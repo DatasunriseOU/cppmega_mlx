@@ -1,0 +1,24 @@
+# Local Python environments and interpreter caches.
+.venv
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Test and tooling caches.
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyright/
+
+# Codex/agent runtime logs are local coordination artifacts.
+.codex/agent-logs/
+
+# Large real-data samples copied from GB10 for local-only smoke tests.
+data/parquet_samples/
+
+# Beads / Dolt files (added by bd init)
+.beads/
+.dolt/
+*.db
+.beads-credential-key
