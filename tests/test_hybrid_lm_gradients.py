@@ -6,6 +6,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
 import numpy as np
+import pytest
 from mlx.utils import tree_flatten
 
 from cppmega_mlx.config.model import DSAConfig, M2RNNConfig, Mamba3Config, Nam56RModelConfig
@@ -64,6 +65,61 @@ def _assert_adamw_state_for(
         assert state_name in optimizer_state
         assert np.isfinite(optimizer_state[state_name]).all(), state_name
         assert _max_abs(optimizer_state, state_name) > 0, state_name
+
+
+@pytest.mark.parametrize(
+    ("symbol", "backend", "param_name"),
+    [
+        ("A", "attention", "layers.0.block.out_proj.weight"),
+        ("E", "moe", "layers.0.block.router.gate.weight"),
+        ("M", "mamba3", "layers.0.block.in_proj.weight"),
+        ("R", "m2rnn", "layers.0.block.state_weight"),
+    ],
+)
+def test_hybrid_lm_single_route_compiled_eager_train_matrix_with_side_channels(
+    symbol: str,
+    backend: str,
+    param_name: str,
+) -> None:
+    batch = synthetic_token_batch(
+        batch_size=1,
+        seq_length=5,
+        vocab_size=_single_route_config(symbol).vocab_size,
+        seed=171,
+        include_structure=True,
+    )
+    assert {"structure_ids", "dep_levels", "ast_depth_ids", "sibling_index_ids", "node_type_ids"} <= set(
+        batch.as_dict()
+    )
+
+    def run_step(*, compile: bool) -> tuple[float, int, np.ndarray, dict[str, np.ndarray]]:
+        mx.random.seed(173)
+        model = HybridTinyLM(_single_route_config(symbol))
+        optimizer = optim.AdamW(learning_rate=1e-3, weight_decay=0.0)
+        before = _flat_tree(model.parameters())
+        metrics = CompiledPretrainingStep(model, optimizer, compile=compile)(batch.as_dict())
+        after = _flat_tree(model.parameters())
+        optimizer_state = _flat_tree(optimizer.state)
+        delta = after[param_name] - before[param_name]
+
+        assert metrics.compiled is compile
+        assert metrics.updated is True
+        assert metrics.step == 1
+        assert metrics.ntokens == metrics.trained_tokens == 4
+        assert math.isfinite(metrics.loss)
+        assert metrics.loss > 0
+        assert model.route_symbols == (symbol,)
+        assert [layer.backend for layer in model.layers] == [backend]
+        assert _max_abs({param_name: delta}, param_name) > 0, param_name
+        _assert_adamw_state_for(optimizer_state, param_name)
+        return metrics.loss, metrics.ntokens, delta, optimizer_state
+
+    eager_loss, eager_ntokens, eager_delta, _ = run_step(compile=False)
+    compiled_loss, compiled_ntokens, compiled_delta, _ = run_step(compile=True)
+
+    assert eager_ntokens == compiled_ntokens == 4
+    assert math.isclose(compiled_loss, eager_loss, rel_tol=1e-5, abs_tol=1e-6)
+    np.testing.assert_allclose(compiled_delta, eager_delta, rtol=1e-4, atol=1e-7)
 
 
 def test_hybrid_lm_single_route_losses_reach_active_route_gradients() -> None:
@@ -184,7 +240,6 @@ def test_hybrid_lm_r_route_updates_m2rnn_recurrence_parameters() -> None:
     mx.eval(model.parameters(), optimizer.state, loss, ntokens)
     flat_grads = _flat_tree(grads)
     after = _flat_tree(model.parameters())
-    optimizer_state = _flat_tree(optimizer.state)
 
     assert model.route_symbols == ("R",)
     assert [layer.backend for layer in model.layers] == ["m2rnn"]

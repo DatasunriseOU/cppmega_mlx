@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import importlib
 import subprocess
 import sys
 from pathlib import Path
@@ -19,6 +20,10 @@ def run_matrix(*args: str) -> subprocess.CompletedProcess[str]:
         timeout=60,
         check=False,
     )
+
+
+def test_bench_matrix_module_is_importable() -> None:
+    assert importlib.import_module("scripts.bench_matrix") is not None
 
 
 def test_help_includes_matched_run_guard() -> None:
@@ -58,11 +63,15 @@ def test_dry_run_json_expands_matrix_schema() -> None:
     assert payload["status"] == "dry_run"
     assert payload["schema_version"] == 1
     assert payload["receipt_schema_version"] == 1
+    assert payload["receipt_scope"] == "local_only"
+    assert payload["local_only"] is True
+    assert payload["gb10_parity_claim"] is False
     assert payload["hardware_label"] == "test-m4"
     assert payload["case_count"] == 4
     assert "matched rows" in payload["matched_run_guard"]
     assert "No GB10" not in payload["parity_claim_policy"]
     assert "claims only after both hardware labels" in payload["parity_claim_policy"]
+    assert "Single-host matrix receipt only" in payload["local_only_policy"]
     assert "software.mlx_version" in payload["required_receipt_fields"]
     assert "timing.wall_time_s" in payload["required_receipt_fields"]
     assert "timing.tokens_per_second_or_step_time" in payload["required_receipt_fields"]
@@ -73,6 +82,9 @@ def test_dry_run_json_expands_matrix_schema() -> None:
     for case in cases:
         assert case["status"] == "dry_run"
         assert case["receipt_schema_version"] == 1
+        assert case["receipt_scope"] == "local_only"
+        assert case["local_only"] is True
+        assert case["gb10_parity_claim"] is False
         assert case["hardware_label"] == "test-m4"
         assert case["mlx_version"] == case["device"]["mlx"]
         assert case["tokens_per_second"] is None
@@ -97,9 +109,15 @@ def test_dry_run_json_expands_matrix_schema() -> None:
         assert case["software_key"]["device_name"] == case["device"]["mlx_device_info"]["device_name"]
         assert case["software_key"]["metal"] == case["device"]["metal"]
         assert case["matched_run"]["key"] == case["matched_run_key"]
+        assert case["matched_run"]["receipt_scope"] == "local_only"
+        assert case["matched_run"]["local_only"] is True
+        assert case["matched_run"]["gb10_parity_claim"] is False
         assert "No GB10 parity claim" in case["matched_run"]["claim_policy"]
         receipt = case["bench_receipt"]
         assert receipt["schema_version"] == 1
+        assert receipt["receipt_scope"] == "local_only"
+        assert receipt["local_only"] is True
+        assert receipt["gb10_parity_claim"] is False
         assert receipt["hardware_label"] == "test-m4"
         assert receipt["route"] == case["route"]
         assert receipt["seq_len"] == case["seq_len"]
@@ -123,6 +141,7 @@ def test_dry_run_json_expands_matrix_schema() -> None:
         assert receipt["timing"]["tokens_per_second_or_step_time"] is False
         assert receipt["timing"]["synchronized_timing"] is None
         assert "claims only after both hardware labels" in receipt["parity_claim_policy"]
+        assert "Single-host matrix receipt only" in receipt["local_only_policy"]
         assert case["run_metadata"]["framework"]["mlx"] == case["device"]["mlx"]
         assert case["run_metadata"]["workload"]["data_contract"] == "synthetic_tokens"
         assert case["profile_hooks"]["enabled"] is False
@@ -164,18 +183,29 @@ def test_archive_baseline_writes_append_only_local_m4_schema(tmp_path: Path) -> 
     assert payload["baseline_archive"]["schema_version"] == 1
     assert payload["baseline_archive"]["kind"] == "cppmega.mlx.local_m4_benchmark_baselines"
     assert payload["baseline_archive"]["record_count"] == 1
+    assert payload["baseline_archive"]["receipt_scope"] == "local_only"
+    assert payload["baseline_archive"]["local_only"] is True
     assert payload["baseline_archive"]["gb10_parity_claim"] is False
     assert "does not contain a GB10 parity claim" in payload["baseline_archive"]["parity_claim_policy"]
+    assert "Single-host matrix receipt only" in payload["baseline_archive"]["local_only_policy"]
 
     archive = json.loads(archive_path.read_text(encoding="utf-8"))
     assert archive["schema_version"] == 1
     assert archive["kind"] == "cppmega.mlx.local_m4_benchmark_baselines"
+    assert archive["receipt_scope"] == "local_only"
+    assert archive["local_only"] is True
+    assert archive["gb10_parity_claim"] is False
+    assert archive["guards"]["local_only"] is True
     assert archive["guards"]["gb10_parity_claim"] is False
     assert "local M4 baseline" in archive["guards"]["parity_claim_policy"]
+    assert "Single-host matrix receipt only" in archive["guards"]["local_only_policy"]
     assert len(archive["records"]) == 1
     record = archive["records"][0]
     assert record["schema_version"] == 1
     assert record["kind"] == "cppmega.mlx.local_m4_benchmark_baseline_record"
+    assert record["receipt_scope"] == "local_only"
+    assert record["local_only"] is True
+    assert record["gb10_parity_claim"] is False
     assert record["hardware_label"] == "M4 Max"
     assert record["note"] == "lane 4 schema smoke"
     assert record["case_count"] == 1
@@ -197,12 +227,17 @@ def test_archive_baseline_writes_append_only_local_m4_schema(tmp_path: Path) -> 
         "peak_memory_bytes",
     ]
     assert "do not reorder" in record["compare_line_contract"]["stability"]
+    assert record["guards"]["local_only"] is True
     assert record["guards"]["gb10_parity_claim"] is False
     assert "does not contain a GB10 parity claim" in record["guards"]["parity_claim_policy"]
+    assert "Single-host matrix receipt only" in record["guards"]["local_only_policy"]
     rows = record["rows"]
     assert len(rows) == 1
     row = rows[0]
     assert row["kind"] == "cppmega.mlx.local_m4_benchmark_baseline_record"
+    assert row["receipt_scope"] == "local_only"
+    assert row["local_only"] is True
+    assert row["gb10_parity_claim"] is False
     assert row["status"] == "dry_run"
     assert row["case_id"] == "smoke-route_plain-b1-s4-float32-eager"
     assert row["profile"] == "smoke"
@@ -210,7 +245,11 @@ def test_archive_baseline_writes_append_only_local_m4_schema(tmp_path: Path) -> 
     assert row["comparison_key"]["workload"] == row["workload_key"]
     assert row["comparison_key"]["software"] == row["software_key"]
     assert row["bench_receipt"]["comparison_key"] == row["comparison_key"]
+    assert row["bench_receipt"]["receipt_scope"] == "local_only"
+    assert row["bench_receipt"]["local_only"] is True
+    assert row["bench_receipt"]["gb10_parity_claim"] is False
     assert row["bench_receipt"]["hardware_label"] == "M4 Max"
+    assert row["guards"]["local_only"] is True
     assert row["guards"]["gb10_parity_claim"] is False
     assert row["metrics"] == {
         "tokens_per_second": None,
@@ -252,6 +291,119 @@ def test_archive_baseline_writes_append_only_local_m4_schema(tmp_path: Path) -> 
     assert appended["records"][1]["rows"][0]["case_id"] == "smoke-route_plain-b1-s5-float32-eager"
 
 
+def test_archive_baseline_refuses_existing_parity_claim(tmp_path: Path) -> None:
+    archive_path = tmp_path / "m4_baselines.json"
+    result = run_matrix(
+        "--dry-run-json",
+        "--archive-baseline",
+        str(archive_path),
+        "--hardware-label",
+        "M4 Max",
+        "--batch-sizes",
+        "1",
+        "--seq-lens",
+        "4",
+        "--profiles",
+        "smoke",
+        "--routes",
+        "plain",
+        "--compile-modes",
+        "eager",
+        "--dtype",
+        "float32",
+        "--steps",
+        "1",
+        "--warmup-steps",
+        "0",
+    )
+    assert result.returncode == 0, result.stderr
+    archive = json.loads(archive_path.read_text(encoding="utf-8"))
+    archive["records"][0]["rows"][0]["bench_receipt"]["gb10_parity_claim"] = True
+    archive_path.write_text(json.dumps(archive), encoding="utf-8")
+
+    blocked = run_matrix(
+        "--dry-run-json",
+        "--archive-baseline",
+        str(archive_path),
+        "--hardware-label",
+        "M4 Max",
+        "--batch-sizes",
+        "1",
+        "--seq-lens",
+        "5",
+        "--profiles",
+        "smoke",
+        "--routes",
+        "plain",
+        "--compile-modes",
+        "eager",
+        "--dtype",
+        "float32",
+        "--steps",
+        "1",
+        "--warmup-steps",
+        "0",
+    )
+
+    assert blocked.returncode == 2
+    payload = json.loads(blocked.stdout)
+    assert payload["status"] == "error"
+    assert "gb10_parity_claim must be false" in payload["error"]
+    assert len(json.loads(archive_path.read_text(encoding="utf-8"))["records"]) == 1
+
+
+def test_archive_baseline_refuses_existing_archive_without_local_only_guard(
+    tmp_path: Path,
+) -> None:
+    archive_path = tmp_path / "m4_baselines.json"
+    archive_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "cppmega.mlx.local_m4_benchmark_baselines",
+                "created_at_utc": "2026-04-30T00:00:00Z",
+                "updated_at_utc": "2026-04-30T00:00:00Z",
+                "records": [],
+                "guards": {
+                    "local_only": True,
+                    "gb10_parity_claim": False,
+                    "matched_run_guard": "legacy",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_matrix(
+        "--dry-run-json",
+        "--archive-baseline",
+        str(archive_path),
+        "--hardware-label",
+        "M4 Max",
+        "--batch-sizes",
+        "1",
+        "--seq-lens",
+        "4",
+        "--profiles",
+        "smoke",
+        "--routes",
+        "plain",
+        "--compile-modes",
+        "eager",
+        "--dtype",
+        "float32",
+        "--steps",
+        "1",
+        "--warmup-steps",
+        "0",
+    )
+
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "error"
+    assert "baseline archive receipt_scope must be 'local_only'" in payload["error"]
+
+
 def test_minimal_real_matrix_reports_comparable_metrics() -> None:
     result = run_matrix(
         "--json",
@@ -278,10 +430,16 @@ def test_minimal_real_matrix_reports_comparable_metrics() -> None:
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
     assert payload["status"] == "ok"
+    assert payload["receipt_scope"] == "local_only"
+    assert payload["local_only"] is True
+    assert payload["gb10_parity_claim"] is False
     assert payload["case_count"] == 1
     case = payload["cases"][0]
     assert case["status"] == "ok"
     assert case["receipt_schema_version"] == 1
+    assert case["receipt_scope"] == "local_only"
+    assert case["local_only"] is True
+    assert case["gb10_parity_claim"] is False
     assert case["case_id"] == "smoke-route_plain-b1-s4-float32-eager"
     assert case["hardware_label"] == "test-m4"
     assert case["mlx_version"]
@@ -312,6 +470,9 @@ def test_minimal_real_matrix_reports_comparable_metrics() -> None:
     assert case["comparison_key"]["software"]["mlx_lm_version"] == case["mlx_lm_version"]
     assert case["comparison_key"]["software"]["mlx_metal_version"] == case["device"]["mlx_metal"]
     receipt = case["bench_receipt"]
+    assert receipt["receipt_scope"] == "local_only"
+    assert receipt["local_only"] is True
+    assert receipt["gb10_parity_claim"] is False
     assert receipt["hardware_label"] == "test-m4"
     assert receipt["profile"] == "smoke"
     assert receipt["route"] == "plain"
@@ -644,6 +805,8 @@ def test_human_output_includes_route_backend_and_device_metadata() -> None:
     assert human.returncode == 0, human.stderr
     assert "tokens_per_second mean_step_time_s median_step_time_s" in human.stdout
     assert "model_route route_symbols backend backend_summary device_name" in human.stdout
+    assert "local_only_policy: Single-host matrix receipt only" in human.stdout
+    assert "gb10_parity_claim: False" in human.stdout
     assert "hybrid-m M mlx mamba3:1" in human.stdout
     assert "hybrid-r R mlx m2rnn:1" in human.stdout
     assert '"Apple M4 Max"' in human.stdout or '"Device(gpu, 0)"' in human.stdout

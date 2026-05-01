@@ -4,6 +4,8 @@ from cppmega_mlx.data.batch import LMTokenBatch, ensure_lm_batch, synthetic_toke
 from cppmega_mlx.data.megatron_indexed import (
     MegatronIndexedDataset,
     MegatronIndexedMetadata,
+    megatron_indexed_side_channel_schema,
+    open_megatron_indexed_dataset,
 )
 from cppmega_mlx.data.parquet_dataset import ParquetColumns, TokenParquetDataset
 from cppmega_mlx.data.token_dataset import (
@@ -25,6 +27,8 @@ __all__ = [
     "TokenParquetDataset",
     "ensure_lm_batch",
     "iterate_token_batches",
+    "megatron_indexed_side_channel_schema",
+    "open_megatron_indexed_dataset",
     "open_token_dataset",
     "synthetic_token_batch",
 ]

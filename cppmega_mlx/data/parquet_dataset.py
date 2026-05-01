@@ -66,6 +66,13 @@ class ParquetColumns:
         return self.types.get(key)
 
 
+@dataclass(frozen=True)
+class _SideChannelColumns:
+    channels: Mapping[str, np.ndarray]
+    sources: Mapping[str, Mapping[str, str | None]]
+    skipped: Sequence[Mapping[str, str | None]]
+
+
 class TokenParquetDataset:
     """Parquet-backed fixed-shape token batch iterator.
 
@@ -116,7 +123,8 @@ class TokenParquetDataset:
             eos_token_id=eos_token_id,
         )
         token_windows = _fixed_windows_from_rows(token_rows, seq_len)
-        side_channels = _side_channel_windows(columns, token_rows, seq_len)
+        side_channel_columns = _side_channel_windows(columns, token_rows, seq_len)
+        side_channels = side_channel_columns.channels
 
         if not len(token_windows):
             raise ValueError("parquet data does not contain a full fixed-shape sample")
@@ -133,6 +141,13 @@ class TokenParquetDataset:
             for key, value in side_channels.items()
         }
         self.metadata = metadata or TokenDatasetMetadata(source_format="parquet")
+        self.parquet_receipt = _parquet_receipt(
+            columns,
+            token_key=token_key,
+            text_key=text_key,
+            side_channel_sources=side_channel_columns.sources,
+            skipped_side_channels=side_channel_columns.skipped,
+        )
 
     def __len__(self) -> int:
         return self.num_batches
@@ -287,8 +302,10 @@ def _side_channel_windows(
     columns: ParquetColumns,
     token_rows: list[list[int]],
     seq_len: int,
-) -> dict[str, np.ndarray]:
+) -> _SideChannelColumns:
     channels: dict[str, np.ndarray] = {}
+    sources: dict[str, dict[str, str | None]] = {}
+    skipped: list[dict[str, str | None]] = []
     for key in _SIDE_CHANNEL_KEYS:
         matched: list[tuple[str, np.ndarray]] = []
         for column_key in _SIDE_CHANNEL_COLUMN_ALIASES.get(key, (key,)):
@@ -310,6 +327,14 @@ def _side_channel_windows(
                         f"{column_key} side-channel rows must be token-aligned with "
                         f"{len(token_rows)} token rows"
                     )
+                skipped.append(
+                    {
+                        "field": key,
+                        "column": column_key,
+                        "type": columns.type_label(column_key),
+                        "reason": "not_token_aligned",
+                    }
+                )
                 continue
             matched.append((column_key, _fixed_windows_from_rows(rows, seq_len)))
         if len(matched) > 1:
@@ -318,19 +343,65 @@ def _side_channel_windows(
                 f"{key} side-channel declared more than once via columns: {aliases}"
             )
         if matched:
-            channels[key] = matched[0][1]
-    return channels
+            column_key, windows = matched[0]
+            channels[key] = windows
+            sources[key] = {
+                "column": column_key,
+                "type": columns.type_label(column_key),
+            }
+    return _SideChannelColumns(channels=channels, sources=sources, skipped=skipped)
+
+
+def _parquet_receipt(
+    columns: ParquetColumns,
+    *,
+    token_key: str,
+    text_key: str | None,
+    side_channel_sources: Mapping[str, Mapping[str, str | None]],
+    skipped_side_channels: Sequence[Mapping[str, str | None]],
+) -> dict[str, Any]:
+    token_source: dict[str, str | None]
+    if token_key in columns.values:
+        token_source = {
+            "mode": "token_column",
+            "column": token_key,
+            "type": columns.type_label(token_key),
+        }
+    else:
+        token_source = {
+            "mode": "text_column",
+            "column": text_key,
+            "type": None if text_key is None else columns.type_label(text_key),
+        }
+    return {
+        "source_format": "parquet",
+        "columns": sorted(columns.values),
+        "column_types": dict(columns.types or {}),
+        "token_source": token_source,
+        "side_channel_sources": {
+            key: dict(value) for key, value in sorted(side_channel_sources.items())
+        },
+        "skipped_side_channel_columns": [
+            dict(value)
+            for value in sorted(
+                skipped_side_channels,
+                key=lambda item: (str(item.get("field")), str(item.get("column"))),
+            )
+        ],
+    }
 
 
 def _rows_are_token_aligned(
-    rows: list[list[int | float]], token_rows: list[list[int]]
+    rows: Sequence[Sequence[int | float]], token_rows: Sequence[Sequence[int]]
 ) -> bool:
     if len(rows) != len(token_rows):
         return False
     return all(len(row) == len(token_row) for row, token_row in zip(rows, token_rows))
 
 
-def _fixed_windows_from_rows(rows: list[list[int | float]], seq_len: int) -> np.ndarray:
+def _fixed_windows_from_rows(
+    rows: Sequence[Sequence[int | float]], seq_len: int
+) -> np.ndarray:
     if not rows:
         return np.empty((0, seq_len), dtype=np.int32)
     if all(len(row) == 1 for row in rows):
@@ -396,7 +467,7 @@ def _coerce_integral_value(value: Any, *, label: str) -> int:
 
 def _coerce_side_channel_row(
     key: str, value: Any, *, label: str
-) -> list[int | float]:
+) -> Sequence[int | float]:
     if key != "attention_mask":
         return _coerce_token_row(value, label=label)
     return _coerce_numeric_row(value, label=label)

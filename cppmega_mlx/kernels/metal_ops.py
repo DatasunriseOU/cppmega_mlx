@@ -28,9 +28,46 @@ class MetalKernelStatus:
 
 @dataclass(frozen=True)
 class TrainingKernelStatus:
+    in_tree: bool
+    source_pinned: bool
+    license_covered: bool
+    fallback_covered: bool
+    parity_covered: bool
+    hotspot_evidence: bool
+    vjp_covered: bool
+    jvp_covered: bool
+    training_safe: bool
     differentiable: bool
     reason: str
     fallback_backend: Backend
+
+    def __post_init__(self) -> None:
+        if not self.training_safe:
+            return
+
+        missing = []
+        if not self.in_tree:
+            missing.append("in-tree ownership")
+        if not self.source_pinned:
+            missing.append("source pin")
+        if not self.license_covered:
+            missing.append("license coverage")
+        if not self.fallback_covered:
+            missing.append("pure-MLX fallback coverage")
+        if not self.parity_covered:
+            missing.append("fallback/Metal parity coverage")
+        if not self.hotspot_evidence:
+            missing.append("profiled hotspot evidence")
+        if not self.differentiable:
+            missing.append("custom differentiation coverage")
+        if not self.vjp_covered:
+            missing.append("VJP/backward parity coverage")
+        if self.fallback_backend != "mlx":
+            missing.append("pure-MLX fallback backend")
+        if missing:
+            raise ValueError(
+                "training-safe Metal kernels require " + ", ".join(missing)
+            )
 
 
 _SUPPORTED_METAL_DTYPES = {mx.float32, mx.float16, mx.bfloat16}
@@ -71,10 +108,20 @@ def squared_relu_training_status() -> TrainingKernelStatus:
     """Return the training policy for the prototype ``squared_relu`` kernel."""
 
     return TrainingKernelStatus(
+        in_tree=True,
+        source_pinned=True,
+        license_covered=True,
+        fallback_covered=True,
+        parity_covered=True,
+        hotspot_evidence=False,
+        vjp_covered=False,
+        jvp_covered=False,
+        training_safe=False,
         differentiable=False,
         reason=(
             "prototype Metal squared_relu is forward-only; training paths must "
-            "use the pure MLX fallback until a custom_function VJP/JVP is defined"
+            "use the pure MLX fallback until an in-tree custom_function VJP/JVP "
+            "is defined, parity remains covered, and hotspot evidence exists"
         ),
         fallback_backend="mlx",
     )
@@ -89,7 +136,8 @@ def squared_relu_reference(x: mx.array) -> mx.array:
 
 def _reject_forward_only_training_kernel() -> None:
     status = squared_relu_training_status()
-    raise MetalKernelUnsupported(status.reason)
+    if not status.training_safe:
+        raise MetalKernelUnsupported(status.reason)
 
 
 def squared_relu(x: mx.array, *, backend: Backend = "auto", training: bool = False) -> mx.array:

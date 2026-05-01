@@ -16,6 +16,7 @@ SCRIPT = ROOT / "scripts" / "train_hybrid_tiny.py"
 GB10_SAMPLE_ROOT = ROOT / "data" / "parquet_samples" / "gb10"
 REAL_PARQUET_COLUMNS = (
     "token_ids",
+    "structure_ids",
     "token_structure_ids",
     "token_dep_levels",
     "token_ast_depth",
@@ -426,11 +427,7 @@ def test_dry_run_json_reports_synthetic_hybrid_plan() -> None:
     assert payload["synthetic_npz"] is True
     assert payload["config"]["npz_path"] is None
     assert payload["dataset"]["num_batches"] >= 1
-    assert payload["dataset"]["side_channels"] == [
-        "attention_mask",
-        "dep_levels",
-        "structure_ids",
-    ]
+    _assert_full_structure_contract(payload["dataset"])
     assert payload["model_source"] == "cppmega_mlx.models.hybrid_lm"
     assert payload["model_config"]["vocab_size"] == 32
     assert payload["route_symbols"] == "AEMR"
@@ -573,6 +570,68 @@ def test_real_gb10_parquet_cli_smoke_trains_with_side_channels(
         "sibling_index_ids",
         "structure_ids",
     ]
+    receipt = payload["dataset"]["dataset_receipt"]
+    assert receipt["parquet_receipt"] == {
+        "source_format": "parquet",
+        "columns": sorted(REAL_PARQUET_COLUMNS),
+        "column_types": {
+            "token_ids": "large_list<element: uint32>",
+            "structure_ids": "large_list<element: int8>",
+            "token_structure_ids": "large_list<element: uint8>",
+            "token_dep_levels": "large_list<element: uint16>",
+            "token_ast_depth": "large_list<element: uint16>",
+            "token_sibling_index": "large_list<element: uint16>",
+            "token_ast_node_type": "large_list<element: uint16>",
+        },
+        "token_source": {
+            "mode": "token_column",
+            "column": "token_ids",
+            "type": "large_list<element: uint32>",
+        },
+        "side_channel_sources": {
+            "ast_depth_ids": {
+                "column": "token_ast_depth",
+                "type": "large_list<element: uint16>",
+            },
+            "dep_levels": {
+                "column": "token_dep_levels",
+                "type": "large_list<element: uint16>",
+            },
+            "node_type_ids": {
+                "column": "token_ast_node_type",
+                "type": "large_list<element: uint16>",
+            },
+            "sibling_index_ids": {
+                "column": "token_sibling_index",
+                "type": "large_list<element: uint16>",
+            },
+            "structure_ids": {
+                "column": "token_structure_ids",
+                "type": "large_list<element: uint8>",
+            },
+        },
+        "skipped_side_channel_columns": [
+            {
+                "field": "structure_ids",
+                "column": "structure_ids",
+                "type": "large_list<element: int8>",
+                "reason": "not_token_aligned",
+            },
+        ],
+    }
+    assert receipt == {
+        "batch_size": 1,
+        "dropped_samples": payload["dataset"]["dropped_samples"],
+        "num_batches": payload["dataset"]["num_batches"],
+        "num_samples": payload["dataset"]["num_samples"],
+        "parquet_receipt": receipt["parquet_receipt"],
+        "seq_len": 64,
+        "side_channels": payload["dataset"]["side_channels"],
+        "source_dataset_name": dataset_name,
+        "source_format": "parquet",
+        "source_path": str(sample_path),
+        "token_key": "token_ids",
+    }
     assert payload["route_symbols"] == "M"
     assert payload["route_roles"] == ["mamba3"]
     assert payload["tokens_per_step"] == 63
@@ -803,6 +862,115 @@ def test_single_route_checkpoint_resume_preserves_batch_cursor(
     )
 
 
+@pytest.mark.parametrize(
+    ("symbol", "backend"),
+    [
+        ("M", "mamba3"),
+        ("R", "m2rnn"),
+    ],
+)
+def test_single_route_checkpoint_resume_eval_records_structure_receipts(
+    tmp_path: Path,
+    symbol: str,
+    backend: str,
+) -> None:
+    npz_path = tmp_path / f"tokens_{symbol}.npz"
+    valid_npz_path = tmp_path / f"valid_tokens_{symbol}.npz"
+    checkpoint_dir = tmp_path / f"checkpoints_{symbol}"
+    resumed_final = tmp_path / f"resumed_final_{symbol}"
+    write_npz(npz_path, vocab_size=32, full_structure=True)
+    write_npz(valid_npz_path, vocab_size=32, full_structure=True)
+
+    first = run_script(
+        str(npz_path),
+        *_tiny_route_args(symbol),
+        "--checkpoint-dir",
+        str(checkpoint_dir),
+        "--checkpoint-save-interval",
+        "1",
+    )
+    first_payload = _load_json_result(first)
+    _assert_finite_route_training_payload(
+        first_payload,
+        symbol=symbol,
+        backend=backend,
+        compiled=False,
+    )
+    _assert_full_structure_contract(first_payload["dataset"])
+
+    checkpoint_path = checkpoint_dir / "checkpoint-000001"
+    manifest = json.loads((checkpoint_path / "metadata.json").read_text())
+    _assert_full_structure_contract(manifest["dataset"])
+    assert manifest["resume_cursor"] == {
+        "batch_cursor": {
+            "batch_offset": 1,
+            "epoch": 0,
+            "global_batch_offset": 1,
+        },
+        "step": 1,
+        "trained_tokens": 3,
+    }
+
+    second = run_script(
+        str(npz_path),
+        *_tiny_route_args(symbol),
+        "--valid-dataset-path",
+        str(valid_npz_path),
+        "--valid-dataset-format",
+        "npz",
+        "--eval-batches",
+        "1",
+        "--resume-from",
+        str(checkpoint_path),
+        "--checkpoint-path",
+        str(resumed_final),
+    )
+    second_payload = _load_json_result(second)
+
+    assert second_payload["route_symbols"] == symbol
+    assert second_payload["route_roles"] == [backend]
+    assert second_payload["resume"]["resume_cursor"] == {
+        "batch_cursor": {
+            "batch_offset": 1,
+            "epoch": 0,
+            "global_batch_offset": 1,
+        },
+        "step": 1,
+        "trained_tokens": 3,
+    }
+    assert second_payload["start_step"] == 1
+    assert second_payload["end_step"] == 2
+    _assert_full_structure_contract(second_payload["dataset"])
+    assert second_payload["evaluation"]["dataset"]["path"] == str(valid_npz_path)
+    _assert_full_structure_contract(second_payload["evaluation"]["dataset"])
+    assert second_payload["evaluation"]["requested_batches"] == 1
+    assert second_payload["evaluation"]["planned_batches"] == 1
+    assert second_payload["evaluation"]["evaluated_batches"] == 1
+    assert second_payload["evaluation"]["metrics"]["batches"] == 1
+    assert second_payload["evaluation"]["metrics"]["ntokens"] == 3
+    assert second_payload["evaluation"]["metrics"]["loss"] > 0
+
+    resumed_manifest = json.loads((resumed_final / "metadata.json").read_text())
+    _assert_full_structure_contract(resumed_manifest["dataset"])
+    assert resumed_manifest["resume_cursor"] == {
+        "batch_cursor": {
+            "batch_offset": 2,
+            "epoch": 0,
+            "global_batch_offset": 2,
+        },
+        "step": 2,
+        "trained_tokens": 6,
+    }
+    assert resumed_manifest["evaluation"]["dataset"]["path"] == str(valid_npz_path)
+    _assert_full_structure_contract(resumed_manifest["evaluation"]["dataset"])
+    assert resumed_manifest["evaluation"]["requested_batches"] == 1
+    assert resumed_manifest["evaluation"]["planned_batches"] == 1
+    assert resumed_manifest["evaluation"]["evaluated_batches"] == 1
+    assert resumed_manifest["evaluation"]["metrics"]["batches"] == 1
+    assert resumed_manifest["evaluation"]["metrics"]["ntokens"] == 3
+    assert resumed_manifest["evaluation"]["metrics"]["loss"] > 0
+
+
 def test_one_eager_training_step_reports_machine_readable_metrics(
     tmp_path: Path,
 ) -> None:
@@ -879,17 +1047,28 @@ def test_training_reports_validation_eval_metrics(tmp_path: Path) -> None:
     assert payload["evaluation"]["metrics"]["tokens_per_second"] > 0
 
 
-def test_training_validation_dataset_path_reports_full_side_channel_contract(
+@pytest.mark.parametrize(
+    ("symbol", "backend"),
+    [
+        ("A", "attention"),
+        ("E", "moe"),
+        ("M", "mamba3"),
+        ("R", "m2rnn"),
+    ],
+)
+def test_route_training_validation_dataset_path_reports_full_side_channel_contract(
     tmp_path: Path,
+    symbol: str,
+    backend: str,
 ) -> None:
-    npz_path = tmp_path / "tokens.npz"
-    valid_npz_path = tmp_path / "valid_tokens.npz"
+    npz_path = tmp_path / f"tokens_{symbol}.npz"
+    valid_npz_path = tmp_path / f"valid_tokens_{symbol}.npz"
     write_npz(npz_path, vocab_size=32, full_structure=True)
     write_npz(valid_npz_path, vocab_size=32, full_structure=True)
 
     result = run_script(
         str(npz_path),
-        *_tiny_route_args("A"),
+        *_tiny_route_args(symbol),
         "--valid-dataset-path",
         str(valid_npz_path),
         "--valid-dataset-format",
@@ -899,11 +1078,21 @@ def test_training_validation_dataset_path_reports_full_side_channel_contract(
     )
 
     payload = _load_json_result(result)
+    _assert_finite_route_training_payload(
+        payload,
+        symbol=symbol,
+        backend=backend,
+        compiled=False,
+    )
     _assert_full_structure_contract(payload["dataset"])
+    assert payload["dataset"]["path"] == str(npz_path)
     assert payload["evaluation"]["dataset"]["path"] == str(valid_npz_path)
     _assert_full_structure_contract(payload["evaluation"]["dataset"])
+    assert payload["evaluation"]["requested_batches"] == 1
+    assert payload["evaluation"]["evaluated_batches"] == 1
     assert payload["evaluation"]["metrics"]["batches"] == 1
     assert payload["evaluation"]["metrics"]["ntokens"] == 3
+    assert payload["evaluation"]["metrics"]["loss"] > 0
 
 
 def test_training_eval_reports_ngram_hash_side_channel_contract(
@@ -1229,6 +1418,105 @@ def test_invalid_steps_returns_error_json_with_device_and_compile_metadata() -> 
     assert payload["compile_plan"]["requested"] is True
     assert "default_device" in payload["device"]
     assert "metal_available" in payload["device"]
+
+
+def test_valid_dataset_format_without_validation_path_returns_error_json() -> None:
+    result = run_script("--json", "--valid-dataset-format", "npz")
+
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "error"
+    assert payload["error_type"] == "ValueError"
+    assert (
+        payload["error"]
+        == "valid_dataset_format requires valid_dataset_path or valid_npz_path"
+    )
+    assert payload["compile"] is False
+    assert payload["compile_enabled"] is False
+    assert payload["compile_plan"]["enabled"] is False
+
+
+@pytest.mark.parametrize(
+    ("mutation", "error"),
+    [
+        ({"step": "1"}, "step must be a non-negative integer"),
+        ({"trained_tokens": True}, "trained_tokens must be a non-negative integer"),
+        (
+            {"batch_cursor": {"global_batch_offset": "1"}},
+            "batch_cursor.global_batch_offset must be a non-negative integer",
+        ),
+    ],
+)
+def test_resume_rejects_coerced_checkpoint_cursor_metadata(
+    tmp_path: Path,
+    mutation: dict[str, Any],
+    error: str,
+) -> None:
+    npz_path = tmp_path / "tokens.npz"
+    checkpoint_dir = tmp_path / "checkpoints"
+    write_npz(npz_path, vocab_size=32)
+
+    first = run_script(
+        str(npz_path),
+        "--json",
+        "--batch-size",
+        "2",
+        "--seq-len",
+        "4",
+        "--steps",
+        "1",
+        "--hidden-size",
+        "8",
+        "--num-attention-heads",
+        "1",
+        "--pattern",
+        "A",
+        "--depth",
+        "1",
+        "--checkpoint-dir",
+        str(checkpoint_dir),
+        "--checkpoint-save-interval",
+        "1",
+    )
+    assert first.returncode == 0, first.stderr
+
+    checkpoint_path = checkpoint_dir / "checkpoint-000001"
+    metadata_path = checkpoint_path / "metadata.json"
+    manifest = json.loads(metadata_path.read_text())
+    if "batch_cursor" in mutation:
+        manifest["batch_cursor"].update(mutation["batch_cursor"])
+    else:
+        manifest.update(mutation)
+    metadata_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+
+    resumed = run_script(
+        str(npz_path),
+        "--json",
+        "--batch-size",
+        "2",
+        "--seq-len",
+        "4",
+        "--steps",
+        "1",
+        "--hidden-size",
+        "8",
+        "--num-attention-heads",
+        "1",
+        "--pattern",
+        "A",
+        "--depth",
+        "1",
+        "--resume-from",
+        str(checkpoint_path),
+    )
+
+    assert resumed.returncode == 2
+    payload = json.loads(resumed.stdout)
+    assert payload["status"] == "error"
+    assert payload["error_type"] == "ValueError"
+    assert error in payload["error"]
+    assert payload["compile"] is False
+    assert payload["compile_enabled"] is False
 
 
 def test_mlx_disable_compile_env_reports_requested_but_eager_execution(

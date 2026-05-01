@@ -1,7 +1,17 @@
 """MLX neural-network building blocks."""
 
 from cppmega_mlx.nn.attention import AttentionConfig, AttentionRouteInfo, CausalSelfAttention
+from cppmega_mlx.nn.m2rnn import (
+    DEFAULT_CHUNK_SIZE,
+    M2RNNConfig,
+    M2RNNMixer,
+    broadcast_m2rnn_heads,
+    chunked_m2rnn_scan,
+    m2rnn_scan,
+    m2rnn_softplus_decay_gate,
+)
 from cppmega_mlx.nn.mamba3 import (
+    Mamba3CacheState,
     Mamba3Config,
     Mamba3InProjDims,
     Mamba3ReferenceBlock,
@@ -17,21 +27,43 @@ from cppmega_mlx.nn.moe import (
     RouterOutput,
     TopKRouter,
 )
+from cppmega_mlx.nn.ngram_hash import (
+    CppMegaNgramHashEmbedding,
+    NgramHashEmbedding,
+    pick_primes,
+)
+from cppmega_mlx.nn.structure_embedding import (
+    CppMegaStructureEmbedding,
+    StructureEmbedding,
+)
 
 __all__ = [
     "AttentionConfig",
     "AttentionRouteInfo",
+    "CppMegaNgramHashEmbedding",
+    "CppMegaStructureEmbedding",
     "CausalSelfAttention",
+    "DEFAULT_CHUNK_SIZE",
     "FeedForwardExpert",
+    "M2RNNConfig",
+    "M2RNNMixer",
+    "Mamba3CacheState",
     "Mamba3Config",
     "Mamba3InProjDims",
     "Mamba3ReferenceBlock",
     "MoEConfig",
     "MoEOutput",
+    "NgramHashEmbedding",
     "ReferenceMoE",
     "RouterOutput",
+    "StructureEmbedding",
     "TopKRouter",
+    "broadcast_m2rnn_heads",
     "causal_depthwise_conv1d",
+    "chunked_m2rnn_scan",
     "compute_mamba3_in_proj_dims",
     "compute_num_rope_angles",
+    "m2rnn_scan",
+    "m2rnn_softplus_decay_gate",
+    "pick_primes",
 ]

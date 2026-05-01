@@ -16,7 +16,7 @@ import platform
 import statistics
 import sys
 import tempfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from importlib import metadata
 from pathlib import Path
 from typing import Any, Literal
@@ -27,14 +27,14 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import mlx.core as mx
-import mlx.optimizers as optim
+import mlx.core as mx  # noqa: E402
+import mlx.optimizers as optim  # noqa: E402
 
-from cppmega_mlx.data.token_dataset import TokenBatchDataset, open_token_dataset
-from cppmega_mlx.models.hybrid_lm import HybridTinyConfig, HybridTinyLM
-from cppmega_mlx.training.checkpoint import load_checkpoint, save_checkpoint
-from cppmega_mlx.training.compiled import CompiledPretrainingStep
-from cppmega_mlx.training.eval import evaluate_batches
+from cppmega_mlx.data.token_dataset import TokenBatchDataset, open_token_dataset  # noqa: E402
+from cppmega_mlx.models.hybrid_lm import HybridTinyConfig, HybridTinyLM  # noqa: E402
+from cppmega_mlx.training.checkpoint import load_checkpoint, save_checkpoint  # noqa: E402
+from cppmega_mlx.training.compiled import CompiledPretrainingStep  # noqa: E402
+from cppmega_mlx.training.eval import evaluate_batches  # noqa: E402
 
 
 DTYPES = {
@@ -411,6 +411,10 @@ def validate_config(config: TrainHybridTinyConfig) -> None:
         data_format=config.valid_dataset_format,
     ):
         raise ValueError(f"token shard path does not exist: {valid_path}")
+    if config.valid_dataset_format is not None and valid_path is None:
+        raise ValueError(
+            "valid_dataset_format requires valid_dataset_path or valid_npz_path"
+        )
     if config.data_format is not None and config.data_format not in {
         "npz",
         "parquet",
@@ -497,6 +501,9 @@ def write_synthetic_npz(path: Path, config: TrainHybridTinyConfig) -> None:
     if config.include_structure:
         arrays["structure_ids"] = (tokens % 7).astype(np.int32)
         arrays["dep_levels"] = (tokens % 3).astype(np.int32)
+        arrays["ast_depth_ids"] = (tokens % 5).astype(np.int32)
+        arrays["sibling_index_ids"] = (tokens % 11).astype(np.int32)
+        arrays["node_type_ids"] = (tokens % 13).astype(np.int32)
     np.savez(path, **arrays)
 
 
@@ -674,6 +681,47 @@ def compile_payload(config: TrainHybridTinyConfig, device: dict[str, Any]) -> di
     }
 
 
+def metadata_non_negative_int(
+    metadata: dict[str, Any],
+    key: str,
+    *,
+    default: int,
+    source: Path,
+) -> int:
+    value = metadata.get(key, default)
+    if value is None:
+        value = default
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(
+            f"checkpoint metadata {source}: {key} must be a non-negative integer"
+        )
+    return value
+
+
+def metadata_batch_cursor_offset(
+    metadata: dict[str, Any],
+    *,
+    default: int,
+    source: Path,
+) -> int:
+    cursor = metadata.get("batch_cursor", {})
+    if cursor is None:
+        return default
+    if not isinstance(cursor, dict):
+        raise ValueError(
+            f"checkpoint metadata {source}: batch_cursor must be an object"
+        )
+    if "global_batch_offset" not in cursor:
+        return default
+    value = cursor["global_batch_offset"]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(
+            f"checkpoint metadata {source}: "
+            "batch_cursor.global_batch_offset must be a non-negative integer"
+        )
+    return value
+
+
 def assert_finite_metric(name: str, value: Any) -> None:
     if not isinstance(value, int | float) or not math.isfinite(float(value)):
         raise ValueError(f"{name} must be finite, found {value!r}")
@@ -691,6 +739,69 @@ def dataset_side_channel_names(dataset: TokenBatchDataset) -> list[str]:
 def dataset_structure_side_channels(dataset: TokenBatchDataset) -> list[str]:
     side_channels = set(dataset_side_channel_names(dataset))
     return sorted(name for name in STRUCTURE_MODEL_KWARG_NAMES if name in side_channels)
+
+
+def dataset_source_format(dataset: TokenBatchDataset) -> str:
+    source_format = getattr(dataset.metadata, "source_format", None)
+    if source_format is not None:
+        return str(source_format)
+    index_metadata = getattr(dataset, "index_metadata", None)
+    index_source_format = getattr(index_metadata, "source_format", None)
+    return str(index_source_format or "unknown")
+
+
+def source_dataset_name(path: Path, *, source_format: str) -> str:
+    stem = path.stem if path.suffix else path.name
+    if source_format == "parquet":
+        if stem == "val_00000" and path.parent.name:
+            return path.parent.name
+        for suffix in ("_local_train_eval_head", "_train_head", "_head"):
+            if stem.endswith(suffix):
+                return stem[: -len(suffix)]
+    return stem
+
+
+def dataset_receipt_payload(
+    dataset: TokenBatchDataset,
+    *,
+    side_channels: list[str] | None = None,
+) -> dict[str, Any]:
+    source_format = dataset_source_format(dataset)
+    payload = {
+        "source_format": source_format,
+        "source_dataset_name": source_dataset_name(
+            dataset.path,
+            source_format=source_format,
+        ),
+        "source_path": str(dataset.path),
+        "token_key": dataset.token_key,
+        "seq_len": dataset.seq_len,
+        "batch_size": dataset.batch_size,
+        "num_samples": dataset.num_samples,
+        "num_batches": dataset.num_batches,
+        "dropped_samples": dataset.dropped_samples,
+        "side_channels": (
+            side_channels if side_channels is not None else dataset_side_channel_names(dataset)
+        ),
+    }
+    index_metadata = getattr(dataset, "index_metadata", None)
+    if index_metadata is not None:
+        payload["index_metadata"] = _json_ready(index_metadata)
+        payload["megatron_indexed_receipt"] = {
+            "ingress": "MegatronIndexedDataset",
+            "path_accepts_suffixless_prefix": True,
+            "sidecar_schema": "explicit_token_aligned_binary_side_channel_paths",
+            "local_only": True,
+            "receipt_scope": "local_mlx_training_ingress",
+            "megatron_runtime_imported": False,
+            "distributed_megatron_parity_claim": False,
+            "gb10_training_correctness_claim": False,
+            "m4_vs_gb10_throughput_parity_claim": False,
+        }
+    parquet_receipt = getattr(dataset, "parquet_receipt", None)
+    if parquet_receipt is not None:
+        payload["parquet_receipt"] = _json_ready(parquet_receipt)
+    return payload
 
 
 def side_channel_contract_payload(
@@ -735,10 +846,26 @@ def dataset_payload(
         "dropped_samples": dataset.dropped_samples,
         "shuffle": dataset.shuffle,
         "loop": dataset.loop,
-        "metadata": dataset.metadata.__dict__,
+        "metadata": _json_ready(dataset.metadata),
         "side_channels": side_channels,
+        "dataset_receipt": dataset_receipt_payload(
+            dataset,
+            side_channels=side_channels,
+        ),
         "side_channel_contract": side_channel_contract_payload(dataset, config),
     }
+
+
+def _json_ready(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if is_dataclass(value) and not isinstance(value, type):
+        return _json_ready(asdict(value))
+    if isinstance(value, dict):
+        return {str(key): _json_ready(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_json_ready(item) for item in value]
+    return value
 
 
 def route_backend_payload(model: HybridTinyLM) -> dict[str, Any]:
@@ -770,15 +897,25 @@ def checkpoint_metadata(
     stepper: CompiledPretrainingStep,
     step: int,
     consumed_batches: int | None = None,
+    evaluation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     cursor = dataset.cursor_after(step if consumed_batches is None else consumed_batches)
-    return {
+    cursor_payload = cursor.__dict__
+    payload = {
         "step": step,
         "trained_tokens": stepper.state.trained_tokens,
-        "batch_cursor": cursor.__dict__,
+        "batch_cursor": cursor_payload,
+        "resume_cursor": {
+            "step": step,
+            "trained_tokens": stepper.state.trained_tokens,
+            "batch_cursor": cursor_payload,
+        },
         "training_config": asdict(config),
         "dataset": dataset_payload(dataset, config),
     }
+    if evaluation is not None:
+        payload["evaluation"] = evaluation
+    return payload
 
 
 def save_training_checkpoint(
@@ -791,6 +928,7 @@ def save_training_checkpoint(
     stepper: CompiledPretrainingStep,
     step: int,
     consumed_batches: int | None = None,
+    evaluation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return save_checkpoint(
         model,
@@ -803,6 +941,7 @@ def save_training_checkpoint(
             stepper=stepper,
             step=step,
             consumed_batches=consumed_batches,
+            evaluation=evaluation,
         ),
     )
 
@@ -842,6 +981,7 @@ def eval_payload(
     return {
         "dataset": dataset_payload(dataset, config),
         "requested_batches": config.eval_batches,
+        "planned_batches": planned_batches,
         "evaluated_batches": planned_batches,
         "metrics": asdict(metrics),
     }
@@ -914,25 +1054,37 @@ def train_hybrid_tiny(
     mx.random.seed(config.seed)
 
     resume_metadata: dict[str, Any] | None = None
+    resume_metadata_path: Path | None = None
     resume_step = 0
     resume_trained_tokens = 0
     resume_batch = 0
     if config.resume_from:
-        metadata_path = Path(config.resume_from)
-        if metadata_path.suffix == ".safetensors":
-            metadata_path = metadata_path.with_suffix(".json")
+        resume_metadata_path = Path(config.resume_from)
+        if resume_metadata_path.suffix == ".safetensors":
+            resume_metadata_path = resume_metadata_path.with_suffix(".json")
         else:
-            metadata_path = metadata_path / "metadata.json"
-        if metadata_path.exists():
-            loaded_metadata: dict[str, Any] = json.loads(metadata_path.read_text())
+            resume_metadata_path = resume_metadata_path / "metadata.json"
+        if resume_metadata_path.exists():
+            loaded_metadata: dict[str, Any] = json.loads(
+                resume_metadata_path.read_text()
+            )
             resume_metadata = loaded_metadata
-            resume_step = int(loaded_metadata.get("step") or 0)
-            resume_trained_tokens = int(loaded_metadata.get("trained_tokens") or 0)
-            resume_batch = int(
-                loaded_metadata.get("batch_cursor", {}).get(
-                    "global_batch_offset",
-                    resume_step,
-                )
+            resume_step = metadata_non_negative_int(
+                loaded_metadata,
+                "step",
+                default=0,
+                source=resume_metadata_path,
+            )
+            resume_trained_tokens = metadata_non_negative_int(
+                loaded_metadata,
+                "trained_tokens",
+                default=0,
+                source=resume_metadata_path,
+            )
+            resume_batch = metadata_batch_cursor_offset(
+                loaded_metadata,
+                default=resume_step,
+                source=resume_metadata_path,
             )
 
     dataset = make_dataset(config, path=npz_path, loop=True, resume_batch=resume_batch)
@@ -945,6 +1097,15 @@ def train_hybrid_tiny(
     route_backend = route_backend_payload(model)
     device = device_info()
     compile_plan = compile_payload(config, device)
+    requested_resume_cursor = (
+        {
+            "step": resume_step,
+            "trained_tokens": resume_trained_tokens,
+            "batch_cursor": dataset.cursor_after(0).__dict__,
+        }
+        if config.resume_from
+        else None
+    )
     optimizer = optim.AdamW(
         learning_rate=config.learning_rate,
         weight_decay=config.weight_decay,
@@ -957,6 +1118,8 @@ def train_hybrid_tiny(
         state={"step": resume_step, "trained_tokens": resume_trained_tokens},
     )
     if config.resume_from:
+        if resume_metadata_path is None:
+            raise ValueError("resume metadata path was not resolved")
         training_step = (
             stepper
             if isinstance((resume_metadata or {}).get("training_state"), dict)
@@ -972,16 +1135,28 @@ def train_hybrid_tiny(
             resume_step = stepper.state.step
             resume_trained_tokens = stepper.state.trained_tokens
         else:
-            resume_step = int(resume_metadata.get("step") or resume_step)
-            resume_trained_tokens = int(
-                resume_metadata.get("trained_tokens") or resume_trained_tokens
+            resume_step = metadata_non_negative_int(
+                resume_metadata,
+                "step",
+                default=resume_step,
+                source=resume_metadata_path,
             )
-        resume_batch = int(
-            resume_metadata.get("batch_cursor", {}).get(
-                "global_batch_offset",
-                resume_batch,
+            resume_trained_tokens = metadata_non_negative_int(
+                resume_metadata,
+                "trained_tokens",
+                default=resume_trained_tokens,
+                source=resume_metadata_path,
             )
+        resume_batch = metadata_batch_cursor_offset(
+            resume_metadata,
+            default=resume_batch,
+            source=resume_metadata_path,
         )
+        requested_resume_cursor = {
+            "step": resume_step,
+            "trained_tokens": resume_trained_tokens,
+            "batch_cursor": dataset.cursor_after(0).__dict__,
+        }
     mx.eval(model.state, optimizer.state)
 
     step_metrics = []
@@ -1015,24 +1190,6 @@ def train_hybrid_tiny(
                 }
             )
 
-    final_checkpoint: dict[str, Any] | None = None
-    if config.checkpoint_path:
-        manifest = save_training_checkpoint(
-            model=model,
-            optimizer=optimizer,
-            path=config.checkpoint_path,
-            config=config,
-            dataset=dataset,
-            stepper=stepper,
-            step=stepper.state.step,
-            consumed_batches=stepper.state.step - resume_step,
-        )
-        final_checkpoint = {
-            "path": str(config.checkpoint_path),
-            "step": manifest["step"],
-            "trained_tokens": manifest["trained_tokens"],
-        }
-
     losses = [item["loss"] for item in step_metrics]
     step_times = [item["seconds"] for item in step_metrics]
     tps_values = [item["tokens_per_second"] for item in step_metrics]
@@ -1048,6 +1205,31 @@ def train_hybrid_tiny(
             raise ValueError(f"step_metrics[{index}].ntokens must be positive")
         if int(item["trained_tokens"]) <= 0:
             raise ValueError(f"step_metrics[{index}].trained_tokens must be positive")
+
+    evaluation = eval_payload(
+        model=model,
+        config=config,
+        valid_path=valid_path,
+    )
+
+    final_checkpoint: dict[str, Any] | None = None
+    if config.checkpoint_path:
+        manifest = save_training_checkpoint(
+            model=model,
+            optimizer=optimizer,
+            path=config.checkpoint_path,
+            config=config,
+            dataset=dataset,
+            stepper=stepper,
+            step=stepper.state.step,
+            consumed_batches=stepper.state.step - resume_step,
+            evaluation=evaluation,
+        )
+        final_checkpoint = {
+            "path": str(config.checkpoint_path),
+            "step": manifest["step"],
+            "trained_tokens": manifest["trained_tokens"],
+        }
 
     return {
         "status": "ok",
@@ -1076,11 +1258,7 @@ def train_hybrid_tiny(
         "median_step_time_s": statistics.median(step_times),
         "tokens_per_second": statistics.fmean(tps_values),
         "step_metrics": step_metrics,
-        "evaluation": eval_payload(
-            model=model,
-            config=config,
-            valid_path=valid_path,
-        ),
+        "evaluation": evaluation,
         "resume": {
             "path": config.resume_from,
             "loaded": config.resume_from is not None,
@@ -1089,6 +1267,7 @@ def train_hybrid_tiny(
             "batch_cursor": resume_metadata.get("batch_cursor")
             if resume_metadata
             else None,
+            "resume_cursor": requested_resume_cursor,
         },
         "checkpoints": {
             "save_interval": config.checkpoint_save_interval,
@@ -1179,6 +1358,7 @@ def main(argv: list[str] | None = None) -> int:
             "device": device_info(),
         }
         payload["compile_plan"] = compile_payload(config, payload["device"])
+        payload["compile_enabled"] = payload["compile_plan"]["enabled"]
         print(json.dumps(payload, indent=2, sort_keys=True))
         return 2
 

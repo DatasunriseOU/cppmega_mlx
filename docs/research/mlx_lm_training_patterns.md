@@ -55,36 +55,29 @@ fresh upstream clone is a drift check; `trainer.py` and `datasets.py` matched th
 installed package, while `utils.py` and `tokenizer_utils.py` had small upstream
 drift.
 
-Current external source snapshot, verified 2026-04-30:
+Current external source snapshot, verified 2026-04-30 and W3.5 refreshed
+2026-05-01:
 
-- MLX repo API returned HTTP 200 for `ml-explore/mlx`: default branch `main`,
-  MIT license, updated `2026-04-30T18:24:14Z`, pushed
-  `2026-04-28T16:39:57Z`, 25,877 stars, 1,732 forks; latest release is
-  `v0.31.2`, published `2026-04-22T01:40:04Z`.
-- MLX-LM repo API returned HTTP 200 for `ml-explore/mlx-lm`: default branch
-  `main`, MIT license, updated `2026-04-30T20:14:26Z`, pushed
-  `2026-04-23T13:54:02Z`, 5,096 stars, 634 forks; latest release is
-  `v0.31.3`, published `2026-04-22T07:43:57Z`.
-- MLX-LM `v0.31.3` highlights are bug fixes plus a thread-local generation
-  stream to accompany MLX `v0.31.2`. That is external drift context only; this
-  document keeps the installed `mlx-lm==0.31.2` trainer and stubs as the local
-  execution contract.
-- MLX examples repo API returned HTTP 200 for `ml-explore/mlx-examples`:
-  default branch `main`, MIT license, updated `2026-04-30T20:14:21Z`, pushed
-  `2026-04-06T18:56:05Z`. The contents API showed `transformer_lm`, `llms`,
-  `lora`, `bert`, and `t5` reference directories. These are mechanics
-  references only, not a cppmega trainer dependency.
-- The Hugging Face Apple M4 kernels listing returned HTTP 200 HTML and embedded
-  10 `KernelList` entries. The guessed API endpoint returned HTTP 404 with
-  `Sorry, we can't find the page you are looking for.`
-- A later direct refresh on 2026-04-30 still returned HTTP 200 for the GitHub
-  REST repo and latest-release endpoints above. The Hugging Face Apple M4 HTML
-  listing still returned HTTP 200 with the same 10 embedded entries, and the
-  guessed API endpoint still returned HTTP 404.
+- Prior same-day GitHub REST observations, retained as drift context only,
+  recorded MLX latest release `v0.31.2` published `2026-04-22T01:40:04Z` and
+  MLX-LM latest release `v0.31.3` published `2026-04-22T07:43:57Z`. That is
+  external drift context only; this document keeps the installed
+  `mlx-lm==0.31.2` trainer and stubs as the local execution contract.
+- The W3.5 2026-05-01 GitHub refresh for the MLX and MLX-LM repo/latest-release
+  endpoints returned HTTP 200. Do not make tests depend on mutable star, fork,
+  `updated_at`, or catalog counters.
+- MLX README, MLX-LM README, MLX-LM loss source, and MLX custom Metal kernel
+  docs direct fetches returned HTTP 200.
+- MLX examples are mechanics references only, not a cppmega trainer dependency.
+- The Hugging Face Apple M4 kernels listing returned HTTP 200 HTML and, after
+  HTML-unescaping the embedded `KernelList` payload, still exposed 10 kernel
+  entries. The guessed API endpoint returned HTTP 404 with `Sorry, we can't find
+  the page you are looking for.`
 
 ## Primary Receipts Refresh
 
-Direct primary-source refresh, verified 2026-04-30:
+Direct primary-source refresh, verified 2026-04-30 and rechecked by W3.5 on
+2026-05-01 where noted:
 
 - MLX README direct fetch returned HTTP 200 from
   `https://raw.githubusercontent.com/ml-explore/mlx/main/README.md` and
@@ -96,6 +89,13 @@ Direct primary-source refresh, verified 2026-04-30:
   confirmed it is an Apple Silicon generation/fine-tuning package with HF Hub
   integration, quantization/upload support, low-rank/full fine-tuning, and
   `mx.distributed`.
+- MLX-LM loss source direct fetch returned HTTP 200 from
+  `https://raw.githubusercontent.com/ml-explore/mlx-lm/main/mlx_lm/tuner/losses.py`;
+  it uses `can_run_metal()`, `mx.fast.metal_kernel`, `@mx.custom_function`,
+  and `.vjp` around differentiable KL/JS Metal loss kernels while keeping
+  non-Metal fallback paths. This is a pattern receipt only; it is not permission
+  to move forward-only cppmega Metal kernels into the differentiated training
+  graph.
 - Hugging Face Apple M4 kernel listing direct fetch returned HTTP 200 from
   `https://huggingface.co/kernels?hardware=apple-m4&sort=trending` and showed 10
   entries, including `mlx-rmsnorm`, `mlx-quantization-metal-kernels`,
@@ -106,6 +106,12 @@ Repo decision from these receipts: MLX-LM should remain a source of training
 patterns, not the cppmega trainer base. HF Apple M4 kernels are reference-only
 material and test-fixture candidates; they are not pretraining dependencies and
 do not prove M4 Max parity with GB10.
+
+Final unsupported-claim audit guard: cppmega.mlx is a bounded local MLX training
+port. It is not a full Megatron/CUDA replacement, does not implement
+distributed Megatron parity, does not use MLX-LM as a full trainer integration,
+does not place HF or remote Metal kernels on the training path, and does not
+make any M4-vs-GB10 throughput claim without matched GB10 rows.
 
 ## Bottom Line
 

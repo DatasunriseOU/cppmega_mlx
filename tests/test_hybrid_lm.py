@@ -398,7 +398,7 @@ def test_hybrid_tiny_lm_structure_side_channels_can_affect_logits_when_enabled()
     assert not np.allclose(np.array(before), np.array(after))
 
 
-def test_hybrid_tiny_lm_slices_full_length_structure_side_channels_like_batch_kwargs() -> None:
+def test_hybrid_tiny_lm_requires_direct_structure_side_channels_to_match_inputs() -> None:
     mx.random.seed(71)
     model = HybridTinyLM(
         _hybrid_config(
@@ -425,18 +425,18 @@ def test_hybrid_tiny_lm_slices_full_length_structure_side_channels_like_batch_kw
     )
 
     sliced_logits = model(batch.inputs, **batch.model_kwargs())
-    full_length_logits = model(
-        batch.inputs,
-        structure_ids=batch.structure_ids,
-        dep_levels=batch.dep_levels,
-        ast_depth_ids=batch.ast_depth_ids,
-        sibling_index_ids=batch.sibling_index_ids,
-        node_type_ids=batch.node_type_ids,
-    )
-    mx.eval(sliced_logits, full_length_logits)
+    mx.eval(sliced_logits)
 
-    assert sliced_logits.shape == full_length_logits.shape
-    assert np.allclose(np.array(sliced_logits), np.array(full_length_logits))
+    assert sliced_logits.shape == batch.inputs.shape + (model.config.vocab_size,)
+    with pytest.raises(ValueError, match="structure_ids shape .* must exactly match input_ids shape"):
+        model(
+            batch.inputs,
+            structure_ids=batch.structure_ids,
+            dep_levels=batch.dep_levels,
+            ast_depth_ids=batch.ast_depth_ids,
+            sibling_index_ids=batch.sibling_index_ids,
+            node_type_ids=batch.node_type_ids,
+        )
 
 
 def test_hybrid_tiny_lm_rejects_malformed_direct_structure_side_channels() -> None:
@@ -463,6 +463,7 @@ def test_hybrid_tiny_lm_rejects_malformed_direct_structure_side_channels() -> No
         ("rank", {"structure_ids": mx.zeros((2, 5, 1), dtype=mx.int32)}),
         ("batch", {"dep_levels": mx.zeros((1, 5), dtype=mx.int32)}),
         ("sequence", {"node_type_ids": mx.zeros((2, 4), dtype=mx.int32)}),
+        ("too_long", {"node_type_ids": mx.zeros((2, 6), dtype=mx.int32)}),
     )
 
     for label, replacement in invalid_cases:

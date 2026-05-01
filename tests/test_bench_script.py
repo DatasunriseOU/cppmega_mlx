@@ -60,6 +60,10 @@ def test_dry_run_json_reports_shape_and_device() -> None:
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
     assert payload["status"] == "dry_run"
+    assert payload["receipt_schema_version"] == 1
+    assert payload["receipt_scope"] == "local_only"
+    assert payload["local_only"] is True
+    assert payload["gb10_parity_claim"] is False
     assert payload["tokens_per_step"] == 8
     assert payload["hardware_label"]
     assert payload["dtype"] == "bfloat16"
@@ -87,7 +91,53 @@ def test_dry_run_json_reports_shape_and_device() -> None:
     assert run_metadata["framework"]["mlx"] == payload["device"]["mlx"]
     assert payload["matched_run"] == run_metadata["matched_run"]
     assert payload["matched_run"]["claim_policy"] == "No GB10 parity claim from a single-host row."
+    assert payload["matched_run"]["receipt_scope"] == "local_only"
+    assert payload["matched_run"]["local_only"] is True
+    assert payload["matched_run"]["gb10_parity_claim"] is False
     assert payload["matched_run"]["key"]["dtype"] == "bfloat16"
+    assert payload["matched_run_key"] == payload["workload_key"]
+    assert payload["workload_key"] == payload["matched_run"]["key"]
+    assert payload["software_key"]["framework"] == "mlx"
+    assert payload["software_key"]["backend"] == payload["backend"]
+    assert payload["software_key"]["execution_backend"] == payload["backend"]
+    assert payload["software_key"]["framework_backend"] == "metal"
+    assert payload["software_key"]["python_version"] == payload["device"]["python"]
+    assert payload["software_key"]["platform"] == payload["device"]["platform"]
+    assert payload["software_key"]["machine"] == payload["device"]["machine"]
+    assert payload["software_key"]["mlx_version"] == payload["device"]["mlx"]
+    assert payload["software_key"]["mlx_lm_version"] == payload["device"]["mlx_lm"]
+    assert payload["software_key"]["mlx_metal_version"] == payload["device"]["mlx_metal"]
+    assert payload["software_key"]["default_device"] == payload["device"]["default_device"]
+    assert payload["software_key"]["device_name"] == payload["device"]["mlx_device_info"]["device_name"]
+    assert payload["software_key"]["metal"] == payload["device"]["metal"]
+    assert payload["comparison_key"]["workload"] == payload["workload_key"]
+    assert payload["comparison_key"]["software"] == payload["software_key"]
+    receipt = payload["bench_receipt"]
+    assert receipt["schema_version"] == 1
+    assert receipt["receipt_scope"] == "local_only"
+    assert receipt["local_only"] is True
+    assert receipt["gb10_parity_claim"] is False
+    assert receipt["hardware_label"] == payload["hardware_label"]
+    assert receipt["seq_len"] == payload["seq_len"]
+    assert receipt["batch_size"] == payload["batch_size"]
+    assert receipt["dtype"] == payload["dtype"]
+    assert receipt["warmup_steps"] == payload["warmup_steps"]
+    assert receipt["measured_steps"] == payload["measured_steps"]
+    assert receipt["compile"] == payload["compile"]
+    assert receipt["include_structure"] == payload["include_structure"]
+    assert receipt["software"] == payload["software_key"]
+    assert receipt["workload"] == payload["workload_key"]
+    assert receipt["comparison_key"] == payload["comparison_key"]
+    assert receipt["timing"]["tokens_per_step"] == payload["tokens_per_step"]
+    assert receipt["timing"]["warmup_steps"] == 0
+    assert receipt["timing"]["measured_steps"] == 1
+    assert receipt["timing"]["compile"] is True
+    assert receipt["timing"]["tokens_per_second"] is None
+    assert receipt["timing"]["mean_step_time_s"] is None
+    assert receipt["timing"]["wall_time_s"] is None
+    assert receipt["timing"]["tokens_per_second_or_step_time"] is False
+    assert receipt["timing"]["synchronized_timing"] is None
+    assert "Single-host tiny benchmark receipt only" in receipt["local_only_policy"]
     memory = payload["memory"]
     assert memory["active_bytes"] is None
     assert memory["peak_bytes"] is None
@@ -144,6 +194,10 @@ def test_minimal_real_benchmark_reports_core_metrics() -> None:
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
     assert payload["status"] == "ok"
+    assert payload["receipt_schema_version"] == 1
+    assert payload["receipt_scope"] == "local_only"
+    assert payload["local_only"] is True
+    assert payload["gb10_parity_claim"] is False
     assert payload["config"]["compile"] is False
     assert payload["hardware_label"]
     assert payload["dtype"] == "float32"
@@ -185,6 +239,58 @@ def test_minimal_real_benchmark_reports_core_metrics() -> None:
     assert run_metadata["framework"]["mlx"] == payload["device"]["mlx"]
     assert payload["matched_run"]["key"]["model_source"] == payload["model_source"]
     assert "No GB10 parity claim" in payload["matched_run"]["claim_policy"]
+    assert payload["matched_run"]["receipt_scope"] == "local_only"
+    assert payload["matched_run"]["local_only"] is True
+    assert payload["matched_run"]["gb10_parity_claim"] is False
+    assert payload["matched_run_key"] == payload["workload_key"]
+    assert payload["workload_key"] == payload["matched_run"]["key"]
+    assert payload["software_key"]["framework"] == "mlx"
+    assert payload["software_key"]["backend"] == payload["backend"]
+    assert payload["software_key"]["execution_backend"] == payload["backend"]
+    assert payload["software_key"]["framework_backend"] == "metal"
+    assert payload["software_key"]["mlx_version"] == payload["device"]["mlx"]
+    assert payload["software_key"]["mlx_lm_version"] == payload["device"]["mlx_lm"]
+    assert payload["software_key"]["mlx_metal_version"] == payload["device"]["mlx_metal"]
+    assert payload["software_key"]["default_device"] == payload["device"]["default_device"]
+    assert payload["software_key"]["device_name"] == payload["device"]["mlx_device_info"]["device_name"]
+    assert payload["comparison_key"]["workload"] == payload["workload_key"]
+    assert payload["comparison_key"]["software"] == payload["software_key"]
+    receipt = payload["bench_receipt"]
+    assert receipt["receipt_scope"] == "local_only"
+    assert receipt["local_only"] is True
+    assert receipt["gb10_parity_claim"] is False
+    assert receipt["hardware_label"] == payload["hardware_label"]
+    assert receipt["seq_len"] == payload["seq_len"]
+    assert receipt["batch_size"] == payload["batch_size"]
+    assert receipt["dtype"] == payload["dtype"]
+    assert receipt["warmup_steps"] == payload["warmup_steps"]
+    assert receipt["measured_steps"] == payload["measured_steps"]
+    assert receipt["compile"] == payload["compile"]
+    assert receipt["include_structure"] == payload["include_structure"]
+    assert receipt["tokens_per_second"] == payload["tokens_per_second"]
+    assert receipt["mean_step_time_s"] == payload["mean_step_time_s"]
+    assert receipt["wall_time_s"] == payload["wall_time_s"]
+    assert receipt["mean_wall_time_s"] == payload["mean_wall_time_s"]
+    assert receipt["total_wall_time_s"] == payload["total_wall_time_s"]
+    assert receipt["median_step_time_s"] == payload["median_step_time_s"]
+    assert receipt["software"] == payload["software_key"]
+    assert receipt["workload"] == payload["workload_key"]
+    assert receipt["comparison_key"] == payload["comparison_key"]
+    assert receipt["timing"]["tokens_per_step"] == payload["tokens_per_step"]
+    assert receipt["timing"]["warmup_steps"] == 0
+    assert receipt["timing"]["measured_steps"] == 1
+    assert receipt["timing"]["compile"] is False
+    assert receipt["timing"]["first_call_time_s"] == payload["first_call_time_s"]
+    assert receipt["timing"]["compile_time_s"] == payload["compile_time_s"]
+    assert receipt["timing"]["mean_step_time_s"] == payload["mean_step_time_s"]
+    assert receipt["timing"]["wall_time_s"] == payload["wall_time_s"]
+    assert receipt["timing"]["mean_wall_time_s"] == payload["mean_wall_time_s"]
+    assert receipt["timing"]["total_wall_time_s"] == payload["total_wall_time_s"]
+    assert receipt["timing"]["median_step_time_s"] == payload["median_step_time_s"]
+    assert receipt["timing"]["tokens_per_second"] == payload["tokens_per_second"]
+    assert receipt["timing"]["tokens_per_second_or_step_time"] is True
+    assert receipt["timing"]["synchronized_timing"] is True
+    assert len(receipt["timing"]["step_times_s"]) == 1
     memory = payload["memory"]
     assert memory["active_bytes"] >= 0
     assert memory["peak_bytes"] == payload["peak_memory_bytes"]

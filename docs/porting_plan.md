@@ -37,6 +37,8 @@ full NAM56R readiness or M4 Max parity with GB10.
 - `cppmega_mlx/nn/attention.py`, `cppmega_mlx/nn/mamba3.py`,
   `cppmega_mlx/nn/m2rnn.py`, and `cppmega_mlx/nn/moe.py` provide small MLX
   reference blocks for attention, Mamba3, M2RNN, and MoE smoke coverage.
+  Mamba3 also exposes a source-shaped local cache-state carrier for continuation
+  tests; this is not a Megatron inference-cache integration.
 - `cppmega_mlx/nn/ngram_hash.py` and
   `cppmega_mlx/nn/structure_embedding.py` provide local enrichment modules.
   `HybridTinyLM` uses the source-equivalent structure module and optional
@@ -80,6 +82,10 @@ full NAM56R readiness or M4 Max parity with GB10.
   batch iterables.
 - `cppmega_mlx/training/profile.py` provides synchronized timing and MLX
   active/peak/cache memory snapshots for measured train/eval scopes.
+- Package-root exports are convenience surfaces for local MLX readers,
+  reference blocks, checkpoint/eval/profile helpers, and guarded MLX-LM adapter
+  probes, not full MLX-LM trainer, Megatron distributed runtime, CUDA/TE, or
+  trainable Metal-kernel claims.
 
 ### Scripts And Docs
 
@@ -107,6 +113,9 @@ full NAM56R readiness or M4 Max parity with GB10.
   `docs/research/mlx_lm_training_patterns.md`, and
   `docs/research/apple_kernel_survey.md` record the MLX/MLX-LM/HF kernel
   research basis.
+- `README.md`, this roadmap, `tests/test_package_exports.py`, and
+  `tests/test_external_research_contract.py` keep the public export, research,
+  and documentation contracts aligned with the fail-closed runtime scope.
 
 ## External Framework Decisions
 
@@ -155,14 +164,15 @@ Current decision after the 2026-04-30 MLX/Metal research refresh:
 The current collected test files are:
 
 - `tests/test_attention.py`
-- `tests/test_bench_script.py`
 - `tests/test_bench_matrix.py`
-- `tests/test_compare_bench_rows.py`
+- `tests/test_bench_script.py`
 - `tests/test_checkpoint.py`
+- `tests/test_compare_bench_rows.py`
 - `tests/test_compiled_train.py`
 - `tests/test_config.py`
 - `tests/test_cppmega_parity_anchors.py`
 - `tests/test_eval.py`
+- `tests/test_external_research_contract.py`
 - `tests/test_hybrid_lm.py`
 - `tests/test_hybrid_lm_gradients.py`
 - `tests/test_m2rnn.py`
@@ -173,8 +183,10 @@ The current collected test files are:
 - `tests/test_moe.py`
 - `tests/test_nam56r_pattern.py`
 - `tests/test_ngram_hash.py`
+- `tests/test_package_exports.py`
 - `tests/test_parquet_dataset.py`
 - `tests/test_profile.py`
+- `tests/test_real_parquet_samples.py`
 - `tests/test_structure_embedding.py`
 - `tests/test_tiny_train.py`
 - `tests/test_token_dataset.py`
@@ -218,6 +230,19 @@ The current collected test files are:
 - Full NAM56R readiness is not proven. The repo has config/pattern helpers and a
   tiny hybrid smoke model, not full NAM56R capacity, parallelism, cache
   behavior, data scale, or production performance.
+- Full NAM56R Megatron parity is fail-closed. The local MLX subset does not
+  implement Transformer Engine, CUDA graph capture, NCCL, Triton, TileLang,
+  native MTP, native DSA, sparse MLA, Hopper/GB10 linear-CE kernels, Megatron
+  launcher parity, distributed optimizer, or TP/PP/VPP/EP/SP process-group
+  behavior.
+- Local Mamba3/M2RNN placement is layout-visible only. `M` and `R` routes are
+  tiny MLX reference blocks at the source layer positions; they are not the
+  source `nam56r_full_spec.py`, `nam56r_te_spec.py`, or `nam56r_noconv_spec.py`
+  runtime with TE, Triton scans, TP mixer behavior, or H200/GB10 launch scripts.
+- MoE support is reference-local. The shared/routed expert defaults are
+  regression anchors, but Megatron all-to-all dispatch, grouped GEMM,
+  expert-parallel overlap, selective FP8 MoE, capacity/drop-pad policy, and
+  Transformer Engine dispatcher monkey patches are not implemented.
 - M4 Max vs GB10 parity is not proven. A local M4 benchmark is a local
   regression baseline only until a matched GB10 run exists with the protocol
   below.

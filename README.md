@@ -4,7 +4,9 @@ MLX-native local training port for the cppmega model family on Apple Silicon.
 
 This repository is intentionally not a direct Megatron/CUDA port. It keeps the
 cppmega model contracts, feature semantics, and test ladder while replacing the
-runtime with MLX, MLX-LM patterns, and later Apple Metal kernels.
+runtime with MLX and MLX-LM-derived local patterns. Apple Metal kernels remain
+optional research/prototype seams until differentiated training support is
+proven behind pure-MLX fallbacks.
 
 Current status:
 
@@ -16,6 +18,8 @@ Current status:
 - tiny A/M/E/R hybrid smoke model for route coverage, not full NAM56R
 - benchmark harness for local Apple GPU regression baselines
 - optional prototype Metal kernel seam with pure MLX fallback
+- package-root exports for local MLX subpackages and helper surfaces, not
+  foreign trainer/runtime aliases
 
 Repo hygiene:
 

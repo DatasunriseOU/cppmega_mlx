@@ -20,12 +20,41 @@ CPPMEGA_DSA_A_RANKS_FROM_LAUNCHERS = (1, 2, 3, 5, 6, 7, 9, 10, 11)
 
 CPPMEGA_SOURCE_ANCHORS = (
     "cppmega/megatron/nam56r_layout.py",
+    "cppmega/recipes/nam56r_megatron.py",
+    "cppmega/recipes/megatron_args.py",
+    "cppmega/recipes/nam56r_launch.py",
+    "cppmega/recipes/nam56r_nemo_recipe.py",
+    "cppmega/megatron/nam56r_full_spec.py",
+    "cppmega/megatron/nam56r_te_spec.py",
+    "cppmega/megatron/nam56r_noconv_spec.py",
+    "cppmega/megatron/mamba3_te_stack_spec.py",
     "cppmega/megatron/m2rnn_spec.py",
     "cppmega/megatron/mamba3_te_in_proj.py",
     "cppmega/megatron/mamba3_mixer.py",
+    "cppmega/megatron/mamba3_te_mixer.py",
     "cppmega/features/engram/ngram_hash.py",
     "cppmega/features/structure/embedding.py",
     "cppmega/megatron/custom_embedding.py",
+    "cppmega/megatron/structure_batch.py",
+    "cppmega/megatron/custom_gpt_model.py",
+    "cppmega/megatron/fastmtp_layer.py",
+    "cppmega/megatron/mtp_native_hopper_ce.py",
+    "cppmega/megatron/dsa_local_spec.py",
+    "cppmega/megatron/dsa_sparse_attention.py",
+    "cppmega/megatron/moe_dispatcher_patch.py",
+    "cppmega/megatron/selective_fp8_moe_patch.py",
+    "scripts/data_prep_parquet_to_megatron.py",
+    "scripts/remote_production_h200_nam56r_v1.sh",
+    "scripts/remote_sweep_h200_dsa_production.sh",
+    "scripts/remote_smoke_h200_dsa_9_4_m.sh",
+    "scripts/remote_smoke_h200_nam56r_k_pp1.sh",
+    "scripts/remote_train_gb10_nam56r_single.sh",
+    "scripts/remote_train_h200_nam56r_full.sh",
+    "scripts/remote_train_h200_nam56r_lite.sh",
+    "scripts/remote_train_h200_nam56r_grid.sh",
+    "scripts/remote_train_h200_nam56r_tp2.sh",
+    "scripts/remote_train_h200_nam56r_noconv.sh",
+    "scripts/remote_train_h200_nam56r_europe_sweep.sh",
 )
 
 
@@ -124,6 +153,71 @@ def test_cppmega_source_reference_anchors_are_documented():
 
     for source_path in CPPMEGA_SOURCE_ANCHORS:
         assert source_path in doc
+
+
+def test_parity_docs_keep_runtime_anchor_claims_fail_closed():
+    doc = (_repo_root() / "docs" / "parity_anchors.md").read_text()
+    porting = (_repo_root() / "docs" / "porting_plan.md").read_text()
+    combined = f"{doc}\n{porting}"
+    normalized = " ".join(combined.split())
+
+    assert "Full NAM56R Megatron Recipe/Runtime Anchors" in doc
+    assert "The source converter writes only `token_ids`" in doc
+    assert "H200 scripts are source/runtime anchors for `../cppmega`" in doc
+    assert "not MLX-supported launchers" in normalized
+    assert "local/tiny/partial" in doc
+    assert "distributed Megatron behavior remains outside the MLX scaffold" in doc
+    assert "distributed Megatron parity is not claimed" in doc
+    assert "M4 Max vs GB10 parity is not proven" in combined
+
+    unsupported_surfaces = (
+        "Transformer Engine",
+        "CUDA graph",
+        "NCCL",
+        "Triton",
+        "TileLang",
+        "native MTP",
+        "native DSA",
+        "sparse MLA",
+        "Hopper/GB10",
+        "TP/PP/VPP/EP/SP",
+        "distributed optimizer",
+    )
+    for surface in unsupported_surfaces:
+        assert surface in combined
+
+    forbidden_overclaims = (
+        "MLX supports full NAM56R",
+        "MLX launcher supports H200",
+        "GB10 parity is proven",
+        "M4 Max parity with GB10 is proven",
+        "M4 Max matches GB10",
+        "M4-only rows prove GB10 parity",
+        "distributed Megatron parity is proven",
+        "full distributed Megatron parity",
+        "H200 launchers are supported by cppmega.mlx",
+    )
+    for phrase in forbidden_overclaims:
+        assert phrase not in combined
+
+
+def test_mamba_m2rnn_perf_doc_does_not_overclaim_nam56r_runtime_parity():
+    doc = (_repo_root() / "docs" / "perf_mamba_m2rnn.md").read_text()
+
+    assert "source `M` layers map to Mamba3 positions" in doc
+    assert "source `R` layers map to M2RNN" in doc
+    assert "`nam56r_full_spec.py`" in doc
+    assert "native MLA/MTP/DSA" in doc
+    assert "H200/GB10 train launchers" in doc
+
+    forbidden_overclaims = (
+        "Mamba3 NAM56R performance parity is proven",
+        "M2RNN NAM56R performance parity is proven",
+        "Mamba3 matches GB10",
+        "M2RNN matches GB10",
+    )
+    for phrase in forbidden_overclaims:
+        assert phrase not in doc
 
 
 def test_cppmega_source_reference_files_exist_when_checkout_is_present():

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from typing import Any
 
 import mlx.core as mx
 import numpy as np
@@ -95,3 +96,20 @@ def test_evaluate_batches_rejects_empty_iterable() -> None:
 
     with pytest.raises(ValueError, match="at least one batch"):
         evaluate_batches(model, [])
+
+
+def test_evaluate_batches_rejects_zero_token_loss_results() -> None:
+    model = TinyLM(_tiny_config())
+    batch = synthetic_token_batch(
+        batch_size=1,
+        seq_length=6,
+        vocab_size=model.config.vocab_size,
+        seed=13,
+        include_structure=False,
+    )
+
+    def zero_token_loss(_model: Any, _batch: Any) -> tuple[mx.array, mx.array]:
+        return mx.array(0.0, dtype=mx.float32), mx.array(0, dtype=mx.int32)
+
+    with pytest.raises(ValueError, match="zero tokens"):
+        evaluate_batches(model, [batch], loss_fn=zero_token_loss)

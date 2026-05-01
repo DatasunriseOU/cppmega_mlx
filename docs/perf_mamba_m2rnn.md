@@ -5,6 +5,13 @@ It is not GB10 parity evidence. Use it only to catch route/backend/device
 metadata regressions and large local performance changes in the Mamba3 and
 M2RNN routes.
 
+The NAM56R source placement contract is stricter than these tiny receipts:
+source `M` layers map to Mamba3 positions and source `R` layers map to M2RNN
+positions in the `AEMEAEMEAEMR` depth-52 layout, but the local rows below do not
+exercise `nam56r_full_spec.py`, `nam56r_te_spec.py`, `nam56r_noconv_spec.py`,
+Transformer Engine, Triton scans, TP mixer behavior, native MLA/MTP/DSA, or
+H200/GB10 train launchers.
+
 `/Users/dave/.codex/prompts/executor.md` was checked for this executor-style
 subtask.
 
@@ -56,12 +63,24 @@ GB10 rows unless both sides were collected with identical
 `comparison_key.workload` and `comparison_key.software` values. That guard must
 cover the route workload and the software stack, including framework/backend,
 Python, platform, MLX, MLX-LM, and MLX-Metal metadata.
+Matrix receipts are explicit about that limitation: summary rows, per-case
+rows, `matched_run`, and `bench_receipt` carry `receipt_scope: local_only`,
+`local_only: true`, and `gb10_parity_claim: false` until a matched GB10 row is
+present.
 
 The comparison parser also accepts receipt-only exports where the workload,
 software, and timing fields live under `bench_receipt`. Those rows still require
 identical nested workload and software keys before a ratio is emitted. In
 particular, parquet data labels such as `parquet_clang_v10_code` must stay in
 the workload key and must not be compared to `synthetic_tokens` smoke rows.
+If a copied row contains multiple modern key sources, such as top-level
+`comparison_key` plus `bench_receipt.comparison_key`, the sources must agree
+inside the row. Conflicting row-local key sources are refusal evidence, not a
+tie-breaker for producing ratios.
+When forwarding Mamba3/M2RNN rows for GB10 comparison, run
+`scripts/compare_bench_rows.py --package-dir ...` and archive the package.
+`matched_comparisons.jsonl` is the only ratio-bearing artifact; refused pairs are
+kept separately as mismatch evidence.
 
 ## Training Smoke Receipts
 
@@ -189,6 +208,21 @@ produces finite gradients and an AdamW update for the M2RNN input projection,
 state transition, learned decay parameters, residual `D`, gate norm, and output
 projection inside `HybridTinyLM`.
 
+The local mixer also has a value-level regression for the source-compatible
+output gate broadcast used by `m2rnn_spec.py`: `g` is flattened to
+`num_g_heads * v_head_dim`, repeated along the final feature axis to
+`num_heads * v_head_dim`, passed through SiLU, then applied before gate norm and
+output projection. This intentionally differs from repeating full
+`v_head_dim` head vectors along a head axis.
+
+The M2RNN `h0` seam is recurrence state only. It guarantees split equivalence
+for `m2rnn_scan` and `chunked_m2rnn_scan`, where `q/k/v/xf` are already formed,
+and for the lightweight mixer only when there is no causal-conv history to carry
+(`conv_kernel=1`). With `conv_kernel > 1`, full hidden-state split equivalence
+would require a separate q/k/v causal-conv tail cache; the local mixer currently
+matches the sibling Megatron training seam by recomputing suffix convolution
+with fresh left padding instead of accepting an inference cache.
+
 No fused Metal M2RNN kernel was added in this slice. MLX exposes custom Metal
 kernels, but a training-safe recurrent kernel would need a matching backward
 path/custom VJP before replacing the current `nn.value_and_grad` route.
@@ -200,6 +234,16 @@ projection contract `[z | x | B | C | dd_dt | dd_A | trap | angles]` intact and
 uses a bounded source-order MLX diagonal recurrence. The helper caps internal
 sub-chunks at 32 tokens to bound Python work, carries only the final state
 between chunks, and preserves explicit `h0` continuation semantics.
+
+The 2026-05-01 continuation slice adds a batch-shaped local cache carrier for
+the source Mamba3 `(angle_dt, ssm, k, v)` allocator contract. The MLX block can
+validate those four tensors, seed continuation from `cache.ssm`, accumulate the
+RoPE angle offset from `cache.angle_dt`, and return finite final `angle_dt`,
+`ssm`, `k`, and `v` tensors with source-compatible shapes. This is deliberately
+not a Megatron inference-cache integration and does not claim arbitrary
+full-prompt versus split-prompt equality: the local reference still does not
+carry a causal-conv tail or trapezoidal `dt[t + 1]` boundary lookahead in the
+cache.
 
 No fused Metal Mamba3 scan kernel was added in this slice. The installed local
 MLX stack exposes `mx.fast.metal_kernel` and `mx.custom_function` but no

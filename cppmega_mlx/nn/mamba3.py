@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Literal, overload
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -121,6 +122,16 @@ class Mamba3InProjDims:
         ]
 
 
+@dataclass(frozen=True)
+class Mamba3CacheState:
+    """Batch-shaped local mirror of source Mamba3 ``(angle_dt, ssm, k, v)`` cache."""
+
+    angle_dt: mx.array
+    ssm: mx.array
+    k: mx.array
+    v: mx.array
+
+
 def compute_num_rope_angles(d_state: int, rope_fraction: float) -> int:
     split_tensor_size = int(d_state * rope_fraction)
     if split_tensor_size % 2 != 0:
@@ -234,6 +245,21 @@ def _apply_rope_on_state_dim(tensor: mx.array, angles_cumsum: mx.array) -> mx.ar
     if rot_dim == d_state:
         return rotated
     return mx.concatenate([rotated, tensor[..., rot_dim:]], axis=-1)
+
+
+def _expand_mimo_rank_to_heads(tensor: mx.array, nheads: int, name: str) -> mx.array:
+    """Expand grouped MIMO B/C tensors from ``(B,S,R,G,N)`` to ``(B,S,R,H,N)``."""
+
+    if tensor.ndim != 5:
+        raise ValueError(f"{name} must be shaped (B,S,R,G,N), got {tensor.shape}")
+    groups = tensor.shape[3]
+    if groups <= 0:
+        raise ValueError(f"{name} group count must be positive, got {groups}")
+    if nheads % groups != 0:
+        raise ValueError(f"{name} group count {groups} must divide nheads {nheads}")
+    if groups == nheads:
+        return tensor
+    return mx.repeat(tensor, repeats=nheads // groups, axis=3)
 
 
 def causal_depthwise_conv1d(x: mx.array, weight: mx.array, bias: mx.array | None = None) -> mx.array:
@@ -393,17 +419,88 @@ class Mamba3ReferenceBlock(nn.Module):
         v_shape = (cfg.nheads, cfg.headdim)
         return (angle_shape, ssm_shape, k_shape, v_shape)
 
+    def zero_cache_state(
+        self,
+        batch: int,
+        *,
+        dtype: mx.Dtype = mx.float32,
+    ) -> Mamba3CacheState:
+        """Return a batch-shaped zero cache matching the source per-request contract."""
+
+        _require_positive_int("batch", batch)
+        angle_shape, ssm_shape, k_shape, v_shape = self.mamba_state_shapes_per_request()
+        return Mamba3CacheState(
+            angle_dt=mx.zeros((batch, *angle_shape), dtype=dtype),
+            ssm=mx.zeros((batch, *ssm_shape), dtype=dtype),
+            k=mx.zeros((batch, *k_shape), dtype=dtype),
+            v=mx.zeros((batch, *v_shape), dtype=dtype),
+        )
+
+    def _validate_cache_state(
+        self,
+        cache: Mamba3CacheState,
+        *,
+        batch: int,
+        dtype: mx.Dtype,
+    ) -> None:
+        angle_shape, ssm_shape, k_shape, v_shape = self.mamba_state_shapes_per_request()
+        expected_shapes = {
+            "angle_dt": (batch, *angle_shape),
+            "ssm": (batch, *ssm_shape),
+            "k": (batch, *k_shape),
+            "v": (batch, *v_shape),
+        }
+        values = {
+            "angle_dt": cache.angle_dt,
+            "ssm": cache.ssm,
+            "k": cache.k,
+            "v": cache.v,
+        }
+        for name, value in values.items():
+            expected = expected_shapes[name]
+            if value.shape != expected:
+                raise ValueError(f"cache.{name} must have shape {expected}, got {value.shape}")
+            if value.dtype != dtype:
+                raise ValueError(f"cache.{name} must have dtype {dtype}, got {value.dtype}")
+
+    @overload
     def __call__(
         self,
         hidden_states: mx.array,
         *,
         h0: mx.array | None = None,
-    ) -> tuple[mx.array, mx.array]:
+        cache: Mamba3CacheState | None = None,
+        return_cache: Literal[False] = False,
+    ) -> tuple[mx.array, mx.array]: ...
+
+    @overload
+    def __call__(
+        self,
+        hidden_states: mx.array,
+        *,
+        h0: mx.array | None = None,
+        cache: Mamba3CacheState | None = None,
+        return_cache: Literal[True],
+    ) -> tuple[mx.array, Mamba3CacheState]: ...
+
+    def __call__(
+        self,
+        hidden_states: mx.array,
+        *,
+        h0: mx.array | None = None,
+        cache: Mamba3CacheState | None = None,
+        return_cache: bool = False,
+    ) -> tuple[mx.array, mx.array] | tuple[mx.array, Mamba3CacheState]:
         if hidden_states.ndim != 3:
             raise ValueError(f"hidden_states must be shaped (B,S,D), got {hidden_states.shape}")
+        if h0 is not None and cache is not None:
+            raise ValueError("pass either h0 or cache, not both")
 
         cfg = self.config
         batch, seq, _ = hidden_states.shape
+        if cache is not None:
+            self._validate_cache_state(cache, batch=batch, dtype=hidden_states.dtype)
+
         z, x, B, C, dd_dt, dd_A, trap, angles = self.split_in_proj(self.in_proj(hidden_states))
 
         xBC = mx.concatenate([x, B, C], axis=-1)
@@ -416,11 +513,11 @@ class Mamba3ReferenceBlock(nn.Module):
         x = x.reshape(batch, seq, cfg.nheads, cfg.headdim)
         z = z.reshape(batch, seq, cfg.nheads, cfg.headdim)
 
-        B = B.reshape(batch, seq, cfg.effective_mimo_rank, cfg.ngroups, cfg.d_state)
-        C = C.reshape(batch, seq, cfg.effective_mimo_rank, cfg.ngroups, cfg.d_state)
-        B, C = self.transform_bc(B, C)
-        B = mx.mean(B, axis=2)
-        C = mx.mean(C, axis=2)
+        B_mimo = B.reshape(batch, seq, cfg.effective_mimo_rank, cfg.ngroups, cfg.d_state)
+        C_mimo = C.reshape(batch, seq, cfg.effective_mimo_rank, cfg.ngroups, cfg.d_state)
+        B_mimo, C_mimo = self.transform_bc(B_mimo, C_mimo)
+        B = mx.mean(B_mimo, axis=2)
+        C = mx.mean(C_mimo, axis=2)
 
         dt = nn.softplus(dd_dt + self.dt_bias.astype(dd_dt.dtype))
         trap_scale = _compute_trapezoidal_scale(dt, trap)
@@ -431,20 +528,44 @@ class Mamba3ReferenceBlock(nn.Module):
             (batch, seq, cfg.nheads, self.dims.num_rope_angles),
         )
         angles_cumsum = mx.cumsum(angles * dt[:, :, :, None], axis=1)
+        if cache is not None:
+            angles_cumsum = angles_cumsum + cache.angle_dt[:, None, :, :].astype(angles_cumsum.dtype)
         B = _apply_rope_on_state_dim(B, angles_cumsum)
         C = _apply_rope_on_state_dim(C, angles_cumsum)
 
+        B_mimo_heads = _expand_mimo_rank_to_heads(B_mimo, cfg.nheads, "B_mimo")
+        k_cache_source = _apply_rope_on_state_dim(
+            B_mimo_heads.reshape(
+                batch,
+                seq * cfg.effective_mimo_rank,
+                cfg.nheads,
+                cfg.d_state,
+            ),
+            mx.repeat(angles_cumsum, repeats=cfg.effective_mimo_rank, axis=1),
+        ).reshape(
+            batch,
+            seq,
+            cfg.effective_mimo_rank,
+            cfg.nheads,
+            cfg.d_state,
+        )
         B = _broadcast_groups_to_heads(B, cfg.nheads, "B")
         C = _broadcast_groups_to_heads(C, cfg.nheads, "C")
 
         A = mx.minimum(-nn.softplus(dd_A), -cfg.A_floor)
 
-        if h0 is None:
+        if cache is not None:
+            h = cache.ssm
+        elif h0 is None:
             h = mx.zeros((batch, cfg.nheads, cfg.headdim, cfg.d_state), dtype=hidden_states.dtype)
         else:
             expected = (batch, cfg.nheads, cfg.headdim, cfg.d_state)
             if h0.shape != expected:
                 raise ValueError(f"h0 must have shape {expected}, got {h0.shape}")
+            if h0.dtype != hidden_states.dtype:
+                raise TypeError(
+                    f"h0 dtype {h0.dtype} must match hidden_states dtype {hidden_states.dtype}"
+                )
             h = h0
 
         log_decay = (A * dt)[:, :, :, None, None]
@@ -463,11 +584,35 @@ class Mamba3ReferenceBlock(nn.Module):
             chunk_size=cfg.chunk_size,
         )
         y = y.reshape(batch, seq, cfg.d_inner)
-        return self.out_proj(y), h
+        out = self.out_proj(y)
+        if not return_cache:
+            return out, h
+
+        if seq == 0:
+            if cache is not None:
+                next_cache = cache
+            else:
+                next_cache = self.zero_cache_state(batch, dtype=hidden_states.dtype)
+                if h0 is not None:
+                    next_cache = Mamba3CacheState(
+                        angle_dt=next_cache.angle_dt,
+                        ssm=h,
+                        k=next_cache.k,
+                        v=next_cache.v,
+                    )
+        else:
+            next_cache = Mamba3CacheState(
+                angle_dt=mx.remainder(angles_cumsum[:, -1], 2.0 * math.pi),
+                ssm=h,
+                k=k_cache_source[:, -1],
+                v=x[:, -1],
+            )
+        return out, next_cache
 
 
 __all__ = [
     "DEFAULT_CHUNK_SIZE",
+    "Mamba3CacheState",
     "Mamba3Config",
     "Mamba3InProjDims",
     "Mamba3ReferenceBlock",

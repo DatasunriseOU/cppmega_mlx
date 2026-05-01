@@ -18,6 +18,19 @@ explicit workload key and selected explicit software key must also be identical
 as complete machine-readable objects. If a GB10 row carries an extra software
 flag, a different data-contract label, or any other key-only distinction that
 normalizes to the same top-level fields, the comparison remains unmatched.
+When modern key sources coexist inside one row, they must agree with each other
+before the row is usable. For example, top-level `comparison_key`,
+`bench_receipt.comparison_key`, and `workload_key` plus `software_key` are
+checked as redundant provenance. If they disagree, the report increments
+`matched_comparison_key_conflict_counts`, marks the row as missing a usable
+matched comparison key, and refuses ratios. The legacy `matched_run.key` plus
+`run_metadata.framework` path is fallback provenance only when no modern key
+source exists.
+
+Local Apple Silicon matrix receipts also carry `receipt_scope: local_only`,
+`local_only: true`, and `gb10_parity_claim: false`. These markers are not a
+replacement for the matched-row guard; they are a visible reminder that a local
+M4 row by itself is single-host evidence.
 
 ## Exact Workload Fields
 
@@ -106,12 +119,17 @@ keys by hand to force a match.
 
 ./.venv/bin/python scripts/compare_bench_rows.py \
   --input runs/m4max_matrix.json \
-  --input runs/gb10_matrix.json > runs/matched_compare.json
+  --input runs/gb10_matrix.json \
+  --package-dir runs/gb10_matched_package > runs/matched_compare.json
 ```
 
 If the final status is `no_matching_rows` or `insufficient_matched_rows`, keep
 the output as refusal evidence and describe the mismatched keys instead of
 reporting a ratio. A valid ratio appears only under `comparisons[*].ratios`.
+The package directory is the durable handoff artifact: `manifest.json` records
+the guard status and input paths, `compare_report.json` keeps the guard/refusal
+summary without ratios, `matched_comparisons.jsonl` is the only ratio-bearing
+JSONL file, and `refused_pairs.jsonl` is mismatch evidence only.
 
 ## Parquet Samples
 

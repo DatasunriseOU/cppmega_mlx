@@ -89,6 +89,7 @@ class MegatronIndexedMetadata:
 
     bin_path: Path
     idx_path: Path | None
+    metadata_path: Path | None
     dtype: str
     sequence_count: int
     document_count: int
@@ -193,6 +194,7 @@ class MegatronIndexedDataset:
         self.index_metadata = MegatronIndexedMetadata(
             bin_path=self.bin_path,
             idx_path=self.idx_path if self.idx_path and self.idx_path.exists() else None,
+            metadata_path=resolved.metadata_path,
             dtype=self._dtype.name,
             sequence_count=int(sequence_lengths.shape[0]),
             document_count=document_count,

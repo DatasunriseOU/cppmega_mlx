@@ -28,6 +28,7 @@ TRAINER_API_NAMES = (
     "iterate_batches",
     "evaluate",
     "train",
+    "grad_checkpoint",
 )
 REQUIRED_TRAINER_PARAMETERS: dict[str, tuple[str, ...]] = {
     "TrainingArgs": (
@@ -40,7 +41,14 @@ REQUIRED_TRAINER_PARAMETERS: dict[str, tuple[str, ...]] = {
     "iterate_batches": ("dataset", "batch_size", "max_seq_length"),
     "evaluate": ("model", "dataset", "batch_size", "num_batches", "loss"),
     "train": ("model", "optimizer", "train_dataset", "args", "loss", "iterate_batches"),
+    "grad_checkpoint": ("layer",),
 }
+TRAINING_ARGS_MEMORY_POLICY_FIELDS = (
+    "grad_checkpoint",
+    "grad_accumulation_steps",
+    "clear_cache_threshold",
+)
+TRAINER_ADAPTER_SAVE_FIELDS = ("adapter_file",)
 STRUCTURE_FIELD_NAMES = (
     "structure_ids",
     "dep_levels",
@@ -322,7 +330,9 @@ __all__ = [
     "MLXLMTrainerIntegrationUnsupported",
     "REQUIRED_TRAINER_PARAMETERS",
     "STRUCTURE_FIELD_NAMES",
+    "TRAINER_ADAPTER_SAVE_FIELDS",
     "TRAINER_API_NAMES",
+    "TRAINING_ARGS_MEMORY_POLICY_FIELDS",
     "TRAINER_MODULE",
     "UNSUPPORTED_TRAINER_INTEGRATION_REASON",
     "as_mlx_lm_loss_args",

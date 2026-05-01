@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from itertools import product
 from pathlib import Path
@@ -18,7 +18,7 @@ for path in (ROOT, SCRIPT_DIR):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from bench_tiny import (
+from bench_tiny import (  # noqa: E402
     MODEL_ROUTES,
     BenchConfig,
     default_hardware_label,
@@ -124,6 +124,12 @@ LOCAL_BASELINE_POLICY = (
     "This archive is a local M4 baseline/regression ledger only. It does not "
     "contain a GB10 parity claim; run scripts/compare_bench_rows.py on matched "
     "M4 and GB10 rows before reporting any cross-host ratio."
+)
+LOCAL_RECEIPT_SCOPE = "local_only"
+LOCAL_ONLY_RECEIPT_POLICY = (
+    "Single-host matrix receipt only; not M4-vs-GB10 parity evidence. "
+    "Cross-host ratios require matched M4 and GB10 rows with identical "
+    "comparison_key.workload and comparison_key.software values."
 )
 
 
@@ -372,6 +378,9 @@ def _augment_metrics(
     alias_metadata = _route_alias_metadata(route, str(metrics.get("model_route") or ""))
     bench_receipt = {
         "schema_version": BENCH_RECEIPT_SCHEMA_VERSION,
+        "receipt_scope": LOCAL_RECEIPT_SCOPE,
+        "local_only": True,
+        "gb10_parity_claim": False,
         "hardware_label": metrics.get("hardware_label"),
         "profile": profile,
         "route": route,
@@ -402,10 +411,31 @@ def _augment_metrics(
         "comparison_key": comparison_key,
         "matched_run_guard": MATCHED_RUN_GUARD,
         "parity_claim_policy": MATRIX_MATCHED_RUN_POLICY,
+        "local_only_policy": LOCAL_ONLY_RECEIPT_POLICY,
+    }
+    matrix_matched_run = {
+        **matched_run,
+        "key": matched_key,
+        "receipt_scope": LOCAL_RECEIPT_SCOPE,
+        "local_only": True,
+        "gb10_parity_claim": False,
+        "guard": (
+            "Compare M4 Max and GB10 only when both rows were collected "
+            "with identical comparison_key.workload and "
+            "comparison_key.software."
+        ),
+    }
+    matrix_run_metadata = {
+        **run_metadata,
+        "matched_run": matrix_matched_run,
     }
     return {
+        **case_metrics,
         "case_id": case_id,
         "receipt_schema_version": BENCH_RECEIPT_SCHEMA_VERSION,
+        "receipt_scope": LOCAL_RECEIPT_SCOPE,
+        "local_only": True,
+        "gb10_parity_claim": False,
         "profile": profile,
         "route": route,
         **alias_metadata,
@@ -418,16 +448,8 @@ def _augment_metrics(
         "matched_run_guard": MATCHED_RUN_GUARD,
         "bench_receipt": bench_receipt,
         "profile_hooks": profile_hooks,
-        **case_metrics,
-        "matched_run": {
-            **matched_run,
-            "key": matched_key,
-            "guard": (
-                "Compare M4 Max and GB10 only when both rows were collected "
-                "with identical comparison_key.workload and "
-                "comparison_key.software."
-            ),
-        },
+        "matched_run": matrix_matched_run,
+        "run_metadata": matrix_run_metadata,
     }
 
 
@@ -493,6 +515,9 @@ def run_matrix(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "schema_version": BENCH_RECEIPT_SCHEMA_VERSION,
         "receipt_schema_version": BENCH_RECEIPT_SCHEMA_VERSION,
+        "receipt_scope": LOCAL_RECEIPT_SCOPE,
+        "local_only": True,
+        "gb10_parity_claim": False,
         "status": "dry_run" if args.dry_run_json else "ok",
         "hardware_label": args.hardware_label,
         "case_count": len(cases),
@@ -501,6 +526,7 @@ def run_matrix(args: argparse.Namespace) -> dict[str, Any]:
         "matched_run_guard": "GB10 parity requires matched rows, not max-throughput cherry-picks.",
         "matched_run_policy": MATRIX_MATCHED_RUN_POLICY,
         "parity_claim_policy": MATRIX_MATCHED_RUN_POLICY,
+        "local_only_policy": LOCAL_ONLY_RECEIPT_POLICY,
         "required_receipt_fields": list(REQUIRED_RECEIPT_FIELDS),
         "cases": cases,
     }
@@ -515,6 +541,9 @@ def _archive_row(case: dict[str, Any]) -> dict[str, Any]:
     return {
         "schema_version": BASELINE_RECORD_SCHEMA_VERSION,
         "kind": BASELINE_RECORD_KIND,
+        "receipt_scope": LOCAL_RECEIPT_SCOPE,
+        "local_only": True,
+        "gb10_parity_claim": False,
         "case_id": case["case_id"],
         "status": case["status"],
         "hardware_label": case["hardware_label"],
@@ -535,6 +564,8 @@ def _archive_row(case: dict[str, Any]) -> dict[str, Any]:
         "guards": {
             "matched_run_guard": MATCHED_RUN_GUARD,
             "parity_claim_policy": LOCAL_BASELINE_POLICY,
+            "local_only_policy": LOCAL_ONLY_RECEIPT_POLICY,
+            "local_only": True,
             "gb10_parity_claim": False,
         },
     }
@@ -550,6 +581,9 @@ def build_baseline_record(
     return {
         "schema_version": BASELINE_RECORD_SCHEMA_VERSION,
         "kind": BASELINE_RECORD_KIND,
+        "receipt_scope": LOCAL_RECEIPT_SCOPE,
+        "local_only": True,
+        "gb10_parity_claim": False,
         "recorded_at_utc": recorded_at,
         "hardware_label": summary["hardware_label"],
         "status": summary["status"],
@@ -571,6 +605,8 @@ def build_baseline_record(
             "matched_run_guard": summary["matched_run_guard"],
             "matched_run_policy": summary["matched_run_policy"],
             "parity_claim_policy": LOCAL_BASELINE_POLICY,
+            "local_only_policy": LOCAL_ONLY_RECEIPT_POLICY,
+            "local_only": True,
             "gb10_parity_claim": False,
         },
         "rows": [_archive_row(case) for case in summary["cases"]],
@@ -581,15 +617,89 @@ def _new_archive(created_at_utc: str) -> dict[str, Any]:
     return {
         "schema_version": BASELINE_ARCHIVE_SCHEMA_VERSION,
         "kind": BASELINE_ARCHIVE_KIND,
+        "receipt_scope": LOCAL_RECEIPT_SCOPE,
+        "local_only": True,
+        "gb10_parity_claim": False,
         "created_at_utc": created_at_utc,
         "updated_at_utc": created_at_utc,
         "records": [],
         "guards": {
             "parity_claim_policy": LOCAL_BASELINE_POLICY,
+            "local_only_policy": LOCAL_ONLY_RECEIPT_POLICY,
+            "local_only": True,
             "gb10_parity_claim": False,
             "matched_run_guard": MATCHED_RUN_GUARD,
         },
     }
+
+
+def _validate_local_only_guards(
+    obj: dict[str, Any],
+    *,
+    label: str,
+    require_scope: bool = True,
+) -> None:
+    if require_scope and obj.get("receipt_scope") != LOCAL_RECEIPT_SCOPE:
+        raise ValueError(f"{label} receipt_scope must be {LOCAL_RECEIPT_SCOPE!r}")
+    if obj.get("local_only") is not True:
+        raise ValueError(f"{label} local_only must be true")
+    if obj.get("gb10_parity_claim") is not False:
+        raise ValueError(f"{label} gb10_parity_claim must be false")
+
+
+def _validate_existing_archive(archive: dict[str, Any]) -> None:
+    _validate_local_only_guards(archive, label="baseline archive")
+    guards = archive.get("guards")
+    if not isinstance(guards, dict):
+        raise ValueError("baseline archive guards must be an object")
+    _validate_local_only_guards(guards, label="baseline archive guards", require_scope=False)
+    records = archive.get("records")
+    if not isinstance(records, list):
+        raise ValueError("baseline archive records must be a list")
+    for index, record in enumerate(records):
+        if not isinstance(record, dict):
+            raise ValueError(f"baseline archive record {index} must be an object")
+        _validate_local_only_guards(record, label=f"baseline archive record {index}")
+        record_guards = record.get("guards")
+        if not isinstance(record_guards, dict):
+            raise ValueError(f"baseline archive record {index} guards must be an object")
+        _validate_local_only_guards(
+            record_guards,
+            label=f"baseline archive record {index} guards",
+            require_scope=False,
+        )
+        rows = record.get("rows")
+        if not isinstance(rows, list):
+            raise ValueError(f"baseline archive record {index} rows must be a list")
+        for row_index, row in enumerate(rows):
+            if not isinstance(row, dict):
+                raise ValueError(
+                    f"baseline archive record {index} row {row_index} must be an object"
+                )
+            _validate_local_only_guards(
+                row,
+                label=f"baseline archive record {index} row {row_index}",
+            )
+            row_guards = row.get("guards")
+            if not isinstance(row_guards, dict):
+                raise ValueError(
+                    f"baseline archive record {index} row {row_index} guards must be an object"
+                )
+            _validate_local_only_guards(
+                row_guards,
+                label=f"baseline archive record {index} row {row_index} guards",
+                require_scope=False,
+            )
+            receipt = row.get("bench_receipt")
+            if not isinstance(receipt, dict):
+                raise ValueError(
+                    f"baseline archive record {index} row {row_index} bench_receipt "
+                    "must be an object"
+                )
+            _validate_local_only_guards(
+                receipt,
+                label=f"baseline archive record {index} row {row_index} bench_receipt",
+            )
 
 
 def _load_archive(path: Path, *, now_utc: str) -> dict[str, Any]:
@@ -603,8 +713,7 @@ def _load_archive(path: Path, *, now_utc: str) -> dict[str, Any]:
         )
     if archive.get("kind") != BASELINE_ARCHIVE_KIND:
         raise ValueError(f"unsupported baseline archive kind {archive.get('kind')!r}")
-    if not isinstance(archive.get("records"), list):
-        raise ValueError("baseline archive records must be a list")
+    _validate_existing_archive(archive)
     return archive
 
 
@@ -623,6 +732,8 @@ def write_baseline_archive(
     archive["guards"] = {
         **(archive.get("guards") or {}),
         "parity_claim_policy": LOCAL_BASELINE_POLICY,
+        "local_only_policy": LOCAL_ONLY_RECEIPT_POLICY,
+        "local_only": True,
         "gb10_parity_claim": False,
         "matched_run_guard": MATCHED_RUN_GUARD,
     }
@@ -651,6 +762,10 @@ def print_human(summary: dict[str, Any]) -> None:
     print(f"status: {summary['status']}")
     print(f"hardware_label: {summary['hardware_label']}")
     print(f"case_count: {summary['case_count']}")
+    print(f"receipt_scope: {summary['receipt_scope']}")
+    print(f"local_only: {summary['local_only']}")
+    print(f"gb10_parity_claim: {summary['gb10_parity_claim']}")
+    print(f"local_only_policy: {summary['local_only_policy']}")
     print(f"matched_run_guard: {summary['matched_run_guard']}")
     print(
         "case_id status tokens_per_second mean_step_time_s median_step_time_s "
@@ -701,6 +816,9 @@ def main(argv: list[str] | None = None) -> int:
                 "kind": archive["kind"],
                 "record_count": len(archive["records"]),
                 "parity_claim_policy": LOCAL_BASELINE_POLICY,
+                "local_only_policy": LOCAL_ONLY_RECEIPT_POLICY,
+                "receipt_scope": LOCAL_RECEIPT_SCOPE,
+                "local_only": True,
                 "gb10_parity_claim": False,
             }
     except Exception as exc:

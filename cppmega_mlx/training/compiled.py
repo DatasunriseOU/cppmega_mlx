@@ -73,10 +73,13 @@ class PretrainingState:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, data: Mapping[str, int]) -> "PretrainingState":
+    def from_dict(cls, data: Mapping[str, Any]) -> "PretrainingState":
         return cls(
-            step=int(data.get("step", 0)),
-            trained_tokens=int(data.get("trained_tokens", 0)),
+            step=_require_non_negative_int(data.get("step", 0), name="step"),
+            trained_tokens=_require_non_negative_int(
+                data.get("trained_tokens", 0),
+                name="trained_tokens",
+            ),
         )
 
 
@@ -110,8 +113,12 @@ class CompiledPretrainingStep:
         compile: bool = True,
         grad_accum_steps: int = 1,
     ):
-        if grad_accum_steps < 1:
-            raise ValueError("grad_accum_steps must be at least 1")
+        if not isinstance(compile, bool):
+            raise TypeError("compile must be a boolean")
+        grad_accum_steps = _require_positive_int(
+            grad_accum_steps,
+            name="grad_accum_steps",
+        )
         self.model = model
         self.optimizer = optimizer
         self.loss_fn = loss_fn
@@ -212,21 +219,30 @@ class CompiledPretrainingStep:
         if not isinstance(state_payload, Mapping):
             raise ValueError("training state must contain a state object")
 
-        grad_accum_steps = int(data.get("grad_accum_steps", self.grad_accum_steps))
+        grad_accum_steps = _require_positive_int(
+            data.get("grad_accum_steps", self.grad_accum_steps),
+            name="grad_accum_steps",
+        )
         if grad_accum_steps != self.grad_accum_steps:
             raise ValueError(
                 "checkpoint grad_accum_steps "
                 f"{grad_accum_steps} does not match runner {self.grad_accum_steps}"
             )
 
-        pending_microbatches = int(data.get("pending_microbatches", 0))
+        pending_microbatches = _require_non_negative_int(
+            data.get("pending_microbatches", 0),
+            name="pending_microbatches",
+        )
         if pending_microbatches < 0 or pending_microbatches >= self.grad_accum_steps:
             raise ValueError(
                 "pending_microbatches must be in "
                 f"[0, {self.grad_accum_steps})"
             )
 
-        expects_accumulator = bool(data.get("gradient_accumulator_present", False))
+        expects_accumulator = _require_bool(
+            data.get("gradient_accumulator_present", False),
+            name="gradient_accumulator_present",
+        )
         if pending_microbatches > 0 and gradient_accumulator is None:
             raise ValueError(
                 "pending_microbatches requires a gradient_accumulator for exact resume"
@@ -236,7 +252,7 @@ class CompiledPretrainingStep:
         if pending_microbatches == 0 and gradient_accumulator is not None:
             raise ValueError("gradient_accumulator cannot be restored at an update boundary")
 
-        self.state = PretrainingState.from_dict(cast(Mapping[str, int], state_payload))
+        self.state = PretrainingState.from_dict(cast(Mapping[str, Any], state_payload))
         self._pending_microbatches = pending_microbatches
         self._grad_accum = gradient_accumulator
         self._compiled_step = None
@@ -310,6 +326,24 @@ def _compiled_batch_signature(batch: CompiledBatch) -> CompiledBatchSignature:
         else:
             signature.append((key, tuple(int(dim) for dim in value.shape), str(value.dtype)))
     return tuple(signature)
+
+
+def _require_non_negative_int(value: Any, *, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
+    return value
+
+
+def _require_positive_int(value: Any, *, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def _require_bool(value: Any, *, name: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be a boolean")
+    return value
 
 
 __all__ = [

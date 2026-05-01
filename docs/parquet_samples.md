@@ -2,7 +2,7 @@
 
 Real cppmega Parquet samples are intentionally local-only and ignored by git.
 Use them to exercise the MLX data path against the same row schema used before
-the Megatron indexed conversion.
+the token-only Megatron indexed conversion.
 
 Hygiene rule: do not add these files to git or move them into tracked test
 fixtures. `.gitignore` must keep `data/parquet_samples/` ignored, and tests that
@@ -48,7 +48,18 @@ The MLX Parquet reader fails closed when token IDs or structure side-channel
 aliases are non-integer, when token-level side-channel aliases are not
 token-aligned, or when a canonical and alias side-channel both declare the same
 batch field. Attention masks are the only numeric side channel that may use
-floating-point values.
+floating-point values. `TokenParquetDataset.parquet_receipt` records the
+physical Parquet columns and schema types it saw, the token source column, the
+physical source column for each normalized side channel, and skipped
+side-channel-looking columns. In the GB10 samples this should show
+`structure_ids` skipped as `not_token_aligned` while `token_structure_ids`
+supplies the normalized `structure_ids` batch field.
+
+These samples validate the Parquet-side aliases before conversion. They do not
+prove that `../cppmega` Stage 3 preserves structure columns, because the current
+source converter reads a single token column and emits token-only `.bin/.idx`
+files. Local Megatron-indexed side channels require an explicit MLX sidecar as
+documented in `docs/megatron_indexed_ingress.md`.
 
 Current local smoke coverage:
 
@@ -60,8 +71,18 @@ Current local smoke coverage:
 The pytest receipt covers both `clang_semantic_4k_v10` and
 `clang_commits_4k_v1`.  `tests/test_real_parquet_samples.py` confirms each
 sample produces fixed-shape token batches with token-aligned structure side
-channels and runs one eager `HybridTinyLM` training-loss call on a copied local
-head of each sample.
+channels, slices those fields through `LMTokenBatch.model_kwargs()`, and runs a
+one-step eager `HybridTinyLM` train/eval smoke on a copied local head of each
+sample.
+
+Train-script JSON receipts mirror this local-only provenance under
+`dataset.dataset_receipt`. For copied Parquet heads the receipt includes
+`source_format: parquet`, the normalized sample name such as
+`clang_semantic_4k_v10`, source path, shape fields, token key, sample/batch
+counts, dropped samples, side channels, and nested `parquet_receipt` provenance.
+Suffixless Megatron `.bin/.idx` prefixes use `source_format: megatron`, preserve
+the prefix name such as `clang_semantic_4k_v10_train`, and include parsed
+`index_metadata`.
 
 This proves local MLX tiny training on copied GB10 Parquet heads only. It does
 not prove full Megatron distributed training, M4 Max vs GB10 throughput parity,

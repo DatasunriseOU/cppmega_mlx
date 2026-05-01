@@ -25,16 +25,20 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import mlx.core as mx
-import mlx.nn as nn
-import mlx.optimizers as optim
+import mlx.core as mx  # noqa: E402
+import mlx.nn as nn  # noqa: E402
+import mlx.optimizers as optim  # noqa: E402
 
 try:
-    from cppmega_mlx.data.batch import LMTokenBatch, synthetic_token_batch
-    from cppmega_mlx.models.hybrid_lm import HybridTinyConfig, HybridTinyLM
-    from cppmega_mlx.models.tiny_lm import TinyLM, TinyLMConfig
-    from cppmega_mlx.training.loss import next_token_cross_entropy
-    from cppmega_mlx.training.profile import MemorySnapshot, profile_context, profile_step
+    from cppmega_mlx.data.batch import LMTokenBatch, synthetic_token_batch  # noqa: E402
+    from cppmega_mlx.models.hybrid_lm import HybridTinyConfig, HybridTinyLM  # noqa: E402
+    from cppmega_mlx.models.tiny_lm import TinyLM, TinyLMConfig  # noqa: E402
+    from cppmega_mlx.training.loss import next_token_cross_entropy  # noqa: E402
+    from cppmega_mlx.training.profile import (  # noqa: E402
+        MemorySnapshot,
+        profile_context,
+        profile_step,
+    )
 except Exception:  # pragma: no cover - exercised only in partial lane checkouts.
     HybridTinyConfig = None
     HybridTinyLM = None
@@ -61,6 +65,18 @@ HYBRID_ROUTE_PATTERNS = {
     "hybrid-m": "M",
     "hybrid-r": "R",
 }
+BENCH_RECEIPT_SCHEMA_VERSION = 1
+LOCAL_RECEIPT_SCOPE = "local_only"
+MATCHED_RUN_GUARD = (
+    "Compare M4 Max and GB10 only when both rows were collected with "
+    "identical comparison_key.workload and comparison_key.software."
+)
+LOCAL_ONLY_RECEIPT_POLICY = (
+    "Single-host tiny benchmark receipt only; not M4-vs-GB10 parity evidence. "
+    "Cross-host ratios require matched M4 and GB10 rows with identical "
+    "comparison_key.workload and comparison_key.software values."
+)
+SINGLE_HOST_PARITY_POLICY = "No GB10 parity claim from a single-host row."
 
 
 @dataclass(frozen=True)
@@ -914,13 +930,164 @@ def matched_run_metadata(
         "profile_helpers": profile_helpers_metadata(),
         "matched_run": {
             "key": key,
-            "guard": (
-                "Compare M4 Max and GB10 only when both rows were collected "
-                "with this same key and compatible framework metadata."
-            ),
-            "claim_policy": "No GB10 parity claim from a single-host row.",
+            "receipt_scope": LOCAL_RECEIPT_SCOPE,
+            "local_only": True,
+            "gb10_parity_claim": False,
+            "guard": MATCHED_RUN_GUARD,
+            "claim_policy": SINGLE_HOST_PARITY_POLICY,
         },
     }
+
+
+def software_key_from_metadata(
+    metrics: dict[str, Any],
+    run_metadata: dict[str, Any],
+) -> dict[str, Any]:
+    device = metrics.get("device") or {}
+    framework_metadata = run_metadata.get("framework") or {}
+    mlx_device_info = framework_metadata.get("mlx_device_info") or device.get(
+        "mlx_device_info"
+    ) or {}
+    metal = framework_metadata.get("metal") or device.get("metal")
+    framework_name = (
+        "mlx" if (framework_metadata.get("mlx") or device.get("mlx")) else None
+    )
+    backend = metrics.get("backend")
+    return {
+        "framework": framework_name,
+        "backend": backend,
+        "execution_backend": backend,
+        "framework_backend": "metal" if metal else framework_name,
+        "python_version": framework_metadata.get("python") or device.get("python"),
+        "platform": framework_metadata.get("platform") or device.get("platform"),
+        "machine": framework_metadata.get("machine") or device.get("machine"),
+        "mlx_version": framework_metadata.get("mlx") or device.get("mlx"),
+        "mlx_lm_version": framework_metadata.get("mlx_lm") or device.get("mlx_lm"),
+        "mlx_metal_version": framework_metadata.get("mlx_metal")
+        or device.get("mlx_metal"),
+        "default_device": framework_metadata.get("default_device")
+        or device.get("default_device"),
+        "device_name": mlx_device_info.get("device_name"),
+        "metal": metal,
+    }
+
+
+def timing_receipt(metrics: dict[str, Any]) -> dict[str, Any]:
+    profile = metrics.get("profile") or {}
+    measured = (profile.get("scopes") or {}).get("measured_steps") or {}
+    synchronized = measured.get("synchronized")
+    if synchronized is None and metrics.get("status") == "ok":
+        synchronized = True
+    tokens_per_second = metrics.get("tokens_per_second")
+    mean_step_time_s = metrics.get("mean_step_time_s")
+    median_step_time_s = metrics.get("median_step_time_s")
+    step_times_s = list(metrics.get("step_times_s") or [])
+    wall_time_s = metrics.get("wall_time_s")
+    if wall_time_s is None:
+        wall_time_s = mean_step_time_s
+    mean_wall_time_s = metrics.get("mean_wall_time_s")
+    if mean_wall_time_s is None:
+        mean_wall_time_s = wall_time_s
+    total_wall_time_s = metrics.get("total_wall_time_s")
+    if total_wall_time_s is None and step_times_s:
+        total_wall_time_s = sum(step_times_s)
+    return {
+        "tokens_per_step": metrics.get("tokens_per_step"),
+        "warmup_steps": metrics.get("warmup_steps"),
+        "measured_steps": metrics.get("measured_steps"),
+        "compile": metrics.get("compile"),
+        "first_call_time_s": metrics.get("first_call_time_s"),
+        "compile_time_s": metrics.get("compile_time_s"),
+        "mean_step_time_s": mean_step_time_s,
+        "wall_time_s": wall_time_s,
+        "mean_wall_time_s": mean_wall_time_s,
+        "total_wall_time_s": total_wall_time_s,
+        "median_step_time_s": median_step_time_s,
+        "tokens_per_second": tokens_per_second,
+        "tokens_per_second_or_step_time": (
+            tokens_per_second is not None
+            or mean_step_time_s is not None
+            or median_step_time_s is not None
+        ),
+        "warmup_step_times_s": list(metrics.get("warmup_step_times_s") or []),
+        "step_times_s": step_times_s,
+        "synchronized_timing": synchronized,
+        "timing_method": (
+            "wall-clock timing around MLX train steps with mx.eval outputs and "
+            "mx.synchronize before reporting; compile first-call time is separate"
+        ),
+    }
+
+
+def add_receipt_metadata(metrics: dict[str, Any]) -> dict[str, Any]:
+    run_metadata = metrics["run_metadata"]
+    workload_key = dict(run_metadata["matched_run"]["key"])
+    software_key = software_key_from_metadata(metrics, run_metadata)
+    comparison_key = {
+        "schema_version": BENCH_RECEIPT_SCHEMA_VERSION,
+        "workload": workload_key,
+        "software": software_key,
+    }
+    timing = timing_receipt(metrics)
+    receipt = {
+        "schema_version": BENCH_RECEIPT_SCHEMA_VERSION,
+        "receipt_scope": LOCAL_RECEIPT_SCOPE,
+        "local_only": True,
+        "gb10_parity_claim": False,
+        "hardware_label": metrics.get("hardware_label"),
+        "model_route": metrics.get("model_route"),
+        "seq_len": metrics.get("seq_len"),
+        "batch_size": metrics.get("batch_size"),
+        "dtype": metrics.get("dtype"),
+        "warmup_steps": timing["warmup_steps"],
+        "measured_steps": timing["measured_steps"],
+        "compile": timing["compile"],
+        "include_structure": metrics.get("include_structure"),
+        "tokens_per_second": timing["tokens_per_second"],
+        "mean_step_time_s": timing["mean_step_time_s"],
+        "wall_time_s": timing["wall_time_s"],
+        "mean_wall_time_s": timing["mean_wall_time_s"],
+        "total_wall_time_s": timing["total_wall_time_s"],
+        "median_step_time_s": timing["median_step_time_s"],
+        "device": {
+            "default_device": software_key["default_device"],
+            "device_name": software_key["device_name"],
+            "platform": software_key["platform"],
+            "machine": software_key["machine"],
+            "metal": software_key["metal"],
+        },
+        "software": software_key,
+        "workload": workload_key,
+        "timing": timing,
+        "comparison_key": comparison_key,
+        "matched_run_guard": MATCHED_RUN_GUARD,
+        "parity_claim_policy": SINGLE_HOST_PARITY_POLICY,
+        "local_only_policy": LOCAL_ONLY_RECEIPT_POLICY,
+    }
+    metrics.update(
+        {
+            "receipt_schema_version": BENCH_RECEIPT_SCHEMA_VERSION,
+            "receipt_scope": LOCAL_RECEIPT_SCOPE,
+            "local_only": True,
+            "gb10_parity_claim": False,
+            "workload_key": workload_key,
+            "software_key": software_key,
+            "comparison_key": comparison_key,
+            "matched_run_key": workload_key,
+            "bench_receipt": receipt,
+            "matched_run": {
+                **run_metadata["matched_run"],
+                "key": workload_key,
+                "receipt_scope": LOCAL_RECEIPT_SCOPE,
+                "local_only": True,
+                "gb10_parity_claim": False,
+                "guard": MATCHED_RUN_GUARD,
+                "claim_policy": SINGLE_HOST_PARITY_POLICY,
+            },
+        }
+    )
+    metrics["run_metadata"]["matched_run"] = metrics["matched_run"]
+    return metrics
 
 
 def make_train_step(
@@ -976,6 +1143,10 @@ def make_train_step(
         return loss
 
     return compiled_train_step, step_args
+
+
+def fallback_loss_callable(model: nn.Module, batch: tuple[mx.array, mx.array]) -> mx.array:
+    return fallback_loss_fn(model, batch[0], batch[1])
 
 
 def build_model_and_batch(config: BenchConfig) -> tuple[nn.Module, Any, str]:
@@ -1104,7 +1275,7 @@ def dry_run_payload(config: BenchConfig) -> dict[str, Any]:
         "matched_run": run_metadata["matched_run"],
     }
     payload.update(comparable_fields(config))
-    return payload
+    return add_receipt_metadata(payload)
 
 
 def run_benchmark(config: BenchConfig) -> dict[str, Any]:
@@ -1121,7 +1292,7 @@ def run_benchmark(config: BenchConfig) -> dict[str, Any]:
     if model_source in {"cppmega_mlx.models.tiny_lm", "cppmega_mlx.models.hybrid_lm"}:
         loss_callable = project_loss_fn
     else:
-        loss_callable = lambda model, batch: fallback_loss_fn(model, batch[0], batch[1])
+        loss_callable = fallback_loss_callable
     step, step_args = make_train_step(
         model,
         optimizer,
@@ -1243,7 +1414,7 @@ def run_benchmark(config: BenchConfig) -> dict[str, Any]:
             peak_memory_bytes=peak_memory_bytes,
         )
     )
-    return metrics
+    return add_receipt_metadata(metrics)
 
 
 def _memory_snapshot_from_profile(

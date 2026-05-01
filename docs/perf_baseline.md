@@ -109,6 +109,11 @@ The current script reports:
   `seq_len`, `batch_size`, warmup/measured step counts, compile mode, tokens/sec
   or step-time fields, device, software stack, workload key, comparison key,
   matched-run guard, and timing metadata in one stable object for log collectors.
+- Matrix summary, case rows, `matched_run`, `bench_receipt`, and local baseline
+  archives mark single-host evidence with `receipt_scope: local_only`,
+  `local_only: true`, and `gb10_parity_claim: false`. Keep those fields visible
+  when copying rows into reports so a local Apple Silicon matrix is not quoted
+  as a GB10 comparison before matched GB10 rows exist.
 - `model_source`: the project tiny model when available, otherwise the
   self-contained fallback.
 
@@ -266,6 +271,12 @@ mirrored as `workload_key`. The per-case `bench_receipt` block is the preferred
 artifact for archiving or forwarding matrix rows because it keeps device,
 software, workload, timing, and guardrail fields together.
 
+Every matrix receipt emitted by `scripts/bench_matrix.py` is local-only until it
+is paired with a GB10 row that has identical `comparison_key.workload` and
+`comparison_key.software`. The receipt fields
+`receipt_scope: local_only`, `local_only: true`, and `gb10_parity_claim: false`
+must remain visible in archived summaries and copied rows.
+
 To maintain a local M4 Max regression ledger, append matrix summaries to a
 schema-versioned archive:
 
@@ -296,13 +307,19 @@ The archive schema is intentionally conservative:
   policy, and one row per matrix case.
 - Row object: stable `case_id`, status, hardware/profile/route selectors,
   `comparison_key`, `workload_key`, `software_key`, `bench_receipt`, compact
-  timing/memory metrics, and `gb10_parity_claim: false`.
+  timing/memory metrics, `receipt_scope: local_only`, `local_only: true`, and
+  `gb10_parity_claim: false`.
 - Compare-line contract: the archived field order mirrors
   `scripts/bench_tiny.py --compare-line` and is guarded by tests:
   `hardware_label`, `dtype`, `batch_size`, `seq_len`, `warmup_steps`,
   `measured_steps`, `compile`, `include_structure`, `tokens_per_second`,
   `peak_memory_bytes`. Treat this field order as append-only by explicit
   migration; do not reorder it for display preferences.
+- Append guard: before appending to an existing archive, the writer validates
+  the archive, every prior record, every row, and every nested `bench_receipt`
+  still carry `receipt_scope: local_only`, `local_only: true`, and
+  `gb10_parity_claim: false`. If a prior archive is missing those guards or
+  contains a parity claim, the append fails instead of rewriting history.
 
 This archive is not a GB10 comparison file. It is a local M4 baseline and
 regression history so later Apple Silicon changes can be compared against the
@@ -318,6 +335,12 @@ source, not only as an archived copy. If an exported row only keeps top-level
 fields from those nested blocks. Mismatched `data_contract` values, including
 future parquet labels such as `parquet_clang_v10_code`, intentionally block
 ratios in the same way as MLX/Metal/Python/software-stack mismatches.
+If a row contains more than one modern key source, for example top-level
+`comparison_key`, `bench_receipt.comparison_key`, and `workload_key` plus
+`software_key`, those sources must agree inside the row before the helper will
+use the row. A row-local conflict is reported through
+`matched_comparison_key_conflicts` and is treated as missing matched-key
+provenance, so no M4-vs-GB10 ratio is emitted.
 
 For local Mamba3/M2RNN/hybrid receipts, prefer the named aliases so exported rows
 are stable across the MLX and Megatron/CUDA inventories:
@@ -379,6 +402,36 @@ M4 Max rows above remain local regression baselines only. Local real-data
 Parquet smoke tests under `data/parquet_samples/` should also be kept separate
 from synthetic benchmark rows unless both hosts consume the same token batches.
 
+Wave 9 lane 5 also produced a local-only smoke receipt at
+`/tmp/cppmega_mlx_wave9_lane5_m4_smoke.json` with this command:
+
+```bash
+./.venv/bin/python scripts/bench_matrix.py \
+  --json \
+  --hardware-label "M4 Max local-only wave9 lane5" \
+  --batch-sizes 1 \
+  --seq-lens 4 \
+  --profiles smoke \
+  --routes plain \
+  --compile-modes eager \
+  --dtype float32 \
+  --warmup-steps 0 \
+  --steps 1 > /tmp/cppmega_mlx_wave9_lane5_m4_smoke.json
+```
+
+That receipt reported one `smoke-route_plain-b1-s4-float32-eager` row on
+`Apple M4 Max`, `receipt_scope: local_only`, `local_only: true`,
+`gb10_parity_claim: false`, tokens/sec `3150.2268407971783`, and mean step time
+`0.0012697498314082623` seconds. It is single-host smoke evidence only.
+
+Wave 10 lane 6 produced another local-only smoke receipt at
+`/tmp/cppmega_mlx_wave10_lane6_m4_smoke.json` with the same smoke workload and
+`--hardware-label "M4 Max local-only wave10 lane6"`. The receipt reported one
+`smoke-route_plain-b1-s4-float32-eager` row on `Apple M4 Max`,
+`receipt_scope: local_only`, `local_only: true`, `gb10_parity_claim: false`,
+tokens/sec `3640.3619589873447`, and mean step time `0.0010987918358296156`
+seconds. It is single-host smoke evidence only and is not a GB10 comparison.
+
 Package matched M4 Max and GB10 rows with the comparison helper rather than by
 hand-copying local-only numbers into a table:
 
@@ -409,7 +462,8 @@ hand-copying local-only numbers into a table:
 
 ./.venv/bin/python scripts/compare_bench_rows.py \
   --input runs/m4max_matrix.json \
-  --input runs/gb10_matrix.json > runs/matched_compare.json
+  --input runs/gb10_matrix.json \
+  --package-dir runs/gb10_matched_package > runs/matched_compare.json
 ```
 
 The helper accepts matrix summary JSON, JSON arrays/objects, or NDJSON rows. Add
@@ -424,6 +478,13 @@ require CUDA version, driver version, and device capability. If only M4 Max or
 only GB10 rows are present, the status is `insufficient_matched_rows`; if both
 hosts are present but no strict key matches, the status is `no_matching_rows`.
 In both cases, `comparisons` stays empty and no ratio should be reported.
+
+The packaged handoff writes `manifest.json`, `compare_report.json`,
+`matched_comparisons.jsonl`, and `refused_pairs.jsonl`. Packaged
+`compare_report.json` keeps the guard/refusal summary without ratios. Only
+`matched_comparisons.jsonl` may contain `ratios`; `refused_pairs.jsonl` is
+archiveable evidence that a pair was rejected because the workload/software keys
+or required metadata did not match.
 
 The GB10 Megatron/Torch launchers in the sibling `../cppmega` checkout use a
 different CUDA/Megatron training stack from this MLX matrix. Those logs are

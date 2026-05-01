@@ -13,7 +13,9 @@ from cppmega_mlx.training.mlx_lm_adapter import (
     MLX_LM_DENSE_BATCH_KEYS,
     MLXLMTrainerIntegrationUnsupported,
     REQUIRED_TRAINER_PARAMETERS,
+    TRAINER_ADAPTER_SAVE_FIELDS,
     TRAINER_API_NAMES,
+    TRAINING_ARGS_MEMORY_POLICY_FIELDS,
     as_mlx_lm_loss_args,
     as_mlx_lm_token_mapping,
     describe_mlx_lm_batch_route_metadata,
@@ -37,6 +39,7 @@ def test_describe_mlx_lm_trainer_apis_reports_installed_surface() -> None:
     assert info.package_versions is not None
     assert info.package_versions["mlx-lm"].startswith("0.31.")
     assert set(info.api_signatures) == set(TRAINER_API_NAMES)
+    assert "grad_checkpoint" in info.api_signatures
     for api_name, required_parameters in REQUIRED_TRAINER_PARAMETERS.items():
         for parameter in required_parameters:
             assert parameter in info.api_signatures[api_name]
@@ -85,11 +88,15 @@ def test_describe_mlx_lm_trainer_apis_fails_closed_when_signatures_drift(
     def train(model, optimizer, dataset):
         return None
 
+    def grad_checkpoint(block):
+        return None
+
     setattr(trainer, "TrainingArgs", TrainingArgs)
     setattr(trainer, "default_loss", default_loss)
     setattr(trainer, "iterate_batches", iterate_batches)
     setattr(trainer, "evaluate", evaluate)
     setattr(trainer, "train", train)
+    setattr(trainer, "grad_checkpoint", grad_checkpoint)
     setattr(trainer, "__file__", "/fake/mlx_lm/tuner/trainer.py")
 
     def fake_import_module(name: str) -> ModuleType:
@@ -109,6 +116,7 @@ def test_describe_mlx_lm_trainer_apis_fails_closed_when_signatures_drift(
         "iterate_batches",
         "evaluate",
         "train",
+        "grad_checkpoint",
     }
     assert any(
         "default_loss missing required parameter(s): batch, lengths" in error
@@ -118,6 +126,28 @@ def test_describe_mlx_lm_trainer_apis_fails_closed_when_signatures_drift(
         "train missing required parameter(s): train_dataset, args, loss, iterate_batches" in error
         for error in info.compatibility_errors
     )
+    assert any(
+        "grad_checkpoint missing required parameter(s): layer" in error
+        for error in info.compatibility_errors
+    )
+
+
+def test_installed_training_args_exposes_memory_and_adapter_save_contract() -> None:
+    from dataclasses import fields
+
+    from mlx_lm.tuner.trainer import TrainingArgs
+
+    field_names = {field.name for field in fields(TrainingArgs)}
+    for name in TRAINING_ARGS_MEMORY_POLICY_FIELDS:
+        assert name in field_names
+    for name in TRAINER_ADAPTER_SAVE_FIELDS:
+        assert name in field_names
+
+    args = TrainingArgs()
+    assert args.grad_checkpoint is False
+    assert args.grad_accumulation_steps == 1
+    assert args.clear_cache_threshold == 0
+    assert args.adapter_file == "adapters.safetensors"
 
 
 def test_as_mlx_lm_token_mapping_keeps_only_dense_token_contract() -> None:
@@ -262,5 +292,7 @@ def test_require_supported_mlx_lm_trainer_integration_fails_closed() -> None:
         )
 
     message = str(exc_info.value)
+    assert "adapter weights" in message
+    assert "full-pretraining checkpoint state" in message
     assert "dropped_fields=attention_mask, structure_ids" in message
     assert "route_symbols=MR" in message

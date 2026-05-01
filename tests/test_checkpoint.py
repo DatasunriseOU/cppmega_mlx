@@ -100,6 +100,27 @@ def _assert_tree_allclose(actual, expected, *, atol: float = 0.0) -> None:
         )
 
 
+def _rewrite_manifest(checkpoint_path, update) -> dict:
+    metadata_path = checkpoint_path / METADATA_NAME
+    manifest = json.loads(metadata_path.read_text())
+    update(manifest)
+    metadata_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    return manifest
+
+
+def _add_manifest_only_tensor(summary: dict) -> None:
+    tensors = list(summary["tensors"])
+    tensors.append("not.in.file")
+    summary.update({"num_tensors": len(tensors), "tensors": tensors})
+
+
+def _replace_manifest_tensor(summary: dict) -> None:
+    tensors = list(summary["tensors"])
+    assert tensors
+    tensors[0] = "not.in.file"
+    summary.update({"num_tensors": len(tensors), "tensors": tensors})
+
+
 def test_checkpoint_manifest_records_resume_contract(tmp_path) -> None:
     config = _tiny_config()
     model = TinyLM(config)
@@ -153,6 +174,8 @@ def test_checkpoint_manifest_records_resume_contract(tmp_path) -> None:
     [
         ({"format": "unknown"}, "unsupported format"),
         ({"version": FORMAT_VERSION + 1}, "unsupported version"),
+        ({"step": "1"}, "step"),
+        ({"trained_tokens": True}, "trained_tokens"),
         ({"tokenizer_contract": "local_profile"}, "tokenizer_contract must be an object"),
         ({"tokenizer_contract": {"vocab_size": -1}}, "tokenizer_contract.vocab_size"),
         ({"batch_cursor": "cursor"}, "batch_cursor must be an object"),
@@ -197,6 +220,154 @@ def test_checkpoint_load_validates_resume_metadata(tmp_path, override, error) ->
         load_checkpoint(TinyLM(config), checkpoint_path)
 
 
+@pytest.mark.parametrize(
+    ("training_state_override", "error"),
+    [
+        ({"compiled": "false"}, "training_state.compiled"),
+        (
+            {"gradient_accumulator": {"present": "false"}},
+            "training_state.gradient_accumulator.present",
+        ),
+    ],
+)
+def test_checkpoint_load_rejects_coerced_training_state_booleans(
+    tmp_path,
+    training_state_override,
+    error,
+) -> None:
+    config = _tiny_config()
+    checkpoint_path = tmp_path / "bad-training-state"
+    model = TinyLM(config)
+    optimizer = optim.AdamW(learning_rate=1e-2, weight_decay=0.0)
+    step = CompiledPretrainingStep(model, optimizer, compile=False)
+    save_checkpoint(
+        model,
+        checkpoint_path,
+        optimizer=optimizer,
+        training_step=step,
+    )
+    metadata_path = checkpoint_path / METADATA_NAME
+    manifest = json.loads(metadata_path.read_text())
+    manifest["training_state"].update(training_state_override)
+    metadata_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+
+    with pytest.raises(ValueError, match=error):
+        load_checkpoint(
+            TinyLM(config),
+            checkpoint_path,
+            optimizer=optim.AdamW(learning_rate=1e-2, weight_decay=0.0),
+            training_step=CompiledPretrainingStep(
+                TinyLM(config),
+                optim.AdamW(learning_rate=1e-2, weight_decay=0.0),
+                compile=False,
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"tensor_model_parallel_size": 2},
+        {"sharded_state_dict": {"embedding.weight": {"replica_id": [0, 1, 0]}}},
+        {"parallelism": {"tensor_model_parallel_size": 2}},
+        {"training_state": {"megatron_parallel_state": {"tp_rank": 0}}},
+        {"training_state": {"state": {"step": 0}, "parallel_state": {"tp_rank": 0}}},
+    ],
+)
+def test_checkpoint_save_rejects_explicit_distributed_or_sharded_metadata(
+    tmp_path,
+    metadata,
+) -> None:
+    checkpoint_path = tmp_path / "unsupported-megatron-state"
+
+    with pytest.raises(ValueError, match="unsupported distributed/sharded"):
+        save_checkpoint(TinyLM(_tiny_config()), checkpoint_path, metadata=metadata)
+
+    assert not (checkpoint_path / WEIGHTS_NAME).exists()
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"tensor_model_parallel_size": 2},
+        {"parallelism": {"tensor_model_parallel_size": 2}},
+        {"sharded_state_dict": {"embedding.weight": {"replica_id": [0, 1, 0]}}},
+        {"training_state": {"megatron_parallel_state": {"tp_rank": 0}}},
+        {"training_state": {"state": {"step": 0}, "parallel_state": {"tp_rank": 0}}},
+    ],
+)
+def test_checkpoint_load_rejects_explicit_distributed_or_sharded_metadata(
+    tmp_path,
+    override,
+) -> None:
+    config = _tiny_config()
+    checkpoint_path = tmp_path / "load-unsupported-megatron-state"
+    save_checkpoint(TinyLM(config), checkpoint_path)
+    _rewrite_manifest(checkpoint_path, lambda manifest: manifest.update(override))
+
+    with pytest.raises(ValueError, match="unsupported distributed/sharded"):
+        load_checkpoint(TinyLM(config), checkpoint_path)
+
+
+def test_checkpoint_allows_architecture_metadata_that_resembles_parallel_config(
+    tmp_path,
+) -> None:
+    config = _tiny_config()
+    checkpoint_path = tmp_path / "architecture-metadata"
+    architecture_metadata = {
+        "model_config": {
+            "moe": {"expert_model_parallel_size": 1},
+            "mamba3": {"partition_sizes": [4, 4, 2, 2]},
+        },
+        "dataset": {
+            "provenance": {
+                "distributed": "source corpus was built by a distributed job",
+            },
+        },
+    }
+
+    manifest = save_checkpoint(
+        TinyLM(config),
+        checkpoint_path,
+        metadata=architecture_metadata,
+    )
+    loaded = load_checkpoint(TinyLM(config), checkpoint_path)
+
+    assert loaded == manifest
+    assert loaded["model_config"] == config.to_dict()
+    assert loaded["dataset"] == architecture_metadata["dataset"]
+
+
+def test_checkpoint_load_rejects_unknown_training_state_fields(tmp_path) -> None:
+    config = _tiny_config()
+    checkpoint_path = tmp_path / "unknown-training-state"
+    model = TinyLM(config)
+    optimizer = optim.AdamW(learning_rate=1e-2, weight_decay=0.0)
+    step = CompiledPretrainingStep(model, optimizer, compile=False)
+    save_checkpoint(
+        model,
+        checkpoint_path,
+        optimizer=optimizer,
+        training_step=step,
+    )
+    _rewrite_manifest(
+        checkpoint_path,
+        lambda manifest: manifest["training_state"].update({"trainer_epoch": 1}),
+    )
+
+    with pytest.raises(ValueError, match="unsupported training_state fields"):
+        load_checkpoint(
+            TinyLM(config),
+            checkpoint_path,
+            optimizer=optim.AdamW(learning_rate=1e-2, weight_decay=0.0),
+            training_step=CompiledPretrainingStep(
+                TinyLM(config),
+                optim.AdamW(learning_rate=1e-2, weight_decay=0.0),
+                compile=False,
+            ),
+        )
+
+
 def test_checkpoint_reserved_metadata_contract_roundtrips(tmp_path) -> None:
     config = _tiny_config()
     checkpoint_path = tmp_path / "ckpt"
@@ -228,6 +399,91 @@ def test_checkpoint_reserved_metadata_contract_roundtrips(tmp_path) -> None:
     assert loaded["tokenizer_contract"]["max_seq_length"] == 8
     assert loaded["tokenizer_contract"]["tokenizer_name"] == "caller-tokenizer"
     assert loaded["batch_cursor"]["global_batch_offset"] == 6
+
+
+def test_checkpoint_evaluation_metadata_contract_roundtrips(tmp_path) -> None:
+    config = _tiny_config()
+    checkpoint_path = tmp_path / "eval-contract"
+    evaluation = {
+        "dataset": {"path": "validation.npz", "num_batches": 2},
+        "requested_batches": 2,
+        "planned_batches": 1,
+        "evaluated_batches": 1,
+        "metrics": {
+            "loss": 1.25,
+            "ntokens": 7,
+            "batches": 1,
+            "seconds": 0.125,
+            "tokens_per_second": 56.0,
+        },
+        "iteration": 3,
+        "val_loss": 1.25,
+        "val_time": 0.125,
+    }
+
+    saved = save_checkpoint(
+        TinyLM(config),
+        checkpoint_path,
+        metadata={"evaluation": evaluation},
+    )
+    loaded = load_checkpoint(TinyLM(config), checkpoint_path)
+
+    assert loaded == saved
+    assert loaded["evaluation"] == evaluation
+
+
+@pytest.mark.parametrize(
+    ("evaluation", "error"),
+    [
+        ({"requested_batches": "1"}, "evaluation.requested_batches"),
+        ({"evaluated_batches": True}, "evaluation.evaluated_batches"),
+        ({"val_loss": float("nan")}, "evaluation.val_loss"),
+        ({"metrics": {"loss": -1.0}}, "evaluation.metrics.loss"),
+        ({"metrics": {"ntokens": "7"}}, "evaluation.metrics.ntokens"),
+    ],
+)
+def test_checkpoint_save_rejects_invalid_evaluation_metadata(
+    tmp_path,
+    evaluation,
+    error,
+) -> None:
+    checkpoint_path = tmp_path / "bad-eval"
+
+    with pytest.raises(ValueError, match=error):
+        save_checkpoint(
+            TinyLM(_tiny_config()),
+            checkpoint_path,
+            metadata={"evaluation": evaluation},
+        )
+
+    assert not (checkpoint_path / WEIGHTS_NAME).exists()
+
+
+@pytest.mark.parametrize(
+    ("evaluation", "error"),
+    [
+        ("done", "evaluation must be an object"),
+        ({"planned_batches": -1}, "evaluation.planned_batches"),
+        ({"val_time": "0.1"}, "evaluation.val_time"),
+        ({"metrics": "loss=1.0"}, "evaluation.metrics must be an object"),
+        ({"metrics": {"tokens_per_second": -1.0}}, "evaluation.metrics.tokens_per_second"),
+    ],
+)
+def test_checkpoint_load_rejects_invalid_evaluation_metadata(
+    tmp_path,
+    evaluation,
+    error,
+) -> None:
+    config = _tiny_config()
+    checkpoint_path = tmp_path / "load-bad-eval"
+    save_checkpoint(TinyLM(config), checkpoint_path)
+    _rewrite_manifest(
+        checkpoint_path,
+        lambda manifest: manifest.update({"evaluation": evaluation}),
+    )
+
+    with pytest.raises(ValueError, match=error):
+        load_checkpoint(TinyLM(config), checkpoint_path)
 
 
 def test_checkpoint_rng_seed_and_single_file_sharding_metadata_roundtrip(tmp_path) -> None:
@@ -418,6 +674,83 @@ def test_checkpoint_load_validates_optimizer_metadata(tmp_path, override, error)
 
     with pytest.raises(ValueError, match=error):
         load_checkpoint(TinyLM(config), checkpoint_path)
+
+
+def test_checkpoint_load_fails_closed_when_optimizer_requested_but_metadata_absent(
+    tmp_path,
+) -> None:
+    config = _tiny_config()
+    checkpoint_path = tmp_path / "no-optimizer"
+    save_checkpoint(TinyLM(config), checkpoint_path)
+
+    with pytest.raises(FileNotFoundError, match="No optimizer state recorded"):
+        load_checkpoint(
+            TinyLM(config),
+            checkpoint_path,
+            optimizer=optim.AdamW(learning_rate=1e-2, weight_decay=0.0),
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutate_manifest", "error"),
+    [
+        (lambda manifest: _add_manifest_only_tensor(manifest), "model tensor count mismatch"),
+        (lambda manifest: _replace_manifest_tensor(manifest), "model tensor names mismatch"),
+    ],
+)
+def test_checkpoint_load_rejects_model_tensor_metadata_mismatch(
+    tmp_path,
+    mutate_manifest,
+    error,
+) -> None:
+    config = _tiny_config()
+    checkpoint_path = tmp_path / "bad-model-summary"
+    save_checkpoint(TinyLM(config), checkpoint_path)
+    _rewrite_manifest(checkpoint_path, mutate_manifest)
+
+    with pytest.raises(ValueError, match=error):
+        load_checkpoint(TinyLM(config), checkpoint_path)
+
+
+@pytest.mark.parametrize(
+    ("mutate_manifest", "error"),
+    [
+        (
+            lambda manifest: _add_manifest_only_tensor(manifest["optimizer"]),
+            "optimizer tensor count mismatch",
+        ),
+        (
+            lambda manifest: _replace_manifest_tensor(manifest["optimizer"]),
+            "optimizer tensor names mismatch",
+        ),
+    ],
+)
+def test_checkpoint_load_rejects_optimizer_tensor_metadata_mismatch(
+    tmp_path,
+    mutate_manifest,
+    error,
+) -> None:
+    config = _tiny_config()
+    checkpoint_path = tmp_path / "bad-optimizer-summary"
+    model = TinyLM(config)
+    optimizer = optim.AdamW(learning_rate=1e-2, weight_decay=0.0)
+    batch = synthetic_token_batch(
+        batch_size=2,
+        seq_length=8,
+        vocab_size=config.vocab_size,
+        seed=25,
+        include_structure=True,
+    )
+    one_step_train(model, optimizer, batch)
+    save_checkpoint(model, checkpoint_path, optimizer=optimizer)
+    _rewrite_manifest(checkpoint_path, mutate_manifest)
+
+    with pytest.raises(ValueError, match=error):
+        load_checkpoint(
+            TinyLM(config),
+            checkpoint_path,
+            optimizer=optim.AdamW(learning_rate=1e-2, weight_decay=0.0),
+        )
 
 
 def test_checkpoint_resume_restores_model_and_optimizer_state(tmp_path) -> None:
@@ -714,6 +1047,127 @@ def test_checkpoint_resume_restores_compiled_step_mid_accumulation(tmp_path) -> 
         uninterrupted_optimizer.state,
         atol=1e-7,
     )
+
+
+def test_checkpoint_resume_rejects_compiled_mode_mismatch(tmp_path) -> None:
+    config = _tiny_config()
+    checkpoint_path = tmp_path / "compiled-mode-mismatch"
+    model = TinyLM(config)
+    optimizer = optim.AdamW(learning_rate=1e-2, weight_decay=0.0)
+    step = CompiledPretrainingStep(model, optimizer, compile=True)
+    save_checkpoint(
+        model,
+        checkpoint_path,
+        optimizer=optimizer,
+        training_step=step,
+    )
+
+    resumed = TinyLM(config)
+    resumed_optimizer = optim.AdamW(learning_rate=1e-2, weight_decay=0.0)
+    with pytest.raises(ValueError, match="training_state.compiled"):
+        load_checkpoint(
+            resumed,
+            checkpoint_path,
+            optimizer=resumed_optimizer,
+            training_step=CompiledPretrainingStep(
+                resumed,
+                resumed_optimizer,
+                compile=False,
+            ),
+        )
+
+
+def test_checkpoint_resume_rejects_grad_accum_step_mismatch(tmp_path) -> None:
+    config = _tiny_config()
+    checkpoint_path = tmp_path / "grad-accum-mismatch"
+    model = TinyLM(config)
+    optimizer = optim.AdamW(learning_rate=1e-2, weight_decay=0.0)
+    step = CompiledPretrainingStep(model, optimizer, compile=False, grad_accum_steps=2)
+    save_checkpoint(
+        model,
+        checkpoint_path,
+        optimizer=optimizer,
+        training_step=step,
+    )
+
+    resumed = TinyLM(config)
+    resumed_optimizer = optim.AdamW(learning_rate=1e-2, weight_decay=0.0)
+    with pytest.raises(ValueError, match="training_state.grad_accum_steps"):
+        load_checkpoint(
+            resumed,
+            checkpoint_path,
+            optimizer=resumed_optimizer,
+            training_step=CompiledPretrainingStep(
+                resumed,
+                resumed_optimizer,
+                compile=False,
+                grad_accum_steps=1,
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutate_manifest", "error"),
+    [
+        (
+            lambda manifest: _add_manifest_only_tensor(
+                manifest["training_state"]["gradient_accumulator"]
+            ),
+            "training_state.gradient_accumulator tensor count mismatch",
+        ),
+        (
+            lambda manifest: _replace_manifest_tensor(
+                manifest["training_state"]["gradient_accumulator"]
+            ),
+            "training_state.gradient_accumulator tensor names mismatch",
+        ),
+    ],
+)
+def test_checkpoint_load_rejects_gradient_accumulator_metadata_mismatch(
+    tmp_path,
+    mutate_manifest,
+    error,
+) -> None:
+    config = _tiny_config()
+    checkpoint_path = tmp_path / "bad-grad-accum-summary"
+    model = TinyLM(config)
+    optimizer = optim.AdamW(learning_rate=1e-2, weight_decay=0.0)
+    step = CompiledPretrainingStep(
+        model,
+        optimizer,
+        compile=False,
+        grad_accum_steps=2,
+    )
+    batch = synthetic_token_batch(
+        batch_size=2,
+        seq_length=8,
+        vocab_size=config.vocab_size,
+        seed=45,
+        include_structure=True,
+    )
+    step(batch)
+    save_checkpoint(
+        model,
+        checkpoint_path,
+        optimizer=optimizer,
+        training_step=step,
+    )
+    _rewrite_manifest(checkpoint_path, mutate_manifest)
+
+    resumed = TinyLM(config)
+    resumed_optimizer = optim.AdamW(learning_rate=1e-2, weight_decay=0.0)
+    with pytest.raises(ValueError, match=error):
+        load_checkpoint(
+            resumed,
+            checkpoint_path,
+            optimizer=resumed_optimizer,
+            training_step=CompiledPretrainingStep(
+                resumed,
+                resumed_optimizer,
+                compile=False,
+                grad_accum_steps=2,
+            ),
+        )
 
 
 def test_checkpoint_mid_accumulation_resume_fails_closed_without_accumulator(

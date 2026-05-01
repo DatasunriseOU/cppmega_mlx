@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import platform
 import statistics
 import sys
@@ -23,18 +24,18 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import mlx.core as mx
-import mlx.optimizers as optim
+import mlx.core as mx  # noqa: E402
+import mlx.optimizers as optim  # noqa: E402
 
-from cppmega_mlx.data.token_dataset import (
+from cppmega_mlx.data.token_dataset import (  # noqa: E402
     TokenBatchDataset,
     TokenDatasetFormat,
     open_token_dataset,
 )
-from cppmega_mlx.models.tiny_lm import TinyLM, TinyLMConfig
-from cppmega_mlx.training.checkpoint import load_checkpoint, save_checkpoint
-from cppmega_mlx.training.compiled import CompiledPretrainingStep
-from cppmega_mlx.training.eval import EvalMetrics, evaluate_batches
+from cppmega_mlx.models.tiny_lm import TinyLM, TinyLMConfig  # noqa: E402
+from cppmega_mlx.training.checkpoint import load_checkpoint, save_checkpoint  # noqa: E402
+from cppmega_mlx.training.compiled import CompiledPretrainingStep  # noqa: E402
+from cppmega_mlx.training.eval import EvalMetrics, evaluate_batches  # noqa: E402
 
 
 DTYPES = {
@@ -269,6 +270,10 @@ def validate_config(config: TrainTinyNpzConfig) -> None:
         )
     if valid_path is not None and not _dataset_path_exists(Path(valid_path)):
         raise ValueError(f"validation dataset path does not exist: {valid_path}")
+    if config.valid_dataset_format is not None and valid_path is None:
+        raise ValueError(
+            "valid_dataset_format requires valid_dataset_path or valid_npz_path"
+        )
     if config.eval_batches < 0:
         raise ValueError("eval_batches must be >= 0")
 
@@ -383,10 +388,79 @@ def device_info() -> dict[str, Any]:
         "python": platform.python_version(),
         "mlx": metadata_version("mlx"),
         "mlx_lm": metadata_version("mlx-lm"),
+        "mlx_disable_compile": os.environ.get("MLX_DISABLE_COMPILE"),
     }
     if hasattr(mx, "device_info"):
         info["mlx_device_info"] = mx.device_info()
     return info
+
+
+def env_flag_enabled(value: Any) -> bool:
+    if value is None:
+        return False
+    return str(value).strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def compile_payload(config: TrainTinyNpzConfig, device: dict[str, Any]) -> dict[str, Any]:
+    disabled_by_env = env_flag_enabled(device.get("mlx_disable_compile"))
+    enabled = config.compile and not disabled_by_env
+    return {
+        "requested": config.compile,
+        "enabled": enabled,
+        "disabled_by_env": disabled_by_env,
+        "backend": "mlx.core.compile" if enabled else "eager",
+        "pattern": "mlx_lm_tuner_stateful_step" if enabled else "python_eager_step",
+        "state_inputs_outputs": [
+            "model.state",
+            "optimizer.state",
+            "mx.random.state",
+        ]
+        if enabled
+        else [],
+        "fixed_batch_signature": enabled,
+        "mlx_disable_compile": device.get("mlx_disable_compile"),
+    }
+
+
+def metadata_non_negative_int(
+    metadata: dict[str, Any],
+    key: str,
+    *,
+    default: int,
+    source: Path,
+) -> int:
+    value = metadata.get(key, default)
+    if value is None:
+        value = default
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(
+            f"checkpoint metadata {source}: {key} must be a non-negative integer"
+        )
+    return value
+
+
+def metadata_batch_cursor_offset(
+    metadata: dict[str, Any],
+    *,
+    default: int,
+    source: Path,
+) -> int:
+    cursor = metadata.get("batch_cursor", {})
+    if cursor is None:
+        return default
+    if not isinstance(cursor, dict):
+        raise ValueError(
+            f"checkpoint metadata {source}: batch_cursor must be an object"
+        )
+    if "global_batch_offset" not in cursor:
+        return default
+    value = cursor["global_batch_offset"]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(
+            f"checkpoint metadata {source}: "
+            "batch_cursor.global_batch_offset must be a non-negative integer"
+        )
+    return value
 
 
 def checkpoint_path_for_step(checkpoint_dir: str | Path, step: int) -> Path:
@@ -439,6 +513,9 @@ def save_training_checkpoint(
 
 def dataset_payload(dataset: TokenBatchDataset) -> dict[str, Any]:
     side_channels = getattr(dataset, "_side_channels", {})
+    side_channel_names = (
+        sorted(side_channels) if isinstance(side_channels, dict) else []
+    )
     payload = {
         "path": str(dataset.path),
         "token_key": dataset.token_key,
@@ -450,7 +527,62 @@ def dataset_payload(dataset: TokenBatchDataset) -> dict[str, Any]:
         "shuffle": dataset.shuffle,
         "loop": dataset.loop,
         "metadata": _json_ready(dataset.metadata),
-        "side_channels": sorted(side_channels) if isinstance(side_channels, dict) else [],
+        "side_channels": side_channel_names,
+        "dataset_receipt": dataset_receipt_payload(
+            dataset,
+            side_channels=side_channel_names,
+        ),
+    }
+    index_metadata = getattr(dataset, "index_metadata", None)
+    if index_metadata is not None:
+        payload["index_metadata"] = _json_ready(index_metadata)
+    return payload
+
+
+def dataset_source_format(dataset: TokenBatchDataset) -> str:
+    source_format = getattr(dataset.metadata, "source_format", None)
+    if source_format is not None:
+        return str(source_format)
+    index_metadata = getattr(dataset, "index_metadata", None)
+    index_source_format = getattr(index_metadata, "source_format", None)
+    return str(index_source_format or "unknown")
+
+
+def source_dataset_name(path: Path, *, source_format: str) -> str:
+    stem = path.stem if path.suffix else path.name
+    if source_format == "parquet":
+        if stem == "val_00000" and path.parent.name:
+            return path.parent.name
+        for suffix in ("_local_train_eval_head", "_train_head", "_head"):
+            if stem.endswith(suffix):
+                return stem[: -len(suffix)]
+    return stem
+
+
+def dataset_receipt_payload(
+    dataset: TokenBatchDataset,
+    *,
+    side_channels: list[str] | None = None,
+) -> dict[str, Any]:
+    source_format = dataset_source_format(dataset)
+    payload = {
+        "source_format": source_format,
+        "source_dataset_name": source_dataset_name(
+            dataset.path,
+            source_format=source_format,
+        ),
+        "source_path": str(dataset.path),
+        "token_key": dataset.token_key,
+        "seq_len": dataset.seq_len,
+        "batch_size": dataset.batch_size,
+        "num_samples": dataset.num_samples,
+        "num_batches": dataset.num_batches,
+        "dropped_samples": dataset.dropped_samples,
+        "side_channels": (
+            side_channels
+            if side_channels is not None
+            else sorted(getattr(dataset, "_side_channels", {}))
+        ),
     }
     index_metadata = getattr(dataset, "index_metadata", None)
     if index_metadata is not None:
@@ -517,6 +649,8 @@ def dry_run_payload(config: TrainTinyNpzConfig) -> dict[str, Any]:
     if eval_dataset is not None:
         validate_dataset_for_training(config, eval_dataset, vocab_size)
     model_config = tiny_model_config(config, dataset, vocab_size)
+    device = device_info()
+    compile_plan = compile_payload(config, device)
     payload = {
         "status": "dry_run",
         "config": asdict(config),
@@ -525,8 +659,10 @@ def dry_run_payload(config: TrainTinyNpzConfig) -> dict[str, Any]:
         "tokens_per_step": config.batch_size * (config.seq_len - 1),
         "planned_steps": config.steps,
         "compile": config.compile,
+        "compile_enabled": compile_plan["enabled"],
+        "compile_plan": compile_plan,
         "dtype": config.dtype,
-        "device": device_info(),
+        "device": device,
     }
     if eval_dataset is not None:
         payload["evaluation"] = {
@@ -547,24 +683,37 @@ def train_tiny_npz(config: TrainTinyNpzConfig) -> dict[str, Any]:
     mx.random.seed(config.seed)
 
     resume_metadata: dict[str, Any] | None = None
+    resume_metadata_path: Path | None = None
     resume_step = 0
     resume_trained_tokens = 0
     resume_batch = 0
     if config.resume_from:
-        metadata_path = Path(config.resume_from)
-        if metadata_path.suffix == ".safetensors":
-            metadata_path = metadata_path.with_suffix(".json")
+        resume_metadata_path = Path(config.resume_from)
+        if resume_metadata_path.suffix == ".safetensors":
+            resume_metadata_path = resume_metadata_path.with_suffix(".json")
         else:
-            metadata_path = metadata_path / "metadata.json"
-        if metadata_path.exists():
-            loaded_metadata: dict[str, Any] = json.loads(metadata_path.read_text())
+            resume_metadata_path = resume_metadata_path / "metadata.json"
+        if resume_metadata_path.exists():
+            loaded_metadata: dict[str, Any] = json.loads(
+                resume_metadata_path.read_text()
+            )
             resume_metadata = loaded_metadata
-            resume_step = int(loaded_metadata.get("step") or 0)
-            resume_trained_tokens = int(loaded_metadata.get("trained_tokens") or 0)
-            resume_batch = int(
-                loaded_metadata.get("batch_cursor", {}).get(
-                    "global_batch_offset", resume_step
-                )
+            resume_step = metadata_non_negative_int(
+                loaded_metadata,
+                "step",
+                default=0,
+                source=resume_metadata_path,
+            )
+            resume_trained_tokens = metadata_non_negative_int(
+                loaded_metadata,
+                "trained_tokens",
+                default=0,
+                source=resume_metadata_path,
+            )
+            resume_batch = metadata_batch_cursor_offset(
+                loaded_metadata,
+                default=resume_step,
+                source=resume_metadata_path,
             )
 
     dataset = make_dataset(config, loop=True, resume_batch=resume_batch)
@@ -576,16 +725,20 @@ def train_tiny_npz(config: TrainTinyNpzConfig) -> dict[str, Any]:
     model_config = tiny_model_config(config, dataset, vocab_size)
     model = TinyLM(model_config)
     model.set_dtype(DTYPES[config.dtype])
+    device = device_info()
+    compile_plan = compile_payload(config, device)
     optimizer = optim.AdamW(
         learning_rate=config.learning_rate, weight_decay=config.weight_decay
     )
     stepper = CompiledPretrainingStep(
         model,
         optimizer,
-        compile=config.compile,
+        compile=bool(compile_plan["enabled"]),
         state={"step": resume_step, "trained_tokens": resume_trained_tokens},
     )
     if config.resume_from:
+        if resume_metadata_path is None:
+            raise ValueError("resume metadata path was not resolved")
         training_step = (
             stepper
             if isinstance((resume_metadata or {}).get("training_state"), dict)
@@ -601,14 +754,22 @@ def train_tiny_npz(config: TrainTinyNpzConfig) -> dict[str, Any]:
             resume_step = stepper.state.step
             resume_trained_tokens = stepper.state.trained_tokens
         else:
-            resume_step = int(resume_metadata.get("step") or resume_step)
-            resume_trained_tokens = int(
-                resume_metadata.get("trained_tokens") or resume_trained_tokens
+            resume_step = metadata_non_negative_int(
+                resume_metadata,
+                "step",
+                default=resume_step,
+                source=resume_metadata_path,
             )
-        resume_batch = int(
-            resume_metadata.get("batch_cursor", {}).get(
-                "global_batch_offset", resume_batch
+            resume_trained_tokens = metadata_non_negative_int(
+                resume_metadata,
+                "trained_tokens",
+                default=resume_trained_tokens,
+                source=resume_metadata_path,
             )
+        resume_batch = metadata_batch_cursor_offset(
+            resume_metadata,
+            default=resume_batch,
+            source=resume_metadata_path,
         )
     mx.eval(model.state, optimizer.state)
 
@@ -689,11 +850,13 @@ def train_tiny_npz(config: TrainTinyNpzConfig) -> dict[str, Any]:
         "model_source": "cppmega_mlx.models.tiny_lm",
         "model_config": model_config.to_dict(),
         "parameter_count": parameter_count(model),
-        "device": device_info(),
+        "device": device,
         "steps": config.steps,
         "start_step": resume_step,
         "end_step": final["step"],
         "compile": config.compile,
+        "compile_enabled": compile_plan["enabled"],
+        "compile_plan": compile_plan,
         "dtype": config.dtype,
         "tokens_per_step": final["ntokens"],
         "trained_tokens": final["trained_tokens"],
@@ -774,7 +937,17 @@ def main(argv: list[str] | None = None) -> int:
             else train_tiny_npz(config)
         )
     except Exception as exc:
-        payload = {"status": "error", "error": str(exc), "config": asdict(config)}
+        device = device_info()
+        compile_plan = compile_payload(config, device)
+        payload = {
+            "status": "error",
+            "error": str(exc),
+            "config": asdict(config),
+            "compile": config.compile,
+            "compile_enabled": compile_plan["enabled"],
+            "compile_plan": compile_plan,
+            "device": device,
+        }
         print(json.dumps(payload, indent=2, sort_keys=True))
         return 2
 

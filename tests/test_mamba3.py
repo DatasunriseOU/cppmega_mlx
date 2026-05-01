@@ -12,6 +12,7 @@ from mlx.utils import tree_flatten
 
 from cppmega_mlx.nn.mamba3 import (
     DEFAULT_CHUNK_SIZE,
+    Mamba3CacheState,
     Mamba3Config,
     Mamba3ReferenceBlock,
     _chunked_mamba3_diagonal_scan,
@@ -72,6 +73,21 @@ def _larger_mimo_config() -> Mamba3Config:
         is_mimo=True,
         d_conv=4,
         chunk_size=9,
+        rope_fraction=1.0,
+    )
+
+
+def _stress_mimo_config() -> Mamba3Config:
+    return Mamba3Config(
+        d_model=24,
+        expand=2,
+        headdim=8,
+        d_state=8,
+        ngroups=3,
+        mimo_rank=2,
+        is_mimo=True,
+        d_conv=4,
+        chunk_size=11,
         rope_fraction=1.0,
     )
 
@@ -177,6 +193,36 @@ def test_reference_block_state_shapes_match_source_cache_contract() -> None:
     )
 
 
+def test_reference_block_zero_cache_and_return_cache_match_source_contract() -> None:
+    _use_mlx_gpu()
+    mx.random.seed(115)
+    cfg = _tiny_config()
+    block = Mamba3ReferenceBlock(cfg)
+    hidden = _rand((2, 6, cfg.d_model), seed=94)
+    cache = block.zero_cache_state(hidden.shape[0], dtype=hidden.dtype)
+
+    out, returned = block(hidden, cache=cache, return_cache=True)
+    mx.eval(out, returned.angle_dt, returned.ssm, returned.k, returned.v)
+
+    assert out.shape == hidden.shape
+    assert returned.angle_dt.shape == (2, cfg.nheads, block.dims.num_rope_angles)
+    assert returned.ssm.shape == (2, cfg.nheads, cfg.headdim, cfg.d_state)
+    assert returned.k.shape == (2, cfg.effective_mimo_rank, cfg.nheads, cfg.d_state)
+    assert returned.v.shape == (2, cfg.nheads, cfg.headdim)
+    assert returned.angle_dt.dtype == hidden.dtype
+    assert returned.ssm.dtype == hidden.dtype
+    assert returned.k.dtype == hidden.dtype
+    assert returned.v.dtype == hidden.dtype
+    assert np.isfinite(np.array(returned.angle_dt)).all()
+    assert np.isfinite(np.array(returned.ssm)).all()
+    assert np.isfinite(np.array(returned.k)).all()
+    assert np.isfinite(np.array(returned.v)).all()
+    assert np.max(np.abs(np.array(returned.angle_dt))) > 0
+    assert np.max(np.abs(np.array(returned.ssm))) > 0
+    assert np.max(np.abs(np.array(returned.k))) > 0
+    assert np.max(np.abs(np.array(returned.v))) > 0
+
+
 def test_reference_block_rejects_mismatched_initial_state_shape() -> None:
     _use_mlx_gpu()
     mx.random.seed(111)
@@ -187,6 +233,130 @@ def test_reference_block_rejects_mismatched_initial_state_shape() -> None:
 
     with pytest.raises(ValueError, match="h0 must have shape"):
         block(hidden, h0=wrong_h0)
+
+
+def test_reference_block_rejects_mismatched_initial_state_dtype() -> None:
+    _use_mlx_gpu()
+    mx.random.seed(119)
+    cfg = _tiny_config()
+    block = Mamba3ReferenceBlock(cfg)
+    hidden = _rand((2, 5, cfg.d_model), seed=101)
+    wrong_h0 = mx.zeros(
+        (2, cfg.nheads, cfg.headdim, cfg.d_state),
+        dtype=mx.float16,
+    )
+
+    with pytest.raises(TypeError, match="h0 dtype"):
+        block(hidden, h0=wrong_h0)
+
+
+def test_reference_block_rejects_mismatched_cache_shape_dtype_or_duplicate_state() -> None:
+    _use_mlx_gpu()
+    mx.random.seed(116)
+    cfg = _tiny_config()
+    block = Mamba3ReferenceBlock(cfg)
+    hidden = _rand((2, 5, cfg.d_model), seed=95)
+    cache = block.zero_cache_state(hidden.shape[0], dtype=hidden.dtype)
+
+    with pytest.raises(ValueError, match="cache.angle_dt must have shape"):
+        block(
+            hidden,
+            cache=Mamba3CacheState(
+                angle_dt=mx.zeros((2, cfg.nheads, block.dims.num_rope_angles + 1)),
+                ssm=cache.ssm,
+                k=cache.k,
+                v=cache.v,
+            ),
+        )
+    with pytest.raises(ValueError, match="cache.ssm must have dtype"):
+        block(
+            hidden,
+            cache=Mamba3CacheState(
+                angle_dt=cache.angle_dt,
+                ssm=cache.ssm.astype(mx.bfloat16),
+                k=cache.k,
+                v=cache.v,
+            ),
+        )
+    with pytest.raises(ValueError, match="either h0 or cache"):
+        block(hidden, h0=cache.ssm, cache=cache)
+
+
+def test_reference_block_initial_state_is_observable_and_differentiable() -> None:
+    _use_mlx_gpu()
+    mx.random.seed(114)
+    cfg = _tiny_config()
+    block = Mamba3ReferenceBlock(cfg)
+    hidden = _rand((2, 6, cfg.d_model), seed=92)
+    state_shape = (2, cfg.nheads, cfg.headdim, cfg.d_state)
+    zero_h0 = mx.zeros(state_shape, dtype=hidden.dtype)
+    seeded_h0 = 0.05 * _rand(state_shape, seed=93)
+
+    implicit_out, implicit_state = block(hidden)
+    zero_out, zero_state = block(hidden, h0=zero_h0)
+    seeded_out, seeded_state = block(hidden, h0=seeded_h0)
+    mx.eval(implicit_out, implicit_state, zero_out, zero_state, seeded_out, seeded_state)
+
+    _assert_close(zero_out, implicit_out, atol=2e-5)
+    _assert_close(zero_state, implicit_state, atol=2e-5)
+    assert np.max(np.abs(np.array(seeded_out - zero_out))) > 0
+    assert np.max(np.abs(np.array(seeded_state - zero_state))) > 0
+    assert np.isfinite(np.array(seeded_out)).all()
+    assert np.isfinite(np.array(seeded_state)).all()
+
+    def loss_from_h0(h0: mx.array) -> mx.array:
+        out, final_state = block(hidden, h0=h0)
+        return mx.mean(mx.square(out)) + 0.01 * mx.mean(mx.square(final_state))
+
+    loss, h0_grad = mx.value_and_grad(loss_from_h0)(seeded_h0)
+    mx.eval(loss, h0_grad)
+    grad_np = np.array(h0_grad)
+
+    assert math.isfinite(float(loss.item()))
+    assert h0_grad.shape == state_shape
+    assert np.isfinite(grad_np).all()
+    assert np.max(np.abs(grad_np)) > 0
+
+
+def test_reference_block_cache_ssm_continuation_matches_h0_with_zero_angle_offset() -> None:
+    _use_mlx_gpu()
+    mx.random.seed(117)
+    cfg = _tiny_config()
+    block = Mamba3ReferenceBlock(cfg)
+    hidden = _rand((2, 6, cfg.d_model), seed=96)
+    state_shape = (2, cfg.nheads, cfg.headdim, cfg.d_state)
+    seeded_h0 = 0.03 * _rand(state_shape, seed=97)
+    cache = Mamba3CacheState(
+        angle_dt=mx.zeros((2, cfg.nheads, block.dims.num_rope_angles), dtype=hidden.dtype),
+        ssm=seeded_h0,
+        k=0.02
+        * _rand((2, cfg.effective_mimo_rank, cfg.nheads, cfg.d_state), seed=98),
+        v=0.02 * _rand((2, cfg.nheads, cfg.headdim), seed=99),
+    )
+
+    out_h0, state_h0 = block(hidden, h0=seeded_h0)
+    out_cache, state_cache = block(hidden, cache=cache)
+    out_cache_returned, returned = block(hidden, cache=cache, return_cache=True)
+    mx.eval(
+        out_h0,
+        state_h0,
+        out_cache,
+        state_cache,
+        out_cache_returned,
+        returned.angle_dt,
+        returned.ssm,
+        returned.k,
+        returned.v,
+    )
+
+    _assert_close(out_cache, out_h0, atol=2e-5)
+    _assert_close(state_cache, state_h0, atol=2e-5)
+    _assert_close(out_cache_returned, out_h0, atol=2e-5)
+    _assert_close(returned.ssm, state_h0, atol=2e-5)
+    assert returned.k.shape == cache.k.shape
+    assert returned.v.shape == cache.v.shape
+    assert np.max(np.abs(np.array(returned.k - cache.k))) > 0
+    assert np.max(np.abs(np.array(returned.v - cache.v))) > 0
 
 
 def test_reference_block_preserves_hidden_shape() -> None:
@@ -435,6 +605,43 @@ def test_reference_block_lookahead_changes_only_prefix_boundary_token() -> None:
     assert np.max(np.abs(np.array(base[:, prefix_len - 1] - changed[:, prefix_len - 1]))) > 0
 
 
+def test_reference_block_cache_continuation_is_explicitly_not_full_split_equivalence() -> None:
+    _use_mlx_gpu()
+    mx.random.seed(118)
+    cfg = _tiny_config()
+    block = Mamba3ReferenceBlock(cfg)
+    hidden = _rand((2, 8, cfg.d_model), seed=100)
+    split = 5
+
+    full_out, _ = block(hidden)
+    prefix_out, prefix_cache = block(hidden[:, :split], return_cache=True)
+    suffix_out, suffix_cache = block(hidden[:, split:], cache=prefix_cache, return_cache=True)
+    h0_suffix_out, h0_suffix_state = block(hidden[:, split:], h0=prefix_cache.ssm)
+    stitched = mx.concatenate([prefix_out, suffix_out], axis=1)
+    mx.eval(
+        full_out,
+        prefix_out,
+        prefix_cache.angle_dt,
+        suffix_out,
+        suffix_cache.angle_dt,
+        suffix_cache.ssm,
+        h0_suffix_out,
+        h0_suffix_state,
+        stitched,
+    )
+
+    # The local cache continues source-shaped angle + SSM state. It deliberately
+    # does not carry the causal-conv tail or trapezoidal boundary lookahead, so
+    # arbitrary split equality against a full prompt remains unsupported.
+    assert suffix_cache.ssm.shape == h0_suffix_state.shape
+    assert np.isfinite(np.array(suffix_cache.ssm)).all()
+    assert np.isfinite(np.array(h0_suffix_state)).all()
+    assert np.max(np.abs(np.array(suffix_cache.ssm - h0_suffix_state))) > 0
+    assert np.max(np.abs(np.array(suffix_out - h0_suffix_out))) > 0
+    assert np.max(np.abs(np.array(suffix_cache.angle_dt - prefix_cache.angle_dt))) > 0
+    assert np.max(np.abs(np.array(stitched - full_out))) > 0
+
+
 def test_reference_block_bc_channels_are_conv_sensitive() -> None:
     _use_mlx_gpu()
     mx.random.seed(108)
@@ -508,6 +715,85 @@ def test_reference_block_larger_mimo_runtime_and_projection_slice_gradients() ->
         grad = np.array(flat_grads[name])
         assert np.isfinite(grad).all(), name
         assert np.max(np.abs(grad)) > 0, name
+
+
+def test_reference_block_larger_compiled_train_step_matches_eager_state_and_gradients() -> None:
+    _use_mlx_gpu()
+    cfg = _stress_mimo_config()
+    dims = compute_mamba3_in_proj_dims(cfg)
+    hidden = _rand((2, 25, cfg.d_model), seed=151)
+    target = _rand((2, 25, cfg.d_model), seed=152)
+    state_target = _rand((2, cfg.nheads, cfg.headdim, cfg.d_state), seed=153)
+
+    def stress_loss(
+        model: Mamba3ReferenceBlock,
+        x: mx.array,
+        y: mx.array,
+        h_target: mx.array,
+    ) -> mx.array:
+        pred, final_state = model(x)
+        return mx.mean(mx.square(pred - y)) + 0.02 * mx.mean(mx.square(final_state - h_target))
+
+    mx.random.seed(113)
+    eager_block = Mamba3ReferenceBlock(cfg)
+    mx.eval(eager_block.parameters())
+    mx.random.seed(113)
+    compiled_block = Mamba3ReferenceBlock(cfg)
+    optimizer = optim.Adam(learning_rate=5e-3)
+    before_params = _flat_params(compiled_block)
+
+    eager_out, eager_state = eager_block(hidden)
+    eager_loss, eager_grads = nn.value_and_grad(eager_block, stress_loss)(
+        eager_block,
+        hidden,
+        target,
+        state_target,
+    )
+    mx.eval(eager_out, eager_state, eager_loss, eager_grads)
+
+    loss_and_grad = nn.value_and_grad(compiled_block, stress_loss)
+    captured_state = [compiled_block.state, optimizer.state, mx.random.state]
+
+    @partial(mx.compile, inputs=captured_state, outputs=captured_state)
+    def step(x: mx.array, y: mx.array, h_target: mx.array):
+        pred, final_state = compiled_block(x)
+        loss, grads = loss_and_grad(compiled_block, x, y, h_target)
+        optimizer.update(compiled_block, grads)
+        return loss, grads, pred, final_state
+
+    compiled_loss, compiled_grads, compiled_out, compiled_state = step(hidden, target, state_target)
+    mx.eval(captured_state, compiled_loss, compiled_grads, compiled_out, compiled_state)
+    after_params = _flat_params(compiled_block)
+
+    assert compiled_out.shape == hidden.shape
+    assert compiled_state.shape == state_target.shape
+    assert math.isfinite(float(compiled_loss.item()))
+    _assert_close(compiled_loss, eager_loss, atol=5e-4)
+    _assert_close(compiled_out, eager_out, atol=5e-4)
+    _assert_close(compiled_state, eager_state, atol=5e-4)
+
+    eager_flat_grads = dict(tree_flatten(eager_grads))
+    compiled_flat_grads = dict(tree_flatten(compiled_grads))
+    for name in ("conv_weight", "dt_bias", "D", "out_proj.weight"):
+        compiled_grad = compiled_flat_grads[name]
+        grad_np = np.array(compiled_grad)
+        assert np.isfinite(grad_np).all(), name
+        assert np.max(np.abs(grad_np)) > 0, name
+        _assert_close(compiled_grad, eager_flat_grads[name], atol=8e-4)
+        assert np.max(np.abs(after_params[name] - before_params[name])) > 0, name
+
+    start = 0
+    in_proj_grad = np.array(compiled_flat_grads["in_proj.weight"])
+    for name, size in zip(
+        ("z", "x", "B", "C", "dd_dt", "dd_A", "trap", "angles"),
+        dims.split_sizes,
+        strict=True,
+    ):
+        grad_slice = in_proj_grad[start : start + size]
+        assert np.isfinite(grad_slice).all(), name
+        assert np.max(np.abs(grad_slice)) > 0, name
+        start += size
+    assert start == dims.total
 
 
 def test_reference_block_trains_with_finite_gradients() -> None:

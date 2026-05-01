@@ -42,6 +42,12 @@ records:
   Python-side step cursor, trained-token cursor, compile flag, gradient
   accumulation width, pending microbatch count, and optional gradient
   accumulator file metadata.
+- `evaluation` when supplied by the trainer, as validation receipt/provenance
+  metadata. The helper validates the current local receipt fields
+  (`requested_batches`, `planned_batches`, `evaluated_batches`, and
+  `metrics.loss` / `metrics.ntokens` / `metrics.batches` /
+  `metrics.tokens_per_second`) plus MLX-LM callback-style `iteration`,
+  `val_loss`, and `val_time` fields, but does not use them for resume.
 - `rng`, currently either `{"mode": "not_saved"}` or seed provenance
   `{"mode": "seed", "seed": N, ...}`. Standalone serialized RNG state is not
   supported.
@@ -88,16 +94,21 @@ HybridTinyLM smoke trainer:
   checkpoints as `DIR/checkpoint-000001/`, `DIR/checkpoint-000002/`, and so on,
   using the global resumed step.
 - `--checkpoint-path PATH` writes a final full-training checkpoint after the
-  requested local steps finish.
+  requested local steps finish. When `--eval-batches` is enabled, the final
+  checkpoint manifest includes the same `evaluation` receipt emitted by the
+  script JSON payload.
 - `--resume-from PATH` restores model weights and optimizer state, restores the
   `CompiledPretrainingStep` cursor from `training_state` when present, falls
   back to legacy top-level `step` / `trained_tokens` metadata otherwise, and
   reconstructs the NPZ dataset cursor from `batch_cursor.global_batch_offset`.
 
-The manifest records `training_config`, `dataset`, `trained_tokens`, and
-`batch_cursor` alongside the lower-level model/optimizer fields. This mirrors
-the MLX-LM trainer's `steps_per_save` cadence while saving full pretraining
-state instead of LoRA adapter-only weights.
+The manifest records `training_config`, `dataset`, `trained_tokens`,
+`batch_cursor`, and a normalized `resume_cursor` alongside the lower-level
+model/optimizer fields. `resume_cursor` mirrors the script JSON receipt with
+the restored step, trained-token count, and batch cursor needed to resume from
+the next fixed-shape batch. This mirrors the MLX-LM trainer's `steps_per_save`
+cadence while saving full pretraining state instead of LoRA adapter-only
+weights.
 
 When the dataset path points at ignored local samples such as
 `data/parquet_samples/gb10/...`, the checkpoint manifest records that local path
@@ -106,13 +117,21 @@ same dataset file and metadata are staged on the target host; do not treat it as
 a portable GB10/M4 parity receipt by itself.
 
 Regression coverage exercises both Mamba3-only (`--pattern M`) and M2RNN-only
-(`--pattern R`) HybridTinyLM routes in eager and compiled modes. It also covers
-a mixed `AEMR` HybridTinyLM checkpoint with custom DSA-routed attention, MoE,
-Mamba3, and M2RNN block parameters plus AdamW state, then verifies the next
-eager train step matches an uninterrupted run. The resume path restores the
-same Python-side `CompiledPretrainingStep` cursor for both compiled modes, and
-the next checkpoint records the continued global batch cursor rather than
-restarting the dataset iterator.
+(`--pattern R`) HybridTinyLM routes in eager and compiled modes. The script
+smokes save/resume/eval for both M and R with full structure side channels
+(`structure_ids`, `dep_levels`, `ast_depth_ids`, `sibling_index_ids`, and
+`node_type_ids`) and asserts the JSON payload plus final manifest expose
+`resume_cursor` and validation metadata. It also covers a mixed `AEMR`
+HybridTinyLM checkpoint with custom DSA-routed attention, MoE, Mamba3, and
+M2RNN block parameters plus AdamW state, then verifies the next eager train step
+matches an uninterrupted run. The resume path restores the same Python-side
+`CompiledPretrainingStep` cursor for both compiled modes, and the next
+checkpoint records the continued global batch cursor rather than restarting the
+dataset iterator.
+
+The synthetic dry-run path writes the same full structure side-channel set plus
+`attention_mask`, so `--dry-run-json` exercises the model-threaded side-channel
+contract even when no local NPZ or parquet sample is supplied.
 
 The current implementation intentionally keeps single-shard model weights. Large
 runs should add MLX-LM-style sharding (`model-00001-of-000NN.safetensors` plus

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import os
 import struct
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import numpy as np
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -93,7 +96,11 @@ def write_mmididx(
     )
 
 
-def run_script(*args: str, timeout: int = 30) -> subprocess.CompletedProcess[str]:
+def run_script(
+    *args: str,
+    timeout: int = 30,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, str(SCRIPT), *args],
         cwd=ROOT,
@@ -101,6 +108,7 @@ def run_script(*args: str, timeout: int = 30) -> subprocess.CompletedProcess[str
         capture_output=True,
         timeout=timeout,
         check=False,
+        env=env,
     )
 
 
@@ -232,6 +240,18 @@ def test_dry_run_json_accepts_suffixless_megatron_prefix(tmp_path: Path) -> None
     assert payload["dataset"]["index_metadata"]["sequence_count"] == 2
     assert payload["dataset"]["index_metadata"]["document_count"] == 2
     assert payload["dataset"]["side_channels"] == []
+    receipt = payload["dataset"]["dataset_receipt"]
+    assert receipt["source_format"] == "megatron"
+    assert receipt["source_dataset_name"] == "clang_semantic_4k_v10_train"
+    assert receipt["source_path"] == str(prefix)
+    assert receipt["token_key"] == "tokens"
+    assert receipt["seq_len"] == 4
+    assert receipt["batch_size"] == 2
+    assert receipt["num_samples"] == payload["dataset"]["num_samples"]
+    assert receipt["num_batches"] == payload["dataset"]["num_batches"]
+    assert receipt["dropped_samples"] == payload["dataset"]["dropped_samples"]
+    assert receipt["side_channels"] == []
+    assert receipt["index_metadata"] == payload["dataset"]["index_metadata"]
     assert payload["model_config"]["vocab_size"] == 32
 
 
@@ -258,6 +278,33 @@ def test_invalid_token_vocab_returns_error_json(tmp_path: Path) -> None:
     payload = json.loads(result.stdout)
     assert payload["status"] == "error"
     assert "exceeds vocab_size=8" in payload["error"]
+    assert payload["compile_enabled"] is True
+    assert payload["compile_plan"]["enabled"] is True
+
+
+def test_valid_dataset_format_without_validation_path_returns_error_json(
+    tmp_path: Path,
+) -> None:
+    npz_path = tmp_path / "tokens.npz"
+    write_npz(npz_path, vocab_size=32)
+
+    result = run_script(
+        str(npz_path),
+        "--json",
+        "--valid-dataset-format",
+        "npz",
+    )
+
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "error"
+    assert (
+        payload["error"]
+        == "valid_dataset_format requires valid_dataset_path or valid_npz_path"
+    )
+    assert payload["compile"] is True
+    assert payload["compile_enabled"] is True
+    assert payload["compile_plan"]["enabled"] is True
 
 
 def test_one_eager_training_step_reports_machine_readable_metrics(
@@ -337,6 +384,18 @@ def test_one_eager_training_step_accepts_suffixless_megatron_prefix(
     assert payload["dataset"]["metadata"]["source_format"] == "megatron"
     assert payload["dataset"]["index_metadata"]["dtype"] == "int32"
     assert payload["dataset"]["side_channels"] == []
+    receipt = payload["dataset"]["dataset_receipt"]
+    assert receipt["source_format"] == "megatron"
+    assert receipt["source_dataset_name"] == "clang_semantic_4k_v10_train"
+    assert receipt["source_path"] == str(prefix)
+    assert receipt["token_key"] == "tokens"
+    assert receipt["seq_len"] == 4
+    assert receipt["batch_size"] == 2
+    assert receipt["num_samples"] == payload["dataset"]["num_samples"]
+    assert receipt["num_batches"] == payload["dataset"]["num_batches"]
+    assert receipt["dropped_samples"] == payload["dataset"]["dropped_samples"]
+    assert receipt["side_channels"] == []
+    assert receipt["index_metadata"] == payload["dataset"]["index_metadata"]
     assert payload["compile"] is False
     assert payload["tokens_per_step"] == 6
     assert payload["trained_tokens"] == 6
@@ -544,6 +603,51 @@ def test_one_compiled_training_step_reports_compiled_metrics(tmp_path: Path) -> 
     assert payload["step_metrics"][0]["compiled"] is True
 
 
+def test_mlx_disable_compile_env_reports_requested_but_eager_execution(
+    tmp_path: Path,
+) -> None:
+    npz_path = tmp_path / "tokens.npz"
+    write_npz(npz_path, vocab_size=32)
+    env = {**os.environ, "MLX_DISABLE_COMPILE": "1"}
+
+    result = run_script(
+        str(npz_path),
+        "--json",
+        "--batch-size",
+        "2",
+        "--seq-len",
+        "4",
+        "--steps",
+        "1",
+        "--dtype",
+        "float32",
+        "--hidden-size",
+        "8",
+        "--num-heads",
+        "1",
+        "--ffn-hidden-size",
+        "16",
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "ok"
+    assert payload["compile"] is True
+    assert payload["compile_enabled"] is False
+    assert payload["compile_plan"] == {
+        "backend": "eager",
+        "disabled_by_env": True,
+        "enabled": False,
+        "fixed_batch_signature": False,
+        "mlx_disable_compile": "1",
+        "pattern": "python_eager_step",
+        "requested": True,
+        "state_inputs_outputs": [],
+    }
+    assert payload["step_metrics"][0]["compiled"] is False
+
+
 def test_checkpoint_save_and_resume_reports_manifest_contract(tmp_path: Path) -> None:
     npz_path = tmp_path / "tokens.npz"
     checkpoint_dir = tmp_path / "checkpoints"
@@ -734,3 +838,87 @@ def test_resume_checkpoint_cursor_advances_from_nonzero_global_offset(
         trained_tokens=second_payload["trained_tokens"],
         compiled=False,
     )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "error"),
+    [
+        ({"step": "1"}, "step must be a non-negative integer"),
+        ({"trained_tokens": True}, "trained_tokens must be a non-negative integer"),
+        (
+            {"batch_cursor": {"global_batch_offset": "1"}},
+            "batch_cursor.global_batch_offset must be a non-negative integer",
+        ),
+    ],
+)
+def test_resume_rejects_coerced_checkpoint_cursor_metadata(
+    tmp_path: Path,
+    mutation: dict[str, Any],
+    error: str,
+) -> None:
+    npz_path = tmp_path / "tokens.npz"
+    checkpoint_dir = tmp_path / "checkpoints"
+    write_npz(npz_path, vocab_size=32)
+
+    first = run_script(
+        str(npz_path),
+        "--json",
+        "--no-compile",
+        "--batch-size",
+        "2",
+        "--seq-len",
+        "4",
+        "--steps",
+        "1",
+        "--dtype",
+        "float32",
+        "--hidden-size",
+        "8",
+        "--num-heads",
+        "1",
+        "--ffn-hidden-size",
+        "16",
+        "--checkpoint-dir",
+        str(checkpoint_dir),
+        "--checkpoint-save-interval",
+        "1",
+    )
+    assert first.returncode == 0, first.stderr
+
+    checkpoint_path = checkpoint_dir / "checkpoint-000001"
+    metadata_path = checkpoint_path / "metadata.json"
+    manifest = json.loads(metadata_path.read_text())
+    if "batch_cursor" in mutation:
+        manifest["batch_cursor"].update(mutation["batch_cursor"])
+    else:
+        manifest.update(mutation)
+    metadata_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+
+    resumed = run_script(
+        str(npz_path),
+        "--json",
+        "--no-compile",
+        "--batch-size",
+        "2",
+        "--seq-len",
+        "4",
+        "--steps",
+        "1",
+        "--dtype",
+        "float32",
+        "--hidden-size",
+        "8",
+        "--num-heads",
+        "1",
+        "--ffn-hidden-size",
+        "16",
+        "--resume-from",
+        str(checkpoint_path),
+    )
+
+    assert resumed.returncode == 2
+    payload = json.loads(resumed.stdout)
+    assert payload["status"] == "error"
+    assert error in payload["error"]
+    assert payload["compile"] is False
+    assert payload["compile_enabled"] is False

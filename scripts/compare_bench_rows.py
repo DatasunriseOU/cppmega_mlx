@@ -7,10 +7,16 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, NamedTuple
 
 
 MISSING = "<missing>"
+COMPARE_PACKAGE_SCHEMA_VERSION = 1
+COMPARE_PACKAGE_KIND = "cppmega.mlx.gb10_matched_compare_package"
+COMPARE_REPORT_FILENAME = "compare_report.json"
+MATCHED_COMPARISONS_FILENAME = "matched_comparisons.jsonl"
+REFUSED_PAIRS_FILENAME = "refused_pairs.jsonl"
+COMPARE_PACKAGE_MANIFEST_FILENAME = "manifest.json"
 
 MATCH_FIELDS: tuple[str, ...] = (
     "profile",
@@ -90,8 +96,17 @@ MATCHED_COMPARISON_KEY_REQUIREMENT = (
     "comparison_key.workload + comparison_key.software, "
     "bench_receipt.comparison_key, workload_key + software_key, or legacy "
     "matched_run.key with run_metadata.framework. The selected workload and "
-    "software keys must be identical across rows, including extra fields."
+    "software keys must be identical across rows, including extra fields. "
+    "When modern comparison-key sources are present in the same row, they must "
+    "also agree with each other; legacy matched_run provenance is used only "
+    "when no modern comparison key exists."
 )
+
+
+class ComparisonKeySource(NamedTuple):
+    name: str
+    workload: dict[str, Any]
+    software: dict[str, Any]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -121,6 +136,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--jsonl",
         action="store_true",
         help="Emit one comparison object per line instead of one summary object.",
+    )
+    parser.add_argument(
+        "--package-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Write a GB10 matched-run package with manifest.json, full report, "
+            "matched comparison JSONL, and refusal JSONL artifacts."
+        ),
     )
     return parser
 
@@ -239,26 +263,37 @@ def _has_mapping(value: Any) -> bool:
     return isinstance(value, dict) and bool(value)
 
 
-def _explicit_comparison_keys(
-    row: dict[str, Any],
-) -> tuple[str, dict[str, Any], dict[str, Any]] | None:
+def _explicit_comparison_key_sources(row: dict[str, Any]) -> list[ComparisonKeySource]:
+    sources: list[ComparisonKeySource] = []
     comparison_key = _dict_value(row.get("comparison_key"))
     comparison_workload = _dict_value(comparison_key.get("workload"))
     comparison_software = _dict_value(comparison_key.get("software"))
     if comparison_workload and comparison_software:
-        return "comparison_key", comparison_workload, comparison_software
+        sources.append(
+            ComparisonKeySource("comparison_key", comparison_workload, comparison_software)
+        )
 
     bench_receipt = _dict_value(row.get("bench_receipt"))
     receipt_comparison_key = _dict_value(bench_receipt.get("comparison_key"))
     receipt_workload = _dict_value(receipt_comparison_key.get("workload"))
     receipt_software = _dict_value(receipt_comparison_key.get("software"))
     if receipt_workload and receipt_software:
-        return "bench_receipt.comparison_key", receipt_workload, receipt_software
+        sources.append(
+            ComparisonKeySource(
+                "bench_receipt.comparison_key",
+                receipt_workload,
+                receipt_software,
+            )
+        )
 
     workload_key = _dict_value(row.get("workload_key"))
     software_key = _dict_value(row.get("software_key"))
     if workload_key and software_key:
-        return "workload_key+software_key", workload_key, software_key
+        sources.append(
+            ComparisonKeySource("workload_key+software_key", workload_key, software_key)
+        )
+    if sources:
+        return sources
 
     matched_key = _dict_value(
         _first_present(
@@ -272,47 +307,48 @@ def _explicit_comparison_keys(
     )
     framework_key = _dict_value(_nested(row, "run_metadata", "framework"))
     if matched_key and _has_mapping(framework_key):
-        return "matched_run+run_metadata.framework", matched_key, framework_key
-
-    return None
-
-
-def _comparison_key_sources(row: dict[str, Any]) -> list[str]:
-    sources: list[str] = []
-    comparison_key = _dict_value(row.get("comparison_key"))
-    if _has_mapping(comparison_key.get("workload")) and _has_mapping(
-        comparison_key.get("software")
-    ):
-        sources.append("comparison_key")
-
-    bench_receipt = _dict_value(row.get("bench_receipt"))
-    receipt_comparison_key = _dict_value(bench_receipt.get("comparison_key"))
-    if _has_mapping(receipt_comparison_key.get("workload")) and _has_mapping(
-        receipt_comparison_key.get("software")
-    ):
-        sources.append("bench_receipt.comparison_key")
-
-    if _has_mapping(row.get("workload_key")) and _has_mapping(row.get("software_key")):
-        sources.append("workload_key+software_key")
-
-    matched_key = _dict_value(
-        _first_present(
-            row,
-            (
-                ("matched_run_key",),
-                ("matched_run", "key"),
-                ("run_metadata", "matched_run", "key"),
-            ),
+        sources.append(
+            ComparisonKeySource(
+                "matched_run+run_metadata.framework",
+                matched_key,
+                framework_key,
+            )
         )
-    )
-    if matched_key and _has_mapping(_nested(row, "run_metadata", "framework")):
-        sources.append("matched_run+run_metadata.framework")
 
     return sources
 
 
+def _comparison_key_conflicts(
+    sources: list[ComparisonKeySource],
+) -> list[dict[str, Any]]:
+    conflicts: list[dict[str, Any]] = []
+    if len(sources) < 2:
+        return conflicts
+    first = sources[0]
+    for source in sources[1:]:
+        for section, first_value, source_value in (
+            ("workload", first.workload, source.workload),
+            ("software", first.software, source.software),
+        ):
+            if _freeze_key_value(first_value) == _freeze_key_value(source_value):
+                continue
+            conflicts.append(
+                {
+                    "section": section,
+                    "left_source": first.name,
+                    "right_source": source.name,
+                    "left": first_value,
+                    "right": source_value,
+                }
+            )
+    return conflicts
+
+
 def missing_matched_comparison_key(row: dict[str, Any]) -> bool:
-    return not row.get("matched_comparison_key_sources")
+    return (
+        not row.get("matched_comparison_key_sources")
+        or bool(row.get("matched_comparison_key_conflicts"))
+    )
 
 
 def normalized_row(row: dict[str, Any]) -> dict[str, Any]:
@@ -336,7 +372,13 @@ def normalized_row(row: dict[str, Any]) -> dict[str, Any]:
     receipt_comparison_software = _dict_value(receipt_comparison_key.get("software"))
     receipt_workload = _dict_value(bench_receipt.get("workload"))
     receipt_software = _dict_value(bench_receipt.get("software"))
-    explicit_comparison_keys = _explicit_comparison_keys(row)
+    explicit_comparison_key_sources = _explicit_comparison_key_sources(row)
+    comparison_key_conflicts = _comparison_key_conflicts(explicit_comparison_key_sources)
+    explicit_comparison_keys = (
+        None if comparison_key_conflicts else explicit_comparison_key_sources[0]
+        if explicit_comparison_key_sources
+        else None
+    )
 
     matched_key = _dict_value(
         _first_present(
@@ -818,15 +860,18 @@ def normalized_row(row: dict[str, Any]) -> dict[str, Any]:
                 _gib_to_bytes(row.get("max_alloc_gib")),
                 _gib_to_bytes(row.get("peak_memory_gib")),
             ),
-            "matched_comparison_key_sources": _comparison_key_sources(row),
+            "matched_comparison_key_sources": [
+                source.name for source in explicit_comparison_key_sources
+            ],
+            "matched_comparison_key_conflicts": comparison_key_conflicts,
             "matched_comparison_key_source": (
-                explicit_comparison_keys[0] if explicit_comparison_keys else None
+                explicit_comparison_keys.name if explicit_comparison_keys else None
             ),
             "matched_comparison_workload_key": (
-                explicit_comparison_keys[1] if explicit_comparison_keys else None
+                explicit_comparison_keys.workload if explicit_comparison_keys else None
             ),
             "matched_comparison_software_key": (
-                explicit_comparison_keys[2] if explicit_comparison_keys else None
+                explicit_comparison_keys.software if explicit_comparison_keys else None
             ),
         }
     )
@@ -924,6 +969,7 @@ def _row_identity(row: dict[str, Any]) -> dict[str, Any]:
         "cuda_version": row.get("cuda_version"),
         "driver_version": row.get("driver_version"),
         "matched_comparison_key_sources": row.get("matched_comparison_key_sources", []),
+        "matched_comparison_key_conflicts": row.get("matched_comparison_key_conflicts", []),
         "matched_comparison_key_source": row.get("matched_comparison_key_source"),
     }
 
@@ -997,6 +1043,10 @@ def unmatched_pair_row(m4: dict[str, Any], gb10: dict[str, Any]) -> dict[str, An
         "missing_matched_comparison_key": {
             "m4": m4_missing_key,
             "gb10": gb10_missing_key,
+        },
+        "matched_comparison_key_conflicts": {
+            "m4": m4.get("matched_comparison_key_conflicts", []),
+            "gb10": gb10.get("matched_comparison_key_conflicts", []),
         },
         "mismatched_comparison_keys": mismatched_comparison_keys,
         "mismatched_fields": mismatched_fields,
@@ -1079,6 +1129,7 @@ def build_report(
     host_counts = {"m4": 0, "gb10": 0, "ignored": 0}
     incomplete_match_metadata_counts = {"m4": 0, "gb10": 0}
     missing_matched_comparison_key_counts = {"m4": 0, "gb10": 0}
+    matched_comparison_key_conflict_counts = {"m4": 0, "gb10": 0}
     for row in normalized:
         kind = host_kind(row, m4_label=m4_label, gb10_label=gb10_label)
         if kind is None:
@@ -1088,10 +1139,13 @@ def build_report(
         host_rows[kind].append(row)
         missing_required = missing_required_match_fields(row)
         missing_key = missing_matched_comparison_key(row)
+        key_conflict = bool(row.get("matched_comparison_key_conflicts"))
         if missing_required:
             incomplete_match_metadata_counts[kind] += 1
         if missing_key:
             missing_matched_comparison_key_counts[kind] += 1
+        if key_conflict:
+            matched_comparison_key_conflict_counts[kind] += 1
         if missing_required or missing_key:
             continue
         grouped.setdefault(strict_match_key(row), {"m4": [], "gb10": []})[kind].append(row)
@@ -1126,12 +1180,109 @@ def build_report(
         },
         "incomplete_match_metadata_counts": incomplete_match_metadata_counts,
         "missing_matched_comparison_key_counts": missing_matched_comparison_key_counts,
+        "matched_comparison_key_conflict_counts": matched_comparison_key_conflict_counts,
         "parity_claim_refused": not comparisons,
         "matched_comparison_count": len(comparisons),
         "unmatched_pair_count": len(refused_pairs),
         "unmatched_pairs": refused_pairs,
         "comparisons": comparisons,
     }
+
+
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+    text = "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows)
+    path.write_text(text, encoding="utf-8")
+
+
+def _packaged_report(report: dict[str, Any]) -> dict[str, Any]:
+    return {
+        **report,
+        "comparisons": [
+            {
+                key: value
+                for key, value in comparison.items()
+                if key != "ratios"
+            }
+            for comparison in report["comparisons"]
+        ],
+        "ratio_artifact": MATCHED_COMPARISONS_FILENAME,
+        "artifact_policy": (
+            "Package compare_report.json intentionally omits ratios. "
+            "Use matched_comparisons.jsonl for ratio-bearing matched rows only."
+        ),
+    }
+
+
+def write_compare_package(
+    report: dict[str, Any],
+    package_dir: Path,
+    *,
+    inputs: list[str],
+    m4_label: str,
+    gb10_label: str,
+) -> dict[str, Any]:
+    package_dir.mkdir(parents=True, exist_ok=True)
+    report_path = package_dir / COMPARE_REPORT_FILENAME
+    matched_path = package_dir / MATCHED_COMPARISONS_FILENAME
+    refused_path = package_dir / REFUSED_PAIRS_FILENAME
+    manifest_path = package_dir / COMPARE_PACKAGE_MANIFEST_FILENAME
+
+    _write_json(report_path, _packaged_report(report))
+    _write_jsonl(matched_path, report["comparisons"])
+    _write_jsonl(refused_path, report["unmatched_pairs"])
+
+    manifest = {
+        "schema_version": COMPARE_PACKAGE_SCHEMA_VERSION,
+        "kind": COMPARE_PACKAGE_KIND,
+        "status": report["status"],
+        "package_dir": str(package_dir),
+        "inputs": list(inputs),
+        "hardware_labels": {
+            "m4": m4_label,
+            "gb10": gb10_label,
+        },
+        "artifacts": {
+            "compare_report": COMPARE_REPORT_FILENAME,
+            "matched_comparisons": MATCHED_COMPARISONS_FILENAME,
+            "refused_pairs": REFUSED_PAIRS_FILENAME,
+            "manifest": COMPARE_PACKAGE_MANIFEST_FILENAME,
+        },
+        "host_counts": report["host_counts"],
+        "incomplete_match_metadata_counts": report[
+            "incomplete_match_metadata_counts"
+        ],
+        "missing_matched_comparison_key_counts": report[
+            "missing_matched_comparison_key_counts"
+        ],
+        "matched_comparison_key_conflict_counts": report[
+            "matched_comparison_key_conflict_counts"
+        ],
+        "matched_comparison_count": report["matched_comparison_count"],
+        "unmatched_pair_count": report["unmatched_pair_count"],
+        "parity_claim_refused": report["parity_claim_refused"],
+        "matched_comparison_key_requirement": report[
+            "matched_comparison_key_requirement"
+        ],
+        "artifact_policy": (
+            "Only matched_comparisons.jsonl may contain ratios. "
+            "refused_pairs.jsonl is refusal evidence and must not be used for "
+            "M4-vs-GB10 throughput or memory claims."
+        ),
+        "workload_software_key_guard": (
+            "GB10 comparisons require identical selected "
+            "comparison_key.workload and comparison_key.software objects on "
+            "both rows; unmatched or row-local conflicting keys stay refused."
+        ),
+    }
+    _write_json(manifest_path, manifest)
+    return manifest
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1142,6 +1293,17 @@ def main(argv: list[str] | None = None) -> int:
             m4_label=args.m4_label,
             gb10_label=args.gb10_label,
         )
+        if args.package_dir is not None:
+            report = {
+                **report,
+                "compare_package": write_compare_package(
+                    report,
+                    args.package_dir,
+                    inputs=args.input,
+                    m4_label=args.m4_label,
+                    gb10_label=args.gb10_label,
+                ),
+            }
     except Exception as exc:
         print(json.dumps({"status": "error", "error": str(exc)}, indent=2, sort_keys=True))
         return 2

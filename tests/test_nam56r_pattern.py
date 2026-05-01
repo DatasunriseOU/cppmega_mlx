@@ -24,6 +24,7 @@ from cppmega_mlx.recipes.pattern import (
     a_layer_numbers,
     expand_nam_pattern,
     expand_symbols,
+    parse_nam_pattern,
     r_layer_numbers,
 )
 
@@ -32,7 +33,8 @@ def _cppmega_source_layout():
     reference_root = Path(__file__).resolve().parents[2] / "cppmega"
     if not reference_root.exists():
         pytest.skip("../cppmega reference checkout is not present")
-    sys.path.insert(0, str(reference_root))
+    if str(reference_root) not in sys.path:
+        sys.path.insert(0, str(reference_root))
     module = pytest.importorskip("cppmega.megatron.nam56r_layout")
     # Use dynamic import so local pyright does not require the sibling checkout.
     module = import_module(module.__name__)
@@ -40,6 +42,20 @@ def _cppmega_source_layout():
     assert module_file is not None
     assert Path(module_file).resolve().is_relative_to(reference_root.resolve())
     return module.load_attention_layer_numbers, module.load_dsa_a_layer_ranks
+
+
+def _cppmega_source_parse_nem_pattern():
+    reference_root = Path(__file__).resolve().parents[2] / "cppmega"
+    if not reference_root.exists():
+        pytest.skip("../cppmega reference checkout is not present")
+    if str(reference_root) not in sys.path:
+        sys.path.insert(0, str(reference_root))
+    module = pytest.importorskip("cppmega.recipes.nam56r_megatron")
+    module = import_module(module.__name__)
+    module_file = module.__file__
+    assert module_file is not None
+    assert Path(module_file).resolve().is_relative_to(reference_root.resolve())
+    return module.parse_nem_pattern
 
 
 def test_expand_symbols_tiles_pattern_to_depth_with_one_based_layers():
@@ -58,6 +74,21 @@ def test_parser_fails_closed_on_unsupported_symbols():
 
     with pytest.raises(ValueError, match="depth must be positive"):
         expand_symbols("AEMR", 0)
+
+
+def test_parser_fails_closed_on_cppmega_supported_upstream_only_symbols():
+    source_parse_nem_pattern = _cppmega_source_parse_nem_pattern()
+    source_cases = {
+        "D": ("ADMR", 4, ["A", "D", "M", "R"]),
+        "G": ("AGMR", 4, ["A", "G", "M", "R"]),
+        "|": ("A|E|M|R", 4, ["A", "E", "M", "R"]),
+    }
+
+    for symbol, (pattern, depth, expected_source) in source_cases.items():
+        assert source_parse_nem_pattern(pattern, depth=depth) == expected_source
+        with pytest.raises(ValueError, match="supported symbols are A, E, M, R"):
+            parse_nam_pattern(pattern)
+        assert symbol
 
 
 def test_default_nam56r_pattern_matches_cppmega_counts_and_indices():

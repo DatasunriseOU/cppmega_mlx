@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import json
 import subprocess
 from pathlib import Path
@@ -62,6 +63,11 @@ def run_compare(*args: str) -> subprocess.CompletedProcess[str]:
         timeout=30,
         check=False,
     )
+
+
+def test_benchmark_package_modules_are_importable() -> None:
+    assert importlib.import_module("scripts.bench_matrix") is not None
+    assert importlib.import_module("scripts.compare_bench_rows") is not None
 
 
 def workload_key(row: dict[str, Any]) -> dict[str, Any]:
@@ -409,6 +415,158 @@ def receipt_only_row(
     }
 
 
+def bench_tiny_json_row(
+    hardware_label: str,
+    *,
+    tokens_per_second: float = 100.0,
+    peak_memory_bytes: int = 1_000,
+) -> dict[str, Any]:
+    workload = {
+        "dtype": "float32",
+        "batch_size": 1,
+        "seq_len": 4,
+        "vocab_size": 32,
+        "d_model": 8,
+        "n_heads": 1,
+        "n_layers": 1,
+        "mlp_dim": 16,
+        "warmup_steps": 0,
+        "measured_steps": 1,
+        "compile": False,
+        "include_structure": False,
+        "learning_rate": 0.001,
+        "model_source": "cppmega_mlx.models.tiny_lm",
+        "model_route": "tiny",
+        "route_plan": tiny_route_plan(),
+        "backend_plan": mlx_tiny_backend_plan(),
+        "backend": "mlx",
+        "data_contract": "synthetic_tokens",
+    }
+    software = {
+        "framework": "mlx",
+        "backend": "mlx",
+        "execution_backend": "mlx",
+        "framework_backend": "metal",
+        "python_version": "3.13.0",
+        "platform": "macOS-15-arm64-arm-64bit",
+        "machine": "arm64",
+        "mlx_version": "0.31.0",
+        "mlx_lm_version": "0.31.0",
+        "mlx_metal_version": "0.31.0",
+        "default_device": "Device(gpu, 0)",
+        "device_name": "Apple M4 Max",
+        "metal": {"available": True, "capture_supported": True},
+    }
+    comparison_key = {
+        "schema_version": 1,
+        "workload": workload,
+        "software": software,
+    }
+    return {
+        "status": "ok",
+        "receipt_schema_version": 1,
+        "receipt_scope": "local_only",
+        "local_only": True,
+        "gb10_parity_claim": False,
+        "hardware_label": hardware_label,
+        "dtype": "float32",
+        "batch_size": 1,
+        "seq_len": 4,
+        "warmup_steps": 0,
+        "measured_steps": 1,
+        "compile": False,
+        "include_structure": False,
+        "tokens_per_second": tokens_per_second,
+        "peak_memory_bytes": peak_memory_bytes,
+        "mean_step_time_s": 0.002,
+        "model_source": "cppmega_mlx.models.tiny_lm",
+        "model_route": "tiny",
+        "route_plan": tiny_route_plan(),
+        "backend_plan": mlx_tiny_backend_plan(),
+        "backend": "mlx",
+        "config": {
+            "hardware_label": hardware_label,
+            "batch_size": 1,
+            "seq_len": 4,
+            "vocab_size": 32,
+            "d_model": 8,
+            "n_heads": 1,
+            "n_layers": 1,
+            "mlp_dim": 16,
+            "dtype": "float32",
+            "learning_rate": 0.001,
+            "warmup_steps": 0,
+            "steps": 1,
+            "seed": 0,
+            "compile": False,
+            "include_structure": False,
+            "model_route": "tiny",
+        },
+        "device": {
+            "python": "3.13.0",
+            "platform": "macOS-15-arm64-arm-64bit",
+            "machine": "arm64",
+            "mlx": "0.31.0",
+            "mlx_lm": "0.31.0",
+            "mlx_metal": "0.31.0",
+            "default_device": "Device(gpu, 0)",
+            "mlx_device_info": {"device_name": "Apple M4 Max"},
+            "metal": {"available": True, "capture_supported": True},
+        },
+        "run_metadata": {
+            "schema_version": 1,
+            "workload": {**workload, "hardware_label": hardware_label},
+            "framework": {
+                "python": "3.13.0",
+                "platform": "macOS-15-arm64-arm-64bit",
+                "machine": "arm64",
+                "mlx": "0.31.0",
+                "mlx_lm": "0.31.0",
+                "mlx_metal": "0.31.0",
+                "default_device": "Device(gpu, 0)",
+                "mlx_device_info": {"device_name": "Apple M4 Max"},
+                "metal": {"available": True, "capture_supported": True},
+            },
+            "matched_run": {
+                "key": workload,
+                "receipt_scope": "local_only",
+                "local_only": True,
+                "gb10_parity_claim": False,
+            },
+        },
+        "matched_run": {
+            "key": workload,
+            "receipt_scope": "local_only",
+            "local_only": True,
+            "gb10_parity_claim": False,
+        },
+        "matched_run_key": workload,
+        "workload_key": workload,
+        "software_key": software,
+        "comparison_key": comparison_key,
+        "bench_receipt": {
+            "schema_version": 1,
+            "receipt_scope": "local_only",
+            "local_only": True,
+            "gb10_parity_claim": False,
+            "hardware_label": hardware_label,
+            "software": software,
+            "workload": workload,
+            "comparison_key": comparison_key,
+            "timing": {
+                "warmup_steps": 0,
+                "measured_steps": 1,
+                "compile": False,
+                "tokens_per_second": tokens_per_second,
+                "mean_step_time_s": 0.002,
+                "wall_time_s": 0.002,
+                "tokens_per_second_or_step_time": True,
+                "synchronized_timing": True,
+            },
+        },
+    }
+
+
 def test_json_summary_reports_ratios_for_matched_rows(tmp_path: Path) -> None:
     path = tmp_path / "matrix.json"
     path.write_text(
@@ -465,6 +623,147 @@ def test_jsonl_input_outputs_comparison_jsonl(tmp_path: Path) -> None:
     assert rows[0]["ratios"]["m4_tokens_per_second_over_gb10"] == 2.0
 
 
+def test_bench_tiny_json_shape_matches_when_explicit_keys_agree(tmp_path: Path) -> None:
+    path = tmp_path / "bench-tiny-shaped.json"
+    path.write_text(
+        json.dumps(
+            {
+                "cases": [
+                    bench_tiny_json_row("M4 Max", tokens_per_second=48.0),
+                    bench_tiny_json_row("GB10", tokens_per_second=24.0),
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_compare("--input", str(path))
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "ok"
+    assert payload["matched_comparison_count"] == 1
+    comparison = payload["comparisons"][0]
+    assert comparison["status"] == "matched"
+    assert comparison["m4"]["matched_comparison_key_sources"] == [
+        "comparison_key",
+        "bench_receipt.comparison_key",
+        "workload_key+software_key",
+    ]
+    assert comparison["gb10"]["matched_comparison_key_sources"] == [
+        "comparison_key",
+        "bench_receipt.comparison_key",
+        "workload_key+software_key",
+    ]
+    assert comparison["ratios"]["m4_tokens_per_second_over_gb10"] == 2.0
+
+
+def test_package_dir_writes_matched_report_manifest_and_jsonl(tmp_path: Path) -> None:
+    input_path = tmp_path / "matched.json"
+    package_dir = tmp_path / "matched_package"
+    input_path.write_text(
+        json.dumps(
+            {
+                "cases": [
+                    bench_row("M4 Max", tokens_per_second=120.0),
+                    bench_row("GB10", tokens_per_second=100.0),
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_compare(
+        "--input",
+        str(input_path),
+        "--package-dir",
+        str(package_dir),
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "ok"
+    assert payload["compare_package"]["matched_comparison_count"] == 1
+    assert payload["compare_package"]["unmatched_pair_count"] == 0
+    manifest = json.loads((package_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["kind"] == "cppmega.mlx.gb10_matched_compare_package"
+    assert manifest["status"] == "ok"
+    assert manifest["artifacts"] == {
+        "compare_report": "compare_report.json",
+        "matched_comparisons": "matched_comparisons.jsonl",
+        "refused_pairs": "refused_pairs.jsonl",
+        "manifest": "manifest.json",
+    }
+    assert manifest["parity_claim_refused"] is False
+    assert "Only matched_comparisons.jsonl may contain ratios" in manifest["artifact_policy"]
+    report = json.loads((package_dir / "compare_report.json").read_text(encoding="utf-8"))
+    assert report["matched_comparison_count"] == 1
+    assert report["ratio_artifact"] == "matched_comparisons.jsonl"
+    assert "intentionally omits ratios" in report["artifact_policy"]
+    assert "ratios" not in report["comparisons"][0]
+    matched_rows = [
+        json.loads(line)
+        for line in (package_dir / "matched_comparisons.jsonl").read_text(
+            encoding="utf-8"
+        ).splitlines()
+    ]
+    refused_text = (package_dir / "refused_pairs.jsonl").read_text(encoding="utf-8")
+    assert len(matched_rows) == 1
+    assert matched_rows[0]["status"] == "matched"
+    assert matched_rows[0]["ratios"]["m4_tokens_per_second_over_gb10"] == 1.2
+    assert refused_text == ""
+
+
+def test_package_dir_writes_refusal_artifact_without_ratios(tmp_path: Path) -> None:
+    input_path = tmp_path / "refused.json"
+    package_dir = tmp_path / "refused_package"
+    input_path.write_text(
+        json.dumps(
+            {
+                "cases": [
+                    bench_row("M4 Max", mlx_version="0.31.0"),
+                    bench_row("GB10", mlx_version="0.32.0"),
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_compare(
+        "--input",
+        str(input_path),
+        "--package-dir",
+        str(package_dir),
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "no_matching_rows"
+    assert payload["compare_package"]["parity_claim_refused"] is True
+    manifest = json.loads((package_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "no_matching_rows"
+    assert manifest["matched_comparison_count"] == 0
+    assert manifest["unmatched_pair_count"] == 1
+    assert manifest["parity_claim_refused"] is True
+    assert "identical selected comparison_key.workload" in manifest[
+        "workload_software_key_guard"
+    ]
+    matched_text = (package_dir / "matched_comparisons.jsonl").read_text(
+        encoding="utf-8"
+    )
+    refused_rows = [
+        json.loads(line)
+        for line in (package_dir / "refused_pairs.jsonl").read_text(
+            encoding="utf-8"
+        ).splitlines()
+    ]
+    assert matched_text == ""
+    assert len(refused_rows) == 1
+    assert refused_rows[0]["status"] == "unmatched"
+    assert refused_rows[0]["parity_claim_refused"] is True
+    assert "ratios" not in refused_rows[0]
+
+
 def test_single_machine_status_is_insufficient_matched_rows(tmp_path: Path) -> None:
     path = tmp_path / "m4.json"
     path.write_text(json.dumps({"cases": [bench_row("M4 Max")]}), encoding="utf-8")
@@ -479,6 +778,57 @@ def test_single_machine_status_is_insufficient_matched_rows(tmp_path: Path) -> N
     assert payload["unmatched_pair_count"] == 0
     assert payload["unmatched_pairs"] == []
     assert payload["comparisons"] == []
+
+
+def test_package_dir_refuses_m4_only_missing_gb10_artifacts(tmp_path: Path) -> None:
+    input_path = tmp_path / "m4-only.json"
+    package_dir = tmp_path / "m4_only_package"
+    input_path.write_text(
+        json.dumps({"cases": [bench_row("M4 Max", tokens_per_second=120.0)]}),
+        encoding="utf-8",
+    )
+
+    result = run_compare(
+        "--input",
+        str(input_path),
+        "--package-dir",
+        str(package_dir),
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "insufficient_matched_rows"
+    assert payload["host_counts"] == {"m4": 1, "gb10": 0, "ignored": 0}
+    assert payload["parity_claim_refused"] is True
+    assert payload["matched_comparison_count"] == 0
+    assert payload["unmatched_pair_count"] == 0
+    assert payload["comparisons"] == []
+    assert payload["unmatched_pairs"] == []
+
+    assert sorted(path.name for path in package_dir.iterdir()) == [
+        "compare_report.json",
+        "manifest.json",
+        "matched_comparisons.jsonl",
+        "refused_pairs.jsonl",
+    ]
+    manifest = json.loads((package_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "insufficient_matched_rows"
+    assert manifest["host_counts"]["m4"] == 1
+    assert manifest["host_counts"]["gb10"] == 0
+    assert manifest["matched_comparison_count"] == 0
+    assert manifest["unmatched_pair_count"] == 0
+    assert manifest["parity_claim_refused"] is True
+    assert "must not be used for M4-vs-GB10" in manifest["artifact_policy"]
+
+    report = json.loads((package_dir / "compare_report.json").read_text(encoding="utf-8"))
+    assert report["status"] == "insufficient_matched_rows"
+    assert report["host_counts"]["gb10"] == 0
+    assert report["parity_claim_refused"] is True
+    assert report["comparisons"] == []
+    assert report["unmatched_pairs"] == []
+    assert report["ratio_artifact"] == "matched_comparisons.jsonl"
+    assert (package_dir / "matched_comparisons.jsonl").read_text(encoding="utf-8") == ""
+    assert (package_dir / "refused_pairs.jsonl").read_text(encoding="utf-8") == ""
 
 
 def test_mismatched_framework_versions_do_not_report_ratios(tmp_path: Path) -> None:
@@ -568,6 +918,64 @@ def test_explicit_software_key_mismatch_blocks_normalized_field_match(tmp_path: 
     assert [field["field"] for field in refusal["mismatched_comparison_keys"]] == [
         "comparison_key.software"
     ]
+    assert "ratios" not in refusal
+    assert payload["comparisons"] == []
+
+
+def test_conflicting_key_sources_inside_row_refuse_ratios(tmp_path: Path) -> None:
+    m4 = bench_row("M4 Max", tokens_per_second=120.0)
+    gb10 = bench_row("GB10", tokens_per_second=100.0)
+    for row in (m4, gb10):
+        row["workload_key"] = row["comparison_key"]["workload"]
+        row["software_key"] = row["comparison_key"]["software"]
+        row["bench_receipt"] = {
+            "comparison_key": {
+                "schema_version": 1,
+                "workload": row["comparison_key"]["workload"],
+                "software": row["comparison_key"]["software"],
+            }
+        }
+    gb10["bench_receipt"]["comparison_key"]["software"] = {
+        **gb10["comparison_key"]["software"],
+        "extra_runtime_flag": "conflicting-receipt-only",
+    }
+    path = tmp_path / "conflicting-key-sources.json"
+    path.write_text(json.dumps({"cases": [m4, gb10]}), encoding="utf-8")
+
+    result = run_compare("--input", str(path))
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "no_matching_rows"
+    assert payload["host_counts"] == {"m4": 1, "gb10": 1, "ignored": 0}
+    assert payload["matched_comparison_count"] == 0
+    assert payload["parity_claim_refused"] is True
+    assert payload["missing_matched_comparison_key_counts"] == {"m4": 0, "gb10": 1}
+    assert payload["matched_comparison_key_conflict_counts"] == {"m4": 0, "gb10": 1}
+    refusal = payload["unmatched_pairs"][0]
+    assert refusal["reason"] == "missing_matched_comparison_key"
+    assert refusal["missing_matched_comparison_key"] == {"m4": False, "gb10": True}
+    assert refusal["mismatched_fields"] == []
+    assert refusal["mismatched_comparison_keys"] == [
+        {
+            "field": "comparison_key.workload",
+            "m4": m4["comparison_key"]["workload"],
+            "gb10": "<missing>",
+        },
+        {
+            "field": "comparison_key.software",
+            "m4": m4["comparison_key"]["software"],
+            "gb10": "<missing>",
+        },
+    ]
+    conflicts = refusal["matched_comparison_key_conflicts"]["gb10"]
+    assert len(conflicts) == 1
+    assert conflicts[0]["section"] == "software"
+    assert conflicts[0]["left_source"] == "comparison_key"
+    assert conflicts[0]["right_source"] == "bench_receipt.comparison_key"
+    assert conflicts[0]["right"]["extra_runtime_flag"] == "conflicting-receipt-only"
+    assert refusal["gb10"]["matched_comparison_key_source"] is None
+    assert refusal["gb10"]["matched_comparison_key_conflicts"] == conflicts
     assert "ratios" not in refusal
     assert payload["comparisons"] == []
 

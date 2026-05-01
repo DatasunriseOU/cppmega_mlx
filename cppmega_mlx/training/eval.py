@@ -53,10 +53,14 @@ def evaluate_batches(
     if batch_count == 0:
         raise ValueError("evaluation requires at least one batch")
 
-    avg_loss = total_loss / mx.maximum(total_tokens, mx.array(1.0, dtype=mx.float32))
-    mx.eval(avg_loss, total_tokens)
-    elapsed = time.perf_counter() - start
+    mx.eval(total_tokens)
     tokens = int(total_tokens.item())
+    if tokens <= 0:
+        raise ValueError("evaluation produced zero tokens")
+
+    avg_loss = total_loss / total_tokens
+    mx.eval(avg_loss)
+    elapsed = time.perf_counter() - start
 
     return EvalMetrics(
         loss=float(avg_loss.item()),

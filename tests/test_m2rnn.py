@@ -15,11 +15,13 @@ from cppmega_mlx.nn.m2rnn import (
     DEFAULT_CHUNK_SIZE,
     M2RNNConfig,
     M2RNNMixer,
+    M2RNNMixerState,
     broadcast_m2rnn_heads,
     chunked_m2rnn_scan,
     m2rnn_softplus_decay_gate,
     m2rnn_scan,
 )
+from cppmega_mlx.nn.mamba3 import causal_depthwise_conv1d
 
 
 def _rand(shape: tuple[int, ...], rng: np.random.Generator) -> mx.array:
@@ -139,6 +141,7 @@ def _mixer_config(
     num_f_heads: int = 2,
     num_g_heads: int = 2,
     num_weight_heads: int = 1,
+    conv_kernel: int = 4,
     chunk_size: int = 3,
     use_residual: bool = True,
     A_init_min: float = 0.0,
@@ -157,6 +160,7 @@ def _mixer_config(
         num_f_heads=num_f_heads,
         num_g_heads=num_g_heads,
         num_weight_heads=num_weight_heads,
+        conv_kernel=conv_kernel,
         chunk_size=chunk_size,
         use_residual=use_residual,
         A_init_min=A_init_min,
@@ -165,6 +169,59 @@ def _mixer_config(
         dt_init_max=dt_init_max,
         dt_init_floor=dt_init_floor,
     )
+
+
+def _stress_mixer_config(*, conv_kernel: int = 4) -> M2RNNConfig:
+    return _mixer_config(
+        d_model=24,
+        k_head_dim=8,
+        v_head_dim=4,
+        num_q_heads=1,
+        num_k_heads=1,
+        num_v_heads=6,
+        num_f_heads=2,
+        num_g_heads=3,
+        num_weight_heads=1,
+        conv_kernel=conv_kernel,
+        chunk_size=7,
+    )
+
+
+def _manual_mixer_qkvfg(
+    mixer: M2RNNMixer,
+    hidden: mx.array,
+    *,
+    conv_state: mx.array | None = None,
+) -> tuple[mx.array, mx.array, mx.array, mx.array, mx.array]:
+    cfg = mixer.config
+    projected = mixer.in_proj(hidden)
+    batch, seq, _ = hidden.shape
+    projected_conv = projected[:, :, : mixer.conv_dim]
+    if conv_state is not None:
+        projected_conv = mx.concatenate([conv_state, projected_conv], axis=1)
+    conv_input = causal_depthwise_conv1d(
+        projected_conv,
+        mixer.conv_weight.astype(projected.dtype),
+        mixer.conv_bias.astype(projected.dtype),
+    )
+    if conv_state is not None:
+        conv_input = conv_input[:, conv_state.shape[1] :, :]
+    conv_input = nn.silu(conv_input)
+
+    q_end = mixer.q_dim
+    k_end = q_end + mixer.k_dim
+    v_end = k_end + mixer.v_dim
+    f_end = mixer.conv_dim + mixer.f_dim
+    q = conv_input[:, :, :q_end].reshape(batch, seq, cfg.num_q_heads, cfg.k_head_dim)
+    k = conv_input[:, :, q_end:k_end].reshape(batch, seq, cfg.num_k_heads, cfg.k_head_dim)
+    v = conv_input[:, :, k_end:v_end].reshape(batch, seq, cfg.num_v_heads, cfg.v_head_dim)
+    xf = m2rnn_softplus_decay_gate(
+        projected[:, :, mixer.conv_dim:f_end],
+        mixer.A_log,
+        mixer.dt_bias,
+    )
+    g = projected[:, :, f_end:].reshape(batch, seq, cfg.num_g_heads, cfg.v_head_dim)
+    return q, k, v, xf, g
 
 
 @pytest.mark.parametrize("chunk_size", [1, 2, 7, 16, 64, 128])
@@ -279,6 +336,177 @@ def test_h0_continues_recurrence_across_chunked_segments() -> None:
 
     _assert_close(stitched_out, full_out)
     _assert_close(suffix_h, full_h)
+
+
+def test_larger_direct_scan_state_continuation_matches_full_run() -> None:
+    q, k, v, W, xf = _inputs(
+        batch=2,
+        seq=23,
+        n_q=1,
+        n_k=1,
+        n_v=6,
+        n_w=1,
+        n_f=3,
+        k_dim=8,
+        v_dim=4,
+        seed=58,
+    )
+    split = 9
+
+    full_out, full_h = chunked_m2rnn_scan(q, k, v, W, xf, chunk_size=7)
+    prefix_out, prefix_h = chunked_m2rnn_scan(
+        q[:, :split],
+        k[:, :split],
+        v[:, :split],
+        W,
+        xf[:, :split],
+        chunk_size=5,
+    )
+    suffix_out, suffix_h = chunked_m2rnn_scan(
+        q[:, split:],
+        k[:, split:],
+        v[:, split:],
+        W,
+        xf[:, split:],
+        h0=prefix_h,
+        chunk_size=4,
+    )
+    stitched_out = mx.concatenate([prefix_out, suffix_out], axis=1)
+    mx.eval(full_out, full_h, prefix_out, stitched_out, suffix_h)
+
+    assert full_out.shape == (2, 23, 6, 4)
+    assert full_h.shape == (2, 6, 8, 4)
+    assert prefix_out.shape == (2, split, 6, 4)
+    _assert_close(stitched_out, full_out, atol=2e-5)
+    _assert_close(suffix_h, full_h, atol=2e-5)
+
+
+def test_lightweight_mixer_h0_continuation_matches_full_run() -> None:
+    mx.random.seed(88)
+    cfg = _stress_mixer_config()
+    mixer = M2RNNMixer(cfg)
+    hidden = _rand((2, 17, cfg.d_model), np.random.default_rng(88))
+    split = 6
+
+    full_out, full_h = mixer(hidden, chunk_size=7)
+    prefix_out, prefix_state = mixer(hidden[:, :split], chunk_size=5, return_state=True)
+    suffix_out, suffix_state = mixer(
+        hidden[:, split:],
+        mixer_state=prefix_state,
+        chunk_size=4,
+        return_state=True,
+    )
+    stitched_out = mx.concatenate([prefix_out, suffix_out], axis=1)
+    mx.eval(full_out, full_h, stitched_out, suffix_state.h, suffix_state.conv_state)
+
+    assert full_out.shape == hidden.shape
+    assert full_h.shape == (2, cfg.num_heads, cfg.k_head_dim, cfg.v_head_dim)
+    assert prefix_out.shape == (2, split, cfg.d_model)
+    assert prefix_state.h.shape == full_h.shape
+    assert prefix_state.conv_state.shape == (2, cfg.conv_kernel - 1, mixer.conv_dim)
+    _assert_close(stitched_out, full_out, atol=3e-5)
+    _assert_close(suffix_state.h, full_h, atol=3e-5)
+
+
+def test_lightweight_mixer_state_carries_projected_conv_history() -> None:
+    mx.random.seed(89)
+    cfg = _stress_mixer_config()
+    mixer = M2RNNMixer(cfg)
+    hidden = _rand((2, 11, cfg.d_model), np.random.default_rng(89))
+    split = 5
+
+    prefix_out, prefix_state = mixer(hidden[:, :split], chunk_size=3, return_state=True)
+    suffix_out, suffix_state = mixer(
+        hidden[:, split:],
+        mixer_state=prefix_state,
+        chunk_size=4,
+        return_state=True,
+    )
+
+    q_prefix, k_prefix, v_prefix, xf_prefix, _ = _manual_mixer_qkvfg(mixer, hidden[:, :split])
+    expected_prefix, expected_prefix_h = chunked_m2rnn_scan(
+        q_prefix,
+        k_prefix,
+        v_prefix,
+        mixer.state_weight.astype(q_prefix.dtype),
+        xf_prefix,
+        chunk_size=3,
+    )
+    if mixer.D is not None:
+        expected_prefix = expected_prefix + v_prefix * mixer.D.astype(expected_prefix.dtype)
+    expected_prefix = expected_prefix.reshape(2, split, cfg.num_heads * cfg.v_head_dim)
+
+    q_suffix, k_suffix, v_suffix, xf_suffix, _ = _manual_mixer_qkvfg(
+        mixer,
+        hidden[:, split:],
+        conv_state=prefix_state.conv_state,
+    )
+    expected_suffix, expected_suffix_h = chunked_m2rnn_scan(
+        q_suffix,
+        k_suffix,
+        v_suffix,
+        mixer.state_weight.astype(q_suffix.dtype),
+        xf_suffix,
+        h0=prefix_state.h,
+        chunk_size=4,
+    )
+    mx.eval(prefix_out, suffix_out, suffix_state.h, expected_prefix, expected_prefix_h, expected_suffix_h)
+
+    assert prefix_state.conv_state.shape == (2, cfg.conv_kernel - 1, mixer.conv_dim)
+    _assert_close(prefix_state.h, expected_prefix_h, atol=3e-5)
+    _assert_close(suffix_state.h, expected_suffix_h, atol=3e-5)
+
+
+def test_lightweight_mixer_state_rejects_bad_shapes_and_dtypes() -> None:
+    mx.random.seed(90)
+    cfg = _mixer_config()
+    mixer = M2RNNMixer(cfg)
+    hidden = _rand((2, 4, cfg.d_model), np.random.default_rng(90))
+    _, state = mixer(hidden[:, :2], return_state=True)
+
+    bad_h = M2RNNMixerState(
+        h=mx.zeros((2, cfg.num_heads - 1, cfg.k_head_dim, cfg.v_head_dim), dtype=hidden.dtype),
+        conv_state=state.conv_state,
+    )
+    with pytest.raises(ValueError, match="h0 must have shape"):
+        mixer(hidden[:, 2:], mixer_state=bad_h)
+
+    bad_conv_shape = M2RNNMixerState(
+        h=state.h,
+        conv_state=mx.zeros((2, cfg.conv_kernel, mixer.conv_dim), dtype=hidden.dtype),
+    )
+    with pytest.raises(ValueError, match="mixer_state\\.conv_state must have shape"):
+        mixer(hidden[:, 2:], mixer_state=bad_conv_shape)
+
+    bad_conv_dtype = M2RNNMixerState(
+        h=state.h,
+        conv_state=state.conv_state.astype(mx.float16),
+    )
+    with pytest.raises(TypeError, match="mixer_state\\.conv_state dtype"):
+        mixer(hidden[:, 2:], mixer_state=bad_conv_dtype)
+
+    with pytest.raises(ValueError, match="pass either h0 or mixer_state"):
+        mixer(hidden[:, 2:], h0=state.h, mixer_state=state)
+
+
+def test_chunked_scan_backpropagates_through_initial_state() -> None:
+    q, k, v, W, xf = _inputs(batch=1, seq=9, n_q=1, n_v=4, n_f=2, k_dim=5, v_dim=3, seed=59)
+    h0 = _rand((1, 4, 5, 3), np.random.default_rng(60))
+    out_probe = _rand((1, 9, 4, 3), np.random.default_rng(61))
+    h_probe = _rand((1, 4, 5, 3), np.random.default_rng(62))
+
+    def loss_fn(h0_arg: mx.array) -> mx.array:
+        out, h = chunked_m2rnn_scan(q, k, v, W, xf, h0=h0_arg, chunk_size=4)
+        return mx.mean(out * out_probe) + 0.05 * mx.mean(h * h_probe)
+
+    loss, grad = mx.value_and_grad(loss_fn)(h0)
+    mx.eval(loss, grad)
+
+    grad_np = np.array(grad)
+    assert math.isfinite(float(loss.item()))
+    assert grad.shape == h0.shape
+    assert np.isfinite(grad_np).all()
+    assert float(np.max(np.abs(grad_np))) > 0.0
 
 
 def test_chunked_scan_supports_direct_mlx_gradients() -> None:
@@ -629,13 +857,134 @@ def test_lightweight_mixer_ports_megatron_output_gate_and_norm_shapes() -> None:
 
     assert mixer.g_dim == cfg.num_g_heads * cfg.v_head_dim
     assert mixer.in_proj.weight.shape == (
-        mixer.q_dim + mixer.k_dim + mixer.v_dim + mixer.f_dim + mixer.g_dim,
+        mixer.conv_dim + mixer.f_dim + mixer.g_dim,
         cfg.d_model,
     )
+    assert mixer.conv_dim == mixer.q_dim + mixer.k_dim + mixer.v_dim
+    assert mixer.conv_weight.shape == (mixer.conv_dim, cfg.conv_kernel, 1)
+    assert mixer.conv_bias.shape == (mixer.conv_dim,)
     assert mixer.g_norm.weight.shape == (cfg.num_heads * cfg.v_head_dim,)
     assert mixer.out_proj.weight.shape == (cfg.d_model, cfg.num_heads * cfg.v_head_dim)
     assert out.shape == hidden.shape
     assert h.shape == (2, cfg.num_heads, cfg.k_head_dim, cfg.v_head_dim)
+
+
+def test_lightweight_mixer_output_gate_uses_source_flattened_repeat_interleave() -> None:
+    mx.random.seed(7)
+    cfg = _mixer_config(
+        num_q_heads=1,
+        num_k_heads=1,
+        num_v_heads=4,
+        num_f_heads=2,
+        num_g_heads=2,
+        v_head_dim=3,
+        chunk_size=2,
+    )
+    mixer = M2RNNMixer(cfg)
+    hidden = _rand((2, 5, cfg.d_model), np.random.default_rng(7))
+
+    actual, actual_h = mixer(hidden)
+
+    batch, seq, _ = hidden.shape
+    q, k, v, xf, g = _manual_mixer_qkvfg(mixer, hidden)
+
+    expected_scan, expected_h = chunked_m2rnn_scan(
+        q,
+        k,
+        v,
+        mixer.state_weight.astype(q.dtype),
+        xf,
+        chunk_size=cfg.chunk_size,
+    )
+    assert mixer.D is not None
+    expected_scan = expected_scan + v * mixer.D.astype(expected_scan.dtype)
+    expected_scan = expected_scan.reshape(batch, seq, cfg.num_heads * cfg.v_head_dim)
+
+    flattened_g = g.reshape(batch, seq, cfg.num_g_heads * cfg.v_head_dim)
+    expected_g = mx.repeat(flattened_g, repeats=cfg.num_heads // cfg.num_g_heads, axis=-1)
+    head_axis_g = mx.repeat(g, repeats=cfg.num_heads // cfg.num_g_heads, axis=-2).reshape(
+        batch,
+        seq,
+        cfg.num_heads * cfg.v_head_dim,
+    )
+    expected = mixer.out_proj(mixer.g_norm(expected_scan * nn.silu(expected_g).astype(expected_scan.dtype)))
+    mx.eval(actual, actual_h, expected, expected_h, expected_g, head_axis_g)
+
+    assert expected_g.shape == (batch, seq, cfg.num_heads * cfg.v_head_dim)
+    assert float(np.max(np.abs(np.array(expected_g) - np.array(head_axis_g)))) > 1e-5
+    _assert_close(actual, expected)
+    _assert_close(actual_h, expected_h)
+
+
+def test_lightweight_mixer_qkv_uses_source_causal_conv_and_silu() -> None:
+    mx.random.seed(8)
+    cfg = _mixer_config(num_v_heads=2, num_f_heads=2, num_g_heads=2, conv_kernel=3)
+    mixer = M2RNNMixer(cfg)
+    hidden = _rand((2, 6, cfg.d_model), np.random.default_rng(8))
+
+    actual, actual_h = mixer(hidden)
+
+    batch, seq, _ = hidden.shape
+    q, k, v, xf, g = _manual_mixer_qkvfg(mixer, hidden)
+    expected_scan, expected_h = chunked_m2rnn_scan(
+        q,
+        k,
+        v,
+        mixer.state_weight.astype(q.dtype),
+        xf,
+        chunk_size=cfg.chunk_size,
+    )
+    assert mixer.D is not None
+    expected_scan = expected_scan + v * mixer.D.astype(expected_scan.dtype)
+    expected_scan = expected_scan.reshape(batch, seq, cfg.num_heads * cfg.v_head_dim)
+    expected_g = mx.repeat(
+        g.reshape(batch, seq, cfg.num_g_heads * cfg.v_head_dim),
+        repeats=cfg.num_heads // cfg.num_g_heads,
+        axis=-1,
+    )
+    expected = mixer.out_proj(
+        mixer.g_norm(expected_scan * nn.silu(expected_g).astype(expected_scan.dtype))
+    )
+
+    projected = mixer.in_proj(hidden)
+    direct_q = projected[:, :, : mixer.q_dim].reshape(
+        batch,
+        seq,
+        cfg.num_q_heads,
+        cfg.k_head_dim,
+    )
+    mx.eval(actual, actual_h, expected, expected_h, q, direct_q)
+
+    _assert_close(actual, expected)
+    _assert_close(actual_h, expected_h)
+    assert float(np.max(np.abs(np.array(q) - np.array(direct_q)))) > 1e-5
+
+
+def test_lightweight_mixer_qkv_causal_conv_parameters_are_observable() -> None:
+    mx.random.seed(9)
+    cfg = _mixer_config(conv_kernel=4)
+    hidden = _rand((2, 7, cfg.d_model), np.random.default_rng(9))
+
+    mx.random.seed(9)
+    base = M2RNNMixer(cfg)
+    mx.random.seed(9)
+    changed_weight = M2RNNMixer(cfg)
+    changed_weight.conv_weight = changed_weight.conv_weight.at[:, -1, :].add(0.25)
+    mx.random.seed(9)
+    changed_bias = M2RNNMixer(cfg)
+    changed_bias.conv_bias = changed_bias.conv_bias + 0.1
+
+    base_out, base_h = base(hidden)
+    weight_out, weight_h = changed_weight(hidden)
+    bias_out, bias_h = changed_bias(hidden)
+    mx.eval(base_out, base_h, weight_out, weight_h, bias_out, bias_h)
+
+    assert np.isfinite(np.array(base_out)).all()
+    assert np.isfinite(np.array(base_h)).all()
+    assert float(np.max(np.abs(np.array(weight_out - base_out)))) > 1e-5
+    assert float(np.max(np.abs(np.array(weight_h - base_h)))) > 1e-5
+    assert float(np.max(np.abs(np.array(bias_out - base_out)))) > 1e-5
+    assert float(np.max(np.abs(np.array(bias_h - base_h)))) > 1e-5
 
 
 def test_softplus_decay_gate_range_shape_and_parameter_sensitivity() -> None:
@@ -699,7 +1048,7 @@ def test_lightweight_mixer_initializes_megatron_style_decay_parameters() -> None
 
 def test_lightweight_mixer_h0_continues_recurrence_across_segments() -> None:
     mx.random.seed(15)
-    cfg = _mixer_config(chunk_size=4)
+    cfg = _mixer_config(conv_kernel=1, chunk_size=4)
     mixer = M2RNNMixer(cfg)
     hidden = _rand((2, 9, cfg.d_model), np.random.default_rng(15))
 
@@ -711,6 +1060,27 @@ def test_lightweight_mixer_h0_continues_recurrence_across_segments() -> None:
 
     _assert_close(stitched_out, full_out)
     _assert_close(suffix_h, full_h)
+
+
+def test_lightweight_mixer_h0_continuation_does_not_cache_conv_tail() -> None:
+    mx.random.seed(18)
+    cfg = _mixer_config(conv_kernel=4, chunk_size=4)
+    mixer = M2RNNMixer(cfg)
+    hidden = _rand((2, 9, cfg.d_model), np.random.default_rng(18))
+
+    full_out, full_h = mixer(hidden, chunk_size=4)
+    prefix_out, prefix_h = mixer(hidden[:, :4], chunk_size=3)
+    suffix_out, suffix_h = mixer(hidden[:, 4:], h0=prefix_h, chunk_size=2)
+    stitched_out = mx.concatenate([prefix_out, suffix_out], axis=1)
+    mx.eval(full_out, full_h, stitched_out, suffix_h)
+
+    # The local h0 seam carries only recurrent state. It does not cache the
+    # q/k/v causal-conv tail, so arbitrary split equivalence is not supported
+    # when conv_kernel > 1.
+    assert suffix_h.shape == full_h.shape
+    assert np.isfinite(np.array(suffix_h)).all()
+    assert float(np.max(np.abs(np.array(stitched_out - full_out)))) > 1e-5
+    assert float(np.max(np.abs(np.array(suffix_h - full_h)))) > 1e-5
 
 
 def test_lightweight_mixer_h0_rejects_wrong_state_shape_after_head_broadcast() -> None:
@@ -882,6 +1252,75 @@ def test_lightweight_mixer_compiled_step_updates_state_weight_and_residual() -> 
         assert float(np.max(np.abs(after[name] - before[name]))) > 0.0, name
 
 
+def test_lightweight_mixer_larger_compiled_train_step_matches_eager_state_and_gradients() -> None:
+    cfg = _stress_mixer_config()
+    hidden = _rand((2, 23, cfg.d_model), np.random.default_rng(301))
+    target = _rand((2, 23, cfg.d_model), np.random.default_rng(302))
+    state_target = _rand((2, cfg.num_heads, cfg.k_head_dim, cfg.v_head_dim), np.random.default_rng(303))
+    key_params = (
+        "in_proj.weight",
+        "g_norm.weight",
+        "out_proj.weight",
+        "state_weight",
+        "A_log",
+        "dt_bias",
+        "D",
+    )
+
+    def loss_fn(model: M2RNNMixer, x: mx.array, y: mx.array, h_target: mx.array) -> mx.array:
+        pred, final_state = model(x)
+        return mx.mean(mx.square(pred - y)) + 0.02 * mx.mean(mx.square(final_state - h_target))
+
+    mx.random.seed(31)
+    eager_mixer = M2RNNMixer(cfg)
+    mx.eval(eager_mixer.parameters())
+    mx.random.seed(31)
+    compiled_mixer = M2RNNMixer(cfg)
+    optimizer = optim.AdamW(learning_rate=5e-3, weight_decay=0.0)
+    before = _flat_tree(compiled_mixer.parameters())
+
+    eager_out, eager_state = eager_mixer(hidden)
+    eager_loss, eager_grads = nn.value_and_grad(eager_mixer, loss_fn)(
+        eager_mixer,
+        hidden,
+        target,
+        state_target,
+    )
+    mx.eval(eager_out, eager_state, eager_loss, eager_grads)
+
+    loss_and_grad = nn.value_and_grad(compiled_mixer, loss_fn)
+    captured_state = [compiled_mixer.state, optimizer.state, mx.random.state]
+
+    @partial(mx.compile, inputs=captured_state, outputs=captured_state)
+    def step(x: mx.array, y: mx.array, h_target: mx.array):
+        pred, final_state = compiled_mixer(x)
+        loss, grads = loss_and_grad(compiled_mixer, x, y, h_target)
+        optimizer.update(compiled_mixer, grads)
+        return loss, grads, pred, final_state
+
+    compiled_loss, compiled_grads, compiled_out, compiled_state = step(hidden, target, state_target)
+    mx.eval(captured_state, compiled_loss, compiled_grads, compiled_out, compiled_state)
+    after = _flat_tree(compiled_mixer.parameters())
+
+    assert compiled_out.shape == hidden.shape
+    assert compiled_state.shape == state_target.shape
+    assert math.isfinite(float(compiled_loss.item()))
+    assert float(compiled_loss.item()) > 0.0
+    _assert_close(compiled_loss, eager_loss, atol=5e-4)
+    _assert_close(compiled_out, eager_out, atol=5e-4)
+    _assert_close(compiled_state, eager_state, atol=5e-4)
+
+    eager_flat_grads = _flat_tree(eager_grads)
+    compiled_flat_grads = _flat_tree(compiled_grads)
+    for name in key_params:
+        assert name in compiled_flat_grads
+        grad_np = compiled_flat_grads[name]
+        assert np.isfinite(grad_np).all(), name
+        assert float(np.max(np.abs(grad_np))) > 0.0, name
+        np.testing.assert_allclose(grad_np, eager_flat_grads[name], atol=8e-4, rtol=8e-4)
+        assert float(np.max(np.abs(after[name] - before[name]))) > 0.0, name
+
+
 def test_invalid_mixer_config_values_fail_fast() -> None:
     invalid_cases = (
         ("d_model", lambda: _mixer_config(d_model=0)),
@@ -924,3 +1363,44 @@ def test_mixer_rejects_explicit_zero_chunk_override() -> None:
 
     with pytest.raises(ValueError, match="chunk_size"):
         mixer(hidden, chunk_size=0)
+
+
+def test_scan_validation_rejects_bad_h0_shape_and_dtype() -> None:
+    q, k, v, W, xf = _inputs(batch=1, seq=3, n_q=2, k_dim=4, v_dim=3, seed=72)
+
+    with pytest.raises(ValueError, match="h0 must have shape"):
+        chunked_m2rnn_scan(q, k, v, W, xf, h0=mx.zeros((1, 1, 4, 3)), chunk_size=2)
+
+    with pytest.raises(TypeError, match="h0 dtype"):
+        chunked_m2rnn_scan(
+            q,
+            k,
+            v,
+            W,
+            xf,
+            h0=mx.zeros((1, 2, 4, 3), dtype=mx.float16),
+            chunk_size=2,
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutate", "error_type", "match"),
+    [
+        (lambda q, k, v, W, xf: (q[:, :, :, :3], k, v, W, xf), ValueError, "k last dim"),
+        (lambda q, k, v, W, xf: (q, k[:, :2], v, W, xf), ValueError, "sequence length"),
+        (lambda q, k, v, W, xf: (q, k.astype(mx.float16), v, W, xf), TypeError, "k dtype"),
+        (lambda q, k, v, W, xf: (q, k, v, W[:, :2, :], xf), ValueError, "W must be square"),
+        (lambda q, k, v, W, xf: (q, k, v, W[:, :2, :2], xf), ValueError, "W V dim"),
+        (lambda q, k, v, W, xf: (q, k, v, W, xf.astype(mx.int32)), TypeError, "xf must use"),
+    ],
+)
+def test_scan_validation_rejects_bad_route_tensor_shapes_and_dtypes(
+    mutate,
+    error_type: type[Exception],
+    match: str,
+) -> None:
+    q, k, v, W, xf = _inputs(batch=1, seq=4, n_q=2, k_dim=4, v_dim=3, seed=73)
+    bad_q, bad_k, bad_v, bad_W, bad_xf = mutate(q, k, v, W, xf)
+
+    with pytest.raises(error_type, match=match):
+        chunked_m2rnn_scan(bad_q, bad_k, bad_v, bad_W, bad_xf, chunk_size=2)

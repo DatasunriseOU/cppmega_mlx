@@ -54,30 +54,24 @@ External/direct sources:
    `kernels-community/bitsandbytes-mps`, and
    `kernels-community/activation`
 
-Current external source snapshot, verified 2026-04-30:
+Current external source snapshot, verified 2026-04-30 and W3.5 refreshed
+2026-05-01:
 
-- MLX repo API returned HTTP 200 for `ml-explore/mlx`: default branch `main`,
-  MIT license, updated `2026-04-30T18:24:14Z`, pushed
-  `2026-04-28T16:39:57Z`, 25,877 stars, 1,732 forks. Latest release is
-  `v0.31.2`, published
-  `2026-04-22T01:40:04Z`.
-- MLX `v0.31.2` release highlights include independent multi-thread
-  computations, wider CUDA quantized matmul and FFT support, standalone JACCL
-  work, Metal split-K quantized matmul, and Metal fixes.
-- MLX-LM repo API returned HTTP 200 for `ml-explore/mlx-lm`: default branch
-  `main`, MIT license, updated `2026-04-30T20:14:26Z`, pushed
-  `2026-04-23T13:54:02Z`, 5,096 stars, 634 forks. Latest release is `v0.31.3`,
-  published
-  `2026-04-22T07:43:57Z`.
-- MLX-LM `v0.31.3` release highlights are bug fixes plus a thread-local
-  generation stream to accompany MLX `v0.31.2`.
-- MLX examples repo API returned HTTP 200 for `ml-explore/mlx-examples`:
-  default branch `main`, MIT license, updated `2026-04-30T20:14:21Z`, pushed
-  `2026-04-06T18:56:05Z`. The contents API showed useful reference directories
-  including `transformer_lm`, `llms`, `lora`, `bert`, and `t5`.
-- Hugging Face Apple M4 kernels listing returned HTTP 200 HTML and embedded 10
-  `KernelList` entries. The guessed API endpoint returned HTTP 404 with
-  `Sorry, we can't find the page you are looking for.`
+- Prior same-day GitHub REST observations, retained as drift context only,
+  recorded MLX latest release `v0.31.2` published `2026-04-22T01:40:04Z` and
+  MLX-LM latest release `v0.31.3` published `2026-04-22T07:43:57Z`. Do not make
+  tests depend on mutable star, fork, `updated_at`, or catalog counters.
+- The W3.5 2026-05-01 GitHub refresh for the MLX and MLX-LM repo/latest-release
+  endpoints returned HTTP 200.
+- MLX README, MLX-LM README, MLX-LM loss source, and MLX custom Metal kernel
+  docs direct fetches returned HTTP 200.
+- MLX examples are useful reference directories such as `transformer_lm`,
+  `llms`, `lora`, `bert`, and `t5`; they remain reading material, not trainer
+  dependencies.
+- Hugging Face Apple M4 kernels listing returned HTTP 200 HTML and, after
+  HTML-unescaping the embedded `KernelList` payload, still exposed 10 kernel
+  entries. The guessed API endpoint returned HTTP 404 with `Sorry, we can't find
+  the page you are looking for.`
 - Direct `git ls-remote` checks against the listed Hugging Face kernel repos
   returned live HEADs for 9 of the 10 repos. Several HEADs differ from the
   listing `sha` fields, so the HTML `sha` values are catalog metadata, not a
@@ -87,7 +81,8 @@ Current external source snapshot, verified 2026-04-30:
 
 ## Primary Receipts Refresh
 
-Direct primary-source refresh, verified 2026-04-30:
+Direct primary-source refresh, verified 2026-04-30 and rechecked by W3.5 on
+2026-05-01 where noted:
 
 - MLX README direct fetch returned HTTP 200 from
   `https://raw.githubusercontent.com/ml-explore/mlx/main/README.md`; the
@@ -98,6 +93,13 @@ Direct primary-source refresh, verified 2026-04-30:
   `https://raw.githubusercontent.com/ml-explore/mlx-lm/main/README.md`; it is a
   generation/fine-tuning package on Apple Silicon with MLX, HF Hub integration,
   quantization/upload support, LoRA/full fine-tuning, and `mx.distributed`.
+- MLX-LM loss source direct fetch returned HTTP 200 from
+  `https://raw.githubusercontent.com/ml-explore/mlx-lm/main/mlx_lm/tuner/losses.py`;
+  it still uses `can_run_metal()`, `mx.fast.metal_kernel`,
+  `@mx.custom_function`, and `.vjp` for differentiable KL/JS Metal loss
+  kernels, while keeping non-Metal fallback paths.
+  This is a pattern receipt, not permission to place a forward-only cppmega
+  kernel on the training path without local VJP/JVP coverage.
 - Hugging Face Apple M4 kernel listing direct fetch returned HTTP 200 from
   `https://huggingface.co/kernels?hardware=apple-m4&sort=trending`; the page
   embedded 10 Apple M4 entries: `mlx-rmsnorm`, `relu`, `paged-attention`,
@@ -112,6 +114,10 @@ remain the local training substrate; MLX-LM remains a pattern source; HF Apple
 M4 kernels remain source references and parity-test fixtures only. No HF kernel
 is on the training path, and no M4 Max vs GB10 parity claim follows from these
 receipts.
+External kernel repositories must not be remote-loaded into cppmega training.
+Any useful HF, MLX example, or MLX-LM kernel pattern must be pinned, licensed,
+reimplemented or vendored in-tree, and covered by local fallback/parity and
+VJP/JVP gates before it can move from reference material to training code.
 
 ## Current Repo Status
 
@@ -191,8 +197,8 @@ fetch are recorded separately below.
 | `kernels-community/gpt-oss-metal-kernels` | Metal | 44 | `2026-04-30T18:43:56.000Z` | `7e271cf432005a22aca3d85b7fc6c82ce22e80b4` |
 | `kernels-community/bitsandbytes-mps` | Metal | 3 | `2026-04-30T18:43:03.000Z` | `bbf141fc155dd09af1b015c8d89e76393aa67408` |
 | `kernels-community/activation` | CUDA, Metal | 34,769 | `2026-04-30T18:43:12.000Z` | `b3bfcb2c5da69cbf744c7f35bbde3c148c904872` |
-| `drbh/test-repo` | Metal | 0 | `2026-04-27T14:55:42Z` | `f86202b4560b8afd9e38bb718ce6b5fc4d7d1139` |
-| `drbh/first-kernel` | Metal | 1 | `2026-03-20T16:21:35Z` | `798f87eaf694ebbc2e687bd7f8586b4d84842ed0` |
+| `drbh/test-repo` | Metal | 0 | `2026-04-30T23:37:10.000Z` | `50290b1041b82b3836ca449fb0688773740ec5eb` |
+| `drbh/first-kernel` | Metal | 1 | `2026-03-20T16:21:35.000Z` | `798f87eaf694ebbc2e687bd7f8586b4d84842ed0` |
 
 Direct repository HEAD refresh after the listing fetch:
 

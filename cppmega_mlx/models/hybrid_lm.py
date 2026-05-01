@@ -88,6 +88,7 @@ class HybridTinyConfig:
     m2rnn_num_v_heads: int = 2
     m2rnn_num_f_heads: int = 2
     m2rnn_num_weight_heads: int = 1
+    m2rnn_conv_kernel: int = 4
     m2rnn_chunk_size: int = 8
     ngram_hash_enabled: bool = False
     ngram_hash_orders: tuple[int, ...] = (2, 3)
@@ -163,6 +164,7 @@ class HybridTinyConfig:
             num_v_heads=self.m2rnn_num_v_heads,
             num_f_heads=self.m2rnn_num_f_heads,
             num_weight_heads=self.m2rnn_num_weight_heads,
+            conv_kernel=self.m2rnn_conv_kernel,
             chunk_size=self.m2rnn_chunk_size,
         )
 
@@ -402,19 +404,19 @@ class HybridTinyLM(nn.Module):
             hidden_states = hidden_states + self.ngram_hash_embedding(input_ids)
 
         structure_embeddings = self.structure_embedding(
-            structure_ids=_validate_and_slice_side_channel(
+            structure_ids=_validate_side_channel_shape(
                 "structure_ids", structure_ids, batch_size, seq_length
             ),
-            dep_levels=_validate_and_slice_side_channel(
+            dep_levels=_validate_side_channel_shape(
                 "dep_levels", dep_levels, batch_size, seq_length
             ),
-            ast_depth_ids=_validate_and_slice_side_channel(
+            ast_depth_ids=_validate_side_channel_shape(
                 "ast_depth_ids", ast_depth_ids, batch_size, seq_length
             ),
-            sibling_index_ids=_validate_and_slice_side_channel(
+            sibling_index_ids=_validate_side_channel_shape(
                 "sibling_index_ids", sibling_index_ids, batch_size, seq_length
             ),
-            node_type_ids=_validate_and_slice_side_channel(
+            node_type_ids=_validate_side_channel_shape(
                 "node_type_ids", node_type_ids, batch_size, seq_length
             ),
             target_dtype=hidden_states.dtype,
@@ -431,7 +433,7 @@ class HybridTinyLM(nn.Module):
         return self.lm_head(self.norm(hidden_states))
 
 
-def _validate_and_slice_side_channel(
+def _validate_side_channel_shape(
     name: str,
     tensor: mx.array | None,
     batch_size: int,
@@ -445,12 +447,12 @@ def _validate_and_slice_side_channel(
         raise ValueError(
             f"{name} batch dimension {tensor.shape[0]} must match input batch {batch_size}"
         )
-    if tensor.shape[1] < seq_length:
+    if tensor.shape[1] != seq_length:
         raise ValueError(
-            f"{name} sequence length {tensor.shape[1]} must be at least input sequence "
-            f"length {seq_length}"
+            f"{name} shape {tensor.shape} must exactly match input_ids shape "
+            f"({batch_size}, {seq_length})"
         )
-    return tensor[:, :seq_length]
+    return tensor
 
 __all__ = [
     "HybridBackend",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -300,6 +301,77 @@ def test_grad_accum_boundary_is_local_when_resuming_state() -> None:
     assert not _has_parameter_delta(before, after_first)
     assert not _has_parameter_delta(before, after_second)
     assert _has_parameter_delta(before, after_third)
+
+
+@pytest.mark.parametrize(
+    ("payload", "error"),
+    [
+        ({"step": True}, "step"),
+        ({"step": "1"}, "step"),
+        ({"step": -1}, "step"),
+        ({"trained_tokens": False}, "trained_tokens"),
+        ({"trained_tokens": "14"}, "trained_tokens"),
+        ({"trained_tokens": -14}, "trained_tokens"),
+    ],
+)
+def test_pretraining_state_from_dict_rejects_coerced_resume_cursors(
+    payload: dict[str, Any],
+    error: str,
+) -> None:
+    with pytest.raises(ValueError, match=error):
+        PretrainingState.from_dict(payload)
+
+
+def test_compiled_pretraining_step_rejects_non_boolean_compile_flag() -> None:
+    model = TinyLM(_tiny_config())
+    optimizer = optim.AdamW(learning_rate=1e-2, weight_decay=0.0)
+    bad_compile: Any = "yes"
+
+    with pytest.raises(TypeError, match="compile must be a boolean"):
+        CompiledPretrainingStep(model, optimizer, compile=bad_compile)
+
+
+@pytest.mark.parametrize("grad_accum_steps", [True, "1", 0])
+def test_compiled_pretraining_step_rejects_coerced_grad_accum_steps(
+    grad_accum_steps: Any,
+) -> None:
+    model = TinyLM(_tiny_config())
+    optimizer = optim.AdamW(learning_rate=1e-2, weight_decay=0.0)
+
+    with pytest.raises(ValueError, match="grad_accum_steps"):
+        CompiledPretrainingStep(
+            model,
+            optimizer,
+            compile=False,
+            grad_accum_steps=grad_accum_steps,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    [
+        ("grad_accum_steps", "1", "grad_accum_steps"),
+        ("pending_microbatches", "0", "pending_microbatches"),
+        (
+            "gradient_accumulator_present",
+            "false",
+            "gradient_accumulator_present",
+        ),
+    ],
+)
+def test_compiled_pretraining_step_load_state_dict_rejects_coerced_fields(
+    field: str,
+    value: Any,
+    error: str,
+) -> None:
+    model = TinyLM(_tiny_config())
+    optimizer = optim.AdamW(learning_rate=1e-2, weight_decay=0.0)
+    step = CompiledPretrainingStep(model, optimizer, compile=False)
+    payload = step.state_dict()
+    payload[field] = value
+
+    with pytest.raises(ValueError, match=error):
+        step.load_state_dict(payload)
 
 
 def test_compiled_pretraining_state_roundtrips_at_update_boundary() -> None:

@@ -46,12 +46,33 @@ sidecar path. Suffixless prefixes are resolved to `<prefix>.bin` plus optional
 Raw `.bin` inputs without `.idx` must provide `dtype` either as an opener
 argument or in JSON metadata. This keeps ambiguous byte streams fail-closed.
 
+The tiny local training CLI accepts the same suffixless prefix path when
+`--data-format megatron` is explicit:
+
+```bash
+./.venv/bin/python scripts/train_hybrid_tiny.py \
+  /path/to/clang_semantic_4k_v10_train \
+  --data-format megatron \
+  --json
+```
+
+The JSON payload includes `dataset.dataset_receipt.index_metadata` with the
+resolved `.bin`, `.idx`, and sidecar paths plus a
+`dataset.dataset_receipt.megatron_indexed_receipt` block. That receipt is scoped
+to local MLX training ingress only: it records that no Megatron runtime is
+imported and makes no distributed Megatron parity, GB10 training correctness, or
+M4-vs-GB10 throughput parity claim.
+
 ## Sidecar Schema
 
-Side channels are token-aligned binary files layered beside a token shard. They
-are not part of the source `../cppmega/scripts/data_prep_parquet_to_megatron.py`
-converter today; that converter writes token-only `.bin/.idx` outputs. For MLX
-local training, write an `.idx.json` sidecar next to the token shard:
+Side channels are token-aligned binary files layered beside a token shard. The
+source `../cppmega` Stage 3 converter is token-only today:
+`scripts/data_prep_parquet_to_megatron.py` reads exactly one configured
+`token_column` (default `token_ids`) and `scripts/data/prepare_format_megacpp.py`
+just forwards that argument. It does not preserve `token_structure_ids`,
+`token_dep_levels`, or other structure columns into separate indexed outputs.
+For MLX local training, write an explicit `.idx.json` sidecar next to the token
+shard:
 
 ```json
 {
@@ -77,6 +98,11 @@ Top-level path entries are also accepted for small handoffs:
 }
 ```
 
+Metadata-only keys such as `token_column`, `parquet_columns`, or
+`original_schema` are descriptive receipt fields. They do not trigger
+side-channel loading; local MLX structure inputs require explicit paths under
+`side_channel_paths` or supported top-level path entries.
+
 Supported canonical keys:
 
 | Key | Default dtype | MLX batch dtype | Model kwarg |
@@ -100,8 +126,9 @@ boundary:
 | `token_sibling_index` | `sibling_index_ids` |
 | `token_ast_node_type` | `node_type_ids` |
 
-Do not declare both a canonical key and its alias in the same sidecar. The
-reader rejects duplicate declarations instead of guessing which file wins.
+Do not declare both a canonical key and its alias anywhere in the same sidecar.
+The reader rejects duplicate declarations across `side_channel_paths` and
+top-level entries instead of guessing which file wins.
 
 ## Fail-Closed Rules
 
@@ -117,4 +144,5 @@ reader rejects duplicate declarations instead of guessing which file wins.
 
 This ingress proves local MLX consumption of Megatron-indexed token shards and
 token-aligned sidecars only. It does not claim source converter preservation of
-side channels, distributed Megatron parity, or M4-vs-GB10 throughput parity.
+side channels, distributed Megatron parity, GB10 training correctness, or
+M4-vs-GB10 throughput parity.

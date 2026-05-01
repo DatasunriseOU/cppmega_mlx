@@ -162,6 +162,7 @@ def test_mmididx_int32_reads_fixed_windows_without_crossing_sequences(tmp_path) 
     assert dataset.num_batches == 2
     assert dataset.dropped_samples == 1
     assert dataset.index_metadata.dtype == "int32"
+    assert dataset.index_metadata.metadata_path is None
     assert dataset.index_metadata.sequence_count == 2
     assert dataset.index_metadata.document_count == 2
     np.testing.assert_array_equal(
@@ -298,6 +299,31 @@ def test_megatron_indexed_fixture_flows_through_token_dataset_and_train_script(
     assert payload["dataset"]["path"] == str(prefix)
     assert payload["dataset"]["metadata"]["source_format"] == "megatron-indexed-test"
     assert payload["dataset"]["metadata"]["tokenizer_contract"] == "local_profile"
+    receipt = payload["dataset"]["dataset_receipt"]
+    assert receipt["source_format"] == "megatron-indexed-test"
+    assert receipt["source_path"] == str(prefix)
+    assert receipt["source_dataset_name"] == prefix.name
+    assert receipt["index_metadata"] == {
+        "bin_path": str(prefix.with_suffix(".bin")),
+        "idx_path": str(prefix.with_suffix(".idx")),
+        "metadata_path": str(prefix.with_suffix(".idx.json")),
+        "dtype": "int32",
+        "sequence_count": 2,
+        "document_count": 2,
+        "token_count": 16,
+        "source_format": "megatron-indexed-test",
+    }
+    assert receipt["megatron_indexed_receipt"] == {
+        "distributed_megatron_parity_claim": False,
+        "gb10_training_correctness_claim": False,
+        "ingress": "MegatronIndexedDataset",
+        "local_only": True,
+        "m4_vs_gb10_throughput_parity_claim": False,
+        "megatron_runtime_imported": False,
+        "path_accepts_suffixless_prefix": True,
+        "receipt_scope": "local_mlx_training_ingress",
+        "sidecar_schema": "explicit_token_aligned_binary_side_channel_paths",
+    }
     assert payload["dataset"]["side_channels"] == [
         "ast_depth_ids",
         "attention_mask",
@@ -357,6 +383,24 @@ def test_train_script_megatron_format_validation_accepts_suffixless_prefix(
     assert payload["status"] == "dry_run"
     assert payload["dataset"]["path"] == str(prefix)
     assert payload["dataset"]["metadata"]["source_format"] == "megatron-indexed-test"
+    receipt = payload["dataset"]["dataset_receipt"]
+    assert receipt["source_path"] == str(prefix)
+    assert receipt["index_metadata"]["metadata_path"] == str(
+        prefix.with_suffix(".idx.json")
+    )
+    assert receipt["megatron_indexed_receipt"]["local_only"] is True
+    assert receipt["megatron_indexed_receipt"]["megatron_runtime_imported"] is False
+    assert (
+        receipt["megatron_indexed_receipt"]["distributed_megatron_parity_claim"]
+        is False
+    )
+    assert receipt["megatron_indexed_receipt"]["gb10_training_correctness_claim"] is False
+    assert (
+        receipt["megatron_indexed_receipt"][
+            "m4_vs_gb10_throughput_parity_claim"
+        ]
+        is False
+    )
 
 
 def test_train_script_reports_missing_megatron_prefix_cleanly(tmp_path) -> None:
@@ -642,6 +686,43 @@ def test_mmididx_top_level_side_channel_entry_is_supported(tmp_path) -> None:
     np.testing.assert_array_equal(np.array(batch.node_type_ids), np.array(batch.tokens) % 11)
 
 
+def test_mmididx_stage3_metadata_only_sidecar_does_not_infer_side_channels(
+    tmp_path,
+) -> None:
+    prefix = tmp_path / "stage3_token_only"
+    _write_mmididx(prefix, [np.arange(8, dtype=np.int32)], dtype=np.int32)
+    prefix.with_suffix(".idx.json").write_text(
+        json.dumps(
+            {
+                "source_format": "cppmega-stage3-token-only",
+                "token_column": "token_ids",
+                "parquet_columns": [
+                    "token_ids",
+                    "token_structure_ids",
+                    "token_dep_levels",
+                    "token_ast_depth",
+                    "token_sibling_index",
+                    "token_ast_node_type",
+                ],
+                "original_schema": {
+                    "token_structure_ids": "large_list<uint8>",
+                    "token_dep_levels": "large_list<uint16>",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    dataset = MegatronIndexedDataset(prefix, seq_len=4, batch_size=1)
+    batch = next(dataset.iter_batches())
+
+    assert dataset.index_metadata.source_format == "cppmega-stage3-token-only"
+    assert getattr(dataset, "_side_channels") == {}
+    assert batch.model_kwargs() == {}
+    assert batch.structure_ids is None
+    assert batch.dep_levels is None
+
+
 def test_mmididx_token_side_channel_aliases_are_normalized(tmp_path) -> None:
     prefix = tmp_path / "alias_structure"
     docs = [np.arange(8, dtype=np.int32)]
@@ -728,6 +809,42 @@ def test_mmididx_top_level_alias_and_canonical_collision_fails_closed(tmp_path) 
             {
                 "structure_ids": "structure_ids.bin",
                 "token_structure_ids": "token_structure_ids.bin",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="structure_ids side-channel declared more than once"):
+        MegatronIndexedDataset(prefix, seq_len=4, batch_size=1)
+
+
+@pytest.mark.parametrize(
+    "side_channel_paths, top_level",
+    [
+        (
+            {"structure_ids": "structure_ids.bin"},
+            {"token_structure_ids": "token_structure_ids.bin"},
+        ),
+        (
+            {"token_structure_ids": "token_structure_ids.bin"},
+            {"structure_ids": "structure_ids.bin"},
+        ),
+    ],
+)
+def test_mmididx_cross_location_alias_and_canonical_collision_fails_closed(
+    tmp_path,
+    side_channel_paths,
+    top_level,
+) -> None:
+    prefix = tmp_path / "cross_location_duplicate_alias"
+    _write_mmididx(prefix, [np.arange(8, dtype=np.int32)], dtype=np.int32)
+    np.arange(8, dtype=np.int32).tofile(tmp_path / "structure_ids.bin")
+    np.arange(8, dtype=np.int32).tofile(tmp_path / "token_structure_ids.bin")
+    prefix.with_suffix(".idx.json").write_text(
+        json.dumps(
+            {
+                "side_channel_paths": side_channel_paths,
+                **top_level,
             }
         ),
         encoding="utf-8",

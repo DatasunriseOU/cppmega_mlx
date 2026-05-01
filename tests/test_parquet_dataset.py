@@ -90,10 +90,19 @@ def test_cppmega_token_side_channel_aliases_are_normalized(monkeypatch) -> None:
         "token_sibling_index": [[0, 1, 0, 1, 0, 1, 0, 1]],
         "token_ast_node_type": [[9, 8, 7, 6, 5, 4, 3, 2]],
     }
+    types = {
+        "token_ids": "large_list<element: uint32>",
+        "structure_ids": "large_list<element: int8>",
+        "token_structure_ids": "large_list<element: uint8>",
+        "token_dep_levels": "large_list<element: uint16>",
+        "token_ast_depth": "large_list<element: uint16>",
+        "token_sibling_index": "large_list<element: uint16>",
+        "token_ast_node_type": "large_list<element: uint16>",
+    }
     monkeypatch.setattr(
         parquet_dataset.importlib,
         "import_module",
-        lambda name: _fake_pyarrow_reader(values)
+        lambda name: _fake_pyarrow_reader(values, types=types)
         if name == "pyarrow.parquet"
         else pytest.fail(f"unexpected import {name}"),
     )
@@ -124,6 +133,46 @@ def test_cppmega_token_side_channel_aliases_are_normalized(monkeypatch) -> None:
         np.array(batch.node_type_ids),
         np.array([[9, 8, 7, 6], [5, 4, 3, 2]], dtype=np.int32),
     )
+    assert dataset.parquet_receipt == {
+        "source_format": "parquet",
+        "columns": sorted(values),
+        "column_types": types,
+        "token_source": {
+            "mode": "token_column",
+            "column": "token_ids",
+            "type": "large_list<element: uint32>",
+        },
+        "side_channel_sources": {
+            "ast_depth_ids": {
+                "column": "token_ast_depth",
+                "type": "large_list<element: uint16>",
+            },
+            "dep_levels": {
+                "column": "token_dep_levels",
+                "type": "large_list<element: uint16>",
+            },
+            "node_type_ids": {
+                "column": "token_ast_node_type",
+                "type": "large_list<element: uint16>",
+            },
+            "sibling_index_ids": {
+                "column": "token_sibling_index",
+                "type": "large_list<element: uint16>",
+            },
+            "structure_ids": {
+                "column": "token_structure_ids",
+                "type": "large_list<element: uint8>",
+            },
+        },
+        "skipped_side_channel_columns": [
+            {
+                "field": "structure_ids",
+                "column": "structure_ids",
+                "type": "large_list<element: int8>",
+                "reason": "not_token_aligned",
+            },
+        ],
+    }
 
 
 def test_source_level_structure_ids_are_ignored_when_not_token_aligned(
@@ -133,10 +182,14 @@ def test_source_level_structure_ids_are_ignored_when_not_token_aligned(
         "token_ids": [[0, 1, 2, 3, 4, 5, 6, 7]],
         "structure_ids": [[10, 20]],
     }
+    types = {
+        "token_ids": "large_list<element: uint32>",
+        "structure_ids": "large_list<element: int8>",
+    }
     monkeypatch.setattr(
         parquet_dataset.importlib,
         "import_module",
-        lambda name: _fake_pyarrow_reader(values)
+        lambda name: _fake_pyarrow_reader(values, types=types)
         if name == "pyarrow.parquet"
         else pytest.fail(f"unexpected import {name}"),
     )
@@ -147,6 +200,15 @@ def test_source_level_structure_ids_are_ignored_when_not_token_aligned(
     batch = next(dataset.iter_batches())
 
     assert batch.structure_ids is None
+    assert dataset.parquet_receipt["side_channel_sources"] == {}
+    assert dataset.parquet_receipt["skipped_side_channel_columns"] == [
+        {
+            "field": "structure_ids",
+            "column": "structure_ids",
+            "type": "large_list<element: int8>",
+            "reason": "not_token_aligned",
+        },
+    ]
 
 
 def test_token_aligned_alias_and_canonical_side_channel_collision_fails_closed(

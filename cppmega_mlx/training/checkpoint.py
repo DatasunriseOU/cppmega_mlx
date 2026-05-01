@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.metadata
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +45,62 @@ _SHARDING_PAYLOAD_KEYS = {
     "index_file",
     "shard_index",
     "max_file_size_gb",
+}
+_UNSUPPORTED_DISTRIBUTED_METADATA_KEYS = {
+    "context_parallel_rank",
+    "context_parallel_size",
+    "cp_rank",
+    "data_parallel_rank",
+    "data_parallel_size",
+    "distributed",
+    "distributed_checkpoint",
+    "distributed_optimizer",
+    "distributed_state",
+    "dp_rank",
+    "ep_rank",
+    "expert_model_parallel_rank",
+    "expert_model_parallel_size",
+    "fsdp",
+    "fully_sharded_data_parallel",
+    "megatron",
+    "model_parallel_rank",
+    "model_parallel_size",
+    "parallel_state",
+    "parallelism",
+    "partition_dim",
+    "partition_sizes",
+    "pipeline_model_parallel_rank",
+    "pipeline_model_parallel_size",
+    "pipeline_stage",
+    "pp_rank",
+    "replica_id",
+    "sequence_parallel",
+    "sharded_offsets",
+    "sharded_state",
+    "sharded_state_dict",
+    "tensor_model_parallel",
+    "tensor_model_parallel_rank",
+    "tensor_model_parallel_size",
+    "tp_rank",
+    "use_distributed_optimizer",
+    "virtual_pipeline_model_parallel_rank",
+    "virtual_pipeline_model_parallel_size",
+    "world_size",
+    "zero_stage",
+}
+_TRAINING_STATE_FIELDS = {
+    "compiled",
+    "grad_accum_steps",
+    "gradient_accumulator",
+    "gradient_accumulator_present",
+    "pending_microbatches",
+    "state",
+}
+_CHECKPOINT_MECHANIC_METADATA_ROOTS = {
+    "optimizer",
+    "rng",
+    "sharding",
+    "training_state",
 }
 
 
@@ -143,6 +200,177 @@ def _require_string(
 ) -> None:
     if not isinstance(value, str):
         raise ValueError(f"checkpoint metadata {metadata_path}: {name} must be a string")
+
+
+def _require_non_negative_number(
+    value: Any,
+    *,
+    name: str,
+    metadata_path: Path,
+) -> None:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or value < 0
+    ):
+        raise ValueError(
+            f"checkpoint metadata {metadata_path}: "
+            f"{name} must be a finite non-negative number"
+        )
+
+
+def _unsupported_metadata_field_paths(value: Any, prefix: str = "") -> list[str]:
+    paths: list[str] = []
+    if isinstance(value, dict):
+        for raw_key, child in value.items():
+            key = str(raw_key)
+            field_path = f"{prefix}.{key}" if prefix else key
+            if key in _UNSUPPORTED_DISTRIBUTED_METADATA_KEYS:
+                paths.append(field_path)
+            if not prefix and key not in _CHECKPOINT_MECHANIC_METADATA_ROOTS:
+                continue
+            paths.extend(_unsupported_metadata_field_paths(child, field_path))
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            field_path = f"{prefix}[{index}]" if prefix else f"[{index}]"
+            paths.extend(_unsupported_metadata_field_paths(child, field_path))
+    return paths
+
+
+def _reject_unsupported_checkpoint_fields(metadata: dict[str, Any], metadata_path: Path) -> None:
+    fields = sorted(set(_unsupported_metadata_field_paths(metadata)))
+    if fields:
+        raise ValueError(
+            f"checkpoint metadata {metadata_path}: unsupported distributed/sharded "
+            f"checkpoint metadata fields {fields!r}; local MLX checkpoints only "
+            "support single-process, single-file resume"
+        )
+
+
+def _require_string_list(
+    value: Any,
+    *,
+    name: str,
+    metadata_path: Path,
+) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError(
+            f"checkpoint metadata {metadata_path}: {name} must be a string list"
+        )
+    return value
+
+
+def _validate_tensor_summary_metadata(
+    summary: dict[str, Any],
+    *,
+    name: str,
+    metadata_path: Path,
+) -> None:
+    num_tensors = summary.get("num_tensors")
+    if num_tensors is not None:
+        _require_non_negative_int(
+            num_tensors,
+            name=f"{name}.num_tensors",
+            metadata_path=metadata_path,
+        )
+        assert isinstance(num_tensors, int)
+
+    tensors = summary.get("tensors")
+    if tensors is None:
+        return
+
+    tensor_names = _require_string_list(
+        tensors,
+        name=f"{name}.tensors",
+        metadata_path=metadata_path,
+    )
+    if num_tensors is not None and len(tensor_names) != num_tensors:
+        raise ValueError(
+            f"checkpoint metadata {metadata_path}: {name}.num_tensors does not "
+            f"match {name}.tensors"
+        )
+
+
+def _validate_tensor_file_matches_metadata(
+    tensor_state: dict[str, Any],
+    metadata: dict[str, Any],
+    metadata_path: Path,
+    *,
+    name: str,
+) -> None:
+    actual = _state_summary(tensor_state)
+    expected_num_tensors = metadata.get("num_tensors")
+    if (
+        isinstance(expected_num_tensors, int)
+        and expected_num_tensors != actual["num_tensors"]
+    ):
+        raise ValueError(
+            f"checkpoint metadata {metadata_path}: {name} tensor count mismatch; "
+            f"metadata records {expected_num_tensors}, file contains "
+            f"{actual['num_tensors']}"
+        )
+
+    expected_tensors = metadata.get("tensors")
+    if isinstance(expected_tensors, list) and sorted(expected_tensors) != actual["tensors"]:
+        raise ValueError(
+            f"checkpoint metadata {metadata_path}: {name} tensor names mismatch; "
+            "metadata does not match the safetensors payload"
+        )
+
+
+def _validate_evaluation_metadata(payload: Any, metadata_path: Path) -> None:
+    if payload is None:
+        return
+    if not isinstance(payload, dict):
+        raise ValueError(
+            f"checkpoint metadata {metadata_path}: evaluation must be an object"
+        )
+
+    for field in (
+        "iteration",
+        "requested_batches",
+        "evaluated_batches",
+        "planned_batches",
+    ):
+        if field in payload and payload[field] is not None:
+            _require_non_negative_int(
+                payload[field],
+                name=f"evaluation.{field}",
+                metadata_path=metadata_path,
+            )
+
+    for field in ("val_loss", "val_time"):
+        if field in payload and payload[field] is not None:
+            _require_non_negative_number(
+                payload[field],
+                name=f"evaluation.{field}",
+                metadata_path=metadata_path,
+            )
+
+    metrics = payload.get("metrics")
+    if metrics is None:
+        return
+    if not isinstance(metrics, dict):
+        raise ValueError(
+            f"checkpoint metadata {metadata_path}: evaluation.metrics must be an object"
+        )
+
+    for field in ("batches", "ntokens"):
+        if field in metrics and metrics[field] is not None:
+            _require_non_negative_int(
+                metrics[field],
+                name=f"evaluation.metrics.{field}",
+                metadata_path=metadata_path,
+            )
+
+    for field in ("loss", "seconds", "tokens_per_second"):
+        if field in metrics and metrics[field] is not None:
+            _require_non_negative_number(
+                metrics[field],
+                name=f"evaluation.metrics.{field}",
+                metadata_path=metadata_path,
+            )
 
 
 def _reject_standalone_rng_payload(metadata: dict[str, Any], metadata_path: Path) -> None:
@@ -300,6 +528,8 @@ def _validate_checkpoint_metadata(payload: dict[str, Any], metadata_path: Path) 
     if not payload:
         return
 
+    _reject_unsupported_checkpoint_fields(payload, metadata_path)
+
     checkpoint_format = payload.get("format")
     if checkpoint_format != FORMAT_NAME:
         raise ValueError(
@@ -313,6 +543,16 @@ def _validate_checkpoint_metadata(payload: dict[str, Any], metadata_path: Path) 
             f"checkpoint metadata {metadata_path}: unsupported version "
             f"{version!r}; expected {FORMAT_VERSION}"
         )
+
+    for field in ("step", "trained_tokens"):
+        if field in payload and payload[field] is not None:
+            _require_non_negative_int(
+                payload[field],
+                name=field,
+                metadata_path=metadata_path,
+            )
+    _validate_evaluation_metadata(payload.get("evaluation"), metadata_path)
+    _validate_tensor_summary_metadata(payload, name="model", metadata_path=metadata_path)
 
     tokenizer_contract = payload.get("tokenizer_contract")
     if not isinstance(tokenizer_contract, dict):
@@ -365,6 +605,12 @@ def _validate_checkpoint_metadata(payload: dict[str, Any], metadata_path: Path) 
             raise ValueError(
                 f"checkpoint metadata {metadata_path}: training_state must be an object"
             )
+        unknown_training_fields = sorted(set(training_state) - _TRAINING_STATE_FIELDS)
+        if unknown_training_fields:
+            raise ValueError(
+                f"checkpoint metadata {metadata_path}: unsupported training_state "
+                f"fields {unknown_training_fields!r}"
+            )
         cursor = training_state.get("state")
         if not isinstance(cursor, dict):
             raise ValueError(
@@ -408,6 +654,12 @@ def _validate_checkpoint_metadata(payload: dict[str, Any], metadata_path: Path) 
                 f"checkpoint metadata {metadata_path}: "
                 "training_state.gradient_accumulator_present must be a boolean"
             )
+        compiled = training_state.get("compiled")
+        if compiled is not None and not isinstance(compiled, bool):
+            raise ValueError(
+                f"checkpoint metadata {metadata_path}: "
+                "training_state.compiled must be a boolean"
+            )
         if pending_microbatches > 0 and not accumulator_present:
             raise ValueError(
                 f"checkpoint metadata {metadata_path}: pending training_state "
@@ -422,7 +674,12 @@ def _validate_checkpoint_metadata(payload: dict[str, Any], metadata_path: Path) 
                     "training_state.gradient_accumulator must be an object"
                 )
             accumulator_file = accumulator.get("file")
-            accumulator_file_present = bool(accumulator.get("present"))
+            accumulator_file_present = accumulator.get("present")
+            if not isinstance(accumulator_file_present, bool):
+                raise ValueError(
+                    f"checkpoint metadata {metadata_path}: "
+                    "training_state.gradient_accumulator.present must be a boolean"
+                )
             if accumulator_file_present != accumulator_present:
                 raise ValueError(
                     f"checkpoint metadata {metadata_path}: "
@@ -438,14 +695,11 @@ def _validate_checkpoint_metadata(payload: dict[str, Any], metadata_path: Path) 
                 name="training_state.gradient_accumulator.num_tensors",
                 metadata_path=metadata_path,
             )
-            tensors = accumulator.get("tensors", [])
-            if not isinstance(tensors, list) or not all(
-                isinstance(name, str) for name in tensors
-            ):
-                raise ValueError(
-                    f"checkpoint metadata {metadata_path}: "
-                    "training_state.gradient_accumulator.tensors must be a string list"
-                )
+            _validate_tensor_summary_metadata(
+                accumulator,
+                name="training_state.gradient_accumulator",
+                metadata_path=metadata_path,
+            )
 
     optimizer_metadata = payload.get("optimizer")
     if optimizer_metadata is not None:
@@ -473,13 +727,43 @@ def _validate_checkpoint_metadata(payload: dict[str, Any], metadata_path: Path) 
             name="optimizer.num_tensors",
             metadata_path=metadata_path,
         )
-        tensors = optimizer_metadata.get("tensors", [])
-        if not isinstance(tensors, list) or not all(
-            isinstance(name, str) for name in tensors
-        ):
-            raise ValueError(
-                f"checkpoint metadata {metadata_path}: optimizer.tensors must be a string list"
-            )
+        _validate_tensor_summary_metadata(
+            optimizer_metadata,
+            name="optimizer",
+            metadata_path=metadata_path,
+        )
+
+
+def _validate_training_step_resume_compatibility(
+    training_step: Any,
+    training_state: dict[str, Any],
+    metadata_path: Path,
+) -> None:
+    checkpoint_compiled = training_state.get("compiled")
+    runner_compiled = getattr(training_step, "compile", None)
+    if (
+        isinstance(checkpoint_compiled, bool)
+        and isinstance(runner_compiled, bool)
+        and checkpoint_compiled != runner_compiled
+    ):
+        raise ValueError(
+            f"checkpoint metadata {metadata_path}: training_state.compiled "
+            f"{checkpoint_compiled!r} does not match runner compiled mode "
+            f"{runner_compiled!r}"
+        )
+
+    checkpoint_grad_accum_steps = training_state.get("grad_accum_steps")
+    runner_grad_accum_steps = getattr(training_step, "grad_accum_steps", None)
+    if (
+        isinstance(checkpoint_grad_accum_steps, int)
+        and isinstance(runner_grad_accum_steps, int)
+        and checkpoint_grad_accum_steps != runner_grad_accum_steps
+    ):
+        raise ValueError(
+            f"checkpoint metadata {metadata_path}: training_state.grad_accum_steps "
+            f"{checkpoint_grad_accum_steps} does not match runner "
+            f"{runner_grad_accum_steps}"
+        )
 
 
 def _training_step_state(training_step: Any | None) -> dict[str, Any] | None:
@@ -506,12 +790,14 @@ def save_checkpoint(
 
     metadata = metadata or {}
     weights_path, metadata_path, optimizer_path = _checkpoint_paths(path)
+    _reject_unsupported_checkpoint_fields(metadata, metadata_path)
     rng_contract = _rng_contract(metadata, metadata_path)
     sharding_contract = _sharding_contract(
         metadata,
         metadata_path,
         weights_name=weights_path.name,
     )
+    _validate_evaluation_metadata(metadata.get("evaluation"), metadata_path)
     weights_path.parent.mkdir(parents=True, exist_ok=True)
     metadata_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -565,6 +851,7 @@ def save_checkpoint(
         "version": FORMAT_VERSION,
         "weights": weights_path.name,
         "num_tensors": len(weights),
+        "tensors": sorted(weights),
         "step": metadata.get("step"),
         "optimizer": {
             "present": optimizer_state_present,
@@ -622,11 +909,35 @@ def load_checkpoint(
             f"No model weights found for checkpoint {path}: {weights_path}"
         )
 
+    model_state = mx.load(str(weights_path))
+    if not isinstance(model_state, dict):
+        raise TypeError(f"Model checkpoint must be a tensor mapping: {weights_path}")
+    if payload:
+        _validate_tensor_file_matches_metadata(
+            model_state,
+            payload,
+            metadata_path,
+            name="model",
+        )
     model.load_weights(str(weights_path), strict=strict)
     mx.eval(model.parameters())
 
+    if training_step is not None:
+        training_state = payload.get("training_state")
+        if not isinstance(training_state, dict):
+            raise ValueError(f"No training_state found for checkpoint {path}")
+        _validate_training_step_resume_compatibility(
+            training_step,
+            training_state,
+            metadata_path,
+        )
+
     if optimizer is not None:
         optimizer_metadata = payload.get("optimizer")
+        if isinstance(optimizer_metadata, dict) and optimizer_metadata.get("present") is False:
+            raise FileNotFoundError(
+                f"No optimizer state recorded in checkpoint metadata {metadata_path}"
+            )
         optimizer_file = (
             optimizer_metadata.get("file")
             if isinstance(optimizer_metadata, dict)
@@ -642,6 +953,13 @@ def load_checkpoint(
         optimizer_state = mx.load(str(optimizer_path))
         if not isinstance(optimizer_state, dict):
             raise TypeError(f"Optimizer checkpoint must be a tensor mapping: {optimizer_path}")
+        if isinstance(optimizer_metadata, dict):
+            _validate_tensor_file_matches_metadata(
+                optimizer_state,
+                optimizer_metadata,
+                metadata_path,
+                name="optimizer",
+            )
         optimizer.state = tree_unflatten(optimizer_state)
         mx.eval(optimizer.state)
 
@@ -669,6 +987,12 @@ def load_checkpoint(
                     "Gradient accumulator checkpoint must be a tensor mapping: "
                     f"{accumulator_path}"
                 )
+            _validate_tensor_file_matches_metadata(
+                accumulator_state,
+                accumulator_metadata,
+                metadata_path,
+                name="training_state.gradient_accumulator",
+            )
             accumulator = tree_unflatten(accumulator_state)
             mx.eval(accumulator)
 

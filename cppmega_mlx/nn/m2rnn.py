@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Literal, overload
 
 import mlx.core as mx
 import mlx.nn as nn
+
+from cppmega_mlx.nn.mamba3 import causal_depthwise_conv1d
 
 DEFAULT_CHUNK_SIZE = 128
 
@@ -29,6 +32,7 @@ class M2RNNConfig:
     num_f_heads: int = 4
     num_g_heads: int = 4
     num_weight_heads: int = 1
+    conv_kernel: int = 4
     chunk_size: int = DEFAULT_CHUNK_SIZE
     use_residual: bool = True
     A_init_min: float = 0.0
@@ -58,6 +62,7 @@ class M2RNNConfig:
         _require_positive_int("num_f_heads", self.num_f_heads)
         _require_positive_int("num_g_heads", self.num_g_heads)
         _require_positive_int("num_weight_heads", self.num_weight_heads)
+        _require_positive_int("conv_kernel", self.conv_kernel)
         _require_positive_int("chunk_size", self.chunk_size)
 
         total_heads = self.num_heads
@@ -78,6 +83,14 @@ class M2RNNConfig:
             "dt_init_floor",
             self.dt_init_floor,
         )
+
+
+@dataclass(frozen=True)
+class M2RNNMixerState:
+    """Explicit continuation state for ``M2RNNMixer`` segmented execution."""
+
+    h: mx.array
+    conv_state: mx.array
 
 
 def _require_nonnegative_float(name: str, value: float) -> None:
@@ -337,7 +350,12 @@ def chunked_m2rnn_scan(
 
 
 class M2RNNMixer(nn.Module):
-    """Lightweight hidden-state mixer for local MLX smoke training."""
+    """Lightweight hidden-state mixer for local MLX smoke training.
+
+    The default return remains ``(out, h)`` for existing callers.  Segmented
+    continuation through the Q/K/V causal convolution must opt into
+    ``return_state=True`` and pass the returned ``mixer_state`` to the suffix.
+    """
 
     def __init__(self, config: M2RNNConfig):
         super().__init__()
@@ -345,14 +363,17 @@ class M2RNNMixer(nn.Module):
         self.q_dim = config.num_q_heads * config.k_head_dim
         self.k_dim = config.num_k_heads * config.k_head_dim
         self.v_dim = config.num_v_heads * config.v_head_dim
+        self.conv_dim = self.q_dim + self.k_dim + self.v_dim
         self.f_dim = config.num_f_heads
         self.g_dim = config.num_g_heads * config.v_head_dim
 
         self.in_proj = nn.Linear(
             config.d_model,
-            self.q_dim + self.k_dim + self.v_dim + self.f_dim + self.g_dim,
+            self.conv_dim + self.f_dim + self.g_dim,
             bias=False,
         )
+        self.conv_weight = self._init_conv_weight(self.conv_dim, config.conv_kernel)
+        self.conv_bias = mx.zeros((self.conv_dim,))
         self.g_norm = nn.RMSNorm(config.num_heads * config.v_head_dim)
         self.out_proj = nn.Linear(config.num_heads * config.v_head_dim, config.d_model, bias=False)
         self.state_weight = mx.broadcast_to(
@@ -362,6 +383,46 @@ class M2RNNMixer(nn.Module):
         self.A_log = self._init_A_log(config)
         self.dt_bias = self._init_dt_bias(config)
         self.D = mx.ones((config.num_heads, config.v_head_dim)) if config.use_residual else None
+
+    @staticmethod
+    def _init_conv_weight(channels: int, kernel_size: int) -> mx.array:
+        if kernel_size <= 0:
+            raise ValueError(f"conv_kernel must be positive, got {kernel_size}")
+        scale = math.sqrt(1 / (channels * kernel_size))
+        return mx.random.uniform(-scale, scale, (channels, kernel_size, 1))
+
+    def _empty_conv_state(self, batch: int, dtype: mx.Dtype) -> mx.array:
+        return mx.zeros((batch, self.config.conv_kernel - 1, self.conv_dim), dtype=dtype)
+
+    def _validate_conv_state(
+        self,
+        conv_state: mx.array,
+        *,
+        batch: int,
+        dtype: mx.Dtype,
+    ) -> mx.array:
+        expected_shape = (batch, self.config.conv_kernel - 1, self.conv_dim)
+        _require_rank("mixer_state.conv_state", conv_state, 3)
+        _require_floating("mixer_state.conv_state", conv_state)
+        if conv_state.shape != expected_shape:
+            raise ValueError(
+                f"mixer_state.conv_state must have shape {expected_shape}, got {conv_state.shape}"
+            )
+        if conv_state.dtype != dtype:
+            raise TypeError(
+                f"mixer_state.conv_state dtype {conv_state.dtype} must match projected dtype {dtype}"
+            )
+        return conv_state
+
+    def _next_conv_state(self, conv_source: mx.array, *, batch: int, dtype: mx.Dtype) -> mx.array:
+        history_len = self.config.conv_kernel - 1
+        if history_len == 0:
+            return self._empty_conv_state(batch, dtype)
+        source_len = conv_source.shape[1]
+        if source_len >= history_len:
+            return conv_source[:, -history_len:, :]
+        pad = mx.zeros((batch, history_len - source_len, self.conv_dim), dtype=dtype)
+        return mx.concatenate([pad, conv_source], axis=1)
 
     @staticmethod
     def _init_A_log(config: M2RNNConfig) -> mx.array:
@@ -375,28 +436,92 @@ class M2RNNMixer(nn.Module):
         dt = mx.exp(mx.random.uniform(math.log(dt_min), math.log(config.dt_init_max), (config.num_heads,)))
         return (dt + mx.log(-mx.expm1(-dt))).astype(mx.float32)
 
+    @overload
     def __call__(
         self,
         hidden_states: mx.array,
         *,
         h0: mx.array | None = None,
+        mixer_state: M2RNNMixerState | None = None,
         chunk_size: int | None = None,
-    ) -> tuple[mx.array, mx.array]:
+        return_state: Literal[False] = False,
+    ) -> tuple[mx.array, mx.array]: ...
+
+    @overload
+    def __call__(
+        self,
+        hidden_states: mx.array,
+        *,
+        h0: mx.array | None = None,
+        mixer_state: M2RNNMixerState | None = None,
+        chunk_size: int | None = None,
+        return_state: Literal[True],
+    ) -> tuple[mx.array, M2RNNMixerState]: ...
+
+    def __call__(
+        self,
+        hidden_states: mx.array,
+        *,
+        h0: mx.array | None = None,
+        mixer_state: M2RNNMixerState | None = None,
+        chunk_size: int | None = None,
+        return_state: bool = False,
+    ) -> tuple[mx.array, mx.array] | tuple[mx.array, M2RNNMixerState]:
         if hidden_states.ndim != 3:
             raise ValueError(f"hidden_states must be shaped (B,S,D), got {hidden_states.shape}")
+        if h0 is not None and mixer_state is not None:
+            raise ValueError("pass either h0 or mixer_state, not both")
 
         cfg = self.config
         projected = self.in_proj(hidden_states)
+        conv_end = self.conv_dim
+        f_end = conv_end + self.f_dim
+
+        batch, seq, _ = hidden_states.shape
+        projected_conv = projected[:, :, :conv_end]
+        conv_prefix: mx.array | None = None
+        scan_h0 = h0
+        if mixer_state is not None:
+            if not isinstance(mixer_state, M2RNNMixerState):
+                raise TypeError("mixer_state must be an M2RNNMixerState")
+            scan_h0 = _initial_m2rnn_state(
+                mixer_state.h,
+                batch=batch,
+                heads=cfg.num_heads,
+                k_dim=cfg.k_head_dim,
+                v_dim=cfg.v_head_dim,
+                dtype=projected.dtype,
+            )
+            conv_prefix = self._validate_conv_state(
+                mixer_state.conv_state,
+                batch=batch,
+                dtype=projected.dtype,
+            )
+        conv_source = (
+            projected_conv
+            if conv_prefix is None or conv_prefix.shape[1] == 0
+            else mx.concatenate([conv_prefix, projected_conv], axis=1)
+        )
+        next_conv_state = self._next_conv_state(conv_source, batch=batch, dtype=projected.dtype)
+        if conv_source.shape[1] == 0:
+            conv_input = mx.zeros((batch, 0, conv_end), dtype=projected.dtype)
+        else:
+            conv_input = causal_depthwise_conv1d(
+                conv_source,
+                self.conv_weight.astype(projected.dtype),
+                self.conv_bias.astype(projected.dtype),
+            )
+        if conv_prefix is not None and conv_prefix.shape[1] > 0:
+            conv_input = conv_input[:, conv_prefix.shape[1] :, :]
+        conv_input = nn.silu(conv_input)
+
         q_end = self.q_dim
         k_end = q_end + self.k_dim
         v_end = k_end + self.v_dim
-        f_end = v_end + self.f_dim
-
-        batch, seq, _ = hidden_states.shape
-        q = projected[:, :, :q_end].reshape(batch, seq, cfg.num_q_heads, cfg.k_head_dim)
-        k = projected[:, :, q_end:k_end].reshape(batch, seq, cfg.num_k_heads, cfg.k_head_dim)
-        v = projected[:, :, k_end:v_end].reshape(batch, seq, cfg.num_v_heads, cfg.v_head_dim)
-        xf = m2rnn_softplus_decay_gate(projected[:, :, v_end:f_end], self.A_log, self.dt_bias)
+        q = conv_input[:, :, :q_end].reshape(batch, seq, cfg.num_q_heads, cfg.k_head_dim)
+        k = conv_input[:, :, q_end:k_end].reshape(batch, seq, cfg.num_k_heads, cfg.k_head_dim)
+        v = conv_input[:, :, k_end:v_end].reshape(batch, seq, cfg.num_v_heads, cfg.v_head_dim)
+        xf = m2rnn_softplus_decay_gate(projected[:, :, conv_end:f_end], self.A_log, self.dt_bias)
         g = projected[:, :, f_end:].reshape(batch, seq, cfg.num_g_heads, cfg.v_head_dim)
 
         out, h = chunked_m2rnn_scan(
@@ -405,7 +530,7 @@ class M2RNNMixer(nn.Module):
             v,
             self.state_weight.astype(q.dtype),
             xf,
-            h0=h0,
+            h0=scan_h0,
             chunk_size=cfg.chunk_size if chunk_size is None else chunk_size,
         )
         if self.D is not None:
@@ -418,6 +543,8 @@ class M2RNNMixer(nn.Module):
         out = out * nn.silu(g).astype(out.dtype)
         out = self.g_norm(out)
         out = self.out_proj(out)
+        if return_state:
+            return out, M2RNNMixerState(h=h, conv_state=next_conv_state)
         return out, h
 
 
@@ -425,6 +552,7 @@ __all__ = [
     "DEFAULT_CHUNK_SIZE",
     "M2RNNConfig",
     "M2RNNMixer",
+    "M2RNNMixerState",
     "broadcast_m2rnn_heads",
     "chunked_m2rnn_scan",
     "m2rnn_softplus_decay_gate",
