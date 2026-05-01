@@ -882,7 +882,7 @@ def load_checkpoint(
     training_step: Any | None = None,
     strict: bool = True,
 ) -> dict[str, Any]:
-    """Load a checkpoint into ``model`` and optional ``optimizer``."""
+    """Load a checkpoint into model and optional optimizer."""
 
     weights_path, metadata_path, default_optimizer_path = _checkpoint_paths(path)
     payload = json.loads(metadata_path.read_text()) if metadata_path.exists() else {}

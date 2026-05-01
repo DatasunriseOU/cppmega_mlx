@@ -26,7 +26,7 @@ _PRIMES = (
 
 
 def pick_primes(count: int, target_size: int) -> tuple[int, ...]:
-    """Pick cppmega-compatible per-table sizes near ``target_size``."""
+    """Pick cppmega-compatible per-table sizes near target_size."""
 
     candidates = [p for p in _PRIMES if abs(p - target_size) / target_size < 0.5]
     if len(candidates) >= count:
@@ -137,7 +137,7 @@ class NgramHashEmbedding(nn.Module):
         return mx.stack(shifted, axis=0)
 
     def _hash_all(self, token_ids: mx.array) -> mx.array:
-        """Return unified table indices with shape ``(batch, tables, seq)``."""
+        """Return unified table indices with shape (batch, tables, seq)."""
 
         if len(token_ids.shape) != 2:
             raise ValueError(f"token_ids must have shape (batch, seq), got {token_ids.shape}")

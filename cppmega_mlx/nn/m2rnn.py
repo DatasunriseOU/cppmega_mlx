@@ -87,7 +87,7 @@ class M2RNNConfig:
 
 @dataclass(frozen=True)
 class M2RNNMixerState:
-    """Explicit continuation state for ``M2RNNMixer`` segmented execution."""
+    """Explicit continuation state for M2RNNMixer segmented execution."""
 
     h: mx.array
     conv_state: mx.array
@@ -154,7 +154,7 @@ def broadcast_m2rnn_heads(
     W: mx.array,
     xf: mx.array,
 ) -> tuple[mx.array, mx.array, mx.array, mx.array, mx.array]:
-    """Broadcast all M2RNN head axes to ``H=max(n_q,n_k,n_v,n_w,n_f)``."""
+    """Broadcast all M2RNN head axes to H=max(n_q,n_k,n_v,n_w,n_f)."""
 
     _require_rank("q", q, 4)
     _require_rank("k", k, 4)
@@ -200,7 +200,7 @@ def m2rnn_softplus_decay_gate(
 ) -> mx.array:
     """Megatron-style learnable M2RNN forget gate.
 
-    Matches ``exp(-exp(A_log) * softplus(f_input + dt_bias))`` and broadcasts
+    Matches exp(-exp(A_log) * softplus(f_input + dt_bias)) and broadcasts
     projected forget heads to the learned per-state head parameters.
     """
 
@@ -254,9 +254,9 @@ def m2rnn_scan(
     """Sequential MLX reference scan matching the Megatron PyTorch M2RNN seam.
 
     Shapes:
-    ``q(B,S,n_q,K)``, ``k(B,S,n_k,K)``, ``v(B,S,n_v,V)``, ``W(n_w,V,V)``,
-    ``xf(B,S,n_f)``, optional ``h0(B,H,K,V)``.  Returns
-    ``out(B,S,H,V)`` and final ``h(B,H,K,V)``.
+    q(B,S,n_q,K), k(B,S,n_k,K), v(B,S,n_v,V), W(n_w,V,V),
+    xf(B,S,n_f), optional h0(B,H,K,V).  Returns
+    out(B,S,H,V) and final h(B,H,K,V).
     """
 
     q, k, v, W, xf = broadcast_m2rnn_heads(q, k, v, W, xf)
@@ -352,9 +352,9 @@ def chunked_m2rnn_scan(
 class M2RNNMixer(nn.Module):
     """Lightweight hidden-state mixer for local MLX smoke training.
 
-    The default return remains ``(out, h)`` for existing callers.  Segmented
+    The default return remains (out, h) for existing callers.  Segmented
     continuation through the Q/K/V causal convolution must opt into
-    ``return_state=True`` and pass the returned ``mixer_state`` to the suffix.
+    return_state=True and pass the returned mixer_state to the suffix.
     """
 
     def __init__(self, config: M2RNNConfig):

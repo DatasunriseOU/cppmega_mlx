@@ -15,7 +15,7 @@ AttentionMode = Literal["mla", "dsa"]
 class AttentionRouteInfo:
     """Runtime marker for cppmega A-layer routing.
 
-    ``dsa`` currently uses the same dense causal reference path as ``mla``.
+    dsa currently uses the same dense causal reference path as mla.
     The marker keeps NAM56R layer intent visible until sparse DSA/MLA Metal
     kernels are wired in.
     """
@@ -92,8 +92,8 @@ def _causal_additive_mask(seq_length: int, dtype: mx.Dtype) -> mx.array:
 class CausalSelfAttention(nn.Module):
     """Correctness-first MLX causal self-attention for cppmega A-layers.
 
-    The module uses MLX fast SDPA with tensors in ``(B, heads, S, D)`` form.
-    ``mode='dsa'`` intentionally remains a dense causal placeholder/reference:
+    The module uses MLX fast SDPA with tensors in (B, heads, S, D) form.
+    mode='dsa' intentionally remains a dense causal placeholder/reference:
     it preserves the layer route marker but does not implement sparse DSA top-k
     indexing or production MLA absorbed projections.
     """

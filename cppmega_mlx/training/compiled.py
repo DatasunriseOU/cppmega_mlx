@@ -1,9 +1,9 @@
 """Compiled MLX pretraining step utilities.
 
 The shape mirrors the current MLX-LM trainer pattern: compute loss with
-``nn.value_and_grad``, update the optimizer, and explicitly ``mx.eval`` the
-model/optimizer state.  The compiled path captures ``model.state`` and
-``optimizer.state`` so fixed-shape batches can be replayed efficiently.
+nn.value_and_grad, update the optimizer, and explicitly mx.eval the
+model/optimizer state.  The compiled path captures model.state and
+optimizer.state so fixed-shape batches can be replayed efficiently.
 """
 
 from __future__ import annotations
@@ -47,9 +47,9 @@ def normalize_compiled_batch(
 ) -> CompiledBatch:
     """Return the fixed-key batch pytree used by compiled train steps.
 
-    ``mx.compile`` keys off the Python input structure as well as array shapes
+    mx.compile keys off the Python input structure as well as array shapes
     and dtypes.  Keep every optional side channel present in the dict and use
-    ``None`` for absent fields so callers do not alternate between different
+    None for absent fields so callers do not alternate between different
     dict key sets when switching between plain token batches and structured
     batches.
     """
@@ -208,7 +208,7 @@ class CompiledPretrainingStep:
         *,
         gradient_accumulator: Any = None,
     ) -> None:
-        """Restore Python-side state from ``state_dict`` metadata.
+        """Restore Python-side state from state_dict metadata.
 
         Optimizer/model tensors are restored by checkpoint loading.  Pending
         gradient accumulation is explicit: a non-zero pending count must be

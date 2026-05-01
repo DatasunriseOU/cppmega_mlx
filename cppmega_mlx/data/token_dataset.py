@@ -1,9 +1,9 @@
 """Fixed-shape token datasets for local MLX training.
 
 The H200 cppmega pipeline stores tokenized C/C++ documents as parquet and then
-formats them into Megatron ``.bin/.idx`` files.  The Mac lane starts from a
+formats them into Megatron .bin/.idx files.  The Mac lane starts from a
 smaller NPZ handoff: it keeps the same token IDs and tokenizer metadata, but
-emits fixed-shape :class:`LMTokenBatch` objects directly for MLX.
+emits fixed-shape :class:LMTokenBatch objects directly for MLX.
 """
 
 from __future__ import annotations
@@ -146,10 +146,10 @@ class BatchCursor:
 class TokenNpzDataset:
     """NPZ-backed fixed-shape token batch iterator.
 
-    ``tokens`` is required in the NPZ.  A flat array is split into contiguous
-    windows of ``seq_len``.  A 2D array is treated as one or more documents and
+    tokens is required in the NPZ.  A flat array is split into contiguous
+    windows of seq_len.  A 2D array is treated as one or more documents and
     split row-wise into windows.  Optional side-channel arrays with matching
-    shape are sliced alongside tokens and passed through to ``LMTokenBatch``.
+    shape are sliced alongside tokens and passed through to LMTokenBatch.
     """
 
     def __init__(
@@ -240,9 +240,9 @@ class TokenNpzDataset:
         epoch: int = 0,
         loop: bool | None = None,
     ) -> Iterator[LMTokenBatch]:
-        """Yield fixed-shape ``LMTokenBatch`` objects.
+        """Yield fixed-shape LMTokenBatch objects.
 
-        ``resume_batch`` counts full batches already consumed in this dataset
+        resume_batch counts full batches already consumed in this dataset
         epoch.  The same seed, epoch, and resume value reconstruct the same
         next batch after checkpoint restore.
         """
@@ -276,7 +276,7 @@ class TokenNpzDataset:
             batch_offset = 0
 
     def cursor_after(self, consumed_batches: int, *, epoch: int = 0) -> BatchCursor:
-        """Return the deterministic cursor after ``consumed_batches``."""
+        """Return the deterministic cursor after consumed_batches."""
 
         if consumed_batches < 0:
             raise ValueError("consumed_batches must be non-negative")
@@ -317,7 +317,7 @@ def open_token_dataset(
     """Open a local token dataset.
 
     Parquet and Megatron readers are optional seams loaded only when selected.
-    Megatron ``.bin/.idx`` support uses the local fail-closed ``MMIDIDX`` reader
+    Megatron .bin/.idx support uses the local fail-closed MMIDIDX reader
     and does not import megatron-core.
     """
 

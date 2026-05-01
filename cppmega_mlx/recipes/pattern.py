@@ -1,6 +1,6 @@
 """NAM-style layer-pattern helpers for the MLX port.
 
-The source cppmega recipe tiles ``AEMEAEMEAEMR`` by depth.  This module keeps
+The source cppmega recipe tiles AEMEAEMEAEMR by depth.  This module keeps
 the MLX port fail-closed: only the symbols that have an explicit local meaning
 are accepted.
 """
@@ -41,10 +41,10 @@ class NamLayer:
 class ExpandedNamPattern:
     """Expanded NAM pattern with derived routing lists.
 
-    ``dsa_a_layer_ranks`` are zero-based indices among A layers, not absolute
-    layer numbers.  This mirrors cppmega's ``CPPMEGA_DSA_A_LAYER_RANKS``
-    contract: source launchers route with ``attn_nums[index]``, and
-    ``CppMegaSelectiveAttentionLayer`` uses ``attention_layer_numbers.index``.
+    dsa_a_layer_ranks are zero-based indices among A layers, not absolute
+    layer numbers.  This mirrors cppmega's CPPMEGA_DSA_A_LAYER_RANKS
+    contract: source launchers route with attn_nums[index], and
+    CppMegaSelectiveAttentionLayer uses attention_layer_numbers.index.
     """
 
     source_pattern: str

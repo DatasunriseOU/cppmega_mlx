@@ -491,7 +491,7 @@ class StepProfiler:
         return self._metrics
 
     def add_eval_args(self, *args: Any) -> None:
-        """Add arrays/pytrees to force with ``mx.eval`` when the scope exits."""
+        """Add arrays/pytrees to force with mx.eval when the scope exits."""
 
         self._eval_args.extend(args)
 

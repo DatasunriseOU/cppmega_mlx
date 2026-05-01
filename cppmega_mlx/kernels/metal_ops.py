@@ -105,7 +105,7 @@ def metal_kernel_status(x: mx.array | None = None) -> MetalKernelStatus:
 
 
 def squared_relu_training_status() -> TrainingKernelStatus:
-    """Return the training policy for the prototype ``squared_relu`` kernel."""
+    """Return the training policy for the prototype squared_relu kernel."""
 
     return TrainingKernelStatus(
         in_tree=True,
@@ -128,7 +128,7 @@ def squared_relu_training_status() -> TrainingKernelStatus:
 
 
 def squared_relu_reference(x: mx.array) -> mx.array:
-    """Pure MLX fallback/reference for ``relu(x) ** 2``."""
+    """Pure MLX fallback/reference for relu(x) ** 2."""
 
     relu = mx.maximum(x, mx.array(0, dtype=x.dtype))
     return relu * relu
@@ -141,17 +141,17 @@ def _reject_forward_only_training_kernel() -> None:
 
 
 def squared_relu(x: mx.array, *, backend: Backend = "auto", training: bool = False) -> mx.array:
-    """Compute ``relu(x) ** 2`` through a safe optional Metal seam.
+    """Compute relu(x) ** 2 through a safe optional Metal seam.
 
-    ``backend="mlx"`` always uses the pure MLX fallback. ``backend="metal"``
-    fails closed when Metal is not eligible. ``backend="auto"`` uses Metal only
-    when the local process and input dtype are supported and ``training`` is
+    backend="mlx" always uses the pure MLX fallback. backend="metal"
+    fails closed when Metal is not eligible. backend="auto" uses Metal only
+    when the local process and input dtype are supported and training is
     false, otherwise it falls back to the reference implementation.
 
-    ``training=True`` makes the differentiability policy explicit: forward-only
-    Metal kernels are never inserted into a training graph. ``backend="auto"``
-    and ``backend="mlx"`` use the pure MLX reference, while ``backend="metal"``
-    raises until the kernel has a custom ``mx.custom_function`` VJP/JVP.
+    training=True makes the differentiability policy explicit: forward-only
+    Metal kernels are never inserted into a training graph. backend="auto"
+    and backend="mlx" use the pure MLX reference, while backend="metal"
+    raises until the kernel has a custom mx.custom_function VJP/JVP.
     """
 
     if backend not in {"auto", "mlx", "metal"}:

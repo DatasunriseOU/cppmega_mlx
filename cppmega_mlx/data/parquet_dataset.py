@@ -76,9 +76,9 @@ class _SideChannelColumns:
 class TokenParquetDataset:
     """Parquet-backed fixed-shape token batch iterator.
 
-    ``token_key`` accepts either one integer token per row or a list-like token
-    sequence per row.  ``text_key`` accepts source text and requires a tokenizer
-    object with ``encode`` or a callable ``str -> Sequence[int]``.
+    token_key accepts either one integer token per row or a list-like token
+    sequence per row.  text_key accepts source text and requires a tokenizer
+    object with encode or a callable str -> Sequence[int].
     """
 
     def __init__(
@@ -180,7 +180,7 @@ class TokenParquetDataset:
         epoch: int = 0,
         loop: bool | None = None,
     ) -> Iterator[LMTokenBatch]:
-        """Yield fixed-shape ``LMTokenBatch`` objects."""
+        """Yield fixed-shape LMTokenBatch objects."""
 
         effective_loop = self.loop if loop is None else loop
         start_batch = self.resume_batch if resume_batch is None else resume_batch
@@ -211,7 +211,7 @@ class TokenParquetDataset:
             batch_offset = 0
 
     def cursor_after(self, consumed_batches: int, *, epoch: int = 0) -> BatchCursor:
-        """Return the deterministic cursor after ``consumed_batches``."""
+        """Return the deterministic cursor after consumed_batches."""
 
         if consumed_batches < 0:
             raise ValueError("consumed_batches must be non-negative")

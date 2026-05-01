@@ -160,9 +160,9 @@ class StructureConfig:
 class SourceStructureEnvConfig:
     """Megatron custom_embedding.py env-gated structure defaults.
 
-    This is intentionally separate from ``StructureConfig``: the standalone
+    This is intentionally separate from StructureConfig: the standalone
     source module defaults are wider, while the Megatron embedding seam fills in
-    smaller env defaults when ``CPPMEGA_STRUCTURE_ENABLED=1``.
+    smaller env defaults when CPPMEGA_STRUCTURE_ENABLED=1.
     """
 
     enabled: bool = False

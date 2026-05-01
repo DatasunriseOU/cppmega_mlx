@@ -124,7 +124,7 @@ class Mamba3InProjDims:
 
 @dataclass(frozen=True)
 class Mamba3CacheState:
-    """Batch-shaped local mirror of source Mamba3 ``(angle_dt, ssm, k, v)`` cache."""
+    """Batch-shaped local mirror of source Mamba3 (angle_dt, ssm, k, v) cache."""
 
     angle_dt: mx.array
     ssm: mx.array
@@ -248,7 +248,7 @@ def _apply_rope_on_state_dim(tensor: mx.array, angles_cumsum: mx.array) -> mx.ar
 
 
 def _expand_mimo_rank_to_heads(tensor: mx.array, nheads: int, name: str) -> mx.array:
-    """Expand grouped MIMO B/C tensors from ``(B,S,R,G,N)`` to ``(B,S,R,H,N)``."""
+    """Expand grouped MIMO B/C tensors from (B,S,R,G,N) to (B,S,R,H,N)."""
 
     if tensor.ndim != 5:
         raise ValueError(f"{name} must be shaped (B,S,R,G,N), got {tensor.shape}")
@@ -292,7 +292,7 @@ def _chunked_mamba3_diagonal_scan(
 ) -> tuple[mx.array, mx.array]:
     """Chunked diagonal SSM scan for the local Mamba3 reference block.
 
-    The recurrence is ``h[t] = exp(log_decay[t]) * h[t-1] + inp[t]``.
+    The recurrence is h[t] = exp(log_decay[t]) * h[t-1] + inp[t].
     Carries are evaluated in source order to avoid stale lazy graph reuse across
     chunk boundaries on current MLX/Metal.
     """

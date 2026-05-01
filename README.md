@@ -13,7 +13,7 @@ Current status:
 - compiled/eager tiny MLX pretraining step with fixed-key side-channel batches
 - NPZ fixed-shape token dataset and tiny train smoke
 - optional local-only GB10 Parquet sample smoke path under ignored
-  `data/parquet_samples/`
+  data/parquet_samples/
 - MLX safetensors checkpoint/resume helper
 - tiny A/M/E/R hybrid smoke model for route coverage, not full NAM56R
 - benchmark harness for local Apple GPU regression baselines
@@ -23,8 +23,8 @@ Current status:
 
 Repo hygiene:
 
-- Keep `.venv`, `__pycache__`, pytest caches, `.beads`, agent logs, and
-  `data/parquet_samples/` out of commits. The Parquet samples are useful for
+- Keep .venv, __pycache__, pytest caches, .beads, agent logs, and
+  data/parquet_samples/ out of commits. The Parquet samples are useful for
   local real-data smoke tests, but they are large local artifacts, not repo
   fixtures.
 
@@ -34,26 +34,26 @@ Non-goals and limits:
   run on GB10 with matched model shape, dtype, data contract, warmup, measured
   steps, and metric definitions.
 - This repo does not yet prove full NAM56R readiness, distributed training,
-  production-scale Parquet input, production-scale Megatron `.bin/.idx` input,
+  production-scale Parquet input, production-scale Megatron .bin/.idx input,
   or training-path custom Metal kernels.
 - Hugging Face Apple M4 kernels are research references only unless a future
   lane proves local parity, backward behavior, dtype coverage, and a measured
   cppmega hotspot.
-- `../nanochat` is a Torch reference only: useful for behavior checks, but too
+- ../nanochat is a Torch reference only: useful for behavior checks, but too
   slow and not Metal-native enough to be the local Mac training substrate.
 
 Useful commands:
 
-```bash
+bash
 ./.venv/bin/python -m pytest --collect-only -q
 ./.venv/bin/python -m pytest
-```
 
-Base package dependencies are `mlx`, `mlx-lm`, `numpy`, and `safetensors`.
-Parquet loading stays optional: install the `parquet` extra or provide an
-environment with `pyarrow` or `pandas` before using `TokenParquetDataset`.
 
-```bash
+Base package dependencies are mlx, mlx-lm, numpy, and safetensors.
+Parquet loading stays optional: install the parquet extra or provide an
+environment with pyarrow or pandas before using TokenParquetDataset.
+
+bash
 ./.venv/bin/python scripts/bench_tiny.py \
   --batch-size 2 \
   --seq-len 64 \
@@ -62,9 +62,9 @@ environment with `pyarrow` or `pandas` before using `TokenParquetDataset`.
   --steps 20 \
   --hardware-label "M4 Max" \
   --json
-```
 
-```bash
+
+bash
 TMP_DIR="$(mktemp -d)"
 TMP_NPZ="$TMP_DIR/tiny_tokens.npz"
 ./.venv/bin/python - "$TMP_NPZ" <<'PY'
@@ -84,7 +84,7 @@ PY
   --json
 
 rm -rf "$TMP_DIR"
-```
 
-See `docs/porting_plan.md` for the implemented / wave-next / blocked roadmap
-and `docs/perf_baseline.md` for the M4 Max vs GB10 comparison protocol.
+
+See docs/porting_plan.md for the implemented / wave-next / blocked roadmap
+and docs/perf_baseline.md for the M4 Max vs GB10 comparison protocol.

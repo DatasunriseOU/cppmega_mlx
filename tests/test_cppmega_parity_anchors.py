@@ -162,8 +162,8 @@ def test_parity_docs_keep_runtime_anchor_claims_fail_closed():
     normalized = " ".join(combined.split())
 
     assert "Full NAM56R Megatron Recipe/Runtime Anchors" in doc
-    assert "The source converter writes only `token_ids`" in doc
-    assert "H200 scripts are source/runtime anchors for `../cppmega`" in doc
+    assert "The source converter writes only token_ids" in doc
+    assert "H200 scripts are source/runtime anchors for ../cppmega" in doc
     assert "not MLX-supported launchers" in normalized
     assert "local/tiny/partial" in doc
     assert "distributed Megatron behavior remains outside the MLX scaffold" in doc
@@ -204,9 +204,9 @@ def test_parity_docs_keep_runtime_anchor_claims_fail_closed():
 def test_mamba_m2rnn_perf_doc_does_not_overclaim_nam56r_runtime_parity():
     doc = (_repo_root() / "docs" / "perf_mamba_m2rnn.md").read_text()
 
-    assert "source `M` layers map to Mamba3 positions" in doc
-    assert "source `R` layers map to M2RNN" in doc
-    assert "`nam56r_full_spec.py`" in doc
+    assert "source M layers map to Mamba3 positions" in doc
+    assert "source R layers map to M2RNN" in doc
+    assert "nam56r_full_spec.py" in doc
     assert "native MLA/MTP/DSA" in doc
     assert "H200/GB10 train launchers" in doc
 

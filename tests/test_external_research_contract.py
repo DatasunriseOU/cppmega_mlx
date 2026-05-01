@@ -45,7 +45,7 @@ def _documented_test_files(porting_plan: str) -> list[str]:
     marker = "The current collected test files are:\n\n"
     start = porting_plan.index(marker) + len(marker)
     end = porting_plan.index("\n## Wave-Next Work", start)
-    return re.findall(r"^- `(tests/test_[^`]+\.py)`$", porting_plan[start:end], re.MULTILINE)
+    return re.findall(r"^- (tests/test_[^]+\.py)$", porting_plan[start:end], re.MULTILINE)
 
 
 def _collected_test_files() -> list[str]:
@@ -105,12 +105,12 @@ def test_research_docs_include_primary_external_receipts() -> None:
     assert "MLX-LM README direct fetch returned HTTP 200" in combined
     assert "Hugging Face Apple M4 kernel listing direct fetch returned HTTP 200" in combined
     assert "Apple Silicon array framework" in combined or "Apple Silicon arrays" in combined
-    assert "`mlx.nn`" in combined
-    assert "`mlx.optimizers`" in combined
-    assert "`mx.distributed`" in combined
+    assert "mlx.nn" in combined
+    assert "mlx.optimizers" in combined
+    assert "mx.distributed" in combined
     assert "MLX-LM loss source direct fetch returned HTTP 200" in combined
-    assert "`mx.fast.metal_kernel`" in combined
-    assert "`@mx.custom_function`" in combined
+    assert "mx.fast.metal_kernel" in combined
+    assert "@mx.custom_function" in combined
     assert "non-Metal fallback paths" in combined
     assert "GitHub refresh for the MLX and MLX-LM repo/latest-release" in combined
     assert "endpoints returned HTTP 200" in combined
@@ -142,10 +142,10 @@ def test_hf_apple_m4_kernel_snapshot_stays_reference_only() -> None:
     assert "External kernel repositories must not be remote-loaded into cppmega training" in combined
     assert "pinned, licensed" in combined
     assert "VJP/JVP gates" in combined
-    assert "`drbh/test-repo`" in combined
-    assert "`drbh/first-kernel`" in combined
-    assert "listing `sha` fields" in normalized
-    assert "HTML `sha` values are catalog metadata, not a pin for source adoption" in normalized
+    assert "drbh/test-repo" in combined
+    assert "drbh/first-kernel" in combined
+    assert "listing sha fields" in normalized
+    assert "HTML sha values are catalog metadata, not a pin for source adoption" in normalized
 
 
 def test_research_docs_keep_full_trainer_and_megatron_claims_fail_closed() -> None:
@@ -232,7 +232,7 @@ def test_package_dependency_contract_matches_documented_runtime() -> None:
     assert any(str(item).startswith("pyarrow>=") for item in parquet_extra)
 
     docs = _read_owned_contract_docs()
-    assert "Base package dependencies are `mlx`, `mlx-lm`, `numpy`, and `safetensors`." in docs
+    assert "Base package dependencies are mlx, mlx-lm, numpy, and safetensors." in docs
     assert "Parquet loading stays optional" in docs
 
 
@@ -312,7 +312,7 @@ def test_no_tracked_parquet_samples_or_runtime_overclaims() -> None:
         "M4-only rows prove GB10 parity",
         "distributed Megatron parity is proven",
         "full distributed Megatron parity",
-        "production-scale Megatron `.bin/.idx` input is proven",
+        "production-scale Megatron .bin/.idx input is proven",
     )
     for phrase in forbidden_overclaims:
         assert phrase not in docs

@@ -224,9 +224,9 @@ def as_mlx_lm_token_mapping(
 ) -> dict[str, mx.array]:
     """Return a minimal MLX-LM-like token batch mapping.
 
-    MLX-LM's trainer passes ``(batch, lengths)`` to ``default_loss`` where
-    ``batch`` is a dense token matrix and ``lengths`` stores ``(offset, length)``
-    per row.  cppmega keeps richer side channels in ``LMTokenBatch``; this
+    MLX-LM's trainer passes (batch, lengths) to default_loss where
+    batch is a dense token matrix and lengths stores (offset, length)
+    per row.  cppmega keeps richer side channels in LMTokenBatch; this
     adapter intentionally exports only the common token/length subset.  It does
     not make cppmega models or side-channel batches drop-in MLX-LM trainer
     inputs.
@@ -250,7 +250,7 @@ def as_mlx_lm_loss_args(
     *,
     offset: OffsetSpec = 0,
 ) -> tuple[mx.array, mx.array]:
-    """Return ``(tokens, lengths)`` for probes against MLX-LM ``default_loss``."""
+    """Return (tokens, lengths) for probes against MLX-LM default_loss."""
 
     mapping = as_mlx_lm_token_mapping(batch, offset=offset)
     return mapping["tokens"], mapping["lengths"]
@@ -264,7 +264,7 @@ def require_supported_mlx_lm_trainer_integration(
     """Fail closed for full MLX-LM trainer integration attempts.
 
     The adapter supports only dense token/loss-argument conversion for API
-    probes and documentation receipts.  Full ``mlx_lm.tuner.trainer.train`` use
+    probes and documentation receipts.  Full mlx_lm.tuner.trainer.train use
     would drop cppmega masks, structure side channels, route semantics, and
     checkpoint state, so callers must stay on the repo-local trainer until that
     boundary is explicitly implemented and tested.

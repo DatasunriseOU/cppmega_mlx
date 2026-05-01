@@ -98,9 +98,9 @@ class MegatronIndexedMetadata:
 
 
 class MegatronIndexedDataset:
-    """Read fixed token windows from Megatron ``.bin/.idx`` shards.
+    """Read fixed token windows from Megatron .bin/.idx shards.
 
-    The reader intentionally implements only the stable ``MMIDIDX`` layout and
+    The reader intentionally implements only the stable MMIDIDX layout and
     explicit raw-binary handoffs.  Unknown headers, dtype codes, and ambiguous
     raw binaries fail closed instead of pulling in the original training stack.
     """
@@ -236,7 +236,7 @@ class MegatronIndexedDataset:
         epoch: int = 0,
         loop: bool | None = None,
     ) -> Iterator[LMTokenBatch]:
-        """Yield fixed-shape ``LMTokenBatch`` objects."""
+        """Yield fixed-shape LMTokenBatch objects."""
 
         effective_loop = self.loop if loop is None else loop
         start_batch = self.resume_batch if resume_batch is None else resume_batch
@@ -267,7 +267,7 @@ class MegatronIndexedDataset:
             batch_offset = 0
 
     def cursor_after(self, consumed_batches: int, *, epoch: int = 0) -> BatchCursor:
-        """Return the deterministic cursor after ``consumed_batches``."""
+        """Return the deterministic cursor after consumed_batches."""
 
         if consumed_batches < 0:
             raise ValueError("consumed_batches must be non-negative")
@@ -347,7 +347,7 @@ def open_megatron_indexed_dataset(
     """Open a standalone local Megatron-indexed shard for CLI/training code.
 
     This is the explicit fail-closed ingress for macOS/MLX paths that already
-    have Megatron ``.bin/.idx`` token shards.  It intentionally depends only on
+    have Megatron .bin/.idx token shards.  It intentionally depends only on
     the local reader, NumPy, and MLX; it does not import Megatron or Torch
     runtime modules.
     """
@@ -370,7 +370,7 @@ def open_megatron_indexed_dataset(
 def megatron_indexed_side_channel_schema() -> dict[str, dict[str, object]]:
     """Return the documented token-aligned side-channel schema.
 
-    Canonical keys are the names delivered on :class:`LMTokenBatch`.  Aliases
+    Canonical keys are the names delivered on :class:LMTokenBatch.  Aliases
     match cppmega Parquet token-level column names and are normalized at the
     JSON sidecar boundary.
     """

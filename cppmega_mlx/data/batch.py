@@ -78,7 +78,7 @@ class LMTokenBatch:
 
 
 def ensure_lm_batch(batch: LMTokenBatch | Mapping[str, Any] | mx.array) -> LMTokenBatch:
-    """Normalize supported tiny-trainer batch inputs into ``LMTokenBatch``."""
+    """Normalize supported tiny-trainer batch inputs into LMTokenBatch."""
 
     if isinstance(batch, LMTokenBatch):
         return batch
