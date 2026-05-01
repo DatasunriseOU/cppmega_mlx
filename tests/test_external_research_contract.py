@@ -45,7 +45,7 @@ def _documented_test_files(porting_plan: str) -> list[str]:
     marker = "The current collected test files are:\n\n"
     start = porting_plan.index(marker) + len(marker)
     end = porting_plan.index("\n## Wave-Next Work", start)
-    return re.findall(r"^- (tests/test_[^]+\.py)$", porting_plan[start:end], re.MULTILINE)
+    return re.findall(r"^- (tests/test_[^\n]+\.py)$", porting_plan[start:end], re.MULTILINE)
 
 
 def _collected_test_files() -> list[str]:

@@ -197,6 +197,10 @@ def test_hotspot_evidence_summarizes_profile_metrics() -> None:
     assert hotspot.route == "M"
     assert hotspot.backend == "mlx"
     assert hotspot.operation == "mamba3_scan"
+    assert hotspot.local_profile is True
+    assert hotspot.differentiable is False
+    assert hotspot.vjp_covered is False
+    assert hotspot.jvp_covered is False
     assert hotspot.calls == 3
     assert 0 < hotspot.fraction <= 0.5
     assert summary["count"] == 1
@@ -205,6 +209,7 @@ def test_hotspot_evidence_summarizes_profile_metrics() -> None:
     top = hotspots[0]
     assert isinstance(top, dict)
     assert top["name"] == "mamba3_scan"
+    assert top["local_profile"] is True
 
 
 def test_kernel_adoption_gate_fails_closed_without_profile_samples() -> None:
@@ -229,6 +234,8 @@ def test_kernel_adoption_gate_blocks_weak_hotspot_fraction() -> None:
             total_seconds=1.0,
             route="A",
             backend="mlx",
+            differentiable=True,
+            vjp_covered=True,
         )
     ]
 
@@ -247,10 +254,44 @@ def test_kernel_adoption_gate_blocks_weak_hotspot_fraction() -> None:
             evidence,
             min_hotspot_fraction=0.10,
             min_hotspot_seconds=0.001,
+            require_training_differentiation=False,
         )
 
 
-def test_kernel_adoption_gate_allows_measured_hotspot() -> None:
+def test_kernel_adoption_gate_blocks_external_references_without_local_profile() -> None:
+    evidence = [
+        HotspotEvidence(
+            name="hf-metal-rmsnorm-card",
+            seconds=1.0,
+            total_seconds=1.0,
+            route="A",
+            backend="metal",
+            operation="rmsnorm",
+            source="huggingface-kernel-card",
+            local_profile=False,
+            differentiable=True,
+            vjp_covered=True,
+        )
+    ]
+
+    assessment = profile_mod.assess_kernel_adoption(
+        "hf-rmsnorm",
+        evidence,
+        min_hotspot_fraction=0.10,
+        min_hotspot_seconds=0.001,
+    )
+    payload = assessment.to_dict()
+    json.dumps(payload)
+
+    assert assessment.allowed is False
+    assert "external kernel references alone" in assessment.reason
+    assert evidence[0].local_profile is False
+    assert payload["require_local_profile"] is True
+    with pytest.raises(KernelAdoptionBlocked, match="external kernel references alone"):
+        profile_mod.require_kernel_hotspot_evidence("hf-rmsnorm", evidence)
+
+
+def test_kernel_adoption_gate_blocks_training_without_differentiation_evidence() -> None:
     evidence = [
         HotspotEvidence(
             name="m2rnn-recurrence",
@@ -266,6 +307,49 @@ def test_kernel_adoption_gate_allows_measured_hotspot() -> None:
             seconds=0.05,
             total_seconds=1.0,
             calls=8,
+        ),
+    ]
+
+    assessment = profile_mod.assess_kernel_adoption(
+        "m2rnn-metal-recurrence",
+        evidence,
+        min_hotspot_fraction=0.20,
+        min_hotspot_seconds=0.10,
+        min_samples=2,
+    )
+
+    assert assessment.allowed is False
+    assert "VJP/backward coverage" in assessment.reason
+    with pytest.raises(KernelAdoptionBlocked, match="VJP/backward coverage"):
+        profile_mod.require_kernel_hotspot_evidence(
+            "m2rnn-metal-recurrence",
+            evidence,
+            min_hotspot_fraction=0.20,
+            min_hotspot_seconds=0.10,
+            min_samples=2,
+        )
+
+
+def test_kernel_adoption_gate_allows_measured_differentiated_hotspot() -> None:
+    evidence = [
+        HotspotEvidence(
+            name="m2rnn-recurrence",
+            seconds=0.25,
+            total_seconds=1.0,
+            calls=8,
+            route="R",
+            backend="mlx",
+            operation="m2rnn",
+            differentiable=True,
+            vjp_covered=True,
+        ),
+        HotspotEvidence(
+            name="loss",
+            seconds=0.05,
+            total_seconds=1.0,
+            calls=8,
+            differentiable=True,
+            vjp_covered=True,
         ),
     ]
 
@@ -286,6 +370,75 @@ def test_kernel_adoption_gate_allows_measured_hotspot() -> None:
     payload_summary = payload["summary"]
     assert isinstance(payload_summary, dict)
     assert payload_summary["count"] == 2
+    assert payload["require_training_differentiation"] is True
+
+
+def test_kernel_adoption_payload_reports_selected_eligible_hotspot() -> None:
+    evidence = [
+        HotspotEvidence(
+            name="hf-metal-rmsnorm-card",
+            seconds=2.0,
+            total_seconds=2.0,
+            source="huggingface-kernel-card",
+            local_profile=False,
+            differentiable=True,
+            vjp_covered=True,
+        ),
+        HotspotEvidence(
+            name="local-m2rnn-recurrence",
+            seconds=0.25,
+            total_seconds=1.0,
+            source="profile_step",
+            route="R",
+            backend="mlx",
+            differentiable=True,
+            vjp_covered=True,
+        ),
+    ]
+
+    assessment = profile_mod.require_kernel_hotspot_evidence(
+        "m2rnn-metal-recurrence",
+        evidence,
+        min_hotspot_fraction=0.20,
+        min_hotspot_seconds=0.10,
+    )
+    payload = assessment.to_dict()
+
+    assert assessment.allowed is True
+    assert assessment.top_hotspot is not None
+    assert assessment.top_hotspot.name == "local-m2rnn-recurrence"
+    top_hotspot = payload["top_hotspot"]
+    summary = payload["summary"]
+    assert isinstance(top_hotspot, dict)
+    assert isinstance(summary, dict)
+    hotspots = summary["hotspots"]
+    assert isinstance(hotspots, list)
+    assert isinstance(hotspots[0], dict)
+    assert top_hotspot["name"] == "local-m2rnn-recurrence"
+    assert hotspots[0]["name"] == "hf-metal-rmsnorm-card"
+
+
+def test_kernel_adoption_gate_can_assess_profile_hotspot_before_training_adoption() -> None:
+    evidence = [
+        HotspotEvidence(
+            name="mamba3-scan",
+            seconds=0.20,
+            total_seconds=1.0,
+            route="M",
+            backend="mlx",
+        )
+    ]
+
+    assessment = profile_mod.require_kernel_hotspot_evidence(
+        "mamba3-metal-scan",
+        evidence,
+        min_hotspot_fraction=0.10,
+        min_hotspot_seconds=0.001,
+        require_training_differentiation=False,
+    )
+
+    assert assessment.allowed is True
+    assert assessment.require_training_differentiation is False
 
 
 def test_hotspot_evidence_validates_shape() -> None:

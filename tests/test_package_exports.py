@@ -96,6 +96,7 @@ def test_package_roots_expose_local_mlx_contracts() -> None:
         "Mamba3CacheState",
         "Mamba3ReferenceBlock",
         "M2RNNMixer",
+        "M2RNNMixerState",
         "ReferenceMoE",
         "CppMegaNgramHashEmbedding",
         "CppMegaStructureEmbedding",

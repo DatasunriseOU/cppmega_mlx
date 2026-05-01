@@ -201,6 +201,20 @@ def test_parity_docs_keep_runtime_anchor_claims_fail_closed():
         assert phrase not in combined
 
 
+def test_parity_docs_track_current_mamba3_and_pattern_parser_contracts():
+    doc = (_repo_root() / "docs" / "parity_anchors.md").read_text()
+
+    assert "projected angles are not consumed" not in doc
+    assert "[z,x,B,C,dd_dt,dd_A,trap,angles]" in doc
+    assert "local trapezoidal input scaling from trap" in doc
+    assert "cumulative projected-angle Author RoPE over B/C" in doc
+    assert "source-shaped" in doc
+    assert "(angle_dt, ssm, k, v) cache" in doc
+    assert "exact Author TE/Triton/TileLang/CUDA SISO/MIMO kernels" in doc
+    assert "fails closed on upstream-only symbols" in doc
+    assert "accepts A, M, D, E, G, R, and pipe-delimited patterns" in doc
+
+
 def test_mamba_m2rnn_perf_doc_does_not_overclaim_nam56r_runtime_parity():
     doc = (_repo_root() / "docs" / "perf_mamba_m2rnn.md").read_text()
 

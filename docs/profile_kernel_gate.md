@@ -18,6 +18,13 @@ Before adopting a custom kernel, collect hotspot records with:
   R, plus mlx/metal/reference backend labels.
 - source: profiler source, for example profile_step, MLX trace, or external
   profiler report.
+- local_profile: true only for a cppmega route/shape measurement, not an
+  external catalog, card, README, or source-reference row.
+- differentiable and vjp_covered: true only when the candidate has local
+  differentiated-training evidence for every trainable input.
+- jvp_covered: true only when forward-mode diagnostics or callers need JVP
+  coverage. VJP-backed training kernels may leave this false only when the
+  caller does not use forward-mode transforms.
 
 assess_kernel_adoption(...) returns a JSON-safe verdict. The stricter
 require_kernel_hotspot_evidence(...) raises KernelAdoptionBlocked when the
@@ -40,11 +47,18 @@ A kernel candidate must remain blocked when:
 - the strongest hotspot is below the minimum profile-fraction threshold,
 - the candidate only has an external HF/MLX example but no cppmega route
   profile,
-- the differentiated training path lacks custom VJP/JVP coverage.
+- the differentiated training path lacks custom VJP/backward coverage.
 
 This means HF Apple M4 kernels and MLX-LM Metal examples are implementation
 references only until local hotspot, parity, dtype, fallback, and backward
 evidence exist in this repo.
+
+The default training-path gate requires local_profile=True, differentiable=True,
+and vjp_covered=True before threshold checks can allow adoption. To inspect a
+hotspot before proposing a training kernel, call assess_kernel_adoption(...) or
+require_kernel_hotspot_evidence(...) with
+require_training_differentiation=False; that opt-out is only a profiling
+triage result, not training adoption approval.
 
 ## Minimal Usage
 
@@ -55,7 +69,11 @@ from cppmega_mlx.training.profile import (
     require_kernel_hotspot_evidence,
 )
 
-with profile_step("mamba3_scan", tokens=4096, extra={"route": "M"}) as prof:
+with profile_step(
+    "mamba3_scan",
+    tokens=4096,
+    extra={"route": "M", "differentiable": True, "vjp_covered": True},
+) as prof:
     loss = run_train_step()
     prof.add_eval_args(loss)
 
@@ -83,3 +101,11 @@ Apple M4/HF kernel survey and MLX custom-kernel constraints: mx.fast
 metal_kernel is available for forward kernels, but differentiated training
 replacement requires a custom-function VJP/JVP and parity tests before
 adoption.
+
+2026-05-01 external refresh: the current MLX custom-function docs describe
+custom VJPs and custom JVPs as the mechanism for controlling reverse- and
+forward-mode automatic differentiation. The MLX custom Metal kernel guide also
+shows a differentiable Metal-kernel example by wrapping forward logic with
+mx.custom_function and attaching a VJP; its scatter-style backward example uses
+init_value=0 and atomic_outputs=True. Those are source receipts for this gate,
+not adoption evidence for any cppmega training kernel.

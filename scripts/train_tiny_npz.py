@@ -587,6 +587,17 @@ def dataset_receipt_payload(
     index_metadata = getattr(dataset, "index_metadata", None)
     if index_metadata is not None:
         payload["index_metadata"] = _json_ready(index_metadata)
+        payload["megatron_indexed_receipt"] = {
+            "ingress": "MegatronIndexedDataset",
+            "path_accepts_suffixless_prefix": True,
+            "sidecar_schema": "explicit_token_aligned_binary_side_channel_paths",
+            "local_only": True,
+            "receipt_scope": "local_mlx_training_ingress",
+            "megatron_runtime_imported": False,
+            "distributed_megatron_parity_claim": False,
+            "gb10_training_correctness_claim": False,
+            "m4_vs_gb10_throughput_parity_claim": False,
+        }
     return payload
 
 

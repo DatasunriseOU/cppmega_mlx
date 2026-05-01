@@ -13,6 +13,15 @@ import mlx.core as mx
 JsonScalar = bool | int | float | str | None
 JsonValue = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
 JsonObject = dict[str, JsonValue]
+_EXTERNAL_SOURCE_MARKERS = (
+    "external",
+    "huggingface",
+    "hf_kernel",
+    "kernel_card",
+    "catalog",
+    "example",
+    "reference",
+)
 
 
 def _json_safe(value: Any) -> JsonValue:
@@ -216,6 +225,10 @@ class HotspotEvidence:
     route: str | None = None
     backend: str | None = None
     operation: str | None = None
+    local_profile: bool = True
+    differentiable: bool = False
+    vjp_covered: bool = False
+    jvp_covered: bool = False
     extra: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -231,6 +244,8 @@ class HotspotEvidence:
             raise ValueError("hotspot total_seconds must be >= seconds")
         if self.calls <= 0:
             raise ValueError("hotspot calls must be positive")
+        if self.local_profile and _looks_like_external_source(self.source):
+            object.__setattr__(self, "local_profile", False)
 
     @property
     def fraction(self) -> float:
@@ -251,6 +266,10 @@ class HotspotEvidence:
             "route": self.route,
             "backend": self.backend,
             "operation": self.operation,
+            "local_profile": self.local_profile,
+            "differentiable": self.differentiable,
+            "vjp_covered": self.vjp_covered,
+            "jvp_covered": self.jvp_covered,
             "extra": _json_safe_mapping(self.extra),
         }
 
@@ -266,9 +285,14 @@ class KernelAdoptionAssessment:
     min_hotspot_fraction: float
     min_hotspot_seconds: float
     min_samples: int
+    require_local_profile: bool
+    require_training_differentiation: bool
+    selected_hotspot: HotspotEvidence | None = None
 
     @property
     def top_hotspot(self) -> HotspotEvidence | None:
+        if self.selected_hotspot is not None:
+            return self.selected_hotspot
         if not self.evidence:
             return None
         return max(self.evidence, key=lambda item: (item.seconds, item.fraction))
@@ -282,6 +306,8 @@ class KernelAdoptionAssessment:
             "min_hotspot_fraction": _json_safe(self.min_hotspot_fraction),
             "min_hotspot_seconds": _json_safe(self.min_hotspot_seconds),
             "min_samples": self.min_samples,
+            "require_local_profile": self.require_local_profile,
+            "require_training_differentiation": self.require_training_differentiation,
             "sample_count": len(self.evidence),
             "top_hotspot": top_hotspot.to_dict() if top_hotspot is not None else None,
             "summary": summarize_hotspots(self.evidence),
@@ -300,6 +326,25 @@ def _mapping_value(value: Mapping[str, Any], key: str) -> Any:
     if isinstance(context, Mapping):
         return context.get(key)
     return None
+
+
+def _mapping_bool(
+    value: Mapping[str, Any],
+    key: str,
+    *,
+    default: bool,
+) -> bool:
+    item = _mapping_value(value, key)
+    if item is None:
+        return default
+    if isinstance(item, str):
+        return item.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(item)
+
+
+def _looks_like_external_source(source: str) -> bool:
+    source_lower = source.lower()
+    return any(marker in source_lower for marker in _EXTERNAL_SOURCE_MARKERS)
 
 
 def hotspot_from_profile_metrics(
@@ -331,6 +376,10 @@ def hotspot_from_profile_metrics(
         route=str(route) if route is not None else None,
         backend=str(backend) if backend is not None else None,
         operation=str(operation) if operation is not None else None,
+        local_profile=_mapping_bool(evidence_extra, "local_profile", default=True),
+        differentiable=_mapping_bool(evidence_extra, "differentiable", default=False),
+        vjp_covered=_mapping_bool(evidence_extra, "vjp_covered", default=False),
+        jvp_covered=_mapping_bool(evidence_extra, "jvp_covered", default=False),
         extra=evidence_extra,
     )
 
@@ -364,6 +413,8 @@ def assess_kernel_adoption(
     min_hotspot_fraction: float = 0.10,
     min_hotspot_seconds: float = 0.001,
     min_samples: int = 1,
+    require_local_profile: bool = True,
+    require_training_differentiation: bool = True,
 ) -> KernelAdoptionAssessment:
     """Assess whether custom-kernel work may proceed from measured evidence."""
 
@@ -389,9 +440,66 @@ def assess_kernel_adoption(
             min_hotspot_fraction=min_hotspot_fraction,
             min_hotspot_seconds=min_hotspot_seconds,
             min_samples=min_samples,
+            require_local_profile=require_local_profile,
+            require_training_differentiation=require_training_differentiation,
         )
 
-    top_hotspot = max(rows, key=lambda item: (item.seconds, item.fraction))
+    candidate_rows = tuple(row for row in rows if row.local_profile) if require_local_profile else rows
+    if require_local_profile and not candidate_rows:
+        return KernelAdoptionAssessment(
+            candidate_kernel=candidate_kernel,
+            allowed=False,
+            reason=(
+                "blocked: external kernel references alone are not cppmega "
+                "profile evidence; collect a local route hotspot before "
+                "training-path kernel adoption"
+            ),
+            evidence=rows,
+            min_hotspot_fraction=min_hotspot_fraction,
+            min_hotspot_seconds=min_hotspot_seconds,
+            min_samples=min_samples,
+            require_local_profile=require_local_profile,
+            require_training_differentiation=require_training_differentiation,
+        )
+
+    if require_training_differentiation:
+        differentiated_rows = tuple(
+            row for row in candidate_rows if row.differentiable and row.vjp_covered
+        )
+        if not differentiated_rows:
+            return KernelAdoptionAssessment(
+                candidate_kernel=candidate_kernel,
+                allowed=False,
+                reason=(
+                    "blocked: training-path kernel adoption requires "
+                    "differentiated local evidence with VJP/backward coverage"
+                ),
+                evidence=rows,
+                min_hotspot_fraction=min_hotspot_fraction,
+                min_hotspot_seconds=min_hotspot_seconds,
+                min_samples=min_samples,
+                require_local_profile=require_local_profile,
+                require_training_differentiation=require_training_differentiation,
+            )
+        candidate_rows = differentiated_rows
+
+    if len(candidate_rows) < min_samples:
+        return KernelAdoptionAssessment(
+            candidate_kernel=candidate_kernel,
+            allowed=False,
+            reason=(
+                f"blocked: need at least {min_samples} eligible local profile "
+                f"sample(s), got {len(candidate_rows)}"
+            ),
+            evidence=rows,
+            min_hotspot_fraction=min_hotspot_fraction,
+            min_hotspot_seconds=min_hotspot_seconds,
+            min_samples=min_samples,
+            require_local_profile=require_local_profile,
+            require_training_differentiation=require_training_differentiation,
+        )
+
+    top_hotspot = max(candidate_rows, key=lambda item: (item.seconds, item.fraction))
     if top_hotspot.seconds < min_hotspot_seconds:
         return KernelAdoptionAssessment(
             candidate_kernel=candidate_kernel,
@@ -405,6 +513,8 @@ def assess_kernel_adoption(
             min_hotspot_fraction=min_hotspot_fraction,
             min_hotspot_seconds=min_hotspot_seconds,
             min_samples=min_samples,
+            require_local_profile=require_local_profile,
+            require_training_differentiation=require_training_differentiation,
         )
     if top_hotspot.fraction < min_hotspot_fraction:
         return KernelAdoptionAssessment(
@@ -419,6 +529,8 @@ def assess_kernel_adoption(
             min_hotspot_fraction=min_hotspot_fraction,
             min_hotspot_seconds=min_hotspot_seconds,
             min_samples=min_samples,
+            require_local_profile=require_local_profile,
+            require_training_differentiation=require_training_differentiation,
         )
 
     return KernelAdoptionAssessment(
@@ -433,6 +545,9 @@ def assess_kernel_adoption(
         min_hotspot_fraction=min_hotspot_fraction,
         min_hotspot_seconds=min_hotspot_seconds,
         min_samples=min_samples,
+        require_local_profile=require_local_profile,
+        require_training_differentiation=require_training_differentiation,
+        selected_hotspot=top_hotspot,
     )
 
 
@@ -443,6 +558,8 @@ def require_kernel_hotspot_evidence(
     min_hotspot_fraction: float = 0.10,
     min_hotspot_seconds: float = 0.001,
     min_samples: int = 1,
+    require_local_profile: bool = True,
+    require_training_differentiation: bool = True,
 ) -> KernelAdoptionAssessment:
     """Return the adoption assessment or fail closed with an explicit reason."""
 
@@ -452,6 +569,8 @@ def require_kernel_hotspot_evidence(
         min_hotspot_fraction=min_hotspot_fraction,
         min_hotspot_seconds=min_hotspot_seconds,
         min_samples=min_samples,
+        require_local_profile=require_local_profile,
+        require_training_differentiation=require_training_differentiation,
     )
     if not assessment.allowed:
         raise KernelAdoptionBlocked(assessment.reason)

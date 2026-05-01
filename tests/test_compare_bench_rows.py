@@ -748,6 +748,13 @@ def test_package_dir_writes_refusal_artifact_without_ratios(tmp_path: Path) -> N
     assert "identical selected comparison_key.workload" in manifest[
         "workload_software_key_guard"
     ]
+    report = json.loads((package_dir / "compare_report.json").read_text(encoding="utf-8"))
+    assert report["status"] == "no_matching_rows"
+    assert report["matched_comparison_count"] == 0
+    assert report["unmatched_pair_count"] == 1
+    assert report["parity_claim_refused"] is True
+    assert report["comparisons"] == []
+    assert "ratios" not in report["unmatched_pairs"][0]
     matched_text = (package_dir / "matched_comparisons.jsonl").read_text(
         encoding="utf-8"
     )
@@ -857,7 +864,7 @@ def test_mismatched_framework_versions_do_not_report_ratios(tmp_path: Path) -> N
     refusal = payload["unmatched_pairs"][0]
     assert refusal["status"] == "unmatched"
     assert refusal["parity_claim_refused"] is True
-    assert refusal["reason"] == "match_field_mismatch"
+    assert refusal["reason"] == "matched_comparison_key_mismatch"
     assert "ratios" not in refusal
     assert refusal["missing_required_fields"] == {"m4": [], "gb10": []}
     assert {field["field"] for field in refusal["mismatched_fields"]} == {"mlx_version"}
@@ -1256,7 +1263,7 @@ def test_receipt_only_parquet_data_contract_mismatch_blocks_match(tmp_path: Path
     assert payload["matched_comparison_count"] == 0
     assert payload["parity_claim_refused"] is True
     refusal = payload["unmatched_pairs"][0]
-    assert refusal["reason"] == "match_field_mismatch"
+    assert refusal["reason"] == "matched_comparison_key_mismatch"
     assert {field["field"] for field in refusal["mismatched_fields"]} == {"data_contract"}
     assert payload["comparisons"] == []
 
@@ -1284,9 +1291,47 @@ def test_receipt_only_software_mismatch_blocks_match(tmp_path: Path) -> None:
     assert payload["matched_comparison_count"] == 0
     assert payload["parity_claim_refused"] is True
     refusal = payload["unmatched_pairs"][0]
-    assert refusal["reason"] == "match_field_mismatch"
+    assert refusal["reason"] == "matched_comparison_key_mismatch"
     assert {field["field"] for field in refusal["mismatched_fields"]} == {"mlx_version"}
     assert payload["comparisons"] == []
+
+
+def test_explicit_comparison_key_mismatch_is_refusal_reason_when_fields_also_differ(
+    tmp_path: Path,
+) -> None:
+    m4 = receipt_only_row(
+        "M4 Max",
+        data_contract="synthetic_tokens",
+        mlx_version="0.31.0",
+    )
+    gb10 = receipt_only_row(
+        "GB10",
+        data_contract="parquet_clang_v10_code",
+        mlx_version="0.32.0",
+    )
+    path = tmp_path / "explicit-key-and-field-mismatch.json"
+    path.write_text(json.dumps({"cases": [m4, gb10]}), encoding="utf-8")
+
+    result = run_compare("--input", str(path))
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "no_matching_rows"
+    assert payload["host_counts"] == {"m4": 1, "gb10": 1, "ignored": 0}
+    assert payload["matched_comparison_count"] == 0
+    assert payload["parity_claim_refused"] is True
+    assert payload["comparisons"] == []
+    refusal = payload["unmatched_pairs"][0]
+    assert refusal["reason"] == "matched_comparison_key_mismatch"
+    assert {field["field"] for field in refusal["mismatched_comparison_keys"]} == {
+        "comparison_key.workload",
+        "comparison_key.software",
+    }
+    assert {field["field"] for field in refusal["mismatched_fields"]} == {
+        "data_contract",
+        "mlx_version",
+    }
+    assert "ratios" not in refusal
 
 
 def test_gb10_torch_cuda_row_is_ingested_but_not_matched_to_mlx(tmp_path: Path) -> None:
@@ -1313,7 +1358,7 @@ def test_gb10_torch_cuda_row_is_ingested_but_not_matched_to_mlx(tmp_path: Path) 
     assert payload["matched_comparison_count"] == 0
     assert payload["parity_claim_refused"] is True
     refusal = payload["unmatched_pairs"][0]
-    assert refusal["reason"] == "match_field_mismatch"
+    assert refusal["reason"] == "matched_comparison_key_mismatch"
     assert "ratios" not in refusal
     assert refusal["missing_required_fields"] == {"m4": [], "gb10": []}
     assert {"framework", "backend"} <= {

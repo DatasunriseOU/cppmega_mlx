@@ -20,7 +20,9 @@ non-critical forward-only relu(x) ** 2 op with a pure MLX fallback.
   reporting available=True.
 - Do not put prototype Metal kernels in the required training graph. Training
   callers must pass through the pure MLX fallback unless the Metal path is
-  explicitly wrapped by mx.custom_function and supplies the required VJP/JVP.
+  explicitly wrapped by mx.custom_function and supplies the required
+  VJP/backward coverage. JVP is additionally required for forward-mode callers
+  and diagnostics.
 - Do not load remote Hugging Face kernels, depend on HF kernel packages, or
   make HF kernel repositories part of the training path. External Apple/Metal
   kernels are source-review and parity-fixture inputs only until pinned,
@@ -82,6 +84,9 @@ mx.custom_function and define a VJP for every trainable input. JVP support is
 required when the training caller or diagnostic path depends on forward-mode
 transforms. Scatter, gather, and routing-style backward kernels must also handle
 initialization and atomic accumulation explicitly before training adoption.
+The separate profile gate now rejects training-path adoption by default unless
+the candidate evidence is local_profile=True, differentiable=True, and
+vjp_covered=True; external kernel references alone cannot satisfy it.
 
 Until that VJP gate is satisfied, a Metal kernel may be used only for
 forward-only diagnostics, preprocessing, or optional inference-style paths that
@@ -95,7 +100,9 @@ receipts are all checked into this repo.
 
 squared_relu(..., training=True) is the concrete enforcement surface. With
 backend="auto" or backend="mlx" it always uses the pure MLX implementation,
-so mx.grad and mx.jvp transform the normal MLX graph. With
+so mx.grad and mx.jvp transform the normal MLX graph. Training mode routes to
+fallback or rejects explicit Metal before querying metal_kernel_status(...), so
+forward-only Metal eligibility cannot influence differentiated callers. With
 backend="metal" it raises MetalKernelUnsupported because the prototype
 Metal kernel is forward-only and has no custom VJP/JVP.
 
@@ -122,6 +129,11 @@ JVP field before training adoption.
 - The same docs show differentiable kernels through mx.custom_function and
   VJP/JVP definitions; scatter-style backward examples use init_value=0 and
   atomic_outputs=True.
+- 2026-05-01 current external lookup: the MLX custom-function API page still
+  documents custom VJP and custom JVP registration, and the MLX custom Metal
+  kernel guide still uses mx.custom_function plus a VJP for differentiable
+  Metal examples. This supports the refusal gate above; it does not approve any
+  forward-only training-path kernel.
 - W3.5 direct MLX/MLX-LM API refresh on 2026-05-01 returned HTTP 200 for the
   GitHub repo and latest-release endpoints. It recorded MLX v0.31.2,
   published 2026-04-22T01:40:04Z, and MLX-LM v0.31.3, published

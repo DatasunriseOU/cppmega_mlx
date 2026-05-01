@@ -240,6 +240,7 @@ def test_dry_run_json_accepts_suffixless_megatron_prefix(tmp_path: Path) -> None
     assert payload["dataset"]["index_metadata"]["sequence_count"] == 2
     assert payload["dataset"]["index_metadata"]["document_count"] == 2
     assert payload["dataset"]["side_channels"] == []
+    assert "megatron_indexed_receipt" not in payload["dataset"]
     receipt = payload["dataset"]["dataset_receipt"]
     assert receipt["source_format"] == "megatron"
     assert receipt["source_dataset_name"] == "clang_semantic_4k_v10_train"
@@ -252,6 +253,18 @@ def test_dry_run_json_accepts_suffixless_megatron_prefix(tmp_path: Path) -> None
     assert receipt["dropped_samples"] == payload["dataset"]["dropped_samples"]
     assert receipt["side_channels"] == []
     assert receipt["index_metadata"] == payload["dataset"]["index_metadata"]
+    megatron_receipt = receipt["megatron_indexed_receipt"]
+    assert megatron_receipt["ingress"] == "MegatronIndexedDataset"
+    assert megatron_receipt["path_accepts_suffixless_prefix"] is True
+    assert megatron_receipt["sidecar_schema"] == (
+        "explicit_token_aligned_binary_side_channel_paths"
+    )
+    assert megatron_receipt["local_only"] is True
+    assert megatron_receipt["receipt_scope"] == "local_mlx_training_ingress"
+    assert megatron_receipt["megatron_runtime_imported"] is False
+    assert megatron_receipt["distributed_megatron_parity_claim"] is False
+    assert megatron_receipt["gb10_training_correctness_claim"] is False
+    assert megatron_receipt["m4_vs_gb10_throughput_parity_claim"] is False
     assert payload["model_config"]["vocab_size"] == 32
 
 
@@ -384,6 +397,7 @@ def test_one_eager_training_step_accepts_suffixless_megatron_prefix(
     assert payload["dataset"]["metadata"]["source_format"] == "megatron"
     assert payload["dataset"]["index_metadata"]["dtype"] == "int32"
     assert payload["dataset"]["side_channels"] == []
+    assert "megatron_indexed_receipt" not in payload["dataset"]
     receipt = payload["dataset"]["dataset_receipt"]
     assert receipt["source_format"] == "megatron"
     assert receipt["source_dataset_name"] == "clang_semantic_4k_v10_train"
@@ -396,6 +410,18 @@ def test_one_eager_training_step_accepts_suffixless_megatron_prefix(
     assert receipt["dropped_samples"] == payload["dataset"]["dropped_samples"]
     assert receipt["side_channels"] == []
     assert receipt["index_metadata"] == payload["dataset"]["index_metadata"]
+    megatron_receipt = receipt["megatron_indexed_receipt"]
+    assert megatron_receipt["ingress"] == "MegatronIndexedDataset"
+    assert megatron_receipt["path_accepts_suffixless_prefix"] is True
+    assert megatron_receipt["sidecar_schema"] == (
+        "explicit_token_aligned_binary_side_channel_paths"
+    )
+    assert megatron_receipt["local_only"] is True
+    assert megatron_receipt["receipt_scope"] == "local_mlx_training_ingress"
+    assert megatron_receipt["megatron_runtime_imported"] is False
+    assert megatron_receipt["distributed_megatron_parity_claim"] is False
+    assert megatron_receipt["gb10_training_correctness_claim"] is False
+    assert megatron_receipt["m4_vs_gb10_throughput_parity_claim"] is False
     assert payload["compile"] is False
     assert payload["tokens_per_step"] == 6
     assert payload["trained_tokens"] == 6

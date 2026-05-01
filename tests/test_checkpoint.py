@@ -138,7 +138,14 @@ def test_checkpoint_manifest_records_resume_contract(tmp_path) -> None:
         model,
         tmp_path / "ckpt",
         optimizer=optimizer,
-        metadata={"step": 1, "tokenizer_name": "synthetic-token-ids"},
+        metadata={
+            "step": 1,
+            "tokenizer_path": "tokenizers/synthetic.json",
+            "tokenizer_name": "synthetic-token-ids",
+            "bos_token_id": 1,
+            "eos_token_id": 2,
+            "pad_token_id": 0,
+        },
     )
     manifest = json.loads((tmp_path / "ckpt" / METADATA_NAME).read_text())
 
@@ -164,7 +171,12 @@ def test_checkpoint_manifest_records_resume_contract(tmp_path) -> None:
     assert manifest["package_versions"]["safetensors"] is not None
     assert manifest["tokenizer_contract"]["vocab_size"] == config.vocab_size
     assert manifest["tokenizer_contract"]["max_seq_length"] == config.max_seq_length
+    assert manifest["tokenizer_contract"]["structure_vocab_size"] == config.structure_vocab_size
+    assert manifest["tokenizer_contract"]["tokenizer_path"] == "tokenizers/synthetic.json"
     assert manifest["tokenizer_contract"]["tokenizer_name"] == "synthetic-token-ids"
+    assert manifest["tokenizer_contract"]["bos_token_id"] == 1
+    assert manifest["tokenizer_contract"]["eos_token_id"] == 2
+    assert manifest["tokenizer_contract"]["pad_token_id"] == 0
     assert (tmp_path / "ckpt" / WEIGHTS_NAME).exists()
     assert (tmp_path / "ckpt" / OPTIMIZER_NAME).exists()
 
@@ -272,6 +284,7 @@ def test_checkpoint_load_rejects_coerced_training_state_booleans(
         {"parallelism": {"tensor_model_parallel_size": 2}},
         {"training_state": {"megatron_parallel_state": {"tp_rank": 0}}},
         {"training_state": {"state": {"step": 0}, "parallel_state": {"tp_rank": 0}}},
+        {"training_state": {"state": {"step": 0}, "mtp_process": True}},
     ],
 )
 def test_checkpoint_save_rejects_explicit_distributed_or_sharded_metadata(
@@ -294,6 +307,7 @@ def test_checkpoint_save_rejects_explicit_distributed_or_sharded_metadata(
         {"sharded_state_dict": {"embedding.weight": {"replica_id": [0, 1, 0]}}},
         {"training_state": {"megatron_parallel_state": {"tp_rank": 0}}},
         {"training_state": {"state": {"step": 0}, "parallel_state": {"tp_rank": 0}}},
+        {"training_state": {"state": {"step": 0}, "pre_process": True, "mtp_process": True}},
     ],
 )
 def test_checkpoint_load_rejects_explicit_distributed_or_sharded_metadata(

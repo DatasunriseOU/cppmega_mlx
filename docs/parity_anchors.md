@@ -52,7 +52,7 @@ These files in ../cppmega are the current source references for parity:
 | Source                                           | Anchor contract                                                                                                                                                                                   | Not being ported as-is                                                                                                                   |
 | ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
 | cppmega/megatron/nam56r_layout.py                | Import-safe NAM56R pattern/depth helpers, R layer loading, A-layer number loading, and DSA rank env parsing.                                                                                      | Megatron symbol probing is only source-side compatibility logic.                                                                         |
-| cppmega/recipes/nam56r_megatron.py               | Full source parser accepts A/M/D/E/G/R/                                                                                                                                                           | and reports whether a recipe is fully native Megatron.                                                                                   | Local MLX pattern parsing intentionally accepts only A/E/M/R and fails closed on upstream-only symbols. |
+| cppmega/recipes/nam56r_megatron.py               | Full source parser accepts A, M, D, E, G, R, and pipe-delimited patterns, and reports whether a recipe is fully native Megatron.                                                                  | Local MLX pattern parsing intentionally accepts only A/E/M/R and fails closed on upstream-only symbols.                                  |
 | cppmega/recipes/megatron_args.py                 | Emits Megatron CLI arguments for MLA, MTP, MoE, DSA, and bf16-only DSA indexer settings.                                                                                                          | Megatron launcher flags, CUDA graph, distributed optimizer, and DSA indexer runtime.                                                     |
 | cppmega/recipes/nam56r_launch.py                 | NAM symbol to Megatron hybrid pattern mapping and R custom-layer index derivation.                                                                                                                | Megatron hybrid-layer CLI construction is not the MLX runtime.                                                                           |
 | cppmega/recipes/nam56r_nemo_recipe.py            | MoE defaults and local/profile vocab constant.                                                                                                                                                    | NeMo/Megatron CLI recipes and distributed launch policy.                                                                                 |
@@ -171,13 +171,16 @@ launchers.
 - Source anchors: cppmega/megatron/mamba3_te_in_proj.py,
   cppmega/megatron/mamba3_mixer.py, and
   cppmega/megatron/mamba3_te_mixer.py.
-- Current MLX coverage: Mamba3ReferenceBlock preserves projection split
-  sizes, trainable local recurrence, B/C QK norm and bias, data-dependent
-  dt/A terms, and the source split-path packed xBC causal conv before B/C
-  transform.
-- Missing contract: projected angles are not consumed, and the Author RoPE,
-  trapezoidal, SISO/MIMO scan kernel semantics are not yet implemented as pure
-  MLX or as trainable Metal kernels with VJP coverage.
+- Current MLX coverage: Mamba3ReferenceBlock preserves the Author packed
+  projection split [z,x,B,C,dd_dt,dd_A,trap,angles], source-shaped
+  (angle_dt, ssm, k, v) cache, trainable local recurrence, B/C QK norm and
+  bias, data-dependent dt/A terms, local trapezoidal input scaling from trap,
+  cumulative projected-angle Author RoPE over B/C, and the source split-path
+  packed xBC causal conv before the [x,B,C] split.
+- Missing contract: exact Author TE/Triton/TileLang/CUDA SISO/MIMO kernels,
+  tensor-parallel/distributed runtime, and source-kernel numerical parity are
+  not implemented as local MLX behavior. Trainable Metal kernels still require
+  explicit VJP/JVP coverage before they can replace the pure-MLX reference.
 
 ### Env, Launcher, And H200 Runtime Anchors
 

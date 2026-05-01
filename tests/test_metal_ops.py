@@ -265,6 +265,27 @@ def test_training_auto_uses_pure_mlx_even_when_metal_is_available(
     _assert_reference(out, x)
 
 
+@pytest.mark.parametrize("backend", ["auto", "mlx"])
+def test_training_fallback_does_not_query_metal_status(
+    monkeypatch: pytest.MonkeyPatch,
+    backend: metal_ops.Backend,
+) -> None:
+    x = _sample()
+
+    def fail_status(_: mx.array | None = None) -> metal_ops.MetalKernelStatus:
+        raise AssertionError("training=True fallback must not query Metal eligibility")
+
+    def fail_if_called(_: mx.array) -> mx.array:
+        raise AssertionError("training=True fallback must not dispatch Metal")
+
+    monkeypatch.setattr(metal_ops, "metal_kernel_status", fail_status)
+    monkeypatch.setattr(metal_ops, "_squared_relu_metal", fail_if_called)
+
+    out = squared_relu(x, backend=backend, training=True)
+
+    _assert_reference(out, x)
+
+
 def test_training_mlx_fallback_preserves_dtype() -> None:
     x = mx.array([-2.0, 0.5, 3.0], dtype=mx.float16)
 
@@ -275,6 +296,22 @@ def test_training_mlx_fallback_preserves_dtype() -> None:
 
 
 def test_training_metal_backend_rejects_forward_only_kernel() -> None:
+    with pytest.raises(MetalKernelUnsupported, match="forward-only.*VJP/JVP"):
+        squared_relu(_sample(), backend="metal", training=True)
+
+
+def test_training_metal_backend_rejects_before_metal_status_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_status(_: mx.array | None = None) -> metal_ops.MetalKernelStatus:
+        raise AssertionError("explicit training rejection must precede Metal eligibility")
+
+    def fail_if_called(_: mx.array) -> mx.array:
+        raise AssertionError("backend='metal' training must reject before kernel dispatch")
+
+    monkeypatch.setattr(metal_ops, "metal_kernel_status", fail_status)
+    monkeypatch.setattr(metal_ops, "_squared_relu_metal", fail_if_called)
+
     with pytest.raises(MetalKernelUnsupported, match="forward-only.*VJP/JVP"):
         squared_relu(_sample(), backend="metal", training=True)
 

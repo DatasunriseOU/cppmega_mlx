@@ -196,16 +196,17 @@ The current collected test files are:
 ## Wave-Next Work
 
 1. Keep the local tiny and hybrid tiny lanes green while increasing coverage.
-   Mamba3 and M2RNN checkpoint save/resume now have normal script-path receipts;
-   next extend the same path to validation loops and side-channel variants.
+   Mamba3 and M2RNN checkpoint save/resume, validation-loop, and structure
+   side-channel variants now have local script-path receipts; keep them as
+   regression lanes rather than next-work placeholders.
 2. Raise the hybrid tiny smoke from "blocks instantiate and train" to "A/M/E/R
    route semantics are regression-locked." Add route-specific loss/gradient
    checks before increasing dimensions.
 3. Extend the data handoff path from fixed-shape NPZ and optional Parquet token
-   shards to the standalone MegatronIndexedDataset seam. Remaining work is a
-   documented side-channel schema/ingress path for attention and structure
-   arrays plus CLI/training integration, not pulling Megatron into the Mac
-   runtime.
+   shards to the standalone MegatronIndexedDataset seam. Tiny CLI/training
+   ingress is wired through scripts/train_tiny_npz.py --dataset-format
+   megatron; remaining work is source-converter side-channel preservation and a
+   multi-shard sidecar/schema, not pulling Megatron into the Mac runtime.
 4. Promote the current scripts/bench_matrix.py M4 Max smoke result into an
    archived JSON regression baseline, then grow it across a small matrix of
    batch/sequence/dtype/profile/route shapes. Track compile time separately from
@@ -247,8 +248,9 @@ The current collected test files are:
   regression baseline only until a matched GB10 run exists with the protocol
   below.
 - Megatron .bin/.idx support is wired into open_token_dataset; the tiny
-  training script remains NPZ-focused, and indexed batches are token-only until
-  a side-channel sidecar or multi-shard schema is defined.
+  training script accepts --dataset-format megatron, but indexed batches remain
+  token-only until the source converter preserves side channels and a multi-shard
+  sidecar/schema is defined.
 - Source-equivalent structure embedding is on the HybridTinyLM forward path
   through CppMegaStructureEmbedding; TinyLM still uses simplified
   summed/modded structure additions, and full Megatron launcher/training parity
@@ -272,8 +274,12 @@ The current collected test files are:
   seam with pure MLX fallback and fail-closed explicit Metal mode.
 - Distributed MLX training is not implemented in this repo. mx.distributed
   remains a future pattern source, not a current capability claim.
-- Large-model memory behavior, optimizer-state size, activation checkpointing,
-  compile-cache churn, and checkpoint sharding are not proven at NAM56R scale.
+- Apple training readiness at large route shapes remains a verification gap:
+  before any NAM56R-scale local training or training-path Metal kernel claim,
+  collect a route/shape profile with MLX active/peak/cache memory, compile-cache
+  churn, optimizer-state size, checkpoint/write behavior, and any macOS wired
+  memory setting used. Kernel adoption still requires the pure-MLX fallback,
+  dtype/shape parity, and custom VJP/JVP coverage described above.
 
 ## M4 Max vs GB10 Comparison Protocol
 
@@ -425,3 +431,21 @@ Current source snapshot, verified 2026-04-30:
   rate limit HTTP 403, so the GitHub API fields above remain a point-in-time
   snapshot. The Hugging Face Apple M4 HTML listing still returned HTTP 200 with
   the same 10 embedded entries.
+
+Current source refresh for lane cppmega-mlx-refill-01, verified 2026-05-01:
+
+- MLX custom Metal kernel docs returned HTTP 200 at
+  https://ml-explore.github.io/mlx/build/html/dev/custom_metal_kernels.html and
+  show custom kernels can be wrapped with mlx.core.custom_function plus a VJP
+  for differentiated training use.
+- MLX custom_function docs returned HTTP 200 at
+  https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.custom_function.html
+  and define the vjp, jvp, and vmap override surface used by the kernel gate.
+- MLX-LM README returned HTTP 200 at
+  https://raw.githubusercontent.com/ml-explore/mlx-lm/main/README.md and
+  documents Apple-silicon fine-tuning, mx.distributed, and macOS 15
+  iogpu.wired_limit_mb guidance for large models.
+- Hugging Face Apple M4 kernel listing returned HTTP 200 at
+  https://huggingface.co/kernels?hardware=apple-m4&sort=trending with 10
+  embedded Metal-capable entries. This remains reference evidence only, not a
+  cppmega adoption or performance claim.

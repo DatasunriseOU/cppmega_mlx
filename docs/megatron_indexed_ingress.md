@@ -47,12 +47,12 @@ Raw .bin inputs without .idx must provide dtype either as an opener
 argument or in JSON metadata. This keeps ambiguous byte streams fail-closed.
 
 The tiny local training CLI accepts the same suffixless prefix path when
---data-format megatron is explicit:
+--dataset-format megatron is explicit:
 
 bash
-./.venv/bin/python scripts/train_hybrid_tiny.py \
+./.venv/bin/python scripts/train_tiny_npz.py \
   /path/to/clang_semantic_4k_v10_train \
-  --data-format megatron \
+  --dataset-format megatron \
   --json
 
 

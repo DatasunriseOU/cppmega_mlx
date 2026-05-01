@@ -1025,10 +1025,10 @@ def unmatched_pair_row(m4: dict[str, Any], gb10: dict[str, Any]) -> dict[str, An
         reason = "missing_required_match_fields"
     elif m4_missing_key or gb10_missing_key:
         reason = "missing_matched_comparison_key"
-    elif mismatched_fields:
-        reason = "match_field_mismatch"
     elif mismatched_comparison_keys:
         reason = "matched_comparison_key_mismatch"
+    elif mismatched_fields:
+        reason = "match_field_mismatch"
     else:
         reason = "match_field_mismatch"
     return {

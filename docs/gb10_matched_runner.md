@@ -131,6 +131,39 @@ the guard status and input paths, compare_report.json keeps the guard/refusal
 summary without ratios, matched_comparisons.jsonl is the only ratio-bearing
 JSONL file, and refused_pairs.jsonl is mismatch evidence only.
 
+## Matched Package Protocol
+
+Treat the package as an audit bundle, not just a convenience output:
+
+- Preserve the raw M4 matrix JSON and raw GB10 matrix JSON next to the package,
+  named by host, date, and route scope. Do not replace them with extracted
+  rows or edited copies.
+- Preserve the exact commands, repo commit, Python executable, and environment
+  summary used on each host in a README or run log beside the raw JSON.
+- Run scripts/compare_bench_rows.py with --package-dir against the raw JSON
+  files. The manifest records the input paths and guard status; it does not
+  prove the raw inputs were immutable, so keep the raw files in the same handoff
+  directory.
+- Treat matched_comparisons.jsonl as the only ratio-bearing artifact.
+  compare_report.json intentionally strips ratios from comparison summaries,
+  and refused_pairs.jsonl must remain refusal evidence only.
+- If manifest.json reports parity_claim_refused: true, publish the package as a
+  refusal package. Do not summarize the M4 and GB10 numbers as a win/loss table.
+- If manifest.json reports status: ok, still quote ratios only from
+  matched_comparisons.jsonl and include the corresponding
+  comparison_key.workload and comparison_key.software objects in the report.
+- Keep local-only M4 baseline archives separate from matched packages. A local
+  baseline archive can be an input to a future package, but it is not itself a
+  GB10 comparison artifact.
+
+MLX timing rows must be synchronized before they enter the package. MLX records
+compute graphs lazily and work only runs when evaluated, so benchmark loops
+must force the training state and timing outputs with mx.eval or an equivalent
+synchronization point. MLX also documents that the first compiled call builds,
+optimizes, and code-generates the graph while later compatible calls use the
+cache, so compile/first-call time must stay separate from steady-state
+tokens/sec in any M4-vs-GB10 package.
+
 ## Parquet Samples
 
 Local Parquet samples under data/parquet_samples/gb10/ are ignored by git and
@@ -138,3 +171,10 @@ are only data-contract smoke inputs. They can help produce the same
 data_contract on both machines, but they do not replace a matched benchmark
 receipt. A valid real-data comparison still needs both M4 and GB10 rows to name
 the same Parquet-derived contract and to pass the comparison-key guard above.
+
+## References Checked
+
+- MLX lazy evaluation:
+  https://ml-explore.github.io/mlx/build/html/usage/lazy_evaluation.html
+- MLX compile behavior:
+  https://ml-explore.github.io/mlx/build/html/usage/compile.html
