@@ -58,7 +58,7 @@ Verdict legend: **VENDOR** = drop in unchanged (pin SHA), **FORK** = vendor + pa
 | X | Tied / sharded embeddings | mlx core + `Embedding.as_linear()` (single-host); `mlx.nn.distributed` for sharded TP | **VENDOR** single-host; **PATTERN-ONLY** sharded | S |
 | Y | Distributed (DP / TP / ZeRO-1) | mlx core `mx.distributed` + JACCL/ring; per-model `shard()` patterns in mlx-lm | **VENDOR** mlx core; **PATTERN-ONLY** ZeRO-1 | M–L |
 | Z | Speculative decoding | **mlx-lm `speculative_generate_step`** (vanilla, greedy-match, NOT Leviathan) | **FORK** mlx-lm to add Leviathan rejection step + **PORT-FUSED** MTP self-spec via D | S / M / L |
-| AA | BPE tokenizer with FIM/iFIM tokens | nanochat `tokenizer.json` + `cpp_tokenizer.py`, vocab=65536, IDs 2/3/4/5/6/7 | **VENDOR** (data-side) | S |
+| AA | BPE tokenizer with FIM/iFIM tokens | **PARTIAL:** deployed GB10/local artifact contract is vocab=65536 with id 7=`<CODE_START>` and id 45=`<FIM_INSTRUCTION>`; `tokenizer.json` legacy 32K is not used | **VENDORED / FAIL-CLOSED** until the 10K-sample CUDA encode/decode round-trip receipt closes M0.1 | S |
 | BB | Linear + CE fusion (Liger-equivalent) | **mlx-lm `tuner/losses.py`** has chunked CE + Metal kernel + VJP | **VENDOR** pattern, extend for ignore_index | M |
 | CC | SwiGLU fused | mlx core + `mx.compile`; **ZMLX `swiglu_mlp`** Metal kernel for decode | **PORT-FUSED** + optional **VENDOR** ZMLX | S |
 | DD | Residual + RMSNorm | `mx.fast.rms_norm` + `mx.compile` | **VENDOR** (`mx.fast.rms_norm`) | S |
