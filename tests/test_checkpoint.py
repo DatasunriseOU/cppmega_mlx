@@ -840,6 +840,123 @@ def test_checkpoint_resume_restores_model_and_optimizer_state(tmp_path) -> None:
     )
 
 
+def test_checkpoint_resume_next_step_matches_uninterrupted_with_cursor_and_rng_metadata(
+    tmp_path,
+) -> None:
+    config = _tiny_config()
+    rng_seed = 1307
+    batches = [
+        synthetic_token_batch(
+            batch_size=2,
+            seq_length=8,
+            vocab_size=config.vocab_size,
+            seed=121,
+            include_structure=True,
+        ),
+        synthetic_token_batch(
+            batch_size=2,
+            seq_length=8,
+            vocab_size=config.vocab_size,
+            seed=122,
+            include_structure=True,
+        ),
+    ]
+
+    def make_stepper() -> tuple[TinyLM, optim.Optimizer, CompiledPretrainingStep]:
+        mx.random.seed(rng_seed)
+        model = TinyLM(config)
+        optimizer = optim.AdamW(learning_rate=1e-2, weight_decay=0.0)
+        mx.eval(model.state, optimizer.state)
+        return model, optimizer, CompiledPretrainingStep(
+            model,
+            optimizer,
+            compile=False,
+        )
+
+    uninterrupted, uninterrupted_optimizer, uninterrupted_step = make_stepper()
+    interrupted, interrupted_optimizer, interrupted_step = make_stepper()
+
+    uninterrupted_step(batches[0])
+    interrupted_step(batches[0])
+
+    cursor = {
+        "epoch": 0,
+        "batch_offset": 1,
+        "global_batch_offset": 1,
+    }
+    rng_metadata = {
+        "mode": RNG_MODE_SEED,
+        "seed": rng_seed,
+        "source": "test deterministic mx.random.seed",
+    }
+    manifest = save_checkpoint(
+        interrupted,
+        tmp_path / "cursor-rng-resume",
+        optimizer=interrupted_optimizer,
+        training_step=interrupted_step,
+        metadata={
+            "step": interrupted_step.state.step,
+            "batch_cursor": cursor,
+            "rng": rng_metadata,
+        },
+    )
+
+    assert manifest["step"] == 1
+    assert manifest["optimizer"]["present"] is True
+    assert manifest["rng"] == rng_metadata
+    assert manifest["batch_cursor"] == cursor
+    assert manifest["training_state"]["state"] == {"step": 1, "trained_tokens": 14}
+    assert manifest["training_state"]["grad_accum_steps"] == 1
+    assert manifest["training_state"]["pending_microbatches"] == 0
+    assert manifest["training_state"]["gradient_accumulator_present"] is False
+
+    mx.random.seed(999)
+    resumed = TinyLM(config)
+    resumed_optimizer = optim.AdamW(learning_rate=1e-2, weight_decay=0.0)
+    resumed_step = CompiledPretrainingStep(
+        resumed,
+        resumed_optimizer,
+        compile=False,
+    )
+    loaded = load_checkpoint(
+        resumed,
+        tmp_path / "cursor-rng-resume",
+        optimizer=resumed_optimizer,
+        training_step=resumed_step,
+    )
+
+    assert loaded == manifest
+    assert resumed_step.state.to_dict() == {"step": 1, "trained_tokens": 14}
+    _assert_tree_allclose(resumed.parameters(), interrupted.parameters(), atol=0)
+    _assert_tree_allclose(resumed.parameters(), uninterrupted.parameters(), atol=1e-7)
+    _assert_tree_allclose(
+        resumed_optimizer.state,
+        interrupted_optimizer.state,
+        atol=0,
+    )
+    _assert_tree_allclose(
+        resumed_optimizer.state,
+        uninterrupted_optimizer.state,
+        atol=1e-7,
+    )
+
+    next_index = loaded["batch_cursor"]["global_batch_offset"]
+    expected_metrics = uninterrupted_step(batches[next_index])
+    resumed_metrics = resumed_step(batches[next_index])
+
+    assert expected_metrics.updated is True
+    assert resumed_metrics.updated is True
+    assert resumed_metrics.step == expected_metrics.step == 2
+    assert resumed_metrics.trained_tokens == expected_metrics.trained_tokens == 28
+    np.testing.assert_allclose(resumed_metrics.loss, expected_metrics.loss, rtol=0, atol=0)
+    _assert_tree_allclose(resumed.parameters(), uninterrupted.parameters(), atol=1e-7)
+    _assert_tree_allclose(
+        resumed_optimizer.state,
+        uninterrupted_optimizer.state,
+        atol=1e-7,
+    )
+
+
 def test_checkpoint_resume_restores_hybrid_custom_blocks_and_optimizer(tmp_path) -> None:
     config = _hybrid_config()
     first_batch = synthetic_token_batch(
