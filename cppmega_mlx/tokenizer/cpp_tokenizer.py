@@ -19,7 +19,8 @@ EXPECTED_SPECIAL_TOKENS: dict[str, int] = {
     "<FIM_PREFIX>": 4,
     "<FIM_MIDDLE>": 5,
     "<FIM_SUFFIX>": 6,
-    "<FIM_INSTRUCTION>": 7,
+    "<CODE_START>": 7,
+    "<FIM_INSTRUCTION>": 45,
 }
 
 
@@ -35,6 +36,9 @@ class CppMegaTokenizer:
         self.path = path
         self._vocab: dict[str, int] = dict(tokenizer.get_vocab())
         self._id_to_token = {token_id: token for token, token_id in self._vocab.items()}
+        from cppmega_mlx.tokenizer._nanochat_decoder import CppTokenizer as _NanochatDecoder
+
+        self._decoder: Any = _NanochatDecoder(str(path))
 
     @property
     def vocab_size(self) -> int:
@@ -59,6 +63,10 @@ class CppMegaTokenizer:
     @property
     def fim_suffix_id(self) -> int:
         return EXPECTED_SPECIAL_TOKENS["<FIM_SUFFIX>"]
+
+    @property
+    def code_start_id(self) -> int:
+        return EXPECTED_SPECIAL_TOKENS["<CODE_START>"]
 
     @property
     def fim_instruction_id(self) -> int:
@@ -91,7 +99,14 @@ class CppMegaTokenizer:
         return [list(encoded.ids) for encoded in self._tokenizer.encode_batch(list(texts))]
 
     def decode(self, ids: Iterable[int]) -> str:
-        return str(self._tokenizer.decode(list(ids)))
+        """Decode IDs via the vendored nanochat C++-aware heuristic.
+
+        Byte-identical to nanochat ``CppTokenizer.decode`` so MLX inference,
+        FIM transforms, and RL reward parsing produce the same strings as
+        the CUDA reference for any given ID stream.
+        """
+
+        return str(self._decoder.decode(list(ids)))
 
     def token_for_id(self, token_id: int) -> str | None:
         return self._id_to_token.get(token_id)
@@ -195,8 +210,10 @@ def _validate_vocab_contract(vocab: dict[str, int], path: Path) -> None:
     for token, expected_id in EXPECTED_SPECIAL_TOKENS.items():
         actual_id = vocab.get(token)
         if actual_id != expected_id:
+            occupant = id_to_token.get(expected_id)
             raise TokenizerContractError(
-                f"{path}: token {token!r} must use id {expected_id}, got {actual_id}"
+                f"{path}: token {token!r} must use id {expected_id}, "
+                f"got {actual_id}; id {expected_id} maps to {occupant!r}"
             )
         actual_token = id_to_token.get(expected_id)
         if actual_token != token:

@@ -1,0 +1,220 @@
+{
+  "tokenizer_path": "/home/dave/cppmega-root/cpp_tokenizer_hf",
+  "vocab_size": 65536,
+  "special_ids": {
+    "<BOS>": 2,
+    "<EOS>": 3,
+    "<CODE_START>": 7,
+    "<FIM_INSTRUCTION>": 45
+  },
+  "samples": [
+    {
+      "text": "void foo() { return; }",
+      "ids": [
+        125,
+        1214,
+        8742,
+        352,
+        353,
+        1214,
+        350,
+        1214,
+        103,
+        358,
+        1214,
+        351
+      ],
+      "decoded": "void   foo()   {   return;   }"
+    },
+    {
+      "text": "int main(int argc, char** argv) { return 0; }",
+      "ids": [
+        133,
+        1214,
+        7298,
+        4728,
+        352,
+        133,
+        1214,
+        4830,
+        7233,
+        360,
+        1214,
+        127,
+        364,
+        364,
+        1214,
+        4830,
+        7250,
+        353,
+        1214,
+        350,
+        1214,
+        103,
+        1214,
+        4900,
+        358,
+        1214,
+        351
+      ],
+      "decoded": "int   ma in(int   arg c,   char* *   arg v)   {   return   0;   }"
+    },
+    {
+      "text": "snake_case_var",
+      "ids": [
+        57008,
+        377,
+        96,
+        377,
+        4503
+      ],
+      "decoded": "snake_case_var"
+    },
+    {
+      "text": "int x = 42;\n",
+      "ids": [
+        133,
+        1214,
+        7252,
+        1214,
+        373,
+        1214,
+        4942,
+        358
+      ],
+      "decoded": "int   x   =   42;"
+    },
+    {
+      "text": "#include <vector>\nstd::vector<int> v;",
+      "ids": [
+        640,
+        1214,
+        356,
+        1502,
+        357,
+        1500,
+        325,
+        1502,
+        356,
+        133,
+        357,
+        1214,
+        7250,
+        358
+      ],
+      "decoded": "#include   <vector> std::vector<int>   v;"
+    },
+    {
+      "text": "<FIM_PREFIX>int x = <FIM_SUFFIX>;\nreturn x;<FIM_MIDDLE>5",
+      "ids": [
+        4,
+        133,
+        1214,
+        7252,
+        1214,
+        373,
+        1214,
+        6,
+        358,
+        103,
+        1214,
+        7252,
+        358,
+        5,
+        4905
+      ],
+      "decoded": "<FIM_PREFIX>int   x   =  <FIM_SUFFIX>; return   x;<FIM_MIDDLE>5"
+    },
+    {
+      "text": "<FIM_INSTRUCTION>Implement add<FIM_PREFIX>int add(int a, int b) {<FIM_SUFFIX>}<FIM_MIDDLE>return a + b;",
+      "ids": [
+        45,
+        9295,
+        923,
+        7235,
+        4734,
+        1214,
+        7372,
+        4,
+        133,
+        1214,
+        7372,
+        352,
+        133,
+        1214,
+        7231,
+        360,
+        1214,
+        133,
+        1214,
+        7232,
+        353,
+        1214,
+        350,
+        6,
+        351,
+        5,
+        103,
+        1214,
+        7231,
+        1214,
+        362,
+        1214,
+        7232,
+        358
+      ],
+      "decoded": "<FIM_INSTRUCTION>Imp l e ment   add<FIM_PREFIX>int   add(int   a,   int   b)   {<FIM_SUFFIX>}<FIM_MIDDLE>return   a   +   b;"
+    },
+    {
+      "text": "<CODE_START>printf(1);<CODE_END>",
+      "ids": [
+        7,
+        1834,
+        352,
+        4901,
+        353,
+        358,
+        8
+      ],
+      "decoded": "<CODE_START>printf(1);<CODE_END>"
+    },
+    {
+      "text": "tab\there",
+      "ids": [
+        9899,
+        7238,
+        4760,
+        7235
+      ],
+      "decoded": "tabher e"
+    },
+    {
+      "text": "",
+      "ids": [],
+      "decoded": ""
+    },
+    {
+      "text": "тест на кириллице",
+      "ids": [
+        1,
+        1,
+        1,
+        1,
+        1214,
+        1,
+        1,
+        1214,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "decoded": "<UNK><UNK><UNK><UNK> <UNK><UNK> <UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK>"
+    }
+  ]
+}
