@@ -170,12 +170,15 @@ The current collected test files are:
 - tests/test_bench_script.py
 - tests/test_check_environment_script.py
 - tests/test_checkpoint.py
+- tests/test_checkpoint_subprocess_resume.py
 - tests/test_compare_bench_rows.py
 - tests/test_compiled_train.py
 - tests/test_config.py
 - tests/test_cppmega_parity_anchors.py
 - tests/test_data_pipeline_doc.py
 - tests/test_data_smoke_script.py
+- tests/test_dataloader_bridge.py
+- tests/test_engram.py
 - tests/test_env_runtime.py
 - tests/test_eval.py
 - tests/test_external_research_contract.py
@@ -183,12 +186,14 @@ The current collected test files are:
 - tests/test_hybrid_lm.py
 - tests/test_hybrid_lm_gradients.py
 - tests/test_lint_mlx.py
+- tests/test_m03_forward_parity_manifest_script.py
 - tests/test_m04_train_step.py
 - tests/test_m2rnn.py
 - tests/test_mamba3.py
 - tests/test_megatron_indexed.py
 - tests/test_memory_runtime.py
 - tests/test_metal_ops.py
+- tests/test_mhc.py
 - tests/test_mlx_lm_adapter.py
 - tests/test_model_factory.py
 - tests/test_moe.py
@@ -198,6 +203,7 @@ The current collected test files are:
 - tests/test_package_exports.py
 - tests/test_parity_manifest.py
 - tests/test_parquet_dataset.py
+- tests/test_plasticity.py
 - tests/test_profile.py
 - tests/test_profile_capture_script.py
 - tests/test_pytest_markers.py
@@ -205,6 +211,7 @@ The current collected test files are:
 - tests/test_runtime_exports.py
 - tests/test_seed_runtime.py
 - tests/test_sequence_packing.py
+- tests/test_stp_loss.py
 - tests/test_structure_embedding.py
 - tests/test_system_requirements_doc.py
 - tests/test_tiny_train.py
@@ -264,6 +271,13 @@ The current collected test files are:
   tiny MLX reference blocks at the source layer positions; they are not the
   source nam56r_full_spec.py, nam56r_te_spec.py, or nam56r_noconv_spec.py
   runtime with TE, Triton scans, TP mixer behavior, or H200/GB10 launch scripts.
+- Stream H feature work is only partially sliced locally. `cppmega_mlx/nn/engram.py`
+  and `cppmega_mlx/nn/mhc.py` are standalone modules, `cppmega_mlx/data/fim.py`
+  is a fail-closed CPU FIM/iFIM transform slice, `cppmega_mlx/training/mtp.py`
+  is local training-side MTP coverage, and `cppmega_mlx/training/stp_loss.py`
+  is opt-in deterministic STP helper coverage. None of these are
+  NAM56R-integrated, CUDA/Megatron parity receipts, full Stream H closure, or
+  Hopper/Liger fused-CE evidence.
 - MoE support is reference-local. The shared/routed expert defaults are
   regression anchors, but Megatron all-to-all dispatch, grouped GEMM,
   expert-parallel overlap, selective FP8 MoE, capacity/drop-pad policy, and
