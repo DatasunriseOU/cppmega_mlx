@@ -191,6 +191,7 @@ The current collected test files are:
 - tests/test_m2rnn.py
 - tests/test_mamba3.py
 - tests/test_megatron_indexed.py
+- tests/test_memory_audit.py
 - tests/test_memory_runtime.py
 - tests/test_metal_ops.py
 - tests/test_mhc.py
