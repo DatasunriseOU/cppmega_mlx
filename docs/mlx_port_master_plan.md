@@ -37,12 +37,12 @@ This document is a planning synthesis from parallel research lanes (local-code a
 - Metal kernel seam (`kernels/metal_ops.py`) holds optional research kernels with pure-MLX fallbacks; `TrainingKernelStatus.differentiable=False` by design.
 - Megatron `.idx` parser rejects ngram sidecar metadata (n-gram is derived in-model instead).
 
-**Missing entirely (the real porting backlog)**
-- **Features**: `mtp` (training head), `fim`, `ifim`, `stp`, `mhc`, `engram` (the layer-level branch — not just the n-gram table).
+**Missing / partial / not integrated (the real porting backlog)**
+- **Features**: FIM/iFIM have local fail-closed CPU token transforms only; `engram` and `mhc` have standalone MLX modules only; MTP has local M0.5 training-side coverage only; STP has a local opt-in deterministic helper plus TinyLM smoke coverage. These slices are not wired into NAM56R integration, do not prove CUDA/Megatron parity, and do not close Stream H.
 - **Distributed**: `mx.distributed` (ring / JACCL), multi-Mac ZeRO-style sharding.
 - **Sharded checkpoints** (`model.safetensors.index.json`).
 - **Sequence packing** (cumulative-doc-id attention mask).
-- **Tokenizer**: still vocab-size constants only; no BPE BPE/FIM/iFIM special-token tables in repo.
+- **Tokenizer**: M0.1 is closed. The vendored GB10 BPE artifact and special-token contract exist for vocab=65536 plus deployed id7=`<CODE_START>` and id45=`<FIM_INSTRUCTION>`, and MLX vendors the nanochat heuristic decoder to match the CUDA reference decode path.
 - **Inference / generation**: no KV cache class, no sampler, no MTP-aware or FIM-aware decoding.
 - **Quantization**: bf16 only; no `mx.quantize` integration, no q4 inference path.
 - **Structural parity anchors, not CUDA tensor parity**: existing `tests/test_cppmega_parity_anchors.py` checks NAM56R route/layer constants, DSA/MLA layer derivation, vocab/MoE anchors, fail-closed parity wording, and optional sibling cppmega source-anchor presence when that checkout exists. The source-file existence check is only one guard; the test is broader than file-presence coverage, but it still does not compare CUDA golden tensors or prove numerical agreement.
@@ -54,7 +54,7 @@ A heavily-engineered Megatron-LM port:
 - Custom CUDA: `cutlass_mxfp8_gemm`, `grouped_mxfp8_gemm`, `quantized_muon_momentum`. CUTLASS Block-Scaled MMA with E8M0 scales for GB10.
 - TileLang sparse-MLA forward+backward (FP8), CuTe DSL Mamba3 MIMO.
 - CUDA/H200 reference receipts include BF16 289 TFLOP/s, 29.2% MFU on H200 PP=1 EP=4 MBS=8, and FP8 268 TFLOP/s on bench3 with Liger reduction-mean workaround. These are sibling-repo CUDA receipts, not cppmega.mlx throughput, FP8, GB10, or production-readiness evidence.
-- Features: **engram + ngram_hash** done, **mHC** config-only, **MTP** fused (Hopper CE + Liger), **FIM/iFIM** flag-only, **STP** not present (only nanochat has it), structure embedding done.
+- Features: **ngram_hash** done; **engram** exists as a standalone MLX per-block branch module but is not integrated into NAM56R; **mHC** config-only; **MTP** fused (Hopper CE + Liger); **FIM/iFIM** flag-only; **STP** exists locally only as an opt-in deterministic MLX helper, with nanochat still serving as the source spec; structure embedding done.
 
 ### What ../nanochat (origin) gives us as the spec
 
@@ -66,10 +66,10 @@ Full-stack research-grade LLM (40-45K LOC):
   - `ngram_hash.py` (multi-head hash n-gram, BLT 2412.09871 + DeepSeek 2601.07372).
   - `mtp.py` (FastMTP arXiv 2509.18362-style recursive shared-block, β-decayed loss).
   - `fim.py` (Bavarian 2207.14255 PSM/SPM, plus AST-FIM 2506.00204).
-  - `ifim.py` (Sun et al. arXiv 2509.24637, Sep 2025: instruction-aware FIM, special token id=7).
+  - `ifim.py` (Sun et al. arXiv 2509.24637, Sep 2025: instruction-aware FIM; paper/source proposal only, not the deployed GB10 token-id contract).
   - `stp.py` (Huang/LeCun arXiv 2602.22617, Feb 2026: JEPA geodesic regularization, ~100 LOC).
 - Speculative decoding (acceptance-rejection), EAGLE-2 draft head.
-- BPE tokenizer with FIM ids `4=PREFIX, 5=MIDDLE, 6=SUFFIX, 3=EOT, 7=FIM_INSTRUCTION`.
+- Tokenizer/FIM intent is a source reference only: live local/GB10 artifacts use the deployed M0.1 contract documented below (`id7=<CODE_START>`, id45=`<FIM_INSTRUCTION>`), and M0.1 decode parity is covered by the vendored nanochat heuristic decoder rather than HF reversible round-trip decode.
 - Training: pretrain + midtrain + SFT + RL via Muon/AdamW, FA3 (CUDA) / Pallas (TPU) / SDPA fallback.
 - Inference: contiguous KV (`engine.py`) + paged KV scheduler (`serving.py`).
 
@@ -124,7 +124,7 @@ Full-stack research-grade LLM (40-45K LOC):
 | Kernels — defaults | `mx.fast.SDPA` / `rope` / `rms_norm` everywhere | fused, mixed-precision aware, supported |
 | Kernels — custom Metal | candidates only after profiling, pure-MLX fallback, parity, hotspot evidence, and VJP/JVP if training-side | maintenance cost is real; ZMLX/mlx-mfa/TurboQuant are pattern references |
 | Checkpoints | sharded `.safetensors` + index manifest + `optimizer.safetensors` + `train_state.json` | future target; fills RNG/cursor gap without claiming current sharded restore |
-| Tokenizer | port BPE with FIM ids 4/5/6/3/7 | matches nanochat fork; assert at model load |
+| Tokenizer | M0.1 closed on deployed GB10 BPE artifact + nanochat heuristic decoder parity | assert vocab/id mapping at model load; future tokenizer work is FIM/iFIM/AST-FIM integration, not an M0.1 blocker |
 | Parity anchors | upgrade `tests/test_cppmega_parity_anchors.py` to numerical | current anchors are structural/doc/source-presence checks, not tensor parity |
 | Bench/CI gate | future regression threshold after baselines exist | do not block or claim throughput until local baselines are committed |
 
@@ -154,13 +154,13 @@ Before fanning out across all 10 streams, prove the smallest viable path on the 
 **Goal**: load `local_gb10_quarter` config (depth=13, hidden=3584, FFN=18944, 28 heads, head_dim=128, vocab=65536, MTP=2, AEMEAEMEAEMR pattern); run a single bf16 training step end-to-end on a single Mac; and produce a numerical parity row against a one-shot CUDA forward at the same seed within the documented bf16 tolerances.
 
 **Gate set** (must all be green before scaling effort):
-- M0.1 — Tokenizer: vendor `nanochat/tokenizer.json` + `cpp_tokenizer.py` into `cppmega_mlx/tokenizer/`. Vocab assertion at load (id 4=PREFIX, 5=MIDDLE, 6=SUFFIX, 3=EOT, 7=FIM_INSTRUCTION, 2=BOS). Round-trip 10K samples byte-exact vs CUDA encode/decode.
-- M0.2 — Model factory entry for `local_gb10_quarter` in `cppmega_mlx/recipes/model_factory.py`. Build → forward on shape `(B=1, T=512)` returns finite logits.
-- M0.3 — **Random-init seed-matched forward parity** (no warm-start, no CUDA weight import for M0): construct MLX model and CUDA reference model with the same `local_gb10_quarter` config; seed both deterministically; compare logits within `rtol=1e-2, atol=1e-1` on a fixed input batch. This validates architectural correctness without coupling M0 to a weight-converter milestone.
-- M0.4 — One training step in bf16 (loss + backward + optimizer.update). No NaNs. Loss decrease over 100 steps on a tiny shard. **Data source**: local `data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet` (already vendored, ~492 MB total of GB10 validation shards). No GB10 scp or full-corpus prep needed for M0.
-- M0.5 — MTP K=2 head wired with β=0.6 / λ=0.3; per-depth losses tracked. MTP-disabled inference path also returns sane logits.
+- M0.1 — **CLOSED**. Tokenizer: vendor the deployed GB10 tokenizer artifact with vocab=65536 and the reserved ID contract (id 2=BOS, 3=EOT/EOS, 4=FIM_PREFIX, 5=FIM_MIDDLE, 6=FIM_SUFFIX, 7=CODE_START, 45=FIM_INSTRUCTION, 46=SPACE, 47=NL). The wrapper normalizes whitespace runs at encode (`[\r\n]+`->`<NL>`, `[ \t]+`->`<SPACE>`) and decode is plain token concat with sentinel substitution; this fixes the BPE-split decode bug (e.g., `sum`->`s`,`u`,`m`->`s u m`) and gives byte-exact round-trip for inputs without multi-char whitespace runs. The vendored nanochat heuristic decoder has been retired in favor of the explicit-token approach, which matches the CUDA-side `nanochat/cpp_tokenizer.py` decode behavior. Do not reopen this gate over the deployed HF `decoder=null` artifact's non-reversible `decode(encode(text))` behavior.
+- M0.2 — Model factory entry for `local_gb10_quarter` in `cppmega_mlx/recipes/model_factory.py`. With M0.1 closed, the default profile is unblocked; acceptance remains the profile contract plus build → forward closure on shape `(B=1, T=512)` returning finite logits with config schema validation rejecting invalid combos.
+- M0.3 — **Random-init seed-matched forward parity** (no warm-start, no CUDA weight import for M0): construct MLX model and CUDA reference model with the same `local_gb10_quarter` config; seed both deterministically; compare logits within `rtol=1e-2, atol=1e-1` on the fixed `B=1,T=512,seed=3003` input batch (`tokens_sha256=c645ca4053e5206dcbe58c13aa26f4a9e56c5aa2aee90a4d4778bbc9d9c33549`). Current gate state is fail-closed: no real CUDA logits artifact exists at `bench/parity/cuda/m03_local_gb10_quarter_seed3003_logits.json`, so `scripts/m03_forward_parity_manifest.py` must refuse the default missing artifact and keep `m0_3_closed=false`. A metadata-valid CUDA artifact only reaches `artifact_preflight_status=valid_not_evaluated`; it is not acceptance until a separate numerical harness compares the full logits tensor (`shape=[1,512,65536]`, `numel=33554432`) against MLX and records pass/fail parity.
+- M0.4 — One training step in bf16 (loss + backward + optimizer.update). No NaNs. Loss decrease over 100 steps on the target local parquet sample. **Data source**: local ignored `data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet` (~492 MB total of GB10 validation shards when present locally; not committed to git). Current receipts may cover tiny-model/full-parquet plumbing only; full M0.4 remains blocked until the `local_gb10_quarter` path runs this gate. No GB10 scp or full-corpus prep needed for M0.
+- M0.5 — MTP K=2 head wired with β=0.6 / λ=0.3; per-depth losses tracked. MTP-disabled inference path also returns sane logits. Current local coverage is bounded to MLX training-side loss semantics and fails closed on Hopper/Liger fused-CE parity until a hardware receipt exists.
 - M0.6 — Memory math validated on the actual dev box (Mac Studio M4 Max 128 GB): peak unified-memory < 75% of installed RAM with `--grad-checkpoint` and AdamW.
-- M0.7 — Resumable training: save mid-run, kill process, reload, identical loss continues for ≥100 steps. RNG state and dataloader cursor preserved.
+- M0.7 — Resumable training: save mid-run, kill process, reload, identical loss continues for ≥100 steps with RNG state and dataloader cursor preserved. Current receipts are TinyLM/HybridTinyLM-scoped only; full M0.7 remains fail-closed until `local_gb10_quarter` resumes on the target parquet lane after the M0.4 full-model training gate is proven.
 
 **M0 data note**: full-corpus pretraining is a post-M0 concern. When that lands, options are (a) `scp` materialized `.bin/.idx` shards from GB10's `/home/dave/cppmega-root/data/megatron/clang_semantic_4k_v10_train`, or (b) port `cppmega/scripts/data/prepare_*` to run on Mac. Resolve at that time.
 
@@ -278,7 +278,28 @@ Before fanning out across all 10 streams, prove the smallest viable path on the 
 
 ### Stream D — Tokenizer & Data Pipeline (61–80)
 
-61. **Vendor** `nanochat/tokenizer.json` (HuggingFace JSON, vocab=65536) and `nanochat/cpp_tokenizer.py` into `cppmega_mlx/tokenizer/`. Do not retrain — this is the same tokenizer the GB10 stack loads via `--tokenizer-type HuggingFaceTokenizer`. Reserve IDs `2=BOS, 3=EOT, 4=FIM_PREFIX, 5=FIM_MIDDLE, 6=FIM_SUFFIX, 7=FIM_INSTRUCTION`.
+61. **Closed for M0.1**: vendor the GB10 HuggingFace JSON tokenizer and helper
+    into `cppmega_mlx/tokenizer/` after it satisfies the deployed M0.1 artifact
+    contract. Live local revalidation on 2026-05-02
+    found that `nanochat/tokenizer.json` is 32K and that both
+    `nanochat/tokenizer_v3.json` and
+    `nanochat/config/tokenizer_v3_fixed_tokens.json` reserve id 7 for
+    `<CODE_START>`. A read-only GB10 check of
+    `/home/dave/cppmega-root/cpp_tokenizer_hf/tokenizer.json` and
+    `/home/dave/cppmega-root/data/tokenizer/tokenizer.json` found vocab=65536
+    with the same id-7 `<CODE_START>` mapping; the option-B extension renames
+    the reserved id-45 slot to `<FIM_INSTRUCTION>` without changing vocab size
+    or existing embedding rows. Do not retrain or rename these
+    artifacts. Required local artifact contract is vocab=65536 with IDs
+    `2=BOS, 3=EOT/EOS, 4=FIM_PREFIX, 5=FIM_MIDDLE, 6=FIM_SUFFIX,
+    7=CODE_START, 45=FIM_INSTRUCTION, 46=SPACE, 47=NL`. Decode parity is
+    handled by the explicit `<SPACE>`/`<NL>` token redesign (encode collapses
+    `[\r\n]+`->`<NL>` and `[ \t]+`->`<SPACE>`, decode concatenates tokens and
+    substitutes sentinels back); this replaces the previously-vendored
+    nanochat heuristic `CppTokenizer.decode` path and matches the CUDA-side
+    `nanochat/cpp_tokenizer.py` updated decode. The M0.1 acceptance target
+    is Mac-vs-GB10 decode parity, with byte-exact round-trip for inputs
+    without multi-char whitespace runs.
 62. Add tokenizer vocab assertion at model load (refuse mismatched ID→token mapping; assert vocab_size == 65536; assert presence of all reserved special tokens by id and string form).
 63. Extend the existing standalone Megatron `IndexedDataset` `.bin/.idx` reader seam with additional golden fixtures and scale checks.
 64. Add IndexedDataset multi-shard support and side-channel schema preservation; do not import Megatron runtime into the Mac path.
@@ -286,10 +307,10 @@ Before fanning out across all 10 streams, prove the smallest viable path on the 
 66. Implement BOS-aligned best-fit packing (mirror nanochat-mlx loader).
 67. Add structure-embedding side-channels in batch: `structure_ids, dep_levels, ast_depth_ids, sibling_index, node_type` (already in `LMTokenBatch`; verify dataset emits them).
 68. Implement FIM data transform: PSM 50% / SPM 50%, `fim_rate=0.5`, random span sampling.
-69. Implement iFIM data transform: instruction-aware (token id=7), instruction extracted from docstrings/comments via tree-sitter.
+69. Implement iFIM data transform: instruction-aware marker id=45 (`<FIM_INSTRUCTION>`), instruction extracted from docstrings/comments via tree-sitter.
 70. Implement AST-FIM transform via tree-sitter (optional dep behind extra), masking complete syntactic blocks per arXiv 2506.00204.
-71. Add data-loader workers via PyTorch DataLoader → NumPy → `mx.array` bridge (`num_workers, persistent_workers=True`).
-72. Add `multiprocessing.set_start_method('spawn')` enforcement (no fork after Metal init).
+71. Add data-loader workers via PyTorch DataLoader → NumPy → `mx.array` bridge (`num_workers, persistent_workers=True`). Current local status: a minimal optional bridge exists for already-local `LMTokenBatch` rows and lazy-imports `torch` only when explicitly requested; this is not a full Stream D closure.
+72. Add spawn-only multiprocessing enforcement (no fork after Metal init). Current local status: the optional DataLoader bridge defaults worker contexts to `spawn` and rejects explicit non-spawn contexts without requiring global `multiprocessing.set_start_method(...)`.
 73. Implement deterministic shuffle with seed checkpoint (record cursor + RNG state).
 74. Verify Parquet loader (existing `cppmega_mlx/data/parquet`) handles structure side-channels.
 75. Verify NPZ loader (existing `cppmega_mlx/data/npz`) handles structure side-channels.
@@ -370,27 +391,27 @@ Before fanning out across all 10 streams, prove the smallest viable path on the 
 
 ### Stream H — Features (engram / mhc / mtp / fim / ifim / stp) (141–160)
 
-Cross-stream note: ngram_hash is **already done** (cppmega_mlx/nn/ngram_hash.py). Skip.
+Cross-stream note: ngram_hash is **already done** (cppmega_mlx/nn/ngram_hash.py). Skip. Current dirty-tree feature slices are partial: `cppmega_mlx/nn/engram.py` is standalone, `cppmega_mlx/nn/mhc.py` is standalone, `cppmega_mlx/data/fim.py` is a CPU FIM/iFIM transform slice, and `cppmega_mlx/training/mtp.py` is a local training-side MTP helper. They are not NAM56R-integrated, not CUDA/Megatron parity receipts, and do not close this stream.
 
-141. Port `engram.py` from `/Volumes/external/sources/nanochat/nanochat/engram.py` to `cppmega_mlx/nn/engram.py`. **Greenfield in MLX** (no vendor candidate). Wrap forward in one `mx.compile` per block; depthwise conv stays as `mx.conv_general` until profile justifies a Metal kernel. See `docs/mlx_buy_vs_build.md` row A.
-142. Implement EngramBranch base mode (avg_pool1d n-gram features → bottleneck → out-projection).
-143. Add gated mode: `α = σ(RMSNorm(h)·RMSNorm(k)/√d)`.
-144. Add grouped causal SiLU conv path (`conv_kernel=4`, optional).
-145. Wire `engram_layers` config (per-layer insertion list).
+141. Port `engram.py` from `/Volumes/external/sources/nanochat/nanochat/engram.py` to `cppmega_mlx/nn/engram.py`. **Partial local slice exists**: the current module is standalone MLX, not NAM56R-wired and not a parity receipt. Wrap forward in one `mx.compile` per block when integrating; depthwise conv stays as `mx.conv_general` until profile justifies a Metal kernel. See `docs/mlx_buy_vs_build.md` row A.
+142. Implement EngramBranch base mode (avg_pool1d n-gram features → bottleneck → out-projection). Current standalone module covers this locally.
+143. Add gated mode: `α = σ(RMSNorm(h)·RMSNorm(k)/√d)`. Current standalone module covers this locally.
+144. Add grouped causal SiLU conv path (`conv_kernel=4`, optional). Current standalone module covers this locally.
+145. Wire `engram_layers` config (per-layer insertion list). This remains open; standalone module presence is not integration.
 146. Validate engram parity vs nanochat fork Torch reference (forward pass, rtol=1e-2 atol=1e-2).
-147. Port `mhc.py` ManifoldBranchMixer with Sinkhorn-Knopp normalization (5 iters, fp32 cast inside). **Greenfield in MLX** — `tokenbender/mHC...` is PyTorch. Compile the fixed-iter Sinkhorn loop in one `mx.compile` closure; do not unroll in Python. See `docs/mlx_buy_vs_build.md` row B.
+147. Port `mhc.py` ManifoldBranchMixer with Sinkhorn-Knopp normalization (5 iters, fp32 cast inside). **Partial local slice exists**: the current module is standalone pure MLX, not wired to an Engram/NAM56R branch combo and not a source parity receipt. Compile the fixed-iter Sinkhorn loop in one `mx.compile` closure when integrating; do not unroll in Python. See `docs/mlx_buy_vs_build.md` row B.
 148. Implement N=4 streams default with `blend_alpha` interpolation to uniform.
 149. Validate Sinkhorn fp32 path vs MaxText reference (column/row stochasticity within 1e-6).
 150. Wire engram + mHC combo path (mHC mixes main_residual + engram_branch + skip_branch).
 151. Port MTP head + recursive shared-block trick from `nanochat/mtp.py` and `cppmega/megatron/fastmtp_layer.py`. Default K=2 (GB10 baseline); single shared transformer block recurred K times per FastMTP arXiv 2509.18362. **Critical**: share weights via direct attribute aliasing (`mtp_head.weight = main.lm_head.weight`), not deep copy — MLX module tree walks recognize the shared parameter and AdamW state stays single. See `docs/mlx_buy_vs_build.md` row D + anti-port rule 13.
 152. Implement `roll-and-mask` static-shape FIM-safe MTP loss (mask wrapped positions as `ignore_index=-1`); preserve XLA/`mx.compile`-safe static shapes.
 153. Add per-depth weighted loss `α_k = β^k / Σ β^j` with β=0.6 default decay (matches `CPPMEGA_FASTMTP_DECAY`); apply at `λ=0.3` (matches `CPPMEGA_FASTMTP_LAMBDA`). Use `reduction='mean'` with broadcast (Liger #968 workaround mirror).
-154. Validate MTP parity vs cppmega CUDA `cppmega/megatron/fastmtp_layer.py` and `mtp_native_hopper_ce.py` (loss values + grad norm at fixed seed; document non-claim where Hopper-fused CE is not reproducible on M4).
-155. Port FIM data transform (PSM/SPM, fim_rate, random span sampling) to `cppmega_mlx/data/fim.py`.
-156. Port iFIM data transform (instruction extraction, AST-aware, special token id=7) to `cppmega_mlx/data/ifim.py`.
-157. Port STP loss (~100 LOC, trivial port) to `cppmega_mlx/training/stp_loss.py`.
-158. Add STP variants A (single triple, last layer), B (N triples last layer), C (multi-layer averaged) toggles.
-159. Wire end-to-end training loss: `L_total = L_NTP + λ_MTP · L_MTP + λ_STP · L_STP`.
+154. Validate MTP parity vs cppmega CUDA `cppmega/megatron/fastmtp_layer.py` and `mtp_native_hopper_ce.py` (loss values + grad norm at fixed seed; document non-claim where Hopper-fused CE is not reproducible on M4). Current M0.5 receipt is fail-closed: no checked-in or locally observed fixed-seed CUDA/GB10 loss+grad-norm artifact exists, so the local MLX K=2 contract tests do not close parity.
+155. Port FIM data transform (PSM/SPM, fim_rate, random span sampling) to `cppmega_mlx/data/fim.py`. Current local coverage is CPU token permutation only and remains blocked on the tokenizer artifact contract for full use.
+156. Port iFIM data transform (instruction extraction, AST-aware, special token id=45) to `cppmega_mlx/data/ifim.py`. Current local coverage is dependency-free instruction extraction plus token formatting in `cppmega_mlx/data/fim.py`; tree-sitter/AST-aware extraction and dataset/training integration remain open.
+157. Port STP loss (~100 LOC, trivial port) to `cppmega_mlx/training/stp_loss.py`. **Local helper done**: deterministic static triples compute `1 - cosine(h[r]-h[s], h[t]-h[r])`, `T < 3` returns zero, tuple/list layer inputs average scalar losses, and defaults remain opt-in (`λ_STP=0`). Receipt: `./.venv/bin/python -m pytest tests/test_stp_loss.py tests/test_package_exports.py -q --tb=short` → `21 passed`; `./.venv/bin/pyright cppmega_mlx/training/stp_loss.py cppmega_mlx/training/loss.py cppmega_mlx/training/__init__.py tests/test_stp_loss.py` → `0 errors`.
+158. Add STP variants A (single triple, last layer), B (N triples last layer), C (multi-layer averaged) toggles. The local helper covers these deterministic loss surfaces via `n_spans` and tuple/list hidden-state input, but Stream H remains open until integration/parity receipts land.
+159. Wire end-to-end training loss: `L_total = L_NTP + λ_MTP · L_MTP + λ_STP · L_STP`. Current local composition is opt-in helper coverage only; NAM56R/full training-loop integration remains open.
 160. Add per-feature parity tests under `tests/features/` (one file per feature).
 
 ### Stream I — Inference & Generation (161–180)
@@ -499,7 +520,19 @@ Critical path: A → B → C → E → H (features) is the longest single chain,
      - 128 GB + 128 GB future production → AdamW preferred (fits comfortably with ZeRO-1; matches GB10 numerics).
    - **Optional half-day smoke after M0**: one-shot JACCL (TB5) + ring fallback measurement on the 128+48 pair, emit a baseline row in `bench/baselines/m4max_heterogeneous_2node.json`, validate the rig works.
 
-3. **Tokenizer — RESOLVED**: Reuse the existing C++ tokenizer from the GB10 stack. Source: `nanochat/tokenizer.json` (HuggingFace JSON BPE, 65536 vocab, special tokens 4=`<FIM_PREFIX>` / 5=`<FIM_MIDDLE>` / 6=`<FIM_SUFFIX>` / 3=`<EOS>`/EOT / 7=`<FIM_INSTRUCTION>` / 2=`<bos>`). cppmega CUDA loads it via `--tokenizer-type HuggingFaceTokenizer`. The MLX port vendors the JSON artifact and the helper `nanochat/cpp_tokenizer.py` directly. No re-training; no corpus question.
+3. **Tokenizer — M0.1 CLOSED**: The earlier source statement was
+   stale. Local `nanochat/tokenizer.json` is a legacy 32K artifact; local
+   `nanochat/tokenizer_v3.json` is 65K and maps id 7 to `<CODE_START>`.
+   The fixed-token config has the same id-7
+   `<CODE_START>` contract. A read-only GB10 check of
+   `/home/dave/cppmega-root/cpp_tokenizer_hf/tokenizer.json` and
+   `/home/dave/cppmega-root/data/tokenizer/tokenizer.json` found vocab=65536,
+   id7=`<CODE_START>`, id45=`<FIM_INSTRUCTION>`, and the same deployed
+   contract. cppmega CUDA loads a HuggingFace tokenizer directory, and the
+   local artifact contract now follows that deployed id 7=`<CODE_START>`
+   mapping. MLX vendors nanochat's heuristic `CppTokenizer.decode` path and
+   closes M0.1 on Mac-vs-GB10 decode parity receipts rather than impossible HF
+   reversible decode with `decoder=null`.
 
 4. **Parity tolerance — RESOLVED (default carried forward)**: bf16 single matmul `rtol=1e-3, atol=1e-1`; chained `rtol=1e-2, atol=1e-1`; attention/RMSNorm `atol=5e-2`; full-step grad `atol=1e-1`. Matches PyTorch's documented bf16 thresholds.
 

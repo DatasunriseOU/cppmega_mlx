@@ -62,3 +62,24 @@ def test_wrong_special_token_id_fails() -> None:
 
     with pytest.raises(ValueError, match="special token 'EOT' must use id 3, got 9"):
         validate_required_special_token_ids(token_to_id)
+
+
+def test_fim_instruction_string_does_not_satisfy_code_start_artifact_contract() -> None:
+    token_to_id = dict(REQUIRED_SPECIAL_TOKEN_IDS)
+    token_to_id.pop("CODE_START")
+    token_to_id["FIM_INSTRUCTION"] = 7
+
+    with pytest.raises(
+        ValueError, match="missing required special token 'CODE_START'"
+    ):
+        validate_required_special_token_ids(token_to_id)
+
+
+def test_missing_fim_instruction_extension_fails() -> None:
+    token_to_id = dict(REQUIRED_SPECIAL_TOKEN_IDS)
+    token_to_id.pop("FIM_INSTRUCTION")
+
+    with pytest.raises(
+        ValueError, match="missing required special token 'FIM_INSTRUCTION'"
+    ):
+        validate_required_special_token_ids(token_to_id)

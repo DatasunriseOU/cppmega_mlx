@@ -58,6 +58,10 @@ def test_load_cppmega_tokenizer_accepts_exact_m01_contract(tmp_path: Path) -> No
     assert tokenizer.id_for_token("<CODE_START>") == 7
     assert tokenizer.token_for_id(45) == "<FIM_INSTRUCTION>"
     assert tokenizer.id_for_token("<FIM_INSTRUCTION>") == 45
+    assert tokenizer.space_token_id == 46
+    assert tokenizer.nl_token_id == 47
+    assert tokenizer.token_for_id(46) == "<SPACE>"
+    assert tokenizer.token_for_id(47) == "<NL>"
     ids = tokenizer.encode("hello world")
     assert isinstance(ids, list)
     assert all(isinstance(token_id, int) for token_id in ids)
@@ -165,6 +169,41 @@ def test_decode_parity_with_gb10_reference_receipt() -> None:
         assert tokenizer.decode(ref_ids) == ref_decoded, text
 
 
+def test_bpe_split_identifier_decodes_without_spurious_spaces() -> None:
+    """Regression: identifiers split by BPE (e.g. "sum" -> "s","u","m") must
+    decode back as a contiguous identifier. Before the <SPACE>/<NL> redesign,
+    decode produced "int s u m = 5" because the wrapper inserted spaces between
+    every BPE piece. Now spaces only appear when an explicit <SPACE> token
+    (id=46) sits between pieces.
+    """
+
+    tokenizer_path = (
+        Path(__file__).resolve().parents[1]
+        / "cppmega_mlx"
+        / "tokenizer"
+        / "tokenizer.json"
+    )
+    if not tokenizer_path.is_file():
+        pytest.skip("vendored tokenizer.json not present")
+
+    tokenizer = load_cppmega_tokenizer(tokenizer_path)
+
+    cases = [
+        ("int sum = 5;", "int sum = 5;"),
+        ("void foo() { return 0; }", "void foo() { return 0; }"),
+        ("int factorial(int n) { return n; }", "int factorial(int n) { return n; }"),
+        ("a\nb", "a\nb"),
+        ("tab\there", "tab here"),  # tab collapses to a single space
+        ("  multi   space\n\nblank", " multi space\nblank"),  # WS runs collapse
+    ]
+    for original, expected in cases:
+        ids = tokenizer.encode(original)
+        decoded = tokenizer.decode(ids)
+        assert decoded == expected, (
+            f"input={original!r}\n  expected={expected!r}\n  got={decoded!r}"
+        )
+
+
 def test_nanochat_v3_fixed_tokens_config_matches_special_id_contract() -> None:
     config_path = NANOCHAT_ROOT / "config" / "tokenizer_v3_fixed_tokens.json"
     if not config_path.is_file():
@@ -181,3 +220,5 @@ def test_nanochat_v3_fixed_tokens_config_matches_special_id_contract() -> None:
     assert special_tokens["<FIM_SUFFIX>"] == 6
     assert special_tokens["<CODE_START>"] == 7
     assert special_tokens["<FIM_INSTRUCTION>"] == 45
+    assert special_tokens["<SPACE>"] == 46
+    assert special_tokens["<NL>"] == 47

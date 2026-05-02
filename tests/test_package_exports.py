@@ -122,11 +122,16 @@ def test_package_roots_expose_local_mlx_contracts() -> None:
         "save_checkpoint",
         "load_checkpoint",
         "next_token_cross_entropy",
+        "next_token_cross_entropy_with_stp",
         "describe_mlx_lm_trainer_apis",
         "require_supported_mlx_lm_trainer_integration",
         "STRUCTURE_FIELD_NAMES",
         "HotspotEvidence",
         "require_kernel_hotspot_evidence",
+        "compute_stp_loss",
+        "next_token_and_stp_loss",
+        "STPLossConfig",
+        "STPLossMetrics",
     } <= _assert_public_exports(training)
     assert {
         "MetalKernelStatus",
@@ -154,7 +159,10 @@ def test_data_root_reexports_fim_transform_and_tokenizer_contract() -> None:
         "FIM_PREFIX": 4,
         "FIM_MIDDLE": 5,
         "FIM_SUFFIX": 6,
-        "FIM_INSTRUCTION": 7,
+        "CODE_START": 7,
+        "FIM_INSTRUCTION": 45,
+        "SPACE": 46,
+        "NL": 47,
     }
 
 

@@ -11,11 +11,14 @@ from cppmega_mlx.recipes.model_factory import (
     LOCAL_GB10_QUARTER_PATTERN,
     MTPProfile,
     ModelFactoryProfile,
+    TokenizerContractStatus,
     build_local_gb10_quarter_tiny_smoke_model,
     forward_has_finite_logits,
     get_model_profile,
+    local_gb10_quarter,
     local_gb10_quarter_profile,
 )
+from cppmega_mlx.tokenizer import TokenizerContractError
 
 
 def test_local_gb10_quarter_profile_matches_m0_2_contract_without_allocation() -> None:
@@ -31,6 +34,21 @@ def test_local_gb10_quarter_profile_matches_m0_2_contract_without_allocation() -
     assert profile.pattern == LOCAL_GB10_QUARTER_PATTERN == "AEMEAEMEAEMR"
     assert profile.dsa_a_layer_ranks == LOCAL_GB10_QUARTER_DSA_A_LAYER_RANKS == (1, 2, 3)
     assert profile.mtp == MTPProfile(depth=2, beta=0.6, loss_weight=0.3)
+    assert profile.tokenizer_contract.expected_vocab_size == 65_536
+    assert profile.tokenizer_contract.required_special_tokens == (
+        ("<BOS>", 2),
+        ("<EOS>", 3),
+        ("<FIM_PREFIX>", 4),
+        ("<FIM_MIDDLE>", 5),
+        ("<FIM_SUFFIX>", 6),
+        ("<CODE_START>", 7),
+        ("<FIM_INSTRUCTION>", 45),
+        ("<SPACE>", 46),
+        ("<NL>", 47),
+    )
+    assert profile.tokenizer_contract.milestone == "M0.1"
+    assert profile.tokenizer_contract.blocker_id == "cppmega-mlx-t8f.1"
+    assert profile.tokenizer_contract.is_resolved is True
     assert profile.expanded_pattern.source_pattern == "AEMEAEMEAEMR"
     assert "".join(profile.expanded_pattern.symbols) == "AEMEAEMEAEMRA"
     assert profile.expanded_pattern.dsa_layer_numbers == (5, 9, 13)
@@ -56,6 +74,34 @@ def test_local_gb10_quarter_builds_valid_existing_configs_without_model_allocati
     assert hybrid.vocab_size == profile.vocab_size
     assert hybrid.max_seq_length == 4096
     assert get_model_profile("local_gb10_quarter") == profile
+
+
+def test_full_local_gb10_quarter_factory_honors_explicit_unresolved_tokenizer_override() -> None:
+    unresolved = TokenizerContractStatus(
+        resolved=False,
+        reason="synthetic unresolved tokenizer contract for regression coverage",
+    )
+    profile = local_gb10_quarter_profile(tokenizer_contract=unresolved)
+
+    with pytest.raises(
+        TokenizerContractError,
+        match="M0\\.1.*cppmega-mlx-t8f\\.1.*synthetic unresolved",
+    ):
+        profile.build_model(
+            hidden_size=16,
+            num_attention_heads=4,
+            max_seq_length=512,
+            vocab_size=64,
+        )
+
+    with pytest.raises(TokenizerContractError, match="M0\\.1.*cppmega-mlx-t8f\\.1"):
+        local_gb10_quarter(
+            tokenizer_contract=unresolved,
+            hidden_size=16,
+            num_attention_heads=4,
+            max_seq_length=512,
+            vocab_size=64,
+        )
 
 
 def test_model_factory_validation_fails_closed_for_invalid_combos() -> None:
@@ -128,3 +174,42 @@ def test_profile_dataclass_rejects_unsupported_model_kind() -> None:
             dsa_a_layer_ranks=(0,),
             model_kind="dense",  # type: ignore[arg-type]
         )
+
+
+def test_resolved_tokenizer_contract_allows_explicit_tiny_allocation() -> None:
+    profile = local_gb10_quarter_profile(
+        depth=1,
+        pattern="A",
+        dsa_a_layer_ranks=(0,),
+        tokenizer_contract=TokenizerContractStatus(resolved=True),
+    )
+
+    model = profile.build_model(
+        vocab_size=64,
+        hidden_size=16,
+        num_attention_heads=4,
+        max_seq_length=512,
+        moe_num_experts=4,
+        moe_top_k=2,
+        moe_expert_hidden_size=32,
+        moe_shared_expert_hidden_size=16,
+        mamba_expand=1,
+        mamba_head_dim=4,
+        mamba_state_dim=4,
+        mamba_groups=1,
+        mamba_mimo_rank=1,
+        mamba_is_mimo=False,
+        mamba_chunk_size=8,
+        m2rnn_k_head_dim=4,
+        m2rnn_v_head_dim=4,
+        m2rnn_num_q_heads=1,
+        m2rnn_num_k_heads=1,
+        m2rnn_num_v_heads=1,
+        m2rnn_num_f_heads=1,
+        m2rnn_num_weight_heads=1,
+        m2rnn_chunk_size=8,
+    )
+
+    assert model.config.vocab_size == 64
+    assert model.config.hidden_size == 16
+    assert model.config.depth == 1

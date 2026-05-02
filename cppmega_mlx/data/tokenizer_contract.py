@@ -10,7 +10,10 @@ REQUIRED_SPECIAL_TOKEN_IDS: dict[str, int] = {
     "FIM_PREFIX": 4,
     "FIM_MIDDLE": 5,
     "FIM_SUFFIX": 6,
-    "FIM_INSTRUCTION": 7,
+    "CODE_START": 7,
+    "FIM_INSTRUCTION": 45,
+    "SPACE": 46,
+    "NL": 47,
 }
 
 SpecialTokenMapping = Mapping[int, str] | Mapping[str, int]

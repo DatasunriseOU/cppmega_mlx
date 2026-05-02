@@ -8,6 +8,7 @@ nearby nanochat tokenizer with different reserved IDs.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Any
@@ -21,7 +22,16 @@ EXPECTED_SPECIAL_TOKENS: dict[str, int] = {
     "<FIM_SUFFIX>": 6,
     "<CODE_START>": 7,
     "<FIM_INSTRUCTION>": 45,
+    "<SPACE>": 46,
+    "<NL>": 47,
 }
+
+
+# Whitespace normalization: collapse runs to a single sentinel token so that
+# BPE-split identifiers (e.g., "sum" -> "s","u","m") decode without spurious
+# inter-token spaces. Encode normalizes; decode replaces sentinels back.
+_WS_RUN_RE = re.compile(r"[ \t]+")
+_NL_RUN_RE = re.compile(r"[\r\n]+")
 
 
 class TokenizerContractError(ValueError):
@@ -36,9 +46,8 @@ class CppMegaTokenizer:
         self.path = path
         self._vocab: dict[str, int] = dict(tokenizer.get_vocab())
         self._id_to_token = {token_id: token for token, token_id in self._vocab.items()}
-        from cppmega_mlx.tokenizer._nanochat_decoder import CppTokenizer as _NanochatDecoder
-
-        self._decoder: Any = _NanochatDecoder(str(path))
+        self._space_token_id = EXPECTED_SPECIAL_TOKENS["<SPACE>"]
+        self._nl_token_id = EXPECTED_SPECIAL_TOKENS["<NL>"]
 
     @property
     def vocab_size(self) -> int:
@@ -72,8 +81,23 @@ class CppMegaTokenizer:
     def fim_instruction_id(self) -> int:
         return EXPECTED_SPECIAL_TOKENS["<FIM_INSTRUCTION>"]
 
+    @property
+    def space_token_id(self) -> int:
+        return self._space_token_id
+
+    @property
+    def nl_token_id(self) -> int:
+        return self._nl_token_id
+
     def get_vocab_size(self) -> int:
         return self.vocab_size
+
+    @staticmethod
+    def _normalize_whitespace(text: str) -> str:
+        """Collapse whitespace runs to ``<SPACE>``/``<NL>`` sentinel tokens."""
+        text = _NL_RUN_RE.sub("<NL>", text)
+        text = _WS_RUN_RE.sub("<SPACE>", text)
+        return text
 
     def encode(
         self,
@@ -86,27 +110,36 @@ class CppMegaTokenizer:
         append_id = self._resolve_optional_token(append)
 
         if isinstance(text, str):
-            ids = list(self._tokenizer.encode(text).ids)
+            normalized = self._normalize_whitespace(text)
+            ids = list(self._tokenizer.encode(normalized).ids)
             return self._with_optional_tokens(ids, prepend_id, append_id)
         if isinstance(text, Sequence):
-            rows = [list(encoded.ids) for encoded in self._tokenizer.encode_batch(list(text))]
+            normalized_batch = [self._normalize_whitespace(t) for t in text]
+            rows = [
+                list(encoded.ids)
+                for encoded in self._tokenizer.encode_batch(normalized_batch)
+            ]
             return [
                 self._with_optional_tokens(row, prepend_id, append_id) for row in rows
             ]
         raise TypeError(f"text must be str or sequence[str], got {type(text).__name__}")
 
     def encode_batch(self, texts: Sequence[str]) -> list[list[int]]:
-        return [list(encoded.ids) for encoded in self._tokenizer.encode_batch(list(texts))]
+        normalized = [self._normalize_whitespace(t) for t in texts]
+        return [list(encoded.ids) for encoded in self._tokenizer.encode_batch(normalized)]
 
     def decode(self, ids: Iterable[int]) -> str:
-        """Decode IDs via the vendored nanochat C++-aware heuristic.
+        """Decode IDs by simple concat then replacing ``<SPACE>``/``<NL>`` sentinels.
 
-        Byte-identical to nanochat ``CppTokenizer.decode`` so MLX inference,
-        FIM transforms, and RL reward parsing produce the same strings as
-        the CUDA reference for any given ID stream.
+        The encoder substitutes whitespace runs with ``<SPACE>``/``<NL>`` tokens so
+        that BPE-split identifiers decode without spurious inter-token spaces.
+        Byte-exact for any input whose internal whitespace runs are at most a
+        single space or single newline (longer runs are collapsed by the
+        normalizer). Matches the CUDA-side ``nanochat.cpp_tokenizer`` decode.
         """
-
-        return str(self._decoder.decode(list(ids)))
+        parts = [self._id_to_token.get(int(i), "") for i in ids]
+        s = "".join(parts)
+        return s.replace("<SPACE>", " ").replace("<NL>", "\n")
 
     def token_for_id(self, token_id: int) -> str | None:
         return self._id_to_token.get(token_id)
