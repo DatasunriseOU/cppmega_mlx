@@ -193,14 +193,14 @@ def test_parquet_smoke_reports_local_ingress_contract(tmp_path: Path) -> None:
     assert payload["dataset"]["parquet_receipt"]["token_source"] == {
         "mode": "token_column",
         "column": "token_ids",
-        "type": "large_list<item: uint32>",
+        "type": "large_list<element: uint32>",
     }
     assert payload["dataset"]["parquet_receipt"]["side_channel_sources"] == {}
     assert payload["dataset"]["parquet_receipt"]["skipped_side_channel_columns"] == [
         {
             "field": "structure_ids",
             "column": "structure_ids",
-            "type": "large_list<item: int8>",
+            "type": "large_list<element: int8>",
             "reason": "not_token_aligned",
         }
     ]

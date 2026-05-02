@@ -98,6 +98,7 @@ class HybridTinyConfig:
     ngram_hash_embed_dim: int = 16
     ngram_hash_dropout: float = 0.0
     ngram_hash_seed: int | None = None
+    grad_checkpoint: bool = False
 
     def __post_init__(self) -> None:
         if self.vocab_size < 2:
@@ -444,8 +445,12 @@ class HybridTinyLM(nn.Module):
                     causal=True,
                     expand_heads=True,
                 )
-        for layer in self.layers:
-            hidden_states = layer(hidden_states, mask)
+        if self.config.grad_checkpoint:
+            for layer in self.layers:
+                hidden_states = mx.checkpoint(layer)(hidden_states, mask)
+        else:
+            for layer in self.layers:
+                hidden_states = layer(hidden_states, mask)
         return self.lm_head(self.norm(hidden_states))
 
 

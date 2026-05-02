@@ -100,6 +100,7 @@ class TrainHybridTinyConfig:
     ngram_hash_dropout: float = 0.0
     ngram_hash_seed: int | None = None
     include_structure: bool = True
+    grad_checkpoint: bool = False
     shuffle: bool = False
     token_key: str = "tokens"
     valid_npz_path: str | None = None
@@ -286,6 +287,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=TrainHybridTinyConfig.seed)
     parser.add_argument("--shuffle", action="store_true")
     parser.add_argument("--no-structure", action="store_true")
+    parser.add_argument(
+        "--grad-checkpoint",
+        action="store_true",
+        help="Wrap each block forward in mx.checkpoint to trade compute for memory.",
+    )
     compile_group = parser.add_mutually_exclusive_group()
     compile_group.add_argument(
         "--compile",
@@ -427,6 +433,7 @@ def config_from_args(args: argparse.Namespace) -> TrainHybridTinyConfig:
         ngram_hash_dropout=args.ngram_hash_dropout,
         ngram_hash_seed=args.ngram_hash_seed,
         include_structure=not args.no_structure,
+        grad_checkpoint=args.grad_checkpoint,
         shuffle=args.shuffle,
         token_key=args.token_key,
         valid_npz_path=args.valid_npz_path,
@@ -670,6 +677,7 @@ def hybrid_model_config(
         ngram_hash_embed_dim=config.ngram_hash_embed_dim,
         ngram_hash_dropout=config.ngram_hash_dropout,
         ngram_hash_seed=config.ngram_hash_seed,
+        grad_checkpoint=config.grad_checkpoint,
     )
 
 
