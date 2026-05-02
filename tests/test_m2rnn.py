@@ -381,7 +381,7 @@ def test_larger_direct_scan_state_continuation_matches_full_run() -> None:
     _assert_close(suffix_h, full_h, atol=2e-5)
 
 
-def test_lightweight_mixer_h0_continuation_matches_full_run() -> None:
+def test_lightweight_mixer_state_continuation_matches_full_run() -> None:
     mx.random.seed(88)
     cfg = _stress_mixer_config()
     mixer = M2RNNMixer(cfg)
@@ -450,9 +450,24 @@ def test_lightweight_mixer_state_carries_projected_conv_history() -> None:
         h0=prefix_state.h,
         chunk_size=4,
     )
-    mx.eval(prefix_out, suffix_out, suffix_state.h, expected_prefix, expected_prefix_h, expected_suffix_h)
+    projected_conv = mixer.in_proj(hidden)[:, :, : mixer.conv_dim]
+    history_len = cfg.conv_kernel - 1
+    expected_prefix_conv_state = projected_conv[:, split - history_len : split, :]
+    expected_suffix_conv_state = projected_conv[:, -history_len:, :]
+    mx.eval(
+        prefix_out,
+        suffix_out,
+        suffix_state.h,
+        expected_prefix,
+        expected_prefix_h,
+        expected_suffix_h,
+        expected_prefix_conv_state,
+        expected_suffix_conv_state,
+    )
 
     assert prefix_state.conv_state.shape == (2, cfg.conv_kernel - 1, mixer.conv_dim)
+    _assert_close(prefix_state.conv_state, expected_prefix_conv_state, atol=3e-5)
+    _assert_close(suffix_state.conv_state, expected_suffix_conv_state, atol=3e-5)
     _assert_close(prefix_state.h, expected_prefix_h, atol=3e-5)
     _assert_close(suffix_state.h, expected_suffix_h, atol=3e-5)
 

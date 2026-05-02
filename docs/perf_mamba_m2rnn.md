@@ -218,10 +218,10 @@ v_head_dim head vectors along a head axis.
 The M2RNN h0 seam is recurrence state only. It guarantees split equivalence
 for m2rnn_scan and chunked_m2rnn_scan, where q/k/v/xf are already formed,
 and for the lightweight mixer only when there is no causal-conv history to carry
-(conv_kernel=1). With conv_kernel > 1, full hidden-state split equivalence
-would require a separate q/k/v causal-conv tail cache; the local mixer currently
-matches the sibling Megatron training seam by recomputing suffix convolution
-with fresh left padding instead of accepting an inference cache.
+(conv_kernel=1). With conv_kernel > 1, callers need the explicit
+M2RNNMixerState path, which carries both recurrent h and projected q/k/v
+causal-conv history for segmented continuation. Passing only h0 still does not
+claim arbitrary hidden-state split equivalence when convolution history matters.
 
 No fused Metal M2RNN kernel was added in this slice. MLX exposes custom Metal
 kernels, but a training-safe recurrent kernel would need a matching backward

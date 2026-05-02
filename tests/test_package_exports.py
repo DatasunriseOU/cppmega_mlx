@@ -12,8 +12,22 @@ import cppmega_mlx.nn.m2rnn as m2rnn
 import cppmega_mlx as package
 import cppmega_mlx.recipes as recipes
 import cppmega_mlx.training as training
+from cppmega_mlx.data import fim as fim_module
 
 PACKAGE_ROOTS = (package, config, data, kernels, models, nn, recipes, training)
+FIM_DATA_EXPORTS = {
+    "EOT_ID",
+    "FIMMode",
+    "FIM_MIDDLE_ID",
+    "FIM_PREFIX_ID",
+    "FIM_SUFFIX_ID",
+    "REQUIRED_SPECIAL_TOKEN_IDS",
+    "SpecialTokenMapping",
+    "apply_fim_permutation",
+    "apply_fim_transform",
+    "sample_middle_span",
+    "validate_required_special_token_ids",
+}
 FOREIGN_RUNTIME_ALIASES = {
     "CudaGraphTrainer",
     "DifferentiableMetalKernel",
@@ -91,7 +105,7 @@ def test_package_roots_expose_local_mlx_contracts() -> None:
         "MegatronIndexedDataset",
         "open_megatron_indexed_dataset",
         "megatron_indexed_side_channel_schema",
-    } <= _assert_public_exports(data)
+    } | FIM_DATA_EXPORTS <= _assert_public_exports(data)
     assert {
         "Mamba3CacheState",
         "Mamba3ReferenceBlock",
@@ -124,6 +138,41 @@ def test_package_roots_expose_local_mlx_contracts() -> None:
     } <= _assert_public_exports(kernels)
 
 
+def test_data_root_reexports_fim_transform_and_tokenizer_contract() -> None:
+    exports = _assert_public_exports(data)
+
+    assert FIM_DATA_EXPORTS <= exports
+    assert data.apply_fim_permutation is fim_module.apply_fim_permutation
+    assert data.apply_fim_transform is fim_module.apply_fim_transform
+    assert data.sample_middle_span is fim_module.sample_middle_span
+    assert data.FIM_PREFIX_ID == 4
+    assert data.FIM_MIDDLE_ID == 5
+    assert data.FIM_SUFFIX_ID == 6
+    assert data.REQUIRED_SPECIAL_TOKEN_IDS == {
+        "BOS": 2,
+        "EOT": 3,
+        "FIM_PREFIX": 4,
+        "FIM_MIDDLE": 5,
+        "FIM_SUFFIX": 6,
+        "FIM_INSTRUCTION": 7,
+    }
+
+
+def test_data_wildcard_import_includes_fim_reference_exports() -> None:
+    namespace: dict[str, object] = {}
+
+    exec("from cppmega_mlx.data import *", {}, namespace)
+
+    for name in FIM_DATA_EXPORTS:
+        assert name in namespace
+    assert namespace["apply_fim_transform"] is data.apply_fim_transform
+    assert namespace["FIM_PREFIX_ID"] == 4
+    assert namespace["FIM_MIDDLE_ID"] == 5
+    assert namespace["FIM_SUFFIX_ID"] == 6
+    assert namespace["EOT_ID"] == 3
+    assert namespace["REQUIRED_SPECIAL_TOKEN_IDS"] is data.REQUIRED_SPECIAL_TOKEN_IDS
+
+
 def test_nn_root_reexports_public_m2rnn_api() -> None:
     m2rnn_exports = _assert_public_exports(m2rnn)
     nn_exports = _assert_public_exports(nn)
@@ -135,6 +184,14 @@ def test_training_root_does_not_export_foreign_trainers_or_generic_evaluate() ->
     exports = _assert_public_exports(training)
     assert FOREIGN_RUNTIME_ALIASES.isdisjoint(exports)
     for name in FOREIGN_RUNTIME_ALIASES:
+        assert not hasattr(training, name), name
+
+
+def test_fim_reference_transform_stays_data_only_not_training_integration() -> None:
+    training_exports = _assert_public_exports(training)
+
+    assert FIM_DATA_EXPORTS.isdisjoint(training_exports)
+    for name in FIM_DATA_EXPORTS:
         assert not hasattr(training, name), name
 
 

@@ -156,6 +156,8 @@ def test_help_lists_npz_training_flags() -> None:
     assert "--valid-dataset-path" in result.stdout
     assert "--valid-dataset-format" in result.stdout
     assert "--eval-batches" in result.stdout
+    assert "--memory-limit-total-bytes" in result.stdout
+    assert "--apply-memory-limit-plan" in result.stdout
     assert "--dry-run-json" in result.stdout
 
 
@@ -551,6 +553,54 @@ def test_dry_run_json_reports_validation_eval_plan(tmp_path: Path) -> None:
     assert payload["evaluation"]["dataset"]["path"] == str(valid_npz_path)
     assert payload["evaluation"]["requested_batches"] == 2
     assert payload["evaluation"]["planned_batches"] == 2
+
+
+def test_dry_run_json_reports_memory_limit_plan_without_applying(
+    tmp_path: Path,
+) -> None:
+    npz_path = tmp_path / "tokens.npz"
+    write_npz(npz_path, vocab_size=32)
+
+    result = run_script(
+        str(npz_path),
+        "--dry-run-json",
+        "--batch-size",
+        "2",
+        "--seq-len",
+        "4",
+        "--steps",
+        "1",
+        "--dtype",
+        "float32",
+        "--hidden-size",
+        "8",
+        "--num-heads",
+        "1",
+        "--ffn-hidden-size",
+        "16",
+        "--memory-limit-total-bytes",
+        "1000",
+        "--memory-limit-wired-ratio",
+        "0.5",
+        "--memory-limit-metal-ratio",
+        "0.75",
+        "--apply-memory-limit-plan",
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    memory_limit = payload["memory_limit"]
+    assert memory_limit["mode"] == "planned"
+    assert memory_limit["apply_requested"] is True
+    assert memory_limit["applied"] is False
+    assert memory_limit["total_bytes_source"] == "cli"
+    assert memory_limit["plan"] == {
+        "metal_limit_bytes": 750,
+        "metal_ratio": 0.75,
+        "total_bytes": 1000,
+        "wired_limit_bytes": 500,
+        "wired_ratio": 0.5,
+    }
 
 
 def test_dry_run_json_reports_full_validation_side_channel_plan(

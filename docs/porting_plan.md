@@ -163,35 +163,53 @@ Current decision after the 2026-04-30 MLX/Metal research refresh:
 
 The current collected test files are:
 
+- tests/test_archive_bench_baseline_script.py
 - tests/test_attention.py
+- tests/test_bench_baselines.py
 - tests/test_bench_matrix.py
 - tests/test_bench_script.py
+- tests/test_check_environment_script.py
 - tests/test_checkpoint.py
 - tests/test_compare_bench_rows.py
 - tests/test_compiled_train.py
 - tests/test_config.py
 - tests/test_cppmega_parity_anchors.py
+- tests/test_data_pipeline_doc.py
+- tests/test_data_smoke_script.py
+- tests/test_env_runtime.py
 - tests/test_eval.py
 - tests/test_external_research_contract.py
+- tests/test_fim_transform.py
 - tests/test_hybrid_lm.py
 - tests/test_hybrid_lm_gradients.py
+- tests/test_lint_mlx.py
 - tests/test_m2rnn.py
 - tests/test_mamba3.py
 - tests/test_megatron_indexed.py
+- tests/test_memory_runtime.py
 - tests/test_metal_ops.py
 - tests/test_mlx_lm_adapter.py
 - tests/test_moe.py
 - tests/test_nam56r_pattern.py
 - tests/test_ngram_hash.py
 - tests/test_package_exports.py
+- tests/test_parity_manifest.py
 - tests/test_parquet_dataset.py
 - tests/test_profile.py
+- tests/test_profile_capture_script.py
+- tests/test_pytest_markers.py
 - tests/test_real_parquet_samples.py
+- tests/test_runtime_exports.py
+- tests/test_seed_runtime.py
+- tests/test_sequence_packing.py
 - tests/test_structure_embedding.py
+- tests/test_system_requirements_doc.py
 - tests/test_tiny_train.py
 - tests/test_token_dataset.py
+- tests/test_tokenizer_contract.py
 - tests/test_train_hybrid_tiny_script.py
 - tests/test_train_tiny_npz_script.py
+- tests/test_training_exports.py
 
 ## Wave-Next Work
 
@@ -199,9 +217,11 @@ The current collected test files are:
    Mamba3 and M2RNN checkpoint save/resume, validation-loop, and structure
    side-channel variants now have local script-path receipts; keep them as
    regression lanes rather than next-work placeholders.
-2. Raise the hybrid tiny smoke from "blocks instantiate and train" to "A/M/E/R
-   route semantics are regression-locked." Add route-specific loss/gradient
-   checks before increasing dimensions.
+2. Keep the hybrid tiny A/M/E/R route-semantics regression lanes green before
+   increasing dimensions. Current coverage includes single-route loss,
+   route-specific gradients, route-specific optimizer updates, and mixed-route
+   eager/compiled train-step checks; future growth should extend those
+   contracts rather than replacing them with shape-only smoke tests.
 3. Extend the data handoff path from fixed-shape NPZ and optional Parquet token
    shards to the standalone MegatronIndexedDataset seam. Tiny CLI/training
    ingress is wired through scripts/train_tiny_npz.py --dataset-format

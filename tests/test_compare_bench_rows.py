@@ -1265,7 +1265,57 @@ def test_receipt_only_parquet_data_contract_mismatch_blocks_match(tmp_path: Path
     refusal = payload["unmatched_pairs"][0]
     assert refusal["reason"] == "matched_comparison_key_mismatch"
     assert {field["field"] for field in refusal["mismatched_fields"]} == {"data_contract"}
+    assert "ratios" not in refusal
     assert payload["comparisons"] == []
+
+
+def test_package_dir_keeps_parquet_contract_refusal_ratio_free(tmp_path: Path) -> None:
+    input_path = tmp_path / "receipt-only-parquet-mismatch.json"
+    package_dir = tmp_path / "parquet_refused_package"
+    input_path.write_text(
+        json.dumps(
+            {
+                "cases": [
+                    receipt_only_row("M4 Max", data_contract="synthetic_tokens"),
+                    receipt_only_row("GB10", data_contract="parquet_clang_v10_code"),
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_compare(
+        "--input",
+        str(input_path),
+        "--package-dir",
+        str(package_dir),
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "no_matching_rows"
+    assert payload["compare_package"]["matched_comparison_count"] == 0
+    assert payload["compare_package"]["unmatched_pair_count"] == 1
+    assert payload["compare_package"]["parity_claim_refused"] is True
+
+    report = json.loads((package_dir / "compare_report.json").read_text(encoding="utf-8"))
+    assert report["comparisons"] == []
+    assert report["unmatched_pair_count"] == 1
+    assert "ratios" not in report["unmatched_pairs"][0]
+
+    assert (package_dir / "matched_comparisons.jsonl").read_text(encoding="utf-8") == ""
+    refused_rows = [
+        json.loads(line)
+        for line in (package_dir / "refused_pairs.jsonl").read_text(
+            encoding="utf-8"
+        ).splitlines()
+    ]
+    assert len(refused_rows) == 1
+    refusal = refused_rows[0]
+    assert refusal["status"] == "unmatched"
+    assert refusal["parity_claim_refused"] is True
+    assert {field["field"] for field in refusal["mismatched_fields"]} == {"data_contract"}
+    assert "ratios" not in refusal
 
 
 def test_receipt_only_software_mismatch_blocks_match(tmp_path: Path) -> None:

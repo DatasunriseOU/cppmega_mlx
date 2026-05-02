@@ -25,3 +25,10 @@ include = ["cppmega_mlx*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = [
+    "parity: equivalence checks against reference cppmega or documented parity anchors",
+    "kernel: MLX kernel, compilation, profiling, and adoption-gate coverage",
+    "training: training-loop, optimizer, checkpoint, and dataset-ingress coverage",
+    "bench: benchmark scripts, benchmark receipts, and comparison-policy coverage",
+    "distributed: distributed-training boundary checks and fail-closed parity guards",
+]

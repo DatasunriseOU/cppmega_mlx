@@ -11,6 +11,7 @@ from mlx.utils import tree_flatten
 from cppmega_mlx.data.batch import synthetic_token_batch
 from cppmega_mlx.models.hybrid_lm import HybridTinyConfig, HybridTinyLM
 from cppmega_mlx.models.tiny_lm import TinyLM, TinyLMConfig
+from cppmega_mlx.runtime.seed import capture_rng_state
 from cppmega_mlx.training.checkpoint import (
     FORMAT_NAME,
     FORMAT_VERSION,
@@ -537,6 +538,24 @@ def test_checkpoint_rng_seed_and_single_file_sharding_metadata_roundtrip(tmp_pat
         "index": None,
         "source": "cppmega_mlx.training.checkpoint",
     }
+
+
+def test_checkpoint_fails_closed_for_local_rng_snapshot_metadata(tmp_path) -> None:
+    config = _tiny_config()
+    rng_snapshot = capture_rng_state()
+    save_path = tmp_path / "save-local-rng-snapshot"
+
+    with pytest.raises(ValueError, match="unsupported rng fields"):
+        save_checkpoint(TinyLM(config), save_path, metadata={"rng": rng_snapshot})
+
+    assert not (save_path / WEIGHTS_NAME).exists()
+
+    load_path = tmp_path / "load-local-rng-snapshot"
+    save_checkpoint(TinyLM(config), load_path)
+    _rewrite_manifest(load_path, lambda manifest: manifest.update({"rng": rng_snapshot}))
+
+    with pytest.raises(ValueError, match="unsupported rng fields"):
+        load_checkpoint(TinyLM(config), load_path)
 
 
 @pytest.mark.parametrize(

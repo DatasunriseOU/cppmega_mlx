@@ -33,6 +33,10 @@ try:
     from cppmega_mlx.data.batch import LMTokenBatch, synthetic_token_batch  # noqa: E402
     from cppmega_mlx.models.hybrid_lm import HybridTinyConfig, HybridTinyLM  # noqa: E402
     from cppmega_mlx.models.tiny_lm import TinyLM, TinyLMConfig  # noqa: E402
+    from cppmega_mlx.runtime.memory import (  # noqa: E402
+        apply_memory_limit_plan,
+        memory_limit_plan,
+    )
     from cppmega_mlx.training.loss import next_token_cross_entropy  # noqa: E402
     from cppmega_mlx.training.profile import (  # noqa: E402
         MemorySnapshot,
@@ -46,6 +50,8 @@ except Exception:  # pragma: no cover - exercised only in partial lane checkouts
     MemorySnapshot = None
     TinyLM = None
     TinyLMConfig = None
+    apply_memory_limit_plan = None
+    memory_limit_plan = None
     profile_context = None
     profile_step = None
     synthetic_token_batch = None
@@ -77,6 +83,7 @@ LOCAL_ONLY_RECEIPT_POLICY = (
     "comparison_key.workload and comparison_key.software values."
 )
 SINGLE_HOST_PARITY_POLICY = "No GB10 parity claim from a single-host row."
+AUTO_WIRED_METAL_RATIO = 0.85
 
 
 @dataclass(frozen=True)
@@ -653,29 +660,42 @@ def _optional_int(value: Any) -> int | None:
     return None if value is None else int(value)
 
 
-def wired_limit_report(config: BenchConfig, *, apply: bool) -> dict[str, Any]:
+def wired_limit_report(
+    config: BenchConfig,
+    *,
+    apply: bool,
+    mx_module: Any | None = None,
+) -> dict[str, Any]:
+    mx_target = mx_module or mx
     limits = device_memory_limits()
     if config.wired_limit_bytes is not None:
         mode = "explicit"
         requested = config.wired_limit_bytes
+        plan_total = None
     elif config.auto_wired_limit:
         mode = "auto_max_recommended"
         requested = limits["max_recommended_working_set_size_bytes"]
+        plan_total = limits["memory_size_bytes"]
     else:
         mode = "off"
         requested = None
+        plan_total = None
 
     report: dict[str, Any] = {
         "mode": mode,
         "requested_bytes": requested,
         "applied_bytes": None,
         "previous_bytes": None,
+        "metal_limit_bytes": None,
+        "previous_metal_limit_bytes": None,
         "applied": False,
-        "available": hasattr(mx, "set_wired_limit") and metal_is_available(),
+        "available": hasattr(mx_target, "set_wired_limit") and metal_is_available(),
         "memory_size_bytes": limits["memory_size_bytes"],
         "max_recommended_working_set_size_bytes": limits[
             "max_recommended_working_set_size_bytes"
         ],
+        "helper": "cppmega_mlx.runtime.memory",
+        "memory_limit_plan": None,
         "error": None,
     }
     if mode == "off":
@@ -695,10 +715,35 @@ def wired_limit_report(config: BenchConfig, *, apply: bool) -> dict[str, Any]:
     if not report["available"]:
         report["error"] = "MLX wired limit is unavailable on this backend"
         return report
+    if (
+        requested > 0
+        and memory_limit_plan is not None
+        and apply_memory_limit_plan is not None
+    ):
+        if plan_total is None:
+            plan_total = limits["memory_size_bytes"] or requested + 1
+        plan = memory_limit_plan(
+            plan_total,
+            wired_ratio=requested / plan_total,
+            metal_ratio=min(AUTO_WIRED_METAL_RATIO, 1 - (1 / plan_total)),
+        )
+        report["memory_limit_plan"] = plan.to_dict()
+        report["metal_limit_bytes"] = plan.metal_limit_bytes
+        if not apply:
+            return report
+        try:
+            applied = apply_memory_limit_plan(plan, mx_module=mx_target, apply=True)
+            report["previous_bytes"] = applied.previous_wired_limit_bytes
+            report["previous_metal_limit_bytes"] = applied.previous_metal_limit_bytes
+            report["applied_bytes"] = plan.wired_limit_bytes
+            report["applied"] = applied.applied
+        except Exception as exc:
+            report["error"] = str(exc)
+        return report
     if not apply:
         return report
     try:
-        report["previous_bytes"] = int(mx.set_wired_limit(requested))
+        report["previous_bytes"] = int(mx_target.set_wired_limit(requested))
         report["applied_bytes"] = requested
         report["applied"] = True
     except Exception as exc:

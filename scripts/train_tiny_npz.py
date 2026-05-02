@@ -33,6 +33,13 @@ from cppmega_mlx.data.token_dataset import (  # noqa: E402
     open_token_dataset,
 )
 from cppmega_mlx.models.tiny_lm import TinyLM, TinyLMConfig  # noqa: E402
+from cppmega_mlx.runtime.memory import (  # noqa: E402
+    DEFAULT_METAL_RATIO,
+    DEFAULT_WIRED_RATIO,
+    apply_memory_limit_plan,
+    device_total_memory_bytes,
+    memory_limit_plan,
+)
 from cppmega_mlx.training.checkpoint import load_checkpoint, save_checkpoint  # noqa: E402
 from cppmega_mlx.training.compiled import CompiledPretrainingStep  # noqa: E402
 from cppmega_mlx.training.eval import EvalMetrics, evaluate_batches  # noqa: E402
@@ -72,6 +79,10 @@ class TrainTinyNpzConfig:
     valid_dataset_path: str | None = None
     valid_dataset_format: TokenDatasetFormat | None = None
     eval_batches: int = 0
+    memory_limit_total_bytes: int | None = None
+    memory_limit_wired_ratio: float = DEFAULT_WIRED_RATIO
+    memory_limit_metal_ratio: float = DEFAULT_METAL_RATIO
+    apply_memory_limit_plan: bool = False
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -174,6 +185,35 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--memory-limit-total-bytes",
+        type=int,
+        default=None,
+        help=(
+            "Plan MLX wired/Metal memory limits from this total byte count. "
+            "Does not apply unless --apply-memory-limit-plan is also set."
+        ),
+    )
+    parser.add_argument(
+        "--memory-limit-wired-ratio",
+        type=float,
+        default=TrainTinyNpzConfig.memory_limit_wired_ratio,
+        help="Wired-limit ratio for --memory-limit-total-bytes planning.",
+    )
+    parser.add_argument(
+        "--memory-limit-metal-ratio",
+        type=float,
+        default=TrainTinyNpzConfig.memory_limit_metal_ratio,
+        help="Metal allocator ratio for --memory-limit-total-bytes planning.",
+    )
+    parser.add_argument(
+        "--apply-memory-limit-plan",
+        action="store_true",
+        help=(
+            "Apply the planned MLX wired and Metal memory limits before training. "
+            "Dry-runs always report the plan without applying it."
+        ),
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="Emit only the metrics JSON object.",
@@ -222,6 +262,10 @@ def config_from_args(args: argparse.Namespace) -> TrainTinyNpzConfig:
         valid_dataset_path=args.valid_dataset_path,
         valid_dataset_format=args.valid_dataset_format,
         eval_batches=args.eval_batches,
+        memory_limit_total_bytes=args.memory_limit_total_bytes,
+        memory_limit_wired_ratio=args.memory_limit_wired_ratio,
+        memory_limit_metal_ratio=args.memory_limit_metal_ratio,
+        apply_memory_limit_plan=args.apply_memory_limit_plan,
     )
 
 
@@ -276,6 +320,13 @@ def validate_config(config: TrainTinyNpzConfig) -> None:
         )
     if config.eval_batches < 0:
         raise ValueError("eval_batches must be >= 0")
+    if config.memory_limit_total_bytes is not None and config.memory_limit_total_bytes <= 0:
+        raise ValueError("memory_limit_total_bytes must be positive")
+    memory_limit_plan(
+        config.memory_limit_total_bytes or 1,
+        wired_ratio=config.memory_limit_wired_ratio,
+        metal_ratio=config.memory_limit_metal_ratio,
+    )
 
 
 def _dataset_path_exists(path: Path) -> bool:
@@ -419,6 +470,55 @@ def compile_payload(config: TrainTinyNpzConfig, device: dict[str, Any]) -> dict[
         else [],
         "fixed_batch_signature": enabled,
         "mlx_disable_compile": device.get("mlx_disable_compile"),
+    }
+
+
+def memory_limit_payload(
+    config: TrainTinyNpzConfig,
+    *,
+    apply: bool,
+    mx_module: Any | None = None,
+) -> dict[str, Any]:
+    should_plan = config.memory_limit_total_bytes is not None or config.apply_memory_limit_plan
+    if not should_plan:
+        return {
+            "mode": "off",
+            "apply_requested": config.apply_memory_limit_plan,
+            "applied": False,
+            "total_bytes_source": None,
+            "plan": None,
+            "previous_wired_limit_bytes": None,
+            "previous_metal_limit_bytes": None,
+        }
+
+    total_bytes = config.memory_limit_total_bytes
+    total_bytes_source = "cli"
+    if total_bytes is None:
+        total_bytes = device_total_memory_bytes(mx_module or mx)
+        total_bytes_source = "mlx.device_info"
+    if total_bytes is None:
+        raise ValueError(
+            "memory_limit_total_bytes is required when MLX device memory_size is unavailable"
+        )
+
+    plan = memory_limit_plan(
+        total_bytes,
+        wired_ratio=config.memory_limit_wired_ratio,
+        metal_ratio=config.memory_limit_metal_ratio,
+    )
+    applied = apply_memory_limit_plan(
+        plan,
+        mx_module=mx_module or mx,
+        apply=apply and config.apply_memory_limit_plan,
+    )
+    return {
+        "mode": "planned",
+        "apply_requested": config.apply_memory_limit_plan,
+        "applied": applied.applied,
+        "total_bytes_source": total_bytes_source,
+        "plan": plan.to_dict(),
+        "previous_wired_limit_bytes": applied.previous_wired_limit_bytes,
+        "previous_metal_limit_bytes": applied.previous_metal_limit_bytes,
     }
 
 
@@ -653,6 +753,7 @@ def evaluation_payload(
 
 def dry_run_payload(config: TrainTinyNpzConfig) -> dict[str, Any]:
     validate_config(config)
+    memory_limit = memory_limit_payload(config, apply=False)
     dataset = make_dataset(config, loop=False)
     vocab_size = resolved_vocab_size(config, dataset)
     validate_dataset_for_training(config, dataset, vocab_size)
@@ -674,6 +775,7 @@ def dry_run_payload(config: TrainTinyNpzConfig) -> dict[str, Any]:
         "compile_plan": compile_plan,
         "dtype": config.dtype,
         "device": device,
+        "memory_limit": memory_limit,
     }
     if eval_dataset is not None:
         payload["evaluation"] = {
@@ -691,6 +793,7 @@ def dry_run_payload(config: TrainTinyNpzConfig) -> dict[str, Any]:
 
 def train_tiny_npz(config: TrainTinyNpzConfig) -> dict[str, Any]:
     validate_config(config)
+    memory_limit = memory_limit_payload(config, apply=True)
     mx.random.seed(config.seed)
 
     resume_metadata: dict[str, Any] | None = None
@@ -862,6 +965,7 @@ def train_tiny_npz(config: TrainTinyNpzConfig) -> dict[str, Any]:
         "model_config": model_config.to_dict(),
         "parameter_count": parameter_count(model),
         "device": device,
+        "memory_limit": memory_limit,
         "steps": config.steps,
         "start_step": resume_step,
         "end_step": final["step"],

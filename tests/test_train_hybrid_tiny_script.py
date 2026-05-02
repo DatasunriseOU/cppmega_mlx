@@ -416,6 +416,8 @@ def test_help_lists_hybrid_training_flags() -> None:
     assert "--valid-dataset-path" in result.stdout
     assert "--valid-dataset-format" in result.stdout
     assert "--eval-batches" in result.stdout
+    assert "--memory-limit-total-bytes" in result.stdout
+    assert "--apply-memory-limit-plan" in result.stdout
 
 
 def test_dry_run_json_reports_synthetic_hybrid_plan() -> None:
@@ -446,6 +448,34 @@ def test_dry_run_json_reports_synthetic_hybrid_plan() -> None:
         "m2rnn": 1,
         "mamba3": 1,
         "moe": 1,
+    }
+
+
+def test_dry_run_json_reports_memory_limit_plan_without_applying() -> None:
+    result = run_script(
+        "--dry-run-json",
+        "--memory-limit-total-bytes",
+        "2000",
+        "--memory-limit-wired-ratio",
+        "0.5",
+        "--memory-limit-metal-ratio",
+        "0.75",
+        "--apply-memory-limit-plan",
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    memory_limit = payload["memory_limit"]
+    assert memory_limit["mode"] == "planned"
+    assert memory_limit["apply_requested"] is True
+    assert memory_limit["applied"] is False
+    assert memory_limit["total_bytes_source"] == "cli"
+    assert memory_limit["plan"] == {
+        "metal_limit_bytes": 1500,
+        "metal_ratio": 0.75,
+        "total_bytes": 2000,
+        "wired_limit_bytes": 1000,
+        "wired_ratio": 0.5,
     }
 
 

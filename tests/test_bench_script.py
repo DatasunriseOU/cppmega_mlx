@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from types import SimpleNamespace
 from pathlib import Path
 
 
@@ -495,3 +496,53 @@ def test_dry_run_reports_explicit_wired_limit_without_applying() -> None:
     assert wired["applied_bytes"] is None
     assert wired["previous_bytes"] is None
     assert wired["applied"] is False
+
+
+def test_wired_limit_report_uses_memory_helper_with_fake_mlx(
+    monkeypatch,
+) -> None:
+    import scripts.bench_tiny as bench
+
+    calls: list[tuple[str, int]] = []
+
+    fake_mx = SimpleNamespace(
+        set_wired_limit=lambda value: calls.append(("wired", value)) or 123,
+        metal=SimpleNamespace(
+            set_memory_limit=lambda value: calls.append(("metal", value)) or 456,
+        ),
+    )
+    monkeypatch.setattr(
+        bench,
+        "device_memory_limits",
+        lambda: {
+            "memory_size_bytes": 1000,
+            "max_recommended_working_set_size_bytes": 700,
+        },
+    )
+    monkeypatch.setattr(bench, "metal_is_available", lambda: True)
+
+    dry = bench.wired_limit_report(
+        bench.BenchConfig(wired_limit_bytes=500),
+        apply=False,
+        mx_module=fake_mx,
+    )
+    assert dry["memory_limit_plan"] == {
+        "metal_limit_bytes": 850,
+        "metal_ratio": 0.85,
+        "total_bytes": 1000,
+        "wired_limit_bytes": 500,
+        "wired_ratio": 0.5,
+    }
+    assert dry["applied"] is False
+    assert calls == []
+
+    applied = bench.wired_limit_report(
+        bench.BenchConfig(wired_limit_bytes=500),
+        apply=True,
+        mx_module=fake_mx,
+    )
+    assert applied["applied"] is True
+    assert applied["applied_bytes"] == 500
+    assert applied["previous_bytes"] == 123
+    assert applied["previous_metal_limit_bytes"] == 456
+    assert calls == [("wired", 500), ("metal", 850)]
