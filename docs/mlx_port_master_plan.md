@@ -42,7 +42,7 @@ This document is a planning synthesis from parallel research lanes (local-code a
 - **Distributed**: `mx.distributed` (ring / JACCL), multi-Mac ZeRO-style sharding.
 - **Sharded checkpoints** (`model.safetensors.index.json`).
 - **Sequence packing** (cumulative-doc-id attention mask).
-- **Tokenizer**: M0.1 is closed. The vendored GB10 BPE artifact and special-token contract exist for vocab=65536 plus deployed id7=`<CODE_START>` and id45=`<FIM_INSTRUCTION>`, and MLX vendors the nanochat heuristic decoder to match the CUDA reference decode path.
+- **Tokenizer**: M0.1 is closed. The vendored GB10 BPE artifact and special-token contract exist for vocab=65536 with id7=`<CODE_START>`, id45=`<FIM_INSTRUCTION>`, id46=`<SPACE>`, id47=`<NL>`. Encode normalizes whitespace runs (`[\r\n]+`->`<NL>`, `[ \t]+`->`<SPACE>`); decode is plain token concat with sentinel substitution. Same wrapper deployed on Mac and gb10/CUDA side.
 - **Inference / generation**: no KV cache class, no sampler, no MTP-aware or FIM-aware decoding.
 - **Quantization**: bf16 only; no `mx.quantize` integration, no q4 inference path.
 - **Structural parity anchors, not CUDA tensor parity**: existing `tests/test_cppmega_parity_anchors.py` checks NAM56R route/layer constants, DSA/MLA layer derivation, vocab/MoE anchors, fail-closed parity wording, and optional sibling cppmega source-anchor presence when that checkout exists. The source-file existence check is only one guard; the test is broader than file-presence coverage, but it still does not compare CUDA golden tensors or prove numerical agreement.
@@ -69,7 +69,7 @@ Full-stack research-grade LLM (40-45K LOC):
   - `ifim.py` (Sun et al. arXiv 2509.24637, Sep 2025: instruction-aware FIM; paper/source proposal only, not the deployed GB10 token-id contract).
   - `stp.py` (Huang/LeCun arXiv 2602.22617, Feb 2026: JEPA geodesic regularization, ~100 LOC).
 - Speculative decoding (acceptance-rejection), EAGLE-2 draft head.
-- Tokenizer/FIM intent is a source reference only: live local/GB10 artifacts use the deployed M0.1 contract documented below (`id7=<CODE_START>`, id45=`<FIM_INSTRUCTION>`), and M0.1 decode parity is covered by the vendored nanochat heuristic decoder rather than HF reversible round-trip decode.
+- Tokenizer/FIM intent is a source reference only: live local/GB10 artifacts use the deployed M0.1 contract documented below (`id7=<CODE_START>`, `id45=<FIM_INSTRUCTION>`, `id46=<SPACE>`, `id47=<NL>`), and M0.1 decode parity is covered by the explicit `<SPACE>`/`<NL>` token redesign rather than HF reversible round-trip decode.
 - Training: pretrain + midtrain + SFT + RL via Muon/AdamW, FA3 (CUDA) / Pallas (TPU) / SDPA fallback.
 - Inference: contiguous KV (`engine.py`) + paged KV scheduler (`serving.py`).
 
