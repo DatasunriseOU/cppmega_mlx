@@ -12,6 +12,7 @@ import mlx.optimizers as optim
 
 from cppmega_mlx.data.batch import LMTokenBatch
 from cppmega_mlx.training.loss import next_token_cross_entropy
+from cppmega_mlx.training.optimizers import make_adamw
 
 
 LossFn = Callable[[nn.Module, LMTokenBatch | Mapping[str, mx.array] | mx.array], tuple[mx.array, mx.array]]
@@ -50,10 +51,6 @@ def one_step_train(
         seconds=elapsed,
         tokens_per_second=tokens / elapsed if elapsed > 0 else float("inf"),
     )
-
-
-def make_adamw(*, learning_rate: float = 1e-3, weight_decay: float = 0.01) -> optim.AdamW:
-    return optim.AdamW(learning_rate=learning_rate, weight_decay=weight_decay)
 
 
 __all__ = ["TrainStepResult", "make_adamw", "one_step_train"]

@@ -29,20 +29,17 @@ scp gb10:/home/dave/cppmega-root/data/parquet_samples/clang_commits_4k_v1/val_00
   data/parquet_samples/gb10/clang_commits_4k_v1/val_00000.parquet
 
 
-The Parquet schema includes token-level side-channel aliases such as
-token_structure_ids, token_dep_levels, token_ast_depth,
-token_sibling_index, and token_ast_node_type.  Source-level columns such as
-structure_ids are not assumed to be token-aligned.
+After the SPACE/NL retokenize, the current copied GB10 samples are token-only
+for MLX side-channel threading. They preserve token_ids plus source-level
+structure_ids, but do not currently include token-level aliases such as
+token_structure_ids, token_dep_levels, token_ast_depth, token_sibling_index, or
+token_ast_node_type. Future regenerated samples may add those aliases back; the
+reader still supports them when they are token-aligned.
 
 The current GB10 samples are expected to expose these list element dtypes:
 
 - token_ids: uint32
 - structure_ids: int8 source-level AST IDs, not token-aligned
-- token_structure_ids: uint8
-- token_dep_levels: uint16
-- token_ast_depth: uint16
-- token_sibling_index: uint16
-- token_ast_node_type: uint16
 
 The MLX Parquet reader fails closed when token IDs or structure side-channel
 aliases are non-integer, when token-level side-channel aliases are not
@@ -51,9 +48,9 @@ batch field. Attention masks are the only numeric side channel that may use
 floating-point values. TokenParquetDataset.parquet_receipt records the
 physical Parquet columns and schema types it saw, the token source column, the
 physical source column for each normalized side channel, and skipped
-side-channel-looking columns. In the GB10 samples this should show
-structure_ids skipped as not_token_aligned while token_structure_ids
-supplies the normalized structure_ids batch field.
+side-channel-looking columns. In the current GB10 samples this shows
+structure_ids skipped as not_token_aligned and no normalized side channels
+threaded into LMTokenBatch.model_kwargs().
 
 These samples validate the Parquet-side aliases before conversion. They do not
 prove that ../cppmega Stage 3 preserves structure columns, because the current
@@ -69,11 +66,10 @@ sh
 
 
 The pytest receipt covers both clang_semantic_4k_v10 and
-clang_commits_4k_v1.  tests/test_real_parquet_samples.py confirms each
-sample produces fixed-shape token batches with token-aligned structure side
-channels, slices those fields through LMTokenBatch.model_kwargs(), and runs a
-one-step eager HybridTinyLM train/eval smoke on a copied local head of each
-sample.
+clang_commits_4k_v1.  tests/test_real_parquet_samples.py confirms each sample
+produces fixed-shape token batches from token_ids, skips source-level
+structure_ids as not_token_aligned, and runs a one-step eager HybridTinyLM
+train/eval smoke on a copied local head of each sample.
 
 Train-script JSON receipts mirror this local-only provenance under
 dataset.dataset_receipt. For copied Parquet heads the receipt includes

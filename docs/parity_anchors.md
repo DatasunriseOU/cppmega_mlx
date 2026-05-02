@@ -114,6 +114,78 @@ does not prove full NAM56R, H200, GB10, CUDA, or distributed Megatron behavior.
 H200 scripts are source/runtime anchors for ../cppmega, not MLX-supported
 launchers.
 
+### M0.1 Tokenizer Contract
+
+- Acceptance anchor: `cppmega-mlx-t8f.1` / M0.1 requires a HuggingFace JSON BPE
+  tokenizer with vocab=65536 and special IDs `2=<BOS>`, `3=<EOS>`/EOT,
+  `4=<FIM_PREFIX>`, `5=<FIM_MIDDLE>`, `6=<FIM_SUFFIX>`, and
+  deployed id `7=<CODE_START>`. The iFIM extension uses literal
+  `<FIM_INSTRUCTION>` at id 45; do not alias `FIM_INSTRUCTION_ID` to id 7.
+- Historical local receipts: `nanochat/tokenizer.json` is vocab=32768, while
+  `nanochat/tokenizer_v3.json` and
+  `nanochat/config/tokenizer_v3_fixed_tokens.json` are 65K-family artifacts
+  that map id 7 to `<CODE_START>`.
+- Artifact receipt: read-only inspection of
+  `/home/dave/cppmega-root/cpp_tokenizer_hf/tokenizer.json` and
+  `/home/dave/cppmega-root/data/tokenizer/tokenizer.json` found vocab=65536,
+  id7=`<CODE_START>`, id45=`<FIM_INSTRUCTION>`, and SHA-256
+  `431170fd0887c2b83f04671a8d63e3ffaef2ad194c3fa5db4651286cc973c5eb`,
+  matching the vendored local artifact contract.
+- Closure receipt: M0.1 is closed after vendoring the deployed GB10 tokenizer
+  plus the explicit whitespace-sentinel wrapper. The deployed JSON remains
+  `decoder=null`; encode collapses newline runs to `<NL>` and space/tab runs to
+  `<SPACE>`, while decode concatenates token strings and substitutes those
+  sentinels. The acceptance target is byte-exact parity with the CUDA reference
+  wrapper, not HF reversible `decode(encode(text))` for arbitrary whitespace.
+  Recorded receipts are 11/11 curated samples and 1000/1000 source-line samples
+  byte-exact against GB10.
+
+### M0.3 Random-Init Forward Parity Manifest
+
+- Acceptance anchor: `cppmega-mlx-t8f.3` / M0.3 requires seed-matched
+  `local_gb10_quarter` MLX and CUDA reference forwards, a fixed input batch,
+  and logits within `rtol=1e-2, atol=1e-1`.
+- Fixed-input scaffold metadata: `B=1`, `T=512`, `seed=3003`,
+  `vocab=65536`, and closure-required token SHA-256
+  `c645ca4053e5206dcbe58c13aa26f4a9e56c5aa2aee90a4d4778bbc9d9c33549`.
+- Required CUDA logits artifact: the real GB10/CUDA golden must be supplied at
+  `bench/parity/cuda/m03_local_gb10_quarter_seed3003_logits.json`. Current
+  local state has no artifact at that path; the manifest must therefore remain
+  `status=refused` with `artifact_preflight_status=missing` when the default
+  path is probed.
+- Artifact JSON contract: `format=cppmega_cuda_m03_forward_logits_v1`,
+  `profile=local_gb10_quarter`, `tensor_name=local_gb10_quarter.logits`,
+  `seed=3003`, `batch_size=1`, `seq_len=512`, `vocab_size=65536`,
+  `shape=[1,512,65536]`, `dtype=bf16`, `logits_dtype` in `bf16`/`bfloat16`/
+  `torch.bfloat16`, matching `input_tokens_sha256`, a `logits_sha256`,
+  source/hardware/CUDA runtime metadata, and a finite numeric `logits_summary`
+  with `numel=33554432`, `min`, `max`, `mean`, `std`, `l2_norm`, and
+  `max_abs`.
+- Artifact preflight statuses are intentionally not pass/fail parity:
+  `not_supplied` means no artifact path was supplied, `missing` means the
+  required/provided path was absent, `invalid` means metadata/checksum/summary
+  contract validation failed, and `valid_not_evaluated` means metadata was
+  valid but logits were still not numerically compared. `valid_not_evaluated`
+  is not M0.3 acceptance and must still leave `m0_3_closed=false`.
+- Current MLX coverage: `cppmega_mlx/training/parity.py` provides a
+  fail-closed manifest builder for `bench/parity/m03_random_init.json`, and
+  `scripts/m03_forward_parity_manifest.py` records either a blocked scaffold or
+  a supplied CUDA artifact path as refused/not-evaluated. The script does not
+  evaluate CUDA logits, full-profile MLX logits, receipt tolerances, or
+  pass/fail parity.
+- Local readiness scope: the script records full `local_gb10_quarter` profile
+  metadata, but it deliberately sets `full_profile_allocation_executed=false`
+  and `full_profile_forward_executed=false`. Its optional MLX execution is only
+  a tiny smoke forward, recorded with `local_mlx_forward_scope=tiny_smoke_only`.
+- Missing contract: the scaffold does not run CUDA, import CUDA weights, or
+  warm-start the MLX model. It never emits a pass/closure manifest; future M0.3
+  closure still requires an external CUDA logits artifact and a separate
+  numerical harness for the same config, seed, fixed input batch, and tolerance
+  policy.
+- Non-claims: the manifest is forward-only architecture evidence. It is not a
+  GB10 performance claim, M4-vs-GB10 parity claim, distributed Megatron parity
+  claim, CUDA weight-conversion receipt, or M0.7 resumable-training receipt.
+
 ### Structure Runtime Handoff
 
 - Source anchors: cppmega/megatron/structure_batch.py,
@@ -126,6 +198,77 @@ launchers.
 - Missing contract: end-to-end training/script handoff is still tiny-local, and
   TinyLM still uses simplified structure addition rather than full source
   embedding semantics.
+
+### MTP / FastMTP Local MLX Coverage
+
+- Source anchors: `cppmega/megatron/fastmtp_layer.py` and
+  `cppmega/megatron/mtp_native_hopper_ce.py`.
+- Current MLX coverage: `cppmega_mlx/training/mtp.py` implements the
+  training-side K=2 default, static-shape roll-and-mask labels/teacher IDs,
+  one shared recurrent MTP block, direct module aliasing for the model
+  embedding/lm head surfaces, beta-decayed normalized per-depth loss weights
+  with beta=0.6, and lambda=0.3 composition through
+  `cppmega_mlx/training/loss.py`.
+- Test anchor: `tests/test_mtp_loss.py` covers K=2 defaults, shared-head
+  aliasing, static roll-and-mask masking, per-depth weighting, lambda
+  integration, MTP-disabled inference sanity, decoder-hidden-state routing,
+  and CUDA-parity detach semantics for main hidden states and output head
+  weight.
+- Non-claims: local MLX MTP does not implement Liger CE, Hopper native linear
+  CE, fused main-plus-MTP CE launch behavior, Megatron monkey patching,
+  production cadence scheduling, sequence-parallel gather, or CUDA/Hopper/GB10
+  kernel parity. Treat Hopper fused CE as source-only evidence until a separate
+  hardware-gated receipt exists.
+- Fail-closed M0.5 receipt: no checked-in or locally observed fixed-seed
+  CUDA/GB10 artifact currently records the required FastMTP loss values plus
+  grad norm for `cppmega/megatron/fastmtp_layer.py` and
+  `cppmega/megatron/mtp_native_hopper_ce.py`. M0.5 remains open until that
+  artifact exists and a numerical MLX-vs-CUDA comparison is evaluated; the
+  local tests above are contract coverage, not closure evidence.
+
+### Engram Standalone Local Slice
+
+- Source anchors: `nanochat/nanochat/engram.py` and the source-side ngram
+  enrichment family under `cppmega/features/engram/`.
+- Current MLX coverage: `cppmega_mlx/nn/engram.py` provides a standalone
+  `EngramBranch` with parsed n-gram orders, causal local averaging, optional
+  document-boundary masking, optional sigmoid gating, optional grouped causal
+  SiLU convolution, and zero-initialized output/value projection behavior.
+- Test anchor: `tests/test_engram.py` covers standalone local behavior, not full
+  model integration.
+- Missing contract: no `engram_layers` route wiring into NAM56R/HybridTinyLM is
+  claimed here, no Engram+mHC branch combo is wired, and no nanochat Torch or
+  cppmega CUDA parity row exists. This does not close Stream H.
+
+### mHC Standalone Local Slice
+
+- Source anchors: `nanochat/nanochat/mhc.py` and the MaxText-style
+  Sinkhorn branch-mixing contract referenced by Stream H.
+- Current MLX coverage: `cppmega_mlx/nn/mhc.py` provides a standalone
+  `ManifoldBranchMixer` with fp32 Sinkhorn-style normalization, branch-shape and
+  dtype validation, branch routing weights, uniform fallback for invalid weights,
+  and `blend_alpha` interpolation.
+- Test anchor: `tests/test_mhc.py` covers standalone local routing/mixing
+  invariants, not full model integration.
+- Missing contract: no Engram/main/skip residual combo is wired into the model,
+  no source MaxText/nanochat parity row exists, and no compile/performance
+  receipt exists for the integrated branch path. This does not close Stream H.
+
+### FIM / iFIM CPU Transform Slice
+
+- Source anchors: `nanochat/nanochat/fim.py`, `nanochat/nanochat/ifim.py`, and
+  the M0.1 tokenizer special-token acceptance contract above.
+- Current MLX coverage: `cppmega_mlx/data/fim.py` provides dependency-free
+  token-level PSM/SPM FIM permutations, sampled FIM transforms, instruction-aware
+  FIM formatting, lightweight comment/signature instruction extraction, and a
+  fail-closed `FIMSpecialTokenIds` wrapper over the required special-token IDs.
+- Test anchor: `tests/test_fim_transform.py` covers local transform behavior and
+  fail-closed special-token validation.
+- Missing contract: no tree-sitter/AST-aware iFIM or AST-FIM extraction is
+  wired, and no dataset/training/inference integration is claimed. M0.1 is
+  already closed by the vendored GB10 tokenizer plus explicit `<SPACE>`/`<NL>`
+  sentinel decode parity receipt; the remaining gap is Stream H feature
+  integration.
 
 ### Megatron Indexed Side-Channel Preservation
 

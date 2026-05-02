@@ -236,6 +236,11 @@ HF kernel adoption gate:
 - Prove backward behavior for differentiated training inputs.
 - Benchmark the local cppmega shape that motivated adoption.
 - Keep a pure MLX fallback and an explicit unsupported-path failure mode.
+- Keep the local lint guardrails green: tools/lint_mlx.py blocks ad hoc
+  mx.fast.metal_kernel construction outside cppmega_mlx/kernels/metal_ops.py,
+  differentiated Metal use without @mx.custom_function plus .vjp/.jvp, and
+  benchmark rows that mix compile/first-call timing into steady-state
+  tokens/sec.
 
 ## Integration Roadmap Impact
 
@@ -351,4 +356,3 @@ PY
   --json
 
 rm -rf "$TMP_DIR"
-

@@ -40,6 +40,7 @@ from cppmega_mlx.runtime.memory import (  # noqa: E402
     device_total_memory_bytes,
     memory_limit_plan,
 )
+from cppmega_mlx.runtime.seed import capture_rng_state  # noqa: E402
 from cppmega_mlx.training.checkpoint import load_checkpoint, save_checkpoint  # noqa: E402
 from cppmega_mlx.training.compiled import CompiledPretrainingStep  # noqa: E402
 from cppmega_mlx.training.eval import EvalMetrics, evaluate_batches  # noqa: E402
@@ -574,6 +575,7 @@ def checkpoint_metadata(
     stepper: CompiledPretrainingStep,
     step: int,
     consumed_batches: int | None = None,
+    rng: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     cursor = dataset.cursor_after(step if consumed_batches is None else consumed_batches)
     return {
@@ -582,6 +584,10 @@ def checkpoint_metadata(
         "batch_cursor": cursor.__dict__,
         "training_config": asdict(config),
         "dataset": dataset_payload(dataset),
+        "rng": rng if rng is not None else {
+            "mode": "snapshot",
+            "snapshot": capture_rng_state(),
+        },
     }
 
 
@@ -595,6 +601,7 @@ def save_training_checkpoint(
     stepper: CompiledPretrainingStep,
     step: int,
     consumed_batches: int | None = None,
+    rng: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return save_checkpoint(
         model,
@@ -607,6 +614,7 @@ def save_training_checkpoint(
             stepper=stepper,
             step=step,
             consumed_batches=consumed_batches,
+            rng=rng,
         ),
     )
 

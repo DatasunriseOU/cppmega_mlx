@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -25,6 +26,34 @@ def write_npz(path: Path, *, include_structure: bool) -> None:
         arrays["structure_ids"] = (tokens % 7).astype(np.int32)
         arrays["dep_levels"] = (tokens % 3).astype(np.int32)
     np.savez(path, **arrays)
+
+
+def write_parquet(path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    table = pa.table(
+        {
+            "token_ids": pa.array(
+                [
+                    [1, 2, 3, 4],
+                    [5, 6, 7, 8],
+                    [9, 10, 11, 12],
+                    [13, 14, 15, 16],
+                ],
+                type=pa.large_list(pa.uint32()),
+            ),
+            "structure_ids": pa.array(
+                [
+                    [1, 2],
+                    [3, 4],
+                    [5, 6],
+                    [7, 8],
+                ],
+                type=pa.large_list(pa.int8()),
+            ),
+        }
+    )
+    pq.write_table(table, path)
 
 
 def run_script(*args: str) -> subprocess.CompletedProcess[str]:
@@ -139,13 +168,59 @@ def test_require_structure_side_channels_fails_closed(tmp_path: Path) -> None:
     assert payload["gb10_parity_claim"] is False
 
 
-def test_unsupported_dataset_format_fails_closed_with_json(tmp_path: Path) -> None:
+def test_parquet_smoke_reports_local_ingress_contract(tmp_path: Path) -> None:
     dataset_path = tmp_path / "tokens.parquet"
+    write_parquet(dataset_path)
+
+    result = run_script(
+        str(dataset_path),
+        "--token-key",
+        "token_ids",
+        "--batch-size",
+        "2",
+        "--seq-len",
+        "4",
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = load_json(result)
+    assert payload["status"] == "ok"
+    assert payload["dataset_format"] == "parquet"
+    assert payload["token_key"] == "token_ids"
+    assert payload["batch_shape"] == [2, 4]
+    assert payload["dataset"]["metadata"]["source_format"] == "parquet"
+    assert payload["dataset"]["parquet_receipt"]["source_format"] == "parquet"
+    assert payload["dataset"]["parquet_receipt"]["token_source"] == {
+        "mode": "token_column",
+        "column": "token_ids",
+        "type": "large_list<item: uint32>",
+    }
+    assert payload["dataset"]["parquet_receipt"]["side_channel_sources"] == {}
+    assert payload["dataset"]["parquet_receipt"]["skipped_side_channel_columns"] == [
+        {
+            "field": "structure_ids",
+            "column": "structure_ids",
+            "type": "large_list<item: int8>",
+            "reason": "not_token_aligned",
+        }
+    ]
+    assert payload["side_channels"] == []
+    assert payload["structure_side_channels"] == []
+    assert payload["structure_side_channels_present"] is False
+    assert payload["local_only"] is True
+    assert payload["gb10_parity_claim"] is False
+    assert payload["m4_vs_gb10_parity_claim"] is False
+    assert payload["distributed_megatron_parity_claim"] is False
+    assert payload["training_wired"] is False
+
+
+def test_unsupported_dataset_format_fails_closed_with_json(tmp_path: Path) -> None:
+    dataset_path = tmp_path / "tokens.jsonl"
 
     result = run_script(
         str(dataset_path),
         "--dataset-format",
-        "parquet",
+        "jsonl",
         "--batch-size",
         "2",
         "--seq-len",
@@ -155,7 +230,7 @@ def test_unsupported_dataset_format_fails_closed_with_json(tmp_path: Path) -> No
     assert result.returncode == 2
     payload = load_json(result)
     assert payload["status"] == "error"
-    assert payload["dataset_format"] == "parquet"
+    assert payload["dataset_format"] == "jsonl"
     assert "unsupported dataset format" in payload["error"]
-    assert "npz, megatron" in payload["error"]
+    assert "npz, parquet, megatron" in payload["error"]
     assert payload["local_only"] is True

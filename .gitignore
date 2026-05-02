@@ -13,6 +13,7 @@ __pycache__/
 
 # Codex/agent runtime logs are local coordination artifacts.
 .codex/agent-logs/
+.claude/
 
 # Large real-data samples copied from GB10 for local-only smoke tests.
 data/parquet_samples/

@@ -1,6 +1,14 @@
 """MLX neural-network building blocks."""
 
 from cppmega_mlx.nn.attention import AttentionConfig, AttentionRouteInfo, CausalSelfAttention
+from cppmega_mlx.nn.engram import (
+    CppMegaEngramBranch,
+    EngramBranch,
+    EngramConfig,
+    causal_depthwise_silu_conv1d,
+    causal_local_average,
+    parse_ngram_orders,
+)
 from cppmega_mlx.nn.m2rnn import (
     DEFAULT_CHUNK_SIZE,
     M2RNNConfig,
@@ -10,6 +18,12 @@ from cppmega_mlx.nn.m2rnn import (
     chunked_m2rnn_scan,
     m2rnn_scan,
     m2rnn_softplus_decay_gate,
+)
+from cppmega_mlx.nn.mhc import (
+    CppMegaManifoldBranchMixer,
+    ManifoldBranchMixer,
+    ManifoldBranchMixerConfig,
+    sinkhorn_normalize,
 )
 from cppmega_mlx.nn.mamba3 import (
     Mamba3CacheState,
@@ -41,10 +55,14 @@ from cppmega_mlx.nn.structure_embedding import (
 __all__ = [
     "AttentionConfig",
     "AttentionRouteInfo",
+    "CppMegaEngramBranch",
+    "CppMegaManifoldBranchMixer",
     "CppMegaNgramHashEmbedding",
     "CppMegaStructureEmbedding",
     "CausalSelfAttention",
     "DEFAULT_CHUNK_SIZE",
+    "EngramBranch",
+    "EngramConfig",
     "FeedForwardExpert",
     "M2RNNConfig",
     "M2RNNMixer",
@@ -53,6 +71,8 @@ __all__ = [
     "Mamba3Config",
     "Mamba3InProjDims",
     "Mamba3ReferenceBlock",
+    "ManifoldBranchMixer",
+    "ManifoldBranchMixerConfig",
     "MoEConfig",
     "MoEOutput",
     "NgramHashEmbedding",
@@ -62,10 +82,14 @@ __all__ = [
     "TopKRouter",
     "broadcast_m2rnn_heads",
     "causal_depthwise_conv1d",
+    "causal_depthwise_silu_conv1d",
+    "causal_local_average",
     "chunked_m2rnn_scan",
     "compute_mamba3_in_proj_dims",
     "compute_num_rope_angles",
     "m2rnn_scan",
     "m2rnn_softplus_decay_gate",
+    "parse_ngram_orders",
     "pick_primes",
+    "sinkhorn_normalize",
 ]

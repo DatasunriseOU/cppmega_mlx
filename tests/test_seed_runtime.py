@@ -5,6 +5,7 @@ import random
 
 import mlx.core as mx
 import numpy as np
+import pytest
 
 from cppmega_mlx.runtime.seed import (
     capture_rng_state,
@@ -61,3 +62,21 @@ def test_mlx_rng_restore_determinism_or_reports_unavailable() -> None:
 
     assert restore_result["mlx_random"] == {"restored": True}
     np.testing.assert_allclose(np.array(actual), np.array(expected), rtol=0, atol=0)
+
+
+def test_rng_restore_rejects_missing_payload_sections() -> None:
+    seed_all(991)
+    snapshot = capture_rng_state()
+    del snapshot["numpy_random"]
+
+    with pytest.raises(ValueError, match="missing 'numpy_random'"):
+        restore_rng_state(snapshot)
+
+
+def test_rng_restore_rejects_wrong_snapshot_scope() -> None:
+    seed_all(991)
+    snapshot = capture_rng_state()
+    snapshot["scope"] = "distributed"
+
+    with pytest.raises(ValueError, match="unsupported RNG snapshot scope"):
+        restore_rng_state(snapshot)

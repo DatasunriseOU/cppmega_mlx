@@ -13,6 +13,8 @@ import mlx.nn as nn
 import mlx.optimizers as optim
 from mlx.utils import tree_flatten, tree_unflatten
 
+from cppmega_mlx.runtime.seed import capture_rng_state, restore_rng_state
+
 
 WEIGHTS_NAME = "model.safetensors"
 OPTIMIZER_NAME = "optimizer.safetensors"
@@ -23,6 +25,7 @@ FORMAT_NAME = "cppmega_mlx_checkpoint_v1"
 FORMAT_VERSION = 1
 RNG_MODE_NOT_SAVED = "not_saved"
 RNG_MODE_SEED = "seed"
+RNG_MODE_SNAPSHOT = "snapshot"
 SHARDING_MODE_SINGLE_FILE = "single_file"
 
 _STANDALONE_RNG_KEYS = {
@@ -378,19 +381,127 @@ def _validate_evaluation_metadata(payload: Any, metadata_path: Path) -> None:
             )
 
 
+def _validate_batch_cursor_metadata(
+    value: Any,
+    *,
+    name: str,
+    metadata_path: Path,
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(
+            f"checkpoint metadata {metadata_path}: {name} must be an object"
+        )
+    for field in ("epoch", "batch_offset", "global_batch_offset"):
+        if field not in value:
+            raise ValueError(
+                f"checkpoint metadata {metadata_path}: {name}.{field} is required"
+            )
+        _require_non_negative_int(
+            value[field],
+            name=f"{name}.{field}",
+            metadata_path=metadata_path,
+        )
+    return value
+
+
+def _require_matching_metadata_field(
+    *,
+    expected: Any,
+    actual: Any,
+    expected_name: str,
+    actual_name: str,
+    metadata_path: Path,
+) -> None:
+    if expected != actual:
+        raise ValueError(
+            f"checkpoint metadata {metadata_path}: {actual_name} does not match "
+            f"{expected_name}"
+        )
+
+
 def _reject_standalone_rng_payload(metadata: dict[str, Any], metadata_path: Path) -> None:
     for key in sorted(_STANDALONE_RNG_KEYS):
         if key in metadata:
             raise ValueError(
                 f"checkpoint metadata {metadata_path}: standalone RNG payloads are "
-                "not supported; use rng.mode='seed' for seed provenance or omit rng"
+                "not supported; use rng.mode='snapshot' with rng.snapshot for "
+                "single-process state, rng.mode='seed' for seed provenance, or omit rng"
             )
 
 
-def _rng_contract(metadata: dict[str, Any], metadata_path: Path) -> dict[str, Any]:
+def _ensure_mlx_rng_restored_if_available(
+    *,
+    snapshot: dict[str, Any],
+    restore_result: dict[str, Any],
+    metadata_path: Path,
+) -> None:
+    mlx_snapshot = snapshot.get("mlx_random")
+    if not isinstance(mlx_snapshot, dict) or mlx_snapshot.get("available") is not True:
+        return
+
+    mlx_result = restore_result.get("mlx_random")
+    if isinstance(mlx_result, dict) and mlx_result.get("restored") is True:
+        return
+
+    reason = (
+        mlx_result.get("reason", "unknown reason")
+        if isinstance(mlx_result, dict)
+        else "missing mlx_random restore status"
+    )
+    raise ValueError(
+        f"checkpoint metadata {metadata_path}: MLX RNG state restore refused "
+        f"for an available snapshot ({reason})"
+    )
+
+
+def _restore_rng_snapshot_fail_closed(
+    snapshot: dict[str, Any],
+    metadata_path: Path,
+) -> dict[str, Any]:
+    restore_result = restore_rng_state(snapshot)
+    _ensure_mlx_rng_restored_if_available(
+        snapshot=snapshot,
+        restore_result=restore_result,
+        metadata_path=metadata_path,
+    )
+    return restore_result
+
+
+def _validate_rng_snapshot_payload(snapshot: Any, metadata_path: Path) -> dict[str, Any]:
+    if not isinstance(snapshot, dict):
+        raise ValueError(
+            f"checkpoint metadata {metadata_path}: rng.snapshot must be an object"
+        )
+
+    current_state = capture_rng_state()
+    try:
+        _restore_rng_snapshot_fail_closed(snapshot, metadata_path)
+    except Exception as exc:
+        raise ValueError(
+            f"checkpoint metadata {metadata_path}: rng.snapshot is invalid: {exc}"
+        ) from exc
+    finally:
+        _restore_rng_snapshot_fail_closed(current_state, metadata_path)
+    return _jsonable(snapshot)
+
+
+def _rng_contract(
+    metadata: dict[str, Any],
+    metadata_path: Path,
+    *,
+    default_snapshot: bool = False,
+) -> dict[str, Any]:
     _reject_standalone_rng_payload(metadata, metadata_path)
     raw_rng = metadata.get("rng")
     if raw_rng is None:
+        if default_snapshot:
+            return {
+                "mode": RNG_MODE_SNAPSHOT,
+                "snapshot": _validate_rng_snapshot_payload(
+                    capture_rng_state(),
+                    metadata_path,
+                ),
+            }
         return {"mode": RNG_MODE_NOT_SAVED}
     if not isinstance(raw_rng, dict):
         raise ValueError(f"checkpoint metadata {metadata_path}: rng must be an object")
@@ -400,10 +511,11 @@ def _rng_contract(metadata: dict[str, Any], metadata_path: Path) -> dict[str, An
         keys = ", ".join(payload_keys)
         raise ValueError(
             f"checkpoint metadata {metadata_path}: standalone RNG payloads are "
-            f"not supported ({keys}); use rng.mode='seed' for seed provenance"
+            f"not supported ({keys}); use rng.mode='snapshot' with rng.snapshot "
+            "for single-process state"
         )
 
-    allowed_keys = {"mode", "seed", "source", "note"}
+    allowed_keys = {"mode", "seed", "snapshot", "source", "note"}
     unknown_keys = sorted(set(raw_rng) - allowed_keys)
     if unknown_keys:
         raise ValueError(
@@ -412,10 +524,11 @@ def _rng_contract(metadata: dict[str, Any], metadata_path: Path) -> dict[str, An
         )
 
     mode = raw_rng.get("mode", RNG_MODE_NOT_SAVED)
-    if mode not in {RNG_MODE_NOT_SAVED, RNG_MODE_SEED}:
+    if mode not in {RNG_MODE_NOT_SAVED, RNG_MODE_SEED, RNG_MODE_SNAPSHOT}:
         raise ValueError(
             f"checkpoint metadata {metadata_path}: unsupported rng.mode "
-            f"{mode!r}; expected {RNG_MODE_NOT_SAVED!r} or {RNG_MODE_SEED!r}"
+            f"{mode!r}; expected {RNG_MODE_NOT_SAVED!r}, {RNG_MODE_SEED!r}, "
+            f"or {RNG_MODE_SNAPSHOT!r}"
         )
 
     contract: dict[str, Any] = {"mode": mode}
@@ -424,12 +537,31 @@ def _rng_contract(metadata: dict[str, Any], metadata_path: Path) -> dict[str, An
             raise ValueError(
                 f"checkpoint metadata {metadata_path}: rng.seed is required "
                 "when rng.mode='seed'"
-            )
+        )
         _require_non_negative_int(raw_rng["seed"], name="rng.seed", metadata_path=metadata_path)
         contract["seed"] = raw_rng["seed"]
+    elif mode == RNG_MODE_SNAPSHOT:
+        if "snapshot" not in raw_rng:
+            raise ValueError(
+                f"checkpoint metadata {metadata_path}: rng.snapshot is required "
+                "when rng.mode='snapshot'"
+            )
+        if "seed" in raw_rng:
+            raise ValueError(
+                f"checkpoint metadata {metadata_path}: rng.seed requires rng.mode='seed'"
+            )
+        contract["snapshot"] = _validate_rng_snapshot_payload(
+            raw_rng["snapshot"],
+            metadata_path,
+        )
     elif "seed" in raw_rng:
         raise ValueError(
             f"checkpoint metadata {metadata_path}: rng.seed requires rng.mode='seed'"
+        )
+    elif "snapshot" in raw_rng:
+        raise ValueError(
+            f"checkpoint metadata {metadata_path}: "
+            "rng.snapshot requires rng.mode='snapshot'"
         )
 
     for field in ("source", "note"):
@@ -589,20 +721,11 @@ def _validate_checkpoint_metadata(payload: dict[str, Any], metadata_path: Path) 
 
     batch_cursor = payload.get("batch_cursor")
     if batch_cursor is not None:
-        if not isinstance(batch_cursor, dict):
-            raise ValueError(
-                f"checkpoint metadata {metadata_path}: batch_cursor must be an object"
-            )
-        for field in ("epoch", "batch_offset", "global_batch_offset"):
-            if field not in batch_cursor:
-                raise ValueError(
-                    f"checkpoint metadata {metadata_path}: batch_cursor.{field} is required"
-                )
-            _require_non_negative_int(
-                batch_cursor[field],
-                name=f"batch_cursor.{field}",
-                metadata_path=metadata_path,
-            )
+        batch_cursor = _validate_batch_cursor_metadata(
+            batch_cursor,
+            name="batch_cursor",
+            metadata_path=metadata_path,
+        )
 
     training_state = payload.get("training_state")
     if training_state is not None:
@@ -631,6 +754,14 @@ def _validate_checkpoint_metadata(payload: dict[str, Any], metadata_path: Path) 
                 name=f"training_state.state.{field}",
                 metadata_path=metadata_path,
             )
+            if field in payload and payload[field] is not None:
+                _require_matching_metadata_field(
+                    expected=payload[field],
+                    actual=cursor[field],
+                    expected_name=field,
+                    actual_name=f"training_state.state.{field}",
+                    metadata_path=metadata_path,
+                )
 
         grad_accum_steps = training_state.get("grad_accum_steps")
         _require_positive_int(
@@ -703,6 +834,44 @@ def _validate_checkpoint_metadata(payload: dict[str, Any], metadata_path: Path) 
             _validate_tensor_summary_metadata(
                 accumulator,
                 name="training_state.gradient_accumulator",
+                metadata_path=metadata_path,
+            )
+
+    resume_cursor = payload.get("resume_cursor")
+    if resume_cursor is not None:
+        if not isinstance(resume_cursor, dict):
+            raise ValueError(
+                f"checkpoint metadata {metadata_path}: resume_cursor must be an object"
+            )
+        for field in ("step", "trained_tokens"):
+            if field not in resume_cursor:
+                raise ValueError(
+                    f"checkpoint metadata {metadata_path}: resume_cursor.{field} is required"
+                )
+            _require_non_negative_int(
+                resume_cursor[field],
+                name=f"resume_cursor.{field}",
+                metadata_path=metadata_path,
+            )
+            if field in payload and payload[field] is not None:
+                _require_matching_metadata_field(
+                    expected=payload[field],
+                    actual=resume_cursor[field],
+                    expected_name=field,
+                    actual_name=f"resume_cursor.{field}",
+                    metadata_path=metadata_path,
+                )
+        resume_batch_cursor = _validate_batch_cursor_metadata(
+            resume_cursor.get("batch_cursor"),
+            name="resume_cursor.batch_cursor",
+            metadata_path=metadata_path,
+        )
+        if batch_cursor is not None:
+            _require_matching_metadata_field(
+                expected=batch_cursor,
+                actual=resume_batch_cursor,
+                expected_name="batch_cursor",
+                actual_name="resume_cursor.batch_cursor",
                 metadata_path=metadata_path,
             )
 
@@ -783,6 +952,21 @@ def _training_step_state(training_step: Any | None) -> dict[str, Any] | None:
     return _jsonable(state)
 
 
+def _restore_rng_from_checkpoint(payload: dict[str, Any], metadata_path: Path) -> None:
+    raw_rng = payload.get("rng")
+    if not isinstance(raw_rng, dict) or raw_rng.get("mode") != RNG_MODE_SNAPSHOT:
+        return
+    try:
+        snapshot = raw_rng["snapshot"]
+        if not isinstance(snapshot, dict):
+            raise ValueError("rng.snapshot must be an object")
+        _restore_rng_snapshot_fail_closed(snapshot, metadata_path)
+    except Exception as exc:
+        raise ValueError(
+            f"checkpoint metadata {metadata_path}: failed to restore rng.snapshot: {exc}"
+        ) from exc
+
+
 def save_checkpoint(
     model: nn.Module,
     path: str | Path,
@@ -796,7 +980,11 @@ def save_checkpoint(
     metadata = metadata or {}
     weights_path, metadata_path, optimizer_path = _checkpoint_paths(path)
     _reject_unsupported_checkpoint_fields(metadata, metadata_path)
-    rng_contract = _rng_contract(metadata, metadata_path)
+    rng_contract = _rng_contract(
+        metadata,
+        metadata_path,
+        default_snapshot=optimizer is not None or training_step is not None,
+    )
     sharding_contract = _sharding_contract(
         metadata,
         metadata_path,
@@ -851,13 +1039,22 @@ def save_checkpoint(
         }
 
     payload: dict[str, Any] = _jsonable(metadata) if metadata else {}
+    top_level_step = payload.get("step")
+    top_level_trained_tokens = payload.get("trained_tokens")
+    if training_state is not None:
+        training_cursor = training_state.get("state")
+        if isinstance(training_cursor, dict):
+            if top_level_step is None:
+                top_level_step = training_cursor.get("step")
+            if top_level_trained_tokens is None:
+                top_level_trained_tokens = training_cursor.get("trained_tokens")
     payload.update({
         "format": FORMAT_NAME,
         "version": FORMAT_VERSION,
         "weights": weights_path.name,
         "num_tensors": len(weights),
         "tensors": sorted(weights),
-        "step": metadata.get("step"),
+        "step": top_level_step,
         "optimizer": {
             "present": optimizer_state_present,
             "file": optimizer_path.name if optimizer_state_present and optimizer_path else None,
@@ -869,6 +1066,8 @@ def save_checkpoint(
         "rng": rng_contract,
         "sharding": sharding_contract,
     })
+    if top_level_trained_tokens is not None:
+        payload["trained_tokens"] = top_level_trained_tokens
     if training_state is not None:
         payload["training_state"] = training_state
     if hasattr(model, "config"):
@@ -1006,6 +1205,8 @@ def load_checkpoint(
             raise TypeError("training_step must expose load_state_dict()")
         load_state_dict(training_state, gradient_accumulator=accumulator)
 
+    _restore_rng_from_checkpoint(payload, metadata_path)
+
     return payload
 
 
@@ -1017,6 +1218,7 @@ __all__ = [
     "OPTIMIZER_NAME",
     "RNG_MODE_NOT_SAVED",
     "RNG_MODE_SEED",
+    "RNG_MODE_SNAPSHOT",
     "SHARDING_MODE_SINGLE_FILE",
     "SHARD_INDEX_NAME",
     "WEIGHTS_NAME",

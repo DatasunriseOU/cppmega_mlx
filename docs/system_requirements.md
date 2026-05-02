@@ -130,6 +130,34 @@ Do not raise `iogpu.wired_limit_mb` inside a training script; if an operator
 changes the system wired limit, record it in the receipt and re-run the
 preflight.
 
+### M0.6 Memory Receipt Gate
+
+For M0.6 (`cppmega-mlx-t8f.6`), the dev-128 arithmetic target is:
+
+- `total_memory_bytes = 137438953472`
+- `wired_limit_bytes = int(0.70 * total) = 96207267430`
+- `metal_limit_bytes = int(0.85 * total) = 116823110451`
+- strict peak-memory threshold `< int(0.75 * total) = 103079215104`
+
+The receipt at `bench/baselines/m06_memory.json` is allowed to exist as a
+partial/blocker receipt while upstream M0.4 dependencies are still open. It must
+not claim full M0.6 acceptance until a 100-step `local_gb10_quarter` run with
+AdamW, grad-checkpoint, documented memory-limit application, recorded
+`mx.clear_cache()` cadence, and a peak-memory profile below the threshold has
+been captured. The documented memory-limit application must include previous
+limit values from `mx.set_wired_limit` and the selected Metal memory-limit API
+path (`mx.set_memory_limit` or `mx.metal.set_memory_limit`) so the receipt can
+distinguish applied limits from arithmetic-only planning. A full-acceptance
+receipt must also record the exact command/provenance for the target run,
+including `local_gb10_quarter`, `--grad-checkpoint`,
+`--apply-memory-limit-plan`, and `--clear-cache-every-steps`, and each
+`mx.clear_cache()` event must report the configured cadence. It must also record
+the local runtime stack: MLX version, MLX-Metal version when installed, default
+MLX device, Metal availability, macOS/platform fields, and `mx.device_info()`
+including device name and memory size. Missing command, cadence, or
+runtime-stack evidence keeps the receipt partial even if the arithmetic and
+peak-memory gates pass.
+
 ## Thermal And Power Caveat
 
 `powermetrics` is a reporting tool, not a correctness oracle. A readiness

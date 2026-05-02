@@ -1,0 +1,278 @@
+{
+  "acceptance_gate": {
+    "blocker": "CUDA reference artifact path was supplied but the artifact is missing; M0.3 closure requires the artifact contract plus a separate numerical parity harness.",
+    "cuda_reference_artifact_preflight_status": "missing",
+    "cuda_reference_artifact_supplied": true,
+    "full_m0_3_acceptance": false,
+    "logits_receipts": 0,
+    "receipt_count": 0,
+    "receipts_evaluated_by_this_manifest": false,
+    "requires_cuda_reference_artifact": true,
+    "requires_external_cuda_logits": true,
+    "requires_fixed_input_batch": true,
+    "requires_mlx_forward": true,
+    "requires_no_cuda_weight_import": true,
+    "requires_same_seed": true,
+    "requires_separate_numerical_harness": true
+  },
+  "acceptance_status": "not_evaluated",
+  "claim_boundary": "This scaffold makes no GB10-vs-M4 throughput, GB10 numerical, M4-vs-GB10 parity, or distributed Megatron parity claim.",
+  "cuda_reference": {
+    "artifact": "/Volumes/external/sources/cppmega.mlx/bench/parity/cuda/m03_local_gb10_quarter_seed3003_logits.json",
+    "artifact_contract": {
+      "allowed_logits_dtype": [
+        "bf16",
+        "bfloat16",
+        "torch.bfloat16"
+      ],
+      "batch_size": 1,
+      "dtype": "bf16",
+      "format": "cppmega_cuda_m03_forward_logits_v1",
+      "profile": "local_gb10_quarter",
+      "required_artifact": "bench/parity/cuda/m03_local_gb10_quarter_seed3003_logits.json",
+      "required_logits_summary_fields": [
+        "numel",
+        "min",
+        "max",
+        "mean",
+        "std",
+        "l2_norm",
+        "max_abs"
+      ],
+      "requires_finite_numeric_summary": true,
+      "requires_input_tokens_sha256": true,
+      "requires_logits_sha256": true,
+      "seed": 3003,
+      "seq_len": 512,
+      "shape": [
+        1,
+        512,
+        65536
+      ],
+      "tensor_name": "local_gb10_quarter.logits",
+      "vocab_size": 65536
+    },
+    "artifact_error": "CUDA reference artifact not found: /Volumes/external/sources/cppmega.mlx/bench/parity/cuda/m03_local_gb10_quarter_seed3003_logits.json",
+    "artifact_preflight_status": "missing",
+    "artifact_supplied": true,
+    "evaluated_by_this_manifest": false,
+    "evaluates_logits": false,
+    "preflight_is_acceptance": false,
+    "required_artifact": "bench/parity/cuda/m03_local_gb10_quarter_seed3003_logits.json",
+    "required_for_closure": true,
+    "status": "refused_missing_artifact"
+  },
+  "cuda_weight_import": false,
+  "distributed_megatron_forward_parity_claim": false,
+  "distributed_megatron_parity_claim": false,
+  "dtype": "bf16",
+  "format": "cppmega_mlx_tensor_parity_manifest_v1",
+  "full_m0_3_acceptance_claim": false,
+  "gb10_forward_parity_claim": false,
+  "gb10_parity_claim": false,
+  "input_batch": {
+    "batch_size": 1,
+    "fixed": true,
+    "seed": 3003,
+    "seq_len": 512,
+    "token_pattern": "numpy.default_rng(seed).integers(0, vocab_size, dtype=uint32)",
+    "tokens_sha256": "c645ca4053e5206dcbe58c13aa26f4a9e56c5aa2aee90a4d4778bbc9d9c33549",
+    "tokens_sha256_required_for_closure": true,
+    "vocab_size": 65536
+  },
+  "issue": {
+    "id": "cppmega-mlx-t8f.3",
+    "title": "M0.3: random-init seed-matched forward parity vs CUDA reference"
+  },
+  "local_only": true,
+  "local_only_policy": "Local CUDA/MLX tensor diff receipts are implementation evidence only. They are not M4-vs-GB10 parity evidence and do not prove distributed Megatron parity.",
+  "m0_3_closed": false,
+  "m0_3_policy": "M0.3 is random-init, seed-matched, forward-only architecture evidence. This helper is a scaffold only: it records the required local_gb10_quarter profile, fixed input metadata, and tolerance policy, but it does not run or evaluate CUDA/MLX logits and never closes M0.3 by itself. Closure requires an external CUDA artifact plus a separate numerical parity harness.",
+  "m0_3_receipt_scope": "local_cuda_mlx_m03_forward_logits",
+  "m0_3_schema_version": 1,
+  "m4_vs_gb10_forward_parity_claim": false,
+  "m4_vs_gb10_parity_claim": false,
+  "metadata": {
+    "git_commit": "73c6a96",
+    "local_mlx_readiness_status": "pass",
+    "scaffold_only": true,
+    "script": "scripts/m03_forward_parity_manifest.py"
+  },
+  "mlx_reference": {
+    "closure_required_mlx_forward_scope": "full_local_gb10_quarter_logits",
+    "evaluated_by_this_manifest": false,
+    "execution_note": "This script records full local_gb10_quarter profile metadata but does not allocate or forward the full profile; it only executes the tiny smoke model below.",
+    "full_profile": {
+      "depth": 13,
+      "dsa_layer_numbers": [
+        5,
+        9,
+        13
+      ],
+      "ffn_hidden_size": 18944,
+      "head_dim": 128,
+      "hidden_size": 3584,
+      "mla_layer_numbers": [
+        1
+      ],
+      "name": "local_gb10_quarter",
+      "num_attention_heads": 28,
+      "pattern": "AEMEAEMEAEMR",
+      "route_roles": [
+        "attention",
+        "moe",
+        "mamba3",
+        "moe",
+        "attention",
+        "moe",
+        "mamba3",
+        "moe",
+        "attention",
+        "moe",
+        "mamba3",
+        "m2rnn",
+        "attention"
+      ],
+      "route_symbols": [
+        "A",
+        "E",
+        "M",
+        "E",
+        "A",
+        "E",
+        "M",
+        "E",
+        "A",
+        "E",
+        "M",
+        "R",
+        "A"
+      ],
+      "vocab_size": 65536
+    },
+    "full_profile_allocation_executed": false,
+    "full_profile_forward_executed": false,
+    "hardware": "macOS-26.4.1-arm64-arm-64bit-Mach-O",
+    "local_mlx_forward_executed": true,
+    "local_mlx_forward_scope": "tiny_smoke_only",
+    "mlx_lm_version": "0.31.2",
+    "mlx_version": "0.31.1",
+    "readiness_is_cuda_parity": false,
+    "readiness_note": "Local MLX structural/tiny forward readiness only; no CUDA logits were evaluated and this does not satisfy full M0.3 acceptance.",
+    "readiness_status": "pass",
+    "required_for_closure": true,
+    "script": "scripts/m03_forward_parity_manifest.py",
+    "status": "not_evaluated",
+    "tiny_smoke_forward": {
+      "hidden_size": 16,
+      "input_tokens_modulo_vocab": true,
+      "input_tokens_sha256": "497958ed6f561d2d22bbb5133538831be3753b6416b6b0a7a6780159e9305aef",
+      "logits_all_finite": true,
+      "logits_dtype": "mlx.core.float32",
+      "logits_sha256": "86b423e7417db2377322d3fb54b883762418aa47c1c574af675bf244b083f36b",
+      "logits_shape": [
+        1,
+        512,
+        256
+      ],
+      "max_seq_length": 512,
+      "route_roles": [
+        "attention",
+        "moe",
+        "mamba3",
+        "moe",
+        "attention",
+        "moe",
+        "mamba3",
+        "moe",
+        "attention",
+        "moe",
+        "mamba3",
+        "m2rnn",
+        "attention"
+      ],
+      "route_symbols": [
+        "A",
+        "E",
+        "M",
+        "E",
+        "A",
+        "E",
+        "M",
+        "E",
+        "A",
+        "E",
+        "M",
+        "R",
+        "A"
+      ],
+      "seed": 3003,
+      "vocab_size": 256
+    },
+    "tiny_smoke_forward_executed": true
+  },
+  "num_receipts": 0,
+  "profile": "local_gb10_quarter",
+  "profile_metadata": {
+    "depth": 13,
+    "ffn_hidden_size": 18944,
+    "head_dim": 128,
+    "hidden_size": 3584,
+    "mtp": {
+      "beta": 0.6,
+      "depth": 2,
+      "loss_weight": 0.3
+    },
+    "name": "local_gb10_quarter",
+    "num_attention_heads": 28,
+    "pattern": "AEMEAEMEAEMR",
+    "vocab_size": 65536
+  },
+  "random_init_seed_matched": true,
+  "receipt_scope": "local_cuda_mlx_tensor",
+  "receipts": [],
+  "required_receipt_fields": [
+    "tensor_name",
+    "shape",
+    "dtype",
+    "atol",
+    "rtol",
+    "max_abs_error",
+    "max_rel_error",
+    "source_commit",
+    "mlx_version",
+    "hardware",
+    "status"
+  ],
+  "seed": 3003,
+  "source": "m03_forward_parity_manifest.py",
+  "status": "refused",
+  "tolerances": {
+    "attention_rmsnorm": {
+      "atol": 0.05
+    },
+    "bf16_single_matmul": {
+      "atol": 0.1,
+      "rtol": 0.001
+    },
+    "chained_bf16": {
+      "atol": 0.1,
+      "rtol": 0.01
+    },
+    "full_step_grad": {
+      "atol": 0.1
+    },
+    "logits": {
+      "atol": 0.1,
+      "rtol": 0.01
+    }
+  },
+  "valid_statuses": [
+    "pass",
+    "fail",
+    "blocked",
+    "refused"
+  ],
+  "version": 1,
+  "warm_start": false
+}

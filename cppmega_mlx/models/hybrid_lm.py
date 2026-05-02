@@ -13,6 +13,7 @@ from typing import Literal, TypedDict
 import mlx.core as mx
 import mlx.nn as nn
 
+from cppmega_mlx.data.packing import mlx_document_boundary_mask
 from cppmega_mlx.nn.attention import AttentionConfig, CausalSelfAttention
 from cppmega_mlx.nn.m2rnn import M2RNNConfig, M2RNNMixer
 from cppmega_mlx.nn.mamba3 import Mamba3Config, Mamba3ReferenceBlock
@@ -385,6 +386,7 @@ class HybridTinyLM(nn.Module):
         ast_depth_ids: mx.array | None = None,
         sibling_index_ids: mx.array | None = None,
         node_type_ids: mx.array | None = None,
+        document_ids: mx.array | None = None,
     ) -> mx.array:
         if input_ids.ndim != 2:
             raise ValueError(f"input_ids must be shaped (B, S), got {input_ids.shape}")
@@ -424,10 +426,24 @@ class HybridTinyLM(nn.Module):
         if structure_embeddings.ndim == hidden_states.ndim:
             hidden_states = hidden_states + structure_embeddings
 
-        mask = nn.MultiHeadAttention.create_additive_causal_mask(
-            seq_length,
-            dtype=hidden_states.dtype,
+        document_ids = _validate_document_ids(
+            document_ids,
+            batch_size=batch_size,
+            seq_length=seq_length,
         )
+        mask = None
+        if any(layer.backend == "attention" for layer in self.layers):
+            if document_ids is None:
+                mask = nn.MultiHeadAttention.create_additive_causal_mask(
+                    seq_length,
+                    dtype=hidden_states.dtype,
+                )
+            else:
+                mask = mlx_document_boundary_mask(
+                    document_ids,
+                    causal=True,
+                    expand_heads=True,
+                )
         for layer in self.layers:
             hidden_states = layer(hidden_states, mask)
         return self.lm_head(self.norm(hidden_states))
@@ -453,6 +469,28 @@ def _validate_side_channel_shape(
             f"({batch_size}, {seq_length})"
         )
     return tensor
+
+
+def _validate_document_ids(
+    document_ids: mx.array | None,
+    *,
+    batch_size: int,
+    seq_length: int,
+) -> mx.array | None:
+    if document_ids is None:
+        return None
+    if document_ids.ndim != 2:
+        raise ValueError(f"document_ids must be shaped (B, S), got {document_ids.shape}")
+    if document_ids.shape != (batch_size, seq_length):
+        raise ValueError(
+            f"document_ids shape {document_ids.shape} must exactly match input_ids shape "
+            f"({batch_size}, {seq_length})"
+        )
+    has_negative = mx.any(document_ids.astype(mx.int32) < 0)
+    mx.eval(has_negative)
+    if bool(has_negative.item()):
+        raise ValueError("document_ids must be non-negative for explicit packed batches")
+    return document_ids.astype(mx.int32)
 
 __all__ = [
     "HybridBackend",

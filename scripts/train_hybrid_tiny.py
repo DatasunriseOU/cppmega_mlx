@@ -28,7 +28,6 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import mlx.core as mx  # noqa: E402
-import mlx.optimizers as optim  # noqa: E402
 
 from cppmega_mlx.data.token_dataset import TokenBatchDataset, open_token_dataset  # noqa: E402
 from cppmega_mlx.models.hybrid_lm import HybridTinyConfig, HybridTinyLM  # noqa: E402
@@ -37,11 +36,14 @@ from cppmega_mlx.runtime.memory import (  # noqa: E402
     DEFAULT_WIRED_RATIO,
     apply_memory_limit_plan,
     device_total_memory_bytes,
+    maybe_clear_cache_after_step,
     memory_limit_plan,
 )
+from cppmega_mlx.runtime.seed import capture_rng_state  # noqa: E402
 from cppmega_mlx.training.checkpoint import load_checkpoint, save_checkpoint  # noqa: E402
 from cppmega_mlx.training.compiled import CompiledPretrainingStep  # noqa: E402
 from cppmega_mlx.training.eval import evaluate_batches  # noqa: E402
+from cppmega_mlx.training.optimizers import make_adamw  # noqa: E402
 
 
 DTYPES = {
@@ -112,6 +114,7 @@ class TrainHybridTinyConfig:
     memory_limit_wired_ratio: float = DEFAULT_WIRED_RATIO
     memory_limit_metal_ratio: float = DEFAULT_METAL_RATIO
     apply_memory_limit_plan: bool = False
+    clear_cache_every_steps: int | None = None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -358,6 +361,12 @@ def build_parser() -> argparse.ArgumentParser:
             "Dry-runs always report the plan without applying it."
         ),
     )
+    parser.add_argument(
+        "--clear-cache-every-steps",
+        type=int,
+        default=TrainHybridTinyConfig.clear_cache_every_steps,
+        help="Run mx.clear_cache after training steps divisible by this cadence.",
+    )
     parser.add_argument("--json", action="store_true", help="Emit metrics JSON only.")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--dry-run-json", action="store_true")
@@ -432,6 +441,7 @@ def config_from_args(args: argparse.Namespace) -> TrainHybridTinyConfig:
         memory_limit_wired_ratio=args.memory_limit_wired_ratio,
         memory_limit_metal_ratio=args.memory_limit_metal_ratio,
         apply_memory_limit_plan=args.apply_memory_limit_plan,
+        clear_cache_every_steps=args.clear_cache_every_steps,
     )
 
 
@@ -507,6 +517,8 @@ def validate_config(config: TrainHybridTinyConfig) -> None:
         wired_ratio=config.memory_limit_wired_ratio,
         metal_ratio=config.memory_limit_metal_ratio,
     )
+    if config.clear_cache_every_steps is not None and config.clear_cache_every_steps <= 0:
+        raise ValueError("clear_cache_every_steps must be positive when provided")
 
 
 def validation_dataset_path(config: TrainHybridTinyConfig) -> str | None:
@@ -781,6 +793,48 @@ def memory_limit_payload(
     }
 
 
+def reset_peak_memory() -> bool:
+    if hasattr(mx, "reset_peak_memory"):
+        mx.reset_peak_memory()
+        return True
+    metal = getattr(mx, "metal", None)
+    if metal is not None and hasattr(metal, "reset_peak_memory"):
+        metal.reset_peak_memory()
+        return True
+    return False
+
+
+def metal_memory_payload() -> dict[str, int | None]:
+    metal = getattr(mx, "metal", None)
+    if metal is None:
+        return {
+            "active_memory_bytes": None,
+            "cache_memory_bytes": None,
+            "peak_memory_bytes": None,
+        }
+    return {
+        "active_memory_bytes": _call_optional_int(mx, "get_active_memory")
+        if hasattr(mx, "get_active_memory")
+        else _call_optional_int(metal, "get_active_memory"),
+        "cache_memory_bytes": _call_optional_int(mx, "get_cache_memory")
+        if hasattr(mx, "get_cache_memory")
+        else _call_optional_int(metal, "get_cache_memory"),
+        "peak_memory_bytes": _call_optional_int(mx, "get_peak_memory")
+        if hasattr(mx, "get_peak_memory")
+        else _call_optional_int(metal, "get_peak_memory"),
+    }
+
+
+def _call_optional_int(obj: Any, name: str) -> int | None:
+    fn = getattr(obj, name, None)
+    if fn is None:
+        return None
+    try:
+        return int(fn())
+    except Exception:
+        return None
+
+
 def metadata_non_negative_int(
     metadata: dict[str, Any],
     key: str,
@@ -998,6 +1052,7 @@ def checkpoint_metadata(
     step: int,
     consumed_batches: int | None = None,
     evaluation: dict[str, Any] | None = None,
+    rng: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     cursor = dataset.cursor_after(step if consumed_batches is None else consumed_batches)
     cursor_payload = cursor.__dict__
@@ -1012,6 +1067,10 @@ def checkpoint_metadata(
         },
         "training_config": asdict(config),
         "dataset": dataset_payload(dataset, config),
+        "rng": rng if rng is not None else {
+            "mode": "snapshot",
+            "snapshot": capture_rng_state(),
+        },
     }
     if evaluation is not None:
         payload["evaluation"] = evaluation
@@ -1021,7 +1080,7 @@ def checkpoint_metadata(
 def save_training_checkpoint(
     *,
     model: HybridTinyLM,
-    optimizer: optim.Optimizer,
+    optimizer: Any,
     path: str | Path,
     config: TrainHybridTinyConfig,
     dataset: TokenBatchDataset,
@@ -1029,6 +1088,7 @@ def save_training_checkpoint(
     step: int,
     consumed_batches: int | None = None,
     evaluation: dict[str, Any] | None = None,
+    rng: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return save_checkpoint(
         model,
@@ -1042,6 +1102,7 @@ def save_training_checkpoint(
             step=step,
             consumed_batches=consumed_batches,
             evaluation=evaluation,
+            rng=rng,
         ),
     )
 
@@ -1200,6 +1261,8 @@ def train_hybrid_tiny(
     route_backend = route_backend_payload(model)
     device = device_info()
     compile_plan = compile_payload(config, device)
+    peak_memory_reset = reset_peak_memory()
+    memory_before = metal_memory_payload()
     requested_resume_cursor = (
         {
             "step": resume_step,
@@ -1209,7 +1272,7 @@ def train_hybrid_tiny(
         if config.resume_from
         else None
     )
-    optimizer = optim.AdamW(
+    optimizer = make_adamw(
         learning_rate=config.learning_rate,
         weight_decay=config.weight_decay,
     )
@@ -1263,12 +1326,21 @@ def train_hybrid_tiny(
     mx.eval(model.state, optimizer.state)
 
     step_metrics = []
+    clear_cache_events: list[dict[str, Any]] = []
     saved_checkpoints: list[dict[str, Any]] = []
     batches = dataset.iter_batches(loop=True)
     for _ in range(config.steps):
         metrics = stepper(next(batches))
         step_metrics.append(asdict(metrics))
         mx.synchronize()
+        clear_cache_event = maybe_clear_cache_after_step(
+            metrics.step,
+            config.clear_cache_every_steps,
+            mx_module=mx,
+            synchronize=False,
+        )
+        if clear_cache_event is not None:
+            clear_cache_events.append(clear_cache_event.to_dict())
         if (
             config.checkpoint_dir
             and config.checkpoint_save_interval
@@ -1314,6 +1386,8 @@ def train_hybrid_tiny(
         config=config,
         valid_path=valid_path,
     )
+    mx.synchronize()
+    memory_after = metal_memory_payload()
 
     final_checkpoint: dict[str, Any] | None = None
     if config.checkpoint_path:
@@ -1347,6 +1421,15 @@ def train_hybrid_tiny(
         "parameter_count": parameter_count(model),
         "device": device,
         "memory_limit": memory_limit,
+        "memory": {
+            "before": memory_before,
+            "after": memory_after,
+            "peak_memory_bytes": memory_after.get("peak_memory_bytes"),
+            "peak_memory_reset": peak_memory_reset,
+            "clear_cache_every_steps": config.clear_cache_every_steps,
+            "clear_cache_events": clear_cache_events,
+            "clear_cache_event_count": len(clear_cache_events),
+        },
         "steps": config.steps,
         "start_step": resume_step,
         "end_step": final["step"],

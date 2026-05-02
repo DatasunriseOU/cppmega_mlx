@@ -27,8 +27,8 @@ from cppmega_mlx.data.token_dataset import (  # noqa: E402
 )
 
 
-SmokeDatasetFormat = Literal["npz", "megatron"]
-SUPPORTED_FORMATS: tuple[SmokeDatasetFormat, ...] = ("npz", "megatron")
+SmokeDatasetFormat = Literal["npz", "parquet", "megatron"]
+SUPPORTED_FORMATS: tuple[SmokeDatasetFormat, ...] = ("npz", "parquet", "megatron")
 STRUCTURE_SIDE_CHANNELS = (
     "structure_ids",
     "dep_levels",
@@ -66,14 +66,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "dataset_path",
         type=str,
-        help="Path to a .npz shard or suffixless/.bin/.idx Megatron indexed shard.",
+        help=(
+            "Path to a .npz/.parquet/.pq shard or suffixless/.bin/.idx "
+            "Megatron indexed shard."
+        ),
     )
     parser.add_argument(
         "--dataset-format",
         default=None,
         help=(
-            "Dataset format override. Smoke support is fail-closed to npz and "
-            "megatron only."
+            "Dataset format override. Smoke support is fail-closed to npz, "
+            "parquet, and megatron."
         ),
     )
     parser.add_argument("--batch-size", type=int, default=2)
@@ -239,6 +242,8 @@ def _resolve_dataset_format(
     suffix = dataset_path.suffix.lower()
     if suffix == ".npz":
         return "npz"
+    if suffix in {".parquet", ".pq"}:
+        return "parquet"
     if suffix in {".bin", ".idx", ".json"}:
         return "megatron"
     if dataset_path.with_suffix(".bin").exists() or dataset_path.with_suffix(
@@ -246,7 +251,8 @@ def _resolve_dataset_format(
     ).exists():
         return "megatron"
     raise SmokeError(
-        "could not infer dataset format; pass --dataset-format npz or megatron"
+        "could not infer dataset format; pass --dataset-format npz, parquet, "
+        "or megatron"
     )
 
 
@@ -272,6 +278,9 @@ def _dataset_receipt(dataset: TokenBatchDataset) -> dict[str, Any]:
     index_metadata = getattr(dataset, "index_metadata", None)
     if index_metadata is not None:
         receipt["index_metadata"] = _jsonable(index_metadata)
+    parquet_receipt = getattr(dataset, "parquet_receipt", None)
+    if parquet_receipt is not None:
+        receipt["parquet_receipt"] = _jsonable(parquet_receipt)
     return receipt
 
 

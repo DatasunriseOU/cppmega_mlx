@@ -323,6 +323,48 @@ def test_no_tracked_parquet_samples_or_runtime_overclaims() -> None:
     assert "full Megatron launcher/training parity remains outside the tiny-local scaffold" in normalized
 
 
+def test_mamba3_m2rnn_docs_stay_tied_to_local_reference_checks() -> None:
+    perf_doc = (ROOT / "docs" / "perf_mamba_m2rnn.md").read_text()
+    buy_vs_build = (ROOT / "docs" / "mlx_buy_vs_build.md").read_text()
+    combined = f"{perf_doc}\n{buy_vs_build}"
+
+    for phrase in (
+        "cppmega_mlx/nn/mamba3.py",
+        "cppmega_mlx/nn/m2rnn.py",
+        "tests/test_mamba3.py",
+        "tests/test_m2rnn.py",
+        "cppmega/megatron/author_mamba3_spec.py",
+        "cppmega/megatron/mamba3_te_mixer.py",
+        "cppmega/megatron/m2rnn_spec.py",
+        "local correctness/reference port",
+        "must not claim a fused Metal Mamba3 scan",
+        "Metal M2RNN recurrence",
+    ):
+        assert phrase in perf_doc
+
+    for phrase in (
+        "Mamba3 block",
+        "M2RNN mixer",
+        "PORT-FUSED",
+        "already partial in `cppmega_mlx/nn/m2rnn.py`",
+    ):
+        assert phrase in buy_vs_build
+
+    forbidden_overclaims = (
+        "fused Metal Mamba3 scan is implemented",
+        "fused Metal M2RNN recurrence is implemented",
+        "Mamba3 Megatron/CUDA numerical parity is proven",
+        "M2RNN Megatron/CUDA numerical parity is proven",
+        "Mamba3 distributed Megatron integration is implemented",
+        "M2RNN distributed Megatron integration is implemented",
+        "M4-vs-GB10 speed parity is proven",
+        "M4 Max matches GB10 for Mamba3",
+        "M4 Max matches GB10 for M2RNN",
+    )
+    for phrase in forbidden_overclaims:
+        assert phrase not in combined
+
+
 def test_external_research_contract_is_importable_from_clean_process() -> None:
     script = "\n".join(
         [

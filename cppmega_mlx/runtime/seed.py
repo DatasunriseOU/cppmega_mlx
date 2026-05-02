@@ -89,6 +89,11 @@ def _require_snapshot_version(snapshot: Mapping[str, Any]) -> None:
             f"unsupported RNG snapshot version {snapshot.get('version')!r}; "
             f"expected {_SNAPSHOT_VERSION}"
         )
+    if snapshot.get("scope") != "single_process_local":
+        raise ValueError(
+            f"unsupported RNG snapshot scope {snapshot.get('scope')!r}; "
+            "expected 'single_process_local'"
+        )
     for key in ("python_random", "numpy_random", "mlx_random"):
         if key not in snapshot:
             raise ValueError(f"RNG snapshot missing {key!r}")

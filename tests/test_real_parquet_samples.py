@@ -26,20 +26,10 @@ GB10_SAMPLE_ROOT = REPO_ROOT / "data" / "parquet_samples" / "gb10"
 REAL_COLUMNS = (
     "token_ids",
     "structure_ids",
-    "token_structure_ids",
-    "token_dep_levels",
-    "token_ast_depth",
-    "token_sibling_index",
-    "token_ast_node_type",
 )
 EXPECTED_GB10_COLUMN_TYPES = {
     "token_ids": "large_list<element: uint32>",
     "structure_ids": "large_list<element: int8>",
-    "token_structure_ids": "large_list<element: uint8>",
-    "token_dep_levels": "large_list<element: uint16>",
-    "token_ast_depth": "large_list<element: uint16>",
-    "token_sibling_index": "large_list<element: uint16>",
-    "token_ast_node_type": "large_list<element: uint16>",
 }
 STRUCTURE_MODEL_KWARG_KEYS = (
     "structure_ids",
@@ -67,7 +57,7 @@ def test_local_parquet_sample_tree_is_git_ignored() -> None:
         ("clang_commits_4k_v1", 4),
     ],
 )
-def test_gb10_real_parquet_schema_loads_token_aligned_side_channels(
+def test_gb10_real_parquet_schema_loads_token_only_training_columns(
     tmp_path: Path, dataset_name: str, expected_min_rows: int
 ) -> None:
     source_path = GB10_SAMPLE_ROOT / dataset_name / "val_00000.parquet"
@@ -91,17 +81,8 @@ def test_gb10_real_parquet_schema_loads_token_aligned_side_channels(
 
     first_token_ids = table["token_ids"].to_pylist()[0]
     first_source_structure = table["structure_ids"].to_pylist()[0]
-    first_token_structure = table["token_structure_ids"].to_pylist()[0]
     assert len(first_token_ids) >= 128
-    assert len(first_token_structure) == len(first_token_ids)
     assert len(first_source_structure) != len(first_token_ids)
-    for alias in (
-        "token_dep_levels",
-        "token_ast_depth",
-        "token_sibling_index",
-        "token_ast_node_type",
-    ):
-        assert len(table[alias].to_pylist()[0]) == len(first_token_ids)
 
     dataset = TokenParquetDataset(
         sample_path,
@@ -119,28 +100,7 @@ def test_gb10_real_parquet_schema_loads_token_aligned_side_channels(
         "column": "token_ids",
         "type": "large_list<element: uint32>",
     }
-    assert dataset.parquet_receipt["side_channel_sources"] == {
-        "ast_depth_ids": {
-            "column": "token_ast_depth",
-            "type": "large_list<element: uint16>",
-        },
-        "dep_levels": {
-            "column": "token_dep_levels",
-            "type": "large_list<element: uint16>",
-        },
-        "node_type_ids": {
-            "column": "token_ast_node_type",
-            "type": "large_list<element: uint16>",
-        },
-        "sibling_index_ids": {
-            "column": "token_sibling_index",
-            "type": "large_list<element: uint16>",
-        },
-        "structure_ids": {
-            "column": "token_structure_ids",
-            "type": "large_list<element: uint8>",
-        },
-    }
+    assert dataset.parquet_receipt["side_channel_sources"] == {}
     assert dataset.parquet_receipt["skipped_side_channel_columns"] == [
         {
             "field": "structure_ids",
@@ -153,18 +113,13 @@ def test_gb10_real_parquet_schema_loads_token_aligned_side_channels(
     token_min, token_max = dataset.token_id_range()
     assert 0 <= token_min <= token_max <= np.iinfo(np.int32).max
 
-    assert batch.structure_ids is not None
     np.testing.assert_array_equal(np.array(batch.tokens[0]), first_token_ids[:128])
-    np.testing.assert_array_equal(
-        np.array(batch.structure_ids[0]), first_token_structure[:128]
-    )
+    assert batch.structure_ids is None
+    assert batch.model_kwargs() == {}
     for field_name in (
         *STRUCTURE_MODEL_KWARG_KEYS,
     ):
-        value = getattr(batch, field_name)
-        assert value is not None
-        assert tuple(value.shape) == tuple(batch.tokens.shape)
-        assert np.array(value).dtype == np.int32
+        assert getattr(batch, field_name) is None
 
 
 @pytest.mark.parametrize(
@@ -174,7 +129,7 @@ def test_gb10_real_parquet_schema_loads_token_aligned_side_channels(
         "clang_commits_4k_v1",
     ],
 )
-def test_gb10_real_parquet_side_channels_reach_training_loss(
+def test_gb10_real_parquet_token_only_batches_reach_training_loss(
     tmp_path: Path, dataset_name: str
 ) -> None:
     source_path = GB10_SAMPLE_ROOT / dataset_name / "val_00000.parquet"
@@ -202,9 +157,7 @@ def test_gb10_real_parquet_side_channels_reach_training_loss(
     assert 0 <= token_min <= token_max
 
     kwargs = batch.model_kwargs()
-    assert tuple(kwargs) == STRUCTURE_MODEL_KWARG_KEYS
-    for key in STRUCTURE_MODEL_KWARG_KEYS:
-        assert tuple(kwargs[key].shape) == (2, 127)
+    assert kwargs == {}
 
     config = HybridTinyConfig(
         vocab_size=max(64, token_max + 1),
@@ -271,10 +224,7 @@ def test_gb10_real_parquet_runs_one_local_train_and_eval_step(
     eval_batch = next(dataset.iter_batches())
 
     kwargs = train_batch.model_kwargs()
-    assert tuple(kwargs) == STRUCTURE_MODEL_KWARG_KEYS
-    for key, value in kwargs.items():
-        assert tuple(value.shape) == tuple(train_batch.inputs.shape)
-        assert tuple(value.shape) == (2, 127), key
+    assert kwargs == {}
 
     _, token_max = dataset.token_id_range()
     config = _real_parquet_tiny_config(token_max=token_max)
@@ -455,24 +405,12 @@ def _assert_cli_dataset_receipt(
     assert dataset_payload["path"] == str(sample_path)
     assert dataset_payload["metadata"]["source_format"] == "parquet"
     assert dataset_payload["token_key"] == "token_ids"
-    assert dataset_payload["side_channels"] == [
-        "ast_depth_ids",
-        "dep_levels",
-        "node_type_ids",
-        "sibling_index_ids",
-        "structure_ids",
-    ]
+    assert dataset_payload["side_channels"] == []
     assert dataset_payload["side_channel_contract"]["structure_side_channels"] == {
         "attention_mask_is_loss_only": False,
         "batch_slice": "tokens[:, :-1]",
         "model_kwarg_names": list(STRUCTURE_MODEL_KWARG_KEYS),
-        "threaded_to_model": [
-            "ast_depth_ids",
-            "dep_levels",
-            "node_type_ids",
-            "sibling_index_ids",
-            "structure_ids",
-        ],
+        "threaded_to_model": [],
     }
 
     receipt = dataset_payload["dataset_receipt"]
@@ -498,28 +436,7 @@ def _assert_cli_dataset_receipt(
             "column": "token_ids",
             "type": "large_list<element: uint32>",
         },
-        "side_channel_sources": {
-            "ast_depth_ids": {
-                "column": "token_ast_depth",
-                "type": "large_list<element: uint16>",
-            },
-            "dep_levels": {
-                "column": "token_dep_levels",
-                "type": "large_list<element: uint16>",
-            },
-            "node_type_ids": {
-                "column": "token_ast_node_type",
-                "type": "large_list<element: uint16>",
-            },
-            "sibling_index_ids": {
-                "column": "token_sibling_index",
-                "type": "large_list<element: uint16>",
-            },
-            "structure_ids": {
-                "column": "token_structure_ids",
-                "type": "large_list<element: uint8>",
-            },
-        },
+        "side_channel_sources": {},
         "skipped_side_channel_columns": [
             {
                 "field": "structure_ids",

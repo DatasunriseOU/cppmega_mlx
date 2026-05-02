@@ -14,7 +14,7 @@ from cppmega_mlx.data.batch import synthetic_token_batch
 from cppmega_mlx.models.hybrid_lm import HybridTinyConfig, HybridTinyLM
 from cppmega_mlx.recipes.nam56r import build_hybrid_tiny_config_from_nam56r
 from cppmega_mlx.training.compiled import CompiledPretrainingStep
-from cppmega_mlx.training.loss import next_token_cross_entropy
+from cppmega_mlx.training.loss import next_token_cross_entropy, next_token_cross_entropy_with_mtp
 
 
 def _hybrid_config(**overrides) -> HybridTinyConfig:
@@ -195,6 +195,187 @@ def test_hybrid_lm_single_route_train_steps_update_route_specific_sentinels() ->
         _assert_finite_nonzero(flat_grads, param_name)
         assert _max_abs({param_name: after[param_name] - before[param_name]}, param_name) > 0
         _assert_adamw_state_for(optimizer_state, param_name)
+
+
+def test_hybrid_lm_skips_causal_mask_allocation_for_non_attention_routes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[int, mx.Dtype]] = []
+    original = nn.MultiHeadAttention.create_additive_causal_mask
+
+    def recording_mask(seq_length: int, *, dtype: mx.Dtype):
+        calls.append((seq_length, dtype))
+        return original(seq_length, dtype=dtype)
+
+    monkeypatch.setattr(
+        nn.MultiHeadAttention,
+        "create_additive_causal_mask",
+        recording_mask,
+    )
+
+    input_ids = mx.array([[1, 2, 3, 4]], dtype=mx.int32)
+    for symbol in ("M", "R", "MR"):
+        model = HybridTinyLM(
+            _hybrid_config(
+                pattern=symbol,
+                depth=len(symbol),
+                dsa_a_layer_ranks=(),
+                hidden_size=8,
+                num_attention_heads=1,
+                max_seq_length=8,
+                mamba_expand=1,
+                mamba_head_dim=4,
+                mamba_state_dim=4,
+                mamba_groups=1,
+                mamba_chunk_size=4,
+                m2rnn_k_head_dim=2,
+                m2rnn_v_head_dim=2,
+                m2rnn_num_v_heads=1,
+                m2rnn_num_f_heads=1,
+                m2rnn_num_weight_heads=1,
+                m2rnn_chunk_size=4,
+            )
+        )
+        out = model(input_ids)
+        mx.eval(out)
+
+    assert calls == []
+
+    attention_model = HybridTinyLM(_single_route_config("A"))
+    attention_out = attention_model(input_ids)
+    mx.eval(attention_out)
+
+    assert calls == [(4, mx.float32)]
+
+
+def test_hybrid_lm_document_ids_mask_cross_document_attention() -> None:
+    mx.random.seed(461)
+    model = HybridTinyLM(_single_route_config("A"))
+    prefix_a = mx.array([[1, 2, 3]], dtype=mx.int32)
+    prefix_b = mx.array([[7, 8, 9]], dtype=mx.int32)
+    suffix = mx.array([[4, 5]], dtype=mx.int32)
+    document_ids = mx.array([[0, 0, 0, 1, 1]], dtype=mx.int32)
+
+    out_a = model(mx.concatenate([prefix_a, suffix], axis=1), document_ids=document_ids)
+    out_b = model(mx.concatenate([prefix_b, suffix], axis=1), document_ids=document_ids)
+    mx.eval(out_a, out_b)
+
+    np.testing.assert_allclose(
+        np.array(out_a[:, 3:, :]),
+        np.array(out_b[:, 3:, :]),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    with pytest.raises(AssertionError):
+        np.testing.assert_allclose(
+            np.array(out_a[:, 3:, :]),
+            np.array(model(mx.concatenate([prefix_b, suffix], axis=1))[:, 3:, :]),
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
+
+def test_hybrid_lm_document_ids_fail_closed_on_shape_and_negative_values() -> None:
+    model = HybridTinyLM(_single_route_config("A"))
+    input_ids = mx.array([[1, 2, 3, 4]], dtype=mx.int32)
+
+    with pytest.raises(ValueError, match="document_ids.*match input_ids"):
+        model(input_ids, document_ids=mx.array([[0, 0, 0]], dtype=mx.int32))
+    with pytest.raises(ValueError, match="document_ids.*non-negative"):
+        model(input_ids, document_ids=mx.array([[0, 0, -1, 1]], dtype=mx.int32))
+
+
+def test_hybrid_lm_document_ids_fail_closed_even_without_attention_routes() -> None:
+    model = HybridTinyLM(
+        _hybrid_config(
+            pattern="M",
+            depth=1,
+            dsa_a_layer_ranks=(),
+            hidden_size=8,
+            num_attention_heads=1,
+            max_seq_length=8,
+            mamba_expand=1,
+            mamba_head_dim=4,
+            mamba_state_dim=4,
+            mamba_groups=1,
+            mamba_chunk_size=4,
+        )
+    )
+    input_ids = mx.array([[1, 2, 3, 4]], dtype=mx.int32)
+
+    with pytest.raises(ValueError, match="document_ids.*match input_ids"):
+        model(input_ids, document_ids=mx.array([[0, 0, 0]], dtype=mx.int32))
+    with pytest.raises(ValueError, match="document_ids.*non-negative"):
+        model(input_ids, document_ids=mx.array([[0, 0, -1, 1]], dtype=mx.int32))
+
+
+def test_next_token_loss_accepts_document_id_aliases_and_rejects_conflicts() -> None:
+    mx.random.seed(463)
+    model = HybridTinyLM(_single_route_config("A"))
+    tokens = mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32)
+    document_ids = mx.array([[0, 0, 0, 1, 1]], dtype=mx.int32)
+
+    losses: list[float] = []
+    for alias in ("document_ids", "doc_ids", "packing_document_ids"):
+        loss, ntokens = next_token_cross_entropy(
+            model,
+            {
+                "tokens": tokens,
+                alias: document_ids,
+            },
+        )
+        mx.eval(loss, ntokens)
+        assert int(ntokens.item()) == 4
+        losses.append(float(loss.item()))
+
+    assert losses[0] == pytest.approx(losses[1], rel=0, abs=0)
+    assert losses[0] == pytest.approx(losses[2], rel=0, abs=0)
+
+    with pytest.raises(ValueError, match="only one document-id alias"):
+        next_token_cross_entropy(
+            model,
+            {
+                "tokens": tokens,
+                "document_ids": document_ids,
+                "doc_ids": document_ids,
+            },
+        )
+    with pytest.raises(ValueError, match="doc_ids.*non-negative"):
+        next_token_cross_entropy(
+            model,
+            {
+                "tokens": tokens,
+                "doc_ids": mx.array([[0, 0, -1, 1, 1]], dtype=mx.int32),
+            },
+        )
+
+
+def test_mtp_loss_threads_document_ids_through_decoder_hidden_states() -> None:
+    mx.random.seed(467)
+    model = HybridTinyLM(_single_route_config("A"))
+    tokens = mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32)
+    document_ids = mx.array([[0, 0, 0, 1, 1]], dtype=mx.int32)
+
+    total_loss, ntokens, metrics = next_token_cross_entropy_with_mtp(
+        model,
+        {
+            "tokens": tokens,
+            "packing_document_ids": document_ids,
+        },
+    )
+    mx.eval(total_loss, ntokens, metrics.mtp_loss)
+
+    assert int(ntokens.item()) == 4
+    assert math.isfinite(float(total_loss.item()))
+    assert math.isfinite(float(metrics.mtp_loss.item()))
+    with pytest.raises(ValueError, match="packing_document_ids.*non-negative"):
+        next_token_cross_entropy_with_mtp(
+            model,
+            {
+                "tokens": tokens,
+                "packing_document_ids": mx.array([[0, 0, 0, -1, 1]], dtype=mx.int32),
+            },
+        )
 
 
 def test_hybrid_lm_r_route_updates_m2rnn_recurrence_parameters() -> None:

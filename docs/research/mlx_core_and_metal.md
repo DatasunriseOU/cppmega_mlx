@@ -328,6 +328,20 @@ Rules for cppmega kernels:
 - Use ensure_row_contiguous=True only where the hidden copy is acceptable. For hot gather/scatter kernels, prefer explicit stride-aware kernels and tests that detect accidental copies.
 - For backward scatter/gather, expect atomics and zero initialization. Test deterministic tolerances carefully.
 
+Local lint guardrails:
+
+- tools/lint_mlx.py enforces MLX001 for mx.array(<python scalar literal>)
+  without an explicit dtype.
+- MLX002 blocks ad hoc mx.fast.metal_kernel construction outside
+  cppmega_mlx/kernels/metal_ops.py so custom kernels stay behind the owned
+  fallback/parity/VJP/JVP/profile-evidence policy seam.
+- MLX003 blocks differentiated custom Metal use when a file combines
+  metal_kernel with mx/nn autodiff calls but lacks @mx.custom_function plus an
+  explicit .vjp or .jvp marker.
+- MLX004 keeps benchmark throughput honest by flagging tokens_per_second
+  derived from first-call/compile timing and compile_time_s derived from warmup
+  or steady-state step timings.
+
 ## custom_function, VJP, And JVP
 
 Local installed API:

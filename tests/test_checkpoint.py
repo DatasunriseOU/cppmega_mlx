@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import random
+from typing import TypedDict
 
 import mlx.core as mx
 import mlx.optimizers as optim
@@ -9,9 +11,11 @@ import pytest
 from mlx.utils import tree_flatten
 
 from cppmega_mlx.data.batch import synthetic_token_batch
+from cppmega_mlx.data.token_dataset import TokenNpzDataset
 from cppmega_mlx.models.hybrid_lm import HybridTinyConfig, HybridTinyLM
 from cppmega_mlx.models.tiny_lm import TinyLM, TinyLMConfig
-from cppmega_mlx.runtime.seed import capture_rng_state
+from cppmega_mlx.runtime.seed import capture_rng_state, seed_all
+import cppmega_mlx.training.checkpoint as checkpoint_module
 from cppmega_mlx.training.checkpoint import (
     FORMAT_NAME,
     FORMAT_VERSION,
@@ -20,6 +24,7 @@ from cppmega_mlx.training.checkpoint import (
     OPTIMIZER_NAME,
     RNG_MODE_NOT_SAVED,
     RNG_MODE_SEED,
+    RNG_MODE_SNAPSHOT,
     SHARD_INDEX_NAME,
     SHARDING_MODE_SINGLE_FILE,
     WEIGHTS_NAME,
@@ -28,6 +33,12 @@ from cppmega_mlx.training.checkpoint import (
 )
 from cppmega_mlx.training.compiled import CompiledPretrainingStep
 from cppmega_mlx.training.loop import one_step_train
+
+
+class RngSample(TypedDict):
+    python_random: list[float]
+    numpy_random: np.ndarray
+    mlx_random: np.ndarray
 
 
 def _tiny_config() -> TinyLMConfig:
@@ -101,6 +112,32 @@ def _assert_tree_allclose(actual, expected, *, atol: float = 0.0) -> None:
         )
 
 
+def _draw_rng_sample() -> RngSample:
+    mlx_values = mx.random.uniform(shape=(4,))
+    mx.eval(mlx_values)
+    return {
+        "python_random": [random.random() for _ in range(4)],
+        "numpy_random": np.random.random(4),
+        "mlx_random": np.array(mlx_values),
+    }
+
+
+def _assert_rng_sample_equal(actual: RngSample, expected: RngSample) -> None:
+    assert actual["python_random"] == expected["python_random"]
+    np.testing.assert_allclose(
+        actual["numpy_random"],
+        expected["numpy_random"],
+        rtol=0,
+        atol=0,
+    )
+    np.testing.assert_allclose(
+        actual["mlx_random"],
+        expected["mlx_random"],
+        rtol=0,
+        atol=0,
+    )
+
+
 def _rewrite_manifest(checkpoint_path, update) -> dict:
     metadata_path = checkpoint_path / METADATA_NAME
     manifest = json.loads(metadata_path.read_text())
@@ -155,7 +192,16 @@ def test_checkpoint_manifest_records_resume_contract(tmp_path) -> None:
     assert manifest["version"] == FORMAT_VERSION
     assert manifest["step"] == 1
     assert manifest["weights"] == WEIGHTS_NAME
-    assert manifest["rng"] == {"mode": RNG_MODE_NOT_SAVED}
+    assert manifest["rng"]["mode"] == RNG_MODE_SNAPSHOT
+    assert manifest["rng"]["snapshot"]["version"] == 1
+    assert manifest["rng"]["snapshot"]["scope"] == "single_process_local"
+    assert set(manifest["rng"]["snapshot"]) == {
+        "version",
+        "scope",
+        "python_random",
+        "numpy_random",
+        "mlx_random",
+    }
     assert manifest["sharding"] == {
         "mode": SHARDING_MODE_SINGLE_FILE,
         "num_shards": 1,
@@ -275,6 +321,143 @@ def test_checkpoint_load_rejects_coerced_training_state_booleans(
                 compile=False,
             ),
         )
+
+
+@pytest.mark.parametrize(
+    ("mutate_manifest", "error"),
+    [
+        (
+            lambda manifest: manifest.update({"step": manifest["step"] + 1}),
+            "training_state.state.step does not match step",
+        ),
+        (
+            lambda manifest: manifest.update(
+                {"trained_tokens": manifest["trained_tokens"] + 1}
+            ),
+            "training_state.state.trained_tokens does not match trained_tokens",
+        ),
+        (
+            lambda manifest: manifest["resume_cursor"].update(
+                {"step": manifest["resume_cursor"]["step"] + 1}
+            ),
+            "resume_cursor.step does not match step",
+        ),
+        (
+            lambda manifest: manifest["resume_cursor"].update(
+                {
+                    "batch_cursor": {
+                        **manifest["resume_cursor"]["batch_cursor"],
+                        "global_batch_offset": (
+                            manifest["resume_cursor"]["batch_cursor"][
+                                "global_batch_offset"
+                            ]
+                            + 1
+                        ),
+                    }
+                }
+            ),
+            "resume_cursor.batch_cursor does not match batch_cursor",
+        ),
+    ],
+)
+def test_checkpoint_load_rejects_inconsistent_resume_cursors(
+    tmp_path,
+    mutate_manifest,
+    error,
+) -> None:
+    config = _tiny_config()
+    checkpoint_path = tmp_path / "inconsistent-resume-cursor"
+    model = TinyLM(config)
+    optimizer = optim.AdamW(learning_rate=1e-2, weight_decay=0.0)
+    step = CompiledPretrainingStep(model, optimizer, compile=False)
+    batch = synthetic_token_batch(
+        batch_size=2,
+        seq_length=8,
+        vocab_size=config.vocab_size,
+        seed=33,
+        include_structure=True,
+    )
+    step(batch)
+    cursor = {
+        "epoch": 0,
+        "batch_offset": 1,
+        "global_batch_offset": 1,
+    }
+    save_checkpoint(
+        model,
+        checkpoint_path,
+        optimizer=optimizer,
+        training_step=step,
+        metadata={
+            "step": step.state.step,
+            "trained_tokens": step.state.trained_tokens,
+            "batch_cursor": cursor,
+            "resume_cursor": {
+                "step": step.state.step,
+                "trained_tokens": step.state.trained_tokens,
+                "batch_cursor": cursor,
+            },
+        },
+    )
+    metadata_path = checkpoint_path / METADATA_NAME
+    manifest = json.loads(metadata_path.read_text())
+    mutate_manifest(manifest)
+    metadata_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+
+    with pytest.raises(ValueError, match=error):
+        load_checkpoint(
+            TinyLM(config),
+            checkpoint_path,
+            optimizer=optim.AdamW(learning_rate=1e-2, weight_decay=0.0),
+            training_step=CompiledPretrainingStep(
+                TinyLM(config),
+                optim.AdamW(learning_rate=1e-2, weight_decay=0.0),
+                compile=False,
+            ),
+        )
+
+
+def test_checkpoint_save_promotes_training_state_cursor_to_top_level_manifest(
+    tmp_path,
+) -> None:
+    config = _tiny_config()
+    checkpoint_path = tmp_path / "training-state-top-level-cursor"
+    model = TinyLM(config)
+    optimizer = optim.AdamW(learning_rate=1e-2, weight_decay=0.0)
+    step = CompiledPretrainingStep(model, optimizer, compile=False)
+    batch = synthetic_token_batch(
+        batch_size=2,
+        seq_length=8,
+        vocab_size=config.vocab_size,
+        seed=34,
+        include_structure=True,
+    )
+    step(batch)
+
+    manifest = save_checkpoint(
+        model,
+        checkpoint_path,
+        optimizer=optimizer,
+        training_step=step,
+    )
+    loaded = load_checkpoint(
+        TinyLM(config),
+        checkpoint_path,
+        optimizer=optim.AdamW(learning_rate=1e-2, weight_decay=0.0),
+        training_step=CompiledPretrainingStep(
+            TinyLM(config),
+            optim.AdamW(learning_rate=1e-2, weight_decay=0.0),
+            compile=False,
+        ),
+    )
+
+    assert loaded == manifest
+    assert manifest["step"] == step.state.step
+    assert manifest["trained_tokens"] == step.state.trained_tokens
+    assert manifest["training_state"]["state"] == {
+        "step": step.state.step,
+        "trained_tokens": step.state.trained_tokens,
+    }
 
 
 @pytest.mark.parametrize(
@@ -540,7 +723,28 @@ def test_checkpoint_rng_seed_and_single_file_sharding_metadata_roundtrip(tmp_pat
     }
 
 
-def test_checkpoint_fails_closed_for_local_rng_snapshot_metadata(tmp_path) -> None:
+def test_checkpoint_explicit_not_saved_rng_mode_overrides_default_snapshot(tmp_path) -> None:
+    config = _tiny_config()
+    optimizer = optim.AdamW(learning_rate=1e-2, weight_decay=0.0)
+    checkpoint_path = tmp_path / "explicit-no-rng"
+
+    saved = save_checkpoint(
+        TinyLM(config),
+        checkpoint_path,
+        optimizer=optimizer,
+        metadata={"rng": {"mode": RNG_MODE_NOT_SAVED}},
+    )
+    loaded = load_checkpoint(
+        TinyLM(config),
+        checkpoint_path,
+        optimizer=optim.AdamW(learning_rate=1e-2, weight_decay=0.0),
+    )
+
+    assert saved["rng"] == {"mode": RNG_MODE_NOT_SAVED}
+    assert loaded["rng"] == {"mode": RNG_MODE_NOT_SAVED}
+
+
+def test_checkpoint_fails_closed_for_raw_local_rng_snapshot_metadata(tmp_path) -> None:
     config = _tiny_config()
     rng_snapshot = capture_rng_state()
     save_path = tmp_path / "save-local-rng-snapshot"
@@ -556,6 +760,69 @@ def test_checkpoint_fails_closed_for_local_rng_snapshot_metadata(tmp_path) -> No
 
     with pytest.raises(ValueError, match="unsupported rng fields"):
         load_checkpoint(TinyLM(config), load_path)
+
+
+def test_checkpoint_explicit_snapshot_rng_restores_global_state(tmp_path) -> None:
+    config = _tiny_config()
+    seed_all(1601)
+    model = TinyLM(config)
+    mx.eval(model.state)
+    snapshot = capture_rng_state()
+    if snapshot["mlx_random"].get("available") is not True:
+        pytest.skip("installed MLX does not expose restorable RNG state")
+    expected = _draw_rng_sample()
+    _ = _draw_rng_sample()
+
+    manifest = save_checkpoint(
+        model,
+        tmp_path / "rng-snapshot",
+        metadata={
+            "rng": {
+                "mode": RNG_MODE_SNAPSHOT,
+                "snapshot": snapshot,
+                "source": "test capture_rng_state",
+            }
+        },
+    )
+
+    seed_all(999)
+    _ = _draw_rng_sample()
+    loaded = load_checkpoint(TinyLM(config), tmp_path / "rng-snapshot")
+
+    assert loaded == manifest
+    assert loaded["rng"]["mode"] == RNG_MODE_SNAPSHOT
+    assert loaded["rng"]["source"] == "test capture_rng_state"
+    _assert_rng_sample_equal(_draw_rng_sample(), expected)
+
+
+def test_checkpoint_fails_closed_when_available_mlx_rng_snapshot_cannot_restore(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    config = _tiny_config()
+    seed_all(2601)
+    model = TinyLM(config)
+    mx.eval(model.state)
+    snapshot = capture_rng_state()
+    if snapshot["mlx_random"].get("available") is not True:
+        pytest.skip("installed MLX does not expose restorable RNG state")
+
+    save_checkpoint(
+        model,
+        tmp_path / "bad-mx-rng-restore",
+        metadata={"rng": {"mode": RNG_MODE_SNAPSHOT, "snapshot": snapshot}},
+    )
+
+    def fake_restore_rng_state(_snapshot: object) -> dict[str, object]:
+        return {
+            "python_random": "restored",
+            "numpy_random": "restored",
+            "mlx_random": {"restored": False, "reason": "forced test failure"},
+        }
+
+    monkeypatch.setattr(checkpoint_module, "restore_rng_state", fake_restore_rng_state)
+    with pytest.raises(ValueError, match="available snapshot"):
+        load_checkpoint(TinyLM(config), tmp_path / "bad-mx-rng-restore")
 
 
 @pytest.mark.parametrize(
@@ -949,6 +1216,158 @@ def test_checkpoint_resume_next_step_matches_uninterrupted_with_cursor_and_rng_m
     assert resumed_metrics.step == expected_metrics.step == 2
     assert resumed_metrics.trained_tokens == expected_metrics.trained_tokens == 28
     np.testing.assert_allclose(resumed_metrics.loss, expected_metrics.loss, rtol=0, atol=0)
+    _assert_tree_allclose(resumed.parameters(), uninterrupted.parameters(), atol=2e-7)
+    _assert_tree_allclose(
+        resumed_optimizer.state,
+        uninterrupted_optimizer.state,
+        atol=2e-7,
+    )
+
+
+def test_checkpoint_resume_matches_uninterrupted_100_steps_with_dataset_cursor(
+    tmp_path,
+) -> None:
+    config = _tiny_config()
+    rng_seed = 2407
+    dataset_seed = 91
+    interrupt_steps = 37
+    post_resume_steps = 100
+    total_steps = interrupt_steps + post_resume_steps
+    seq_len = 8
+    batch_size = 2
+
+    dataset_path = tmp_path / "resume_tokens.npz"
+    np.savez(
+        dataset_path,
+        tokens=np.arange(128 * seq_len, dtype=np.int32) % config.vocab_size,
+        vocab_size=np.array(config.vocab_size, dtype=np.int64),
+        tokenizer_contract=np.array("local_profile"),
+    )
+    dataset = TokenNpzDataset(
+        dataset_path,
+        seq_len=seq_len,
+        batch_size=batch_size,
+        shuffle=True,
+        seed=dataset_seed,
+        loop=True,
+    )
+    assert dataset.num_batches == 64
+    assert total_steps > dataset.num_batches
+
+    def make_stepper() -> tuple[TinyLM, optim.Optimizer, CompiledPretrainingStep]:
+        mx.random.seed(rng_seed)
+        model = TinyLM(config)
+        optimizer = optim.AdamW(learning_rate=1e-2, weight_decay=0.0)
+        mx.eval(model.state, optimizer.state)
+        return model, optimizer, CompiledPretrainingStep(
+            model,
+            optimizer,
+            compile=False,
+        )
+
+    def run_steps(
+        stepper: CompiledPretrainingStep,
+        batches,
+        count: int,
+    ) -> list[float]:
+        losses: list[float] = []
+        for _ in range(count):
+            losses.append(stepper(next(batches)).loss)
+        return losses
+
+    uninterrupted, uninterrupted_optimizer, uninterrupted_step = make_stepper()
+    interrupted, interrupted_optimizer, interrupted_step = make_stepper()
+
+    uninterrupted_iter = dataset.iter_batches(loop=True)
+    interrupted_iter = dataset.iter_batches(loop=True)
+    uninterrupted_prefix = run_steps(
+        uninterrupted_step,
+        uninterrupted_iter,
+        interrupt_steps,
+    )
+    interrupted_prefix = run_steps(
+        interrupted_step,
+        interrupted_iter,
+        interrupt_steps,
+    )
+    np.testing.assert_allclose(interrupted_prefix, uninterrupted_prefix, rtol=0, atol=0)
+    _assert_tree_allclose(interrupted.parameters(), uninterrupted.parameters(), atol=1e-7)
+    _assert_tree_allclose(
+        interrupted_optimizer.state,
+        uninterrupted_optimizer.state,
+        atol=1e-7,
+    )
+
+    cursor_obj = dataset.cursor_after(interrupt_steps)
+    cursor = {
+        "epoch": cursor_obj.epoch,
+        "batch_offset": cursor_obj.batch_offset,
+        "global_batch_offset": cursor_obj.global_batch_offset,
+    }
+    manifest = save_checkpoint(
+        interrupted,
+        tmp_path / "resume-100",
+        optimizer=interrupted_optimizer,
+        training_step=interrupted_step,
+        metadata={
+            "step": interrupted_step.state.step,
+            "batch_cursor": cursor,
+        },
+    )
+    assert manifest["step"] == interrupt_steps
+    assert manifest["batch_cursor"] == cursor
+    assert manifest["rng"]["mode"] == RNG_MODE_SNAPSHOT
+    assert manifest["rng"]["snapshot"]["scope"] == "single_process_local"
+    assert manifest["training_state"]["state"] == {
+        "step": interrupt_steps,
+        "trained_tokens": interrupt_steps * batch_size * (seq_len - 1),
+    }
+    assert manifest["training_state"]["pending_microbatches"] == 0
+    assert manifest["training_state"]["gradient_accumulator_present"] is False
+
+    expected_suffix = run_steps(
+        uninterrupted_step,
+        uninterrupted_iter,
+        post_resume_steps,
+    )
+
+    mx.random.seed(999)
+    resumed = TinyLM(config)
+    resumed_optimizer = optim.AdamW(learning_rate=1e-2, weight_decay=0.0)
+    resumed_step = CompiledPretrainingStep(
+        resumed,
+        resumed_optimizer,
+        compile=False,
+    )
+    loaded = load_checkpoint(
+        resumed,
+        tmp_path / "resume-100",
+        optimizer=resumed_optimizer,
+        training_step=resumed_step,
+    )
+    assert loaded == manifest
+    assert resumed_step.state.to_dict() == {
+        "step": interrupt_steps,
+        "trained_tokens": interrupt_steps * batch_size * (seq_len - 1),
+    }
+
+    resumed_iter = dataset.iter_batches(
+        resume_batch=loaded["batch_cursor"]["batch_offset"],
+        epoch=loaded["batch_cursor"]["epoch"],
+        loop=True,
+    )
+    resumed_suffix = run_steps(
+        resumed_step,
+        resumed_iter,
+        post_resume_steps,
+    )
+
+    np.testing.assert_allclose(resumed_suffix, expected_suffix, rtol=0, atol=0)
+    assert resumed_step.state.to_dict() == {
+        "step": total_steps,
+        "trained_tokens": total_steps * batch_size * (seq_len - 1),
+    }
+    assert uninterrupted_step.state.to_dict() == resumed_step.state.to_dict()
     _assert_tree_allclose(resumed.parameters(), uninterrupted.parameters(), atol=1e-7)
     _assert_tree_allclose(
         resumed_optimizer.state,

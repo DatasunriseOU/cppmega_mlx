@@ -19,6 +19,7 @@ DEFAULT_MTP_DEPTH = 2
 DEFAULT_MTP_DECAY = 0.6
 DEFAULT_MTP_LAMBDA = 0.3
 MTP_IGNORE_INDEX = -1
+MTP_INVALID_DOCUMENT_ID = -1
 
 
 @dataclass(frozen=True)
@@ -99,6 +100,7 @@ def roll_and_mask_mtp_labels(
     *,
     depth: int = DEFAULT_MTP_DEPTH,
     ignore_index: int = MTP_IGNORE_INDEX,
+    document_ids: mx.array | None = None,
 ) -> tuple[mx.array, ...]:
     """Build static-shape future labels for all MTP depths.
 
@@ -112,10 +114,23 @@ def roll_and_mask_mtp_labels(
     if depth < 0:
         raise ValueError("MTP depth must be non-negative")
 
+    base_doc_ids = _validate_mtp_document_ids(document_ids, tokens=targets)
+    rolled_doc_ids = base_doc_ids
     rolled = targets
     labels: list[mx.array] = []
     for _ in range(depth):
         rolled = _roll_left_with_fill(rolled, ignore_index)
+        if base_doc_ids is not None and rolled_doc_ids is not None:
+            rolled_doc_ids = _roll_left_with_fill(
+                rolled_doc_ids,
+                MTP_INVALID_DOCUMENT_ID,
+            )
+            rolled = _mask_cross_document_roll(
+                rolled,
+                base_doc_ids,
+                rolled_doc_ids,
+                fill_value=ignore_index,
+            )
         labels.append(rolled)
     return tuple(labels)
 
@@ -124,6 +139,7 @@ def roll_and_mask_mtp_ids(
     token_ids: mx.array,
     *,
     depth: int = DEFAULT_MTP_DEPTH,
+    document_ids: mx.array | None = None,
 ) -> tuple[mx.array, ...]:
     """Build static-shape teacher-forcing token IDs for all MTP depths."""
 
@@ -132,10 +148,23 @@ def roll_and_mask_mtp_ids(
     if depth < 0:
         raise ValueError("MTP depth must be non-negative")
 
+    base_doc_ids = _validate_mtp_document_ids(document_ids, tokens=token_ids)
+    rolled_doc_ids = base_doc_ids
     rolled = token_ids
     ids: list[mx.array] = []
     for _ in range(depth):
         rolled = _roll_left_with_fill(rolled, 0)
+        if base_doc_ids is not None and rolled_doc_ids is not None:
+            rolled_doc_ids = _roll_left_with_fill(
+                rolled_doc_ids,
+                MTP_INVALID_DOCUMENT_ID,
+            )
+            rolled = _mask_cross_document_roll(
+                rolled,
+                base_doc_ids,
+                rolled_doc_ids,
+                fill_value=0,
+            )
         ids.append(rolled)
     return tuple(ids)
 
@@ -215,6 +244,8 @@ class MinimalMTPHead(nn.Module):
         self,
         hidden_states: mx.array,
         target_tokens: mx.array,
+        *,
+        document_ids: mx.array | None = None,
     ) -> tuple[mx.array, ...]:
         if hidden_states.ndim != 3:
             raise ValueError(
@@ -226,9 +257,15 @@ class MinimalMTPHead(nn.Module):
                 f"target_tokens {target_tokens.shape}"
             )
 
-        teacher_ids = roll_and_mask_mtp_ids(target_tokens, depth=self.config.depth)
+        teacher_ids = roll_and_mask_mtp_ids(
+            target_tokens,
+            depth=self.config.depth,
+            document_ids=document_ids,
+        )
         logits_by_depth: list[mx.array] = []
-        h = hidden_states
+        # Match CUDA FastMTP: MTP supervises the shared head/block, but does
+        # not backpropagate through the already-computed main decoder states.
+        h = mx.stop_gradient(hidden_states)
         for ids in teacher_ids:
             teacher_emb = self.token_embedding(ids)
             h_mtp = self.proj(
@@ -238,20 +275,27 @@ class MinimalMTPHead(nn.Module):
                 )
             )
             h = self.output_norm(self.shared_block(h_mtp))
-            logits_by_depth.append(self.lm_head(h))
+            logits_by_depth.append(_lm_head_with_stopped_weight(self.lm_head, h))
         return tuple(logits_by_depth)
 
     def loss(
         self,
         hidden_states: mx.array,
         target_tokens: mx.array,
+        *,
+        document_ids: mx.array | None = None,
     ) -> tuple[mx.array, tuple[mx.array, ...], mx.array]:
         labels = roll_and_mask_mtp_labels(
             target_tokens,
             depth=self.config.depth,
             ignore_index=self.config.ignore_index,
+            document_ids=document_ids,
         )
-        logits_by_depth = self(hidden_states, target_tokens)
+        logits_by_depth = self(
+            hidden_states,
+            target_tokens,
+            document_ids=document_ids,
+        )
         per_depth = tuple(
             mtp_cross_entropy_from_logits(
                 logits,
@@ -265,6 +309,46 @@ class MinimalMTPHead(nn.Module):
             decay=self.config.decay,
         )
         return mtp_loss, per_depth, depth_weights
+
+
+def attach_mtp_head(
+    model: nn.Module,
+    *,
+    config: MTPLossConfig | None = None,
+) -> MinimalMTPHead:
+    """Attach a persistent MTP head to a model using direct module aliasing."""
+
+    token_embedding = getattr(model, "token_embedding", None)
+    lm_head = getattr(model, "lm_head", None)
+    if not isinstance(token_embedding, nn.Embedding):
+        raise TypeError("MTP loss requires model.token_embedding to be an nn.Embedding")
+    if not isinstance(lm_head, nn.Linear):
+        raise TypeError("MTP loss requires model.lm_head to be an nn.Linear")
+
+    head = MinimalMTPHead(token_embedding, lm_head, config=config)
+    setattr(model, "mtp_head", head)
+    return head
+
+
+def get_or_attach_mtp_head(
+    model: nn.Module,
+    *,
+    config: MTPLossConfig | None = None,
+) -> MinimalMTPHead:
+    """Return the model-owned MTP head, creating it once if absent."""
+
+    cfg = config or MTPLossConfig()
+    existing = getattr(model, "mtp_head", None)
+    if existing is None:
+        return attach_mtp_head(model, config=cfg)
+    if not isinstance(existing, MinimalMTPHead):
+        raise TypeError("model.mtp_head must be a MinimalMTPHead")
+    if existing.config != cfg:
+        raise ValueError(
+            "model.mtp_head config does not match requested MTP loss config; "
+            "attach a head with the desired config before training"
+        )
+    return existing
 
 
 def next_token_and_mtp_loss(
@@ -320,6 +404,45 @@ def _roll_left_with_fill(x: mx.array, fill_value: int) -> mx.array:
     return mx.where(keep, rolled, mx.array(fill_value, dtype=x.dtype))
 
 
+def _validate_mtp_document_ids(
+    document_ids: mx.array | None,
+    *,
+    tokens: mx.array,
+) -> mx.array | None:
+    if document_ids is None:
+        return None
+    if document_ids.ndim != 2:
+        raise ValueError(f"document_ids must be shaped (B, T), got {document_ids.shape}")
+    if document_ids.shape != tokens.shape:
+        raise ValueError(
+            f"document_ids shape {document_ids.shape} must match token shape {tokens.shape}"
+        )
+    return document_ids.astype(mx.int32)
+
+
+def _mask_cross_document_roll(
+    x: mx.array,
+    base_doc_ids: mx.array,
+    rolled_doc_ids: mx.array,
+    *,
+    fill_value: int,
+) -> mx.array:
+    same_doc = mx.equal(base_doc_ids, rolled_doc_ids)
+    same_doc = mx.logical_and(same_doc, base_doc_ids >= 0)
+    same_doc = mx.logical_and(same_doc, rolled_doc_ids >= 0)
+    return mx.where(same_doc, x, mx.array(fill_value, dtype=x.dtype))
+
+
+def _lm_head_with_stopped_weight(lm_head: nn.Linear, hidden_states: mx.array) -> mx.array:
+    """Apply lm_head while matching CUDA FastMTP output-weight detach semantics."""
+
+    logits = hidden_states @ mx.stop_gradient(lm_head.weight).T
+    bias = getattr(lm_head, "bias", None)
+    if bias is not None:
+        logits = logits + mx.stop_gradient(bias)
+    return logits
+
+
 __all__ = [
     "DEFAULT_MTP_DECAY",
     "DEFAULT_MTP_DEPTH",
@@ -330,8 +453,10 @@ __all__ = [
     "MTPInferenceHead",
     "MinimalMTPHead",
     "MinimalMTPSharedBlock",
+    "attach_mtp_head",
     "compute_mtp_step_weights",
     "compute_weighted_mtp_loss",
+    "get_or_attach_mtp_head",
     "mtp_cross_entropy_from_logits",
     "mtp_loss_for_model",
     "next_token_and_mtp_loss",

@@ -18,6 +18,11 @@ from cppmega_mlx.config.model import (
 from cppmega_mlx.models.hybrid_lm import HybridTinyConfig, HybridTinyLM
 from cppmega_mlx.recipes.nam56r import build_hybrid_tiny_config_from_nam56r
 from cppmega_mlx.recipes.pattern import ExpandedNamPattern, expand_nam_pattern
+from cppmega_mlx.tokenizer.cpp_tokenizer import (
+    EXPECTED_SPECIAL_TOKENS,
+    EXPECTED_VOCAB_SIZE,
+    TokenizerContractError,
+)
 
 LOCAL_GB10_QUARTER_PROFILE = "local_gb10_quarter"
 LOCAL_GB10_QUARTER_PATTERN = "AEMEAEMEAEMR"
@@ -32,8 +37,44 @@ LOCAL_GB10_QUARTER_MTP_DEPTH = 2
 LOCAL_GB10_QUARTER_MTP_BETA = 0.6
 LOCAL_GB10_QUARTER_MTP_LAMBDA = 0.3
 LOCAL_GB10_QUARTER_MAX_SEQ_LENGTH = 4096
+LOCAL_GB10_QUARTER_TOKENIZER_BLOCKER_ID = "cppmega-mlx-t8f.1"
+LOCAL_GB10_QUARTER_TOKENIZER_MILESTONE = "M0.1"
+LOCAL_GB10_QUARTER_TOKENIZER_REQUIRED_SPECIALS: tuple[tuple[str, int], ...] = tuple(
+    EXPECTED_SPECIAL_TOKENS.items()
+)
 
 ModelKind = Literal["hybrid_tiny"]
+
+
+@dataclass(frozen=True)
+class TokenizerContractStatus:
+    """Tokenizer readiness metadata for fail-closed model factory allocation."""
+
+    expected_vocab_size: int = EXPECTED_VOCAB_SIZE
+    required_special_tokens: tuple[
+        tuple[str, int], ...
+    ] = LOCAL_GB10_QUARTER_TOKENIZER_REQUIRED_SPECIALS
+    resolved: bool = True
+    milestone: str = LOCAL_GB10_QUARTER_TOKENIZER_MILESTONE
+    blocker_id: str = LOCAL_GB10_QUARTER_TOKENIZER_BLOCKER_ID
+    reason: str = (
+        "M0.1 is closed: the deployed GB10 65K tokenizer is vendored with "
+        "id 7=<CODE_START>, id 45=<FIM_INSTRUCTION>, id 46=<SPACE>, and "
+        "id 47=<NL>; MLX/CUDA wrappers use explicit whitespace-sentinel "
+        "encode/decode with Mac-vs-GB10 parity receipts"
+    )
+
+    @property
+    def is_resolved(self) -> bool:
+        return self.resolved
+
+    def require_resolved(self) -> None:
+        if self.resolved:
+            return
+        raise TokenizerContractError(
+            f"{self.milestone} tokenizer contract is unresolved "
+            f"({self.blocker_id}): {self.reason}"
+        )
 
 
 @dataclass(frozen=True)
@@ -83,6 +124,7 @@ class ModelFactoryProfile:
     moe_expert_hidden_size: int = 896
     moe_shared_expert_hidden_size: int = 1024
     mtp: MTPProfile = MTPProfile()
+    tokenizer_contract: TokenizerContractStatus = TokenizerContractStatus()
     model_kind: ModelKind = "hybrid_tiny"
 
     @property
@@ -193,6 +235,7 @@ class ModelFactoryProfile:
     def build_model(self, **hybrid_config_overrides) -> HybridTinyLM:
         """Allocate the profile's MLX model via the existing HybridTinyLM builder."""
 
+        self.tokenizer_contract.require_resolved()
         return HybridTinyLM(self.hybrid_config(**hybrid_config_overrides))
 
     def build_tiny_smoke_model(self, **hybrid_config_overrides) -> HybridTinyLM:
@@ -237,7 +280,13 @@ def local_gb10_quarter(**hybrid_config_overrides) -> HybridTinyLM:
     exercise full-profile memory behavior.
     """
 
-    return local_gb10_quarter_profile().build_model(**hybrid_config_overrides)
+    profile_overrides = {}
+    tokenizer_contract = hybrid_config_overrides.pop("tokenizer_contract", None)
+    if tokenizer_contract is not None:
+        profile_overrides["tokenizer_contract"] = tokenizer_contract
+    return local_gb10_quarter_profile(**profile_overrides).build_model(
+        **hybrid_config_overrides
+    )
 
 
 def build_local_gb10_quarter_tiny_smoke_model(**hybrid_config_overrides) -> HybridTinyLM:
@@ -268,9 +317,13 @@ __all__ = [
     "LOCAL_GB10_QUARTER_NUM_HEADS",
     "LOCAL_GB10_QUARTER_PATTERN",
     "LOCAL_GB10_QUARTER_PROFILE",
+    "LOCAL_GB10_QUARTER_TOKENIZER_BLOCKER_ID",
+    "LOCAL_GB10_QUARTER_TOKENIZER_MILESTONE",
+    "LOCAL_GB10_QUARTER_TOKENIZER_REQUIRED_SPECIALS",
     "LOCAL_GB10_QUARTER_VOCAB_SIZE",
     "MTPProfile",
     "ModelFactoryProfile",
+    "TokenizerContractStatus",
     "build_local_gb10_quarter_tiny_smoke_model",
     "forward_has_finite_logits",
     "get_model_profile",

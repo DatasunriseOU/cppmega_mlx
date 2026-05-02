@@ -6,12 +6,37 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import mlx.core as mx
+import mlx.nn as nn
+import mlx.optimizers as optim
 import pytest
+
+import scripts.m04_train_step as m04_train_step
+from cppmega_mlx.training.optimizers import (
+    ADAMW_BASE_CLASS,
+    ADAMW_FP32_MOMENTS_CLASS,
+    AdamWFP32Moments,
+    collect_adamw_moment_dtypes,
+    dtype_name,
+    make_adamw,
+)
+from scripts.m04_train_step import (
+    OBSERVED_OPTIMIZER_IDENTITY,
+    REQUIRED_ADAMW_MASTER_MOMENT_DTYPE,
+    REQUIRED_DTYPE,
+    REQUIRED_MODEL_GEOMETRY,
+    REQUIRED_MODEL_SOURCE,
+    acceptance_gate_payload,
+    applied_memory_limit_api_path_from_payload,
+    local_gb10_quarter_preflight_payload,
+    target_dataset_path,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "m04_train_step.py"
 PYTHON = ROOT / ".venv" / "bin" / "python"
+BASELINE_RECEIPT = ROOT / "bench" / "baselines" / "m04_train_step.json"
 GB10_SAMPLE = (
     ROOT
     / "data"
@@ -20,6 +45,7 @@ GB10_SAMPLE = (
     / "clang_semantic_4k_v10"
     / "val_00000.parquet"
 )
+TARGET_PARQUET = "data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet"
 REAL_PARQUET_COLUMNS = (
     "token_ids",
     "structure_ids",
@@ -94,8 +120,129 @@ def assert_m04_receipt_contract(payload: dict[str, Any]) -> None:
     assert payload["gb10_training_correctness_claim"] is False
     assert payload["m4_vs_gb10_throughput_parity_claim"] is False
     assert payload["full_m0_4_acceptance_claim"] is False
+    gate = payload["acceptance_gate"]
+    assert gate["full_target_dataset"] == TARGET_PARQUET
+    assert gate["full_target_dataset_100_step_required"] is True
+    assert gate["local_gb10_quarter_required"] is True
+    assert gate["required_model_profile"] == "local_gb10_quarter"
+    assert gate["required_dtype"] == REQUIRED_DTYPE
+    assert gate["observed_dtype"] == "bfloat16"
+    assert gate["dtype_ok"] is True
+    assert gate["required_optimizer_name"] == "AdamW"
+    assert gate["grad_checkpoint_required"] is True
+    assert gate["full_local_gb10_quarter_gate_required"] is True
+    for key in (
+        "real_parquet_source_identity",
+        "target_parquet_path_ok",
+        "dataset_name_ok",
+        "dataset_format_ok",
+        "dtype_ok",
+        "local_gb10_quarter_preflight",
+        "local_gb10_quarter_preflight_ok",
+        "model_identity_ok",
+        "model_identity",
+        "optimizer_identity_ok",
+        "optimizer_identity",
+        "required_adamw_master_moment_dtype",
+        "observed_adamw_master_moment_dtypes",
+        "fp32_adamw_master_moments_ok",
+        "adamw_ok",
+        "grad_checkpoint_expectation_ok",
+        "grad_checkpoint_identity",
+        "step_count_ok",
+        "loss_decrease_ok",
+        "loss_fields_ok",
+        "all_finite_ok",
+        "optimizer_update_ok",
+        "m4_runtime_metadata",
+        "m4_runtime_metadata_ok",
+        "full_local_gb10_quarter_gate_completed",
+        "full_local_gb10_quarter_gate_blockers",
+    ):
+        assert key in gate
+    assert gate["real_parquet_source_identity"]["required_path"] == TARGET_PARQUET
+    assert payload["local_gb10_quarter_preflight"] == gate["local_gb10_quarter_preflight"]
+    preflight = payload["local_gb10_quarter_preflight"]
+    assert preflight["profile_name"] == "local_gb10_quarter"
+    assert preflight["source"] == REQUIRED_MODEL_SOURCE
+    assert preflight["required_geometry"] == REQUIRED_MODEL_GEOMETRY
+    assert preflight["profile_geometry"] == REQUIRED_MODEL_GEOMETRY
+    assert preflight["geometry_matches_required"] is True
+    assert preflight["tokenizer_contract"]["resolved"] is True
+    assert preflight["tokenizer_contract"]["expected_vocab_size"] == 65_536
+    assert preflight["tokenizer_contract"]["blocker_id"] == "cppmega-mlx-t8f.1"
+    assert preflight["tokenizer_contract"]["milestone"] == "M0.1"
+    assert "<FIM_INSTRUCTION>" in preflight["tokenizer_contract"]["required_special_tokens"]
+    assert "CODE_START" in preflight["tokenizer_contract"]["reason"]
+    assert "M0.1 is closed" in preflight["tokenizer_contract"]["reason"]
+    if payload["workload"]["probe_local_gb10_quarter_allocation"]:
+        assert preflight["allocation_attempted"] is True
+        assert preflight["allocation_ready"] is True
+        assert preflight["allocation_mode"] == "full_profile_allocation_probe"
+        assert preflight["allocation_probe"]["status"] == "ok"
+        assert preflight["allocation_probe"]["forward_executed"] is False
+        assert preflight["allocation_probe"]["training_executed"] is False
+        assert preflight["ok"] is True
+        assert preflight["blockers"] == []
+        assert gate["local_gb10_quarter_preflight_ok"] is True
+    else:
+        assert preflight["allocation_attempted"] is False
+        assert preflight["allocation_ready"] is False
+        assert preflight["allocation_mode"] == "allocation_free_preflight"
+        assert preflight["ok"] is False
+        assert {"allocation_attempted", "allocation_ready"}.issubset(
+            set(preflight["blockers"])
+        )
+        assert "tokenizer_contract_resolved" not in preflight["blockers"]
+        assert gate["local_gb10_quarter_preflight_ok"] is False
+    if gate["full_target_dataset_100_step_completed"]:
+        assert gate["uses_full_target_dataset"] is True
+        assert gate["real_parquet_source_identity"]["ok"] is True
+        assert gate["full_target_dataset_blocker"] is None
+    else:
+        assert gate["full_target_dataset_blocker"]
+    assert gate["full_local_gb10_quarter_gate_completed"] is False
+    assert gate["full_local_gb10_quarter_gate_blockers"]
+    model_identity = gate["model_identity"]
+    assert model_identity["required_name"] == "local_gb10_quarter"
+    assert model_identity["required_source"] == REQUIRED_MODEL_SOURCE
+    assert model_identity["required_profile"] == "local_gb10_quarter"
+    assert model_identity["required_geometry"] == REQUIRED_MODEL_GEOMETRY
+    assert model_identity["ok"] is gate["model_identity_ok"]
+    optimizer_identity = gate["optimizer_identity"]
+    assert gate["required_adamw_master_moment_dtype"] == (
+        REQUIRED_ADAMW_MASTER_MOMENT_DTYPE
+    )
+    assert optimizer_identity["required_master_moment_dtype"] == (
+        REQUIRED_ADAMW_MASTER_MOMENT_DTYPE
+    )
+    assert optimizer_identity["master_moment_evidence"]["required_dtype"] == (
+        REQUIRED_ADAMW_MASTER_MOMENT_DTYPE
+    )
+    assert optimizer_identity["master_moment_dtype_ok"] is (
+        gate["fp32_adamw_master_moments_ok"]
+    )
     assert payload["workload"]["dtype"] == "bfloat16"
     assert payload["model"]["source"] == "cppmega_mlx.models.hybrid_lm"
+    assert payload["model"]["name"] == "HybridTinyLM"
+    assert payload["model"]["required_profile"] == "local_gb10_quarter"
+    assert payload["model"]["profile_matches_required"] is False
+    assert payload["model"]["local_gb10_quarter_preflight"] == preflight
+    assert payload["training"]["optimizer"]["name"] == "AdamW"
+    assert payload["training"]["optimizer"]["class"] == (
+        ADAMW_FP32_MOMENTS_CLASS
+    )
+    assert payload["training"]["optimizer"]["base_class"] == ADAMW_BASE_CLASS
+    assert payload["training"]["optimizer"]["adamw"] is True
+    assert payload["training"]["optimizer"]["required_master_moment_dtype"] == (
+        REQUIRED_ADAMW_MASTER_MOMENT_DTYPE
+    )
+    assert payload["training"]["optimizer"]["master_moment_evidence"] == (
+        optimizer_identity["master_moment_evidence"]
+    )
+    assert payload["training"]["grad_checkpoint"]["required"] is True
+    assert payload["training"]["grad_checkpoint"]["observed_enabled"] is False
+    assert payload["training"]["grad_checkpoint"]["expectation_satisfied"] is False
     assert payload["baseline_row"] == {
         "batch_size": payload["workload"]["batch_size"],
         "commit": payload["software"]["git_commit"] or "unknown",
@@ -111,6 +258,45 @@ def assert_m04_receipt_contract(payload: dict[str, Any]) -> None:
     }
 
 
+def test_checked_in_receipt_can_record_full_parquet_gate_without_m0_4_claim() -> None:
+    payload = json.loads(BASELINE_RECEIPT.read_text())
+
+    assert_m04_receipt_contract(payload)
+    assert payload["status"] == "ok"
+    assert payload["acceptance_gate"]["uses_full_target_dataset"] is True
+    assert payload["acceptance_gate"]["real_parquet_source_identity"]["ok"] is True
+    assert payload["acceptance_gate"]["full_target_dataset_100_step_completed"] is True
+    assert payload["acceptance_gate"]["full_local_gb10_quarter_gate_completed"] is False
+    assert payload["acceptance_gate"]["model_identity_ok"] is False
+    assert payload["acceptance_gate"]["optimizer_identity_ok"] is True
+    assert payload["acceptance_gate"]["adamw_ok"] is True
+    assert payload["acceptance_gate"]["fp32_adamw_master_moments_ok"] is True
+    assert set(payload["acceptance_gate"]["observed_adamw_master_moment_dtypes"].values()) == {
+        "float32"
+    }
+    assert payload["acceptance_gate"]["grad_checkpoint_expectation_ok"] is False
+    assert payload["acceptance_gate"]["m4_runtime_metadata_ok"] is True
+    assert set(payload["acceptance_gate"]["full_local_gb10_quarter_gate_blockers"]) == {
+        "model_identity_ok",
+        "grad_checkpoint_expectation_ok",
+    }
+    assert payload["acceptance_gate"]["full_target_dataset_blocker"] is None
+    assert payload["workload"]["data_format"] == "parquet"
+    assert payload["workload"]["data_path"] == (
+        "data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet"
+    )
+    assert payload["training"]["steps_completed"] >= 100
+    assert payload["training"]["all_finite"] is True
+    assert payload["training"]["optimizer_updated"] is True
+    assert payload["training"]["optimizer"]["name"] == "AdamW"
+    assert payload["training"]["grad_checkpoint"]["observed_enabled"] is False
+    assert payload["training"]["final_loss"] < payload["training"]["initial_loss"]
+    assert payload["baseline_row"]["model"] == "HybridTinyLM"
+    assert {item["id"] for item in payload["acceptance_blockers"]} == {
+        "cppmega-mlx-t8f.4.local_gb10_quarter_gate",
+    }
+
+
 def test_synthetic_one_step_writes_finite_receipt(tmp_path: Path) -> None:
     output = tmp_path / "m04_train_step.json"
     result = run_script(*tiny_args(output))
@@ -122,10 +308,16 @@ def test_synthetic_one_step_writes_finite_receipt(tmp_path: Path) -> None:
     assert payload["status"] == "ok"
     assert payload["workload"]["synthetic"] is True
     assert payload["workload"]["data_format"] == "npz"
+    assert payload["workload"]["probe_local_gb10_quarter_allocation"] is False
     assert payload["training"]["steps_completed"] == 1
     assert payload["training"]["optimizer_updated"] is True
     assert payload["training"]["all_finite"] is True
     assert payload["training"]["loss_decrease_satisfied"] is True
+    assert payload["acceptance_gate"]["uses_full_target_dataset"] is False
+    assert payload["acceptance_gate"]["real_parquet_source_identity"]["ok"] is False
+    assert payload["acceptance_gate"]["full_target_dataset_100_step_completed"] is False
+    assert payload["acceptance_gate"]["full_local_gb10_quarter_gate_completed"] is False
+    assert payload["acceptance_gate"]["full_target_dataset_blocker"]
     assert payload["training"]["final_loss"] > 0
     assert payload["training"]["step_metrics"][0]["updated"] is True
     assert payload["memory"]["peak_memory_bytes"] is None or (
@@ -166,6 +358,187 @@ def test_missing_dataset_dry_run_reports_blocked_receipt(tmp_path: Path) -> None
     assert payload["blockers"][0]["type"] == "missing_dataset"
     assert payload["training"]["steps_completed"] == 0
     assert payload["workload"]["data_path"] == str(missing)
+    assert payload["acceptance_gate"]["uses_full_target_dataset"] is False
+    assert payload["acceptance_gate"]["full_target_dataset_100_step_completed"] is False
+    assert payload["acceptance_gate"]["full_local_gb10_quarter_gate_completed"] is False
+
+
+def test_local_gb10_allocation_probe_success_is_preflight_only(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def fake_probe() -> dict[str, Any]:
+        return {
+            "status": "ok",
+            "allocation_ready": True,
+            "profile_name": "local_gb10_quarter",
+            "model_class": "HybridTinyLM",
+            "eval_scope": "parameters_only_no_forward_no_training",
+            "forward_executed": False,
+            "training_executed": False,
+            "memory_before": {"active_memory_bytes": 0},
+            "memory_after": {"active_memory_bytes": 1024},
+        }
+
+    monkeypatch.setattr(m04_train_step, "probe_local_gb10_quarter_allocation", fake_probe)
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--probe-local-gb10-quarter-allocation",
+            "--output",
+            str(tmp_path / "receipt.json"),
+        ]
+    )
+
+    preflight = m04_train_step.local_gb10_quarter_preflight_from_args(args)
+    gate = local_gb10_gate(
+        model_name="HybridTinyLM",
+        grad_checkpoint=grad_checkpoint_identity(enabled=False),
+        local_gb10_quarter_preflight=preflight,
+    )
+
+    assert preflight["allocation_attempted"] is True
+    assert preflight["allocation_ready"] is True
+    assert preflight["allocation_mode"] == "full_profile_allocation_probe"
+    assert preflight["allocation_probe"]["forward_executed"] is False
+    assert preflight["allocation_probe"]["training_executed"] is False
+    assert preflight["ok"] is True
+    assert preflight["blockers"] == []
+    assert gate["local_gb10_quarter_preflight_ok"] is True
+    assert gate["full_local_gb10_quarter_gate_completed"] is False
+    assert {
+        "model_identity_ok",
+        "grad_checkpoint_expectation_ok",
+    }.issubset(set(gate["full_local_gb10_quarter_gate_blockers"]))
+
+
+def test_local_gb10_allocation_probe_failure_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def fake_probe() -> dict[str, Any]:
+        return {
+            "status": "blocked",
+            "allocation_ready": False,
+            "profile_name": "local_gb10_quarter",
+            "eval_scope": "parameters_only_no_forward_no_training",
+            "forward_executed": False,
+            "training_executed": False,
+            "memory_before": {"active_memory_bytes": 0},
+            "memory_after": {"active_memory_bytes": 0},
+            "error_type": "RuntimeError",
+            "error": "synthetic allocation failure",
+        }
+
+    monkeypatch.setattr(m04_train_step, "probe_local_gb10_quarter_allocation", fake_probe)
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--probe-local-gb10-quarter-allocation",
+            "--output",
+            str(tmp_path / "receipt.json"),
+        ]
+    )
+
+    preflight = m04_train_step.local_gb10_quarter_preflight_from_args(args)
+    gate = local_gb10_gate(local_gb10_quarter_preflight=preflight)
+
+    assert preflight["allocation_attempted"] is True
+    assert preflight["allocation_ready"] is False
+    assert preflight["allocation_mode"] == "full_profile_allocation_probe"
+    assert preflight["allocation_probe"]["error_type"] == "RuntimeError"
+    assert preflight["allocation_probe"]["error"] == "synthetic allocation failure"
+    assert preflight["ok"] is False
+    assert preflight["blockers"] == ["allocation_ready"]
+    assert gate["local_gb10_quarter_preflight_ok"] is False
+    assert gate["full_local_gb10_quarter_gate_completed"] is False
+    assert "local_gb10_quarter_preflight_ok" in (
+        gate["full_local_gb10_quarter_gate_blockers"]
+    )
+
+
+def test_applied_memory_limit_api_path_preserves_actual_fallback_path() -> None:
+    payload = {
+        "applied": True,
+        "metal_limit_api_path": "mx.set_memory_limit",
+    }
+
+    assert applied_memory_limit_api_path_from_payload(payload) == "mx.set_memory_limit"
+
+
+class _Bf16Probe(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = mx.ones((2, 2), dtype=mx.bfloat16)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return mx.sum(x @ self.weight)
+
+
+def _run_bf16_probe_update(
+    optimizer: optim.Optimizer,
+) -> tuple[_Bf16Probe, dict[str, str]]:
+    model = _Bf16Probe()
+
+    def loss_fn(probe: _Bf16Probe, x: mx.array) -> mx.array:
+        return probe(x)
+
+    loss_and_grad = nn.value_and_grad(model, loss_fn)
+    _, grads = loss_and_grad(model, mx.ones((2, 2), dtype=mx.bfloat16))
+    optimizer.update(model, grads)
+    mx.eval(model.parameters(), optimizer.state)
+    return model, collect_adamw_moment_dtypes(optimizer.state)
+
+
+def test_stock_mlx_adamw_uses_bf16_moments_for_bf16_params() -> None:
+    model, moment_dtypes = _run_bf16_probe_update(
+        optim.AdamW(learning_rate=1e-3, weight_decay=0.0)
+    )
+
+    assert dtype_name(model.weight) == "bfloat16"
+    assert moment_dtypes == {
+        "weight/m": "bfloat16",
+        "weight/v": "bfloat16",
+    }
+
+
+def test_repo_local_adamw_keeps_bf16_params_with_fp32_moments() -> None:
+    optimizer = make_adamw(learning_rate=1e-3, weight_decay=0.0)
+    model, moment_dtypes = _run_bf16_probe_update(optimizer)
+
+    assert isinstance(optimizer, AdamWFP32Moments)
+    assert dtype_name(model.weight) == "bfloat16"
+    assert moment_dtypes == {
+        "weight/m": "float32",
+        "weight/v": "float32",
+    }
+
+
+def test_repo_local_adamw_weight_decay_preserves_fp32_moments() -> None:
+    optimizer = make_adamw(learning_rate=1e-3, weight_decay=0.1)
+    model, moment_dtypes = _run_bf16_probe_update(optimizer)
+
+    assert isinstance(optimizer, AdamWFP32Moments)
+    assert dtype_name(model.weight) == "bfloat16"
+    assert bool(mx.all(mx.isfinite(model.weight)).item())
+    assert moment_dtypes == {
+        "weight/m": "float32",
+        "weight/v": "float32",
+    }
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        {},
+        {"applied": False, "metal_limit_api_path": "mx.set_memory_limit"},
+        {"applied": True},
+        {"applied": True, "metal_limit_api_path": ""},
+    ],
+)
+def test_applied_memory_limit_api_path_requires_applied_recorded_path(
+    payload: Any,
+) -> None:
+    assert applied_memory_limit_api_path_from_payload(payload) is None
 
 
 def test_real_parquet_dry_run_uses_gb10_sample_receipt(tmp_path: Path) -> None:
@@ -202,8 +575,309 @@ def test_real_parquet_dry_run_uses_gb10_sample_receipt(tmp_path: Path) -> None:
     assert payload["workload"]["synthetic"] is False
     assert payload["workload"]["data_format"] == "parquet"
     assert payload["workload"]["data_path"] == str(sample_path)
+    assert payload["acceptance_gate"]["uses_full_target_dataset"] is False
+    assert payload["acceptance_gate"]["real_parquet_source_identity"]["ok"] is False
+    assert payload["acceptance_gate"]["full_target_dataset_100_step_completed"] is False
+    assert payload["acceptance_gate"]["full_local_gb10_quarter_gate_completed"] is False
+    assert payload["acceptance_gate"]["full_target_dataset_blocker"]
     assert payload["dataset"]["metadata"]["source_format"] == "parquet"
     assert payload["dataset"]["dataset_receipt"]["source_dataset_name"] == (
         "clang_semantic_4k_v10"
     )
     assert payload["training"]["steps_completed"] == 0
+
+
+def target_dataset_receipt(
+    *,
+    source_path: str = TARGET_PARQUET,
+    source_format: str = "parquet",
+    source_dataset_name: str = "clang_semantic_4k_v10",
+) -> dict[str, Any]:
+    return {
+        "path": source_path,
+        "dataset_receipt": {
+            "source_path": source_path,
+            "source_format": source_format,
+            "source_dataset_name": source_dataset_name,
+        },
+        "metadata": {"source_format": source_format},
+    }
+
+
+def adamw_moment_evidence(*, moment_dtype: str = "float32") -> dict[str, Any]:
+    return {
+        "required_dtype": REQUIRED_ADAMW_MASTER_MOMENT_DTYPE,
+        "observed_parameter_dtype": REQUIRED_DTYPE,
+        "observed_moment_dtypes": {
+            "weight/m": moment_dtype,
+            "weight/v": moment_dtype,
+        },
+        "optimizer_class": ADAMW_FP32_MOMENTS_CLASS,
+        "optimizer_base_class": ADAMW_BASE_CLASS,
+        "state_keys": ["learning_rate", "step", "weight"],
+        "ok": moment_dtype == REQUIRED_ADAMW_MASTER_MOMENT_DTYPE,
+    }
+
+
+def adamw_identity(
+    *,
+    name: str = "AdamW",
+    updated: bool = True,
+    moment_dtype: str = "float32",
+) -> dict[str, Any]:
+    master_moment_evidence = adamw_moment_evidence(moment_dtype=moment_dtype)
+    return {
+        **OBSERVED_OPTIMIZER_IDENTITY,
+        "name": name,
+        "required_name": "AdamW",
+        "name_matches_required": name == "AdamW",
+        "adamw": name == "AdamW",
+        "learning_rate": 1e-3,
+        "weight_decay": 0.0,
+        "update_observed": updated,
+        "required_master_moment_dtype": REQUIRED_ADAMW_MASTER_MOMENT_DTYPE,
+        "master_moment_evidence": master_moment_evidence,
+        "master_moment_dtype_ok": master_moment_evidence["ok"],
+    }
+
+
+def grad_checkpoint_identity(*, enabled: bool = True) -> dict[str, Any]:
+    return {
+        "required": True,
+        "observed_enabled": enabled,
+        "source": "unit-test-local-gb10-quarter",
+        "expectation_satisfied": enabled,
+    }
+
+
+def m4_device_metadata(*, device_name: str = "Apple M4 Max") -> dict[str, Any]:
+    return {
+        "machine": "arm64",
+        "metal_available": True,
+        "platform": "macOS-26.4.1-arm64-arm-64bit-Mach-O",
+        "mlx_device_info": {
+            "device_name": device_name,
+            "memory_size": 137438953472,
+        },
+    }
+
+
+def local_gb10_model_config(**overrides: Any) -> dict[str, Any]:
+    config = {
+        "profile": "local_gb10_quarter",
+        **REQUIRED_MODEL_GEOMETRY,
+    }
+    config["mtp"] = dict(REQUIRED_MODEL_GEOMETRY["mtp"])
+    config.update(overrides)
+    return config
+
+
+def resolved_local_gb10_preflight(**overrides: Any) -> dict[str, Any]:
+    preflight = local_gb10_quarter_preflight_payload(
+        allocation_attempted=True,
+        allocation_ready=True,
+    )
+    preflight["tokenizer_contract"] = {
+        **preflight["tokenizer_contract"],
+        "resolved": True,
+    }
+    preflight["ok"] = True
+    preflight["blockers"] = []
+    preflight.update(overrides)
+    return preflight
+
+
+def local_gb10_gate(**overrides: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "data_path": target_dataset_path(),
+        "data_format": "parquet",
+        "dtype": REQUIRED_DTYPE,
+        "dataset": target_dataset_receipt(),
+        "steps_requested": 100,
+        "steps_completed": 100,
+        "loss_decreased": True,
+        "all_finite": True,
+        "optimizer_updated": True,
+        "model_name": "local_gb10_quarter",
+        "model_source": REQUIRED_MODEL_SOURCE,
+        "model_config": local_gb10_model_config(),
+        "optimizer": adamw_identity(),
+        "grad_checkpoint": grad_checkpoint_identity(),
+        "device": m4_device_metadata(),
+        "local_gb10_quarter_preflight": resolved_local_gb10_preflight(),
+    }
+    payload.update(overrides)
+    return acceptance_gate_payload(**payload)
+
+
+def test_acceptance_gate_accepts_complete_local_gb10_quarter_evidence() -> None:
+    gate = local_gb10_gate()
+
+    assert gate["real_parquet_source_identity"]["ok"] is True
+    assert gate["full_target_dataset_100_step_completed"] is True
+    assert gate["dtype_ok"] is True
+    assert gate["local_gb10_quarter_preflight_ok"] is True
+    assert gate["local_gb10_quarter_preflight"]["source"] == REQUIRED_MODEL_SOURCE
+    assert gate["local_gb10_quarter_preflight"]["required_geometry"] == (
+        REQUIRED_MODEL_GEOMETRY
+    )
+    assert gate["local_gb10_quarter_preflight"]["profile_geometry"] == (
+        REQUIRED_MODEL_GEOMETRY
+    )
+    assert gate["model_identity_ok"] is True
+    assert gate["optimizer_identity_ok"] is True
+    assert gate["required_adamw_master_moment_dtype"] == "float32"
+    assert gate["observed_adamw_master_moment_dtypes"] == {
+        "weight/m": "float32",
+        "weight/v": "float32",
+    }
+    assert gate["fp32_adamw_master_moments_ok"] is True
+    assert gate["adamw_ok"] is True
+    assert gate["grad_checkpoint_expectation_ok"] is True
+    assert gate["m4_runtime_metadata_ok"] is True
+    assert gate["full_local_gb10_quarter_gate_completed"] is True
+    assert gate["full_local_gb10_quarter_gate_blockers"] == []
+
+
+@pytest.mark.parametrize(
+    ("overrides", "failed_checks"),
+    [
+        (
+            {
+                "dataset": target_dataset_receipt(
+                    source_path="/tmp/fake/clang_semantic_4k_v10/val_00000.parquet"
+                )
+            },
+            {"real_parquet_source_identity_ok", "target_parquet_path_ok"},
+        ),
+        (
+            {"dataset": target_dataset_receipt(source_dataset_name="not_clang")},
+            {"real_parquet_source_identity_ok", "dataset_name_ok"},
+        ),
+        (
+            {
+                "data_format": "npz",
+                "dataset": target_dataset_receipt(source_format="npz"),
+            },
+            {"real_parquet_source_identity_ok", "dataset_format_ok"},
+        ),
+        (
+            {"dtype": "float32"},
+            {"dtype_ok"},
+        ),
+        (
+            {
+                "model_name": "HybridTinyLM",
+                "model_config": local_gb10_model_config(),
+            },
+            {"model_identity_ok"},
+        ),
+        (
+            {
+                "model_name": "local_gb10_quarter",
+                "model_config": local_gb10_model_config(profile="HybridTinyLM"),
+            },
+            {"model_identity_ok"},
+        ),
+        (
+            {"model_source": "fake.local_gb10_quarter"},
+            {"model_identity_ok"},
+        ),
+        (
+            {"model_config": local_gb10_model_config(hidden_size=16)},
+            {"model_identity_ok"},
+        ),
+        (
+            {
+                "model_config": local_gb10_model_config(
+                    mtp={"depth": 1, "beta": 0.6, "loss_weight": 0.3}
+                )
+            },
+            {"model_identity_ok"},
+        ),
+        (
+            {
+                "local_gb10_quarter_preflight": resolved_local_gb10_preflight(
+                    source="fake.local_gb10_quarter"
+                )
+            },
+            {"local_gb10_quarter_preflight_ok"},
+        ),
+        (
+            {
+                "local_gb10_quarter_preflight": resolved_local_gb10_preflight(
+                    profile_geometry={
+                        **REQUIRED_MODEL_GEOMETRY,
+                        "hidden_size": 16,
+                    }
+                )
+            },
+            {"local_gb10_quarter_preflight_ok"},
+        ),
+        (
+            {
+                "local_gb10_quarter_preflight": resolved_local_gb10_preflight(
+                    tokenizer_contract={
+                        **resolved_local_gb10_preflight()["tokenizer_contract"],
+                        "resolved": False,
+                    }
+                )
+            },
+            {"local_gb10_quarter_preflight_ok"},
+        ),
+        (
+            {"optimizer": adamw_identity(name="SGD")},
+            {"optimizer_identity_ok", "adamw_ok"},
+        ),
+        (
+            {"optimizer": {**adamw_identity(), "class": "fake.AdamW"}},
+            {"optimizer_identity_ok", "adamw_ok"},
+        ),
+        (
+            {"optimizer": adamw_identity(moment_dtype="bfloat16")},
+            {"fp32_adamw_master_moments_ok"},
+        ),
+        (
+            {"grad_checkpoint": grad_checkpoint_identity(enabled=False)},
+            {"grad_checkpoint_expectation_ok"},
+        ),
+        (
+            {"device": m4_device_metadata(device_name="Apple M3 Max")},
+            {"m4_runtime_metadata_ok"},
+        ),
+        (
+            {"steps_completed": 99},
+            {"step_count_ok"},
+        ),
+        (
+            {"loss_decreased": False},
+            {"loss_decrease_ok", "loss_fields_ok"},
+        ),
+        (
+            {"all_finite": False},
+            {"all_finite_ok", "loss_fields_ok"},
+        ),
+    ],
+)
+def test_acceptance_gate_fail_closes_on_fake_or_incomplete_evidence(
+    overrides: dict[str, Any],
+    failed_checks: set[str],
+) -> None:
+    gate = local_gb10_gate(**overrides)
+
+    assert gate["full_local_gb10_quarter_gate_completed"] is False
+    assert failed_checks.issubset(set(gate["full_local_gb10_quarter_gate_blockers"]))
+    if any(
+        check in failed_checks
+        for check in (
+            "real_parquet_source_identity_ok",
+            "target_parquet_path_ok",
+            "dataset_name_ok",
+            "dataset_format_ok",
+            "dtype_ok",
+            "step_count_ok",
+            "loss_fields_ok",
+            "optimizer_update_ok",
+        )
+    ):
+        assert gate["full_target_dataset_100_step_completed"] is False

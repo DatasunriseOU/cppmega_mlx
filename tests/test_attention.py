@@ -7,7 +7,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
 
-from cppmega_mlx.nn.attention import AttentionConfig, CausalSelfAttention
+from cppmega_mlx.nn.attention import AttentionConfig, CausalSelfAttention, causal_sdpa_mask
 
 
 def _rand(shape: tuple[int, ...], seed: int = 0) -> mx.array:
@@ -41,6 +41,36 @@ def test_attention_config_validation_fails_closed() -> None:
         AttentionConfig(d_model=16, num_q_heads=4, mode="dense")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="divisible"):
         AttentionConfig(d_model=16, num_q_heads=4, num_kv_heads=3)
+    with pytest.raises(ValueError, match="sliding_window"):
+        AttentionConfig(d_model=16, num_q_heads=4, sliding_window=0)
+
+
+def test_causal_sdpa_mask_is_boolean_and_sliding_windowed() -> None:
+    mask = causal_sdpa_mask(5, sliding_window=2, expand_heads=True)
+    mx.eval(mask)
+
+    assert mask.shape == (1, 1, 5, 5)
+    assert mask.dtype == mx.bool_
+    np.testing.assert_array_equal(
+        np.array(mask[0, 0]),
+        np.array(
+            [
+                [True, False, False, False, False],
+                [True, True, False, False, False],
+                [False, True, True, False, False],
+                [False, False, True, True, False],
+                [False, False, False, True, True],
+            ],
+            dtype=np.bool_,
+        ),
+    )
+
+
+def test_causal_sdpa_mask_rejects_invalid_lengths() -> None:
+    with pytest.raises(ValueError, match="seq_length"):
+        causal_sdpa_mask(0)
+    with pytest.raises(ValueError, match="sliding_window"):
+        causal_sdpa_mask(4, sliding_window=-1)
 
 
 @pytest.mark.parametrize("mode", ["mla", "dsa"])
@@ -75,6 +105,90 @@ def test_causal_prefix_invariance_with_gqa() -> None:
         atol=1e-5,
         rtol=1e-5,
     )
+
+
+def test_causal_mask_sentinel_matches_default_mask() -> None:
+    cfg = AttentionConfig(d_model=16, num_q_heads=4, num_kv_heads=2, mode="mla")
+    attn = CausalSelfAttention(cfg)
+    x = _rand((1, 5, 16), seed=12)
+
+    default_out = attn(x)
+    sentinel_out = attn(x, mask="causal")
+    mx.eval(default_out, sentinel_out)
+
+    np.testing.assert_allclose(
+        np.array(sentinel_out),
+        np.array(default_out),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
+def test_explicit_boolean_mask_is_forwarded_without_string_comparison() -> None:
+    cfg = AttentionConfig(d_model=16, num_q_heads=4, num_kv_heads=2, mode="mla")
+    attn = CausalSelfAttention(cfg)
+    x = _rand((1, 5, 16), seed=13)
+    explicit_mask = causal_sdpa_mask(5)
+
+    explicit_out = attn(x, mask=explicit_mask)
+    default_out = attn(x)
+    mx.eval(explicit_out, default_out)
+
+    np.testing.assert_allclose(
+        np.array(explicit_out),
+        np.array(default_out),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
+def test_sliding_window_attention_does_not_see_old_prefix_tokens() -> None:
+    cfg = AttentionConfig(
+        d_model=16,
+        num_q_heads=4,
+        num_kv_heads=2,
+        mode="mla",
+        sliding_window=3,
+    )
+    attn = CausalSelfAttention(cfg)
+    prefix_a = _rand((1, 2, 16), seed=7)
+    prefix_b = _rand((1, 2, 16), seed=8)
+    local_tail = _rand((1, 3, 16), seed=9)
+
+    out_a = attn(mx.concatenate([prefix_a, local_tail], axis=1))
+    out_b = attn(mx.concatenate([prefix_b, local_tail], axis=1))
+    mx.eval(out_a, out_b)
+
+    np.testing.assert_allclose(
+        np.array(out_a[:, -1, :]),
+        np.array(out_b[:, -1, :]),
+        atol=1e-5,
+        rtol=1e-5,
+    )
+
+
+def test_attention_sinks_are_forwarded_to_fast_sdpa() -> None:
+    cfg = AttentionConfig(d_model=16, num_q_heads=4, num_kv_heads=2, mode="mla")
+    attn = CausalSelfAttention(cfg)
+    x = _rand((1, 4, 16), seed=10)
+    sinks = mx.array([0.0, 0.25, -0.125, 0.5], dtype=mx.float32)
+
+    out = attn(x, sinks=sinks)
+    mx.eval(out)
+
+    assert out.shape == x.shape
+    assert np.isfinite(np.array(out)).all()
+
+
+def test_attention_sink_shape_validation_fails_closed() -> None:
+    cfg = AttentionConfig(d_model=16, num_q_heads=4, num_kv_heads=2, mode="mla")
+    attn = CausalSelfAttention(cfg)
+    x = _rand((1, 4, 16), seed=11)
+
+    with pytest.raises(ValueError, match="one value per query head"):
+        attn(x, sinks=mx.zeros((2,), dtype=mx.float32))
+    with pytest.raises(ValueError, match="1D"):
+        attn(x, sinks=mx.zeros((1, 4), dtype=mx.float32))
 
 
 def test_attention_train_step_has_finite_loss_and_gradients() -> None:

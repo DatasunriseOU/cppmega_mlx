@@ -37,6 +37,7 @@ class AttentionConfig:
     use_rope: bool = True
     rope_theta: float = 10000.0
     bias: bool = False
+    sliding_window: int | None = None
 
     def __post_init__(self) -> None:
         if self.mode not in ("mla", "dsa"):
@@ -63,6 +64,8 @@ class AttentionConfig:
             )
         if self.rope_theta <= 0:
             raise ValueError(f"rope_theta must be positive, got {self.rope_theta}")
+        if self.sliding_window is not None and self.sliding_window <= 0:
+            raise ValueError(f"sliding_window must be positive, got {self.sliding_window}")
 
     @property
     def kv_heads(self) -> int:
@@ -85,8 +88,46 @@ class AttentionConfig:
         return self.kv_heads != self.num_q_heads
 
 
-def _causal_additive_mask(seq_length: int, dtype: mx.Dtype) -> mx.array:
-    return nn.MultiHeadAttention.create_additive_causal_mask(seq_length, dtype=dtype)
+def causal_sdpa_mask(
+    seq_length: int,
+    *,
+    sliding_window: int | None = None,
+    expand_heads: bool = False,
+) -> mx.array:
+    """Return a boolean causal mask suitable for MLX fast SDPA.
+
+    ``sliding_window`` counts the current token, so ``sliding_window=2`` allows
+    each query to see itself and the immediately previous key.
+    """
+
+    if seq_length <= 0:
+        raise ValueError(f"seq_length must be positive, got {seq_length}")
+    if sliding_window is not None and sliding_window <= 0:
+        raise ValueError(f"sliding_window must be positive, got {sliding_window}")
+
+    positions = mx.arange(seq_length)
+    query_positions = positions[:, None]
+    key_positions = positions[None, :]
+    mask = query_positions >= key_positions
+    if sliding_window is not None:
+        mask = mask & (query_positions < key_positions + sliding_window)
+    mask = mask.astype(mx.bool_)
+    if expand_heads:
+        return mask[None, None, :, :]
+    return mask
+
+
+def _validate_attention_sinks(sinks: mx.array | None, num_q_heads: int) -> mx.array | None:
+    if sinks is None:
+        return None
+    if sinks.ndim != 1:
+        raise ValueError(f"attention sinks must be 1D, got shape {sinks.shape}")
+    if sinks.shape[0] != num_q_heads:
+        raise ValueError(
+            f"attention sinks must have one value per query head ({num_q_heads}), "
+            f"got shape {sinks.shape}"
+        )
+    return sinks
 
 
 class CausalSelfAttention(nn.Module):
@@ -122,7 +163,13 @@ class CausalSelfAttention(nn.Module):
             k = self.rope(k)
         return q, k, v
 
-    def __call__(self, hidden_states: mx.array, mask: mx.array | Literal["causal"] | None = None) -> mx.array:
+    def __call__(
+        self,
+        hidden_states: mx.array,
+        mask: mx.array | Literal["causal"] | None = None,
+        *,
+        sinks: mx.array | None = None,
+    ) -> mx.array:
         if hidden_states.ndim != 3:
             raise ValueError(f"hidden_states must be shaped (B,S,D), got {hidden_states.shape}")
         if hidden_states.shape[-1] != self.config.d_model:
@@ -131,14 +178,19 @@ class CausalSelfAttention(nn.Module):
             )
 
         q, k, v = self._project_qkv(hidden_states)
-        if mask is None:
-            mask = _causal_additive_mask(hidden_states.shape[1], hidden_states.dtype)
+        if mask is None or (isinstance(mask, str) and mask == "causal"):
+            mask = causal_sdpa_mask(
+                hidden_states.shape[1],
+                sliding_window=self.config.sliding_window,
+            )
+        sinks = _validate_attention_sinks(sinks, self.config.num_q_heads)
         out = mx.fast.scaled_dot_product_attention(
             q,
             k,
             v,
             scale=self.config.q_head_dim**-0.5,
             mask=mask,
+            sinks=sinks,
         )
         out = mx.transpose(out, (0, 2, 1, 3)).reshape(
             hidden_states.shape[0],
@@ -153,4 +205,5 @@ __all__ = [
     "AttentionMode",
     "AttentionRouteInfo",
     "CausalSelfAttention",
+    "causal_sdpa_mask",
 ]

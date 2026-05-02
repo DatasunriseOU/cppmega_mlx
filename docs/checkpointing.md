@@ -55,9 +55,12 @@ records:
   metrics.loss / metrics.ntokens / metrics.batches /
   metrics.tokens_per_second) plus MLX-LM callback-style iteration,
   val_loss, and val_time fields, but does not use them for resume.
-- rng, currently either {"mode": "not_saved"} or seed provenance
-  {"mode": "seed", "seed": N, ...}. Standalone serialized RNG state is not
-  supported.
+- rng, currently {"mode": "not_saved"}, seed provenance
+  {"mode": "seed", "seed": N, ...}, or a single-process snapshot
+  {"mode": "snapshot", "snapshot": ...}. Directory checkpoints that save
+  optimizer/training state default to snapshot mode unless caller metadata
+  explicitly opts out with {"mode": "not_saved"}. Standalone serialized RNG
+  state outside the rng object is not supported.
 - sharding, currently {"mode": "single_file", "num_shards": 1,
   "weights": ["model.safetensors"], "index": null}. Multi-shard manifests and
   index payloads are not supported.
@@ -74,10 +77,28 @@ FileNotFoundError when an optimizer is requested.
 
 Metadata validation runs before model weights are loaded whenever a
 metadata.json file is present. Unsupported RNG payloads or sharding requests
-therefore fail closed before mutating the target model. The only accepted RNG
-metadata is seed provenance; exact standalone MLX/NumPy/Python random-state
-roundtrip remains intentionally unsupported until local training has a concrete
-resume blocker that requires it.
+therefore fail closed before mutating the target model. Accepted RNG metadata is
+limited to explicit opt-out, seed provenance, or a single-process snapshot
+captured by `cppmega_mlx.runtime.seed.capture_rng_state()`. On load, snapshot
+mode restores Python's global `random` state, NumPy's legacy global RNG state,
+and MLX's mutable `mx.random.state` when the installed MLX build exposes it. If
+a checkpoint snapshot says MLX RNG state is available but restore cannot replay
+it, loading fails closed rather than silently continuing with a divergent random
+stream.
+
+Snapshot RNG support is a local single-process contract. It does not cover
+distributed per-rank RNGs, independently created NumPy `Generator` instances,
+DataLoader worker state, or Megatron tensor/pipeline/expert parallel RNG
+streams.
+
+M0.7 acceptance is currently scoped to local TinyLM/HybridTinyLM checkpoint
+mechanics and the subprocess HybridTinyLM NPZ resume regression. That receipt
+proves a 37-step interrupted tiny run can reload and match the uninterrupted
+100-step continuation suffix with optimizer state, training_state, RNG snapshot,
+and batch cursor preserved. It is not full `local_gb10_quarter` acceptance:
+M0.7 remains fail-closed until the resolved tokenizer/model-factory path, the
+target GB10 parquet training lane, and the exact 100-step continuation check all
+run on the M0 target.
 
 Unsupported sharding requests also fail closed. The manifest may only describe
 the single local weight file. Fields such as weight_map, shards,

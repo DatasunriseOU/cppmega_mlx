@@ -37,7 +37,12 @@ from cppmega_mlx.training.checkpoint import (
 )
 from cppmega_mlx.training.eval import EvalMetrics, evaluate_batches
 from cppmega_mlx.training.loop import TrainStepResult, make_adamw, one_step_train
-from cppmega_mlx.training.loss import next_token_cross_entropy
+from cppmega_mlx.training.loss import (
+    next_token_cross_entropy,
+    next_token_cross_entropy_mtp_loss,
+    next_token_cross_entropy_with_mtp,
+    next_token_cross_entropy_with_stp,
+)
 from cppmega_mlx.training.mtp import (
     DEFAULT_MTP_DECAY,
     DEFAULT_MTP_DEPTH,
@@ -47,13 +52,34 @@ from cppmega_mlx.training.mtp import (
     MTPLossMetrics,
     MinimalMTPHead,
     MinimalMTPSharedBlock,
+    attach_mtp_head,
     compute_mtp_step_weights,
     compute_weighted_mtp_loss,
+    get_or_attach_mtp_head,
     mtp_cross_entropy_from_logits,
     mtp_loss_for_model,
     next_token_and_mtp_loss,
     roll_and_mask_mtp_ids,
     roll_and_mask_mtp_labels,
+)
+from cppmega_mlx.training.stp_loss import (
+    DEFAULT_STP_LAMBDA,
+    DEFAULT_STP_SPANS,
+    STP_COSINE_EPSILON,
+    STPLossConfig,
+    STPLossMetrics,
+    compute_stp_loss,
+    next_token_and_stp_loss,
+)
+from cppmega_mlx.training.optimizers import (
+    ADAMW_BASE_CLASS,
+    ADAMW_FP32_MOMENTS_CLASS,
+    ADAMW_FP32_MOMENTS_SOURCE,
+    ADAMW_MOMENT_STATE_KEYS,
+    AdamWFP32Moments,
+    adamw_moment_dtypes_ok,
+    collect_adamw_moment_dtypes,
+    dtype_name,
 )
 from cppmega_mlx.training.mlx_lm_adapter import (
     MLX_LM_DENSE_BATCH_KEYS,
@@ -107,6 +133,12 @@ from cppmega_mlx.training.profile import (
 )
 
 __all__ = [
+    "ADAMW_BASE_CLASS",
+    "ADAMW_FP32_MOMENTS_CLASS",
+    "ADAMW_FP32_MOMENTS_SOURCE",
+    "ADAMW_MOMENT_STATE_KEYS",
+    "adamw_moment_dtypes_ok",
+    "AdamWFP32Moments",
     "archive_baseline_row",
     "baseline_filename",
     "BASELINE_ARCHIVE_KIND",
@@ -119,10 +151,15 @@ __all__ = [
     "coerce_parity_receipt",
     "CompiledPretrainingStep",
     "compute_mtp_step_weights",
+    "compute_stp_loss",
     "compute_weighted_mtp_loss",
+    "collect_adamw_moment_dtypes",
     "DEFAULT_MTP_DECAY",
     "DEFAULT_MTP_DEPTH",
     "DEFAULT_MTP_LAMBDA",
+    "DEFAULT_STP_LAMBDA",
+    "DEFAULT_STP_SPANS",
+    "dtype_name",
     "EvalMetrics",
     "FORMAT_NAME",
     "FORMAT_VERSION",
@@ -169,14 +206,20 @@ __all__ = [
     "as_mlx_lm_loss_args",
     "as_mlx_lm_token_mapping",
     "assess_kernel_adoption",
+    "attach_mtp_head",
     "describe_mlx_lm_batch_route_metadata",
     "describe_mlx_lm_trainer_apis",
     "evaluate_batches",
+    "get_or_attach_mtp_head",
     "hotspot_from_profile_metrics",
     "load_checkpoint",
     "make_adamw",
     "next_token_cross_entropy",
+    "next_token_cross_entropy_mtp_loss",
+    "next_token_cross_entropy_with_mtp",
+    "next_token_cross_entropy_with_stp",
     "next_token_and_mtp_loss",
+    "next_token_and_stp_loss",
     "normalize_compiled_batch",
     "one_step_train",
     "profile_context",
@@ -188,6 +231,9 @@ __all__ = [
     "roll_and_mask_mtp_labels",
     "save_checkpoint",
     "STABLE_BATCH_KEYS",
+    "STP_COSINE_EPSILON",
+    "STPLossConfig",
+    "STPLossMetrics",
     "StepProfiler",
     "summarize_hotspots",
     "synchronize",

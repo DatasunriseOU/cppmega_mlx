@@ -17,11 +17,6 @@ GB10_SAMPLE_ROOT = ROOT / "data" / "parquet_samples" / "gb10"
 REAL_PARQUET_COLUMNS = (
     "token_ids",
     "structure_ids",
-    "token_structure_ids",
-    "token_dep_levels",
-    "token_ast_depth",
-    "token_sibling_index",
-    "token_ast_node_type",
 )
 FULL_SIDE_CHANNELS = [
     "ast_depth_ids",
@@ -274,6 +269,7 @@ def _assert_finite_mixed_mr_training_payload(
     assert payload["parameter_count"] > 0
     assert isinstance(payload["device"]["metal_available"], bool)
     assert "mlx_metal" in payload["device"]
+    _assert_memory_receipt(payload)
 
     final_loss = payload["final_loss"]
     assert isinstance(final_loss, float)
@@ -339,6 +335,7 @@ def _assert_finite_route_training_payload(
     assert payload["parameter_count"] > 0
     assert isinstance(payload["device"]["metal_available"], bool)
     assert "mlx_metal" in payload["device"]
+    _assert_memory_receipt(payload)
 
     final_loss = payload["final_loss"]
     assert isinstance(final_loss, float)
@@ -372,6 +369,37 @@ def _assert_finite_route_training_payload(
         assert step["loss"] > 0
 
 
+def _assert_optional_non_negative_int(value: Any) -> None:
+    assert value is None or (isinstance(value, int) and value >= 0)
+
+
+def _assert_memory_receipt(payload: dict[str, Any]) -> None:
+    memory = payload["memory"]
+    assert {
+        "after",
+        "before",
+        "peak_memory_bytes",
+        "peak_memory_reset",
+    }.issubset(memory)
+    assert isinstance(memory["peak_memory_reset"], bool)
+    assert memory["peak_memory_bytes"] == memory["after"]["peak_memory_bytes"]
+    for scope in ("before", "after"):
+        assert set(memory[scope]) == {
+            "active_memory_bytes",
+            "cache_memory_bytes",
+            "peak_memory_bytes",
+        }
+        for key in ("active_memory_bytes", "cache_memory_bytes", "peak_memory_bytes"):
+            _assert_optional_non_negative_int(memory[scope][key])
+    if "clear_cache_every_steps" in memory:
+        cadence = memory["clear_cache_every_steps"]
+        assert cadence is None or (isinstance(cadence, int) and cadence > 0)
+    if "clear_cache_events" in memory:
+        assert isinstance(memory["clear_cache_events"], list)
+    if "clear_cache_event_count" in memory:
+        assert memory["clear_cache_event_count"] == len(memory.get("clear_cache_events", []))
+
+
 def _assert_update_boundary_training_state(
     manifest: dict[str, Any],
     *,
@@ -394,6 +422,23 @@ def _assert_update_boundary_training_state(
             "step": step,
             "trained_tokens": trained_tokens,
         },
+    }
+
+
+def _assert_snapshot_rng_contract(manifest: dict[str, Any]) -> None:
+    rng = manifest["rng"]
+    assert isinstance(rng, dict)
+    assert rng["mode"] == "snapshot"
+    snapshot = rng["snapshot"]
+    assert isinstance(snapshot, dict)
+    assert snapshot["version"] == 1
+    assert snapshot["scope"] == "single_process_local"
+    assert set(snapshot) == {
+        "version",
+        "scope",
+        "python_random",
+        "numpy_random",
+        "mlx_random",
     }
 
 
@@ -541,7 +586,7 @@ def test_dry_run_json_reports_npz_hybrid_plan(tmp_path: Path) -> None:
         "clang_commits_4k_v1",
     ],
 )
-def test_real_gb10_parquet_cli_smoke_trains_with_side_channels(
+def test_real_gb10_parquet_cli_smoke_trains_token_only_after_retokenize(
     tmp_path: Path,
     dataset_name: str,
 ) -> None:
@@ -593,13 +638,10 @@ def test_real_gb10_parquet_cli_smoke_trains_with_side_channels(
     assert payload["dataset"]["metadata"]["source_format"] == "parquet"
     assert payload["dataset"]["token_key"] == "token_ids"
     assert payload["dataset"]["num_samples"] >= 4
-    assert payload["dataset"]["side_channels"] == [
-        "ast_depth_ids",
-        "dep_levels",
-        "node_type_ids",
-        "sibling_index_ids",
-        "structure_ids",
-    ]
+    assert payload["dataset"]["side_channels"] == []
+    assert payload["dataset"]["side_channel_contract"]["structure_side_channels"][
+        "threaded_to_model"
+    ] == []
     receipt = payload["dataset"]["dataset_receipt"]
     assert receipt["parquet_receipt"] == {
         "source_format": "parquet",
@@ -607,39 +649,13 @@ def test_real_gb10_parquet_cli_smoke_trains_with_side_channels(
         "column_types": {
             "token_ids": "large_list<element: uint32>",
             "structure_ids": "large_list<element: int8>",
-            "token_structure_ids": "large_list<element: uint8>",
-            "token_dep_levels": "large_list<element: uint16>",
-            "token_ast_depth": "large_list<element: uint16>",
-            "token_sibling_index": "large_list<element: uint16>",
-            "token_ast_node_type": "large_list<element: uint16>",
         },
         "token_source": {
             "mode": "token_column",
             "column": "token_ids",
             "type": "large_list<element: uint32>",
         },
-        "side_channel_sources": {
-            "ast_depth_ids": {
-                "column": "token_ast_depth",
-                "type": "large_list<element: uint16>",
-            },
-            "dep_levels": {
-                "column": "token_dep_levels",
-                "type": "large_list<element: uint16>",
-            },
-            "node_type_ids": {
-                "column": "token_ast_node_type",
-                "type": "large_list<element: uint16>",
-            },
-            "sibling_index_ids": {
-                "column": "token_sibling_index",
-                "type": "large_list<element: uint16>",
-            },
-            "structure_ids": {
-                "column": "token_structure_ids",
-                "type": "large_list<element: uint8>",
-            },
-        },
+        "side_channel_sources": {},
         "skipped_side_channel_columns": [
             {
                 "field": "structure_ids",
@@ -1287,6 +1303,7 @@ def test_checkpoint_save_and_resume_reports_hybrid_cursor(tmp_path: Path) -> Non
     assert manifest["batch_cursor"]["batch_offset"] == 1
     assert manifest["optimizer"]["present"] is True
     assert manifest["model_config"]["pattern"] == "AEMR"
+    _assert_snapshot_rng_contract(manifest)
     _assert_update_boundary_training_state(
         manifest,
         step=1,
@@ -1337,6 +1354,7 @@ def test_checkpoint_save_and_resume_reports_hybrid_cursor(tmp_path: Path) -> Non
     )
     assert resumed_manifest["step"] == 2
     assert resumed_manifest["batch_cursor"]["global_batch_offset"] == 2
+    _assert_snapshot_rng_contract(resumed_manifest)
     _assert_update_boundary_training_state(
         resumed_manifest,
         step=2,

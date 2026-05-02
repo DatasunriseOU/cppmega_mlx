@@ -1,0 +1,282 @@
+{
+  "applied_memory_limits": {
+    "applied": true,
+    "metal_limit_api_path": "mx.metal.set_memory_limit",
+    "metal_limit_bytes": 116823110451,
+    "metal_ratio": 0.85,
+    "previous_metal_limit_bytes": 130567005798,
+    "previous_wired_limit_bytes": 0,
+    "total_bytes": 137438953472,
+    "wired_limit_bytes": 96207267430,
+    "wired_ratio": 0.7
+  },
+  "baseline_commit": "73c6a96",
+  "blockers": [
+    {
+      "id": "cppmega-mlx-t8f.1",
+      "impact": "Tokenizer gate is closed; this blocker is retained as historical context for why older receipts were partial.",
+      "status": "closed",
+      "title": "M0.1 tokenizer gate is closed"
+    },
+    {
+      "id": "cppmega-mlx-t8f.2",
+      "impact": "Model-factory gate is closed; this receipt still uses HybridTinyLM rather than the target 3.79B local_gb10_quarter profile.",
+      "status": "closed",
+      "title": "M0.2 local_gb10_quarter model factory gate is closed"
+    },
+    {
+      "id": "cppmega-mlx-t8f.6",
+      "impact": "No 100-step local_gb10_quarter AdamW + grad-checkpoint receipt exists yet.",
+      "status": "open",
+      "title": "M0.6 exact acceptance run is still missing"
+    }
+  ],
+  "clear_cache_cadence_recorded": true,
+  "clear_cache_event": {
+    "api_path": "mx.clear_cache",
+    "cache_memory_after_bytes": 0,
+    "cache_memory_before_bytes": 147315502,
+    "every_steps": 10,
+    "step": 100
+  },
+  "clear_cache_event_count": 10,
+  "clear_cache_event_recorded": true,
+  "clear_cache_event_scope": "train_hybrid_tiny_step_loop",
+  "clear_cache_events": [
+    {
+      "api_path": "mx.clear_cache",
+      "cache_memory_after_bytes": 0,
+      "cache_memory_before_bytes": 155709372,
+      "every_steps": 10,
+      "step": 10
+    },
+    {
+      "api_path": "mx.clear_cache",
+      "cache_memory_after_bytes": 0,
+      "cache_memory_before_bytes": 147310344,
+      "every_steps": 10,
+      "step": 20
+    },
+    {
+      "api_path": "mx.clear_cache",
+      "cache_memory_after_bytes": 0,
+      "cache_memory_before_bytes": 147312294,
+      "every_steps": 10,
+      "step": 30
+    },
+    {
+      "api_path": "mx.clear_cache",
+      "cache_memory_after_bytes": 0,
+      "cache_memory_before_bytes": 147310602,
+      "every_steps": 10,
+      "step": 40
+    },
+    {
+      "api_path": "mx.clear_cache",
+      "cache_memory_after_bytes": 0,
+      "cache_memory_before_bytes": 147312352,
+      "every_steps": 10,
+      "step": 50
+    },
+    {
+      "api_path": "mx.clear_cache",
+      "cache_memory_after_bytes": 0,
+      "cache_memory_before_bytes": 147313956,
+      "every_steps": 10,
+      "step": 60
+    },
+    {
+      "api_path": "mx.clear_cache",
+      "cache_memory_after_bytes": 0,
+      "cache_memory_before_bytes": 147313390,
+      "every_steps": 10,
+      "step": 70
+    },
+    {
+      "api_path": "mx.clear_cache",
+      "cache_memory_after_bytes": 0,
+      "cache_memory_before_bytes": 147322904,
+      "every_steps": 10,
+      "step": 80
+    },
+    {
+      "api_path": "mx.clear_cache",
+      "cache_memory_after_bytes": 0,
+      "cache_memory_before_bytes": 147315446,
+      "every_steps": 10,
+      "step": 90
+    },
+    {
+      "api_path": "mx.clear_cache",
+      "cache_memory_after_bytes": 0,
+      "cache_memory_before_bytes": 147315502,
+      "every_steps": 10,
+      "step": 100
+    }
+  ],
+  "clear_cache_event_api_paths": [
+    "mx.clear_cache",
+    "mx.clear_cache",
+    "mx.clear_cache",
+    "mx.clear_cache",
+    "mx.clear_cache",
+    "mx.clear_cache",
+    "mx.clear_cache",
+    "mx.clear_cache",
+    "mx.clear_cache",
+    "mx.clear_cache"
+  ],
+  "clear_cache_event_cadences": [
+    10,
+    10,
+    10,
+    10,
+    10,
+    10,
+    10,
+    10,
+    10,
+    10
+  ],
+  "clear_cache_events_meet_gate": true,
+  "clear_cache_event_count_meets_gate": true,
+  "clear_cache_event_sequence_meets_gate": true,
+  "clear_cache_event_steps": [
+    10,
+    20,
+    30,
+    40,
+    50,
+    60,
+    70,
+    80,
+    90,
+    100
+  ],
+  "clear_cache_every_steps": 10,
+  "expected_clear_cache_event_count": 10,
+  "expected_clear_cache_steps": [
+    10,
+    20,
+    30,
+    40,
+    50,
+    60,
+    70,
+    80,
+    90,
+    100
+  ],
+  "device": {
+    "architecture": "applegpu_g16s",
+    "device_name": "Apple M4 Max",
+    "max_buffer_length": 86586540032,
+    "max_recommended_working_set_size": 115448725504,
+    "memory_size": 137438953472,
+    "resource_limit": 499000
+  },
+  "full_m0_6_acceptance_claim": false,
+  "grad_checkpoint_enabled": false,
+  "grad_checkpoint_meets_gate": false,
+  "issue": {
+    "id": "cppmega-mlx-t8f.6",
+    "title": "M0.6: memory math validated on dev-128 with grad-checkpoint + AdamW"
+  },
+  "local_only": true,
+  "measured_profile": {
+    "all_finite": true,
+    "batch_size": 1,
+    "data_format": "parquet",
+    "data_path": "data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet",
+    "dtype": "bfloat16",
+    "final_loss": 8.26601791381836,
+    "initial_loss": 12.025533676147461,
+    "loss_decreased": true,
+    "model": "HybridTinyLM",
+    "optimizer_name": "AdamW",
+    "optimizer_updated": true,
+    "peak_memory_bytes": 151213278,
+    "profile_claim_scope": "m04_target_parquet_hybrid_tiny_memory_smoke_only",
+    "seq_len": 64,
+    "source_issue": "cppmega-mlx-t8f.4",
+    "steps_completed": 100,
+    "steps_requested": 100,
+    "tokens_per_second": 6881.038014320876
+  },
+  "measured_steps": 100,
+  "measured_steps_meet_gate": true,
+  "memory_limit_api_status": {
+    "metal_memory_limit_available": true,
+    "preferred_memory_limit_api_path": "mx.metal.set_memory_limit",
+    "root_memory_limit_available": true,
+    "supported_memory_limit_api_paths": [
+      "mx.metal.set_memory_limit",
+      "mx.set_memory_limit"
+    ],
+    "wired_limit_available": true
+  },
+  "memory_limit_plan": {
+    "metal_limit_bytes": 116823110451,
+    "metal_ratio": 0.85,
+    "total_bytes": 137438953472,
+    "wired_limit_bytes": 96207267430,
+    "wired_ratio": 0.7
+  },
+  "memory_limit_ratios_meet_gate": true,
+  "memory_limits_applied_meet_gate": true,
+  "memory_profile_source": "/tmp/cppmega_m04_m06_memory_receipt.json",
+  "mlx_metal_version": "0.31.1",
+  "mlx_version": "0.31.1",
+  "model_profile": "HybridTinyLM",
+  "model_profile_meets_gate": false,
+  "notes": [
+    "This is a closest executable M0.6 memory-gated receipt: 100 steps on the target parquet through HybridTinyLM with AdamW, applied process-local MLX limits, trainer-loop mx.clear_cache cadence, and peak-memory capture.",
+    "It is not full M0.6 acceptance because the model_profile is HybridTinyLM, not local_gb10_quarter, and grad_checkpoint_enabled is false.",
+    "Local MLX 0.31.1 accepts mx.metal.set_memory_limit but emits a deprecation warning recommending mx.set_memory_limit.",
+    "No M4-vs-GB10 parity, full-model memory, grad-checkpoint behavior, or full M0.6 closure is claimed."
+  ],
+  "optimizer_meets_gate": true,
+  "optimizer_name": "AdamW",
+  "peak_memory_below_threshold": true,
+  "peak_memory_bytes": 151213278,
+  "peak_threshold_bytes": 103079215104,
+  "peak_threshold_ratio": 0.75,
+  "receipt_schema_version": 2,
+  "receipt_scope": "local_mlx_m06_memory",
+  "required_model_profile": "local_gb10_quarter",
+  "required_optimizer_name": "AdamW",
+  "required_metal_ratio": 0.85,
+  "required_run_command_tokens": [
+    "local_gb10_quarter",
+    "--grad-checkpoint",
+    "--apply-memory-limit-plan",
+    "--clear-cache-every-steps"
+  ],
+  "required_steps": 100,
+  "required_wired_ratio": 0.7,
+  "runtime_stack": {
+    "default_device": "Device(gpu, 0)",
+    "device_info": {
+      "architecture": "applegpu_g16s",
+      "device_name": "Apple M4 Max",
+      "max_buffer_length": 86586540032,
+      "max_recommended_working_set_size": 115448725504,
+      "memory_size": 137438953472,
+      "resource_limit": 499000
+    },
+    "machine": "arm64",
+    "macos_version": "26.4.1",
+    "metal_available": true,
+    "mlx_metal_version": "0.31.1",
+    "mlx_version": "0.31.1",
+    "platform_release": "25.4.0",
+    "platform_system": "Darwin"
+  },
+  "runtime_stack_meets_gate": true,
+  "runtime_stack_recorded": true,
+  "run_command": null,
+  "run_command_meets_gate": false,
+  "run_command_recorded": false,
+  "status": "partial",
+  "total_memory_bytes": 137438953472
+}

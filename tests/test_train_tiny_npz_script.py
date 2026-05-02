@@ -137,6 +137,23 @@ def _assert_update_boundary_training_state(
     }
 
 
+def _assert_snapshot_rng_contract(manifest: dict[str, object]) -> None:
+    rng = manifest["rng"]
+    assert isinstance(rng, dict)
+    assert rng["mode"] == "snapshot"
+    snapshot = rng["snapshot"]
+    assert isinstance(snapshot, dict)
+    assert snapshot["version"] == 1
+    assert snapshot["scope"] == "single_process_local"
+    assert set(snapshot) == {
+        "version",
+        "scope",
+        "python_random",
+        "numpy_random",
+        "mlx_random",
+    }
+
+
 def test_help_lists_npz_training_flags() -> None:
     result = run_script("--help")
 
@@ -770,6 +787,7 @@ def test_checkpoint_save_and_resume_reports_manifest_contract(tmp_path: Path) ->
     assert manifest["trained_tokens"] == first_payload["trained_tokens"]
     assert manifest["optimizer"]["present"] is True
     assert manifest["batch_cursor"]["global_batch_offset"] == 1
+    _assert_snapshot_rng_contract(manifest)
     _assert_update_boundary_training_state(
         manifest,
         step=1,
@@ -820,6 +838,7 @@ def test_checkpoint_save_and_resume_reports_manifest_contract(tmp_path: Path) ->
     assert resumed_manifest["trained_tokens"] == second_payload["trained_tokens"]
     assert resumed_manifest["batch_cursor"]["global_batch_offset"] == 2
     assert resumed_manifest["batch_cursor"]["batch_offset"] == 2
+    _assert_snapshot_rng_contract(resumed_manifest)
     _assert_update_boundary_training_state(
         resumed_manifest,
         step=2,

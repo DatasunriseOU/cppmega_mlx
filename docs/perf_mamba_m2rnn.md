@@ -157,6 +157,25 @@ bash
 Result: PASS, route R, backend m2rnn, compiled, finite loss 4.126661,
 trained tokens 3.
 
+Fresh local train-smoke receipts were collected on 2026-05-02 after adding the
+trainer memory receipt. These are two-step synthetic-token runs on the local
+Apple M4 Max with batch size 1 and sequence length 4. `peak_memory_reset=true`
+means the MLX allocator peak counter was reset immediately before the measured
+training call; memory columns are allocator bytes in active/cache/peak order.
+
+| Route | Mode     | Result | Tokens/s | Mean step ms | Final loss | Memory before a/c/p | Memory after a/c/p | Peak bytes |
+| ----- | -------- | ------ | -------: | -----------: | ---------: | ------------------- | ------------------ | ---------: |
+| M     | eager    | ok     |   758.14 |       5.8177 |   3.992802 | 212/8/0             | 41272/74904/105544 |     105544 |
+| M     | compiled | ok     |   210.13 |      17.9608 |   3.992802 | 212/8/0             | 41480/63892/94952  |      94952 |
+| R     | eager    | ok     |   876.49 |       4.1838 |   3.309039 | 228/8/0             | 37824/81100/112716 |     112716 |
+| R     | compiled | ok     |   273.31 |      13.0414 |   3.309039 | 228/8/0             | 37752/59172/84436  |      84436 |
+
+The 2026-05-02 receipts are local route health checks only. They do not claim
+compiled mode is faster at this tiny shape, do not characterize steady-state
+throughput, and do not establish cross-host GB10 or CUDA/Megatron parity. The
+listed runs used the default cache-clear cadence, so `clear_cache_every_steps`
+was null and `clear_cache_event_count` was 0.
+
 Checkpoint/resume was also run against an explicit /tmp NPZ shard with the
 same route flags. For each of M and R, eager and compiled runs saved
 checkpoint-000001, resumed from step 1, advanced to step 2, and wrote a
@@ -178,6 +197,9 @@ R compile PASS first_loss=4.126661 resume_loss=3.040913 start/end=1/2 trained=6 
 
 - The smoke shape is intentionally tiny, so tokens/s values are dominated by
   launch/compile overhead and should not be used as throughput claims.
+- The train-smoke memory receipt is MLX allocator telemetry only. Active, cache,
+  and peak bytes are not system-wide resident memory and are not a hardware
+  memory-limit proof.
 - Mamba3 and M2RNN route correctness here means finite local MLX loss,
   optimizer update, metadata, and checkpoint cursor continuity; it is not
   numerical parity against the CUDA/Megatron implementation.
@@ -249,6 +271,19 @@ No fused Metal Mamba3 scan kernel was added in this slice. The installed local
 MLX stack exposes mx.fast.metal_kernel and mx.custom_function but no
 mx.scan; the repo kernel policy still requires a custom VJP before a custom
 Metal recurrent kernel can enter the differentiated training graph.
+
+## Factual Port Boundary
+
+As of 2026-05-02, this repository has local MLX module surfaces at
+`cppmega_mlx/nn/mamba3.py` and `cppmega_mlx/nn/m2rnn.py`, with targeted
+regressions in `tests/test_mamba3.py` and `tests/test_m2rnn.py`. The source
+contracts checked for this note are the sibling Megatron files
+`cppmega/megatron/author_mamba3_spec.py`,
+`cppmega/megatron/mamba3_te_mixer.py`, and `cppmega/megatron/m2rnn_spec.py`.
+That means docs may describe a local correctness/reference port with smoke and
+parity-style checks; they must not claim a fused Metal Mamba3 scan, a fused
+Metal M2RNN recurrence, Megatron/CUDA numerical parity, distributed Megatron
+integration, or M4-vs-GB10 speed parity.
 
 ## Regression Checks
 
