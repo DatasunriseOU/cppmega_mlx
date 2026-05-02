@@ -20,7 +20,7 @@
     },
     {
       "id": "cppmega-mlx-t8f.2",
-      "impact": "Model-factory gate is closed; this receipt still uses HybridTinyLM rather than the target 3.79B local_gb10_quarter profile.",
+      "impact": "Model-factory gate is closed; this receipt still uses HybridTinyLM rather than the target 1.2B local_gb10_quarter profile (NAM56R-quartered to 13/52 layers).",
       "status": "closed",
       "title": "M0.2 local_gb10_quarter model factory gate is closed"
     },

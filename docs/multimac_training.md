@@ -25,7 +25,7 @@ Run `system_profiler SPHardwareDataType SPThunderboltDataType && sw_vers` on eac
 Purpose: serve inference, run continuous validation, host the speculative-decode draft model. Does **not** participate in training.
 
 Workloads it handles:
-- q4 quantized inference of mini (3.79B at q4 ≈ 2 GB weights + KV) with full headroom for batch and prompt cache.
+- q4 quantized inference of mini (1.2B at q4 ≈ 0.7 GB weights + KV) with full headroom for batch and prompt cache.
 - Eval / parity / regression CI runs against fresh `dev-128` checkpoints.
 - Speculative-decode draft model server for Stream I (steps 167–169): vanilla acceptance-rejection, EAGLE-2 draft, or MTP self-spec — pick per workload.
 - Long-context benchmarks (NIAH, RULER) on KV-q4 path.
@@ -40,18 +40,18 @@ Memory budget on a 48 GB peer:
 
 Purpose: hold a rank of a distributed training run.
 
-Per-rank memory budget for `local_gb10_quarter` mini (3.79B):
+Per-rank memory budget for `local_gb10_quarter` mini (1.2B):
 
 | Optimizer | Sharding | Per-rank memory | 128 GB? | 48 GB? |
 |---|---|---|---|---|
-| AdamW | none (full DP replica) | ~70–80 GB | ✓ | ❌ |
-| AdamW | ZeRO-1 (opt state shard) | ~55–65 GB | ✓ | ❌ |
-| AdamW | ZeRO-2 (grads + opt) | ~50–58 GB | ✓ | ⚠️ tight |
-| Lion | none (full DP replica) | ~50–60 GB | ✓ | ⚠️ tight |
-| Lion | ZeRO-1 (opt state shard) | ~35–40 GB | ✓ | ✓ headless |
-| Lion | ZeRO-2 (grads + opt) | ~30–35 GB | ✓ | ✓ |
+| AdamW | none (full DP replica) | ~22–26 GB | ✓ | ✓ |
+| AdamW | ZeRO-1 (opt state shard) | ~18–22 GB | ✓ | ✓ |
+| AdamW | ZeRO-2 (grads + opt) | ~16–20 GB | ✓ | ✓ |
+| Lion | none (full DP replica) | ~16–20 GB | ✓ | ✓ |
+| Lion | ZeRO-1 (opt state shard) | ~12–14 GB | ✓ | ✓ headless |
+| Lion | ZeRO-2 (grads + opt) | ~10–12 GB | ✓ | ✓ |
 
-**The 48 GB peer is feasible as `training_peer` only with Lion + ZeRO-1 (or ZeRO-2) and headless mode.** This is a smoke configuration to prove the distributed code path works end-to-end, not a production throughput target.
+**The 48 GB peer is feasible as `training_peer` across all optimizer/sharding combinations once we reach the calibrated 1.2B size**; the previous 3.79B figure was wrong and overstated memory pressure by ~3×. Smoke configuration goal is to prove the distributed code path works end-to-end, not a production throughput target.
 
 ---
 
