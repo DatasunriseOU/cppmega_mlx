@@ -1,5 +1,8 @@
 """Recipe and layer-pattern helpers."""
 
+from importlib import import_module
+from typing import TYPE_CHECKING
+
 from cppmega_mlx.recipes.pattern import (
     ORDERED_NAM_SYMBOLS,
     SUPPORTED_NAM_SYMBOLS,
@@ -17,11 +20,60 @@ from cppmega_mlx.recipes.pattern import (
     r_layer_numbers,
 )
 
+if TYPE_CHECKING:
+    from cppmega_mlx.recipes.model_factory import (
+        LOCAL_GB10_QUARTER_DEPTH,
+        LOCAL_GB10_QUARTER_DSA_A_LAYER_RANKS,
+        LOCAL_GB10_QUARTER_FFN_HIDDEN_SIZE,
+        LOCAL_GB10_QUARTER_HEAD_DIM,
+        LOCAL_GB10_QUARTER_HIDDEN_SIZE,
+        LOCAL_GB10_QUARTER_MAX_SEQ_LENGTH,
+        LOCAL_GB10_QUARTER_MTP_BETA,
+        LOCAL_GB10_QUARTER_MTP_DEPTH,
+        LOCAL_GB10_QUARTER_MTP_LAMBDA,
+        LOCAL_GB10_QUARTER_NUM_HEADS,
+        LOCAL_GB10_QUARTER_PATTERN,
+        LOCAL_GB10_QUARTER_PROFILE,
+        LOCAL_GB10_QUARTER_VOCAB_SIZE,
+        MTPProfile,
+        ModelFactoryProfile,
+        build_local_gb10_quarter_tiny_smoke_model,
+        forward_has_finite_logits,
+        get_model_profile,
+        local_gb10_quarter,
+        local_gb10_quarter_profile,
+    )
+
 REFERENCE_PATTERN = "AEMEAEMEAEMR"
 REFERENCE_DEPTH = 52
 REFERENCE_DSA_A_LAYER_RANKS = (1, 2, 3, 5, 6, 7, 9, 10, 11)
 UNSUPPORTED_MEGATRON_PARITY_SYMBOLS = ("D", "G", "|")
 CUSTOM_MEGATRON_LAYER_ROLES = ("mamba3", "m2rnn")
+
+_MODEL_FACTORY_EXPORTS = frozenset(
+    {
+        "LOCAL_GB10_QUARTER_DEPTH",
+        "LOCAL_GB10_QUARTER_DSA_A_LAYER_RANKS",
+        "LOCAL_GB10_QUARTER_FFN_HIDDEN_SIZE",
+        "LOCAL_GB10_QUARTER_HEAD_DIM",
+        "LOCAL_GB10_QUARTER_HIDDEN_SIZE",
+        "LOCAL_GB10_QUARTER_MAX_SEQ_LENGTH",
+        "LOCAL_GB10_QUARTER_MTP_BETA",
+        "LOCAL_GB10_QUARTER_MTP_DEPTH",
+        "LOCAL_GB10_QUARTER_MTP_LAMBDA",
+        "LOCAL_GB10_QUARTER_NUM_HEADS",
+        "LOCAL_GB10_QUARTER_PATTERN",
+        "LOCAL_GB10_QUARTER_PROFILE",
+        "LOCAL_GB10_QUARTER_VOCAB_SIZE",
+        "MTPProfile",
+        "ModelFactoryProfile",
+        "build_local_gb10_quarter_tiny_smoke_model",
+        "forward_has_finite_logits",
+        "get_model_profile",
+        "local_gb10_quarter",
+        "local_gb10_quarter_profile",
+    }
+)
 
 
 def build_nam56r_config(**overrides):
@@ -82,6 +134,13 @@ def build_hybrid_tiny_config_from_nam56r(config=None, **overrides):
 
     return impl(config, **overrides)
 
+
+def __getattr__(name: str):
+    if name in _MODEL_FACTORY_EXPORTS:
+        impl = import_module("cppmega_mlx.recipes.model_factory")
+        return getattr(impl, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 __all__ = [
     "CUSTOM_MEGATRON_LAYER_ROLES",
     "ORDERED_NAM_SYMBOLS",
@@ -93,18 +152,38 @@ __all__ = [
     "AttentionRoute",
     "ExpandedNamPattern",
     "LayerRole",
+    "LOCAL_GB10_QUARTER_DEPTH",
+    "LOCAL_GB10_QUARTER_DSA_A_LAYER_RANKS",
+    "LOCAL_GB10_QUARTER_FFN_HIDDEN_SIZE",
+    "LOCAL_GB10_QUARTER_HEAD_DIM",
+    "LOCAL_GB10_QUARTER_HIDDEN_SIZE",
+    "LOCAL_GB10_QUARTER_MAX_SEQ_LENGTH",
+    "LOCAL_GB10_QUARTER_MTP_BETA",
+    "LOCAL_GB10_QUARTER_MTP_DEPTH",
+    "LOCAL_GB10_QUARTER_MTP_LAMBDA",
+    "LOCAL_GB10_QUARTER_NUM_HEADS",
+    "LOCAL_GB10_QUARTER_PATTERN",
+    "LOCAL_GB10_QUARTER_PROFILE",
+    "LOCAL_GB10_QUARTER_VOCAB_SIZE",
+    "MTPProfile",
+    "ModelFactoryProfile",
     "NamLayer",
     "NamSymbol",
     "a_layer_numbers",
     "attention_route_for_layer",
     "build_hybrid_tiny_config_from_nam56r",
+    "build_local_gb10_quarter_tiny_smoke_model",
     "build_nam56r_config",
     "build_nam56r_parity_contract",
     "build_nam56r_pattern",
     "default_nam56r_config",
     "expand_nam_pattern",
     "expand_symbols",
+    "forward_has_finite_logits",
+    "get_model_profile",
     "layer_numbers_for_symbol",
+    "local_gb10_quarter",
+    "local_gb10_quarter_profile",
     "parse_nam_pattern",
     "parse_rank_list",
     "r_layer_numbers",

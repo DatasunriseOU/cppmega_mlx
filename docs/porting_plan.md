@@ -183,13 +183,16 @@ The current collected test files are:
 - tests/test_hybrid_lm.py
 - tests/test_hybrid_lm_gradients.py
 - tests/test_lint_mlx.py
+- tests/test_m04_train_step.py
 - tests/test_m2rnn.py
 - tests/test_mamba3.py
 - tests/test_megatron_indexed.py
 - tests/test_memory_runtime.py
 - tests/test_metal_ops.py
 - tests/test_mlx_lm_adapter.py
+- tests/test_model_factory.py
 - tests/test_moe.py
+- tests/test_mtp_loss.py
 - tests/test_nam56r_pattern.py
 - tests/test_ngram_hash.py
 - tests/test_package_exports.py
@@ -207,6 +210,7 @@ The current collected test files are:
 - tests/test_tiny_train.py
 - tests/test_token_dataset.py
 - tests/test_tokenizer_contract.py
+- tests/test_tokenizer_loader.py
 - tests/test_train_hybrid_tiny_script.py
 - tests/test_train_tiny_npz_script.py
 - tests/test_training_exports.py

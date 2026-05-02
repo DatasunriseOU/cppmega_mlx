@@ -130,6 +130,23 @@ Full-stack research-grade LLM (40-45K LOC):
 
 ---
 
+## 0.4 Buy-vs-build addendum
+
+`docs/mlx_buy_vs_build.md` (added 2026-05-02) is the per-feature decision matrix derived from an 8-agent research pass. **Read it before starting any Stream H/I/G work.** Key findings:
+
+- **mlx-lm already ships `mlx_lm/models/nanochat.py`** plus DeepSeek-V3 (MLA), DeepSeek-V3.2 (DSA), GPT-OSS (sinks + sliding window), Mamba2 + `ssm.py` Metal kernel, switch-routing MoE, AWQ/DWQ/GPTQ, QuantizedKVCache, full LoRA/DoRA/QLoRA tuner. **Vendor first.**
+- **scasella/nanochat-mlx** ships exactly the two pieces mlx-lm lacks: Muon+AdamW MultiOptimizer (~289 LOC) + BOS-aligned best-fit packer (~119 LOC). Vendor.
+- **vllm-mlx `paged_cache.py`** (Apache-2.0) is standalone-vendorable for paged KV inference.
+- **ZMLX** (`swiglu_mlp`, `rmsnorm`) provides Python-MSL kernels for fused decode paths; vendor.
+- **arozanov/turboquant-mlx** (Apache-2.0) ships the Hadamard + Lloyd-Max KV-quant Metal kernels we planned for Stream G.
+- **Greenfield work that survives**: engram per-block branch, mhc Sinkhorn mixer, MTP K=2 head with shared-weight aliasing, FIM/iFIM/STP transforms, Mamba3 trapezoidal/MIMO patch on top of mlx-lm Mamba2, doc-id mask generator, 8-bit Adam (only if memory blocks).
+- **Skip Hopper-only fusions**: CUTLASS MXFP8, Grouped MXFP8, MTP native Hopper CE, FP8 activations, GB10 SMEM preflight.
+- **Speculative decoding is greenfield on GB10** (CUDA accepts `is_spec_decode` and forwards to upstream Megatron unused). MLX-side work: fork mlx-lm's `speculative_generate_step` to add Leviathan rejection (mlx-lm uses greedy-match, not Leviathan), then Token Recycling (Phase 2), then MTP self-spec via the K=2 head (Phase 3).
+
+The buy-vs-build addendum also contains a 20-rule anti-port playbook — the things to **not** do when carrying torch into MLX (don't materialize GQA repeats, don't manual-softmax around `mx.fast.SDPA`, don't `mx.array(scalar)` in hot paths, don't deep-copy shared weights, etc.). Lint rules in `tools/lint_mlx.py` enforce a subset.
+
+---
+
 ## 0.5 First milestone (M0): `local_gb10_quarter` end-to-end on a single Mac
 
 Before fanning out across all 10 streams, prove the smallest viable path on the resolved mini target. This is a single, sequenced, ~3–5-week milestone that gates the rest of the plan.
@@ -355,17 +372,17 @@ Before fanning out across all 10 streams, prove the smallest viable path on the 
 
 Cross-stream note: ngram_hash is **already done** (cppmega_mlx/nn/ngram_hash.py). Skip.
 
-141. Port `engram.py` from `/Volumes/external/sources/nanochat/nanochat/engram.py` to `cppmega_mlx/nn/engram.py`.
+141. Port `engram.py` from `/Volumes/external/sources/nanochat/nanochat/engram.py` to `cppmega_mlx/nn/engram.py`. **Greenfield in MLX** (no vendor candidate). Wrap forward in one `mx.compile` per block; depthwise conv stays as `mx.conv_general` until profile justifies a Metal kernel. See `docs/mlx_buy_vs_build.md` row A.
 142. Implement EngramBranch base mode (avg_pool1d n-gram features → bottleneck → out-projection).
 143. Add gated mode: `α = σ(RMSNorm(h)·RMSNorm(k)/√d)`.
 144. Add grouped causal SiLU conv path (`conv_kernel=4`, optional).
 145. Wire `engram_layers` config (per-layer insertion list).
 146. Validate engram parity vs nanochat fork Torch reference (forward pass, rtol=1e-2 atol=1e-2).
-147. Port `mhc.py` ManifoldBranchMixer with Sinkhorn-Knopp normalization (5 iters, fp32 cast inside).
+147. Port `mhc.py` ManifoldBranchMixer with Sinkhorn-Knopp normalization (5 iters, fp32 cast inside). **Greenfield in MLX** — `tokenbender/mHC...` is PyTorch. Compile the fixed-iter Sinkhorn loop in one `mx.compile` closure; do not unroll in Python. See `docs/mlx_buy_vs_build.md` row B.
 148. Implement N=4 streams default with `blend_alpha` interpolation to uniform.
 149. Validate Sinkhorn fp32 path vs MaxText reference (column/row stochasticity within 1e-6).
 150. Wire engram + mHC combo path (mHC mixes main_residual + engram_branch + skip_branch).
-151. Port MTP head + recursive shared-block trick from `nanochat/mtp.py` and `cppmega/megatron/fastmtp_layer.py`. Default K=2 (GB10 baseline); single shared transformer block recurred K times per FastMTP arXiv 2509.18362.
+151. Port MTP head + recursive shared-block trick from `nanochat/mtp.py` and `cppmega/megatron/fastmtp_layer.py`. Default K=2 (GB10 baseline); single shared transformer block recurred K times per FastMTP arXiv 2509.18362. **Critical**: share weights via direct attribute aliasing (`mtp_head.weight = main.lm_head.weight`), not deep copy — MLX module tree walks recognize the shared parameter and AdamW state stays single. See `docs/mlx_buy_vs_build.md` row D + anti-port rule 13.
 152. Implement `roll-and-mask` static-shape FIM-safe MTP loss (mask wrapped positions as `ignore_index=-1`); preserve XLA/`mx.compile`-safe static shapes.
 153. Add per-depth weighted loss `α_k = β^k / Σ β^j` with β=0.6 default decay (matches `CPPMEGA_FASTMTP_DECAY`); apply at `λ=0.3` (matches `CPPMEGA_FASTMTP_LAMBDA`). Use `reduction='mean'` with broadcast (Liger #968 workaround mirror).
 154. Validate MTP parity vs cppmega CUDA `cppmega/megatron/fastmtp_layer.py` and `mtp_native_hopper_ce.py` (loss values + grad norm at fixed seed; document non-claim where Hopper-fused CE is not reproducible on M4).

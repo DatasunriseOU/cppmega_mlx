@@ -12,6 +12,7 @@ dependencies = [
     "mlx-lm>=0.31",
     "numpy>=1.26",
     "safetensors>=0.7",
+    "tokenizers>=0.22",
 ]
 
 [project.optional-dependencies]
