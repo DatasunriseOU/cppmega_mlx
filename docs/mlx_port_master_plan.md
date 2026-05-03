@@ -511,6 +511,34 @@ Reference: `nanochat/nanochat/fire.py`, Han et al. arXiv:2602.08040v1 (Feb 2026)
 160b. **DASH** (Direction-Aware SHrinking). Per-row cosine similarity between weight and gradient; rows with `cos > alpha=0.05` shrunk by `1 - shrink_rate * (cos - alpha)`, clamped to `[0.5, 1.0]`. Periodic, every `--dash_every` steps. Skips Muon-managed params (Muon already strips parallel component). Mirror nanochat call site `scripts/base_train.py:17342`.
 160c. **ReDo** (Recycling Dormant Neurons). EMA of post-activation magnitude per neuron (relu² profile). Periodic at `--redo_every=1000` steps; neurons below `tau=0.025` of layer mean get reinitialized with weakened Gaussian (`std × 0.1`). Replaces torch forward hooks with an opt-in `_redo_probe(post_act)` callable on each MLP module — the MLP forward calls it only when set, so steady-state cost is zero. Surgery uses `mx.where`, no host sync, no boolean indexing. Multi-Mac: `diag.sync_stats()` (DP all-reduce) added later.
 
+#### Stream X addendum — cppmega doc-audit recovery candidates (2026-05-03)
+
+Audit of cppmega CUDA docs surfaced 6 tested-and-adopted optimizations not yet in cppmega.mlx. Tracked under beads epic `cppmega-mlx-m3v`. Source receipts cited verbatim (read-only audit at `/tmp/cppmega_doc_audit.md`):
+
+160d. **Quantized Muon momentum** (int8 + 256-block absmax). Half memory on Muon momentum buffer. Hardware-independent. cppmega.mlx `MuonAdamWMulti` currently holds full bf16 momentum. Source: `cppmega/docs/quantized_muon_momentum.md`. Bead: `cppmega-mlx-s43` (P2).
+160e. **M2RNN sparse fp32 recurrent checkpoints + chunk-recompute backward** (chunk=64). Receipt: 1.375 GiB → 89.38 MiB on NAM56R-quarter shape (15.4× reduction). Apply to `cppmega_mlx/nn/m2rnn.py`. Source: `cppmega/docs/gb10_local_memory_perf_2026_04_25.md`. Bead: `cppmega-mlx-z4x` (P2).
+160f. **M2RNN broadcast-view (stride-0 expand)** for 1→H head broadcast. Receipt: fwd −17.7%, peak −44.9%. Replace materialized broadcasts with `mx.broadcast_to` views (zero-copy). Source: `cppmega/docs/status/m2rnn_broadcast_views_2026_04_30.md`. Bead: `cppmega-mlx-2s7` (P2).
+160g. **Regional compile allow/deny matrix.** Codify cppmega's per-op compile speedups into `cppmega_mlx/training/compiled.py`: `RMSNorm 0.41×`, `RMSNormGated 0.47×`, `MoE Router 0.97×` (DO NOT compile); `DataDep-A 5.93×`, `mamba3-pre 2.66×` (DO compile). Source: `cppmega/docs/optimization_session_2026_04_13.md` §1.7. Bead: `cppmega-mlx-uy5` (P2).
+160h. **20-step BF16-vs-X acceptance harness** (wave44a). Typed plan/run/compare contract with explicit non-acceptance counters as a precision-regression gate; adapt via `scripts/compare_bench_rows.py`. Source: `cppmega/docs/status/wave44a_mxfp8_acceptance_harness.md`. Bead: `cppmega-mlx-5r7` (P2).
+160i. **Liger FLCE `reduction='none'` silent-corruption guard test** for our shipped `cppmega_mlx/training/cut_cross_entropy.py`. Liger backward reads only `grad_output[0]` as scalar — relevant gotcha for chunked CE patterns. Source: `cppmega/docs/findings_2026_04_14_session.md` §1. Bead: `cppmega-mlx-z3o` (P3).
+
+Rejected (do NOT pursue, save us future work):
+- FP8/MXFP8 Mamba SSM scan (0.45–0.91× — slower; cppmega `docs/changelog.md`).
+- DeepGEMM on sm12x (`cppmega/docs/deepgemm_gb10_check_2026_04_25.md`).
+- HF kernel-hub TE replacements (forward-only, no autograd backward; `cppmega/docs/hf_kernel_replacements_2026_04_25.md`).
+- DualPipeV with EP>1.
+
+#### Stream X addendum — TileLang kernel ports from cppmega (10 kernels)
+
+Inventory of cppmega TileLang kernels to port via Path B/C (epic `cppmega-mlx-za1`, blocked on `cppmega-mlx-0ce`). Source: `/tmp/cppmega_tilelang_inventory.md`. Path B verified working: 5.2× speedup vs MLX Python loop on Mamba3-style scan PoC, 3 transform-layer gotchas (~150 LOC) documented.
+
+160j. **Sparse-MLA BF16 fwd/bwd pair** (`cppmega/megatron/sparse_mla_ops/tilelang_sparse_mla_{fwd,bwd}.py`). Highest-value port — powers DSA, Triton-free, no MLX equivalent. Bead: `cppmega-mlx-5t2` (P2). Pure-MLX reference must be written first as parity oracle.
+160k. **Sparse-MLA FP8 + blockscaled variants** (4 kernels). FP8 dependent on Apple Silicon FP8 path (mxfp4/mxfp8/nvfp4 already in `mx.quantized_matmul`). Bead: `cppmega-mlx-cx9` (P3).
+160l. **topk_selector** (`cppmega/megatron/tilelang_sparse_mla/topk_selector.py`). Smallest kernel — first port for Path B transform-layer smoke. Bead: `cppmega-mlx-zlv` (P3).
+160m. **Mamba3 MIMO autograd wrapper** (`cppmega/megatron/tilelang_mimo_autograd.py` + 3 Triton helpers `compute_dacs_segsum`, `bwd_dadt_fused`, `bwd_dtrap_ddt`). Triton helpers must be re-implemented in TileLang or pure-MLX (Triton has no Metal backend). Parity oracle: existing `cppmega_mlx/nn/mamba3.py` reference scan. Bead: `cppmega-mlx-8w8` (P2).
+
+Excluded as Hopper-only dead-end on Metal: `cppmega/megatron/cute_dsl_mimo/` (sm_90a CuTe DSL).
+
 ### Stream I — Inference & Generation (161–180)
 
 161. Implement contiguous KV-cache class `cppmega_mlx/inference/engine.py` (mirror `nanochat/engine.py`).

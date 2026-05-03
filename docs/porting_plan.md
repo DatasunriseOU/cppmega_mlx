@@ -175,6 +175,7 @@ The current collected test files are:
 - tests/test_compiled_train.py
 - tests/test_config.py
 - tests/test_cppmega_parity_anchors.py
+- tests/test_cut_cross_entropy.py
 - tests/test_data_pipeline_doc.py
 - tests/test_data_smoke_script.py
 - tests/test_dataloader_bridge.py
@@ -188,6 +189,7 @@ The current collected test files are:
 - tests/test_lint_mlx.py
 - tests/test_m03_forward_parity_manifest_script.py
 - tests/test_m04_train_step.py
+- tests/test_m05_mtp_parity_manifest_script.py
 - tests/test_m2rnn.py
 - tests/test_mamba3.py
 - tests/test_megatron_indexed.py
