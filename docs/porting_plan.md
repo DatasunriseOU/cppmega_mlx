@@ -67,8 +67,9 @@ full NAM56R readiness or M4 Max parity with GB10.
   raw .bin handoffs. It does not import Megatron, Torch, or CUDA code and is
   wired into open_token_dataset(..., format="megatron") plus .bin/.idx
   suffix inference.
-- cppmega_mlx/training/loss.py implements next-token cross entropy over the
-  local batch contract.
+- cppmega_mlx/training/loss.py implements default next-token cross entropy over
+  the local batch contract plus an opt-in train-only CCE path
+  (`next_token_cut_cross_entropy`) used by `train_hybrid_tiny.py --loss-backend cce`.
 - cppmega_mlx/training/loop.py remains a small eager one-step helper.
 - cppmega_mlx/training/compiled.py implements the current MLX-LM-style
   CompiledPretrainingStep: fixed-key batch normalization, eager/compiled
@@ -193,6 +194,7 @@ The current collected test files are:
 - tests/test_m04_train_step.py
 - tests/test_m05_mtp_parity_manifest_script.py
 - tests/test_m2rnn.py
+- tests/test_m2rnn_dispatch.py
 - tests/test_mamba3.py
 - tests/test_mamba3_dispatch.py
 - tests/test_megatron_indexed.py
@@ -223,6 +225,7 @@ The current collected test files are:
 - tests/test_stp_loss.py
 - tests/test_structure_embedding.py
 - tests/test_system_requirements_doc.py
+- tests/test_tilelang_m2rnn.py
 - tests/test_tilelang_mamba3.py
 - tests/test_tilelang_mamba3_helpers.py
 - tests/test_tilelang_mamba3_path_c.py

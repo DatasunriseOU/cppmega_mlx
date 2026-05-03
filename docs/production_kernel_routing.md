@@ -142,11 +142,20 @@ Default behavior on Apple Silicon is in the **"Production"** column. Override vi
       <td><code>mx.topk</code> doesn't expose the per-row<br>index format we need.</td>
     </tr>
     <tr>
+      <td><strong>M2RNN main scan<br>(R blocks, fwd+bwd)</strong></td>
+      <td><strong>B</strong> — <code>cppmega_mlx.nn._tilelang.m2rnn_apply_with_state</code></td>
+      <td><code>chunked_m2rnn_scan</code><br>(pure MLX in <code>nn/m2rnn.py</code>)</td>
+      <td>❌ not implemented (Mamba3-only proof artifact)</td>
+      <td>One MSL kernel per fwd / bwd; 1 threadgroup per (B, H) lane,<br><code>K_DIM</code> threads per group sharing <code>W</code> via threadgroup memory.<br>fp16 carrier; bf16 upcast to fp16 to dodge simdgroup MSL bugs.</td>
+    </tr>
+    <tr>
       <td><strong>Cross-entropy<br>(chunked, V=65536)</strong></td>
-      <td><strong>B</strong> — <code>cppmega_mlx.training.cut_cross_entropy.linear_cross_entropy_value_and_grad</code></td>
+      <td><strong>Opt-in</strong> — <code>train_hybrid_tiny.py --loss-backend cce</code><br>
+      calls <code>cppmega_mlx.training.loss.next_token_cut_cross_entropy</code></td>
       <td><code>nn.losses.cross_entropy</code></td>
       <td>N/A — pure MLX, no TileLang</td>
-      <td>Saves 26.9% F+B peak memory at V=65536<br>vs the materialized [B*T, V] path.</td>
+      <td>Default training and eval still use materialized CE.<br>
+      The CCE path is scoped train integration; c08.2 full backward/memory acceptance remains open.</td>
     </tr>
     <tr>
       <td><strong>FP8 scaled matmul /<br>vecmat</strong> (when used in<br>custom paths)</td>
@@ -167,14 +176,14 @@ The hybrid mini config (1.2B params, calibrated quarter from 4.8B) at training t
    - **A blocks** (HybridBackend="attention"): RMSNorm (A) → Linear projections (A — mx.matmul) → RoPE (A — mx.fast.rope) → **sparse-MLA (B)** → output projection (A) → residual.
    - **M blocks** (HybridBackend="mamba3"): RMSNorm (A) → in-projections (A) → causal depthwise conv1d (A) → **Mamba3 main scan (B)** → out projection (A) → residual.
    - **E blocks** (HybridBackend="moe"): RMSNorm (A) → router (A) → **gather_mm SwitchGLU (A)** → residual.
-   - **R blocks** (HybridBackend="m2rnn"): RMSNorm (A) → in-proj (A) → m2rnn cell (pure MLX reference, **no Path B** yet) → residual.
+   - **R blocks** (HybridBackend="m2rnn"): RMSNorm (A) → in-proj (A) → causal depthwise conv1d (A) → **M2RNN main scan (B)** → out projection (A) → residual. Reference fallback: <code>chunked_m2rnn_scan</code> via <code>CPPMEGA_KERNEL_PATH=ref</code>.
 3. **Final RMSNorm** → A.
 4. **lm_head projection** → A — mx.matmul.
-5. **Loss** → **B** — linear_cross_entropy_value_and_grad (chunked, fused with the lm_head projection inside the chunked loop).
+5. **Loss** → default **A/reference** — `nn.losses.cross_entropy`; opt-in **CCE** — `next_token_cut_cross_entropy` when the recipe passes `--loss-backend cce`.
 
 ### What this means for a typical training step (mini, B=4 T=2048):
 - **Path A** dominates raw FLOPs (every Linear, every RoPE, every RMSNorm, every attention QKV, every gather_mm).
-- **Path B** carries the sequence-dimension reductions (Mamba3 scan, sparse-MLA attention, chunked CE) — the ops that have no native MLX equivalent.
+- **Path B** carries the sequence-dimension reductions (Mamba3 scan, sparse-MLA attention). Chunked CE is opt-in recipe behavior, not the default production loss.
 - **Path C** is **never hit** in the default production path. It exists only as a reproducibility receipt that the TileLang DSL lowers correctly through patched apple-head TileLang on Metal (proof-of-DSL artifact for docs/upstream/_pr_filing_pack.md).
 
 ## Override mechanism
@@ -200,18 +209,21 @@ The dispatch decision is recorded in a process-wide ring buffer (last 256 record
 | Op                                       |             Path A |                   Path B |                  Path C | Δ B vs A | Δ C vs B |
 | ---------------------------------------- | -----------------: | -----------------------: | ----------------------: | -------: | -------: |
 | Mamba3 fwd+bwd (B=2 T=512 H=4 P=32 N=64) |  n/a (no SSM in A) |                 7.823 ms |                7.707 ms |      n/a |    -1.5% |
+| M2RNN fwd (B=2 T=512 H=4 K=64 V=16, fp16) |                — |   2.9 ms vs 46.9 ms ref |                     n/a |   16.1×  |        — |
+| M2RNN fwd+bwd (B=2 T=512 H=4 K=64 V=16, fp16) |             — |  12.9 ms vs 170.1 ms ref |                     n/a |   13.2×  |        — |
+| M2RNN fwd+bwd (B=2 T=2048 H=8 K=64 V=32, fp16) |            — |  132.5 ms vs 3441 ms ref |                     n/a |   26.0×  |        — |
 | Sparse-MLA fwd BF16 (production shape)   |                n/a | 1.4-3.3× faster than ref |                     n/a |        — |        — |
 | FP8 matmul 128×128×128 e4m3              |                n/a |  0.172 ms / 0.024 TFLOPS | 0.555 ms / 0.008 TFLOPS |      n/a |   -3.16× |
 | FP8 vecmat M=1 N=K=4096                  |                n/a |  0.182 ms / 0.184 TFLOPS | 1.098 ms / 0.031 TFLOPS |      n/a |   -6.01× |
-| Cross-entropy chunked V=65536 fwd peak   |           baseline |              -54.6% peak |                     n/a |        — |        — |
-| Cross-entropy chunked V=65536 F+B peak   |           baseline |              -26.9% peak |                     n/a |        — |        — |
+| Cross-entropy chunked V=65536 fwd peak   |           baseline | -54.6% peak (bench only) |                     n/a |        — |        — |
+| Cross-entropy chunked V=65536 F+B peak   |           baseline | -26.9% peak (bench only; c08.2 not closed) |         n/a |        — |        — |
 | Regular SDPA                             |  shipped (fastest) |                        — |                       — |        — |        — |
 | RMSNorm                                  |  shipped (fastest) |                        — |                       — |        — |        — |
 | Dense GEMM                               | shipped (MPS BNNS) |                        — |                       — |        — |        — |
 
 ## Honest limitations
 
-- **R (m2rnn) blocks have no Path B port today.** They run pure-MLX reference. Adding a port is post-M0 work; the reference is correct but slow on long sequences.
+- **R (m2rnn) blocks now ship a Path B port** (cppmega_mlx/nn/_tilelang/m2rnn.py). Both forward and backward run as hand-written MSL via mx.fast.metal_kernel; the chunked-scan reference remains as the parity oracle and is reachable via CPPMEGA_KERNEL_PATH=ref. The kernel uses one threadgroup per (batch, head) with K_DIM threads per group; W is loaded into threadgroup memory once per (B, H). The fp16 carrier dodges the bf16 simdgroup MSL codegen bugs that Mamba3 also worked around.
 - **Path C is not in the hot path.** It exists for two reasons: (a) prove the patched apple-head TileLang DSL lowers correctly on Apple Silicon — necessary because we file the patches upstream; (b) reproducibility receipt for future contributors who want to re-derive the kernel from a high-level DSL rather than read 700 lines of MSL.
 - **FP8 paths are software emulation.** Apple Silicon (M1–M4) has no native FP8 ALU. The uchar storage + LUT decode + fp32 fma loop pattern (vendored from audiohacking/fp8-mps-metal Apache 2.0) is what we ship. Native FP8 is M5/M6 territory.
 - **TileLang DSL on Metal works for FP16/FP32 GEMM and Mamba3 today.** Sparse-MLA via DSL is blocked on T.Pipelined num_stages>1 working at 32×32 tiles (only 16×16 works after Agent D's 3D-buffer fix). FP8 scaled matmul DSL macro exists but the scheduler doesn't fuse per-load scale into GemmMetalScalar's K-loop yet — that's the documented follow-up in docs/upstream/tilelang_metal_fp8_scaled_matmul/README.md.
@@ -226,7 +238,7 @@ json
   "kernel_dispatch": [
     {"op": "mamba3_mimo", "path": "auto", "kernel_used": "metal_kernel_fwd_v1"},
     {"op": "sparse_mla", "path": "auto", "kernel_used": "metal_kernel_fwd_v1"},
-    {"op": "cut_cross_entropy", "path": "path_b", "kernel_used": "linear_cross_entropy_value_and_grad"}
+    {"op": "cut_cross_entropy", "path": "opt_in_cce", "kernel_used": "next_token_cut_cross_entropy"}
   ]
 }
 

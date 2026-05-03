@@ -267,19 +267,19 @@ Plus two DIY seams:
 - `mx.fast.metal_kernel` — author-your-own MSL kernel, still requires `@mx.custom_function` for VJP/JVP.
 - `mx.custom_function` — Python-side custom forward/backward for non-Metal pure-MLX paths.
 
-Everything else — matmul, activations (SwiGLU/ReLU²/GELU), cross-entropy loss, MoE
-dispatch/routing, Mamba selective scan, M2RNN recurrence, quantized matmul, NgramHash
-gather, structure-embedding fusion — currently runs through the MLX op fuser without a
-dedicated Metal kernel. There is no `mx.fast.cross_entropy` in 0.31.x; `mlx.nn.losses.cross_entropy`
-materializes the full `[B*T, V]` logits tensor (4 GiB at fp32 with B=4, T=512, V=65536).
+Everything else — matmul, activations (SwiGLU/ReLU²/GELU), the default cross-entropy
+loss, MoE dispatch/routing, Mamba selective scan, M2RNN recurrence, quantized matmul,
+NgramHash gather, structure-embedding fusion — currently runs through native MLX ops /
+the MLX op fuser without a dedicated Metal kernel. There is no `mx.fast.cross_entropy`
+in 0.31.x; `mlx.nn.losses.cross_entropy` materializes the full `[B*T, V]` logits tensor
+(4 GiB at fp32 with B=4, T=512, V=65536).
 
-This addendum is a snapshot, not a closing receipt. Parallel research lanes (agents D-I)
-are running web/HF/perplexity searches for kernel alternatives (cut_cross_entropy port,
-TurboQuant patterns, mlx-mfa SDPA variants, ZMLX fused activations, gpt-oss-metal-kernels
-loss/MoE candidates). Their findings will be appended to this addendum as separate dated
-entries; nothing here adopts a custom kernel into the training path. All adoption stays
-gated by the Stream B steps 27–29 contract: profiling evidence, pure-MLX fallback, parity
-tests, and `@mx.custom_function` VJP/JVP coverage.
+The scoped CCE integration now exists as `train_hybrid_tiny.py --loss-backend cce`,
+which routes training through `next_token_cut_cross_entropy(...)` while default training
+and eval remain materialized CE. This is not a c08.2 closing receipt: manual chunked
+backward and the large-shape `B=4,T=512,V=65536` parity/memory acceptance remain open.
+All broader adoption stays gated by the Stream B steps 27–29 contract: profiling
+evidence, pure-MLX fallback, parity tests, and `@mx.custom_function` VJP/JVP coverage.
 
 #### Stream B addendum — Regional compile allow/deny matrix (2026-05-03)
 
@@ -408,6 +408,45 @@ the only path that fits the 48 GB peer in the heterogeneous Stream F smoke per s
 Default Lion config when invoked: `make_lion(lr=3e-4, betas=(0.9, 0.99), wd=0.1)` — the
 `wd=0.1` figure is 10× AdamW per Chen et al. arXiv 2302.06675.
 
+TinyLM table validates LR scaling and state-size delta only. The production
+throughput receipt at the M0 target shape lives in the next sub-section.
+
+##### 100-step throughput sweep on local_gb10_quarter at T=4096 (~1.985B, depth=13) (2026-05-03)
+
+This row is the production throughput receipt at the M0 target shape (T=4096
+matches the cppmega parquet corpus shape — `clang_semantic_4k_v10` /
+`clang_commits_4k_v1`). Bench script
+`scripts/bench_local_gb10_quarter_throughput.py`, receipt
+`bench/baselines/local_gb10_quarter_throughput_m4.json`, summary
+`docs/bench_local_gb10_quarter_production.md`. bf16 weights with
+grad-checkpoint, fp32 master moments, CCE chunked logits (no full `[B*T, V]`
+materialization), Path B kernels (`mamba3_mimo` + `m2rnn`
+`metal_kernel_fwd_v1`) verified on the first measured step.
+
+A. Lion `lr=3e-3, betas=(0.9, 0.99), wd=0.1` — empirically-optimal LR from
+the TinyLM smoke above:
+
+<!-- LION_TABLE -->
+
+B. Muon+AdamW `make_muon(cppmega_cuda_parity=True)` — both groups share
+`lr=1e-4, betas_adamw=(0.9, 0.999)`, Nesterov off, NS steps=5, fp32 NS
+carrier; 2-D `nn.Linear` weights → Muon, embeddings/lm_head/RMSNorm/Mamba
+scalars → AdamW (Megatron `_is_nonlinear_or_embedding` predicate inverted).
+This is the configuration GB10 actually runs.
+
+<!-- MUON_TABLE -->
+
+C. Path A vs Path B at the winning Muon+AdamW B (1 row each):
+
+<!-- PATH_TABLE -->
+
+D. M4 Max vs GB10 honest comparison (Muon+AdamW only — that's what GB10
+runs):
+
+<!-- M4_VS_GB10_TABLE -->
+
+<!-- CONCLUSIONS -->
+
 ##### cppmega CUDA optimizer wiring (reference, not status)
 
 cppmega CUDA uses `MultiOptimizer = Muon + adam8bit` via the Megatron emerging_optimizers
@@ -439,10 +478,10 @@ optimizer code change is implied here. Implementation is tracked under the paren
   pattern mirroring `_is_nonlinear_or_embedding`. Defaults: Muon `lr=2e-3,
   momentum=0.95, nesterov=True, ns_steps=5`; AdamW `lr=1e-4, betas=(0.9, 0.95), wd=0.01`.
   Optional `cppmega_cuda_parity=True` flag forces shared lr=1e-4.
-- `cppmega-mlx-c08.2` — Pure-MLX CCE (cut_cross_entropy) port (P2). Chunked vocab loss
-  avoiding `[B*T, V]` materialization; rtol=1e-4 vs `nn.losses.cross_entropy`. Parallel
-  agent A is starting on this; the issue tracks the long-term work (full backward
-  parity, perf claim).
+- `cppmega-mlx-c08.2` — Pure-MLX CCE (cut_cross_entropy) port (P2). Scoped opt-in train
+  integration has landed via `--loss-backend cce` and matches the masked HybridTiny CE
+  semantics in focused tests. The issue stays open for full backward parity and the
+  accepted large-shape memory receipt (`B=4,T=512,V=65536`, `>=4x` reduction).
 - `cppmega-mlx-c08.3` — Document Lion vs AdamW state-cost trade-off (P3). 0.5× state
   savings + 3× LR rule for cppmega.mlx context; Lion not default; `make_lion(lr=3e-4,
   betas=(0.9, 0.99), wd=0.1)` per Chen et al. 2302.06675.

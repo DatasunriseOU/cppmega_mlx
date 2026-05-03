@@ -401,6 +401,54 @@ def reset_state() -> None:
         mx.reset_peak_memory()
 
 
+def apply_metal_memory_caps(*, memory_cap_gb: float) -> dict[str, int | None]:
+    """Apply hard MLX/Metal memory caps so allocator pressure does not push
+    macOS into swap.
+
+    The wired limit is set just below the throughput cap to prevent MLX from
+    keeping a large cache resident when the working set churns; the metal
+    set_memory_limit hard-caps the allocator so OOM raises cleanly instead of
+    silently spilling to swap.
+    """
+
+    cap_bytes = int(memory_cap_gb * (1024**3))
+    # Wired limit holds resident pages; keep it well below the throughput cap
+    # so the OS retains headroom for the rest of the system.
+    wired_limit_bytes = int(cap_bytes * 0.85)
+
+    applied: dict[str, int | None] = {
+        "memory_cap_bytes": cap_bytes,
+        "wired_limit_bytes": wired_limit_bytes,
+        "previous_memory_limit": None,
+        "previous_wired_limit": None,
+        "memory_limit_api_path": None,
+    }
+    # Prefer the root mx.set_memory_limit (mx.metal.* is deprecated in 0.31).
+    set_memory_limit = getattr(mx, "set_memory_limit", None)
+    api_path = "mx.set_memory_limit"
+    if not callable(set_memory_limit):
+        metal = getattr(mx, "metal", None)
+        set_memory_limit = (
+            getattr(metal, "set_memory_limit", None)
+            if metal is not None
+            else None
+        )
+        api_path = "mx.metal.set_memory_limit"
+    set_wired_limit = getattr(mx, "set_wired_limit", None)
+    if callable(set_memory_limit):
+        try:
+            applied["previous_memory_limit"] = int(set_memory_limit(cap_bytes))
+            applied["memory_limit_api_path"] = api_path
+        except Exception as exc:  # pragma: no cover - device-dependent
+            applied["memory_limit_error"] = str(exc)
+    if callable(set_wired_limit):
+        try:
+            applied["previous_wired_limit"] = int(set_wired_limit(wired_limit_bytes))
+        except Exception as exc:  # pragma: no cover - device-dependent
+            applied["wired_limit_error"] = str(exc)
+    return applied
+
+
 def get_peak_memory_bytes() -> int:
     fn = getattr(mx, "get_peak_memory", None)
     if fn is None:
@@ -444,17 +492,29 @@ def run_bench_one(
     kernel_path_label: str,
     grad_checkpoint: bool = True,
     log_prefix: str = "",
+    thrash_step_seconds: float | None = None,
 ) -> BenchRow:
-    """Run one (optimizer, B) bench and return a BenchRow."""
+    """Run one (optimizer, B) bench and return a BenchRow.
+
+    ``thrash_step_seconds`` is an optional early-abort guard: when set, if a
+    step takes more than ``thrash_step_seconds`` we treat the current B as
+    memory-bound (system swapping) and stop the sweep with
+    ``memory_cap_hit=True`` so the inner sweep loop terminates that
+    optimizer's batch sequence. This catches the case where MLX peak is
+    nominally below the cap but the OS is paging the working set under
+    wired-limit pressure.
+    """
 
     print(
         f"{log_prefix}[bench] optimizer={optimizer_key} B={batch_size} "
         f"T={seq_len} steps={steps} warmup={warmup} "
-        f"kernel_path={kernel_path_label}",
+        f"kernel_path={kernel_path_label} "
+        f"thrash_guard_s={thrash_step_seconds}",
         flush=True,
     )
 
     reset_state()
+    apply_metal_memory_caps(memory_cap_gb=memory_cap_gb)
     mx.random.seed(seed)
     start_wall = time.perf_counter()
 
@@ -467,6 +527,7 @@ def run_bench_one(
     dispatch_snapshot: tuple[dict[str, str], ...] = ()
     peak_bytes = 0
     steps_completed = 0
+    cap_hit_early = False
 
     model = None
     optimizer = None
@@ -514,6 +575,11 @@ def run_bench_one(
             current_peak = get_peak_memory_bytes()
             peak_bytes = max(peak_bytes, current_peak)
 
+            # Clear cache periodically to keep MLX from inflating its
+            # allocator beyond the working-set need.
+            if (step + 1) % 10 == 0 and hasattr(mx, "clear_cache"):
+                mx.clear_cache()
+
             if step == 0:
                 dispatch_snapshot = tuple(
                     {str(k): str(v) for k, v in entry.items()}
@@ -543,6 +609,24 @@ def run_bench_one(
                 )
                 break
 
+            # Thrash guard: when MLX is below the cap but the OS is paging
+            # under wired-limit pressure, individual steps balloon to several
+            # multiples of the steady-state time. We treat this as
+            # cap-equivalent because pushing further is "do not OOM" territory.
+            if (
+                thrash_step_seconds is not None
+                and step >= 1  # ignore JIT-warmed first step
+                and dt > thrash_step_seconds
+            ):
+                cap_hit_early = True
+                print(
+                    f"{log_prefix}[bench] STOP: B={batch_size} thrash guard "
+                    f"(step={step + 1} dt={dt:.1f}s > {thrash_step_seconds:.1f}s) "
+                    f"peak={current_peak / (1024**3):.2f} GB; treating as cap-equivalent",
+                    flush=True,
+                )
+                break
+
         if losses:
             last10 = losses[-min(10, len(losses)):]
             last10_mean = statistics.fmean(last10)
@@ -567,7 +651,9 @@ def run_bench_one(
 
     if peak_bytes == 0:
         peak_bytes = get_peak_memory_bytes()
-    cap_hit = peak_bytes > int(memory_cap_gb * (1024**3))
+    # cap_hit is True if MLX peak exceeded the cap OR the thrash guard fired
+    # (system paging under wired pressure even though peak was below cap).
+    cap_hit = peak_bytes > int(memory_cap_gb * (1024**3)) or cap_hit_early
 
     elapsed = time.perf_counter() - start_wall
 
@@ -577,8 +663,12 @@ def run_bench_one(
     if model is not None:
         del model
     gc.collect()
+    if hasattr(mx, "synchronize"):
+        mx.synchronize()
     if hasattr(mx, "clear_cache"):
         mx.clear_cache()
+    if hasattr(mx, "reset_peak_memory"):
+        mx.reset_peak_memory()
 
     return BenchRow(
         optimizer=optimizer_key,
@@ -610,6 +700,18 @@ def run_bench_one(
     )
 
 
+def _checkpoint_partial(out_path: Path, partial: dict[str, Any]) -> None:
+    """Persist a partial receipt after each (optimizer, B) row so that a kill
+    or OOM later in the sweep does not lose the rows we already measured.
+    """
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(
+        json.dumps(partial, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
 def run_sweep(args: argparse.Namespace) -> dict[str, Any]:
     if args.seq_len != SEQ_LEN_REQUIRED and not args.allow_non_4k_seq_len:
         raise SystemExit(
@@ -635,7 +737,42 @@ def run_sweep(args: argparse.Namespace) -> dict[str, Any]:
     sweep_start = time.perf_counter()
     aborted = False
 
+    def _emit_partial() -> None:
+        partial = {
+            "schema_version": 1,
+            "scope": "local_gb10_quarter_throughput_m4",
+            "status": "partial",
+            "config": {
+                "batch_sizes": list(batch_sizes),
+                "seq_len": args.seq_len,
+                "optimizers": list(optimizers),
+                "steps": args.steps,
+                "warmup": args.warmup,
+                "memory_cap_gb": args.memory_cap_gb,
+                "vocab_size": args.vocab_size,
+                "seed": args.seed,
+                "cce_chunk_rows": args.cce_chunk_rows,
+                "grad_checkpoint": True,
+                "dtype": "bfloat16",
+                "kernel_path_default": initial_kernel_label,
+                "lion_kwargs": LION_KWARGS,
+                "muon_kwargs": MUON_KWARGS,
+            },
+            "rows": [row.to_dict() for row in rows],
+            "elapsed_s": time.perf_counter() - sweep_start,
+            "synthetic_tokens": True,
+        }
+        _checkpoint_partial(args.out, partial)
+
     for optimizer_key in optimizers:
+        # Thrash guard: we want to detect "throughput per token collapsed" at
+        # higher batch sizes. The threshold is a per-step wall-time ceiling
+        # scaled by ``B / B_first`` so a linear scaling of step time with B is
+        # allowed (legitimate memory-bandwidth saturation), while super-linear
+        # blowups (system paging under wired pressure) are caught early.
+        thrash_factor = 3.0
+        first_B_step_time: float | None = None
+        first_B_value: int | None = None
         for B in batch_sizes:
             if (
                 args.max_runtime_s is not None
@@ -647,6 +784,11 @@ def run_sweep(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 aborted = True
                 break
+            thrash_step_seconds = (
+                first_B_step_time * thrash_factor * (B / first_B_value)
+                if first_B_step_time is not None and first_B_value is not None
+                else None
+            )
             row = run_bench_one(
                 optimizer_key=optimizer_key,
                 batch_size=B,
@@ -658,8 +800,22 @@ def run_sweep(args: argparse.Namespace) -> dict[str, Any]:
                 cce_chunk_rows=args.cce_chunk_rows,
                 memory_cap_gb=args.memory_cap_gb,
                 kernel_path_label=initial_kernel_label,
+                thrash_step_seconds=thrash_step_seconds,
             )
             rows.append(row)
+            _emit_partial()
+            if (
+                row.error is None
+                and not row.memory_cap_hit
+                and row.tokens_per_second_median is not None
+                and math.isfinite(row.tokens_per_second_median)
+                and row.tokens_per_step > 0
+                and row.tokens_per_second_median > 0
+                and first_B_step_time is None
+            ):
+                # Lock in the steady-state step time from the first successful B.
+                first_B_step_time = row.tokens_per_step / row.tokens_per_second_median
+                first_B_value = row.batch_size
             if row.error is not None:
                 # OOM-shaped errors are why we stop the inner sweep.
                 # Cap-already-hit returns row.memory_cap_hit=True via measurement;
@@ -719,6 +875,35 @@ def run_sweep(args: argparse.Namespace) -> dict[str, Any]:
                         log_prefix="[path-cmp] ",
                     )
                     path_comparison_rows.append(row)
+                    # Persist after the path comparison row too.
+                    partial = {
+                        "schema_version": 1,
+                        "scope": "local_gb10_quarter_throughput_m4",
+                        "status": "partial",
+                        "config": {
+                            "batch_sizes": list(batch_sizes),
+                            "seq_len": args.seq_len,
+                            "optimizers": list(optimizers),
+                            "steps": args.steps,
+                            "warmup": args.warmup,
+                            "memory_cap_gb": args.memory_cap_gb,
+                            "vocab_size": args.vocab_size,
+                            "seed": args.seed,
+                            "cce_chunk_rows": args.cce_chunk_rows,
+                            "grad_checkpoint": True,
+                            "dtype": "bfloat16",
+                            "kernel_path_default": initial_kernel_label,
+                            "lion_kwargs": LION_KWARGS,
+                            "muon_kwargs": MUON_KWARGS,
+                        },
+                        "rows": [r.to_dict() for r in rows],
+                        "path_comparison_rows": [
+                            r.to_dict() for r in path_comparison_rows
+                        ],
+                        "elapsed_s": time.perf_counter() - sweep_start,
+                        "synthetic_tokens": True,
+                    }
+                    _checkpoint_partial(args.out, partial)
                 finally:
                     if env_backup is None:
                         os.environ.pop("CPPMEGA_KERNEL_PATH", None)
