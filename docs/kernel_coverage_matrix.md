@@ -21,7 +21,7 @@ Status legend: 🟢 shipped & usable · 🟡 partial / single-direction (fwd-onl
 | **Cross-entropy / loss** | `nn.losses.cross_entropy` materializes [B*T, V] | **`cppmega_mlx.training.cut_cross_entropy.linear_cross_entropy_value_and_grad`** (this repo, commit `2d29171`) — 🟢 | 80 LOC core + 14 tests | yes (manual chunked bwd outside autograd) | V=65536 → −54.6% fwd peak, −26.9% F+B peak |
 | **Selective scan (Mamba)** | None — current `cppmega_mlx/nn/mamba3.py` is reference scan | **D-CSIL/mlx-recurrence** `ssm_scan.py` (~430 LOC, MIT, full fwd+bwd VJP) — 🟢 (post-M0) | medium (430 LOC vendor + MIMO rank>1 extension if needed) | yes | when long-T forward is bottleneck; 19× fwd+bwd, ~3× e2e on M3 Max |
 | **Selective scan (inference only)** | reference scan | mlx-lm PR #1153 — 🟡 fwd-only, 18.7× prefill | medium | no | inference scout / 48 GB peer |
-| **Mamba3 / MIMO chunked SSD** | reference (chunked matmul inter-chunk) | nothing public — needs extension of D-CSIL kernel | high (custom Metal + MIMO low-rank A) | needs writing | full Mamba3 perf parity vs cppmega CUDA CuTe DSL |
+| **Mamba3 / MIMO chunked SSD** | reference (chunked matmul inter-chunk) | **TileLang Apple Metal** (PR tile-ai/tilelang#799 merged 2025-10-07) — emits MSL via TVM, lowers `mamba_ssm.ops.tilelang.mamba3.*`. CuTe DSL path is sm_90a-only and dead-end on Metal. | medium (port: strip PyTorch-MPS launcher → rehost via `mx.fast.metal_kernel`; rewrite 3 Triton helpers; fp16 carrier — bf16 simdgroup MSL bugs) | algorithmically portable; needs custom VJP wrapper | full Mamba3 perf parity with cppmega CUDA TileLang path |
 | **KV-cache q4 (inference)** | None | **TurboQuant** (vllm-metal upstream / arozanov / sharpner) — 🟢 4.6× compression, ~98% fp16 speed | low (drop-in mlx-lm KVCache) | inference only | inference-scout role; long context |
 | **NF4 / QLoRA training** | not in MLX 🔴 | none — would need `mx.custom_function` with manual gradient | high | needs writing | not on master plan (training stays bf16) |
 | **W8A8 GPTQ training** | not in MLX 🔴 | none | high | needs writing | not on master plan |
@@ -44,7 +44,8 @@ Status legend: 🟢 shipped & usable · 🟡 partial / single-direction (fwd-onl
 
 ### Defer (write only when profile demands it)
 
-- **Selective-scan Metal kernel** — vendor D-CSIL `ssm_scan.py` post-M0. Reference scan in `cppmega_mlx/nn/mamba3.py` is fine for M0 smoke + correctness. When forward becomes a bottleneck, vendor and extend for MIMO rank > 1.
+- **Mamba3 MIMO via TileLang Apple Metal** — TileLang's Metal device backend (PR #799, 2025-10-07) is real and `mamba_ssm.ops.tilelang.mamba3` is algorithmically portable. Path: strip the PyTorch-MPS launcher, rehost the emitted MSL via `mx.fast.metal_kernel`, rewrite the 3 Triton helpers (`compute_dacs_segsum`, `bwd_dadt_fused`, `bwd_dtrap_ddt`) in TileLang or pure MLX, force fp16 carrier (bf16 simdgroup MSL codegen has bugs per cubecl#1202). Treat as a spike, not a sprint. Major unlock for full Stream B perf parity with cppmega CUDA's TileLang path. The CuTe DSL Mamba3 path (cppmega/megatron/cute_dsl_mimo/) is sm_90a-only and a dead-end on Metal — anchor on TileLang only.
+- **Selective-scan Metal kernel (Mamba1)** — vendor D-CSIL `ssm_scan.py` post-M0 if TileLang path proves too heavy. Reference scan in `cppmega_mlx/nn/mamba3.py` is fine for M0 smoke + correctness.
 - **Fused GEMM+bias+act** — DIY `mx.fast.metal_kernel` only when profile shows BNNS+op-fuser path is the bottleneck. No upstream MLX merge in 0.32; PR #1123 closed stale.
 - **Custom Metal CCE** — pure-MLX chunked CE is sufficient for M0+. Metal port becomes a **measured optimization**, not a blocker. Pattern: mirror Apple CCE's flash-memory matmul + lse reduction in MSL.
 
