@@ -8,7 +8,7 @@
     "machine": "arm64",
     "python_version": "3.13.12",
     "mlx_version": "0.31.1",
-    "tilelang_version": "0.1.9+git7f4a5cb8"
+    "tilelang_version": "0.1.9+gita69d6df7"
   },
   "shape": {
     "batch": 2,
@@ -25,48 +25,48 @@
   "timings": {
     "fwd_path_b": {
       "label": "fwd_path_b",
-      "mean_ms": 2.233479148708284,
-      "median_ms": 2.140624448657036,
-      "min_ms": 1.8943750765174627,
-      "max_ms": 3.5685421898961067,
+      "mean_ms": 2.034474052488804,
+      "median_ms": 1.8688123673200607,
+      "min_ms": 1.8018328119069338,
+      "max_ms": 4.030541051179171,
       "iters": 50,
       "warmup": 10
     },
     "fwd_path_c": {
       "label": "fwd_path_c",
-      "mean_ms": 2.1435382682830095,
-      "median_ms": 2.1631454583257437,
-      "min_ms": 1.8528748769313097,
-      "max_ms": 2.3738748859614134,
+      "mean_ms": 1.9249742524698377,
+      "median_ms": 1.9072084687650204,
+      "min_ms": 1.8154589924961329,
+      "max_ms": 2.1577500738203526,
       "iters": 50,
       "warmup": 10
     },
     "fwd_bwd_path_b": {
       "label": "fwd_bwd_path_b",
-      "mean_ms": 18.659544265829027,
-      "median_ms": 14.447937486693263,
-      "min_ms": 14.134000055491924,
-      "max_ms": 222.60095900855958,
+      "mean_ms": 14.147424101829529,
+      "median_ms": 14.082707930356264,
+      "min_ms": 13.875958044081926,
+      "max_ms": 17.35712494701147,
       "iters": 50,
       "warmup": 10
     },
     "fwd_bwd_path_c": {
       "label": "fwd_bwd_path_c",
-      "mean_ms": 19.53027080744505,
-      "median_ms": 15.263020526617765,
-      "min_ms": 15.001333085820079,
-      "max_ms": 224.27529119886458,
+      "mean_ms": 12.043664129450917,
+      "median_ms": 11.93912501912564,
+      "min_ms": 11.636999901384115,
+      "max_ms": 16.82108291424811,
       "iters": 50,
       "warmup": 10
     },
-    "bwd_path_b_median_ms": 12.307313038036227,
-    "bwd_path_c_median_ms": 13.099875068292022
+    "bwd_path_b_median_ms": 12.213895563036203,
+    "bwd_path_c_median_ms": 10.03191655036062
   },
   "gflops": {
-    "fwd_path_b": 40.41228252544357,
-    "fwd_path_c": 39.991540867971075,
-    "fwd_bwd_path_b": 23.950136849546737,
-    "fwd_bwd_path_c": 22.67114031567637
+    "fwd_path_b": 46.29010462085858,
+    "fwd_path_c": 45.358187852435684,
+    "fwd_bwd_path_b": 24.571274339511646,
+    "fwd_bwd_path_c": 28.982867626034917
   },
   "memory_bytes_peak": {
     "fwd_path_b": 9764896,
@@ -74,7 +74,7 @@
     "fwd_bwd_path_b": 222758468,
     "fwd_bwd_path_c": 222758468
   },
-  "ratio_path_c_over_path_b_fwd_bwd": 1.0564151831827349,
-  "verdict": "Path C within 10% of Path B; recommend keeping Path B as primary and treating Path C as a documentation/reproducibility artifact.",
+  "ratio_path_c_over_path_b_fwd_bwd": 0.8477861699730362,
+  "verdict": "Path C is 10-20% faster than Path B; recommend switching Path C into the candidate hot path and keeping Path B as the fallback.",
   "matched_run_guard": "Compare Path B and Path C only when both rows were collected on the same hardware with identical kernel inputs. This is a local_only receipt."
 }

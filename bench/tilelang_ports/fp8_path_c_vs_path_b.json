@@ -1,0 +1,206 @@
+{
+  "schema_version": 1,
+  "kind": "lane_f_path_c_vs_path_b_fp8_profile",
+  "host": "Davids-Mac-Studio.local",
+  "platform": {
+    "system": "Darwin",
+    "machine": "arm64",
+    "platform": "macOS-26.4.1-arm64-arm-64bit-Mach-O",
+    "python": "3.13.12",
+    "mlx": "0.31.1",
+    "torch": "2.13.0.dev20260503"
+  },
+  "env_contract": {
+    "MAKEFLAGS": null,
+    "CMAKE_BUILD_PARALLEL_LEVEL": null,
+    "PYTHONPATH": null
+  },
+  "repos": {
+    "cppmega_mlx": {
+      "path": "/Volumes/external/sources/cppmega.mlx",
+      "exists": true,
+      "head": {
+        "ok": true,
+        "returncode": 0,
+        "stdout": "b469396480fc798ebc5cf6ac647895453185ea11",
+        "stderr": ""
+      },
+      "status_short": {
+        "ok": true,
+        "returncode": 0,
+        "stdout": "M docs/mlx_port_master_plan.md",
+        "stderr": ""
+      }
+    },
+    "tilelang": {
+      "path": "/private/tmp/tilelang_apple_head/tilelang",
+      "exists": true,
+      "head": {
+        "ok": true,
+        "returncode": 0,
+        "stdout": "a69d6df75b46d7f0eca2eab205a901bc45c6a6af",
+        "stderr": ""
+      },
+      "status_short": {
+        "ok": true,
+        "returncode": 0,
+        "stdout": "m 3rdparty/tvm\n M pyproject.toml\n M requirements-dev.txt\n M requirements.txt\n M src/op/builtin.cc\n M src/op/builtin.h\n M src/op/copy.cc\n M src/op/gemm_sp.h\n M src/target/codegen_metal.cc\n M src/target/codegen_metal.h\n M src/transform/storage_rewrite.cc\n M testing/python/transform/test_readonly_param_const_codegen.py\n M tilelang/engine/phase.py\n M tilelang/intrinsics/metal_macro_generator.py\n M tilelang/language/__init__.py\n M tilelang/language/loop.py\n M tilelang/tileop/gemm/__init__.py\n M tilelang/transform/metal_fragment_to_simdgroup.py\n?? testing/python/cpu/test_fp8_scaled_matmul_lowering.py\n?? testing/python/metal/test_fp8_scaled_matmul_metal.py\n?? testing/python/metal/test_metal_topk_selector.py\n?? tilelang/language/fp8_op.py\n?? tilelang/tileop/gemm/gemm_metal_fp8.py\n?? tilelang/transform/fp8_scaled_matmul_to_gemm.py\n?? tmp_fp8_vecmat_probe.py",
+        "stderr": ""
+      }
+    },
+    "tvm": {
+      "path": "/private/tmp/tvm_apple_head/tvm",
+      "exists": true,
+      "head": {
+        "ok": true,
+        "returncode": 0,
+        "stdout": "fbea96c8b72dbdf528abbf1348e0303fa284ec08",
+        "stderr": ""
+      },
+      "status_short": {
+        "ok": true,
+        "returncode": 0,
+        "stdout": "M src/runtime/metal/metal_device_api.mm\n M src/target/metal/codegen_metal.cc\n M src/target/metal/codegen_metal.h\n M tests/python/codegen/test_target_codegen_metal.py\n?? .venv/",
+        "stderr": ""
+      }
+    }
+  },
+  "path_b_status": {
+    "available": true,
+    "reason": "Vendored FP8 e4m3fn MSL kernels (LUT-based decode + integer-bit encode) are compiled and ready to dispatch."
+  },
+  "results": [
+    {
+      "shape_name": "vecmat_4096",
+      "shape": {
+        "kind": "vecmat",
+        "M": 1,
+        "N": 4096,
+        "K": 4096,
+        "BM": 1,
+        "BN": 32,
+        "BK": 32,
+        "num_stages": 0
+      },
+      "rows": [
+        {
+          "label": "path_b_msl_fp8_scaled_vecmat",
+          "bench": {
+            "label": "path_b_msl_fp8_scaled_vecmat",
+            "ok": true,
+            "median_ms": 0.23422937374562025,
+            "min_ms": 0.21837488748133183,
+            "p90_ms": 0.2647079527378082,
+            "max_ms": 0.6068339571356773,
+            "tflops": 0.14325458614956238,
+            "warmup": 10,
+            "iters": 50,
+            "error": null
+          },
+          "parity_vs_torch_cpu_dequant": {
+            "max_abs": 0.0001220703125,
+            "max_rel": 3.525330976117402e-05
+          }
+        },
+        {
+          "label": "vecmat_tl_fp8_scaled_matmul",
+          "variant": "T.fp8_scaled_matmul",
+          "source_metrics": {
+            "source_len": 4459,
+            "markers": {
+              "simdgroup_multiply_accumulate": 0,
+              "simdgroup_load": 0,
+              "simdgroup_store": 0,
+              "threadgroup_half": 0,
+              "threadgroup_uchar": 2,
+              "threadgroup_barrier": 2,
+              "fp8_e4m3_decode_helper": 3,
+              "fp8_e5m2_decode_helper": 1,
+              "A_scale_loads": 0,
+              "B_scale_loads": 0,
+              "scalar_float_a_val": 1,
+              "scalar_float_b_val": 1,
+              "tvm_thread_allreduce": 0,
+              "simd_sum": 0,
+              "kernel_void": 1
+            }
+          },
+          "xcrun_compile": {
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "msl_path": "/tmp/tl_fp8_vecmat_msl/vecmat_tl_fp8_scaled_matmul.metal",
+            "air_path": "/tmp/tl_fp8_vecmat_msl/vecmat_tl_fp8_scaled_matmul.air"
+          },
+          "bench": {
+            "label": "vecmat_tl_fp8_scaled_matmul",
+            "ok": true,
+            "median_ms": 26.56770800240338,
+            "min_ms": 26.468334021046758,
+            "p90_ms": 26.69716696254909,
+            "max_ms": 26.958958012983203,
+            "tflops": 0.001262978048274416,
+            "warmup": 10,
+            "iters": 50,
+            "error": null
+          },
+          "parity_vs_torch_cpu_dequant": {
+            "max_abs": 0.0,
+            "max_rel": 0.0
+          }
+        },
+        {
+          "label": "vecmat_tl_reduce_fp8",
+          "variant": "TileLang fp8 vecmat thread_allreduce",
+          "source_metrics": {
+            "source_len": 5079,
+            "markers": {
+              "simdgroup_multiply_accumulate": 0,
+              "simdgroup_load": 0,
+              "simdgroup_store": 0,
+              "threadgroup_half": 0,
+              "threadgroup_uchar": 0,
+              "threadgroup_barrier": 2,
+              "fp8_e4m3_decode_helper": 3,
+              "fp8_e5m2_decode_helper": 1,
+              "A_scale_loads": 1,
+              "B_scale_loads": 1,
+              "scalar_float_a_val": 0,
+              "scalar_float_b_val": 0,
+              "tvm_thread_allreduce": 0,
+              "simd_sum": 0,
+              "kernel_void": 1
+            }
+          },
+          "xcrun_compile": {
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "msl_path": "/tmp/tl_fp8_vecmat_msl/vecmat_tl_reduce_fp8.metal",
+            "air_path": "/tmp/tl_fp8_vecmat_msl/vecmat_tl_reduce_fp8.air"
+          },
+          "bench": {
+            "label": "vecmat_tl_reduce_fp8",
+            "ok": true,
+            "median_ms": 0.28327153995633125,
+            "min_ms": 0.2620830200612545,
+            "p90_ms": 0.3243749961256981,
+            "max_ms": 0.7823749911040068,
+            "tflops": 0.11845324103216548,
+            "warmup": 10,
+            "iters": 50,
+            "error": null
+          },
+          "parity_vs_torch_cpu_dequant": {
+            "max_abs": 0.0001220703125,
+            "max_rel": 5.6433196732541546e-05
+          }
+        }
+      ],
+      "ratios": {
+        "vecmat_tl_fp8_scaled_matmul_over_path_b": 113.4260301240299,
+        "vecmat_tl_reduce_fp8_over_path_b": 1.2093766696570354
+      }
+    }
+  ]
+}

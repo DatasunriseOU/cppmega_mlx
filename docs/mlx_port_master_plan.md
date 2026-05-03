@@ -489,6 +489,19 @@ Conclusions: (a) the 58 GB cap, not a throughput plateau, is the limit on M4 Max
 
 Param aliasing fix (commit `df80703`) verified to also kill grad-buffer aliasing — `scripts/audit_grad_buffer_reuse.py` receipt at `bench/baselines/grad_buffer_audit.json`. Production `local_gb10_quarter` (bf16 default, B=1 T=256) now reports `param_entries=335`, `grad_entries=335`, `param_total_numel == grad_total_numel == 1,796,521,354` (matches the `audit_memory` 1.797B unique-param count, NOT the pre-fix 3.108B aliased count), `grad_param_byte_ratio=1.000000`, zero aliased ids in either tree. Verdict: `no double allocation`. The −5.16 GiB Lion-state savings already documented above (`11.58 → 6.69 GiB` after the fix) is therefore consistent with grads also being allocated exactly once per unique parameter, not twice as in the pre-fix walk. Fast smoke regression in `tests/test_grad_buffer_no_aliasing.py` runs in ~1 s on the tiny-smoke profile.
 
+##### Bag 2 receipt — Lion fp32 vs Lion8bit memory comparison (2026-05-03)
+
+Local M4 receipt at `bench/baselines/lion8bit_state_size_m4.json` (script `scripts/bench_lion8bit.py`) on the full `local_gb10_quarter` (1.797B params, bf16 weights). Mirrors `bitsandbytes.optim.Lion8bit` on the GB10 CUDA stack — see `cppmega/docs/lion8bit_ab_2026_04_25.md` for the matched 2-iter A/B run that documented the same trade-off (~0.34 GiB optimizer-state savings on the AdamW group at the cppmega scale; the savings here are larger because Lion8bit replaces the *full* persistent momentum tensor, not just a scalar fallback group).
+
+| optimizer       | persistent state per param | total state for 1.797B | step time M4 (B=1, T=64) | peak GiB (M4) |
+| --------------- | -------------------------- | ---------------------- | ------------------------ | ------------- |
+| LionFP32Moments | 4.000 B (fp32 m)           | 6.69 GiB               | 538 ms (median)          | 27.7          |
+| Lion8bit        | 1.016 B (uint8 m + fp32 absmax / 256) | 1.70 GiB    | 617 ms (median)          | 23.6          |
+
+Compaction ratio: **3.94x state shrink** (gates >=3.0x); step time is ~14.7% slower than LionFP32Moments because every `apply_single` does an extra dequant (uint8 -> fp32) + requant (fp32 -> uint8) round trip — there is no fused Metal kernel for Lion8bit yet (vs the `_fused_adam8bit_kernel.py` fast path used by Adam8bit on the symmetric scheme). 50-step Lion vs Lion8bit loss-trajectory smoke on noisy linear regression: median per-step relative drift 0.16%, max early-step drift 0.003% (well within the 2% policy). Acceptance harness in `tests/test_optimizers_quantized.py::test_lion8bit_loss_matches_lion_fp32_within_tolerance`.
+
+`make_muon(scalar_optimizer="lion8bit")` routes the AdamW (scalar / embedding) group to `Lion8bit`, mirroring `cppmega.cuda`'s `--muon-scalar-optimizer lion8bit` knob. The `lion8bit_quant_scheme` factory argument selects `"symmetric_int8_v1"` (default) or `"dynamic_int8_v1"` (bnb LUT parity), reusing the codec dispatch from `_quantize_8bit.quantize_blockwise`. Default stays symmetric for backwards compatibility; the dynamic LUT is the closer match to `bitsandbytes.optim.Lion8bit` numerics on CUDA.
+
 ##### cppmega CUDA optimizer wiring (reference, not status)
 
 cppmega CUDA uses `MultiOptimizer = Muon + adam8bit` via the Megatron emerging_optimizers

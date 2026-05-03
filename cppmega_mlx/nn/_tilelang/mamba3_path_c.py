@@ -48,9 +48,11 @@ Threadgroup tuning
 
 The Path B grid uses one thread per (b, h, p) lane with up to 256 threads per
 threadgroup, matching the Apple Metal target's 1024-thread / 32 KB-shared
-ceilings. We retune Path C identically: per-lane state lives in registers
-(``T.alloc_local((STATE,), 'float32')``); no shared memory is needed for the
-per-lane scan; threadgroup size is min(256, lanes).
+ceilings. Path C uses the same one-thread-per-lane algorithm, but caps the
+threadgroup at 32 lanes. The TileLang-lowered scan keeps ``h_state[STATE]`` and
+backward ``dh[STATE]`` in per-thread registers; smaller threadgroups reduce the
+register-pressure/occupancy cliff on M4 Max while keeping the generated MSL and
+global memory layout identical.
 
 Apple/M4 Max threadgroup limits (from ``tilelang.target.Target("metal")``):
   ``-max_num_threads=256 -max_shared_memory_per_block=32768``
@@ -140,15 +142,15 @@ def _threads_for(lanes: int) -> int:
     """Return the threadgroup size for a per-lane kernel.
 
     Apple Metal's ``Target("metal")`` reports ``max_num_threads=256``; the
-    selective-scan kernels keep per-lane register pressure modest enough to
-    saturate that without spilling on M4 Max. We use a power-of-two aligned to
-    the lane count when ``lanes <= 256`` and a flat 256 for larger fanouts so
-    occupancy stays high on the chip's 32 KB shared-memory ceiling.
+    Mamba3 selective-scan kernels have enough per-thread register state that
+    smaller threadgroups benchmark better on M4 Max. A 32-thread cap preserves
+    one full Apple SIMD group while avoiding the 128/256-thread occupancy cliff
+    seen in the backward replay/reverse-scan kernel.
     """
 
     if lanes <= 0:
         return 1
-    return min(256, lanes)
+    return min(32, lanes)
 
 
 @lru_cache(maxsize=128)

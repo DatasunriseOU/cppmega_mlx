@@ -341,15 +341,26 @@ def main() -> int:
 
     # Recommendation logic from the task spec.
     ratio = fwd_bwd_pc["median_ms"] / fwd_bwd_pb["median_ms"] if fwd_bwd_pb["median_ms"] > 0 else float("inf")
-    if 0.9 <= ratio <= 1.1:
+    if ratio < 0.8:
+        verdict = (
+            "Path C is >20% faster than Path B; recommend switching to Path C "
+            "and archiving Path B's MSL as a fallback."
+        )
+    elif ratio < 0.9:
+        verdict = (
+            "Path C is 10-20% faster than Path B; recommend switching Path C "
+            "into the candidate hot path and keeping Path B as the fallback."
+        )
+    elif ratio <= 1.1:
         verdict = (
             "Path C within 10% of Path B; recommend keeping Path B as primary "
             "and treating Path C as a documentation/reproducibility artifact."
         )
-    elif ratio < 0.8:
+    elif ratio <= 1.2:
         verdict = (
-            "Path C is >20% faster than Path B; recommend switching to Path C "
-            "and archiving Path B's MSL as a fallback."
+            "Path C is between 10% and 20% slower than Path B; close enough to "
+            "Path B that it is best kept as a documentation artifact; not in "
+            "the hot path."
         )
     elif ratio > 1.2:
         verdict = (
@@ -357,12 +368,6 @@ def main() -> int:
             "primary, KEEPING Path C as a reproducibility artifact (proves the "
             "DSL path works), and flagging the perf gap as a future TileLang "
             "scheduler bug."
-        )
-    else:
-        verdict = (
-            "Path C is between 10% and 20% slower than Path B; close enough to "
-            "Path B that it is best kept as a documentation artifact; not in "
-            "the hot path."
         )
     print(f"verdict: {verdict}")
 
