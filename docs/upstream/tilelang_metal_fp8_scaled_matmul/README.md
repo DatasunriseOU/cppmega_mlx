@@ -1,169 +1,290 @@
-# T.fp8_scaled_matmul intrinsic (frontend stub)
+# T.fp8_scaled_matmul intrinsic for TileLang (Metal + CUDA)
 
-## Blocker
+## Status
 
-The vendor agent (`a469a838bd6a1ba86`) is integrating
-`audiohacking/fp8-mps-metal`'s `fp8_scaled_matmul_kernel` and
-`fp8_scaled_vecmat_kernel` as `mx.fast.metal_kernel` wrappers in
-`cppmega_mlx/nn/_tilelang/fp8_msl_kernels.py` (out of scope for this
-change). That gives a working FP8 GEMM on Metal, but it lives outside
-the TileLang DSL — users who write TileLang prim_funcs cannot say
-`T.fp8_scaled_matmul(...)` and have it compile.
+**Done.** This patch ships a real, working `T.fp8_scaled_matmul` intrinsic
+that lowers correctly on Metal and CUDA. It replaces the earlier stub
+(which raised `NotImplementedError` on Metal) with a hygienic
+`@T.macro` that emits the audiohacking/fp8-mps-metal scaled-matmul
+algorithm directly into the `@T.prim_func` AST.
 
-This patch adds the surface: a single `T.fp8_scaled_matmul(A_fp8,
-A_scale, B_fp8, B_scale, C_out)` API that mirrors the audiohacking
-kernel signature.
+## What ships
 
-## Design
+| File | Lines | Role |
+|------|-------|------|
+| `tilelang/language/fp8_op.py` | 379 | New file. The `fp8_scaled_matmul` macro + validators + dispatch. |
+| `tilelang/language/__init__.py` | +1 | Re-export `T.fp8_scaled_matmul`. |
+| `testing/python/cpu/test_fp8_scaled_matmul_lowering.py` | 195 | New file. IR-level lowering tests (no GPU required). |
+| `testing/python/metal/test_fp8_scaled_matmul_metal.py` | 879 | New file. Metal codegen + xcrun compile + e2e parity vs audiohacking + bench. |
+| `3rdparty/tvm/src/target/source/codegen_metal.cc` | +6 / -2 | Bugfix: e4m3 subnormal decode constant `e+8` -> `e+7`. |
+| `src/target/codegen_metal.cc` | +4 / -1 | Same fix in the TileLang fork copy. |
 
-This is a **frontend-only stub** — pure Python, no TIR op registered, no
-scheduler changes, no C++ rebuild required. It dispatches at parse-time
-based on the active `tvm.target.Target`:
+Total: 1465 insertions, 3 deletions across 6 files.
 
-| Target          | Behaviour                                          |
-|-----------------|----------------------------------------------------|
-| `metal`         | Raise `NotImplementedError` with structured redirect message pointing at `cppmega_mlx.nn._tilelang.fp8_msl_kernels`. |
-| `cuda` / `rocm` | Emit a `tir.call_intrin` placeholder `tl.fp8_scaled_matmul_fallback`. Full lowering = follow-up patch. |
-| `cpu` / other   | Same fallback emission. |
+## Algorithm
 
-### Why a stub for Metal
+The macro is a line-for-line port of the `fp8_scaled_matmul_kernel` body
+from [audiohacking/fp8-mps-metal](https://github.com/audiohacking/fp8-mps-metal)
+(commit `d4fbd40c`, MIT). The expansion inside a `@T.prim_func` is:
 
-The full Metal lowering needs:
-
-1. **Vector FP8 cast lowering** — done in
-   `docs/upstream/tilelang_metal_fp8_vector/`.
-2. **Scaled-gemm scheduler pass** that fuses per-load scale
-   multiplication into the K-loop. Mirrors what the audiohacking MSL
-   kernel does at line 121 of `fp8_matmul.metal`:
-
-   ```msl
-   for (; k < K4; k += 4) {
-       float a0 = fp8_e4m3fn_to_float(A[a_idx]);
-       // ... 3 more lanes ...
-       float b0 = fp8_e4m3fn_to_float(B[b_idx]);
-       // ... 3 more lanes ...
-       sum += a0 * b0 + a1 * b1 + a2 * b2 + a3 * b3;
-   }
-   sum *= sa * sb;  // per-tensor scale broadcast
-   ```
-
-3. **GemmMetalScalar extension** for FP8 operands — PR #2118 brought
-   `GemmMetalScalar` for fp16/fp32 mixed; FP8 needs the dtype check
-   relaxed and the dequant cast inserted at the inner-loop element
-   read.
-
-(2) and (3) are sizeable scheduler patches that exceed this PR's budget.
-The stub is honest about that: users get a clear error and a precise
-redirect to the production-ready MSL kernel.
-
-### Why a stub for non-Metal too
-
-The CUDA path is in nominally OK shape (PRs #202 / #1600 added
-`tcgen05_gemm` blockscaled FP8 gemm), but the TileLang scheduler
-dispatch from a generic `T.fp8_scaled_matmul` to those backend ops is
-non-trivial — the existing `T.gemm` dispatcher in
-`tilelang/tileop/gemm/__init__.py` selects between `gemm_cute`,
-`gemm_tcgen05`, `gemm_metal_scalar` based on dtype + arch. Adding a
-new entry point for "scaled FP8 matmul" duplicates the dispatcher.
-Better: leave the stub here and either (a) lower into the existing
-`gemm_tcgen05_blockscaled` op when the dtypes match, or (b) tell users
-to call the existing op directly. Both options are documented in the
-docstring.
-
-## audiohacking attribution
-
-The audiohacking/fp8-mps-metal MSL kernel is **not vendored** by this
-patch — only the API signature is mirrored. The actual MSL ships
-through `cppmega_mlx/nn/_tilelang/fp8_msl_kernels.py` (vendor agent
-work, separate PR), which carries the audiohacking source under its
-Apache 2.0 license.
-
-The redirect message in this stub references
-`audiohacking/fp8-mps-metal` explicitly so users hit the correct
-attribution chain when they follow the error.
-
-## Diff stat
-
+```python
+for i, j in T.Parallel(M, N):
+    for k in T.serial(K):
+        a = T.cast(A_fp8[i, k], "float32")        # FP8 byte -> fp32
+        b = T.cast(B_fp8[k, j], "float32")        # FP8 byte -> fp32
+        sa = A_scale[0] if A_scale.shape == (1,) else A_scale[i]
+        sb = B_scale[0] if B_scale.shape == (1,) else B_scale[j]
+        C_local[i, j] += a * b * sa * sb
 ```
-2 files changed, 181 insertions(+)
-  tilelang/language/__init__.py   +1
-  tilelang/language/fp8_op.py     +180  (new file)
+
+Per-tensor vs per-row dispatch happens at macro-expansion time based on
+the static shape of the scale operand; the resulting MSL contains **no
+runtime predicate** for the scale layout.
+
+## Lowering paths
+
+The macro emits the same TIR on every target. Output codegen differs only
+in the FP8-to-fp32 cast helper:
+
+* **Metal** -- `T.cast(fp8 byte, fp32)` lowers via
+  `__tvm_fp8_e4m3_to_half` / `__tvm_fp8_e5m2_to_half` from the Agent C
+  storage-only patch. The TileLang `Gemm` dispatcher at
+  `tilelang/tileop/gemm/__init__.py` already routes FP8 inputs through
+  `GemmMetalScalar` (Agent E), so the loop body for `T.gemm(fp8, fp8,
+  fp32)` and `T.fp8_scaled_matmul(...)` is structurally identical except
+  for the extra `* sa * sb` multiplications. The resulting MSL is
+  functionally identical to the audiohacking kernel (one branch + a few
+  shifts per byte per dequantization + fp32 fma).
+
+* **CUDA / ROCm** -- `T.cast` uses TVM's native FP8 path
+  (`__nv_fp8_e4m3_to_half` etc.). For Hopper / Blackwell, callers who
+  want the tensor-core FP8 FMA path should use
+  `T.tcgen05_gemm_blockscaled(...)` directly (PRs #202 / #1600). Those
+  GEMMs ingest the `e8m0fnu` block-scale operand explicitly and don't
+  fit this op's per-tensor / per-row scale signature -- we keep this
+  intrinsic limited to the audiohacking-style scalar layout.
+
+* **CPU** -- same scalar TIR; `T.cast(fp8, fp32)` lowers via TVM's CPU
+  FP8 helpers.
+
+We chose the macro form (rather than registering a new TIR op via
+`src/op/builtin.cc`) because:
+
+1. The lowering is identical to `T.gemm(fp8, fp8, fp32)` plus a fused
+   per-element scale; a registered op would just call back into the
+   existing `GemmMetalScalar` machinery with a wrapped body. The macro
+   skips the round-trip.
+2. Metal has no native FP8 ALU through the M5 generation (Apple WWDC 2025
+   cooperative tensors session), so the inner loop is necessarily scalar.
+   There is no MMA path to switch into, so the multi-target TIR-op
+   dispatcher we'd need would have only one implementation today.
+3. Macro form means **no C++ rebuild** for the surface API (the rebuild
+   is only needed for the included e4m3 subnormal bugfix in
+   `codegen_metal.cc`).
+
+## Bugfix: e4m3 subnormal decode
+
+The Agent C storage-only patch (`docs/upstream/tilelang_metal_fp8/`)
+included an inline `__tvm_fp8_e4m3_to_half` helper whose subnormal path
+produced values 2x too large for the byte range `0x01..0x07` and
+`0x81..0x87`:
+
+```cpp
+// Before (incorrect):
+"      h = (ushort)(sign | ((ushort)(e + 8) << 10) | (ushort)(m << 8));\n"
+// After:
+"      h = (ushort)(sign | ((ushort)(e + 7) << 10) | (ushort)(m << 8));\n"
 ```
+
+The half biased exponent should be `e + 7`, not `e + 8`, after the
+mantissa-realignment loop normalises the leading 1 to bit 2. We carry
+this fix in both `3rdparty/tvm/src/target/source/codegen_metal.cc` (the
+TVM submodule) and `src/target/codegen_metal.cc` (the TileLang fork
+copy).
+
+The fix is mandatory for parity with PyTorch / `mlx.from_fp8` /
+audiohacking decoders; without it the per-tensor 32x32x64 e2e test
+fails with 7% relative error on outputs that depend on small-magnitude
+operands.
 
 ## Test results
 
-### Direct probe — `/tmp/test_fp8_scaled_matmul.py`
-
 ```
-=== Phase 1: import surface ===
-PASS: T.fp8_scaled_matmul resolvable
-    docstring (first line): Scaled FP8 matmul intrinsic.
-
-=== Phase 2: Metal target redirect ===
-PASS: NotImplementedError raised with redirect:
-     T.fp8_scaled_matmul is not yet lowered through the TileLang Metal scheduler.
-     Apple Silicon (M1-M4) has no native FP8 ALU; the audiohacking pattern
-     requires a scaled-gemm pass that fuses per-load scale with the K-loop,
-     which is not yet wired through GemmMetalScalar.
-
-     Use the ready-to-go MSL kernel via mx.fast.metal_kernel:
-         from cppmega_mlx.nn._tilelang.fp8_msl_kernels import (
-             fp8_scaled_matmul as _fp8_scaled_matmul,
-         )
-
-=== Phase 3: fallback path (cuda target) ===
-PASS: fallback returns Call
-
-All phases OK.
+$ cd /tmp/tilelang_apple_head/tilelang
+$ pytest testing/python/cpu/test_fp8_scaled_matmul_lowering.py \
+         testing/python/metal/test_fp8_scaled_matmul_metal.py -v
 ```
 
-The redirect message contains:
-- `mx.fast.metal_kernel` (the MLX FFI to use)
-- `cppmega_mlx.nn._tilelang.fp8_msl_kernels` (the module path)
-- `audiohacking` (attribution)
+```
+testing/python/cpu/test_fp8_scaled_matmul_lowering.py
+  test_macro_expands_to_scalar_kloop_metal              PASSED
+  test_per_tensor_scale_lowering_shape                  PASSED
+  test_per_row_scale_lowering_shape                     PASSED
+  test_e5m2_lowering_uses_e5m2_helper                   PASSED
+  test_validation_rejects_non_fp8_inputs                PASSED
+  test_validation_rejects_bad_scale_size                PASSED
+  test_validation_rejects_k_mismatch                    PASSED
+  test_intrinsic_in_pre_lowering_ir                     PASSED
 
-### cppmega.mlx tilelang test suite
+testing/python/metal/test_fp8_scaled_matmul_metal.py
+  test_per_tensor_scale_lowers_on_metal                 PASSED
+  test_per_row_scale_lowers_on_metal                    PASSED
+  test_per_col_scale_lowers_on_metal                    PASSED
+  test_e5m2_lowers_on_metal                             PASSED
+  test_mixed_e4m3_e5m2_lowers_on_metal                  PASSED
+  test_xcrun_compile_per_tensor_scale                   PASSED
+  test_xcrun_compile_per_row_scale                      PASSED
+  test_xcrun_compile_mixed_dtype                        PASSED
+  test_e2e_per_tensor_scale_parity                      PASSED
+  test_e2e_per_row_scale_parity                         PASSED
+  test_rejects_non_fp8_a                                PASSED
+  test_rejects_bad_scale_shape                          PASSED
+  test_e2e_audiohacking_parity_per_tensor_128           PASSED
+  test_e2e_audiohacking_parity_per_row_singleblock      PASSED
+  test_e2e_audiohacking_parity_vecmat_4096              PASSED
+  test_bench_matmul_vs_audiohacking                     PASSED
+  test_bench_vecmat_vs_audiohacking                     PASSED
+
+25 passed in 4.71s
+```
+
+The 8 CPU lowering tests don't need a GPU; they assert that the macro
+expansion produces the audiohacking-shaped TIR (`Cast(fp8 -> fp32) *
+Cast(fp8 -> fp32) * sa * sb` accumulation) and that the per-tensor /
+per-row branch picks the right buffer index pattern.
+
+The 12 Metal codegen + xcrun tests verify that:
+
+* The lowered MSL contains the `__tvm_fp8_e4m3_to_half` /
+  `__tvm_fp8_e5m2_to_half` calls in the kernel body (not just the
+  prelude).
+* The MSL is accepted by `xcrun --sdk macosx metal -c` (offline
+  compile) on per-tensor, per-row, and mixed-dtype operands.
+* The MSL contains no `simdgroup_multiply_accumulate` -- FP8 inputs go
+  through the scalar fallback.
+
+The 5 e2e + bench tests (gated on `tilelang.testing.requires_metal`,
+`torch.mps`, and the `cppmega_mlx` audiohacking MSL kernels):
+
+* `test_e2e_per_tensor_scale_parity` -- 32x32x64, max abs err 0.0
+  vs torch reference.
+* `test_e2e_per_row_scale_parity` -- 32x32x64 with per-row A scale,
+  max abs err < 1e-3 vs torch reference.
+* `test_e2e_audiohacking_parity_per_tensor_128` -- 128x128x128
+  per-tensor vs the audiohacking LUT-decode kernel via `mlx.core`,
+  abs err < 1e-3.
+* `test_e2e_audiohacking_parity_per_row_singleblock` -- single-block
+  per-row vs audiohacking, abs err < 1e-3.
+* `test_e2e_audiohacking_parity_vecmat_4096` -- M=1, K=N=4096 matmul
+  vs audiohacking matmul kernel, abs err < 5e-2 (FP32 FMA reordering
+  across 4096-K contraction).
+
+## Bench results
+
+Run on M-series Apple Silicon via `pytest -s` (the bench tests print to
+stdout). Median of 9-of-10 iterations after 3 warm-up calls.
+
+### 128x128x128 e4m3 per-tensor scaled matmul
 
 ```
-$ .venv/bin/python -m pytest tests/test_tilelang_*.py -q --no-header
-134 passed, 80 warnings in 1.99s
+[bench] 128x128x128 per-tensor e4m3 FP8 scaled matmul:
+  TileLang  :   0.555 +/- 0.016 ms  (0.008 TFLOPS)
+  audiohack :   0.172 +/- 0.031 ms  (0.024 TFLOPS)
+  ratio TileLang / audio = 3.16x
 ```
 
-No regressions (the import surface adds one new symbol, no existing
-behaviour changes).
+The audiohacking kernel uses a single-pass dispatch with 256-entry LUT
+decode and 4-element K-axis unrolling; TileLang's scalar fallback runs
+the same arithmetic but goes through the `GemmMetalScalar` replicated
+fragment layout. The scalar fallback is correctness-equivalent at
+1e-3 absolute tolerance.
 
-## Upstream-PR readiness
+### M=1 N=K=4096 e4m3 vecmat
 
-**For `tile-ai/tilelang`**: Submittable today as a frontend-only PR. The
-follow-up to actually lower this through the scheduler can land
-separately. The stub becomes a TODO marker in the codebase that's
-honest about the gap.
+```
+[bench] M=1 N=4096 K=4096 e4m3 FP8 vecmat:
+  TileLang scalar  :   1.098 +/- 0.032 ms  ( 0.031 TFLOPS)
+  audiohack simdg  :   0.182 +/- 0.012 ms  ( 0.184 TFLOPS)
+  ratio TileLang / audio = 6.01x (audiohacking wins; TileLang has no
+                                  simdgroup reduction yet)
+```
 
-**For `apache/tvm`**: Not applicable — this is a TileLang-side change
-only. No TVM TIR op registered (yet); the placeholder
-`tl.fp8_scaled_matmul_fallback` is consumed only inside TileLang's
-Python dispatcher.
+The audiohacking project ships a dedicated
+`fp8_scaled_vecmat_kernel` for M=1 with simdgroup reduction (one SIMD
+group per output row, `simd_sum` reduction). TileLang's scalar fallback
+distributes the M*N=N output cells across `threads`, so for M=1 each
+thread does `K/threads` of the work in scalar form -- no cross-thread
+reduction. Closing this gap is a follow-up; the necessary scaffolding
+(`metal_simdgroup` tile-op) already exists for fp16/fp32 in
+`tilelang/tileop/metal_simdgroup.py` but doesn't yet plumb through for
+FP8 storage.
 
-**Splittable**: Yes — three follow-ups to fully replace the stub with a
-real lowering:
+## Limitations and follow-ups
 
-1. **TIR op registration** in `src/op/builtin.cc` (small C++ change,
-   needs rebuild).
-2. **Metal scheduler pass** that fuses per-load scale into the
-   GemmMetalScalar inner loop. Largest part. Needs to interact with
-   the existing `metal_fragment_to_simdgroup.py` rewrite.
-3. **CUDA scheduler dispatch** to existing `gemm_tcgen05_blockscaled`
-   on Blackwell. Smaller.
+These items are explicitly out of scope for this PR but tracked here:
+
+1. **Per-row scale at multi-block tile granularity.** The macro
+   currently indexes `A_scale[i]` where `i` is the **block-local** row
+   in the K-tile loop. To support a full `(M,)` per-row scale with
+   `BM < M`, the user must either pass a sliced view at the call site
+   (`A_scale[by * BM:(by + 1) * BM]`) or wait for a follow-up macro
+   extension that threads `by * BM` into the scale index. Per-tensor
+   `(1,)` scales work transparently for any tile size. Single-block
+   per-row (`BM == M`) is fully covered by tests.
+
+2. **Performance: simdgroup reduction for vecmat.** Audiohacking is
+   6x faster on M=1 because of `simd_sum`. Plumbing this through
+   `T.fp8_scaled_matmul` requires a simdgroup-reduction tile-op for
+   FP8-storage inputs; the TileLang Metal codegen rejects allocating
+   `metal.simdgroup` buffers with FP8 dtype, so the path would be
+   "dequant FP8 -> half on load, run simdgroup_matrix_multiply, scale
+   post-loop." That's a separate Agent task.
+
+3. **Performance: K-axis vectorisation.** The audiohacking kernel
+   reads 4 FP8 bytes at a time via `uint` reinterpretation
+   (`reinterpret_cast<device const uint*>(W + row_offset)`). TileLang
+   has the vector FP8 cast helpers from Agent F-1
+   (`__tvm_fp8_e4m3_to_half_v4`) but the macro's K-loop uses scalar
+   `T.cast`. A vectorised inner loop is a clean follow-up that would
+   close most of the 3.2x matmul performance gap.
+
+4. **CUDA scheduler dispatch.** On Hopper / Blackwell, the
+   `T.tcgen05_gemm_blockscaled` op (PRs #202 / #1600) is a tensor-core
+   FP8 path. Adding an automatic dispatch from `T.fp8_scaled_matmul`
+   to `T.tcgen05_gemm_blockscaled` when (a) the target architecture
+   supports it and (b) the scale layout matches `e8m0fnu` would buy
+   substantial CUDA performance. The current CUDA path uses scalar
+   `T.cast` plus standard fp32 fma -- correct but slow.
 
 ## How to apply
 
 ```bash
 cd /tmp/tilelang_apple_head/tilelang
-# Pre-req: Agent C's storage-only patch and the F-1 vector cast patch
-git apply docs/upstream/tilelang_metal_fp8/0001-metal-fp8-storage-only.patch
-git apply docs/upstream/tilelang_metal_fp8_vector/0001-metal-fp8-vector-cast.patch
-git apply docs/upstream/tilelang_metal_fp8_scaled_matmul/0001-tilelang-fp8-scaled-matmul-intrinsic.patch
+# Pre-req: storage-only FP8 patch + auto-dequant dispatcher + vector cast.
+git apply /Volumes/external/sources/cppmega.mlx/docs/upstream/tilelang_metal_fp8/0001-metal-fp8-storage-only.patch
+git apply /Volumes/external/sources/cppmega.mlx/docs/upstream/tilelang_metal_fp8_gemm/0001-metal-fp8-gemm.patch
+git apply /Volumes/external/sources/cppmega.mlx/docs/upstream/tilelang_metal_fp8_vector/0001-metal-fp8-vector-cast.patch
+git apply /Volumes/external/sources/cppmega.mlx/docs/upstream/tilelang_metal_fp8_scaled_matmul/0001-tilelang-fp8-scaled-matmul-intrinsic.patch
+# Rebuild C++ to pick up the e4m3 subnormal decode fix.
+cd build && cmake --build . -j 8
 ```
 
-Already applied in `/tmp/tilelang_apple_head/tilelang` for the
-cppmega.mlx editable install.
+The patch applies cleanly with `git apply --check` against the post-Agent-F-1
+state of the tilelang tree (commit `a69d6df7` in the
+`cppmega/gemm-mixed-dtype-metal` branch).
+
+## Attribution
+
+* **audiohacking/fp8-mps-metal** (commit
+  `d4fbd40c48aa2a243e600d06627c7dd818150636`, MIT). Algorithm: scalar
+  dequant, fp32 fma, per-tensor / per-row scale broadcast.
+* **AppMana/mps-fp8-for-torch-and-comfyui-python-package** (commit
+  `a902571eca5362f5e2496cf33dcce52c8bac6a15`, Apache 2.0). The
+  cppmega.mlx `cppmega_mlx.nn._tilelang.fp8_msl_kernels` module ports
+  this fork's 256-entry LUT decode + integer-bit encoder via
+  `mx.fast.metal_kernel`; it serves as the ground-truth oracle in our
+  e2e parity tests.
+* **tilelang/tilelang** -- this patch builds on Agent C's storage-only
+  FP8 (`docs/upstream/tilelang_metal_fp8/`), Agent E's auto-dequant
+  Gemm dispatcher (`docs/upstream/tilelang_metal_fp8_gemm/`), and
+  Agent F-1's vector FP8 cast (`docs/upstream/tilelang_metal_fp8_vector/`).
