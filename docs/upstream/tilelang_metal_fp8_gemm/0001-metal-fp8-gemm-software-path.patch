@@ -1,0 +1,140 @@
+diff --git a/tilelang/tileop/gemm/__init__.py b/tilelang/tileop/gemm/__init__.py
+index faaedb1a..cc0081f5 100644
+--- a/tilelang/tileop/gemm/__init__.py
++++ b/tilelang/tileop/gemm/__init__.py
+@@ -164,12 +164,33 @@ class Gemm(Node, Scriptable):
+         6. METAL_SIMDGROUP for Metal target (simdgroup_matrix)
+         7. Scalar for CPU target (scalar fallback)
+ 
+-        Special-case: when A and B carry different element dtypes (a chained
+-        mixed-precision pattern, e.g. attention's FP32 accumulator feeding
+-        back as one operand of a subsequent FP16 GEMM), Metal cannot use
+-        ``simdgroup_matrix_multiply`` (which requires same-dtype operands),
+-        so we force the scalar fallback that casts both operands to
+-        ``accum_dtype`` independently.
++        Special-cases on Metal:
++
++        - **Mixed-input-dtype**: when A and B carry different element dtypes
++          (a chained mixed-precision pattern, e.g. attention's FP32
++          accumulator feeding back as one operand of a subsequent FP16
++          GEMM), Metal cannot use ``simdgroup_matrix_multiply`` (which
++          requires same-dtype operands), so we force the scalar fallback
++          that casts both operands to ``accum_dtype`` independently.
++
++        - **FP8 inputs**: Apple Silicon has no native FP8 hardware (M1-M5
++          inclusive — see Apple WWDC 2025 cooperative tensors session).
++          The TileLang Metal codegen rejects allocating ``metal.simdgroup``
++          buffers with FP8 dtype (see ``codegen_metal.cc:454`` —
++          "Only float16, float32, and bfloat16 are supported"). We route
++          FP8-input GEMMs to the scalar fallback ``GemmMetalScalar``,
++          which emits per-element ``T.cast(value, accum_dtype)`` reads
++          for both operands. The ``T.cast`` from FP8 to a wider dtype is
++          handled by the storage-only FP8 emulation patch in
++          ``codegen_metal.cc::VisitExpr_(CastNode)`` which expands to
++          ``__tvm_fp8_e4m3_to_half`` / ``__tvm_fp8_e5m2_to_half``
++          helper calls (see
++          ``docs/upstream/tilelang_metal_fp8/0001-metal-fp8-storage-only.patch``).
++
++          This mirrors the audiohacking ``fp8_scaled_matmul_kernel``
++          reference (https://github.com/audiohacking/fp8-mps-metal): a
++          scalar dequant-multiply-accumulate loop in ``half`` /
++          ``float`` rather than any FP8 simdgroup intrinsic.
+ 
+         Args:
+             thread_nums: Number of threads in the block
+@@ -186,6 +207,12 @@ class Gemm(Node, Scriptable):
+             # `T.cast(..., accum_dtype)`.
+             if self._has_mixed_input_dtype():
+                 return GemmInst.Scalar
++            # FP8 (e4m3 / e5m2 / e8m0fnu) inputs: Apple has no native FP8
++            # ALU through M5; route to scalar fallback so the per-element
++            # `T.cast(..., accum_dtype)` invokes the storage-only FP8
++            # decode helpers.
++            if self._has_fp8_input_dtype():
++                return GemmInst.Scalar
+             return GemmInst.METAL_SIMDGROUP
+         return GemmInst(_ffi_api.GemmGetGemmInst(self, int(thread_nums), target))
+ 
+@@ -205,6 +232,29 @@ class Gemm(Node, Scriptable):
+             pass
+         return str(a.dtype) != str(b.dtype)
+ 
++    def _has_fp8_input_dtype(self) -> bool:
++        """Return True if either A or B carries an FP8 dtype.
++
++        Used by the Metal dispatcher to force routing through the scalar
++        fallback (``GemmMetalScalar``) because Metal has no native FP8
++        ALU (Apple Silicon M1-M5 inclusive) and the TileLang codegen
++        rejects allocating ``metal.simdgroup`` buffers with FP8 dtype.
++        The scalar fallback's ``T.cast(..., accum_dtype)`` reads invoke
++        the storage-only FP8 decode helpers emitted by
++        ``codegen_metal.cc::VisitExpr_(CastNode)``.
++        """
++        a = getattr(self, "a", None)
++        b = getattr(self, "b", None)
++        for buf in (a, b):
++            if buf is None:
++                continue
++            try:
++                if str(buf.dtype).startswith("float8"):
++                    return True
++            except AttributeError:  # pragma: no cover - defensive
++                continue
++        return False
++
+     def _get_implementation_class(self, gemm_inst: GemmInst, target: Target):
+         """Get the appropriate implementation class for the given GEMM instruction.
+ 
+diff --git a/tilelang/transform/metal_fragment_to_simdgroup.py b/tilelang/transform/metal_fragment_to_simdgroup.py
+index dad10876..37949ff6 100644
+--- a/tilelang/transform/metal_fragment_to_simdgroup.py
++++ b/tilelang/transform/metal_fragment_to_simdgroup.py
+@@ -49,6 +49,22 @@ def _extract_buffer_from_region(region_call):
+     return None
+ 
+ 
++def _is_fp8_dtype(dt) -> bool:
++    """Return True if the dtype is one of the FP8 storage variants.
++
++    On Metal the FP8 path is storage-only emulation (see
++    ``docs/upstream/tilelang_metal_fp8/0001-metal-fp8-storage-only.patch``)
++    so any GEMM with FP8 inputs must take the scalar fallback. Used here
++    to keep the C accumulator (and any fragment-A operand) out of the
++    ``metal.simdgroup`` rewrite — that scope rejects FP8 allocations
++    in ``codegen_metal.cc`` (line ~454).
++    """
++    try:
++        return str(dt).startswith("float8")
++    except Exception:  # pragma: no cover - defensive
++        return False
++
++
+ def _collect_fragment_gemm_accum_vars(body: tir.Stmt):
+     """Walk the body and return fragment vars safe to rewrite to simdgroup.
+ 
+@@ -61,6 +77,12 @@ def _collect_fragment_gemm_accum_vars(body: tir.Stmt):
+     fallback can perform its per-element ``T.cast(..., accum_dtype)``
+     arithmetic on them without tripping the Metal codegen's check that
+     ``metal.simdgroup`` allocations are scalar 8x8 blocks.
++
++    FP8-input GEMMs are excluded for the same reason: the dispatcher
++    routes them to ``GemmMetalScalar`` (Apple has no native FP8 ALU
++    through M5; the per-element ``T.cast`` invokes the storage-only
++    decode helpers from the FP8 prelude — see audiohacking
++    ``fp8_scaled_matmul_kernel`` for the analogous pattern).
+     """
+     simd_accum_vars: set = set()
+     scalar_accum_vars: set = set()
+@@ -83,7 +105,11 @@ def _collect_fragment_gemm_accum_vars(body: tir.Stmt):
+                 # tilelang/tileop/gemm/__init__.py).
+                 mixed = (a_buf is not None and b_buf is not None
+                          and str(a_buf.dtype) != str(b_buf.dtype))
+-                if mixed:
++                # FP8 inputs (storage-only on Metal) also route to the
++                # scalar fallback regardless of mixed-dtype.
++                fp8_inputs = (a_buf is not None and _is_fp8_dtype(a_buf.dtype)) or \
++                             (b_buf is not None and _is_fp8_dtype(b_buf.dtype))
++                if mixed or fp8_inputs:
+                     scalar_accum_vars.add(c_var)
+                     # If A is itself a fragment in this scalar gemm, the
+                     # scalar fallback reads it scalar — never via

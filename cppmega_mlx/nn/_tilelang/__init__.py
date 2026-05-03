@@ -29,8 +29,11 @@ from cppmega_mlx.nn._tilelang import (
     _mamba3_helpers_tilelang,
     _msl_transform,
     _path_b_lowering,
+    fp8_msl_kernels,
     mamba3,
     sparse_mla,
+    sparse_mla_blockscaled,
+    sparse_mla_fp8,
     topk_selector,
 )
 from cppmega_mlx.nn._tilelang._mamba3_helpers import (
@@ -42,6 +45,15 @@ from cppmega_mlx.nn._tilelang._path_b_lowering import (
     TransformedKernel,
     build_mlx_body,
     transform_tilelang_kernel,
+)
+from cppmega_mlx.nn._tilelang.fp8_msl_kernels import (
+    FP8MSLKernelStatus,
+    fp8_msl_status,
+    fp8_scaled_matmul,
+    fp8_scaled_matmul_raw,
+    fp8_scaled_vecmat,
+    fp8_to_half,
+    half_to_fp8,
 )
 from cppmega_mlx.nn._tilelang.mamba3 import (
     Mamba3MetalStatus,
@@ -58,6 +70,24 @@ from cppmega_mlx.nn._tilelang.sparse_mla import (
     sparse_mla_fwd_metal,
     sparse_mla_metal_status,
 )
+from cppmega_mlx.nn._tilelang.sparse_mla_blockscaled import (
+    MXFP8_BLOCK_SIZE,
+    SparseMLABlockScaledMetalStatus,
+    sparse_mla_blockscaled_apply,
+    sparse_mla_blockscaled_bwd_metal,
+    sparse_mla_blockscaled_fwd_metal,
+    sparse_mla_blockscaled_metal_status,
+    sparse_mla_blockscaled_reference,
+)
+from cppmega_mlx.nn._tilelang.sparse_mla_fp8 import (
+    SparseMLAFp8MetalStatus,
+    sparse_mla_fp8_apply,
+    sparse_mla_fp8_bwd_metal,
+    sparse_mla_fp8_fwd_metal,
+    sparse_mla_fp8_metal_status,
+    sparse_mla_fp8_reference,
+    sparse_mla_quantized_matmul_reference,
+)
 from cppmega_mlx.nn._tilelang.topk_selector import (
     PathBStatus,
     topk_selector_path_b_status,
@@ -66,8 +96,12 @@ from cppmega_mlx.nn._tilelang.topk_selector import (
 from cppmega_mlx.nn._tilelang.topk_selector import topk_selector as topk_selector_fn
 
 __all__ = [
+    "FP8MSLKernelStatus",
     "Mamba3MetalStatus",
+    "MXFP8_BLOCK_SIZE",
     "PathBStatus",
+    "SparseMLABlockScaledMetalStatus",
+    "SparseMLAFp8MetalStatus",
     "SparseMLAMetalStatus",
     "TransformedKernel",
     "_mamba3_helpers",
@@ -78,6 +112,13 @@ __all__ = [
     "bwd_dadt_fused",
     "bwd_dtrap_ddt",
     "compute_dacs_segsum",
+    "fp8_msl_kernels",
+    "fp8_msl_status",
+    "fp8_scaled_matmul",
+    "fp8_scaled_matmul_raw",
+    "fp8_scaled_vecmat",
+    "fp8_to_half",
+    "half_to_fp8",
     "mamba3",
     "mamba3_mimo_apply",
     "mamba3_mimo_bwd_metal",
@@ -86,9 +127,22 @@ __all__ = [
     "mamba3_mimo_reference",
     "sparse_mla",
     "sparse_mla_apply",
+    "sparse_mla_blockscaled",
+    "sparse_mla_blockscaled_apply",
+    "sparse_mla_blockscaled_bwd_metal",
+    "sparse_mla_blockscaled_fwd_metal",
+    "sparse_mla_blockscaled_metal_status",
+    "sparse_mla_blockscaled_reference",
     "sparse_mla_bwd_metal",
+    "sparse_mla_fp8",
+    "sparse_mla_fp8_apply",
+    "sparse_mla_fp8_bwd_metal",
+    "sparse_mla_fp8_fwd_metal",
+    "sparse_mla_fp8_metal_status",
+    "sparse_mla_fp8_reference",
     "sparse_mla_fwd_metal",
     "sparse_mla_metal_status",
+    "sparse_mla_quantized_matmul_reference",
     "topk_selector",
     "topk_selector_fn",
     "topk_selector_path_b_status",

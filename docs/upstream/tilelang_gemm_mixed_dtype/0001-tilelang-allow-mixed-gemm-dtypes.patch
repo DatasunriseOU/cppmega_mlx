@@ -6,47 +6,47 @@ MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
 
-The tile-op T.gemm() asserts ``A.dtype == B.dtype`` in
-``tilelang.tileop.gemm.GemmBase.in_dtype``, blocking chained
-mixed-precision patterns such as attention's ``S = Q·Kᵀ`` (FP16×FP16
-→ FP32) followed by ``O = S·V`` where the FP32 ``S`` accumulator feeds
-back as one operand of an FP16 ``V``.
+The tile-op T.gemm() asserts A.dtype == B.dtype in
+tilelang.tileop.gemm.GemmBase.in_dtype, blocking chained
+mixed-precision patterns such as attention's S = Q·Kᵀ (FP16×FP16
+→ FP32) followed by O = S·V where the FP32 S accumulator feeds
+back as one operand of an FP16 V.
 
 This patch:
 
-1. Drops the strict assert in ``GemmBase.in_dtype`` and adds a
-   ``has_mixed_input_dtype`` property used by dispatchers to detect the
+1. Drops the strict assert in GemmBase.in_dtype and adds a
+   has_mixed_input_dtype property used by dispatchers to detect the
    mixed-precision case.
 
 2. Routes mixed-dtype Metal GEMMs to the existing
-   ``GemmMetalScalar`` fallback instead of ``GemmMetal``
-   (``simdgroup_matrix_multiply`` requires same-dtype operands). The
-   scalar fallback already casts both A and B values to ``accum_dtype``
+   GemmMetalScalar fallback instead of GemmMetal
+   (simdgroup_matrix_multiply requires same-dtype operands). The
+   scalar fallback already casts both A and B values to accum_dtype
    per element, so it handles dtype mismatch correctly.
 
-3. Updates the ``MetalFragmentToSimdgroup`` transform to skip
+3. Updates the MetalFragmentToSimdgroup transform to skip
    accumulator vars produced by mixed-dtype GEMMs and the fragment
-   operand ``A`` of a mixed-dtype GEMM. Without this, the second
-   GEMM's scalar reads would dereference a ``simdgroup_floatNN``
+   operand A of a mixed-dtype GEMM. Without this, the second
+   GEMM's scalar reads would dereference a simdgroup_floatNN
    register, which the Metal codegen rejects.
 
-4. Adds a unit test ``test_attention_chain_mixed_dtype_metal_codegen``
+4. Adds a unit test test_attention_chain_mixed_dtype_metal_codegen
    that exercises the FP16 Q·Kᵀ → FP32 ; FP32·FP16 → FP32 chain.
 
 Other backends (CUDA MMA, ROCm MFMA/WMMA, Hopper WGMMA, Blackwell
-TCGEN5MMA) continue to use the original C++ ``GemmGetGemmInst``
-selection. They pass through ``in_dtype`` (now without the assert) and
+TCGEN5MMA) continue to use the original C++ GemmGetGemmInst
+selection. They pass through in_dtype (now without the assert) and
 emit single-typed MMA intrinsics; if a backend genuinely cannot lower
 a mixed-dtype gemm, downstream layout / emitter checks raise instead
 of the frontend assert. CPU scalar already supports mixed dtypes via
-``T.cast(..., accum_dtype)``.
+T.cast(..., accum_dtype).
 
 Tests:
-* New: ``testing/python/metal/test_metal_codegen_linux.py::test_attention_chain_mixed_dtype_metal_codegen`` passes.
+* New: testing/python/metal/test_metal_codegen_linux.py::test_attention_chain_mixed_dtype_metal_codegen passes.
 * Existing: 50/56 metal codegen tests pass (6 pre-existing failures
   unrelated to this patch); all 11 CPU gemm tests pass; all 130
   cppmega.mlx tilelang tests pass.
-* Probe ``docs/upstream/test_sparse_mla_pipeline.py k3_multi_gemm`` now
+* Probe docs/upstream/test_sparse_mla_pipeline.py k3_multi_gemm now
   reports OK (was: AssertionError "A and B must have the same dtype").
 ---
  .../python/metal/test_metal_codegen_linux.py  | 55 +++++++++++++++
@@ -64,17 +64,17 @@ index 6194e411..8d417be6 100644
  
  
 +def attention_chain_mixed_dtype():
-+    """Two-step chain ``S = Q·Kᵀ`` (FP16×FP16→FP32) then ``O = S·V``
-+    where ``S`` is the FP32 fragment from the first GEMM and ``V`` is
++    """Two-step chain S = Q·Kᵀ (FP16×FP16→FP32) then O = S·V
++    where S is the FP32 fragment from the first GEMM and V is
 +    FP16 in shared memory.
 +
-+    The second ``T.gemm(S, V, O)`` carries ``A.dtype = float32`` and
-+    ``B.dtype = float16``. Before the patch this tripped
-+    ``assert self.A.dtype == self.B.dtype`` in
-+    ``tilelang.tileop.gemm.gemm_base.GemmBase.in_dtype``. After the
++    The second T.gemm(S, V, O) carries A.dtype = float32 and
++    B.dtype = float16. Before the patch this tripped
++    assert self.A.dtype == self.B.dtype in
++    tilelang.tileop.gemm.gemm_base.GemmBase.in_dtype. After the
 +    patch, the dispatcher routes mixed-dtype Metal GEMMs through
-+    ``GemmMetalScalar`` which casts both operands to ``accum_dtype``
-+    independently, and the ``MetalFragmentToSimdgroup`` transform
++    GemmMetalScalar which casts both operands to accum_dtype
++    independently, and the MetalFragmentToSimdgroup transform
 +    correctly leaves the scalar accumulator out of the simdgroup
 +    rewrite set.
 +    """
@@ -132,9 +132,9 @@ index 5be39750..faaedb1a 100644
 +        Special-case: when A and B carry different element dtypes (a chained
 +        mixed-precision pattern, e.g. attention's FP32 accumulator feeding
 +        back as one operand of a subsequent FP16 GEMM), Metal cannot use
-+        ``simdgroup_matrix_multiply`` (which requires same-dtype operands),
++        simdgroup_matrix_multiply (which requires same-dtype operands),
 +        so we force the scalar fallback that casts both operands to
-+        ``accum_dtype`` independently.
++        accum_dtype independently.
 +
          Args:
              thread_nums: Number of threads in the block
@@ -144,10 +144,10 @@ index 5be39750..faaedb1a 100644
          """
          if target_is_metal(target):
 +            # GemmMetal (simdgroup) requires A.dtype == B.dtype because it
-+            # lowers to `simdgroup_matrix_multiply`. For chained
++            # lowers to simdgroup_matrix_multiply. For chained
 +            # mixed-precision patterns we route to the scalar fallback
 +            # (GemmMetalScalar) which handles dtype mismatch via per-load
-+            # `T.cast(..., accum_dtype)`.
++            # T.cast(..., accum_dtype).
 +            if self._has_mixed_input_dtype():
 +                return GemmInst.Scalar
              return GemmInst.METAL_SIMDGROUP
@@ -181,15 +181,15 @@ index 95f69bbf..bf3d2880 100644
          For the TS variant, A resides in TMEM with the accumulator dtype, so
          the actual input dtype is derived from B.
 +
-+        For mixed-precision chains (e.g. attention's ``S = Q·Kᵀ`` in FP32
-+        followed by ``O = S·V`` where ``V`` is FP16), ``A.dtype`` and
-+        ``B.dtype`` may differ. This property returns ``A.dtype`` in that
++        For mixed-precision chains (e.g. attention's S = Q·Kᵀ in FP32
++        followed by O = S·V where V is FP16), A.dtype and
++        B.dtype may differ. This property returns A.dtype in that
 +        case; backends that emit a single-typed MMA intrinsic (Metal
 +        simdgroup, CUDA MMA, etc.) are responsible for either inserting
 +        an explicit cast at the load site or refusing to lower (in which
-+        case the dispatcher in ``Gemm._select_gemm_instruction`` should
++        case the dispatcher in Gemm._select_gemm_instruction should
 +        steer the call toward a scalar fallback that casts both operands
-+        to ``accum_dtype`` independently).
++        to accum_dtype independently).
          """
          if is_tensor_memory(self.A):
              return self.B.dtype
@@ -227,7 +227,7 @@ index 0b5dd1bd..dad10876 100644
 +    Used to inspect operand dtypes so we can detect mixed-precision GEMMs
 +    (which route to the Metal scalar fallback rather than simdgroup MMA
 +    and therefore must NOT have their accumulator scope rewritten to
-+    ``metal.simdgroup``).
++    metal.simdgroup).
 +    """
 +    if not isinstance(region_call, tir.Call):
 +        return None
@@ -244,13 +244,13 @@ index 0b5dd1bd..dad10876 100644
 +
 +    Returns the set of fragment vars used as the C operand of a
 +    same-dtype GEMM (the ones that will be lowered through
-+    ``GemmMetal`` / simdgroup_matrix_multiply). Vars that appear as the C
++    GemmMetal / simdgroup_matrix_multiply). Vars that appear as the C
 +    operand of a mixed-dtype GEMM (which will route to the scalar
-+    fallback ``GemmMetalScalar``) — or as the A operand of such a GEMM
++    fallback GemmMetalScalar) — or as the A operand of such a GEMM
 +    when A is itself a fragment — are excluded so that the scalar
-+    fallback can perform its per-element ``T.cast(..., accum_dtype)``
++    fallback can perform its per-element T.cast(..., accum_dtype)
 +    arithmetic on them without tripping the Metal codegen's check that
-+    ``metal.simdgroup`` allocations are scalar 8x8 blocks.
++    metal.simdgroup allocations are scalar 8x8 blocks.
 +    """
 +    simd_accum_vars: set = set()
 +    scalar_accum_vars: set = set()

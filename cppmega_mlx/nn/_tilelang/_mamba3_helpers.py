@@ -183,10 +183,6 @@ def bwd_dtrap_ddt(
         axis=1,
     )
     dt_f = dt.astype(work_dtype)
-    dt_shift = mx.concatenate(
-        [dt_f[:, 1:, :], mx.zeros_like(dt_f[:, :1, :])],
-        axis=1,
-    )
     d_scale = dB_scaled.astype(work_dtype)
 
     # Inverse of right-shift: shift left by one, with zero fill at index 0.

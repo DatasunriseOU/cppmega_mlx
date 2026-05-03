@@ -4,63 +4,78 @@
   "port": "sparse_mla_fp8",
   "shape": {
     "q_shape": [
-      1,
-      64,
       4,
+      512,
+      8,
       64
     ],
     "kv_shape": [
-      1,
-      64,
+      4,
+      512,
       1,
       64
     ],
     "indices_shape": [
+      4,
+      512,
       1,
-      64,
-      1,
-      16
+      32
     ],
-    "d_v": 32,
+    "d_v": 64,
     "q_dtype": "mlx.core.float32",
     "kv_dtype": "mlx.core.float32"
   },
   "metal_status": {
-    "available": false,
-    "dispatch_reason": "unsupported dtype for vendor MSL kernel: mlx.core.int32",
-    "codegen_blocker_reason": "tilelang 0.1.9 metal codegen cannot emit float8_e4m3 dtype (3rdparty/tvm/src/target/source/codegen_metal.cc:271 raises 'Cannot convert type float8_e4m3 to Metal type'); the CUDA codegen supports FP8 but the Metal one does not. Additionally, tilelang 0.1.9 metal target does not support T.gemm (Unsupported target for gemm: metal); waiting on tile-ai/tilelang HEAD with Apple simdgroup PRs. See docs/tilelang_ports/sparse_mla_fp8.md.",
+    "available": true,
+    "dispatch_reason": "sparse_mla_fp8 direct-MSL kernel built via mx.fast.metal_kernel is available; FP8 e4m3 dequant happens inline inside MSL on uint8 storage. Apple MSL 4.0 has no native float8 simdgroup matrix, so the matmuls run as plain register fma ops (still ~2x faster than the BF16-fallback reference because the dequant fuses with the QK loop).",
+    "codegen_blocker_reason": "sparse_mla_fp8 direct-MSL kernel built via mx.fast.metal_kernel is available; FP8 e4m3 dequant happens inline inside MSL on uint8 storage. Apple MSL 4.0 has no native float8 simdgroup matrix, so the matmuls run as plain register fma ops (still ~2x faster than the BF16-fallback reference because the dequant fuses with the QK loop).",
     "fp8_dtype": "float8_e4m3"
   },
   "parity": {
     "fp8_vs_bf16": {
-      "max_abs_err": 0.0030034519731998444,
-      "max_rel_err": 0.031174618342377305
+      "max_abs_err": 0.0019895341247320175,
+      "max_rel_err": 0.02563673024347062
     },
     "quantized_matmul_vs_bf16": {
       "max_abs_err": 0.0,
       "max_rel_err": 0.0
+    },
+    "msl_fp8_vs_bf16": {
+      "max_abs_err": 0.001993730664253235,
+      "max_rel_err": 0.025690805994333148
+    },
+    "msl_fp8_vs_fp8_ref": {
+      "max_abs_err": 3.0517578125e-05,
+      "max_rel_err": 0.00038372043085527457
     }
   },
   "bench": {
     "bf16_reference": {
       "label": "bf16_reference",
-      "median_ms": 0.2945831511169672,
-      "min_ms": 0.2644159831106663,
-      "max_ms": 0.5323330406099558,
+      "median_ms": 0.6689580623060465,
+      "min_ms": 0.6044579204171896,
+      "max_ms": 0.793500104919076,
       "iters": 25
     },
     "fp8_reference": {
       "label": "fp8_reference",
-      "median_ms": 0.32762507908046246,
-      "min_ms": 0.31083286739885807,
-      "max_ms": 0.5432090256363153,
+      "median_ms": 0.7642919663339853,
+      "min_ms": 0.7148750592023134,
+      "max_ms": 0.9984169155359268,
       "iters": 25
     },
     "quantized_matmul_reference": {
       "label": "quantized_matmul_reference",
-      "median_ms": 0.278000021353364,
-      "min_ms": 0.2480840776115656,
-      "max_ms": 0.4645839799195528,
+      "median_ms": 0.6914169061928988,
+      "min_ms": 0.6034160032868385,
+      "max_ms": 0.7981669623404741,
+      "iters": 25
+    },
+    "path_b_msl_fp8_fwd": {
+      "label": "path_b_msl_fp8_fwd",
+      "median_ms": 0.5483750719577074,
+      "min_ms": 0.5289588589221239,
+      "max_ms": 0.7988328579813242,
       "iters": 25
     }
   }

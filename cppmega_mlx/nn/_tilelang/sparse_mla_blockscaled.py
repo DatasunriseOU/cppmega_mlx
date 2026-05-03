@@ -63,7 +63,6 @@ import mlx.core as mx
 
 from cppmega_mlx.nn._tilelang import _msl_transform
 from cppmega_mlx.nn._tilelang._msl_transform import (
-    MSLDispatchStatus,
     can_run_metal,
     msl_dispatch_status,
 )
@@ -794,7 +793,6 @@ def _reduce_dkv_partial_fp32(dkv_partial, indices_i32, shapes):
     B = shapes.batch
     S = shapes.seq_len
     Skv = shapes.seq_len_kv
-    H = shapes.heads
     G = shapes.kv_group
     head_kv = shapes.head_kv
     topk = shapes.topk

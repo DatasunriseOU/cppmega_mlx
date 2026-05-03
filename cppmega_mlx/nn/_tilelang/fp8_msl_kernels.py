@@ -79,12 +79,10 @@ from typing import Tuple, cast
 import mlx.core as mx
 
 from cppmega_mlx.nn._tilelang._msl_transform import (
-    MSLDispatchStatus,
     MetalKernel,
     can_run_metal,
     dispatch,
     make_metal_kernel,
-    msl_dispatch_status,
 )
 
 
@@ -457,7 +455,7 @@ def fp8_to_half(fp8_uchar: mx.array) -> mx.array:
 
 
 def half_to_fp8(half_arr: mx.array) -> mx.array:
-    """Quantize an fp16 (or fp32 cast to fp16) tensor to e4m3fn FP8 bytes.
+    """Quantize an fp16 tensor to e4m3fn FP8 bytes.
 
     Rounding is round-half-to-even (banker's rounding) inside the MSL
     kernel; this matches the reference PyTorch CPU encoder used by the

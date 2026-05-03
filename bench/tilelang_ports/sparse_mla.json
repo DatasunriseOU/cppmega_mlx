@@ -6,8 +6,8 @@
   "mlx_version": "0.31.1",
   "fp16_carrier": true,
   "path_b_status": {
-    "available": false,
-    "reason": "tilelang 0.1.9 metal target does not support T.gemm (Unsupported target for gemm: metal); waiting on tile-ai/tilelang HEAD with Apple simdgroup PRs. See cppmega_mlx/nn/_tilelang/sparse_mla.py module docstring."
+    "available": true,
+    "reason": "sparse_mla direct-MSL kernel built via mx.fast.metal_kernel is available; bypasses TileLang's T.gemm metal blocker."
   },
   "rows": [
     {
@@ -23,31 +23,47 @@
       },
       "fwd_reference_ms": {
         "label": "reference_fwd",
-        "median_ms": 0.3807500470429659,
-        "min_ms": 0.3353329375386238,
-        "max_ms": 0.5231250543147326,
-        "iters": 8,
-        "warmup": 3
+        "median_ms": 0.3045625053346157,
+        "min_ms": 0.2698330208659172,
+        "max_ms": 0.398874981328845,
+        "iters": 20,
+        "warmup": 5
       },
       "fwd_apply_ms": {
         "label": "apply_fwd",
-        "median_ms": 0.3325209254398942,
-        "min_ms": 0.3155411686748266,
-        "max_ms": 0.5976250395178795,
-        "iters": 8,
-        "warmup": 3
+        "median_ms": 0.19204092677682638,
+        "min_ms": 0.1691670622676611,
+        "max_ms": 0.37195906043052673,
+        "iters": 20,
+        "warmup": 5
+      },
+      "fwd_msl_ms": {
+        "label": "path_b_msl_fwd",
+        "median_ms": 0.16543746460229158,
+        "min_ms": 0.14849985018372536,
+        "max_ms": 0.3844161983579397,
+        "iters": 20,
+        "warmup": 5
       },
       "bwd_reference_ms": {
         "label": "reference_bwd",
-        "median_ms": 0.5935414228588343,
-        "min_ms": 0.5756248719990253,
-        "max_ms": 0.8209170773625374,
-        "iters": 8,
-        "warmup": 3
+        "median_ms": 0.42310403659939766,
+        "min_ms": 0.392459100112319,
+        "max_ms": 0.723833916708827,
+        "iters": 20,
+        "warmup": 5
+      },
+      "bwd_msl_ms": {
+        "label": "path_b_msl_bwd",
+        "median_ms": 0.21860399283468723,
+        "min_ms": 0.1968329306691885,
+        "max_ms": 0.3337911330163479,
+        "iters": 20,
+        "warmup": 5
       },
       "path_b": {
-        "available": false,
-        "reason": "tilelang 0.1.9 metal target does not support T.gemm (Unsupported target for gemm: metal); waiting on tile-ai/tilelang HEAD with Apple simdgroup PRs. See cppmega_mlx/nn/_tilelang/sparse_mla.py module docstring."
+        "available": true,
+        "reason": "sparse_mla direct-MSL kernel built via mx.fast.metal_kernel is available; bypasses TileLang's T.gemm metal blocker."
       }
     },
     {
@@ -63,31 +79,103 @@
       },
       "fwd_reference_ms": {
         "label": "reference_fwd",
-        "median_ms": 0.9523334447294474,
-        "min_ms": 0.6372500211000443,
-        "max_ms": 1.264624996110797,
-        "iters": 8,
-        "warmup": 3
+        "median_ms": 0.6622289074584842,
+        "min_ms": 0.6308748852461576,
+        "max_ms": 0.8234591223299503,
+        "iters": 20,
+        "warmup": 5
       },
       "fwd_apply_ms": {
         "label": "apply_fwd",
-        "median_ms": 0.6870626239106059,
-        "min_ms": 0.6336669903248549,
-        "max_ms": 0.803167000412941,
-        "iters": 8,
-        "warmup": 3
+        "median_ms": 0.2726255916059017,
+        "min_ms": 0.2595840487629175,
+        "max_ms": 0.4384580533951521,
+        "iters": 20,
+        "warmup": 5
+      },
+      "fwd_msl_ms": {
+        "label": "path_b_msl_fwd",
+        "median_ms": 0.2826038980856538,
+        "min_ms": 0.2612920943647623,
+        "max_ms": 0.40770811028778553,
+        "iters": 20,
+        "warmup": 5
       },
       "bwd_reference_ms": {
         "label": "reference_bwd",
-        "median_ms": 1.3578329235315323,
-        "min_ms": 1.3051670975983143,
-        "max_ms": 1.445709029212594,
-        "iters": 8,
-        "warmup": 3
+        "median_ms": 1.3848749222233891,
+        "min_ms": 1.3008338864892721,
+        "max_ms": 1.5331250615417957,
+        "iters": 20,
+        "warmup": 5
+      },
+      "bwd_msl_ms": {
+        "label": "path_b_msl_bwd",
+        "median_ms": 0.47056248877197504,
+        "min_ms": 0.4547080025076866,
+        "max_ms": 0.619000056758523,
+        "iters": 20,
+        "warmup": 5
       },
       "path_b": {
-        "available": false,
-        "reason": "tilelang 0.1.9 metal target does not support T.gemm (Unsupported target for gemm: metal); waiting on tile-ai/tilelang HEAD with Apple simdgroup PRs. See cppmega_mlx/nn/_tilelang/sparse_mla.py module docstring."
+        "available": true,
+        "reason": "sparse_mla direct-MSL kernel built via mx.fast.metal_kernel is available; bypasses TileLang's T.gemm metal blocker."
+      }
+    },
+    {
+      "shape": {
+        "name": "B4_S1024_H8_D64",
+        "B": 4,
+        "S": 1024,
+        "H": 8,
+        "D": 64,
+        "G": 1,
+        "topk": 64,
+        "Skv": 1024
+      },
+      "fwd_reference_ms": {
+        "label": "reference_fwd",
+        "median_ms": 1.9627080764621496,
+        "min_ms": 1.9030000548809767,
+        "max_ms": 2.0499590318650007,
+        "iters": 20,
+        "warmup": 5
+      },
+      "fwd_apply_ms": {
+        "label": "apply_fwd",
+        "median_ms": 0.6549168610945344,
+        "min_ms": 0.59908302500844,
+        "max_ms": 1.299707917496562,
+        "iters": 20,
+        "warmup": 5
+      },
+      "fwd_msl_ms": {
+        "label": "path_b_msl_fwd",
+        "median_ms": 0.6497289286926389,
+        "min_ms": 0.5877499934285879,
+        "max_ms": 0.9210838470607996,
+        "iters": 20,
+        "warmup": 5
+      },
+      "bwd_reference_ms": {
+        "label": "reference_bwd",
+        "median_ms": 4.273728933185339,
+        "min_ms": 4.1577499359846115,
+        "max_ms": 4.351999843493104,
+        "iters": 20,
+        "warmup": 5
+      },
+      "bwd_msl_ms": {
+        "label": "path_b_msl_bwd",
+        "median_ms": 1.3683749129995704,
+        "min_ms": 1.276042079553008,
+        "max_ms": 1.4829998835921288,
+        "iters": 20,
+        "warmup": 5
+      },
+      "path_b": {
+        "available": true,
+        "reason": "sparse_mla direct-MSL kernel built via mx.fast.metal_kernel is available; bypasses TileLang's T.gemm metal blocker."
       }
     }
   ]

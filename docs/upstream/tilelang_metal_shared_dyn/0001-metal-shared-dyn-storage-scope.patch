@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: cppmega-mlx investigation
+Date: 2026-05-02
+Subject: [PATCH] (no-op) shared.dyn storage scope on Metal
+
+This patch is intentionally empty. The "Unknown storage scope shared.dyn"
+blocker described in the original task does not reproduce on TileLang's
+apple-head branch (commit 7f4a5cb8 + cherry-picks).
+
+Codegen already accepts shared.dyn as equivalent to shared, see:
+
+    src/target/codegen_metal.cc::PrintStorageScope (line 493)
+        } else if (scope == "shared" || scope == "shared.dyn") {
+          os << "threadgroup ";
+
+The MergeSharedMemoryAllocations pass collapses dynamic-shmem allocs
+into a single static-sized threadgroup buffer when extents are
+compile-time constant. For the rare case of symbolic-extent dynamic
+shmem the codegen still ICHECK-fails on constant_size > 0; that is a
+separate limitation documented in README.md (it is NOT on the cppmega
+Path B path: topk_selector — the only consumer of dyn shmem in the
+porting matrix — was rewritten as direct mx.fast.metal_kernel MSL).
+
+If/when symbolic dyn shmem becomes a hard requirement, the right fix
+is to mirror the CUDA path: emit a "threadgroup uint8_t* buf_dyn_shmem
+[[threadgroup(0)]]" parameter when the kernel carries the
+kUseDynamicSharedMemoryTag launch param, and in metal_module.mm
+add [encoder setThreadgroupMemoryLength:dyn_shmem_size atIndex:0]
+before dispatchThreadgroups. That is a ~50-line patch but needs the
+ThreadWorkLoad.dyn_shmem_size value to be threaded through Metal's
+launch-param packing path, which is not currently wired.
+
+See docs/upstream/tilelang_metal_shared_dyn/README.md for full context.

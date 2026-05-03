@@ -4,63 +4,78 @@
   "port": "sparse_mla_blockscaled",
   "shape": {
     "q_shape": [
-      1,
-      64,
       4,
+      512,
+      8,
       64
     ],
     "kv_shape": [
-      1,
-      64,
+      4,
+      512,
       1,
       64
     ],
     "indices_shape": [
+      4,
+      512,
       1,
-      64,
-      1,
-      16
+      32
     ],
-    "d_v": 32,
+    "d_v": 64,
     "q_dtype": "mlx.core.float32",
     "kv_dtype": "mlx.core.float32"
   },
   "metal_status": {
-    "available": false,
-    "dispatch_reason": "unsupported dtype for vendor MSL kernel: mlx.core.int32",
-    "codegen_blocker_reason": "tilelang 0.1.9 metal codegen cannot emit float8_e4m3 dtype (3rdparty/tvm/src/target/source/codegen_metal.cc:271 raises 'Cannot convert type float8_e4m3 to Metal type'); the CUDA codegen supports FP8 but the Metal one does not. Additionally, tilelang 0.1.9 metal target does not support T.gemm (Unsupported target for gemm: metal); waiting on tile-ai/tilelang HEAD with Apple simdgroup PRs. See docs/tilelang_ports/sparse_mla_blockscaled.md.",
+    "available": true,
+    "dispatch_reason": "sparse_mla_blockscaled direct-MSL kernel built via mx.fast.metal_kernel is available; block-scaled MXFP8 dequant happens inline inside MSL on uint8 e4m3 storage with E8M0 block-scales. Apple MSL 4.0 has no native float8 simdgroup matrix, so the matmuls run as plain register fma.",
+    "codegen_blocker_reason": "sparse_mla_blockscaled direct-MSL kernel built via mx.fast.metal_kernel is available; block-scaled MXFP8 dequant happens inline inside MSL on uint8 e4m3 storage with E8M0 block-scales. Apple MSL 4.0 has no native float8 simdgroup matrix, so the matmuls run as plain register fma.",
     "block_size": 32
   },
   "parity": {
     "blockscaled_vs_bf16": {
-      "max_abs_err": 0.011328823864459991,
-      "max_rel_err": 0.11758861583070061
+      "max_abs_err": 0.0072389086708426476,
+      "max_rel_err": 0.09327909812881975
     },
     "quantized_matmul_vs_bf16": {
       "max_abs_err": 0.0,
       "max_rel_err": 0.0
+    },
+    "msl_blockscaled_vs_bf16": {
+      "max_abs_err": 0.007239911705255508,
+      "max_rel_err": 0.09329202302533084
+    },
+    "msl_blockscaled_vs_bs_ref": {
+      "max_abs_err": 3.0525028705596924e-05,
+      "max_rel_err": 0.00039309027943857804
     }
   },
   "bench": {
     "bf16_reference": {
       "label": "bf16_reference",
-      "median_ms": 0.2945831511169672,
-      "min_ms": 0.2644159831106663,
-      "max_ms": 0.5323330406099558,
+      "median_ms": 0.6689580623060465,
+      "min_ms": 0.6044579204171896,
+      "max_ms": 0.793500104919076,
       "iters": 25
     },
     "blockscaled_reference": {
       "label": "blockscaled_reference",
-      "median_ms": 0.29075006023049355,
-      "min_ms": 0.2660411410033703,
-      "max_ms": 0.41208299808204174,
+      "median_ms": 0.6787080783396959,
+      "min_ms": 0.6490829400718212,
+      "max_ms": 0.8397498168051243,
       "iters": 25
     },
     "quantized_matmul_reference": {
       "label": "quantized_matmul_reference",
-      "median_ms": 0.278000021353364,
-      "min_ms": 0.2480840776115656,
-      "max_ms": 0.4645839799195528,
+      "median_ms": 0.6914169061928988,
+      "min_ms": 0.6034160032868385,
+      "max_ms": 0.7981669623404741,
+      "iters": 25
+    },
+    "path_b_msl_blockscaled_fwd": {
+      "label": "path_b_msl_blockscaled_fwd",
+      "median_ms": 0.5451659671962261,
+      "min_ms": 0.517082866281271,
+      "max_ms": 0.6890830118209124,
       "iters": 25
     }
   }

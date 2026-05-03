@@ -21,15 +21,10 @@ Tolerances: rtol=1e-3, atol=1e-3 for fp16 (plus generous fp32 hand checks).
 
 from __future__ import annotations
 
-import importlib
-import os
-
 import numpy as np
 import pytest
 
 import mlx.core as mx
-
-pytest.importorskip("tilelang")  # noqa: E402
 
 from cppmega_mlx.nn._tilelang.sparse_mla import (  # noqa: E402
     SparseMLAMetalStatus,

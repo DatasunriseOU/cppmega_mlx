@@ -102,13 +102,13 @@ index a5e6dbe..f726716 100644
 +      [](nb::object obj) { return dlpack_to_mlx(obj); },
 +      "obj"_a,
 +      R"pbdoc(
-+        Build an :class:`array` from a DLPack capsule or any object that
-+        implements ``__dlpack__()``.
++        Build an :class:array from a DLPack capsule or any object that
++        implements __dlpack__().
 +
-+        For ``device_type == kDLCPU`` the bytes are copied into a fresh MLX
-+        allocation. For ``device_type == kDLMetal`` the foreign ``MTLBuffer``
++        For device_type == kDLCPU the bytes are copied into a fresh MLX
++        allocation. For device_type == kDLMetal the foreign MTLBuffer
 +        is wrapped without copying; the buffer must use
-+        ``MTLStorageModeShared`` so MLX can read and write it. Other DLPack
++        MTLStorageModeShared so MLX can read and write it. Other DLPack
 +        device types raise an exception.
 +
 +        The returned array takes over the capsule's lifecycle: the producer's
@@ -116,9 +116,9 @@ index a5e6dbe..f726716 100644
 +        aliases) are destroyed.
 +
 +        Args:
-+            obj: a DLPack ``PyCapsule`` (named ``"dltensor"`` or
-+                ``"dltensor_versioned"``) or a Python object with a
-+                ``__dlpack__()`` method.
++            obj: a DLPack PyCapsule (named "dltensor" or
++                "dltensor_versioned") or a Python object with a
++                __dlpack__() method.
 +
 +        Returns:
 +            array: an MLX array sharing memory with the producer when
@@ -234,7 +234,7 @@ index 0000000..d12ea5f
 +  PyObject* capsule = nullptr;
 +  bool versioned = false;
 +  nb::dlpack::dltensor* tensor = nullptr;
-+  void* managed = nullptr; // typed by `versioned`
++  void* managed = nullptr; // typed by versioned
 +};
 +
 +ParsedCapsule parse_capsule(PyObject* obj) {
@@ -581,7 +581,7 @@ index 0000000..ce3a30c
 +    throw std::invalid_argument(
 +        "[from_dlpack] kDLMetal capsule has null MTLBuffer pointer.");
 +  }
-+  // For kDLMetal, DLPack stipulates `data` is an MTL::Buffer*.
++  // For kDLMetal, DLPack stipulates data is an MTL::Buffer*.
 +  auto mtl_buffer = static_cast<MTL::Buffer*>(t.data);
 +  if (mtl_buffer->storageMode() != MTL::StorageModeShared) {
 +    throw std::invalid_argument(
@@ -690,7 +690,7 @@ index 0000000..e03f1bf
 +++ b/python/tests/test_dlpack_consumer.py
 @@ -0,0 +1,128 @@
 +# Copyright © 2026 Apple Inc.
-+"""Tests for ``mx.from_dlpack`` (consumer side).
++"""Tests for mx.from_dlpack (consumer side).
 +
 +The patch adds a Python-visible entry point::
 +
@@ -699,13 +699,13 @@ index 0000000..e03f1bf
 +These tests cover three scenarios that don't depend on a third-party Metal
 +producer:
 +
-+1. Round trip through NumPy (``kDLCPU`` path).
-+2. Self round trip via ``mx.array.__dlpack__`` (``kDLMetal`` on Metal hosts,
-+   ``kDLCPU`` otherwise).
++1. Round trip through NumPy (kDLCPU path).
++2. Self round trip via mx.array.__dlpack__ (kDLMetal on Metal hosts,
++   kDLCPU otherwise).
 +3. Negative paths: CUDA capsule, malformed capsule, etc.
 +
 +The Metal-with-Private-storage rejection test is provided as an optional
-+helper exercised when both metal-cpp and the producer-side ``__dlpack__``
++helper exercised when both metal-cpp and the producer-side __dlpack__
 +hook are available; on systems where only MLX-allocated buffers can be
 +produced (always shared) it simply checks that MLX's own export does not
 +trip the private-mode guard.

@@ -29,8 +29,6 @@ import pytest
 
 import mlx.core as mx
 
-pytest.importorskip("tilelang")  # noqa: E402
-
 from cppmega_mlx.nn._tilelang.sparse_mla_blockscaled import (  # noqa: E402
     MXFP8_BLOCK_SIZE,
     SparseMLABlockScaledMetalStatus,

@@ -23,11 +23,8 @@ These tests exercise:
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
 import mlx.core as mx
-
-pytest.importorskip("tilelang")  # noqa: E402
 
 from cppmega_mlx.nn._tilelang.sparse_mla_fp8 import (  # noqa: E402
     SparseMLAFp8MetalStatus,

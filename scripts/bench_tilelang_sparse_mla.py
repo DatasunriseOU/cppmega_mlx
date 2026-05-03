@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import platform
 import statistics
 import sys
@@ -30,6 +29,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from cppmega_mlx.nn._tilelang.sparse_mla import (
     sparse_mla_apply,
+    sparse_mla_bwd_metal,
+    sparse_mla_fwd_metal,
     sparse_mla_metal_status,
 )
 from cppmega_mlx.nn.sparse_mla import (
@@ -41,6 +42,7 @@ from cppmega_mlx.nn.sparse_mla import (
 DEFAULT_SHAPES = [
     {"name": "B2_S128_H8_D64", "B": 2, "S": 128, "H": 8, "D": 64, "G": 1, "topk": 16, "Skv": 128},
     {"name": "B4_S512_H8_D64", "B": 4, "S": 512, "H": 8, "D": 64, "G": 1, "topk": 32, "Skv": 512},
+    {"name": "B4_S1024_H8_D64", "B": 4, "S": 1024, "H": 8, "D": 64, "G": 1, "topk": 64, "Skv": 1024},
 ]
 
 
@@ -109,8 +111,15 @@ def _bench_shape(cfg: dict[str, Any], *, warmup: int, iters: int) -> dict[str, A
     def fwd_apply():
         return sparse_mla_apply(q, kv, indices, sm_scale=sm_scale, d_v=d_v)
 
+    def fwd_msl():
+        result = sparse_mla_fwd_metal(q, kv, indices, sm_scale=sm_scale, d_v=d_v)
+        if result is None:
+            return mx.zeros((1,))
+        return result[0]
+
     fwd_ref_bench = _bench_callable("reference_fwd", fwd_reference, warmup=warmup, iters=iters)
     fwd_apply_bench = _bench_callable("apply_fwd", fwd_apply, warmup=warmup, iters=iters)
+    fwd_msl_bench = _bench_callable("path_b_msl_fwd", fwd_msl, warmup=warmup, iters=iters)
 
     # Backward via mx.value_and_grad on a scalar mean.
     q_fp32 = q.astype(mx.float32)
@@ -129,6 +138,20 @@ def _bench_shape(cfg: dict[str, Any], *, warmup: int, iters: int) -> dict[str, A
 
     bwd_ref_bench = _bench_callable("reference_bwd", bwd_reference, warmup=warmup, iters=iters)
 
+    # Direct MSL backward.
+    d_out = mx.array(np.random.default_rng(0).standard_normal(
+        (cfg["B"], cfg["S"], cfg["H"], cfg.get("d_v", cfg["D"]))
+    ).astype(np.float16))
+    mx.eval(d_out)
+
+    def bwd_msl():
+        result = sparse_mla_bwd_metal(q, kv, d_out, indices, sm_scale=sm_scale, d_v=d_v)
+        if result is None:
+            return mx.zeros((1,))
+        return result[0]
+
+    bwd_msl_bench = _bench_callable("path_b_msl_bwd", bwd_msl, warmup=warmup, iters=iters)
+
     metal_status = sparse_mla_metal_status(q, kv, indices)
     path_b = {
         "available": metal_status.available,
@@ -139,7 +162,9 @@ def _bench_shape(cfg: dict[str, Any], *, warmup: int, iters: int) -> dict[str, A
         "shape": cfg,
         "fwd_reference_ms": fwd_ref_bench,
         "fwd_apply_ms": fwd_apply_bench,
+        "fwd_msl_ms": fwd_msl_bench,
         "bwd_reference_ms": bwd_ref_bench,
+        "bwd_msl_ms": bwd_msl_bench,
         "path_b": path_b,
     }
 

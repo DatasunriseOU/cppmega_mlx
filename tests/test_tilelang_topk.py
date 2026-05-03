@@ -18,14 +18,10 @@ The tests verify:
 
 from __future__ import annotations
 
-import importlib
-
 import numpy as np
 import pytest
 
 import mlx.core as mx
-
-pytest.importorskip("tilelang")  # noqa: E402
 
 from cppmega_mlx.nn._tilelang.topk_selector import (  # noqa: E402
     PathBStatus,

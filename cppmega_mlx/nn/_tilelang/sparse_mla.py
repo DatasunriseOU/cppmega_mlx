@@ -64,7 +64,6 @@ import mlx.core as mx
 
 from cppmega_mlx.nn._tilelang import _msl_transform
 from cppmega_mlx.nn._tilelang._msl_transform import (
-    MSLDispatchUnsupported,
     can_run_metal,
     msl_dispatch_status,
 )
@@ -710,12 +709,10 @@ def _reduce_dkv_partial(
     B = shapes.batch
     S = shapes.seq_len
     Skv = shapes.seq_len_kv
-    H = shapes.heads
     G = shapes.kv_group
     head_kv = shapes.head_kv
     topk = shapes.topk
     qk_dim = shapes.qk_dim
-    d_v = shapes.d_v
 
     # First, sum dkv_partial across the head_kv dim within each kv_group:
     # dkv_partial[B, S, H, topk, qk_dim] -> [B, S, G, topk, qk_dim]

@@ -36,10 +36,12 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from cppmega_mlx.nn._tilelang.sparse_mla_blockscaled import (  # noqa: E402
+    sparse_mla_blockscaled_fwd_metal,
     sparse_mla_blockscaled_metal_status,
     sparse_mla_blockscaled_reference,
 )
 from cppmega_mlx.nn._tilelang.sparse_mla_fp8 import (  # noqa: E402
+    sparse_mla_fp8_fwd_metal,
     sparse_mla_fp8_metal_status,
     sparse_mla_fp8_reference,
     sparse_mla_quantized_matmul_reference,
@@ -188,6 +190,23 @@ def main() -> None:
         **bench_kwargs,
     )
 
+    # Direct-MSL Path B kernels.
+    def _msl_fp8():
+        result = sparse_mla_fp8_fwd_metal(q, kv, indices, d_v=d_v)
+        return result[0] if result is not None else mx.zeros((1,))
+
+    def _msl_bs():
+        result = sparse_mla_blockscaled_fwd_metal(q, kv, indices, d_v=d_v)
+        return result[0] if result is not None else mx.zeros((1,))
+
+    fp8_msl_bench = _bench("path_b_msl_fp8_fwd", _msl_fp8, **bench_kwargs)
+    bs_msl_bench = _bench("path_b_msl_blockscaled_fwd", _msl_bs, **bench_kwargs)
+
+    # Capture parity vs reference for the MSL paths.
+    msl_fp8_out = sparse_mla_fp8_fwd_metal(q, kv, indices, d_v=d_v)[0]
+    msl_bs_out = sparse_mla_blockscaled_fwd_metal(q, kv, indices, d_v=d_v)[0]
+    mx.eval(msl_fp8_out, msl_bs_out)
+
     # Capture both dispatch status (which may report dispatcher-level rejections
     # such as int32 indices) and codegen blocker status (no arrays passed) so
     # downstream tooling can distinguish the two layers.
@@ -211,11 +230,14 @@ def main() -> None:
         "parity": {
             "fp8_vs_bf16": _max_abs_err(fp8_ref_out, bf16_ref_out),
             "quantized_matmul_vs_bf16": _max_abs_err(qm_out, bf16_ref_out),
+            "msl_fp8_vs_bf16": _max_abs_err(msl_fp8_out, bf16_ref_out),
+            "msl_fp8_vs_fp8_ref": _max_abs_err(msl_fp8_out, fp8_ref_out),
         },
         "bench": {
             "bf16_reference": bf16_bench,
             "fp8_reference": fp8_bench,
             "quantized_matmul_reference": qm_bench,
+            "path_b_msl_fp8_fwd": fp8_msl_bench,
         },
     }
 
@@ -233,11 +255,14 @@ def main() -> None:
         "parity": {
             "blockscaled_vs_bf16": _max_abs_err(bs_ref_out, bf16_ref_out),
             "quantized_matmul_vs_bf16": _max_abs_err(qm_out, bf16_ref_out),
+            "msl_blockscaled_vs_bf16": _max_abs_err(msl_bs_out, bf16_ref_out),
+            "msl_blockscaled_vs_bs_ref": _max_abs_err(msl_bs_out, bs_ref_out),
         },
         "bench": {
             "bf16_reference": bf16_bench,
             "blockscaled_reference": bs_bench,
             "quantized_matmul_reference": qm_bench,
+            "path_b_msl_blockscaled_fwd": bs_msl_bench,
         },
     }
 
@@ -250,11 +275,15 @@ def main() -> None:
     print(f"  bf16_reference        median={bf16_bench['median_ms']:.4f} ms")
     print(f"  fp8_reference         median={fp8_bench['median_ms']:.4f} ms")
     print(f"  quantized_matmul_ref  median={qm_bench['median_ms']:.4f} ms")
+    print(f"  path_b_msl_fp8_fwd    median={fp8_msl_bench['median_ms']:.4f} ms (Path B direct-MSL)")
     print(f"  fp8 vs bf16 max_abs_err={fp8_payload['parity']['fp8_vs_bf16']['max_abs_err']:.4e}")
+    print(f"  msl_fp8 vs bf16 max_abs_err={fp8_payload['parity']['msl_fp8_vs_bf16']['max_abs_err']:.4e}")
 
     print(f"[bench] {bs_path}")
     print(f"  blockscaled_reference median={bs_bench['median_ms']:.4f} ms")
+    print(f"  path_b_msl_blockscaled_fwd median={bs_msl_bench['median_ms']:.4f} ms (Path B direct-MSL)")
     print(f"  blockscaled vs bf16 max_abs_err={bs_payload['parity']['blockscaled_vs_bf16']['max_abs_err']:.4e}")
+    print(f"  msl_bs vs bf16 max_abs_err={bs_payload['parity']['msl_blockscaled_vs_bf16']['max_abs_err']:.4e}")
 
 
 if __name__ == "__main__":
