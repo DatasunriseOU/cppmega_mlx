@@ -136,8 +136,9 @@ launchers.
   plus the explicit whitespace-sentinel wrapper. The deployed JSON remains
   decoder=null; encode collapses newline runs to <NL> and space/tab runs to
   <SPACE>, while decode concatenates token strings and substitutes those
-  sentinels. The acceptance target is byte-exact parity with the CUDA reference
-  wrapper, not HF reversible decode(encode(text)) for arbitrary whitespace.
+  sentinels. The acceptance target is byte-exact parity with the deployed GB10
+  tokenizer wrapper, not HF reversible decode(encode(text)) for arbitrary
+  whitespace.
   Recorded receipts are 11/11 curated samples and 1000/1000 source-line samples
   byte-exact against GB10.
 
@@ -186,6 +187,8 @@ launchers.
 - Non-claims: the manifest is forward-only architecture evidence. It is not a
   GB10 performance claim, M4-vs-GB10 parity claim, distributed Megatron parity
   claim, CUDA weight-conversion receipt, or M0.7 resumable-training receipt.
+- Mac-local scope: this is external reference closure only. It does not block
+  Mac-local MLX/Metal M0.4 training acceptance.
 
 ### Structure Runtime Handoff
 
@@ -213,7 +216,7 @@ launchers.
 - Test anchor: tests/test_mtp_loss.py covers K=2 defaults, shared-head
   aliasing, static roll-and-mask masking, per-depth weighting, lambda
   integration, MTP-disabled inference sanity, decoder-hidden-state routing,
-  and CUDA-parity detach semantics for main hidden states and output head
+  and source-reference detach semantics for main hidden states and output head
   weight.
 - Non-claims: local MLX MTP does not implement Liger CE, Hopper native linear
   CE, fused main-plus-MTP CE launch behavior, Megatron monkey patching,
@@ -230,6 +233,8 @@ launchers.
   CUDA/MLX overclaim fields such as numerical-harness, parity-passed, and full
   acceptance flags. This is scaffold hardening only; it does not replace the
   required CUDA artifact or numerical harness.
+- Mac-local scope: this is external reference closure only. It does not block
+  Mac-local MLX/Metal M0.4 training acceptance.
 
 ### Engram Standalone Local Slice
 

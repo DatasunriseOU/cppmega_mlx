@@ -134,9 +134,10 @@ def test_decode_parity_with_gb10_reference_receipt() -> None:
     """MLX-side decode is byte-identical to gb10's CppTokenizer.decode.
 
     Each entry pairs an ID stream with the exact decoded string captured from
-    gb10's nanochat CppTokenizer wrapper (the CUDA reference). This guards the
-    M0.1 acceptance gate: MLX inference, FIM transforms, and RL reward parsing
-    must produce the same strings as the CUDA reference for any ID stream.
+    gb10's nanochat CppTokenizer wrapper (the deployed tokenizer receipt).
+    This guards the M0.1 acceptance gate: MLX inference, FIM transforms, and
+    RL reward parsing must produce the same strings as the deployed tokenizer
+    receipt for any ID stream.
     """
 
     tokenizer_path = (

@@ -1,7 +1,7 @@
 # cppmega.mlx — Master Port Plan & Architecture Review
 
 **Date:** 2026-05-01
-**Scope:** Conservative MLX port planning for Apple Silicon; not a production-parity or M4-vs-GB10 parity claim
+**Scope:** Conservative MLX port planning for Apple Silicon; Mac-local MLX/Metal acceptance, not a production-parity or M4-vs-GB10 parity claim
 **Sibling repos audited:**
 - `/Volumes/external/sources/nanochat` (origin / "MegaCpp" fork, commit `4acb8af1`)
 - `/Volumes/external/sources/cppmega` (CUDA / Megatron-LM port, GB10 + H200 tuned)
@@ -76,8 +76,8 @@ Full-stack research-grade LLM (40-45K LOC):
 ### Critical research findings for MLX on M4 Max
 
 **Precision (current policy):**
-- bf16 weights + bf16 activations + **fp32 AdamW master moments**. No loss scaling needed (bf16 has fp32 exponent range). Mirrors the CUDA port and avoids parity drift.
-- fp16 mixed-precision is a benchmark question, not a default: it can break parity with the CUDA reference, so use it only if repo-local matched runs prove a worthwhile speedup.
+- bf16 weights + bf16 activations + **fp32 AdamW master moments**. No loss scaling needed (bf16 has fp32 exponent range). This is the Mac-local MLX/Metal stability default and keeps later external-reference comparisons meaningful.
+- fp16 mixed-precision is a benchmark question, not a default: it can change numerics and complicate external-reference comparability, so use it only if repo-local matched runs prove a worthwhile speedup.
 - **No fp8 / mxfp* / nvfp* training support is claimed on M4 Max.** Current repo source and tests do not prove those training paths. Keep fp8-family work deferred or inference/quantization-only until local source, tests, and hardware evidence justify a narrower claim.
 - **Inference**: q4 affine, group_size=64, embed/lm_head at q8, and KV q4 remain inference-planning candidates. External mlx-lm rows are pattern evidence only until reproduced with repo-local matched shapes.
 
@@ -113,7 +113,7 @@ Full-stack research-grade LLM (40-45K LOC):
 
 | Decision | Choice | Why |
 |---|---|---|
-| Training precision | bf16 + fp32 AdamW master | parity with CUDA reference, no loss-scaling complexity |
+| Training precision | bf16 + fp32 AdamW master | local MLX/Metal stability, no loss-scaling complexity, and cleaner external-reference comparability |
 | Inference precision (candidate) | q4 affine g64; embed/lm_head q8; KV q4 | external pattern only until repo-local matched-shape rows exist |
 | FP8 / mxfp4 / mxfp8 / nvfp4 training | deferred | no current M4 training support claim in this repo; revisit only with source/test/hardware proof |
 | Optimizer (default) | AdamW (≤3B) / Lion (7B+) | bnb 8-bit Adam absent; Lion halves state cost |
@@ -151,20 +151,20 @@ The buy-vs-build addendum also contains a 20-rule anti-port playbook — the thi
 
 Before fanning out across all 10 streams, prove the smallest viable path on the resolved mini target. This is a single, sequenced, ~3–5-week milestone that gates the rest of the plan.
 
-**Goal**: load `local_gb10_quarter` config (depth=13, hidden=3584, FFN=18944, 28 heads, head_dim=128, vocab=65536, MTP=2, AEMEAEMEAEMR pattern); run a single bf16 training step end-to-end on a single Mac; and produce a numerical parity row against a one-shot CUDA forward at the same seed within the documented bf16 tolerances.
+**Goal**: load `local_gb10_quarter` config (depth=13, hidden=3584, FFN=18944, 28 heads, head_dim=128, vocab=65536, MTP=2, AEMEAEMEAEMR pattern); run bf16 training end-to-end on a single Mac using MLX/Metal; validate local parquet loss/memory receipts; and keep external CUDA/GB10 numerical reference closure separate from Mac-local acceptance.
 
-**Gate set** (must all be green before scaling effort):
+**Gate set** (Mac-local gates must be green before scaling effort; external reference closure is tracked fail-closed but does not block Mac-local M0.4 work):
 - M0.1 — **CLOSED**. Tokenizer: vendor the deployed GB10 tokenizer artifact with vocab=65536 and the reserved ID contract (id 2=BOS, 3=EOT/EOS, 4=FIM_PREFIX, 5=FIM_MIDDLE, 6=FIM_SUFFIX, 7=CODE_START, 45=FIM_INSTRUCTION, 46=SPACE, 47=NL). The wrapper normalizes whitespace runs at encode (`[\r\n]+`->`<NL>`, `[ \t]+`->`<SPACE>`) and decode is plain token concat with sentinel substitution; this fixes the BPE-split decode bug (e.g., `sum`->`s`,`u`,`m`->`s u m`) and gives byte-exact round-trip for inputs without multi-char whitespace runs. The explicit-token approach matches the CUDA-side `nanochat/cpp_tokenizer.py` decode behavior. Do not reopen this gate over the deployed HF `decoder=null` artifact's non-reversible `decode(encode(text))` behavior.
 - M0.2 — Model factory entry for `local_gb10_quarter` in `cppmega_mlx/recipes/model_factory.py`. With M0.1 closed, the default profile is unblocked; acceptance remains the profile contract plus build → forward closure on shape `(B=1, T=512)` returning finite logits with config schema validation rejecting invalid combos.
-- M0.3 — **Random-init seed-matched forward parity** (no warm-start, no CUDA weight import for M0): construct MLX model and CUDA reference model with the same `local_gb10_quarter` config; seed both deterministically; compare logits within `rtol=1e-2, atol=1e-1` on the fixed `B=1,T=512,seed=3003` input batch (`tokens_sha256=c645ca4053e5206dcbe58c13aa26f4a9e56c5aa2aee90a4d4778bbc9d9c33549`). Current gate state is fail-closed: no real CUDA logits artifact exists at `bench/parity/cuda/m03_local_gb10_quarter_seed3003_logits.json`, so `scripts/m03_forward_parity_manifest.py` must refuse the default missing artifact and keep `m0_3_closed=false`. A metadata-valid CUDA artifact only reaches `artifact_preflight_status=valid_not_evaluated`; it is not acceptance until a separate numerical harness compares the full logits tensor (`shape=[1,512,65536]`, `numel=33554432`) against MLX and records pass/fail parity.
+- M0.3 — **External reference closure, not a Mac-local blocker**. Random-init seed-matched forward parity remains useful for comparing MLX against a CUDA/GB10 reference, but it does not gate local MLX/Metal M0.4 training progress. The fail-closed scaffold constructs the same `local_gb10_quarter` config and fixed `B=1,T=512,seed=3003` input batch (`tokens_sha256=c645ca4053e5206dcbe58c13aa26f4a9e56c5aa2aee90a4d4778bbc9d9c33549`). No real CUDA logits artifact exists at `bench/parity/cuda/m03_local_gb10_quarter_seed3003_logits.json`, so `scripts/m03_forward_parity_manifest.py` must refuse the default missing artifact and keep `m0_3_closed=false`. A metadata-valid CUDA artifact only reaches `artifact_preflight_status=valid_not_evaluated`; it is not external reference acceptance until a separate numerical harness compares the full logits tensor (`shape=[1,512,65536]`, `numel=33554432`) against MLX and records pass/fail parity.
 - M0.4 — One training step in bf16 (loss + backward + optimizer.update). No NaNs. Loss decrease over 100 steps on the target local parquet sample. **Data source**: local ignored `data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet` (~492 MB total of GB10 validation shards when present locally; not committed to git). Current scoped progress covers training-plumbing guardrails, canonical metadata/preflight receipts, grad-checkpoint expectation metadata, requested-vs-completed step accounting, and a metadata-only `--model-profile local_gb10_quarter --dry-run-json` preflight that performs no forward pass, no training, no optimizer-state allocation, and does not route through HybridTinyLM. Optional parameter allocation probing remains preflight evidence only. Full M0.4 remains open until the real `local_gb10_quarter` bf16 AdamW + grad-checkpoint path completes the 100-step target-parquet gate. No GB10 scp or full-corpus prep needed for M0.
-- M0.5 — MTP K=2 head wired with β=0.6 / λ=0.3; per-depth losses tracked. MTP-disabled inference path also returns sane logits. Current local coverage is bounded to MLX training-side loss semantics plus fail-closed manifest hardening, including nested CUDA/MLX overclaim rejection. M0.5 remains open until a fixed-seed CUDA/GB10 FastMTP loss+grad-norm artifact exists and an MLX-vs-CUDA numerical harness evaluates it.
+- M0.5 — MTP K=2 head wired with β=0.6 / λ=0.3; per-depth losses tracked. MTP-disabled inference path also returns sane logits. Current local coverage is bounded to MLX training-side loss semantics plus fail-closed manifest hardening, including nested CUDA/MLX overclaim rejection. External CUDA/GB10 FastMTP loss+grad-norm closure remains open until a fixed-seed artifact exists and an MLX-vs-CUDA numerical harness evaluates it; that external reference closure does not block Mac-local M0.4 training acceptance.
 - M0.6 — Memory math validated on the actual dev box (Mac Studio M4 Max 128 GB): peak unified-memory < 75% of installed RAM with `--grad-checkpoint` and AdamW.
 - M0.7 — Resumable training: save mid-run, kill process, reload, identical loss continues for ≥100 steps with RNG state and dataloader cursor preserved. Current receipts are TinyLM/HybridTinyLM-scoped only; full M0.7 remains fail-closed until `local_gb10_quarter` resumes on the target parquet lane after the M0.4 full-model training gate is proven.
 
 **M0 data note**: full-corpus pretraining is a post-M0 concern. When that lands, options are (a) `scp` materialized `.bin/.idx` shards from GB10's `/home/dave/cppmega-root/data/megatron/clang_semantic_4k_v10_train`, or (b) port `cppmega/scripts/data/prepare_*` to run on Mac. Resolve at that time.
 
-**2nd Mac connection trigger (revised)**: ~1–2 weeks after M0 work starts, when M0.2/M0.3 are green and there's a real working baseline to extend. Earlier is debug surface without payoff; later (waiting for step ~100) leaves Stream F starting cold.
+**2nd Mac connection trigger (revised)**: ~1–2 weeks after M0 work starts, when M0.2 plus the local M0.4 baseline are green and there's a real working baseline to extend. Earlier is debug surface without payoff; later (waiting for step ~100) leaves Stream F starting cold.
 
 **Mapping to plan steps** (M0 is the first ~35 steps, executed sequentially): A1, A5, A7, A8, A9, A11, A13, A15 → B21, B22, B23, B32, B33, B34 → C41, C50, C58 → D61, D62, D63, D78 → E81, E83, E84, E85, E86, E87, E89, E91 → H151, H152, H153, H154 → J187. Everything else (Streams F, I, full G, full H, the rest of A/B/C/D/E) waits behind M0 acceptance.
 
@@ -176,7 +176,7 @@ Before fanning out across all 10 streams, prove the smallest viable path on the 
 
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
-| MLX bf16 path silently slower than fp16 → CUDA-parity-vs-throughput tradeoff | High | Medium | Benchmark both in stream G; if fp16 wins ≥20% on M4, add as opt-in |
+| MLX bf16 path silently slower than fp16 → local-stability-vs-throughput tradeoff | High | Medium | Benchmark both in stream G; if fp16 wins ≥20% on M4, add as opt-in |
 | `mx.compile` re-compiles on shape change | High | Medium | Bucket seq_len to powers of 2; document anti-patterns |
 | Wired-memory kernel panic on KV overrun | Medium | High | Always set `mx.metal.set_memory_limit` + `set_wired_limit` ≤ 0.7 |
 | Sinkhorn (mHC) numerical instability in bf16 | Medium | Medium | Force fp32 inside Sinkhorn iters (mirror nanochat) |
@@ -703,7 +703,7 @@ Critical path: A → B → C → E → H (features) is the longest single chain,
 - Do not claim distributed Megatron parity from `mx.distributed` references, JACCL docs, or local single-process tests.
 - Do not claim full NAM56R readiness from route/config metadata or tiny/hybrid receipts.
 - Do not move forward-only custom Metal kernels into the training path.
-- Do not adopt fp16 mixed-precision unless a measured ≥20% speedup justifies the parity break with CUDA.
+- Do not adopt fp16 mixed-precision unless a measured ≥20% speedup justifies the local-stability and external-comparability cost.
 - Do not write custom Metal for ops that `mx.fast` covers (SDPA, RoPE, RMSNorm, LayerNorm) — maintenance cost without speedup.
 - Do not use `mx.array(python_scalar)` in hot paths — silent fp32 promotion kills bf16 perf.
 - Do not call `.eval()` inside `mx.compile`'d functions — crashes; capture state via `inputs=`/`outputs=`.
@@ -732,7 +732,7 @@ Critical path: A → B → C → E → H (features) is the longest single chain,
 2. **Multi-Mac topology — RESOLVED (heterogeneous pair planned)**: One Mac currently active (Mac Studio, Apple M4 Max, 128 GB, macOS 26.4.1, 4× TB5 ports rated up to 120 Gb/s). A 48 GB second Mac will be added at some stage (no purchase — already on hand) and gets **both roles** in `docs/multimac_training.md`:
    - `role: inference_scout` — q4 inference / draft model server / eval & CI runner / parity-anchor checker. 1.2B at q4 ≈ 0.7 GB weights + KV; trivially fits 48 GB with headroom for batch and prompt cache.
    - `role: training_peer` — Stream F smoke target. Run distributed code paths (DP, ZeRO-1, TP=2) end-to-end on the heterogeneous pair to **prove the plumbing works**, not for production throughput. Memory fit is feasible with **Lion + ZeRO-1**: 7.6 W + 7.6 G + 7.6 Lion-m-half (sharded across 2 ranks) ≈ 22.8 GB params/grads/opt + ~3–5 GB activations w/ grad-ckpt + ~10 GB MLX/macOS = ~35–40 GB peak per rank. Headless mode on the 48 GB peer recommended.
-   - **Connection trigger (revised)**: ~1–2 weeks after M0 work starts, when M0.2/M0.3 are green and there's a real working baseline to extend.
+   - **Connection trigger (revised)**: ~1–2 weeks after M0 work starts, when M0.2 plus the local M0.4 baseline are green and there's a real working baseline to extend.
    - **Future homogeneous pair**: if/when a second 128 GB Mac becomes available, demote 48 GB to `role: inference_scout` only; the 128+128 pair becomes the production training peer for AdamW + larger configs.
    - **Lion vs AdamW policy**:
      - 128 GB single-Mac M0 → AdamW (default, matches GB10 baseline).

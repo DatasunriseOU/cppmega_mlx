@@ -167,8 +167,8 @@ EAGLE-2 / Medusa / Hydra remain **PATTERN-ONLY** until we are sure phases 1-3 un
 
 Restating, for completeness when this doc is read in isolation:
 
-- **bf16** on M4 Max is supported but slower than fp16; train in bf16 for CUDA parity, accept the throughput cost.
-- **fp16** mixed precision is faster on M4 but breaks CUDA parity and adds loss-scaling complexity. Skip for default training; reconsider for inference-only acceleration.
+- **bf16** on M4 Max is supported but slower than fp16; train in bf16 by default for local MLX/Metal stability and cleaner external-reference comparability, accepting the throughput cost until matched local benches say otherwise.
+- **fp16** mixed precision can be faster on M4, but it changes numerics and adds loss-scaling complexity. Skip for default training; reconsider for inference-only acceleration or matched local benchmark lanes.
 - **fp8 / mxfp4 / mxfp8 / nvfp4** — no M4 hardware support, no MLX dtype, no roadmap before M5+. **Skip everything fp8-family.**
 - **q4 affine g64** for inference is 2.5× faster decode than bf16 on M4 Max (mlx-lm bench: Qwen3-4B q5 at 110 tok/s vs bf16 at 52 tok/s).
 - **KV q4 with --quantized-kv-start 256** is the recommended inference default on long context.

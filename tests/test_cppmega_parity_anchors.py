@@ -158,7 +158,9 @@ def test_cppmega_source_reference_anchors_are_documented():
 def test_parity_docs_keep_runtime_anchor_claims_fail_closed():
     doc = (_repo_root() / "docs" / "parity_anchors.md").read_text()
     porting = (_repo_root() / "docs" / "porting_plan.md").read_text()
-    combined = f"{doc}\n{porting}"
+    master_plan = (_repo_root() / "docs" / "mlx_port_master_plan.md").read_text()
+    buy_vs_build = (_repo_root() / "docs" / "mlx_buy_vs_build.md").read_text()
+    combined = f"{doc}\n{porting}\n{master_plan}\n{buy_vs_build}"
     normalized = " ".join(combined.split())
 
     assert "Full NAM56R Megatron Recipe/Runtime Anchors" in doc
@@ -169,6 +171,11 @@ def test_parity_docs_keep_runtime_anchor_claims_fail_closed():
     assert "distributed Megatron behavior remains outside the MLX scaffold" in doc
     assert "distributed Megatron parity is not claimed" in doc
     assert "M4 Max vs GB10 parity is not proven" in combined
+    assert "Mac-local MLX/Metal M0.4 training acceptance" in doc
+    assert "external reference closure only" in doc
+    assert "It does not block Mac-local MLX/Metal M0.4" in normalized
+    assert "Mac-local MLX/Metal acceptance" in master_plan
+    assert "local MLX/Metal stability" in buy_vs_build
 
     unsupported_surfaces = (
         "Transformer Engine",
@@ -196,6 +203,13 @@ def test_parity_docs_keep_runtime_anchor_claims_fail_closed():
         "distributed Megatron parity is proven",
         "full distributed Megatron parity",
         "H200 launchers are supported by cppmega.mlx",
+        "H200 gates local acceptance",
+        "GB10 gates local acceptance",
+        "CUDA parity gates M0",
+        "train in bf16 for CUDA parity",
+        "breaks CUDA parity",
+        "parity break with CUDA",
+        "M0.2/M0.3 are green",
     )
     for phrase in forbidden_overclaims:
         assert phrase not in combined
