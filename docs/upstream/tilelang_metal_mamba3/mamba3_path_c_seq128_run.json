@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "scope": "local_only",
+  "kernel": "mamba3_mimo_path_c_vs_path_b",
+  "hardware_label": "Davids-Mac-Studio.local",
+  "platform": {
+    "system": "Darwin",
+    "machine": "arm64",
+    "python_version": "3.13.12",
+    "mlx_version": "0.31.1",
+    "tilelang_version": "0.1.9+git7f4a5cb8"
+  },
+  "shape": {
+    "batch": 2,
+    "seq": 128,
+    "heads": 4,
+    "headdim": 32,
+    "state": 64,
+    "dtype": "float32"
+  },
+  "parity": {
+    "y_max_abs": 0.0,
+    "h_max_abs": 0.0
+  },
+  "timings": {
+    "fwd_path_b": {
+      "label": "fwd_path_b",
+      "mean_ms": 0.9786804066970944,
+      "median_ms": 0.7226249435916543,
+      "min_ms": 0.5383340176194906,
+      "max_ms": 6.893583806231618,
+      "iters": 100,
+      "warmup": 10
+    },
+    "fwd_path_c": {
+      "label": "fwd_path_c",
+      "mean_ms": 0.8100399817340076,
+      "median_ms": 0.6833960069343448,
+      "min_ms": 0.47529186122119427,
+      "max_ms": 2.5040418840944767,
+      "iters": 100,
+      "warmup": 10
+    },
+    "fwd_bwd_path_b": {
+      "label": "fwd_bwd_path_b",
+      "mean_ms": 4.256382102612406,
+      "median_ms": 2.0557499956339598,
+      "min_ms": 1.8705420661717653,
+      "max_ms": 212.3890419024974,
+      "iters": 100,
+      "warmup": 10
+    },
+    "fwd_bwd_path_c": {
+      "label": "fwd_bwd_path_c",
+      "mean_ms": 4.201685469597578,
+      "median_ms": 2.006395487114787,
+      "min_ms": 1.8436249811202288,
+      "max_ms": 217.77066704817116,
+      "iters": 100,
+      "warmup": 10
+    },
+    "bwd_path_b_median_ms": 1.3331250520423055,
+    "bwd_path_c_median_ms": 1.3229994801804423
+  },
+  "gflops": {
+    "fwd_path_b": 14.964111183671694,
+    "fwd_path_c": 15.82309508729522,
+    "fwd_bwd_path_b": 21.04037946825399,
+    "fwd_bwd_path_c": 21.5579432259386
+  },
+  "memory_bytes_peak": {
+    "fwd_path_b": 1450016,
+    "fwd_path_c": 1450016,
+    "fwd_bwd_path_b": 28132932,
+    "fwd_bwd_path_c": 28132932
+  },
+  "ratio_path_c_over_path_b_fwd_bwd": 0.9759919695371554,
+  "verdict": "Path C within 10% of Path B; recommend keeping Path B as primary and treating Path C as a documentation/reproducibility artifact.",
+  "matched_run_guard": "Compare Path B and Path C only when both rows were collected on the same hardware with identical kernel inputs. This is a local_only receipt."
+}

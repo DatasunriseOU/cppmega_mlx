@@ -13,6 +13,47 @@ import mlx.nn as nn
 DEFAULT_CHUNK_SIZE = 128
 
 
+@mx.custom_function
+def _mamba3_mimo_apply_with_state(
+    x: mx.array,
+    B: mx.array,
+    C: mx.array,
+    z: mx.array,
+    A: mx.array,
+    dt: mx.array,
+    D: mx.array,
+    h0: mx.array,
+) -> tuple[mx.array, mx.array]:
+    """Differentiable Path B Mamba3 forward returning ``(y, h_last)``.
+
+    Wraps :func:`cppmega_mlx.nn._tilelang.mamba3_mimo_fwd_metal` and reuses
+    its existing manual VJP (via :func:`mamba3_mimo_bwd_metal`). Gradients
+    flow only through ``y``; the cotangent for ``h_last`` is treated as
+    zero. This matches the production model contract: the loss path uses
+    ``y``, the cache path uses ``h_last`` for inference only.
+    """
+
+    from cppmega_mlx.nn._tilelang.mamba3 import mamba3_mimo_fwd_metal
+
+    return mamba3_mimo_fwd_metal(x, B, C, z, A, dt, D, h0)
+
+
+@_mamba3_mimo_apply_with_state.vjp
+def _mamba3_mimo_apply_with_state_vjp(
+    primals: tuple[mx.array, ...],
+    cotangent: tuple[mx.array, mx.array],
+    output: tuple[mx.array, mx.array],
+) -> tuple[mx.array, ...]:
+    """VJP that ignores the ``h_last`` cotangent (always zero in practice)."""
+
+    from cppmega_mlx.nn._tilelang.mamba3 import mamba3_mimo_bwd_metal
+
+    del output
+    x, B, C, z, A, dt, D, h0 = primals
+    dy = cotangent[0]
+    return mamba3_mimo_bwd_metal(dy, x, B, C, z, A, dt, D, h0)
+
+
 @dataclass(frozen=True)
 class Mamba3Config:
     """Local MLX config using cppmega-facing Author Mamba3 names where possible."""
@@ -351,6 +392,100 @@ def _chunked_mamba3_diagonal_scan(
     return mx.stack(outputs, axis=1), h
 
 
+def _dispatch_mamba3_scan(
+    *,
+    x: mx.array,
+    B: mx.array,
+    C: mx.array,
+    z: mx.array,
+    A: mx.array,
+    dt: mx.array,
+    D: mx.array,
+    h0: mx.array,
+    chunk_size: int,
+) -> tuple[mx.array, mx.array]:
+    """Route the Mamba3 selective scan according to :class:`KernelPath`.
+
+    AUTO/PATH_B uses :func:`_mamba3_mimo_apply_with_state` (Path B Metal
+    kernel) when available; the wrapper preserves grad through ``y`` via
+    the manual VJP shipped with the kernel and exposes ``h_last`` for
+    cache assembly. REFERENCE always uses the pure-MLX chunked scan.
+    PATH_C routes to the lowered TileLang DSL kernel.
+    """
+
+    from cppmega_mlx.nn._tilelang.mamba3 import mamba3_mimo_metal_status
+    from cppmega_mlx.runtime.kernel_policy import (
+        KernelPath,
+        record_dispatch,
+        selected_path,
+    )
+
+    path = selected_path("mamba3_mimo")
+
+    if path is KernelPath.PATH_C:
+        from cppmega_mlx.nn._tilelang.mamba3_path_c import (
+            mamba3_mimo_apply_path_c,
+            mamba3_mimo_fwd_path_c,
+        )
+
+        record_dispatch("mamba3_mimo", path, "path_c_tilelang_dsl")
+        y = mamba3_mimo_apply_path_c(x, B, C, z, A, dt, D, h0)
+        # Path C apply returns y only; recover h_last via the non-grad fwd.
+        _, h_last = mamba3_mimo_fwd_path_c(x, B, C, z, A, dt, D, h0)
+        return y, h_last
+
+    if path is KernelPath.REFERENCE:
+        record_dispatch("mamba3_mimo", path, "reference_pure_mlx")
+        return _reference_scan(
+            x=x, B=B, C=C, z=z, A=A, dt=dt, D=D, h0=h0, chunk_size=chunk_size,
+        )
+
+    # AUTO + PATH_B share the Metal-availability check.
+    status = mamba3_mimo_metal_status(x)
+    if path is KernelPath.PATH_B and not status.available:
+        raise RuntimeError(
+            f"mamba3_mimo: Path B kernel unavailable ({status.reason})"
+        )
+    if status.available:
+        record_dispatch("mamba3_mimo", path, "metal_kernel_fwd_v1")
+        y, h_last = _mamba3_mimo_apply_with_state(x, B, C, z, A, dt, D, h0)
+        return y, h_last
+
+    # AUTO fallback: pure-MLX reference.
+    record_dispatch("mamba3_mimo", path, "reference_pure_mlx")
+    return _reference_scan(
+        x=x, B=B, C=C, z=z, A=A, dt=dt, D=D, h0=h0, chunk_size=chunk_size,
+    )
+
+
+def _reference_scan(
+    *,
+    x: mx.array,
+    B: mx.array,
+    C: mx.array,
+    z: mx.array,
+    A: mx.array,
+    dt: mx.array,
+    D: mx.array,
+    h0: mx.array,
+    chunk_size: int,
+) -> tuple[mx.array, mx.array]:
+    """Adapter that builds (log_decay, inp) and runs the chunked diagonal scan."""
+
+    log_decay = (A * dt)[:, :, :, None, None]
+    inp = x[:, :, :, :, None] * B[:, :, :, None, :]
+    return _chunked_mamba3_diagonal_scan(
+        log_decay,
+        inp,
+        C,
+        x,
+        z,
+        D,
+        h0,
+        chunk_size=chunk_size,
+    )
+
+
 class Mamba3ReferenceBlock(nn.Module):
     """Minimal trainable Mamba3-like MLX block.
 
@@ -568,19 +703,15 @@ class Mamba3ReferenceBlock(nn.Module):
                 )
             h = h0
 
-        log_decay = (A * dt)[:, :, :, None, None]
-        inp = (
-            x[:, :, :, :, None]
-            * B[:, :, :, None, :]
-        )
-        y, h = _chunked_mamba3_diagonal_scan(
-            log_decay,
-            inp,
-            C,
-            x,
-            z,
-            self.D,
-            h,
+        y, h = _dispatch_mamba3_scan(
+            x=x,
+            B=B,
+            C=C,
+            z=z,
+            A=A,
+            dt=dt,
+            D=self.D,
+            h0=h,
             chunk_size=cfg.chunk_size,
         )
         y = y.reshape(batch, seq, cfg.d_inner)

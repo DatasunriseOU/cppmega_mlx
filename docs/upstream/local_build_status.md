@@ -25,7 +25,7 @@ are not Mamba3-specific PRs.
 | 5   | tilelang_metal_fp8               | TileLang + TileLang/tvm or apache/tvm Metal codegen | 0001-metal-fp8-storage-only.patch               | Print FP8 as uchar storage and lower scalar FP8 casts through MSL helper functions.                    | Normal patch artifact.                                                                                                                                | Scalar FP8 cast probes and xcrun --sdk macosx metal -c compile.                                             | Storage/cast only; FP8 GEMM needs the companion dispatcher path and is software, not native FP8.                |
 | 6   | tilelang_metal_fp8_gemm          | TileLang                                            | 0001-metal-fp8-gemm-software-path.patch         | Route FP8-input T.gemm on Metal to scalar dequant-multiply-accumulate fallback.                        | Regenerated 2026-05-03; round-trip verified on clean apple-head@7f4a5cb8 + mixed_dtype prereq. Storage-only FP8 (#5) is a runtime prereq but not a patch-level prereq.                                            | Local branch receipt says FP8 GEMM variants lower and compile to MSL without simdgroup_multiply_accumulate. | Companion to #3 (mixed-dtype) and #5 (storage-only FP8); replayable artifact.                                    |
 | 7   | tilelang_metal_fp8_vector        | TileLang + TVM Metal codegen                        | 0001-metal-fp8-vector-cast.patch                | Vector FP8 casts (lanes 2/3/4) routed through ucharN/halfN inline helpers.                              | Regenerated 2026-05-03; round-trip verified on clean apple-head@7f4a5cb8 + storage-only FP8 (#5) prereq.                                                                                                          | README records the successful local probe; the regenerated artifact applies and reverses cleanly.          | Lanes 8/16 still raise FATAL by design; widen via separate patch when needed.                                    |
-| 8   | tilelang_metal_fp8_scaled_matmul | TileLang language surface                           | 0001-tilelang-fp8-scaled-matmul-intrinsic.patch | Add T.fp8_scaled_matmul(...) frontend stub and explicit Metal redirect.                                | Normal patch artifact, but its documented prereq stack includes the vector patch, which currently needs regeneration.                                 | Import / Metal redirect / fallback probe documented in README.                                              | Frontend stub only; no real Metal scheduler lowering yet.                                                       |
+| 8   | tilelang_metal_fp8_scaled_matmul | TileLang language surface                           | 0001-tilelang-fp8-scaled-matmul-intrinsic.patch | Add T.fp8_scaled_matmul(...) as a hygienic TileLang macro for scalar scaled FP8 matmul.                 | Normal patch artifact: 4 files, 1454 insertions. The full FP8 stack uses the regenerated vector patch, but vector is no longer a packaging blocker. | 8 CPU + 17 Metal tests = 25 passed; MSL/xcrun/e2e/bench receipts are in README.                            | Macro expansion only; no registered TIR op in src/op/builtin.cc and no Metal scheduler/simdgroup lowering.       |
 | 9   | tilelang_metal_shared_dyn        | TileLang investigation artifact                     | 0001-metal-shared-dyn-storage-scope.patch       | Document that shared.dyn static extents are already fixed on Apple-head.                               | Intentional no-op artifact; git apply --check reports No valid patches in input.                                                                      | test_shared_dyn_probe.py covers static, merged, and symbolic regimes.                                       | Not a code PR; symbolic dynamic shared memory still needs a separate issue/patch if required.                   |
 
 MLX DLPack performance/readiness note: the mlx_from_dlpack artifact
@@ -50,16 +50,17 @@ tilelang_metal_fp8.
 tilelang_metal_fp8_gemm and tilelang_metal_fp8_vector were regenerated
 2026-05-03 and now pass round-trip apply/reverse on a clean
 apple-head@7f4a5cb8 stack (with #3 and #5 prereqs respectively). Treat
-tilelang_metal_fp8_scaled_matmul as a frontend-stub PR only. Do not file
-tilelang_metal_shared_dyn as a code PR; use it as an upstream issue /
-investigation note for the remaining symbolic dynamic-shared-memory
-limitation.
+tilelang_metal_fp8_scaled_matmul as a macro-baseline PR only: it is not
+a registered TIR op or Metal scheduler-lowering PR and should not claim
+FP16 simdgroup throughput. Do not file tilelang_metal_shared_dyn as a
+code PR; use it as an upstream issue / investigation note for the
+remaining symbolic dynamic-shared-memory limitation.
 
 ### Pack-level proof commands
 
 Run documentation/package checks from the cppmega.mlx checkout:
 
-bash
+```bash
 cd /Volumes/external/sources/cppmega.mlx
 git diff --check -- docs/upstream
 rg -n "git apply (docs/upstream|../docs/upstream)" docs/upstream/*/README.md docs/upstream/local_build_status.md
@@ -70,25 +71,25 @@ rg -n "git apply (docs/upstream|../docs/upstream)" docs/upstream/*/README.md doc
   docs/upstream/tilelang_metal_shared_dyn/test_shared_dyn_probe.py \
   docs/upstream/tvm_shared_storage/test_metal_shared_storage.py
 
+```
 
 Patch packaging probes:
 
-bash
+```bash
 git apply --stat docs/upstream/mlx_from_dlpack/0001-add-from_dlpack-metal-consumer.patch
 git apply --stat docs/upstream/tvm_shared_storage/0001-metal-shared-storage-opt-in.patch
 git apply --stat docs/upstream/tilelang_gemm_mixed_dtype/0001-tilelang-allow-mixed-gemm-dtypes.patch
 git apply --stat docs/upstream/tilelang_metal_fp8/0001-metal-fp8-storage-only.patch
-git apply --stat docs/upstream/tilelang_metal_fp8_scaled_matmul/0001-tilelang-fp8-scaled-matmul-intrinsic.patch
+git apply --stat docs/upstream/tilelang_metal_fp8_gemm/0001-metal-fp8-gemm-software-path.patch
 git apply --stat docs/upstream/tilelang_metal_pipelined/0001-metal-pipeline-3d-buffer.patch
+git apply --stat docs/upstream/tilelang_metal_fp8_vector/0001-metal-fp8-vector-cast.patch
+git apply --stat docs/upstream/tilelang_metal_fp8_scaled_matmul/0001-tilelang-fp8-scaled-matmul-intrinsic.patch
 
-# Expected blockers / non-patches:
-git apply --check docs/upstream/tilelang_metal_fp8_gemm/0001-metal-fp8-gemm-software-path.patch
-# -> patch failed: tilelang/tileop/gemm/__init__.py / metal_fragment_to_simdgroup.py
-git apply --check docs/upstream/tilelang_metal_fp8_vector/0001-metal-fp8-vector-cast.patch
-# -> error: corrupt patch at line 73
+# Intentional non-patch:
 git apply --check docs/upstream/tilelang_metal_shared_dyn/0001-metal-shared-dyn-storage-scope.patch
 # -> error: No valid patches in input
 
+```
 
 ## Audit barrier 2026-05-03 — sparse MLA / FP8 upstream artifact replay
 
@@ -103,7 +104,7 @@ Apply-check matrix on that base:
 | tilelang_metal_pipelined/0001-metal-pipeline-3d-buffer.patch                     | OK     | Branch-specific; public tile-ai/tilelang:main@2eec5f0 has drift and lacks tilelang/intrinsics/metal_macro_generator.py.                                                                                 |
 | tilelang_gemm_mixed_dtype/0001-tilelang-allow-mixed-gemm-dtypes.patch            | OK     | Branch-specific; public main drift breaks hunks in tests, dispatcher, and metal_fragment_to_simdgroup.py.                                                                                               |
 | tilelang_metal_fp8/0001-metal-fp8-storage-only.patch                             | OK     | Requires initialized 3rdparty/tvm submodule.                                                                                                                                                            |
-| tilelang_metal_fp8_scaled_matmul/0001-tilelang-fp8-scaled-matmul-intrinsic.patch | OK     | Also applies on current public main as a standalone frontend stub. Its documented full stack still waits on regenerated vector FP8 cast artifact.                                                       |
+| tilelang_metal_fp8_scaled_matmul/0001-tilelang-fp8-scaled-matmul-intrinsic.patch | OK     | Macro baseline: 8 CPU + 17 Metal tests = 25 passed. Not a registered op or scheduler lowering; vector is no longer a packaging blocker after regeneration.                                             |
 | tilelang_metal_fp8_vector/0001-metal-fp8-vector-cast.patch                       | OK     | Regenerated 2026-05-03; round-trip verified on apple-head@7f4a5cb8 with storage-only FP8 (#5) applied as prereq.                                                                                       |
 | tilelang_metal_fp8_gemm/0001-metal-fp8-gemm-software-path.patch                  | OK     | Regenerated 2026-05-03; round-trip verified on apple-head@7f4a5cb8 + mixed_dtype (#3) prereq. Touches dispatcher Python only; runtime behavior depends on storage-only FP8 (#5) being applied.        |
 | tilelang_metal_shared_dyn/0001-metal-shared-dyn-storage-scope.patch              | NO-OP  | No valid patches in input; keep as investigation artifact, not a code PR.                                                                                                                               |
@@ -125,13 +126,14 @@ kernel with MPS tensors, and verifies the result against torch.matmul.
 
 Commands:
 
-bash
+```bash
 .venv/bin/python docs/upstream/test_metal_gemm.py
 .venv/bin/python docs/upstream/test_metal_gemm.py --profile-lowering --lowering-repeats 9
 .venv/bin/python docs/upstream/test_metal_gemm.py --profile-runtime --runtime-reps 300 --runtime-warmups 50 --runtime-rounds 7
 .venv/bin/python docs/upstream/test_metal_gemm.py --profile-runtime --enable-tilelang-cache --runtime-reps 100 --runtime-warmups 10 --runtime-rounds 3
 xctrace record --quiet --no-prompt --template 'Metal System Trace' --time-limit 3s --output /tmp/tilelang_metal_gemm_lane1_final.trace --target-stdout - --launch -- ./.venv/bin/python docs/upstream/test_metal_gemm.py --profile-runtime --runtime-reps 5000 --runtime-warmups 100 --runtime-rounds 20
 
+```
 
 Lowering on this local M-series TileLang dev build
 (/private/tmp/tilelang_apple_head/tilelang/build) produced MSL with
@@ -199,12 +201,13 @@ CompiledArtifact; rt_mod=none with generated Metal source sizes of 1897,
 
 The new CLI modes make the compile-only boundary explicit:
 
-bash
+```bash
 .venv/bin/python docs/upstream/test_sparse_mla_pipeline.py
 .venv/bin/python docs/upstream/test_sparse_mla_pipeline.py --time --repeat 3
 .venv/bin/python docs/upstream/test_sparse_mla_pipeline.py --profile --kernel k2 --profile-limit 16
 .venv/bin/python docs/upstream/test_sparse_mla_pipeline.py --time --repeat 2 --device-compile
 
+```
 
 Measured on the local M-series TileLang dev build (/private/tmp/tilelang_apple_head/tilelang/build):
 
@@ -239,11 +242,10 @@ Submission guidance from this audit:
 
 - Submit or refresh branch-specific PRs from the real TileLang Metal branch,
   not from public main, unless rebased first.
-- Do not include tilelang_metal_fp8_vector or tilelang_metal_fp8_gemm in a
-  PR pack as-is. Their README motivation is useful, but their patch artifacts
-  are not replayable.
-- Treat tilelang_metal_fp8_scaled_matmul as a frontend-stub PR only. It is
-  not proof of a real scaled-FP8 Metal scheduler lowering.
+- tilelang_metal_fp8_vector and tilelang_metal_fp8_gemm have regenerated
+  artifacts; file them only with their stated prereq stack and replay receipts.
+- Treat tilelang_metal_fp8_scaled_matmul as a macro-baseline PR only. It is
+  not proof of a registered TIR op or real scaled-FP8 Metal scheduler lowering.
 - Treat tilelang_metal_shared_dyn as a documented no-op / issue note unless a
   future symbolic dynamic-shared-memory patch is produced.
 
@@ -494,16 +496,18 @@ Two new patches landed on top of Agent C's tilelang_metal_fp8/0001-metal-fp8-sto
 - **Test impact** (testing/python/metal/test_metal_codegen_linux.py): pre-patch 8 pass / 4 fail → post-patch 9 pass / 3 fail. Net **+1**. The pre-existing 3 failures are unrelated (metal.simdgroup vector dtype check). cppmega.mlx tilelang suite: 134 pass (unchanged).
 - **Probe**: /tmp/test_fp8_vector_cast.py — both phases pass (scalar baseline + vectorized lanes=4).
 
-### Patch F-2: T.fp8_scaled_matmul frontend stub
+### Patch F-2: T.fp8_scaled_matmul macro baseline
 
 - **Path**: docs/upstream/tilelang_metal_fp8_scaled_matmul/0001-tilelang-fp8-scaled-matmul-intrinsic.patch
 - **README**: docs/upstream/tilelang_metal_fp8_scaled_matmul/README.md
 - **Files touched** (Python only; no rebuild):
-  - tilelang/language/fp8_op.py (new) — frontend stub with target-aware dispatch.
+  - tilelang/language/fp8_op.py (new) — hygienic macro, validators, and dispatch.
   - tilelang/language/__init__.py — export fp8_scaled_matmul.
-- **Effect**: T.fp8_scaled_matmul(A_fp8, A_scale, B_fp8, B_scale, C_out) exists as a Python frontend. On Metal target it raises NotImplementedError with a redirect message pointing at cppmega_mlx.nn._tilelang.fp8_msl_kernels (where the vendor agent's mx.fast.metal_kernel wrappers will land). On other targets it emits a placeholder tir.call_intrin for downstream lowering.
-- **Why a stub**: full Metal lowering needs a scaled-gemm scheduler pass that fuses per-load scale into the K-loop and a GemmMetalScalar extension for FP8 operands — both sizeable, exceeded the budget. The stub gives users a stable API surface today.
-- **Probe**: /tmp/test_fp8_scaled_matmul.py — all three phases pass (import surface, Metal redirect, cuda fallback).
+  - testing/python/cpu/test_fp8_scaled_matmul_lowering.py — 8 CPU lowering tests.
+  - testing/python/metal/test_fp8_scaled_matmul_metal.py — 17 Metal codegen/xcrun/e2e/bench tests.
+- **Effect**: T.fp8_scaled_matmul(A_fp8, A_scale, B_fp8, B_scale, C_out) expands inline to the audiohacking-style scalar K-loop: fp8 cast/dequant, scale multiply, fp32 accumulate. It no longer raises NotImplementedError on Metal, but it is still a macro expansion rather than a registered TIR op.
+- **Why macro baseline**: full Metal performance lowering still needs a registered op or scheduler hook that fuses scale/dequant into the GEMM K-loop and feeds an FP16 simdgroup path. This patch proves the scalar correctness/API baseline only.
+- **Probe**: pytest reports 8 CPU + 17 Metal tests = 25 passed; MSL inspection asserts no simdgroup_multiply_accumulate.
 
 ### Path B blocker status — updated again
 

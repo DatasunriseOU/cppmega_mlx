@@ -1,24 +1,24 @@
-"""Probe script for Metal `shared.dyn` storage scope support.
+"""Probe script for Metal shared.dyn storage scope support.
 
 Documents three regimes:
 
-1. ``static_size_dyn``: a single ``T.alloc_shared(scope="shared.dyn")`` with
-   compile-time-known extent. ``MergeSharedMemoryAllocations`` collapses
+1. static_size_dyn: a single T.alloc_shared(scope="shared.dyn") with
+   compile-time-known extent. MergeSharedMemoryAllocations collapses
    the dynamic alloc into a constant-sized merged buffer that codegen
-   prints as ``threadgroup half buf_dyn_shmem[128]``. Lowers cleanly.
+   prints as threadgroup half buf_dyn_shmem[128]. Lowers cleanly.
 
-2. ``merged_dyn``: two distinct dynamic allocs that the merge pass
+2. merged_dyn: two distinct dynamic allocs that the merge pass
    coalesces into a single backing buffer (still constant size).
    Lowers cleanly.
 
-3. ``symbolic_dyn``: an ``alloc_shared`` whose extent depends on a
+3. symbolic_dyn: an alloc_shared whose extent depends on a
    symbolic dimension. The merged buffer's extent stays symbolic and
-   ``codegen_metal.cc::VisitStmt_(AllocateNode)`` fires the
-   ``ICHECK_GT(constant_size, 0)`` assertion. Documented as a known
+   codegen_metal.cc::VisitStmt_(AllocateNode) fires the
+   ICHECK_GT(constant_size, 0) assertion. Documented as a known
    limitation; not on the cppmega Path B path because the topk_selector
    port (the original consumer of dynamic shmem) was rewritten to use
-   direct ``mx.fast.metal_kernel`` (see
-   ``cppmega_mlx/nn/_tilelang/topk_selector.py``).
+   direct mx.fast.metal_kernel (see
+   cppmega_mlx/nn/_tilelang/topk_selector.py).
 """
 from __future__ import annotations
 

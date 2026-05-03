@@ -43,7 +43,15 @@ from cppmega_mlx.runtime.seed import capture_rng_state  # noqa: E402
 from cppmega_mlx.training.checkpoint import load_checkpoint, save_checkpoint  # noqa: E402
 from cppmega_mlx.training.compiled import CompiledPretrainingStep  # noqa: E402
 from cppmega_mlx.training.eval import evaluate_batches  # noqa: E402
-from cppmega_mlx.training.optimizers import make_adamw  # noqa: E402
+from cppmega_mlx.training.optimizers import (  # noqa: E402
+    ADAMW_FP32_MOMENTS_CLASS,
+    ADAMW_FP32_MOMENTS_SOURCE,
+    MUON_ADAMW_MULTI_CLASS,
+    MUON_ADAMW_MULTI_SOURCE,
+    MUON_NS_CARRIER_ENV,
+    make_adamw,
+    make_muon,
+)
 
 
 DTYPES = {
@@ -58,6 +66,9 @@ STRUCTURE_MODEL_KWARG_NAMES = (
     "sibling_index_ids",
     "node_type_ids",
 )
+OPTIMIZER_ENV = "CPPMEGA_OPTIMIZER"
+OPTIMIZER_NAMES = ("adamw", "muon")
+OPTIMIZER_SOURCES = ("default", "cli", "env")
 MODEL_NAME = "HybridTinyLM"
 MODEL_SOURCE = "cppmega_mlx.models.hybrid_lm"
 DEFAULT_MODEL_PROFILE = "hybrid_tiny"
@@ -76,6 +87,8 @@ class TrainHybridTinyConfig:
     seed: int = 0
     learning_rate: float = 1e-3
     weight_decay: float = 0.0
+    optimizer: str = "adamw"
+    optimizer_source: str = "default"
     vocab_size: int | None = None
     hidden_size: int = 8
     pattern: str = "AEMR"
@@ -162,6 +175,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--weight-decay",
         type=float,
         default=TrainHybridTinyConfig.weight_decay,
+    )
+    parser.add_argument(
+        "--optimizer",
+        choices=OPTIMIZER_NAMES,
+        default=None,
+        help=(
+            "Training optimizer. Defaults to AdamW; can also be selected with "
+            f"{OPTIMIZER_ENV}=muon for opt-in local Muon+AdamW smokes."
+        ),
     )
     parser.add_argument(
         "--vocab-size",
@@ -404,8 +426,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return build_parser().parse_args(argv)
 
 
+def optimizer_from_args(args: argparse.Namespace) -> tuple[str, str]:
+    raw_optimizer = getattr(args, "optimizer", None)
+    if raw_optimizer is not None:
+        return str(raw_optimizer).strip().lower(), "cli"
+
+    env_optimizer = os.environ.get(OPTIMIZER_ENV)
+    if env_optimizer is not None and env_optimizer.strip():
+        return env_optimizer.strip().lower(), "env"
+
+    return "adamw", "default"
+
+
 def config_from_args(args: argparse.Namespace) -> TrainHybridTinyConfig:
     shared_hidden = args.moe_shared_expert_hidden_size
+    optimizer, optimizer_source = optimizer_from_args(args)
     return TrainHybridTinyConfig(
         npz_path=args.npz_path,
         data_format=args.data_format,
@@ -418,6 +453,8 @@ def config_from_args(args: argparse.Namespace) -> TrainHybridTinyConfig:
         seed=args.seed,
         learning_rate=args.lr,
         weight_decay=args.weight_decay,
+        optimizer=optimizer,
+        optimizer_source=optimizer_source,
         vocab_size=args.vocab_size,
         hidden_size=args.hidden_size,
         pattern=args.pattern,
@@ -505,6 +542,17 @@ def validate_config(config: TrainHybridTinyConfig) -> None:
         raise ValueError("learning_rate must be > 0")
     if config.weight_decay < 0:
         raise ValueError("weight_decay must be >= 0")
+    if config.optimizer not in OPTIMIZER_NAMES:
+        allowed = ", ".join(OPTIMIZER_NAMES)
+        raise ValueError(
+            f"unsupported optimizer={config.optimizer!r}; expected one of: {allowed}"
+        )
+    if config.optimizer_source not in OPTIMIZER_SOURCES:
+        allowed = ", ".join(OPTIMIZER_SOURCES)
+        raise ValueError(
+            "unsupported optimizer_source="
+            f"{config.optimizer_source!r}; expected one of: {allowed}"
+        )
     if config.vocab_size is not None and config.vocab_size < 2:
         raise ValueError("vocab_size must be at least 2")
     if config.eval_batches < 0:
@@ -765,6 +813,85 @@ def compile_payload(config: TrainHybridTinyConfig, device: dict[str, Any]) -> di
     }
 
 
+def training_optimizer_payload(config: TrainHybridTinyConfig) -> dict[str, Any]:
+    if config.optimizer == "adamw":
+        return {
+            "name": "adamw",
+            "source": config.optimizer_source,
+            "class": ADAMW_FP32_MOMENTS_CLASS,
+            "factory": ADAMW_FP32_MOMENTS_SOURCE,
+            "learning_rate": config.learning_rate,
+            "weight_decay": config.weight_decay,
+            "groups": {
+                "adamw": {
+                    "learning_rate": config.learning_rate,
+                    "weight_decay": config.weight_decay,
+                    "betas": [0.9, 0.999],
+                    "moment_dtype": "float32",
+                },
+            },
+        }
+    if config.optimizer == "muon":
+        ns_carrier = os.environ.get(MUON_NS_CARRIER_ENV, "fp32")
+        return {
+            "name": "muon",
+            "source": config.optimizer_source,
+            "class": MUON_ADAMW_MULTI_CLASS,
+            "factory": MUON_ADAMW_MULTI_SOURCE,
+            "learning_rate": config.learning_rate,
+            "weight_decay": config.weight_decay,
+            "cppmega_cuda_parity": False,
+            "groups": {
+                "muon": {
+                    "learning_rate": config.learning_rate,
+                    "momentum": 0.95,
+                    "nesterov": True,
+                    "ns_steps": 5,
+                    "ns_carrier": ns_carrier,
+                    "weight_decay": config.weight_decay,
+                },
+                "adamw": {
+                    "learning_rate": 1e-4,
+                    "weight_decay": config.weight_decay,
+                    "betas": [0.9, 0.95],
+                    "moment_dtype": "float32",
+                },
+            },
+        }
+    raise ValueError(
+        f"unsupported optimizer={config.optimizer!r}; expected one of: "
+        f"{', '.join(OPTIMIZER_NAMES)}"
+    )
+
+
+def safe_training_optimizer_payload(config: TrainHybridTinyConfig) -> dict[str, Any]:
+    try:
+        return training_optimizer_payload(config)
+    except ValueError as exc:
+        return {
+            "name": config.optimizer,
+            "source": config.optimizer_source,
+            "error": str(exc),
+        }
+
+
+def make_training_optimizer(config: TrainHybridTinyConfig) -> Any:
+    if config.optimizer == "adamw":
+        return make_adamw(
+            learning_rate=config.learning_rate,
+            weight_decay=config.weight_decay,
+        )
+    if config.optimizer == "muon":
+        return make_muon(
+            lr_muon=config.learning_rate,
+            weight_decay=config.weight_decay,
+        )
+    raise ValueError(
+        f"unsupported optimizer={config.optimizer!r}; expected one of: "
+        f"{', '.join(OPTIMIZER_NAMES)}"
+    )
+
+
 def memory_limit_payload(
     config: TrainHybridTinyConfig,
     *,
@@ -895,6 +1022,32 @@ def metadata_batch_cursor_offset(
             "batch_cursor.global_batch_offset must be a non-negative integer"
         )
     return value
+
+
+def validate_resume_training_optimizer(
+    metadata: dict[str, Any],
+    config: TrainHybridTinyConfig,
+    *,
+    source: Path,
+) -> None:
+    payload = metadata.get("training_optimizer")
+    if payload is None:
+        return
+    if not isinstance(payload, dict):
+        raise ValueError(
+            f"checkpoint metadata {source}: training_optimizer must be an object"
+        )
+    checkpoint_optimizer = payload.get("name")
+    if not isinstance(checkpoint_optimizer, str) or not checkpoint_optimizer:
+        raise ValueError(
+            f"checkpoint metadata {source}: training_optimizer.name must be a string"
+        )
+    if checkpoint_optimizer != config.optimizer:
+        raise ValueError(
+            "checkpoint optimizer "
+            f"{checkpoint_optimizer!r} does not match requested optimizer "
+            f"{config.optimizer!r}"
+        )
 
 
 def assert_finite_metric(name: str, value: Any) -> None:
@@ -1087,6 +1240,7 @@ def checkpoint_metadata(
             "batch_cursor": cursor_payload,
         },
         "training_config": asdict(config),
+        "training_optimizer": training_optimizer_payload(config),
         "model_name": MODEL_NAME,
         "model_profile": config.model_profile,
         "model_source": MODEL_SOURCE,
@@ -1211,6 +1365,7 @@ def dry_run_payload(
     return {
         "status": "dry_run",
         "config": asdict(config),
+        "training_optimizer": training_optimizer_payload(config),
         "synthetic_npz": config.npz_path is None,
         "dataset": dataset_payload(dataset, config),
         "model_name": MODEL_NAME,
@@ -1259,6 +1414,11 @@ def train_hybrid_tiny(
                 resume_metadata_path.read_text()
             )
             resume_metadata = loaded_metadata
+            validate_resume_training_optimizer(
+                loaded_metadata,
+                config,
+                source=resume_metadata_path,
+            )
             resume_step = metadata_non_negative_int(
                 loaded_metadata,
                 "step",
@@ -1298,10 +1458,7 @@ def train_hybrid_tiny(
         if config.resume_from
         else None
     )
-    optimizer = make_adamw(
-        learning_rate=config.learning_rate,
-        weight_decay=config.weight_decay,
-    )
+    optimizer = make_training_optimizer(config)
 
     stepper = CompiledPretrainingStep(
         model,
@@ -1437,6 +1594,7 @@ def train_hybrid_tiny(
     return {
         "status": "ok",
         "config": asdict(config),
+        "training_optimizer": training_optimizer_payload(config),
         "synthetic_npz": config.npz_path is None,
         "dataset": dataset_payload(dataset, config),
         "model_name": MODEL_NAME,
@@ -1569,6 +1727,7 @@ def main(argv: list[str] | None = None) -> int:
             "error": str(exc),
             "error_type": type(exc).__name__,
             "config": asdict(config),
+            "training_optimizer": safe_training_optimizer_payload(config),
             "compile": config.compile,
             "device": device_info(),
         }

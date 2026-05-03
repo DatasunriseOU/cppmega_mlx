@@ -463,3 +463,82 @@ def test_kernel_adoption_gate_validates_thresholds() -> None:
         profile_mod.assess_kernel_adoption("x", [], min_samples=0)
     with pytest.raises(ValueError, match="top_n"):
         profile_mod.summarize_hotspots([], top_n=0)
+
+
+def test_profile_step_snapshots_kernel_dispatch_log() -> None:
+    from cppmega_mlx.runtime.kernel_policy import (
+        KernelPath,
+        clear_dispatch_log,
+        record_dispatch,
+    )
+
+    # Pre-populate the buffer; the profiler must clear at scope begin so we
+    # only see records emitted inside the scope.
+    clear_dispatch_log()
+    record_dispatch("sparse_mla", KernelPath.AUTO, "metal_kernel_fwd_v1")
+
+    with profile_step("kernel-dispatch", reset_peak=False, sync=False) as prof:
+        record_dispatch("mamba3_mimo", KernelPath.PATH_B, "metal_kernel_fwd_v1")
+        record_dispatch("sparse_mla", KernelPath.AUTO, "reference_pure_mlx")
+
+    payload = prof.metrics.to_dict()
+    json.dumps(payload)
+    dispatch = payload["kernel_dispatch"]
+    assert isinstance(dispatch, list)
+    assert dispatch == [
+        {
+            "op_name": "mamba3_mimo",
+            "path": "path_b",
+            "kernel_used": "metal_kernel_fwd_v1",
+        },
+        {
+            "op_name": "sparse_mla",
+            "path": "auto",
+            "kernel_used": "reference_pure_mlx",
+        },
+    ]
+
+
+def test_profile_step_kernel_dispatch_capture_can_be_disabled() -> None:
+    from cppmega_mlx.runtime.kernel_policy import (
+        KernelPath,
+        clear_dispatch_log,
+        get_dispatch_log,
+        record_dispatch,
+    )
+
+    clear_dispatch_log()
+    record_dispatch("sparse_mla", KernelPath.AUTO, "metal_kernel_fwd_v1")
+
+    with profile_step(
+        "no-dispatch", reset_peak=False, sync=False, capture_kernel_dispatch=False
+    ) as prof:
+        # The buffer must NOT be cleared at scope begin.
+        assert get_dispatch_log()  # still has the pre-existing record
+
+    payload = prof.metrics.to_dict()
+    assert payload["kernel_dispatch"] == []
+    # Cleanup so other tests start with an empty buffer.
+    clear_dispatch_log()
+
+
+def test_manual_profile_metrics_default_kernel_dispatch_empty() -> None:
+    memory = MemorySnapshot(
+        active_bytes=None,
+        peak_bytes=None,
+        cache_bytes=None,
+        available=False,
+    )
+    metrics = profile_mod.ProfileMetrics(
+        label="manual-no-dispatch",
+        seconds=1.0,
+        tokens=None,
+        tokens_per_second=None,
+        memory=memory,
+        peak_memory_reset=False,
+        synchronized=False,
+        evaluated=False,
+    )
+    payload = metrics.to_dict()
+    json.dumps(payload)
+    assert payload["kernel_dispatch"] == []

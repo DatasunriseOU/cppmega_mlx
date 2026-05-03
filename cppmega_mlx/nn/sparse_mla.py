@@ -214,16 +214,84 @@ def sparse_mla_attention(
     *,
     sm_scale: float | None = None,
     d_v: int | None = None,
-) -> mx.array:
-    """Convenience entry point used by callers that don't need lse."""
+    return_lse: bool = False,
+) -> mx.array | Tuple[mx.array, mx.array]:
+    """Production sparse-MLA entry point dispatched per :class:`KernelPath`.
 
+    Routing rules (controlled by ``CPPMEGA_KERNEL_PATH``):
+
+    - ``AUTO`` (default): use the Path B Metal kernel via
+      :func:`cppmega_mlx.nn._tilelang.sparse_mla_apply` when available; on
+      hosts without Metal eligibility fall back to the pure-MLX reference.
+    - ``REFERENCE``: always run the pure-MLX reference.
+    - ``PATH_B``: force the Metal kernel (raises if Metal is unavailable).
+    - ``PATH_C``: not yet implemented for sparse-MLA; raises
+      :class:`NotImplementedError`. (Path C is reserved for the TileLang DSL
+      lowering of mamba3 only — Path B is the production speedup here.)
+    """
+
+    # Lazy import to avoid pulling Metal kernels into the reference module
+    # when only the parity oracle is exercised.
+    from cppmega_mlx.nn._tilelang.sparse_mla import (
+        sparse_mla_apply as _sparse_mla_apply,
+        sparse_mla_metal_status as _sparse_mla_metal_status,
+    )
+    from cppmega_mlx.runtime.kernel_policy import (
+        KernelPath,
+        record_dispatch,
+        selected_path,
+    )
+
+    path = selected_path("sparse_mla")
+
+    if path is KernelPath.PATH_C:
+        raise NotImplementedError(
+            "sparse-MLA Path C not implemented; use Path B"
+        )
+
+    if path is KernelPath.REFERENCE:
+        record_dispatch("sparse_mla", path, "reference_pure_mlx")
+        return sparse_mla_attention_reference(
+            q,
+            kv,
+            indices,
+            sm_scale=sm_scale,
+            d_v=d_v,
+            return_lse=return_lse,
+        )
+
+    if path is KernelPath.PATH_B:
+        record_dispatch("sparse_mla", path, "metal_kernel_fwd_v1")
+        return _sparse_mla_apply(
+            q,
+            kv,
+            indices,
+            sm_scale=sm_scale,
+            d_v=d_v,
+            return_lse=return_lse,
+            force_metal=True,
+        )
+
+    # KernelPath.AUTO
+    status = _sparse_mla_metal_status(q, kv, indices)
+    if status.available:
+        record_dispatch("sparse_mla", path, "metal_kernel_fwd_v1")
+        return _sparse_mla_apply(
+            q,
+            kv,
+            indices,
+            sm_scale=sm_scale,
+            d_v=d_v,
+            return_lse=return_lse,
+        )
+    record_dispatch("sparse_mla", path, "reference_pure_mlx")
     return sparse_mla_attention_reference(
         q,
         kv,
         indices,
         sm_scale=sm_scale,
         d_v=d_v,
-        return_lse=False,
+        return_lse=return_lse,
     )
 
 

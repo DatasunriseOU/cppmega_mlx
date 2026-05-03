@@ -1,12 +1,14 @@
-# T.fp8_scaled_matmul intrinsic for TileLang (Metal + CUDA)
+# T.fp8_scaled_matmul macro baseline for TileLang (Metal + CUDA)
 
 ## Status
 
-**Done.** This patch ships a real, working T.fp8_scaled_matmul intrinsic
-that lowers correctly on Metal and CUDA. It replaces the earlier stub
-(which raised NotImplementedError on Metal) with a hygienic
-@T.macro that emits the audiohacking/fp8-mps-metal scaled-matmul
-algorithm directly into the @T.prim_func AST.
+**Correctness baseline, not the scheduler/MMA optimization.** This patch
+exposes `T.fp8_scaled_matmul(...)` as a hygienic `@T.macro` that lowers on
+Metal and CUDA by emitting the audiohacking/fp8-mps-metal scalar
+scaled-matmul algorithm directly into the `@T.prim_func` AST. It does **not**
+register a real TIR op in `src/op/builtin.cc`, does **not** add a Metal
+scheduler pass, and does **not** implement the proposed fast path
+`dequant FP8 -> FP16 threadgroup tile -> existing FP16 simdgroup MMA`.
 
 ## What ships
 
@@ -30,13 +32,22 @@ helper. See the "e4m3 subnormal correctness" section in
 docs/upstream/tilelang_metal_fp8/README.md for the byte-level
 analysis.
 
+## Apple Silicon / MLA motivation
+
+For Apple Silicon M4 / M4 Max MLA work, this macro gives TileLang programs a
+testable FP8 scaled-matmul surface with Metal lowering, xcrun compile checks,
+and parity against an independent audiohacking-style reference. That is useful
+for validating FP8 storage/decode and scale semantics before wiring a faster
+Metal scheduler path. It should not be presented as a measured FP8 simdgroup
+speedup.
+
 ## Algorithm
 
 The macro is a line-for-line port of the fp8_scaled_matmul_kernel body
 from [audiohacking/fp8-mps-metal](https://github.com/audiohacking/fp8-mps-metal)
 (commit d4fbd40c, MIT). The expansion inside a @T.prim_func is:
 
-python
+```python
 for i, j in T.Parallel(M, N):
     for k in T.serial(K):
         a = T.cast(A_fp8[i, k], "float32")        # FP8 byte -> fp32
@@ -45,6 +56,7 @@ for i, j in T.Parallel(M, N):
         sb = B_scale[0] if B_scale.shape == (1,) else B_scale[j]
         C_local[i, j] += a * b * sa * sb
 
+```
 
 Per-tensor vs per-row dispatch happens at macro-expansion time based on
 the static shape of the scale operand; the resulting MSL contains **no
@@ -76,17 +88,18 @@ in the FP8-to-fp32 cast helper:
 * **CPU** -- same scalar TIR; T.cast(fp8, fp32) lowers via TVM's CPU
   FP8 helpers.
 
-We chose the macro form (rather than registering a new TIR op via
-src/op/builtin.cc) because:
+We chose the macro form for this baseline (rather than registering a new TIR
+op via src/op/builtin.cc) because:
 
 1. The lowering is identical to T.gemm(fp8, fp8, fp32) plus a fused
    per-element scale; a registered op would just call back into the
    existing GemmMetalScalar machinery with a wrapped body. The macro
    skips the round-trip.
-2. Metal has no native FP8 ALU through the M5 generation (Apple WWDC 2025
-   cooperative tensors session), so the inner loop is necessarily scalar.
-   There is no MMA path to switch into, so the multi-target TIR-op
-   dispatcher we'd need would have only one implementation today.
+2. This patch does not implement the separate Metal scheduler path that would
+   dequantize FP8 into half threadgroup tiles and feed the existing FP16
+   simdgroup MMA emitter. Until that exists, the validated lowering path here
+   is scalar dequant + fp32 fma, and the tests explicitly assert that no
+   `simdgroup_multiply_accumulate` is emitted for this macro.
 3. Macro form means **no C++ rebuild** for the surface API. This patch
    is pure Python; the e4m3 decode helper already ships with the
    correct biased exponent in patch #5
@@ -260,20 +273,23 @@ These items are explicitly out of scope for this PR but tracked here:
 
 ## How to apply
 
-bash
+```bash
 cd /tmp/tilelang_apple_head/tilelang
 # Pre-req: storage-only FP8 patch + auto-dequant dispatcher + vector cast.
 git apply /Volumes/external/sources/cppmega.mlx/docs/upstream/tilelang_metal_fp8/0001-metal-fp8-storage-only.patch
-git apply /Volumes/external/sources/cppmega.mlx/docs/upstream/tilelang_metal_fp8_gemm/0001-metal-fp8-gemm.patch
+git apply /Volumes/external/sources/cppmega.mlx/docs/upstream/tilelang_metal_fp8_gemm/0001-metal-fp8-gemm-software-path.patch
 git apply /Volumes/external/sources/cppmega.mlx/docs/upstream/tilelang_metal_fp8_vector/0001-metal-fp8-vector-cast.patch
 git apply /Volumes/external/sources/cppmega.mlx/docs/upstream/tilelang_metal_fp8_scaled_matmul/0001-tilelang-fp8-scaled-matmul-intrinsic.patch
-# Rebuild C++ to pick up the e4m3 subnormal decode fix.
+# Rebuild C++ once for the storage-only/vector FP8 prerequisites.
 cd build && cmake --build . -j 8
 
+```
 
 The patch applies cleanly with git apply --check against the post-Agent-F-1
 state of the tilelang tree (commit a69d6df7 in the
-cppmega/gemm-mixed-dtype-metal branch).
+cppmega/gemm-mixed-dtype-metal branch). Re-run that clean-apply check before
+filing; this README is not evidence that the artifact applies to public
+`tile-ai/tilelang` `main`.
 
 ## Attribution
 

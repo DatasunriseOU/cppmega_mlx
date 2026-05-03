@@ -179,6 +179,7 @@ class ProfileMetrics:
     synchronized: bool
     evaluated: bool
     extra: Mapping[str, Any] = field(default_factory=dict)
+    kernel_dispatch: tuple[Mapping[str, str], ...] = ()
 
     @property
     def peak_memory_bytes(self) -> int | None:
@@ -208,6 +209,7 @@ class ProfileMetrics:
             "synchronized": self.synchronized,
             "evaluated": self.evaluated,
             "extra": _json_safe_mapping(self.extra),
+            "kernel_dispatch": [dict(entry) for entry in self.kernel_dispatch],
         }
 
 
@@ -589,6 +591,7 @@ class StepProfiler:
         reset_peak: bool = True,
         sync: bool = True,
         extra: Mapping[str, Any] | None = None,
+        capture_kernel_dispatch: bool = True,
     ) -> None:
         if tokens is not None and tokens < 0:
             raise ValueError("tokens must be non-negative")
@@ -597,6 +600,7 @@ class StepProfiler:
         self.reset_peak = reset_peak
         self.sync = sync
         self.extra = _json_safe_mapping(extra or {})
+        self.capture_kernel_dispatch = capture_kernel_dispatch
         self._eval_args = list(eval_args)
         self._start: float | None = None
         self._peak_memory_reset = False
@@ -615,6 +619,11 @@ class StepProfiler:
         self._eval_args.extend(args)
 
     def __enter__(self) -> "StepProfiler":
+        if self.capture_kernel_dispatch:
+            # Reset the dispatch log so this scope's receipt is clean.
+            from cppmega_mlx.runtime.kernel_policy import clear_dispatch_log
+
+            clear_dispatch_log()
         if self.reset_peak:
             self._peak_memory_reset = reset_peak_memory()
         if self.sync:
@@ -641,6 +650,15 @@ class StepProfiler:
             if self.tokens is not None and elapsed > 0
             else None
         )
+        if self.capture_kernel_dispatch:
+            from cppmega_mlx.runtime.kernel_policy import get_dispatch_log
+
+            kernel_dispatch = tuple(
+                {str(k): str(v) for k, v in entry.items()}
+                for entry in get_dispatch_log()
+            )
+        else:
+            kernel_dispatch = ()
         self._metrics = ProfileMetrics(
             label=self.label,
             seconds=elapsed,
@@ -651,6 +669,7 @@ class StepProfiler:
             synchronized=self._start_synchronized or end_synchronized,
             evaluated=evaluated,
             extra=self.extra,
+            kernel_dispatch=kernel_dispatch,
         )
         return None
 
@@ -663,8 +682,16 @@ def profile_step(
     reset_peak: bool = True,
     sync: bool = True,
     extra: Mapping[str, Any] | None = None,
+    capture_kernel_dispatch: bool = True,
 ) -> StepProfiler:
-    """Return a profiling context manager for one train/eval step."""
+    """Return a profiling context manager for one train/eval step.
+
+    When ``capture_kernel_dispatch`` is True (default), the profiler clears
+    :func:`cppmega_mlx.runtime.kernel_policy.get_dispatch_log` at scope begin
+    and snapshots it at scope exit, so the resulting :class:`ProfileMetrics`
+    records the per-op kernel paths actually dispatched during the measured
+    step. This is the "evidence" half of the kernel adoption gate.
+    """
 
     return StepProfiler(
         label,
@@ -673,6 +700,7 @@ def profile_step(
         reset_peak=reset_peak,
         sync=sync,
         extra=extra,
+        capture_kernel_dispatch=capture_kernel_dispatch,
     )
 
 

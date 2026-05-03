@@ -2,8 +2,8 @@
 
 ## Packaging status
 
-Regenerated 2026-05-03; round-trip verified against a fresh apple-head@7f4a5cb8
-checkout with the storage-only FP8 patch (#5) applied:
+Regenerated 2026-05-03; the recorded round-trip receipt was against an
+apple-head@7f4a5cb8 checkout with the storage-only FP8 patch (#5) applied:
 
 ```
 git apply --check  docs/upstream/tilelang_metal_fp8_vector/0001-metal-fp8-vector-cast.patch  -> OK
@@ -19,6 +19,11 @@ Stack-apply order (against clean apple-head@7f4a5cb8):
    extends the FP8 prelude added by #5; both touch the same files in
    src/target/codegen_metal.{cc,h} and 3rdparty/tvm/src/target/source/codegen_metal.{cc,h})
 4. tilelang_metal_fp8_vector (#7) — this patch.
+
+Before filing, re-run the same `git apply --check` / `git apply --reverse
+--check` sequence on a fresh intended TileLang base. Do not file from this
+README alone if the current PR-prep lane still reports a corrupt-patch or
+line-73 apply failure; regenerate the patch from the clean checkout first.
 
 ## Blocker
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -66,12 +67,26 @@ def write_npz(
     np.savez(path, **arrays)
 
 
-def run_script(*args: str, timeout: int = 45) -> subprocess.CompletedProcess[str]:
+def run_script(
+    *args: str,
+    timeout: int = 45,
+    env: dict[str, str | None] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    process_env = os.environ.copy()
+    if env is None or "CPPMEGA_OPTIMIZER" not in env:
+        process_env.pop("CPPMEGA_OPTIMIZER", None)
+    if env is not None:
+        for key, value in env.items():
+            if value is None:
+                process_env.pop(key, None)
+            else:
+                process_env[key] = value
     return subprocess.run(
         [sys.executable, str(SCRIPT), *args],
         cwd=ROOT,
         text=True,
         capture_output=True,
+        env=process_env,
         timeout=timeout,
         check=False,
     )
@@ -191,6 +206,56 @@ def _load_json_result(result: subprocess.CompletedProcess[str]) -> dict[str, Any
     payload = json.loads(result.stdout)
     assert isinstance(payload, dict)
     return payload
+
+
+def _assert_training_optimizer(
+    payload: dict[str, Any],
+    *,
+    name: str,
+    source: str = "default",
+    learning_rate: float | None = None,
+    weight_decay: float | None = None,
+) -> None:
+    optimizer = payload["training_optimizer"]
+    assert optimizer["name"] == name
+    assert optimizer["source"] == source
+    if learning_rate is not None:
+        assert optimizer["learning_rate"] == learning_rate
+    if weight_decay is not None:
+        assert optimizer["weight_decay"] == weight_decay
+
+    groups = optimizer["groups"]
+    if name == "adamw":
+        assert optimizer["class"] == "cppmega_mlx.training.optimizers.AdamWFP32Moments"
+        assert optimizer["factory"] == "cppmega_mlx.training.optimizers.make_adamw"
+        assert groups == {
+            "adamw": {
+                "betas": [0.9, 0.999],
+                "learning_rate": optimizer["learning_rate"],
+                "moment_dtype": "float32",
+                "weight_decay": optimizer["weight_decay"],
+            },
+        }
+    elif name == "muon":
+        assert optimizer["class"] == "cppmega_mlx.training.optimizers.MuonAdamWMulti"
+        assert optimizer["factory"] == "cppmega_mlx.training.optimizers.make_muon"
+        assert optimizer["cppmega_cuda_parity"] is False
+        assert groups["muon"] == {
+            "learning_rate": optimizer["learning_rate"],
+            "momentum": 0.95,
+            "nesterov": True,
+            "ns_carrier": "fp32",
+            "ns_steps": 5,
+            "weight_decay": optimizer["weight_decay"],
+        }
+        assert groups["adamw"] == {
+            "betas": [0.9, 0.95],
+            "learning_rate": 1e-4,
+            "moment_dtype": "float32",
+            "weight_decay": optimizer["weight_decay"],
+        }
+    else:
+        raise AssertionError(f"unexpected optimizer under test: {name}")
 
 
 def _tiny_ngram_hash_args() -> list[str]:
@@ -461,6 +526,10 @@ def test_help_lists_hybrid_training_flags() -> None:
     assert "--valid-dataset-path" in result.stdout
     assert "--valid-dataset-format" in result.stdout
     assert "--eval-batches" in result.stdout
+    assert "--optimizer" in result.stdout
+    assert "adamw" in result.stdout
+    assert "muon" in result.stdout
+    assert "CPPMEGA_OPTIMIZER" in result.stdout
     assert "--memory-limit-total-bytes" in result.stdout
     assert "--apply-memory-limit-plan" in result.stdout
 
@@ -473,6 +542,9 @@ def test_dry_run_json_reports_synthetic_hybrid_plan() -> None:
     assert payload["status"] == "dry_run"
     assert payload["synthetic_npz"] is True
     assert payload["config"]["npz_path"] is None
+    assert payload["config"]["optimizer"] == "adamw"
+    assert payload["config"]["optimizer_source"] == "default"
+    _assert_training_optimizer(payload, name="adamw")
     assert payload["dataset"]["num_batches"] >= 1
     _assert_full_structure_contract(payload["dataset"])
     assert payload["model_source"] == "cppmega_mlx.models.hybrid_lm"
@@ -494,6 +566,58 @@ def test_dry_run_json_reports_synthetic_hybrid_plan() -> None:
         "mamba3": 1,
         "moe": 1,
     }
+
+
+def test_dry_run_json_selects_muon_from_cli() -> None:
+    result = run_script(
+        "--dry-run-json",
+        "--optimizer",
+        "muon",
+        "--lr",
+        "0.002",
+        "--weight-decay",
+        "0.01",
+    )
+
+    payload = _load_json_result(result)
+    assert payload["config"]["optimizer"] == "muon"
+    assert payload["config"]["optimizer_source"] == "cli"
+    _assert_training_optimizer(
+        payload,
+        name="muon",
+        source="cli",
+        learning_rate=0.002,
+        weight_decay=0.01,
+    )
+
+
+def test_dry_run_json_selects_muon_from_environment() -> None:
+    result = run_script(
+        "--dry-run-json",
+        env={"CPPMEGA_OPTIMIZER": "muon"},
+    )
+
+    payload = _load_json_result(result)
+    assert payload["config"]["optimizer"] == "muon"
+    assert payload["config"]["optimizer_source"] == "env"
+    _assert_training_optimizer(payload, name="muon", source="env")
+
+
+def test_invalid_optimizer_env_returns_error_json() -> None:
+    result = run_script(
+        "--json",
+        env={"CPPMEGA_OPTIMIZER": "lion"},
+    )
+
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "error"
+    assert payload["error_type"] == "ValueError"
+    assert "unsupported optimizer='lion'" in payload["error"]
+    assert payload["config"]["optimizer"] == "lion"
+    assert payload["config"]["optimizer_source"] == "env"
+    assert payload["training_optimizer"]["name"] == "lion"
+    assert "unsupported optimizer='lion'" in payload["training_optimizer"]["error"]
 
 
 def test_dry_run_json_reports_memory_limit_plan_without_applying() -> None:
@@ -1288,6 +1412,7 @@ def test_checkpoint_save_and_resume_reports_hybrid_cursor(tmp_path: Path) -> Non
     assert first.returncode == 0, first.stderr
     first_payload = json.loads(first.stdout)
     assert first_payload["status"] == "ok"
+    _assert_training_optimizer(first_payload, name="adamw")
     assert first_payload["start_step"] == 0
     assert first_payload["end_step"] == 1
     assert first_payload["checkpoints"]["saved"][0]["step"] == 1
@@ -1302,6 +1427,7 @@ def test_checkpoint_save_and_resume_reports_hybrid_cursor(tmp_path: Path) -> Non
     assert manifest["batch_cursor"]["global_batch_offset"] == 1
     assert manifest["batch_cursor"]["batch_offset"] == 1
     assert manifest["optimizer"]["present"] is True
+    _assert_training_optimizer(manifest, name="adamw")
     assert manifest["model_config"]["pattern"] == "AEMR"
     _assert_snapshot_rng_contract(manifest)
     _assert_update_boundary_training_state(
@@ -1339,6 +1465,7 @@ def test_checkpoint_save_and_resume_reports_hybrid_cursor(tmp_path: Path) -> Non
     assert second.returncode == 0, second.stderr
     second_payload = json.loads(second.stdout)
     assert second_payload["status"] == "ok"
+    _assert_training_optimizer(second_payload, name="adamw")
     assert second_payload["resume"]["loaded"] is True
     assert second_payload["resume"]["step"] == 1
     assert second_payload["resume"]["trained_tokens"] == first_payload["trained_tokens"]
@@ -1354,6 +1481,7 @@ def test_checkpoint_save_and_resume_reports_hybrid_cursor(tmp_path: Path) -> Non
     )
     assert resumed_manifest["step"] == 2
     assert resumed_manifest["batch_cursor"]["global_batch_offset"] == 2
+    _assert_training_optimizer(resumed_manifest, name="adamw")
     _assert_snapshot_rng_contract(resumed_manifest)
     _assert_update_boundary_training_state(
         resumed_manifest,
@@ -1361,6 +1489,93 @@ def test_checkpoint_save_and_resume_reports_hybrid_cursor(tmp_path: Path) -> Non
         trained_tokens=second_payload["trained_tokens"],
         compiled=False,
     )
+
+
+def test_muon_checkpoint_receipt_and_resume_optimizer_mismatch_fail_closed(
+    tmp_path: Path,
+) -> None:
+    npz_path = tmp_path / "tokens.npz"
+    checkpoint_dir = tmp_path / "checkpoints"
+    write_npz(npz_path, vocab_size=32)
+
+    first = run_script(
+        str(npz_path),
+        "--json",
+        "--batch-size",
+        "2",
+        "--seq-len",
+        "4",
+        "--steps",
+        "1",
+        "--hidden-size",
+        "8",
+        "--num-attention-heads",
+        "1",
+        "--pattern",
+        "A",
+        "--depth",
+        "1",
+        "--optimizer",
+        "muon",
+        "--lr",
+        "0.002",
+        "--weight-decay",
+        "0.01",
+        "--checkpoint-dir",
+        str(checkpoint_dir),
+        "--checkpoint-save-interval",
+        "1",
+    )
+
+    first_payload = _load_json_result(first)
+    _assert_training_optimizer(
+        first_payload,
+        name="muon",
+        source="cli",
+        learning_rate=0.002,
+        weight_decay=0.01,
+    )
+
+    checkpoint_path = checkpoint_dir / "checkpoint-000001"
+    manifest = json.loads((checkpoint_path / "metadata.json").read_text())
+    _assert_training_optimizer(
+        manifest,
+        name="muon",
+        source="cli",
+        learning_rate=0.002,
+        weight_decay=0.01,
+    )
+
+    resumed = run_script(
+        str(npz_path),
+        "--json",
+        "--batch-size",
+        "2",
+        "--seq-len",
+        "4",
+        "--steps",
+        "1",
+        "--hidden-size",
+        "8",
+        "--num-attention-heads",
+        "1",
+        "--pattern",
+        "A",
+        "--depth",
+        "1",
+        "--optimizer",
+        "adamw",
+        "--resume-from",
+        str(checkpoint_path),
+    )
+
+    assert resumed.returncode == 2
+    payload = json.loads(resumed.stdout)
+    assert payload["status"] == "error"
+    assert payload["error_type"] == "ValueError"
+    assert "checkpoint optimizer 'muon'" in payload["error"]
+    assert "requested optimizer 'adamw'" in payload["error"]
+    _assert_training_optimizer(payload, name="adamw", source="cli")
 
 
 def test_resume_checkpoint_cursor_advances_from_nonzero_global_offset(

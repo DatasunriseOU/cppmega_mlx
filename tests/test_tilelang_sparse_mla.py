@@ -225,7 +225,11 @@ def test_reference_backward_finite() -> None:
 
 
 def test_reference_backward_against_finite_difference() -> None:
-    """Spot-check a single q entry's gradient via central finite differences."""
+    """Spot-check a single q entry's gradient via central finite differences.
+
+    Targets the pure-MLX reference explicitly (independent of the production
+    dispatcher) so the FD comparison stays at fp32 precision.
+    """
 
     rng = np.random.default_rng(4)
     B, S, H, D = 1, 4, 2, 8
@@ -243,7 +247,7 @@ def test_reference_backward_against_finite_difference() -> None:
     indices = mx.array(indices_np)
 
     def scalar_loss(q_in: mx.array) -> mx.array:
-        out = sparse_mla_attention(q_in, kv, indices, sm_scale=sm_scale)
+        out = sparse_mla_attention_reference(q_in, kv, indices, sm_scale=sm_scale)
         return mx.sum(out)
 
     grad_q = mx.grad(scalar_loss)(q)
