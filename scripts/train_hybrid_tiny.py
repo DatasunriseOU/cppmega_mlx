@@ -994,6 +994,7 @@ def memory_limit_payload(
             "plan": None,
             "previous_wired_limit_bytes": None,
             "previous_metal_limit_bytes": None,
+            "metal_limit_api_path": None,
         }
 
     total_bytes = config.memory_limit_total_bytes
@@ -1024,6 +1025,7 @@ def memory_limit_payload(
         "plan": plan.to_dict(),
         "previous_wired_limit_bytes": applied.previous_wired_limit_bytes,
         "previous_metal_limit_bytes": applied.previous_metal_limit_bytes,
+        "metal_limit_api_path": applied.metal_limit_api_path,
     }
 
 

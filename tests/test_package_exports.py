@@ -147,6 +147,12 @@ def test_package_roots_expose_local_mlx_contracts() -> None:
         "squared_relu_reference",
         "squared_relu_training_status",
     } <= _assert_public_exports(kernels)
+    assert recipes.MODEL_FACTORY_UPSTREAM_RECIPE_MODULE == "cppmega.recipes.run_profiles"
+    assert recipes.NAM56R_FULL_UPSTREAM_RECIPE_NAME == "h200_dsa_9_4_m"
+    assert recipes.get_model_profile("nam56r_full").upstream_recipe_name == (
+        "h200_dsa_9_4_m"
+    )
+    assert not hasattr(recipes, "nam56r_full")
 
 
 def test_data_root_reexports_fim_transform_and_tokenizer_contract() -> None:

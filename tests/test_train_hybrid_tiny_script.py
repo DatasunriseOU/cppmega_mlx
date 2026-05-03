@@ -693,6 +693,7 @@ def test_dry_run_json_reports_memory_limit_plan_without_applying() -> None:
     assert memory_limit["mode"] == "planned"
     assert memory_limit["apply_requested"] is True
     assert memory_limit["applied"] is False
+    assert memory_limit["metal_limit_api_path"] is None
     assert memory_limit["total_bytes_source"] == "cli"
     assert memory_limit["plan"] == {
         "metal_limit_bytes": 1500,

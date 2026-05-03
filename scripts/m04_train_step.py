@@ -368,6 +368,13 @@ def _run_existing_training(args: argparse.Namespace, *, data_path: Path) -> tupl
     except Exception as exc:
         return blocked_receipt(args, str(exc), type(exc).__name__), 0 if args.dry_run_json else 2
     if config.model_profile == REQUIRED_MODEL_PROFILE:
+        if args.dry_run_json:
+            receipt = local_gb10_quarter_metadata_dry_run_receipt(
+                args,
+                config=config,
+                data_path=data_path,
+            )
+            return enforce_loss_decrease_requirement(args, receipt)
         return (
             blocked_receipt(
                 args,
@@ -406,9 +413,22 @@ def _run_existing_training(args: argparse.Namespace, *, data_path: Path) -> tupl
         memory_after=memory_after,
     )
     if args.require_loss_decrease and not receipt["training"]["loss_decreased"]:
+        return enforce_loss_decrease_requirement(args, receipt)
+    return receipt, 0
+
+
+def enforce_loss_decrease_requirement(
+    args: argparse.Namespace,
+    receipt: dict[str, Any],
+) -> tuple[dict[str, Any], int]:
+    training = receipt.get("training")
+    if not isinstance(training, dict):
+        training = {}
+        receipt["training"] = training
+    if args.require_loss_decrease and not bool(training.get("loss_decreased")):
         receipt["status"] = "failed"
-        receipt["training"]["loss_decrease_required"] = True
-        receipt["training"]["loss_decrease_satisfied"] = False
+        training["loss_decrease_required"] = True
+        training["loss_decrease_satisfied"] = False
         return receipt, 2
     return receipt, 0
 
@@ -946,6 +966,185 @@ def grad_checkpoint_payload(
             observed_enabled if GRAD_CHECKPOINT_EXPECTATION["required"] else True
         ),
     }
+
+
+def metadata_only_optimizer_identity(
+    config: TrainHybridTinyConfig | argparse.Namespace,
+) -> dict[str, Any]:
+    return optimizer_identity(
+        config,
+        optimizer_updated=False,
+        master_moment_evidence={
+            "required_dtype": REQUIRED_ADAMW_MASTER_MOMENT_DTYPE,
+            "observed_parameter_dtype": None,
+            "observed_moment_dtypes": {},
+            "optimizer_class": OBSERVED_OPTIMIZER_IDENTITY["class"],
+            "optimizer_base_class": OBSERVED_OPTIMIZER_IDENTITY["base_class"],
+            "state_keys": [],
+            "ok": False,
+            "skipped": True,
+            "reason": "metadata-only dry-run does not allocate optimizer state",
+        },
+    )
+
+
+def local_gb10_quarter_metadata_dry_run_receipt(
+    args: argparse.Namespace,
+    *,
+    config: TrainHybridTinyConfig,
+    data_path: Path,
+) -> dict[str, Any]:
+    """Emit a metadata-only preflight receipt for the full M0.4 target profile.
+
+    The opt-in allocation probe may instantiate parameters. This route never
+    runs forward/training or allocates optimizer state.
+    """
+
+    local_gb10_preflight = local_gb10_quarter_preflight_from_args(args)
+    optimizer = metadata_only_optimizer_identity(config)
+    grad_checkpoint = grad_checkpoint_payload(config)
+    memory_snapshot = metal_memory_payload()
+    device = device_info()
+    commit = git_commit()
+    acceptance_gate = acceptance_gate_payload(
+        data_path=str(data_path),
+        data_format=config.data_format,
+        dtype=config.dtype,
+        dataset=None,
+        steps_requested=config.steps,
+        steps_completed=0,
+        loss_decreased=False,
+        all_finite=False,
+        optimizer_updated=False,
+        model_name=None,
+        model_source=None,
+        model_config=None,
+        optimizer=optimizer,
+        grad_checkpoint=grad_checkpoint,
+        device=device,
+        local_gb10_quarter_preflight=local_gb10_preflight,
+    )
+    receipt = {
+        "receipt_schema_version": RECEIPT_SCHEMA_VERSION,
+        "receipt_scope": RECEIPT_SCOPE,
+        "status": "dry_run",
+        "issue": {
+            "id": "cppmega-mlx-t8f.4",
+            "title": "M0.4: one bf16 training step + 100-step loss decrease on local parquet samples",
+        },
+        "local_only": True,
+        "gb10_training_correctness_claim": False,
+        "m4_vs_gb10_throughput_parity_claim": False,
+        "full_m0_4_acceptance_claim": False,
+        "acceptance_blockers": list(OPEN_M0_BLOCKERS),
+        "local_gb10_quarter_preflight": local_gb10_preflight,
+        "acceptance_gate": acceptance_gate,
+        "workload": {
+            "target_data_path": target_dataset_path(),
+            "data_path": str(data_path),
+            "data_format": config.data_format,
+            "synthetic": bool(args.synthetic),
+            "dtype": config.dtype,
+            "steps_requested": config.steps,
+            "batch_size": config.batch_size,
+            "seq_len": config.seq_len,
+            "tokens_per_step": config.batch_size * max(config.seq_len - 1, 0),
+            "compile_requested": config.compile,
+            "model_profile": config.model_profile,
+            "grad_checkpoint": config.grad_checkpoint,
+            "mode": "metadata_only_no_forward_no_training",
+            "require_loss_decrease": bool(args.require_loss_decrease),
+            "memory_limit_total_bytes": args.memory_limit_total_bytes,
+            "memory_limit_wired_ratio": args.memory_limit_wired_ratio,
+            "memory_limit_metal_ratio": args.memory_limit_metal_ratio,
+            "apply_memory_limit_plan": bool(args.apply_memory_limit_plan),
+            "clear_cache_every_steps": args.clear_cache_every_steps,
+            "probe_local_gb10_quarter_allocation": bool(
+                args.probe_local_gb10_quarter_allocation
+            ),
+        },
+        "training": {
+            "steps_completed": 0,
+            "optimizer_updated": False,
+            "optimizer": optimizer,
+            "grad_checkpoint": grad_checkpoint,
+            "all_finite": False,
+            "losses": [],
+            "initial_loss": None,
+            "final_loss": None,
+            "mean_loss": None,
+            "loss_decreased": False,
+            "loss_decrease_required": bool(args.require_loss_decrease),
+            "loss_decrease_satisfied": False,
+            "trained_tokens": 0,
+            "step_metrics": [],
+        },
+        "timing": {
+            "step_times_s": [],
+            "mean_step_time_s": None,
+            "median_step_time_s": None,
+            "tokens_per_second": None,
+        },
+        "memory": {
+            "before": memory_snapshot,
+            "after": memory_snapshot,
+            "peak_memory_bytes": memory_snapshot.get("peak_memory_bytes"),
+            "memory_limit": None,
+            "memory_limit_api_status": memory_limit_api_status(mx).to_dict(),
+            "applied_memory_limit_api_path": None,
+            "clear_cache_every_steps": args.clear_cache_every_steps,
+            "clear_cache_cadence_recorded": args.clear_cache_every_steps is not None,
+            "clear_cache_events": [],
+            "clear_cache_event_count": 0,
+            "clear_cache_event": None,
+            "clear_cache_event_recorded": False,
+            "clear_cache_event_scope": None,
+            "trainer_memory": None,
+        },
+        "dataset": {},
+        "model": {
+            "source": None,
+            "name": None,
+            "observed_source": None,
+            "observed_name": None,
+            "required_source": REQUIRED_MODEL_SOURCE,
+            "required_name": REQUIRED_MODEL_PROFILE,
+            "required_profile": REQUIRED_MODEL_PROFILE,
+            "requested_profile": config.model_profile,
+            "profile": None,
+            "requested_profile_matches_required": (
+                config.model_profile == REQUIRED_MODEL_PROFILE
+            ),
+            "profile_matches_required": False,
+            "local_gb10_quarter_preflight": local_gb10_preflight,
+            "parameter_count": None,
+            "route_symbols": None,
+            "route_roles": None,
+            "backend_plan": None,
+            "config": None,
+            "metadata_only": True,
+            "forward_executed": False,
+            "training_executed": False,
+        },
+        "software": {
+            "git_commit": commit,
+            "device": device,
+        },
+        "baseline_row": {
+            "hardware": str(device.get("machine") or "local-mac"),
+            "commit": commit or "unknown",
+            "dtype": config.dtype,
+            "batch_size": config.batch_size,
+            "seq_len": config.seq_len,
+            "route": "metadata_only_no_forward_no_training",
+            "model": "metadata_only_no_observed_model",
+            "mode": "metadata_only_no_forward_no_training",
+            "tokens_per_second": 0.0,
+            "local_only": True,
+            "gb10_parity_claim": False,
+        },
+    }
+    return json_ready(receipt)
 
 
 def acceptance_gate_payload(

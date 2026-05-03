@@ -266,11 +266,23 @@ def assert_m04_receipt_contract(payload: dict[str, Any]) -> None:
         gate["fp32_adamw_master_moments_ok"]
     )
     assert payload["workload"]["dtype"] == "bfloat16"
-    assert payload["model"]["source"] == "cppmega_mlx.models.hybrid_lm"
-    assert payload["model"]["name"] == "HybridTinyLM"
-    assert payload["model"]["required_profile"] == "local_gb10_quarter"
-    assert payload["model"]["profile_matches_required"] is False
-    assert payload["model"]["local_gb10_quarter_preflight"] == preflight
+    model_payload = payload["model"]
+    if model_payload.get("metadata_only"):
+        assert payload["workload"]["mode"] == "metadata_only_no_forward_no_training"
+        assert model_payload["source"] is None
+        assert model_payload["name"] is None
+        assert model_payload["required_source"] == REQUIRED_MODEL_SOURCE
+        assert model_payload["required_profile"] == "local_gb10_quarter"
+        assert model_payload["profile_matches_required"] is False
+        assert model_payload["local_gb10_quarter_preflight"] == preflight
+        assert model_payload["forward_executed"] is False
+        assert model_payload["training_executed"] is False
+    else:
+        assert model_payload["source"] == "cppmega_mlx.models.hybrid_lm"
+        assert model_payload["name"] == "HybridTinyLM"
+        assert model_payload["required_profile"] == "local_gb10_quarter"
+        assert model_payload["profile_matches_required"] is False
+        assert model_payload["local_gb10_quarter_preflight"] == preflight
     assert payload["training"]["optimizer"]["name"] == "AdamW"
     assert payload["training"]["optimizer"]["class"] == (
         ADAMW_FP32_MOMENTS_CLASS
@@ -300,6 +312,16 @@ def assert_m04_receipt_contract(payload: dict[str, Any]) -> None:
         grad_checkpoint_expected
     )
     assert gate["grad_checkpoint_identity"]["ok"] is grad_checkpoint_expected
+    expected_model = (
+        "metadata_only_no_observed_model"
+        if model_payload.get("metadata_only")
+        else "HybridTinyLM"
+    )
+    expected_route = (
+        "metadata_only_no_forward_no_training"
+        if model_payload.get("metadata_only")
+        else model_payload["route_symbols"]
+    )
     assert payload["baseline_row"] == {
         "batch_size": payload["workload"]["batch_size"],
         "commit": payload["software"]["git_commit"] or "unknown",
@@ -308,47 +330,58 @@ def assert_m04_receipt_contract(payload: dict[str, Any]) -> None:
         "hardware": payload["baseline_row"]["hardware"],
         "local_only": True,
         "mode": payload["workload"]["mode"],
-        "model": "HybridTinyLM",
-        "route": payload["model"]["route_symbols"],
+        "model": expected_model,
+        "route": expected_route,
         "seq_len": payload["workload"]["seq_len"],
         "tokens_per_second": payload["timing"]["tokens_per_second"] or 0.0,
     }
 
 
-def test_checked_in_receipt_can_record_full_parquet_gate_without_m0_4_claim() -> None:
+def test_checked_in_receipt_records_metadata_only_preflight_without_m0_4_claim() -> None:
     payload = json.loads(BASELINE_RECEIPT.read_text())
 
     assert_m04_receipt_contract(payload)
-    assert payload["status"] == "ok"
-    assert payload["acceptance_gate"]["uses_full_target_dataset"] is True
-    assert payload["acceptance_gate"]["real_parquet_source_identity"]["ok"] is True
-    assert payload["acceptance_gate"]["full_target_dataset_100_step_completed"] is True
+    assert_local_gb10_metadata_dry_run_contract(payload)
+    assert payload["status"] == "dry_run"
+    assert payload["acceptance_gate"]["uses_full_target_dataset"] is False
+    assert payload["acceptance_gate"]["real_parquet_source_identity"]["ok"] is False
+    assert payload["acceptance_gate"]["full_target_dataset_100_step_completed"] is False
     assert payload["acceptance_gate"]["full_local_gb10_quarter_gate_completed"] is False
     assert payload["acceptance_gate"]["model_identity_ok"] is False
     assert payload["acceptance_gate"]["optimizer_identity_ok"] is True
-    assert payload["acceptance_gate"]["adamw_ok"] is True
-    assert payload["acceptance_gate"]["fp32_adamw_master_moments_ok"] is True
-    assert set(payload["acceptance_gate"]["observed_adamw_master_moment_dtypes"].values()) == {
-        "float32"
-    }
+    assert payload["acceptance_gate"]["adamw_ok"] is False
+    assert payload["acceptance_gate"]["fp32_adamw_master_moments_ok"] is False
+    assert payload["acceptance_gate"]["observed_adamw_master_moment_dtypes"] == {}
     assert payload["acceptance_gate"]["grad_checkpoint_expectation_ok"] is False
     assert payload["acceptance_gate"]["m4_runtime_metadata_ok"] is True
     assert set(payload["acceptance_gate"]["full_local_gb10_quarter_gate_blockers"]) == {
-        "model_identity_ok",
+        "adamw_ok",
+        "all_finite_ok",
+        "dataset_format_ok",
+        "dataset_name_ok",
+        "fp32_adamw_master_moments_ok",
         "grad_checkpoint_expectation_ok",
+        "local_gb10_quarter_preflight_ok",
+        "loss_decrease_ok",
+        "loss_fields_ok",
+        "model_identity_ok",
+        "optimizer_update_ok",
+        "real_parquet_source_identity_ok",
+        "step_count_ok",
+        "target_parquet_path_ok",
     }
-    assert payload["acceptance_gate"]["full_target_dataset_blocker"] is None
-    assert payload["workload"]["data_format"] == "parquet"
-    assert payload["workload"]["data_path"] == (
-        "data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet"
-    )
-    assert payload["training"]["steps_completed"] >= 100
-    assert payload["training"]["all_finite"] is True
-    assert payload["training"]["optimizer_updated"] is True
+    assert payload["acceptance_gate"]["full_target_dataset_blocker"]
+    assert payload["workload"]["synthetic"] is True
+    assert payload["workload"]["data_format"] == "npz"
+    assert payload["workload"]["mode"] == "metadata_only_no_forward_no_training"
+    assert payload["training"]["steps_completed"] == 0
+    assert payload["training"]["all_finite"] is False
+    assert payload["training"]["optimizer_updated"] is False
     assert payload["training"]["optimizer"]["name"] == "AdamW"
     assert payload["training"]["grad_checkpoint"]["observed_enabled"] is False
-    assert payload["training"]["final_loss"] < payload["training"]["initial_loss"]
-    assert payload["baseline_row"]["model"] == "HybridTinyLM"
+    assert payload["training"]["final_loss"] is None
+    assert payload["training"]["initial_loss"] is None
+    assert payload["baseline_row"]["model"] == "metadata_only_no_observed_model"
     assert {item["id"] for item in payload["acceptance_blockers"]} == {
         "cppmega-mlx-t8f.4.local_gb10_quarter_gate",
     }
@@ -445,14 +478,78 @@ def test_missing_dataset_dry_run_reports_blocked_receipt(tmp_path: Path) -> None
     assert payload["acceptance_gate"]["full_local_gb10_quarter_gate_completed"] is False
 
 
-def test_local_gb10_quarter_dry_run_fails_closed_before_tiny_route(
+def assert_local_gb10_metadata_dry_run_contract(payload: dict[str, Any]) -> None:
+    status = payload["status"]
+    assert status in {"dry_run", "failed"}
+    assert payload["receipt_schema_version"] == 1
+    assert payload["receipt_scope"] == "local_mlx_m04_train_step"
+    assert payload["local_only"] is True
+    assert payload["gb10_training_correctness_claim"] is False
+    assert payload["m4_vs_gb10_throughput_parity_claim"] is False
+    assert payload["full_m0_4_acceptance_claim"] is False
+    assert "blockers" not in payload
+    assert {item["id"] for item in payload["acceptance_blockers"]} == {
+        "cppmega-mlx-t8f.4.local_gb10_quarter_gate",
+    }
+    assert payload["workload"]["model_profile"] == "local_gb10_quarter"
+    assert payload["workload"]["mode"] == "metadata_only_no_forward_no_training"
+    assert payload["training"]["steps_completed"] == 0
+    assert payload["training"]["optimizer_updated"] is False
+    assert payload["training"]["losses"] == []
+    assert payload["training"]["optimizer"]["update_observed"] is False
+    assert payload["training"]["optimizer"]["master_moment_evidence"]["skipped"] is True
+    assert payload["model"]["source"] is None
+    assert payload["model"]["name"] is None
+    assert payload["model"]["observed_source"] is None
+    assert payload["model"]["observed_name"] is None
+    assert payload["model"]["required_source"] == REQUIRED_MODEL_SOURCE
+    assert payload["model"]["required_name"] == "local_gb10_quarter"
+    assert payload["model"]["requested_profile"] == "local_gb10_quarter"
+    assert payload["model"]["profile"] is None
+    assert payload["model"]["requested_profile_matches_required"] is True
+    assert payload["model"]["profile_matches_required"] is False
+    assert payload["model"]["metadata_only"] is True
+    assert payload["model"]["forward_executed"] is False
+    assert payload["model"]["training_executed"] is False
+    assert payload["baseline_row"]["model"] == "metadata_only_no_observed_model"
+    assert payload["baseline_row"]["tokens_per_second"] == 0.0
+    assert payload["baseline_row"]["local_only"] is True
+    assert payload["baseline_row"]["gb10_parity_claim"] is False
+    gate = payload["acceptance_gate"]
+    assert gate["required_model_profile"] == "local_gb10_quarter"
+    assert gate["observed_model_name"] is None
+    assert gate["observed_model_source"] is None
+    assert gate["model_identity_ok"] is False
+    assert gate["optimizer_update_ok"] is False
+    assert gate["adamw_ok"] is False
+    assert gate["full_target_dataset_100_step_completed"] is False
+    assert gate["full_local_gb10_quarter_gate_completed"] is False
+    assert {
+        "real_parquet_source_identity_ok",
+        "target_parquet_path_ok",
+        "dataset_name_ok",
+        "dataset_format_ok",
+        "model_identity_ok",
+        "optimizer_update_ok",
+        "loss_decrease_ok",
+        "loss_fields_ok",
+        "all_finite_ok",
+    }.issubset(set(gate["full_local_gb10_quarter_gate_blockers"]))
+
+
+def test_local_gb10_quarter_dry_run_is_metadata_only_preflight(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    def fail_dry_run(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
-        raise AssertionError("HybridTinyLM dry-run route must not be called")
+    def fail_route(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("training and dry-run routes must not be called")
 
-    monkeypatch.setattr(m04_train_step, "dry_run_payload", fail_dry_run)
+    def fail_allocation_probe(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("full local_gb10_quarter allocation must be opt-in")
+
+    monkeypatch.setattr(m04_train_step, "dry_run_payload", fail_route)
+    monkeypatch.setattr(m04_train_step, "train_hybrid_tiny", fail_route)
+    monkeypatch.setattr(m04_train_step, "local_gb10_quarter", fail_allocation_probe)
     args = m04_train_step.build_parser().parse_args(
         [
             "--synthetic",
@@ -467,15 +564,77 @@ def test_local_gb10_quarter_dry_run_fails_closed_before_tiny_route(
     payload, exit_code = m04_train_step.run_receipt(args)
 
     assert exit_code == 0
-    assert payload["status"] == "blocked"
-    assert payload["full_m0_4_acceptance_claim"] is False
-    assert payload["blockers"][0]["type"] == "unsupported_model_profile_route"
-    assert "HybridTinyLM smoke route" in payload["blockers"][0]["reason"]
-    assert payload["workload"]["model_profile"] == "local_gb10_quarter"
+    assert_local_gb10_metadata_dry_run_contract(payload)
     assert payload["workload"]["grad_checkpoint"] is False
-    assert payload["training"]["steps_completed"] == 0
+    assert payload["workload"]["probe_local_gb10_quarter_allocation"] is False
+    assert payload["local_gb10_quarter_preflight"]["allocation_attempted"] is False
+    assert payload["local_gb10_quarter_preflight"]["allocation_mode"] == (
+        "allocation_free_preflight"
+    )
+    assert payload["acceptance_gate"]["local_gb10_quarter_preflight_ok"] is False
     assert payload["acceptance_gate"]["full_local_gb10_quarter_gate_completed"] is False
-    assert payload["acceptance_gate"]["model_identity_ok"] is False
+
+
+def test_local_gb10_quarter_dry_run_require_loss_decrease_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def fail_route(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("training and dry-run routes must not be called")
+
+    monkeypatch.setattr(m04_train_step, "dry_run_payload", fail_route)
+    monkeypatch.setattr(m04_train_step, "train_hybrid_tiny", fail_route)
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--synthetic",
+            "--model-profile",
+            "local_gb10_quarter",
+            "--dry-run-json",
+            "--require-loss-decrease",
+            "--output",
+            str(tmp_path / "receipt.json"),
+        ]
+    )
+
+    payload, exit_code = m04_train_step.run_receipt(args)
+
+    assert exit_code == 2
+    assert_local_gb10_metadata_dry_run_contract(payload)
+    assert payload["status"] == "failed"
+    assert payload["training"]["loss_decreased"] is False
+    assert payload["training"]["loss_decrease_required"] is True
+    assert payload["training"]["loss_decrease_satisfied"] is False
+    assert payload["acceptance_gate"]["loss_decrease_ok"] is False
+    assert payload["acceptance_gate"]["full_local_gb10_quarter_gate_completed"] is False
+
+
+def test_local_gb10_quarter_dry_run_cli_writes_requested_output_only(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "m04_local_gb10_metadata.json"
+    baseline_before = (
+        BASELINE_RECEIPT.read_text(encoding="utf-8")
+        if BASELINE_RECEIPT.exists()
+        else None
+    )
+
+    result = run_script(
+        "--synthetic",
+        "--model-profile",
+        "local_gb10_quarter",
+        "--dry-run-json",
+        "--output",
+        str(output),
+        "--json",
+    )
+
+    payload = load_json_result(result)
+    assert json.loads(output.read_text(encoding="utf-8")) == payload
+    assert_local_gb10_metadata_dry_run_contract(payload)
+    if baseline_before is None:
+        assert not BASELINE_RECEIPT.exists()
+    else:
+        assert BASELINE_RECEIPT.read_text(encoding="utf-8") == baseline_before
 
 
 def test_local_gb10_quarter_training_fails_closed_before_tiny_route(
@@ -545,7 +704,7 @@ def test_local_gb10_quarter_grad_checkpoint_fails_closed_before_tiny_route(
     )
 
 
-def test_local_gb10_quarter_with_allocation_probe_still_fails_closed_before_tiny_route(
+def test_local_gb10_quarter_dry_run_with_allocation_probe_is_preflight_only(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -556,11 +715,12 @@ def test_local_gb10_quarter_with_allocation_probe_still_fails_closed_before_tiny
         probe_called = True
         return canonical_allocation_probe()
 
-    def fail_dry_run(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
-        raise AssertionError("HybridTinyLM dry-run route must not be called")
+    def fail_route(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("training and dry-run routes must not be called")
 
     monkeypatch.setattr(m04_train_step, "probe_local_gb10_quarter_allocation", fake_probe)
-    monkeypatch.setattr(m04_train_step, "dry_run_payload", fail_dry_run)
+    monkeypatch.setattr(m04_train_step, "dry_run_payload", fail_route)
+    monkeypatch.setattr(m04_train_step, "train_hybrid_tiny", fail_route)
     args = m04_train_step.build_parser().parse_args(
         [
             "--synthetic",
@@ -577,13 +737,9 @@ def test_local_gb10_quarter_with_allocation_probe_still_fails_closed_before_tiny
 
     assert probe_called is True
     assert exit_code == 0
-    assert payload["status"] == "blocked"
-    assert payload["full_m0_4_acceptance_claim"] is False
-    assert payload["blockers"][0]["type"] == "unsupported_model_profile_route"
-    assert payload["workload"]["model_profile"] == "local_gb10_quarter"
+    assert_local_gb10_metadata_dry_run_contract(payload)
     assert payload["workload"]["grad_checkpoint"] is False
     assert payload["workload"]["probe_local_gb10_quarter_allocation"] is True
-    assert payload["training"]["steps_completed"] == 0
     preflight = payload["local_gb10_quarter_preflight"]
     assert preflight["allocation_attempted"] is True
     assert preflight["allocation_ready"] is True
