@@ -1,0 +1,120 @@
+--- path_b_handwritten_msl_body
++++ path_c_lowered_msl
+@@ -1,72 +1,49 @@
+-// Inputs (all fp32 carriers after up-cast in Python wrapper):
+-    //   x      [B, T, H, P]
+-    //   B_proj [B, T, H, N]
+-    //   C_proj [B, T, H, N]
+-    //   z      [B, T, H, P]
+-    //   A      [B, T, H]    (log-decay; will be A * dt)
+-    //   dt     [B, T, H]
+-    //   D      [H]          (skip)
+-    //   h0     [B, H, P, N]
+-    // Outputs:
+-    //   y      [B, T, H, P]
+-    //   h_last [B, H, P, N]
+-    // Grid is launched with one thread per (b, h, p) lane and the time loop
+-    // runs sequentially inside the thread to preserve causal carry.
++// Function: fwd_kernel
++#include <metal_stdlib>
++using namespace metal;
+ 
+-    uint tid = thread_position_in_grid.x;
+-    uint total_lanes = uint(BATCH) * uint(HEADS) * uint(HEADDIM);
+-    if (tid >= total_lanes) {
+-        return;
++union __TVMArgUnion {
++ int v_int[2];
++};
++
++kernel void fwd_kernel(  device float* A [[ buffer(0) ]],
++  device float* B [[ buffer(1) ]],
++  device float* C [[ buffer(2) ]],
++  device float* D [[ buffer(3) ]],
++  device float* dt [[ buffer(4) ]],
++  device float* h0 [[ buffer(5) ]],
++  device float* h_last [[ buffer(6) ]],
++  device float* x [[ buffer(7) ]],
++  device float* y [[ buffer(8) ]],
++  device float* z [[ buffer(9) ]],
++  uint3 blockIdx [[threadgroup_position_in_grid]],
++  uint3 threadIdx [[thread_position_in_threadgroup]]
++) {
++  thread float h_state[64];
++  thread float y_acc[1];
++  for (int n = 0; n < 64; ++n) {
++    h_state[n] = h0[((((int)threadIdx.x) * 64) + n)];
++  }
++  for (int t = 0; t < 1024; ++t) {
++    float A_val = A[((((((int)threadIdx.x) >> 7) * 4096) + (t * 4)) + ((((int)threadIdx.x) & 127) >> 5))];
++    float dt_val = dt[((((((int)threadIdx.x) >> 7) * 4096) + (t * 4)) + ((((int)threadIdx.x) & 127) >> 5))];
++    float decay = exp((A_val * dt_val));
++    float x_val = x[((((((int)threadIdx.x) >> 7) * 131072) + (t * 128)) + (((int)threadIdx.x) & 127))];
++    float z_val = z[((((((int)threadIdx.x) >> 7) * 131072) + (t * 128)) + (((int)threadIdx.x) & 127))];
++    y_acc[0] = 0.000000e+00f;
++    for (int n_1 = 0; n_1 < 64; ++n_1) {
++      float new_h = ((decay * h_state[n_1]) + (x_val * B[(((((((int)threadIdx.x) >> 7) * 262144) + (t * 256)) + (((((int)threadIdx.x) & 127) >> 5) * 64)) + n_1)]));
++      h_state[n_1] = new_h;
++      y_acc[0] = (y_acc[0] + (new_h * C[(((((((int)threadIdx.x) >> 7) * 262144) + (t * 256)) + (((((int)threadIdx.x) & 127) >> 5) * 64)) + n_1)]));
+     }
+-    uint p = tid % uint(HEADDIM);
+-    uint h = (tid / uint(HEADDIM)) % uint(HEADS);
+-    uint b = tid / (uint(HEADDIM) * uint(HEADS));
++    float D_h = D[((((int)threadIdx.x) & 127) >> 5)];
++    float y_skipped = (y_acc[0] + (D_h * x_val));
++    float sig_z = (1.000000e+00f / (1.000000e+00f + exp((z_val * -1.000000e+00f))));
++    y[((((((int)threadIdx.x) >> 7) * 131072) + (t * 128)) + (((int)threadIdx.x) & 127))] = ((z_val * sig_z) * y_skipped);
++  }
++  for (int n_2 = 0; n_2 < 64; ++n_2) {
++    h_last[((((int)threadIdx.x) * 64) + n_2)] = h_state[n_2];
++  }
++}
+ 
+-    // Per-lane state lives in registers (size N), accumulated as fp32.
+-    float h_state[STATE];
+-    uint h_base = ((b * uint(HEADS) + h) * uint(HEADDIM) + p) * uint(STATE);
+-    for (uint n = 0; n < uint(STATE); ++n) {
+-        h_state[n] = float(h0[h_base + n]);
+-    }
+ 
+-    uint xz_stride_t = uint(HEADS) * uint(HEADDIM);
+-    uint bc_stride_t = uint(HEADS) * uint(STATE);
+-    uint adt_stride_t = uint(HEADS);
+-    uint xz_base = b * uint(SEQ) * xz_stride_t;
+-    uint bc_base = b * uint(SEQ) * bc_stride_t;
+-    uint adt_base = b * uint(SEQ) * adt_stride_t;
+-
+-    float D_h = float(D[h]);
+-
+-    for (uint t = 0; t < uint(SEQ); ++t) {
+-        uint xz_idx = xz_base + t * xz_stride_t + h * uint(HEADDIM) + p;
+-        uint bc_idx = bc_base + t * bc_stride_t + h * uint(STATE);
+-        uint adt_idx = adt_base + t * adt_stride_t + h;
+-
+-        float x_val = float(x[xz_idx]);
+-        float z_val = float(z[xz_idx]);
+-        float A_val = float(A[adt_idx]);
+-        float dt_val = float(dt[adt_idx]);
+-        float decay = exp(A_val * dt_val);
+-
+-        // Scan: h_state[n] = decay * h_state[n] + x_val * B_proj[n]
+-        // Output: y = sum(h_state[n] * C_proj[n]) + D_h * x_val
+-        //         y_gated = silu(z) * y
+-        float y_acc = 0.0f;
+-        for (uint n = 0; n < uint(STATE); ++n) {
+-            float B_val = float(B_proj[bc_idx + n]);
+-            float C_val = float(C_proj[bc_idx + n]);
+-            float new_h = decay * h_state[n] + x_val * B_val;
+-            h_state[n] = new_h;
+-            y_acc += new_h * C_val;
+-        }
+-        float y_skipped = y_acc + D_h * x_val;
+-        // SiLU: z * sigmoid(z)
+-        float sig_z = 1.0f / (1.0f + exp(-z_val));
+-        y[xz_idx] = T_OUT(z_val * sig_z * y_skipped);
+-    }
+-
+-    // Persist final state.
+-    for (uint n = 0; n < uint(STATE); ++n) {
+-        h_last[h_base + n] = T_OUT(h_state[n]);
+-    }
