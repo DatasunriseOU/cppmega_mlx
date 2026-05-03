@@ -142,11 +142,12 @@ launchers.
   Recorded receipts are 11/11 curated samples and 1000/1000 source-line samples
   byte-exact against GB10.
 
-### M0.3 Random-Init Forward Parity Manifest
+### M0.3 Random-Init Forward External Reference Manifest
 
-- Acceptance anchor: cppmega-mlx-t8f.3 / M0.3 requires seed-matched
-  local_gb10_quarter MLX and CUDA reference forwards, a fixed input batch,
-  and logits within rtol=1e-2, atol=1e-1.
+- External-reference anchor: cppmega-mlx-t8f.3 / M0.3 tracks
+  seed-matched local_gb10_quarter MLX and CUDA reference forwards, a fixed
+  input batch, and logits within rtol=1e-2, atol=1e-1. This is not a
+  Mac-local acceptance gate.
 - Fixed-input scaffold metadata: B=1, T=512, seed=3003,
   vocab=65536, and closure-required token SHA-256
   c645ca4053e5206dcbe58c13aa26f4a9e56c5aa2aee90a4d4778bbc9d9c33549.
@@ -168,7 +169,7 @@ launchers.
   required/provided path was absent, invalid means metadata/checksum/summary
   contract validation failed, and valid_not_evaluated means metadata was
   valid but logits were still not numerically compared. valid_not_evaluated
-  is not M0.3 acceptance and must still leave m0_3_closed=false.
+  is not external reference closure and must still leave m0_3_closed=false.
 - Current MLX coverage: cppmega_mlx/training/parity.py provides a
   fail-closed manifest builder for bench/parity/m03_random_init.json, and
   scripts/m03_forward_parity_manifest.py records either a blocked scaffold or

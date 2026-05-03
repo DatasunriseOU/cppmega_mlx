@@ -1,0 +1,119 @@
+{
+  "acceptance": {
+    "meets_state_compaction_gate": true,
+    "state_compaction_lower_bound": 3.0,
+    "state_compaction_ratio_fp32_over_quant": 3.9384614471112975,
+    "step_speedup_fp32_over_quant_median": 0.6802749342956121
+  },
+  "adam8bit": {
+    "optimizer_class": "Adam8bit",
+    "peak_memory_bytes": 28121674008,
+    "state_bytes": 3649184088,
+    "state_dtype_breakdown_bytes": {
+      "learning_rate": {
+        "float32": 4
+      },
+      "m_absmax": {
+        "float32": 28070684
+      },
+      "m_quant": {
+        "uint8": 1796521354
+      },
+      "step": {
+        "uint64": 8
+      },
+      "v_absmax": {
+        "float32": 28070684
+      },
+      "v_quant": {
+        "uint8": 1796521354
+      }
+    },
+    "state_gib": 3.398567520081997,
+    "step_ms": {
+      "iters": 3,
+      "max": 890.4879579786211,
+      "mean": 882.8948609686146,
+      "median": 885.2186249569058,
+      "min": 872.9779999703169,
+      "samples_ms": [
+        890.4879579786211,
+        885.2186249569058,
+        872.9779999703169
+      ],
+      "warmup": 1
+    }
+  },
+  "config": {
+    "batch_size": 1,
+    "block_size": 256,
+    "iters": 3,
+    "learning_rate": 0.0001,
+    "model_dtype": "bfloat16",
+    "model_profile": "local_gb10_quarter",
+    "param_bytes": 3593042708,
+    "param_count": 1796521354,
+    "param_gib": 3.346281785517931,
+    "quant_kind": "symmetric_int8_blockwise_v1",
+    "seq_len": 64,
+    "warmup": 1,
+    "weight_decay": 0.01
+  },
+  "fp32_moments_adamw": {
+    "optimizer_class": "AdamWFP32Moments",
+    "peak_memory_bytes": 26999881866,
+    "state_bytes": 14372170844,
+    "state_dtype_breakdown_bytes": {
+      "learning_rate": {
+        "float32": 4
+      },
+      "m": {
+        "float32": 7186085416
+      },
+      "step": {
+        "uint64": 8
+      },
+      "v": {
+        "float32": 7186085416
+      }
+    },
+    "state_gib": 13.385127153247595,
+    "step_ms": {
+      "iters": 3,
+      "max": 606.3542920164764,
+      "mean": 602.8543473221362,
+      "median": 602.1920419298112,
+      "min": 600.0167080201209,
+      "samples_ms": [
+        606.3542920164764,
+        600.0167080201209,
+        602.1920419298112
+      ],
+      "warmup": 1
+    }
+  },
+  "guards": {
+    "bitsandbytes_bit_exact_claim": false,
+    "first_call_compile_time_excluded": true,
+    "gb10_parity_claim": false,
+    "local_only": true,
+    "m4_vs_gb10_throughput_parity_claim": false
+  },
+  "kind": "cppmega.mlx.local_m4_adam8bit_state_receipt",
+  "machine": {
+    "cppmega_mlx": "0.1.0",
+    "machine": "arm64",
+    "metal_device_info": "{'resource_limit': 499000, 'max_buffer_length': 86586540032, 'architecture': 'applegpu_g16s', 'memory_size': 137438953472, 'max_recommended_working_set_size': 115448725504, 'device_name': 'Apple M4 Max'}",
+    "mlx": "0.31.1",
+    "platform": "macOS-26.4.1-arm64-arm-64bit-Mach-O",
+    "processor": "arm",
+    "python": "3.13.12"
+  },
+  "notes": [
+    "Local Apple Silicon receipt only; does not claim GB10 parity.",
+    "Adam8bit uses symmetric int8 blockwise quantization, not the bitsandbytes dynamic LUT.",
+    "AdamWFP32Moments needs ~14.4 GiB of optimizer state for 1.797B-param bf16 weights; pass --skip-fp32 if the host runs out of memory."
+  ],
+  "schema_version": 1,
+  "source_bead": "cppmega-mlx-adam8bit"
+}

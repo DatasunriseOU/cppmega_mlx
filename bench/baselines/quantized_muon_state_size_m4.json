@@ -1,0 +1,64 @@
+{
+  "config": {
+    "block_size": 256,
+    "cppmega_cuda_parity": true,
+    "do_step": true,
+    "model_profile": "local_gb10_quarter",
+    "scheme": "symmetric_int8_v1"
+  },
+  "delta": {
+    "muon_state_compression_ratio": 3.9384615119915116,
+    "muon_state_saved_bytes": 3914415120,
+    "muon_state_saved_gib": 3.6455831676721573,
+    "total_state_saved_bytes": 3914415120,
+    "total_state_saved_gib": 3.6455831676721573
+  },
+  "fp32_momentum": {
+    "adamw_state_bytes": 3879079004,
+    "adamw_state_gib": 3.612673845142126,
+    "cppmega_cuda_parity": true,
+    "elapsed_s": 6.85307920887135,
+    "muon_state_bytes": 5246545932,
+    "muon_state_gib": 4.886226665228605,
+    "peak_memory_after_init_bytes": 14026559272,
+    "peak_memory_after_init_gib": 13.063251294195652,
+    "peak_memory_after_step_bytes": 23333614848,
+    "peak_memory_after_step_gib": 21.731122255325317,
+    "quantize_momentum": false,
+    "total_state_bytes": 9125624936,
+    "total_state_gib": 8.498900510370731
+  },
+  "guards": {
+    "gb10_parity_claim": false,
+    "local_only": true,
+    "m4_vs_gb10_throughput_parity_claim": false
+  },
+  "int8_momentum": {
+    "adamw_state_bytes": 3879079004,
+    "adamw_state_gib": 3.612673845142126,
+    "cppmega_cuda_parity": true,
+    "elapsed_s": 7.114616082981229,
+    "muon_state_bytes": 1332130812,
+    "muon_state_gib": 1.240643497556448,
+    "peak_memory_after_init_bytes": 10116387368,
+    "peak_memory_after_init_gib": 9.421619929373264,
+    "peak_memory_after_step_bytes": 21552398280,
+    "peak_memory_after_step_gib": 20.07223505526781,
+    "quantize_momentum": true,
+    "total_state_bytes": 5211209816,
+    "total_state_gib": 4.853317342698574
+  },
+  "kind": "cppmega.mlx.local_m4_quantized_muon_momentum_state_receipt",
+  "machine": {
+    "machine": "arm64",
+    "platform": "macOS-26.4.1-arm64-arm-64bit-Mach-O",
+    "python": "3.13.12"
+  },
+  "notes": [
+    "Local Apple Silicon receipt only; does not claim GB10 parity.",
+    "Mirrors cppmega CUDA quantized_muon_momentum_update_multi_and_normalize_groups_ in megatron/core/optimizer/emerging_optimizers.py.",
+    "AdamW group is untouched (parallel work-stream owns Adam8bit)."
+  ],
+  "schema_version": 1,
+  "source_bead": "cppmega-mlx-quantized-muon-momentum"
+}

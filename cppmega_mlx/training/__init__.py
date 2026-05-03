@@ -41,7 +41,12 @@ from cppmega_mlx.training.checkpoint import (
     save_checkpoint,
 )
 from cppmega_mlx.training.eval import EvalMetrics, evaluate_batches
-from cppmega_mlx.training.loop import TrainStepResult, make_adamw, one_step_train
+from cppmega_mlx.training.loop import (
+    TrainStepResult,
+    assert_grad_dtype_matches_param_dtype,
+    make_adamw,
+    one_step_train,
+)
 from cppmega_mlx.training.loss import (
     next_token_cross_entropy,
     next_token_cross_entropy_mtp_loss,
@@ -77,14 +82,34 @@ from cppmega_mlx.training.stp_loss import (
     next_token_and_stp_loss,
 )
 from cppmega_mlx.training.optimizers import (
+    ADAM8BIT_CLASS,
+    ADAM8BIT_QUANT_KIND,
+    ADAM8BIT_SOURCE,
     ADAMW_BASE_CLASS,
     ADAMW_FP32_MOMENTS_CLASS,
     ADAMW_FP32_MOMENTS_SOURCE,
     ADAMW_MOMENT_STATE_KEYS,
+    Adam8bit,
     AdamWFP32Moments,
+    LionFP32Moments,
+    MUON_ADAMW_MULTI_CLASS,
+    MUON_ADAMW_MULTI_SOURCE,
+    MUON_QUANTIZED_MOMENTUM_BLOCK_SIZE,
+    MUON_QUANTIZED_MOMENTUM_SCHEME,
+    MuonAdamWMulti,
+    QuantizedMuonWithNSCarrier,
     adamw_moment_dtypes_ok,
     collect_adamw_moment_dtypes,
     dtype_name,
+    make_adam8bit,
+    make_lion,
+    make_muon,
+)
+from cppmega_mlx.training.distributed_optimizer import (
+    SUPPORTED_INNER_CLASSES as DISTRIBUTED_OPTIMIZER_SUPPORTED_INNER_CLASSES,
+    ZERO1_STREAM_F_POLICY,
+    DistributedZeRO1Optimizer,
+    make_distributed_optimizer,
 )
 from cppmega_mlx.training.mlx_lm_adapter import (
     MLX_LM_DENSE_BATCH_KEYS,
@@ -157,12 +182,30 @@ from cppmega_mlx.training.profile import (
 )
 
 __all__ = [
+    "ADAM8BIT_CLASS",
+    "ADAM8BIT_QUANT_KIND",
+    "ADAM8BIT_SOURCE",
     "ADAMW_BASE_CLASS",
     "ADAMW_FP32_MOMENTS_CLASS",
     "ADAMW_FP32_MOMENTS_SOURCE",
     "ADAMW_MOMENT_STATE_KEYS",
+    "Adam8bit",
     "adamw_moment_dtypes_ok",
     "AdamWFP32Moments",
+    "DISTRIBUTED_OPTIMIZER_SUPPORTED_INNER_CLASSES",
+    "DistributedZeRO1Optimizer",
+    "LionFP32Moments",
+    "make_adam8bit",
+    "make_distributed_optimizer",
+    "make_lion",
+    "make_muon",
+    "MUON_ADAMW_MULTI_CLASS",
+    "MUON_ADAMW_MULTI_SOURCE",
+    "MUON_QUANTIZED_MOMENTUM_BLOCK_SIZE",
+    "MUON_QUANTIZED_MOMENTUM_SCHEME",
+    "MuonAdamWMulti",
+    "QuantizedMuonWithNSCarrier",
+    "ZERO1_STREAM_F_POLICY",
     "archive_baseline_row",
     "baseline_filename",
     "BASELINE_ARCHIVE_KIND",
@@ -247,6 +290,7 @@ __all__ = [
     "TRAINING_ARGS_MEMORY_POLICY_FIELDS",
     "as_mlx_lm_loss_args",
     "as_mlx_lm_token_mapping",
+    "assert_grad_dtype_matches_param_dtype",
     "assess_kernel_adoption",
     "attach_mtp_head",
     "describe_mlx_lm_batch_route_metadata",

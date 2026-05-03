@@ -11,11 +11,28 @@ import mlx.nn as nn
 import mlx.optimizers as optim
 from mlx.utils import tree_flatten, tree_merge, tree_unflatten
 
+from cppmega_mlx.training._quantize_8bit import (
+    DEFAULT_BLOCK_SIZE as MUON_QUANTIZED_MOMENTUM_BLOCK_SIZE,
+    dequantize_dynamic_blockwise,
+    num_blocks as _quant_num_blocks,
+    quantize_dynamic_blockwise,
+)
+from cppmega_mlx.training.optimizers_quantized import (
+    ADAM8BIT_CLASS,
+    ADAM8BIT_QUANT_KIND,
+    ADAM8BIT_SOURCE,
+    Adam8bit,
+    make_adam8bit,
+)
+
 
 ADAMW_FP32_MOMENTS_CLASS = "cppmega_mlx.training.optimizers.AdamWFP32Moments"
 ADAMW_FP32_MOMENTS_SOURCE = "cppmega_mlx.training.optimizers.make_adamw"
 ADAMW_BASE_CLASS = "mlx.optimizers.AdamW"
 ADAMW_MOMENT_STATE_KEYS = ("m", "v")
+
+MUON_SCALAR_OPTIMIZERS = ("adamw", "adam8bit")
+MuonScalarOptimizer = Literal["adamw", "adam8bit"]
 
 MUON_BASE_CLASS = "mlx.optimizers.Muon"
 MUON_ADAMW_MULTI_CLASS = "cppmega_mlx.training.optimizers.MuonAdamWMulti"
@@ -23,6 +40,16 @@ MUON_ADAMW_MULTI_SOURCE = "cppmega_mlx.training.optimizers.make_muon"
 MUON_NS_CARRIER_ENV = "CPPMEGA_MUON_NS_CARRIER"
 MUON_NS_CARRIERS = ("fp32", "bf16")
 MuonNSCarrier = Literal["fp32", "bf16"]
+
+MUON_QUANTIZED_MOMENTUM_SCHEME = "symmetric_int8_v1"
+"""Codec identifier for the v1 symmetric int8 momentum mapping.
+
+Mirrors cppmega CUDA's
+``quantized_muon_momentum_update_multi_and_normalize_groups_`` per-256-block
+absmax layout in ``megatron/core/optimizer/emerging_optimizers.py``. The
+asymmetric / dynamic-range int8 path (mirroring bitsandbytes ``Adam8bit``
+LUT) is a follow-up: TODO once the symmetric path is locked in.
+"""
 
 EMBEDDING_LIKE_NAME_HINTS = ("embed", "embedding", "lm_head", "wte", "wpe")
 MAMBA_SCALAR_LEAVES = frozenset(
@@ -328,6 +355,122 @@ class MuonWithNSCarrier(optim.Muon):
         return updated.astype(parameter.dtype)
 
 
+class QuantizedMuonWithNSCarrier(MuonWithNSCarrier):
+    """Muon variant that stores the persistent momentum buffer as ``uint8``
+    payload + per-256-block fp32 absmax.
+
+    Mirrors cppmega CUDA's
+    ``quantized_muon_momentum_update_multi_and_normalize_groups_`` from
+    ``megatron/core/optimizer/emerging_optimizers.py``. Memory cost on the
+    Muon group drops from 4 B/param (fp32 momentum) to ~1.0156 B/param
+    (1 B uint8 + 4/256 B absmax). On a 1.797B-param model with ~73% of the
+    parameters routed to Muon (~1.31B), that is ~5.24 GiB -> ~1.33 GiB,
+    about 4 GiB freed for activations + reserve.
+
+    Critical invariant: only the *persistent* momentum buffer is quantized.
+    The Newton-Schulz orthogonalization carrier inside ``apply_single``
+    stays fp32 (or bf16, controlled by ``ns_carrier``) because the
+    iterative matrix-sign step needs that fidelity. The fp32 fast-path
+    inside the kernel is preserved: dequantize at start of the step,
+    perform the standard Muon math + NS in fp32, re-quantize at the end.
+
+    Codec is **symmetric int8** (``MUON_QUANTIZED_MOMENTUM_SCHEME ==
+    "symmetric_int8_v1"``). An asymmetric / dynamic-LUT variant matching
+    bitsandbytes ``Adam8bit`` is tracked as a follow-up TODO.
+    """
+
+    def __init__(
+        self,
+        learning_rate: float | Callable[[mx.array], mx.array],
+        momentum: float = 0.95,
+        weight_decay: float = 0.01,
+        nesterov: bool = True,
+        ns_steps: int = 5,
+        *,
+        ns_carrier: str = "fp32",
+        block_size: int = MUON_QUANTIZED_MOMENTUM_BLOCK_SIZE,
+    ) -> None:
+        super().__init__(
+            learning_rate=learning_rate,
+            momentum=momentum,
+            weight_decay=weight_decay,
+            nesterov=nesterov,
+            ns_steps=ns_steps,
+            ns_carrier=ns_carrier,
+        )
+        self.block_size = int(block_size)
+
+    def init_single(self, parameter: mx.array, state: dict[str, Any]) -> None:
+        # Bias 128 maps to signed 0 -> dequantizes to a zero-momentum buffer
+        # without keeping an fp32 zero around. Storing the absmax as zeros is
+        # also equivalent to a zero buffer (the dequant kernel multiplies by
+        # the per-block scale).
+        nb = _quant_num_blocks(int(parameter.size), self.block_size)
+        state["v_quant"] = mx.full(parameter.shape, 128, dtype=mx.uint8)
+        state["v_absmax"] = mx.zeros((nb,), dtype=mx.float32)
+
+    def apply_single(
+        self,
+        gradient: mx.array,
+        parameter: mx.array,
+        state: dict[str, Any],
+    ) -> mx.array:
+        # 1) Dequantize persistent momentum to fp32 for the inner math.
+        v_prev = dequantize_dynamic_blockwise(
+            state["v_quant"], state["v_absmax"], out_dtype=mx.float32
+        )
+
+        gradient_for_state = gradient.astype(mx.float32)
+        if self.weight_decay != 0:
+            gradient_for_state = gradient_for_state + self.weight_decay * parameter.astype(
+                mx.float32
+            )
+
+        # 2) Standard Muon momentum update in fp32.
+        v_new = self.momentum * v_prev + (1.0 - self.momentum) * gradient_for_state
+
+        if self.nesterov:
+            update = (
+                gradient_for_state * (1.0 - self.momentum) + v_new * self.momentum
+            )
+        else:
+            update = v_new
+
+        # 3) Re-quantize the *persistent* momentum buffer (and only that).
+        # The NS update path below operates on the un-quantized fp32 ``update``
+        # tensor so the matrix-sign iteration retains fp32 carrier fidelity.
+        v_q, v_absmax = quantize_dynamic_blockwise(v_new, self.block_size)
+        state["v_quant"] = v_q
+        state["v_absmax"] = v_absmax
+
+        # 4) Newton-Schulz on the fp32 update; carrier stays fp32 (or bf16
+        # via ns_carrier) -- never quantized. This matches cppmega CUDA.
+        lr = self.learning_rate.astype(mx.float32)
+        if update.ndim >= 2:
+            original_shape = update.shape
+            reshape_needed = update.ndim > 2
+
+            if reshape_needed:
+                update = mx.reshape(update, (update.shape[0], -1))
+
+            update = _muon_zeropower_newtonschulz5(
+                update,
+                steps=self.ns_steps,
+                ns_carrier=self.ns_carrier,
+                output_dtype=mx.float32,
+            )
+
+            if reshape_needed:
+                update = mx.reshape(update, original_shape)
+
+            lr = lr * (max(1, update.shape[-2] / update.shape[-1]) ** 0.5)
+
+        # 5) Apply the orthogonalized update in fp32, cast back to the
+        # parameter's dtype (bf16 in production).
+        updated = parameter.astype(mx.float32) - lr * update
+        return updated.astype(parameter.dtype)
+
+
 class MuonAdamWMulti(optim.Optimizer):
     """Composite optimizer that delegates 2-D weights to Muon and the rest to
     AdamW, matching Megatron emerging_optimizers' ``_is_nonlinear_or_embedding``
@@ -413,6 +556,16 @@ class MuonAdamWMulti(optim.Optimizer):
         self._adamw.learning_rate = learning_rate
 
 
+def _normalize_muon_scalar_optimizer(scalar_optimizer: str) -> MuonScalarOptimizer:
+    normalized = scalar_optimizer.strip().lower()
+    if normalized not in MUON_SCALAR_OPTIMIZERS:
+        allowed = ", ".join(MUON_SCALAR_OPTIMIZERS)
+        raise ValueError(
+            f"scalar_optimizer must be one of {allowed}; got {scalar_optimizer!r}"
+        )
+    return normalized  # type: ignore[return-value]
+
+
 def make_muon(
     *,
     lr_muon: float = 2e-3,
@@ -425,6 +578,8 @@ def make_muon(
     eps: float = 1e-8,
     cppmega_cuda_parity: bool = False,
     ns_carrier: str = "fp32",
+    scalar_optimizer: str = "adamw",
+    quantize_momentum: bool = False,
 ) -> MuonAdamWMulti:
     """Construct a Muon + AdamW chained optimizer with cppmega CUDA-style routing.
 
@@ -443,11 +598,26 @@ def make_muon(
     ``ns_carrier`` mirrors cppmega's ``CPPMEGA_MUON_NS_CARRIER`` knob. The
     factory uses a repo-local Muon subclass so the carrier policy does not
     depend on MLX's private Newton-Schulz helper.
+
+    ``scalar_optimizer`` selects the optimizer used for the AdamW group
+    (embeddings, RMSNorm, biases, Mamba scalars, 3-D+ tensors). The default
+    ``"adamw"`` keeps the fp32-moments AdamW used everywhere else in the repo.
+    Setting it to ``"adam8bit"`` swaps in :class:`Adam8bit`, mirroring cppmega
+    CUDA's ``muon_scalar_optimizer="adam8bit"`` knob to cut the AdamW-group
+    optimizer state from ~8 B/param to ~2 B/param.
+
+    ``quantize_momentum`` mirrors cppmega CUDA's
+    ``quantized_muon_momentum_update_multi_and_normalize_groups_`` knob.
+    When True, the persistent Muon momentum buffer is stored as ``uint8``
+    payload + per-256-block fp32 absmax (~1.0156 B/param) instead of fp32
+    (~4 B/param). The Newton-Schulz orthogonalization carrier stays fp32
+    regardless -- only the persistent state is quantized.
     """
 
     ns_carrier = _normalize_muon_ns_carrier(
         os.environ.get(MUON_NS_CARRIER_ENV, ns_carrier)
     )
+    scalar_optimizer = _normalize_muon_scalar_optimizer(scalar_optimizer)
 
     if cppmega_cuda_parity:
         lr_muon = 1e-4
@@ -468,13 +638,24 @@ def make_muon(
     if "ns_carrier" in accepted:
         muon_kwargs["ns_carrier"] = ns_carrier
 
-    muon_optimizer = MuonWithNSCarrier(**muon_kwargs)
-    adamw_optimizer = make_adamw(
-        learning_rate=lr_adamw,
-        weight_decay=weight_decay,
-        betas=list(betas_adamw),
-        eps=eps,
-    )
+    if quantize_momentum:
+        muon_optimizer: optim.Optimizer = QuantizedMuonWithNSCarrier(**muon_kwargs)
+    else:
+        muon_optimizer = MuonWithNSCarrier(**muon_kwargs)
+    if scalar_optimizer == "adam8bit":
+        adamw_optimizer: optim.Optimizer = make_adam8bit(
+            learning_rate=lr_adamw,
+            weight_decay=weight_decay,
+            betas=list(betas_adamw),
+            eps=eps,
+        )
+    else:
+        adamw_optimizer = make_adamw(
+            learning_rate=lr_adamw,
+            weight_decay=weight_decay,
+            betas=list(betas_adamw),
+            eps=eps,
+        )
     return MuonAdamWMulti(muon_optimizer, adamw_optimizer)
 
 
@@ -514,10 +695,14 @@ def dtype_name(value: Any) -> str:
 
 
 __all__ = [
+    "ADAM8BIT_CLASS",
+    "ADAM8BIT_QUANT_KIND",
+    "ADAM8BIT_SOURCE",
     "ADAMW_BASE_CLASS",
     "ADAMW_FP32_MOMENTS_CLASS",
     "ADAMW_FP32_MOMENTS_SOURCE",
     "ADAMW_MOMENT_STATE_KEYS",
+    "Adam8bit",
     "AdamWFP32Moments",
     "EMBEDDING_LIKE_NAME_HINTS",
     "LionFP32Moments",
@@ -527,13 +712,19 @@ __all__ = [
     "MUON_BASE_CLASS",
     "MUON_NS_CARRIER_ENV",
     "MUON_NS_CARRIERS",
+    "MUON_QUANTIZED_MOMENTUM_BLOCK_SIZE",
+    "MUON_QUANTIZED_MOMENTUM_SCHEME",
+    "MUON_SCALAR_OPTIMIZERS",
     "MuonAdamWMulti",
     "MuonNSCarrier",
+    "MuonScalarOptimizer",
     "MuonWithNSCarrier",
+    "QuantizedMuonWithNSCarrier",
     "adamw_moment_dtypes_ok",
     "collect_adamw_moment_dtypes",
     "dtype_name",
     "is_muon_compatible",
+    "make_adam8bit",
     "make_adamw",
     "make_lion",
     "make_muon",

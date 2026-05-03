@@ -180,12 +180,15 @@ The current collected test files are:
 - tests/test_data_pipeline_doc.py
 - tests/test_data_smoke_script.py
 - tests/test_dataloader_bridge.py
+- tests/test_distributed_zero1.py
 - tests/test_engram.py
 - tests/test_env_runtime.py
 - tests/test_eval.py
 - tests/test_external_research_contract.py
 - tests/test_fim_transform.py
 - tests/test_fp8_msl_kernels.py
+- tests/test_grad_buffer_no_aliasing.py
+- tests/test_grad_dtype_contract.py
 - tests/test_hybrid_lm.py
 - tests/test_hybrid_lm_gradients.py
 - tests/test_kernel_policy.py
@@ -210,6 +213,8 @@ The current collected test files are:
 - tests/test_muon_ns_carrier_bench.py
 - tests/test_nam56r_pattern.py
 - tests/test_ngram_hash.py
+- tests/test_optimizer_no_master_contract.py
+- tests/test_optimizers_quantized.py
 - tests/test_package_exports.py
 - tests/test_parity_manifest.py
 - tests/test_parquet_dataset.py
@@ -217,6 +222,7 @@ The current collected test files are:
 - tests/test_profile.py
 - tests/test_profile_capture_script.py
 - tests/test_pytest_markers.py
+- tests/test_quantized_muon_momentum.py
 - tests/test_real_parquet_samples.py
 - tests/test_runtime_exports.py
 - tests/test_seed_runtime.py

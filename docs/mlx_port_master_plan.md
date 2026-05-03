@@ -485,6 +485,10 @@ D. M4 Max vs GB10 honest comparison (Muon+AdamW only):
 
 Conclusions: (a) the 58 GB cap, not a throughput plateau, is the limit on M4 Max under this Docker-tight budget — both optimizers fit B=1 only and B=2 hits ~83 GB on the first step; (b) Lion outpaces Muon+AdamW by roughly 2.4x at B=1 under this cap (Muon's Newton-Schulz iterations dominate per-step cost); (c) Path A (reference pure-MLX) cannot fit at B=1 under the 58 GB cap (peak 86.93 GB at step 1) — Path B is the only viable kernel path at this production shape; (d) the M4 Max-vs-GB10 ratio understates M4 Max because the M4 Max is running with ~70 GB removed by Docker while GB10 has its full memory budget. With the full 128 GB available, the historical 88 GB-cap receipt fit larger batch sizes.
 
+##### Bag 1 receipt — param + grad buffer aliasing audit (2026-05-03)
+
+Param aliasing fix (commit `df80703`) verified to also kill grad-buffer aliasing — `scripts/audit_grad_buffer_reuse.py` receipt at `bench/baselines/grad_buffer_audit.json`. Production `local_gb10_quarter` (bf16 default, B=1 T=256) now reports `param_entries=335`, `grad_entries=335`, `param_total_numel == grad_total_numel == 1,796,521,354` (matches the `audit_memory` 1.797B unique-param count, NOT the pre-fix 3.108B aliased count), `grad_param_byte_ratio=1.000000`, zero aliased ids in either tree. Verdict: `no double allocation`. The −5.16 GiB Lion-state savings already documented above (`11.58 → 6.69 GiB` after the fix) is therefore consistent with grads also being allocated exactly once per unique parameter, not twice as in the pre-fix walk. Fast smoke regression in `tests/test_grad_buffer_no_aliasing.py` runs in ~1 s on the tiny-smoke profile.
+
 ##### cppmega CUDA optimizer wiring (reference, not status)
 
 cppmega CUDA uses `MultiOptimizer = Muon + adam8bit` via the Megatron emerging_optimizers
@@ -527,6 +531,41 @@ optimizer code change is implied here. Implementation is tracked under the paren
   `CPPMEGA_MUON_NS_CARRIER=bf16`. Saves ~1.5× compute per NS iter at no quality cost
   per cppmega CUDA traces.
 
+#### Stream E addendum — Grad dtype contract (no fp32 grad accumulation) (2026-05-03)
+
+**Policy**: gradients match parameter dtype. We do **not** promote grads to fp32 for
+accumulation. With `local_gb10_quarter()` defaulting to `mx.bfloat16` since commit
+`df80703` (kill param aliasing + default to bf16), this means bf16 weights are paired
+with bf16 grads at 1.797B params: **3.346 GiB params + 3.346 GiB grads** (1:1 ratio,
+not 2:1). Promoting grads to fp32 would double the gradient buffer to 6.69 GiB and
+silently cost ~3.3 GiB of extra unified memory per step.
+
+This mirrors cppmega CUDA's `--accumulate-allreduce-grads-in-fp32 = false` policy from
+`cppmega/docs/gb10_local_memory_perf_2026_04_25.md:47-51` ("BF16 training no longer
+auto-enables FP32 grad accumulation/reduction; `--accumulate-allreduce-grads-in-fp32`
+is rejected"). MLX honors this by default: `nn.value_and_grad` produces grads in the
+same dtype as the parameter being differentiated, with no implicit fp32 cast.
+
+Receipts:
+
+- Smoke contract `tests/test_grad_dtype_contract.py` (5 fast cases, <2s):
+  bf16 / fp32 / fp16 model dtypes each yield grads matching that dtype; the helper
+  rejects a synthetically promoted leaf; bf16 grad-buffer == bf16 param-buffer 1:1.
+- Production receipt `tests/test_grad_dtype_contract.py::test_grads_match_bf16_on_full_local_gb10_quarter`
+  (opt-in via `CPPMEGA_GRAD_DTYPE_PRODUCTION_SHAPE=1`, ~3.4s on M4 Max 128 GB):
+  full 1.797B-parameter `local_gb10_quarter()` runs one
+  `next_token_cut_cross_entropy` forward+backward; observed
+  `params=3.346 GiB, grads=3.346 GiB, ratio=1.000`.
+- Defensive runtime check `cppmega_mlx.training.loop.assert_grad_dtype_matches_param_dtype`
+  is gated by `STRICT_DTYPE_CONTRACT=1` (off by default, available for debugging).
+
+This pins the policy as a regression gate. Any future change that lifts grads to fp32
+(e.g., enabling `accumulate-allreduce-grads-in-fp32`-style behaviour, an inadvertent
+`.astype(mx.float32)` inside `next_token_cut_cross_entropy`, or a Megatron-style fp32
+grad-buffer wrapper) will fail one of these tests before it lands a 2× peak-memory
+regression. The fp32-master-moments path (Stream E #83, AdamW `m,v` in fp32) lives in
+the optimizer state, **not** in the gradient buffer, and remains unchanged.
+
 ### Stream F — Distributed & Multi-Mac (101–120)
 
 101. Add `mx.distributed.init(backend='auto')` to launcher.
@@ -549,6 +588,35 @@ optimizer code change is implied here. Implementation is tracked under the paren
 118. Add `tests/test_distributed_smoke.py`: 2-rank toy run on single machine via TCP loopback.
 119. Run mlx-pretrain-style 2-Mac toy run at scale (~100M tokens, ~30 min); record throughput.
 120. Expand `docs/multimac_training.md` (initial role-stub already lands at the start of Stream F): full playbook with hardware list, network topology, run scripts, role transitions (48 GB scout↔peer when 2nd 128 GB arrives), and JACCL vs ring fallback decision tree.
+
+#### Stream F sub-section: ZeRO-1 wrapper scaffold (covers step 106)
+
+`cppmega_mlx.training.distributed_optimizer.DistributedZeRO1Optimizer` lands as
+the MLX-native ZeRO-1 (optimizer-state sharding) wrapper for step 106. It wraps
+any of the three cppmega.mlx optimizers (`AdamWFP32Moments`,
+`LionFP32Moments`, `MuonAdamWMulti`) and shards optimizer state across
+`mx.distributed` ranks via:
+
+- `mx.distributed.all_sum` (gradients, divided by `world_size` for DDP-style mean).
+- Round-robin per-leaf shard assignment (`leaves[R::W]`) restricting the inner
+  optimizer's state to only `1 / world_size` of leaves.
+- `mx.distributed.all_sum` over zero-padded contributions per leaf to gather
+  the full updated parameter tree (round-robin shapes are non-uniform per
+  rank, so direct `all_gather` does not apply; the sparse-sum pattern is one
+  collective per leaf).
+
+Status: **scaffold + single-rank receipts; multi-node receipt pending peer-48
+hardware**. Single-Mac single-rank runs are bit-identical to wrapping nothing
+(the wrapper short-circuits when `world_size == 1`). The 9-test simulation
+suite in `tests/test_distributed_zero1.py` covers world-size-1 numerical
+identity, world-size-2 disjoint shard assignment, simulated W=2 loss within
+1% of non-sharded, and ~50% memory reduction at W=2 on a balanced stack.
+
+The full hand-off procedure for the 2-node receipt is in
+`docs/distributed_zero1_smoke_procedure.md`. Until
+`bench/baselines/zero1_smoke_2node.json` exists, the wrapper does not carry
+a multi-node Megatron-parity claim — only a single-Mac scaffold receipt with
+simulated multi-rank coverage.
 
 ### Stream G — Quantization & Precision (121–140)
 
