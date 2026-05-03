@@ -10,10 +10,10 @@
 
 ## How to apply
 
-```bash
+bash
 cd /Volumes/external/sources/mlx
 git apply /Volumes/external/sources/cppmega.mlx/docs/upstream/mlx_from_dlpack/0001-add-from_dlpack-metal-consumer.patch
-```
+
 
 ## Pairing with the TVM patch
 
@@ -58,18 +58,18 @@ The error message tells the producer exactly what to fix — they need to alloca
 ## Performance / readiness status
 
 Treat the Metal path as a copy-elision interop patch, not as a measured kernel
-speedup. The CPU consumer path allocates a fresh MLX buffer, `memcpy`s producer
+speedup. The CPU consumer path allocates a fresh MLX buffer, memcpys producer
 bytes, then invokes the DLPack deleter. The Metal consumer path casts
-`DLTensor.data` to `MTL::Buffer*`, rejects non-Shared storage, and returns
-`mx::array(wrapped, shape, dtype, deleter)` without copying the payload.
+DLTensor.data to MTL::Buffer*, rejects non-Shared storage, and returns
+mx::array(wrapped, shape, dtype, deleter) without copying the payload.
 
 Current local evidence is apply/build/test plus code review of that copy
-boundary. A clean apply-check against `ml-explore/mlx@e8ebdeb` passed on
+boundary. A clean apply-check against ml-explore/mlx@e8ebdeb passed on
 2026-05-03, and the unit tests cover the CPU path and capsule/error handling.
-There is still no checked-in foreign `kDLMetal` producer smoke or
+There is still no checked-in foreign kDLMetal producer smoke or
 from_dlpack-specific profiler receipt, so do not claim an end-to-end TVM -> MLX
 speedup yet. The honest performance claim is narrower: once paired with a
-Shared-`MTLBuffer` producer such as the TVM storage-mode opt-in, this consumer
+Shared-MTLBuffer producer such as the TVM storage-mode opt-in, this consumer
 can avoid the host-copy import path; timing that bridge still needs the foreign
 producer test.
 
@@ -108,7 +108,7 @@ Pre-existing test_dlpack and test_dlx_device_type in python/tests/test_array.py 
 Coverage gap before filing: the current tests exercise the CPU path, raw
 capsule handling, self round-trip, dtype mapping, used-capsule rejection, and
 strided rejection. They do not yet construct a foreign kDLMetal capsule backed
-by a non-MLX `MTL::Buffer`, so the zero-copy Metal wrapping path and the
+by a non-MLX MTL::Buffer, so the zero-copy Metal wrapping path and the
 non-Shared-storage rejection path are covered by code review only. Add either a
 small ObjC++ test producer or a TVM integration smoke before presenting this as
 fully end-to-end Metal-tested.
@@ -117,7 +117,7 @@ fully end-to-end Metal-tested.
 
 Ready text for the ml-explore/mlx PR body:
 
-```markdown
+markdown
 ## [Python] Add mx.from_dlpack(obj) Metal-aware consumer
 
 MLX currently advertises kDLMetal in mx.array.*dlpack_device*() but
@@ -151,7 +151,7 @@ canonical Apple-Silicon-Metal interop primitive. With this PR plus
 the paired apache/tvm TVM_METAL_STORAGE_MODE=shared opt-in, two
 allocators on the same MTLDevice can finally share an MTLBuffer
 without memcpy.
-```
+
 
 ## Filing checklist
 
@@ -177,7 +177,7 @@ When ready to file:
 
 To use this patched MLX in cppmega.mlx today:
 
-```bash
+bash
 cd /Volumes/external/sources/mlx
 git checkout cppmega/from-dlpack-metal-consumer
 
@@ -200,7 +200,7 @@ print('from_dlpack OK:', a.shape, a.dtype)
 
 # Run tests:
 python -m pytest python/tests/test_dlpack_consumer.py -v
-```
+
 
 ## Files in this directory
 

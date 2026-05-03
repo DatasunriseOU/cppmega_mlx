@@ -3,14 +3,16 @@
 Status: storage-only partial fix shipped. With this patch alone, T.Cast between
 float8_e4m3 / float8_e5m2 and float16 (or any fp/int via half) lowers cleanly
 on the Metal target. T.gemm(fp8_A, fp8_B, fp32_C) still needs the companion
-`tilelang_metal_fp8_gemm` software fallback patch, or the caller must
+tilelang_metal_fp8_gemm software fallback patch, or the caller must
 explicitly dequantize FP8 to half/float before the gemm.
 
-Packaging note: the `tilelang_metal_fp8_gemm` README records the intended
-dispatcher design and local branch receipt, but the stored
-`0001-metal-fp8-gemm-software-path.patch` currently fails `git apply --check`
-on clean `apple-head@7f4a5cb8`. Regenerate that companion patch before treating
-FP8 `T.gemm` as replayable from `docs/upstream` artifacts.
+Packaging note: this storage-only patch is replayable on the local Metal branch
+apple-head@7f4a5cb8 with TVM submodule 0e15b274b, but it is not replayable
+on public tile-ai/tilelang@2eec5f0 because that public snapshot lacks
+TileLang's src/target/codegen_metal.{cc,h} specialization. The companion
+tilelang_metal_fp8_gemm README records a local-stack receipt: that GEMM patch
+applies cleanly on the mixed-dtype branch head a69d6df7 after this patch, but
+not on public main or clean apple-head@7f4a5cb8.
 
 ## Blocker
 
@@ -42,9 +44,11 @@ WWDC 2025 sessions on cooperative tensors:
 
 Apple's MetalPerformancePrimitives matmul2d and the M5 NAX cooperative
 tensor primitives announced at WWDC 2025 expose **FP16 and INT8** matmul
-intrinsics; they do not expose FP8. The MSL specification (current 3.2,
-no 4.x bump in the FP type story) lists scalar floating types half,
-bfloat, float, double only — there is no float8 type token.
+intrinsics; they do not expose FP8. Local xcrun --sdk macosx metal probes
+confirm the same practical boundary: device uchar* storage compiles, but
+float8_t is unknown, float8 is a reserved incomplete type, and
+simdgroup_matrix<uchar, ...> fails the Metal stdlib element-type assertion.
+The local SDK headers also expose no MTLTensorDataTypeFloat8E4M3 macro.
 
 **Conclusion:** any FP8 path on Metal is purely software emulation. The
 right strategy is "storage-only FP8" — pack 8-bit values in uchar /
@@ -113,6 +117,14 @@ fails fast: "Only float16, float32, and bfloat16 are supported".
 Both files apply cleanly via git apply --check on TileLang/tvm fork
 @ 0e15b274b.
 
+May 3 2026 replay audit:
+
+| Base                              | TVM submodule | storage-only patch                                      |
+| --------------------------------- | ------------- | ------------------------------------------------------- |
+| public tile-ai/tilelang@2eec5f0   | 0e15b274b     | FAIL: public main lacks src/target/codegen_metal.{cc,h} |
+| local apple-head@7f4a5cb8         | 0e15b274b     | OK                                                      |
+| local mixed-dtype branch a69d6df7 | 0e15b274b     | OK                                                      |
+
 ## Test results
 
 All four scalar cast directions lower successfully through TileLang's
@@ -126,9 +138,24 @@ that **compiles with xcrun metal -c**:
 [OK] half -> fp8_e5m2
 
 
+### e4m3 subnormal correctness
+
+The __tvm_fp8_e4m3_to_half helper ships with the corrected biased
+exponent for the subnormal path (h = sign | ((e + 7) << 10) | (m << 8))
+from the start. After the mantissa-realignment loop normalises the
+leading 1 to bit 2 (0x4), the half biased exponent is (e - 9 + 1) +
+15 = e + 7, not e + 8. An earlier draft of this helper used (e + 8),
+which decoded all seven e4m3 subnormal magnitudes (bytes 0x01-0x07
+and 0x81-0x87) at 2x their true value and showed up as ~7% relative
+error in T.fp8_scaled_matmul parity tests against PyTorch
+torch.float8_e4m3fn / mlx.from_fp8 / the audiohacking reference
+kernel. The shipped patch is correct on byte-by-byte parity for the
+full e4m3 finite range; the docs/upstream/tilelang_metal_fp8_scaled_matmul
+test suite (25/25 passed in 4.14s) covers this end-to-end.
+
 Sample MSL (TileLang codegen, e4m3 round-trip kernel):
 
-```msl
+msl
 #include <metal_stdlib>
 using namespace metal;
 
@@ -148,7 +175,7 @@ kernel void fp8_round_trip_kernel(
   B[((int)threadIdx.x)] = __tvm_half_to_fp8_e4m3((x + 1.000000e+00h));
   C[((int)threadIdx.x)] = x;
 }
-```
+
 
 The stock TVM Metal codegen path (target.build.metal) goes through the
 legalize_fp8 pass first, which expands FP8 ops into bit-shuffle code
@@ -160,13 +187,62 @@ at the metal.simdgroup allocation check (TileLang's existing assert at
 src/target/codegen_metal.cc:454):
 > Only float16, float32, and bfloat16 are supported, but got float8_e4m3
 
-Caller must either apply the companion `tilelang_metal_fp8_gemm` software
+Caller must either apply the companion tilelang_metal_fp8_gemm software
 fallback patch or dequantize FP8 to half/float in shared memory before T.gemm.
 This matches the FP8 gemm pattern used in
 tilelang/examples/deepseek_v32/fp8_lighting_indexer.py.
 
 mxfp8 (float8_e8m0fnu scale storage) also lowers correctly: it's a
 device uchar* buffer with no helper calls (just pass-through).
+
+## Performance and profiler audit (May 3 2026)
+
+This patch is a representation and lowering unblocker, not a speedup by
+itself. It makes FP8 buffers printable as integer storage and makes scalar
+casts explicit in generated MSL. Any arithmetic that reaches Metal still pays
+software decode/encode cost unless a higher-level kernel dequantizes once and
+then uses the existing FP16/INT8 hardware paths.
+
+Native-FP8 probe commands used:
+
+bash
+xcrun --sdk macosx metal -c uchar_storage.metal
+xcrun --sdk macosx metal -c float8_t.metal
+xcrun --sdk macosx metal -c float8_scalar.metal
+xcrun --sdk macosx metal -c simdgroup_uchar.metal
+clang++ -fobjc-arc -framework Metal -framework Foundation mtl_tensor_dtype.mm -o mtl_tensor_dtype
+rg -n 'MTLTensorDataType.*(Float8|FP8|E4M3|E5M2)|Float8|FP8|E4M3|E5M2' \
+  "$(xcrun --sdk macosx --show-sdk-path)/System/Library/Frameworks/Metal.framework/Headers"
+
+
+Results:
+
+- uchar_storage.metal: OK.
+- float8_t.metal: FAIL, unknown type name float8_t.
+- float8_scalar.metal: FAIL, float8 is reserved/incomplete.
+- simdgroup_uchar.metal: FAIL, invalid simdgroup_matrix element type.
+- MTLTensorDataTypeFloat8E4M3: absent from the local Metal headers.
+
+The same SDK capability boundary is now locked by
+test_metal_fp8_capability_probe.py; run it from this repository with:
+
+bash
+./.venv/bin/python -m pytest \
+  docs/upstream/tilelang_metal_fp8/test_metal_fp8_capability_probe.py -q
+
+
+TileLang's current profiler path is not usable for MPS timing. The source in
+tilelang/profiler/bench.py calls torch.cuda.synchronize(), allocates its
+cache flush tensor on device="cuda", and records torch.cuda.Event timings.
+On this Mac the README probe reports AssertionError: Torch not compiled with
+CUDA enabled. The valid local timing receipt is therefore a wall-clock harness
+around the Metal execution backend with torch.mps.synchronize(), not
+get_profiler().do_bench(...).
+
+See docs/upstream/tilelang_metal_fp8_gemm/README.md for the GEMM fallback
+numbers. The important conclusion for this storage-only patch is narrow: it is
+required to make FP8 visible to Metal codegen, but performance work must happen
+above it by avoiding repeated per-element conversion.
 
 ## Upstream PR readiness for the TileLang/tvm fork
 
@@ -217,8 +293,10 @@ Open questions for upstream review:
 
 ## How to apply
 
-```bash
+bash
 cd /tmp/tilelang_apple_head/tilelang
+git checkout 7f4a5cb8
+git submodule update --init 3rdparty/tvm
 git apply /Volumes/external/sources/cppmega.mlx/docs/upstream/tilelang_metal_fp8/0001-metal-fp8-storage-only.patch
 cd build && ninja -j$(sysctl -n hw.ncpu)
-```
+

@@ -10,10 +10,10 @@
 
 ## How to apply
 
-```bash
+bash
 cd /Volumes/external/sources/tvm
 git apply /Volumes/external/sources/cppmega.mlx/docs/upstream/tvm_shared_storage/0001-metal-shared-storage-opt-in.patch
-```
+
 
 ## Why we need this
 
@@ -44,20 +44,20 @@ The staging-buffer pool (metal_common.h:383) and temp-buffer pool (metal_device_
 
 ## Test surface
 
-The upstream patch adds `metal.GetStorageMode` as a small FFI-visible probe so
+The upstream patch adds metal.GetStorageMode as a small FFI-visible probe so
 tests can verify the resolved env-var mode without an ObjC bridge. The patch
-artifact itself currently changes only `src/runtime/metal/metal_device_api.mm`;
-it does not yet add an upstream `tests/python/runtime/...` file.
+artifact itself currently changes only src/runtime/metal/metal_device_api.mm;
+it does not yet add an upstream tests/python/runtime/... file.
 
 Local review coverage in this directory:
 
-- `syntax_check.mm` compiles the env parser against Apple Metal headers and can
+- syntax_check.mm compiles the env parser against Apple Metal headers and can
   be run in fresh processes for unset/shared/managed/private/invalid values.
-- `runtime_check.mm` links against a patched `libtvm_runtime.dylib`, calls
-  `metal.GetStorageMode`, then allocates through `device_api.metal.AllocDataSpace`
-  and inspects the returned `MTLBuffer.storageMode`.
-- `test_metal_shared_storage.py` is a downstream pytest smoke: it checks
-  `metal.GetStorageMode`, builds a tiny Metal TIR add kernel, and verifies a
+- runtime_check.mm links against a patched libtvm_runtime.dylib, calls
+  metal.GetStorageMode, then allocates through device_api.metal.AllocDataSpace
+  and inspects the returned MTLBuffer.storageMode.
+- test_metal_shared_storage.py is a downstream pytest smoke: it checks
+  metal.GetStorageMode, builds a tiny Metal TIR add kernel, and verifies a
   round-trip result.
 
 Before filing upstream, either fold a pytest equivalent into the TVM patch or
@@ -68,11 +68,11 @@ first patch is runtime-only.
 
 cppmega.mlx Path C (TVM kernel runtime + MLX tensor frontend) sets the env var before importing TVM:
 
-```python
+python
 import os
 os.environ["TVM_METAL_STORAGE_MODE"] = "shared"
 import tvm  # MetalWorkspace caches "shared" on first alloc
-```
+
 
 Once set, mx.array.__dlpack__() and tvm.runtime.from_dlpack(...) should round-trip without std::bad_cast (assuming the matching MLX-side mx.from_dlpack patch lands or already works for the export-only direction).
 
@@ -84,37 +84,37 @@ GPU-only. The performance motivation is narrower: Shared mode removes the
 host-staging buffer plus blit/wait step at the TVM/foreign-framework boundary,
 which is the path needed by DLPack interop with MLX.
 
-The downstream `runtime_check.mm` file now includes a standalone transfer
+The downstream runtime_check.mm file now includes a standalone transfer
 microbenchmark that does not need TVM headers:
 
-```bash
+bash
 xcrun --sdk macosx clang++ -std=c++17 -fobjc-arc -framework Metal \
   -O2 -DCPPMEGA_STANDALONE_METAL_BENCH runtime_check.mm -o metal_transfer_bench
 ./metal_transfer_bench 50
-```
+
 
 Live result on Apple M4 Max, Xcode 26.4.1 / macOS SDK 26.4, 50 iterations:
 
-| bytes    | direction    | private median us | shared median us | shared/private |
-| -------- | ------------ | ----------------- | ---------------- | -------------- |
-| 4 KiB    | CPU -> Metal | 117.250           | 0.042            | 0.000          |
-| 4 KiB    | Metal -> CPU | 110.458           | 0.083            | 0.001          |
-| 1 MiB    | CPU -> Metal | 138.375           | 12.750           | 0.092          |
-| 1 MiB    | Metal -> CPU | 122.833           | 12.542           | 0.102          |
-| 16 MiB   | CPU -> Metal | 392.458           | 220.000          | 0.561          |
-| 16 MiB   | Metal -> CPU | 403.083           | 236.666          | 0.587          |
+| bytes  | direction    | private median us | shared median us | shared/private |
+| ------ | ------------ | ----------------- | ---------------- | -------------- |
+| 4 KiB  | CPU -> Metal | 117.250           | 0.042            | 0.000          |
+| 4 KiB  | Metal -> CPU | 110.458           | 0.083            | 0.001          |
+| 1 MiB  | CPU -> Metal | 138.375           | 12.750           | 0.092          |
+| 1 MiB  | Metal -> CPU | 122.833           | 12.542           | 0.102          |
+| 16 MiB | CPU -> Metal | 392.458           | 220.000          | 0.561          |
+| 16 MiB | Metal -> CPU | 403.083           | 236.666          | 0.587          |
 
 Interpretation: the speedup is the avoided staging/blit synchronization on
 host boundary transfers. It does not prove faster Metal compute kernels, and it
-does not replace the TVM-linked `runtime_check` that inspects the real
-`MetalWorkspace::AllocDataSpace` buffer mode. The standalone bench verifies the
+does not replace the TVM-linked runtime_check that inspects the real
+MetalWorkspace::AllocDataSpace buffer mode. The standalone bench verifies the
 copied data after timing so the measured paths cannot be optimized away.
 
 ## PR description draft
 
 Ready text for the apache/tvm PR body:
 
-```markdown
+markdown
 ## [Runtime][Metal] Add TVM_METAL_STORAGE_MODE env opt-in
 
 The Metal device API has always allocated MTLBuffer with
@@ -147,7 +147,7 @@ microbenchmarks on Apple M4 Max show Shared buffers remove the staging-buffer
 and blit/wait cost at CPU<->Metal transfer boundaries (for example, 1 MiB
 CPU->Metal median 138.375 us Private vs 12.750 us Shared in the downstream
 probe).
-```
+
 
 ## Filing checklist
 
@@ -167,7 +167,7 @@ When ready to file:
 
 To use this patched TVM in cppmega.mlx today (without waiting for upstream merge):
 
-```bash
+bash
 cd /Volumes/external/sources/tvm
 git checkout cppmega/metal-shared-storage-opt-in
 
@@ -187,14 +187,14 @@ print('metal:', tvm.metal().exist)
 arr = tvm.nd.empty((4,), dtype='float32', device=tvm.metal())
 print('alloc OK:', arr.shape)
 "
-```
+
 
 ## Files in this directory
 
 - 0001-metal-shared-storage-opt-in.patch — apply with git am or git apply (181 lines, +102/−13)
 - README.md — this file
 - syntax_check.mm — standalone Metal-only program that vendors the helper and exercises the env-var parsing (no libtvm needed). Build: xcrun --sdk macosx clang++ -std=c++17 -framework Metal syntax_check.mm -o syntax_check. Verifies all 6 cases (unset, shared, mixed-case Shared, invalid, managed, private).
-- runtime_check.mm — live in-process C++ test that loads the freshly-built libtvm_runtime.dylib and (a) calls metal.GetStorageMode() via FFI, (b) calls device_api.metal.AllocDataSpace() and inspects the MTLBuffer.storageMode. It also has `-DCPPMEGA_STANDALONE_METAL_BENCH` mode for copy-elision transfer timing without TVM headers. The TVM-linked mode is the strongest possible verification — it proves the env var actually flows through to a real MTLBuffer. *Live results captured 2026-05-03 on Apple M4 Max:*
+- runtime_check.mm — live in-process C++ test that loads the freshly-built libtvm_runtime.dylib and (a) calls metal.GetStorageMode() via FFI, (b) calls device_api.metal.AllocDataSpace() and inspects the MTLBuffer.storageMode. It also has -DCPPMEGA_STANDALONE_METAL_BENCH mode for copy-elision transfer timing without TVM headers. The TVM-linked mode is the strongest possible verification — it proves the env var actually flows through to a real MTLBuffer. *Live results captured 2026-05-03 on Apple M4 Max:*
 
 
 $ ./runtime_check
@@ -218,4 +218,4 @@ MTLBuffer.storageMode = private
 OK
 
 
-- test_metal_shared_storage.py — Python smoke test (skips if `tvm` or a Metal device is unavailable) for downstream CI. Checks the `metal.GetStorageMode` FFI helper, compiles a TIR element-wise add for target="metal", round-trips through `tvm.nd.array`, and asserts numerical correctness with the env var set.
+- test_metal_shared_storage.py — Python smoke test (skips if tvm or a Metal device is unavailable) for downstream CI. Checks the metal.GetStorageMode FFI helper, compiles a TIR element-wise add for target="metal", round-trips through tvm.nd.array, and asserts numerical correctness with the env var set.

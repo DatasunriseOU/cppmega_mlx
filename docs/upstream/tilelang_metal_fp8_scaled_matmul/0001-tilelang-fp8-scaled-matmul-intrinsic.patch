@@ -22,16 +22,12 @@ Algorithm:
 
 The macro relies on three earlier patches in this stack:
 
-  - Agent C: storage-only FP8 emulation in codegen_metal.cc.
+  - Agent C: storage-only FP8 emulation in codegen_metal.cc (the
+    e4m3 subnormal decode helper now ships with the corrected
+    e+7 biased exponent baked in -- see the prerequisite
+    docs/upstream/tilelang_metal_fp8 patch).
   - Agent E: GemmMetalScalar dispatcher routing fp8 inputs to scalar fma.
   - Agent F-1: vector FP8 cast lowering (lanes 2-4).
-
-Bugfix: the e4m3 subnormal decode in __tvm_fp8_e4m3_to_half from Agent C's
-storage-only patch produced values 2x too large for bytes 0x01..0x07 and
-0x81..0x87 (the half biased exponent should be e+7, not e+8 after
-re-aligning the leading mantissa bit). This patch corrects that constant
-in both the TVM submodule copy (3rdparty/tvm) and the TileLang fork copy
-(src/target).
 
 Test results (cd /tmp/tilelang_apple_head/tilelang && pytest):
 
@@ -61,60 +57,15 @@ correct, dispatcher-routed baseline that lifts the user out of the prior
 "NotImplementedError" stub.
 
 ---
- 3rdparty/tvm/src/target/source/codegen_metal.cc          |   8 +-
- src/target/codegen_metal.cc                              |   6 +-
  testing/python/cpu/test_fp8_scaled_matmul_lowering.py    | 195 +++
  testing/python/metal/test_fp8_scaled_matmul_metal.py     | 879 ++++++++++++++++
  tilelang/language/__init__.py                            |   1 +
  tilelang/language/fp8_op.py                              | 379 +++++++
- 6 files changed, 1465 insertions(+), 3 deletions(-)
+ 4 files changed, 1454 insertions(+)
  create mode 100644 testing/python/cpu/test_fp8_scaled_matmul_lowering.py
  create mode 100644 testing/python/metal/test_fp8_scaled_matmul_metal.py
  create mode 100644 tilelang/language/fp8_op.py
 
-diff --git a/3rdparty/tvm/src/target/source/codegen_metal.cc b/3rdparty/tvm/src/target/source/codegen_metal.cc
---- a/3rdparty/tvm/src/target/source/codegen_metal.cc
-+++ b/3rdparty/tvm/src/target/source/codegen_metal.cc
-@@ -76,12 +76,17 @@ void CodeGenMetal::PrintFP8Prelude(std::ostream& os) {
-       "      h = sign; // signed zero\n"
-       "    } else {\n"
-       "      // subnormal: normalise into half\n"
-+      "      // e4m3 subnormal value = mant * 2^-9. After shifting the\n"
-+      "      // mantissa so the leading 1 is at bit 2 (0x4), the unbiased\n"
-+      "      // exponent in half is (e - 9 + 1) = e - 8, giving biased\n"
-+      "      // (e - 8 + 15) = e + 7. The previous (e + 8) yielded values\n"
-+      "      // 2x too large for the entire subnormal range (bytes\n"
-+      "      // 0x01..0x07 and 0x81..0x87).\n"
-       "      ushort m = mant;\n"
-       "      ushort e = 1;\n"
-       "      while ((m & 0x4) == 0) { m <<= 1; e -= 1; }\n"
-       "      m &= 0x3;\n"
--      "      // half exp = (e - 7 + 15) = (e + 8); fp8 bias=7, half bias=15\n"
--      "      h = (ushort)(sign | ((ushort)(e + 8) << 10) | (ushort)(m << 8));\n"
-+      "      h = (ushort)(sign | ((ushort)(e + 7) << 10) | (ushort)(m << 8));\n"
-       "    }\n"
-       "  } else if (exp == 0x0F && mant == 0x07) {\n"
-       "    // E4M3 finite-only spec uses S.1111.111 as NaN; map to half NaN.\n"
-diff --git a/src/target/codegen_metal.cc b/src/target/codegen_metal.cc
---- a/src/target/codegen_metal.cc
-+++ b/src/target/codegen_metal.cc
-@@ -76,11 +76,15 @@ void CodeGenTileLangMetal::PrintFP8Prelude(std::ostream &os) {
-       "    if (mant == 0) {\n"
-       "      h = sign;\n"
-       "    } else {\n"
-+      "      // subnormal: e4m3 value = mant * 2^-9. After shifting the\n"
-+      "      // mantissa so the leading 1 hits bit 2 (0x4), the half\n"
-+      "      // biased exponent is (e + 7), not (e + 8) which produced\n"
-+      "      // values 2x too large for bytes 0x01-0x07 / 0x81-0x87.\n"
-       "      ushort m = mant;\n"
-       "      ushort e = 1;\n"
-       "      while ((m & 0x4) == 0) { m <<= 1; e -= 1; }\n"
-       "      m &= 0x3;\n"
--      "      h = (ushort)(sign | ((ushort)(e + 8) << 10) | (ushort)(m << 8));\n"
-+      "      h = (ushort)(sign | ((ushort)(e + 7) << 10) | (ushort)(m << 8));\n"
-       "    }\n"
-       "  } else if (exp == 0x0F && mant == 0x07) {\n"
-       "    h = (ushort)(sign | 0x7E00);\n"
 diff --git a/tilelang/language/__init__.py b/tilelang/language/__init__.py
 --- a/tilelang/language/__init__.py
 +++ b/tilelang/language/__init__.py

@@ -1,8 +1,8 @@
 diff --git a/3rdparty/tvm/src/target/source/codegen_metal.cc b/3rdparty/tvm/src/target/source/codegen_metal.cc
-index 01042776c..cdd58a4f1 100644
+index 01042776c..b8bf845fb 100644
 --- a/3rdparty/tvm/src/target/source/codegen_metal.cc
 +++ b/3rdparty/tvm/src/target/source/codegen_metal.cc
-@@ -56,6 +56,111 @@ CodeGenMetal::CodeGenMetal(Target target) : target_(target) {
+@@ -56,6 +56,113 @@ CodeGenMetal::CodeGenMetal(Target target) : target_(target) {
                << "};\n\n";
  }
  
@@ -25,13 +25,15 @@ index 01042776c..cdd58a4f1 100644
 +      "    if (mant == 0) {\n"
 +      "      h = sign; // signed zero\n"
 +      "    } else {\n"
-+      "      // subnormal: normalise into half\n"
++      "      // subnormal: e4m3 value = mant * 2^-9. After shifting the\n"
++      "      // mantissa so the leading 1 hits bit 2 (0x4), the unbiased\n"
++      "      // exponent in half is (e - 9 + 1) = e - 8, giving biased\n"
++      "      // (e - 8 + 15) = e + 7. fp8 bias=7, half bias=15.\n"
 +      "      ushort m = mant;\n"
 +      "      ushort e = 1;\n"
 +      "      while ((m & 0x4) == 0) { m <<= 1; e -= 1; }\n"
 +      "      m &= 0x3;\n"
-+      "      // half exp = (e - 7 + 15) = (e + 8); fp8 bias=7, half bias=15\n"
-+      "      h = (ushort)(sign | ((ushort)(e + 8) << 10) | (ushort)(m << 8));\n"
++      "      h = (ushort)(sign | ((ushort)(e + 7) << 10) | (ushort)(m << 8));\n"
 +      "    }\n"
 +      "  } else if (exp == 0x0F && mant == 0x07) {\n"
 +      "    // E4M3 finite-only spec uses S.1111.111 as NaN; map to half NaN.\n"
@@ -114,7 +116,7 @@ index 01042776c..cdd58a4f1 100644
  void CodeGenMetal::AddFunction(const GlobalVar& gvar, const PrimFunc& func) {
    // NOTE: There is no inter-function calls among Metal kernels.
    // For now we keep the metal codegen without inter-function call
-@@ -267,6 +372,28 @@ void CodeGenMetal::PrintType(DataType t, std::ostream& os) {  // NOLINT(*)
+@@ -267,6 +374,28 @@ void CodeGenMetal::PrintType(DataType t, std::ostream& os) {  // NOLINT(*)
    } else if (t.is_bfloat16()) {
      os << "bfloat";
      return;
@@ -143,7 +145,7 @@ index 01042776c..cdd58a4f1 100644
    }
    LOG(FATAL) << "Cannot convert type " << t << " to Metal type";
  }
-@@ -412,6 +539,82 @@ void CodeGenMetal::VisitExpr_(const CallNode* op, std::ostream& os) {  // NOLINT
+@@ -412,6 +541,82 @@ void CodeGenMetal::VisitExpr_(const CallNode* op, std::ostream& os) {  // NOLINT
    }
  }
  
@@ -257,10 +259,10 @@ index 9bc0e15d1..97bb6071f 100644
  };
  }  // namespace codegen
 diff --git a/src/target/codegen_metal.cc b/src/target/codegen_metal.cc
-index faa43a35..7b3e09bc 100644
+index faa43a35..025a98e2 100644
 --- a/src/target/codegen_metal.cc
 +++ b/src/target/codegen_metal.cc
-@@ -57,6 +57,95 @@ CodeGenTileLangMetal::CodeGenTileLangMetal(Target target) : target_(target) {
+@@ -57,6 +57,98 @@ CodeGenTileLangMetal::CodeGenTileLangMetal(Target target) : target_(target) {
                << "};\n\n";
  }
  
@@ -283,11 +285,14 @@ index faa43a35..7b3e09bc 100644
 +      "    if (mant == 0) {\n"
 +      "      h = sign;\n"
 +      "    } else {\n"
++      "      // subnormal: e4m3 value = mant * 2^-9. After shifting the\n"
++      "      // mantissa so the leading 1 hits bit 2 (0x4), the half\n"
++      "      // biased exponent is (e + 7), not (e + 8).\n"
 +      "      ushort m = mant;\n"
 +      "      ushort e = 1;\n"
 +      "      while ((m & 0x4) == 0) { m <<= 1; e -= 1; }\n"
 +      "      m &= 0x3;\n"
-+      "      h = (ushort)(sign | ((ushort)(e + 8) << 10) | (ushort)(m << 8));\n"
++      "      h = (ushort)(sign | ((ushort)(e + 7) << 10) | (ushort)(m << 8));\n"
 +      "    }\n"
 +      "  } else if (exp == 0x0F && mant == 0x07) {\n"
 +      "    h = (ushort)(sign | 0x7E00);\n"
@@ -356,7 +361,7 @@ index faa43a35..7b3e09bc 100644
  void CodeGenTileLangMetal::AddFunction(const GlobalVar &gvar,
                                         const PrimFunc &func) {
    // NOTE: There is no inter-function calls among Metal kernels.
-@@ -275,6 +364,27 @@ void CodeGenTileLangMetal::PrintType(DataType t,
+@@ -275,6 +367,27 @@ void CodeGenTileLangMetal::PrintType(DataType t,
    } else if (t.is_bfloat16()) {
      os << "bfloat";
      return;
@@ -384,7 +389,7 @@ index faa43a35..7b3e09bc 100644
    }
    LOG(FATAL) << "Cannot convert type " << t << " to Metal type";
  }
-@@ -517,6 +627,73 @@ void CodeGenTileLangMetal::VisitExpr_(const CallNode *op,
+@@ -517,6 +630,73 @@ void CodeGenTileLangMetal::VisitExpr_(const CallNode *op,
    }
  }
  
