@@ -22,6 +22,7 @@ from cppmega_mlx.training.optimizers import (
 )
 from scripts.m04_train_step import (
     OBSERVED_OPTIMIZER_IDENTITY,
+    GRAD_CHECKPOINT_EXPECTATION,
     REQUIRED_ADAMW_MASTER_MOMENT_DTYPE,
     REQUIRED_DTYPE,
     REQUIRED_MODEL_GEOMETRY,
@@ -55,6 +56,36 @@ REAL_PARQUET_COLUMNS = (
     "token_sibling_index",
     "token_ast_node_type",
 )
+
+
+def canonical_allocation_probe(**overrides: Any) -> dict[str, Any]:
+    probe = {
+        "status": "ok",
+        "allocation_ready": True,
+        "source": REQUIRED_MODEL_SOURCE,
+        "allocation_mode": "full_profile_allocation_probe",
+        "required_geometry": REQUIRED_MODEL_GEOMETRY,
+        "profile_geometry": REQUIRED_MODEL_GEOMETRY,
+        "geometry_matches_required": True,
+        "profile_name": "local_gb10_quarter",
+        "model_class": "HybridTinyLM",
+        "eval_scope": "parameters_only_no_forward_no_training",
+        "forward_executed": False,
+        "training_executed": False,
+        "memory_before": {"active_memory_bytes": 0},
+        "memory_after": {"active_memory_bytes": 1024},
+    }
+    probe.update(overrides)
+    return probe
+
+
+def test_m04_import_preserves_recipes_package_exports() -> None:
+    import cppmega_mlx.recipes as recipes
+
+    assert recipes is sys.modules["cppmega_mlx.recipes"]
+    assert isinstance(recipes.__all__, list)
+    assert "local_gb10_quarter" in recipes.__all__
+    assert hasattr(recipes, "local_gb10_quarter")
 
 
 def run_script(*args: str, timeout: int = 60) -> subprocess.CompletedProcess[str]:
@@ -180,6 +211,18 @@ def assert_m04_receipt_contract(payload: dict[str, Any]) -> None:
         assert preflight["allocation_ready"] is True
         assert preflight["allocation_mode"] == "full_profile_allocation_probe"
         assert preflight["allocation_probe"]["status"] == "ok"
+        assert preflight["allocation_probe"]["source"] == REQUIRED_MODEL_SOURCE
+        assert preflight["allocation_probe"]["allocation_mode"] == (
+            "full_profile_allocation_probe"
+        )
+        assert preflight["allocation_probe"]["required_geometry"] == (
+            REQUIRED_MODEL_GEOMETRY
+        )
+        assert preflight["allocation_probe"]["profile_geometry"] == (
+            REQUIRED_MODEL_GEOMETRY
+        )
+        assert preflight["allocation_probe"]["geometry_matches_required"] is True
+        assert preflight["allocation_probe"]["model_class"] == "HybridTinyLM"
         assert preflight["allocation_probe"]["forward_executed"] is False
         assert preflight["allocation_probe"]["training_executed"] is False
         assert preflight["ok"] is True
@@ -240,9 +283,23 @@ def assert_m04_receipt_contract(payload: dict[str, Any]) -> None:
     assert payload["training"]["optimizer"]["master_moment_evidence"] == (
         optimizer_identity["master_moment_evidence"]
     )
+    grad_checkpoint_expected = bool(payload["workload"].get("grad_checkpoint", False))
     assert payload["training"]["grad_checkpoint"]["required"] is True
-    assert payload["training"]["grad_checkpoint"]["observed_enabled"] is False
-    assert payload["training"]["grad_checkpoint"]["expectation_satisfied"] is False
+    assert payload["training"]["grad_checkpoint"]["observed_enabled"] is (
+        grad_checkpoint_expected
+    )
+    assert payload["training"]["grad_checkpoint"]["expectation_satisfied"] is (
+        grad_checkpoint_expected
+    )
+    assert gate["grad_checkpoint_observed_enabled"] is grad_checkpoint_expected
+    assert gate["grad_checkpoint_expectation_ok"] is grad_checkpoint_expected
+    assert gate["grad_checkpoint_identity"]["observed_enabled"] is (
+        grad_checkpoint_expected
+    )
+    assert gate["grad_checkpoint_identity"]["expectation_satisfied"] is (
+        grad_checkpoint_expected
+    )
+    assert gate["grad_checkpoint_identity"]["ok"] is grad_checkpoint_expected
     assert payload["baseline_row"] == {
         "batch_size": payload["workload"]["batch_size"],
         "commit": payload["software"]["git_commit"] or "unknown",
@@ -308,6 +365,8 @@ def test_synthetic_one_step_writes_finite_receipt(tmp_path: Path) -> None:
     assert payload["status"] == "ok"
     assert payload["workload"]["synthetic"] is True
     assert payload["workload"]["data_format"] == "npz"
+    assert payload["workload"]["model_profile"] == "hybrid_tiny"
+    assert payload["workload"]["grad_checkpoint"] is False
     assert payload["workload"]["probe_local_gb10_quarter_allocation"] is False
     assert payload["training"]["steps_completed"] == 1
     assert payload["training"]["optimizer_updated"] is True
@@ -323,6 +382,29 @@ def test_synthetic_one_step_writes_finite_receipt(tmp_path: Path) -> None:
     assert payload["memory"]["peak_memory_bytes"] is None or (
         payload["memory"]["peak_memory_bytes"] >= 0
     )
+
+
+def test_synthetic_grad_checkpoint_receipt_marks_gate_without_m0_4_claim(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "m04_train_step.json"
+    result = run_script(*tiny_args(output), "--grad-checkpoint")
+    payload = load_json_result(result)
+
+    assert output.exists()
+    assert json.loads(output.read_text()) == payload
+    assert_m04_receipt_contract(payload)
+    assert payload["status"] == "ok"
+    assert payload["workload"]["model_profile"] == "hybrid_tiny"
+    assert payload["workload"]["grad_checkpoint"] is True
+    assert payload["training"]["grad_checkpoint"]["observed_enabled"] is True
+    assert payload["training"]["grad_checkpoint"]["expectation_satisfied"] is True
+    assert payload["acceptance_gate"]["grad_checkpoint_expectation_ok"] is True
+    assert payload["acceptance_gate"]["full_local_gb10_quarter_gate_completed"] is False
+    assert {
+        "local_gb10_quarter_preflight_ok",
+        "model_identity_ok",
+    }.issubset(set(payload["acceptance_gate"]["full_local_gb10_quarter_gate_blockers"]))
 
 
 def test_require_loss_decrease_fails_single_step_but_writes_receipt(tmp_path: Path) -> None:
@@ -363,22 +445,163 @@ def test_missing_dataset_dry_run_reports_blocked_receipt(tmp_path: Path) -> None
     assert payload["acceptance_gate"]["full_local_gb10_quarter_gate_completed"] is False
 
 
+def test_local_gb10_quarter_dry_run_fails_closed_before_tiny_route(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def fail_dry_run(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("HybridTinyLM dry-run route must not be called")
+
+    monkeypatch.setattr(m04_train_step, "dry_run_payload", fail_dry_run)
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--synthetic",
+            "--model-profile",
+            "local_gb10_quarter",
+            "--dry-run-json",
+            "--output",
+            str(tmp_path / "receipt.json"),
+        ]
+    )
+
+    payload, exit_code = m04_train_step.run_receipt(args)
+
+    assert exit_code == 0
+    assert payload["status"] == "blocked"
+    assert payload["full_m0_4_acceptance_claim"] is False
+    assert payload["blockers"][0]["type"] == "unsupported_model_profile_route"
+    assert "HybridTinyLM smoke route" in payload["blockers"][0]["reason"]
+    assert payload["workload"]["model_profile"] == "local_gb10_quarter"
+    assert payload["workload"]["grad_checkpoint"] is False
+    assert payload["training"]["steps_completed"] == 0
+    assert payload["acceptance_gate"]["full_local_gb10_quarter_gate_completed"] is False
+    assert payload["acceptance_gate"]["model_identity_ok"] is False
+
+
+def test_local_gb10_quarter_training_fails_closed_before_tiny_route(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def fail_train(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("HybridTinyLM training route must not be called")
+
+    monkeypatch.setattr(m04_train_step, "train_hybrid_tiny", fail_train)
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--synthetic",
+            "--model-profile",
+            "local_gb10_quarter",
+            "--output",
+            str(tmp_path / "receipt.json"),
+        ]
+    )
+
+    payload, exit_code = m04_train_step.run_receipt(args)
+
+    assert exit_code == 2
+    assert payload["status"] == "blocked"
+    assert payload["full_m0_4_acceptance_claim"] is False
+    assert payload["blockers"][0]["type"] == "unsupported_model_profile_route"
+    assert "real cppmega_mlx.recipes.model_factory" in payload["blockers"][0]["reason"]
+    assert payload["workload"]["model_profile"] == "local_gb10_quarter"
+    assert payload["workload"]["grad_checkpoint"] is False
+    assert payload["training"]["steps_completed"] == 0
+    assert payload["acceptance_gate"]["full_local_gb10_quarter_gate_completed"] is False
+    assert payload["acceptance_gate"]["model_identity_ok"] is False
+
+
+def test_local_gb10_quarter_grad_checkpoint_fails_closed_before_tiny_route(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def fail_train(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("HybridTinyLM training route must not be called")
+
+    monkeypatch.setattr(m04_train_step, "train_hybrid_tiny", fail_train)
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--synthetic",
+            "--model-profile",
+            "local_gb10_quarter",
+            "--grad-checkpoint",
+            "--output",
+            str(tmp_path / "receipt.json"),
+        ]
+    )
+
+    payload, exit_code = m04_train_step.run_receipt(args)
+
+    assert exit_code == 2
+    assert payload["status"] == "blocked"
+    assert payload["blockers"][0]["type"] == "unsupported_model_profile_route"
+    assert payload["workload"]["model_profile"] == "local_gb10_quarter"
+    assert payload["workload"]["grad_checkpoint"] is True
+    assert payload["training"]["steps_completed"] == 0
+    assert payload["training"]["grad_checkpoint"]["observed_enabled"] is True
+    assert payload["acceptance_gate"]["grad_checkpoint_expectation_ok"] is True
+    assert payload["acceptance_gate"]["model_identity_ok"] is False
+    assert (
+        payload["acceptance_gate"]["full_local_gb10_quarter_gate_completed"] is False
+    )
+
+
+def test_local_gb10_quarter_with_allocation_probe_still_fails_closed_before_tiny_route(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    probe_called = False
+
+    def fake_probe() -> dict[str, Any]:
+        nonlocal probe_called
+        probe_called = True
+        return canonical_allocation_probe()
+
+    def fail_dry_run(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("HybridTinyLM dry-run route must not be called")
+
+    monkeypatch.setattr(m04_train_step, "probe_local_gb10_quarter_allocation", fake_probe)
+    monkeypatch.setattr(m04_train_step, "dry_run_payload", fail_dry_run)
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--synthetic",
+            "--model-profile",
+            "local_gb10_quarter",
+            "--probe-local-gb10-quarter-allocation",
+            "--dry-run-json",
+            "--output",
+            str(tmp_path / "receipt.json"),
+        ]
+    )
+
+    payload, exit_code = m04_train_step.run_receipt(args)
+
+    assert probe_called is True
+    assert exit_code == 0
+    assert payload["status"] == "blocked"
+    assert payload["full_m0_4_acceptance_claim"] is False
+    assert payload["blockers"][0]["type"] == "unsupported_model_profile_route"
+    assert payload["workload"]["model_profile"] == "local_gb10_quarter"
+    assert payload["workload"]["grad_checkpoint"] is False
+    assert payload["workload"]["probe_local_gb10_quarter_allocation"] is True
+    assert payload["training"]["steps_completed"] == 0
+    preflight = payload["local_gb10_quarter_preflight"]
+    assert preflight["allocation_attempted"] is True
+    assert preflight["allocation_ready"] is True
+    assert preflight["allocation_mode"] == "full_profile_allocation_probe"
+    assert preflight["allocation_probe"]["forward_executed"] is False
+    assert preflight["allocation_probe"]["training_executed"] is False
+    assert preflight["ok"] is True
+    assert payload["acceptance_gate"]["local_gb10_quarter_preflight_ok"] is True
+    assert payload["acceptance_gate"]["model_identity_ok"] is False
+    assert payload["acceptance_gate"]["full_local_gb10_quarter_gate_completed"] is False
+
+
 def test_local_gb10_allocation_probe_success_is_preflight_only(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     def fake_probe() -> dict[str, Any]:
-        return {
-            "status": "ok",
-            "allocation_ready": True,
-            "profile_name": "local_gb10_quarter",
-            "model_class": "HybridTinyLM",
-            "eval_scope": "parameters_only_no_forward_no_training",
-            "forward_executed": False,
-            "training_executed": False,
-            "memory_before": {"active_memory_bytes": 0},
-            "memory_after": {"active_memory_bytes": 1024},
-        }
+        return canonical_allocation_probe()
 
     monkeypatch.setattr(m04_train_step, "probe_local_gb10_quarter_allocation", fake_probe)
     args = m04_train_step.build_parser().parse_args(
@@ -416,18 +639,13 @@ def test_local_gb10_allocation_probe_failure_fails_closed(
     tmp_path: Path,
 ) -> None:
     def fake_probe() -> dict[str, Any]:
-        return {
-            "status": "blocked",
-            "allocation_ready": False,
-            "profile_name": "local_gb10_quarter",
-            "eval_scope": "parameters_only_no_forward_no_training",
-            "forward_executed": False,
-            "training_executed": False,
-            "memory_before": {"active_memory_bytes": 0},
-            "memory_after": {"active_memory_bytes": 0},
-            "error_type": "RuntimeError",
-            "error": "synthetic allocation failure",
-        }
+        return canonical_allocation_probe(
+            status="blocked",
+            allocation_ready=False,
+            memory_after={"active_memory_bytes": 0},
+            error_type="RuntimeError",
+            error="synthetic allocation failure",
+        )
 
     monkeypatch.setattr(m04_train_step, "probe_local_gb10_quarter_allocation", fake_probe)
     args = m04_train_step.build_parser().parse_args(
@@ -645,7 +863,7 @@ def grad_checkpoint_identity(*, enabled: bool = True) -> dict[str, Any]:
     return {
         "required": True,
         "observed_enabled": enabled,
-        "source": "unit-test-local-gb10-quarter",
+        "source": GRAD_CHECKPOINT_EXPECTATION["source"],
         "expectation_satisfied": enabled,
     }
 
@@ -673,9 +891,12 @@ def local_gb10_model_config(**overrides: Any) -> dict[str, Any]:
 
 
 def resolved_local_gb10_preflight(**overrides: Any) -> dict[str, Any]:
+    allocation_probe = canonical_allocation_probe()
     preflight = local_gb10_quarter_preflight_payload(
         allocation_attempted=True,
         allocation_ready=True,
+        allocation_mode="full_profile_allocation_probe",
+        allocation_probe=allocation_probe,
     )
     preflight["tokenizer_contract"] = {
         **preflight["tokenizer_contract"],
@@ -842,11 +1063,24 @@ def test_acceptance_gate_accepts_complete_local_gb10_quarter_evidence() -> None:
             {"grad_checkpoint_expectation_ok"},
         ),
         (
+            {
+                "grad_checkpoint": {
+                    **grad_checkpoint_identity(),
+                    "source": "unit-test-local-gb10-quarter",
+                }
+            },
+            {"grad_checkpoint_expectation_ok"},
+        ),
+        (
             {"device": m4_device_metadata(device_name="Apple M3 Max")},
             {"m4_runtime_metadata_ok"},
         ),
         (
             {"steps_completed": 99},
+            {"step_count_ok"},
+        ),
+        (
+            {"steps_requested": 101, "steps_completed": 100},
             {"step_count_ok"},
         ),
         (
@@ -881,3 +1115,52 @@ def test_acceptance_gate_fail_closes_on_fake_or_incomplete_evidence(
         )
     ):
         assert gate["full_target_dataset_100_step_completed"] is False
+
+
+@pytest.mark.parametrize(
+    "preflight_overrides",
+    [
+        {"allocation_probe": None},
+        {"allocation_probe": canonical_allocation_probe(status="blocked")},
+        {"allocation_probe": canonical_allocation_probe(allocation_ready=False)},
+        {"allocation_probe": canonical_allocation_probe(source="fake.local_gb10_quarter")},
+        {"allocation_probe": canonical_allocation_probe(source=None)},
+        {"allocation_probe": canonical_allocation_probe(allocation_mode="caller_supplied_allocation_evidence")},
+        {"allocation_probe": canonical_allocation_probe(allocation_mode=None)},
+        {"allocation_probe": canonical_allocation_probe(profile_name="HybridTinyLM")},
+        {"allocation_probe": canonical_allocation_probe(model_class="FakeTinyLM")},
+        {"allocation_probe": canonical_allocation_probe(model_class=None)},
+        {"allocation_probe": canonical_allocation_probe(eval_scope="forward_smoke")},
+        {"allocation_probe": canonical_allocation_probe(forward_executed=True)},
+        {"allocation_probe": canonical_allocation_probe(training_executed=True)},
+        {"allocation_probe": canonical_allocation_probe(geometry_matches_required=False)},
+        {
+            "allocation_probe": canonical_allocation_probe(
+                required_geometry={**REQUIRED_MODEL_GEOMETRY, "hidden_size": 16}
+            )
+        },
+        {
+            "allocation_probe": canonical_allocation_probe(
+                profile_geometry={**REQUIRED_MODEL_GEOMETRY, "hidden_size": 16}
+            )
+        },
+        {
+            "allocation_mode": "caller_supplied_allocation_evidence",
+            "allocation_probe": canonical_allocation_probe(),
+        },
+    ],
+)
+def test_acceptance_gate_requires_canonical_allocation_probe(
+    preflight_overrides: dict[str, Any],
+) -> None:
+    gate = local_gb10_gate(
+        local_gb10_quarter_preflight=resolved_local_gb10_preflight(
+            **preflight_overrides
+        )
+    )
+
+    assert gate["local_gb10_quarter_preflight_ok"] is False
+    assert gate["full_local_gb10_quarter_gate_completed"] is False
+    assert "local_gb10_quarter_preflight_ok" in (
+        gate["full_local_gb10_quarter_gate_blockers"]
+    )

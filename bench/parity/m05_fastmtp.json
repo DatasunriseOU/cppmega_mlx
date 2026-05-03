@@ -1,0 +1,177 @@
+{
+  "acceptance_gate": {
+    "blocker": "CUDA FastMTP reference artifact path was supplied but the artifact is missing; M0.5 closure requires the artifact contract plus a separate numerical parity harness.",
+    "cuda_reference_artifact_preflight_status": "missing",
+    "cuda_reference_artifact_supplied": true,
+    "full_m0_5_acceptance": false,
+    "mtp_receipts": 0,
+    "receipt_count": 0,
+    "receipts_evaluated_by_this_manifest": false,
+    "requires_cuda_reference_artifact": true,
+    "requires_external_cuda_grad_norm": true,
+    "requires_external_cuda_mtp_losses": true,
+    "requires_hopper_liger_fused_ce_receipt": true,
+    "requires_matching_beta_lambda": true,
+    "requires_matching_mtp_depth": true,
+    "requires_mlx_mtp_losses": true,
+    "requires_separate_numerical_harness": true
+  },
+  "acceptance_status": "not_evaluated",
+  "claim_boundary": "This scaffold makes no FastMTP numerical parity, Hopper/Liger fused-CE, GB10, M4-vs-GB10, or distributed Megatron parity claim.",
+  "cuda_reference": {
+    "artifact": "/Volumes/external/sources/cppmega.mlx/bench/parity/cuda/m05_local_gb10_quarter_fastmtp.json",
+    "artifact_contract": {
+      "format": "cppmega_cuda_m05_fastmtp_v1",
+      "mtp_beta": 0.6,
+      "mtp_depth": 2,
+      "mtp_lambda": 0.3,
+      "profile": "local_gb10_quarter",
+      "required_artifact": "bench/parity/cuda/m05_local_gb10_quarter_fastmtp.json",
+      "required_cuda_reference_sources": [
+        "cppmega/megatron/fastmtp_layer.py",
+        "cppmega/megatron/mtp_native_hopper_ce.py"
+      ],
+      "required_loss_value_fields": [
+        "next_token_loss",
+        "mtp_loss",
+        "total_loss",
+        "mtp_depth_1_loss",
+        "mtp_depth_2_loss",
+        "grad_norm"
+      ],
+      "requires_false_claim_fields": [
+        "acceptance_claim",
+        "numerical_harness_passed",
+        "numerical_parity_passed",
+        "full_m0_5_acceptance",
+        "full_m0_5_acceptance_claim",
+        "gb10_mtp_parity_claim",
+        "m4_vs_gb10_mtp_parity_claim",
+        "distributed_megatron_mtp_parity_claim",
+        "evaluated_by_numerical_harness"
+      ],
+      "requires_finite_loss_values": true,
+      "requires_grad_norm": true,
+      "requires_loss_values_sha256": true,
+      "requires_separate_numerical_harness": true,
+      "requires_source_sha256": true
+    },
+    "artifact_error": "CUDA FastMTP reference artifact not found: /Volumes/external/sources/cppmega.mlx/bench/parity/cuda/m05_local_gb10_quarter_fastmtp.json",
+    "artifact_preflight_status": "missing",
+    "artifact_supplied": true,
+    "evaluated_by_this_manifest": false,
+    "evaluates_mtp_losses": false,
+    "preflight_is_acceptance": false,
+    "required_artifact": "bench/parity/cuda/m05_local_gb10_quarter_fastmtp.json",
+    "required_for_closure": true,
+    "status": "refused_missing_artifact"
+  },
+  "cuda_reference_identity": {
+    "artifact_contract": {
+      "format": "cppmega_cuda_m05_fastmtp_v1",
+      "mtp_beta": 0.6,
+      "mtp_depth": 2,
+      "mtp_lambda": 0.3,
+      "profile": "local_gb10_quarter",
+      "required_artifact": "bench/parity/cuda/m05_local_gb10_quarter_fastmtp.json",
+      "required_cuda_reference_sources": [
+        "cppmega/megatron/fastmtp_layer.py",
+        "cppmega/megatron/mtp_native_hopper_ce.py"
+      ],
+      "required_loss_value_fields": [
+        "next_token_loss",
+        "mtp_loss",
+        "total_loss",
+        "mtp_depth_1_loss",
+        "mtp_depth_2_loss",
+        "grad_norm"
+      ],
+      "requires_false_claim_fields": [
+        "acceptance_claim",
+        "numerical_harness_passed",
+        "numerical_parity_passed",
+        "full_m0_5_acceptance",
+        "full_m0_5_acceptance_claim",
+        "gb10_mtp_parity_claim",
+        "m4_vs_gb10_mtp_parity_claim",
+        "distributed_megatron_mtp_parity_claim",
+        "evaluated_by_numerical_harness"
+      ],
+      "requires_finite_loss_values": true,
+      "requires_grad_norm": true,
+      "requires_loss_values_sha256": true,
+      "requires_separate_numerical_harness": true,
+      "requires_source_sha256": true
+    },
+    "required_sources": [
+      "cppmega/megatron/fastmtp_layer.py",
+      "cppmega/megatron/mtp_native_hopper_ce.py"
+    ],
+    "requires_hopper_liger_fused_ce_receipt": true
+  },
+  "distributed_megatron_mtp_parity_claim": false,
+  "distributed_megatron_parity_claim": false,
+  "format": "cppmega_mlx_tensor_parity_manifest_v1",
+  "full_m0_5_acceptance_claim": false,
+  "gb10_mtp_parity_claim": false,
+  "gb10_parity_claim": false,
+  "issue": {
+    "id": "cppmega-mlx-t8f.5",
+    "title": "M0.5: fail-closed FastMTP parity scaffold"
+  },
+  "local_only": true,
+  "local_only_policy": "Local CUDA/MLX tensor diff receipts are implementation evidence only. They are not M4-vs-GB10 parity evidence and do not prove distributed Megatron parity.",
+  "m0_5_closed": false,
+  "m0_5_policy": "M0.5 FastMTP parity is fail-closed. This helper records the required local_gb10_quarter MTP metadata and CUDA reference identity, but it does not run CUDA, MLX, Hopper/Liger fused CE, or a numerical comparison. Closure requires a real GB10 CUDA FastMTP golden artifact plus a separate numerical MLX-vs-CUDA comparison harness.",
+  "m0_5_receipt_scope": "local_cuda_mlx_m05_fastmtp",
+  "m0_5_schema_version": 1,
+  "m4_vs_gb10_mtp_parity_claim": false,
+  "m4_vs_gb10_parity_claim": false,
+  "metadata": {
+    "git_commit": "2728cfe",
+    "metadata_preflight_only": true,
+    "scaffold_only": true,
+    "script": "scripts/m05_mtp_parity_manifest.py"
+  },
+  "mlx_reference": {
+    "evaluated_by_this_manifest": false,
+    "local_mlx_mtp_losses_evaluated": false,
+    "readiness_is_cuda_parity": false,
+    "readiness_note": "Manifest scaffold only; no MLX FastMTP losses were evaluated and no CUDA FastMTP numerical comparison was run.",
+    "required_for_closure": true,
+    "script": "scripts/m05_mtp_parity_manifest.py",
+    "status": "not_evaluated"
+  },
+  "mtp_config": {
+    "beta": 0.6,
+    "depth": 2,
+    "lambda": 0.3,
+    "profile": "local_gb10_quarter"
+  },
+  "num_receipts": 0,
+  "profile": "local_gb10_quarter",
+  "receipt_scope": "local_cuda_mlx_tensor",
+  "receipts": [],
+  "required_receipt_fields": [
+    "tensor_name",
+    "shape",
+    "dtype",
+    "atol",
+    "rtol",
+    "max_abs_error",
+    "max_rel_error",
+    "source_commit",
+    "mlx_version",
+    "hardware",
+    "status"
+  ],
+  "source": "m05_mtp_parity_manifest.py",
+  "status": "refused",
+  "valid_statuses": [
+    "pass",
+    "fail",
+    "blocked",
+    "refused"
+  ],
+  "version": 1
+}

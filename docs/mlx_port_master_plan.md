@@ -181,7 +181,7 @@ Before fanning out across all 10 streams, prove the smallest viable path on the 
 | Wired-memory kernel panic on KV overrun | Medium | High | Always set `mx.metal.set_memory_limit` + `set_wired_limit` ≤ 0.7 |
 | Sinkhorn (mHC) numerical instability in bf16 | Medium | Medium | Force fp32 inside Sinkhorn iters (mirror nanochat) |
 | MTP recursive shared-block breaks `mx.compile` | Medium | Medium | Use static-shape roll-and-mask trick; static K |
-| FIM/iFIM token-id collision on tokenizer reload | Medium | High | Assert at model load; reserve range [3..7] in tokenizer training |
+| FIM/iFIM token-id collision on tokenizer reload | Medium | High | Assert deployed layout at model load; preserve id7=`<CODE_START>` and id45=`<FIM_INSTRUCTION>` |
 | Distributed parity drift across ranks | Medium | High | Determinism harness with seeded `mx.random.state` per rank |
 | MacBook thermal throttling masquerading as code regression | High | Low | Run benches on Mac Studio only; thermal monitor in CI |
 | `mlx-data` Python-transform GIL bottleneck | Medium | Medium | PyTorch DataLoader bridge fallback; keep transforms in C++ ops |

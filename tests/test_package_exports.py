@@ -132,6 +132,12 @@ def test_package_roots_expose_local_mlx_contracts() -> None:
         "next_token_and_stp_loss",
         "STPLossConfig",
         "STPLossMetrics",
+        "M05_MTP_PARITY_POLICY",
+        "M05_MTP_PARITY_PROFILE",
+        "build_m05_mtp_parity_manifest",
+        "m05_loss_values_sha256",
+        "validate_m05_mtp_parity_manifest_dict",
+        "write_m05_mtp_parity_manifest_json",
     } <= _assert_public_exports(training)
     assert {
         "MetalKernelStatus",

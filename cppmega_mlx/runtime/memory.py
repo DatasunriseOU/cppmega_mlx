@@ -409,7 +409,10 @@ def _memory_limit_plan_ratios_meet_gate(plan: MemoryLimitPlan) -> bool:
     )
 
 
-def _runtime_stack_meets_gate(runtime_stack: RuntimeStackEvidence | None) -> bool:
+def _runtime_stack_meets_gate(
+    runtime_stack: RuntimeStackEvidence | None,
+    total_bytes: int,
+) -> bool:
     if runtime_stack is None:
         return False
     device_info = runtime_stack.device_info
@@ -420,9 +423,11 @@ def _runtime_stack_meets_gate(runtime_stack: RuntimeStackEvidence | None) -> boo
     return (
         runtime_stack.mlx_version is not None
         and runtime_stack.mlx_metal_version is not None
+        and runtime_stack.platform_system == "Darwin"
+        and runtime_stack.machine == "arm64"
         and runtime_stack.metal_available is True
         and bool(runtime_stack.default_device)
-        and memory_size > 0
+        and memory_size == total_bytes
         and bool(device_info.get("device_name"))
     )
 
@@ -623,7 +628,7 @@ def memory_limit_receipt(
         run_command,
         required_run_command_tokens,
     )
-    runtime_stack_meets_gate = _runtime_stack_meets_gate(runtime_stack)
+    runtime_stack_meets_gate = _runtime_stack_meets_gate(runtime_stack, total)
     full_gate_satisfied = (
         full_acceptance_claim
         and peak_below_threshold is True

@@ -215,12 +215,17 @@ class TokenParquetDataset:
 
         if consumed_batches < 0:
             raise ValueError("consumed_batches must be non-negative")
+        total_batches = self.resume_batch + consumed_batches
         if self.num_batches == 0:
-            return BatchCursor(epoch=epoch, batch_offset=0, global_batch_offset=0)
+            return BatchCursor(
+                epoch=epoch,
+                batch_offset=0,
+                global_batch_offset=total_batches,
+            )
         return BatchCursor(
-            epoch=epoch + consumed_batches // self.num_batches,
-            batch_offset=consumed_batches % self.num_batches,
-            global_batch_offset=consumed_batches,
+            epoch=epoch + total_batches // self.num_batches,
+            batch_offset=total_batches % self.num_batches,
+            global_batch_offset=total_batches,
         )
 
     def token_id_range(self) -> tuple[int, int]:

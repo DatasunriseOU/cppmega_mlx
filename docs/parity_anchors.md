@@ -128,8 +128,9 @@ launchers.
 - Artifact receipt: read-only inspection of
   `/home/dave/cppmega-root/cpp_tokenizer_hf/tokenizer.json` and
   `/home/dave/cppmega-root/data/tokenizer/tokenizer.json` found vocab=65536,
-  id7=`<CODE_START>`, id45=`<FIM_INSTRUCTION>`, and SHA-256
-  `431170fd0887c2b83f04671a8d63e3ffaef2ad194c3fa5db4651286cc973c5eb`,
+  id7=`<CODE_START>`, id45=`<FIM_INSTRUCTION>`, id46=`<SPACE>`,
+  id47=`<NL>`, and SHA-256
+  `d3c4711161a452ee36d64222b6977845ddd58b1e723a7de54158c64c50d2a888`,
   matching the vendored local artifact contract.
 - Closure receipt: M0.1 is closed after vendoring the deployed GB10 tokenizer
   plus the explicit whitespace-sentinel wrapper. The deployed JSON remains
@@ -225,6 +226,10 @@ launchers.
   `cppmega/megatron/mtp_native_hopper_ce.py`. M0.5 remains open until that
   artifact exists and a numerical MLX-vs-CUDA comparison is evaluated; the
   local tests above are contract coverage, not closure evidence.
+- Hardening receipt: the M0.5 manifest builder/validator now rejects nested
+  CUDA/MLX overclaim fields such as numerical-harness, parity-passed, and full
+  acceptance flags. This is scaffold hardening only; it does not replace the
+  required CUDA artifact or numerical harness.
 
 ### Engram Standalone Local Slice
 

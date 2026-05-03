@@ -7,6 +7,7 @@ runtime; callers provide already-computed error metrics.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 from dataclasses import dataclass, field
@@ -123,6 +124,83 @@ _M03_CUDA_STATUS_BY_PREFLIGHT_STATUS = {
     "invalid": "refused_invalid_artifact",
     "valid_not_evaluated": "refused_not_evaluated",
 }
+M05_MTP_PARITY_RECEIPT_SCOPE = "local_cuda_mlx_m05_fastmtp"
+M05_MTP_PARITY_ISSUE_ID = "cppmega-mlx-t8f.5"
+M05_MTP_PARITY_OUTPUT = "bench/parity/m05_fastmtp.json"
+M05_MTP_PARITY_PROFILE = "local_gb10_quarter"
+M05_MTP_DEPTH = 2
+M05_MTP_BETA = 0.6
+M05_MTP_LAMBDA = 0.3
+M05_MTP_PARITY_POLICY = (
+    "M0.5 FastMTP parity is fail-closed. This helper records the required "
+    "local_gb10_quarter MTP metadata and CUDA reference identity, but it does "
+    "not run CUDA, MLX, Hopper/Liger fused CE, or a numerical comparison. "
+    "Closure requires a real GB10 CUDA FastMTP golden artifact plus a separate "
+    "numerical MLX-vs-CUDA comparison harness."
+)
+M05_MTP_CUDA_REFERENCE_SOURCES = (
+    "cppmega/megatron/fastmtp_layer.py",
+    "cppmega/megatron/mtp_native_hopper_ce.py",
+)
+M05_MTP_CUDA_ARTIFACT_PATH = "bench/parity/cuda/m05_local_gb10_quarter_fastmtp.json"
+M05_MTP_CUDA_ARTIFACT_FORMAT = "cppmega_cuda_m05_fastmtp_v1"
+M05_MTP_CUDA_ARTIFACT_PREFLIGHT_STATUSES = M03_FORWARD_PARITY_CUDA_ARTIFACT_PREFLIGHT_STATUSES
+M05_MTP_CUDA_LOSS_VALUE_FIELDS = (
+    "next_token_loss",
+    "mtp_loss",
+    "total_loss",
+    "mtp_depth_1_loss",
+    "mtp_depth_2_loss",
+    "grad_norm",
+)
+_M05_CUDA_REFERENCE_FALSE_CLAIM_FIELDS = (
+    "acceptance_claim",
+    "numerical_harness_passed",
+    "numerical_parity_passed",
+    "full_m0_5_acceptance",
+    "full_m0_5_acceptance_claim",
+    "gb10_mtp_parity_claim",
+    "m4_vs_gb10_mtp_parity_claim",
+    "distributed_megatron_mtp_parity_claim",
+    "evaluated_by_numerical_harness",
+)
+M05_MTP_CUDA_ARTIFACT_CONTRACT: JsonObject = {
+    "format": M05_MTP_CUDA_ARTIFACT_FORMAT,
+    "required_artifact": M05_MTP_CUDA_ARTIFACT_PATH,
+    "profile": M05_MTP_PARITY_PROFILE,
+    "mtp_depth": M05_MTP_DEPTH,
+    "mtp_beta": M05_MTP_BETA,
+    "mtp_lambda": M05_MTP_LAMBDA,
+    "required_cuda_reference_sources": list(M05_MTP_CUDA_REFERENCE_SOURCES),
+    "required_loss_value_fields": list(M05_MTP_CUDA_LOSS_VALUE_FIELDS),
+    "requires_source_sha256": True,
+    "requires_loss_values_sha256": True,
+    "requires_finite_loss_values": True,
+    "requires_grad_norm": True,
+    "requires_false_claim_fields": list(_M05_CUDA_REFERENCE_FALSE_CLAIM_FIELDS),
+    "requires_separate_numerical_harness": True,
+}
+_M05_CUDA_STATUS_BY_PREFLIGHT_STATUS = _M03_CUDA_STATUS_BY_PREFLIGHT_STATUS
+_M05_MTP_TENSOR_NAME_MARKERS = (".mtp", "_mtp", "mtp_", "mtp.")
+_M05_MTP_LOSS_REL_TOL = 1e-12
+_M05_MTP_LOSS_ABS_TOL = 1e-12
+_M05_REQUIRED_CLAIM_BOUNDARY_PHRASES = (
+    "no FastMTP numerical parity",
+    "Hopper/Liger fused-CE",
+    "GB10",
+    "M4-vs-GB10",
+    "distributed Megatron parity",
+)
+_M05_MLX_REFERENCE_FALSE_CLAIM_FIELDS = (
+    "numerical_parity_passed",
+    "full_m0_5_acceptance",
+    "full_m0_5_acceptance_claim",
+    "gb10_mtp_parity_claim",
+    "m4_vs_gb10_mtp_parity_claim",
+    "distributed_megatron_mtp_parity_claim",
+    "local_mlx_mtp_losses_evaluated",
+    "readiness_is_cuda_parity",
+)
 REQUIRED_RECEIPT_FIELDS = (
     "tensor_name",
     "shape",
@@ -167,9 +245,69 @@ def _require_mapping(payload: Any, *, label: str) -> Mapping[str, Any]:
 
 def _require_non_empty_string(payload: Mapping[str, Any], field_name: str) -> str:
     value = payload.get(field_name)
-    if not isinstance(value, str) or not value:
+    if not isinstance(value, str) or not value.strip():
         raise ValueError(f"parity receipt {field_name} must be a non-empty string")
     return value
+
+
+def _require_exact_keyset(
+    payload: Mapping[str, Any],
+    expected: Iterable[str],
+    *,
+    label: str,
+) -> None:
+    expected_set = set(expected)
+    observed_set = set(payload)
+    if observed_set != expected_set:
+        missing = sorted(expected_set - observed_set)
+        extra = sorted(observed_set - expected_set)
+        raise ValueError(
+            f"{label} must contain exactly {sorted(expected_set)!r}; "
+            f"missing={missing!r}; extra={extra!r}"
+        )
+
+
+def _require_gb10_cuda_reference_metadata(
+    payload: Mapping[str, Any],
+    *,
+    hardware_field: str,
+    cuda_runtime_field: str,
+    label: str,
+) -> None:
+    hardware = _require_non_empty_string(payload, hardware_field)
+    hardware_upper = hardware.upper()
+    negated_cuda_markers = ("NOT CUDA", "NO CUDA", "NON-CUDA", "WITHOUT CUDA")
+    contradictory_markers = (
+        "APPLE",
+        "M4",
+        "METAL",
+        "MPS",
+        "MLX",
+        "CPU",
+        "FALLBACK",
+        "EMULATION",
+        "EMULATED",
+        "SIMULATED",
+        "HOST-ONLY",
+        "HOST ONLY",
+        "FAKE",
+        "NOT ACTUALLY",
+    )
+    if (
+        "GB10" not in hardware_upper
+        or "CUDA" not in hardware_upper
+        or any(marker in hardware_upper for marker in negated_cuda_markers)
+        or any(marker in hardware_upper for marker in contradictory_markers)
+    ):
+        raise ValueError(f"{label} {hardware_field} must contain GB10 and CUDA")
+    cuda_runtime = _require_non_empty_string(payload, cuda_runtime_field)
+    cuda_runtime_upper = cuda_runtime.upper()
+    if "CUDA" not in cuda_runtime_upper or any(
+        marker in cuda_runtime_upper for marker in negated_cuda_markers
+    ) or any(
+        marker in cuda_runtime_upper for marker in contradictory_markers
+    ):
+        raise ValueError(f"{label} {cuda_runtime_field} must contain CUDA")
 
 
 def _require_non_negative_number(payload: Mapping[str, Any], field_name: str) -> float:
@@ -251,6 +389,54 @@ def _validate_no_local_parity_claims(payload: Mapping[str, Any], *, label: str) 
     for field_name in _FALSE_CLAIM_FIELDS:
         if payload.get(field_name) is not False:
             raise ValueError(f"{label} {field_name} must be false")
+
+
+def _is_m05_mtp_receipt_tensor_name(tensor_name: Any) -> bool:
+    if not isinstance(tensor_name, str):
+        return False
+    lowered = tensor_name.lower()
+    return (
+        M05_MTP_PARITY_PROFILE in lowered
+        and any(marker in lowered for marker in _M05_MTP_TENSOR_NAME_MARKERS)
+    )
+
+
+def _count_m05_mtp_receipts(receipts: Iterable[Any]) -> int:
+    return sum(
+        1
+        for receipt in receipts
+        if isinstance(receipt, Mapping)
+        and _is_m05_mtp_receipt_tensor_name(receipt.get("tensor_name"))
+    )
+
+
+def _expected_m05_mtp_loss(loss_values: Mapping[str, Any]) -> float:
+    beta_weights = [M05_MTP_BETA ** depth for depth in range(M05_MTP_DEPTH)]
+    weight_sum = math.fsum(beta_weights)
+    weighted_depth_loss = math.fsum(
+        weight
+        * float(loss_values[f"mtp_depth_{depth + 1}_loss"])
+        for depth, weight in enumerate(beta_weights)
+    )
+    return weighted_depth_loss / weight_sum
+
+
+def m05_loss_values_sha256(loss_values: Mapping[str, Any]) -> str:
+    """Return the canonical hash for an M0.5 CUDA loss_values payload."""
+
+    canonical_loss_values: dict[str, float] = {}
+    for field_name in M05_MTP_CUDA_LOSS_VALUE_FIELDS:
+        value = float(loss_values[field_name])
+        if not math.isfinite(value):
+            raise ValueError("M0.5 loss_values hash fields must be finite")
+        canonical_loss_values[field_name] = value
+    encoded = json.dumps(
+        canonical_loss_values,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -444,8 +630,12 @@ def validate_m03_cuda_reference_artifact_dict(
         raise ValueError("M0.3 CUDA reference artifact input_tokens_sha256 is stale")
     _require_sha256(payload, "logits_sha256", label="M0.3 CUDA reference artifact")
     _require_non_empty_string(payload, "source_commit")
-    _require_non_empty_string(payload, "hardware")
-    _require_non_empty_string(payload, "cuda_runtime")
+    _require_gb10_cuda_reference_metadata(
+        payload,
+        hardware_field="hardware",
+        cuda_runtime_field="cuda_runtime",
+        label="M0.3 CUDA reference artifact",
+    )
 
     summary = _require_mapping(
         payload.get("logits_summary"),
@@ -468,6 +658,133 @@ def validate_m03_cuda_reference_artifact_dict(
                 f"M0.3 CUDA reference artifact logits_summary {field_name} "
                 "must be non-negative"
             )
+
+
+def validate_m05_cuda_reference_artifact_dict(payload: Mapping[str, Any]) -> None:
+    """Validate the external CUDA FastMTP artifact metadata for M0.5.
+
+    This is a metadata/checksum preflight only. It never compares MLX and CUDA
+    loss tensors and cannot close M0.5.
+    """
+
+    _require_mapping(payload, label="M0.5 CUDA reference artifact")
+    if payload.get("format") != M05_MTP_CUDA_ARTIFACT_FORMAT:
+        raise ValueError(
+            "M0.5 CUDA reference artifact format must be "
+            f"{M05_MTP_CUDA_ARTIFACT_FORMAT!r}"
+        )
+    if payload.get("profile") != M05_MTP_PARITY_PROFILE:
+        raise ValueError(
+            f"M0.5 CUDA reference artifact profile must be {M05_MTP_PARITY_PROFILE!r}"
+        )
+    _require_exact_int(
+        payload,
+        "mtp_depth",
+        M05_MTP_DEPTH,
+        label="M0.5 CUDA reference artifact",
+    )
+    beta = _require_finite_number(payload, "mtp_beta", label="M0.5 CUDA reference artifact")
+    if beta != M05_MTP_BETA:
+        raise ValueError(f"M0.5 CUDA reference artifact mtp_beta must be {M05_MTP_BETA}")
+    lambda_value = _require_finite_number(
+        payload,
+        "mtp_lambda",
+        label="M0.5 CUDA reference artifact",
+    )
+    if lambda_value != M05_MTP_LAMBDA:
+        raise ValueError(f"M0.5 CUDA reference artifact mtp_lambda must be {M05_MTP_LAMBDA}")
+
+    sources = payload.get("cuda_reference_sources")
+    if not isinstance(sources, list):
+        raise ValueError("M0.5 CUDA reference artifact cuda_reference_sources must be a list")
+    if any(not isinstance(source, str) for source in sources):
+        raise ValueError(
+            "M0.5 CUDA reference artifact cuda_reference_sources must contain only strings"
+        )
+    if len(sources) != len(set(sources)):
+        raise ValueError("M0.5 CUDA reference artifact cuda_reference_sources must not contain duplicates")
+    expected_sources = list(M05_MTP_CUDA_REFERENCE_SOURCES)
+    if sources != expected_sources:
+        raise ValueError(
+            "M0.5 CUDA reference artifact cuda_reference_sources must exactly match "
+            f"{expected_sources!r}"
+        )
+    source_sha256 = _require_mapping(
+        payload.get("source_sha256"),
+        label="M0.5 CUDA reference artifact source_sha256",
+    )
+    _require_exact_keyset(
+        source_sha256,
+        M05_MTP_CUDA_REFERENCE_SOURCES,
+        label="M0.5 CUDA reference artifact source_sha256",
+    )
+    for source in M05_MTP_CUDA_REFERENCE_SOURCES:
+        _require_sha256(source_sha256, source, label="M0.5 CUDA reference artifact source_sha256")
+
+    loss_values = _require_mapping(
+        payload.get("loss_values"),
+        label="M0.5 CUDA reference artifact loss_values",
+    )
+    _require_exact_keyset(
+        loss_values,
+        M05_MTP_CUDA_LOSS_VALUE_FIELDS,
+        label="M0.5 CUDA reference artifact loss_values",
+    )
+    for field_name in M05_MTP_CUDA_LOSS_VALUE_FIELDS:
+        value = _require_finite_number(
+            loss_values,
+            field_name,
+            label="M0.5 CUDA reference artifact loss_values",
+        )
+        if value < 0:
+            raise ValueError(
+                f"M0.5 CUDA reference artifact loss_values {field_name} must be non-negative"
+            )
+    expected_mtp_loss = _expected_m05_mtp_loss(loss_values)
+    mtp_loss = float(loss_values["mtp_loss"])
+    if not math.isclose(
+        mtp_loss,
+        expected_mtp_loss,
+        rel_tol=_M05_MTP_LOSS_REL_TOL,
+        abs_tol=_M05_MTP_LOSS_ABS_TOL,
+    ):
+        raise ValueError(
+            "M0.5 CUDA reference artifact loss_values mtp_loss must equal "
+            "beta-normalized weighted per-depth MTP loss"
+        )
+    expected_total_loss = float(loss_values["next_token_loss"]) + M05_MTP_LAMBDA * mtp_loss
+    total_loss = float(loss_values["total_loss"])
+    if not math.isclose(
+        total_loss,
+        expected_total_loss,
+        rel_tol=_M05_MTP_LOSS_REL_TOL,
+        abs_tol=_M05_MTP_LOSS_ABS_TOL,
+    ):
+        raise ValueError(
+            "M0.5 CUDA reference artifact loss_values total_loss must equal "
+            "next_token_loss + mtp_lambda * mtp_loss"
+        )
+    loss_values_sha256 = _require_sha256(
+        payload,
+        "loss_values_sha256",
+        label="M0.5 CUDA reference artifact",
+    )
+    expected_loss_values_sha256 = m05_loss_values_sha256(loss_values)
+    if loss_values_sha256 != expected_loss_values_sha256:
+        raise ValueError(
+            "M0.5 CUDA reference artifact loss_values_sha256 must match "
+            "canonical loss_values"
+        )
+    _require_non_empty_string(payload, "source_commit")
+    _require_gb10_cuda_reference_metadata(
+        payload,
+        hardware_field="hardware",
+        cuda_runtime_field="cuda_runtime",
+        label="M0.5 CUDA reference artifact",
+    )
+    for field_name in _M05_CUDA_REFERENCE_FALSE_CLAIM_FIELDS:
+        if payload.get(field_name) is not False:
+            raise ValueError(f"M0.5 CUDA reference artifact {field_name} must be false")
 
 
 def build_parity_manifest(
@@ -890,8 +1207,12 @@ def validate_m03_forward_parity_manifest_dict(payload: Mapping[str, Any]) -> Non
             label="M0.3 cuda_reference",
         )
         _require_non_empty_string(cuda_reference, "artifact_source_commit")
-        _require_non_empty_string(cuda_reference, "artifact_hardware")
-        _require_non_empty_string(cuda_reference, "artifact_cuda_runtime")
+        _require_gb10_cuda_reference_metadata(
+            cuda_reference,
+            hardware_field="artifact_hardware",
+            cuda_runtime_field="artifact_cuda_runtime",
+            label="M0.3 cuda_reference",
+        )
     artifact = cuda_reference.get("artifact")
     if artifact_supplied:
         if status != "refused":
@@ -993,6 +1314,404 @@ def write_m03_forward_parity_manifest_json(
     return manifest
 
 
+def build_m05_mtp_parity_manifest(
+    receipts: Iterable[TensorParityReceipt | Mapping[str, Any]],
+    *,
+    profile: str = M05_MTP_PARITY_PROFILE,
+    mtp_depth: int = M05_MTP_DEPTH,
+    mtp_beta: float = M05_MTP_BETA,
+    mtp_lambda: float = M05_MTP_LAMBDA,
+    source: str | None = None,
+    cuda_reference_artifact: str | Path | None = None,
+    cuda_reference: Mapping[str, Any] | None = None,
+    cuda_reference_preflight: Mapping[str, Any] | None = None,
+    mlx_reference: Mapping[str, Any] | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> JsonObject:
+    """Build the fail-closed M0.5 FastMTP parity scaffold manifest."""
+
+    if profile != M05_MTP_PARITY_PROFILE:
+        raise ValueError(f"M0.5 profile must be {M05_MTP_PARITY_PROFILE!r}")
+    _require_exact_int({"mtp_depth": mtp_depth}, "mtp_depth", M05_MTP_DEPTH, label="M0.5")
+    if mtp_beta != M05_MTP_BETA:
+        raise ValueError(f"M0.5 mtp_beta must be {M05_MTP_BETA}")
+    if mtp_lambda != M05_MTP_LAMBDA:
+        raise ValueError(f"M0.5 mtp_lambda must be {M05_MTP_LAMBDA}")
+
+    manifest = build_parity_manifest(receipts, source=source, metadata=metadata)
+    rows = manifest["receipts"]
+    if not isinstance(rows, list):  # pragma: no cover - build_parity_manifest invariant.
+        raise ValueError("M0.5 receipts must be a list")
+    mtp_receipts = _count_m05_mtp_receipts(rows)
+    artifact_text = str(cuda_reference_artifact) if cuda_reference_artifact is not None else None
+    artifact_supplied = bool(artifact_text)
+    cuda_preflight_payload = _json_safe_mapping(cuda_reference_preflight or {})
+    preflight_status = cuda_preflight_payload.get("artifact_preflight_status")
+    if not isinstance(preflight_status, str):
+        preflight_status = "missing" if artifact_supplied else "not_supplied"
+        cuda_preflight_payload["artifact_preflight_status"] = preflight_status
+    cuda_status = _M05_CUDA_STATUS_BY_PREFLIGHT_STATUS.get(preflight_status)
+    if cuda_status is None:
+        allowed = ", ".join(M05_MTP_CUDA_ARTIFACT_PREFLIGHT_STATUSES)
+        raise ValueError(f"M0.5 artifact_preflight_status must be one of {allowed}")
+    status = "blocked" if preflight_status == "not_supplied" else "refused"
+    if "required_artifact" not in cuda_preflight_payload:
+        cuda_preflight_payload["required_artifact"] = M05_MTP_CUDA_ARTIFACT_PATH
+    if "artifact_contract" not in cuda_preflight_payload:
+        cuda_preflight_payload["artifact_contract"] = _json_safe_mapping(
+            M05_MTP_CUDA_ARTIFACT_CONTRACT
+        )
+    if "artifact_error" not in cuda_preflight_payload:
+        if preflight_status == "valid_not_evaluated":
+            cuda_preflight_payload["artifact_error"] = None
+        elif preflight_status == "not_supplied":
+            cuda_preflight_payload["artifact_error"] = (
+                "No CUDA FastMTP reference artifact was supplied."
+            )
+        else:
+            cuda_preflight_payload["artifact_error"] = (
+                "CUDA FastMTP reference artifact preflight was not run by the caller."
+            )
+    if "evaluates_mtp_losses" not in cuda_preflight_payload:
+        cuda_preflight_payload["evaluates_mtp_losses"] = False
+    if "preflight_is_acceptance" not in cuda_preflight_payload:
+        cuda_preflight_payload["preflight_is_acceptance"] = False
+    if preflight_status == "valid_not_evaluated":
+        blocker = (
+            "CUDA FastMTP reference artifact passed metadata preflight, but MTP losses "
+            "and grad norm were not compared; M0.5 closure requires a separate "
+            "numerical parity harness."
+        )
+    elif preflight_status == "not_supplied":
+        blocker = (
+            "No CUDA FastMTP reference artifact was supplied; M0.5 closure requires "
+            f"the exact external artifact at {M05_MTP_CUDA_ARTIFACT_PATH} plus a "
+            "separate numerical parity harness."
+        )
+    elif preflight_status == "missing":
+        blocker = (
+            "CUDA FastMTP reference artifact path was supplied but the artifact is "
+            "missing; M0.5 closure requires the artifact contract plus a separate "
+            "numerical parity harness."
+        )
+    else:
+        blocker = (
+            "CUDA FastMTP reference artifact preflight failed; M0.5 closure requires "
+            "a valid artifact contract plus a separate numerical parity harness."
+        )
+
+    cuda_reference_payload = _json_safe_mapping(cuda_reference or {})
+    cuda_reference_payload.update(cuda_preflight_payload)
+    cuda_reference_payload.update(
+        {
+            "status": cuda_status,
+            "artifact": artifact_text,
+            "artifact_supplied": artifact_supplied,
+            "evaluated_by_this_manifest": False,
+            "required_for_closure": True,
+            "required_artifact": cuda_preflight_payload["required_artifact"],
+            "artifact_contract": cuda_preflight_payload["artifact_contract"],
+            "artifact_error": cuda_preflight_payload["artifact_error"],
+        }
+    )
+    mlx_reference_payload = _json_safe_mapping(mlx_reference or {})
+    mlx_reference_payload.update(
+        {
+            "status": "not_evaluated",
+            "evaluated_by_this_manifest": False,
+            "required_for_closure": True,
+        }
+    )
+
+    manifest.update(
+        {
+            "m0_5_schema_version": 1,
+            "m0_5_receipt_scope": M05_MTP_PARITY_RECEIPT_SCOPE,
+            "status": status,
+            "issue": {
+                "id": M05_MTP_PARITY_ISSUE_ID,
+                "title": "M0.5: fail-closed FastMTP parity scaffold",
+            },
+            "m0_5_policy": M05_MTP_PARITY_POLICY,
+            "profile": profile,
+            "mtp_config": {
+                "depth": mtp_depth,
+                "beta": mtp_beta,
+                "lambda": mtp_lambda,
+                "profile": profile,
+            },
+            "cuda_reference_identity": {
+                "required_sources": list(M05_MTP_CUDA_REFERENCE_SOURCES),
+                "artifact_contract": _json_safe_mapping(M05_MTP_CUDA_ARTIFACT_CONTRACT),
+                "requires_hopper_liger_fused_ce_receipt": True,
+            },
+            "acceptance_status": "not_evaluated",
+            "m0_5_closed": False,
+            "full_m0_5_acceptance_claim": False,
+            "gb10_mtp_parity_claim": False,
+            "m4_vs_gb10_mtp_parity_claim": False,
+            "distributed_megatron_mtp_parity_claim": False,
+            "claim_boundary": (
+                "This scaffold makes no FastMTP numerical parity, Hopper/Liger fused-CE, "
+                "GB10, M4-vs-GB10, or distributed Megatron parity claim."
+            ),
+            "cuda_reference": cuda_reference_payload,
+            "mlx_reference": mlx_reference_payload,
+            "acceptance_gate": {
+                "requires_cuda_reference_artifact": True,
+                "requires_external_cuda_mtp_losses": True,
+                "requires_external_cuda_grad_norm": True,
+                "requires_mlx_mtp_losses": True,
+                "requires_matching_mtp_depth": True,
+                "requires_matching_beta_lambda": True,
+                "requires_separate_numerical_harness": True,
+                "requires_hopper_liger_fused_ce_receipt": True,
+                "cuda_reference_artifact_supplied": artifact_supplied,
+                "cuda_reference_artifact_preflight_status": preflight_status,
+                "receipt_count": len(rows),
+                "mtp_receipts": mtp_receipts,
+                "receipts_evaluated_by_this_manifest": False,
+                "full_m0_5_acceptance": False,
+                "blocker": blocker,
+            },
+        }
+    )
+    validate_m05_mtp_parity_manifest_dict(manifest)
+    return manifest
+
+
+def validate_m05_mtp_parity_manifest_dict(payload: Mapping[str, Any]) -> None:
+    """Validate the M0.5 wrapper and its generic parity manifest payload."""
+
+    validate_parity_manifest_dict(payload)
+    if payload.get("m0_5_schema_version") != 1:
+        raise ValueError("M0.5 manifest m0_5_schema_version must be 1")
+    if payload.get("m0_5_receipt_scope") != M05_MTP_PARITY_RECEIPT_SCOPE:
+        raise ValueError(
+            f"M0.5 manifest m0_5_receipt_scope must be {M05_MTP_PARITY_RECEIPT_SCOPE!r}"
+        )
+    issue = _require_mapping(payload.get("issue"), label="M0.5 manifest issue")
+    if issue.get("id") != M05_MTP_PARITY_ISSUE_ID:
+        raise ValueError(f"M0.5 manifest issue.id must be {M05_MTP_PARITY_ISSUE_ID!r}")
+    status = _require_non_empty_string(payload, "status")
+    if status not in ("blocked", "refused"):
+        raise ValueError("M0.5 manifest status must be blocked or refused")
+    if payload.get("profile") != M05_MTP_PARITY_PROFILE:
+        raise ValueError(f"M0.5 manifest profile must be {M05_MTP_PARITY_PROFILE!r}")
+    mtp_config = _require_mapping(payload.get("mtp_config"), label="M0.5 mtp_config")
+    if mtp_config.get("depth") != M05_MTP_DEPTH:
+        raise ValueError("M0.5 mtp_config.depth must match fixed MTP depth")
+    if mtp_config.get("beta") != M05_MTP_BETA:
+        raise ValueError("M0.5 mtp_config.beta must match fixed MTP beta")
+    if mtp_config.get("lambda") != M05_MTP_LAMBDA:
+        raise ValueError("M0.5 mtp_config.lambda must match fixed MTP lambda")
+    if mtp_config.get("profile") != M05_MTP_PARITY_PROFILE:
+        raise ValueError("M0.5 mtp_config.profile must match fixed profile")
+
+    identity = _require_mapping(
+        payload.get("cuda_reference_identity"),
+        label="M0.5 cuda_reference_identity",
+    )
+    if identity.get("required_sources") != list(M05_MTP_CUDA_REFERENCE_SOURCES):
+        raise ValueError("M0.5 cuda_reference_identity.required_sources must match contract")
+    contract = _require_mapping(
+        identity.get("artifact_contract"),
+        label="M0.5 cuda_reference_identity.artifact_contract",
+    )
+    if contract != M05_MTP_CUDA_ARTIFACT_CONTRACT:
+        raise ValueError("M0.5 cuda_reference_identity.artifact_contract must match contract")
+    if identity.get("requires_hopper_liger_fused_ce_receipt") is not True:
+        raise ValueError(
+            "M0.5 cuda_reference_identity.requires_hopper_liger_fused_ce_receipt must be true"
+        )
+
+    if payload.get("acceptance_status") != "not_evaluated":
+        raise ValueError("M0.5 acceptance_status must be not_evaluated")
+    if payload.get("m0_5_closed") is not False:
+        raise ValueError("M0.5 m0_5_closed must be false")
+    for field_name in (
+        "full_m0_5_acceptance_claim",
+        "gb10_mtp_parity_claim",
+        "m4_vs_gb10_mtp_parity_claim",
+        "distributed_megatron_mtp_parity_claim",
+    ):
+        if payload.get(field_name) is not False:
+            raise ValueError(f"M0.5 manifest {field_name} must be false")
+    claim_boundary = payload.get("claim_boundary")
+    if not isinstance(claim_boundary, str) or not claim_boundary:
+        raise ValueError("M0.5 manifest claim_boundary must be a non-empty string")
+    missing_claim_phrases = [
+        phrase for phrase in _M05_REQUIRED_CLAIM_BOUNDARY_PHRASES if phrase not in claim_boundary
+    ]
+    if missing_claim_phrases:
+        raise ValueError(
+            "M0.5 manifest claim_boundary missing required phrases: "
+            f"{', '.join(missing_claim_phrases)}"
+        )
+
+    gate = _require_mapping(payload.get("acceptance_gate"), label="M0.5 acceptance_gate")
+    for field_name in (
+        "requires_cuda_reference_artifact",
+        "requires_external_cuda_mtp_losses",
+        "requires_external_cuda_grad_norm",
+        "requires_mlx_mtp_losses",
+        "requires_matching_mtp_depth",
+        "requires_matching_beta_lambda",
+        "requires_separate_numerical_harness",
+        "requires_hopper_liger_fused_ce_receipt",
+    ):
+        if gate.get(field_name) is not True:
+            raise ValueError(f"M0.5 acceptance_gate.{field_name} must be true")
+    if gate.get("receipts_evaluated_by_this_manifest") is not False:
+        raise ValueError("M0.5 acceptance_gate.receipts_evaluated_by_this_manifest must be false")
+    if gate.get("full_m0_5_acceptance") is not False:
+        raise ValueError("M0.5 acceptance_gate.full_m0_5_acceptance must be false")
+    blocker = gate.get("blocker")
+    if not isinstance(blocker, str) or not blocker:
+        raise ValueError("M0.5 acceptance_gate.blocker must be a non-empty string")
+    receipts = payload.get("receipts")
+    if not isinstance(receipts, list):  # validate_parity_manifest_dict checks this first.
+        raise ValueError("M0.5 manifest receipts must be a list")
+    receipt_count = gate.get("receipt_count")
+    if receipt_count != payload.get("num_receipts") or receipt_count != len(receipts):
+        raise ValueError("M0.5 acceptance_gate.receipt_count must match num_receipts and receipts length")
+    mtp_receipts = gate.get("mtp_receipts")
+    if isinstance(mtp_receipts, bool) or not isinstance(mtp_receipts, int):
+        raise ValueError("M0.5 acceptance_gate.mtp_receipts must be an integer")
+    expected_mtp_receipts = _count_m05_mtp_receipts(receipts)
+    if mtp_receipts != expected_mtp_receipts:
+        raise ValueError("M0.5 acceptance_gate.mtp_receipts must match scoped MTP receipts")
+
+    cuda_reference = _require_mapping(payload.get("cuda_reference"), label="M0.5 cuda_reference")
+    artifact_supplied = cuda_reference.get("artifact_supplied")
+    if not isinstance(artifact_supplied, bool):
+        raise ValueError("M0.5 cuda_reference.artifact_supplied must be boolean")
+    if gate.get("cuda_reference_artifact_supplied") is not artifact_supplied:
+        raise ValueError("M0.5 acceptance_gate.cuda_reference_artifact_supplied mismatch")
+    preflight_status = cuda_reference.get("artifact_preflight_status")
+    if preflight_status not in M05_MTP_CUDA_ARTIFACT_PREFLIGHT_STATUSES:
+        allowed = ", ".join(M05_MTP_CUDA_ARTIFACT_PREFLIGHT_STATUSES)
+        raise ValueError(f"M0.5 cuda_reference.artifact_preflight_status must be one of {allowed}")
+    if gate.get("cuda_reference_artifact_preflight_status") != preflight_status:
+        raise ValueError("M0.5 acceptance_gate.cuda_reference_artifact_preflight_status mismatch")
+    expected_supplied = preflight_status != "not_supplied"
+    if artifact_supplied is not expected_supplied:
+        raise ValueError("M0.5 cuda_reference.artifact_supplied must match preflight status")
+    expected_cuda_status = _M05_CUDA_STATUS_BY_PREFLIGHT_STATUS[preflight_status]
+    if cuda_reference.get("status") != expected_cuda_status:
+        raise ValueError(f"M0.5 cuda_reference.status must be {expected_cuda_status!r}")
+    if cuda_reference.get("evaluated_by_this_manifest") is not False:
+        raise ValueError("M0.5 cuda_reference.evaluated_by_this_manifest must be false")
+    if cuda_reference.get("required_for_closure") is not True:
+        raise ValueError("M0.5 cuda_reference.required_for_closure must be true")
+    if cuda_reference.get("evaluates_mtp_losses") is not False:
+        raise ValueError("M0.5 cuda_reference.evaluates_mtp_losses must be false")
+    if cuda_reference.get("preflight_is_acceptance") is not False:
+        raise ValueError("M0.5 cuda_reference.preflight_is_acceptance must be false")
+    for field_name in _M05_CUDA_REFERENCE_FALSE_CLAIM_FIELDS:
+        _require_false_when_present(
+            cuda_reference,
+            field_name,
+            label="M0.5 cuda_reference",
+        )
+    if cuda_reference.get("required_artifact") != M05_MTP_CUDA_ARTIFACT_PATH:
+        raise ValueError(
+            "M0.5 cuda_reference.required_artifact must be "
+            f"{M05_MTP_CUDA_ARTIFACT_PATH!r}"
+        )
+    cuda_contract = _require_mapping(
+        cuda_reference.get("artifact_contract"),
+        label="M0.5 cuda_reference.artifact_contract",
+    )
+    if cuda_contract != M05_MTP_CUDA_ARTIFACT_CONTRACT:
+        raise ValueError("M0.5 cuda_reference.artifact_contract must match required contract")
+    artifact_error = cuda_reference.get("artifact_error")
+    if preflight_status in {"missing", "invalid"}:
+        if not isinstance(artifact_error, str) or not artifact_error:
+            raise ValueError("M0.5 cuda_reference.artifact_error must describe refusal")
+    elif artifact_error is not None and not isinstance(artifact_error, str):
+        raise ValueError("M0.5 cuda_reference.artifact_error must be null or a string")
+    if preflight_status == "valid_not_evaluated":
+        if artifact_error is not None:
+            raise ValueError("M0.5 cuda_reference.artifact_error must be null after valid preflight")
+        if cuda_reference.get("artifact_format") != M05_MTP_CUDA_ARTIFACT_FORMAT:
+            raise ValueError(
+                "M0.5 cuda_reference.artifact_format must be "
+                f"{M05_MTP_CUDA_ARTIFACT_FORMAT!r}"
+            )
+        _require_non_empty_string(cuda_reference, "artifact_source_commit")
+        _require_gb10_cuda_reference_metadata(
+            cuda_reference,
+            hardware_field="artifact_hardware",
+            cuda_runtime_field="artifact_cuda_runtime",
+            label="M0.5 cuda_reference",
+        )
+        _require_sha256(
+            cuda_reference,
+            "artifact_loss_values_sha256",
+            label="M0.5 cuda_reference",
+        )
+    artifact = cuda_reference.get("artifact")
+    if artifact_supplied:
+        if status != "refused":
+            raise ValueError("M0.5 artifact-supplied scaffold status must be refused")
+        if not isinstance(artifact, str) or not artifact:
+            raise ValueError("M0.5 cuda_reference.artifact must be non-empty when supplied")
+    else:
+        if status != "blocked":
+            raise ValueError("M0.5 missing-artifact scaffold status must be blocked")
+        if artifact is not None:
+            raise ValueError("M0.5 cuda_reference.artifact must be null when not supplied")
+
+    mlx_reference = _require_mapping(payload.get("mlx_reference"), label="M0.5 mlx_reference")
+    if mlx_reference.get("status") != "not_evaluated":
+        raise ValueError("M0.5 mlx_reference.status must be not_evaluated")
+    if mlx_reference.get("evaluated_by_this_manifest") is not False:
+        raise ValueError("M0.5 mlx_reference.evaluated_by_this_manifest must be false")
+    if mlx_reference.get("required_for_closure") is not True:
+        raise ValueError("M0.5 mlx_reference.required_for_closure must be true")
+    for field_name in _M05_MLX_REFERENCE_FALSE_CLAIM_FIELDS:
+        _require_false_when_present(
+            mlx_reference,
+            field_name,
+            label="M0.5 mlx_reference",
+        )
+
+
+def write_m05_mtp_parity_manifest_json(
+    path: str | Path,
+    receipts: Iterable[TensorParityReceipt | Mapping[str, Any]],
+    *,
+    profile: str = M05_MTP_PARITY_PROFILE,
+    mtp_depth: int = M05_MTP_DEPTH,
+    mtp_beta: float = M05_MTP_BETA,
+    mtp_lambda: float = M05_MTP_LAMBDA,
+    source: str | None = None,
+    cuda_reference_artifact: str | Path | None = None,
+    cuda_reference: Mapping[str, Any] | None = None,
+    cuda_reference_preflight: Mapping[str, Any] | None = None,
+    mlx_reference: Mapping[str, Any] | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> JsonObject:
+    manifest = build_m05_mtp_parity_manifest(
+        receipts,
+        profile=profile,
+        mtp_depth=mtp_depth,
+        mtp_beta=mtp_beta,
+        mtp_lambda=mtp_lambda,
+        source=source,
+        cuda_reference_artifact=cuda_reference_artifact,
+        cuda_reference=cuda_reference,
+        cuda_reference_preflight=cuda_reference_preflight,
+        mlx_reference=mlx_reference,
+        metadata=metadata,
+    )
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return manifest
+
+
 def _require_positive_int(name: str, value: Any) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"{name} must be a positive integer")
@@ -1031,6 +1750,20 @@ __all__ = [
     "M03_FORWARD_PARITY_SEQ_LEN",
     "M03_FORWARD_PARITY_TOLERANCES",
     "M03_FORWARD_PARITY_VOCAB_SIZE",
+    "M05_MTP_BETA",
+    "M05_MTP_CUDA_ARTIFACT_CONTRACT",
+    "M05_MTP_CUDA_ARTIFACT_FORMAT",
+    "M05_MTP_CUDA_ARTIFACT_PATH",
+    "M05_MTP_CUDA_ARTIFACT_PREFLIGHT_STATUSES",
+    "M05_MTP_CUDA_LOSS_VALUE_FIELDS",
+    "M05_MTP_CUDA_REFERENCE_SOURCES",
+    "M05_MTP_DEPTH",
+    "M05_MTP_LAMBDA",
+    "M05_MTP_PARITY_ISSUE_ID",
+    "M05_MTP_PARITY_OUTPUT",
+    "M05_MTP_PARITY_POLICY",
+    "M05_MTP_PARITY_PROFILE",
+    "M05_MTP_PARITY_RECEIPT_SCOPE",
     "PARITY_MANIFEST_FORMAT",
     "PARITY_MANIFEST_VERSION",
     "PARITY_RECEIPT_SCOPE",
@@ -1038,13 +1771,18 @@ __all__ = [
     "TensorParityReceipt",
     "VALID_PARITY_STATUSES",
     "build_m03_forward_parity_manifest",
+    "build_m05_mtp_parity_manifest",
     "build_parity_manifest",
     "coerce_parity_receipt",
+    "m05_loss_values_sha256",
     "validate_m03_cuda_reference_artifact_dict",
     "validate_m03_forward_parity_manifest_dict",
+    "validate_m05_cuda_reference_artifact_dict",
+    "validate_m05_mtp_parity_manifest_dict",
     "validate_parity_manifest_dict",
     "validate_parity_receipt_dict",
     "write_m03_forward_parity_manifest_json",
+    "write_m05_mtp_parity_manifest_json",
     "write_parity_manifest_json",
     "write_parity_manifest_jsonl",
 ]

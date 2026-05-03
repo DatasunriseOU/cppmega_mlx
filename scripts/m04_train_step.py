@@ -16,7 +16,6 @@ import statistics
 import subprocess
 import sys
 import tempfile
-from types import ModuleType
 from typing import Any
 
 import numpy as np
@@ -24,19 +23,6 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-
-
-def _install_recipes_import_shim() -> None:
-    """Bypass package-level recipe exports when importing training smoke code."""
-
-    if "cppmega_mlx.recipes" in sys.modules:
-        return
-    module = ModuleType("cppmega_mlx.recipes")
-    setattr(module, "__path__", [str(ROOT / "cppmega_mlx" / "recipes")])
-    sys.modules["cppmega_mlx.recipes"] = module
-
-
-_install_recipes_import_shim()
 
 import mlx.core as mx  # noqa: E402
 import mlx.nn as nn  # noqa: E402
@@ -98,6 +84,13 @@ REQUIRED_MODEL_GEOMETRY: dict[str, Any] = {
     },
 }
 CURRENT_MODEL_NAME = "HybridTinyLM"
+FULL_PROFILE_ALLOCATION_MODE = "full_profile_allocation_probe"
+ALLOCATION_PROBE_EVAL_SCOPE = "parameters_only_no_forward_no_training"
+UNSUPPORTED_REQUIRED_MODEL_PROFILE_ROUTE_REASON = (
+    "requested model_profile=local_gb10_quarter requires the real "
+    "cppmega_mlx.recipes.model_factory local_gb10_quarter training route; "
+    "the current HybridTinyLM smoke route is training-plumbing evidence only"
+)
 REQUIRED_OPTIMIZER_NAME = "AdamW"
 REQUIRED_ADAMW_MASTER_MOMENT_DTYPE = "float32"
 OBSERVED_OPTIMIZER_IDENTITY = {
@@ -112,8 +105,10 @@ OBSERVED_OPTIMIZER_IDENTITY = {
 }
 GRAD_CHECKPOINT_EXPECTATION = {
     "required": True,
-    "observed_enabled": False,
-    "source": "HybridTinyLM smoke wrapper does not expose grad checkpointing",
+    "source": (
+        "TrainHybridTinyConfig.grad_checkpoint -> HybridTinyConfig.grad_checkpoint "
+        "-> HybridTinyLM mx.checkpoint block wrapper"
+    ),
 }
 OPEN_M0_BLOCKERS = (
     {
@@ -146,6 +141,14 @@ def build_parser() -> argparse.ArgumentParser:
         default="parquet",
     )
     parser.add_argument("--token-key", default="token_ids")
+    parser.add_argument(
+        "--model-profile",
+        default=TrainHybridTinyConfig.model_profile,
+        help=(
+            "Receipt model/profile identity label passed through the training "
+            "smoke. This does not by itself satisfy the local_gb10_quarter gate."
+        ),
+    )
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--steps", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=2)
@@ -168,6 +171,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--compile",
         action="store_true",
         help="Request mlx.core.compile for the train step. Eager is default for local reliability.",
+    )
+    parser.add_argument(
+        "--grad-checkpoint",
+        action="store_true",
+        help="Enable HybridTinyLM block checkpointing for the M0.4 smoke receipt.",
     )
     parser.add_argument(
         "--synthetic",
@@ -241,6 +249,7 @@ def config_from_args(args: argparse.Namespace, *, data_path: Path) -> TrainHybri
     return TrainHybridTinyConfig(
         npz_path=str(data_path),
         data_format=args.data_format,
+        model_profile=args.model_profile,
         batch_size=args.batch_size,
         seq_len=args.seq_len,
         steps=args.steps,
@@ -259,6 +268,7 @@ def config_from_args(args: argparse.Namespace, *, data_path: Path) -> TrainHybri
         mamba_state_dim=args.mamba_state_dim,
         mamba_groups=args.mamba_groups,
         mamba_chunk_size=args.mamba_chunk_size,
+        grad_checkpoint=args.grad_checkpoint,
         token_key=args.token_key,
         memory_limit_total_bytes=args.memory_limit_total_bytes,
         memory_limit_wired_ratio=args.memory_limit_wired_ratio,
@@ -329,12 +339,14 @@ def run_receipt(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 vocab_size=args.vocab_size,
             )
             original_format = args.data_format
+            original_token_key = args.token_key
             args.data_format = "npz"
             args.token_key = "tokens"
             try:
                 payload, exit_code = _run_existing_training(args, data_path=data_path)
             finally:
                 args.data_format = original_format
+                args.token_key = original_token_key
             return payload, exit_code
 
     data_path = args.data_path
@@ -355,6 +367,15 @@ def _run_existing_training(args: argparse.Namespace, *, data_path: Path) -> tupl
         validate_config(config)
     except Exception as exc:
         return blocked_receipt(args, str(exc), type(exc).__name__), 0 if args.dry_run_json else 2
+    if config.model_profile == REQUIRED_MODEL_PROFILE:
+        return (
+            blocked_receipt(
+                args,
+                UNSUPPORTED_REQUIRED_MODEL_PROFILE_ROUTE_REASON,
+                "unsupported_model_profile_route",
+            ),
+            0 if args.dry_run_json else 2,
+        )
 
     reset_peak_memory()
     memory_before = metal_memory_payload()
@@ -425,8 +446,12 @@ def receipt_from_train_payload(
         memory_limit
     )
     optimizer = optimizer_identity(config, optimizer_updated=optimizer_updated)
-    grad_checkpoint = grad_checkpoint_payload()
+    grad_checkpoint = grad_checkpoint_payload(config)
     local_gb10_preflight = local_gb10_quarter_preflight_from_args(args)
+    observed_model_profile = train_payload.get("model_profile")
+    model_config_for_gate = dict(model_config)
+    if isinstance(observed_model_profile, str):
+        model_config_for_gate.setdefault("profile", observed_model_profile)
     acceptance_gate = acceptance_gate_payload(
         data_path=config.npz_path,
         data_format=config.data_format,
@@ -439,7 +464,7 @@ def receipt_from_train_payload(
         optimizer_updated=optimizer_updated,
         model_name=CURRENT_MODEL_NAME,
         model_source=train_payload.get("model_source"),
-        model_config=model_config,
+        model_config=model_config_for_gate,
         optimizer=optimizer,
         grad_checkpoint=grad_checkpoint,
         device=train_payload.get("device", device_info()),
@@ -472,6 +497,8 @@ def receipt_from_train_payload(
             "seq_len": config.seq_len,
             "tokens_per_step": train_payload.get("tokens_per_step"),
             "compile_requested": config.compile,
+            "model_profile": config.model_profile,
+            "grad_checkpoint": config.grad_checkpoint,
             "mode": mode,
             "require_loss_decrease": bool(args.require_loss_decrease),
             "memory_limit_total_bytes": args.memory_limit_total_bytes,
@@ -532,7 +559,8 @@ def receipt_from_train_payload(
             "source": train_payload.get("model_source"),
             "name": CURRENT_MODEL_NAME,
             "required_profile": REQUIRED_MODEL_PROFILE,
-            "profile_matches_required": False,
+            "profile": observed_model_profile,
+            "profile_matches_required": observed_model_profile == REQUIRED_MODEL_PROFILE,
             "local_gb10_quarter_preflight": local_gb10_preflight,
             "parameter_count": train_payload.get("parameter_count"),
             "route_symbols": train_payload.get("route_symbols"),
@@ -673,7 +701,11 @@ def local_gb10_quarter_preflight_payload(
     allocation_mode: str | None = None,
     allocation_probe: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Record the target-profile readiness without allocating the full model."""
+    """Record target-profile readiness.
+
+    The default preflight is allocation-free; the opt-in probe records a
+    parameter-allocation-only check with no forward or training execution.
+    """
 
     profile = local_gb10_quarter_profile()
     tokenizer_contract = profile.tokenizer_contract
@@ -693,6 +725,8 @@ def local_gb10_quarter_preflight_payload(
         blockers.append("allocation_attempted")
     if not resolved_allocation_ready:
         blockers.append("allocation_ready")
+    if resolved_allocation_mode != FULL_PROFILE_ALLOCATION_MODE:
+        blockers.append("allocation_mode")
     if not tokenizer_resolved:
         blockers.append("tokenizer_contract_resolved")
     if not geometry_matches_required:
@@ -700,6 +734,7 @@ def local_gb10_quarter_preflight_payload(
     ok = bool(
         allocation_attempted
         and resolved_allocation_ready
+        and resolved_allocation_mode == FULL_PROFILE_ALLOCATION_MODE
         and tokenizer_resolved
         and geometry_matches_required
     )
@@ -745,7 +780,7 @@ def local_gb10_quarter_preflight_from_args(
     return local_gb10_quarter_preflight_payload(
         allocation_attempted=True,
         allocation_ready=allocation_probe.get("allocation_ready") is True,
-        allocation_mode="full_profile_allocation_probe",
+        allocation_mode=FULL_PROFILE_ALLOCATION_MODE,
         allocation_probe=allocation_probe,
     )
 
@@ -755,6 +790,15 @@ def probe_local_gb10_quarter_allocation() -> dict[str, Any]:
 
     model: Any | None = None
     memory_before = metal_memory_payload()
+    profile_geometry = _local_gb10_quarter_profile_geometry()
+    geometry_matches_required = profile_geometry == REQUIRED_MODEL_GEOMETRY
+    identity_payload = {
+        "source": REQUIRED_MODEL_SOURCE,
+        "allocation_mode": FULL_PROFILE_ALLOCATION_MODE,
+        "required_geometry": REQUIRED_MODEL_GEOMETRY,
+        "profile_geometry": profile_geometry,
+        "geometry_matches_required": geometry_matches_required,
+    }
     try:
         model = local_gb10_quarter()
         mx.eval(model.parameters())
@@ -763,9 +807,10 @@ def probe_local_gb10_quarter_allocation() -> dict[str, Any]:
         return {
             "status": "ok",
             "allocation_ready": True,
+            **identity_payload,
             "profile_name": REQUIRED_MODEL_PROFILE,
             "model_class": type(model).__name__,
-            "eval_scope": "parameters_only_no_forward_no_training",
+            "eval_scope": ALLOCATION_PROBE_EVAL_SCOPE,
             "forward_executed": False,
             "training_executed": False,
             "memory_before": memory_before,
@@ -775,8 +820,9 @@ def probe_local_gb10_quarter_allocation() -> dict[str, Any]:
         return {
             "status": "blocked",
             "allocation_ready": False,
+            **identity_payload,
             "profile_name": REQUIRED_MODEL_PROFILE,
-            "eval_scope": "parameters_only_no_forward_no_training",
+            "eval_scope": ALLOCATION_PROBE_EVAL_SCOPE,
             "forward_executed": False,
             "training_executed": False,
             "memory_before": memory_before,
@@ -889,10 +935,13 @@ def adamw_master_moment_evidence() -> dict[str, Any]:
         }
 
 
-def grad_checkpoint_payload() -> dict[str, Any]:
-    observed_enabled = bool(GRAD_CHECKPOINT_EXPECTATION["observed_enabled"])
+def grad_checkpoint_payload(
+    config: TrainHybridTinyConfig | argparse.Namespace | None = None,
+) -> dict[str, Any]:
+    observed_enabled = bool(getattr(config, "grad_checkpoint", False))
     return {
         **GRAD_CHECKPOINT_EXPECTATION,
+        "observed_enabled": observed_enabled,
         "expectation_satisfied": (
             observed_enabled if GRAD_CHECKPOINT_EXPECTATION["required"] else True
         ),
@@ -938,7 +987,7 @@ def acceptance_gate_payload(
     real_parquet_source_identity_ok = bool(
         target_parquet_path_ok and dataset_format_ok and dataset_name_ok
     )
-    step_count_ok = steps_requested >= 100 and steps_completed >= 100
+    step_count_ok = steps_requested >= 100 and steps_completed >= steps_requested
     loss_fields_ok = all_finite and loss_decreased
     optimizer_update_ok = bool(optimizer_updated)
     full_target_100_step_completed = bool(
@@ -962,6 +1011,7 @@ def acceptance_gate_payload(
     )
     preflight_payload = _mapping(local_gb10_quarter_preflight)
     preflight_tokenizer = _mapping(preflight_payload.get("tokenizer_contract"))
+    preflight_allocation_probe = _mapping(preflight_payload.get("allocation_probe"))
     preflight_profile = _string_from_mapping(preflight_payload, "profile_name")
     preflight_source = _string_from_mapping(preflight_payload, "source")
     local_gb10_quarter_preflight_ok = bool(
@@ -970,7 +1020,20 @@ def acceptance_gate_payload(
         and preflight_source == REQUIRED_MODEL_SOURCE
         and preflight_payload.get("allocation_attempted") is True
         and preflight_payload.get("allocation_ready") is True
-        and preflight_payload.get("allocation_mode") != "allocation_free_preflight"
+        and preflight_payload.get("allocation_mode") == FULL_PROFILE_ALLOCATION_MODE
+        and preflight_allocation_probe.get("status") == "ok"
+        and preflight_allocation_probe.get("allocation_ready") is True
+        and preflight_allocation_probe.get("source") == REQUIRED_MODEL_SOURCE
+        and preflight_allocation_probe.get("allocation_mode")
+        == FULL_PROFILE_ALLOCATION_MODE
+        and preflight_allocation_probe.get("profile_name") == REQUIRED_MODEL_PROFILE
+        and preflight_allocation_probe.get("model_class") == CURRENT_MODEL_NAME
+        and preflight_allocation_probe.get("eval_scope") == ALLOCATION_PROBE_EVAL_SCOPE
+        and preflight_allocation_probe.get("forward_executed") is False
+        and preflight_allocation_probe.get("training_executed") is False
+        and preflight_allocation_probe.get("geometry_matches_required") is True
+        and preflight_allocation_probe.get("required_geometry") == REQUIRED_MODEL_GEOMETRY
+        and preflight_allocation_probe.get("profile_geometry") == REQUIRED_MODEL_GEOMETRY
         and preflight_payload.get("geometry_matches_required") is True
         and preflight_payload.get("required_geometry") == REQUIRED_MODEL_GEOMETRY
         and preflight_payload.get("profile_geometry") == REQUIRED_MODEL_GEOMETRY
@@ -1014,6 +1077,8 @@ def acceptance_gate_payload(
     grad_checkpoint_enabled = grad_checkpoint_payload_value.get("observed_enabled")
     grad_checkpoint_expectation_ok = bool(
         grad_checkpoint_payload_value.get("required") is True
+        and grad_checkpoint_payload_value.get("source")
+        == GRAD_CHECKPOINT_EXPECTATION["source"]
         and grad_checkpoint_enabled is True
         and grad_checkpoint_payload_value.get("expectation_satisfied") is True
     )
@@ -1181,7 +1246,7 @@ def blocked_receipt(
             model_source=None,
             model_config=None,
             optimizer=optimizer_identity(args, optimizer_updated=False),
-            grad_checkpoint=grad_checkpoint_payload(),
+            grad_checkpoint=grad_checkpoint_payload(args),
             device=device_info(),
             local_gb10_quarter_preflight=local_gb10_preflight,
         ),
@@ -1203,6 +1268,8 @@ def blocked_receipt(
             "batch_size": args.batch_size,
             "seq_len": args.seq_len,
             "compile_requested": bool(args.compile),
+            "model_profile": args.model_profile,
+            "grad_checkpoint": bool(args.grad_checkpoint),
             "require_loss_decrease": bool(args.require_loss_decrease),
             "memory_limit_total_bytes": args.memory_limit_total_bytes,
             "memory_limit_wired_ratio": args.memory_limit_wired_ratio,
@@ -1217,7 +1284,7 @@ def blocked_receipt(
             "steps_completed": 0,
             "optimizer_updated": False,
             "optimizer": optimizer_identity(args, optimizer_updated=False),
-            "grad_checkpoint": grad_checkpoint_payload(),
+            "grad_checkpoint": grad_checkpoint_payload(args),
             "all_finite": False,
             "losses": [],
             "initial_loss": None,

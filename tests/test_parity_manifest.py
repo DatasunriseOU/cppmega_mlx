@@ -28,14 +28,25 @@ from cppmega_mlx.training.parity import (
     M03_FORWARD_PARITY_SEQ_LEN,
     M03_FORWARD_PARITY_TOLERANCES,
     M03_FORWARD_PARITY_VOCAB_SIZE,
+    M05_MTP_BETA,
+    M05_MTP_CUDA_ARTIFACT_CONTRACT,
+    M05_MTP_CUDA_ARTIFACT_FORMAT,
+    M05_MTP_CUDA_REFERENCE_SOURCES,
+    M05_MTP_DEPTH,
+    M05_MTP_LAMBDA,
+    M05_MTP_PARITY_PROFILE,
     PARITY_MANIFEST_FORMAT,
     PARITY_MANIFEST_VERSION,
     PARITY_RECEIPT_SCOPE,
     TensorParityReceipt,
     build_m03_forward_parity_manifest,
+    build_m05_mtp_parity_manifest,
     build_parity_manifest,
+    m05_loss_values_sha256,
     validate_m03_cuda_reference_artifact_dict,
     validate_m03_forward_parity_manifest_dict,
+    validate_m05_cuda_reference_artifact_dict,
+    validate_m05_mtp_parity_manifest_dict,
     validate_parity_manifest_dict,
     validate_parity_receipt_dict,
     write_m03_forward_parity_manifest_json,
@@ -97,6 +108,43 @@ def _valid_m03_cuda_artifact(
     }
 
 
+def _valid_m05_cuda_artifact() -> dict[str, Any]:
+    loss_values = {
+        "next_token_loss": 2.0,
+        "mtp_loss": 1.4375,
+        "total_loss": 2.43125,
+        "mtp_depth_1_loss": 1.25,
+        "mtp_depth_2_loss": 1.75,
+        "grad_norm": 3.5,
+    }
+    return {
+        "format": M05_MTP_CUDA_ARTIFACT_FORMAT,
+        "profile": M05_MTP_PARITY_PROFILE,
+        "mtp_depth": M05_MTP_DEPTH,
+        "mtp_beta": M05_MTP_BETA,
+        "mtp_lambda": M05_MTP_LAMBDA,
+        "cuda_reference_sources": list(M05_MTP_CUDA_REFERENCE_SOURCES),
+        "source_sha256": {
+            "cppmega/megatron/fastmtp_layer.py": "1" * 64,
+            "cppmega/megatron/mtp_native_hopper_ce.py": "2" * 64,
+        },
+        "loss_values": loss_values,
+        "loss_values_sha256": m05_loss_values_sha256(loss_values),
+        "source_commit": "cuda-fastmtp-abc123",
+        "hardware": "GB10 CUDA reference",
+        "cuda_runtime": "CUDA 13.0",
+        "acceptance_claim": False,
+        "numerical_harness_passed": False,
+        "numerical_parity_passed": False,
+        "full_m0_5_acceptance": False,
+        "full_m0_5_acceptance_claim": False,
+        "gb10_mtp_parity_claim": False,
+        "m4_vs_gb10_mtp_parity_claim": False,
+        "distributed_megatron_mtp_parity_claim": False,
+        "evaluated_by_numerical_harness": False,
+    }
+
+
 def _valid_m03_cuda_preflight() -> dict[str, Any]:
     return {
         "artifact_preflight_status": "valid_not_evaluated",
@@ -120,6 +168,19 @@ def _valid_m03_mlx_readiness() -> dict[str, Any]:
         "full_profile_forward_executed": False,
         "tiny_smoke_forward_executed": True,
         "closure_required_mlx_forward_scope": "full_local_gb10_quarter_logits",
+    }
+
+
+def _valid_m05_cuda_preflight() -> dict[str, Any]:
+    artifact = _valid_m05_cuda_artifact()
+    return {
+        "artifact_preflight_status": "valid_not_evaluated",
+        "artifact_error": None,
+        "artifact_format": M05_MTP_CUDA_ARTIFACT_FORMAT,
+        "artifact_loss_values_sha256": artifact["loss_values_sha256"],
+        "artifact_source_commit": "cuda-fastmtp-abc123",
+        "artifact_hardware": "GB10 CUDA reference",
+        "artifact_cuda_runtime": "CUDA 13.0",
     }
 
 
@@ -283,6 +344,213 @@ def test_m03_cuda_reference_artifact_contract_rejects_bad_metadata(
             artifact,
             input_tokens_sha256=INPUT_TOKENS_SHA256,
         )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value", "error"),
+    [
+        ("hardware", "M4 CUDA reference", "GB10 and CUDA"),
+        ("hardware", "GB10 Metal reference", "GB10 and CUDA"),
+        ("hardware", "GB10 not CUDA reference", "GB10 and CUDA"),
+        ("hardware", "", "hardware"),
+        ("hardware", "   ", "hardware"),
+        ("hardware", "GB10 CUDA Apple fallback", "GB10 and CUDA"),
+        ("hardware", "GB10 CUDA M4 reference", "GB10 and CUDA"),
+        ("hardware", "GB10 CUDA Metal reference", "GB10 and CUDA"),
+        ("hardware", "GB10 CUDA MPS reference", "GB10 and CUDA"),
+        ("hardware", "GB10 CUDA MLX reference", "GB10 and CUDA"),
+        ("hardware", "GB10 CUDA CPU fallback", "GB10 and CUDA"),
+        ("hardware", "GB10 CUDA simulated reference", "GB10 and CUDA"),
+        ("hardware", "GB10 CUDA not actually reference", "GB10 and CUDA"),
+        ("cuda_runtime", "not CUDA", "cuda_runtime"),
+        ("cuda_runtime", "\t\n", "cuda_runtime"),
+        ("cuda_runtime", "CUDA 13.0 via MLX fallback", "cuda_runtime"),
+        ("cuda_runtime", "CUDA 13.0 CPU fallback", "cuda_runtime"),
+        ("source_commit", " ", "source_commit"),
+    ],
+)
+def test_m03_cuda_reference_artifact_requires_gb10_cuda_metadata(
+    field_name: str,
+    value: str,
+    error: str,
+) -> None:
+    artifact = _valid_m03_cuda_artifact()
+    artifact[field_name] = value
+
+    with pytest.raises(ValueError, match=error):
+        validate_m03_cuda_reference_artifact_dict(
+            artifact,
+            input_tokens_sha256=INPUT_TOKENS_SHA256,
+        )
+
+
+def test_m05_cuda_reference_artifact_contract_accepts_valid_metadata() -> None:
+    validate_m05_cuda_reference_artifact_dict(_valid_m05_cuda_artifact())
+
+
+def test_m05_loss_values_sha256_is_canonical_and_order_independent() -> None:
+    loss_values = cast(dict[str, Any], _valid_m05_cuda_artifact()["loss_values"])
+    reordered = {field_name: loss_values[field_name] for field_name in reversed(loss_values)}
+
+    assert m05_loss_values_sha256(reordered) == m05_loss_values_sha256(loss_values)
+
+
+def test_m05_cuda_reference_artifact_rejects_forged_loss_values_hash() -> None:
+    artifact = _valid_m05_cuda_artifact()
+    artifact["loss_values_sha256"] = "3" * 64
+
+    with pytest.raises(ValueError, match="loss_values_sha256.*canonical loss_values"):
+        validate_m05_cuda_reference_artifact_dict(artifact)
+
+
+@pytest.mark.parametrize(
+    ("sources", "error"),
+    [
+        (
+            ["cppmega/megatron/fastmtp_layer.py"],
+            "exactly match",
+        ),
+        (
+            [
+                *M05_MTP_CUDA_REFERENCE_SOURCES,
+                "cppmega/megatron/extra_fastmtp.py",
+            ],
+            "exactly match",
+        ),
+        (
+            [
+                "cppmega/megatron/fastmtp_layer.py",
+                "cppmega/megatron/fastmtp_layer.py",
+            ],
+            "duplicates",
+        ),
+        (
+            [
+                "cppmega/megatron/fastmtp_layer.py",
+                7,
+            ],
+            "only strings",
+        ),
+        (
+            list(reversed(M05_MTP_CUDA_REFERENCE_SOURCES)),
+            "exactly match",
+        ),
+    ],
+)
+def test_m05_cuda_reference_artifact_rejects_non_exact_source_lists(
+    sources: list[Any],
+    error: str,
+) -> None:
+    artifact = _valid_m05_cuda_artifact()
+    artifact["cuda_reference_sources"] = sources
+
+    with pytest.raises(ValueError, match=error):
+        validate_m05_cuda_reference_artifact_dict(artifact)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value", "error"),
+    [
+        ("hardware", "M4 CUDA reference", "GB10 and CUDA"),
+        ("hardware", "GB10 Metal reference", "GB10 and CUDA"),
+        ("hardware", "GB10 not CUDA reference", "GB10 and CUDA"),
+        ("hardware", "", "hardware"),
+        ("hardware", "   ", "hardware"),
+        ("hardware", "GB10 CUDA Apple fallback", "GB10 and CUDA"),
+        ("hardware", "GB10 CUDA M4 reference", "GB10 and CUDA"),
+        ("hardware", "GB10 CUDA Metal reference", "GB10 and CUDA"),
+        ("hardware", "GB10 CUDA MPS reference", "GB10 and CUDA"),
+        ("hardware", "GB10 CUDA MLX reference", "GB10 and CUDA"),
+        ("hardware", "GB10 CUDA CPU fallback", "GB10 and CUDA"),
+        ("hardware", "GB10 CUDA simulated reference", "GB10 and CUDA"),
+        ("hardware", "GB10 CUDA not actually reference", "GB10 and CUDA"),
+        ("cuda_runtime", "not CUDA", "cuda_runtime"),
+        ("cuda_runtime", "\t\n", "cuda_runtime"),
+        ("cuda_runtime", "CUDA 13.0 via MLX fallback", "cuda_runtime"),
+        ("cuda_runtime", "CUDA 13.0 CPU fallback", "cuda_runtime"),
+        ("source_commit", " ", "source_commit"),
+    ],
+)
+def test_m05_cuda_reference_artifact_requires_gb10_cuda_metadata(
+    field_name: str,
+    value: str,
+    error: str,
+) -> None:
+    artifact = _valid_m05_cuda_artifact()
+    artifact[field_name] = value
+
+    with pytest.raises(ValueError, match=error):
+        validate_m05_cuda_reference_artifact_dict(artifact)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "error"),
+    [
+        (
+            lambda artifact: cast(dict[str, Any], artifact["source_sha256"]).pop(
+                "cppmega/megatron/fastmtp_layer.py"
+            ),
+            "source_sha256.*exactly",
+        ),
+        (
+            lambda artifact: cast(dict[str, Any], artifact["source_sha256"]).update(
+                {"cppmega/megatron/extra_fastmtp.py": "3" * 64}
+            ),
+            "source_sha256.*exactly",
+        ),
+        (
+            lambda artifact: cast(dict[str, Any], artifact["loss_values"]).pop("grad_norm"),
+            "loss_values.*exactly",
+        ),
+        (
+            lambda artifact: cast(dict[str, Any], artifact["loss_values"]).update(
+                {"acceptance_passed": 1.0}
+            ),
+            "loss_values.*exactly",
+        ),
+    ],
+)
+def test_m05_cuda_reference_artifact_requires_exact_nested_keysets(
+    mutation,
+    error: str,
+) -> None:
+    artifact = _valid_m05_cuda_artifact()
+    mutation(artifact)
+
+    with pytest.raises(ValueError, match=error):
+        validate_m05_cuda_reference_artifact_dict(artifact)
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "acceptance_claim",
+        "numerical_harness_passed",
+        "numerical_parity_passed",
+        "full_m0_5_acceptance",
+        "full_m0_5_acceptance_claim",
+        "gb10_mtp_parity_claim",
+        "m4_vs_gb10_mtp_parity_claim",
+        "distributed_megatron_mtp_parity_claim",
+        "evaluated_by_numerical_harness",
+    ],
+)
+def test_m05_cuda_reference_artifact_rejects_false_acceptance_claim_fields(
+    field_name: str,
+) -> None:
+    artifact = _valid_m05_cuda_artifact()
+    artifact[field_name] = True
+
+    with pytest.raises(ValueError, match=field_name):
+        validate_m05_cuda_reference_artifact_dict(artifact)
+
+
+def test_m05_cuda_reference_artifact_rejects_bad_total_loss_formula() -> None:
+    artifact = _valid_m05_cuda_artifact()
+    cast(dict[str, Any], artifact["loss_values"]).update({"total_loss": 2.46})
+
+    with pytest.raises(ValueError, match="total_loss"):
+        validate_m05_cuda_reference_artifact_dict(artifact)
 
 
 def test_m03_forward_parity_manifest_refuses_artifact_receipts_without_evaluation(tmp_path) -> None:
@@ -568,8 +836,17 @@ def test_m03_forward_parity_manifest_rejects_nested_m03_overclaims() -> None:
         ("artifact_tensor_name", "local_gb10_quarter.accepted_logits", "artifact_tensor_name"),
         ("artifact_logits_sha256", "not-sha", "artifact_logits_sha256"),
         ("artifact_source_commit", "", "artifact_source_commit"),
+        ("artifact_source_commit", " ", "artifact_source_commit"),
         ("artifact_hardware", "", "artifact_hardware"),
+        ("artifact_hardware", "   ", "artifact_hardware"),
+        ("artifact_hardware", "M4 CUDA reference", "GB10 and CUDA"),
+        ("artifact_hardware", "GB10 Metal reference", "GB10 and CUDA"),
+        ("artifact_hardware", "GB10 CUDA Apple fallback", "GB10 and CUDA"),
+        ("artifact_hardware", "GB10 CUDA CPU fallback", "GB10 and CUDA"),
         ("artifact_cuda_runtime", "", "artifact_cuda_runtime"),
+        ("artifact_cuda_runtime", "\t\n", "artifact_cuda_runtime"),
+        ("artifact_cuda_runtime", "not CUDA", "artifact_cuda_runtime"),
+        ("artifact_cuda_runtime", "CUDA 13.0 via MLX fallback", "artifact_cuda_runtime"),
     ]
     for field_name, value, error in cuda_mutations:
         mutated = dict(manifest)
@@ -638,3 +915,172 @@ def test_m03_forward_parity_manifest_does_not_evaluate_ambiguous_logits_receipts
     assert acceptance_gate["logits_receipts"] == 2
     assert acceptance_gate["receipts_evaluated_by_this_manifest"] is False
     assert acceptance_gate["full_m0_3_acceptance"] is False
+
+
+def test_m05_cuda_reference_artifact_requires_beta_weighted_mtp_loss() -> None:
+    artifact = _valid_m05_cuda_artifact()
+    validate_m05_cuda_reference_artifact_dict(artifact)
+
+    loss_values = dict(cast(dict[str, Any], artifact["loss_values"]))
+    loss_values["mtp_loss"] = 1.5
+    loss_values["total_loss"] = loss_values["next_token_loss"] + M05_MTP_LAMBDA * loss_values["mtp_loss"]
+    artifact["loss_values"] = loss_values
+
+    with pytest.raises(ValueError, match="beta-normalized weighted per-depth MTP loss"):
+        validate_m05_cuda_reference_artifact_dict(artifact)
+
+
+def test_m05_mtp_manifest_counts_only_scoped_mtp_receipts() -> None:
+    manifest = build_m05_mtp_parity_manifest(
+        [
+            _receipt("local_gb10_quarter.mtp.depth_1_loss"),
+            _receipt("local_gb10_quarter.attempt.loss"),
+            _receipt("other_profile.mtp.depth_1_loss"),
+        ],
+        source="unit-test",
+    )
+
+    assert manifest["status"] == "blocked"
+    assert manifest["m0_5_closed"] is False
+    assert manifest["full_m0_5_acceptance_claim"] is False
+    assert manifest["gb10_mtp_parity_claim"] is False
+    assert manifest["m4_vs_gb10_mtp_parity_claim"] is False
+    assert manifest["distributed_megatron_mtp_parity_claim"] is False
+    identity = cast(dict[str, Any], manifest["cuda_reference_identity"])
+    assert identity["artifact_contract"] == M05_MTP_CUDA_ARTIFACT_CONTRACT
+    acceptance_gate = cast(dict[str, Any], manifest["acceptance_gate"])
+    assert acceptance_gate["receipt_count"] == 3
+    assert acceptance_gate["mtp_receipts"] == 1
+    assert acceptance_gate["receipts_evaluated_by_this_manifest"] is False
+    assert acceptance_gate["full_m0_5_acceptance"] is False
+
+
+@pytest.mark.parametrize(
+    ("mutation", "error"),
+    [
+        (
+            lambda manifest: cast(dict[str, Any], manifest["acceptance_gate"]).update(
+                {"receipt_count": 99}
+            ),
+            "receipt_count",
+        ),
+        (
+            lambda manifest: cast(dict[str, Any], manifest["acceptance_gate"]).update(
+                {"mtp_receipts": 2}
+            ),
+            "mtp_receipts",
+        ),
+        (
+            lambda manifest: manifest.update(
+                {
+                    "claim_boundary": (
+                        "This scaffold makes Hopper/Liger fused-CE, GB10, "
+                        "M4-vs-GB10, or distributed Megatron parity claim."
+                    )
+                }
+            ),
+            "claim_boundary",
+        ),
+    ],
+)
+def test_m05_mtp_manifest_validator_rejects_gate_and_claim_boundary_drift(
+    mutation,
+    error: str,
+) -> None:
+    manifest = build_m05_mtp_parity_manifest(
+        [
+            _receipt("local_gb10_quarter.mtp.depth_1_loss"),
+            _receipt("local_gb10_quarter.attempt.loss"),
+        ]
+    )
+    mutation(manifest)
+
+    with pytest.raises(ValueError, match=error):
+        validate_m05_mtp_parity_manifest_dict(manifest)
+
+
+def test_m05_mtp_manifest_builder_rejects_nested_cuda_overclaims() -> None:
+    with pytest.raises(ValueError, match="numerical_harness_passed"):
+        build_m05_mtp_parity_manifest(
+            [],
+            cuda_reference={
+                "numerical_harness_passed": True,
+            },
+        )
+
+
+def test_m05_mtp_manifest_rejects_nested_m05_overclaims() -> None:
+    manifest = build_m05_mtp_parity_manifest([])
+
+    cuda_mutations: list[tuple[str, Any, str]] = [
+        ("numerical_harness_passed", True, "numerical_harness_passed"),
+        ("numerical_parity_passed", True, "numerical_parity_passed"),
+        ("full_m0_5_acceptance", True, "full_m0_5_acceptance"),
+        ("gb10_mtp_parity_claim", True, "gb10_mtp_parity_claim"),
+        ("m4_vs_gb10_mtp_parity_claim", True, "m4_vs_gb10_mtp_parity_claim"),
+        (
+            "distributed_megatron_mtp_parity_claim",
+            True,
+            "distributed_megatron_mtp_parity_claim",
+        ),
+        ("evaluated_by_numerical_harness", True, "evaluated_by_numerical_harness"),
+        ("acceptance_claim", True, "acceptance_claim"),
+    ]
+    for field_name, value, error in cuda_mutations:
+        mutated = dict(manifest)
+        cuda_reference = dict(cast(dict[str, Any], mutated["cuda_reference"]))
+        cuda_reference[field_name] = value
+        mutated["cuda_reference"] = cuda_reference
+        with pytest.raises(ValueError, match=error):
+            validate_m05_mtp_parity_manifest_dict(mutated)
+
+    mlx_mutations: list[tuple[str, Any, str]] = [
+        ("numerical_parity_passed", True, "numerical_parity_passed"),
+        ("full_m0_5_acceptance", True, "full_m0_5_acceptance"),
+        ("gb10_mtp_parity_claim", True, "gb10_mtp_parity_claim"),
+        ("m4_vs_gb10_mtp_parity_claim", True, "m4_vs_gb10_mtp_parity_claim"),
+        (
+            "distributed_megatron_mtp_parity_claim",
+            True,
+            "distributed_megatron_mtp_parity_claim",
+        ),
+        ("local_mlx_mtp_losses_evaluated", True, "local_mlx_mtp_losses_evaluated"),
+        ("readiness_is_cuda_parity", True, "readiness_is_cuda_parity"),
+    ]
+    for field_name, value, error in mlx_mutations:
+        mutated = dict(manifest)
+        mlx_reference = dict(cast(dict[str, Any], mutated["mlx_reference"]))
+        mlx_reference[field_name] = value
+        mutated["mlx_reference"] = mlx_reference
+        with pytest.raises(ValueError, match=error):
+            validate_m05_mtp_parity_manifest_dict(mutated)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value", "error"),
+    [
+        ("artifact_hardware", "M4 CUDA reference", "GB10 and CUDA"),
+        ("artifact_hardware", "GB10 Metal reference", "GB10 and CUDA"),
+        ("artifact_hardware", "GB10 CUDA Apple fallback", "GB10 and CUDA"),
+        ("artifact_hardware", "GB10 CUDA CPU fallback", "GB10 and CUDA"),
+        ("artifact_hardware", "   ", "artifact_hardware"),
+        ("artifact_cuda_runtime", "not CUDA", "artifact_cuda_runtime"),
+        ("artifact_cuda_runtime", "CUDA 13.0 via MLX fallback", "artifact_cuda_runtime"),
+        ("artifact_cuda_runtime", "\t\n", "artifact_cuda_runtime"),
+        ("artifact_source_commit", " ", "artifact_source_commit"),
+    ],
+)
+def test_m05_mtp_manifest_rejects_forged_valid_preflight_metadata(
+    field_name: str,
+    value: str,
+    error: str,
+) -> None:
+    cuda_preflight = _valid_m05_cuda_preflight()
+    cuda_preflight[field_name] = value
+
+    with pytest.raises(ValueError, match=error):
+        build_m05_mtp_parity_manifest(
+            [],
+            cuda_reference_artifact="external_cuda_fastmtp.json",
+            cuda_reference_preflight=cuda_preflight,
+        )

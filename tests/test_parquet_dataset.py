@@ -275,6 +275,57 @@ def test_scalar_token_column_is_treated_as_one_contiguous_stream(monkeypatch) ->
     np.testing.assert_array_equal(np.array(batch.tokens[2]), np.arange(8, 12))
 
 
+def test_cursor_after_includes_dataset_resume_batch_across_epoch_rollover(
+    monkeypatch,
+) -> None:
+    values = {"tokens": list(range(40))}
+    monkeypatch.setattr(
+        parquet_dataset.importlib,
+        "import_module",
+        lambda name: _fake_pyarrow_reader(values)
+        if name == "pyarrow.parquet"
+        else pytest.fail(f"unexpected import {name}"),
+    )
+
+    dataset = TokenParquetDataset(
+        "resume_cursor.parquet",
+        seq_len=5,
+        batch_size=2,
+        shuffle=True,
+        seed=7,
+        loop=True,
+        resume_batch=3,
+    )
+    stream = dataset.iter_batches()
+    next(stream)
+    next(stream)
+    expected_next = next(stream)
+
+    cursor = dataset.cursor_after(2)
+    restored = TokenParquetDataset(
+        "resume_cursor.parquet",
+        seq_len=5,
+        batch_size=2,
+        shuffle=True,
+        seed=7,
+        loop=True,
+    )
+    actual_next = next(
+        restored.iter_batches(
+            resume_batch=cursor.batch_offset,
+            epoch=cursor.epoch,
+        )
+    )
+
+    assert cursor.epoch == 1
+    assert cursor.batch_offset == 1
+    assert cursor.global_batch_offset == 5
+    np.testing.assert_array_equal(
+        np.array(actual_next.tokens),
+        np.array(expected_next.tokens),
+    )
+
+
 def test_text_column_requires_and_uses_tokenizer(monkeypatch) -> None:
     values = {"text": ["abcd", "efgh"]}
     monkeypatch.setattr(

@@ -58,12 +58,16 @@ STRUCTURE_MODEL_KWARG_NAMES = (
     "sibling_index_ids",
     "node_type_ids",
 )
+MODEL_NAME = "HybridTinyLM"
+MODEL_SOURCE = "cppmega_mlx.models.hybrid_lm"
+DEFAULT_MODEL_PROFILE = "hybrid_tiny"
 
 
 @dataclass(frozen=True)
 class TrainHybridTinyConfig:
     npz_path: str | None = None
     data_format: Literal["npz", "parquet", "megatron"] | None = None
+    model_profile: str = DEFAULT_MODEL_PROFILE
     batch_size: int = 1
     seq_len: int = 8
     steps: int = 1
@@ -140,6 +144,14 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("npz", "parquet", "megatron"),
         default=None,
         help="Override token shard format inference.",
+    )
+    parser.add_argument(
+        "--model-profile",
+        default=TrainHybridTinyConfig.model_profile,
+        help=(
+            "Receipt identity label for the model/profile being exercised. "
+            "The default is the tiny local smoke profile, not local_gb10_quarter."
+        ),
     )
     parser.add_argument("--batch-size", type=int, default=TrainHybridTinyConfig.batch_size)
     parser.add_argument("--seq-len", type=int, default=TrainHybridTinyConfig.seq_len)
@@ -397,6 +409,7 @@ def config_from_args(args: argparse.Namespace) -> TrainHybridTinyConfig:
     return TrainHybridTinyConfig(
         npz_path=args.npz_path,
         data_format=args.data_format,
+        model_profile=args.model_profile,
         batch_size=args.batch_size,
         seq_len=args.seq_len,
         steps=args.steps,
@@ -1074,6 +1087,9 @@ def checkpoint_metadata(
             "batch_cursor": cursor_payload,
         },
         "training_config": asdict(config),
+        "model_name": MODEL_NAME,
+        "model_profile": config.model_profile,
+        "model_source": MODEL_SOURCE,
         "dataset": dataset_payload(dataset, config),
         "rng": rng if rng is not None else {
             "mode": "snapshot",
@@ -1197,7 +1213,9 @@ def dry_run_payload(
         "config": asdict(config),
         "synthetic_npz": config.npz_path is None,
         "dataset": dataset_payload(dataset, config),
-        "model_source": "cppmega_mlx.models.hybrid_lm",
+        "model_name": MODEL_NAME,
+        "model_profile": config.model_profile,
+        "model_source": MODEL_SOURCE,
         "model_config": model_config.to_dict(),
         "route_symbols": route_backend["route_symbols"],
         "route_roles": route_backend["route_roles"],
@@ -1421,7 +1439,9 @@ def train_hybrid_tiny(
         "config": asdict(config),
         "synthetic_npz": config.npz_path is None,
         "dataset": dataset_payload(dataset, config),
-        "model_source": "cppmega_mlx.models.hybrid_lm",
+        "model_name": MODEL_NAME,
+        "model_profile": config.model_profile,
+        "model_source": MODEL_SOURCE,
         "model_config": model_config.to_dict(),
         "route_symbols": route_backend["route_symbols"],
         "route_roles": route_backend["route_roles"],

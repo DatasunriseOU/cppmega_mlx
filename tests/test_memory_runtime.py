@@ -425,6 +425,83 @@ def test_memory_limit_receipt_does_not_accept_unknown_or_over_threshold_peak(
     assert receipt["status"] == "partial"
 
 
+def test_memory_limit_receipt_rejects_mismatched_plan_total() -> None:
+    with pytest.raises(ValueError, match="plan.total_bytes must match total_bytes"):
+        memory_limit_receipt(
+            total_bytes=DEV_128_TOTAL_BYTES,
+            peak_memory_bytes=151_213_010,
+            measured_steps=100,
+            clear_cache_every_steps=10,
+            plan=memory_limit_plan(1024),
+        )
+
+
+def test_memory_limit_receipt_rejects_mismatched_applied_limit_plan() -> None:
+    plan = memory_limit_plan(DEV_128_TOTAL_BYTES)
+    applied_limits = AppliedMemoryLimits(
+        plan=memory_limit_plan(1024),
+        applied=True,
+        previous_wired_limit_bytes=0,
+        previous_metal_limit_bytes=0,
+        metal_limit_api_path="mx.metal.set_memory_limit",
+    )
+
+    with pytest.raises(ValueError, match="applied_limits.plan must match plan"):
+        memory_limit_receipt(
+            total_bytes=DEV_128_TOTAL_BYTES,
+            peak_memory_bytes=151_213_010,
+            measured_steps=100,
+            clear_cache_every_steps=10,
+            plan=plan,
+            applied_limits=applied_limits,
+        )
+
+
+def test_memory_limit_receipt_rejects_mismatched_clear_cache_event_count() -> None:
+    with pytest.raises(
+        ValueError,
+        match="clear_cache_event_count must match clear_cache_events length",
+    ):
+        memory_limit_receipt(
+            total_bytes=DEV_128_TOTAL_BYTES,
+            peak_memory_bytes=151_213_010,
+            measured_steps=100,
+            clear_cache_every_steps=10,
+            clear_cache_event_count=9,
+            clear_cache_events=clear_cache_events_for_receipt(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "error"),
+    [
+        (
+            {"peak_memory_bytes": -1},
+            "peak_memory_bytes must be non-negative when provided",
+        ),
+        ({"measured_steps": -1}, "measured_steps must be non-negative"),
+        (
+            {"run_command": ("python", 1)},
+            "run_command entries must be strings",
+        ),
+    ],
+)
+def test_memory_limit_receipt_rejects_invalid_m06_metrics(
+    kwargs: dict[str, object],
+    error: str,
+) -> None:
+    receipt_kwargs = {
+        "total_bytes": DEV_128_TOTAL_BYTES,
+        "peak_memory_bytes": 151_213_010,
+        "measured_steps": 100,
+        "clear_cache_every_steps": 10,
+        **kwargs,
+    }
+
+    with pytest.raises((TypeError, ValueError), match=error):
+        memory_limit_receipt(**receipt_kwargs)  # type: ignore[arg-type]
+
+
 @pytest.mark.parametrize(
     (
         "model_profile",
@@ -520,11 +597,28 @@ def test_checked_in_m06_receipt_remains_partial_until_exact_gate_runs() -> None:
     assert payload["run_command_recorded"] is False
     assert payload["run_command_meets_gate"] is False
     assert payload["run_command"] is None
+    assert payload["measured_profile"]["profile_claim_scope"] == (
+        "m04_target_parquet_hybrid_tiny_memory_smoke_only"
+    )
+    assert payload["measured_profile"]["steps_completed"] == payload["measured_steps"]
+    assert (
+        payload["measured_profile"]["peak_memory_bytes"]
+        == payload["peak_memory_bytes"]
+    )
+    assert (
+        payload["runtime_stack"]["device_info"]["memory_size"]
+        == payload["total_memory_bytes"]
+    )
     assert payload["required_wired_ratio"] == DEFAULT_WIRED_RATIO
     assert payload["required_metal_ratio"] == DEFAULT_METAL_RATIO
     assert payload["memory_limit_ratios_meet_gate"] is True
     assert payload["memory_limits_applied_meet_gate"] is True
     assert payload["peak_memory_below_threshold"] is True
+    blockers = {blocker["id"]: blocker for blocker in payload["blockers"]}
+    assert blockers["cppmega-mlx-t8f.6"]["status"] == "open"
+    assert "No 100-step local_gb10_quarter" in blockers["cppmega-mlx-t8f.6"]["impact"]
+    assert any("not full M0.6 acceptance" in note for note in payload["notes"])
+    assert any("No M4-vs-GB10 parity" in note for note in payload["notes"])
 
     expected_events = payload["measured_steps"] // payload["clear_cache_every_steps"]
     assert payload["expected_clear_cache_event_count"] == expected_events
@@ -601,6 +695,74 @@ def test_memory_limit_receipt_accepts_only_complete_m06_gate() -> None:
     assert receipt["clear_cache_events_meet_gate"] is True
     assert receipt["memory_limits_applied_meet_gate"] is True
     assert receipt["memory_limit_ratios_meet_gate"] is True
+    assert receipt["full_m0_6_acceptance_claim"] is True
+    assert receipt["status"] == "accepted"
+
+
+def test_memory_limit_receipt_requires_runtime_memory_size_to_match_total() -> None:
+    receipt = memory_limit_receipt(
+        total_bytes=DEV_128_TOTAL_BYTES,
+        peak_memory_bytes=151_213_010,
+        measured_steps=100,
+        clear_cache_every_steps=10,
+        clear_cache_event_count=10,
+        clear_cache_events=clear_cache_events_for_receipt(),
+        model_profile="local_gb10_quarter",
+        optimizer_name="AdamW",
+        grad_checkpoint_enabled=True,
+        applied_limits=applied_limits_for_receipt(),
+        api_status=memory_limit_api_status(_FakeMLX()),
+        runtime_stack=RuntimeStackEvidence(
+            mlx_version="0.31.1",
+            mlx_metal_version="0.31.1",
+            platform_system="Darwin",
+            platform_release="25.4.0",
+            macos_version="26.4.1",
+            machine="arm64",
+            default_device="Device(gpu, 0)",
+            metal_available=True,
+            device_info={
+                "device_name": "Apple M4 Max",
+                "memory_size": DEV_128_TOTAL_BYTES - 1,
+            },
+        ),
+        run_command=local_gb10_quarter_run_command(),
+        full_acceptance_claim=True,
+    )
+
+    assert receipt["runtime_stack_meets_gate"] is False
+    assert receipt["full_m0_6_acceptance_claim"] is False
+    assert receipt["status"] == "partial"
+
+
+def test_memory_limit_receipt_accepts_split_argv_run_command_tokens() -> None:
+    receipt = memory_limit_receipt(
+        total_bytes=DEV_128_TOTAL_BYTES,
+        peak_memory_bytes=151_213_010,
+        measured_steps=100,
+        clear_cache_every_steps=10,
+        clear_cache_event_count=10,
+        clear_cache_events=clear_cache_events_for_receipt(),
+        model_profile="local_gb10_quarter",
+        optimizer_name="AdamW",
+        grad_checkpoint_enabled=True,
+        applied_limits=applied_limits_for_receipt(),
+        api_status=memory_limit_api_status(_FakeMLX()),
+        runtime_stack=runtime_stack_for_receipt(),
+        run_command=(
+            "./.venv/bin/python",
+            "scripts/m04_train_step.py",
+            "--model-profile",
+            "local_gb10_quarter",
+            "--grad-checkpoint",
+            "--apply-memory-limit-plan",
+            "--clear-cache-every-steps",
+            "10",
+        ),
+        full_acceptance_claim=True,
+    )
+
+    assert receipt["run_command_meets_gate"] is True
     assert receipt["full_m0_6_acceptance_claim"] is True
     assert receipt["status"] == "accepted"
 
@@ -896,6 +1058,20 @@ def test_memory_limit_receipt_requires_clear_cache_event_cadence_metadata() -> N
         ),
         RuntimeStackEvidence(
             mlx_version="0.31.1",
+            mlx_metal_version=None,
+            platform_system="Darwin",
+            platform_release="25.4.0",
+            macos_version="26.4.1",
+            machine="arm64",
+            default_device="Device(gpu, 0)",
+            metal_available=True,
+            device_info={
+                "memory_size": DEV_128_TOTAL_BYTES,
+                "device_name": "Apple M4 Max",
+            },
+        ),
+        RuntimeStackEvidence(
+            mlx_version="0.31.1",
             mlx_metal_version="0.31.1",
             platform_system="Darwin",
             platform_release="25.4.0",
@@ -915,6 +1091,34 @@ def test_memory_limit_receipt_requires_clear_cache_event_cadence_metadata() -> N
             platform_release="25.4.0",
             macos_version="26.4.1",
             machine="arm64",
+            default_device="",
+            metal_available=True,
+            device_info={
+                "memory_size": DEV_128_TOTAL_BYTES,
+                "device_name": "Apple M4 Max",
+            },
+        ),
+        RuntimeStackEvidence(
+            mlx_version="0.31.1",
+            mlx_metal_version="0.31.1",
+            platform_system="Linux",
+            platform_release="6.9.0",
+            macos_version="",
+            machine="arm64",
+            default_device="Device(gpu, 0)",
+            metal_available=True,
+            device_info={
+                "memory_size": DEV_128_TOTAL_BYTES,
+                "device_name": "Apple M4 Max",
+            },
+        ),
+        RuntimeStackEvidence(
+            mlx_version="0.31.1",
+            mlx_metal_version="0.31.1",
+            platform_system="Darwin",
+            platform_release="25.4.0",
+            macos_version="26.4.1",
+            machine="x86_64",
             default_device="Device(gpu, 0)",
             metal_available=True,
             device_info={"memory_size": DEV_128_TOTAL_BYTES},

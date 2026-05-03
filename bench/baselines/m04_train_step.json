@@ -29,7 +29,7 @@
       "observed_enabled": false,
       "ok": false,
       "required": true,
-      "source": "HybridTinyLM smoke wrapper does not expose grad checkpointing"
+      "source": "TrainHybridTinyConfig.grad_checkpoint -> HybridTinyConfig.grad_checkpoint -> HybridTinyLM mx.checkpoint block wrapper"
     },
     "grad_checkpoint_observed_enabled": false,
     "grad_checkpoint_required": true,
@@ -38,8 +38,10 @@
       "allocation_mode": "full_profile_allocation_probe",
       "allocation_probe": {
         "allocation_ready": true,
+        "allocation_mode": "full_profile_allocation_probe",
         "eval_scope": "parameters_only_no_forward_no_training",
         "forward_executed": false,
+        "geometry_matches_required": true,
         "memory_after": {
           "active_memory_bytes": 7186156424,
           "cache_memory_bytes": 197576486,
@@ -51,7 +53,36 @@
           "peak_memory_bytes": 167984344
         },
         "model_class": "HybridTinyLM",
+        "profile_geometry": {
+          "depth": 13,
+          "ffn_hidden_size": 18944,
+          "head_dim": 128,
+          "hidden_size": 3584,
+          "mtp": {
+            "beta": 0.6,
+            "depth": 2,
+            "loss_weight": 0.3
+          },
+          "num_attention_heads": 28,
+          "pattern": "AEMEAEMEAEMR",
+          "vocab_size": 65536
+        },
         "profile_name": "local_gb10_quarter",
+        "required_geometry": {
+          "depth": 13,
+          "ffn_hidden_size": 18944,
+          "head_dim": 128,
+          "hidden_size": 3584,
+          "mtp": {
+            "beta": 0.6,
+            "depth": 2,
+            "loss_weight": 0.3
+          },
+          "num_attention_heads": 28,
+          "pattern": "AEMEAEMEAEMR",
+          "vocab_size": 65536
+        },
+        "source": "cppmega_mlx.recipes.model_factory",
         "status": "ok",
         "training_executed": false
       },
@@ -354,8 +385,10 @@
     "allocation_mode": "full_profile_allocation_probe",
     "allocation_probe": {
       "allocation_ready": true,
+      "allocation_mode": "full_profile_allocation_probe",
       "eval_scope": "parameters_only_no_forward_no_training",
       "forward_executed": false,
+      "geometry_matches_required": true,
       "memory_after": {
         "active_memory_bytes": 7186156424,
         "cache_memory_bytes": 197576486,
@@ -367,7 +400,36 @@
         "peak_memory_bytes": 167984344
       },
       "model_class": "HybridTinyLM",
+      "profile_geometry": {
+        "depth": 13,
+        "ffn_hidden_size": 18944,
+        "head_dim": 128,
+        "hidden_size": 3584,
+        "mtp": {
+          "beta": 0.6,
+          "depth": 2,
+          "loss_weight": 0.3
+        },
+        "num_attention_heads": 28,
+        "pattern": "AEMEAEMEAEMR",
+        "vocab_size": 65536
+      },
       "profile_name": "local_gb10_quarter",
+      "required_geometry": {
+        "depth": 13,
+        "ffn_hidden_size": 18944,
+        "head_dim": 128,
+        "hidden_size": 3584,
+        "mtp": {
+          "beta": 0.6,
+          "depth": 2,
+          "loss_weight": 0.3
+        },
+        "num_attention_heads": 28,
+        "pattern": "AEMEAEMEAEMR",
+        "vocab_size": 65536
+      },
+      "source": "cppmega_mlx.recipes.model_factory",
       "status": "ok",
       "training_executed": false
     },
@@ -553,8 +615,10 @@
       "allocation_mode": "full_profile_allocation_probe",
       "allocation_probe": {
         "allocation_ready": true,
+        "allocation_mode": "full_profile_allocation_probe",
         "eval_scope": "parameters_only_no_forward_no_training",
         "forward_executed": false,
+        "geometry_matches_required": true,
         "memory_after": {
           "active_memory_bytes": 7186156424,
           "cache_memory_bytes": 197576486,
@@ -566,7 +630,36 @@
           "peak_memory_bytes": 167984344
         },
         "model_class": "HybridTinyLM",
+        "profile_geometry": {
+          "depth": 13,
+          "ffn_hidden_size": 18944,
+          "head_dim": 128,
+          "hidden_size": 3584,
+          "mtp": {
+            "beta": 0.6,
+            "depth": 2,
+            "loss_weight": 0.3
+          },
+          "num_attention_heads": 28,
+          "pattern": "AEMEAEMEAEMR",
+          "vocab_size": 65536
+        },
         "profile_name": "local_gb10_quarter",
+        "required_geometry": {
+          "depth": 13,
+          "ffn_hidden_size": 18944,
+          "head_dim": 128,
+          "hidden_size": 3584,
+          "mtp": {
+            "beta": 0.6,
+            "depth": 2,
+            "loss_weight": 0.3
+          },
+          "num_attention_heads": 28,
+          "pattern": "AEMEAEMEAEMR",
+          "vocab_size": 65536
+        },
+        "source": "cppmega_mlx.recipes.model_factory",
         "status": "ok",
         "training_executed": false
       },
@@ -772,7 +865,7 @@
       "expectation_satisfied": false,
       "observed_enabled": false,
       "required": true,
-      "source": "HybridTinyLM smoke wrapper does not expose grad checkpointing"
+      "source": "TrainHybridTinyConfig.grad_checkpoint -> HybridTinyConfig.grad_checkpoint -> HybridTinyLM mx.checkpoint block wrapper"
     },
     "initial_loss": 11.940933227539062,
     "loss_decrease_required": true,

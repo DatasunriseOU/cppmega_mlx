@@ -1,0 +1,230 @@
+{
+  "machine": {
+    "platform": "macOS-26.4.1-arm64-arm-64bit-Mach-O",
+    "machine": "arm64",
+    "processor": "arm",
+    "python": "3.13.12",
+    "metal_device_info": "{'device_name': 'Apple M4 Max', 'max_recommended_working_set_size': 115448725504, 'memory_size': 137438953472, 'architecture': 'applegpu_g16s', 'max_buffer_length': 86586540032, 'resource_limit': 499000}"
+  },
+  "tilelang_status": {
+    "available": true,
+    "reason": "Path B helpers ready",
+    "fp16_carrier": true
+  },
+  "warmup": 5,
+  "iters": 30,
+  "shapes": [
+    {
+      "label": "tiny",
+      "B": 1,
+      "T": 16,
+      "H": 4,
+      "P": 4,
+      "N": 8,
+      "compute_dacs_segsum": {
+        "pure_mlx": {
+          "median_ms": 0.16062497161328793,
+          "min_ms": 0.14699995517730713,
+          "max_ms": 0.2848329022526741
+        },
+        "tilelang_metal": {
+          "median_ms": 0.14599994756281376,
+          "min_ms": 0.11799996718764305,
+          "max_ms": 0.21954206749796867,
+          "peak_gib": 8.106231689453125e-06
+        },
+        "speedup_tilelang_over_pure": 1.1001714335834403,
+        "max_abs_err": 0.0
+      },
+      "bwd_dadt_fused": {
+        "pure_mlx": {
+          "median_ms": 0.14924979768693447,
+          "min_ms": 0.13012508861720562,
+          "max_ms": 0.5117501132190228
+        },
+        "tilelang_metal": {
+          "median_ms": 0.13999990187585354,
+          "min_ms": 0.1284999307245016,
+          "max_ms": 0.2828750293701887,
+          "peak_gib": 8.58306884765625e-06
+        },
+        "speedup_tilelang_over_pure": 1.0660707306729642,
+        "max_abs_err": 0.0
+      },
+      "bwd_dtrap_ddt": {
+        "pure_mlx": {
+          "median_ms": 0.19233301281929016,
+          "min_ms": 0.17808307893574238,
+          "max_ms": 0.39833388291299343
+        },
+        "tilelang_metal": {
+          "median_ms": 0.13537495397031307,
+          "min_ms": 0.12420909479260445,
+          "max_ms": 0.25654095225036144,
+          "peak_gib": 5.960464477539062e-07
+        },
+        "speedup_tilelang_over_pure": 1.4207429600416903,
+        "max_abs_err": 0.0
+      }
+    },
+    {
+      "label": "small",
+      "B": 2,
+      "T": 32,
+      "H": 4,
+      "P": 4,
+      "N": 8,
+      "compute_dacs_segsum": {
+        "pure_mlx": {
+          "median_ms": 0.16083312220871449,
+          "min_ms": 0.14241598546504974,
+          "max_ms": 0.30691688880324364
+        },
+        "tilelang_metal": {
+          "median_ms": 0.15354203060269356,
+          "min_ms": 0.1466250978410244,
+          "max_ms": 0.3202499356120825,
+          "peak_gib": 3.24249267578125e-05
+        },
+        "speedup_tilelang_over_pure": 1.0474859657476292,
+        "max_abs_err": 0.00048828125
+      },
+      "bwd_dadt_fused": {
+        "pure_mlx": {
+          "median_ms": 0.1435840968042612,
+          "min_ms": 0.1356659922748804,
+          "max_ms": 0.2661249600350857
+        },
+        "tilelang_metal": {
+          "median_ms": 0.15649991109967232,
+          "min_ms": 0.1357079017907381,
+          "max_ms": 0.24933414533734322,
+          "peak_gib": 3.4332275390625e-05
+        },
+        "speedup_tilelang_over_pure": 0.9174707882921082,
+        "max_abs_err": 0.0
+      },
+      "bwd_dtrap_ddt": {
+        "pure_mlx": {
+          "median_ms": 0.2057079691439867,
+          "min_ms": 0.16854098066687584,
+          "max_ms": 0.30683400109410286
+        },
+        "tilelang_metal": {
+          "median_ms": 0.14337501488626003,
+          "min_ms": 0.1190828625112772,
+          "max_ms": 0.231417128816247,
+          "peak_gib": 2.384185791015625e-06
+        },
+        "speedup_tilelang_over_pure": 1.4347546488987335,
+        "max_abs_err": 0.0
+      }
+    },
+    {
+      "label": "medium",
+      "B": 4,
+      "T": 64,
+      "H": 8,
+      "P": 4,
+      "N": 16,
+      "compute_dacs_segsum": {
+        "pure_mlx": {
+          "median_ms": 0.1680420245975256,
+          "min_ms": 0.15645800158381462,
+          "max_ms": 0.30933297239243984
+        },
+        "tilelang_metal": {
+          "median_ms": 0.1527499407529831,
+          "min_ms": 0.1453340519219637,
+          "max_ms": 0.2854159101843834,
+          "peak_gib": 0.0005035400390625
+        },
+        "speedup_tilelang_over_pure": 1.1001118806931116,
+        "max_abs_err": 0.00048828125
+      },
+      "bwd_dadt_fused": {
+        "pure_mlx": {
+          "median_ms": 0.15366589650511742,
+          "min_ms": 0.13845902867615223,
+          "max_ms": 0.2705410588532686
+        },
+        "tilelang_metal": {
+          "median_ms": 0.15974999405443668,
+          "min_ms": 0.14158315025269985,
+          "max_ms": 0.2147909253835678,
+          "peak_gib": 0.000518798828125
+        },
+        "speedup_tilelang_over_pure": 0.9619148809029311,
+        "max_abs_err": 0.0
+      },
+      "bwd_dtrap_ddt": {
+        "pure_mlx": {
+          "median_ms": 0.20470889285206795,
+          "min_ms": 0.18320814706385136,
+          "max_ms": 0.40645780973136425
+        },
+        "tilelang_metal": {
+          "median_ms": 0.1300419680774212,
+          "min_ms": 0.11879182420670986,
+          "max_ms": 0.2632918767631054,
+          "peak_gib": 1.9073486328125e-05
+        },
+        "speedup_tilelang_over_pure": 1.5741755979130783,
+        "max_abs_err": 3.0517578125e-05
+      }
+    },
+    {
+      "label": "mamba3-default",
+      "B": 2,
+      "T": 128,
+      "H": 4,
+      "P": 64,
+      "N": 16,
+      "compute_dacs_segsum": {
+        "pure_mlx": {
+          "median_ms": 0.215957872569561,
+          "min_ms": 0.19862502813339233,
+          "max_ms": 0.4004170186817646
+        },
+        "tilelang_metal": {
+          "median_ms": 0.2187499776482582,
+          "min_ms": 0.2013330813497305,
+          "max_ms": 0.4028331022709608,
+          "peak_gib": 0.00391387939453125
+        },
+        "speedup_tilelang_over_pure": 0.9872360897646042,
+        "max_abs_err": 0.0009765625
+      },
+      "bwd_dadt_fused": {
+        "pure_mlx": {
+          "median_ms": 0.19945786334574223,
+          "min_ms": 0.16483315266668797,
+          "max_ms": 0.5550410132855177
+        },
+        "tilelang_metal": {
+          "median_ms": 0.22191694006323814,
+          "min_ms": 0.21041696891188622,
+          "max_ms": 0.32049999572336674,
+          "peak_gib": 0.0039215087890625
+        },
+        "speedup_tilelang_over_pure": 0.8987951225756091,
+        "max_abs_err": 7.2479248046875e-05
+      },
+      "bwd_dtrap_ddt": {
+        "pure_mlx": {
+          "median_ms": 0.2073331270366907,
+          "min_ms": 0.18833298236131668,
+          "max_ms": 0.37212506867945194
+        },
+        "tilelang_metal": {
+          "median_ms": 0.13820803724229336,
+          "min_ms": 0.11658389121294022,
+          "max_ms": 0.24645798839628696,
+          "peak_gib": 9.5367431640625e-06
+        },
+        "speedup_tilelang_over_pure": 1.5001524598255724,
+        "max_abs_err": 0.0
+      }
+    }
+  ]
+}

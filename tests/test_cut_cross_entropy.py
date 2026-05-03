@@ -139,6 +139,46 @@ def test_chunked_forward_grad_matches_materialized_grad() -> None:
     assert _max_abs(gmat[1], gch[1]) <= 1e-6
 
 
+def test_reduction_none_masked_backward_honors_per_token_grad_output() -> None:
+    """Non-uniform masks must influence every row's backward gradient.
+
+    This guards against the Liger FLCE failure mode where reduction="none"
+    backward only consumes grad_output[0] as a scalar and silently ignores
+    per-position weighting.
+    """
+
+    e, c, targets = _make_inputs(batch=2, seq=5, hidden=16, vocab=32)
+    weights = mx.array(
+        [
+            [0.0, 0.25, 1.0, 0.5, 2.0],
+            [1.5, 0.0, 0.75, 1.25, 0.1],
+        ],
+        dtype=mx.float32,
+    )
+    normalizer = mx.sum(weights)
+
+    def loss_mat(e: mx.array, c: mx.array) -> mx.array:
+        per_token = materialized_cross_entropy(e, c, targets, reduction="none")
+        return mx.sum(per_token * weights) / normalizer
+
+    def loss_chunk(e: mx.array, c: mx.array) -> mx.array:
+        per_token = linear_cross_entropy(
+            e,
+            c,
+            targets,
+            chunk_rows=3,
+            reduction="none",
+        )
+        return mx.sum(per_token * weights) / normalizer
+
+    expected = mx.grad(loss_mat, argnums=(0, 1))(e, c)
+    actual = mx.grad(loss_chunk, argnums=(0, 1))(e, c)
+    mx.eval(expected, actual)
+
+    assert _max_abs(actual[0], expected[0]) <= 1e-6
+    assert _max_abs(actual[1], expected[1]) <= 1e-6
+
+
 def test_eager_value_and_grad_handles_2d_inputs() -> None:
     """``e`` may already be flattened to ``(N, D)``."""
 

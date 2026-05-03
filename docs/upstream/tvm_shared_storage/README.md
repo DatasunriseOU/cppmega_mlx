@@ -18,12 +18,12 @@ This blocks Path C (`apache-tvm-ffi` + `mlc-ai-nightly-cpu` pip-install path for
 
 Adds an env var `TVM_METAL_STORAGE_MODE` that overrides the storage mode used in `MetalWorkspace::AllocDataSpace`:
 
-| value | mode | semantics |
-|---|---|---|
-| unset / `private` | `MTLResourceStorageModePrivate` | **default**, GPU-only, preserves historical behaviour |
-| `shared` | `MTLResourceStorageModeShared` | CPU+GPU mapped — required for zero-copy DLPack to MLX |
-| `managed` | `MTLResourceStorageModeManaged` | macOS-only intermediate (driver tracks dirty pages) |
-| anything else | `MTLResourceStorageModePrivate` + warning | safe fall-back |
+| value             | mode                                      | semantics                                             |
+| ----------------- | ----------------------------------------- | ----------------------------------------------------- |
+| unset / `private` | `MTLResourceStorageModePrivate`           | **default**, GPU-only, preserves historical behaviour |
+| `shared`          | `MTLResourceStorageModeShared`            | CPU+GPU mapped — required for zero-copy DLPack to MLX |
+| `managed`         | `MTLResourceStorageModeManaged`           | macOS-only intermediate (driver tracks dirty pages)   |
+| anything else     | `MTLResourceStorageModePrivate` + warning | safe fall-back                                        |
 
 The env var is parsed once on the first `AllocDataSpace` call and cached in a function-local `static`. No per-allocation overhead.
 

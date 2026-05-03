@@ -17,6 +17,7 @@ mlx-mfa (which inherits MLX's allocator) is Shared-by-default and works out of t
 ## Why we need this
 
 MLX 0.31.x has `mx.array.__dlpack__()` and `__dlpack_device__()` — EXPORT works, but:
+
 - `mx.array.__dlpack_device__()` advertises `(8, 0)` (`kDLMetal`) when Metal is available
 - The exporter at `convert.cpp:100-159` emits the actual capsule with `device_type=1` (`kDLCPU`) — uses `a.data<T>()` (host pointer) without a `nb::device::metal` annotation
 - There is NO `mx.from_dlpack(obj)` at all
@@ -27,16 +28,17 @@ So MLX is currently a one-way `kDLCPU` producer despite advertising `kDLMetal`. 
 ## What the patch does
 
 Adds a top-level `mx.from_dlpack(obj)` that consumes either:
+
 - A raw `PyCapsule` (named `"dltensor"` or `"dltensor_versioned"`)
 - Any object whose `__dlpack__()` chain yields one (up to 4 unwrap iterations)
 
 Dispatch is by `DLDevice.device_type`:
 
-| device_type | behavior |
-|---|---|
-| `kDLCPU` (1) | Copy into a fresh MLX allocation; run producer's deleter immediately after copy |
+| device_type    | behavior                                                                                                                                                                                                                                       |
+| -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `kDLCPU` (1)   | Copy into a fresh MLX allocation; run producer's deleter immediately after copy                                                                                                                                                                |
 | `kDLMetal` (8) | Wrap the foreign `MTLBuffer` as an `mx.array` via `array(allocator::Buffer, Shape, Dtype, Deleter)` — the constructor MLX already exposes. Storage mode validated to be `MTLResourceStorageModeShared`; non-Shared rejected with a clear error |
-| Any other | Rejected explicitly (`kDLCUDA`, `kDLROCM`, etc.) |
+| Any other      | Rejected explicitly (`kDLCUDA`, `kDLROCM`, etc.)                                                                                                                                                                                               |
 
 Used capsules are detected and rejected on second consume. Non-contiguous strided views are rejected with a clear error.
 
@@ -48,18 +50,18 @@ The error message tells the producer exactly what to fix — they need to alloca
 
 ## True LOC count
 
-| File | LOC |
-|---|---|
-| `python/src/dlpack_consumer.cpp` | 226 |
-| `python/src/dlpack_consumer.h` | 24 |
-| `python/src/dlpack_consumer_metal.cpp` | 138 |
-| `python/src/dlpack_consumer_no_metal.cpp` | 11 |
-| `python/src/dlpack_format.h` | 25 |
-| `python/src/array.cpp` additions | ~26 |
-| `python/src/CMakeLists.txt` additions | 2 |
-| **C++ subtotal** | **~452** |
-| `python/tests/test_dlpack_consumer.py` | 90 |
-| **Grand total** | **~542 LOC** |
+| File                                      | LOC          |
+| ----------------------------------------- | ------------ |
+| `python/src/dlpack_consumer.cpp`          | 226          |
+| `python/src/dlpack_consumer.h`            | 24           |
+| `python/src/dlpack_consumer_metal.cpp`    | 138          |
+| `python/src/dlpack_consumer_no_metal.cpp` | 11           |
+| `python/src/dlpack_format.h`              | 25           |
+| `python/src/array.cpp` additions          | ~26          |
+| `python/src/CMakeLists.txt` additions     | 2            |
+| **C++ subtotal**                          | **~452**     |
+| `python/tests/test_dlpack_consumer.py`    | 90           |
+| **Grand total**                           | **~542 LOC** |
 
 Honest count: not the 200 LOC I initially estimated, not 800. The DLPack ABI plumbing + storage-mode validation + version-aware capsule handling + nanobind integration brings it to ~450 LOC of C++.
 
@@ -85,22 +87,22 @@ Ready text for the ml-explore/mlx PR body:
 ```markdown
 ## [Python] Add mx.from_dlpack(obj) Metal-aware consumer
 
-MLX currently advertises kDLMetal in mx.array.__dlpack_device__() but
-emits kDLCPU capsules in __dlpack__() and has no consumer at all.
+MLX currently advertises kDLMetal in mx.array.**dlpack_device**() but
+emits kDLCPU capsules in **dlpack**() and has no consumer at all.
 This means cross-stack DLPack interop on Apple Silicon (with TVM,
 mlx-mfa, etc) requires a host roundtrip — defeating the point of
 DLPack.
 
 This PR adds mx.from_dlpack(obj) that consumes either a raw PyCapsule
-or an object with __dlpack__(). Dispatch by DLDevice.device_type:
+or an object with **dlpack**(). Dispatch by DLDevice.device_type:
 
-* kDLCPU: copy into a fresh MLX allocation
-* kDLMetal: wrap the foreign MTLBuffer via the existing
+- kDLCPU: copy into a fresh MLX allocation
+- kDLMetal: wrap the foreign MTLBuffer via the existing
   array(allocator::Buffer, Shape, Dtype, Deleter) constructor.
   Storage mode validated to MTLResourceStorageModeShared; non-Shared
   rejected with a clear error pointing the producer at allocator
   fix-up.
-* Other device types rejected explicitly.
+- Other device types rejected explicitly.
 
 Used capsules detected, strided views rejected.
 
@@ -108,7 +110,7 @@ Used capsules detected, strided views rejected.
 
 A separate Phase 2 PR will fix MLX's exporter (convert.cpp:100-159)
 to actually emit kDLMetal capsules when running on Metal — currently
-the device_type advertised by __dlpack_device__() and the device_type
+the device_type advertised by **dlpack_device**() and the device_type
 of the emitted capsule disagree.
 
 Motivation: zero-copy DLPack with TVM-NDArray and mlx-mfa is the

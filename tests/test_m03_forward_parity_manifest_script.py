@@ -320,6 +320,61 @@ def test_script_refuses_stale_and_non_numeric_cuda_artifacts(tmp_path: Path) -> 
     assert "mean must be a finite number" in non_numeric_manifest["cuda_reference"]["artifact_error"]
 
 
+def test_script_refuses_forged_valid_cuda_artifact_hardware(tmp_path: Path) -> None:
+    cuda_artifact = tmp_path / "forged_hardware.json"
+    output = tmp_path / "forged_hardware_out.json"
+    payload = valid_cuda_artifact_payload()
+    payload["hardware"] = "GB10 CUDA Apple fallback"
+    write_json(cuda_artifact, payload)
+
+    manifest = load_json_result(
+        run_script(
+            "--cuda-reference-artifact",
+            str(cuda_artifact),
+            "--output",
+            str(output),
+            "--json",
+        )
+    )
+
+    assert json.loads(output.read_text()) == manifest
+    validate_m03_forward_parity_manifest_dict(manifest)
+    assert manifest["status"] == "refused"
+    assert manifest["cuda_reference"]["status"] == "refused_invalid_artifact"
+    assert manifest["cuda_reference"]["artifact_preflight_status"] == "invalid"
+    assert "hardware" in manifest["cuda_reference"]["artifact_error"]
+    assert "GB10 and CUDA" in manifest["cuda_reference"]["artifact_error"]
+    assert manifest["acceptance_gate"]["cuda_reference_artifact_preflight_status"] == "invalid"
+    assert manifest["acceptance_gate"]["full_m0_3_acceptance"] is False
+
+
+def test_script_refuses_forged_valid_cuda_artifact_runtime(tmp_path: Path) -> None:
+    cuda_artifact = tmp_path / "forged_runtime.json"
+    output = tmp_path / "forged_runtime_out.json"
+    payload = valid_cuda_artifact_payload()
+    payload["cuda_runtime"] = "CUDA 13.0 via MLX fallback"
+    write_json(cuda_artifact, payload)
+
+    manifest = load_json_result(
+        run_script(
+            "--cuda-reference-artifact",
+            str(cuda_artifact),
+            "--output",
+            str(output),
+            "--json",
+        )
+    )
+
+    assert json.loads(output.read_text()) == manifest
+    validate_m03_forward_parity_manifest_dict(manifest)
+    assert manifest["status"] == "refused"
+    assert manifest["cuda_reference"]["status"] == "refused_invalid_artifact"
+    assert manifest["cuda_reference"]["artifact_preflight_status"] == "invalid"
+    assert "cuda_runtime" in manifest["cuda_reference"]["artifact_error"]
+    assert manifest["acceptance_gate"]["cuda_reference_artifact_preflight_status"] == "invalid"
+    assert manifest["acceptance_gate"]["full_m0_3_acceptance"] is False
+
+
 def test_script_records_valid_cuda_artifact_but_still_refuses_closure(tmp_path: Path) -> None:
     cuda_artifact = tmp_path / "cuda_logits.json"
     output = tmp_path / "m03_random_init.json"

@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "scope": "local_only",
+  "kernel": "mamba3_mimo_path_b",
+  "hardware_label": "Davids-Mac-Studio.local",
+  "platform": {
+    "system": "Darwin",
+    "machine": "arm64",
+    "python_version": "3.13.12",
+    "mlx_version": "0.31.1"
+  },
+  "shape": {
+    "batch": 2,
+    "seq": 512,
+    "heads": 4,
+    "headdim": 32,
+    "state": 64,
+    "dtype": "float16",
+    "d_inner": 128,
+    "d_model_equivalent": 64
+  },
+  "metal_status": {
+    "available": true,
+    "reason": "MSL dispatch path is available"
+  },
+  "parity": {
+    "y_max_abs": 0.000213623046875,
+    "y_ref_norm": 2.1877773654025283,
+    "h_max_abs": 0.003173828125,
+    "h_ref_norm": 11.379222044407847,
+    "y_rel": 9.764386918574684e-05,
+    "h_rel": 0.00027891433286157316
+  },
+  "timings": {
+    "fwd_reference": {
+      "label": "fwd_reference",
+      "mean_ms": 15.01639997586608,
+      "median_ms": 15.095958020538092,
+      "min_ms": 14.016291126608849,
+      "max_ms": 15.740958042442799,
+      "iters": 15,
+      "warmup": 5
+    },
+    "fwd_metal": {
+      "label": "fwd_metal",
+      "mean_ms": 0.5889334095021089,
+      "median_ms": 0.5766251124441624,
+      "min_ms": 0.5585828330367804,
+      "max_ms": 0.6690409500151873,
+      "iters": 15,
+      "warmup": 5
+    },
+    "fwd_bwd_reference": {
+      "label": "fwd_bwd_reference",
+      "mean_ms": 116.46697758696973,
+      "median_ms": 113.75637515448034,
+      "min_ms": 109.80929178185761,
+      "max_ms": 152.8458329848945,
+      "iters": 15,
+      "warmup": 5
+    },
+    "fwd_bwd_metal": {
+      "label": "fwd_bwd_metal",
+      "mean_ms": 5.378491664305329,
+      "median_ms": 5.3478749468922615,
+      "min_ms": 5.256708944216371,
+      "max_ms": 5.607499973848462,
+      "iters": 15,
+      "warmup": 5
+    }
+  },
+  "speedups": {
+    "fwd": 25.497619482245227,
+    "fwd_bwd": 21.654208067274617
+  },
+  "matched_run_guard": "Compare M4 Max and GB10 only when both rows were collected with identical kernel inputs and dtype. This is a local_only receipt."
+}
