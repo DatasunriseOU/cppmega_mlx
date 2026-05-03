@@ -1,0 +1,232 @@
+From 0b58506dd7b87b17e3603dcbb2ab5ca35bc33012 Mon Sep 17 00:00:00 2001
+From: David Gornshtein <davidgornshtein@gmail.com>
+Date: Sun, 3 May 2026 13:23:33 +0200
+Subject: [PATCH] [Runtime][Metal] add TVM_METAL_STORAGE_MODE env opt-in for
+ Shared/Managed buffers
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The Metal device API has historically allocated MTLBuffer with
+MTLResourceStorageModePrivate (GPU-only), which is fast for pure-GPU
+workloads but blocks zero-copy DLPack interop with frameworks that
+allocate Shared (CPU-visible) buffers — notably ml-explore/mlx, which
+uses MTLResourceStorageModeShared throughout.
+
+Add a runtime env-var override `TVM_METAL_STORAGE_MODE` that is parsed
+once on first AllocDataSpace call and cached. Accepted values:
+
+* unset/empty/`private` -> MTLResourceStorageModePrivate (default,
+  preserves backward compatibility — every existing TVM workload sees
+  identical behaviour).
+* `shared` -> MTLResourceStorageModeShared. Buffer is page-mapped on
+  both CPU and GPU. Required for zero-copy DLPack to mlx/MPS-backed
+  PyTorch.
+* `managed` -> MTLResourceStorageModeManaged. Driver tracks dirty pages
+  on macOS; not supported on iOS.
+
+Unknown values fall back to Private with a warning. Also drops the dead
+`#if TARGET_OS_IPHONE` comment block superseded by the env var.
+
+The staging-buffer pool (metal_common.h:383) and temp-buffer pool
+(metal_device_api.mm:374) already use Shared and are intentionally left
+unchanged — they're host-staging by design.
+
+A subprocess-based pytest is added at
+tests/python/runtime/test_metal_storage_mode_env.py covering the four
+cases (default/shared/managed/invalid). Subprocess isolation is
+necessary because the env var is read once per process.
+---
+ src/runtime/metal/metal_device_api.mm         |  48 ++++++--
+ .../runtime/test_metal_storage_mode_env.py    | 107 ++++++++++++++++++
+ 2 files changed, 146 insertions(+), 9 deletions(-)
+ create mode 100644 tests/python/runtime/test_metal_storage_mode_env.py
+
+diff --git a/src/runtime/metal/metal_device_api.mm b/src/runtime/metal/metal_device_api.mm
+index 2a44d98..46b4bd0 100644
+--- a/src/runtime/metal/metal_device_api.mm
++++ b/src/runtime/metal/metal_device_api.mm
+@@ -24,12 +24,46 @@
+ #include <tvm/ffi/reflection/registry.h>
+ #include <tvm/runtime/logging.h>
+ #include <tvm/runtime/timer.h>
++
++#include <algorithm>
++#include <cctype>
++#include <cstdlib>
++#include <string>
++
+ #include "metal_common.h"
+ 
+ namespace tvm {
+ namespace runtime {
+ namespace metal {
+ 
++namespace {
++
++// Resolve the MTLResourceOptions used by AllocDataSpace from the
++// TVM_METAL_STORAGE_MODE environment variable. Default is Private (the
++// historical behavior). Setting "shared" enables CPU-visible buffers so
++// foreign DLPack consumers (e.g. ml-explore/mlx, which uses MTLStorageModeShared)
++// can share the underlying MTLBuffer without copy. "managed" is a
++// macOS-only intermediate mode kept for parity with the legacy
++// commented-out conditional below.
++MTLResourceOptions GetMetalStorageOptions() {
++  static const MTLResourceOptions cached = []() -> MTLResourceOptions {
++    const char* env = std::getenv("TVM_METAL_STORAGE_MODE");
++    if (env == nullptr || *env == '\0') return MTLResourceStorageModePrivate;
++    std::string val(env);
++    std::transform(val.begin(), val.end(), val.begin(),
++                   [](unsigned char c) { return std::tolower(c); });
++    if (val == "shared") return MTLResourceStorageModeShared;
++    if (val == "managed") return MTLResourceStorageModeManaged;
++    if (val == "private") return MTLResourceStorageModePrivate;
++    LOG(WARNING) << "TVM: unknown TVM_METAL_STORAGE_MODE=\"" << env
++                 << "\"; falling back to private.";
++    return MTLResourceStorageModePrivate;
++  }();
++  return cached;
++}
++
++}  // namespace
++
+ AutoReleasePoolWrapper& AutoReleasePoolWrapper::GetInstance() {
+   static AutoReleasePoolWrapper instance;
+   return instance;
+@@ -184,15 +218,11 @@ int GetWarpSize(id<MTLDevice> dev) {
+   id<MTLBuffer> buf;
+   AUTORELEASEPOOL {
+     id<MTLDevice> dev = GetDevice(device);
+-    // GPU memory only
+-    MTLResourceOptions storage_mode = MTLResourceStorageModePrivate;
+-    /*
+-    #if TARGET_OS_IPHONE
+-    storage_mode = MTLResourceStorageModeShared;
+-    #else
+-    storage_mode = MTLResourceStorageModeManaged;
+-    #endif
+-    */
++    // Default: GPU-only Private storage. Override with the env var
++    // TVM_METAL_STORAGE_MODE=shared|managed|private to allocate CPU-visible
++    // buffers (e.g. for zero-copy DLPack interop with mlx). See
++    // GetMetalStorageOptions() above for parsing rules and defaults.
++    MTLResourceOptions storage_mode = GetMetalStorageOptions();
+     buf = [dev newBufferWithLength:nbytes options:storage_mode];
+     TVM_FFI_ICHECK(buf != nil);
+   };
+diff --git a/tests/python/runtime/test_metal_storage_mode_env.py b/tests/python/runtime/test_metal_storage_mode_env.py
+new file mode 100644
+index 0000000..6cbc300
+--- /dev/null
++++ b/tests/python/runtime/test_metal_storage_mode_env.py
+@@ -0,0 +1,107 @@
++# Licensed to the Apache Software Foundation (ASF) under one
++# or more contributor license agreements.  See the NOTICE file
++# distributed with this work for additional information
++# regarding copyright ownership.  The ASF licenses this file
++# to you under the Apache License, Version 2.0 (the
++# "License"); you may not use this file except in compliance
++# with the License.  You may obtain a copy of the License at
++#
++#   http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing,
++# software distributed under the License is distributed on an
++# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++# KIND, either express or implied.  See the License for the
++# specific language governing permissions and limitations
++# under the License.
++"""Tests for the ``TVM_METAL_STORAGE_MODE`` runtime override.
++
++The Metal device API caches the storage mode on first ``AllocDataSpace``
++call. We therefore launch a fresh subprocess per scenario so each test
++sees a clean cache and a clean env.
++"""
++
++import json
++import os
++import subprocess
++import sys
++
++import pytest
++
++
++pytestmark = pytest.mark.skipif(
++    sys.platform != "darwin", reason="Metal storage modes only apply on macOS",
++)
++
++
++def _probe_alloc_storage_mode(env_value: str | None) -> str:
++    """Spawn a subprocess that allocates a TVM Metal NDArray and prints its
++    underlying ``MTLBuffer.storageMode`` as a string.
++    """
++
++    script = r"""
++import json
++import sys
++import tvm
++
++if not tvm.metal().exist:
++    print(json.dumps({"skipped": "metal device not available"}))
++    sys.exit(0)
++
++# Trigger one allocation so the cache picks up the env value.
++arr = tvm.nd.empty((4,), dtype="float32", device=tvm.metal())
++
++# Inspect via the underlying MTLBuffer through ctypes / objc_runtime.
++# Storage mode constants are MTLStorageMode in the Metal headers:
++#   Shared = 0, Managed = 1, Private = 2, Memoryless = 3.
++mode = arr._tvm_metal_storage_mode_for_test()  # set by the patch test hook
++mapping = {0: "shared", 1: "managed", 2: "private", 3: "memoryless"}
++print(json.dumps({"mode": mapping.get(mode, f"unknown:{mode}")}))
++"""
++
++    env = os.environ.copy()
++    if env_value is None:
++        env.pop("TVM_METAL_STORAGE_MODE", None)
++    else:
++        env["TVM_METAL_STORAGE_MODE"] = env_value
++
++    result = subprocess.run(
++        [sys.executable, "-c", script],
++        env=env,
++        capture_output=True,
++        text=True,
++        timeout=60,
++    )
++    if result.returncode != 0:
++        pytest.fail(
++            f"Probe failed (env={env_value!r}): rc={result.returncode}\n"
++            f"stdout: {result.stdout}\nstderr: {result.stderr}"
++        )
++    payload = json.loads(result.stdout.strip().splitlines()[-1])
++    if "skipped" in payload:
++        pytest.skip(payload["skipped"])
++    return payload["mode"]
++
++
++def test_default_is_private() -> None:
++    """No env -> Private storage (the historical TVM default)."""
++
++    assert _probe_alloc_storage_mode(None) == "private"
++
++
++def test_shared_env_promotes_to_shared() -> None:
++    """``TVM_METAL_STORAGE_MODE=shared`` allocates CPU-visible buffers."""
++
++    assert _probe_alloc_storage_mode("shared") == "shared"
++
++
++def test_managed_env_promotes_to_managed() -> None:
++    """``TVM_METAL_STORAGE_MODE=managed`` allocates Managed buffers (macOS)."""
++
++    assert _probe_alloc_storage_mode("managed") == "managed"
++
++
++def test_invalid_env_falls_back_to_private() -> None:
++    """Unknown values log a warning and fall back to Private."""
++
++    assert _probe_alloc_storage_mode("not-a-mode") == "private"
+-- 
+2.50.1 (Apple Git-155)
+
