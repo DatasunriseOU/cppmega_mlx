@@ -14,6 +14,10 @@ __pycache__/
 # Build artifacts.
 *.egg-info/
 
+# Local Metal GPU traces (multi-hundred-MB Apple Xcode capture bundles).
+*.gputrace
+docs/upstream/tilelang_metal_mamba3/captures/
+
 # Codex/agent runtime logs are local coordination artifacts.
 .codex/agent-logs/
 .claude/

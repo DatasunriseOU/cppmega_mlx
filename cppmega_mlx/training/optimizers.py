@@ -373,11 +373,18 @@ class MuonAdamWMulti(optim.Optimizer):
 
     def apply_gradients(self, gradients: Any, parameters: Any) -> Any:
         muon_grads, adamw_grads = self._split(gradients)
+        muon_params, adamw_params = self._split(parameters)
         merged: Any = {}
         if muon_grads:
-            merged = tree_merge(merged, self._muon.apply_gradients(muon_grads, parameters))
+            merged = tree_merge(
+                merged,
+                self._muon.apply_gradients(muon_grads, muon_params),
+            )
         if adamw_grads:
-            merged = tree_merge(merged, self._adamw.apply_gradients(adamw_grads, parameters))
+            merged = tree_merge(
+                merged,
+                self._adamw.apply_gradients(adamw_grads, adamw_params),
+            )
         return merged
 
     def update(self, model: nn.Module, gradients: Any) -> None:

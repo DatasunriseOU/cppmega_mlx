@@ -12,7 +12,7 @@ import math
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
-from mlx.utils import tree_flatten
+from mlx.utils import tree_flatten, tree_unflatten
 
 from cppmega_mlx.training.optimizers import (
     EMBEDDING_LIKE_NAME_HINTS,
@@ -173,6 +173,49 @@ def test_make_muon_update_step_completes_without_error() -> None:
         after_arr = after[key]
         delta = mx.max(mx.abs(after_arr - before_arr)).item()
         assert delta > 0.0, f"parameter {key!r} did not change after update"
+
+
+class _RecordingOptimizer:
+    def __init__(self) -> None:
+        self.calls: list[tuple[set[str], set[str]]] = []
+        self.state: dict[str, object] = {}
+        self.learning_rate = mx.array(0.0)
+
+    def init(self, parameters: object) -> None:
+        self.state = {"keys": sorted(_flatten_keys(parameters))}
+
+    def apply_gradients(self, gradients: object, parameters: object) -> object:
+        grad_keys = _flatten_keys(gradients)
+        param_keys = _flatten_keys(parameters)
+        self.calls.append((grad_keys, param_keys))
+        assert param_keys == grad_keys
+        return parameters
+
+
+def test_muon_adamw_multi_passes_routed_parameter_subtrees_to_suboptimizers() -> None:
+    model = _SplitterModel()
+    params = model.trainable_parameters()
+    gradients = tree_unflatten(
+        [
+            (key, mx.ones_like(value))
+            for key, value in tree_flatten(params)
+            if isinstance(value, mx.array)
+        ]
+    )
+    muon = _RecordingOptimizer()
+    adamw = _RecordingOptimizer()
+    optimizer = MuonAdamWMulti(muon, adamw)
+
+    updates = optimizer.apply_gradients(gradients, params)
+
+    assert _flatten_keys(updates) == _flatten_keys(params)
+    assert muon.calls == [({"linear.weight"}, {"linear.weight"})]
+    assert adamw.calls == [
+        (
+            {"embedding.weight", "linear.bias", "lm_head.weight", "norm_weight"},
+            {"embedding.weight", "linear.bias", "lm_head.weight", "norm_weight"},
+        )
+    ]
 
 
 def test_make_muon_cppmega_cuda_parity_forces_shared_lr() -> None:
