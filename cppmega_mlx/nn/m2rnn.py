@@ -295,6 +295,80 @@ def m2rnn_scan(
     return out, h
 
 
+def _dispatch_m2rnn_scan(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    W: mx.array,
+    xf: mx.array,
+    *,
+    h0: mx.array | None,
+    chunk_size: int,
+) -> tuple[mx.array, mx.array]:
+    """Route the M2RNN scan according to :class:`KernelPath`.
+
+    AUTO/PATH_B uses the Path B Metal kernel via
+    :func:`cppmega_mlx.nn._tilelang.m2rnn_apply_with_state` when available;
+    the wrapper preserves grad through ``y`` via the manual VJP shipped with
+    the kernel and exposes ``h_last`` for cache assembly. REFERENCE always
+    uses the pure-MLX :func:`chunked_m2rnn_scan`. PATH_C is not implemented
+    for m2rnn (Path C is a Mamba3-only proof-of-DSL artifact).
+    """
+
+    from cppmega_mlx.runtime.kernel_policy import (
+        KernelPath,
+        record_dispatch,
+        selected_path,
+    )
+
+    # Validate chunk_size up-front so production parity holds for all paths,
+    # including PATH_B which would otherwise skip the chunked-scan check.
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+
+    path = selected_path("m2rnn")
+
+    if path is KernelPath.PATH_C:
+        raise NotImplementedError("m2rnn Path C not implemented; use Path B")
+
+    if path is KernelPath.REFERENCE:
+        record_dispatch("m2rnn", path, "reference_pure_mlx")
+        return chunked_m2rnn_scan(q, k, v, W, xf, h0=h0, chunk_size=chunk_size)
+
+    # AUTO + PATH_B share the Metal-availability check.
+    from cppmega_mlx.nn._tilelang.m2rnn import (
+        m2rnn_apply_with_state,
+        m2rnn_metal_status,
+    )
+
+    status = m2rnn_metal_status(q)
+    if path is KernelPath.PATH_B and not status.available:
+        raise RuntimeError(
+            f"m2rnn: Path B kernel unavailable ({status.reason})"
+        )
+    if status.available:
+        # Broadcast heads ahead of the kernel so the dispatch input matches the
+        # contract used by chunked_m2rnn_scan / m2rnn_scan.
+        q_b, k_b, v_b, W_b, xf_b = broadcast_m2rnn_heads(q, k, v, W, xf)
+        batch, seq, heads, k_dim = q_b.shape
+        v_dim = v_b.shape[-1]
+        h0_full = _initial_m2rnn_state(
+            h0,
+            batch=batch,
+            heads=heads,
+            k_dim=k_dim,
+            v_dim=v_dim,
+            dtype=q_b.dtype,
+        )
+        record_dispatch("m2rnn", path, "metal_kernel_fwd_v1")
+        y, h_last = m2rnn_apply_with_state(q_b, k_b, v_b, W_b, xf_b, h0_full)
+        return y, h_last
+
+    # AUTO fallback when Metal is unavailable.
+    record_dispatch("m2rnn", path, "reference_pure_mlx")
+    return chunked_m2rnn_scan(q, k, v, W, xf, h0=h0, chunk_size=chunk_size)
+
+
 def chunked_m2rnn_scan(
     q: mx.array,
     k: mx.array,
@@ -528,7 +602,7 @@ class M2RNNMixer(nn.Module):
         xf = m2rnn_softplus_decay_gate(projected[:, :, conv_end:f_end], self.A_log, self.dt_bias)
         g = projected[:, :, f_end:].reshape(batch, seq, cfg.num_g_heads, cfg.v_head_dim)
 
-        out, h = chunked_m2rnn_scan(
+        out, h = _dispatch_m2rnn_scan(
             q,
             k,
             v,

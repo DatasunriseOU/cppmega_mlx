@@ -258,6 +258,40 @@ def _assert_training_optimizer(
         raise AssertionError(f"unexpected optimizer under test: {name}")
 
 
+def _assert_training_loss(
+    payload: dict[str, Any],
+    *,
+    backend: str = "cross_entropy",
+    chunk_rows: int | None = None,
+) -> None:
+    loss = payload["training_loss"]
+    assert loss["backend"] == backend
+    assert loss["eval_backend"] == "cross_entropy"
+    assert loss["manual_chunked_backward"] is False
+    if backend == "cross_entropy":
+        assert loss == {
+            "backend": "cross_entropy",
+            "chunk_rows": None,
+            "default": True,
+            "eval_backend": "cross_entropy",
+            "forward_memory_saving_claim": False,
+            "manual_chunked_backward": False,
+            "source": "cppmega_mlx.training.loss.next_token_cross_entropy",
+        }
+    elif backend == "cce":
+        assert loss == {
+            "backend": "cce",
+            "chunk_rows": chunk_rows,
+            "default": False,
+            "eval_backend": "cross_entropy",
+            "forward_memory_saving_claim": True,
+            "manual_chunked_backward": False,
+            "source": "cppmega_mlx.training.loss.next_token_cut_cross_entropy",
+        }
+    else:
+        raise AssertionError(f"unexpected loss backend under test: {backend}")
+
+
 def _tiny_ngram_hash_args() -> list[str]:
     return [
         "--ngram-hash",
@@ -530,6 +564,8 @@ def test_help_lists_hybrid_training_flags() -> None:
     assert "adamw" in result.stdout
     assert "muon" in result.stdout
     assert "CPPMEGA_OPTIMIZER" in result.stdout
+    assert "--loss-backend" in result.stdout
+    assert "--cce-chunk-rows" in result.stdout
     assert "--memory-limit-total-bytes" in result.stdout
     assert "--apply-memory-limit-plan" in result.stdout
 
@@ -544,7 +580,10 @@ def test_dry_run_json_reports_synthetic_hybrid_plan() -> None:
     assert payload["config"]["npz_path"] is None
     assert payload["config"]["optimizer"] == "adamw"
     assert payload["config"]["optimizer_source"] == "default"
+    assert payload["config"]["loss_backend"] == "cross_entropy"
+    assert payload["config"]["cce_chunk_rows"] > 0
     _assert_training_optimizer(payload, name="adamw")
+    _assert_training_loss(payload)
     assert payload["dataset"]["num_batches"] >= 1
     _assert_full_structure_contract(payload["dataset"])
     assert payload["model_source"] == "cppmega_mlx.models.hybrid_lm"
@@ -566,6 +605,22 @@ def test_dry_run_json_reports_synthetic_hybrid_plan() -> None:
         "mamba3": 1,
         "moe": 1,
     }
+
+
+def test_dry_run_json_reports_opt_in_cce_loss_backend() -> None:
+    result = run_script(
+        "--dry-run-json",
+        "--loss-backend",
+        "cce",
+        "--cce-chunk-rows",
+        "4",
+    )
+
+    payload = _load_json_result(result)
+    assert payload["status"] == "dry_run"
+    assert payload["config"]["loss_backend"] == "cce"
+    assert payload["config"]["cce_chunk_rows"] == 4
+    _assert_training_loss(payload, backend="cce", chunk_rows=4)
 
 
 def test_dry_run_json_selects_muon_from_cli() -> None:
@@ -861,6 +916,33 @@ def test_single_route_cli_smoke_eager_reports_finite_route_metadata(
     )
     assert payload["synthetic_npz"] is False
     assert payload["dataset"]["path"] == str(npz_path)
+
+
+def test_cce_loss_backend_cli_smoke_eager_reports_finite_training(
+    tmp_path: Path,
+) -> None:
+    npz_path = tmp_path / "tokens_cce.npz"
+    write_npz(npz_path, vocab_size=32)
+
+    result = run_script(
+        str(npz_path),
+        *_tiny_route_args("A"),
+        "--loss-backend",
+        "cce",
+        "--cce-chunk-rows",
+        "2",
+    )
+    payload = _load_json_result(result)
+
+    _assert_finite_route_training_payload(
+        payload,
+        symbol="A",
+        backend="attention",
+        compiled=False,
+    )
+    assert payload["config"]["loss_backend"] == "cce"
+    assert payload["config"]["cce_chunk_rows"] == 2
+    _assert_training_loss(payload, backend="cce", chunk_rows=2)
 
 
 @pytest.mark.parametrize(
@@ -1413,6 +1495,7 @@ def test_checkpoint_save_and_resume_reports_hybrid_cursor(tmp_path: Path) -> Non
     first_payload = json.loads(first.stdout)
     assert first_payload["status"] == "ok"
     _assert_training_optimizer(first_payload, name="adamw")
+    _assert_training_loss(first_payload)
     assert first_payload["start_step"] == 0
     assert first_payload["end_step"] == 1
     assert first_payload["checkpoints"]["saved"][0]["step"] == 1
@@ -1428,6 +1511,7 @@ def test_checkpoint_save_and_resume_reports_hybrid_cursor(tmp_path: Path) -> Non
     assert manifest["batch_cursor"]["batch_offset"] == 1
     assert manifest["optimizer"]["present"] is True
     _assert_training_optimizer(manifest, name="adamw")
+    _assert_training_loss(manifest)
     assert manifest["model_config"]["pattern"] == "AEMR"
     _assert_snapshot_rng_contract(manifest)
     _assert_update_boundary_training_state(
@@ -1466,6 +1550,7 @@ def test_checkpoint_save_and_resume_reports_hybrid_cursor(tmp_path: Path) -> Non
     second_payload = json.loads(second.stdout)
     assert second_payload["status"] == "ok"
     _assert_training_optimizer(second_payload, name="adamw")
+    _assert_training_loss(second_payload)
     assert second_payload["resume"]["loaded"] is True
     assert second_payload["resume"]["step"] == 1
     assert second_payload["resume"]["trained_tokens"] == first_payload["trained_tokens"]
@@ -1482,6 +1567,7 @@ def test_checkpoint_save_and_resume_reports_hybrid_cursor(tmp_path: Path) -> Non
     assert resumed_manifest["step"] == 2
     assert resumed_manifest["batch_cursor"]["global_batch_offset"] == 2
     _assert_training_optimizer(resumed_manifest, name="adamw")
+    _assert_training_loss(resumed_manifest)
     _assert_snapshot_rng_contract(resumed_manifest)
     _assert_update_boundary_training_state(
         resumed_manifest,
@@ -1681,6 +1767,20 @@ def test_invalid_steps_returns_error_json_with_device_and_compile_metadata() -> 
     assert payload["compile_plan"]["requested"] is True
     assert "default_device" in payload["device"]
     assert "metal_available" in payload["device"]
+
+
+def test_invalid_cce_chunk_rows_returns_error_json_with_loss_metadata() -> None:
+    result = run_script("--json", "--loss-backend", "cce", "--cce-chunk-rows", "0")
+
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "error"
+    assert payload["error_type"] == "ValueError"
+    assert "cce_chunk_rows must be positive" in payload["error"]
+    assert payload["config"]["loss_backend"] == "cce"
+    assert payload["config"]["cce_chunk_rows"] == 0
+    assert payload["training_loss"]["backend"] == "cce"
+    assert payload["training_loss"]["chunk_rows"] == 0
 
 
 def test_valid_dataset_format_without_validation_path_returns_error_json() -> None:

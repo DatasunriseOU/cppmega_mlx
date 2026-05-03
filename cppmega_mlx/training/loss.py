@@ -10,6 +10,10 @@ import mlx.nn as nn
 
 from cppmega_mlx.data.batch import LMTokenBatch, ensure_lm_batch
 from cppmega_mlx.nn.structure_embedding import StructureEmbedding
+from cppmega_mlx.training.cut_cross_entropy import (
+    DEFAULT_CHUNK_ROWS,
+    linear_cross_entropy,
+)
 from cppmega_mlx.training.mtp import (
     MTPLossConfig,
     MTPLossMetrics,
@@ -48,6 +52,53 @@ def next_token_cross_entropy(
 
     token_losses = nn.losses.cross_entropy(
         logits.astype(mx.float32), targets, reduction="none"
+    )
+    mask = lm_batch.target_mask
+    ntokens = mask.sum()
+    denom = mx.maximum(ntokens, mx.array(1.0, dtype=mx.float32))
+    loss = (token_losses * mask).astype(mx.float32).sum() / denom
+    return loss, ntokens
+
+
+def next_token_cut_cross_entropy(
+    model: nn.Module,
+    batch: LMTokenBatch | Mapping[str, mx.array] | mx.array,
+    *,
+    chunk_rows: int = DEFAULT_CHUNK_ROWS,
+) -> tuple[mx.array, mx.array]:
+    """Return masked next-token CE via the MLX-native chunked linear path.
+
+    This mirrors :func:`next_token_cross_entropy` but avoids materializing the
+    full ``[B*T, V]`` logits tensor in the forward loss. Under
+    ``nn.value_and_grad`` MLX still owns the backward trace, so this is a train
+    integration path, not a full manual chunked-backward memory receipt.
+    """
+
+    document_ids = _extract_document_ids(batch)
+    lm_batch = ensure_lm_batch(batch)
+    hidden_states = _decoder_hidden_states_for_mtp(
+        model,
+        lm_batch,
+        document_ids=document_ids[:, :-1] if document_ids is not None else None,
+    )
+    targets = lm_batch.targets
+    if hidden_states.shape[:2] != targets.shape:
+        raise ValueError(
+            "hidden-states prefix shape "
+            f"{hidden_states.shape[:2]} must match targets {targets.shape}"
+        )
+
+    lm_head = getattr(model, "lm_head", None)
+    head_weight = getattr(lm_head, "weight", None)
+    if not isinstance(head_weight, mx.array):
+        raise TypeError("CCE loss requires model.lm_head.weight to be an mx.array")
+
+    token_losses = linear_cross_entropy(
+        hidden_states,
+        head_weight,
+        targets,
+        reduction="none",
+        chunk_rows=chunk_rows,
     )
     mask = lm_batch.target_mask
     ntokens = mask.sum()
@@ -344,6 +395,7 @@ def _raise_if_negative_document_ids(document_ids: mx.array, *, alias: str = "doc
 
 
 __all__ = [
+    "next_token_cut_cross_entropy",
     "next_token_cross_entropy",
     "next_token_cross_entropy_mtp_loss",
     "next_token_cross_entropy_with_stp",

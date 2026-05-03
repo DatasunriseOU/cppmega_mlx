@@ -30,6 +30,7 @@ from cppmega_mlx.nn._tilelang import (
     _msl_transform,
     _path_b_lowering,
     fp8_msl_kernels,
+    m2rnn,
     mamba3,
     sparse_mla,
     sparse_mla_blockscaled,
@@ -54,6 +55,15 @@ from cppmega_mlx.nn._tilelang.fp8_msl_kernels import (
     fp8_scaled_vecmat,
     fp8_to_half,
     half_to_fp8,
+)
+from cppmega_mlx.nn._tilelang.m2rnn import (
+    M2RNNMetalStatus,
+    m2rnn_apply,
+    m2rnn_apply_with_state,
+    m2rnn_bwd_metal,
+    m2rnn_fwd_metal,
+    m2rnn_metal_status,
+    m2rnn_reference,
 )
 from cppmega_mlx.nn._tilelang.mamba3 import (
     Mamba3MetalStatus,
@@ -97,6 +107,7 @@ from cppmega_mlx.nn._tilelang.topk_selector import topk_selector as topk_selecto
 
 __all__ = [
     "FP8MSLKernelStatus",
+    "M2RNNMetalStatus",
     "Mamba3MetalStatus",
     "MXFP8_BLOCK_SIZE",
     "PathBStatus",
@@ -119,6 +130,13 @@ __all__ = [
     "fp8_scaled_vecmat",
     "fp8_to_half",
     "half_to_fp8",
+    "m2rnn",
+    "m2rnn_apply",
+    "m2rnn_apply_with_state",
+    "m2rnn_bwd_metal",
+    "m2rnn_fwd_metal",
+    "m2rnn_metal_status",
+    "m2rnn_reference",
     "mamba3",
     "mamba3_mimo_apply",
     "mamba3_mimo_bwd_metal",

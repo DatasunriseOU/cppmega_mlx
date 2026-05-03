@@ -17,6 +17,7 @@ import statistics
 import sys
 import tempfile
 from dataclasses import asdict, dataclass, is_dataclass
+from functools import partial
 from importlib import metadata
 from pathlib import Path
 from typing import Any, Literal
@@ -42,7 +43,12 @@ from cppmega_mlx.runtime.memory import (  # noqa: E402
 from cppmega_mlx.runtime.seed import capture_rng_state  # noqa: E402
 from cppmega_mlx.training.checkpoint import load_checkpoint, save_checkpoint  # noqa: E402
 from cppmega_mlx.training.compiled import CompiledPretrainingStep  # noqa: E402
+from cppmega_mlx.training.cut_cross_entropy import DEFAULT_CHUNK_ROWS  # noqa: E402
 from cppmega_mlx.training.eval import evaluate_batches  # noqa: E402
+from cppmega_mlx.training.loss import (  # noqa: E402
+    next_token_cross_entropy,
+    next_token_cut_cross_entropy,
+)
 from cppmega_mlx.training.optimizers import (  # noqa: E402
     ADAMW_FP32_MOMENTS_CLASS,
     ADAMW_FP32_MOMENTS_SOURCE,
@@ -69,6 +75,7 @@ STRUCTURE_MODEL_KWARG_NAMES = (
 OPTIMIZER_ENV = "CPPMEGA_OPTIMIZER"
 OPTIMIZER_NAMES = ("adamw", "muon")
 OPTIMIZER_SOURCES = ("default", "cli", "env")
+LOSS_BACKENDS = ("cross_entropy", "cce")
 MODEL_NAME = "HybridTinyLM"
 MODEL_SOURCE = "cppmega_mlx.models.hybrid_lm"
 DEFAULT_MODEL_PROFILE = "hybrid_tiny"
@@ -89,6 +96,8 @@ class TrainHybridTinyConfig:
     weight_decay: float = 0.0
     optimizer: str = "adamw"
     optimizer_source: str = "default"
+    loss_backend: Literal["cross_entropy", "cce"] = "cross_entropy"
+    cce_chunk_rows: int = DEFAULT_CHUNK_ROWS
     vocab_size: int | None = None
     hidden_size: int = 8
     pattern: str = "AEMR"
@@ -184,6 +193,21 @@ def build_parser() -> argparse.ArgumentParser:
             "Training optimizer. Defaults to AdamW; can also be selected with "
             f"{OPTIMIZER_ENV}=muon for opt-in local Muon+AdamW smokes."
         ),
+    )
+    parser.add_argument(
+        "--loss-backend",
+        choices=LOSS_BACKENDS,
+        default=TrainHybridTinyConfig.loss_backend,
+        help=(
+            "Training loss backend. Defaults to materialized next-token "
+            "cross-entropy; cce opts into the local MLX chunked CE forward."
+        ),
+    )
+    parser.add_argument(
+        "--cce-chunk-rows",
+        type=int,
+        default=TrainHybridTinyConfig.cce_chunk_rows,
+        help="Rows per logits chunk for --loss-backend cce.",
     )
     parser.add_argument(
         "--vocab-size",
@@ -455,6 +479,8 @@ def config_from_args(args: argparse.Namespace) -> TrainHybridTinyConfig:
         weight_decay=args.weight_decay,
         optimizer=optimizer,
         optimizer_source=optimizer_source,
+        loss_backend=args.loss_backend,
+        cce_chunk_rows=args.cce_chunk_rows,
         vocab_size=args.vocab_size,
         hidden_size=args.hidden_size,
         pattern=args.pattern,
@@ -553,6 +579,14 @@ def validate_config(config: TrainHybridTinyConfig) -> None:
             "unsupported optimizer_source="
             f"{config.optimizer_source!r}; expected one of: {allowed}"
         )
+    if config.loss_backend not in LOSS_BACKENDS:
+        allowed = ", ".join(LOSS_BACKENDS)
+        raise ValueError(
+            f"unsupported loss_backend={config.loss_backend!r}; "
+            f"expected one of: {allowed}"
+        )
+    if config.cce_chunk_rows <= 0:
+        raise ValueError("cce_chunk_rows must be positive")
     if config.vocab_size is not None and config.vocab_size < 2:
         raise ValueError("vocab_size must be at least 2")
     if config.eval_batches < 0:
@@ -873,6 +907,58 @@ def safe_training_optimizer_payload(config: TrainHybridTinyConfig) -> dict[str, 
             "source": config.optimizer_source,
             "error": str(exc),
         }
+
+
+def training_loss_payload(config: TrainHybridTinyConfig) -> dict[str, Any]:
+    if config.loss_backend == "cross_entropy":
+        return {
+            "backend": "cross_entropy",
+            "source": "cppmega_mlx.training.loss.next_token_cross_entropy",
+            "default": True,
+            "chunk_rows": None,
+            "forward_memory_saving_claim": False,
+            "manual_chunked_backward": False,
+            "eval_backend": "cross_entropy",
+        }
+    if config.loss_backend == "cce":
+        return {
+            "backend": "cce",
+            "source": "cppmega_mlx.training.loss.next_token_cut_cross_entropy",
+            "default": False,
+            "chunk_rows": config.cce_chunk_rows,
+            "forward_memory_saving_claim": True,
+            "manual_chunked_backward": False,
+            "eval_backend": "cross_entropy",
+        }
+    raise ValueError(
+        f"unsupported loss_backend={config.loss_backend!r}; expected one of: "
+        f"{', '.join(LOSS_BACKENDS)}"
+    )
+
+
+def safe_training_loss_payload(config: TrainHybridTinyConfig) -> dict[str, Any]:
+    try:
+        return training_loss_payload(config)
+    except ValueError as exc:
+        return {
+            "backend": config.loss_backend,
+            "chunk_rows": config.cce_chunk_rows,
+            "error": str(exc),
+        }
+
+
+def make_training_loss_fn(config: TrainHybridTinyConfig) -> Any:
+    if config.loss_backend == "cross_entropy":
+        return next_token_cross_entropy
+    if config.loss_backend == "cce":
+        return partial(
+            next_token_cut_cross_entropy,
+            chunk_rows=config.cce_chunk_rows,
+        )
+    raise ValueError(
+        f"unsupported loss_backend={config.loss_backend!r}; expected one of: "
+        f"{', '.join(LOSS_BACKENDS)}"
+    )
 
 
 def make_training_optimizer(config: TrainHybridTinyConfig) -> Any:
@@ -1241,6 +1327,7 @@ def checkpoint_metadata(
         },
         "training_config": asdict(config),
         "training_optimizer": training_optimizer_payload(config),
+        "training_loss": training_loss_payload(config),
         "model_name": MODEL_NAME,
         "model_profile": config.model_profile,
         "model_source": MODEL_SOURCE,
@@ -1366,6 +1453,7 @@ def dry_run_payload(
         "status": "dry_run",
         "config": asdict(config),
         "training_optimizer": training_optimizer_payload(config),
+        "training_loss": training_loss_payload(config),
         "synthetic_npz": config.npz_path is None,
         "dataset": dataset_payload(dataset, config),
         "model_name": MODEL_NAME,
@@ -1459,12 +1547,14 @@ def train_hybrid_tiny(
         else None
     )
     optimizer = make_training_optimizer(config)
+    loss_fn = make_training_loss_fn(config)
 
     stepper = CompiledPretrainingStep(
         model,
         optimizer,
         compile=bool(compile_plan["enabled"]),
         state={"step": resume_step, "trained_tokens": resume_trained_tokens},
+        loss_fn=loss_fn,
     )
     if config.resume_from:
         if resume_metadata_path is None:
@@ -1595,6 +1685,7 @@ def train_hybrid_tiny(
         "status": "ok",
         "config": asdict(config),
         "training_optimizer": training_optimizer_payload(config),
+        "training_loss": training_loss_payload(config),
         "synthetic_npz": config.npz_path is None,
         "dataset": dataset_payload(dataset, config),
         "model_name": MODEL_NAME,
@@ -1728,6 +1819,7 @@ def main(argv: list[str] | None = None) -> int:
             "error_type": type(exc).__name__,
             "config": asdict(config),
             "training_optimizer": safe_training_optimizer_payload(config),
+            "training_loss": safe_training_loss_payload(config),
             "compile": config.compile,
             "device": device_info(),
         }

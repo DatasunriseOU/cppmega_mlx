@@ -17,11 +17,17 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
+from cppmega_mlx.data.batch import LMTokenBatch
+from cppmega_mlx.models.hybrid_lm import HybridTinyConfig, HybridTinyLM
 from cppmega_mlx.training.cut_cross_entropy import (
     DEFAULT_CHUNK_ROWS,
     linear_cross_entropy,
     linear_cross_entropy_value_and_grad,
     materialized_cross_entropy,
+)
+from cppmega_mlx.training.loss import (
+    next_token_cross_entropy,
+    next_token_cut_cross_entropy,
 )
 
 
@@ -51,6 +57,38 @@ def _max_abs(a: mx.array, b: mx.array) -> float:
     diff = mx.max(mx.abs(a.astype(mx.float32) - b.astype(mx.float32)))
     mx.eval(diff)
     return float(diff.item())
+
+
+def _hybrid_tiny_batch() -> dict[str, mx.array]:
+    tokens = mx.array(
+        [
+            [1, 2, 3, 4, 5, 6],
+            [6, 5, 4, 3, 2, 1],
+        ],
+        dtype=mx.int32,
+    )
+    return {
+        "tokens": tokens,
+        "attention_mask": mx.array(
+            [
+                [1, 1, 1, 1, 0, 0],
+                [1, 1, 0, 1, 1, 1],
+            ],
+            dtype=mx.float32,
+        ),
+        "structure_ids": tokens % 7,
+        "dep_levels": tokens % 3,
+        "ast_depth_ids": tokens % 5,
+        "sibling_index_ids": tokens % 4,
+        "node_type_ids": tokens % 6,
+        "document_ids": mx.array(
+            [
+                [0, 0, 0, 1, 1, 1],
+                [2, 2, 3, 3, 3, 3],
+            ],
+            dtype=mx.int32,
+        ),
+    }
 
 
 def test_chunked_forward_matches_materialized_fp32() -> None:
@@ -322,3 +360,64 @@ def test_chunked_forward_matches_mlx_cross_entropy_directly() -> None:
     direct = nn.losses.cross_entropy(logits, flat_t, reduction="mean")
     chunked = linear_cross_entropy(e, c, targets, chunk_rows=4)
     assert math.isclose(_scalar(direct), _scalar(chunked), abs_tol=1e-6)
+
+
+def test_next_token_cut_cross_entropy_matches_hybrid_tiny_ce() -> None:
+    """Train-path CCE must preserve HybridTiny masked next-token semantics."""
+
+    mx.random.seed(11)
+    model = HybridTinyLM(
+        HybridTinyConfig(
+            vocab_size=16,
+            hidden_size=8,
+            max_seq_length=6,
+            pattern="A",
+            depth=1,
+            num_attention_heads=1,
+        )
+    )
+    batch = _hybrid_tiny_batch()
+
+    ce_loss, ce_tokens = next_token_cross_entropy(model, batch)
+    cce_loss, cce_tokens = next_token_cut_cross_entropy(
+        model,
+        batch,
+        chunk_rows=2,
+    )
+    mx.eval(ce_loss, ce_tokens, cce_loss, cce_tokens)
+
+    assert _scalar(cce_tokens) == _scalar(ce_tokens)
+    assert math.isclose(_scalar(cce_loss), _scalar(ce_loss), abs_tol=1e-5)
+
+
+def test_next_token_cut_cross_entropy_works_under_value_and_grad() -> None:
+    """CompiledPretrainingStep-style MLX autograd can consume the CCE loss."""
+
+    mx.random.seed(12)
+    model = HybridTinyLM(
+        HybridTinyConfig(
+            vocab_size=16,
+            hidden_size=8,
+            max_seq_length=6,
+            pattern="M",
+            depth=1,
+            mamba_expand=1,
+            mamba_head_dim=4,
+            mamba_state_dim=4,
+            mamba_groups=1,
+            mamba_chunk_size=4,
+        )
+    )
+    batch = LMTokenBatch(**{k: v for k, v in _hybrid_tiny_batch().items() if k != "document_ids"})
+
+    def loss_fn(model: HybridTinyLM, batch: LMTokenBatch) -> tuple[mx.array, mx.array]:
+        return next_token_cut_cross_entropy(model, batch, chunk_rows=2)
+
+    (loss, ntokens), grads = nn.value_and_grad(model, loss_fn)(model, batch)
+    mx.eval(loss, ntokens, grads)
+
+    assert math.isfinite(_scalar(loss))
+    assert _scalar(loss) > 0
+    assert _scalar(ntokens) > 0
+    assert isinstance(grads, dict)
+    assert grads
