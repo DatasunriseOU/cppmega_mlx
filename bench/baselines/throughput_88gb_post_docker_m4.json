@@ -1,0 +1,122 @@
+[
+  {
+    "opt": "lion8bit_fused_symmetric",
+    "B": 1,
+    "T": 4096,
+    "tokens_per_step": 4096,
+    "median_step_s": 4.031113862991333,
+    "min_step_s": 3.980008125305176,
+    "tok_per_sec_median": 1016.0963295044505,
+    "tok_per_sec_p90": 1029.1436276115467,
+    "peak_gib_final": 40.66957485675812,
+    "loss_first": 24.150375366210938,
+    "warmup_steps": 5,
+    "measured_steps": 15,
+    "wall_seconds": 80.94077730178833
+  },
+  {
+    "opt": "lion8bit_fused_symmetric",
+    "B": 2,
+    "T": 4096,
+    "tokens_per_step": 8192,
+    "median_step_s": 12.664076089859009,
+    "min_step_s": 11.08563494682312,
+    "tok_per_sec_median": 646.8691392781424,
+    "tok_per_sec_p90": 738.9743609000612,
+    "peak_gib_final": 74.26939952000976,
+    "loss_first": 16.996536254882812,
+    "warmup_steps": 5,
+    "measured_steps": 15,
+    "wall_seconds": 355.15196681022644
+  },
+  {
+    "opt": "lion8bit_fused_symmetric",
+    "B": 3,
+    "T": 4096,
+    "cap_hit_at": "step_1",
+    "peak_gib": 105.53471474349499,
+    "step_times": [
+      31.951597213745117
+    ]
+  },
+  {
+    "opt": "muon_adamw_quantized",
+    "B": 1,
+    "T": 4096,
+    "tokens_per_step": 4096,
+    "median_step_s": 9.565788269042969,
+    "min_step_s": 9.410717010498047,
+    "tok_per_sec_median": 428.1926261378346,
+    "tok_per_sec_p90": 435.24845082800186,
+    "peak_gib_final": 39.48419931344688,
+    "loss_first": 1.4846755266189575,
+    "warmup_steps": 5,
+    "measured_steps": 15,
+    "wall_seconds": 191.29697966575623
+  },
+  {
+    "opt": "muon_adamw_quantized",
+    "B": 2,
+    "T": 4096,
+    "tokens_per_step": 8192,
+    "median_step_s": 15.666474342346191,
+    "min_step_s": 14.689449310302734,
+    "tok_per_sec_median": 522.9000361528168,
+    "tok_per_sec_p90": 557.6791768670579,
+    "peak_gib_final": 72.82075711153448,
+    "loss_first": 0.20774824917316437,
+    "warmup_steps": 5,
+    "measured_steps": 15,
+    "wall_seconds": 443.85091853141785
+  },
+  {
+    "opt": "muon_adamw_quantized",
+    "B": 3,
+    "T": 4096,
+    "cap_hit_at": "step_1",
+    "peak_gib": 104.84886870346963,
+    "step_times": [
+      33.732908964157104
+    ]
+  },
+  {
+    "opt": "muon_adamw_fp32",
+    "B": 1,
+    "T": 4096,
+    "tokens_per_step": 4096,
+    "median_step_s": 9.480611801147461,
+    "min_step_s": 9.3561270236969,
+    "tok_per_sec_median": 432.0396284451022,
+    "tok_per_sec_p90": 437.7879853090688,
+    "peak_gib_final": 45.797319861128926,
+    "loss_first": 0.16989775002002716,
+    "warmup_steps": 5,
+    "measured_steps": 15,
+    "wall_seconds": 192.80599117279053
+  },
+  {
+    "opt": "muon_adamw_fp32",
+    "B": 2,
+    "T": 4096,
+    "tokens_per_step": 8192,
+    "median_step_s": 22.44938373565674,
+    "min_step_s": 16.29035997390747,
+    "tok_per_sec_median": 364.90979424920727,
+    "tok_per_sec_p90": 502.8740932134868,
+    "peak_gib_final": 79.06290215440094,
+    "loss_first": 0.14027482271194458,
+    "warmup_steps": 5,
+    "measured_steps": 15,
+    "wall_seconds": 491.6190547943115
+  },
+  {
+    "opt": "muon_adamw_fp32",
+    "B": 3,
+    "T": 4096,
+    "cap_hit_at": "step_1",
+    "peak_gib": 111.18600325472653,
+    "step_times": [
+      62.39953112602234
+    ]
+  }
+]

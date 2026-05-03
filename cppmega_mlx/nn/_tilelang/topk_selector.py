@@ -78,32 +78,27 @@ pipeline.
 Algorithm sketch::
 
   for each (b) in parallel:
-    threadgroup float scores_smem[T_PAD]
-    threadgroup int   index_smem[T_PAD]
+    # Each thread sweeps a strided slice and keeps a private sorted list of
+    # its local K largest valid entries.
+    for j = tid; j < T; j += threads:
+      if starts[b] <= j < ends[b]:
+        insert (score, j) into local top-K list
 
-    # Each thread loads (T_PAD / threads) entries; masked entries become -INF.
-    for j = tid; j < T_PAD; j += threads:
-      scores_smem[j] = mask_in[j] ? scores[b, j] : -INF
-      index_smem[j]  = j
-    threadgroup_barrier()
+    # All threads write their local top-K lists to a bounded threadgroup
+    # buffer. A tree merge combines pairs of lists until thread 0 owns the
+    # final top-K list for the row.
+    for stride in powers_of_two:
+      merge top-K(pair_a, pair_b) -> pair_a
 
-    # K passes of "find max, mark used". Each pass does a tree reduction
-    # over (T_PAD) entries to identify argmax, then writes that argmax to
-    # the output and replaces its slot with -INF so the next pass picks the
-    # next-largest. At T_PAD == 4096 and k == 256 this is the same big-O as
-    # the radix-select but trivially correct on Metal.
-    for kk = 0; kk < K; ++kk:
-      # tree-reduce argmax over scores_smem
-      ...
+The kernel avoids an O(T_PAD) shared buffer. Threadgroup memory is bounded by
+``BLOCK_SIZE * K * (sizeof(float) + sizeof(int))`` and the host caps
+``BLOCK_SIZE`` for the requested K so the pair buffer stays within the M-series
+threadgroup budget.
 
-The kernel is correct for arbitrary T_PAD <= 4096 because we use a
-*static* threadgroup buffer sized to the next power of two. ``T_PAD`` is
-embedded as a template constant and statically shaped at JIT time.
-
-The fast tree-reduce-argmax approach is O(K * T_PAD / threads + K * log threads)
-which beats radix's two-pass complexity at T_PAD <= 4096 / k <= 256 because
-threadgroup-memory reduction tree latency is bounded by simdgroup ops on Apple
-silicon.
+The mini-heap/list approach is O(T / threads * K + BLOCK_SIZE * K * log threads)
+with small compile-time K. It is not faster than MLX ``argpartition`` as a
+standalone top-k, but it is a useful direct-MSL smoke and a future fused
+sparse-MLA building block.
 
 Return contract:
 
@@ -113,11 +108,9 @@ Return contract:
     fill order, but this MSL kernel writes them out greedy by-rank).
     Tests assert *set* equality with the reference, not sequence equality,
     so this divergence is invisible at the test boundary.
-  * Sentinel handling: if ``starts``/``ends`` produce an empty interval, the
-    masked rows are filled by the next-largest available globally; if every
-    column is masked, the output entries become -1 to indicate "no valid
-    selection" (this matches the gb10 contract where invalid slots use a
-    sentinel).
+  * Sentinel handling: if ``starts``/``ends`` produce fewer than ``k`` valid
+    columns, the valid indices are emitted first and remaining output slots are
+    filled with ``-1``.
 """
 
 from __future__ import annotations
@@ -177,40 +170,66 @@ def topk_selector_reference(
 
     # Apply the [starts, ends) mask if present.
     masked = scores
-    if starts is not None or ends is not None:
+    has_interval_mask = starts is not None or ends is not None
+    if has_interval_mask:
         batch = int(scores.shape[0])
-        if starts is None:
-            starts = mx.zeros((batch,), dtype=mx.int32)
-        if ends is None:
-            ends = mx.full((batch,), seq_len, dtype=mx.int32)
-        if starts.shape != (batch,) or ends.shape != (batch,):
+        start_arr = (
+            mx.zeros((batch,), dtype=mx.int32)
+            if starts is None
+            else starts
+        )
+        end_arr = (
+            mx.full((batch,), seq_len, dtype=mx.int32)
+            if ends is None
+            else ends
+        )
+        if start_arr.shape != (batch,) or end_arr.shape != (batch,):
             raise ValueError(
                 "starts/ends must have shape (B,); "
-                f"got starts={starts.shape}, ends={ends.shape}"
+                f"got starts={start_arr.shape}, ends={end_arr.shape}"
             )
+        start_i = mx.minimum(
+            mx.maximum(start_arr.astype(mx.int32), mx.array(0, dtype=mx.int32)),
+            mx.array(seq_len, dtype=mx.int32),
+        )
+        end_i = mx.minimum(
+            mx.maximum(end_arr.astype(mx.int32), mx.array(0, dtype=mx.int32)),
+            mx.array(seq_len, dtype=mx.int32),
+        )
+        valid_counts = mx.maximum(end_i - start_i, mx.array(0, dtype=mx.int32))
         col = mx.arange(seq_len, dtype=mx.int32)[None, :]
-        valid = (col >= starts[:, None]) & (col < ends[:, None])
+        valid = (col >= start_i[:, None]) & (col < end_i[:, None])
         # Use the smallest representable value of `scores.dtype` for masking.
         if scores.dtype == mx.float32 or scores.dtype == mx.float16 or scores.dtype == mx.bfloat16:
             mask_value = mx.array(float("-inf"), dtype=scores.dtype)
         else:
             mask_value = mx.array(-2**31, dtype=scores.dtype)
         masked = mx.where(valid, scores, mask_value)
+    else:
+        valid_counts = mx.full(
+            (int(scores.shape[0]),),
+            seq_len,
+            dtype=mx.int32,
+        )
 
     # argpartition picks the indices of the `k` largest values (when sorting
     # the *negated* scores ascending, the first k elements are those with
     # the largest original scores). MLX guarantees the partition contract;
     # ordering within the slice is implementation-defined.
-    if k == seq_len:
+    if k == seq_len and not has_interval_mask:
         # argpartition with kth == size is undefined for some backends; just
         # take an arange.
         order = mx.broadcast_to(
             mx.arange(seq_len, dtype=mx.int32)[None, :],
             scores.shape,
         )
-        return order
-    part = mx.argpartition(-masked, kth=k, axis=-1)[..., :k]
-    return part.astype(mx.int32)
+        part = order
+    elif k == seq_len:
+        part = mx.argsort(-masked, axis=-1).astype(mx.int32)
+    else:
+        part = mx.argpartition(-masked, kth=k, axis=-1)[..., :k]
+    rank = mx.arange(k, dtype=mx.int32)[None, :]
+    return mx.where(rank < valid_counts[:, None], part.astype(mx.int32), -1)
 
 
 # ---------------------------------------------------------------------------
@@ -223,8 +242,8 @@ _TOPK_SOURCE = """
     //
     // Inputs:
     //   scores  [B, T]   float
-    //   starts  [B]      int32   (sentinel: -1 means "no start mask")
-    //   ends    [B]      int32   (sentinel: -1 means "no end mask")
+    //   starts  [B]      int32   (ignored when HAS_STARTS == 0)
+    //   ends    [B]      int32   (ignored when HAS_ENDS == 0)
     //
     // Output:
     //   indices [B, K]   int32   (k largest indices, value-descending)
@@ -270,8 +289,12 @@ _TOPK_SOURCE = """
     }
     if (HAS_ENDS != 0) {
         int ev = ends[b];
-        if (ev >= 0) s_end = ev;
+        s_end = ev;
     }
+    if (s_start < 0) s_start = 0;
+    if (s_start > int(SEQ_LEN)) s_start = int(SEQ_LEN);
+    if (s_end < 0) s_end = 0;
+    if (s_end > int(SEQ_LEN)) s_end = int(SEQ_LEN);
 
     uint base_in = b * uint(SEQ_LEN);
     uint base_out = b * uint(K);

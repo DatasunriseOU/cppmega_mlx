@@ -97,8 +97,8 @@ def k2_pipelined_gemm(
 
 
 # Control for Test 2: same 32x32/fp32 accumulator fragment without the software
-# pipeline transform. This isolates the current failure to Metal simdgroup vector
-# dtype lowering, not to runtime execution or the 3-D pipeline-buffer rewrite.
+# pipeline transform. This catches regressions in the Metal simdgroup vector
+# dtype path independently from the 3-D pipeline-buffer rewrite.
 @T.prim_func
 def k2_32x32_no_pipeline(
     A: T.Tensor((32, 32), "float16"),
@@ -116,8 +116,8 @@ def k2_32x32_no_pipeline(
         T.copy(C_local, C)
 
 
-# Control for Test 2: same software-pipeline pattern, but with the 16x16/fp16
-# fragment shape that avoids the known float32x4 simdgroup-vector path.
+# Control for Test 2: same software-pipeline pattern, but with the smaller
+# 16x16/fp16 fragment shape that worked before the 32x32 path was fixed.
 @T.prim_func
 def k2_pipelined_16x16_control(
     A: T.Tensor((64, 128), "float16"),
@@ -165,14 +165,12 @@ def test_simple_metal_gemm_lowers() -> None:
     assert status == "OK", err
 
 
-@pytest.mark.xfail(reason="32x32 pipelined fragment still hits the known float32x4 simdgroup-vector limitation")
-def test_pipelined_sparse_mla_pattern_lowers_when_simdgroup_vector_bug_is_fixed() -> None:
+def test_pipelined_sparse_mla_pattern_lowers() -> None:
     _, status, err = try_lower("k2_pipelined_gemm", k2_pipelined_gemm)
     assert status == "OK", err
 
 
-@pytest.mark.xfail(reason="32x32 fp32 accumulator fragment hits the known float32x4 simdgroup-vector limitation")
-def test_32x32_no_pipeline_sparse_mla_shape_lowers_when_simdgroup_vector_bug_is_fixed() -> None:
+def test_32x32_no_pipeline_sparse_mla_shape_lowers() -> None:
     _, status, err = try_lower("k2_32x32_no_pipeline", k2_32x32_no_pipeline)
     assert status == "OK", err
 

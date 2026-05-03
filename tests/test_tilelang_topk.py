@@ -49,14 +49,18 @@ def _np_topk_indices(
     B, T = scores.shape
     for b in range(B):
         row = scores[b].copy()
+        valid_count = T
         if starts is not None or ends is not None:
-            s = 0 if starts is None else int(starts[b])
-            e = T if ends is None else int(ends[b])
+            s = 0 if starts is None else int(np.clip(starts[b], 0, T))
+            e = T if ends is None else int(np.clip(ends[b], 0, T))
+            valid_count = max(0, e - s)
             mask = np.ones(T, dtype=bool)
             mask[:s] = False
             mask[e:] = False
             row = np.where(mask, row, np.float32("-inf"))
-        order = np.argsort(-row, kind="stable")[:k]
+        order = np.argsort(-row, kind="stable")[:k].astype(np.int32)
+        if valid_count < k:
+            order[valid_count:] = -1
         out.append(set(int(x) for x in order))
     return out
 
@@ -65,6 +69,32 @@ def _to_index_sets(indices: mx.array) -> list[set[int]]:
     mx.eval(indices)
     arr = np.asarray(indices)
     return [set(int(x) for x in row) for row in arr]
+
+
+def _acceptance_scores(
+    *,
+    batch: int,
+    seq_len: int,
+    k: int,
+    dtype: mx.Dtype,
+    seed: int,
+) -> mx.array:
+    """Build top-k fixtures with a hard gap at the k boundary.
+
+    bfloat16 has few mantissa bits, so random normal inputs can create ties at
+    the top-k boundary after dtype conversion. The selector contract does not
+    define tie-breaking; these acceptance fixtures verify dispatch/parity for
+    the production shapes without depending on implementation-specific ties.
+    """
+
+    rng = np.random.default_rng(seed)
+    scores_np = np.full((batch, seq_len), -1.0, dtype=np.float32)
+    for row in range(batch):
+        top = rng.choice(seq_len, size=k, replace=False)
+        # Exactly k entries are above the rest; ties within the top-k set are
+        # harmless because set membership is the asserted contract.
+        scores_np[row, top] = 1.0
+    return mx.array(scores_np).astype(dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +167,24 @@ def test_reference_starts_ends_mask_excludes_outside_range() -> None:
             assert starts_np[b] <= idx < ends_np[b], (
                 f"idx {idx} not in [{starts_np[b]}, {ends_np[b]})"
             )
+
+
+def test_reference_short_and_empty_intervals_use_negative_one_sentinel() -> None:
+    scores = mx.array(np.array([
+        [9.0, 8.0, 7.0, 6.0, 5.0],
+        [4.0, 3.0, 2.0, 1.0, 0.0],
+        [0.0, 1.0, 2.0, 3.0, 4.0],
+    ], dtype=np.float32))
+    starts = mx.array(np.array([1, 2, 4], dtype=np.int32))
+    ends = mx.array(np.array([3, 2, 99], dtype=np.int32))
+
+    out = topk_selector_reference(scores, k=4, starts=starts, ends=ends)
+    mx.eval(out)
+    arr = np.asarray(out)
+
+    assert set(int(x) for x in arr[0]) == {1, 2, -1}
+    assert arr[1].tolist() == [-1, -1, -1, -1]
+    assert set(int(x) for x in arr[2]) == {4, -1}
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +291,59 @@ def test_path_b_forward_parity_with_starts_ends() -> None:
     actual = _to_index_sets(out_msl)
     expected = _to_index_sets(out_ref)
     assert actual == expected
+
+
+def test_path_b_forward_parity_with_short_and_empty_intervals() -> None:
+    rng = np.random.default_rng(19)
+    batch, seq_len, k = 4, 64, 8
+    scores = mx.array(rng.standard_normal((batch, seq_len)).astype(np.float32))
+    starts = mx.array(np.array([0, 7, 32, 63], dtype=np.int32))
+    ends = mx.array(np.array([3, 7, 65, 64], dtype=np.int32))
+
+    out_msl = topk_selector_metal(scores, k, starts=starts, ends=ends)
+    assert out_msl is not None
+    out_ref = topk_selector_reference(scores, k, starts=starts, ends=ends)
+    assert _to_index_sets(out_msl) == _to_index_sets(out_ref)
+
+
+def test_path_b_forward_parity_with_negative_user_ends() -> None:
+    scores = mx.array(np.array([[5.0, 4.0, 3.0, 2.0]], dtype=np.float32))
+    starts = mx.array(np.array([0], dtype=np.int32))
+    ends = mx.array(np.array([-1], dtype=np.int32))
+
+    out_msl = topk_selector_metal(scores, k=2, starts=starts, ends=ends)
+    assert out_msl is not None
+    out_ref = topk_selector_reference(scores, k=2, starts=starts, ends=ends)
+    mx.eval(out_msl, out_ref)
+    assert np.asarray(out_msl).tolist() == [[-1, -1]]
+    assert np.asarray(out_msl).tolist() == np.asarray(out_ref).tolist()
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+def test_path_b_acceptance_shape_512x64_dispatches(dtype: mx.Dtype) -> None:
+    scores = _acceptance_scores(batch=4, seq_len=512, k=64, dtype=dtype, seed=512)
+    out_msl = topk_selector_metal(scores, k=64)
+    assert out_msl is not None
+    out_ref = topk_selector_reference(scores, k=64)
+    assert _to_index_sets(out_msl) == _to_index_sets(out_ref)
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+def test_path_b_acceptance_shape_4096x256_dispatches(dtype: mx.Dtype) -> None:
+    scores = _acceptance_scores(batch=1, seq_len=4096, k=256, dtype=dtype, seed=4096)
+    out_msl = topk_selector_metal(scores, k=256)
+    assert out_msl is not None
+    out_ref = topk_selector_reference(scores, k=256)
+    assert _to_index_sets(out_msl) == _to_index_sets(out_ref)
+
+
+def test_path_b_full_seq_topk_dispatches() -> None:
+    rng = np.random.default_rng(32)
+    scores = mx.array(rng.standard_normal((2, 32)).astype(np.float32))
+    out_msl = topk_selector_metal(scores, k=32)
+    assert out_msl is not None
+    out_ref = topk_selector_reference(scores, k=32)
+    assert _to_index_sets(out_msl) == _to_index_sets(out_ref)
 
 
 def test_public_entry_point_metal_backend_dispatches_kernel() -> None:

@@ -37,6 +37,12 @@ from cppmega_mlx.nn._tilelang.sparse_mla_fp8 import (  # noqa: E402
     sparse_mla_fp8_reference,
     sparse_mla_quantized_matmul_reference,
 )
+from cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c import (  # noqa: E402
+    SparseMLAFp8PathCStatus,
+    fp8_sparse_mla_qk_msl_features,
+    fp8_sparse_mla_qk_path_c_status,
+    lower_fp8_sparse_mla_qk_msl,
+)
 from cppmega_mlx.nn.sparse_mla import sparse_mla_attention_reference  # noqa: E402
 
 
@@ -92,6 +98,71 @@ def test_fp8_metal_status_with_arrays_validates_dispatcher_path() -> None:
         assert status.available is True
     else:
         assert status.available is False
+
+
+def test_fp8_sparse_mla_path_c_status_reports_current_qk_blocker() -> None:
+    status = fp8_sparse_mla_qk_path_c_status()
+    assert isinstance(status, SparseMLAFp8PathCStatus)
+    assert status.m == 1
+    assert status.n == 16
+    assert status.k == 64
+    assert status.transpose_B is True
+    assert status.available is False
+    assert status.reason
+    if status.features:
+        assert not (
+            status.features["simdgroup_multiply_accumulate"]
+            and status.features["A_scale_refs"]
+            and status.features["B_scale_refs"]
+        ), "M=1 Sparse-MLA QK shape must not be reported available unless scale-aware MMA lowers"
+        assert (
+            "scale operands disappeared" in status.reason
+            or "M=1/topk" in status.reason
+            or "scalar fallback" in status.reason
+        )
+
+
+def test_fp8_sparse_mla_path_c_scale_semantics_fail_closed() -> None:
+    status = fp8_sparse_mla_qk_path_c_status()
+    if not status.features:
+        assert status.available is False
+        return
+    scale_refs_present = bool(status.features["A_scale_refs"]) and bool(status.features["B_scale_refs"])
+    scale_signature_present = bool(status.features["signature_has_A_scale"]) and bool(
+        status.features["signature_has_B_scale"]
+    )
+    assert (scale_refs_present and scale_signature_present) or "scale operands disappeared" in status.reason
+
+
+def test_fp8_sparse_mla_path_c_square_control_lowers_to_scale_aware_fast_path() -> None:
+    status = fp8_sparse_mla_qk_path_c_status(
+        M=32,
+        N=32,
+        K=64,
+        BM=32,
+        BN=32,
+        BK=64,
+        a_scale_size=1,
+        b_scale_size=32,
+    )
+    if not status.available:
+        assert status.reason
+        return
+    assert status.features["simdgroup_multiply_accumulate"] >= 1
+    assert status.features["A_scale_refs"] >= 1
+    assert status.features["B_scale_refs"] >= 1
+    assert status.features["signature_has_A_scale"] is True
+    assert status.features["signature_has_B_scale"] is True
+
+
+def test_fp8_sparse_mla_path_c_lowered_features_are_reported() -> None:
+    msl = lower_fp8_sparse_mla_qk_msl(M=32, N=32, K=64, BM=32, BN=32, BK=64, b_scale_size=32)
+    features = fp8_sparse_mla_qk_msl_features(msl)
+    assert features["kernel_void"] >= 1
+    assert features["fp8_e4m3_decode_helper"] >= 1
+    assert features["simdgroup_multiply_accumulate"] >= 1
+    assert features["A_scale_refs"] >= 1
+    assert features["B_scale_refs"] >= 1
 
 
 def test_fp8_fwd_metal_returns_outputs() -> None:

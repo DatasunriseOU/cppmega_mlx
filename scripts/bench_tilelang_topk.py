@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
-"""Benchmark cppmega's topk_selector forward across pure-MLX strategies.
+"""Benchmark cppmega's topk_selector forward across MLX/Metal strategies.
 
 The cppmega TileLang ``topk_selector`` kernel returns the indices of the
-``k`` largest values per batch row. Path B (TileLang -> MSL -> MLX) is
-currently blocked by tilelang 0.1.9's metal codegen
-(see ``cppmega_mlx/nn/_tilelang/topk_selector.py``); on Apple Silicon the
-runtime path is therefore pure MLX. This script measures three pure-MLX
-strategies with the same shape and dtype matrix used by the source kernel
-("BLOCK_SIZE", "RADIX") so we can pick the best fallback today and have a
-real comparison waiting for the moment the Path B blocker lifts.
+``k`` largest values per batch row. TileLang's own Metal lowering is still
+blocked by tilelang 0.1.9's ``shared.dyn`` / ``LowerTileOp`` failures, so the
+Mac path uses a direct-MSL bypass through ``mx.fast.metal_kernel`` plus pure-MLX
+fallback strategies.
 
 Strategies:
 
@@ -20,6 +17,9 @@ Strategies:
 * ``topk_take_along`` -- ``mx.argpartition(...)[..., :k]`` followed by
   ``mx.take_along_axis(scores, indices, axis=-1)`` so the values are
   materialized too. This is the "fused selector" shape callers use.
+* ``path_b_msl`` -- hand-written direct-MSL Metal kernel. If it cannot dispatch
+  for a shape/device, the bench records ``ran=false`` instead of timing a
+  fallback as if it were Metal.
 
 Run from the repo root::
 
@@ -40,7 +40,7 @@ import sys
 import time
 from importlib import metadata
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -112,10 +112,7 @@ def _strategy_path_b_msl(scores: mx.array, k: int) -> mx.array:
 
     out = topk_selector_metal(scores, k)
     if out is None:
-        # If Metal is unavailable just return the reference so the bench
-        # still reports a number. The path_b_status JSON field tells the
-        # reader whether the Metal kernel actually ran.
-        return topk_selector_reference(scores, k)
+        raise RuntimeError("direct-MSL Path B kernel did not dispatch")
     return out
 
 
@@ -135,12 +132,30 @@ def _time_strategy(
     warmup: int,
     iters: int,
 ) -> dict[str, Any]:
-    for _ in range(warmup):
-        out = fn(scores, k)
-        if isinstance(out, tuple):
-            mx.eval(*out)
-        else:
-            mx.eval(out)
+    ran = True
+    error: str | None = None
+    try:
+        for _ in range(warmup):
+            out = fn(scores, k)
+            if isinstance(out, tuple):
+                mx.eval(*out)
+            else:
+                mx.eval(out)
+    except RuntimeError as exc:
+        ran = False
+        error = str(exc)
+    if not ran:
+        return {
+            "ran": False,
+            "error": error,
+            "iters": iters,
+            "warmup": warmup,
+            "median_ms": None,
+            "min_ms": None,
+            "max_ms": None,
+            "mean_ms": None,
+            "peak_gib": None,
+        }
     samples_ms: list[float] = []
     peaks: list[int] = []
     reset_fn = getattr(mx, "reset_peak_memory", None)
@@ -157,12 +172,14 @@ def _time_strategy(
         t1 = time.perf_counter()
         samples_ms.append((t1 - t0) * 1000.0)
         if callable(get_peak_fn):
-            peaks.append(int(get_peak_fn()))
+            peak_value = cast(Callable[[], int | float], get_peak_fn)()
+            peaks.append(int(peak_value))
     samples_ms.sort()
     peak_bytes = max(peaks) if peaks else 0
     return {
         "iters": iters,
         "warmup": warmup,
+        "ran": True,
         "median_ms": float(statistics.median(samples_ms)),
         "min_ms": float(samples_ms[0]),
         "max_ms": float(samples_ms[-1]),
@@ -220,8 +237,8 @@ def _build_payload(
         "kernel": "tilelang_topk_selector",
         "source": "cppmega/megatron/tilelang_sparse_mla/topk_selector.py",
         "path_b_status": {
-            "available": topk_selector_path_b_status().available,
-            "reason": topk_selector_path_b_status().reason,
+            "available": (status := topk_selector_path_b_status()).available,
+            "reason": status.reason,
         },
         "hardware_label": _hardware_label(),
         "platform": {
@@ -263,7 +280,8 @@ def _format_table(payload: dict[str, Any]) -> str:
         ap = row["strategies"]["argpartition"]["median_ms"]
         ass = row["strategies"]["argsort_slice"]["median_ms"]
         fused = row["strategies"]["topk_take_along"]["median_ms"]
-        msl = row["strategies"].get("path_b_msl", {}).get("median_ms", float("nan"))
+        msl = row["strategies"].get("path_b_msl", {}).get("median_ms")
+        msl_str = f"{msl:.4f}" if isinstance(msl, float) else "SKIP"
         peak = row["strategies"]["argpartition"].get("peak_gib")
         peak_str = f"{peak:.4f}" if peak else "-"
         line = "  ".join([
@@ -274,7 +292,7 @@ def _format_table(payload: dict[str, Any]) -> str:
             f"{ap:.4f}".ljust(width[4]),
             f"{ass:.4f}".ljust(width[5]),
             f"{fused:.4f}".ljust(width[6]),
-            f"{msl:.4f}".ljust(width[7]),
+            msl_str.ljust(width[7]),
             peak_str.ljust(width[8]),
         ])
         out_lines.append(line)
@@ -282,7 +300,7 @@ def _format_table(payload: dict[str, Any]) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
+    p = argparse.ArgumentParser(description=(__doc__ or "").split("\n", 1)[0])
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--iters", type=int, default=50)
     p.add_argument("--seed", type=int, default=1)
@@ -320,7 +338,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.json:
         print(json.dumps(payload, indent=2))
     else:
-        print("# topk_selector pure-MLX strategy comparison")
+        print("# topk_selector MLX/Metal strategy comparison")
         print(f"# Path B available: {payload['path_b_status']['available']}")
         print(f"# warmup={payload['warmup']} iters={payload['iters']} seed={payload['seed']}")
         print()

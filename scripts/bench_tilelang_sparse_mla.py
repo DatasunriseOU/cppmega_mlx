@@ -1,10 +1,7 @@
-"""Bench script for the cppmega sparse-MLA Path B port.
+"""Bench script for the cppmega sparse-MLA Path B and Path C ports.
 
-Compares pure-MLX reference forward and backward against the (currently
-gated) Path B Metal kernel. While the GEMM blocker on tilelang 0.1.9 is in
-effect, only the reference numbers are produced; ``path_b_*`` rows record
-the blocker reason instead of timings so downstream parity reports can show
-the gap.
+Compares pure-MLX reference forward/backward against the Path B direct-MSL
+kernel and the Path C TileLang DSL forward/backward kernels.
 
 Output: bench/tilelang_ports/sparse_mla.json by default.
 """
@@ -32,6 +29,11 @@ from cppmega_mlx.nn._tilelang.sparse_mla import (
     sparse_mla_bwd_metal,
     sparse_mla_fwd_metal,
     sparse_mla_metal_status,
+)
+from cppmega_mlx.nn._tilelang.sparse_mla_path_c import (
+    sparse_mla_bwd_path_c,
+    sparse_mla_fwd_path_c,
+    sparse_mla_path_c_status,
 )
 from cppmega_mlx.nn.sparse_mla import (
     sparse_mla_attention,
@@ -117,9 +119,18 @@ def _bench_shape(cfg: dict[str, Any], *, warmup: int, iters: int) -> dict[str, A
             return mx.zeros((1,))
         return result[0]
 
+    def fwd_path_c():
+        result = sparse_mla_fwd_path_c(q, kv, indices, sm_scale=sm_scale, d_v=d_v)
+        if result is None:
+            return mx.zeros((1,))
+        return result[0]
+
     fwd_ref_bench = _bench_callable("reference_fwd", fwd_reference, warmup=warmup, iters=iters)
     fwd_apply_bench = _bench_callable("apply_fwd", fwd_apply, warmup=warmup, iters=iters)
     fwd_msl_bench = _bench_callable("path_b_msl_fwd", fwd_msl, warmup=warmup, iters=iters)
+    fwd_path_c_bench = _bench_callable(
+        "path_c_tilelang_fwd", fwd_path_c, warmup=warmup, iters=iters
+    )
 
     # Backward via mx.value_and_grad on a scalar mean.
     q_fp32 = q.astype(mx.float32)
@@ -148,14 +159,29 @@ def _bench_shape(cfg: dict[str, Any], *, warmup: int, iters: int) -> dict[str, A
         result = sparse_mla_bwd_metal(q, kv, d_out, indices, sm_scale=sm_scale, d_v=d_v)
         if result is None:
             return mx.zeros((1,))
-        return result[0]
+        return result
 
     bwd_msl_bench = _bench_callable("path_b_msl_bwd", bwd_msl, warmup=warmup, iters=iters)
 
+    def bwd_path_c():
+        result = sparse_mla_bwd_path_c(q, kv, d_out, indices, sm_scale=sm_scale, d_v=d_v)
+        if result is None:
+            return mx.zeros((1,))
+        return result
+
+    bwd_path_c_bench = _bench_callable(
+        "path_c_tilelang_bwd", bwd_path_c, warmup=warmup, iters=iters
+    )
+
     metal_status = sparse_mla_metal_status(q, kv, indices)
+    path_c_status = sparse_mla_path_c_status()
     path_b = {
         "available": metal_status.available,
         "reason": metal_status.reason,
+    }
+    path_c = {
+        "available": path_c_status.available,
+        "reason": path_c_status.reason,
     }
 
     return {
@@ -163,9 +189,12 @@ def _bench_shape(cfg: dict[str, Any], *, warmup: int, iters: int) -> dict[str, A
         "fwd_reference_ms": fwd_ref_bench,
         "fwd_apply_ms": fwd_apply_bench,
         "fwd_msl_ms": fwd_msl_bench,
+        "fwd_path_c_ms": fwd_path_c_bench,
         "bwd_reference_ms": bwd_ref_bench,
         "bwd_msl_ms": bwd_msl_bench,
+        "bwd_path_c_ms": bwd_path_c_bench,
         "path_b": path_b,
+        "path_c": path_c,
     }
 
 
@@ -187,6 +216,7 @@ def main() -> int:
         rows.append(_bench_shape(cfg, warmup=args.warmup, iters=args.iters))
 
     metal_status = sparse_mla_metal_status()
+    path_c_status = sparse_mla_path_c_status()
     payload = {
         "schema": 1,
         "kernel": "sparse_mla",
@@ -197,6 +227,10 @@ def main() -> int:
         "path_b_status": {
             "available": metal_status.available,
             "reason": metal_status.reason,
+        },
+        "path_c_status": {
+            "available": path_c_status.available,
+            "reason": path_c_status.reason,
         },
         "rows": rows,
     }

@@ -1,9 +1,10 @@
 # Path B port: tilelang_sparse_mla/topk_selector.py
 
-This document records the Apple Metal port attempt for the smallest TileLang
-kernel cppmega ships, the radix-select top-k that backs DSA sparse-MLA index
-selection. The port follows the Path B contract (TileLang -> MSL string ->
-mx.fast.metal_kernel) used by the rest of cppmega_mlx/nn/_tilelang/.
+This document records the Apple Metal port for the smallest TileLang kernel
+cppmega ships, the radix-select top-k that backs DSA sparse-MLA index
+selection. TileLang's Metal lowering is still blocked, so this port uses the
+Path B bypass: a hand-written MSL kernel launched through
+mx.fast.metal_kernel.
 
 ## Source attribution
 
@@ -62,10 +63,12 @@ proved on a manual GEMM. The helpers handle three concrete pitfalls:
    PrimFunc names back to MLX local names so the call argument list matches
    the emitted helper's parameter order.
 
-These helpers are dormant for topk_selector because TileLang refuses to
-lower the kernel before any MSL is produced.
+These helpers are still useful for kernels that produce MSL through TileLang.
+They are dormant for topk_selector because TileLang refuses to lower the source
+kernel before any MSL is produced; topk_selector therefore ships a direct-MSL
+body instead.
 
-## Apple Metal status -- blocked
+## TileLang Metal lowering status -- blocked
 
 Probed with the cppmega kernel restructured into a T.prim_func and
 tilelang.engine.lower.lower(prim, target=Target("metal")), with both the
@@ -108,35 +111,32 @@ There are two distinct failures and they compose:
        with target: lower(use_shared, target=target)
        # -> Fatal: Unknown storage scope shared.dyn
 
-This is a hard codegen blocker for the entire DSA sparse-MLA family the
-top-k selector belongs to: every kernel in the family relies on
-threadgroup memory and partial barriers. The alternative paths are:
+This remains a hard TileLang-codegen blocker for the DSA sparse-MLA family:
+every kernel in the family relies on threadgroup memory and partial barriers.
+For topk_selector, the shipped path takes the second option from the original
+decision tree: hand-write MSL and bypass TileLang lowering entirely.
 
-- wait for a tilelang release that adds shared.dyn to its metal codegen
-  (the upstream PR tile-ai/tilelang#799 has the lowering scaffold but
-  does not address shared.dyn as of 0.1.9), or
-- hand-write the MSL ourselves bypassing TileLang -- the same pattern the
-  Mamba3 port at cppmega_mlx/nn/_tilelang/mamba3.py already follows.
-
-The hand-written option is tracked separately. For this port, we ship
-the pure-MLX reference as the runtime path and document the codegen
-failure here so the next agent knows exactly which TileLang gap is in the
-way.
-
-## Pure-MLX reference contract
+## Runtime contract
 
 cppmega_mlx/nn/_tilelang/topk_selector.topk_selector_reference(scores, k,
-*, starts=None, ends=None) is the runtime path on Apple. It uses
-mx.argpartition(-scores, k, axis=-1)[..., :k] and an optional
-[starts, ends) mask. The output is mx.int32 to match the source
-kernel's index buffer dtype.
+*, starts=None, ends=None) is the pure-MLX oracle. It uses
+mx.argpartition(-scores, k, axis=-1)[..., :k] and an optional [starts, ends)
+mask, with -1 sentinel fill when a row has fewer than k valid columns. The
+output is mx.int32 to match the source kernel's index buffer dtype.
+
+cppmega_mlx/nn/_tilelang/topk_selector.topk_selector_metal(...) is the
+direct-MSL Path B runtime on Mac. It launches via mx.fast.metal_kernel, clamps
+per-row starts/ends inside the kernel, emits value-descending indices, and
+returns None only when the Metal path cannot dispatch. topk_selector(...,
+backend="auto") prefers this Metal path and falls back to the reference;
+backend="metal" fails closed if the direct-MSL kernel is unavailable.
 
 Top-k indices are non-differentiable (the gather of the selected values
 is differentiable; the indices themselves are a discrete selector). We
-therefore do **not** wrap the function in mx.custom_function. Tests
-treat parity as the indices' set-membership for the largest k values,
-because both mx.argpartition and the source kernel have
-implementation-defined ordering inside the slice.
+therefore do **not** wrap the function in mx.custom_function. Tests treat
+parity as the indices' set-membership for the largest k values, because
+mx.argpartition, the source radix kernel, and the direct-MSL greedy kernel do
+not share a stable tie-breaking contract.
 
 ## Tests
 
@@ -146,20 +146,22 @@ tests/test_tilelang_topk.py covers:
   T in {64, 512, 2048}, and k in {1, 8, 32} (with k <= T)
 - dtype in {float32, float16, bfloat16} -> output dtype is int32
 - edge cases: k == 1 returns the argmax, k == seq_len returns all
-  indices, [starts, ends) masking excludes out-of-range columns
+  indices, [starts, ends) masking excludes out-of-range columns, and short or
+  empty intervals fill invalid slots with -1
 - shape/dtype validation (rejects non-2D inputs and k <= 0,
   k > seq_len)
-- Path B status helper records the blocker reason and is stable across
+- Path B status helper records the direct-MSL availability and is stable across
   calls
-- a placeholder test_path_b_forward_parity that skips while the codegen
-  blocker is active and is ready to assert real Metal-vs-reference parity
-  the moment the blocker lifts
+- direct-MSL Metal-vs-reference parity for the main sweep, short/empty
+  intervals, k == seq_len, and acceptance shapes B=4/T=512/k=64 plus
+  B=1/T=4096/k=256 for float32, float16, and bfloat16
 
-29 tests collected; 28 pass, 1 expected skip on M4 Max.
+58 tests pass on M4 Max.
 
 ## Bench
 
-scripts/bench_tilelang_topk.py compares three pure-MLX strategies
+scripts/bench_tilelang_topk.py compares three pure-MLX strategies plus the
+direct-MSL Path B kernel
 across a small shape matrix (10 warmup, 50 timed iterations, perf_counter
 wall time, mx.get_peak_memory() for peak GiB):
 
@@ -169,36 +171,37 @@ wall time, mx.get_peak_memory() for peak GiB):
 - topk_take_along -- argpartition followed by mx.take_along_axis so
   values are materialized too. Models the "fused selector" call-site
   shape downstream code uses.
+- path_b_msl -- hand-written MSL via mx.fast.metal_kernel. If it cannot
+  dispatch for a shape/device, the bench records ran=false instead of timing a
+  fallback as if it were Metal.
 
-Sample output on M4 Max (median ms across 50 iters; full JSON receipts
-in bench/tilelang_ports/topk_selector.json):
-
-
-B    T       k      dtype      argpart_ms    argsort_ms    fused_ms      peak_gib
-1    64      8      float32    0.1406        0.1382        0.1354        0.0000
-1    512     32     float32    0.1337        0.1229        0.1398        0.0000
-1    2048    64     float32    0.1352        0.1422        0.1408        0.0000
-4    2048    64     float32    0.1399        0.1396        0.1498        0.0001
-4    2048    64     float16    0.1429        0.1390        0.1461        0.0001
-4    2048    64     bfloat16   0.1366        0.1357        0.1474        0.0001
-4    4096    256    float32    0.1578        0.1588        0.1674        0.0004
+Sample smoke output on M4 Max (median ms across 10 iters, warmup=3):
 
 
-The three strategies sit within noise of each other at these shapes
-(the tile is dominated by MLX dispatch overhead). The fused
-topk_take_along is the right shape for downstream callers and only
-costs a take_along_axis over the indices, so we treat it as the
-recommended call-site.
+B    T       k      dtype      argpart_ms    argsort_ms    fused_ms      msl_ms        peak_gib
+1    64      8      float32    0.1666        0.1485        0.1801        0.1784        0.0000
+1    512     32     float32    0.1509        0.1391        0.1671        0.3726        0.0000
+1    2048    64     float32    0.1716        0.1549        0.1849        0.8641        0.0000
+4    2048    64     float32    0.1765        0.1397        0.1572        0.5147        0.0001
+4    2048    64     float16    0.1627        0.1398        0.1616        0.5072        0.0001
+4    2048    64     bfloat16   0.1481        0.1471        0.1590        0.4941        0.0001
+4    4096    256    float32    0.1658        0.1593        0.1898        8.8177        0.0004
 
-Parity tolerance: bit-exact set membership against a NumPy
-argsort(-row)[:k] oracle for B in {1, 4}, T in {64, 512, 2048},
-k in {1, 8, 32} covered in tests.
+
+MLX argpartition remains the better standalone top-k implementation, especially
+for B=4/T=4096/k=256. The direct-MSL kernel is kept as the smoke-test for the
+Path B bypass and as a building block for future fused sparse-MLA kernels,
+where selection can happen inline with the attention reduction.
+
+Parity tolerance: bit-exact set membership for the largest k values; tie
+breaking is intentionally not part of the contract.
 
 ## Reproduce
 
 
-.venv/bin/pytest tests/test_tilelang_topk.py
-.venv/bin/python scripts/bench_tilelang_topk.py --json
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m pytest -p no:cacheprovider tests/test_tilelang_topk.py -q --tb=short
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/pyright cppmega_mlx/nn/_tilelang/topk_selector.py tests/test_tilelang_topk.py scripts/bench_tilelang_topk.py
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python scripts/bench_tilelang_topk.py --json --no-output-file
 
 
 The bench writes bench/tilelang_ports/topk_selector.json and (with

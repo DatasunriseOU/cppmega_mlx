@@ -4,24 +4,24 @@
   "port": "sparse_mla_blockscaled",
   "shape": {
     "q_shape": [
+      1,
+      64,
       4,
-      512,
-      8,
       64
     ],
     "kv_shape": [
-      4,
-      512,
+      1,
+      64,
       1,
       64
     ],
     "indices_shape": [
-      4,
-      512,
       1,
-      32
+      64,
+      1,
+      16
     ],
-    "d_v": 64,
+    "d_v": 32,
     "q_dtype": "mlx.core.float32",
     "kv_dtype": "mlx.core.float32"
   },
@@ -33,50 +33,50 @@
   },
   "parity": {
     "blockscaled_vs_bf16": {
-      "max_abs_err": 0.0072389086708426476,
-      "max_rel_err": 0.09327909812881975
+      "max_abs_err": 0.011328823864459991,
+      "max_rel_err": 0.11758861583070061
     },
     "quantized_matmul_vs_bf16": {
       "max_abs_err": 0.0,
       "max_rel_err": 0.0
     },
     "msl_blockscaled_vs_bf16": {
-      "max_abs_err": 0.007239911705255508,
-      "max_rel_err": 0.09329202302533084
+      "max_abs_err": 0.011317778378725052,
+      "max_rel_err": 0.1174739681502098
     },
     "msl_blockscaled_vs_bs_ref": {
-      "max_abs_err": 3.0525028705596924e-05,
-      "max_rel_err": 0.00039309027943857804
+      "max_abs_err": 3.0465424060821533e-05,
+      "max_rel_err": 0.0003377691831805473
     }
   },
   "bench": {
     "bf16_reference": {
       "label": "bf16_reference",
-      "median_ms": 0.6689580623060465,
-      "min_ms": 0.6044579204171896,
-      "max_ms": 0.793500104919076,
-      "iters": 25
+      "median_ms": 0.9395829401910305,
+      "min_ms": 0.665042083710432,
+      "max_ms": 0.9992080740630627,
+      "iters": 8
     },
     "blockscaled_reference": {
       "label": "blockscaled_reference",
-      "median_ms": 0.6787080783396959,
-      "min_ms": 0.6490829400718212,
-      "max_ms": 0.8397498168051243,
-      "iters": 25
+      "median_ms": 0.645665917545557,
+      "min_ms": 0.3741669934242964,
+      "max_ms": 1.2330419849604368,
+      "iters": 8
     },
     "quantized_matmul_reference": {
       "label": "quantized_matmul_reference",
-      "median_ms": 0.6914169061928988,
-      "min_ms": 0.6034160032868385,
-      "max_ms": 0.7981669623404741,
-      "iters": 25
+      "median_ms": 0.3338339738547802,
+      "min_ms": 0.2703331410884857,
+      "max_ms": 0.5257499869912863,
+      "iters": 8
     },
     "path_b_msl_blockscaled_fwd": {
       "label": "path_b_msl_blockscaled_fwd",
-      "median_ms": 0.5451659671962261,
-      "min_ms": 0.517082866281271,
-      "max_ms": 0.6890830118209124,
-      "iters": 25
+      "median_ms": 0.9964159689843655,
+      "min_ms": 0.5499999970197678,
+      "max_ms": 1.009250059723854,
+      "iters": 8
     }
   }
 }

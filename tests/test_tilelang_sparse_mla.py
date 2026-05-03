@@ -34,7 +34,10 @@ from cppmega_mlx.nn._tilelang.sparse_mla import (  # noqa: E402
     sparse_mla_metal_status,
 )
 from cppmega_mlx.nn._tilelang.sparse_mla_path_c import (  # noqa: E402
+    dump_lowered_bwd_msl,
+    dump_lowered_fwd_msl,
     sparse_mla_bwd_path_c,
+    sparse_mla_fwd_path_c,
     sparse_mla_path_c_status,
 )
 from cppmega_mlx.nn.sparse_mla import (  # noqa: E402
@@ -396,6 +399,88 @@ def test_path_b_forward_parity_with_invalid_indices() -> None:
     np.testing.assert_array_equal(out_np[0, 0, 0], np.zeros(D, dtype=out_np.dtype))
 
 
+@pytest.mark.parametrize(
+    "cfg",
+    [
+        dict(B=1, S=4, H=2, D=16, G=1, topk=4, Skv=8),
+        dict(B=1, S=8, H=4, D=16, G=2, topk=8, Skv=16, d_v=8),
+    ],
+    ids=["bf16_small_16x16", "bf16_multigroup_tail_16x16"],
+)
+def test_path_c_forward_bf16_parity(cfg) -> None:
+    """TileLang DSL Path C BF16 forward matches the pure-MLX reference."""
+
+    status = sparse_mla_path_c_status()
+    if not status.available:
+        pytest.skip(status.reason)
+
+    rng = np.random.default_rng(19)
+    B, S, H, D = cfg["B"], cfg["S"], cfg["H"], cfg["D"]
+    G = cfg["G"]
+    topk = cfg["topk"]
+    Skv = cfg["Skv"]
+    d_v = cfg.get("d_v", D)
+
+    q = mx.array(rng.standard_normal((B, S, H, D)).astype(np.float32)).astype(mx.bfloat16)
+    kv = mx.array(rng.standard_normal((B, Skv, G, D)).astype(np.float32)).astype(mx.bfloat16)
+    indices_np = rng.integers(0, Skv, size=(B, S, G, topk)).astype(np.int32)
+    indices_np[0, 0, 0, ::2] = -1
+    indices = mx.array(indices_np)
+
+    result = sparse_mla_fwd_path_c(q, kv, indices, d_v=d_v)
+    assert result is not None, "TileLang DSL Path C BF16 forward kernel must dispatch"
+    out_path_c, lse_path_c = result
+    mx.eval(out_path_c, lse_path_c)
+
+    out_ref, lse_ref = sparse_mla_attention_reference(
+        q, kv, indices, d_v=d_v, return_lse=True
+    )
+    mx.eval(out_ref, lse_ref)
+
+    assert out_path_c.dtype == mx.bfloat16
+    assert lse_path_c.dtype == mx.float32
+    np.testing.assert_allclose(
+        np.array(out_path_c.astype(mx.float32)),
+        np.array(out_ref.astype(mx.float32)),
+        rtol=2e-3,
+        atol=3e-3,
+    )
+    np.testing.assert_allclose(
+        np.array(lse_path_c).astype(np.float32),
+        np.array(lse_ref).astype(np.float32),
+        rtol=2e-3,
+        atol=3e-3,
+    )
+
+
+def test_path_c_forward_bf16_invalid_indices_zero_output() -> None:
+    status = sparse_mla_path_c_status()
+    if not status.available:
+        pytest.skip(status.reason)
+
+    rng = np.random.default_rng(21)
+    B, S, H, D = 1, 4, 2, 16
+    G = 1
+    topk = 4
+    Skv = 8
+    q = mx.array(rng.standard_normal((B, S, H, D)).astype(np.float32)).astype(mx.bfloat16)
+    kv = mx.array(rng.standard_normal((B, Skv, G, D)).astype(np.float32)).astype(mx.bfloat16)
+    indices_np = rng.integers(0, Skv, size=(B, S, G, topk)).astype(np.int32)
+    indices_np[0, 0, 0, :] = -1
+    indices = mx.array(indices_np)
+
+    result = sparse_mla_fwd_path_c(q, kv, indices)
+    assert result is not None
+    out, lse = result
+    mx.eval(out, lse)
+    out_np = np.array(out.astype(mx.float32))
+    lse_np = np.array(lse)
+    assert not np.isnan(out_np).any()
+    assert not np.isnan(lse_np).any()
+    np.testing.assert_array_equal(out_np[0, 0, 0], np.zeros(D, dtype=np.float32))
+    assert lse_np[0, 0, 0] == 0.0
+
+
 def test_path_b_backward_parity() -> None:
     rng = np.random.default_rng(23)
     B, S, H, D = 2, 8, 4, 32
@@ -441,8 +526,9 @@ def test_path_b_backward_parity() -> None:
     [
         dict(B=1, S=4, H=2, D=16, G=1, topk=4, Skv=8),
         dict(B=1, S=4, H=4, D=16, G=2, topk=4, Skv=8, d_v=8),
+        dict(B=1, S=8, H=4, D=32, G=1, topk=16, Skv=32),
     ],
-    ids=["small", "multigroup_tail_dim"],
+    ids=["small", "multigroup_tail_dim", "topk16_threadgroup"],
 )
 def test_path_c_backward_parity(cfg) -> None:
     """TileLang DSL Path C sparse-MLA backward matches the pure-MLX VJP."""
@@ -490,6 +576,50 @@ def test_path_c_backward_parity(cfg) -> None:
         rtol=1e-4,
         atol=1e-4,
     )
+
+
+def test_path_c_backward_lowered_msl_uses_threadgroup_reductions() -> None:
+    status = sparse_mla_path_c_status()
+    if not status.available:
+        pytest.skip(status.reason)
+
+    msl = dump_lowered_bwd_msl(
+        batch=1,
+        seq_len=4,
+        heads=2,
+        qk_dim=16,
+        kv_group=1,
+        topk=8,
+        seq_len_kv=16,
+    )
+    lowered = msl.lower()
+    assert "kernel void" in msl
+    assert "thread_position_in_threadgroup" in msl
+    assert "threadgroup float" in lowered
+    assert "threadgroup_barrier" in lowered
+    assert "atomic_" not in lowered
+
+
+def test_path_c_forward_lowered_msl_uses_threadgroup_reductions() -> None:
+    status = sparse_mla_path_c_status()
+    if not status.available:
+        pytest.skip(status.reason)
+
+    msl = dump_lowered_fwd_msl(
+        batch=1,
+        seq_len=4,
+        heads=2,
+        qk_dim=16,
+        kv_group=1,
+        topk=8,
+        seq_len_kv=16,
+    )
+    lowered = msl.lower()
+    assert "kernel void" in msl
+    assert "thread_position_in_threadgroup" in msl
+    assert "threadgroup float" in lowered
+    assert "threadgroup_barrier" in lowered
+    assert "t.tvm_mma_sync" not in lowered
 
 
 def test_apply_backward_through_custom_vjp() -> None:

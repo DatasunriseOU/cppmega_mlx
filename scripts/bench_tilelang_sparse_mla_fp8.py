@@ -46,6 +46,9 @@ from cppmega_mlx.nn._tilelang.sparse_mla_fp8 import (  # noqa: E402
     sparse_mla_fp8_reference,
     sparse_mla_quantized_matmul_reference,
 )
+from cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c import (  # noqa: E402
+    fp8_sparse_mla_qk_path_c_status,
+)
 from cppmega_mlx.nn.sparse_mla import sparse_mla_attention_reference  # noqa: E402
 
 
@@ -212,6 +215,17 @@ def main() -> None:
     # downstream tooling can distinguish the two layers.
     fp8_status_with_arrays = sparse_mla_fp8_metal_status(q, kv, indices)
     fp8_status_codegen = sparse_mla_fp8_metal_status()
+    fp8_path_c_qk_status = fp8_sparse_mla_qk_path_c_status(
+        M=1,
+        N=args.topk,
+        K=args.qk_dim,
+        BM=1,
+        BN=args.topk,
+        BK=args.qk_dim,
+        a_scale_size=1,
+        b_scale_size=args.topk,
+        transpose_B=True,
+    )
     bs_status_with_arrays = sparse_mla_blockscaled_metal_status(q, kv, indices)
     bs_status_codegen = sparse_mla_blockscaled_metal_status()
     shape_meta = _shape_metadata(q, kv, indices, d_v)
@@ -226,6 +240,16 @@ def main() -> None:
             "dispatch_reason": fp8_status_with_arrays.reason,
             "codegen_blocker_reason": fp8_status_codegen.reason,
             "fp8_dtype": fp8_status_with_arrays.fp8_dtype,
+        },
+        "path_c_tilelang_qk_status": {
+            "available": bool(fp8_path_c_qk_status.available),
+            "reason": fp8_path_c_qk_status.reason,
+            "target": fp8_path_c_qk_status.target,
+            "m": fp8_path_c_qk_status.m,
+            "n": fp8_path_c_qk_status.n,
+            "k": fp8_path_c_qk_status.k,
+            "transpose_B": fp8_path_c_qk_status.transpose_B,
+            "features": fp8_path_c_qk_status.features,
         },
         "parity": {
             "fp8_vs_bf16": _max_abs_err(fp8_ref_out, bf16_ref_out),
@@ -276,6 +300,7 @@ def main() -> None:
     print(f"  fp8_reference         median={fp8_bench['median_ms']:.4f} ms")
     print(f"  quantized_matmul_ref  median={qm_bench['median_ms']:.4f} ms")
     print(f"  path_b_msl_fp8_fwd    median={fp8_msl_bench['median_ms']:.4f} ms (Path B direct-MSL)")
+    print(f"  path_c_tilelang_qk    available={fp8_path_c_qk_status.available} ({fp8_path_c_qk_status.reason})")
     print(f"  fp8 vs bf16 max_abs_err={fp8_payload['parity']['fp8_vs_bf16']['max_abs_err']:.4e}")
     print(f"  msl_fp8 vs bf16 max_abs_err={fp8_payload['parity']['msl_fp8_vs_bf16']['max_abs_err']:.4e}")
 

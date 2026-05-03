@@ -33,7 +33,6 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 TILELANG_ROOT = Path(os.environ.get("TILELANG_ROOT", "/private/tmp/tilelang_apple_head/tilelang"))
 TVM_ROOT = Path(os.environ.get("TVM_ROOT", "/private/tmp/tvm_apple_head/tvm"))
 TILELANG_METAL_TARGET = "metal"
-TILELANG_METAL_VECMAT_TARGET = "metal -thread_warp_size=32"
 
 sys.path.insert(0, str(REPO_ROOT))
 if TILELANG_ROOT.exists():
@@ -46,6 +45,10 @@ from cppmega_mlx.nn._tilelang.fp8_msl_kernels import (  # noqa: E402
     fp8_msl_status,
     fp8_scaled_matmul_raw,
     fp8_scaled_vecmat,
+)
+from cppmega_mlx.nn._tilelang.fp8_vecmat_path_c import (  # noqa: E402
+    TILELANG_METAL_VECMAT_TARGET,
+    make_fp8_vecmat_reduce_kernel,
 )
 
 
@@ -264,69 +267,6 @@ def _make_scaled_matmul_kernel(
             T.copy(C_local, C[by * _BM, bx * _BN])
 
     return fp8_scaled_kernel
-
-
-def _make_vecmat_reduce_kernel(*, N: int, K: int, outputs_per_block: int = 4):
-    """Build the experimental Path C vecmat DSL reducer from the local probe."""
-
-    _, T, _, _ = _import_tilelang()
-    reduce_threads = 32
-    vec = 4
-    block_k = reduce_threads * vec
-    g = globals()
-    g.update(
-        _VM_N=N,
-        _VM_K=K,
-        _VM_NP=outputs_per_block,
-        _VM_RT=reduce_threads,
-        _VM_VEC=vec,
-        _VM_BLOCK_K=block_k,
-    )
-
-    @T.prim_func
-    def fp8_vecmat_reduce(
-        A: T.Tensor((1, _VM_K), "float8_e4m3"),
-        A_scale: T.Tensor((1,), "float32"),
-        B: T.Tensor((_VM_N, _VM_K), "float8_e4m3"),
-        B_scale: T.Tensor((1,), "float32"),
-        C: T.Tensor((1, _VM_N), "float32"),
-    ):
-        with T.Kernel(T.ceildiv(_VM_N, _VM_NP), threads=(_VM_RT, _VM_NP)) as bx:
-            accum = T.alloc_local((1,), "float32")
-            reduced = T.alloc_local((1,), "float32")
-            kr = T.get_thread_binding(0)
-            ni = T.get_thread_binding(1)
-            col = bx * _VM_NP + ni
-            T.clear(accum)
-            for ko in T.serial(T.ceildiv(_VM_K, _VM_BLOCK_K)):
-                for v in T.serial(_VM_VEC):
-                    k = ko * _VM_BLOCK_K + kr * _VM_VEC + v
-                    if col < _VM_N and k < _VM_K:
-                        accum[0] += T.cast(A[0, k], "float32") * T.cast(B[col, k], "float32")
-            with T.attr(
-                T.comm_reducer(lambda x, y: x + y, [T.cast(0, "float32")]),
-                "reduce_scope",
-                T.reinterpret(T.uint64(0), dtype="handle"),
-            ):
-                T.evaluate(
-                    T.tvm_thread_allreduce(
-                        T.uint32(1),
-                        accum[0],
-                        True,
-                        reduced[0],
-                        kr,
-                        dtype="handle",
-                    )
-                )
-            if kr == 0 and col < _VM_N:
-                C[0, col] = reduced[0] * A_scale[0] * B_scale[0]
-
-    try:
-        from tilelang.transform.simplify import apply_simplify
-
-        return apply_simplify(fp8_vecmat_reduce)
-    except Exception:
-        return fp8_vecmat_reduce
 
 
 def _lower_source(prim_func: Any, *, target: str = TILELANG_METAL_TARGET) -> str:
@@ -615,7 +555,7 @@ def _bench_path_c_vecmat_reduce(
         "target": TILELANG_METAL_VECMAT_TARGET,
     }
     try:
-        prim = _make_vecmat_reduce_kernel(N=N, K=K)
+        prim = make_fp8_vecmat_reduce_kernel(N=N, K=K)
         src = _lower_source(prim, target=TILELANG_METAL_VECMAT_TARGET)
         result["source_metrics"] = _source_metrics(src)
         result["xcrun_compile"] = (

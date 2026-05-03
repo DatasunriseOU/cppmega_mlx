@@ -4,24 +4,24 @@
   "port": "sparse_mla_fp8",
   "shape": {
     "q_shape": [
+      1,
+      64,
       4,
-      512,
-      8,
       64
     ],
     "kv_shape": [
-      4,
-      512,
+      1,
+      64,
       1,
       64
     ],
     "indices_shape": [
-      4,
-      512,
       1,
-      32
+      64,
+      1,
+      16
     ],
-    "d_v": 64,
+    "d_v": 32,
     "q_dtype": "mlx.core.float32",
     "kv_dtype": "mlx.core.float32"
   },
@@ -33,50 +33,50 @@
   },
   "parity": {
     "fp8_vs_bf16": {
-      "max_abs_err": 0.0019895341247320175,
-      "max_rel_err": 0.02563673024347062
+      "max_abs_err": 0.0030034519731998444,
+      "max_rel_err": 0.031174618342377305
     },
     "quantized_matmul_vs_bf16": {
       "max_abs_err": 0.0,
       "max_rel_err": 0.0
     },
     "msl_fp8_vs_bf16": {
-      "max_abs_err": 0.001993730664253235,
-      "max_rel_err": 0.025690805994333148
+      "max_abs_err": 0.0030084550380706787,
+      "max_rel_err": 0.0312265481349234
     },
     "msl_fp8_vs_fp8_ref": {
-      "max_abs_err": 3.0517578125e-05,
-      "max_rel_err": 0.00038372043085527457
+      "max_abs_err": 3.0413269996643066e-05,
+      "max_rel_err": 0.0003079714788127215
     }
   },
   "bench": {
     "bf16_reference": {
       "label": "bf16_reference",
-      "median_ms": 0.6689580623060465,
-      "min_ms": 0.6044579204171896,
-      "max_ms": 0.793500104919076,
-      "iters": 25
+      "median_ms": 0.9395829401910305,
+      "min_ms": 0.665042083710432,
+      "max_ms": 0.9992080740630627,
+      "iters": 8
     },
     "fp8_reference": {
       "label": "fp8_reference",
-      "median_ms": 0.7642919663339853,
-      "min_ms": 0.7148750592023134,
-      "max_ms": 0.9984169155359268,
-      "iters": 25
+      "median_ms": 0.4516250919550657,
+      "min_ms": 0.33437483943998814,
+      "max_ms": 0.5283341743052006,
+      "iters": 8
     },
     "quantized_matmul_reference": {
       "label": "quantized_matmul_reference",
-      "median_ms": 0.6914169061928988,
-      "min_ms": 0.6034160032868385,
-      "max_ms": 0.7981669623404741,
-      "iters": 25
+      "median_ms": 0.3338339738547802,
+      "min_ms": 0.2703331410884857,
+      "max_ms": 0.5257499869912863,
+      "iters": 8
     },
     "path_b_msl_fp8_fwd": {
       "label": "path_b_msl_fp8_fwd",
-      "median_ms": 0.5483750719577074,
-      "min_ms": 0.5289588589221239,
-      "max_ms": 0.7988328579813242,
-      "iters": 25
+      "median_ms": 0.9899579454213381,
+      "min_ms": 0.21674996241927147,
+      "max_ms": 2.00541689991951,
+      "iters": 8
     }
   }
 }

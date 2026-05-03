@@ -1,0 +1,28 @@
+[
+  {
+    "opt": "lion8bit_fused_symmetric",
+    "B": 1,
+    "T": 4096,
+    "tokens_per_step": 4096,
+    "median_step_s": 15.927656888961792,
+    "p10_step_s": 11.383439588546754,
+    "p90_step_s": 21.360082149505615,
+    "tok_per_sec_median": 257.1627470728991,
+    "tok_per_sec_p90": 359.82094586956987,
+    "peak_gib_final": 44.01596713066101,
+    "loss_first": 15.928504943847656,
+    "warmup_steps": 5,
+    "measured_steps": 15,
+    "wall_seconds": 352.62506651878357
+  },
+  {
+    "opt": "lion8bit_fused_symmetric",
+    "B": 2,
+    "T": 4096,
+    "cap_hit_at": "step_1",
+    "peak_gib": 74.26880329847336,
+    "step_times": [
+      82.52351689338684
+    ]
+  }
+]

@@ -56,6 +56,13 @@ from cppmega_mlx.nn._tilelang.fp8_msl_kernels import (
     fp8_to_half,
     half_to_fp8,
 )
+from cppmega_mlx.nn._tilelang.fp8_vecmat_path_c import (
+    FP8VecmatPathCStatus,
+    fp8_vecmat_msl_features,
+    fp8_vecmat_path_c_status,
+    lower_fp8_vecmat_msl,
+    make_fp8_vecmat_reduce_kernel,
+)
 from cppmega_mlx.nn._tilelang.m2rnn import (
     M2RNNMetalStatus,
     m2rnn_apply,
@@ -83,7 +90,9 @@ from cppmega_mlx.nn._tilelang.sparse_mla import (
 from cppmega_mlx.nn._tilelang.sparse_mla_path_c import (
     SparseMLAPathCStatus,
     dump_lowered_bwd_msl,
+    dump_lowered_fwd_msl,
     sparse_mla_bwd_path_c,
+    sparse_mla_fwd_path_c,
     sparse_mla_path_c_status,
 )
 from cppmega_mlx.nn._tilelang.sparse_mla_blockscaled import (
@@ -113,6 +122,7 @@ from cppmega_mlx.nn._tilelang.topk_selector import topk_selector as topk_selecto
 
 __all__ = [
     "FP8MSLKernelStatus",
+    "FP8VecmatPathCStatus",
     "M2RNNMetalStatus",
     "Mamba3MetalStatus",
     "MXFP8_BLOCK_SIZE",
@@ -136,7 +146,11 @@ __all__ = [
     "fp8_scaled_matmul_raw",
     "fp8_scaled_vecmat",
     "fp8_to_half",
+    "fp8_vecmat_msl_features",
+    "fp8_vecmat_path_c_status",
     "half_to_fp8",
+    "lower_fp8_vecmat_msl",
+    "make_fp8_vecmat_reduce_kernel",
     "m2rnn",
     "m2rnn_apply",
     "m2rnn_apply_with_state",
@@ -161,6 +175,7 @@ __all__ = [
     "sparse_mla_bwd_metal",
     "sparse_mla_bwd_path_c",
     "dump_lowered_bwd_msl",
+    "dump_lowered_fwd_msl",
     "sparse_mla_fp8",
     "sparse_mla_fp8_apply",
     "sparse_mla_fp8_bwd_metal",
@@ -168,6 +183,7 @@ __all__ = [
     "sparse_mla_fp8_metal_status",
     "sparse_mla_fp8_reference",
     "sparse_mla_fwd_metal",
+    "sparse_mla_fwd_path_c",
     "sparse_mla_metal_status",
     "sparse_mla_path_c_status",
     "sparse_mla_quantized_matmul_reference",
