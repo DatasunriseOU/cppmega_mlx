@@ -25,6 +25,8 @@ from cppmega_mlx.tokenizer.cpp_tokenizer import (
 )
 
 LOCAL_GB10_QUARTER_PROFILE = "local_gb10_quarter"
+MODEL_FACTORY_UPSTREAM_RECIPE_MODULE = "cppmega.recipes.run_profiles"
+LOCAL_GB10_QUARTER_UPSTREAM_RECIPE_NAME = "local_gb10_quarter"
 LOCAL_GB10_QUARTER_PATTERN = "AEMEAEMEAEMR"
 LOCAL_GB10_QUARTER_DEPTH = 13
 LOCAL_GB10_QUARTER_HIDDEN_SIZE = 3584
@@ -43,6 +45,18 @@ LOCAL_GB10_QUARTER_TOKENIZER_REQUIRED_SPECIALS: tuple[tuple[str, int], ...] = tu
     EXPECTED_SPECIAL_TOKENS.items()
 )
 
+NAM56R_FULL_PROFILE = "nam56r_full"
+NAM56R_FULL_UPSTREAM_RECIPE_NAME = "h200_dsa_9_4_m"
+NAM56R_FULL_PATTERN = "AEMEAEMEAEMR"
+NAM56R_FULL_DEPTH = 52
+NAM56R_FULL_HIDDEN_SIZE = 4096
+NAM56R_FULL_FFN_HIDDEN_SIZE = 21_504
+NAM56R_FULL_NUM_HEADS = 32
+NAM56R_FULL_HEAD_DIM = 128
+NAM56R_FULL_VOCAB_SIZE = 65_536
+NAM56R_FULL_DSA_A_LAYER_RANKS = (1, 2, 3, 5, 6, 7, 9, 10, 11)
+NAM56R_FULL_MAX_SEQ_LENGTH = 4096
+
 ModelKind = Literal["hybrid_tiny"]
 
 
@@ -60,8 +74,8 @@ class TokenizerContractStatus:
     reason: str = (
         "M0.1 is closed: the deployed GB10 65K tokenizer is vendored with "
         "id 7=<CODE_START>, id 45=<FIM_INSTRUCTION>, id 46=<SPACE>, and "
-        "id 47=<NL>; MLX/CUDA wrappers use explicit whitespace-sentinel "
-        "encode/decode with Mac-vs-GB10 parity receipts"
+        "id 47=<NL>; MLX and upstream wrappers use explicit whitespace-sentinel "
+        "encode/decode with Mac-vs-upstream parity receipts"
     )
 
     @property
@@ -105,6 +119,8 @@ class ModelFactoryProfile:
 
     The profile is intentionally allocation-free.  It can be converted to the
     existing NAM56R/HybridTiny configs, or used as metadata for parity tests.
+    Upstream recipe identity is provenance only; it is not a local Mac/MLX
+    acceptance target.
     """
 
     name: str
@@ -126,6 +142,8 @@ class ModelFactoryProfile:
     mtp: MTPProfile = MTPProfile()
     tokenizer_contract: TokenizerContractStatus = TokenizerContractStatus()
     model_kind: ModelKind = "hybrid_tiny"
+    upstream_recipe_module: str = MODEL_FACTORY_UPSTREAM_RECIPE_MODULE
+    upstream_recipe_name: str | None = None
 
     @property
     def expanded_pattern(self) -> ExpandedNamPattern:
@@ -161,6 +179,10 @@ class ModelFactoryProfile:
             _require_positive("dsa_indexer_head_dim", self.dsa_indexer_head_dim)
         if self.model_kind != "hybrid_tiny":
             raise ValueError(f"unsupported model_kind={self.model_kind!r}")
+        if not self.upstream_recipe_module:
+            raise ValueError("upstream_recipe_module must be non-empty")
+        if self.upstream_recipe_name == "":
+            raise ValueError("upstream_recipe_name must be non-empty when provided")
         self.expanded_pattern
 
     def nam56r_config(self) -> Nam56RModelConfig:
@@ -232,16 +254,32 @@ class ModelFactoryProfile:
         params.update(overrides)
         return HybridTinyConfig(**params)
 
-    def build_model(self, **hybrid_config_overrides) -> HybridTinyLM:
+    def build_model(
+        self,
+        *,
+        dtype: mx.Dtype | None = None,
+        **hybrid_config_overrides,
+    ) -> HybridTinyLM:
         """Allocate the profile's MLX model via the existing HybridTinyLM builder."""
 
         self.tokenizer_contract.require_resolved()
-        return HybridTinyLM(self.hybrid_config(**hybrid_config_overrides))
+        return HybridTinyLM(
+            self.hybrid_config(**hybrid_config_overrides),
+            dtype=dtype,
+        )
 
-    def build_tiny_smoke_model(self, **hybrid_config_overrides) -> HybridTinyLM:
+    def build_tiny_smoke_model(
+        self,
+        *,
+        dtype: mx.Dtype | None = None,
+        **hybrid_config_overrides,
+    ) -> HybridTinyLM:
         """Allocate a tiny model that preserves route metadata for smoke tests."""
 
-        return HybridTinyLM(self.tiny_smoke_config(**hybrid_config_overrides))
+        return HybridTinyLM(
+            self.tiny_smoke_config(**hybrid_config_overrides),
+            dtype=dtype,
+        )
 
 
 def local_gb10_quarter_profile(**overrides) -> ModelFactoryProfile:
@@ -257,6 +295,28 @@ def local_gb10_quarter_profile(**overrides) -> ModelFactoryProfile:
         head_dim=LOCAL_GB10_QUARTER_HEAD_DIM,
         vocab_size=LOCAL_GB10_QUARTER_VOCAB_SIZE,
         dsa_a_layer_ranks=LOCAL_GB10_QUARTER_DSA_A_LAYER_RANKS,
+        upstream_recipe_name=LOCAL_GB10_QUARTER_UPSTREAM_RECIPE_NAME,
+    )
+    if not overrides:
+        return profile
+    return replace(profile, **overrides)
+
+
+def nam56r_full_profile(**overrides) -> ModelFactoryProfile:
+    """Return the allocation-free full NAM56R factory profile metadata."""
+
+    profile = ModelFactoryProfile(
+        name=NAM56R_FULL_PROFILE,
+        pattern=NAM56R_FULL_PATTERN,
+        depth=NAM56R_FULL_DEPTH,
+        hidden_size=NAM56R_FULL_HIDDEN_SIZE,
+        ffn_hidden_size=NAM56R_FULL_FFN_HIDDEN_SIZE,
+        num_attention_heads=NAM56R_FULL_NUM_HEADS,
+        head_dim=NAM56R_FULL_HEAD_DIM,
+        vocab_size=NAM56R_FULL_VOCAB_SIZE,
+        max_seq_length=NAM56R_FULL_MAX_SEQ_LENGTH,
+        dsa_a_layer_ranks=NAM56R_FULL_DSA_A_LAYER_RANKS,
+        upstream_recipe_name=NAM56R_FULL_UPSTREAM_RECIPE_NAME,
     )
     if not overrides:
         return profile
@@ -266,18 +326,29 @@ def local_gb10_quarter_profile(**overrides) -> ModelFactoryProfile:
 def get_model_profile(name: str) -> ModelFactoryProfile:
     if name == LOCAL_GB10_QUARTER_PROFILE:
         return local_gb10_quarter_profile()
+    if name == NAM56R_FULL_PROFILE:
+        return nam56r_full_profile()
     raise ValueError(
-        f"unknown model factory profile {name!r}; supported: {LOCAL_GB10_QUARTER_PROFILE}"
+        f"unknown model factory profile {name!r}; supported: "
+        f"{LOCAL_GB10_QUARTER_PROFILE}, {NAM56R_FULL_PROFILE}"
     )
 
 
-def local_gb10_quarter(**hybrid_config_overrides) -> HybridTinyLM:
+def local_gb10_quarter(
+    *,
+    dtype: mx.Dtype | None = mx.bfloat16,
+    **hybrid_config_overrides,
+) -> HybridTinyLM:
     """Allocate the full local_gb10_quarter MLX model.
 
     This constructs the real profile dimensions and can allocate billions of
     parameters.  Tests should use ``local_gb10_quarter_profile`` or
     ``build_local_gb10_quarter_tiny_smoke_model`` unless they intentionally
     exercise full-profile memory behavior.
+
+    The default ``dtype`` is ``mx.bfloat16`` to match the cppmega CUDA training
+    configuration (``precision="bf16"``); pass ``dtype=mx.float32`` to override
+    for parity probes that need fp32 weights.
     """
 
     profile_overrides = {}
@@ -285,7 +356,8 @@ def local_gb10_quarter(**hybrid_config_overrides) -> HybridTinyLM:
     if tokenizer_contract is not None:
         profile_overrides["tokenizer_contract"] = tokenizer_contract
     return local_gb10_quarter_profile(**profile_overrides).build_model(
-        **hybrid_config_overrides
+        dtype=dtype,
+        **hybrid_config_overrides,
     )
 
 
@@ -317,16 +389,30 @@ __all__ = [
     "LOCAL_GB10_QUARTER_NUM_HEADS",
     "LOCAL_GB10_QUARTER_PATTERN",
     "LOCAL_GB10_QUARTER_PROFILE",
+    "LOCAL_GB10_QUARTER_UPSTREAM_RECIPE_NAME",
     "LOCAL_GB10_QUARTER_TOKENIZER_BLOCKER_ID",
     "LOCAL_GB10_QUARTER_TOKENIZER_MILESTONE",
     "LOCAL_GB10_QUARTER_TOKENIZER_REQUIRED_SPECIALS",
     "LOCAL_GB10_QUARTER_VOCAB_SIZE",
+    "MODEL_FACTORY_UPSTREAM_RECIPE_MODULE",
     "MTPProfile",
     "ModelFactoryProfile",
+    "NAM56R_FULL_DEPTH",
+    "NAM56R_FULL_DSA_A_LAYER_RANKS",
+    "NAM56R_FULL_FFN_HIDDEN_SIZE",
+    "NAM56R_FULL_HEAD_DIM",
+    "NAM56R_FULL_HIDDEN_SIZE",
+    "NAM56R_FULL_MAX_SEQ_LENGTH",
+    "NAM56R_FULL_NUM_HEADS",
+    "NAM56R_FULL_PATTERN",
+    "NAM56R_FULL_PROFILE",
+    "NAM56R_FULL_UPSTREAM_RECIPE_NAME",
+    "NAM56R_FULL_VOCAB_SIZE",
     "TokenizerContractStatus",
     "build_local_gb10_quarter_tiny_smoke_model",
     "forward_has_finite_logits",
     "get_model_profile",
     "local_gb10_quarter",
     "local_gb10_quarter_profile",
+    "nam56r_full_profile",
 ]

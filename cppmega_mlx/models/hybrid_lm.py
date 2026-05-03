@@ -239,37 +239,54 @@ class HybridTinyConfig:
 
 
 class HybridTinyBlock(nn.Module):
-    """One pre-norm residual A/M/E/R route block."""
+    """One pre-norm residual A/M/E/R route block.
+
+    The active sub-module is held under a single attribute (``self.block``)
+    so MLX's ``tree_flatten`` walks every parameter exactly once. The legacy
+    ``attention_block`` / ``mamba3_block`` / ``moe_block`` / ``m2rnn_block``
+    accessors are exposed as plain Python ``@property`` so they do not
+    introduce a second path into the parameter tree (which would otherwise
+    double the optimizer state and gradient buffer cost — see
+    ``docs/research/precision_strategy_decision.md``).
+    """
 
     def __init__(self, layer: NamLayer, config: HybridTinyConfig):
         super().__init__()
         self.layer = layer
         self.norm = nn.RMSNorm(config.hidden_size)
-        self.attention_block: CausalSelfAttention | None = None
-        self.mamba3_block: Mamba3ReferenceBlock | None = None
-        self.moe_block: ReferenceMoE | None = None
-        self.m2rnn_block: M2RNNMixer | None = None
         self.block: HybridBlockModule
 
         if layer.symbol == "A":
             mode = layer.attention_route or "mla"
             self.backend: HybridBackend = "attention"
-            self.attention_block = CausalSelfAttention(config.attention_config(mode))
-            self.block = self.attention_block
+            self.block = CausalSelfAttention(config.attention_config(mode))
         elif layer.symbol == "M":
             self.backend = "mamba3"
-            self.mamba3_block = Mamba3ReferenceBlock(config.mamba3_config())
-            self.block = self.mamba3_block
+            self.block = Mamba3ReferenceBlock(config.mamba3_config())
         elif layer.symbol == "E":
             self.backend = "moe"
-            self.moe_block = ReferenceMoE(config.moe_config())
-            self.block = self.moe_block
+            self.block = ReferenceMoE(config.moe_config())
         elif layer.symbol == "R":
             self.backend = "m2rnn"
-            self.m2rnn_block = M2RNNMixer(config.m2rnn_config())
-            self.block = self.m2rnn_block
+            self.block = M2RNNMixer(config.m2rnn_config())
         else:  # pragma: no cover - expand_nam_pattern rejects this first.
             raise ValueError(f"unsupported hybrid layer symbol {layer.symbol!r}")
+
+    @property
+    def attention_block(self) -> CausalSelfAttention | None:
+        return self.block if self.backend == "attention" else None  # type: ignore[return-value]
+
+    @property
+    def mamba3_block(self) -> Mamba3ReferenceBlock | None:
+        return self.block if self.backend == "mamba3" else None  # type: ignore[return-value]
+
+    @property
+    def moe_block(self) -> ReferenceMoE | None:
+        return self.block if self.backend == "moe" else None  # type: ignore[return-value]
+
+    @property
+    def m2rnn_block(self) -> M2RNNMixer | None:
+        return self.block if self.backend == "m2rnn" else None  # type: ignore[return-value]
 
     def __call__(
         self,
@@ -293,24 +310,19 @@ class HybridTinyBlock(nn.Module):
                 f"requires backend {expected_backend!r}, got {self.backend!r}"
             )
 
-        active_modules = {
-            "attention": self.attention_block,
-            "mamba3": self.mamba3_block,
-            "moe": self.moe_block,
-            "m2rnn": self.m2rnn_block,
-        }
-        if active_modules[self.backend] is None:
-            raise ValueError(f"{self.backend} backend missing {self.backend} block")
+        if self.block is None:
+            raise ValueError(f"{self.backend} backend missing block instance")
 
-        unexpected = [
-            backend
-            for backend, module in active_modules.items()
-            if backend != self.backend and module is not None
-        ]
-        if unexpected:
+        expected_cls = {
+            "attention": CausalSelfAttention,
+            "mamba3": Mamba3ReferenceBlock,
+            "moe": ReferenceMoE,
+            "m2rnn": M2RNNMixer,
+        }[self.backend]
+        if not isinstance(self.block, expected_cls):
             raise ValueError(
                 f"hybrid layer {self.layer.number} backend {self.backend!r} "
-                f"has unexpected route modules {tuple(unexpected)!r}"
+                f"has block of unexpected class {type(self.block).__name__!r}"
             )
 
     def route_delta(
@@ -323,21 +335,13 @@ class HybridTinyBlock(nn.Module):
         self.validate_backend()
         x = self.norm(hidden_states)
         if self.backend == "attention":
-            if self.attention_block is None:  # pragma: no cover - constructor invariant.
-                raise ValueError("attention backend missing attention block")
-            delta = self.attention_block(x, mask)
+            delta = self.block(x, mask)
         elif self.backend == "mamba3":
-            if self.mamba3_block is None:  # pragma: no cover - constructor invariant.
-                raise ValueError("mamba3 backend missing mamba3 block")
-            delta, _ = self.mamba3_block(x)
+            delta, _ = self.block(x)
         elif self.backend == "moe":
-            if self.moe_block is None:  # pragma: no cover - constructor invariant.
-                raise ValueError("moe backend missing moe block")
-            delta = self.moe_block(x).output
+            delta = self.block(x).output
         elif self.backend == "m2rnn":
-            if self.m2rnn_block is None:  # pragma: no cover - constructor invariant.
-                raise ValueError("m2rnn backend missing m2rnn block")
-            delta, _ = self.m2rnn_block(x)
+            delta, _ = self.block(x)
         else:  # pragma: no cover - self.backend is fixed during construction.
             raise ValueError(f"unsupported hybrid backend {self.backend!r}")
         return delta
@@ -346,7 +350,12 @@ class HybridTinyBlock(nn.Module):
 class HybridTinyLM(nn.Module):
     """Tiny decoder-only LM assembled from local NAM A/M/E/R reference blocks."""
 
-    def __init__(self, config: HybridTinyConfig | None = None):
+    def __init__(
+        self,
+        config: HybridTinyConfig | None = None,
+        *,
+        dtype: mx.Dtype | None = None,
+    ):
         super().__init__()
         self.config = config or HybridTinyConfig()
         cfg = self.config
@@ -369,6 +378,9 @@ class HybridTinyLM(nn.Module):
         self.layers = [HybridTinyBlock(layer, cfg) for layer in self.pattern.layers]
         self.norm = nn.RMSNorm(cfg.hidden_size)
         self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
+
+        if dtype is not None and dtype != mx.float32:
+            self.set_dtype(dtype)
 
     @property
     def route_symbols(self) -> tuple[str, ...]:

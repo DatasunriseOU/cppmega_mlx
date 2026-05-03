@@ -612,12 +612,12 @@ def test_hybrid_tiny_mamba3_m2rnn_compiled_step_updates_both_custom_routes() -> 
     assert _has_parameter_delta_under(
         before,
         after,
-        "layers.0.mamba3_block.",
+        "layers.0.block.",
     )
     assert _has_parameter_delta_under(
         before,
         after,
-        "layers.1.m2rnn_block.",
+        "layers.1.block.",
     )
 
 
@@ -649,14 +649,14 @@ def test_hybrid_tiny_mamba3_only_compiled_step_updates_m_route_parameters() -> N
     assert math.isfinite(metrics.loss)
     assert metrics.loss > 0
     for prefix in (
-        "layers.0.mamba3_block.in_proj.",
-        "layers.0.mamba3_block.out_proj.",
-        "layers.0.mamba3_block.conv_",
-        "layers.0.mamba3_block.dt_bias",
-        "layers.0.mamba3_block.B_norm_weight",
-        "layers.0.mamba3_block.C_norm_weight",
-        "layers.0.mamba3_block.B_bias",
-        "layers.0.mamba3_block.C_bias",
-        "layers.0.mamba3_block.D",
+        "layers.0.block.in_proj.",
+        "layers.0.block.out_proj.",
+        "layers.0.block.conv_",
+        "layers.0.block.dt_bias",
+        "layers.0.block.B_norm_weight",
+        "layers.0.block.C_norm_weight",
+        "layers.0.block.B_bias",
+        "layers.0.block.C_bias",
+        "layers.0.block.D",
     ):
         assert _has_parameter_delta_under(before, after, prefix), prefix

@@ -1,0 +1,16 @@
+{
+  "model_params_unique": 1796521354,
+  "model_params_unique_gib": 3.346281785517931,
+  "model_params_via_tree": 1796521354,
+  "opt_state_gib": 6.692563582211733,
+  "opt_state_numel": 1796521356,
+  "peak_gib_final": 38.16839601658285,
+  "active_gib_final": 24.355115339159966,
+  "step_times_s": [
+    15.82521104812622,
+    9.3374502658844,
+    6.217135906219482
+  ],
+  "median_step_s": 7.777293086051941,
+  "tok_per_sec": 131.6653479134631
+}

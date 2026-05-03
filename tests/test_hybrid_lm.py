@@ -492,8 +492,8 @@ def test_hybrid_tiny_block_fails_closed_on_backend_metadata_corruption() -> None
         model.layers[0].route_delta(hidden_states, mask)
 
     model = HybridTinyLM(_small_single_route_config("A"))
-    model.layers[0].mamba3_block = object()  # type: ignore[assignment]
-    with pytest.raises(ValueError, match="unexpected route modules"):
+    model.layers[0].block = object()  # type: ignore[assignment]
+    with pytest.raises(ValueError, match="unexpected class"):
         model.layers[0].route_delta(hidden_states, mask)
 
 
