@@ -157,8 +157,8 @@ Before fanning out across all 10 streams, prove the smallest viable path on the 
 - M0.1 — **CLOSED**. Tokenizer: vendor the deployed GB10 tokenizer artifact with vocab=65536 and the reserved ID contract (id 2=BOS, 3=EOT/EOS, 4=FIM_PREFIX, 5=FIM_MIDDLE, 6=FIM_SUFFIX, 7=CODE_START, 45=FIM_INSTRUCTION, 46=SPACE, 47=NL). The wrapper normalizes whitespace runs at encode (`[\r\n]+`->`<NL>`, `[ \t]+`->`<SPACE>`) and decode is plain token concat with sentinel substitution; this fixes the BPE-split decode bug (e.g., `sum`->`s`,`u`,`m`->`s u m`) and gives byte-exact round-trip for inputs without multi-char whitespace runs. The explicit-token approach matches the CUDA-side `nanochat/cpp_tokenizer.py` decode behavior. Do not reopen this gate over the deployed HF `decoder=null` artifact's non-reversible `decode(encode(text))` behavior.
 - M0.2 — Model factory entry for `local_gb10_quarter` in `cppmega_mlx/recipes/model_factory.py`. With M0.1 closed, the default profile is unblocked; acceptance remains the profile contract plus build → forward closure on shape `(B=1, T=512)` returning finite logits with config schema validation rejecting invalid combos.
 - M0.3 — **Random-init seed-matched forward parity** (no warm-start, no CUDA weight import for M0): construct MLX model and CUDA reference model with the same `local_gb10_quarter` config; seed both deterministically; compare logits within `rtol=1e-2, atol=1e-1` on the fixed `B=1,T=512,seed=3003` input batch (`tokens_sha256=c645ca4053e5206dcbe58c13aa26f4a9e56c5aa2aee90a4d4778bbc9d9c33549`). Current gate state is fail-closed: no real CUDA logits artifact exists at `bench/parity/cuda/m03_local_gb10_quarter_seed3003_logits.json`, so `scripts/m03_forward_parity_manifest.py` must refuse the default missing artifact and keep `m0_3_closed=false`. A metadata-valid CUDA artifact only reaches `artifact_preflight_status=valid_not_evaluated`; it is not acceptance until a separate numerical harness compares the full logits tensor (`shape=[1,512,65536]`, `numel=33554432`) against MLX and records pass/fail parity.
-- M0.4 — One training step in bf16 (loss + backward + optimizer.update). No NaNs. Loss decrease over 100 steps on the target local parquet sample. **Data source**: local ignored `data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet` (~492 MB total of GB10 validation shards when present locally; not committed to git). Current receipts may cover tiny-model/full-parquet plumbing only; full M0.4 remains blocked until the `local_gb10_quarter` path runs this gate. No GB10 scp or full-corpus prep needed for M0.
-- M0.5 — MTP K=2 head wired with β=0.6 / λ=0.3; per-depth losses tracked. MTP-disabled inference path also returns sane logits. Current local coverage is bounded to MLX training-side loss semantics and fails closed on Hopper/Liger fused-CE parity until a hardware receipt exists.
+- M0.4 — One training step in bf16 (loss + backward + optimizer.update). No NaNs. Loss decrease over 100 steps on the target local parquet sample. **Data source**: local ignored `data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet` (~492 MB total of GB10 validation shards when present locally; not committed to git). Current hardening covers scoped training plumbing, canonical allocation-preflight metadata, grad-checkpoint source expectations, and requested-vs-completed step accounting. Full M0.4 remains open until the `local_gb10_quarter` bf16 AdamW + grad-checkpoint path runs the 100-step target-parquet gate. No GB10 scp or full-corpus prep needed for M0.
+- M0.5 — MTP K=2 head wired with β=0.6 / λ=0.3; per-depth losses tracked. MTP-disabled inference path also returns sane logits. Current local coverage is bounded to MLX training-side loss semantics plus fail-closed manifest hardening, including nested CUDA/MLX overclaim rejection. M0.5 remains open until a fixed-seed CUDA/GB10 FastMTP loss+grad-norm artifact exists and an MLX-vs-CUDA numerical harness evaluates it.
 - M0.6 — Memory math validated on the actual dev box (Mac Studio M4 Max 128 GB): peak unified-memory < 75% of installed RAM with `--grad-checkpoint` and AdamW.
 - M0.7 — Resumable training: save mid-run, kill process, reload, identical loss continues for ≥100 steps with RNG state and dataloader cursor preserved. Current receipts are TinyLM/HybridTinyLM-scoped only; full M0.7 remains fail-closed until `local_gb10_quarter` resumes on the target parquet lane after the M0.4 full-model training gate is proven.
 
@@ -253,6 +253,34 @@ Before fanning out across all 10 streams, prove the smallest viable path on the 
 39. Add YaRN RoPE variant (`rope.py` from nanochat).
 40. Add Llama3 piecewise scaling RoPE.
 
+#### Stream B addendum — MLX built-in kernel surface (2026-05-03)
+
+Built-in fused fast ops in MLX 0.31.x are exactly four:
+
+- `mx.fast.scaled_dot_product_attention` — fused MHA/GQA/MQA, causal/additive/sinks masks.
+- `mx.fast.rms_norm` — fused RMSNorm (fp/bf16-aware).
+- `mx.fast.layer_norm` — fused LayerNorm (fp/bf16-aware).
+- `mx.fast.rope` — fused RoPE with precomputed `freqs`.
+
+Plus two DIY seams:
+
+- `mx.fast.metal_kernel` — author-your-own MSL kernel, still requires `@mx.custom_function` for VJP/JVP.
+- `mx.custom_function` — Python-side custom forward/backward for non-Metal pure-MLX paths.
+
+Everything else — matmul, activations (SwiGLU/ReLU²/GELU), cross-entropy loss, MoE
+dispatch/routing, Mamba selective scan, M2RNN recurrence, quantized matmul, NgramHash
+gather, structure-embedding fusion — currently runs through the MLX op fuser without a
+dedicated Metal kernel. There is no `mx.fast.cross_entropy` in 0.31.x; `mlx.nn.losses.cross_entropy`
+materializes the full `[B*T, V]` logits tensor (4 GiB at fp32 with B=4, T=512, V=65536).
+
+This addendum is a snapshot, not a closing receipt. Parallel research lanes (agents D-I)
+are running web/HF/perplexity searches for kernel alternatives (cut_cross_entropy port,
+TurboQuant patterns, mlx-mfa SDPA variants, ZMLX fused activations, gpt-oss-metal-kernels
+loss/MoE candidates). Their findings will be appended to this addendum as separate dated
+entries; nothing here adopts a custom kernel into the training path. All adoption stays
+gated by the Stream B steps 27–29 contract: profiling evidence, pure-MLX fallback, parity
+tests, and `@mx.custom_function` VJP/JVP coverage.
+
 ### Stream C — Model Architecture & Blocks (41–60)
 
 41. Refactor `attention.py` to support GQA explicitly: `kv_repeat = num_q_heads // num_kv_heads` in QKV projection; assert configs.
@@ -342,6 +370,68 @@ Before fanning out across all 10 streams, prove the smallest viable path on the 
 99. Add LoRA / QLoRA fine-tuning only after an installed-API audit; treat `mlx_lm.lora` as a reference pattern until cppmega_mlx checkpoint compatibility is proven locally.
 100. Wire W&B logging (`--report-to wandb`); also TensorBoard fallback.
 
+#### Stream E addendum — Optimizer choices (Muon / AdamW / Lion) (2026-05-03)
+
+##### 100-step smoke at tiny config, real parquet (2026-05-02)
+
+| optimizer        | state MiB | loss[0] | mean_last10 | min   | tok/s |
+|------------------|-----------|---------|-------------|-------|-------|
+| AdamW lr=1e-3    | 65.3      | 11.215  | 4.04        | 1.76  | 9488  |
+| Lion  lr=1e-4    | 32.7      | 11.215  | 10.77       | 10.46 | 9644  |
+| Lion  lr=3e-4    | 32.7      | 11.215  | 9.29        | 8.82  | 9469  |
+| Lion  lr=1e-3    | 32.7      | 11.215  | 5.28        | 4.14  | 9271  |
+| Lion  lr=3e-3    | 32.7      | 11.215  | 4.60        | 1.86  | 9141  |
+
+Conclusion: Lion at roughly 3× AdamW LR matches AdamW; Lion optimizer state is 0.5×
+AdamW; throughput equal to within noise. On the 1.985B `local_gb10_quarter` model that
+trade-off is approximately **13 GiB optimizer-state savings** when Lion is used.
+Single-Mac M0 default stays AdamW; Lion remains the documented memory-tight option (and
+the only path that fits the 48 GB peer in the heterogeneous Stream F smoke per step 81).
+Default Lion config when invoked: `make_lion(lr=3e-4, betas=(0.9, 0.99), wd=0.1)` — the
+`wd=0.1` figure is 10× AdamW per Chen et al. arXiv 2302.06675.
+
+##### cppmega CUDA optimizer wiring (reference, not status)
+
+cppmega CUDA uses `MultiOptimizer = Muon + adam8bit` via the Megatron emerging_optimizers
+registry. Param-category mapping (predicate `_is_nonlinear_or_embedding` at
+`megatron-lm/megatron/core/optimizer/emerging_optimizers.py:125-132`):
+
+- **Muon** — every 2D `nn.Linear.weight`: attention QKV/O, MLP up/down/gate, MoE experts.
+- **AdamW (or adam8bit fallback)** — 1D params (RMSNorm/LayerNorm weights, biases), 3D+
+  tensors, embeddings, `lm_head`, Mamba scalars (`A_log`, `D`, `dt_bias`, `B_bias`,
+  `C_bias`, `mimo_*`).
+
+Lion is **not** used as a fallback in the cppmega CUDA wiring; the historical fallback is
+`adam8bit` with no documented reason beyond "Megatron default". cppmega applies a single
+shared `--lr 1e-4` to both groups. The Keller paper recommends Muon LR roughly 10×
+AdamW LR; **cppmega does not apply this split**, so any cppmega-CUDA-trace-bit parity
+test must run with `cppmega_cuda_parity=True` (forces shared lr=1e-4) rather than the
+Keller-recommended split. cppmega defaults: `momentum=0.95, nesterov=False,
+num_ns_steps=5, weight_decay=0.01, clip_grad=1.0`. Environment knobs:
+`CPPMEGA_OPTIMIZER`, `CPPMEGA_LR`, `CPPMEGA_MUON_MOMENTUM`, `CPPMEGA_MUON_NUM_NS_STEPS`,
+`CPPMEGA_MUON_NS_CARRIER`, `CPPMEGA_MUON_TP_MODE`.
+
+This addendum documents the reference wiring and the LR-split divergence; no cppmega.mlx
+optimizer code change is implied here. Implementation is tracked under the parent epic
+`cppmega-mlx-c08` ([epic] Optimizer parity with cppmega CUDA).
+
+##### Follow-up beads issues
+
+- `cppmega-mlx-c08.1` — make_muon group-splitter for CUDA parity (P2). Multi-optimizer
+  pattern mirroring `_is_nonlinear_or_embedding`. Defaults: Muon `lr=2e-3,
+  momentum=0.95, nesterov=True, ns_steps=5`; AdamW `lr=1e-4, betas=(0.9, 0.95), wd=0.01`.
+  Optional `cppmega_cuda_parity=True` flag forces shared lr=1e-4.
+- `cppmega-mlx-c08.2` — Pure-MLX CCE (cut_cross_entropy) port (P2). Chunked vocab loss
+  avoiding `[B*T, V]` materialization; rtol=1e-4 vs `nn.losses.cross_entropy`. Parallel
+  agent A is starting on this; the issue tracks the long-term work (full backward
+  parity, perf claim).
+- `cppmega-mlx-c08.3` — Document Lion vs AdamW state-cost trade-off (P3). 0.5× state
+  savings + 3× LR rule for cppmega.mlx context; Lion not default; `make_lion(lr=3e-4,
+  betas=(0.9, 0.99), wd=0.1)` per Chen et al. 2302.06675.
+- `cppmega-mlx-c08.4` — Add `muon_ns_carrier=bf16` option (P3). Mirrors cppmega
+  `CPPMEGA_MUON_NS_CARRIER=bf16`. Saves ~1.5× compute per NS iter at no quality cost
+  per cppmega CUDA traces.
+
 ### Stream F — Distributed & Multi-Mac (101–120)
 
 101. Add `mx.distributed.init(backend='auto')` to launcher.
@@ -405,8 +495,8 @@ Cross-stream note: ngram_hash is **already done** (cppmega_mlx/nn/ngram_hash.py)
 151. Port MTP head + recursive shared-block trick from `nanochat/mtp.py` and `cppmega/megatron/fastmtp_layer.py`. Default K=2 (GB10 baseline); single shared transformer block recurred K times per FastMTP arXiv 2509.18362. **Critical**: share weights via direct attribute aliasing (`mtp_head.weight = main.lm_head.weight`), not deep copy — MLX module tree walks recognize the shared parameter and AdamW state stays single. See `docs/mlx_buy_vs_build.md` row D + anti-port rule 13.
 152. Implement `roll-and-mask` static-shape FIM-safe MTP loss (mask wrapped positions as `ignore_index=-1`); preserve XLA/`mx.compile`-safe static shapes.
 153. Add per-depth weighted loss `α_k = β^k / Σ β^j` with β=0.6 default decay (matches `CPPMEGA_FASTMTP_DECAY`); apply at `λ=0.3` (matches `CPPMEGA_FASTMTP_LAMBDA`). Use `reduction='mean'` with broadcast (Liger #968 workaround mirror).
-154. Validate MTP parity vs cppmega CUDA `cppmega/megatron/fastmtp_layer.py` and `mtp_native_hopper_ce.py` (loss values + grad norm at fixed seed; document non-claim where Hopper-fused CE is not reproducible on M4). Current M0.5 receipt is fail-closed: no checked-in or locally observed fixed-seed CUDA/GB10 loss+grad-norm artifact exists, so the local MLX K=2 contract tests do not close parity.
-155. Port FIM data transform (PSM/SPM, fim_rate, random span sampling) to `cppmega_mlx/data/fim.py`. Current local coverage is CPU token permutation only and remains blocked on the tokenizer artifact contract for full use.
+154. Validate MTP parity vs cppmega CUDA `cppmega/megatron/fastmtp_layer.py` and `mtp_native_hopper_ce.py` (loss values + grad norm at fixed seed; document non-claim where Hopper-fused CE is not reproducible on M4). Current M0.5 receipt is fail-closed: local K=2 contract tests and nested-overclaim hardening pass, but no checked-in or locally observed fixed-seed CUDA/GB10 loss+grad-norm artifact exists, so the local MLX tests do not close parity.
+155. Port FIM data transform (PSM/SPM, fim_rate, random span sampling) to `cppmega_mlx/data/fim.py`. Current local coverage is CPU token permutation only; the tokenizer artifact contract is closed, but dataset/training integration and source parity coverage remain open.
 156. Port iFIM data transform (instruction extraction, AST-aware, special token id=45) to `cppmega_mlx/data/ifim.py`. Current local coverage is dependency-free instruction extraction plus token formatting in `cppmega_mlx/data/fim.py`; tree-sitter/AST-aware extraction and dataset/training integration remain open.
 157. Port STP loss (~100 LOC, trivial port) to `cppmega_mlx/training/stp_loss.py`. **Local helper done**: deterministic static triples compute `1 - cosine(h[r]-h[s], h[t]-h[r])`, `T < 3` returns zero, tuple/list layer inputs average scalar losses, and defaults remain opt-in (`λ_STP=0`). Receipt: `./.venv/bin/python -m pytest tests/test_stp_loss.py tests/test_package_exports.py -q --tb=short` → `21 passed`; `./.venv/bin/pyright cppmega_mlx/training/stp_loss.py cppmega_mlx/training/loss.py cppmega_mlx/training/__init__.py tests/test_stp_loss.py` → `0 errors`.
 158. Add STP variants A (single triple, last layer), B (N triples last layer), C (multi-layer averaged) toggles. The local helper covers these deterministic loss surfaces via `n_spans` and tuple/list hidden-state input, but Stream H remains open until integration/parity receipts land.
@@ -534,7 +624,8 @@ Critical path: A → B → C → E → H (features) is the longest single chain,
    `<CODE_START>` contract. A read-only GB10 check of
    `/home/dave/cppmega-root/cpp_tokenizer_hf/tokenizer.json` and
    `/home/dave/cppmega-root/data/tokenizer/tokenizer.json` found vocab=65536,
-   id7=`<CODE_START>`, id45=`<FIM_INSTRUCTION>`, and the same deployed
+   id7=`<CODE_START>`, id45=`<FIM_INSTRUCTION>`, id46=`<SPACE>`,
+   id47=`<NL>`, and the same deployed
    contract. cppmega CUDA loads a HuggingFace tokenizer directory, and the
    local artifact contract now follows that deployed id 7=`<CODE_START>`
     mapping. MLX/CUDA wrappers now use the explicit `<SPACE>`/`<NL>` sentinel
