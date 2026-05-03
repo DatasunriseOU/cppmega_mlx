@@ -2,16 +2,39 @@
 
 from __future__ import annotations
 
+import inspect
 from typing import Any, Callable
 
 import mlx.core as mx
+import mlx.nn as nn
 import mlx.optimizers as optim
+from mlx.utils import tree_flatten, tree_merge, tree_unflatten
 
 
 ADAMW_FP32_MOMENTS_CLASS = "cppmega_mlx.training.optimizers.AdamWFP32Moments"
 ADAMW_FP32_MOMENTS_SOURCE = "cppmega_mlx.training.optimizers.make_adamw"
 ADAMW_BASE_CLASS = "mlx.optimizers.AdamW"
 ADAMW_MOMENT_STATE_KEYS = ("m", "v")
+
+MUON_BASE_CLASS = "mlx.optimizers.Muon"
+MUON_ADAMW_MULTI_CLASS = "cppmega_mlx.training.optimizers.MuonAdamWMulti"
+MUON_ADAMW_MULTI_SOURCE = "cppmega_mlx.training.optimizers.make_muon"
+
+EMBEDDING_LIKE_NAME_HINTS = ("embed", "embedding", "lm_head", "wte", "wpe")
+MAMBA_SCALAR_LEAVES = frozenset(
+    {
+        "A_log",
+        "dt_bias",
+        "D",
+        "B_bias",
+        "C_bias",
+        "B_norm_weight",
+        "C_norm_weight",
+        "mimo_x",
+        "mimo_z",
+        "mimo_o",
+    }
+)
 
 
 class AdamWFP32Moments(optim.AdamW):
@@ -57,6 +80,253 @@ def make_adamw(
     )
 
 
+class LionFP32Moments(optim.Lion):
+    """Lion with fp32 momentum state for bf16-weight training.
+
+    Lion only carries one momentum buffer per parameter (vs Adam's two), so
+    optimizer state cost is 0.5x AdamW. Param updates are sign-based and
+    quantization-friendly.
+    """
+
+    def init_single(self, parameter: mx.array, state: dict[str, Any]) -> None:
+        state["m"] = mx.zeros(parameter.shape, dtype=mx.float32)
+
+    def apply_single(
+        self,
+        gradient: mx.array,
+        parameter: mx.array,
+        state: dict[str, Any],
+    ) -> mx.array:
+        lr = self.learning_rate.astype(mx.float32)
+        decayed_parameter = parameter.astype(mx.float32) * (1 - lr * self.weight_decay)
+        updated = optim.Lion.apply_single(
+            self,
+            gradient.astype(mx.float32),
+            decayed_parameter,
+            state,
+        )
+        return updated.astype(parameter.dtype)
+
+
+def make_lion(
+    *,
+    learning_rate: float | Callable[[mx.array], mx.array] = 1e-4,
+    weight_decay: float = 0.01,
+    betas: list[float] | None = None,
+) -> LionFP32Moments:
+    """Construct the repo default Lion with fp32 moment for bf16 training.
+
+    Default LR is 3-10x smaller than AdamW because Lion's sign updates do not
+    rescale by gradient magnitude; matches Chen et al. 2302.06675 guidance.
+    """
+
+    return LionFP32Moments(
+        learning_rate=learning_rate,
+        betas=[0.9, 0.99] if betas is None else betas,
+        weight_decay=weight_decay,
+    )
+
+
+def is_muon_compatible(name: str, param: mx.array) -> bool:
+    """Mirror of Megatron's ``_is_nonlinear_or_embedding`` predicate, inverted so
+    that True means the parameter belongs to the Muon group.
+
+    The Muon group keeps only 2-D weight matrices that are not embedding tables,
+    not LM head projections, and not Mamba scalar leaves (``A_log``, ``D``,
+    ``dt_bias`` and friends). Everything else (1-D vectors, 3-D+ tensors,
+    embeddings, lm_head, Mamba scalars, RMSNorm weights) is routed to the AdamW
+    fallback group. This matches ``cppmega.cuda``'s
+    ``_is_nonlinear_or_embedding`` Megatron emerging_optimizers gate.
+    """
+
+    if param.ndim != 2:
+        return False
+    leaf = name.rsplit(".", 1)[-1]
+    if leaf in MAMBA_SCALAR_LEAVES:
+        return False
+    name_lower = name.lower()
+    if any(hint in name_lower for hint in EMBEDDING_LIKE_NAME_HINTS):
+        return False
+    return True
+
+
+def split_param_groups(
+    model_params: Any,
+    *,
+    predicate: Callable[[str, mx.array], bool] = is_muon_compatible,
+) -> tuple[Any, Any]:
+    """Walk a parameter pytree and partition it into ``(muon, other)`` pytrees.
+
+    Each returned pytree contains only the leaves that match its group; the
+    other group's leaves are simply absent (no zero-sized placeholders, which
+    keeps the underlying optimizers from initialising state for the wrong
+    parameters). The two pytrees together cover every leaf in the input
+    pytree exactly once.
+    """
+
+    flat = tree_flatten(model_params)
+    muon_pairs: list[tuple[str, mx.array]] = []
+    other_pairs: list[tuple[str, mx.array]] = []
+    for name, value in flat:
+        if isinstance(value, mx.array) and predicate(name, value):
+            muon_pairs.append((name, value))
+        else:
+            other_pairs.append((name, value))
+    muon_tree = tree_unflatten(muon_pairs) if muon_pairs else {}
+    other_tree = tree_unflatten(other_pairs) if other_pairs else {}
+    return muon_tree, other_tree
+
+
+def _muon_supported_kwargs() -> set[str]:
+    """Return the keyword argument names accepted by ``mlx.optimizers.Muon``.
+
+    Used so we can adapt to whatever subset of knobs the installed MLX exposes
+    instead of fail-closing if a kwarg is missing.
+    """
+
+    try:
+        signature = inspect.signature(optim.Muon.__init__)
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        return set()
+    params = signature.parameters
+    return {name for name in params if name != "self"}
+
+
+class MuonAdamWMulti(optim.Optimizer):
+    """Composite optimizer that delegates 2-D weights to Muon and the rest to
+    AdamW, matching Megatron emerging_optimizers' ``_is_nonlinear_or_embedding``
+    routing.
+
+    The wrapper deliberately does not subclass :class:`mlx.optimizers.MultiOptimizer`
+    because the audit tooling needs a state surface with explicit ``muon`` and
+    ``adamw`` buckets rather than the upstream ``{"states": [...]}`` list.
+    """
+
+    def __init__(
+        self,
+        muon_optimizer: optim.Optimizer,
+        adamw_optimizer: optim.Optimizer,
+        *,
+        predicate: Callable[[str, mx.array], bool] = is_muon_compatible,
+    ) -> None:
+        super().__init__()
+        self._muon = muon_optimizer
+        self._adamw = adamw_optimizer
+        self._predicate = predicate
+
+    @property
+    def muon(self) -> optim.Optimizer:
+        return self._muon
+
+    @property
+    def adamw(self) -> optim.Optimizer:
+        return self._adamw
+
+    @property
+    def predicate(self) -> Callable[[str, mx.array], bool]:
+        return self._predicate
+
+    def _split(self, tree: Any) -> tuple[Any, Any]:
+        return split_param_groups(tree, predicate=self._predicate)
+
+    def init(self, parameters: Any) -> None:
+        muon_params, adamw_params = self._split(parameters)
+        self._muon.init(muon_params)
+        self._adamw.init(adamw_params)
+        self._initialized = True
+
+    def apply_gradients(self, gradients: Any, parameters: Any) -> Any:
+        muon_grads, adamw_grads = self._split(gradients)
+        merged: Any = {}
+        if muon_grads:
+            merged = tree_merge(merged, self._muon.apply_gradients(muon_grads, parameters))
+        if adamw_grads:
+            merged = tree_merge(merged, self._adamw.apply_gradients(adamw_grads, parameters))
+        return merged
+
+    def update(self, model: nn.Module, gradients: Any) -> None:
+        model.update(self.apply_gradients(gradients, model))
+
+    @property
+    def state(self) -> dict[str, Any]:
+        return {"muon": self._muon.state, "adamw": self._adamw.state}
+
+    @state.setter
+    def state(self, state: dict[str, Any]) -> None:
+        if not isinstance(state, dict) or "muon" not in state or "adamw" not in state:
+            raise ValueError(
+                "MuonAdamWMulti state must be a dict with 'muon' and 'adamw' buckets"
+            )
+        self._muon.state = state["muon"]
+        self._adamw.state = state["adamw"]
+
+    @property
+    def learning_rate(self) -> mx.array:
+        return self._muon.learning_rate
+
+    @learning_rate.setter
+    def learning_rate(self, learning_rate: float | mx.array) -> None:
+        self._muon.learning_rate = learning_rate
+        self._adamw.learning_rate = learning_rate
+
+
+def make_muon(
+    *,
+    lr_muon: float = 2e-3,
+    lr_adamw: float = 1e-4,
+    momentum: float = 0.95,
+    nesterov: bool = True,
+    ns_steps: int = 5,
+    betas_adamw: tuple[float, float] = (0.9, 0.95),
+    weight_decay: float = 0.01,
+    eps: float = 1e-8,
+    cppmega_cuda_parity: bool = False,
+) -> MuonAdamWMulti:
+    """Construct a Muon + AdamW chained optimizer with cppmega CUDA-style routing.
+
+    Defaults follow Keller Jordan's reference implementation: Muon at ``lr=2e-3``
+    with ``momentum=0.95`` Nesterov updates and 5 Newton-Schulz steps, AdamW at
+    ``lr=1e-4`` with ``betas=(0.9, 0.95)``. The Muon group covers 2-D linear
+    weights only; the AdamW group catches embeddings, lm_head, RMSNorm scalars,
+    Mamba ``A_log``/``D``/``dt_bias`` leaves, and any 3-D+ tensors — exactly the
+    inversion of Megatron emerging_optimizers' ``_is_nonlinear_or_embedding``.
+
+    When ``cppmega_cuda_parity`` is True, both groups are forced to share
+    ``lr=1e-4`` and ``betas_adamw=(0.9, 0.999)``, which matches the gb10 CUDA
+    runner that takes a single ``--lr 1e-4`` flag and is the parity-trace
+    configuration used by the audit tooling.
+
+    The factory adapts to whatever Muon kwargs the installed MLX exposes via
+    ``inspect.signature``, so we do not fail-close if a future version drops or
+    renames a knob.
+    """
+
+    if cppmega_cuda_parity:
+        lr_muon = 1e-4
+        lr_adamw = 1e-4
+        betas_adamw = (0.9, 0.999)
+
+    muon_kwargs: dict[str, Any] = {"learning_rate": lr_muon}
+    accepted = _muon_supported_kwargs()
+    if "momentum" in accepted:
+        muon_kwargs["momentum"] = momentum
+    if "nesterov" in accepted:
+        muon_kwargs["nesterov"] = nesterov
+    if "ns_steps" in accepted:
+        muon_kwargs["ns_steps"] = ns_steps
+    if "weight_decay" in accepted:
+        muon_kwargs["weight_decay"] = weight_decay
+
+    muon_optimizer = optim.Muon(**muon_kwargs)
+    adamw_optimizer = make_adamw(
+        learning_rate=lr_adamw,
+        weight_decay=weight_decay,
+        betas=list(betas_adamw),
+        eps=eps,
+    )
+    return MuonAdamWMulti(muon_optimizer, adamw_optimizer)
+
+
 def collect_adamw_moment_dtypes(state: Any) -> dict[str, str]:
     moment_dtypes: dict[str, str] = {}
 
@@ -98,8 +368,19 @@ __all__ = [
     "ADAMW_FP32_MOMENTS_SOURCE",
     "ADAMW_MOMENT_STATE_KEYS",
     "AdamWFP32Moments",
+    "EMBEDDING_LIKE_NAME_HINTS",
+    "LionFP32Moments",
+    "MAMBA_SCALAR_LEAVES",
+    "MUON_ADAMW_MULTI_CLASS",
+    "MUON_ADAMW_MULTI_SOURCE",
+    "MUON_BASE_CLASS",
+    "MuonAdamWMulti",
     "adamw_moment_dtypes_ok",
     "collect_adamw_moment_dtypes",
     "dtype_name",
+    "is_muon_compatible",
     "make_adamw",
+    "make_lion",
+    "make_muon",
+    "split_param_groups",
 ]

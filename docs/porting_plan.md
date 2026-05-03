@@ -199,6 +199,7 @@ The current collected test files are:
 - tests/test_model_factory.py
 - tests/test_moe.py
 - tests/test_mtp_loss.py
+- tests/test_muon_group_splitter.py
 - tests/test_nam56r_pattern.py
 - tests/test_ngram_hash.py
 - tests/test_package_exports.py

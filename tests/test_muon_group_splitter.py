@@ -1,0 +1,194 @@
+"""Tests for the Muon + AdamW splitter and ``make_muon`` factory.
+
+These checks pin down the parameter-routing rules that mirror Megatron
+emerging_optimizers' ``_is_nonlinear_or_embedding`` predicate (used by
+cppmega CUDA), so we can keep CUDA <-> MLX parity traces aligned.
+"""
+
+from __future__ import annotations
+
+import math
+
+import mlx.core as mx
+import mlx.nn as nn
+import pytest
+from mlx.utils import tree_flatten
+
+from cppmega_mlx.training.optimizers import (
+    EMBEDDING_LIKE_NAME_HINTS,
+    MAMBA_SCALAR_LEAVES,
+    MuonAdamWMulti,
+    is_muon_compatible,
+    make_muon,
+    split_param_groups,
+)
+
+
+def _flatten_keys(tree: object) -> set[str]:
+    return {key for key, _ in tree_flatten(tree)}
+
+
+def test_is_muon_compatible_classifies_2d_linear_as_muon() -> None:
+    weight = mx.zeros((8, 4))
+    assert is_muon_compatible("layers.0.linear.weight", weight) is True
+
+
+def test_is_muon_compatible_classifies_embedding_as_adamw() -> None:
+    weight = mx.zeros((50257, 768))
+    for hint in ("token_embedding.weight", "embed.weight", "wte.weight", "wpe.weight"):
+        assert is_muon_compatible(hint, weight) is False, hint
+
+
+def test_is_muon_compatible_classifies_lm_head_as_adamw() -> None:
+    weight = mx.zeros((768, 50257))
+    assert is_muon_compatible("lm_head.weight", weight) is False
+
+
+def test_is_muon_compatible_classifies_mamba_scalars_as_adamw() -> None:
+    # 1-D Mamba scalars hit the ndim != 2 short-circuit, but the leaf-name
+    # check also has to keep them out of the Muon group. We exercise both.
+    a_log = mx.zeros((16,))
+    assert is_muon_compatible("layers.0.mamba.A_log", a_log) is False
+
+    # If a Mamba scalar were ever 2-D the leaf-name guard would still keep it
+    # in the AdamW bucket, so confirm that path explicitly.
+    a_log_2d = mx.zeros((4, 4))
+    assert is_muon_compatible("layers.0.mamba.A_log", a_log_2d) is False
+    assert is_muon_compatible("layers.0.mamba.D", a_log_2d) is False
+    assert is_muon_compatible("layers.0.mamba.dt_bias", a_log_2d) is False
+
+
+def test_is_muon_compatible_classifies_norm_weights_as_adamw() -> None:
+    rmsnorm_weight = mx.zeros((128,))
+    for name in (
+        "layers.0.norm.weight",
+        "norm_final.weight",
+        "block.attn.norm.weight",
+    ):
+        assert is_muon_compatible(name, rmsnorm_weight) is False, name
+
+
+def test_is_muon_compatible_rejects_3d_tensors() -> None:
+    # 3-D+ tensors (e.g. fused QKV, conv-style weights) belong to AdamW
+    # because Muon's Newton-Schulz orthogonalisation only handles 2-D.
+    big = mx.zeros((4, 4, 4))
+    assert is_muon_compatible("block.fused_qkv.weight", big) is False
+
+
+class _SplitterModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.linear = nn.Linear(4, 8, bias=True)
+        self.embedding = nn.Embedding(10, 4)
+        self.lm_head = nn.Linear(8, 10, bias=False)
+        # 1-D RMSNorm-shaped weight that sits at the model root
+        self.norm_weight = mx.ones((8,))
+
+    def __call__(self, ids: mx.array, x: mx.array) -> mx.array:  # pragma: no cover - shape only
+        emb = self.embedding(ids)
+        return self.lm_head(self.linear(emb + x))
+
+
+def test_split_param_groups_partitions_pytree_correctly() -> None:
+    model = _SplitterModel()
+    params = model.trainable_parameters()
+    muon_tree, adamw_tree = split_param_groups(params)
+
+    all_keys = _flatten_keys(params)
+    muon_keys = _flatten_keys(muon_tree)
+    adamw_keys = _flatten_keys(adamw_tree)
+
+    # Each leaf must end up in exactly one group.
+    assert muon_keys.isdisjoint(adamw_keys)
+    assert muon_keys | adamw_keys == all_keys
+
+    # Spot-check the routing matches Megatron emerging_optimizers' rule.
+    assert "linear.weight" in muon_keys  # 2-D nonlinear weight -> Muon
+    assert "linear.bias" in adamw_keys  # 1-D bias -> AdamW
+    assert "embedding.weight" in adamw_keys  # name hint forces AdamW
+    assert "lm_head.weight" in adamw_keys  # name hint forces AdamW
+    assert "norm_weight" in adamw_keys  # 1-D RMSNorm scalar -> AdamW
+
+
+def test_split_param_groups_handles_empty_groups() -> None:
+    # AdamW-only model: no 2-D non-embedding weights at all.
+    only_scalars = {"norm.weight": mx.ones((4,))}
+    muon_tree, adamw_tree = split_param_groups(only_scalars)
+    assert muon_tree == {}
+    assert _flatten_keys(adamw_tree) == {"norm.weight"}
+
+
+def test_make_muon_init_runs_and_state_has_both_buckets() -> None:
+    model = _SplitterModel()
+    optimizer = make_muon()
+    optimizer.init(model.trainable_parameters())
+
+    state = optimizer.state
+    assert set(state.keys()) == {"muon", "adamw"}
+    # Each bucket must carry the standard optimizer scaffolding plus at least
+    # one routed parameter, otherwise the audit tooling will treat the bucket
+    # as missing and reject the trace.
+    assert "step" in state["muon"]
+    assert "step" in state["adamw"]
+    assert "linear" in state["muon"]  # 2-D weight ended up in Muon bucket
+    assert "embedding" in state["adamw"]  # embedding ended up in AdamW bucket
+    assert "lm_head" in state["adamw"]
+
+
+def test_make_muon_update_step_completes_without_error() -> None:
+    model = _SplitterModel()
+    optimizer = make_muon()
+    optimizer.init(model.trainable_parameters())
+
+    before = {key: mx.array(value) for key, value in tree_flatten(model.trainable_parameters())}
+
+    ids = mx.array([[0, 1, 2, 3]])
+    x = mx.zeros((1, 4, 4))
+
+    def loss_fn(m: nn.Module, ids: mx.array, x: mx.array) -> mx.array:
+        return m(ids, x).sum()
+
+    loss_and_grad = nn.value_and_grad(model, loss_fn)
+    loss, grads = loss_and_grad(model, ids, x)
+    optimizer.update(model, grads)
+    mx.eval(model.parameters(), optimizer.state, loss)
+
+    after = dict(tree_flatten(model.trainable_parameters()))
+    assert math.isfinite(float(loss.item()))
+    # All parameters that received a gradient should have moved.
+    grad_keys = {key for key, _ in tree_flatten(grads)}
+    for key in grad_keys:
+        before_arr = before[key]
+        after_arr = after[key]
+        delta = mx.max(mx.abs(after_arr - before_arr)).item()
+        assert delta > 0.0, f"parameter {key!r} did not change after update"
+
+
+def test_make_muon_cppmega_cuda_parity_forces_shared_lr() -> None:
+    optimizer = make_muon(cppmega_cuda_parity=True)
+    expected = pytest.approx(1e-4, rel=1e-4)
+    assert float(optimizer.muon.learning_rate) == expected
+    assert float(optimizer.adamw.learning_rate) == expected
+    # Parity mode also pins AdamW's betas to the cppmega CUDA defaults.
+    assert list(optimizer.adamw.betas) == [0.9, 0.999]
+
+
+def test_make_muon_default_lrs_match_keller_recipe() -> None:
+    optimizer = make_muon()
+    assert float(optimizer.muon.learning_rate) == pytest.approx(2e-3, rel=1e-4)
+    assert float(optimizer.adamw.learning_rate) == pytest.approx(1e-4, rel=1e-4)
+
+
+def test_make_muon_returns_muon_adamw_multi() -> None:
+    optimizer = make_muon()
+    assert isinstance(optimizer, MuonAdamWMulti)
+
+
+def test_embedding_and_mamba_constants_are_immutable() -> None:
+    # Sanity: the gates that drive routing are documented constants that the
+    # audit tool inspects, so they need to stay frozen tuples/sets.
+    assert isinstance(EMBEDDING_LIKE_NAME_HINTS, tuple)
+    assert isinstance(MAMBA_SCALAR_LEAVES, frozenset)
+    # A few canonical leaf names that cppmega CUDA's predicate also pins down.
+    for leaf in ("A_log", "D", "dt_bias", "B_bias", "C_bias", "mimo_x"):
+        assert leaf in MAMBA_SCALAR_LEAVES
