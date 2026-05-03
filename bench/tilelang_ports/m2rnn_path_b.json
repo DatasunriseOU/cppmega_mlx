@@ -1,0 +1,155 @@
+{
+  "schema_version": 1,
+  "scope": "local_only",
+  "kernel": "m2rnn_path_b",
+  "hardware_label": "Davids-Mac-Studio.local",
+  "platform": {
+    "system": "Darwin",
+    "machine": "arm64",
+    "python_version": "3.13.12",
+    "mlx_version": "0.31.1"
+  },
+  "metal_status": {
+    "available": true,
+    "reason": "MSL dispatch path is available"
+  },
+  "shapes": [
+    {
+      "shape": {
+        "batch": 2,
+        "seq": 512,
+        "heads": 4,
+        "k_dim": 64,
+        "v_dim": 16,
+        "dtype": "float16"
+      },
+      "parity": {
+        "y_max_abs": 0.389892578125,
+        "y_ref_norm": 105.73022680092481,
+        "h_max_abs": 1.5703125,
+        "h_ref_norm": 49.73440199889308,
+        "y_rel": 0.0036876169655732354,
+        "h_rel": 0.031573969664597926
+      },
+      "timings": {
+        "fwd_reference": {
+          "label": "fwd_reference",
+          "mean_ms": 48.74301658477634,
+          "median_ms": 46.89199954736978,
+          "min_ms": 13.668666128069162,
+          "max_ms": 99.89720792509615,
+          "iters": 50,
+          "warmup": 5
+        },
+        "fwd_metal": {
+          "label": "fwd_metal",
+          "mean_ms": 2.824378381483257,
+          "median_ms": 2.904604538343847,
+          "min_ms": 2.032791031524539,
+          "max_ms": 4.156125010922551,
+          "iters": 50,
+          "warmup": 5
+        },
+        "fwd_bwd_reference": {
+          "label": "fwd_bwd_reference",
+          "mean_ms": 186.4197759050876,
+          "median_ms": 170.1187085127458,
+          "min_ms": 68.81175003945827,
+          "max_ms": 571.0861249826849,
+          "iters": 50,
+          "warmup": 5
+        },
+        "fwd_bwd_metal": {
+          "label": "fwd_bwd_metal",
+          "mean_ms": 16.612812466919422,
+          "median_ms": 12.928749434649944,
+          "min_ms": 7.8518749214708805,
+          "max_ms": 85.25191619992256,
+          "iters": 50,
+          "warmup": 5
+        }
+      },
+      "peak_memory_mb": {
+        "fwd_reference": 26.667407989501953,
+        "fwd_metal": 17.572280883789062,
+        "fwd_bwd_reference": 465.6676826477051,
+        "fwd_bwd_metal": 35.242462158203125
+      },
+      "speedups": {
+        "fwd_median": 16.144021992786236,
+        "fwd_bwd_median": 13.1581719773156
+      },
+      "gflops_fwd_est": 0.301989888,
+      "gflops_per_sec_fwd_metal": 103.96936450846049
+    },
+    {
+      "shape": {
+        "batch": 2,
+        "seq": 2048,
+        "heads": 8,
+        "k_dim": 64,
+        "v_dim": 32,
+        "dtype": "float16"
+      },
+      "parity": {
+        "y_max_abs": 2.27099609375,
+        "y_ref_norm": 492.7822636570842,
+        "h_max_abs": 1.65283203125,
+        "h_ref_norm": 110.12163906619352,
+        "y_rel": 0.004608518327945198,
+        "h_rel": 0.015009148476771915
+      },
+      "timings": {
+        "fwd_reference": {
+          "label": "fwd_reference",
+          "mean_ms": 146.86903255525976,
+          "median_ms": 113.15154191106558,
+          "min_ms": 63.79266595467925,
+          "max_ms": 353.78783382475376,
+          "iters": 50,
+          "warmup": 5
+        },
+        "fwd_metal": {
+          "label": "fwd_metal",
+          "mean_ms": 26.5186450118199,
+          "median_ms": 25.987291475757957,
+          "min_ms": 20.215624943375587,
+          "max_ms": 41.83133412152529,
+          "iters": 50,
+          "warmup": 5
+        },
+        "fwd_bwd_reference": {
+          "label": "fwd_bwd_reference",
+          "mean_ms": 3533.469589916058,
+          "median_ms": 3441.2225204287097,
+          "min_ms": 2818.252708064392,
+          "max_ms": 4574.155749985948,
+          "iters": 50,
+          "warmup": 5
+        },
+        "fwd_bwd_metal": {
+          "label": "fwd_bwd_metal",
+          "mean_ms": 136.40409165993333,
+          "median_ms": 132.49860343057662,
+          "min_ms": 109.40637486055493,
+          "max_ms": 231.10737511888146,
+          "iters": 50,
+          "warmup": 5
+        }
+      },
+      "peak_memory_mb": {
+        "fwd_reference": 403.2682361602783,
+        "fwd_metal": 272.32814025878906,
+        "fwd_bwd_reference": 3012.5129165649414,
+        "fwd_bwd_metal": 546.5627746582031
+      },
+      "speedups": {
+        "fwd_median": 4.354110624287957,
+        "fwd_bwd_median": 25.971764466421394
+      },
+      "gflops_fwd_est": 9.126805504,
+      "gflops_per_sec_fwd_metal": 351.2026450510962
+    }
+  ],
+  "matched_run_guard": "Compare M4 Max and GB10 only when both rows were collected with identical kernel inputs and dtype. This is a local_only receipt."
+}
