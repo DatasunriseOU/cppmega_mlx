@@ -764,7 +764,7 @@ def _scatter_along_axis(buffer: mx.array, value: mx.array, index: int, *, axis: 
     """
 
     idx = mx.arange(buffer.shape[axis])
-    mask = (idx == index).astype(buffer.dtype)
+    mask = mx.equal(idx, index).astype(buffer.dtype)
     mask_shape = [1] * buffer.ndim
     mask_shape[axis] = buffer.shape[axis]
     mask = mask.reshape(mask_shape)

@@ -1,10 +1,12 @@
 # TileLang Metal FP8 GEMM — software dequant-and-multiply path
 
-Status: shipped. `T.gemm(fp8_A, fp8_B, fp32_C)` lowers cleanly on the Metal
-target and emits MSL that compiles with `xcrun metal -c`. The patch is a
-pure-Python dispatcher change that builds on the storage-only FP8 codegen
-patch (`docs/upstream/tilelang_metal_fp8/`) and the Metal scalar-gemm
-fallback (PR #2118).
+Status: local-branch receipt recorded, but patch packaging needs regeneration.
+The intended change makes `T.gemm(fp8_A, fp8_B, fp32_C)` lower cleanly on the
+Metal target and emit MSL that compiles with `xcrun metal -c`. However, the
+stored `0001-metal-fp8-gemm-software-path.patch` currently fails
+`git apply --check` on clean `apple-head@7f4a5cb8`, both standalone and after
+the documented `mixed_dtype` + storage-only FP8 prereqs. Do not file this
+artifact as-is; regenerate it from the TileLang branch first.
 
 ## Blocker
 
@@ -198,7 +200,7 @@ correctness path established here is the foundation.
 
 ## Upstream PR readiness
 
-This is a clean Python-only patch on top of:
+This is an intended Python-only change on top of:
 - PR #2118 ("Metal scalar fallback for T.gemm")
 - `docs/upstream/tilelang_metal_fp8/0001-metal-fp8-storage-only.patch`
   (the codegen FP8 prelude / cast-node patch)
@@ -206,15 +208,33 @@ This is a clean Python-only patch on top of:
   (the mixed-dtype dispatcher patch — its `_has_mixed_input_dtype`
   helper served as the template for `_has_fp8_input_dtype`)
 
-For an upstream PR against `tile-ai/tilelang:main`, the patch should
-apply unchanged once the storage-only FP8 codegen patch is upstreamed
-(the dispatcher change itself doesn't depend on that — it just routes
-around the codegen rejection).
+Packaging blocker: as of the 2026-05-03 audit, the stored patch does not apply
+on clean `apple-head@7f4a5cb8`, and it still does not apply after first applying
+`tilelang_gemm_mixed_dtype` and `tilelang_metal_fp8`. The failing hunks are in
+`tilelang/tileop/gemm/__init__.py` and
+`tilelang/transform/metal_fragment_to_simdgroup.py`. Re-export from the local
+TileLang branch before opening an upstream PR. For `tile-ai/tilelang:main`,
+also expect public-main drift until the Metal branch files and PR #2118 stack
+are reconciled.
 
 ## Files
 
 - `0001-metal-fp8-gemm-software-path.patch` — the dispatcher patch
 - `README.md` — this document
+
+## How to apply
+
+Apply after the storage-only FP8 codegen patch:
+
+```bash
+cd /tmp/tilelang_apple_head/tilelang
+git apply /Volumes/external/sources/cppmega.mlx/docs/upstream/tilelang_metal_fp8/0001-metal-fp8-storage-only.patch
+git apply /Volumes/external/sources/cppmega.mlx/docs/upstream/tilelang_metal_fp8_gemm/0001-metal-fp8-gemm-software-path.patch
+```
+
+Expected current result for the second command is failure. Treat the command
+block above as the intended replay sequence after patch regeneration, not as a
+passing receipt for the artifact currently checked into this directory.
 
 ## Attribution
 

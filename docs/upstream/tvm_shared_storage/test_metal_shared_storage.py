@@ -25,12 +25,37 @@ from __future__ import annotations
 import os
 import sys
 
-import numpy as np
+import pytest
 
-import tvm
-import tvm.testing
-from tvm.script import ir as I
-from tvm.script import tirx as T
+try:
+    import numpy as np
+except ImportError as exc:
+    np = None
+    _NUMPY_IMPORT_ERROR = exc
+else:
+    _NUMPY_IMPORT_ERROR = None
+
+try:
+    import tvm
+except ImportError as exc:
+    tvm = None
+    _TVM_IMPORT_ERROR = exc
+else:
+    _TVM_IMPORT_ERROR = None
+
+if tvm is not None:
+    from tvm.script import ir as I
+    try:
+        from tvm.script import tirx as T
+    except ImportError as exc:
+        T = None
+        _TIRX_IMPORT_ERROR = exc
+    else:
+        _TIRX_IMPORT_ERROR = None
+else:
+    I = None
+    T = None
+    _TIRX_IMPORT_ERROR = _TVM_IMPORT_ERROR
 
 
 def _expected_mode() -> str:
@@ -38,6 +63,26 @@ def _expected_mode() -> str:
     if raw in {"shared", "managed", "private"}:
         return raw
     return "private"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, "private"),
+        ("", "private"),
+        ("shared", "shared"),
+        ("Shared", "shared"),
+        ("managed", "managed"),
+        ("private", "private"),
+        ("invalid", "private"),
+    ],
+)
+def test_expected_mode_matches_runtime_parser_contract(monkeypatch, raw: str | None, expected: str) -> None:
+    if raw is None:
+        monkeypatch.delenv("TVM_METAL_STORAGE_MODE", raising=False)
+    else:
+        monkeypatch.setenv("TVM_METAL_STORAGE_MODE", raw)
+    assert _expected_mode() == expected
 
 
 def _check_storage_mode_ffi() -> str:
@@ -82,7 +127,30 @@ def _check_kernel_round_trip(dev) -> None:
     np.testing.assert_allclose(c.asnumpy(), a_np + b_np, rtol=1e-5, atol=1e-6)
 
 
+def test_tvm_metal_storage_mode_env_matches_ffi_and_kernel_round_trips() -> None:
+    if np is None:
+        pytest.skip(f"requires NumPy: {_NUMPY_IMPORT_ERROR}")
+    if tvm is None:
+        pytest.skip(f"requires Apache TVM: {_TVM_IMPORT_ERROR}")
+    if T is None:
+        pytest.skip(f"requires apache TVM with tvm.script.tirx: {_TIRX_IMPORT_ERROR}")
+    if not tvm.metal(0).exist:
+        pytest.skip("Metal device unavailable on this host")
+    mode = _check_storage_mode_ffi()
+    assert mode == _expected_mode()
+    _check_kernel_round_trip(tvm.metal(0))
+
+
 def main() -> int:
+    if np is None:
+        print(f"NumPy unavailable, skipping: {_NUMPY_IMPORT_ERROR}")
+        return 0
+    if tvm is None:
+        print(f"Apache TVM unavailable, skipping: {_TVM_IMPORT_ERROR}")
+        return 0
+    if T is None:
+        print(f"Apache TVM tirx API unavailable, skipping: {_TIRX_IMPORT_ERROR}")
+        return 0
     if not tvm.metal(0).exist:
         print("Metal device unavailable on this host, skipping.")
         return 0

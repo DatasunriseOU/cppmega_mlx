@@ -17,8 +17,12 @@ from cppmega_mlx.training.compiled import (
     CompiledPretrainingStep,
     PretrainingMetrics,
     PretrainingState,
+    REGIONAL_COMPILE_TARGETS,
     STABLE_BATCH_KEYS,
+    maybe_compile_region,
     normalize_compiled_batch,
+    regional_compile,
+    should_compile_region,
 )
 
 
@@ -91,6 +95,76 @@ def _assert_params_allclose(
     assert actual_params.keys() == expected_params.keys()
     for name, expected_value in expected_params.items():
         np.testing.assert_allclose(actual_params[name], expected_value, rtol=0, atol=atol)
+
+
+def test_regional_compile_policy_matches_cppmega_receipt() -> None:
+    assert REGIONAL_COMPILE_TARGETS == {
+        "mamba3_pre": True,
+        "data_dep_a": True,
+        "rmsnorm": False,
+        "rmsnorm_gated": False,
+        "moe_router": False,
+    }
+    assert should_compile_region("data_dep_a") is True
+    assert should_compile_region("mamba3_pre") is True
+    assert should_compile_region("rmsnorm") is False
+    assert should_compile_region("rmsnorm_gated") is False
+    assert should_compile_region("moe_router") is False
+
+
+def test_regional_compile_rejects_unknown_targets_fail_closed() -> None:
+    bad_target: Any = "attention"
+
+    with pytest.raises(ValueError, match="unknown regional compile target"):
+        should_compile_region(bad_target)
+    with pytest.raises(ValueError, match="unknown regional compile target"):
+        regional_compile(bad_target, lambda x: x)
+
+
+def test_regional_compile_allowed_target_calls_mx_compile(monkeypatch: Any) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_compile(fn: Any, **kwargs: Any) -> Any:
+        calls.append({"fn": fn, "kwargs": kwargs})
+
+        def wrapper(x: mx.array) -> mx.array:
+            return fn(x) + 1
+
+        return wrapper
+
+    monkeypatch.setattr("cppmega_mlx.training.compiled.mx.compile", fake_compile)
+
+    @regional_compile("data_dep_a", shapeless=True)
+    def add_two(x: mx.array) -> mx.array:
+        return x + 2
+
+    result = add_two(mx.array(3))
+
+    assert len(calls) == 1
+    assert calls[0]["kwargs"] == {"shapeless": True}
+    assert int(result.item()) == 6
+
+
+def test_regional_compile_denied_target_returns_original_function(
+    monkeypatch: Any,
+) -> None:
+    calls: list[Any] = []
+
+    def fake_compile(fn: Any, **kwargs: Any) -> Any:
+        calls.append((fn, kwargs))
+        return fn
+
+    monkeypatch.setattr("cppmega_mlx.training.compiled.mx.compile", fake_compile)
+
+    def rmsnorm_like(x: mx.array) -> mx.array:
+        return x * 2
+
+    maybe_compiled = maybe_compile_region("rmsnorm", rmsnorm_like, shapeless=True)
+    result = maybe_compiled(mx.array(3))
+
+    assert maybe_compiled is rmsnorm_like
+    assert calls == []
+    assert int(result.item()) == 6
 
 
 def test_compiled_pretraining_step_updates_tiny_lm_and_state() -> None:

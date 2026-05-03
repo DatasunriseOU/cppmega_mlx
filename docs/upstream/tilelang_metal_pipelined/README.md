@@ -80,18 +80,77 @@ metal.simdgroup buffers earlier (T.copy fallback to `simdgroup_store`) or
 handle vectorised simdgroup access via lane shuffle. That work is out of scope
 for this patch.
 
+## Performance / profiling
+
+This patch changes Python-side Metal macro indexing only. It threads the
+software-pipeline version index into `T.access_ptr`; it does not add an extra
+runtime MSL operation beyond the double / triple buffering already requested by
+`T.Pipelined(..., num_stages=N)`.
+
+`test_pipelined_probe.py` now prints deterministic generated-source metrics and
+asserts the key buffer sizes and simdgroup operation counts under pytest. On the
+Apple-head Metal checkout used for this artifact:
+
+| Kernel | Source lines | Source bytes | Threadgroup buffers | simdgroup_load | simdgroup_multiply_accumulate | simdgroup_store |
+|---|---:|---:|---|---:|---:|---:|
+| `k_pipe_2` | 56 | 3065 | `A_shared[1024]`, `B_shared[1024]` | 4 | 2 | 2 |
+| `k_pipe_3` | 69 | 3942 | `A_shared[1536]`, `B_shared[1536]` | 6 | 3 | 2 |
+| `k_attn` | 55 | 2758 | `K_shared[512]`, `Q_shared[256]` | 4 | 2 | 2 |
+
+Generated MSL also compiles with:
+
+    xcrun --sdk macosx metal -c <generated>.metal -o <generated>.air
+
+A Torch/MPS launch smoke using `tilelang.compile(..., execution_backend="torch",
+target="metal")` completed for `k_pipe_2`, `k_pipe_3`, and `k_attn`, but this is
+not yet a PR-grade latency benchmark: the current Metal adapter logs a
+non-fatal cache-save error (`MetalKernelAdapter` has no `libpath`). Keep runtime
+latency checks manual until that adapter noise is fixed.
+
+Manual lowering timing is available without making pytest flaky:
+
+    TILELANG_PIPELINED_PROFILE=1 .venv/bin/python docs/upstream/tilelang_metal_pipelined/test_pipelined_probe.py
+
+Manual Torch/MPS launch timing is also available and disables the TileLang disk
+cache path to avoid the current Metal `libpath` cache-save noise:
+
+    TILELANG_PIPELINED_RUNTIME_PROFILE=1 TILELANG_PIPELINED_RUNTIME_REPS=50 .venv/bin/python docs/upstream/tilelang_metal_pipelined/test_pipelined_probe.py
+
+On the local MPS smoke run (`reps=50`, `warmups=10`, `rounds=3`), the observed
+`tilelang.compile` wall times were about `257 ms`, `249 ms`, and `132 ms` for
+`k_pipe_2`, `k_pipe_3`, and `k_attn`; launch medians were about `0.010 ms`,
+`0.015 ms`, and `0.008 ms`. Treat those numbers as a local health check only,
+not an upstream latency threshold.
+
+Backed by the generated MSL, the only clear kernel-level tuning opportunity is
+to choose `num_stages` deliberately: shared-memory use grows linearly with the
+requested stage count (`1024` -> `1536` half elements per GEMM operand from
+2-stage to 3-stage), while the generated MMA count grows with the loop body that
+is already present. For the attention-shaped probe, only `K_shared` is
+double-buffered and `Q_shared` stays single-loaded (`Q_shared[256]`), which is
+the right source pattern for reusing Q across the K loop. No redundant
+`simdgroup_multiply_accumulate` or `simdgroup_store` operations were introduced
+by the 3D-buffer indexing fix.
+
 ## Apply
 
-Cherry-pick onto `tilelang` checkout:
+Cherry-pick onto the Apple-head / Metal-dev `tilelang` checkout that still has
+`tilelang/intrinsics/metal_macro_generator.py`:
 
     cd /tmp/tilelang_apple_head/tilelang
-    git apply ../docs/upstream/tilelang_metal_pipelined/0001-metal-pipeline-3d-buffer.patch
+    git apply /Volumes/external/sources/cppmega.mlx/docs/upstream/tilelang_metal_pipelined/0001-metal-pipeline-3d-buffer.patch
 
 The change is Python-only — no rebuild required.
 
+Public-main drift note: a fresh `tile-ai/tilelang` main checkout at `2eec5f0`
+does not contain `tilelang/intrinsics/metal_macro_generator.py`, so this
+artifact does not apply there as-is (`git apply --check` reports
+`No such file or directory`). Refresh the patch against the branch that owns the
+Metal macro emitter before opening a public upstream PR.
+
 ## Upstream-PR readiness
 
-Ready. The fix:
+Ready on the Apple-head / Metal-dev branch. The fix:
 
 * Mirrors the existing CUDA implementation pattern (1:1 with
   `mma_macro_generator.py`).

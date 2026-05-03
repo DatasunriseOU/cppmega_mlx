@@ -22,17 +22,20 @@ Documents three regimes:
 """
 from __future__ import annotations
 
-import tilelang
+import pytest
+
+pytest.importorskip("tilelang")
+
 import tilelang.language as T
 from tilelang import tvm as tvm_inner
 from tilelang.engine.lower import lower
 
-target = tvm_inner.target.Target("metal")
+TARGET = tvm_inner.target.Target("metal")
 
 
 def try_lower(name, func):
     try:
-        result = lower(func, target=target)
+        result = lower(func, target=TARGET)
         return (name, "OK", result.kernel_source)
     except Exception as exc:
         return (name, "FAILED", f"{type(exc).__name__}: {str(exc)[:200]}")
@@ -98,6 +101,26 @@ def main():
         else:
             note = payload[:60]
         print(f"{n:<40} {status:<10} {note:<30}")
+
+
+@pytest.mark.parametrize(
+    ("name", "kernel"),
+    [
+        ("static_size_dyn", static_size_dyn),
+        ("merged_dyn", merged_dyn),
+    ],
+)
+def test_const_extent_shared_dyn_lowers_to_threadgroup(name, kernel) -> None:
+    _, status, payload = try_lower(name, kernel)
+    assert status == "OK", payload
+    assert "threadgroup" in payload
+    assert "buf_dyn_shmem" in payload
+
+
+@pytest.mark.xfail(reason="symbolic shared.dyn extent is a documented Metal codegen limitation")
+def test_symbolic_extent_shared_dyn_lowers_when_runtime_dyn_shmem_is_implemented() -> None:
+    _, status, payload = try_lower("symbolic_dyn", symbolic_dyn)
+    assert status == "OK", payload
 
 
 if __name__ == "__main__":

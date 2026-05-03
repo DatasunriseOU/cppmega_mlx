@@ -281,6 +281,24 @@ entries; nothing here adopts a custom kernel into the training path. All adoptio
 gated by the Stream B steps 27–29 contract: profiling evidence, pure-MLX fallback, parity
 tests, and `@mx.custom_function` VJP/JVP coverage.
 
+#### Stream B addendum — Regional compile allow/deny matrix (2026-05-03)
+
+Source receipt: `cppmega/docs/optimization_session_2026_04_13.md` §1.7 measured
+per-region CUDA compile behavior and found small normalization/router regions were
+slowdowns (`RMSNorm 0.41×`, `RMSNormGated 0.47×`, `MoE Router 0.97×`) while the
+larger data-dependent regions were wins (`DataDep-A 5.93×`, `mamba3-pre 2.66×`).
+`cppmega_mlx/training/compiled.py` now codifies this as the typed
+`REGIONAL_COMPILE_TARGETS` registry plus fail-closed decorator helpers, so call
+sites opt into regional compile only for known allow-listed targets.
+
+Local Apple Silicon receipt: `bench/baselines/uy5_regional_compile_m4.json`
+records one DO and one DON'T case on the local M4 Max. Cached `mx.compile` for
+`data_dep_a` was `1.13×` faster by median time on the measured shape, while the
+`rmsnorm` path verified that `maybe_compile_region("rmsnorm", ...)` returns the
+original function without calling `mx.compile`. This is a local pattern receipt
+only; it is not GB10 parity evidence and must not be reported as a cross-host
+throughput claim.
+
 ### Stream C — Model Architecture & Blocks (41–60)
 
 41. Refactor `attention.py` to support GQA explicitly: `kv_repeat = num_q_heads // num_kv_heads` in QKV projection; assert configs.
@@ -518,7 +536,7 @@ Audit of cppmega CUDA docs surfaced 6 tested-and-adopted optimizations not yet i
 160d. **Quantized Muon momentum** (int8 + 256-block absmax). Half memory on Muon momentum buffer. Hardware-independent. cppmega.mlx `MuonAdamWMulti` currently holds full bf16 momentum. Source: `cppmega/docs/quantized_muon_momentum.md`. Bead: `cppmega-mlx-s43` (P2).
 160e. **M2RNN sparse fp32 recurrent checkpoints + chunk-recompute backward** (chunk=64). Receipt: 1.375 GiB → 89.38 MiB on NAM56R-quarter shape (15.4× reduction). Apply to `cppmega_mlx/nn/m2rnn.py`. Source: `cppmega/docs/gb10_local_memory_perf_2026_04_25.md`. Bead: `cppmega-mlx-z4x` (P2).
 160f. **M2RNN broadcast-view (stride-0 expand)** for 1→H head broadcast. Receipt: fwd −17.7%, peak −44.9%. Replace materialized broadcasts with `mx.broadcast_to` views (zero-copy). Source: `cppmega/docs/status/m2rnn_broadcast_views_2026_04_30.md`. Bead: `cppmega-mlx-2s7` (P2).
-160g. **Regional compile allow/deny matrix.** Codify cppmega's per-op compile speedups into `cppmega_mlx/training/compiled.py`: `RMSNorm 0.41×`, `RMSNormGated 0.47×`, `MoE Router 0.97×` (DO NOT compile); `DataDep-A 5.93×`, `mamba3-pre 2.66×` (DO compile). Source: `cppmega/docs/optimization_session_2026_04_13.md` §1.7. Bead: `cppmega-mlx-uy5` (P2).
+160g. **Regional compile allow/deny matrix.** Codify cppmega's per-op compile speedups into `cppmega_mlx/training/compiled.py`: `RMSNorm 0.41×`, `RMSNormGated 0.47×`, `MoE Router 0.97×` (DO NOT compile); `DataDep-A 5.93×`, `mamba3-pre 2.66×` (DO compile). Source: `cppmega/docs/optimization_session_2026_04_13.md` §1.7. **Local MLX receipt landed**: `bench/baselines/uy5_regional_compile_m4.json` records M4 Max pattern-only evidence (`data_dep_a` cached compile `1.13×` median faster; `rmsnorm` deny path returns the original function). Bead: `cppmega-mlx-uy5` (P2, closure-ready after focused tests).
 160h. **20-step BF16-vs-X acceptance harness** (wave44a). Typed plan/run/compare contract with explicit non-acceptance counters as a precision-regression gate; adapt via `scripts/compare_bench_rows.py`. Source: `cppmega/docs/status/wave44a_mxfp8_acceptance_harness.md`. Bead: `cppmega-mlx-5r7` (P2).
 160i. **Liger FLCE `reduction='none'` silent-corruption guard test** for our shipped `cppmega_mlx/training/cut_cross_entropy.py`. Liger backward reads only `grad_output[0]` as scalar — relevant gotcha for chunked CE patterns. Source: `cppmega/docs/findings_2026_04_14_session.md` §1. Bead: `cppmega-mlx-z3o` (P3).
 

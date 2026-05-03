@@ -11,7 +11,7 @@ from __future__ import annotations
 import time
 from dataclasses import asdict, dataclass
 from functools import partial
-from typing import Any, Callable, Mapping, cast
+from typing import Any, Callable, Literal, Mapping, TypeVar, cast
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -27,6 +27,22 @@ LossFn = Callable[
     [nn.Module, LMTokenBatch | Mapping[str, mx.array] | mx.array],
     tuple[mx.array, mx.array],
 ]
+CompileTarget = Literal[
+    "mamba3_pre",
+    "data_dep_a",
+    "rmsnorm",
+    "rmsnorm_gated",
+    "moe_router",
+]
+F = TypeVar("F", bound=Callable[..., Any])
+
+REGIONAL_COMPILE_TARGETS: Mapping[CompileTarget, bool] = {
+    "mamba3_pre": True,
+    "data_dep_a": True,
+    "rmsnorm": False,
+    "rmsnorm_gated": False,
+    "moe_router": False,
+}
 
 STABLE_BATCH_KEYS = (
     "tokens",
@@ -40,6 +56,49 @@ STABLE_BATCH_KEYS = (
 
 CompiledBatch = dict[str, mx.array | None]
 CompiledBatchSignature = tuple[tuple[str, tuple[int, ...] | None, str | None], ...]
+
+
+def should_compile_region(target: CompileTarget) -> bool:
+    """Return the fail-closed regional compile decision for a known target."""
+
+    try:
+        return REGIONAL_COMPILE_TARGETS[target]
+    except KeyError as exc:
+        raise ValueError(f"unknown regional compile target: {target!r}") from exc
+
+
+def regional_compile(
+    target: CompileTarget,
+    fn: F | None = None,
+    **compile_kwargs: Any,
+) -> F | Callable[[F], F]:
+    """Compile only regions that cppmega benchmarks allow.
+
+    This is deliberately separate from CompiledPretrainingStep's full-step
+    compile path.  It codifies the measured per-op allow/deny matrix so local
+    call sites do not blanket-compile small regions that are known slowdowns.
+    """
+
+    def decorate(inner: F) -> F:
+        if not should_compile_region(target):
+            return inner
+        compiled = mx.compile(inner, **compile_kwargs)
+        return cast(F, compiled)
+
+    if fn is None:
+        return decorate
+    return decorate(fn)
+
+
+def maybe_compile_region(
+    target: CompileTarget,
+    fn: F,
+    **compile_kwargs: Any,
+) -> F:
+    """Function-call form of regional_compile for dynamic call sites."""
+
+    compiled = regional_compile(target, fn, **compile_kwargs)
+    return cast(F, compiled)
 
 
 def normalize_compiled_batch(
@@ -347,9 +406,14 @@ def _require_bool(value: Any, *, name: str) -> bool:
 
 
 __all__ = [
+    "CompileTarget",
     "CompiledPretrainingStep",
+    "REGIONAL_COMPILE_TARGETS",
+    "maybe_compile_region",
     "normalize_compiled_batch",
     "PretrainingMetrics",
     "PretrainingState",
+    "regional_compile",
+    "should_compile_region",
     "STABLE_BATCH_KEYS",
 ]

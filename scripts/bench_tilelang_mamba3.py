@@ -17,7 +17,7 @@ import sys
 import time
 from importlib import metadata
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -68,7 +68,7 @@ def _run_iter(fn: Callable[[], Any]) -> float:
     return time.perf_counter() - start
 
 
-def _bench(label: str, fn: Callable[[], Any], *, warmup: int, iters: int) -> dict[str, float]:
+def _bench(label: str, fn: Callable[[], Any], *, warmup: int, iters: int) -> dict[str, Any]:
     for _ in range(warmup):
         fn()
         mx.synchronize()
@@ -168,10 +168,34 @@ def main() -> int:
         y = mamba3_mimo_apply(*inputs)
         return mx.sum(y * y) * 0.5
 
-    grad_ref = mx.value_and_grad(lambda *xs: 0.5 * mx.sum(mamba3_mimo_reference(*xs)[0] ** 2),
-                                 argnums=(0, 1, 2, 3, 4, 5, 6, 7))
-    grad_met = mx.value_and_grad(lambda *xs: 0.5 * mx.sum(mamba3_mimo_apply(*xs) ** 2),
-                                 argnums=(0, 1, 2, 3, 4, 5, 6, 7))
+    def grad_ref_loss(
+        x: mx.array,
+        B: mx.array,
+        C: mx.array,
+        z: mx.array,
+        A: mx.array,
+        dt: mx.array,
+        D: mx.array,
+        h0: mx.array,
+    ) -> mx.array:
+        y, _ = mamba3_mimo_reference(x, B, C, z, A, dt, D, h0)
+        return mx.sum(y * y) * 0.5
+
+    def grad_met_loss(
+        x: mx.array,
+        B: mx.array,
+        C: mx.array,
+        z: mx.array,
+        A: mx.array,
+        dt: mx.array,
+        D: mx.array,
+        h0: mx.array,
+    ) -> mx.array:
+        y = cast(mx.array, mamba3_mimo_apply(x, B, C, z, A, dt, D, h0))
+        return mx.sum(y * y) * 0.5
+
+    grad_ref = mx.value_and_grad(grad_ref_loss, argnums=(0, 1, 2, 3, 4, 5, 6, 7))
+    grad_met = mx.value_and_grad(grad_met_loss, argnums=(0, 1, 2, 3, 4, 5, 6, 7))
 
     fwd_bwd_ref = _bench(
         "fwd_bwd_reference",

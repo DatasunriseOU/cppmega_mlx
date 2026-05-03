@@ -10,10 +10,10 @@ tilelang/tileop/gemm/gemm_base.py:88 asserted self.A.dtype == self.B.dtype,
 which blocked chained mixed-precision patterns. The canonical case is the
 two-step attention path:
 
-python
+```python
 T.gemm(Q_shared, K_shared, S_local, transpose_B=True)   # fp16 × fp16 → fp32
 T.gemm(S_local, V_shared, O_local)                       # fp32 × fp16 → fp32
-
+```
 
 The second call has A.dtype = float32 (the accumulator from the first GEMM)
 and B.dtype = float16 (V_shared), tripping the assert before any backend
@@ -99,6 +99,62 @@ touch their failure paths.
 
 * tests/test_tilelang_*.py: 130 passed.
 
+## Performance / profiler readout
+
+This patch is a correctness/codegen attempt, not a throughput optimization. I
+rechecked the generated Metal source from
+`docs/upstream/test_sparse_mla_pipeline.py::k3_multi_gemm` on 2026-05-03 with
+the local TileLang dev tree imported from
+`/private/tmp/tilelang_apple_head/tilelang` at `a69d6df7`. The TileLang
+`lower()` path and the scoped pytest still pass, but `xcrun --sdk macosx metal
+-c` on the generated MSL fails, so there is no honest runtime profiler number
+for this artifact yet. The simple same-dtype `docs/upstream/test_metal_gemm.py`
+MSL compiles with the same `xcrun` command, so this is not just a local Metal
+toolchain failure.
+
+Observed lowering:
+
+* The first same-dtype `Q_shared x K_shared -> S_local` GEMM still attempts the
+  simdgroup path: generated MSL contains one `simdgroup_multiply_accumulate`
+  and two `simdgroup_load` sites.
+* Because `S_local` is later consumed by the mixed-dtype scalar fallback, the
+  conservative simdgroup-rewrite skip leaves it as `thread float S_local[1024]`.
+  That makes the first simdgroup call invalid MSL:
+
+```text
+error: no matching function for call to 'simdgroup_multiply_accumulate'
+candidate template ignored: could not match 'simdgroup_matrix<R, Cols, Rows>'
+against 'float'
+```
+
+* The second mixed-dtype `S_local x V_shared -> O_local` GEMM deliberately does
+  **not** use `simdgroup_multiply_accumulate`; generated MSL contains an
+  explicit scalar loop:
+
+```metal
+for (int i_7 = 0; i_7 < 32; ++i_7) {
+  for (int j_4 = 0; j_4 < 64; ++j_4) {
+    for (int k = 0; k < 32; ++k) {
+      float a_val = S_local[((i_7 * 32) + k)];
+      float b_val = ((float)V_shared[((k * 64) + j_4)]);
+      O_local[((i_7 * 64) + j_4)] = (O_local[((i_7 * 64) + j_4)] + (a_val * b_val));
+    }
+  }
+}
+```
+
+So the concrete performance finding is stricter than "scalar fallback is slow":
+the current patch is not profiler-ready for the chained attention probe because
+the same fragment is produced by simdgroup GEMM and consumed by scalar GEMM. A
+safe upstream fix has to handle that producer/consumer conflict explicitly, for
+example by routing every GEMM that touches a mixed-consumed fragment through the
+scalar path, or by materializing a separate scalar/cast copy for the second GEMM.
+The latter is the only route with a plausible speed path. A kernel-local
+workaround is to keep the second GEMM same-dtype by staging or casting `S_local`
+to FP16 before `S x V` when the accuracy budget allows it; a real upstream
+speedup would need a separate TileLang Metal lowering/scheduler patch that
+supports mixed-input simdgroup MMA or an explicit pre-cast/fused-load strategy.
+
 ## Upstream-PR readiness
 
 * **Independent of FP8 / TVM-storage-mode work** — touches only the
@@ -106,9 +162,14 @@ touch their failure paths.
   3rdparty/tvm changes, no codegen_metal.cc changes.
 * **Backwards compatible** — when A and B share a dtype, the
   dispatch and rewrite both produce the same IR as before.
-* **Targets apple-head** — applies cleanly on top of PR #2118
-  (GemmMetalScalar lowering). For an upstream PR against main, the
-  patch should also apply since PR #2118 is itself open against main.
+* **Targets apple-head / Metal-dev** — applies cleanly on top of the branch
+  that already contains PR #2118's GemmMetalScalar lowering.
+* **Needs refresh for current public main** — on fresh `tile-ai/tilelang` main
+  at `2eec5f0`, `git apply --check` fails because the public tree has drifted:
+  `tilelang/transform/metal_fragment_to_simdgroup.py` is absent and the
+  `test_metal_codegen_linux.py` / `tilelang/tileop/gemm/__init__.py` hunks no
+  longer match. Refresh this patch against the actual upstream PR base before
+  submitting it.
 * **One follow-up could mirror this on CUDA / ROCm**: route to a
   scalar fallback when A.dtype != B.dtype and the chosen MMA emitter
   would refuse same-dtype inputs. Out of scope here — left for the
@@ -116,10 +177,10 @@ touch their failure paths.
 
 ## Reproduction
 
-bash
+```bash
 cd /tmp/tilelang_apple_head/tilelang
 git apply /Volumes/external/sources/cppmega.mlx/docs/upstream/tilelang_gemm_mixed_dtype/0001-tilelang-allow-mixed-gemm-dtypes.patch
 ninja -C build -j$(sysctl -n hw.ncpu) tilelang_objs   # Python-only patch — no rebuild needed
 .venv/bin/python /Volumes/external/sources/cppmega.mlx/docs/upstream/test_sparse_mla_pipeline.py
 .venv/bin/python -m pytest testing/python/metal/test_metal_codegen_linux.py::test_attention_chain_mixed_dtype_metal_codegen -v
-
+```

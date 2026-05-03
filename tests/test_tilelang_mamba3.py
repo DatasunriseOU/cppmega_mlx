@@ -9,7 +9,7 @@ Coverage:
 
 from __future__ import annotations
 
-import math
+from typing import cast
 
 import numpy as np
 import pytest
@@ -59,6 +59,7 @@ def _make_inputs(
     dt = (mx.random.uniform(0.001, 0.05, (batch, seq, heads))).astype(dtype)
     D = mx.ones((heads,), dtype=dtype)
     h0 = mx.zeros((batch, heads, headdim, state), dtype=dtype)
+    mx.eval(x, B, C, z, A, dt, D, h0)
     return x, B, C, z, A, dt, D, h0
 
 
@@ -68,16 +69,17 @@ def _make_inputs(
 
 
 def test_compute_dacs_segsum_matches_reverse_segment_sum() -> None:
-    mx.random.seed(11)
     batch, seq, heads = 2, 8, 3
-    A = -mx.random.uniform(0.0, 0.1, (batch, seq, heads), dtype=mx.float32)
-    dt = mx.random.uniform(0.01, 0.05, (batch, seq, heads), dtype=mx.float32)
-    dh = mx.random.normal((batch, seq, heads, 4), dtype=mx.float32)
+    rng = np.random.default_rng(11)
+    A_np = -rng.uniform(0.0, 0.1, size=(batch, seq, heads)).astype(np.float32)
+    dt_np = rng.uniform(0.01, 0.05, size=(batch, seq, heads)).astype(np.float32)
+    dh_np = rng.standard_normal((batch, seq, heads, 4)).astype(np.float32)
+    A = mx.array(A_np)
+    dt = mx.array(dt_np)
+    dh = mx.array(dh_np)
+    mx.eval(A, dt, dh)
 
     actual = _np(compute_dacs_segsum(A, dt, dh))
-    A_np = _np(A)
-    dt_np = _np(dt)
-    dh_np = _np(dh)
     decay = A_np * dt_np
     expected = np.zeros_like(dh_np)
     for b in range(batch):
@@ -111,6 +113,7 @@ def test_bwd_dadt_fused_matches_pointwise_chain_rule() -> None:
     dt = mx.random.uniform(0.01, 0.1, (batch, seq, heads), dtype=mx.float32)
     dY = mx.random.normal((batch, seq, heads, p, n), dtype=mx.float32)
     h = mx.random.normal((batch, seq, heads, p, n), dtype=mx.float32)
+    mx.eval(A, dt, dY, h)
 
     dA, ddt = bwd_dadt_fused(dY, A, dt, h)
     d_decay = _np(dY) * _np(h)
@@ -125,6 +128,7 @@ def test_bwd_dtrap_ddt_matches_autograd_through_reference_forward() -> None:
     dt = mx.random.uniform(0.001, 0.05, (batch, seq, heads), dtype=mx.float32)
     trap = mx.random.normal((batch, seq, heads), dtype=mx.float32)
     dB_scaled = mx.random.normal((batch, seq, heads), dtype=mx.float32) * 0.1
+    mx.eval(dt, trap, dB_scaled)
 
     def loss(dt: mx.array, trap: mx.array, dB: mx.array) -> mx.array:
         s = reference_trap_scale_forward(dt, trap)
@@ -208,7 +212,7 @@ def test_bwd_metal_matches_autograd_through_reference_fp32() -> None:
 
     def metal_loss(x: mx.array, B: mx.array, C: mx.array, z: mx.array,
                    A: mx.array, dt: mx.array, D: mx.array, h0: mx.array) -> mx.array:
-        y = mamba3_mimo_apply(x, B, C, z, A, dt, D, h0)
+        y = cast(mx.array, mamba3_mimo_apply(x, B, C, z, A, dt, D, h0))
         return mx.sum(y * y) * 0.5
 
     g_ref = mx.grad(ref_loss, argnums=(0, 1, 2, 3, 4, 5, 6, 7))(*inputs)
@@ -240,7 +244,9 @@ def test_bwd_metal_with_trap_overlay_runs() -> None:
     x, B, C, z, A, dt, D, h0 = inputs
     trap = mx.random.normal((1, 4, 2), dtype=mx.float32)
     dy = mx.random.normal(x.shape, dtype=mx.float32) * 0.1
+    mx.eval(trap, dy)
     grads = mamba3_mimo_bwd_metal(dy, x, B, C, z, A, dt, D, h0, trap=trap)
+    mx.eval(*grads)
     # ddt index is 5; trap-aware backward should add trap-mediated contribution.
     assert grads[5].shape == dt.shape
     assert grads[7].shape == h0.shape
@@ -315,6 +321,7 @@ def test_mamba3_metal_kernel_equivalent_to_reference_scan_at_full_block_shapes()
     C = _broadcast_groups_to_heads(C, cfg.nheads, "C")
     A = mx.minimum(-nn.softplus(dd_A), -cfg.A_floor)
     h0 = mx.zeros((1, cfg.nheads, cfg.headdim, cfg.d_state), dtype=hidden.dtype)
+    mx.eval(x, B, C, z, A, dt, block.D, h0)
 
     log_decay = (A * dt)[:, :, :, None, None]
     inp = x[:, :, :, :, None] * B[:, :, :, None, :]

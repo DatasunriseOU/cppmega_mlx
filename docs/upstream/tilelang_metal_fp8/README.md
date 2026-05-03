@@ -1,9 +1,16 @@
 # TileLang Metal FP8 — storage-only emulation patch
 
-Status: partial fix shipped. T.Cast between float8_e4m3 / float8_e5m2 and
-float16 (or any fp/int via half) lowers cleanly on the Metal target.
-T.gemm(fp8_A, fp8_B, fp32_C) does **not** work — caller must explicitly
-dequantize FP8 to half/float before the gemm.
+Status: storage-only partial fix shipped. With this patch alone, T.Cast between
+float8_e4m3 / float8_e5m2 and float16 (or any fp/int via half) lowers cleanly
+on the Metal target. T.gemm(fp8_A, fp8_B, fp32_C) still needs the companion
+`tilelang_metal_fp8_gemm` software fallback patch, or the caller must
+explicitly dequantize FP8 to half/float before the gemm.
+
+Packaging note: the `tilelang_metal_fp8_gemm` README records the intended
+dispatcher design and local branch receipt, but the stored
+`0001-metal-fp8-gemm-software-path.patch` currently fails `git apply --check`
+on clean `apple-head@7f4a5cb8`. Regenerate that companion patch before treating
+FP8 `T.gemm` as replayable from `docs/upstream` artifacts.
 
 ## Blocker
 
@@ -121,7 +128,7 @@ that **compiles with xcrun metal -c**:
 
 Sample MSL (TileLang codegen, e4m3 round-trip kernel):
 
-msl
+```msl
 #include <metal_stdlib>
 using namespace metal;
 
@@ -141,20 +148,21 @@ kernel void fp8_round_trip_kernel(
   B[((int)threadIdx.x)] = __tvm_half_to_fp8_e4m3((x + 1.000000e+00h));
   C[((int)threadIdx.x)] = x;
 }
-
+```
 
 The stock TVM Metal codegen path (target.build.metal) goes through the
 legalize_fp8 pass first, which expands FP8 ops into bit-shuffle code
 inline. With this patch its PrintType no longer faults, so the legalised
 output also compiles with xcrun metal -c.
 
-T.gemm(fp8_A, fp8_B, fp32_C) still fails — by design — at the
-metal.simdgroup allocation check (TileLang's existing assert at
+With this storage-only patch alone, T.gemm(fp8_A, fp8_B, fp32_C) still fails
+at the metal.simdgroup allocation check (TileLang's existing assert at
 src/target/codegen_metal.cc:454):
 > Only float16, float32, and bfloat16 are supported, but got float8_e4m3
 
-Caller must dequantize FP8 to half/float in shared memory before
-T.gemm. This matches the FP8 gemm pattern used in
+Caller must either apply the companion `tilelang_metal_fp8_gemm` software
+fallback patch or dequantize FP8 to half/float in shared memory before T.gemm.
+This matches the FP8 gemm pattern used in
 tilelang/examples/deepseek_v32/fp8_lighting_indexer.py.
 
 mxfp8 (float8_e8m0fnu scale storage) also lowers correctly: it's a
@@ -206,3 +214,11 @@ Open questions for upstream review:
 
 - 0001-metal-fp8-storage-only.patch — combined patch (3rdparty/tvm
   + tilelang) ready for git apply from the tilelang repo root.
+
+## How to apply
+
+```bash
+cd /tmp/tilelang_apple_head/tilelang
+git apply /Volumes/external/sources/cppmega.mlx/docs/upstream/tilelang_metal_fp8/0001-metal-fp8-storage-only.patch
+cd build && ninja -j$(sysctl -n hw.ncpu)
+```

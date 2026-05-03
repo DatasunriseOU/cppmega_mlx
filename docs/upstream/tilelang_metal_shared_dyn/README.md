@@ -87,6 +87,9 @@ folder with the failing kernel as repro.
 This patch is intentionally a no-op. `0001-metal-shared-dyn-storage-scope.patch`
 is a documentation-only artefact recording the investigation outcome
 (the original blocker is already resolved in the apple-head branch).
+It is not meant to be applied with `git apply`; on a fresh TileLang checkout,
+`git apply --check 0001-metal-shared-dyn-storage-scope.patch` correctly reports
+`No valid patches in input`.
 
 ## Test
 
@@ -100,6 +103,8 @@ and failing regimes. Run it against the built tilelang to confirm:
 
 ## Upstream-PR readiness
 
-Nothing to upstream. The "Unknown storage scope" surface fix is already
-in TileLang. The symbolic-extent limitation is real but not on cppmega's
-critical path — file as separate upstream issue when/if needed.
+Do not file this as a code PR. The "Unknown storage scope" surface fix is
+already in the Apple-head / Metal-dev TileLang branch. The symbolic-extent
+limitation is real but not on cppmega's critical path; file it as a separate
+upstream issue with `test_shared_dyn_probe.py::symbolic_dyn` as the repro when
+or if a kernel needs symbolic dynamic shared memory on Metal.

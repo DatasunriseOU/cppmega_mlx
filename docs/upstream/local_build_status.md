@@ -1,5 +1,252 @@
 # Local TVM+TileLang build state (2026-05-03)
 
+## Submission pack summary: 9 upstream artifacts
+
+This `docs/upstream/` directory is a community contribution pack for the
+macOS / Apple Silicon Metal path across MLX, TVM, and TileLang. The motivation
+is practical M4 Max sparse-MLA / TileLang bring-up: remove avoidable Metal
+lowering blockers, keep FP8 honest as software storage-only emulation because
+Apple GPUs expose no native FP8 scalar or simdgroup matmul type, and make the
+MLX <-> TVM DLPack bridge possible without a host copy when both sides use
+Shared `MTLBuffer` storage. The pack does **not** claim full sparse-MLA
+production parity or FP16 simdgroup throughput for FP8 paths.
+
+Mamba3 note: there are no Mamba3-named upstream patches or probes under
+`docs/upstream`. Mamba3 appears here only as downstream motivation for the
+Metal / TileLang / TVM interop work; the reviewed submission artifacts below
+are not Mamba3-specific PRs.
+
+| # | Directory | Upstream target | Artifact | Purpose | Packaging / apply status | Proof surface | Honest limitation |
+|---|---|---|---|---|---|---|---|
+| 1 | `mlx_from_dlpack` | `ml-explore/mlx` | `0001-add-from_dlpack-metal-consumer.patch` | Add `mx.from_dlpack(obj)` with a fail-closed Metal Shared-buffer consumer. | Normal patch artifact; apply from the MLX checkout with an absolute path into this repo. | MLX CMake build and `python/tests/test_dlpack_consumer.py` 8/8. | Needs the TVM Shared-storage producer patch for TVM zero-copy; MLX exporter still needs a later kDLMetal phase. |
+| 2 | `tvm_shared_storage` | `apache/tvm` | `0001-metal-shared-storage-opt-in.patch` | Add opt-in `TVM_METAL_STORAGE_MODE=shared/managed/private`. | Normal patch artifact; standalone TVM fork artifact, not for TileLang's older vendored TVM. | `runtime_check.mm`, `syntax_check.mm`, and `test_metal_shared_storage.py`. | Must be paired with MLX consumer for end-to-end TVM -> MLX DLPack. |
+| 3 | `tilelang_gemm_mixed_dtype` | TileLang Apple-head / Metal-dev branch | `0001-tilelang-allow-mixed-gemm-dtypes.patch` | Let Metal scalar fallback lower chained `fp16 x fp16 -> fp32`, then `fp32 x fp16 -> fp32` attention GEMMs. | Normal branch-specific patch artifact; public `tile-ai/tilelang:main` has drift and needs refresh before PR filing. | `docs/upstream/test_sparse_mla_pipeline.py::k3_multi_gemm`; upstream Metal/CPU test slices documented below. | Non-Metal backend scalar routing remains follow-up work. |
+| 4 | `tilelang_metal_pipelined` | TileLang Apple-head / Metal-dev branch | `0001-metal-pipeline-3d-buffer.patch` | Thread the pipeline stage dimension through Metal `T.access_ptr` for `T.Pipelined(num_stages > 1)`. | Normal branch-specific patch artifact; public main currently lacks the touched Metal macro emitter file. | `test_pipelined_probe.py` for `num_stages=2`, `num_stages=3`, and Q*K^T attention shape. | The separate `float32x4` simdgroup vector dtype failure remains open. |
+| 5 | `tilelang_metal_fp8` | TileLang + TileLang/tvm or apache/tvm Metal codegen | `0001-metal-fp8-storage-only.patch` | Print FP8 as `uchar` storage and lower scalar FP8 casts through MSL helper functions. | Normal patch artifact. | Scalar FP8 cast probes and `xcrun --sdk macosx metal -c` compile. | Storage/cast only; FP8 GEMM needs the companion dispatcher path and is software, not native FP8. |
+| 6 | `tilelang_metal_fp8_gemm` | TileLang | `0001-metal-fp8-gemm-software-path.patch` | Route FP8-input `T.gemm` on Metal to scalar dequant-multiply-accumulate fallback. | **Packaging blocker:** current artifact does not apply on clean `apple-head@7f4a5cb8`, even after `mixed_dtype` + storage-only FP8. Regenerate before PR. | Local branch receipt says FP8 GEMM variants lower and compile to MSL without `simdgroup_multiply_accumulate`. | Receipt is not enough for submission; the stored patch artifact is currently not replayable. |
+| 7 | `tilelang_metal_fp8_vector` | TileLang + TVM Metal codegen | `0001-metal-fp8-vector-cast.patch` | Intended follow-up for vector FP8 casts with lanes 2/3/4. | **Packaging blocker:** current file is corrupt; `git apply --check` fails at line 73. Regenerate before any PR. | README records the successful local probe, but the stored patch artifact itself is not applyable. | Cannot be submitted as-is; all dependent stack commands must wait for a regenerated patch. |
+| 8 | `tilelang_metal_fp8_scaled_matmul` | TileLang language surface | `0001-tilelang-fp8-scaled-matmul-intrinsic.patch` | Add `T.fp8_scaled_matmul(...)` frontend stub and explicit Metal redirect. | Normal patch artifact, but its documented prereq stack includes the vector patch, which currently needs regeneration. | Import / Metal redirect / fallback probe documented in README. | Frontend stub only; no real Metal scheduler lowering yet. |
+| 9 | `tilelang_metal_shared_dyn` | TileLang investigation artifact | `0001-metal-shared-dyn-storage-scope.patch` | Document that `shared.dyn` static extents are already fixed on Apple-head. | Intentional no-op artifact; `git apply --check` reports `No valid patches in input`. | `test_shared_dyn_probe.py` covers static, merged, and symbolic regimes. | Not a code PR; symbolic dynamic shared memory still needs a separate issue/patch if required. |
+
+MLX DLPack performance/readiness note: the `mlx_from_dlpack` artifact
+apply-checks cleanly on `ml-explore/mlx@e8ebdeb` and its source has a real
+copy boundary difference (`kDLCPU` imports copy into a fresh MLX allocation;
+`kDLMetal` Shared-buffer imports wrap the foreign `MTLBuffer` directly). The
+pack should still describe this as copy-elision readiness, not a measured
+end-to-end speedup, because no checked-in foreign `kDLMetal` producer smoke or
+from_dlpack-specific profiler receipt exists yet.
+
+### Current submission order
+
+Treat the table above as the authoritative current readiness snapshot. The
+chronological sections below keep the bring-up history and may still quote
+pre-patch blockers before later patches resolved them.
+
+File as ordinary code PRs after refreshing against each project's intended PR
+base: `mlx_from_dlpack`, `tvm_shared_storage`,
+`tilelang_gemm_mixed_dtype`, `tilelang_metal_pipelined`, and
+`tilelang_metal_fp8`.
+
+Hold `tilelang_metal_fp8_gemm` and `tilelang_metal_fp8_vector` until their
+patch artifacts are regenerated and `git apply --check` passes. Treat
+`tilelang_metal_fp8_scaled_matmul` as a frontend-stub PR only; if filed
+together with the FP8 vector stack, it is gated by that regenerated vector
+patch. Do not file `tilelang_metal_shared_dyn` as a code PR; use it as an
+upstream issue / investigation note for the remaining symbolic
+dynamic-shared-memory limitation.
+
+### Pack-level proof commands
+
+Run documentation/package checks from the cppmega.mlx checkout:
+
+```bash
+cd /Volumes/external/sources/cppmega.mlx
+git diff --check -- docs/upstream
+rg -n "git apply (docs/upstream|../docs/upstream)" docs/upstream/*/README.md docs/upstream/local_build_status.md
+.venv/bin/python -m py_compile \
+  docs/upstream/test_metal_gemm.py \
+  docs/upstream/test_sparse_mla_pipeline.py \
+  docs/upstream/tilelang_metal_pipelined/test_pipelined_probe.py \
+  docs/upstream/tilelang_metal_shared_dyn/test_shared_dyn_probe.py \
+  docs/upstream/tvm_shared_storage/test_metal_shared_storage.py
+```
+
+Patch packaging probes:
+
+```bash
+git apply --stat docs/upstream/mlx_from_dlpack/0001-add-from_dlpack-metal-consumer.patch
+git apply --stat docs/upstream/tvm_shared_storage/0001-metal-shared-storage-opt-in.patch
+git apply --stat docs/upstream/tilelang_gemm_mixed_dtype/0001-tilelang-allow-mixed-gemm-dtypes.patch
+git apply --stat docs/upstream/tilelang_metal_fp8/0001-metal-fp8-storage-only.patch
+git apply --stat docs/upstream/tilelang_metal_fp8_scaled_matmul/0001-tilelang-fp8-scaled-matmul-intrinsic.patch
+git apply --stat docs/upstream/tilelang_metal_pipelined/0001-metal-pipeline-3d-buffer.patch
+
+# Expected blockers / non-patches:
+git apply --check docs/upstream/tilelang_metal_fp8_gemm/0001-metal-fp8-gemm-software-path.patch
+# -> patch failed: tilelang/tileop/gemm/__init__.py / metal_fragment_to_simdgroup.py
+git apply --check docs/upstream/tilelang_metal_fp8_vector/0001-metal-fp8-vector-cast.patch
+# -> error: corrupt patch at line 73
+git apply --check docs/upstream/tilelang_metal_shared_dyn/0001-metal-shared-dyn-storage-scope.patch
+# -> error: No valid patches in input
+```
+
+## Audit barrier 2026-05-03 — sparse MLA / FP8 upstream artifact replay
+
+Scope: only `docs/upstream` sparse-MLA and FP8 TileLang artifacts were audited.
+Clean replay base was a fresh clone from `/tmp/tilelang_apple_head/tilelang`
+checked out at `apple-head@7f4a5cb8` with `3rdparty/tvm@0e15b274b`.
+
+Apply-check matrix on that base:
+
+| Artifact | Result | Notes |
+|---|---|---|
+| `tilelang_metal_pipelined/0001-metal-pipeline-3d-buffer.patch` | OK | Branch-specific; public `tile-ai/tilelang:main@2eec5f0` has drift and lacks `tilelang/intrinsics/metal_macro_generator.py`. |
+| `tilelang_gemm_mixed_dtype/0001-tilelang-allow-mixed-gemm-dtypes.patch` | OK | Branch-specific; public main drift breaks hunks in tests, dispatcher, and `metal_fragment_to_simdgroup.py`. |
+| `tilelang_metal_fp8/0001-metal-fp8-storage-only.patch` | OK | Requires initialized `3rdparty/tvm` submodule. |
+| `tilelang_metal_fp8_scaled_matmul/0001-tilelang-fp8-scaled-matmul-intrinsic.patch` | OK | Also applies on current public main as a standalone frontend stub. Its documented full stack still waits on regenerated vector FP8 cast artifact. |
+| `tilelang_metal_fp8_vector/0001-metal-fp8-vector-cast.patch` | FAIL | `error: corrupt patch at line 73`; the file switches to prose instead of a valid second unified diff. |
+| `tilelang_metal_fp8_gemm/0001-metal-fp8-gemm-software-path.patch` | FAIL | Fails on clean `apple-head` and after applying both `mixed_dtype` and storage-only FP8; hunks for `tilelang/tileop/gemm/__init__.py` and `tilelang/transform/metal_fragment_to_simdgroup.py` need regeneration. |
+| `tilelang_metal_shared_dyn/0001-metal-shared-dyn-storage-scope.patch` | NO-OP | `No valid patches in input`; keep as investigation artifact, not a code PR. |
+
+Live scoped probes in the cppmega.mlx venv:
+
+| Command | Result | Meaning |
+|---|---|---|
+| `.venv/bin/python docs/upstream/test_sparse_mla_pipeline.py` | exit 0; `k1_simple_gemm OK`, `k2_pipelined_gemm FAILED InternalError: Check failed: float32x4`, `k2_32x32_no_pipeline FAILED InternalError: Check failed: float32x4`, `k2_pipelined_16x16_control OK`, `k3_multi_gemm OK` | Mixed-dtype attention chain is lowered; the 32x32 sparse-MLA fragment shape still exposes the separate simdgroup vector dtype blocker even without `T.Pipelined`, while the 16x16 pipelined control proves the 3-D pipeline-buffer fix itself is not the remaining blocker. |
+| `.venv/bin/python docs/upstream/tilelang_metal_pipelined/test_pipelined_probe.py` | exit 0; `k_pipe_2 OK`, `k_pipe_3 OK`, `k_attn OK` | The 3-D pipeline-region fix works for the included reduced probes. |
+
+### Performance lane 1 — TileLang Metal GEMM runtime baseline
+
+The `docs/upstream/test_metal_gemm.py` probe is now both a pytest lowering
+check and a reproducible timing CLI. It does execute on MPS, not just lower:
+the runtime path uses `tilelang.compile(..., target="metal",
+execution_backend="torch")`, returns a `MetalKernelAdapter`, calls the compiled
+kernel with MPS tensors, and verifies the result against `torch.matmul`.
+
+Commands:
+
+```bash
+.venv/bin/python docs/upstream/test_metal_gemm.py
+.venv/bin/python docs/upstream/test_metal_gemm.py --profile-lowering --lowering-repeats 9
+.venv/bin/python docs/upstream/test_metal_gemm.py --profile-runtime --runtime-reps 300 --runtime-warmups 50 --runtime-rounds 7
+.venv/bin/python docs/upstream/test_metal_gemm.py --profile-runtime --enable-tilelang-cache --runtime-reps 100 --runtime-warmups 10 --runtime-rounds 3
+xctrace record --quiet --no-prompt --template 'Metal System Trace' --time-limit 3s --output /tmp/tilelang_metal_gemm_lane1_final.trace --target-stdout - --launch -- ./.venv/bin/python docs/upstream/test_metal_gemm.py --profile-runtime --runtime-reps 5000 --runtime-warmups 100 --runtime-rounds 20
+```
+
+Lowering on this local M-series TileLang dev build
+(`/private/tmp/tilelang_apple_head/tilelang/build`) produced MSL with
+`kernel void` and `simdgroup_multiply_accumulate`; kernel source length was
+1899 bytes. The final sequential nine-repeat lowering run measured min
+51.276 ms, median 54.413 ms, and mean 57.180 ms, with the same
+generated-source checks.
+
+Runtime timing uses synchronized wall-clock measurements because TileLang's
+`tilelang.profiler.do_bench` still follows CUDA-only paths on this checkout
+(`torch.cuda.synchronize()`, CUDA cache tensors, CUDA events / CUPTI /
+CUDAGraph code paths), while a `torch.mps.Event(enable_timing=True)` smoke
+test hung on this machine. The PyTorch baseline is now allocation-free:
+`torch.matmul(a, b, out=torch_out)` writes into a preallocated MPS tensor,
+the probe verifies that the returned pointer is the same output tensor, and
+`runtime_torch_matmul_out_max_abs_vs_torch_matmul` was 0.0.
+
+Four repeated 300-rep / 50-warmup / 7-round runtime runs with TileLang disk
+cache disabled by default:
+
+| Run | compile ms | TileLang median ms | PyTorch `matmul(out=...)` median ms | Speedup | max abs vs PyTorch |
+|---|---:|---:|---:|---:|---:|
+| 1 | 72.366 | 0.004734 | 0.013609 | 2.875x | 0.03125 |
+| 2 | 66.549 | 0.004759 | 0.013972 | 2.936x | 0.03515625 |
+| 3 | 67.649 | 0.004531 | 0.013672 | 3.018x | 0.03125 |
+| 4 | 67.924 | 0.004653 | 0.013672 | 2.938x | 0.03125 |
+| 5 final sequential rerun | 92.071 | 0.004745 | 0.014519 | 3.060x | 0.03125 |
+
+A longer `xctrace`-wrapped wall-clock run with 5000 reps / 100 warmups /
+20 rounds measured compile 71.789 ms, TileLang median 0.003188 ms, PyTorch
+`matmul(out=...)` median 0.017245 ms, speedup 5.409x, and max abs 0.03125.
+Use the shorter sequential run above as the conservative baseline; the longer
+run is useful mainly because it gives `xctrace` enough time to attach while
+preserving the same correctness and generated-source checks.
+
+The short `xctrace` smoke also launched the same probe successfully under the
+Metal System Trace template and wrote a 116 MB trace under `/tmp`; the trace
+TOC records launched `python` exit status 0 and Metal trace tables. It is not
+used as a kernel-counter receipt here because that CLI capture reported
+`Counter Set: (null)` and `Shader Timeline: Disabled`.
+
+TileLang disk cache is disabled by default in the runtime mode because the
+current Metal adapter has no shared-library path to save. Running with
+`--enable-tilelang-cache` reproduces the non-fatal upstream cache bug:
+`AttributeError: 'MetalKernelAdapter' object has no attribute 'libpath'` from
+`tilelang/cache/kernel_cache.py`, while the kernel still compiles, executes,
+and verifies.
+
+No upstream kernel speedup was made in this docs-only lane. The generated
+kernel already uses the simdgroup MMA path for this 64x32x64 FP16 probe, and a
+real scheduler/codegen speedup would require editing TileLang outside
+`docs/upstream`. The safe improvement here is the reproducible runtime mode,
+the fair preallocated PyTorch baseline, and the cache/profiler limitation
+receipts.
+
+### Performance lane 2 — sparse MLA lowering/profiling probe
+
+The sparse-MLA probe is a source-codegen / lowering probe, not a runtime kernel
+benchmark: `tilelang.engine.lower.lower(...)` returns `CompiledArtifact` with
+`rt_mod=none` for the passing cases in this script, and no MLX / TVM runtime
+adapter is invoked. The status output now prints the artifact detail directly:
+`k1_simple_gemm`, `k2_pipelined_16x16_control`, and `k3_multi_gemm` all report
+`CompiledArtifact; rt_mod=none` with generated Metal source sizes of 1897,
+3101, and 3044 bytes respectively.
+
+The new CLI modes make the compile-only boundary explicit:
+
+```bash
+.venv/bin/python docs/upstream/test_sparse_mla_pipeline.py
+.venv/bin/python docs/upstream/test_sparse_mla_pipeline.py --time --repeat 3
+.venv/bin/python docs/upstream/test_sparse_mla_pipeline.py --profile --kernel k2 --profile-limit 16
+.venv/bin/python docs/upstream/test_sparse_mla_pipeline.py --time --repeat 2 --device-compile
+```
+
+Measured on the local M-series TileLang dev build (`/private/tmp/tilelang_apple_head/tilelang/build`):
+
+| Kernel | Status | mean ms | median ms | min ms | max ms | Interpretation |
+|---|---:|---:|---:|---:|---:|---|
+| `k1_simple_gemm` | OK | 61.0 | 61.7 | 59.3 | 62.0 | Baseline scalar Metal `T.gemm` lowering; artifact detail shows `rt_mod=none`. |
+| `k2_pipelined_gemm` | expected fail | 147.2 | 148.3 | 144.2 | 149.0 | Production-like 32x32/fp32 accumulator + `T.Pipelined`; fails before runtime on `float32x4`. |
+| `k2_32x32_no_pipeline` | expected fail | 71.0 | 71.0 | 67.7 | 74.2 | Same 32x32/fp32 accumulator without `T.Pipelined`; proves the current blocker is the simdgroup vector dtype rewrite, not the pipeline-buffer patch. |
+| `k2_pipelined_16x16_control` | OK | 110.3 | 109.4 | 108.7 | 112.7 | Pipelined control that avoids `float32x4`; confirms the software-pipeline region path still lowers. |
+| `k3_multi_gemm` | OK | 140.7 | 138.7 | 136.8 | 146.4 | Chained mixed-dtype attention GEMMs lower after the mixed-dtype dispatcher patch; artifact detail shows `rt_mod=none`. |
+
+The k2 profiler points at compile/lowering time, not Metal execution time.
+For `k2_pipelined_gemm`, cumulative time was concentrated in
+`lower.py:271(lower)` -> `transform.py:153(__call__)` -> `phase.py:144(LowerAndLegalize)`;
+`gemm_metal.py:21(lower)` accounted for about 51 ms of the 185 ms profiled
+sample. The reduced `k2_32x32_no_pipeline` failed in 81 ms and still reached
+`gemm_metal.py:82(_gemm_ss_simdgroup)` before the same `float32x4` ICHECK.
+Requesting TileLang's Metal device-compile path (`--device-compile`) did not
+change the runtime boundary: the passing cases still reported
+`CompiledArtifact; rt_mod=none`, while the 32x32 cases failed on the same
+`float32x4` check.
+
+The only safe "speedup" available in this probe is a shape workaround for
+experimentation: keep the Metal TileLang path at the 16x16/fp16-fragment
+control shape, or bypass TileLang for the production 32x32/fp32 sparse-MLA
+kernel until the upstream Metal simdgroup allocation path accepts vectorized
+`float32x{2,4}` element dtypes or avoids vectorizing that allocation. The
+probe intentionally keeps both 32x32 cases as pytest `xfail` so the expected
+failure remains visible without breaking scoped CI.
+
+Submission guidance from this audit:
+
+- Submit or refresh branch-specific PRs from the real TileLang Metal branch,
+  not from public main, unless rebased first.
+- Do not include `tilelang_metal_fp8_vector` or `tilelang_metal_fp8_gemm` in a
+  PR pack as-is. Their README motivation is useful, but their patch artifacts
+  are not replayable.
+- Treat `tilelang_metal_fp8_scaled_matmul` as a frontend-stub PR only. It is
+  not proof of a real scaled-FP8 Metal scheduler lowering.
+- Treat `tilelang_metal_shared_dyn` as a documented no-op / issue note unless a
+  future symbolic dynamic-shared-memory patch is produced.
+
 ## Decision: Option 3 (defer storage-mode patch on TileLang's vendored TVM)
 
 *Why*: TileLang vendors github.com/TileLang/tvm@0e15b274b — a TileLang-maintained fork — not apache/tvm. Our TVM_METAL_STORAGE_MODE patch was authored against apache/tvm@8873a4c and uses TVM_FFI_ICHECK macros that don't exist in TileLang's older vendored copy. Storage-mode patch stays in /Volumes/external/sources/tvm as upstream-PR artifact only.

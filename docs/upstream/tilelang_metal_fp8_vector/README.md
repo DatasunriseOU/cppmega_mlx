@@ -1,5 +1,20 @@
 # Vector FP8 cast lowering for Metal codegen
 
+## Packaging note
+
+The local worktree probe succeeded, but the stored patch artifact currently
+needs regeneration before PR filing:
+
+```bash
+cd /Volumes/external/sources/cppmega.mlx
+git apply --check docs/upstream/tilelang_metal_fp8_vector/0001-metal-fp8-vector-cast.patch
+# error: corrupt patch at line 73
+```
+
+Treat the design and proof below as the intended contribution, not as an
+applyable patch receipt, until `0001-metal-fp8-vector-cast.patch` is
+re-exported from the TileLang branch and rechecked.
+
 ## Blocker
 
 `docs/upstream/tilelang_metal_fp8/0001-metal-fp8-storage-only.patch`
@@ -75,6 +90,23 @@ FP8 loadout and motivates the requirement to keep vector FP8 casts cheap.
 
 ## Test results
 
+### Artifact check — fresh TileLang clone
+
+Current artifact status is negative and repeatable:
+
+```bash
+git -C /tmp/cppmega_lane6_tilelang rev-parse HEAD
+# 2eec5f0109125b46cd71091eeb9c2ad573d6e3d1
+git -C /tmp/cppmega_lane6_tilelang apply --check \
+  /Volumes/external/sources/cppmega.mlx/docs/upstream/tilelang_metal_fp8_vector/0001-metal-fp8-vector-cast.patch
+# error: corrupt patch at line 73
+```
+
+The corruption is structural, not a base-revision mismatch: the first file
+diff reaches the next `diff --git` header without a hunk header. Regenerate
+the patch from the TileLang branch before running any performance claim or
+PR submission against this artifact.
+
 ### Direct probe — `/tmp/test_fp8_vector_cast.py`
 
 ```
@@ -121,28 +153,65 @@ $ .venv/bin/python -m pytest tests/test_tilelang_*.py -q --no-header
 
 No regressions.
 
+## Performance / profiler status
+
+No upstream performance claim is currently valid from the stored artifact.
+Because `0001-metal-fp8-vector-cast.patch` cannot be applied, there is no
+fresh TileLang-generated Metal kernel to profile from this directory.
+
+Even after regeneration, the helper design is a codegen unblocker rather than
+a guaranteed speedup. The emitted `half2` / `half3` / `half4` helpers preserve
+`ucharN` / vector cast syntax in MSL, but each helper still calls the scalar
+FP8 conversion per lane. The Apple compiler may lower that back to scalar
+helper calls, so the only defensible performance claim after regeneration is:
+"the vectorized TileLang program now lowers and can be profiled." A speedup
+requires generated MSL plus profiler evidence showing fewer scalarized loads /
+stores or lower cast overhead.
+
+### Next optimization plan
+
+1. Regenerate `0001-metal-fp8-vector-cast.patch` from a clean TileLang branch
+   and add a hunk-integrity gate (`git apply --check`) before PR filing.
+2. Add a docs-scoped vector-cast probe artifact that records the generated MSL
+   before and after the patch, specifically checking for `uchar4` load/cast
+   syntax and the vector helper prelude.
+3. Run `xcrun xctrace record --template 'Metal System Trace'` on a regenerated
+   TileLang kernel, then export the trace TOC and any shader/counter tables
+   that are available. The local template exists, but its default run records
+   `Counter Set: (null)` / `Shader Timeline: Disabled`, so a trace file alone
+   is not enough for an optimization claim.
+4. If the compiler still scalarizes the helpers, the next code change should
+   avoid per-lane helper calls in the hot path: load packed bytes as `uchar4`,
+   unpack with integer bit operations inside the K-loop, and only materialize
+   `half4`/`float4` when the following operation can consume a vector.
+
 ## Upstream-PR readiness
 
-**For `tile-ai/tilelang`**: This patch is a clean follow-up to Agent C's
-storage-only patch. The two together are submittable as a single
-"Metal FP8 storage-only emulation (scalar + vector)" PR.
+**For `tile-ai/tilelang`**: The design is a clean follow-up to the
+storage-only patch, but the stored artifact is **not PR-ready** until it is
+regenerated and `git apply --check` passes. Do not submit the current
+`0001-metal-fp8-vector-cast.patch`.
 
 **For `apache/tvm`**: The mirror change in `3rdparty/tvm/src/target/source/`
-applies to apache/tvm's own `codegen_metal.cc`. If apache/tvm doesn't yet
-have Agent C's patch, both halves should be combined into a single TVM PR
-with the storage-only patch as the base.
+should be included when regenerating from a clean branch, because apache/tvm's
+own `codegen_metal.cc` needs the same vector helper surface. If apache/tvm
+doesn't yet have the storage-only patch, both halves should be combined into a
+single TVM PR with the storage-only patch as the base.
 
-**Splittable**: Yes. The TVM half can land first (carries the prelude +
-vector helpers), the TileLang half second (uses the same helper names).
+**Splittable after regeneration**: Yes. The TVM half can land first (carries
+the prelude + vector helpers), the TileLang half second (uses the same helper
+names). The current corrupt artifact should only be treated as design notes
+plus local probe evidence.
 
 ## How to apply
 
 ```bash
 cd /tmp/tilelang_apple_head/tilelang
-git apply docs/upstream/tilelang_metal_fp8/0001-metal-fp8-storage-only.patch
-git apply docs/upstream/tilelang_metal_fp8_vector/0001-metal-fp8-vector-cast.patch
+git apply /Volumes/external/sources/cppmega.mlx/docs/upstream/tilelang_metal_fp8/0001-metal-fp8-storage-only.patch
+git apply /Volumes/external/sources/cppmega.mlx/docs/upstream/tilelang_metal_fp8_vector/0001-metal-fp8-vector-cast.patch
 cd build && ninja -j$(sysctl -n hw.ncpu)
 ```
 
-Already applied in `/tmp/tilelang_apple_head/tilelang` for the
-cppmega.mlx editable install.
+Already applied in `/tmp/tilelang_apple_head/tilelang` for the cppmega.mlx
+editable install, but regenerate the patch file first if applying from the
+artifact in this directory.

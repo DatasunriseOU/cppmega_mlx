@@ -11,6 +11,9 @@ __pycache__/
 .ruff_cache/
 .pyright/
 
+# Build artifacts.
+*.egg-info/
+
 # Codex/agent runtime logs are local coordination artifacts.
 .codex/agent-logs/
 .claude/
