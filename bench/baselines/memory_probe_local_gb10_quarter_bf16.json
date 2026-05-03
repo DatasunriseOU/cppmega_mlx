@@ -1,0 +1,56 @@
+[
+  {
+    "B": 1,
+    "T": 1024,
+    "opt": "lion",
+    "dtype": "bf16",
+    "params": 1796521354,
+    "params_gib": 3.346281785517931,
+    "peak_gib_final": 35.28439376689494,
+    "active_gib_final": 20.715933015570045,
+    "median_step_s": 22.398778438568115,
+    "tok_per_sec": 45.716778832759466,
+    "log": [
+      {
+        "label": "baseline",
+        "active_gib": 7.450580596923828e-09,
+        "peak_gib": 0.0
+      },
+      {
+        "label": "after model build (0.4s, bf16)",
+        "active_gib": 3.346356276422739,
+        "peak_gib": 4.564256124198437
+      },
+      {
+        "label": "after opt init (lion, 0.3s)",
+        "active_gib": 14.925859712064266,
+        "peak_gib": 14.925860285758972
+      },
+      {
+        "label": "after batch alloc",
+        "active_gib": 14.925863564014435,
+        "peak_gib": 14.925863564014435
+      },
+      {
+        "label": "after fwd only (0.65s) loss=11.252",
+        "active_gib": 14.925863547250628,
+        "peak_gib": 15.532245153561234
+      },
+      {
+        "label": "step 1 (16.47s) loss=11.252",
+        "active_gib": 20.71594171784818,
+        "peak_gib": 35.28439376689494
+      },
+      {
+        "label": "step 3 (18.78s) loss=19.538",
+        "active_gib": 20.715933015570045,
+        "peak_gib": 35.28439376689494
+      }
+    ],
+    "step_times": [
+      16.467423915863037,
+      26.020955085754395,
+      18.776601791381836
+    ]
+  }
+]

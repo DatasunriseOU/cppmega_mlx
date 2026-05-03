@@ -447,6 +447,44 @@ runs):
 
 <!-- CONCLUSIONS -->
 
+
+##### 50-step throughput sweep on local_gb10_quarter at T=4096 under 60 GB cap (Docker present) (2026-05-03)
+
+This row is the production throughput receipt at the M0 target shape (T=4096) under a Docker-imposed 60 GB unified-memory ceiling on the M4 Max (peak-memory cap 58 GB; 2 GB safety margin). Bench script `scripts/bench_local_gb10_quarter_throughput.py`, receipt `bench/baselines/local_gb10_quarter_throughput_60gb_m4.json`, summary `docs/bench_local_gb10_quarter_production.md`. bf16 weights with grad-checkpoint, fp32 master moments, CCE chunked logits, Path B kernels (`mamba3_mimo` + `m2rnn` `metal_kernel_fwd_v1`) verified on the first measured step. 50 steps / 25 warmup per (optimizer, B). Both optimizers cap at B=1 because B=2 jumps to ~83 GB peak, which is the cap-hit signal — not a throughput plateau.
+
+A. Lion `lr=3e-3, betas=(0.9, 0.99), wd=0.1`:
+
+| B | tok/s median | tok/s p10 | tok/s p90 | peak GB | % of 60 GB | loss[0] | mean_last10 | opt state GB | cap hit |
+| - | ------------ | --------- | --------- | ------- | ---------- | ------- | ----------- | ------------ | ------- |
+| 1 | 762 | 739 | 779 | 53.69 | 89.5% | 11.262 | 71.176 | 11.58 | no |
+| 2 | - | - | - | 83.17 | 138.6% | 11.263 | 11.263 | 11.58 | yes |
+
+B. Muon+AdamW `make_muon(cppmega_cuda_parity=True)`:
+
+| B | tok/s median | tok/s p10 | tok/s p90 | peak GB | % of 60 GB | loss[0] | mean_last10 | opt state GB | cap hit |
+| - | ------------ | --------- | --------- | ------- | ---------- | ------- | ----------- | ------------ | ------- |
+| 1 | 318 | 292 | 407 | 51.22 | 85.4% | 11.262 | 11.702 | 13.39 | no |
+| 2 | - | - | - | 83.08 | 138.5% | 11.263 | 11.263 | 13.39 | yes |
+
+C. Path A vs Path B at the winning Muon+AdamW B (B=1):
+
+| Path | tok/s median | peak GB | % of 60 GB | path_b_dispatched | cap hit |
+| ---- | ------------ | ------- | ---------- | ----------------- | ------- |
+| Path B (auto) | 318 | 51.22 | 85.4% | yes | no |
+| Path A (ref) | - | 86.93 | 144.9% | yes | yes |
+
+D. M4 Max vs GB10 honest comparison (Muon+AdamW only):
+
+| metric | value |
+| ------ | ----- |
+| M4 Max max sustainable B at T=4096 (Muon+AdamW, 58 GB cap) | B=1 |
+| M4 Max tok/s median (Muon+AdamW, B=1, T=4096) | 318 |
+| M4 Max peak memory (Muon+AdamW, B=1, T=4096) | 51.22 GB |
+| GB10 reference tok/s (Muon+AdamW, T=4096, B unknown) | ~4000 |
+| Ratio M4 Max / GB10 | 0.080 (8.0%) |
+
+Conclusions: (a) the 58 GB cap, not a throughput plateau, is the limit on M4 Max under this Docker-tight budget — both optimizers fit B=1 only and B=2 hits ~83 GB on the first step; (b) Lion outpaces Muon+AdamW by roughly 2.4x at B=1 under this cap (Muon's Newton-Schulz iterations dominate per-step cost); (c) Path A (reference pure-MLX) cannot fit at B=1 under the 58 GB cap (peak 86.93 GB at step 1) — Path B is the only viable kernel path at this production shape; (d) the M4 Max-vs-GB10 ratio understates M4 Max because the M4 Max is running with ~70 GB removed by Docker while GB10 has its full memory budget. With the full 128 GB available, the historical 88 GB-cap receipt fit larger batch sizes.
+
 ##### cppmega CUDA optimizer wiring (reference, not status)
 
 cppmega CUDA uses `MultiOptimizer = Muon + adam8bit` via the Megatron emerging_optimizers

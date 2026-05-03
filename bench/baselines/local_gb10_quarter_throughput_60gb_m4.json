@@ -1,0 +1,4907 @@
+{
+  "config": {
+    "batch_sizes": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "cce_chunk_rows": 512,
+    "dtype": "bfloat16",
+    "grad_checkpoint": true,
+    "kernel_path_default": "auto",
+    "lion_kwargs": {
+      "betas": [
+        0.9,
+        0.99
+      ],
+      "learning_rate": 0.003,
+      "weight_decay": 0.1
+    },
+    "max_runtime_s": 1800.0,
+    "memory_cap_gb": 58.0,
+    "muon_kwargs": {
+      "cppmega_cuda_parity": true
+    },
+    "optimizers": [
+      "lion",
+      "muon_adamw"
+    ],
+    "path_b_comparison_enabled": true,
+    "seed": 4096,
+    "seq_len": 4096,
+    "steps": 50,
+    "vocab_size": 65536,
+    "warmup": 25
+  },
+  "data_note": "Throughput-only synthetic random tokens. The cppmega parquet corpus shape is T=4096; this receipt does not satisfy M0.4 by itself.",
+  "device": {
+    "default_device": "Device(gpu, 0)",
+    "machine": "arm64",
+    "metal_device_info": {
+      "architecture": "applegpu_g16s",
+      "device_name": "Apple M4 Max",
+      "max_buffer_length": 86586540032,
+      "max_recommended_working_set_size": 115448725504,
+      "memory_size": 137438953472,
+      "resource_limit": 499000
+    },
+    "mlx_version": "0.31.1",
+    "platform": "macOS-26.4.1-arm64-arm-64bit-Mach-O",
+    "python": "3.13.12"
+  },
+  "gb10_parity_claim": false,
+  "gb10_reference_tok_per_sec": 4000.0,
+  "git_commit": "74359f7",
+  "memory_budget_gb": 60.0,
+  "memory_budget_note": "Docker is consuming approximately 70 GB of the 128 GB M4 Max unified memory; cppmega bench is allotted 60 GB peak with a 2 GB safety margin (cap = 58 GB).",
+  "memory_cap_gb": 58.0,
+  "model_geometry": {
+    "depth": 13,
+    "ffn_hidden_size": 18944,
+    "hidden_size": 3584,
+    "num_attention_heads": 28,
+    "pattern": "AEMEAEMEAEMR",
+    "vocab_size": 65536
+  },
+  "model_profile": "local_gb10_quarter",
+  "params_total": 1985000000,
+  "path_comparison_rows": [
+    {
+      "batch_size": 1,
+      "dtype": "bfloat16",
+      "error": null,
+      "error_type": null,
+      "grad_checkpoint_enabled": true,
+      "kernel_dispatch": [
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "reference_pure_mlx",
+          "op_name": "mamba3_mimo",
+          "path": "ref"
+        },
+        {
+          "kernel_used": "reference_pure_mlx",
+          "op_name": "mamba3_mimo",
+          "path": "ref"
+        },
+        {
+          "kernel_used": "reference_pure_mlx",
+          "op_name": "mamba3_mimo",
+          "path": "ref"
+        },
+        {
+          "kernel_used": "reference_pure_mlx",
+          "op_name": "m2rnn",
+          "path": "ref"
+        }
+      ],
+      "kernel_path": "ref",
+      "loss_first": 11.262030601501465,
+      "loss_last_10_mean": 11.262030601501465,
+      "memory_cap_gb": 58.0,
+      "memory_cap_hit": true,
+      "model_profile": "local_gb10_quarter",
+      "optimizer": "muon_adamw",
+      "optimizer_config_str": "make_muon(cppmega_cuda_parity=True)",
+      "optimizer_state_bytes": 14373463720,
+      "optimizer_state_size_gb": 13.386331237852573,
+      "params_total": 1985000000,
+      "path_b_dispatched": true,
+      "peak_memory_bytes": 93343430590,
+      "peak_memory_gb": 86.93284410052001,
+      "peak_memory_pct_of_60gb": 144.8880735008667,
+      "seq_len": 4096,
+      "software_pins": {
+        "chip": "Apple M4 Max",
+        "macos": "macOS-26.4.1-arm64-arm-64bit-Mach-O",
+        "mlx": "0.31.1"
+      },
+      "steps_measured": 0,
+      "steps_total": 50,
+      "synthetic_data": true,
+      "tok_per_sec_median": null,
+      "tok_per_sec_p10": null,
+      "tok_per_sec_p90": null,
+      "wall_time_seconds": 591.6849813340232,
+      "warmup_steps": 25
+    }
+  ],
+  "rows": [
+    {
+      "batch_size": 1,
+      "dtype": "bfloat16",
+      "error": null,
+      "error_type": null,
+      "grad_checkpoint_enabled": true,
+      "kernel_dispatch": [
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        }
+      ],
+      "kernel_path": "auto",
+      "loss_first": 11.261956214904785,
+      "loss_last_10_mean": 71.17578582763672,
+      "memory_cap_gb": 58.0,
+      "memory_cap_hit": false,
+      "model_profile": "local_gb10_quarter",
+      "optimizer": "lion",
+      "optimizer_config_str": "make_lion(lr=3e-3, betas=(0.9, 0.99), wd=0.1)",
+      "optimizer_state_bytes": 12433277780,
+      "optimizer_state_size_gb": 11.579392272979021,
+      "params_total": 1985000000,
+      "path_b_dispatched": true,
+      "peak_memory_bytes": 57647812227,
+      "peak_memory_gb": 53.6887089041993,
+      "peak_memory_pct_of_60gb": 89.48118150699884,
+      "seq_len": 4096,
+      "software_pins": {
+        "chip": "Apple M4 Max",
+        "macos": "macOS-26.4.1-arm64-arm-64bit-Mach-O",
+        "mlx": "0.31.1"
+      },
+      "steps_measured": 25,
+      "steps_total": 50,
+      "synthetic_data": true,
+      "tok_per_sec_median": 762.4354836481743,
+      "tok_per_sec_p10": 739.1727582468459,
+      "tok_per_sec_p90": 778.8330522434223,
+      "wall_time_seconds": 270.9914136249572,
+      "warmup_steps": 25
+    },
+    {
+      "batch_size": 2,
+      "dtype": "bfloat16",
+      "error": null,
+      "error_type": null,
+      "grad_checkpoint_enabled": true,
+      "kernel_dispatch": [
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        }
+      ],
+      "kernel_path": "auto",
+      "loss_first": 11.262968063354492,
+      "loss_last_10_mean": 11.262968063354492,
+      "memory_cap_gb": 58.0,
+      "memory_cap_hit": true,
+      "model_profile": "local_gb10_quarter",
+      "optimizer": "lion",
+      "optimizer_config_str": "make_lion(lr=3e-3, betas=(0.9, 0.99), wd=0.1)",
+      "optimizer_state_bytes": 12433277780,
+      "optimizer_state_size_gb": 11.579392272979021,
+      "params_total": 1985000000,
+      "path_b_dispatched": true,
+      "peak_memory_bytes": 89302896816,
+      "peak_memory_gb": 83.16980378329754,
+      "peak_memory_pct_of_60gb": 138.61633963882923,
+      "seq_len": 4096,
+      "software_pins": {
+        "chip": "Apple M4 Max",
+        "macos": "macOS-26.4.1-arm64-arm-64bit-Mach-O",
+        "mlx": "0.31.1"
+      },
+      "steps_measured": 0,
+      "steps_total": 50,
+      "synthetic_data": true,
+      "tok_per_sec_median": null,
+      "tok_per_sec_p10": null,
+      "tok_per_sec_p90": null,
+      "wall_time_seconds": 15.867921666009352,
+      "warmup_steps": 25
+    },
+    {
+      "batch_size": 1,
+      "dtype": "bfloat16",
+      "error": null,
+      "error_type": null,
+      "grad_checkpoint_enabled": true,
+      "kernel_dispatch": [
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        }
+      ],
+      "kernel_path": "auto",
+      "loss_first": 11.261956214904785,
+      "loss_last_10_mean": 11.701680660247803,
+      "memory_cap_gb": 58.0,
+      "memory_cap_hit": false,
+      "model_profile": "local_gb10_quarter",
+      "optimizer": "muon_adamw",
+      "optimizer_config_str": "make_muon(cppmega_cuda_parity=True)",
+      "optimizer_state_bytes": 14373463720,
+      "optimizer_state_size_gb": 13.386331237852573,
+      "params_total": 1985000000,
+      "path_b_dispatched": true,
+      "peak_memory_bytes": 55001650934,
+      "peak_memory_gb": 51.22427915595472,
+      "peak_memory_pct_of_60gb": 85.37379859325786,
+      "seq_len": 4096,
+      "software_pins": {
+        "chip": "Apple M4 Max",
+        "macos": "macOS-26.4.1-arm64-arm-64bit-Mach-O",
+        "mlx": "0.31.1"
+      },
+      "steps_measured": 25,
+      "steps_total": 50,
+      "synthetic_data": true,
+      "tok_per_sec_median": 318.47722683913366,
+      "tok_per_sec_p10": 291.9361534985791,
+      "tok_per_sec_p90": 407.3739050416116,
+      "wall_time_seconds": 562.6874540420249,
+      "warmup_steps": 25
+    },
+    {
+      "batch_size": 2,
+      "dtype": "bfloat16",
+      "error": null,
+      "error_type": null,
+      "grad_checkpoint_enabled": true,
+      "kernel_dispatch": [
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "mamba3_mimo",
+          "path": "auto"
+        },
+        {
+          "kernel_used": "metal_kernel_fwd_v1",
+          "op_name": "m2rnn",
+          "path": "auto"
+        }
+      ],
+      "kernel_path": "auto",
+      "loss_first": 11.262968063354492,
+      "loss_last_10_mean": 11.262968063354492,
+      "memory_cap_gb": 58.0,
+      "memory_cap_hit": true,
+      "model_profile": "local_gb10_quarter",
+      "optimizer": "muon_adamw",
+      "optimizer_config_str": "make_muon(cppmega_cuda_parity=True)",
+      "optimizer_state_bytes": 14373463720,
+      "optimizer_state_size_gb": 13.386331237852573,
+      "params_total": 1985000000,
+      "path_b_dispatched": true,
+      "peak_memory_bytes": 89211107942,
+      "peak_memory_gb": 83.0843187328428,
+      "peak_memory_pct_of_60gb": 138.47386455473801,
+      "seq_len": 4096,
+      "software_pins": {
+        "chip": "Apple M4 Max",
+        "macos": "macOS-26.4.1-arm64-arm-64bit-Mach-O",
+        "mlx": "0.31.1"
+      },
+      "steps_measured": 0,
+      "steps_total": 50,
+      "synthetic_data": true,
+      "tok_per_sec_median": null,
+      "tok_per_sec_p10": null,
+      "tok_per_sec_p90": null,
+      "wall_time_seconds": 24.772781583014876,
+      "warmup_steps": 25
+    }
+  ],
+  "schema_version": 1,
+  "scope": "local_gb10_quarter_throughput_60gb_m4",
+  "synthetic_data": true,
+  "wall_time_seconds": 1467.162410999881
+}

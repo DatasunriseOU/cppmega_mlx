@@ -1,0 +1,60 @@
+[
+  {
+    "B": 1,
+    "T": 1024,
+    "opt": "lion",
+    "dtype": "fp32",
+    "params_total": 1796521354,
+    "params_gib": 6.692563571035862,
+    "opt_state_gib": 11.579392272979021,
+    "peak_gib_final": 38.92880327254534,
+    "active_gib_final": 29.85172624513507,
+    "step_times_s": [
+      25.466196060180664,
+      76.02927017211914,
+      64.86070489883423,
+      70.25092124938965
+    ],
+    "median_step_s": 70.25092124938965,
+    "tok_per_sec_median": 14.576321303528767,
+    "loss_first": 22.903278350830078,
+    "wall_seconds": 236.60709238052368,
+    "log": [
+      {
+        "label": "baseline (after reset)",
+        "active_gib": 7.450580596923828e-09,
+        "peak_gib": 0.0
+      },
+      {
+        "label": "after model build (0.3s, fp32)",
+        "active_gib": 6.692613206803799,
+        "peak_gib": 6.692613735795021
+      },
+      {
+        "label": "after optimizer init (lion, 0.7s)",
+        "active_gib": 18.27210484072566,
+        "peak_gib": 18.272105414420366
+      },
+      {
+        "label": "after batch alloc",
+        "active_gib": 18.27210869267583,
+        "peak_gib": 18.27210869267583
+      },
+      {
+        "label": "after forward only (0.77s) loss=11.250",
+        "active_gib": 18.272108674049377,
+        "peak_gib": 19.32922748103738
+      },
+      {
+        "label": "after step 1 (25.47s) loss=11.250",
+        "active_gib": 29.851810228079557,
+        "peak_gib": 38.90799146145582
+      },
+      {
+        "label": "after step 4 done",
+        "active_gib": 29.85172624513507,
+        "peak_gib": 38.92880327254534
+      }
+    ]
+  }
+]
