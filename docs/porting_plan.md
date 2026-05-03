@@ -220,6 +220,7 @@ The current collected test files are:
 - tests/test_system_requirements_doc.py
 - tests/test_tilelang_mamba3.py
 - tests/test_tilelang_sparse_mla.py
+- tests/test_tilelang_sparse_mla_blockscaled.py
 - tests/test_tilelang_sparse_mla_fp8.py
 - tests/test_tilelang_topk.py
 - tests/test_tiny_train.py

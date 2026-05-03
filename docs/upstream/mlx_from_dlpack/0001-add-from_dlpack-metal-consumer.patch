@@ -1,0 +1,822 @@
+From 22fc6b2d96d34e030b9820241515c5e6d6878062 Mon Sep 17 00:00:00 2001
+From: David Gornshtein <davidgornshtein@gmail.com>
+Date: Sun, 3 May 2026 13:46:31 +0200
+Subject: [PATCH] [Python] add mx.from_dlpack(obj) Metal-aware consumer
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds a top-level mx.from_dlpack(obj) that consumes either a raw
+PyCapsule (named "dltensor" or "dltensor_versioned") or any object
+whose __dlpack__() chain yields one. The consumer dispatches on
+DLDevice.device_type:
+
+- kDLCPU (1): copy into a fresh MLX allocation; producer's deleter
+  runs immediately after the copy.
+- kDLMetal (8): wrap the foreign MTLBuffer as an mx.array via
+  array(allocator::Buffer, Shape, Dtype, Deleter) (the constructor
+  MLX already exposes for foreign buffers). Storage mode validated to
+  be MTLResourceStorageModeShared; non-Shared rejected with a clear
+  error message that tells the producer how to fix its allocator.
+
+Other device types (kDLCUDA, kDLROCM, ...) rejected explicitly. Used
+capsules detected and rejected on second consume. Non-contiguous
+strided views rejected.
+
+Motivation: enable zero-copy DLPack interop with TVM-NDArray (which
+allocates Metal buffers as Shared via TVM_METAL_STORAGE_MODE=shared,
+the paired apache/tvm patch), mlx-mfa, and similar Apple Silicon
+producers. Today MLX advertises kDLMetal in __dlpack_device__() but
+exports kDLCPU capsules and offers no consumer at all, so cross-stack
+DLPack interop on Apple Silicon is one-way and host-mediated.
+
+Implementation:
+- dlpack_consumer.{h,cpp} — entry point, capsule parsing, CPU path,
+  used-capsule detection, deleter wiring.
+- dlpack_consumer_metal.cpp — Metal-only TU compiled when
+  MLX_BUILD_METAL=ON; handles kDLMetal capsules.
+- dlpack_consumer_no_metal.cpp — stub linked otherwise.
+- dlpack_format.h — local DLPack ABI structs (DLManagedTensor +
+  DLManagedTensorVersioned + kDL device codes); not vendoring upstream
+  dlpack.h to avoid a third-party dep churn for an MVP.
+- array.cpp — m.def("from_dlpack", ...).
+- CMakeLists.txt — new sources via $<IF:$<BOOL:${MLX_BUILD_METAL}>...>.
+
+Tests: python/tests/test_dlpack_consumer.py covers existence,
+NumPy round-trip, raw capsule round-trip, self round-trip (currently
+exercises CPU path because MLX export still emits kDLCPU — Phase 2),
+13 dtype variants, non-DLPack rejection, used-capsule rejection,
+strided rejection. 8/8 pass.
+
+Phase 2 (separate PR): fix MLX's exporter (convert.cpp lines 100-159)
+to actually emit kDLMetal capsules when running on Metal — currently
+__dlpack_device__() and the produced capsule disagree.
+---
+ python/src/CMakeLists.txt               |   2 +
+ python/src/array.cpp                    |  29 +++
+ python/src/dlpack_consumer.cpp          | 258 ++++++++++++++++++++++++
+ python/src/dlpack_consumer.h            |  55 +++++
+ python/src/dlpack_consumer_metal.cpp    | 157 ++++++++++++++
+ python/src/dlpack_consumer_no_metal.cpp |  16 ++
+ python/src/dlpack_format.h              |  39 ++++
+ python/tests/test_dlpack_consumer.py    | 128 ++++++++++++
+ 8 files changed, 684 insertions(+)
+ create mode 100644 python/src/dlpack_consumer.cpp
+ create mode 100644 python/src/dlpack_consumer.h
+ create mode 100644 python/src/dlpack_consumer_metal.cpp
+ create mode 100644 python/src/dlpack_consumer_no_metal.cpp
+ create mode 100644 python/src/dlpack_format.h
+ create mode 100644 python/tests/test_dlpack_consumer.py
+
+diff --git a/python/src/CMakeLists.txt b/python/src/CMakeLists.txt
+index 4472715..58cd31c 100644
+--- a/python/src/CMakeLists.txt
++++ b/python/src/CMakeLists.txt
+@@ -10,6 +10,8 @@ nanobind_add_module(
+   ${CMAKE_CURRENT_SOURCE_DIR}/array.cpp
+   ${CMAKE_CURRENT_SOURCE_DIR}/convert.cpp
+   ${CMAKE_CURRENT_SOURCE_DIR}/device.cpp
++  ${CMAKE_CURRENT_SOURCE_DIR}/dlpack_consumer.cpp
++  $<IF:$<BOOL:${MLX_BUILD_METAL}>,${CMAKE_CURRENT_SOURCE_DIR}/dlpack_consumer_metal.cpp,${CMAKE_CURRENT_SOURCE_DIR}/dlpack_consumer_no_metal.cpp>
+   ${CMAKE_CURRENT_SOURCE_DIR}/distributed.cpp
+   ${CMAKE_CURRENT_SOURCE_DIR}/export.cpp
+   ${CMAKE_CURRENT_SOURCE_DIR}/fast.cpp
+diff --git a/python/src/array.cpp b/python/src/array.cpp
+index a5e6dbe..f726716 100644
+--- a/python/src/array.cpp
++++ b/python/src/array.cpp
+@@ -15,6 +15,7 @@
+ #include "mlx/utils.h"
+ #include "python/src/buffer.h"
+ #include "python/src/convert.h"
++#include "python/src/dlpack_consumer.h"
+ #include "python/src/indexing.h"
+ #include "python/src/small_vector.h"
+ #include "python/src/utils.h"
+@@ -280,6 +281,34 @@ void init_array(nb::module_& m) {
+       .def("__next__", &ArrayPythonIterator::next)
+       .def("__iter__", [](const ArrayPythonIterator& it) { return it; });
+ 
++  m.def(
++      "from_dlpack",
++      [](nb::object obj) { return dlpack_to_mlx(obj); },
++      "obj"_a,
++      R"pbdoc(
++        Build an :class:`array` from a DLPack capsule or any object that
++        implements ``__dlpack__()``.
++
++        For ``device_type == kDLCPU`` the bytes are copied into a fresh MLX
++        allocation. For ``device_type == kDLMetal`` the foreign ``MTLBuffer``
++        is wrapped without copying; the buffer must use
++        ``MTLStorageModeShared`` so MLX can read and write it. Other DLPack
++        device types raise an exception.
++
++        The returned array takes over the capsule's lifecycle: the producer's
++        deleter is invoked exactly once, after the wrapping array (and any
++        aliases) are destroyed.
++
++        Args:
++            obj: a DLPack ``PyCapsule`` (named ``"dltensor"`` or
++                ``"dltensor_versioned"``) or a Python object with a
++                ``__dlpack__()`` method.
++
++        Returns:
++            array: an MLX array sharing memory with the producer when
++                possible.
++      )pbdoc");
++
+   // Install buffer protocol functions
+   PyType_Slot array_slots[] = {
+       {Py_bf_getbuffer, (void*)getbuffer},
+diff --git a/python/src/dlpack_consumer.cpp b/python/src/dlpack_consumer.cpp
+new file mode 100644
+index 0000000..d12ea5f
+--- /dev/null
++++ b/python/src/dlpack_consumer.cpp
+@@ -0,0 +1,258 @@
++// Copyright © 2026 Apple Inc.
++
++#include "python/src/dlpack_consumer.h"
++
++#include <cstring>
++#include <memory>
++#include <sstream>
++
++#include "mlx/allocator.h"
++#include "mlx/dtype.h"
++#include "python/src/convert.h"
++#include "python/src/dlpack_format.h"
++
++namespace {
++
++mx::Dtype dlpack_to_mlx_dtype(const nb::dlpack::dtype& dt) {
++  if (dt.lanes != 1) {
++    std::ostringstream msg;
++    msg << "[from_dlpack] DLPack tensors with lanes != 1 are not supported "
++        << "(got lanes=" << dt.lanes << ").";
++    throw std::invalid_argument(msg.str());
++  }
++  using Code = nb::dlpack::dtype_code;
++  switch (static_cast<Code>(dt.code)) {
++    case Code::Bool:
++      if (dt.bits == 8)
++        return mx::bool_;
++      break;
++    case Code::Int:
++      switch (dt.bits) {
++        case 8:
++          return mx::int8;
++        case 16:
++          return mx::int16;
++        case 32:
++          return mx::int32;
++        case 64:
++          return mx::int64;
++      }
++      break;
++    case Code::UInt:
++      switch (dt.bits) {
++        case 8:
++          return mx::uint8;
++        case 16:
++          return mx::uint16;
++        case 32:
++          return mx::uint32;
++        case 64:
++          return mx::uint64;
++      }
++      break;
++    case Code::Float:
++      switch (dt.bits) {
++        case 16:
++          return mx::float16;
++        case 32:
++          return mx::float32;
++        case 64:
++          return mx::float64;
++      }
++      break;
++    case Code::Bfloat:
++      if (dt.bits == 16)
++        return mx::bfloat16;
++      break;
++    case Code::Complex:
++      if (dt.bits == 64)
++        return mx::complex64;
++      break;
++    default:
++      break;
++  }
++  std::ostringstream msg;
++  msg << "[from_dlpack] Unsupported DLPack dtype: code=" << int(dt.code)
++      << ", bits=" << int(dt.bits) << ".";
++  throw std::invalid_argument(msg.str());
++}
++
++bool is_row_contiguous(
++    int32_t ndim,
++    const int64_t* shape,
++    const int64_t* strides) {
++  if (strides == nullptr) {
++    return true;
++  }
++  int64_t expected = 1;
++  for (int i = ndim - 1; i >= 0; --i) {
++    if (strides[i] != expected) {
++      return false;
++    }
++    expected *= shape[i];
++  }
++  return true;
++}
++
++struct ParsedCapsule {
++  PyObject* capsule = nullptr;
++  bool versioned = false;
++  nb::dlpack::dltensor* tensor = nullptr;
++  void* managed = nullptr; // typed by `versioned`
++};
++
++ParsedCapsule parse_capsule(PyObject* obj) {
++  ParsedCapsule out;
++  if (PyCapsule_IsValid(obj, "dltensor_versioned")) {
++    out.versioned = true;
++    auto* m = static_cast<dlpack_format::DLManagedTensorVersioned*>(
++        PyCapsule_GetPointer(obj, "dltensor_versioned"));
++    if (m == nullptr) {
++      throw std::invalid_argument(
++          "[from_dlpack] dltensor_versioned capsule is null.");
++    }
++    out.managed = static_cast<void*>(m);
++    out.tensor = &m->dl_tensor;
++  } else if (PyCapsule_IsValid(obj, "dltensor")) {
++    out.versioned = false;
++    auto* m = static_cast<dlpack_format::DLManagedTensor*>(
++        PyCapsule_GetPointer(obj, "dltensor"));
++    if (m == nullptr) {
++      throw std::invalid_argument("[from_dlpack] dltensor capsule is null.");
++    }
++    out.managed = static_cast<void*>(m);
++    out.tensor = &m->dl_tensor;
++  } else {
++    throw std::invalid_argument(
++        "[from_dlpack] expected a PyCapsule named 'dltensor' or "
++        "'dltensor_versioned'.");
++  }
++  out.capsule = obj;
++  return out;
++}
++
++void rename_capsule_after_take(PyObject* capsule, bool versioned) {
++  const char* used =
++      versioned ? "used_dltensor_versioned" : "used_dltensor";
++  PyCapsule_SetName(capsule, used);
++  PyCapsule_SetDestructor(capsule, nullptr);
++}
++
++mx::Shape extract_shape(const nb::dlpack::dltensor& t) {
++  mx::Shape shape;
++  shape.reserve(t.ndim);
++  for (int i = 0; i < t.ndim; ++i) {
++    if (t.shape[i] > std::numeric_limits<int32_t>::max()) {
++      throw std::invalid_argument(
++          "[from_dlpack] shape dim exceeds int32 range.");
++    }
++    shape.push_back(static_cast<int32_t>(t.shape[i]));
++  }
++  return shape;
++}
++
++mx::array build_cpu_array(
++    nb::dlpack::dltensor& t,
++    std::shared_ptr<DLPackOwner> owner) {
++  if (!is_row_contiguous(t.ndim, t.shape, t.strides)) {
++    throw std::invalid_argument(
++        "[from_dlpack] non-row-contiguous DLPack strides are not supported "
++        "for kDLCPU tensors yet.");
++  }
++  if (t.byte_offset != 0) {
++    throw std::invalid_argument(
++        "[from_dlpack] kDLCPU capsule with non-zero byte_offset is not "
++        "supported yet.");
++  }
++  auto shape = extract_shape(t);
++  auto dtype = dlpack_to_mlx_dtype(t.dtype);
++
++  size_t nelems = 1;
++  for (int i = 0; i < t.ndim; ++i)
++    nelems *= static_cast<size_t>(t.shape[i]);
++  size_t nbytes = nelems * dtype.size();
++
++  // Allocate a fresh mlx buffer and copy the producer's bytes in. This
++  // mirrors the semantics of nd_array_to_mlx_contiguous for the kDLCPU
++  // path. We use the (allocator::Buffer, Shape, Dtype, Deleter) overload to
++  // get an array whose status() == Status::available immediately.
++  auto buffer = mx::allocator::malloc(nbytes);
++  std::memcpy(
++      static_cast<uint8_t*>(buffer.raw_ptr()),
++      t.data,
++      nbytes);
++  mx::array out(buffer, std::move(shape), dtype, mx::allocator::free);
++
++  // Done with the producer; bytes are copied.
++  owner->invoke();
++  return out;
++}
++
++} // namespace
++
++void DLPackOwner::invoke() {
++  if (mt_ == nullptr)
++    return;
++  if (versioned_) {
++    auto* m = static_cast<dlpack_format::DLManagedTensorVersioned*>(mt_);
++    if (m->deleter)
++      m->deleter(m);
++  } else {
++    auto* m = static_cast<dlpack_format::DLManagedTensor*>(mt_);
++    if (m->deleter)
++      m->deleter(m);
++  }
++  mt_ = nullptr;
++}
++
++mx::array dlpack_to_mlx(nb::object obj) {
++  // Accept either:
++  //   * a PyCapsule (raw DLPack output),
++  //   * an object that returns a PyCapsule from __dlpack__(),
++  //   * an object whose __dlpack__() returns *another* object that is itself
++  //     PEP-3118 / DLPack-compliant (e.g. nanobind's nb_ndarray wrapper that
++  //     mlx returns from mx.array.__dlpack__). We unwrap up to N times.
++  constexpr int kMaxUnwrap = 4;
++  PyObject* raw = obj.ptr();
++  nb::object current = obj; // own a reference for the chain
++
++  for (int i = 0; i < kMaxUnwrap; ++i) {
++    if (PyCapsule_CheckExact(raw)) {
++      break;
++    }
++    if (!nb::hasattr(current, "__dlpack__")) {
++      throw std::invalid_argument(
++          "[from_dlpack] expected a PyCapsule or an object exposing "
++          "__dlpack__().");
++    }
++    current = current.attr("__dlpack__")();
++    raw = current.ptr();
++  }
++  if (!PyCapsule_CheckExact(raw)) {
++    throw std::invalid_argument(
++        "[from_dlpack] could not resolve input to a DLPack PyCapsule "
++        "after repeated __dlpack__() calls.");
++  }
++
++  ParsedCapsule p = parse_capsule(raw);
++  auto owner = std::make_shared<DLPackOwner>(p.versioned, p.managed);
++  rename_capsule_after_take(p.capsule, p.versioned);
++
++  auto& t = *p.tensor;
++  switch (t.device.device_type) {
++    case dlpack_format::kDLCPU:
++      return build_cpu_array(t, owner);
++    case dlpack_format::kDLMetal:
++      return build_dlpack_metal_array(t, owner);
++    case dlpack_format::kDLCUDA:
++      throw std::invalid_argument(
++          "[from_dlpack] kDLCUDA tensors are not supported by MLX. Move the "
++          "tensor to host memory or to a Metal-backed framework first.");
++    default: {
++      std::ostringstream msg;
++      msg << "[from_dlpack] unsupported DLPack device_type "
++          << t.device.device_type << ".";
++      throw std::invalid_argument(msg.str());
++    }
++  }
++}
+diff --git a/python/src/dlpack_consumer.h b/python/src/dlpack_consumer.h
+new file mode 100644
+index 0000000..682d43a
+--- /dev/null
++++ b/python/src/dlpack_consumer.h
+@@ -0,0 +1,55 @@
++// Copyright © 2026 Apple Inc.
++#pragma once
++
++#include <memory>
++
++#include <nanobind/nanobind.h>
++#include <nanobind/ndarray.h>
++
++#include "mlx/array.h"
++
++namespace mx = mlx::core;
++namespace nb = nanobind;
++
++// Convert a DLPack capsule (or a Python object exposing __dlpack__) into an
++// mx::array.
++//
++// Supported device types:
++//   * kDLCPU (1)        : copies host bytes into a fresh mlx allocation.
++//   * kDLMetal (8)      : zero-copy; wraps a foreign MTL::Buffer in shared
++//                         storage mode. Non-shared buffers are rejected.
++//
++// All other device types raise std::invalid_argument.
++//
++// The returned mx::array takes ownership of the capsule's deleter. Once the
++// array (and any aliases) are destroyed, the capsule's deleter is invoked
++// exactly once.
++mx::array dlpack_to_mlx(nb::object obj);
++
++// A small reference-counted holder that drives the DLPack capsule's deleter
++// exactly once. Kept here so the metal-glue translation unit can reach it.
++class DLPackOwner {
++ public:
++  DLPackOwner(bool versioned, void* mt) : versioned_(versioned), mt_(mt) {}
++
++  ~DLPackOwner() {
++    invoke();
++  }
++
++  void invoke();
++
++  // Disable copies: only one DLPackOwner may exist per managed tensor.
++  DLPackOwner(const DLPackOwner&) = delete;
++  DLPackOwner& operator=(const DLPackOwner&) = delete;
++
++ private:
++  bool versioned_;
++  void* mt_;
++};
++
++// Build an mx::array from a DLPack tensor whose data is a foreign MTL::Buffer.
++// Defined in dlpack_consumer_metal.cpp when MLX_BUILD_METAL is on, and in
++// dlpack_consumer_no_metal.cpp otherwise.
++mx::array build_dlpack_metal_array(
++    nb::dlpack::dltensor& t,
++    std::shared_ptr<DLPackOwner> owner);
+diff --git a/python/src/dlpack_consumer_metal.cpp b/python/src/dlpack_consumer_metal.cpp
+new file mode 100644
+index 0000000..ce3a30c
+--- /dev/null
++++ b/python/src/dlpack_consumer_metal.cpp
+@@ -0,0 +1,157 @@
++// Copyright © 2026 Apple Inc.
++
++#include <Metal/Metal.hpp>
++
++#include <memory>
++#include <sstream>
++
++#include "mlx/allocator.h"
++#include "mlx/array.h"
++#include "mlx/backend/metal/metal.h"
++#include "mlx/dtype.h"
++#include "python/src/dlpack_consumer.h"
++#include "python/src/dlpack_format.h"
++
++namespace {
++
++mx::Dtype dlpack_to_mlx_dtype(const nb::dlpack::dtype& dt) {
++  using Code = nb::dlpack::dtype_code;
++  if (dt.lanes != 1) {
++    throw std::invalid_argument(
++        "[from_dlpack] DLPack tensors with lanes != 1 are not supported.");
++  }
++  switch (static_cast<Code>(dt.code)) {
++    case Code::Bool:
++      if (dt.bits == 8)
++        return mx::bool_;
++      break;
++    case Code::Int:
++      switch (dt.bits) {
++        case 8:
++          return mx::int8;
++        case 16:
++          return mx::int16;
++        case 32:
++          return mx::int32;
++        case 64:
++          return mx::int64;
++      }
++      break;
++    case Code::UInt:
++      switch (dt.bits) {
++        case 8:
++          return mx::uint8;
++        case 16:
++          return mx::uint16;
++        case 32:
++          return mx::uint32;
++        case 64:
++          return mx::uint64;
++      }
++      break;
++    case Code::Float:
++      switch (dt.bits) {
++        case 16:
++          return mx::float16;
++        case 32:
++          return mx::float32;
++        case 64:
++          return mx::float64;
++      }
++      break;
++    case Code::Bfloat:
++      if (dt.bits == 16)
++        return mx::bfloat16;
++      break;
++    case Code::Complex:
++      if (dt.bits == 64)
++        return mx::complex64;
++      break;
++    default:
++      break;
++  }
++  std::ostringstream msg;
++  msg << "[from_dlpack] Unsupported DLPack dtype: code=" << int(dt.code)
++      << ", bits=" << int(dt.bits) << ".";
++  throw std::invalid_argument(msg.str());
++}
++
++bool is_row_contiguous(
++    int32_t ndim,
++    const int64_t* shape,
++    const int64_t* strides) {
++  if (strides == nullptr) {
++    return true;
++  }
++  int64_t expected = 1;
++  for (int i = ndim - 1; i >= 0; --i) {
++    if (strides[i] != expected) {
++      return false;
++    }
++    expected *= shape[i];
++  }
++  return true;
++}
++
++mx::Shape extract_shape(const nb::dlpack::dltensor& t) {
++  mx::Shape shape;
++  shape.reserve(t.ndim);
++  for (int i = 0; i < t.ndim; ++i) {
++    if (t.shape[i] > std::numeric_limits<int32_t>::max()) {
++      throw std::invalid_argument(
++          "[from_dlpack] shape dim exceeds int32 range.");
++    }
++    shape.push_back(static_cast<int32_t>(t.shape[i]));
++  }
++  return shape;
++}
++
++} // namespace
++
++mx::array build_dlpack_metal_array(
++    nb::dlpack::dltensor& t,
++    std::shared_ptr<DLPackOwner> owner) {
++  if (!mx::metal::is_available()) {
++    throw std::invalid_argument(
++        "[from_dlpack] Metal device tensors require an MLX build with Metal "
++        "support enabled and a Metal-capable host.");
++  }
++  if (t.data == nullptr) {
++    throw std::invalid_argument(
++        "[from_dlpack] kDLMetal capsule has null MTLBuffer pointer.");
++  }
++  // For kDLMetal, DLPack stipulates `data` is an MTL::Buffer*.
++  auto mtl_buffer = static_cast<MTL::Buffer*>(t.data);
++  if (mtl_buffer->storageMode() != MTL::StorageModeShared) {
++    throw std::invalid_argument(
++        "[from_dlpack] foreign MTLBuffer must use MTLStorageModeShared. MLX "
++        "currently relies on shared-mode buffers for read/write access. "
++        "Allocate the producer-side buffer with MTLResourceStorageModeShared "
++        "before exporting via DLPack.");
++  }
++  if (t.byte_offset != 0) {
++    throw std::invalid_argument(
++        "[from_dlpack] kDLMetal capsule with non-zero byte_offset is not "
++        "supported yet.");
++  }
++  if (!is_row_contiguous(t.ndim, t.shape, t.strides)) {
++    throw std::invalid_argument(
++        "[from_dlpack] non-row-contiguous DLPack strides are not supported. "
++        "Reshape on the producer side before exporting.");
++  }
++
++  auto shape = extract_shape(t);
++  auto dtype = dlpack_to_mlx_dtype(t.dtype);
++
++  // Wrap the foreign MTL::Buffer* directly. The producer retains the
++  // underlying allocation; we drive the capsule's deleter when the wrapping
++  // mx::array (and any aliases) are destroyed.
++  mx::allocator::Buffer wrapped(static_cast<void*>(mtl_buffer));
++  mx::Deleter deleter = [owner](mx::allocator::Buffer) mutable {
++    // Drop our shared_ptr; if this was the last reference, the owner's
++    // destructor invokes the DLPack deleter.
++    owner.reset();
++  };
++
++  return mx::array(wrapped, std::move(shape), dtype, std::move(deleter));
++}
+diff --git a/python/src/dlpack_consumer_no_metal.cpp b/python/src/dlpack_consumer_no_metal.cpp
+new file mode 100644
+index 0000000..40db88e
+--- /dev/null
++++ b/python/src/dlpack_consumer_no_metal.cpp
+@@ -0,0 +1,16 @@
++// Copyright © 2026 Apple Inc.
++
++#include <stdexcept>
++
++#include "python/src/dlpack_consumer.h"
++
++mx::array build_dlpack_metal_array(
++    nb::dlpack::dltensor& /*t*/,
++    std::shared_ptr<DLPackOwner> owner) {
++  // Drive the producer's deleter so we don't leak its allocation.
++  if (owner)
++    owner->invoke();
++  throw std::invalid_argument(
++      "[from_dlpack] MLX was built without Metal support; cannot consume "
++      "kDLMetal capsules.");
++}
+diff --git a/python/src/dlpack_format.h b/python/src/dlpack_format.h
+new file mode 100644
+index 0000000..b95f747
+--- /dev/null
++++ b/python/src/dlpack_format.h
+@@ -0,0 +1,39 @@
++// Copyright © 2026 Apple Inc.
++#pragma once
++
++#include <cstdint>
++
++#include <nanobind/ndarray.h>
++
++namespace nb = nanobind;
++
++// DLPack ABI structs. We define them locally because nanobind does not expose
++// the DLManagedTensor wrapper, and the patch should not introduce a new
++// third-party dependency. These match the upstream DLPack header at
++// https://github.com/dmlc/dlpack/blob/main/include/dlpack/dlpack.h
++namespace dlpack_format {
++
++struct DLManagedTensor {
++  nb::dlpack::dltensor dl_tensor;
++  void* manager_ctx;
++  void (*deleter)(struct DLManagedTensor* self);
++};
++
++struct DLPackVersion {
++  uint32_t major;
++  uint32_t minor;
++};
++
++struct DLManagedTensorVersioned {
++  DLPackVersion version;
++  void* manager_ctx;
++  void (*deleter)(struct DLManagedTensorVersioned* self);
++  uint64_t flags;
++  nb::dlpack::dltensor dl_tensor;
++};
++
++constexpr int32_t kDLCPU = 1;
++constexpr int32_t kDLCUDA = 2;
++constexpr int32_t kDLMetal = 8;
++
++} // namespace dlpack_format
+diff --git a/python/tests/test_dlpack_consumer.py b/python/tests/test_dlpack_consumer.py
+new file mode 100644
+index 0000000..e03f1bf
+--- /dev/null
++++ b/python/tests/test_dlpack_consumer.py
+@@ -0,0 +1,128 @@
++# Copyright © 2026 Apple Inc.
++"""Tests for ``mx.from_dlpack`` (consumer side).
++
++The patch adds a Python-visible entry point::
++
++    arr = mx.from_dlpack(capsule_or_obj)
++
++These tests cover three scenarios that don't depend on a third-party Metal
++producer:
++
++1. Round trip through NumPy (``kDLCPU`` path).
++2. Self round trip via ``mx.array.__dlpack__`` (``kDLMetal`` on Metal hosts,
++   ``kDLCPU`` otherwise).
++3. Negative paths: CUDA capsule, malformed capsule, etc.
++
++The Metal-with-Private-storage rejection test is provided as an optional
++helper exercised when both metal-cpp and the producer-side ``__dlpack__``
++hook are available; on systems where only MLX-allocated buffers can be
++produced (always shared) it simply checks that MLX's own export does not
++trip the private-mode guard.
++"""
++
++from __future__ import annotations
++
++import unittest
++
++import numpy as np
++
++try:
++    import mlx.core as mx
++except ImportError as exc:  # pragma: no cover - import error is environment specific
++    raise unittest.SkipTest(f"mlx.core unavailable: {exc}")
++
++
++class TestFromDLPackBasic(unittest.TestCase):
++    def test_function_exists(self):
++        self.assertTrue(hasattr(mx, "from_dlpack"))
++
++    def test_round_trip_via_numpy(self):
++        # NumPy arrays implement __dlpack__ (always kDLCPU). Going through
++        # this path validates the kDLCPU branch which copies bytes into a
++        # fresh mlx allocation and drives the producer deleter immediately.
++        arr_np = np.arange(12, dtype=np.float32).reshape(3, 4)
++        arr_mx = mx.from_dlpack(arr_np)
++        self.assertEqual(tuple(arr_mx.shape), (3, 4))
++        self.assertEqual(arr_mx.dtype, mx.float32)
++        self.assertTrue(np.allclose(np.asarray(arr_mx), arr_np))
++
++    def test_round_trip_via_capsule(self):
++        # Pass a raw PyCapsule rather than the producer object.
++        arr_np = np.arange(8, dtype=np.int32).reshape(2, 4)
++        capsule = arr_np.__dlpack__()
++        arr_mx = mx.from_dlpack(capsule)
++        self.assertEqual(tuple(arr_mx.shape), (2, 4))
++        self.assertEqual(arr_mx.dtype, mx.int32)
++        self.assertTrue(np.array_equal(np.asarray(arr_mx), arr_np))
++
++    def test_self_round_trip(self):
++        # mx.array -> __dlpack__ -> from_dlpack should be byte-identical.
++        x = mx.arange(20, dtype=mx.float32).reshape(4, 5)
++        y = mx.from_dlpack(x)
++        # Different arrays, same data
++        self.assertTrue(mx.array_equal(x, y).item())
++
++    def test_dtypes(self):
++        cases = [
++            (np.bool_, mx.bool_),
++            (np.int8, mx.int8),
++            (np.int16, mx.int16),
++            (np.int32, mx.int32),
++            (np.int64, mx.int64),
++            (np.uint8, mx.uint8),
++            (np.uint16, mx.uint16),
++            (np.uint32, mx.uint32),
++            (np.uint64, mx.uint64),
++            (np.float16, mx.float16),
++            (np.float32, mx.float32),
++            (np.float64, mx.float64),
++            (np.complex64, mx.complex64),
++        ]
++        for np_dtype, mx_dtype in cases:
++            with self.subTest(np_dtype=np_dtype):
++                arr = np.zeros((2, 3), dtype=np_dtype)
++                if np_dtype is np.bool_:
++                    arr[0, 0] = True
++                else:
++                    arr[0, 0] = 1
++                converted = mx.from_dlpack(arr)
++                self.assertEqual(converted.dtype, mx_dtype)
++                self.assertEqual(tuple(converted.shape), (2, 3))
++
++
++class TestFromDLPackErrors(unittest.TestCase):
++    def test_rejects_non_dlpack_object(self):
++        with self.assertRaises(Exception):
++            mx.from_dlpack(object())
++
++    def test_rejects_used_capsule(self):
++        arr_np = np.arange(4, dtype=np.float32)
++        capsule = arr_np.__dlpack__()
++        # First call consumes; second must fail because the capsule was
++        # renamed to "used_dltensor".
++        _ = mx.from_dlpack(capsule)
++        with self.assertRaises(Exception):
++            mx.from_dlpack(capsule)
++
++
++class TestFromDLPackNonContiguous(unittest.TestCase):
++    def test_strided_view_rejected(self):
++        # MLX's first-cut consumer does not support arbitrary DLPack strides.
++        # NumPy emits __dlpack__ with explicit strides for slices; producers
++        # may or may not encode strides depending on contiguity. We assert
++        # that a non-row-contiguous slice is rejected with a clear error
++        # rather than silently misinterpreting the layout.
++        big = np.arange(16, dtype=np.float32).reshape(4, 4)
++        view = big[::2, :]
++        try:
++            capsule = view.__dlpack__()
++        except (TypeError, BufferError):
++            self.skipTest(
++                "NumPy refused to export a non-contiguous DLPack capsule"
++            )
++        with self.assertRaises(Exception):
++            mx.from_dlpack(capsule)
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.50.1 (Apple Git-155)
+

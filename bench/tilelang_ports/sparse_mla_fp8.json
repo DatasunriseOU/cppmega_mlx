@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "kind": "tilelang_port_bench",
+  "port": "sparse_mla_fp8",
+  "shape": {
+    "q_shape": [
+      1,
+      64,
+      4,
+      64
+    ],
+    "kv_shape": [
+      1,
+      64,
+      1,
+      64
+    ],
+    "indices_shape": [
+      1,
+      64,
+      1,
+      16
+    ],
+    "d_v": 32,
+    "q_dtype": "mlx.core.float32",
+    "kv_dtype": "mlx.core.float32"
+  },
+  "metal_status": {
+    "available": false,
+    "dispatch_reason": "unsupported dtype for vendor MSL kernel: mlx.core.int32",
+    "codegen_blocker_reason": "tilelang 0.1.9 metal codegen cannot emit float8_e4m3 dtype (3rdparty/tvm/src/target/source/codegen_metal.cc:271 raises 'Cannot convert type float8_e4m3 to Metal type'); the CUDA codegen supports FP8 but the Metal one does not. Additionally, tilelang 0.1.9 metal target does not support T.gemm (Unsupported target for gemm: metal); waiting on tile-ai/tilelang HEAD with Apple simdgroup PRs. See docs/tilelang_ports/sparse_mla_fp8.md.",
+    "fp8_dtype": "float8_e4m3"
+  },
+  "parity": {
+    "fp8_vs_bf16": {
+      "max_abs_err": 0.0030034519731998444,
+      "max_rel_err": 0.031174618342377305
+    },
+    "quantized_matmul_vs_bf16": {
+      "max_abs_err": 0.0,
+      "max_rel_err": 0.0
+    }
+  },
+  "bench": {
+    "bf16_reference": {
+      "label": "bf16_reference",
+      "median_ms": 0.2945831511169672,
+      "min_ms": 0.2644159831106663,
+      "max_ms": 0.5323330406099558,
+      "iters": 25
+    },
+    "fp8_reference": {
+      "label": "fp8_reference",
+      "median_ms": 0.32762507908046246,
+      "min_ms": 0.31083286739885807,
+      "max_ms": 0.5432090256363153,
+      "iters": 25
+    },
+    "quantized_matmul_reference": {
+      "label": "quantized_matmul_reference",
+      "median_ms": 0.278000021353364,
+      "min_ms": 0.2480840776115656,
+      "max_ms": 0.4645839799195528,
+      "iters": 25
+    }
+  }
+}
