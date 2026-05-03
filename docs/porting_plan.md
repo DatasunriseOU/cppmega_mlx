@@ -218,6 +218,10 @@ The current collected test files are:
 - tests/test_stp_loss.py
 - tests/test_structure_embedding.py
 - tests/test_system_requirements_doc.py
+- tests/test_tilelang_mamba3.py
+- tests/test_tilelang_sparse_mla.py
+- tests/test_tilelang_sparse_mla_fp8.py
+- tests/test_tilelang_topk.py
 - tests/test_tiny_train.py
 - tests/test_token_dataset.py
 - tests/test_tokenizer_contract.py

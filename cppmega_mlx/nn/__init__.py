@@ -47,6 +47,11 @@ from cppmega_mlx.nn.ngram_hash import (
     NgramHashEmbedding,
     pick_primes,
 )
+from cppmega_mlx.nn.sparse_mla import (
+    SparseMLAShapes,
+    sparse_mla_attention,
+    sparse_mla_attention_reference,
+)
 from cppmega_mlx.nn.structure_embedding import (
     CppMegaStructureEmbedding,
     StructureEmbedding,
@@ -78,6 +83,7 @@ __all__ = [
     "NgramHashEmbedding",
     "ReferenceMoE",
     "RouterOutput",
+    "SparseMLAShapes",
     "StructureEmbedding",
     "TopKRouter",
     "broadcast_m2rnn_heads",
@@ -92,4 +98,6 @@ __all__ = [
     "parse_ngram_orders",
     "pick_primes",
     "sinkhorn_normalize",
+    "sparse_mla_attention",
+    "sparse_mla_attention_reference",
 ]

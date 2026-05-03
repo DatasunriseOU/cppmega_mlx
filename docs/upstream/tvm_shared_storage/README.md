@@ -4,7 +4,9 @@
 
 **Local fork branch**: `cppmega/metal-shared-storage-opt-in` in `/Volumes/external/sources/tvm` (sibling to this repo). Branched from `apache/tvm@8873a4c` (HEAD on `main` at clone time).
 
-**Patch artifact**: `0001-metal-shared-storage-opt-in.patch` in this directory. Apply with `git am` or `git apply`.
+**Patch artifact**: `0001-metal-shared-storage-opt-in.patch` in this directory (181 lines, +102/−13 in 1 file). Apply with `git am` or `git apply`.
+
+**Live-verified**: 4/4 scenarios on real Apple Silicon hardware (Xcode 21, MacOSX26.4 SDK). `MTLBuffer.storageMode` matches the env var setting after `MetalWorkspace::AllocDataSpace`. See `runtime_check.mm` in this directory.
 
 ## Why we need this
 
@@ -123,5 +125,31 @@ print('alloc OK:', arr.shape)
 
 ## Files in this directory
 
-- `0001-metal-shared-storage-opt-in.patch` — apply with `git am` or `git apply`
+- `0001-metal-shared-storage-opt-in.patch` — apply with `git am` or `git apply` (181 lines, +102/−13)
 - `README.md` — this file
+- `syntax_check.mm` — standalone Metal-only program that vendors the helper and exercises the env-var parsing (no libtvm needed). Build: `xcrun --sdk macosx clang++ -std=c++17 -framework Metal syntax_check.mm -o syntax_check`. Verifies all 6 cases (unset, shared, mixed-case Shared, invalid, managed, private).
+- `runtime_check.mm` — live in-process C++ test that loads the freshly-built `libtvm_runtime.dylib` and (a) calls `metal.GetStorageMode()` via FFI, (b) calls `device_api.metal.AllocDataSpace()` and inspects the `MTLBuffer.storageMode`. Strongest possible verification — proves the env var actually flows through to a real `MTLBuffer`. **Live results captured 2026-05-03 on Apple M4 Max:**
+
+```
+$ ./runtime_check
+metal.GetStorageMode -> 'private'
+MTLBuffer.storageMode = private
+OK
+
+$ TVM_METAL_STORAGE_MODE=shared ./runtime_check
+metal.GetStorageMode -> 'shared'
+MTLBuffer.storageMode = shared
+OK
+
+$ TVM_METAL_STORAGE_MODE=managed ./runtime_check
+metal.GetStorageMode -> 'managed'
+MTLBuffer.storageMode = managed
+OK
+
+$ TVM_METAL_STORAGE_MODE=private ./runtime_check
+metal.GetStorageMode -> 'private'
+MTLBuffer.storageMode = private
+OK
+```
+
+- `test_metal_shared_storage.py` — Python smoke test (gated on `tvm.testing.requires_metal`) for downstream CI. Compiles a TIR element-wise add for `target="metal"`, round-trips through `tvm.nd.array`, asserts numerical correctness with the env var set.

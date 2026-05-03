@@ -1,59 +1,47 @@
-From 0b58506dd7b87b17e3603dcbb2ab5ca35bc33012 Mon Sep 17 00:00:00 2001
-From: David Gornshtein <davidgornshtein@gmail.com>
-Date: Sun, 3 May 2026 13:23:33 +0200
-Subject: [PATCH] [Runtime][Metal] add TVM_METAL_STORAGE_MODE env opt-in for
- Shared/Managed buffers
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
+From 9b2d4985e9afa55ad512741942443c38290f1913 Mon Sep 17 00:00:00 2001
+From: Claude Patch <patch@local>
+Date: Sun, 3 May 2026 13:23:17 +0200
+Subject: [PATCH] [Metal] Opt-in shared-storage allocation via
+ TVM_METAL_STORAGE_MODE
 
-The Metal device API has historically allocated MTLBuffer with
-MTLResourceStorageModePrivate (GPU-only), which is fast for pure-GPU
-workloads but blocks zero-copy DLPack interop with frameworks that
-allocate Shared (CPU-visible) buffers — notably ml-explore/mlx, which
-uses MTLResourceStorageModeShared throughout.
+Add an opt-in environment variable that lets users allocate device data
+buffers as MTLResourceStorageModeShared instead of the default
+MTLResourceStorageModePrivate. The default behaviour is unchanged.
 
-Add a runtime env-var override `TVM_METAL_STORAGE_MODE` that is parsed
-once on first AllocDataSpace call and cached. Accepted values:
+Motivation: zero-copy DLPack interop with frameworks that allocate
+their own MTLBuffers as Shared (notably MLX 0.31+). Two allocators on
+the same MTLDevice cannot share an MTLBuffer that has different
+page-mapping semantics, so DLPack capsules cross-imported between
+TVM-NDArray and mx.array currently fail with std::bad_cast. Setting
+TVM_METAL_STORAGE_MODE=shared aligns the storage classes and unblocks
+the zero-copy path.
 
-* unset/empty/`private` -> MTLResourceStorageModePrivate (default,
-  preserves backward compatibility — every existing TVM workload sees
-  identical behaviour).
-* `shared` -> MTLResourceStorageModeShared. Buffer is page-mapped on
-  both CPU and GPU. Required for zero-copy DLPack to mlx/MPS-backed
-  PyTorch.
-* `managed` -> MTLResourceStorageModeManaged. Driver tracks dirty pages
-  on macOS; not supported on iOS.
+The flag is read once at first use and cached for the lifetime of the
+process. The staging buffer pool and GPU->CPU temp buffer are
+deliberately untouched: both are host-staging buffers that must remain
+Shared for their existing copy paths to work.
 
-Unknown values fall back to Private with a warning. Also drops the dead
-`#if TARGET_OS_IPHONE` comment block superseded by the env var.
+A new FFI helper metal.GetStorageMode is registered alongside the
+existing metal.GetProfileCounters / metal.ResetProfileCounters helpers
+so Python tests can verify the resolved mode without an ObjC bridge.
 
-The staging-buffer pool (metal_common.h:383) and temp-buffer pool
-(metal_device_api.mm:374) already use Shared and are intentionally left
-unchanged — they're host-staging by design.
-
-A subprocess-based pytest is added at
-tests/python/runtime/test_metal_storage_mode_env.py covering the four
-cases (default/shared/managed/invalid). Subprocess isolation is
-necessary because the env var is read once per process.
+No build-system change is required.
 ---
- src/runtime/metal/metal_device_api.mm         |  48 ++++++--
- .../runtime/test_metal_storage_mode_env.py    | 107 ++++++++++++++++++
- 2 files changed, 146 insertions(+), 9 deletions(-)
- create mode 100644 tests/python/runtime/test_metal_storage_mode_env.py
+ src/runtime/metal/metal_device_api.mm | 115 +++++++++++++++++++++++---
+ 1 file changed, 102 insertions(+), 13 deletions(-)
 
 diff --git a/src/runtime/metal/metal_device_api.mm b/src/runtime/metal/metal_device_api.mm
-index 2a44d98..46b4bd0 100644
+index 2a44d98..93351b7 100644
 --- a/src/runtime/metal/metal_device_api.mm
 +++ b/src/runtime/metal/metal_device_api.mm
-@@ -24,12 +24,46 @@
+@@ -24,12 +24,91 @@
  #include <tvm/ffi/reflection/registry.h>
  #include <tvm/runtime/logging.h>
  #include <tvm/runtime/timer.h>
 +
-+#include <algorithm>
 +#include <cctype>
 +#include <cstdlib>
++#include <cstring>
 +#include <string>
 +
  #include "metal_common.h"
@@ -62,38 +50,83 @@ index 2a44d98..46b4bd0 100644
  namespace runtime {
  namespace metal {
  
-+namespace {
-+
-+// Resolve the MTLResourceOptions used by AllocDataSpace from the
-+// TVM_METAL_STORAGE_MODE environment variable. Default is Private (the
-+// historical behavior). Setting "shared" enables CPU-visible buffers so
-+// foreign DLPack consumers (e.g. ml-explore/mlx, which uses MTLStorageModeShared)
-+// can share the underlying MTLBuffer without copy. "managed" is a
-+// macOS-only intermediate mode kept for parity with the legacy
-+// commented-out conditional below.
-+MTLResourceOptions GetMetalStorageOptions() {
++/*!
++ * \brief Resolve the storage mode used for device data buffers from the
++ *        TVM_METAL_STORAGE_MODE environment variable (read once, cached).
++ *
++ * Accepted values (case-insensitive):
++ *   - "private" (default; backward compatible) -> MTLResourceStorageModePrivate
++ *   - "shared"                                  -> MTLResourceStorageModeShared
++ *   - "managed" (macOS discrete GPUs only)      -> MTLResourceStorageModeManaged
++ *
++ * Why an environment variable instead of a CMake flag or a runtime API:
++ *   - CMake flag would require rebuilding TVM to flip behaviour, which makes
++ *     downstream packaging (mlc-llm, tvm-ffi consumers, prebuilt wheels)
++ *     awkward — they would need two builds.
++ *   - A runtime SetStorageMode() API has the right shape but adds a public
++ *     C++/Python surface to MetalWorkspace; it is also racy if any allocation
++ *     can happen before the user sets the mode, so consumers would still need
++ *     to set an env var or call the API extremely early.
++ *   - An env var read-once-at-init is the smallest possible behaviour change:
++ *     default (unset) keeps the historical Private mode, opt-in is a one-line
++ *     export. This matches how TVM exposes other low-level toggles
++ *     (e.g. TVM_LOG_DEBUG, TVM_NUM_THREADS).
++ *
++ * The motivating use case is zero-copy DLPack interop with MLX (which
++ * allocates Metal buffers as Shared). Two allocators on the same MTLDevice
++ * cannot share an MTLBuffer that has different page-mapping semantics, so
++ * DLPack capsules cross-imported between TVM-NDArray and mx.array currently
++ * fail. With TVM_METAL_STORAGE_MODE=shared, the two allocators agree on the
++ * storage class and the underlying MTLBuffer can be aliased without copy.
++ *
++ * Notes:
++ *   - This intentionally does NOT change the staging buffer pool
++ *     (StagingBufferPool::GetOrCreate) or the GPU->CPU temp buffer
++ *     (GetTempBuffer); both must remain Shared because they are host-staging
++ *     buffers whose entire purpose is host visibility. Changing them would
++ *     break CPU<->GPU memcpy, which is unrelated to the device-data
++ *     allocation that this flag governs.
++ *   - Shared-mode device buffers are valid arguments to compute kernels
++ *     (setBuffer:offset:atIndex:) on every Metal device family — MLX itself
++ *     proves this in production. The kernel dispatch path in metal_module.mm
++ *     does not need any change.
++ */
++inline MTLResourceOptions GetMetalStorageOptions() {
 +  static const MTLResourceOptions cached = []() -> MTLResourceOptions {
-+    const char* env = std::getenv("TVM_METAL_STORAGE_MODE");
-+    if (env == nullptr || *env == '\0') return MTLResourceStorageModePrivate;
-+    std::string val(env);
-+    std::transform(val.begin(), val.end(), val.begin(),
-+                   [](unsigned char c) { return std::tolower(c); });
-+    if (val == "shared") return MTLResourceStorageModeShared;
-+    if (val == "managed") return MTLResourceStorageModeManaged;
-+    if (val == "private") return MTLResourceStorageModePrivate;
-+    LOG(WARNING) << "TVM: unknown TVM_METAL_STORAGE_MODE=\"" << env
-+                 << "\"; falling back to private.";
++    const char* raw = std::getenv("TVM_METAL_STORAGE_MODE");
++    if (raw == nullptr || raw[0] == '\0') {
++      return MTLResourceStorageModePrivate;
++    }
++    // Lowercase a small bounded copy for case-insensitive comparison.
++    std::string v(raw);
++    for (auto& c : v) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
++    if (v == "shared") {
++      return MTLResourceStorageModeShared;
++    }
++    if (v == "managed") {
++#if TARGET_OS_IPHONE
++      LOG(WARNING) << "TVM_METAL_STORAGE_MODE=managed is not supported on iOS, "
++                   << "falling back to MTLResourceStorageModeShared.";
++      return MTLResourceStorageModeShared;
++#else
++      return MTLResourceStorageModeManaged;
++#endif
++    }
++    if (v == "private") {
++      return MTLResourceStorageModePrivate;
++    }
++    LOG(WARNING) << "Unknown TVM_METAL_STORAGE_MODE='" << raw
++                 << "', expected one of {private,shared,managed}. "
++                 << "Falling back to MTLResourceStorageModePrivate.";
 +    return MTLResourceStorageModePrivate;
 +  }();
 +  return cached;
 +}
 +
-+}  // namespace
-+
  AutoReleasePoolWrapper& AutoReleasePoolWrapper::GetInstance() {
    static AutoReleasePoolWrapper instance;
    return instance;
-@@ -184,15 +218,11 @@ int GetWarpSize(id<MTLDevice> dev) {
+@@ -184,15 +263,11 @@ int GetWarpSize(id<MTLDevice> dev) {
    id<MTLBuffer> buf;
    AUTORELEASEPOOL {
      id<MTLDevice> dev = GetDevice(device);
@@ -106,127 +139,43 @@ index 2a44d98..46b4bd0 100644
 -    storage_mode = MTLResourceStorageModeManaged;
 -    #endif
 -    */
-+    // Default: GPU-only Private storage. Override with the env var
-+    // TVM_METAL_STORAGE_MODE=shared|managed|private to allocate CPU-visible
-+    // buffers (e.g. for zero-copy DLPack interop with mlx). See
-+    // GetMetalStorageOptions() above for parsing rules and defaults.
++    // Storage mode for device-data buffers. Defaults to Private (the
++    // historical behaviour); set TVM_METAL_STORAGE_MODE=shared to enable
++    // zero-copy DLPack interop with frameworks that allocate Shared (e.g.
++    // MLX). See GetMetalStorageOptions() for the rationale.
 +    MTLResourceOptions storage_mode = GetMetalStorageOptions();
      buf = [dev newBufferWithLength:nbytes options:storage_mode];
      TVM_FFI_ICHECK(buf != nil);
    };
-diff --git a/tests/python/runtime/test_metal_storage_mode_env.py b/tests/python/runtime/test_metal_storage_mode_env.py
-new file mode 100644
-index 0000000..6cbc300
---- /dev/null
-+++ b/tests/python/runtime/test_metal_storage_mode_env.py
-@@ -0,0 +1,107 @@
-+# Licensed to the Apache Software Foundation (ASF) under one
-+# or more contributor license agreements.  See the NOTICE file
-+# distributed with this work for additional information
-+# regarding copyright ownership.  The ASF licenses this file
-+# to you under the Apache License, Version 2.0 (the
-+# "License"); you may not use this file except in compliance
-+# with the License.  You may obtain a copy of the License at
-+#
-+#   http://www.apache.org/licenses/LICENSE-2.0
-+#
-+# Unless required by applicable law or agreed to in writing,
-+# software distributed under the License is distributed on an
-+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-+# KIND, either express or implied.  See the License for the
-+# specific language governing permissions and limitations
-+# under the License.
-+"""Tests for the ``TVM_METAL_STORAGE_MODE`` runtime override.
-+
-+The Metal device API caches the storage mode on first ``AllocDataSpace``
-+call. We therefore launch a fresh subprocess per scenario so each test
-+sees a clean cache and a clean env.
-+"""
-+
-+import json
-+import os
-+import subprocess
-+import sys
-+
-+import pytest
-+
-+
-+pytestmark = pytest.mark.skipif(
-+    sys.platform != "darwin", reason="Metal storage modes only apply on macOS",
-+)
-+
-+
-+def _probe_alloc_storage_mode(env_value: str | None) -> str:
-+    """Spawn a subprocess that allocates a TVM Metal NDArray and prints its
-+    underlying ``MTLBuffer.storageMode`` as a string.
-+    """
-+
-+    script = r"""
-+import json
-+import sys
-+import tvm
-+
-+if not tvm.metal().exist:
-+    print(json.dumps({"skipped": "metal device not available"}))
-+    sys.exit(0)
-+
-+# Trigger one allocation so the cache picks up the env value.
-+arr = tvm.nd.empty((4,), dtype="float32", device=tvm.metal())
-+
-+# Inspect via the underlying MTLBuffer through ctypes / objc_runtime.
-+# Storage mode constants are MTLStorageMode in the Metal headers:
-+#   Shared = 0, Managed = 1, Private = 2, Memoryless = 3.
-+mode = arr._tvm_metal_storage_mode_for_test()  # set by the patch test hook
-+mapping = {0: "shared", 1: "managed", 2: "private", 3: "memoryless"}
-+print(json.dumps({"mode": mapping.get(mode, f"unknown:{mode}")}))
-+"""
-+
-+    env = os.environ.copy()
-+    if env_value is None:
-+        env.pop("TVM_METAL_STORAGE_MODE", None)
-+    else:
-+        env["TVM_METAL_STORAGE_MODE"] = env_value
-+
-+    result = subprocess.run(
-+        [sys.executable, "-c", script],
-+        env=env,
-+        capture_output=True,
-+        text=True,
-+        timeout=60,
-+    )
-+    if result.returncode != 0:
-+        pytest.fail(
-+            f"Probe failed (env={env_value!r}): rc={result.returncode}\n"
-+            f"stdout: {result.stdout}\nstderr: {result.stderr}"
-+        )
-+    payload = json.loads(result.stdout.strip().splitlines()[-1])
-+    if "skipped" in payload:
-+        pytest.skip(payload["skipped"])
-+    return payload["mode"]
-+
-+
-+def test_default_is_private() -> None:
-+    """No env -> Private storage (the historical TVM default)."""
-+
-+    assert _probe_alloc_storage_mode(None) == "private"
-+
-+
-+def test_shared_env_promotes_to_shared() -> None:
-+    """``TVM_METAL_STORAGE_MODE=shared`` allocates CPU-visible buffers."""
-+
-+    assert _probe_alloc_storage_mode("shared") == "shared"
-+
-+
-+def test_managed_env_promotes_to_managed() -> None:
-+    """``TVM_METAL_STORAGE_MODE=managed`` allocates Managed buffers (macOS)."""
-+
-+    assert _probe_alloc_storage_mode("managed") == "managed"
-+
-+
-+def test_invalid_env_falls_back_to_private() -> None:
-+    """Unknown values log a warning and fall back to Private."""
-+
-+    assert _probe_alloc_storage_mode("not-a-mode") == "private"
+@@ -418,10 +493,24 @@ int GetWarpSize(id<MTLDevice> dev) {
+              result.Set("free_syncs", static_cast<int64_t>(p.free_syncs));
+              return result;
+            })
+-      .def("metal.ResetProfileCounters", [](int device_id) {
+-        auto* ws = MetalWorkspace::Global();
+-        ws->CastStreamOrGetDefault(nullptr, device_id)->profile.Reset();
+-      });
++      .def("metal.ResetProfileCounters",
++           [](int device_id) {
++             auto* ws = MetalWorkspace::Global();
++             ws->CastStreamOrGetDefault(nullptr, device_id)->profile.Reset();
++           })
++      .def("metal.GetStorageMode",
++           []() -> ffi::String {
++             // Return a stable string for parity tests; mirrors the env-var
++             // names accepted by GetMetalStorageOptions().
++             MTLResourceOptions opts = GetMetalStorageOptions();
++             // The Resource enum encodes the storage mode in the high bits
++             // (MTLResourceStorageModeShift == 4), but the lower-level enum
++             // values overlap, so we compare directly with the resource enum
++             // values to remain robust on every SDK version.
++             if (opts == MTLResourceStorageModeShared) return ffi::String("shared");
++             if (opts == MTLResourceStorageModeManaged) return ffi::String("managed");
++             return ffi::String("private");
++           });
+ }
+ 
+ class MetalTimerNode : public TimerNode {
 -- 
 2.50.1 (Apple Git-155)
 

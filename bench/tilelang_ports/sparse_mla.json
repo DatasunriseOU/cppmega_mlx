@@ -1,0 +1,94 @@
+{
+  "schema": 1,
+  "kernel": "sparse_mla",
+  "platform": "macOS-26.4.1-arm64-arm-64bit-Mach-O",
+  "machine": "arm64",
+  "mlx_version": "0.31.1",
+  "fp16_carrier": true,
+  "path_b_status": {
+    "available": false,
+    "reason": "tilelang 0.1.9 metal target does not support T.gemm (Unsupported target for gemm: metal); waiting on tile-ai/tilelang HEAD with Apple simdgroup PRs. See cppmega_mlx/nn/_tilelang/sparse_mla.py module docstring."
+  },
+  "rows": [
+    {
+      "shape": {
+        "name": "B2_S128_H8_D64",
+        "B": 2,
+        "S": 128,
+        "H": 8,
+        "D": 64,
+        "G": 1,
+        "topk": 16,
+        "Skv": 128
+      },
+      "fwd_reference_ms": {
+        "label": "reference_fwd",
+        "median_ms": 0.3807500470429659,
+        "min_ms": 0.3353329375386238,
+        "max_ms": 0.5231250543147326,
+        "iters": 8,
+        "warmup": 3
+      },
+      "fwd_apply_ms": {
+        "label": "apply_fwd",
+        "median_ms": 0.3325209254398942,
+        "min_ms": 0.3155411686748266,
+        "max_ms": 0.5976250395178795,
+        "iters": 8,
+        "warmup": 3
+      },
+      "bwd_reference_ms": {
+        "label": "reference_bwd",
+        "median_ms": 0.5935414228588343,
+        "min_ms": 0.5756248719990253,
+        "max_ms": 0.8209170773625374,
+        "iters": 8,
+        "warmup": 3
+      },
+      "path_b": {
+        "available": false,
+        "reason": "tilelang 0.1.9 metal target does not support T.gemm (Unsupported target for gemm: metal); waiting on tile-ai/tilelang HEAD with Apple simdgroup PRs. See cppmega_mlx/nn/_tilelang/sparse_mla.py module docstring."
+      }
+    },
+    {
+      "shape": {
+        "name": "B4_S512_H8_D64",
+        "B": 4,
+        "S": 512,
+        "H": 8,
+        "D": 64,
+        "G": 1,
+        "topk": 32,
+        "Skv": 512
+      },
+      "fwd_reference_ms": {
+        "label": "reference_fwd",
+        "median_ms": 0.9523334447294474,
+        "min_ms": 0.6372500211000443,
+        "max_ms": 1.264624996110797,
+        "iters": 8,
+        "warmup": 3
+      },
+      "fwd_apply_ms": {
+        "label": "apply_fwd",
+        "median_ms": 0.6870626239106059,
+        "min_ms": 0.6336669903248549,
+        "max_ms": 0.803167000412941,
+        "iters": 8,
+        "warmup": 3
+      },
+      "bwd_reference_ms": {
+        "label": "reference_bwd",
+        "median_ms": 1.3578329235315323,
+        "min_ms": 1.3051670975983143,
+        "max_ms": 1.445709029212594,
+        "iters": 8,
+        "warmup": 3
+      },
+      "path_b": {
+        "available": false,
+        "reason": "tilelang 0.1.9 metal target does not support T.gemm (Unsupported target for gemm: metal); waiting on tile-ai/tilelang HEAD with Apple simdgroup PRs. See cppmega_mlx/nn/_tilelang/sparse_mla.py module docstring."
+      }
+    }
+  ]
+}
