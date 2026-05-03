@@ -7,7 +7,7 @@ fp32 grad buffer, no aliased per-parameter side-channel. The bf16 weights
 are the source of truth and gradients/parameters are cast to fp32 inline
 inside ``apply_single``.
 
-These tests walk ``tree_flatten(opt.state)`` for the production-shape
+These opt-in tests walk ``tree_flatten(opt.state)`` for the production-shape
 ``local_gb10_quarter()`` model and assert:
 
 * The exact set of leaf keys is the documented allow-list.
@@ -73,9 +73,14 @@ def production_model() -> object:
 
     The audit needs production shapes — toy models cannot detect a hidden
     master buffer because their state is dominated by the header. Tests
-    that cannot afford ~17 GiB peak (3.3 GiB params + 13.4 GiB AdamW) must
-    set ``CPPMEGA_OPTIMIZER_CONTRACT_SKIP=1`` to opt out.
+    that can afford ~17 GiB peak (3.3 GiB params + 13.4 GiB AdamW) must
+    set ``CPPMEGA_OPTIMIZER_CONTRACT_PRODUCTION_SHAPE=1`` to opt in.
     """
+    if os.environ.get("CPPMEGA_OPTIMIZER_CONTRACT_PRODUCTION_SHAPE") != "1":
+        pytest.skip(
+            "set CPPMEGA_OPTIMIZER_CONTRACT_PRODUCTION_SHAPE=1 to run the "
+            "production-shape optimizer-state audit"
+        )
     if os.environ.get("CPPMEGA_OPTIMIZER_CONTRACT_SKIP") == "1":
         pytest.skip("CPPMEGA_OPTIMIZER_CONTRACT_SKIP=1 set; skipping production-shape audit")
     return local_gb10_quarter()

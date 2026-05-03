@@ -1,0 +1,110 @@
+{
+  "acceptance": {
+    "meets_state_compaction_gate": true,
+    "state_compaction_lower_bound": 3.0,
+    "state_compaction_ratio_fp32_over_quant": 3.938461437448442,
+    "step_speedup_fp32_over_quant_median": 0.8721320847693073
+  },
+  "config": {
+    "batch_size": 1,
+    "block_size": 256,
+    "iters": 2,
+    "learning_rate": 0.0001,
+    "model_dtype": "bfloat16",
+    "model_profile": "local_gb10_quarter",
+    "param_bytes": 3593042708,
+    "param_count": 1796521354,
+    "param_gib": 3.346281785517931,
+    "quant_kind": "symmetric_int8_blockwise_v1",
+    "seq_len": 64,
+    "warmup": 1,
+    "weight_decay": 0.01
+  },
+  "fp32_moments_lion": {
+    "optimizer_class": "LionFP32Moments",
+    "peak_memory_bytes": 29744373182,
+    "state_bytes": 7186085428,
+    "state_dtype_breakdown_bytes": {
+      "learning_rate": {
+        "float32": 4
+      },
+      "m": {
+        "float32": 7186085416
+      },
+      "step": {
+        "uint64": 8
+      }
+    },
+    "state_gib": 6.692563582211733,
+    "step_ms": {
+      "iters": 2,
+      "max": 561.3599580246955,
+      "mean": 538.2136040134355,
+      "median": 538.2136040134355,
+      "min": 515.0672500021756,
+      "samples_ms": [
+        561.3599580246955,
+        515.0672500021756
+      ],
+      "warmup": 1
+    }
+  },
+  "guards": {
+    "bitsandbytes_bit_exact_claim": false,
+    "first_call_compile_time_excluded": true,
+    "gb10_parity_claim": false,
+    "local_only": true,
+    "m4_vs_gb10_throughput_parity_claim": false
+  },
+  "kind": "cppmega.mlx.local_m4_lion8bit_state_receipt",
+  "lion8bit": {
+    "optimizer_class": "Lion8bit",
+    "peak_memory_bytes": 25385114820,
+    "state_bytes": 1824592050,
+    "state_dtype_breakdown_bytes": {
+      "learning_rate": {
+        "float32": 4
+      },
+      "m_absmax": {
+        "float32": 28070684
+      },
+      "m_quant": {
+        "uint8": 1796521354
+      },
+      "step": {
+        "uint64": 8
+      }
+    },
+    "state_gib": 1.699283765628934,
+    "step_ms": {
+      "iters": 2,
+      "max": 622.5095828995109,
+      "mean": 617.1239579562098,
+      "median": 617.1239579562098,
+      "min": 611.7383330129087,
+      "samples_ms": [
+        622.5095828995109,
+        611.7383330129087
+      ],
+      "warmup": 1
+    }
+  },
+  "machine": {
+    "cppmega_mlx": "0.1.0",
+    "machine": "arm64",
+    "metal_device_info": "{'resource_limit': 499000, 'max_buffer_length': 86586540032, 'architecture': 'applegpu_g16s', 'memory_size': 137438953472, 'max_recommended_working_set_size': 115448725504, 'device_name': 'Apple M4 Max'}",
+    "mlx": "0.31.1",
+    "platform": "macOS-26.4.1-arm64-arm-64bit-Mach-O",
+    "processor": "arm",
+    "python": "3.13.12"
+  },
+  "notes": [
+    "Local Apple Silicon receipt only; does not claim GB10 parity.",
+    "Lion8bit uses symmetric int8 blockwise quantization, not the bitsandbytes dynamic LUT (default). Pass --quant-scheme dynamic_int8_v1 to compare on the bnb-style codec.",
+    "LionFP32Moments needs ~6.69 GiB of optimizer state for 1.797B-param bf16 weights; pass --skip-fp32 if the host runs out of memory.",
+    "Step time is expected to be slightly slower than LionFP32Moments because of the extra dequant -> fp32 math -> requant pipeline; the compaction ratio is the load-bearing number.",
+    "CUDA reference: cppmega/docs/lion8bit_ab_2026_04_25.md."
+  ],
+  "schema_version": 1,
+  "source_bead": "cppmega-mlx-lion8bit"
+}

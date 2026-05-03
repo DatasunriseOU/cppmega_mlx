@@ -1,17 +1,22 @@
 {
   "acceptance": {
-    "fused_vs_fp32_step_ratio_median": 0.3713035268385908,
+    "dynamic_vs_symmetric_state_lower_bound": 0.99,
+    "dynamic_vs_symmetric_state_ratio_median": 1.0,
+    "dynamic_vs_symmetric_state_upper_bound": 1.01,
+    "dynamic_vs_symmetric_step_ratio_median": 4.67109536488527,
+    "fused_vs_fp32_step_ratio_median": null,
     "fused_vs_unfused_lower_bound": 1.1,
-    "fused_vs_unfused_speedup_median": 4.401063704001518,
-    "meets_fused_vs_unfused_gate": true,
-    "meets_state_compaction_gate": true,
+    "fused_vs_unfused_speedup_median": null,
+    "meets_dynamic_vs_symmetric_state_gate": true,
+    "meets_fused_vs_unfused_gate": false,
+    "meets_state_compaction_gate": false,
     "state_compaction_lower_bound": 3.0,
-    "state_compaction_ratio_fp32_over_quant": 3.9384614471112975,
-    "step_speedup_fp32_over_quant_median": 2.6932143858539472
+    "state_compaction_ratio_fp32_over_quant": null,
+    "step_speedup_fp32_over_quant_median": null
   },
   "adam8bit": {
     "optimizer_class": "Adam8bit",
-    "peak_memory_bytes": 12270263364,
+    "peak_memory_bytes": 12269917460,
     "state_bytes": 3649184088,
     "state_dtype_breakdown_bytes": {
       "learning_rate": {
@@ -35,22 +40,21 @@
     },
     "state_gib": 3.398567520081997,
     "step_ms": {
-      "iters": 3,
-      "max": 225.4550000652671,
-      "mean": 223.4320417046547,
-      "median": 223.29287487082183,
-      "min": 221.54825017787516,
+      "iters": 2,
+      "max": 224.28258298896253,
+      "mean": 222.9118124814704,
+      "median": 222.9118124814704,
+      "min": 221.54104197397828,
       "samples_ms": [
-        223.29287487082183,
-        225.4550000652671,
-        221.54825017787516
+        221.54104197397828,
+        224.28258298896253
       ],
       "warmup": 1
     }
   },
-  "adam8bit_unfused": {
+  "adam8bit_dynamic": {
     "optimizer_class": "Adam8bit",
-    "peak_memory_bytes": 28121608532,
+    "peak_memory_bytes": 28121292904,
     "state_bytes": 3649184088,
     "state_dtype_breakdown_bytes": {
       "learning_rate": {
@@ -74,23 +78,23 @@
     },
     "state_gib": 3.398567520081997,
     "step_ms": {
-      "iters": 3,
-      "max": 987.1605830267072,
-      "mean": 982.2769863530993,
-      "median": 982.7261669561267,
-      "min": 976.9442090764642,
+      "iters": 2,
+      "max": 1044.50883413665,
+      "mean": 1041.242334060371,
+      "median": 1041.242334060371,
+      "min": 1037.9758339840919,
       "samples_ms": [
-        982.7261669561267,
-        976.9442090764642,
-        987.1605830267072
+        1037.9758339840919,
+        1044.50883413665
       ],
       "warmup": 1
     }
   },
+  "adam8bit_unfused": null,
   "config": {
     "batch_size": 1,
     "block_size": 256,
-    "iters": 3,
+    "iters": 2,
     "learning_rate": 0.0001,
     "model_dtype": "bfloat16",
     "model_profile": "local_gb10_quarter",
@@ -102,39 +106,7 @@
     "warmup": 1,
     "weight_decay": 0.01
   },
-  "fp32_moments_adamw": {
-    "optimizer_class": "AdamWFP32Moments",
-    "peak_memory_bytes": 26999881866,
-    "state_bytes": 14372170844,
-    "state_dtype_breakdown_bytes": {
-      "learning_rate": {
-        "float32": 4
-      },
-      "m": {
-        "float32": 7186085416
-      },
-      "step": {
-        "uint64": 8
-      },
-      "v": {
-        "float32": 7186085416
-      }
-    },
-    "state_gib": 13.385127153247595,
-    "step_ms": {
-      "iters": 3,
-      "max": 742.6495419349521,
-      "mean": 648.0131942468385,
-      "median": 601.3755828607827,
-      "min": 600.0144579447806,
-      "samples_ms": [
-        742.6495419349521,
-        600.0144579447806,
-        601.3755828607827
-      ],
-      "warmup": 1
-    }
-  },
+  "fp32_moments_adamw": null,
   "guards": {
     "bitsandbytes_bit_exact_claim": false,
     "first_call_compile_time_excluded": true,
@@ -154,10 +126,15 @@
   },
   "notes": [
     "Local Apple Silicon receipt only; does not claim GB10 parity.",
-    "Adam8bit uses symmetric int8 blockwise quantization, not the bitsandbytes dynamic LUT.",
+    "adam8bit (default) uses symmetric int8 blockwise quantization, matching the existing M0 codec. adam8bit_dynamic uses the bitsandbytes-style 256-entry signed dynamic LUT (denser bins near zero); both share the per-256-block uint8 + fp32-absmax memory layout so the state size is identical.",
     "AdamWFP32Moments needs ~14.4 GiB of optimizer state for 1.797B-param bf16 weights; pass --skip-fp32 if the host runs out of memory.",
-    "adam8bit_unfused is the legacy Python-chain dequant -> math -> quant -> apply path; adam8bit is the fused single-kernel-launch MSL implementation. Both produce identical updates within fp32 noise."
+    "adam8bit_unfused is the legacy Python-chain dequant -> math -> quant -> apply path; adam8bit is the fused single-kernel-launch MSL implementation. Both produce identical updates within fp32 noise. The fused kernel is symmetric-only -- adam8bit_dynamic always runs through the unfused chain."
   ],
   "schema_version": 1,
+  "schemes": {
+    "adam8bit": "symmetric_int8_v1",
+    "adam8bit_dynamic": "dynamic_int8_v1",
+    "adam8bit_unfused": "symmetric_int8_v1"
+  },
   "source_bead": "cppmega-mlx-adam8bit"
 }

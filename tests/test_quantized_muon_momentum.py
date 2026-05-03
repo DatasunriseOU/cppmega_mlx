@@ -21,12 +21,18 @@ from mlx.utils import tree_flatten
 
 from cppmega_mlx.training._quantize_8bit import (
     DEFAULT_BLOCK_SIZE,
+    QUANT_SCHEME_DYNAMIC,
+    QUANT_SCHEME_SYMMETRIC,
+    QUANT_SCHEMES,
     dequantize_dynamic_blockwise,
+    dequantize_dynamic_lut_blockwise,
     quantize_dynamic_blockwise,
+    quantize_dynamic_lut_blockwise,
 )
 from cppmega_mlx.training.optimizers import (
     MUON_QUANTIZED_MOMENTUM_BLOCK_SIZE,
     MUON_QUANTIZED_MOMENTUM_SCHEME,
+    MUON_QUANTIZED_MOMENTUM_SCHEMES,
     MuonAdamWMulti,
     MuonWithNSCarrier,
     QuantizedMuonWithNSCarrier,
@@ -270,3 +276,146 @@ def test_quantized_muon_apply_preserves_param_dtype(nesterov: bool) -> None:
     for key, arr in tree_flatten(model.trainable_parameters()):
         if isinstance(arr, mx.array):
             assert arr.dtype == mx.bfloat16, (key, arr.dtype)
+
+
+# -----------------------------------------------------------------------------
+# Dynamic 8-bit LUT scheme on the Muon momentum buffer
+# -----------------------------------------------------------------------------
+#
+# These tests exercise QuantizedMuonWithNSCarrier with the bnb-style dynamic
+# LUT codec (``quant_scheme="dynamic_int8_v1"``) added alongside the
+# default symmetric path. The state layout is identical (uint8 v_quant +
+# fp32 v_absmax) so the only difference is which kernel pair runs in
+# ``apply_single``.
+
+
+def test_muon_quantized_momentum_dynamic_dtype_uint8() -> None:
+    """Dynamic-LUT Muon momentum must keep the same uint8 + fp32 state layout."""
+
+    mx.random.seed(11)
+    model = _MuonOnlyModel(in_dim=16, hidden=24, out_dim=16)
+    model.set_dtype(mx.bfloat16)
+    opt = QuantizedMuonWithNSCarrier(
+        learning_rate=1e-3,
+        momentum=0.95,
+        weight_decay=0.0,
+        quant_scheme=QUANT_SCHEME_DYNAMIC,
+    )
+    opt.init(model.trainable_parameters())
+    assert opt.quant_scheme == QUANT_SCHEME_DYNAMIC
+
+    flat = dict(tree_flatten(opt.state))
+    quant_keys = [k for k in flat if k.endswith("v_quant")]
+    absmax_keys = [k for k in flat if k.endswith("v_absmax")]
+    assert quant_keys
+    assert absmax_keys
+    for key in quant_keys:
+        assert flat[key].dtype == mx.uint8, (key, flat[key].dtype)
+        # Initial bytes for dynamic must be 127 (LUT[127] == 0.0 zero entry).
+        mx.eval(flat[key])
+        sample = int(flat[key].reshape(-1)[0].item())
+        assert sample == 127, (key, sample)
+    for key in absmax_keys:
+        assert flat[key].dtype == mx.float32, (key, flat[key].dtype)
+
+
+def test_muon_quantized_momentum_dynamic_round_trip_within_tolerance() -> None:
+    """The dynamic-LUT codec applied to a Muon-momentum-shaped tensor must
+    round-trip with mean error tighter than the symmetric path when an
+    outlier sets the per-block absmax (the realistic momentum-buffer
+    distribution after a few hundred steps)."""
+
+    mx.random.seed(0)
+    n = 4 * 256
+    base = (mx.random.normal((n,)) * 0.01).astype(mx.float32)
+    idx = mx.arange(n)
+    x = base
+    # Outlier per block to drive absmax up to ~1.0.
+    for i, v in [(0, 1.0), (256, -1.5), (512, 0.8), (768, -2.0)]:
+        x = mx.where(idx == i, mx.full((n,), v, dtype=mx.float32), x)
+    mx.eval(x)
+
+    qd, amd = quantize_dynamic_lut_blockwise(x)
+    qs, ams = quantize_dynamic_blockwise(x)
+    rec_d = dequantize_dynamic_lut_blockwise(qd, amd, out_dtype=mx.float32)
+    rec_s = dequantize_dynamic_blockwise(qs, ams, out_dtype=mx.float32)
+    mx.eval(rec_d, rec_s)
+
+    small_mask = mx.abs(x) < 0.5
+    err_d_mean = float(mx.mean(mx.abs(rec_d - x) * small_mask).item())
+    err_s_mean = float(mx.mean(mx.abs(rec_s - x) * small_mask).item())
+    ratio = err_s_mean / max(err_d_mean, 1e-12)
+    assert ratio >= 4.0, (
+        f"dynamic LUT must beat symmetric on small-value mean error: "
+        f"symmetric={err_s_mean:.6e}, dynamic={err_d_mean:.6e}, ratio={ratio:.2f}x"
+    )
+
+
+def test_muon_quantized_momentum_dynamic_loss_matches_fp32_within_tolerance() -> None:
+    """50-step Muon training: dynamic LUT must track fp32 within 2%, the
+    same envelope the symmetric scheme is held to."""
+
+    in_dim, hidden, out_dim = 64, 256, 64
+    batch = 32
+    steps = 50
+    seed = 7
+
+    fp32_opt = MuonWithNSCarrier(
+        learning_rate=1e-3,
+        momentum=0.95,
+        weight_decay=0.0,
+        nesterov=True,
+        ns_steps=5,
+    )
+    dynamic_opt = QuantizedMuonWithNSCarrier(
+        learning_rate=1e-3,
+        momentum=0.95,
+        weight_decay=0.0,
+        nesterov=True,
+        ns_steps=5,
+        quant_scheme=QUANT_SCHEME_DYNAMIC,
+    )
+    fp32_losses = _train_n_steps(
+        fp32_opt,
+        in_dim=in_dim, hidden=hidden, out_dim=out_dim,
+        batch=batch, steps=steps, seed=seed, dtype=mx.float32,
+    )
+    dynamic_losses = _train_n_steps(
+        dynamic_opt,
+        in_dim=in_dim, hidden=hidden, out_dim=out_dim,
+        batch=batch, steps=steps, seed=seed, dtype=mx.float32,
+    )
+
+    assert fp32_losses[-1] < fp32_losses[0]
+    assert dynamic_losses[-1] < dynamic_losses[0]
+
+    fp32_tail = sum(fp32_losses[-5:]) / 5
+    dynamic_tail = sum(dynamic_losses[-5:]) / 5
+    rel_diff = abs(dynamic_tail - fp32_tail) / max(abs(fp32_tail), 1e-9)
+    assert rel_diff < 0.02, (
+        f"Muon dynamic-LUT tail loss {dynamic_tail:.6f} differs from fp32 "
+        f"{fp32_tail:.6f} by {rel_diff*100:.2f}%, exceeding 2% budget"
+    )
+
+
+def test_quantized_muon_default_scheme_is_symmetric_for_backcompat() -> None:
+    """Default Muon quantization scheme stays symmetric for backwards
+    compatibility with existing checkpoints."""
+
+    opt = QuantizedMuonWithNSCarrier(learning_rate=1e-3)
+    assert opt.quant_scheme == QUANT_SCHEME_SYMMETRIC
+    assert MUON_QUANTIZED_MOMENTUM_SCHEMES == QUANT_SCHEMES
+
+
+def test_make_muon_routes_quantize_momentum_scheme_through() -> None:
+    opt = make_muon(quantize_momentum=True, quantize_momentum_scheme=QUANT_SCHEME_DYNAMIC)
+    assert isinstance(opt.muon, QuantizedMuonWithNSCarrier)
+    assert opt.muon.quant_scheme == QUANT_SCHEME_DYNAMIC
+    # Default still symmetric.
+    opt_default = make_muon(quantize_momentum=True)
+    assert opt_default.muon.quant_scheme == QUANT_SCHEME_SYMMETRIC
+
+
+def test_quantized_muon_rejects_unknown_quant_scheme() -> None:
+    with pytest.raises(ValueError, match="quant_scheme must be one of"):
+        QuantizedMuonWithNSCarrier(learning_rate=1e-3, quant_scheme="bogus_v9")  # type: ignore[arg-type]

@@ -58,6 +58,29 @@ ZERO1_STREAM_F_POLICY = (
 )
 
 
+def _normalize_parameters(parameters: Any) -> Any:
+    """Coerce ``parameters`` into a parameter pytree.
+
+    The ZeRO-1 wrapper accepts either a plain pytree (the canonical input
+    shape) or an :class:`nn.Module`. When given a module the wrapper must
+    restrict its view to the **trainable** parameter tree -- module-level
+    :class:`mx.array` attributes that are not trainable parameters (e.g.
+    ``HybridTinyLM.structure_embedding._comp_offsets`` lookup tables that
+    backprop never reaches) would otherwise enter the round-robin shard
+    assignment, causing the assignment computed at :meth:`init` time to
+    diverge from the one used at :meth:`apply_gradients` time, and breaking
+    cross-rank parity.
+
+    A nn.Module is detected duck-typed via the ``trainable_parameters``
+    attribute so any future module-base class that exposes the same surface
+    keeps working without the wrapper needing to import it directly.
+    """
+
+    if hasattr(parameters, "trainable_parameters"):
+        return parameters.trainable_parameters()
+    return parameters
+
+
 def _flatten_param_tree(tree: Any) -> list[tuple[str, mx.array]]:
     """Return [(name, leaf), ...] for every :class:mx.array leaf, sorted
     by name so every rank produces the same ordering deterministically."""
@@ -250,16 +273,22 @@ class DistributedZeRO1Optimizer:
         Other ranks instantiate state for their own shards independently. After
         :meth:init returns, self.state reflects only the local shard
         (~1 / world_size of total optimizer-state bytes).
+
+        Accepts either a plain parameter pytree or an :class:`nn.Module`. A
+        module is normalized via ``module.trainable_parameters()`` so the
+        shard assignment cannot accidentally include non-trainable
+        :class:`mx.array` attributes that backprop never touches.
         """
 
+        normalized = _normalize_parameters(parameters)
         if self.is_sharded:
-            owned = self._select_owned(parameters)
+            owned = _select_owned_subtree(normalized, self._rank, self._world_size)
             self._inner.init(owned)
             self._owned_names = tuple(name for name, _ in _flatten_param_tree(owned))
         else:
-            self._inner.init(parameters)
+            self._inner.init(normalized)
             self._owned_names = tuple(
-                name for name, _ in _flatten_param_tree(parameters)
+                name for name, _ in _flatten_param_tree(normalized)
             )
         self._initialized = True
 
@@ -306,6 +335,11 @@ class DistributedZeRO1Optimizer:
         For a contiguous-slice sharding policy the more efficient path would be
         all_gather on the leaves; the round-robin policy used here is
         simpler and the wrapper is a scaffold, not a perf path.
+
+        ``full_parameters`` must already be a parameter pytree (caller is
+        responsible for ``_normalize_parameters``); the gather will trigger a
+        ``KeyError`` for any leaf the inner optimizer did not produce an
+        update for.
         """
 
         if not self.is_sharded:
@@ -314,6 +348,16 @@ class DistributedZeRO1Optimizer:
         owned_lookup = {
             name: leaf for name, leaf in _flatten_param_tree(owned_updates)
         }
+        # Materialise every owned update before entering the gather loop.
+        # The gather issues one ``all_sum`` per leaf in alphabetical order;
+        # without an upfront eval, MLX records the entire chain into a single
+        # lazy graph and the ring backend's TCP round-trips per all_sum
+        # accumulate into a giant command buffer that exceeds the Metal
+        # 5-second timeout under loopback contention. Materialising the
+        # owned tree once breaks the chain into one bounded compute prefix
+        # plus a sequence of pure communication ops.
+        if owned_lookup:
+            mx.eval(*owned_lookup.values())
         full_pairs = _flatten_param_tree(full_parameters)
         assignment = _shard_assignment(len(full_pairs), self._world_size)
         group = self._group
@@ -328,26 +372,45 @@ class DistributedZeRO1Optimizer:
             gathered = mx.distributed.all_sum(contribution, group=group)
             merged.append((name, gathered))
 
+        # Materialise the gathered tree so callers see a fully-resolved tree
+        # rather than a 155-deep lazy chain that would otherwise be evaluated
+        # in one big batch on the next ``mx.eval`` call. Under loopback
+        # contention that batched evaluation hits the Metal command-buffer
+        # timeout; sequential per-rank evaluation here keeps each step's
+        # critical path bounded.
+        if merged:
+            mx.eval(*(value for _, value in merged))
+
         return tree_unflatten(merged)
 
     def apply_gradients(self, gradients: Any, parameters: Any) -> Any:
         """Reduce gradients across ranks, step the inner optimizer on the
         local shard, and reconstitute the full updated parameter tree.
 
-        Returns a parameter tree with the same structure as parameters;
-        every rank receives identical output (so it is safe to feed the result
-        back into model.update).
+        Returns a parameter tree with the same structure as the normalized
+        parameter tree (i.e. ``parameters.trainable_parameters()`` if a module
+        was passed, otherwise ``parameters`` directly); every rank receives
+        identical output (so it is safe to feed the result back into
+        :meth:`nn.Module.update`).
+
+        ``parameters`` may be either a parameter pytree or an
+        :class:`nn.Module`. A module is normalized via
+        ``module.trainable_parameters()`` to keep the shard assignment
+        consistent with :meth:`init` and to avoid round-robin-assigning
+        module-level non-trainable :class:`mx.array` attributes that have
+        no corresponding gradient or optimizer state.
         """
 
         if not self._initialized:
             self.init(parameters)
 
+        normalized = _normalize_parameters(parameters)
         reduced = self._all_reduce_mean(gradients)
         if not self.is_sharded:
-            return self._inner.apply_gradients(reduced, parameters)
+            return self._inner.apply_gradients(reduced, normalized)
 
         owned_grads = self._select_owned(reduced)
-        owned_params = self._select_owned(parameters)
+        owned_params = self._select_owned(normalized)
         if not owned_grads:
             # Defensive: every rank must contribute the same number of leaves
             # to the all_sum gather; with round-robin sharding and num_leaves
@@ -356,7 +419,7 @@ class DistributedZeRO1Optimizer:
             owned_updates: Any = {}
         else:
             owned_updates = self._inner.apply_gradients(owned_grads, owned_params)
-        return self._gather_full_params(owned_updates, parameters)
+        return self._gather_full_params(owned_updates, normalized)
 
     def update(self, model: nn.Module, gradients: Any) -> None:
         """Convenience method matching :class:mlx.optimizers.Optimizer."""
@@ -420,3 +483,7 @@ __all__ = [
     "DistributedZeRO1Optimizer",
     "make_distributed_optimizer",
 ]
+
+# _normalize_parameters is exported as a leading-underscore helper for
+# tests that exercise the module-vs-pytree normalization behavior.
+
