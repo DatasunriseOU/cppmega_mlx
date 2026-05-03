@@ -116,3 +116,46 @@ To make the unlocked T.gemm path observable in our tests, either:
 - (this file) `docs/upstream/local_build_status.md`
 
 No code changes in `cppmega_mlx/`. The build state is documented; refactoring our status helpers + re-attempting the BF16 sparse-MLA Path B port (with workarounds for the K-loop and dtype constraints) is the natural follow-up beads issue.
+
+## Update 2026-05-03 — TileLang mixed-dtype T.gemm patch (k3_multi_gemm unblocked)
+
+**Patch artifact**: `docs/upstream/tilelang_gemm_mixed_dtype/0001-tilelang-allow-mixed-gemm-dtypes.patch` (170 lines, +169 / -9).
+**Local TileLang branch**: `cppmega/gemm-mixed-dtype-metal` @ `a69d6df7` (built off `apple-head`).
+**Files touched** (Python only; no C++ rebuild):
+- `tilelang/tileop/gemm/gemm_base.py` — drop `assert A.dtype == B.dtype`, add `has_mixed_input_dtype` property.
+- `tilelang/tileop/gemm/__init__.py` — Metal dispatcher routes mixed-dtype to `GemmMetalScalar`.
+- `tilelang/transform/metal_fragment_to_simdgroup.py` — exclude mixed-dtype-gemm accumulators (and fragment A operand) from the simdgroup rewrite.
+- `testing/python/metal/test_metal_codegen_linux.py` — new test `test_attention_chain_mixed_dtype_metal_codegen`.
+
+### Probe re-run after patch
+
+| Kernel pattern | Pre-patch | Post-patch |
+|---|---|---|
+| `k1_simple_gemm` | OK | OK |
+| `k2_pipelined_gemm` | FAILED (3-D buffer from T.Pipelined num_stages=2) | FAILED — same blocker, not addressed by this patch |
+| `k3_multi_gemm` (Q·Kᵀ → ·V chain, mixed dtype) | FAILED `AssertionError: A and B must have the same dtype` | **OK** |
+
+### Upstream test impact
+
+- `testing/python/metal/`: 50 pass / 6 fail (was 49/6) — **+1 net pass**; the previously-failing `test_t_gemm_metal_codegen_pipelined_float32` flipped to passing as a side effect of the more conservative simdgroup-rewrite criterion.
+- `testing/python/cpu/test_tilelang_cpu_tgemm.py`: 11 pass (unchanged).
+- cppmega.mlx local suite (`tests/test_tilelang_*.py`): 130 pass (unchanged).
+
+### Path B blocker status — updated
+
+| Kernel | Pre-patch status | Post-patch status |
+|---|---|---|
+| topk_selector | "Unknown storage scope shared.dyn" + injective layout | unchanged (independent issue) |
+| sparse-MLA BF16 | gated on chained-gemm dtype constraint + Pipelined | **dtype constraint lifted**; Pipelined num_stages>1 still blocks |
+| sparse-MLA FP8 | dtype + FP8 codegen | dtype lifted; FP8 codegen still missing |
+| sparse-MLA blockscaled | same as FP8 | same |
+
+### Why this didn't need a TVM patch
+
+`GemmMetalScalar` (PR #2118) already emits per-element `T.cast(value, accum_dtype)` for both A and B reads inside its scalar gemm prim_func. The only missing wiring was (a) the dispatcher pre-check, and (b) the simdgroup-rewrite exclusion. Both are pure-Python changes in TileLang.
+
+### Upstream-PR readiness
+
+This patch is independent from the local FP8 prelude / `metal_macro_generator.py` work and from the TVM storage-mode patch. Cleanly applies on top of `apple-head` (which has PR #2118 cherry-picked). For a PR against `tile-ai/tilelang:main` the patch should apply unchanged once PR #2118 lands upstream.
+
+Backend symmetry note: CUDA / ROCm / Hopper / Blackwell still use the C++ `GemmGetGemmInst` selection. If they hit a `(A.dtype != B.dtype)` chain, they'll currently fail downstream in their MMA emitters rather than in `GemmBase.in_dtype`. Mirroring the dispatcher route to scalar for those backends is out-of-scope for this patch and left for the relevant backend PRs.

@@ -17,7 +17,10 @@ from mlx.utils import tree_flatten
 from cppmega_mlx.training.optimizers import (
     EMBEDDING_LIKE_NAME_HINTS,
     MAMBA_SCALAR_LEAVES,
+    AdamWFP32Moments,
     MuonAdamWMulti,
+    MuonWithNSCarrier,
+    _muon_zeropower_newtonschulz5,
     is_muon_compatible,
     make_muon,
     split_param_groups,
@@ -26,6 +29,10 @@ from cppmega_mlx.training.optimizers import (
 
 def _flatten_keys(tree: object) -> set[str]:
     return {key for key, _ in tree_flatten(tree)}
+
+
+def _flatten_state(tree: object) -> dict[str, mx.array]:
+    return {key: value for key, value in tree_flatten(tree) if isinstance(value, mx.array)}
 
 
 def test_is_muon_compatible_classifies_2d_linear_as_muon() -> None:
@@ -140,7 +147,11 @@ def test_make_muon_update_step_completes_without_error() -> None:
     optimizer = make_muon()
     optimizer.init(model.trainable_parameters())
 
-    before = {key: mx.array(value) for key, value in tree_flatten(model.trainable_parameters())}
+    before = {
+        key: mx.array(value)
+        for key, value in tree_flatten(model.trainable_parameters())
+        if isinstance(value, mx.array)
+    }
 
     ids = mx.array([[0, 1, 2, 3]])
     x = mx.zeros((1, 4, 4))
@@ -169,6 +180,9 @@ def test_make_muon_cppmega_cuda_parity_forces_shared_lr() -> None:
     expected = pytest.approx(1e-4, rel=1e-4)
     assert float(optimizer.muon.learning_rate) == expected
     assert float(optimizer.adamw.learning_rate) == expected
+    assert isinstance(optimizer.muon, MuonWithNSCarrier)
+    assert optimizer.muon.nesterov is False
+    assert isinstance(optimizer.adamw, AdamWFP32Moments)
     # Parity mode also pins AdamW's betas to the cppmega CUDA defaults.
     assert list(optimizer.adamw.betas) == [0.9, 0.999]
 
@@ -177,6 +191,112 @@ def test_make_muon_default_lrs_match_keller_recipe() -> None:
     optimizer = make_muon()
     assert float(optimizer.muon.learning_rate) == pytest.approx(2e-3, rel=1e-4)
     assert float(optimizer.adamw.learning_rate) == pytest.approx(1e-4, rel=1e-4)
+
+
+def test_make_muon_ns_carrier_defaults_to_fp32_state_for_bf16_params() -> None:
+    model = _SplitterModel()
+    model.set_dtype(mx.bfloat16)
+    optimizer = make_muon()
+    optimizer.init(model.trainable_parameters())
+
+    state = _flatten_state(optimizer.state["muon"])
+    assert state["linear.weight.v"].dtype == mx.float32
+
+
+def test_make_muon_accepts_bf16_ns_carrier_and_preserves_param_dtype() -> None:
+    model = _SplitterModel()
+    model.set_dtype(mx.bfloat16)
+    optimizer = make_muon(ns_carrier="bf16")
+    optimizer.init(model.trainable_parameters())
+
+    ids = mx.array([[0, 1, 2, 3]])
+    x = mx.zeros((1, 4, 4), dtype=mx.bfloat16)
+
+    def loss_fn(m: nn.Module, ids: mx.array, x: mx.array) -> mx.array:
+        return m(ids, x).sum()
+
+    loss_and_grad = nn.value_and_grad(model, loss_fn)
+    loss, grads = loss_and_grad(model, ids, x)
+    optimizer.update(model, grads)
+    mx.eval(model.parameters(), optimizer.state, loss)
+
+    state = _flatten_state(optimizer.state["muon"])
+    params = dict(tree_flatten(model.trainable_parameters()))
+    assert state["linear.weight.v"].dtype == mx.float32
+    assert params["linear.weight"].dtype == mx.bfloat16
+    assert math.isfinite(float(loss.item()))
+
+
+def test_make_muon_honors_ns_carrier_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CPPMEGA_MUON_NS_CARRIER", "bf16")
+    optimizer = make_muon(ns_carrier="fp32")
+    assert isinstance(optimizer.muon, MuonWithNSCarrier)
+    assert optimizer.muon.ns_carrier == "bf16"
+
+
+@pytest.mark.parametrize("value", ["fp16", "", "float32"])
+def test_make_muon_rejects_invalid_ns_carrier(value: str) -> None:
+    with pytest.raises(ValueError, match="ns_carrier must be one of"):
+        make_muon(ns_carrier=value)
+
+
+def test_make_muon_rejects_invalid_ns_carrier_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CPPMEGA_MUON_NS_CARRIER", "fp16")
+    with pytest.raises(ValueError, match="ns_carrier must be one of"):
+        make_muon()
+
+
+def test_muon_ns_carrier_does_not_call_mlx_private_ns_helper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_private_helper(*_args: object, **_kwargs: object) -> mx.array:
+        raise AssertionError("MLX private Newton-Schulz helper should not be called")
+
+    monkeypatch.setattr(
+        MuonWithNSCarrier,
+        "_zeropower_via_newtonschulz5",
+        fail_private_helper,
+        raising=True,
+    )
+    optimizer = MuonWithNSCarrier(
+        learning_rate=1e-3,
+        momentum=0.95,
+        nesterov=True,
+        ns_steps=2,
+        ns_carrier="bf16",
+    )
+    state: dict[str, mx.array] = {}
+    parameter = mx.ones((4, 4), dtype=mx.bfloat16)
+    gradient = mx.full((4, 4), 0.125, dtype=mx.bfloat16)
+    optimizer.init_single(parameter, state)
+
+    updated = optimizer.apply_single(gradient, parameter, state)
+    mx.eval(updated, state)
+
+    assert updated.dtype == parameter.dtype
+
+
+def test_muon_bf16_ns_carrier_matches_fp32_orthogonalization() -> None:
+    mx.random.seed(0)
+    update = mx.random.normal((256, 256)).astype(mx.float32) * 0.02
+    fp32_orthogonalized = _muon_zeropower_newtonschulz5(
+        update,
+        steps=5,
+        ns_carrier="fp32",
+        output_dtype=mx.float32,
+    )
+    bf16_orthogonalized = _muon_zeropower_newtonschulz5(
+        update,
+        steps=5,
+        ns_carrier="bf16",
+        output_dtype=mx.float32,
+    )
+    mx.eval(fp32_orthogonalized, bf16_orthogonalized)
+
+    max_abs = mx.max(mx.abs(fp32_orthogonalized - bf16_orthogonalized))
+    assert float(max_abs.item()) <= 1e-2
 
 
 def test_make_muon_returns_muon_adamw_multi() -> None:

@@ -49,6 +49,7 @@ if str(ROOT) not in sys.path:
 import mlx.core as mx  # noqa: E402
 
 from cppmega_mlx.nn._tilelang.topk_selector import (  # noqa: E402
+    topk_selector_metal,
     topk_selector_path_b_status,
     topk_selector_reference,
 )
@@ -106,10 +107,23 @@ def _strategy_topk_take_along(scores: mx.array, k: int) -> tuple[mx.array, mx.ar
     return indices, values
 
 
+def _strategy_path_b_msl(scores: mx.array, k: int) -> mx.array:
+    """Direct-MSL Path B kernel (bypasses TileLang)."""
+
+    out = topk_selector_metal(scores, k)
+    if out is None:
+        # If Metal is unavailable just return the reference so the bench
+        # still reports a number. The path_b_status JSON field tells the
+        # reader whether the Metal kernel actually ran.
+        return topk_selector_reference(scores, k)
+    return out
+
+
 _STRATEGIES: dict[str, Callable[[mx.array, int], Any]] = {
     "argpartition": _strategy_argpartition,
     "argsort_slice": _strategy_argsort_slice,
     "topk_take_along": _strategy_topk_take_along,
+    "path_b_msl": _strategy_path_b_msl,
 }
 
 
@@ -242,13 +256,14 @@ def _default_shapes() -> list[dict[str, int | str]]:
 
 
 def _format_table(payload: dict[str, Any]) -> str:
-    headers = ["B", "T", "k", "dtype", "argpart_ms", "argsort_ms", "fused_ms", "peak_gib"]
-    width = [3, 6, 5, 9, 12, 12, 12, 9]
+    headers = ["B", "T", "k", "dtype", "argpart_ms", "argsort_ms", "fused_ms", "msl_ms", "peak_gib"]
+    width = [3, 6, 5, 9, 12, 12, 12, 12, 9]
     out_lines = ["  ".join(h.ljust(w) for h, w in zip(headers, width))]
     for row in payload["rows"]:
         ap = row["strategies"]["argpartition"]["median_ms"]
         ass = row["strategies"]["argsort_slice"]["median_ms"]
         fused = row["strategies"]["topk_take_along"]["median_ms"]
+        msl = row["strategies"].get("path_b_msl", {}).get("median_ms", float("nan"))
         peak = row["strategies"]["argpartition"].get("peak_gib")
         peak_str = f"{peak:.4f}" if peak else "-"
         line = "  ".join([
@@ -259,7 +274,8 @@ def _format_table(payload: dict[str, Any]) -> str:
             f"{ap:.4f}".ljust(width[4]),
             f"{ass:.4f}".ljust(width[5]),
             f"{fused:.4f}".ljust(width[6]),
-            peak_str.ljust(width[7]),
+            f"{msl:.4f}".ljust(width[7]),
+            peak_str.ljust(width[8]),
         ])
         out_lines.append(line)
     return "\n".join(out_lines)

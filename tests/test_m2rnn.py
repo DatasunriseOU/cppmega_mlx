@@ -592,6 +592,62 @@ def test_broadcast_nq1_nk1_nv4_nw1() -> None:
     _assert_close(h_chunk, h_seq)
 
 
+def test_singleton_head_broadcast_matches_explicit_repeat_values() -> None:
+    q, k, v, W, xf = _inputs(
+        batch=2,
+        seq=5,
+        n_q=1,
+        n_k=1,
+        n_v=4,
+        n_w=1,
+        n_f=1,
+        k_dim=3,
+        v_dim=2,
+        seed=125,
+    )
+
+    bq, bk, bv, bW, bxf = broadcast_m2rnn_heads(q, k, v, W, xf)
+    mx.eval(bq, bk, bv, bW, bxf)
+
+    assert bq.shape == (2, 5, 4, 3)
+    assert bk.shape == (2, 5, 4, 3)
+    assert bv.shape == v.shape
+    assert bW.shape == (4, 2, 2)
+    assert bxf.shape == (2, 5, 4)
+    _assert_close(bq, mx.repeat(q, repeats=4, axis=-2))
+    _assert_close(bk, mx.repeat(k, repeats=4, axis=-2))
+    _assert_close(bW, mx.repeat(W, repeats=4, axis=0))
+    _assert_close(bxf, mx.repeat(xf, repeats=4, axis=-1))
+
+
+def test_grouped_head_broadcast_fallback_matches_explicit_repeat_values() -> None:
+    q, k, v, W, xf = _inputs(
+        batch=1,
+        seq=6,
+        n_q=2,
+        n_k=2,
+        n_v=4,
+        n_w=2,
+        n_f=2,
+        k_dim=5,
+        v_dim=3,
+        seed=126,
+    )
+
+    bq, bk, bv, bW, bxf = broadcast_m2rnn_heads(q, k, v, W, xf)
+    mx.eval(bq, bk, bv, bW, bxf)
+
+    assert bq.shape == (1, 6, 4, 5)
+    assert bk.shape == (1, 6, 4, 5)
+    assert bv.shape == v.shape
+    assert bW.shape == (4, 3, 3)
+    assert bxf.shape == (1, 6, 4)
+    _assert_close(bq, mx.repeat(q, repeats=2, axis=-2))
+    _assert_close(bk, mx.repeat(k, repeats=2, axis=-2))
+    _assert_close(bW, mx.repeat(W, repeats=2, axis=0))
+    _assert_close(bxf, mx.repeat(xf, repeats=2, axis=-1))
+
+
 def test_broadcast_nq1_nk1_nv4_nw1_nf1_matches_chunked_scan() -> None:
     q, k, v, W, xf = _inputs(
         batch=1,

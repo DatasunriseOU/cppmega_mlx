@@ -144,6 +144,10 @@ def _broadcast_heads(x: mx.array, total_heads: int, axis: int, name: str) -> mx.
     _require_positive_divisible(total_heads, heads, name)
     if heads == total_heads:
         return x
+    if heads == 1:
+        target_shape = list(x.shape)
+        target_shape[axis] = total_heads
+        return mx.broadcast_to(x, tuple(target_shape))
     return mx.repeat(x, repeats=total_heads // heads, axis=axis)
 
 

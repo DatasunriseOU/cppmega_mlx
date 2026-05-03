@@ -1,23 +1,23 @@
 """Parity + status tests for the Path B FP8 sparse-MLA port.
 
-The FP8 path through tilelang's TVM-Metal lowering is blocked by both
-``T.gemm`` registration and ``float8_e4m3 -> Metal type`` codegen (see
-``cppmega_mlx/nn/_tilelang/sparse_mla_fp8.py`` module docstring). These tests
-exercise:
+The Path B FP8 kernel is now available via direct-MSL bypass (see
+``cppmega_mlx/nn/_tilelang/sparse_mla_fp8.py`` module docstring). The
+previous TileLang ``T.gemm`` and ``float8_e4m3 -> Metal type`` blockers are
+bypassed by emitting MSL through ``mx.fast.metal_kernel`` directly with
+inline e4m3 dequant on uint8 storage.
 
-1. The Metal-status surface returns ``available=False`` with the documented
-   reason while the codegen blockers are in place.
-2. ``sparse_mla_fp8_apply`` falls back to the FP8 reference and
-   ``force_metal=True`` raises with the blocker message.
-3. The pure-MLX FP8 reference matches a "dequantize-then-BF16" parity oracle
-   exactly (because both paths consume the same FP8-recovered Q/KV).
-4. The FP8 reference matches the original BF16 reference within FP8 noise
-   tolerance (rtol=5e-3 on small inputs, where the e4m3 mantissa preserves
-   enough precision for attention-scale outputs).
-5. The MXFP8 quantized_matmul side-path runs and produces finite outputs.
-6. MLX autograd flows backward through the FP8 reference cleanly, with grads
-   that match a BF16 reference taken over the same recovered tensors within
-   FP8 noise tolerance (rtol=1e-2).
+These tests exercise:
+
+1. The Metal-status surface returns ``available=True`` on a Metal device.
+2. ``sparse_mla_fp8_apply`` dispatches the kernel and parity holds vs the
+   pure-MLX FP8 reference within FP8 noise tolerance.
+3. ``force_metal=True`` succeeds (no blocker to raise).
+4. The pure-MLX FP8 reference matches a "dequantize-then-BF16" parity oracle
+   exactly.
+5. The FP8 reference matches the original BF16 reference within FP8 noise
+   tolerance (rtol=5e-3 on small inputs).
+6. The MXFP8 quantized_matmul side-path runs and produces finite outputs.
+7. MLX autograd flows backward through the FP8 path cleanly.
 """
 
 from __future__ import annotations
@@ -27,7 +27,9 @@ import pytest
 
 import mlx.core as mx
 
-from cppmega_mlx.nn._tilelang.sparse_mla_fp8 import (
+pytest.importorskip("tilelang")  # noqa: E402
+
+from cppmega_mlx.nn._tilelang.sparse_mla_fp8 import (  # noqa: E402
     SparseMLAFp8MetalStatus,
     _from_fp8_with_scale,
     _to_fp8_with_per_tensor_scale,
@@ -38,7 +40,7 @@ from cppmega_mlx.nn._tilelang.sparse_mla_fp8 import (
     sparse_mla_fp8_reference,
     sparse_mla_quantized_matmul_reference,
 )
-from cppmega_mlx.nn.sparse_mla import sparse_mla_attention_reference
+from cppmega_mlx.nn.sparse_mla import sparse_mla_attention_reference  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -76,47 +78,50 @@ def _make_inputs(
 # ---------------------------------------------------------------------------
 
 
-def test_fp8_metal_status_returns_blocker_reason() -> None:
+def test_fp8_metal_status_reports_available() -> None:
     status = sparse_mla_fp8_metal_status()
     assert isinstance(status, SparseMLAFp8MetalStatus)
-    assert status.available is False
-    assert "float8_e4m3" in status.reason
-    assert "codegen_metal.cc:271" in status.reason
+    if mx.metal.is_available():
+        assert status.available is True
+        assert "FP8 e4m3" in status.reason or "direct-MSL" in status.reason
+    else:
+        assert status.available is False
 
 
 def test_fp8_metal_status_with_arrays_validates_dispatcher_path() -> None:
     q, kv, indices, _ = _make_inputs()
     status = sparse_mla_fp8_metal_status(q, kv, indices)
-    assert status.available is False
-    # Reason is either the dispatcher reason or the blocker reason (whichever
-    # fires first); both branches are valid contract behavior.
-    assert status.reason
+    if mx.metal.is_available():
+        assert status.available is True
+    else:
+        assert status.available is False
 
 
-def test_fp8_fwd_metal_returns_status_and_none_outputs() -> None:
+def test_fp8_fwd_metal_returns_outputs() -> None:
     q, kv, indices, d_v = _make_inputs()
-    status, out, lse = sparse_mla_fp8_fwd_metal(q, kv, indices, d_v=d_v)
-    assert status.available is False
-    assert out is None and lse is None
+    result = sparse_mla_fp8_fwd_metal(q, kv, indices, d_v=d_v)
+    assert result is not None
+    out, lse = result
+    mx.eval(out, lse)
+    assert tuple(out.shape) == tuple(q.shape[:3]) + (d_v,)
 
 
-def test_fp8_bwd_metal_returns_status_and_none_outputs() -> None:
+def test_fp8_bwd_metal_returns_outputs() -> None:
     q, kv, indices, d_v = _make_inputs()
-    out_dummy = mx.zeros((1, 4, 2, d_v), dtype=mx.float32)
-    grad_dummy = mx.zeros_like(out_dummy)
-    lse_dummy = mx.zeros((1, 4, 2), dtype=mx.float32)
-    status, dq, dkv = sparse_mla_fp8_bwd_metal(
-        q, kv, out_dummy, grad_dummy, indices, lse_dummy, d_v=d_v
-    )
-    assert status.available is False
-    assert dq is None and dkv is None
+    d_out = mx.zeros((1, 4, 2, d_v), dtype=mx.float32)
+    grads = sparse_mla_fp8_bwd_metal(q, kv, d_out, indices, d_v=d_v)
+    assert grads is not None
+    dq, dkv = grads
+    mx.eval(dq, dkv)
+    assert tuple(dq.shape) == tuple(q.shape)
+    assert tuple(dkv.shape) == tuple(kv.shape)
 
 
-def test_fp8_apply_force_metal_raises_with_blocker_reason() -> None:
+def test_fp8_apply_force_metal_dispatches_kernel() -> None:
     q, kv, indices, d_v = _make_inputs()
-    with pytest.raises(RuntimeError) as exc:
-        sparse_mla_fp8_apply(q, kv, indices, d_v=d_v, force_metal=True)
-    assert "Metal path unavailable" in str(exc.value)
+    out = sparse_mla_fp8_apply(q, kv, indices, d_v=d_v, force_metal=True)
+    mx.eval(out)
+    assert tuple(out.shape) == tuple(q.shape[:3]) + (d_v,)
 
 
 # ---------------------------------------------------------------------------
@@ -143,12 +148,75 @@ def test_to_fp8_per_tensor_scale_roundtrip_recovers_within_noise() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_fp8_apply_falls_back_to_reference() -> None:
-    q, kv, indices, d_v = _make_inputs()
+def test_fp8_apply_matches_reference_within_fp8_tolerance() -> None:
+    """``sparse_mla_fp8_apply`` (Metal kernel) vs the pure-MLX FP8 reference.
+
+    Now that the direct-MSL FP8 kernel is wired the apply runs on Metal; the
+    parity tolerance is FP8 noise (rtol=5e-3) plus a small fp16 carrier
+    rounding margin.
+    """
+
+    q, kv, indices, d_v = _make_inputs(scale=0.1)
     out_apply = sparse_mla_fp8_apply(q, kv, indices, d_v=d_v)
     out_ref = sparse_mla_fp8_reference(q, kv, indices, d_v=d_v)
     mx.eval(out_apply, out_ref)
-    np.testing.assert_array_equal(np.asarray(out_apply), np.asarray(out_ref))
+    np.testing.assert_allclose(
+        np.asarray(out_apply).astype(np.float32),
+        np.asarray(out_ref).astype(np.float32),
+        rtol=5e-3,
+        atol=5e-3,
+    )
+
+
+def test_fp8_path_b_forward_parity() -> None:
+    """Direct-MSL FP8 forward must agree with the reference within FP8 noise."""
+
+    q, kv, indices, d_v = _make_inputs(scale=0.1)
+    result = sparse_mla_fp8_fwd_metal(q, kv, indices, d_v=d_v)
+    assert result is not None
+    out_msl, lse = result
+    out_ref = sparse_mla_fp8_reference(q, kv, indices, d_v=d_v)
+    mx.eval(out_msl, lse, out_ref)
+    np.testing.assert_allclose(
+        np.asarray(out_msl).astype(np.float32),
+        np.asarray(out_ref).astype(np.float32),
+        rtol=5e-3,
+        atol=5e-3,
+    )
+
+
+def test_fp8_path_b_backward_parity() -> None:
+    """Direct-MSL FP8 backward must agree with autograd of the reference."""
+
+    q, kv, indices, d_v = _make_inputs(scale=0.1)
+
+    rng = np.random.default_rng(31)
+    d_out = mx.array((rng.standard_normal(tuple(q.shape[:3]) + (d_v,)) * 0.1).astype(np.float32))
+
+    grads = sparse_mla_fp8_bwd_metal(q, kv, d_out, indices, d_v=d_v)
+    assert grads is not None
+    dq_msl, dkv_msl = grads
+    mx.eval(dq_msl, dkv_msl)
+
+    def loss(q_, kv_):
+        out = sparse_mla_fp8_reference(q_, kv_, indices, d_v=d_v)
+        return mx.sum(out * d_out)
+
+    dq_ref, dkv_ref = mx.grad(loss, argnums=(0, 1))(q, kv)
+    mx.eval(dq_ref, dkv_ref)
+
+    np.testing.assert_allclose(
+        np.asarray(dq_msl).astype(np.float32),
+        np.asarray(dq_ref).astype(np.float32),
+        rtol=1e-2,
+        atol=5e-3,
+    )
+    np.testing.assert_allclose(
+        np.asarray(dkv_msl).astype(np.float32),
+        np.asarray(dkv_ref).astype(np.float32),
+        rtol=1e-2,
+        atol=5e-3,
+    )
 
 
 def test_fp8_reference_matches_bf16_within_fp8_tolerance() -> None:

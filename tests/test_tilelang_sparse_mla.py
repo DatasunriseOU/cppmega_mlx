@@ -1,17 +1,20 @@
 """Tests for the Path B sparse-MLA port + pure-MLX reference parity oracle.
 
-The Path B Metal kernel is currently blocked by tilelang 0.1.9's missing
-``T.gemm`` lowering for the ``metal`` target. While that blocker is in place
-the tests verify:
+The Path B Metal kernel is now available via direct-MSL bypass (see
+``cppmega_mlx/nn/_tilelang/sparse_mla.py`` module docstring): we emit MSL
+through ``mx.fast.metal_kernel`` directly, skipping TileLang's TVM-Metal
+lowering entirely. The previous T.gemm blocker is bypassed.
+
+The tests verify:
 
 1. The pure-MLX reference matches a hand-rolled NumPy reference (forward
    parity oracle).
 2. The reference is differentiable via mx.value_and_grad and gradient norms
    are finite.
-3. The Path B status helpers report the blocker reason and the apply helper
-   falls back to the reference rather than dispatching a half-built kernel.
-4. The Metal kernel test surface is collected (skipped when tilelang is not
-   importable or the GEMM blocker is active).
+3. The direct-MSL Path B kernel matches the pure-MLX reference within fp16
+   tolerance (forward) and within autograd-grad tolerance (backward).
+4. The metal status helper reports availability and ``sparse_mla_apply``
+   exercises the Metal kernel with a fallback to the reference if needed.
 
 Tolerances: rtol=1e-3, atol=1e-3 for fp16 (plus generous fp32 hand checks).
 """
@@ -26,12 +29,16 @@ import pytest
 
 import mlx.core as mx
 
-from cppmega_mlx.nn._tilelang.sparse_mla import (
+pytest.importorskip("tilelang")  # noqa: E402
+
+from cppmega_mlx.nn._tilelang.sparse_mla import (  # noqa: E402
     SparseMLAMetalStatus,
     sparse_mla_apply,
+    sparse_mla_bwd_metal,
+    sparse_mla_fwd_metal,
     sparse_mla_metal_status,
 )
-from cppmega_mlx.nn.sparse_mla import (
+from cppmega_mlx.nn.sparse_mla import (  # noqa: E402
     sparse_mla_attention,
     sparse_mla_attention_reference,
 )
@@ -268,16 +275,20 @@ def test_reference_backward_against_finite_difference() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_metal_status_blocker_reported() -> None:
-    """Until the GEMM blocker lifts the Metal path must not appear available."""
+def test_metal_status_reports_available() -> None:
+    """The direct-MSL bypass should report available on a Metal device."""
 
     status = sparse_mla_metal_status()
     assert isinstance(status, SparseMLAMetalStatus)
-    assert status.available is False
-    assert "tilelang" in status.reason.lower() or "metal" in status.reason.lower()
+    # On a Metal-capable host the kernel must be available.
+    if mx.metal.is_available():
+        assert status.available is True
+        assert status.fp16_carrier is True
+    else:
+        assert status.available is False
 
 
-def test_apply_falls_back_to_reference() -> None:
+def test_apply_matches_reference_within_fp16_tolerance() -> None:
     rng = np.random.default_rng(5)
     B, S, H, D = 2, 8, 4, 32
     G = 1
@@ -295,45 +306,152 @@ def test_apply_falls_back_to_reference() -> None:
         mx.array(q_np), mx.array(kv_np), mx.array(indices_np), sm_scale=D ** -0.5
     )
     mx.eval(out_apply, out_ref)
-    np.testing.assert_array_equal(np.array(out_apply), np.array(out_ref))
+    # fp16 tolerance: the MSL kernel uses fp16 carrier with fp32 accumulators.
+    np.testing.assert_allclose(
+        np.array(out_apply).astype(np.float32),
+        np.array(out_ref).astype(np.float32),
+        rtol=1e-3,
+        atol=2e-3,
+    )
 
 
-def test_apply_force_metal_raises_during_blocker() -> None:
+def test_apply_force_metal_dispatches_kernel() -> None:
+    """force_metal=True must succeed now that the direct-MSL kernel exists."""
+
     rng = np.random.default_rng(6)
-    q = mx.array(rng.standard_normal((1, 4, 2, 8)).astype(np.float16))
-    kv = mx.array(rng.standard_normal((1, 8, 1, 8)).astype(np.float16))
-    indices = mx.array(rng.integers(0, 8, size=(1, 4, 1, 3)).astype(np.int32))
-    with pytest.raises(RuntimeError):
-        sparse_mla_apply(q, kv, indices, force_metal=True)
+    q = mx.array(rng.standard_normal((1, 4, 2, 32)).astype(np.float16))
+    kv = mx.array(rng.standard_normal((1, 8, 1, 32)).astype(np.float16))
+    indices = mx.array(rng.integers(0, 8, size=(1, 4, 1, 4)).astype(np.int32))
+    out = sparse_mla_apply(q, kv, indices, force_metal=True)
+    mx.eval(out)
+    assert tuple(out.shape) == (1, 4, 2, 32)
 
 
 # ---------------------------------------------------------------------------
-# Path B kernel suite (skipped while T.gemm blocker is active)
+# Path B kernel parity (replaces the previous "blocked" placeholders).
 # ---------------------------------------------------------------------------
 
 
-def _tilelang_metal_gemm_blocked() -> bool:
-    try:
-        importlib.import_module("tilelang")
-    except Exception:
-        return True
-    # Until the blocker lifts the status helper reports unavailable.
-    return not sparse_mla_metal_status().available
-
-
-@pytest.mark.skipif(
-    _tilelang_metal_gemm_blocked(),
-    reason="Path B sparse-MLA kernel blocked by tilelang 0.1.9 metal T.gemm gap",
+@pytest.mark.parametrize(
+    "cfg",
+    [
+        dict(B=1, S=4, H=2, D=16, G=1, topk=4, Skv=8),
+        dict(B=2, S=16, H=4, D=32, G=1, topk=8, Skv=32),
+        dict(B=1, S=8, H=4, D=32, G=2, topk=8, Skv=16),
+        dict(B=2, S=8, H=4, D=48, G=1, topk=8, Skv=16, d_v=32),
+    ],
+    ids=["small", "medium", "multigroup", "tail_dim"],
 )
-def test_path_b_forward_parity() -> None:
-    # Placeholder: the moment the blocker lifts, replace with a real parity
-    # check between sparse_mla_fwd_metal and the reference.
-    pytest.skip("sparse_mla_fwd_metal is not yet implemented")
+def test_path_b_forward_parity(cfg) -> None:
+    rng = np.random.default_rng(13)
+    B, S, H, D = cfg["B"], cfg["S"], cfg["H"], cfg["D"]
+    G = cfg["G"]
+    topk = cfg["topk"]
+    Skv = cfg["Skv"]
+    d_v = cfg.get("d_v")
+
+    q = mx.array(rng.standard_normal((B, S, H, D)).astype(np.float16))
+    kv = mx.array(rng.standard_normal((B, Skv, G, D)).astype(np.float16))
+    indices = mx.array(rng.integers(0, Skv, size=(B, S, G, topk)).astype(np.int32))
+
+    result = sparse_mla_fwd_metal(q, kv, indices, d_v=d_v)
+    assert result is not None, "direct-MSL Path B kernel must dispatch"
+    out_msl, lse = result
+    mx.eval(out_msl, lse)
+
+    out_ref = sparse_mla_attention_reference(q, kv, indices, d_v=d_v)
+    mx.eval(out_ref)
+
+    np.testing.assert_allclose(
+        np.array(out_msl).astype(np.float32),
+        np.array(out_ref).astype(np.float32),
+        rtol=1e-3,
+        atol=2e-3,
+    )
 
 
-@pytest.mark.skipif(
-    _tilelang_metal_gemm_blocked(),
-    reason="Path B sparse-MLA kernel blocked by tilelang 0.1.9 metal T.gemm gap",
-)
+def test_path_b_forward_parity_with_invalid_indices() -> None:
+    """Sentinel handling: -1 indices should produce zero output for fully-masked tokens."""
+
+    rng = np.random.default_rng(17)
+    B, S, H, D = 2, 4, 2, 32
+    G = 1
+    topk = 4
+    Skv = 8
+    q = mx.array(rng.standard_normal((B, S, H, D)).astype(np.float16))
+    kv = mx.array(rng.standard_normal((B, Skv, G, D)).astype(np.float16))
+    ind_np = rng.integers(0, Skv, size=(B, S, G, topk)).astype(np.int32)
+    ind_np[0, 0, 0, :] = -1  # all invalid for first token
+    indices = mx.array(ind_np)
+
+    result = sparse_mla_fwd_metal(q, kv, indices)
+    assert result is not None
+    out, _ = result
+    mx.eval(out)
+    out_np = np.array(out)
+    assert not np.isnan(out_np).any()
+    np.testing.assert_array_equal(out_np[0, 0, 0], np.zeros(D, dtype=out_np.dtype))
+
+
 def test_path_b_backward_parity() -> None:
-    pytest.skip("sparse_mla_bwd_metal is not yet implemented")
+    rng = np.random.default_rng(23)
+    B, S, H, D = 2, 8, 4, 32
+    G = 1
+    topk = 8
+    Skv = 16
+
+    q = mx.array(rng.standard_normal((B, S, H, D)).astype(np.float32))
+    kv = mx.array(rng.standard_normal((B, Skv, G, D)).astype(np.float32))
+    indices = mx.array(rng.integers(0, Skv, size=(B, S, G, topk)).astype(np.int32))
+    d_out = mx.array(rng.standard_normal((B, S, H, D)).astype(np.float32))
+
+    grads = sparse_mla_bwd_metal(q, kv, d_out, indices)
+    assert grads is not None
+    dq_msl, dkv_msl = grads
+    mx.eval(dq_msl, dkv_msl)
+
+    # Reference: autograd of pure-MLX path.
+    def loss(q_, kv_):
+        out = sparse_mla_attention_reference(q_, kv_, indices)
+        return mx.sum(out * d_out)
+
+    dq_ref, dkv_ref = mx.grad(loss, argnums=(0, 1))(q, kv)
+    mx.eval(dq_ref, dkv_ref)
+
+    # fp16 carrier means slightly looser tolerance than fp32.
+    np.testing.assert_allclose(
+        np.array(dq_msl).astype(np.float32),
+        np.array(dq_ref).astype(np.float32),
+        rtol=5e-3,
+        atol=5e-3,
+    )
+    np.testing.assert_allclose(
+        np.array(dkv_msl).astype(np.float32),
+        np.array(dkv_ref).astype(np.float32),
+        rtol=5e-3,
+        atol=5e-3,
+    )
+
+
+def test_apply_backward_through_custom_vjp() -> None:
+    """``sparse_mla_apply`` must propagate gradients via the custom VJP."""
+
+    rng = np.random.default_rng(29)
+    B, S, H, D = 1, 4, 2, 16
+    G = 1
+    topk = 4
+    Skv = 8
+    q = mx.array(rng.standard_normal((B, S, H, D)).astype(np.float32))
+    kv = mx.array(rng.standard_normal((B, Skv, G, D)).astype(np.float32))
+    indices = mx.array(rng.integers(0, Skv, size=(B, S, G, topk)).astype(np.int32))
+
+    def loss(q_, kv_):
+        out = sparse_mla_apply(q_, kv_, indices)
+        return mx.sum(out * out)
+
+    dq, dkv = mx.grad(loss, argnums=(0, 1))(q, kv)
+    mx.eval(dq, dkv)
+    assert np.all(np.isfinite(np.array(dq)))
+    assert np.all(np.isfinite(np.array(dkv)))
+    assert np.linalg.norm(np.array(dq)) > 0
+    assert np.linalg.norm(np.array(dkv)) > 0

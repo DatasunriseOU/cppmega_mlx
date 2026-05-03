@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import inspect
-from typing import Any, Callable
+import os
+from typing import Any, Callable, Literal
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -19,6 +20,9 @@ ADAMW_MOMENT_STATE_KEYS = ("m", "v")
 MUON_BASE_CLASS = "mlx.optimizers.Muon"
 MUON_ADAMW_MULTI_CLASS = "cppmega_mlx.training.optimizers.MuonAdamWMulti"
 MUON_ADAMW_MULTI_SOURCE = "cppmega_mlx.training.optimizers.make_muon"
+MUON_NS_CARRIER_ENV = "CPPMEGA_MUON_NS_CARRIER"
+MUON_NS_CARRIERS = ("fp32", "bf16")
+MuonNSCarrier = Literal["fp32", "bf16"]
 
 EMBEDDING_LIKE_NAME_HINTS = ("embed", "embedding", "lm_head", "wte", "wpe")
 MAMBA_SCALAR_LEAVES = frozenset(
@@ -165,8 +169,8 @@ def split_param_groups(
     """
 
     flat = tree_flatten(model_params)
-    muon_pairs: list[tuple[str, mx.array]] = []
-    other_pairs: list[tuple[str, mx.array]] = []
+    muon_pairs: list[tuple[str, Any]] = []
+    other_pairs: list[tuple[str, Any]] = []
     for name, value in flat:
         if isinstance(value, mx.array) and predicate(name, value):
             muon_pairs.append((name, value))
@@ -190,6 +194,138 @@ def _muon_supported_kwargs() -> set[str]:
         return set()
     params = signature.parameters
     return {name for name in params if name != "self"}
+
+
+def _normalize_muon_ns_carrier(ns_carrier: str) -> MuonNSCarrier:
+    normalized = ns_carrier.strip().lower()
+    if normalized not in MUON_NS_CARRIERS:
+        allowed = ", ".join(MUON_NS_CARRIERS)
+        raise ValueError(f"ns_carrier must be one of {allowed}; got {ns_carrier!r}")
+    return normalized  # type: ignore[return-value]
+
+
+def _muon_ns_carrier_dtype(ns_carrier: MuonNSCarrier) -> mx.Dtype:
+    return mx.bfloat16 if ns_carrier == "bf16" else mx.float32
+
+
+def _muon_state_dtype() -> mx.Dtype:
+    return mx.float32
+
+
+def _muon_zeropower_newtonschulz5(
+    update: mx.array,
+    *,
+    steps: int,
+    ns_carrier: MuonNSCarrier,
+    output_dtype: mx.Dtype,
+) -> mx.array:
+    """Newton-Schulz matrix-sign iteration with an explicit carrier dtype.
+
+    This mirrors MLX's public Muon algorithm but keeps the carrier policy
+    repo-local so we do not depend on MLX's private underscore helper.
+    """
+
+    if update.ndim != 2:
+        raise ValueError(
+            "Expected a 2D array for Newton-Schulz iteration, "
+            f"got shape {update.shape} instead."
+        )
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    transpose_needed = update.shape[-2] > update.shape[-1]
+
+    x = update.astype(mx.float32)
+    if transpose_needed:
+        x = x.T
+
+    x = x / (mx.linalg.norm(x, keepdims=True) + 1e-7)
+    carrier_dtype = _muon_ns_carrier_dtype(ns_carrier)
+    x = x.astype(carrier_dtype)
+
+    for _ in range(steps):
+        gram = x @ x.T
+        basis = mx.addmm(b * gram, gram, gram, beta=1.0, alpha=c)
+        x = mx.addmm(a * x, basis, x, beta=1.0, alpha=1.0).astype(carrier_dtype)
+
+    if transpose_needed:
+        x = x.T
+    return x.astype(output_dtype)
+
+
+class MuonWithNSCarrier(optim.Muon):
+    """MLX Muon with a configurable Newton-Schulz carrier dtype.
+
+    ``ns_carrier="fp32"`` keeps the momentum/update path in fp32 and uses fp32
+    NS iterations. ``ns_carrier="bf16"`` mirrors cppmega's GB10 knob by running
+    only the NS polynomial on bf16 carrier tensors; the optimizer momentum and
+    update state remain fp32.
+    """
+
+    def __init__(
+        self,
+        learning_rate: float | Callable[[mx.array], mx.array],
+        momentum: float = 0.95,
+        weight_decay: float = 0.01,
+        nesterov: bool = True,
+        ns_steps: int = 5,
+        *,
+        ns_carrier: str = "fp32",
+    ) -> None:
+        super().__init__(
+            learning_rate=learning_rate,
+            momentum=momentum,
+            weight_decay=weight_decay,
+            nesterov=nesterov,
+            ns_steps=ns_steps,
+        )
+        self.ns_carrier: MuonNSCarrier = _normalize_muon_ns_carrier(ns_carrier)
+
+    def init_single(self, parameter: mx.array, state: dict[str, Any]) -> None:
+        state["v"] = mx.zeros(parameter.shape, dtype=_muon_state_dtype())
+
+    def apply_single(
+        self,
+        gradient: mx.array,
+        parameter: mx.array,
+        state: dict[str, Any],
+    ) -> mx.array:
+        state_dtype = state["v"].dtype
+        gradient_for_state = gradient.astype(state_dtype)
+        if self.weight_decay != 0:
+            gradient_for_state = gradient_for_state + self.weight_decay * parameter.astype(
+                state_dtype
+            )
+
+        v = self.momentum * state["v"]
+        v = v + (1 - self.momentum) * gradient_for_state
+        state["v"] = v
+
+        if self.nesterov:
+            update = gradient_for_state * (1 - self.momentum) + v * self.momentum
+        else:
+            update = v
+
+        lr = self.learning_rate.astype(update.dtype)
+        if update.ndim >= 2:
+            original_shape = update.shape
+            reshape_needed = update.ndim > 2
+
+            if reshape_needed:
+                update = mx.reshape(update, (update.shape[0], -1))
+
+            update = _muon_zeropower_newtonschulz5(
+                update,
+                steps=self.ns_steps,
+                ns_carrier=self.ns_carrier,
+                output_dtype=update.dtype,
+            )
+
+            if reshape_needed:
+                update = mx.reshape(update, original_shape)
+
+            lr *= max(1, update.shape[-2] / update.shape[-1]) ** 0.5
+
+        updated = parameter.astype(update.dtype) - lr * update
+        return updated.astype(parameter.dtype)
 
 
 class MuonAdamWMulti(optim.Optimizer):
@@ -281,6 +417,7 @@ def make_muon(
     weight_decay: float = 0.01,
     eps: float = 1e-8,
     cppmega_cuda_parity: bool = False,
+    ns_carrier: str = "fp32",
 ) -> MuonAdamWMulti:
     """Construct a Muon + AdamW chained optimizer with cppmega CUDA-style routing.
 
@@ -296,18 +433,23 @@ def make_muon(
     runner that takes a single ``--lr 1e-4`` flag and is the parity-trace
     configuration used by the audit tooling.
 
-    The factory adapts to whatever Muon kwargs the installed MLX exposes via
-    ``inspect.signature``, so we do not fail-close if a future version drops or
-    renames a knob.
+    ``ns_carrier`` mirrors cppmega's ``CPPMEGA_MUON_NS_CARRIER`` knob. The
+    factory uses a repo-local Muon subclass so the carrier policy does not
+    depend on MLX's private Newton-Schulz helper.
     """
+
+    ns_carrier = _normalize_muon_ns_carrier(
+        os.environ.get(MUON_NS_CARRIER_ENV, ns_carrier)
+    )
 
     if cppmega_cuda_parity:
         lr_muon = 1e-4
         lr_adamw = 1e-4
+        nesterov = False
         betas_adamw = (0.9, 0.999)
 
     muon_kwargs: dict[str, Any] = {"learning_rate": lr_muon}
-    accepted = _muon_supported_kwargs()
+    accepted = _muon_supported_kwargs() | {"ns_carrier"}
     if "momentum" in accepted:
         muon_kwargs["momentum"] = momentum
     if "nesterov" in accepted:
@@ -316,8 +458,10 @@ def make_muon(
         muon_kwargs["ns_steps"] = ns_steps
     if "weight_decay" in accepted:
         muon_kwargs["weight_decay"] = weight_decay
+    if "ns_carrier" in accepted:
+        muon_kwargs["ns_carrier"] = ns_carrier
 
-    muon_optimizer = optim.Muon(**muon_kwargs)
+    muon_optimizer = MuonWithNSCarrier(**muon_kwargs)
     adamw_optimizer = make_adamw(
         learning_rate=lr_adamw,
         weight_decay=weight_decay,
@@ -374,7 +518,11 @@ __all__ = [
     "MUON_ADAMW_MULTI_CLASS",
     "MUON_ADAMW_MULTI_SOURCE",
     "MUON_BASE_CLASS",
+    "MUON_NS_CARRIER_ENV",
+    "MUON_NS_CARRIERS",
     "MuonAdamWMulti",
+    "MuonNSCarrier",
+    "MuonWithNSCarrier",
     "adamw_moment_dtypes_ok",
     "collect_adamw_moment_dtypes",
     "dtype_name",

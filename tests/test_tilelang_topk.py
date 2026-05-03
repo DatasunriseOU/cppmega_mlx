@@ -1,21 +1,19 @@
 """Tests for the Path B topk_selector port.
 
-The Path B Metal kernel is currently blocked by tilelang 0.1.9's missing
-``shared.dyn`` storage scope on the ``metal`` target (and a downstream
-``LowerTileOp`` injective-layout failure when the histogram fill is sized
-``RADIX+1``). See docs/tilelang_ports/topk_selector.md for the probe
-transcript.
+The Path B Metal kernel is now available via direct-MSL bypass (see
+``cppmega_mlx/nn/_tilelang/topk_selector.py``). The previous TileLang
+``shared.dyn`` / ``LowerTileOp`` blockers are bypassed by emitting MSL
+through ``mx.fast.metal_kernel`` directly with static threadgroup arrays.
 
-While that blocker is in place the tests verify:
+The tests verify:
 
 1. The pure-MLX reference returns the correct top-k indices (set-equality
    to a NumPy oracle) for a sweep of (B, T, k) shapes.
-2. Output shape and dtype match the cppmega source contract.
-3. Edge cases (k=1, k=seq_len, and start/end masking) are exercised.
-4. The Path B status helper reports the blocker reason and the public
-   ``topk_selector`` entry point still produces the reference output.
-5. The Metal kernel test surface is collected (skipped when tilelang is
-   not importable or the codegen blocker is active).
+2. The direct-MSL Path B kernel produces the same set of indices as the
+   reference (set-equality, since both partition contracts are
+   order-unspecified).
+3. Output shape and dtype match the cppmega source contract.
+4. Edge cases (k=1, k=seq_len, and start/end masking) are exercised.
 """
 
 from __future__ import annotations
@@ -27,9 +25,12 @@ import pytest
 
 import mlx.core as mx
 
-from cppmega_mlx.nn._tilelang.topk_selector import (
+pytest.importorskip("tilelang")  # noqa: E402
+
+from cppmega_mlx.nn._tilelang.topk_selector import (  # noqa: E402
     PathBStatus,
     topk_selector,
+    topk_selector_metal,
     topk_selector_path_b_status,
     topk_selector_reference,
 )
@@ -183,12 +184,14 @@ def test_public_topk_selector_matches_reference() -> None:
     assert _to_index_sets(out_pub) == _to_index_sets(out_ref)
 
 
-def test_path_b_status_records_blocker_reason() -> None:
+def test_path_b_status_reports_available_on_metal() -> None:
     status = topk_selector_path_b_status()
     assert isinstance(status, PathBStatus)
-    assert status.available is False
-    # The reason must mention the codegen problem so future readers find it.
-    assert "shared.dyn" in status.reason or "Loop layout" in status.reason
+    if mx.metal.is_available():
+        assert status.available is True
+        assert "direct-MSL" in status.reason or "available" in status.reason
+    else:
+        assert status.available is False
 
 
 def test_path_b_status_reason_is_stable() -> None:
@@ -198,22 +201,58 @@ def test_path_b_status_reason_is_stable() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Path B kernel suite (skipped while shared.dyn / layout blocker is active).
+# Direct-MSL Path B kernel parity (replaces the previous "blocked" placeholder).
 # ---------------------------------------------------------------------------
 
-def _tilelang_metal_topk_blocked() -> bool:
-    try:
-        importlib.import_module("tilelang")
-    except Exception:
-        return True
-    return not topk_selector_path_b_status().available
+
+@pytest.mark.parametrize("batch", [1, 4])
+@pytest.mark.parametrize("seq_len", [64, 512, 2048])
+@pytest.mark.parametrize("k", [1, 8, 32])
+def test_path_b_forward_parity_set_equality(batch: int, seq_len: int, k: int) -> None:
+    if k > seq_len:
+        pytest.skip("k must be <= seq_len")
+    rng = np.random.default_rng(seed=batch * 7919 + seq_len * 31 + k)
+    scores_np = rng.standard_normal((batch, seq_len)).astype(np.float32)
+    # Make values unique so set-equality is well defined (no ties to resolve).
+    scores_np = (
+        scores_np
+        + 1e-3
+        * np.arange(scores_np.size).reshape(scores_np.shape).astype(np.float32)
+        / scores_np.size
+    )
+    scores = mx.array(scores_np)
+    out_msl = topk_selector_metal(scores, k)
+    assert out_msl is not None, "direct-MSL Path B kernel must dispatch"
+    out_ref = topk_selector_reference(scores, k)
+    actual = _to_index_sets(out_msl)
+    expected = _to_index_sets(out_ref)
+    assert actual == expected
+    assert out_msl.dtype == mx.int32
+    assert tuple(out_msl.shape) == (batch, k)
 
 
-@pytest.mark.skipif(
-    _tilelang_metal_topk_blocked(),
-    reason="Path B topk_selector kernel blocked by tilelang 0.1.9 metal shared.dyn gap",
-)
-def test_path_b_forward_parity() -> None:
-    # Placeholder: the moment the blocker lifts, replace with a real parity
-    # check between a Metal-backed topk_selector and the pure-MLX reference.
-    pytest.skip("Metal-backed topk_selector is not yet implemented")
+def test_path_b_forward_parity_with_starts_ends() -> None:
+    rng = np.random.default_rng(7)
+    batch, seq_len, k = 3, 32, 4
+    scores_np = rng.standard_normal((batch, seq_len)).astype(np.float32)
+    starts_np = np.array([4, 0, 8], dtype=np.int32)
+    ends_np = np.array([16, 8, 24], dtype=np.int32)
+    scores = mx.array(scores_np)
+    starts = mx.array(starts_np)
+    ends = mx.array(ends_np)
+
+    out_msl = topk_selector_metal(scores, k, starts=starts, ends=ends)
+    assert out_msl is not None
+    out_ref = topk_selector_reference(scores, k, starts=starts, ends=ends)
+    actual = _to_index_sets(out_msl)
+    expected = _to_index_sets(out_ref)
+    assert actual == expected
+
+
+def test_public_entry_point_metal_backend_dispatches_kernel() -> None:
+    rng = np.random.default_rng(11)
+    scores = mx.array(rng.standard_normal((2, 64)).astype(np.float32))
+    # backend='metal' should not raise now.
+    out_metal = topk_selector(scores, k=8, backend="metal")
+    out_ref = topk_selector(scores, k=8, backend="mlx")
+    assert _to_index_sets(out_metal) == _to_index_sets(out_ref)

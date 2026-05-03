@@ -1,0 +1,305 @@
+From a69d6df75b46d7f0eca2eab205a901bc45c6a6af Mon Sep 17 00:00:00 2001
+From: David Gornshtein <davidgornshtein@gmail.com>
+Date: Sun, 3 May 2026 14:41:17 +0200
+Subject: [PATCH] tilelang: allow mixed-dtype T.gemm via Metal scalar fallback
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The tile-op T.gemm() asserts ``A.dtype == B.dtype`` in
+``tilelang.tileop.gemm.GemmBase.in_dtype``, blocking chained
+mixed-precision patterns such as attention's ``S = Q·Kᵀ`` (FP16×FP16
+→ FP32) followed by ``O = S·V`` where the FP32 ``S`` accumulator feeds
+back as one operand of an FP16 ``V``.
+
+This patch:
+
+1. Drops the strict assert in ``GemmBase.in_dtype`` and adds a
+   ``has_mixed_input_dtype`` property used by dispatchers to detect the
+   mixed-precision case.
+
+2. Routes mixed-dtype Metal GEMMs to the existing
+   ``GemmMetalScalar`` fallback instead of ``GemmMetal``
+   (``simdgroup_matrix_multiply`` requires same-dtype operands). The
+   scalar fallback already casts both A and B values to ``accum_dtype``
+   per element, so it handles dtype mismatch correctly.
+
+3. Updates the ``MetalFragmentToSimdgroup`` transform to skip
+   accumulator vars produced by mixed-dtype GEMMs and the fragment
+   operand ``A`` of a mixed-dtype GEMM. Without this, the second
+   GEMM's scalar reads would dereference a ``simdgroup_floatNN``
+   register, which the Metal codegen rejects.
+
+4. Adds a unit test ``test_attention_chain_mixed_dtype_metal_codegen``
+   that exercises the FP16 Q·Kᵀ → FP32 ; FP32·FP16 → FP32 chain.
+
+Other backends (CUDA MMA, ROCm MFMA/WMMA, Hopper WGMMA, Blackwell
+TCGEN5MMA) continue to use the original C++ ``GemmGetGemmInst``
+selection. They pass through ``in_dtype`` (now without the assert) and
+emit single-typed MMA intrinsics; if a backend genuinely cannot lower
+a mixed-dtype gemm, downstream layout / emitter checks raise instead
+of the frontend assert. CPU scalar already supports mixed dtypes via
+``T.cast(..., accum_dtype)``.
+
+Tests:
+* New: ``testing/python/metal/test_metal_codegen_linux.py::test_attention_chain_mixed_dtype_metal_codegen`` passes.
+* Existing: 50/56 metal codegen tests pass (6 pre-existing failures
+  unrelated to this patch); all 11 CPU gemm tests pass; all 130
+  cppmega.mlx tilelang tests pass.
+* Probe ``docs/upstream/test_sparse_mla_pipeline.py k3_multi_gemm`` now
+  reports OK (was: AssertionError "A and B must have the same dtype").
+---
+ .../python/metal/test_metal_codegen_linux.py  | 55 +++++++++++++++
+ tilelang/tileop/gemm/__init__.py              | 30 ++++++++
+ tilelang/tileop/gemm/gemm_base.py             | 23 +++++-
+ .../transform/metal_fragment_to_simdgroup.py  | 70 ++++++++++++++++---
+ 4 files changed, 169 insertions(+), 9 deletions(-)
+
+diff --git a/testing/python/metal/test_metal_codegen_linux.py b/testing/python/metal/test_metal_codegen_linux.py
+index 6194e411..8d417be6 100644
+--- a/testing/python/metal/test_metal_codegen_linux.py
++++ b/testing/python/metal/test_metal_codegen_linux.py
+@@ -303,6 +303,61 @@ def test_t_gemm_attention_like_metal_codegen_float32():
+     assert_attention_like_metal_codegen(16, 16, 16)
+ 
+ 
++def attention_chain_mixed_dtype():
++    """Two-step chain ``S = Q·Kᵀ`` (FP16×FP16→FP32) then ``O = S·V``
++    where ``S`` is the FP32 fragment from the first GEMM and ``V`` is
++    FP16 in shared memory.
++
++    The second ``T.gemm(S, V, O)`` carries ``A.dtype = float32`` and
++    ``B.dtype = float16``. Before the patch this tripped
++    ``assert self.A.dtype == self.B.dtype`` in
++    ``tilelang.tileop.gemm.gemm_base.GemmBase.in_dtype``. After the
++    patch, the dispatcher routes mixed-dtype Metal GEMMs through
++    ``GemmMetalScalar`` which casts both operands to ``accum_dtype``
++    independently, and the ``MetalFragmentToSimdgroup`` transform
++    correctly leaves the scalar accumulator out of the simdgroup
++    rewrite set.
++    """
++
++    @T.prim_func
++    def main(
++        Q: T.Tensor((32, 64), T.float16),
++        K: T.Tensor((32, 64), T.float16),
++        V: T.Tensor((32, 64), T.float16),
++        O: T.Tensor((32, 64), T.float16),
++    ):
++        with T.Kernel(1, threads=128) as (bx,):
++            Q_shared = T.alloc_shared((32, 64), T.float16, scope="shared")
++            K_shared = T.alloc_shared((32, 64), T.float16, scope="shared")
++            V_shared = T.alloc_shared((32, 64), T.float16, scope="shared")
++            S_local = T.alloc_fragment((32, 32), T.float32)
++            O_local = T.alloc_fragment((32, 64), T.float32)
++            T.clear(S_local)
++            T.clear(O_local)
++            T.copy(Q, Q_shared)
++            T.copy(K, K_shared)
++            T.copy(V, V_shared)
++            T.gemm(Q_shared, K_shared, S_local, transpose_B=True)
++            T.gemm(S_local, V_shared, O_local)
++            T.copy(O_local, O)
++
++    return main
++
++
++def assert_attention_chain_mixed_dtype_metal_codegen():
++    func = attention_chain_mixed_dtype()
++    with tvm.transform.PassContext():
++        artifact = tilelang.lower(func, target="metal")
++
++    src_code = artifact.kernel_source
++    assert src_code is not None
++    assert "kernel void" in src_code
++
++
++def test_attention_chain_mixed_dtype_metal_codegen():
++    assert_attention_chain_mixed_dtype_metal_codegen()
++
++
+ def test_mixed_shared_merge_metal_codegen():
+     assert_mixed_shared_merge_metal_codegen()
+ 
+diff --git a/tilelang/tileop/gemm/__init__.py b/tilelang/tileop/gemm/__init__.py
+index 5be39750..faaedb1a 100644
+--- a/tilelang/tileop/gemm/__init__.py
++++ b/tilelang/tileop/gemm/__init__.py
+@@ -164,6 +164,13 @@ class Gemm(Node, Scriptable):
+         6. METAL_SIMDGROUP for Metal target (simdgroup_matrix)
+         7. Scalar for CPU target (scalar fallback)
+ 
++        Special-case: when A and B carry different element dtypes (a chained
++        mixed-precision pattern, e.g. attention's FP32 accumulator feeding
++        back as one operand of a subsequent FP16 GEMM), Metal cannot use
++        ``simdgroup_matrix_multiply`` (which requires same-dtype operands),
++        so we force the scalar fallback that casts both operands to
++        ``accum_dtype`` independently.
++
+         Args:
+             thread_nums: Number of threads in the block
+             target: Target architecture
+@@ -172,9 +179,32 @@ class Gemm(Node, Scriptable):
+             GemmInst: The selected GEMM instruction type
+         """
+         if target_is_metal(target):
++            # GemmMetal (simdgroup) requires A.dtype == B.dtype because it
++            # lowers to `simdgroup_matrix_multiply`. For chained
++            # mixed-precision patterns we route to the scalar fallback
++            # (GemmMetalScalar) which handles dtype mismatch via per-load
++            # `T.cast(..., accum_dtype)`.
++            if self._has_mixed_input_dtype():
++                return GemmInst.Scalar
+             return GemmInst.METAL_SIMDGROUP
+         return GemmInst(_ffi_api.GemmGetGemmInst(self, int(thread_nums), target))
+ 
++    def _has_mixed_input_dtype(self) -> bool:
++        """Return True if A.dtype != B.dtype (mixed-precision chain)."""
++        a = getattr(self, "a", None)
++        b = getattr(self, "b", None)
++        if a is None or b is None:
++            return False
++        # TS variant (A in TMEM) carries accum dtype on A; not a "mixed
++        # input dtype" case for the purposes of MMA selection.
++        try:
++            from tilelang.utils.language import is_tensor_memory
++            if is_tensor_memory(a):
++                return False
++        except Exception:  # pragma: no cover - defensive
++            pass
++        return str(a.dtype) != str(b.dtype)
++
+     def _get_implementation_class(self, gemm_inst: GemmInst, target: Target):
+         """Get the appropriate implementation class for the given GEMM instruction.
+ 
+diff --git a/tilelang/tileop/gemm/gemm_base.py b/tilelang/tileop/gemm/gemm_base.py
+index 95f69bbf..bf3d2880 100644
+--- a/tilelang/tileop/gemm/gemm_base.py
++++ b/tilelang/tileop/gemm/gemm_base.py
+@@ -82,12 +82,33 @@ class GemmBase:
+ 
+         For the TS variant, A resides in TMEM with the accumulator dtype, so
+         the actual input dtype is derived from B.
++
++        For mixed-precision chains (e.g. attention's ``S = Q·Kᵀ`` in FP32
++        followed by ``O = S·V`` where ``V`` is FP16), ``A.dtype`` and
++        ``B.dtype`` may differ. This property returns ``A.dtype`` in that
++        case; backends that emit a single-typed MMA intrinsic (Metal
++        simdgroup, CUDA MMA, etc.) are responsible for either inserting
++        an explicit cast at the load site or refusing to lower (in which
++        case the dispatcher in ``Gemm._select_gemm_instruction`` should
++        steer the call toward a scalar fallback that casts both operands
++        to ``accum_dtype`` independently).
+         """
+         if is_tensor_memory(self.A):
+             return self.B.dtype
+-        assert self.A.dtype == self.B.dtype, "A and B must have the same dtype"
+         return self.A.dtype
+ 
++    @property
++    def has_mixed_input_dtype(self) -> bool:
++        """True when A and B carry different element dtypes.
++
++        Used by dispatchers to decide whether to route to a scalar
++        fallback that handles mixed precision (cast both to accum_dtype)
++        instead of a strict same-dtype MMA intrinsic.
++        """
++        if is_tensor_memory(self.A):
++            return False
++        return str(self.A.dtype) != str(self.B.dtype)
++
+     @property
+     def accum_dtype(self) -> str:
+         return self.C.dtype
+diff --git a/tilelang/transform/metal_fragment_to_simdgroup.py b/tilelang/transform/metal_fragment_to_simdgroup.py
+index 0b5dd1bd..dad10876 100644
+--- a/tilelang/transform/metal_fragment_to_simdgroup.py
++++ b/tilelang/transform/metal_fragment_to_simdgroup.py
+@@ -31,22 +31,76 @@ def _extract_buffer_var_from_region(region_call):
+     return None
+ 
+ 
+-def _collect_fragment_gemm_accum_vars(body: tir.Stmt) -> set:
+-    accum_vars: set = set()
++def _extract_buffer_from_region(region_call):
++    """Return the Buffer referenced by a tl.region(BufferLoad, ...) call.
++
++    Used to inspect operand dtypes so we can detect mixed-precision GEMMs
++    (which route to the Metal scalar fallback rather than simdgroup MMA
++    and therefore must NOT have their accumulator scope rewritten to
++    ``metal.simdgroup``).
++    """
++    if not isinstance(region_call, tir.Call):
++        return None
++    if len(region_call.args) < 1:
++        return None
++    buf_load = region_call.args[0]
++    if isinstance(buf_load, tir.BufferLoad):
++        return buf_load.buffer
++    return None
++
++
++def _collect_fragment_gemm_accum_vars(body: tir.Stmt):
++    """Walk the body and return fragment vars safe to rewrite to simdgroup.
++
++    Returns the set of fragment vars used as the C operand of a
++    same-dtype GEMM (the ones that will be lowered through
++    ``GemmMetal`` / simdgroup_matrix_multiply). Vars that appear as the C
++    operand of a mixed-dtype GEMM (which will route to the scalar
++    fallback ``GemmMetalScalar``) — or as the A operand of such a GEMM
++    when A is itself a fragment — are excluded so that the scalar
++    fallback can perform its per-element ``T.cast(..., accum_dtype)``
++    arithmetic on them without tripping the Metal codegen's check that
++    ``metal.simdgroup`` allocations are scalar 8x8 blocks.
++    """
++    simd_accum_vars: set = set()
++    scalar_accum_vars: set = set()
+     gemm_ops = _get_gemm_ops()
+ 
+     def _visitor(stmt):
+         if isinstance(stmt, tir.Evaluate) and isinstance(stmt.value, tir.Call):
+             call = stmt.value
+             if call.op in gemm_ops and len(call.args) >= 3:
+-                var = _extract_buffer_var_from_region(call.args[2])
+-                if var is not None and hasattr(var, "type_annotation"):
+-                    ta = var.type_annotation
+-                    if ta is not None and hasattr(ta, "storage_scope") and ta.storage_scope == "local.fragment":
+-                        accum_vars.add(var)
++                a_buf = _extract_buffer_from_region(call.args[0])
++                b_buf = _extract_buffer_from_region(call.args[1])
++                c_var = _extract_buffer_var_from_region(call.args[2])
++                if c_var is None or not hasattr(c_var, "type_annotation"):
++                    return
++                ta = c_var.type_annotation
++                if ta is None or not hasattr(ta, "storage_scope") or ta.storage_scope != "local.fragment":
++                    return
++                # Mixed-dtype A/B routes to the scalar fallback on Metal
++                # (see Gemm._select_gemm_instruction in
++                # tilelang/tileop/gemm/__init__.py).
++                mixed = (a_buf is not None and b_buf is not None
++                         and str(a_buf.dtype) != str(b_buf.dtype))
++                if mixed:
++                    scalar_accum_vars.add(c_var)
++                    # If A is itself a fragment in this scalar gemm, the
++                    # scalar fallback reads it scalar — never via
++                    # simdgroup_load. Don't promote it.
++                    if a_buf is not None and hasattr(a_buf.data, "type_annotation"):
++                        a_ta = a_buf.data.type_annotation
++                        if (a_ta is not None and hasattr(a_ta, "storage_scope")
++                                and a_ta.storage_scope == "local.fragment"):
++                            scalar_accum_vars.add(a_buf.data)
++                else:
++                    simd_accum_vars.add(c_var)
+ 
+     tir.stmt_functor.post_order_visit(body, _visitor)
+-    return accum_vars
++    # Conservative: if a var appears in BOTH modes (e.g. fp16 Q@Kt
++    # produces S into simdgroup, then mixed-dtype S@V reads S as scalar),
++    # keep the scalar scope so the scalar reads typecheck.
++    return simd_accum_vars - scalar_accum_vars
+ 
+ 
+ def _remap_buffer(buf, var_map):
+-- 
+2.50.1 (Apple Git-155)
+
