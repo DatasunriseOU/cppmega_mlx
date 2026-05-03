@@ -25,48 +25,48 @@
   "timings": {
     "fwd_path_b": {
       "label": "fwd_path_b",
-      "mean_ms": 0.5692583648487926,
-      "median_ms": 0.5517500685527921,
-      "min_ms": 0.46770786866545677,
-      "max_ms": 0.9815420489758253,
+      "mean_ms": 0.6237783376127481,
+      "median_ms": 0.5545414751395583,
+      "min_ms": 0.47370814718306065,
+      "max_ms": 0.9534580167382956,
       "iters": 50,
       "warmup": 10
     },
     "fwd_path_c": {
       "label": "fwd_path_c",
-      "mean_ms": 0.49590252339839935,
-      "median_ms": 0.49020792357623577,
-      "min_ms": 0.4166669677942991,
-      "max_ms": 0.6639580242335796,
+      "mean_ms": 0.46924753580242395,
+      "median_ms": 0.4696454852819443,
+      "min_ms": 0.42450008913874626,
+      "max_ms": 0.5375421606004238,
       "iters": 50,
       "warmup": 10
     },
     "fwd_bwd_path_b": {
       "label": "fwd_bwd_path_b",
-      "mean_ms": 2.6291924249380827,
-      "median_ms": 2.002312568947673,
-      "min_ms": 1.8661250360310078,
-      "max_ms": 28.89762492850423,
+      "mean_ms": 1.9653625274077056,
+      "median_ms": 1.8711455632001162,
+      "min_ms": 1.7966250889003277,
+      "max_ms": 3.6355420015752316,
       "iters": 50,
       "warmup": 10
     },
     "fwd_bwd_path_c": {
       "label": "fwd_bwd_path_c",
-      "mean_ms": 2.216772548854351,
-      "median_ms": 1.5702290693297982,
-      "min_ms": 1.4001249801367521,
-      "max_ms": 28.967499965801835,
+      "mean_ms": 1.8649207707494497,
+      "median_ms": 1.5288959257304668,
+      "min_ms": 1.3888750690966845,
+      "max_ms": 4.158874973654747,
       "iters": 50,
       "warmup": 10
     },
-    "bwd_path_b_median_ms": 1.4505625003948808,
-    "bwd_path_c_median_ms": 1.0800211457535625
+    "bwd_path_b_median_ms": 1.3166040880605578,
+    "bwd_path_c_median_ms": 1.0592504404485226
   },
   "gflops": {
-    "fwd_path_b": 19.598438888033158,
-    "fwd_path_c": 22.05888456700624,
-    "fwd_bwd_path_b": 21.60190205604726,
-    "fwd_bwd_path_c": 27.546146511261238
+    "fwd_path_b": 19.49978583167047,
+    "fwd_path_c": 23.024686362114867,
+    "fwd_bwd_path_b": 23.116191947154288,
+    "fwd_bwd_path_c": 28.290846533150695
   },
   "memory_bytes_peak": {
     "fwd_path_b": 1450016,
@@ -74,7 +74,7 @@
     "fwd_bwd_path_b": 28132932,
     "fwd_bwd_path_c": 28132932
   },
-  "ratio_path_c_over_path_b_fwd_bwd": 0.7842077673991935,
-  "verdict": "Path C is >20% faster than Path B; recommend switching to Path C and archiving Path B's MSL as a fallback.",
+  "ratio_path_c_over_path_b_fwd_bwd": 0.8170908537525435,
+  "verdict": "Path C is 10-20% faster than Path B; recommend switching Path C into the candidate hot path and keeping Path B as the fallback.",
   "matched_run_guard": "Compare Path B and Path C only when both rows were collected on the same hardware with identical kernel inputs. This is a local_only receipt."
 }

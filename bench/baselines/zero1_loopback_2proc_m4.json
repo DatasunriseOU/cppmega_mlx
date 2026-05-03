@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "scope": "cppmega_mlx_zero1_loopback_receipt",
+  "primitive": "mx.distributed",
+  "host_count": 1,
+  "world_size": 2,
+  "production_multi_node_receipt": false,
+  "ranks": [
+    {
+      "rank": 0,
+      "is_sharded": true,
+      "owned_param_count": 78,
+      "full_param_leaf_count": 155,
+      "opt_state_bytes": 164796,
+      "opt_state_gib": 0.0001534782350063324,
+      "loss_first": 5.635409355163574,
+      "loss_last": 5.150001525878906,
+      "step_time_ms_median": 51.46252037957311,
+      "step_time_ms_min": 49.71941700205207,
+      "peak_memory_gb": 0.001382912
+    },
+    {
+      "rank": 1,
+      "is_sharded": true,
+      "owned_param_count": 77,
+      "full_param_leaf_count": 155,
+      "opt_state_bytes": 86100,
+      "opt_state_gib": 8.01868736743927e-05,
+      "loss_first": 5.635409355163574,
+      "loss_last": 5.150001525878906,
+      "step_time_ms_median": 51.471978542394936,
+      "step_time_ms_min": 49.71104208379984,
+      "peak_memory_gb": 0.001217104
+    }
+  ],
+  "control_run_w1": {
+    "loss_first": 5.635409355163574,
+    "loss_last": 5.150001525878906,
+    "step_time_ms_median": 14.690917101688683,
+    "step_time_ms_min": 13.328374829143286,
+    "opt_state_bytes": 250884,
+    "opt_state_gib": 0.0002336539328098297,
+    "peak_memory_gb": 0.001331728
+  },
+  "loss_diff_w2_vs_w1_relative": 0.0,
+  "parity_tolerance_relative": 0.01,
+  "parity_passed": true,
+  "config": {
+    "steps": 20,
+    "lr": 0.0001,
+    "batch_size": 1,
+    "seq_len": 16,
+    "model": "build_local_gb10_quarter_tiny_smoke_model",
+    "optimizer": "lion",
+    "model_seed": 1234,
+    "data_seed": 5678
+  },
+  "caveats": [
+    "Single-host receipt: both processes run on the same Mac; this is verification of the ZeRO-1 wrapper's distributed math, not a throughput claim.",
+    "True 2-node parity (across dev-128 + peer-48) remains gated on the peer-48 hand-off documented in docs/distributed_zero1_smoke_procedure.md.",
+    "Per-rank batch is identical (data_seed=5678); a real DDP loader would shard the batch across ranks. Identical batches give step-for-step parity vs. the W=1 control."
+  ]
+}

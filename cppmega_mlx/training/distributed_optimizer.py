@@ -4,11 +4,17 @@ Wraps any cppmega.mlx optimizer
 (:class:AdamWFP32Moments, :class:LionFP32Moments, :class:MuonAdamWMulti)
 and shards optimizer state across mx.distributed ranks.
 
-Status: scaffold + single-rank receipts. The 48 GB Stream F peer is not yet
-connected, so this module ships with simulated multi-rank tests but no real
-2-node receipt. See :mod:docs/distributed_zero1_smoke_procedure.md for the
-hand-off procedure that will produce the multi-node receipt once peer-48 is
-online.
+Status: scaffold + single-rank receipts + single-host loopback receipt
+(``bench/baselines/zero1_loopback_2proc_m4.json``, produced by
+``scripts/bench_zero1_loopback.py`` under ``mlx.launch -n 2 --hosts
+127.0.0.1``). The 48 GB Stream F peer is not yet connected, so this
+module still does **not** ship a true cross-host 2-node receipt. The
+loopback receipt verifies the wrapper's distributed math by exercising
+real ``mx.distributed.all_sum`` collectives between two MLX processes on
+a single Mac; it is **not** a throughput claim. See
+:mod:docs/distributed_zero1_smoke_procedure.md for both the loopback
+procedure and the hand-off procedure that will produce the multi-node
+receipt once peer-48 is online.
 
 Design (mirrors Megatron's DistributedOptimizer):
 
@@ -52,9 +58,10 @@ SUPPORTED_INNER_CLASSES: tuple[type, ...] = (
 )
 
 ZERO1_STREAM_F_POLICY = (
-    "ZeRO-1 wrapper is a scaffold + single-rank receipts; multi-node "
-    "receipt pending peer-48 hardware connection per docs/multimac_training.md "
-    "Phase 2."
+    "ZeRO-1 wrapper is a scaffold + single-rank receipts + single-host "
+    "loopback receipt (mx.distributed under mlx.launch -n 2 --hosts "
+    "127.0.0.1); cross-host 2-node receipt pending peer-48 hardware "
+    "connection per docs/multimac_training.md Phase 2."
 )
 
 
@@ -408,6 +415,17 @@ class DistributedZeRO1Optimizer:
         reduced = self._all_reduce_mean(gradients)
         if not self.is_sharded:
             return self._inner.apply_gradients(reduced, normalized)
+
+        # Materialise reduced gradients before per-rank sharding. Without this
+        # eval the reduce ``all_sum`` chain stays lazy through the inner
+        # optimizer compute and the gather ``all_sum`` chain, producing a
+        # ~3x-deep lazy graph (reduce -> inner update -> gather) that the
+        # ring backend cannot reliably process under loopback contention --
+        # the per-rank ``all_sum`` calls in the gather phase end up returning
+        # only the local contribution rather than the cross-rank sum,
+        # silently breaking parity. Forcing the reduce result here turns the
+        # step into three bounded phases.
+        mx.eval(*(leaf for _, leaf in _flatten_param_tree(reduced)))
 
         owned_grads = self._select_owned(reduced)
         owned_params = self._select_owned(normalized)

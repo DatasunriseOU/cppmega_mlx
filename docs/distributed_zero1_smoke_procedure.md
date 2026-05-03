@@ -5,10 +5,109 @@ captures the exact steps to produce one once the 48 GB peer
 (`docs/multimac_training.md` Phase 2 hardware) is connected. Until that
 receipt lands, the
 [`cppmega_mlx.training.distributed_optimizer.DistributedZeRO1Optimizer`](../cppmega_mlx/training/distributed_optimizer.py)
-wrapper has only single-rank receipts plus simulated W=2 tests; see
-`tests/test_distributed_zero1.py`.
+wrapper has only single-rank receipts, simulated W=2 tests in
+`tests/test_distributed_zero1.py`, **and the single-host loopback receipt
+introduced below**, which exercises the real `mx.distributed` runtime on
+one Mac with two processes.
 
 This document is a planning aid, not a production-readiness claim.
+
+---
+
+## Local loopback receipt (single Mac, 2 processes)
+
+Before peer-48 is online, the wrapper can be exercised end-to-end on a
+single Mac via `mlx.launch -n 2 --hosts 127.0.0.1`. The launcher spawns
+two Python processes that communicate over the **ring TCP backend on
+loopback (`127.0.0.1`)**; both processes call `mx.distributed.init()`,
+participate in real `mx.distributed.all_sum` collectives, and step the
+ZeRO-1 wrapper end-to-end. This is verification of the wrapper's
+distributed math, **not** a multi-node throughput claim.
+
+```sh
+.venv/bin/mlx.launch \
+    -n 2 \
+    --hosts 127.0.0.1 \
+    --backend ring \
+    --python .venv/bin/python \
+    -- \
+    scripts/bench_zero1_loopback.py \
+    --steps 20 \
+    --out bench/baselines/zero1_loopback_2proc_m4.json
+```
+
+The bench script:
+
+1. Each rank builds the smoke model (`build_local_gb10_quarter_tiny_smoke_model`),
+   wraps `make_lion(learning_rate=1e-4)` in
+   `make_distributed_optimizer(...)`, and runs 20 training steps with
+   synthetic random tokens (`MODEL_SEED=1234`, `DATA_SEED=5678`).
+2. Per-rank metrics are dumped to `<out>.ranks/rank{N}.json`.
+3. Rank 0 then runs an in-process **W=1 control** with the same seeds
+   and asserts `loss_w2_avg == loss_w1` within 1% relative error.
+4. Rank 0 writes the merged receipt to the `--out` path. The receipt
+   tags `primitive: "mx.distributed"` and `production_multi_node_receipt:
+   false` so consumers cannot mistake it for a true 2-node parity claim.
+
+If `mlx.launch` is not available (no ring backend, missing launcher
+script, etc.) drop to the in-process simulation:
+
+```sh
+.venv/bin/python scripts/bench_zero1_loopback.py \
+    --simulate \
+    --steps 20 \
+    --out bench/baselines/zero1_simulated_2proc_m4.json
+```
+
+The simulation tags `primitive: "multiprocessing-simulation"` -- it
+exercises the wrapper's selection / shard / merge helpers but **does not**
+exercise `mx.distributed.all_sum`. It is the documented fallback path
+when loopback is unavailable.
+
+### What the loopback receipt covers
+
+- `mx.distributed.init(strict=True)` returns `size=2` and the wrapper
+  auto-detects W=2 without explicit overrides.
+- `mx.distributed.all_sum` is exercised through both
+  `_all_reduce_mean` (155 leaves per step on the smoke model) and
+  `_gather_full_params` (another 155 per step).
+- `model.update(opt.apply_gradients(...))` round-trips correctly: every
+  rank exits each step with bit-identical model state, verified by the
+  W=1 parity check (`loss_diff_w2_vs_w1_relative == 0.0` on the smoke
+  model).
+
+### What the loopback receipt does not cover
+
+- **Throughput**: two MLX processes on a single GPU contend for Metal
+  command buffers; the per-step time is dominated by serialization and
+  TCP round-trips, not by useful work. The receipt's
+  `step_time_ms_median` is reported but is **not** a baseline for
+  cross-host scaling.
+- **Cross-host all-reduce semantics**: TCP loopback does not exercise
+  the network failure modes (RDMA timeouts, JACCL coordinator drops,
+  variable bandwidth) that a real two-Mac topology would.
+- **Heterogeneous memory budgets**: both processes share the same Mac's
+  Metal heap; the per-rank `peak_memory_gb` field reflects in-process
+  bookkeeping only.
+
+The 2-node receipt described in the rest of this document is **still
+required** before claiming distributed parity; the loopback path is
+strictly the wrapper-correctness gate.
+
+### Bug surfaced by the loopback
+
+Producing the loopback receipt uncovered a real wrapper bug: chained
+lazy `mx.distributed.all_sum` ops (reduce -> inner-optimizer step ->
+gather, ~310 calls per step) silently returned only the local
+contribution rather than the cross-rank sum, breaking parity even on
+correct math. The fix in
+`cppmega_mlx/training/distributed_optimizer.py::apply_gradients` adds a
+single `mx.eval` between the all-reduce and the inner-optimizer phase
+to break the lazy chain into bounded prefixes; without that eval the
+ring backend hits "errno 54" / "Receiving from socket 4 failed" or a
+Metal command-buffer timeout and rank 0 silently exits with code -6.
+A regression test for this lives at
+`tests/test_distributed_zero1_loopback.py`.
 
 ---
 

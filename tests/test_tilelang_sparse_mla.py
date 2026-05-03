@@ -33,6 +33,10 @@ from cppmega_mlx.nn._tilelang.sparse_mla import (  # noqa: E402
     sparse_mla_fwd_metal,
     sparse_mla_metal_status,
 )
+from cppmega_mlx.nn._tilelang.sparse_mla_path_c import (  # noqa: E402
+    sparse_mla_bwd_path_c,
+    sparse_mla_path_c_status,
+)
 from cppmega_mlx.nn.sparse_mla import (  # noqa: E402
     sparse_mla_attention,
     sparse_mla_attention_reference,
@@ -429,6 +433,62 @@ def test_path_b_backward_parity() -> None:
         np.array(dkv_ref).astype(np.float32),
         rtol=5e-3,
         atol=5e-3,
+    )
+
+
+@pytest.mark.parametrize(
+    "cfg",
+    [
+        dict(B=1, S=4, H=2, D=16, G=1, topk=4, Skv=8),
+        dict(B=1, S=4, H=4, D=16, G=2, topk=4, Skv=8, d_v=8),
+    ],
+    ids=["small", "multigroup_tail_dim"],
+)
+def test_path_c_backward_parity(cfg) -> None:
+    """TileLang DSL Path C sparse-MLA backward matches the pure-MLX VJP."""
+
+    status = sparse_mla_path_c_status()
+    if not status.available:
+        pytest.skip(status.reason)
+
+    rng = np.random.default_rng(31)
+    B, S, H, D = cfg["B"], cfg["S"], cfg["H"], cfg["D"]
+    G = cfg["G"]
+    topk = cfg["topk"]
+    Skv = cfg["Skv"]
+    d_v = cfg.get("d_v", D)
+
+    q = mx.array(rng.standard_normal((B, S, H, D)).astype(np.float32))
+    kv = mx.array(rng.standard_normal((B, Skv, G, D)).astype(np.float32))
+    indices_np = rng.integers(0, Skv, size=(B, S, G, topk)).astype(np.int32)
+    indices_np[0, 0, 0, :] = -1
+    indices_np[0, 1, 0, ::2] = -1
+    indices = mx.array(indices_np)
+    d_out = mx.array(rng.standard_normal((B, S, H, d_v)).astype(np.float32))
+
+    grads = sparse_mla_bwd_path_c(q, kv, d_out, indices, d_v=d_v)
+    assert grads is not None, "TileLang DSL Path C backward kernel must dispatch"
+    dq_path_c, dkv_path_c = grads
+    mx.eval(dq_path_c, dkv_path_c)
+
+    def loss(q_, kv_):
+        out = sparse_mla_attention_reference(q_, kv_, indices, d_v=d_v)
+        return mx.sum(out * d_out)
+
+    dq_ref, dkv_ref = mx.grad(loss, argnums=(0, 1))(q, kv)
+    mx.eval(dq_ref, dkv_ref)
+
+    np.testing.assert_allclose(
+        np.array(dq_path_c).astype(np.float32),
+        np.array(dq_ref).astype(np.float32),
+        rtol=1e-4,
+        atol=1e-4,
+    )
+    np.testing.assert_allclose(
+        np.array(dkv_path_c).astype(np.float32),
+        np.array(dkv_ref).astype(np.float32),
+        rtol=1e-4,
+        atol=1e-4,
     )
 
 

@@ -32,4 +32,5 @@ markers = [
     "training: training-loop, optimizer, checkpoint, and dataset-ingress coverage",
     "bench: benchmark scripts, benchmark receipts, and comparison-policy coverage",
     "distributed: distributed-training boundary checks and fail-closed parity guards",
+    "slow: tests that spawn subprocesses or run extended training loops; opt-in via -m slow",
 ]

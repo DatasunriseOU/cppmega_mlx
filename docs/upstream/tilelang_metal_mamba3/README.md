@@ -9,7 +9,7 @@ Environment:
 - Device: Apple M4 Max, `applegpu_g16s`
 - Python: 3.13.12
 - MLX: 0.31.1
-- TileLang: 0.1.9+git7f4a5cb8
+- TileLang: 0.1.9+gita69d6df7
 
 ## Commands
 
@@ -23,13 +23,13 @@ Benchmarks:
 
 ```bash
 .venv/bin/python scripts/bench_tilelang_mamba3_path_c.py \
-  --seq 128 --warmup 10 --iters 100 \
+  --seq 128 --warmup 10 --iters 50 \
   --output docs/upstream/tilelang_metal_mamba3/mamba3_path_c_seq128_run.json \
   --msl-dump docs/upstream/tilelang_metal_mamba3/mamba3_path_c_lowered_seq128.metal \
   --diff-output docs/upstream/tilelang_metal_mamba3/mamba3_path_b_vs_c_seq128.diff
 
 .venv/bin/python scripts/bench_tilelang_mamba3_path_c.py \
-  --warmup 10 --iters 100 \
+  --warmup 10 --iters 50 \
   --output docs/upstream/tilelang_metal_mamba3/mamba3_path_c_spec_run.json \
   --msl-dump docs/upstream/tilelang_metal_mamba3/mamba3_path_c_lowered_spec.metal \
   --diff-output docs/upstream/tilelang_metal_mamba3/mamba3_path_b_vs_c_spec.diff
@@ -72,15 +72,15 @@ Median timings from same-process Path B/Path C matched runs:
 
 | Shape | Metric | Path B | Path C | C/B |
 | --- | --- | ---: | ---: | ---: |
-| T=128 | fwd | 0.723 ms | 0.683 ms | 0.946 |
-| T=128 | bwd | 1.333 ms | 1.323 ms | 0.992 |
-| T=128 | fwd+bwd | 2.056 ms | 2.006 ms | 0.976 |
-| T=512 | fwd | 1.046 ms | 1.079 ms | 1.031 |
-| T=512 | bwd | 6.933 ms | 6.940 ms | 1.001 |
-| T=512 | fwd+bwd | 7.979 ms | 8.019 ms | 1.005 |
-| T=1024 | fwd | 2.141 ms | 2.163 ms | 1.011 |
-| T=1024 | bwd | 12.307 ms | 13.100 ms | 1.064 |
-| T=1024 | fwd+bwd | 14.448 ms | 15.263 ms | 1.056 |
+| T=128 | fwd | 0.555 ms | 0.470 ms | 0.847 |
+| T=128 | bwd | 1.317 ms | 1.059 ms | 0.805 |
+| T=128 | fwd+bwd | 1.871 ms | 1.529 ms | 0.817 |
+| T=512 | fwd | 1.122 ms | 0.990 ms | 0.882 |
+| T=512 | bwd | 6.416 ms | 5.146 ms | 0.802 |
+| T=512 | fwd+bwd | 7.538 ms | 6.136 ms | 0.814 |
+| T=1024 | fwd | 1.869 ms | 1.907 ms | 1.021 |
+| T=1024 | bwd | 12.214 ms | 10.032 ms | 0.821 |
+| T=1024 | fwd+bwd | 14.083 ms | 11.939 ms | 0.848 |
 
 Peak memory matched Path B at every measured shape:
 
@@ -90,16 +90,16 @@ Peak memory matched Path B at every measured shape:
 | T=512 | 4.78 MB | 106.38 MB |
 | T=1024 | 9.31 MB | 212.44 MB |
 
-Interpretation: the original table claim holds for the checked shapes. Path C
-is stable and near Path B, but the current checked-in 256-thread Path C is not
-clearly better than Path B.
+Interpretation: the original table claim is now stale for Mamba3. With the
+checked-in 32-thread Path C policy, Path C is bit-exact and faster than Path B
+on fwd+bwd across the checked M4 Max shapes, with unchanged peak memory.
 
 ## Profiler Captures
 
 Programmatic MLX capture only emitted files when `MTL_CAPTURE_ENABLED=1` was set.
 The initial attempt without that environment variable produced no trace files.
 
-Captured traces:
+Existing pre-32-thread traces:
 
 | Marker filename | Size | Scope |
 | --- | ---: | --- |
@@ -124,31 +124,29 @@ The lowered MSL is structurally the same per-lane scan:
   `dA`, `ddt`, and `dD`.
 
 The dominant cost is therefore the same in Path B and Path C: serial recurrent
-work per lane plus large backward scratch traffic. TileLang lowering currently
-does not introduce a different schedule that would make Path C inherently
-faster.
+work per lane plus large backward scratch traffic. The current Path C win comes
+from avoiding the register-pressure/occupancy cliff in the backward replay and
+reverse-scan kernel, not from a different algorithm.
 
-## Threadgroup Probe
+## Threadgroup Tuning
 
-No source files were edited for this probe. A fresh Python process monkeypatched
-`_threads_for` in memory and rebuilt the Path C shape-specialized kernels for
-the spec shape.
+A pre-patch Python process monkeypatched `_threads_for` in memory and rebuilt
+the Path C shape-specialized kernels for the spec shape.
 
 | Path C threads | fwd median | fwd+bwd median | Notes |
 | ---: | ---: | ---: | --- |
 | 64 | 1.012 ms | 6.452 ms | Best fwd+bwd in this probe |
 | 128 | 0.980 ms | 6.681 ms | Best fwd-only in this probe |
-| 256 | 1.065 ms | 7.828 ms | Current checked-in policy |
+| 256 | 1.065 ms | 7.828 ms | Old checked-in policy |
 
-This is the only observed path to make Path C clearly better than the current
-table numbers without changing the algorithm. It needs a guarded production
-change and a rerun across the same shapes before changing the hot path.
+The production patch now caps Path C at 32 threads. The full three-shape matrix
+above is the acceptance evidence: 32 threads keeps one Apple SIMD group active
+while reducing the per-thread register-state occupancy cliff relative to the
+old 256-thread launch.
 
 ## Verdict
 
-Path C is correct and stable enough to keep as the upstream TileLang Metal
-repro artifact. It does not beat Path B as currently checked in, but the
-threadgroup probe suggests that reducing Path C from 256 threads to 64 or 128
-threads could make it clearly faster at the spec shape. That should be a small,
-isolated follow-up change with regression tests and the same three-shape
-benchmark matrix.
+Path C is now correct, stable, and faster than Path B for Mamba3 fwd+bwd on the
+checked M4 Max FP32 shapes. The minimal patch is the 32-thread launch cap plus
+the benchmark verdict fix; no TileLang Metal codegen change is required for this
+lane.

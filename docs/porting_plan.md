@@ -181,6 +181,7 @@ The current collected test files are:
 - tests/test_data_smoke_script.py
 - tests/test_dataloader_bridge.py
 - tests/test_distributed_zero1.py
+- tests/test_distributed_zero1_loopback.py
 - tests/test_engram.py
 - tests/test_env_runtime.py
 - tests/test_eval.py

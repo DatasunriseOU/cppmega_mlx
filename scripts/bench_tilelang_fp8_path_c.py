@@ -32,6 +32,8 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TILELANG_ROOT = Path(os.environ.get("TILELANG_ROOT", "/private/tmp/tilelang_apple_head/tilelang"))
 TVM_ROOT = Path(os.environ.get("TVM_ROOT", "/private/tmp/tvm_apple_head/tvm"))
+TILELANG_METAL_TARGET = "metal"
+TILELANG_METAL_VECMAT_TARGET = "metal -thread_warp_size=32"
 
 sys.path.insert(0, str(REPO_ROOT))
 if TILELANG_ROOT.exists():
@@ -327,9 +329,9 @@ def _make_vecmat_reduce_kernel(*, N: int, K: int, outputs_per_block: int = 4):
         return fp8_vecmat_reduce
 
 
-def _lower_source(prim_func: Any) -> str:
+def _lower_source(prim_func: Any, *, target: str = TILELANG_METAL_TARGET) -> str:
     tilelang, _, _, Target = _import_tilelang()
-    artifact = tilelang.lower(prim_func, target=Target("metal"))
+    artifact = tilelang.lower(prim_func, target=Target(target))
     if hasattr(artifact, "kernel_source"):
         return str(artifact.kernel_source)
     if hasattr(artifact, "rt_mod") and hasattr(artifact.rt_mod, "get_source"):
@@ -337,9 +339,9 @@ def _lower_source(prim_func: Any) -> str:
     return str(artifact)
 
 
-def _compile_tilelang(prim_func: Any) -> Any:
+def _compile_tilelang(prim_func: Any, *, target: str = TILELANG_METAL_TARGET) -> Any:
     tilelang, _, _, _ = _import_tilelang()
-    return tilelang.compile(prim_func, target="metal")
+    return tilelang.compile(prim_func, target=target)
 
 
 def _source_metrics(src: str) -> dict[str, Any]:
@@ -607,17 +609,21 @@ def _bench_path_c_vecmat_reduce(
     label = "vecmat_tl_reduce_fp8"
     N, K = int(shape["N"]), int(shape["K"])
     flops = 2.0 * N * K
-    result: dict[str, Any] = {"label": label, "variant": "TileLang fp8 vecmat thread_allreduce"}
+    result: dict[str, Any] = {
+        "label": label,
+        "variant": "TileLang fp8 vecmat thread_allreduce",
+        "target": TILELANG_METAL_VECMAT_TARGET,
+    }
     try:
         prim = _make_vecmat_reduce_kernel(N=N, K=K)
-        src = _lower_source(prim)
+        src = _lower_source(prim, target=TILELANG_METAL_VECMAT_TARGET)
         result["source_metrics"] = _source_metrics(src)
         result["xcrun_compile"] = (
             {"skipped": True, "reason": "--skip-xcrun"}
             if skip_xcrun
             else _xcrun_compile(src, label=label, dump_dir=dump_dir)
         )
-        compiled = _compile_tilelang(prim)
+        compiled = _compile_tilelang(prim, target=TILELANG_METAL_VECMAT_TARGET)
         c_out = inputs["c_out_mps"]
 
         def run() -> None:

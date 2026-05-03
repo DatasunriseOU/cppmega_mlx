@@ -60,6 +60,7 @@ from cppmega_mlx.recipes.model_factory import (  # noqa: E402
     build_local_gb10_quarter_tiny_smoke_model,
 )
 from cppmega_mlx.training.distributed_optimizer import (  # noqa: E402
+    _flatten_param_tree,
     _state_numel_bytes,
     make_distributed_optimizer,
 )
@@ -328,32 +329,6 @@ def _run_loopback_rank(
 # ---------------------------------------------------------------------------
 
 
-def _simulate_worker(args: tuple[int, int, float, int, int, str]) -> dict[str, Any]:
-    """Module-level entry for ``multiprocessing.Pool``-spawned workers.
-
-    Each worker imports its own copy of MLX (separate process state) and
-    runs ``_run_training_loop`` with explicit ``world_size`` / ``rank``
-    overrides so the wrapper uses simulated sharding. No
-    ``mx.distributed`` collectives execute -- the all_sum / all_gather
-    short-circuit because the wrapper falls back to the inner optimizer
-    on each worker (each worker thinks it is rank R out of W=2 but
-    cannot actually communicate with rank 1-R).
-
-    For a faithful simulated path we cannot rely on the wrapper's
-    distributed code path -- instead, the parent process performs the
-    cross-rank reduction in-process (see :func:`_run_simulated_pair`).
-    This worker entry point is unused in the current simulation layout
-    but kept here so a future refactor can add real cross-process
-    signalling via an ``mp.Queue``.
-    """
-
-    raise RuntimeError(
-        "_simulate_worker should not be invoked: the simulated path runs "
-        "ranks sequentially in-process to mirror the distributed all_sum "
-        "semantics. See _run_simulated_pair."
-    )
-
-
 def _run_simulated_pair(
     *,
     steps: int,
@@ -365,36 +340,138 @@ def _run_simulated_pair(
     """In-process simulation of a 2-rank ZeRO-1 receipt.
 
     The ``--simulate`` mode is the fallback when ``mlx.launch`` is not
-    available. Two ranks share a single Python process and the wrapper
-    is invoked twice with different rank overrides. Cross-rank
-    gradients reduction (the all_sum step) is short-circuited by the
-    wrapper at world_size=1, so this path does **not** exercise
-    :func:`mx.distributed.all_sum`. Instead it reuses the simulated
-    helper from :mod:`tests.test_distributed_zero1` semantics:
+    available. The wrapper's distributed code path requires a real
+    :mod:`mx.distributed` group of ``size > 1`` -- with no live peer the
+    ``all_sum`` collective short-circuits to identity, so simply
+    constructing two wrapper instances with ``world_size=2`` overrides
+    does **not** model what would happen on real hardware.
 
-    - Both ranks see identical synthetic data (same seed -> same batch).
-    - Each rank runs the wrapper with its rank/world_size override.
-    - Because both ranks consume the same batch, gradients are
-      identical, so the all_sum / W mean is a no-op and the wrapper
-      can be invoked rank-by-rank without introducing skew.
+    The faithful simulation mirrors
+    ``test_distributed_zero1.test_zero1_simulation_w2_loss_matches_non_sharded_within_tolerance``:
 
-    The receipt produced under ``--simulate`` is labelled
-    ``primitive: "multiprocessing-simulation"`` so consumers can
-    distinguish it from the real loopback path.
+    1. Build two inner :class:`LionFP32Moments` instances, one per
+       simulated rank, each initialised on the rank's owned shard.
+    2. Step them rank-by-rank using
+       :func:`_select_owned_subtree` to slice grads/params -- the
+       all_reduce is a no-op because both ranks share a single process
+       and therefore see identical local gradients.
+    3. Manually reconstruct the full updated parameter tree from the
+       two ranks' disjoint owned-update trees.
+
+    The resulting receipt is labelled ``primitive:
+    "multiprocessing-simulation"`` so downstream consumers can tell it
+    apart from the real loopback path. It exercises the wrapper's
+    helpers (``_select_owned_subtree``, ``_shard_assignment``) but does
+    **not** exercise :func:`mx.distributed.all_sum`.
     """
 
-    rank_rows = []
-    for rank in (0, 1):
-        metrics = _run_training_loop(
-            rank=rank,
-            world_size=2,
-            steps=steps,
-            lr=lr,
-            batch_size=batch_size,
-            seq_len=seq_len,
-            use_distributed=False,
-        )
-        rank_rows.append(metrics)
+    from cppmega_mlx.training.distributed_optimizer import _select_owned_subtree
+
+    # 1. Build the model and capture initial state.
+    mx.random.seed(MODEL_SEED)
+    model = build_local_gb10_quarter_tiny_smoke_model()
+    mx.eval(model.parameters())
+    vocab_size = int(model.config.vocab_size)
+    tokens, targets = _build_smoke_batch(
+        batch_size=batch_size,
+        seq_len=seq_len,
+        vocab_size=vocab_size,
+        seed=DATA_SEED,
+    )
+
+    inner_r0 = make_lion(learning_rate=lr)
+    inner_r1 = make_lion(learning_rate=lr)
+    initial_params = model.trainable_parameters()
+    inner_r0.init(_select_owned_subtree(initial_params, rank=0, world_size=2))
+    inner_r1.init(_select_owned_subtree(initial_params, rank=1, world_size=2))
+
+    loss_and_grad = nn.value_and_grad(model, _smoke_loss)
+
+    _reset_peak_memory()
+    losses_r0: list[float] = []
+    losses_r1: list[float] = []
+    step_times_ms: list[float] = []
+
+    for _ in range(steps):
+        t0 = time.perf_counter()
+        loss, grads = loss_and_grad(model, tokens, targets)
+        # Identical batch on both simulated ranks => identical grads,
+        # so the all_reduce-mean step is a no-op (sum=2g; *1/2 = g).
+        grads_r0 = _select_owned_subtree(grads, rank=0, world_size=2)
+        grads_r1 = _select_owned_subtree(grads, rank=1, world_size=2)
+        params_r0 = _select_owned_subtree(model.trainable_parameters(), rank=0, world_size=2)
+        params_r1 = _select_owned_subtree(model.trainable_parameters(), rank=1, world_size=2)
+
+        updates_r0 = inner_r0.apply_gradients(grads_r0, params_r0) if grads_r0 else {}
+        updates_r1 = inner_r1.apply_gradients(grads_r1, params_r1) if grads_r1 else {}
+
+        # Disjoint owned-update trees -> flatten + concatenate + unflatten
+        # reconstitutes the full tree without leaf-collision issues.
+        merged_pairs = [
+            (name, leaf)
+            for name, leaf in (
+                *tree_flatten(updates_r0),
+                *tree_flatten(updates_r1),
+            )
+            if isinstance(leaf, mx.array)
+        ]
+        from mlx.utils import tree_unflatten
+
+        new_params = tree_unflatten(merged_pairs)
+        model.update(new_params)
+        mx.eval(model.parameters(), loss)
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        loss_value = float(loss.item())
+        # Both simulated ranks observe the same loss because they share
+        # the model state in-process; we record the same value twice for
+        # schema parity with the loopback path.
+        losses_r0.append(loss_value)
+        losses_r1.append(loss_value)
+        step_times_ms.append(elapsed_ms)
+
+    # Count owned parameter leaves (not state leaves — state contains Lion's
+    # ``step`` scalar and ``m`` per leaf, which would inflate the count by
+    # 1-2 vs. the number of trainable parameters this rank actually owns).
+    owned_r0_param_count = len(
+        _flatten_param_tree(_select_owned_subtree(initial_params, rank=0, world_size=2))
+    )
+    owned_r1_param_count = len(
+        _flatten_param_tree(_select_owned_subtree(initial_params, rank=1, world_size=2))
+    )
+    full_leaf_count = len(_flatten_param_tree(initial_params))
+
+    rank_rows = [
+        {
+            "rank": 0,
+            "world_size": 2,
+            "is_sharded": True,
+            "owned_param_count": owned_r0_param_count,
+            "full_param_leaf_count": full_leaf_count,
+            "opt_state_bytes": int(_state_numel_bytes(inner_r0.state)),
+            "opt_state_gib": _bytes_to_gib(_state_numel_bytes(inner_r0.state)),
+            "loss_first": losses_r0[0],
+            "loss_last": losses_r0[-1],
+            "loss_trajectory": losses_r0,
+            "step_time_ms_median": statistics.median(step_times_ms),
+            "step_time_ms_min": min(step_times_ms),
+            "peak_memory_gb": _peak_memory_gb(),
+        },
+        {
+            "rank": 1,
+            "world_size": 2,
+            "is_sharded": True,
+            "owned_param_count": owned_r1_param_count,
+            "full_param_leaf_count": full_leaf_count,
+            "opt_state_bytes": int(_state_numel_bytes(inner_r1.state)),
+            "opt_state_gib": _bytes_to_gib(_state_numel_bytes(inner_r1.state)),
+            "loss_first": losses_r1[0],
+            "loss_last": losses_r1[-1],
+            "loss_trajectory": losses_r1,
+            "step_time_ms_median": statistics.median(step_times_ms),
+            "step_time_ms_min": min(step_times_ms),
+            "peak_memory_gb": _peak_memory_gb(),
+        },
+    ]
 
     control = _run_training_loop(
         rank=0,

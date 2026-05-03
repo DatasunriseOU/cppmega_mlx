@@ -80,6 +80,12 @@ from cppmega_mlx.nn._tilelang.sparse_mla import (
     sparse_mla_fwd_metal,
     sparse_mla_metal_status,
 )
+from cppmega_mlx.nn._tilelang.sparse_mla_path_c import (
+    SparseMLAPathCStatus,
+    dump_lowered_bwd_msl,
+    sparse_mla_bwd_path_c,
+    sparse_mla_path_c_status,
+)
 from cppmega_mlx.nn._tilelang.sparse_mla_blockscaled import (
     MXFP8_BLOCK_SIZE,
     SparseMLABlockScaledMetalStatus,
@@ -114,6 +120,7 @@ __all__ = [
     "SparseMLABlockScaledMetalStatus",
     "SparseMLAFp8MetalStatus",
     "SparseMLAMetalStatus",
+    "SparseMLAPathCStatus",
     "TransformedKernel",
     "_mamba3_helpers",
     "_mamba3_helpers_tilelang",
@@ -152,6 +159,8 @@ __all__ = [
     "sparse_mla_blockscaled_metal_status",
     "sparse_mla_blockscaled_reference",
     "sparse_mla_bwd_metal",
+    "sparse_mla_bwd_path_c",
+    "dump_lowered_bwd_msl",
     "sparse_mla_fp8",
     "sparse_mla_fp8_apply",
     "sparse_mla_fp8_bwd_metal",
@@ -160,6 +169,7 @@ __all__ = [
     "sparse_mla_fp8_reference",
     "sparse_mla_fwd_metal",
     "sparse_mla_metal_status",
+    "sparse_mla_path_c_status",
     "sparse_mla_quantized_matmul_reference",
     "topk_selector",
     "topk_selector_fn",
