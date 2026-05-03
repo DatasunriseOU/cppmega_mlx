@@ -281,10 +281,10 @@ The current collected test files are:
   tiny MLX reference blocks at the source layer positions; they are not the
   source nam56r_full_spec.py, nam56r_te_spec.py, or nam56r_noconv_spec.py
   runtime with TE, Triton scans, TP mixer behavior, or H200/GB10 launch scripts.
-- Stream H feature work is only partially sliced locally. `cppmega_mlx/nn/engram.py`
-  and `cppmega_mlx/nn/mhc.py` are standalone modules, `cppmega_mlx/data/fim.py`
-  is a fail-closed CPU FIM/iFIM transform slice, `cppmega_mlx/training/mtp.py`
-  is local training-side MTP coverage, and `cppmega_mlx/training/stp_loss.py`
+- Stream H feature work is only partially sliced locally. cppmega_mlx/nn/engram.py
+  and cppmega_mlx/nn/mhc.py are standalone modules, cppmega_mlx/data/fim.py
+  is a fail-closed CPU FIM/iFIM transform slice, cppmega_mlx/training/mtp.py
+  is local training-side MTP coverage, and cppmega_mlx/training/stp_loss.py
   is opt-in deterministic STP helper coverage. None of these are
   NAM56R-integrated, CUDA/Megatron parity receipts, full Stream H closure, or
   Hopper/Liger fused-CE evidence.

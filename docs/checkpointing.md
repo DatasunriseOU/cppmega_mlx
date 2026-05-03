@@ -2,8 +2,8 @@
 
 Local MLX pretraining checkpoints use MLX safetensors files with MLX-LM-compatible
 weight naming where possible. The on-disk weight files are written through
-MLX's `mx.save_safetensors(..., metadata={"format": "mlx"})` API, which accepts
-an optional string metadata map for `.safetensors` output.
+MLX's mx.save_safetensors(..., metadata={"format": "mlx"}) API, which accepts
+an optional string metadata map for .safetensors output.
 
 ## Layout
 
@@ -25,10 +25,10 @@ The current implementation is deliberately single-file for model weights:
 model.safetensors must be present. MLX-LM's export format can split weights
 into model-00001-of-000NN.safetensors files with
 model.safetensors.index.json; cppmega-mlx refuses to load that layout until a
-real sharded pretraining resume path exists. Current MLX-LM `save_weights`
-writes the same single `model.safetensors` name for one shard, switches to
-`model-00001-of-000NN.safetensors` names when multiple shards are needed, and
-always emits `model.safetensors.index.json` with a `weight_map`; cppmega-mlx
+real sharded pretraining resume path exists. Current MLX-LM save_weights
+writes the same single model.safetensors name for one shard, switches to
+model-00001-of-000NN.safetensors names when multiple shards are needed, and
+always emits model.safetensors.index.json with a weight_map; cppmega-mlx
 intentionally does not consume that index yet.
 
 ## Manifest
@@ -79,15 +79,15 @@ Metadata validation runs before model weights are loaded whenever a
 metadata.json file is present. Unsupported RNG payloads or sharding requests
 therefore fail closed before mutating the target model. Accepted RNG metadata is
 limited to explicit opt-out, seed provenance, or a single-process snapshot
-captured by `cppmega_mlx.runtime.seed.capture_rng_state()`. On load, snapshot
-mode restores Python's global `random` state, NumPy's legacy global RNG state,
-and MLX's mutable `mx.random.state` when the installed MLX build exposes it. If
+captured by cppmega_mlx.runtime.seed.capture_rng_state(). On load, snapshot
+mode restores Python's global random state, NumPy's legacy global RNG state,
+and MLX's mutable mx.random.state when the installed MLX build exposes it. If
 a checkpoint snapshot says MLX RNG state is available but restore cannot replay
 it, loading fails closed rather than silently continuing with a divergent random
 stream.
 
 Snapshot RNG support is a local single-process contract. It does not cover
-distributed per-rank RNGs, independently created NumPy `Generator` instances,
+distributed per-rank RNGs, independently created NumPy Generator instances,
 DataLoader worker state, or Megatron tensor/pipeline/expert parallel RNG
 streams.
 
@@ -95,7 +95,7 @@ M0.7 acceptance is currently scoped to local TinyLM/HybridTinyLM checkpoint
 mechanics and the subprocess HybridTinyLM NPZ resume regression. That receipt
 proves a 37-step interrupted tiny run can reload and match the uninterrupted
 100-step continuation suffix with optimizer state, training_state, RNG snapshot,
-and batch cursor preserved. It is not full `local_gb10_quarter` acceptance:
+and batch cursor preserved. It is not full local_gb10_quarter acceptance:
 M0.7 remains fail-closed until the resolved tokenizer/model-factory path, the
 target GB10 parquet training lane, and the exact 100-step continuation check all
 run on the M0 target.
@@ -110,7 +110,7 @@ Megatron pipeline-parallel, tensor-parallel, expert-parallel, distributed
 optimizer, and MTP replica semantics are explicit non-goals for this local
 single-process checkpoint format. In the source Megatron codebase, cppmega
 custom embedding tensors have distributed-checkpoint ownership rules such as
-`replica_id[0] == 0` for the PP first-stage main copy and `replica_id[0] == 1`
+replica_id[0] == 0 for the PP first-stage main copy and replica_id[0] == 1
 for the MTP-stage copy. This MLX helper does not encode or replay those
 pipeline/MTP replica assignments; metadata keys such as parallel_state,
 megatron_parallel_state, sharded_state_dict, replica_id, pre_process,
@@ -179,7 +179,7 @@ is treated as an unsupported checkpoint layout, not as a partial resume target.
 
 External checkpoint-format sources checked for this boundary:
 
-- MLX `mlx.core.save_safetensors` docs:
+- MLX mlx.core.save_safetensors docs:
   https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.save_safetensors.html
-- MLX-LM `mlx_lm/utils.py` save/load conventions:
+- MLX-LM mlx_lm/utils.py save/load conventions:
   https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/utils.py
