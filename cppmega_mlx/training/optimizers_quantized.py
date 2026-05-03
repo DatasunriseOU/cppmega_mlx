@@ -47,6 +47,13 @@ from cppmega_mlx.training._fused_adam8bit_kernel import (
     FUSED_BLOCK_SIZE,
     fused_adam8bit_step,
 )
+from cppmega_mlx.training._fused_dynamic8bit_kernel import (
+    fused_adam8bit_dynamic_step,
+    fused_lion8bit_dynamic_step,
+)
+from cppmega_mlx.training._fused_lion8bit_kernel import (
+    fused_lion8bit_step,
+)
 from cppmega_mlx.training._quantize_8bit import (
     DEFAULT_BLOCK_SIZE,
     QUANT_SCHEME_DYNAMIC,
@@ -150,16 +157,17 @@ class Adam8bit(optim.Optimizer):
                 f"quant_scheme must be one of {QUANT_SCHEMES}; got {quant_scheme!r}"
             )
         self.quant_scheme: str = quant_scheme
-        # The fused kernel is symmetric-only (it embeds the int8 +128 bias in
-        # the codec). For the dynamic LUT scheme we fall back to the unfused
-        # chain that calls quantize_blockwise / dequantize_blockwise -- those
-        # dispatch on ``quant_scheme`` to the right Metal kernel pair. Other
-        # block sizes also fall back because the fused kernel hardcodes
-        # block_size=256 in threadgroup memory.
+        # Both the symmetric-int8 and dynamic-LUT schemes have a fused Metal
+        # kernel implementation. The symmetric kernel embeds the +128 bias
+        # inline; the dynamic kernel loads the 256-entry bnb signed LUT into
+        # threadgroup memory once per block and uses a binary search for the
+        # quantize step. Other block sizes fall back to the unfused chain
+        # because both fused kernels hardcode block_size=256 in threadgroup
+        # memory.
         self.use_fused_kernel = (
             bool(use_fused_kernel)
             and self.block_size == FUSED_BLOCK_SIZE
-            and self.quant_scheme == QUANT_SCHEME_SYMMETRIC
+            and self.quant_scheme in (QUANT_SCHEME_SYMMETRIC, QUANT_SCHEME_DYNAMIC)
         )
 
     def init_single(self, parameter: mx.array, state: dict[str, Any]) -> None:
@@ -191,25 +199,43 @@ class Adam8bit(optim.Optimizer):
             # Fused path: dequant -> AdamW math + noise floor -> quant -> apply
             # in a single Metal kernel launch. The numerical contract matches
             # the unfused chain below to within fp32 noise (the only source of
-            # divergence is reduction order in the per-block absmax). Only
-            # reachable when quant_scheme == symmetric_int8_v1 because the
-            # fused kernel embeds the +128 bias in its codec.
-            param_out, m_q, m_absmax, v_q, v_absmax = fused_adam8bit_step(
-                parameter,
-                gradient,
-                state["m_quant"],
-                state["m_absmax"],
-                state["v_quant"],
-                state["v_absmax"],
-                learning_rate=lr_fp32,
-                beta1=b1,
-                beta2=b2,
-                eps=eps,
-                weight_decay=self.weight_decay,
-                step=self.step,
-                bias_correction=self.bias_correction,
-                block_size=self.block_size,
-            )
+            # divergence is reduction order in the per-block absmax). Two
+            # codec-specific kernels: symmetric uses inline +128 bias; dynamic
+            # loads the bnb LUT into threadgroup memory and binary-searches it.
+            if self.quant_scheme == QUANT_SCHEME_DYNAMIC:
+                param_out, m_q, m_absmax, v_q, v_absmax = fused_adam8bit_dynamic_step(
+                    parameter,
+                    gradient,
+                    state["m_quant"],
+                    state["m_absmax"],
+                    state["v_quant"],
+                    state["v_absmax"],
+                    learning_rate=lr_fp32,
+                    beta1=b1,
+                    beta2=b2,
+                    eps=eps,
+                    weight_decay=self.weight_decay,
+                    step=self.step,
+                    bias_correction=self.bias_correction,
+                    block_size=self.block_size,
+                )
+            else:
+                param_out, m_q, m_absmax, v_q, v_absmax = fused_adam8bit_step(
+                    parameter,
+                    gradient,
+                    state["m_quant"],
+                    state["m_absmax"],
+                    state["v_quant"],
+                    state["v_absmax"],
+                    learning_rate=lr_fp32,
+                    beta1=b1,
+                    beta2=b2,
+                    eps=eps,
+                    weight_decay=self.weight_decay,
+                    step=self.step,
+                    bias_correction=self.bias_correction,
+                    block_size=self.block_size,
+                )
             state["m_quant"] = m_q
             state["m_absmax"] = m_absmax
             state["v_quant"] = v_q
@@ -392,6 +418,7 @@ class Lion8bit(optim.Optimizer):
         betas: tuple[float, float] = (0.9, 0.99),
         weight_decay: float = 0.0,
         block_size: int = DEFAULT_BLOCK_SIZE,
+        use_fused_kernel: bool = True,
         quant_scheme: Lion8bitQuantScheme = QUANT_SCHEME_SYMMETRIC,
     ) -> None:
         super().__init__()
@@ -404,6 +431,18 @@ class Lion8bit(optim.Optimizer):
                 f"quant_scheme must be one of {QUANT_SCHEMES}; got {quant_scheme!r}"
             )
         self.quant_scheme: str = quant_scheme
+        # Both the symmetric-int8 and dynamic-LUT schemes have a fused Metal
+        # kernel implementation. The symmetric kernel embeds the +128 bias
+        # inline; the dynamic kernel loads the 256-entry bnb signed LUT into
+        # threadgroup memory once per block and uses a binary search for the
+        # quantize step. Other block sizes fall back to the unfused chain
+        # because both fused kernels hardcode block_size=256 in threadgroup
+        # memory.
+        self.use_fused_kernel = (
+            bool(use_fused_kernel)
+            and self.block_size == FUSED_BLOCK_SIZE
+            and self.quant_scheme in (QUANT_SCHEME_SYMMETRIC, QUANT_SCHEME_DYNAMIC)
+        )
 
     def init_single(self, parameter: mx.array, state: dict[str, Any]) -> None:
         nb = num_blocks(int(parameter.size), self.block_size)
@@ -426,6 +465,41 @@ class Lion8bit(optim.Optimizer):
         lr_fp32 = self.learning_rate.astype(mx.float32)
         param_dtype = parameter.dtype
         scheme = self.quant_scheme
+
+        if self.use_fused_kernel:
+            # Fused path: dequant -> Lion math (sign-update) -> apply -> quant
+            # in a single Metal kernel launch. Numerical contract matches the
+            # unfused chain below to within fp32 noise (only source of
+            # divergence is the per-block absmax tree-reduction order). Two
+            # codec-specific kernels: symmetric uses inline +128 bias; dynamic
+            # loads the bnb LUT into threadgroup memory and binary-searches it.
+            if self.quant_scheme == QUANT_SCHEME_DYNAMIC:
+                param_out, m_q, m_absmax = fused_lion8bit_dynamic_step(
+                    parameter,
+                    gradient,
+                    state["m_quant"],
+                    state["m_absmax"],
+                    learning_rate=lr_fp32,
+                    beta1=b1,
+                    beta2=b2,
+                    weight_decay=self.weight_decay,
+                    block_size=self.block_size,
+                )
+            else:
+                param_out, m_q, m_absmax = fused_lion8bit_step(
+                    parameter,
+                    gradient,
+                    state["m_quant"],
+                    state["m_absmax"],
+                    learning_rate=lr_fp32,
+                    beta1=b1,
+                    beta2=b2,
+                    weight_decay=self.weight_decay,
+                    block_size=self.block_size,
+                )
+            state["m_quant"] = m_q
+            state["m_absmax"] = m_absmax
+            return param_out
 
         # 1) Dequantize the persistent momentum to fp32 for the inner math.
         # Lion's update is sign-based, so symmetric int8 quant noise on m
@@ -474,6 +548,7 @@ def make_lion8bit(
     weight_decay: float = 0.01,
     betas: list[float] | None = None,
     block_size: int = DEFAULT_BLOCK_SIZE,
+    use_fused_kernel: bool = True,
     quant_scheme: Lion8bitQuantScheme = QUANT_SCHEME_SYMMETRIC,
 ) -> Lion8bit:
     """Construct the repo-default 8-bit Lion for bf16 training.
@@ -505,6 +580,7 @@ def make_lion8bit(
         betas=(0.9, 0.99) if betas is None else (betas[0], betas[1]),
         weight_decay=weight_decay,
         block_size=block_size,
+        use_fused_kernel=use_fused_kernel,
         quant_scheme=quant_scheme,
     )
 

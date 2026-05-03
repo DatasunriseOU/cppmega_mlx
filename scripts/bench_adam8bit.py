@@ -281,6 +281,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--skip-symmetric",
+        action="store_true",
+        help=(
+            "Skip the Adam8bit symmetric measurements (both fused and "
+            "unfused). Useful when the host cannot afford to allocate the "
+            "symmetric optimizer state alongside the dynamic one. The fp32 "
+            "and dynamic rows are unaffected."
+        ),
+    )
+    parser.add_argument(
         "--skip-step-timing",
         action="store_true",
         help=(
@@ -327,7 +337,8 @@ def build_receipt(args: argparse.Namespace) -> dict[str, Any]:
     fp32_result: dict[str, Any] | None = None
     quant_unfused_result: dict[str, Any] | None = None
     quant_result: dict[str, Any] | None = None  # fused (default) Adam8bit
-    quant_dynamic_result: dict[str, Any] | None = None  # bnb-style dynamic LUT
+    quant_dynamic_result: dict[str, Any] | None = None  # FUSED bnb-style dynamic LUT
+    quant_dynamic_unfused_result: dict[str, Any] | None = None  # unfused dynamic chain
 
     if not args.skip_fp32:
         print("Measuring AdamWFP32Moments ...", file=sys.stderr)
@@ -352,7 +363,7 @@ def build_receipt(args: argparse.Namespace) -> dict[str, Any]:
     # Measure the unfused (legacy Python-chain) Adam8bit path so the bench
     # captures the pre-fusion baseline alongside the fused number. This is
     # the row that quantifies the kernel-fusion speedup.
-    if not args.skip_quant and not args.skip_unfused:
+    if not args.skip_quant and not args.skip_unfused and not args.skip_symmetric:
         print("Measuring Adam8bit (unfused, Python chain) ...", file=sys.stderr)
         quant_unfused_optimizer = make_adam8bit(
             learning_rate=args.learning_rate,
@@ -372,7 +383,7 @@ def build_receipt(args: argparse.Namespace) -> dict[str, Any]:
             )
         del quant_unfused_optimizer
 
-    if not args.skip_quant:
+    if not args.skip_quant and not args.skip_symmetric:
         print("Measuring Adam8bit (fused Metal kernel) ...", file=sys.stderr)
         quant_optimizer = make_adam8bit(
             learning_rate=args.learning_rate,
@@ -392,15 +403,48 @@ def build_receipt(args: argparse.Namespace) -> dict[str, Any]:
             )
         del quant_optimizer
 
-    # The dynamic-LUT (bnb-style) Adam8bit row. Same memory layout as the
-    # symmetric path but a different codec; the fused kernel is symmetric-only
-    # so this row exercises the unfused chain with the dynamic dispatcher.
+    # The dynamic-LUT (bnb-style) Adam8bit rows. Same memory layout as the
+    # symmetric path but a different codec; the fused dynamic kernel loads
+    # the 256-entry signed LUT into threadgroup memory once per block and
+    # binary-searches it on the quant step. We capture both the unfused
+    # chain (legacy, 4-5 separate launches per parameter) and the fused
+    # single-launch path so the speedup gate is visible.
+    if not args.skip_quant and not args.skip_dynamic and not args.skip_unfused:
+        print(
+            "Measuring Adam8bit dynamic (unfused, Python chain) ...",
+            file=sys.stderr,
+        )
+        quant_dynamic_unfused_optimizer = make_adam8bit(
+            learning_rate=args.learning_rate,
+            weight_decay=args.weight_decay,
+            quant_scheme=QUANT_SCHEME_DYNAMIC,
+            use_fused_kernel=False,
+        )
+        if args.skip_step_timing:
+            quant_dynamic_unfused_result = _measure_state_only(
+                model, quant_dynamic_unfused_optimizer
+            )
+        else:
+            quant_dynamic_unfused_result = _measure_optimizer(
+                model,
+                quant_dynamic_unfused_optimizer,
+                batch_size=args.batch_size,
+                seq_len=args.seq_len,
+                warmup=args.warmup,
+                iters=args.iters,
+            )
+        del quant_dynamic_unfused_optimizer
+
     if not args.skip_quant and not args.skip_dynamic:
-        print("Measuring Adam8bit (dynamic LUT, bitsandbytes-style) ...", file=sys.stderr)
+        print(
+            "Measuring Adam8bit dynamic (fused Metal kernel) ...",
+            file=sys.stderr,
+        )
         quant_dynamic_optimizer = make_adam8bit(
             learning_rate=args.learning_rate,
             weight_decay=args.weight_decay,
             quant_scheme=QUANT_SCHEME_DYNAMIC,
+            use_fused_kernel=True,
         )
         if args.skip_step_timing:
             quant_dynamic_result = _measure_state_only(model, quant_dynamic_optimizer)
@@ -460,6 +504,21 @@ def build_receipt(args: argparse.Namespace) -> dict[str, Any]:
                 / quant_result["step_ms"]["median"]
             )
 
+    # Fused-vs-unfused speedup for the dynamic path. Mirrors the symmetric
+    # path's gate but compares the fused dynamic kernel to the unfused
+    # dynamic chain (both at scheme=dynamic_int8_v1).
+    fused_vs_unfused_dynamic_speedup = None
+    if (
+        quant_dynamic_unfused_result is not None
+        and quant_dynamic_result is not None
+        and quant_dynamic_unfused_result.get("step_ms") is not None
+        and quant_dynamic_result.get("step_ms") is not None
+    ):
+        fused_vs_unfused_dynamic_speedup = (
+            quant_dynamic_unfused_result["step_ms"]["median"]
+            / quant_dynamic_result["step_ms"]["median"]
+        )
+
     return {
         "schema_version": SCHEMA_VERSION,
         "kind": "cppmega.mlx.local_m4_adam8bit_state_receipt",
@@ -499,15 +558,22 @@ def build_receipt(args: argparse.Namespace) -> dict[str, Any]:
         "adam8bit_unfused": quant_unfused_result,
         "adam8bit": quant_result,
         "adam8bit_dynamic": quant_dynamic_result,
+        "adam8bit_dynamic_unfused": quant_dynamic_unfused_result,
         "acceptance": {
             "state_compaction_ratio_fp32_over_quant": state_compaction,
             "step_speedup_fp32_over_quant_median": step_speedup,
             "fused_vs_unfused_speedup_median": fused_vs_unfused_speedup,
+            "fused_vs_unfused_dynamic_speedup_median": fused_vs_unfused_dynamic_speedup,
             "fused_vs_fp32_step_ratio_median": fused_vs_fp32_step_ratio,
             "fused_vs_unfused_lower_bound": 1.10,
             "meets_fused_vs_unfused_gate": (
                 fused_vs_unfused_speedup is not None
                 and fused_vs_unfused_speedup >= 1.10
+            ),
+            "fused_vs_unfused_dynamic_lower_bound": 2.0,
+            "meets_fused_vs_unfused_dynamic_gate": (
+                fused_vs_unfused_dynamic_speedup is not None
+                and fused_vs_unfused_dynamic_speedup >= 2.0
             ),
             "state_compaction_lower_bound": 3.0,
             "meets_state_compaction_gate": (
@@ -526,6 +592,7 @@ def build_receipt(args: argparse.Namespace) -> dict[str, Any]:
             "adam8bit": QUANT_SCHEME_SYMMETRIC,
             "adam8bit_unfused": QUANT_SCHEME_SYMMETRIC,
             "adam8bit_dynamic": QUANT_SCHEME_DYNAMIC,
+            "adam8bit_dynamic_unfused": QUANT_SCHEME_DYNAMIC,
         },
         "notes": [
             "Local Apple Silicon receipt only; does not claim GB10 parity.",
@@ -540,8 +607,11 @@ def build_receipt(args: argparse.Namespace) -> dict[str, Any]:
             "adam8bit_unfused is the legacy Python-chain dequant -> math -> "
             "quant -> apply path; adam8bit is the fused single-kernel-launch "
             "MSL implementation. Both produce identical updates within fp32 "
-            "noise. The fused kernel is symmetric-only -- adam8bit_dynamic "
-            "always runs through the unfused chain.",
+            "noise. Both schemes (symmetric + dynamic) have fused kernels: "
+            "adam8bit_dynamic uses the dynamic-LUT fused MSL kernel that "
+            "loads the bnb 256-entry signed LUT into threadgroup memory and "
+            "binary-searches it on the quant step; adam8bit_dynamic_unfused "
+            "is the legacy Python chain for the dynamic codec.",
         ],
     }
 

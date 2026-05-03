@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 """Local receipt for the symmetric 8-bit Lion (Lion8bit) optimizer state.
 
-Measures the optimizer-state byte total and 1-step time for both
-``LionFP32Moments`` and :class:`Lion8bit` against the full
-``local_gb10_quarter`` 1.797B-param bf16 model. The point is to capture the
-local M4 Apple-Silicon evidence that Lion8bit cuts the optimizer-state
-footprint by ~3.7-3.9x without inflating step time, mirroring
-``bitsandbytes.optim.Lion8bit`` on the GB10 CUDA stack -- see
-``cppmega/docs/lion8bit_ab_2026_04_25.md`` for the reference run.
+Measures the optimizer-state byte total and 1-step time for
+``LionFP32Moments``, the unfused (Python chain) :class:`Lion8bit` and the
+fused-kernel :class:`Lion8bit` against the full ``local_gb10_quarter``
+1.797B-param bf16 model. The point is to capture the local M4 Apple-Silicon
+evidence that Lion8bit cuts the optimizer-state footprint by ~3.7-3.9x and
+that the fused Metal kernel cuts step time below the LionFP32Moments
+baseline, mirroring ``bitsandbytes.optim.Lion8bit`` on the GB10 CUDA stack
+-- see ``cppmega/docs/lion8bit_ab_2026_04_25.md`` for the reference run.
 
 This is a **local-only** receipt -- it does not claim GB10 parity or compare
 M4 throughput against GB10. The compaction ratio is the load-bearing number;
-the absolute timings are diagnostic. Step time is expected to be a touch
-slower than Lion fp32 because every apply_single goes through a uint8 ->
-fp32 dequant + fp32 -> uint8 re-quant round trip.
+the absolute timings are diagnostic. With the fused kernel we expect a 3-4x
+speedup over the unfused Lion8bit Python chain and step time at or below the
+LionFP32Moments baseline; with the unfused chain we expect step time to be a
+touch slower than LionFP32Moments because every apply_single goes through a
+uint8 -> fp32 dequant + fp32 -> uint8 re-quant round trip.
 """
 
 from __future__ import annotations
@@ -271,6 +274,38 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip the Lion8bit measurement (diagnostic; usually leave off).",
     )
     parser.add_argument(
+        "--skip-unfused",
+        action="store_true",
+        help=(
+            "Skip the Lion8bit unfused-Python-chain measurement. The unfused "
+            "row is the baseline that the fused kernel is judged against; skip "
+            "it only when the host is too tight on memory to run all three rows."
+        ),
+    )
+    parser.add_argument(
+        "--skip-fused",
+        action="store_true",
+        help="Skip the Lion8bit fused-kernel measurement (diagnostic).",
+    )
+    parser.add_argument(
+        "--skip-symmetric",
+        action="store_true",
+        help=(
+            "Skip the symmetric Lion8bit measurements (both fused and unfused). "
+            "Useful when the host cannot afford to allocate the symmetric "
+            "optimizer state alongside the dynamic one."
+        ),
+    )
+    parser.add_argument(
+        "--skip-dynamic",
+        action="store_true",
+        help=(
+            "Skip the dynamic-LUT (bitsandbytes-style) Lion8bit measurements. "
+            "By default the bench captures both symmetric and dynamic codec "
+            "rows so the LUT-vs-symmetric step-time gap is visible."
+        ),
+    )
+    parser.add_argument(
         "--skip-step-timing",
         action="store_true",
         help=(
@@ -298,7 +333,10 @@ def build_receipt(args: argparse.Namespace) -> dict[str, Any]:
     )
 
     fp32_result: dict[str, Any] | None = None
-    quant_result: dict[str, Any] | None = None
+    unfused_result: dict[str, Any] | None = None
+    fused_result: dict[str, Any] | None = None
+    dynamic_unfused_result: dict[str, Any] | None = None
+    dynamic_fused_result: dict[str, Any] | None = None
 
     if not args.skip_fp32:
         print("Measuring LionFP32Moments ...", file=sys.stderr)
@@ -320,37 +358,143 @@ def build_receipt(args: argparse.Namespace) -> dict[str, Any]:
         # Free fp32 state before allocating quant state (M4 RAM matters here).
         del fp32_optimizer
 
-    if not args.skip_quant:
-        print("Measuring Lion8bit ...", file=sys.stderr)
-        quant_optimizer = make_lion8bit(
+    if not args.skip_quant and not args.skip_unfused and not args.skip_symmetric:
+        print("Measuring Lion8bit (unfused, Python chain) ...", file=sys.stderr)
+        unfused_optimizer = make_lion8bit(
             learning_rate=args.learning_rate,
             weight_decay=args.weight_decay,
+            use_fused_kernel=False,
         )
         if args.skip_step_timing:
-            quant_result = _measure_state_only(model, quant_optimizer)
+            unfused_result = _measure_state_only(model, unfused_optimizer)
         else:
-            quant_result = _measure_optimizer(
+            unfused_result = _measure_optimizer(
                 model,
-                quant_optimizer,
+                unfused_optimizer,
                 batch_size=args.batch_size,
                 seq_len=args.seq_len,
                 warmup=args.warmup,
                 iters=args.iters,
             )
+        del unfused_optimizer
+
+    if not args.skip_quant and not args.skip_fused and not args.skip_symmetric:
+        print("Measuring Lion8bit (FUSED Metal kernel) ...", file=sys.stderr)
+        fused_optimizer = make_lion8bit(
+            learning_rate=args.learning_rate,
+            weight_decay=args.weight_decay,
+            use_fused_kernel=True,
+        )
+        if args.skip_step_timing:
+            fused_result = _measure_state_only(model, fused_optimizer)
+        else:
+            fused_result = _measure_optimizer(
+                model,
+                fused_optimizer,
+                batch_size=args.batch_size,
+                seq_len=args.seq_len,
+                warmup=args.warmup,
+                iters=args.iters,
+            )
+        del fused_optimizer
+
+    # Dynamic-LUT (bnb-style) Lion8bit rows. Same uint8 + fp32 absmax layout
+    # as the symmetric path; the fused dynamic kernel loads the 256-entry
+    # signed LUT into threadgroup memory and binary-searches it on quant.
+    if (
+        not args.skip_quant
+        and not args.skip_unfused
+        and not args.skip_dynamic
+    ):
+        print(
+            "Measuring Lion8bit dynamic (unfused, Python chain) ...",
+            file=sys.stderr,
+        )
+        dyn_unfused_optimizer = make_lion8bit(
+            learning_rate=args.learning_rate,
+            weight_decay=args.weight_decay,
+            use_fused_kernel=False,
+            quant_scheme="dynamic_int8_v1",
+        )
+        if args.skip_step_timing:
+            dynamic_unfused_result = _measure_state_only(model, dyn_unfused_optimizer)
+        else:
+            dynamic_unfused_result = _measure_optimizer(
+                model,
+                dyn_unfused_optimizer,
+                batch_size=args.batch_size,
+                seq_len=args.seq_len,
+                warmup=args.warmup,
+                iters=args.iters,
+            )
+        del dyn_unfused_optimizer
+
+    if not args.skip_quant and not args.skip_fused and not args.skip_dynamic:
+        print(
+            "Measuring Lion8bit dynamic (FUSED Metal kernel) ...",
+            file=sys.stderr,
+        )
+        dyn_fused_optimizer = make_lion8bit(
+            learning_rate=args.learning_rate,
+            weight_decay=args.weight_decay,
+            use_fused_kernel=True,
+            quant_scheme="dynamic_int8_v1",
+        )
+        if args.skip_step_timing:
+            dynamic_fused_result = _measure_state_only(model, dyn_fused_optimizer)
+        else:
+            dynamic_fused_result = _measure_optimizer(
+                model,
+                dyn_fused_optimizer,
+                batch_size=args.batch_size,
+                seq_len=args.seq_len,
+                warmup=args.warmup,
+                iters=args.iters,
+            )
+        del dyn_fused_optimizer
+
+    # The "lion8bit" payload retains the previous schema's role as the
+    # default-configuration row (fused if available, otherwise unfused).
+    quant_result: dict[str, Any] | None = fused_result or unfused_result
 
     state_compaction = None
-    step_speedup = None
+    step_speedup_fp32_over_fused = None
+    step_speedup_unfused_over_fused = None
     if fp32_result is not None and quant_result is not None:
         state_compaction = (
             fp32_result["state_bytes"] / max(quant_result["state_bytes"], 1)
         )
-        if (
-            fp32_result.get("step_ms") is not None
-            and quant_result.get("step_ms") is not None
-        ):
-            step_speedup = (
-                fp32_result["step_ms"]["median"] / quant_result["step_ms"]["median"]
-            )
+    if (
+        fp32_result is not None
+        and fp32_result.get("step_ms") is not None
+        and fused_result is not None
+        and fused_result.get("step_ms") is not None
+    ):
+        step_speedup_fp32_over_fused = (
+            fp32_result["step_ms"]["median"] / fused_result["step_ms"]["median"]
+        )
+    if (
+        unfused_result is not None
+        and unfused_result.get("step_ms") is not None
+        and fused_result is not None
+        and fused_result.get("step_ms") is not None
+    ):
+        step_speedup_unfused_over_fused = (
+            unfused_result["step_ms"]["median"] / fused_result["step_ms"]["median"]
+        )
+
+    # Fused-vs-unfused speedup for the dynamic-LUT path.
+    step_speedup_unfused_over_fused_dynamic = None
+    if (
+        dynamic_unfused_result is not None
+        and dynamic_unfused_result.get("step_ms") is not None
+        and dynamic_fused_result is not None
+        and dynamic_fused_result.get("step_ms") is not None
+    ):
+        step_speedup_unfused_over_fused_dynamic = (
+            dynamic_unfused_result["step_ms"]["median"]
+            / dynamic_fused_result["step_ms"]["median"]
+        )
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -389,25 +533,43 @@ def build_receipt(args: argparse.Namespace) -> dict[str, Any]:
         },
         "fp32_moments_lion": fp32_result,
         "lion8bit": quant_result,
+        "lion8bit_unfused": unfused_result,
+        "lion8bit_fused": fused_result,
+        "lion8bit_dynamic_fused": dynamic_fused_result,
+        "lion8bit_dynamic_unfused": dynamic_unfused_result,
         "acceptance": {
             "state_compaction_ratio_fp32_over_quant": state_compaction,
-            "step_speedup_fp32_over_quant_median": step_speedup,
+            "step_speedup_fp32_over_quant_median": step_speedup_fp32_over_fused,
+            "step_speedup_unfused_over_fused_median": step_speedup_unfused_over_fused,
+            "step_speedup_unfused_over_fused_dynamic_median": (
+                step_speedup_unfused_over_fused_dynamic
+            ),
             "state_compaction_lower_bound": 3.0,
             "meets_state_compaction_gate": (
                 state_compaction is not None and state_compaction >= 3.0
             ),
+            "fused_vs_unfused_dynamic_lower_bound": 2.0,
+            "meets_fused_vs_unfused_dynamic_gate": (
+                step_speedup_unfused_over_fused_dynamic is not None
+                and step_speedup_unfused_over_fused_dynamic >= 2.0
+            ),
         },
         "notes": [
             "Local Apple Silicon receipt only; does not claim GB10 parity.",
-            "Lion8bit uses symmetric int8 blockwise quantization, not the "
-            "bitsandbytes dynamic LUT (default). Pass --quant-scheme dynamic_int8_v1"
-            " to compare on the bnb-style codec.",
+            "Both schemes have fused single-kernel-launch MSL implementations: "
+            "the symmetric kernel embeds the +128 bias inline, the dynamic "
+            "kernel loads the bnb 256-entry signed LUT into threadgroup memory "
+            "and binary-searches it on the quant step (8 cmps/elem).",
             "LionFP32Moments needs ~6.69 GiB of optimizer state for "
             "1.797B-param bf16 weights; pass --skip-fp32 if the host runs "
             "out of memory.",
-            "Step time is expected to be slightly slower than LionFP32Moments "
-            "because of the extra dequant -> fp32 math -> requant pipeline; "
-            "the compaction ratio is the load-bearing number.",
+            "lion8bit_unfused: Python chain (3 Metal launches per param). "
+            "lion8bit_fused: single fused-kernel launch per param "
+            "(dequant -> Lion math -> apply -> quant fused into one MSL kernel). "
+            "Default optimizer instance uses the fused kernel.",
+            "lion8bit_dynamic_fused / lion8bit_dynamic_unfused: same paths but "
+            "using the bnb-style 256-entry dynamic LUT codec. Skip with "
+            "--skip-dynamic when host memory is tight.",
             "CUDA reference: cppmega/docs/lion8bit_ab_2026_04_25.md.",
         ],
     }
