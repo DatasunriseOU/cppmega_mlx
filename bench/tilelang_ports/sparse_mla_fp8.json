@@ -5,19 +5,19 @@
   "shape": {
     "q_shape": [
       1,
-      64,
       4,
+      2,
       64
     ],
     "kv_shape": [
       1,
-      64,
+      4,
       1,
       64
     ],
     "indices_shape": [
       1,
-      64,
+      4,
       1,
       16
     ],
@@ -31,52 +31,115 @@
     "codegen_blocker_reason": "sparse_mla_fp8 direct-MSL kernel built via mx.fast.metal_kernel is available; FP8 e4m3 dequant happens inline inside MSL on uint8 storage. Apple MSL 4.0 has no native float8 simdgroup matrix, so the matmuls run as plain register fma ops (still ~2x faster than the BF16-fallback reference because the dequant fuses with the QK loop).",
     "fp8_dtype": "float8_e4m3"
   },
+  "path_c_tilelang_qk_status": {
+    "available": false,
+    "reason": "TileLang Path C FP8 Sparse-MLA QK is not safe to dispatch: no simdgroup_multiply_accumulate; scale operands disappeared from emitted MSL; scalar fallback markers present; Sparse-MLA M=1/topk tile violates current Metal FP8 simdgroup tile constraints",
+    "target": "metal",
+    "m": 1,
+    "n": 16,
+    "k": 64,
+    "transpose_B": true,
+    "features": {
+      "kernel_void": 1,
+      "simdgroup_multiply_accumulate": 0,
+      "simdgroup_load": 0,
+      "simdgroup_store": 0,
+      "fp8_e4m3_decode_helper": 3,
+      "A_scale_refs": 0,
+      "B_scale_refs": 0,
+      "signature_has_A_scale": false,
+      "signature_has_B_scale": false,
+      "float_a_val": true,
+      "float_b_val": true,
+      "threadgroup_half": false
+    }
+  },
+  "path_c_tilelang_qk_reduce_status": {
+    "available": true,
+    "reason": "TileLang Path C FP8 Sparse-MLA real QK reducer is dispatchable for M=1/topk with per-row B scales",
+    "target": "metal",
+    "n": 16,
+    "k": 64,
+    "outputs_per_block": 4,
+    "reduce_threads": 32,
+    "vec": 4,
+    "features": {
+      "kernel_void": 1,
+      "fp8_e4m3_decode_helper": 3,
+      "scalar_fp8_byte_decode": 3,
+      "scalar_fp8_byte_decode_calls": 2,
+      "tvm_thread_allreduce": 0,
+      "simd_sum": 0,
+      "simd_shuffle_down": 5,
+      "A_scale_refs": 1,
+      "B_scale_refs": 1,
+      "signature_has_A_scale": true,
+      "signature_has_B_scale": true,
+      "per_row_B_scale": true,
+      "reinterpret_cast": 0,
+      "device_const_uint": 0,
+      "uchar4": 0,
+      "threadgroup_half": false,
+      "qk_shape": "m1_n_topk_k"
+    }
+  },
   "parity": {
     "fp8_vs_bf16": {
-      "max_abs_err": 0.0030034519731998444,
-      "max_rel_err": 0.031174618342377305
+      "max_abs_err": 0.0034084729850292206,
+      "max_rel_err": 0.047518537152928295
     },
     "quantized_matmul_vs_bf16": {
       "max_abs_err": 0.0,
       "max_rel_err": 0.0
     },
     "msl_fp8_vs_bf16": {
-      "max_abs_err": 0.0030084550380706787,
-      "max_rel_err": 0.0312265481349234
+      "max_abs_err": 0.003423169255256653,
+      "max_rel_err": 0.04772342223368997
     },
     "msl_fp8_vs_fp8_ref": {
-      "max_abs_err": 3.0413269996643066e-05,
-      "max_rel_err": 0.0003079714788127215
+      "max_abs_err": 3.0234456062316895e-05,
+      "max_rel_err": 0.00042000606965991613
+    },
+    "path_c_qk_reduce_vs_oracle": {
+      "max_abs_err": 0.0,
+      "max_rel_err": 0.0
     }
   },
   "bench": {
     "bf16_reference": {
       "label": "bf16_reference",
-      "median_ms": 0.9395829401910305,
-      "min_ms": 0.665042083710432,
-      "max_ms": 0.9992080740630627,
-      "iters": 8
+      "median_ms": 0.608749920502305,
+      "min_ms": 0.5949169863015413,
+      "max_ms": 0.6114158313721418,
+      "iters": 3
     },
     "fp8_reference": {
       "label": "fp8_reference",
-      "median_ms": 0.4516250919550657,
-      "min_ms": 0.33437483943998814,
-      "max_ms": 0.5283341743052006,
-      "iters": 8
+      "median_ms": 0.6220829673111439,
+      "min_ms": 0.6120421458035707,
+      "max_ms": 0.6377911195158958,
+      "iters": 3
     },
     "quantized_matmul_reference": {
       "label": "quantized_matmul_reference",
-      "median_ms": 0.3338339738547802,
-      "min_ms": 0.2703331410884857,
-      "max_ms": 0.5257499869912863,
-      "iters": 8
+      "median_ms": 0.5981249269098043,
+      "min_ms": 0.5954578518867493,
+      "max_ms": 0.7106249686330557,
+      "iters": 3
     },
     "path_b_msl_fp8_fwd": {
       "label": "path_b_msl_fp8_fwd",
-      "median_ms": 0.9899579454213381,
-      "min_ms": 0.21674996241927147,
-      "max_ms": 2.00541689991951,
-      "iters": 8
+      "median_ms": 0.5564999300986528,
+      "min_ms": 0.22545899264514446,
+      "max_ms": 0.6050418596714735,
+      "iters": 3
+    },
+    "path_c_tilelang_fp8_qk_reduce": {
+      "label": "path_c_tilelang_fp8_qk_reduce",
+      "median_ms": 0.20920787937939167,
+      "min_ms": 0.1621670089662075,
+      "max_ms": 0.5389999132603407,
+      "iters": 3
     }
   }
 }

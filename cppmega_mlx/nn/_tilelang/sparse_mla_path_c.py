@@ -17,6 +17,7 @@ power-of-two tree reductions for the max/sum/rowsum phases. That mirrors Path
 B's direct-MSL contract while keeping the source in TileLang DSL.
 """
 
+import re
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, cast
@@ -29,8 +30,51 @@ from cppmega_mlx.nn._tilelang._msl_transform import (
     can_run_metal,
     lower_tilelang_to_msl_inline,
 )
-from cppmega_mlx.nn._tilelang.sparse_mla import _reduce_dkv_partial
+from cppmega_mlx.nn._tilelang.sparse_mla import _promote_to_fp16_carrier, _reduce_dkv_partial
 from cppmega_mlx.nn.sparse_mla import _resolve_shapes
+
+
+_KV_BOUNDS_CHECK_RE = re.compile(
+    r"(?P<indent>[ \t]*)half (?P<var>condval(?:_\d+)?);\n"
+    r"(?P=indent)if \(\(\(0 <= gather_idx\[0\]\) && "
+    r"\(gather_idx\[0\] < (?P<seq_len_kv>\d+)\)\)\) \{\n"
+    r"(?P=indent)  (?P=var) = (?P<load>kv\[[^\n]+]);\n"
+    r"(?P=indent)\} else \{\n"
+    r"(?P=indent)  (?P=var) = 0\.000000e\+00h;\n"
+    r"(?P=indent)\}",
+    re.MULTILINE,
+)
+
+
+def _remove_redundant_kv_bounds_checks(msl: str, *, seq_len_kv: int) -> str:
+    """Mirror Path B's valid-index contract by deleting hot-loop KV load guards."""
+
+    def replace(match: re.Match[str]) -> str:
+        if int(match.group("seq_len_kv")) != seq_len_kv:
+            return match.group(0)
+        return f"{match.group('indent')}half {match.group('var')} = {match.group('load')};"
+
+    return _KV_BOUNDS_CHECK_RE.sub(replace, msl)
+
+
+def _scalarize_singleton_thread_arrays(msl: str) -> str:
+    """Trim TileLang's one-element thread arrays from hot scalar state."""
+
+    for var, dtype in {
+        "gather_idx": "int",
+        "acc": "float",
+        "local": "float",
+        "inv_sum": "float",
+        "stride": "int",
+    }.items():
+        msl = re.sub(rf"\bthread {dtype} {var}\[1\];", f"{dtype} {var};", msl)
+        msl = re.sub(rf"\b{var}\[(?:0|\(long\)0)\]", var, msl)
+    return msl
+
+
+def _postprocess_lowered_msl(msl: str, *, seq_len_kv: int) -> str:
+    msl = _remove_redundant_kv_bounds_checks(msl, seq_len_kv=seq_len_kv)
+    return _scalarize_singleton_thread_arrays(msl)
 
 
 @dataclass(frozen=True)
@@ -39,7 +83,7 @@ class SparseMLAPathCStatus:
 
     available: bool
     reason: str
-    fp32_carrier: bool = True
+    fp16_carrier: bool = True
 
 
 def _tilelang_available() -> tuple[bool, str]:
@@ -102,11 +146,11 @@ def _fwd_kernel_for(
 
     @T.prim_func
     def sparse_mla_fwd(
-        q: T.Tensor((BATCH, SEQ_LEN, HEADS, QK_DIM), "float32"),
-        kv: T.Tensor((BATCH, SEQ_LEN_KV, KV_GROUP, QK_DIM), "float32"),
+        q: T.Tensor((BATCH, SEQ_LEN, HEADS, QK_DIM), "float16"),
+        kv: T.Tensor((BATCH, SEQ_LEN_KV, KV_GROUP, QK_DIM), "float16"),
         indices: T.Tensor((BATCH, SEQ_LEN, KV_GROUP, TOPK), "int32"),
         sm_scale_buf: T.Tensor((1,), "float32"),
-        out: T.Tensor((BATCH, SEQ_LEN, HEADS, D_V), "float32"),
+        out: T.Tensor((BATCH, SEQ_LEN, HEADS, D_V), "float16"),
         lse: T.Tensor((BATCH, SEQ_LEN, HEADS), "float32"),
     ):
         with T.Kernel(LANES, threads=THREADS) as bx:
@@ -132,7 +176,9 @@ def _fwd_kernel_for(
                 else:
                     acc[0] = 0.0
                     for d in T.serial(QK_DIM):
-                        acc[0] = acc[0] + q[b, s, h, d] * kv[b, gather_idx[0], g, d]
+                        acc[0] = acc[0] + T.cast(q[b, s, h, d], "float32") * T.cast(
+                            kv[b, gather_idx[0], g, d], "float32"
+                        )
                     scores[k] = acc[0] * sm_scale
             T.sync_threads()
 
@@ -178,7 +224,9 @@ def _fwd_kernel_for(
                 for k in T.serial(TOPK):
                     gather_idx[0] = indices[b, s, g, k]
                     if gather_idx[0] >= 0:
-                        acc[0] = acc[0] + scores[k] * kv[b, gather_idx[0], g, d]
+                        acc[0] = acc[0] + scores[k] * T.cast(
+                            kv[b, gather_idx[0], g, d], "float32"
+                        )
                 out[b, s, h, d] = acc[0] * inv_sum[0]
 
             if lane == 0:
@@ -188,9 +236,18 @@ def _fwd_kernel_for(
                     lse[b, s, h] = 0.0
 
     lowering = lower_tilelang_to_msl_inline(sparse_mla_fwd)
+    lowering = _msl_transform.TileLangMSLLowering(
+        header=lowering.header,
+        body=_postprocess_lowered_msl(lowering.body, seq_len_kv=SEQ_LEN_KV),
+        grid=lowering.grid,
+        threadgroup=lowering.threadgroup,
+        msl_text=_postprocess_lowered_msl(lowering.msl_text, seq_len_kv=SEQ_LEN_KV),
+        buffer_param_names=lowering.buffer_param_names,
+        kernel_name=lowering.kernel_name,
+    )
     kernel = mx.fast.metal_kernel(
         name=(
-            "cppmega_sparse_mla_path_c_fwd_"
+            "cppmega_sparse_mla_path_c_fwd_noguard_"
             f"{BATCH}_{SEQ_LEN}_{HEADS}_{QK_DIM}_{KV_GROUP}_{TOPK}_{SEQ_LEN_KV}_{D_V}_{THREADS}"
         ),
         input_names=["indices", "kv", "q", "sm_scale_buf"],
@@ -224,13 +281,13 @@ def _bwd_kernel_for(
 
     @T.prim_func
     def sparse_mla_bwd(
-        q: T.Tensor((BATCH, SEQ_LEN, HEADS, QK_DIM), "float32"),
-        kv: T.Tensor((BATCH, SEQ_LEN_KV, KV_GROUP, QK_DIM), "float32"),
-        d_out: T.Tensor((BATCH, SEQ_LEN, HEADS, D_V), "float32"),
+        q: T.Tensor((BATCH, SEQ_LEN, HEADS, QK_DIM), "float16"),
+        kv: T.Tensor((BATCH, SEQ_LEN_KV, KV_GROUP, QK_DIM), "float16"),
+        d_out: T.Tensor((BATCH, SEQ_LEN, HEADS, D_V), "float16"),
         indices: T.Tensor((BATCH, SEQ_LEN, KV_GROUP, TOPK), "int32"),
         sm_scale_buf: T.Tensor((1,), "float32"),
-        dq: T.Tensor((BATCH, SEQ_LEN, HEADS, QK_DIM), "float32"),
-        dkv_partial: T.Tensor((BATCH, SEQ_LEN, HEADS, TOPK, QK_DIM), "float32"),
+        dq: T.Tensor((BATCH, SEQ_LEN, HEADS, QK_DIM), "float16"),
+        dkv_partial: T.Tensor((BATCH, SEQ_LEN, HEADS, TOPK, QK_DIM), "float16"),
     ):
         with T.Kernel(LANES, threads=THREADS) as bx:
             lane = T.get_thread_binding()
@@ -258,7 +315,9 @@ def _bwd_kernel_for(
                 else:
                     acc[0] = 0.0
                     for d in T.serial(QK_DIM):
-                        acc[0] = acc[0] + q[b, s, h, d] * kv[b, gather_idx[0], g, d]
+                        acc[0] = acc[0] + T.cast(q[b, s, h, d], "float32") * T.cast(
+                            kv[b, gather_idx[0], g, d], "float32"
+                        )
                     scores[k] = acc[0] * sm_scale
             T.sync_threads()
 
@@ -310,7 +369,9 @@ def _bwd_kernel_for(
                 else:
                     acc[0] = 0.0
                     for d in T.serial(D_V):
-                        acc[0] = acc[0] + kv[b, gather_idx[0], g, d] * d_out[b, s, h, d]
+                        acc[0] = acc[0] + T.cast(
+                            kv[b, gather_idx[0], g, d], "float32"
+                        ) * T.cast(d_out[b, s, h, d], "float32")
                     dp[k] = acc[0]
             T.sync_threads()
 
@@ -335,7 +396,9 @@ def _bwd_kernel_for(
                 for k in T.serial(TOPK):
                     gather_idx[0] = indices[b, s, g, k]
                     if gather_idx[0] >= 0:
-                        acc[0] = acc[0] + ds[k] * kv[b, gather_idx[0], g, d]
+                        acc[0] = acc[0] + ds[k] * T.cast(
+                            kv[b, gather_idx[0], g, d], "float32"
+                        )
                 dq[b, s, h, d] = acc[0] * sm_scale
 
             for kd in T.serial(lane, TOPK * QK_DIM, step=THREADS):
@@ -345,16 +408,27 @@ def _bwd_kernel_for(
                 if gather_idx[0] < 0:
                     dkv_partial[b, s, h, k, d] = 0.0
                 else:
-                    acc[0] = sm_scale * ds[k] * q[b, s, h, d]
+                    acc[0] = sm_scale * ds[k] * T.cast(q[b, s, h, d], "float32")
                     if d < D_V:
-                        dkv_partial[b, s, h, k, d] = p[k] * d_out[b, s, h, d] + acc[0]
+                        dkv_partial[b, s, h, k, d] = p[k] * T.cast(
+                            d_out[b, s, h, d], "float32"
+                        ) + acc[0]
                     else:
                         dkv_partial[b, s, h, k, d] = acc[0]
 
     lowering = lower_tilelang_to_msl_inline(sparse_mla_bwd)
+    lowering = _msl_transform.TileLangMSLLowering(
+        header=lowering.header,
+        body=_postprocess_lowered_msl(lowering.body, seq_len_kv=SEQ_LEN_KV),
+        grid=lowering.grid,
+        threadgroup=lowering.threadgroup,
+        msl_text=_postprocess_lowered_msl(lowering.msl_text, seq_len_kv=SEQ_LEN_KV),
+        buffer_param_names=lowering.buffer_param_names,
+        kernel_name=lowering.kernel_name,
+    )
     kernel = mx.fast.metal_kernel(
         name=(
-            "cppmega_sparse_mla_path_c_bwd_"
+            "cppmega_sparse_mla_path_c_bwd_noguard_"
             f"{BATCH}_{SEQ_LEN}_{HEADS}_{QK_DIM}_{KV_GROUP}_{TOPK}_{SEQ_LEN_KV}_{D_V}_{THREADS}"
         ),
         input_names=["d_out", "indices", "kv", "q", "sm_scale_buf"],
@@ -377,8 +451,8 @@ def sparse_mla_fwd_path_c(
     """TileLang DSL Path C Sparse-MLA forward.
 
     Returns ``(out, lse)`` or ``None`` if the Metal/TileLang path cannot be
-    built. The kernel uses fp32 carrier/accumulators and casts ``out`` back to
-    the input dtype so BF16 tests exercise the BF16 public contract.
+    built. The kernel mirrors Path B's raw forward contract: fp16 carrier I/O
+    with fp32 accumulators and fp32 ``lse``.
     """
 
     status = sparse_mla_path_c_status()
@@ -392,9 +466,8 @@ def sparse_mla_fwd_path_c(
         sm_scale_value = sm_scale
     threads = _threadgroup_size(shapes.topk)
 
-    out_dtype = q.dtype
-    q32 = q.astype(mx.float32)
-    kv32 = kv.astype(mx.float32)
+    q16 = _promote_to_fp16_carrier(q)
+    kv16 = _promote_to_fp16_carrier(kv)
     indices_i32 = indices.astype(mx.int32)
     sm_scale_buf = mx.array([float(sm_scale_value)], dtype=mx.float32)
 
@@ -422,12 +495,12 @@ def sparse_mla_fwd_path_c(
 
     try:
         outputs = kernel(
-            inputs=[indices_i32, kv32, q32, sm_scale_buf],
+            inputs=[indices_i32, kv16, q16, sm_scale_buf],
             output_shapes=[
                 (shapes.batch, shapes.seq_len, shapes.heads),
                 (shapes.batch, shapes.seq_len, shapes.heads, shapes.d_v),
             ],
-            output_dtypes=[mx.float32, mx.float32],
+            output_dtypes=[mx.float32, mx.float16],
             grid=grid,
             threadgroup=lowering.threadgroup,
             stream=mx.gpu,
@@ -436,10 +509,10 @@ def sparse_mla_fwd_path_c(
         return None
 
     lse, out = outputs
-    return cast(mx.array, out.astype(out_dtype)), cast(mx.array, lse)
+    return cast(mx.array, out), cast(mx.array, lse)
 
 
-def sparse_mla_bwd_path_c(
+def _sparse_mla_bwd_path_c_partial(
     q: mx.array,
     kv: mx.array,
     d_out: mx.array,
@@ -447,11 +520,11 @@ def sparse_mla_bwd_path_c(
     *,
     sm_scale: float | None = None,
     d_v: int | None = None,
-) -> tuple[mx.array, mx.array] | None:
-    """TileLang DSL Path C Sparse-MLA backward.
+) -> tuple[mx.array, mx.array, mx.array, Any] | None:
+    """Run the TileLang backward kernel and return unreduced dKV partials.
 
-    Returns ``(dq, dkv)`` or ``None`` if the Metal/TileLang path cannot be
-    built. The kernel emits fp32 partials; the host reduction returns fp32 dKV.
+    This is intentionally private and exists so the benchmark can isolate the
+    TileLang kernel cost from the shared Path B/Path C dKV scatter-reduction.
     """
 
     status = sparse_mla_path_c_status()
@@ -465,9 +538,9 @@ def sparse_mla_bwd_path_c(
         sm_scale_value = sm_scale
     threads = _threadgroup_size(shapes.topk)
 
-    q32 = q.astype(mx.float32)
-    kv32 = kv.astype(mx.float32)
-    d_out32 = d_out.astype(mx.float32)
+    q16 = _promote_to_fp16_carrier(q)
+    kv16 = _promote_to_fp16_carrier(kv)
+    d_out16 = _promote_to_fp16_carrier(d_out)
     indices_i32 = indices.astype(mx.int32)
     sm_scale_buf = mx.array([float(sm_scale_value)], dtype=mx.float32)
 
@@ -495,7 +568,7 @@ def sparse_mla_bwd_path_c(
 
     try:
         outputs = kernel(
-            inputs=[d_out32, indices_i32, kv32, q32, sm_scale_buf],
+            inputs=[d_out16, indices_i32, kv16, q16, sm_scale_buf],
             output_shapes=[
                 (
                     shapes.batch,
@@ -506,7 +579,7 @@ def sparse_mla_bwd_path_c(
                 ),
                 (shapes.batch, shapes.seq_len, shapes.heads, shapes.qk_dim),
             ],
-            output_dtypes=[mx.float32, mx.float32],
+            output_dtypes=[mx.float16, mx.float16],
             grid=grid,
             threadgroup=lowering.threadgroup,
             stream=mx.gpu,
@@ -515,6 +588,37 @@ def sparse_mla_bwd_path_c(
         return None
 
     dkv_partial, dq = outputs
+    return cast(mx.array, dkv_partial), cast(mx.array, dq), indices_i32, shapes
+
+
+def sparse_mla_bwd_path_c(
+    q: mx.array,
+    kv: mx.array,
+    d_out: mx.array,
+    indices: mx.array,
+    *,
+    sm_scale: float | None = None,
+    d_v: int | None = None,
+) -> tuple[mx.array, mx.array] | None:
+    """TileLang DSL Path C Sparse-MLA backward.
+
+    Returns ``(dq, dkv)`` or ``None`` if the Metal/TileLang path cannot be
+    built. The kernel mirrors Path B's fp16 carrier/partial contract while
+    keeping fp32 accumulators inside the TileLang kernel.
+    """
+
+    partial = _sparse_mla_bwd_path_c_partial(
+        q,
+        kv,
+        d_out,
+        indices,
+        sm_scale=sm_scale,
+        d_v=d_v,
+    )
+    if partial is None:
+        return None
+
+    dkv_partial, dq, indices_i32, shapes = partial
     dkv = _reduce_dkv_partial(dkv_partial, indices_i32, shapes)
     return cast(mx.array, dq), cast(mx.array, dkv)
 

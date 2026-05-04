@@ -116,6 +116,8 @@ Return contract:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
+from typing import Any
 
 import mlx.core as mx
 
@@ -586,6 +588,298 @@ def topk_selector_metal(
 
 
 # ---------------------------------------------------------------------------
+# TileLang DSL Path C kernel.
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class PathCStatus:
+    """Why Path C (TileLang DSL -> Metal -> MLX) is or isn't available."""
+
+    available: bool
+    reason: str
+
+
+_PATH_C_OK_REASON = (
+    "topk_selector TileLang DSL Path C is available; the shape-specialized "
+    "threadgroup merge kernel lowers to static Metal threadgroup buffers."
+)
+
+
+def _tilelang_available() -> tuple[bool, str]:
+    try:
+        import tilelang  # noqa: F401
+        from tilelang import tvm as _tvm  # noqa: F401
+        import tilelang.language as _T  # noqa: F401
+    except Exception as exc:  # pragma: no cover - host without TileLang build
+        return False, f"tilelang import failed: {exc}"
+    return True, "tilelang importable"
+
+
+def topk_selector_path_c_status() -> PathCStatus:
+    """Return whether the TileLang DSL Path C topk selector can dispatch."""
+
+    if not _msl_transform.can_run_metal():
+        return PathCStatus(
+            available=False,
+            reason="MLX Metal backend is not available on the default GPU device",
+        )
+    ok, reason = _tilelang_available()
+    if not ok:
+        return PathCStatus(available=False, reason=reason)
+    return PathCStatus(available=True, reason=_PATH_C_OK_REASON)
+
+
+def _path_c_threads_for(k: int) -> int:
+    """Pick a power-of-two threadgroup that fits Apple's 32 KiB shared budget."""
+
+    max_shared_bytes = 32 * 1024
+    max_threads_for_k = max(1, max_shared_bytes // (max(k, 1) * 8))
+    threads = min(64, max_threads_for_k)
+    pow2 = 1
+    while (pow2 << 1) <= threads:
+        pow2 <<= 1
+    return max(1, pow2)
+
+
+def _path_c_score_dtype(scores: mx.array) -> tuple[str, mx.array] | None:
+    if scores.dtype == mx.float32:
+        return "float32", scores
+    if scores.dtype == mx.float16:
+        return "float16", scores
+    if scores.dtype == mx.bfloat16:
+        return "float32", scores.astype(mx.float32)
+    return None
+
+
+def _path_c_interval_buffers(
+    *,
+    batch: int,
+    seq_len: int,
+    starts: mx.array | None,
+    ends: mx.array | None,
+) -> tuple[mx.array, mx.array]:
+    zero = mx.array(0, dtype=mx.int32)
+    seq = mx.array(seq_len, dtype=mx.int32)
+    if starts is None:
+        starts_i = mx.zeros((batch,), dtype=mx.int32)
+    else:
+        if starts.shape != (batch,):
+            raise ValueError(f"starts must have shape ({batch},); got {starts.shape}")
+        starts_i = starts.astype(mx.int32)
+    if ends is None:
+        ends_i = mx.full((batch,), seq_len, dtype=mx.int32)
+    else:
+        if ends.shape != (batch,):
+            raise ValueError(f"ends must have shape ({batch},); got {ends.shape}")
+        ends_i = ends.astype(mx.int32)
+    return mx.minimum(mx.maximum(starts_i, zero), seq), mx.minimum(
+        mx.maximum(ends_i, zero), seq
+    )
+
+
+@lru_cache(maxsize=128)
+def _path_c_kernel_for(
+    batch: int,
+    seq_len: int,
+    k: int,
+    threads: int,
+    score_dtype: str,
+) -> tuple[Any, _msl_transform.TileLangMSLLowering]:
+    """Build and cache a shape-specialized TileLang topk selector kernel."""
+
+    if threads < 1 or threads & (threads - 1):
+        raise ValueError(f"topk selector merge requires power-of-two threads; got {threads}")
+    if k < 1 or k > seq_len:
+        raise ValueError(f"topk selector requires 1 <= k <= seq_len; got k={k}, seq_len={seq_len}")
+    if threads * k * 8 > 32 * 1024:
+        raise ValueError(
+            f"topk selector shared merge buffer exceeds 32KiB: threads={threads}, k={k}"
+        )
+
+    import tilelang.language as T
+
+    globals().update(
+        T=T,
+        _TOPK_C_B=batch,
+        _TOPK_C_N=seq_len,
+        _TOPK_C_K=k,
+        _TOPK_C_THREADS=threads,
+        _TOPK_C_LOG_THREADS=threads.bit_length() - 1,
+        _TOPK_C_SCORE_DTYPE=score_dtype,
+    )
+
+    @T.prim_func
+    def topk_selector_kernel(
+        scores: T.Tensor((_TOPK_C_B, _TOPK_C_N), _TOPK_C_SCORE_DTYPE),
+        starts: T.Tensor((_TOPK_C_B,), "int32"),
+        ends: T.Tensor((_TOPK_C_B,), "int32"),
+        indices: T.Tensor((_TOPK_C_B, _TOPK_C_K), "int32"),
+    ):
+        with T.Kernel(_TOPK_C_B, threads=_TOPK_C_THREADS) as bx:
+            lane = T.get_thread_binding()
+            local_vals = T.alloc_local((_TOPK_C_K,), "float32")
+            local_idx = T.alloc_local((_TOPK_C_K,), "int32")
+            merged_vals = T.alloc_local((_TOPK_C_K,), "float32")
+            merged_idx = T.alloc_local((_TOPK_C_K,), "int32")
+            pair_vals = T.alloc_shared(
+                (_TOPK_C_THREADS, _TOPK_C_K),
+                "float32",
+                scope="shared",
+            )
+            pair_idx = T.alloc_shared(
+                (_TOPK_C_THREADS, _TOPK_C_K),
+                "int32",
+                scope="shared",
+            )
+            pos = T.alloc_var("int32")
+            ap = T.alloc_var("int32")
+            bp = T.alloc_var("int32")
+            stride = T.alloc_var("int32")
+            other = T.alloc_var("int32")
+            a_val = T.alloc_var("float32")
+            b_val = T.alloc_var("float32")
+            a_idx = T.alloc_var("int32")
+            b_idx = T.alloc_var("int32")
+            s = starts[bx]
+            e = ends[bx]
+
+            for i in T.serial(_TOPK_C_K):
+                local_vals[i] = -T.infinity("float32")
+                local_idx[i] = -1
+
+            for j in T.serial(lane, _TOPK_C_N, step=_TOPK_C_THREADS):
+                valid = (j >= s) & (j < e)
+                value = T.if_then_else(
+                    valid,
+                    T.cast(scores[bx, j], "float32"),
+                    -T.infinity("float32"),
+                )
+                if value > local_vals[0]:
+                    pos = 0
+                    for p in T.serial(1, _TOPK_C_K):
+                        if value > local_vals[p]:
+                            local_vals[p - 1] = local_vals[p]
+                            local_idx[p - 1] = local_idx[p]
+                            pos = p
+                    local_vals[pos] = value
+                    local_idx[pos] = j
+
+            for i in T.serial(_TOPK_C_K):
+                pair_vals[lane, i] = local_vals[i]
+                pair_idx[lane, i] = local_idx[i]
+            T.sync_threads()
+
+            for round_id in T.serial(_TOPK_C_LOG_THREADS):
+                stride = T.shift_left(1, round_id)
+                if lane % (stride * 2) == 0:
+                    other = lane + stride
+                    if other < _TOPK_C_THREADS:
+                        ap = _TOPK_C_K - 1
+                        bp = _TOPK_C_K - 1
+                        for pick in T.serial(_TOPK_C_K):
+                            a_val = -T.infinity("float32")
+                            b_val = -T.infinity("float32")
+                            a_idx = -1
+                            b_idx = -1
+                            if ap >= 0:
+                                a_val = pair_vals[lane, ap]
+                                a_idx = pair_idx[lane, ap]
+                            if bp >= 0:
+                                b_val = pair_vals[other, bp]
+                                b_idx = pair_idx[other, bp]
+                            if a_val >= b_val:
+                                merged_vals[_TOPK_C_K - 1 - pick] = a_val
+                                merged_idx[_TOPK_C_K - 1 - pick] = a_idx
+                                ap -= 1
+                            else:
+                                merged_vals[_TOPK_C_K - 1 - pick] = b_val
+                                merged_idx[_TOPK_C_K - 1 - pick] = b_idx
+                                bp -= 1
+                        for i in T.serial(_TOPK_C_K):
+                            pair_vals[lane, i] = merged_vals[i]
+                            pair_idx[lane, i] = merged_idx[i]
+                T.sync_threads()
+
+            if lane == 0:
+                for i in T.serial(_TOPK_C_K):
+                    indices[bx, i] = pair_idx[0, _TOPK_C_K - 1 - i]
+
+    lowering = _msl_transform.lower_tilelang_to_msl_inline(topk_selector_kernel)
+    kernel = mx.fast.metal_kernel(
+        name=f"cppmega_topk_selector_path_c_{batch}_{seq_len}_{k}_{threads}_{score_dtype}",
+        input_names=["ends", "scores", "starts"],
+        output_names=["indices"],
+        source=lowering.body,
+        header=lowering.header,
+        ensure_row_contiguous=True,
+    )
+    return kernel, lowering
+
+
+def topk_selector_tilelang(
+    scores: mx.array,
+    k: int,
+    *,
+    starts: mx.array | None = None,
+    ends: mx.array | None = None,
+) -> mx.array | None:
+    """TileLang DSL Path C forward.
+
+    Returns ``None`` when TileLang/Metal cannot dispatch. This is an explicit
+    experimental backend; ``backend="auto"`` remains Path B-first unless the
+    benchmark demonstrates that Path C is no worse than the hand-written MSL.
+    """
+
+    if scores.ndim != 2:
+        raise ValueError(
+            f"topk_selector expects a (B, T) array; got shape {scores.shape}"
+        )
+    batch = int(scores.shape[0])
+    seq_len = int(scores.shape[1])
+    if k < 1 or k > seq_len:
+        raise ValueError(f"topk must be in [1, {seq_len}]; got {k}")
+    if batch <= 0 or scores.size == 0:
+        return None
+    if not topk_selector_path_c_status().available:
+        return None
+
+    dtype_pair = _path_c_score_dtype(scores)
+    if dtype_pair is None:
+        return None
+    score_dtype, work_scores = dtype_pair
+    starts_buf, ends_buf = _path_c_interval_buffers(
+        batch=batch,
+        seq_len=seq_len,
+        starts=starts,
+        ends=ends,
+    )
+    threads = _path_c_threads_for(int(k))
+
+    try:
+        kernel, lowering = _path_c_kernel_for(batch, seq_len, int(k), threads, score_dtype)
+    except Exception:
+        return None
+
+    grid = (
+        lowering.grid[0] * lowering.threadgroup[0],
+        lowering.grid[1] * lowering.threadgroup[1],
+        lowering.grid[2] * lowering.threadgroup[2],
+    )
+    try:
+        outputs = kernel(
+            inputs=[ends_buf, work_scores, starts_buf],
+            output_shapes=[(batch, int(k))],
+            output_dtypes=[mx.int32],
+            grid=grid,
+            threadgroup=lowering.threadgroup,
+            stream=mx.gpu,
+        )
+    except Exception:
+        return None
+    return outputs[0]
+
+
+# ---------------------------------------------------------------------------
 # Path B status seam.
 # ---------------------------------------------------------------------------
 
@@ -642,10 +936,12 @@ def topk_selector(
         ends: optional (B,) int32 ends for per-row mask.
         backend: ``"auto"`` (default) prefers the direct-MSL Path B kernel and
             falls back to the pure-MLX reference; ``"metal"`` requires the
-            kernel and raises on fallback; ``"mlx"`` always uses the reference.
+            Path B kernel and raises on fallback; ``"tilelang"`` / ``"path_c"``
+            require the TileLang DSL Path C kernel; ``"mlx"`` always uses the
+            reference.
     """
 
-    if backend not in {"auto", "mlx", "metal"}:
+    if backend not in {"auto", "mlx", "metal", "tilelang", "path_c"}:
         raise ValueError(f"unknown backend {backend!r}")
     if backend == "mlx":
         return topk_selector_reference(scores, k, starts=starts, ends=ends)
@@ -653,6 +949,11 @@ def topk_selector(
         out = topk_selector_metal(scores, k, starts=starts, ends=ends)
         if out is None:
             raise RuntimeError("topk_selector: direct-MSL Metal path unavailable")
+        return out
+    if backend in {"tilelang", "path_c"}:
+        out = topk_selector_tilelang(scores, k, starts=starts, ends=ends)
+        if out is None:
+            raise RuntimeError("topk_selector: TileLang Path C path unavailable")
         return out
     # auto
     out = topk_selector_metal(scores, k, starts=starts, ends=ends)
@@ -663,8 +964,11 @@ def topk_selector(
 
 __all__ = [
     "PathBStatus",
+    "PathCStatus",
     "topk_selector",
     "topk_selector_metal",
     "topk_selector_path_b_status",
+    "topk_selector_path_c_status",
     "topk_selector_reference",
+    "topk_selector_tilelang",
 ]

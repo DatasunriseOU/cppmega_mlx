@@ -41,6 +41,15 @@ from cppmega_mlx.nn._tilelang.sparse_mla_blockscaled import (  # noqa: E402
     sparse_mla_blockscaled_metal_status,
     sparse_mla_blockscaled_reference,
 )
+from cppmega_mlx.nn._tilelang.sparse_mla_blockscaled_path_c import (  # noqa: E402
+    E8M0_BLOCK_SIZE,
+    E8M0_LAYOUT,
+    E8M0_SCALE_FORMAT,
+    SparseMLABlockScaledPathCStatus,
+    blockscaled_sparse_mla_qk_msl_features,
+    blockscaled_sparse_mla_qk_path_c_status,
+    lower_blockscaled_sparse_mla_qk_msl,
+)
 from cppmega_mlx.nn.sparse_mla import sparse_mla_attention_reference  # noqa: E402
 
 
@@ -99,6 +108,107 @@ def test_blockscaled_metal_status_with_arrays_validates_dispatcher_path() -> Non
         assert status.available is True
     else:
         assert status.available is False
+
+
+def test_blockscaled_path_c_status_reports_current_e8m0_qk_blocker() -> None:
+    status = blockscaled_sparse_mla_qk_path_c_status()
+    assert isinstance(status, SparseMLABlockScaledPathCStatus)
+    assert status.m == 1
+    assert status.n == 16
+    assert status.k == 64
+    assert status.transpose_B is True
+    assert status.scale_block_size == E8M0_BLOCK_SIZE
+    assert status.scale_layout == E8M0_LAYOUT
+    assert status.available is False
+    assert status.reason
+    if status.features:
+        assert status.features["scale_format"] == E8M0_SCALE_FORMAT
+        assert status.features["scale_block_size"] == E8M0_BLOCK_SIZE
+        assert status.features["scale_axis"] == "contracted_k"
+        assert (
+            "M=1/topk" in status.reason
+            or "no simdgroup_multiply_accumulate" in status.reason
+            or "scale operands disappeared" in status.reason
+        )
+
+
+def test_blockscaled_path_c_square_control_lowers_to_e8m0_scale_aware_fast_path() -> None:
+    status = blockscaled_sparse_mla_qk_path_c_status(
+        M=32,
+        N=32,
+        K=64,
+        BM=32,
+        BN=32,
+        BK=64,
+        a_scale_size=2,
+        b_scale_size=2,
+    )
+    assert status.available is True, status.reason
+    assert status.features["simdgroup_multiply_accumulate"] >= 1
+    assert status.features["A_scale_refs"] >= 1
+    assert status.features["B_scale_refs"] >= 1
+    assert status.features["signature_has_A_scale"] is True
+    assert status.features["signature_has_B_scale"] is True
+    assert status.features["e8m0_exp2"] >= 1
+    assert status.features["e8m0_bias_subtract_127"] >= 1
+    assert status.features["e8m0_sentinel_255"] >= 1
+    assert status.features["k_block_shift_5"] or status.features["k_block_div_32"]
+    assert status.features["A_scale_collapsed_zero"] == 0
+    assert status.features["B_scale_collapsed_zero"] == 0
+    assert status.features["scale_layout"] == E8M0_LAYOUT
+
+
+def test_blockscaled_path_c_lowered_features_document_e8m0_layout() -> None:
+    msl = lower_blockscaled_sparse_mla_qk_msl(
+        M=32,
+        N=32,
+        K=64,
+        BM=32,
+        BN=32,
+        BK=64,
+        a_scale_size=2,
+        b_scale_size=2,
+    )
+    features = blockscaled_sparse_mla_qk_msl_features(msl)
+    assert features["kernel_void"] >= 1
+    assert features["fp8_e4m3_decode_helper"] >= 1
+    assert features["simdgroup_multiply_accumulate"] >= 1
+    assert features["threadgroup_half"] is True
+    assert features["scale_format"] == E8M0_SCALE_FORMAT
+    assert features["scale_block_size"] == E8M0_BLOCK_SIZE
+    assert features["scale_axis"] == "contracted_k"
+    assert features["scale_layout"] == E8M0_LAYOUT
+
+
+def test_blockscaled_path_c_rejects_non_k32_scale_layout() -> None:
+    status = blockscaled_sparse_mla_qk_path_c_status(
+        M=32,
+        N=32,
+        K=48,
+        BM=32,
+        BN=32,
+        BK=48,
+        a_scale_size=2,
+        b_scale_size=2,
+    )
+    assert status.available is False
+    assert "K divisible by 32" in status.reason
+
+
+def test_blockscaled_path_c_documents_bk_chunk_scale_offset_blocker() -> None:
+    status = blockscaled_sparse_mla_qk_path_c_status(
+        M=32,
+        N=32,
+        K=64,
+        BM=32,
+        BN=32,
+        BK=32,
+        a_scale_size=2,
+        b_scale_size=2,
+        num_stages=2,
+    )
+    assert status.available is False
+    assert "A_scale e8m0_block_k32 size must be K/32=1; got size 2" in status.reason
 
 
 def test_blockscaled_fwd_metal_returns_outputs() -> None:
@@ -370,6 +480,7 @@ def test_module_public_exports_present() -> None:
         "sparse_mla_blockscaled_bwd_metal",
         "sparse_mla_blockscaled_fwd_metal",
         "sparse_mla_blockscaled_metal_status",
+        "blockscaled_sparse_mla_qk_path_c_status",
         "sparse_mla_blockscaled_reference",
     }
     assert expected.issubset(set(module.__all__))

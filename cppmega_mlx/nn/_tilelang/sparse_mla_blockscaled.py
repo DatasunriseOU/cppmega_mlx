@@ -66,6 +66,9 @@ from cppmega_mlx.nn._tilelang._msl_transform import (
     can_run_metal,
     msl_dispatch_status,
 )
+from cppmega_mlx.nn._tilelang.sparse_mla_blockscaled_path_c import (
+    blockscaled_sparse_mla_qk_path_c_status,
+)
 from cppmega_mlx.nn.sparse_mla import (
     SparseMLAShapes,
     _resolve_shapes,
@@ -951,6 +954,7 @@ def sparse_mla_blockscaled_apply(
 __all__ = [
     "MXFP8_BLOCK_SIZE",
     "SparseMLABlockScaledMetalStatus",
+    "blockscaled_sparse_mla_qk_path_c_status",
     "sparse_mla_blockscaled_apply",
     "sparse_mla_blockscaled_bwd_metal",
     "sparse_mla_blockscaled_fwd_metal",

@@ -40,7 +40,11 @@ from cppmega_mlx.nn._tilelang.sparse_mla_blockscaled import (  # noqa: E402
     sparse_mla_blockscaled_metal_status,
     sparse_mla_blockscaled_reference,
 )
+from cppmega_mlx.nn._tilelang.sparse_mla_blockscaled_path_c import (  # noqa: E402
+    blockscaled_sparse_mla_qk_path_c_status,
+)
 from cppmega_mlx.nn._tilelang.sparse_mla_fp8 import (  # noqa: E402
+    _to_fp8_with_per_tensor_scale,
     sparse_mla_fp8_fwd_metal,
     sparse_mla_fp8_metal_status,
     sparse_mla_fp8_reference,
@@ -48,6 +52,8 @@ from cppmega_mlx.nn._tilelang.sparse_mla_fp8 import (  # noqa: E402
 )
 from cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c import (  # noqa: E402
     fp8_sparse_mla_qk_path_c_status,
+    fp8_sparse_mla_qk_reduce_path_c,
+    fp8_sparse_mla_qk_reduce_path_c_status,
 )
 from cppmega_mlx.nn.sparse_mla import sparse_mla_attention_reference  # noqa: E402
 
@@ -104,6 +110,7 @@ def _make_inputs(
         (batch, seq_len, kv_group, 1),
     )
     ind_np[:, :, :, topk // 2:] = -1
+    ind_np[ind_np >= seq_len] = -1
     return mx.array(q_np), mx.array(kv_np), mx.array(ind_np)
 
 
@@ -171,6 +178,24 @@ def main() -> None:
     qm_out = sparse_mla_quantized_matmul_reference(q, kv, indices, d_v=d_v)
     mx.eval(bf16_ref_out, fp8_ref_out, bs_ref_out, qm_out)
 
+    q_fp8, q_scale = _to_fp8_with_per_tensor_scale(q)
+    kv_fp8, kv_scale = _to_fp8_with_per_tensor_scale(kv)
+    mx.eval(q_fp8, q_scale, kv_fp8, kv_scale)
+    qk_A_fp8 = q_fp8[0, 0, 0, :].reshape((1, args.qk_dim))
+    qk_A_scale = q_scale[0, 0, 0].reshape((1,))
+    qk_indices_np = np.asarray(indices[0, 0, 0, :]).astype(np.int32)
+    kv_fp8_np = np.asarray(kv_fp8[0, :, 0, :]).astype(np.uint8)
+    kv_scale_np = np.asarray(kv_scale[0, :, 0]).astype(np.float32)
+    qk_B_fp8_np = np.zeros((args.topk, args.qk_dim), dtype=np.uint8)
+    qk_B_scale_np = np.zeros((args.topk,), dtype=np.float32)
+    for row, kv_pos in enumerate(qk_indices_np):
+        if 0 <= kv_pos < kv_fp8_np.shape[0]:
+            qk_B_fp8_np[row, :] = kv_fp8_np[kv_pos, :]
+            qk_B_scale_np[row] = kv_scale_np[kv_pos]
+    qk_B_fp8 = mx.array(qk_B_fp8_np)
+    qk_B_scale = mx.array(qk_B_scale_np)
+    mx.eval(qk_A_fp8, qk_A_scale, qk_B_fp8, qk_B_scale)
+
     # Bench each path
     bf16_bench = _bench(
         "bf16_reference",
@@ -205,6 +230,55 @@ def main() -> None:
     fp8_msl_bench = _bench("path_b_msl_fp8_fwd", _msl_fp8, **bench_kwargs)
     bs_msl_bench = _bench("path_b_msl_blockscaled_fwd", _msl_bs, **bench_kwargs)
 
+    qk_reduce_status = fp8_sparse_mla_qk_reduce_path_c_status(
+        N=args.topk,
+        K=args.qk_dim,
+        outputs_per_block=4,
+        reduce_threads=32,
+        vec=4,
+    )
+    qk_reduce_out = fp8_sparse_mla_qk_reduce_path_c(
+        qk_A_fp8,
+        qk_A_scale,
+        qk_B_fp8,
+        qk_B_scale,
+        outputs_per_block=4,
+        reduce_threads=32,
+        vec=4,
+    )
+    qk_reduce_oracle = (
+        mx.matmul(
+            mx.from_fp8(qk_A_fp8, dtype=mx.float32),
+            mx.swapaxes(mx.from_fp8(qk_B_fp8, dtype=mx.float32), 0, 1),
+        )
+        * qk_A_scale.reshape((1, 1)).astype(mx.float32)
+        * qk_B_scale.reshape((1, args.topk)).astype(mx.float32)
+    )
+    if qk_reduce_out is not None:
+        mx.eval(qk_reduce_out, qk_reduce_oracle)
+
+    def _tilelang_fp8_qk_reduce():
+        result = fp8_sparse_mla_qk_reduce_path_c(
+            qk_A_fp8,
+            qk_A_scale,
+            qk_B_fp8,
+            qk_B_scale,
+            outputs_per_block=4,
+            reduce_threads=32,
+            vec=4,
+        )
+        return result if result is not None else mx.zeros((1,), dtype=mx.float32)
+
+    qk_reduce_bench = (
+        _bench("path_c_tilelang_fp8_qk_reduce", _tilelang_fp8_qk_reduce, **bench_kwargs)
+        if qk_reduce_out is not None
+        else {
+            "label": "path_c_tilelang_fp8_qk_reduce",
+            "available": False,
+            "reason": qk_reduce_status.reason,
+        }
+    )
+
     # Capture parity vs reference for the MSL paths.
     msl_fp8_out = sparse_mla_fp8_fwd_metal(q, kv, indices, d_v=d_v)[0]
     msl_bs_out = sparse_mla_blockscaled_fwd_metal(q, kv, indices, d_v=d_v)[0]
@@ -228,6 +302,17 @@ def main() -> None:
     )
     bs_status_with_arrays = sparse_mla_blockscaled_metal_status(q, kv, indices)
     bs_status_codegen = sparse_mla_blockscaled_metal_status()
+    bs_path_c_qk_status = blockscaled_sparse_mla_qk_path_c_status(
+        M=1,
+        N=args.topk,
+        K=args.qk_dim,
+        BM=1,
+        BN=args.topk,
+        BK=args.qk_dim,
+        a_scale_size=args.qk_dim // 32,
+        b_scale_size=args.qk_dim // 32,
+        transpose_B=True,
+    )
     shape_meta = _shape_metadata(q, kv, indices, d_v)
 
     fp8_payload: dict[str, Any] = {
@@ -251,17 +336,34 @@ def main() -> None:
             "transpose_B": fp8_path_c_qk_status.transpose_B,
             "features": fp8_path_c_qk_status.features,
         },
+        "path_c_tilelang_qk_reduce_status": {
+            "available": bool(qk_reduce_status.available),
+            "reason": qk_reduce_status.reason,
+            "target": qk_reduce_status.target,
+            "n": qk_reduce_status.n,
+            "k": qk_reduce_status.k,
+            "outputs_per_block": qk_reduce_status.outputs_per_block,
+            "reduce_threads": qk_reduce_status.reduce_threads,
+            "vec": qk_reduce_status.vec,
+            "features": qk_reduce_status.features,
+        },
         "parity": {
             "fp8_vs_bf16": _max_abs_err(fp8_ref_out, bf16_ref_out),
             "quantized_matmul_vs_bf16": _max_abs_err(qm_out, bf16_ref_out),
             "msl_fp8_vs_bf16": _max_abs_err(msl_fp8_out, bf16_ref_out),
             "msl_fp8_vs_fp8_ref": _max_abs_err(msl_fp8_out, fp8_ref_out),
+            "path_c_qk_reduce_vs_oracle": (
+                _max_abs_err(qk_reduce_out, qk_reduce_oracle)
+                if qk_reduce_out is not None
+                else {"available": False, "reason": qk_reduce_status.reason}
+            ),
         },
         "bench": {
             "bf16_reference": bf16_bench,
             "fp8_reference": fp8_bench,
             "quantized_matmul_reference": qm_bench,
             "path_b_msl_fp8_fwd": fp8_msl_bench,
+            "path_c_tilelang_fp8_qk_reduce": qk_reduce_bench,
         },
     }
 
@@ -275,6 +377,18 @@ def main() -> None:
             "dispatch_reason": bs_status_with_arrays.reason,
             "codegen_blocker_reason": bs_status_codegen.reason,
             "block_size": bs_status_with_arrays.block_size,
+        },
+        "path_c_tilelang_e8m0_qk_status": {
+            "available": bool(bs_path_c_qk_status.available),
+            "reason": bs_path_c_qk_status.reason,
+            "target": bs_path_c_qk_status.target,
+            "m": bs_path_c_qk_status.m,
+            "n": bs_path_c_qk_status.n,
+            "k": bs_path_c_qk_status.k,
+            "transpose_B": bs_path_c_qk_status.transpose_B,
+            "scale_block_size": bs_path_c_qk_status.scale_block_size,
+            "scale_layout": bs_path_c_qk_status.scale_layout,
+            "features": bs_path_c_qk_status.features,
         },
         "parity": {
             "blockscaled_vs_bf16": _max_abs_err(bs_ref_out, bf16_ref_out),
@@ -301,12 +415,27 @@ def main() -> None:
     print(f"  quantized_matmul_ref  median={qm_bench['median_ms']:.4f} ms")
     print(f"  path_b_msl_fp8_fwd    median={fp8_msl_bench['median_ms']:.4f} ms (Path B direct-MSL)")
     print(f"  path_c_tilelang_qk    available={fp8_path_c_qk_status.available} ({fp8_path_c_qk_status.reason})")
+    if qk_reduce_out is not None:
+        print(
+            "  path_c_tilelang_fp8_qk_reduce "
+            f"median={qk_reduce_bench['median_ms']:.4f} ms "
+            f"(TileLang real QK tile, N={args.topk}, K={args.qk_dim})"
+        )
+    else:
+        print(f"  path_c_tilelang_fp8_qk_reduce unavailable ({qk_reduce_status.reason})")
     print(f"  fp8 vs bf16 max_abs_err={fp8_payload['parity']['fp8_vs_bf16']['max_abs_err']:.4e}")
     print(f"  msl_fp8 vs bf16 max_abs_err={fp8_payload['parity']['msl_fp8_vs_bf16']['max_abs_err']:.4e}")
+    if qk_reduce_out is not None:
+        qk_parity = fp8_payload["parity"]["path_c_qk_reduce_vs_oracle"]
+        print(f"  path_c_qk_reduce vs oracle max_abs_err={qk_parity['max_abs_err']:.4e}")
 
     print(f"[bench] {bs_path}")
     print(f"  blockscaled_reference median={bs_bench['median_ms']:.4f} ms")
     print(f"  path_b_msl_blockscaled_fwd median={bs_msl_bench['median_ms']:.4f} ms (Path B direct-MSL)")
+    print(
+        "  path_c_tilelang_e8m0_qk "
+        f"available={bs_path_c_qk_status.available} ({bs_path_c_qk_status.reason})"
+    )
     print(f"  blockscaled vs bf16 max_abs_err={bs_payload['parity']['blockscaled_vs_bf16']['max_abs_err']:.4e}")
     print(f"  msl_bs vs bf16 max_abs_err={bs_payload['parity']['msl_blockscaled_vs_bf16']['max_abs_err']:.4e}")
 

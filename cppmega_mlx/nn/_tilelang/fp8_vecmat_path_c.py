@@ -6,9 +6,9 @@ It is intentionally scoped to the inference shape that matters for this lane:
 ``M == 1``, ``B`` already transposed as ``(N, K)``, and e4m3 storage.
 
 The current TileLang Metal lowering can express the correct thread-level GEMV
-shape with ``tvm_thread_allreduce`` across K, but it still scalar-decodes FP8
-bytes in generated MSL. Path B remains faster because it emits packed uint32
-global loads plus a literal ``simd_sum`` reduction.
+shape with ``tvm_thread_allreduce`` across K and now lowers the single-warp
+sum to literal Metal ``simd_sum``. Path B remains faster because it emits
+packed uint32 global loads instead of scalar FP8 byte decodes in the hot loop.
 """
 
 from __future__ import annotations
@@ -246,22 +246,49 @@ def fp8_vecmat_msl_features(msl: str) -> dict[str, int]:
     """Return feature counters used by tests and bench receipts."""
 
     lowered = msl.lower()
+    scalar_decode_sites = msl.count("__tvm_fp8_e4m3_to_half(")
     return {
         "kernel_void": msl.count("kernel void"),
         "fp8_e4m3_decode_helper": msl.count("__tvm_fp8_e4m3_to_half"),
         "tvm_thread_allreduce": msl.count("tvm_thread_allreduce"),
+        "simd_shuffle_down": msl.count("simd_shuffle_down"),
         "simd_sum": msl.count("simd_sum"),
         "reinterpret_cast": msl.count("reinterpret_cast"),
         "device_const_uint": msl.count("device const uint"),
         "uint_pointer": msl.count("uint*"),
         "uchar4": lowered.count("uchar4"),
-        "scalar_fp8_byte_decode": msl.count("__tvm_fp8_e4m3_to_half("),
+        "scalar_fp8_byte_decode": scalar_decode_sites,
+        "scalar_fp8_byte_decode_calls": max(0, scalar_decode_sites - 1),
+    }
+
+
+def fp8_vecmat_msl_blockers(msl: str) -> dict[str, Any]:
+    """Summarize why the generated Path C MSL still misses Path B's fast path."""
+
+    features = fp8_vecmat_msl_features(msl)
+    missing: list[str] = []
+    if features["reinterpret_cast"] == 0 or features["device_const_uint"] == 0:
+        missing.append("packed_uint32_fp8_loads")
+    if features["simd_sum"] == 0:
+        missing.append("metal_simd_sum_reduction")
+    if features["scalar_fp8_byte_decode_calls"] > 0:
+        missing.append("lut_or_packed_decode_instead_of_scalar_fp8_helper_calls")
+    return {
+        "path_b_fast_path_ready": not missing,
+        "missing": missing,
+        "generated_features": features,
+        "required_fast_path": {
+            "packed_uint32_fp8_loads": "reinterpret_cast<device const uint*> loads for 4 FP8 bytes",
+            "metal_simd_sum_reduction": "literal Metal simd_sum(sum) reduction",
+            "no_scalar_fp8_helper_calls": "avoid per-byte __tvm_fp8_e4m3_to_half calls in the hot loop",
+        },
     }
 
 
 __all__ = [
     "FP8VecmatPathCStatus",
     "TILELANG_METAL_VECMAT_TARGET",
+    "fp8_vecmat_msl_blockers",
     "fp8_vecmat_msl_features",
     "fp8_vecmat_path_c_status",
     "lower_fp8_vecmat_msl",

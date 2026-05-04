@@ -413,6 +413,7 @@ def test_path_c_forward_bf16_parity(cfg) -> None:
     status = sparse_mla_path_c_status()
     if not status.available:
         pytest.skip(status.reason)
+    assert status.fp16_carrier is True
 
     rng = np.random.default_rng(19)
     B, S, H, D = cfg["B"], cfg["S"], cfg["H"], cfg["D"]
@@ -432,22 +433,29 @@ def test_path_c_forward_bf16_parity(cfg) -> None:
     out_path_c, lse_path_c = result
     mx.eval(out_path_c, lse_path_c)
 
-    out_ref, lse_ref = sparse_mla_attention_reference(
-        q, kv, indices, d_v=d_v, return_lse=True
-    )
-    mx.eval(out_ref, lse_ref)
+    result_b = sparse_mla_fwd_metal(q, kv, indices, d_v=d_v)
+    assert result_b is not None, "Path B forward kernel must dispatch for Path C parity"
+    out_path_b, lse_path_b = result_b
+    out_ref, _lse_ref = sparse_mla_attention_reference(q, kv, indices, d_v=d_v, return_lse=True)
+    mx.eval(out_path_b, lse_path_b, out_ref)
 
-    assert out_path_c.dtype == mx.bfloat16
+    assert out_path_c.dtype == mx.float16
     assert lse_path_c.dtype == mx.float32
     np.testing.assert_allclose(
         np.array(out_path_c.astype(mx.float32)),
+        np.array(out_path_b.astype(mx.float32)),
+        rtol=1e-3,
+        atol=2e-3,
+    )
+    np.testing.assert_allclose(
+        np.array(out_path_c.astype(mx.float32)),
         np.array(out_ref.astype(mx.float32)),
-        rtol=2e-3,
-        atol=3e-3,
+        rtol=5e-3,
+        atol=8e-3,
     )
     np.testing.assert_allclose(
         np.array(lse_path_c).astype(np.float32),
-        np.array(lse_ref).astype(np.float32),
+        np.array(lse_path_b).astype(np.float32),
         rtol=2e-3,
         atol=3e-3,
     )
@@ -475,6 +483,7 @@ def test_path_c_forward_bf16_invalid_indices_zero_output() -> None:
     mx.eval(out, lse)
     out_np = np.array(out.astype(mx.float32))
     lse_np = np.array(lse)
+    assert out.dtype == mx.float16
     assert not np.isnan(out_np).any()
     assert not np.isnan(lse_np).any()
     np.testing.assert_array_equal(out_np[0, 0, 0], np.zeros(D, dtype=np.float32))
@@ -564,17 +573,18 @@ def test_path_c_backward_parity(cfg) -> None:
     dq_ref, dkv_ref = mx.grad(loss, argnums=(0, 1))(q, kv)
     mx.eval(dq_ref, dkv_ref)
 
+    # Path C backward now mirrors Path B's fp16 carrier/partial contract.
     np.testing.assert_allclose(
         np.array(dq_path_c).astype(np.float32),
         np.array(dq_ref).astype(np.float32),
-        rtol=1e-4,
-        atol=1e-4,
+        rtol=5e-3,
+        atol=5e-3,
     )
     np.testing.assert_allclose(
         np.array(dkv_path_c).astype(np.float32),
         np.array(dkv_ref).astype(np.float32),
-        rtol=1e-4,
-        atol=1e-4,
+        rtol=5e-3,
+        atol=5e-3,
     )
 
 
@@ -595,6 +605,10 @@ def test_path_c_backward_lowered_msl_uses_threadgroup_reductions() -> None:
     lowered = msl.lower()
     assert "kernel void" in msl
     assert "thread_position_in_threadgroup" in msl
+    assert "device const half* q" in msl
+    assert "device const half* kv" in msl
+    assert "device half* dkv_partial" in msl
+    assert "device half* dq" in msl
     assert "threadgroup float" in lowered
     assert "threadgroup_barrier" in lowered
     assert "atomic_" not in lowered
@@ -617,8 +631,13 @@ def test_path_c_forward_lowered_msl_uses_threadgroup_reductions() -> None:
     lowered = msl.lower()
     assert "kernel void" in msl
     assert "thread_position_in_threadgroup" in msl
+    assert "device const half* q" in msl
+    assert "device const half* kv" in msl
+    assert "device half* out" in msl
+    assert "device float* lse" in msl
     assert "threadgroup float" in lowered
     assert "threadgroup_barrier" in lowered
+    assert "gather_idx[0] < 16" not in lowered
     assert "t.tvm_mma_sync" not in lowered
 
 

@@ -38,9 +38,14 @@ from cppmega_mlx.nn._tilelang.sparse_mla_fp8 import (  # noqa: E402
     sparse_mla_quantized_matmul_reference,
 )
 from cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c import (  # noqa: E402
+    SparseMLAFp8QKReducePathCStatus,
     SparseMLAFp8PathCStatus,
+    fp8_sparse_mla_qk_reduce_msl_features,
+    fp8_sparse_mla_qk_reduce_path_c,
+    fp8_sparse_mla_qk_reduce_path_c_status,
     fp8_sparse_mla_qk_msl_features,
     fp8_sparse_mla_qk_path_c_status,
+    lower_fp8_sparse_mla_qk_reduce_msl,
     lower_fp8_sparse_mla_qk_msl,
 )
 from cppmega_mlx.nn.sparse_mla import sparse_mla_attention_reference  # noqa: E402
@@ -163,6 +168,60 @@ def test_fp8_sparse_mla_path_c_lowered_features_are_reported() -> None:
     assert features["simdgroup_multiply_accumulate"] >= 1
     assert features["A_scale_refs"] >= 1
     assert features["B_scale_refs"] >= 1
+
+
+def test_fp8_sparse_mla_path_c_qk_reduce_status_reports_available() -> None:
+    status = fp8_sparse_mla_qk_reduce_path_c_status(N=16, K=64)
+    assert isinstance(status, SparseMLAFp8QKReducePathCStatus)
+    assert status.n == 16
+    assert status.k == 64
+    if mx.metal.is_available():
+        assert status.available is True
+        assert status.features["signature_has_A_scale"] is True
+        assert status.features["signature_has_B_scale"] is True
+        assert status.features["A_scale_refs"] >= 1
+        assert status.features["B_scale_refs"] >= 1
+    else:
+        assert status.available is False
+
+
+def test_fp8_sparse_mla_path_c_qk_reduce_lowered_features_are_reported() -> None:
+    msl = lower_fp8_sparse_mla_qk_reduce_msl(N=16, K=64)
+    features = fp8_sparse_mla_qk_reduce_msl_features(msl)
+    assert features["kernel_void"] >= 1
+    assert features["fp8_e4m3_decode_helper"] >= 1
+    assert features["signature_has_A_scale"] is True
+    assert features["signature_has_B_scale"] is True
+    assert features["A_scale_refs"] >= 1
+    assert features["B_scale_refs"] >= 1
+    assert features["per_row_B_scale"] is True
+
+
+def test_fp8_sparse_mla_path_c_qk_reduce_matches_dequant_oracle() -> None:
+    q, kv, _indices, _d_v = _make_inputs(seq_len=16, heads=2, qk_dim=64, topk=16, scale=0.1)
+    q_fp8, q_scale = _to_fp8_with_per_tensor_scale(q)
+    kv_fp8, kv_scale = _to_fp8_with_per_tensor_scale(kv)
+    mx.eval(q_fp8, q_scale, kv_fp8, kv_scale)
+
+    A_fp8 = q_fp8[0, 0, 0, :].reshape((1, 64))
+    A_scale = q_scale[0, 0, 0].reshape((1,))
+    B_fp8 = kv_fp8[0, :16, 0, :]
+    B_scale = kv_scale[0, :16, 0]
+    out = fp8_sparse_mla_qk_reduce_path_c(A_fp8, A_scale, B_fp8, B_scale)
+    assert out is not None
+
+    oracle = mx.matmul(
+        mx.from_fp8(A_fp8, dtype=mx.float32),
+        mx.swapaxes(mx.from_fp8(B_fp8, dtype=mx.float32), 0, 1),
+    )
+    oracle = oracle * A_scale.reshape((1, 1)).astype(mx.float32) * B_scale.reshape((1, 16)).astype(mx.float32)
+    mx.eval(out, oracle)
+    np.testing.assert_allclose(
+        np.asarray(out).astype(np.float32),
+        np.asarray(oracle).astype(np.float32),
+        rtol=1e-5,
+        atol=1e-5,
+    )
 
 
 def test_fp8_fwd_metal_returns_outputs() -> None:

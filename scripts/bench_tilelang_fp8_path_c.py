@@ -48,6 +48,7 @@ from cppmega_mlx.nn._tilelang.fp8_msl_kernels import (  # noqa: E402
 )
 from cppmega_mlx.nn._tilelang.fp8_vecmat_path_c import (  # noqa: E402
     TILELANG_METAL_VECMAT_TARGET,
+    fp8_vecmat_msl_blockers,
     make_fp8_vecmat_reduce_kernel,
 )
 
@@ -558,6 +559,7 @@ def _bench_path_c_vecmat_reduce(
         prim = make_fp8_vecmat_reduce_kernel(N=N, K=K)
         src = _lower_source(prim, target=TILELANG_METAL_VECMAT_TARGET)
         result["source_metrics"] = _source_metrics(src)
+        result["path_c_blockers"] = fp8_vecmat_msl_blockers(src)
         result["xcrun_compile"] = (
             {"skipped": True, "reason": "--skip-xcrun"}
             if skip_xcrun
@@ -755,6 +757,9 @@ def _print_summary(payload: dict[str, Any]) -> None:
                     f"allreduce={metrics['tvm_thread_allreduce']} "
                     f"scalar_a={metrics['scalar_float_a_val']}"
                 )
+            blockers = item.get("path_c_blockers")
+            if blockers and not blockers.get("path_b_fast_path_ready", False):
+                print(f"    path-c blockers: {', '.join(blockers.get('missing', []))}")
         for ratio_name, value in row.get("ratios", {}).items():
             print(f"  ratio {ratio_name}={value:.3f}x")
     sparse = payload.get("sparse_mla")
