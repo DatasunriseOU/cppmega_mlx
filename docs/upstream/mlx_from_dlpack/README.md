@@ -41,11 +41,33 @@ Adds a top-level mx.from_dlpack(obj) that consumes either:
 
 Dispatch is by DLDevice.device_type:
 
-| device_type  | behavior                                                                                                                                                                                                                               |
-| ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| kDLCPU (1)   | Copy into a fresh MLX allocation; run producer's deleter immediately after copy                                                                                                                                                        |
-| kDLMetal (8) | Wrap the foreign MTLBuffer as an mx.array via array(allocator::Buffer, Shape, Dtype, Deleter) — the constructor MLX already exposes. Storage mode validated to be MTLResourceStorageModeShared; non-Shared rejected with a clear error |
-| Any other    | Rejected explicitly (kDLCUDA, kDLROCM, etc.)                                                                                                                                                                                           |
+<table>
+  <thead>
+    <tr>
+      <th>device_type</th>
+      <th>behavior</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>kDLCPU (1)</td>
+      <td>Copy into a fresh MLX allocation; run producer's deleter<br>
+      immediately after copy</td>
+    </tr>
+    <tr>
+      <td>kDLMetal (8)</td>
+      <td>Wrap the foreign MTLBuffer as an mx.array via<br>
+      array(allocator::Buffer, Shape, Dtype, Deleter) — the<br>
+      constructor MLX already exposes. Storage mode validated to<br>
+      be MTLResourceStorageModeShared; non-Shared rejected with a<br>
+      clear error</td>
+    </tr>
+    <tr>
+      <td>Any other</td>
+      <td>Rejected explicitly (kDLCUDA, kDLROCM, etc.)</td>
+    </tr>
+  </tbody>
+</table>
 
 Used capsules are detected and rejected on second consume. Non-contiguous strided views are rejected with a clear error.
 

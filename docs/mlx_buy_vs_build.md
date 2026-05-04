@@ -30,43 +30,291 @@ The headline finding is that we should **vendor first, fork second, write Metal 
 
 Verdict legend: **VENDOR** = drop in unchanged (pin SHA), **FORK** = vendor + patch, **PORT-FUSED** = write fresh MLX with mx.fast + mx.compile rather than mirroring torch tensor-by-tensor, **WRITE-METAL** = custom Metal kernel after profiling justifies it, **SKIP** = not in scope.
 
-| #   | Feature                                       | MLX-native source                                                                                                                                                                                                                                                        | Decision                                                                                     | Effort    |
-| --- | --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------- | --------- |
-| A   | engram (per-block n-gram + gate)              | nanochat torch ref only                                                                                                                                                                                                                                                  | **PORT-FUSED** (1× mx.compile per block)                                                     | M         |
-| B   | mhc (Sinkhorn manifold mixer)                 | nanochat torch ref + tokenbender/mHC... PyTorch                                                                                                                                                                                                                          | **PORT-FUSED** (compile 20-iter Sinkhorn loop)                                               | M         |
-| C   | ngram_hash (additive)                         | already in cppmega_mlx/nn/ngram_hash.py                                                                                                                                                                                                                                  | **DONE**                                                                                     | —         |
-| D   | MTP K=2 head (FastMTP)                        | nanochat mtp.py + cppmega fastmtp_layer.py (β=0.6 / λ=0.3)                                                                                                                                                                                                               | **PORT-FUSED** with shared-weight aliasing                                                   | L         |
-| E   | FIM PSM/SPM transform                         | nanochat fim.py (CPU only)                                                                                                                                                                                                                                               | **PORT-FUSED** (cpu)                                                                         | S         |
-| F   | iFIM instruction-aware                        | nanochat experiments/sota_impl/ifim/ifim.py (CPU only)                                                                                                                                                                                                                   | **PORT-FUSED** (cpu)                                                                         | S         |
-| G   | STP JEPA geodesic loss                        | nanochat stp.py (~100 LOC)                                                                                                                                                                                                                                               | **PORT-FUSED**                                                                               | S         |
-| H   | MLA                                           | **mlx-lm models/deepseek_v3.py + mla.py**                                                                                                                                                                                                                                | **VENDOR**                                                                                   | M         |
-| I   | DSA (sparse top-k indexer)                    | **mlx-lm models/deepseek_v32.py + glm_moe_dsa.py** (~80 % cov)                                                                                                                                                                                                           | **VENDOR** then **WRITE-METAL** if profile justifies                                         | L         |
-| J   | Mamba3 block                                  | mlx-lm models/mamba2.py + ssm.py (Metal kernel for single-token decode) — Mamba3 trapezoidal/complex/MIMO is the patch                                                                                                                                                   | **PORT-FUSED** on top of mamba2 base                                                         | L         |
-| K   | M2RNN mixer                                   | already partial in cppmega_mlx/nn/m2rnn.py; mlx-xLSTM as cross-reference                                                                                                                                                                                                 | **PORT-FUSED**                                                                               | M         |
-| L   | MoE with EP (single-host)                     | **mlx-lm models/switch_layers.py** (SwitchGLU, QuantizedSwitchLinear); ZMLX gather_qmm_swiglu for quantized                                                                                                                                                              | **VENDOR** + optional **FORK** ZMLX                                                          | M         |
-| M   | Structure embeddings (5-channel)              | already in cppmega_mlx/nn/structure_embedding.py                                                                                                                                                                                                                         | **DONE**                                                                                     | —         |
-| N   | RoPE NTK / YaRN / Llama3 piecewise            | **mlx-lm models/rope_utils.py** (initialize_rope)                                                                                                                                                                                                                        | **VENDOR**                                                                                   | S         |
-| O   | Sliding-window + sinks                        | **mlx-lm models/gpt_oss.py** (uses mx.fast.scaled_dot_product_attention(sinks=...))                                                                                                                                                                                      | **VENDOR**                                                                                   | S         |
-| P   | Paged KV cache                                | **vllm-mlx vllm_mlx/paged_cache.py + prefix_cache.py** (Apache-2.0, vendorable)                                                                                                                                                                                          | **VENDOR** (inference only)                                                                  | S–M       |
-| Q   | KV-cache quantization                         | **mlx-lm QuantizedKVCache** + **arozanov/turboquant-mlx** Metal kernels                                                                                                                                                                                                  | **VENDOR**                                                                                   | S         |
-| R   | Sequence packing (cumulative doc-id mask)     | **scasella/nanochat-mlx dataloader.py** + write doc-id mask ourselves                                                                                                                                                                                                    | **VENDOR** packer + **PORT-FUSED** mask                                                      | S–M       |
-| S   | Megatron .bin/.idx ingress                    | already in cppmega_mlx/data/megatron_indexed.py                                                                                                                                                                                                                          | **DONE** (verify multi-shard)                                                                | —         |
-| T   | AdamW with fp32 master moments                | mlx.optimizers.AdamW (built-in)                                                                                                                                                                                                                                          | **VENDOR**                                                                                   | S         |
-| U   | Lion optimizer                                | mlx.optimizers.Lion (built-in) + scasella optim.py Muon+AdamW MultiOptimizer                                                                                                                                                                                             | **VENDOR**                                                                                   | S         |
-| V   | LoRA / DoRA / QLoRA / full FT                 | **mlx-lm tuner/** complete                                                                                                                                                                                                                                               | **VENDOR**                                                                                   | S         |
-| W   | q4 affine inference quantization              | **mlx-lm mlx_lm/quant/{awq,dwq,gptq,dynamic_quant}.py** with Metal kernels                                                                                                                                                                                               | **VENDOR** (DWQ is the production path per Awni)                                             | S         |
-| X   | Tied / sharded embeddings                     | mlx core + Embedding.as_linear() (single-host); mlx.nn.distributed for sharded TP                                                                                                                                                                                        | **VENDOR** single-host; **PATTERN-ONLY** sharded                                             | S         |
-| Y   | Distributed (DP / TP / ZeRO-1)                | mlx core mx.distributed + JACCL/ring; per-model shard() patterns in mlx-lm                                                                                                                                                                                               | **VENDOR** mlx core; **PATTERN-ONLY** ZeRO-1                                                 | M–L       |
-| Z   | Speculative decoding                          | **mlx-lm speculative_generate_step** (vanilla, greedy-match, NOT Leviathan)                                                                                                                                                                                              | **FORK** mlx-lm to add Leviathan rejection step + **PORT-FUSED** MTP self-spec via D         | S / M / L |
-| AA  | BPE tokenizer with FIM/iFIM tokens            | **CLOSED for M0.1:** deployed GB10/local artifact contract is vocab=65536 with id 7=<CODE_START>, id 45=<FIM_INSTRUCTION>, id 46=<SPACE>, and id 47=<NL>; tokenizer.json legacy 32K is not used; MLX/CUDA wrappers use explicit whitespace-sentinel encode/decode parity | **VENDORED**; future tokenizer work is iFIM/AST-FIM feature integration, not an M0.1 blocker | S         |
-| BB  | Linear + CE fusion (Liger-equivalent)         | Scoped pure-MLX CCE train backend is available via `train_hybrid_tiny.py --loss-backend cce`; default/eval remain materialized CE until c08.2 full backward + memory acceptance lands                                                                                   | **DONE scoped opt-in**; Metal/manual-backward CCE remains a measured future optimization     | M         |
-| CC  | SwiGLU fused                                  | mlx core + mx.compile; **ZMLX swiglu_mlp** Metal kernel for decode                                                                                                                                                                                                       | **PORT-FUSED** + optional **VENDOR** ZMLX                                                    | S         |
-| DD  | Residual + RMSNorm                            | mx.fast.rms_norm + mx.compile                                                                                                                                                                                                                                            | **VENDOR** (mx.fast.rms_norm)                                                                | S         |
-| EE  | Sampling (top-k / top-p / temp / min-p / XTC) | **mlx-lm sample_utils.py**                                                                                                                                                                                                                                               | **VENDOR**                                                                                   | S         |
-| FF  | Prompt cache                                  | **mlx-lm LRUPromptCache + PromptTrie**                                                                                                                                                                                                                                   | **VENDOR**                                                                                   | S         |
-| GG  | Async checkpoint save                         | none in MLX; pattern: mx.eval(parameters) + ThreadPoolExecutor worker                                                                                                                                                                                                    | **PORT-FUSED** (small wrapper)                                                               | S         |
-| HH  | Resumable training (RNG + cursor)             | already in cppmega_mlx/training/checkpoint.py (saves cursor + grad-accum + RNG)                                                                                                                                                                                          | **DONE** (verify)                                                                            | —         |
-| II  | Speculative spec sampling correctness         | mlx-lm uses greedy-match; mlx-community/speculative-decoding (Swift) is the only Leviathan-correct MLX impl                                                                                                                                                              | **FORK** mlx-lm to add Leviathan acceptance                                                  | M         |
+<table>
+  <thead>
+    <tr>
+      <th>#</th>
+      <th>Feature</th>
+      <th>MLX-native source</th>
+      <th>Decision</th>
+      <th>Effort</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>A</td>
+      <td>engram (per-block n-gram + gate)</td>
+      <td>nanochat torch ref only</td>
+      <td>**PORT-FUSED** (1× mx.compile per block)</td>
+      <td>M</td>
+    </tr>
+    <tr>
+      <td>B</td>
+      <td>mhc (Sinkhorn manifold mixer)</td>
+      <td>nanochat torch ref + tokenbender/mHC... PyTorch</td>
+      <td>**PORT-FUSED** (compile 20-iter Sinkhorn loop)</td>
+      <td>M</td>
+    </tr>
+    <tr>
+      <td>C</td>
+      <td>ngram_hash (additive)</td>
+      <td>already in cppmega_mlx/nn/ngram_hash.py</td>
+      <td>**DONE**</td>
+      <td>—</td>
+    </tr>
+    <tr>
+      <td>D</td>
+      <td>MTP K=2 head (FastMTP)</td>
+      <td>nanochat mtp.py + cppmega fastmtp_layer.py (β=0.6 / λ=0.3)</td>
+      <td>**PORT-FUSED** with shared-weight aliasing</td>
+      <td>L</td>
+    </tr>
+    <tr>
+      <td>E</td>
+      <td>FIM PSM/SPM transform</td>
+      <td>nanochat fim.py (CPU only)</td>
+      <td>**PORT-FUSED** (cpu)</td>
+      <td>S</td>
+    </tr>
+    <tr>
+      <td>F</td>
+      <td>iFIM instruction-aware</td>
+      <td>nanochat experiments/sota_impl/ifim/ifim.py (CPU only)</td>
+      <td>**PORT-FUSED** (cpu)</td>
+      <td>S</td>
+    </tr>
+    <tr>
+      <td>G</td>
+      <td>STP JEPA geodesic loss</td>
+      <td>nanochat stp.py (~100 LOC)</td>
+      <td>**PORT-FUSED**</td>
+      <td>S</td>
+    </tr>
+    <tr>
+      <td>H</td>
+      <td>MLA</td>
+      <td>**mlx-lm models/deepseek_v3.py + mla.py**</td>
+      <td>**VENDOR**</td>
+      <td>M</td>
+    </tr>
+    <tr>
+      <td>I</td>
+      <td>DSA (sparse top-k indexer)</td>
+      <td>**mlx-lm models/deepseek_v32.py + glm_moe_dsa.py** (~80 %<br>
+      cov)</td>
+      <td>**VENDOR** then **WRITE-METAL** if profile justifies</td>
+      <td>L</td>
+    </tr>
+    <tr>
+      <td>J</td>
+      <td>Mamba3 block</td>
+      <td>mlx-lm models/mamba2.py + ssm.py (Metal kernel for single-<br>
+      token decode) — Mamba3 trapezoidal/complex/MIMO is the patch</td>
+      <td>**PORT-FUSED** on top of mamba2 base</td>
+      <td>L</td>
+    </tr>
+    <tr>
+      <td>K</td>
+      <td>M2RNN mixer</td>
+      <td>already partial in cppmega_mlx/nn/m2rnn.py; mlx-xLSTM as<br>
+      cross-reference</td>
+      <td>**PORT-FUSED**</td>
+      <td>M</td>
+    </tr>
+    <tr>
+      <td>L</td>
+      <td>MoE with EP (single-host)</td>
+      <td>**mlx-lm models/switch_layers.py** (SwitchGLU,<br>
+      QuantizedSwitchLinear); ZMLX gather_qmm_swiglu for quantized</td>
+      <td>**VENDOR** + optional **FORK** ZMLX</td>
+      <td>M</td>
+    </tr>
+    <tr>
+      <td>M</td>
+      <td>Structure embeddings (5-channel)</td>
+      <td>already in cppmega_mlx/nn/structure_embedding.py</td>
+      <td>**DONE**</td>
+      <td>—</td>
+    </tr>
+    <tr>
+      <td>N</td>
+      <td>RoPE NTK / YaRN / Llama3 piecewise</td>
+      <td>**mlx-lm models/rope_utils.py** (initialize_rope)</td>
+      <td>**VENDOR**</td>
+      <td>S</td>
+    </tr>
+    <tr>
+      <td>O</td>
+      <td>Sliding-window + sinks</td>
+      <td>**mlx-lm models/gpt_oss.py** (uses<br>
+      mx.fast.scaled_dot_product_attention(sinks=...))</td>
+      <td>**VENDOR**</td>
+      <td>S</td>
+    </tr>
+    <tr>
+      <td>P</td>
+      <td>Paged KV cache</td>
+      <td>**vllm-mlx vllm_mlx/paged_cache.py + prefix_cache.py**<br>
+      (Apache-2.0, vendorable)</td>
+      <td>**VENDOR** (inference only)</td>
+      <td>S–M</td>
+    </tr>
+    <tr>
+      <td>Q</td>
+      <td>KV-cache quantization</td>
+      <td>**mlx-lm QuantizedKVCache** + **arozanov/turboquant-mlx**<br>
+      Metal kernels</td>
+      <td>**VENDOR**</td>
+      <td>S</td>
+    </tr>
+    <tr>
+      <td>R</td>
+      <td>Sequence packing (cumulative doc-id mask)</td>
+      <td>**scasella/nanochat-mlx dataloader.py** + write doc-id mask<br>
+      ourselves</td>
+      <td>**VENDOR** packer + **PORT-FUSED** mask</td>
+      <td>S–M</td>
+    </tr>
+    <tr>
+      <td>S</td>
+      <td>Megatron .bin/.idx ingress</td>
+      <td>already in cppmega_mlx/data/megatron_indexed.py</td>
+      <td>**DONE** (verify multi-shard)</td>
+      <td>—</td>
+    </tr>
+    <tr>
+      <td>T</td>
+      <td>AdamW with fp32 master moments</td>
+      <td>mlx.optimizers.AdamW (built-in)</td>
+      <td>**VENDOR**</td>
+      <td>S</td>
+    </tr>
+    <tr>
+      <td>U</td>
+      <td>Lion optimizer</td>
+      <td>mlx.optimizers.Lion (built-in) + scasella optim.py<br>
+      Muon+AdamW MultiOptimizer</td>
+      <td>**VENDOR**</td>
+      <td>S</td>
+    </tr>
+    <tr>
+      <td>V</td>
+      <td>LoRA / DoRA / QLoRA / full FT</td>
+      <td>**mlx-lm tuner/** complete</td>
+      <td>**VENDOR**</td>
+      <td>S</td>
+    </tr>
+    <tr>
+      <td>W</td>
+      <td>q4 affine inference quantization</td>
+      <td>**mlx-lm mlx_lm/quant/{awq,dwq,gptq,dynamic_quant}.py** with<br>
+      Metal kernels</td>
+      <td>**VENDOR** (DWQ is the production path per Awni)</td>
+      <td>S</td>
+    </tr>
+    <tr>
+      <td>X</td>
+      <td>Tied / sharded embeddings</td>
+      <td>mlx core + Embedding.as_linear() (single-host);<br>
+      mlx.nn.distributed for sharded TP</td>
+      <td>**VENDOR** single-host; **PATTERN-ONLY** sharded</td>
+      <td>S</td>
+    </tr>
+    <tr>
+      <td>Y</td>
+      <td>Distributed (DP / TP / ZeRO-1)</td>
+      <td>mlx core mx.distributed + JACCL/ring; per-model shard()<br>
+      patterns in mlx-lm</td>
+      <td>**VENDOR** mlx core; **PATTERN-ONLY** ZeRO-1</td>
+      <td>M–L</td>
+    </tr>
+    <tr>
+      <td>Z</td>
+      <td>Speculative decoding</td>
+      <td>**mlx-lm speculative_generate_step** (vanilla, greedy-match,<br>
+      NOT Leviathan)</td>
+      <td>**FORK** mlx-lm to add Leviathan rejection step + **PORT-<br>
+      FUSED** MTP self-spec via D</td>
+      <td>S / M / L</td>
+    </tr>
+    <tr>
+      <td>AA</td>
+      <td>BPE tokenizer with FIM/iFIM tokens</td>
+      <td>**CLOSED for M0.1:** deployed GB10/local artifact contract<br>
+      is vocab=65536 with id 7=<CODE_START>, id<br>
+      45=<FIM_INSTRUCTION>, id 46=<SPACE>, and id 47=<NL>;<br>
+      tokenizer.json legacy 32K is not used; MLX/CUDA wrappers use<br>
+      explicit whitespace-sentinel encode/decode parity</td>
+      <td>**VENDORED**; future tokenizer work is iFIM/AST-FIM feature<br>
+      integration, not an M0.1 blocker</td>
+      <td>S</td>
+    </tr>
+    <tr>
+      <td>BB</td>
+      <td>Linear + CE fusion (Liger-equivalent)</td>
+      <td>Scoped pure-MLX CCE train backend is available via<br>
+      train_hybrid_tiny.py --loss-backend cce; default/eval remain<br>
+      materialized CE until c08.2 full backward + memory<br>
+      acceptance lands</td>
+      <td>**DONE scoped opt-in**; Metal/manual-backward CCE remains a<br>
+      measured future optimization</td>
+      <td>M</td>
+    </tr>
+    <tr>
+      <td>CC</td>
+      <td>SwiGLU fused</td>
+      <td>mlx core + mx.compile; **ZMLX swiglu_mlp** Metal kernel for<br>
+      decode</td>
+      <td>**PORT-FUSED** + optional **VENDOR** ZMLX</td>
+      <td>S</td>
+    </tr>
+    <tr>
+      <td>DD</td>
+      <td>Residual + RMSNorm</td>
+      <td>mx.fast.rms_norm + mx.compile</td>
+      <td>**VENDOR** (mx.fast.rms_norm)</td>
+      <td>S</td>
+    </tr>
+    <tr>
+      <td>EE</td>
+      <td>Sampling (top-k / top-p / temp / min-p / XTC)</td>
+      <td>**mlx-lm sample_utils.py**</td>
+      <td>**VENDOR**</td>
+      <td>S</td>
+    </tr>
+    <tr>
+      <td>FF</td>
+      <td>Prompt cache</td>
+      <td>**mlx-lm LRUPromptCache + PromptTrie**</td>
+      <td>**VENDOR**</td>
+      <td>S</td>
+    </tr>
+    <tr>
+      <td>GG</td>
+      <td>Async checkpoint save</td>
+      <td>none in MLX; pattern: mx.eval(parameters) +<br>
+      ThreadPoolExecutor worker</td>
+      <td>**PORT-FUSED** (small wrapper)</td>
+      <td>S</td>
+    </tr>
+    <tr>
+      <td>HH</td>
+      <td>Resumable training (RNG + cursor)</td>
+      <td>already in cppmega_mlx/training/checkpoint.py (saves cursor<br>
+      + grad-accum + RNG)</td>
+      <td>**DONE** (verify)</td>
+      <td>—</td>
+    </tr>
+    <tr>
+      <td>II</td>
+      <td>Speculative spec sampling correctness</td>
+      <td>mlx-lm uses greedy-match; mlx-community/speculative-decoding<br>
+      (Swift) is the only Leviathan-correct MLX impl</td>
+      <td>**FORK** mlx-lm to add Leviathan acceptance</td>
+      <td>M</td>
+    </tr>
+  </tbody>
+</table>
 
 ---
 

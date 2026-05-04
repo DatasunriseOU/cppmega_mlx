@@ -14,12 +14,52 @@ tile-ai/tilelang main being merged first; until then it must be filed as
 a stacked PR on top of #2130. Every dependency is publicly visible at the
 listed branch URLs - none of them require a private fork.
 
-| Layer | PR    | Author      | Branch                                                                                            | What it lands                                                          |
-| ----- | ----- | ----------- | ------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
-| 1     | #1869 | oraluben    | https://github.com/oraluben/tilelang/tree/metal-gemm                                              | Initial Apple Metal GEMM lowering (simdgroup_matrix_multiply)          |
-| 2     | #2118 | cklxx       | https://github.com/cklxx/tilelang/tree/metal-gemm-scalar-fallback                                 | GemmMetalScalar scalar fallback path used by this patch                |
-| 3     | #2130 | jorgecurious| https://github.com/jorgecurious/tilelang/tree/metal-gemm-upstream-rebase                          | Upstream-rebase + simdgroup-store hardening; current direct base       |
-| 4     | this  | cppmega.mlx | this patch                                                                                        | Mixed-dtype T.gemm dispatcher + MetalFragmentToSimdgroup conservatism  |
+<table>
+  <thead>
+    <tr>
+      <th>Layer</th>
+      <th>PR</th>
+      <th>Author</th>
+      <th>Branch</th>
+      <th>What it lands</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>1</td>
+      <td>#1869</td>
+      <td>oraluben</td>
+      <td>https://github.com/oraluben/tilelang/tree/metal-gemm</td>
+      <td>Initial Apple Metal GEMM lowering<br>
+      (simdgroup_matrix_multiply)</td>
+    </tr>
+    <tr>
+      <td>2</td>
+      <td>#2118</td>
+      <td>cklxx</td>
+      <td>https://github.com/cklxx/tilelang/tree/metal-gemm-scalar-<br>
+      fallback</td>
+      <td>GemmMetalScalar scalar fallback path used by this patch</td>
+    </tr>
+    <tr>
+      <td>3</td>
+      <td>#2130</td>
+      <td>jorgecurious</td>
+      <td>https://github.com/jorgecurious/tilelang/tree/metal-gemm-<br>
+      upstream-rebase</td>
+      <td>Upstream-rebase + simdgroup-store hardening; current direct<br>
+      base</td>
+    </tr>
+    <tr>
+      <td>4</td>
+      <td>this</td>
+      <td>cppmega.mlx</td>
+      <td>this patch</td>
+      <td>Mixed-dtype T.gemm dispatcher + MetalFragmentToSimdgroup<br>
+      conservatism</td>
+    </tr>
+  </tbody>
+</table>
 
 When upstream main lands #1869 + #2118 + #2130, this patch becomes a
 direct PR against tile-ai/tilelang main. Until then, file it as a

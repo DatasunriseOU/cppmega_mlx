@@ -190,16 +190,16 @@ The hybrid mini config (1.2B params, calibrated quarter from 4.8B) at training t
    - **R blocks** (HybridBackend="m2rnn"): RMSNorm (A) → in-proj (A) → causal depthwise conv1d (A) → **M2RNN main scan (B)** → out projection (A) → residual. Reference fallback: <code>chunked_m2rnn_scan</code> via <code>CPPMEGA_KERNEL_PATH=ref</code>.
 3. **Final RMSNorm** → A.
 4. **lm_head projection** → A — mx.matmul.
-5. **Loss** → default **A/reference** — `nn.losses.cross_entropy`; opt-in **CCE** — `next_token_cut_cross_entropy` when the recipe passes `--loss-backend cce`.
+5. **Loss** → default **A/reference** — nn.losses.cross_entropy; opt-in **CCE** — next_token_cut_cross_entropy when the recipe passes --loss-backend cce.
 
 ### What this means for a typical training step (mini, B=4 T=2048):
 - **Path A** dominates raw FLOPs (every Linear, every RoPE, every RMSNorm, every attention QKV, every gather_mm).
 - **Path B** carries the sequence-dimension reductions (Mamba3 scan, sparse-MLA attention). Chunked CE is opt-in recipe behavior, not the default production loss.
-- **Path C** is hit by `topk_selector(..., backend="auto")` when that selector is used and the TileLang path is available. Sparse-MLA BF16 uses a per-shape fail-closed AUTO gate: checked green rows use Path C, unreceipted rows stay Path B. Mamba3 Path C remains a proof/override path.
+- **Path C** is hit by topk_selector(..., backend="auto") when that selector is used and the TileLang path is available. Sparse-MLA BF16 uses a per-shape fail-closed AUTO gate: checked green rows use Path C, unreceipted rows stay Path B. Mamba3 Path C remains a proof/override path.
 
 ## Override mechanism
 
-```bash
+bash
 # Default — Path B preferred, reference fallback if Metal kernel unavailable
 unset CPPMEGA_KERNEL_PATH
 
@@ -215,45 +215,178 @@ export CPPMEGA_KERNEL_PATH=path_c
 
 # topk_selector is selected by its explicit backend argument, not this env var:
 # topk_selector(scores, k) / backend="auto" prefers Path C, then Path B.
-```
+
 
 The dispatch decision is recorded in a process-wide ring buffer (last 256 records) accessible via cppmega_mlx.runtime.kernel_policy.get_dispatch_log(). The training profile snapshots this log at step boundaries and exposes it under ProfileMetrics.kernel_dispatch so the receipt JSON shows which kernels actually fired.
 
 ## Bench summary (M4 Max, FP32 unless noted)
 
-| Op                                       |             Path A |                   Path B |                  Path C | Δ B vs A | Δ C vs B |
-| ---------------------------------------- | -----------------: | -----------------------: | ----------------------: | -------: | -------: |
-| Mamba3 fwd+bwd (B=2 T=512 H=4 P=32 N=64) |  n/a (no SSM in A) |                 7.823 ms |                7.707 ms |      n/a |    -1.5% |
-| M2RNN fwd (B=2 T=512 H=4 K=64 V=16, fp16) |                — |   2.9 ms vs 46.9 ms ref |                     n/a |   16.1×  |        — |
-| M2RNN fwd+bwd (B=2 T=512 H=4 K=64 V=16, fp16) |             — |  12.9 ms vs 170.1 ms ref |                     n/a |   13.2×  |        — |
-| M2RNN fwd+bwd (B=2 T=2048 H=8 K=64 V=32, fp16) |            — |  132.5 ms vs 3441 ms ref |                     n/a |   26.0×  |        — |
-| topk_selector checked shapes             |                n/a |              paired Path B | paired Path C, C/B 0.510-0.880 | — | C no worse |
-| Sparse-MLA BF16 B2_S128_H8_D64           |                n/a |              Path B available | fwd C/B 0.973; paired fwd C/B 0.993; paired bwd C/B 0.913 | — | AUTO promotes C |
-| Sparse-MLA BF16 B4_S512_H8_D64           |                n/a |              Path B available | fwd C/B 1.048; paired fwd C/B 0.993; paired bwd C/B 0.975 | — | AUTO promotes C |
-| Sparse-MLA BF16 B4_S1024_H8_D64          |                n/a |              Path B available | fwd C/B 1.017; paired fwd C/B 0.994; paired bwd C/B 0.997 | — | AUTO promotes C |
-| Sparse-MLA FP8 indexed QK reduce         |                n/a |                 Path B fwd | Path C partial reducers C/B 0.864 and 0.696; full QK unavailable and full-dispatch gate red | — | partial only |
-| Sparse-MLA blockscaled e8m0 QK reduce    |                n/a |      Path B blockscaled fwd | Path C partial reducer C/B 0.4364; full QK unavailable and full-dispatch gate red | — | partial only |
-| FP8 matmul 128×128×128 e4m3              |                n/a |  0.172 ms / 0.024 TFLOPS | 0.555 ms / 0.008 TFLOPS |      n/a |   -3.16× |
-| FP8 vecmat M=1 N=K=4096                  |                n/a |  0.182 ms / 0.184 TFLOPS | 1.098 ms / 0.031 TFLOPS |      n/a |   -6.01× |
-| Cross-entropy chunked V=65536 fwd peak   |           baseline | -54.6% peak (bench only) |                     n/a |        — |        — |
-| Cross-entropy chunked V=65536 F+B peak   |           baseline | -26.9% peak (bench only; c08.2 not closed) |         n/a |        — |        — |
-| Regular SDPA                             |  shipped (fastest) |                        — |                       — |        — |        — |
-| RMSNorm                                  |  shipped (fastest) |                        — |                       — |        — |        — |
-| Dense GEMM                               | shipped (MPS BNNS) |                        — |                       — |        — |        — |
+<table>
+  <thead>
+    <tr>
+      <th>Op</th>
+      <th>Path A</th>
+      <th>Path B</th>
+      <th>Path C</th>
+      <th>Δ B vs A</th>
+      <th>Δ C vs B</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Mamba3 fwd+bwd (B=2 T=512 H=4 P=32 N=64)</td>
+      <td>n/a (no SSM in A)</td>
+      <td>7.823 ms</td>
+      <td>7.707 ms</td>
+      <td>n/a</td>
+      <td>-1.5%</td>
+    </tr>
+    <tr>
+      <td>M2RNN fwd (B=2 T=512 H=4 K=64 V=16, fp16)</td>
+      <td>—</td>
+      <td>2.9 ms vs 46.9 ms ref</td>
+      <td>n/a</td>
+      <td>16.1×</td>
+      <td>—</td>
+    </tr>
+    <tr>
+      <td>M2RNN fwd+bwd (B=2 T=512 H=4 K=64 V=16, fp16)</td>
+      <td>—</td>
+      <td>12.9 ms vs 170.1 ms ref</td>
+      <td>n/a</td>
+      <td>13.2×</td>
+      <td>—</td>
+    </tr>
+    <tr>
+      <td>M2RNN fwd+bwd (B=2 T=2048 H=8 K=64 V=32, fp16)</td>
+      <td>—</td>
+      <td>132.5 ms vs 3441 ms ref</td>
+      <td>n/a</td>
+      <td>26.0×</td>
+      <td>—</td>
+    </tr>
+    <tr>
+      <td>topk_selector checked shapes</td>
+      <td>n/a</td>
+      <td>paired Path B</td>
+      <td>paired Path C, C/B 0.510-0.880</td>
+      <td>—</td>
+      <td>C no worse</td>
+    </tr>
+    <tr>
+      <td>Sparse-MLA BF16 B2_S128_H8_D64</td>
+      <td>n/a</td>
+      <td>Path B available</td>
+      <td>fwd C/B 0.973; paired fwd C/B 0.993; paired bwd C/B 0.913</td>
+      <td>—</td>
+      <td>AUTO promotes C</td>
+    </tr>
+    <tr>
+      <td>Sparse-MLA BF16 B4_S512_H8_D64</td>
+      <td>n/a</td>
+      <td>Path B available</td>
+      <td>fwd C/B 1.048; paired fwd C/B 0.993; paired bwd C/B 0.975</td>
+      <td>—</td>
+      <td>AUTO promotes C</td>
+    </tr>
+    <tr>
+      <td>Sparse-MLA BF16 B4_S1024_H8_D64</td>
+      <td>n/a</td>
+      <td>Path B available</td>
+      <td>fwd C/B 1.017; paired fwd C/B 0.994; paired bwd C/B 0.997</td>
+      <td>—</td>
+      <td>AUTO promotes C</td>
+    </tr>
+    <tr>
+      <td>Sparse-MLA FP8 indexed QK reduce</td>
+      <td>n/a</td>
+      <td>Path B fwd</td>
+      <td>Path C partial reducers C/B 0.864 and 0.696; full QK<br>
+      unavailable and full-dispatch gate red</td>
+      <td>—</td>
+      <td>partial only</td>
+    </tr>
+    <tr>
+      <td>Sparse-MLA blockscaled e8m0 QK reduce</td>
+      <td>n/a</td>
+      <td>Path B blockscaled fwd</td>
+      <td>Path C partial reducer C/B 0.4364; full QK unavailable and<br>
+      full-dispatch gate red</td>
+      <td>—</td>
+      <td>partial only</td>
+    </tr>
+    <tr>
+      <td>FP8 matmul 128×128×128 e4m3</td>
+      <td>n/a</td>
+      <td>0.172 ms / 0.024 TFLOPS</td>
+      <td>0.555 ms / 0.008 TFLOPS</td>
+      <td>n/a</td>
+      <td>-3.16×</td>
+    </tr>
+    <tr>
+      <td>FP8 vecmat M=1 N=K=4096</td>
+      <td>n/a</td>
+      <td>0.182 ms / 0.184 TFLOPS</td>
+      <td>1.098 ms / 0.031 TFLOPS</td>
+      <td>n/a</td>
+      <td>-6.01×</td>
+    </tr>
+    <tr>
+      <td>Cross-entropy chunked V=65536 fwd peak</td>
+      <td>baseline</td>
+      <td>-54.6% peak (bench only)</td>
+      <td>n/a</td>
+      <td>—</td>
+      <td>—</td>
+    </tr>
+    <tr>
+      <td>Cross-entropy chunked V=65536 F+B peak</td>
+      <td>baseline</td>
+      <td>-26.9% peak (bench only; c08.2 not closed)</td>
+      <td>n/a</td>
+      <td>—</td>
+      <td>—</td>
+    </tr>
+    <tr>
+      <td>Regular SDPA</td>
+      <td>shipped (fastest)</td>
+      <td>—</td>
+      <td>—</td>
+      <td>—</td>
+      <td>—</td>
+    </tr>
+    <tr>
+      <td>RMSNorm</td>
+      <td>shipped (fastest)</td>
+      <td>—</td>
+      <td>—</td>
+      <td>—</td>
+      <td>—</td>
+    </tr>
+    <tr>
+      <td>Dense GEMM</td>
+      <td>shipped (MPS BNNS)</td>
+      <td>—</td>
+      <td>—</td>
+      <td>—</td>
+      <td>—</td>
+    </tr>
+  </tbody>
+</table>
 
 ## Honest limitations
 
 - **R (m2rnn) blocks now ship a Path B port** (cppmega_mlx/nn/_tilelang/m2rnn.py). Both forward and backward run as hand-written MSL via mx.fast.metal_kernel; the chunked-scan reference remains as the parity oracle and is reachable via CPPMEGA_KERNEL_PATH=ref. The kernel uses one threadgroup per (batch, head) with K_DIM threads per group; W is loaded into threadgroup memory once per (B, H). The fp16 carrier dodges the bf16 simdgroup MSL codegen bugs that Mamba3 also worked around.
-- **Path C is narrow, not global.** It is the default for `topk_selector` where the checked-in receipt proves C no worse than B. Sparse-MLA BF16 uses a per-shape fail-closed AUTO gate backed by `bench/tilelang_ports/sparse_mla.json`: green checked rows promote, unreceipted rows stay Path B. Mamba3 Path C remains a proof/override path.
+- **Path C is narrow, not global.** It is the default for topk_selector where the checked-in receipt proves C no worse than B. Sparse-MLA BF16 uses a per-shape fail-closed AUTO gate backed by bench/tilelang_ports/sparse_mla.json: green checked rows promote, unreceipted rows stay Path B. Mamba3 Path C remains a proof/override path.
 - **FP8 paths are software emulation.** Apple Silicon (M1–M4) has no native FP8 ALU. The uchar storage + LUT decode + fp32 fma loop pattern (vendored from audiohacking/fp8-mps-metal Apache 2.0) is what we ship. Native FP8 is M5/M6 territory.
 - **TileLang DSL on Metal works for FP16/FP32 GEMM, Mamba3, topk_selector, and BF16 sparse-MLA today.** The stale 32×32 T.Pipelined blocker no longer describes the in-tree sparse BF16 port. Remaining Sparse-MLA gaps are FP8 scheduler composition, e8m0 full-layout coverage, and unreceipted BF16 shapes outside the checked routing table.
-- **CPPMEGA_KERNEL_PATH=path_c is not a complete global path.** It redirects env-policy ops that have Path C wiring, currently Mamba3 and sparse-MLA. `topk_selector` uses its explicit `backend` argument. Other ops without Path C support must stay on Path A/B or fail closed.
+- **CPPMEGA_KERNEL_PATH=path_c is not a complete global path.** It redirects env-policy ops that have Path C wiring, currently Mamba3 and sparse-MLA. topk_selector uses its explicit backend argument. Other ops without Path C support must stay on Path A/B or fail closed.
 
 ## Receipts
 
 The training receipt JSON (emitted by cppmega_mlx.training.profile) gains a kernel_dispatch field documenting which path each op took during the profiled step. Example:
 
-```json
+json
 {
   "kernel_dispatch": [
     {"op": "mamba3_mimo", "path": "auto", "kernel_used": "metal_kernel_fwd_v1"},
@@ -261,7 +394,7 @@ The training receipt JSON (emitted by cppmega_mlx.training.profile) gains a kern
     {"op": "cut_cross_entropy", "path": "opt_in_cce", "kernel_used": "next_token_cut_cross_entropy"}
   ]
 }
-```
+
 
 
 Use these receipts in CI to gate adoption decisions: a PR that flips a kernel from Path B to reference must show evidence in the dispatch log + parity within the documented atol/rtol.

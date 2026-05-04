@@ -11,8 +11,11 @@ import cppmega_mlx.inference as inference
 from cppmega_mlx.inference import (
     ContiguousKVCache,
     GenerationChunk,
+    PromptCacheEntry,
+    build_prompt_cache,
     generate_tokens,
     generate_tokens_with_kv_cache,
+    generate_tokens_with_prompt_cache,
     next_token_logits,
     stream_generate_tokens,
 )
@@ -81,6 +84,29 @@ class _KVScriptedLogitsModel(_ScriptedLogitsModel):
         assert kv_cache is not None
         self.seen_cache_ids.append(id(kv_cache))
         return super().__call__(tokens)
+
+
+class _UpdatingKVScriptedLogitsModel(_KVScriptedLogitsModel):
+    def __call__(
+        self,
+        tokens: mx.array,
+        *,
+        kv_cache: ContiguousKVCache | None = None,
+    ) -> mx.array:
+        assert kv_cache is not None
+        batch_size, sequence_length = tokens.shape
+        keys = mx.zeros(
+            (
+                batch_size,
+                kv_cache.config.num_kv_heads,
+                sequence_length,
+                kv_cache.config.head_dim,
+            ),
+            dtype=kv_cache.config.dtype or mx.float32,
+        )
+        for layer_idx in range(kv_cache.config.num_layers):
+            kv_cache.update_and_fetch(layer_idx, keys, keys)
+        return super().__call__(tokens, kv_cache=kv_cache)
 
 
 def _make_cache(
@@ -552,6 +578,116 @@ def test_generate_tokens_with_kv_cache_seeded_sampling_is_deterministic() -> Non
     assert len(set(right_model.seen_cache_ids)) == 1
 
 
+def test_build_prompt_cache_prefills_once_and_records_next_logits() -> None:
+    model = _UpdatingKVScriptedLogitsModel([[7], [8]])
+    prompt = mx.array([[1, 2, 3]], dtype=mx.int32)
+
+    prompt_cache = build_prompt_cache(
+        model,
+        prompt,
+        cache=_make_cache(),
+    )
+
+    assert isinstance(prompt_cache, PromptCacheEntry)
+    assert prompt_cache.cache.position() == 3
+    assert model.seen_shapes == [(1, 3)]
+    np.testing.assert_array_equal(
+        _as_numpy(prompt_cache.prompt_ids),
+        np.array([[1, 2, 3]], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(
+        _as_numpy(mx.argmax(prompt_cache.next_logits, axis=-1)),
+        np.array([7], dtype=np.uint32),
+    )
+
+
+def test_generate_tokens_with_prompt_cache_reuses_prefix_without_prefill_call() -> None:
+    model = _UpdatingKVScriptedLogitsModel([[4], [5], [6]])
+    prompt = mx.array([[1, 2, 3]], dtype=mx.int32)
+    prompt_cache = build_prompt_cache(
+        model,
+        prompt,
+        cache=_make_cache(),
+    )
+
+    tokens = generate_tokens_with_prompt_cache(
+        model,
+        prompt,
+        prompt_cache=prompt_cache,
+        max_new_tokens=3,
+        temperature=0.0,
+    )
+
+    np.testing.assert_array_equal(
+        _as_numpy(tokens),
+        np.array([[1, 2, 3, 4, 5, 6]], dtype=np.int32),
+    )
+    assert model.seen_shapes == [(1, 3), (1, 1), (1, 1)]
+    assert len(set(model.seen_cache_ids[1:])) == 1
+    assert model.seen_cache_ids[1] != model.seen_cache_ids[0]
+    assert prompt_cache.cache.position() == 3
+
+
+def test_generate_tokens_with_prompt_cache_decodes_suffix_before_new_tokens() -> None:
+    model = _UpdatingKVScriptedLogitsModel([[4], [9], [10]])
+    prefix = mx.array([[1, 2]], dtype=mx.int32)
+    prompt_cache = build_prompt_cache(
+        model,
+        prefix,
+        cache=_make_cache(),
+    )
+    extended_prompt = mx.array([[1, 2, 7, 8]], dtype=mx.int32)
+
+    tokens = generate_tokens_with_prompt_cache(
+        model,
+        extended_prompt,
+        prompt_cache=prompt_cache,
+        max_new_tokens=2,
+        temperature=0.0,
+    )
+
+    np.testing.assert_array_equal(
+        _as_numpy(tokens),
+        np.array([[1, 2, 7, 8, 9, 10]], dtype=np.int32),
+    )
+    assert model.seen_shapes == [(1, 2), (1, 2), (1, 1)]
+    assert prompt_cache.cache.position() == 2
+
+
+def test_generate_tokens_with_prompt_cache_rejects_non_matching_prefix() -> None:
+    model = _UpdatingKVScriptedLogitsModel([[4]])
+    prompt_cache = build_prompt_cache(
+        model,
+        mx.array([[1, 2]], dtype=mx.int32),
+        cache=_make_cache(),
+    )
+
+    with pytest.raises(ValueError, match="start with prompt_cache"):
+        generate_tokens_with_prompt_cache(
+            model,
+            mx.array([[1, 9]], dtype=mx.int32),
+            prompt_cache=prompt_cache,
+            max_new_tokens=1,
+        )
+
+
+def test_generate_tokens_with_prompt_cache_returns_prompt_for_zero_new_tokens() -> None:
+    model = _UpdatingKVScriptedLogitsModel([[4]])
+    prompt = mx.array([[1, 2]], dtype=mx.int32)
+    prompt_cache = build_prompt_cache(model, prompt, cache=_make_cache())
+    calls_after_build = model.calls
+
+    tokens = generate_tokens_with_prompt_cache(
+        model,
+        prompt,
+        prompt_cache=prompt_cache,
+        max_new_tokens=0,
+    )
+
+    assert tokens is prompt
+    assert model.calls == calls_after_build
+
+
 def test_real_hybrid_tiny_lm_greedy_kv_cache_matches_full_prefix_generation() -> None:
     model = _tiny_attention_lm()
     prompt = mx.array([[1, 2, 3]], dtype=mx.int32)
@@ -570,6 +706,40 @@ def test_real_hybrid_tiny_lm_greedy_kv_cache_matches_full_prefix_generation() ->
             head_dim=8,
             max_seq_len=8,
         ),
+        temperature=0.0,
+    )
+
+    np.testing.assert_array_equal(_as_numpy(cached), _as_numpy(full_prefix))
+
+
+def test_real_hybrid_tiny_lm_prompt_cache_matches_full_prefix_kv_generation() -> None:
+    model = _tiny_attention_lm()
+    prefix = mx.array([[1, 2, 3]], dtype=mx.int32)
+    prompt_cache = build_prompt_cache(
+        model,
+        prefix,
+        cache=_make_cache(
+            head_dim=8,
+            max_seq_len=8,
+        ),
+    )
+    extended_prompt = mx.array([[1, 2, 3, 4]], dtype=mx.int32)
+
+    full_prefix = generate_tokens_with_kv_cache(
+        model,
+        extended_prompt,
+        max_new_tokens=2,
+        cache=_make_cache(
+            head_dim=8,
+            max_seq_len=8,
+        ),
+        temperature=0.0,
+    )
+    cached = generate_tokens_with_prompt_cache(
+        model,
+        extended_prompt,
+        prompt_cache=prompt_cache,
+        max_new_tokens=2,
         temperature=0.0,
     )
 
@@ -803,6 +973,15 @@ def test_inference_root_exports_generate_tokens() -> None:
 def test_inference_root_exports_generate_tokens_with_kv_cache() -> None:
     assert inference.generate_tokens_with_kv_cache is generate_tokens_with_kv_cache
     assert "generate_tokens_with_kv_cache" in inference.__all__
+
+
+def test_inference_root_exports_prompt_cache_generation() -> None:
+    assert inference.PromptCacheEntry is PromptCacheEntry
+    assert inference.build_prompt_cache is build_prompt_cache
+    assert inference.generate_tokens_with_prompt_cache is generate_tokens_with_prompt_cache
+    assert "PromptCacheEntry" in inference.__all__
+    assert "build_prompt_cache" in inference.__all__
+    assert "generate_tokens_with_prompt_cache" in inference.__all__
 
 
 def test_inference_root_exports_next_token_logits() -> None:

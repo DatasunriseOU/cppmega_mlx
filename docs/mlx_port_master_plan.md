@@ -3,9 +3,9 @@
 **Date:** 2026-05-01
 **Scope:** Conservative MLX port planning for Apple Silicon; Mac-local MLX/Metal acceptance, not a production-parity or M4-vs-GB10 parity claim
 **Sibling repos audited:**
-- `/Volumes/external/sources/nanochat` (origin / "MegaCpp" fork, commit `4acb8af1`)
-- `/Volumes/external/sources/cppmega` (CUDA / Megatron-LM port, GB10 + H200 tuned)
-- `/Volumes/external/sources/cppmega.mlx` (this repo)
+- /Volumes/external/sources/nanochat (origin / "MegaCpp" fork, commit 4acb8af1)
+- /Volumes/external/sources/cppmega (CUDA / Megatron-LM port, GB10 + H200 tuned)
+- /Volumes/external/sources/cppmega.mlx (this repo)
 
 This document is a planning synthesis from parallel research lanes (local-code audits plus external research streams). It contains the executive review, architectural decisions, risk register, and a 200-step plan organized into 10 work-streams that can largely run in parallel. It is not a completion receipt.
 
@@ -18,40 +18,40 @@ This document is a planning synthesis from parallel research lanes (local-code a
 ### Where we actually are (cppmega.mlx today)
 
 **Current local implementations and guarded scaffolds**
-- Package layout (`cppmega_mlx/` with `config / data / kernels / models / nn / recipes / training`), public API boundaries enforced.
-- NAM56R route-pattern metadata (`AEMEAEMEAEMR`, depth 52, DSA ranks `(1,2,3,5,6,7,9,10,11)`, MLA ranks `(0,16,32,48)`), not full NAM56R readiness.
-- Causal self-attention via `mx.fast.scaled_dot_product_attention` with `nn.RoPE`, GQA-ready.
+- Package layout (cppmega_mlx/ with config / data / kernels / models / nn / recipes / training), public API boundaries enforced.
+- NAM56R route-pattern metadata (AEMEAEMEAEMR, depth 52, DSA ranks (1,2,3,5,6,7,9,10,11), MLA ranks (0,16,32,48)), not full NAM56R readiness.
+- Causal self-attention via mx.fast.scaled_dot_product_attention with nn.RoPE, GQA-ready.
 - Mamba3 reference block (depthwise conv + SSM + cache state).
 - M2RNN mixer (chunked / full RNN scans, RoPE projection in state).
-- MoE with top-k routing and selectable activation (`gelu / relu2 / swiglu`).
-- **NgramHashEmbedding** (multi-head hash n-gram, unified table, seeded primes, MLX `int64` ops) is implemented locally; source offload, PP/MTP checkpoint semantics, and full feature parity are not claimed.
+- MoE with top-k routing and selectable activation (gelu / relu2 / swiglu).
+- **NgramHashEmbedding** (multi-head hash n-gram, unified table, seeded primes, MLX int64 ops) is implemented locally; source offload, PP/MTP checkpoint semantics, and full feature parity are not claimed.
 - Structure side-channels (5-component embedding with selective masking).
-- Standalone fail-closed Megatron-indexed `.idx/.bin` reader seam + Parquet + NPZ datasets.
-- Training loop (eager + `mx.compile`-based `CompiledPretrainingStep`).
+- Standalone fail-closed Megatron-indexed .idx/.bin reader seam + Parquet + NPZ datasets.
+- Training loop (eager + mx.compile-based CompiledPretrainingStep).
 - Single-file safetensors checkpointing with metadata; distributed/sharded checkpoint metadata is not implemented.
-- Profiling harness (`profile_step` context, `HotspotEvidence`, JSON metrics).
+- Profiling harness (profile_step context, HotspotEvidence, JSON metrics).
 - 573 collected tests across 29 tracked test files, including parity anchors, kernel gates, training smoke, package-export contracts.
 
 **Scaffolded / placeholder**
 - DSA mode is dense causal (no sparse top-k indexer yet).
-- Metal kernel seam (`kernels/metal_ops.py`) holds optional research kernels with pure-MLX fallbacks; `TrainingKernelStatus.differentiable=False` by design.
-- Megatron `.idx` parser rejects ngram sidecar metadata (n-gram is derived in-model instead).
+- Metal kernel seam (kernels/metal_ops.py) holds optional research kernels with pure-MLX fallbacks; TrainingKernelStatus.differentiable=False by design.
+- Megatron .idx parser rejects ngram sidecar metadata (n-gram is derived in-model instead).
 
 **Missing / partial / not integrated (the real porting backlog)**
-- **Features**: FIM/iFIM have local fail-closed CPU token transforms only; `engram` and `mhc` have standalone MLX modules only; MTP has local M0.5 training-side coverage only; STP has a local opt-in deterministic helper plus TinyLM smoke coverage. These slices are not wired into NAM56R integration, do not prove CUDA/Megatron parity, and do not close Stream H.
-- **Distributed**: `mx.distributed` (ring / JACCL), multi-Mac ZeRO-style sharding.
-- **Sharded checkpoints** (`model.safetensors.index.json`).
+- **Features**: FIM/iFIM have local fail-closed CPU token transforms only; engram and mhc have standalone MLX modules only; MTP has local M0.5 training-side coverage only; STP has a local opt-in deterministic helper plus TinyLM smoke coverage. These slices are not wired into NAM56R integration, do not prove CUDA/Megatron parity, and do not close Stream H.
+- **Distributed**: mx.distributed (ring / JACCL), multi-Mac ZeRO-style sharding.
+- **Sharded checkpoints** (model.safetensors.index.json).
 - **Sequence packing** (cumulative-doc-id attention mask).
-- **Tokenizer**: M0.1 is closed. The vendored GB10 BPE artifact and special-token contract exist for vocab=65536 with id7=`<CODE_START>`, id45=`<FIM_INSTRUCTION>`, id46=`<SPACE>`, id47=`<NL>`. Encode normalizes whitespace runs (`[\r\n]+`->`<NL>`, `[ \t]+`->`<SPACE>`); decode is plain token concat with sentinel substitution. Same wrapper deployed on Mac and gb10/CUDA side.
+- **Tokenizer**: M0.1 is closed. The vendored GB10 BPE artifact and special-token contract exist for vocab=65536 with id7=<CODE_START>, id45=<FIM_INSTRUCTION>, id46=<SPACE>, id47=<NL>. Encode normalizes whitespace runs ([\r\n]+-><NL>, [ \t]+-><SPACE>); decode is plain token concat with sentinel substitution. Same wrapper deployed on Mac and gb10/CUDA side.
 - **Inference / generation**: temperature/top-k/top-p sampling, eager no-KV full-prefix generation, fail-closed standard MTP/draft-output guard, and prompt-only FIM/iFIM infilling construction exist locally; no KV cache class, paged scheduler, prompt cache, integrated FIM decode loop, speculative/self-spec decode, q4 path, or KV-q4 path.
-- **Quantization**: bf16 only; no `mx.quantize` integration, no q4 inference path.
-- **Structural parity anchors, not CUDA tensor parity**: existing `tests/test_cppmega_parity_anchors.py` checks NAM56R route/layer constants, DSA/MLA layer derivation, vocab/MoE anchors, fail-closed parity wording, and optional sibling cppmega source-anchor presence when that checkout exists. The source-file existence check is only one guard; the test is broader than file-presence coverage, but it still does not compare CUDA golden tensors or prove numerical agreement.
+- **Quantization**: bf16 only; no mx.quantize integration, no q4 inference path.
+- **Structural parity anchors, not CUDA tensor parity**: existing tests/test_cppmega_parity_anchors.py checks NAM56R route/layer constants, DSA/MLA layer derivation, vocab/MoE anchors, fail-closed parity wording, and optional sibling cppmega source-anchor presence when that checkout exists. The source-file existence check is only one guard; the test is broader than file-presence coverage, but it still does not compare CUDA golden tensors or prove numerical agreement.
 
 ### What ../cppmega (CUDA) gives us as a reference target, not MLX status
 
 A heavily-engineered Megatron-LM port:
-- 50+ unconditional / conditional Megatron patches (Linear+CE swap, MTP Liger fused CE, DSA fused indexer BMM, `torch.compile` on Mamba3 data-dependent-A, GB10 sm_121 SMEM preflight).
-- Custom CUDA: `cutlass_mxfp8_gemm`, `grouped_mxfp8_gemm`, `quantized_muon_momentum`. CUTLASS Block-Scaled MMA with E8M0 scales for GB10.
+- 50+ unconditional / conditional Megatron patches (Linear+CE swap, MTP Liger fused CE, DSA fused indexer BMM, torch.compile on Mamba3 data-dependent-A, GB10 sm_121 SMEM preflight).
+- Custom CUDA: cutlass_mxfp8_gemm, grouped_mxfp8_gemm, quantized_muon_momentum. CUTLASS Block-Scaled MMA with E8M0 scales for GB10.
 - TileLang sparse-MLA forward+backward (FP8), CuTe DSL Mamba3 MIMO.
 - CUDA/H200 reference receipts include BF16 289 TFLOP/s, 29.2% MFU on H200 PP=1 EP=4 MBS=8, and FP8 268 TFLOP/s on bench3 with Liger reduction-mean workaround. These are sibling-repo CUDA receipts, not cppmega.mlx throughput, FP8, GB10, or production-readiness evidence.
 - Features: **ngram_hash** done; **engram** exists as a standalone MLX per-block branch module but is not integrated into NAM56R; **mHC** config-only; **MTP** fused (Hopper CE + Liger); **FIM/iFIM** flag-only; **STP** exists locally only as an opt-in deterministic MLX helper, with nanochat still serving as the source spec; structure embedding done.
@@ -61,17 +61,17 @@ A heavily-engineered Megatron-LM port:
 Full-stack research-grade LLM (40-45K LOC):
 - GQA + RMSNorm + RoPE (standard / llama3 piecewise / YaRN), SwiGLU/ReLU², sliding-window, attention sinks, gated attention, optional QK-norm/clip, optional MLA (DeepSeek-V3 style), optional Mamba3 / M2RNN / MoBA / DeepEP / MoDification / GateSkip.
 - All seven features implemented in clean Torch:
-  - `engram.py` (DeepSeek arXiv 2601.07372, Jan 2026): per-block branch with avg-pool n-gram + optional sigmoid gating + grouped causal SiLU conv.
-  - `mhc.py` (Manifold-Branch Mixer, Sinkhorn-Knopp routing ported from MaxText).
-  - `ngram_hash.py` (multi-head hash n-gram, BLT 2412.09871 + DeepSeek 2601.07372).
-  - `mtp.py` (FastMTP arXiv 2509.18362-style recursive shared-block, β-decayed loss).
-  - `fim.py` (Bavarian 2207.14255 PSM/SPM, plus AST-FIM 2506.00204).
-  - `ifim.py` (Sun et al. arXiv 2509.24637, Sep 2025: instruction-aware FIM; paper/source proposal only, not the deployed GB10 token-id contract).
-  - `stp.py` (Huang/LeCun arXiv 2602.22617, Feb 2026: JEPA geodesic regularization, ~100 LOC).
+  - engram.py (DeepSeek arXiv 2601.07372, Jan 2026): per-block branch with avg-pool n-gram + optional sigmoid gating + grouped causal SiLU conv.
+  - mhc.py (Manifold-Branch Mixer, Sinkhorn-Knopp routing ported from MaxText).
+  - ngram_hash.py (multi-head hash n-gram, BLT 2412.09871 + DeepSeek 2601.07372).
+  - mtp.py (FastMTP arXiv 2509.18362-style recursive shared-block, β-decayed loss).
+  - fim.py (Bavarian 2207.14255 PSM/SPM, plus AST-FIM 2506.00204).
+  - ifim.py (Sun et al. arXiv 2509.24637, Sep 2025: instruction-aware FIM; paper/source proposal only, not the deployed GB10 token-id contract).
+  - stp.py (Huang/LeCun arXiv 2602.22617, Feb 2026: JEPA geodesic regularization, ~100 LOC).
 - Speculative decoding (acceptance-rejection), EAGLE-2 draft head.
-- Tokenizer/FIM intent is a source reference only: live local/GB10 artifacts use the deployed M0.1 contract documented below (`id7=<CODE_START>`, `id45=<FIM_INSTRUCTION>`, `id46=<SPACE>`, `id47=<NL>`), and M0.1 decode parity is covered by the explicit `<SPACE>`/`<NL>` token redesign rather than HF reversible round-trip decode.
+- Tokenizer/FIM intent is a source reference only: live local/GB10 artifacts use the deployed M0.1 contract documented below (id7=<CODE_START>, id45=<FIM_INSTRUCTION>, id46=<SPACE>, id47=<NL>), and M0.1 decode parity is covered by the explicit <SPACE>/<NL> token redesign rather than HF reversible round-trip decode.
 - Training: pretrain + midtrain + SFT + RL via Muon/AdamW, FA3 (CUDA) / Pallas (TPU) / SDPA fallback.
-- Inference: contiguous KV (`engine.py`) + paged KV scheduler (`serving.py`).
+- Inference: contiguous KV (engine.py) + paged KV scheduler (serving.py).
 
 ### Critical research findings for MLX on M4 Max
 
@@ -82,87 +82,166 @@ Full-stack research-grade LLM (40-45K LOC):
 - **Inference**: q4 affine, group_size=64, embed/lm_head at q8, and KV q4 remain inference-planning candidates. External mlx-lm rows are pattern evidence only until reproduced with repo-local matched shapes.
 
 **Kernels & fusion:**
-- Standardize on `mx.fast.scaled_dot_product_attention` for supported MHA/GQA/MQA, causal masks, additive masks, and attention sinks; pin exact MLX behavior to the installed version before relying on version-specific optimizations.
-- `mx.fast.rope` with precomputed `freqs` array for NTK / YaRN / llama3 piecewise.
-- `mx.fast.rms_norm` / `layer_norm` — fused, mixed-precision-aware. Don't cast around them.
-- Use `mx.compile(inputs=..., outputs=...)` around training step + decode step where state capture is required. Prefer Python scalars over `mx.array(scalar)` (silent fp32 promotion). Avoid `shapeless=True` unless shape-dependent code is audited; bucket sequence lengths to powers of 2.
-- **Custom Metal candidates only after profiling** (`mx.fast.metal_kernel`): fused SwiGLU (gate+up+silu), fused residual+RMSNorm, paged-attention with sinks+sliding-window, KV-cache quantization (TurboQuant Hadamard + codebook). Treat ZMLX, mlx-mfa, and TurboQuant as pattern references; do not adopt a training-path kernel without pure-MLX fallback, parity coverage, hotspot evidence, and VJP/JVP support.
-- Build `metal_kernel` objects once at import; never JIT in the hot path.
-- `mx.async_eval` can pipeline graph construction with execution; measure any training-loop gain locally before treating it as a performance assumption.
-- Profile via `mx.metal.start_capture` → Xcode `.gputrace` debugger.
+- Standardize on mx.fast.scaled_dot_product_attention for supported MHA/GQA/MQA, causal masks, additive masks, and attention sinks; pin exact MLX behavior to the installed version before relying on version-specific optimizations.
+- mx.fast.rope with precomputed freqs array for NTK / YaRN / llama3 piecewise.
+- mx.fast.rms_norm / layer_norm — fused, mixed-precision-aware. Don't cast around them.
+- Use mx.compile(inputs=..., outputs=...) around training step + decode step where state capture is required. Prefer Python scalars over mx.array(scalar) (silent fp32 promotion). Avoid shapeless=True unless shape-dependent code is audited; bucket sequence lengths to powers of 2.
+- **Custom Metal candidates only after profiling** (mx.fast.metal_kernel): fused SwiGLU (gate+up+silu), fused residual+RMSNorm, paged-attention with sinks+sliding-window, KV-cache quantization (TurboQuant Hadamard + codebook). Treat ZMLX, mlx-mfa, and TurboQuant as pattern references; do not adopt a training-path kernel without pure-MLX fallback, parity coverage, hotspot evidence, and VJP/JVP support.
+- Build metal_kernel objects once at import; never JIT in the hot path.
+- mx.async_eval can pipeline graph construction with execution; measure any training-loop gain locally before treating it as a performance assumption.
+- Profile via mx.metal.start_capture → Xcode .gputrace debugger.
 
 **Distributed (future pattern source, not current capability):**
-- `mx.distributed` backends include ring, JACCL, MPI, and CUDA-only NCCL, but this repo has not implemented distributed MLX training or Megatron-parity distributed semantics.
+- mx.distributed backends include ring, JACCL, MPI, and CUDA-only NCCL, but this repo has not implemented distributed MLX training or Megatron-parity distributed semantics.
 - JACCL/TB5 is a future candidate backend and must be measured locally before any capability or performance claim.
 - External examples such as mlxgpt.com training nanochat-d20 on 2× Mac Mini M4 Pro over TB5 are reference context, not cppmega.mlx receipts.
-- Candidate MLX distributed primitives include `nn.AllToShardedLinear` / `nn.ShardedToAllLinear` and `nn.average_gradients`; do not treat them as cppmega.mlx TP/DP parity until wired and tested locally.
+- Candidate MLX distributed primitives include nn.AllToShardedLinear / nn.ShardedToAllLinear and nn.average_gradients; do not treat them as cppmega.mlx TP/DP parity until wired and tested locally.
 - **No native ZeRO/FSDP** — must hand-roll ZeRO-1-equivalent (shard optimizer state across ranks, all-gather params for fwd/bwd, reduce-scatter grads).
 
 **Data & training stack:**
-- Megatron `.bin/.idx` ingress is already wired locally through the standalone fail-closed `cppmega_mlx.data.megatron_indexed` seam. Remaining work is multi-shard/source-converter side-channel preservation and scale validation, not a claim of distributed Megatron runtime parity.
+- Megatron .bin/.idx ingress is already wired locally through the standalone fail-closed cppmega_mlx.data.megatron_indexed seam. Remaining work is multi-shard/source-converter side-channel preservation and scale validation, not a claim of distributed Megatron runtime parity.
 - Sequence packing (concat-with-EOS + cumulative-doc-id mask) must be reimplemented; nanochat-mlx fork has a reference.
-- `mlx-data` is C++ thread-pool, not multi-process; GIL-bound for Python transforms. Practical pattern: PyTorch DataLoader → NumPy → `mx.array` on the unified-memory device (zero-copy).
+- mlx-data is C++ thread-pool, not multi-process; GIL-bound for Python transforms. Practical pattern: PyTorch DataLoader → NumPy → mx.array on the unified-memory device (zero-copy).
 - AdamW is fine for ≤3B; Lion for 7B+ on 64 GB Macs (1× state vs Adam's 2×). 8-bit Adam doesn't exist for MLX.
-- Optimizer state is at fp32 by default. For 7B bf16 weights: weights 14 GB + grads 14 GB + Adam state 56 GB ≈ 84 GB → 128 GB Mac is tight; use `--grad-checkpoint` and Lion.
-- Future checkpoint target: sharded `.safetensors` with an index manifest, plus `optimizer.safetensors` and `train_state.json` (step, epoch, rng, dataloader cursor, `mx.random.state` b64). Current repo status remains single-file local safetensors, not distributed/sharded Megatron restore.
-- Memory knobs every training entrypoint must set: `mx.set_wired_limit(0.7 * total)`, `mx.metal.set_memory_limit(0.85 * total)`, `mx.clear_cache()` every N steps, `mx.async_eval` for pipelining. Wiring >75% has caused kernel panics (mlx-lm #883).
-- Logging: W&B remains a future local integration; mlx-lm's `--report-to wandb` is a reference pattern, not a cppmega.mlx receipt.
-- Parity tolerances: bf16 single matmul `rtol=1e-3, atol=1e-1`; chained `rtol=1e-2, atol=1e-1`; attention/RMSNorm `atol=5e-2`; full-step grad `atol=1e-1`. Match PyTorch's documented bf16 thresholds.
+- Optimizer state is at fp32 by default. For 7B bf16 weights: weights 14 GB + grads 14 GB + Adam state 56 GB ≈ 84 GB → 128 GB Mac is tight; use --grad-checkpoint and Lion.
+- Future checkpoint target: sharded .safetensors with an index manifest, plus optimizer.safetensors and train_state.json (step, epoch, rng, dataloader cursor, mx.random.state b64). Current repo status remains single-file local safetensors, not distributed/sharded Megatron restore.
+- Memory knobs every training entrypoint must set: mx.set_wired_limit(0.7 * total), mx.metal.set_memory_limit(0.85 * total), mx.clear_cache() every N steps, mx.async_eval for pipelining. Wiring >75% has caused kernel panics (mlx-lm #883).
+- Logging: W&B remains a future local integration; mlx-lm's --report-to wandb is a reference pattern, not a cppmega.mlx receipt.
+- Parity tolerances: bf16 single matmul rtol=1e-3, atol=1e-1; chained rtol=1e-2, atol=1e-1; attention/RMSNorm atol=5e-2; full-step grad atol=1e-1. Match PyTorch's documented bf16 thresholds.
 
 ### Planning decisions (fail-closed, not production commitments)
 
-| Decision | Choice | Why |
-|---|---|---|
-| Training precision | bf16 + fp32 AdamW master | local MLX/Metal stability, no loss-scaling complexity, and cleaner external-reference comparability |
-| Inference precision (candidate) | q4 affine g64; embed/lm_head q8; KV q4 | external pattern only until repo-local matched-shape rows exist |
-| FP8 / mxfp4 / mxfp8 / nvfp4 training | deferred | no current M4 training support claim in this repo; revisit only with source/test/hardware proof |
-| Optimizer (default) | AdamW (≤3B) / Lion (7B+) | bnb 8-bit Adam absent; Lion halves state cost |
-| Distributed backend | future JACCL/ring evaluation | pattern source only until repo-local distributed training is implemented and tested |
-| Sharding strategy | future ZeRO-1-style optimizer-state sharding | no native FSDP/ZeRO in MLX; no distributed Megatron parity claim |
-| Data format | use existing standalone Megatron `.bin/.idx` seam | preserves token ingress locally; side-channel preservation and multi-shard scale remain open |
-| Sequence packing | concat-with-EOS + cumulative doc-id, attn mask via `mx.cumsum` | nanochat-mlx reference exists |
-| Kernels — defaults | `mx.fast.SDPA` / `rope` / `rms_norm` everywhere | fused, mixed-precision aware, supported |
-| Kernels — custom Metal | candidates only after profiling, pure-MLX fallback, parity, hotspot evidence, and VJP/JVP if training-side | maintenance cost is real; ZMLX/mlx-mfa/TurboQuant are pattern references |
-| Checkpoints | sharded `.safetensors` + index manifest + `optimizer.safetensors` + `train_state.json` | future target; fills RNG/cursor gap without claiming current sharded restore |
-| Tokenizer | M0.1 closed on deployed GB10 BPE artifact + explicit `<SPACE>`/`<NL>` sentinel decode parity | assert vocab/id mapping at model load; future tokenizer work is FIM/iFIM/AST-FIM integration, not an M0.1 blocker |
-| Parity anchors | upgrade `tests/test_cppmega_parity_anchors.py` to numerical | current anchors are structural/doc/source-presence checks, not tensor parity |
-| Bench/CI gate | future regression threshold after baselines exist | do not block or claim throughput until local baselines are committed |
+<table>
+  <thead>
+    <tr>
+      <th>Decision</th>
+      <th>Choice</th>
+      <th>Why</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Training precision</td>
+      <td>bf16 + fp32 AdamW master</td>
+      <td>local MLX/Metal stability, no loss-scaling complexity, and<br>
+      cleaner external-reference comparability</td>
+    </tr>
+    <tr>
+      <td>Inference precision (candidate)</td>
+      <td>q4 affine g64; embed/lm_head q8; KV q4</td>
+      <td>external pattern only until repo-local matched-shape rows<br>
+      exist</td>
+    </tr>
+    <tr>
+      <td>FP8 / mxfp4 / mxfp8 / nvfp4 training</td>
+      <td>deferred</td>
+      <td>no current M4 training support claim in this repo; revisit<br>
+      only with source/test/hardware proof</td>
+    </tr>
+    <tr>
+      <td>Optimizer (default)</td>
+      <td>AdamW (≤3B) / Lion (7B+)</td>
+      <td>bnb 8-bit Adam absent; Lion halves state cost</td>
+    </tr>
+    <tr>
+      <td>Distributed backend</td>
+      <td>future JACCL/ring evaluation</td>
+      <td>pattern source only until repo-local distributed training is<br>
+      implemented and tested</td>
+    </tr>
+    <tr>
+      <td>Sharding strategy</td>
+      <td>future ZeRO-1-style optimizer-state sharding</td>
+      <td>no native FSDP/ZeRO in MLX; no distributed Megatron parity<br>
+      claim</td>
+    </tr>
+    <tr>
+      <td>Data format</td>
+      <td>use existing standalone Megatron .bin/.idx seam</td>
+      <td>preserves token ingress locally; side-channel preservation<br>
+      and multi-shard scale remain open</td>
+    </tr>
+    <tr>
+      <td>Sequence packing</td>
+      <td>concat-with-EOS + cumulative doc-id, attn mask via mx.cumsum</td>
+      <td>nanochat-mlx reference exists</td>
+    </tr>
+    <tr>
+      <td>Kernels — defaults</td>
+      <td>mx.fast.SDPA / rope / rms_norm everywhere</td>
+      <td>fused, mixed-precision aware, supported</td>
+    </tr>
+    <tr>
+      <td>Kernels — custom Metal</td>
+      <td>candidates only after profiling, pure-MLX fallback, parity,<br>
+      hotspot evidence, and VJP/JVP if training-side</td>
+      <td>maintenance cost is real; ZMLX/mlx-mfa/TurboQuant are<br>
+      pattern references</td>
+    </tr>
+    <tr>
+      <td>Checkpoints</td>
+      <td>sharded .safetensors + index manifest +<br>
+      optimizer.safetensors + train_state.json</td>
+      <td>future target; fills RNG/cursor gap without claiming current<br>
+      sharded restore</td>
+    </tr>
+    <tr>
+      <td>Tokenizer</td>
+      <td>M0.1 closed on deployed GB10 BPE artifact + explicit<br>
+      <SPACE>/<NL> sentinel decode parity</td>
+      <td>assert vocab/id mapping at model load; future tokenizer work<br>
+      is FIM/iFIM/AST-FIM integration, not an M0.1 blocker</td>
+    </tr>
+    <tr>
+      <td>Parity anchors</td>
+      <td>upgrade tests/test_cppmega_parity_anchors.py to numerical</td>
+      <td>current anchors are structural/doc/source-presence checks,<br>
+      not tensor parity</td>
+    </tr>
+    <tr>
+      <td>Bench/CI gate</td>
+      <td>future regression threshold after baselines exist</td>
+      <td>do not block or claim throughput until local baselines are<br>
+      committed</td>
+    </tr>
+  </tbody>
+</table>
 
 ---
 
 ## 0.4 Buy-vs-build addendum
 
-`docs/mlx_buy_vs_build.md` (added 2026-05-02) is the per-feature decision matrix derived from an 8-agent research pass. **Read it before starting any Stream H/I/G work.** Key findings:
+docs/mlx_buy_vs_build.md (added 2026-05-02) is the per-feature decision matrix derived from an 8-agent research pass. **Read it before starting any Stream H/I/G work.** Key findings:
 
-- **mlx-lm already ships `mlx_lm/models/nanochat.py`** plus DeepSeek-V3 (MLA), DeepSeek-V3.2 (DSA), GPT-OSS (sinks + sliding window), Mamba2 + `ssm.py` Metal kernel, switch-routing MoE, AWQ/DWQ/GPTQ, QuantizedKVCache, full LoRA/DoRA/QLoRA tuner. **Vendor first.**
+- **mlx-lm already ships mlx_lm/models/nanochat.py** plus DeepSeek-V3 (MLA), DeepSeek-V3.2 (DSA), GPT-OSS (sinks + sliding window), Mamba2 + ssm.py Metal kernel, switch-routing MoE, AWQ/DWQ/GPTQ, QuantizedKVCache, full LoRA/DoRA/QLoRA tuner. **Vendor first.**
 - **scasella/nanochat-mlx** ships exactly the two pieces mlx-lm lacks: Muon+AdamW MultiOptimizer (~289 LOC) + BOS-aligned best-fit packer (~119 LOC). Vendor.
-- **vllm-mlx `paged_cache.py`** (Apache-2.0) is standalone-vendorable for paged KV inference.
-- **ZMLX** (`swiglu_mlp`, `rmsnorm`) provides Python-MSL kernels for fused decode paths; vendor.
+- **vllm-mlx paged_cache.py** (Apache-2.0) is standalone-vendorable for paged KV inference.
+- **ZMLX** (swiglu_mlp, rmsnorm) provides Python-MSL kernels for fused decode paths; vendor.
 - **arozanov/turboquant-mlx** (Apache-2.0) ships the Hadamard + Lloyd-Max KV-quant Metal kernels we planned for Stream G.
 - **Greenfield work that survives**: engram per-block branch, mhc Sinkhorn mixer, MTP K=2 head with shared-weight aliasing, FIM/iFIM/STP transforms, Mamba3 trapezoidal/MIMO patch on top of mlx-lm Mamba2, doc-id mask generator, 8-bit Adam (only if memory blocks).
 - **Skip Hopper-only fusions**: CUTLASS MXFP8, Grouped MXFP8, MTP native Hopper CE, FP8 activations, GB10 SMEM preflight.
-- **Speculative decoding is greenfield on GB10** (CUDA accepts `is_spec_decode` and forwards to upstream Megatron unused). MLX-side work: fork mlx-lm's `speculative_generate_step` to add Leviathan rejection (mlx-lm uses greedy-match, not Leviathan), then Token Recycling (Phase 2), then MTP self-spec via the K=2 head (Phase 3).
+- **Speculative decoding is greenfield on GB10** (CUDA accepts is_spec_decode and forwards to upstream Megatron unused). MLX-side work: fork mlx-lm's speculative_generate_step to add Leviathan rejection (mlx-lm uses greedy-match, not Leviathan), then Token Recycling (Phase 2), then MTP self-spec via the K=2 head (Phase 3).
 
-The buy-vs-build addendum also contains a 20-rule anti-port playbook — the things to **not** do when carrying torch into MLX (don't materialize GQA repeats, don't manual-softmax around `mx.fast.SDPA`, don't `mx.array(scalar)` in hot paths, don't deep-copy shared weights, etc.). Lint rules in `tools/lint_mlx.py` enforce a subset.
+The buy-vs-build addendum also contains a 20-rule anti-port playbook — the things to **not** do when carrying torch into MLX (don't materialize GQA repeats, don't manual-softmax around mx.fast.SDPA, don't mx.array(scalar) in hot paths, don't deep-copy shared weights, etc.). Lint rules in tools/lint_mlx.py enforce a subset.
 
 ---
 
-## 0.5 First milestone (M0): `local_gb10_quarter` end-to-end on a single Mac
+## 0.5 First milestone (M0): local_gb10_quarter end-to-end on a single Mac
 
 Before fanning out across all 10 streams, prove the smallest viable path on the resolved mini target. This is a single, sequenced, ~3–5-week milestone that gates the rest of the plan.
 
-**Goal**: load `local_gb10_quarter` config (depth=13, hidden=3584, FFN=18944, 28 heads, head_dim=128, vocab=65536, MTP=2, AEMEAEMEAEMR pattern); run bf16 training end-to-end on a single Mac using MLX/Metal; validate local parquet loss/memory receipts; and keep external CUDA/GB10 numerical reference closure separate from Mac-local acceptance.
+**Goal**: load local_gb10_quarter config (depth=13, hidden=3584, FFN=18944, 28 heads, head_dim=128, vocab=65536, MTP=2, AEMEAEMEAEMR pattern); run bf16 training end-to-end on a single Mac using MLX/Metal; validate local parquet loss/memory receipts; and keep external CUDA/GB10 numerical reference closure separate from Mac-local acceptance.
 
 **Gate set** (Mac-local gates must be green before scaling effort; external reference closure is tracked fail-closed but does not block Mac-local M0.4 work):
-- M0.1 — **CLOSED**. Tokenizer: vendor the deployed GB10 tokenizer artifact with vocab=65536 and the reserved ID contract (id 2=BOS, 3=EOT/EOS, 4=FIM_PREFIX, 5=FIM_MIDDLE, 6=FIM_SUFFIX, 7=CODE_START, 45=FIM_INSTRUCTION, 46=SPACE, 47=NL). The wrapper normalizes whitespace runs at encode (`[\r\n]+`->`<NL>`, `[ \t]+`->`<SPACE>`) and decode is plain token concat with sentinel substitution; this fixes the BPE-split decode bug (e.g., `sum`->`s`,`u`,`m`->`s u m`) and gives byte-exact round-trip for inputs without multi-char whitespace runs. The explicit-token approach matches the CUDA-side `nanochat/cpp_tokenizer.py` decode behavior. Do not reopen this gate over the deployed HF `decoder=null` artifact's non-reversible `decode(encode(text))` behavior.
-- M0.2 — Model factory entry for `local_gb10_quarter` in `cppmega_mlx/recipes/model_factory.py`. With M0.1 closed, the default profile is unblocked; acceptance remains the profile contract plus build → forward closure on shape `(B=1, T=512)` returning finite logits with config schema validation rejecting invalid combos.
-- M0.3 — **External reference closure, not a Mac-local blocker**. Random-init seed-matched forward parity remains useful for comparing MLX against a CUDA/GB10 reference, but it does not gate local MLX/Metal M0.4 training progress. The fail-closed scaffold constructs the same `local_gb10_quarter` config and fixed `B=1,T=512,seed=3003` input batch (`tokens_sha256=c645ca4053e5206dcbe58c13aa26f4a9e56c5aa2aee90a4d4778bbc9d9c33549`). No real CUDA logits artifact exists at `bench/parity/cuda/m03_local_gb10_quarter_seed3003_logits.json`, so `scripts/m03_forward_parity_manifest.py` must refuse the default missing artifact and keep `m0_3_closed=false`. A metadata-valid CUDA artifact only reaches `artifact_preflight_status=valid_not_evaluated`; it is not external reference acceptance until a separate numerical harness compares the full logits tensor (`shape=[1,512,65536]`, `numel=33554432`) against MLX and records pass/fail parity.
-- M0.4 — One training step in bf16 (loss + backward + optimizer.update). No NaNs. Loss decrease over 100 steps on the target local parquet sample. **Data source**: local ignored `data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet` (~492 MB total of GB10 validation shards when present locally; not committed to git). Current scoped progress covers training-plumbing guardrails, canonical metadata/preflight receipts, grad-checkpoint expectation metadata, requested-vs-completed step accounting, and a metadata-only `--model-profile local_gb10_quarter --dry-run-json` preflight that performs no forward pass, no training, no optimizer-state allocation, and does not route through HybridTinyLM. Optional parameter allocation probing remains preflight evidence only. Full M0.4 remains open until the real `local_gb10_quarter` bf16 AdamW + grad-checkpoint path completes the 100-step target-parquet gate. No GB10 scp or full-corpus prep needed for M0.
+- M0.1 — **CLOSED**. Tokenizer: vendor the deployed GB10 tokenizer artifact with vocab=65536 and the reserved ID contract (id 2=BOS, 3=EOT/EOS, 4=FIM_PREFIX, 5=FIM_MIDDLE, 6=FIM_SUFFIX, 7=CODE_START, 45=FIM_INSTRUCTION, 46=SPACE, 47=NL). The wrapper normalizes whitespace runs at encode ([\r\n]+-><NL>, [ \t]+-><SPACE>) and decode is plain token concat with sentinel substitution; this fixes the BPE-split decode bug (e.g., sum->s,u,m->s u m) and gives byte-exact round-trip for inputs without multi-char whitespace runs. The explicit-token approach matches the CUDA-side nanochat/cpp_tokenizer.py decode behavior. Do not reopen this gate over the deployed HF decoder=null artifact's non-reversible decode(encode(text)) behavior.
+- M0.2 — Model factory entry for local_gb10_quarter in cppmega_mlx/recipes/model_factory.py. With M0.1 closed, the default profile is unblocked; acceptance remains the profile contract plus build → forward closure on shape (B=1, T=512) returning finite logits with config schema validation rejecting invalid combos.
+- M0.3 — **External reference closure, not a Mac-local blocker**. Random-init seed-matched forward parity remains useful for comparing MLX against a CUDA/GB10 reference, but it does not gate local MLX/Metal M0.4 training progress. The fail-closed scaffold constructs the same local_gb10_quarter config and fixed B=1,T=512,seed=3003 input batch (tokens_sha256=c645ca4053e5206dcbe58c13aa26f4a9e56c5aa2aee90a4d4778bbc9d9c33549). No real CUDA logits artifact exists at bench/parity/cuda/m03_local_gb10_quarter_seed3003_logits.json, so scripts/m03_forward_parity_manifest.py must refuse the default missing artifact and keep m0_3_closed=false. A metadata-valid CUDA artifact only reaches artifact_preflight_status=valid_not_evaluated; it is not external reference acceptance until a separate numerical harness compares the full logits tensor (shape=[1,512,65536], numel=33554432) against MLX and records pass/fail parity.
+- M0.4 — One training step in bf16 (loss + backward + optimizer.update). No NaNs. Loss decrease over 100 steps on the target local parquet sample. **Data source**: local ignored data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet (~492 MB total of GB10 validation shards when present locally; not committed to git). Current scoped progress covers training-plumbing guardrails, canonical metadata/preflight receipts, grad-checkpoint expectation metadata, requested-vs-completed step accounting, and a metadata-only --model-profile local_gb10_quarter --dry-run-json preflight that performs no forward pass, no training, no optimizer-state allocation, and does not route through HybridTinyLM. Optional parameter allocation probing remains preflight evidence only. Full M0.4 remains open until the real local_gb10_quarter bf16 AdamW + grad-checkpoint path completes the 100-step target-parquet gate. No GB10 scp or full-corpus prep needed for M0.
 - M0.5 — MTP K=2 head wired with β=0.6 / λ=0.3; per-depth losses tracked. MTP-disabled inference path also returns sane logits. Current local coverage is bounded to MLX training-side loss semantics plus fail-closed manifest hardening, including nested CUDA/MLX overclaim rejection. External CUDA/GB10 FastMTP loss+grad-norm closure remains open until a fixed-seed artifact exists and an MLX-vs-CUDA numerical harness evaluates it; that external reference closure does not block Mac-local M0.4 training acceptance.
-- M0.6 — Memory math validated on the actual dev box (Mac Studio M4 Max 128 GB): peak unified-memory < 75% of installed RAM with `--grad-checkpoint` and AdamW.
-- M0.7 — Resumable training: save mid-run, kill process, reload, identical loss continues for ≥100 steps with RNG state and dataloader cursor preserved. Current receipts are TinyLM/HybridTinyLM-scoped only; full M0.7 remains fail-closed until `local_gb10_quarter` resumes on the target parquet lane after the M0.4 full-model training gate is proven.
+- M0.6 — Memory math validated on the actual dev box (Mac Studio M4 Max 128 GB): peak unified-memory < 75% of installed RAM with --grad-checkpoint and AdamW.
+- M0.7 — Resumable training: save mid-run, kill process, reload, identical loss continues for ≥100 steps with RNG state and dataloader cursor preserved. Current receipts are TinyLM/HybridTinyLM-scoped only; full M0.7 remains fail-closed until local_gb10_quarter resumes on the target parquet lane after the M0.4 full-model training gate is proven.
 
-**M0 data note**: full-corpus pretraining is a post-M0 concern. When that lands, options are (a) `scp` materialized `.bin/.idx` shards from GB10's `/home/dave/cppmega-root/data/megatron/clang_semantic_4k_v10_train`, or (b) port `cppmega/scripts/data/prepare_*` to run on Mac. Resolve at that time.
+**M0 data note**: full-corpus pretraining is a post-M0 concern. When that lands, options are (a) scp materialized .bin/.idx shards from GB10's /home/dave/cppmega-root/data/megatron/clang_semantic_4k_v10_train, or (b) port cppmega/scripts/data/prepare_* to run on Mac. Resolve at that time.
 
 **2nd Mac connection trigger (revised)**: ~1–2 weeks after M0 work starts, when M0.2 plus the local M0.4 baseline are green and there's a real working baseline to extend. Earlier is debug surface without payoff; later (waiting for step ~100) leaves Stream F starting cold.
 
@@ -174,21 +253,101 @@ Before fanning out across all 10 streams, prove the smallest viable path on the 
 
 ## 1. Risk Register
 
-| Risk | Likelihood | Impact | Mitigation |
-|---|---|---|---|
-| MLX bf16 path silently slower than fp16 → local-stability-vs-throughput tradeoff | High | Medium | Benchmark both in stream G; if fp16 wins ≥20% on M4, add as opt-in |
-| `mx.compile` re-compiles on shape change | High | Medium | Bucket seq_len to powers of 2; document anti-patterns |
-| Wired-memory kernel panic on KV overrun | Medium | High | Always set `mx.metal.set_memory_limit` + `set_wired_limit` ≤ 0.7 |
-| Sinkhorn (mHC) numerical instability in bf16 | Medium | Medium | Force fp32 inside Sinkhorn iters (mirror nanochat) |
-| MTP recursive shared-block breaks `mx.compile` | Medium | Medium | Use static-shape roll-and-mask trick; static K |
-| FIM/iFIM token-id collision on tokenizer reload | Medium | High | Assert deployed layout at model load; preserve id7=`<CODE_START>` and id45=`<FIM_INSTRUCTION>` |
-| Distributed parity drift across ranks | Medium | High | Determinism harness with seeded `mx.random.state` per rank |
-| MacBook thermal throttling masquerading as code regression | High | Low | Run benches on Mac Studio only; thermal monitor in CI |
-| `mlx-data` Python-transform GIL bottleneck | Medium | Medium | PyTorch DataLoader bridge fallback; keep transforms in C++ ops |
-| MLX version churn (0.30 → 0.31 → 0.32) breaking custom Metal | High | Medium | Pin MLX in pyproject; add MLX-version smoke test in CI |
-| FP8 / mxfp4 expectations from CUDA team | High | Low | Document explicit refusal; phase plan with E gated on M5+ |
-| Megatron `.idx` format drift (Megatron-Core changes) | Low | Medium | Version-pin spec; golden-file test |
-| Apple Silicon ANE temptation for training | Low | Low | Document explicitly: ANE is CoreML-inference only, not exposed to MLX |
+<table>
+  <thead>
+    <tr>
+      <th>Risk</th>
+      <th>Likelihood</th>
+      <th>Impact</th>
+      <th>Mitigation</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>MLX bf16 path silently slower than fp16 → local-stability-<br>
+      vs-throughput tradeoff</td>
+      <td>High</td>
+      <td>Medium</td>
+      <td>Benchmark both in stream G; if fp16 wins ≥20% on M4, add as<br>
+      opt-in</td>
+    </tr>
+    <tr>
+      <td>mx.compile re-compiles on shape change</td>
+      <td>High</td>
+      <td>Medium</td>
+      <td>Bucket seq_len to powers of 2; document anti-patterns</td>
+    </tr>
+    <tr>
+      <td>Wired-memory kernel panic on KV overrun</td>
+      <td>Medium</td>
+      <td>High</td>
+      <td>Always set mx.metal.set_memory_limit + set_wired_limit ≤ 0.7</td>
+    </tr>
+    <tr>
+      <td>Sinkhorn (mHC) numerical instability in bf16</td>
+      <td>Medium</td>
+      <td>Medium</td>
+      <td>Force fp32 inside Sinkhorn iters (mirror nanochat)</td>
+    </tr>
+    <tr>
+      <td>MTP recursive shared-block breaks mx.compile</td>
+      <td>Medium</td>
+      <td>Medium</td>
+      <td>Use static-shape roll-and-mask trick; static K</td>
+    </tr>
+    <tr>
+      <td>FIM/iFIM token-id collision on tokenizer reload</td>
+      <td>Medium</td>
+      <td>High</td>
+      <td>Assert deployed layout at model load; preserve<br>
+      id7=<CODE_START> and id45=<FIM_INSTRUCTION></td>
+    </tr>
+    <tr>
+      <td>Distributed parity drift across ranks</td>
+      <td>Medium</td>
+      <td>High</td>
+      <td>Determinism harness with seeded mx.random.state per rank</td>
+    </tr>
+    <tr>
+      <td>MacBook thermal throttling masquerading as code regression</td>
+      <td>High</td>
+      <td>Low</td>
+      <td>Run benches on Mac Studio only; thermal monitor in CI</td>
+    </tr>
+    <tr>
+      <td>mlx-data Python-transform GIL bottleneck</td>
+      <td>Medium</td>
+      <td>Medium</td>
+      <td>PyTorch DataLoader bridge fallback; keep transforms in C++<br>
+      ops</td>
+    </tr>
+    <tr>
+      <td>MLX version churn (0.30 → 0.31 → 0.32) breaking custom Metal</td>
+      <td>High</td>
+      <td>Medium</td>
+      <td>Pin MLX in pyproject; add MLX-version smoke test in CI</td>
+    </tr>
+    <tr>
+      <td>FP8 / mxfp4 expectations from CUDA team</td>
+      <td>High</td>
+      <td>Low</td>
+      <td>Document explicit refusal; phase plan with E gated on M5+</td>
+    </tr>
+    <tr>
+      <td>Megatron .idx format drift (Megatron-Core changes)</td>
+      <td>Low</td>
+      <td>Medium</td>
+      <td>Version-pin spec; golden-file test</td>
+    </tr>
+    <tr>
+      <td>Apple Silicon ANE temptation for training</td>
+      <td>Low</td>
+      <td>Low</td>
+      <td>Document explicitly: ANE is CoreML-inference only, not<br>
+      exposed to MLX</td>
+    </tr>
+  </tbody>
+</table>
 
 ---
 
@@ -209,184 +368,184 @@ Before fanning out across all 10 streams, prove the smallest viable path on the 
 
 ### Stream A — Foundation & Infrastructure (1–20)
 
-1. Pin MLX version in `pyproject.toml`; add `__mlx_version__` runtime check; document required MLX APIs for the supported bf16/q4 paths. Do not imply M4 fp8-family training support.
-2. Add pytest markers: `parity`, `kernel`, `training`, `bench`, `distributed`. Document conventions in `pyproject.toml`.
-3. Set up benchmark database schema (`bench/baselines/*.json`, indexed by hardware + commit hash + dtype + batch + seq).
+1. Pin MLX version in pyproject.toml; add __mlx_version__ runtime check; document required MLX APIs for the supported bf16/q4 paths. Do not imply M4 fp8-family training support.
+2. Add pytest markers: parity, kernel, training, bench, distributed. Document conventions in pyproject.toml.
+3. Set up benchmark database schema (bench/baselines/*.json, indexed by hardware + commit hash + dtype + batch + seq).
 4. Set up parity database (per-tensor diff vs CUDA reference, JSON manifest).
-5. Add `mx.metal.set_memory_limit(0.85 * total)` and `mx.set_wired_limit(0.7 * total)` to all training/inference entrypoints. Add `cppmega_mlx/runtime/memory.py` with helpers.
-6. Add `mx.clear_cache()` cadence to `CompiledPretrainingStep` (every N steps, configurable).
-7. Create `cppmega_mlx/runtime/env.py`: detects M4 vs M5, GPU core count, RAM tier, macOS version.
-8. Add macOS file-descriptor `ulimit -n 65536` enforcement on startup; abort with clear message if too low.
-9. Enforce `multiprocessing.set_start_method('spawn')` before any MLX import in launcher scripts.
-10. Add thermal-throttling detector parsing `powermetrics`; auto-pause training if package power-throttled.
-11. Document JACCL prerequisites in `docs/system_requirements.md` only after local verification of the MLX version, macOS version, Thunderbolt/RDMA setup, and fallback behavior.
+5. Add mx.metal.set_memory_limit(0.85 * total) and mx.set_wired_limit(0.7 * total) to all training/inference entrypoints. Add cppmega_mlx/runtime/memory.py with helpers.
+6. Add mx.clear_cache() cadence to CompiledPretrainingStep (every N steps, configurable).
+7. Create cppmega_mlx/runtime/env.py: detects M4 vs M5, GPU core count, RAM tier, macOS version.
+8. Add macOS file-descriptor ulimit -n 65536 enforcement on startup; abort with clear message if too low.
+9. Enforce multiprocessing.set_start_method('spawn') before any MLX import in launcher scripts.
+10. Add thermal-throttling detector parsing powermetrics; auto-pause training if package power-throttled.
+11. Document JACCL prerequisites in docs/system_requirements.md only after local verification of the MLX version, macOS version, Thunderbolt/RDMA setup, and fallback behavior.
 12. Document hardware tiers (M4 Max 64/128GB, Mac Studio M3 Ultra 192GB) in same doc with peak-memory math.
-13. Add deterministic-seed harness: capture `mx.random.state`, `np.random`, Python `random`. Reproducibility test.
-14. Add CI lint for `mx.array(<python_scalar>)` antipattern (forces fp32 promotion); flag in `tools/lint_mlx.py`.
-15. Add `tests/conftest.py` shared fixtures: tiny model (depth=2, width=128), tiny tokenizer, golden batch.
-16. Convert `tests/test_cppmega_parity_anchors.py` from structural/doc/source-presence checks to actual numerical anchor assertions (load CUDA-side golden tensors and compare with rtol/atol matrix).
-17. Set up nightly bench cron (cron user + GitHub Action) running `scripts/bench_matrix.py` against committed baselines.
-18. Add `scripts/profile_capture.py` wrapping `mx.metal.start_capture` / `stop_capture` for one-shot `.gputrace` capture.
-19. Add `scripts/check_environment.py` (reports MLX, macOS, RAM, GPU cores, thermal, JACCL availability, file descriptors).
-20. Document the contributor workflow in `CLAUDE.md`: use beads, run `pytest -m parity` before merge, capture `.gputrace` for any kernel-touching PR.
+13. Add deterministic-seed harness: capture mx.random.state, np.random, Python random. Reproducibility test.
+14. Add CI lint for mx.array(<python_scalar>) antipattern (forces fp32 promotion); flag in tools/lint_mlx.py.
+15. Add tests/conftest.py shared fixtures: tiny model (depth=2, width=128), tiny tokenizer, golden batch.
+16. Convert tests/test_cppmega_parity_anchors.py from structural/doc/source-presence checks to actual numerical anchor assertions (load CUDA-side golden tensors and compare with rtol/atol matrix).
+17. Set up nightly bench cron (cron user + GitHub Action) running scripts/bench_matrix.py against committed baselines.
+18. Add scripts/profile_capture.py wrapping mx.metal.start_capture / stop_capture for one-shot .gputrace capture.
+19. Add scripts/check_environment.py (reports MLX, macOS, RAM, GPU cores, thermal, JACCL availability, file descriptors).
+20. Document the contributor workflow in CLAUDE.md: use beads, run pytest -m parity before merge, capture .gputrace for any kernel-touching PR.
 
 ### Stream B — Core Ops & Kernels (21–40)
 
-21. Audit all attention sites for `mx.fast.scaled_dot_product_attention` with proper `mask='causal'` / additive mask.
-22. Add `mx.fast.rope` with `freqs=` parameter; precompute RoPE freq table once per model in `__init__`.
-23. Promote `nn.RMSNorm` usages to verify they bottom out on `mx.fast.rms_norm` (it does, but verify no shadowing elsewhere).
+21. Audit all attention sites for mx.fast.scaled_dot_product_attention with proper mask='causal' / additive mask.
+22. Add mx.fast.rope with freqs= parameter; precompute RoPE freq table once per model in __init__.
+23. Promote nn.RMSNorm usages to verify they bottom out on mx.fast.rms_norm (it does, but verify no shadowing elsewhere).
 24. Add SDPA sliding-window via additive-mask construction; benchmark vs unfused.
-25. Add SDPA attention-sinks via `sinks=` parameter (1-D per-head scalar); test for GPT-OSS-style models.
-26. Benchmark stock `mx.fast.SDPA` vs `mlx-mfa` for sliding-window window=256 on M4 Max (mlx-mfa shows 20× on M1; verify on M4); pick winner per-config.
+25. Add SDPA attention-sinks via sinks= parameter (1-D per-head scalar); test for GPT-OSS-style models.
+26. Benchmark stock mx.fast.SDPA vs mlx-mfa for sliding-window window=256 on M4 Max (mlx-mfa shows 20× on M1; verify on M4); pick winner per-config.
 27. If profiling identifies a stable hotspot, prototype fused SwiGLU Metal behind a pure-MLX fallback and parity tests before adoption.
 28. If profiling identifies a stable hotspot, prototype fused residual + RMSNorm Metal behind a pure-MLX fallback and parity tests before adoption.
-29. Keep custom Metal kernels out of the training path unless `mx.custom_function` plus `.vjp`/`.jvp` coverage, pure-MLX fallback, gradient parity, and hotspot evidence are all present.
-30. Build `cppmega_mlx/metal/` directory with `.metal` MSL source files, headers, build manifest.
-31. Pre-load all `metal_kernel` objects at import time of `cppmega_mlx.kernels`; never JIT in hot path.
-32. Benchmark `mx.compile(shapeless=True)` vs default for fixed-shape training; document recompilation triggers.
+29. Keep custom Metal kernels out of the training path unless mx.custom_function plus .vjp/.jvp coverage, pure-MLX fallback, gradient parity, and hotspot evidence are all present.
+30. Build cppmega_mlx/metal/ directory with .metal MSL source files, headers, build manifest.
+31. Pre-load all metal_kernel objects at import time of cppmega_mlx.kernels; never JIT in hot path.
+32. Benchmark mx.compile(shapeless=True) vs default for fixed-shape training; document recompilation triggers.
 33. Bucket dynamic shapes (powers of 2 for seq_len, fixed batch sizes) in dataloader to reduce recompile cost.
-34. Add `mx.async_eval` wrapping in `CompiledPretrainingStep` (build step N+1 graph while N runs); measure throughput delta.
+34. Add mx.async_eval wrapping in CompiledPretrainingStep (build step N+1 graph while N runs); measure throughput delta.
 35. Implement attention with paged KV cache first as an inference-only pure-MLX/reference path; consider custom Metal only after profiling and fallback coverage.
 36. Implement KV-cache quantization as an inference candidate; treat TurboQuant-style Hadamard/codebook designs as references until repo-local rows exist.
-37. Benchmark affine q4 inference candidates on M4 Max; keep `mxfp4` / `nvfp4` as future hardware-gated research, not M4 training support.
-38. Add NTK-aware RoPE scaling via precomputed `freqs`.
-39. Add YaRN RoPE variant (`rope.py` from nanochat).
+37. Benchmark affine q4 inference candidates on M4 Max; keep mxfp4 / nvfp4 as future hardware-gated research, not M4 training support.
+38. Add NTK-aware RoPE scaling via precomputed freqs.
+39. Add YaRN RoPE variant (rope.py from nanochat).
 40. Add Llama3 piecewise scaling RoPE.
 
 #### Stream B addendum — MLX built-in kernel surface (2026-05-03)
 
 Built-in fused fast ops in MLX 0.31.x are exactly four:
 
-- `mx.fast.scaled_dot_product_attention` — fused MHA/GQA/MQA, causal/additive/sinks masks.
-- `mx.fast.rms_norm` — fused RMSNorm (fp/bf16-aware).
-- `mx.fast.layer_norm` — fused LayerNorm (fp/bf16-aware).
-- `mx.fast.rope` — fused RoPE with precomputed `freqs`.
+- mx.fast.scaled_dot_product_attention — fused MHA/GQA/MQA, causal/additive/sinks masks.
+- mx.fast.rms_norm — fused RMSNorm (fp/bf16-aware).
+- mx.fast.layer_norm — fused LayerNorm (fp/bf16-aware).
+- mx.fast.rope — fused RoPE with precomputed freqs.
 
 Plus two DIY seams:
 
-- `mx.fast.metal_kernel` — author-your-own MSL kernel, still requires `@mx.custom_function` for VJP/JVP.
-- `mx.custom_function` — Python-side custom forward/backward for non-Metal pure-MLX paths.
+- mx.fast.metal_kernel — author-your-own MSL kernel, still requires @mx.custom_function for VJP/JVP.
+- mx.custom_function — Python-side custom forward/backward for non-Metal pure-MLX paths.
 
 Everything else — matmul, activations (SwiGLU/ReLU²/GELU), the default cross-entropy
 loss, MoE dispatch/routing, Mamba selective scan, M2RNN recurrence, quantized matmul,
 NgramHash gather, structure-embedding fusion — currently runs through native MLX ops /
-the MLX op fuser without a dedicated Metal kernel. There is no `mx.fast.cross_entropy`
-in 0.31.x; `mlx.nn.losses.cross_entropy` materializes the full `[B*T, V]` logits tensor
+the MLX op fuser without a dedicated Metal kernel. There is no mx.fast.cross_entropy
+in 0.31.x; mlx.nn.losses.cross_entropy materializes the full [B*T, V] logits tensor
 (4 GiB at fp32 with B=4, T=512, V=65536).
 
-The scoped CCE integration now exists as `train_hybrid_tiny.py --loss-backend cce`,
-which routes training through `next_token_cut_cross_entropy(...)` while default training
+The scoped CCE integration now exists as train_hybrid_tiny.py --loss-backend cce,
+which routes training through next_token_cut_cross_entropy(...) while default training
 and eval remain materialized CE. This is not a c08.2 closing receipt: manual chunked
-backward and the large-shape `B=4,T=512,V=65536` parity/memory acceptance remain open.
+backward and the large-shape B=4,T=512,V=65536 parity/memory acceptance remain open.
 All broader adoption stays gated by the Stream B steps 27–29 contract: profiling
-evidence, pure-MLX fallback, parity tests, and `@mx.custom_function` VJP/JVP coverage.
+evidence, pure-MLX fallback, parity tests, and @mx.custom_function VJP/JVP coverage.
 
 #### Stream B addendum — Regional compile allow/deny matrix (2026-05-03)
 
-Source receipt: `cppmega/docs/optimization_session_2026_04_13.md` §1.7 measured
+Source receipt: cppmega/docs/optimization_session_2026_04_13.md §1.7 measured
 per-region CUDA compile behavior and found small normalization/router regions were
-slowdowns (`RMSNorm 0.41×`, `RMSNormGated 0.47×`, `MoE Router 0.97×`) while the
-larger data-dependent regions were wins (`DataDep-A 5.93×`, `mamba3-pre 2.66×`).
-`cppmega_mlx/training/compiled.py` now codifies this as the typed
-`REGIONAL_COMPILE_TARGETS` registry plus fail-closed decorator helpers, so call
+slowdowns (RMSNorm 0.41×, RMSNormGated 0.47×, MoE Router 0.97×) while the
+larger data-dependent regions were wins (DataDep-A 5.93×, mamba3-pre 2.66×).
+cppmega_mlx/training/compiled.py now codifies this as the typed
+REGIONAL_COMPILE_TARGETS registry plus fail-closed decorator helpers, so call
 sites opt into regional compile only for known allow-listed targets.
 
-Local Apple Silicon receipt: `bench/baselines/uy5_regional_compile_m4.json`
-records one DO and one DON'T case on the local M4 Max. Cached `mx.compile` for
-`data_dep_a` was `1.13×` faster by median time on the measured shape, while the
-`rmsnorm` path verified that `maybe_compile_region("rmsnorm", ...)` returns the
-original function without calling `mx.compile`. This is a local pattern receipt
+Local Apple Silicon receipt: bench/baselines/uy5_regional_compile_m4.json
+records one DO and one DON'T case on the local M4 Max. Cached mx.compile for
+data_dep_a was 1.13× faster by median time on the measured shape, while the
+rmsnorm path verified that maybe_compile_region("rmsnorm", ...) returns the
+original function without calling mx.compile. This is a local pattern receipt
 only; it is not GB10 parity evidence and must not be reported as a cross-host
 throughput claim.
 
 ### Stream C — Model Architecture & Blocks (41–60)
 
-41. Refactor `attention.py` to support GQA explicitly: `kv_repeat = num_q_heads // num_kv_heads` in QKV projection; assert configs.
-42. Add MQA path (`num_kv_heads=1`).
-43. Add full MHA path (`num_kv_heads=num_q_heads`).
-44. Promote `mode='dsa'` from dense placeholder to actual sparse top-k indexing; mirror cppmega CUDA `dsa_indexer_fused_patch.py`.
-45. Implement DSA indexer with per-head BMM accumulation (no `[sq,b,h,sk]` intermediate), per cppmega Patch 3.
-46. Verify Mamba3 reference matches CUDA `mamba3_te_mixer.py` numerics within tolerance on golden batch.
+41. Refactor attention.py to support GQA explicitly: kv_repeat = num_q_heads // num_kv_heads in QKV projection; assert configs.
+42. Add MQA path (num_kv_heads=1).
+43. Add full MHA path (num_kv_heads=num_q_heads).
+44. Promote mode='dsa' from dense placeholder to actual sparse top-k indexing; mirror cppmega CUDA dsa_indexer_fused_patch.py.
+45. Implement DSA indexer with per-head BMM accumulation (no [sq,b,h,sk] intermediate), per cppmega Patch 3.
+46. Verify Mamba3 reference matches CUDA mamba3_te_mixer.py numerics within tolerance on golden batch.
 47. Verify M2RNN reference matches Megatron M2RNN numerics on golden batch.
 48. Add MoE expert-parallel sharding hooks (no compute yet — placeholders for Stream F).
 49. Validate NAM56R AEMEAEMEAEMR pattern at depth 52 vs cppmega CUDA gold runs (numerical match on tiny config).
 50. Add HybridLM end-to-end forward parity test vs CUDA (load fixed seed, compare logits with rtol=1e-2 atol=1e-1).
-51. Add gradient checkpointing wrapper using `mx.checkpoint`; measure activation-memory savings.
-52. Implement selective recompute (attention vs MLP separately; mirror CUDA `recompute_moe_experts`).
+51. Add gradient checkpointing wrapper using mx.checkpoint; measure activation-memory savings.
+52. Implement selective recompute (attention vs MLP separately; mirror CUDA recompute_moe_experts).
 53. Add weight tying option (tied embed/lm_head) for upstream-nanochat compatibility.
-54. Add embedding scale option (`embed_scale=True`) per Karpathy nanochat standard.
+54. Add embedding scale option (embed_scale=True) per Karpathy nanochat standard.
 55. Add QK-norm option (post Q/K projections).
 56. Add gated attention option (sigmoid gate per head/channel).
 57. Add attention softcap and output softcap options.
-58. Build `cppmega_mlx/recipes/model_factory.py` with `local_gb10_quarter` (M0 target: depth=13, hidden=3584, FFN=18944, 28 heads, head_dim=128, MTP=2) as the first profile, plus `nam56r_full` (depth=52) and the d20/d26/d34/NAM52 references mirrored from `speedrun.sh`/`run1000.sh`.
+58. Build cppmega_mlx/recipes/model_factory.py with local_gb10_quarter (M0 target: depth=13, hidden=3584, FFN=18944, 28 heads, head_dim=128, MTP=2) as the first profile, plus nam56r_full (depth=52) and the d20/d26/d34/NAM52 references mirrored from speedrun.sh/run1000.sh.
 59. Validate vocab=65536 (local + cppmega tokenizer match) golden anchors. Drop the vocab=131072 alternate if not in the GB10 baseline; document non-claim if dropped.
-60. Add config schema validation: refuse invalid combos (e.g., DSA mode without indexer, MTP without `mtp_depth`).
+60. Add config schema validation: refuse invalid combos (e.g., DSA mode without indexer, MTP without mtp_depth).
 
 ### Stream D — Tokenizer & Data Pipeline (61–80)
 
 61. **Closed for M0.1**: vendor the GB10 HuggingFace JSON tokenizer and helper
-    into `cppmega_mlx/tokenizer/` after it satisfies the deployed M0.1 artifact
+    into cppmega_mlx/tokenizer/ after it satisfies the deployed M0.1 artifact
     contract. Live local revalidation on 2026-05-02
-    found that `nanochat/tokenizer.json` is 32K and that both
-    `nanochat/tokenizer_v3.json` and
-    `nanochat/config/tokenizer_v3_fixed_tokens.json` reserve id 7 for
-    `<CODE_START>`. A read-only GB10 check of
-    `/home/dave/cppmega-root/cpp_tokenizer_hf/tokenizer.json` and
-    `/home/dave/cppmega-root/data/tokenizer/tokenizer.json` found vocab=65536
-    with the same id-7 `<CODE_START>` mapping; the option-B extension renames
-    the reserved id-45 slot to `<FIM_INSTRUCTION>` without changing vocab size
+    found that nanochat/tokenizer.json is 32K and that both
+    nanochat/tokenizer_v3.json and
+    nanochat/config/tokenizer_v3_fixed_tokens.json reserve id 7 for
+    <CODE_START>. A read-only GB10 check of
+    /home/dave/cppmega-root/cpp_tokenizer_hf/tokenizer.json and
+    /home/dave/cppmega-root/data/tokenizer/tokenizer.json found vocab=65536
+    with the same id-7 <CODE_START> mapping; the option-B extension renames
+    the reserved id-45 slot to <FIM_INSTRUCTION> without changing vocab size
     or existing embedding rows. Do not retrain or rename these
     artifacts. Required local artifact contract is vocab=65536 with IDs
-    `2=BOS, 3=EOT/EOS, 4=FIM_PREFIX, 5=FIM_MIDDLE, 6=FIM_SUFFIX,
-    7=CODE_START, 45=FIM_INSTRUCTION, 46=SPACE, 47=NL`. Decode parity is
-    handled by the explicit `<SPACE>`/`<NL>` token redesign (encode collapses
-    `[\r\n]+`->`<NL>` and `[ \t]+`->`<SPACE>`, decode concatenates tokens and
+    2=BOS, 3=EOT/EOS, 4=FIM_PREFIX, 5=FIM_MIDDLE, 6=FIM_SUFFIX,
+    7=CODE_START, 45=FIM_INSTRUCTION, 46=SPACE, 47=NL. Decode parity is
+    handled by the explicit <SPACE>/<NL> token redesign (encode collapses
+    [\r\n]+-><NL> and [ \t]+-><SPACE>, decode concatenates tokens and
     substitutes sentinels back); this explicit-token approach matches the
-    CUDA-side `nanochat/cpp_tokenizer.py` updated decode. The M0.1 acceptance target
+    CUDA-side nanochat/cpp_tokenizer.py updated decode. The M0.1 acceptance target
     is Mac-vs-GB10 decode parity, with byte-exact round-trip for inputs
     without multi-char whitespace runs.
 62. Add tokenizer vocab assertion at model load (refuse mismatched ID→token mapping; assert vocab_size == 65536; assert presence of all reserved special tokens by id and string form).
-63. Extend the existing standalone Megatron `IndexedDataset` `.bin/.idx` reader seam with additional golden fixtures and scale checks.
+63. Extend the existing standalone Megatron IndexedDataset .bin/.idx reader seam with additional golden fixtures and scale checks.
 64. Add IndexedDataset multi-shard support and side-channel schema preservation; do not import Megatron runtime into the Mac path.
-65. Implement sequence packing: concat-with-EOS, cumulative doc-id; attention mask via `mx.cumsum` comparison.
+65. Implement sequence packing: concat-with-EOS, cumulative doc-id; attention mask via mx.cumsum comparison.
 66. Implement BOS-aligned best-fit packing (mirror nanochat-mlx loader).
-67. Add structure-embedding side-channels in batch: `structure_ids, dep_levels, ast_depth_ids, sibling_index, node_type` (already in `LMTokenBatch`; verify dataset emits them).
-68. Implement FIM data transform: PSM 50% / SPM 50%, `fim_rate=0.5`, random span sampling.
-69. Implement iFIM data transform: instruction-aware marker id=45 (`<FIM_INSTRUCTION>`), instruction extracted from docstrings/comments via tree-sitter.
+67. Add structure-embedding side-channels in batch: structure_ids, dep_levels, ast_depth_ids, sibling_index, node_type (already in LMTokenBatch; verify dataset emits them).
+68. Implement FIM data transform: PSM 50% / SPM 50%, fim_rate=0.5, random span sampling.
+69. Implement iFIM data transform: instruction-aware marker id=45 (<FIM_INSTRUCTION>), instruction extracted from docstrings/comments via tree-sitter.
 70. Implement AST-FIM transform via tree-sitter (optional dep behind extra), masking complete syntactic blocks per arXiv 2506.00204.
-71. Add data-loader workers via PyTorch DataLoader → NumPy → `mx.array` bridge (`num_workers, persistent_workers=True`). Current local status: a minimal optional bridge exists for already-local `LMTokenBatch` rows and lazy-imports `torch` only when explicitly requested; this is not a full Stream D closure.
-72. Add spawn-only multiprocessing enforcement (no fork after Metal init). Current local status: the optional DataLoader bridge defaults worker contexts to `spawn` and rejects explicit non-spawn contexts without requiring global `multiprocessing.set_start_method(...)`.
+71. Add data-loader workers via PyTorch DataLoader → NumPy → mx.array bridge (num_workers, persistent_workers=True). Current local status: a minimal optional bridge exists for already-local LMTokenBatch rows and lazy-imports torch only when explicitly requested; this is not a full Stream D closure.
+72. Add spawn-only multiprocessing enforcement (no fork after Metal init). Current local status: the optional DataLoader bridge defaults worker contexts to spawn and rejects explicit non-spawn contexts without requiring global multiprocessing.set_start_method(...).
 73. Implement deterministic shuffle with seed checkpoint (record cursor + RNG state).
-74. Verify Parquet loader (existing `cppmega_mlx/data/parquet`) handles structure side-channels.
-75. Verify NPZ loader (existing `cppmega_mlx/data/npz`) handles structure side-channels.
+74. Verify Parquet loader (existing cppmega_mlx/data/parquet) handles structure side-channels.
+75. Verify NPZ loader (existing cppmega_mlx/data/npz) handles structure side-channels.
 76. Validate tokenizer round-trip on golden corpus (10K samples, exact byte match).
 77. Add tokenizer parity test vs CUDA cppmega tokenizer (encode-decode equivalence).
-78. Add `scripts/data_smoke.py` for end-to-end ingress check (`.bin/.idx` → packed → batched → forward).
-79. Document data format in `docs/data_pipeline.md` (file layout, special tokens, packing algorithm, FIM rates).
+78. Add scripts/data_smoke.py for end-to-end ingress check (.bin/.idx → packed → batched → forward).
+79. Document data format in docs/data_pipeline.md (file layout, special tokens, packing algorithm, FIM rates).
 80. Add stress test: 100M-token shard, measure throughput and peak memory.
 
 ### Stream E — Training Loop & Checkpointing (81–100)
 
 81. Standardize on AdamW for single-Mac M0 (≤3B mini on 128 GB) and the future 128+128 peer; switch to Lion for the 128+48 heterogeneous Stream F smoke (only path that fits the 48 GB peer with ZeRO-1). Document the switch threshold and rationale.
 82. Add Muon optimizer port (mirror nanochat fork) — optional path.
-83. Wire fp32 master moments for AdamW (bf16 weights + fp32 m,v); confirm via `optimizer.state` dtype assertion.
+83. Wire fp32 master moments for AdamW (bf16 weights + fp32 m,v); confirm via optimizer.state dtype assertion.
 84. Add LR scheduler: cosine annealing + linear warmup; pluggable schedules.
 85. Add gradient clipping (norm-based, default 1.0).
-86. Add gradient accumulation (configurable `accum_steps`).
-87. Add MTP loss head (training-side) with `mtp_depth=2` default (matches GB10 `local_gb10_quarter`), β decay = 0.6 (`CPPMEGA_FASTMTP_DECAY`), λ = 0.3 (`CPPMEGA_FASTMTP_LAMBDA`). K=3 added as a benchmark variant once K=2 is at parity.
+86. Add gradient accumulation (configurable accum_steps).
+87. Add MTP loss head (training-side) with mtp_depth=2 default (matches GB10 local_gb10_quarter), β decay = 0.6 (CPPMEGA_FASTMTP_DECAY), λ = 0.3 (CPPMEGA_FASTMTP_LAMBDA). K=3 added as a benchmark variant once K=2 is at parity.
 88. Add STP auxiliary loss (geodesic regularization, ~100 LOC, XLA-safe static shapes).
-89. Compose total loss: `L = L_NTP + λ_MTP · L_MTP + λ_STP · L_STP`.
+89. Compose total loss: L = L_NTP + λ_MTP · L_MTP + λ_STP · L_STP.
 90. Add per-loss metrics tracking (next-token CE, MTP-k CE per depth, STP cosine).
 91. Validate compiled training step end-to-end (forward + backward + update) on tiny model; loss decrease.
-92. Save sharded `.safetensors` checkpoints: per-rank shard, `model.safetensors.index.json` manifest.
-93. Save `optimizer.safetensors` (flattened state tree via `tree_flatten`).
-94. Save `train_state.json`: `{step, epoch, rng_seed, dataloader_cursor, mx.random.state b64, package_versions}`.
-95. Async checkpoint saver: spawn background thread post-`mx.eval`; non-blocking.
+92. Save sharded .safetensors checkpoints: per-rank shard, model.safetensors.index.json manifest.
+93. Save optimizer.safetensors (flattened state tree via tree_flatten).
+94. Save train_state.json: {step, epoch, rng_seed, dataloader_cursor, mx.random.state b64, package_versions}.
+95. Async checkpoint saver: spawn background thread post-mx.eval; non-blocking.
 96. Resumable training: rebuild dataloader cursor + RNG state on load; loss-curve continuity test.
-97. Add checkpoint-conversion utility: HuggingFace `.safetensors` → cppmega_mlx (handle Conv2d OIHW→OHWI if any).
+97. Add checkpoint-conversion utility: HuggingFace .safetensors → cppmega_mlx (handle Conv2d OIHW→OHWI if any).
 98. Add weight surgery: load partial weights, freeze layer ranges (for staged training).
-99. Add LoRA / QLoRA fine-tuning only after an installed-API audit; treat `mlx_lm.lora` as a reference pattern until cppmega_mlx checkpoint compatibility is proven locally.
-100. Wire W&B logging (`--report-to wandb`); also TensorBoard fallback.
+99. Add LoRA / QLoRA fine-tuning only after an installed-API audit; treat mlx_lm.lora as a reference pattern until cppmega_mlx checkpoint compatibility is proven locally.
+100. Wire W&B logging (--report-to wandb); also TensorBoard fallback.
 
 #### Stream E addendum — Optimizer choices (Muon / AdamW / Lion) (2026-05-03)
 
@@ -401,12 +560,12 @@ throughput claim.
 | Lion  lr=3e-3    | 32.7      | 11.215  | 4.60        | 1.86  | 9141  |
 
 Conclusion: Lion at roughly 3× AdamW LR matches AdamW; Lion optimizer state is 0.5×
-AdamW; throughput equal to within noise. On the 1.985B `local_gb10_quarter` model that
+AdamW; throughput equal to within noise. On the 1.985B local_gb10_quarter model that
 trade-off is approximately **13 GiB optimizer-state savings** when Lion is used.
 Single-Mac M0 default stays AdamW; Lion remains the documented memory-tight option (and
 the only path that fits the 48 GB peer in the heterogeneous Stream F smoke per step 81).
-Default Lion config when invoked: `make_lion(lr=3e-4, betas=(0.9, 0.99), wd=0.1)` — the
-`wd=0.1` figure is 10× AdamW per Chen et al. arXiv 2302.06675.
+Default Lion config when invoked: make_lion(lr=3e-4, betas=(0.9, 0.99), wd=0.1) — the
+wd=0.1 figure is 10× AdamW per Chen et al. arXiv 2302.06675.
 
 TinyLM table validates LR scaling and state-size delta only. The production
 throughput receipt at the M0 target shape lives in the next sub-section.
@@ -414,24 +573,24 @@ throughput receipt at the M0 target shape lives in the next sub-section.
 ##### 100-step throughput sweep on local_gb10_quarter at T=4096 (~1.985B, depth=13) (2026-05-03)
 
 This row is the production throughput receipt at the M0 target shape (T=4096
-matches the cppmega parquet corpus shape — `clang_semantic_4k_v10` /
-`clang_commits_4k_v1`). Bench script
-`scripts/bench_local_gb10_quarter_throughput.py`, receipt
-`bench/baselines/local_gb10_quarter_throughput_m4.json`, summary
-`docs/bench_local_gb10_quarter_production.md`. bf16 weights with
-grad-checkpoint, fp32 master moments, CCE chunked logits (no full `[B*T, V]`
-materialization), Path B kernels (`mamba3_mimo` + `m2rnn`
-`metal_kernel_fwd_v1`) verified on the first measured step.
+matches the cppmega parquet corpus shape — clang_semantic_4k_v10 /
+clang_commits_4k_v1). Bench script
+scripts/bench_local_gb10_quarter_throughput.py, receipt
+bench/baselines/local_gb10_quarter_throughput_m4.json, summary
+docs/bench_local_gb10_quarter_production.md. bf16 weights with
+grad-checkpoint, fp32 master moments, CCE chunked logits (no full [B*T, V]
+materialization), Path B kernels (mamba3_mimo + m2rnn
+metal_kernel_fwd_v1) verified on the first measured step.
 
-A. Lion `lr=3e-3, betas=(0.9, 0.99), wd=0.1` — empirically-optimal LR from
+A. Lion lr=3e-3, betas=(0.9, 0.99), wd=0.1 — empirically-optimal LR from
 the TinyLM smoke above:
 
 <!-- LION_TABLE -->
 
-B. Muon+AdamW `make_muon(cppmega_cuda_parity=True)` — both groups share
-`lr=1e-4, betas_adamw=(0.9, 0.999)`, Nesterov off, NS steps=5, fp32 NS
-carrier; 2-D `nn.Linear` weights → Muon, embeddings/lm_head/RMSNorm/Mamba
-scalars → AdamW (Megatron `_is_nonlinear_or_embedding` predicate inverted).
+B. Muon+AdamW make_muon(cppmega_cuda_parity=True) — both groups share
+lr=1e-4, betas_adamw=(0.9, 0.999), Nesterov off, NS steps=5, fp32 NS
+carrier; 2-D nn.Linear weights → Muon, embeddings/lm_head/RMSNorm/Mamba
+scalars → AdamW (Megatron _is_nonlinear_or_embedding predicate inverted).
 This is the configuration GB10 actually runs.
 
 <!-- MUON_TABLE -->
@@ -450,16 +609,16 @@ runs):
 
 ##### 50-step throughput sweep on local_gb10_quarter at T=4096 under 60 GB cap (Docker present) (2026-05-03)
 
-This row is the production throughput receipt at the M0 target shape (T=4096) under a Docker-imposed 60 GB unified-memory ceiling on the M4 Max (peak-memory cap 58 GB; 2 GB safety margin). Bench script `scripts/bench_local_gb10_quarter_throughput.py`, receipt `bench/baselines/local_gb10_quarter_throughput_60gb_m4.json`, summary `docs/bench_local_gb10_quarter_production.md`. bf16 weights with grad-checkpoint, fp32 master moments, CCE chunked logits, Path B kernels (`mamba3_mimo` + `m2rnn` `metal_kernel_fwd_v1`) verified on the first measured step. 50 steps / 25 warmup per (optimizer, B). Both optimizers cap at B=1 because B=2 jumps to ~83 GB peak, which is the cap-hit signal — not a throughput plateau.
+This row is the production throughput receipt at the M0 target shape (T=4096) under a Docker-imposed 60 GB unified-memory ceiling on the M4 Max (peak-memory cap 58 GB; 2 GB safety margin). Bench script scripts/bench_local_gb10_quarter_throughput.py, receipt bench/baselines/local_gb10_quarter_throughput_60gb_m4.json, summary docs/bench_local_gb10_quarter_production.md. bf16 weights with grad-checkpoint, fp32 master moments, CCE chunked logits, Path B kernels (mamba3_mimo + m2rnn metal_kernel_fwd_v1) verified on the first measured step. 50 steps / 25 warmup per (optimizer, B). Both optimizers cap at B=1 because B=2 jumps to ~83 GB peak, which is the cap-hit signal — not a throughput plateau.
 
-A. Lion `lr=3e-3, betas=(0.9, 0.99), wd=0.1`:
+A. Lion lr=3e-3, betas=(0.9, 0.99), wd=0.1:
 
 | B | tok/s median | tok/s p10 | tok/s p90 | peak GB | % of 60 GB | loss[0] | mean_last10 | opt state GB | cap hit |
 | - | ------------ | --------- | --------- | ------- | ---------- | ------- | ----------- | ------------ | ------- |
 | 1 | 762 | 739 | 779 | 53.69 | 89.5% | 11.262 | 71.176 | 11.58 | no |
 | 2 | - | - | - | 83.17 | 138.6% | 11.263 | 11.263 | 11.58 | yes |
 
-B. Muon+AdamW `make_muon(cppmega_cuda_parity=True)`:
+B. Muon+AdamW make_muon(cppmega_cuda_parity=True):
 
 | B | tok/s median | tok/s p10 | tok/s p90 | peak GB | % of 60 GB | loss[0] | mean_last10 | opt state GB | cap hit |
 | - | ------------ | --------- | --------- | ------- | ---------- | ------- | ----------- | ------------ | ------- |
@@ -487,147 +646,147 @@ Conclusions: (a) the 58 GB cap, not a throughput plateau, is the limit on M4 Max
 
 ##### Bag 1 receipt — param + grad buffer aliasing audit (2026-05-03)
 
-Param aliasing fix (commit `df80703`) verified to also kill grad-buffer aliasing — `scripts/audit_grad_buffer_reuse.py` receipt at `bench/baselines/grad_buffer_audit.json`. Production `local_gb10_quarter` (bf16 default, B=1 T=256) now reports `param_entries=335`, `grad_entries=335`, `param_total_numel == grad_total_numel == 1,796,521,354` (matches the `audit_memory` 1.797B unique-param count, NOT the pre-fix 3.108B aliased count), `grad_param_byte_ratio=1.000000`, zero aliased ids in either tree. Verdict: `no double allocation`. The −5.16 GiB Lion-state savings already documented above (`11.58 → 6.69 GiB` after the fix) is therefore consistent with grads also being allocated exactly once per unique parameter, not twice as in the pre-fix walk. Fast smoke regression in `tests/test_grad_buffer_no_aliasing.py` runs in ~1 s on the tiny-smoke profile.
+Param aliasing fix (commit df80703) verified to also kill grad-buffer aliasing — scripts/audit_grad_buffer_reuse.py receipt at bench/baselines/grad_buffer_audit.json. Production local_gb10_quarter (bf16 default, B=1 T=256) now reports param_entries=335, grad_entries=335, param_total_numel == grad_total_numel == 1,796,521,354 (matches the audit_memory 1.797B unique-param count, NOT the pre-fix 3.108B aliased count), grad_param_byte_ratio=1.000000, zero aliased ids in either tree. Verdict: no double allocation. The −5.16 GiB Lion-state savings already documented above (11.58 → 6.69 GiB after the fix) is therefore consistent with grads also being allocated exactly once per unique parameter, not twice as in the pre-fix walk. Fast smoke regression in tests/test_grad_buffer_no_aliasing.py runs in ~1 s on the tiny-smoke profile.
 
 ##### Bag 2 receipt — Lion fp32 vs Lion8bit memory comparison (2026-05-03)
 
-Local M4 receipt at `bench/baselines/lion8bit_state_size_m4.json` (script `scripts/bench_lion8bit.py`) on the full `local_gb10_quarter` (1.797B params, bf16 weights). Mirrors `bitsandbytes.optim.Lion8bit` on the GB10 CUDA stack — see `cppmega/docs/lion8bit_ab_2026_04_25.md` for the matched 2-iter A/B run that documented the same trade-off (~0.34 GiB optimizer-state savings on the AdamW group at the cppmega scale; the savings here are larger because Lion8bit replaces the *full* persistent momentum tensor, not just a scalar fallback group).
+Local M4 receipt at bench/baselines/lion8bit_state_size_m4.json (script scripts/bench_lion8bit.py) on the full local_gb10_quarter (1.797B params, bf16 weights). Mirrors bitsandbytes.optim.Lion8bit on the GB10 CUDA stack — see cppmega/docs/lion8bit_ab_2026_04_25.md for the matched 2-iter A/B run that documented the same trade-off (~0.34 GiB optimizer-state savings on the AdamW group at the cppmega scale; the savings here are larger because Lion8bit replaces the *full* persistent momentum tensor, not just a scalar fallback group).
 
 | optimizer       | persistent state per param | total state for 1.797B | step time M4 (B=1, T=64) | peak GiB (M4) |
 | --------------- | -------------------------- | ---------------------- | ------------------------ | ------------- |
 | LionFP32Moments | 4.000 B (fp32 m)           | 6.69 GiB               | 538 ms (median)          | 27.7          |
 | Lion8bit        | 1.016 B (uint8 m + fp32 absmax / 256) | 1.70 GiB    | 617 ms (median)          | 23.6          |
 
-Compaction ratio: **3.94x state shrink** (gates >=3.0x); step time is ~14.7% slower than LionFP32Moments because every `apply_single` does an extra dequant (uint8 -> fp32) + requant (fp32 -> uint8) round trip — there is no fused Metal kernel for Lion8bit yet (vs the `_fused_adam8bit_kernel.py` fast path used by Adam8bit on the symmetric scheme). 50-step Lion vs Lion8bit loss-trajectory smoke on noisy linear regression: median per-step relative drift 0.16%, max early-step drift 0.003% (well within the 2% policy). Acceptance harness in `tests/test_optimizers_quantized.py::test_lion8bit_loss_matches_lion_fp32_within_tolerance`.
+Compaction ratio: **3.94x state shrink** (gates >=3.0x); step time is ~14.7% slower than LionFP32Moments because every apply_single does an extra dequant (uint8 -> fp32) + requant (fp32 -> uint8) round trip — there is no fused Metal kernel for Lion8bit yet (vs the _fused_adam8bit_kernel.py fast path used by Adam8bit on the symmetric scheme). 50-step Lion vs Lion8bit loss-trajectory smoke on noisy linear regression: median per-step relative drift 0.16%, max early-step drift 0.003% (well within the 2% policy). Acceptance harness in tests/test_optimizers_quantized.py::test_lion8bit_loss_matches_lion_fp32_within_tolerance.
 
-`make_muon(scalar_optimizer="lion8bit")` routes the AdamW (scalar / embedding) group to `Lion8bit`, mirroring `cppmega.cuda`'s `--muon-scalar-optimizer lion8bit` knob. The `lion8bit_quant_scheme` factory argument selects `"symmetric_int8_v1"` (default) or `"dynamic_int8_v1"` (bnb LUT parity), reusing the codec dispatch from `_quantize_8bit.quantize_blockwise`. Default stays symmetric for backwards compatibility; the dynamic LUT is the closer match to `bitsandbytes.optim.Lion8bit` numerics on CUDA.
+make_muon(scalar_optimizer="lion8bit") routes the AdamW (scalar / embedding) group to Lion8bit, mirroring cppmega.cuda's --muon-scalar-optimizer lion8bit knob. The lion8bit_quant_scheme factory argument selects "symmetric_int8_v1" (default) or "dynamic_int8_v1" (bnb LUT parity), reusing the codec dispatch from _quantize_8bit.quantize_blockwise. Default stays symmetric for backwards compatibility; the dynamic LUT is the closer match to bitsandbytes.optim.Lion8bit numerics on CUDA.
 
 ##### cppmega CUDA optimizer wiring (reference, not status)
 
-cppmega CUDA uses `MultiOptimizer = Muon + adam8bit` via the Megatron emerging_optimizers
-registry. Param-category mapping (predicate `_is_nonlinear_or_embedding` at
-`megatron-lm/megatron/core/optimizer/emerging_optimizers.py:125-132`):
+cppmega CUDA uses MultiOptimizer = Muon + adam8bit via the Megatron emerging_optimizers
+registry. Param-category mapping (predicate _is_nonlinear_or_embedding at
+megatron-lm/megatron/core/optimizer/emerging_optimizers.py:125-132):
 
-- **Muon** — every 2D `nn.Linear.weight`: attention QKV/O, MLP up/down/gate, MoE experts.
+- **Muon** — every 2D nn.Linear.weight: attention QKV/O, MLP up/down/gate, MoE experts.
 - **AdamW (or adam8bit fallback)** — 1D params (RMSNorm/LayerNorm weights, biases), 3D+
-  tensors, embeddings, `lm_head`, Mamba scalars (`A_log`, `D`, `dt_bias`, `B_bias`,
-  `C_bias`, `mimo_*`).
+  tensors, embeddings, lm_head, Mamba scalars (A_log, D, dt_bias, B_bias,
+  C_bias, mimo_*).
 
 Lion is **not** used as a fallback in the cppmega CUDA wiring; the historical fallback is
-`adam8bit` with no documented reason beyond "Megatron default". cppmega applies a single
-shared `--lr 1e-4` to both groups. The Keller paper recommends Muon LR roughly 10×
+adam8bit with no documented reason beyond "Megatron default". cppmega applies a single
+shared --lr 1e-4 to both groups. The Keller paper recommends Muon LR roughly 10×
 AdamW LR; **cppmega does not apply this split**, so any cppmega-CUDA-trace-bit parity
-test must run with `cppmega_cuda_parity=True` (forces shared lr=1e-4) rather than the
-Keller-recommended split. cppmega defaults: `momentum=0.95, nesterov=False,
-num_ns_steps=5, weight_decay=0.01, clip_grad=1.0`. Environment knobs:
-`CPPMEGA_OPTIMIZER`, `CPPMEGA_LR`, `CPPMEGA_MUON_MOMENTUM`, `CPPMEGA_MUON_NUM_NS_STEPS`,
-`CPPMEGA_MUON_NS_CARRIER`, `CPPMEGA_MUON_TP_MODE`.
+test must run with cppmega_cuda_parity=True (forces shared lr=1e-4) rather than the
+Keller-recommended split. cppmega defaults: momentum=0.95, nesterov=False,
+num_ns_steps=5, weight_decay=0.01, clip_grad=1.0. Environment knobs:
+CPPMEGA_OPTIMIZER, CPPMEGA_LR, CPPMEGA_MUON_MOMENTUM, CPPMEGA_MUON_NUM_NS_STEPS,
+CPPMEGA_MUON_NS_CARRIER, CPPMEGA_MUON_TP_MODE.
 
 This addendum documents the reference wiring and the LR-split divergence; no cppmega.mlx
 optimizer code change is implied here. Implementation is tracked under the parent epic
-`cppmega-mlx-c08` ([epic] Optimizer parity with cppmega CUDA).
+cppmega-mlx-c08 ([epic] Optimizer parity with cppmega CUDA).
 
 ##### Follow-up beads issues
 
-- `cppmega-mlx-c08.1` — make_muon group-splitter for CUDA parity (P2). Multi-optimizer
-  pattern mirroring `_is_nonlinear_or_embedding`. Defaults: Muon `lr=2e-3,
-  momentum=0.95, nesterov=True, ns_steps=5`; AdamW `lr=1e-4, betas=(0.9, 0.95), wd=0.01`.
-  Optional `cppmega_cuda_parity=True` flag forces shared lr=1e-4.
-- `cppmega-mlx-c08.2` — Pure-MLX CCE (cut_cross_entropy) port (P2). Scoped opt-in train
-  integration has landed via `--loss-backend cce` and matches the masked HybridTiny CE
+- cppmega-mlx-c08.1 — make_muon group-splitter for CUDA parity (P2). Multi-optimizer
+  pattern mirroring _is_nonlinear_or_embedding. Defaults: Muon lr=2e-3,
+  momentum=0.95, nesterov=True, ns_steps=5; AdamW lr=1e-4, betas=(0.9, 0.95), wd=0.01.
+  Optional cppmega_cuda_parity=True flag forces shared lr=1e-4.
+- cppmega-mlx-c08.2 — Pure-MLX CCE (cut_cross_entropy) port (P2). Scoped opt-in train
+  integration has landed via --loss-backend cce and matches the masked HybridTiny CE
   semantics in focused tests. The issue stays open for full backward parity and the
-  accepted large-shape memory receipt (`B=4,T=512,V=65536`, `>=4x` reduction).
-- `cppmega-mlx-c08.3` — Document Lion vs AdamW state-cost trade-off (P3). 0.5× state
-  savings + 3× LR rule for cppmega.mlx context; Lion not default; `make_lion(lr=3e-4,
-  betas=(0.9, 0.99), wd=0.1)` per Chen et al. 2302.06675.
-- `cppmega-mlx-c08.4` — Add `muon_ns_carrier=bf16` option (P3). Mirrors cppmega
-  `CPPMEGA_MUON_NS_CARRIER=bf16`. Saves ~1.5× compute per NS iter at no quality cost
+  accepted large-shape memory receipt (B=4,T=512,V=65536, >=4x reduction).
+- cppmega-mlx-c08.3 — Document Lion vs AdamW state-cost trade-off (P3). 0.5× state
+  savings + 3× LR rule for cppmega.mlx context; Lion not default; make_lion(lr=3e-4,
+  betas=(0.9, 0.99), wd=0.1) per Chen et al. 2302.06675.
+- cppmega-mlx-c08.4 — Add muon_ns_carrier=bf16 option (P3). Mirrors cppmega
+  CPPMEGA_MUON_NS_CARRIER=bf16. Saves ~1.5× compute per NS iter at no quality cost
   per cppmega CUDA traces.
 
 #### Stream E addendum — Grad dtype contract (no fp32 grad accumulation) (2026-05-03)
 
 **Policy**: gradients match parameter dtype. We do **not** promote grads to fp32 for
-accumulation. With `local_gb10_quarter()` defaulting to `mx.bfloat16` since commit
-`df80703` (kill param aliasing + default to bf16), this means bf16 weights are paired
+accumulation. With local_gb10_quarter() defaulting to mx.bfloat16 since commit
+df80703 (kill param aliasing + default to bf16), this means bf16 weights are paired
 with bf16 grads at 1.797B params: **3.346 GiB params + 3.346 GiB grads** (1:1 ratio,
 not 2:1). Promoting grads to fp32 would double the gradient buffer to 6.69 GiB and
 silently cost ~3.3 GiB of extra unified memory per step.
 
-This mirrors cppmega CUDA's `--accumulate-allreduce-grads-in-fp32 = false` policy from
-`cppmega/docs/gb10_local_memory_perf_2026_04_25.md:47-51` ("BF16 training no longer
-auto-enables FP32 grad accumulation/reduction; `--accumulate-allreduce-grads-in-fp32`
-is rejected"). MLX honors this by default: `nn.value_and_grad` produces grads in the
+This mirrors cppmega CUDA's --accumulate-allreduce-grads-in-fp32 = false policy from
+cppmega/docs/gb10_local_memory_perf_2026_04_25.md:47-51 ("BF16 training no longer
+auto-enables FP32 grad accumulation/reduction; --accumulate-allreduce-grads-in-fp32
+is rejected"). MLX honors this by default: nn.value_and_grad produces grads in the
 same dtype as the parameter being differentiated, with no implicit fp32 cast.
 
 Receipts:
 
-- Smoke contract `tests/test_grad_dtype_contract.py` (5 fast cases, <2s):
+- Smoke contract tests/test_grad_dtype_contract.py (5 fast cases, <2s):
   bf16 / fp32 / fp16 model dtypes each yield grads matching that dtype; the helper
   rejects a synthetically promoted leaf; bf16 grad-buffer == bf16 param-buffer 1:1.
-- Production receipt `tests/test_grad_dtype_contract.py::test_grads_match_bf16_on_full_local_gb10_quarter`
-  (opt-in via `CPPMEGA_GRAD_DTYPE_PRODUCTION_SHAPE=1`, ~3.4s on M4 Max 128 GB):
-  full 1.797B-parameter `local_gb10_quarter()` runs one
-  `next_token_cut_cross_entropy` forward+backward; observed
-  `params=3.346 GiB, grads=3.346 GiB, ratio=1.000`.
-- Defensive runtime check `cppmega_mlx.training.loop.assert_grad_dtype_matches_param_dtype`
-  is gated by `STRICT_DTYPE_CONTRACT=1` (off by default, available for debugging).
+- Production receipt tests/test_grad_dtype_contract.py::test_grads_match_bf16_on_full_local_gb10_quarter
+  (opt-in via CPPMEGA_GRAD_DTYPE_PRODUCTION_SHAPE=1, ~3.4s on M4 Max 128 GB):
+  full 1.797B-parameter local_gb10_quarter() runs one
+  next_token_cut_cross_entropy forward+backward; observed
+  params=3.346 GiB, grads=3.346 GiB, ratio=1.000.
+- Defensive runtime check cppmega_mlx.training.loop.assert_grad_dtype_matches_param_dtype
+  is gated by STRICT_DTYPE_CONTRACT=1 (off by default, available for debugging).
 
 This pins the policy as a regression gate. Any future change that lifts grads to fp32
-(e.g., enabling `accumulate-allreduce-grads-in-fp32`-style behaviour, an inadvertent
-`.astype(mx.float32)` inside `next_token_cut_cross_entropy`, or a Megatron-style fp32
+(e.g., enabling accumulate-allreduce-grads-in-fp32-style behaviour, an inadvertent
+.astype(mx.float32) inside next_token_cut_cross_entropy, or a Megatron-style fp32
 grad-buffer wrapper) will fail one of these tests before it lands a 2× peak-memory
-regression. The fp32-master-moments path (Stream E #83, AdamW `m,v` in fp32) lives in
+regression. The fp32-master-moments path (Stream E #83, AdamW m,v in fp32) lives in
 the optimizer state, **not** in the gradient buffer, and remains unchanged.
 
 ### Stream F — Distributed & Multi-Mac (101–120)
 
-101. Add `mx.distributed.init(backend='auto')` to launcher.
-102. Add `scripts/mlx_launch.py` wrapper around `mlx.launch -n N`.
+101. Add mx.distributed.init(backend='auto') to launcher.
+102. Add scripts/mlx_launch.py wrapper around mlx.launch -n N.
 103. Add JACCL/ring setup helper as an experimental MLX distributed lane, clearly separate from Megatron distributed parity.
-104. Implement data-parallel via `nn.average_gradients` across ranks.
-105. Implement tensor-parallel via `nn.AllToShardedLinear` / `nn.ShardedToAllLinear` for attention/MLP.
+104. Implement data-parallel via nn.average_gradients across ranks.
+105. Implement tensor-parallel via nn.AllToShardedLinear / nn.ShardedToAllLinear for attention/MLP.
 106. Prototype ZeRO-1-style optimizer-state sharding only after a repo-local distributed smoke exists; do not label it Megatron/FSDP parity. **Required for the 128+48 heterogeneous smoke** — the 48 GB peer cannot hold a full Lion or AdamW state without ZeRO-1.
-107. Add per-rank checkpoint shard naming: `model_rank{R}_of{N}.safetensors`.
+107. Add per-rank checkpoint shard naming: model_rank{R}_of{N}.safetensors.
 108. Add multi-Mac launch test on the 128+48 heterogeneous pair over TB5: end-to-end Lion + ZeRO-1 training step at depth-13 mini. Goal is to validate the distributed code path works, not to chase throughput parity with single-Mac AdamW.
-109. Profile JACCL `all_sum` throughput on a locally verified TB5/RDMA setup before setting any performance target.
-110. Profile ring `all_sum` throughput on TB4 (baseline).
+109. Profile JACCL all_sum throughput on a locally verified TB5/RDMA setup before setting any performance target.
+110. Profile ring all_sum throughput on TB4 (baseline).
 111. Add fail-soft: if JACCL not available, drop to ring with warning.
-112. Document distributed setup in `docs/distributed.md` (host file format, ring/JACCL config).
+112. Document distributed setup in docs/distributed.md (host file format, ring/JACCL config).
 113. Add expert-parallel for MoE layers (mirror cppmega EP).
 114. Add pipeline-parallel scaffolding (helpers + schedule); defer full impl (high complexity, low priority on single-machine).
 115. Validate gradient determinism across distributed runs (same seed → same loss to bit-identity at full precision).
 116. Add per-rank thermal monitoring; auto-pause + checkpoint if any node thermal-throttles.
 117. Add NCCL backend gate (CUDA hosts only — N/A for Mac, raise NotImplementedError).
-118. Add `tests/test_distributed_smoke.py`: 2-rank toy run on single machine via TCP loopback.
+118. Add tests/test_distributed_smoke.py: 2-rank toy run on single machine via TCP loopback.
 119. Run mlx-pretrain-style 2-Mac toy run at scale (~100M tokens, ~30 min); record throughput.
-120. Expand `docs/multimac_training.md` (initial role-stub already lands at the start of Stream F): full playbook with hardware list, network topology, run scripts, role transitions (48 GB scout↔peer when 2nd 128 GB arrives), and JACCL vs ring fallback decision tree.
+120. Expand docs/multimac_training.md (initial role-stub already lands at the start of Stream F): full playbook with hardware list, network topology, run scripts, role transitions (48 GB scout↔peer when 2nd 128 GB arrives), and JACCL vs ring fallback decision tree.
 
 #### Stream F sub-section: ZeRO-1 wrapper scaffold (covers step 106)
 
-`cppmega_mlx.training.distributed_optimizer.DistributedZeRO1Optimizer` lands as
+cppmega_mlx.training.distributed_optimizer.DistributedZeRO1Optimizer lands as
 the MLX-native ZeRO-1 (optimizer-state sharding) wrapper for step 106. It wraps
-any of the three cppmega.mlx optimizers (`AdamWFP32Moments`,
-`LionFP32Moments`, `MuonAdamWMulti`) and shards optimizer state across
-`mx.distributed` ranks via:
+any of the three cppmega.mlx optimizers (AdamWFP32Moments,
+LionFP32Moments, MuonAdamWMulti) and shards optimizer state across
+mx.distributed ranks via:
 
-- `mx.distributed.all_sum` (gradients, divided by `world_size` for DDP-style mean).
-- Round-robin per-leaf shard assignment (`leaves[R::W]`) restricting the inner
-  optimizer's state to only `1 / world_size` of leaves.
-- `mx.distributed.all_sum` over zero-padded contributions per leaf to gather
+- mx.distributed.all_sum (gradients, divided by world_size for DDP-style mean).
+- Round-robin per-leaf shard assignment (leaves[R::W]) restricting the inner
+  optimizer's state to only 1 / world_size of leaves.
+- mx.distributed.all_sum over zero-padded contributions per leaf to gather
   the full updated parameter tree (round-robin shapes are non-uniform per
-  rank, so direct `all_gather` does not apply; the sparse-sum pattern is one
+  rank, so direct all_gather does not apply; the sparse-sum pattern is one
   collective per leaf).
 
 Status: **scaffold + single-rank receipts; multi-node receipt pending peer-48
 hardware**. Single-Mac single-rank runs are bit-identical to wrapping nothing
-(the wrapper short-circuits when `world_size == 1`). The 9-test simulation
-suite in `tests/test_distributed_zero1.py` covers world-size-1 numerical
+(the wrapper short-circuits when world_size == 1). The 9-test simulation
+suite in tests/test_distributed_zero1.py covers world-size-1 numerical
 identity, world-size-2 disjoint shard assignment, simulated W=2 loss within
 1% of non-sharded, and ~50% memory reduction at W=2 on a balanced stack.
 
 The full hand-off procedure for the 2-node receipt is in
-`docs/distributed_zero1_smoke_procedure.md`. Until
-`bench/baselines/zero1_smoke_2node.json` exists, the wrapper does not carry
+docs/distributed_zero1_smoke_procedure.md. Until
+bench/baselines/zero1_smoke_2node.json exists, the wrapper does not carry
 a multi-node Megatron-parity claim — only a single-Mac scaffold receipt with
 simulated multi-rank coverage.
 
@@ -635,131 +794,131 @@ simulated multi-rank coverage.
 
 121. Standardize default dtype = bf16 for training; assert at model init.
 122. Add dtype assertion in optimizer: refuse fp32 weights for training (catch accidental upcasts).
-123. Implement `mx.quantize` integration for inference: `mode='affine'`, `bits=4`, `group_size=64`.
-124. Add per-layer quantization predicate (skip `embed_tokens` / `lm_head` → q8 instead of q4).
-125. Add `scripts/quantize_checkpoint.py` wrapping `mlx_lm.convert` for cppmega_mlx checkpoints.
+123. Implement mx.quantize integration for inference: mode='affine', bits=4, group_size=64.
+124. Add per-layer quantization predicate (skip embed_tokens / lm_head → q8 instead of q4).
+125. Add scripts/quantize_checkpoint.py wrapping mlx_lm.convert for cppmega_mlx checkpoints.
 126. Add post-quantization perplexity validation: q4-converted model PPL within +0.05 of bf16 on held-out slice.
 127. Add KV-cache quantization (kv_bits=4, kv_group_size=64, quantized_kv_start=256).
 128. Test q4 vs bf16 inference latency on M4 Max; record local deltas without a fixed speedup target.
 129. Add q8 path (more conservative: 2× compression, near-zero quality loss).
-130. Benchmark affine q4 inference first; keep `mxfp4`/`nvfp4` comparisons hardware-gated and outside M4 training claims.
-131. Document quantization in `docs/quantization.md` with phase plan and DO/DON'T list.
+130. Benchmark affine q4 inference first; keep mxfp4/nvfp4 comparisons hardware-gated and outside M4 training claims.
+131. Document quantization in docs/quantization.md with phase plan and DO/DON'T list.
 132. Add quantization parity test: bf16 vs q4 on tiny model; per-token KLD < 0.05.
-133. Implement DWQ fine-tuning pipeline (mlx-lm `LEARNED_QUANTS.md` pattern).
+133. Implement DWQ fine-tuning pipeline (mlx-lm LEARNED_QUANTS.md pattern).
 134. Add AWQ fine-tuning pipeline.
 135. Add GPTQ fine-tuning pipeline.
 136. Document phased adoption: A bf16 training → B q4 inference → C KV q4 inference → D int8 research → E fp8-family research only when hardware/source/tests support it.
-137. Add explicit refusal for FP8-family training paths on M4 (`raise NotImplementedError` with message pointing at phase plan).
+137. Add explicit refusal for FP8-family training paths on M4 (raise NotImplementedError with message pointing at phase plan).
 138. Verify any future fp8-family API only in a hardware-gated research lane; do not make it a current M4 support gate.
 139. Add GGUF export gate (for llama.cpp comparison runs); not a primary path but useful for benchmarking.
 140. Add comparison harness: cppmega_mlx q4 vs llama.cpp q4 throughput on same model.
 
 ### Stream H — Features (engram / mhc / mtp / fim / ifim / stp) (141–160)
 
-Cross-stream note: ngram_hash is **already done** (cppmega_mlx/nn/ngram_hash.py). Skip. Current dirty-tree feature slices are partial: `cppmega_mlx/nn/engram.py` is standalone, `cppmega_mlx/nn/mhc.py` is standalone, `cppmega_mlx/data/fim.py` is a CPU FIM/iFIM transform slice, and `cppmega_mlx/training/mtp.py` is a local training-side MTP helper. They are not NAM56R-integrated, not CUDA/Megatron parity receipts, and do not close this stream.
+Cross-stream note: ngram_hash is **already done** (cppmega_mlx/nn/ngram_hash.py). Skip. Current dirty-tree feature slices are partial: cppmega_mlx/nn/engram.py is standalone, cppmega_mlx/nn/mhc.py is standalone, cppmega_mlx/data/fim.py is a CPU FIM/iFIM transform slice, and cppmega_mlx/training/mtp.py is a local training-side MTP helper. They are not NAM56R-integrated, not CUDA/Megatron parity receipts, and do not close this stream.
 
-141. Port `engram.py` from `/Volumes/external/sources/nanochat/nanochat/engram.py` to `cppmega_mlx/nn/engram.py`. **Partial local slice exists**: the current module is standalone MLX, not NAM56R-wired and not a parity receipt. Wrap forward in one `mx.compile` per block when integrating; depthwise conv stays as `mx.conv_general` until profile justifies a Metal kernel. See `docs/mlx_buy_vs_build.md` row A.
+141. Port engram.py from /Volumes/external/sources/nanochat/nanochat/engram.py to cppmega_mlx/nn/engram.py. **Partial local slice exists**: the current module is standalone MLX, not NAM56R-wired and not a parity receipt. Wrap forward in one mx.compile per block when integrating; depthwise conv stays as mx.conv_general until profile justifies a Metal kernel. See docs/mlx_buy_vs_build.md row A.
 142. Implement EngramBranch base mode (avg_pool1d n-gram features → bottleneck → out-projection). Current standalone module covers this locally.
-143. Add gated mode: `α = σ(RMSNorm(h)·RMSNorm(k)/√d)`. Current standalone module covers this locally.
-144. Add grouped causal SiLU conv path (`conv_kernel=4`, optional). Current standalone module covers this locally.
-145. Wire `engram_layers` config (per-layer insertion list). This remains open; standalone module presence is not integration.
+143. Add gated mode: α = σ(RMSNorm(h)·RMSNorm(k)/√d). Current standalone module covers this locally.
+144. Add grouped causal SiLU conv path (conv_kernel=4, optional). Current standalone module covers this locally.
+145. Wire engram_layers config (per-layer insertion list). This remains open; standalone module presence is not integration.
 146. Validate engram parity vs nanochat fork Torch reference (forward pass, rtol=1e-2 atol=1e-2).
-147. Port `mhc.py` ManifoldBranchMixer with Sinkhorn-Knopp normalization (5 iters, fp32 cast inside). **Partial local slice exists**: the current module is standalone pure MLX, not wired to an Engram/NAM56R branch combo and not a source parity receipt. Compile the fixed-iter Sinkhorn loop in one `mx.compile` closure when integrating; do not unroll in Python. See `docs/mlx_buy_vs_build.md` row B.
-148. Implement N=4 streams default with `blend_alpha` interpolation to uniform.
+147. Port mhc.py ManifoldBranchMixer with Sinkhorn-Knopp normalization (5 iters, fp32 cast inside). **Partial local slice exists**: the current module is standalone pure MLX, not wired to an Engram/NAM56R branch combo and not a source parity receipt. Compile the fixed-iter Sinkhorn loop in one mx.compile closure when integrating; do not unroll in Python. See docs/mlx_buy_vs_build.md row B.
+148. Implement N=4 streams default with blend_alpha interpolation to uniform.
 149. Validate Sinkhorn fp32 path vs MaxText reference (column/row stochasticity within 1e-6).
 150. Wire engram + mHC combo path (mHC mixes main_residual + engram_branch + skip_branch).
-151. Port MTP head + recursive shared-block trick from `nanochat/mtp.py` and `cppmega/megatron/fastmtp_layer.py`. Default K=2 (GB10 baseline); single shared transformer block recurred K times per FastMTP arXiv 2509.18362. **Critical**: share weights via direct attribute aliasing (`mtp_head.weight = main.lm_head.weight`), not deep copy — MLX module tree walks recognize the shared parameter and AdamW state stays single. See `docs/mlx_buy_vs_build.md` row D + anti-port rule 13.
-152. Implement `roll-and-mask` static-shape FIM-safe MTP loss (mask wrapped positions as `ignore_index=-1`); preserve XLA/`mx.compile`-safe static shapes.
-153. Add per-depth weighted loss `α_k = β^k / Σ β^j` with β=0.6 default decay (matches `CPPMEGA_FASTMTP_DECAY`); apply at `λ=0.3` (matches `CPPMEGA_FASTMTP_LAMBDA`). Use `reduction='mean'` with broadcast (Liger #968 workaround mirror).
-154. Validate MTP parity vs cppmega CUDA `cppmega/megatron/fastmtp_layer.py` and `mtp_native_hopper_ce.py` (loss values + grad norm at fixed seed; document non-claim where Hopper-fused CE is not reproducible on M4). Current M0.5 receipt is fail-closed: local K=2 contract tests and nested-overclaim hardening pass, but no checked-in or locally observed fixed-seed CUDA/GB10 loss+grad-norm artifact exists, so the local MLX tests do not close parity.
-155. Port FIM data transform (PSM/SPM, fim_rate, random span sampling) to `cppmega_mlx/data/fim.py`. Current local coverage is CPU token permutation only; the tokenizer artifact contract is closed, but dataset/training integration and source parity coverage remain open.
-156. Port iFIM data transform (instruction extraction, AST-aware, special token id=45) to `cppmega_mlx/data/ifim.py`. Current local coverage is dependency-free instruction extraction plus token formatting in `cppmega_mlx/data/fim.py`; tree-sitter/AST-aware extraction and dataset/training integration remain open.
-157. Port STP loss (~100 LOC, trivial port) to `cppmega_mlx/training/stp_loss.py`. **Local helper done**: deterministic static triples compute `1 - cosine(h[r]-h[s], h[t]-h[r])`, `T < 3` returns zero, tuple/list layer inputs average scalar losses, and defaults remain opt-in (`λ_STP=0`). Receipt: `./.venv/bin/python -m pytest tests/test_stp_loss.py tests/test_package_exports.py -q --tb=short` → `21 passed`; `./.venv/bin/pyright cppmega_mlx/training/stp_loss.py cppmega_mlx/training/loss.py cppmega_mlx/training/__init__.py tests/test_stp_loss.py` → `0 errors`.
-158. Add STP variants A (single triple, last layer), B (N triples last layer), C (multi-layer averaged) toggles. The local helper covers these deterministic loss surfaces via `n_spans` and tuple/list hidden-state input, but Stream H remains open until integration/parity receipts land.
-159. Wire end-to-end training loss: `L_total = L_NTP + λ_MTP · L_MTP + λ_STP · L_STP`. Current local composition is opt-in helper coverage only; NAM56R/full training-loop integration remains open.
-160. Add per-feature parity tests under `tests/features/` (one file per feature).
+151. Port MTP head + recursive shared-block trick from nanochat/mtp.py and cppmega/megatron/fastmtp_layer.py. Default K=2 (GB10 baseline); single shared transformer block recurred K times per FastMTP arXiv 2509.18362. **Critical**: share weights via direct attribute aliasing (mtp_head.weight = main.lm_head.weight), not deep copy — MLX module tree walks recognize the shared parameter and AdamW state stays single. See docs/mlx_buy_vs_build.md row D + anti-port rule 13.
+152. Implement roll-and-mask static-shape FIM-safe MTP loss (mask wrapped positions as ignore_index=-1); preserve XLA/mx.compile-safe static shapes.
+153. Add per-depth weighted loss α_k = β^k / Σ β^j with β=0.6 default decay (matches CPPMEGA_FASTMTP_DECAY); apply at λ=0.3 (matches CPPMEGA_FASTMTP_LAMBDA). Use reduction='mean' with broadcast (Liger #968 workaround mirror).
+154. Validate MTP parity vs cppmega CUDA cppmega/megatron/fastmtp_layer.py and mtp_native_hopper_ce.py (loss values + grad norm at fixed seed; document non-claim where Hopper-fused CE is not reproducible on M4). Current M0.5 receipt is fail-closed: local K=2 contract tests and nested-overclaim hardening pass, but no checked-in or locally observed fixed-seed CUDA/GB10 loss+grad-norm artifact exists, so the local MLX tests do not close parity.
+155. Port FIM data transform (PSM/SPM, fim_rate, random span sampling) to cppmega_mlx/data/fim.py. Current local coverage is CPU token permutation only; the tokenizer artifact contract is closed, but dataset/training integration and source parity coverage remain open.
+156. Port iFIM data transform (instruction extraction, AST-aware, special token id=45) to cppmega_mlx/data/ifim.py. Current local coverage is dependency-free instruction extraction plus token formatting in cppmega_mlx/data/fim.py; tree-sitter/AST-aware extraction and dataset/training integration remain open.
+157. Port STP loss (~100 LOC, trivial port) to cppmega_mlx/training/stp_loss.py. **Local helper done**: deterministic static triples compute 1 - cosine(h[r]-h[s], h[t]-h[r]), T < 3 returns zero, tuple/list layer inputs average scalar losses, and defaults remain opt-in (λ_STP=0). Receipt: ./.venv/bin/python -m pytest tests/test_stp_loss.py tests/test_package_exports.py -q --tb=short → 21 passed; ./.venv/bin/pyright cppmega_mlx/training/stp_loss.py cppmega_mlx/training/loss.py cppmega_mlx/training/__init__.py tests/test_stp_loss.py → 0 errors.
+158. Add STP variants A (single triple, last layer), B (N triples last layer), C (multi-layer averaged) toggles. The local helper covers these deterministic loss surfaces via n_spans and tuple/list hidden-state input, but Stream H remains open until integration/parity receipts land.
+159. Wire end-to-end training loss: L_total = L_NTP + λ_MTP · L_MTP + λ_STP · L_STP. Current local composition is opt-in helper coverage only; NAM56R/full training-loop integration remains open.
+160. Add per-feature parity tests under tests/features/ (one file per feature).
 
 #### Stream H addendum — Plasticity Toolkit (FIRE / DASH / ReDo)
 
-Reference: `nanochat/nanochat/fire.py`, Han et al. arXiv:2602.08040v1 (Feb 2026). All three combat plasticity loss in long-horizon training. **Implementations landed**: `cppmega_mlx/training/plasticity/{fire,dash,redo}.py` (GPU-native, no SVD dependency, 7 tests pass). Wiring into the training loop tracked under beads `cppmega-mlx-6tx` (epic) + `6r7` (FIRE) / `amr` (DASH) / `asn` (ReDo).
+Reference: nanochat/nanochat/fire.py, Han et al. arXiv:2602.08040v1 (Feb 2026). All three combat plasticity loss in long-horizon training. **Implementations landed**: cppmega_mlx/training/plasticity/{fire,dash,redo}.py (GPU-native, no SVD dependency, 7 tests pass). Wiring into the training loop tracked under beads cppmega-mlx-6tx (epic) + 6r7 (FIRE) / amr (DASH) / asn (ReDo).
 
-160a. **FIRE** (Frobenius-Isometry REinitialization). One-shot Newton-Schulz orthogonalization at a phase transition. Spectral norm via 12-iter power iteration on GPU (MLX `linalg.svd` is CPU-only as of 0.x; ml-explore/mlx#1392 confirms no GPU plan; PR #2290 closed stale). Adam moments wiped only for FIRE'd params. Mirror nanochat call site (`scripts/base_train.py:17475`) at `--fire_at_step=5000`. Skips `wte`, `lm_head`, `embedding`, `embed_tokens`. Compatible with Mamba 1D params (skipped automatically — non-2D).
-160b. **DASH** (Direction-Aware SHrinking). Per-row cosine similarity between weight and gradient; rows with `cos > alpha=0.05` shrunk by `1 - shrink_rate * (cos - alpha)`, clamped to `[0.5, 1.0]`. Periodic, every `--dash_every` steps. Skips Muon-managed params (Muon already strips parallel component). Mirror nanochat call site `scripts/base_train.py:17342`.
-160c. **ReDo** (Recycling Dormant Neurons). EMA of post-activation magnitude per neuron (relu² profile). Periodic at `--redo_every=1000` steps; neurons below `tau=0.025` of layer mean get reinitialized with weakened Gaussian (`std × 0.1`). Replaces torch forward hooks with an opt-in `_redo_probe(post_act)` callable on each MLP module — the MLP forward calls it only when set, so steady-state cost is zero. Surgery uses `mx.where`, no host sync, no boolean indexing. Multi-Mac: `diag.sync_stats()` (DP all-reduce) added later.
+160a. **FIRE** (Frobenius-Isometry REinitialization). One-shot Newton-Schulz orthogonalization at a phase transition. Spectral norm via 12-iter power iteration on GPU (MLX linalg.svd is CPU-only as of 0.x; ml-explore/mlx#1392 confirms no GPU plan; PR #2290 closed stale). Adam moments wiped only for FIRE'd params. Mirror nanochat call site (scripts/base_train.py:17475) at --fire_at_step=5000. Skips wte, lm_head, embedding, embed_tokens. Compatible with Mamba 1D params (skipped automatically — non-2D).
+160b. **DASH** (Direction-Aware SHrinking). Per-row cosine similarity between weight and gradient; rows with cos > alpha=0.05 shrunk by 1 - shrink_rate * (cos - alpha), clamped to [0.5, 1.0]. Periodic, every --dash_every steps. Skips Muon-managed params (Muon already strips parallel component). Mirror nanochat call site scripts/base_train.py:17342.
+160c. **ReDo** (Recycling Dormant Neurons). EMA of post-activation magnitude per neuron (relu² profile). Periodic at --redo_every=1000 steps; neurons below tau=0.025 of layer mean get reinitialized with weakened Gaussian (std × 0.1). Replaces torch forward hooks with an opt-in _redo_probe(post_act) callable on each MLP module — the MLP forward calls it only when set, so steady-state cost is zero. Surgery uses mx.where, no host sync, no boolean indexing. Multi-Mac: diag.sync_stats() (DP all-reduce) added later.
 
 #### Stream X addendum — cppmega doc-audit recovery candidates (2026-05-03)
 
-Audit of cppmega CUDA docs surfaced 6 tested-and-adopted optimizations not yet in cppmega.mlx. Tracked under beads epic `cppmega-mlx-m3v`. Source receipts cited verbatim (read-only audit at `/tmp/cppmega_doc_audit.md`):
+Audit of cppmega CUDA docs surfaced 6 tested-and-adopted optimizations not yet in cppmega.mlx. Tracked under beads epic cppmega-mlx-m3v. Source receipts cited verbatim (read-only audit at /tmp/cppmega_doc_audit.md):
 
-160d. **Quantized Muon momentum** (int8 + 256-block absmax). Half memory on Muon momentum buffer. Hardware-independent. cppmega.mlx `MuonAdamWMulti` currently holds full bf16 momentum. Source: `cppmega/docs/quantized_muon_momentum.md`. Bead: `cppmega-mlx-s43` (P2).
-160e. **M2RNN sparse fp32 recurrent checkpoints + chunk-recompute backward** (chunk=64). Receipt: 1.375 GiB → 89.38 MiB on NAM56R-quarter shape (15.4× reduction). Apply to `cppmega_mlx/nn/m2rnn.py`. Source: `cppmega/docs/gb10_local_memory_perf_2026_04_25.md`. Bead: `cppmega-mlx-z4x` (P2).
-160f. **M2RNN broadcast-view (stride-0 expand)** for 1→H head broadcast. Receipt: fwd −17.7%, peak −44.9%. Replace materialized broadcasts with `mx.broadcast_to` views (zero-copy). Source: `cppmega/docs/status/m2rnn_broadcast_views_2026_04_30.md`. Bead: `cppmega-mlx-2s7` (P2).
-160g. **Regional compile allow/deny matrix.** Codify cppmega's per-op compile speedups into `cppmega_mlx/training/compiled.py`: `RMSNorm 0.41×`, `RMSNormGated 0.47×`, `MoE Router 0.97×` (DO NOT compile); `DataDep-A 5.93×`, `mamba3-pre 2.66×` (DO compile). Source: `cppmega/docs/optimization_session_2026_04_13.md` §1.7. **Local MLX receipt landed**: `bench/baselines/uy5_regional_compile_m4.json` records M4 Max pattern-only evidence (`data_dep_a` cached compile `1.13×` median faster; `rmsnorm` deny path returns the original function). Bead: `cppmega-mlx-uy5` (P2, closure-ready after focused tests).
-160h. **20-step BF16-vs-X acceptance harness** (wave44a). Typed plan/run/compare contract with explicit non-acceptance counters as a precision-regression gate; adapt via `scripts/compare_bench_rows.py`. Source: `cppmega/docs/status/wave44a_mxfp8_acceptance_harness.md`. Bead: `cppmega-mlx-5r7` (P2).
-160i. **Liger FLCE `reduction='none'` silent-corruption guard test** for our shipped `cppmega_mlx/training/cut_cross_entropy.py`. Liger backward reads only `grad_output[0]` as scalar — relevant gotcha for chunked CE patterns. Source: `cppmega/docs/findings_2026_04_14_session.md` §1. Bead: `cppmega-mlx-z3o` (P3).
+160d. **Quantized Muon momentum** (int8 + 256-block absmax). Half memory on Muon momentum buffer. Hardware-independent. cppmega.mlx MuonAdamWMulti currently holds full bf16 momentum. Source: cppmega/docs/quantized_muon_momentum.md. Bead: cppmega-mlx-s43 (P2).
+160e. **M2RNN sparse fp32 recurrent checkpoints + chunk-recompute backward** (chunk=64). Receipt: 1.375 GiB → 89.38 MiB on NAM56R-quarter shape (15.4× reduction). Apply to cppmega_mlx/nn/m2rnn.py. Source: cppmega/docs/gb10_local_memory_perf_2026_04_25.md. Bead: cppmega-mlx-z4x (P2).
+160f. **M2RNN broadcast-view (stride-0 expand)** for 1→H head broadcast. Receipt: fwd −17.7%, peak −44.9%. Replace materialized broadcasts with mx.broadcast_to views (zero-copy). Source: cppmega/docs/status/m2rnn_broadcast_views_2026_04_30.md. Bead: cppmega-mlx-2s7 (P2).
+160g. **Regional compile allow/deny matrix.** Codify cppmega's per-op compile speedups into cppmega_mlx/training/compiled.py: RMSNorm 0.41×, RMSNormGated 0.47×, MoE Router 0.97× (DO NOT compile); DataDep-A 5.93×, mamba3-pre 2.66× (DO compile). Source: cppmega/docs/optimization_session_2026_04_13.md §1.7. **Local MLX receipt landed**: bench/baselines/uy5_regional_compile_m4.json records M4 Max pattern-only evidence (data_dep_a cached compile 1.13× median faster; rmsnorm deny path returns the original function). Bead: cppmega-mlx-uy5 (P2, closure-ready after focused tests).
+160h. **20-step BF16-vs-X acceptance harness** (wave44a). Typed plan/run/compare contract with explicit non-acceptance counters as a precision-regression gate; adapt via scripts/compare_bench_rows.py. Source: cppmega/docs/status/wave44a_mxfp8_acceptance_harness.md. Bead: cppmega-mlx-5r7 (P2).
+160i. **Liger FLCE reduction='none' silent-corruption guard test** for our shipped cppmega_mlx/training/cut_cross_entropy.py. Liger backward reads only grad_output[0] as scalar — relevant gotcha for chunked CE patterns. Source: cppmega/docs/findings_2026_04_14_session.md §1. Bead: cppmega-mlx-z3o (P3).
 
 Rejected (do NOT pursue, save us future work):
-- FP8/MXFP8 Mamba SSM scan (0.45–0.91× — slower; cppmega `docs/changelog.md`).
-- DeepGEMM on sm12x (`cppmega/docs/deepgemm_gb10_check_2026_04_25.md`).
-- HF kernel-hub TE replacements (forward-only, no autograd backward; `cppmega/docs/hf_kernel_replacements_2026_04_25.md`).
+- FP8/MXFP8 Mamba SSM scan (0.45–0.91× — slower; cppmega docs/changelog.md).
+- DeepGEMM on sm12x (cppmega/docs/deepgemm_gb10_check_2026_04_25.md).
+- HF kernel-hub TE replacements (forward-only, no autograd backward; cppmega/docs/hf_kernel_replacements_2026_04_25.md).
 - DualPipeV with EP>1.
 
 #### Stream X addendum — TileLang kernel ports from cppmega (10 kernels)
 
-Inventory of cppmega TileLang kernels to port via Path B/C (epic `cppmega-mlx-za1`). Source: `/tmp/cppmega_tilelang_inventory.md`. Generic TileLang-MSL adapter and Mamba3 wrapper work remain open under `cppmega-mlx-0ce` / `cppmega-mlx-9ba`, but several sparse-MLA/topk lanes are no longer blocked on that adapter: direct-MSL Path B ships for BF16, tensorwise FP8, and blockscaled sparse-MLA, and narrow Path C reducers/selectors exist where the bench receipts say so. Path B verified working: 5.2× speedup vs MLX Python loop on Mamba3-style scan PoC, 3 transform-layer gotchas (~150 LOC) documented.
+Inventory of cppmega TileLang kernels to port via Path B/C (epic cppmega-mlx-za1). Source: /tmp/cppmega_tilelang_inventory.md. Generic TileLang-MSL adapter and Mamba3 wrapper work remain open under cppmega-mlx-0ce / cppmega-mlx-9ba, but several sparse-MLA/topk lanes are no longer blocked on that adapter: direct-MSL Path B ships for BF16, tensorwise FP8, and blockscaled sparse-MLA, and narrow Path C reducers/selectors exist where the bench receipts say so. Path B verified working: 5.2× speedup vs MLX Python loop on Mamba3-style scan PoC, 3 transform-layer gotchas (~150 LOC) documented.
 
-160j. **Sparse-MLA BF16 fwd/bwd pair** (`cppmega/megatron/sparse_mla_ops/tilelang_sparse_mla_{fwd,bwd}.py`). Path B remains the fail-closed fallback. Forced Path C is available, and AUTO promotes the three checked fwd+bwd receipt rows (`B2_S128_H8_D64`, `B4_S512_H8_D64`, `B4_S1024_H8_D64`) because their required no-worse gates are green. Unreceipted shapes stay on Path B.
+160j. **Sparse-MLA BF16 fwd/bwd pair** (cppmega/megatron/sparse_mla_ops/tilelang_sparse_mla_{fwd,bwd}.py). Path B remains the fail-closed fallback. Forced Path C is available, and AUTO promotes the three checked fwd+bwd receipt rows (B2_S128_H8_D64, B4_S512_H8_D64, B4_S1024_H8_D64) because their required no-worse gates are green. Unreceipted shapes stay on Path B.
 160k. **Sparse-MLA FP8 + blockscaled variants** (4 kernels). Path B remains production. Path C has partial reducers only: FP8 QK-reduce/indexed QK-reduce and blockscaled e8m0 QK-reduce have parity/timing receipts, but both families keep the full Path C dispatch gate red because full QK remains unavailable.
-160l. **topk_selector** (`cppmega/megatron/tilelang_sparse_mla/topk_selector.py`). Path C is the AUTO/default where available, with Path B fallback; checked-in receipt runs both paths and keeps every C/B ratio <= 1.0.
-160m. **Mamba3 MIMO autograd wrapper** (`cppmega/megatron/tilelang_mimo_autograd.py` + 3 Triton helpers `compute_dacs_segsum`, `bwd_dadt_fused`, `bwd_dtrap_ddt`). Triton helpers must be re-implemented in TileLang or pure-MLX (Triton has no Metal backend). Parity oracle: existing `cppmega_mlx/nn/mamba3.py` reference scan. Bead: `cppmega-mlx-8w8` (P2).
+160l. **topk_selector** (cppmega/megatron/tilelang_sparse_mla/topk_selector.py). Path C is the AUTO/default where available, with Path B fallback; checked-in receipt runs both paths and keeps every C/B ratio <= 1.0.
+160m. **Mamba3 MIMO autograd wrapper** (cppmega/megatron/tilelang_mimo_autograd.py + 3 Triton helpers compute_dacs_segsum, bwd_dadt_fused, bwd_dtrap_ddt). Triton helpers must be re-implemented in TileLang or pure-MLX (Triton has no Metal backend). Parity oracle: existing cppmega_mlx/nn/mamba3.py reference scan. Bead: cppmega-mlx-8w8 (P2).
 
-Excluded as Hopper-only dead-end on Metal: `cppmega/megatron/cute_dsl_mimo/` (sm_90a CuTe DSL).
+Excluded as Hopper-only dead-end on Metal: cppmega/megatron/cute_dsl_mimo/ (sm_90a CuTe DSL).
 
 ### Stream I — Inference & Generation (161–180)
 
-161. Implement contiguous KV-cache class `cppmega_mlx/inference/engine.py` (mirror `nanochat/engine.py`).
-162. **SCOPED DONE**: add MLX-local paged KV block manager and continuous-batch scheduler metadata in `cppmega_mlx/inference/serving.py`; this allocates KV block pools, padded block tables, priority/FIFO admission, preemption, generated-token capacity growth, and fail-closed model-integrated paged attention. It does not wire model attention to consume paged KV or provide an API server.
-163. **SCOPED DONE**: add temperature/top-k/top-p sampling in `cppmega_mlx/inference/sampling.py`; this is a token sampler only, not a KV/paged serving path.
-164. **SCOPED DONE**: add eager full-prefix no-KV `generate_tokens(...)` in `cppmega_mlx/inference/generation.py`, including temp=0 greedy decode; KV cache, paged serving, streaming, prompt cache, integrated FIM decode loop, q4/KV-q4, and speculative decode remain open.
-165. **SCOPED DONE**: add `next_token_logits(...)` standard-decode guard in `cppmega_mlx/inference/generation.py`; plain `(batch, sequence, vocab)` logits return the final-position logits, while tuple/list/dict structured outputs and 4D MTP/draft logits fail closed. This is not MTP self-speculation; row 169 remains open.
-166. **SCOPED DONE**: add prompt-only FIM-aware infilling in `cppmega_mlx/inference/infilling.py` (PSM/SPM token routing plus iFIM id45 prefix). This constructs inference prompts ending at `<FIM_MIDDLE>` only; it does not append the target middle/EOT, run generation, post-process the generated span, or add a KV/paged decode loop.
-167. Implement vanilla speculative decoding (acceptance-rejection sampling, target-only verifier) referencing `nanochat/speculative_decode.py`. Note: cppmega CUDA does not implement speculative decoding — this is greenfield work on MLX, not a parity gap.
-168. Add EAGLE-2-style draft head (separate small draft model, GQA-aware) referencing `nanochat/experiments/sota_impl/eagle2/`. Gated; defer if MTP self-speculation already meets the throughput target.
-169. Add self-speculative decoding via MTP (FastMTP-aligned: same model emits draft tokens via its MTP heads, target verifies in one extra forward) referencing `nanochat/mtp_draft.py`. Cheapest of the three since MTP head already lands in Stream H; benchmark first.
-170. Wire mlx-lm `stream_generate` compatibility; export model via mlx-lm registry.
+161. Implement contiguous KV-cache class cppmega_mlx/inference/engine.py (mirror nanochat/engine.py).
+162. **SCOPED DONE**: add MLX-local paged KV block manager and continuous-batch scheduler metadata in cppmega_mlx/inference/serving.py; this allocates KV block pools, padded block tables, priority/FIFO admission, preemption, generated-token capacity growth, and fail-closed model-integrated paged attention. It does not wire model attention to consume paged KV or provide an API server.
+163. **SCOPED DONE**: add temperature/top-k/top-p sampling in cppmega_mlx/inference/sampling.py; this is a token sampler only, not a KV/paged serving path.
+164. **SCOPED DONE**: add eager full-prefix no-KV generate_tokens(...) in cppmega_mlx/inference/generation.py, including temp=0 greedy decode; KV cache, paged serving, streaming, prompt cache, integrated FIM decode loop, q4/KV-q4, and speculative decode remain open.
+165. **SCOPED DONE**: add next_token_logits(...) standard-decode guard in cppmega_mlx/inference/generation.py; plain (batch, sequence, vocab) logits return the final-position logits, while tuple/list/dict structured outputs and 4D MTP/draft logits fail closed. This is not MTP self-speculation; row 169 remains open.
+166. **SCOPED DONE**: add prompt-only FIM-aware infilling in cppmega_mlx/inference/infilling.py (PSM/SPM token routing plus iFIM id45 prefix). This constructs inference prompts ending at <FIM_MIDDLE> only; it does not append the target middle/EOT, run generation, post-process the generated span, or add a KV/paged decode loop.
+167. Implement vanilla speculative decoding (acceptance-rejection sampling, target-only verifier) referencing nanochat/speculative_decode.py. Note: cppmega CUDA does not implement speculative decoding — this is greenfield work on MLX, not a parity gap.
+168. Add EAGLE-2-style draft head (separate small draft model, GQA-aware) referencing nanochat/experiments/sota_impl/eagle2/. Gated; defer if MTP self-speculation already meets the throughput target.
+169. Add self-speculative decoding via MTP (FastMTP-aligned: same model emits draft tokens via its MTP heads, target verifies in one extra forward) referencing nanochat/mtp_draft.py. Cheapest of the three since MTP head already lands in Stream H; benchmark first.
+170. **SCOPED DONE (local streaming slice)**: add `GenerationChunk` and `stream_generate_tokens(...)` in `cppmega_mlx/inference/generation.py`, exported from `cppmega_mlx.inference`. Covered eager full-prefix and contiguous-KV token streaming, batched rows, all-rows EOS stopping, optional per-token text decode, zero-new-token no-op, package export boundary, quantized-KV fail-closed behavior, and paged-attention non-integration guard. This is not full mlx-lm registry export, model-integrated paged attention, prompt cache, q4/KV-q4, speculative/self-spec decoding, OpenAI serving, throughput/quality/long-context benching, or GB10/CUDA parity.
 171. Add prompt-cache for repeated prefixes.
 172. Validate prompt-cache safety with sliding-window/SSM against the installed mlx-lm prompt-cache APIs; do not assume a generic KV cache is safe for every route.
-173. Add OpenAI-compatible serving endpoint (vllm-mlx pattern); `cppmega_mlx/inference/serve.py`.
+173. Add OpenAI-compatible serving endpoint (vllm-mlx pattern); cppmega_mlx/inference/serve.py.
 174. Add throughput benchmark: prefill / decode tok/s on Qwen3-4B-class and NAM56R-class models.
 175. Add quality benchmark: ARC / MMLU / HumanEval on q4-quantized model.
 176. Add long-context benchmark (NIAH, RULER) on KV-q4 path.
-177. Document inference modes in `docs/inference.md`.
-178. Add inference-only `quantize_for_inference.py` helper script.
+177. Document inference modes in docs/inference.md.
+178. Add inference-only quantize_for_inference.py helper script.
 179. Add JSON-mode constrained decoding (logits processor).
 180. Add tool-use template support (chat-template special tokens already reserved).
 
 ### Stream J — Benchmarking, Profiling & Validation (181–200)
 
-181. Build `bench_matrix.py` matrix sweep (batch × seq × dtype × feature on/off); output to `bench/results/`.
-182. Wire `scripts/compare_bench_rows.py` regression detection (compare current run vs `bench/baselines/`).
+181. Build bench_matrix.py matrix sweep (batch × seq × dtype × feature on/off); output to bench/results/.
+182. Wire scripts/compare_bench_rows.py regression detection (compare current run vs bench/baselines/).
 183. Add CI gate: throughput regression > 5% blocks merge.
-184. Set up Xcode `.gputrace` capture pipeline (`scripts/profile_capture.py`); document workflow.
-185. Per-kernel timing dashboard: parse Metal frame capture → `bench/per_kernel/<commit>.json`.
-186. Add `mactop`-style GPU-saturation check before claiming GPU-bound; add to bench harness.
-187. Upgrade `tests/test_cppmega_parity_anchors.py` to numerical assertions (golden-tensor compare vs CUDA reference).
-188. Add `tests/test_mtp_parity.py` (vs nanochat fork golden tensors).
-189. Add `tests/test_engram_parity.py`.
-190. Add `tests/test_mhc_sinkhorn.py` (doubly-stochastic property test).
-191. Add `tests/test_stp_loss.py`.
-192. Add `tests/test_fim_transform.py` (round-trip PSM and SPM).
-193. Add `tests/test_ifim_transform.py` (instruction extraction).
-194. Add `tests/test_kv_quant.py` (q4-KV vs bf16-KV PPL drift).
-195. Add `tests/test_distributed_smoke.py` (2-rank loopback or real multi-Mac).
-196. Add `tests/test_resumable_training.py` (save mid-training, reload, verify identical loss curve).
-197. Add `tests/test_grad_checkpointing.py` (loss equivalence with/without checkpointing).
-198. Lock nightly throughput baseline JSON in `bench/baselines/m4max_nam56r_d20.json` and `m4max_qwen3_4b.json`.
+184. Set up Xcode .gputrace capture pipeline (scripts/profile_capture.py); document workflow.
+185. Per-kernel timing dashboard: parse Metal frame capture → bench/per_kernel/<commit>.json.
+186. Add mactop-style GPU-saturation check before claiming GPU-bound; add to bench harness.
+187. Upgrade tests/test_cppmega_parity_anchors.py to numerical assertions (golden-tensor compare vs CUDA reference).
+188. Add tests/test_mtp_parity.py (vs nanochat fork golden tensors).
+189. Add tests/test_engram_parity.py.
+190. Add tests/test_mhc_sinkhorn.py (doubly-stochastic property test).
+191. Add tests/test_stp_loss.py.
+192. Add tests/test_fim_transform.py (round-trip PSM and SPM).
+193. Add tests/test_ifim_transform.py (instruction extraction).
+194. Add tests/test_kv_quant.py (q4-KV vs bf16-KV PPL drift).
+195. Add tests/test_distributed_smoke.py (2-rank loopback or real multi-Mac).
+196. Add tests/test_resumable_training.py (save mid-training, reload, verify identical loss curve).
+197. Add tests/test_grad_checkpointing.py (loss equivalence with/without checkpointing).
+198. Lock nightly throughput baseline JSON in bench/baselines/m4max_nam56r_d20.json and m4max_qwen3_4b.json.
 199. Run a nanochat-d20-style benchmark on M4 Max as a local reference row only; compare external mlxgpt.com or GB10 numbers as unmatched context, not as a pass/fail parity target.
-200. Document scoped cppmega.mlx support status in `docs/production_status.md` (single source of truth: throughput, peak memory, supported features, deprecated paths, and explicit non-claims).
+200. Document scoped cppmega.mlx support status in docs/production_status.md (single source of truth: throughput, peak memory, supported features, deprecated paths, and explicit non-claims).
 
 ---
 
@@ -781,21 +940,21 @@ Critical path: A → B → C → E → H (features) is the longest single chain,
 
 - Do not attempt fp8 / mxfp4 / mxfp8 / nvfp4 *training* on M4 Max without current source, hardware, and gradient-path proof; keep it deferred or inference/quantization-only until proven locally.
 - Do not claim M4 Max vs GB10 parity without matched rows.
-- Do not claim distributed Megatron parity from `mx.distributed` references, JACCL docs, or local single-process tests.
+- Do not claim distributed Megatron parity from mx.distributed references, JACCL docs, or local single-process tests.
 - Do not claim full NAM56R readiness from route/config metadata or tiny/hybrid receipts.
 - Do not move forward-only custom Metal kernels into the training path.
 - Do not adopt fp16 mixed-precision unless a measured ≥20% speedup justifies the local-stability and external-comparability cost.
-- Do not write custom Metal for ops that `mx.fast` covers (SDPA, RoPE, RMSNorm, LayerNorm) — maintenance cost without speedup.
-- Do not use `mx.array(python_scalar)` in hot paths — silent fp32 promotion kills bf16 perf.
-- Do not call `.eval()` inside `mx.compile`'d functions — crashes; capture state via `inputs=`/`outputs=`.
-- Do not use `shapeless=True` if your graph branches on shape — silent wrong results.
+- Do not write custom Metal for ops that mx.fast covers (SDPA, RoPE, RMSNorm, LayerNorm) — maintenance cost without speedup.
+- Do not use mx.array(python_scalar) in hot paths — silent fp32 promotion kills bf16 perf.
+- Do not call .eval() inside mx.compile'd functions — crashes; capture state via inputs=/outputs=.
+- Do not use shapeless=True if your graph branches on shape — silent wrong results.
 - Do not target the Apple Neural Engine (ANE) for training — CoreML inference only, not exposed to MLX.
-- Do not rely on `mx.random` parity across Python random / NumPy — capture and restore explicitly.
-- Do not use `prefetch(num_threads>1)` in mlx-data without `Buffer.ordered_prefetch` if you need determinism.
-- Do not fork after Metal init — always `set_start_method('spawn')`.
+- Do not rely on mx.random parity across Python random / NumPy — capture and restore explicitly.
+- Do not use prefetch(num_threads>1) in mlx-data without Buffer.ordered_prefetch if you need determinism.
+- Do not fork after Metal init — always set_start_method('spawn').
 - Do not wire >75% of unified memory — kernel panics observed in mlx-lm #883.
-- Do not `git push` benchmark results without thermal-throttle check (laptop benches are unreliable).
-- Do not run `bd push --no-verify` to skip hooks — investigate root cause.
+- Do not git push benchmark results without thermal-throttle check (laptop benches are unreliable).
+- Do not run bd push --no-verify to skip hooks — investigate root cause.
 
 ---
 
@@ -803,50 +962,50 @@ Critical path: A → B → C → E → H (features) is the longest single chain,
 
 ### Resolved 2026-05-01 (from team discussion)
 
-1. **Model size target — RESOLVED**: First milestone is `local_gb10_quarter` (the GB10 quarter-depth profile), defined in `cppmega/recipes/run_profiles.py:387–422`:
+1. **Model size target — RESOLVED**: First milestone is local_gb10_quarter (the GB10 quarter-depth profile), defined in cppmega/recipes/run_profiles.py:387–422:
    - depth=13 (1/4 of NAM56R's 52), hidden=3584, FFN=18944, num_heads=28, head_dim=128, vocab=65536, MoE pattern AEMEAEMEAEMR
-   - mtp_depths=2, exponential decay β=0.6 (`CPPMEGA_FASTMTP_DECAY`), MTP loss weight λ=0.3 (`CPPMEGA_FASTMTP_LAMBDA`)
+   - mtp_depths=2, exponential decay β=0.6 (CPPMEGA_FASTMTP_DECAY), MTP loss weight λ=0.3 (CPPMEGA_FASTMTP_LAMBDA)
    - Approximately **1.2B total params** (~1/4 of NAM56R full at 4.8B; "quarter" = 13 of 52 layers, params scale ~linearly with depth modulo fixed embedding). Note: the local HybridTinyLM smoke wrapper at this geometry currently emits 3.50B because lm_head is not tied to token_embedding (-235M when tied) and the MoE expert hidden size is over-budgeted (-1.5B when calibrated to NAM56R's per-layer ~92M parameter budget). Both are config knobs, not architectural mismatches.
-   - Lite-stack builder: `cppmega/megatron/nam56r_lite_spec.py` (delegates to full-stack builder)
+   - Lite-stack builder: cppmega/megatron/nam56r_lite_spec.py (delegates to full-stack builder)
    - Memory math at bf16 weights + bf16 grads + fp32 AdamW m,v at 1.2B: ≈ 2.4 + 2.4 + 9.6 = 14.4 GB before activations and runtime overhead. With grad checkpointing + Lion (1× state instead of 2×), drops to ≈ 7.2 GB — fits 48 GB Mac comfortably. AdamW + grad-ckpt path on M4 Max 128 GB has ample headroom.
 
-2. **Multi-Mac topology — RESOLVED (heterogeneous pair planned)**: One Mac currently active (Mac Studio, Apple M4 Max, 128 GB, macOS 26.4.1, 4× TB5 ports rated up to 120 Gb/s). A 48 GB second Mac will be added at some stage (no purchase — already on hand) and gets **both roles** in `docs/multimac_training.md`:
-   - `role: inference_scout` — q4 inference / draft model server / eval & CI runner / parity-anchor checker. 1.2B at q4 ≈ 0.7 GB weights + KV; trivially fits 48 GB with headroom for batch and prompt cache.
-   - `role: training_peer` — Stream F smoke target. Run distributed code paths (DP, ZeRO-1, TP=2) end-to-end on the heterogeneous pair to **prove the plumbing works**, not for production throughput. Memory fit is feasible with **Lion + ZeRO-1**: 7.6 W + 7.6 G + 7.6 Lion-m-half (sharded across 2 ranks) ≈ 22.8 GB params/grads/opt + ~3–5 GB activations w/ grad-ckpt + ~10 GB MLX/macOS = ~35–40 GB peak per rank. Headless mode on the 48 GB peer recommended.
+2. **Multi-Mac topology — RESOLVED (heterogeneous pair planned)**: One Mac currently active (Mac Studio, Apple M4 Max, 128 GB, macOS 26.4.1, 4× TB5 ports rated up to 120 Gb/s). A 48 GB second Mac will be added at some stage (no purchase — already on hand) and gets **both roles** in docs/multimac_training.md:
+   - role: inference_scout — q4 inference / draft model server / eval & CI runner / parity-anchor checker. 1.2B at q4 ≈ 0.7 GB weights + KV; trivially fits 48 GB with headroom for batch and prompt cache.
+   - role: training_peer — Stream F smoke target. Run distributed code paths (DP, ZeRO-1, TP=2) end-to-end on the heterogeneous pair to **prove the plumbing works**, not for production throughput. Memory fit is feasible with **Lion + ZeRO-1**: 7.6 W + 7.6 G + 7.6 Lion-m-half (sharded across 2 ranks) ≈ 22.8 GB params/grads/opt + ~3–5 GB activations w/ grad-ckpt + ~10 GB MLX/macOS = ~35–40 GB peak per rank. Headless mode on the 48 GB peer recommended.
    - **Connection trigger (revised)**: ~1–2 weeks after M0 work starts, when M0.2 plus the local M0.4 baseline are green and there's a real working baseline to extend.
-   - **Future homogeneous pair**: if/when a second 128 GB Mac becomes available, demote 48 GB to `role: inference_scout` only; the 128+128 pair becomes the production training peer for AdamW + larger configs.
+   - **Future homogeneous pair**: if/when a second 128 GB Mac becomes available, demote 48 GB to role: inference_scout only; the 128+128 pair becomes the production training peer for AdamW + larger configs.
    - **Lion vs AdamW policy**:
      - 128 GB single-Mac M0 → AdamW (default, matches GB10 baseline).
      - 128 GB + 48 GB Stream F smoke → Lion + ZeRO-1 (only path that fits 48 GB peer).
      - 128 GB + 128 GB future production → AdamW preferred (fits comfortably with ZeRO-1; matches GB10 numerics).
-   - **Optional half-day smoke after M0**: one-shot JACCL (TB5) + ring fallback measurement on the 128+48 pair, emit a baseline row in `bench/baselines/m4max_heterogeneous_2node.json`, validate the rig works.
+   - **Optional half-day smoke after M0**: one-shot JACCL (TB5) + ring fallback measurement on the 128+48 pair, emit a baseline row in bench/baselines/m4max_heterogeneous_2node.json, validate the rig works.
 
 3. **Tokenizer — M0.1 CLOSED**: The earlier source statement was
-   stale. Local `nanochat/tokenizer.json` is a legacy 32K artifact; local
-   `nanochat/tokenizer_v3.json` is 65K and maps id 7 to `<CODE_START>`.
+   stale. Local nanochat/tokenizer.json is a legacy 32K artifact; local
+   nanochat/tokenizer_v3.json is 65K and maps id 7 to <CODE_START>.
    The fixed-token config has the same id-7
-   `<CODE_START>` contract. A read-only GB10 check of
-   `/home/dave/cppmega-root/cpp_tokenizer_hf/tokenizer.json` and
-   `/home/dave/cppmega-root/data/tokenizer/tokenizer.json` found vocab=65536,
-   id7=`<CODE_START>`, id45=`<FIM_INSTRUCTION>`, id46=`<SPACE>`,
-   id47=`<NL>`, and the same deployed
+   <CODE_START> contract. A read-only GB10 check of
+   /home/dave/cppmega-root/cpp_tokenizer_hf/tokenizer.json and
+   /home/dave/cppmega-root/data/tokenizer/tokenizer.json found vocab=65536,
+   id7=<CODE_START>, id45=<FIM_INSTRUCTION>, id46=<SPACE>,
+   id47=<NL>, and the same deployed
    contract. cppmega CUDA loads a HuggingFace tokenizer directory, and the
-   local artifact contract now follows that deployed id 7=`<CODE_START>`
-    mapping. MLX/CUDA wrappers now use the explicit `<SPACE>`/`<NL>` sentinel
+   local artifact contract now follows that deployed id 7=<CODE_START>
+    mapping. MLX/CUDA wrappers now use the explicit <SPACE>/<NL> sentinel
     encode/decode contract and close M0.1 on Mac-vs-GB10 decode parity receipts
-    rather than impossible HF reversible decode with `decoder=null`.
+    rather than impossible HF reversible decode with decoder=null.
 
-4. **Parity tolerance — RESOLVED (default carried forward)**: bf16 single matmul `rtol=1e-3, atol=1e-1`; chained `rtol=1e-2, atol=1e-1`; attention/RMSNorm `atol=5e-2`; full-step grad `atol=1e-1`. Matches PyTorch's documented bf16 thresholds.
+4. **Parity tolerance — RESOLVED (default carried forward)**: bf16 single matmul rtol=1e-3, atol=1e-1; chained rtol=1e-2, atol=1e-1; attention/RMSNorm atol=5e-2; full-step grad atol=1e-1. Matches PyTorch's documented bf16 thresholds.
 
-5. **MTP depth default — RESOLVED**: K=2 (matches GB10 `mtp_depths=2`). K=3 added as a benchmark configuration to test once K=2 is at parity. β=0.6, λ=0.3 carried over from cppmega CUDA defaults. Architecture: single shared transformer block recurred K times (FastMTP arXiv 2509.18362-style); cppmega CUDA's `fastmtp_layer.py` is the reference. Standard inference currently rejects MTP/draft outputs unless the caller passes plain base logits; MTP self-speculation stays separate under row 169.
+5. **MTP depth default — RESOLVED**: K=2 (matches GB10 mtp_depths=2). K=3 added as a benchmark configuration to test once K=2 is at parity. β=0.6, λ=0.3 carried over from cppmega CUDA defaults. Architecture: single shared transformer block recurred K times (FastMTP arXiv 2509.18362-style); cppmega CUDA's fastmtp_layer.py is the reference. Standard inference currently rejects MTP/draft outputs unless the caller passes plain base logits; MTP self-speculation stays separate under row 169.
 
-6. **Speculative decoding — RESOLVED**: GB10/cppmega CUDA does **not** implement speculative decoding (only accepts the `is_spec_decode` parameter and forwards to upstream Megatron without adding its own draft head). This makes MLX greenfield work, not a parity gap. Plan tests all three paths and picks based on M4 measurement:
-   - **MTP self-speculation** (FastMTP-aligned, target verifies its own MTP-head drafts) — references `nanochat/mtp_draft.py`. Cheapest to add since MTP head already lands in Stream H.
-   - **EAGLE-2 draft head** — references `nanochat/experiments/sota_impl/eagle2/` (separate small draft model, GQA-aware).
-   - **Vanilla acceptance-rejection** — references `nanochat/speculative_decode.py` (target-only acceptance sampling with arbitrary draft).
+6. **Speculative decoding — RESOLVED**: GB10/cppmega CUDA does **not** implement speculative decoding (only accepts the is_spec_decode parameter and forwards to upstream Megatron without adding its own draft head). This makes MLX greenfield work, not a parity gap. Plan tests all three paths and picks based on M4 measurement:
+   - **MTP self-speculation** (FastMTP-aligned, target verifies its own MTP-head drafts) — references nanochat/mtp_draft.py. Cheapest to add since MTP head already lands in Stream H.
+   - **EAGLE-2 draft head** — references nanochat/experiments/sota_impl/eagle2/ (separate small draft model, GQA-aware).
+   - **Vanilla acceptance-rejection** — references nanochat/speculative_decode.py (target-only acceptance sampling with arbitrary draft).
    - Each gets a separate gated path; benchmark and pick the winner per workload.
 
-### Confirmed dev-box hardware (verified via `system_profiler`)
+### Confirmed dev-box hardware (verified via system_profiler)
 
 - Mac Studio, Apple M4 Max, **128 GB unified memory**, macOS 26.4.1, 4× TB5 ports (Up to 120 Gb/s, 3 free).
 - Closes the AdamW-vs-Lion question for the mini: AdamW default; Lion is a benchmark variant only.
@@ -855,14 +1014,14 @@ Critical path: A → B → C → E → H (features) is the longest single chain,
 
 ### Resolved 2026-05-02
 
-7. **Production deployment target — RESOLVED**: 2× Mac Studio M4 Max 128 GB each, local research topology. Stream I scopes to local serving only; mlx-lm `stream_generate` compat stays in scope, OpenAI-style API and cloud-fleet hardening are out of scope until separately reopened.
+7. **Production deployment target — RESOLVED**: 2× Mac Studio M4 Max 128 GB each, local research topology. Stream I scopes to local serving only; mlx-lm stream_generate compat stays in scope, OpenAI-style API and cloud-fleet hardening are out of scope until separately reopened.
 8. **Sharded checkpoint format — RESOLVED**: local-first manifest with explicit non-claims about Megatron restore. HuggingFace-compatible shard-index is a future converter, not a primary path; defer until a real export need surfaces.
 9. **CUDA-side regression policy — RESOLVED**: out of scope. cppmega CUDA evolves on its own track; MLX uses CUDA only as a one-time golden reference where useful. No reciprocal-validation cadence committed.
-10. **MLX version pin — RESOLVED (bleeding-edge allowed)**: prefer latest stable, but **latest nightly and even unmerged PRs are in scope** when they contain something we need (a fast-path API, a kernel fix, a `mx.distributed` improvement). Process:
-    - Pin per-commit via `pyproject.toml` (e.g. git URL + commit SHA) so builds stay reproducible.
+10. **MLX version pin — RESOLVED (bleeding-edge allowed)**: prefer latest stable, but **latest nightly and even unmerged PRs are in scope** when they contain something we need (a fast-path API, a kernel fix, a mx.distributed improvement). Process:
+    - Pin per-commit via pyproject.toml (e.g. git URL + commit SHA) so builds stay reproducible.
     - When pulling nightly or a PR branch, open a dedicated PR here that re-runs parity + bench gates and explicitly notes which upstream change we depend on and why.
-    - Keep a documented backout to the last good stable in `docs/mlx_version_journal.md` so we can roll back per-commit if upstream regresses.
-    - Vendor unmerged PR patches under `vendor/mlx_patches/` as `.patch` files when full PR-branch tracking is too noisy.
+    - Keep a documented backout to the last good stable in docs/mlx_version_journal.md so we can roll back per-commit if upstream regresses.
+    - Vendor unmerged PR patches under vendor/mlx_patches/ as .patch files when full PR-branch tracking is too noisy.
 
 ---
 

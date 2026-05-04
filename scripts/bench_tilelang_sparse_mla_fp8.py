@@ -306,13 +306,14 @@ def _full_dispatch_strict_failures(
         failures.append(f"{status_key}.available=false blocks full Path C {label} dispatch")
         return failures
     features = status.get("features", {})
-    if features.get("dispatch_surface") != "qk_reduce":
+    dispatch_surface = features.get("dispatch_surface")
+    if dispatch_surface != "full_fwd_bwd":
         failures.append(
-            f"{status_key}.features.dispatch_surface={features.get('dispatch_surface')!r} "
-            f"is not the runnable qk_reduce Path C {label} surface"
+            f"{status_key}.features.dispatch_surface={dispatch_surface!r} "
+            f"is not full_fwd_bwd Path C {label} dispatch"
         )
-    if features.get("runnable_qk_reduce_available") is not True:
-        failures.append(f"{status_key}.features.runnable_qk_reduce_available is not true")
+    if features.get("full_fwd_bwd_available") is not True:
+        failures.append(f"{status_key}.features.full_fwd_bwd_available is not true")
     return failures
 
 
@@ -943,6 +944,7 @@ def main() -> None:
     )
     bs_payload["qk_reducer_strict"] = {
         "enabled": bool(args.strict),
+        "scope": "qk_reducer_dispatch",
         "passed": not bs_strict_failures,
         "max_abs_err": args.strict_max_blockscaled_abs_err,
         "max_ratio": args.strict_max_blockscaled_ratio,

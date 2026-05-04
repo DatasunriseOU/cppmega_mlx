@@ -411,18 +411,89 @@ trending kernels on 2026-04-30. The unsupported API attempt noted above returned
 HTTP 404, so the snapshot below comes from the HTML-embedded KernelList
 metadata.
 
-| Kernel                                           | Drivers                     | Downloads | Last modified            | SHA                                      |
-| ------------------------------------------------ | --------------------------- | --------: | ------------------------ | ---------------------------------------- |
-| kernels-community/mlx-rmsnorm                    | Metal                       |         5 | 2026-04-30T18:39:26.000Z | ba4229bb80ec474f8196e3b2feffb661bfba30be |
-| kernels-community/relu                           | CUDA, ROCm, Metal, XPU, CPU |    38,972 | 2026-04-30T21:14:58.000Z | e417a11b50085675a3fbab75a75e5a1c137469e1 |
-| kernels-community/paged-attention                | CUDA, ROCm, Metal           |        30 | 2026-04-30T21:30:35.000Z | e4cf9c63c76f5bbcb2142f69dbf9d3d7bb149fb9 |
-| kernels-community/mlx-quantization-metal-kernels | Metal                       |        25 | 2026-04-30T18:43:20.000Z | 35b71b84e62f6ea5516f1834dbaa2d17df7fd169 |
-| kernels-community/metal-flash-sdpa               | Metal                       |        41 | 2026-04-30T18:44:27.000Z | 76f2476def1cfad6bad9133d5c6cd5c05f5418a7 |
-| kernels-community/gpt-oss-metal-kernels          | Metal                       |        44 | 2026-04-30T18:43:56.000Z | 7e271cf432005a22aca3d85b7fc6c82ce22e80b4 |
-| kernels-community/bitsandbytes-mps               | Metal                       |         3 | 2026-04-30T18:43:03.000Z | bbf141fc155dd09af1b015c8d89e76393aa67408 |
-| kernels-community/activation                     | CUDA, Metal                 |    34,769 | 2026-04-30T18:43:12.000Z | b3bfcb2c5da69cbf744c7f35bbde3c148c904872 |
-| drbh/test-repo                                   | Metal                       |         0 | 2026-04-30T23:37:10.000Z | 50290b1041b82b3836ca449fb0688773740ec5eb |
-| drbh/first-kernel                                | Metal                       |         1 | 2026-03-20T16:21:35.000Z | 798f87eaf694ebbc2e687bd7f8586b4d84842ed0 |
+<table>
+  <thead>
+    <tr>
+      <th>Kernel</th>
+      <th>Drivers</th>
+      <th>Downloads</th>
+      <th>Last modified</th>
+      <th>SHA</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>kernels-community/mlx-rmsnorm</td>
+      <td>Metal</td>
+      <td>5</td>
+      <td>2026-04-30T18:39:26.000Z</td>
+      <td>ba4229bb80ec474f8196e3b2feffb661bfba30be</td>
+    </tr>
+    <tr>
+      <td>kernels-community/relu</td>
+      <td>CUDA, ROCm, Metal, XPU, CPU</td>
+      <td>38,972</td>
+      <td>2026-04-30T21:14:58.000Z</td>
+      <td>e417a11b50085675a3fbab75a75e5a1c137469e1</td>
+    </tr>
+    <tr>
+      <td>kernels-community/paged-attention</td>
+      <td>CUDA, ROCm, Metal</td>
+      <td>30</td>
+      <td>2026-04-30T21:30:35.000Z</td>
+      <td>e4cf9c63c76f5bbcb2142f69dbf9d3d7bb149fb9</td>
+    </tr>
+    <tr>
+      <td>kernels-community/mlx-quantization-metal-kernels</td>
+      <td>Metal</td>
+      <td>25</td>
+      <td>2026-04-30T18:43:20.000Z</td>
+      <td>35b71b84e62f6ea5516f1834dbaa2d17df7fd169</td>
+    </tr>
+    <tr>
+      <td>kernels-community/metal-flash-sdpa</td>
+      <td>Metal</td>
+      <td>41</td>
+      <td>2026-04-30T18:44:27.000Z</td>
+      <td>76f2476def1cfad6bad9133d5c6cd5c05f5418a7</td>
+    </tr>
+    <tr>
+      <td>kernels-community/gpt-oss-metal-kernels</td>
+      <td>Metal</td>
+      <td>44</td>
+      <td>2026-04-30T18:43:56.000Z</td>
+      <td>7e271cf432005a22aca3d85b7fc6c82ce22e80b4</td>
+    </tr>
+    <tr>
+      <td>kernels-community/bitsandbytes-mps</td>
+      <td>Metal</td>
+      <td>3</td>
+      <td>2026-04-30T18:43:03.000Z</td>
+      <td>bbf141fc155dd09af1b015c8d89e76393aa67408</td>
+    </tr>
+    <tr>
+      <td>kernels-community/activation</td>
+      <td>CUDA, Metal</td>
+      <td>34,769</td>
+      <td>2026-04-30T18:43:12.000Z</td>
+      <td>b3bfcb2c5da69cbf744c7f35bbde3c148c904872</td>
+    </tr>
+    <tr>
+      <td>drbh/test-repo</td>
+      <td>Metal</td>
+      <td>0</td>
+      <td>2026-04-30T23:37:10.000Z</td>
+      <td>50290b1041b82b3836ca449fb0688773740ec5eb</td>
+    </tr>
+    <tr>
+      <td>drbh/first-kernel</td>
+      <td>Metal</td>
+      <td>1</td>
+      <td>2026-03-20T16:21:35.000Z</td>
+      <td>798f87eaf694ebbc2e687bd7f8586b4d84842ed0</td>
+    </tr>
+  </tbody>
+</table>
 
 These should be treated as reference material, not production dependencies. The immediately relevant items for cppmega are metal-flash-sdpa, paged-attention, mlx-rmsnorm, mlx-quantization-metal-kernels, activation, and gpt-oss-metal-kernels.
 

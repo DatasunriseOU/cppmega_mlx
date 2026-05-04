@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: cppmega mlx path-c <noreply@example.com>
+Date: Mon, 4 May 2026 13:00:00 +0200
+Subject: [PATCH] fix(metal): keep simdgroup storage scalar for 32x32 pipelines
+
+T.Pipelined(..., num_stages > 1) on Metal first needs the Metal macro
+emitter to keep the software-pipeline leading stage dimension when forming
+T.access_ptr indices.  After that fix, 32x32 accumulator fragments still hit a
+separate Metal lowering failure: StorageRewrite can rewrite
+metal.simdgroup pointer variables from scalar float/half element types to
+vector element types such as float32x4 when later ramp accesses are observed.
+
+That rewrite is not valid for Metal simdgroup matrix storage.  Metal codegen
+lowers metal.simdgroup buffers to MSL simdgroup_matrix<T, 8, 8> arrays, whose
+element type must remain scalar.  Keep those pointer element types scalar and
+leave vectorization to the simdgroup load/store/mma intrinsics.
+
+diff --git a/src/transform/storage_rewrite.cc b/src/transform/storage_rewrite.cc
+index d494fdac..7b05d67a 100644
+--- a/src/transform/storage_rewrite.cc
++++ b/src/transform/storage_rewrite.cc
+@@ -1713,6 +1713,13 @@ public:
+     // type.
+     for (const auto &pair : info_map) {
+       const auto &var_info = pair.second;
++      // Metal simdgroup buffers lower to MSL simdgroup_matrix<T, 8, 8>
++      // arrays.  The Metal codegen only accepts scalar matrix element dtypes
++      // (half, float, bfloat), so keep their pointer element type scalar even
++      // if downstream store/load patterns use ramp indices.
++      if (GetPtrStorageScope(var_info.var) == "metal.simdgroup") {
++        continue;
++      }
+       DataType preferred = var_info.get_preferred_dtype();
+       if (preferred != var_info.element_dtype &&
+           (rewrite_mask & var_info.declaration_location)) {
+-- 
+2.49.0
+

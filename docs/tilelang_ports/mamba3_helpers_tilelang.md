@@ -30,13 +30,39 @@ fallback when the TileLang lowering fails.
 
 ## Files in this port
 
-| Path                                                 | Purpose                                                                                                                                                          |
-| ---------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| cppmega_mlx/nn/_tilelang/_mamba3_helpers_tilelang.py | TileLang PrimFunc definitions, MSL lowering, MLX dispatch wrappers, status surface.                                                                              |
-| cppmega_mlx/nn/_tilelang/_msl_transform.py           | Adds lower_tilelang_to_msl_inline() so the kernel body is inlined into MLX's source= (not into an inline void, which Metal forbids for threadgroup allocations). |
-| tests/test_tilelang_mamba3_helpers.py                | 19 parameterised parity tests + status assertions.                                                                                                               |
-| scripts/bench_tilelang_mamba3_helpers.py             | Side-by-side bench vs pure-MLX.                                                                                                                                  |
-| bench/tilelang_ports/mamba3_helpers.json             | Bench output (this file is overwritten on each run).                                                                                                             |
+<table>
+  <thead>
+    <tr>
+      <th>Path</th>
+      <th>Purpose</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>cppmega_mlx/nn/_tilelang/_mamba3_helpers_tilelang.py</td>
+      <td>TileLang PrimFunc definitions, MSL lowering, MLX dispatch<br>
+      wrappers, status surface.</td>
+    </tr>
+    <tr>
+      <td>cppmega_mlx/nn/_tilelang/_msl_transform.py</td>
+      <td>Adds lower_tilelang_to_msl_inline() so the kernel body is<br>
+      inlined into MLX's source= (not into an inline void, which<br>
+      Metal forbids for threadgroup allocations).</td>
+    </tr>
+    <tr>
+      <td>tests/test_tilelang_mamba3_helpers.py</td>
+      <td>19 parameterised parity tests + status assertions.</td>
+    </tr>
+    <tr>
+      <td>scripts/bench_tilelang_mamba3_helpers.py</td>
+      <td>Side-by-side bench vs pure-MLX.</td>
+    </tr>
+    <tr>
+      <td>bench/tilelang_ports/mamba3_helpers.json</td>
+      <td>Bench output (this file is overwritten on each run).</td>
+    </tr>
+  </tbody>
+</table>
 
 ## TileLang DSL → MSL translation notes
 

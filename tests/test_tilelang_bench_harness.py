@@ -564,6 +564,8 @@ def test_checked_in_sparse_mla_receipt_blocks_auto_path_c_flip() -> None:
 def test_checked_in_sparse_mla_fp8_receipt_records_full_path_c_strict_state() -> None:
     receipt = _load_receipt("sparse_mla_fp8.json")
     strict = receipt["strict"]
+    ratios = receipt["ratios"]
+    indexed_reduce_ratio = ratios["path_c_indexed_qk_reduce_over_path_b_fwd"]
 
     assert receipt["schema_version"] == 1
     assert receipt["path_c_tilelang_qk_reduce_status"]["available"] is True
@@ -571,17 +573,18 @@ def test_checked_in_sparse_mla_fp8_receipt_records_full_path_c_strict_state() ->
     qk_strict = receipt["qk_reducer_strict"]
     assert qk_strict["enabled"] is True
     assert qk_strict["scope"] == "qk_reducer_dispatch"
-    assert qk_strict["passed"] is True
-    assert qk_strict["failures"] == []
+    assert qk_strict["passed"] is (float(indexed_reduce_ratio) <= float(qk_strict["max_ratio"]))
+    if qk_strict["passed"] is True:
+        assert qk_strict["failures"] == []
+    else:
+        assert any("path_c_indexed_qk_reduce_over_path_b_fwd" in item for item in qk_strict["failures"])
     _assert_full_path_c_status_matches_strict_gate(
         receipt=receipt,
         strict=strict,
         status_key="path_c_tilelang_qk_status",
     )
     assert strict["max_ratio"] == 1.0
-    ratios = receipt["ratios"]
     qk_reduce_ratio = ratios["path_c_qk_reduce_over_path_b_qk_vecmat"]
-    indexed_reduce_ratio = ratios["path_c_indexed_qk_reduce_over_path_b_fwd"]
     assert _finite_positive_float(qk_reduce_ratio)
     assert _finite_positive_float(indexed_reduce_ratio)
 
@@ -597,16 +600,27 @@ def _assert_full_path_c_status_matches_strict_gate(
     assert isinstance(status, dict)
     assert strict["scope"] == "full_path_c_dispatch"
     assert strict["enabled"] is True
-    if status["available"] is True:
+    features = status.get("features", {})
+    assert isinstance(features, dict)
+    if (
+        status["available"] is True
+        and features.get("dispatch_surface") == "full_fwd_bwd"
+        and features.get("full_fwd_bwd_available") is True
+    ):
         assert strict["passed"] is True
         assert strict["failures"] == []
         return
 
-    assert status["available"] is False
     assert strict["passed"] is False
     failures = strict["failures"]
     assert isinstance(failures, list)
-    assert any(f"{status_key}.available=false" in item for item in failures)
+    if status["available"] is False:
+        assert any(f"{status_key}.available=false" in item for item in failures)
+    else:
+        if features.get("dispatch_surface") != "full_fwd_bwd":
+            assert any("dispatch_surface" in item and "full_fwd_bwd" in item for item in failures)
+        if features.get("full_fwd_bwd_available") is not True:
+            assert any("full_fwd_bwd_available is not true" in item for item in failures)
 
 
 def test_checked_in_sparse_mla_blockscaled_receipt_keeps_full_path_c_blocked() -> None:
@@ -617,6 +631,7 @@ def test_checked_in_sparse_mla_blockscaled_receipt_keeps_full_path_c_blocked() -
     assert receipt["path_c_tilelang_e8m0_qk_reduce_status"]["available"] is True
     qk_strict = receipt["qk_reducer_strict"]
     assert qk_strict["enabled"] is True
+    assert qk_strict["scope"] == "qk_reducer_dispatch"
     assert qk_strict["passed"] is True
     assert qk_strict["failures"] == []
     _assert_full_path_c_status_matches_strict_gate(

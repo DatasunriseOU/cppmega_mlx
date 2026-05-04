@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TypeAlias, cast
 
 import mlx.core as mx
@@ -142,6 +142,30 @@ def make_contiguous_kv_cache(
     )
 
 
+def clone_contiguous_kv_cache(
+    source: ContiguousKVCache,
+    *,
+    batch_size: int | None = None,
+    max_seq_len: int | None = None,
+) -> ContiguousKVCache:
+    """Clone a contiguous KV cache into a fresh mutable cache instance."""
+
+    _validate_cache(source)
+    if batch_size is not None:
+        _validate_positive_int("batch_size", batch_size)
+    if max_seq_len is not None:
+        _validate_positive_int("max_seq_len", max_seq_len)
+
+    config = replace(
+        source.config,
+        batch_size=source.config.batch_size if batch_size is None else batch_size,
+        max_seq_len=source.config.max_seq_len if max_seq_len is None else max_seq_len,
+    )
+    destination = ContiguousKVCache(config)
+    prefill_contiguous_kv_cache(destination, source)
+    return destination
+
+
 def kv_cache_position(cache: ContiguousKVCache) -> int:
     """Return the aligned offset for all layers, failing closed on drift."""
 
@@ -151,6 +175,34 @@ def kv_cache_position(cache: ContiguousKVCache) -> int:
     if any(offset != first for offset in offsets):
         raise RuntimeError("contiguous KV cache layer offsets are not aligned")
     return first
+
+
+@dataclass(frozen=True)
+class PromptCacheEntry:
+    """Reusable contiguous-KV prefix cache plus logits for the next token."""
+
+    prompt_ids: mx.array
+    cache: ContiguousKVCache
+    next_logits: mx.array
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.prompt_ids, mx.array):
+            raise TypeError("prompt_ids must be an mlx.core.array")
+        if len(self.prompt_ids.shape) != 2:
+            raise ValueError("prompt_ids must have shape (batch, sequence)")
+        _validate_positive_int("prompt sequence", int(self.prompt_ids.shape[1]))
+        _validate_cache(self.cache)
+        if not isinstance(self.next_logits, mx.array):
+            raise TypeError("next_logits must be an mlx.core.array")
+        if len(self.next_logits.shape) != 2:
+            raise ValueError("next_logits must have shape (batch, vocab)")
+        batch_size = int(self.prompt_ids.shape[0])
+        if int(self.next_logits.shape[0]) != batch_size:
+            raise ValueError("next_logits batch size must match prompt_ids")
+        if self.cache.config.batch_size != batch_size:
+            raise ValueError("cache batch_size must match prompt_ids")
+        if kv_cache_position(self.cache) != int(self.prompt_ids.shape[1]):
+            raise ValueError("cache position must match prompt_ids sequence length")
 
 
 def trim_contiguous_kv_cache(cache: ContiguousKVCache, num_tokens: int) -> int:
@@ -298,6 +350,8 @@ def _validate_non_negative_int(name: str, value: int) -> None:
 __all__ = [
     "ContiguousKVCache",
     "ContiguousKVCacheConfig",
+    "PromptCacheEntry",
+    "clone_contiguous_kv_cache",
     "kv_cache_position",
     "make_contiguous_kv_cache",
     "prefill_contiguous_kv_cache",

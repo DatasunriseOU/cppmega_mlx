@@ -11,6 +11,9 @@ import mlx.core as mx
 from cppmega_mlx.inference.engine import (
     ContiguousKVCache,
     ContiguousKVCacheConfig,
+    PromptCacheEntry,
+    clone_contiguous_kv_cache,
+    kv_cache_position,
     make_contiguous_kv_cache,
 )
 from cppmega_mlx.inference.sampling import sample_next_token
@@ -224,6 +227,127 @@ def generate_tokens_with_kv_cache(
     return tokens
 
 
+def build_prompt_cache(
+    model: Any,
+    prompt_ids: mx.array,
+    *,
+    cache: ContiguousKVCache | None = None,
+    cache_config: ContiguousKVCacheConfig | None = None,
+    num_layers: int | None = None,
+    num_kv_heads: int | None = None,
+    head_dim: int | None = None,
+    max_seq_len: int | None = None,
+    dtype: mx.Dtype | None = None,
+    quantized: bool = False,
+    kv_bits: int = 4,
+    kv_group_size: int = 64,
+) -> PromptCacheEntry:
+    """Prefill and package a reusable contiguous-KV prompt prefix."""
+
+    if len(prompt_ids.shape) != 2:
+        raise ValueError("prompt_ids must have shape (batch, sequence)")
+    if int(prompt_ids.shape[1]) <= 0:
+        raise ValueError("prompt_ids must contain at least one token")
+
+    max_seq_length = _model_max_seq_length(model)
+    if max_seq_length is not None and prompt_ids.shape[1] > max_seq_length:
+        raise ValueError("prompt_ids already exceed model.config.max_seq_length")
+
+    kv_cache = _resolve_kv_cache(
+        cache=cache,
+        cache_config=cache_config,
+        batch_size=int(prompt_ids.shape[0]),
+        num_layers=num_layers,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        max_seq_len=max_seq_len,
+        dtype=dtype,
+        quantized=quantized,
+        kv_bits=kv_bits,
+        kv_group_size=kv_group_size,
+    )
+    if kv_cache_position(kv_cache) != 0:
+        raise RuntimeError("prompt cache build requires an empty contiguous KV cache")
+
+    next_logits = next_token_logits(model(prompt_ids, kv_cache=kv_cache), prompt_ids)
+    return PromptCacheEntry(
+        prompt_ids=mx.array(prompt_ids),
+        cache=kv_cache,
+        next_logits=mx.array(next_logits),
+    )
+
+
+def generate_tokens_with_prompt_cache(
+    model: Any,
+    prompt_ids: mx.array,
+    *,
+    prompt_cache: PromptCacheEntry,
+    max_new_tokens: int,
+    eos_token_id: int | None = None,
+    temperature: float = 1.0,
+    top_k: int | None = None,
+    top_p: float | None = 1.0,
+    rng_key: Any | None = None,
+) -> mx.array:
+    """Generate by cloning a reusable contiguous-KV prefix cache.
+
+    The cache entry must match the start of ``prompt_ids`` exactly. Any suffix
+    in ``prompt_ids`` is decoded through the cloned cache before new tokens are
+    sampled. Paged attention, quantized attention, and safety for SSM or
+    sliding-window routes are intentionally outside this narrow Stream I slice.
+    """
+
+    if len(prompt_ids.shape) != 2:
+        raise ValueError("prompt_ids must have shape (batch, sequence)")
+    if max_new_tokens < 0:
+        raise ValueError("max_new_tokens must be non-negative")
+    _validate_prompt_cache_prefix(prompt_ids, prompt_cache)
+    if max_new_tokens == 0:
+        return prompt_ids
+
+    max_seq_length = _model_max_seq_length(model)
+    if max_seq_length is not None and prompt_ids.shape[1] > max_seq_length:
+        raise ValueError("prompt_ids already exceed model.config.max_seq_length")
+
+    tokens = prompt_ids
+    kv_cache = clone_contiguous_kv_cache(prompt_cache.cache)
+    prefix_length = int(prompt_cache.prompt_ids.shape[1])
+    suffix = prompt_ids[:, prefix_length:]
+    if suffix.shape[1] == 0:
+        step_logits = prompt_cache.next_logits
+    else:
+        step_logits = next_token_logits(model(suffix, kv_cache=kv_cache), suffix)
+
+    key = rng_key
+    for step in range(max_new_tokens):
+        if max_seq_length is not None and tokens.shape[1] >= max_seq_length:
+            raise ValueError("generation would exceed model.config.max_seq_length")
+
+        key, step_key = _split_generation_key(key)
+        next_token = sample_next_token(
+            step_logits,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            rng_key=step_key,
+        ).astype(tokens.dtype)
+        tokens = mx.concatenate([tokens, next_token], axis=1)
+
+        if eos_token_id is not None:
+            eos_matches = cast(mx.array, next_token[:, 0] == eos_token_id)
+            if bool(mx.all(eos_matches)):
+                break
+
+        if step + 1 >= max_new_tokens:
+            break
+        if max_seq_length is not None and tokens.shape[1] >= max_seq_length:
+            raise ValueError("generation would exceed model.config.max_seq_length")
+
+        step_logits = next_token_logits(model(next_token, kv_cache=kv_cache), next_token)
+
+    return tokens
+
+
 def stream_generate_tokens(
     model: Any,
     prompt_ids: mx.array,
@@ -366,6 +490,22 @@ def _resolve_kv_cache(
         kv_bits=kv_bits,
         kv_group_size=kv_group_size,
     )
+
+
+def _validate_prompt_cache_prefix(
+    prompt_ids: mx.array,
+    prompt_cache: PromptCacheEntry,
+) -> None:
+    if not isinstance(prompt_cache, PromptCacheEntry):
+        raise TypeError("prompt_cache must be a PromptCacheEntry")
+    if prompt_ids.shape[0] != prompt_cache.prompt_ids.shape[0]:
+        raise ValueError("prompt_ids batch size must match prompt_cache")
+    prefix_length = int(prompt_cache.prompt_ids.shape[1])
+    if int(prompt_ids.shape[1]) < prefix_length:
+        raise ValueError("prompt_ids must include the full prompt_cache prefix")
+    prefix_matches = cast(mx.array, prompt_ids[:, :prefix_length] == prompt_cache.prompt_ids)
+    if not bool(mx.all(prefix_matches)):
+        raise ValueError("prompt_ids must start with prompt_cache.prompt_ids")
 
 
 def _stream_generate_tokens_with_kv_cache(

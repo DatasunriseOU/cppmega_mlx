@@ -11,6 +11,8 @@ import cppmega_mlx.inference as inference
 from cppmega_mlx.inference import (
     ContiguousKVCache,
     ContiguousKVCacheConfig,
+    PromptCacheEntry,
+    clone_contiguous_kv_cache,
     kv_cache_position,
     make_contiguous_kv_cache,
     prefill_contiguous_kv_cache,
@@ -178,6 +180,34 @@ def test_prefill_contiguous_kv_cache_copies_single_batch_into_larger_batch() -> 
     replacement = _keys(1, batch=3, start=20_000)
     destination.update_and_fetch(0, replacement, replacement + 1.0)
     assert source.position() == 4
+
+
+def test_clone_contiguous_kv_cache_returns_independent_mutable_copy() -> None:
+    source = make_contiguous_kv_cache(
+        num_layers=1,
+        batch_size=1,
+        num_kv_heads=2,
+        head_dim=32,
+        max_seq_len=8,
+        dtype=mx.float32,
+    )
+    keys = _keys(3)
+    source.update_and_fetch(0, keys, keys + 1.0)
+
+    clone = clone_contiguous_kv_cache(source, max_seq_len=10)
+
+    assert clone is not source
+    assert clone.config.max_seq_len == 10
+    assert clone.position() == 3
+    replacement = _keys(1, start=20_000)
+    clone.update_and_fetch(0, replacement, replacement + 1.0)
+    assert clone.position() == 4
+    assert source.position() == 3
+    src_state = source.layers[0].state
+    clone_state = clone.layers[0].state
+    assert src_state is not None
+    assert clone_state is not None
+    assert src_state is not clone_state
 
 
 def test_prefill_rejects_non_empty_destination_and_incompatible_shape() -> None:
@@ -365,9 +395,36 @@ def test_contiguous_kv_position_and_rollback_fail_closed() -> None:
         )
 
 
+def test_prompt_cache_entry_validates_prefix_cache_contract() -> None:
+    cache = make_contiguous_kv_cache(
+        num_layers=1,
+        batch_size=1,
+        num_kv_heads=2,
+        head_dim=32,
+    )
+    keys = _keys(2)
+    cache.update_and_fetch(0, keys, keys)
+
+    entry = PromptCacheEntry(
+        prompt_ids=mx.array([[1, 2]], dtype=mx.int32),
+        cache=cache,
+        next_logits=mx.zeros((1, 8), dtype=mx.float32),
+    )
+
+    assert entry.cache is cache
+    with pytest.raises(ValueError, match="cache position"):
+        PromptCacheEntry(
+            prompt_ids=mx.array([[1]], dtype=mx.int32),
+            cache=cache,
+            next_logits=mx.zeros((1, 8), dtype=mx.float32),
+        )
+
+
 def test_inference_root_exports_contiguous_kv_helpers() -> None:
     assert inference.ContiguousKVCache is ContiguousKVCache
     assert inference.ContiguousKVCacheConfig is ContiguousKVCacheConfig
+    assert inference.PromptCacheEntry is PromptCacheEntry
+    assert inference.clone_contiguous_kv_cache is clone_contiguous_kv_cache
     assert inference.kv_cache_position is kv_cache_position
     assert inference.make_contiguous_kv_cache is make_contiguous_kv_cache
     assert inference.prefill_contiguous_kv_cache is prefill_contiguous_kv_cache
@@ -376,6 +433,8 @@ def test_inference_root_exports_contiguous_kv_helpers() -> None:
     assert {
         "ContiguousKVCache",
         "ContiguousKVCacheConfig",
+        "PromptCacheEntry",
+        "clone_contiguous_kv_cache",
         "kv_cache_position",
         "make_contiguous_kv_cache",
         "prefill_contiguous_kv_cache",

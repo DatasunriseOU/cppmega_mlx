@@ -209,6 +209,7 @@
   },
   "qk_reducer_strict": {
     "enabled": true,
+    "scope": "qk_reducer_dispatch",
     "passed": true,
     "max_abs_err": 1e-05,
     "max_ratio": 1.0,
@@ -217,9 +218,12 @@
   "strict": {
     "enabled": true,
     "scope": "full_path_c_dispatch",
-    "passed": true,
+    "passed": false,
     "max_abs_err": 1e-05,
     "max_ratio": 1.0,
-    "failures": []
+    "failures": [
+      "path_c_tilelang_e8m0_qk_status.features.dispatch_surface='qk_reduce' is not full_fwd_bwd Path C blockscaled dispatch",
+      "path_c_tilelang_e8m0_qk_status.features.full_fwd_bwd_available is not true"
+    ]
   }
 }

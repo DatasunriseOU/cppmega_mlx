@@ -495,10 +495,54 @@ claiming parity across framework boundaries.
 
 Use a table like this for comparisons:
 
-| Host   | Device            | Stack            | Model source             | Dtype | Batch |  Seq |         Params | Compile s | Mean step s | Tokens/s | Peak GiB |
-| ------ | ----------------- | ---------------- | ------------------------ | ----- | ----: | ---: | -------------: | --------: | ----------: | -------: | -------: |
-| M4 Max | Apple M4 Max      | MLX/Metal        | fallback tiny            | bf16  |     2 |   64 | fill from JSON |      fill |        fill |     fill |     fill |
-| GB10   | fill exact device | fill exact stack | fallback tiny equivalent | bf16  |     2 |   64 | fill from JSON |      fill |        fill |     fill |     fill |
+<table>
+  <thead>
+    <tr>
+      <th>Host</th>
+      <th>Device</th>
+      <th>Stack</th>
+      <th>Model source</th>
+      <th>Dtype</th>
+      <th>Batch</th>
+      <th>Seq</th>
+      <th>Params</th>
+      <th>Compile s</th>
+      <th>Mean step s</th>
+      <th>Tokens/s</th>
+      <th>Peak GiB</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>M4 Max</td>
+      <td>Apple M4 Max</td>
+      <td>MLX/Metal</td>
+      <td>fallback tiny</td>
+      <td>bf16</td>
+      <td>2</td>
+      <td>64</td>
+      <td>fill from JSON</td>
+      <td>fill</td>
+      <td>fill</td>
+      <td>fill</td>
+      <td>fill</td>
+    </tr>
+    <tr>
+      <td>GB10</td>
+      <td>fill exact device</td>
+      <td>fill exact stack</td>
+      <td>fallback tiny equivalent</td>
+      <td>bf16</td>
+      <td>2</td>
+      <td>64</td>
+      <td>fill from JSON</td>
+      <td>fill</td>
+      <td>fill</td>
+      <td>fill</td>
+      <td>fill</td>
+    </tr>
+  </tbody>
+</table>
 
 Only mark the target as met when the steady-state tokens/sec and memory numbers
 come from matched rows. Keep compile-time as its own result because it affects

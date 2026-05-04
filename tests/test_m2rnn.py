@@ -620,6 +620,46 @@ def test_singleton_head_broadcast_matches_explicit_repeat_values() -> None:
     _assert_close(bxf, mx.repeat(xf, repeats=4, axis=-1))
 
 
+def test_singleton_head_broadcast_uses_mlx_broadcast_to_views(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    q, k, v, W, xf = _inputs(
+        batch=2,
+        seq=5,
+        n_q=1,
+        n_k=1,
+        n_v=4,
+        n_w=1,
+        n_f=1,
+        k_dim=3,
+        v_dim=2,
+        seed=125,
+    )
+    original_broadcast_to = mx.broadcast_to
+    broadcast_targets: list[tuple[int, ...]] = []
+
+    def recording_broadcast_to(x: mx.array, shape: tuple[int, ...]) -> mx.array:
+        broadcast_targets.append(tuple(shape))
+        return original_broadcast_to(x, shape)
+
+    monkeypatch.setattr(mx, "broadcast_to", recording_broadcast_to)
+
+    bq, bk, bv, bW, bxf = broadcast_m2rnn_heads(q, k, v, W, xf)
+    mx.eval(bq, bk, bv, bW, bxf)
+
+    assert broadcast_targets == [
+        (2, 5, 4, 3),
+        (2, 5, 4, 3),
+        (4, 2, 2),
+        (2, 5, 4),
+    ]
+    assert bv is v
+    _assert_close(bq, mx.repeat(q, repeats=4, axis=-2))
+    _assert_close(bk, mx.repeat(k, repeats=4, axis=-2))
+    _assert_close(bW, mx.repeat(W, repeats=4, axis=0))
+    _assert_close(bxf, mx.repeat(xf, repeats=4, axis=-1))
+
+
 def test_grouped_head_broadcast_fallback_matches_explicit_repeat_values() -> None:
     q, k, v, W, xf = _inputs(
         batch=1,

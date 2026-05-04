@@ -49,45 +49,262 @@ attention_layer_numbers.index(layer_idx). That indexed contract yields the
 
 These files in ../cppmega are the current source references for parity:
 
-| Source                                           | Anchor contract                                                                                                                                    | Not being ported as-is                                                                                                                  |
-| ------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| cppmega/megatron/nam56r_layout.py                | Import-safe NAM56R pattern/depth helpers, R layer loading, A-layer number loading, and DSA rank env parsing.                                       | Megatron symbol probing is only source-side compatibility logic.                                                                        |
-| cppmega/recipes/nam56r_megatron.py               | Full source parser accepts A, M, D, E, G, R, and pipe-delimited patterns, and reports whether a recipe is fully native Megatron.                   | Local MLX pattern parsing intentionally accepts only A/E/M/R and fails closed on upstream-only symbols.                                 |
-| cppmega/recipes/megatron_args.py                 | Emits Megatron CLI arguments for MLA, MTP, MoE, DSA, and bf16-only DSA indexer settings.                                                           | Megatron launcher flags, CUDA graph, distributed optimizer, and DSA indexer runtime.                                                    |
-| cppmega/recipes/nam56r_launch.py                 | NAM symbol to Megatron hybrid pattern mapping and R custom-layer index derivation.                                                                 | Megatron hybrid-layer CLI construction is not the MLX runtime.                                                                          |
-| cppmega/recipes/nam56r_nemo_recipe.py            | MoE defaults and local/profile vocab constant.                                                                                                     | NeMo/Megatron CLI recipes and distributed launch policy.                                                                                |
-| cppmega/megatron/nam56r_full_spec.py             | Full NAM56R Megatron recipe/runtime anchors: mixed MLA/DSA A-layers, MTP dense-attention override, Author Mamba3 or TP Mamba3 mixer selection,     |                                                                                                                                         |
-|                                                  | M2RNN-on-R placement, and TE provider requirement.                                                                                                 | Transformer Engine provider, native MLA/DSA/MTP module specs, TP mixer runtime, CUDA execution, and distributed Megatron graph behavior |
-| cppmega/megatron/nam56r_te_spec.py               | TE-preserving NAM56R spec that only swaps the Mamba mixer to Author Mamba3 or M2RNN by source layer placement.                                     | Transformer Engine attention/MoE/MTP submodules and Megatron runtime execution.                                                         |
-| cppmega/megatron/nam56r_noconv_spec.py           | No-conv Mamba3 B/C feature branch with R layers still routed to CppMegaM2RNNMixer.                                                                 | TE fused submodules, vanilla SSD/Triton scan path, and full Author Mamba3 feature parity.                                               |
-| cppmega/megatron/mamba3_te_stack_spec.py         | Upstream TE stack spec replacing only the Mamba mixer with the cppmega Mamba3 mixer.                                                               | TE GatedDeltaNet, MLP, MTP, and Megatron ModuleSpec execution.                                                                          |
-| scripts/remote_production_h200_nam56r_v1.sh      | Production defaults for pattern, depth, R layers, ngram hash, structure, DSA tuple, and the indexed DSA/MLA preflight.                             | H200 launcher, CUDA graph, NCCL, TE, and distributed shell runtime.                                                                     |
-| scripts/remote_sweep_h200_dsa_production.sh      | Same DSA 9+4 indexed preflight used in sweep lanes.                                                                                                | Remote H200 sweep orchestration and CUDA-only runtime checks.                                                                           |
-| cppmega/megatron/m2rnn_spec.py                   | M2RNN feature semantics: projection split, recurrence, decay gate, residual path, and training-only limitations.                                   | Megatron ModuleSpec, Transformer Engine norm, Triton scan kernel, and CUDA training execution.                                          |
-| cppmega/megatron/mamba3_te_in_proj.py            | Author Mamba3 in-projection slices [z,x,B,C,dd_dt,dd_A,trap,angles] and TP partition-size semantics.                                               | TELayerNormColumnParallelLinear and Transformer Engine checkpoint resharding runtime.                                                   |
-| cppmega/megatron/mamba3_mixer.py                 | Mamba3 feature semantics: QK norm on B/C, B/C bias, optional data-dependent A, and split path packed xBC causal conv before [x,B,C] split.         | Megatron MambaMixer, mamba_ssm Triton kernels, CUDA graph compatibility mechanics.                                                      |
-| cppmega/megatron/mamba3_te_mixer.py              | Author Mamba3 kernel path: [z,x,B,C,dd_dt,dd_A,trap,angles] projection feeds data-dependent-A, trapezoidal, RoPE/angle, and SISO/MIMO scan kernels | Transformer Engine, Triton/TileLang scan kernels, CUDA inference step kernels, and distributed TP runtime.                              |
-| cppmega/features/engram/ngram_hash.py            | Additive n-gram hash enrichment defaults: orders (2,3), heads 8, table size 500000, embed dim 16.                                                  | Torch module implementation and CUDA execution.                                                                                         |
-| cppmega/features/structure/embedding.py          | Additive structure embedding components, especially core = structure, dep_level.                                                                   | Torch module implementation and CUDA execution.                                                                                         |
-| cppmega/megatron/custom_embedding.py             | Optional env-gated ngram and structure enrichments added beside Megatron token embeddings.                                                         | Megatron LanguageModelEmbedding, pipeline-stage sharded-state mechanics, and CUDA dropout/sequence-parallel runtime.                    |
-| cppmega/megatron/structure_batch.py              | Source-side structure side-channel key set: structure_ids, dep_levels, ast_depth_ids, sibling_index_ids, and node_type_ids.                        | Torch batch plumbing and Megatron data-loader integration.                                                                              |
-| cppmega/megatron/custom_gpt_model.py             | Source-side handoff for setting cppmega structure inputs on the GPT model before the embedding layer consumes them.                                | Megatron GPT model execution, pipeline parallelism, and CUDA runtime.                                                                   |
-| cppmega/megatron/fastmtp_layer.py                | Optional CPPMEGA_FASTMTP=1 Torch/Megatron FastMTP path with checkpointing, cadence, and optional Liger CE.                                         | Native MLX MTP layer, Megatron MTP monkey patching, Liger CE, and production MTP scheduling.                                            |
-| cppmega/megatron/mtp_native_hopper_ce.py         | Hopper/Megatron native linear-CE path for main-plus-MTP loss fusion.                                                                               | Hopper/GB10 CE kernels, native Megatron CE patching, and fused main+MTP launch behavior.                                                |
-| cppmega/megatron/dsa_local_spec.py               | Source-side helper for validating official Megatron DSA before copying residual behavior.                                                          | Local native DSA implementation or sparse-MLA training kernel.                                                                          |
-| cppmega/megatron/dsa_sparse_attention.py         | CUDA/Torch sparse gather-scatter DSA attention replacement for Megatron's unfused DSA function.                                                    | Sparse DSA/MLA Metal kernel and differentiable MLX training implementation.                                                             |
-| cppmega/megatron/moe_dispatcher_patch.py         | Runtime monkey patch around Megatron/Transformer Engine MoE dispatcher behavior.                                                                   | Megatron all-to-all dispatcher parity, grouped-GEMM scheduling, and expert-parallel overlap.                                            |
-| cppmega/megatron/selective_fp8_moe_patch.py      | Selective FP8 gating for MoE layers while attention/Mamba/R layers remain bf16.                                                                    | FP8/NVFP4 training, Transformer Engine FP8 contexts, and local MLX mixed-precision dispatcher parity.                                   |
-| scripts/data_prep_parquet_to_megatron.py         | Parquet-to-Megatron conversion currently reads a configurable token column whose default is token_ids.                                             | Structure side-channel conversion; the converter does not emit sidecar metadata for the MLX reader.                                     |
-| scripts/remote_smoke_h200_dsa_9_4_m.sh           | H200 DSA/MLA 9+4 smoke anchor with ngram/structure env flags and source-side runtime patches.                                                      | Local MLX launcher support, CUDA runtime, and distributed Megatron execution.                                                           |
-| scripts/remote_smoke_h200_nam56r_k_pp1.sh        | H200 NAM56R smoke anchor for launcher env flags, native MLA/MoE/MTP/DSA args, and 9+4 DSA/MLA preflight.                                           | Local MLX launcher support, CUDA runtime, and distributed Megatron execution.                                                           |
-| scripts/remote_train_gb10_nam56r_single.sh       | GB10 NAM56R source-side train script anchor.                                                                                                       | GB10 performance parity or local MLX launcher support.                                                                                  |
-| scripts/remote_train_h200_nam56r_full.sh         | H200 full NAM56R train script anchor.                                                                                                              | H200 distributed Megatron launcher parity.                                                                                              |
-| scripts/remote_train_h200_nam56r_lite.sh         | H200 lite NAM56R train script anchor.                                                                                                              | Local tiny smoke equivalence to H200 lite training.                                                                                     |
-| scripts/remote_train_h200_nam56r_grid.sh         | H200 NAM56R grid train script anchor.                                                                                                              | Local distributed sweep orchestration.                                                                                                  |
-| scripts/remote_train_h200_nam56r_tp2.sh          | H200 NAM56R TP=2 train script anchor.                                                                                                              | MLX tensor-parallel parity.                                                                                                             |
-| scripts/remote_train_h200_nam56r_noconv.sh       | H200 no-conv NAM56R train script anchor.                                                                                                           | MLX no-conv branch performance or feature parity.                                                                                       |
-| scripts/remote_train_h200_nam56r_europe_sweep.sh | H200 Europe sweep train script anchor.                                                                                                             | Remote fleet orchestration or benchmark parity.                                                                                         |
+<table>
+  <thead>
+    <tr>
+      <th>Source</th>
+      <th>Anchor contract</th>
+      <th>Not being ported as-is</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>cppmega/megatron/nam56r_layout.py</td>
+      <td>Import-safe NAM56R pattern/depth helpers, R layer loading,<br>
+      A-layer number loading, and DSA rank env parsing.</td>
+      <td>Megatron symbol probing is only source-side compatibility<br>
+      logic.</td>
+    </tr>
+    <tr>
+      <td>cppmega/recipes/nam56r_megatron.py</td>
+      <td>Full source parser accepts A, M, D, E, G, R, and pipe-<br>
+      delimited patterns, and reports whether a recipe is fully<br>
+      native Megatron.</td>
+      <td>Local MLX pattern parsing intentionally accepts only A/E/M/R<br>
+      and fails closed on upstream-only symbols.</td>
+    </tr>
+    <tr>
+      <td>cppmega/recipes/megatron_args.py</td>
+      <td>Emits Megatron CLI arguments for MLA, MTP, MoE, DSA, and<br>
+      bf16-only DSA indexer settings.</td>
+      <td>Megatron launcher flags, CUDA graph, distributed optimizer,<br>
+      and DSA indexer runtime.</td>
+    </tr>
+    <tr>
+      <td>cppmega/recipes/nam56r_launch.py</td>
+      <td>NAM symbol to Megatron hybrid pattern mapping and R custom-<br>
+      layer index derivation.</td>
+      <td>Megatron hybrid-layer CLI construction is not the MLX<br>
+      runtime.</td>
+    </tr>
+    <tr>
+      <td>cppmega/recipes/nam56r_nemo_recipe.py</td>
+      <td>MoE defaults and local/profile vocab constant.</td>
+      <td>NeMo/Megatron CLI recipes and distributed launch policy.</td>
+    </tr>
+    <tr>
+      <td>cppmega/megatron/nam56r_full_spec.py</td>
+      <td>Full NAM56R Megatron recipe/runtime anchors: mixed MLA/DSA<br>
+      A-layers, MTP dense-attention override, Author Mamba3 or TP<br>
+      Mamba3 mixer selection,</td>
+      <td></td>
+    </tr>
+    <tr>
+      <td></td>
+      <td>M2RNN-on-R placement, and TE provider requirement.</td>
+      <td>Transformer Engine provider, native MLA/DSA/MTP module<br>
+      specs, TP mixer runtime, CUDA execution, and distributed<br>
+      Megatron graph behavior</td>
+    </tr>
+    <tr>
+      <td>cppmega/megatron/nam56r_te_spec.py</td>
+      <td>TE-preserving NAM56R spec that only swaps the Mamba mixer to<br>
+      Author Mamba3 or M2RNN by source layer placement.</td>
+      <td>Transformer Engine attention/MoE/MTP submodules and Megatron<br>
+      runtime execution.</td>
+    </tr>
+    <tr>
+      <td>cppmega/megatron/nam56r_noconv_spec.py</td>
+      <td>No-conv Mamba3 B/C feature branch with R layers still routed<br>
+      to CppMegaM2RNNMixer.</td>
+      <td>TE fused submodules, vanilla SSD/Triton scan path, and full<br>
+      Author Mamba3 feature parity.</td>
+    </tr>
+    <tr>
+      <td>cppmega/megatron/mamba3_te_stack_spec.py</td>
+      <td>Upstream TE stack spec replacing only the Mamba mixer with<br>
+      the cppmega Mamba3 mixer.</td>
+      <td>TE GatedDeltaNet, MLP, MTP, and Megatron ModuleSpec<br>
+      execution.</td>
+    </tr>
+    <tr>
+      <td>scripts/remote_production_h200_nam56r_v1.sh</td>
+      <td>Production defaults for pattern, depth, R layers, ngram<br>
+      hash, structure, DSA tuple, and the indexed DSA/MLA<br>
+      preflight.</td>
+      <td>H200 launcher, CUDA graph, NCCL, TE, and distributed shell<br>
+      runtime.</td>
+    </tr>
+    <tr>
+      <td>scripts/remote_sweep_h200_dsa_production.sh</td>
+      <td>Same DSA 9+4 indexed preflight used in sweep lanes.</td>
+      <td>Remote H200 sweep orchestration and CUDA-only runtime<br>
+      checks.</td>
+    </tr>
+    <tr>
+      <td>cppmega/megatron/m2rnn_spec.py</td>
+      <td>M2RNN feature semantics: projection split, recurrence, decay<br>
+      gate, residual path, and training-only limitations.</td>
+      <td>Megatron ModuleSpec, Transformer Engine norm, Triton scan<br>
+      kernel, and CUDA training execution.</td>
+    </tr>
+    <tr>
+      <td>cppmega/megatron/mamba3_te_in_proj.py</td>
+      <td>Author Mamba3 in-projection slices<br>
+      [z,x,B,C,dd_dt,dd_A,trap,angles] and TP partition-size<br>
+      semantics.</td>
+      <td>TELayerNormColumnParallelLinear and Transformer Engine<br>
+      checkpoint resharding runtime.</td>
+    </tr>
+    <tr>
+      <td>cppmega/megatron/mamba3_mixer.py</td>
+      <td>Mamba3 feature semantics: QK norm on B/C, B/C bias, optional<br>
+      data-dependent A, and split path packed xBC causal conv<br>
+      before [x,B,C] split.</td>
+      <td>Megatron MambaMixer, mamba_ssm Triton kernels, CUDA graph<br>
+      compatibility mechanics.</td>
+    </tr>
+    <tr>
+      <td>cppmega/megatron/mamba3_te_mixer.py</td>
+      <td>Author Mamba3 kernel path: [z,x,B,C,dd_dt,dd_A,trap,angles]<br>
+      projection feeds data-dependent-A, trapezoidal, RoPE/angle,<br>
+      and SISO/MIMO scan kernels</td>
+      <td>Transformer Engine, Triton/TileLang scan kernels, CUDA<br>
+      inference step kernels, and distributed TP runtime.</td>
+    </tr>
+    <tr>
+      <td>cppmega/features/engram/ngram_hash.py</td>
+      <td>Additive n-gram hash enrichment defaults: orders (2,3),<br>
+      heads 8, table size 500000, embed dim 16.</td>
+      <td>Torch module implementation and CUDA execution.</td>
+    </tr>
+    <tr>
+      <td>cppmega/features/structure/embedding.py</td>
+      <td>Additive structure embedding components, especially core =<br>
+      structure, dep_level.</td>
+      <td>Torch module implementation and CUDA execution.</td>
+    </tr>
+    <tr>
+      <td>cppmega/megatron/custom_embedding.py</td>
+      <td>Optional env-gated ngram and structure enrichments added<br>
+      beside Megatron token embeddings.</td>
+      <td>Megatron LanguageModelEmbedding, pipeline-stage sharded-<br>
+      state mechanics, and CUDA dropout/sequence-parallel runtime.</td>
+    </tr>
+    <tr>
+      <td>cppmega/megatron/structure_batch.py</td>
+      <td>Source-side structure side-channel key set: structure_ids,<br>
+      dep_levels, ast_depth_ids, sibling_index_ids, and<br>
+      node_type_ids.</td>
+      <td>Torch batch plumbing and Megatron data-loader integration.</td>
+    </tr>
+    <tr>
+      <td>cppmega/megatron/custom_gpt_model.py</td>
+      <td>Source-side handoff for setting cppmega structure inputs on<br>
+      the GPT model before the embedding layer consumes them.</td>
+      <td>Megatron GPT model execution, pipeline parallelism, and CUDA<br>
+      runtime.</td>
+    </tr>
+    <tr>
+      <td>cppmega/megatron/fastmtp_layer.py</td>
+      <td>Optional CPPMEGA_FASTMTP=1 Torch/Megatron FastMTP path with<br>
+      checkpointing, cadence, and optional Liger CE.</td>
+      <td>Native MLX MTP layer, Megatron MTP monkey patching, Liger<br>
+      CE, and production MTP scheduling.</td>
+    </tr>
+    <tr>
+      <td>cppmega/megatron/mtp_native_hopper_ce.py</td>
+      <td>Hopper/Megatron native linear-CE path for main-plus-MTP loss<br>
+      fusion.</td>
+      <td>Hopper/GB10 CE kernels, native Megatron CE patching, and<br>
+      fused main+MTP launch behavior.</td>
+    </tr>
+    <tr>
+      <td>cppmega/megatron/dsa_local_spec.py</td>
+      <td>Source-side helper for validating official Megatron DSA<br>
+      before copying residual behavior.</td>
+      <td>Local native DSA implementation or sparse-MLA training<br>
+      kernel.</td>
+    </tr>
+    <tr>
+      <td>cppmega/megatron/dsa_sparse_attention.py</td>
+      <td>CUDA/Torch sparse gather-scatter DSA attention replacement<br>
+      for Megatron's unfused DSA function.</td>
+      <td>Sparse DSA/MLA Metal kernel and differentiable MLX training<br>
+      implementation.</td>
+    </tr>
+    <tr>
+      <td>cppmega/megatron/moe_dispatcher_patch.py</td>
+      <td>Runtime monkey patch around Megatron/Transformer Engine MoE<br>
+      dispatcher behavior.</td>
+      <td>Megatron all-to-all dispatcher parity, grouped-GEMM<br>
+      scheduling, and expert-parallel overlap.</td>
+    </tr>
+    <tr>
+      <td>cppmega/megatron/selective_fp8_moe_patch.py</td>
+      <td>Selective FP8 gating for MoE layers while attention/Mamba/R<br>
+      layers remain bf16.</td>
+      <td>FP8/NVFP4 training, Transformer Engine FP8 contexts, and<br>
+      local MLX mixed-precision dispatcher parity.</td>
+    </tr>
+    <tr>
+      <td>scripts/data_prep_parquet_to_megatron.py</td>
+      <td>Parquet-to-Megatron conversion currently reads a<br>
+      configurable token column whose default is token_ids.</td>
+      <td>Structure side-channel conversion; the converter does not<br>
+      emit sidecar metadata for the MLX reader.</td>
+    </tr>
+    <tr>
+      <td>scripts/remote_smoke_h200_dsa_9_4_m.sh</td>
+      <td>H200 DSA/MLA 9+4 smoke anchor with ngram/structure env flags<br>
+      and source-side runtime patches.</td>
+      <td>Local MLX launcher support, CUDA runtime, and distributed<br>
+      Megatron execution.</td>
+    </tr>
+    <tr>
+      <td>scripts/remote_smoke_h200_nam56r_k_pp1.sh</td>
+      <td>H200 NAM56R smoke anchor for launcher env flags, native<br>
+      MLA/MoE/MTP/DSA args, and 9+4 DSA/MLA preflight.</td>
+      <td>Local MLX launcher support, CUDA runtime, and distributed<br>
+      Megatron execution.</td>
+    </tr>
+    <tr>
+      <td>scripts/remote_train_gb10_nam56r_single.sh</td>
+      <td>GB10 NAM56R source-side train script anchor.</td>
+      <td>GB10 performance parity or local MLX launcher support.</td>
+    </tr>
+    <tr>
+      <td>scripts/remote_train_h200_nam56r_full.sh</td>
+      <td>H200 full NAM56R train script anchor.</td>
+      <td>H200 distributed Megatron launcher parity.</td>
+    </tr>
+    <tr>
+      <td>scripts/remote_train_h200_nam56r_lite.sh</td>
+      <td>H200 lite NAM56R train script anchor.</td>
+      <td>Local tiny smoke equivalence to H200 lite training.</td>
+    </tr>
+    <tr>
+      <td>scripts/remote_train_h200_nam56r_grid.sh</td>
+      <td>H200 NAM56R grid train script anchor.</td>
+      <td>Local distributed sweep orchestration.</td>
+    </tr>
+    <tr>
+      <td>scripts/remote_train_h200_nam56r_tp2.sh</td>
+      <td>H200 NAM56R TP=2 train script anchor.</td>
+      <td>MLX tensor-parallel parity.</td>
+    </tr>
+    <tr>
+      <td>scripts/remote_train_h200_nam56r_noconv.sh</td>
+      <td>H200 no-conv NAM56R train script anchor.</td>
+      <td>MLX no-conv branch performance or feature parity.</td>
+    </tr>
+    <tr>
+      <td>scripts/remote_train_h200_nam56r_europe_sweep.sh</td>
+      <td>H200 Europe sweep train script anchor.</td>
+      <td>Remote fleet orchestration or benchmark parity.</td>
+    </tr>
+  </tbody>
+</table>
 
 ## Full NAM56R Megatron Recipe/Runtime Anchors
 

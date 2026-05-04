@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
 from pathlib import Path
 from typing import cast
 
@@ -115,6 +116,10 @@ def _load_fp8_bench_module():
     return module
 
 
+def _finite_positive_float(value: object) -> bool:
+    return isinstance(value, int | float) and math.isfinite(float(value)) and float(value) > 0.0
+
+
 def _indexed_qk_score_oracle_np(
     q_fp8: mx.array,
     q_scale: mx.array,
@@ -185,7 +190,10 @@ def test_fp8_sparse_mla_path_c_status_reports_dispatchable_qk_reducer() -> None:
         assert status.available is False
         return
     assert status.available is True
+    # This status is intentionally reducer-only.  It must not satisfy the
+    # full Sparse-MLA Path C dispatch gate.
     assert status.features["dispatch_surface"] == "qk_reduce"
+    assert status.features.get("full_fwd_bwd_available") is not True
     assert status.features["legacy_fp8_scaled_matmul_probe_available"] is False
     assert "legacy_fp8_scaled_matmul_probe_reason" in status.features
     assert status.features["runnable_qk_reduce_available"] is True
@@ -615,6 +623,76 @@ def test_fp8_sparse_mla_bench_strict_gate_enforces_path_c_perf_and_parity() -> N
     assert any("invalid_mismatch_count=1" in failure for failure in failures)
 
 
+def test_fp8_sparse_mla_full_dispatch_gate_rejects_reducer_only_status() -> None:
+    bench = _load_fp8_bench_module()
+    payload = {
+        "path_c_tilelang_qk_status": {
+            "available": True,
+            "reason": "reducer-only",
+            "features": {
+                "dispatch_surface": "qk_reduce",
+                "runnable_qk_reduce_available": True,
+            },
+        }
+    }
+
+    failures = bench._full_dispatch_strict_failures(
+        payload,
+        status_key="path_c_tilelang_qk_status",
+        label="FP8",
+    )
+    assert failures == [
+        "path_c_tilelang_qk_status.features.dispatch_surface='qk_reduce' "
+        "is not full_fwd_bwd Path C FP8 dispatch",
+        "path_c_tilelang_qk_status.features.full_fwd_bwd_available is not true",
+    ]
+
+
+def test_fp8_sparse_mla_full_dispatch_gate_rejects_reducer_only_e8m0_status() -> None:
+    bench = _load_fp8_bench_module()
+    payload = {
+        "path_c_tilelang_e8m0_qk_status": {
+            "available": True,
+            "reason": "reducer-only",
+            "features": {
+                "dispatch_surface": "qk_reduce",
+                "runnable_qk_reduce_available": True,
+            },
+        }
+    }
+
+    failures = bench._full_dispatch_strict_failures(
+        payload,
+        status_key="path_c_tilelang_e8m0_qk_status",
+        label="blockscaled",
+    )
+    assert failures == [
+        "path_c_tilelang_e8m0_qk_status.features.dispatch_surface='qk_reduce' "
+        "is not full_fwd_bwd Path C blockscaled dispatch",
+        "path_c_tilelang_e8m0_qk_status.features.full_fwd_bwd_available is not true",
+    ]
+
+
+def test_fp8_sparse_mla_full_dispatch_gate_requires_full_fwd_bwd_available_flag() -> None:
+    bench = _load_fp8_bench_module()
+    payload = {
+        "path_c_tilelang_qk_status": {
+            "available": True,
+            "reason": "surface-only",
+            "features": {
+                "dispatch_surface": "full_fwd_bwd",
+                "runnable_qk_reduce_available": True,
+            },
+        }
+    }
+
+    assert bench._full_dispatch_strict_failures(
+        payload,
+        status_key="path_c_tilelang_qk_status",
+        label="FP8",
+    ) == ["path_c_tilelang_qk_status.features.full_fwd_bwd_available is not true"]
+
+
 def test_fp8_sparse_mla_checked_receipt_keeps_path_c_qk_claims_honest() -> None:
     receipt_path = Path(__file__).resolve().parents[1] / "bench" / "tilelang_ports" / "sparse_mla_fp8.json"
     payload = json.loads(receipt_path.read_text())
@@ -622,8 +700,19 @@ def test_fp8_sparse_mla_checked_receipt_keeps_path_c_qk_claims_honest() -> None:
     assert payload["shape"]["q_shape"] == [1, 64, 4, 64]
     assert payload["shape"]["kv_shape"] == [1, 64, 1, 64]
     assert payload["shape"]["indices_shape"] == [1, 64, 1, 16]
-    assert payload["strict"]["passed"] is True
-    assert payload["qk_reducer_strict"]["passed"] is True
+    assert payload["strict"]["passed"] is False
+    assert payload["strict"]["scope"] == "full_path_c_dispatch"
+    assert payload["strict"]["failures"] == [
+        "path_c_tilelang_qk_status.features.dispatch_surface='qk_reduce' "
+        "is not full_fwd_bwd Path C FP8 dispatch",
+        "path_c_tilelang_qk_status.features.full_fwd_bwd_available is not true",
+    ]
+    qk_reducer_strict = payload["qk_reducer_strict"]
+    assert qk_reducer_strict["scope"] == "qk_reducer_dispatch"
+    assert qk_reducer_strict["passed"] is False
+    assert qk_reducer_strict["failures"] == [
+        "path_c_indexed_qk_reduce_over_path_b_fwd=1.26662 exceeds 1"
+    ]
 
     qk_status = payload["path_c_tilelang_qk_reduce_status"]
     indexed_status = payload["path_c_tilelang_indexed_qk_reduce_status"]
@@ -631,6 +720,7 @@ def test_fp8_sparse_mla_checked_receipt_keeps_path_c_qk_claims_honest() -> None:
     scaled_matmul_probe = payload["path_c_tilelang_qk_scaled_matmul_probe_status"]
     assert dispatch_status["available"] is True
     assert dispatch_status["features"]["dispatch_surface"] == "qk_reduce"
+    assert dispatch_status["features"].get("full_fwd_bwd_available") is not True
     assert dispatch_status["features"]["runnable_qk_reduce_available"] is True
     assert dispatch_status["features"]["legacy_fp8_scaled_matmul_probe_available"] is False
     assert scaled_matmul_probe["available"] is False
@@ -655,7 +745,7 @@ def test_fp8_sparse_mla_checked_receipt_keeps_path_c_qk_claims_honest() -> None:
 
     ratios = payload["ratios"]
     assert 0.0 < ratios["path_c_qk_reduce_over_path_b_qk_vecmat"] <= 1.0
-    assert 0.0 < ratios["path_c_indexed_qk_reduce_over_path_b_fwd"] <= 1.0
+    assert _finite_positive_float(ratios["path_c_indexed_qk_reduce_over_path_b_fwd"])
 
 
 def test_fp8_fwd_metal_returns_outputs() -> None:

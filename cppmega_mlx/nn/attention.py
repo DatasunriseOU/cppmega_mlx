@@ -401,12 +401,14 @@ class CausalSelfAttention(nn.Module):
             )
 
         cache_position = 0
+        cache_layer_idx: int | None = None
         if kv_cache is not None:
             if layer_idx is None:
                 raise ValueError("layer_idx is required when kv_cache is provided")
             if layer_idx < 0 or layer_idx >= len(kv_cache.layers):
                 raise IndexError("layer_idx out of range")
-            layer_cache = kv_cache.layers[layer_idx]
+            cache_layer_idx = layer_idx
+            layer_cache = kv_cache.layers[cache_layer_idx]
             if isinstance(layer_cache, QuantizedKVCache):
                 raise NotImplementedError(
                     "quantized KV cache is not integrated with MLX SDPA attention yet"
@@ -415,7 +417,9 @@ class CausalSelfAttention(nn.Module):
 
         q, k, v = self._project_qkv(hidden_states, rope_offset=cache_position)
         if kv_cache is not None:
-            updated_k, updated_v = kv_cache.update_and_fetch(layer_idx, k, v)
+            if cache_layer_idx is None:
+                raise ValueError("layer_idx is required when kv_cache is provided")
+            updated_k, updated_v = kv_cache.update_and_fetch(cache_layer_idx, k, v)
             if not isinstance(updated_k, mx.array) or not isinstance(updated_v, mx.array):
                 raise NotImplementedError(
                     "quantized KV cache is not integrated with MLX SDPA attention yet"

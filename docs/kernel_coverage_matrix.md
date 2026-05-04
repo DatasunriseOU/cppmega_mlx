@@ -8,25 +8,177 @@ Status legend: 🟢 shipped & usable · 🟡 partial / single-direction (fwd-onl
 
 ## Master matrix
 
-| Op family                               | Built-in MLX path                                                          | Best vendor                                                                                                                                                                           | Cost (LOC / risk)                                                                                                                             | Backward?                                          | When it matters                                                   |
-| --------------------------------------- | -------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------- | ----------------------------------------------------------------- |
-| **GEMM (dense)**                        | mx.matmul (MPS BNNS), no fused bias/act on Metal                           | DIY mx.fast.metal_kernel (~150 LOC/epilogue + Python VJP)                                                                                                                             | high — bf16 carrier + fp32 accum, K%8=0                                                                                                       | yes (you write it)                                 | when matmul+bias+act becomes profile-bottleneck                   |
-| **GEMM (quantized)**                    | mx.gather_qmm, mx.quantized_matmul (affine q4 g=64; mxfp4/mxfp8/nvfp4) — 🟢 | nothing — built-in is the kernel HF/mlx-lm/vllm-metal all use                                                                                                                         | 0                                                                                                                                             | inference only (no VJP through dequant)            | shipped today; q4 inference target                                |
-| **Attention**                           | mx.fast.scaled_dot_product_attention — 🟢 fused fwd+bwd                     | nothing                                                                                                                                                                               | 0                                                                                                                                             | yes                                                | shipped today                                                     |
-| **RMSNorm / LayerNorm**                 | mx.fast.{rms_norm, layer_norm} — 🟢 fused fwd+bwd                           | nothing                                                                                                                                                                               | 0                                                                                                                                             | yes                                                | shipped today                                                     |
-| **RoPE**                                | mx.fast.rope — 🟢 fused                                                     | nothing                                                                                                                                                                               | 0                                                                                                                                             | yes                                                | shipped today                                                     |
-| **SwiGLU / GLU activations**            | plain nn.silu(gate) * up op-fused                                          | **mlx-lm models/activations.py** @mx.compile(shapeless=True) (PR #753 merged) — 🟢                                                                                                     | low (~70 LOC)                                                                                                                                 | yes (autograd)                                     | every MLP forward; landed today                                   |
-| **GeGLU / ReLU² / xIELU / GELU-topk**   | nn.gelu / nn.relu² (op fuser)                                              | mlx-lm models/activations.py already covers most; ZMLX explicit-VJP for hot loop (~120 LOC)                                                                                           | low                                                                                                                                           | yes                                                | per-layer activation cost                                         |
-| **fused gate+up matmul (MoE)**          | mx.gather_mm — 🟢 (fwd+bwd)                                                 | mlx-lm SwitchGLU pattern — 🟢 (Mixtral/Llama4/Gemma4-MoE/GLM-MoE all use it)                                                                                                           | ~50 LOC replace per-expert loop                                                                                                               | yes                                                | scales with #experts; current 4-expert reference loop fine for M0 |
-| **Cross-entropy / loss**                | nn.losses.cross_entropy materializes [B*T, V]                              | **cppmega_mlx.training.loss.next_token_cut_cross_entropy** opt-in via `train_hybrid_tiny.py --loss-backend cce`; default/eval stay materialized CE — 🟡                               | 80 LOC core + train-script wiring/tests                                                                                                       | yes via MLX autograd in train path; manual chunked bwd not wired | V=65536 memory bench is evidence only; c08.2 full acceptance open |
-| **Selective scan (Mamba)**              | None — current cppmega_mlx/nn/mamba3.py is reference scan                  | **D-CSIL/mlx-recurrence** ssm_scan.py (~430 LOC, MIT, full fwd+bwd VJP) — 🟢 (post-M0)                                                                                                 | medium (430 LOC vendor + MIMO rank>1 extension if needed)                                                                                     | yes                                                | when long-T forward is bottleneck; 19× fwd+bwd, ~3× e2e on M3 Max |
-| **Selective scan (inference only)**     | reference scan                                                             | mlx-lm PR #1153 — 🟡 fwd-only, 18.7× prefill                                                                                                                                           | medium                                                                                                                                        | no                                                 | inference scout / 48 GB peer                                      |
-| **Mamba3 / MIMO chunked SSD**           | reference (chunked matmul inter-chunk)                                     | **TileLang Apple Metal** (PR tile-ai/tilelang#799 merged 2025-10-07) — emits MSL via TVM, lowers mamba_ssm.ops.tilelang.mamba3.*. CuTe DSL path is sm_90a-only and dead-end on Metal. | medium (port: strip PyTorch-MPS launcher → rehost via mx.fast.metal_kernel; rewrite 3 Triton helpers; fp16 carrier — bf16 simdgroup MSL bugs) | algorithmically portable; needs custom VJP wrapper | full Mamba3 perf parity with cppmega CUDA TileLang path           |
-| **M2RNN main scan (R blocks)**          | reference per-token recurrence in cppmega_mlx/nn/m2rnn.py                  | **cppmega_mlx.nn._tilelang.m2rnn** (Path B, this repo) — fp16 carrier, 1 threadgroup per (B,H) lane, K_DIM threads sharing W via threadgroup memory                                    | medium (~700 LOC fwd+bwd MSL + custom_function VJP)                                                                                           | yes (manual VJP per kernel)                        | M2RNN R blocks — 4-16× fwd, 13-26× fwd+bwd at production shapes  |
-| **KV-cache q4 (inference)**             | None                                                                       | **TurboQuant** (vllm-metal upstream / arozanov / sharpner) — 🟢 4.6× compression, ~98% fp16 speed                                                                                      | low (drop-in mlx-lm KVCache)                                                                                                                  | inference only                                     | inference-scout role; long context                                |
-| **NF4 / QLoRA training**                | not in MLX 🔴                                                               | none — would need mx.custom_function with manual gradient                                                                                                                             | high                                                                                                                                          | needs writing                                      | not on master plan (training stays bf16)                          |
-| **W8A8 GPTQ training**                  | not in MLX 🔴                                                               | none                                                                                                                                                                                  | high                                                                                                                                          | needs writing                                      | not on master plan                                                |
-| **all-to-all expert dispatch (DeepEP)** | not in MLX 🔴                                                               | none — only matters at 64+ experts and EP across nodes                                                                                                                                | very high                                                                                                                                     | n/a                                                | irrelevant at our 4-expert config                                 |
+<table>
+  <thead>
+    <tr>
+      <th>Op family</th>
+      <th>Built-in MLX path</th>
+      <th>Best vendor</th>
+      <th>Cost (LOC / risk)</th>
+      <th>Backward?</th>
+      <th>When it matters</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>**GEMM (dense)**</td>
+      <td>mx.matmul (MPS BNNS), no fused bias/act on Metal</td>
+      <td>DIY mx.fast.metal_kernel (~150 LOC/epilogue + Python VJP)</td>
+      <td>high — bf16 carrier + fp32 accum, K%8=0</td>
+      <td>yes (you write it)</td>
+      <td>when matmul+bias+act becomes profile-bottleneck</td>
+    </tr>
+    <tr>
+      <td>**GEMM (quantized)**</td>
+      <td>mx.gather_qmm, mx.quantized_matmul (affine q4 g=64;<br>
+      mxfp4/mxfp8/nvfp4) — 🟢</td>
+      <td>nothing — built-in is the kernel HF/mlx-lm/vllm-metal all<br>
+      use</td>
+      <td>0</td>
+      <td>inference only (no VJP through dequant)</td>
+      <td>shipped today; q4 inference target</td>
+    </tr>
+    <tr>
+      <td>**Attention**</td>
+      <td>mx.fast.scaled_dot_product_attention — 🟢 fused fwd+bwd</td>
+      <td>nothing</td>
+      <td>0</td>
+      <td>yes</td>
+      <td>shipped today</td>
+    </tr>
+    <tr>
+      <td>**RMSNorm / LayerNorm**</td>
+      <td>mx.fast.{rms_norm, layer_norm} — 🟢 fused fwd+bwd</td>
+      <td>nothing</td>
+      <td>0</td>
+      <td>yes</td>
+      <td>shipped today</td>
+    </tr>
+    <tr>
+      <td>**RoPE**</td>
+      <td>mx.fast.rope — 🟢 fused</td>
+      <td>nothing</td>
+      <td>0</td>
+      <td>yes</td>
+      <td>shipped today</td>
+    </tr>
+    <tr>
+      <td>**SwiGLU / GLU activations**</td>
+      <td>plain nn.silu(gate) * up op-fused</td>
+      <td>**mlx-lm models/activations.py** @mx.compile(shapeless=True)<br>
+      (PR #753 merged) — 🟢</td>
+      <td>low (~70 LOC)</td>
+      <td>yes (autograd)</td>
+      <td>every MLP forward; landed today</td>
+    </tr>
+    <tr>
+      <td>**GeGLU / ReLU² / xIELU / GELU-topk**</td>
+      <td>nn.gelu / nn.relu² (op fuser)</td>
+      <td>mlx-lm models/activations.py already covers most; ZMLX<br>
+      explicit-VJP for hot loop (~120 LOC)</td>
+      <td>low</td>
+      <td>yes</td>
+      <td>per-layer activation cost</td>
+    </tr>
+    <tr>
+      <td>**fused gate+up matmul (MoE)**</td>
+      <td>mx.gather_mm — 🟢 (fwd+bwd)</td>
+      <td>mlx-lm SwitchGLU pattern — 🟢 (Mixtral/Llama4/Gemma4-MoE/GLM-<br>
+      MoE all use it)</td>
+      <td>~50 LOC replace per-expert loop</td>
+      <td>yes</td>
+      <td>scales with #experts; current 4-expert reference loop fine<br>
+      for M0</td>
+    </tr>
+    <tr>
+      <td>**Cross-entropy / loss**</td>
+      <td>nn.losses.cross_entropy materializes [B*T, V]</td>
+      <td>**cppmega_mlx.training.loss.next_token_cut_cross_entropy**<br>
+      opt-in via train_hybrid_tiny.py --loss-backend cce;<br>
+      default/eval stay materialized CE — 🟡</td>
+      <td>80 LOC core + train-script wiring/tests</td>
+      <td>yes via MLX autograd in train path; manual chunked bwd not<br>
+      wired</td>
+      <td>V=65536 memory bench is evidence only; c08.2 full acceptance<br>
+      open</td>
+    </tr>
+    <tr>
+      <td>**Selective scan (Mamba)**</td>
+      <td>None — current cppmega_mlx/nn/mamba3.py is reference scan</td>
+      <td>**D-CSIL/mlx-recurrence** ssm_scan.py (~430 LOC, MIT, full<br>
+      fwd+bwd VJP) — 🟢 (post-M0)</td>
+      <td>medium (430 LOC vendor + MIMO rank>1 extension if needed)</td>
+      <td>yes</td>
+      <td>when long-T forward is bottleneck; 19× fwd+bwd, ~3× e2e on<br>
+      M3 Max</td>
+    </tr>
+    <tr>
+      <td>**Selective scan (inference only)**</td>
+      <td>reference scan</td>
+      <td>mlx-lm PR #1153 — 🟡 fwd-only, 18.7× prefill</td>
+      <td>medium</td>
+      <td>no</td>
+      <td>inference scout / 48 GB peer</td>
+    </tr>
+    <tr>
+      <td>**Mamba3 / MIMO chunked SSD**</td>
+      <td>reference (chunked matmul inter-chunk)</td>
+      <td>**TileLang Apple Metal** (PR tile-ai/tilelang#799 merged<br>
+      2025-10-07) — emits MSL via TVM, lowers<br>
+      mamba_ssm.ops.tilelang.mamba3.*. CuTe DSL path is<br>
+      sm_90a-only and dead-end on Metal.</td>
+      <td>medium (port: strip PyTorch-MPS launcher → rehost via<br>
+      mx.fast.metal_kernel; rewrite 3 Triton helpers; fp16 carrier<br>
+      — bf16 simdgroup MSL bugs)</td>
+      <td>algorithmically portable; needs custom VJP wrapper</td>
+      <td>full Mamba3 perf parity with cppmega CUDA TileLang path</td>
+    </tr>
+    <tr>
+      <td>**M2RNN main scan (R blocks)**</td>
+      <td>reference per-token recurrence in cppmega_mlx/nn/m2rnn.py</td>
+      <td>**cppmega_mlx.nn._tilelang.m2rnn** (Path B, this repo) —<br>
+      fp16 carrier, 1 threadgroup per (B,H) lane, K_DIM threads<br>
+      sharing W via threadgroup memory</td>
+      <td>medium (~700 LOC fwd+bwd MSL + custom_function VJP)</td>
+      <td>yes (manual VJP per kernel)</td>
+      <td>M2RNN R blocks — 4-16× fwd, 13-26× fwd+bwd at production<br>
+      shapes</td>
+    </tr>
+    <tr>
+      <td>**KV-cache q4 (inference)**</td>
+      <td>None</td>
+      <td>**TurboQuant** (vllm-metal upstream / arozanov / sharpner) —<br>
+      🟢 4.6× compression, ~98% fp16 speed</td>
+      <td>low (drop-in mlx-lm KVCache)</td>
+      <td>inference only</td>
+      <td>inference-scout role; long context</td>
+    </tr>
+    <tr>
+      <td>**NF4 / QLoRA training**</td>
+      <td>not in MLX 🔴</td>
+      <td>none — would need mx.custom_function with manual gradient</td>
+      <td>high</td>
+      <td>needs writing</td>
+      <td>not on master plan (training stays bf16)</td>
+    </tr>
+    <tr>
+      <td>**W8A8 GPTQ training**</td>
+      <td>not in MLX 🔴</td>
+      <td>none</td>
+      <td>high</td>
+      <td>needs writing</td>
+      <td>not on master plan</td>
+    </tr>
+    <tr>
+      <td>**all-to-all expert dispatch (DeepEP)**</td>
+      <td>not in MLX 🔴</td>
+      <td>none — only matters at 64+ experts and EP across nodes</td>
+      <td>very high</td>
+      <td>n/a</td>
+      <td>irrelevant at our 4-expert config</td>
+    </tr>
+  </tbody>
+</table>
 
 ## Decision summary (action items)
 
@@ -38,7 +190,7 @@ Status legend: 🟢 shipped & usable · 🟡 partial / single-direction (fwd-onl
 
 ### Already shipped (this session)
 
-- cppmega_mlx/training/cut_cross_entropy.py + `train_hybrid_tiny.py --loss-backend cce` — scoped opt-in chunked CE train integration. Default training/eval remain `nn.losses.cross_entropy`. Existing V=65536 memory benches (−54.6% forward peak / −26.9% F+B peak) are supporting evidence, not the c08.2 full backward/memory closure.
+- cppmega_mlx/training/cut_cross_entropy.py + train_hybrid_tiny.py --loss-backend cce — scoped opt-in chunked CE train integration. Default training/eval remain nn.losses.cross_entropy. Existing V=65536 memory benches (−54.6% forward peak / −26.9% F+B peak) are supporting evidence, not the c08.2 full backward/memory closure.
 - cppmega_mlx/training/optimizers.py::MuonAdamWMulti (make_muon) — Muon+AdamW group splitter mirroring cppmega CUDA's _is_nonlinear_or_embedding (commit d5c1986). 14 tests pass. cppmega_cuda_parity=True flag for trace-matching gb10.
 - cppmega_mlx/runtime/memory_audit.py — runtime audit with attribute alias dedup (commit 0602832).
 - cppmega_mlx/training/plasticity/{fire,dash,redo}.py — FIRE/DASH/ReDo (commit 9173e42).

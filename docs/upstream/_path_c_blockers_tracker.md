@@ -3,27 +3,61 @@
 Date: 2026-05-04
 
 This document tracks what TileLang DSL features are still missing so Path C
-(`@T.prim_func` lowered through patched apple-head TileLang on Metal target)
-can match Path B (hand-written MSL via `mx.fast.metal_kernel`) for the
-remaining ops in `cppmega_mlx/nn/_tilelang/`.
+(@T.prim_func lowered through patched apple-head TileLang on Metal target)
+can match Path B (hand-written MSL via mx.fast.metal_kernel) for the
+remaining ops in cppmega_mlx/nn/_tilelang/.
 
 **Why this matters:** every Path C port we add may surface a new TileLang
 scheduler/codegen gap. When that happens, we file a fresh upstream patch
-under `docs/upstream/`, stack it on top of the existing `jorgecurious/tilelang:metal-gemm-upstream-rebase`
+under docs/upstream/, stack it on top of the existing jorgecurious/tilelang:metal-gemm-upstream-rebase
 chain (PR #2130), and update this tracker.
 
-The Path B/C bench table in `docs/production_kernel_routing.md` is the
+The Path B/C bench table in docs/production_kernel_routing.md is the
 authoritative scoreboard. This doc explains the **why** for each ❌.
 
 ---
 
 ## Current Path C dispatch status
 
-| Op | Bench receipt (M4 Max) | Dispatch status | Notes |
-|---|---|---|---|
-| **topk_selector** | C/B ratios 0.510-0.880 across the checked shapes | ✅ production AUTO | `topk_selector(..., backend="auto")` prefers Path C where available, then falls back to Path B and pure MLX. |
-| **Mamba3 main fwd+bwd** (B=2 T=512 H=4 P=32 N=64 FP32) | C 7.707 ms vs B 7.823 ms | ✅ proof/override | Bit-exact parity with B, 1.5% faster (within noise). Path B remains the production route; Path C is kept as a DSL-path reproducibility receipt. |
-| **Sparse-MLA BF16 fwd+bwd** | paired C/B: `B2_S128_H8_D64` fwd 0.993 / bwd 0.913; `B4_S512_H8_D64` fwd 0.993 / bwd 0.975; `B4_S1024_H8_D64` fwd 0.994 / bwd 0.997 | ⚠️ per-shape AUTO | `sparse_mla_path_c.py` lowers TileLang DSL to scalar MSL and mirrors Path B lane loops. AUTO promotes checked rows only when the receipt shape matches and all required fwd+bwd no-worse gates are true; today all three checked BF16 rows promote to Path C. |
+<table>
+  <thead>
+    <tr>
+      <th>Op</th>
+      <th>Bench receipt (M4 Max)</th>
+      <th>Dispatch status</th>
+      <th>Notes</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>**topk_selector**</td>
+      <td>C/B ratios 0.510-0.880 across the checked shapes</td>
+      <td>✅ production AUTO</td>
+      <td>topk_selector(..., backend="auto") prefers Path C where<br>
+      available, then falls back to Path B and pure MLX.</td>
+    </tr>
+    <tr>
+      <td>**Mamba3 main fwd+bwd** (B=2 T=512 H=4 P=32 N=64 FP32)</td>
+      <td>C 7.707 ms vs B 7.823 ms</td>
+      <td>✅ proof/override</td>
+      <td>Bit-exact parity with B, 1.5% faster (within noise). Path B<br>
+      remains the production route; Path C is kept as a DSL-path<br>
+      reproducibility receipt.</td>
+    </tr>
+    <tr>
+      <td>**Sparse-MLA BF16 fwd+bwd**</td>
+      <td>paired C/B: B2_S128_H8_D64 fwd 0.993 / bwd 0.913;<br>
+      B4_S512_H8_D64 fwd 0.993 / bwd 0.975; B4_S1024_H8_D64 fwd<br>
+      0.994 / bwd 0.997</td>
+      <td>⚠️ per-shape AUTO</td>
+      <td>sparse_mla_path_c.py lowers TileLang DSL to scalar MSL and<br>
+      mirrors Path B lane loops. AUTO promotes checked rows only<br>
+      when the receipt shape matches and all required fwd+bwd no-<br>
+      worse gates are true; today all three checked BF16 rows<br>
+      promote to Path C.</td>
+    </tr>
+  </tbody>
+</table>
 
 ---
 
@@ -31,30 +65,67 @@ authoritative scoreboard. This doc explains the **why** for each ❌.
 
 ### Sparse-MLA family (BF16 AUTO is per-shape; FP8/e8m0 still blocked)
 
-The old "no BF16 Path C exists" blocker is closed in `cppmega.mlx`: the in-tree
-Path C port does not wait on upstream `T.gemm`/`T.Pipelined` Sparse-MLA
+The old "no BF16 Path C exists" blocker is closed in cppmega.mlx: the in-tree
+Path C port does not wait on upstream T.gemm/T.Pipelined Sparse-MLA
 templates. It uses scalar TileLang DSL, lowers through apple-head Metal,
 postprocesses the MSL back to Path-B-style lane loops, and keeps the same
-`dkv_partial` backward contract.
+dkv_partial backward contract.
 
 AUTO is intentionally per-shape and fail-closed. The checked-in
-`bench/tilelang_ports/sparse_mla.json` receipt covers forward and backward
-(`strict.phase="all"`, `fwd_only=false`), so it promotes only rows that match
-the requested shape and have every required fwd+bwd `no_worse_than_path_b` gate
-set. The current receipt promotes `B2_S128_H8_D64`, `B4_S512_H8_D64`, and
-`B4_S1024_H8_D64`; unreceipted shapes stay on Path B.
+bench/tilelang_ports/sparse_mla.json receipt covers forward and backward
+(strict.phase="all", fwd_only=false), so it promotes only rows that match
+the requested shape and have every required fwd+bwd no_worse_than_path_b gate
+set. The current receipt promotes B2_S128_H8_D64, B4_S512_H8_D64, and
+B4_S1024_H8_D64; unreceipted shapes stay on Path B.
 
-| Op | Path C blocker | What patch unblocks it |
-|---|---|---|
-| Sparse-MLA BF16 unreceipted shapes | The three checked fwd+bwd rows promote, but no receipt proves other shape/topk combinations. | Regenerate `bench/tilelang_ports/sparse_mla.json` with the new shape, then update dispatch tests and docs before widening AUTO promotion. |
-| Sparse-MLA FP8 fwd/bwd | Partial qk reducers have parity/timing receipts (QK-reduce C/B 0.864, indexed QK-reduce C/B 0.696), but they are not the strict full-dispatch gate. Full Path C QK remains unavailable, so `sparse_mla_fp8.json` keeps the full Path C gate red. | Extend the FP8 scaled-matmul scheduler so per-load scale fuses into the K loop, then add a full Sparse-MLA FP8 Path C wrapper/test pair that mirrors BF16 `dkv_partial`. |
-| Sparse-MLA blockscaled fwd/bwd (e8m0) | Partial e8m0 QK-reduce has a parity/timing receipt (C/B 0.4364), but it is not the strict full-dispatch gate. Full Path C QK remains unavailable, so `sparse_mla_blockscaled.json` keeps the full Path C gate red. | Introduce `T.BlockScaledLayout(scale_dtype="e8m0", block_size=16)` API and lower it through the Metal scalar path with matching scale-tile bookkeeping; then mirror the BF16 partial-backward contract. Larger work — likely 200-400 LOC. |
+<table>
+  <thead>
+    <tr>
+      <th>Op</th>
+      <th>Path C blocker</th>
+      <th>What patch unblocks it</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Sparse-MLA BF16 unreceipted shapes</td>
+      <td>The three checked fwd+bwd rows promote, but no receipt<br>
+      proves other shape/topk combinations.</td>
+      <td>Regenerate bench/tilelang_ports/sparse_mla.json with the new<br>
+      shape, then update dispatch tests and docs before widening<br>
+      AUTO promotion.</td>
+    </tr>
+    <tr>
+      <td>Sparse-MLA FP8 fwd/bwd</td>
+      <td>Partial qk reducers have parity/timing receipts (QK-reduce<br>
+      C/B 0.864, indexed QK-reduce C/B 0.696), but they are not<br>
+      the strict full-dispatch gate. Full Path C QK remains<br>
+      unavailable, so sparse_mla_fp8.json keeps the full Path C<br>
+      gate red.</td>
+      <td>Extend the FP8 scaled-matmul scheduler so per-load scale<br>
+      fuses into the K loop, then add a full Sparse-MLA FP8 Path C<br>
+      wrapper/test pair that mirrors BF16 dkv_partial.</td>
+    </tr>
+    <tr>
+      <td>Sparse-MLA blockscaled fwd/bwd (e8m0)</td>
+      <td>Partial e8m0 QK-reduce has a parity/timing receipt (C/B<br>
+      0.4364), but it is not the strict full-dispatch gate. Full<br>
+      Path C QK remains unavailable, so<br>
+      sparse_mla_blockscaled.json keeps the full Path C gate red.</td>
+      <td>Introduce T.BlockScaledLayout(scale_dtype="e8m0",<br>
+      block_size=16) API and lower it through the Metal scalar<br>
+      path with matching scale-tile bookkeeping; then mirror the<br>
+      BF16 partial-backward contract. Larger work — likely 200-400<br>
+      LOC.</td>
+    </tr>
+  </tbody>
+</table>
 
 ### Topk + selector follow-up (not a dispatch blocker)
 
-`topk_selector` is not blocked for production dispatch: the current AUTO path
+topk_selector is not blocked for production dispatch: the current AUTO path
 uses Path C when available, and the checked-in receipt keeps every C/B ratio
-<= 1.0. A future `T.simdgroup_reduce` primitive can still improve reduction
+<= 1.0. A future T.simdgroup_reduce primitive can still improve reduction
 ergonomics and FP8 vecmat specialization, but it is not required to select
 Path C for topk today.
 
@@ -63,25 +134,81 @@ Path C for topk today.
 These technically work via Path C but are 3-6× slower than Path B's
 audiohacking-style hand-written MSL. The win path is **fused scheduler**.
 
-| Op | Current Path C state | What's needed |
-|---|---|---|
-| FP8 scaled matmul (128³ e4m3 per-tensor) | ✅ 0.555 ms (Path B 0.172 ms — 3.16× slower) | Fuse the per-load scale broadcast into the GemmMetalScalar K-loop. The audiohacking kernel does this; our DSL path emits a post-loop multiply. **NEW patch**: `tilelang_metal_fp8_scaled_matmul_fused_scheduler`. |
-| FP8 scaled vecmat (M=1 N=K=4096 e4m3) | ✅ 1.098 ms (Path B 0.182 ms — 6.01× slower) | Same as matmul + simdgroup_sum reduction for M=1 specialization. Path B uses hand-written `simd_sum`; DSL needs a `T.simdgroup_reduce_sum` primitive. **NEW patch**: extend the fused scheduler with simdgroup-sum specialization. |
+<table>
+  <thead>
+    <tr>
+      <th>Op</th>
+      <th>Current Path C state</th>
+      <th>What's needed</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>FP8 scaled matmul (128³ e4m3 per-tensor)</td>
+      <td>✅ 0.555 ms (Path B 0.172 ms — 3.16× slower)</td>
+      <td>Fuse the per-load scale broadcast into the GemmMetalScalar<br>
+      K-loop. The audiohacking kernel does this; our DSL path<br>
+      emits a post-loop multiply. **NEW patch**:<br>
+      tilelang_metal_fp8_scaled_matmul_fused_scheduler.</td>
+    </tr>
+    <tr>
+      <td>FP8 scaled vecmat (M=1 N=K=4096 e4m3)</td>
+      <td>✅ 1.098 ms (Path B 0.182 ms — 6.01× slower)</td>
+      <td>Same as matmul + simdgroup_sum reduction for M=1<br>
+      specialization. Path B uses hand-written simd_sum; DSL needs<br>
+      a T.simdgroup_reduce_sum primitive. **NEW patch**: extend<br>
+      the fused scheduler with simdgroup-sum specialization.</td>
+    </tr>
+  </tbody>
+</table>
 
 ---
 
 ## Suggested upstream patch roadmap (ordered by ROI)
 
-When we file these as new `docs/upstream/` artifacts, all stack on top of
-`jorgecurious/tilelang:metal-gemm-upstream-rebase` (PR #2130) plus our existing
-`tilelang_metal_pipelined`, `tilelang_metal_fp8`, `tilelang_metal_fp8_scaled_matmul`
+When we file these as new docs/upstream/ artifacts, all stack on top of
+jorgecurious/tilelang:metal-gemm-upstream-rebase (PR #2130) plus our existing
+tilelang_metal_pipelined, tilelang_metal_fp8, tilelang_metal_fp8_scaled_matmul
 patches. Each new patch adds another link in the dependency chain.
 
-| # | Patch | Unblocks | Effort | ROI |
-|---|---|---|---|---|
-| **A** | `tilelang_metal_fp8_scaled_matmul_fused_scheduler` (fuse per-load scale into GemmMetalScalar K-loop) | FP8 matmul/vecmat speed parity and Sparse-MLA FP8 Path C composition | medium-high (~250 LOC, scheduler pass) | **HIGH** — remaining Sparse-MLA FP8 blocker |
-| **B** | `tilelang_metal_blockscaled_e8m0` (DSL primitive for e8m0 block-scale layout) | Sparse-MLA blockscaled fwd/bwd via Path C | high (~350 LOC, language + lowering) | **MEDIUM** — needed for blockscaled Path C |
-| **C** | `tilelang_metal_simdgroup_reduce` (T.simdgroup_reduce_sum primitive) | FP8 vecmat M=1 specialization and future selector ergonomics | medium (~200 LOC) | **LOW** — Path B/topk dispatch is already covered |
+<table>
+  <thead>
+    <tr>
+      <th>#</th>
+      <th>Patch</th>
+      <th>Unblocks</th>
+      <th>Effort</th>
+      <th>ROI</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>**A**</td>
+      <td>tilelang_metal_fp8_scaled_matmul_fused_scheduler (fuse per-<br>
+      load scale into GemmMetalScalar K-loop)</td>
+      <td>FP8 matmul/vecmat speed parity and Sparse-MLA FP8 Path C<br>
+      composition</td>
+      <td>medium-high (~250 LOC, scheduler pass)</td>
+      <td>**HIGH** — remaining Sparse-MLA FP8 blocker</td>
+    </tr>
+    <tr>
+      <td>**B**</td>
+      <td>tilelang_metal_blockscaled_e8m0 (DSL primitive for e8m0<br>
+      block-scale layout)</td>
+      <td>Sparse-MLA blockscaled fwd/bwd via Path C</td>
+      <td>high (~350 LOC, language + lowering)</td>
+      <td>**MEDIUM** — needed for blockscaled Path C</td>
+    </tr>
+    <tr>
+      <td>**C**</td>
+      <td>tilelang_metal_simdgroup_reduce (T.simdgroup_reduce_sum<br>
+      primitive)</td>
+      <td>FP8 vecmat M=1 specialization and future selector ergonomics</td>
+      <td>medium (~200 LOC)</td>
+      <td>**LOW** — Path B/topk dispatch is already covered</td>
+    </tr>
+  </tbody>
+</table>
 
 BF16 Sparse-MLA no longer needs a TileLang language extension in this repo for
 the checked fwd+bwd rows, and those rows already have Path C AUTO coverage. The
@@ -94,14 +221,14 @@ coverage plus optional reduction ergonomics.
 ## What this means for current PR filing
 
 The 3 rebase agents (mixed_dtype, fp8_gemm, fp8_vector) are putting our
-existing patches on top of `jorgecurious/tilelang:metal-gemm-upstream-rebase`.
+existing patches on top of jorgecurious/tilelang:metal-gemm-upstream-rebase.
 **These are not the end of the story** — patches A through C above are
 expected follow-ups when we extend Path C beyond topk AUTO, Mamba3 proof runs,
 and BF16 Sparse-MLA's current per-shape AUTO coverage.
 
 The filing pack should explicitly say:
 - "Current 8 patches are the foundation; future Path C ports surface new gaps"
-- "Each follow-up will be a fresh `docs/upstream/<name>/` directory with its own README + patch file"
+- "Each follow-up will be a fresh docs/upstream/<name>/ directory with its own README + patch file"
 - "All of them stack on PR #2130 (or whatever upstream Apple Metal PR series eventually merges)"
 
 ---
@@ -113,10 +240,10 @@ When a new Path C port hits a TileLang gap:
 1. Add a row under "Ops where Path C is blocked" with the specific blocker
 2. If the unblock is identifiable as a single patch, add to the roadmap with
    estimated effort and ROI
-3. When the patch lands locally, update `docs/production_kernel_routing.md`
+3. When the patch lands locally, update docs/production_kernel_routing.md
    bench scoreboard and move the row from "blocked" to "shipped"
 4. If the patch ends up filed upstream, link it from the README in
-   `docs/upstream/<patch_name>/`
+   docs/upstream/<patch_name>/
 
 The tracker exists so we don't lose track of what TileLang DSL needs as we
 extend coverage — every Path C "❌" in the production table should map back
@@ -126,7 +253,7 @@ to a specific gap explained here.
 
 ## Currently expected dependency chain (top to bottom)
 
-```
+
 upstream tile-ai/tilelang main
   ↑
   PR #1869 (oraluben metal-gemm)
@@ -148,4 +275,4 @@ upstream tile-ai/tilelang main
   Patch A: tilelang_metal_fp8_scaled_matmul_fused_scheduler  (when FP8 sparse-MLA Path C lands)
   Patch B: tilelang_metal_blockscaled_e8m0          (when blockscaled Path C lands)
   Patch C: tilelang_metal_simdgroup_reduce          (for FP8 vecmat/future selector ergonomics)
-```
+

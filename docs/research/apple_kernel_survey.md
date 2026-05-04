@@ -171,14 +171,54 @@ Adoption priority:
 
 ## Source Matrix
 
-| Source                       | Current use                                                                                                             | Decision                                                                        |
-| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
-| MLX core                     | Arrays, modules, optimizers, nn.value_and_grad, mx.compile, mx.eval, memory telemetry, fast ops, custom Metal API       | P0 runtime substrate                                                            |
-| MLX-LM                       | Compiled-step pattern, wired-limit/memory conventions, safetensors and Hub conventions, future mx.distributed reference | P0/P1 pattern source, not trainer dependency                                    |
-| MLX examples                 | transformer_lm, llms, lora, bert, and t5 mechanics for small model/training patterns                                    | Reference only; do not make it a trainer base or dependency                     |
-| MLX community repos          | Reference implementations for simple model mechanics and fine-tuning/RL/multimodal ideas                                | Reference only                                                                  |
-| HF Apple M4 kernels          | RMSNorm, activation, attention, quantization, GPT-style inference kernel references                                     | P2 references/test fixtures                                                     |
-| Custom cppmega Metal kernels | Optional prototype seam only today                                                                                      | Blocked from training until fallback, parity, profiling, and VJP/JVP gates pass |
+<table>
+  <thead>
+    <tr>
+      <th>Source</th>
+      <th>Current use</th>
+      <th>Decision</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>MLX core</td>
+      <td>Arrays, modules, optimizers, nn.value_and_grad, mx.compile,<br>
+      mx.eval, memory telemetry, fast ops, custom Metal API</td>
+      <td>P0 runtime substrate</td>
+    </tr>
+    <tr>
+      <td>MLX-LM</td>
+      <td>Compiled-step pattern, wired-limit/memory conventions,<br>
+      safetensors and Hub conventions, future mx.distributed<br>
+      reference</td>
+      <td>P0/P1 pattern source, not trainer dependency</td>
+    </tr>
+    <tr>
+      <td>MLX examples</td>
+      <td>transformer_lm, llms, lora, bert, and t5 mechanics for small<br>
+      model/training patterns</td>
+      <td>Reference only; do not make it a trainer base or dependency</td>
+    </tr>
+    <tr>
+      <td>MLX community repos</td>
+      <td>Reference implementations for simple model mechanics and<br>
+      fine-tuning/RL/multimodal ideas</td>
+      <td>Reference only</td>
+    </tr>
+    <tr>
+      <td>HF Apple M4 kernels</td>
+      <td>RMSNorm, activation, attention, quantization, GPT-style<br>
+      inference kernel references</td>
+      <td>P2 references/test fixtures</td>
+    </tr>
+    <tr>
+      <td>Custom cppmega Metal kernels</td>
+      <td>Optional prototype seam only today</td>
+      <td>Blocked from training until fallback, parity, profiling, and<br>
+      VJP/JVP gates pass</td>
+    </tr>
+  </tbody>
+</table>
 
 ## HF Apple M4 Kernel Snapshot
 
@@ -187,18 +227,89 @@ below are point-in-time listing metadata, not adoption or quality proof. The
 catalog is mutable even within the day; direct repo HEADs checked after the HTML
 fetch are recorded separately below.
 
-| Kernel                                           | Drivers                     | Downloads | Last modified            | SHA                                      |
-| ------------------------------------------------ | --------------------------- | --------: | ------------------------ | ---------------------------------------- |
-| kernels-community/mlx-rmsnorm                    | Metal                       |         5 | 2026-04-30T18:39:26.000Z | ba4229bb80ec474f8196e3b2feffb661bfba30be |
-| kernels-community/relu                           | CUDA, ROCm, Metal, XPU, CPU |    38,972 | 2026-04-30T21:14:58.000Z | e417a11b50085675a3fbab75a75e5a1c137469e1 |
-| kernels-community/paged-attention                | CUDA, ROCm, Metal           |        30 | 2026-04-30T21:30:35.000Z | e4cf9c63c76f5bbcb2142f69dbf9d3d7bb149fb9 |
-| kernels-community/mlx-quantization-metal-kernels | Metal                       |        25 | 2026-04-30T18:43:20.000Z | 35b71b84e62f6ea5516f1834dbaa2d17df7fd169 |
-| kernels-community/metal-flash-sdpa               | Metal                       |        41 | 2026-04-30T18:44:27.000Z | 76f2476def1cfad6bad9133d5c6cd5c05f5418a7 |
-| kernels-community/gpt-oss-metal-kernels          | Metal                       |        44 | 2026-04-30T18:43:56.000Z | 7e271cf432005a22aca3d85b7fc6c82ce22e80b4 |
-| kernels-community/bitsandbytes-mps               | Metal                       |         3 | 2026-04-30T18:43:03.000Z | bbf141fc155dd09af1b015c8d89e76393aa67408 |
-| kernels-community/activation                     | CUDA, Metal                 |    34,769 | 2026-04-30T18:43:12.000Z | b3bfcb2c5da69cbf744c7f35bbde3c148c904872 |
-| drbh/test-repo                                   | Metal                       |         0 | 2026-04-30T23:37:10.000Z | 50290b1041b82b3836ca449fb0688773740ec5eb |
-| drbh/first-kernel                                | Metal                       |         1 | 2026-03-20T16:21:35.000Z | 798f87eaf694ebbc2e687bd7f8586b4d84842ed0 |
+<table>
+  <thead>
+    <tr>
+      <th>Kernel</th>
+      <th>Drivers</th>
+      <th>Downloads</th>
+      <th>Last modified</th>
+      <th>SHA</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>kernels-community/mlx-rmsnorm</td>
+      <td>Metal</td>
+      <td>5</td>
+      <td>2026-04-30T18:39:26.000Z</td>
+      <td>ba4229bb80ec474f8196e3b2feffb661bfba30be</td>
+    </tr>
+    <tr>
+      <td>kernels-community/relu</td>
+      <td>CUDA, ROCm, Metal, XPU, CPU</td>
+      <td>38,972</td>
+      <td>2026-04-30T21:14:58.000Z</td>
+      <td>e417a11b50085675a3fbab75a75e5a1c137469e1</td>
+    </tr>
+    <tr>
+      <td>kernels-community/paged-attention</td>
+      <td>CUDA, ROCm, Metal</td>
+      <td>30</td>
+      <td>2026-04-30T21:30:35.000Z</td>
+      <td>e4cf9c63c76f5bbcb2142f69dbf9d3d7bb149fb9</td>
+    </tr>
+    <tr>
+      <td>kernels-community/mlx-quantization-metal-kernels</td>
+      <td>Metal</td>
+      <td>25</td>
+      <td>2026-04-30T18:43:20.000Z</td>
+      <td>35b71b84e62f6ea5516f1834dbaa2d17df7fd169</td>
+    </tr>
+    <tr>
+      <td>kernels-community/metal-flash-sdpa</td>
+      <td>Metal</td>
+      <td>41</td>
+      <td>2026-04-30T18:44:27.000Z</td>
+      <td>76f2476def1cfad6bad9133d5c6cd5c05f5418a7</td>
+    </tr>
+    <tr>
+      <td>kernels-community/gpt-oss-metal-kernels</td>
+      <td>Metal</td>
+      <td>44</td>
+      <td>2026-04-30T18:43:56.000Z</td>
+      <td>7e271cf432005a22aca3d85b7fc6c82ce22e80b4</td>
+    </tr>
+    <tr>
+      <td>kernels-community/bitsandbytes-mps</td>
+      <td>Metal</td>
+      <td>3</td>
+      <td>2026-04-30T18:43:03.000Z</td>
+      <td>bbf141fc155dd09af1b015c8d89e76393aa67408</td>
+    </tr>
+    <tr>
+      <td>kernels-community/activation</td>
+      <td>CUDA, Metal</td>
+      <td>34,769</td>
+      <td>2026-04-30T18:43:12.000Z</td>
+      <td>b3bfcb2c5da69cbf744c7f35bbde3c148c904872</td>
+    </tr>
+    <tr>
+      <td>drbh/test-repo</td>
+      <td>Metal</td>
+      <td>0</td>
+      <td>2026-04-30T23:37:10.000Z</td>
+      <td>50290b1041b82b3836ca449fb0688773740ec5eb</td>
+    </tr>
+    <tr>
+      <td>drbh/first-kernel</td>
+      <td>Metal</td>
+      <td>1</td>
+      <td>2026-03-20T16:21:35.000Z</td>
+      <td>798f87eaf694ebbc2e687bd7f8586b4d84842ed0</td>
+    </tr>
+  </tbody>
+</table>
 
 Direct repository HEAD refresh after the listing fetch:
 
@@ -217,17 +328,72 @@ Direct repository HEAD refresh after the listing fetch:
 
 Kernel-specific decisions:
 
-| Kernel                            | Card signal                                                                        | cppmega.mlx decision                                                                                                            |
-| --------------------------------- | ---------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| mlx-rmsnorm                       | MIT card, rmsnorm_forward, rmsnorm_backward, no benchmark on card                  | Compare only after MLX RMSNorm baseline. Do not replace first-party MLX without parity and hotspot evidence.                    |
-| relu                              | General multi-platform activation kernel                                           | Low value; built-in MLX activations cover the current need.                                                                     |
-| paged-attention                   | Paged cache functions and a benchmark command                                      | Decode/KV-cache oriented. Defer for pretraining unless backward and train-shape relevance are proven.                           |
-| mlx-quantization-metal-kernels    | Metal-only quantization listing                                                    | Quantization/inference reference only. Do not put on the pretraining path without a measured local hotspot and fallback parity. |
-| metal-flash-sdpa                  | flash_attention_varlen functions, no benchmark on card                             | Useful attention source material. Keep MLX SDPA/reference attention first.                                                      |
-| gpt-oss-metal-kernels             | Matmul, embedding, RMSNorm, RoPE, SDPA, top-k, routing metadata, scatter functions | Good reading material for future matmul/routing/scatter lanes; not a training dependency.                                       |
-| bitsandbytes-mps                  | 4-bit quantize/dequantize/GEMV/GEMM/linear functions                               | Inference/quantization reference. Defer for pretraining.                                                                        |
-| activation                        | Fused activation and activation-and-mul functions plus benchmark command           | Candidate only if profiling identifies a fused activation bottleneck.                                                           |
-| drbh/test-repo, drbh/first-kernel | Demo/test repos                                                                    | Do not adopt.                                                                                                                   |
+<table>
+  <thead>
+    <tr>
+      <th>Kernel</th>
+      <th>Card signal</th>
+      <th>cppmega.mlx decision</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>mlx-rmsnorm</td>
+      <td>MIT card, rmsnorm_forward, rmsnorm_backward, no benchmark on<br>
+      card</td>
+      <td>Compare only after MLX RMSNorm baseline. Do not replace<br>
+      first-party MLX without parity and hotspot evidence.</td>
+    </tr>
+    <tr>
+      <td>relu</td>
+      <td>General multi-platform activation kernel</td>
+      <td>Low value; built-in MLX activations cover the current need.</td>
+    </tr>
+    <tr>
+      <td>paged-attention</td>
+      <td>Paged cache functions and a benchmark command</td>
+      <td>Decode/KV-cache oriented. Defer for pretraining unless<br>
+      backward and train-shape relevance are proven.</td>
+    </tr>
+    <tr>
+      <td>mlx-quantization-metal-kernels</td>
+      <td>Metal-only quantization listing</td>
+      <td>Quantization/inference reference only. Do not put on the<br>
+      pretraining path without a measured local hotspot and<br>
+      fallback parity.</td>
+    </tr>
+    <tr>
+      <td>metal-flash-sdpa</td>
+      <td>flash_attention_varlen functions, no benchmark on card</td>
+      <td>Useful attention source material. Keep MLX SDPA/reference<br>
+      attention first.</td>
+    </tr>
+    <tr>
+      <td>gpt-oss-metal-kernels</td>
+      <td>Matmul, embedding, RMSNorm, RoPE, SDPA, top-k, routing<br>
+      metadata, scatter functions</td>
+      <td>Good reading material for future matmul/routing/scatter<br>
+      lanes; not a training dependency.</td>
+    </tr>
+    <tr>
+      <td>bitsandbytes-mps</td>
+      <td>4-bit quantize/dequantize/GEMV/GEMM/linear functions</td>
+      <td>Inference/quantization reference. Defer for pretraining.</td>
+    </tr>
+    <tr>
+      <td>activation</td>
+      <td>Fused activation and activation-and-mul functions plus<br>
+      benchmark command</td>
+      <td>Candidate only if profiling identifies a fused activation<br>
+      bottleneck.</td>
+    </tr>
+    <tr>
+      <td>drbh/test-repo, drbh/first-kernel</td>
+      <td>Demo/test repos</td>
+      <td>Do not adopt.</td>
+    </tr>
+  </tbody>
+</table>
 
 HF kernel adoption gate:
 
