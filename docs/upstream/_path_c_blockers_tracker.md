@@ -276,5 +276,5 @@ upstream tile-ai/tilelang main
   Our: tilelang_metal_shared_dyn       (no-op investigation artifact, not a code PR)
   ↑ LOCAL ARTIFACTS / PROBES EXIST; NEED APPLY-TO-APPLE-HEAD + UPSTREAM FILING
   Patch A: tilelang_metal_pipelined_32x32
-  Patch B: tilelang_metal_fp8_scaled_matmul_fused_scheduler  (when FP8 sparse-MLA Path C lands)
+  Patch B: tilelang_metal_fp8_scaled_matmul_fused_scheduler  (DRAFTED, PROBE-FAILED 2026-05-04 — patch targets a tileop/gemm scheduler hierarchy that does not exist on apple-head; T.fp8_scaled_matmul is a @T.macro on PR #2142, not a tileop scheduler. Needs re-draft.)
   Patch C: tilelang_metal_blockscaled_e8m0          (when blockscaled Path C lands)

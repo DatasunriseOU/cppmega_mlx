@@ -34,6 +34,10 @@ Lowering metadata remains explicit:
   scale_block_size=32
   scale_axis="contracted_k"
 
+Both metadata fields are required when using the metadata spelling. A bare
+block_size=32 is rejected so future non-E8M0 K/32 layouts cannot accidentally
+lower through this primitive.
+
 For the Sparse-MLA Path C shape this preserves the concrete scale contract:
 
   A_scale shape: (K / 32,)
@@ -41,12 +45,12 @@ For the Sparse-MLA Path C shape this preserves the concrete scale contract:
   scale block:   kb = k // 32
 
 ---
- testing/python/cpu/test_blockscaled_e8m0_layout.py | 137 +++++++++++++++++++
+ testing/python/cpu/test_blockscaled_e8m0_layout.py | 154 ++++++++++++++++++++
  tilelang/language/__init__.py                      |   2 +
- tilelang/language/blockscaled_layout.py            | 151 +++++++++++++++++++++
- tilelang/language/fp8_op.py                        |  68 ++++++++-
- tilelang/tileop/metal_quant.py                     |  25 ++++
- 5 files changed, 380 insertions(+), 3 deletions(-)
+ tilelang/language/blockscaled_layout.py            | 154 +++++++++++++++++++++
+ tilelang/language/fp8_op.py                        | 121 +++++++++++++++-
+ tilelang/tileop/metal_quant.py                     |  27 ++++
+ 5 files changed, 455 insertions(+), 3 deletions(-)
  create mode 100644 testing/python/cpu/test_blockscaled_e8m0_layout.py
  create mode 100644 tilelang/language/blockscaled_layout.py
 
@@ -66,7 +70,7 @@ diff --git a/tilelang/language/blockscaled_layout.py b/tilelang/language/blocksc
 new file mode 100644
 --- /dev/null
 +++ b/tilelang/language/blockscaled_layout.py
-@@ -0,0 +1,151 @@
+@@ -0,0 +1,154 @@
 +"""Block-scale layout primitives for TileLang FP8 DSL surfaces.
 +
 +The first consumer is Apple MXFP8/E8M0, where FP8 data remains e4m3 storage
@@ -238,7 +242,7 @@ diff --git a/tilelang/language/fp8_op.py b/tilelang/language/fp8_op.py
  __all__ = [
      "fp8_scaled_matmul",
      "FP8_DTYPES",
-@@ -72,6 +79,39 @@ def _shape_extent(buffer, axis: int) -> int:
+@@ -72,6 +79,49 @@ def _shape_extent(buffer, axis: int) -> int:
      return -1
  
  
@@ -263,9 +267,18 @@ diff --git a/tilelang/language/fp8_op.py b/tilelang/language/fp8_op.py
 +                "T.fp8_scaled_matmul scale_block_size conflicts with block_scale_layout"
 +            )
 +        return block_scale_layout
-+    if scale_format == E8M0_BLOCK_K32 or int(scale_block_size or 0) == E8M0_BLOCK_SIZE:
-+        return BlockScaledLayout.e8m0_k32()
-+    return None
++    if scale_format is None and scale_block_size is None:
++        return None
++    if scale_format != E8M0_BLOCK_K32:
++        raise ValueError(
++            "T.fp8_scaled_matmul e8m0 block-scale metadata requires "
++            "scale_format='e8m0_block_k32'"
++        )
++    if scale_block_size is None or int(scale_block_size) != E8M0_BLOCK_SIZE:
++        raise ValueError(
++            "T.fp8_scaled_matmul e8m0_block_k32 metadata requires scale_block_size=32"
++        )
++    return BlockScaledLayout.e8m0_k32()
 +
 +
 +def _block_scale_value(scale, *, axis: str, col, k, layout: BlockScaledLayout):
@@ -302,7 +315,7 @@ diff --git a/tilelang/language/fp8_op.py b/tilelang/language/fp8_op.py
      This is intentionally a DSL macro, not a target-specific intrinsic. The
      target scheduler may replace this loop with a fused Metal implementation
      when it recognizes the same op attributes.
-@@ -185,6 +234,11 @@ def fp8_scaled_matmul(
+@@ -185,7 +234,13 @@ def fp8_scaled_matmul(
          B_scale,
          C_out,
          transpose_B=transpose_B,
@@ -316,7 +329,7 @@ diff --git a/tilelang/language/fp8_op.py b/tilelang/language/fp8_op.py
  
      M = _shape_extent(A_fp8, 0)
      K = _shape_extent(A_fp8, 1)
-@@ -195,14 +249,22 @@ def fp8_scaled_matmul(
+@@ -195,14 +249,26 @@ def fp8_scaled_matmul(
      if M <= 0 or N <= 0 or K <= 0:
          raise ValueError("T.fp8_scaled_matmul requires static positive M/N/K")
  
@@ -349,7 +362,7 @@ diff --git a/tilelang/language/fp8_op.py b/tilelang/language/fp8_op.py
 diff --git a/tilelang/tileop/metal_quant.py b/tilelang/tileop/metal_quant.py
 --- a/tilelang/tileop/metal_quant.py
 +++ b/tilelang/tileop/metal_quant.py
-@@ -1,5 +1,30 @@
+@@ -1,5 +1,32 @@
  """Metal quantization helpers used by TileLang FP8 schedulers."""
  
 +from __future__ import annotations
@@ -386,12 +399,13 @@ diff --git a/testing/python/cpu/test_blockscaled_e8m0_layout.py b/testing/python
 new file mode 100644
 --- /dev/null
 +++ b/testing/python/cpu/test_blockscaled_e8m0_layout.py
-@@ -0,0 +1,137 @@
+@@ -0,0 +1,154 @@
 +from __future__ import annotations
 +
 +import pytest
 +
 +import tilelang.language as T
++from tilelang.language.fp8_op import _normalize_block_scale_layout
 +
 +
 +def test_blockscaled_layout_canonical_metadata() -> None:
@@ -506,6 +520,32 @@ new file mode 100644
 +            )
 +
 +    assert "blockscaled_qk_legacy_attrs" in str(blockscaled_qk_legacy_attrs)
++
++
++@pytest.mark.parametrize(
++    ("kwargs", "message"),
++    [
++        (
++            {"scale_format": "e8m0_block_k32", "scale_block_size": None},
++            "scale_block_size=32",
++        ),
++        (
++            {"scale_format": None, "scale_block_size": 32},
++            "scale_format='e8m0_block_k32'",
++        ),
++        (
++            {"scale_format": "other_block_k32", "scale_block_size": 32},
++            "scale_format='e8m0_block_k32'",
++        ),
++        (
++            {"scale_format": "e8m0_block_k32", "scale_block_size": 16},
++            "scale_block_size=32",
++        ),
++    ],
++)
++def test_fp8_scaled_matmul_rejects_partial_or_inconsistent_e8m0_metadata(kwargs, message) -> None:
++    with pytest.raises(ValueError, match=message):
++        _normalize_block_scale_layout(None, **kwargs)
 +
 +
 +def test_e8m0_decode_semantics_document_sentinels() -> None:

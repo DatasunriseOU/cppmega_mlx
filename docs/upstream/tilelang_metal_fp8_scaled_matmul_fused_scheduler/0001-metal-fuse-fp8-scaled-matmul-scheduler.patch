@@ -23,12 +23,12 @@ Scale multiplication is deliberately fused into the load/FMA path. The emitted
 Metal must not materialize a post-loop "C *= scale" epilogue.
 
 ---
- testing/python/metal/test_fp8_scaled_matmul_fused_scheduler.py | 211 +++++++
+ testing/python/metal/test_fp8_scaled_matmul_fused_scheduler.py |  70 +++
  tilelang/tileop/gemm/__init__.py                               |   1 +
  tilelang/tileop/gemm/gemm_metal.py                             |   7 +
- tilelang/tileop/gemm/gemm_metal_fp8_scaled.py                  | 428 +++++++++++++
- tilelang/tileop/gemm/gemm_schedule.py                          |  12 +
- 5 files changed, 659 insertions(+)
+ tilelang/tileop/gemm/gemm_metal_fp8_scaled.py                  | 224 +++++++++++++
+ tilelang/tileop/gemm/gemm_schedule.py                          |  19 +
+ 5 files changed, 321 insertions(+)
  create mode 100644 testing/python/metal/test_fp8_scaled_matmul_fused_scheduler.py
  create mode 100644 tilelang/tileop/gemm/gemm_metal_fp8_scaled.py
 
@@ -75,13 +75,21 @@ diff --git a/tilelang/tileop/gemm/gemm_schedule.py b/tilelang/tileop/gemm/gemm_s
 +        schedule.scale_format = op.attrs.get("scale_format", "per_tensor_or_row")
 +        schedule.scale_block_size = int(op.attrs.get("scale_block_size", 0) or 0)
 +        schedule.transpose_B = bool(op.attrs.get("transpose_B", False))
++        schedule.attrs = dict(getattr(schedule, "attrs", {}))
++        schedule.attrs.update(
++            A_scale=schedule.A_scale,
++            B_scale=schedule.B_scale,
++            scale_format=schedule.scale_format,
++            scale_block_size=schedule.scale_block_size,
++            transpose_B=schedule.transpose_B,
++        )
 +        return schedule
 +
 diff --git a/tilelang/tileop/gemm/gemm_metal_fp8_scaled.py b/tilelang/tileop/gemm/gemm_metal_fp8_scaled.py
 new file mode 100644
 --- /dev/null
 +++ b/tilelang/tileop/gemm/gemm_metal_fp8_scaled.py
-@@ -0,0 +1,428 @@
+@@ -0,0 +1,224 @@
 +"""Metal scheduler for T.fp8_scaled_matmul.
 +
 +The scalar macro implementation is correct but too slow for Apple Silicon
@@ -93,13 +101,12 @@ new file mode 100644
 +* Four e4m3 bytes are loaded as one uint32 with
 +  reinterpret_cast<device const uint*>.
 +* __tvm_fp8_e4m3_dot4_packed / T.metal_fp8_e4m3_dot4 performs LUT-backed dot4.
-+* Scale loads are selected inside the K loop by _scale_expr_for.
++* Scale loads are selected inside the K loop by T.macro scale readers.
 +* M == 1 and transpose_B=True lowers to a simd_sum row reducer.
 +"""
 +
 +from __future__ import annotations
 +
-+from dataclasses import dataclass
 +from typing import Any
 +
 +import tilelang.language as T
@@ -115,15 +122,6 @@ new file mode 100644
 +    return scale_format == E8M0_BLOCK_K32 and int(scale_block_size or 0) == 32
 +
 +
-+@dataclass(frozen=True)
-+class ScaleSpec:
-+    operand: Any
-+    extent0: int
-+    per_row: bool
-+    scale_format: str | None = None
-+    scale_block_size: int = 0
-+
-+
 +class GemmMetalFP8ScaledScheduler:
 +    """Emit fused Metal code for T.fp8_scaled_matmul."""
 +
@@ -132,8 +130,8 @@ new file mode 100644
 +        self.A = gemm.A
 +        self.B = gemm.B
 +        self.C = gemm.C
-+        self.A_scale = gemm.attrs["A_scale"]
-+        self.B_scale = gemm.attrs["B_scale"]
++        self.A_scale = gemm.attrs.get("A_scale", getattr(gemm, "A_scale", None))
++        self.B_scale = gemm.attrs.get("B_scale", getattr(gemm, "B_scale", None))
 +        self.M = int(gemm.M)
 +        self.N = int(gemm.N)
 +        self.K = int(gemm.K)
@@ -146,8 +144,12 @@ new file mode 100644
 +        return self._emit_scaled_inner_product(scale_format=scale_format, scale_block_size=scale_block_size)
 +
 +    def _validate(self, *, scale_format: str | None, scale_block_size: int | None) -> None:
++        if self.A_scale is None or self.B_scale is None:
++            raise ValueError("T.fp8_scaled_matmul Metal scheduler requires A_scale and B_scale attrs")
 +        if not _is_fp8_dtype(self.A.dtype) or not _is_fp8_dtype(self.B.dtype):
 +            raise TypeError("T.fp8_scaled_matmul Metal scheduler requires FP8 A/B storage")
++        if not self.transpose_B:
++            raise ValueError("T.fp8_scaled_matmul Metal scheduler requires transpose_B=True packed B storage")
 +        if self.K % 4 != 0:
 +            raise ValueError("T.fp8_scaled_matmul Metal scheduler requires K divisible by 4")
 +        if _is_e8m0_block_scale(scale_format, scale_block_size) and self.K % 32 != 0:
@@ -166,6 +168,8 @@ new file mode 100644
 +    ):
 +        if _is_e8m0_block_scale(scale_format, scale_block_size):
 +            block = k // 32
++            if axis == "A" and len(scale.shape) == 2:
++                return T.e8m0_to_float(scale[row, block])
 +            if axis == "B" and len(scale.shape) == 2:
 +                return T.e8m0_to_float(scale[col, block])
 +            return T.e8m0_to_float(scale[block])
@@ -174,6 +178,21 @@ new file mode 100644
 +        if axis == "A":
 +            return T.cast(scale[row], "float32")
 +        return T.cast(scale[col], "float32")
++
++    def _make_scale_reader(self, *, axis: str, scale_format: str | None, scale_block_size: int | None):
++        @T.macro
++        def scale_at(scale, row, col, k):
++            return self._scale_expr_for(
++                scale,
++                row=row,
++                col=col,
++                k=k,
++                axis=axis,
++                scale_format=scale_format,
++                scale_block_size=scale_block_size,
++            )
++
++        return scale_at
 +
 +    def _emit_scaled_inner_product(self, *, scale_format: str | None, scale_block_size: int | None):
 +        A = self.A
@@ -184,7 +203,16 @@ new file mode 100644
 +        M = self.M
 +        N = self.N
 +        K4 = self.K // 4
-+        transpose_B = self.transpose_B
++        a_scale_at = self._make_scale_reader(
++            axis="A",
++            scale_format=scale_format,
++            scale_block_size=scale_block_size,
++        )
++        b_scale_at = self._make_scale_reader(
++            axis="B",
++            scale_format=scale_format,
++            scale_block_size=scale_block_size,
++        )
 +
 +        @T.prim_func
 +        def fp8_scaled_matmul_fused(
@@ -204,31 +232,15 @@ new file mode 100644
 +                        for kw in T.serial(K4):
 +                            k = kw * 4
 +                            a_dot_offset = row * K4 + kw
-+                            b_dot_offset = col * K4 + kw if transpose_B else kw * N + col
++                            b_dot_offset = col * K4 + kw
 +                            product = T.metal_fp8_e4m3_dot4(
 +                                T.access_ptr(A_buf[row, 0], "r", extent=K4 * 4),
-+                                T.access_ptr(B_buf[col, 0] if transpose_B else B_buf[0, col], "r", extent=K4 * 4),
++                                T.access_ptr(B_buf[col, 0], "r", extent=K4 * 4),
 +                                a_dot_offset,
 +                                b_dot_offset,
 +                            )
-+                            sa = self._scale_expr_for(
-+                                A_scale_buf,
-+                                row=row,
-+                                col=col,
-+                                k=k,
-+                                axis="A",
-+                                scale_format=scale_format,
-+                                scale_block_size=scale_block_size,
-+                            )
-+                            sb = self._scale_expr_for(
-+                                B_scale_buf,
-+                                row=row,
-+                                col=col,
-+                                k=k,
-+                                axis="B",
-+                                scale_format=scale_format,
-+                                scale_block_size=scale_block_size,
-+                            )
++                            sa = a_scale_at(A_scale_buf, row, col, k)
++                            sb = b_scale_at(B_scale_buf, row, col, k)
 +                            acc[0] += product * sa * sb
 +                        C_buf[row, col] = acc[0]
 +
@@ -242,6 +254,16 @@ new file mode 100644
 +        B_scale = self.B_scale
 +        N = self.N
 +        K4 = self.K // 4
++        a_scale_at = self._make_scale_reader(
++            axis="A",
++            scale_format=scale_format,
++            scale_block_size=scale_block_size,
++        )
++        b_scale_at = self._make_scale_reader(
++            axis="B",
++            scale_format=scale_format,
++            scale_block_size=scale_block_size,
++        )
 +
 +        @T.prim_func
 +        def fp8_scaled_vecmat_fused(
@@ -269,24 +291,8 @@ new file mode 100644
 +                                word,
 +                                word,
 +                            )
-+                            sa = self._scale_expr_for(
-+                                A_scale_buf,
-+                                row=0,
-+                                col=col,
-+                                k=k,
-+                                axis="A",
-+                                scale_format=scale_format,
-+                                scale_block_size=scale_block_size,
-+                            )
-+                            sb = self._scale_expr_for(
-+                                B_scale_buf,
-+                                row=0,
-+                                col=col,
-+                                k=k,
-+                                axis="B",
-+                                scale_format=scale_format,
-+                                scale_block_size=scale_block_size,
-+                            )
++                            sa = a_scale_at(A_scale_buf, 0, col, k)
++                            sb = b_scale_at(B_scale_buf, 0, col, k)
 +                            acc[0] += product * sa * sb
 +                with T.attr(
 +                    T.comm_reducer(lambda x, y: x + y, [T.cast(0, "float32")]),
@@ -312,7 +318,7 @@ diff --git a/testing/python/metal/test_fp8_scaled_matmul_fused_scheduler.py b/te
 new file mode 100644
 --- /dev/null
 +++ b/testing/python/metal/test_fp8_scaled_matmul_fused_scheduler.py
-@@ -0,0 +1,211 @@
+@@ -0,0 +1,70 @@
 +from __future__ import annotations
 +
 +import re
@@ -383,4 +389,3 @@ new file mode 100644
 +
 +def test_scheduler_rejects_non_k32_e8m0():
 +    assert GemmMetalFP8ScaledScheduler is not None
-*** End Patch

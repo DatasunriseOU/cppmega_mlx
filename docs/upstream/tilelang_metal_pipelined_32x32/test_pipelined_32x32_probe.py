@@ -95,6 +95,39 @@ def _assert_simdgroup_scalar_guard_text(text: str, *, require_diff_header: bool)
     assert "future patch" not in normalized.lower()
 
 
+def _write_storage_rewrite_preimage(root: Path) -> Path:
+    source_path = root / "src" / "transform" / "storage_rewrite.cc"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_text(
+        "\n".join(
+            ["// synthetic TileLang storage_rewrite.cc preimage"]
+            + ["// filler"] * 1711
+            + [
+                "    // type.",
+                "    for (const auto &pair : info_map) {",
+                "      const auto &var_info = pair.second;",
+                "      DataType preferred = var_info.get_preferred_dtype();",
+                "      if (preferred != var_info.element_dtype &&",
+                "          (rewrite_mask & var_info.declaration_location)) {",
+                "      }",
+                "    }",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return source_path
+
+
+def _git_apply(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "apply", *args, str(_PATCH_PATH)],
+        cwd=root,
+        capture_output=True,
+        text=True,
+    )
+
+
 def _find_storage_rewrite_source() -> Path | None:
     if tilelang is None:
         return None
@@ -252,6 +285,23 @@ def test_patch_is_concrete_storage_rewrite_cpp_fix():
     assert "diff --git a/src/transform/storage_rewrite.cc" in patch
     assert "+++ b/src/transform/storage_rewrite.cc" in patch
     _assert_simdgroup_scalar_guard_text(patch, require_diff_header=True)
+
+
+def test_patch_applies_to_storage_rewrite_preimage_and_inserts_guard():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        source_path = _write_storage_rewrite_preimage(root)
+
+        check = _git_apply(root, "--check")
+        assert check.returncode == 0, check.stderr
+
+        applied = _git_apply(root)
+        assert applied.returncode == 0, applied.stderr
+
+        _assert_simdgroup_scalar_guard_text(
+            source_path.read_text(encoding="utf-8"),
+            require_diff_header=False,
+        )
 
 
 def test_local_storage_rewrite_contains_simdgroup_scalar_guard_when_available():

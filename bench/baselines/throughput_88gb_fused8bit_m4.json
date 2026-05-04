@@ -1,0 +1,126 @@
+[
+  {
+    "opt": "lion8bit_fused_dyn",
+    "B": 1,
+    "T": 4096,
+    "tok_per_sec_median": 980.619611559801,
+    "tok_per_sec_p90": 996.5616727003193,
+    "median_step_s": 4.176950931549072,
+    "peak_gib_final": 39.207717817276716,
+    "loss_first": 18.09836196899414,
+    "wall_seconds": 95.76790571212769
+  },
+  {
+    "opt": "lion8bit_fused_dyn",
+    "B": 2,
+    "T": 4096,
+    "tok_per_sec_median": 418.8311626312578,
+    "tok_per_sec_p90": 498.0735506000049,
+    "median_step_s": 19.559194087982178,
+    "peak_gib_final": 72.61057051643729,
+    "loss_first": 19.623493194580078,
+    "wall_seconds": 414.41943740844727
+  },
+  {
+    "opt": "lion8bit_fused_dyn",
+    "B": 3,
+    "cap_hit_at": "step_1",
+    "peak_gib": 104.75400253385305,
+    "step_times": [
+      47.50838232040405
+    ]
+  },
+  {
+    "opt": "lion8bit_fused_sym",
+    "B": 1,
+    "T": 4096,
+    "tok_per_sec_median": 1020.637542352622,
+    "tok_per_sec_p90": 1036.879087510485,
+    "median_step_s": 4.013177871704102,
+    "peak_gib_final": 39.207701340317726,
+    "loss_first": 59.43545913696289,
+    "wall_seconds": 80.46661281585693
+  },
+  {
+    "opt": "lion8bit_fused_sym",
+    "B": 2,
+    "T": 4096,
+    "tok_per_sec_median": 452.1999004099784,
+    "tok_per_sec_p90": 583.0670600781533,
+    "median_step_s": 18.11588191986084,
+    "peak_gib_final": 72.61058577522635,
+    "loss_first": 20.481122970581055,
+    "wall_seconds": 331.3647515773773
+  },
+  {
+    "opt": "lion8bit_fused_sym",
+    "B": 3,
+    "cap_hit_at": "step_1",
+    "peak_gib": 104.75400253385305,
+    "step_times": [
+      52.66072607040405
+    ]
+  },
+  {
+    "opt": "adam8bit_fused_sym",
+    "B": 1,
+    "T": 4096,
+    "tok_per_sec_median": 997.9918707773091,
+    "tok_per_sec_p90": 1007.0577338050635,
+    "median_step_s": 4.104241847991943,
+    "peak_gib_final": 40.96190464310348,
+    "loss_first": NaN,
+    "wall_seconds": 82.51076364517212
+  },
+  {
+    "opt": "adam8bit_fused_sym",
+    "B": 2,
+    "T": 4096,
+    "tok_per_sec_median": 669.7974484343658,
+    "tok_per_sec_p90": 712.3582232141317,
+    "median_step_s": 12.230563163757324,
+    "peak_gib_final": 74.11008934490383,
+    "loss_first": NaN,
+    "wall_seconds": 246.70658588409424
+  },
+  {
+    "opt": "adam8bit_fused_sym",
+    "B": 3,
+    "cap_hit_at": "step_1",
+    "peak_gib": 106.11427024565637,
+    "step_times": [
+      29.56212830543518
+    ]
+  },
+  {
+    "opt": "muon_adamw_quantized",
+    "B": 1,
+    "T": 4096,
+    "tok_per_sec_median": 435.9776463067616,
+    "tok_per_sec_p90": 440.58189114113094,
+    "median_step_s": 9.39497709274292,
+    "peak_gib_final": 41.19491177611053,
+    "loss_first": 0.17814324796199799,
+    "wall_seconds": 188.44212794303894
+  },
+  {
+    "opt": "muon_adamw_quantized",
+    "B": 2,
+    "T": 4096,
+    "tok_per_sec_median": 561.2671242172012,
+    "tok_per_sec_p90": 565.069449109994,
+    "median_step_s": 14.595545768737793,
+    "peak_gib_final": 73.06282279081643,
+    "loss_first": 0.26168230175971985,
+    "wall_seconds": 291.478972196579
+  },
+  {
+    "opt": "muon_adamw_quantized",
+    "B": 3,
+    "cap_hit_at": "step_1",
+    "peak_gib": 105.34989325888455,
+    "step_times": [
+      33.98225498199463
+    ]
+  }
+]

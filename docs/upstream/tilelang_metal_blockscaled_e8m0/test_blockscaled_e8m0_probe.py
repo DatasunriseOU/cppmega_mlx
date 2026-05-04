@@ -32,8 +32,23 @@ def test_patch_exports_e8m0_layout_dsl_surface() -> None:
     assert "block_scale_layout=T.BlockScaledLayout.e8m0_k32()" in normalized
     assert "scale_format=\"e8m0_block_k32\"" in normalized
     assert "scale_block_size=32" in normalized
+    assert "scale_format != E8M0_BLOCK_K32" in normalized
+    assert "scale_block_size is None" in normalized
+    assert "int(scale_block_size) != E8M0_BLOCK_SIZE" in normalized
     assert "scale_axis=\"contracted_k\"" in normalized
     assert "logical_unswizzled_k_axis_blocks" in normalized
+
+
+def test_patch_rejects_partial_or_inconsistent_e8m0_metadata() -> None:
+    normalized = _without_diff_markers(_read(PATCH_PATH))
+
+    assert "if scale_format is None and scale_block_size is None:" in normalized
+    assert "scale_format='e8m0_block_k32'" in normalized
+    assert "scale_block_size=32" in normalized
+    assert (
+        "scale_format == E8M0_BLOCK_K32 or int(scale_block_size or 0) == E8M0_BLOCK_SIZE"
+        not in normalized
+    )
 
 
 def test_patch_locks_concrete_e8m0_decode_semantics() -> None:
@@ -68,6 +83,8 @@ def test_readme_matches_artifact_and_local_verification_contract() -> None:
     assert "T.e8m0_to_float" in readme
     assert "scale_format = \"e8m0_block_k32\"" in readme
     assert "scale_block_size = 32" in readme
+    assert "both fields required" in readme
+    assert "A bare `block_size=32` is not enough" in readme
     assert "test_blockscaled_e8m0_probe.py" in readme
     assert "Mac M4 Max" in readme
     assert "MLX/Metal" in readme

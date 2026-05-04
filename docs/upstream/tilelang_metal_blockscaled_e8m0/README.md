@@ -38,12 +38,17 @@ T.fp8_scaled_matmul(
 )
 ```
 
-Equivalent metadata:
+Equivalent metadata, with both fields required:
 
 ```python
 scale_format = "e8m0_block_k32"
 scale_block_size = 32
 ```
+
+A bare `block_size=32` is not enough to select this primitive. The metadata
+spelling must carry `scale_format = "e8m0_block_k32"` and
+`scale_block_size = 32` together so other future K/32 scale formats cannot be
+silently lowered through the E8M0 path.
 
 ## Patch
 
