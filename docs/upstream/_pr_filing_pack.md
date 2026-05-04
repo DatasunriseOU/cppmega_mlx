@@ -1,5 +1,43 @@
 # PR Filing Pack - Four Ready Upstream Artifacts
 
+> **2026-05-04 reality check** (added after fresh-clone verification against
+> actual upstream HEADs):
+>
+> - **PR #1 (`mlx_from_dlpack` → `ml-explore/mlx@e8ebdeb`)**: applies cleanly
+>   on fresh main. **READY TO FILE.**
+> - **PR #2 (`tvm_shared_storage` → `apache/tvm@8873a4c`)**: applies cleanly
+>   on fresh main. **READY TO FILE.**
+> - **PR #3 (`tilelang_gemm_mixed_dtype` → tile-ai/tilelang)**: does **NOT**
+>   apply on `tile-ai/tilelang@d135bd1` main directly. Apple Metal landing
+>   for tilelang is currently in 4 OPEN upstream PRs (none merged):
+>   - PR #1869 (oraluben metal-gemm)
+>   - PR #2118 (cklxx metal-gemm-scalar-fallback)
+>   - PR #2121 (SiriusNEO multi-backend codegen refactor)
+>   - PR #2130 (jorgecurious metal-gemm-upstream-rebase)
+>
+>   Our patch must be filed as a **stacked PR on top of #2130**, OR we wait
+>   for upstream to merge #1869+#2118+#2121+#2130 first. Patch was rebased
+>   2026-05-04 to apply cleanly on `jorgecurious/tilelang:metal-gemm-upstream-rebase` (HEAD `971c17b`).
+> - **PR #4 (`tilelang_metal_pipelined`)**: same situation as PR #3 — applies
+>   cleanly on `jorgecurious/tilelang:metal-gemm-upstream-rebase` but not on
+>   tile-ai/tilelang main. Stack on #2130.
+>
+> 4 additional tilelang patches (`tilelang_metal_fp8`, `tilelang_metal_fp8_gemm`,
+> `tilelang_metal_fp8_vector`, `tilelang_metal_fp8_scaled_matmul`) all also
+> apply cleanly on jorgecurious's branch and stack on PR #2130.
+>
+> **Working stack apply order** on `jorgecurious/tilelang:metal-gemm-upstream-rebase`:
+> 1. `tilelang_metal_fp8_gemm`
+> 2. `tilelang_gemm_mixed_dtype`
+> 3. `tilelang_metal_fp8`
+> 4. `tilelang_metal_fp8_vector`
+> 5. `tilelang_metal_pipelined`
+> 6. `tilelang_metal_fp8_scaled_matmul`
+>
+> See `docs/upstream/_path_c_blockers_tracker.md` for what additional patches
+> the Path C TileLang DSL ports will surface as we extend coverage beyond
+> Mamba3.
+
 This pack contains everything needed to file the four PR-ready upstream
 artifacts listed below manually with `gh pr create`. **Nothing here pushes or
 opens PRs**; it only consolidates the materials so the user can paste them into
