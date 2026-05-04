@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import math
 import sys
+
+import pytest
 from importlib import import_module
 from importlib import metadata as importlib_metadata
 from pathlib import Path
@@ -49,13 +51,18 @@ class _FakeMxArray:
 
 
 def test_tilelang_imports_resolve_to_local_tree_and_pinned_ffi() -> None:
+    tilelang_root = fp8_bench.TILELANG_ROOT.resolve()
+    local_tilelang_init = tilelang_root / "tilelang" / "__init__.py"
+    local_tvm_init = tilelang_root / "3rdparty" / "tvm" / "python" / "tvm" / "__init__.py"
+    if not local_tilelang_init.is_file() or not local_tvm_init.is_file():
+        pytest.skip(f"local apple-head TileLang checkout is not available at {tilelang_root}")
+
     tilelang = import_module("tilelang")
     tvm = import_module("tvm")
     tvm_ffi = import_module("tvm_ffi")
     assert isinstance(tilelang.__file__, str)
     assert isinstance(tvm.__file__, str)
 
-    tilelang_root = fp8_bench.TILELANG_ROOT.resolve()
     tilelang_path = Path(tilelang.__file__).resolve()
     tvm_path = Path(tvm.__file__).resolve()
 
@@ -933,3 +940,123 @@ def test_fp8_main_strict_exit_2_does_not_write_receipt(monkeypatch, tmp_path) ->
 
     assert rc == 2
     assert not out.exists()
+
+
+def test_fp8_path_c_bench_sparse_status_uses_checked_in_reducers() -> None:
+    source = (REPO_ROOT / "scripts" / "bench_tilelang_fp8_path_c.py").read_text()
+
+    assert "No checked-in TileLang DSL Sparse-MLA Path C reference found in this lane." not in source
+    assert "path_c_tilelang_qk_reduce_status" in source
+    assert "path_c_tilelang_indexed_qk_reduce_status" in source
+    assert "path_c_tilelang_e8m0_qk_reduce_status" in source
+
+
+def test_fp8_sparse_full_dispatch_gate_rejects_reducer_only_status() -> None:
+    payload = {
+        "path_c_tilelang_qk_status": {
+            "available": True,
+            "reason": "TileLang Path C FP8 Sparse-MLA QK reducer is runnable",
+            "features": {
+                "dispatch_surface": "qk_reduce",
+                "runnable_qk_reduce_available": True,
+            },
+        }
+    }
+
+    failures = fp8_bench._full_dispatch_strict_failures(
+        payload,
+        status_key="path_c_tilelang_qk_status",
+        label="FP8",
+    )
+
+    assert any("dispatch_surface" in item and "full_fwd_bwd" in item for item in failures)
+    assert any("full_fwd_bwd_available is not true" in item for item in failures)
+
+
+def test_fp8_sparse_status_payload_records_reducers_but_keeps_full_gate_closed() -> None:
+    reducer_status = SimpleNamespace(
+        available=True,
+        reason="TileLang Path C reducer runnable",
+        target="metal",
+        n=16,
+        k=64,
+        outputs_per_block=16,
+        reduce_threads=32,
+        vec=4,
+        features={"dispatch_surface": "qk_reduce"},
+    )
+    indexed_status = SimpleNamespace(
+        available=True,
+        reason="TileLang Path C indexed reducer runnable",
+        target="metal",
+        batch=1,
+        seq_len=1,
+        heads=1,
+        seq_len_kv=16,
+        kv_group=1,
+        head_kv=1,
+        topk=16,
+        k=64,
+        outputs_per_block=16,
+        reduce_threads=32,
+        vec=4,
+        features={"dispatch_surface": "indexed_qk_reduce"},
+    )
+    full_status = SimpleNamespace(
+        available=True,
+        reason="QK reducer available, not full Sparse-MLA fwd/bwd",
+        target="metal",
+        m=1,
+        n=16,
+        k=64,
+        transpose_B=True,
+        features={
+            "dispatch_surface": "qk_reduce",
+            "runnable_qk_reduce_available": True,
+        },
+    )
+    e8m0_full_status = SimpleNamespace(
+        available=True,
+        reason="E8M0 reducer available, not full Sparse-MLA fwd/bwd",
+        target="metal",
+        m=1,
+        n=16,
+        k=64,
+        transpose_B=True,
+        scale_block_size=32,
+        scale_layout="logical_unswizzled_k_axis_blocks",
+        features={
+            "dispatch_surface": "qk_reduce",
+            "runnable_qk_reduce_available": True,
+        },
+    )
+    e8m0_reducer_status = SimpleNamespace(
+        available=True,
+        reason="TileLang Path C E8M0 Sparse-MLA real QK reducer runnable",
+        target="metal",
+        n=16,
+        k=64,
+        outputs_per_block=4,
+        reduce_threads=32,
+        vec=4,
+        scale_block_size=32,
+        scale_layout="logical_unswizzled_k_axis_blocks",
+        features={"dispatch_surface": "qk_reduce"},
+    )
+
+    payload = fp8_bench._sparse_path_c_status_payload(
+        fp8_qk_status=full_status,
+        fp8_qk_reduce_status=reducer_status,
+        fp8_indexed_qk_reduce_status=indexed_status,
+        e8m0_qk_status=e8m0_full_status,
+        e8m0_qk_reduce_status=e8m0_reducer_status,
+    )
+
+    assert payload["path_c_tilelang_qk_reduce_status"]["available"] is True
+    assert payload["path_c_tilelang_indexed_qk_reduce_status"]["available"] is True
+    assert payload["path_c_tilelang_e8m0_qk_reduce_status"]["available"] is True
+    assert payload["path_c_tilelang_e8m0_qk_reduce_status"]["scale_block_size"] == 32
+    assert payload["path_c_status"] == payload["path_c_tilelang_qk_status"]
+    assert payload["strict"]["scope"] == "full_path_c_dispatch"
+    assert payload["strict"]["passed"] is False
+    assert any("full_fwd_bwd" in item for item in payload["strict"]["failures"])

@@ -112,9 +112,9 @@ B4_S1024_H8_D64; unreceipted shapes stay on Path B.
       0.4364), but it is not the strict full-dispatch gate. Full<br>
       Path C QK remains unavailable, so<br>
       sparse_mla_blockscaled.json keeps the full Path C gate red.</td>
-      <td>Introduce T.BlockScaledLayout(scale_dtype="e8m0",<br>
-      block_size=16) API and lower it through the Metal scalar<br>
-      path with matching scale-tile bookkeeping; then mirror the<br>
+      <td>Introduce T.BlockScaledLayout.e8m0_k32() /<br>
+      scale_format="e8m0_block_k32" API and lower block_size=32<br>
+      through the Metal scalar path with matching scale-tile bookkeeping; then mirror the<br>
       BF16 partial-backward contract. Larger work — likely 200-400<br>
       LOC.</td>
     </tr>
@@ -164,12 +164,14 @@ audiohacking-style hand-written MSL. The win path is **fused scheduler**.
 
 ---
 
-## Suggested upstream patch roadmap (ordered by ROI)
+## Suggested upstream patch roadmap (artifact order)
 
-When we file these as new docs/upstream/ artifacts, all stack on top of
+The local docs/upstream/ artifact and probe directories already exist for the
+three Path C follow-ups below. They still need apply-to-apple-head verification
+and upstream filing. All stack on top of
 jorgecurious/tilelang:metal-gemm-upstream-rebase (PR #2130) plus our existing
 tilelang_metal_pipelined, tilelang_metal_fp8, tilelang_metal_fp8_scaled_matmul
-patches. Each new patch adds another link in the dependency chain.
+patches. Each patch adds another link in the dependency chain.
 
 <table>
   <thead>
@@ -184,6 +186,15 @@ patches. Each new patch adds another link in the dependency chain.
   <tbody>
     <tr>
       <td>**A**</td>
+      <td>tilelang_metal_pipelined_32x32 (keep simdgroup storage<br>
+      scalar for 32x32 pipelined Metal kernels)</td>
+      <td>32x32 pipelined TileLang Metal lowering for Path C follow-<br>
+      up probes</td>
+      <td>medium (~100 LOC, storage rewrite)</td>
+      <td>**HIGH** — first artifact/probe in the Path C follow-up chain</td>
+    </tr>
+    <tr>
+      <td>**B**</td>
       <td>tilelang_metal_fp8_scaled_matmul_fused_scheduler (fuse per-<br>
       load scale into GemmMetalScalar K-loop)</td>
       <td>FP8 matmul/vecmat speed parity and Sparse-MLA FP8 Path C<br>
@@ -192,20 +203,12 @@ patches. Each new patch adds another link in the dependency chain.
       <td>**HIGH** — remaining Sparse-MLA FP8 blocker</td>
     </tr>
     <tr>
-      <td>**B**</td>
-      <td>tilelang_metal_blockscaled_e8m0 (DSL primitive for e8m0<br>
-      block-scale layout)</td>
+      <td>**C**</td>
+      <td>tilelang_metal_blockscaled_e8m0 (DSL primitive for<br>
+      e8m0_block_k32 block-scale layout)</td>
       <td>Sparse-MLA blockscaled fwd/bwd via Path C</td>
       <td>high (~350 LOC, language + lowering)</td>
       <td>**MEDIUM** — needed for blockscaled Path C</td>
-    </tr>
-    <tr>
-      <td>**C**</td>
-      <td>tilelang_metal_simdgroup_reduce (T.simdgroup_reduce_sum<br>
-      primitive)</td>
-      <td>FP8 vecmat M=1 specialization and future selector ergonomics</td>
-      <td>medium (~200 LOC)</td>
-      <td>**LOW** — Path B/topk dispatch is already covered</td>
     </tr>
   </tbody>
 </table>
@@ -222,13 +225,13 @@ coverage plus optional reduction ergonomics.
 
 The 3 rebase agents (mixed_dtype, fp8_gemm, fp8_vector) are putting our
 existing patches on top of jorgecurious/tilelang:metal-gemm-upstream-rebase.
-**These are not the end of the story** — patches A through C above are
-expected follow-ups when we extend Path C beyond topk AUTO, Mamba3 proof runs,
-and BF16 Sparse-MLA's current per-shape AUTO coverage.
+**These are not the end of the story** — local artifact/probe directories for
+patches A through C above already exist, but they still need apply-to-apple-head
+verification and upstream filing before they become upstreamed Path C coverage.
 
 The filing pack should explicitly say:
-- "Current 8 patches are the foundation; future Path C ports surface new gaps"
-- "Each follow-up will be a fresh docs/upstream/<name>/ directory with its own README + patch file"
+- "Current 8 patches are the foundation; Path C ports surfaced A/B/C follow-up gaps"
+- "Each A/B/C follow-up has a local docs/upstream/<name>/ artifact/probe directory, but still needs apply-to-apple-head verification and upstream filing"
 - "All of them stack on PR #2130 (or whatever upstream Apple Metal PR series eventually merges)"
 
 ---
@@ -271,8 +274,7 @@ upstream tile-ai/tilelang main
   Our: tilelang_metal_fp8_vector       (rebased 2026-05-04, depends on tilelang_metal_fp8)
   Our: tilelang_metal_fp8_scaled_matmul (clean apply on PR #2130, frontend macro)
   Our: tilelang_metal_shared_dyn       (no-op investigation artifact, not a code PR)
-  ↑ FUTURE
-  Patch A: tilelang_metal_fp8_scaled_matmul_fused_scheduler  (when FP8 sparse-MLA Path C lands)
-  Patch B: tilelang_metal_blockscaled_e8m0          (when blockscaled Path C lands)
-  Patch C: tilelang_metal_simdgroup_reduce          (for FP8 vecmat/future selector ergonomics)
-
+  ↑ LOCAL ARTIFACTS / PROBES EXIST; NEED APPLY-TO-APPLE-HEAD + UPSTREAM FILING
+  Patch A: tilelang_metal_pipelined_32x32
+  Patch B: tilelang_metal_fp8_scaled_matmul_fused_scheduler  (when FP8 sparse-MLA Path C lands)
+  Patch C: tilelang_metal_blockscaled_e8m0          (when blockscaled Path C lands)

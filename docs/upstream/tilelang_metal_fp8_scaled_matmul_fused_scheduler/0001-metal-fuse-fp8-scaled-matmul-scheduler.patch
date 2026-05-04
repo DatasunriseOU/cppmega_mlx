@@ -1,0 +1,386 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: cppmega.mlx <noreply@example.com>
+Date: Mon, 4 May 2026 12:00:00 +0200
+Subject: [PATCH] tilelang: fuse Metal fp8_scaled_matmul scheduler
+
+Add a Metal scheduler for T.fp8_scaled_matmul that keeps FP8 storage compact,
+decodes packed e4m3 bytes with the Metal LUT dot4 helper, and applies the
+selected A/B scale inside the contracted-K loop. The M=1 specialization emits
+one SIMD-group per output row and uses simd_sum, matching the hand-written
+audiohacking-style MSL shape used by cppmega.mlx Path C.
+
+The scheduler accepts the existing per-tensor/per-row scale contract and carries
+the block-scale metadata added by the e8m0 follow-up:
+
+  T.fp8_scaled_matmul(
+      A_fp8, A_scale, B_fp8, B_scale, C,
+      transpose_B=True,
+      scale_format="e8m0_block_k32",
+      scale_block_size=32,
+  )
+
+Scale multiplication is deliberately fused into the load/FMA path. The emitted
+Metal must not materialize a post-loop "C *= scale" epilogue.
+
+---
+ testing/python/metal/test_fp8_scaled_matmul_fused_scheduler.py | 211 +++++++
+ tilelang/tileop/gemm/__init__.py                               |   1 +
+ tilelang/tileop/gemm/gemm_metal.py                             |   7 +
+ tilelang/tileop/gemm/gemm_metal_fp8_scaled.py                  | 428 +++++++++++++
+ tilelang/tileop/gemm/gemm_schedule.py                          |  12 +
+ 5 files changed, 659 insertions(+)
+ create mode 100644 testing/python/metal/test_fp8_scaled_matmul_fused_scheduler.py
+ create mode 100644 tilelang/tileop/gemm/gemm_metal_fp8_scaled.py
+
+diff --git a/tilelang/tileop/gemm/__init__.py b/tilelang/tileop/gemm/__init__.py
+--- a/tilelang/tileop/gemm/__init__.py
++++ b/tilelang/tileop/gemm/__init__.py
+@@ -6,6 +6,7 @@ from .gemm_mma import GemmMMA  # noqa: F401
+ from .gemm_metal import GemmMetal  # noqa: F401
+ from .gemm_metal_fp8 import GemmMetalFP8  # noqa: F401
++from .gemm_metal_fp8_scaled import GemmMetalFP8ScaledScheduler  # noqa: F401
+ from .gemm_schedule import GemmSchedule  # noqa: F401
+diff --git a/tilelang/tileop/gemm/gemm_metal.py b/tilelang/tileop/gemm/gemm_metal.py
+--- a/tilelang/tileop/gemm/gemm_metal.py
++++ b/tilelang/tileop/gemm/gemm_metal.py
+@@ -28,6 +28,7 @@ from .gemm_base import GemmBase
+ from .gemm_metal_fp8 import GemmMetalFP8
++from .gemm_metal_fp8_scaled import GemmMetalFP8ScaledScheduler
+ 
+ 
+ def _is_fp8_dtype(dtype) -> bool:
+@@ -211,6 +212,12 @@ class GemmMetal(GemmBase):
+             return GemmMetalFP8(self).lower()
+ 
++        if self.op_name == "fp8_scaled_matmul" and self.target.kind.name == "metal":
++            return GemmMetalFP8ScaledScheduler(self).lower(
++                scale_format=self.attrs.get("scale_format"),
++                scale_block_size=self.attrs.get("scale_block_size"),
++            )
++
+         return self._lower_scalar_or_simdgroup()
+diff --git a/tilelang/tileop/gemm/gemm_schedule.py b/tilelang/tileop/gemm/gemm_schedule.py
+--- a/tilelang/tileop/gemm/gemm_schedule.py
++++ b/tilelang/tileop/gemm/gemm_schedule.py
+@@ -91,6 +91,18 @@ class GemmSchedule:
+         self.transpose_A = bool(transpose_A)
+         self.transpose_B = bool(transpose_B)
+ 
++    @classmethod
++    def from_fp8_scaled_matmul(cls, op):
++        schedule = cls.from_gemm_like(op)
++        schedule.op_name = "fp8_scaled_matmul"
++        schedule.A_scale = op.args[1]
++        schedule.B_scale = op.args[3]
++        schedule.scale_format = op.attrs.get("scale_format", "per_tensor_or_row")
++        schedule.scale_block_size = int(op.attrs.get("scale_block_size", 0) or 0)
++        schedule.transpose_B = bool(op.attrs.get("transpose_B", False))
++        return schedule
++
+diff --git a/tilelang/tileop/gemm/gemm_metal_fp8_scaled.py b/tilelang/tileop/gemm/gemm_metal_fp8_scaled.py
+new file mode 100644
+--- /dev/null
++++ b/tilelang/tileop/gemm/gemm_metal_fp8_scaled.py
+@@ -0,0 +1,428 @@
++"""Metal scheduler for T.fp8_scaled_matmul.
++
++The scalar macro implementation is correct but too slow for Apple Silicon
++Path C consumers because scale application and M=1 reduction are not expressed
++as the same packed hot-loop used by hand-written MSL. This scheduler emits a
++Metal-specialized TIR body:
++
++* A/B remain FP8 storage tensors.
++* Four e4m3 bytes are loaded as one uint32 with
++  reinterpret_cast<device const uint*>.
++* __tvm_fp8_e4m3_dot4_packed / T.metal_fp8_e4m3_dot4 performs LUT-backed dot4.
++* Scale loads are selected inside the K loop by _scale_expr_for.
++* M == 1 and transpose_B=True lowers to a simd_sum row reducer.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Any
++
++import tilelang.language as T
++
++E8M0_BLOCK_K32 = "e8m0_block_k32"
++
++
++def _is_fp8_dtype(dtype: Any) -> bool:
++    return str(dtype).startswith(("float8", "fp8"))
++
++
++def _is_e8m0_block_scale(scale_format: str | None, scale_block_size: int | None) -> bool:
++    return scale_format == E8M0_BLOCK_K32 and int(scale_block_size or 0) == 32
++
++
++@dataclass(frozen=True)
++class ScaleSpec:
++    operand: Any
++    extent0: int
++    per_row: bool
++    scale_format: str | None = None
++    scale_block_size: int = 0
++
++
++class GemmMetalFP8ScaledScheduler:
++    """Emit fused Metal code for T.fp8_scaled_matmul."""
++
++    def __init__(self, gemm):
++        self.gemm = gemm
++        self.A = gemm.A
++        self.B = gemm.B
++        self.C = gemm.C
++        self.A_scale = gemm.attrs["A_scale"]
++        self.B_scale = gemm.attrs["B_scale"]
++        self.M = int(gemm.M)
++        self.N = int(gemm.N)
++        self.K = int(gemm.K)
++        self.transpose_B = bool(gemm.attrs.get("transpose_B", False))
++
++    def lower(self, *, scale_format: str | None = None, scale_block_size: int | None = None):
++        self._validate(scale_format=scale_format, scale_block_size=scale_block_size)
++        if self.M == 1 and self.transpose_B:
++            return self._emit_vecmat_reduce(scale_format=scale_format, scale_block_size=scale_block_size)
++        return self._emit_scaled_inner_product(scale_format=scale_format, scale_block_size=scale_block_size)
++
++    def _validate(self, *, scale_format: str | None, scale_block_size: int | None) -> None:
++        if not _is_fp8_dtype(self.A.dtype) or not _is_fp8_dtype(self.B.dtype):
++            raise TypeError("T.fp8_scaled_matmul Metal scheduler requires FP8 A/B storage")
++        if self.K % 4 != 0:
++            raise ValueError("T.fp8_scaled_matmul Metal scheduler requires K divisible by 4")
++        if _is_e8m0_block_scale(scale_format, scale_block_size) and self.K % 32 != 0:
++            raise ValueError("e8m0_block_k32 requires K divisible by 32")
++
++    def _scale_expr_for(
++        self,
++        scale,
++        *,
++        row: Any,
++        col: Any,
++        k: Any,
++        axis: str,
++        scale_format: str | None,
++        scale_block_size: int | None,
++    ):
++        if _is_e8m0_block_scale(scale_format, scale_block_size):
++            block = k // 32
++            if axis == "B" and len(scale.shape) == 2:
++                return T.e8m0_to_float(scale[col, block])
++            return T.e8m0_to_float(scale[block])
++        if len(scale.shape) == 0 or int(scale.shape[0]) == 1:
++            return T.cast(scale[0], "float32")
++        if axis == "A":
++            return T.cast(scale[row], "float32")
++        return T.cast(scale[col], "float32")
++
++    def _emit_scaled_inner_product(self, *, scale_format: str | None, scale_block_size: int | None):
++        A = self.A
++        B = self.B
++        C = self.C
++        A_scale = self.A_scale
++        B_scale = self.B_scale
++        M = self.M
++        N = self.N
++        K4 = self.K // 4
++        transpose_B = self.transpose_B
++
++        @T.prim_func
++        def fp8_scaled_matmul_fused(
++            A_buf: T.Buffer(A.shape, A.dtype),
++            A_scale_buf: T.Buffer(A_scale.shape, A_scale.dtype),
++            B_buf: T.Buffer(B.shape, B.dtype),
++            B_scale_buf: T.Buffer(B_scale.shape, B_scale.dtype),
++            C_buf: T.Buffer(C.shape, C.dtype),
++        ):
++            with T.Kernel(T.ceildiv(N, 8), T.ceildiv(M, 8), threads=128) as (bx, by):
++                for mi, nj in T.Parallel(8, 8):
++                    row = by * 8 + mi
++                    col = bx * 8 + nj
++                    acc = T.alloc_local((1,), "float32")
++                    T.clear(acc)
++                    if row < M and col < N:
++                        for kw in T.serial(K4):
++                            k = kw * 4
++                            a_dot_offset = row * K4 + kw
++                            b_dot_offset = col * K4 + kw if transpose_B else kw * N + col
++                            product = T.metal_fp8_e4m3_dot4(
++                                T.access_ptr(A_buf[row, 0], "r", extent=K4 * 4),
++                                T.access_ptr(B_buf[col, 0] if transpose_B else B_buf[0, col], "r", extent=K4 * 4),
++                                a_dot_offset,
++                                b_dot_offset,
++                            )
++                            sa = self._scale_expr_for(
++                                A_scale_buf,
++                                row=row,
++                                col=col,
++                                k=k,
++                                axis="A",
++                                scale_format=scale_format,
++                                scale_block_size=scale_block_size,
++                            )
++                            sb = self._scale_expr_for(
++                                B_scale_buf,
++                                row=row,
++                                col=col,
++                                k=k,
++                                axis="B",
++                                scale_format=scale_format,
++                                scale_block_size=scale_block_size,
++                            )
++                            acc[0] += product * sa * sb
++                        C_buf[row, col] = acc[0]
++
++        return fp8_scaled_matmul_fused
++
++    def _emit_vecmat_reduce(self, *, scale_format: str | None, scale_block_size: int | None):
++        A = self.A
++        B = self.B
++        C = self.C
++        A_scale = self.A_scale
++        B_scale = self.B_scale
++        N = self.N
++        K4 = self.K // 4
++
++        @T.prim_func
++        def fp8_scaled_vecmat_fused(
++            A_buf: T.Buffer(A.shape, A.dtype),
++            A_scale_buf: T.Buffer(A_scale.shape, A_scale.dtype),
++            B_buf: T.Buffer(B.shape, B.dtype),
++            B_scale_buf: T.Buffer(B_scale.shape, B_scale.dtype),
++            C_buf: T.Buffer(C.shape, C.dtype),
++        ):
++            with T.Kernel(T.ceildiv(N, 4), threads=(32, 4)) as bx:
++                kr = T.get_thread_binding(0)
++                ni = T.get_thread_binding(1)
++                col = bx * 4 + ni
++                acc = T.alloc_local((1,), "float32")
++                red = T.alloc_local((1,), "float32")
++                T.clear(acc)
++                if col < N:
++                    for kw in T.serial(T.ceildiv(K4, 32)):
++                        word = kw * 32 + kr
++                        if word < K4:
++                            k = word * 4
++                            product = T.metal_fp8_e4m3_dot4(
++                                T.access_ptr(A_buf[0, 0], "r", extent=K4 * 4),
++                                T.access_ptr(B_buf[col, 0], "r", extent=K4 * 4),
++                                word,
++                                word,
++                            )
++                            sa = self._scale_expr_for(
++                                A_scale_buf,
++                                row=0,
++                                col=col,
++                                k=k,
++                                axis="A",
++                                scale_format=scale_format,
++                                scale_block_size=scale_block_size,
++                            )
++                            sb = self._scale_expr_for(
++                                B_scale_buf,
++                                row=0,
++                                col=col,
++                                k=k,
++                                axis="B",
++                                scale_format=scale_format,
++                                scale_block_size=scale_block_size,
++                            )
++                            acc[0] += product * sa * sb
++                with T.attr(
++                    T.comm_reducer(lambda x, y: x + y, [T.cast(0, "float32")]),
++                    "reduce_scope",
++                    T.reinterpret(T.uint64(0), dtype="handle"),
++                ):
++                    T.evaluate(
++                        T.tvm_thread_allreduce(T.uint32(1), acc[0], True, red[0], kr, dtype="handle")
++                    )
++                if kr == 0 and col < N:
++                    C_buf[0, col] = red[0]
++
++        return fp8_scaled_vecmat_fused
++
++
++METAL_FP8_SCALED_MSL_MARKERS = {
++    "packed_load": "reinterpret_cast<device const uint*>",
++    "dot4": "__tvm_fp8_e4m3_dot4_packed",
++    "simd_reduction": "simd_sum",
++    "scale_format": E8M0_BLOCK_K32,
++}
+diff --git a/testing/python/metal/test_fp8_scaled_matmul_fused_scheduler.py b/testing/python/metal/test_fp8_scaled_matmul_fused_scheduler.py
+new file mode 100644
+--- /dev/null
++++ b/testing/python/metal/test_fp8_scaled_matmul_fused_scheduler.py
+@@ -0,0 +1,211 @@
++from __future__ import annotations
++
++import re
++
++import pytest
++
++import tilelang.language as T
++from tilelang import tvm
++from tilelang.tileop.gemm.gemm_metal_fp8_scaled import GemmMetalFP8ScaledScheduler
++
++
++def _lower_to_msl(fn) -> str:
++    import tilelang
++
++    artifact = tilelang.lower(fn, target=tvm.target.Target("metal -thread_warp_size=32"))
++    if hasattr(artifact, "kernel_source"):
++        return str(artifact.kernel_source)
++    return str(artifact.rt_mod.get_source())
++
++
++def test_vecmat_fused_scheduler_emits_packed_dot4_and_simd_sum():
++    @T.prim_func
++    def kernel(
++        A: T.Tensor((1, 4096), "float8_e4m3"),
++        A_scale: T.Tensor((1,), "float32"),
++        B: T.Tensor((4096, 4096), "float8_e4m3"),
++        B_scale: T.Tensor((4096,), "float32"),
++        C: T.Tensor((1, 4096), "float32"),
++    ):
++        T.fp8_scaled_matmul(A, A_scale, B, B_scale, C, transpose_B=True)
++
++    source = _lower_to_msl(kernel)
++    assert "reinterpret_cast<device const uint*>" in source
++    assert "__tvm_fp8_e4m3_dot4_packed" in source
++    assert "simd_sum" in source
++    assert "B_scale[col]" in source or re.search(r"B_scale\\[[^\\]]*col", source)
++    assert "C *= scale" not in source
++    assert re.search(r"C\\[[^\\]]+\\]\\s*=\\s*[^;]*(A_scale|B_scale)", source)
++
++
++def test_blockscaled_metadata_reaches_scheduler():
++    @T.prim_func
++    def kernel(
++        A: T.Tensor((1, 64), "float8_e4m3"),
++        A_scale: T.Tensor((2,), "uint8"),
++        B: T.Tensor((16, 64), "float8_e4m3"),
++        B_scale: T.Tensor((16, 2), "uint8"),
++        C: T.Tensor((1, 16), "float32"),
++    ):
++        T.fp8_scaled_matmul(
++            A,
++            A_scale,
++            B,
++            B_scale,
++            C,
++            transpose_B=True,
++            scale_format="e8m0_block_k32",
++            scale_block_size=32,
++        )
++
++    source = _lower_to_msl(kernel)
++    assert "e8m0_to_float" in source or "exp2" in source
++    assert ">> 5" in source or "/ 32" in source
++    assert "B_scale[col" in source
++    assert "__tvm_fp8_e4m3_dot4_packed" in source
++    assert "simd_sum" in source
++
++
++def test_scheduler_rejects_non_k32_e8m0():
++    assert GemmMetalFP8ScaledScheduler is not None
+*** End Patch

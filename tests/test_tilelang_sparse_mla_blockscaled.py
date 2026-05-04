@@ -92,6 +92,20 @@ def _make_inputs(
     return q, kv, indices, d_v
 
 
+def _skip_if_tilelang_checkout_unavailable(reason: str) -> None:
+    if "tilelang import failed" in reason:
+        pytest.skip(reason)
+
+
+def _require_path_c_available(
+    status: SparseMLABlockScaledPathCStatus | SparseMLABlockScaledQKReducePathCStatus,
+) -> None:
+    if status.available:
+        return
+    _skip_if_tilelang_checkout_unavailable(status.reason)
+    pytest.fail(status.reason)
+
+
 def test_blockscaled_bench_strict_exit_includes_full_dispatch_scope() -> None:
     failures = _strict_exit_failures(
         fp8_reducer_failures=[],
@@ -142,7 +156,7 @@ def test_blockscaled_path_c_status_reports_e8m0_qk_reduce_dispatch_surface() -> 
     assert status.scale_layout == E8M0_LAYOUT
     assert status.reason
     if mx.metal.is_available():
-        assert status.available is True, status.reason
+        _require_path_c_available(status)
         assert status.features["dispatch_surface"] == "qk_reduce"
         assert status.features["runnable_qk_reduce_available"] is True
         assert status.features["scale_format"] == E8M0_SCALE_FORMAT
@@ -164,7 +178,7 @@ def test_blockscaled_path_c_square_control_lowers_to_e8m0_scale_aware_fast_path(
         a_scale_size=2,
         b_scale_size=2,
     )
-    assert status.available is True, status.reason
+    _require_path_c_available(status)
     assert status.features["simdgroup_multiply_accumulate"] >= 1
     assert status.features["A_scale_refs"] >= 1
     assert status.features["B_scale_refs"] >= 1
@@ -180,6 +194,17 @@ def test_blockscaled_path_c_square_control_lowers_to_e8m0_scale_aware_fast_path(
 
 
 def test_blockscaled_path_c_lowered_features_document_e8m0_layout() -> None:
+    status = blockscaled_sparse_mla_qk_path_c_status(
+        M=32,
+        N=32,
+        K=64,
+        BM=32,
+        BN=32,
+        BK=64,
+        a_scale_size=2,
+        b_scale_size=2,
+    )
+    _require_path_c_available(status)
     msl = lower_blockscaled_sparse_mla_qk_msl(
         M=32,
         N=32,
@@ -212,6 +237,7 @@ def test_blockscaled_path_c_rejects_non_k32_scale_layout() -> None:
         a_scale_size=2,
         b_scale_size=2,
     )
+    _skip_if_tilelang_checkout_unavailable(status.reason)
     assert status.available is False
     assert "K divisible by 32" in status.reason
 
@@ -228,7 +254,7 @@ def test_blockscaled_path_c_chunked_bk_uses_scale_subregion_offsets() -> None:
         b_scale_size=2,
         num_stages=2,
     )
-    assert status.available is True, status.reason
+    _require_path_c_available(status)
     assert status.features["simdgroup_multiply_accumulate"] >= 1
     assert status.features["A_scale_refs"] >= 1
     assert status.features["B_scale_refs"] >= 1
@@ -245,7 +271,7 @@ def test_blockscaled_path_c_e8m0_qk_reduce_status_reports_available() -> None:
     assert status.scale_block_size == E8M0_BLOCK_SIZE
     assert status.scale_layout == E8M0_LAYOUT
     if mx.metal.is_available():
-        assert status.available is True, status.reason
+        _require_path_c_available(status)
         assert status.features["signature_has_A_scale"] is True
         assert status.features["signature_has_B_scale"] is True
         assert status.features["A_scale_refs"] >= 1
@@ -257,6 +283,8 @@ def test_blockscaled_path_c_e8m0_qk_reduce_status_reports_available() -> None:
 
 
 def test_blockscaled_path_c_e8m0_qk_reduce_lowered_features_are_reported() -> None:
+    status = blockscaled_sparse_mla_qk_reduce_path_c_status(N=16, K=64)
+    _require_path_c_available(status)
     msl = lower_blockscaled_sparse_mla_qk_reduce_msl(N=16, K=64)
     features = blockscaled_sparse_mla_qk_reduce_msl_features(msl)
     assert features["kernel_void"] >= 1
@@ -280,6 +308,8 @@ def test_blockscaled_path_c_e8m0_qk_reduce_lowered_features_are_reported() -> No
 def test_blockscaled_path_c_e8m0_qk_reduce_locks_current_perf_blocker() -> None:
     """Real Sparse-MLA shape uses dot4 decode but still not the MMA fast path."""
 
+    status = blockscaled_sparse_mla_qk_reduce_path_c_status(N=16, K=4096)
+    _require_path_c_available(status)
     features = blockscaled_sparse_mla_qk_reduce_msl_features(
         lower_blockscaled_sparse_mla_qk_reduce_msl(N=16, K=4096)
     )
@@ -295,6 +325,8 @@ def _e8m0_decode_np(x: np.ndarray) -> np.ndarray:
 
 
 def test_blockscaled_path_c_e8m0_qk_reduce_matches_blockscale_oracle() -> None:
+    status = blockscaled_sparse_mla_qk_reduce_path_c_status(N=16, K=64)
+    _require_path_c_available(status)
     q, kv, _indices, _d_v = _make_inputs(seq_len=16, heads=2, qk_dim=64, topk=16, scale=0.1)
     q_packed, _q_scales = _quantize_mxfp8(q)
     kv_packed, _kv_scales = _quantize_mxfp8(kv)
@@ -336,6 +368,8 @@ def test_blockscaled_path_c_e8m0_qk_reduce_matches_blockscale_oracle() -> None:
 
 
 def test_blockscaled_path_c_e8m0_qk_reduce_accepts_broadcast_b_scale() -> None:
+    status = blockscaled_sparse_mla_qk_reduce_path_c_status(N=16, K=64)
+    _require_path_c_available(status)
     q, kv, _indices, _d_v = _make_inputs(seq_len=16, heads=2, qk_dim=64, topk=16, scale=0.1)
     q_packed, _q_scales = _quantize_mxfp8(q)
     kv_packed, _kv_scales = _quantize_mxfp8(kv)
@@ -370,6 +404,8 @@ def test_blockscaled_path_c_e8m0_qk_reduce_accepts_broadcast_b_scale() -> None:
 
 
 def test_blockscaled_path_c_e8m0_qk_reduce_handles_tail_n_and_multi_k_chunk() -> None:
+    status = blockscaled_sparse_mla_qk_reduce_path_c_status(N=10, K=160)
+    _require_path_c_available(status)
     rng = np.random.default_rng(91)
     n = 10
     k_dim = 160
