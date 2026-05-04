@@ -1,6 +1,42 @@
 # Vector FP8 cast lowering for Metal codegen
 
-## Packaging status
+## Filed upstream PRs (2026-05-04)
+
+The combined `0001-metal-fp8-vector-cast.patch` (345 lines) was split into
+two companion PRs because it touches both the TileLang supermodule and its
+vendored TileLang/tvm submodule:
+
+| Half | Repo | PR | Patch file |
+|---|---|---|---|
+| Supermodule (`src/target/codegen_metal.{cc,h}`) | `tile-ai/tilelang` | https://github.com/tile-ai/tilelang/pull/2145 | `0001-tilelang-metal-fp8-vector-cast.patch` (148 lines) |
+| Submodule (`src/target/source/codegen_metal.{cc,h}`) | `TileLang/tvm` | https://github.com/tile-ai/tvm/pull/39 | `0002-tvm-metal-fp8-vector-cast.patch` (151 lines) |
+
+Both branches: `apstenku123:cppmega/metal-fp8-vector-cast`.
+
+### Dependency chain
+
+Each PR's branch includes 2 commits stacked: the
+`tilelang_metal_fp8` storage-only prereq first, then the vector-cast
+patch on top. The supermodule branch additionally stacks on PR #2130
+(`metal-gemm-upstream-rebase` @ `971c17b`).
+
+```
+[Apple Metal landing chain] #1869 -> #2118 -> #2121 -> #2130 (open)
+                                                        |
+                                                        v
+                  [tilelang_metal_fp8 storage-only PR pair (parallel)]
+                                                        |
+                                                        v
+                  [tilelang_metal_fp8_vector PR pair, this directory]
+                  - tile-ai/tilelang #2145 (supermodule)
+                  - TileLang/tvm #39       (submodule)
+```
+
+When the storage-only PR pair merges, the prereq commit on each
+vector-cast branch should be rebased away. Until then, they are
+reviewable as 2-commit stacks.
+
+## Packaging status (pre-split)
 
 Rebased 2026-05-03 onto jorgecurious/tilelang's
 `metal-gemm-upstream-rebase` branch (PR #2130, HEAD `971c17b`). Applies
@@ -12,6 +48,22 @@ git apply  docs/upstream/tilelang_metal_fp8/0001-metal-fp8-storage-only.patch   
 git apply --check  docs/upstream/tilelang_metal_fp8_vector/0001-metal-fp8-vector-cast.patch  -> OK
 git apply          docs/upstream/tilelang_metal_fp8_vector/0001-metal-fp8-vector-cast.patch  -> OK
 git apply --reverse docs/upstream/tilelang_metal_fp8_vector/0001-metal-fp8-vector-cast.patch  -> OK
+```
+
+### Round-trip verification of the split patches (2026-05-04)
+
+```
+# TileLang half: jorgecurious/tilelang @ 971c17b + storage-only prereq applied first
+git apply --check    docs/upstream/tilelang_metal_fp8_vector/0001-tilelang-metal-fp8-vector-cast.patch  -> OK
+git apply --index    docs/upstream/tilelang_metal_fp8_vector/0001-tilelang-metal-fp8-vector-cast.patch  -> OK
+git apply --reverse  docs/upstream/tilelang_metal_fp8_vector/0001-tilelang-metal-fp8-vector-cast.patch  -> OK
+git apply --reverse  docs/upstream/tilelang_metal_fp8/0001-tilelang-metal-fp8-storage-only.patch        -> OK (matches base)
+
+# TVM half: TileLang/tvm @ 0e15b274 + storage-only prereq applied first
+git apply --check    docs/upstream/tilelang_metal_fp8_vector/0002-tvm-metal-fp8-vector-cast.patch       -> OK
+git apply --index    docs/upstream/tilelang_metal_fp8_vector/0002-tvm-metal-fp8-vector-cast.patch       -> OK
+git apply --reverse  docs/upstream/tilelang_metal_fp8_vector/0002-tvm-metal-fp8-vector-cast.patch       -> OK
+git apply --reverse  docs/upstream/tilelang_metal_fp8/0002-tvm-metal-fp8-storage-only.patch             -> OK (matches base)
 ```
 
 ## Stacking topology

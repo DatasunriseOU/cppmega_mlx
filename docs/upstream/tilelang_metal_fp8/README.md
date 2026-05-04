@@ -106,16 +106,25 @@ fails fast: "Only float16, float32, and bfloat16 are supported".
 
 ## Diff stat
 
+Split into two companion patches (May 4 2026):
 
- 3rdparty/tvm/src/target/source/codegen_metal.cc | 203 +++++++++++++++++++
- 3rdparty/tvm/src/target/source/codegen_metal.h  |  10 +
+TileLang half (0001-tilelang-metal-fp8-storage-only.patch):
+
  src/target/codegen_metal.cc                     | 177 ++++++++++++++++
  src/target/codegen_metal.h                      |  10 +
- 4 files changed, 400 insertions(+)
+ 2 files changed, 187 insertions(+)
 
+TileLang/tvm half (0002-tvm-metal-fp8-storage-only.patch):
 
-Both files apply cleanly via git apply --check on TileLang/tvm fork
-@ 0e15b274b.
+ src/target/source/codegen_metal.cc              | 203 +++++++++++++++++++
+ src/target/source/codegen_metal.h               |  10 +
+ 2 files changed, 213 insertions(+)
+
+Combined: 4 files changed, 400 insertions(+).
+
+Both halves apply cleanly via git apply --check:
+- TileLang half against jorgecurious/tilelang:metal-gemm-upstream-rebase.
+- TileLang/tvm half against tile-ai/tvm:tilelang_main @ 0e15b274.
 
 May 3 2026 replay audit:
 
@@ -288,15 +297,41 @@ Open questions for upstream review:
 
 ## Files
 
-- 0001-metal-fp8-storage-only.patch — combined patch (3rdparty/tvm
-  + tilelang) ready for git apply from the tilelang repo root.
+- 0001-tilelang-metal-fp8-storage-only.patch — TileLang half. Touches
+  src/target/codegen_metal.{cc,h} (the CodeGenTileLangMetal
+  specialisation). Applies cleanly at the tile-ai/tilelang repo root
+  on top of jorgecurious/tilelang:metal-gemm-upstream-rebase.
+- 0002-tvm-metal-fp8-storage-only.patch — TileLang/tvm submodule half.
+  Touches src/target/source/codegen_metal.{cc,h} in the vendored TVM
+  fork. Applies cleanly at the tile-ai/tvm:tilelang_main repo root at
+  HEAD 0e15b274 (the SHA TileLang's 3rdparty/tvm submodule pins).
+
+## Filed PRs
+
+- TileLang half: https://github.com/tile-ai/tilelang/pull/2144 (stacks on tile-ai/tilelang#2130)
+- TileLang/tvm half: https://github.com/tile-ai/tvm/pull/38 (targets tilelang_main @ 0e15b274)
+
+Both PRs must land for full FP8 storage-only coverage: the tilelang
+PR unblocks target.build.tilelang_metal, the tvm PR unblocks
+target.build.metal (vanilla TVM Metal codegen used by tilelang's
+external_runtime path and any code that lowers via stock TVM).
 
 ## How to apply
 
+The patches are companion patches; apply each in its respective repo.
+
+TileLang half (against the supermodule):
+
 bash
-cd /tmp/tilelang_apple_head/tilelang
-git checkout 7f4a5cb8
-git submodule update --init 3rdparty/tvm
-git apply /Volumes/external/sources/cppmega.mlx/docs/upstream/tilelang_metal_fp8/0001-metal-fp8-storage-only.patch
-cd build && ninja -j$(sysctl -n hw.ncpu)
+cd /tmp && git clone --branch metal-gemm-upstream-rebase https://github.com/jorgecurious/tilelang.git
+cd tilelang
+git submodule update --init --depth 1 3rdparty/tvm
+git apply /Volumes/external/sources/cppmega.mlx/docs/upstream/tilelang_metal_fp8/0001-tilelang-metal-fp8-storage-only.patch
+
+TileLang/tvm half (against the vendored TVM fork):
+
+bash
+cd /tmp && git clone https://github.com/tile-ai/tvm.git tilelang_tvm
+cd tilelang_tvm && git checkout 0e15b274bce8b46f971abf5ac390e844aa6acee5
+git apply /Volumes/external/sources/cppmega.mlx/docs/upstream/tilelang_metal_fp8/0002-tvm-metal-fp8-storage-only.patch
 

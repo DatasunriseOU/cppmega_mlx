@@ -1,7 +1,11 @@
 # TileLang Metal codegen: emit Metal builtins directly
 
-Filed PR: https://github.com/tile-ai/tilelang/pull/2143
-Branch: `apstenku123:cppmega/metal-emit-builtins-directly`
+Filed PRs:
+
+* Tilelang supermodule half: https://github.com/tile-ai/tilelang/pull/2143
+* TileLang/tvm submodule mirror: https://github.com/tile-ai/tvm/pull/37
+
+Branch: `apstenku123:cppmega/metal-emit-builtins-directly` (same name on both forks)
 Stacks on: tile-ai/tilelang#2130 (jorgecurious metal-gemm-upstream-rebase)
 
 ## What this fixes
