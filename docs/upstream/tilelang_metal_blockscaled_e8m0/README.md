@@ -60,6 +60,12 @@ The patch stacks after:
 - `tilelang_metal_fp8_scaled_matmul`
 - Path C patch **B**, `tilelang_metal_fp8_scaled_matmul_fused_scheduler`
 
+Patch C is authored against the current `T.fp8_scaled_matmul(...)` prereq
+shape in `tilelang/language/fp8_op.py`: the public wrapper dispatches to two
+top-level macros, `_fp8_scaled_matmul_macro` and
+`_fp8_scaled_matmul_macro_trans_b`. It intentionally does not patch the older
+inline `_body()` form.
+
 ## Local Probe
 
 ```bash
@@ -70,9 +76,26 @@ The patch stacks after:
 
 The probe is source-level and focused on the artifact contract. It validates
 that the patch carries the DSL surface, E8M0 decode semantics, K/32 shape rules,
-contracted-K indexing, and a Mac MLX/Metal-only acceptance boundary. It also
-rereads the current local Path C source to confirm the runtime evidence still
-exposes the same constants and reducer markers.
+contracted-K indexing, the current two-macro `fp8_op.py` prereq shape, and a
+Mac MLX/Metal-only acceptance boundary. It also rereads the current local Path C
+source to confirm the runtime evidence still exposes the same constants and
+reducer markers.
+
+If a TileLang checkout with the prereq stack is available, run the optional
+apply probe:
+
+```bash
+TILELANG_CHECKOUT=/path/to/tilelang ./.venv/bin/python -m pytest \
+  docs/upstream/tilelang_metal_blockscaled_e8m0/test_blockscaled_e8m0_probe.py \
+  -q
+```
+
+That env-gated test executes:
+
+```bash
+git -C "$TILELANG_CHECKOUT" apply --check \
+  /Volumes/external/sources/cppmega.mlx/docs/upstream/tilelang_metal_blockscaled_e8m0/0001-tilelang-add-e8m0-blockscaled-layout-primitive.patch
+```
 
 ## Remaining Risk
 

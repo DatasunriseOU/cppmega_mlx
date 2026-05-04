@@ -1,30 +1,35 @@
-# Metal FP8 scaled-matmul fused scheduler
+# Metal FP8 scaled-matmul fused-scale macro prototype
 
 ## Status
 
 Local upstream artifact for Path C patch **B**.
 
-This patch replaces the older scalar `T.fp8_scaled_matmul` macro expansion with a
-Metal scheduler path that fuses FP8 decode and scale application inside the
-contracted-K loop. It is the TileLang-side counterpart to cppmega.mlx's current
-Path C FP8 vecmat runtime body:
+This is a macro-level prototype against the real current TileLang surface. After
+the `tilelang_metal_fp8_scaled_matmul` prereq, `T.fp8_scaled_matmul(...)` lives
+in `tilelang/language/fp8_op.py` as two `@T.macro` bodies:
 
-- packed `uint32` FP8 loads via `reinterpret_cast<device const uint*>`
-- LUT-backed e4m3 dot4 decode
-- `simd_sum` for the M=1 vecmat reduction
-- per-tensor and per-row scale loads applied before the accumulation is stored
+- `_fp8_scaled_matmul_macro`
+- `_fp8_scaled_matmul_macro_trans_b`
 
-## Why This Exists
+The earlier draft targeted a nonexistent `tilelang/tileop/gemm` scheduler stack.
+This replacement does not add `GemmMetalFP8ScaledScheduler`, `GemmSchedule`, or a
+fake Metal GEMM dispatch hook.
 
-The historical `tilelang_metal_fp8_scaled_matmul` patch was a correctness-first
-frontend macro. It made `T.fp8_scaled_matmul(...)` usable, but the generated
-Metal path still left too much work outside the hot loop for the M=1/top-k Path
-C sparse-MLA surfaces. cppmega.mlx now carries local runtime MSL that proves the
-desired Apple Silicon shape: decode packed FP8 bytes, multiply by the selected
-scale for the current K/block, reduce with a SIMD-group primitive, then store.
+## What Patch B Does
 
-This upstream patch moves that shape into TileLang proper so downstream code no
-longer needs a bespoke MSL replacement for the FP8 vecmat/`M == 1` case.
+- Patches only `tilelang/language/fp8_op.py`.
+- Keeps scale selection inside the contracted-K loop.
+- Rewrites both macro bodies from `a_val * b_val * sa * sb` into explicit
+  `a_scaled = a_val * sa`, `b_scaled = b_val * sb`, then
+  `C_local += a_scaled * b_scaled`.
+- Covers the `transpose_B=True` macro that maps to the current M == 1 Path C
+  vecmat shape.
+- Avoids a post-loop `C *= scale` epilogue.
+
+This is intentionally not CUDA/H200 acceptance and not a final performance
+scheduler. The packed `uint32` FP8 loads, LUT-backed dot4 decode, and `simd_sum`
+row reducer still live in cppmega.mlx's local MLX/Metal runtime body and remain
+the reference shape for a future real TileLang scheduler.
 
 ## Patch
 
@@ -36,8 +41,8 @@ The patch stacks after:
 - `tilelang_metal_fp8`
 - `tilelang_metal_fp8_gemm`
 - `tilelang_metal_fp8_scaled_matmul`
-- optional Path C patch A, `tilelang_metal_pipelined_32x32`, for the wider
-  Sparse-MLA 32x32 fragment route
+- optional `tilelang_metal_blockscaled_e8m0`, if the block-scale prereq is part
+  of the local replay
 
 ## Local Probe
 
@@ -47,13 +52,45 @@ The patch stacks after:
   -q
 ```
 
-The probe is intentionally source-level. It validates that the artifact contains
-the concrete scheduler API and that the in-tree cppmega.mlx Path C runtime still
-has the packed-load, LUT dot4, `simd_sum`, and per-row-scale markers this patch
-is meant to upstream.
+The local probe is source-level by default. It verifies that the artifact targets
+`tilelang/language/fp8_op.py`, references both real macro names, keeps scale
+multiplication inside each K loop, and no longer references the impossible
+`tilelang/tileop/gemm` scheduler classes.
+
+To run the real apply check, point `TILELANG_CHECKOUT` at a TileLang checkout
+with the prereq patches already applied:
+
+```bash
+TILELANG_CHECKOUT=/path/to/tilelang \
+  ./.venv/bin/python -m pytest \
+  docs/upstream/tilelang_metal_fp8_scaled_matmul_fused_scheduler/test_fp8_scaled_matmul_fused_scheduler_probe.py \
+  -q
+```
+
+When `TILELANG_CHECKOUT` is unset, the `git apply --check` test is skipped.
+
+Current validation recipe used for the local disposable apply check:
+
+```bash
+rm -rf /tmp/tilelang-path-b-apply
+git clone /Volumes/external/sources/cppmega.backup/.tmp/tilelang-build \
+  /tmp/tilelang-path-b-apply
+git -C /tmp/tilelang-path-b-apply apply \
+  /Volumes/external/sources/cppmega.mlx/docs/upstream/tilelang_metal_fp8_scaled_matmul/0001-tilelang-fp8-scaled-matmul-intrinsic.patch
+git -C /tmp/tilelang-path-b-apply apply --check \
+  /Volumes/external/sources/cppmega.mlx/docs/upstream/tilelang_metal_fp8_scaled_matmul_fused_scheduler/0001-metal-fuse-fp8-scaled-matmul-scheduler.patch
+TILELANG_CHECKOUT=/tmp/tilelang-path-b-apply \
+  ./.venv/bin/python -m pytest \
+  docs/upstream/tilelang_metal_fp8_scaled_matmul_fused_scheduler/test_fp8_scaled_matmul_fused_scheduler_probe.py \
+  -q
+```
+
+The expected result is that the prereq applies cleanly, `git apply --check` on
+patch B exits 0, and the env-gated probe reports all tests passing instead of a
+source-only skip.
 
 ## Remaining Risk
 
 This artifact is an upstream patch, not a vendored TileLang subtree. Runtime
-acceptance still requires applying it to the apple-head TileLang checkout and
-rerunning the strict FP8 Path C benchmarks on M4 Max.
+acceptance still requires applying it to the current TileLang stack after
+prereqs and running the relevant Apple Silicon Metal checks.

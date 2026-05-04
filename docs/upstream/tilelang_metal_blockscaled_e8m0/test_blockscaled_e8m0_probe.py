@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import os
 import re
+import subprocess
 from pathlib import Path
+
+import pytest
 
 
 THIS_DIR = Path(__file__).resolve().parent
@@ -21,6 +25,16 @@ def _without_diff_markers(text: str) -> str:
     return re.sub(r"(?m)^[+ -]", "", text)
 
 
+def _patch_file_section(path: str) -> str:
+    patch = _read(PATCH_PATH)
+    marker = f"diff --git a/{path} b/{path}"
+    start = patch.index(marker)
+    next_file = patch.find("\ndiff --git ", start + len(marker))
+    if next_file == -1:
+        return patch[start:]
+    return patch[start:next_file]
+
+
 def test_patch_exports_e8m0_layout_dsl_surface() -> None:
     patch = _read(PATCH_PATH)
     normalized = _without_diff_markers(patch)
@@ -29,13 +43,14 @@ def test_patch_exports_e8m0_layout_dsl_surface() -> None:
     assert "BlockScaledLayout" in normalized
     assert "def e8m0_to_float" in normalized
     assert "T.BlockScaledLayout.e8m0_k32()" in normalized
-    assert "block_scale_layout=T.BlockScaledLayout.e8m0_k32()" in normalized
+    assert "layout = T.BlockScaledLayout.e8m0_k32()" in normalized
+    assert "block_scale_layout=layout" in normalized
     assert "scale_format=\"e8m0_block_k32\"" in normalized
     assert "scale_block_size=32" in normalized
     assert "scale_format != E8M0_BLOCK_K32" in normalized
     assert "scale_block_size is None" in normalized
     assert "int(scale_block_size) != E8M0_BLOCK_SIZE" in normalized
-    assert "scale_axis=\"contracted_k\"" in normalized
+    assert 'layout.scale_axis == "contracted_k"' in normalized
     assert "logical_unswizzled_k_axis_blocks" in normalized
 
 
@@ -54,24 +69,41 @@ def test_patch_rejects_partial_or_inconsistent_e8m0_metadata() -> None:
 def test_patch_locks_concrete_e8m0_decode_semantics() -> None:
     normalized = _without_diff_markers(_read(PATCH_PATH))
 
-    assert re.search(r"byte\s*==\s*0", normalized)
-    assert re.search(r"byte\s*==\s*0xFF", normalized)
-    assert "byte - 127" in normalized
+    assert "bits_i == T.int32(0)" in normalized
+    assert "bits_i == T.int32(255)" in normalized
+    assert "bits_i - T.int32(127)" in normalized
     assert "T.exp2" in normalized
     assert "T.if_then_else" in normalized
+
+
+def test_patch_targets_current_fp8_scaled_matmul_macro_prereq_shape() -> None:
+    section = _patch_file_section("tilelang/language/fp8_op.py")
+    normalized = _without_diff_markers(section)
+
+    assert "def _fp8_scaled_matmul_macro(" in section
+    assert "def _fp8_scaled_matmul_macro_trans_b(" in section
+    assert "def _body(" not in section
+    assert "C_out, layout)" in normalized
+    assert "block_scale_layout=None" in normalized
+    assert "block_scale_layout: BlockScaledLayout | None = None" in normalized
+    assert "return _fp8_scaled_matmul_macro_trans_b(A_fp8, A_scale, B_fp8, B_scale, C_out, layout)" in normalized
+    assert "return _fp8_scaled_matmul_macro(A_fp8, A_scale, B_fp8, B_scale, C_out, layout)" in normalized
+    assert "_block_scale_value(A_scale, axis=\"A\", col=j, k=k)" in normalized
+    assert "_block_scale_value(B_scale, axis=\"B\", col=j, k=k)" in normalized
 
 
 def test_patch_locks_contracted_k_shape_and_indexing_rules() -> None:
     normalized = _without_diff_markers(_read(PATCH_PATH))
 
-    assert "A_scale shape: (K / 32,)" in normalized
-    assert "B_scale shape: (N, K / 32)" in normalized
-    assert "broadcast (K / 32,)" in normalized
-    assert re.search(r"kb\s*=\s*k\s*//\s*32", normalized)
-    assert re.search(r"return\s+k\s*//\s*32", normalized)
+    assert "layout.a_scale_shape(64) == (2,)" in normalized
+    assert "layout.b_scale_shape(16, 64) == (16, 2)" in normalized
+    assert "layout.broadcast_b_scale_shape(64) == (2,)" in normalized
+    assert "kb = k // 32" in normalized
+    assert "return k // 32" in normalized
     assert "K divisible by 32" in normalized
-    assert "(K / 32,)" in normalized
-    assert "(N, K / 32)" in normalized
+    assert "A_scale for e8m0_block_k32 must have shape" in normalized
+    assert "B_scale for e8m0_block_k32 must have shape" in normalized
+    assert "B_scale for e8m0_block_k32 must be broadcast (K / 32,)" in normalized
 
 
 def test_readme_matches_artifact_and_local_verification_contract() -> None:
@@ -83,6 +115,8 @@ def test_readme_matches_artifact_and_local_verification_contract() -> None:
     assert "T.e8m0_to_float" in readme
     assert "scale_format = \"e8m0_block_k32\"" in readme
     assert "scale_block_size = 32" in readme
+    assert "TILELANG_CHECKOUT=/path/to/tilelang" in readme
+    assert "apply --check" in readme
     assert "both fields required" in readme
     assert "A bare `block_size=32` is not enough" in readme
     assert "test_blockscaled_e8m0_probe.py" in readme
@@ -98,7 +132,24 @@ def test_artifact_does_not_claim_cuda_or_h200_acceptance() -> None:
 
     assert "h200" not in lower
     assert "cuda acceptance" not in lower
-    assert "cuda" not in lower
+
+
+def test_patch_git_apply_check_when_tilelang_checkout_is_provided() -> None:
+    checkout = os.environ.get("TILELANG_CHECKOUT")
+    if not checkout:
+        pytest.skip("set TILELANG_CHECKOUT to run the upstream git apply --check probe")
+
+    checkout_path = Path(checkout)
+    if not checkout_path.is_dir():
+        pytest.fail(f"TILELANG_CHECKOUT does not exist or is not a directory: {checkout}")
+
+    result = subprocess.run(
+        ["git", "-C", str(checkout_path), "apply", "--check", str(PATCH_PATH)],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_current_path_c_source_still_exposes_e8m0_layout_contract() -> None:

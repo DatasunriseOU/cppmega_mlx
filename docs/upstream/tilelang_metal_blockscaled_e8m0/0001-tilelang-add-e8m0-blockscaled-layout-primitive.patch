@@ -1,402 +1,21 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: cppmega.mlx <noreply@example.com>
-Date: Mon, 4 May 2026 13:10:00 +0200
+From 07dbf580d65211b0ff0f87587eeb05cb6699bf65 Mon Sep 17 00:00:00 2001
+From: David Gornshtein <davidgornshtein@gmail.com>
+Date: Mon, 4 May 2026 16:45:26 +0200
 Subject: [PATCH] tilelang: add E8M0 block-scaled layout primitive
 
-Add a first-class DSL layout object for MXFP8/E8M0 block scales:
-
-  T.BlockScaledLayout(
-      scale_dtype="e8m0",
-      axis="contracted_k",
-      block_size=32,
-      layout="logical_unswizzled_k_axis_blocks",
-  )
-
-and expose T.e8m0_to_float(byte) with the Metal-compatible E8M0 semantics used
-by Apple MXFP8: byte 0 and byte 0xFF are sentinels that decode to zero, while
-all other bytes decode as 2 ** (byte - 127).
-
-The layout plugs into T.fp8_scaled_matmul through the existing scale metadata:
-
-  T.fp8_scaled_matmul(
-      A_fp8,
-      A_scale,
-      B_fp8,
-      B_scale,
-      C,
-      transpose_B=True,
-      block_scale_layout=T.BlockScaledLayout.e8m0_k32(),
-  )
-
-Lowering metadata remains explicit:
-
-  scale_format="e8m0_block_k32"
-  scale_block_size=32
-  scale_axis="contracted_k"
-
-Both metadata fields are required when using the metadata spelling. A bare
-block_size=32 is rejected so future non-E8M0 K/32 layouts cannot accidentally
-lower through this primitive.
-
-For the Sparse-MLA Path C shape this preserves the concrete scale contract:
-
-  A_scale shape: (K / 32,)
-  B_scale shape: (N, K / 32) or broadcast (K / 32,)
-  scale block:   kb = k // 32
-
 ---
- testing/python/cpu/test_blockscaled_e8m0_layout.py | 154 ++++++++++++++++++++
- tilelang/language/__init__.py                      |   2 +
- tilelang/language/blockscaled_layout.py            | 154 +++++++++++++++++++++
- tilelang/language/fp8_op.py                        | 121 +++++++++++++++-
- tilelang/tileop/metal_quant.py                     |  27 ++++
- 5 files changed, 455 insertions(+), 3 deletions(-)
+ .../cpu/test_blockscaled_e8m0_layout.py       | 154 ++++++++++++++++++
+ tilelang/language/__init__.py                 |   2 +
+ tilelang/language/blockscaled_layout.py       | 136 ++++++++++++++++
+ tilelang/language/fp8_op.py                   | 115 +++++++++++--
+ tilelang/tileop/metal_quant.py                |  12 +-
+ 5 files changed, 403 insertions(+), 16 deletions(-)
  create mode 100644 testing/python/cpu/test_blockscaled_e8m0_layout.py
  create mode 100644 tilelang/language/blockscaled_layout.py
 
-diff --git a/tilelang/language/__init__.py b/tilelang/language/__init__.py
---- a/tilelang/language/__init__.py
-+++ b/tilelang/language/__init__.py
-@@ -114,6 +114,8 @@ from .builtin import stg128 as stg128  # noqa: F401
- from .builtin import stg256 as stg256  # noqa: F401
- from .builtin import any_sync as any_sync  # noqa: F401
- from .builtin import all_sync as all_sync  # noqa: F401
-+from .blockscaled_layout import BlockScaledLayout as BlockScaledLayout  # noqa: F401
-+from .blockscaled_layout import e8m0_to_float as e8m0_to_float  # noqa: F401
- from .fp8_op import fp8_scaled_matmul as fp8_scaled_matmul  # noqa: F401
- from .builtin import ballot_sync as ballot_sync  # noqa: F401
- from .builtin import ballot as ballot  # noqa: F401
-diff --git a/tilelang/language/blockscaled_layout.py b/tilelang/language/blockscaled_layout.py
-new file mode 100644
---- /dev/null
-+++ b/tilelang/language/blockscaled_layout.py
-@@ -0,0 +1,154 @@
-+"""Block-scale layout primitives for TileLang FP8 DSL surfaces.
-+
-+The first consumer is Apple MXFP8/E8M0, where FP8 data remains e4m3 storage
-+and a separate uint8 scale byte applies to each 32-value block along the
-+contracted-K axis. The layout object is intentionally small: it carries the
-+static metadata that schedulers need, while the scale tensors remain ordinary
-+TileLang buffers.
-+"""
-+
-+from __future__ import annotations
-+
-+from dataclasses import dataclass
-+from typing import Any
-+
-+import tilelang.language as T
-+
-+E8M0_BLOCK_SIZE = 32
-+E8M0_BLOCK_K32 = "e8m0_block_k32"
-+E8M0_LAYOUT = "logical_unswizzled_k_axis_blocks"
-+CONTRACTED_K_AXIS = "contracted_k"
-+
-+
-+def e8m0_to_float(byte: Any):
-+    """Decode one E8M0 scale byte to float32.
-+
-+    Apple MXFP8 uses uint8 exponent bytes for block scales. The normal values
-+    decode as ``2 ** (byte - 127)``. Byte 0 and byte 0xFF are sentinels; both
-+    are treated as zero so padded/invalid blocks do not poison reductions.
-+    """
-+
-+    zero = T.cast(0.0, "float32")
-+    decoded = T.exp2(T.cast(byte, "float32") - T.cast(127.0, "float32"))
-+    return T.if_then_else(
-+        byte == 0,
-+        zero,
-+        T.if_then_else(byte == 0xFF, zero, decoded),
-+    )
-+
-+
-+@dataclass(frozen=True)
-+class BlockScaledLayout:
-+    """Static block-scale metadata for FP8 scaled matmul-like operators.
-+
-+    ``scale_dtype="e8m0"`` with ``block_size=32`` describes the MXFP8 layout
-+    used by Metal Path C:
-+
-+    * A scale shape is ``(K / 32,)``.
-+    * B scale shape is ``(N, K / 32)`` for per-row scales.
-+    * A broadcast B scale shape ``(K / 32,)`` is accepted for local probes.
-+    * The scale block index is the contracted-K block, ``kb = k // 32``.
-+    """
-+
-+    scale_dtype: str = "e8m0"
-+    axis: str = CONTRACTED_K_AXIS
-+    block_size: int = E8M0_BLOCK_SIZE
-+    layout: str = E8M0_LAYOUT
-+    allow_broadcast_b_scale: bool = True
-+
-+    def __post_init__(self) -> None:
-+        if self.scale_dtype != "e8m0":
-+            raise ValueError(
-+                "BlockScaledLayout currently supports only scale_dtype='e8m0'"
-+            )
-+        if self.axis != CONTRACTED_K_AXIS:
-+            raise ValueError(
-+                "BlockScaledLayout currently supports only axis='contracted_k'"
-+            )
-+        if int(self.block_size) != E8M0_BLOCK_SIZE:
-+            raise ValueError("E8M0 block-scale layout requires block_size=32")
-+        if self.layout != E8M0_LAYOUT:
-+            raise ValueError(
-+                "E8M0 block-scale layout must be "
-+                "'logical_unswizzled_k_axis_blocks'"
-+            )
-+
-+    @classmethod
-+    def e8m0_k32(cls) -> "BlockScaledLayout":
-+        """Return the canonical logical unswizzled E8M0 K/32 layout."""
-+
-+        return cls(
-+            scale_dtype="e8m0",
-+            axis=CONTRACTED_K_AXIS,
-+            block_size=E8M0_BLOCK_SIZE,
-+            layout=E8M0_LAYOUT,
-+        )
-+
-+    @property
-+    def scale_format(self) -> str:
-+        return E8M0_BLOCK_K32
-+
-+    @property
-+    def scale_axis(self) -> str:
-+        return CONTRACTED_K_AXIS
-+
-+    def scale_blocks(self, k_extent: int) -> int:
-+        k_extent = int(k_extent)
-+        if k_extent <= 0:
-+            raise ValueError(f"block-scaled K extent must be positive, got {k_extent}")
-+        if k_extent % E8M0_BLOCK_SIZE != 0:
-+            raise ValueError(
-+                f"e8m0_block_k32 requires K divisible by 32, got K={k_extent}"
-+            )
-+        return k_extent // E8M0_BLOCK_SIZE
-+
-+    def a_scale_shape(self, k_extent: int) -> tuple[int]:
-+        return (self.scale_blocks(k_extent),)
-+
-+    def b_scale_shape(self, n_extent: int, k_extent: int) -> tuple[int, int]:
-+        n_extent = int(n_extent)
-+        if n_extent <= 0:
-+            raise ValueError(f"block-scaled N extent must be positive, got {n_extent}")
-+        return (n_extent, self.scale_blocks(k_extent))
-+
-+    def broadcast_b_scale_shape(self, k_extent: int) -> tuple[int]:
-+        return (self.scale_blocks(k_extent),)
-+
-+    def scale_index(self, k: Any):
-+        """Return the contracted-K scale block index for element ``k``."""
-+
-+        return k // 32
-+
-+    def decode(self, byte: Any):
-+        return e8m0_to_float(byte)
-+
-+    def validate_scale_shapes(
-+        self,
-+        *,
-+        k_extent: int,
-+        a_scale_shape: tuple[int, ...],
-+        b_scale_shape: tuple[int, ...],
-+        n_extent: int | None = None,
-+    ) -> None:
-+        blocks = self.scale_blocks(k_extent)
-+        if tuple(a_scale_shape) != (blocks,):
-+            raise ValueError(
-+                "A_scale for e8m0_block_k32 must have shape "
-+                f"(K / 32,) == ({blocks},), got {a_scale_shape}"
-+            )
-+        if tuple(b_scale_shape) == (blocks,) and self.allow_broadcast_b_scale:
-+            return
-+        if n_extent is None:
-+            raise ValueError(
-+                "B_scale for e8m0_block_k32 must be broadcast (K / 32,) "
-+                "or per-row (N, K / 32); n_extent is required to validate "
-+                f"shape {b_scale_shape}"
-+            )
-+        expected = (int(n_extent), blocks)
-+        if tuple(b_scale_shape) != expected:
-+            raise ValueError(
-+                "B_scale for e8m0_block_k32 must have shape "
-+                f"(N, K / 32) == {expected} or broadcast ({blocks},), "
-+                f"got {b_scale_shape}"
-+            )
-+
-diff --git a/tilelang/language/fp8_op.py b/tilelang/language/fp8_op.py
---- a/tilelang/language/fp8_op.py
-+++ b/tilelang/language/fp8_op.py
-@@ -11,6 +11,13 @@ import tilelang.language as T
- from tilelang._typing import BufferLikeType
- from tvm import tir
- 
-+from .blockscaled_layout import (
-+    BlockScaledLayout,
-+    E8M0_BLOCK_K32,
-+    E8M0_BLOCK_SIZE,
-+    e8m0_to_float,
-+)
-+
- __all__ = [
-     "fp8_scaled_matmul",
-     "FP8_DTYPES",
-@@ -72,6 +79,49 @@ def _shape_extent(buffer, axis: int) -> int:
-     return -1
- 
- 
-+def _normalize_block_scale_layout(
-+    block_scale_layout: BlockScaledLayout | None,
-+    *,
-+    scale_format: str | None,
-+    scale_block_size: int | None,
-+) -> BlockScaledLayout | None:
-+    if block_scale_layout is not None:
-+        if not isinstance(block_scale_layout, BlockScaledLayout):
-+            raise TypeError(
-+                "T.fp8_scaled_matmul block_scale_layout must be a "
-+                "T.BlockScaledLayout instance"
-+            )
-+        if scale_format is not None and scale_format != block_scale_layout.scale_format:
-+            raise ValueError(
-+                "T.fp8_scaled_matmul scale_format conflicts with block_scale_layout"
-+            )
-+        if scale_block_size is not None and int(scale_block_size) != block_scale_layout.block_size:
-+            raise ValueError(
-+                "T.fp8_scaled_matmul scale_block_size conflicts with block_scale_layout"
-+            )
-+        return block_scale_layout
-+    if scale_format is None and scale_block_size is None:
-+        return None
-+    if scale_format != E8M0_BLOCK_K32:
-+        raise ValueError(
-+            "T.fp8_scaled_matmul e8m0 block-scale metadata requires "
-+            "scale_format='e8m0_block_k32'"
-+        )
-+    if scale_block_size is None or int(scale_block_size) != E8M0_BLOCK_SIZE:
-+        raise ValueError(
-+            "T.fp8_scaled_matmul e8m0_block_k32 metadata requires scale_block_size=32"
-+        )
-+    return BlockScaledLayout.e8m0_k32()
-+
-+
-+def _block_scale_value(scale, *, axis: str, col, k, layout: BlockScaledLayout):
-+    # Path C E8M0 is explicitly contracted-K-block indexed: kb = k // 32.
-+    kb = k // 32
-+    if axis == "B" and len(getattr(scale, "shape", ())) == 2:
-+        return e8m0_to_float(scale[col, kb])
-+    return e8m0_to_float(scale[kb])
-+
-+
- def _validate_buffers(A_fp8, A_scale, B_fp8, B_scale, C_out, *, transpose_B: bool, accum_dtype: str) -> None:
-     """Sanity-check operand dtypes and 2D shape compatibility.
- 
-@@ -160,6 +200,9 @@ def fp8_scaled_matmul(
-     *,
-     transpose_B: bool = False,
-     accum_dtype: str = "float32",
-+    scale_format: str | None = None,
-+    scale_block_size: int | None = None,
-+    block_scale_layout: BlockScaledLayout | None = None,
- ) -> None:
-     """Inline FP8 scaled matmul macro.
- 
-@@ -176,6 +219,12 @@ def fp8_scaled_matmul(
-     ``transpose_B=True`` accepts B as ``(N, K)``. This is the layout used by
-     Sparse-MLA QK reducers where gathered rows are contiguous.
- 
-+    ``block_scale_layout=T.BlockScaledLayout.e8m0_k32()`` switches scale
-+    indexing from per-tensor/per-row to E8M0 K/32 block scales. The A scale is
-+    indexed as ``A_scale[k // 32]``. The B scale is indexed as
-+    ``B_scale[col, k // 32]`` when it is two-dimensional, or broadcast as
-+    ``B_scale[k // 32]`` when it is one-dimensional.
-+
-     This is intentionally a DSL macro, not a target-specific intrinsic. The
-     target scheduler may replace this loop with a fused Metal implementation
-     when it recognizes the same op attributes.
-@@ -185,7 +234,13 @@ def fp8_scaled_matmul(
-         B_scale,
-         C_out,
-         transpose_B=transpose_B,
-+        accum_dtype=accum_dtype,
-     )
-+    layout = _normalize_block_scale_layout(
-+        block_scale_layout,
-+        scale_format=scale_format,
-+        scale_block_size=scale_block_size,
-+    )
- 
-     M = _shape_extent(A_fp8, 0)
-     K = _shape_extent(A_fp8, 1)
-@@ -195,14 +249,26 @@ def fp8_scaled_matmul(
-     if M <= 0 or N <= 0 or K <= 0:
-         raise ValueError("T.fp8_scaled_matmul requires static positive M/N/K")
- 
-+    if layout is not None:
-+        layout.validate_scale_shapes(
-+            k_extent=K,
-+            a_scale_shape=tuple(int(v) for v in A_scale.shape),
-+            b_scale_shape=tuple(int(v) for v in B_scale.shape),
-+            n_extent=N,
-+        )
-+
-     @T.macro
-     def _body():
-         for i, j in T.grid(M, N):
-             for k in T.serial(K):
-                 a_val = T.cast(A_fp8[i, k], accum_dtype)
-                 b_val = T.cast(B_fp8[j, k] if transpose_B else B_fp8[k, j], accum_dtype)
--                a_scale = A_scale[0] if _shape_extent(A_scale, 0) == 1 else A_scale[i]
--                b_scale = B_scale[0] if _shape_extent(B_scale, 0) == 1 else B_scale[j]
--                C_out[i, j] = C_out[i, j] + a_val * b_val * a_scale * b_scale
-+                if layout is not None:
-+                    a_scale = _block_scale_value(A_scale, axis="A", col=j, k=k, layout=layout)
-+                    b_scale = _block_scale_value(B_scale, axis="B", col=j, k=k, layout=layout)
-+                else:
-+                    a_scale = A_scale[0] if _shape_extent(A_scale, 0) == 1 else A_scale[i]
-+                    b_scale = B_scale[0] if _shape_extent(B_scale, 0) == 1 else B_scale[j]
-+                C_out[i, j] = C_out[i, j] + a_val * b_val * a_scale * b_scale
- 
-     _body()
-diff --git a/tilelang/tileop/metal_quant.py b/tilelang/tileop/metal_quant.py
---- a/tilelang/tileop/metal_quant.py
-+++ b/tilelang/tileop/metal_quant.py
-@@ -1,5 +1,32 @@
- """Metal quantization helpers used by TileLang FP8 schedulers."""
- 
-+from __future__ import annotations
-+
-+from typing import Any
-+
-+import tilelang.language as T
-+
-+
-+def e8m0_to_float(byte: Any):
-+    """Decode an E8M0 scale byte as a TileLang float32 expression.
-+
-+    The function is re-exported on the DSL surface as ``T.e8m0_to_float``.
-+    It intentionally mirrors the Metal helper emitted by Path C kernels:
-+
-+    * ``byte == 0`` decodes to zero.
-+    * ``byte == 0xFF`` decodes to zero.
-+    * normal bytes decode as ``exp2(byte - 127)``.
-+    """
-+
-+    zero = T.cast(0.0, "float32")
-+    decoded = T.exp2(T.cast(byte, "float32") - T.cast(127.0, "float32"))
-+    return T.if_then_else(
-+        byte == 0,
-+        zero,
-+        T.if_then_else(byte == 0xFF, zero, decoded),
-+    )
-+
-+
- def metal_fp8_e4m3_dot4(a_ptr, b_ptr, a_word_offset, b_word_offset):
-     """Return dot(float4(e4m3 bytes), float4(e4m3 bytes)) for packed words."""
- 
 diff --git a/testing/python/cpu/test_blockscaled_e8m0_layout.py b/testing/python/cpu/test_blockscaled_e8m0_layout.py
 new file mode 100644
+index 0000000..decb1a4
 --- /dev/null
 +++ b/testing/python/cpu/test_blockscaled_e8m0_layout.py
 @@ -0,0 +1,154 @@
@@ -554,3 +173,371 @@ new file mode 100644
 +    assert "byte == 0" in text
 +    assert "byte == 0xFF" in text
 +    assert "byte - 127" in text
+diff --git a/tilelang/language/__init__.py b/tilelang/language/__init__.py
+index 5758dcf..e7041b7 100644
+--- a/tilelang/language/__init__.py
++++ b/tilelang/language/__init__.py
+@@ -114,6 +114,8 @@ from .builtin import stg128 as stg128  # noqa: F401
+ from .builtin import stg256 as stg256  # noqa: F401
+ from .builtin import any_sync as any_sync  # noqa: F401
+ from .builtin import all_sync as all_sync  # noqa: F401
++from .blockscaled_layout import BlockScaledLayout as BlockScaledLayout  # noqa: F401
++from .blockscaled_layout import e8m0_to_float as e8m0_to_float  # noqa: F401
+ from .fp8_op import fp8_scaled_matmul as fp8_scaled_matmul  # noqa: F401
+ from .builtin import ballot_sync as ballot_sync  # noqa: F401
+ from .builtin import ballot as ballot  # noqa: F401
+diff --git a/tilelang/language/blockscaled_layout.py b/tilelang/language/blockscaled_layout.py
+new file mode 100644
+index 0000000..fcdbba5
+--- /dev/null
++++ b/tilelang/language/blockscaled_layout.py
+@@ -0,0 +1,136 @@
++"""Block-scale layout primitives for TileLang FP8 DSL surfaces.
++
++The first consumer is Apple MXFP8/E8M0, where FP8 data remains e4m3 storage
++and a separate uint8 scale byte applies to each 32-value block along the
++contracted-K axis. The layout object is intentionally small: it carries the
++static metadata that schedulers need, while the scale tensors remain ordinary
++TileLang buffers.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Any
++
++from tilelang.tileop.metal_quant import e8m0_to_float
++
++E8M0_BLOCK_SIZE = 32
++E8M0_BLOCK_K32 = "e8m0_block_k32"
++E8M0_LAYOUT = "logical_unswizzled_k_axis_blocks"
++CONTRACTED_K_AXIS = "contracted_k"
++
++
++@dataclass(frozen=True)
++class BlockScaledLayout:
++    """Static block-scale metadata for FP8 scaled matmul-like operators.
++
++    ``scale_dtype="e8m0"`` with ``block_size=32`` describes the MXFP8 layout
++    used by Metal Path C:
++
++    * A scale shape is ``(K / 32,)``.
++    * B scale shape is ``(N, K / 32)`` for per-row scales.
++    * A broadcast B scale shape ``(K / 32,)`` is accepted for local probes.
++    * The scale block index is the contracted-K block, ``kb = k // 32``.
++    """
++
++    scale_dtype: str = "e8m0"
++    axis: str = CONTRACTED_K_AXIS
++    block_size: int = E8M0_BLOCK_SIZE
++    layout: str = E8M0_LAYOUT
++    allow_broadcast_b_scale: bool = True
++
++    def __post_init__(self) -> None:
++        if self.scale_dtype != "e8m0":
++            raise ValueError(
++                "BlockScaledLayout currently supports only scale_dtype='e8m0'"
++            )
++        if self.axis != CONTRACTED_K_AXIS:
++            raise ValueError(
++                "BlockScaledLayout currently supports only axis='contracted_k'"
++            )
++        if int(self.block_size) != E8M0_BLOCK_SIZE:
++            raise ValueError("E8M0 block-scale layout requires block_size=32")
++        if self.layout != E8M0_LAYOUT:
++            raise ValueError(
++                "E8M0 block-scale layout must be "
++                "'logical_unswizzled_k_axis_blocks'"
++            )
++
++    @classmethod
++    def e8m0_k32(cls) -> "BlockScaledLayout":
++        """Return the canonical logical unswizzled E8M0 K/32 layout."""
++
++        return cls(
++            scale_dtype="e8m0",
++            axis=CONTRACTED_K_AXIS,
++            block_size=E8M0_BLOCK_SIZE,
++            layout=E8M0_LAYOUT,
++        )
++
++    @property
++    def scale_format(self) -> str:
++        return E8M0_BLOCK_K32
++
++    @property
++    def scale_axis(self) -> str:
++        return CONTRACTED_K_AXIS
++
++    def scale_blocks(self, k_extent: int) -> int:
++        k_extent = int(k_extent)
++        if k_extent <= 0:
++            raise ValueError(f"block-scaled K extent must be positive, got {k_extent}")
++        if k_extent % E8M0_BLOCK_SIZE != 0:
++            raise ValueError(
++                f"e8m0_block_k32 requires K divisible by 32, got K={k_extent}"
++            )
++        return k_extent // E8M0_BLOCK_SIZE
++
++    def a_scale_shape(self, k_extent: int) -> tuple[int]:
++        return (self.scale_blocks(k_extent),)
++
++    def b_scale_shape(self, n_extent: int, k_extent: int) -> tuple[int, int]:
++        n_extent = int(n_extent)
++        if n_extent <= 0:
++            raise ValueError(f"block-scaled N extent must be positive, got {n_extent}")
++        return (n_extent, self.scale_blocks(k_extent))
++
++    def broadcast_b_scale_shape(self, k_extent: int) -> tuple[int]:
++        return (self.scale_blocks(k_extent),)
++
++    def scale_index(self, k: Any):
++        """Return the contracted-K scale block index for element ``k``."""
++
++        return k // 32
++
++    def decode(self, byte: Any):
++        return e8m0_to_float(byte)
++
++    def validate_scale_shapes(
++        self,
++        *,
++        k_extent: int,
++        a_scale_shape: tuple[int, ...],
++        b_scale_shape: tuple[int, ...],
++        n_extent: int | None = None,
++    ) -> None:
++        blocks = self.scale_blocks(k_extent)
++        if tuple(a_scale_shape) != (blocks,):
++            raise ValueError(
++                "A_scale for e8m0_block_k32 must have shape "
++                f"(K / 32,) == ({blocks},), got {a_scale_shape}"
++            )
++        if tuple(b_scale_shape) == (blocks,) and self.allow_broadcast_b_scale:
++            return
++        if n_extent is None:
++            raise ValueError(
++                "B_scale for e8m0_block_k32 must be broadcast (K / 32,) "
++                "or per-row (N, K / 32); n_extent is required to validate "
++                f"shape {b_scale_shape}"
++            )
++        expected = (int(n_extent), blocks)
++        if tuple(b_scale_shape) != expected:
++            raise ValueError(
++                "B_scale for e8m0_block_k32 must have shape "
++                f"(N, K / 32) == {expected} or broadcast ({blocks},), "
++                f"got {b_scale_shape}"
++            )
+diff --git a/tilelang/language/fp8_op.py b/tilelang/language/fp8_op.py
+index dc97ff5..1260c93 100644
+--- a/tilelang/language/fp8_op.py
++++ b/tilelang/language/fp8_op.py
+@@ -104,6 +104,13 @@ from tilelang._typing import BufferLikeType
+ from tvm import tir
+ from tvm.target import Target
+ 
++from .blockscaled_layout import (
++    BlockScaledLayout,
++    E8M0_BLOCK_K32,
++    E8M0_BLOCK_SIZE,
++    e8m0_to_float,
++)
++
+ __all__ = [
+     "fp8_scaled_matmul",
+     "FP8_DTYPES",
+@@ -146,7 +153,60 @@ def _shape_extent(buffer, axis: int) -> int:
+     return -1
+ 
+ 
+-def _validate_buffers(A_fp8, A_scale, B_fp8, B_scale, C_out, *, transpose_B: bool, accum_dtype: str) -> None:
++def _normalize_block_scale_layout(
++    block_scale_layout: BlockScaledLayout | None,
++    *,
++    scale_format: str | None,
++    scale_block_size: int | None,
++) -> BlockScaledLayout | None:
++    if block_scale_layout is not None:
++        if not isinstance(block_scale_layout, BlockScaledLayout):
++            raise TypeError(
++                "T.fp8_scaled_matmul block_scale_layout must be a "
++                "T.BlockScaledLayout instance"
++            )
++        if scale_format is not None and scale_format != block_scale_layout.scale_format:
++            raise ValueError(
++                "T.fp8_scaled_matmul scale_format conflicts with block_scale_layout"
++            )
++        if scale_block_size is not None and int(scale_block_size) != block_scale_layout.block_size:
++            raise ValueError(
++                "T.fp8_scaled_matmul scale_block_size conflicts with block_scale_layout"
++            )
++        return block_scale_layout
++    if scale_format is None and scale_block_size is None:
++        return None
++    if scale_format != E8M0_BLOCK_K32:
++        raise ValueError(
++            "T.fp8_scaled_matmul e8m0 block-scale metadata requires "
++            "scale_format='e8m0_block_k32'"
++        )
++    if scale_block_size is None or int(scale_block_size) != E8M0_BLOCK_SIZE:
++        raise ValueError(
++            "T.fp8_scaled_matmul e8m0_block_k32 metadata requires scale_block_size=32"
++        )
++    return BlockScaledLayout.e8m0_k32()
++
++
++def _block_scale_value(scale, *, axis: str, col, k):
++    # Path C E8M0 is explicitly contracted-K-block indexed: kb = k // 32.
++    kb = k // 32
++    if axis == "B" and len(getattr(scale, "shape", ())) == 2:
++        return e8m0_to_float(scale[col, kb])
++    return e8m0_to_float(scale[kb])
++
++
++def _validate_buffers(
++    A_fp8,
++    A_scale,
++    B_fp8,
++    B_scale,
++    C_out,
++    *,
++    transpose_B: bool,
++    accum_dtype: str,
++    block_scale_layout: BlockScaledLayout | None = None,
++) -> None:
+     """Sanity-check operand dtypes and 2D shape compatibility.
+ 
+     Raises ``TypeError`` / ``ValueError`` early so misuse surfaces at the
+@@ -168,13 +228,16 @@ def _validate_buffers(A_fp8, A_scale, B_fp8, B_scale, C_out, *, transpose_B: boo
+         raise TypeError(
+             f"T.fp8_scaled_matmul: B_fp8 must be FP8 (e4m3 or e5m2), got dtype={B_dtype!r}"
+         )
+-    if sa_dtype and not (sa_dtype.startswith("float32") or sa_dtype.startswith("float16") or sa_dtype.startswith("bfloat")):
++    scale_prefixes = ("float32", "float16", "bfloat")
++    if block_scale_layout is not None:
++        scale_prefixes = ("uint8",)
++    if sa_dtype and not sa_dtype.startswith(scale_prefixes):
+         raise TypeError(
+-            f"T.fp8_scaled_matmul: A_scale must be a floating-point scalar buffer, got dtype={sa_dtype!r}"
++            f"T.fp8_scaled_matmul: A_scale must be a {'uint8 E8M0 block-scale' if block_scale_layout is not None else 'floating-point scalar'} buffer, got dtype={sa_dtype!r}"
+         )
+-    if sb_dtype and not (sb_dtype.startswith("float32") or sb_dtype.startswith("float16") or sb_dtype.startswith("bfloat")):
++    if sb_dtype and not sb_dtype.startswith(scale_prefixes):
+         raise TypeError(
+-            f"T.fp8_scaled_matmul: B_scale must be a floating-point scalar buffer, got dtype={sb_dtype!r}"
++            f"T.fp8_scaled_matmul: B_scale must be a {'uint8 E8M0 block-scale' if block_scale_layout is not None else 'floating-point scalar'} buffer, got dtype={sb_dtype!r}"
+         )
+     if C_dtype and not (C_dtype.startswith("float32") or C_dtype.startswith("float16") or C_dtype.startswith("bfloat")):
+         raise TypeError(
+@@ -219,6 +282,14 @@ def _validate_buffers(A_fp8, A_scale, B_fp8, B_scale, C_out, *, transpose_B: boo
+ 
+     sa_size = _shape_extent(A_scale, 0)
+     sb_size = _shape_extent(B_scale, 0)
++    if block_scale_layout is not None:
++        block_scale_layout.validate_scale_shapes(
++            k_extent=K,
++            a_scale_shape=tuple(int(v) for v in A_scale.shape),
++            b_scale_shape=tuple(int(v) for v in B_scale.shape),
++            n_extent=N,
++        )
++        return
+     if M > 0 and sa_size > 0 and sa_size != 1 and sa_size != M:
+         raise ValueError(
+             f"T.fp8_scaled_matmul: A_scale must be per-tensor (size 1) or "
+@@ -240,7 +311,7 @@ def _validate_buffers(A_fp8, A_scale, B_fp8, B_scale, C_out, *, transpose_B: boo
+ 
+ 
+ @T.macro
+-def _fp8_scaled_matmul_macro(A_fp8, A_scale, B_fp8, B_scale, C_local):
++def _fp8_scaled_matmul_macro(A_fp8, A_scale, B_fp8, B_scale, C_local, block_scale_layout=None):
+     """Hygienic body of ``T.fp8_scaled_matmul``: dequant + per-element scale + FMA.
+ 
+     The body is parsed once at macro-decoration time and re-substituted at
+@@ -272,13 +343,17 @@ def _fp8_scaled_matmul_macro(A_fp8, A_scale, B_fp8, B_scale, C_local):
+         for k in T.serial(K_dim):
+             a_val = T.cast(A_fp8[i, k], "float32")
+             b_val = T.cast(B_fp8[k, j], "float32")
+-            sa = A_scale[0] if sa_size == 1 else A_scale[i]
+-            sb = B_scale[0] if sb_size == 1 else B_scale[j]
++            if block_scale_layout is not None:
++                sa = _block_scale_value(A_scale, axis="A", col=j, k=k)
++                sb = _block_scale_value(B_scale, axis="B", col=j, k=k)
++            else:
++                sa = A_scale[0] if sa_size == 1 else A_scale[i]
++                sb = B_scale[0] if sb_size == 1 else B_scale[j]
+             C_local[i, j] = C_local[i, j] + a_val * b_val * sa * sb
+ 
+ 
+ @T.macro
+-def _fp8_scaled_matmul_macro_trans_b(A_fp8, A_scale, B_fp8, B_scale, C_local):
++def _fp8_scaled_matmul_macro_trans_b(A_fp8, A_scale, B_fp8, B_scale, C_local, block_scale_layout=None):
+     """``transpose_B=True`` variant: B is (N, K) row-major, indexed B[j, k]."""
+     M_dim, K_dim = A_fp8.shape
+     N_dim, K_dim_b = B_fp8.shape
+@@ -289,8 +364,12 @@ def _fp8_scaled_matmul_macro_trans_b(A_fp8, A_scale, B_fp8, B_scale, C_local):
+         for k in T.serial(K_dim):
+             a_val = T.cast(A_fp8[i, k], "float32")
+             b_val = T.cast(B_fp8[j, k], "float32")
+-            sa = A_scale[0] if sa_size == 1 else A_scale[i]
+-            sb = B_scale[0] if sb_size == 1 else B_scale[j]
++            if block_scale_layout is not None:
++                sa = _block_scale_value(A_scale, axis="A", col=j, k=k)
++                sb = _block_scale_value(B_scale, axis="B", col=j, k=k)
++            else:
++                sa = A_scale[0] if sa_size == 1 else A_scale[i]
++                sb = B_scale[0] if sb_size == 1 else B_scale[j]
+             C_local[i, j] = C_local[i, j] + a_val * b_val * sa * sb
+ 
+ 
+@@ -304,6 +383,9 @@ def fp8_scaled_matmul(
+     transpose_B: bool = False,
+     accum_dtype: str = "float32",
+     target: Optional[Target] = None,  # accepted for API compat, currently unused
++    scale_format: str | None = None,
++    scale_block_size: int | None = None,
++    block_scale_layout: BlockScaledLayout | None = None,
+ ):
+     """Scaled FP8 matmul intrinsic — accumulate scaled FP8 product into ``C``.
+ 
+@@ -369,11 +451,16 @@ def fp8_scaled_matmul(
+             ``N`` mismatch, or scale shapes that are neither 1 nor
+             matching).
+     """
++    layout = _normalize_block_scale_layout(
++        block_scale_layout,
++        scale_format=scale_format,
++        scale_block_size=scale_block_size,
++    )
+     _validate_buffers(
+         A_fp8, A_scale, B_fp8, B_scale, C_out,
+-        transpose_B=transpose_B, accum_dtype=accum_dtype,
++        transpose_B=transpose_B, accum_dtype=accum_dtype, block_scale_layout=layout,
+     )
+ 
+     if transpose_B:
+-        return _fp8_scaled_matmul_macro_trans_b(A_fp8, A_scale, B_fp8, B_scale, C_out)
+-    return _fp8_scaled_matmul_macro(A_fp8, A_scale, B_fp8, B_scale, C_out)
++        return _fp8_scaled_matmul_macro_trans_b(A_fp8, A_scale, B_fp8, B_scale, C_out, layout)
++    return _fp8_scaled_matmul_macro(A_fp8, A_scale, B_fp8, B_scale, C_out, layout)
+diff --git a/tilelang/tileop/metal_quant.py b/tilelang/tileop/metal_quant.py
+index c6b25d2..c10c3e2 100644
+--- a/tilelang/tileop/metal_quant.py
++++ b/tilelang/tileop/metal_quant.py
+@@ -107,7 +107,15 @@ def fp4_e2m1fn_to_float(bits, nibble_index):
+ 
+ 
+ def e8m0_to_float(bits):
+-    """Decode torch.float8_e8m0fnu-compatible scale byte to fp32."""
++    """Decode an E8M0 scale byte to fp32.
++
++    Path C treats byte 0 and byte 0xFF as sentinels that decode to zero.
++    Normal bytes decode as ``2 ** (byte - 127)``.
++    """
+     bits_i = T.Cast("int32", bits)
+     value = T.exp2(T.Cast(FP32, bits_i - T.int32(127)))
+-    return T.if_then_else(bits_i == T.int32(255), T.float32(0.0), value)
++    return T.if_then_else(
++        bits_i == T.int32(0),
++        T.float32(0.0),
++        T.if_then_else(bits_i == T.int32(255), T.float32(0.0), value),
++    )
