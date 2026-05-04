@@ -1,4 +1,4 @@
-From a69d6df75b46d7f0eca2eab205a901bc45c6a6af Mon Sep 17 00:00:00 2001
+From 117c26a01e14d997a257616e3d220bd278cf9053 Mon Sep 17 00:00:00 2001
 From: David Gornshtein <davidgornshtein@gmail.com>
 Date: Sun, 3 May 2026 14:41:17 +0200
 Subject: [PATCH] tilelang: allow mixed-dtype T.gemm via Metal scalar fallback
@@ -56,11 +56,11 @@ Tests:
  4 files changed, 169 insertions(+), 9 deletions(-)
 
 diff --git a/testing/python/metal/test_metal_codegen_linux.py b/testing/python/metal/test_metal_codegen_linux.py
-index 6194e411..8d417be6 100644
+index 690a0a3..e7d4b16 100644
 --- a/testing/python/metal/test_metal_codegen_linux.py
 +++ b/testing/python/metal/test_metal_codegen_linux.py
-@@ -303,6 +303,61 @@ def test_t_gemm_attention_like_metal_codegen_float32():
-     assert_attention_like_metal_codegen(16, 16, 16)
+@@ -68,5 +68,60 @@ def test_metal_codegen_int32():
+     assert_metal_codegen(1024, 1024, 1024, 16, 16, 16, dtype=T.int32)
  
  
 +def attention_chain_mixed_dtype():
@@ -118,14 +118,13 @@ index 6194e411..8d417be6 100644
 +    assert_attention_chain_mixed_dtype_metal_codegen()
 +
 +
- def test_mixed_shared_merge_metal_codegen():
-     assert_mixed_shared_merge_metal_codegen()
- 
+ if __name__ == "__main__":
+     tilelang.testing.main()
 diff --git a/tilelang/tileop/gemm/__init__.py b/tilelang/tileop/gemm/__init__.py
-index 5be39750..faaedb1a 100644
+index 8117f83..075f344 100644
 --- a/tilelang/tileop/gemm/__init__.py
 +++ b/tilelang/tileop/gemm/__init__.py
-@@ -164,6 +164,13 @@ class Gemm(Node, Scriptable):
+@@ -163,6 +163,13 @@ class Gemm(Node, Scriptable):
          6. METAL_SIMDGROUP for Metal target (simdgroup_matrix)
          7. Scalar for CPU target (scalar fallback)
  
@@ -139,7 +138,7 @@ index 5be39750..faaedb1a 100644
          Args:
              thread_nums: Number of threads in the block
              target: Target architecture
-@@ -172,9 +179,32 @@ class Gemm(Node, Scriptable):
+@@ -171,9 +178,32 @@ class Gemm(Node, Scriptable):
              GemmInst: The selected GEMM instruction type
          """
          if target_is_metal(target):
@@ -173,7 +172,7 @@ index 5be39750..faaedb1a 100644
          """Get the appropriate implementation class for the given GEMM instruction.
  
 diff --git a/tilelang/tileop/gemm/gemm_base.py b/tilelang/tileop/gemm/gemm_base.py
-index 95f69bbf..bf3d2880 100644
+index 95f69bb..620cdaf 100644
 --- a/tilelang/tileop/gemm/gemm_base.py
 +++ b/tilelang/tileop/gemm/gemm_base.py
 @@ -82,12 +82,33 @@ class GemmBase:
@@ -212,7 +211,7 @@ index 95f69bbf..bf3d2880 100644
      def accum_dtype(self) -> str:
          return self.C.dtype
 diff --git a/tilelang/transform/metal_fragment_to_simdgroup.py b/tilelang/transform/metal_fragment_to_simdgroup.py
-index 0b5dd1bd..dad10876 100644
+index 0b5dd1b..b01fc02 100644
 --- a/tilelang/transform/metal_fragment_to_simdgroup.py
 +++ b/tilelang/transform/metal_fragment_to_simdgroup.py
 @@ -31,22 +31,76 @@ def _extract_buffer_var_from_region(region_call):

@@ -1,8 +1,42 @@
 # TileLang patch: allow mixed-dtype T.gemm via Metal scalar fallback
 
 Artifact: 0001-tilelang-allow-mixed-gemm-dtypes.patch
-Authored against: tile-ai/tilelang apple-head branch (HEAD: 7f4a5cb8 "Preserve Metal reduce thread range")
-Local branch: cppmega/gemm-mixed-dtype-metal @ a69d6df7
+Applies cleanly on: jorgecurious/tilelang:metal-gemm-upstream-rebase
+(PR #2130 base) at HEAD 971c17b "fix(metal): harden simdgroup store
+lowering". This is the most upstream-rebased branch that already stacks
+the Apple Metal landing on top of public tile-ai/tilelang main.
+Patch sha (regenerated 2026-05-03): 117c26a01e14d997a257616e3d220bd278cf9053.
+
+## Stacking topology
+
+This patch is a stacked PR. It depends on three OPEN PRs against
+tile-ai/tilelang main being merged first; until then it must be filed as
+a stacked PR on top of #2130. Every dependency is publicly visible at the
+listed branch URLs - none of them require a private fork.
+
+| Layer | PR    | Author      | Branch                                                                                            | What it lands                                                          |
+| ----- | ----- | ----------- | ------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| 1     | #1869 | oraluben    | https://github.com/oraluben/tilelang/tree/metal-gemm                                              | Initial Apple Metal GEMM lowering (simdgroup_matrix_multiply)          |
+| 2     | #2118 | cklxx       | https://github.com/cklxx/tilelang/tree/metal-gemm-scalar-fallback                                 | GemmMetalScalar scalar fallback path used by this patch                |
+| 3     | #2130 | jorgecurious| https://github.com/jorgecurious/tilelang/tree/metal-gemm-upstream-rebase                          | Upstream-rebase + simdgroup-store hardening; current direct base       |
+| 4     | this  | cppmega.mlx | this patch                                                                                        | Mixed-dtype T.gemm dispatcher + MetalFragmentToSimdgroup conservatism  |
+
+When upstream main lands #1869 + #2118 + #2130, this patch becomes a
+direct PR against tile-ai/tilelang main. Until then, file it as a
+follow-up PR with #2130 as the base.
+
+## Test file path
+
+The new unit test lands in
+testing/python/metal/test_metal_codegen_linux.py
+(appended before if __name__ == "__main__"). The jorgecurious base
+ships a slim 72-line version of this file - the apple-head fork's
+expanded test suite (assert_attention_like_metal_codegen,
+test_mixed_shared_merge_metal_codegen, etc.) has not yet been upstreamed,
+so the patch's test hunk targets the end of the slim file rather than
+inserting after test_t_gemm_attention_like_metal_codegen_float32 as on
+apple-head. The added function bodies are byte-identical to apple-head -
+only the surrounding context is different.
 
 ## Blocker
 
@@ -162,14 +196,17 @@ supports mixed-input simdgroup MMA or an explicit pre-cast/fused-load strategy.
   3rdparty/tvm changes, no codegen_metal.cc changes.
 * **Backwards compatible** — when A and B share a dtype, the
   dispatch and rewrite both produce the same IR as before.
-* **Targets apple-head / Metal-dev** — applies cleanly on top of the branch
-  that already contains PR #2118's GemmMetalScalar lowering.
+* **Targets jorgecurious metal-gemm-upstream-rebase (PR #2130)** —
+  applies cleanly at HEAD 971c17b. That branch stacks PR #1869 +
+  PR #2118 (the GemmMetalScalar lowering this patch depends on) on top
+  of a recent tile-ai/tilelang main. See the "Stacking topology" section
+  above for the full dependency chain.
 * **Needs refresh for current public main** — on fresh tile-ai/tilelang main
-  at 2eec5f0, git apply --check fails because the public tree has drifted:
-  tilelang/transform/metal_fragment_to_simdgroup.py is absent and the
-  test_metal_codegen_linux.py / tilelang/tileop/gemm/__init__.py hunks no
-  longer match. Refresh this patch against the actual upstream PR base before
-  submitting it.
+  git apply --check fails because the public tree has drifted: the file
+  tilelang/transform/metal_fragment_to_simdgroup.py is absent (it lands
+  via PR #1869 / #2118 / #2130). Once those PRs merge, this patch can be
+  re-targeted directly to upstream main without context changes — only
+  the base branch name changes.
 * **One follow-up could mirror this on CUDA / ROCm**: route to a
   scalar fallback when A.dtype != B.dtype and the chosen MMA emitter
   would refuse same-dtype inputs. Out of scope here — left for the
@@ -178,9 +215,11 @@ supports mixed-input simdgroup MMA or an explicit pre-cast/fused-load strategy.
 ## Reproduction
 
 bash
-cd /tmp/tilelang_apple_head/tilelang
+git clone --branch metal-gemm-upstream-rebase \
+    https://github.com/jorgecurious/tilelang.git tilelang_gemm_rebase
+cd tilelang_gemm_rebase
+git submodule update --init --depth 1 3rdparty/tvm
 git apply /Volumes/external/sources/cppmega.mlx/docs/upstream/tilelang_gemm_mixed_dtype/0001-tilelang-allow-mixed-gemm-dtypes.patch
-ninja -C build -j$(sysctl -n hw.ncpu) tilelang_objs   # Python-only patch — no rebuild needed
-.venv/bin/python /Volumes/external/sources/cppmega.mlx/docs/upstream/test_sparse_mla_pipeline.py
+# Python-only patch — no native rebuild needed
 .venv/bin/python -m pytest testing/python/metal/test_metal_codegen_linux.py::test_attention_chain_mixed_dtype_metal_codegen -v
 

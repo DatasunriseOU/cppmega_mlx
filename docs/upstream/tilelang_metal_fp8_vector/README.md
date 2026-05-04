@@ -2,28 +2,63 @@
 
 ## Packaging status
 
-Regenerated 2026-05-03; the recorded round-trip receipt was against an
-apple-head@7f4a5cb8 checkout with the storage-only FP8 patch (#5) applied:
+Rebased 2026-05-03 onto jorgecurious/tilelang's
+`metal-gemm-upstream-rebase` branch (PR #2130, HEAD `971c17b`). Applies
+cleanly on top of the `tilelang_metal_fp8` storage-only patch:
 
 ```
+# clean checkout of jorgecurious/tilelang:metal-gemm-upstream-rebase @ 971c17b
+git apply  docs/upstream/tilelang_metal_fp8/0001-metal-fp8-storage-only.patch         -> OK
 git apply --check  docs/upstream/tilelang_metal_fp8_vector/0001-metal-fp8-vector-cast.patch  -> OK
 git apply          docs/upstream/tilelang_metal_fp8_vector/0001-metal-fp8-vector-cast.patch  -> OK
 git apply --reverse docs/upstream/tilelang_metal_fp8_vector/0001-metal-fp8-vector-cast.patch  -> OK
 ```
 
-Stack-apply order (against clean apple-head@7f4a5cb8):
+## Stacking topology
 
-1. tilelang_gemm_mixed_dtype (#3) — independent, applies first
-2. tilelang_metal_pipelined  (#4) — independent
-3. tilelang_metal_fp8        (#5) — required prereq for #7 (this patch
-   extends the FP8 prelude added by #5; both touch the same files in
-   src/target/codegen_metal.{cc,h} and 3rdparty/tvm/src/target/source/codegen_metal.{cc,h})
-4. tilelang_metal_fp8_vector (#7) — this patch.
+This patch stacks on the following upstream PRs (all already merged into
+or open against tile-ai/tilelang's `metal-gemm-upstream-rebase` lane), in
+addition to our own storage-only prereq:
 
-Before filing, re-run the same `git apply --check` / `git apply --reverse
---check` sequence on a fresh intended TileLang base. Do not file from this
-README alone if the current PR-prep lane still reports a corrupt-patch or
-line-73 apply failure; regenerate the patch from the clean checkout first.
+1. tile-ai/tilelang **#1869** — initial Apple Metal landing
+2. tile-ai/tilelang **#2118** — Metal pipelined stages
+3. tile-ai/tilelang **#2121** — CodeGen refactor that reformatted
+   `src/target/codegen_metal.cc`
+4. tile-ai/tilelang **#2130** — `metal-gemm-upstream-rebase`
+   (jorgecurious branch URL:
+   https://github.com/jorgecurious/tilelang/tree/metal-gemm-upstream-rebase
+   @ HEAD `971c17b`)
+5. our `docs/upstream/tilelang_metal_fp8/0001-metal-fp8-storage-only.patch`
+   — required prereq for this patch (extends the FP8 prelude added by it)
+
+The patch keeps its two-half nature: it modifies both
+`src/target/codegen_metal.{cc,h}` (Tilelang side) and
+`3rdparty/tvm/src/target/source/codegen_metal.{cc,h}` (vendored TVM
+mirror). When filing upstream, the TVM-mirror half belongs in
+apache/tvm; the Tilelang half belongs in tile-ai/tilelang. They can be
+landed independently because they only share helper names.
+
+## Drift handled in this rebase
+
+The `tilelang_metal_fp8` prereq adds, on the TVM-mirror side, a
+4-line comment block above the `LOG(FATAL)` for the unsupported vector
+case (lines like
+`// Vector path: not supported by this storage-only patch; ...`).
+This rebase replaces the comment block + `LOG(FATAL)` together with the
+new vector path body and a tightened `LOG(FATAL)` covering only
+lanes outside 2/3/4 (semantically identical to the original patch
+aside from the wording tweak). The Tilelang-side context did not have
+the extra comment block, so its hunk reuses the same delete shape.
+
+Diff stat after rebase:
+
+```
+src/target/codegen_metal.h                       +7 / -0
+src/target/codegen_metal.cc                      +96 / -3
+3rdparty/tvm/src/target/source/codegen_metal.h   +7 / -0
+3rdparty/tvm/src/target/source/codegen_metal.cc  +95 / -7
+(345 lines total in patch file, regenerated 2026-05-03)
+```
 
 ## Blocker
 
@@ -88,32 +123,26 @@ https://github.com/audiohacking/fp8-mps-metal for this patch — but the
 fp8_scaled_matmul kernel in that repo is the canonical Apple Silicon
 FP8 loadout and motivates the requirement to keep vector FP8 casts cheap.
 
-## Diff stat
-
-```
-4 files changed, ~280 insertions(+), 6 deletions(-)
-  src/target/codegen_metal.h                       +9 / -1
-  src/target/codegen_metal.cc                      +94 / -2
-  3rdparty/tvm/src/target/source/codegen_metal.h   +9 / -1
-  3rdparty/tvm/src/target/source/codegen_metal.cc  +96 / -2
-  (335 lines total in patch file, regenerated 2026-05-03)
-```
-
-
 ## Test results
 
-### Artifact check — fresh apple-head clone (2026-05-03 regeneration)
+### Artifact check — fresh jorgecurious rebase clone (2026-05-03 rebase)
 
 ```
-cd /tmp/verify_p7
-git apply --check  docs/upstream/tilelang_metal_fp8_vector/0001-metal-fp8-vector-cast.patch  -> OK
-git apply          docs/upstream/tilelang_metal_fp8_vector/0001-metal-fp8-vector-cast.patch  -> OK
-git apply --reverse docs/upstream/tilelang_metal_fp8_vector/0001-metal-fp8-vector-cast.patch  -> OK
+cd /tmp/upstream_pr_check/tilelang_fp8vec_rebase  # @ 971c17b
+git apply           tilelang_metal_fp8/0001-metal-fp8-storage-only.patch        -> OK
+git apply --check   tilelang_metal_fp8_vector/0001-metal-fp8-vector-cast.patch  -> OK
+git apply           tilelang_metal_fp8_vector/0001-metal-fp8-vector-cast.patch  -> OK
+git apply --reverse tilelang_metal_fp8_vector/0001-metal-fp8-vector-cast.patch  -> OK
 ```
 
-Verified against apple-head@7f4a5cb8 with TVM submodule
-0e15b274bce8b46f971abf5ac390e844aa6acee5 and the storage-only FP8 patch (#5)
-applied as a prereq.
+Verified against jorgecurious/tilelang `metal-gemm-upstream-rebase` HEAD
+`971c17b` with TVM submodule `0e15b274bce8b46f971abf5ac390e844aa6acee5`
+and the `tilelang_metal_fp8` storage-only patch applied as a prereq.
+
+The historical "corrupt patch / line 73 apply failure" against
+apple-head was caused by the CodeGen reformat introduced in PR #2121;
+this rebase resolves it by rewriting the hunks against the post-#2121
+file layout and the post-prereq LOG(FATAL) comment block.
 
 ### Direct probe — /tmp/test_fp8_vector_cast.py
 
@@ -188,28 +217,30 @@ fewer scalarized loads / stores or lower cast overhead.
 
 ## Upstream-PR readiness
 
-**For tile-ai/tilelang**: Clean follow-up to the storage-only patch (#5).
-The artifact passes `git apply --check` and `git apply --reverse --check` on
-fresh apple-head@7f4a5cb8 with #5 applied as prereq.
+**For tile-ai/tilelang**: Clean follow-up to the `tilelang_metal_fp8`
+storage-only patch. The artifact passes `git apply --check` and
+`git apply --reverse --check` on fresh
+`jorgecurious/tilelang:metal-gemm-upstream-rebase` (PR #2130) at HEAD
+`971c17b` with `tilelang_metal_fp8` applied as prereq.
 
-**For apache/tvm**: The mirror change in 3rdparty/tvm/src/target/source/
-should be included when filing upstream, because apache/tvm's
-own codegen_metal.cc needs the same vector helper surface. If apache/tvm
-doesn't yet have the storage-only patch, both halves should be combined into a
-single TVM PR with the storage-only patch as the base.
+**For apache/tvm**: The mirror change in `3rdparty/tvm/src/target/source/`
+should be included when filing upstream, because apache/tvm's own
+`codegen_metal.cc` needs the same vector helper surface. If apache/tvm
+doesn't yet have the storage-only patch, both halves should be combined
+into a single TVM PR with the storage-only patch as the base.
 
 **Splittable**: Yes. The TVM half can land first (carries the prelude +
-vector helpers), the TileLang half second (uses the same helper names).
+vector helpers), the Tilelang half second (uses the same helper names).
 
 ## How to apply
 
 ```bash
-cd /tmp/tilelang_apple_head/tilelang
+# clean checkout of jorgecurious/tilelang:metal-gemm-upstream-rebase @ 971c17b
 git apply /Volumes/external/sources/cppmega.mlx/docs/upstream/tilelang_metal_fp8/0001-metal-fp8-storage-only.patch
 git apply /Volumes/external/sources/cppmega.mlx/docs/upstream/tilelang_metal_fp8_vector/0001-metal-fp8-vector-cast.patch
 cd build && ninja -j$(sysctl -n hw.ncpu)
 ```
 
-Already applied in /tmp/tilelang_apple_head/tilelang for the cppmega.mlx
-editable install. The patch file in this directory is round-trip verified
-on fresh apple-head@7f4a5cb8 + #5 baseline.
+The patch file in this directory is round-trip verified on fresh
+`jorgecurious/tilelang:metal-gemm-upstream-rebase` @ `971c17b` with the
+`tilelang_metal_fp8` prereq applied first.

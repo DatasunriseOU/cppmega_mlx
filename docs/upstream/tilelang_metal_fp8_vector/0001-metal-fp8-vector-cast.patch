@@ -25,10 +25,16 @@ Wider lanes (8 / 16) are not yet wired; they are documented as
 
 Files (mirrored across both TileLang src/target/ and the vendored
 3rdparty/tvm/src/target/source/ codepaths):
-  src/target/codegen_metal.h                       +9 / -1
-  src/target/codegen_metal.cc                      +94 / -2
-  3rdparty/tvm/src/target/source/codegen_metal.h   +9 / -1
-  3rdparty/tvm/src/target/source/codegen_metal.cc  +96 / -2
+  src/target/codegen_metal.h                       +7 / -0
+  src/target/codegen_metal.cc                      +96 / -3
+  3rdparty/tvm/src/target/source/codegen_metal.h   +7 / -0
+  3rdparty/tvm/src/target/source/codegen_metal.cc  +95 / -7
+
+Rebased 2026-05-03 onto jorgecurious/tilelang:metal-gemm-upstream-rebase
+(PR #2130, HEAD 971c17b) on top of the tilelang_metal_fp8 prereq patch.
+The TVM-mirror prereq adds a comment block above the LOG(FATAL); this
+rebase replaces both the comment block and the FATAL with the vector
+path so wider-lane callers still get a clear FATAL.
 
 Tested against /tmp/test_fp8_vector_cast.py:
   - scalar baseline: PASS (Agent C path)
@@ -39,10 +45,10 @@ No regressions in testing/python/metal/test_metal_codegen_linux.py
 
 ---
 diff --git a/src/target/codegen_metal.cc b/src/target/codegen_metal.cc
-index 9c84e77e..f1aa6104 100644
+index 025a98e..7c5ccad 100644
 --- a/src/target/codegen_metal.cc
 +++ b/src/target/codegen_metal.cc
-@@ -150,6 +150,53 @@ void CodeGenTileLangMetal::PrintFP8Prelude(std::ostream &os) {
+@@ -149,6 +149,53 @@ void CodeGenTileLangMetal::PrintFP8Prelude(std::ostream &os) {
        "}\n\n";
  }
  
@@ -96,7 +102,7 @@ index 9c84e77e..f1aa6104 100644
  void CodeGenTileLangMetal::AddFunction(const GlobalVar &gvar,
                                         const PrimFunc &func) {
    // NOTE: There is no inter-function calls among Metal kernels.
-@@ -675,9 +722,52 @@ void CodeGenTileLangMetal::VisitExpr_(const CastNode *op,
+@@ -673,9 +720,52 @@ void CodeGenTileLangMetal::VisitExpr_(const CastNode *op,
        }
        return;
      }
@@ -152,7 +158,7 @@ index 9c84e77e..f1aa6104 100644
    }
    CodeGenC::VisitExpr_(op, os);
  }
-@@ -687,6 +777,9 @@ std::string CodeGenTileLangMetal::Finish() {
+@@ -685,6 +775,9 @@ std::string CodeGenTileLangMetal::Finish() {
    if (enable_fp8_) {
      PrintFP8Prelude(prelude);
    }
@@ -163,7 +169,7 @@ index 9c84e77e..f1aa6104 100644
    if (prelude.str().empty())
      return base;
 diff --git a/src/target/codegen_metal.h b/src/target/codegen_metal.h
-index f2f41e40..4ff284e7 100644
+index f2f41e4..4ff284e 100644
 --- a/src/target/codegen_metal.h
 +++ b/src/target/codegen_metal.h
 @@ -73,12 +73,19 @@ public:
@@ -187,10 +193,10 @@ index f2f41e40..4ff284e7 100644
  };
  } // namespace codegen
 diff --git a/3rdparty/tvm/src/target/source/codegen_metal.cc b/3rdparty/tvm/src/target/source/codegen_metal.cc
-index 893ba4996..0cbeb6dbd 100644
+index b8bf845..74eeec8 100644
 --- a/3rdparty/tvm/src/target/source/codegen_metal.cc
 +++ b/3rdparty/tvm/src/target/source/codegen_metal.cc
-@@ -166,6 +166,51 @@ void CodeGenMetal::PrintFP8Prelude(std::ostream& os) {
+@@ -163,6 +163,51 @@ void CodeGenMetal::PrintFP8Prelude(std::ostream& os) {
        "}\n\n";
  }
  
@@ -242,10 +248,14 @@ index 893ba4996..0cbeb6dbd 100644
  void CodeGenMetal::AddFunction(const GlobalVar& gvar, const PrimFunc& func) {
    // NOTE: There is no inter-function calls among Metal kernels.
    // For now we keep the metal codegen without inter-function call
-@@ -587,9 +632,53 @@ void CodeGenMetal::VisitExpr_(const CastNode* op, std::ostream& os) {  // NOLINT
+@@ -584,13 +629,53 @@ void CodeGenMetal::VisitExpr_(const CastNode* op, std::ostream& os) {  // NOLINT
        }
        return;
      }
+-    // Vector path: not supported by this storage-only patch; defer to scalarised
+-    // emulation by emitting per-lane casts via CodeGenC's lane-by-lane fallback.
+-    // Falling through to CodeGenC will produce raw uchar<->float casts which
+-    // are wrong for FP8 semantics; warn loudly so callers know to scalarise.
 -    LOG(FATAL) << "Vector FP8 casts (lanes=" << target_ty.lanes()
 -               << ") are not yet supported by Metal storage-only FP8 emulation;"
 -               << " scalarise the cast or extend codegen_metal.cc.";
@@ -299,7 +309,7 @@ index 893ba4996..0cbeb6dbd 100644
    }
    CodeGenC::VisitExpr_(op, os);
  }
-@@ -602,6 +691,9 @@ std::string CodeGenMetal::Finish() {
+@@ -603,6 +688,9 @@ std::string CodeGenMetal::Finish() {
    if (enable_fp8_) {
      PrintFP8Prelude(prelude);
    }
@@ -310,7 +320,7 @@ index 893ba4996..0cbeb6dbd 100644
    if (prelude.str().empty()) return base;
    // Find the spot right after `using namespace metal;` to inject the helpers
 diff --git a/3rdparty/tvm/src/target/source/codegen_metal.h b/3rdparty/tvm/src/target/source/codegen_metal.h
-index 97bb6071f..026eea5cd 100644
+index 97bb607..026eea5 100644
 --- a/3rdparty/tvm/src/target/source/codegen_metal.h
 +++ b/3rdparty/tvm/src/target/source/codegen_metal.h
 @@ -68,12 +68,19 @@ class CodeGenMetal final : public CodeGenC {
