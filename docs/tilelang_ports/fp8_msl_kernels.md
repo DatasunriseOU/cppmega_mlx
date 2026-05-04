@@ -32,13 +32,19 @@ Apple Silicon (through M5 / MSL 4.0) has no native FP8 hardware path:
 - TileLang TVM-Metal codegen errors on float8_e4m3 -> Metal type
   conversion (3rdparty/tvm/src/target/source/codegen_metal.cc:271).
 
-Instead we treat FP8 as **storage-only**:
+Path B therefore treats FP8 as **storage-only**:
 
 1. Quantize: float -> uint8 via the integer-bit-manipulation encode with
    round-half-to-even (banker's rounding).
 2. Dequantize: uint8 -> float via a 256-entry LUT in MSL constant memory
    (single load, no branching).
 3. Matmul: dequant in-register, fp32 fma accumulation, fp32 output.
+
+Path C now uses the same storage-only premise for the receipted TileLang
+128x128x128 per-tensor case, but takes the faster route through TileLang's
+Metal FP8 GEMM lowering: decode the FP8 shared tiles once into `threadgroup
+half`, synchronize, then feed the existing FP16 `simdgroup_matrix` MMA
+sequence. This is still not native FP8 MMA; it is FP8 storage plus FP16 MMA.
 
 ## Kernel surface
 
@@ -94,6 +100,58 @@ Headline numbers:
   elements, so runtime quantization is cheap relative to the matmul.
 - **50% memory savings on FP8 storage** is preserved end-to-end (32 MB
   of fp16 weights becomes 16 MB of uint8 e4m3fn).
+
+## Path C comparison
+
+The Path C bench harness is `scripts/bench_tilelang_fp8_path_c.py`; its strict
+gate requires Path C and Path B to run, Path C median ratio to be `<= 1.0`, and
+Path C vs Path B parity to stay within `1e-5` max abs/rel for parity-enabled
+shapes.
+
+Current checked and live receipts for `matmul_128` use the compact simdgroup
+MSL path, not the older scalar fallback:
+
+| Receipt | Path B median ms | Path C median ms | Paired Path C / Path B | Parity max abs / rel | Source markers |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `bench/tilelang_ports/fp8_path_c_vs_path_b.json` | 0.1227 | 0.1076 | 0.890x | 0.0 / 0.0 | `simdgroup_multiply_accumulate=1`, `threadgroup_half=2`, `fp8_e4m3_lut=0` |
+| `bench/tilelang_ports/fp8_path_c.json` | 0.1521 | 0.1362 | 0.896x | 0.0 / 0.0 | same |
+| `/tmp/fp8_path_c_matmul128_before.json` (Lane 6 live run, 3 warmups / 8 iters, `--skip-xcrun`) | 0.2068 | 0.1738 | 0.835x | 0.0 / 0.0 | same |
+
+Path B remains valuable as the generic direct-MLX MSL fallback and correctness
+oracle. Path C is the preferred measured route only for the shapes and scale
+layouts covered by the strict receipts; larger or per-row/per-block shapes
+still need fresh receipts before claiming the same performance relationship.
+
+## Path C vecmat gate (Lane 7)
+
+Path C now matches the Path B M=1 vecmat hot loop for the 4096x4096 gate:
+
+- Runtime body: `thread_index_in_simdgroup`, `reinterpret_cast<device const uint*>`
+  packed FP8 loads, LUT-backed dot4 decode, and literal `simd_sum(sum)`.
+- Launch shape: four SIMD groups per threadgroup, `threadgroup=(128, 1, 1)`,
+  with one SIMD group producing one output row.
+- Dispatch shape: direct MLX tuple dispatch returns `(N,)`, avoiding the older
+  TileLang buffer-map reshape path for the production reducer.
+- Strict local receipt:
+  `bench/tilelang_ports/lane7_fp8_vecmat_4096.json`, generated with
+  `scripts/bench_tilelang_fp8_path_c.py --shapes vecmat_4096 --warmup 10
+  --iters 50 --skip-sparse --strict --max-ratio 1.0`.
+
+Latest strict result on Davids-Mac-Studio.local (MLX 0.31.1):
+
+| Shape | Path B median ms | Path C median ms | Paired median ratio | Parity vs Path B |
+| --- | ---: | ---: | ---: | --- |
+| M=1,N=4096,K=4096 | 0.242562 | 0.238667 | 0.980702x | max_abs=0.0, max_rel=0.0 |
+
+The blocker list is empty for this gate:
+`path_b_fast_path_ready=true`, `missing=[]`, with runtime markers
+`packed_uint_loads=2`, `fp8_e4m3_lut=8`, and `simd_sum=1`.
+
+External check: current MLX custom Metal kernels support the raw MSL body/header
+path used here, and TileLang's public Metal backend landed separately upstream
+in `tile-ai/tilelang` PR #799. There is still no native Apple FP8 MMA path, so
+this gate is about matching the scalar-LUT vecmat reducer, not turning FP8
+matmul into a tensor-core-style path.
 
 ## How this complements the existing FP8 path
 

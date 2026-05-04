@@ -10,9 +10,11 @@ import pytest
 import cppmega_mlx.inference as inference
 from cppmega_mlx.inference import (
     ContiguousKVCache,
+    GenerationChunk,
     generate_tokens,
     generate_tokens_with_kv_cache,
     next_token_logits,
+    stream_generate_tokens,
 )
 from cppmega_mlx.models.hybrid_lm import HybridTinyConfig, HybridTinyLM
 
@@ -574,6 +576,225 @@ def test_real_hybrid_tiny_lm_greedy_kv_cache_matches_full_prefix_generation() ->
     np.testing.assert_array_equal(_as_numpy(cached), _as_numpy(full_prefix))
 
 
+def test_stream_generate_tokens_yields_per_token_chunks_and_final_length() -> None:
+    model = _ScriptedLogitsModel([[4], [5], [6]])
+    prompt = mx.array([[1, 2, 3]], dtype=mx.int32)
+
+    chunks = list(
+        stream_generate_tokens(
+            model,
+            prompt,
+            max_new_tokens=3,
+            temperature=0.0,
+        )
+    )
+
+    assert [chunk.finish_reason for chunk in chunks] == [None, None, "length"]
+    np.testing.assert_array_equal(
+        _as_numpy(chunks[0].token_ids),
+        np.array([[4]], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(
+        _as_numpy(chunks[-1].tokens),
+        np.array([[1, 2, 3, 4, 5, 6]], dtype=np.int32),
+    )
+    assert model.seen_shapes == [(1, 3), (1, 4), (1, 5)]
+
+
+def test_stream_generate_tokens_stops_on_eos_and_decodes_text() -> None:
+    eos = 2
+    model = _ScriptedLogitsModel([[4], [eos], [6]])
+    prompt = mx.array([[1]], dtype=mx.int32)
+
+    chunks = list(
+        stream_generate_tokens(
+            model,
+            prompt,
+            max_new_tokens=3,
+            eos_token_id=eos,
+            temperature=0.0,
+            decode_token=lambda token_id: f"<{token_id}>",
+        )
+    )
+
+    assert [chunk.text for chunk in chunks] == ["<4>", "<2>"]
+    assert [chunk.finish_reason for chunk in chunks] == [None, "eos"]
+    np.testing.assert_array_equal(
+        _as_numpy(chunks[-1].tokens),
+        np.array([[1, 4, eos]], dtype=np.int32),
+    )
+    assert model.calls == 2
+
+
+def test_stream_generate_tokens_returns_no_chunks_for_zero_new_tokens() -> None:
+    model = _ScriptedLogitsModel([[4]])
+    prompt = mx.array([[1, 2]], dtype=mx.int32)
+
+    chunks = list(stream_generate_tokens(model, prompt, max_new_tokens=0))
+
+    assert chunks == []
+    assert model.calls == 0
+
+
+def test_stream_generate_tokens_handles_batched_rows_and_decodes_texts() -> None:
+    model = _ScriptedLogitsModel([[4, 5], [6, 7]])
+    prompt = mx.array([[1, 2], [3, 4]], dtype=mx.int32)
+
+    chunks = list(
+        stream_generate_tokens(
+            model,
+            prompt,
+            max_new_tokens=2,
+            temperature=0.0,
+            decode_token=lambda token_id: f"<{token_id}>",
+        )
+    )
+
+    assert [chunk.text for chunk in chunks] == [["<4>", "<5>"], ["<6>", "<7>"]]
+    assert [chunk.finish_reason for chunk in chunks] == [None, "length"]
+    np.testing.assert_array_equal(
+        _as_numpy(chunks[0].token_ids),
+        np.array([[4], [5]], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(
+        _as_numpy(chunks[-1].tokens),
+        np.array([[1, 2, 4, 6], [3, 4, 5, 7]], dtype=np.int32),
+    )
+    assert model.seen_shapes == [(2, 2), (2, 3)]
+
+
+def test_stream_generate_tokens_stops_on_eos_only_when_all_rows_emit_eos() -> None:
+    eos = 2
+    model = _ScriptedLogitsModel([[eos, 1], [eos, eos], [5, 5]])
+    prompt = mx.array([[10], [11]], dtype=mx.int32)
+
+    chunks = list(
+        stream_generate_tokens(
+            model,
+            prompt,
+            max_new_tokens=3,
+            eos_token_id=eos,
+            temperature=0.0,
+        )
+    )
+
+    assert [chunk.finish_reason for chunk in chunks] == [None, "eos"]
+    np.testing.assert_array_equal(
+        _as_numpy(chunks[-1].tokens),
+        np.array([[10, eos, eos], [11, 1, eos]], dtype=np.int32),
+    )
+    assert model.calls == 2
+
+
+def test_stream_generate_tokens_rejects_eager_kv_config_without_kv_mode() -> None:
+    model = _ScriptedLogitsModel([[4]])
+
+    with pytest.raises(ValueError, match="use_kv_cache"):
+        list(
+            stream_generate_tokens(
+                model,
+                mx.array([[1]], dtype=mx.int32),
+                max_new_tokens=1,
+                cache=_make_cache(),
+            )
+        )
+
+
+def test_stream_generate_tokens_with_kv_cache_prefills_then_decodes_one_token_steps() -> None:
+    model = _KVScriptedLogitsModel([[4], [5], [6]])
+    prompt = mx.array([[1, 2, 3]], dtype=mx.int32)
+    cache = _make_cache()
+
+    chunks = list(
+        stream_generate_tokens(
+            model,
+            prompt,
+            max_new_tokens=3,
+            use_kv_cache=True,
+            cache=cache,
+            temperature=0.0,
+        )
+    )
+
+    np.testing.assert_array_equal(
+        _as_numpy(chunks[-1].tokens),
+        np.array([[1, 2, 3, 4, 5, 6]], dtype=np.int32),
+    )
+    assert [chunk.finish_reason for chunk in chunks] == [None, None, "length"]
+    assert model.seen_shapes == [(1, 3), (1, 1), (1, 1)]
+    assert model.seen_cache_ids == [id(cache), id(cache), id(cache)]
+
+
+def test_stream_generate_tokens_with_kv_cache_handles_batched_rows() -> None:
+    model = _KVScriptedLogitsModel([[4, 5], [6, 7]])
+    prompt = mx.array([[1, 2], [3, 4]], dtype=mx.int32)
+    cache = _make_cache(batch_size=2)
+
+    chunks = list(
+        stream_generate_tokens(
+            model,
+            prompt,
+            max_new_tokens=2,
+            use_kv_cache=True,
+            cache=cache,
+            temperature=0.0,
+            decode_token=lambda token_id: str(token_id),
+        )
+    )
+
+    assert [chunk.text for chunk in chunks] == [["4", "5"], ["6", "7"]]
+    assert [chunk.finish_reason for chunk in chunks] == [None, "length"]
+    np.testing.assert_array_equal(
+        _as_numpy(chunks[-1].tokens),
+        np.array([[1, 2, 4, 6], [3, 4, 5, 7]], dtype=np.int32),
+    )
+    assert model.seen_shapes == [(2, 2), (2, 1)]
+    assert model.seen_cache_ids == [id(cache), id(cache)]
+
+
+def test_stream_generate_tokens_with_kv_cache_can_build_cache_from_shape_kwargs() -> None:
+    model = _KVScriptedLogitsModel([[4], [5]])
+
+    chunks = list(
+        stream_generate_tokens(
+            model,
+            mx.array([[1, 2]], dtype=mx.int32),
+            max_new_tokens=2,
+            use_kv_cache=True,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=32,
+            temperature=0.0,
+        )
+    )
+
+    np.testing.assert_array_equal(
+        _as_numpy(chunks[-1].tokens),
+        np.array([[1, 2, 4, 5]], dtype=np.int32),
+    )
+    assert len(set(model.seen_cache_ids)) == 1
+
+
+def test_stream_generate_tokens_quantized_kv_stays_fail_closed_at_attention() -> None:
+    model = _tiny_attention_lm()
+
+    with pytest.raises(NotImplementedError, match="quantized KV cache"):
+        list(
+            stream_generate_tokens(
+                model,
+                mx.array([[1, 2]], dtype=mx.int32),
+                max_new_tokens=1,
+                use_kv_cache=True,
+                num_layers=1,
+                num_kv_heads=1,
+                head_dim=64,
+                max_seq_len=8,
+                quantized=True,
+                temperature=0.0,
+            )
+        )
+
+
 def test_inference_root_exports_generate_tokens() -> None:
     assert inference.generate_tokens is generate_tokens
     assert "generate_tokens" in inference.__all__
@@ -587,3 +808,10 @@ def test_inference_root_exports_generate_tokens_with_kv_cache() -> None:
 def test_inference_root_exports_next_token_logits() -> None:
     assert inference.next_token_logits is next_token_logits
     assert "next_token_logits" in inference.__all__
+
+
+def test_inference_root_exports_stream_generate_tokens() -> None:
+    assert inference.GenerationChunk is GenerationChunk
+    assert inference.stream_generate_tokens is stream_generate_tokens
+    assert "GenerationChunk" in inference.__all__
+    assert "stream_generate_tokens" in inference.__all__

@@ -345,6 +345,55 @@ def test_dispatch_grad_flows_through_path_c(monkeypatch: pytest.MonkeyPatch) -> 
     assert np.linalg.norm(np.array(dkv)) > 0
 
 
+def test_dispatch_path_c_grad_supports_packed_value_tail_dim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    status = sparse_mla_path_c_status()
+    if not status.available:
+        pytest.skip(status.reason)
+    monkeypatch.setenv("CPPMEGA_KERNEL_PATH", "path_c")
+    rng = np.random.default_rng(5)
+    B, S, H, D = 1, 4, 4, 16
+    G = 2
+    d_v = 8
+    q = mx.array(rng.standard_normal((B, S, H, D)).astype(np.float32))
+    kv = mx.array(rng.standard_normal((B, 8, G, D)).astype(np.float32))
+    indices_np = rng.integers(0, 8, size=(B, S, G, 4)).astype(np.int32)
+    indices_np[0, 0, 0, :] = -1
+    indices_np[0, 1, :, ::2] = -1
+    indices = mx.array(indices_np)
+
+    def path_c_loss(q_, kv_):
+        out = sparse_mla_attention(q_, kv_, indices, d_v=d_v)
+        assert isinstance(out, MLXArray)
+        return mx.sum(cast(mx.array, out) ** 2)
+
+    def reference_loss(q_, kv_):
+        out = sparse_mla_attention_reference(q_, kv_, indices, d_v=d_v)
+        return mx.sum(cast(mx.array, out) ** 2)
+
+    dq, dkv = mx.grad(path_c_loss, argnums=(0, 1))(q, kv)
+    dq_ref, dkv_ref = mx.grad(reference_loss, argnums=(0, 1))(q, kv)
+    mx.eval(dq, dkv, dq_ref, dkv_ref)
+
+    log = get_dispatch_log()
+    assert log[-1]["path"] == "path_c"
+    assert log[-1]["kernel_used"] == "tilelang_path_c_fwd_bwd_v1"
+    np.testing.assert_allclose(
+        np.array(dq).astype(np.float32),
+        np.array(dq_ref).astype(np.float32),
+        rtol=5e-3,
+        atol=5e-3,
+    )
+    np.testing.assert_allclose(
+        np.array(dkv).astype(np.float32),
+        np.array(dkv_ref).astype(np.float32),
+        rtol=5e-3,
+        atol=5e-3,
+    )
+    assert np.linalg.norm(np.array(dkv[..., d_v:]).astype(np.float32)) > 0
+
+
 def test_return_lse_path_routes_through_dispatcher(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

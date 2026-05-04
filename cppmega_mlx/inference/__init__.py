@@ -11,9 +11,11 @@ from cppmega_mlx.inference.engine import (
 )
 from cppmega_mlx.inference.infilling import build_fim_prompt_ids
 from cppmega_mlx.inference.generation import (
+    GenerationChunk,
     generate_tokens,
     generate_tokens_with_kv_cache,
     next_token_logits,
+    stream_generate_tokens,
 )
 from cppmega_mlx.inference.quantization import (
     InferenceQuantizationConfig,
@@ -45,6 +47,7 @@ __all__ = [
     "ContiguousKVCache",
     "ContiguousKVCacheConfig",
     "ContinuousBatchScheduler",
+    "GenerationChunk",
     "InferenceQuantizationConfig",
     "PAGED_ATTENTION_NOT_INTEGRATED_MESSAGE",
     "PagedKVBlockManager",
@@ -68,6 +71,7 @@ __all__ = [
     "should_start_kv_quantization",
     "speculative_acceptance",
     "speculative_acceptance_batch",
+    "stream_generate_tokens",
     "trim_contiguous_kv_cache",
     "typical_acceptance",
     "typical_acceptance_batch",

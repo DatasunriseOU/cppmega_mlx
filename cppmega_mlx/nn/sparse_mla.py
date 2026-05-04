@@ -344,7 +344,8 @@ def sparse_mla_attention(
     - ``PATH_B``: force the direct-MSL Metal kernel (raises if unavailable).
     - ``PATH_C``: force the TileLang-DSL-lowered Path C Metal kernel (raises
       if unavailable). Path C is an experimental proof path with the same
-      pure-MLX parity oracle and custom VJP coverage for default parameters.
+      pure-MLX parity oracle and custom VJP coverage for default parameters
+      plus forced non-default ``d_v``/``sm_scale`` wrappers.
     """
 
     # Lazy import to avoid pulling Metal kernels into the reference module

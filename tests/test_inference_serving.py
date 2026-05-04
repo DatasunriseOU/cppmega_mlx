@@ -166,6 +166,15 @@ def test_scheduler_complete_frees_blocks_and_buffers_completed() -> None:
     assert scheduler.get_completed() == []
 
 
+def test_streaming_generation_is_not_paged_attention_integration() -> None:
+    assert inference.stream_generate_tokens is not require_model_integrated_paged_attention
+    assert (
+        "model-integrated paged attention is not wired yet"
+        in inference.PAGED_ATTENTION_NOT_INTEGRATED_MESSAGE
+    )
+    assert "contiguous KV inference" in inference.PAGED_ATTENTION_NOT_INTEGRATED_MESSAGE
+
+
 def test_paged_attention_model_integration_fails_closed() -> None:
     with pytest.raises(NotImplementedError, match="not wired yet"):
         require_model_integrated_paged_attention()

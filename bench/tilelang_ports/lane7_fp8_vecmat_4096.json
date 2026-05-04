@@ -1,0 +1,219 @@
+{
+  "schema_version": 1,
+  "kind": "lane7_path_c_vs_path_b_fp8_profile",
+  "host": "Davids-Mac-Studio.local",
+  "platform": {
+    "system": "Darwin",
+    "machine": "arm64",
+    "platform": "macOS-26.4.1-arm64-arm-64bit-Mach-O",
+    "python": "3.13.12",
+    "mlx": "0.31.1",
+    "torch": "2.13.0.dev20260503"
+  },
+  "env_contract": {
+    "MAKEFLAGS": null,
+    "CMAKE_BUILD_PARALLEL_LEVEL": null,
+    "PYTHONPATH": null
+  },
+  "repos": {
+    "cppmega_mlx": {
+      "path": "/Volumes/external/sources/cppmega.mlx",
+      "exists": true,
+      "head": {
+        "ok": true,
+        "returncode": 0,
+        "stdout": "ac80716dc9b36eafae370999c7da8ba5f5b9553e",
+        "stderr": ""
+      },
+      "status_short": {
+        "ok": true,
+        "returncode": 0,
+        "stdout": "M cppmega_mlx/inference/__init__.py\n M cppmega_mlx/inference/generation.py\n M cppmega_mlx/nn/_tilelang/sparse_mla_path_c.py\n M docs/tilelang_ports/fp8_msl_kernels.md\n M scripts/bench_tilelang_fp8_path_c.py\n M tests/test_inference_generation.py\n M tests/test_inference_serving.py\n M tests/test_package_exports.py\n M tests/test_sparse_mla_dispatch.py\n?? bench/tilelang_ports/lane7_fp8_vecmat_4096.json",
+        "stderr": ""
+      }
+    },
+    "tilelang": {
+      "path": "/private/tmp/tilelang_apple_head/tilelang",
+      "exists": true,
+      "head": {
+        "ok": true,
+        "returncode": 0,
+        "stdout": "a69d6df75b46d7f0eca2eab205a901bc45c6a6af",
+        "stderr": ""
+      },
+      "status_short": {
+        "ok": true,
+        "returncode": 0,
+        "stdout": "m 3rdparty/tvm\n M pyproject.toml\n M requirements-dev.txt\n M requirements.txt\n M src/op/builtin.cc\n M src/op/builtin.h\n M src/op/copy.cc\n M src/op/gemm_sp.h\n M src/op/reduce.cc\n M src/target/codegen_metal.cc\n M src/target/codegen_metal.h\n M src/transform/lower_thread_allreduce.cc\n M src/transform/storage_rewrite.cc\n M testing/python/metal/test_metal_simdgroup_store.py\n M testing/python/transform/test_readonly_param_const_codegen.py\n M tilelang/engine/phase.py\n M tilelang/intrinsics/metal_macro_generator.py\n M tilelang/language/__init__.py\n M tilelang/language/builtin.py\n M tilelang/language/loop.py\n M tilelang/tileop/gemm/__init__.py\n M tilelang/tileop/metal_quant.py\n M tilelang/transform/metal_fragment_to_simdgroup.py\n?? testing/python/cpu/test_fp8_scaled_matmul_lowering.py\n?? testing/python/metal/test_fp8_scaled_matmul_metal.py\n?? testing/python/metal/test_metal_fp8_vecmat_packed_lut.py\n?? testing/python/metal/test_metal_sparse_mla_bwd_reduction.py\n?? testing/python/metal/test_metal_sparse_mla_pipeline.py\n?? testing/python/metal/test_metal_topk_selector.py\n?? tilelang/language/fp8_op.py\n?? tilelang/tileop/gemm/gemm_metal_fp8.py\n?? tilelang/transform/fp8_scaled_matmul_to_gemm.py\n?? tmp_fp8_vecmat_probe.py",
+        "stderr": ""
+      }
+    },
+    "tvm": {
+      "path": "/private/tmp/tvm_apple_head/tvm",
+      "exists": true,
+      "head": {
+        "ok": true,
+        "returncode": 0,
+        "stdout": "fbea96c8b72dbdf528abbf1348e0303fa284ec08",
+        "stderr": ""
+      },
+      "status_short": {
+        "ok": true,
+        "returncode": 0,
+        "stdout": "M src/runtime/metal/metal_device_api.mm\n M src/target/metal/codegen_metal.cc\n M src/target/metal/codegen_metal.h\n M tests/python/codegen/test_target_codegen_metal.py\n?? .venv/",
+        "stderr": ""
+      }
+    }
+  },
+  "path_b_status": {
+    "available": true,
+    "reason": "Vendored FP8 e4m3fn MSL kernels (LUT-based decode + integer-bit encode) are compiled and ready to dispatch."
+  },
+  "strict_policy": {
+    "path_c_over_path_b_max_ratio": 1.0,
+    "path_c_vs_path_b_parity_max_abs": 1e-05,
+    "path_c_vs_path_b_parity_max_rel": 1e-05,
+    "requires_path_b_and_path_c": true
+  },
+  "results": [
+    {
+      "shape_name": "vecmat_4096",
+      "shape": {
+        "kind": "vecmat",
+        "M": 1,
+        "N": 4096,
+        "K": 4096,
+        "BM": 1,
+        "BN": 32,
+        "BK": 32,
+        "num_stages": 0
+      },
+      "parity_required": true,
+      "rows": [
+        {
+          "label": "path_b_msl_fp8_scaled_vecmat",
+          "bench": {
+            "label": "path_b_msl_fp8_scaled_vecmat",
+            "ok": true,
+            "median_ms": 0.24256203323602676,
+            "min_ms": 0.21600001491606236,
+            "p90_ms": 0.4433330614119768,
+            "max_ms": 0.8270000107586384,
+            "tflops": 0.13833340507724726,
+            "warmup": 10,
+            "iters": 50,
+            "paired": true,
+            "error": null
+          },
+          "parity_vs_torch_cpu_dequant": {
+            "max_abs": 0.0001220703125,
+            "max_rel": 3.525330976117402e-05
+          }
+        },
+        {
+          "label": "path_c_mlx_tilelang_fp8_scaled_vecmat",
+          "variant": "MLX-dispatched TileLang fp8 vecmat packed dot4",
+          "target": "metal -thread_warp_size=32",
+          "bench": {
+            "label": "path_c_mlx_tilelang_fp8_scaled_vecmat",
+            "ok": true,
+            "median_ms": 0.23866700939834118,
+            "min_ms": 0.2182498574256897,
+            "p90_ms": 0.49537490122020245,
+            "max_ms": 2.351250033825636,
+            "tflops": 0.140590993638324,
+            "warmup": 10,
+            "iters": 50,
+            "paired": true,
+            "error": null
+          },
+          "paired_ratios": {
+            "path_c_mlx_tilelang_fp8_scaled_vecmat_over_path_b_msl_fp8_scaled_vecmat_paired_median": 0.980701867110862,
+            "path_c_mlx_tilelang_fp8_scaled_vecmat_over_path_b_msl_fp8_scaled_vecmat_paired_p90": 1.439142080653323
+          },
+          "source_metrics": {
+            "source_len": 997,
+            "markers": {
+              "simdgroup_multiply_accumulate": 0,
+              "simdgroup_load": 0,
+              "simdgroup_store": 0,
+              "threadgroup_half": 0,
+              "threadgroup_uchar": 0,
+              "threadgroup_barrier": 0,
+              "fp8_e4m3_decode_helper": 0,
+              "fp8_e5m2_decode_helper": 0,
+              "A_scale_loads": 1,
+              "B_scale_loads": 1,
+              "scalar_float_a_val": 0,
+              "scalar_float_b_val": 0,
+              "tvm_thread_allreduce": 0,
+              "simd_sum": 1,
+              "kernel_void": 0,
+              "packed_uint_loads": 2,
+              "fp8_e4m3_lut": 8
+            },
+            "source": "mlx_runtime_canonical_body"
+          },
+          "diagnostic_tilelang_source_metrics": {
+            "source_len": 6934,
+            "markers": {
+              "simdgroup_multiply_accumulate": 0,
+              "simdgroup_load": 0,
+              "simdgroup_store": 0,
+              "threadgroup_half": 0,
+              "threadgroup_uchar": 0,
+              "threadgroup_barrier": 0,
+              "fp8_e4m3_decode_helper": 1,
+              "fp8_e5m2_decode_helper": 1,
+              "A_scale_loads": 1,
+              "B_scale_loads": 1,
+              "scalar_float_a_val": 0,
+              "scalar_float_b_val": 0,
+              "tvm_thread_allreduce": 0,
+              "simd_sum": 1,
+              "kernel_void": 1,
+              "packed_uint_loads": 2,
+              "fp8_e4m3_lut": 9
+            }
+          },
+          "path_c_blockers": {
+            "path_b_fast_path_ready": true,
+            "missing": [],
+            "generated_features": {
+              "kernel_void": 1,
+              "fp8_e4m3_decode_helper": 1,
+              "tvm_thread_allreduce": 0,
+              "simd_shuffle_down": 0,
+              "simd_sum": 1,
+              "reinterpret_cast": 2,
+              "device_const_uint": 4,
+              "uint_pointer": 4,
+              "uchar4": 0,
+              "fp8_e4m3_lut": 9,
+              "metal_fp8_dot4_helper": 2,
+              "scalar_fp8_byte_decode": 1,
+              "scalar_fp8_byte_decode_calls": 0
+            },
+            "required_fast_path": {
+              "packed_uint32_fp8_loads": "reinterpret_cast<device const uint*> loads for 4 FP8 bytes",
+              "metal_simd_sum_reduction": "literal Metal simd_sum(sum) reduction",
+              "packed_lut_dot4_decode": "fp8_e4m3fn_lut-backed packed dot4 decode in the hot loop",
+              "no_scalar_fp8_helper_calls": "avoid per-byte __tvm_fp8_e4m3_to_half calls in the hot loop"
+            }
+          },
+          "parity_vs_path_b_msl": {
+            "max_abs": 0.0,
+            "max_rel": 0.0
+          },
+          "parity_vs_torch_cpu_dequant": {
+            "max_abs": 0.0001220703125,
+            "max_rel": 3.525330976117402e-05
+          }
+        }
+      ],
+      "ratios": {
+        "path_c_mlx_tilelang_fp8_scaled_vecmat_over_path_b": 0.980701867110862
+      }
+    }
+  ]
+}

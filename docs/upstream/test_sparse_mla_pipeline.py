@@ -12,8 +12,11 @@ import cProfile
 import io
 import os
 import pstats
+import shutil
 import statistics
+import subprocess
 import sys
+import tempfile
 import time
 import traceback
 
@@ -57,6 +60,42 @@ def timed_try_lower(name, func, *, enable_device_compile: bool = False):
     start = time.perf_counter()
     result = try_lower(name, func, enable_device_compile=enable_device_compile)
     return (*result, (time.perf_counter() - start) * 1000.0)
+
+
+def lower_source(func) -> str:
+    artifact = lower(func, target=TARGET)
+    source = getattr(artifact, "kernel_source", "") or ""
+    assert source, "lower() did not expose generated Metal source"
+    return source
+
+
+def _has_metal_sdk() -> bool:
+    return (
+        shutil.which("xcrun") is not None
+        and subprocess.run(
+            ["xcrun", "--sdk", "macosx", "--find", "metal"],
+            capture_output=True,
+        ).returncode
+        == 0
+    )
+
+
+def _xcrun_compile(msl_source: str) -> tuple[int, str]:
+    with tempfile.NamedTemporaryFile(suffix=".metal", delete=False) as f:
+        f.write(msl_source.encode("utf-8"))
+        msl_path = f.name
+    try:
+        air_path = msl_path + ".air"
+        res = subprocess.run(
+            ["xcrun", "--sdk", "macosx", "metal", "-c", msl_path, "-o", air_path],
+            capture_output=True,
+            text=True,
+        )
+        return res.returncode, res.stderr or ""
+    finally:
+        for path in (msl_path, msl_path + ".air"):
+            if os.path.exists(path):
+                os.remove(path)
 
 
 # Test 1: simple gemm (already verified, baseline)
@@ -160,6 +199,58 @@ def k3_multi_gemm(
         T.copy(O_local, O)
 
 
+# Test 4: Sparse-MLA-shaped 32x32 software pipeline. This is the concrete Path C
+# forward blocker surface: two score GEMMs, exp2 update, score staging, then
+# S*V, all under T.Pipelined(num_stages=2).
+@T.prim_func
+def k4_sparse_mla_pipeline_32x32(
+    Q: T.Tensor((1, 32, 32), "float16"),
+    Q_pe: T.Tensor((1, 32, 32), "float16"),
+    KV: T.Tensor((1, 64, 1, 32), "float16"),
+    K_pe: T.Tensor((1, 64, 1, 32), "float16"),
+    Output: T.Tensor((1, 32, 32), "float16"),
+):
+    with T.Kernel(1, 1, threads=256) as (hid, bid):
+        Q_shared = T.alloc_shared((32, 32), "float16")
+        Q_pe_shared = T.alloc_shared((32, 32), "float16")
+        KV_shared = T.alloc_shared((32, 32), "float16")
+        K_pe_shared = T.alloc_shared((32, 32), "float16")
+        S_shared = T.alloc_shared((32, 32), "float16")
+        O_shared = T.alloc_shared((32, 32), "float16")
+        acc_s = T.alloc_fragment((32, 32), "float32")
+        acc_o = T.alloc_fragment((32, 32), "float32")
+
+        T.copy(Q[bid, hid * 32 : (hid + 1) * 32, :], Q_shared)
+        T.copy(Q_pe[bid, hid * 32 : (hid + 1) * 32, :], Q_pe_shared)
+        T.clear(acc_o)
+
+        for k in T.Pipelined(T.ceildiv(64, 32), num_stages=2):
+            T.copy(KV[bid, k * 32 : (k + 1) * 32, 0, :], KV_shared)
+            T.copy(K_pe[bid, k * 32 : (k + 1) * 32, 0, :], K_pe_shared)
+            T.gemm(
+                Q_shared,
+                KV_shared,
+                acc_s,
+                transpose_B=True,
+                policy=T.GemmWarpPolicy.FullCol,
+                clear_accum=True,
+            )
+            T.gemm(
+                Q_pe_shared,
+                K_pe_shared,
+                acc_s,
+                transpose_B=True,
+                policy=T.GemmWarpPolicy.FullCol,
+            )
+            for i, j in T.Parallel(32, 32):
+                acc_s[i, j] = T.exp2(acc_s[i, j] * 1.4426950408889634)
+            T.copy(acc_s, S_shared)
+            T.gemm(S_shared, KV_shared, acc_o, policy=T.GemmWarpPolicy.FullCol)
+
+        T.copy(acc_o, O_shared)
+        T.copy(O_shared, Output[bid, hid * 32 : (hid + 1) * 32, :])
+
+
 def test_simple_metal_gemm_lowers() -> None:
     _, status, err = try_lower("k1_simple_gemm", k1_simple_gemm)
     assert status == "OK", err
@@ -185,12 +276,33 @@ def test_chained_mixed_dtype_attention_gemms_lower() -> None:
     assert status == "OK", err
 
 
+def test_sparse_mla_32x32_pipelined_kernel_lowers() -> None:
+    _, status, err = try_lower("k4_sparse_mla_pipeline_32x32", k4_sparse_mla_pipeline_32x32)
+    assert status == "OK", err
+    body = lower_source(k4_sparse_mla_pipeline_32x32)
+    lowered = body.lower()
+    assert "simdgroup_multiply_accumulate" in body
+    assert body.count("simdgroup_multiply_accumulate") >= 3
+    assert "threadgroup_barrier" in lowered
+    assert "exp2" in lowered
+    assert "threadgroup half buf_dyn_shmem[14336]" in body
+    assert "+ 5120" in body, "second pipeline stage must have a distinct KV tile"
+    assert "+ 6144" in body, "S_shared must not alias pipelined KV inputs"
+
+
+@pytest.mark.skipif(not _has_metal_sdk(), reason="macOS Metal SDK (xcrun) not available")
+def test_sparse_mla_32x32_pipelined_kernel_xcrun_compiles() -> None:
+    rc, stderr = _xcrun_compile(lower_source(k4_sparse_mla_pipeline_32x32))
+    assert rc == 0, f"xcrun metal -c failed:\n{stderr}"
+
+
 KERNELS = [
     ("k1_simple_gemm", k1_simple_gemm),
     ("k2_pipelined_gemm", k2_pipelined_gemm),
     ("k2_32x32_no_pipeline", k2_32x32_no_pipeline),
     ("k2_pipelined_16x16_control", k2_pipelined_16x16_control),
     ("k3_multi_gemm", k3_multi_gemm),
+    ("k4_sparse_mla_pipeline_32x32", k4_sparse_mla_pipeline_32x32),
 ]
 
 
@@ -266,7 +378,7 @@ def print_profile(kernels, limit: int, *, enable_device_compile: bool) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--kernel", choices=["all", "k1", "k2", "k3"], default="all")
+    parser.add_argument("--kernel", choices=["all", "k1", "k2", "k3", "k4"], default="all")
     parser.add_argument("--time", action="store_true", help="time TileLang lower/codegen for each selected kernel")
     parser.add_argument("--repeat", type=int, default=3, help="repeat count for --time")
     parser.add_argument("--profile", action="store_true", help="print cProfile cumulative hot frames for lower/codegen")

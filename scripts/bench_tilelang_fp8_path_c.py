@@ -1,9 +1,9 @@
 # pyright: reportInvalidTypeForm=false, reportMissingImports=false, reportUndefinedVariable=false
 """Profile TileLang Path C FP8 kernels against Path B hand-written MSL.
 
-This is Lane F's local M4/MPS harness. It intentionally lives outside the
-TileLang/TVM trees: the script profiles the current apple-head TileLang Metal
-lowering without modifying core codegen.
+This is the local Apple-Silicon/Metal Path C FP8 harness. It intentionally
+lives outside the TileLang/TVM trees: the script profiles the current
+apple-head TileLang Metal lowering without modifying core codegen.
 
 Default output:
     bench/tilelang_ports/fp8_path_c_vs_path_b.json
@@ -1350,7 +1350,7 @@ def main() -> int:
 
     payload: dict[str, Any] = {
         "schema_version": 1,
-        "kind": "lane_f_path_c_vs_path_b_fp8_profile",
+        "kind": "path_c_vs_path_b_fp8_profile",
         "host": socket.gethostname(),
         "platform": {
             "system": platform.system(),

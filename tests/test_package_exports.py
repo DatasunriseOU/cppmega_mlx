@@ -111,8 +111,10 @@ def test_package_roots_expose_local_mlx_contracts() -> None:
         "megatron_indexed_side_channel_schema",
     } | FIM_DATA_EXPORTS <= _assert_public_exports(data)
     assert {
+        "GenerationChunk",
         "generate_tokens",
         "sample_next_token",
+        "stream_generate_tokens",
     } <= _assert_public_exports(inference)
     assert {
         "Mamba3CacheState",

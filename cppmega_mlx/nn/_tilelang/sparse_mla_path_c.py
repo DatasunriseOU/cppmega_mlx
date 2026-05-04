@@ -2302,6 +2302,53 @@ def _sparse_mla_path_c_metal_apply_vjp(primals, cotangent, output):
     return (dq.astype(q.dtype), dkv.astype(kv.dtype), mx.zeros_like(indices))
 
 
+@lru_cache(maxsize=128)
+def _sparse_mla_path_c_apply_for_params(sm_scale: float, d_v: int) -> Any:
+    """Build a custom VJP wrapper for one non-default Path C parameter set."""
+
+    @mx.custom_function
+    def _apply(q: mx.array, kv: mx.array, indices: mx.array) -> mx.array:
+        result = sparse_mla_fwd_path_c(q, kv, indices, sm_scale=sm_scale, d_v=d_v)
+        if result is None:
+            return cast(
+                mx.array,
+                sparse_mla_attention_reference(q, kv, indices, sm_scale=sm_scale, d_v=d_v),
+            )
+        out, _lse = result
+        return out
+
+    apply_any = cast(Any, _apply)
+
+    @apply_any.vjp
+    def _apply_vjp(primals, cotangent, output):
+        del output
+        q, kv, indices = primals
+        grads = sparse_mla_bwd_path_c(
+            q,
+            kv,
+            cotangent,
+            indices,
+            sm_scale=sm_scale,
+            d_v=d_v,
+        )
+        if grads is None:
+            def _reference_apply(q_, kv_):
+                return sparse_mla_attention_reference(
+                    q_,
+                    kv_,
+                    indices,
+                    sm_scale=sm_scale,
+                    d_v=d_v,
+                )
+
+            _, vjps = mx.vjp(_reference_apply, [q, kv], [cotangent])
+            return (vjps[0], vjps[1], mx.zeros_like(indices))
+        dq, dkv = grads
+        return (dq.astype(q.dtype), dkv.astype(kv.dtype), mx.zeros_like(indices))
+
+    return apply_any
+
+
 def sparse_mla_path_c_apply(
     q: mx.array,
     kv: mx.array,
@@ -2315,9 +2362,9 @@ def sparse_mla_path_c_apply(
     """Apply Sparse-MLA through the TileLang DSL Path C Metal kernel.
 
     The default ``sm_scale``/``d_v`` path is wrapped in ``mx.custom_function``
-    and uses the Path C backward kernel for VJP coverage. Non-default forward
-    shapes are supported for ``return_lse=True``; differentiable non-default
-    dispatch intentionally falls back unless Path C is explicitly forced.
+    and uses the Path C backward kernel for VJP coverage. Forced Path C
+    non-default ``d_v``/``sm_scale`` dispatch uses a shape-parameterized custom
+    VJP wrapper over the same forward/backward kernels.
     """
 
     shapes = _resolve_shapes(q, kv, indices, d_v=d_v)
@@ -2364,11 +2411,14 @@ def sparse_mla_path_c_apply(
         out = sparse_mla_path_c_metal_apply(q, kv, indices)
         return cast(mx.array, out).astype(q.dtype)
 
+    status = sparse_mla_path_c_status()
+    if status.available:
+        apply = _sparse_mla_path_c_apply_for_params(float(sm_scale), shapes.d_v)
+        out = apply(q, kv, indices)
+        return cast(mx.array, out).astype(q.dtype)
     if force_path_c:
         raise RuntimeError(
-            "sparse_mla_path_c_apply: Path C custom VJP currently supports only "
-            "default sm_scale and d_v; use return_lse=True for forward-only "
-            "non-default dispatch."
+            f"sparse_mla_path_c_apply: Path C unavailable: {status.reason}"
         )
     return sparse_mla_attention_reference(
         q,
