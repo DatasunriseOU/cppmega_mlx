@@ -56,6 +56,8 @@ Numerical contract:
 
 from __future__ import annotations
 
+# pyright: reportFunctionMemberAccess=false
+
 from dataclasses import dataclass
 from typing import Tuple, cast
 
@@ -67,7 +69,10 @@ from cppmega_mlx.nn._tilelang._msl_transform import (
     msl_dispatch_status,
 )
 from cppmega_mlx.nn._tilelang.sparse_mla_blockscaled_path_c import (
+    SparseMLABlockScaledQKReducePathCStatus,
     blockscaled_sparse_mla_qk_path_c_status,
+    blockscaled_sparse_mla_qk_reduce_path_c,
+    blockscaled_sparse_mla_qk_reduce_path_c_status,
 )
 from cppmega_mlx.nn.sparse_mla import (
     SparseMLAShapes,
@@ -654,8 +659,7 @@ def sparse_mla_blockscaled_fwd_metal(
     shapes = _resolve_shapes(q, kv, indices, d_v=d_v)
     if shapes.qk_dim % MXFP8_BLOCK_SIZE != 0:
         return None  # callers fall back to BF16 reference
-    if sm_scale is None:
-        sm_scale = shapes.qk_dim ** -0.5
+    sm_scale_value = shapes.qk_dim ** -0.5 if sm_scale is None else sm_scale
     status = sparse_mla_blockscaled_metal_status(q, kv, indices)
     if not status.available:
         return None
@@ -691,7 +695,7 @@ def sparse_mla_blockscaled_fwd_metal(
         ("MXFP8_BS", MXFP8_BLOCK_SIZE),
     ]
 
-    sm_scale_buf = mx.array([float(sm_scale)], dtype=mx.float32)
+    sm_scale_buf = mx.array([float(sm_scale_value)], dtype=mx.float32)
     grid_x = shapes.batch * shapes.seq_len * shapes.heads
     outputs = _msl_transform.dispatch(
         cast(_msl_transform.MetalKernel, _BLOCKSCALED_FWD_KERNEL),
@@ -730,8 +734,7 @@ def sparse_mla_blockscaled_bwd_metal(
     shapes = _resolve_shapes(q, kv, indices, d_v=d_v)
     if shapes.qk_dim % MXFP8_BLOCK_SIZE != 0:
         return None
-    if sm_scale is None:
-        sm_scale = shapes.qk_dim ** -0.5
+    sm_scale_value = shapes.qk_dim ** -0.5 if sm_scale is None else sm_scale
     status = sparse_mla_blockscaled_metal_status(q, kv, indices)
     if not status.available:
         return None
@@ -762,7 +765,7 @@ def sparse_mla_blockscaled_bwd_metal(
         ("BLOCK_SIZE", threads),
         ("MXFP8_BS", MXFP8_BLOCK_SIZE),
     ]
-    sm_scale_buf = mx.array([float(sm_scale)], dtype=mx.float32)
+    sm_scale_buf = mx.array([float(sm_scale_value)], dtype=mx.float32)
     grid_x = shapes.batch * shapes.seq_len * shapes.heads
     outputs = _msl_transform.dispatch(
         cast(_msl_transform.MetalKernel, _BLOCKSCALED_BWD_KERNEL),
@@ -844,8 +847,8 @@ def sparse_mla_blockscaled_reference(
             q, kv, indices, sm_scale=sm_scale, d_v=d_v, return_lse=return_lse
         )
 
-    q_recovered = _mxfp8_roundtrip_ste(q)
-    kv_recovered = _mxfp8_roundtrip_ste(kv)
+    q_recovered = cast(mx.array, _mxfp8_roundtrip_ste(q))
+    kv_recovered = cast(mx.array, _mxfp8_roundtrip_ste(kv))
     return sparse_mla_attention_reference(
         q_recovered,
         kv_recovered,
@@ -871,7 +874,7 @@ def sparse_mla_blockscaled_metal_apply(
 
     result = sparse_mla_blockscaled_fwd_metal(q, kv, indices)
     if result is None:
-        return sparse_mla_blockscaled_reference(q, kv, indices)
+        return cast(mx.array, sparse_mla_blockscaled_reference(q, kv, indices))
     out, _lse = result
     return out
 
@@ -883,8 +886,9 @@ def _sparse_mla_blockscaled_metal_apply_vjp(primals, cotangent, output):
     grads = sparse_mla_blockscaled_bwd_metal(q, kv, cotangent, indices)
     if grads is None:
         def _ref_apply(q_, kv_):
-            return sparse_mla_blockscaled_reference(q_, kv_, indices)
-        _, vjps = mx.vjp(_ref_apply, (q, kv), (cotangent,))
+            return cast(mx.array, sparse_mla_blockscaled_reference(q_, kv_, indices))
+
+        _, vjps = mx.vjp(_ref_apply, [q, kv], [cotangent])
         return (vjps[0], vjps[1], mx.zeros_like(indices))
     dq, dkv = grads
     return (dq.astype(q.dtype), dkv.astype(kv.dtype), mx.zeros_like(indices))
@@ -909,12 +913,11 @@ def sparse_mla_blockscaled_apply(
             q, kv, indices, sm_scale=sm_scale, d_v=d_v, return_lse=return_lse
         )
 
-    if sm_scale is None:
-        sm_scale = shapes.qk_dim ** -0.5
+    sm_scale_value = shapes.qk_dim ** -0.5 if sm_scale is None else sm_scale
 
     if return_lse:
         result = sparse_mla_blockscaled_fwd_metal(
-            q, kv, indices, sm_scale=sm_scale, d_v=d_v
+            q, kv, indices, sm_scale=sm_scale_value, d_v=d_v
         )
         if result is None:
             if force_metal:
@@ -923,7 +926,7 @@ def sparse_mla_blockscaled_apply(
                     f"{sparse_mla_blockscaled_metal_status(q, kv, indices).reason}"
                 )
             return sparse_mla_blockscaled_reference(
-                q, kv, indices, sm_scale=sm_scale, d_v=d_v, return_lse=True
+                q, kv, indices, sm_scale=sm_scale_value, d_v=d_v, return_lse=True
             )
         out, lse = result
         return out.astype(q.dtype), lse
@@ -936,25 +939,38 @@ def sparse_mla_blockscaled_apply(
                 f"{status.reason}"
             )
         return sparse_mla_blockscaled_reference(
-            q, kv, indices, sm_scale=sm_scale, d_v=d_v, return_lse=False
+            q,
+            kv,
+            indices,
+            sm_scale=sm_scale_value,
+            d_v=d_v,
+            return_lse=False,
         )
 
     is_default = (
         d_v is None or d_v == shapes.qk_dim
-    ) and abs(sm_scale - shapes.qk_dim ** -0.5) < 1e-9
+    ) and abs(sm_scale_value - shapes.qk_dim ** -0.5) < 1e-9
     if is_default:
         out = sparse_mla_blockscaled_metal_apply(q, kv, indices)
-        return out.astype(q.dtype)
+        return cast(mx.array, out).astype(q.dtype)
 
     return sparse_mla_blockscaled_reference(
-        q, kv, indices, sm_scale=sm_scale, d_v=d_v, return_lse=False
+        q,
+        kv,
+        indices,
+        sm_scale=sm_scale_value,
+        d_v=d_v,
+        return_lse=False,
     )
 
 
 __all__ = [
     "MXFP8_BLOCK_SIZE",
     "SparseMLABlockScaledMetalStatus",
+    "SparseMLABlockScaledQKReducePathCStatus",
     "blockscaled_sparse_mla_qk_path_c_status",
+    "blockscaled_sparse_mla_qk_reduce_path_c",
+    "blockscaled_sparse_mla_qk_reduce_path_c_status",
     "sparse_mla_blockscaled_apply",
     "sparse_mla_blockscaled_bwd_metal",
     "sparse_mla_blockscaled_fwd_metal",

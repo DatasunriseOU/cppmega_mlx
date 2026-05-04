@@ -12,22 +12,32 @@ logical MXFP8 layout:
 
 Current apple-head TileLang can lower a square 32x32x64 control tile to Metal
 simdgroup MMA with E8M0 decode in the staging path. The literal Sparse-MLA QK
-shape remains ``M=1`` query row against top-k KV rows, which violates the
-current Metal FP8 simdgroup tile constraints. The public status fails closed on
-that shape so tests and benches do not report fake Path C support.
+shape remains ``M=1`` query row against top-k KV rows, so Path C dispatches that
+production shape through a hand-shaped TileLang reducer instead of pretending
+the square ``T.fp8_scaled_matmul`` probe is the runnable surface.
 
-The second current blocker is K-chunking: Sparse-MLA wants global scale vectors
-of size ``K / 32`` and per-``ko`` offsets into them, while the current TileLang
-``T.fp8_scaled_matmul`` validator interprets the staged shared tile width
-``BK`` as the complete contracted dimension and requires scale size ``BK / 32``.
-Until the DSL can pass a scale subregion/offset for each K chunk, Path C cannot
-represent the production block-scaled Sparse-MLA loop without changing the ABI.
+The QK loop passes per-``ko`` scale subregions of size ``BK / 32`` into
+``T.fp8_scaled_matmul`` while keeping the external Sparse-MLA ABI as global
+``K / 32`` scale vectors. The TileLang Metal lowering then preserves the
+subregion min as the base offset for E8M0 scale loads.
 """
+
+# pyright: reportInvalidTypeForm=false, reportMissingImports=false
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from functools import lru_cache
+from typing import Any, cast
+
+import mlx.core as mx
+
+from cppmega_mlx.nn._tilelang import _msl_transform
+from cppmega_mlx.nn._tilelang._msl_transform import (
+    MSLDispatchUnsupported,
+    can_run_metal,
+    lower_tilelang_to_msl_inline,
+)
 
 
 TILELANG_METAL_E8M0_SPARSE_MLA_TARGET = "metal"
@@ -52,6 +62,15 @@ _BSFP8_B_SHARED_SHAPE = (16, 64)
 _BSFP8_TRANSPOSE_B = True
 _BSFP8_NUM_STAGES = 0
 
+_BSFP8_QKR_N = 16
+_BSFP8_QKR_K = 64
+_BSFP8_QKR_NP = 4
+_BSFP8_QKR_RT = 32
+_BSFP8_QKR_VEC = 4
+_BSFP8_QKR_BLOCK_K = _BSFP8_QKR_RT * _BSFP8_QKR_VEC
+_BSFP8_QKR_SCALE_BLOCKS = _BSFP8_QKR_K // E8M0_BLOCK_SIZE
+_BSFP8_QKR_K_WORDS = _BSFP8_QKR_K // 4
+
 
 @dataclass(frozen=True)
 class SparseMLABlockScaledPathCStatus:
@@ -65,6 +84,23 @@ class SparseMLABlockScaledPathCStatus:
     n: int = 16
     k: int = 64
     transpose_B: bool = True
+    scale_block_size: int = E8M0_BLOCK_SIZE
+    scale_layout: str = E8M0_LAYOUT
+
+
+@dataclass(frozen=True)
+class SparseMLABlockScaledQKReducePathCStatus:
+    """Runtime/lowering status for the real-shape Path C E8M0 QK reducer."""
+
+    available: bool
+    reason: str
+    features: dict[str, int | bool | str]
+    target: str = TILELANG_METAL_E8M0_SPARSE_MLA_TARGET
+    n: int = 16
+    k: int = 64
+    outputs_per_block: int = 4
+    reduce_threads: int = 32
+    vec: int = 4
     scale_block_size: int = E8M0_BLOCK_SIZE
     scale_layout: str = E8M0_LAYOUT
 
@@ -105,6 +141,8 @@ def _validate_shape(
         raise ValueError(f"E8M0 Sparse-MLA Path C shape values must be positive: {bad}")
     if K % E8M0_BLOCK_SIZE != 0:
         raise ValueError(f"E8M0 Sparse-MLA Path C requires K divisible by {E8M0_BLOCK_SIZE}; got K={K}")
+    if BK % E8M0_BLOCK_SIZE != 0:
+        raise ValueError(f"E8M0 Sparse-MLA Path C requires BK divisible by {E8M0_BLOCK_SIZE}; got BK={BK}")
     expected_scale_size = K // E8M0_BLOCK_SIZE
     if a_scale_size != expected_scale_size:
         raise ValueError(
@@ -116,6 +154,28 @@ def _validate_shape(
             "E8M0 Sparse-MLA Path C B scale size must be "
             f"K/{E8M0_BLOCK_SIZE}={expected_scale_size}; got {b_scale_size}"
         )
+
+
+def _validate_reduce_shape(
+    *,
+    N: int,
+    K: int,
+    outputs_per_block: int,
+    reduce_threads: int,
+    vec: int,
+) -> None:
+    values = {
+        "N": N,
+        "K": K,
+        "outputs_per_block": outputs_per_block,
+        "reduce_threads": reduce_threads,
+        "vec": vec,
+    }
+    bad = {name: value for name, value in values.items() if value <= 0}
+    if bad:
+        raise ValueError(f"E8M0 Sparse-MLA Path C reducer shape values must be positive: {bad}")
+    if K % E8M0_BLOCK_SIZE != 0:
+        raise ValueError(f"E8M0 Sparse-MLA Path C reducer requires K divisible by {E8M0_BLOCK_SIZE}; got K={K}")
 
 
 def make_blockscaled_sparse_mla_qk_kernel(
@@ -193,11 +253,13 @@ def make_blockscaled_sparse_mla_qk_kernel(
                     T.copy(B_fp8[bx * _BSFP8_BN, ko * _BSFP8_BK], B_shared)
                 else:
                     T.copy(B_fp8[ko * _BSFP8_BK, bx * _BSFP8_BN], B_shared)
+                scale_begin = ko * (_BSFP8_BK // E8M0_BLOCK_SIZE)
+                scale_end = scale_begin + (_BSFP8_BK // E8M0_BLOCK_SIZE)
                 T.fp8_scaled_matmul(
                     A_shared,
-                    A_scale,
+                    A_scale[scale_begin:scale_end],
                     B_shared,
-                    B_scale,
+                    B_scale[scale_begin:scale_end],
                     C_local,
                     transpose_B=_BSFP8_TRANSPOSE_B,
                     scale_format=E8M0_SCALE_FORMAT,
@@ -206,6 +268,157 @@ def make_blockscaled_sparse_mla_qk_kernel(
             T.copy(C_local, C[by * _BSFP8_BM, bx * _BSFP8_BN])
 
     return blockscaled_sparse_mla_qk_kernel
+
+
+def make_blockscaled_sparse_mla_qk_reduce_kernel(
+    *,
+    N: int,
+    K: int,
+    outputs_per_block: int = 4,
+    reduce_threads: int = 32,
+    vec: int = 4,
+) -> Any:
+    """Build the real Sparse-MLA MXFP8/E8M0 QK tile as a TileLang reducer.
+
+    This dispatchable reducer mirrors Path B's block-scaled QK contract for
+    ``M=1`` gathered top-k rows without using the square-tile-only
+    ``T.fp8_scaled_matmul`` fast path.
+    """
+
+    _validate_reduce_shape(
+        N=N,
+        K=K,
+        outputs_per_block=outputs_per_block,
+        reduce_threads=reduce_threads,
+        vec=vec,
+    )
+
+    import tilelang.language as T
+    from tilelang.tileop.metal_quant import e8m0_to_float
+
+    T = cast(Any, T)
+
+    block_k = reduce_threads * vec
+    scale_blocks = K // E8M0_BLOCK_SIZE
+    g = globals()
+    g.update(
+        _BSFP8_QKR_N=N,
+        _BSFP8_QKR_K=K,
+        _BSFP8_QKR_NP=outputs_per_block,
+        _BSFP8_QKR_RT=reduce_threads,
+        _BSFP8_QKR_VEC=vec,
+        _BSFP8_QKR_BLOCK_K=block_k,
+        _BSFP8_QKR_SCALE_BLOCKS=scale_blocks,
+        _BSFP8_QKR_K_WORDS=K // 4,
+    )
+
+    if vec == 4 and K % 4 == 0:
+
+        @T.prim_func
+        def blockscaled_sparse_mla_qk_reduce(
+            A_fp8: T.Tensor((1, _BSFP8_QKR_K), "float8_e4m3"),
+            A_scale: T.Tensor((_BSFP8_QKR_SCALE_BLOCKS,), "uint8"),
+            B_fp8: T.Tensor((_BSFP8_QKR_N, _BSFP8_QKR_K), "float8_e4m3"),
+            B_scale: T.Tensor((_BSFP8_QKR_N, _BSFP8_QKR_SCALE_BLOCKS), "uint8"),
+            C: T.Tensor((1, _BSFP8_QKR_N), "float32"),
+        ):
+            with T.Kernel(
+                T.ceildiv(_BSFP8_QKR_N, _BSFP8_QKR_NP),
+                threads=(_BSFP8_QKR_RT, _BSFP8_QKR_NP),
+            ) as bx:
+                accum = T.alloc_local((1,), "float32")
+                reduced = T.alloc_local((1,), "float32")
+                kr = T.get_thread_binding(0)
+                ni = T.get_thread_binding(1)
+                col = bx * _BSFP8_QKR_NP + ni
+                T.clear(accum)
+                for ko in T.serial(T.ceildiv(_BSFP8_QKR_K_WORDS, _BSFP8_QKR_RT)):
+                    i = ko * _BSFP8_QKR_RT + kr
+                    if col < _BSFP8_QKR_N and i < _BSFP8_QKR_K_WORDS:
+                        kb = i // (E8M0_BLOCK_SIZE // 4)
+                        accum[0] += (
+                            T.metal_fp8_e4m3_dot4(
+                                T.access_ptr(A_fp8[0, 0], "r", extent=_BSFP8_QKR_K),
+                                T.access_ptr(B_fp8[col, 0], "r", extent=_BSFP8_QKR_K),
+                                i,
+                                i,
+                            )
+                            * e8m0_to_float(A_scale[kb])
+                            * e8m0_to_float(B_scale[col, kb])
+                        )
+                with T.attr(
+                    T.comm_reducer(lambda x, y: x + y, [T.cast(0, "float32")]),
+                    "reduce_scope",
+                    T.reinterpret(T.uint64(0), dtype="handle"),
+                ):
+                    T.evaluate(
+                        T.tvm_thread_allreduce(
+                            T.uint32(1),
+                            accum[0],
+                            True,
+                            reduced[0],
+                            kr,
+                            dtype="handle",
+                        )
+                    )
+                if kr == 0 and col < _BSFP8_QKR_N:
+                    C[0, col] = reduced[0]
+
+    else:
+
+        @T.prim_func
+        def blockscaled_sparse_mla_qk_reduce(
+            A_fp8: T.Tensor((1, _BSFP8_QKR_K), "float8_e4m3"),
+            A_scale: T.Tensor((_BSFP8_QKR_SCALE_BLOCKS,), "uint8"),
+            B_fp8: T.Tensor((_BSFP8_QKR_N, _BSFP8_QKR_K), "float8_e4m3"),
+            B_scale: T.Tensor((_BSFP8_QKR_N, _BSFP8_QKR_SCALE_BLOCKS), "uint8"),
+            C: T.Tensor((1, _BSFP8_QKR_N), "float32"),
+        ):
+            with T.Kernel(
+                T.ceildiv(_BSFP8_QKR_N, _BSFP8_QKR_NP),
+                threads=(_BSFP8_QKR_RT, _BSFP8_QKR_NP),
+            ) as bx:
+                accum = T.alloc_local((1,), "float32")
+                reduced = T.alloc_local((1,), "float32")
+                kr = T.get_thread_binding(0)
+                ni = T.get_thread_binding(1)
+                col = bx * _BSFP8_QKR_NP + ni
+                T.clear(accum)
+                for ko in T.serial(T.ceildiv(_BSFP8_QKR_K, _BSFP8_QKR_BLOCK_K)):
+                    for v in T.serial(_BSFP8_QKR_VEC):
+                        k = ko * _BSFP8_QKR_BLOCK_K + kr * _BSFP8_QKR_VEC + v
+                        if col < _BSFP8_QKR_N and k < _BSFP8_QKR_K:
+                            kb = k // E8M0_BLOCK_SIZE
+                            accum[0] += (
+                                T.cast(A_fp8[0, k], "float32")
+                                * T.cast(B_fp8[col, k], "float32")
+                                * e8m0_to_float(A_scale[kb])
+                                * e8m0_to_float(B_scale[col, kb])
+                            )
+                with T.attr(
+                    T.comm_reducer(lambda x, y: x + y, [T.cast(0, "float32")]),
+                    "reduce_scope",
+                    T.reinterpret(T.uint64(0), dtype="handle"),
+                ):
+                    T.evaluate(
+                        T.tvm_thread_allreduce(
+                            T.uint32(1),
+                            accum[0],
+                            True,
+                            reduced[0],
+                            kr,
+                            dtype="handle",
+                        )
+                    )
+                if kr == 0 and col < _BSFP8_QKR_N:
+                    C[0, col] = reduced[0]
+
+    try:
+        from tilelang.transform.simplify import apply_simplify
+
+        return apply_simplify(blockscaled_sparse_mla_qk_reduce)
+    except Exception:
+        return blockscaled_sparse_mla_qk_reduce
 
 
 def lower_blockscaled_sparse_mla_qk_msl(
@@ -242,8 +455,39 @@ def lower_blockscaled_sparse_mla_qk_msl(
     artifact = tilelang.lower(prim, target=tvm.target.Target(target))
     if hasattr(artifact, "kernel_source"):
         return str(artifact.kernel_source)
-    if hasattr(artifact, "rt_mod") and hasattr(artifact.rt_mod, "get_source"):
-        return str(artifact.rt_mod.get_source())
+    rt_mod = getattr(artifact, "rt_mod", None)
+    if rt_mod is not None and hasattr(rt_mod, "get_source"):
+        return str(rt_mod.get_source())
+    return str(artifact)
+
+
+def lower_blockscaled_sparse_mla_qk_reduce_msl(
+    *,
+    N: int = 16,
+    K: int = 64,
+    outputs_per_block: int = 4,
+    reduce_threads: int = 32,
+    vec: int = 4,
+    target: str = TILELANG_METAL_E8M0_SPARSE_MLA_TARGET,
+) -> str:
+    """Lower the real-shape Path C E8M0 Sparse-MLA QK reducer to MSL."""
+
+    import tilelang
+    from tilelang import tvm
+
+    prim = make_blockscaled_sparse_mla_qk_reduce_kernel(
+        N=N,
+        K=K,
+        outputs_per_block=outputs_per_block,
+        reduce_threads=reduce_threads,
+        vec=vec,
+    )
+    artifact = tilelang.lower(prim, target=tvm.target.Target(target))
+    if hasattr(artifact, "kernel_source"):
+        return str(artifact.kernel_source)
+    rt_mod = getattr(artifact, "rt_mod", None)
+    if rt_mod is not None and hasattr(rt_mod, "get_source"):
+        return str(rt_mod.get_source())
     return str(artifact)
 
 
@@ -281,7 +525,299 @@ def blockscaled_sparse_mla_qk_msl_features(msl: str) -> dict[str, int | bool | s
     }
 
 
-def blockscaled_sparse_mla_qk_path_c_status(
+def blockscaled_sparse_mla_qk_reduce_msl_features(msl: str) -> dict[str, int | bool | str]:
+    """Return source markers for the runnable E8M0 QK reducer."""
+
+    body = msl.split("kernel void", 1)[-1] if "kernel void" in msl else msl
+    signature = body.split("{", 1)[0]
+    scalar_decode_sites = msl.count("__tvm_fp8_e4m3_to_half(")
+    return {
+        "kernel_void": msl.count("kernel void"),
+        "fp8_e4m3_decode_helper": msl.count("__tvm_fp8_e4m3_to_half"),
+        "fp8_e4m3_lut": msl.count("__tvm_fp8_e4m3fn_lut"),
+        "metal_fp8_dot4_helper": msl.count("__tvm_fp8_e4m3_dot4_packed"),
+        "scalar_fp8_byte_decode": scalar_decode_sites,
+        "scalar_fp8_byte_decode_calls": max(0, scalar_decode_sites - 1),
+        "simdgroup_multiply_accumulate": msl.count("simdgroup_multiply_accumulate"),
+        "tvm_thread_allreduce": msl.count("tvm_thread_allreduce"),
+        "simd_sum": msl.count("simd_sum"),
+        "simd_shuffle_down": msl.count("simd_shuffle_down"),
+        "A_scale_refs": body.count("A_scale["),
+        "B_scale_refs": body.count("B_scale["),
+        "A_scale_collapsed_zero": body.count("A_scale[0]"),
+        "B_scale_collapsed_zero": body.count("B_scale[0]"),
+        "signature_has_A_scale": "A_scale" in signature,
+        "signature_has_B_scale": "B_scale" in signature,
+        "per_row_B_scale": body.count("B_scale[") > body.count("B_scale[0]"),
+        "e8m0_exp2": body.count("exp2"),
+        "e8m0_bias_subtract_127": body.count("- 127"),
+        "e8m0_sentinel_255": body.count("== 255"),
+        "e8m0_zero_sentinel": body.count("== 0"),
+        "k_block_shift_5": body.count(">> 5"),
+        "k_block_div_32": body.count("/ 32"),
+        "scale_block_index_shift": body.count(">> 3") + body.count(">> 4") + body.count(">> 5"),
+        "scale_format": E8M0_SCALE_FORMAT,
+        "scale_block_size": E8M0_BLOCK_SIZE,
+        "scale_axis": "contracted_k",
+        "scale_layout": E8M0_LAYOUT,
+        "qk_shape": "m1_n_topk_k",
+    }
+
+
+def _prefix_feature_keys(
+    prefix: str,
+    features: dict[str, int | bool | str],
+) -> dict[str, int | bool | str]:
+    return {f"{prefix}{key}": value for key, value in features.items()}
+
+
+@lru_cache(maxsize=128)
+def _qk_reduce_kernel_for(
+    N: int,
+    K: int,
+    outputs_per_block: int,
+    reduce_threads: int,
+    vec: int,
+) -> tuple[Any, _msl_transform.TileLangMSLLowering, list[str]]:
+    """Build and cache the MLX-dispatchable E8M0 TileLang QK reducer."""
+
+    prim = make_blockscaled_sparse_mla_qk_reduce_kernel(
+        N=N,
+        K=K,
+        outputs_per_block=outputs_per_block,
+        reduce_threads=reduce_threads,
+        vec=vec,
+    )
+    lowering = lower_tilelang_to_msl_inline(prim)
+    input_names = [name for name in lowering.buffer_param_names if name != "C"]
+    if set(input_names) != {"A_fp8", "A_scale", "B_fp8", "B_scale"}:
+        raise MSLDispatchUnsupported(
+            "unexpected TileLang E8M0 QK reducer buffer signature: "
+            + ", ".join(lowering.buffer_param_names)
+        )
+    kernel = mx.fast.metal_kernel(
+        name=f"cppmega_sparse_mla_blockscaled_qk_reduce_path_c_{N}_{K}_{outputs_per_block}_{reduce_threads}_{vec}",
+        input_names=input_names,
+        output_names=["C"],
+        source=lowering.body,
+        header=lowering.header,
+        ensure_row_contiguous=True,
+    )
+    return kernel, lowering, input_names
+
+
+def _normalize_qk_reduce_inputs(
+    A_fp8: mx.array,
+    A_scale: mx.array,
+    B_fp8: mx.array,
+    B_scale: mx.array,
+) -> tuple[mx.array, mx.array, mx.array, mx.array, int, int]:
+    if A_fp8.ndim != 2 or A_fp8.shape[0] != 1:
+        raise ValueError(f"A_fp8 must have shape (1, K); got {tuple(A_fp8.shape)}")
+    if B_fp8.ndim != 2:
+        raise ValueError(f"B_fp8 must have shape (N, K); got {tuple(B_fp8.shape)}")
+    if A_fp8.dtype != mx.uint8 or B_fp8.dtype != mx.uint8:
+        raise ValueError(f"A_fp8/B_fp8 must be mx.uint8 e4m3 storage; got {A_fp8.dtype}, {B_fp8.dtype}")
+
+    n = int(B_fp8.shape[0])
+    k = int(A_fp8.shape[1])
+    if n <= 0 or k <= 0 or int(B_fp8.shape[1]) != k:
+        raise ValueError(f"A_fp8/B_fp8 shape mismatch: A={tuple(A_fp8.shape)}, B={tuple(B_fp8.shape)}")
+    if k % E8M0_BLOCK_SIZE != 0:
+        raise ValueError(f"E8M0 QK reducer requires K divisible by {E8M0_BLOCK_SIZE}; got K={k}")
+
+    scale_blocks = k // E8M0_BLOCK_SIZE
+    if A_scale.size != scale_blocks:
+        raise ValueError(
+            f"A_scale must contain K/{E8M0_BLOCK_SIZE}={scale_blocks} E8M0 bytes; "
+            f"got shape {tuple(A_scale.shape)}"
+        )
+    if B_scale.size not in (scale_blocks, n * scale_blocks):
+        raise ValueError(
+            f"B_scale must contain K/{E8M0_BLOCK_SIZE}={scale_blocks} broadcast bytes "
+            f"or N*K/{E8M0_BLOCK_SIZE}={n * scale_blocks} row-block bytes; "
+            f"got shape {tuple(B_scale.shape)}"
+        )
+
+    A_scale_1d = A_scale.reshape((scale_blocks,)).astype(mx.uint8)
+    B_scale_1d = B_scale.reshape((B_scale.size,)).astype(mx.uint8)
+    if B_scale_1d.size == scale_blocks:
+        B_scale_2d = mx.broadcast_to(B_scale_1d.reshape((1, scale_blocks)), (n, scale_blocks))
+    else:
+        B_scale_2d = B_scale_1d.reshape((n, scale_blocks))
+    return (
+        A_fp8.astype(mx.uint8),
+        A_scale_1d,
+        B_fp8.astype(mx.uint8),
+        B_scale_2d.astype(mx.uint8),
+        n,
+        k,
+    )
+
+
+def blockscaled_sparse_mla_qk_reduce_path_c(
+    A_fp8: mx.array,
+    A_scale: mx.array,
+    B_fp8: mx.array,
+    B_scale: mx.array,
+    *,
+    outputs_per_block: int = 4,
+    reduce_threads: int = 32,
+    vec: int = 4,
+) -> mx.array | None:
+    """Run the real-shape Path C E8M0 Sparse-MLA QK reducer.
+
+    Returns a ``(1, N)`` fp32 score tile, or ``None`` when Metal/TileLang is
+    unavailable. Shape/type mismatches raise ``ValueError``.
+    """
+
+    if not can_run_metal():
+        return None
+    A_fp8_u8, A_scale_u8, B_fp8_u8, B_scale_u8, n, k = _normalize_qk_reduce_inputs(
+        A_fp8,
+        A_scale,
+        B_fp8,
+        B_scale,
+    )
+    try:
+        kernel, lowering, input_names = _qk_reduce_kernel_for(
+            n,
+            k,
+            outputs_per_block,
+            reduce_threads,
+            vec,
+        )
+    except MSLDispatchUnsupported:
+        return None
+    except Exception:
+        return None
+
+    input_map = {
+        "A_fp8": A_fp8_u8,
+        "A_scale": A_scale_u8,
+        "B_fp8": B_fp8_u8,
+        "B_scale": B_scale_u8,
+    }
+    outputs = _msl_transform.dispatch(
+        cast(_msl_transform.MetalKernel, kernel),
+        inputs=[input_map[name] for name in input_names],
+        output_shapes=[(1, n)],
+        output_dtypes=[mx.float32],
+        lowering=lowering,
+    )
+    return outputs[0]
+
+
+def blockscaled_sparse_mla_qk_reduce_path_c_status(
+    *,
+    N: int = 16,
+    K: int = 64,
+    outputs_per_block: int = 4,
+    reduce_threads: int = 32,
+    vec: int = 4,
+    target: str = TILELANG_METAL_E8M0_SPARSE_MLA_TARGET,
+) -> SparseMLABlockScaledQKReducePathCStatus:
+    """Return whether the real-shape E8M0 QK reducer can dispatch."""
+
+    ok, reason = _tilelang_available()
+    if not ok:
+        return SparseMLABlockScaledQKReducePathCStatus(
+            available=False,
+            reason=reason,
+            features={},
+            target=target,
+            n=N,
+            k=K,
+            outputs_per_block=outputs_per_block,
+            reduce_threads=reduce_threads,
+            vec=vec,
+        )
+    if not can_run_metal():
+        return SparseMLABlockScaledQKReducePathCStatus(
+            available=False,
+            reason="MLX Metal backend is not available on the default GPU device",
+            features={},
+            target=target,
+            n=N,
+            k=K,
+            outputs_per_block=outputs_per_block,
+            reduce_threads=reduce_threads,
+            vec=vec,
+        )
+
+    try:
+        kernel, lowering, _ = _qk_reduce_kernel_for(N, K, outputs_per_block, reduce_threads, vec)
+        del kernel
+        features = blockscaled_sparse_mla_qk_reduce_msl_features(lowering.msl_text)
+    except Exception as exc:
+        return SparseMLABlockScaledQKReducePathCStatus(
+            available=False,
+            reason=f"TileLang/MLX lowering failed for E8M0 Sparse-MLA QK reducer: {type(exc).__name__}: {exc}",
+            features={},
+            target=target,
+            n=N,
+            k=K,
+            outputs_per_block=outputs_per_block,
+            reduce_threads=reduce_threads,
+            vec=vec,
+        )
+
+    has_scale_refs = bool(features["A_scale_refs"]) and bool(features["B_scale_refs"])
+    has_scale_signature = bool(features["signature_has_A_scale"]) and bool(features["signature_has_B_scale"])
+    has_reduce = bool(features["simd_sum"] or features["simd_shuffle_down"] or features["tvm_thread_allreduce"])
+    has_e8m0_decode = bool(
+        features["e8m0_exp2"]
+        and features["e8m0_bias_subtract_127"]
+        and features["e8m0_sentinel_255"]
+    )
+    has_k_block_index = bool(
+        features["k_block_shift_5"]
+        or features["k_block_div_32"]
+        or features["scale_block_index_shift"]
+    )
+    has_row_scale = bool(features["per_row_B_scale"])
+    if has_scale_refs and has_scale_signature and has_reduce and has_e8m0_decode and has_k_block_index and has_row_scale:
+        return SparseMLABlockScaledQKReducePathCStatus(
+            available=True,
+            reason=(
+                "TileLang Path C E8M0 Sparse-MLA real QK reducer is dispatchable "
+                "for M=1/topk with per-row K/32 E8M0 scales"
+            ),
+            features=features,
+            target=target,
+            n=N,
+            k=K,
+            outputs_per_block=outputs_per_block,
+            reduce_threads=reduce_threads,
+            vec=vec,
+        )
+
+    blockers: list[str] = []
+    if not has_scale_refs or not has_scale_signature:
+        blockers.append("scale operands missing from emitted MSL")
+    if not has_reduce:
+        blockers.append("thread reduction missing from emitted MSL")
+    if not has_e8m0_decode:
+        blockers.append("E8M0 exp2(byte - 127) decode markers missing")
+    if not has_k_block_index:
+        blockers.append("scale operands are not indexed by K/32")
+    if not has_row_scale:
+        blockers.append("B_scale is not per output row")
+    return SparseMLABlockScaledQKReducePathCStatus(
+        available=False,
+        reason="TileLang Path C E8M0 Sparse-MLA real QK reducer is not safe to dispatch: "
+        + "; ".join(blockers),
+        features=features,
+        target=target,
+        n=N,
+        k=K,
+        outputs_per_block=outputs_per_block,
+        reduce_threads=reduce_threads,
+        vec=vec,
+    )
+
+
+def blockscaled_sparse_mla_qk_scaled_matmul_probe_status(
     *,
     M: int = 1,
     N: int = 16,
@@ -295,7 +831,7 @@ def blockscaled_sparse_mla_qk_path_c_status(
     num_stages: int = 0,
     target: str = TILELANG_METAL_E8M0_SPARSE_MLA_TARGET,
 ) -> SparseMLABlockScaledPathCStatus:
-    """Fail-closed availability probe for the E8M0 Sparse-MLA Path C QK tile."""
+    """Probe the legacy ``T.fp8_scaled_matmul`` E8M0 Sparse-MLA QK lowering only."""
 
     ok, reason = _tilelang_available()
     if not ok:
@@ -349,7 +885,14 @@ def blockscaled_sparse_mla_qk_path_c_status(
         and features["e8m0_sentinel_255"]
     )
     has_k_block_index = bool(features["k_block_shift_5"] or features["k_block_div_32"])
-    has_collapsed_scale = bool(features["A_scale_collapsed_zero"] or features["B_scale_collapsed_zero"])
+    a_scale_refs = int(features["A_scale_refs"])
+    b_scale_refs = int(features["B_scale_refs"])
+    a_zero_refs = int(features["A_scale_collapsed_zero"])
+    b_zero_refs = int(features["B_scale_collapsed_zero"])
+    has_collapsed_scale = bool(
+        (a_scale_refs and a_zero_refs == a_scale_refs)
+        or (b_scale_refs and b_zero_refs == b_scale_refs)
+    )
     has_scalar_fallback = bool(features["float_a_val"]) or bool(features["float_b_val"])
     shape_eligible = M >= 8 and BM >= 8 and N >= 8 and BN >= 8
 
@@ -404,14 +947,162 @@ def blockscaled_sparse_mla_qk_path_c_status(
     )
 
 
+def blockscaled_sparse_mla_qk_path_c_status(
+    *,
+    M: int = 1,
+    N: int = 16,
+    K: int = 64,
+    BM: int = 1,
+    BN: int = 16,
+    BK: int = 64,
+    a_scale_size: int = 2,
+    b_scale_size: int = 2,
+    transpose_B: bool = True,
+    num_stages: int = 0,
+    target: str = TILELANG_METAL_E8M0_SPARSE_MLA_TARGET,
+) -> SparseMLABlockScaledPathCStatus:
+    """Availability probe for the dispatchable E8M0 Sparse-MLA Path C QK tile."""
+
+    probe_status = blockscaled_sparse_mla_qk_scaled_matmul_probe_status(
+        M=M,
+        N=N,
+        K=K,
+        BM=BM,
+        BN=BN,
+        BK=BK,
+        a_scale_size=a_scale_size,
+        b_scale_size=b_scale_size,
+        transpose_B=transpose_B,
+        num_stages=num_stages,
+        target=target,
+    )
+
+    if M == 1 and BM == 1 and transpose_B:
+        reducer_status = blockscaled_sparse_mla_qk_reduce_path_c_status(
+            N=N,
+            K=K,
+            outputs_per_block=_BSFP8_QKR_NP,
+            reduce_threads=_BSFP8_QKR_RT,
+            vec=_BSFP8_QKR_VEC,
+            target=target,
+        )
+        legacy_features = _prefix_feature_keys(
+            "legacy_e8m0_scaled_matmul_probe_",
+            probe_status.features,
+        )
+        if reducer_status.available:
+            return SparseMLABlockScaledPathCStatus(
+                available=True,
+                reason=(
+                    "TileLang Path C E8M0 Sparse-MLA QK dispatches through the "
+                    "real M=1/topk reducer; T.fp8_scaled_matmul remains probe-only "
+                    "for this shape"
+                ),
+                features={
+                    **reducer_status.features,
+                    "dispatch_surface": "qk_reduce",
+                    "runnable_qk_reduce_available": True,
+                    "runnable_qk_reduce_reason": reducer_status.reason,
+                    "legacy_e8m0_scaled_matmul_probe_available": bool(probe_status.available),
+                    "legacy_e8m0_scaled_matmul_probe_reason": probe_status.reason,
+                    **legacy_features,
+                },
+                target=target,
+                m=M,
+                n=N,
+                k=K,
+                transpose_B=transpose_B,
+            )
+        if probe_status.available:
+            return SparseMLABlockScaledPathCStatus(
+                available=True,
+                reason=probe_status.reason,
+                features={
+                    **probe_status.features,
+                    "dispatch_surface": "fp8_scaled_matmul",
+                    "runnable_qk_reduce_available": False,
+                    "runnable_qk_reduce_reason": reducer_status.reason,
+                    "legacy_e8m0_scaled_matmul_probe_available": True,
+                    "legacy_e8m0_scaled_matmul_probe_reason": probe_status.reason,
+                },
+                target=target,
+                m=M,
+                n=N,
+                k=K,
+                transpose_B=transpose_B,
+            )
+        features = {
+            "dispatch_surface": "unavailable",
+            "runnable_qk_reduce_available": False,
+            "runnable_qk_reduce_reason": reducer_status.reason,
+            "legacy_e8m0_scaled_matmul_probe_available": False,
+            "legacy_e8m0_scaled_matmul_probe_reason": probe_status.reason,
+            **legacy_features,
+        }
+        return SparseMLABlockScaledPathCStatus(
+            available=False,
+            reason=(
+                "TileLang Path C E8M0 Sparse-MLA QK has no safe dispatch surface: "
+                f"qk_reduce={reducer_status.reason}; "
+                f"T.fp8_scaled_matmul={probe_status.reason}"
+            ),
+            features=features,
+            target=target,
+            m=M,
+            n=N,
+            k=K,
+            transpose_B=transpose_B,
+        )
+
+    if probe_status.available:
+        return SparseMLABlockScaledPathCStatus(
+            available=True,
+            reason=probe_status.reason,
+            features={
+                **probe_status.features,
+                "dispatch_surface": "fp8_scaled_matmul",
+                "legacy_e8m0_scaled_matmul_probe_available": True,
+                "legacy_e8m0_scaled_matmul_probe_reason": probe_status.reason,
+            },
+            target=target,
+            m=M,
+            n=N,
+            k=K,
+            transpose_B=transpose_B,
+        )
+    features = {
+        **probe_status.features,
+        "dispatch_surface": "unavailable",
+        "legacy_e8m0_scaled_matmul_probe_available": False,
+        "legacy_e8m0_scaled_matmul_probe_reason": probe_status.reason,
+    }
+    return SparseMLABlockScaledPathCStatus(
+        available=False,
+        reason=probe_status.reason,
+        features=features,
+        target=target,
+        m=M,
+        n=N,
+        k=K,
+        transpose_B=transpose_B,
+    )
+
+
 __all__ = [
     "E8M0_BLOCK_SIZE",
     "E8M0_LAYOUT",
     "E8M0_SCALE_FORMAT",
+    "SparseMLABlockScaledQKReducePathCStatus",
     "SparseMLABlockScaledPathCStatus",
     "TILELANG_METAL_E8M0_SPARSE_MLA_TARGET",
     "blockscaled_sparse_mla_qk_msl_features",
     "blockscaled_sparse_mla_qk_path_c_status",
+    "blockscaled_sparse_mla_qk_reduce_msl_features",
+    "blockscaled_sparse_mla_qk_reduce_path_c",
+    "blockscaled_sparse_mla_qk_reduce_path_c_status",
+    "blockscaled_sparse_mla_qk_scaled_matmul_probe_status",
     "lower_blockscaled_sparse_mla_qk_msl",
+    "lower_blockscaled_sparse_mla_qk_reduce_msl",
+    "make_blockscaled_sparse_mla_qk_reduce_kernel",
     "make_blockscaled_sparse_mla_qk_kernel",
 ]

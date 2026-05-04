@@ -5,16 +5,18 @@ from types import ModuleType
 
 import cppmega_mlx.data as data
 import cppmega_mlx.config as config
+import cppmega_mlx.inference as inference
 import cppmega_mlx.kernels as kernels
 import cppmega_mlx.models as models
 import cppmega_mlx.nn as nn
+import cppmega_mlx.nn._tilelang as tilelang
 import cppmega_mlx.nn.m2rnn as m2rnn
 import cppmega_mlx as package
 import cppmega_mlx.recipes as recipes
 import cppmega_mlx.training as training
 from cppmega_mlx.data import fim as fim_module
 
-PACKAGE_ROOTS = (package, config, data, kernels, models, nn, recipes, training)
+PACKAGE_ROOTS = (package, config, data, inference, kernels, models, nn, recipes, training)
 FIM_DATA_EXPORTS = {
     "EOT_ID",
     "FIMMode",
@@ -77,6 +79,7 @@ def test_package_root_exposes_subpackages_without_overclaiming_runtime() -> None
     assert {
         "config",
         "data",
+        "inference",
         "kernels",
         "models",
         "nn",
@@ -85,6 +88,7 @@ def test_package_root_exposes_subpackages_without_overclaiming_runtime() -> None
     } <= _assert_public_exports(package)
     assert package.config is config
     assert package.data is data
+    assert package.inference is inference
     assert package.kernels is kernels
     assert package.models is models
     assert package.nn is nn
@@ -106,6 +110,10 @@ def test_package_roots_expose_local_mlx_contracts() -> None:
         "open_megatron_indexed_dataset",
         "megatron_indexed_side_channel_schema",
     } | FIM_DATA_EXPORTS <= _assert_public_exports(data)
+    assert {
+        "generate_tokens",
+        "sample_next_token",
+    } <= _assert_public_exports(inference)
     assert {
         "Mamba3CacheState",
         "Mamba3ReferenceBlock",
@@ -198,6 +206,14 @@ def test_nn_root_reexports_public_m2rnn_api() -> None:
     nn_exports = _assert_public_exports(nn)
 
     assert m2rnn_exports <= nn_exports
+
+
+def test_tilelang_root_exports_sparse_mla_path_c_status_not_direct_dispatch() -> None:
+    exports = _assert_public_exports(tilelang)
+
+    assert "sparse_mla_path_c_status" in exports
+    assert "sparse_mla_path_c_apply" not in exports
+    assert "sparse_mla_path_c_metal_apply" not in exports
 
 
 def test_training_root_does_not_export_foreign_trainers_or_generic_evaluate() -> None:

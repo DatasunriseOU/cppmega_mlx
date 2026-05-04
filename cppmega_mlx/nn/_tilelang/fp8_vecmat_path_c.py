@@ -1,3 +1,4 @@
+# pyright: reportInvalidTypeForm=false, reportMissingImports=false
 """Path C FP8 vecmat/GEMV via TileLang DSL lowering.
 
 This module is the TileLang-DSL counterpart to the hand-written Path B MSL
@@ -5,19 +6,38 @@ This module is the TileLang-DSL counterpart to the hand-written Path B MSL
 It is intentionally scoped to the inference shape that matters for this lane:
 ``M == 1``, ``B`` already transposed as ``(N, K)``, and e4m3 storage.
 
-The current TileLang Metal lowering can express the correct thread-level GEMV
-shape with ``tvm_thread_allreduce`` across K and now lowers the single-warp
-sum to literal Metal ``simd_sum``. Path B remains faster because it emits
-packed uint32 global loads instead of scalar FP8 byte decodes in the hot loop.
+The default Metal lowering uses a TileLang intrinsic for packed uint32 e4m3
+dot4 decode plus ``tvm_thread_allreduce`` across K. That keeps the generated
+MSL on the same hot-loop shape as Path B's hand-written vecmat kernel.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from functools import lru_cache
+from typing import Any, cast
+
+import mlx.core as mx
+
+from cppmega_mlx.nn._tilelang import _msl_transform
+from cppmega_mlx.nn._tilelang._msl_transform import (
+    MSLDispatchUnsupported,
+    can_run_metal,
+    lower_tilelang_to_msl_inline,
+)
 
 
 TILELANG_METAL_VECMAT_TARGET = "metal -thread_warp_size=32"
+
+# TileLang resolves these globals while decorating the nested @T.prim_func.
+# Defaults keep static tooling aligned with the runtime-specialized contract.
+_FP8_VM_N = 128
+_FP8_VM_K = 128
+_FP8_VM_NP = 4
+_FP8_VM_RT = 32
+_FP8_VM_VEC = 4
+_FP8_VM_BLOCK_K = _FP8_VM_RT * _FP8_VM_VEC
+_FP8_VM_K_WORDS = _FP8_VM_K // 4
 
 
 @dataclass(frozen=True)
@@ -68,7 +88,7 @@ def make_fp8_vecmat_reduce_kernel(
     *,
     N: int,
     K: int,
-    outputs_per_block: int = 4,
+    outputs_per_block: int = 1,
     reduce_threads: int = 32,
     vec: int = 4,
     vectorized_loads: bool = False,
@@ -80,6 +100,11 @@ def make_fp8_vecmat_reduce_kernel(
     * ``A`` is ``(1, K)`` e4m3.
     * ``B`` is ``(N, K)`` e4m3, i.e. already transposed.
     * ``C`` is ``(1, N)`` fp32.
+
+    The default uses one output row per Metal threadgroup. The older four-row
+    threadgroup shape matched Path B's launch grouping, but the lowered
+    TileLang MSL pays extra 2-D thread-indexing overhead and is slower on the
+    M4 Max vecmat_4096 gate.
 
     ``vectorized_loads=True`` mirrors upstream TileLang GEMV examples by
     staging a small local vector with ``T.vectorized(vec)``. On current
@@ -97,6 +122,8 @@ def make_fp8_vecmat_reduce_kernel(
 
     import tilelang.language as T
 
+    T = cast(Any, T)
+
     block_k = reduce_threads * vec
     g = globals()
     g.update(
@@ -106,6 +133,7 @@ def make_fp8_vecmat_reduce_kernel(
         _FP8_VM_RT=reduce_threads,
         _FP8_VM_VEC=vec,
         _FP8_VM_BLOCK_K=block_k,
+        _FP8_VM_K_WORDS=K // 4,
     )
 
     if vectorized_loads:
@@ -115,7 +143,7 @@ def make_fp8_vecmat_reduce_kernel(
             A: T.Tensor((1, _FP8_VM_K), "float8_e4m3"),
             A_scale: T.Tensor((1,), "float32"),
             B: T.Tensor((_FP8_VM_N, _FP8_VM_K), "float8_e4m3"),
-            B_scale: T.Tensor((1,), "float32"),
+            B_scale: T.Tensor((_FP8_VM_N,), "float32"),
             C: T.Tensor((1, _FP8_VM_N), "float32"),
         ):
             with T.Kernel(
@@ -156,7 +184,54 @@ def make_fp8_vecmat_reduce_kernel(
                         )
                     )
                 if kr == 0 and col < _FP8_VM_N:
-                    C[0, col] = reduced[0] * A_scale[0] * B_scale[0]
+                    C[0, col] = reduced[0] * A_scale[0] * B_scale[col]
+
+    elif vec == 4 and K % 4 == 0:
+
+        @T.prim_func
+        def fp8_vecmat_reduce(
+            A: T.Tensor((1, _FP8_VM_K), "float8_e4m3"),
+            A_scale: T.Tensor((1,), "float32"),
+            B: T.Tensor((_FP8_VM_N, _FP8_VM_K), "float8_e4m3"),
+            B_scale: T.Tensor((_FP8_VM_N,), "float32"),
+            C: T.Tensor((1, _FP8_VM_N), "float32"),
+        ):
+            with T.Kernel(
+                T.ceildiv(_FP8_VM_N, _FP8_VM_NP),
+                threads=(_FP8_VM_RT, _FP8_VM_NP),
+            ) as bx:
+                accum = T.alloc_local((1,), "float32")
+                reduced = T.alloc_local((1,), "float32")
+                kr = T.get_thread_binding(0)
+                ni = T.get_thread_binding(1)
+                col = bx * _FP8_VM_NP + ni
+                T.clear(accum)
+                for ko in T.serial(T.ceildiv(_FP8_VM_K_WORDS, _FP8_VM_RT)):
+                    i = ko * _FP8_VM_RT + kr
+                    if col < _FP8_VM_N and i < _FP8_VM_K_WORDS:
+                        accum[0] += T.metal_fp8_e4m3_dot4(
+                            T.access_ptr(A[0, 0], "r", extent=_FP8_VM_K),
+                            T.access_ptr(B[col, 0], "r", extent=_FP8_VM_K),
+                            i,
+                            i,
+                        )
+                with T.attr(
+                    T.comm_reducer(lambda x, y: x + y, [T.cast(0, "float32")]),
+                    "reduce_scope",
+                    T.reinterpret(T.uint64(0), dtype="handle"),
+                ):
+                    T.evaluate(
+                        T.tvm_thread_allreduce(
+                            T.uint32(1),
+                            accum[0],
+                            True,
+                            reduced[0],
+                            kr,
+                            dtype="handle",
+                        )
+                    )
+                if kr == 0 and col < _FP8_VM_N:
+                    C[0, col] = reduced[0] * A_scale[0] * B_scale[col]
 
     else:
 
@@ -165,7 +240,7 @@ def make_fp8_vecmat_reduce_kernel(
             A: T.Tensor((1, _FP8_VM_K), "float8_e4m3"),
             A_scale: T.Tensor((1,), "float32"),
             B: T.Tensor((_FP8_VM_N, _FP8_VM_K), "float8_e4m3"),
-            B_scale: T.Tensor((1,), "float32"),
+            B_scale: T.Tensor((_FP8_VM_N,), "float32"),
             C: T.Tensor((1, _FP8_VM_N), "float32"),
         ):
             with T.Kernel(
@@ -201,7 +276,7 @@ def make_fp8_vecmat_reduce_kernel(
                         )
                     )
                 if kr == 0 and col < _FP8_VM_N:
-                    C[0, col] = reduced[0] * A_scale[0] * B_scale[0]
+                    C[0, col] = reduced[0] * A_scale[0] * B_scale[col]
 
     try:
         from tilelang.transform.simplify import apply_simplify
@@ -215,7 +290,7 @@ def lower_fp8_vecmat_msl(
     *,
     N: int = 4096,
     K: int = 4096,
-    outputs_per_block: int = 4,
+    outputs_per_block: int = 1,
     reduce_threads: int = 32,
     vec: int = 4,
     vectorized_loads: bool = False,
@@ -224,7 +299,7 @@ def lower_fp8_vecmat_msl(
     """Lower the Path C vecmat reducer and return the emitted MSL source."""
 
     import tilelang
-    from tvm.target import Target
+    from tilelang import tvm
 
     prim = make_fp8_vecmat_reduce_kernel(
         N=N,
@@ -234,11 +309,12 @@ def lower_fp8_vecmat_msl(
         vec=vec,
         vectorized_loads=vectorized_loads,
     )
-    artifact = tilelang.lower(prim, target=Target(target))
+    artifact = tilelang.lower(prim, target=tvm.target.Target(target))
     if hasattr(artifact, "kernel_source"):
         return str(artifact.kernel_source)
-    if hasattr(artifact, "rt_mod") and hasattr(artifact.rt_mod, "get_source"):
-        return str(artifact.rt_mod.get_source())
+    rt_mod = getattr(artifact, "rt_mod", None)
+    if rt_mod is not None and hasattr(rt_mod, "get_source"):
+        return str(rt_mod.get_source())
     return str(artifact)
 
 
@@ -257,6 +333,8 @@ def fp8_vecmat_msl_features(msl: str) -> dict[str, int]:
         "device_const_uint": msl.count("device const uint"),
         "uint_pointer": msl.count("uint*"),
         "uchar4": lowered.count("uchar4"),
+        "fp8_e4m3_lut": msl.count("fp8_e4m3fn_lut"),
+        "metal_fp8_dot4_helper": msl.count("__tvm_fp8_e4m3_dot4_packed"),
         "scalar_fp8_byte_decode": scalar_decode_sites,
         "scalar_fp8_byte_decode_calls": max(0, scalar_decode_sites - 1),
     }
@@ -271,6 +349,8 @@ def fp8_vecmat_msl_blockers(msl: str) -> dict[str, Any]:
         missing.append("packed_uint32_fp8_loads")
     if features["simd_sum"] == 0:
         missing.append("metal_simd_sum_reduction")
+    if features["fp8_e4m3_lut"] == 0 or features["metal_fp8_dot4_helper"] == 0:
+        missing.append("packed_lut_dot4_decode")
     if features["scalar_fp8_byte_decode_calls"] > 0:
         missing.append("lut_or_packed_decode_instead_of_scalar_fp8_helper_calls")
     return {
@@ -280,14 +360,248 @@ def fp8_vecmat_msl_blockers(msl: str) -> dict[str, Any]:
         "required_fast_path": {
             "packed_uint32_fp8_loads": "reinterpret_cast<device const uint*> loads for 4 FP8 bytes",
             "metal_simd_sum_reduction": "literal Metal simd_sum(sum) reduction",
+            "packed_lut_dot4_decode": "fp8_e4m3fn_lut-backed packed dot4 decode in the hot loop",
             "no_scalar_fp8_helper_calls": "avoid per-byte __tvm_fp8_e4m3_to_half calls in the hot loop",
         },
     }
 
 
+@lru_cache(maxsize=128)
+def _fp8_vecmat_kernel_for(
+    N: int,
+    K: int,
+    outputs_per_block: int,
+    reduce_threads: int,
+    vec: int,
+    scale_w_per_row: bool,
+) -> tuple[
+    Any,
+    _msl_transform.TileLangMSLLowering,
+    list[str],
+    tuple[int, ...],
+    tuple[int, int, int],
+    tuple[int, int, int],
+]:
+    """Build and cache the MLX-dispatchable TileLang FP8 vecmat reducer."""
+
+    prim = make_fp8_vecmat_reduce_kernel(
+        N=N,
+        K=K,
+        outputs_per_block=outputs_per_block,
+        reduce_threads=reduce_threads,
+        vec=vec,
+    )
+    lowering = lower_tilelang_to_msl_inline(prim, target=TILELANG_METAL_VECMAT_TARGET)
+    tilelang_input_names = [name for name in lowering.buffer_param_names if name != "C"]
+    if set(tilelang_input_names) != {"A", "A_scale", "B", "B_scale"}:
+        raise MSLDispatchUnsupported(
+            "unexpected TileLang FP8 vecmat buffer signature: "
+            + ", ".join(lowering.buffer_param_names)
+        )
+    input_names = ["A", "A_scale", "B", "B_scale"]
+    source = lowering.body
+    threadgroup = lowering.threadgroup
+    grid = _grid_for_lowering(lowering)
+    output_shape: tuple[int, ...] = (1, N)
+    if reduce_threads == 32 and vec == 4 and K % 4 == 0:
+        source = canonical_vecmat_runtime_body(N=N, K=K, scale_w_per_row=scale_w_per_row)
+        output_shape = (N,)
+        # Four SIMD-groups per threadgroup matches Path B's launch occupancy
+        # while retaining the faster direct tuple dispatch path below.
+        threadgroup = (128, 1, 1)
+        grid = (((N * 32 + threadgroup[0] - 1) // threadgroup[0]) * threadgroup[0], 1, 1)
+    kernel = mx.fast.metal_kernel(
+        name=(
+            f"cppmega_fp8_vecmat_path_c_{N}_{K}_{outputs_per_block}_"
+            f"{reduce_threads}_{vec}_{int(scale_w_per_row)}"
+        ),
+        input_names=input_names,
+        output_names=["C"],
+        source=source,
+        header=lowering.header,
+        ensure_row_contiguous=True,
+    )
+    return kernel, lowering, input_names, output_shape, grid, threadgroup
+
+
+def canonical_vecmat_runtime_body(*, N: int, K: int, scale_w_per_row: bool) -> str:
+    """Path-C runtime body canonicalized to one SIMD-group per output row."""
+
+    k_words = K // 4
+    scale_w_expr = "B_scale[row]" if scale_w_per_row else "B_scale[0]"
+    # Keep the hot loop structurally aligned with Path B, but specialize known
+    # dimensions so Path C does not pay dynamic shape loads in the kernel.
+    return f"""
+    uint gid = thread_position_in_grid.x;
+    uint simd_lane = thread_index_in_simdgroup;
+    uint row = gid / 32u;
+    if (row >= {N}u) return;
+
+    uint row_offset = row * {K}u;
+    float sum = 0.0f;
+
+    device const uint* A4 = reinterpret_cast<device const uint*>(A);
+    device const uint* B4 = reinterpret_cast<device const uint*>(B + row_offset);
+    uint K4 = {k_words}u;
+    for (uint i = simd_lane; i < K4; i += 32u) {{
+        uint px = A4[i];
+        uint pw = B4[i];
+        sum += fp8_e4m3fn_lut[px & 0xFFu]          * fp8_e4m3fn_lut[pw & 0xFFu]
+             + fp8_e4m3fn_lut[(px >> 8) & 0xFFu]   * fp8_e4m3fn_lut[(pw >> 8) & 0xFFu]
+             + fp8_e4m3fn_lut[(px >> 16) & 0xFFu]  * fp8_e4m3fn_lut[(pw >> 16) & 0xFFu]
+             + fp8_e4m3fn_lut[(px >> 24) & 0xFFu]  * fp8_e4m3fn_lut[(pw >> 24) & 0xFFu];
+    }}
+
+    sum = simd_sum(sum);
+
+    if (simd_lane == 0u) {{
+        float sx = float(A_scale[0]);
+        float sw = float({scale_w_expr});
+        C[row] = sum * sx * sw;
+    }}
+"""
+
+
+def _grid_for_lowering(
+    lowering: _msl_transform.TileLangMSLLowering,
+) -> tuple[int, int, int]:
+    return (
+        max(1, lowering.grid[0] * lowering.threadgroup[0]),
+        max(1, lowering.grid[1] * lowering.threadgroup[1]),
+        max(1, lowering.grid[2] * lowering.threadgroup[2]),
+    )
+
+
+def _resolve_vecmat_scale(
+    scale: mx.array | float,
+    *,
+    length: int,
+    name: str,
+    scalar_only: bool = False,
+) -> mx.array:
+    if isinstance(scale, (int, float)):
+        return mx.array([float(scale)], dtype=mx.float32)
+    if scale.ndim == 1 and scale.dtype == mx.float32:
+        arr = scale
+    else:
+        arr = scale.reshape((scale.size,))
+        if arr.dtype != mx.float32:
+            arr = arr.astype(mx.float32)
+    if arr.size == 1:
+        return arr
+    if not scalar_only and arr.size == length:
+        return arr
+    expected = "1" if scalar_only else f"1 or {length}"
+    raise ValueError(f"fp8_scaled_vecmat_path_c: expected {name} size {expected}; got shape {tuple(scale.shape)}")
+
+
+def _normalize_vecmat_inputs(
+    x_fp8: mx.array,
+    W_fp8: mx.array,
+    scale_x: mx.array | float,
+    scale_w: mx.array | float,
+) -> tuple[mx.array, mx.array, mx.array, mx.array, int, int, bool]:
+    if x_fp8.ndim != 1 or W_fp8.ndim != 2:
+        raise ValueError(
+            f"fp8_scaled_vecmat_path_c expects 1D x and 2D W; got "
+            f"x.ndim={x_fp8.ndim}, W.ndim={W_fp8.ndim}"
+        )
+    if x_fp8.dtype != mx.uint8 or W_fp8.dtype != mx.uint8:
+        raise ValueError(f"x_fp8/W_fp8 must be mx.uint8 e4m3 storage; got {x_fp8.dtype}, {W_fp8.dtype}")
+    (k,) = x_fp8.shape
+    n, k_w = W_fp8.shape
+    if k != k_w:
+        raise ValueError(f"fp8_scaled_vecmat_path_c shape mismatch: x=(K={k},), W=(N={n}, K={k_w})")
+    if k % 4 != 0:
+        raise ValueError(f"fp8_scaled_vecmat_path_c: K must be a multiple of 4; got K={k}")
+
+    scale_x_arr = _resolve_vecmat_scale(scale_x, length=1, name="scale_x", scalar_only=True)
+    scale_w_arr = _resolve_vecmat_scale(scale_w, length=n, name="scale_w")
+    scale_w_per_row = scale_w_arr.size == n
+    return (
+        x_fp8,
+        scale_x_arr,
+        W_fp8,
+        scale_w_arr,
+        int(n),
+        int(k),
+        scale_w_per_row,
+    )
+
+
+def fp8_scaled_vecmat_path_c(
+    x_fp8: mx.array,
+    W_fp8: mx.array,
+    *,
+    scale_x: mx.array | float,
+    scale_w: mx.array | float,
+    outputs_per_block: int = 1,
+    reduce_threads: int = 32,
+    vec: int = 4,
+) -> mx.array | None:
+    """Run Path C TileLang FP8 vecmat through MLX Metal.
+
+    ``x_fp8`` is ``(K,)`` uint8 e4m3 storage and ``W_fp8`` is transposed
+    ``(N, K)`` storage, matching Path B. ``scale_x`` is scalar; ``scale_w`` may
+    be scalar or per-output ``(N,)``. Returns ``None`` only when the TileLang
+    Metal dispatch surface is unavailable.
+    """
+
+    if not can_run_metal():
+        return None
+    A, A_scale, B, B_scale, n, k, scale_w_per_row = _normalize_vecmat_inputs(
+        x_fp8,
+        W_fp8,
+        scale_x,
+        scale_w,
+    )
+    try:
+        kernel, _lowering, input_names, output_shape, grid, threadgroup = _fp8_vecmat_kernel_for(
+            n,
+            k,
+            outputs_per_block,
+            reduce_threads,
+            vec,
+            scale_w_per_row,
+        )
+    except MSLDispatchUnsupported:
+        return None
+
+    if output_shape == (n,) and input_names == ["A", "A_scale", "B", "B_scale"]:
+        outputs = cast(_msl_transform.MetalKernel, kernel)(
+            inputs=(A, A_scale, B, B_scale),
+            template=None,
+            output_shapes=(output_shape,),
+            output_dtypes=(mx.float32,),
+            grid=grid,
+            threadgroup=threadgroup,
+            stream=mx.gpu,
+        )
+        return outputs[0]
+
+    input_map = {
+        "A": A.reshape((1, k)),
+        "A_scale": A_scale,
+        "B": B,
+        "B_scale": B_scale,
+    }
+    outputs = _msl_transform.dispatch(
+        cast(_msl_transform.MetalKernel, kernel),
+        inputs=[input_map[name] for name in input_names],
+        output_shapes=[output_shape],
+        output_dtypes=[mx.float32],
+        grid=grid,
+        threadgroup=threadgroup,
+    )
+    out = outputs[0]
+    return out if out.ndim == 1 else out.reshape((n,))
+
+
 __all__ = [
     "FP8VecmatPathCStatus",
     "TILELANG_METAL_VECMAT_TARGET",
+    "canonical_vecmat_runtime_body",
+    "fp8_scaled_vecmat_path_c",
     "fp8_vecmat_msl_blockers",
     "fp8_vecmat_msl_features",
     "fp8_vecmat_path_c_status",

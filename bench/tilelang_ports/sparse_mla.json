@@ -5,9 +5,28 @@
   "machine": "arm64",
   "mlx_version": "0.31.1",
   "fp16_carrier": true,
+  "fwd_only": false,
+  "strict_policy": {
+    "path_c_over_path_b_max_ratio": 1.0,
+    "requires_path_b_and_path_c": true,
+    "fwd_only": false,
+    "phase": "all"
+  },
+  "strict": {
+    "enabled": true,
+    "passed": true,
+    "path_c_over_path_b_max_ratio": 1.0,
+    "phase": "all",
+    "fwd_only": false,
+    "failures": []
+  },
   "path_b_status": {
     "available": true,
     "reason": "sparse_mla direct-MSL kernel built via mx.fast.metal_kernel is available; bypasses TileLang's T.gemm metal blocker."
+  },
+  "path_c_status": {
+    "available": true,
+    "reason": "Sparse-MLA Path C forward/backward TileLang DSL ready"
   },
   "rows": [
     {
@@ -23,48 +42,185 @@
       },
       "fwd_reference_ms": {
         "label": "reference_fwd",
-        "median_ms": 0.3045625053346157,
-        "min_ms": 0.2698330208659172,
-        "max_ms": 0.398874981328845,
+        "ok": true,
+        "median_ms": 0.5088755860924721,
+        "min_ms": 0.4468339029699564,
+        "max_ms": 0.6669159047305584,
         "iters": 20,
         "warmup": 5
       },
       "fwd_apply_ms": {
         "label": "apply_fwd",
-        "median_ms": 0.19204092677682638,
-        "min_ms": 0.1691670622676611,
-        "max_ms": 0.37195906043052673,
+        "ok": true,
+        "median_ms": 0.2631660318002105,
+        "min_ms": 0.2083340659737587,
+        "max_ms": 0.366083113476634,
         "iters": 20,
         "warmup": 5
       },
       "fwd_msl_ms": {
         "label": "path_b_msl_fwd",
-        "median_ms": 0.16543746460229158,
-        "min_ms": 0.14849985018372536,
-        "max_ms": 0.3844161983579397,
+        "ok": true,
+        "median_ms": 0.33935403916984797,
+        "min_ms": 0.216625165194273,
+        "max_ms": 2.4489169009029865,
         "iters": 20,
         "warmup": 5
       },
+      "fwd_path_c_ms": {
+        "label": "path_c_tilelang_fwd",
+        "ok": true,
+        "median_ms": 0.5448755109682679,
+        "min_ms": 0.22033415734767914,
+        "max_ms": 0.6674169562757015,
+        "iters": 20,
+        "warmup": 5
+      },
+      "fwd_msl_paired_ms": {
+        "label": "path_b_msl_fwd_paired",
+        "ok": true,
+        "median_ms": 0.2044999273493886,
+        "min_ms": 0.1960410736501217,
+        "max_ms": 0.29699993319809437,
+        "iters": 20,
+        "warmup": 5
+      },
+      "fwd_path_c_paired_ms": {
+        "label": "path_c_tilelang_fwd_paired",
+        "ok": true,
+        "median_ms": 0.20497955847531557,
+        "min_ms": 0.19162497483193874,
+        "max_ms": 0.2462498378008604,
+        "iters": 20,
+        "warmup": 5,
+        "pair_ratio_median": 0.9789618739606343,
+        "pair_ratio_min": 0.7564543883098608,
+        "pair_ratio_max": 1.2561134930343592
+      },
+      "fwd_path_c_over_path_b_ratio": 1.6056255358008444,
+      "fwd_path_c_over_path_b_paired_ratio": 0.9789618739606343,
+      "path_c_over_path_b_max_ratio": 1.0,
+      "fwd_path_c_no_worse_than_path_b": true,
+      "fwd_path_c_no_worse_than_path_b_paired": true,
+      "fwd_path_c_unpaired_within_max_ratio": false,
+      "path_b": {
+        "available": true,
+        "reason": "sparse_mla direct-MSL kernel built via mx.fast.metal_kernel is available; bypasses TileLang's T.gemm metal blocker."
+      },
+      "path_c": {
+        "available": true,
+        "reason": "Sparse-MLA Path C forward/backward TileLang DSL ready"
+      },
       "bwd_reference_ms": {
         "label": "reference_bwd",
-        "median_ms": 0.42310403659939766,
-        "min_ms": 0.392459100112319,
-        "max_ms": 0.723833916708827,
+        "ok": true,
+        "median_ms": 0.7143545662984252,
+        "min_ms": 0.5975000094622374,
+        "max_ms": 0.8313329890370369,
         "iters": 20,
         "warmup": 5
       },
       "bwd_msl_ms": {
         "label": "path_b_msl_bwd",
-        "median_ms": 0.21860399283468723,
-        "min_ms": 0.1968329306691885,
-        "max_ms": 0.3337911330163479,
+        "ok": true,
+        "median_ms": 0.3629166167229414,
+        "min_ms": 0.33449986949563026,
+        "max_ms": 0.42054103687405586,
         "iters": 20,
         "warmup": 5
       },
-      "path_b": {
-        "available": true,
-        "reason": "sparse_mla direct-MSL kernel built via mx.fast.metal_kernel is available; bypasses TileLang's T.gemm metal blocker."
-      }
+      "bwd_msl_paired_ms": {
+        "label": "path_b_msl_bwd_paired",
+        "ok": true,
+        "median_ms": 0.38716651033610106,
+        "min_ms": 0.34262496046721935,
+        "max_ms": 0.516833970323205,
+        "iters": 20,
+        "warmup": 5
+      },
+      "bwd_msl_kernel_ms": {
+        "label": "path_b_msl_bwd_kernel_only",
+        "ok": true,
+        "median_ms": 0.2708961255848408,
+        "min_ms": 0.23908400908112526,
+        "max_ms": 0.31687505543231964,
+        "iters": 20,
+        "warmup": 5
+      },
+      "bwd_msl_fresh_reduce_ms": {
+        "label": "path_b_msl_bwd_fresh_reduce",
+        "ok": true,
+        "median_ms": 0.36900013219565153,
+        "min_ms": 0.3409581258893013,
+        "max_ms": 0.46045915223658085,
+        "iters": 20,
+        "warmup": 5
+      },
+      "bwd_msl_reduce_ms": {
+        "label": "path_b_msl_bwd_reduce_only",
+        "ok": true,
+        "median_ms": 0.26524998247623444,
+        "min_ms": 0.22204197011888027,
+        "max_ms": 0.30629104003310204,
+        "iters": 20,
+        "warmup": 5
+      },
+      "bwd_path_c_ms": {
+        "label": "path_c_tilelang_bwd",
+        "ok": true,
+        "median_ms": 0.3621248761191964,
+        "min_ms": 0.3260830417275429,
+        "max_ms": 0.7642088457942009,
+        "iters": 20,
+        "warmup": 5
+      },
+      "bwd_path_c_paired_ms": {
+        "label": "path_c_tilelang_bwd_paired",
+        "ok": true,
+        "median_ms": 0.3857710398733616,
+        "min_ms": 0.33737486228346825,
+        "max_ms": 0.566291157156229,
+        "iters": 20,
+        "warmup": 5,
+        "pair_ratio_median": 0.9863642344125931,
+        "pair_ratio_min": 0.761929646339623,
+        "pair_ratio_max": 1.3351987233222606
+      },
+      "bwd_path_c_kernel_ms": {
+        "label": "path_c_tilelang_bwd_kernel_only",
+        "ok": true,
+        "median_ms": 0.2572080120444298,
+        "min_ms": 0.23887515999376774,
+        "max_ms": 0.3451250959187746,
+        "iters": 20,
+        "warmup": 5
+      },
+      "bwd_path_c_fresh_reduce_ms": {
+        "label": "path_c_tilelang_bwd_fresh_reduce",
+        "ok": true,
+        "median_ms": 0.362811959348619,
+        "min_ms": 0.3284171689301729,
+        "max_ms": 0.5834170151501894,
+        "iters": 20,
+        "warmup": 5
+      },
+      "bwd_path_c_reduce_ms": {
+        "label": "path_c_tilelang_bwd_reduce_only",
+        "ok": true,
+        "median_ms": 0.24522899184376,
+        "min_ms": 0.2204999327659607,
+        "max_ms": 0.3440000582486391,
+        "iters": 20,
+        "warmup": 5
+      },
+      "bwd_path_c_over_path_b_ratio": 0.997818395280728,
+      "bwd_path_c_over_path_b_paired_ratio": 0.9863642344125931,
+      "bwd_path_c_kernel_over_path_b_kernel_ratio": 0.9494709881477279,
+      "bwd_path_c_fresh_reduce_over_path_b_fresh_reduce_ratio": 0.9832298898913363,
+      "bwd_path_c_reduce_over_path_b_reduce_ratio": 0.9245202942312419,
+      "bwd_path_c_no_worse_than_path_b": true,
+      "bwd_path_c_no_worse_than_path_b_paired": true,
+      "bwd_blocker": "none: Path C backward is within strict ratio 1"
     },
     {
       "shape": {
@@ -79,48 +235,185 @@
       },
       "fwd_reference_ms": {
         "label": "reference_fwd",
-        "median_ms": 0.6622289074584842,
-        "min_ms": 0.6308748852461576,
-        "max_ms": 0.8234591223299503,
+        "ok": true,
+        "median_ms": 0.9513329714536667,
+        "min_ms": 0.9174169972538948,
+        "max_ms": 1.1240001767873764,
         "iters": 20,
         "warmup": 5
       },
       "fwd_apply_ms": {
         "label": "apply_fwd",
-        "median_ms": 0.2726255916059017,
-        "min_ms": 0.2595840487629175,
-        "max_ms": 0.4384580533951521,
+        "ok": true,
+        "median_ms": 0.40760403499007225,
+        "min_ms": 0.3593750298023224,
+        "max_ms": 0.5952909123152494,
         "iters": 20,
         "warmup": 5
       },
       "fwd_msl_ms": {
         "label": "path_b_msl_fwd",
-        "median_ms": 0.2826038980856538,
-        "min_ms": 0.2612920943647623,
-        "max_ms": 0.40770811028778553,
+        "ok": true,
+        "median_ms": 0.35356252919882536,
+        "min_ms": 0.3293328918516636,
+        "max_ms": 0.3970409743487835,
         "iters": 20,
         "warmup": 5
       },
+      "fwd_path_c_ms": {
+        "label": "path_c_tilelang_fwd",
+        "ok": true,
+        "median_ms": 0.405103899538517,
+        "min_ms": 0.38779107853770256,
+        "max_ms": 1.1106671299785376,
+        "iters": 20,
+        "warmup": 5
+      },
+      "fwd_msl_paired_ms": {
+        "label": "path_b_msl_fwd_paired",
+        "ok": true,
+        "median_ms": 0.4164584679529071,
+        "min_ms": 0.39737485349178314,
+        "max_ms": 0.451916828751564,
+        "iters": 20,
+        "warmup": 5
+      },
+      "fwd_path_c_paired_ms": {
+        "label": "path_c_tilelang_fwd_paired",
+        "ok": true,
+        "median_ms": 0.4096659831702709,
+        "min_ms": 0.38499990478157997,
+        "max_ms": 0.5201669409871101,
+        "iters": 20,
+        "warmup": 5,
+        "pair_ratio_median": 0.986280731941101,
+        "pair_ratio_min": 0.8920337687174646,
+        "pair_ratio_max": 1.2550531323240925
+      },
+      "fwd_path_c_over_path_b_ratio": 1.1457772418827432,
+      "fwd_path_c_over_path_b_paired_ratio": 0.986280731941101,
+      "path_c_over_path_b_max_ratio": 1.0,
+      "fwd_path_c_no_worse_than_path_b": true,
+      "fwd_path_c_no_worse_than_path_b_paired": true,
+      "fwd_path_c_unpaired_within_max_ratio": false,
+      "path_b": {
+        "available": true,
+        "reason": "sparse_mla direct-MSL kernel built via mx.fast.metal_kernel is available; bypasses TileLang's T.gemm metal blocker."
+      },
+      "path_c": {
+        "available": true,
+        "reason": "Sparse-MLA Path C forward/backward TileLang DSL ready"
+      },
       "bwd_reference_ms": {
         "label": "reference_bwd",
-        "median_ms": 1.3848749222233891,
-        "min_ms": 1.3008338864892721,
-        "max_ms": 1.5331250615417957,
+        "ok": true,
+        "median_ms": 1.744479057379067,
+        "min_ms": 1.5491670928895473,
+        "max_ms": 2.027333015576005,
         "iters": 20,
         "warmup": 5
       },
       "bwd_msl_ms": {
         "label": "path_b_msl_bwd",
-        "median_ms": 0.47056248877197504,
-        "min_ms": 0.4547080025076866,
-        "max_ms": 0.619000056758523,
+        "ok": true,
+        "median_ms": 1.0810205712914467,
+        "min_ms": 0.9934159461408854,
+        "max_ms": 1.5196669846773148,
         "iters": 20,
         "warmup": 5
       },
-      "path_b": {
-        "available": true,
-        "reason": "sparse_mla direct-MSL kernel built via mx.fast.metal_kernel is available; bypasses TileLang's T.gemm metal blocker."
-      }
+      "bwd_msl_paired_ms": {
+        "label": "path_b_msl_bwd_paired",
+        "ok": true,
+        "median_ms": 1.0988749563694,
+        "min_ms": 0.9750828612595797,
+        "max_ms": 1.6122499946504831,
+        "iters": 20,
+        "warmup": 5
+      },
+      "bwd_msl_kernel_ms": {
+        "label": "path_b_msl_bwd_kernel_only",
+        "ok": true,
+        "median_ms": 0.5475829821079969,
+        "min_ms": 0.493000028654933,
+        "max_ms": 0.9923749603331089,
+        "iters": 20,
+        "warmup": 5
+      },
+      "bwd_msl_fresh_reduce_ms": {
+        "label": "path_b_msl_bwd_fresh_reduce",
+        "ok": true,
+        "median_ms": 1.0012495331466198,
+        "min_ms": 0.9537499863654375,
+        "max_ms": 1.1012910399585962,
+        "iters": 20,
+        "warmup": 5
+      },
+      "bwd_msl_reduce_ms": {
+        "label": "path_b_msl_bwd_reduce_only",
+        "ok": true,
+        "median_ms": 0.5963754374533892,
+        "min_ms": 0.5457501392811537,
+        "max_ms": 0.6547500379383564,
+        "iters": 20,
+        "warmup": 5
+      },
+      "bwd_path_c_ms": {
+        "label": "path_c_tilelang_bwd",
+        "ok": true,
+        "median_ms": 0.9518745355308056,
+        "min_ms": 0.9022080339491367,
+        "max_ms": 1.3796661514788866,
+        "iters": 20,
+        "warmup": 5
+      },
+      "bwd_path_c_paired_ms": {
+        "label": "path_c_tilelang_bwd_paired",
+        "ok": true,
+        "median_ms": 1.053937477990985,
+        "min_ms": 0.9299169760197401,
+        "max_ms": 1.4024581760168076,
+        "iters": 20,
+        "warmup": 5,
+        "pair_ratio_median": 0.9528290878755353,
+        "pair_ratio_min": 0.6663309053093763,
+        "pair_ratio_max": 1.2758318095467656
+      },
+      "bwd_path_c_kernel_ms": {
+        "label": "path_c_tilelang_bwd_kernel_only",
+        "ok": true,
+        "median_ms": 0.5105414893478155,
+        "min_ms": 0.46504195779561996,
+        "max_ms": 0.8435000199824572,
+        "iters": 20,
+        "warmup": 5
+      },
+      "bwd_path_c_fresh_reduce_ms": {
+        "label": "path_c_tilelang_bwd_fresh_reduce",
+        "ok": true,
+        "median_ms": 1.0823541088029742,
+        "min_ms": 0.985792139545083,
+        "max_ms": 2.5564159732311964,
+        "iters": 20,
+        "warmup": 5
+      },
+      "bwd_path_c_reduce_ms": {
+        "label": "path_c_tilelang_bwd_reduce_only",
+        "ok": true,
+        "median_ms": 0.6197295151650906,
+        "min_ms": 0.57050003670156,
+        "max_ms": 0.9530000388622284,
+        "iters": 20,
+        "warmup": 5
+      },
+      "bwd_path_c_over_path_b_ratio": 0.8805332301804801,
+      "bwd_path_c_over_path_b_paired_ratio": 0.9528290878755353,
+      "bwd_path_c_kernel_over_path_b_kernel_ratio": 0.9323545581756667,
+      "bwd_path_c_fresh_reduce_over_path_b_fresh_reduce_ratio": 1.081003359273954,
+      "bwd_path_c_reduce_over_path_b_reduce_ratio": 1.0391600261262046,
+      "bwd_path_c_no_worse_than_path_b": true,
+      "bwd_path_c_no_worse_than_path_b_paired": true,
+      "bwd_blocker": "none: Path C backward is within strict ratio 1"
     },
     {
       "shape": {
@@ -135,48 +428,185 @@
       },
       "fwd_reference_ms": {
         "label": "reference_fwd",
-        "median_ms": 1.9627080764621496,
-        "min_ms": 1.9030000548809767,
-        "max_ms": 2.0499590318650007,
+        "ok": true,
+        "median_ms": 1.9888125825673342,
+        "min_ms": 1.9142080564051867,
+        "max_ms": 2.212916035205126,
         "iters": 20,
         "warmup": 5
       },
       "fwd_apply_ms": {
         "label": "apply_fwd",
-        "median_ms": 0.6549168610945344,
-        "min_ms": 0.59908302500844,
-        "max_ms": 1.299707917496562,
+        "ok": true,
+        "median_ms": 0.6540210451930761,
+        "min_ms": 0.6229581777006388,
+        "max_ms": 0.7203749846667051,
         "iters": 20,
         "warmup": 5
       },
       "fwd_msl_ms": {
         "label": "path_b_msl_fwd",
-        "median_ms": 0.6497289286926389,
-        "min_ms": 0.5877499934285879,
-        "max_ms": 0.9210838470607996,
+        "ok": true,
+        "median_ms": 0.6391460774466395,
+        "min_ms": 0.59908302500844,
+        "max_ms": 0.714499969035387,
         "iters": 20,
         "warmup": 5
       },
+      "fwd_path_c_ms": {
+        "label": "path_c_tilelang_fwd",
+        "ok": true,
+        "median_ms": 0.6107079098001122,
+        "min_ms": 0.587834045290947,
+        "max_ms": 1.1003748513758183,
+        "iters": 20,
+        "warmup": 5
+      },
+      "fwd_msl_paired_ms": {
+        "label": "path_b_msl_fwd_paired",
+        "ok": true,
+        "median_ms": 0.7228541653603315,
+        "min_ms": 0.6157499738037586,
+        "max_ms": 1.9713749643415213,
+        "iters": 20,
+        "warmup": 5
+      },
+      "fwd_path_c_paired_ms": {
+        "label": "path_c_tilelang_fwd_paired",
+        "ok": true,
+        "median_ms": 0.7043329533189535,
+        "min_ms": 0.6042500026524067,
+        "max_ms": 1.6400408931076527,
+        "iters": 20,
+        "warmup": 5,
+        "pair_ratio_median": 0.9544853226416186,
+        "pair_ratio_min": 0.6154345774957265,
+        "pair_ratio_max": 1.6719888044489155
+      },
+      "fwd_path_c_over_path_b_ratio": 0.9555059967509516,
+      "fwd_path_c_over_path_b_paired_ratio": 0.9544853226416186,
+      "path_c_over_path_b_max_ratio": 1.0,
+      "fwd_path_c_no_worse_than_path_b": true,
+      "fwd_path_c_no_worse_than_path_b_paired": true,
+      "fwd_path_c_unpaired_within_max_ratio": true,
+      "path_b": {
+        "available": true,
+        "reason": "sparse_mla direct-MSL kernel built via mx.fast.metal_kernel is available; bypasses TileLang's T.gemm metal blocker."
+      },
+      "path_c": {
+        "available": true,
+        "reason": "Sparse-MLA Path C forward/backward TileLang DSL ready"
+      },
       "bwd_reference_ms": {
         "label": "reference_bwd",
-        "median_ms": 4.273728933185339,
-        "min_ms": 4.1577499359846115,
-        "max_ms": 4.351999843493104,
+        "ok": true,
+        "median_ms": 4.179979441687465,
+        "min_ms": 4.063500091433525,
+        "max_ms": 4.539333982393146,
         "iters": 20,
         "warmup": 5
       },
       "bwd_msl_ms": {
         "label": "path_b_msl_bwd",
-        "median_ms": 1.3683749129995704,
-        "min_ms": 1.276042079553008,
-        "max_ms": 1.4829998835921288,
+        "ok": true,
+        "median_ms": 3.2154585933312774,
+        "min_ms": 3.1490421388298273,
+        "max_ms": 3.3985839691013098,
         "iters": 20,
         "warmup": 5
       },
-      "path_b": {
-        "available": true,
-        "reason": "sparse_mla direct-MSL kernel built via mx.fast.metal_kernel is available; bypasses TileLang's T.gemm metal blocker."
-      }
+      "bwd_msl_paired_ms": {
+        "label": "path_b_msl_bwd_paired",
+        "ok": true,
+        "median_ms": 3.2436869805678725,
+        "min_ms": 3.172666998580098,
+        "max_ms": 4.219457972794771,
+        "iters": 20,
+        "warmup": 5
+      },
+      "bwd_msl_kernel_ms": {
+        "label": "path_b_msl_bwd_kernel_only",
+        "ok": true,
+        "median_ms": 1.3682085555046797,
+        "min_ms": 1.3169168960303068,
+        "max_ms": 1.9037919119000435,
+        "iters": 20,
+        "warmup": 5
+      },
+      "bwd_msl_fresh_reduce_ms": {
+        "label": "path_b_msl_bwd_fresh_reduce",
+        "ok": true,
+        "median_ms": 3.265624982304871,
+        "min_ms": 3.204416949301958,
+        "max_ms": 3.7985830567777157,
+        "iters": 20,
+        "warmup": 5
+      },
+      "bwd_msl_reduce_ms": {
+        "label": "path_b_msl_bwd_reduce_only",
+        "ok": true,
+        "median_ms": 2.09958350751549,
+        "min_ms": 1.9423749763518572,
+        "max_ms": 2.5133751332759857,
+        "iters": 20,
+        "warmup": 5
+      },
+      "bwd_path_c_ms": {
+        "label": "path_c_tilelang_bwd",
+        "ok": true,
+        "median_ms": 3.15445801243186,
+        "min_ms": 3.060457995161414,
+        "max_ms": 3.3690829295665026,
+        "iters": 20,
+        "warmup": 5
+      },
+      "bwd_path_c_paired_ms": {
+        "label": "path_c_tilelang_bwd_paired",
+        "ok": true,
+        "median_ms": 3.1869164668023586,
+        "min_ms": 3.0899581033736467,
+        "max_ms": 3.3125418704003096,
+        "iters": 20,
+        "warmup": 5,
+        "pair_ratio_median": 0.9869828082802563,
+        "pair_ratio_min": 0.7551424935524665,
+        "pair_ratio_max": 1.0206781979486759
+      },
+      "bwd_path_c_kernel_ms": {
+        "label": "path_c_tilelang_bwd_kernel_only",
+        "ok": true,
+        "median_ms": 1.3220836408436298,
+        "min_ms": 1.273083034902811,
+        "max_ms": 1.6095410101115704,
+        "iters": 20,
+        "warmup": 5
+      },
+      "bwd_path_c_fresh_reduce_ms": {
+        "label": "path_c_tilelang_bwd_fresh_reduce",
+        "ok": true,
+        "median_ms": 3.2718749716877937,
+        "min_ms": 3.129000077024102,
+        "max_ms": 3.671125043183565,
+        "iters": 20,
+        "warmup": 5
+      },
+      "bwd_path_c_reduce_ms": {
+        "label": "path_c_tilelang_bwd_reduce_only",
+        "ok": true,
+        "median_ms": 2.0773543510586023,
+        "min_ms": 1.9916249439120293,
+        "max_ms": 2.4284161627292633,
+        "iters": 20,
+        "warmup": 5
+      },
+      "bwd_path_c_over_path_b_ratio": 0.9810289639474973,
+      "bwd_path_c_over_path_b_paired_ratio": 0.9869828082802563,
+      "bwd_path_c_kernel_over_path_b_kernel_ratio": 0.9662880965950135,
+      "bwd_path_c_fresh_reduce_over_path_b_fresh_reduce_ratio": 1.0019138723572942,
+      "bwd_path_c_reduce_over_path_b_reduce_ratio": 0.9894125876025802,
+      "bwd_path_c_no_worse_than_path_b": true,
+      "bwd_path_c_no_worse_than_path_b_paired": true,
+      "bwd_blocker": "none: Path C backward is within strict ratio 1"
     }
   ]
 }

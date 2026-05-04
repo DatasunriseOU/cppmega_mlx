@@ -28,7 +28,7 @@
       "status_short": {
         "ok": true,
         "returncode": 0,
-        "stdout": "M bench/tilelang_ports/fp8_path_c_vs_path_b.json\n M bench/tilelang_ports/sparse_mla.json\n M bench/tilelang_ports/sparse_mla_blockscaled.json\n M bench/tilelang_ports/sparse_mla_fp8.json\n M bench/tilelang_ports/topk_selector.json\n M cppmega_mlx/__init__.py\n M cppmega_mlx/models/hybrid_lm.py\n M cppmega_mlx/nn/_tilelang/__init__.py\n M cppmega_mlx/nn/_tilelang/_msl_transform.py\n M cppmega_mlx/nn/_tilelang/fp8_vecmat_path_c.py\n M cppmega_mlx/nn/_tilelang/sparse_mla_blockscaled.py\n M cppmega_mlx/nn/_tilelang/sparse_mla_blockscaled_path_c.py\n M cppmega_mlx/nn/_tilelang/sparse_mla_fp8_path_c.py\n M cppmega_mlx/nn/_tilelang/sparse_mla_path_c.py\n M cppmega_mlx/nn/_tilelang/topk_selector.py\n M cppmega_mlx/nn/sparse_mla.py\n M docs/mlx_buy_vs_build.md\n M docs/mlx_port_master_plan.md\n M docs/production_kernel_routing.md\n M docs/tilelang_ports/sparse_mla.md\n M docs/tilelang_ports/sparse_mla_blockscaled.md\n M docs/tilelang_ports/sparse_mla_fp8.md\n M docs/tilelang_ports/topk_selector.md\n M docs/upstream/_path_c_blockers_tracker.md\n M scripts/bench_tilelang_fp8_path_c.py\n M scripts/bench_tilelang_sparse_mla.py\n M scripts/bench_tilelang_sparse_mla_fp8.py\n M scripts/bench_tilelang_topk.py\n M scripts/m04_train_step.py\n M tests/test_hybrid_lm.py\n M tests/test_m04_train_step.py\n M tests/test_package_exports.py\n M tests/test_sparse_mla_dispatch.py\n M tests/test_tilelang_fp8_vecmat_path_c.py\n M tests/test_tilelang_sparse_mla.py\n M tests/test_tilelang_sparse_mla_blockscaled.py\n M tests/test_tilelang_sparse_mla_fp8.py\n M tests/test_tilelang_topk.py\n M tests/test_tokenizer_loader.py\n?? bench/tilelang_ports/fp8_path_c.json\n?? cppmega_mlx/inference/\n?? tests/test_inference_engine.py\n?? tests/test_inference_generation.py\n?? tests/test_inference_infilling.py\n?? tests/test_inference_quantization.py\n?? tests/test_inference_sampling.py\n?? tests/test_inference_serving.py\n?? tests/test_inference_speculative_decode.py\n?? tests/test_mhc_integration.py\n?? tests/test_tilelang_bench_harness.py\n?? tests/test_tilelang_fp8_matmul_path_c_bench.py\n?? tests/test_tilelang_msl_transform.py",
+        "stdout": "M bench/tilelang_ports/fp8_path_c_vs_path_b.json\n M bench/tilelang_ports/sparse_mla.json\n M bench/tilelang_ports/sparse_mla_blockscaled.json\n M bench/tilelang_ports/sparse_mla_fp8.json\n M bench/tilelang_ports/topk_selector.json\n M cppmega_mlx/__init__.py\n M cppmega_mlx/models/hybrid_lm.py\n M cppmega_mlx/nn/_tilelang/__init__.py\n M cppmega_mlx/nn/_tilelang/_msl_transform.py\n M cppmega_mlx/nn/_tilelang/fp8_vecmat_path_c.py\n M cppmega_mlx/nn/_tilelang/sparse_mla_blockscaled.py\n M cppmega_mlx/nn/_tilelang/sparse_mla_blockscaled_path_c.py\n M cppmega_mlx/nn/_tilelang/sparse_mla_fp8_path_c.py\n M cppmega_mlx/nn/_tilelang/sparse_mla_path_c.py\n M cppmega_mlx/nn/_tilelang/topk_selector.py\n M cppmega_mlx/nn/sparse_mla.py\n M docs/mlx_buy_vs_build.md\n M docs/mlx_port_master_plan.md\n M docs/production_kernel_routing.md\n M docs/tilelang_ports/sparse_mla.md\n M docs/tilelang_ports/sparse_mla_blockscaled.md\n M docs/tilelang_ports/sparse_mla_fp8.md\n M docs/tilelang_ports/topk_selector.md\n M docs/upstream/_path_c_blockers_tracker.md\n M scripts/bench_tilelang_fp8_path_c.py\n M scripts/bench_tilelang_sparse_mla.py\n M scripts/bench_tilelang_sparse_mla_fp8.py\n M scripts/bench_tilelang_topk.py\n M tests/test_hybrid_lm.py\n M tests/test_m04_train_step.py\n M tests/test_package_exports.py\n M tests/test_sparse_mla_dispatch.py\n M tests/test_tilelang_fp8_vecmat_path_c.py\n M tests/test_tilelang_sparse_mla.py\n M tests/test_tilelang_sparse_mla_blockscaled.py\n M tests/test_tilelang_sparse_mla_fp8.py\n M tests/test_tilelang_topk.py\n M tests/test_tokenizer_loader.py\n?? cppmega_mlx/inference/\n?? tests/test_inference_engine.py\n?? tests/test_inference_generation.py\n?? tests/test_inference_infilling.py\n?? tests/test_inference_quantization.py\n?? tests/test_inference_sampling.py\n?? tests/test_inference_serving.py\n?? tests/test_inference_speculative_decode.py\n?? tests/test_mhc_integration.py\n?? tests/test_tilelang_bench_harness.py\n?? tests/test_tilelang_fp8_matmul_path_c_bench.py\n?? tests/test_tilelang_msl_transform.py",
         "stderr": ""
       }
     },
@@ -44,7 +44,7 @@
       "status_short": {
         "ok": true,
         "returncode": 0,
-        "stdout": "m 3rdparty/tvm\n M pyproject.toml\n M requirements-dev.txt\n M requirements.txt\n M src/op/builtin.cc\n M src/op/builtin.h\n M src/op/copy.cc\n M src/op/gemm_sp.h\n M src/op/reduce.cc\n M src/target/codegen_metal.cc\n M src/target/codegen_metal.h\n M src/transform/lower_thread_allreduce.cc\n M src/transform/storage_rewrite.cc\n M testing/python/metal/test_metal_simdgroup_store.py\n M testing/python/transform/test_readonly_param_const_codegen.py\n M tilelang/engine/phase.py\n M tilelang/intrinsics/metal_macro_generator.py\n M tilelang/language/__init__.py\n M tilelang/language/builtin.py\n M tilelang/language/loop.py\n M tilelang/tileop/gemm/__init__.py\n M tilelang/tileop/metal_quant.py\n M tilelang/transform/metal_fragment_to_simdgroup.py\n?? testing/python/cpu/test_fp8_scaled_matmul_lowering.py\n?? testing/python/metal/test_fp8_scaled_matmul_metal.py\n?? testing/python/metal/test_metal_fp8_vecmat_packed_lut.py\n?? testing/python/metal/test_metal_sparse_mla_bwd_reduction.py\n?? testing/python/metal/test_metal_sparse_mla_pipeline.py\n?? testing/python/metal/test_metal_topk_selector.py\n?? tilelang/language/fp8_op.py\n?? tilelang/tileop/gemm/gemm_metal_fp8.py\n?? tilelang/transform/fp8_scaled_matmul_to_gemm.py\n?? tmp_fp8_vecmat_probe.py",
+        "stdout": "m 3rdparty/tvm\n M pyproject.toml\n M requirements-dev.txt\n M requirements.txt\n M src/op/builtin.cc\n M src/op/builtin.h\n M src/op/copy.cc\n M src/op/gemm_sp.h\n M src/target/codegen_metal.cc\n M src/target/codegen_metal.h\n M src/transform/lower_thread_allreduce.cc\n M src/transform/storage_rewrite.cc\n M testing/python/metal/test_metal_simdgroup_store.py\n M testing/python/transform/test_readonly_param_const_codegen.py\n M tilelang/engine/phase.py\n M tilelang/intrinsics/metal_macro_generator.py\n M tilelang/language/__init__.py\n M tilelang/language/builtin.py\n M tilelang/language/loop.py\n M tilelang/tileop/gemm/__init__.py\n M tilelang/tileop/metal_quant.py\n M tilelang/transform/metal_fragment_to_simdgroup.py\n?? testing/python/cpu/test_fp8_scaled_matmul_lowering.py\n?? testing/python/metal/test_fp8_scaled_matmul_metal.py\n?? testing/python/metal/test_metal_fp8_vecmat_packed_lut.py\n?? testing/python/metal/test_metal_sparse_mla_bwd_reduction.py\n?? testing/python/metal/test_metal_sparse_mla_pipeline.py\n?? testing/python/metal/test_metal_topk_selector.py\n?? tilelang/language/fp8_op.py\n?? tilelang/tileop/gemm/gemm_metal_fp8.py\n?? tilelang/transform/fp8_scaled_matmul_to_gemm.py\n?? tmp_fp8_vecmat_probe.py",
         "stderr": ""
       }
     },
@@ -95,11 +95,11 @@
           "bench": {
             "label": "path_b_msl_fp8_scaled_matmul",
             "ok": true,
-            "median_ms": 0.12268754653632641,
-            "min_ms": 0.1105000264942646,
-            "p90_ms": 0.1473750453442335,
-            "max_ms": 0.20816689357161522,
-            "tflops": 0.03418687648756684,
+            "median_ms": 0.15214609447866678,
+            "min_ms": 0.1379579771310091,
+            "p90_ms": 0.16875006258487701,
+            "max_ms": 0.2517090179026127,
+            "tflops": 0.027567608714320995,
             "warmup": 10,
             "iters": 50,
             "paired": true,
@@ -143,17 +143,17 @@
             "air_path": null
           },
           "paired_ratios": {
-            "matmul_tl_fp8_scaled_matmul_over_path_b_msl_fp8_scaled_matmul_paired_median": 0.8900230393675586,
-            "matmul_tl_fp8_scaled_matmul_over_path_b_msl_fp8_scaled_matmul_paired_p90": 1.0814934598391828
+            "matmul_tl_fp8_scaled_matmul_over_path_b_msl_fp8_scaled_matmul_paired_median": 0.8963795799302364,
+            "matmul_tl_fp8_scaled_matmul_over_path_b_msl_fp8_scaled_matmul_paired_p90": 0.9909106644075656
           },
           "bench": {
             "label": "matmul_tl_fp8_scaled_matmul",
             "ok": true,
-            "median_ms": 0.10762503370642662,
-            "min_ms": 0.10091718286275864,
-            "p90_ms": 0.14066696166992188,
-            "max_ms": 0.2730421256273985,
-            "tflops": 0.038971453532279314,
+            "median_ms": 0.13624993152916431,
+            "min_ms": 0.12720911763608456,
+            "p90_ms": 0.15616603195667267,
+            "max_ms": 0.2377079799771309,
+            "tflops": 0.03078389803889339,
             "warmup": 10,
             "iters": 50,
             "paired": true,
@@ -170,7 +170,7 @@
         }
       ],
       "ratios": {
-        "matmul_tl_fp8_scaled_matmul_over_path_b": 0.8900230393675586
+        "matmul_tl_fp8_scaled_matmul_over_path_b": 0.8963795799302364
       }
     },
     {
@@ -192,11 +192,11 @@
           "bench": {
             "label": "path_b_msl_fp8_scaled_vecmat",
             "ok": true,
-            "median_ms": 0.19658368546515703,
-            "min_ms": 0.16300007700920105,
-            "p90_ms": 0.2282080240547657,
-            "max_ms": 0.6085829809308052,
-            "tflops": 0.17068777564426765,
+            "median_ms": 0.22514595184475183,
+            "min_ms": 0.1786251086741686,
+            "p90_ms": 0.2923749852925539,
+            "max_ms": 0.3470410592854023,
+            "tflops": 0.14903413419192754,
             "warmup": 10,
             "iters": 50,
             "paired": true,
@@ -214,19 +214,19 @@
           "bench": {
             "label": "path_c_mlx_tilelang_fp8_scaled_vecmat",
             "ok": true,
-            "median_ms": 0.18262502271682024,
-            "min_ms": 0.15562493354082108,
-            "p90_ms": 0.23154192604124546,
-            "max_ms": 0.6084591150283813,
-            "tflops": 0.18373403327116766,
+            "median_ms": 0.23016647901386023,
+            "min_ms": 0.17341692000627518,
+            "p90_ms": 0.27129193767905235,
+            "max_ms": 0.339999794960022,
+            "tflops": 0.1457833136422068,
             "warmup": 10,
             "iters": 50,
             "paired": true,
             "error": null
           },
           "paired_ratios": {
-            "path_c_mlx_tilelang_fp8_scaled_vecmat_over_path_b_msl_fp8_scaled_vecmat_paired_median": 0.9608089092133086,
-            "path_c_mlx_tilelang_fp8_scaled_vecmat_over_path_b_msl_fp8_scaled_vecmat_paired_p90": 1.1419314283421493
+            "path_c_mlx_tilelang_fp8_scaled_vecmat_over_path_b_msl_fp8_scaled_vecmat_paired_median": 0.9837469853400479,
+            "path_c_mlx_tilelang_fp8_scaled_vecmat_over_path_b_msl_fp8_scaled_vecmat_paired_p90": 1.1635124009142415
           },
           "source_metrics": {
             "source_len": 997,
@@ -309,7 +309,7 @@
         }
       ],
       "ratios": {
-        "path_c_mlx_tilelang_fp8_scaled_vecmat_over_path_b": 0.9608089092133086
+        "path_c_mlx_tilelang_fp8_scaled_vecmat_over_path_b": 0.9837469853400479
       }
     }
   ],
@@ -325,10 +325,10 @@
     "path_b_bench": {
       "label": "path_b_sparse_mla_fp8_fwd",
       "ok": true,
-      "median_ms": 0.22858299780637026,
-      "min_ms": 0.21112500689923763,
-      "p90_ms": 0.26995898224413395,
-      "max_ms": 0.32558408565819263,
+      "median_ms": 0.2344370586797595,
+      "min_ms": 0.21108309738337994,
+      "p90_ms": 0.2530410420149565,
+      "max_ms": 0.3102088812738657,
       "tflops": 0.0,
       "warmup": 10,
       "iters": 50,

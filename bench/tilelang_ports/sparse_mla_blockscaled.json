@@ -5,19 +5,19 @@
   "shape": {
     "q_shape": [
       1,
+      64,
       4,
-      2,
       64
     ],
     "kv_shape": [
       1,
-      4,
+      64,
       1,
       64
     ],
     "indices_shape": [
       1,
-      4,
+      64,
       1,
       16
     ],
@@ -32,8 +32,8 @@
     "block_size": 32
   },
   "path_c_tilelang_e8m0_qk_status": {
-    "available": false,
-    "reason": "TileLang Path C E8M0 Sparse-MLA QK is not safe to dispatch: no simdgroup_multiply_accumulate; scale operands disappeared from emitted MSL; E8M0 exp2(byte - 127) decode markers missing; scale operands are not indexed by K/32; scalar fallback markers present; Sparse-MLA M=1/topk tile violates current Metal FP8 simdgroup tile constraints",
+    "available": true,
+    "reason": "TileLang Path C E8M0 Sparse-MLA QK dispatches through the real M=1/topk reducer; T.fp8_scaled_matmul remains probe-only for this shape",
     "target": "metal",
     "m": 1,
     "n": 16,
@@ -43,77 +43,183 @@
     "scale_layout": "logical_unswizzled_k_axis_blocks",
     "features": {
       "kernel_void": 1,
+      "fp8_e4m3_decode_helper": 1,
+      "fp8_e4m3_lut": 0,
+      "metal_fp8_dot4_helper": 2,
+      "scalar_fp8_byte_decode": 1,
+      "scalar_fp8_byte_decode_calls": 0,
       "simdgroup_multiply_accumulate": 0,
-      "simdgroup_load": 0,
-      "simdgroup_store": 0,
-      "fp8_e4m3_decode_helper": 3,
-      "A_scale_refs": 0,
-      "B_scale_refs": 0,
-      "signature_has_A_scale": false,
-      "signature_has_B_scale": false,
-      "e8m0_exp2": 0,
-      "e8m0_bias_subtract_127": 0,
-      "e8m0_sentinel_255": 0,
-      "e8m0_zero_sentinel": 1,
-      "k_block_shift_5": 0,
-      "k_block_div_32": 0,
+      "tvm_thread_allreduce": 0,
+      "simd_sum": 1,
+      "simd_shuffle_down": 0,
+      "A_scale_refs": 3,
+      "B_scale_refs": 3,
       "A_scale_collapsed_zero": 0,
       "B_scale_collapsed_zero": 0,
-      "float_a_val": true,
-      "float_b_val": true,
-      "threadgroup_half": false,
+      "signature_has_A_scale": true,
+      "signature_has_B_scale": true,
+      "per_row_B_scale": true,
+      "e8m0_exp2": 2,
+      "e8m0_bias_subtract_127": 2,
+      "e8m0_sentinel_255": 2,
+      "e8m0_zero_sentinel": 3,
+      "k_block_shift_5": 0,
+      "k_block_div_32": 0,
+      "scale_block_index_shift": 6,
       "scale_format": "e8m0_block_k32",
       "scale_block_size": 32,
       "scale_axis": "contracted_k",
-      "scale_layout": "logical_unswizzled_k_axis_blocks"
+      "scale_layout": "logical_unswizzled_k_axis_blocks",
+      "qk_shape": "m1_n_topk_k",
+      "dispatch_surface": "qk_reduce",
+      "runnable_qk_reduce_available": true,
+      "runnable_qk_reduce_reason": "TileLang Path C E8M0 Sparse-MLA real QK reducer is dispatchable for M=1/topk with per-row K/32 E8M0 scales",
+      "legacy_e8m0_scaled_matmul_probe_available": false,
+      "legacy_e8m0_scaled_matmul_probe_reason": "TileLang Path C E8M0 Sparse-MLA QK is not safe to dispatch: no simdgroup_multiply_accumulate; scale operands disappeared from emitted MSL; E8M0 exp2(byte - 127) decode markers missing; scale operands are not indexed by K/32; scalar fallback markers present; Sparse-MLA M=1/topk tile violates current Metal FP8 simdgroup tile constraints",
+      "legacy_e8m0_scaled_matmul_probe_kernel_void": 1,
+      "legacy_e8m0_scaled_matmul_probe_simdgroup_multiply_accumulate": 0,
+      "legacy_e8m0_scaled_matmul_probe_simdgroup_load": 0,
+      "legacy_e8m0_scaled_matmul_probe_simdgroup_store": 0,
+      "legacy_e8m0_scaled_matmul_probe_fp8_e4m3_decode_helper": 3,
+      "legacy_e8m0_scaled_matmul_probe_A_scale_refs": 0,
+      "legacy_e8m0_scaled_matmul_probe_B_scale_refs": 0,
+      "legacy_e8m0_scaled_matmul_probe_signature_has_A_scale": false,
+      "legacy_e8m0_scaled_matmul_probe_signature_has_B_scale": false,
+      "legacy_e8m0_scaled_matmul_probe_e8m0_exp2": 0,
+      "legacy_e8m0_scaled_matmul_probe_e8m0_bias_subtract_127": 0,
+      "legacy_e8m0_scaled_matmul_probe_e8m0_sentinel_255": 0,
+      "legacy_e8m0_scaled_matmul_probe_e8m0_zero_sentinel": 1,
+      "legacy_e8m0_scaled_matmul_probe_k_block_shift_5": 0,
+      "legacy_e8m0_scaled_matmul_probe_k_block_div_32": 0,
+      "legacy_e8m0_scaled_matmul_probe_A_scale_collapsed_zero": 0,
+      "legacy_e8m0_scaled_matmul_probe_B_scale_collapsed_zero": 0,
+      "legacy_e8m0_scaled_matmul_probe_float_a_val": true,
+      "legacy_e8m0_scaled_matmul_probe_float_b_val": true,
+      "legacy_e8m0_scaled_matmul_probe_threadgroup_half": false,
+      "legacy_e8m0_scaled_matmul_probe_scale_format": "e8m0_block_k32",
+      "legacy_e8m0_scaled_matmul_probe_scale_block_size": 32,
+      "legacy_e8m0_scaled_matmul_probe_scale_axis": "contracted_k",
+      "legacy_e8m0_scaled_matmul_probe_scale_layout": "logical_unswizzled_k_axis_blocks"
+    }
+  },
+  "path_c_tilelang_e8m0_qk_reduce_status": {
+    "available": true,
+    "reason": "TileLang Path C E8M0 Sparse-MLA real QK reducer is dispatchable for M=1/topk with per-row K/32 E8M0 scales",
+    "target": "metal",
+    "n": 16,
+    "k": 64,
+    "outputs_per_block": 4,
+    "reduce_threads": 32,
+    "vec": 4,
+    "scale_block_size": 32,
+    "scale_layout": "logical_unswizzled_k_axis_blocks",
+    "features": {
+      "kernel_void": 1,
+      "fp8_e4m3_decode_helper": 1,
+      "fp8_e4m3_lut": 0,
+      "metal_fp8_dot4_helper": 2,
+      "scalar_fp8_byte_decode": 1,
+      "scalar_fp8_byte_decode_calls": 0,
+      "simdgroup_multiply_accumulate": 0,
+      "tvm_thread_allreduce": 0,
+      "simd_sum": 1,
+      "simd_shuffle_down": 0,
+      "A_scale_refs": 3,
+      "B_scale_refs": 3,
+      "A_scale_collapsed_zero": 0,
+      "B_scale_collapsed_zero": 0,
+      "signature_has_A_scale": true,
+      "signature_has_B_scale": true,
+      "per_row_B_scale": true,
+      "e8m0_exp2": 2,
+      "e8m0_bias_subtract_127": 2,
+      "e8m0_sentinel_255": 2,
+      "e8m0_zero_sentinel": 3,
+      "k_block_shift_5": 0,
+      "k_block_div_32": 0,
+      "scale_block_index_shift": 6,
+      "scale_format": "e8m0_block_k32",
+      "scale_block_size": 32,
+      "scale_axis": "contracted_k",
+      "scale_layout": "logical_unswizzled_k_axis_blocks",
+      "qk_shape": "m1_n_topk_k"
     }
   },
   "parity": {
     "blockscaled_vs_bf16": {
-      "max_abs_err": 0.004521891474723816,
-      "max_rel_err": 0.06304103596741027
+      "max_abs_err": 0.011328823864459991,
+      "max_rel_err": 0.11758861583070061
     },
     "quantized_matmul_vs_bf16": {
       "max_abs_err": 0.0,
       "max_rel_err": 0.0
     },
     "msl_blockscaled_vs_bf16": {
-      "max_abs_err": 0.0045216078869998455,
-      "max_rel_err": 0.06303708238647923
+      "max_abs_err": 0.011317778378725052,
+      "max_rel_err": 0.1174739681502098
     },
     "msl_blockscaled_vs_bs_ref": {
-      "max_abs_err": 2.81408429145813e-05,
-      "max_rel_err": 0.00039434889228588904
+      "max_abs_err": 3.0465424060821533e-05,
+      "max_rel_err": 0.0003377691831805473
+    },
+    "path_c_e8m0_qk_reduce_vs_oracle": {
+      "max_abs_err": 0.0,
+      "max_rel_err": 0.0
     }
   },
   "bench": {
     "bf16_reference": {
       "label": "bf16_reference",
-      "median_ms": 0.608749920502305,
-      "min_ms": 0.5949169863015413,
-      "max_ms": 0.6114158313721418,
-      "iters": 3
+      "median_ms": 0.2738339826464653,
+      "min_ms": 0.2565840259194374,
+      "max_ms": 0.4980410449206829,
+      "iters": 50
     },
     "blockscaled_reference": {
       "label": "blockscaled_reference",
-      "median_ms": 0.5933749489486217,
-      "min_ms": 0.5850829184055328,
-      "max_ms": 0.6149171385914087,
-      "iters": 3
+      "median_ms": 0.28558308258652687,
+      "min_ms": 0.2714169677346945,
+      "max_ms": 0.4012908320873976,
+      "iters": 50
     },
     "quantized_matmul_reference": {
       "label": "quantized_matmul_reference",
-      "median_ms": 0.5981249269098043,
-      "min_ms": 0.5954578518867493,
-      "max_ms": 0.7106249686330557,
-      "iters": 3
+      "median_ms": 0.2645421773195267,
+      "min_ms": 0.24854205548763275,
+      "max_ms": 0.3612081054598093,
+      "iters": 50
     },
     "path_b_msl_blockscaled_fwd": {
       "label": "path_b_msl_blockscaled_fwd",
-      "median_ms": 0.18091709353029728,
-      "min_ms": 0.1712499652057886,
-      "max_ms": 0.20291702821850777,
-      "iters": 3
+      "median_ms": 0.1668750774115324,
+      "min_ms": 0.1563329715281725,
+      "max_ms": 0.28187502175569534,
+      "iters": 50
+    },
+    "path_c_tilelang_e8m0_qk_reduce": {
+      "label": "path_c_tilelang_e8m0_qk_reduce",
+      "median_ms": 0.13095885515213013,
+      "min_ms": 0.11108303442597389,
+      "max_ms": 0.2446670550853014,
+      "iters": 50
     }
+  },
+  "ratios": {
+    "path_c_e8m0_qk_reduce_over_path_b_blockscaled_fwd": 0.7847718016583812
+  },
+  "qk_reducer_strict": {
+    "enabled": true,
+    "passed": true,
+    "max_abs_err": 1e-05,
+    "max_ratio": 1.0,
+    "failures": []
+  },
+  "strict": {
+    "enabled": true,
+    "scope": "full_path_c_dispatch",
+    "passed": true,
+    "max_abs_err": 1e-05,
+    "max_ratio": 1.0,
+    "failures": []
   }
 }

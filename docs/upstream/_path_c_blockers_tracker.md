@@ -17,36 +17,46 @@ authoritative scoreboard. This doc explains the **why** for each ❌.
 
 ---
 
-## Currently shipped Path C (1 of 11 ops)
+## Current Path C dispatch status
 
-| Op | Bench (M4 Max) | Status | Notes |
+| Op | Bench receipt (M4 Max) | Dispatch status | Notes |
 |---|---|---|---|
-| **Mamba3 main fwd+bwd** (B=2 T=512 H=4 P=32 N=64 FP32) | C 7.707 ms vs B 7.823 ms | ✅ shipped | Bit-exact parity with B, 1.5% faster (within noise). Path C kept as DSL-path-works reproducibility receipt. |
+| **topk_selector** | C/B ratios 0.510-0.880 across the checked shapes | ✅ production AUTO | `topk_selector(..., backend="auto")` prefers Path C where available, then falls back to Path B and pure MLX. |
+| **Mamba3 main fwd+bwd** (B=2 T=512 H=4 P=32 N=64 FP32) | C 7.707 ms vs B 7.823 ms | ✅ proof/override | Bit-exact parity with B, 1.5% faster (within noise). Path B remains the production route; Path C is kept as a DSL-path reproducibility receipt. |
+| **Sparse-MLA BF16 fwd+bwd** | paired C/B: `B2_S128_H8_D64` fwd 0.993 / bwd 0.913; `B4_S512_H8_D64` fwd 0.993 / bwd 0.975; `B4_S1024_H8_D64` fwd 0.994 / bwd 0.997 | ⚠️ per-shape AUTO | `sparse_mla_path_c.py` lowers TileLang DSL to scalar MSL and mirrors Path B lane loops. AUTO promotes checked rows only when the receipt shape matches and all required fwd+bwd no-worse gates are true; today all three checked BF16 rows promote to Path C. |
 
 ---
 
 ## Ops where Path C is blocked
 
-### Sparse-MLA family (4 ops)
+### Sparse-MLA family (BF16 AUTO is per-shape; FP8/e8m0 still blocked)
 
-The sparse-MLA kernels need 32×32 fragment tiles for performance. Our
-existing `tilelang_metal_pipelined` patch (Agent D's 3D-buffer fix)
-unblocked T.Pipelined num_stages>1 only at **16×16** fragments — sparse-MLA
-wants 32×32. The path forward is a follow-up patch that extends the 3D
-buffer fix to larger fragment sizes.
+The old "no BF16 Path C exists" blocker is closed in `cppmega.mlx`: the in-tree
+Path C port does not wait on upstream `T.gemm`/`T.Pipelined` Sparse-MLA
+templates. It uses scalar TileLang DSL, lowers through apple-head Metal,
+postprocesses the MSL back to Path-B-style lane loops, and keeps the same
+`dkv_partial` backward contract.
 
-| Op | Path C blocker | What patch unblocks it |
-|---|---|---|
-| Sparse-MLA fwd BF16 | T.Pipelined num_stages>1 only works at 16×16 fragments | **NEW patch needed**: extend `tilelang_metal_pipelined` to 32×32 fragments. Likely touches `tilelang/intrinsics/metal_macro_generator.py` (3D handling) and `src/op/copy.cc` (fragment size dispatch). |
-| Sparse-MLA fwd FP8 | (a) same T.Pipelined 32×32 issue, (b) scheduler-glue between `T.fp8_scaled_matmul` macro and `GemmMetalScalar` so per-load scale fuses into K-loop | Two patches: same as above, plus a scheduler pass that fuses scale broadcast at gemm fragment-load time. The scaffold for the macro is already in `tilelang_metal_fp8_scaled_matmul`; a follow-up scheduler patch is needed. |
-| Sparse-MLA fwd blockscaled (e8m0) | TileLang DSL has no block-scale (e8m0) layout primitive | **NEW patch**: introduce `T.BlockScaledLayout(scale_dtype="e8m0", block_size=16)` API and lower it through GemmMetalScalar with the matching scale tile bookkeeping. Larger work — likely 200-400 LOC. |
-| Sparse-MLA bwd (chunked dQ/dK/dV) | DSL doesn't compose chunked backward flow with VJP via `mx.custom_function`-like glue. Path B does manual chunking outside autograd. | **DSL feature**: scheduler-level support for "chunked backward with explicit dKV accumulation". Not blocked on a single patch — may require a TileLang language-level extension. Defer. |
-
-### Topk + selector (1 op)
+AUTO is intentionally per-shape and fail-closed. The checked-in
+`bench/tilelang_ports/sparse_mla.json` receipt covers forward and backward
+(`strict.phase="all"`, `fwd_only=false`), so it promotes only rows that match
+the requested shape and have every required fwd+bwd `no_worse_than_path_b` gate
+set. The current receipt promotes `B2_S128_H8_D64`, `B4_S512_H8_D64`, and
+`B4_S1024_H8_D64`; unreceipted shapes stay on Path B.
 
 | Op | Path C blocker | What patch unblocks it |
 |---|---|---|
-| `topk_selector` | No profitable Metal schedule for argpartition + per-row index gather. Path B uses a hand-tuned simdgroup reduction; DSL can't currently emit that pattern. | **DSL feature**: T.simdgroup_reduce primitive with custom comparator + per-row stable sort. Larger work; not on the critical path for M0. Defer. |
+| Sparse-MLA BF16 unreceipted shapes | The three checked fwd+bwd rows promote, but no receipt proves other shape/topk combinations. | Regenerate `bench/tilelang_ports/sparse_mla.json` with the new shape, then update dispatch tests and docs before widening AUTO promotion. |
+| Sparse-MLA FP8 fwd/bwd | Partial qk reducers have parity/timing receipts (QK-reduce C/B 0.864, indexed QK-reduce C/B 0.696), but they are not the strict full-dispatch gate. Full Path C QK remains unavailable, so `sparse_mla_fp8.json` keeps the full Path C gate red. | Extend the FP8 scaled-matmul scheduler so per-load scale fuses into the K loop, then add a full Sparse-MLA FP8 Path C wrapper/test pair that mirrors BF16 `dkv_partial`. |
+| Sparse-MLA blockscaled fwd/bwd (e8m0) | Partial e8m0 QK-reduce has a parity/timing receipt (C/B 0.4364), but it is not the strict full-dispatch gate. Full Path C QK remains unavailable, so `sparse_mla_blockscaled.json` keeps the full Path C gate red. | Introduce `T.BlockScaledLayout(scale_dtype="e8m0", block_size=16)` API and lower it through the Metal scalar path with matching scale-tile bookkeeping; then mirror the BF16 partial-backward contract. Larger work — likely 200-400 LOC. |
+
+### Topk + selector follow-up (not a dispatch blocker)
+
+`topk_selector` is not blocked for production dispatch: the current AUTO path
+uses Path C when available, and the checked-in receipt keeps every C/B ratio
+<= 1.0. A future `T.simdgroup_reduce` primitive can still improve reduction
+ergonomics and FP8 vecmat specialization, but it is not required to select
+Path C for topk today.
 
 ### FP8 ops (2 ops, slower than B)
 
@@ -69,15 +79,15 @@ patches. Each new patch adds another link in the dependency chain.
 
 | # | Patch | Unblocks | Effort | ROI |
 |---|---|---|---|---|
-| **A** | `tilelang_metal_pipelined_32x32` (extend 3D buffer fix to 32×32 fragments) | Sparse-MLA fwd BF16 + FP8 (Path C parity with B) | medium (~150 LOC, touches metal_macro_generator + dispatch) | **HIGH** — unblocks 2 sparse-MLA ports |
-| **B** | `tilelang_metal_fp8_scaled_matmul_fused_scheduler` (fuse per-load scale into GemmMetalScalar K-loop) | FP8 matmul/vecmat speed parity with audiohacking | medium-high (~250 LOC, scheduler pass) | **MEDIUM** — quality-of-life, Path B already wins |
-| **C** | `tilelang_metal_blockscaled_e8m0` (DSL primitive for e8m0 block-scale layout) | Sparse-MLA blockscaled fwd via Path C | high (~350 LOC, language + lowering) | **MEDIUM** — only useful for FP8 path |
-| **D** | `tilelang_metal_simdgroup_reduce` (T.simdgroup_reduce_sum primitive) | FP8 vecmat M=1 specialization, topk_selector | medium (~200 LOC) | **LOW** — Path B already optimized, M0 doesn't need topk via DSL |
-| **E** | `tilelang_metal_chunked_bwd` (chunked backward flow with explicit accumulation) | Sparse-MLA bwd via Path C | very high (language-level extension) | **LOW** — Path B already chunks outside autograd; DSL would just match it |
+| **A** | `tilelang_metal_fp8_scaled_matmul_fused_scheduler` (fuse per-load scale into GemmMetalScalar K-loop) | FP8 matmul/vecmat speed parity and Sparse-MLA FP8 Path C composition | medium-high (~250 LOC, scheduler pass) | **HIGH** — remaining Sparse-MLA FP8 blocker |
+| **B** | `tilelang_metal_blockscaled_e8m0` (DSL primitive for e8m0 block-scale layout) | Sparse-MLA blockscaled fwd/bwd via Path C | high (~350 LOC, language + lowering) | **MEDIUM** — needed for blockscaled Path C |
+| **C** | `tilelang_metal_simdgroup_reduce` (T.simdgroup_reduce_sum primitive) | FP8 vecmat M=1 specialization and future selector ergonomics | medium (~200 LOC) | **LOW** — Path B/topk dispatch is already covered |
 
-Total estimated effort: A is the only must-do for Path C parity on the
-production-shape kernels. B-D are quality-of-life. E is language-design
-work and shouldn't block the M0 timeline.
+BF16 Sparse-MLA no longer needs a TileLang language extension in this repo for
+the checked fwd+bwd rows, and those rows already have Path C AUTO coverage. The
+remaining BF16 work is widening the receipt matrix without dropping the
+fail-closed row gate. The remaining upstream work is FP8 scheduler/layout
+coverage plus optional reduction ergonomics.
 
 ---
 
@@ -85,8 +95,9 @@ work and shouldn't block the M0 timeline.
 
 The 3 rebase agents (mixed_dtype, fp8_gemm, fp8_vector) are putting our
 existing patches on top of `jorgecurious/tilelang:metal-gemm-upstream-rebase`.
-**These are not the end of the story** — patches A through E above are
-expected follow-ups when we extend Path C beyond Mamba3.
+**These are not the end of the story** — patches A through C above are
+expected follow-ups when we extend Path C beyond topk AUTO, Mamba3 proof runs,
+and BF16 Sparse-MLA's current per-shape AUTO coverage.
 
 The filing pack should explicitly say:
 - "Current 8 patches are the foundation; future Path C ports surface new gaps"
@@ -134,9 +145,7 @@ upstream tile-ai/tilelang main
   Our: tilelang_metal_fp8_scaled_matmul (clean apply on PR #2130, frontend macro)
   Our: tilelang_metal_shared_dyn       (no-op investigation artifact, not a code PR)
   ↑ FUTURE
-  Patch A: tilelang_metal_pipelined_32x32           (when sparse-MLA Path C lands)
-  Patch B: tilelang_metal_fp8_scaled_matmul_fused_scheduler  (when FP8 perf parity matters)
-  Patch C: tilelang_metal_blockscaled_e8m0          (when blockscaled Path C lands)
-  Patch D: tilelang_metal_simdgroup_reduce          (when topk Path C lands)
-  Patch E: tilelang_metal_chunked_bwd               (DSL language extension, deferred)
+  Patch A: tilelang_metal_fp8_scaled_matmul_fused_scheduler  (when FP8 sparse-MLA Path C lands)
+  Patch B: tilelang_metal_blockscaled_e8m0          (when blockscaled Path C lands)
+  Patch C: tilelang_metal_simdgroup_reduce          (for FP8 vecmat/future selector ergonomics)
 ```

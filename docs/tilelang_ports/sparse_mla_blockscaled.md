@@ -36,8 +36,14 @@ online-softmax + S@V flow.
 
 ## Status on Apple Silicon (tilelang 0.1.9, MLX 0.31)
 
-Same two blockers as the tensorwise FP8 path (see
-docs/tilelang_ports/sparse_mla_fp8.md):
+Same native TileLang DSL blockers as the tensorwise FP8 path (see
+docs/tilelang_ports/sparse_mla_fp8.md), but they no longer block the shipped
+Path B kernel. Current local code uses hand-written MSL through
+`mx.fast.metal_kernel`: e4m3 data rides as `uint8` storage, E8M0 block scales
+ride as `uint8`, and both are dequantized inline inside the sparse QK/SV loops.
+`sparse_mla_blockscaled_metal_status(...)` therefore reports
+`available=True` when the direct-MSL kernel can dispatch. The blockers below
+apply only to future native TileLang `T.gemm`/float8 lowering work.
 
 1. **FP8 dtype emission to MSL is unsupported.** Failure at
    3rdparty/tvm/src/target/source/codegen_metal.cc:271:
@@ -45,20 +51,25 @@ docs/tilelang_ports/sparse_mla_fp8.md):
 2. **T.gemm is not registered for the metal target.**
    Unsupported target for gemm: metal -keys=metal,gpu ....
 
-Block-scaled additionally needs the per-block dequant pattern
-partial * QScale[h, kb] * KVScale[j, kb] to lower correctly — but since
-both blockers above are upstream of that, this is moot until they lift.
+Native TileLang block-scaled lowering additionally needs the per-block dequant
+pattern `partial * QScale[h, kb] * KVScale[j, kb]` to lower correctly. Path B
+bypasses this by decoding the E8M0 scales directly in MSL and multiplying them
+inside the fp32 QK loop.
 
 ## What this port ships today
 
 cppmega_mlx/nn/_tilelang/sparse_mla_blockscaled.py provides:
 
 1. sparse_mla_blockscaled_metal_status(...) -> SparseMLABlockScaledMetalStatus
-   — Returns available=False with both blocker reasons. Reports the
+   — Returns available=True when the direct-MSL Path B kernel can be
+   constructed and the local Metal device can dispatch it. Reports the
    block_size=32 constant in the status dataclass.
 2. sparse_mla_blockscaled_fwd_metal(...) and
    sparse_mla_blockscaled_bwd_metal(...)
-   — Stubs returning (status, None, None) while gated.
+   — Quantize Q/KV to MXFP8, unpack e4m3 payload bytes to uint8 storage, and
+   dispatch the direct-MSL forward/backward kernels. They return `(out, lse)`
+   and `(dq, dkv)` when Metal is available, otherwise `None` so callers can
+   fall back.
 3. sparse_mla_blockscaled_reference(...)
    — Pure-MLX MXFP8 reference using mx.quantize(mode='mxfp8') /
    mx.dequantize(mode='mxfp8') with group_size=32. The MLX kernel returns
@@ -66,8 +77,13 @@ cppmega_mlx/nn/_tilelang/sparse_mla_blockscaled.py provides:
    power-of-two block exponent, and 4 fp8 e4m3 values pack into one uint32.
    Round-trip happens via the STE wrapper (see below).
 4. sparse_mla_blockscaled_apply(...)
-   — High-level entry that falls back to the reference and supports
-   force_metal=True to surface the blocker.
+   — High-level entry that prefers direct-MSL Path B, falls back to the
+   reference, and supports force_metal=True to fail closed when Metal is
+   unavailable.
+5. Path C E8M0 QK reducer in sparse_mla_blockscaled_path_c.py
+   — Experimental TileLang-DSL reducer. The checked-in receipt has the partial
+   reducer faster than Path B forward, but it is not a full QK/dispatch path
+   and is not production AUTO.
 
 ## Scale tensor handling
 
@@ -128,22 +144,36 @@ tensorwise FP8 path does — see docs/tilelang_ports/sparse_mla_fp8.md.
 
 ## Bench (current Apple M-series)
 
-From bench/tilelang_ports/sparse_mla_blockscaled.json on the same shape:
+From bench/tilelang_ports/sparse_mla_blockscaled.json on the current
+(B=1, S=64, H=4, D=64, topk=16) receipt shape:
 
 | path                         | median ms |
 | ---------------------------- | --------- |
-| BF16 reference               | ~0.30     |
-| Block-scaled MXFP8 reference | ~0.30     |
-| quantized_matmul reference   | ~0.29     |
+| BF16 reference               | 0.275     |
+| Block-scaled MXFP8 reference | 0.244     |
+| quantized_matmul reference   | 0.236     |
+| Path B direct-MSL blockscaled fwd | 0.166 |
+| Path C E8M0 QK reducer       | 0.135     |
 
-Block-scaled is roughly the same wall-time as BF16 because Apple's mxfp8
-quantize/dequantize is a fused MSL kernel that costs the same as a single
-matmul tile pass. Once tilelang's metal target supports FP8 storage we
-expect this path to drop to ~0.5x BF16 (matching the H100 ratio).
+The direct-MSL Path B kernel is faster than the references on this local M4
+receipt because E8M0 scale decode and e4m3 byte decode are fused into the sparse
+QK/SV loops. This is software FP8 emulation, not a CUDA/H100/H200-style native
+FP8 tensor-core claim. The Path C E8M0 reducer is faster than Path B forward on
+the partial QK-only receipt (`path_c_e8m0_qk_reduce_over_path_b_blockscaled_fwd
+=0.8168`), but full QK/layout dispatch is still unavailable. The checked-in
+receipt intentionally has `qk_reducer_strict.passed=true` and
+`strict.passed=false`: reducer-only support is available, full Path C
+blockscaled dispatch is not.
 
-## Post-blocker plan
+## Next steps
 
-When tile-ai/tilelang HEAD lands FP8 + simdgroup support:
+1. Keep production/default dispatch on Path B direct MSL.
+2. Keep native TileLang FP8/E8M0 `T.gemm` lowering fail-closed until float8
+   storage, E8M0 scale plumbing, and Metal GEMM lowering are present together.
+3. Extend Path C from partial reducers to full-layout kernels only with paired
+   correctness and timing receipts.
+4. When tile-ai/tilelang HEAD lands FP8 + simdgroup support, verify the native
+   path against Path B before changing dispatch policy:
 
 1. Verify T.gemm(A_fp8, B_fp8, C_fp32, ...) lowers correctly in
    block-scaled context (FP32 accumulator + per-block FP32 scale tensor).

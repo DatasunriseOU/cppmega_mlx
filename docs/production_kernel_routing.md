@@ -35,7 +35,8 @@ This document is the authoritative source for **which kernel implementation each
       <td>TileLang DSL <code>@T.prim_func</code> lowered to MSL via the<br>
       patched apple-head TileLang on Metal target.</td>
       <td><code>cppmega_mlx/nn/_tilelang/mamba3_path_c.py</code><br>
-      (only Mamba3 today).</td>
+      <code>cppmega_mlx/nn/_tilelang/sparse_mla_path_c.py</code><br>
+      <code>cppmega_mlx/nn/_tilelang/topk_selector.py</code></td>
       <td>Yes — via <code>mx.custom_function</code><br>
       wrapper around the lowered MSL.</td>
     </tr>
@@ -108,38 +109,48 @@ Default behavior on Apple Silicon is in the **"Production"** column. Override vi
     </tr>
     <tr>
       <td><strong>Sparse-MLA fwd BF16</strong></td>
-      <td><strong>B</strong> — <code>cppmega_mlx.nn._tilelang.sparse_mla_apply</code></td>
+      <td><strong>C when row-green, else B</strong> — <code>sparse_mla_attention(...)</code></td>
       <td><code>sparse_mla_attention_reference</code></td>
-      <td>❌ blocked (T.Pipelined num_stages&gt;1<br>only works at 16×16 tiles, sparse-MLA wants 32×32)</td>
-      <td>Path B 1.4–3.3× speedup measured;<br>reference kept for parity oracle.</td>
+      <td>Path C available via <code>sparse_mla_path_c_apply</code>;<br>
+      AUTO promotes only receipt rows where every forward no-worse flag is true.</td>
+      <td><code>B2_S128_H8_D64</code>, <code>B4_S512_H8_D64</code>,<br>
+      and <code>B4_S1024_H8_D64</code> promote to Path C today;<br>
+      unreceipted shapes stay Path B fail-closed.</td>
     </tr>
     <tr>
       <td><strong>Sparse-MLA fwd FP8</strong></td>
       <td><strong>B</strong> — <code>cppmega_mlx.nn._tilelang.sparse_mla_fp8_apply</code></td>
       <td><code>sparse_mla_fp8_reference</code></td>
-      <td>❌ requires both T.Pipelined 32×32 and scheduler glue<br>to T.fp8_scaled_matmul macro</td>
+      <td>❌ partial reducers only; QK-reduce C/B 0.864 and indexed C/B 0.696,<br>
+      but full Path C QK is unavailable and full-dispatch gate is red.</td>
       <td>FP8 path is software-emulated via uchar storage<br>+ LUT decode (Apple Silicon has no native FP8 ALU).</td>
     </tr>
     <tr>
       <td><strong>Sparse-MLA fwd<br>blockscaled (e8m0)</strong></td>
       <td><strong>B</strong> — <code>sparse_mla_blockscaled_apply</code></td>
       <td><code>sparse_mla_blockscaled_reference</code></td>
-      <td>❌ no e8m0 layout in DSL</td>
+      <td>❌ partial e8m0 QK reducer has a parity/timing receipt<br>
+      (C/B 0.4364), but full Path C QK remains unavailable<br>
+      and the full-dispatch gate stays red.</td>
       <td>mxfp8 block-scale is a software emulation;<br>Path B handles the 16-element scale tile bookkeeping.</td>
     </tr>
     <tr>
       <td><strong>Sparse-MLA bwd</strong><br>(chunked dQ/dK/dV)</td>
-      <td><strong>B</strong> — <code>sparse_mla_bwd_metal</code><br>(called via <code>sparse_mla_apply</code> VJP)</td>
+      <td><strong>C when row-green, else B</strong><br>(called through sparse-MLA custom VJP)</td>
       <td>autograd through reference fwd</td>
-      <td>❌</td>
-      <td>Path B keeps memory bounded by chunking dKV;<br>reference autograd OOMs at production shapes.</td>
+      <td>Backward parity is tested and participates in the strict row gate;<br>
+      row-level AUTO requires all no-worse flags to stay green.</td>
+      <td><code>B2_S128_H8_D64</code>, <code>B4_S512_H8_D64</code>,<br>
+      and <code>B4_S1024_H8_D64</code> promote to Path C today;<br>
+      unreceipted shapes stay Path B fail-closed.</td>
     </tr>
     <tr>
       <td><strong>topk_selector</strong><br>(per-row top-k indices<br>for sparse-MLA)</td>
-      <td><strong>B</strong> — <code>cppmega_mlx.nn._tilelang.topk_selector</code></td>
+      <td><strong>C</strong> — <code>topk_selector(..., backend="auto")</code></td>
       <td><code>topk_selector_reference</code></td>
-      <td>❌</td>
-      <td><code>mx.topk</code> doesn't expose the per-row<br>index format we need.</td>
+      <td>Default Path C with Path B fallback via <code>backend="metal"</code>.</td>
+      <td>Checked-in topk receipt runs both B and C on every row and<br>
+      keeps all C/B ratios <= 1.0.</td>
     </tr>
     <tr>
       <td><strong>M2RNN main scan<br>(R blocks, fwd+bwd)</strong></td>
@@ -173,7 +184,7 @@ The hybrid mini config (1.2B params, calibrated quarter from 4.8B) at training t
 
 1. **Embedding lookup** → Path A.
 2. **Per-block (alternating M=mamba3 / A=attention / E=moe / R=m2rnn — see HybridLMConfig)**:
-   - **A blocks** (HybridBackend="attention"): RMSNorm (A) → Linear projections (A — mx.matmul) → RoPE (A — mx.fast.rope) → **sparse-MLA (B)** → output projection (A) → residual.
+   - **A blocks** (HybridBackend="attention"): RMSNorm (A) → Linear projections (A — mx.matmul) → RoPE (A — mx.fast.rope) → **sparse-MLA (per-shape AUTO: green receipt rows use C, otherwise B)** → output projection (A) → residual.
    - **M blocks** (HybridBackend="mamba3"): RMSNorm (A) → in-projections (A) → causal depthwise conv1d (A) → **Mamba3 main scan (B)** → out projection (A) → residual.
    - **E blocks** (HybridBackend="moe"): RMSNorm (A) → router (A) → **gather_mm SwitchGLU (A)** → residual.
    - **R blocks** (HybridBackend="m2rnn"): RMSNorm (A) → in-proj (A) → causal depthwise conv1d (A) → **M2RNN main scan (B)** → out projection (A) → residual. Reference fallback: <code>chunked_m2rnn_scan</code> via <code>CPPMEGA_KERNEL_PATH=ref</code>.
@@ -184,11 +195,11 @@ The hybrid mini config (1.2B params, calibrated quarter from 4.8B) at training t
 ### What this means for a typical training step (mini, B=4 T=2048):
 - **Path A** dominates raw FLOPs (every Linear, every RoPE, every RMSNorm, every attention QKV, every gather_mm).
 - **Path B** carries the sequence-dimension reductions (Mamba3 scan, sparse-MLA attention). Chunked CE is opt-in recipe behavior, not the default production loss.
-- **Path C** is **never hit** in the default production path. It exists only as a reproducibility receipt that the TileLang DSL lowers correctly through patched apple-head TileLang on Metal (proof-of-DSL artifact for docs/upstream/_pr_filing_pack.md).
+- **Path C** is hit by `topk_selector(..., backend="auto")` when that selector is used and the TileLang path is available. Sparse-MLA BF16 uses a per-shape fail-closed AUTO gate: checked green rows use Path C, unreceipted rows stay Path B. Mamba3 Path C remains a proof/override path.
 
 ## Override mechanism
 
-bash
+```bash
 # Default — Path B preferred, reference fallback if Metal kernel unavailable
 unset CPPMEGA_KERNEL_PATH
 
@@ -198,9 +209,13 @@ export CPPMEGA_KERNEL_PATH=ref
 # Force Path B; raise if Metal unavailable
 export CPPMEGA_KERNEL_PATH=path_b
 
-# Force Path C (only Mamba3 supported; raises NotImplementedError for sparse-MLA)
+# Force Path C for ops wired to the env policy (Mamba3 and sparse-MLA today);
+# ops without a Path C implementation still fail closed.
 export CPPMEGA_KERNEL_PATH=path_c
 
+# topk_selector is selected by its explicit backend argument, not this env var:
+# topk_selector(scores, k) / backend="auto" prefers Path C, then Path B.
+```
 
 The dispatch decision is recorded in a process-wide ring buffer (last 256 records) accessible via cppmega_mlx.runtime.kernel_policy.get_dispatch_log(). The training profile snapshots this log at step boundaries and exposes it under ProfileMetrics.kernel_dispatch so the receipt JSON shows which kernels actually fired.
 
@@ -212,7 +227,12 @@ The dispatch decision is recorded in a process-wide ring buffer (last 256 record
 | M2RNN fwd (B=2 T=512 H=4 K=64 V=16, fp16) |                — |   2.9 ms vs 46.9 ms ref |                     n/a |   16.1×  |        — |
 | M2RNN fwd+bwd (B=2 T=512 H=4 K=64 V=16, fp16) |             — |  12.9 ms vs 170.1 ms ref |                     n/a |   13.2×  |        — |
 | M2RNN fwd+bwd (B=2 T=2048 H=8 K=64 V=32, fp16) |            — |  132.5 ms vs 3441 ms ref |                     n/a |   26.0×  |        — |
-| Sparse-MLA fwd BF16 (production shape)   |                n/a | 1.4-3.3× faster than ref |                     n/a |        — |        — |
+| topk_selector checked shapes             |                n/a |              paired Path B | paired Path C, C/B 0.510-0.880 | — | C no worse |
+| Sparse-MLA BF16 B2_S128_H8_D64           |                n/a |              Path B available | fwd C/B 0.973; paired fwd C/B 0.993; paired bwd C/B 0.913 | — | AUTO promotes C |
+| Sparse-MLA BF16 B4_S512_H8_D64           |                n/a |              Path B available | fwd C/B 1.048; paired fwd C/B 0.993; paired bwd C/B 0.975 | — | AUTO promotes C |
+| Sparse-MLA BF16 B4_S1024_H8_D64          |                n/a |              Path B available | fwd C/B 1.017; paired fwd C/B 0.994; paired bwd C/B 0.997 | — | AUTO promotes C |
+| Sparse-MLA FP8 indexed QK reduce         |                n/a |                 Path B fwd | Path C partial reducers C/B 0.864 and 0.696; full QK unavailable and full-dispatch gate red | — | partial only |
+| Sparse-MLA blockscaled e8m0 QK reduce    |                n/a |      Path B blockscaled fwd | Path C partial reducer C/B 0.4364; full QK unavailable and full-dispatch gate red | — | partial only |
 | FP8 matmul 128×128×128 e4m3              |                n/a |  0.172 ms / 0.024 TFLOPS | 0.555 ms / 0.008 TFLOPS |      n/a |   -3.16× |
 | FP8 vecmat M=1 N=K=4096                  |                n/a |  0.182 ms / 0.184 TFLOPS | 1.098 ms / 0.031 TFLOPS |      n/a |   -6.01× |
 | Cross-entropy chunked V=65536 fwd peak   |           baseline | -54.6% peak (bench only) |                     n/a |        — |        — |
@@ -224,16 +244,16 @@ The dispatch decision is recorded in a process-wide ring buffer (last 256 record
 ## Honest limitations
 
 - **R (m2rnn) blocks now ship a Path B port** (cppmega_mlx/nn/_tilelang/m2rnn.py). Both forward and backward run as hand-written MSL via mx.fast.metal_kernel; the chunked-scan reference remains as the parity oracle and is reachable via CPPMEGA_KERNEL_PATH=ref. The kernel uses one threadgroup per (batch, head) with K_DIM threads per group; W is loaded into threadgroup memory once per (B, H). The fp16 carrier dodges the bf16 simdgroup MSL codegen bugs that Mamba3 also worked around.
-- **Path C is not in the hot path.** It exists for two reasons: (a) prove the patched apple-head TileLang DSL lowers correctly on Apple Silicon — necessary because we file the patches upstream; (b) reproducibility receipt for future contributors who want to re-derive the kernel from a high-level DSL rather than read 700 lines of MSL.
+- **Path C is narrow, not global.** It is the default for `topk_selector` where the checked-in receipt proves C no worse than B. Sparse-MLA BF16 uses a per-shape fail-closed AUTO gate backed by `bench/tilelang_ports/sparse_mla.json`: green checked rows promote, unreceipted rows stay Path B. Mamba3 Path C remains a proof/override path.
 - **FP8 paths are software emulation.** Apple Silicon (M1–M4) has no native FP8 ALU. The uchar storage + LUT decode + fp32 fma loop pattern (vendored from audiohacking/fp8-mps-metal Apache 2.0) is what we ship. Native FP8 is M5/M6 territory.
-- **TileLang DSL on Metal works for FP16/FP32 GEMM and Mamba3 today.** Sparse-MLA via DSL is blocked on T.Pipelined num_stages>1 working at 32×32 tiles (only 16×16 works after Agent D's 3D-buffer fix). FP8 scaled matmul DSL macro exists but the scheduler doesn't fuse per-load scale into GemmMetalScalar's K-loop yet — that's the documented follow-up in docs/upstream/tilelang_metal_fp8_scaled_matmul/README.md.
-- **CPPMEGA_KERNEL_PATH=path_c is not a complete path.** It only redirects Mamba3. Other ops that don't have a Path C port raise NotImplementedError with a redirect to Path B. This is by design — Path C is a proof artifact, not a primary execution mode.
+- **TileLang DSL on Metal works for FP16/FP32 GEMM, Mamba3, topk_selector, and BF16 sparse-MLA today.** The stale 32×32 T.Pipelined blocker no longer describes the in-tree sparse BF16 port. Remaining Sparse-MLA gaps are FP8 scheduler composition, e8m0 full-layout coverage, and unreceipted BF16 shapes outside the checked routing table.
+- **CPPMEGA_KERNEL_PATH=path_c is not a complete global path.** It redirects env-policy ops that have Path C wiring, currently Mamba3 and sparse-MLA. `topk_selector` uses its explicit `backend` argument. Other ops without Path C support must stay on Path A/B or fail closed.
 
 ## Receipts
 
 The training receipt JSON (emitted by cppmega_mlx.training.profile) gains a kernel_dispatch field documenting which path each op took during the profiled step. Example:
 
-json
+```json
 {
   "kernel_dispatch": [
     {"op": "mamba3_mimo", "path": "auto", "kernel_used": "metal_kernel_fwd_v1"},
@@ -241,6 +261,7 @@ json
     {"op": "cut_cross_entropy", "path": "opt_in_cce", "kernel_used": "next_token_cut_cross_entropy"}
   ]
 }
+```
 
 
 Use these receipts in CI to gate adoption decisions: a PR that flips a kernel from Path B to reference must show evidence in the dispatch log + parity within the documented atol/rtol.

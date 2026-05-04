@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 from cppmega_mlx.data.batch import synthetic_token_batch
+from cppmega_mlx.inference.engine import make_contiguous_kv_cache
 from cppmega_mlx.models.hybrid_lm import HybridTinyConfig, HybridTinyLM
 from cppmega_mlx.nn.structure_embedding import CppMegaStructureEmbedding
 from cppmega_mlx.recipes.nam56r import REFERENCE_PATTERN
@@ -129,6 +130,57 @@ def test_single_route_blocks_emit_finite_distinguishable_route_deltas() -> None:
             if left >= right:
                 continue
             assert not np.allclose(deltas[left], deltas[right]), (left, right)
+
+
+class _CaptureFirstBranch:
+    def __init__(self) -> None:
+        self.branches: list[mx.array] | None = None
+
+    def __call__(self, branches: list[mx.array]) -> mx.array:
+        self.branches = list(branches)
+        return branches[0]
+
+
+def test_hybrid_tiny_block_mhc_anchors_on_updated_branch() -> None:
+    model = HybridTinyLM(_small_single_route_config("A"))
+    layer = model.layers[0]
+    mixer = _CaptureFirstBranch()
+    layer.mhc = mixer  # type: ignore[assignment]
+    batch = synthetic_token_batch(
+        batch_size=1,
+        seq_length=5,
+        vocab_size=model.config.vocab_size,
+        seed=401,
+        include_structure=False,
+    )
+    hidden_states = model.token_embedding(batch.inputs) + model.position_embedding(
+        mx.arange(batch.inputs.shape[1])[None, :]
+    )
+    mask = mx.zeros((batch.inputs.shape[1], batch.inputs.shape[1]), dtype=hidden_states.dtype)
+
+    delta = layer.route_delta(hidden_states, mask)
+    out = layer(hidden_states, mask)
+    mx.eval(delta, out)
+
+    assert mixer.branches is not None
+    np.testing.assert_allclose(
+        np.array(mixer.branches[0]),
+        np.array(hidden_states + delta),
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    np.testing.assert_allclose(np.array(mixer.branches[1]), np.array(hidden_states))
+    np.testing.assert_allclose(np.array(out), np.array(hidden_states + delta), atol=1e-5, rtol=1e-5)
+    assert not np.allclose(np.array(mixer.branches[0]), np.array(hidden_states))
+
+
+def test_hybrid_tiny_lm_wires_mhc_when_enabled() -> None:
+    model = HybridTinyLM(_small_single_route_config("A"))
+    mhc_config = _small_single_route_config("A")
+    mhc_model = HybridTinyLM(HybridTinyConfig(**{**mhc_config.to_dict(), "mhc_enabled": True}))
+
+    assert model.layers[0].mhc is None
+    assert mhc_model.layers[0].mhc is not None
 
 
 def test_mixed_mamba3_m2rnn_route_runs_loss_and_train_step() -> None:
@@ -362,6 +414,91 @@ def test_hybrid_tiny_lm_accepts_all_structure_side_channels() -> None:
     )
     assert logits.shape == batch.inputs.shape + (model.config.vocab_size,)
     assert np.isfinite(np.array(logits)).all()
+
+
+def test_hybrid_tiny_lm_contiguous_kv_cache_matches_full_prefix_last_token() -> None:
+    mx.random.seed(1401)
+    model = HybridTinyLM(
+        _hybrid_config(
+            pattern="A",
+            depth=1,
+            dsa_a_layer_ranks=(),
+            max_seq_length=8,
+        )
+    )
+    prefix = mx.array([[1, 2, 3, 4]], dtype=mx.int32)
+    next_token = mx.array([[5]], dtype=mx.int32)
+    full = model(mx.concatenate([prefix, next_token], axis=1))
+
+    cache = make_contiguous_kv_cache(
+        num_layers=1,
+        batch_size=1,
+        num_kv_heads=4,
+        head_dim=4,
+        max_seq_len=8,
+    )
+    _ = model(prefix, kv_cache=cache)
+    cached_next = model(next_token, kv_cache=cache)
+    mx.eval(full, cached_next)
+
+    assert cache.position() == 5
+    np.testing.assert_allclose(
+        np.array(cached_next[:, -1, :]),
+        np.array(full[:, -1, :]),
+        atol=1e-5,
+        rtol=1e-5,
+    )
+
+
+def test_hybrid_tiny_lm_kv_cache_rejects_document_boundaries() -> None:
+    model = HybridTinyLM(_small_single_route_config("A"))
+    cache = make_contiguous_kv_cache(
+        num_layers=1,
+        batch_size=1,
+        num_kv_heads=1,
+        head_dim=8,
+    )
+
+    with pytest.raises(ValueError, match="document_ids.*kv_cache"):
+        model(
+            mx.array([[1, 2, 3]], dtype=mx.int32),
+            document_ids=mx.array([[0, 0, 0]], dtype=mx.int32),
+            kv_cache=cache,
+        )
+
+
+def test_hybrid_tiny_lm_kv_cache_rejects_grad_checkpointing() -> None:
+    config = _small_single_route_config("A")
+    model = HybridTinyLM(HybridTinyConfig(**{**config.to_dict(), "grad_checkpoint": True}))
+    cache = make_contiguous_kv_cache(
+        num_layers=1,
+        batch_size=1,
+        num_kv_heads=1,
+        head_dim=8,
+    )
+
+    with pytest.raises(ValueError, match="grad_checkpoint"):
+        model(mx.array([[1, 2, 3]], dtype=mx.int32), kv_cache=cache)
+
+
+def test_hybrid_tiny_lm_kv_cache_requires_attention_layer_count() -> None:
+    model = HybridTinyLM(
+        _hybrid_config(
+            pattern="AA",
+            depth=2,
+            dsa_a_layer_ranks=(),
+            max_seq_length=8,
+        )
+    )
+    cache = make_contiguous_kv_cache(
+        num_layers=1,
+        batch_size=1,
+        num_kv_heads=1,
+        head_dim=16,
+    )
+
+    with pytest.raises(ValueError, match="num_layers"):
+        model(mx.array([[1, 2, 3]], dtype=mx.int32), kv_cache=cache)
 
 
 def test_hybrid_tiny_lm_structure_side_channels_can_affect_logits_when_enabled() -> None:

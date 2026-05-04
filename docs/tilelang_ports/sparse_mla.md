@@ -1,10 +1,13 @@
-# Sparse Multi-Latent Attention (sparse_mla) Path B Port
+# Sparse Multi-Latent Attention (sparse_mla) Path B/C Metal Port
 
-Status: pure-MLX reference complete; Path B Metal kernel **blocked on tilelang
-0.1.9 metal-target T.gemm support**. Reference is already wired into the autograd
-path so the gap is correctness-neutral while the blocker stands.
+Status: pure-MLX reference complete; Path B direct-MSL Metal forward/backward is
+the fallback production path on Apple Silicon; Path C TileLang-DSL-lowered Metal
+forward/backward is available for forced runs via `CPPMEGA_KERNEL_PATH=path_c`
+and for per-shape AUTO promotion. AUTO promotes only checked-in receipt rows
+whose forward `no_worse_than_path_b` flags are true; unreceipted or failing rows
+stay on Path B.
 
-Date: 2026-05-02
+Date: 2026-05-04
 
 ## Source Attribution
 
@@ -46,35 +49,54 @@ probs    = softmax(scores)                              # masked entries -> 0
 out[b, s, h, :] = probs @ gathered[:, :d_v]             # [d_v]
 
 
-The TileLang kernel implements this with the standard flash-attention
-log-sum-exp (Lse) trick across topk-blocks of size block_I (default 64).
-The backward reuses the saved Lse, computes Delta = sum(O * dO) per row, then
-runs a second pass to accumulate dQ and dKV (atomic-add into dKV with
-split_store=2).
+The pure-MLX reference implements the same log-sum-exp (LSE) softmax contract
+and is the parity oracle for both Metal paths. The Mac production Path B does
+not lower the CUDA-oriented TileLang `T.gemm` source. It uses hand-written MSL
+threadgroup reductions through `mx.fast.metal_kernel`, with fp16 carrier I/O and
+fp32 score/LSE accumulators. Path C keeps the algorithm expressed in TileLang
+DSL, then canonicalizes the lowered MSL back to the same lane-loop shape as Path
+B and reuses Path B's host-side dKV scatter/reduction contract.
 
 ## Path B Status
 
-Probe (see /tmp/probe_sparse_mla_tl.py) lowering a stripped-down variant of
-the forward primfunc on tilelang 0.1.9 with target='metal' raises:
+Path B is live. On a Metal-capable host:
 
+- `sparse_mla_attention(...)` with the default `CPPMEGA_KERNEL_PATH=auto`
+  records `kernel_used="metal_kernel_fwd_v1"`.
+- `CPPMEGA_KERNEL_PATH=path_b` forces the same direct-MSL kernel and fails closed
+  if Metal is unavailable.
+- `CPPMEGA_KERNEL_PATH=ref` forces `sparse_mla_attention_reference(...)`.
+- The custom VJP calls the direct-MSL backward kernel and checks gradients
+  against the pure-MLX VJP oracle.
+
+The historical TileLang 0.1.9 probe lowering the upstream `T.gemm` primfunc to
+`target="metal"` raised:
 
 InternalError: Check failed: (0) is false: Unsupported target for gemm:
 metal -keys=metal,gpu -max_function_args=31 -max_num_threads=256
 -max_shared_memory_per_block=32768 -max_threads_per_block=256
 -thread_warp_size=16
 
+That is no longer the in-tree Path B status. It explains why Path B bypasses the
+upstream CUDA-style `T.gemm` pipeline and ships as direct MSL instead.
 
-This is the documented T.gemm blocker. The forward primfunc has 3 T.gemm
-calls per pipelined step (Q*K, Q_tail*K_tail, S*V) and the backward has 5
-(Q*K, dO*K, dP*K, dP*Q, P*dO). Manual GEMM rewrites of all eight tile mms
-(after-the-fact, with TileLang fragments and policies wired in) is roughly a
-flash-attention kernel rewrite; outside the scope of a Path B *port*.
+## Path C Status
 
-A parallel agent is rebuilding tilelang from HEAD with the Apple simdgroup
-PRs that wire GemmInst for the metal target. When that lands, the status
-helper will flip available=True and the kernel skeleton in
-cppmega_mlx/nn/_tilelang/sparse_mla.py becomes the place to implement the
-actual TileLang -> MSL -> mx.fast.metal_kernel pipeline.
+Path C is live for sparse-MLA BF16 with a per-shape fail-closed AUTO gate:
+
+- `sparse_mla_path_c_status()` returns available on hosts with MLX Metal and the
+  TileLang import stack.
+- `CPPMEGA_KERNEL_PATH=path_c` routes sparse-MLA through
+  `tilelang_path_c_fwd_bwd_v1`.
+- Default AUTO routes receipt-covered forward-green shapes through
+  `tilelang_path_c_fwd_bwd_v1`; today that includes `B2_S128_H8_D64`,
+  `B4_S512_H8_D64`, and `B4_S1024_H8_D64`.
+- Path C mirrors Path B's fp16 carrier and partial-dKV contract, including
+  topk16/32/64 parity coverage.
+- Default AUTO stays on Path B for unreceipted rows or rows with any false
+  forward `no_worse_than_path_b` flag. The current checked-in receipt is full
+  forward/backward strict and passes with Path C paired C/B <= 1.0 on every
+  benchmark row.
 
 ## fp16 vs bf16 Carrier Note
 
@@ -95,19 +117,25 @@ bug is fixed upstream we can revisit lifting the fp16 forced-cast.
 ## Files
 
 - cppmega_mlx/nn/sparse_mla.py - pure-MLX reference parity oracle.
-- cppmega_mlx/nn/_tilelang/sparse_mla.py - Path B port scaffold + status
-  surface + fallback dispatcher.
-- tests/test_tilelang_sparse_mla.py - parity oracle tests + Path B status
-  surface tests.
+- cppmega_mlx/nn/_tilelang/sparse_mla.py - Path B direct-MSL forward/backward
+  kernels, status surface, custom VJP wrapper.
+- cppmega_mlx/nn/_tilelang/sparse_mla_path_c.py - Path C TileLang DSL
+  forward/backward, MSL canonicalization, and forced-path wrapper.
+- tests/test_sparse_mla_dispatch.py - production dispatcher, env-policy, and
+  dispatch-log coverage for AUTO/ref/path_b/path_c.
+- tests/test_tilelang_sparse_mla.py - parity oracle tests, Path B/C status
+  surfaces, Path C topk16/32/64 coverage, and lowered-MSL shape guards.
 - scripts/bench_tilelang_sparse_mla.py - bench harness (writes
   bench/tilelang_ports/sparse_mla.json).
 
 ## Reference Parity Tolerances
 
-- Forward parity (fp16 carrier vs hand-rolled NumPy fp32 oracle):
-  atol=1e-3, rtol=1e-3.
-- Backward smoke (autograd through reference vs central finite-difference of
-  scalar loss): atol=5e-3, rtol=5e-3.
+- Path B forward parity against pure-MLX reference: atol=2e-3, rtol=1e-3.
+- Path B backward parity against pure-MLX VJP: atol=5e-3, rtol=5e-3.
+- Path C forward parity against Path B: atol=2e-3, rtol=1e-3.
+- Path C forward parity against pure-MLX reference: atol=8e-3, rtol=5e-3.
+- Path C LSE parity against Path B: atol=3e-3, rtol=2e-3.
+- Path C backward parity against pure-MLX VJP: atol=5e-3, rtol=5e-3.
 
 Tests cover four shape configurations, including:
 
@@ -115,36 +143,35 @@ Tests cover four shape configurations, including:
 - (B=4, S=512, H=8, D=64) larger smoke (matches porting-plan spec)
 - (B=1, S=64, H=8, D=64, G=2) kv_group=2 / GQA-style grouping
 - tail_dim=16 with d_v=32, qk_dim=48 to exercise the MLA channel split
+- Path C topk32/topk64 direct parity against Path B.
 
 ## Bench Numbers (M4 Max, MLX 0.31.1)
 
-Recorded by scripts/bench_tilelang_sparse_mla.py --warmup 3 --iters 8:
+Use `scripts/bench_tilelang_sparse_mla.py` for current local receipts. The
+checked-in routing summary records:
 
-| Shape          | reference fwd | apply (fallback) fwd | reference bwd |
-| -------------- | ------------- | -------------------- | ------------- |
-| B2_S128_H8_D64 | 0.38 ms       | 0.33 ms              | 0.59 ms       |
-| B4_S512_H8_D64 | 1.12 ms       | 0.98 ms              | 1.92 ms       |
+| Shape family | Forward C/B | Paired forward C/B | Backward C/B | Paired backward C/B | Gate |
+| ------------ | ----------- | ------------------ | ------------ | ------------------- | ---- |
+| B2_S128_H8_D64 | 0.973 | 0.993 | 1.067 | 0.913 | AUTO promotes to Path C |
+| B4_S512_H8_D64 | 1.048 | 0.993 | 1.044 | 0.975 | AUTO promotes to Path C |
+| B4_S1024_H8_D64 | 1.017 | 0.994 | 0.998 | 0.997 | AUTO promotes to Path C |
 
-These are M4 Max smoke timings only; they are **not** GB10 parity claims and
-they do not include a Path B kernel row (still gated by the GEMM blocker).
-The apply row currently calls the pure-MLX reference path and is reported so
-that we can compare the same numbers once the kernel goes live.
+Strict receipt: `--strict --max-ratio 1.0 --warmup 5 --iters 20` passed for
+all rows with `strict.phase="all"` and no failures. The unpaired ratios remain
+diagnostic; the strict gate uses paired C/B medians because Path B and Path C
+are measured in an alternating run to avoid Apple-GPU cache/power-state skew.
 
-## Next Steps Once Blocker Lifts
+These are M4 Max smoke/bench receipts only; they are **not** CUDA/H200 or GB10
+acceptance claims.
 
-1. Re-run the probe at /tmp/probe_sparse_mla_tl.py against the tilelang HEAD
-   wheel and confirm the metal target builds without Unsupported target for
-   gemm.
-2. Replace the NotImplementedError bodies in
-   cppmega_mlx/nn/_tilelang/sparse_mla.py::sparse_mla_fwd_metal /
-   ..._bwd_metal with the TileLang -> MSL -> mx.fast.metal_kernel flow.
-   Reuse the transform pattern from /tmp/path_b_msl_mlx/bench_msl_path_b.py
-   (paren-balanced signature parser, alphabetic buffer reordering, const
-   tagging for inputs only).
-3. Wrap the Metal forward in mx.custom_function whose VJP invokes the Metal
-   backward.
-4. Promote test_path_b_forward_parity and test_path_b_backward_parity from
-   skip to passing parity tests against the pure-MLX reference at the same
-   tolerances above.
-5. Update bench/tilelang_ports/sparse_mla.json to add the path_b kernel row,
-   and update this doc with the resulting numbers.
+## Next Steps
+
+1. Keep the AUTO policy per-shape and fail-closed: add a dispatch test whenever
+   a receipt row changes from failing to passing or passing to failing.
+2. Use `CPPMEGA_KERNEL_PATH=path_c` for forced Path C parity/benchmark work and
+   keep it fail-closed when TileLang or Metal is unavailable.
+3. Regenerate `bench/tilelang_ports/sparse_mla.json` and update
+   docs/production_kernel_routing.md, this page, and dispatch tests together
+   before widening AUTO promotion to any additional BF16 shapes.
+4. Keep FP8 and e8m0 sparse-MLA Path C separate from BF16 Path C; current gaps
+   there are scheduler/full-layout coverage, not this BF16 port.

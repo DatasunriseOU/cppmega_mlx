@@ -1,4 +1,4 @@
-"""Path B port of cppmega's TileLang topk-selector kernel.
+"""Path B/Path C ports of cppmega's TileLang topk-selector kernel.
 
 Source attribution
 ------------------
@@ -36,8 +36,9 @@ It uses:
 Apple Metal status (TileLang 0.1.9, MLX 0.31.x)
 -----------------------------------------------
 
-The Path B pipeline through ``tilelang.engine.lower(.., target=Target('metal'))``
-remained blocked even after multiple probe sweeps:
+The original CUDA-style TileLang schedule through
+``tilelang.engine.lower(.., target=Target('metal'))`` remained blocked even
+after multiple probe sweeps:
 
   * ``T.alloc_shared`` on every layout we tried lowers to storage scope
     ``shared.dyn`` which TVM's Metal codegen rejects with
@@ -45,14 +46,15 @@ remained blocked even after multiple probe sweeps:
   * Histogram fills sized ``RADIX+1`` over BLOCK_SIZE threads fail
     LowerTileOp's injective-layout check.
 
-Direct-MSL bypass (this module)
--------------------------------
+Direct-MSL bypass and TileLang Path C (this module)
+---------------------------------------------------
 
-We skip TileLang entirely and emit MSL by hand through
-``mx.fast.metal_kernel`` (the same approach the Mamba3 main port used to get
-the Path B speedup). Each query batch row maps to one threadgroup; threads
-within the threadgroup cooperate via *static* (compile-time-sized)
-``threadgroup`` arrays - no ``shared.dyn`` scope, no off-by-one fills.
+Path B skips TileLang entirely and emits MSL by hand through
+``mx.fast.metal_kernel``. Path C keeps a real TileLang DSL ``@T.prim_func``,
+but uses the same Metal-friendly one-threadgroup-per-row algorithm instead of
+the upstream radix/histogram schedule. Both variants cooperate via *static*
+(compile-time-sized) ``threadgroup`` arrays - no ``shared.dyn`` scope, no
+off-by-one fills.
 
 Performance vs MLX's built-in ``argpartition``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -115,13 +117,27 @@ Return contract:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+# pyright: reportInvalidTypeForm=false
+
+import re
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from typing import Any
 
 import mlx.core as mx
 
 from cppmega_mlx.nn._tilelang import _msl_transform
+
+
+# TileLang's eager builder reads these module globals after _path_c_kernel_for
+# overwrites them for the current shape. Static placeholders keep pyright from
+# treating the macro globals inside the nested @T.prim_func as missing.
+_TOPK_C_B = 1
+_TOPK_C_N = 1
+_TOPK_C_K = 1
+_TOPK_C_THREADS = 1
+_TOPK_C_LOG_THREADS = 0
+_TOPK_C_SCORE_DTYPE = "float32"
 
 
 # ---------------------------------------------------------------------------
@@ -497,10 +513,9 @@ def topk_selector_metal(
     """Direct-MSL Path B forward.
 
     Returns ``None`` if Metal is not eligible (no Metal device, dtype
-    unsupported, etc.). The MSL kernel uses static threadgroup arrays sized
-    by ``T_PAD = next_pow2(seq_len)``; ``seq_len <= 4096`` is supported by
-    default (Apple's per-threadgroup memory budget on M-series is 32KiB
-    which fits 4096 floats + 4096 ints + 256-thread reduction scratch).
+    unsupported, etc.). The MSL kernel uses static ``BLOCK_SIZE * K`` pair
+    buffers, and the host picks a power-of-two ``BLOCK_SIZE`` that keeps the
+    pair merge scratch within the M-series threadgroup-memory budget.
     """
 
     if scores.ndim != 2:
@@ -605,16 +620,18 @@ _PATH_C_OK_REASON = (
 )
 
 
+@lru_cache(maxsize=1)
 def _tilelang_available() -> tuple[bool, str]:
     try:
-        import tilelang  # noqa: F401
-        from tilelang import tvm as _tvm  # noqa: F401
-        import tilelang.language as _T  # noqa: F401
+        import tilelang  # type: ignore[reportMissingImports]  # noqa: F401
+        from tilelang import tvm as _tvm  # type: ignore[reportMissingImports]  # noqa: F401
+        import tilelang.language as _T  # type: ignore[reportMissingImports]  # noqa: F401
     except Exception as exc:  # pragma: no cover - host without TileLang build
         return False, f"tilelang import failed: {exc}"
     return True, "tilelang importable"
 
 
+@lru_cache(maxsize=1)
 def topk_selector_path_c_status() -> PathCStatus:
     """Return whether the TileLang DSL Path C topk selector can dispatch."""
 
@@ -634,7 +651,11 @@ def _path_c_threads_for(k: int) -> int:
 
     max_shared_bytes = 32 * 1024
     max_threads_for_k = max(1, max_shared_bytes // (max(k, 1) * 8))
-    threads = min(64, max_threads_for_k)
+    # The Path C schedule is scalar top-K insertion plus a shared-memory tree
+    # merge. k<=32 is latency-bound on M4 Max and the paired local sweep showed
+    # 32 lanes beating narrower groups; K>=64 benefits from the wider scan.
+    preferred_threads = 32 if k <= 32 else 64
+    threads = min(preferred_threads, max_threads_for_k)
     pow2 = 1
     while (pow2 << 1) <= threads:
         pow2 <<= 1
@@ -651,6 +672,55 @@ def _path_c_score_dtype(scores: mx.array) -> tuple[str, mx.array] | None:
     return None
 
 
+_PATH_C_AUTO_PROFITABLE_RECEIPTS = frozenset(
+    {
+        (1, 64, 8, "float32"),
+        (1, 512, 32, "float32"),
+        (1, 2048, 64, "float32"),
+        (4, 2048, 64, "float32"),
+        (4, 2048, 64, "float16"),
+        (4, 2048, 64, "bfloat16"),
+        (4, 4096, 256, "float32"),
+    }
+)
+
+
+def _path_c_auto_profitable(
+    scores: mx.array,
+    k: int,
+    *,
+    starts: mx.array | None,
+    ends: mx.array | None,
+) -> bool:
+    """Return whether AUTO may route to Path C first.
+
+    Path C remains explicitly available for correctness coverage outside this
+    set. AUTO is stricter: it only prefers Path C where the checked bench
+    receipt proves C/B <= 1.0 and no interval mask changes the timing envelope.
+    """
+
+    if scores.ndim != 2 or starts is not None or ends is not None:
+        return False
+    dtype_pair = _path_c_score_dtype(scores)
+    if dtype_pair is None:
+        return False
+    dtype_name, _ = dtype_pair
+    return (
+        int(scores.shape[0]),
+        int(scores.shape[1]),
+        int(k),
+        dtype_name if scores.dtype != mx.bfloat16 else "bfloat16",
+    ) in _PATH_C_AUTO_PROFITABLE_RECEIPTS
+
+
+@lru_cache(maxsize=128)
+def _path_c_default_interval_buffers(batch: int, seq_len: int) -> tuple[mx.array, mx.array]:
+    return (
+        mx.zeros((batch,), dtype=mx.int32),
+        mx.full((batch,), seq_len, dtype=mx.int32),
+    )
+
+
 def _path_c_interval_buffers(
     *,
     batch: int,
@@ -658,6 +728,9 @@ def _path_c_interval_buffers(
     starts: mx.array | None,
     ends: mx.array | None,
 ) -> tuple[mx.array, mx.array]:
+    if starts is None and ends is None:
+        return _path_c_default_interval_buffers(batch, seq_len)
+
     zero = mx.array(0, dtype=mx.int32)
     seq = mx.array(seq_len, dtype=mx.int32)
     if starts is None:
@@ -675,6 +748,59 @@ def _path_c_interval_buffers(
     return mx.minimum(mx.maximum(starts_i, zero), seq), mx.minimum(
         mx.maximum(ends_i, zero), seq
     )
+
+
+def _path_c_rewrite_merge_round(
+    lowering: _msl_transform.TileLangMSLLowering,
+) -> _msl_transform.TileLangMSLLowering:
+    """Tighten TileLang's conservative merge-round lowering.
+
+    In each tree-reduction round, active lane `t` reads slots `t` and
+    `t + stride`, then writes only slot `t`. `t + stride` is never active in
+    that same round, so there is no read/write race inside the active-lane
+    branch. TileLang currently emits a pre-write barrier and splits writeback
+    into a second identical branch; the final round barrier is enough to
+    protect the next round.
+    """
+
+    lane_expr = "((int)thread_position_in_threadgroup.x)"
+    active_mod = f"({lane_expr} % (stride * 2)) == 0"
+    active_mask = f"({lane_expr} & ((stride * 2) - 1)) == 0"
+    prewrite_barrier = (
+        "\n    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        f"    if ({active_mod}) {{"
+    )
+    replacement = f"\n    if ({active_mod}) {{"
+    body = lowering.body
+    if body.count(prewrite_barrier) == 1:
+        body = body.replace(prewrite_barrier, replacement, 1)
+
+    body = body.replace(
+        active_mod,
+        active_mask,
+    )
+    active_branch = rf"(?:{re.escape(active_mod)}|{re.escape(active_mask)})"
+    second_branch = re.compile(
+        r"      \}\n"
+        r"    \}\n"
+        r"(?:    threadgroup_barrier\(mem_flags::mem_threadgroup\);\n)?"
+        rf"    if \({active_branch}\) \{{\n"
+        rf"      if \(other < {_TOPK_C_THREADS}\) \{{\n"
+        r"        for \(int i_2 = 0;"
+    )
+    body = second_branch.sub("        for (int i_2 = 0;", body, count=1)
+    body = body.replace(
+        f"((((long){lane_expr}) * (long){_TOPK_C_K}) + ((long)ap))",
+        f"(({lane_expr} * {_TOPK_C_K}) + ap)",
+    )
+    body = body.replace(
+        f"((((long)other) * (long){_TOPK_C_K}) + ((long)bp))",
+        f"((other * {_TOPK_C_K}) + bp)",
+    )
+
+    if body == lowering.body:
+        return lowering
+    return replace(lowering, body=body)
 
 
 @lru_cache(maxsize=128)
@@ -696,7 +822,7 @@ def _path_c_kernel_for(
             f"topk selector shared merge buffer exceeds 32KiB: threads={threads}, k={k}"
         )
 
-    import tilelang.language as T
+    import tilelang.language as T  # type: ignore[reportMissingImports]
 
     globals().update(
         T=T,
@@ -761,6 +887,8 @@ def _path_c_kernel_for(
                             local_vals[p - 1] = local_vals[p]
                             local_idx[p - 1] = local_idx[p]
                             pos = p
+                        elif (_TOPK_C_K <= 8) or (_TOPK_C_K >= 64):
+                            break
                     local_vals[pos] = value
                     local_idx[pos] = j
 
@@ -804,7 +932,9 @@ def _path_c_kernel_for(
                 for i in T.serial(_TOPK_C_K):
                     indices[bx, i] = pair_idx[0, _TOPK_C_K - 1 - i]
 
-    lowering = _msl_transform.lower_tilelang_to_msl_inline(topk_selector_kernel)
+    lowering = _path_c_rewrite_merge_round(
+        _msl_transform.lower_tilelang_to_msl_inline(topk_selector_kernel)
+    )
     kernel = mx.fast.metal_kernel(
         name=f"cppmega_topk_selector_path_c_{batch}_{seq_len}_{k}_{threads}_{score_dtype}",
         input_names=["ends", "scores", "starts"],
@@ -825,9 +955,10 @@ def topk_selector_tilelang(
 ) -> mx.array | None:
     """TileLang DSL Path C forward.
 
-    Returns ``None`` when TileLang/Metal cannot dispatch. This is an explicit
-    experimental backend; ``backend="auto"`` remains Path B-first unless the
-    benchmark demonstrates that Path C is no worse than the hand-written MSL.
+    Returns ``None`` when TileLang/Metal cannot dispatch. Explicit Path C is
+    allowed outside the profitable bench envelope for correctness tests and
+    forced callers; ``backend="auto"`` only tries it first for receipt-backed
+    unmasked shapes.
     """
 
     if scores.ndim != 2:
@@ -853,9 +984,8 @@ def topk_selector_tilelang(
         starts=starts,
         ends=ends,
     )
-    threads = _path_c_threads_for(int(k))
-
     try:
+        threads = _path_c_threads_for(int(k))
         kernel, lowering = _path_c_kernel_for(batch, seq_len, int(k), threads, score_dtype)
     except Exception:
         return None
@@ -893,8 +1023,9 @@ class PathBStatus:
 
 _PATH_B_OK_REASON = (
     "topk_selector direct-MSL kernel built via mx.fast.metal_kernel is "
-    "available; bypasses TileLang lowering entirely (which is blocked on "
-    "shared.dyn / LowerTileOp issues, see docs/tilelang_ports/topk_selector.md)."
+    "available; bypasses the original CUDA-style TileLang schedule that is "
+    "blocked on shared.dyn / LowerTileOp issues, see "
+    "docs/tilelang_ports/topk_selector.md."
 )
 _PATH_B_BLOCKER_REASON = (
     "topk_selector direct-MSL kernel could not be constructed: "
@@ -934,11 +1065,12 @@ def topk_selector(
         k: number of top entries to select.
         starts: optional (B,) int32 starts for per-row mask.
         ends: optional (B,) int32 ends for per-row mask.
-        backend: ``"auto"`` (default) prefers the direct-MSL Path B kernel and
-            falls back to the pure-MLX reference; ``"metal"`` requires the
-            Path B kernel and raises on fallback; ``"tilelang"`` / ``"path_c"``
-            require the TileLang DSL Path C kernel; ``"mlx"`` always uses the
-            reference.
+        backend: ``"auto"`` (default) prefers the TileLang DSL Path C kernel
+            only for strict-green unmasked bench receipt rows, otherwise it
+            tries direct-MSL Path B before the pure-MLX reference;
+            ``"metal"`` requires the Path B kernel and raises on fallback;
+            ``"tilelang"`` / ``"path_c"`` require the TileLang DSL Path C
+            kernel; ``"mlx"`` always uses the reference.
     """
 
     if backend not in {"auto", "mlx", "metal", "tilelang", "path_c"}:
@@ -955,7 +1087,12 @@ def topk_selector(
         if out is None:
             raise RuntimeError("topk_selector: TileLang Path C path unavailable")
         return out
-    # auto
+    # auto: Path C-first only where the checked paired bench proves C/B <= 1.0.
+    # Unreceipted or masked calls stay Path B-first to avoid dishonest routing.
+    if _path_c_auto_profitable(scores, k, starts=starts, ends=ends):
+        out = topk_selector_tilelang(scores, k, starts=starts, ends=ends)
+        if out is not None:
+            return out
     out = topk_selector_metal(scores, k, starts=starts, ends=ends)
     if out is not None:
         return out

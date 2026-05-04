@@ -375,13 +375,10 @@ def _run_existing_training(args: argparse.Namespace, *, data_path: Path) -> tupl
                 data_path=data_path,
             )
             return enforce_loss_decrease_requirement(args, receipt)
-        return (
-            blocked_receipt(
-                args,
-                UNSUPPORTED_REQUIRED_MODEL_PROFILE_ROUTE_REASON,
-                "unsupported_model_profile_route",
-            ),
-            0 if args.dry_run_json else 2,
+        return run_local_gb10_quarter_training(
+            args,
+            config=config,
+            data_path=data_path,
         )
 
     reset_peak_memory()
@@ -415,6 +412,29 @@ def _run_existing_training(args: argparse.Namespace, *, data_path: Path) -> tupl
     if args.require_loss_decrease and not receipt["training"]["loss_decreased"]:
         return enforce_loss_decrease_requirement(args, receipt)
     return receipt, 0
+
+
+def run_local_gb10_quarter_training(
+    args: argparse.Namespace,
+    *,
+    config: TrainHybridTinyConfig,
+    data_path: Path,
+) -> tuple[dict[str, Any], int]:
+    """Training-route seam for the full local_gb10_quarter M0.4 target.
+
+    The default implementation remains allocation-free and fail-closed. Tests
+    and future route work can monkeypatch this symbol without touching the
+    HybridTinyLM smoke path or allocating the full profile in normal pytest.
+    """
+
+    return (
+        blocked_receipt(
+            args,
+            UNSUPPORTED_REQUIRED_MODEL_PROFILE_ROUTE_REASON,
+            "unsupported_model_profile_route",
+        ),
+        2,
+    )
 
 
 def enforce_loss_decrease_requirement(

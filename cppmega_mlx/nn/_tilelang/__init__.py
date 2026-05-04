@@ -1,27 +1,26 @@
-"""Path B TileLang kernel ports for cppmega MLX.
+"""Path B/C TileLang kernel ports for cppmega MLX.
 
-This subpackage hosts hand-written Apple Metal kernel ports of cppmega's
-TileLang sources. Each port keeps a pure-MLX fallback and pairs the Metal
-forward with a manual VJP via mx.custom_function so it remains differentiable.
+This subpackage hosts Apple Metal kernel ports of cppmega's TileLang sources.
+Each port keeps a pure-MLX fallback and pairs the Metal forward with a manual
+VJP via mx.custom_function so it remains differentiable.
 
 Membership:
 
 - _msl_transform.py: tiny MSL string assembly + dispatch helper.
 - _path_b_lowering.py: vendored TileLang->MSL string-rewrite helpers used
   when a TileLang PrimFunc actually lowers to Metal (does not apply to
-  topk_selector or sparse_mla, which fail at lower(); see their docs).
+  direct-MSL Path B kernels).
 - _mamba3_helpers.py: pure-MLX rewrites of three Triton helpers
   (compute_dacs_segsum, bwd_dadt_fused, bwd_dtrap_ddt) that have no Metal
   backend in upstream Triton.
 - mamba3.py: Path B port of mamba_ssm.ops.tilelang.mamba3.{fwd,bwd} plus the
   mx.custom_function wrapper that ties forward to backward.
-- topk_selector.py: Path B port attempt for cppmega's tilelang_sparse_mla
-  topk-selector kernel. Documents the TileLang metal codegen blockers and
-  ships a pure-MLX runtime path.
+- topk_selector.py: Path B/C port for cppmega's tilelang_sparse_mla
+  topk-selector kernel. AUTO prefers Path C where the checked-in bench receipt
+  keeps Path C no worse than Path B, then falls back to Path B and pure MLX.
 
-The upstream TileLang TVM-Metal lowering (PR tile-ai/tilelang#799) is *not*
-required at runtime: this module emits MSL directly via mx.fast.metal_kernel.
-That is the Path B contract noted in docs/kernel_coverage_matrix.md.
+Path B emits MSL directly via mx.fast.metal_kernel. Path C lowers TileLang DSL
+to Metal when the in-tree lowering bridge supports the shape/kernel.
 """
 
 from cppmega_mlx.nn._tilelang import (
@@ -108,10 +107,17 @@ from cppmega_mlx.nn._tilelang.sparse_mla_blockscaled_path_c import (
     E8M0_BLOCK_SIZE,
     E8M0_LAYOUT,
     E8M0_SCALE_FORMAT,
+    SparseMLABlockScaledQKReducePathCStatus,
     SparseMLABlockScaledPathCStatus,
     blockscaled_sparse_mla_qk_msl_features,
     blockscaled_sparse_mla_qk_path_c_status,
+    blockscaled_sparse_mla_qk_reduce_msl_features,
+    blockscaled_sparse_mla_qk_reduce_path_c,
+    blockscaled_sparse_mla_qk_reduce_path_c_status,
+    blockscaled_sparse_mla_qk_scaled_matmul_probe_status,
     lower_blockscaled_sparse_mla_qk_msl,
+    lower_blockscaled_sparse_mla_qk_reduce_msl,
+    make_blockscaled_sparse_mla_qk_reduce_kernel,
     make_blockscaled_sparse_mla_qk_kernel,
 )
 from cppmega_mlx.nn._tilelang.sparse_mla_fp8 import (
@@ -141,6 +147,7 @@ __all__ = [
     "MXFP8_BLOCK_SIZE",
     "PathBStatus",
     "SparseMLABlockScaledMetalStatus",
+    "SparseMLABlockScaledQKReducePathCStatus",
     "SparseMLABlockScaledPathCStatus",
     "SparseMLAFp8MetalStatus",
     "SparseMLAMetalStatus",
@@ -155,6 +162,10 @@ __all__ = [
     "bwd_dtrap_ddt",
     "blockscaled_sparse_mla_qk_msl_features",
     "blockscaled_sparse_mla_qk_path_c_status",
+    "blockscaled_sparse_mla_qk_reduce_msl_features",
+    "blockscaled_sparse_mla_qk_reduce_path_c",
+    "blockscaled_sparse_mla_qk_reduce_path_c_status",
+    "blockscaled_sparse_mla_qk_scaled_matmul_probe_status",
     "compute_dacs_segsum",
     "fp8_msl_kernels",
     "fp8_msl_status",
@@ -167,6 +178,8 @@ __all__ = [
     "half_to_fp8",
     "lower_fp8_vecmat_msl",
     "lower_blockscaled_sparse_mla_qk_msl",
+    "lower_blockscaled_sparse_mla_qk_reduce_msl",
+    "make_blockscaled_sparse_mla_qk_reduce_kernel",
     "make_blockscaled_sparse_mla_qk_kernel",
     "make_fp8_vecmat_reduce_kernel",
     "m2rnn",

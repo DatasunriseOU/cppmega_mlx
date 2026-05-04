@@ -19,13 +19,21 @@ The tests verify:
 Tolerances: rtol=1e-3, atol=1e-3 for fp16 (plus generous fp32 hand checks).
 """
 
+# pyright: reportMissingImports=false
+
 from __future__ import annotations
+
+import json
+import sys
 
 import numpy as np
 import pytest
 
 import mlx.core as mx
 
+from typing import cast
+
+import cppmega_mlx.nn._tilelang.sparse_mla as sparse_mla_path_b  # noqa: E402
 from cppmega_mlx.nn._tilelang.sparse_mla import (  # noqa: E402
     SparseMLAMetalStatus,
     sparse_mla_apply,
@@ -34,6 +42,11 @@ from cppmega_mlx.nn._tilelang.sparse_mla import (  # noqa: E402
     sparse_mla_metal_status,
 )
 from cppmega_mlx.nn._tilelang.sparse_mla_path_c import (  # noqa: E402
+    _bwd_kernel_for,
+    _fwd_kernel_for,
+    _mlx_total_thread_grid,
+    _sparse_mla_bwd_path_c_partial,
+    _threadgroup_size,
     dump_lowered_bwd_msl,
     dump_lowered_fwd_msl,
     sparse_mla_bwd_path_c,
@@ -44,6 +57,34 @@ from cppmega_mlx.nn.sparse_mla import (  # noqa: E402
     sparse_mla_attention,
     sparse_mla_attention_reference,
 )
+
+
+def _assert_bwd_path_b_hot_loop_shape(msl: str) -> None:
+    """Guard the Path C bwd postprocess against regressing to TileLang temps."""
+
+    assert "float acc;" not in msl
+    assert "float local;" not in msl
+    assert "\n  int gather_idx;\n" not in msl
+    assert "acc = 0.000000e+00f;" not in msl
+    assert "local =" not in msl
+    assert "p[k] = exp" not in msl
+    assert "float local_max = -INFINITY;" in msl
+    assert "float local_sum = 0.0f;" in msl
+    assert "float local_rs = 0.0f;" in msl
+    assert "float inv_sum = 1.0f / sumexp;" in msl
+    assert "float inv_sum = (sumexp > 0.000000e+00f)" not in msl
+    assert "float a = reduce_buf[tid];" in msl
+    assert "float b_v = reduce_buf[tid + stride];" in msl
+    assert "if (b_v > a) reduce_buf[tid] = b_v;" in msl
+    assert "if (reduce_buf[tid] < reduce_buf[tid + stride])" not in msl
+    assert "p[k] = (v == -INFINITY) ? 0.0f : exp(v - row_max);" in msl
+    assert "reduce_buf[tid] = (reduce_buf[tid] + reduce_buf[tid + stride]);" not in msl
+    assert "reduce_buf[tid] += reduce_buf[tid + stride];" in msl
+    p_phase = msl.split("float row_max = reduce_buf[0];", 1)[1].split(
+        "threadgroup_barrier(mem_flags::mem_threadgroup);",
+        1,
+    )[0]
+    assert "indices[idx_base + k]" not in p_phase
 
 
 # ---------------------------------------------------------------------------
@@ -214,7 +255,7 @@ def test_reference_backward_finite() -> None:
     indices = mx.array(indices_np)
 
     def loss(q_in: mx.array, kv_in: mx.array) -> mx.array:
-        out = sparse_mla_attention(q_in, kv_in, indices, sm_scale=D ** -0.5)
+        out = cast(mx.array, sparse_mla_attention(q_in, kv_in, indices, sm_scale=D ** -0.5))
         return mx.mean(out * out)
 
     grads = mx.grad(loss, argnums=(0, 1))(q, kv)
@@ -329,6 +370,7 @@ def test_apply_force_metal_dispatches_kernel() -> None:
     kv = mx.array(rng.standard_normal((1, 8, 1, 32)).astype(np.float16))
     indices = mx.array(rng.integers(0, 8, size=(1, 4, 1, 4)).astype(np.int32))
     out = sparse_mla_apply(q, kv, indices, force_metal=True)
+    out = cast(mx.array, out)
     mx.eval(out)
     assert tuple(out.shape) == (1, 4, 2, 32)
 
@@ -404,8 +446,9 @@ def test_path_b_forward_parity_with_invalid_indices() -> None:
     [
         dict(B=1, S=4, H=2, D=16, G=1, topk=4, Skv=8),
         dict(B=1, S=8, H=4, D=16, G=2, topk=8, Skv=16, d_v=8),
+        dict(B=1, S=32, H=4, D=64, G=1, topk=32, Skv=64),
     ],
-    ids=["bf16_small_16x16", "bf16_multigroup_tail_16x16"],
+    ids=["bf16_small_16x16", "bf16_multigroup_tail_16x16", "bf16_topk32_32x32"],
 )
 def test_path_c_forward_bf16_parity(cfg) -> None:
     """TileLang DSL Path C BF16 forward matches the pure-MLX reference."""
@@ -536,8 +579,9 @@ def test_path_b_backward_parity() -> None:
         dict(B=1, S=4, H=2, D=16, G=1, topk=4, Skv=8),
         dict(B=1, S=4, H=4, D=16, G=2, topk=4, Skv=8, d_v=8),
         dict(B=1, S=8, H=4, D=32, G=1, topk=16, Skv=32),
+        dict(B=1, S=32, H=4, D=64, G=1, topk=32, Skv=64),
     ],
-    ids=["small", "multigroup_tail_dim", "topk16_threadgroup"],
+    ids=["small", "multigroup_tail_dim", "topk16_threadgroup", "topk32_threadgroup"],
 )
 def test_path_c_backward_parity(cfg) -> None:
     """TileLang DSL Path C sparse-MLA backward matches the pure-MLX VJP."""
@@ -588,6 +632,324 @@ def test_path_c_backward_parity(cfg) -> None:
     )
 
 
+def test_path_c_backward_matches_path_b_direct_msl() -> None:
+    """Path C backward must mirror Path B's chunked dQ/dKV contract."""
+
+    status = sparse_mla_path_c_status()
+    if not status.available:
+        pytest.skip(status.reason)
+
+    rng = np.random.default_rng(57)
+    B, S, H, D = 1, 4, 4, 16
+    G = 2
+    topk = 4
+    Skv = 8
+    d_v = 8
+
+    q = mx.array(rng.standard_normal((B, S, H, D)).astype(np.float32))
+    kv = mx.array(rng.standard_normal((B, Skv, G, D)).astype(np.float32))
+    indices_np = rng.integers(0, Skv, size=(B, S, G, topk)).astype(np.int32)
+    indices_np[0, 0, 0, :] = -1
+    indices_np[0, 1, :, ::2] = -1
+    indices = mx.array(indices_np)
+    d_out = mx.array(rng.standard_normal((B, S, H, d_v)).astype(np.float32))
+
+    path_b = sparse_mla_bwd_metal(q, kv, d_out, indices, d_v=d_v)
+    path_c = sparse_mla_bwd_path_c(q, kv, d_out, indices, d_v=d_v)
+    assert path_b is not None, "Path B backward must dispatch for direct parity"
+    assert path_c is not None, "Path C backward must dispatch for direct parity"
+    dq_b, dkv_b = path_b
+    dq_c, dkv_c = path_c
+    mx.eval(dq_b, dkv_b, dq_c, dkv_c)
+
+    np.testing.assert_allclose(
+        np.array(dq_c).astype(np.float32),
+        np.array(dq_b).astype(np.float32),
+        rtol=0,
+        atol=0,
+    )
+    np.testing.assert_allclose(
+        np.array(dkv_c).astype(np.float32),
+        np.array(dkv_b).astype(np.float32),
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_path_c_backward_accumulates_duplicate_kv_indices() -> None:
+    """Repeated topk hits must scatter-add all Path C partial dKV rows."""
+
+    status = sparse_mla_path_c_status()
+    if not status.available:
+        pytest.skip(status.reason)
+
+    rng = np.random.default_rng(58)
+    B, S, H, D = 1, 4, 4, 16
+    G = 2
+    Skv = 8
+    d_v = 8
+
+    q = mx.array(rng.standard_normal((B, S, H, D)).astype(np.float32))
+    kv = mx.array(rng.standard_normal((B, Skv, G, D)).astype(np.float32))
+    indices_np = np.array(
+        [
+            [
+                [[2, 2, 2, 5], [3, 3, 6, 3]],
+                [[2, -1, 2, 2], [3, 7, 3, -1]],
+                [[1, 2, 2, 4], [3, 3, 3, 0]],
+                [[-1, 2, 5, 2], [6, 3, 3, 3]],
+            ]
+        ],
+        dtype=np.int32,
+    )
+    indices = mx.array(indices_np)
+    d_out = mx.array(rng.standard_normal((B, S, H, d_v)).astype(np.float32))
+
+    grads = sparse_mla_bwd_path_c(q, kv, d_out, indices, d_v=d_v)
+    assert grads is not None, "Path C duplicate-index backward must dispatch"
+    dq_path_c, dkv_path_c = grads
+    mx.eval(dq_path_c, dkv_path_c)
+
+    def loss(q_, kv_):
+        out = sparse_mla_attention_reference(q_, kv_, indices, d_v=d_v)
+        return mx.sum(out * d_out)
+
+    dq_ref, dkv_ref = mx.grad(loss, argnums=(0, 1))(q, kv)
+    mx.eval(dq_ref, dkv_ref)
+
+    dq_path_c_np = np.array(dq_path_c).astype(np.float32)
+    dkv_path_c_np = np.array(dkv_path_c).astype(np.float32)
+    dq_ref_np = np.array(dq_ref).astype(np.float32)
+    dkv_ref_np = np.array(dkv_ref).astype(np.float32)
+
+    assert np.linalg.norm(dkv_ref_np[0, 2, 0]) > 0
+    assert np.linalg.norm(dkv_ref_np[0, 3, 1]) > 0
+    np.testing.assert_allclose(dq_path_c_np, dq_ref_np, rtol=5e-3, atol=5e-3)
+    np.testing.assert_allclose(dkv_path_c_np, dkv_ref_np, rtol=5e-3, atol=5e-3)
+
+
+def test_path_c_backward_reuses_int32_indices_for_partial_reduce() -> None:
+    """Avoid an extra MLX cast/copy on the bwd hot path when indices are int32."""
+
+    status = sparse_mla_path_c_status()
+    if not status.available:
+        pytest.skip(status.reason)
+
+    rng = np.random.default_rng(59)
+    B, S, H, D = 1, 4, 2, 16
+    G = 1
+    topk = 4
+    Skv = 8
+
+    q = mx.array(rng.standard_normal((B, S, H, D)).astype(np.float32))
+    kv = mx.array(rng.standard_normal((B, Skv, G, D)).astype(np.float32))
+    indices = mx.array(rng.integers(0, Skv, size=(B, S, G, topk)).astype(np.int32))
+    d_out = mx.array(rng.standard_normal((B, S, H, D)).astype(np.float32))
+
+    partial = _sparse_mla_bwd_path_c_partial(q, kv, d_out, indices)
+    assert partial is not None, "Path C backward partial kernel must dispatch"
+    dkv_partial, dq, indices_i32, _shapes = partial
+    mx.eval(dkv_partial, dq)
+
+    assert indices_i32 is indices
+
+
+def test_path_c_topk32_matches_path_b_direct_msl() -> None:
+    """Path C must keep the 32x32 sparse-MLA contract bit-exact with Path B."""
+
+    status = sparse_mla_path_c_status()
+    if not status.available:
+        pytest.skip(status.reason)
+
+    rng = np.random.default_rng(123)
+    B, S, H, D = 1, 32, 4, 64
+    G = 1
+    topk = 32
+    Skv = 64
+
+    q = mx.array(rng.standard_normal((B, S, H, D)).astype(np.float32)).astype(mx.bfloat16)
+    kv = mx.array(rng.standard_normal((B, Skv, G, D)).astype(np.float32)).astype(mx.bfloat16)
+    indices_np = rng.integers(0, Skv, size=(B, S, G, topk)).astype(np.int32)
+    indices_np[0, 0, 0, :] = -1
+    indices_np[0, 1, 0, ::3] = -1
+    indices = mx.array(indices_np)
+    d_out = mx.array(rng.standard_normal((B, S, H, D)).astype(np.float32)).astype(
+        mx.bfloat16
+    )
+
+    fwd_b = sparse_mla_fwd_metal(q, kv, indices)
+    fwd_c = sparse_mla_fwd_path_c(q, kv, indices)
+    assert fwd_b is not None, "Path B topk32 forward must dispatch for parity"
+    assert fwd_c is not None, "Path C topk32 forward must dispatch"
+    out_b, lse_b = fwd_b
+    out_c, lse_c = fwd_c
+    mx.eval(out_b, lse_b, out_c, lse_c)
+
+    np.testing.assert_allclose(
+        np.array(out_c).astype(np.float32),
+        np.array(out_b).astype(np.float32),
+        rtol=0,
+        atol=0,
+    )
+    np.testing.assert_allclose(
+        np.array(lse_c).astype(np.float32),
+        np.array(lse_b).astype(np.float32),
+        rtol=0,
+        atol=0,
+    )
+
+    bwd_b = sparse_mla_bwd_metal(q, kv, d_out, indices)
+    bwd_c = sparse_mla_bwd_path_c(q, kv, d_out, indices)
+    assert bwd_b is not None, "Path B topk32 backward must dispatch for parity"
+    assert bwd_c is not None, "Path C topk32 backward must dispatch"
+    dq_b, dkv_b = bwd_b
+    dq_c, dkv_c = bwd_c
+    mx.eval(dq_b, dkv_b, dq_c, dkv_c)
+
+    np.testing.assert_allclose(
+        np.array(dq_c).astype(np.float32),
+        np.array(dq_b).astype(np.float32),
+        rtol=0,
+        atol=0,
+    )
+    np.testing.assert_allclose(
+        np.array(dkv_c).astype(np.float32),
+        np.array(dkv_b).astype(np.float32),
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_path_c_topk64_matches_path_b_direct_msl() -> None:
+    """Path C must keep the topk64 sparse-MLA contract bit-exact with Path B."""
+
+    status = sparse_mla_path_c_status()
+    if not status.available:
+        pytest.skip(status.reason)
+
+    rng = np.random.default_rng(127)
+    B, S, H, D = 1, 32, 4, 64
+    G = 1
+    topk = 64
+    Skv = 128
+
+    q = mx.array(rng.standard_normal((B, S, H, D)).astype(np.float32)).astype(mx.bfloat16)
+    kv = mx.array(rng.standard_normal((B, Skv, G, D)).astype(np.float32)).astype(mx.bfloat16)
+    indices_np = rng.integers(0, Skv, size=(B, S, G, topk)).astype(np.int32)
+    indices_np[0, 0, 0, :] = -1
+    indices_np[0, 1, 0, ::4] = -1
+    indices = mx.array(indices_np)
+    d_out = mx.array(rng.standard_normal((B, S, H, D)).astype(np.float32)).astype(
+        mx.bfloat16
+    )
+
+    fwd_b = sparse_mla_fwd_metal(q, kv, indices)
+    fwd_c = sparse_mla_fwd_path_c(q, kv, indices)
+    assert fwd_b is not None, "Path B topk64 forward must dispatch for parity"
+    assert fwd_c is not None, "Path C topk64 forward must dispatch"
+    out_b, lse_b = fwd_b
+    out_c, lse_c = fwd_c
+    mx.eval(out_b, lse_b, out_c, lse_c)
+
+    np.testing.assert_allclose(
+        np.array(out_c).astype(np.float32),
+        np.array(out_b).astype(np.float32),
+        rtol=0,
+        atol=0,
+    )
+    np.testing.assert_allclose(
+        np.array(lse_c).astype(np.float32),
+        np.array(lse_b).astype(np.float32),
+        rtol=0,
+        atol=0,
+    )
+
+    bwd_b = sparse_mla_bwd_metal(q, kv, d_out, indices)
+    bwd_c = sparse_mla_bwd_path_c(q, kv, d_out, indices)
+    assert bwd_b is not None, "Path B topk64 backward must dispatch for parity"
+    assert bwd_c is not None, "Path C topk64 backward must dispatch"
+    dq_b, dkv_b = bwd_b
+    dq_c, dkv_c = bwd_c
+    mx.eval(dq_b, dkv_b, dq_c, dkv_c)
+
+    np.testing.assert_allclose(
+        np.array(dq_c).astype(np.float32),
+        np.array(dq_b).astype(np.float32),
+        rtol=0,
+        atol=0,
+    )
+    np.testing.assert_allclose(
+        np.array(dkv_c).astype(np.float32),
+        np.array(dkv_b).astype(np.float32),
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_bench_strict_failure_still_writes_receipt(monkeypatch, tmp_path) -> None:
+    """A red strict gate must leave a JSON receipt for diagnosis."""
+
+    import scripts.bench_tilelang_sparse_mla as bench_sparse_mla
+
+    class _Status:
+        available = True
+        reason = "test status"
+
+    fake_shape = {
+        "name": "fake_sparse_mla",
+        "B": 1,
+        "S": 1,
+        "H": 1,
+        "D": 16,
+        "G": 1,
+        "topk": 4,
+        "Skv": 4,
+    }
+
+    def fake_bench_shape(*_args, **_kwargs):
+        return {
+            "shape": fake_shape,
+            "path_b": {"available": True, "reason": "ok"},
+            "path_c": {"available": True, "reason": "ok"},
+            "fwd_msl_paired_ms": {"ok": True},
+            "fwd_path_c_paired_ms": {"ok": True},
+            "fwd_path_c_over_path_b_paired_ratio": 1.25,
+            # Guard that strict diagnostics use paired ratios, not unpaired row flags.
+            "fwd_path_c_no_worse_than_path_b": True,
+        }
+
+    out_path = tmp_path / "strict_fail.json"
+    monkeypatch.setattr(bench_sparse_mla, "DEFAULT_SHAPES", [fake_shape])
+    monkeypatch.setattr(bench_sparse_mla, "_bench_shape", fake_bench_shape)
+    monkeypatch.setattr(bench_sparse_mla, "sparse_mla_metal_status", lambda: _Status())
+    monkeypatch.setattr(bench_sparse_mla, "sparse_mla_path_c_status", lambda: _Status())
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "bench_tilelang_sparse_mla.py",
+            "--strict",
+            "--fwd-only",
+            "--shape",
+            "fake_sparse_mla",
+            "--max-ratio",
+            "1.0",
+            "--out",
+            str(out_path),
+        ],
+    )
+
+    assert bench_sparse_mla.main() == 2
+    payload = json.loads(out_path.read_text())
+    assert payload["strict"]["enabled"] is True
+    assert payload["strict"]["passed"] is False
+    assert payload["strict"]["failures"] == [
+        "fake_sparse_mla: forward strict gate failed paired C/B=1.25 "
+        "path_b_ok=True path_c_ok=True"
+    ]
+    assert payload["rows"][0]["shape"]["name"] == "fake_sparse_mla"
+
+
 def test_path_c_backward_lowered_msl_uses_threadgroup_reductions() -> None:
     status = sparse_mla_path_c_status()
     if not status.available:
@@ -611,7 +973,235 @@ def test_path_c_backward_lowered_msl_uses_threadgroup_reductions() -> None:
     assert "device half* dq" in msl
     assert "threadgroup float" in lowered
     assert "threadgroup_barrier" in lowered
+    assert "if (((0 <=" not in lowered
     assert "atomic_" not in lowered
+    assert "uint tid = thread_position_in_threadgroup.x;" in msl
+    assert "uint gid = threadgroup_position_in_grid.x;" in msl
+    assert "uint3 threadIdx =" not in msl
+    assert "uint3 blockIdx =" not in msl
+    assert "uint threads =" in msl
+    assert "int tid = int(threadIdx.x);" not in msl
+    assert "int gid = int(blockIdx.x);" not in msl
+    assert "((int)threadIdx.x)" not in msl
+    assert "((int)blockIdx.x)" not in msl
+    assert "_tmp" not in msl
+    assert "for (int _tmp" not in msl
+    assert "int stride;" not in msl
+    assert "if (0 <= gather_idx)" not in msl
+    assert "half condval" not in msl
+    assert "round_id" not in msl
+    assert "sumexp <= 0.000000e+00f" in msl
+    assert "return;" in msl
+    assert "uint q_row_base =" in msl
+    assert "uint d_out_row =" in msl
+    assert "uint kv_b_base =" in msl
+    assert "uint idx_base =" in msl
+    assert "uint dkv_pb =" in msl
+    assert "indices[idx_base + k]" in msl
+    assert "q[q_row_base + d]" in msl
+    assert "d_out[d_out_row + d]" in msl
+    assert "dq[q_row_base + d]" in msl
+    assert "dkv_partial[dkv_pb + kd]" in msl
+    assert "q[((gid * 16) + d)]" not in msl
+    assert "d_out[((gid * 16) + d_1)]" not in msl
+    assert msl.count("for (uint stride = threads / 2; stride > 0; stride >>= 1)") == 3
+    _assert_bwd_path_b_hot_loop_shape(msl)
+
+
+def test_path_c_backward_bench_shape_msl_uses_path_b_lane_loops() -> None:
+    status = sparse_mla_path_c_status()
+    if not status.available:
+        pytest.skip(status.reason)
+
+    msl = dump_lowered_bwd_msl(
+        batch=2,
+        seq_len=128,
+        heads=8,
+        qk_dim=64,
+        kv_group=1,
+        topk=16,
+        seq_len_kv=128,
+    )
+    assert "uint tid = thread_position_in_threadgroup.x;" in msl
+    assert "uint gid = threadgroup_position_in_grid.x;" in msl
+    assert "uint3 threadIdx =" not in msl
+    assert "uint3 blockIdx =" not in msl
+    assert "uint threads = 16;" in msl
+    assert "_tmp" not in msl
+    assert "round_id" not in msl
+    assert "half condval" not in msl
+    assert "((int)threadIdx.x)" not in msl
+    assert "int stride;" not in msl
+    assert "for (uint d = tid; d < 64; d += threads)" in msl
+    assert "for (uint kd = tid; kd < 1024; kd += threads)" in msl
+    assert "uint q_row_base =" in msl
+    assert "uint d_out_row =" in msl
+    assert "uint kv_b_base =" in msl
+    assert "uint idx_base =" in msl
+    assert "uint dkv_pb =" in msl
+    assert "kv[kv_row_base + d]" in msl
+    assert "uint k = kd / 64;" in msl
+    assert "uint d = kd % 64;" in msl
+    assert "int gather_idx = indices[idx_base + k];" in msl
+    assert "float qv = float(q[q_row_base + d]);" in msl
+    assert "float ks_q = sm_scale * ds[k] * qv;" in msl
+    assert "float dod = float(d_out[d_out_row + d]);" in msl
+    assert "dkv_partial[dkv_pb + kd] = ((half)((p[k] * dod) + ks_q));" in msl
+    assert "indices[((gid >> 3) * 16) + k]" not in msl
+    assert "q[((gid * 64) + d)]" not in msl
+    assert "d_out[((gid * 64) + d_1)]" not in msl
+    assert "dkv_partial[(gid * 1024) + kd]" not in msl
+    hot_loop = msl.split("for (uint kd = tid; kd < 1024; kd += threads)", 1)[1]
+    assert "kd / 64)" not in hot_loop
+    assert "kd % 64)" not in hot_loop
+    assert "sumexp <= 0.000000e+00f" in msl
+    assert msl.count("for (uint stride = threads / 2; stride > 0; stride >>= 1)") == 3
+    _assert_bwd_path_b_hot_loop_shape(msl)
+
+
+def test_path_c_backward_topk32_bench_shape_msl_uses_path_b_lane_loops() -> None:
+    status = sparse_mla_path_c_status()
+    if not status.available:
+        pytest.skip(status.reason)
+
+    msl = dump_lowered_bwd_msl(
+        batch=4,
+        seq_len=512,
+        heads=8,
+        qk_dim=64,
+        kv_group=1,
+        topk=32,
+        seq_len_kv=512,
+    )
+    assert "uint tid = thread_position_in_threadgroup.x;" in msl
+    assert "uint gid = threadgroup_position_in_grid.x;" in msl
+    assert "uint3 threadIdx =" not in msl
+    assert "uint3 blockIdx =" not in msl
+    assert "uint threads = 32;" in msl
+    assert "_tmp" not in msl
+    assert "round_id" not in msl
+    assert "half condval" not in msl
+    assert "((int)threadIdx.x)" not in msl
+    assert "int stride;" not in msl
+    assert "for (uint d = tid; d < 64; d += threads)" in msl
+    assert "for (uint kd = tid; kd < 2048; kd += threads)" in msl
+    assert "uint q_row_base =" in msl
+    assert "uint d_out_row =" in msl
+    assert "uint kv_b_base =" in msl
+    assert "uint idx_base =" in msl
+    assert "uint dkv_pb =" in msl
+    assert "kv[kv_row_base + d]" in msl
+    assert "uint k = kd / 64;" in msl
+    assert "uint d = kd % 64;" in msl
+    assert "int gather_idx = indices[idx_base + k];" in msl
+    assert "float qv = float(q[q_row_base + d]);" in msl
+    assert "float ks_q = sm_scale * ds[k] * qv;" in msl
+    assert "float dod = float(d_out[d_out_row + d]);" in msl
+    assert "dkv_partial[dkv_pb + kd] = ((half)((p[k] * dod) + ks_q));" in msl
+    assert "indices[((gid >> 3) * 32) + k]" not in msl
+    assert "q[((gid * 64) + d)]" not in msl
+    assert "d_out[((gid * 64) + d_1)]" not in msl
+    assert "dkv_partial[(gid * 2048) + kd]" not in msl
+    hot_loop = msl.split("for (uint kd = tid; kd < 2048; kd += threads)", 1)[1]
+    assert "kd / 64)" not in hot_loop
+    assert "kd % 64)" not in hot_loop
+    assert "sumexp <= 0.000000e+00f" in msl
+    assert msl.count("for (uint stride = threads / 2; stride > 0; stride >>= 1)") == 3
+    _assert_bwd_path_b_hot_loop_shape(msl)
+
+
+def test_path_c_backward_topk64_bench_shape_msl_uses_path_b_lane_loops() -> None:
+    status = sparse_mla_path_c_status()
+    if not status.available:
+        pytest.skip(status.reason)
+
+    msl = dump_lowered_bwd_msl(
+        batch=4,
+        seq_len=1024,
+        heads=8,
+        qk_dim=64,
+        kv_group=1,
+        topk=64,
+        seq_len_kv=1024,
+    )
+    assert "uint tid = thread_position_in_threadgroup.x;" in msl
+    assert "uint gid = threadgroup_position_in_grid.x;" in msl
+    assert "uint3 threadIdx =" not in msl
+    assert "uint3 blockIdx =" not in msl
+    assert "uint threads = 64;" in msl
+    assert "_tmp" not in msl
+    assert "round_id" not in msl
+    assert "half condval" not in msl
+    assert "((int)threadIdx.x)" not in msl
+    assert "int stride;" not in msl
+    assert "for (uint d = tid; d < 64; d += threads)" in msl
+    assert "for (uint kd = tid; kd < 4096; kd += threads)" in msl
+    assert "uint q_row_base =" in msl
+    assert "uint d_out_row =" in msl
+    assert "uint kv_b_base =" in msl
+    assert "uint idx_base =" in msl
+    assert "uint dkv_pb =" in msl
+    assert "uint k = kd / 64;" in msl
+    assert "uint d = kd % 64;" in msl
+    assert "int gather_idx = indices[idx_base + k];" in msl
+    assert "float qv = float(q[q_row_base + d]);" in msl
+    assert "float ks_q = sm_scale * ds[k] * qv;" in msl
+    assert "float dod = float(d_out[d_out_row + d]);" in msl
+    assert "dkv_partial[dkv_pb + kd] = ((half)((p[k] * dod) + ks_q));" in msl
+    assert "indices[((gid >> 3) * 64) + k]" not in msl
+    assert "q[((gid * 64) + d)]" not in msl
+    assert "d_out[((gid * 64) + d_1)]" not in msl
+    assert "dkv_partial[(gid * 4096) + kd]" not in msl
+    hot_loop = msl.split("for (uint kd = tid; kd < 4096; kd += threads)", 1)[1]
+    assert "kd / 64)" not in hot_loop
+    assert "kd % 64)" not in hot_loop
+    assert "sumexp <= 0.000000e+00f" in msl
+    assert msl.count("for (uint stride = threads / 2; stride > 0; stride >>= 1)") == 3
+    _assert_bwd_path_b_hot_loop_shape(msl)
+
+
+def test_path_c_backward_tail_dim_msl_uses_kd_element_offsets() -> None:
+    status = sparse_mla_path_c_status()
+    if not status.available:
+        pytest.skip(status.reason)
+
+    msl = dump_lowered_bwd_msl(
+        batch=2,
+        seq_len=64,
+        heads=4,
+        qk_dim=48,
+        kv_group=1,
+        topk=16,
+        seq_len_kv=96,
+        d_v=32,
+    )
+    assert "_tmp" not in msl
+    assert "round_id" not in msl
+    assert "half condval" not in msl
+    assert "for (uint d = tid; d < 48; d += threads)" in msl
+    assert "for (uint kd = tid; kd < 768; kd += threads)" in msl
+    assert "uint q_row_base =" in msl
+    assert "uint d_out_row =" in msl
+    assert "uint kv_b_base =" in msl
+    assert "uint idx_base =" in msl
+    assert "uint dkv_pb =" in msl
+    assert "uint k = kd / 48;" in msl
+    assert "uint d = kd % 48;" in msl
+    assert "int gather_idx = indices[idx_base + k];" in msl
+    assert "float qv = float(q[q_row_base + d]);" in msl
+    assert "float ks_q = sm_scale * ds[k] * qv;" in msl
+    assert "if (d < 32)" in msl
+    assert "float dod = float(d_out[d_out_row + d]);" in msl
+    assert "dkv_partial[dkv_pb + kd] = ((half)((p[k] * dod) + ks_q));" in msl
+    assert "dkv_partial[dkv_pb + kd] = ((half)ks_q);" in msl
+    assert "indices[((gid >> 2) * 16) + k]" not in msl
+    assert "q[((gid * 48) + d)]" not in msl
+    assert "d_out[((gid * 32) + d_1)]" not in msl
+    assert "dkv_partial[(gid * 768) + kd]" not in msl
+    hot_loop = msl.split("for (uint kd = tid; kd < 768; kd += threads)", 1)[1]
+    assert "kd / 48)" not in hot_loop
+    assert "kd % 48)" not in hot_loop
+    _assert_bwd_path_b_hot_loop_shape(msl)
 
 
 def test_path_c_forward_lowered_msl_uses_threadgroup_reductions() -> None:
@@ -638,7 +1228,272 @@ def test_path_c_forward_lowered_msl_uses_threadgroup_reductions() -> None:
     assert "threadgroup float" in lowered
     assert "threadgroup_barrier" in lowered
     assert "gather_idx[0] < 16" not in lowered
+    assert "if (((0 <=" not in lowered
+    assert "uint tid = thread_position_in_threadgroup.x;" in msl
+    assert "uint gid = threadgroup_position_in_grid.x;" in msl
+    assert "uint3 threadIdx =" not in msl
+    assert "uint3 blockIdx =" not in msl
+    assert "uint threads =" in msl
+    assert "int tid = int(threadIdx.x);" not in msl
+    assert "int gid = int(blockIdx.x);" not in msl
+    assert "((int)threadIdx.x)" not in msl
+    assert "((int)blockIdx.x)" not in msl
+    assert "row_max == -INFINITY" in msl
+    assert "return;" in msl
+    assert "kv_row_base" in msl
+    assert "int stride;" not in msl
+    assert "if (0 <= gather_idx)" not in msl
+    assert "half condval" not in msl
+    assert msl.count("if (gather_idx < 0) {") == 2
+    assert msl.count("continue;") == 2
+    assert "round_id" not in msl
+    assert msl.count("for (uint stride = threads / 2; stride > 0; stride >>= 1)") == 2
+    assert (
+        "inv_sum = (sumexp > 0.000000e+00f) ? "
+        "(1.000000e+00f / sumexp) : 0.000000e+00f;"
+    ) in msl
+    assert "lse[gid] = (row_max + log(sumexp));" in msl
+    assert "if (0.000000e+00f < sumexp)" not in msl
     assert "t.tvm_mma_sync" not in lowered
+
+
+def test_path_c_forward_bench_shape_msl_uses_path_b_lane_loops() -> None:
+    status = sparse_mla_path_c_status()
+    if not status.available:
+        pytest.skip(status.reason)
+
+    msl = dump_lowered_fwd_msl(
+        batch=2,
+        seq_len=128,
+        heads=8,
+        qk_dim=64,
+        kv_group=1,
+        topk=16,
+        seq_len_kv=128,
+    )
+    assert "uint tid = thread_position_in_threadgroup.x;" in msl
+    assert "uint gid = threadgroup_position_in_grid.x;" in msl
+    assert "uint3 threadIdx =" not in msl
+    assert "uint3 blockIdx =" not in msl
+    assert "uint threads = 16;" in msl
+    assert "int tid = int(threadIdx.x);" not in msl
+    assert "int gid = int(blockIdx.x);" not in msl
+    assert "((int)threadIdx.x)" not in msl
+    assert "((int)blockIdx.x)" not in msl
+    assert "for (int _tmp" not in msl
+    assert "for (uint k = tid; k < 16; k += threads)" in msl
+    assert "{\n    uint k = tid;" not in msl
+    assert "for (int k = tid;" not in msl
+    assert "for (uint d = tid; d < 64; d += threads)" in msl
+    assert "scores[k]" in msl
+    assert "uint q_row_base =" in msl
+    assert "uint kv_b_base =" in msl
+    assert "uint idx_base =" in msl
+    assert "uint out_row =" in msl
+    assert "indices[idx_base + k]" in msl
+    assert "kv_b_base + (uint(gather_idx) * kv_group + g) * qk_dim" in msl
+    assert "q[q_row_base + d]" in msl
+    assert "kv[kv_row_base + d]" in msl
+    assert "kv_row_base_1" not in msl
+    assert "out[out_row + d]" in msl
+    assert "indices[((gid >> 3) * 16) + k]" not in msl
+    assert "out[(gid * 64) + d]" not in msl
+    assert "out[(((gid * 64) + (_tmp_4 * 16)) + tid)]" not in msl
+    assert "int stride;" not in msl
+    assert "if (0 <= gather_idx)" not in msl
+    assert "half condval" not in msl
+    assert msl.count("if (gather_idx < 0) {") == 2
+    assert msl.count("continue;") == 2
+    assert "round_id" not in msl
+    assert msl.count("for (uint stride = threads / 2; stride > 0; stride >>= 1)") == 2
+    assert (
+        "inv_sum = (sumexp > 0.000000e+00f) ? "
+        "(1.000000e+00f / sumexp) : 0.000000e+00f;"
+    ) in msl
+    assert "lse[gid] = (row_max + log(sumexp));" in msl
+    assert "if (0.000000e+00f < sumexp)" not in msl
+
+
+def test_path_c_forward_topk32_bench_shape_msl_uses_path_b_lane_loops() -> None:
+    status = sparse_mla_path_c_status()
+    if not status.available:
+        pytest.skip(status.reason)
+
+    msl = dump_lowered_fwd_msl(
+        batch=4,
+        seq_len=512,
+        heads=8,
+        qk_dim=64,
+        kv_group=1,
+        topk=32,
+        seq_len_kv=512,
+    )
+    assert "uint tid = thread_position_in_threadgroup.x;" in msl
+    assert "uint gid = threadgroup_position_in_grid.x;" in msl
+    assert "uint3 threadIdx =" not in msl
+    assert "uint3 blockIdx =" not in msl
+    assert "uint threads = 32;" in msl
+    assert "int tid = int(threadIdx.x);" not in msl
+    assert "int gid = int(blockIdx.x);" not in msl
+    assert "((int)threadIdx.x)" not in msl
+    assert "((int)blockIdx.x)" not in msl
+    assert "_tmp" not in msl
+    assert "round_id" not in msl
+    assert "half condval" not in msl
+    assert "int stride;" not in msl
+    assert "if (0 <= gather_idx)" not in msl
+    assert "for (uint k = tid; k < 32; k += threads)" in msl
+    assert "for (uint d = tid; d < 64; d += threads)" in msl
+    assert "uint q_row_base =" in msl
+    assert "uint kv_b_base =" in msl
+    assert "uint idx_base =" in msl
+    assert "uint out_row =" in msl
+    assert "indices[idx_base + k]" in msl
+    assert "kv_b_base + (uint(gather_idx) * kv_group + g) * qk_dim" in msl
+    assert "q[q_row_base + d]" in msl
+    assert "kv[kv_row_base + d]" in msl
+    assert "kv_row_base_1" not in msl
+    assert "out[out_row + d]" in msl
+    assert "indices[((gid >> 3) * 32) + k]" not in msl
+    assert "out[(gid * 64) + d]" not in msl
+    assert "out[(((gid * 64) + (_tmp_4 * 32)) + tid)]" not in msl
+    assert msl.count("if (gather_idx < 0) {") == 2
+    assert msl.count("continue;") == 2
+    assert msl.count("for (uint stride = threads / 2; stride > 0; stride >>= 1)") == 2
+    assert (
+        "inv_sum = (sumexp > 0.000000e+00f) ? "
+        "(1.000000e+00f / sumexp) : 0.000000e+00f;"
+    ) in msl
+    assert "lse[gid] = (row_max + log(sumexp));" in msl
+    assert "if (0.000000e+00f < sumexp)" not in msl
+
+
+def test_path_c_forward_topk64_bench_shape_msl_uses_path_b_lane_loops() -> None:
+    status = sparse_mla_path_c_status()
+    if not status.available:
+        pytest.skip(status.reason)
+
+    msl = dump_lowered_fwd_msl(
+        batch=4,
+        seq_len=1024,
+        heads=8,
+        qk_dim=64,
+        kv_group=1,
+        topk=64,
+        seq_len_kv=1024,
+    )
+    assert "uint tid = thread_position_in_threadgroup.x;" in msl
+    assert "uint gid = threadgroup_position_in_grid.x;" in msl
+    assert "uint3 threadIdx =" not in msl
+    assert "uint3 blockIdx =" not in msl
+    assert "uint threads = 64;" in msl
+    assert "int tid = int(threadIdx.x);" not in msl
+    assert "int gid = int(blockIdx.x);" not in msl
+    assert "((int)threadIdx.x)" not in msl
+    assert "((int)blockIdx.x)" not in msl
+    assert "_tmp" not in msl
+    assert "round_id" not in msl
+    assert "half condval" not in msl
+    assert "int stride;" not in msl
+    assert "if (0 <= gather_idx)" not in msl
+    assert "for (uint k = tid; k < 64; k += threads)" in msl
+    assert "for (uint d = tid; d < 64; d += threads)" in msl
+    assert "uint q_row_base =" in msl
+    assert "uint kv_b_base =" in msl
+    assert "uint idx_base =" in msl
+    assert "uint out_row =" in msl
+    assert "indices[idx_base + k]" in msl
+    assert "kv_b_base + (uint(gather_idx) * kv_group + g) * qk_dim" in msl
+    assert "q[q_row_base + d]" in msl
+    assert "kv[kv_row_base + d]" in msl
+    assert "kv_row_base_1" not in msl
+    assert "out[out_row + d]" in msl
+    assert "indices[((gid >> 3) * 64) + k]" not in msl
+    assert "out[(gid * 64) + d]" not in msl
+    assert "out[(((gid * 64) + (_tmp_4 * 64)) + tid)]" not in msl
+    assert msl.count("if (gather_idx < 0) {") == 2
+    assert msl.count("continue;") == 2
+    assert msl.count("for (uint stride = threads / 2; stride > 0; stride >>= 1)") == 2
+    assert (
+        "inv_sum = (sumexp > 0.000000e+00f) ? "
+        "(1.000000e+00f / sumexp) : 0.000000e+00f;"
+    ) in msl
+    assert "lse[gid] = (row_max + log(sumexp));" in msl
+    assert "if (0.000000e+00f < sumexp)" not in msl
+
+
+def test_path_c_forward_bench_shape_dispatch_smoke() -> None:
+    status = sparse_mla_path_c_status()
+    if not status.available:
+        pytest.skip(status.reason)
+
+    rng = np.random.default_rng(43)
+    B, S, H, D = 2, 128, 8, 64
+    G = 1
+    topk = 16
+    Skv = 128
+    q = mx.array(rng.standard_normal((B, S, H, D)).astype(np.float32)).astype(mx.bfloat16)
+    kv = mx.array(rng.standard_normal((B, Skv, G, D)).astype(np.float32)).astype(mx.bfloat16)
+    indices_np = rng.integers(0, Skv, size=(B, S, G, topk)).astype(np.int32)
+    indices_np[0, 0, 0, :] = -1
+    indices = mx.array(indices_np)
+
+    result = sparse_mla_fwd_path_c(q, kv, indices)
+    assert result is not None, "bench-shape Path C forward must compile and dispatch"
+    out, lse = result
+    mx.eval(out, lse)
+    assert out.shape == (B, S, H, D)
+    assert lse.shape == (B, S, H)
+
+
+def test_path_c_forward_uses_tilelang_generated_kernel_not_path_b_alias() -> None:
+    """Path C forward must dispatch its lowered TileLang source, not Path B."""
+
+    status = sparse_mla_path_c_status()
+    if not status.available:
+        pytest.skip(status.reason)
+
+    kernel, lowering = _fwd_kernel_for(1, 8, 2, 16, 1, 2, 4, 8, 16, 4)
+
+    assert kernel is not sparse_mla_path_b._FWD_KERNEL
+    assert "kernel void" not in lowering.body
+    assert "threadgroup_position_in_grid.x" in lowering.body
+    assert "thread_position_in_threadgroup.x" in lowering.body
+
+
+@pytest.mark.parametrize("topk", [16, 32, 64])
+def test_path_c_lowering_dispatch_grid_matches_mlx_total_thread_contract(topk: int) -> None:
+    """MLX launches total threads, so TileLang's block grid must be scaled once."""
+
+    status = sparse_mla_path_c_status()
+    if not status.available:
+        pytest.skip(status.reason)
+
+    batch, seq_len, heads, qk_dim = 2, 128, 8, 64
+    kv_group, seq_len_kv, d_v = 1, 128, 64
+    head_kv = heads // kv_group
+    threads = _threadgroup_size(topk)
+    lanes = batch * seq_len * heads
+    args = (
+        batch,
+        seq_len,
+        heads,
+        qk_dim,
+        kv_group,
+        head_kv,
+        topk,
+        seq_len_kv,
+        d_v,
+        threads,
+    )
+
+    _kernel, fwd_lowering = _fwd_kernel_for(*args)
+    _kernel, bwd_lowering = _bwd_kernel_for(*args)
+
+    for lowering in (fwd_lowering, bwd_lowering):
+        assert lowering.grid == (lanes, 1, 1)
+        assert lowering.threadgroup == (threads, 1, 1)
+        assert _mlx_total_thread_grid(lowering) == (lanes * threads, 1, 1)
 
 
 def test_apply_backward_through_custom_vjp() -> None:
@@ -654,7 +1509,7 @@ def test_apply_backward_through_custom_vjp() -> None:
     indices = mx.array(rng.integers(0, Skv, size=(B, S, G, topk)).astype(np.int32))
 
     def loss(q_, kv_):
-        out = sparse_mla_apply(q_, kv_, indices)
+        out = cast(mx.array, sparse_mla_apply(q_, kv_, indices))
         return mx.sum(out * out)
 
     dq, dkv = mx.grad(loss, argnums=(0, 1))(q, kv)

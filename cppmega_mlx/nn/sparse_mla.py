@@ -21,13 +21,18 @@ peak memory for code clarity.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
-from typing import Tuple
+from pathlib import Path
+from typing import Tuple, cast
 
 import mlx.core as mx
 
 
 _INVALID_INDEX_SENTINEL = -1
+_PATH_C_AUTO_PROMOTION_RECEIPT = (
+    Path(__file__).resolve().parents[2] / "bench" / "tilelang_ports" / "sparse_mla.json"
+)
 
 
 @dataclass(frozen=True)
@@ -77,11 +82,10 @@ def _resolve_shapes(
             f"{batch},{seq_len},{kv_group},*)"
         )
 
-    if d_v is None:
-        d_v = qk_dim
-    if not (0 < d_v <= qk_dim):
-        raise ValueError(f"d_v must be in (0, {qk_dim}], got {d_v}")
-    tail_dim = qk_dim - d_v
+    d_v_resolved = qk_dim if d_v is None else int(d_v)
+    if not (0 < d_v_resolved <= qk_dim):
+        raise ValueError(f"d_v must be in (0, {qk_dim}], got {d_v_resolved}")
+    tail_dim = qk_dim - d_v_resolved
 
     return SparseMLAShapes(
         batch=batch,
@@ -90,7 +94,7 @@ def _resolve_shapes(
         heads=heads,
         kv_group=kv_group,
         head_kv=head_kv,
-        d_v=d_v,
+        d_v=d_v_resolved,
         qk_dim=qk_dim,
         tail_dim=tail_dim,
         topk=topk,
@@ -148,14 +152,13 @@ def sparse_mla_attention_reference(
     shapes = _resolve_shapes(q, kv, indices, d_v=d_v)
     qk_dim = shapes.qk_dim
     d_v_resolved = shapes.d_v
-    if sm_scale is None:
-        sm_scale = qk_dim ** -0.5
+    sm_scale_value = qk_dim ** -0.5 if sm_scale is None else sm_scale
 
     # Gather KV: [B, S, G, topk, D_qk]
     indices_i32 = indices.astype(mx.int32)
     gathered = _gather_kv(kv, indices_i32, seq_len_kv=shapes.seq_len_kv)
     # Build mask for invalid indices: True -> valid.
-    valid_mask = indices_i32 != _INVALID_INDEX_SENTINEL  # [B, S, G, topk]
+    valid_mask = cast(mx.array, indices_i32 != _INVALID_INDEX_SENTINEL)  # [B, S, G, topk]
 
     # Reshape q to [B, S, G, head_kv, D_qk] so each kv group's heads are grouped.
     head_kv = shapes.head_kv
@@ -169,7 +172,7 @@ def sparse_mla_attention_reference(
     # q_fp32: [B, S, G, head_kv, D_qk]
     # kv_fp32: [B, S, G, topk, D_qk]
     scores = mx.matmul(q_fp32, mx.swapaxes(kv_fp32, -1, -2))  # [B,S,G,head_kv,topk]
-    scores = scores * sm_scale
+    scores = scores * sm_scale_value
 
     # Apply mask broadcasting over heads: valid_mask is [B,S,G,topk] -> add new head axis.
     mask = valid_mask[:, :, :, None, :]
@@ -207,6 +210,118 @@ def sparse_mla_attention_reference(
     return out, lse
 
 
+def _sparse_mla_path_c_receipt_allows_auto_promotion(
+    receipt_path: Path = _PATH_C_AUTO_PROMOTION_RECEIPT,
+    *,
+    q: mx.array | None = None,
+    kv: mx.array | None = None,
+    indices: mx.array | None = None,
+) -> bool:
+    """Per-shape fail-closed Path C gate backed by the checked-in bench receipt."""
+
+    try:
+        data = json.loads(receipt_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+
+    if not isinstance(data, dict):
+        return False
+    strict_policy = data.get("strict_policy")
+    if not isinstance(strict_policy, dict):
+        return False
+    if data.get("kernel") != "sparse_mla":
+        return False
+    fwd_only = data.get("fwd_only")
+    if fwd_only not in (True, False):
+        return False
+    fp16_carrier = data.get("fp16_carrier")
+    if fp16_carrier not in (None, True, False):
+        return False
+    if fp16_carrier is True:
+        if q is None or kv is None:
+            return False
+        if q.dtype != mx.float16 or kv.dtype != mx.float16:
+            return False
+    if strict_policy.get("phase") != "all":
+        return False
+    if strict_policy.get("fwd_only") is not fwd_only:
+        return False
+    if strict_policy.get("requires_path_b_and_path_c") is not True:
+        return False
+
+    path_b_status = data.get("path_b_status")
+    path_c_status = data.get("path_c_status")
+    if not isinstance(path_b_status, dict) or path_b_status.get("available") is not True:
+        return False
+    if not isinstance(path_c_status, dict) or path_c_status.get("available") is not True:
+        return False
+
+    rows = data.get("rows")
+    if not isinstance(rows, list) or not rows:
+        return False
+    if (q is None) != (kv is None) or (q is None) != (indices is None):
+        return False
+    requested_shape = None
+    if q is not None and kv is not None and indices is not None:
+        shapes = _resolve_shapes(q, kv, indices, d_v=None)
+        requested_shape = {
+            "B": shapes.batch,
+            "S": shapes.seq_len,
+            "H": shapes.heads,
+            "D": shapes.qk_dim,
+            "G": shapes.kv_group,
+            "topk": shapes.topk,
+            "Skv": shapes.seq_len_kv,
+        }
+    required_row_flags = [
+        "fwd_path_c_no_worse_than_path_b",
+        "fwd_path_c_no_worse_than_path_b_paired",
+    ]
+    if not fwd_only:
+        required_row_flags.extend(
+            [
+                "bwd_path_c_no_worse_than_path_b",
+                "bwd_path_c_no_worse_than_path_b_paired",
+            ]
+        )
+    matching_rows = []
+    for row in rows:
+        if not isinstance(row, dict):
+            return False
+        shape = row.get("shape")
+        if requested_shape is not None:
+            if not isinstance(shape, dict):
+                continue
+            if any(shape.get(key) != value for key, value in requested_shape.items()):
+                continue
+        matching_rows.append(row)
+        for key in required_row_flags:
+            if row.get(key) is not True:
+                return False
+        for key, value in row.items():
+            if "no_worse_than_path_b" in key and isinstance(value, bool) and not value:
+                return False
+    return bool(matching_rows)
+
+
+def _sparse_mla_path_c_auto_request_eligible(
+    q: mx.array,
+    kv: mx.array,
+    indices: mx.array,
+    *,
+    sm_scale: float | None,
+    d_v: int | None,
+    return_lse: bool,
+) -> bool:
+    if return_lse:
+        return False
+    shapes = _resolve_shapes(q, kv, indices, d_v=d_v)
+    if d_v is not None and int(d_v) != shapes.qk_dim:
+        return False
+    default_sm_scale = shapes.qk_dim**-0.5
+    return sm_scale is None or abs(float(sm_scale) - default_sm_scale) < 1e-9
+
+
 def sparse_mla_attention(
     q: mx.array,
     kv: mx.array,
@@ -220,14 +335,16 @@ def sparse_mla_attention(
 
     Routing rules (controlled by ``CPPMEGA_KERNEL_PATH``):
 
-    - ``AUTO`` (default): use the Path B Metal kernel via
-      :func:`cppmega_mlx.nn._tilelang.sparse_mla_apply` when available; on
-      hosts without Metal eligibility fall back to the pure-MLX reference.
+    - ``AUTO`` (default): promote only receipt-covered default-parameter
+      shapes whose Path C receipt row has all no-worse-than-Path-B flags set;
+      otherwise use the Path B Metal kernel via
+      :func:`cppmega_mlx.nn._tilelang.sparse_mla_apply` when available. On
+      hosts without Metal eligibility, fall back to the pure-MLX reference.
     - ``REFERENCE``: always run the pure-MLX reference.
-    - ``PATH_B``: force the Metal kernel (raises if Metal is unavailable).
-    - ``PATH_C``: not yet implemented for sparse-MLA; raises
-      :class:`NotImplementedError`. (Path C is reserved for the TileLang DSL
-      lowering of mamba3 only — Path B is the production speedup here.)
+    - ``PATH_B``: force the direct-MSL Metal kernel (raises if unavailable).
+    - ``PATH_C``: force the TileLang-DSL-lowered Path C Metal kernel (raises
+      if unavailable). Path C is an experimental proof path with the same
+      pure-MLX parity oracle and custom VJP coverage for default parameters.
     """
 
     # Lazy import to avoid pulling Metal kernels into the reference module
@@ -235,6 +352,10 @@ def sparse_mla_attention(
     from cppmega_mlx.nn._tilelang.sparse_mla import (
         sparse_mla_apply as _sparse_mla_apply,
         sparse_mla_metal_status as _sparse_mla_metal_status,
+    )
+    from cppmega_mlx.nn._tilelang.sparse_mla_path_c import (
+        sparse_mla_path_c_apply as _sparse_mla_path_c_apply,
+        sparse_mla_path_c_status as _sparse_mla_path_c_status,
     )
     from cppmega_mlx.runtime.kernel_policy import (
         KernelPath,
@@ -245,8 +366,15 @@ def sparse_mla_attention(
     path = selected_path("sparse_mla")
 
     if path is KernelPath.PATH_C:
-        raise NotImplementedError(
-            "sparse-MLA Path C not implemented; use Path B"
+        record_dispatch("sparse_mla", path, "tilelang_path_c_fwd_bwd_v1")
+        return _sparse_mla_path_c_apply(
+            q,
+            kv,
+            indices,
+            sm_scale=sm_scale,
+            d_v=d_v,
+            return_lse=return_lse,
+            force_path_c=True,
         )
 
     if path is KernelPath.REFERENCE:
@@ -273,6 +401,29 @@ def sparse_mla_attention(
         )
 
     # KernelPath.AUTO
+    if (
+        _sparse_mla_path_c_receipt_allows_auto_promotion(q=q, kv=kv, indices=indices)
+        and _sparse_mla_path_c_auto_request_eligible(
+            q,
+            kv,
+            indices,
+            sm_scale=sm_scale,
+            d_v=d_v,
+            return_lse=return_lse,
+        )
+        and _sparse_mla_path_c_status().available
+    ):
+        record_dispatch("sparse_mla", path, "tilelang_path_c_fwd_bwd_v1")
+        return _sparse_mla_path_c_apply(
+            q,
+            kv,
+            indices,
+            sm_scale=sm_scale,
+            d_v=d_v,
+            return_lse=return_lse,
+            force_path_c=True,
+        )
+
     status = _sparse_mla_metal_status(q, kv, indices)
     if status.available:
         record_dispatch("sparse_mla", path, "metal_kernel_fwd_v1")

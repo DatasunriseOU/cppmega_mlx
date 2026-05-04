@@ -7,6 +7,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
 
+from cppmega_mlx.inference.engine import ContiguousKVCacheConfig, make_contiguous_kv_cache
 from cppmega_mlx.nn.attention import AttentionConfig, CausalSelfAttention, causal_sdpa_mask
 
 
@@ -69,8 +70,35 @@ def test_causal_sdpa_mask_is_boolean_and_sliding_windowed() -> None:
 def test_causal_sdpa_mask_rejects_invalid_lengths() -> None:
     with pytest.raises(ValueError, match="seq_length"):
         causal_sdpa_mask(0)
+    with pytest.raises(ValueError, match="key_length"):
+        causal_sdpa_mask(4, key_length=0)
+    with pytest.raises(ValueError, match="query_offset"):
+        causal_sdpa_mask(4, query_offset=-1)
     with pytest.raises(ValueError, match="sliding_window"):
         causal_sdpa_mask(4, sliding_window=-1)
+
+
+def test_causal_sdpa_mask_supports_cached_decode_offsets() -> None:
+    mask = causal_sdpa_mask(
+        2,
+        query_offset=3,
+        key_length=5,
+        sliding_window=3,
+        expand_heads=True,
+    )
+    mx.eval(mask)
+
+    assert mask.shape == (1, 1, 2, 5)
+    np.testing.assert_array_equal(
+        np.array(mask[0, 0]),
+        np.array(
+            [
+                [False, True, True, True, False],
+                [False, False, True, True, True],
+            ],
+            dtype=np.bool_,
+        ),
+    )
 
 
 @pytest.mark.parametrize("mode", ["mla", "dsa"])
@@ -165,6 +193,63 @@ def test_sliding_window_attention_does_not_see_old_prefix_tokens() -> None:
         atol=1e-5,
         rtol=1e-5,
     )
+
+
+def test_causal_attention_contiguous_kv_cache_matches_full_prefix_last_token() -> None:
+    cfg = AttentionConfig(d_model=16, num_q_heads=4, num_kv_heads=2, mode="mla")
+    attn = CausalSelfAttention(cfg)
+    prefix = _rand((1, 4, 16), seed=21)
+    next_token = _rand((1, 1, 16), seed=22)
+    full = attn(mx.concatenate([prefix, next_token], axis=1))
+
+    cache = make_contiguous_kv_cache(
+        ContiguousKVCacheConfig(
+            num_layers=1,
+            batch_size=1,
+            num_kv_heads=2,
+            head_dim=4,
+            max_seq_len=8,
+        )
+    )
+    _ = attn(prefix, kv_cache=cache, layer_idx=0)
+    cached_next = attn(next_token, kv_cache=cache, layer_idx=0)
+    mx.eval(full, cached_next)
+
+    assert cache.position() == 5
+    np.testing.assert_allclose(
+        np.array(cached_next[:, -1, :]),
+        np.array(full[:, -1, :]),
+        atol=1e-5,
+        rtol=1e-5,
+    )
+
+
+def test_causal_attention_kv_cache_requires_layer_idx() -> None:
+    attn = CausalSelfAttention(AttentionConfig(d_model=16, num_q_heads=4, num_kv_heads=2))
+    cache = make_contiguous_kv_cache(
+        num_layers=1,
+        batch_size=1,
+        num_kv_heads=2,
+        head_dim=4,
+    )
+
+    with pytest.raises(ValueError, match="layer_idx"):
+        attn(_rand((1, 2, 16), seed=23), kv_cache=cache)
+
+
+def test_causal_attention_rejects_quantized_kv_cache_until_sdpa_path_lands() -> None:
+    attn = CausalSelfAttention(AttentionConfig(d_model=16, num_q_heads=4, num_kv_heads=2))
+    cache = make_contiguous_kv_cache(
+        num_layers=1,
+        batch_size=1,
+        num_kv_heads=2,
+        head_dim=64,
+        quantized=True,
+        kv_group_size=64,
+    )
+
+    with pytest.raises(NotImplementedError, match="quantized KV cache"):
+        attn(_rand((1, 2, 16), seed=24), kv_cache=cache, layer_idx=0)
 
 
 def test_attention_sinks_are_forwarded_to_fast_sdpa() -> None:

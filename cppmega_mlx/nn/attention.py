@@ -7,6 +7,9 @@ from typing import Literal
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx_lm.models.cache import QuantizedKVCache
+
+from cppmega_mlx.inference.engine import ContiguousKVCache
 
 AttentionMode = Literal["mla", "dsa"]
 
@@ -93,21 +96,29 @@ def causal_sdpa_mask(
     *,
     sliding_window: int | None = None,
     expand_heads: bool = False,
+    query_offset: int = 0,
+    key_length: int | None = None,
 ) -> mx.array:
     """Return a boolean causal mask suitable for MLX fast SDPA.
 
     ``sliding_window`` counts the current token, so ``sliding_window=2`` allows
-    each query to see itself and the immediately previous key.
+    each query to see itself and the immediately previous key. ``query_offset``
+    and ``key_length`` cover cached decode where a short query attends over a
+    longer contiguous key cache.
     """
 
     if seq_length <= 0:
         raise ValueError(f"seq_length must be positive, got {seq_length}")
+    if query_offset < 0:
+        raise ValueError(f"query_offset must be non-negative, got {query_offset}")
+    key_length = seq_length if key_length is None else key_length
+    if key_length <= 0:
+        raise ValueError(f"key_length must be positive, got {key_length}")
     if sliding_window is not None and sliding_window <= 0:
         raise ValueError(f"sliding_window must be positive, got {sliding_window}")
 
-    positions = mx.arange(seq_length)
-    query_positions = positions[:, None]
-    key_positions = positions[None, :]
+    query_positions = (query_offset + mx.arange(seq_length))[:, None]
+    key_positions = mx.arange(key_length)[None, :]
     mask = query_positions >= key_positions
     if sliding_window is not None:
         mask = mask & (query_positions < key_positions + sliding_window)
@@ -149,7 +160,12 @@ class CausalSelfAttention(nn.Module):
         self.rope = nn.RoPE(config.q_head_dim, base=config.rope_theta) if config.use_rope else None
         self.route_info = AttentionRouteInfo(mode=config.mode, backend="mlx.fast.sdpa")
 
-    def _project_qkv(self, hidden_states: mx.array) -> tuple[mx.array, mx.array, mx.array]:
+    def _project_qkv(
+        self,
+        hidden_states: mx.array,
+        *,
+        rope_offset: int = 0,
+    ) -> tuple[mx.array, mx.array, mx.array]:
         batch, seq, _ = hidden_states.shape
         cfg = self.config
         q = self.q_proj(hidden_states).reshape(batch, seq, cfg.num_q_heads, cfg.q_head_dim)
@@ -159,8 +175,8 @@ class CausalSelfAttention(nn.Module):
         k = mx.transpose(k, (0, 2, 1, 3))
         v = mx.transpose(v, (0, 2, 1, 3))
         if self.rope is not None:
-            q = self.rope(q)
-            k = self.rope(k)
+            q = self.rope(q, offset=rope_offset)
+            k = self.rope(k, offset=rope_offset)
         return q, k, v
 
     def __call__(
@@ -169,6 +185,8 @@ class CausalSelfAttention(nn.Module):
         mask: mx.array | Literal["causal"] | None = None,
         *,
         sinks: mx.array | None = None,
+        kv_cache: ContiguousKVCache | None = None,
+        layer_idx: int | None = None,
     ) -> mx.array:
         if hidden_states.ndim != 3:
             raise ValueError(f"hidden_states must be shaped (B,S,D), got {hidden_states.shape}")
@@ -177,11 +195,35 @@ class CausalSelfAttention(nn.Module):
                 f"hidden_states last dim must be {self.config.d_model}, got {hidden_states.shape[-1]}"
             )
 
-        q, k, v = self._project_qkv(hidden_states)
+        cache_position = 0
+        if kv_cache is not None:
+            if layer_idx is None:
+                raise ValueError("layer_idx is required when kv_cache is provided")
+            if layer_idx < 0 or layer_idx >= len(kv_cache.layers):
+                raise IndexError("layer_idx out of range")
+            layer_cache = kv_cache.layers[layer_idx]
+            if isinstance(layer_cache, QuantizedKVCache):
+                raise NotImplementedError(
+                    "quantized KV cache is not integrated with MLX SDPA attention yet"
+                )
+            cache_position = int(layer_cache.offset)
+
+        q, k, v = self._project_qkv(hidden_states, rope_offset=cache_position)
+        if kv_cache is not None:
+            updated_k, updated_v = kv_cache.update_and_fetch(layer_idx, k, v)
+            if not isinstance(updated_k, mx.array) or not isinstance(updated_v, mx.array):
+                raise NotImplementedError(
+                    "quantized KV cache is not integrated with MLX SDPA attention yet"
+                )
+            k = updated_k
+            v = updated_v
+
         if mask is None or (isinstance(mask, str) and mask == "causal"):
             mask = causal_sdpa_mask(
                 hidden_states.shape[1],
                 sliding_window=self.config.sliding_window,
+                query_offset=cache_position,
+                key_length=k.shape[2],
             )
         sinks = _validate_attention_sinks(sinks, self.config.num_q_heads)
         out = mx.fast.scaled_dot_product_attention(

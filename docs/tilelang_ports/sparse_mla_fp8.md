@@ -21,7 +21,13 @@ avoid having to apply per-token scales mid-GEMM.
 
 ## Status on Apple Silicon (tilelang 0.1.9, MLX 0.31)
 
-The FP8 path through TileLang's TVM-Metal lowering is **doubly blocked**:
+The native TileLang DSL path through TVM-Metal is still **doubly blocked**,
+but this no longer blocks the shipped Path B kernel. Current local code uses
+hand-written MSL through `mx.fast.metal_kernel`: Q/KV are stored as `uint8`
+e4m3 payloads and dequantized inline before the fp32 QK/SV arithmetic.
+`sparse_mla_fp8_metal_status(...)` therefore reports `available=True` when
+Metal dispatch is present. The blockers below apply only to a future native
+TileLang `T.gemm`/float8 lowering path.
 
 ### Blocker 1: FP8 dtype emission to MSL is unsupported
 
@@ -43,10 +49,9 @@ int*, uint*, and bool. There is no float8_e4m3 / float8_e5m2 branch.
 The CUDA codegen (codegen_cuda.cc:464,488,589) *does* have FP8 paths, and
 the HIP backend has them too. The Metal one does not.
 
-This means even if every other detail of the FP8 kernel were ported by hand,
-the FP8 storage tensors themselves cannot be referenced through the
-TVM-Metal lowering — the type would have to be converted before the kernel
-is invoked.
+This means native TileLang FP8 storage tensors still cannot be referenced
+through TVM-Metal lowering. Path B bypasses this by treating the payload as
+plain `uint8` storage in MSL.
 
 ### Blocker 2: T.gemm is not registered for the metal target
 
@@ -67,23 +72,21 @@ lowered with target='metal' raises:
 InternalError: Check failed: (0) is false: Unsupported target for gemm: metal -keys=metal,gpu ...
 
 
-The simdgroup_matrix path is not yet wired up. Apple PRs in
-tile-ai/tilelang HEAD are tracking this; once they land we expect both
-blockers to lift simultaneously since the FP8 emit work and the GEMM intrinsic
-share the simdgroup type plumbing.
+The simdgroup_matrix path is not yet wired up. Apple PRs in tile-ai/tilelang
+HEAD are tracking this; once they land we can revisit a native TileLang Path C
+full-kernel implementation. Until then Path B is the production path.
 
 ## What this port ships today
 
-Until the codegen blockers lift, cppmega_mlx/nn/_tilelang/sparse_mla_fp8.py
-provides:
+cppmega_mlx/nn/_tilelang/sparse_mla_fp8.py provides:
 
 1. sparse_mla_fp8_metal_status(...) -> SparseMLAFp8MetalStatus
-   — Returns available=False with both blocker reasons.
+   — Returns available=True when the direct-MSL Path B kernel can be
+   constructed and the local Metal device can dispatch it.
 2. sparse_mla_fp8_fwd_metal(...) and sparse_mla_fp8_bwd_metal(...)
-   — Return (status, None, None) while gated; reserved for the post-blocker
-   implementation that will follow the same Path B pattern as mamba3.py
-   (lower with target='metal', strip kernel void, mark Q/KV/Indices
-   const device, leave Output/Lse device).
+   — Quantize Q/KV into uint8 e4m3 storage and dispatch the direct-MSL
+   forward/backward kernels. They return `(out, lse)` and `(dq, dkv)` when
+   Metal is available, otherwise `None` so callers can fall back.
 3. sparse_mla_fp8_reference(...)
    — Pure-MLX FP8 reference using mx.to_fp8 / mx.from_fp8 with a per-tensor
    scale derived from amax / 448.0 (the e4m3 max). Mirrors the gb10
@@ -93,8 +96,15 @@ provides:
    provided as a forward-only bench upper bound for what the
    mx.quantized_matmul(mode='mxfp8') path could reach.
 5. sparse_mla_fp8_apply(...)
-   — High-level entry that falls back to the reference and supports
-   force_metal=True to surface the blocker.
+   — High-level entry that prefers direct-MSL Path B, falls back to the
+   reference, and supports force_metal=True to fail closed when Metal is
+   unavailable.
+6. Path C QK reducers in sparse_mla_fp8_path_c.py
+   — TileLang-DSL QK reducer and full-shape indexed QK reducer. The checked-in
+   receipt has both reducers dispatchable, parity-clean, and not slower than
+   their Path B comparison rows for the current smoke shape. They cover the QK
+   score tile only; full FP8 forward/backward production dispatch remains Path B
+   until the complete Path C sparse-MLA layout is wired and measured.
 
 ## FP8 dtype lowering surprises
 
@@ -121,8 +131,8 @@ and backward uses rtol=1e-2. Both tolerances are achievable with the
 following caveat: input magnitude matters.
 
 - With scale=0.1 (typical post-layernorm attention queries) the FP8 path
-  matches the BF16 reference to **max abs err ~3e-3** on the
-  (B=1, S=64, H=4, D=64, topk=16) smoke shape. See bench JSON.
+  matches the BF16 reference to low single-digit e-3 absolute error on the
+  checked smoke shapes. See bench JSON.
 - With scale=1.0 (raw standard normal) the FP8 path drifts to ~4e-1 max abs
   err — that is real e4m3 quantization noise propagated through softmax + V
   matmul, not a port bug. Tests use scale=0.1 to stay inside the brief's
@@ -134,26 +144,37 @@ following caveat: input magnitude matters.
 
 ## Bench (current Apple M-series)
 
-From bench/tilelang_ports/sparse_mla_fp8.json on the
+From bench/tilelang_ports/sparse_mla_fp8.json on the current
 (B=1, S=64, H=4, D=64, topk=16) smoke shape:
 
 | path                          | median ms |
 | ----------------------------- | --------- |
-| BF16 reference                | ~0.30     |
-| FP8 reference (STE roundtrip) | ~0.36     |
-| quantized_matmul ref          | ~0.29     |
+| BF16 reference                | 0.285     |
+| FP8 reference (STE roundtrip) | 0.318     |
+| quantized_matmul ref          | 0.231     |
+| Path B direct-MSL FP8 fwd     | 0.198     |
+| Path B direct-MSL QK vecmat   | 0.109     |
+| Path C QK reducer             | 0.104     |
+| Path C indexed QK reducer     | 0.113     |
 
-The FP8 reference is *slower* than BF16 because the quantize+dequantize
-roundtrip adds work without the corresponding tensor-core speedup that the
-real FP8 sparse-MLA kernel would deliver on H100/H200. The
-quantized_matmul_reference row uses regular FP32 matmul on dequantized
-inputs and is therefore identical to the BF16 reference plus a constant
-overhead — it is not a real mxfp8 quantized_matmul yet, just a placeholder
-showing where the kernel will plug in once blockers lift.
+The direct-MSL Path B kernel is faster than the references on this local M4
+receipt because e4m3 byte decode is fused into the sparse QK/SV loops. This is
+software FP8 emulation, not a CUDA/H100/H200-style native FP8 tensor-core
+claim. Path C is correctness-live for QK: the checked ratios are
+`path_c_qk_reduce_over_path_b_qk_vecmat=0.9551` and
+`path_c_indexed_qk_reduce_over_path_b_fwd=0.5721`, with
+`invalid_mismatch_count=0` for masked/OOB indices. This is a QK reducer receipt,
+not a claim that full Sparse-MLA FP8 forward/backward has moved from Path B to
+Path C.
 
-## Post-blocker plan
+## Next steps
 
-When tile-ai/tilelang HEAD lands the Apple PRs:
+1. Keep production/default dispatch on Path B direct MSL.
+2. Keep native TileLang FP8 `T.gemm` lowering fail-closed until float8 storage
+   and Metal GEMM lowering are both present.
+3. Extend Path C only with measured reducers/full-layout kernels; do not AUTO
+   promote until the strict full forward/backward gate is green.
+4. When tile-ai/tilelang HEAD lands the Apple PRs:
 
 1. Verify that T.gemm(A_fp8, B_fp8, C_fp32, ...) lowers to MSL with
    simdgroup_matrix and an FP32 accumulator.
@@ -164,4 +185,4 @@ When tile-ai/tilelang HEAD lands the Apple PRs:
    helper, and dispatch through mx.fast.metal_kernel.
 4. Add a manual VJP via mx.custom_function that wires forward outputs to
    the FP8 backward PrimFunc.
-5. Drop the force_metal=True path's RuntimeError once dispatch is wired.
+5. Compare it against Path B before changing dispatch policy.

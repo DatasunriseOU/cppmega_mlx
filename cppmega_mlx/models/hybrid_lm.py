@@ -8,15 +8,17 @@ implementation and does not claim production kernel performance.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Literal, TypedDict
+from typing import Literal, TypedDict, cast
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from cppmega_mlx.data.packing import mlx_document_boundary_mask
+from cppmega_mlx.inference.engine import ContiguousKVCache, kv_cache_position
 from cppmega_mlx.nn.attention import AttentionConfig, CausalSelfAttention
 from cppmega_mlx.nn.m2rnn import M2RNNConfig, M2RNNMixer
 from cppmega_mlx.nn.mamba3 import Mamba3Config, Mamba3ReferenceBlock
+from cppmega_mlx.nn.mhc import ManifoldBranchMixer, ManifoldBranchMixerConfig
 from cppmega_mlx.nn.moe import ActivationName, MoEConfig, ReferenceMoE
 from cppmega_mlx.nn.ngram_hash import NgramHashEmbedding
 from cppmega_mlx.nn.structure_embedding import CppMegaStructureEmbedding
@@ -98,6 +100,7 @@ class HybridTinyConfig:
     ngram_hash_embed_dim: int = 16
     ngram_hash_dropout: float = 0.0
     ngram_hash_seed: int | None = None
+    mhc_enabled: bool = False
     grad_checkpoint: bool = False
 
     def __post_init__(self) -> None:
@@ -127,6 +130,7 @@ class HybridTinyConfig:
         self.moe_config()
         self.structure_embedding_config()
         self.ngram_hash_config()
+        self.mhc_config()
 
     def expanded_pattern(self) -> ExpandedNamPattern:
         return expand_nam_pattern(
@@ -234,6 +238,11 @@ class HybridTinyConfig:
             "seed": self.ngram_hash_seed,
         }
 
+    def mhc_config(self) -> ManifoldBranchMixerConfig | None:
+        if not self.mhc_enabled:
+            return None
+        return ManifoldBranchMixerConfig(hidden_size=self.hidden_size, max_branches=2)
+
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
 
@@ -254,6 +263,10 @@ class HybridTinyBlock(nn.Module):
         super().__init__()
         self.layer = layer
         self.norm = nn.RMSNorm(config.hidden_size)
+        mhc_config = config.mhc_config()
+        self.mhc: ManifoldBranchMixer | None = (
+            ManifoldBranchMixer(mhc_config) if mhc_config is not None else None
+        )
         self.block: HybridBlockModule
 
         if layer.symbol == "A":
@@ -292,11 +305,22 @@ class HybridTinyBlock(nn.Module):
         self,
         hidden_states: mx.array,
         mask: mx.array | Literal["causal"] | None,
+        *,
+        kv_cache: ContiguousKVCache | None = None,
+        attention_layer_idx: int | None = None,
     ) -> mx.array:
         self.validate_backend()
         residual = hidden_states
-        delta = self.route_delta(hidden_states, mask)
-        return residual + delta
+        delta = self.route_delta(
+            hidden_states,
+            mask,
+            kv_cache=kv_cache,
+            attention_layer_idx=attention_layer_idx,
+        )
+        updated = residual + delta
+        if self.mhc is not None:
+            return self.mhc([updated, residual])
+        return updated
 
     def validate_backend(self) -> None:
         """Fail closed if route metadata and the active module diverge."""
@@ -329,19 +353,29 @@ class HybridTinyBlock(nn.Module):
         self,
         hidden_states: mx.array,
         mask: mx.array | Literal["causal"] | None,
+        *,
+        kv_cache: ContiguousKVCache | None = None,
+        attention_layer_idx: int | None = None,
     ) -> mx.array:
         """Return this route's pre-residual contribution for regression tests."""
 
         self.validate_backend()
+        if kv_cache is not None and self.backend != "attention":
+            raise ValueError("kv_cache may only be passed to attention route blocks")
         x = self.norm(hidden_states)
         if self.backend == "attention":
-            delta = self.block(x, mask)
+            delta = cast(CausalSelfAttention, self.block)(
+                x,
+                mask,
+                kv_cache=kv_cache,
+                layer_idx=attention_layer_idx,
+            )
         elif self.backend == "mamba3":
-            delta, _ = self.block(x)
+            delta, _ = cast(Mamba3ReferenceBlock, self.block)(x)
         elif self.backend == "moe":
-            delta = self.block(x).output
+            delta = cast(ReferenceMoE, self.block)(x).output
         elif self.backend == "m2rnn":
-            delta, _ = self.block(x)
+            delta, _ = cast(M2RNNMixer, self.block)(x)
         else:  # pragma: no cover - self.backend is fixed during construction.
             raise ValueError(f"unsupported hybrid backend {self.backend!r}")
         return delta
@@ -400,19 +434,35 @@ class HybridTinyLM(nn.Module):
         sibling_index_ids: mx.array | None = None,
         node_type_ids: mx.array | None = None,
         document_ids: mx.array | None = None,
+        kv_cache: ContiguousKVCache | None = None,
     ) -> mx.array:
         if input_ids.ndim != 2:
             raise ValueError(f"input_ids must be shaped (B, S), got {input_ids.shape}")
 
         seq_length = input_ids.shape[1]
         batch_size = input_ids.shape[0]
-        if seq_length > self.config.max_seq_length:
+        position_offset = 0
+        if kv_cache is not None:
+            if self.config.grad_checkpoint:
+                raise ValueError("kv_cache is incompatible with grad_checkpoint")
+            if document_ids is not None:
+                raise ValueError("document_ids are incompatible with kv_cache decode")
+            if kv_cache.config.batch_size != batch_size:
+                raise ValueError("kv_cache batch_size must match input_ids batch size")
+            attention_layer_count = _attention_layer_count(self.layers)
+            if kv_cache.config.num_layers != attention_layer_count:
+                raise ValueError(
+                    "kv_cache num_layers must match the number of attention layers"
+                )
+            position_offset = kv_cache_position(kv_cache)
+
+        if position_offset + seq_length > self.config.max_seq_length:
             raise ValueError(
-                f"sequence length {seq_length} exceeds max_seq_length "
+                f"sequence length {position_offset + seq_length} exceeds max_seq_length "
                 f"{self.config.max_seq_length}"
             )
 
-        positions = mx.arange(seq_length)[None, :]
+        positions = (position_offset + mx.arange(seq_length))[None, :]
         hidden_states = self.token_embedding(input_ids) + self.position_embedding(positions)
 
         if self.ngram_hash_embedding is not None:
@@ -447,10 +497,11 @@ class HybridTinyLM(nn.Module):
         mask = None
         if any(layer.backend == "attention" for layer in self.layers):
             if document_ids is None:
-                mask = nn.MultiHeadAttention.create_additive_causal_mask(
-                    seq_length,
-                    dtype=hidden_states.dtype,
-                )
+                if kv_cache is None:
+                    mask = nn.MultiHeadAttention.create_additive_causal_mask(
+                        seq_length,
+                        dtype=hidden_states.dtype,
+                    )
             else:
                 mask = mlx_document_boundary_mask(
                     document_ids,
@@ -461,8 +512,18 @@ class HybridTinyLM(nn.Module):
             for layer in self.layers:
                 hidden_states = mx.checkpoint(layer)(hidden_states, mask)
         else:
+            attention_layer_idx = 0
             for layer in self.layers:
-                hidden_states = layer(hidden_states, mask)
+                if layer.backend == "attention":
+                    hidden_states = layer(
+                        hidden_states,
+                        mask,
+                        kv_cache=kv_cache,
+                        attention_layer_idx=attention_layer_idx if kv_cache is not None else None,
+                    )
+                    attention_layer_idx += 1
+                else:
+                    hidden_states = layer(hidden_states, mask)
         return self.lm_head(self.norm(hidden_states))
 
 
@@ -508,6 +569,10 @@ def _validate_document_ids(
     if bool(has_negative.item()):
         raise ValueError("document_ids must be non-negative for explicit packed batches")
     return document_ids.astype(mx.int32)
+
+
+def _attention_layer_count(layers: list[HybridTinyBlock]) -> int:
+    return sum(1 for layer in layers if layer.backend == "attention")
 
 __all__ = [
     "HybridBackend",

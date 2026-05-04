@@ -1,10 +1,10 @@
-# Path B port: tilelang_sparse_mla/topk_selector.py
+# Path C port: tilelang_sparse_mla/topk_selector.py
 
-This document records the Apple Metal port for the smallest TileLang kernel
-cppmega ships, the radix-select top-k that backs DSA sparse-MLA index
-selection. TileLang's Metal lowering is still blocked, so this port uses the
-Path B bypass: a hand-written MSL kernel launched through
-mx.fast.metal_kernel.
+This document records the Apple Metal top-k selector ports for cppmega's DSA
+sparse-MLA index selection. Path B is the hand-written MSL kernel launched via
+`mx.fast.metal_kernel`. Path C is now a real TileLang DSL `@T.prim_func` lowered
+to Metal and then launched through `mx.fast.metal_kernel` with the
+TileLang-generated kernel body.
 
 ## Source attribution
 
@@ -14,224 +14,191 @@ mx.fast.metal_kernel.
 | upstream lineage | NVIDIA Megatron-LM PR #3674 ("DSA thd" branch), in turn from tile-ai/tilelang/examples/deepseek_v32/ |
 | license          | Apache 2.0 / BSD-3-Clause (matches Megatron-LM headers)                                              |
 | destination      | cppmega_mlx/nn/_tilelang/topk_selector.py                                                            |
-| tests            | tests/test_tilelang_topk.py                                                                          |
+| tests            | tests/test_tilelang_topk.py and /private/tmp/tilelang_apple_head/tilelang/testing/python/metal/test_metal_topk_selector.py |
 | bench            | scripts/bench_tilelang_topk.py -> bench/tilelang_ports/topk_selector.json                            |
 
 ## Source kernel summary
 
-topk_selector(input, starts, ends, topk) returns, per batch row, the
-topk indices into input[bx, starts[bx]:ends[bx]] of the largest
-values. The CUDA implementation runs a two-stage radix-select inside one
-threadgroup of BLOCK_SIZE = 1024 threads:
+`topk_selector(input, starts, ends, topk)` returns, per batch row, the `topk`
+indices into `input[bx, starts[bx]:ends[bx]]` of the largest values. The CUDA
+implementation runs a two-stage radix-select inside one threadgroup of
+`BLOCK_SIZE = 1024` threads:
 
-1. Stage 1 -- 8-bit histogram over the high byte of the sign-flipped
-   fp16 representation, prefix-summed via Hillis-Steele over 256 threads,
-   followed by a tail-collection step that splits "definitely above"
-   indices to the output and tail candidates to shared memory.
-2. Stage 2 -- up to 4 rounds of byte-deeper refinement on the tail
-   candidates, finalizing the output once l_new_topk == 0.
+1. Stage 1: 8-bit histogram over the high byte of the sign-flipped fp16/fp32
+   representation, prefix-summed via Hillis-Steele over 256 threads, followed
+   by tail collection.
+2. Stage 2: up to 4 rounds of byte-deeper refinement on the tail candidates,
+   finalizing the output once `l_new_topk == 0`.
 
-Resources used:
+The upstream schedule depends on `T.alloc_shared`, atomics, partial barriers,
+and fp bit reinterpretation. That CUDA schedule is still not the profitable
+Metal schedule, so cppmega carries a Metal-specific Path B and Path C schedule.
 
-- T.alloc_shared([257], int32) -- the histogram (RADIX+1 entries to
-  leave room for the cumsum prefix).
-- T.alloc_shared([2, 4096], int32) -- ping-pong tail-candidate buffer.
-- T.alloc_shared([2], int32) -- per-stage tail counts.
-- T.alloc_shared([1], int32) -- threshold bin id.
-- T.atomic_add(..., return_prev=True) -- emits output positions and tail
-  positions in race-free order.
-- T.sync_threads(3, RADIX) -- partial barriers covering the first 256
-  threads only.
-- T.reinterpret(hval, T.uint16) and T.reinterpret(x, T.uint32) --
-  fp16/fp32 sign-flip bit fiddling for radix sort.
+## Path B: direct MSL
 
-## Path B transform layer
+`topk_selector_metal(...)` emits a hand-written MSL body through
+`mx.fast.metal_kernel`. Each row maps to one Metal threadgroup. Threads scan a
+strided slice, keep a private sorted top-K list, then merge per-thread lists
+through static `threadgroup` buffers.
 
-cppmega_mlx/nn/_tilelang/_path_b_lowering.py vendors the small string-
-rewriting helpers that the prototype at /tmp/path_b_msl_mlx/bench_msl_path_b.py
-proved on a manual GEMM. The helpers handle three concrete pitfalls:
+Path B remains the first fallback for hosts without TileLang or for unsupported
+Path C dtypes/shapes.
 
-1. **TileLang emits kernel void <name>(...), MLX expects body only.** The
-   regex r"kernel\s+void\s+(?P<name>\w+)\s*\(" plus paren-counting locates
-   the signature; the body is preserved verbatim and re-emitted as
-   inline void <helper>(...) injected into MLX's header=.
-2. **MLX uses const device T* for inputs; TileLang's all-mutable.** The
-   helper accepts a const_buffer_names set and rewrites \bdevice\b to
-   const device only on those parameters.
-3. **TileLang reorders buffer params alphabetically.** The MSL signature is
-   parsed to recover the actual buffer order, then build_mlx_body maps
-   PrimFunc names back to MLX local names so the call argument list matches
-   the emitted helper's parameter order.
+## Path C: TileLang DSL -> Metal
 
-These helpers are still useful for kernels that produce MSL through TileLang.
-They are dormant for topk_selector because TileLang refuses to lower the source
-kernel before any MSL is produced; topk_selector therefore ships a direct-MSL
-body instead.
+`topk_selector_tilelang(...)` builds a shape-specialized TileLang PrimFunc with
+the same one-threadgroup-per-row algorithm as Path B:
 
-## TileLang Metal lowering status -- blocked
+- private `T.alloc_local((K,), float32/int32)` top-K lists per lane
+- static `T.alloc_shared((threads, K), ...)` pair buffers
+- `T.sync_threads()` after local writes and after every tree-merge round
+- no dynamic shared scope, no atomics, and no repeated `T.reduce_max` passes
+- fp32 compare path; fp16 inputs are read directly and bf16 inputs are promoted
+  to fp32 before dispatch
 
-Probed with the cppmega kernel restructured into a T.prim_func and
-tilelang.engine.lower.lower(prim, target=Target("metal")), with both the
-original constants and a sweep of smaller BLOCK_SIZE/RADIX to localize
-the failure:
+The MSL emitted by TileLang is split by `_msl_transform.lower_tilelang_to_msl_inline(...)`.
+The kernel body is inlined into an MLX `mx.fast.metal_kernel` wrapper so the
+threadgroup allocations remain legal kernel-scope MSL.
 
-| BLOCK_SIZE | RADIX | SMEM_INPUT_SIZE | status | reason                                                                                                                                                                                 |
-| ---------- | ----- | --------------- | ------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 256        | 256   | 4096            | FAIL   | LowerTileOp: Loop layout is not injective: Fragment([257] -> [2], replicate: 1, thread: 256, ..., forward_thread: _i % 256, forward_index: [_i // 256], thread_range: I.Range(0, 256)) |
-| 256        | 128   | 512             | FAIL   | Fatal: Unknown storage scope shared.dyn                                                                                                                                                |
-| 256        | 64    | 512             | FAIL   | Fatal: Unknown storage scope shared.dyn                                                                                                                                                |
-| 128        | 256   | 512             | FAIL   | layout-not-injective ([257] -> [3])                                                                                                                                                    |
-| 128        | 128   | 512             | FAIL   | layout-not-injective ([129] -> [2])                                                                                                                                                    |
-| 128        | 64    | 512             | FAIL   | Fatal: Unknown storage scope shared.dyn                                                                                                                                                |
+Threadgroup selection is intentionally simple and deterministic:
 
-There are two distinct failures and they compose:
+- `K <= 32`: prefer 32 threads.
+- `K >= 64`: prefer 64 threads.
+- The final value is capped by `threads * K * 8 <= 32 KiB`; for `K=256` this
+  selects 16 threads.
 
-1. **Loop layout not injective.** When the histogram size (RADIX + 1) is
-   not a multiple of BLOCK_SIZE, TileLang's LowerTileOp cannot tile the
-   trivial T.parallel(257) fill into 256 threads injectively. This bites
-   any setting where RADIX == BLOCK_SIZE (the original cppmega config:
-   BLOCK_SIZE=1024, RADIX=256 is presumably saved by the partial barrier
-   pattern; on the metal target the target descriptor advertises only
-   max_num_threads = 256).
-2. **shared.dyn storage scope unsupported.** Once the histogram size is
-   chosen to dodge the layout check, TileLang gets through legalization but
-   the metal codegen rejects the storage scope. T.alloc_shared in
-   tilelang 0.1.9 lowers to shared.dyn, and the TVM metal backend bundled
-   with tilelang has no handler for it. A minimal probe confirms this:
+A local thread sweep on M4 Max and the checked receipt show the important
+cases:
 
-       @T.prim_func
-       def use_shared(A: T.Tensor((256,), 'float32'),
-                      B: T.Tensor((256,), 'float32')):
-           with T.Kernel(1, threads=256) as bx:
-               tx = T.get_thread_binding()
-               s = T.alloc_shared([256], 'float32')
-               s[tx] = A[tx]; T.sync_threads(); B[tx] = s[tx] * 2.0
+| shape        | best Path C threads | observed C/B |
+| ------------ | ------------------- | ------------ |
+| B=1,T=64,K=8 | 32                  | 0.903x       |
+| B=1,T=512,K=32 | 32               | 0.507x       |
+| B=4,T=2048,K=64 | 64              | 0.659x       |
+| B=4,T=4096,K=256 | 16             | 0.566x       |
 
-       target = tvm.target.Target('metal')
-       with target: lower(use_shared, target=target)
-       # -> Fatal: Unknown storage scope shared.dyn
-
-This remains a hard TileLang-codegen blocker for the DSA sparse-MLA family:
-every kernel in the family relies on threadgroup memory and partial barriers.
-For topk_selector, the shipped path takes the second option from the original
-decision tree: hand-write MSL and bypass TileLang lowering entirely.
+The exact ratios move with warmup and MLX compiler cache state, so the checked
+benchmark script is the source of truth.
 
 ## Runtime contract
 
-cppmega_mlx/nn/_tilelang/topk_selector.topk_selector_reference(scores, k,
-*, starts=None, ends=None) is the pure-MLX oracle. It uses
-mx.argpartition(-scores, k, axis=-1)[..., :k] and an optional [starts, ends)
-mask, with -1 sentinel fill when a row has fewer than k valid columns. The
-output is mx.int32 to match the source kernel's index buffer dtype.
+`topk_selector_reference(scores, k, *, starts=None, ends=None)` is the pure-MLX
+oracle. It uses `mx.argpartition(-scores, k, axis=-1)[..., :k]` and an optional
+`[starts, ends)` mask, with `-1` sentinel fill when a row has fewer than `k`
+valid columns. Output dtype is `mx.int32`.
 
-cppmega_mlx/nn/_tilelang/topk_selector.topk_selector_metal(...) is the
-direct-MSL Path B runtime on Mac. It launches via mx.fast.metal_kernel, clamps
-per-row starts/ends inside the kernel, emits value-descending indices, and
-returns None only when the Metal path cannot dispatch. topk_selector(...,
-backend="auto") prefers this Metal path and falls back to the reference;
-backend="metal" fails closed if the direct-MSL kernel is unavailable.
+`topk_selector_metal(...)` is Path B and returns `None` if the direct-MSL kernel
+cannot dispatch.
 
-Top-k indices are non-differentiable (the gather of the selected values
-is differentiable; the indices themselves are a discrete selector). We
-therefore do **not** wrap the function in mx.custom_function. Tests treat
-parity as the indices' set-membership for the largest k values, because
-mx.argpartition, the source radix kernel, and the direct-MSL greedy kernel do
-not share a stable tie-breaking contract.
+`topk_selector_tilelang(...)` is Path C and returns `None` if TileLang/Metal
+cannot dispatch. Public `topk_selector(..., backend="tilelang")` and
+`backend="path_c"` fail closed if Path C is unavailable. Public
+`backend="auto"` tries Path C first only for unmasked rows with strict-green
+bench receipts. Masked calls and unreceipted shapes route Path B first, then the
+pure-MLX fallback.
+
+Top-k indices are non-differentiable. Tests compare set membership for the
+largest `k` values, because MLX argpartition, the upstream radix kernel, Path B,
+and Path C do not share a stable tie-breaking contract.
+
+## Supported Path C shapes and dtypes
+
+Path C is shape-specialized and supports the required 2D `(B, T)` selector
+contract with static `K` where `1 <= K <= T` and `threads * K * 8 <= 32 KiB`.
+Current acceptance and benchmark coverage includes:
+
+- `(B=2, T=64, K=4)`, float32, with and without `[starts, ends)`
+- `(B=1, T=64, K=8)`, float32
+- `(B=1, T=512, K=32)`, float32
+- `(B=1, T=2048, K=64)`, float32
+- `(B=4, T=512, K=64)`, float32, float16, bfloat16
+- `(B=4, T=2048, K=64)`, float32, float16, bfloat16
+- `(B=1, T=4096, K=256)`, float32
+- `(B=4, T=4096, K=256)`, float32
+- short and empty intervals with `-1` sentinel fill
+
+Input dtype support:
+
+- `mx.float32`: native Path C compare path
+- `mx.float16`: native load, fp32 internal compare
+- `mx.bfloat16`: promoted to fp32 before dispatch
+
+Unsupported dtypes fail closed and should use `backend="mlx"` or Path B/auto if
+eligible.
 
 ## Tests
 
-tests/test_tilelang_topk.py covers:
+`tests/test_tilelang_topk.py` covers:
 
-- pure-MLX reference parity vs a NumPy oracle for B in {1, 4},
-  T in {64, 512, 2048}, and k in {1, 8, 32} (with k <= T)
-- dtype in {float32, float16, bfloat16} -> output dtype is int32
-- edge cases: k == 1 returns the argmax, k == seq_len returns all
-  indices, [starts, ends) masking excludes out-of-range columns, and short or
-  empty intervals fill invalid slots with -1
-- shape/dtype validation (rejects non-2D inputs and k <= 0,
-  k > seq_len)
-- Path B status helper records the direct-MSL availability and is stable across
-  calls
-- direct-MSL Metal-vs-reference parity for the main sweep, short/empty
-  intervals, k == seq_len, and acceptance shapes B=4/T=512/k=64 plus
-  B=1/T=4096/k=256 for float32, float16, and bfloat16
+- pure-MLX reference parity vs a NumPy oracle for B in `{1, 4}`, T in
+  `{64, 512, 2048}`, and k in `{1, 8, 32}`
+- dtype in `{float32, float16, bfloat16}` -> output dtype is int32
+- edge cases: `k == 1`, `k == seq_len`, `[starts, ends)` masking, and short or
+  empty intervals
+- Path B and Path C status helpers
+- direct-MSL Path B parity for the main sweep and acceptance shapes
+- TileLang DSL Path C parity against both the reference and Path B for the
+  required acceptance shapes
 
-58 tests pass on M4 Max.
+The TileLang tree also carries
+`/private/tmp/tilelang_apple_head/tilelang/testing/python/metal/test_metal_topk_selector.py`.
+That probe lowers the standalone Path C PrimFunc, checks the emitted MSL for
+static `threadgroup` buffers and `threadgroup_barrier`, and runs MPS parity
+through `tilelang.compile`.
 
 ## Bench
 
-scripts/bench_tilelang_topk.py compares three pure-MLX strategies plus the
-direct-MSL Path B kernel
-across a small shape matrix (10 warmup, 50 timed iterations, perf_counter
-wall time, mx.get_peak_memory() for peak GiB):
+`scripts/bench_tilelang_topk.py` compares:
 
-- argpartition -- the reference (mx.argpartition(-scores, k)[..., :k]).
-- argsort_slice -- mx.argsort(-scores)[..., :k]. Higher-work upper
-  bound, kept honest for the parity sweep.
-- topk_take_along -- argpartition followed by mx.take_along_axis so
-  values are materialized too. Models the "fused selector" call-site
-  shape downstream code uses.
-- path_b_msl -- hand-written MSL via mx.fast.metal_kernel. If it cannot
-  dispatch for a shape/device, the bench records ran=false instead of timing a
-  fallback as if it were Metal.
+- `argpartition`: the pure-MLX reference selector.
+- `argsort_slice`: `mx.argsort(-scores)[..., :k]`.
+- `topk_take_along`: argpartition plus value materialization.
+- `path_b_msl`: hand-written MSL Path B.
+- `path_c_tilelang`: TileLang DSL Path C.
 
-Sample smoke output on M4 Max (median ms across 10 iters, warmup=3):
+Smoke output on M4 Max, `warmup=10`, `iters=50`, Python `3.13.12`,
+`mlx 0.31.1`, `mlx-metal 0.31.1`, `tilelang 0.1.9+gita69d6df7`,
+`apache-tvm-ffi 0.1.11rc2`, `numpy 2.4.4`:
 
+```text
+B    T       k      dtype      argpart_ms    argsort_ms    fused_ms      path_b_ms     path_c_ms     C/B
+1    64      8      float32    0.1869        0.1560        0.1761        0.1704        0.1539        0.903
+1    512     32     float32    0.1738        0.1551        0.1598        0.3724        0.1888        0.507
+1    2048    64     float32    0.1605        0.1509        0.1715        0.5249        0.3363        0.641
+4    2048    64     float32    0.1740        0.1559        0.1758        0.5300        0.3495        0.659
+4    2048    64     float16    0.1780        0.1589        0.1772        0.5465        0.3531        0.646
+4    2048    64     bfloat16   0.1781        0.1671        0.1875        0.6085        0.3893        0.640
+4    4096    256    float32    0.1926        0.1664        0.1984        8.7999        4.9800        0.566
+```
 
-B    T       k      dtype      argpart_ms    argsort_ms    fused_ms      msl_ms        peak_gib
-1    64      8      float32    0.1666        0.1485        0.1801        0.1784        0.0000
-1    512     32     float32    0.1509        0.1391        0.1671        0.3726        0.0000
-1    2048    64     float32    0.1716        0.1549        0.1849        0.8641        0.0000
-4    2048    64     float32    0.1765        0.1397        0.1572        0.5147        0.0001
-4    2048    64     float16    0.1627        0.1398        0.1616        0.5072        0.0001
-4    2048    64     bfloat16   0.1481        0.1471        0.1590        0.4941        0.0001
-4    4096    256    float32    0.1658        0.1593        0.1898        8.8177        0.0004
+The checked receipt keeps Path C no worse than Path B on the measured required
+shapes, including `K=256`, and correct for the required dtype/interval
+contract. `backend="auto"` uses that receipt as a routing gate: it is Path-C
+first only for the strict-green unmasked rows in
+`bench/tilelang_ports/topk_selector.json`. Explicit `backend="tilelang"` remains
+available and fail-closed for correctness/probe runs outside that profitable
+envelope.
 
+## Remaining blocker
 
-MLX argpartition remains the better standalone top-k implementation, especially
-for B=4/T=4096/k=256. The direct-MSL kernel is kept as the smoke-test for the
-Path B bypass and as a building block for future fused sparse-MLA kernels,
-where selection can happen inline with the attention reduction.
-
-Parity tolerance: bit-exact set membership for the largest k values; tie
-breaking is intentionally not part of the contract.
+This lane no longer has a correctness, feature, or measured Path-B-parity
+blocker for the receipt-backed standalone top-k selector shapes. Remaining risk
+is schedule generality outside the checked envelope: the TileLang DSL schedule
+still lowers to scalar per-lane sorted insertions plus full `threads * K`
+shared-memory list merges. It does not expose a Metal simdgroup top-k/reduce
+primitive, a custom comparator network intrinsic, or scheduler glue for every
+possible masked or unmeasured top-k regime, so AUTO keeps those calls Path-B
+first and unsupported shapes/dtypes still fail closed to Path B or the MLX
+reference.
 
 ## Reproduce
 
-
+```bash
 PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m pytest -p no:cacheprovider tests/test_tilelang_topk.py -q --tb=short
 PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/pyright cppmega_mlx/nn/_tilelang/topk_selector.py tests/test_tilelang_topk.py scripts/bench_tilelang_topk.py
-PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python scripts/bench_tilelang_topk.py --json --no-output-file
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python scripts/bench_tilelang_topk.py --warmup 3 --iters 10 --strict --no-output-file
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python scripts/bench_tilelang_topk.py --json
+```
 
-
-The bench writes bench/tilelang_ports/topk_selector.json and (with
---json) prints the same payload to stdout.
-
-## TileLang Metal codegen surprises
-
-For future ports, the failures we hit on this kernel are the
-load-bearing ones:
-
-1. T.alloc_shared -> shared.dyn, which TVM's metal backend in
-   tilelang 0.1.9 does not implement. Any kernel using threadgroup
-   memory hits this immediately. The bench_msl_path_b.py prototype
-   sidestepped the issue by allocating into thread-local registers
-   only (T.alloc_local).
-2. LowerTileOp requires the parallel-loop iter space to tile
-   injectively into the threadgroup size. T.fill(buffer_with_size_257,
-   0) over 256 threads fails this check. Workarounds: pad the buffer
-   to a multiple of BLOCK_SIZE, or hoist the fill out of the kernel
-   and pass a pre-zeroed buffer in.
-3. The pass_configs parameter accepted by @tilelang.jit is **not**
-   accepted by tilelang.engine.lower.lower(...). The flags
-   TL_DISABLE_THREAD_STORAGE_SYNC and
-   TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE from the cppmega source
-   are not currently reachable through the lower API; they will need
-   to be set via the global PassContext once that API stabilizes.
-4. T.dynamic shape variables produce TIR with unbound tir.Vars in
-   T.Kernel extents, which the metal codegen does not lower. Concrete
-   shapes must be baked into the PrimFunc per (B, T) instance.
-5. from __future__ import annotations breaks @T.prim_func's
-   get_type_hints resolution because closure variables stop being
-   visible to the eager builder; the working pattern keeps types eager
-   and uses string dtypes only.
+The bench writes `bench/tilelang_ports/topk_selector.json` unless
+`--no-output-file` is used.

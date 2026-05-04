@@ -22,6 +22,8 @@ These tests exercise:
    head-dim fall back to the BF16 reference without quantization.
 """
 
+# pyright: reportOperatorIssue=false, reportAttributeAccessIssue=false, reportMissingImports=false
+
 from __future__ import annotations
 
 import numpy as np
@@ -29,12 +31,15 @@ import pytest
 
 import mlx.core as mx
 
+from scripts.bench_tilelang_sparse_mla_fp8 import _strict_exit_failures
+
 from cppmega_mlx.nn._tilelang.sparse_mla_blockscaled import (  # noqa: E402
     MXFP8_BLOCK_SIZE,
     SparseMLABlockScaledMetalStatus,
     _dequantize_mxfp8,
     _mxfp8_roundtrip_ste,
     _quantize_mxfp8,
+    _unpack_mxfp8_to_uint8,
     sparse_mla_blockscaled_apply,
     sparse_mla_blockscaled_bwd_metal,
     sparse_mla_blockscaled_fwd_metal,
@@ -45,10 +50,15 @@ from cppmega_mlx.nn._tilelang.sparse_mla_blockscaled_path_c import (  # noqa: E4
     E8M0_BLOCK_SIZE,
     E8M0_LAYOUT,
     E8M0_SCALE_FORMAT,
+    SparseMLABlockScaledQKReducePathCStatus,
     SparseMLABlockScaledPathCStatus,
     blockscaled_sparse_mla_qk_msl_features,
     blockscaled_sparse_mla_qk_path_c_status,
+    blockscaled_sparse_mla_qk_reduce_msl_features,
+    blockscaled_sparse_mla_qk_reduce_path_c,
+    blockscaled_sparse_mla_qk_reduce_path_c_status,
     lower_blockscaled_sparse_mla_qk_msl,
+    lower_blockscaled_sparse_mla_qk_reduce_msl,
 )
 from cppmega_mlx.nn.sparse_mla import sparse_mla_attention_reference  # noqa: E402
 
@@ -82,6 +92,17 @@ def _make_inputs(
     return q, kv, indices, d_v
 
 
+def test_blockscaled_bench_strict_exit_includes_full_dispatch_scope() -> None:
+    failures = _strict_exit_failures(
+        fp8_reducer_failures=[],
+        fp8_full_dispatch_failures=["fp8 full dispatch blocked"],
+        include_blockscaled=True,
+        blockscaled_reducer_failures=[],
+        blockscaled_full_dispatch_failures=["blockscaled full dispatch blocked"],
+    )
+    assert failures == ["fp8 full dispatch blocked", "blockscaled full dispatch blocked"]
+
+
 # ---------------------------------------------------------------------------
 # Constants and status surface
 # ---------------------------------------------------------------------------
@@ -110,7 +131,7 @@ def test_blockscaled_metal_status_with_arrays_validates_dispatcher_path() -> Non
         assert status.available is False
 
 
-def test_blockscaled_path_c_status_reports_current_e8m0_qk_blocker() -> None:
+def test_blockscaled_path_c_status_reports_e8m0_qk_reduce_dispatch_surface() -> None:
     status = blockscaled_sparse_mla_qk_path_c_status()
     assert isinstance(status, SparseMLABlockScaledPathCStatus)
     assert status.m == 1
@@ -119,17 +140,17 @@ def test_blockscaled_path_c_status_reports_current_e8m0_qk_blocker() -> None:
     assert status.transpose_B is True
     assert status.scale_block_size == E8M0_BLOCK_SIZE
     assert status.scale_layout == E8M0_LAYOUT
-    assert status.available is False
     assert status.reason
-    if status.features:
+    if mx.metal.is_available():
+        assert status.available is True, status.reason
+        assert status.features["dispatch_surface"] == "qk_reduce"
+        assert status.features["runnable_qk_reduce_available"] is True
         assert status.features["scale_format"] == E8M0_SCALE_FORMAT
         assert status.features["scale_block_size"] == E8M0_BLOCK_SIZE
         assert status.features["scale_axis"] == "contracted_k"
-        assert (
-            "M=1/topk" in status.reason
-            or "no simdgroup_multiply_accumulate" in status.reason
-            or "scale operands disappeared" in status.reason
-        )
+        assert status.features["legacy_e8m0_scaled_matmul_probe_available"] is False
+    else:
+        assert status.available is False
 
 
 def test_blockscaled_path_c_square_control_lowers_to_e8m0_scale_aware_fast_path() -> None:
@@ -153,8 +174,8 @@ def test_blockscaled_path_c_square_control_lowers_to_e8m0_scale_aware_fast_path(
     assert status.features["e8m0_bias_subtract_127"] >= 1
     assert status.features["e8m0_sentinel_255"] >= 1
     assert status.features["k_block_shift_5"] or status.features["k_block_div_32"]
-    assert status.features["A_scale_collapsed_zero"] == 0
-    assert status.features["B_scale_collapsed_zero"] == 0
+    assert status.features["A_scale_refs"] > status.features["A_scale_collapsed_zero"]
+    assert status.features["B_scale_refs"] > status.features["B_scale_collapsed_zero"]
     assert status.features["scale_layout"] == E8M0_LAYOUT
 
 
@@ -195,7 +216,7 @@ def test_blockscaled_path_c_rejects_non_k32_scale_layout() -> None:
     assert "K divisible by 32" in status.reason
 
 
-def test_blockscaled_path_c_documents_bk_chunk_scale_offset_blocker() -> None:
+def test_blockscaled_path_c_chunked_bk_uses_scale_subregion_offsets() -> None:
     status = blockscaled_sparse_mla_qk_path_c_status(
         M=32,
         N=32,
@@ -207,8 +228,191 @@ def test_blockscaled_path_c_documents_bk_chunk_scale_offset_blocker() -> None:
         b_scale_size=2,
         num_stages=2,
     )
-    assert status.available is False
-    assert "A_scale e8m0_block_k32 size must be K/32=1; got size 2" in status.reason
+    assert status.available is True, status.reason
+    assert status.features["simdgroup_multiply_accumulate"] >= 1
+    assert status.features["A_scale_refs"] >= 1
+    assert status.features["B_scale_refs"] >= 1
+    assert status.features["A_scale_refs"] > status.features["A_scale_collapsed_zero"]
+    assert status.features["B_scale_refs"] > status.features["B_scale_collapsed_zero"]
+    assert status.features["k_block_shift_5"] or status.features["k_block_div_32"]
+
+
+def test_blockscaled_path_c_e8m0_qk_reduce_status_reports_available() -> None:
+    status = blockscaled_sparse_mla_qk_reduce_path_c_status(N=16, K=64)
+    assert isinstance(status, SparseMLABlockScaledQKReducePathCStatus)
+    assert status.n == 16
+    assert status.k == 64
+    assert status.scale_block_size == E8M0_BLOCK_SIZE
+    assert status.scale_layout == E8M0_LAYOUT
+    if mx.metal.is_available():
+        assert status.available is True, status.reason
+        assert status.features["signature_has_A_scale"] is True
+        assert status.features["signature_has_B_scale"] is True
+        assert status.features["A_scale_refs"] >= 1
+        assert status.features["B_scale_refs"] >= 1
+        assert status.features["per_row_B_scale"] is True
+        assert status.features["e8m0_exp2"] >= 1
+    else:
+        assert status.available is False
+
+
+def test_blockscaled_path_c_e8m0_qk_reduce_lowered_features_are_reported() -> None:
+    msl = lower_blockscaled_sparse_mla_qk_reduce_msl(N=16, K=64)
+    features = blockscaled_sparse_mla_qk_reduce_msl_features(msl)
+    assert features["kernel_void"] >= 1
+    assert features["fp8_e4m3_decode_helper"] >= 1
+    assert features["signature_has_A_scale"] is True
+    assert features["signature_has_B_scale"] is True
+    assert features["A_scale_refs"] >= 1
+    assert features["B_scale_refs"] >= 1
+    assert features["per_row_B_scale"] is True
+    assert features["metal_fp8_dot4_helper"] >= 1
+    assert features["e8m0_exp2"] >= 1
+    assert features["e8m0_bias_subtract_127"] >= 1
+    assert features["e8m0_sentinel_255"] >= 1
+    assert (
+        features["k_block_shift_5"]
+        or features["k_block_div_32"]
+        or features["scale_block_index_shift"]
+    )
+
+
+def test_blockscaled_path_c_e8m0_qk_reduce_locks_current_perf_blocker() -> None:
+    """Real Sparse-MLA shape uses dot4 decode but still not the MMA fast path."""
+
+    features = blockscaled_sparse_mla_qk_reduce_msl_features(
+        lower_blockscaled_sparse_mla_qk_reduce_msl(N=16, K=4096)
+    )
+    assert features["simdgroup_multiply_accumulate"] == 0
+    assert features["metal_fp8_dot4_helper"] >= 1
+    assert features["scalar_fp8_byte_decode_calls"] == 0
+    assert features["simd_sum"] >= 1
+
+
+def _e8m0_decode_np(x: np.ndarray) -> np.ndarray:
+    x_i = x.astype(np.int32)
+    return np.where((x_i == 0) | (x_i == 255), 0.0, np.exp2(x_i - 127)).astype(np.float32)
+
+
+def test_blockscaled_path_c_e8m0_qk_reduce_matches_blockscale_oracle() -> None:
+    q, kv, _indices, _d_v = _make_inputs(seq_len=16, heads=2, qk_dim=64, topk=16, scale=0.1)
+    q_packed, _q_scales = _quantize_mxfp8(q)
+    kv_packed, _kv_scales = _quantize_mxfp8(kv)
+    mx.eval(q_packed, kv_packed)
+
+    A_fp8 = _unpack_mxfp8_to_uint8(q_packed, 64)[0, 0, 0, :].reshape((1, 64))
+    B_fp8 = _unpack_mxfp8_to_uint8(kv_packed, 64)[0, :16, 0, :]
+    A_scale = mx.array(np.array([126, 129], dtype=np.uint8))
+    B_scale_np = np.stack(
+        [
+            np.array([127 + (row % 3), 128 - (row % 2)], dtype=np.uint8)
+            for row in range(16)
+        ],
+        axis=0,
+    )
+    B_scale = mx.array(B_scale_np)
+    out = blockscaled_sparse_mla_qk_reduce_path_c(A_fp8, A_scale, B_fp8, B_scale)
+    assert out is not None
+
+    A_dec = np.asarray(mx.from_fp8(A_fp8, dtype=mx.float32)).astype(np.float32)
+    B_dec = np.asarray(mx.from_fp8(B_fp8, dtype=mx.float32)).astype(np.float32)
+    A_scale_dec = _e8m0_decode_np(np.asarray(A_scale))
+    B_scale_dec = _e8m0_decode_np(B_scale_np)
+    oracle_np = np.zeros((1, 16), dtype=np.float32)
+    for row in range(16):
+        for kb in range(2):
+            start = kb * E8M0_BLOCK_SIZE
+            stop = start + E8M0_BLOCK_SIZE
+            partial = np.float32(np.dot(A_dec[0, start:stop], B_dec[row, start:stop]))
+            oracle_np[0, row] += partial * A_scale_dec[kb] * B_scale_dec[row, kb]
+    oracle = mx.array(oracle_np)
+    mx.eval(out, oracle)
+    np.testing.assert_allclose(
+        np.asarray(out).astype(np.float32),
+        oracle_np,
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+
+def test_blockscaled_path_c_e8m0_qk_reduce_accepts_broadcast_b_scale() -> None:
+    q, kv, _indices, _d_v = _make_inputs(seq_len=16, heads=2, qk_dim=64, topk=16, scale=0.1)
+    q_packed, _q_scales = _quantize_mxfp8(q)
+    kv_packed, _kv_scales = _quantize_mxfp8(kv)
+    mx.eval(q_packed, kv_packed)
+
+    A_fp8 = _unpack_mxfp8_to_uint8(q_packed, 64)[0, 0, 0, :].reshape((1, 64))
+    B_fp8 = _unpack_mxfp8_to_uint8(kv_packed, 64)[0, :16, 0, :]
+    A_scale = mx.array(np.array([126, 129], dtype=np.uint8))
+    B_scale_np = np.array([128, 126], dtype=np.uint8)
+    B_scale = mx.array(B_scale_np)
+    out = blockscaled_sparse_mla_qk_reduce_path_c(A_fp8, A_scale, B_fp8, B_scale)
+    assert out is not None
+
+    A_dec = np.asarray(mx.from_fp8(A_fp8, dtype=mx.float32)).astype(np.float32)
+    B_dec = np.asarray(mx.from_fp8(B_fp8, dtype=mx.float32)).astype(np.float32)
+    A_scale_dec = _e8m0_decode_np(np.asarray(A_scale))
+    B_scale_dec = _e8m0_decode_np(B_scale_np)
+    oracle_np = np.zeros((1, 16), dtype=np.float32)
+    for row in range(16):
+        for kb in range(2):
+            start = kb * E8M0_BLOCK_SIZE
+            stop = start + E8M0_BLOCK_SIZE
+            partial = np.float32(np.dot(A_dec[0, start:stop], B_dec[row, start:stop]))
+            oracle_np[0, row] += partial * A_scale_dec[kb] * B_scale_dec[kb]
+    mx.eval(out)
+    np.testing.assert_allclose(
+        np.asarray(out).astype(np.float32),
+        oracle_np,
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+
+def test_blockscaled_path_c_e8m0_qk_reduce_handles_tail_n_and_multi_k_chunk() -> None:
+    rng = np.random.default_rng(91)
+    n = 10
+    k_dim = 160
+    scale_blocks = k_dim // E8M0_BLOCK_SIZE
+    q = mx.array((rng.standard_normal((1, 1, 1, k_dim)) * 0.1).astype(np.float32))
+    kv = mx.array((rng.standard_normal((1, n, 1, k_dim)) * 0.1).astype(np.float32))
+    q_packed, _q_scales = _quantize_mxfp8(q)
+    kv_packed, _kv_scales = _quantize_mxfp8(kv)
+    mx.eval(q_packed, kv_packed)
+
+    A_fp8 = _unpack_mxfp8_to_uint8(q_packed, k_dim)[0, 0, 0, :].reshape((1, k_dim))
+    B_fp8 = _unpack_mxfp8_to_uint8(kv_packed, k_dim)[0, :, 0, :]
+    A_scale_np = np.array([126, 127, 128, 129, 130], dtype=np.uint8)
+    B_scale_np = np.stack(
+        [
+            np.array([126 + ((row + kb) % 5) for kb in range(scale_blocks)], dtype=np.uint8)
+            for row in range(n)
+        ],
+        axis=0,
+    )
+    A_scale = mx.array(A_scale_np)
+    B_scale = mx.array(B_scale_np)
+    out = blockscaled_sparse_mla_qk_reduce_path_c(A_fp8, A_scale, B_fp8, B_scale)
+    assert out is not None
+
+    A_dec = np.asarray(mx.from_fp8(A_fp8, dtype=mx.float32)).astype(np.float32)
+    B_dec = np.asarray(mx.from_fp8(B_fp8, dtype=mx.float32)).astype(np.float32)
+    A_scale_dec = _e8m0_decode_np(A_scale_np)
+    B_scale_dec = _e8m0_decode_np(B_scale_np)
+    oracle_np = np.zeros((1, n), dtype=np.float32)
+    for row in range(n):
+        for kb in range(scale_blocks):
+            start = kb * E8M0_BLOCK_SIZE
+            stop = start + E8M0_BLOCK_SIZE
+            partial = np.float32(np.dot(A_dec[0, start:stop], B_dec[row, start:stop]))
+            oracle_np[0, row] += partial * A_scale_dec[kb] * B_scale_dec[row, kb]
+    mx.eval(out)
+    np.testing.assert_allclose(
+        np.asarray(out).astype(np.float32),
+        oracle_np,
+        rtol=1e-5,
+        atol=1e-5,
+    )
 
 
 def test_blockscaled_fwd_metal_returns_outputs() -> None:
@@ -476,11 +680,14 @@ def test_module_public_exports_present() -> None:
     expected = {
         "MXFP8_BLOCK_SIZE",
         "SparseMLABlockScaledMetalStatus",
+        "SparseMLABlockScaledQKReducePathCStatus",
         "sparse_mla_blockscaled_apply",
         "sparse_mla_blockscaled_bwd_metal",
         "sparse_mla_blockscaled_fwd_metal",
         "sparse_mla_blockscaled_metal_status",
         "blockscaled_sparse_mla_qk_path_c_status",
+        "blockscaled_sparse_mla_qk_reduce_path_c",
+        "blockscaled_sparse_mla_qk_reduce_path_c_status",
         "sparse_mla_blockscaled_reference",
     }
     assert expected.issubset(set(module.__all__))

@@ -43,7 +43,7 @@ This document is a planning synthesis from parallel research lanes (local-code a
 - **Sharded checkpoints** (`model.safetensors.index.json`).
 - **Sequence packing** (cumulative-doc-id attention mask).
 - **Tokenizer**: M0.1 is closed. The vendored GB10 BPE artifact and special-token contract exist for vocab=65536 with id7=`<CODE_START>`, id45=`<FIM_INSTRUCTION>`, id46=`<SPACE>`, id47=`<NL>`. Encode normalizes whitespace runs (`[\r\n]+`->`<NL>`, `[ \t]+`->`<SPACE>`); decode is plain token concat with sentinel substitution. Same wrapper deployed on Mac and gb10/CUDA side.
-- **Inference / generation**: no KV cache class, no sampler, no MTP-aware or FIM-aware decoding.
+- **Inference / generation**: temperature/top-k/top-p sampling, eager no-KV full-prefix generation, fail-closed standard MTP/draft-output guard, and prompt-only FIM/iFIM infilling construction exist locally; no KV cache class, paged scheduler, prompt cache, integrated FIM decode loop, speculative/self-spec decode, q4 path, or KV-q4 path.
 - **Quantization**: bf16 only; no `mx.quantize` integration, no q4 inference path.
 - **Structural parity anchors, not CUDA tensor parity**: existing `tests/test_cppmega_parity_anchors.py` checks NAM56R route/layer constants, DSA/MLA layer derivation, vocab/MoE anchors, fail-closed parity wording, and optional sibling cppmega source-anchor presence when that checkout exists. The source-file existence check is only one guard; the test is broader than file-presence coverage, but it still does not compare CUDA golden tensors or prove numerical agreement.
 
@@ -706,11 +706,11 @@ Rejected (do NOT pursue, save us future work):
 
 #### Stream X addendum — TileLang kernel ports from cppmega (10 kernels)
 
-Inventory of cppmega TileLang kernels to port via Path B/C (epic `cppmega-mlx-za1`, blocked on `cppmega-mlx-0ce`). Source: `/tmp/cppmega_tilelang_inventory.md`. Path B verified working: 5.2× speedup vs MLX Python loop on Mamba3-style scan PoC, 3 transform-layer gotchas (~150 LOC) documented.
+Inventory of cppmega TileLang kernels to port via Path B/C (epic `cppmega-mlx-za1`). Source: `/tmp/cppmega_tilelang_inventory.md`. Generic TileLang-MSL adapter and Mamba3 wrapper work remain open under `cppmega-mlx-0ce` / `cppmega-mlx-9ba`, but several sparse-MLA/topk lanes are no longer blocked on that adapter: direct-MSL Path B ships for BF16, tensorwise FP8, and blockscaled sparse-MLA, and narrow Path C reducers/selectors exist where the bench receipts say so. Path B verified working: 5.2× speedup vs MLX Python loop on Mamba3-style scan PoC, 3 transform-layer gotchas (~150 LOC) documented.
 
-160j. **Sparse-MLA BF16 fwd/bwd pair** (`cppmega/megatron/sparse_mla_ops/tilelang_sparse_mla_{fwd,bwd}.py`). Highest-value port — powers DSA, Triton-free, no MLX equivalent. Bead: `cppmega-mlx-5t2` (P2). Pure-MLX reference must be written first as parity oracle.
-160k. **Sparse-MLA FP8 + blockscaled variants** (4 kernels). FP8 dependent on Apple Silicon FP8 path (mxfp4/mxfp8/nvfp4 already in `mx.quantized_matmul`). Bead: `cppmega-mlx-cx9` (P3).
-160l. **topk_selector** (`cppmega/megatron/tilelang_sparse_mla/topk_selector.py`). Smallest kernel — first port for Path B transform-layer smoke. Bead: `cppmega-mlx-zlv` (P3).
+160j. **Sparse-MLA BF16 fwd/bwd pair** (`cppmega/megatron/sparse_mla_ops/tilelang_sparse_mla_{fwd,bwd}.py`). Path B remains the fail-closed fallback. Forced Path C is available, and AUTO promotes the three checked fwd+bwd receipt rows (`B2_S128_H8_D64`, `B4_S512_H8_D64`, `B4_S1024_H8_D64`) because their required no-worse gates are green. Unreceipted shapes stay on Path B.
+160k. **Sparse-MLA FP8 + blockscaled variants** (4 kernels). Path B remains production. Path C has partial reducers only: FP8 QK-reduce/indexed QK-reduce and blockscaled e8m0 QK-reduce have parity/timing receipts, but both families keep the full Path C dispatch gate red because full QK remains unavailable.
+160l. **topk_selector** (`cppmega/megatron/tilelang_sparse_mla/topk_selector.py`). Path C is the AUTO/default where available, with Path B fallback; checked-in receipt runs both paths and keeps every C/B ratio <= 1.0.
 160m. **Mamba3 MIMO autograd wrapper** (`cppmega/megatron/tilelang_mimo_autograd.py` + 3 Triton helpers `compute_dacs_segsum`, `bwd_dadt_fused`, `bwd_dtrap_ddt`). Triton helpers must be re-implemented in TileLang or pure-MLX (Triton has no Metal backend). Parity oracle: existing `cppmega_mlx/nn/mamba3.py` reference scan. Bead: `cppmega-mlx-8w8` (P2).
 
 Excluded as Hopper-only dead-end on Metal: `cppmega/megatron/cute_dsl_mimo/` (sm_90a CuTe DSL).
@@ -718,11 +718,11 @@ Excluded as Hopper-only dead-end on Metal: `cppmega/megatron/cute_dsl_mimo/` (sm
 ### Stream I — Inference & Generation (161–180)
 
 161. Implement contiguous KV-cache class `cppmega_mlx/inference/engine.py` (mirror `nanochat/engine.py`).
-162. Implement paged KV-cache scheduler `cppmega_mlx/inference/serving.py` (mirror `nanochat/serving.py`).
-163. Add temperature/top-k/top-p sampling.
-164. Add greedy decode path (temp=0).
-165. Add MTP-aware decoding helper (verify MTP heads disabled at inference; standard next-token decode).
-166. Add FIM-aware infilling (PSM/SPM token routing for prompt construction).
+162. **SCOPED DONE**: add MLX-local paged KV block manager and continuous-batch scheduler metadata in `cppmega_mlx/inference/serving.py`; this allocates KV block pools, padded block tables, priority/FIFO admission, preemption, generated-token capacity growth, and fail-closed model-integrated paged attention. It does not wire model attention to consume paged KV or provide an API server.
+163. **SCOPED DONE**: add temperature/top-k/top-p sampling in `cppmega_mlx/inference/sampling.py`; this is a token sampler only, not a KV/paged serving path.
+164. **SCOPED DONE**: add eager full-prefix no-KV `generate_tokens(...)` in `cppmega_mlx/inference/generation.py`, including temp=0 greedy decode; KV cache, paged serving, streaming, prompt cache, integrated FIM decode loop, q4/KV-q4, and speculative decode remain open.
+165. **SCOPED DONE**: add `next_token_logits(...)` standard-decode guard in `cppmega_mlx/inference/generation.py`; plain `(batch, sequence, vocab)` logits return the final-position logits, while tuple/list/dict structured outputs and 4D MTP/draft logits fail closed. This is not MTP self-speculation; row 169 remains open.
+166. **SCOPED DONE**: add prompt-only FIM-aware infilling in `cppmega_mlx/inference/infilling.py` (PSM/SPM token routing plus iFIM id45 prefix). This constructs inference prompts ending at `<FIM_MIDDLE>` only; it does not append the target middle/EOT, run generation, post-process the generated span, or add a KV/paged decode loop.
 167. Implement vanilla speculative decoding (acceptance-rejection sampling, target-only verifier) referencing `nanochat/speculative_decode.py`. Note: cppmega CUDA does not implement speculative decoding — this is greenfield work on MLX, not a parity gap.
 168. Add EAGLE-2-style draft head (separate small draft model, GQA-aware) referencing `nanochat/experiments/sota_impl/eagle2/`. Gated; defer if MTP self-speculation already meets the throughput target.
 169. Add self-speculative decoding via MTP (FastMTP-aligned: same model emits draft tokens via its MTP heads, target verifies in one extra forward) referencing `nanochat/mtp_draft.py`. Cheapest of the three since MTP head already lands in Stream H; benchmark first.
@@ -838,7 +838,7 @@ Critical path: A → B → C → E → H (features) is the longest single chain,
 
 4. **Parity tolerance — RESOLVED (default carried forward)**: bf16 single matmul `rtol=1e-3, atol=1e-1`; chained `rtol=1e-2, atol=1e-1`; attention/RMSNorm `atol=5e-2`; full-step grad `atol=1e-1`. Matches PyTorch's documented bf16 thresholds.
 
-5. **MTP depth default — RESOLVED**: K=2 (matches GB10 `mtp_depths=2`). K=3 added as a benchmark configuration to test once K=2 is at parity. β=0.6, λ=0.3 carried over from cppmega CUDA defaults. Architecture: single shared transformer block recurred K times (FastMTP arXiv 2509.18362-style); cppmega CUDA's `fastmtp_layer.py` is the reference.
+5. **MTP depth default — RESOLVED**: K=2 (matches GB10 `mtp_depths=2`). K=3 added as a benchmark configuration to test once K=2 is at parity. β=0.6, λ=0.3 carried over from cppmega CUDA defaults. Architecture: single shared transformer block recurred K times (FastMTP arXiv 2509.18362-style); cppmega CUDA's `fastmtp_layer.py` is the reference. Standard inference currently rejects MTP/draft outputs unless the caller passes plain base logits; MTP self-speculation stays separate under row 169.
 
 6. **Speculative decoding — RESOLVED**: GB10/cppmega CUDA does **not** implement speculative decoding (only accepts the `is_spec_decode` parameter and forwards to upstream Megatron without adding its own draft head). This makes MLX greenfield work, not a parity gap. Plan tests all three paths and picks based on M4 measurement:
    - **MTP self-speculation** (FastMTP-aligned, target verifies its own MTP-head drafts) — references `nanochat/mtp_draft.py`. Cheapest to add since MTP head already lands in Stream H.

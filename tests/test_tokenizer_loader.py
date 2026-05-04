@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -198,7 +199,8 @@ def test_bpe_split_identifier_decodes_without_spurious_spaces() -> None:
         ("  multi   space\n\nblank", " multi space\nblank"),  # WS runs collapse
     ]
     for original, expected in cases:
-        ids = tokenizer.encode(original)
+        ids = cast(list[int], tokenizer.encode(original))
+        assert all(isinstance(token_id, int) for token_id in ids)
         decoded = tokenizer.decode(ids)
         assert decoded == expected, (
             f"input={original!r}\n  expected={expected!r}\n  got={decoded!r}"

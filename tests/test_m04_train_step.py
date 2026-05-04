@@ -337,51 +337,46 @@ def assert_m04_receipt_contract(payload: dict[str, Any]) -> None:
     }
 
 
-def test_checked_in_receipt_records_metadata_only_preflight_without_m0_4_claim() -> None:
+def test_checked_in_receipt_records_parquet_smoke_without_m0_4_claim() -> None:
     payload = json.loads(BASELINE_RECEIPT.read_text())
 
     assert_m04_receipt_contract(payload)
-    assert_local_gb10_metadata_dry_run_contract(payload)
-    assert payload["status"] == "dry_run"
-    assert payload["acceptance_gate"]["uses_full_target_dataset"] is False
-    assert payload["acceptance_gate"]["real_parquet_source_identity"]["ok"] is False
-    assert payload["acceptance_gate"]["full_target_dataset_100_step_completed"] is False
+    assert payload["status"] == "ok"
+    assert payload["full_m0_4_acceptance_claim"] is False
+    assert payload["workload"]["synthetic"] is False
+    assert payload["workload"]["data_format"] == "parquet"
+    assert payload["workload"]["mode"] == "eager"
+    assert payload["workload"]["steps_requested"] == 100
+    assert payload["workload"]["batch_size"] == 1
+    assert payload["workload"]["seq_len"] == 64
+    assert payload["workload"]["probe_local_gb10_quarter_allocation"] is True
+    assert payload["acceptance_gate"]["uses_full_target_dataset"] is True
+    assert payload["acceptance_gate"]["real_parquet_source_identity"]["ok"] is True
+    assert payload["acceptance_gate"]["full_target_dataset_100_step_completed"] is True
     assert payload["acceptance_gate"]["full_local_gb10_quarter_gate_completed"] is False
     assert payload["acceptance_gate"]["model_identity_ok"] is False
     assert payload["acceptance_gate"]["optimizer_identity_ok"] is True
-    assert payload["acceptance_gate"]["adamw_ok"] is False
-    assert payload["acceptance_gate"]["fp32_adamw_master_moments_ok"] is False
-    assert payload["acceptance_gate"]["observed_adamw_master_moment_dtypes"] == {}
+    assert payload["acceptance_gate"]["adamw_ok"] is True
+    assert payload["acceptance_gate"]["fp32_adamw_master_moments_ok"] is True
+    assert payload["acceptance_gate"]["observed_adamw_master_moment_dtypes"]
     assert payload["acceptance_gate"]["grad_checkpoint_expectation_ok"] is False
     assert payload["acceptance_gate"]["m4_runtime_metadata_ok"] is True
     assert set(payload["acceptance_gate"]["full_local_gb10_quarter_gate_blockers"]) == {
-        "adamw_ok",
-        "all_finite_ok",
-        "dataset_format_ok",
-        "dataset_name_ok",
-        "fp32_adamw_master_moments_ok",
         "grad_checkpoint_expectation_ok",
-        "local_gb10_quarter_preflight_ok",
-        "loss_decrease_ok",
-        "loss_fields_ok",
         "model_identity_ok",
-        "optimizer_update_ok",
-        "real_parquet_source_identity_ok",
-        "step_count_ok",
-        "target_parquet_path_ok",
     }
-    assert payload["acceptance_gate"]["full_target_dataset_blocker"]
-    assert payload["workload"]["synthetic"] is True
-    assert payload["workload"]["data_format"] == "npz"
-    assert payload["workload"]["mode"] == "metadata_only_no_forward_no_training"
-    assert payload["training"]["steps_completed"] == 0
-    assert payload["training"]["all_finite"] is False
-    assert payload["training"]["optimizer_updated"] is False
+    assert payload["acceptance_gate"]["full_target_dataset_blocker"] is None
+    assert payload["training"]["steps_completed"] == 100
+    assert payload["training"]["all_finite"] is True
+    assert payload["training"]["optimizer_updated"] is True
+    assert payload["training"]["loss_decreased"] is True
+    assert payload["training"]["loss_decrease_satisfied"] is True
+    assert payload["training"]["final_loss"] < payload["training"]["initial_loss"]
     assert payload["training"]["optimizer"]["name"] == "AdamW"
     assert payload["training"]["grad_checkpoint"]["observed_enabled"] is False
-    assert payload["training"]["final_loss"] is None
-    assert payload["training"]["initial_loss"] is None
-    assert payload["baseline_row"]["model"] == "metadata_only_no_observed_model"
+    assert payload["model"]["name"] == "HybridTinyLM"
+    assert payload["model"]["profile_matches_required"] is False
+    assert payload["baseline_row"]["model"] == "HybridTinyLM"
     assert {item["id"] for item in payload["acceptance_blockers"]} == {
         "cppmega-mlx-t8f.4.local_gb10_quarter_gate",
     }
@@ -637,14 +632,37 @@ def test_local_gb10_quarter_dry_run_cli_writes_requested_output_only(
         assert BASELINE_RECEIPT.read_text(encoding="utf-8") == baseline_before
 
 
-def test_local_gb10_quarter_training_fails_closed_before_tiny_route(
+def test_local_gb10_quarter_training_routes_to_monkeypatchable_seam(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    route_calls: list[tuple[m04_train_step.TrainHybridTinyConfig, Path]] = []
+
     def fail_train(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
         raise AssertionError("HybridTinyLM training route must not be called")
 
+    def fake_local_gb10_route(
+        _args: Any,
+        *,
+        config: m04_train_step.TrainHybridTinyConfig,
+        data_path: Path,
+    ) -> tuple[dict[str, Any], int]:
+        route_calls.append((config, data_path))
+        return (
+            m04_train_step.blocked_receipt(
+                _args,
+                "unit-test local_gb10_quarter route called",
+                "unit_test_route_called",
+            ),
+            2,
+        )
+
     monkeypatch.setattr(m04_train_step, "train_hybrid_tiny", fail_train)
+    monkeypatch.setattr(
+        m04_train_step,
+        "run_local_gb10_quarter_training",
+        fake_local_gb10_route,
+    )
     args = m04_train_step.build_parser().parse_args(
         [
             "--synthetic",
@@ -657,11 +675,17 @@ def test_local_gb10_quarter_training_fails_closed_before_tiny_route(
 
     payload, exit_code = m04_train_step.run_receipt(args)
 
+    assert len(route_calls) == 1
+    config, data_path = route_calls[0]
+    assert config.model_profile == "local_gb10_quarter"
+    assert config.grad_checkpoint is False
+    assert config.data_format == "npz"
+    assert data_path.suffix == ".npz"
     assert exit_code == 2
     assert payload["status"] == "blocked"
     assert payload["full_m0_4_acceptance_claim"] is False
-    assert payload["blockers"][0]["type"] == "unsupported_model_profile_route"
-    assert "real cppmega_mlx.recipes.model_factory" in payload["blockers"][0]["reason"]
+    assert payload["blockers"][0]["type"] == "unit_test_route_called"
+    assert payload["blockers"][0]["reason"] == "unit-test local_gb10_quarter route called"
     assert payload["workload"]["model_profile"] == "local_gb10_quarter"
     assert payload["workload"]["grad_checkpoint"] is False
     assert payload["training"]["steps_completed"] == 0
@@ -669,14 +693,37 @@ def test_local_gb10_quarter_training_fails_closed_before_tiny_route(
     assert payload["acceptance_gate"]["model_identity_ok"] is False
 
 
-def test_local_gb10_quarter_grad_checkpoint_fails_closed_before_tiny_route(
+def test_local_gb10_quarter_grad_checkpoint_routes_to_monkeypatchable_seam(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    route_calls: list[tuple[m04_train_step.TrainHybridTinyConfig, Path]] = []
+
     def fail_train(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
         raise AssertionError("HybridTinyLM training route must not be called")
 
+    def fake_local_gb10_route(
+        _args: Any,
+        *,
+        config: m04_train_step.TrainHybridTinyConfig,
+        data_path: Path,
+    ) -> tuple[dict[str, Any], int]:
+        route_calls.append((config, data_path))
+        return (
+            m04_train_step.blocked_receipt(
+                _args,
+                "unit-test local_gb10_quarter grad-checkpoint route called",
+                "unit_test_route_called",
+            ),
+            2,
+        )
+
     monkeypatch.setattr(m04_train_step, "train_hybrid_tiny", fail_train)
+    monkeypatch.setattr(
+        m04_train_step,
+        "run_local_gb10_quarter_training",
+        fake_local_gb10_route,
+    )
     args = m04_train_step.build_parser().parse_args(
         [
             "--synthetic",
@@ -690,9 +737,18 @@ def test_local_gb10_quarter_grad_checkpoint_fails_closed_before_tiny_route(
 
     payload, exit_code = m04_train_step.run_receipt(args)
 
+    assert len(route_calls) == 1
+    config, data_path = route_calls[0]
+    assert config.model_profile == "local_gb10_quarter"
+    assert config.grad_checkpoint is True
+    assert config.data_format == "npz"
+    assert data_path.suffix == ".npz"
     assert exit_code == 2
     assert payload["status"] == "blocked"
-    assert payload["blockers"][0]["type"] == "unsupported_model_profile_route"
+    assert payload["blockers"][0]["type"] == "unit_test_route_called"
+    assert payload["blockers"][0]["reason"] == (
+        "unit-test local_gb10_quarter grad-checkpoint route called"
+    )
     assert payload["workload"]["model_profile"] == "local_gb10_quarter"
     assert payload["workload"]["grad_checkpoint"] is True
     assert payload["training"]["steps_completed"] == 0

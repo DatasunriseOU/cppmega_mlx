@@ -4,11 +4,21 @@ from importlib import import_module
 from types import ModuleType
 from typing import TYPE_CHECKING
 
-_SUBPACKAGES = ("config", "data", "kernels", "models", "nn", "recipes", "training")
+_SUBPACKAGES = (
+    "config",
+    "data",
+    "inference",
+    "kernels",
+    "models",
+    "nn",
+    "recipes",
+    "training",
+)
 
 if TYPE_CHECKING:
     from . import config as config
     from . import data as data
+    from . import inference as inference
     from . import kernels as kernels
     from . import models as models
     from . import nn as nn
@@ -19,6 +29,7 @@ __all__ = [
     "__version__",
     "config",
     "data",
+    "inference",
     "kernels",
     "models",
     "nn",
