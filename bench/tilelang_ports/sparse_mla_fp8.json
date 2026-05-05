@@ -41,21 +41,21 @@
     "transpose_B": true,
     "features": {
       "kernel_void": 1,
-      "fp8_e4m3_decode_helper": 1,
-      "scalar_fp8_byte_decode": 1,
+      "fp8_e4m3_decode_helper": 2,
+      "scalar_fp8_byte_decode": 0,
       "scalar_fp8_byte_decode_calls": 0,
       "tvm_thread_allreduce": 0,
-      "simd_sum": 1,
-      "simd_shuffle_down": 0,
+      "simd_sum": 0,
+      "simd_shuffle_down": 5,
       "A_scale_refs": 1,
       "B_scale_refs": 1,
       "signature_has_A_scale": true,
       "signature_has_B_scale": true,
       "per_row_B_scale": true,
-      "reinterpret_cast": 2,
-      "device_const_uint": 4,
+      "reinterpret_cast": 0,
+      "device_const_uint": 0,
       "uchar4": 0,
-      "fp8_e4m3_lut": 9,
+      "fp8_e4m3_lut": 0,
       "metal_fp8_dot4_helper": 2,
       "threadgroup_half": false,
       "qk_shape": "m1_n_topk_k",
@@ -63,24 +63,24 @@
       "runnable_qk_reduce_available": true,
       "runnable_qk_reduce_reason": "TileLang Path C FP8 Sparse-MLA real QK reducer is dispatchable for M=1/topk with per-row B scales",
       "legacy_fp8_scaled_matmul_probe_available": false,
-      "legacy_fp8_scaled_matmul_probe_reason": "TileLang Path C FP8 Sparse-MLA QK is not safe to dispatch: no simdgroup_multiply_accumulate; scale operands disappeared from emitted MSL; scalar fallback markers present; Sparse-MLA M=1/topk tile violates current Metal FP8 simdgroup tile constraints",
+      "legacy_fp8_scaled_matmul_probe_reason": "TileLang Path C FP8 Sparse-MLA QK is not safe to dispatch: no simdgroup_multiply_accumulate; Sparse-MLA M=1/topk tile violates current Metal FP8 simdgroup tile constraints",
       "legacy_fp8_scaled_matmul_probe_kernel_void": 1,
       "legacy_fp8_scaled_matmul_probe_simdgroup_multiply_accumulate": 0,
       "legacy_fp8_scaled_matmul_probe_simdgroup_load": 0,
       "legacy_fp8_scaled_matmul_probe_simdgroup_store": 0,
-      "legacy_fp8_scaled_matmul_probe_fp8_e4m3_decode_helper": 3,
-      "legacy_fp8_scaled_matmul_probe_A_scale_refs": 0,
-      "legacy_fp8_scaled_matmul_probe_B_scale_refs": 0,
-      "legacy_fp8_scaled_matmul_probe_signature_has_A_scale": false,
-      "legacy_fp8_scaled_matmul_probe_signature_has_B_scale": false,
-      "legacy_fp8_scaled_matmul_probe_float_a_val": true,
-      "legacy_fp8_scaled_matmul_probe_float_b_val": true,
+      "legacy_fp8_scaled_matmul_probe_fp8_e4m3_decode_helper": 2,
+      "legacy_fp8_scaled_matmul_probe_A_scale_refs": 1,
+      "legacy_fp8_scaled_matmul_probe_B_scale_refs": 1,
+      "legacy_fp8_scaled_matmul_probe_signature_has_A_scale": true,
+      "legacy_fp8_scaled_matmul_probe_signature_has_B_scale": true,
+      "legacy_fp8_scaled_matmul_probe_float_a_val": false,
+      "legacy_fp8_scaled_matmul_probe_float_b_val": false,
       "legacy_fp8_scaled_matmul_probe_threadgroup_half": false
     }
   },
   "path_c_tilelang_qk_scaled_matmul_probe_status": {
     "available": false,
-    "reason": "TileLang Path C FP8 Sparse-MLA QK is not safe to dispatch: no simdgroup_multiply_accumulate; scale operands disappeared from emitted MSL; scalar fallback markers present; Sparse-MLA M=1/topk tile violates current Metal FP8 simdgroup tile constraints",
+    "reason": "TileLang Path C FP8 Sparse-MLA QK is not safe to dispatch: no simdgroup_multiply_accumulate; Sparse-MLA M=1/topk tile violates current Metal FP8 simdgroup tile constraints",
     "target": "metal",
     "m": 1,
     "n": 16,
@@ -91,13 +91,13 @@
       "simdgroup_multiply_accumulate": 0,
       "simdgroup_load": 0,
       "simdgroup_store": 0,
-      "fp8_e4m3_decode_helper": 3,
-      "A_scale_refs": 0,
-      "B_scale_refs": 0,
-      "signature_has_A_scale": false,
-      "signature_has_B_scale": false,
-      "float_a_val": true,
-      "float_b_val": true,
+      "fp8_e4m3_decode_helper": 2,
+      "A_scale_refs": 1,
+      "B_scale_refs": 1,
+      "signature_has_A_scale": true,
+      "signature_has_B_scale": true,
+      "float_a_val": false,
+      "float_b_val": false,
       "threadgroup_half": false
     }
   },
@@ -112,21 +112,21 @@
     "vec": 4,
     "features": {
       "kernel_void": 1,
-      "fp8_e4m3_decode_helper": 1,
-      "scalar_fp8_byte_decode": 1,
+      "fp8_e4m3_decode_helper": 2,
+      "scalar_fp8_byte_decode": 0,
       "scalar_fp8_byte_decode_calls": 0,
       "tvm_thread_allreduce": 0,
-      "simd_sum": 1,
-      "simd_shuffle_down": 0,
+      "simd_sum": 0,
+      "simd_shuffle_down": 5,
       "A_scale_refs": 1,
       "B_scale_refs": 1,
       "signature_has_A_scale": true,
       "signature_has_B_scale": true,
       "per_row_B_scale": true,
-      "reinterpret_cast": 2,
-      "device_const_uint": 4,
+      "reinterpret_cast": 0,
+      "device_const_uint": 0,
       "uchar4": 0,
-      "fp8_e4m3_lut": 9,
+      "fp8_e4m3_lut": 0,
       "metal_fp8_dot4_helper": 2,
       "threadgroup_half": false,
       "qk_shape": "m1_n_topk_k"
@@ -149,12 +149,12 @@
     "vec": 4,
     "features": {
       "kernel_void": 1,
-      "fp8_e4m3_decode_helper": 1,
-      "scalar_fp8_byte_decode": 1,
+      "fp8_e4m3_decode_helper": 2,
+      "scalar_fp8_byte_decode": 0,
       "scalar_fp8_byte_decode_calls": 0,
       "tvm_thread_allreduce": 0,
-      "simd_sum": 1,
-      "simd_shuffle_down": 0,
+      "simd_sum": 0,
+      "simd_shuffle_down": 5,
       "q_scale_refs": 1,
       "kv_scale_refs": 1,
       "indices_refs": 2,
@@ -164,10 +164,10 @@
       "signature_has_indices": true,
       "signature_has_sm_scale": true,
       "invalid_index_guard": true,
-      "reinterpret_cast": 2,
-      "device_const_uint": 4,
+      "reinterpret_cast": 0,
+      "device_const_uint": 0,
       "uchar4": 0,
-      "fp8_e4m3_lut": 9,
+      "fp8_e4m3_lut": 0,
       "metal_fp8_dot4_helper": 2,
       "threadgroup_half": false,
       "qk_shape": "indexed_b_s_h_topk_k"
@@ -211,70 +211,68 @@
   "bench": {
     "bf16_reference": {
       "label": "bf16_reference",
-      "median_ms": 0.2738339826464653,
-      "min_ms": 0.2565840259194374,
-      "max_ms": 0.4980410449206829,
-      "iters": 50
+      "median_ms": 0.2668329980224371,
+      "min_ms": 0.24599999596830457,
+      "max_ms": 0.6180829950608313,
+      "iters": 25
     },
     "fp8_reference": {
       "label": "fp8_reference",
-      "median_ms": 0.3346248995512724,
-      "min_ms": 0.31416607089340687,
-      "max_ms": 0.43320818804204464,
-      "iters": 50
+      "median_ms": 0.31608300196239725,
+      "min_ms": 0.29516700305975974,
+      "max_ms": 1.0121669984073378,
+      "iters": 25
     },
     "quantized_matmul_reference": {
       "label": "quantized_matmul_reference",
-      "median_ms": 0.2645421773195267,
-      "min_ms": 0.24854205548763275,
-      "max_ms": 0.3612081054598093,
-      "iters": 50
+      "median_ms": 0.2572919984231703,
+      "min_ms": 0.24074999964796007,
+      "max_ms": 0.3806249951594509,
+      "iters": 25
     },
     "path_b_msl_fp8_fwd": {
       "label": "path_b_msl_fp8_fwd",
-      "median_ms": 0.20362483337521553,
-      "min_ms": 0.19141705706715584,
-      "max_ms": 0.27604191564023495,
-      "iters": 50
+      "median_ms": 0.20558400137815624,
+      "min_ms": 0.1974159968085587,
+      "max_ms": 0.9019159988383763,
+      "iters": 25
     },
     "path_b_msl_fp8_qk_vecmat": {
       "label": "path_b_msl_fp8_qk_vecmat",
-      "median_ms": 0.1444169320166111,
-      "min_ms": 0.12166588567197323,
-      "max_ms": 0.521959038451314,
-      "iters": 50
+      "median_ms": 0.13737500557908788,
+      "min_ms": 0.13137500354787335,
+      "max_ms": 0.17854099860414863,
+      "iters": 25
     },
     "path_c_tilelang_fp8_qk_reduce": {
       "label": "path_c_tilelang_fp8_qk_reduce",
-      "median_ms": 0.1356659922748804,
-      "min_ms": 0.11370796710252762,
-      "max_ms": 1.4927498996257782,
-      "iters": 50
+      "median_ms": 0.13395799760473892,
+      "min_ms": 0.11287500092294067,
+      "max_ms": 0.5470830001286231,
+      "iters": 25
     },
     "path_c_tilelang_fp8_indexed_qk_reduce": {
       "label": "path_c_tilelang_fp8_indexed_qk_reduce",
-      "median_ms": 0.25791581720113754,
-      "min_ms": 0.1371251419186592,
-      "max_ms": 2.473041880875826,
-      "iters": 50
+      "median_ms": 0.13462499919114634,
+      "min_ms": 0.1249999986612238,
+      "max_ms": 0.2247910015285015,
+      "iters": 25
     }
   },
   "ratios": {
-    "path_c_qk_reduce_over_path_b_qk_vecmat": 0.9394050294551047,
-    "path_c_indexed_qk_reduce_over_path_b_fwd": 1.266622606516176
+    "path_c_qk_reduce_over_path_b_qk_vecmat": 0.9751264215790567,
+    "path_c_indexed_qk_reduce_over_path_b_fwd": 0.6548418081595456
   },
   "qk_reducer_strict": {
-    "enabled": true,
+    "enabled": false,
     "scope": "qk_reducer_dispatch",
-    "passed": false,
+    "passed": true,
     "max_abs_err": 1e-05,
     "max_ratio": 1.0,
-    "failures": [
-      "path_c_indexed_qk_reduce_over_path_b_fwd=1.26662 exceeds 1"
-    ]
+    "failures": []
   },
   "strict": {
-    "enabled": true,
+    "enabled": false,
     "scope": "full_path_c_dispatch",
     "passed": false,
     "max_abs_err": 1e-05,

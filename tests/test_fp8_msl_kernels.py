@@ -1,9 +1,9 @@
 """Tests for the vendored FP8 (e4m3fn) MSL kernels.
 
-The kernels live in ``cppmega_mlx/nn/_tilelang/fp8_msl_kernels.py`` and are
-direct ports of the upstream AppMana / audiohacking Apple Silicon FP8
-sources (see module docstring for SHAs and license attribution). These
-tests exercise:
+The kernels live in ``cppmega_mlx/nn/_tilelang/fp8_msl_kernels.py`` and combine
+AppMana-style LUT decode kernels with audiohacking-compatible scalar FP8
+semantics (see module docstring for SHAs and license attribution). These tests
+exercise:
 
 1. Compile success: the kernels assemble and produce a non-None handle.
 2. Encode round-trip via the LUT decode is bit-exact against ``mx.from_fp8``

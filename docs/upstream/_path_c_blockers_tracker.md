@@ -98,13 +98,14 @@ B4_S1024_H8_D64; unreceipted shapes stay on Path B.
     <tr>
       <td>Sparse-MLA FP8 fwd/bwd</td>
       <td>Partial qk reducers have parity/timing receipts (QK-reduce<br>
-      C/B 0.864, indexed QK-reduce C/B 0.696), but they are not<br>
+      C/B 0.975, indexed QK-reduce C/B 0.655), but they are not<br>
       the strict full-dispatch gate. Full Path C QK remains<br>
       unavailable, so sparse_mla_fp8.json keeps the full Path C<br>
       gate red.</td>
-      <td>Extend the FP8 scaled-matmul scheduler so per-load scale<br>
-      fuses into the K loop, then add a full Sparse-MLA FP8 Path C<br>
-      wrapper/test pair that mirrors BF16 dkv_partial.</td>
+      <td>Keep the real packed-dot4 QK reducer as the dispatchable partial<br>
+      path, then add full Path C FP8 fwd/bwd composition. The<br>
+      standalone scaled-matmul macro probe is no longer the M==1<br>
+      vecmat blocker after the direct-global simdgroup lowering.</td>
     </tr>
     <tr>
       <td>Sparse-MLA blockscaled fwd/bwd (e8m0)</td>
@@ -129,10 +130,15 @@ uses Path C when available, and the checked-in receipt keeps every C/B ratio
 ergonomics and FP8 vecmat specialization, but it is not required to select
 Path C for topk today.
 
-### FP8 ops (2 ops, slower than B)
+### FP8 ops (matmul still slower; M==1 vecmat parity closed)
 
-These technically work via Path C but are 3-6× slower than Path B's
-audiohacking-style hand-written MSL. The win path is **fused scheduler**.
+These technically work via Path C. The hand-written Metal reference split
+matters: `/tmp/fp8-mps-metal` provides byte FP8 decode, 4-way K unroll,
+scale-after-accumulated-dot, and the M==1 `simd_sum` vecmat reducer; the
+cppmega.mlx/AppMana fast path adds packed `uint32` loads plus LUT-backed dot4
+decode. The win path is **real FP8 Metal scheduler/codegen**, not an algebraic
+rewrite of the same scalar multiply. As of the 2026-05-05 TileLang worktree
+receipt, M==1 vecmat is no longer the perf blocker; full matmul remains slower.
 
 <table>
   <thead>
@@ -145,19 +151,20 @@ audiohacking-style hand-written MSL. The win path is **fused scheduler**.
   <tbody>
     <tr>
       <td>FP8 scaled matmul (128³ e4m3 per-tensor)</td>
-      <td>✅ 0.555 ms (Path B 0.172 ms — 3.16× slower)</td>
-      <td>Fuse the per-load scale broadcast into the GemmMetalScalar<br>
-      K-loop. The audiohacking kernel does this; our DSL path<br>
-      emits a post-loop multiply. **NEW patch**:<br>
-      tilelang_metal_fp8_scaled_matmul_fused_scheduler.</td>
+      <td>✅ 0.242 ms (audiohacking 0.157 ms — 1.54× slower)</td>
+      <td>Lower the FP8 hot loop to real Metal codegen: preserve the<br>
+      audiohacking byte-decode/unrolled-dot/scale-after-dot contract,<br>
+      then add the local cppmega.mlx/AppMana packed uint32 + LUT-dot4<br>
+      fast path where alignment and layout make it legal. The retired<br>
+      macro rewrite is not a performance path.</td>
     </tr>
     <tr>
       <td>FP8 scaled vecmat (M=1 N=K=4096 e4m3)</td>
-      <td>✅ 1.098 ms (Path B 0.182 ms — 6.01× slower)</td>
-      <td>Same as matmul + simdgroup_sum reduction for M=1<br>
-      specialization. Path B uses hand-written simd_sum; DSL needs<br>
-      a T.simdgroup_reduce_sum primitive. **NEW patch**: extend<br>
-      the fused scheduler with simdgroup-sum specialization.</td>
+      <td>✅ 0.239 ms (audiohacking 0.282 ms — 0.85×)</td>
+      <td>Parity closed locally: TileLang now emits direct-global<br>
+      transpose_B vecmat with packed FP8 dot4, 4-way K unroll,<br>
+      simdgroup_sum reduction, no C_shared staging/barrier, and scales<br>
+      applied after the SIMD dot reduction.</td>
     </tr>
   </tbody>
 </table>
@@ -166,12 +173,25 @@ audiohacking-style hand-written MSL. The win path is **fused scheduler**.
 
 ## Suggested upstream patch roadmap (artifact order)
 
-The local docs/upstream/ artifact and probe directories already exist for the
-three Path C follow-ups below. They still need apply-to-apple-head verification
-and upstream filing. All stack on top of
+The local docs/upstream/ artifact and probe directories track the three Path C
+follow-ups below. Patch A shipped locally; patches B/C were filed as #2146/#2147,
+but B's original performance framing was wrong. The local B artifact is now a
+documentation-only tombstone until a real scheduler/codegen implementation
+replaces it. All real upstream code patches stack on top of
 jorgecurious/tilelang:metal-gemm-upstream-rebase (PR #2130) plus our existing
 tilelang_metal_pipelined, tilelang_metal_fp8, tilelang_metal_fp8_scaled_matmul
 patches. Each patch adds another link in the dependency chain.
+
+2026-05-05 update: the local sparse FP8 QK reducer no longer depends on the
+legacy scaled-matmul macro probe for M==1/topk. It lowers through the active
+packed `__tvm_fp8_e4m3_dot4_packed` Metal path, applies scales after the dot,
+uses a finite fp32-min sentinel for invalid indices because current TileLang
+Metal cannot lower `T.infinity`, and the refreshed M4 Max receipt reports
+QK-reduce C/B=0.975 and indexed-QK C/B=0.655 with zero invalid-index mismatch.
+The TileLang `/private/tmp/tl_pr_c` M==1 vecmat receipt now reports
+`0.239 ms` versus audiohacking `0.282 ms` (`0.85×`) on the same M4 Max path.
+The full-dispatch sparse FP8 gate intentionally stays red until fwd/bwd
+composition is implemented and the remaining full-matmul gap is closed.
 
 <table>
   <thead>
@@ -195,12 +215,14 @@ patches. Each patch adds another link in the dependency chain.
     </tr>
     <tr>
       <td>**B**</td>
-      <td>tilelang_metal_fp8_scaled_matmul_fused_scheduler (fuse per-<br>
-      load scale into GemmMetalScalar K-loop)</td>
-      <td>FP8 matmul/vecmat speed parity and Sparse-MLA FP8 Path C<br>
-      composition</td>
-      <td>medium-high (~250 LOC, scheduler pass)</td>
-      <td>**HIGH** — remaining Sparse-MLA FP8 blocker</td>
+      <td>tilelang_metal_fp8_scaled_matmul_fused_scheduler (currently a<br>
+      tombstone for the retired algebraic patch; replacement is the<br>
+      active packed FP8 Metal scheduler/codegen path)</td>
+      <td>Full FP8 matmul speed parity and Sparse-MLA FP8 Path C<br>
+      composition; M==1 vecmat parity is closed locally</td>
+      <td>medium/high (continue scheduler/codegen pass from the<br>
+      direct-global vecmat lowering)</td>
+      <td>**HIGH** — remaining full-matmul Sparse-MLA FP8 blocker</td>
     </tr>
     <tr>
       <td>**C**</td>
@@ -223,16 +245,18 @@ coverage plus optional reduction ergonomics.
 
 ## What this means for current PR filing
 
-The 3 rebase agents (mixed_dtype, fp8_gemm, fp8_vector) are putting our
-existing patches on top of jorgecurious/tilelang:metal-gemm-upstream-rebase.
-**These are not the end of the story** — local artifact/probe directories for
-patches A through C above already exist, but they still need apply-to-apple-head
-verification and upstream filing before they become upstreamed Path C coverage.
+The 3 rebase agents (mixed_dtype, fp8_gemm, fp8_vector) put the foundation
+patches on top of jorgecurious/tilelang:metal-gemm-upstream-rebase. **These are
+not the end of the story** — local artifact/probe directories for patches A
+through C track the remaining Path C coverage. A shipped locally; B/C were filed,
+but B's local artifact is now only a tombstone for the retired algebraic
+scaled-operands patch. It is not applyable scheduler/codegen work.
 
 The filing pack should explicitly say:
-- "Current 8 patches are the foundation; Path C ports surfaced A/B/C follow-up gaps"
-- "Each A/B/C follow-up has a local docs/upstream/<name>/ artifact/probe directory, but still needs apply-to-apple-head verification and upstream filing"
-- "All of them stack on PR #2130 (or whatever upstream Apple Metal PR series eventually merges)"
+- "Current filed patches are the foundation; Path C ports surfaced A/B/C follow-up gaps"
+- "Each A/B/C follow-up has a local docs/upstream/<name>/ artifact/probe directory with current status"
+- "Patch B's #2146 macro rewrite is retired; real FP8 speed parity still needs Metal scheduler/codegen work"
+- "All of them stack on PR #2130 / #2142 (or whatever upstream Apple Metal PR series eventually merges)"
 
 ---
 
@@ -274,7 +298,7 @@ upstream tile-ai/tilelang main
   Our: tilelang_metal_fp8_vector       (rebased 2026-05-04, depends on tilelang_metal_fp8)
   Our: tilelang_metal_fp8_scaled_matmul (clean apply on PR #2130, frontend macro)
   Our: tilelang_metal_shared_dyn       (no-op investigation artifact, not a code PR)
-  ↑ LOCAL ARTIFACTS / PROBES EXIST; NEED APPLY-TO-APPLE-HEAD + UPSTREAM FILING
-  Patch A: tilelang_metal_pipelined_32x32
-  Patch B: tilelang_metal_fp8_scaled_matmul_fused_scheduler  (DRAFTED, PROBE-FAILED 2026-05-04 — patch targets a tileop/gemm scheduler hierarchy that does not exist on apple-head; T.fp8_scaled_matmul is a @T.macro on PR #2142, not a tileop scheduler. Needs re-draft.)
-  Patch C: tilelang_metal_blockscaled_e8m0          (when blockscaled Path C lands)
+  ↑ LOCAL ARTIFACTS / PROBES EXIST; TRACK CURRENT FOLLOW-UP STATUS
+  Patch A: tilelang_metal_pipelined_32x32           (local shipped)
+  Patch B: tilelang_metal_fp8_scaled_matmul_fused_scheduler  (FILED #2146, RETIRED LOCALLY 2026-05-04 — the algebraic scaled-operands patch is not applyable here and does not close the local Path B FP8 MSL gap. The local MLX/Metal Path C story is scale-after-dot plus packed uint32/LUT dot4 decode, 4-way K stride, and simd_sum vecmat reduction in cppmega_mlx/nn/_tilelang/fp8_vecmat_path_c.py; the real upstream work remains a packed FP8 Metal scheduler/codegen path.)
+  Patch C: tilelang_metal_blockscaled_e8m0          (FILED #2147; keep apply checks against the active prereq stack)

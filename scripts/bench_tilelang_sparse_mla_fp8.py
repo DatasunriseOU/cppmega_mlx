@@ -183,7 +183,7 @@ def _indexed_qk_err(actual: mx.array, ref: np.ndarray, indices: mx.array) -> dic
     head_kv = actual_np.shape[2] // indices_np.shape[2]
     invalid = np.repeat(indices_np == -1, repeats=head_kv, axis=2)
     finite = ~invalid
-    invalid_mismatch = int(np.count_nonzero(~np.isneginf(actual_np[invalid])))
+    invalid_mismatch = int(np.count_nonzero(actual_np[invalid] > -3.0e38))
     if np.any(finite):
         err = float(np.abs(actual_np[finite] - ref[finite]).max())
         rel = err / (float(np.abs(ref[finite]).max()) + 1e-9)

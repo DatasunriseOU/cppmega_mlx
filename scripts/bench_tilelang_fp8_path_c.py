@@ -45,6 +45,7 @@ np: Any = None
 mx: Any = None
 torch: Any = None
 fp8_msl_status: Any = None
+_FP8_MATMUL_BODY: Any = None
 fp8_scaled_matmul_raw: Any = None
 fp8_scaled_vecmat: Any = None
 canonical_vecmat_runtime_body: Any = None
@@ -58,6 +59,7 @@ def _require_bench_deps() -> None:
 
     global TILELANG_METAL_VECMAT_TARGET
     global canonical_vecmat_runtime_body
+    global _FP8_MATMUL_BODY
     global fp8_msl_status
     global fp8_scaled_matmul_raw
     global fp8_scaled_vecmat
@@ -82,11 +84,13 @@ def _require_bench_deps() -> None:
         torch = _torch
     if fp8_msl_status is None:
         from cppmega_mlx.nn._tilelang.fp8_msl_kernels import (
+            _FP8_MATMUL_BODY as _fp8_matmul_body,
             fp8_msl_status as _fp8_msl_status,
             fp8_scaled_matmul_raw as _fp8_scaled_matmul_raw,
             fp8_scaled_vecmat as _fp8_scaled_vecmat,
         )
 
+        _FP8_MATMUL_BODY = _fp8_matmul_body
         fp8_msl_status = _fp8_msl_status
         fp8_scaled_matmul_raw = _fp8_scaled_matmul_raw
         fp8_scaled_vecmat = _fp8_scaled_vecmat
@@ -107,6 +111,11 @@ def _require_bench_deps() -> None:
 
 
 Shape = dict[str, Any]
+
+PATH_B_MATMUL_LABEL = "path_b_msl_fp8_scaled_matmul"
+PATH_C_MATMUL_LABEL = "path_c_mlx_metal_fp8_scaled_matmul"
+PATH_B_VECMAT_LABEL = "path_b_msl_fp8_scaled_vecmat"
+PATH_C_VECMAT_LABEL = "path_c_mlx_tilelang_fp8_scaled_vecmat"
 
 SHAPES: dict[str, Shape] = {
     "tiny_128": {

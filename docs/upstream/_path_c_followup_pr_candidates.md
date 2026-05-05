@@ -72,7 +72,7 @@ These aliases mirror CUDA's `blockIdx.x` / `threadIdx.x` notation but aren't req
 The Path C blocker tracker (`docs/upstream/_path_c_blockers_tracker.md`) already lists 5 future patches (A-E). Three of them are concrete and worth filing once we have a working scheduler/layout implementation:
 
 - **A** `tilelang_metal_pipelined_32x32` — extend our PR #2141 fix to 32×32 fragments. Needed for full sparse-MLA Path C parity.
-- **B** `tilelang_metal_fp8_scaled_matmul_fused_scheduler` — scheduler pass that fuses per-load scale into the GemmMetalScalar K-loop, closing the 3-6× gap to audiohacking MSL.
+- **B** `tilelang_metal_fp8_scaled_matmul_fused_scheduler` — real FP8 Metal scheduler/codegen work: preserve audiohacking-compatible scalar semantics, 4-way K unroll, scale-after-accumulated-dot, and M==1 `simd_sum`, then add the local cppmega.mlx/AppMana packed loads plus LUT/dot4 decode where legal. The current macro rewrite is only algebraically identical scaffolding and does not close the local Path B FP8 MSL gap.
 - **C** `tilelang_metal_blockscaled_e8m0` — DSL primitive for e8m0 block-scale layout.
 
 These are larger pieces of work than candidates #1 and #2 — they need real implementation, not just patches.

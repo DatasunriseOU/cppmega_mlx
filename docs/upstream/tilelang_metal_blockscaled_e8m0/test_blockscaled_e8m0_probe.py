@@ -68,12 +68,22 @@ def test_patch_rejects_partial_or_inconsistent_e8m0_metadata() -> None:
 
 def test_patch_locks_concrete_e8m0_decode_semantics() -> None:
     normalized = _without_diff_markers(_read(PATCH_PATH))
+    section = _patch_file_section("tilelang/language/blockscaled_layout.py")
+    section_normalized = _without_diff_markers(section)
 
+    assert "def e8m0_to_float(bits):" in section_normalized
     assert "bits_i == T.int32(0)" in normalized
     assert "bits_i == T.int32(255)" in normalized
     assert "bits_i - T.int32(127)" in normalized
     assert "T.exp2" in normalized
     assert "T.if_then_else" in normalized
+
+
+def test_patch_does_not_create_or_import_tileop_metal_quant() -> None:
+    patch = _read(PATCH_PATH)
+
+    assert "tilelang/tileop/metal_quant.py" not in patch
+    assert "from tilelang.tileop.metal_quant" not in patch
 
 
 def test_patch_targets_current_fp8_scaled_matmul_macro_prereq_shape() -> None:
@@ -90,6 +100,24 @@ def test_patch_targets_current_fp8_scaled_matmul_macro_prereq_shape() -> None:
     assert "return _fp8_scaled_matmul_macro(A_fp8, A_scale, B_fp8, B_scale, C_out, layout)" in normalized
     assert "_block_scale_value(A_scale, axis=\"A\", col=j, k=k)" in normalized
     assert "_block_scale_value(B_scale, axis=\"B\", col=j, k=k)" in normalized
+
+
+def test_patch_does_not_reintroduce_false_fused_scale_perf_claims() -> None:
+    normalized = _without_diff_markers(_read(PATCH_PATH))
+
+    forbidden = [
+        "dequant + fused-scale FMA",
+        "fuse the selected scales",
+        "closes the audiohacking gap",
+        "close the audiohacking gap",
+        "3-6x gap",
+        "3-6× gap",
+    ]
+    for marker in forbidden:
+        assert marker not in normalized
+
+    assert "dequant + algebraic scale form" in normalized
+    assert "expose the algebraic scaled-operands form" in normalized
 
 
 def test_patch_locks_contracted_k_shape_and_indexing_rules() -> None:

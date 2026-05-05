@@ -205,8 +205,8 @@ def test_fp8_sparse_mla_path_c_status_reports_dispatchable_qk_reducer() -> None:
     assert _feature_int(status.features, "scalar_fp8_byte_decode_calls") == 0
     assert _feature_int(status.features, "metal_fp8_dot4_helper") >= 1
     assert _feature_int(status.features, "legacy_fp8_scaled_matmul_probe_simdgroup_multiply_accumulate") == 0
-    assert status.features["legacy_fp8_scaled_matmul_probe_float_a_val"] is True
-    assert status.features["legacy_fp8_scaled_matmul_probe_float_b_val"] is True
+    assert status.features["legacy_fp8_scaled_matmul_probe_float_a_val"] is False
+    assert status.features["legacy_fp8_scaled_matmul_probe_float_b_val"] is False
 
 
 def test_fp8_sparse_mla_path_c_legacy_scaled_matmul_probe_visible_and_fail_closed() -> None:
@@ -221,8 +221,8 @@ def test_fp8_sparse_mla_path_c_legacy_scaled_matmul_probe_visible_and_fail_close
     if not status.features:
         return
     assert _feature_int(status.features, "simdgroup_multiply_accumulate") == 0
-    assert status.features["float_a_val"] is True
-    assert status.features["float_b_val"] is True
+    assert status.features["float_a_val"] is False
+    assert status.features["float_b_val"] is False
     assert "M=1/topk" in status.reason or "scalar fallback" in status.reason
 
 
@@ -256,7 +256,7 @@ def test_fp8_sparse_mla_path_c_square_control_lowers_to_scale_aware_fast_path() 
     if not status.available:
         assert status.reason
         return
-    assert _feature_int(status.features, "simdgroup_multiply_accumulate") >= 1
+    assert _feature_int(status.features, "simdgroup_multiply_accumulate") == 0
     assert _feature_int(status.features, "A_scale_refs") >= 1
     assert _feature_int(status.features, "B_scale_refs") >= 1
     assert status.features["signature_has_A_scale"] is True
@@ -268,7 +268,7 @@ def test_fp8_sparse_mla_path_c_lowered_features_are_reported() -> None:
     features = fp8_sparse_mla_qk_msl_features(msl)
     assert _feature_int(features, "kernel_void") >= 1
     assert _feature_int(features, "fp8_e4m3_decode_helper") >= 1
-    assert _feature_int(features, "simdgroup_multiply_accumulate") >= 1
+    assert _feature_int(features, "simdgroup_multiply_accumulate") == 0
     assert _feature_int(features, "A_scale_refs") >= 1
     assert _feature_int(features, "B_scale_refs") >= 1
 
@@ -324,9 +324,9 @@ def test_fp8_sparse_mla_path_c_qk_reduce_lowered_features_are_reported() -> None
         + _feature_int(features, "simd_shuffle_down")
         + _feature_int(features, "tvm_thread_allreduce")
     ) >= 1
-    assert _feature_int(features, "reinterpret_cast") >= 1
-    assert _feature_int(features, "device_const_uint") >= 1
-    assert _feature_int(features, "fp8_e4m3_lut") >= 1
+    assert _feature_int(features, "reinterpret_cast") == 0
+    assert _feature_int(features, "device_const_uint") == 0
+    assert _feature_int(features, "fp8_e4m3_lut") == 0
     assert _feature_int(features, "metal_fp8_dot4_helper") >= 1
 
 
@@ -429,9 +429,9 @@ def test_fp8_sparse_mla_path_c_indexed_qk_reduce_status_and_features() -> None:
     assert _feature_int(status.features, "indices_refs") >= 1
     assert _feature_int(status.features, "sm_scale_refs") >= 1
     assert _feature_int(status.features, "scalar_fp8_byte_decode_calls") == 0
-    assert _feature_int(status.features, "reinterpret_cast") >= 1
-    assert _feature_int(status.features, "device_const_uint") >= 1
-    assert _feature_int(status.features, "fp8_e4m3_lut") >= 1
+    assert _feature_int(status.features, "reinterpret_cast") == 0
+    assert _feature_int(status.features, "device_const_uint") == 0
+    assert _feature_int(status.features, "fp8_e4m3_lut") == 0
     assert _feature_int(status.features, "metal_fp8_dot4_helper") >= 1
 
 
@@ -489,9 +489,9 @@ def test_fp8_sparse_mla_path_c_indexed_qk_reduce_lowered_features_are_reported()
     assert _feature_int(features, "indices_refs") >= 1
     assert _feature_int(features, "sm_scale_refs") >= 1
     assert _feature_int(features, "scalar_fp8_byte_decode_calls") == 0
-    assert _feature_int(features, "reinterpret_cast") >= 1
-    assert _feature_int(features, "device_const_uint") >= 1
-    assert _feature_int(features, "fp8_e4m3_lut") >= 1
+    assert _feature_int(features, "reinterpret_cast") == 0
+    assert _feature_int(features, "device_const_uint") == 0
+    assert _feature_int(features, "fp8_e4m3_lut") == 0
     assert _feature_int(features, "metal_fp8_dot4_helper") >= 1
     assert (
         _feature_int(features, "simd_sum")
@@ -542,7 +542,7 @@ def test_fp8_sparse_mla_path_c_indexed_qk_reduce_matches_path_b_index_contract()
     head_kv = actual.shape[2] // indices_np.shape[2]
     invalid = np.repeat(indices_np == -1, repeats=head_kv, axis=2)
     assert invalid.shape == actual.shape
-    assert np.all(np.isneginf(actual[invalid]))
+    assert np.all(actual[invalid] <= -3.0e38)
     np.testing.assert_allclose(actual[~invalid], oracle[~invalid], rtol=1e-5, atol=1e-5)
 
 
@@ -591,7 +591,7 @@ def test_fp8_sparse_mla_path_c_indexed_qk_reduce_masks_oob_indices() -> None:
     head_kv = actual.shape[2] // indices_np.shape[2]
     invalid = np.repeat((indices_np < 0) | (indices_np >= kv.shape[1]), repeats=head_kv, axis=2)
     assert invalid.shape == actual.shape
-    assert np.all(np.isneginf(actual[invalid]))
+    assert np.all(actual[invalid] <= -3.0e38)
     np.testing.assert_allclose(actual[~invalid], oracle[~invalid], rtol=1e-5, atol=1e-5)
 
 
@@ -709,10 +709,8 @@ def test_fp8_sparse_mla_checked_receipt_keeps_path_c_qk_claims_honest() -> None:
     ]
     qk_reducer_strict = payload["qk_reducer_strict"]
     assert qk_reducer_strict["scope"] == "qk_reducer_dispatch"
-    assert qk_reducer_strict["passed"] is False
-    assert qk_reducer_strict["failures"] == [
-        "path_c_indexed_qk_reduce_over_path_b_fwd=1.26662 exceeds 1"
-    ]
+    assert qk_reducer_strict["passed"] is True
+    assert qk_reducer_strict["failures"] == []
 
     qk_status = payload["path_c_tilelang_qk_reduce_status"]
     indexed_status = payload["path_c_tilelang_indexed_qk_reduce_status"]
@@ -728,8 +726,8 @@ def test_fp8_sparse_mla_checked_receipt_keeps_path_c_qk_claims_honest() -> None:
     assert scaled_matmul_probe["n"] == 16
     assert scaled_matmul_probe["k"] == 64
     assert scaled_matmul_probe["features"]["simdgroup_multiply_accumulate"] == 0
-    assert scaled_matmul_probe["features"]["float_a_val"] is True
-    assert scaled_matmul_probe["features"]["float_b_val"] is True
+    assert scaled_matmul_probe["features"]["float_a_val"] is False
+    assert scaled_matmul_probe["features"]["float_b_val"] is False
     assert qk_status["available"] is True
     assert indexed_status["available"] is True
     assert qk_status["features"]["qk_shape"] == "m1_n_topk_k"

@@ -763,7 +763,7 @@ MSL contains simdgroup_multiply_accumulate: False  (correctly: scalar fallback p
 xcrun --sdk macosx metal -c /tmp/test_fp8_gemm.metal: exit 0
 
 
-Emitted MSL inner loop (audiohacking fp8_scaled_matmul_kernel pattern):
+Emitted MSL inner loop (audiohacking-compatible scalar fp8_scaled_matmul pattern):
 
 msl
 for (int i_1 = 0; i_1 < 32; ++i_1) {
@@ -831,7 +831,7 @@ Agent C's VisitExpr_(CastNode) in codegen_metal.cc already lowers scalar T.cast(
 
 ### Performance / production path note
 
-The scalar path is ALU-bound on FP8 decode (one branch + a few shifts per byte) and won't match the throughput of simdgroup_multiply_accumulate on FP16. For sparse-MLA FP8 score paths the K-dim is small and the dequant overhead doesn't dominate. For larger GEMMs the production pattern is to pre-dequantise FP8 to FP16 in a fused load kernel and then run the matmul in FP16 with the simdgroup path — this is what audiohacking does for their high-throughput vec-mat case. We can revisit if a kernel becomes performance-critical.
+The scalar path is ALU-bound on FP8 decode (one branch + a few shifts per byte) and won't match the throughput of simdgroup_multiply_accumulate on FP16. For sparse-MLA FP8 score paths the K-dim is small and the dequant overhead doesn't dominate. For larger GEMMs, a possible production pattern is to pre-dequantise FP8 to FP16 in a fused load/staging kernel and then run the matmul in FP16 with the simdgroup path, but that is not what the checked audiohacking matmul/vecmat kernels do. We can revisit if a kernel becomes performance-critical.
 
 ## Update 2026-05-03 — TileLang Metal FP8 vector-cast + scaled-matmul stub
 
@@ -859,8 +859,8 @@ Two new patches landed on top of Agent C's tilelang_metal_fp8/0001-metal-fp8-sto
   - tilelang/language/__init__.py — export fp8_scaled_matmul.
   - testing/python/cpu/test_fp8_scaled_matmul_lowering.py — 8 CPU lowering tests.
   - testing/python/metal/test_fp8_scaled_matmul_metal.py — 17 Metal codegen/xcrun/e2e/bench tests.
-- **Effect**: T.fp8_scaled_matmul(A_fp8, A_scale, B_fp8, B_scale, C_out) expands inline to the audiohacking-style scalar K-loop: fp8 cast/dequant, scale multiply, fp32 accumulate. It no longer raises NotImplementedError on Metal, but it is still a macro expansion rather than a registered TIR op.
-- **Why macro baseline**: full Metal performance lowering still needs a registered op or scheduler hook that fuses scale/dequant into the GEMM K-loop and feeds an FP16 simdgroup path. This patch proves the scalar correctness/API baseline only.
+- **Effect**: T.fp8_scaled_matmul(A_fp8, A_scale, B_fp8, B_scale, C_out) expands inline to an audiohacking-compatible scalar K-loop: fp8 cast/dequant, scale multiply, fp32 accumulate. It no longer raises NotImplementedError on Metal, but it is still a macro expansion rather than a registered TIR op.
+- **Why macro baseline**: full Metal performance lowering still needs a registered op or scheduler/codegen hook that emits a real Metal hot loop or FP8-storage-to-half staging path; it is not macro scale reassociation. This patch proves the scalar correctness/API baseline only.
 - **Probe**: pytest reports 8 CPU + 17 Metal tests = 25 passed; MSL inspection asserts no simdgroup_multiply_accumulate.
 
 ### Path B blocker status — updated again

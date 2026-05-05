@@ -248,8 +248,9 @@ Metal for large FP8 GEMMs is to:
    byte is decoded once per tile), and
 2. Run the actual GEMM in FP16 with the simdgroup path.
 
-The same pattern audiohacking uses for their high-throughput
-fp8_scaled_vecmat_kernel.
+This is a possible production staging path, not what the checked audiohacking
+`fp8_scaled_vecmat_kernel` does. That kernel uses byte FP8 loads, scalar
+bit-extraction decode, 4-way unroll, and `simd_sum`.
 
 ## Files
 

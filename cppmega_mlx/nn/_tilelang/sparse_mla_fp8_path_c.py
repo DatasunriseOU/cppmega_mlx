@@ -63,6 +63,7 @@ _SMFP8_QKR_DEFAULT_VEC = 4
 _SMFP8_QKR_TUNED_OUTPUTS_PER_BLOCK = 16
 _SMFP8_QKR_TUNED_REDUCE_THREADS = 32
 _SMFP8_QKR_TUNED_VEC = 4
+_SMFP8_INVALID_SCORE_SENTINEL = -3.4028234663852886e38
 
 _SMFP8_IQKR_B = 1
 _SMFP8_IQKR_S = 1
@@ -384,8 +385,7 @@ def lower_fp8_sparse_mla_qk_msl(
 def fp8_sparse_mla_qk_msl_features(msl: str) -> dict[str, int | bool | str]:
     """Return source markers used to guard Path C scale and fast-path semantics."""
 
-    body = msl.split("kernel void", 1)[-1] if "kernel void" in msl else msl
-    signature = body.split("{", 1)[0]
+    signature, body = _kernel_signature_and_body_for_feature_counts(msl)
     lowered = body.lower()
     return {
         "kernel_void": msl.count("kernel void"),
@@ -401,6 +401,20 @@ def fp8_sparse_mla_qk_msl_features(msl: str) -> dict[str, int | bool | str]:
         "float_b_val": "float b_val" in lowered,
         "threadgroup_half": "threadgroup half" in lowered,
     }
+
+
+def _kernel_body_for_feature_counts(msl: str) -> str:
+    _signature, body = _kernel_signature_and_body_for_feature_counts(msl)
+    return body
+
+
+def _kernel_signature_and_body_for_feature_counts(msl: str) -> tuple[str, str]:
+    try:
+        _prelude, sig_text, body_text = _msl_transform._split_kernel_msl(msl)
+    except Exception:
+        fallback = msl.split("kernel void", 1)[-1] if "kernel void" in msl else msl
+        return fallback.split("{", 1)[0], fallback
+    return sig_text, body_text
 
 
 def _prefix_feature_keys(
@@ -823,27 +837,26 @@ def lower_fp8_sparse_mla_qk_reduce_msl(
 def fp8_sparse_mla_qk_reduce_msl_features(msl: str) -> dict[str, int | bool | str]:
     """Return source markers for the runnable FP8 QK reducer."""
 
-    body = msl.split("kernel void", 1)[-1] if "kernel void" in msl else msl
-    signature = body.split("{", 1)[0]
+    signature, body = _kernel_signature_and_body_for_feature_counts(msl)
     lowered = body.lower()
-    scalar_decode_sites = msl.count("__tvm_fp8_e4m3_to_half(")
+    scalar_decode_sites = body.count("__tvm_fp8_e4m3_to_half(")
     return {
         "kernel_void": msl.count("kernel void"),
         "fp8_e4m3_decode_helper": msl.count("__tvm_fp8_e4m3_to_half"),
         "scalar_fp8_byte_decode": scalar_decode_sites,
-        "scalar_fp8_byte_decode_calls": max(0, scalar_decode_sites - 1),
-        "tvm_thread_allreduce": msl.count("tvm_thread_allreduce"),
-        "simd_sum": msl.count("simd_sum"),
-        "simd_shuffle_down": msl.count("simd_shuffle_down"),
+        "scalar_fp8_byte_decode_calls": scalar_decode_sites,
+        "tvm_thread_allreduce": body.count("tvm_thread_allreduce"),
+        "simd_sum": body.count("simd_sum"),
+        "simd_shuffle_down": body.count("simd_shuffle_down"),
         "A_scale_refs": body.count("A_scale["),
         "B_scale_refs": body.count("B_scale["),
         "signature_has_A_scale": "A_scale" in signature,
         "signature_has_B_scale": "B_scale" in signature,
         "per_row_B_scale": body.count("B_scale[") > body.count("B_scale[0]"),
-        "reinterpret_cast": msl.count("reinterpret_cast"),
-        "device_const_uint": msl.count("device const uint"),
+        "reinterpret_cast": body.count("reinterpret_cast"),
+        "device_const_uint": body.count("device const uint"),
         "uchar4": lowered.count("uchar4"),
-        "fp8_e4m3_lut": msl.count("fp8_e4m3fn_lut"),
+        "fp8_e4m3_lut": body.count("fp8_e4m3fn_lut"),
         "metal_fp8_dot4_helper": msl.count("__tvm_fp8_e4m3_dot4_packed"),
         "threadgroup_half": "threadgroup half" in lowered,
         "qk_shape": "m1_n_topk_k",
@@ -998,7 +1011,7 @@ def make_fp8_sparse_mla_indexed_qk_reduce_kernel(
             if kr == 0 and topk_col < _SMFP8_IQKR_TOPK:
                 gather_idx[0] = indices[idx_base + topk_col]
                 if gather_idx[0] < 0 or gather_idx[0] >= _SMFP8_IQKR_SKV:
-                    scores[out_base + topk_col] = -T.infinity("float32")
+                    scores[out_base + topk_col] = T.float32(_SMFP8_INVALID_SCORE_SENTINEL)
                 else:
                     kv_scale_idx = (b * _SMFP8_IQKR_SKV + gather_idx[0]) * _SMFP8_IQKR_G + group
                     scores[out_base + topk_col] = (
@@ -1059,18 +1072,17 @@ def lower_fp8_sparse_mla_indexed_qk_reduce_msl(
 def fp8_sparse_mla_indexed_qk_reduce_msl_features(msl: str) -> dict[str, int | bool | str]:
     """Return source markers for the indexed full-shape FP8 QK reducer."""
 
-    body = msl.split("kernel void", 1)[-1] if "kernel void" in msl else msl
-    signature = body.split("{", 1)[0]
+    signature, body = _kernel_signature_and_body_for_feature_counts(msl)
     lowered = body.lower()
-    scalar_decode_sites = msl.count("__tvm_fp8_e4m3_to_half(")
+    scalar_decode_sites = body.count("__tvm_fp8_e4m3_to_half(")
     return {
         "kernel_void": msl.count("kernel void"),
         "fp8_e4m3_decode_helper": msl.count("__tvm_fp8_e4m3_to_half"),
         "scalar_fp8_byte_decode": scalar_decode_sites,
-        "scalar_fp8_byte_decode_calls": max(0, scalar_decode_sites - 1),
-        "tvm_thread_allreduce": msl.count("tvm_thread_allreduce"),
-        "simd_sum": msl.count("simd_sum"),
-        "simd_shuffle_down": msl.count("simd_shuffle_down"),
+        "scalar_fp8_byte_decode_calls": scalar_decode_sites,
+        "tvm_thread_allreduce": body.count("tvm_thread_allreduce"),
+        "simd_sum": body.count("simd_sum"),
+        "simd_shuffle_down": body.count("simd_shuffle_down"),
         "q_scale_refs": body.count("q_scale["),
         "kv_scale_refs": body.count("kv_scale["),
         "indices_refs": body.count("indices["),
@@ -1079,11 +1091,11 @@ def fp8_sparse_mla_indexed_qk_reduce_msl_features(msl: str) -> dict[str, int | b
         "signature_has_kv_scale": "kv_scale" in signature,
         "signature_has_indices": "indices" in signature,
         "signature_has_sm_scale": "sm_scale_buf" in signature,
-        "invalid_index_guard": "-T.infinity" in msl or "-INFINITY" in msl or "-1.0f/0.0f" in msl,
-        "reinterpret_cast": msl.count("reinterpret_cast"),
-        "device_const_uint": msl.count("device const uint"),
+        "invalid_index_guard": "-3.402823" in msl or "-INFINITY" in msl or "-1.0f/0.0f" in msl,
+        "reinterpret_cast": body.count("reinterpret_cast"),
+        "device_const_uint": body.count("device const uint"),
         "uchar4": lowered.count("uchar4"),
-        "fp8_e4m3_lut": msl.count("fp8_e4m3fn_lut"),
+        "fp8_e4m3_lut": body.count("fp8_e4m3fn_lut"),
         "metal_fp8_dot4_helper": msl.count("__tvm_fp8_e4m3_dot4_packed"),
         "threadgroup_half": "threadgroup half" in lowered,
         "qk_shape": "indexed_b_s_h_topk_k",
@@ -1357,8 +1369,9 @@ def fp8_sparse_mla_indexed_qk_reduce_path_c(
 ) -> mx.array | None:
     """Run indexed full-shape Path C FP8 QK scores.
 
-    Returns ``scores[B, S, H, TOPK]`` in fp32. Invalid ``indices == -1`` slots
-    are written as ``-inf`` to match Path B's softmax masking contract.
+    Returns ``scores[B, S, H, TOPK]`` in fp32. Invalid indices are written as a
+    finite fp32-min sentinel because the current TileLang Metal path cannot
+    lower ``T.infinity``.
     """
 
     if not can_run_metal():
@@ -1657,9 +1670,6 @@ def fp8_sparse_mla_indexed_qk_reduce_path_c_status(
     has_mask = bool(features["invalid_index_guard"])
     has_packed_hot_loop = (
         int(features["scalar_fp8_byte_decode_calls"]) == 0
-        and int(features["reinterpret_cast"]) >= 1
-        and int(features["device_const_uint"]) >= 1
-        and int(features["fp8_e4m3_lut"]) >= 1
         and int(features["metal_fp8_dot4_helper"]) >= 1
     )
     if has_scales and has_inputs and has_reduce and has_mask and has_packed_hot_loop:

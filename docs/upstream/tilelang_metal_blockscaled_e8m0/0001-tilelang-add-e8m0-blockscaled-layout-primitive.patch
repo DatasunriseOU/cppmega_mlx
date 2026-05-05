@@ -1,21 +1,6 @@
-From 07dbf580d65211b0ff0f87587eeb05cb6699bf65 Mon Sep 17 00:00:00 2001
-From: David Gornshtein <davidgornshtein@gmail.com>
-Date: Mon, 4 May 2026 16:45:26 +0200
-Subject: [PATCH] tilelang: add E8M0 block-scaled layout primitive
-
----
- .../cpu/test_blockscaled_e8m0_layout.py       | 154 ++++++++++++++++++
- tilelang/language/__init__.py                 |   2 +
- tilelang/language/blockscaled_layout.py       | 136 ++++++++++++++++
- tilelang/language/fp8_op.py                   | 115 +++++++++++--
- tilelang/tileop/metal_quant.py                |  12 +-
- 5 files changed, 403 insertions(+), 16 deletions(-)
- create mode 100644 testing/python/cpu/test_blockscaled_e8m0_layout.py
- create mode 100644 tilelang/language/blockscaled_layout.py
-
 diff --git a/testing/python/cpu/test_blockscaled_e8m0_layout.py b/testing/python/cpu/test_blockscaled_e8m0_layout.py
 new file mode 100644
-index 0000000..decb1a4
+index 00000000..68c2e63f
 --- /dev/null
 +++ b/testing/python/cpu/test_blockscaled_e8m0_layout.py
 @@ -0,0 +1,154 @@
@@ -170,11 +155,11 @@ index 0000000..decb1a4
 +def test_e8m0_decode_semantics_document_sentinels() -> None:
 +    src = T.e8m0_to_float
 +    text = getattr(src, "__doc__", "") or ""
-+    assert "byte == 0" in text
-+    assert "byte == 0xFF" in text
++    assert "byte 0" in text
++    assert "byte 0xFF" in text
 +    assert "byte - 127" in text
 diff --git a/tilelang/language/__init__.py b/tilelang/language/__init__.py
-index 5758dcf..e7041b7 100644
+index 5758dcf2..e7041b71 100644
 --- a/tilelang/language/__init__.py
 +++ b/tilelang/language/__init__.py
 @@ -114,6 +114,8 @@ from .builtin import stg128 as stg128  # noqa: F401
@@ -188,10 +173,10 @@ index 5758dcf..e7041b7 100644
  from .builtin import ballot as ballot  # noqa: F401
 diff --git a/tilelang/language/blockscaled_layout.py b/tilelang/language/blockscaled_layout.py
 new file mode 100644
-index 0000000..fcdbba5
+index 00000000..fcdbba5a
 --- /dev/null
 +++ b/tilelang/language/blockscaled_layout.py
-@@ -0,0 +1,136 @@
+@@ -0,0 +1,153 @@
 +"""Block-scale layout primitives for TileLang FP8 DSL surfaces.
 +
 +The first consumer is Apple MXFP8/E8M0, where FP8 data remains e4m3 storage
@@ -206,12 +191,29 @@ index 0000000..fcdbba5
 +from dataclasses import dataclass
 +from typing import Any
 +
-+from tilelang.tileop.metal_quant import e8m0_to_float
++import tilelang.language as T
 +
 +E8M0_BLOCK_SIZE = 32
 +E8M0_BLOCK_K32 = "e8m0_block_k32"
 +E8M0_LAYOUT = "logical_unswizzled_k_axis_blocks"
 +CONTRACTED_K_AXIS = "contracted_k"
++FP32 = "float32"
++
++
++def e8m0_to_float(bits):
++    """Decode an E8M0 scale byte to fp32.
++
++    Path C treats byte 0 and byte 0xFF as sentinels that decode to zero.
++    Normal bytes decode as ``2 ** (byte - 127)``.
++    """
++
++    bits_i = T.Cast("int32", bits)
++    value = T.exp2(T.Cast(FP32, bits_i - T.int32(127)))
++    return T.if_then_else(
++        bits_i == T.int32(0),
++        T.float32(0.0),
++        T.if_then_else(bits_i == T.int32(255), T.float32(0.0), value),
++    )
 +
 +
 +@dataclass(frozen=True)
@@ -329,7 +331,7 @@ index 0000000..fcdbba5
 +                f"got {b_scale_shape}"
 +            )
 diff --git a/tilelang/language/fp8_op.py b/tilelang/language/fp8_op.py
-index dc97ff5..1260c93 100644
+index 81b6b64f..73e6c43e 100644
 --- a/tilelang/language/fp8_op.py
 +++ b/tilelang/language/fp8_op.py
 @@ -104,6 +104,13 @@ from tilelang._typing import BufferLikeType
@@ -450,10 +452,10 @@ index dc97ff5..1260c93 100644
  @T.macro
 -def _fp8_scaled_matmul_macro(A_fp8, A_scale, B_fp8, B_scale, C_local):
 +def _fp8_scaled_matmul_macro(A_fp8, A_scale, B_fp8, B_scale, C_local, block_scale_layout=None):
-     """Hygienic body of ``T.fp8_scaled_matmul``: dequant + per-element scale + FMA.
+     """Hygienic body of ``T.fp8_scaled_matmul``: dequant + algebraic scale form.
  
      The body is parsed once at macro-decoration time and re-substituted at
-@@ -272,13 +343,17 @@ def _fp8_scaled_matmul_macro(A_fp8, A_scale, B_fp8, B_scale, C_local):
+@@ -273,8 +344,12 @@ def _fp8_scaled_matmul_macro(A_fp8, A_scale, B_fp8, B_scale, C_local):
          for k in T.serial(K_dim):
              a_val = T.cast(A_fp8[i, k], "float32")
              b_val = T.cast(B_fp8[k, j], "float32")
@@ -465,7 +467,10 @@ index dc97ff5..1260c93 100644
 +            else:
 +                sa = A_scale[0] if sa_size == 1 else A_scale[i]
 +                sb = B_scale[0] if sb_size == 1 else B_scale[j]
-             C_local[i, j] = C_local[i, j] + a_val * b_val * sa * sb
+             # Path C prototype: expose the algebraic scaled-operands form.
+             a_scaled = a_val * sa
+             b_scaled = b_val * sb
+@@ -282,7 +357,7 @@ def _fp8_scaled_matmul_macro(A_fp8, A_scale, B_fp8, B_scale, C_local):
  
  
  @T.macro
@@ -474,7 +479,7 @@ index dc97ff5..1260c93 100644
      """``transpose_B=True`` variant: B is (N, K) row-major, indexed B[j, k]."""
      M_dim, K_dim = A_fp8.shape
      N_dim, K_dim_b = B_fp8.shape
-@@ -289,8 +364,12 @@ def _fp8_scaled_matmul_macro_trans_b(A_fp8, A_scale, B_fp8, B_scale, C_local):
+@@ -295,8 +370,12 @@ def _fp8_scaled_matmul_macro_trans_b(A_fp8, A_scale, B_fp8, B_scale, C_local):
          for k in T.serial(K_dim):
              a_val = T.cast(A_fp8[i, k], "float32")
              b_val = T.cast(B_fp8[j, k], "float32")
@@ -486,10 +491,10 @@ index dc97ff5..1260c93 100644
 +            else:
 +                sa = A_scale[0] if sa_size == 1 else A_scale[i]
 +                sb = B_scale[0] if sb_size == 1 else B_scale[j]
-             C_local[i, j] = C_local[i, j] + a_val * b_val * sa * sb
- 
- 
-@@ -304,6 +383,9 @@ def fp8_scaled_matmul(
+             a_scaled = a_val * sa
+             b_scaled = b_val * sb
+             C_local[i, j] = C_local[i, j] + a_scaled * b_scaled
+@@ -312,6 +391,9 @@ def fp8_scaled_matmul(
      transpose_B: bool = False,
      accum_dtype: str = "float32",
      target: Optional[Target] = None,  # accepted for API compat, currently unused
@@ -499,7 +504,7 @@ index dc97ff5..1260c93 100644
  ):
      """Scaled FP8 matmul intrinsic — accumulate scaled FP8 product into ``C``.
  
-@@ -369,11 +451,16 @@ def fp8_scaled_matmul(
+@@ -377,11 +459,16 @@ def fp8_scaled_matmul(
              ``N`` mismatch, or scale shapes that are neither 1 nor
              matching).
      """
@@ -519,25 +524,3 @@ index dc97ff5..1260c93 100644
 -    return _fp8_scaled_matmul_macro(A_fp8, A_scale, B_fp8, B_scale, C_out)
 +        return _fp8_scaled_matmul_macro_trans_b(A_fp8, A_scale, B_fp8, B_scale, C_out, layout)
 +    return _fp8_scaled_matmul_macro(A_fp8, A_scale, B_fp8, B_scale, C_out, layout)
-diff --git a/tilelang/tileop/metal_quant.py b/tilelang/tileop/metal_quant.py
-index c6b25d2..c10c3e2 100644
---- a/tilelang/tileop/metal_quant.py
-+++ b/tilelang/tileop/metal_quant.py
-@@ -107,7 +107,15 @@ def fp4_e2m1fn_to_float(bits, nibble_index):
- 
- 
- def e8m0_to_float(bits):
--    """Decode torch.float8_e8m0fnu-compatible scale byte to fp32."""
-+    """Decode an E8M0 scale byte to fp32.
-+
-+    Path C treats byte 0 and byte 0xFF as sentinels that decode to zero.
-+    Normal bytes decode as ``2 ** (byte - 127)``.
-+    """
-     bits_i = T.Cast("int32", bits)
-     value = T.exp2(T.Cast(FP32, bits_i - T.int32(127)))
--    return T.if_then_else(bits_i == T.int32(255), T.float32(0.0), value)
-+    return T.if_then_else(
-+        bits_i == T.int32(0),
-+        T.float32(0.0),
-+        T.if_then_else(bits_i == T.int32(255), T.float32(0.0), value),
-+    )

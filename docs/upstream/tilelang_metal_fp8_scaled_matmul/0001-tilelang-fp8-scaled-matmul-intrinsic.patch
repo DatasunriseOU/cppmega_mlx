@@ -39,7 +39,7 @@ Test results (cd /tmp/tilelang_apple_head/tilelang && pytest):
 Bench at 128x128x128 e4m3 per-tensor on M-series:
 
   TileLang T.fp8_scaled_matmul : 0.555 ms (0.008 TFLOPS)
-  audiohacking ref kernel      : 0.172 ms (0.024 TFLOPS) -- 3.16x faster
+  local cppmega/AppMana ref    : 0.172 ms (0.024 TFLOPS) -- 3.16x faster
                                   (LUT decode, no cooperative reduction)
 
 Bench at M=1 N=K=4096 vecmat on M-series:
@@ -99,7 +99,7 @@ index 0000000..0000000
 +
 +The intrinsic is a hygienic ``@T.macro`` that expands inline to the
 +audiohacking pattern: a scalar K-loop over a dequantize-multiply-accumulate
-+body with the per-tensor (or per-row) scale fused in. On Metal the inner
++body with the per-tensor (or per-row) scale broadcast applied in the scalar K-loop. On Metal the inner
 +``T.cast(fp8_byte, fp32)`` is lowered by Agent C's storage-only patch in
 +``codegen_metal.cc`` to the ``__tvm_fp8_e4m3_to_half`` /
 +``__tvm_fp8_e5m2_to_half`` helpers; on CUDA ``T.cast`` lowers to
@@ -1121,11 +1121,11 @@ index 0000000..0000000
 +# --------------------------------------------------------------------------
 +#
 +# These tests use ``cppmega_mlx.nn._tilelang.fp8_msl_kernels`` as the
-+# ground truth oracle. That module ships the audiohacking fp8-mps-metal
-+# kernel pattern via ``mx.fast.metal_kernel`` (256-entry LUT decode); it
-+# is byte-compatible with PyTorch's ``torch.float8_e4m3fn`` representation.
-+# Comparing TileLang's TIR-lowered scalar K-loop against the LUT-based
-+# audiohacking kernel verifies that:
++# ground truth oracle. That module is the local cppmega/AppMana LUT-decode
++# MSL oracle via ``mx.fast.metal_kernel``; it is byte-compatible with
++# PyTorch's ``torch.float8_e4m3fn`` representation. It is not
++# audiohacking's scalar bit-extraction kernel. Comparing TileLang's
++# TIR-lowered scalar K-loop against the local LUT-based kernel verifies that:
 +#
 +# 1. The dequant in ``__tvm_fp8_e4m3_to_half`` matches the LUT decode for
 +#    every byte 0x00..0xFF (including subnormals 0x01..0x07 / 0x81..0x87,
@@ -1424,11 +1424,11 @@ index 0000000..0000000
 +)
 +@tilelang.testing.requires_metal
 +def test_bench_matmul_vs_audiohacking(capsys):
-+    """Bench: TileLang T.fp8_scaled_matmul vs audiohacking matmul kernel at 128x128x128.
++    """Bench: TileLang T.fp8_scaled_matmul vs local LUT matmul kernel at 128x128x128.
 +
 +    Reports:
 +      - TileLang lowered MSL elapsed time (median of 10 iters)
-+      - Audiohacking LUT-decode kernel elapsed time
++      - Local cppmega/AppMana LUT-decode kernel elapsed time
 +      - TFLOPS achieved
 +    """
 +    import torch

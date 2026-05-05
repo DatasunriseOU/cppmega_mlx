@@ -1,88 +1,28 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: cppmega.mlx <noreply@example.com>
-Date: Mon, 4 May 2026 12:00:00 +0200
-Subject: [PATCH] tilelang: prototype fused-scale fp8_scaled_matmul macro
+This file is intentionally not an applyable upstream patch.
 
-Path C patch B must stack on the real current TileLang surface: after the
-FP8 scaled-matmul prereq, T.fp8_scaled_matmul is a hygienic @T.macro in
-tilelang/language/fp8_op.py. There is no tilelang/tileop/gemm scheduler
-class for this operation on that stack.
+Historical name:
+  0001-metal-fuse-fp8-scaled-matmul-scheduler.patch
 
-Keep this prototype intentionally small and architecture-correct. It does not
-invent a GemmMetalFP8ScaledScheduler or promise packed-dot4/simd_sum lowering.
-Instead, it rewrites both macro bodies so the selected A/B scales are fused
-with the dequantized FP8 operands inside the contracted-K loop before the FMA
-updates the accumulator. That preserves the current API and gives downstream
-Path C work a real, applyable patch point for the macro-level implementation.
+Status:
+  Retired local artifact. Keep the filename so existing docs and probe commands
+  still resolve, but do not run `git apply` on this file.
 
-This is not the final performance scheduler. A future scheduler pass can still
-replace the same macro shape with packed uint32 loads, LUT dot4 decode, and an
-M == 1 SIMD-group reduction when TileLang grows a real fp8_scaled_matmul
-scheduler representation.
+Why retired:
+  The previous version was a bogus patch-B story: it rewrote
+  the per-element FP8 product into a scaled-operands multiply. That is only
+  algebraic reassociation. It is not scale-after-dot, not a packed uint32/LUT
+  dot4 Metal hot loop, not a 4-way K unroll, and not an M == 1 simd_sum vecmat
+  specialization.
 
----
- tilelang/language/fp8_op.py | 24 ++++++++++++++++--------
- 1 file changed, 16 insertions(+), 8 deletions(-)
+Current honest Path C story:
+  The local cppmega.mlx MLX/Metal Path C reference is
+  `cppmega_mlx/nn/_tilelang/fp8_vecmat_path_c.py`. Its dispatchable runtime
+  body uses packed `uint32` loads, `fp8_e4m3fn_lut` dot4 decode, a 4-byte K
+  stride, `simd_sum(sum)`, and applies scales after the accumulated dot:
+  `C[row] = sum * sx * sw`.
 
-diff --git a/tilelang/language/fp8_op.py b/tilelang/language/fp8_op.py
-index dc97ff57..81b6b64f 100644
---- a/tilelang/language/fp8_op.py
-+++ b/tilelang/language/fp8_op.py
-@@ -241,7 +241,7 @@ def _validate_buffers(A_fp8, A_scale, B_fp8, B_scale, C_out, *, transpose_B: boo
-
- @T.macro
- def _fp8_scaled_matmul_macro(A_fp8, A_scale, B_fp8, B_scale, C_local):
--    """Hygienic body of ``T.fp8_scaled_matmul``: dequant + per-element scale + FMA.
-+    """Hygienic body of ``T.fp8_scaled_matmul``: dequant + fused-scale FMA.
-
-     The body is parsed once at macro-decoration time and re-substituted at
-     each call. Static integer extents — including ``A_scale.shape[0]`` and
-@@ -263,18 +263,22 @@ def _fp8_scaled_matmul_macro(A_fp8, A_scale, B_fp8, B_scale, C_local):
-     sa_size = A_scale.shape[0]
-     sb_size = B_scale.shape[0]
-
--    # The accumulation matches the audiohacking ``fp8_scaled_matmul_kernel``
--    # algorithm: per-element FP8 dequant, fp32 FMA, scale broadcast through
--    # the multiply. ``T.cast(fp8 -> fp32)`` lowers to ``__tvm_fp8_*_to_half``
--    # on Metal (Agent C's storage-only patch) or ``__nv_fp8_*_to_half`` on
--    # CUDA (TVM's existing FP8 type lowering).
-+    # The accumulation keeps scale multiplication in the contracted-K loop:
-+    # per-element FP8 dequant, scale the operands, then fp32 FMA. This is
-+    # deliberately not a post-loop C *= scale epilogue. ``T.cast(fp8 ->
-+    # fp32)`` lowers to ``__tvm_fp8_*_to_half`` on Metal (Agent C's
-+    # storage-only patch) or ``__nv_fp8_*_to_half`` on CUDA (TVM's existing
-+    # FP8 type lowering).
-     for i, j in T.Parallel(M_dim, N_dim):
-         for k in T.serial(K_dim):
-             a_val = T.cast(A_fp8[i, k], "float32")
-             b_val = T.cast(B_fp8[k, j], "float32")
-             sa = A_scale[0] if sa_size == 1 else A_scale[i]
-             sb = B_scale[0] if sb_size == 1 else B_scale[j]
--            C_local[i, j] = C_local[i, j] + a_val * b_val * sa * sb
-+            # Path C prototype: fuse the selected scales before accumulation.
-+            a_scaled = a_val * sa
-+            b_scaled = b_val * sb
-+            C_local[i, j] = C_local[i, j] + a_scaled * b_scaled
-
-
- @T.macro
-@@ -285,13 +289,17 @@ def _fp8_scaled_matmul_macro_trans_b(A_fp8, A_scale, B_fp8, B_scale, C_local):
-     N_dim, K_dim_b = B_fp8.shape
-     sa_size = A_scale.shape[0]
-     sb_size = B_scale.shape[0]
-
-+    # Same fused-scale contract as the non-transposed macro, with B indexed as
-+    # (N, K). This is the current real hook for the M == 1 Path C vecmat shape.
-     for i, j in T.Parallel(M_dim, N_dim):
-         for k in T.serial(K_dim):
-             a_val = T.cast(A_fp8[i, k], "float32")
-             b_val = T.cast(B_fp8[j, k], "float32")
-             sa = A_scale[0] if sa_size == 1 else A_scale[i]
-             sb = B_scale[0] if sb_size == 1 else B_scale[j]
--            C_local[i, j] = C_local[i, j] + a_val * b_val * sa * sb
-+            a_scaled = a_val * sa
-+            b_scaled = b_val * sb
-+            C_local[i, j] = C_local[i, j] + a_scaled * b_scaled
-
-
- def fp8_scaled_matmul(
+Upstream status:
+  There is no accepted upstream TileLang tileop scheduler for this operation
+  in this artifact. A real upstream patch would need to add scheduler/codegen
+  support that preserves scale-after-dot and emits the packed Metal hot loop
+  shape above. This file makes no CUDA/H200 acceptance claim.

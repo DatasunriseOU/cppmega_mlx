@@ -267,15 +267,18 @@ _FP8_MATMUL_BODY = """
     uint a_base = row * K;
     uint b_base = col * K;
 
-    uint k = 0;
-    uint K4 = (K / 4u) * 4u;
-    for (; k < K4; k += 4u) {
-        sum += fp8_e4m3fn_lut[uint(A[a_base + k])]      * fp8_e4m3fn_lut[uint(B[b_base + k])]
-             + fp8_e4m3fn_lut[uint(A[a_base + k + 1u])] * fp8_e4m3fn_lut[uint(B[b_base + k + 1u])]
-             + fp8_e4m3fn_lut[uint(A[a_base + k + 2u])] * fp8_e4m3fn_lut[uint(B[b_base + k + 2u])]
-             + fp8_e4m3fn_lut[uint(A[a_base + k + 3u])] * fp8_e4m3fn_lut[uint(B[b_base + k + 3u])];
+    device const uint* A4 = reinterpret_cast<device const uint*>(A + a_base);
+    device const uint* B4 = reinterpret_cast<device const uint*>(B + b_base);
+    uint K4 = K / 4u;
+    for (uint i = 0u; i < K4; i++) {
+        uint pa = A4[i];
+        uint pb = B4[i];
+        sum += fp8_e4m3fn_lut[pa & 0xFFu]          * fp8_e4m3fn_lut[pb & 0xFFu]
+             + fp8_e4m3fn_lut[(pa >> 8) & 0xFFu]   * fp8_e4m3fn_lut[(pb >> 8) & 0xFFu]
+             + fp8_e4m3fn_lut[(pa >> 16) & 0xFFu]  * fp8_e4m3fn_lut[(pb >> 16) & 0xFFu]
+             + fp8_e4m3fn_lut[(pa >> 24) & 0xFFu]  * fp8_e4m3fn_lut[(pb >> 24) & 0xFFu];
     }
-    for (; k < K; k++) {
+    for (uint k = K4 * 4u; k < K; k++) {
         sum += fp8_e4m3fn_lut[uint(A[a_base + k])] * fp8_e4m3fn_lut[uint(B[b_base + k])];
     }
 
