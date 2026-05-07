@@ -183,3 +183,50 @@ threshold `paired_ratio ≤ 1.0`; auto-routing falls back to Path B for
 non-profitable shapes). See the upstream
 [TileLang README](https://github.com/DatasunriseOU/tilelang/blob/z3-final/README.md)
 for the full pass index and design notes.
+
+## Wave-7/8 — empirical test results & remaining bugs (2026-05-07)
+
+The 5 waves of static review-fix loops with grok-4 produced multiple
+"GREEN ship-ready" verdicts that did NOT survive empirical runtime
+testing on Apple M4 Max (macOS 26.4.1, Metal 3.2, MLX 0.31.1). Test
+matrix at
+[`tilelang/docs/research/runtime_test_matrix.md`](https://github.com/DatasunriseOU/tilelang/blob/main/docs/research/runtime_test_matrix.md)
++ `numerical_parity_metal.md` + `engine_vs_shim_parity.md` +
+`torch_compile_e2e.md` + `wave5_q_hoist_bench.md`.
+
+**Empirical verdict — what really works on Metal**:
+
+| Integration | Static review claim | Runtime reality |
+|-------------|---------------------|-----------------|
+| #01 Triton mapper | GREEN | Wave-3 ok; reduce_prod blocked by C++ pass bug (xfail) |
+| #02 torch.compile | GREEN | **3/4 e2e cases work** after wave-7 #4 redo (`-> List[Tensor]`) |
+| #03 PtrAnalysis | GREEN | 8/8 tests pass on Metal |
+| #04 TritonStructured | GREEN | 2/2 vendor-drift pass |
+| #05 fp8_amax | wave-3 ok | **Broken**: closure cells invisible to `get_type_hints` (wave-8 fix queued) |
+| #06 dsa_splitk wave-5 | "~2× speedup" | Claim cannot fire on production shapes (AH≥8); budget gate too tight; `denom` IR leak fixed wave-8 |
+| #07 TMA fallback | GREEN | Wave-7 #3 `tilelang.Allocate` dispatcher landed |
+| #08 extern_intrinsic | GREEN | factories ok |
+| #09 autograd | GREEN | 12/12 `test_autograd_compose.py` pass |
+
+**Wave-7/8 fix commits** in this repo (mlx-z3-wiring → main):
+
+- `a439df0` (wave-7 #1) — `_amax_kernel_for` closure capture for `in_dtype`
+- `cac10a0` (wave-7 #2) — wave-5 stage-2 `s` IR scoping
+- `bbe9334` (wave-8 #2) — wave-5 stage-2 `denom`/`denom1` IR scoping
+- `fb73493` (wave-8 topk) — MSL extraction fallback chain in `_path_c_kernel_for`
+
+**Wave-8 backlog (queued, agent-rate-limited)**:
+
+1. fp8_amax `get_type_hints(__closure__)` fix — inject closure cells into `_kernel.__globals__` before `@T.prim_func`
+2. dsa_splitk budget gate — tiled Q-cache for `AH≥8` production shapes
+3. ATEN_DISPATCH `_scaled_dot_product_flash_attention_for_cpu` wiring (FA TileLang kernel exists at `_kernels/flash_attention.py`)
+4. reduce_prod `vectorize_loop.cc` / `storage_rewrite.cc` mul-kind handling
+5. `scripts/check_mlx_abi.sh` to catch venv-vs-brew dylib mismatch (host venv `mlx.core.so` was built against older `libmlx.dylib` — silent test skips)
+
+NVFP4 on MLX research is committed at
+[`tilelang/docs/research/nvfp4_mlx_metal.md`](https://github.com/DatasunriseOU/tilelang/blob/main/docs/research/nvfp4_mlx_metal.md):
+`mlx.core.quantize(mode="nvfp4")`, group_size=16, packed `uint32` + signed
+E4M3 scale buffer; **no FP4 tensor core on M3/M4/M5** — implemented as
+Metal compute shaders (PR ml-explore/mlx#2946, v0.30.3). Wave-8 candidates
+for NVFP4 adoption: `linear_qmm`, `embedding_qlookup`, `gemm_quantized`,
+`gather_qmm_rhs`.
