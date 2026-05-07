@@ -430,6 +430,17 @@ def make_blockscaled_sparse_mla_qk_reduce_kernel(
         return blockscaled_sparse_mla_qk_reduce
 
 
+def _artifact_to_source(artifact: Any) -> str:
+    """Return rendered kernel source from a ``tilelang.lower`` / engine artifact."""
+
+    if hasattr(artifact, "kernel_source"):
+        return str(artifact.kernel_source)
+    rt_mod = getattr(artifact, "rt_mod", None)
+    if rt_mod is not None and hasattr(rt_mod, "get_source"):
+        return str(rt_mod.get_source())
+    return str(artifact)
+
+
 def lower_blockscaled_sparse_mla_qk_msl(
     *,
     M: int = 1,
@@ -444,10 +455,17 @@ def lower_blockscaled_sparse_mla_qk_msl(
     num_stages: int = 0,
     target: str = TILELANG_METAL_E8M0_SPARSE_MLA_TARGET,
 ) -> str:
-    """Lower the Path C E8M0 Sparse-MLA QK probe and return MSL source."""
+    """Lower the Path C E8M0 Sparse-MLA QK probe and return kernel source.
 
-    import tilelang
-    from tilelang import tvm
+    Routes through :func:`_engine_dispatch.dispatch_lower` so the env var
+    ``CPPMEGA_MLX_TILELANG_ENGINE`` selects between the unified
+    ``tilelang.compile`` engine and the legacy MSL shim. The function name
+    keeps the historic ``_msl`` suffix for caller compatibility; under
+    ``engine`` mode the returned source can be CUDA / HIP / Metal depending
+    on ``target``.
+    """
+
+    from cppmega_mlx.nn._tilelang._engine_dispatch import dispatch_lower
 
     prim = make_blockscaled_sparse_mla_qk_kernel(
         M=M,
@@ -461,13 +479,10 @@ def lower_blockscaled_sparse_mla_qk_msl(
         transpose_B=transpose_B,
         num_stages=num_stages,
     )
-    artifact = tilelang.lower(prim, target=tvm.target.Target(target))
-    if hasattr(artifact, "kernel_source"):
-        return str(artifact.kernel_source)
-    rt_mod = getattr(artifact, "rt_mod", None)
-    if rt_mod is not None and hasattr(rt_mod, "get_source"):
-        return str(rt_mod.get_source())
-    return str(artifact)
+    artifact = dispatch_lower(prim, target)
+    if hasattr(artifact, "msl_text"):
+        return str(artifact.msl_text)
+    return _artifact_to_source(artifact)
 
 
 def lower_blockscaled_sparse_mla_qk_reduce_msl(
@@ -479,10 +494,13 @@ def lower_blockscaled_sparse_mla_qk_reduce_msl(
     vec: int = 4,
     target: str = TILELANG_METAL_E8M0_SPARSE_MLA_TARGET,
 ) -> str:
-    """Lower the real-shape Path C E8M0 Sparse-MLA QK reducer to MSL."""
+    """Lower the real-shape Path C E8M0 Sparse-MLA QK reducer.
 
-    import tilelang
-    from tilelang import tvm
+    Routes through :func:`_engine_dispatch.dispatch_lower`; see
+    :func:`lower_blockscaled_sparse_mla_qk_msl` for engine/shim semantics.
+    """
+
+    from cppmega_mlx.nn._tilelang._engine_dispatch import dispatch_lower
 
     prim = make_blockscaled_sparse_mla_qk_reduce_kernel(
         N=N,
@@ -491,13 +509,10 @@ def lower_blockscaled_sparse_mla_qk_reduce_msl(
         reduce_threads=reduce_threads,
         vec=vec,
     )
-    artifact = tilelang.lower(prim, target=tvm.target.Target(target))
-    if hasattr(artifact, "kernel_source"):
-        return str(artifact.kernel_source)
-    rt_mod = getattr(artifact, "rt_mod", None)
-    if rt_mod is not None and hasattr(rt_mod, "get_source"):
-        return str(rt_mod.get_source())
-    return str(artifact)
+    artifact = dispatch_lower(prim, target)
+    if hasattr(artifact, "msl_text"):
+        return str(artifact.msl_text)
+    return _artifact_to_source(artifact)
 
 
 def blockscaled_sparse_mla_qk_msl_features(msl: str) -> dict[str, int | bool | str]:
@@ -588,7 +603,14 @@ def _qk_reduce_kernel_for(
     reduce_threads: int,
     vec: int,
 ) -> tuple[Any, _msl_transform.TileLangMSLLowering, list[str]]:
-    """Build and cache the MLX-dispatchable E8M0 TileLang QK reducer."""
+    """Build and cache the MLX-dispatchable E8M0 TileLang QK reducer.
+
+    The MLX runtime requires ``buffer_param_names`` / ``body`` / ``header``
+    fields from :class:`TileLangMSLLowering`, so this cache must use the
+    legacy MSL shim regardless of the engine flag. Engine-mode parity is
+    available via :func:`_qk_reduce_kernel_engine_for` and exposed through
+    :func:`lower_blockscaled_sparse_mla_qk_reduce_msl`.
+    """
 
     prim = make_blockscaled_sparse_mla_qk_reduce_kernel(
         N=N,
@@ -613,6 +635,36 @@ def _qk_reduce_kernel_for(
         ensure_row_contiguous=True,
     )
     return kernel, lowering, input_names
+
+
+@lru_cache(maxsize=128)
+def _qk_reduce_kernel_engine_for(
+    N: int,
+    K: int,
+    outputs_per_block: int,
+    reduce_threads: int,
+    vec: int,
+    target: str = TILELANG_METAL_E8M0_SPARSE_MLA_TARGET,
+) -> Any:
+    """Build the QK reducer through the unified engine dispatcher.
+
+    Returns whatever :func:`dispatch_lower` returns for the active mode:
+    a ``tilelang.compile`` artifact (engine) carrying
+    ``_tilelang_engine_target``, or a :class:`TileLangMSLLowering` (shim).
+    Used by parity tests and by callers that want a backend-portable
+    artifact (CUDA / HIP / Metal).
+    """
+
+    from cppmega_mlx.nn._tilelang._engine_dispatch import dispatch_lower
+
+    prim = make_blockscaled_sparse_mla_qk_reduce_kernel(
+        N=N,
+        K=K,
+        outputs_per_block=outputs_per_block,
+        reduce_threads=reduce_threads,
+        vec=vec,
+    )
+    return dispatch_lower(prim, target)
 
 
 def _normalize_qk_reduce_inputs(
