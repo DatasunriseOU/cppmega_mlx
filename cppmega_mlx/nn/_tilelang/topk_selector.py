@@ -853,6 +853,26 @@ def _path_c_rewrite_merge_round(
     branch. TileLang currently emits a pre-write barrier and splits writeback
     into a second identical branch; the final round barrier is enough to
     protect the next round.
+
+    TODO(fix-round-3, fragility): this rewrite is regex/string-based on the
+    emitted MSL body produced by `_msl_transform.lower_tilelang_to_msl_inline`.
+    Any change to TileLang's MSL emission (whitespace, variable names, brace
+    style, barrier ordering) silently no-ops the rewrite -- the
+    ``body == lowering.body`` short-circuit returns the original lowering, so
+    functionally we degrade to TileLang's conservative emission rather than
+    miscompile, but we lose the perf win without warning. A durable fix is
+    one of:
+      (a) move this to a TileLang TIR-level pass that runs before MSL
+          codegen, where the IR is structured (waiting on a `pass_configs`
+          hook for user passes in TileLang 0.1.10+);
+      (b) add a unit/regex assertion that the rewrite found *some* target
+          pattern and fails loud-and-early when TileLang's emission shape
+          changes (forces a deliberate regex update);
+      (c) drop the rewrite entirely once `tl.intra_warp_barrier_elision`
+          (already wired in `__init__.py`) lands a tighter merge-round
+          schedule that no longer needs textual surgery.
+    Tracking: docs/upstream/_path_c_blockers_tracker.md ("topk merge regex
+    rewrite hardening", to be filed alongside the canonicalize fixes).
     """
 
     lane_expr = "((int)thread_position_in_threadgroup.x)"
