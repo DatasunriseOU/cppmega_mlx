@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import warnings
 from dataclasses import dataclass, replace
 from functools import lru_cache
 from typing import Any, cast
@@ -60,6 +61,13 @@ _FP8_VECMAT_PATH_C_CANDIDATE_PASS_CONFIGS: dict[str, Any] = {
 
 _FP8_VECMAT_PATH_C_FILTERED_KEYS_LOGGED: set[str] = set()
 _FP8_VECMAT_PATH_C_PASS_CONFIGS_CACHE: dict[str, Any] | None = None
+# grok design P2: cache the result of the Metal FP8 intrinsic registration
+# check so we don't re-validate on every kernel build. ``True`` means
+# "intrinsics confirmed registered this process"; ``False`` means we have
+# not checked yet. Once checked, subsequent macro-path builds skip the
+# scan entirely.
+_FP8_VECMAT_PATH_C_INTRINSICS_CHECKED: bool = False
+_FP8_VECMAT_PATH_C_INTRINSICS_CHECK_LOCK = threading.Lock()
 # Guards first-time populate of ``_FP8_VECMAT_PATH_C_PASS_CONFIGS_CACHE`` so
 # two MLX threads lowering this kernel concurrently don't race the probe loop.
 _fp8_vecmat_path_c_pass_configs_cache_lock = threading.Lock()
@@ -153,11 +161,118 @@ def _tilelang_available() -> tuple[bool, str]:
     return True, "tilelang importable"
 
 
+_FP8_VECMAT_PATH_C_STATUS_UNAVAILABLE_LOGGED: set[str] = set()
+
+
+_FP8_VECMAT_PATH_C_VECTORIZED_PROBE_LOGGED = False
+
+
+def _warn_vectorized_loads_probe() -> None:
+    """One-shot stderr warning when the ``vectorized_loads=True`` probe runs.
+
+    The vectorized-loads PrimFunc branch is an experimental probe — on the
+    current apple-head Metal lowering it does not reliably emit packed
+    uint32 MSL loads, so production callers should leave the default
+    ``vectorized_loads=False`` and ride the packed dot4 macro fast path.
+    Kept for receipts; logged once per process so the off-canonical
+    selection is observable.
+    """
+
+    global _FP8_VECMAT_PATH_C_VECTORIZED_PROBE_LOGGED
+    if _FP8_VECMAT_PATH_C_VECTORIZED_PROBE_LOGGED:
+        return
+    _FP8_VECMAT_PATH_C_VECTORIZED_PROBE_LOGGED = True
+    warnings.warn(
+        "fp8_vecmat_path_c: vectorized_loads=True is an experimental probe "
+        "and does not reliably emit packed uint32 MSL loads on the current "
+        "apple-head Metal lowering; the canonical fast path is the packed "
+        "dot4 macro (vectorized_loads=False). Use at own risk.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+    print(
+        "[cppmega-mlx-cuz] fp8_vecmat_path_c: vectorized_loads=True probe "
+        "engaged (off canonical fast path).",
+        file=sys.stderr,
+    )
+
+
+def _ensure_path_c_metal_fp8_intrinsics_registered() -> None:
+    """Cached wrapper around ``_assert_path_c_metal_fp8_intrinsics_registered``.
+
+    The underlying scan iterates the Metal FP8 intrinsic table and probes
+    ``Op.get`` for each name, which is a tiny but non-zero cost paid on
+    every macro-path kernel build. Cache the *successful* outcome so
+    subsequent builds (same process) short-circuit. A failure is *not*
+    cached: if intrinsics are temporarily missing during a hot-reload
+    we want the next build to retry rather than raise stale.
+    """
+
+    global _FP8_VECMAT_PATH_C_INTRINSICS_CHECKED
+    if _FP8_VECMAT_PATH_C_INTRINSICS_CHECKED:
+        return
+    with _FP8_VECMAT_PATH_C_INTRINSICS_CHECK_LOCK:
+        if _FP8_VECMAT_PATH_C_INTRINSICS_CHECKED:
+            return
+        _assert_path_c_metal_fp8_intrinsics_registered()
+        _FP8_VECMAT_PATH_C_INTRINSICS_CHECKED = True
+
+
+_FP8_VECMAT_PATH_C_SIMPLIFY_FAILURE_LOGGED: set[str] = set()
+
+
+def _warn_apply_simplify_failed(exc: BaseException) -> None:
+    """One-shot RuntimeWarning when ``apply_simplify`` raises.
+
+    Keyed by ``(type, str)`` so a recurring failure logs once but a new
+    failure mode logs again. Keeps the fallback path silent on the data
+    plane while still surfacing the regression to anyone listening for
+    warnings.
+    """
+
+    key = f"{type(exc).__name__}: {exc}"
+    if key in _FP8_VECMAT_PATH_C_SIMPLIFY_FAILURE_LOGGED:
+        return
+    _FP8_VECMAT_PATH_C_SIMPLIFY_FAILURE_LOGGED.add(key)
+    warnings.warn(
+        f"fp8_vecmat_path_c: tilelang.transform.simplify.apply_simplify "
+        f"failed ({key}); falling back to un-simplified PrimFunc. "
+        "Lowering will continue but may emit slower MSL.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+
+
+def _warn_path_c_unavailable(reason: str) -> None:
+    """One-shot RuntimeWarning when the Path C fast path is skipped.
+
+    Used by both ``fp8_vecmat_path_c_status`` (TileLang import) and
+    ``fp8_scaled_vecmat_path_c`` (``can_run_metal`` /
+    ``MSLDispatchUnsupported``) so callers see *why* Path C returned ``None``
+    and the hand-written Path B fallback was picked instead. De-duplicated by
+    reason string to avoid log spam in tight loops.
+    """
+
+    if reason in _FP8_VECMAT_PATH_C_STATUS_UNAVAILABLE_LOGGED:
+        return
+    _FP8_VECMAT_PATH_C_STATUS_UNAVAILABLE_LOGGED.add(reason)
+    warnings.warn(
+        f"fp8_scaled_vecmat_path_c: Path C unavailable ({reason}); "
+        "caller should fall back to Path B.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+
+
 def fp8_vecmat_path_c_status() -> FP8VecmatPathCStatus:
     """Return whether TileLang is importable for Path C vecmat lowering."""
 
     ok, reason = _tilelang_available()
     if not ok:
+        # grok correctness P1 (silent failure): emit a one-shot RuntimeWarning
+        # carrying the actual reason so callers polling status don't get a
+        # quiet ``available=False`` with no breadcrumb.
+        _warn_path_c_unavailable(f"tilelang unavailable: {reason}")
         return FP8VecmatPathCStatus(available=False, reason=reason)
     return FP8VecmatPathCStatus(
         available=True,
@@ -231,6 +346,18 @@ def make_fp8_vecmat_reduce_kernel(
     )
 
     if vectorized_loads:
+        # Note: experimental probe — use at own risk.
+        # grok performance P2 / design: this branch mirrors upstream TileLang
+        # GEMV examples by staging a small local vector with
+        # ``T.vectorized(vec)``, but on the current apple-head Metal lowering
+        # it does NOT reliably emit packed uint32 MSL loads — the fast path
+        # is the ``_uses_fp8_dot4_packed_macro`` branch below. Kept here for
+        # receipts (so a future TileLang upgrade that wires vectorized FP8
+        # loads can be A/B'd) and per repo policy (no silent delete of dead
+        # code; investigate intent and close the debt properly). Emit a
+        # one-shot warning so anyone enabling this in production sees that
+        # they are off the canonical path.
+        _warn_vectorized_loads_probe()
 
         @T.prim_func
         def fp8_vecmat_reduce(
@@ -291,7 +418,11 @@ def make_fp8_vecmat_reduce_kernel(
         # parse the macro PrimFunc. Without this we get an opaque FFI
         # ``AttributeError`` deep in the lowering pipeline; with it we get
         # a clear ``RuntimeError`` naming the missing intrinsic.
-        _assert_path_c_metal_fp8_intrinsics_registered()
+        # grok design P2: cache the result so we run the registration
+        # scan once per process instead of on every kernel build. Failure
+        # still raises (the intrinsic is required for correctness); only
+        # the *successful* check is cached.
+        _ensure_path_c_metal_fp8_intrinsics_registered()
 
         @T.prim_func
         def fp8_vecmat_reduce(
@@ -377,7 +508,14 @@ def make_fp8_vecmat_reduce_kernel(
         from tilelang.transform.simplify import apply_simplify
 
         return apply_simplify(fp8_vecmat_reduce)
-    except Exception:
+    except Exception as exc:
+        # grok correctness P2: apply_simplify failure used to fall through
+        # silently, so a regression in TileLang's simplify pass would just
+        # quietly hand back un-simplified IR (slower or wrong codegen).
+        # Surface a one-shot RuntimeWarning naming the exception, but keep
+        # the fallback so we don't break lowering on TileLang versions
+        # missing the pass.
+        _warn_apply_simplify_failed(exc)
         return fp8_vecmat_reduce
 
 
@@ -655,11 +793,25 @@ def canonical_vecmat_runtime_body(*, N: int, K: int, scale_w_per_row: bool) -> s
 def _grid_for_lowering(
     lowering: _msl_transform.TileLangMSLLowering,
 ) -> tuple[int, int, int]:
-    return (
-        max(1, lowering.grid[0] * lowering.threadgroup[0]),
-        max(1, lowering.grid[1] * lowering.threadgroup[1]),
-        max(1, lowering.grid[2] * lowering.threadgroup[2]),
-    )
+    """Compute the MLX dispatch grid (total threads) for a TileLang lowering.
+
+    grok correctness P1 investigation: the multiplication
+    ``lowering.grid[i] * lowering.threadgroup[i]`` is *intentional* and
+    correct. TileLang's Metal lowering populates ``lowering.grid`` with
+    *threadgroup* extents (one per ``T.Kernel`` block dim) — i.e. the
+    ``T.ceildiv(_FP8_VM_N, _FP8_VM_NP)`` factor on dim 0 here — while
+    ``mx.fast.metal_kernel`` requires the *total* thread count per axis.
+    Multiplying threadgroups * threads-per-threadgroup yields the total
+    grid MLX expects; without it MLX would launch one thread per TileLang
+    block (under-launch, missed outputs).
+
+    This duplicates ``_msl_transform.metal_grid_for_lowering`` for legacy
+    reasons and is kept as a thin alias to avoid a broader API change in
+    this wave; both helpers must compute the same value. See the
+    ``metal_grid_for_lowering`` docstring for the canonical contract.
+    """
+
+    return _msl_transform.metal_grid_for_lowering(lowering)
 
 
 def _resolve_vecmat_scale(
@@ -738,6 +890,11 @@ def fp8_scaled_vecmat_path_c(
     """
 
     if not can_run_metal():
+        # grok correctness P1 (silent failure): warn once so callers know why
+        # the Path C fast path returned ``None`` and the caller fell back to
+        # the slower path. ``can_run_metal`` already encapsulates "is mlx +
+        # Metal usable here", so we don't have a richer reason string to log.
+        _warn_path_c_unavailable("can_run_metal() returned False")
         return None
     A, A_scale, B, B_scale, n, k, scale_w_per_row = _normalize_vecmat_inputs(
         x_fp8,
@@ -754,7 +911,13 @@ def fp8_scaled_vecmat_path_c(
             vec,
             scale_w_per_row,
         )
-    except MSLDispatchUnsupported:
+    except MSLDispatchUnsupported as exc:
+        # grok correctness P1: surface the dispatch-unsupported reason
+        # instead of silently returning ``None`` and routing to the
+        # hand-written Path B fallback.
+        _warn_path_c_unavailable(
+            f"MSLDispatchUnsupported during kernel build: {exc}"
+        )
         return None
 
     if input_names == ["A", "A_scale", "B", "B_scale"] and output_shape in (

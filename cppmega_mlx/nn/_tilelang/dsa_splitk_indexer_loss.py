@@ -327,6 +327,11 @@ def make_dsa_splitk_stage1_kernel(
             # buffers internally.
             Q_s = T.alloc_shared((BLOCK_SQ, BLOCK_D), in_dtype)
             K_s = T.alloc_shared((BLOCK_D, BLOCK_SK), in_dtype)
+            # Wave-2 perf #5: hoist Q out of the sk_tile loop. Q[sq_block, b, h, :]
+            # depends only on (sq_block_id, b, h) and not on sk_tile, so loading
+            # it once per Q-block per head saves SK_TILES-1 redundant HBM reloads
+            # of the same BLOCK_SQ*AD*sizeof(in_dtype) bytes per pass.
+            Q_full = T.alloc_shared((BLOCK_SQ, AD), in_dtype)
 
             # Online-softmax fragments live in registers.
             scores_f = T.alloc_fragment((BLOCK_SQ, BLOCK_SK), "float32")
@@ -352,25 +357,41 @@ def make_dsa_splitk_stage1_kernel(
                 m_i[i] = T.cast(-3.4028234663852886e38, "float32")
                 d_i[i] = T.cast(0, "float32")
 
-            # Stream the SK dimension. Triton's causal mask trims iterations
-            # to ``min(sq) + 1`` but TileLang lacks a runtime-trim grid bound;
-            # instead we iterate the full SK and let the per-tile causal mask
-            # zero out invalid positions (matches ``casual_mask`` in Triton ref
-            # at line ~153). This pessimises CUDA perf marginally but keeps
-            # codegen target-portable.
-            for sk_tile in T.Pipelined(SK_TILES, num_stages=num_stages):
+            # Wave-2 perf #5: load Q for this (sq_block, h) once, reuse across
+            # all sk_tiles + d_tiles below. AD is the head dim (typically 64)
+            # so BLOCK_SQ*AD fp16 fits comfortably in shared (worst case CUDA
+            # 128*128*2 = 32 KB; Metal 32*64*2 = 4 KB).
+            for i, dd in T.Parallel(BLOCK_SQ, AD):
+                sq_idx = sq_block_id * BLOCK_SQ + i
+                if sq_idx < ASq:
+                    Q_full[i, dd] = Q[sq_idx, b, h, dd]
+                else:
+                    Q_full[i, dd] = T.cast(0, in_dtype)
+
+            # Wave-2 perf #3: causal trim. The per-element causal mask
+            # ``sq_idx >= sk_idx`` zero-contributes any sk_tile beyond
+            # ``(min(max_sq_in_block, ASq-1)) // BLOCK_SK + 1`` -- skip those
+            # tiles entirely instead of iterating the full SK_TILES range.
+            # On the last Q-block the trim is a no-op (max_useful_sk == Sk-1);
+            # for early Q-blocks it can drop most iterations (e.g. block 0
+            # only needs sk_tile==0).
+            _max_sq_in_block = sq_block_id * BLOCK_SQ + (BLOCK_SQ - 1)
+            _max_useful_sk = T.min(_max_sq_in_block, ASq - 1)
+            _active_sk_tiles = T.min(SK_TILES, _max_useful_sk // BLOCK_SK + 1)
+            for sk_tile in T.Pipelined(_active_sk_tiles, num_stages=num_stages):
                 # Initialise the score accumulator for this tile.
                 for i, j in T.Parallel(BLOCK_SQ, BLOCK_SK):
                     scores_f[i, j] = T.cast(0, "float32")
 
                 # Inner D-loop: matmul Q @ K^T, accumulating into scores_f.
                 for d_tile in T.serial((AD + BLOCK_D - 1) // BLOCK_D):
-                    # Stage Q[BLOCK_SQ, BLOCK_D] for this (h, sq_block, d_tile).
+                    # Wave-2 perf #5: copy from the hoisted Q_full[BLOCK_SQ, AD]
+                    # shared buffer (loaded once outside the sk_tile loop)
+                    # rather than re-reading Q from HBM on every sk_tile pass.
                     for i, dd in T.Parallel(BLOCK_SQ, BLOCK_D):
-                        sq_idx = sq_block_id * BLOCK_SQ + i
                         d_idx = d_tile * BLOCK_D + dd
-                        if (sq_idx < ASq) and (d_idx < AD):
-                            Q_s[i, dd] = Q[sq_idx, b, h, d_idx]
+                        if d_idx < AD:
+                            Q_s[i, dd] = Q_full[i, d_idx]
                         else:
                             Q_s[i, dd] = T.cast(0, in_dtype)
 
@@ -547,6 +568,12 @@ def make_dsa_splitk_stage2_kernel(
             loss_i = T.alloc_fragment((BLOCK_SQ,), "float32")
             m_h = T.alloc_fragment((BLOCK_SQ,), "float32")
             d_h = T.alloc_fragment((BLOCK_SQ,), "float32")
+            # Wave-2 perf #5: pre-load all heads' (m_h, d_h) for this sq block
+            # so the inner sk_tile->h double loop reads them from registers
+            # instead of HBM on every pass. Cost: AH*BLOCK_SQ fp32 fragments
+            # (CUDA 128*128*4 = 64 KB worst case; Metal 128*32*4 = 16 KB).
+            M_pre = T.alloc_fragment((AH, BLOCK_SQ), "float32")
+            D_pre = T.alloc_fragment((AH, BLOCK_SQ), "float32")
 
             # Load stage-1 index-softmax statistics for this sq block.
             for i in T.Parallel(BLOCK_SQ):
@@ -559,7 +586,31 @@ def make_dsa_splitk_stage2_kernel(
                     d1_local[i] = T.cast(1, "float32")
                 loss_i[i] = T.cast(0, "float32")
 
-            for sk_tile in T.Pipelined(SK_TILES, num_stages=num_stages):
+            # Wave-2 perf #5: pre-load M[b, h, sq], D[b, h, sq] for all h once
+            # per sq_block, before the sk_tile loop. The inner per-sk_tile
+            # h-loop reads M_pre[h, i] / D_pre[h, i] from registers.
+            for hh in T.serial(AH):
+                for i in T.Parallel(BLOCK_SQ):
+                    sq_idx = sq_block_id * BLOCK_SQ + i
+                    if sq_idx < ASq:
+                        M_pre[hh, i] = M[b, hh, sq_idx]
+                        D_pre[hh, i] = D[b, hh, sq_idx]
+                    else:
+                        M_pre[hh, i] = T.cast(0, "float32")
+                        D_pre[hh, i] = T.cast(1, "float32")
+
+            # Wave-2 perf #3: causal trim (mirrors stage 1).
+            _max_sq_in_block = sq_block_id * BLOCK_SQ + (BLOCK_SQ - 1)
+            _max_useful_sk = T.min(_max_sq_in_block, ASq - 1)
+            _active_sk_tiles = T.min(SK_TILES, _max_useful_sk // BLOCK_SK + 1)
+            # TODO(integration-06-wave3): hoist Q out of the sk_tile loop in
+            # stage 2 too. Q depends on (h, sq_block, d_tile) but not sk_tile,
+            # so it could be cached per (sq_block, h) in a shared buffer. The
+            # current sk_tile->h->d_tile nesting makes this a non-trivial
+            # restructure (would need either a per-h shared buffer reset on
+            # each sk_tile, or an outer h-loop with a SK_TILES-deep softmax_attn
+            # accumulator); deferred to next wave.
+            for sk_tile in T.Pipelined(_active_sk_tiles, num_stages=num_stages):
                 # Zero softmax_attn for this tile (we accumulate over heads).
                 for i, j in T.Parallel(BLOCK_SQ, BLOCK_SK):
                     softmax_attn[i, j] = T.cast(0, "float32")
@@ -590,15 +641,12 @@ def make_dsa_splitk_stage2_kernel(
 
                         T.gemm(Q_s, K_s, h_scores)
 
-                    # Load this head's stage-1 stats.
+                    # Wave-2 perf #5: copy from the hoisted M_pre/D_pre
+                    # fragments (loaded once outside the sk_tile loop) instead
+                    # of re-reading M[b, h, sq] / D[b, h, sq] from HBM.
                     for i in T.Parallel(BLOCK_SQ):
-                        sq_idx = sq_block_id * BLOCK_SQ + i
-                        if sq_idx < ASq:
-                            m_h[i] = M[b, h, sq_idx]
-                            d_h[i] = D[b, h, sq_idx]
-                        else:
-                            m_h[i] = T.cast(0, "float32")
-                            d_h[i] = T.cast(1, "float32")
+                        m_h[i] = M_pre[h, i]
+                        d_h[i] = D_pre[h, i]
 
                     # Scale + causal mask + (optional) sparse mask + add to
                     # accumulated softmax_attn (averaged over heads at the
