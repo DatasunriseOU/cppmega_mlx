@@ -530,18 +530,35 @@ def fp8_amax_tilelang(x: torch.Tensor) -> torch.Tensor:
     in_dtype = _resolve_in_dtype(flat)
     target = _resolve_target(flat.device)
 
-    # Bucket cache key by next-pow2 to avoid per-shape JIT thrashing.
-    # ``amax(zeros) == 0`` is the identity element for ``max`` so padding
-    # the tail with zeros leaves the result unchanged.
+    # Wave-9 #3: skip the pad+copy hot-path on shapes where it would waste
+    # >50% of kernel work. The per-block ``if gi < N`` predicate (wave-3
+    # partial-block guard inside ``make_fp8_amax_kernel``) already masks the
+    # tail correctly, so we can build a per-shape kernel keyed on the exact
+    # ``n_actual`` instead of bucket-padding.
+    #
+    # Trade-off:
+    # * Pad+bucket path: ``mx.zeros + copy_`` on every call (HBM cost) but
+    #   amortizes JIT across nearby shapes via the next-pow2 bucket key.
+    # * Exact path: zero alloc / copy on the call but each unique shape
+    #   triggers a fresh JIT (lru_cache up to 256 shapes).
+    #
+    # Heuristic: use exact path when bucket would inflate the work by >=50%
+    # (bucket_n >= 1.5 * n_actual). Tiny shapes (n_actual < block) keep the
+    # legacy bucket path because the pad cost is dominated by the kernel
+    # launch overhead anyway.
     block, _threads = _pick_block_size(target, n_actual)
     bucket_n = _bucket_n(n_actual, block)
 
-    if bucket_n != n_actual:
-        padded = torch.zeros(bucket_n, dtype=flat.dtype, device=flat.device)
-        padded[:n_actual] = flat
-        flat = padded
+    use_exact = n_actual >= block and bucket_n * 2 >= 3 * n_actual
 
-    kernel = _amax_kernel_for(bucket_n, in_dtype, target)
+    if use_exact:
+        kernel = _amax_kernel_for(n_actual, in_dtype, target)
+    else:
+        if bucket_n != n_actual:
+            padded = torch.zeros(bucket_n, dtype=flat.dtype, device=flat.device)
+            padded[:n_actual] = flat
+            flat = padded
+        kernel = _amax_kernel_for(bucket_n, in_dtype, target)
 
     amax = torch.zeros(1, dtype=torch.float32, device=flat.device)
     kernel(flat, amax)
