@@ -1,19 +1,39 @@
 """Vendored FP8 (e4m3fn) MSL kernels for Apple Silicon.
 
 .. note::
-   **Migration phase-3 status**: this module remains on raw MSL Path-B and is
-   *not* routed through ``_engine_dispatch.dispatch_lower``. All eight kernels
-   are FP8-specific shaders; flipping them to the unified engine requires the
-   FP8 SIMDgroup fragment factories (``simdgroup_a_fp8`` / ``simdgroup_b_fp8``)
-   in ``tilelang/language/extern.py`` plus an Apple-silicon FP8 hardware path.
-   Until those land, callers stay on ``mx.fast.metal_kernel`` here. See
-   ``MIGRATION_PLAN.md §2.4`` and gap #7.
+   **Migration wave-6 audit**: this module hosts **four** raw-MSL kernels
+   (``_FP8_TO_HALF``, ``_HALF_TO_FP8``, ``_FP8_MATMUL``, ``_FP8_VECMAT``).
+   None of them use Apple-silicon FP8 SIMDgroup MMA -- the matmul/vecmat
+   kernels decode FP8 bytes via a 256-entry LUT in MSL constant memory and
+   accumulate in plain ``float`` ALU registers. So the originally-suspected
+   blocker (``simdgroup_a_fp8`` / ``simdgroup_b_fp8`` Fragment factories in
+   ``tilelang/language/extern.py``) is **not** what gates flipping these
+   kernels to the unified engine.
 
-   TODO(fp8-factories): when the factories land, replace each
-   ``mx.fast.metal_kernel`` body with a Path-C ``@T.prim_func`` invoking
-   ``tl.extern_intrinsic`` with the appropriate ``simdgroup_*_fp8`` Frag, then
-   route through ``_engine_dispatch.dispatch_lower`` so CUDA / HIP get the
-   same kernels for free.
+   The actual blocker is two-fold:
+
+   1. ``tl.extern_intrinsic`` on the Metal target does not yet emit a
+      ``mx.fast.metal_kernel``-shaped artifact (it emits a CUDA/HIP-shaped
+      device-function call), and
+   2. The unified engine has no mechanism to inject a 256-entry constant
+      LUT (``constant float fp8_e4m3fn_lut[256]`` here) into the MSL
+      header at codegen time -- TileLang would need a constant-table
+      extern declaration that ``codegen_metal.cc`` knows to materialise.
+
+   Until both land, callers stay on ``mx.fast.metal_kernel`` directly. The
+   3-kernel classification below survives in source comments per kernel.
+
+   TODO(wave-7): once Metal-target ``extern_intrinsic`` ships, wrap each
+   kernel body in a thin ``@T.prim_func`` calling ``T.extern_intrinsic``
+   with the existing MSL body verbatim, then route through
+   ``_engine_dispatch.dispatch_lower(prim, "metal", return_msl=True)`` so
+   the four wrappers participate in the unified ``CPPMEGA_MLX_TILELANG_ENGINE``
+   env-flag dispatch. The ``_msl_extraction.extract_msl_from_engine_artifact``
+   adapter (commit 00d6d90) is already prepared for this -- it reads
+   ``artifact.kernel_source`` and reconstitutes a ``TileLangMSLLowering``.
+
+   See ``MIGRATION_PLAN.md §2.4`` (FP8 vecmat consolidation) and gap #7
+   (FP8 factories - not actually a blocker for THIS file).
 
 Source attribution
 ------------------
@@ -348,6 +368,19 @@ _FP8_VECMAT_BODY = """
 # ---------------------------------------------------------------------------
 
 
+# Wave-6 classification (per kernel, see module docstring for the 2-fold blocker):
+#   _FP8_TO_HALF_KERNEL      : fp8-bordered (256-entry LUT lookup, elementwise)
+#   _HALF_TO_FP8_KERNEL      : fp8-pure     (integer bit-manipulation encode)
+#   _FP8_MATMUL_KERNEL       : fp8-bordered (LUT decode + fp32 fma + scale epilogue)
+#   _FP8_VECMAT_KERNEL       : fp8-bordered (LUT decode + fp32 fma + simd_sum)
+#
+# All four stay on mx.fast.metal_kernel until wave-7 (Metal-target
+# extern_intrinsic + constant-table extern in codegen_metal.cc). The
+# wave-6 audit reclassifies them away from the originally-suspected
+# "FP8 SIMDgroup factory" blocker -- none of the kernels here use
+# simdgroup_matrix<float8> MMA.
+
+
 _FP8_TO_HALF_KERNEL: MetalKernel | None = make_metal_kernel(
     name="cppmega_fp8_to_half",
     input_names=["input"],
@@ -379,6 +412,33 @@ _FP8_VECMAT_KERNEL: MetalKernel | None = make_metal_kernel(
     source=_FP8_VECMAT_BODY,
     header=_FP8_HEADER,
 )
+
+
+# ---------------------------------------------------------------------------
+# Wave-7 flip pattern (placeholder — gated on Metal-target extern_intrinsic
+# + constant-table extern landing in tilelang codegen_metal.cc).
+# ---------------------------------------------------------------------------
+
+
+def _wave7_engine_flip_blocked_reason() -> str:
+    """Return a human-readable reason this module hasn't been engine-flipped.
+
+    Used by tests and by ``fp8_msl_status()`` to report why the four kernels
+    here remain on raw ``mx.fast.metal_kernel`` even after wave-3 landed the
+    ``_msl_extraction`` adapter. The two prerequisites are described in the
+    module docstring; this function exists so callers can branch precisely
+    on the real blocker rather than the FP8-factory red herring.
+    """
+
+    return (
+        "wave-7 blocked: tl.extern_intrinsic does not yet emit "
+        "mx.fast.metal_kernel-shaped artifacts on the Metal target, and "
+        "the unified engine has no constant-table extern (LUT injection) "
+        "for codegen_metal.cc. The four FP8 MSL kernels here do NOT need "
+        "FP8 SIMDgroup factories — they decode via a 256-entry uint8 LUT "
+        "in MSL constant memory and accumulate in plain fp32. See module "
+        "docstring TODO(wave-7) for the flip plan."
+    )
 
 
 # ---------------------------------------------------------------------------
