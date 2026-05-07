@@ -63,6 +63,7 @@ from typing import Tuple
 import mlx.core as mx
 
 from cppmega_mlx.nn._tilelang import _mamba3_helpers as _pure_helpers
+from cppmega_mlx.nn._tilelang._engine_dispatch import dispatch_lower
 from cppmega_mlx.nn._tilelang._msl_transform import (
     MSLDispatchUnsupported,
     can_run_metal,
@@ -174,7 +175,10 @@ def _segsum_kernel_for(BH: int, T_: int, K: int, BLOCK_K: int):
                         carrier_dtype,
                     )
 
-    lowering = lower_tilelang_to_msl_inline(segsum)
+    artifact = dispatch_lower(segsum, target="metal")
+    if hasattr(artifact, "_tilelang_engine_target"):
+        return artifact, None
+    lowering = artifact
     kernel = mx.fast.metal_kernel(
         name=f"tlmamba3_segsum_{BH}_{T_}_{K}_{BLOCK_K}",
         # Buffer order in the lowered MSL is alphabetic: A, dh, dt, out.
@@ -229,7 +233,10 @@ def _dadt_kernel_for(BH: int, T_: int, K: int, BLOCK_T: int):
                 dA[bh, t_index] = acc[0] * dt[bh, t_index]
                 ddt[bh, t_index] = acc[0] * A[bh, t_index]
 
-    lowering = lower_tilelang_to_msl_inline(dadt)
+    artifact = dispatch_lower(dadt, target="metal")
+    if hasattr(artifact, "_tilelang_engine_target"):
+        return artifact, None
+    lowering = artifact
     kernel = mx.fast.metal_kernel(
         name=f"tlmamba3_dadt_{BH}_{T_}_{K}_{BLOCK_T}",
         # Buffer order alphabetic: A, dA, dY, ddt, dh, dt -> after sort:
@@ -308,7 +315,10 @@ def _dtrap_kernel_for(BH: int, T_: int, BLOCK_T: int):
                 ddt_out[bh, t_index] = T.cast(ddt_v[0], carrier_dtype)
                 dtrap_out[bh, t_index] = T.cast(dtrap_v[0], carrier_dtype)
 
-    lowering = lower_tilelang_to_msl_inline(dtrap)
+    artifact = dispatch_lower(dtrap, target="metal")
+    if hasattr(artifact, "_tilelang_engine_target"):
+        return artifact, None
+    lowering = artifact
     kernel = mx.fast.metal_kernel(
         name=f"tlmamba3_dtrap_{BH}_{T_}_{BLOCK_T}",
         # Alphabetic order from MSL: dB_scaled, ddt_out, dt, dtrap_out, trap
@@ -441,6 +451,16 @@ def compute_dacs_segsum(
             A, dt, dh, accumulate_in_fp32=accumulate_in_fp32
         )
 
+    if lowering is None:
+        # Engine path: runtime call signature for the engine artifact is not
+        # yet wired through the mlx fast-kernel dispatch (mx.fast.metal_kernel
+        # expects mx.array buffers, the engine artifact takes raw prim args).
+        # Fall back to pure-MLX for parity until Phase-4 plumbs the engine
+        # artifact through the fast-kernel runtime.
+        return _pure_helpers.compute_dacs_segsum(
+            A, dt, dh, accumulate_in_fp32=accumulate_in_fp32
+        )
+
     grid = (
         lowering.grid[0] * lowering.threadgroup[0],
         lowering.grid[1] * lowering.threadgroup[1],
@@ -522,6 +542,12 @@ def bwd_dadt_fused(
             dY, A, dt, h, accumulate_in_fp32=accumulate_in_fp32
         )
 
+    if lowering is None:
+        # Engine path: not yet wired through fast-kernel runtime — fall back.
+        return _pure_helpers.bwd_dadt_fused(
+            dY, A, dt, h, accumulate_in_fp32=accumulate_in_fp32
+        )
+
     grid = (
         lowering.grid[0] * lowering.threadgroup[0],
         lowering.grid[1] * lowering.threadgroup[1],
@@ -590,6 +616,12 @@ def bwd_dtrap_ddt(
     try:
         kernel, lowering = _dtrap_kernel_for(BH, T_, BLOCK_T)
     except (MSLDispatchUnsupported, RuntimeError, ValueError):
+        return _pure_helpers.bwd_dtrap_ddt(
+            dB_scaled, dt, trap, accumulate_in_fp32=accumulate_in_fp32
+        )
+
+    if lowering is None:
+        # Engine path: not yet wired through fast-kernel runtime — fall back.
         return _pure_helpers.bwd_dtrap_ddt(
             dB_scaled, dt, trap, accumulate_in_fp32=accumulate_in_fp32
         )
