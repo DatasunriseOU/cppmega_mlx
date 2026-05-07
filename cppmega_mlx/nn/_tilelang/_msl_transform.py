@@ -36,6 +36,7 @@ Z3 roadmap note (cppmega-mlx-cuz wiring):
 
 from __future__ import annotations
 
+import collections
 import ctypes
 import functools
 import os
@@ -265,7 +266,7 @@ def make_metal_kernel(
 
 
 def dispatch(
-    kernel: MetalKernel,
+    kernel: MetalKernel | None,
     *,
     inputs: Sequence[mx.array],
     output_shapes: Sequence[Sequence[int]],
@@ -275,6 +276,19 @@ def dispatch(
     lowering: TileLangMSLLowering | None = None,
     template: Sequence[tuple[str, object]] | None = None,
 ) -> list[mx.array]:
+    # fix-round-9 (Wave 4 grok finding #2): explicit None-kernel guard. If
+    # ``make_metal_kernel`` returned None (because ``can_run_metal()`` is
+    # False or ``mx.fast.metal_kernel`` is missing), calling kernel(...) below
+    # would raise ``TypeError: 'NoneType' is not callable`` and confuse the
+    # caller, who is expecting either a clean ``MSLDispatchUnsupported`` or a
+    # successful tensor list. Funnel the failure through the same exception
+    # type as every other dispatch failure so callers can continue to use a
+    # single ``except MSLDispatchUnsupported`` to fall back to Path B.
+    if kernel is None:
+        raise MSLDispatchUnsupported(
+            "metal_kernel is None — check can_run_metal() and "
+            "mx.fast.metal_kernel availability"
+        )
     if any(isinstance(x, mx.array) and x.size == 0 for x in inputs):
         raise MSLDispatchUnsupported("empty tensors must use the pure MLX fallback")
     if lowering is not None:
@@ -481,41 +495,200 @@ def _split_kernel_msl(msl: str) -> tuple[str, str, str]:
     return prelude, sig_text, body_text
 
 
-def _parse_buffer_param_names(sig_text: str) -> list[str]:
-    """Return the buffer parameter names from a kernel signature, in order."""
+# Documentation/test corpus for ``_parse_buffer_param_names``. Each entry is a
+# *single* parameter declaration as TileLang's Metal codegen emits it (or as
+# we've observed in the wild via the Apache TVM Metal target). The parser is
+# expected to:
+#   - return the param's identifier when it is a top-level address-space
+#     buffer (``device`` or ``constant``);
+#   - skip ``threadgroup`` (local), Metal builtin params (``blockIdx``,
+#     ``threadIdx``, ``simd_lane``-style with ``[[thread_index_in_simdgroup]]``
+#     etc.), and any ``[[...]]`` attribute markers.
+#
+# fix-round-9 (Wave 4 grok): grow the corpus from a handful of hand-written
+# cases to the full set of qualifier orderings TileLang emits post-PR #799,
+# plus a couple of TVM-Metal-direct variants we've seen in older lowering
+# output (mamba3 fwd_kernel uses ``device float* A``; FP8 paths use
+# ``device const float8_e4m3 *A``; matmul backwards-compat uses
+# ``const device half *B``). The previous parser tripped on the
+# ``device const`` ordering because the trailing-identifier regex consumed
+# the buffer-name token correctly but the ``"device "`` substring check was
+# fine; the real failure mode was *attribute strip greediness* with nested
+# ``[[...]]`` and missing handling of ``constant`` (Metal address space for
+# constant buffers, not const-qualified device pointers).
+_TEST_PARSE_SIGNATURES: tuple[tuple[str, str | None], ...] = (
+    ("device const float8_e4m3 *A", "A"),
+    ("const device half *B [[ buffer(0) ]]", "B"),
+    ("device float* C [[ buffer(2) ]]", "C"),
+    ("device const half* __restrict D [[buffer(3)]]", "D"),
+    ("const device float &E [[buffer(4)]]", "E"),
+    ("constant float* F [[buffer(5)]]", "F"),  # Metal "constant" address space
+    ("threadgroup uchar* shared_buf", None),  # threadgroup = local, skip
+    ("uint3 blockIdx [[threadgroup_position_in_grid]]", None),
+    ("uint3 threadIdx [[thread_position_in_threadgroup]]", None),
+    ("uint simd_lane [[thread_index_in_simdgroup]]", None),
+    ("uint3 gridDim [[threadgroups_per_grid]]", None),
+    ("uint3 blockDim [[threads_per_threadgroup]]", None),
+)
+
+
+# fix-round-9 (Wave 4 grok): identifiers we never want to treat as buffers,
+# even if a future TileLang/TVM change adds a "device" qualifier in front of
+# them. These are Metal builtins that callers don't pass; they're filled in
+# by the runtime from the [[...]] attribute.
+_METAL_BUILTIN_PARAM_NAMES = frozenset({
+    "blockIdx",
+    "threadIdx",
+    "gridDim",
+    "blockDim",
+})
+
+
+def _split_signature_decls(sig_text: str) -> list[str]:
+    """Split a signature parameter list on top-level commas.
+
+    Respects nested ``(...)`` and ``[[...]]`` Metal attribute markers so that
+    a comma inside an attribute (e.g., ``[[buffer(0), function_constant(1)]]``)
+    does not split a parameter declaration.
+    """
 
     decls: list[str] = []
-    depth = 0
+    depth_paren = 0
+    depth_attr = 0  # tracks ``[[`` / ``]]`` nesting
+    i = 0
     current: list[str] = []
-    for ch in sig_text:
+    n = len(sig_text)
+    while i < n:
+        ch = sig_text[i]
+        # Detect ``[[`` / ``]]`` as paired tokens (Metal attribute markers).
+        if ch == "[" and i + 1 < n and sig_text[i + 1] == "[":
+            depth_attr += 1
+            current.append("[[")
+            i += 2
+            continue
+        if ch == "]" and i + 1 < n and sig_text[i + 1] == "]" and depth_attr > 0:
+            depth_attr -= 1
+            current.append("]]")
+            i += 2
+            continue
         if ch == "(":
-            depth += 1
+            depth_paren += 1
             current.append(ch)
         elif ch == ")":
-            depth -= 1
+            depth_paren -= 1
             current.append(ch)
-        elif ch == "," and depth == 0:
+        elif ch == "," and depth_paren == 0 and depth_attr == 0:
             decls.append("".join(current).strip())
             current = []
         else:
             current.append(ch)
-    if current:
-        last = "".join(current).strip()
-        if last:
-            decls.append(last)
+        i += 1
+    last = "".join(current).strip()
+    if last:
+        decls.append(last)
+    return decls
+
+
+def _strip_attribute_markers(decl: str) -> str:
+    """Remove all ``[[...]]`` Metal attribute markers from a decl string.
+
+    Iterative balanced strip — the previous non-greedy regex
+    ``re.sub(r"\\[\\[.*?\\]\\]", "", decl)`` only matched the *first* ``]]`` and
+    handled nested attribute markers incorrectly. This walks the string and
+    removes balanced ``[[ ... ]]`` segments at any depth.
+    """
+
+    out: list[str] = []
+    i = 0
+    n = len(decl)
+    while i < n:
+        if decl[i] == "[" and i + 1 < n and decl[i + 1] == "[":
+            # Find the matching ``]]`` at the same nesting depth.
+            depth = 1
+            j = i + 2
+            while j < n and depth > 0:
+                if decl[j] == "[" and j + 1 < n and decl[j + 1] == "[":
+                    depth += 1
+                    j += 2
+                    continue
+                if decl[j] == "]" and j + 1 < n and decl[j + 1] == "]":
+                    depth -= 1
+                    j += 2
+                    continue
+                j += 1
+            if depth == 0:
+                i = j  # skip the entire ``[[...]]``
+                continue
+            # Unbalanced — fall through and keep the char so the caller can see
+            # there's a parse problem instead of silently truncating.
+        out.append(decl[i])
+        i += 1
+    return "".join(out)
+
+
+def _extract_param_identifier(clean: str) -> str | None:
+    """Pull the parameter's identifier out of a stripped decl string.
+
+    Strategy: drop pointer/reference sigils (``*``, ``&``) and any trailing
+    array-extent ``[N]``, then take the last word. This tolerates ``__restrict``
+    and other type modifiers that appear *before* the identifier — those are
+    earlier-word tokens and are simply ignored.
+    """
+
+    # Drop trailing ``[N]`` array extent if present (Metal allows it for
+    # ``constant`` buffers).
+    cleaned = re.sub(r"\[[^\]]*\]\s*$", "", clean).strip()
+    # Drop pointer/reference sigils that appear adjacent to the name.
+    cleaned = cleaned.replace("*", " ").replace("&", " ").strip()
+    m = re.search(r"\b([A-Za-z_]\w*)\s*$", cleaned)
+    return m.group(1) if m else None
+
+
+def _parse_buffer_param_names(sig_text: str) -> list[str]:
+    """Return the buffer parameter names from a kernel signature, in order.
+
+    fix-round-9 (Wave 4 grok finding #1): hardened against TileLang/Metal
+    signature variants. The previous version used a single non-greedy
+    ``[[.*?]]`` strip and a lone ``"device "`` substring check, which broke on:
+
+    * ``device const T*`` ordering (greedy-strip + position-sensitive check),
+    * the ``constant`` Metal address space (a legitimate top-level buffer),
+    * trailing array extents and ``__restrict`` modifiers,
+    * Metal builtin params (``gridDim``, ``blockDim``) that lack a ``device``
+      qualifier but were never explicitly excluded.
+
+    See ``_TEST_PARSE_SIGNATURES`` above for the documented input corpus.
+
+    Note: we intentionally do not try to introspect ``prim_func.buffer_map``
+    here. TileLang's lowering pipeline transforms PrimFunc params (it adds
+    grid/thread axis buffers, drops some, renames others) before emitting the
+    final MSL signature, so the *only* authoritative source for "what does
+    ``mx.fast.metal_kernel`` need fed in, in what order" is the emitted
+    signature itself. ``buffer_map`` would be wrong.
+    """
+
+    decls = _split_signature_decls(sig_text)
 
     names: list[str] = []
     for decl in decls:
-        clean = re.sub(r"\[\[.*?\]\]", "", decl).strip()
-        m = re.search(r"(\w+)\s*$", clean)
-        if not m:
+        clean = _strip_attribute_markers(decl).strip()
+        if not clean:
             continue
-        var = m.group(1)
-        if var in ("blockIdx", "threadIdx"):
+        # Skip threadgroup-local buffers — those are allocated inside the
+        # kernel, not passed in by the caller.
+        if re.search(r"\bthreadgroup\b", clean):
             continue
-        # Buffer parameters always have a "device" qualifier (or "const device").
-        if "device " in clean:
-            names.append(var)
+        # Top-level buffers carry one of two Metal address-space qualifiers.
+        is_device = re.search(r"\bdevice\b", clean) is not None
+        is_constant = re.search(r"\bconstant\b", clean) is not None
+        if not (is_device or is_constant):
+            continue
+        var = _extract_param_identifier(clean)
+        if var is None:
+            continue
+        if var in _METAL_BUILTIN_PARAM_NAMES:
+            continue
+        names.append(var)
     return names
 
 
@@ -606,39 +779,106 @@ def metal_grid_for_lowering(
 
 
 # fix-round-8 (Wave 3 grok-4): manual cache for lowering results keyed on
-# ``(id(prim_func), frozenset(pass_configs), target_str)``. We use ``id()``
+# ``(id(prim_func), frozen(pass_configs), target_str)``. We use ``id()``
 # rather than ``hash(prim_func)`` because TVM PrimFunc instances are not
 # generally hash-stable across re-imports (and may not be hashable at all
 # in older builds). ``id()`` is process-lifetime stable for any cached
 # prim_func — sufficient because callers in the cppmega.mlx tree hold a
 # module-level reference to their PrimFunc, so the id stays valid for the
 # full life of the cache.
-_LOWERING_CACHE: dict[
-    tuple[int, frozenset[tuple[str, Any]], str], TileLangMSLLowering
-] = {}
+#
+# fix-round-9 (Wave 4 grok finding #4): bound the cache. The key set scales
+# with (#PrimFuncs * #distinct pass_configs * #targets); bench shape sweeps
+# can probe dozens of configs and the keepalive list pinned every prim_func
+# strongly forever. Switch to an LRU OrderedDict with an env-tunable cap and
+# evict the matching keepalive entry alongside the cache entry.
+_LOWERING_CACHE_MAX_SIZE = max(
+    1, int(os.environ.get("CPPMEGA_LOWERING_CACHE_SIZE", "128"))
+)
+_LOWERING_CACHE: collections.OrderedDict[
+    tuple[int, Any, str], TileLangMSLLowering
+] = collections.OrderedDict()
 # Hold strong references so cached ids cannot be reused for a different
 # PrimFunc. (CPython only reuses an id() after the original object is GC'd;
 # keeping a strong reference here pins the PrimFunc and prevents that.)
-_LOWERING_CACHE_KEEPALIVE: list[Any] = []
+# Keyed by the same cache key so eviction can drop the matching ref together
+# with the cache entry, allowing GC.
+_LOWERING_CACHE_KEEPALIVE: collections.OrderedDict[
+    tuple[int, Any, str], Any
+] = collections.OrderedDict()
+
+
+def _freeze_for_hash(obj: Any) -> Any:
+    """Recursively convert ``obj`` into a hashable, structural representation.
+
+    fix-round-9 (Wave 4 grok finding #4): the previous ``frozenset(items())``
+    silently bypassed caching on any unhashable nested value (e.g., a
+    dict-of-dicts pass_config), causing repeated full lowering on the hot
+    path. This recurses into mappings/sequences/sets and stringifies anything
+    that's still unhashable at the leaves so we always get *some* stable key.
+    """
+
+    if isinstance(obj, dict):
+        return frozenset(
+            (_freeze_for_hash(k), _freeze_for_hash(v)) for k, v in obj.items()
+        )
+    if isinstance(obj, (list, tuple)):
+        return tuple(_freeze_for_hash(x) for x in obj)
+    if isinstance(obj, (set, frozenset)):
+        return frozenset(_freeze_for_hash(x) for x in obj)
+    try:
+        hash(obj)
+        return obj
+    except TypeError:
+        # Last-resort stringification — not pretty, but stable per-process and
+        # avoids the alternative of skipping the cache entirely.
+        return repr(obj)
 
 
 def _lowering_cache_key(
     prim_func: Any,
     target: str,
     pass_configs: dict[str, Any] | None,
-) -> tuple[int, frozenset[tuple[str, Any]], str] | None:
-    """Build a cache key, or return None if the inputs are not cacheable.
+) -> tuple[int, Any, str]:
+    """Build a cache key for the lowering cache.
 
-    ``pass_configs`` values must be hashable for the frozenset to work; if
-    any value is unhashable (e.g., a dict-of-dicts) we skip caching for
-    that call rather than raising.
+    Always succeeds: ``_freeze_for_hash`` falls back to ``repr()`` for any
+    leaf value that cannot be hashed, so we never silently skip caching.
     """
 
-    try:
-        cfg = frozenset((pass_configs or {}).items())
-    except TypeError:
-        return None
+    cfg = _freeze_for_hash(pass_configs or {})
     return (id(prim_func), cfg, target)
+
+
+def clear_lowering_cache() -> None:
+    """Public hook for tests/bench to reset the lowering cache + keepalive.
+
+    Drops every cached lowering result and the strong refs that pinned the
+    associated PrimFunc objects, allowing GC to reclaim them.
+    """
+
+    _LOWERING_CACHE.clear()
+    _LOWERING_CACHE_KEEPALIVE.clear()
+
+
+def _store_lowering_in_cache(
+    cache_key: tuple[int, Any, str],
+    prim_func: Any,
+    result: TileLangMSLLowering,
+) -> None:
+    """Insert (or refresh) a cache entry under LRU eviction."""
+
+    if cache_key in _LOWERING_CACHE:
+        _LOWERING_CACHE.move_to_end(cache_key)
+        _LOWERING_CACHE_KEEPALIVE.move_to_end(cache_key)
+        _LOWERING_CACHE[cache_key] = result
+        _LOWERING_CACHE_KEEPALIVE[cache_key] = prim_func
+        return
+    _LOWERING_CACHE[cache_key] = result
+    _LOWERING_CACHE_KEEPALIVE[cache_key] = prim_func
+    while len(_LOWERING_CACHE) > _LOWERING_CACHE_MAX_SIZE:
+        evicted_key, _ = _LOWERING_CACHE.popitem(last=False)
+        _LOWERING_CACHE_KEEPALIVE.pop(evicted_key, None)
 
 
 def lower_tilelang_to_msl_inline(
@@ -685,10 +925,12 @@ def lower_tilelang_to_msl_inline(
     # hashable for any reason, _lowering_cache_key returns None and we fall
     # through to the uncached slow path.
     cache_key = _lowering_cache_key(prim_func, target, pass_configs)
-    if cache_key is not None:
-        cached = _LOWERING_CACHE.get(cache_key)
-        if cached is not None:
-            return cached
+    cached = _LOWERING_CACHE.get(cache_key)
+    if cached is not None:
+        # fix-round-9 (Wave 4 grok finding #4): refresh LRU position on hit.
+        _LOWERING_CACHE.move_to_end(cache_key)
+        _LOWERING_CACHE_KEEPALIVE.move_to_end(cache_key)
+        return cached
 
     # fix-round-8 (Wave 3 grok-4): trigger the lazy libz3 preload here (instead
     # of at module-import time). By this point any conftest.py that wanted to
@@ -763,12 +1005,9 @@ def lower_tilelang_to_msl_inline(
         buffer_param_names=_parse_buffer_param_names(sig_text),
         kernel_name=_KERNEL_DEF_RE.search(msl_text).group("name"),  # type: ignore[union-attr]
     )
-    if cache_key is not None:
-        _LOWERING_CACHE[cache_key] = result
-        # Pin a strong ref so the cached id() cannot be reused. Bounded by
-        # the number of distinct (prim_func, pass_configs, target) tuples a
-        # process actually exercises, which is small in practice.
-        _LOWERING_CACHE_KEEPALIVE.append(prim_func)
+    # fix-round-9 (Wave 4 grok finding #4): bounded LRU store. Pins a strong
+    # ref to ``prim_func`` under the same key so eviction releases both.
+    _store_lowering_in_cache(cache_key, prim_func, result)
     return result
 
 
@@ -1018,6 +1257,7 @@ __all__ = [
     "_assert_path_c_metal_fp8_intrinsics_registered",
     "_register_path_c_metal_fp8_intrinsics",
     "can_run_metal",
+    "clear_lowering_cache",
     "dispatch",
     "ensure_libz3_preloaded",
     "lower_tilelang_to_msl_inline",
