@@ -3,7 +3,7 @@
   "kernel": "sparse_mla",
   "platform": "macOS-26.4.1-arm64-arm-64bit-Mach-O",
   "machine": "arm64",
-  "mlx_version": "0.31.1",
+  "mlx_version": "0.31.2",
   "fp16_carrier": true,
   "fwd_only": false,
   "strict_policy": {
@@ -19,12 +19,8 @@
     "phase": "all",
     "fwd_only": false,
     "failures": [
-      "B2_S128_H8_D64: forward strict gate failed paired C/B=inf path_b_ok=False path_c_ok=False",
-      "B2_S128_H8_D64: backward strict gate failed paired C/B=inf path_b_ok=False path_c_ok=False",
-      "B4_S512_H8_D64: forward strict gate failed paired C/B=inf path_b_ok=False path_c_ok=False",
-      "B4_S512_H8_D64: backward strict gate failed paired C/B=inf path_b_ok=False path_c_ok=False",
-      "B4_S1024_H8_D64: forward strict gate failed paired C/B=inf path_b_ok=False path_c_ok=False",
-      "B4_S1024_H8_D64: backward strict gate failed paired C/B=inf path_b_ok=False path_c_ok=False"
+      "B4_S1024_H8_D64: forward strict gate failed paired C/B=1.0018111836229635 path_b_ok=True path_c_ok=True",
+      "B4_S1024_H8_D64: backward strict gate failed paired C/B=1.0814509485342598 path_b_ok=True path_c_ok=True"
     ]
   },
   "path_b_status": {
@@ -50,66 +46,66 @@
       "fwd_reference_ms": {
         "label": "reference_fwd",
         "ok": true,
-        "median_ms": 0.3458955034147948,
-        "min_ms": 0.3270419838372618,
-        "max_ms": 0.5210000090301037,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 0.5502499989233911,
+        "min_ms": 0.36525001632981,
+        "max_ms": 1.0494579910300672,
+        "iters": 10,
+        "warmup": 3
       },
       "fwd_apply_ms": {
         "label": "apply_fwd",
         "ok": true,
-        "median_ms": 0.20806251268368214,
-        "min_ms": 0.19558300846256316,
-        "max_ms": 0.24791699252091348,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 0.22647948935627937,
+        "min_ms": 0.2145830076187849,
+        "max_ms": 0.23037497885525227,
+        "iters": 10,
+        "warmup": 3
       },
       "fwd_msl_ms": {
         "label": "path_b_msl_fwd",
         "ok": true,
-        "median_ms": 0.2024790010182187,
-        "min_ms": 0.19316698308102787,
-        "max_ms": 0.3789999755099416,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 0.20879149087704718,
+        "min_ms": 0.19720799173228443,
+        "max_ms": 0.2658749872352928,
+        "iters": 10,
+        "warmup": 3
       },
       "fwd_path_c_ms": {
         "label": "path_c_tilelang_fwd",
-        "ok": false,
-        "median_ms": null,
-        "min_ms": null,
-        "max_ms": null,
-        "iters": 20,
-        "warmup": 5,
-        "error": "RuntimeError: Path C sparse_mla_fwd_path_c did not dispatch"
+        "ok": true,
+        "median_ms": 0.20041700918227434,
+        "min_ms": 0.1833749993238598,
+        "max_ms": 0.24216598831117153,
+        "iters": 10,
+        "warmup": 3
       },
       "fwd_msl_paired_ms": {
         "label": "path_b_msl_fwd_paired",
-        "ok": false,
-        "median_ms": null,
-        "min_ms": null,
-        "max_ms": null,
-        "iters": 20,
-        "warmup": 5,
-        "error": "RuntimeError: Path C sparse_mla_fwd_path_c did not dispatch"
+        "ok": true,
+        "median_ms": 0.196917011635378,
+        "min_ms": 0.1880000054370612,
+        "max_ms": 0.5675000138580799,
+        "iters": 10,
+        "warmup": 3
       },
       "fwd_path_c_paired_ms": {
         "label": "path_c_tilelang_fwd_paired",
-        "ok": false,
-        "median_ms": null,
-        "min_ms": null,
-        "max_ms": null,
-        "iters": 20,
-        "warmup": 5,
-        "error": "RuntimeError: Path C sparse_mla_fwd_path_c did not dispatch"
+        "ok": true,
+        "median_ms": 0.19395799608901143,
+        "min_ms": 0.18779098172672093,
+        "max_ms": 0.22537499899044633,
+        "iters": 10,
+        "warmup": 3,
+        "pair_ratio_median": 0.9944458545099523,
+        "pair_ratio_min": 0.33759293737491763,
+        "pair_ratio_max": 1.1627277328657093
       },
-      "fwd_path_c_over_path_b_ratio": Infinity,
-      "fwd_path_c_over_path_b_paired_ratio": Infinity,
+      "fwd_path_c_over_path_b_ratio": 0.9598906944933671,
+      "fwd_path_c_over_path_b_paired_ratio": 0.9944458545099523,
       "path_c_over_path_b_max_ratio": 1.0,
-      "fwd_path_c_no_worse_than_path_b": false,
-      "fwd_path_c_no_worse_than_path_b_paired": false,
-      "fwd_path_c_unpaired_within_max_ratio": false,
+      "fwd_path_c_no_worse_than_path_b": true,
+      "fwd_path_c_no_worse_than_path_b_paired": true,
+      "fwd_path_c_unpaired_within_max_ratio": true,
       "path_b": {
         "available": true,
         "reason": "sparse_mla direct-MSL kernel built via mx.fast.metal_kernel is available; bypasses TileLang's T.gemm metal blocker."
@@ -121,116 +117,113 @@
       "bwd_reference_ms": {
         "label": "reference_bwd",
         "ok": true,
-        "median_ms": 0.6307709991233423,
-        "min_ms": 0.5643750191666186,
-        "max_ms": 2.1297080093063414,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 0.5005830171285197,
+        "min_ms": 0.47154200728982687,
+        "max_ms": 0.5894160130992532,
+        "iters": 10,
+        "warmup": 3
       },
       "bwd_msl_ms": {
         "label": "path_b_msl_bwd",
         "ok": true,
-        "median_ms": 0.3363544965395704,
-        "min_ms": 0.3267920110374689,
-        "max_ms": 0.3792500065173954,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 0.29656248807441443,
+        "min_ms": 0.2834589977283031,
+        "max_ms": 0.46120898332446814,
+        "iters": 10,
+        "warmup": 3
       },
       "bwd_msl_paired_ms": {
         "label": "path_b_msl_bwd_paired",
-        "ok": false,
-        "median_ms": null,
-        "min_ms": null,
-        "max_ms": null,
-        "iters": 20,
-        "warmup": 5,
-        "error": "RuntimeError: Path C sparse_mla_bwd_path_c did not dispatch"
+        "ok": true,
+        "median_ms": 0.354353993316181,
+        "min_ms": 0.3448750067036599,
+        "max_ms": 0.8831250015646219,
+        "iters": 10,
+        "warmup": 3
       },
       "bwd_msl_kernel_ms": {
         "label": "path_b_msl_bwd_kernel_only",
         "ok": true,
-        "median_ms": 0.2600205043563619,
-        "min_ms": 0.2481660048943013,
-        "max_ms": 0.3267499851062894,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 0.22706248273607343,
+        "min_ms": 0.2064580039586872,
+        "max_ms": 0.23708399385213852,
+        "iters": 10,
+        "warmup": 3
       },
       "bwd_msl_fresh_reduce_ms": {
         "label": "path_b_msl_bwd_fresh_reduce",
         "ok": true,
-        "median_ms": 0.3524790081428364,
-        "min_ms": 0.3423750167712569,
-        "max_ms": 0.5134580133017153,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 0.2862499968614429,
+        "min_ms": 0.2772090083453804,
+        "max_ms": 0.30970899388194084,
+        "iters": 10,
+        "warmup": 3
       },
       "bwd_msl_reduce_ms": {
         "label": "path_b_msl_bwd_reduce_only",
         "ok": true,
-        "median_ms": 0.24812501214910299,
-        "min_ms": 0.21904101595282555,
-        "max_ms": 0.3621250216383487,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 0.208854500669986,
+        "min_ms": 0.1968329888768494,
+        "max_ms": 0.22112499573267996,
+        "iters": 10,
+        "warmup": 3
       },
       "bwd_path_c_ms": {
         "label": "path_c_tilelang_bwd",
-        "ok": false,
-        "median_ms": null,
-        "min_ms": null,
-        "max_ms": null,
-        "iters": 20,
-        "warmup": 5,
-        "error": "RuntimeError: Path C sparse_mla_bwd_path_c did not dispatch"
+        "ok": true,
+        "median_ms": 0.3546874941093847,
+        "min_ms": 0.3393749939277768,
+        "max_ms": 0.8883749833330512,
+        "iters": 10,
+        "warmup": 3
       },
       "bwd_path_c_paired_ms": {
         "label": "path_c_tilelang_bwd_paired",
-        "ok": false,
-        "median_ms": null,
-        "min_ms": null,
-        "max_ms": null,
-        "iters": 20,
-        "warmup": 5,
-        "error": "RuntimeError: Path C sparse_mla_bwd_path_c did not dispatch"
+        "ok": true,
+        "median_ms": 0.33920850546564907,
+        "min_ms": 0.3216250042896718,
+        "max_ms": 0.38899999344721437,
+        "iters": 10,
+        "warmup": 3,
+        "pair_ratio_median": 0.9534192757412644,
+        "pair_ratio_min": 0.4044342422988917,
+        "pair_ratio_max": 1.084825536746018
       },
       "bwd_path_c_kernel_ms": {
         "label": "path_c_tilelang_bwd_kernel_only",
-        "ok": false,
-        "median_ms": null,
-        "min_ms": null,
-        "max_ms": null,
-        "iters": 20,
-        "warmup": 5,
-        "error": "RuntimeError: Path C backward partial kernel did not dispatch"
+        "ok": true,
+        "median_ms": 0.25154151080641896,
+        "min_ms": 0.23725000210106373,
+        "max_ms": 0.3191670111846179,
+        "iters": 10,
+        "warmup": 3
       },
       "bwd_path_c_fresh_reduce_ms": {
         "label": "path_c_tilelang_bwd_fresh_reduce",
-        "ok": false,
-        "median_ms": null,
-        "min_ms": null,
-        "max_ms": null,
-        "iters": 20,
-        "warmup": 5,
-        "error": "RuntimeError: Path C backward partial kernel did not dispatch"
+        "ok": true,
+        "median_ms": 0.3380205016583204,
+        "min_ms": 0.33195799915120006,
+        "max_ms": 0.3516249998938292,
+        "iters": 10,
+        "warmup": 3
       },
       "bwd_path_c_reduce_ms": {
         "label": "path_c_tilelang_bwd_reduce_only",
-        "ok": false,
-        "median_ms": null,
-        "min_ms": null,
-        "max_ms": null,
-        "iters": 20,
-        "warmup": 5,
-        "error": "kernel did not dispatch"
+        "ok": true,
+        "median_ms": 0.23749998945277184,
+        "min_ms": 0.22870799875818193,
+        "max_ms": 0.3897499991580844,
+        "iters": 10,
+        "warmup": 3
       },
-      "bwd_path_c_over_path_b_ratio": Infinity,
-      "bwd_path_c_over_path_b_paired_ratio": Infinity,
-      "bwd_path_c_kernel_over_path_b_kernel_ratio": Infinity,
-      "bwd_path_c_fresh_reduce_over_path_b_fresh_reduce_ratio": Infinity,
-      "bwd_path_c_reduce_over_path_b_reduce_ratio": Infinity,
-      "bwd_path_c_no_worse_than_path_b": false,
-      "bwd_path_c_no_worse_than_path_b_paired": false,
-      "bwd_blocker": "TileLang-lowered backward kernel slower than direct-MSL Path B kernel"
+      "bwd_path_c_over_path_b_ratio": 1.1959958132681479,
+      "bwd_path_c_over_path_b_paired_ratio": 0.9534192757412644,
+      "bwd_path_c_kernel_over_path_b_kernel_ratio": 1.1078074535932858,
+      "bwd_path_c_fresh_reduce_over_path_b_fresh_reduce_ratio": 1.1808576606620422,
+      "bwd_path_c_reduce_over_path_b_reduce_ratio": 1.1371552381724777,
+      "bwd_path_c_no_worse_than_path_b": true,
+      "bwd_path_c_no_worse_than_path_b_paired": true,
+      "bwd_blocker": "none: Path C backward is within strict ratio 1"
     },
     {
       "shape": {
@@ -246,65 +239,65 @@
       "fwd_reference_ms": {
         "label": "reference_fwd",
         "ok": true,
-        "median_ms": 0.9751454927027225,
-        "min_ms": 0.9131249971687794,
-        "max_ms": 1.140084001235664,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 0.906853994820267,
+        "min_ms": 0.8248329977504909,
+        "max_ms": 1.3709999911952764,
+        "iters": 10,
+        "warmup": 3
       },
       "fwd_apply_ms": {
         "label": "apply_fwd",
         "ok": true,
-        "median_ms": 0.3998540050815791,
-        "min_ms": 0.37041600444354117,
-        "max_ms": 0.5071659979876131,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 0.3503124898998067,
+        "min_ms": 0.3339999821037054,
+        "max_ms": 0.3591670247260481,
+        "iters": 10,
+        "warmup": 3
       },
       "fwd_msl_ms": {
         "label": "path_b_msl_fwd",
         "ok": true,
-        "median_ms": 0.35772898991126567,
-        "min_ms": 0.33599999733269215,
-        "max_ms": 0.5067919846624136,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 0.33222899946849793,
+        "min_ms": 0.3225000109523535,
+        "max_ms": 0.9111670078709722,
+        "iters": 10,
+        "warmup": 3
       },
       "fwd_path_c_ms": {
         "label": "path_c_tilelang_fwd",
-        "ok": false,
-        "median_ms": null,
-        "min_ms": null,
-        "max_ms": null,
-        "iters": 20,
-        "warmup": 5,
-        "error": "RuntimeError: Path C sparse_mla_fwd_path_c did not dispatch"
+        "ok": true,
+        "median_ms": 0.3493954864097759,
+        "min_ms": 0.26704202173277736,
+        "max_ms": 0.7470420096069574,
+        "iters": 10,
+        "warmup": 3
       },
       "fwd_msl_paired_ms": {
         "label": "path_b_msl_fwd_paired",
-        "ok": false,
-        "median_ms": null,
-        "min_ms": null,
-        "max_ms": null,
-        "iters": 20,
-        "warmup": 5,
-        "error": "RuntimeError: Path C sparse_mla_fwd_path_c did not dispatch"
+        "ok": true,
+        "median_ms": 0.293021003017202,
+        "min_ms": 0.28583299717865884,
+        "max_ms": 0.30779201188124716,
+        "iters": 10,
+        "warmup": 3
       },
       "fwd_path_c_paired_ms": {
         "label": "path_c_tilelang_fwd_paired",
-        "ok": false,
-        "median_ms": null,
-        "min_ms": null,
-        "max_ms": null,
-        "iters": 20,
-        "warmup": 5,
-        "error": "RuntimeError: Path C sparse_mla_fwd_path_c did not dispatch"
+        "ok": true,
+        "median_ms": 0.2858959778677672,
+        "min_ms": 0.27150000096298754,
+        "max_ms": 0.2998750132974237,
+        "iters": 10,
+        "warmup": 3,
+        "pair_ratio_median": 0.9748266077444726,
+        "pair_ratio_min": 0.8884627743841637,
+        "pair_ratio_max": 1.016032096392376
       },
-      "fwd_path_c_over_path_b_ratio": Infinity,
-      "fwd_path_c_over_path_b_paired_ratio": Infinity,
+      "fwd_path_c_over_path_b_ratio": 1.0516706457556115,
+      "fwd_path_c_over_path_b_paired_ratio": 0.9748266077444726,
       "path_c_over_path_b_max_ratio": 1.0,
-      "fwd_path_c_no_worse_than_path_b": false,
-      "fwd_path_c_no_worse_than_path_b_paired": false,
+      "fwd_path_c_no_worse_than_path_b": true,
+      "fwd_path_c_no_worse_than_path_b_paired": true,
       "fwd_path_c_unpaired_within_max_ratio": false,
       "path_b": {
         "available": true,
@@ -317,116 +310,113 @@
       "bwd_reference_ms": {
         "label": "reference_bwd",
         "ok": true,
-        "median_ms": 1.7288334929617122,
-        "min_ms": 1.5693329914938658,
-        "max_ms": 1.9352079834789038,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 1.3698755064979196,
+        "min_ms": 1.3008750102017075,
+        "max_ms": 1.7153749940916896,
+        "iters": 10,
+        "warmup": 3
       },
       "bwd_msl_ms": {
         "label": "path_b_msl_bwd",
         "ok": true,
-        "median_ms": 1.0948540002573282,
-        "min_ms": 0.9992920095100999,
-        "max_ms": 1.5130420215427876,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 0.9592704882379621,
+        "min_ms": 0.9210410062223673,
+        "max_ms": 1.3900829944759607,
+        "iters": 10,
+        "warmup": 3
       },
       "bwd_msl_paired_ms": {
         "label": "path_b_msl_bwd_paired",
-        "ok": false,
-        "median_ms": null,
-        "min_ms": null,
-        "max_ms": null,
-        "iters": 20,
-        "warmup": 5,
-        "error": "RuntimeError: Path C sparse_mla_bwd_path_c did not dispatch"
+        "ok": true,
+        "median_ms": 0.9300210076617077,
+        "min_ms": 0.9108330123126507,
+        "max_ms": 1.0267079924233258,
+        "iters": 10,
+        "warmup": 3
       },
       "bwd_msl_kernel_ms": {
         "label": "path_b_msl_bwd_kernel_only",
         "ok": true,
-        "median_ms": 0.5092289939057082,
-        "min_ms": 0.47274999087676406,
-        "max_ms": 0.5750420095864683,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 0.4742504970636219,
+        "min_ms": 0.4540420195553452,
+        "max_ms": 0.8899579988792539,
+        "iters": 10,
+        "warmup": 3
       },
       "bwd_msl_fresh_reduce_ms": {
         "label": "path_b_msl_bwd_fresh_reduce",
         "ok": true,
-        "median_ms": 0.9682915115263313,
-        "min_ms": 0.9048330248333514,
-        "max_ms": 1.3416669971775264,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 0.9336874936707318,
+        "min_ms": 0.9091669926419854,
+        "max_ms": 1.3217090163379908,
+        "iters": 10,
+        "warmup": 3
       },
       "bwd_msl_reduce_ms": {
         "label": "path_b_msl_bwd_reduce_only",
         "ok": true,
-        "median_ms": 0.575854501221329,
-        "min_ms": 0.5432500038295984,
-        "max_ms": 0.6253340106923133,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 0.5586460029007867,
+        "min_ms": 0.5365409888327122,
+        "max_ms": 0.6072089890949428,
+        "iters": 10,
+        "warmup": 3
       },
       "bwd_path_c_ms": {
         "label": "path_c_tilelang_bwd",
-        "ok": false,
-        "median_ms": null,
-        "min_ms": null,
-        "max_ms": null,
-        "iters": 20,
-        "warmup": 5,
-        "error": "RuntimeError: Path C sparse_mla_bwd_path_c did not dispatch"
+        "ok": true,
+        "median_ms": 0.9387079771840945,
+        "min_ms": 0.9115000138990581,
+        "max_ms": 1.204208005219698,
+        "iters": 10,
+        "warmup": 3
       },
       "bwd_path_c_paired_ms": {
         "label": "path_c_tilelang_bwd_paired",
-        "ok": false,
-        "median_ms": null,
-        "min_ms": null,
-        "max_ms": null,
-        "iters": 20,
-        "warmup": 5,
-        "error": "RuntimeError: Path C sparse_mla_bwd_path_c did not dispatch"
+        "ok": true,
+        "median_ms": 0.9164164948742837,
+        "min_ms": 0.9017910051625222,
+        "max_ms": 1.3256660022307187,
+        "iters": 10,
+        "warmup": 3,
+        "pair_ratio_median": 0.9855883398048408,
+        "pair_ratio_min": 0.896067818795582,
+        "pair_ratio_max": 1.38162167877749
       },
       "bwd_path_c_kernel_ms": {
         "label": "path_c_tilelang_bwd_kernel_only",
-        "ok": false,
-        "median_ms": null,
-        "min_ms": null,
-        "max_ms": null,
-        "iters": 20,
-        "warmup": 5,
-        "error": "RuntimeError: Path C backward partial kernel did not dispatch"
+        "ok": true,
+        "median_ms": 0.471104503958486,
+        "min_ms": 0.4621249972842634,
+        "max_ms": 0.8262089977506548,
+        "iters": 10,
+        "warmup": 3
       },
       "bwd_path_c_fresh_reduce_ms": {
         "label": "path_c_tilelang_bwd_fresh_reduce",
-        "ok": false,
-        "median_ms": null,
-        "min_ms": null,
-        "max_ms": null,
-        "iters": 20,
-        "warmup": 5,
-        "error": "RuntimeError: Path C backward partial kernel did not dispatch"
+        "ok": true,
+        "median_ms": 0.9618330077501014,
+        "min_ms": 0.9283749968744814,
+        "max_ms": 1.444624998839572,
+        "iters": 10,
+        "warmup": 3
       },
       "bwd_path_c_reduce_ms": {
         "label": "path_c_tilelang_bwd_reduce_only",
-        "ok": false,
-        "median_ms": null,
-        "min_ms": null,
-        "max_ms": null,
-        "iters": 20,
-        "warmup": 5,
-        "error": "kernel did not dispatch"
+        "ok": true,
+        "median_ms": 0.5609369982266799,
+        "min_ms": 0.5338329938240349,
+        "max_ms": 0.8909169991966337,
+        "iters": 10,
+        "warmup": 3
       },
-      "bwd_path_c_over_path_b_ratio": Infinity,
-      "bwd_path_c_over_path_b_paired_ratio": Infinity,
-      "bwd_path_c_kernel_over_path_b_kernel_ratio": Infinity,
-      "bwd_path_c_fresh_reduce_over_path_b_fresh_reduce_ratio": Infinity,
-      "bwd_path_c_reduce_over_path_b_reduce_ratio": Infinity,
-      "bwd_path_c_no_worse_than_path_b": false,
-      "bwd_path_c_no_worse_than_path_b_paired": false,
-      "bwd_blocker": "TileLang-lowered backward kernel slower than direct-MSL Path B kernel"
+      "bwd_path_c_over_path_b_ratio": 0.978564428588189,
+      "bwd_path_c_over_path_b_paired_ratio": 0.9855883398048408,
+      "bwd_path_c_kernel_over_path_b_kernel_ratio": 0.9933663894405707,
+      "bwd_path_c_fresh_reduce_over_path_b_fresh_reduce_ratio": 1.0301444693970543,
+      "bwd_path_c_reduce_over_path_b_reduce_ratio": 1.0041009786412094,
+      "bwd_path_c_no_worse_than_path_b": true,
+      "bwd_path_c_no_worse_than_path_b_paired": true,
+      "bwd_blocker": "none: Path C backward is within strict ratio 1"
     },
     {
       "shape": {
@@ -442,62 +432,62 @@
       "fwd_reference_ms": {
         "label": "reference_fwd",
         "ok": true,
-        "median_ms": 1.869229003204964,
-        "min_ms": 1.8209159898106009,
-        "max_ms": 1.9551670120563358,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 1.8706045084400102,
+        "min_ms": 1.8104159971699119,
+        "max_ms": 2.278208005009219,
+        "iters": 10,
+        "warmup": 3
       },
       "fwd_apply_ms": {
         "label": "apply_fwd",
         "ok": true,
-        "median_ms": 0.6408545013982803,
-        "min_ms": 0.6213749875314534,
-        "max_ms": 0.6820840062573552,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 0.616979508777149,
+        "min_ms": 0.6067499925848097,
+        "max_ms": 0.6809580081608146,
+        "iters": 10,
+        "warmup": 3
       },
       "fwd_msl_ms": {
         "label": "path_b_msl_fwd",
         "ok": true,
-        "median_ms": 0.6240420188987628,
-        "min_ms": 0.5932080093771219,
-        "max_ms": 0.7286669861059636,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 0.6237920024432242,
+        "min_ms": 0.6013340025674552,
+        "max_ms": 0.7268750050570816,
+        "iters": 10,
+        "warmup": 3
       },
       "fwd_path_c_ms": {
         "label": "path_c_tilelang_fwd",
-        "ok": false,
-        "median_ms": null,
-        "min_ms": null,
-        "max_ms": null,
-        "iters": 20,
-        "warmup": 5,
-        "error": "RuntimeError: Path C sparse_mla_fwd_path_c did not dispatch"
+        "ok": true,
+        "median_ms": 0.6457084964495152,
+        "min_ms": 0.5959169939160347,
+        "max_ms": 1.0181249817833304,
+        "iters": 10,
+        "warmup": 3
       },
       "fwd_msl_paired_ms": {
         "label": "path_b_msl_fwd_paired",
-        "ok": false,
-        "median_ms": null,
-        "min_ms": null,
-        "max_ms": null,
-        "iters": 20,
-        "warmup": 5,
-        "error": "RuntimeError: Path C sparse_mla_fwd_path_c did not dispatch"
+        "ok": true,
+        "median_ms": 0.6268335127970204,
+        "min_ms": 0.6045829795766622,
+        "max_ms": 1.0208330058958381,
+        "iters": 10,
+        "warmup": 3
       },
       "fwd_path_c_paired_ms": {
         "label": "path_c_tilelang_fwd_paired",
-        "ok": false,
-        "median_ms": null,
-        "min_ms": null,
-        "max_ms": null,
-        "iters": 20,
-        "warmup": 5,
-        "error": "RuntimeError: Path C sparse_mla_fwd_path_c did not dispatch"
+        "ok": true,
+        "median_ms": 0.634854004601948,
+        "min_ms": 0.6107919907663018,
+        "max_ms": 0.7138749933801591,
+        "iters": 10,
+        "warmup": 3,
+        "pair_ratio_median": 1.0018111836229635,
+        "pair_ratio_min": 0.5983270400140497,
+        "pair_ratio_max": 1.1244339279217026
       },
-      "fwd_path_c_over_path_b_ratio": Infinity,
-      "fwd_path_c_over_path_b_paired_ratio": Infinity,
+      "fwd_path_c_over_path_b_ratio": 1.0351342978435922,
+      "fwd_path_c_over_path_b_paired_ratio": 1.0018111836229635,
       "path_c_over_path_b_max_ratio": 1.0,
       "fwd_path_c_no_worse_than_path_b": false,
       "fwd_path_c_no_worse_than_path_b_paired": false,
@@ -513,116 +503,113 @@
       "bwd_reference_ms": {
         "label": "reference_bwd",
         "ok": true,
-        "median_ms": 4.084354484803043,
-        "min_ms": 3.934916981961578,
-        "max_ms": 4.401750018587336,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 3.9911249914439395,
+        "min_ms": 3.800957987550646,
+        "max_ms": 4.367166984593496,
+        "iters": 10,
+        "warmup": 3
       },
       "bwd_msl_ms": {
         "label": "path_b_msl_bwd",
         "ok": true,
-        "median_ms": 3.057207999518141,
-        "min_ms": 2.9697089921683073,
-        "max_ms": 3.1908329983707517,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 3.136082988930866,
+        "min_ms": 3.0271660070866346,
+        "max_ms": 3.647082980023697,
+        "iters": 10,
+        "warmup": 3
       },
       "bwd_msl_paired_ms": {
         "label": "path_b_msl_bwd_paired",
-        "ok": false,
-        "median_ms": null,
-        "min_ms": null,
-        "max_ms": null,
-        "iters": 20,
-        "warmup": 5,
-        "error": "RuntimeError: Path C sparse_mla_bwd_path_c did not dispatch"
+        "ok": true,
+        "median_ms": 3.0860625120112672,
+        "min_ms": 3.0205000075511634,
+        "max_ms": 3.1896659929770976,
+        "iters": 10,
+        "warmup": 3
       },
       "bwd_msl_kernel_ms": {
         "label": "path_b_msl_bwd_kernel_only",
         "ok": true,
-        "median_ms": 1.2605625088326633,
-        "min_ms": 1.2374999932944775,
-        "max_ms": 1.3048750115558505,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 1.2732289906125516,
+        "min_ms": 1.2442920124158263,
+        "max_ms": 1.6839580202940851,
+        "iters": 10,
+        "warmup": 3
       },
       "bwd_msl_fresh_reduce_ms": {
         "label": "path_b_msl_bwd_fresh_reduce",
         "ok": true,
-        "median_ms": 3.0483955051749945,
-        "min_ms": 2.9819170013070107,
-        "max_ms": 3.12266600667499,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 3.200833496521227,
+        "min_ms": 3.0227089882828295,
+        "max_ms": 3.5200840211473405,
+        "iters": 10,
+        "warmup": 3
       },
       "bwd_msl_reduce_ms": {
         "label": "path_b_msl_bwd_reduce_only",
         "ok": true,
-        "median_ms": 1.9146255071973428,
-        "min_ms": 1.8508329812902957,
-        "max_ms": 2.071333001367748,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 1.9561255176085979,
+        "min_ms": 1.84304200229235,
+        "max_ms": 2.280916989548132,
+        "iters": 10,
+        "warmup": 3
       },
       "bwd_path_c_ms": {
         "label": "path_c_tilelang_bwd",
-        "ok": false,
-        "median_ms": null,
-        "min_ms": null,
-        "max_ms": null,
-        "iters": 20,
-        "warmup": 5,
-        "error": "RuntimeError: Path C sparse_mla_bwd_path_c did not dispatch"
+        "ok": true,
+        "median_ms": 3.172333992552012,
+        "min_ms": 2.998083975398913,
+        "max_ms": 3.7057500157970935,
+        "iters": 10,
+        "warmup": 3
       },
       "bwd_path_c_paired_ms": {
         "label": "path_c_tilelang_bwd_paired",
-        "ok": false,
-        "median_ms": null,
-        "min_ms": null,
-        "max_ms": null,
-        "iters": 20,
-        "warmup": 5,
-        "error": "RuntimeError: Path C sparse_mla_bwd_path_c did not dispatch"
+        "ok": true,
+        "median_ms": 3.3463125000707805,
+        "min_ms": 3.1017499859444797,
+        "max_ms": 3.553709015250206,
+        "iters": 10,
+        "warmup": 3,
+        "pair_ratio_median": 1.0814509485342598,
+        "pair_ratio_min": 0.9815225368034229,
+        "pair_ratio_max": 1.1749157357150586
       },
       "bwd_path_c_kernel_ms": {
         "label": "path_c_tilelang_bwd_kernel_only",
-        "ok": false,
-        "median_ms": null,
-        "min_ms": null,
-        "max_ms": null,
-        "iters": 20,
-        "warmup": 5,
-        "error": "RuntimeError: Path C backward partial kernel did not dispatch"
+        "ok": true,
+        "median_ms": 1.3036040036240593,
+        "min_ms": 1.2460830039344728,
+        "max_ms": 1.6750420036260039,
+        "iters": 10,
+        "warmup": 3
       },
       "bwd_path_c_fresh_reduce_ms": {
         "label": "path_c_tilelang_bwd_fresh_reduce",
-        "ok": false,
-        "median_ms": null,
-        "min_ms": null,
-        "max_ms": null,
-        "iters": 20,
-        "warmup": 5,
-        "error": "RuntimeError: Path C backward partial kernel did not dispatch"
+        "ok": true,
+        "median_ms": 3.1531669956166297,
+        "min_ms": 2.98529100837186,
+        "max_ms": 3.71595800970681,
+        "iters": 10,
+        "warmup": 3
       },
       "bwd_path_c_reduce_ms": {
         "label": "path_c_tilelang_bwd_reduce_only",
-        "ok": false,
-        "median_ms": null,
-        "min_ms": null,
-        "max_ms": null,
-        "iters": 20,
-        "warmup": 5,
-        "error": "kernel did not dispatch"
+        "ok": true,
+        "median_ms": 1.9890830153599381,
+        "min_ms": 1.901332987472415,
+        "max_ms": 2.2922079951968044,
+        "iters": 10,
+        "warmup": 3
       },
-      "bwd_path_c_over_path_b_ratio": Infinity,
-      "bwd_path_c_over_path_b_paired_ratio": Infinity,
-      "bwd_path_c_kernel_over_path_b_kernel_ratio": Infinity,
-      "bwd_path_c_fresh_reduce_over_path_b_fresh_reduce_ratio": Infinity,
-      "bwd_path_c_reduce_over_path_b_reduce_ratio": Infinity,
+      "bwd_path_c_over_path_b_ratio": 1.011559325358767,
+      "bwd_path_c_over_path_b_paired_ratio": 1.0814509485342598,
+      "bwd_path_c_kernel_over_path_b_kernel_ratio": 1.0238566771849062,
+      "bwd_path_c_fresh_reduce_over_path_b_fresh_reduce_ratio": 0.9851080973263986,
+      "bwd_path_c_reduce_over_path_b_reduce_ratio": 1.0168483553098533,
       "bwd_path_c_no_worse_than_path_b": false,
       "bwd_path_c_no_worse_than_path_b_paired": false,
-      "bwd_blocker": "TileLang-lowered backward kernel slower than direct-MSL Path B kernel"
+      "bwd_blocker": "mixed overhead: Path C backward slower without one phase exceeding 10%"
     }
   ]
 }
