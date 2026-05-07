@@ -639,20 +639,58 @@ def _q_cache_bytes(BLOCK_SQ: int, AH: int, AD: int, in_dtype: str) -> int:
     return BLOCK_SQ * AH * AD * dtype_bytes
 
 
+def _q_cache_budget_bytes(target: str) -> int:
+    """Per-target shared-memory budget for the wave-5 full Q-cache."""
+
+    if _is_metal(target):
+        return _Q_CACHE_BUDGET_METAL_BYTES
+    if target.startswith("hip"):
+        return _Q_CACHE_BUDGET_HIP_BYTES
+    return _Q_CACHE_BUDGET_CUDA_BYTES
+
+
 def _can_use_q_cache_v5(
     BLOCK_SQ: int, AH: int, AD: int, in_dtype: str, target: str
 ) -> bool:
     """Return True iff the wave-5 full Q-cache (AH, BLOCK_SQ, AD) shared
-    fragment fits within the per-target shared-memory budget.
+    fragment fits within the per-target shared-memory budget at the
+    requested ``BLOCK_SQ``.
+
+    Use :func:`_can_use_q_cache_v5_tiled` when you want the largest
+    ``BLOCK_SQ`` that fits instead of a yes/no answer at a fixed value.
     """
 
-    n = _q_cache_bytes(BLOCK_SQ, AH, AD, in_dtype)
-    if _is_metal(target):
-        return n <= _Q_CACHE_BUDGET_METAL_BYTES
-    if target.startswith("hip"):
-        return n <= _Q_CACHE_BUDGET_HIP_BYTES
-    # CUDA / NVRTC default
-    return n <= _Q_CACHE_BUDGET_CUDA_BYTES
+    return _q_cache_bytes(BLOCK_SQ, AH, AD, in_dtype) <= _q_cache_budget_bytes(target)
+
+
+# Wave-8 #3: production DSA decoder shapes (AH>=8, AD>=64) blow the
+# fixed BLOCK_SQ=64 budget on Metal (16 KB) -- the wave-5 "~2x speedup"
+# claim never fires there. _can_use_q_cache_v5_tiled lets the caller
+# pick the largest power-of-two BLOCK_SQ that fits the per-target
+# budget instead of bouncing the kernel back to wave-4 wholesale.
+_Q_CACHE_TILE_BLOCK_SQ_CHOICES: tuple[int, ...] = (64, 32, 16, 8)
+
+
+def _can_use_q_cache_v5_tiled(
+    AH: int, AD: int, in_dtype: str, target: str
+) -> int | None:
+    """Pick the largest ``BLOCK_SQ`` in {64, 32, 16, 8} that lets the
+    wave-5 full Q-cache fit the per-target shared-memory budget, or
+    ``None`` if even the smallest tile is over budget.
+
+    Examples (Metal, fp16, 16 KB budget):
+
+        AH=4,  AD=64  -> 64   (4 * 64 * 64 * 2 = 32 KB ... wait, 16 KB)
+        AH=4,  AD=64  -> 32   (4 * 32 * 64 * 2 = 16 KB exactly, fits)
+        AH=8,  AD=64  -> 16   (8 * 16 * 64 * 2 = 16 KB exactly)
+        AH=128, AD=64 -> None (128 * 8 * 64 * 2 = 128 KB even at smallest)
+    """
+
+    budget = _q_cache_budget_bytes(target)
+    for block_sq in _Q_CACHE_TILE_BLOCK_SQ_CHOICES:
+        if _q_cache_bytes(block_sq, AH, AD, in_dtype) <= budget:
+            return block_sq
+    return None
 
 
 def make_dsa_splitk_stage2_kernel(
@@ -1376,13 +1414,19 @@ def dsa_splitk_indexer_loss_tilelang(
     )
 
     # Stage 2 (with wave-5 budget-gated full Q hoist when it fits).
-    _wave5_q_cache = _can_use_q_cache_v5(
-        BLOCK_SQ=stage2_kw["BLOCK_SQ"],
-        AH=AH,
-        AD=AD,
-        in_dtype=in_dtype,
-        target=target,
+    # Wave-8 #3: try tiled BLOCK_SQ ∈ {64, 32, 16, 8} so production DSA
+    # shapes (AH>=8, AD>=64) reach the wave-5 path on Metal instead of
+    # bouncing wholesale to wave-4. Falls through to the wave-4 path
+    # (use_q_cache_v5=False) only when even BLOCK_SQ=8 is over budget.
+    _wave5_block_sq = _can_use_q_cache_v5_tiled(
+        AH=AH, AD=AD, in_dtype=in_dtype, target=target
     )
+    if _wave5_block_sq is not None:
+        _stage2_block_sq = _wave5_block_sq
+        _wave5_q_cache = True
+    else:
+        _stage2_block_sq = stage2_kw["BLOCK_SQ"]
+        _wave5_q_cache = False
     stage2 = _stage2_kernel_for(
         AB,
         AH,
@@ -1393,7 +1437,7 @@ def dsa_splitk_indexer_loss_tilelang(
         scale_bits,
         in_dtype,
         target,
-        stage2_kw["BLOCK_SQ"],
+        _stage2_block_sq,
         stage2_kw["BLOCK_SK"],
         stage2_kw["BLOCK_D"],
         stage2_kw["threads"],
@@ -1445,22 +1489,28 @@ def _bench_stage2_q_hoist_wave5(
     stage1_kw, stage2_kw = _block_constants_for_target(target, AH=AH)
     scale_bits = _scale_to_bits(1.0 / math.sqrt(AD)) if AD > 0 else _scale_to_bits(1.0)
 
-    fits = _can_use_q_cache_v5(
-        BLOCK_SQ=stage2_kw["BLOCK_SQ"], AH=AH, AD=AD, in_dtype=in_dtype, target=target
+    # Wave-8 #3: prefer the tiled budget gate so production DSA shapes
+    # (AH>=8, AD=64) still bench wave-5 by halving BLOCK_SQ instead of
+    # skipping outright.
+    tiled_block_sq = _can_use_q_cache_v5_tiled(
+        AH=AH, AD=AD, in_dtype=in_dtype, target=target
     )
-    if not fits:
+    if tiled_block_sq is None:
         return {
             "skipped": (
-                f"Q-cache (AH={AH}, BLOCK_SQ={stage2_kw['BLOCK_SQ']}, AD={AD}) "
-                f"does not fit target {target!r} budget"
+                f"Q-cache (AH={AH}, AD={AD}) does not fit target "
+                f"{target!r} budget at any tile in {_Q_CACHE_TILE_BLOCK_SQ_CHOICES}"
             )
         }
 
     timings: dict[str, float] = {}
-    for label, use_v5 in (("wave4_ms", False), ("wave5_ms", True)):
+    for label, use_v5, block_sq in (
+        ("wave4_ms", False, stage2_kw["BLOCK_SQ"]),
+        ("wave5_ms", True, tiled_block_sq),
+    ):
         kernel = _stage2_kernel_for(
             AB, AH, AD, Sk, ASq, False, scale_bits, in_dtype, target,
-            stage2_kw["BLOCK_SQ"], stage2_kw["BLOCK_SK"], stage2_kw["BLOCK_D"],
+            block_sq, stage2_kw["BLOCK_SK"], stage2_kw["BLOCK_D"],
             stage2_kw["threads"], stage2_kw["num_stages"],
             use_q_cache_v5=use_v5,
         )
