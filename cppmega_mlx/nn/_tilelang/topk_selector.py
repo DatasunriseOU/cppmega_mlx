@@ -122,6 +122,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+import threading
 from dataclasses import dataclass, replace
 from functools import lru_cache
 from typing import Any
@@ -159,6 +160,9 @@ _TOPK_PATH_C_CANDIDATE_PASS_CONFIGS: dict[str, Any] = {
 
 _TOPK_PATH_C_FILTERED_KEYS_LOGGED: set[str] = set()
 _TOPK_PATH_C_PASS_CONFIGS_CACHE: dict[str, Any] | None = None
+# Guards first-time populate of ``_TOPK_PATH_C_PASS_CONFIGS_CACHE`` so two
+# MLX threads lowering this kernel concurrently don't race the probe loop.
+_topk_path_c_pass_configs_cache_lock = threading.Lock()
 
 
 def _topk_filter_supported_pass_configs(candidates: dict[str, Any]) -> dict[str, Any]:
@@ -203,11 +207,12 @@ def _topk_path_c_pass_configs() -> dict[str, Any]:
     ):
         return {}
     global _TOPK_PATH_C_PASS_CONFIGS_CACHE
-    if _TOPK_PATH_C_PASS_CONFIGS_CACHE is None:
-        _TOPK_PATH_C_PASS_CONFIGS_CACHE = _topk_filter_supported_pass_configs(
-            _TOPK_PATH_C_CANDIDATE_PASS_CONFIGS
-        )
-    return dict(_TOPK_PATH_C_PASS_CONFIGS_CACHE)
+    with _topk_path_c_pass_configs_cache_lock:
+        if _TOPK_PATH_C_PASS_CONFIGS_CACHE is None:
+            _TOPK_PATH_C_PASS_CONFIGS_CACHE = _topk_filter_supported_pass_configs(
+                _TOPK_PATH_C_CANDIDATE_PASS_CONFIGS
+            )
+        return dict(_TOPK_PATH_C_PASS_CONFIGS_CACHE)
 
 
 # TileLang's eager builder reads these module globals after _path_c_kernel_for
