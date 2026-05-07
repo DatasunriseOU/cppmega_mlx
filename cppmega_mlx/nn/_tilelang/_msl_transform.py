@@ -117,7 +117,19 @@ def _preload_libz3_for_dev_tilelang() -> None:
                 # Set _done only AFTER the dlopen actually succeeds.
                 _preload_libz3_for_dev_tilelang._done = True  # type: ignore[attr-defined]
                 return
-        except OSError:
+        except FileNotFoundError:
+            # fix-round-5: TOCTOU — file vanished between exists() and dlopen.
+            # Not actionable; try next candidate silently.
+            continue
+        except OSError as e:
+            # fix-round-5: distinguish a *broken* libz3 (e.g., wrong arch,
+            # corrupt dylib, missing transitive dep) from a missing file.
+            # Surface broken libs so they don't get hidden by the silent retry.
+            import logging as _logging
+
+            _logging.getLogger(__name__).warning(
+                "libz3 preload at %s failed: %s", candidate, e
+            )
             continue
     # No candidate succeeded — bump the failed-attempts counter so we'll
     # stop retrying once we've tried enough times. _done stays unset so that
