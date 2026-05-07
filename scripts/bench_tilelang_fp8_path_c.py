@@ -76,16 +76,11 @@ def _first_existing_path(candidates: Iterable[Path], fallback: Path) -> Path:
 
 
 def _default_tilelang_root() -> Path:
-    return _first_existing_path(
-        (
-            # Active fork-with-Z3 checkout (DatasunriseOU/tilelang).
-            Path("/private/tmp/tl_apache_tvm_swap"),
-            Path("/private/tmp/tl_pr_c"),
-            Path("/private/tmp/cppmega-mlx-tilelang-stack-c"),
-            Path("/private/tmp/tilelang_apple_head/tilelang"),
-        ),
-        Path("/private/tmp/tilelang_apple_head/tilelang"),
-    )
+    # Convergence 2026-05-07: collapsed to single canonical worktree
+    # (DatasunriseOU/tilelang fork, branch `main`). Old fallback candidates
+    # (`tl_pr_c`, `cppmega-mlx-tilelang-stack-c`, `tilelang_apple_head/`)
+    # removed — they pointed at stale forks now archived.
+    return Path("/private/tmp/tl_apache_tvm_swap")
 
 
 def _default_tvm_root(tilelang_root: Path) -> Path:
