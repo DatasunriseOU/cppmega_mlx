@@ -1313,6 +1313,14 @@ def dsa_splitk_indexer_loss_tilelang(
     ASq, AB, AH, AD = (int(query.shape[0]), int(query.shape[1]), int(query.shape[2]), int(query.shape[3]))
     Sk = int(key.shape[0])
 
+    # Wave-10 #1 (grok+meta HIGH consensus): zero-size early-out. Without this,
+    # ASq=0 / AB=0 / AH=0 / AD=0 / Sk=0 reaches T.ceildiv(N, BLOCK_*) inside
+    # stage-1/stage-2 kernel build → div-by-zero → CUDA illegal memory access
+    # / Metal host crash. Attacker scenario: malicious ONNX with attention mask
+    # length 0. Match the documented return contract (0-d fp32 scalar).
+    if ASq == 0 or AB == 0 or AH == 0 or AD == 0 or Sk == 0:
+        return torch.zeros((), device=query.device, dtype=torch.float32)
+
     if AH > 128:
         raise ValueError(
             "dsa_splitk_indexer_loss_tilelang: AH > 128 is numerically unsafe in "
