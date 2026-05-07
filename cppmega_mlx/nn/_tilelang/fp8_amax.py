@@ -573,6 +573,17 @@ _TORCH_DTYPE_TO_TL: dict[torch.dtype, str] = {
 
 
 def _resolve_in_dtype(tensor: torch.Tensor) -> str:
+    # Wave-12 #4 (meta wave-11 MED): strict floating-point gate BEFORE the
+    # dict lookup. A custom torch dtype that has ``__torch_dtype__='float16'``
+    # but ``is_floating_point=False`` (supply-chain attack via custom torch
+    # fork) would otherwise pass the dict lookup and hit the kernel with
+    # int bit-patterns reinterpreted as fp16, producing garbage amax and
+    # corrupting the downstream inv_scale.
+    if not getattr(tensor.dtype, "is_floating_point", False):
+        raise TypeError(
+            f"fp8_amax_tilelang: input must have a floating-point dtype, "
+            f"got {tensor.dtype!r} (is_floating_point=False)"
+        )
     tl_dtype = _TORCH_DTYPE_TO_TL.get(tensor.dtype)
     if tl_dtype is None:
         raise TypeError(
