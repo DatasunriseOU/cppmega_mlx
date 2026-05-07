@@ -80,7 +80,7 @@ def _filter_supported_pass_configs(candidates: dict[str, Any]) -> dict[str, Any]
         try:
             with tvm.transform.PassContext(opt_level=3, config={key: value}):
                 pass
-        except Exception:
+        except (AttributeError, KeyError, TypeError):
             if key not in _FP8_VECMAT_PATH_C_FILTERED_KEYS_LOGGED:
                 _FP8_VECMAT_PATH_C_FILTERED_KEYS_LOGGED.add(key)
                 print(
@@ -401,6 +401,8 @@ def _uses_fp8_dot4_packed_macro(*, vec: int, K: int) -> bool:
 
     structural_match = vec == 4
     if not structural_match:
+        return False
+    if K <= 0:
         return False
     k_aligned = (K % 4 == 0)
     if not k_aligned:
