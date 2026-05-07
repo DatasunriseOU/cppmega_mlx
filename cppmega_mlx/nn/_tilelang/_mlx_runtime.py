@@ -206,7 +206,17 @@ _METAL_BUILTIN_PARAM_NAMES: frozenset[str] = frozenset(
 
 
 def _parse_buffer_param_names(sig_text: str) -> list[str]:
-    """Return ``device``/``constant``-qualified buffer names, in order."""
+    """Return ``device``/``constant``-qualified buffer names, in order.
+
+    Skips TileLang's auto-emitted scalar-args struct (``constant
+    foo_kernel_args_t& arg [[ buffer(N) ]]``). That parameter is a
+    *reference to a struct of scalars* (e.g. ``n_elements``,
+    ``gridDim_0``) -- it is NOT a user data tensor and the caller
+    cannot pass an ``mx.array`` for it. Detection is via two stable
+    markers: the type ends in ``_args_t`` AND the parameter is passed
+    by reference (``&``) rather than by pointer (``*``). User data
+    buffers always come through as ``device <T>* <name>``.
+    """
 
     names: list[str] = []
     for decl in _split_signature_decls(sig_text):
@@ -218,6 +228,13 @@ def _parse_buffer_param_names(sig_text: str) -> list[str]:
         is_device = re.search(r"\bdevice\b", clean) is not None
         is_constant = re.search(r"\bconstant\b", clean) is not None
         if not (is_device or is_constant):
+            continue
+        # Strip array extents to keep the by-ref detection clean.
+        type_part = re.sub(r"\[[^\]]*\]\s*$", "", clean).strip()
+        # TileLang's args struct: ``constant foo_kernel_args_t& arg``. We
+        # detect by the pair (passed-by-reference, type-name ends in
+        # ``_args_t``). Either heuristic alone is too aggressive.
+        if "&" in type_part and re.search(r"_args_t\s*&", type_part):
             continue
         ident = _extract_param_identifier(clean)
         if ident is None:

@@ -139,6 +139,65 @@ kernel void sum_and_diff(
     assert np.allclose(diff_result, a_np - b_np, atol=1e-6, rtol=1e-6)
 
 
+def test_wrap_skips_tilelang_args_struct() -> None:
+    """TileLang's auto-emitted scalar-args struct must NOT be counted as
+    a user data buffer by the parser.
+
+    When TileLang lowers a PrimFunc that has scalar runtime args (e.g.
+    ``n_elements`` for vector_add), it emits a ``constant
+    <kernel>_kernel_args_t&`` parameter at the *end* of the kernel
+    signature. That parameter holds *scalars*, not a user-supplied data
+    tensor; counting it would cause the buffer count check to inflate
+    beyond ``input_count + output_count`` and the wrap call would fail
+    with ``buffer count mismatch`` when the caller can only pass
+    ``mx.array`` data buffers, not the scalars struct.
+
+    Regression for the e2e numeric harness vector_add path
+    (poc/triton_frontend/_test_harness/numeric_smoke.py).
+    """
+    from cppmega_mlx.nn._tilelang._mlx_runtime import wrap_tilelang_metal_kernel
+
+    src = """
+#include <metal_stdlib>
+using namespace metal;
+
+struct vector_add_kernel_args_t {
+  int n_elements[2];
+  int gridDim_0[2];
+};
+
+kernel void vector_add_kernel(
+    device float* arg0 [[ buffer(0) ]],
+    device float* arg1 [[ buffer(1) ]],
+    device float* arg2 [[ buffer(2) ]],
+    constant vector_add_kernel_args_t& arg [[ buffer(3) ]],
+    uint blockIdx [[threadgroup_position_in_grid]]
+) {
+    uint id = blockIdx;
+    if (id < arg.n_elements[0]) {
+        arg2[id] = arg0[id] + arg1[id];
+    }
+}
+"""
+
+    # 3 user data buffers (a, b, c) + the args struct. The wrapper must
+    # see only the 3 user buffers; the ``_args_t&`` is filtered out.
+    adapter = wrap_tilelang_metal_kernel(src, input_count=2, output_count=1)
+    assert adapter.buffer_names == ("arg0", "arg1", "arg2")
+    assert adapter.input_names == ("inp0", "inp1")
+    assert adapter.output_names == ("out0",)
+    # The body's user-buffer references must be renamed.
+    assert "inp0[id]" in adapter.body
+    assert "inp1[id]" in adapter.body
+    assert "out0[id]" in adapter.body
+    # The args struct identifier ``arg`` must NOT have been renamed away
+    # (it is referenced by the body via ``arg.n_elements[0]``); the
+    # rename map only contains user-buffer names. The prefix-collision
+    # check below is conservative -- ``arg0/1/2`` start with ``arg`` but
+    # the regex uses ``\b`` so the bare ``arg`` identifier is preserved.
+    assert "arg.n_elements[0]" in adapter.body
+
+
 def test_wrap_skips_cleanly_when_mlx_unavailable() -> None:
     """When mlx.fast.metal_kernel is missing, build() raises MLXRuntimeError.
 
