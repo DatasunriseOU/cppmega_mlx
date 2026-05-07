@@ -130,6 +130,10 @@ from typing import Any
 import mlx.core as mx
 
 from cppmega_mlx.nn._tilelang import _msl_transform
+from cppmega_mlx.nn._tilelang._engine_dispatch import (
+    dispatch_lower,
+    tilelang_engine_mode,
+)
 
 
 # CPPMEGA Z3 wiring (beads cppmega-mlx-cuz):
@@ -1063,12 +1067,29 @@ def _path_c_kernel_for(
                 for i in T.serial(_TOPK_C_K):
                     indices[bx, i] = pair_idx[0, _TOPK_C_K - 1 - i]
 
-    lowering = _path_c_rewrite_merge_round(
-        _msl_transform.lower_tilelang_to_msl_inline(
-            topk_selector_kernel,
-            pass_configs=_topk_path_c_pass_configs(),
+    # Migration phase-2: route the lowering through the shared
+    # ``dispatch_lower`` helper. In ``shim``/``auto`` modes (default) this
+    # returns a :class:`TileLangMSLLowering`, preserving the existing
+    # ``mx.fast.metal_kernel`` path. In ``engine`` mode it returns a
+    # ``tilelang.compile`` artifact stamped with ``_tilelang_engine_target``;
+    # the engine artifact is returned directly so callers can dispatch via the
+    # unified runtime instead of MLX's MSL kernel wrapper.
+    artifact = dispatch_lower(topk_selector_kernel, target="metal")
+    if getattr(artifact, "_tilelang_engine_target", None) is not None:
+        return artifact, None  # engine path: caller invokes the artifact directly
+
+    # Shim path: rewrite the merge round + wrap in mx.fast.metal_kernel as before.
+    lowering = _path_c_rewrite_merge_round(artifact)
+    if _topk_path_c_pass_configs() and getattr(artifact, "pass_configs", None) is None:
+        # The shim helper does not currently thread ``pass_configs`` through
+        # ``dispatch_lower``; re-lower through ``_msl_transform`` so the
+        # tuned PassConfigs (Z3 idea #4 / #9) actually apply on the shim path.
+        lowering = _path_c_rewrite_merge_round(
+            _msl_transform.lower_tilelang_to_msl_inline(
+                topk_selector_kernel,
+                pass_configs=_topk_path_c_pass_configs(),
+            )
         )
-    )
     kernel = mx.fast.metal_kernel(
         name=f"cppmega_topk_selector_path_c_{batch}_{seq_len}_{k}_{threads}_{score_dtype}",
         input_names=["ends", "scores", "starts"],
@@ -1123,6 +1144,17 @@ def topk_selector_tilelang(
         kernel, lowering = _path_c_kernel_for(batch, seq_len, int(k), threads, score_dtype)
     except Exception:
         return None
+
+    if lowering is None:
+        # Engine path: ``kernel`` is a ``tilelang.compile`` artifact. Invoke it
+        # directly via its standard ``__call__`` contract. Failures here surface
+        # as ``None`` to keep the public selector contract stable.
+        try:
+            indices = mx.zeros((batch, int(k)), dtype=mx.int32)
+            kernel(work_scores, starts_buf, ends_buf, indices)
+            return indices
+        except Exception:
+            return None
 
     grid = (
         lowering.grid[0] * lowering.threadgroup[0],
