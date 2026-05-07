@@ -53,11 +53,25 @@ def tilelang_engine_mode() -> str:
 
 
 def _engine_compile(prim_func: Any, target: str) -> Any:
-    """Run ``tilelang.compile`` and stamp the result with the target tag."""
+    """Run ``tilelang.compile`` and stamp the result with the target tag.
+
+    Normalizes legacy CLI-form metal targets (e.g.
+    ``"metal -thread_warp_size=32"``) through ``_as_metal_target`` from
+    ``_msl_transform`` so they bypass tilelang's ``determine_target``
+    base-name allowlist (which rejects strings with ``-flag=value``
+    suffixes post-#2143). Non-string targets (already-built
+    ``tvm.target.Target`` objects) pass through unchanged.
+    """
 
     import tilelang  # noqa: F401  - intentional eager import for ImportError surfacing
 
-    artifact = tilelang.compile(prim_func, target=target, out_idx=None)
+    compile_target: Any = target
+    if isinstance(target, str) and target.startswith("metal") and "-" in target:
+        from cppmega_mlx.nn._tilelang._msl_transform import _as_metal_target
+
+        compile_target = _as_metal_target(target)
+
+    artifact = tilelang.compile(prim_func, target=compile_target, out_idx=None)
     try:
         setattr(artifact, "_tilelang_engine_target", target)
     except (AttributeError, TypeError):

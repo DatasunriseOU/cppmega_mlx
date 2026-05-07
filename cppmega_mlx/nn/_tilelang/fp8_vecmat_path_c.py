@@ -824,9 +824,26 @@ def _fp8_vecmat_kernel_for(
     # In ``shim``/``auto`` modes (default) it returns a
     # :class:`TileLangMSLLowering`; in ``engine`` mode it returns a
     # ``tilelang.compile`` artifact stamped with ``_tilelang_engine_target``.
+    #
+    # 2026-05-07 fix: tilelang engine artifacts are NOT mx.array-callable —
+    # invoking ``kernel(A, A_scale, B, B_scale, output)`` on a
+    # ``CompiledArtifact`` raises ``RuntimeError: Unsupported argument type``
+    # because the engine expects DLPack/torch-style tensors, not mx.array.
+    # Until a proper MLX↔engine bridge lands, force shim mode for this kernel
+    # so the lowered MSL goes through ``mx.fast.metal_kernel`` (which DOES
+    # accept mx.array).
     from cppmega_mlx.nn._tilelang._engine_dispatch import dispatch_lower
+    import os as _os
 
-    artifact = dispatch_lower(prim, target=TILELANG_METAL_VECMAT_TARGET)
+    _saved_engine_mode = _os.environ.get("CPPMEGA_MLX_TILELANG_ENGINE")
+    _os.environ["CPPMEGA_MLX_TILELANG_ENGINE"] = "shim"
+    try:
+        artifact = dispatch_lower(prim, target=TILELANG_METAL_VECMAT_TARGET)
+    finally:
+        if _saved_engine_mode is None:
+            _os.environ.pop("CPPMEGA_MLX_TILELANG_ENGINE", None)
+        else:
+            _os.environ["CPPMEGA_MLX_TILELANG_ENGINE"] = _saved_engine_mode
 
     if getattr(artifact, "_tilelang_engine_target", None) is not None:
         # Engine path: return the artifact directly. Callers branch on
