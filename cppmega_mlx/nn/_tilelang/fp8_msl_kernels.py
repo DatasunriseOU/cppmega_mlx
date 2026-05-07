@@ -1,5 +1,20 @@
 """Vendored FP8 (e4m3fn) MSL kernels for Apple Silicon.
 
+.. note::
+   **Migration phase-3 status**: this module remains on raw MSL Path-B and is
+   *not* routed through ``_engine_dispatch.dispatch_lower``. All eight kernels
+   are FP8-specific shaders; flipping them to the unified engine requires the
+   FP8 SIMDgroup fragment factories (``simdgroup_a_fp8`` / ``simdgroup_b_fp8``)
+   in ``tilelang/language/extern.py`` plus an Apple-silicon FP8 hardware path.
+   Until those land, callers stay on ``mx.fast.metal_kernel`` here. See
+   ``MIGRATION_PLAN.md §2.4`` and gap #7.
+
+   TODO(fp8-factories): when the factories land, replace each
+   ``mx.fast.metal_kernel`` body with a Path-C ``@T.prim_func`` invoking
+   ``tl.extern_intrinsic`` with the appropriate ``simdgroup_*_fp8`` Frag, then
+   route through ``_engine_dispatch.dispatch_lower`` so CUDA / HIP get the
+   same kernels for free.
+
 Source attribution
 ------------------
 

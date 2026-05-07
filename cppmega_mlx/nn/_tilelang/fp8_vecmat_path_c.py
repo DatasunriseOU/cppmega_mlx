@@ -9,6 +9,28 @@ It is intentionally scoped to the inference shape that matters for this lane:
 The default Metal lowering uses a TileLang intrinsic for packed uint32 e4m3
 dot4 decode plus ``tvm_thread_allreduce`` across K. That keeps the generated
 MSL on the same hot-loop shape as Path B's hand-written vecmat kernel.
+
+Migration phase-3 (2026-05-07)
+------------------------------
+``_fp8_vecmat_kernel_for`` now routes its lowering through
+:func:`cppmega_mlx.nn._tilelang._engine_dispatch.dispatch_lower`, mirroring
+the topk_selector / sparse_mla_blockscaled migrations. In the default
+``shim``/``auto`` modes the cache still returns the historical 6-tuple
+``(kernel, lowering, input_names, output_shape, grid, threadgroup)`` so
+existing call sites are unchanged. Setting
+``CPPMEGA_MLX_TILELANG_ENGINE=engine`` makes ``dispatch_lower`` return a
+``tilelang.compile`` artifact directly; the cache then exposes
+``(artifact, None, ["A","A_scale","B","B_scale"], (n,), grid, threadgroup)``
+and ``fp8_scaled_vecmat_path_c`` invokes the artifact's ``__call__``
+contract instead of going through ``mx.fast.metal_kernel``. The
+shim path still re-lowers via ``lower_tilelang_to_msl_inline`` so the
+PassConfigs (Z3 idea #4 / #9) actually apply in the legacy emission.
+
+The vendored FP8 MSL inner kernel (``fp8_msl_kernels.fp8_scaled_vecmat``)
+keeps using the legacy ``mx.fast.metal_kernel`` path because the proper
+FP8 SIMDgroup fragment factories (``simdgroup_a_fp8`` / ``simdgroup_b_fp8``)
+do not exist yet in ``tilelang/language/extern.py``. See
+``MIGRATION_PLAN.md §2.4`` gap #7 — TODO(fp8-factories).
 """
 
 from __future__ import annotations
@@ -798,11 +820,42 @@ def _fp8_vecmat_kernel_for(
         vectorized_loads=vectorized_loads,
         scale_w_per_row=scale_w_per_row,
     )
-    lowering = lower_tilelang_to_msl_inline(
-        prim,
-        target=TILELANG_METAL_VECMAT_TARGET,
-        pass_configs=_fp8_vecmat_pass_configs(),
-    )
+    # Migration phase-3: route the lowering decision through ``dispatch_lower``.
+    # In ``shim``/``auto`` modes (default) it returns a
+    # :class:`TileLangMSLLowering`; in ``engine`` mode it returns a
+    # ``tilelang.compile`` artifact stamped with ``_tilelang_engine_target``.
+    from cppmega_mlx.nn._tilelang._engine_dispatch import dispatch_lower
+
+    artifact = dispatch_lower(prim, target=TILELANG_METAL_VECMAT_TARGET)
+
+    if getattr(artifact, "_tilelang_engine_target", None) is not None:
+        # Engine path: return the artifact directly. Callers branch on
+        # ``lowering is None`` to dispatch via the unified runtime instead of
+        # ``mx.fast.metal_kernel``. Output shape is always flat (n,) on the
+        # engine path because the artifact owns its own buffer layout.
+        input_names = ["A", "A_scale", "B", "B_scale"]
+        output_shape: tuple[int, ...] = (N,)
+        # Engine artifacts manage their own grid / threadgroup launch — we
+        # report ``(0, 0, 0)`` placeholders so callers know to invoke
+        # ``artifact.__call__`` rather than thread these through MLX.
+        result = (artifact, None, input_names, output_shape, (0, 0, 0), (0, 0, 0))
+        with _FP8_VECMAT_KERNEL_CACHE_LOCK:
+            _FP8_VECMAT_KERNEL_CACHE[cache_key] = result
+        return result
+
+    # Shim path: ``dispatch_lower`` already produced a TileLangMSLLowering
+    # for us, but the shim helper does not currently thread ``pass_configs``
+    # through (Z3 idea #4 / #9), so re-lower through ``_msl_transform`` to
+    # ensure the tuned PassConfigs actually apply on the legacy MSL emission.
+    pass_configs = _fp8_vecmat_pass_configs()
+    if pass_configs and getattr(artifact, "pass_configs", None) is None:
+        lowering = lower_tilelang_to_msl_inline(
+            prim,
+            target=TILELANG_METAL_VECMAT_TARGET,
+            pass_configs=pass_configs,
+        )
+    else:
+        lowering = artifact
     tilelang_input_names = [name for name in lowering.buffer_param_names if name != "C"]
     if set(tilelang_input_names) != {"A", "A_scale", "B", "B_scale"}:
         raise MSLDispatchUnsupported(
@@ -1032,6 +1085,22 @@ def fp8_scaled_vecmat_path_c(
             f"MSLDispatchUnsupported during kernel build: {exc}"
         )
         return None
+
+    # Migration phase-3 engine path: when ``CPPMEGA_MLX_TILELANG_ENGINE=engine``
+    # the cache returned a ``tilelang.compile`` artifact instead of an
+    # ``mx.fast.metal_kernel``. Invoke its ``__call__`` contract directly
+    # rather than going through MLX's MSL kernel wrapper. Failures surface
+    # as ``None`` so the public selector contract (Path-C may decline) holds.
+    if _lowering is None:
+        try:
+            output = mx.zeros((n,), dtype=mx.float32)
+            kernel(A, A_scale, B, B_scale, output)
+            return output
+        except Exception as exc:
+            _warn_path_c_unavailable(
+                f"engine artifact dispatch failed: {exc.__class__.__name__}: {exc}"
+            )
+            return None
 
     # grok correctness P1: route the dispatch decision through
     # ``_canonicalize_macro_output_shape`` so a TileLang version that emits
