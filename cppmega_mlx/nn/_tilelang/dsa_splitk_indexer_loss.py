@@ -978,9 +978,15 @@ def make_dsa_splitk_stage2_kernel(
                                 T.cast(0, "float32"),
                             )
                         if valid:
-                            denom = d_h[i]
-                            if denom <= T.cast(0, "float32"):
-                                denom = T.cast(1, "float32")
+                            # Single-assignment denom: avoid IfFrame rebind that
+                            # leaks the immutable IR var outside its defining
+                            # region (same pattern as the wave-7 ``s`` fix in
+                            # commit cac10a0).
+                            denom = T.if_then_else(
+                                d_h[i] <= T.cast(0, "float32"),
+                                T.cast(1, "float32"),
+                                d_h[i],
+                            )
                             softmax_attn[i, j] = softmax_attn[i, j] + T.exp(s - m_h[i]) / denom
 
                 # Average over heads.
@@ -992,9 +998,12 @@ def make_dsa_splitk_stage2_kernel(
                     sq_idx = sq_block_id * BLOCK_SQ + i
                     sk_idx = sk_tile * BLOCK_SK + j
                     valid = (sq_idx < ASq) and (sk_idx < Sk)
-                    denom1 = d1_local[i]
-                    if denom1 <= T.cast(0, "float32"):
-                        denom1 = T.cast(1, "float32")
+                    # Single-assignment denom1 (cf. wave-7 ``s`` fix cac10a0).
+                    denom1 = T.if_then_else(
+                        d1_local[i] <= T.cast(0, "float32"),
+                        T.cast(1, "float32"),
+                        d1_local[i],
+                    )
                     # Predicate IndexScores / IndexMask reads on bounds to
                     # avoid OOB on boundary tiles.
                     if valid:
