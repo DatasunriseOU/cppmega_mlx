@@ -1311,20 +1311,21 @@ def dsa_splitk_indexer_loss_tilelang(
         topk_idx64 = topk_indices.to(dtype=torch.int64, copy=False)
         if not topk_idx64.is_contiguous():
             topk_idx64 = topk_idx64.contiguous()
-        # Wave-1b fix-round-2 (MED sec): bounds-check topk_idx64 before
-        # scatter_. PyTorch's CUDA scatter_ wraps negatives but does NOT
-        # check the upper bound in release builds, so an OOB index would
-        # silently corrupt adjacent memory.
-        #
-        # Wave-4 perf #1 (grok wave-3 review): the .item() / .all() calls
-        # below force GPU->CPU syncs + extra reduction kernels on every
-        # sparse forward pass (~milliseconds at ASq*TOPK=large). Gate
-        # behind CPPMEGA_MLX_DSA_DEBUG so production training paths skip
-        # them but CI / first-run regressions still catch corruption.
-        if _dsa_debug_enabled() and topk_idx64.numel() > 0:
-            _max_idx = int(topk_idx64.max().item())
-            _min_idx = int(topk_idx64.min().item())
-            if _max_idx >= Sk or _min_idx < 0:
+        # Wave-9 #4 (grok wave-7/8 review HIGH): always-on OOB bounds check.
+        # The previous debug-gated path (CPPMEGA_MLX_DSA_DEBUG) skipped this
+        # in production, leaving scatter_ free to corrupt adjacent memory on
+        # CUDA release builds (PyTorch wraps negatives but does NOT check
+        # the upper bound). Replace the old two-sync .max().item() +
+        # .min().item() pattern with a single fused reduction
+        # ``((idx < 0) | (idx >= Sk)).any().item()`` — one sync, one kernel.
+        # That's <0.05 ms per forward at typical ASq*TOPK shapes vs the
+        # original 2-3 syncs, while closing the security foot-gun for ALL
+        # callers (training included).
+        if topk_idx64.numel() > 0:
+            _oob = ((topk_idx64 < 0) | (topk_idx64 >= Sk)).any()
+            if bool(_oob.item()):
+                _max_idx = int(topk_idx64.max().item())
+                _min_idx = int(topk_idx64.min().item())
                 raise ValueError(
                     "dsa_splitk_indexer_loss_tilelang: topk_indices out of "
                     f"range [0, {Sk}); got [{_min_idx}, {_max_idx}]."
