@@ -18,6 +18,20 @@ helper (``lower_tilelang_to_msl``) that takes a ``@T.prim_func`` PrimFunc and
 returns the MLX-callable kernel handle plus thread/grid metadata. Body
 extraction is done inline rather than wrapping into ``inline void`` because
 Apple's MSL forbids ``threadgroup`` allocations in non-kernel functions.
+
+Z3 roadmap note (cppmega-mlx-cuz wiring):
+    This module operates on TileLang's *post-MSL textual output* — it splits
+    the emitted MSL kernel signature/body, rewrites a handful of Apple Metal
+    builtin aliases, and inlines the body for ``mx.fast.metal_kernel``. None
+    of the Z3 roadmap proofs (idea #1 contiguity, #4 bound-check drop, #9
+    simd-lift, #10 fp8 dot4 legality) operate at this layer — they all run
+    inside TileLang lowering before the MSL string is generated. Therefore
+    enabling/disabling those Z3 passes is *independent* of this module: any
+    redundant runtime checks the Z3 passes prove away live in the calling
+    kernels (e.g. ``fp8_vecmat_path_c.py``), not here. The lowering helper
+    below now accepts an optional ``pass_configs`` dict so callers can opt
+    their PrimFunc into the actually-shipped Z3 PassConfigs without having
+    to re-import TVM in each module.
 """
 
 from __future__ import annotations
@@ -432,6 +446,7 @@ def lower_tilelang_to_msl_inline(
     prim_func: Any,
     *,
     target: str = "metal",
+    pass_configs: dict[str, Any] | None = None,
 ) -> TileLangMSLLowering:
     """Lower a TileLang PrimFunc to MSL and prepare an inline body for MLX.
 
@@ -443,6 +458,23 @@ def lower_tilelang_to_msl_inline(
 
     Raises ``MSLDispatchUnsupported`` when tilelang or its Metal target is
     unavailable, mirroring the pure-MLX fallback contract.
+
+    ``pass_configs`` (cppmega-mlx-cuz Z3 wiring): optional dict of TileLang
+    pass-config keys to enable for *this* lowering only. Threaded through a
+    ``tvm.transform.PassContext`` around the engine ``lower`` call so a
+    kernel can opt in to Z3-roadmap passes without flipping any global flag.
+    Conservative-by-default: each pass falls back to its legacy code path
+    when its proof obligation is not discharged. Currently shipped keys
+    relevant to Path C kernels:
+      * ``tl.simd_lift_reductions`` (Z3 idea #9, detection-only today).
+      * ``tl.drop_provable_bound_checks`` (Z3 idea #4).
+      * ``tl.auto_double_buffer`` (Z3 idea #2, gated stub).
+    Idea #10 (fp8 dot4 legality) and idea #11 (intra-warp barrier elision)
+    do not currently expose PassConfig keys in the in-tree TileLang fork —
+    #10 is enforced inside ``T.fp8_scaled_matmul`` directly and gated by
+    the ``TILELANG_DISABLE_FP8_DOT4_AUTO`` env var; #11 has not landed yet.
+    Callers should filter their pass-config dict at runtime: not every
+    candidate key is registered with the active ``libtilelang`` build.
     """
 
     try:
@@ -454,7 +486,15 @@ def lower_tilelang_to_msl_inline(
         ) from exc
 
     _ensure_single_libtvm_ffi_image()
-    artifact = tl_lower(prim_func, target=tvm.target.Target(target))
+    metal_target = tvm.target.Target(target)
+    if pass_configs:
+        # opt_level=3 mirrors tilelang.jit.kernel.JitKernel default, so the
+        # only behavioural delta vs. the legacy (no-PassContext) path is the
+        # caller-supplied config dict.
+        with tvm.transform.PassContext(opt_level=3, config=dict(pass_configs)):
+            artifact = tl_lower(prim_func, target=metal_target)
+    else:
+        artifact = tl_lower(prim_func, target=metal_target)
 
     grid = [1, 1, 1]
     block = [1, 1, 1]
