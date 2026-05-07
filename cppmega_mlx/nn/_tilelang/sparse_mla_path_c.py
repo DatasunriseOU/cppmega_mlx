@@ -121,6 +121,44 @@ def _insert_forward_all_masked_fast_return(msl: str, *, d_v: int, threads: int) 
     return msl.replace(row_max_decl, fast_return, 1)
 
 
+def _strip_z3_hoisted_address_decls(msl: str) -> str:
+    """Drop z3-final's algebraic hoists of address bases ahead of canonicalization.
+
+    z3-final's CommonSubexprElimTIR/algebraic_simplify passes hoist expressions
+    such as ``int h = (((int)threadgroup_position_in_grid.x) & 1)``,
+    ``int q_row_base = (... * 16)``, ``int idx_base = ((... >> 1) * 4)`` etc. to
+    the top of the kernel body — *above* the ``float sm_scale = sm_scale_buf[0];``
+    marker that ``_canonicalize_fwd_lane_indexing`` keys off when injecting
+    ``int gid = int(blockIdx.x);``. The hoisted expressions therefore reference
+    a ``gid`` that has not yet been declared and they collide (with conflicting
+    ``int`` vs ``uint`` types) with the unsigned address basics that
+    ``_canonicalize_fwd_base_indexing`` re-injects right after the marker. The
+    canonical fix is to delete the hoisted declarations up-front; the
+    canonicalization passes re-emit equivalent ``uint`` versions further down.
+    Idempotent: a no-op if z3-final did not hoist these (older builds).
+    """
+
+    # Each pattern matches one of the hoisted decls. ``threadgroup_position_in_grid.x``
+    # may already have been textually rewritten to ``gid`` by an earlier pass —
+    # match either form.
+    hoisted_names = (
+        "h",
+        "b",
+        "g",
+        "q_row_base",
+        "kv_b_base",
+        "idx_base",
+        "out_row",
+        "d_out_row",
+        "dkv_partial_base",
+    )
+    hoisted_pattern = re.compile(
+        r"(?m)^[ \t]*int (?:" + "|".join(hoisted_names) + r") = "
+        r"(?:0|\([^\n]*(?:threadgroup_position_in_grid\.x|gid)[^\n]*\));\n"
+    )
+    return hoisted_pattern.sub("", msl)
+
+
 def _canonicalize_fwd_lane_indexing(
     msl: str,
     *,
@@ -129,6 +167,12 @@ def _canonicalize_fwd_lane_indexing(
     d_v: int,
 ) -> str:
     """Trim TileLang lane-loop syntax back to Path-B-style MSL loops."""
+
+    # z3-final hoists address-base computations above ``sm_scale = sm_scale_buf[0]``.
+    # Remove them before injecting ``gid``/``tid`` so they don't reference an
+    # undeclared identifier or collide with the ``uint`` address bases that
+    # ``_canonicalize_fwd_base_indexing`` re-emits after the marker.
+    msl = _strip_z3_hoisted_address_decls(msl)
 
     marker = "  float sm_scale = sm_scale_buf[0];"
     if marker in msl and "  int tid = int(threadIdx.x);" not in msl:
@@ -174,6 +218,12 @@ def _canonicalize_fwd_lane_indexing(
             r"indices[((gid >> \g<shift>) * \g<mult>) + k]",
             msl,
         )
+        # After ``((_tmp * N) + tid)`` collapses to ``k``, the inner-body ``int k = k;``
+        # / ``int k_N = k;`` decls become tautologies. Drop them — the outer ``for``
+        # loop owns ``k``, and the per-iteration aliases are unused (modulo a few
+        # warnings the test suite cares about).
+        msl = re.sub(r"(?m)^[ \t]*int k = k;\n", "", msl)
+        msl = re.sub(r"(?m)^[ \t]*int k_\d+ = k;\n", "", msl)
 
     d_loop_limit = d_v + threads - 1
     d_header = (
@@ -194,6 +244,8 @@ def _canonicalize_fwd_lane_indexing(
             r"out[(gid * \g<dim>) + d]",
             msl,
         )
+        # Same cleanup as the topk loop: drop tautological ``int d_N = d;`` aliases.
+        msl = re.sub(r"(?m)^[ \t]*int d_\d+ = d;\n", "", msl)
     return msl
 
 
@@ -583,6 +635,16 @@ def _canonicalize_fwd_base_indexing(
         r"\g<indent>int gather_idx = \g<idx>;",
         msl,
     )
+    # Output-projection kd loop also reads ``gather_idx`` once per inner step;
+    # z3-final leaves this as a bare assignment because the original lowering
+    # had a thread-local ``int gather_idx[1]`` that we strip. Promote it to a
+    # declaration so the identifier is in scope.
+    msl = re.sub(
+        r"(?m)^(?P<indent>[ \t]*)gather_idx = "
+        r"(?P<idx>indices\[\(\(\(gid >> \d+\) \* \d+\) \+ k_\d+\)\]);",
+        r"\g<indent>int gather_idx = \g<idx>;",
+        msl,
+    )
     msl = re.sub(r"\buint kv_row_base_1 = ", "uint kv_row_base = ", msl)
     msl = re.sub(r"\bkv\[kv_row_base_1 \+ d\]", "kv[kv_row_base + d]", msl)
     return msl
@@ -685,6 +747,9 @@ def _canonicalize_bwd_lane_indexing(
 ) -> str:
     """Trim backward TileLang lane loops to the Path-B-style Metal shape."""
 
+    # See _strip_z3_hoisted_address_decls — same hoist hazard on the bwd path.
+    msl = _strip_z3_hoisted_address_decls(msl)
+
     marker = "  float sm_scale = sm_scale_buf[0];"
     if marker in msl and "  int tid = int(threadIdx.x);" not in msl:
         msl = msl.replace(
@@ -761,6 +826,15 @@ def _canonicalize_bwd_lane_indexing(
     msl = re.sub(r"d_out\[\({2,}\(gid \* (?P<dim>\d+)\) \+ \(kd % (?P=dim)\)\)\]", r"d_out[(gid * \g<dim>) + (kd % \g<dim>)]", msl)
     msl = re.sub(r"dq\[\({2,}\(gid \* (?P<dim>\d+)\) \+ d\)\]", r"dq[(gid * \g<dim>) + d]", msl)
     msl = re.sub(r"dkv_partial\[\({2,}\(gid \* (?P<stride>\d+)\) \+ kd\)\]", r"dkv_partial[(gid * \g<stride>) + kd]", msl)
+
+    # Drop tautological aliases (cf. fwd path) — ``int k = k;``, ``int kd = ...``,
+    # ``int d_N = d;``. The outer ``for (uint k = tid; ...)`` already owns these.
+    msl = re.sub(r"(?m)^[ \t]*int k = k;\n", "", msl)
+    msl = re.sub(r"(?m)^[ \t]*int k_\d+ = k;\n", "", msl)
+    msl = re.sub(r"(?m)^[ \t]*int kd = \(\(kd - tid\) \+ tid\);\n", "", msl)
+    msl = re.sub(r"(?m)^[ \t]*int kd_\d+ = kd;\n", "", msl)
+    msl = re.sub(r"(?m)^[ \t]*int d_\d+ = d;\n", "", msl)
+    msl = re.sub(r"(?m)^[ \t]*int d = d;\n", "", msl)
 
     return msl
 
@@ -1232,6 +1306,21 @@ def _canonicalize_bwd_base_indexing(
         r"\g<indent>int gather_idx = \g<idx>;",
         msl,
     )
+    # Bwd output-projection / dq paths leave bare ``gather_idx = indices[...]``
+    # assignments where the original ``thread int gather_idx[1]`` decl has been
+    # stripped. Promote them to declarations so the symbol is in scope.
+    msl = re.sub(
+        r"(?m)^(?P<indent>[ \t]*)gather_idx = "
+        r"(?P<idx>indices\[\(\(\(gid >> \d+\) \* \d+\) \+ k_\d+\)\]);",
+        r"\g<indent>int gather_idx = \g<idx>;",
+        msl,
+    )
+    msl = re.sub(
+        r"(?m)^(?P<indent>[ \t]*)gather_idx = "
+        r"(?P<idx>indices\[idx_base \+ \(kd / \d+\)\]);",
+        r"\g<indent>int gather_idx = \g<idx>;",
+        msl,
+    )
     return msl
 
 
@@ -1532,6 +1621,13 @@ def _postprocess_lowered_msl(
     d_v: int | None = None,
     threads: int | None = None,
 ) -> str:
+    # The TIR uses ``T.float32(-1.0e38)`` as a finite stand-in for ``-INFINITY``
+    # because ``-T.infinity('float32')`` was tripping z3-final's canonicalizer
+    # in upstream tilelang. The lowered MSL therefore reads ``-1.000000e+38f``
+    # everywhere we previously had ``-INFINITY``. Normalize back so the rest of
+    # the canonicalization regexes (and the all-masked fast-return) keep
+    # matching against the historical token.
+    msl = msl.replace("-1.000000e+38f", "-INFINITY")
     msl = _remove_redundant_kv_bounds_checks(msl, seq_len_kv=seq_len_kv)
     if remove_flat_kv_bounds:
         msl = _remove_redundant_flat_kv_bounds_checks(msl)
@@ -1741,7 +1837,7 @@ def _fwd_kernel_for(
             for k in T.serial(lane, TOPK, step=THREADS):
                 gather_idx[0] = indices[idx_base + k]
                 if gather_idx[0] < 0:
-                    scores[k] = -T.infinity("float32")
+                    scores[k] = T.float32(-1.0e38)
                 else:
                     acc[0] = 0.0
                     kv_row_base = kv_b_base + (gather_idx[0] * KV_GROUP + g) * QK_DIM
@@ -1752,7 +1848,7 @@ def _fwd_kernel_for(
                     scores[k] = acc[0] * sm_scale
             T.sync_threads()
 
-            local[0] = -T.infinity("float32")
+            local[0] = T.float32(-1.0e38)
             for k in T.serial(lane, TOPK, step=THREADS):
                 if scores[k] > local[0]:
                     local[0] = scores[k]
@@ -1767,7 +1863,7 @@ def _fwd_kernel_for(
             row_max = reduce_buf[0]
 
             for k in T.serial(lane, TOPK, step=THREADS):
-                if scores[k] == -T.infinity("float32"):
+                if scores[k] == T.float32(-1.0e38):
                     scores[k] = 0.0
                 else:
                     scores[k] = T.exp(scores[k] - row_max)
@@ -1921,7 +2017,7 @@ def _bwd_kernel_for(
             for k in T.serial(lane, TOPK, step=THREADS):
                 gather_idx[0] = indices[idx_base + k]
                 if gather_idx[0] < 0:
-                    scores[k] = -T.infinity("float32")
+                    scores[k] = T.float32(-1.0e38)
                 else:
                     acc[0] = 0.0
                     kv_row_base = kv_b_base + (gather_idx[0] * KV_GROUP + g) * QK_DIM
@@ -1932,7 +2028,7 @@ def _bwd_kernel_for(
                     scores[k] = acc[0] * sm_scale
             T.sync_threads()
 
-            local[0] = -T.infinity("float32")
+            local[0] = T.float32(-1.0e38)
             for k in T.serial(lane, TOPK, step=THREADS):
                 if scores[k] > local[0]:
                     local[0] = scores[k]

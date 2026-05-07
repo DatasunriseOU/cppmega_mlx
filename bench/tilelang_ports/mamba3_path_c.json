@@ -7,8 +7,8 @@
     "system": "Darwin",
     "machine": "arm64",
     "python_version": "3.13.12",
-    "mlx_version": "0.31.1",
-    "tilelang_version": "0.1.9+git7f4a5cb8"
+    "mlx_version": "0.31.2",
+    "tilelang_version": "0.1.9+gitcab1a7db"
   },
   "shape": {
     "batch": 2,
@@ -25,48 +25,48 @@
   "timings": {
     "fwd_path_b": {
       "label": "fwd_path_b",
-      "mean_ms": 1.1376800294965506,
-      "median_ms": 1.071228994987905,
-      "min_ms": 1.0073750745505095,
-      "max_ms": 1.9082918297499418,
+      "mean_ms": 1.0903741378569975,
+      "median_ms": 1.0196875082328916,
+      "min_ms": 0.9729999874252826,
+      "max_ms": 2.27237498620525,
       "iters": 50,
       "warmup": 5
     },
     "fwd_path_c": {
       "label": "fwd_path_c",
-      "mean_ms": 1.0266349697485566,
-      "median_ms": 1.0098960483446717,
-      "min_ms": 0.9712090250104666,
-      "max_ms": 1.1659169103950262,
+      "mean_ms": 1.0216184193268418,
+      "median_ms": 1.005353988148272,
+      "min_ms": 0.9633339941501617,
+      "max_ms": 1.2104170164093375,
       "iters": 50,
       "warmup": 5
     },
     "fwd_bwd_path_b": {
       "label": "fwd_bwd_path_b",
-      "mean_ms": 7.833235017023981,
-      "median_ms": 7.823458174243569,
-      "min_ms": 7.453458849340677,
-      "max_ms": 9.90958302281797,
+      "mean_ms": 7.858181623741984,
+      "median_ms": 7.576832998893224,
+      "min_ms": 7.276249991264194,
+      "max_ms": 20.377167005790398,
       "iters": 50,
       "warmup": 5
     },
     "fwd_bwd_path_c": {
       "label": "fwd_bwd_path_c",
-      "mean_ms": 7.717452477663755,
-      "median_ms": 7.707083597779274,
-      "min_ms": 7.333917077630758,
-      "max_ms": 8.184792008250952,
+      "mean_ms": 9.844281559926458,
+      "median_ms": 5.950332983047701,
+      "min_ms": 5.760582978837192,
+      "max_ms": 200.7697919907514,
       "iters": 50,
       "warmup": 5
     },
-    "bwd_path_b_median_ms": 6.752229179255664,
-    "bwd_path_c_median_ms": 6.697187549434602
+    "bwd_path_b_median_ms": 6.557145490660332,
+    "bwd_path_c_median_ms": 4.944978994899429
   },
   "gflops": {
-    "fwd_path_b": 40.37769720795167,
-    "fwd_path_c": 42.82991310927255,
-    "fwd_bwd_path_b": 22.114905729233787,
-    "fwd_bwd_path_c": 22.448833959690372
+    "fwd_path_b": 42.41864262410976,
+    "fwd_path_c": 43.023413155865285,
+    "fwd_bwd_path_b": 22.834743754451623,
+    "fwd_bwd_path_c": 29.076530757675922
   },
   "memory_bytes_peak": {
     "fwd_path_b": 5013536,
@@ -74,7 +74,7 @@
     "fwd_bwd_path_b": 111543876,
     "fwd_bwd_path_c": 111543876
   },
-  "ratio_path_c_over_path_b_fwd_bwd": 0.9851249186903785,
-  "verdict": "Path C within 10% of Path B; recommend keeping Path B as primary and treating Path C as a documentation/reproducibility artifact.",
+  "ratio_path_c_over_path_b_fwd_bwd": 0.7853324712207447,
+  "verdict": "Path C is >20% faster than Path B; recommend switching to Path C and archiving Path B's MSL as a fallback.",
   "matched_run_guard": "Compare Path B and Path C only when both rows were collected on the same hardware with identical kernel inputs. This is a local_only receipt."
 }

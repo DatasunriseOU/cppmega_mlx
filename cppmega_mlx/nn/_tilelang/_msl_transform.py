@@ -36,14 +36,186 @@ Z3 roadmap note (cppmega-mlx-cuz wiring):
 
 from __future__ import annotations
 
+import collections
 import ctypes
+import functools
+import json
 import os
 import re
 import sys
+import warnings
 from dataclasses import dataclass
+from pathlib import Path as _Path
 from typing import Any, Callable, Sequence, cast
 
 import mlx.core as mx
+
+
+# fix-round-7 finding-5: test-only candidate injection point. Production code
+# leaves this empty; tests that need to load a libz3 from a non-default path
+# (e.g., the in-tree dev tree at ``/tmp/tl_apache_tvm_swap``) populate this
+# list in ``conftest.py``. Replaces the prior approach of hard-coding the
+# /tmp candidate behind ``CPPMEGA_ALLOW_UNSAFE_LIBZ3=1`` — production never
+# touches /tmp now, removing the world-writable-dylib attack surface entirely.
+_LIBZ3_DEV_CANDIDATES: list[_Path] = []
+
+
+def _preload_libz3_for_dev_tilelang() -> None:
+    """Preload ``libz3.dylib`` so dev-build ``libtilelang.dylib`` can dlopen.
+
+    The in-tree dev build ``libtilelang.dylib`` records ``libz3.dylib`` as a
+    bare basename rather than ``@rpath/libz3.dylib`` (or ``@loader_path/...``).
+    On macOS this means dyld will not find the libz3 shipped *next to it* in
+    the build directory. The result is that ``import tilelang`` raises
+    ``OSError: Library not loaded: libz3.dylib`` and every Path C kernel then
+    silently returns ``None`` in its dispatch try/except — bench scripts log
+    "did not dispatch" with no actionable signal.
+
+    Workaround: explicitly ``dlopen`` the libz3 that is already shipped next to
+    the tilelang dev build. Once the lib is in the process image, dyld will
+    satisfy the basename-only reference for libtilelang.dylib's later load.
+    Idempotent and silent on success / when libz3 is already present.
+    """
+
+    if getattr(_preload_libz3_for_dev_tilelang, "_done", False):
+        return
+    # fix-round-7 finding-6: defensive Darwin-only guard inside the function
+    # itself. The module-level call site below already gates on
+    # ``sys.platform == "darwin"``, but a future caller (e.g., a unit test
+    # invoking the preload directly to reset its state) could otherwise
+    # re-enter this on Linux/Windows where the dlopen-by-basename problem
+    # this routine works around does not apply.
+    if sys.platform != "darwin":
+        return
+    # fix-round-4: bail after a small number of full-sweep failures so we
+    # don't keep retrying every candidate (and re-stat'ing every path) on
+    # every Path C dispatch when libz3 genuinely isn't present.
+    _MAX_FAILED_ATTEMPTS = 3
+    failed = getattr(_preload_libz3_for_dev_tilelang, "_failed_attempts", 0)
+    if failed >= _MAX_FAILED_ATTEMPTS:
+        return
+
+    candidates: list[_Path] = []
+    dev_build_root = os.environ.get("TILELANG_DEV_BUILD_ROOT")
+    if dev_build_root:
+        candidates.append(_Path(dev_build_root) / "lib" / "libz3.dylib")
+    # Fallback: every tilelang dev tree we've seen drops libz3.dylib at
+    # ``<root>/build/lib`` next to libtilelang.dylib.
+    for env_var in ("TILELANG_ROOT",):
+        root = os.environ.get(env_var)
+        if root:
+            candidates.append(_Path(root) / "build" / "lib" / "libz3.dylib")
+    # fix-round-7 finding-5: production code no longer hard-codes any
+    # world-writable path (previously /tmp/tl_apache_tvm_swap was added
+    # behind ``CPPMEGA_ALLOW_UNSAFE_LIBZ3=1``, but conftest.py forced that
+    # env var ON for tests, which inverted the security boundary —
+    # production processes that happened to inherit the env from a parent
+    # would silently load a /tmp dylib). Tests that need a non-default
+    # candidate now inject it explicitly via ``_LIBZ3_DEV_CANDIDATES`` (see
+    # tests/conftest.py); production keeps an empty list.
+    # TOCTOU note: exists() → dlopen has a small race; non-mitigatable on
+    # macOS without fd-based dlopen. The remaining candidates are env-rooted
+    # (dev controls them) or /opt/homebrew (root-owned), so the surface is
+    # bounded. The previous /tmp path is removed entirely.
+    candidates.extend(_LIBZ3_DEV_CANDIDATES)
+    # Brew-installed z3 (works as a basename-resolution fallback).
+    candidates.append(_Path("/opt/homebrew/lib/libz3.dylib"))
+
+    for candidate in candidates:
+        # fix-round-8 (Wave 3 grok-4): drop the exists()-then-CDLL precheck. It
+        # introduced a TOCTOU window where the file could disappear/change
+        # between the stat() and the dlopen(). Calling CDLL directly and
+        # discriminating on the exception type yields the same outcome with
+        # no race. We still preserve the round-5 distinction between "missing
+        # file" (silent skip — not actionable) and "broken dylib" (warn —
+        # surfaces wrong-arch/corrupt-dylib/missing-dep so it doesn't hide
+        # behind the silent retry).
+        try:
+            ctypes.CDLL(str(candidate), ctypes.RTLD_GLOBAL)
+        except FileNotFoundError:
+            # File missing at dlopen time. Not actionable; try next candidate.
+            continue
+        except OSError as e:
+            # On macOS dyld surfaces "image not found" as OSError (errno=2 in
+            # the message but not always settable on the exception). Detect
+            # that case heuristically and treat it as "missing" (silent skip);
+            # everything else is a *broken* libz3 and gets logged.
+            msg = str(e)
+            if "image not found" in msg or "no such file" in msg.lower():
+                continue
+            import logging as _logging
+
+            _logging.getLogger(__name__).warning(
+                "libz3 preload at %s failed: %s", candidate, e
+            )
+            continue
+        # Set _done only AFTER the dlopen actually succeeds.
+        _preload_libz3_for_dev_tilelang._done = True  # type: ignore[attr-defined]
+        return
+    # No candidate succeeded — bump the failed-attempts counter so we'll
+    # stop retrying once we've tried enough times. _done stays unset so that
+    # if the env later changes (e.g., user sets TILELANG_DEV_BUILD_ROOT) we
+    # can still pick up a real lib up to the attempt cap.
+    _preload_libz3_for_dev_tilelang._failed_attempts = failed + 1  # type: ignore[attr-defined]
+
+
+# fix-round-8 (Wave 3 grok-4): the preload is now *lazy*. Previously this
+# fired at module-import time, which ran *before* tests/conftest.py could
+# mutate ``_LIBZ3_DEV_CANDIDATES`` to inject extra dev candidates — the
+# conftest then had to manually clear the ``_done`` / ``_failed_attempts``
+# flags and re-invoke. With a lazy guard, the first real entry-point call
+# (``lower_tilelang_to_msl_inline`` or the public
+# ``ensure_libz3_preloaded`` below) sees the post-conftest candidate list.
+# Bench scripts that want eager preload should call
+# ``ensure_libz3_preloaded()`` explicitly at the top of ``main``.
+_LIBZ3_PRELOAD_ATTEMPTED = False
+
+
+def _maybe_preload_libz3() -> None:
+    """Lazy entry point: run the preload at most once per process."""
+
+    global _LIBZ3_PRELOAD_ATTEMPTED
+    if _LIBZ3_PRELOAD_ATTEMPTED:
+        return
+    _LIBZ3_PRELOAD_ATTEMPTED = True
+    if sys.platform != "darwin":
+        return
+    _preload_libz3_for_dev_tilelang()
+
+
+def ensure_libz3_preloaded() -> None:
+    """Public entry point for bench scripts that want eager libz3 preload.
+
+    Idempotent: calling repeatedly is cheap (the underlying preload uses its
+    own ``_done`` / ``_failed_attempts`` guards). Useful for short-lived
+    scripts that import tilelang directly without going through the lazy
+    ``lower_tilelang_to_msl_inline`` path.
+    """
+
+    _maybe_preload_libz3()
+
+
+def reset_libz3_preload_state() -> None:
+    """Reset all libz3 preload state so a future lower call re-attempts.
+
+    Wave 5 grok finding #6: ``_LIBZ3_PRELOAD_ATTEMPTED`` and the
+    ``_failed_attempts`` counter on ``_preload_libz3_for_dev_tilelang`` persist
+    once set. If the host environment changes mid-process (e.g. the user sets
+    ``TILELANG_DEV_BUILD_ROOT`` after a failed attempt, or ``conftest.py``
+    populates ``_LIBZ3_DEV_CANDIDATES`` after the lazy guard already fired),
+    no retry would otherwise happen and Path C silently falls back to pure
+    MLX. Tests/bench scripts call this to force a clean slate.
+
+    Clears: the module-level ``_LIBZ3_PRELOAD_ATTEMPTED`` guard, plus the
+    ``_done`` and ``_failed_attempts`` attributes on
+    ``_preload_libz3_for_dev_tilelang``.
+    """
+
+    global _LIBZ3_PRELOAD_ATTEMPTED
+    _LIBZ3_PRELOAD_ATTEMPTED = False
+    for attr in ("_done", "_failed_attempts"):
+        if hasattr(_preload_libz3_for_dev_tilelang, attr):
+            delattr(_preload_libz3_for_dev_tilelang, attr)
 
 
 MetalKernel = Callable[..., list[mx.array]]
@@ -88,6 +260,16 @@ def msl_dispatch_status(*arrays: mx.array) -> MSLDispatchStatus:
     return MSLDispatchStatus(True, "MSL dispatch path is available")
 
 
+# Wave 5 grok finding #4: the most recent reason ``make_metal_kernel`` returned
+# None, exposed so ``dispatch()``'s None-guard can surface a specific cause
+# instead of a generic "metal_kernel is None" message. Module-level singleton
+# is intentional — there's no concurrent ``make_metal_kernel`` call pattern in
+# this codebase (kernels are constructed at module-import or first-dispatch
+# time, both serial), and we want the latest failure visible to the next
+# ``dispatch()`` on the same thread.
+_LAST_MAKE_METAL_KERNEL_REASON: str | None = None
+
+
 def make_metal_kernel(
     *,
     name: str,
@@ -97,13 +279,28 @@ def make_metal_kernel(
     header: str = "",
     ensure_row_contiguous: bool = True,
 ) -> MetalKernel | None:
-    """Create a cached mx.fast.metal_kernel handle, or None if unavailable."""
+    """Create a cached mx.fast.metal_kernel handle, or None if unavailable.
 
+    On every None-return path we set ``_LAST_MAKE_METAL_KERNEL_REASON`` to a
+    short human-readable reason (Wave 5 grok finding #4) so the downstream
+    ``dispatch()`` None-guard can include it in its ``MSLDispatchUnsupported``
+    message instead of the previous generic "metal_kernel is None".
+    """
+
+    global _LAST_MAKE_METAL_KERNEL_REASON
     if not can_run_metal():
+        _LAST_MAKE_METAL_KERNEL_REASON = (
+            f"can_run_metal() is False (default_device={mx.default_device()}, "
+            f"metal_available={getattr(getattr(mx, 'metal', None), 'is_available', lambda: False)()})"
+        )
         return None
     constructor = _metal_kernel_constructor()
     if constructor is None:
+        _LAST_MAKE_METAL_KERNEL_REASON = (
+            "mx.fast.metal_kernel constructor is unavailable on this MLX build"
+        )
         return None
+    _LAST_MAKE_METAL_KERNEL_REASON = None
     return cast(
         MetalKernel,
         constructor(
@@ -118,7 +315,7 @@ def make_metal_kernel(
 
 
 def dispatch(
-    kernel: MetalKernel,
+    kernel: MetalKernel | None,
     *,
     inputs: Sequence[mx.array],
     output_shapes: Sequence[Sequence[int]],
@@ -128,9 +325,41 @@ def dispatch(
     lowering: TileLangMSLLowering | None = None,
     template: Sequence[tuple[str, object]] | None = None,
 ) -> list[mx.array]:
+    # fix-round-9 (Wave 4 grok finding #2): explicit None-kernel guard. If
+    # ``make_metal_kernel`` returned None (because ``can_run_metal()`` is
+    # False or ``mx.fast.metal_kernel`` is missing), calling kernel(...) below
+    # would raise ``TypeError: 'NoneType' is not callable`` and confuse the
+    # caller, who is expecting either a clean ``MSLDispatchUnsupported`` or a
+    # successful tensor list. Funnel the failure through the same exception
+    # type as every other dispatch failure so callers can continue to use a
+    # single ``except MSLDispatchUnsupported`` to fall back to Path B.
+    if kernel is None:
+        # Wave 5 grok finding #4: surface the *specific* reason
+        # ``make_metal_kernel`` returned None instead of a generic message.
+        # Reads the module-level singleton populated on each None-return path.
+        reason = _LAST_MAKE_METAL_KERNEL_REASON or "unknown"
+        raise MSLDispatchUnsupported(
+            f"metal_kernel is None — {reason}"
+        )
     if any(isinstance(x, mx.array) and x.size == 0 for x in inputs):
         raise MSLDispatchUnsupported("empty tensors must use the pure MLX fallback")
     if lowering is not None:
+        # fix-round-8 (Wave 3 grok-4): validate caller-supplied input count
+        # against the parsed buffer names from the lowered kernel signature.
+        # ``buffer_param_names`` enumerates *all* device-qualified buffer
+        # parameters (inputs followed by outputs) in TileLang's emission
+        # order; the input count is therefore total - len(output_dtypes).
+        # Without this check, a caller that gets the order wrong silently
+        # passes a wrong tensor as the kernel's i-th input and we get
+        # garbage numerics with no diagnostic.
+        parsed = lowering.buffer_param_names
+        expected_inputs = len(parsed) - len(output_dtypes)
+        if expected_inputs < 0 or len(inputs) != expected_inputs:
+            raise MSLDispatchUnsupported(
+                f"dispatch input count mismatch: got {len(inputs)}, parsed "
+                f"{expected_inputs} input buffer names from lowering "
+                f"(params={parsed}, output_dtypes={list(output_dtypes)})"
+            )
         launch_grid = metal_grid_for_lowering(lowering)
         launch_threadgroup = lowering.threadgroup
         if grid is not None and grid != launch_grid:
@@ -318,41 +547,293 @@ def _split_kernel_msl(msl: str) -> tuple[str, str, str]:
     return prelude, sig_text, body_text
 
 
-def _parse_buffer_param_names(sig_text: str) -> list[str]:
-    """Return the buffer parameter names from a kernel signature, in order."""
+# Documentation/test corpus for ``_parse_buffer_param_names``. Each entry is a
+# *single* parameter declaration as TileLang's Metal codegen emits it (or as
+# we've observed in the wild via the Apache TVM Metal target). The parser is
+# expected to:
+#   - return the param's identifier when it is a top-level address-space
+#     buffer (``device`` or ``constant``);
+#   - skip ``threadgroup`` (local), Metal builtin params (``blockIdx``,
+#     ``threadIdx``, ``simd_lane``-style with ``[[thread_index_in_simdgroup]]``
+#     etc.), and any ``[[...]]`` attribute markers.
+#
+# fix-round-9 (Wave 4 grok): grow the corpus from a handful of hand-written
+# cases to the full set of qualifier orderings TileLang emits post-PR #799,
+# plus a couple of TVM-Metal-direct variants we've seen in older lowering
+# output (mamba3 fwd_kernel uses ``device float* A``; FP8 paths use
+# ``device const float8_e4m3 *A``; matmul backwards-compat uses
+# ``const device half *B``). The previous parser tripped on the
+# ``device const`` ordering because the trailing-identifier regex consumed
+# the buffer-name token correctly but the ``"device "`` substring check was
+# fine; the real failure mode was *attribute strip greediness* with nested
+# ``[[...]]`` and missing handling of ``constant`` (Metal address space for
+# constant buffers, not const-qualified device pointers).
+_TEST_PARSE_SIGNATURES: tuple[tuple[str, str | None], ...] = (
+    ("device const float8_e4m3 *A", "A"),
+    ("const device half *B [[ buffer(0) ]]", "B"),
+    ("device float* C [[ buffer(2) ]]", "C"),
+    ("device const half* __restrict D [[buffer(3)]]", "D"),
+    ("const device float &E [[buffer(4)]]", "E"),
+    ("constant float* F [[buffer(5)]]", "F"),  # Metal "constant" address space
+    ("threadgroup uchar* shared_buf", None),  # threadgroup = local, skip
+    ("uint3 blockIdx [[threadgroup_position_in_grid]]", None),
+    ("uint3 threadIdx [[thread_position_in_threadgroup]]", None),
+    ("uint simd_lane [[thread_index_in_simdgroup]]", None),
+    ("uint3 gridDim [[threadgroups_per_grid]]", None),
+    ("uint3 blockDim [[threads_per_threadgroup]]", None),
+)
+
+
+# fix-round-9 (Wave 4 grok): identifiers we never want to treat as buffers,
+# even if a future TileLang/TVM change adds a "device" qualifier in front of
+# them. These are Metal builtins that callers don't pass; they're filled in
+# by the runtime from the [[...]] attribute.
+_METAL_BUILTIN_PARAM_NAMES = frozenset({
+    "blockIdx",
+    "threadIdx",
+    "gridDim",
+    "blockDim",
+})
+
+
+# Wave 5 grok finding #1: full multi-parameter signature corpus. The
+# single-decl ``_TEST_PARSE_SIGNATURES`` above exercises ``_strip_attribute_markers``
+# / ``_extract_param_identifier`` per-decl, but did NOT exercise
+# ``_split_signature_decls`` against realistic full kernel signatures. The
+# entries below are realistic-shape examples covering:
+#
+#   * Comma inside a balanced ``[[...]]`` attribute (Metal allows
+#     ``[[buffer(0), function_constant(...)]]``).
+#   * Multiple device-qualified buffers with different qualifier orderings
+#     (``device const T*`` vs ``const device T*``).
+#   * Mixed ``device`` / ``constant`` address spaces.
+#   * Trailing Metal builtin params (threadgroup_position_in_grid / thread_*).
+#   * A leading threadgroup-local buffer that should be skipped.
+#
+# Each entry is ``(full_signature_string, expected_buffer_names_in_order)``.
+# Validate via ``_validate_test_full_signatures()`` (called manually or under
+# ``CPPMEGA_VALIDATE_PARSE_TESTS=1`` at module import; tests are not modified
+# in this file's scope).
+_TEST_PARSE_FULL_SIGNATURES: tuple[tuple[str, list[str]], ...] = (
+    # Realistic mamba3-shape fwd_kernel: 4 device buffers + builtin grid/thread
+    # params. The qualifier orderings exercise both ``device const T*`` and
+    # bare ``device T*``.
+    (
+        "device const half* A [[buffer(0)]], "
+        "device const half* B [[buffer(1)]], "
+        "device float* C [[buffer(2)]], "
+        "device const float* D [[buffer(3)]], "
+        "uint3 blockIdx [[threadgroup_position_in_grid]], "
+        "uint3 threadIdx [[thread_position_in_threadgroup]]",
+        ["A", "B", "C", "D"],
+    ),
+    # FP8 path: ``device const float8_e4m3 *`` mixed with a constant-address-
+    # space scalar buffer for shape parameters, plus an output buffer.
+    (
+        "device const float8_e4m3 *X [[buffer(0)]], "
+        "constant uint* shape [[buffer(1)]], "
+        "device float* Y [[buffer(2)]], "
+        "uint3 blockIdx [[threadgroup_position_in_grid]]",
+        ["X", "shape", "Y"],
+    ),
+    # ``const device`` ordering (matmul backwards-compat) + ``__restrict``
+    # modifier + a threadgroup-local scratch buffer that must be skipped.
+    (
+        "const device half *A [[buffer(0)]], "
+        "const device half *B [[buffer(1)]], "
+        "device float* __restrict C [[buffer(2)]], "
+        "threadgroup float* scratch, "
+        "uint3 threadIdx [[thread_position_in_threadgroup]], "
+        "uint simd_lane [[thread_index_in_simdgroup]]",
+        ["A", "B", "C"],
+    ),
+    # Comma INSIDE a ``[[...]]`` attribute marker — must not split the decl.
+    # Synthesized but valid Metal: ``[[buffer(0), function_constant(2)]]``.
+    (
+        "device const float* A [[buffer(0), function_constant(2)]], "
+        "device float* B [[buffer(1)]], "
+        "uint3 blockIdx [[threadgroup_position_in_grid]]",
+        ["A", "B"],
+    ),
+    # Single-buffer signature (degenerate but legal — verifies trailing-decl
+    # handling when there is no terminating comma).
+    (
+        "device float* only [[buffer(0)]]",
+        ["only"],
+    ),
+)
+
+
+def _validate_test_full_signatures() -> list[tuple[str, list[str], list[str]]]:
+    """Self-test: parse every ``_TEST_PARSE_FULL_SIGNATURES`` entry.
+
+    Returns a list of ``(sig_text, expected, actual)`` triples for entries
+    where the parser output diverges from the expected list. Empty list = all
+    pass. Wave 5 grok finding #1: the previous test corpus only had
+    single-decl strings, so ``_split_signature_decls`` was never exercised in
+    the pinned corpus. Run via:
+
+        from cppmega_mlx.nn._tilelang._msl_transform import (
+            _validate_test_full_signatures,
+        )
+        assert _validate_test_full_signatures() == []
+
+    or set ``CPPMEGA_VALIDATE_PARSE_TESTS=1`` to run automatically at import.
+    """
+
+    mismatches: list[tuple[str, list[str], list[str]]] = []
+    for sig, expected in _TEST_PARSE_FULL_SIGNATURES:
+        actual = _parse_buffer_param_names(sig)
+        if actual != expected:
+            mismatches.append((sig, list(expected), actual))
+    return mismatches
+
+
+def _split_signature_decls(sig_text: str) -> list[str]:
+    """Split a signature parameter list on top-level commas.
+
+    Respects nested ``(...)`` and ``[[...]]`` Metal attribute markers so that
+    a comma inside an attribute (e.g., ``[[buffer(0), function_constant(1)]]``)
+    does not split a parameter declaration.
+    """
 
     decls: list[str] = []
-    depth = 0
+    depth_paren = 0
+    depth_attr = 0  # tracks ``[[`` / ``]]`` nesting
+    i = 0
     current: list[str] = []
-    for ch in sig_text:
+    n = len(sig_text)
+    while i < n:
+        ch = sig_text[i]
+        # Detect ``[[`` / ``]]`` as paired tokens (Metal attribute markers).
+        if ch == "[" and i + 1 < n and sig_text[i + 1] == "[":
+            depth_attr += 1
+            current.append("[[")
+            i += 2
+            continue
+        if ch == "]" and i + 1 < n and sig_text[i + 1] == "]" and depth_attr > 0:
+            depth_attr -= 1
+            current.append("]]")
+            i += 2
+            continue
         if ch == "(":
-            depth += 1
+            depth_paren += 1
             current.append(ch)
         elif ch == ")":
-            depth -= 1
+            depth_paren -= 1
             current.append(ch)
-        elif ch == "," and depth == 0:
+        elif ch == "," and depth_paren == 0 and depth_attr == 0:
             decls.append("".join(current).strip())
             current = []
         else:
             current.append(ch)
-    if current:
-        last = "".join(current).strip()
-        if last:
-            decls.append(last)
+        i += 1
+    last = "".join(current).strip()
+    if last:
+        decls.append(last)
+    return decls
+
+
+def _strip_attribute_markers(decl: str) -> str:
+    """Remove all ``[[...]]`` Metal attribute markers from a decl string.
+
+    Iterative balanced strip — the previous non-greedy regex
+    ``re.sub(r"\\[\\[.*?\\]\\]", "", decl)`` only matched the *first* ``]]`` and
+    handled nested attribute markers incorrectly. This walks the string and
+    removes balanced ``[[ ... ]]`` segments at any depth.
+    """
+
+    out: list[str] = []
+    i = 0
+    n = len(decl)
+    while i < n:
+        if decl[i] == "[" and i + 1 < n and decl[i + 1] == "[":
+            # Find the matching ``]]`` at the same nesting depth.
+            depth = 1
+            j = i + 2
+            while j < n and depth > 0:
+                if decl[j] == "[" and j + 1 < n and decl[j + 1] == "[":
+                    depth += 1
+                    j += 2
+                    continue
+                if decl[j] == "]" and j + 1 < n and decl[j + 1] == "]":
+                    depth -= 1
+                    j += 2
+                    continue
+                j += 1
+            if depth == 0:
+                i = j  # skip the entire ``[[...]]``
+                continue
+            # Unbalanced — fall through and keep the char so the caller can see
+            # there's a parse problem instead of silently truncating.
+        out.append(decl[i])
+        i += 1
+    return "".join(out)
+
+
+def _extract_param_identifier(clean: str) -> str | None:
+    """Pull the parameter's identifier out of a stripped decl string.
+
+    Strategy: drop pointer/reference sigils (``*``, ``&``) and any trailing
+    array-extent ``[N]``, then take the last word. This tolerates ``__restrict``
+    and other type modifiers that appear *before* the identifier — those are
+    earlier-word tokens and are simply ignored.
+    """
+
+    # Drop trailing ``[N]`` array extent if present (Metal allows it for
+    # ``constant`` buffers).
+    cleaned = re.sub(r"\[[^\]]*\]\s*$", "", clean).strip()
+    # Drop pointer/reference sigils that appear adjacent to the name.
+    cleaned = cleaned.replace("*", " ").replace("&", " ").strip()
+    m = re.search(r"\b([A-Za-z_]\w*)\s*$", cleaned)
+    return m.group(1) if m else None
+
+
+def _parse_buffer_param_names(sig_text: str) -> list[str]:
+    """Return the buffer parameter names from a kernel signature, in order.
+
+    fix-round-9 (Wave 4 grok finding #1): hardened against TileLang/Metal
+    signature variants. The previous version used a single non-greedy
+    ``[[.*?]]`` strip and a lone ``"device "`` substring check, which broke on:
+
+    * ``device const T*`` ordering (greedy-strip + position-sensitive check),
+    * the ``constant`` Metal address space (a legitimate top-level buffer),
+    * trailing array extents and ``__restrict`` modifiers,
+    * Metal builtin params (``gridDim``, ``blockDim``) that lack a ``device``
+      qualifier but were never explicitly excluded.
+
+    See ``_TEST_PARSE_SIGNATURES`` above for the documented input corpus.
+
+    Note: we intentionally do not try to introspect ``prim_func.buffer_map``
+    here. TileLang's lowering pipeline transforms PrimFunc params (it adds
+    grid/thread axis buffers, drops some, renames others) before emitting the
+    final MSL signature, so the *only* authoritative source for "what does
+    ``mx.fast.metal_kernel`` need fed in, in what order" is the emitted
+    signature itself. ``buffer_map`` would be wrong.
+    """
+
+    decls = _split_signature_decls(sig_text)
 
     names: list[str] = []
     for decl in decls:
-        clean = re.sub(r"\[\[.*?\]\]", "", decl).strip()
-        m = re.search(r"(\w+)\s*$", clean)
-        if not m:
+        clean = _strip_attribute_markers(decl).strip()
+        if not clean:
             continue
-        var = m.group(1)
-        if var in ("blockIdx", "threadIdx"):
+        # Skip threadgroup-local buffers — those are allocated inside the
+        # kernel, not passed in by the caller.
+        if re.search(r"\bthreadgroup\b", clean):
             continue
-        # Buffer parameters always have a "device" qualifier (or "const device").
-        if "device " in clean:
-            names.append(var)
+        # Top-level buffers carry one of two Metal address-space qualifiers.
+        is_device = re.search(r"\bdevice\b", clean) is not None
+        is_constant = re.search(r"\bconstant\b", clean) is not None
+        if not (is_device or is_constant):
+            continue
+        var = _extract_param_identifier(clean)
+        if var is None:
+            continue
+        if var in _METAL_BUILTIN_PARAM_NAMES:
+            continue
+        names.append(var)
     return names
 
 
@@ -442,6 +923,184 @@ def metal_grid_for_lowering(
     )
 
 
+# fix-round-8 (Wave 3 grok-4): manual cache for lowering results keyed on
+# ``(id(prim_func), frozen(pass_configs), target_str)``. We use ``id()``
+# rather than ``hash(prim_func)`` because TVM PrimFunc instances are not
+# generally hash-stable across re-imports (and may not be hashable at all
+# in older builds). ``id()`` is process-lifetime stable for any cached
+# prim_func — sufficient because callers in the cppmega.mlx tree hold a
+# module-level reference to their PrimFunc, so the id stays valid for the
+# full life of the cache.
+#
+# fix-round-9 (Wave 4 grok finding #4): bound the cache. The key set scales
+# with (#PrimFuncs * #distinct pass_configs * #targets); bench shape sweeps
+# can probe dozens of configs and the keepalive list pinned every prim_func
+# strongly forever. Switch to an LRU OrderedDict with an env-tunable cap and
+# evict the matching keepalive entry alongside the cache entry.
+_LOWERING_CACHE_MAX_SIZE = max(
+    1, int(os.environ.get("CPPMEGA_LOWERING_CACHE_SIZE", "128"))
+)
+_LOWERING_CACHE: collections.OrderedDict[
+    tuple[int, Any, str], TileLangMSLLowering
+] = collections.OrderedDict()
+# Hold strong references so cached ids cannot be reused for a different
+# PrimFunc. (CPython only reuses an id() after the original object is GC'd;
+# keeping a strong reference here pins the PrimFunc and prevents that.)
+# Keyed by the same cache key so eviction can drop the matching ref together
+# with the cache entry, allowing GC.
+_LOWERING_CACHE_KEEPALIVE: collections.OrderedDict[
+    tuple[int, Any, str], Any
+] = collections.OrderedDict()
+
+
+# Phase-2 migration: emit a one-shot DeprecationWarning when callers reach the
+# legacy MSL-inline lowering. New callers should route through
+# ``cppmega_mlx.nn._tilelang.dispatch_lower(prim, target)`` instead.
+_DEPRECATION_WARNED: bool = False
+
+
+# Sentinel returned by ``_freeze_for_hash`` when no stable serialization is
+# possible. ``_lowering_cache_key`` propagates this as ``None`` and the
+# lowering call site falls through to the uncached slow path. Trade-off
+# (Wave 5 grok finding #5): we lose caching for that one call rather than
+# risk a non-deterministic cache key colliding across structurally distinct
+# pass_configs.
+_FREEZE_UNSTABLE = object()
+
+
+def _freeze_for_hash(obj: Any) -> Any:
+    """Recursively convert ``obj`` into a deterministic hashable representation.
+
+    Wave 5 grok finding #5: ``repr(obj)`` for arbitrary TVM objects is not
+    deterministic — it can include memory addresses, depend on internal dict
+    ordering, or vary across processes. Using it as a cache key risked the
+    *worst* outcome: a same-config-different-repr miss is just a perf hit, but
+    a different-config-same-repr collision would return a wrong lowering for a
+    structurally distinct PrimFunc. Strategy now, in order:
+
+    1. Containers (dict / list / tuple / set / frozenset) recurse.
+    2. Hashable primitives are returned as-is.
+    3. Objects exposing TVM-idiomatic stable serializers
+       (``_serialize_to_str()`` or ``to_json()``) are serialized via those.
+    4. ``json.dumps(obj, sort_keys=True, default=str)`` — deterministic for
+       JSON-compatible primitives and sorted dicts.
+    5. Last resort: return the ``_FREEZE_UNSTABLE`` sentinel so the caller
+       can skip caching rather than risk a non-deterministic key.
+
+    Returning the sentinel is preferred over returning ``repr(obj)`` because
+    cache **correctness** beats cache hit rate — a wrong-cache hit yields
+    silent wrong numerics; a cache skip just costs a re-lowering.
+    """
+
+    if isinstance(obj, dict):
+        # Sort frozenset entries by their hashable key representation so
+        # iteration order can never affect equality. (frozenset already
+        # ignores construction order for ``hash()`` / ``==``, but freezing the
+        # key first guarantees nested unhashables don't bubble up.)
+        frozen_items = []
+        for k, v in obj.items():
+            fk = _freeze_for_hash(k)
+            fv = _freeze_for_hash(v)
+            if fk is _FREEZE_UNSTABLE or fv is _FREEZE_UNSTABLE:
+                return _FREEZE_UNSTABLE
+            frozen_items.append((fk, fv))
+        return frozenset(frozen_items)
+    if isinstance(obj, (list, tuple)):
+        out = []
+        for x in obj:
+            fx = _freeze_for_hash(x)
+            if fx is _FREEZE_UNSTABLE:
+                return _FREEZE_UNSTABLE
+            out.append(fx)
+        return tuple(out)
+    if isinstance(obj, (set, frozenset)):
+        out_set = []
+        for x in obj:
+            fx = _freeze_for_hash(x)
+            if fx is _FREEZE_UNSTABLE:
+                return _FREEZE_UNSTABLE
+            out_set.append(fx)
+        return frozenset(out_set)
+    try:
+        hash(obj)
+        return obj
+    except TypeError:
+        pass
+    # Try TVM-idiomatic stable serializers before falling back to JSON.
+    for serializer_name in ("_serialize_to_str", "to_json"):
+        serializer = getattr(obj, serializer_name, None)
+        if callable(serializer):
+            try:
+                return (serializer_name, serializer())
+            except Exception:
+                continue
+    # Deterministic JSON fallback for things that look JSON-able. Catches
+    # primitives we somehow missed plus simple containers; ``default=str``
+    # prevents TypeError on unknown leaves but only as a *last* leaf step
+    # (not at the top level — top-level recursion is handled above). If even
+    # this raises, return the unstable sentinel.
+    try:
+        return ("json", json.dumps(obj, sort_keys=True, default=str))
+    except (TypeError, ValueError):
+        return _FREEZE_UNSTABLE
+
+
+def _lowering_cache_key(
+    prim_func: Any,
+    target: str,
+    pass_configs: dict[str, Any] | None,
+) -> tuple[int, Any, str] | None:
+    """Build a cache key for the lowering cache, or None if unstable.
+
+    Wave 5 grok finding #5: returns ``None`` instead of falling back to
+    ``repr()`` when ``_freeze_for_hash`` cannot produce a deterministic key.
+    The caller skips cache lookup/store for that lowering — losing the perf
+    win on that one call but preserving correctness across the cache.
+    """
+
+    cfg = _freeze_for_hash(pass_configs or {})
+    if cfg is _FREEZE_UNSTABLE:
+        return None
+    return (id(prim_func), cfg, target)
+
+
+def clear_lowering_cache() -> None:
+    """Public hook for tests/bench to reset the lowering cache + keepalive.
+
+    Drops every cached lowering result and the strong refs that pinned the
+    associated PrimFunc objects, allowing GC to reclaim them.
+
+    Wave 5 grok finding #6 cascade: also resets the libz3 preload state.
+    "Clear cached state" means *all* cached state — leaving the libz3 preload
+    flags pinned would defeat the purpose for tests that mutate the candidate
+    list and then call ``clear_lowering_cache`` to reset.
+    """
+
+    _LOWERING_CACHE.clear()
+    _LOWERING_CACHE_KEEPALIVE.clear()
+    reset_libz3_preload_state()
+
+
+def _store_lowering_in_cache(
+    cache_key: tuple[int, Any, str],
+    prim_func: Any,
+    result: TileLangMSLLowering,
+) -> None:
+    """Insert (or refresh) a cache entry under LRU eviction."""
+
+    if cache_key in _LOWERING_CACHE:
+        _LOWERING_CACHE.move_to_end(cache_key)
+        _LOWERING_CACHE_KEEPALIVE.move_to_end(cache_key)
+        _LOWERING_CACHE[cache_key] = result
+        _LOWERING_CACHE_KEEPALIVE[cache_key] = prim_func
+        return
+    _LOWERING_CACHE[cache_key] = result
+    _LOWERING_CACHE_KEEPALIVE[cache_key] = prim_func
+    while len(_LOWERING_CACHE) > _LOWERING_CACHE_MAX_SIZE:
+        evicted_key, _ = _LOWERING_CACHE.popitem(last=False)
+        _LOWERING_CACHE_KEEPALIVE.pop(evicted_key, None)
+
+
 def lower_tilelang_to_msl_inline(
     prim_func: Any,
     *,
@@ -477,24 +1136,70 @@ def lower_tilelang_to_msl_inline(
     candidate key is registered with the active ``libtilelang`` build.
     """
 
+    global _DEPRECATION_WARNED
+    if not _DEPRECATION_WARNED:
+        import warnings
+        warnings.warn(
+            "lower_tilelang_to_msl_inline is deprecated; use "
+            "cppmega_mlx.nn._tilelang.dispatch_lower(prim, target) instead. "
+            "Will be removed in v0.x.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        _DEPRECATION_WARNED = True
+
+    cache_key = _lowering_cache_key(prim_func, target, pass_configs)
+    if cache_key is not None:
+        cached = _LOWERING_CACHE.get(cache_key)
+        if cached is not None:
+            # fix-round-9 (Wave 4 grok finding #4): refresh LRU position on hit.
+            _LOWERING_CACHE.move_to_end(cache_key)
+            _LOWERING_CACHE_KEEPALIVE.move_to_end(cache_key)
+            return cached
+
+    # fix-round-8 (Wave 3 grok-4): trigger the lazy libz3 preload here (instead
+    # of at module-import time). By this point any conftest.py that wanted to
+    # inject extra dev candidates via ``_LIBZ3_DEV_CANDIDATES`` has already
+    # run; the preload sees the post-conftest list on the very first lower
+    # call.
+    _maybe_preload_libz3()
+
+    # fix-round-8 (Wave 3 grok-4): narrow the catch. Previously a bare
+    # ``except Exception`` swallowed *any* failure in the tilelang import as
+    # "tilelang unavailable", including TVM-internal AttributeErrors and
+    # PassContext drift. Now only an honest import failure (module not
+    # installed / dylib not loadable) maps to ``MSLDispatchUnsupported``;
+    # other exceptions propagate so callers see the real chain.
     try:
         from tilelang import tvm  # type: ignore
         from tilelang.engine.lower import lower as tl_lower  # type: ignore
-    except Exception as exc:  # pragma: no cover - guarded by callers
+    except (ImportError, ModuleNotFoundError) as exc:  # pragma: no cover
         raise MSLDispatchUnsupported(
             f"tilelang import failed: {exc}; falling back to pure MLX"
         ) from exc
 
     _ensure_single_libtvm_ffi_image()
     metal_target = _as_metal_target(target)
-    if pass_configs:
-        # opt_level=3 mirrors tilelang.jit.kernel.JitKernel default, so the
-        # only behavioural delta vs. the legacy (no-PassContext) path is the
-        # caller-supplied config dict.
-        with tvm.transform.PassContext(opt_level=3, config=dict(pass_configs)):
+    # fix-round-8 (Wave 3 grok-4): wrap the lowering call so any TVM-internal
+    # error gets a clear ``MSLDispatchUnsupported("lowering failed: ...")``
+    # *with* a ``raise from`` chain. Callers can still inspect ``__cause__``
+    # to see the original TVM error, but the public surface stays consistent
+    # (every dispatch failure is an ``MSLDispatchUnsupported``).
+    try:
+        if pass_configs:
+            # opt_level=3 mirrors tilelang.jit.kernel.JitKernel default, so the
+            # only behavioural delta vs. the legacy (no-PassContext) path is
+            # the caller-supplied config dict.
+            with tvm.transform.PassContext(opt_level=3, config=dict(pass_configs)):
+                artifact = tl_lower(prim_func, target=metal_target)
+        else:
             artifact = tl_lower(prim_func, target=metal_target)
-    else:
-        artifact = tl_lower(prim_func, target=metal_target)
+    except (ImportError, ModuleNotFoundError, MSLDispatchUnsupported):
+        raise
+    except Exception as exc:
+        raise MSLDispatchUnsupported(
+            f"tilelang lowering failed: {exc}"
+        ) from exc
 
     grid = [1, 1, 1]
     block = [1, 1, 1]
@@ -516,7 +1221,7 @@ def lower_tilelang_to_msl_inline(
     prelude, sig_text, body_text = _split_kernel_msl(msl_text)
     inner = body_text[1:-1]
     body = _inline_tilelang_kernel_body(inner)
-    return TileLangMSLLowering(
+    result = TileLangMSLLowering(
         header=prelude,
         body=body,
         grid=(grid[0], grid[1], grid[2]),
@@ -525,6 +1230,12 @@ def lower_tilelang_to_msl_inline(
         buffer_param_names=_parse_buffer_param_names(sig_text),
         kernel_name=_KERNEL_DEF_RE.search(msl_text).group("name"),  # type: ignore[union-attr]
     )
+    # fix-round-9 (Wave 4 grok finding #4): bounded LRU store. Pins a strong
+    # ref to ``prim_func`` under the same key so eviction releases both.
+    # Wave 5 grok finding #5: skip the store when the key is unstable.
+    if cache_key is not None:
+        _store_lowering_in_cache(cache_key, prim_func, result)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -669,6 +1380,18 @@ def _assert_path_c_metal_fp8_intrinsics_registered() -> None:
         )
 
 
+# fix-round-8 (Wave 3 grok-4): cache resolved Target objects keyed on the
+# string spec. Construction parses the spec and instantiates a
+# ``tvm.target.Target``, which is non-trivial. ``lower_tilelang_to_msl_inline``
+# calls this on every lowering; the active set of distinct target strings is
+# tiny (typically just ``"metal"`` and ``"metal -thread_warp_size=32"``), so
+# a 4-entry LRU is more than enough. Non-string inputs bypass the cache
+# (they may be unhashable dicts) and go straight to the slow path.
+@functools.lru_cache(maxsize=4)
+def _as_metal_target_cached(target: str) -> Any:
+    return _as_metal_target_uncached(target)
+
+
 def _as_metal_target(target: Any) -> Any:
     """Coerce a Metal target spec into a form Apache TVM accepts.
 
@@ -681,6 +1404,12 @@ def _as_metal_target(target: Any) -> Any:
     error rather than an opaque import failure here.
     """
 
+    if isinstance(target, str):
+        return _as_metal_target_cached(target)
+    return _as_metal_target_uncached(target)
+
+
+def _as_metal_target_uncached(target: Any) -> Any:
     try:
         from tilelang import tvm  # type: ignore
     except Exception:
@@ -731,12 +1460,36 @@ def _as_metal_target(target: Any) -> Any:
             return spec
 
 
-# Auto-register intrinsics at module import. Best-effort only — failures
-# here are tolerated so the module imports cleanly on hosts without TVM.
+# Wave 5 grok finding #1: optional self-validation of the full-signature
+# corpus at import time. Off by default to keep import fast; enable in CI or
+# during local development by setting ``CPPMEGA_VALIDATE_PARSE_TESTS=1``.
+if os.environ.get("CPPMEGA_VALIDATE_PARSE_TESTS") == "1":
+    _parse_test_mismatches = _validate_test_full_signatures()
+    if _parse_test_mismatches:
+        warnings.warn(
+            "_TEST_PARSE_FULL_SIGNATURES mismatches: "
+            + "; ".join(
+                f"sig={sig!r} expected={exp} got={act}"
+                for sig, exp, act in _parse_test_mismatches
+            ),
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+
+# Auto-register intrinsics at module import. fix-round-8 (Wave 3 grok-4):
+# narrow the catch from bare ``Exception``. Only import-time errors (TVM
+# / tilelang not installed) and missing-attribute errors (TVM internals
+# moved) are tolerated as "deferred" with a visible warning. Other
+# exception types propagate so they're not silently swallowed at import.
 try:
     _register_path_c_metal_fp8_intrinsics()
-except Exception:
-    pass
+except (ImportError, ModuleNotFoundError, AttributeError) as _register_exc:
+    warnings.warn(
+        f"Path C intrinsic registration deferred: {_register_exc}",
+        RuntimeWarning,
+        stacklevel=2,
+    )
 
 
 __all__ = [
@@ -748,9 +1501,12 @@ __all__ = [
     "_assert_path_c_metal_fp8_intrinsics_registered",
     "_register_path_c_metal_fp8_intrinsics",
     "can_run_metal",
+    "clear_lowering_cache",
     "dispatch",
+    "ensure_libz3_preloaded",
     "lower_tilelang_to_msl_inline",
     "make_metal_kernel",
     "metal_grid_for_lowering",
     "msl_dispatch_status",
+    "reset_libz3_preload_state",
 ]

@@ -18,8 +18,8 @@
     "python": "3.13.12"
   },
   "package_versions": {
-    "mlx": "0.31.1",
-    "mlx_metal": "0.31.1",
+    "mlx": "0.31.2",
+    "mlx_metal": "0.31.2",
     "tilelang": "0.1.9+gitcab1a7db",
     "apache_tvm_ffi": "0.1.11",
     "numpy": "2.4.4"
@@ -91,10 +91,10 @@
           "warmup": 10,
           "ran": true,
           "paired": false,
-          "median_ms": 0.17193799430970103,
-          "min_ms": 0.16337502165697515,
-          "max_ms": 0.2534580125939101,
-          "mean_ms": 0.17963672056794167,
+          "median_ms": 0.16872899141162634,
+          "min_ms": 0.14258400187827647,
+          "max_ms": 0.3145420050714165,
+          "mean_ms": 0.1753432978875935,
           "peak_gib": 7.7858567237854e-07
         },
         "argsort_slice": {
@@ -102,10 +102,10 @@
           "warmup": 10,
           "ran": true,
           "paired": false,
-          "median_ms": 0.1651874918024987,
-          "min_ms": 0.1533330068923533,
-          "max_ms": 0.2842909889295697,
-          "mean_ms": 0.1704816403798759,
+          "median_ms": 0.1583124976605177,
+          "min_ms": 0.13345800107344985,
+          "max_ms": 0.2907919988501817,
+          "mean_ms": 0.16104331938549876,
           "peak_gib": 7.301568984985352e-07
         },
         "topk_take_along": {
@@ -113,37 +113,37 @@
           "warmup": 10,
           "ran": true,
           "paired": false,
-          "median_ms": 0.17791699792724103,
-          "min_ms": 0.1640410046093166,
-          "max_ms": 0.2822499955072999,
-          "mean_ms": 0.19056592136621475,
+          "median_ms": 0.17320849292445928,
+          "min_ms": 0.15654199523851275,
+          "max_ms": 0.4502090159803629,
+          "mean_ms": 0.18235418072436005,
           "peak_gib": 8.083879947662354e-07
         },
         "path_b_msl": {
           "iters": 50,
           "warmup": 10,
           "ran": true,
-          "paired": false,
-          "median_ms": 0.15833300130907446,
-          "min_ms": 0.14866702258586884,
-          "max_ms": 0.2796660119201988,
-          "mean_ms": 0.16691089898813516,
-          "peak_gib": 2.980232238769531e-07
+          "paired": true,
+          "median_ms": 0.15535400598309934,
+          "min_ms": 0.1355829881504178,
+          "max_ms": 0.57045798166655,
+          "mean_ms": 0.17042412189766765,
+          "peak_gib": 3.0547380447387695e-07
         },
         "path_c_tilelang": {
-          "ran": false,
-          "error": "TileLang DSL Path C kernel did not dispatch",
           "iters": 50,
           "warmup": 10,
-          "median_ms": null,
-          "min_ms": null,
-          "max_ms": null,
-          "mean_ms": null,
-          "peak_gib": null
+          "ran": true,
+          "paired": true,
+          "median_ms": 0.13904149818699807,
+          "min_ms": 0.11754099978134036,
+          "max_ms": 0.2349170099478215,
+          "mean_ms": 0.14507256099022925,
+          "peak_gib": 2.905726432800293e-07
         }
       },
       "ratios": {
-        "path_c_over_path_b": null
+        "path_c_over_path_b": 0.8949978296801958
       }
     },
     {
@@ -157,10 +157,10 @@
           "warmup": 10,
           "ran": true,
           "paired": false,
-          "median_ms": 0.1805005013011396,
-          "min_ms": 0.16033300198614597,
-          "max_ms": 0.3030420048162341,
-          "mean_ms": 0.18579834082629532,
+          "median_ms": 0.16162500833161175,
+          "min_ms": 0.13650002074427903,
+          "max_ms": 0.4955829936079681,
+          "mean_ms": 0.17141828022431582,
           "peak_gib": 5.904585123062134e-06
         },
         "argsort_slice": {
@@ -168,10 +168,10 @@
           "warmup": 10,
           "ran": true,
           "paired": false,
-          "median_ms": 0.16395850980188698,
-          "min_ms": 0.1486249966546893,
-          "max_ms": 0.2924170112237334,
-          "mean_ms": 0.16894256346859038,
+          "median_ms": 0.1526455016573891,
+          "min_ms": 0.13479101471602917,
+          "max_ms": 0.4402089980430901,
+          "mean_ms": 0.1627649401780218,
           "peak_gib": 5.7443976402282715e-06
         },
         "topk_take_along": {
@@ -179,37 +179,37 @@
           "warmup": 10,
           "ran": true,
           "paired": false,
-          "median_ms": 0.18247948901262134,
-          "min_ms": 0.17120799748227,
-          "max_ms": 0.6031669909134507,
-          "mean_ms": 0.22035667847376317,
+          "median_ms": 0.14816649490967393,
+          "min_ms": 0.13995799235999584,
+          "max_ms": 0.6422910082619637,
+          "mean_ms": 0.163997458294034,
           "peak_gib": 6.023794412612915e-06
         },
         "path_b_msl": {
           "iters": 50,
           "warmup": 10,
           "ran": true,
-          "paired": false,
-          "median_ms": 0.38789649261161685,
-          "min_ms": 0.36962502053938806,
-          "max_ms": 0.606291985604912,
-          "mean_ms": 0.3984375618165359,
-          "peak_gib": 2.0638108253479004e-06
+          "paired": true,
+          "median_ms": 0.31549998675473034,
+          "min_ms": 0.2700829936657101,
+          "max_ms": 0.7760419975966215,
+          "mean_ms": 0.3304399404441938,
+          "peak_gib": 2.0712614059448242e-06
         },
         "path_c_tilelang": {
-          "ran": false,
-          "error": "TileLang DSL Path C kernel did not dispatch",
           "iters": 50,
           "warmup": 10,
-          "median_ms": null,
-          "min_ms": null,
-          "max_ms": null,
-          "mean_ms": null,
-          "peak_gib": null
+          "ran": true,
+          "paired": true,
+          "median_ms": 0.355791999027133,
+          "min_ms": 0.3108329838141799,
+          "max_ms": 0.4604579880833626,
+          "mean_ms": 0.3561416995944455,
+          "peak_gib": 2.0563602447509766e-06
         }
       },
       "ratios": {
-        "path_c_over_path_b": null
+        "path_c_over_path_b": 1.1277084436257858
       }
     },
     {
@@ -223,10 +223,10 @@
           "warmup": 10,
           "ran": true,
           "paired": false,
-          "median_ms": 0.19485400116536766,
-          "min_ms": 0.17625000327825546,
-          "max_ms": 0.5582909798249602,
-          "mean_ms": 0.21461747819557786,
+          "median_ms": 0.1807289954740554,
+          "min_ms": 0.1619999820832163,
+          "max_ms": 0.4182090051472187,
+          "mean_ms": 0.1908125396585092,
           "peak_gib": 2.3227185010910034e-05
         },
         "argsort_slice": {
@@ -234,10 +234,10 @@
           "warmup": 10,
           "ran": true,
           "paired": false,
-          "median_ms": 0.18020850257016718,
-          "min_ms": 0.16591700841672719,
-          "max_ms": 0.32550000469200313,
-          "mean_ms": 0.18556169990915805,
+          "median_ms": 0.16158349171746522,
+          "min_ms": 0.14795898459851742,
+          "max_ms": 0.4182499833405018,
+          "mean_ms": 0.1670932787237689,
           "peak_gib": 2.2917985916137695e-05
         },
         "topk_take_along": {
@@ -245,37 +245,37 @@
           "warmup": 10,
           "ran": true,
           "paired": false,
-          "median_ms": 0.19624999549705535,
-          "min_ms": 0.18920900765806437,
-          "max_ms": 0.327207992086187,
-          "mean_ms": 0.20217589975800365,
+          "median_ms": 0.17141649732366204,
+          "min_ms": 0.15445900498889387,
+          "max_ms": 0.5942920106463134,
+          "mean_ms": 0.1806108804885298,
           "peak_gib": 2.3465603590011597e-05
         },
         "path_b_msl": {
           "iters": 50,
           "warmup": 10,
           "ran": true,
-          "paired": false,
-          "median_ms": 0.5376039916882291,
-          "min_ms": 0.5118749977555126,
-          "max_ms": 0.9239999926649034,
-          "mean_ms": 0.5578333779703826,
-          "peak_gib": 7.912516593933105e-06
+          "paired": true,
+          "median_ms": 0.53879150073044,
+          "min_ms": 0.5234999989625067,
+          "max_ms": 0.8017499931156635,
+          "mean_ms": 0.5476575181819499,
+          "peak_gib": 7.91996717453003e-06
         },
         "path_c_tilelang": {
-          "ran": false,
-          "error": "TileLang DSL Path C kernel did not dispatch",
           "iters": 50,
           "warmup": 10,
-          "median_ms": null,
-          "min_ms": null,
-          "max_ms": null,
-          "mean_ms": null,
-          "peak_gib": null
+          "ran": true,
+          "paired": true,
+          "median_ms": 0.35204150481149554,
+          "min_ms": 0.3359580005053431,
+          "max_ms": 0.49199999193660915,
+          "mean_ms": 0.36293665994890034,
+          "peak_gib": 7.905066013336182e-06
         }
       },
       "ratios": {
-        "path_c_over_path_b": null
+        "path_c_over_path_b": 0.653390976535882
       }
     },
     {
@@ -289,10 +289,10 @@
           "warmup": 10,
           "ran": true,
           "paired": false,
-          "median_ms": 0.22462500783149153,
-          "min_ms": 0.19170899759046733,
-          "max_ms": 0.3531249822117388,
-          "mean_ms": 0.2295917586889118,
+          "median_ms": 0.18027050828095526,
+          "min_ms": 0.16720799612812698,
+          "max_ms": 0.44091700692661107,
+          "mean_ms": 0.18859751871787012,
           "peak_gib": 9.304285049438477e-05
         },
         "argsort_slice": {
@@ -300,10 +300,10 @@
           "warmup": 10,
           "ran": true,
           "paired": false,
-          "median_ms": 0.17966650193557143,
-          "min_ms": 0.16437500016763806,
-          "max_ms": 0.35266700433567166,
-          "mean_ms": 0.1873601000988856,
+          "median_ms": 0.16606200370006263,
+          "min_ms": 0.13341600424610078,
+          "max_ms": 0.28045798535458744,
+          "mean_ms": 0.16921836067922413,
           "peak_gib": 9.254366159439087e-05
         },
         "topk_take_along": {
@@ -311,37 +311,37 @@
           "warmup": 10,
           "ran": true,
           "paired": false,
-          "median_ms": 0.2120415010722354,
-          "min_ms": 0.18520798766985536,
-          "max_ms": 0.3057919966522604,
-          "mean_ms": 0.2143357804743573,
+          "median_ms": 0.17860399384517223,
+          "min_ms": 0.15712500317022204,
+          "max_ms": 0.5280839977785945,
+          "mean_ms": 0.1896882796427235,
           "peak_gib": 9.399652481079102e-05
         },
         "path_b_msl": {
           "iters": 50,
           "warmup": 10,
           "ran": true,
-          "paired": false,
-          "median_ms": 0.7366040081251413,
-          "min_ms": 0.6116250006016344,
-          "max_ms": 0.9269159927498549,
-          "mean_ms": 0.7508182822493836,
-          "peak_gib": 3.154575824737549e-05
+          "paired": true,
+          "median_ms": 0.5280835030134767,
+          "min_ms": 0.5122919974382967,
+          "max_ms": 0.6462080054916441,
+          "mean_ms": 0.5348316812887788,
+          "peak_gib": 3.1575560569763184e-05
         },
         "path_c_tilelang": {
-          "ran": false,
-          "error": "TileLang DSL Path C kernel did not dispatch",
           "iters": 50,
           "warmup": 10,
-          "median_ms": null,
-          "min_ms": null,
-          "max_ms": null,
-          "mean_ms": null,
-          "peak_gib": null
+          "ran": true,
+          "paired": true,
+          "median_ms": 0.34587499976623803,
+          "min_ms": 0.3289580054115504,
+          "max_ms": 0.6101670151110739,
+          "mean_ms": 0.35515750176273286,
+          "peak_gib": 3.1538307666778564e-05
         }
       },
       "ratios": {
-        "path_c_over_path_b": null
+        "path_c_over_path_b": 0.6549627053155859
       }
     },
     {
@@ -355,59 +355,59 @@
           "warmup": 10,
           "ran": true,
           "paired": false,
-          "median_ms": 0.20245800260454416,
-          "min_ms": 0.19245798466727138,
-          "max_ms": 0.3692079917527735,
-          "mean_ms": 0.21394093986600637,
-          "peak_gib": 6.253272294998169e-05
+          "median_ms": 0.17464601842220873,
+          "min_ms": 0.1657090033404529,
+          "max_ms": 0.596500001847744,
+          "mean_ms": 0.18966338131576777,
+          "peak_gib": 6.255507469177246e-05
         },
         "argsort_slice": {
           "iters": 50,
           "warmup": 10,
           "ran": true,
           "paired": false,
-          "median_ms": 0.19052049901802093,
-          "min_ms": 0.17845799447968602,
-          "max_ms": 0.3059159789700061,
-          "mean_ms": 0.19772747706156224,
-          "peak_gib": 6.203353404998779e-05
+          "median_ms": 0.15614551375620067,
+          "min_ms": 0.13837500591762364,
+          "max_ms": 0.28787500923499465,
+          "mean_ms": 0.1584707823349163,
+          "peak_gib": 6.205588579177856e-05
         },
         "topk_take_along": {
           "iters": 50,
           "warmup": 10,
           "ran": true,
           "paired": false,
-          "median_ms": 0.21075000404380262,
-          "min_ms": 0.19362499006092548,
-          "max_ms": 0.33912499202415347,
-          "mean_ms": 0.2181007171748206,
-          "peak_gib": 6.300956010818481e-05
+          "median_ms": 0.1728329953039065,
+          "min_ms": 0.1594589848536998,
+          "max_ms": 0.5594580143224448,
+          "mean_ms": 0.18218837911263108,
+          "peak_gib": 6.303191184997559e-05
         },
         "path_b_msl": {
           "iters": 50,
           "warmup": 10,
           "ran": true,
-          "paired": false,
-          "median_ms": 0.5530624912353233,
-          "min_ms": 0.5297909956425428,
-          "max_ms": 0.6372920179273933,
-          "mean_ms": 0.5588690977310762,
-          "peak_gib": 1.6294419765472412e-05
+          "paired": true,
+          "median_ms": 0.5330415006028488,
+          "min_ms": 0.5166660121176392,
+          "max_ms": 0.6941249885130674,
+          "mean_ms": 0.5396300222491845,
+          "peak_gib": 1.6316771507263184e-05
         },
         "path_c_tilelang": {
-          "ran": false,
-          "error": "TileLang DSL Path C kernel did not dispatch",
           "iters": 50,
           "warmup": 10,
-          "median_ms": null,
-          "min_ms": null,
-          "max_ms": null,
-          "mean_ms": null,
-          "peak_gib": null
+          "ran": true,
+          "paired": true,
+          "median_ms": 0.35018699418287724,
+          "min_ms": 0.33316700137220323,
+          "max_ms": 0.48362501547671854,
+          "mean_ms": 0.35668917989823967,
+          "peak_gib": 1.6279518604278564e-05
         }
       },
       "ratios": {
-        "path_c_over_path_b": null
+        "path_c_over_path_b": 0.6569600937015778
       }
     },
     {
@@ -421,59 +421,59 @@
           "warmup": 10,
           "ran": true,
           "paired": false,
-          "median_ms": 0.1973335020011291,
-          "min_ms": 0.18462497973814607,
-          "max_ms": 0.3402919974178076,
-          "mean_ms": 0.20752667740453035,
-          "peak_gib": 6.253272294998169e-05
+          "median_ms": 0.1793749979697168,
+          "min_ms": 0.15100001473911107,
+          "max_ms": 0.5498339887708426,
+          "mean_ms": 0.18745176203083247,
+          "peak_gib": 6.255507469177246e-05
         },
         "argsort_slice": {
           "iters": 50,
           "warmup": 10,
           "ran": true,
           "paired": false,
-          "median_ms": 0.1737085112836212,
-          "min_ms": 0.16191700706258416,
-          "max_ms": 0.27187500381842256,
-          "mean_ms": 0.1806791394483298,
-          "peak_gib": 6.203353404998779e-05
+          "median_ms": 0.15916700067464262,
+          "min_ms": 0.14970797928981483,
+          "max_ms": 0.1854579895734787,
+          "mean_ms": 0.16103671689052135,
+          "peak_gib": 6.205588579177856e-05
         },
         "topk_take_along": {
           "iters": 50,
           "warmup": 10,
           "ran": true,
           "paired": false,
-          "median_ms": 0.19722901924978942,
-          "min_ms": 0.1757920254021883,
-          "max_ms": 0.27179199969395995,
-          "mean_ms": 0.19883244181983173,
-          "peak_gib": 6.300956010818481e-05
+          "median_ms": 0.17591650248505175,
+          "min_ms": 0.15049998182803392,
+          "max_ms": 0.4726249899249524,
+          "mean_ms": 0.184006659546867,
+          "peak_gib": 6.303191184997559e-05
         },
         "path_b_msl": {
           "iters": 50,
           "warmup": 10,
           "ran": true,
-          "paired": false,
-          "median_ms": 0.72552049823571,
-          "min_ms": 0.5885839927941561,
-          "max_ms": 0.9030000073835254,
-          "mean_ms": 0.7303182600298896,
-          "peak_gib": 4.681199789047241e-05
+          "paired": true,
+          "median_ms": 0.5168334755580872,
+          "min_ms": 0.49945799401029944,
+          "max_ms": 0.8559999987483025,
+          "mean_ms": 0.5329666199395433,
+          "peak_gib": 4.6834349632263184e-05
         },
         "path_c_tilelang": {
-          "ran": false,
-          "error": "TileLang DSL Path C kernel did not dispatch",
           "iters": 50,
           "warmup": 10,
-          "median_ms": null,
-          "min_ms": null,
-          "max_ms": null,
-          "mean_ms": null,
-          "peak_gib": null
+          "ran": true,
+          "paired": true,
+          "median_ms": 0.3428539930609986,
+          "min_ms": 0.3241660015191883,
+          "max_ms": 0.5630000086966902,
+          "mean_ms": 0.35044910036958754,
+          "peak_gib": 4.6797096729278564e-05
         }
       },
       "ratios": {
-        "path_c_over_path_b": null
+        "path_c_over_path_b": 0.6633741993797478
       }
     },
     {
@@ -487,59 +487,59 @@
           "warmup": 10,
           "ran": true,
           "paired": false,
-          "median_ms": 0.20674998813774437,
-          "min_ms": 0.1842500059865415,
-          "max_ms": 0.3138750034850091,
-          "mean_ms": 0.21956084063276649,
-          "peak_gib": 0.0004330947995185852
+          "median_ms": 0.18985399219673127,
+          "min_ms": 0.16712502110749483,
+          "max_ms": 0.5471250042319298,
+          "mean_ms": 0.19841660163365304,
+          "peak_gib": 0.000433117151260376
         },
         "argsort_slice": {
           "iters": 50,
           "warmup": 10,
           "ran": true,
           "paired": false,
-          "median_ms": 0.192916500964202,
-          "min_ms": 0.16958301421254873,
-          "max_ms": 0.3149579861201346,
-          "mean_ms": 0.20280076016206294,
-          "peak_gib": 0.00043116509914398193
+          "median_ms": 0.17291649419348687,
+          "min_ms": 0.14975000522099435,
+          "max_ms": 0.3106250078417361,
+          "mean_ms": 0.17958830168936402,
+          "peak_gib": 0.0004311874508857727
         },
         "topk_take_along": {
           "iters": 50,
           "warmup": 10,
           "ran": true,
           "paired": false,
-          "median_ms": 0.21487449703272432,
-          "min_ms": 0.19208301091566682,
-          "max_ms": 0.4647919849958271,
-          "mean_ms": 0.2276083780452609,
-          "peak_gib": 0.0004369094967842102
+          "median_ms": 0.1907705154735595,
+          "min_ms": 0.17529199249111116,
+          "max_ms": 0.6079160084482282,
+          "mean_ms": 0.2022225596010685,
+          "peak_gib": 0.000436931848526001
         },
         "path_b_msl": {
           "iters": 50,
           "warmup": 10,
           "ran": true,
-          "paired": false,
-          "median_ms": 8.844812487950549,
-          "min_ms": 8.793582994258031,
-          "max_ms": 9.081666998099536,
-          "mean_ms": 8.860433279187419,
-          "peak_gib": 6.493180990219116e-05
+          "paired": true,
+          "median_ms": 9.00941650616005,
+          "min_ms": 8.75641600578092,
+          "max_ms": 9.332624991657212,
+          "mean_ms": 9.01134159648791,
+          "peak_gib": 6.498396396636963e-05
         },
         "path_c_tilelang": {
-          "ran": false,
-          "error": "TileLang DSL Path C kernel did not dispatch",
           "iters": 50,
           "warmup": 10,
-          "median_ms": null,
-          "min_ms": null,
-          "max_ms": null,
-          "mean_ms": null,
-          "peak_gib": null
+          "ran": true,
+          "paired": true,
+          "median_ms": 5.086500008474104,
+          "min_ms": 4.9399579875171185,
+          "max_ms": 5.298665986629203,
+          "mean_ms": 5.095796659006737,
+          "peak_gib": 6.494671106338501e-05
         }
       },
       "ratios": {
-        "path_c_over_path_b": null
+        "path_c_over_path_b": 0.5645759639368751
       }
     }
   ],
@@ -548,13 +548,7 @@
     "passed": false,
     "path_c_over_path_b_max_ratio": 1.0,
     "failures": [
-      "strict topk Path C gate failed: B=1 T=64 k=8 dtype=float32 C/B=None path_b_ran=True path_c_ran=False",
-      "strict topk Path C gate failed: B=1 T=512 k=32 dtype=float32 C/B=None path_b_ran=True path_c_ran=False",
-      "strict topk Path C gate failed: B=1 T=2048 k=64 dtype=float32 C/B=None path_b_ran=True path_c_ran=False",
-      "strict topk Path C gate failed: B=4 T=2048 k=64 dtype=float32 C/B=None path_b_ran=True path_c_ran=False",
-      "strict topk Path C gate failed: B=4 T=2048 k=64 dtype=float16 C/B=None path_b_ran=True path_c_ran=False",
-      "strict topk Path C gate failed: B=4 T=2048 k=64 dtype=bfloat16 C/B=None path_b_ran=True path_c_ran=False",
-      "strict topk Path C gate failed: B=4 T=4096 k=256 dtype=float32 C/B=None path_b_ran=True path_c_ran=False"
+      "strict topk Path C gate failed: B=1 T=512 k=32 dtype=float32 C/B=1.1277084436257858 path_b_ran=True path_c_ran=True"
     ]
   }
 }

@@ -15,8 +15,9 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
+import warnings
 from dataclasses import dataclass, replace
-from functools import lru_cache
 from typing import Any, cast
 
 import mlx.core as mx
@@ -59,6 +60,26 @@ _FP8_VECMAT_PATH_C_CANDIDATE_PASS_CONFIGS: dict[str, Any] = {
 
 _FP8_VECMAT_PATH_C_FILTERED_KEYS_LOGGED: set[str] = set()
 _FP8_VECMAT_PATH_C_PASS_CONFIGS_CACHE: dict[str, Any] | None = None
+# grok design P2: cache the result of the Metal FP8 intrinsic registration
+# check so we don't re-validate on every kernel build. ``True`` means
+# "intrinsics confirmed registered this process"; ``False`` means we have
+# not checked yet. Once checked, subsequent macro-path builds skip the
+# scan entirely.
+_FP8_VECMAT_PATH_C_INTRINSICS_CHECKED: bool = False
+# grok wave-2 correctness P2: a single re-entrant lock now guards both the
+# intrinsics-check first-run and the PassConfig probe-and-cache. They are
+# *not* fully independent: the macro-path branch of
+# ``make_fp8_vecmat_reduce_kernel`` calls
+# ``_ensure_path_c_metal_fp8_intrinsics_registered`` and the surrounding
+# build flow may also pull ``_fp8_vecmat_pass_configs`` (e.g. via
+# ``lower_fp8_vecmat_msl``); separate locks let two MLX worker threads
+# interleave the two first-time probes in pathological orderings, which
+# duplicated the one-shot warnings and (in the worst case) partially
+# populated ``_FP8_VECMAT_PATH_C_PASS_CONFIGS_CACHE`` from one thread while
+# another read it. A single ``RLock`` is safe — the critical sections never
+# call into each other recursively, but reentrance keeps the door open if
+# they ever do — and serialises both first-time setups behind one barrier.
+_FP8_VECMAT_PATH_C_FIRST_RUN_LOCK = threading.RLock()
 
 
 def _filter_supported_pass_configs(candidates: dict[str, Any]) -> dict[str, Any]:
@@ -80,7 +101,7 @@ def _filter_supported_pass_configs(candidates: dict[str, Any]) -> dict[str, Any]
         try:
             with tvm.transform.PassContext(opt_level=3, config={key: value}):
                 pass
-        except Exception:
+        except (AttributeError, KeyError, TypeError):
             if key not in _FP8_VECMAT_PATH_C_FILTERED_KEYS_LOGGED:
                 _FP8_VECMAT_PATH_C_FILTERED_KEYS_LOGGED.add(key)
                 print(
@@ -109,11 +130,12 @@ def _fp8_vecmat_pass_configs() -> dict[str, Any]:
     ):
         return {}
     global _FP8_VECMAT_PATH_C_PASS_CONFIGS_CACHE
-    if _FP8_VECMAT_PATH_C_PASS_CONFIGS_CACHE is None:
-        _FP8_VECMAT_PATH_C_PASS_CONFIGS_CACHE = _filter_supported_pass_configs(
-            _FP8_VECMAT_PATH_C_CANDIDATE_PASS_CONFIGS
-        )
-    return dict(_FP8_VECMAT_PATH_C_PASS_CONFIGS_CACHE)
+    with _FP8_VECMAT_PATH_C_FIRST_RUN_LOCK:
+        if _FP8_VECMAT_PATH_C_PASS_CONFIGS_CACHE is None:
+            _FP8_VECMAT_PATH_C_PASS_CONFIGS_CACHE = _filter_supported_pass_configs(
+                _FP8_VECMAT_PATH_C_CANDIDATE_PASS_CONFIGS
+            )
+        return dict(_FP8_VECMAT_PATH_C_PASS_CONFIGS_CACHE)
 
 # TileLang resolves these globals while decorating the nested @T.prim_func.
 # Defaults keep static tooling aligned with the runtime-specialized contract.
@@ -148,11 +170,118 @@ def _tilelang_available() -> tuple[bool, str]:
     return True, "tilelang importable"
 
 
+_FP8_VECMAT_PATH_C_STATUS_UNAVAILABLE_LOGGED: set[str] = set()
+
+
+_FP8_VECMAT_PATH_C_VECTORIZED_PROBE_LOGGED = False
+
+
+def _warn_vectorized_loads_probe() -> None:
+    """One-shot stderr warning when the ``vectorized_loads=True`` probe runs.
+
+    The vectorized-loads PrimFunc branch is an experimental probe — on the
+    current apple-head Metal lowering it does not reliably emit packed
+    uint32 MSL loads, so production callers should leave the default
+    ``vectorized_loads=False`` and ride the packed dot4 macro fast path.
+    Kept for receipts; logged once per process so the off-canonical
+    selection is observable.
+    """
+
+    global _FP8_VECMAT_PATH_C_VECTORIZED_PROBE_LOGGED
+    if _FP8_VECMAT_PATH_C_VECTORIZED_PROBE_LOGGED:
+        return
+    _FP8_VECMAT_PATH_C_VECTORIZED_PROBE_LOGGED = True
+    warnings.warn(
+        "fp8_vecmat_path_c: vectorized_loads=True is an experimental probe "
+        "and does not reliably emit packed uint32 MSL loads on the current "
+        "apple-head Metal lowering; the canonical fast path is the packed "
+        "dot4 macro (vectorized_loads=False). Use at own risk.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+    print(
+        "[cppmega-mlx-cuz] fp8_vecmat_path_c: vectorized_loads=True probe "
+        "engaged (off canonical fast path).",
+        file=sys.stderr,
+    )
+
+
+def _ensure_path_c_metal_fp8_intrinsics_registered() -> None:
+    """Cached wrapper around ``_assert_path_c_metal_fp8_intrinsics_registered``.
+
+    The underlying scan iterates the Metal FP8 intrinsic table and probes
+    ``Op.get`` for each name, which is a tiny but non-zero cost paid on
+    every macro-path kernel build. Cache the *successful* outcome so
+    subsequent builds (same process) short-circuit. A failure is *not*
+    cached: if intrinsics are temporarily missing during a hot-reload
+    we want the next build to retry rather than raise stale.
+    """
+
+    global _FP8_VECMAT_PATH_C_INTRINSICS_CHECKED
+    if _FP8_VECMAT_PATH_C_INTRINSICS_CHECKED:
+        return
+    with _FP8_VECMAT_PATH_C_FIRST_RUN_LOCK:
+        if _FP8_VECMAT_PATH_C_INTRINSICS_CHECKED:
+            return
+        _assert_path_c_metal_fp8_intrinsics_registered()
+        _FP8_VECMAT_PATH_C_INTRINSICS_CHECKED = True
+
+
+_FP8_VECMAT_PATH_C_SIMPLIFY_FAILURE_LOGGED: set[str] = set()
+
+
+def _warn_apply_simplify_failed(exc: BaseException) -> None:
+    """One-shot RuntimeWarning when ``apply_simplify`` raises.
+
+    Keyed by ``(type, str)`` so a recurring failure logs once but a new
+    failure mode logs again. Keeps the fallback path silent on the data
+    plane while still surfacing the regression to anyone listening for
+    warnings.
+    """
+
+    key = f"{type(exc).__name__}: {exc}"
+    if key in _FP8_VECMAT_PATH_C_SIMPLIFY_FAILURE_LOGGED:
+        return
+    _FP8_VECMAT_PATH_C_SIMPLIFY_FAILURE_LOGGED.add(key)
+    warnings.warn(
+        f"fp8_vecmat_path_c: tilelang.transform.simplify.apply_simplify "
+        f"failed ({key}); falling back to un-simplified PrimFunc. "
+        "Lowering will continue but may emit slower MSL.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+
+
+def _warn_path_c_unavailable(reason: str) -> None:
+    """One-shot RuntimeWarning when the Path C fast path is skipped.
+
+    Used by both ``fp8_vecmat_path_c_status`` (TileLang import) and
+    ``fp8_scaled_vecmat_path_c`` (``can_run_metal`` /
+    ``MSLDispatchUnsupported``) so callers see *why* Path C returned ``None``
+    and the hand-written Path B fallback was picked instead. De-duplicated by
+    reason string to avoid log spam in tight loops.
+    """
+
+    if reason in _FP8_VECMAT_PATH_C_STATUS_UNAVAILABLE_LOGGED:
+        return
+    _FP8_VECMAT_PATH_C_STATUS_UNAVAILABLE_LOGGED.add(reason)
+    warnings.warn(
+        f"fp8_scaled_vecmat_path_c: Path C unavailable ({reason}); "
+        "caller should fall back to Path B.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+
+
 def fp8_vecmat_path_c_status() -> FP8VecmatPathCStatus:
     """Return whether TileLang is importable for Path C vecmat lowering."""
 
     ok, reason = _tilelang_available()
     if not ok:
+        # grok correctness P1 (silent failure): emit a one-shot RuntimeWarning
+        # carrying the actual reason so callers polling status don't get a
+        # quiet ``available=False`` with no breadcrumb.
+        _warn_path_c_unavailable(f"tilelang unavailable: {reason}")
         return FP8VecmatPathCStatus(available=False, reason=reason)
     return FP8VecmatPathCStatus(
         available=True,
@@ -226,6 +355,18 @@ def make_fp8_vecmat_reduce_kernel(
     )
 
     if vectorized_loads:
+        # Note: experimental probe — use at own risk.
+        # grok performance P2 / design: this branch mirrors upstream TileLang
+        # GEMV examples by staging a small local vector with
+        # ``T.vectorized(vec)``, but on the current apple-head Metal lowering
+        # it does NOT reliably emit packed uint32 MSL loads — the fast path
+        # is the ``_uses_fp8_dot4_packed_macro`` branch below. Kept here for
+        # receipts (so a future TileLang upgrade that wires vectorized FP8
+        # loads can be A/B'd) and per repo policy (no silent delete of dead
+        # code; investigate intent and close the debt properly). Emit a
+        # one-shot warning so anyone enabling this in production sees that
+        # they are off the canonical path.
+        _warn_vectorized_loads_probe()
 
         @T.prim_func
         def fp8_vecmat_reduce(
@@ -286,7 +427,11 @@ def make_fp8_vecmat_reduce_kernel(
         # parse the macro PrimFunc. Without this we get an opaque FFI
         # ``AttributeError`` deep in the lowering pipeline; with it we get
         # a clear ``RuntimeError`` naming the missing intrinsic.
-        _assert_path_c_metal_fp8_intrinsics_registered()
+        # grok design P2: cache the result so we run the registration
+        # scan once per process instead of on every kernel build. Failure
+        # still raises (the intrinsic is required for correctness); only
+        # the *successful* check is cached.
+        _ensure_path_c_metal_fp8_intrinsics_registered()
 
         @T.prim_func
         def fp8_vecmat_reduce(
@@ -372,7 +517,14 @@ def make_fp8_vecmat_reduce_kernel(
         from tilelang.transform.simplify import apply_simplify
 
         return apply_simplify(fp8_vecmat_reduce)
-    except Exception:
+    except Exception as exc:
+        # grok correctness P2: apply_simplify failure used to fall through
+        # silently, so a regression in TileLang's simplify pass would just
+        # quietly hand back un-simplified IR (slower or wrong codegen).
+        # Surface a one-shot RuntimeWarning naming the exception, but keep
+        # the fallback so we don't break lowering on TileLang versions
+        # missing the pass.
+        _warn_apply_simplify_failed(exc)
         return fp8_vecmat_reduce
 
 
@@ -401,6 +553,8 @@ def _uses_fp8_dot4_packed_macro(*, vec: int, K: int) -> bool:
 
     structural_match = vec == 4
     if not structural_match:
+        return False
+    if K <= 0:
         return False
     k_aligned = (K % 4 == 0)
     if not k_aligned:
@@ -543,7 +697,61 @@ def fp8_vecmat_msl_blockers(msl: str) -> dict[str, Any]:
     }
 
 
-@lru_cache(maxsize=128)
+def _canonicalize_macro_output_shape(
+    output_shape: tuple[int, ...], n: int
+) -> tuple[int, ...]:
+    """Canonicalize a TileLang macro output shape to the public flat ``(n,)``.
+
+    grok correctness P1: the dispatch logic in ``fp8_scaled_vecmat_path_c``
+    used to test ``output_shape in ((n,), (1, n))`` directly. That made the
+    fast-path gate fragile to TileLang version drift — if a future lowering
+    began emitting ``(n, 1)`` (or any other equivalent shape) the literal
+    set would silently fail to match and route to the slower
+    ``_msl_transform.dispatch`` path while ``mx.fast.metal_kernel`` was
+    still capable of running it. Worse, the output buffer would be
+    allocated against the wrong tuple.
+
+    This helper accepts the known equivalent shapes ``(n,)``, ``(1, n)``,
+    and ``(n, 1)`` and returns the canonical flat ``(n,)`` (matching Path
+    B's public contract). Any other tuple is *unexpected* — emit a
+    one-shot warning and raise ``RuntimeError`` so the regression is
+    surfaced loudly per repo policy "fail-fast on fallback" instead of
+    silently degrading.
+    """
+
+    if output_shape in ((n,), (1, n), (n, 1)):
+        return (n,)
+
+    reason = (
+        f"unexpected TileLang FP8 vecmat output_shape {output_shape!r}; "
+        f"expected (n,), (1, n), or (n, 1) for n={n}"
+    )
+    _warn_path_c_unavailable(reason)
+    raise RuntimeError(f"fp8_vecmat_path_c: {reason}")
+
+
+# grok performance P2: the previous ``@lru_cache`` decorator on
+# ``_fp8_vecmat_kernel_for`` did NOT include ``vectorized_loads`` in its key
+# (it wasn't even a parameter). Toggling the experimental probe between
+# kernel builds therefore reused a cached PrimFunc compiled for the *other*
+# branch — incorrect reuse. We now key on the full tuple including
+# ``vectorized_loads`` via a manual dict guarded by a re-entrant lock; this
+# also lets us share state across the in-process kernel cache and the
+# intrinsics/pass-config first-run lock if we ever want to chain them.
+_FP8_VECMAT_KERNEL_CACHE: dict[
+    tuple[int, int, int, int, int, bool, bool],
+    tuple[
+        Any,
+        _msl_transform.TileLangMSLLowering,
+        list[str],
+        tuple[int, ...],
+        tuple[int, int, int],
+        tuple[int, int, int],
+    ],
+] = {}
+_FP8_VECMAT_KERNEL_CACHE_LOCK = threading.RLock()
+
+
 def _fp8_vecmat_kernel_for(
     N: int,
     K: int,
@@ -551,6 +759,7 @@ def _fp8_vecmat_kernel_for(
     reduce_threads: int,
     vec: int,
     scale_w_per_row: bool,
+    vectorized_loads: bool = False,
 ) -> tuple[
     Any,
     _msl_transform.TileLangMSLLowering,
@@ -559,7 +768,26 @@ def _fp8_vecmat_kernel_for(
     tuple[int, int, int],
     tuple[int, int, int],
 ]:
-    """Build and cache the MLX-dispatchable TileLang FP8 vecmat reducer."""
+    """Build and cache the MLX-dispatchable TileLang FP8 vecmat reducer.
+
+    grok performance P2: the cache key now includes ``vectorized_loads``
+    so toggling the experimental probe between calls produces a fresh
+    kernel rather than reusing a PrimFunc compiled for the other branch.
+    """
+
+    cache_key = (
+        int(N),
+        int(K),
+        int(outputs_per_block),
+        int(reduce_threads),
+        int(vec),
+        bool(scale_w_per_row),
+        bool(vectorized_loads),
+    )
+    with _FP8_VECMAT_KERNEL_CACHE_LOCK:
+        cached = _FP8_VECMAT_KERNEL_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
 
     prim = make_fp8_vecmat_reduce_kernel(
         N=N,
@@ -567,6 +795,7 @@ def _fp8_vecmat_kernel_for(
         outputs_per_block=outputs_per_block,
         reduce_threads=reduce_threads,
         vec=vec,
+        vectorized_loads=vectorized_loads,
         scale_w_per_row=scale_w_per_row,
     )
     lowering = lower_tilelang_to_msl_inline(
@@ -596,7 +825,8 @@ def _fp8_vecmat_kernel_for(
     kernel = mx.fast.metal_kernel(
         name=(
             f"cppmega_fp8_vecmat_path_c_{N}_{K}_{outputs_per_block}_"
-            f"{reduce_threads}_{vec}_{int(scale_w_per_row)}"
+            f"{reduce_threads}_{vec}_{int(scale_w_per_row)}_"
+            f"{int(vectorized_loads)}"
         ),
         input_names=input_names,
         output_names=["C"],
@@ -604,7 +834,12 @@ def _fp8_vecmat_kernel_for(
         header=lowering.header,
         ensure_row_contiguous=True,
     )
-    return kernel, lowering, input_names, output_shape, grid, threadgroup
+    result = (kernel, lowering, input_names, output_shape, grid, threadgroup)
+    with _FP8_VECMAT_KERNEL_CACHE_LOCK:
+        # Tolerate concurrent first-build races: last-writer-wins is fine,
+        # both producers built the same PrimFunc for the same key.
+        _FP8_VECMAT_KERNEL_CACHE[cache_key] = result
+    return result
 
 
 def canonical_vecmat_runtime_body(*, N: int, K: int, scale_w_per_row: bool) -> str:
@@ -648,11 +883,25 @@ def canonical_vecmat_runtime_body(*, N: int, K: int, scale_w_per_row: bool) -> s
 def _grid_for_lowering(
     lowering: _msl_transform.TileLangMSLLowering,
 ) -> tuple[int, int, int]:
-    return (
-        max(1, lowering.grid[0] * lowering.threadgroup[0]),
-        max(1, lowering.grid[1] * lowering.threadgroup[1]),
-        max(1, lowering.grid[2] * lowering.threadgroup[2]),
-    )
+    """Compute the MLX dispatch grid (total threads) for a TileLang lowering.
+
+    grok correctness P1 investigation: the multiplication
+    ``lowering.grid[i] * lowering.threadgroup[i]`` is *intentional* and
+    correct. TileLang's Metal lowering populates ``lowering.grid`` with
+    *threadgroup* extents (one per ``T.Kernel`` block dim) — i.e. the
+    ``T.ceildiv(_FP8_VM_N, _FP8_VM_NP)`` factor on dim 0 here — while
+    ``mx.fast.metal_kernel`` requires the *total* thread count per axis.
+    Multiplying threadgroups * threads-per-threadgroup yields the total
+    grid MLX expects; without it MLX would launch one thread per TileLang
+    block (under-launch, missed outputs).
+
+    This duplicates ``_msl_transform.metal_grid_for_lowering`` for legacy
+    reasons and is kept as a thin alias to avoid a broader API change in
+    this wave; both helpers must compute the same value. See the
+    ``metal_grid_for_lowering`` docstring for the canonical contract.
+    """
+
+    return _msl_transform.metal_grid_for_lowering(lowering)
 
 
 def _resolve_vecmat_scale(
@@ -662,9 +911,32 @@ def _resolve_vecmat_scale(
     name: str,
     scalar_only: bool = False,
 ) -> mx.array:
+    """Normalize a scalar/per-row scale tensor to canonical 1D float32.
+
+    grok performance P2: this runs on every M=1 vecmat call (hot inference
+    path). We deliberately skip a memoization layer here — ``mx.array`` is
+    not hashable and id-keyed memoization would extend tensor lifetimes
+    past their natural scope on the inference path. Instead we make the
+    no-op fast path explicit: when the caller has already passed a 1D
+    float32 tensor of the right size, return it without any reshape /
+    astype / size check work. The ValueError path still validates
+    aggressively so wrong shapes don't slip through.
+    """
+
     if isinstance(scale, (int, float)):
         return mx.array([float(scale)], dtype=mx.float32)
+    # Fast no-op: caller already passed canonical 1D float32. Skip the
+    # reshape and size-check work entirely when the shape matches what
+    # the kernel expects (length-1 scalar or per-row of size ``length``).
     if scale.ndim == 1 and scale.dtype == mx.float32:
+        size = scale.size
+        if size == 1:
+            return scale
+        if not scalar_only and size == length:
+            return scale
+        # 1D float32 but wrong size — fall through to the validation /
+        # error path below so the error message is consistent with the
+        # non-canonical input branches.
         arr = scale
     else:
         arr = scale.reshape((scale.size,))
@@ -731,6 +1003,11 @@ def fp8_scaled_vecmat_path_c(
     """
 
     if not can_run_metal():
+        # grok correctness P1 (silent failure): warn once so callers know why
+        # the Path C fast path returned ``None`` and the caller fell back to
+        # the slower path. ``can_run_metal`` already encapsulates "is mlx +
+        # Metal usable here", so we don't have a richer reason string to log.
+        _warn_path_c_unavailable("can_run_metal() returned False")
         return None
     A, A_scale, B, B_scale, n, k, scale_w_per_row = _normalize_vecmat_inputs(
         x_fp8,
@@ -747,13 +1024,26 @@ def fp8_scaled_vecmat_path_c(
             vec,
             scale_w_per_row,
         )
-    except MSLDispatchUnsupported:
+    except MSLDispatchUnsupported as exc:
+        # grok correctness P1: surface the dispatch-unsupported reason
+        # instead of silently returning ``None`` and routing to the
+        # hand-written Path B fallback.
+        _warn_path_c_unavailable(
+            f"MSLDispatchUnsupported during kernel build: {exc}"
+        )
         return None
 
-    if input_names == ["A", "A_scale", "B", "B_scale"] and output_shape in (
-        (n,),
-        (1, n),
-    ):
+    # grok correctness P1: route the dispatch decision through
+    # ``_canonicalize_macro_output_shape`` so a TileLang version that emits
+    # an equivalent-but-different shape tuple (e.g. ``(n, 1)``) doesn't
+    # silently skip the fast tuple-input path. Unexpected shapes raise
+    # ``RuntimeError`` rather than degrading to the slower
+    # ``_msl_transform.dispatch`` path.
+    if input_names == ["A", "A_scale", "B", "B_scale"]:
+        canonical_shape = _canonicalize_macro_output_shape(output_shape, n)
+        # Allocate the output buffer using the *emitted* shape so MLX
+        # allocates the buffer the kernel actually writes; reshape to the
+        # canonical flat ``(n,)`` on the way out.
         outputs = cast(_msl_transform.MetalKernel, kernel)(
             inputs=(A, A_scale, B, B_scale),
             template=None,
@@ -766,7 +1056,7 @@ def fp8_scaled_vecmat_path_c(
         out = outputs[0]
         # Macro path declares C as (1, N); fallbacks as (N,). Caller
         # contract returns flat (n,).
-        return out if out.ndim == 1 else out.reshape((n,))
+        return out if out.shape == canonical_shape else out.reshape(canonical_shape)
 
     input_map = {
         "A": A.reshape((1, k)),

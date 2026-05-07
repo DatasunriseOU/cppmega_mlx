@@ -1,6 +1,6 @@
 --- path_b_handwritten_msl_body
 +++ path_c_lowered_msl
-@@ -1,72 +1,49 @@
+@@ -1,72 +1,53 @@
 -// Inputs (all fp32 carriers after up-cast in Python wrapper):
 -    //   x      [B, T, H, P]
 -    //   B_proj [B, T, H, N]
@@ -42,31 +42,35 @@
 +) {
 +  thread float h_state[64];
 +  thread float y_acc[1];
++  int global_lane = ((((int)blockIdx.x) * 32) + ((int)threadIdx.x));
++  int p = ((int)threadIdx.x);
++  int h = (((int)blockIdx.x) & 3);
++  int b = (((int)blockIdx.x) >> 2);
 +  for (int n = 0; n < 64; ++n) {
-+    h_state[n] = h0[((((int)threadIdx.x) * 64) + n)];
++    h_state[n] = h0[(((((int)blockIdx.x) * 2048) + (((int)threadIdx.x) * 64)) + n)];
 +  }
 +  for (int t = 0; t < 512; ++t) {
-+    float A_val = A[((((((int)threadIdx.x) >> 7) * 2048) + (t * 4)) + ((((int)threadIdx.x) & 127) >> 5))];
-+    float dt_val = dt[((((((int)threadIdx.x) >> 7) * 2048) + (t * 4)) + ((((int)threadIdx.x) & 127) >> 5))];
++    float A_val = A[((((((int)blockIdx.x) >> 2) * 2048) + (t * 4)) + (((int)blockIdx.x) & 3))];
++    float dt_val = dt[((((((int)blockIdx.x) >> 2) * 2048) + (t * 4)) + (((int)blockIdx.x) & 3))];
 +    float decay = exp((A_val * dt_val));
-+    float x_val = x[((((((int)threadIdx.x) >> 7) * 65536) + (t * 128)) + (((int)threadIdx.x) & 127))];
-+    float z_val = z[((((((int)threadIdx.x) >> 7) * 65536) + (t * 128)) + (((int)threadIdx.x) & 127))];
++    float x_val = x[(((((((int)blockIdx.x) >> 2) * 65536) + (t * 128)) + ((((int)blockIdx.x) & 3) * 32)) + ((int)threadIdx.x))];
++    float z_val = z[(((((((int)blockIdx.x) >> 2) * 65536) + (t * 128)) + ((((int)blockIdx.x) & 3) * 32)) + ((int)threadIdx.x))];
 +    y_acc[0] = 0.000000e+00f;
 +    for (int n_1 = 0; n_1 < 64; ++n_1) {
-+      float new_h = ((decay * h_state[n_1]) + (x_val * B[(((((((int)threadIdx.x) >> 7) * 131072) + (t * 256)) + (((((int)threadIdx.x) & 127) >> 5) * 64)) + n_1)]));
++      float new_h = ((exp((A_val * dt_val)) * h_state[n_1]) + (x_val * B[(((((((int)blockIdx.x) >> 2) * 131072) + (t * 256)) + ((((int)blockIdx.x) & 3) * 64)) + n_1)]));
 +      h_state[n_1] = new_h;
-+      y_acc[0] = (y_acc[0] + (new_h * C[(((((((int)threadIdx.x) >> 7) * 131072) + (t * 256)) + (((((int)threadIdx.x) & 127) >> 5) * 64)) + n_1)]));
++      y_acc[0] = (y_acc[0] + (new_h * C[(((((((int)blockIdx.x) >> 2) * 131072) + (t * 256)) + ((((int)blockIdx.x) & 3) * 64)) + n_1)]));
      }
 -    uint p = tid % uint(HEADDIM);
 -    uint h = (tid / uint(HEADDIM)) % uint(HEADS);
 -    uint b = tid / (uint(HEADDIM) * uint(HEADS));
-+    float D_h = D[((((int)threadIdx.x) & 127) >> 5)];
++    float D_h = D[(((int)blockIdx.x) & 3)];
 +    float y_skipped = (y_acc[0] + (D_h * x_val));
 +    float sig_z = (1.000000e+00f / (1.000000e+00f + exp((z_val * -1.000000e+00f))));
-+    y[((((((int)threadIdx.x) >> 7) * 65536) + (t * 128)) + (((int)threadIdx.x) & 127))] = ((z_val * sig_z) * y_skipped);
++    y[(((((((int)blockIdx.x) >> 2) * 65536) + (t * 128)) + ((((int)blockIdx.x) & 3) * 32)) + ((int)threadIdx.x))] = ((z_val * (1.000000e+00f / (1.000000e+00f + exp((z_val * -1.000000e+00f))))) * y_skipped);
 +  }
 +  for (int n_2 = 0; n_2 < 64; ++n_2) {
-+    h_last[((((int)threadIdx.x) * 64) + n_2)] = h_state[n_2];
++    h_last[(((((int)blockIdx.x) * 2048) + (((int)threadIdx.x) * 64)) + n_2)] = h_state[n_2];
 +  }
 +}
  

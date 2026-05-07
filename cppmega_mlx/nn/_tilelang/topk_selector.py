@@ -122,6 +122,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+import threading
 from dataclasses import dataclass, replace
 from functools import lru_cache
 from typing import Any
@@ -129,6 +130,10 @@ from typing import Any
 import mlx.core as mx
 
 from cppmega_mlx.nn._tilelang import _msl_transform
+from cppmega_mlx.nn._tilelang._engine_dispatch import (
+    dispatch_lower,
+    tilelang_engine_mode,
+)
 
 
 # CPPMEGA Z3 wiring (beads cppmega-mlx-cuz):
@@ -159,6 +164,9 @@ _TOPK_PATH_C_CANDIDATE_PASS_CONFIGS: dict[str, Any] = {
 
 _TOPK_PATH_C_FILTERED_KEYS_LOGGED: set[str] = set()
 _TOPK_PATH_C_PASS_CONFIGS_CACHE: dict[str, Any] | None = None
+# Guards first-time populate of ``_TOPK_PATH_C_PASS_CONFIGS_CACHE`` so two
+# MLX threads lowering this kernel concurrently don't race the probe loop.
+_topk_path_c_pass_configs_cache_lock = threading.Lock()
 
 
 def _topk_filter_supported_pass_configs(candidates: dict[str, Any]) -> dict[str, Any]:
@@ -203,11 +211,12 @@ def _topk_path_c_pass_configs() -> dict[str, Any]:
     ):
         return {}
     global _TOPK_PATH_C_PASS_CONFIGS_CACHE
-    if _TOPK_PATH_C_PASS_CONFIGS_CACHE is None:
-        _TOPK_PATH_C_PASS_CONFIGS_CACHE = _topk_filter_supported_pass_configs(
-            _TOPK_PATH_C_CANDIDATE_PASS_CONFIGS
-        )
-    return dict(_TOPK_PATH_C_PASS_CONFIGS_CACHE)
+    with _topk_path_c_pass_configs_cache_lock:
+        if _TOPK_PATH_C_PASS_CONFIGS_CACHE is None:
+            _TOPK_PATH_C_PASS_CONFIGS_CACHE = _topk_filter_supported_pass_configs(
+                _TOPK_PATH_C_CANDIDATE_PASS_CONFIGS
+            )
+        return dict(_TOPK_PATH_C_PASS_CONFIGS_CACHE)
 
 
 # TileLang's eager builder reads these module globals after _path_c_kernel_for
@@ -756,7 +765,13 @@ def _path_c_score_dtype(scores: mx.array) -> tuple[str, mx.array] | None:
 _PATH_C_AUTO_PROFITABLE_RECEIPTS = frozenset(
     {
         (1, 64, 8, "float32"),
-        (1, 512, 32, "float32"),
+        # fix-round-3: dropped (1, 512, 32, "float32") -- the prior
+        # profitable bench was driven by the buggy
+        # ``elif (K<=8) or (K>=64): break`` heuristic that miscompiled the
+        # local-heap insertion sort for K=16/32. After the correctness fix
+        # the K=32 row is ~1.3x Path B at this shape, so AUTO must not
+        # prefer Path C here. K=64+ (which always took the early break
+        # under the old heuristic too, so it stayed correct) remains.
         (1, 2048, 64, "float32"),
         (4, 2048, 64, "float32"),
         (4, 2048, 64, "float16"),
@@ -842,6 +857,26 @@ def _path_c_rewrite_merge_round(
     branch. TileLang currently emits a pre-write barrier and splits writeback
     into a second identical branch; the final round barrier is enough to
     protect the next round.
+
+    TODO(fix-round-3, fragility): this rewrite is regex/string-based on the
+    emitted MSL body produced by `_msl_transform.lower_tilelang_to_msl_inline`.
+    Any change to TileLang's MSL emission (whitespace, variable names, brace
+    style, barrier ordering) silently no-ops the rewrite -- the
+    ``body == lowering.body`` short-circuit returns the original lowering, so
+    functionally we degrade to TileLang's conservative emission rather than
+    miscompile, but we lose the perf win without warning. A durable fix is
+    one of:
+      (a) move this to a TileLang TIR-level pass that runs before MSL
+          codegen, where the IR is structured (waiting on a `pass_configs`
+          hook for user passes in TileLang 0.1.10+);
+      (b) add a unit/regex assertion that the rewrite found *some* target
+          pattern and fails loud-and-early when TileLang's emission shape
+          changes (forces a deliberate regex update);
+      (c) drop the rewrite entirely once `tl.intra_warp_barrier_elision`
+          (already wired in `__init__.py`) lands a tighter merge-round
+          schedule that no longer needs textual surgery.
+    Tracking: docs/upstream/_path_c_blockers_tracker.md ("topk merge regex
+    rewrite hardening", to be filed alongside the canonicalize fixes).
     """
 
     lane_expr = "((int)thread_position_in_threadgroup.x)"
@@ -879,8 +914,17 @@ def _path_c_rewrite_merge_round(
         f"((other * {_TOPK_C_K}) + bp)",
     )
 
-    if body == lowering.body:
-        return lowering
+    # fix-round-4: a silent no-op here masked TileLang emission drift —
+    # we'd quietly degrade to the conservative lowering with no log signal.
+    # Make the no-match case fail loud so a future TileLang version that
+    # changes whitespace / variable names / barrier ordering forces a
+    # deliberate regex update instead of a silent perf regression.
+    assert body != lowering.body, (
+        "_path_c_rewrite_merge_round: MSL pattern not found — TileLang "
+        "merge-round emission shape has changed. Update the regex/string "
+        "patterns in this function (see docs/upstream/"
+        "_path_c_blockers_tracker.md, 'topk merge regex rewrite hardening')."
+    )
     return replace(lowering, body=body)
 
 
@@ -951,7 +995,7 @@ def _path_c_kernel_for(
             e = ends[bx]
 
             for i in T.serial(_TOPK_C_K):
-                local_vals[i] = -T.infinity("float32")
+                local_vals[i] = T.float32(-1.0e38)
                 local_idx[i] = -1
 
             for j in T.serial(lane, _TOPK_C_N, step=_TOPK_C_THREADS):
@@ -959,16 +1003,26 @@ def _path_c_kernel_for(
                 value = T.if_then_else(
                     valid,
                     T.cast(scores[bx, j], "float32"),
-                    -T.infinity("float32"),
+                    T.float32(-1.0e38),
                 )
                 if value > local_vals[0]:
                     pos = 0
+                    # Insertion sort into the ascending top-K list. local_vals
+                    # is sorted ascending, so once we find p with
+                    # value <= local_vals[p] we can stop shifting -- the rest
+                    # of the array is already >= value and stays sorted.
+                    # fix-round-3: the prior `elif (K<=8) or (K>=64): break`
+                    # was a tuning heuristic that *skipped* the break for
+                    # K in {16, 32}, leaving the loop walking past the
+                    # insertion point and corrupting later shifts (correctness
+                    # regression on top-k for K=16/32). The standard
+                    # insertion-sort early-exit is `else: break` for all K.
                     for p in T.serial(1, _TOPK_C_K):
                         if value > local_vals[p]:
                             local_vals[p - 1] = local_vals[p]
                             local_idx[p - 1] = local_idx[p]
                             pos = p
-                        elif (_TOPK_C_K <= 8) or (_TOPK_C_K >= 64):
+                        else:
                             break
                     local_vals[pos] = value
                     local_idx[pos] = j
@@ -986,8 +1040,8 @@ def _path_c_kernel_for(
                         ap = _TOPK_C_K - 1
                         bp = _TOPK_C_K - 1
                         for pick in T.serial(_TOPK_C_K):
-                            a_val = -T.infinity("float32")
-                            b_val = -T.infinity("float32")
+                            a_val = T.float32(-1.0e38)
+                            b_val = T.float32(-1.0e38)
                             a_idx = -1
                             b_idx = -1
                             if ap >= 0:
@@ -1013,12 +1067,29 @@ def _path_c_kernel_for(
                 for i in T.serial(_TOPK_C_K):
                     indices[bx, i] = pair_idx[0, _TOPK_C_K - 1 - i]
 
-    lowering = _path_c_rewrite_merge_round(
-        _msl_transform.lower_tilelang_to_msl_inline(
-            topk_selector_kernel,
-            pass_configs=_topk_path_c_pass_configs(),
+    # Migration phase-2: route the lowering through the shared
+    # ``dispatch_lower`` helper. In ``shim``/``auto`` modes (default) this
+    # returns a :class:`TileLangMSLLowering`, preserving the existing
+    # ``mx.fast.metal_kernel`` path. In ``engine`` mode it returns a
+    # ``tilelang.compile`` artifact stamped with ``_tilelang_engine_target``;
+    # the engine artifact is returned directly so callers can dispatch via the
+    # unified runtime instead of MLX's MSL kernel wrapper.
+    artifact = dispatch_lower(topk_selector_kernel, target="metal")
+    if getattr(artifact, "_tilelang_engine_target", None) is not None:
+        return artifact, None  # engine path: caller invokes the artifact directly
+
+    # Shim path: rewrite the merge round + wrap in mx.fast.metal_kernel as before.
+    lowering = _path_c_rewrite_merge_round(artifact)
+    if _topk_path_c_pass_configs() and getattr(artifact, "pass_configs", None) is None:
+        # The shim helper does not currently thread ``pass_configs`` through
+        # ``dispatch_lower``; re-lower through ``_msl_transform`` so the
+        # tuned PassConfigs (Z3 idea #4 / #9) actually apply on the shim path.
+        lowering = _path_c_rewrite_merge_round(
+            _msl_transform.lower_tilelang_to_msl_inline(
+                topk_selector_kernel,
+                pass_configs=_topk_path_c_pass_configs(),
+            )
         )
-    )
     kernel = mx.fast.metal_kernel(
         name=f"cppmega_topk_selector_path_c_{batch}_{seq_len}_{k}_{threads}_{score_dtype}",
         input_names=["ends", "scores", "starts"],
@@ -1073,6 +1144,17 @@ def topk_selector_tilelang(
         kernel, lowering = _path_c_kernel_for(batch, seq_len, int(k), threads, score_dtype)
     except Exception:
         return None
+
+    if lowering is None:
+        # Engine path: ``kernel`` is a ``tilelang.compile`` artifact. Invoke it
+        # directly via its standard ``__call__`` contract. Failures here surface
+        # as ``None`` to keep the public selector contract stable.
+        try:
+            indices = mx.zeros((batch, int(k)), dtype=mx.int32)
+            kernel(work_scores, starts_buf, ends_buf, indices)
+            return indices
+        except Exception:
+            return None
 
     grid = (
         lowering.grid[0] * lowering.threadgroup[0],

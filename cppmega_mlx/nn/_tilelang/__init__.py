@@ -6,7 +6,16 @@ VJP via mx.custom_function so it remains differentiable.
 
 Membership:
 
-- _msl_transform.py: tiny MSL string assembly + dispatch helper.
+- _msl_transform.py: legacy TileLang->MSL inline lowering shim. **DEPRECATED.**
+  New callers should route through ``dispatch_lower(prim, target)`` which
+  prefers ``tilelang.engine.lower(target=...)`` (engine path) and only falls
+  back to this shim when the engine is unavailable. See
+  ``_engine_dispatch.py`` and ``MIGRATION_PLAN.md``. Existing callers that
+  consume ``TileLangMSLLowering.body``/``.header`` strings for
+  ``mx.fast.metal_kernel`` need an adapter layer (Phase 3) before they can
+  flip — the engine artifact is a runtime callable, not an MSL string.
+- _engine_dispatch.py: ``dispatch_lower(prim, target)`` — phase-1 dispatcher
+  that flips between engine and shim based on ``$CPPMEGA_MLX_TILELANG_ENGINE``.
 - _path_b_lowering.py: vendored TileLang->MSL string-rewrite helpers used
   when a TileLang PrimFunc actually lowers to Metal (does not apply to
   direct-MSL Path B kernels).
@@ -50,6 +59,7 @@ Public Path C surface — what is *exported here* vs what only lives in submodul
 """
 
 from cppmega_mlx.nn._tilelang import (
+    _engine_dispatch,
     _mamba3_helpers,
     _mamba3_helpers_tilelang,
     _msl_transform,
@@ -61,6 +71,10 @@ from cppmega_mlx.nn._tilelang import (
     sparse_mla_blockscaled,
     sparse_mla_fp8,
     topk_selector,
+)
+from cppmega_mlx.nn._tilelang._engine_dispatch import (
+    dispatch_lower,
+    tilelang_engine_mode,
 )
 from cppmega_mlx.nn._tilelang._mamba3_helpers import (
     bwd_dadt_fused,
@@ -143,6 +157,9 @@ from cppmega_mlx.nn._tilelang import _experimental
 from cppmega_mlx.nn._tilelang._experimental import *  # noqa: F401,F403
 
 __all__ = [
+    "dispatch_lower",
+    "tilelang_engine_mode",
+    "_engine_dispatch",
     "FP8MSLKernelStatus",
     "FP8VecmatPathCStatus",
     "E8M0_BLOCK_SIZE",
