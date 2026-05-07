@@ -382,8 +382,22 @@ def make_fp8_amax_kernel(
             # the global fp32 scalar. TileLang lowers this to atomicMax on
             # CUDA and to a CAS loop on Metal (atomicMax on fp32 is not a
             # native MSL primitive).
+            #
+            # Wave-11: pre-filter NaN before atomic_max. CUDA atomicMax on
+            # fp32 has undefined behaviour on NaN inputs and the Metal CAS
+            # loop spins forever (NaN != NaN, so compare_exchange never
+            # succeeds). ``v == v`` is False iff v is NaN; substitute 0.0
+            # (amax identity) on NaN. The wave-3 ``FloatingPointError`` raise
+            # in ``fp8_amax_tilelang`` still fires on the post-kernel scalar
+            # if the input was all-NaN, so callers still get a hard failure
+            # instead of silent zero scale.
             if T.get_thread_binding(0) == 0:
-                T.atomic_max(Amax, local_amax[0])
+                amax_safe = T.if_then_else(
+                    local_amax[0] == local_amax[0],
+                    local_amax[0],
+                    T.cast(0, "float32"),
+                )
+                T.atomic_max(Amax, amax_safe)
 
     return fp8_amax_reduce
 
