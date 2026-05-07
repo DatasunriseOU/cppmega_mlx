@@ -1,6 +1,20 @@
 # pyright: reportInvalidTypeForm=false, reportMissingImports=false
 """Path C FP8 Sparse-MLA QK TileLang DSL surfaces.
 
+REDUCERS-ONLY status — there is no ``sparse_mla_fp8_path_c_apply`` here.
+This module exposes only QK / indexed-QK reducer surfaces, not an end-to-end
+FP8 sparse-MLA forward. The only full callable wrapper for FP8 sparse-MLA is
+the Path B ``sparse_mla_fp8_apply`` (in ``sparse_mla_fp8.py``), so the
+``force_metal`` -> ``force_path_c`` kwarg rename used by the BF16 sparse-MLA
+pair does not apply here. See ``docs/production_kernel_routing.md``.
+
+Runtime status: currently broken — ``tirx.metal.fp8_e4m3_dot4`` is not
+registered in the in-tree TileLang/TVM build, so dispatching the lowered FP8
+reducers raises ``AttributeError: Operator tirx.metal.fp8_e4m3_dot4 is not
+registered``. See agent-D report
+``reports/2026-05-06-tilelang-tvm-review/agent-D-planning-vs-reality/grok__design__20260506T171408.md``
+finding #1.
+
 Path B ships the full direct-MSL FP8 Sparse-MLA forward/backward kernels in
 ``sparse_mla_fp8.py``.  This module owns the Path C QK tile needed by that
 forward path and exposes two separate TileLang surfaces:

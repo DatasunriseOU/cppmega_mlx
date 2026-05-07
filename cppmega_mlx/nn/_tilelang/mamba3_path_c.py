@@ -565,7 +565,16 @@ def mamba3_mimo_apply_path_c(
     D: mx.array,
     h0: mx.array,
 ) -> mx.array:
-    """Path C forward wrapper exposing only ``y`` for VJP symmetry."""
+    """Path C forward wrapper exposing only ``y`` for VJP symmetry.
+
+    Note (Path B vs Path C):
+        The Path B analogue is ``mamba3_mimo_apply`` in ``mamba3.py``.
+        Neither apply accepts a ``force_metal`` / ``force_path_c`` kwarg, so
+        there is no kwarg rename to migrate. This entrypoint is **not**
+        re-exported from ``cppmega_mlx.nn._tilelang.__init__`` — Path C
+        Mamba3 is a proof / override path; Path B is the production
+        entrypoint. See ``docs/production_kernel_routing.md``.
+    """
 
     y, _ = mamba3_mimo_fwd_path_c(x, B, C, z, A, dt, D, h0)
     return y

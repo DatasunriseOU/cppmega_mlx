@@ -24,6 +24,8 @@ import mlx.core as mx
 from cppmega_mlx.nn._tilelang import _msl_transform
 from cppmega_mlx.nn._tilelang._msl_transform import (
     MSLDispatchUnsupported,
+    _as_metal_target,
+    _assert_path_c_metal_fp8_intrinsics_registered,
     can_run_metal,
     lower_tilelang_to_msl_inline,
 )
@@ -279,13 +281,20 @@ def make_fp8_vecmat_reduce_kernel(
 
     elif _uses_fp8_dot4_packed_macro(vec=vec, K=K):
 
+        # Fix-1 + Fix-A re-application: ensure the Path C Metal FP8 ops
+        # (notably ``tirx.metal.fp8_e4m3_dot4``) are registered before we
+        # parse the macro PrimFunc. Without this we get an opaque FFI
+        # ``AttributeError`` deep in the lowering pipeline; with it we get
+        # a clear ``RuntimeError`` naming the missing intrinsic.
+        _assert_path_c_metal_fp8_intrinsics_registered()
+
         @T.prim_func
         def fp8_vecmat_reduce(
             A: T.Tensor((1, _FP8_VM_K), "float8_e4m3"),
             A_scale: T.Tensor((1,), "float32"),
             B: T.Tensor((_FP8_VM_N, _FP8_VM_K), "float8_e4m3"),
             B_scale: T.Tensor((_FP8_VM_SW,), "float32"),
-            C: T.Tensor((_FP8_VM_N,), "float32"),
+            C: T.Tensor((1, _FP8_VM_N), "float32"),
         ):
             with T.Kernel(T.ceildiv(_FP8_VM_N, _FP8_VM_NP), threads=_FP8_VM_RT * _FP8_VM_NP) as bx:
                 accum = T.alloc_local((1,), "float32")
@@ -306,9 +315,9 @@ def make_fp8_vecmat_reduce_kernel(
                 reduced = T.call_intrin("float32", "tir.metal.simd_sum", accum[0])
                 if kr == 0 and col < _FP8_VM_N:
                     if _FP8_VM_SW == 1:
-                        C[col] = reduced * A_scale[0] * B_scale[0]
+                        C[0, col] = reduced * A_scale[0] * B_scale[0]
                     else:
-                        C[col] = reduced * A_scale[0] * B_scale[col]
+                        C[0, col] = reduced * A_scale[0] * B_scale[col]
 
     else:
 
@@ -438,7 +447,10 @@ def lower_fp8_vecmat_msl(
         vectorized_loads=vectorized_loads,
         scale_w_per_row=scale_w_per_row,
     )
-    metal_target = tvm.target.Target(target)
+    # Route through ``_as_metal_target`` so the legacy CLI-form spec
+    # ``"metal -thread_warp_size=32"`` is normalised to the dict form Apache
+    # TVM requires post-#2143.
+    metal_target = _as_metal_target(target)
     pass_configs = _fp8_vecmat_pass_configs()
     if pass_configs:
         with tvm.transform.PassContext(opt_level=3, config=pass_configs):
@@ -572,7 +584,15 @@ def _fp8_vecmat_kernel_for(
     source = lowering.body
     threadgroup = lowering.threadgroup
     grid = _grid_for_lowering(lowering)
-    output_shape: tuple[int, ...] = (N,)
+    # Fix-1 + Fix-A re-application: the packed-dot4 macro PrimFunc declares
+    # ``C: T.Tensor((1, N), float32)`` so its lowered output is two-dim;
+    # scalar / vectorized fallbacks declare ``C: T.Tensor((N,), float32)``.
+    # Caller always reshapes back to ``(n,)``.
+    output_shape: tuple[int, ...]
+    if _uses_fp8_dot4_packed_macro(vec=vec, K=K):
+        output_shape = (1, N)
+    else:
+        output_shape = (N,)
     kernel = mx.fast.metal_kernel(
         name=(
             f"cppmega_fp8_vecmat_path_c_{N}_{K}_{outputs_per_block}_"
@@ -730,7 +750,10 @@ def fp8_scaled_vecmat_path_c(
     except MSLDispatchUnsupported:
         return None
 
-    if output_shape == (n,) and input_names == ["A", "A_scale", "B", "B_scale"]:
+    if input_names == ["A", "A_scale", "B", "B_scale"] and output_shape in (
+        (n,),
+        (1, n),
+    ):
         outputs = cast(_msl_transform.MetalKernel, kernel)(
             inputs=(A, A_scale, B, B_scale),
             template=None,
@@ -740,7 +763,10 @@ def fp8_scaled_vecmat_path_c(
             threadgroup=threadgroup,
             stream=mx.gpu,
         )
-        return outputs[0]
+        out = outputs[0]
+        # Macro path declares C as (1, N); fallbacks as (N,). Caller
+        # contract returns flat (n,).
+        return out if out.ndim == 1 else out.reshape((n,))
 
     input_map = {
         "A": A.reshape((1, k)),

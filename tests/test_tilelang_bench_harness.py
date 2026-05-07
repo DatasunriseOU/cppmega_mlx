@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import sys
+import warnings
 
 import pytest
 from importlib import import_module
@@ -19,6 +20,40 @@ from scripts import bench_tilelang_topk as topk_bench
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+# Schema versioning. v1 is the legacy nested-key shape; v2 is the FLAT shape
+# emitted by scripts/bench_tilelang_fp8_path_c.py. v1 is accepted for now but
+# will be dropped after _V1_DEPRECATION_DROP_DATE.
+CURRENT_SCHEMA_VERSION: int = 2
+LEGACY_SCHEMA_VERSIONS: set[int] = {1}
+SUPPORTED_SCHEMA_VERSIONS: set[int] = LEGACY_SCHEMA_VERSIONS | {CURRENT_SCHEMA_VERSION}
+_V1_DEPRECATION_DROP_DATE: str = "2026-08-06"  # informational; not enforced
+
+
+def _assert_schema(payload: dict, *, source: str = "<unknown>") -> int:
+    """Assert payload schema_version (or legacy 'schema') is supported.
+
+    Emits DeprecationWarning when payload uses a LEGACY_SCHEMA_VERSIONS value.
+    Returns the resolved version int.
+    """
+    version = payload.get("schema_version")
+    if version is None:
+        version = payload.get("schema")
+    assert version in SUPPORTED_SCHEMA_VERSIONS, (
+        f"{source}: unsupported schema_version {version!r}; "
+        f"expected one of {sorted(SUPPORTED_SCHEMA_VERSIONS)}"
+    )
+    if version in LEGACY_SCHEMA_VERSIONS:
+        warnings.warn(
+            f"{source}: bench JSON schema_version={version} is deprecated; "
+            f"will be dropped after {_V1_DEPRECATION_DROP_DATE}. "
+            f"Re-run scripts/bench_tilelang_fp8_path_c.py to upgrade to "
+            f"v{CURRENT_SCHEMA_VERSION}.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    return version
 
 
 def _bench_result(*, ok: bool = True, median_ms: float | None = 1.0) -> dict[str, object]:

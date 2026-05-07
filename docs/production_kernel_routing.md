@@ -34,9 +34,17 @@ This document is the authoritative source for **which kernel implementation each
       <td><strong>Path C</strong></td>
       <td>TileLang DSL <code>@T.prim_func</code> lowered to MSL via the<br>
       patched apple-head TileLang on Metal target.</td>
-      <td><code>cppmega_mlx/nn/_tilelang/mamba3_path_c.py</code><br>
-      <code>cppmega_mlx/nn/_tilelang/sparse_mla_path_c.py</code><br>
-      <code>cppmega_mlx/nn/_tilelang/topk_selector.py</code></td>
+      <td><code>cppmega_mlx/nn/_tilelang/mamba3_path_c.py</code> (full apply)<br>
+      <code>cppmega_mlx/nn/_tilelang/sparse_mla_path_c.py</code> (full apply)<br>
+      <code>cppmega_mlx/nn/_tilelang/topk_selector.py</code> (backend="auto")<br>
+      <code>cppmega_mlx/nn/_tilelang/sparse_mla_blockscaled_path_c.py</code>
+      (PROBE-ONLY; E8M0 QK reducer, no full apply)<br>
+      <code>cppmega_mlx/nn/_tilelang/sparse_mla_fp8_path_c.py</code>
+      (REDUCERS-ONLY; QK + indexed-QK reducers, no full apply)<br>
+      <code>cppmega_mlx/nn/_tilelang/fp8_vecmat_path_c.py</code>
+      (full apply <code>fp8_scaled_vecmat_path_c</code>; <strong>broken at runtime</strong>
+      until <code>tirx.metal.fp8_e4m3_dot4</code> is registered in TileLang/TVM
+      — see agent-D report)</td>
       <td>Yes — via <code>mx.custom_function</code><br>
       wrapper around the lowered MSL.</td>
     </tr>
@@ -112,26 +120,73 @@ Default behavior on Apple Silicon is in the **"Production"** column. Override vi
       <td><strong>C when row-green, else B</strong> — <code>sparse_mla_attention(...)</code></td>
       <td><code>sparse_mla_attention_reference</code></td>
       <td>Path C available via <code>sparse_mla_path_c_apply</code>;<br>
-      AUTO promotes only receipt rows where every forward no-worse flag is true.</td>
+      AUTO promotes only receipt rows where every forward no-worse flag is true.<br>
+      <strong>Kwarg rename:</strong> Path B accepts <code>force_metal=True</code> while
+      Path C accepts <code>force_path_c=True</code>. There is intentionally no
+      backwards-compatible alias — callers migrating from Path B must rename the
+      kwarg explicitly. AUTO callers never see this kwarg directly.</td>
       <td><code>B2_S128_H8_D64</code>, <code>B4_S512_H8_D64</code>,<br>
       and <code>B4_S1024_H8_D64</code> promote to Path C today;<br>
       unreceipted shapes stay Path B fail-closed.</td>
     </tr>
     <tr>
+      <td><strong>FP8 vecmat (Path C)</strong><br>(M=1, transpose-B contract)</td>
+      <td>Opt-in only — see Path B FP8 vecmat row below.</td>
+      <td><code>fp8_scaled_vecmat</code> (Path B)</td>
+      <td><code>fp8_scaled_vecmat_path_c</code> (in
+      <code>cppmega_mlx/nn/_tilelang/fp8_vecmat_path_c.py</code>):<br>
+      <code>x_fp8 (K,) uint8 e4m3</code>,
+      <code>W_fp8 (N, K) uint8 e4m3</code>,
+      <code>scale_x</code> scalar, <code>scale_w</code> scalar or <code>(N,)</code>.<br>
+      Mirrors Path B's vecmat contract. <strong>Status:</strong> entrypoint exists in
+      code but is <em>not</em> exported from
+      <code>cppmega_mlx.nn._tilelang.__init__.py</code> — callers must import the
+      module directly. Bench receipt: 0.82× vs Path B at M=1 N=K=4096.<br>
+      <strong>BROKEN at runtime today</strong> when the underlying TileLang FP8
+      lowering is exercised: the
+      <code>tirx.metal.fp8_e4m3_dot4</code> intrinsic is not registered in the
+      local TileLang/TVM build, so dispatch raises
+      <code>AttributeError: Operator tirx.metal.fp8_e4m3_dot4 is not registered</code>.
+      See agent-D report
+      <code>reports/2026-05-06-tilelang-tvm-review/agent-D-planning-vs-reality/grok__design__20260506T171408.md</code>
+      finding #1.</td>
+      <td>Listed for accuracy — earlier revisions of this table omitted FP8 vecmat
+      Path C even though the entrypoint exists in the tree.</td>
+    </tr>
+    <tr>
       <td><strong>Sparse-MLA fwd FP8</strong></td>
       <td><strong>B</strong> — <code>cppmega_mlx.nn._tilelang.sparse_mla_fp8_apply</code></td>
       <td><code>sparse_mla_fp8_reference</code></td>
-      <td>❌ partial reducers only; QK-reduce C/B 0.864 and indexed C/B 0.696,<br>
-      but full Path C QK is unavailable and full-dispatch gate is red.</td>
+      <td><strong>REDUCERS-ONLY (no apply)</strong> — Path C exposes only QK-reduce
+      and indexed-QK-reduce surfaces (<code>fp8_sparse_mla_qk_reduce_path_c</code>
+      and <code>fp8_sparse_mla_indexed_qk_reduce_path_c</code> in
+      <code>sparse_mla_fp8_path_c.py:826</code>). There is no
+      <code>sparse_mla_fp8_path_c_apply</code> — full Path C QK is unavailable
+      and the full-dispatch gate is red. Bench partial reducers C/B 0.864 and
+      indexed C/B 0.696.<br>
+      <strong>BROKEN at runtime:</strong> the FP8 e4m3 dot4 intrinsic
+      (<code>tirx.metal.fp8_e4m3_dot4</code>) is not registered in the in-tree
+      TileLang/TVM build — see agent-D report
+      <code>reports/2026-05-06-tilelang-tvm-review/agent-D-planning-vs-reality/grok__design__20260506T171408.md</code>
+      finding #1. Until the intrinsic lands the FP8 reducers are non-dispatchable
+      and Path B is the only callable surface.</td>
       <td>FP8 path is software-emulated via uchar storage<br>+ LUT decode (Apple Silicon has no native FP8 ALU).</td>
     </tr>
     <tr>
       <td><strong>Sparse-MLA fwd<br>blockscaled (e8m0)</strong></td>
       <td><strong>B</strong> — <code>sparse_mla_blockscaled_apply</code></td>
       <td><code>sparse_mla_blockscaled_reference</code></td>
-      <td>❌ partial e8m0 QK reducer has a parity/timing receipt<br>
-      (C/B 0.4364), but full Path C QK remains unavailable<br>
-      and the full-dispatch gate stays red.</td>
+      <td><strong>PROBE-ONLY (E8M0 QK)</strong> —
+      <code>sparse_mla_blockscaled_path_c.py:25</code> exposes only the E8M0 QK
+      probe and a real-shape QK reducer
+      (<code>blockscaled_sparse_mla_qk_reduce_path_c</code>). There is no public
+      <code>sparse_mla_blockscaled_path_c_apply</code>; the file's own docstring
+      states it is "intentionally a lowering/status surface, not a production
+      Sparse-MLA forward" (<code>sparse_mla_blockscaled_path_c.py:1-23</code>).
+      Earlier revisions of this routing doc advertised "Path C available" for
+      this op — that claim is retracted. The QK reducer parity/timing receipt
+      stands (C/B 0.4364) but the full-dispatch gate stays red and there is no
+      end-to-end Path C attention path.</td>
       <td>mxfp8 block-scale is a software emulation;<br>Path B handles the 16-element scale tile bookkeeping.</td>
     </tr>
     <tr>
@@ -172,8 +227,10 @@ Default behavior on Apple Silicon is in the **"Production"** column. Override vi
       <td><strong>FP8 scaled matmul /<br>vecmat</strong> (when used in<br>custom paths)</td>
       <td><strong>B</strong> — <code>cppmega_mlx.nn._tilelang.fp8_scaled_matmul</code><br>(audiohacking-style)</td>
       <td>dequant + <code>mx.matmul</code></td>
-      <td>macro <code>T.fp8_scaled_matmul</code> exists but is 3.16×<br>slower than B for 128³ matmul, 6.01× slower for vecmat</td>
-      <td>Not in the production hot path today;<br>available for custom kernel composition.</td>
+      <td><code>T.fp8_scaled_matmul</code> now has packed-dot4 Metal<br>
+      lowering receipts: 0.95× for 128³ matmul, 0.82× for vecmat</td>
+      <td>Standalone parity is closed in the TileLang worktree;<br>
+      production sparse-MLA FP8 still waits on full fwd/bwd composition.</td>
     </tr>
   </tbody>
 </table>
@@ -301,8 +358,11 @@ The dispatch decision is recorded in a process-wide ring buffer (last 256 record
       <td>Sparse-MLA FP8 indexed QK reduce</td>
       <td>n/a</td>
       <td>Path B fwd</td>
-      <td>Path C partial reducers C/B 0.864 and 0.696; full QK<br>
-      unavailable and full-dispatch gate red</td>
+      <td><strong>REDUCERS-ONLY (no apply).</strong> Path C partial reducers
+      C/B 0.864 and 0.696; full QK unavailable and full-dispatch gate red.
+      Currently <strong>broken at runtime</strong> — <code>tirx.metal.fp8_e4m3_dot4</code>
+      not registered in local TileLang/TVM build (agent-D report
+      <code>grok__design__20260506T171408.md</code> finding #1).</td>
       <td>—</td>
       <td>partial only</td>
     </tr>
@@ -310,26 +370,30 @@ The dispatch decision is recorded in a process-wide ring buffer (last 256 record
       <td>Sparse-MLA blockscaled e8m0 QK reduce</td>
       <td>n/a</td>
       <td>Path B blockscaled fwd</td>
-      <td>Path C partial reducer C/B 0.4364; full QK unavailable and<br>
-      full-dispatch gate red</td>
+      <td><strong>PROBE-ONLY (E8M0 QK).</strong> Path C partial reducer C/B 0.4364;
+      full QK unavailable and full-dispatch gate red. No
+      <code>sparse_mla_blockscaled_path_c_apply</code> exists — file is a
+      lowering/status surface only.</td>
       <td>—</td>
       <td>partial only</td>
     </tr>
     <tr>
       <td>FP8 matmul 128×128×128 e4m3</td>
       <td>n/a</td>
-      <td>0.172 ms / 0.024 TFLOPS</td>
-      <td>0.555 ms / 0.008 TFLOPS</td>
+      <td>0.142 ms / 0.029 TFLOPS</td>
+      <td>0.135 ms / 0.031 TFLOPS</td>
       <td>n/a</td>
-      <td>-3.16×</td>
+      <td>0.95×</td>
     </tr>
     <tr>
       <td>FP8 vecmat M=1 N=K=4096</td>
       <td>n/a</td>
-      <td>0.182 ms / 0.184 TFLOPS</td>
-      <td>1.098 ms / 0.031 TFLOPS</td>
+      <td>0.254 ms / 0.132 TFLOPS</td>
+      <td>0.209 ms / 0.160 TFLOPS (bench history; runtime currently broken,<br>
+      see <code>tirx.metal.fp8_e4m3_dot4</code> not-registered note above and
+      agent-D <code>grok__design__20260506T171408.md</code>)</td>
       <td>n/a</td>
-      <td>-6.01×</td>
+      <td>0.82×</td>
     </tr>
     <tr>
       <td>Cross-entropy chunked V=65536 fwd peak</td>

@@ -789,6 +789,15 @@ def mamba3_mimo_apply(
     ``y`` from the differentiable surface to keep the VJP signature symmetric
     with autograd-through-reference. Callers that need ``h_last`` can call
     :func:`mamba3_mimo_fwd_metal` directly.
+
+    Note (Path B vs Path C):
+        Path C's analogous wrapper is ``mamba3_mimo_apply_path_c`` in
+        ``mamba3_path_c.py``. Neither apply takes a ``force_metal`` /
+        ``force_path_c`` kwarg today, so there is no kwarg rename to migrate.
+        Path B is the production entrypoint; Path C is a proof / override
+        path reached only via the submodule import (it is not re-exported
+        from ``cppmega_mlx.nn._tilelang.__init__``). See
+        ``docs/production_kernel_routing.md``.
     """
 
     y, _ = mamba3_mimo_fwd_metal(x, B, C, z, A, dt, D, h0)

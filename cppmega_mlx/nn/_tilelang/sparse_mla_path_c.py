@@ -2365,6 +2365,15 @@ def sparse_mla_path_c_apply(
     and uses the Path C backward kernel for VJP coverage. Forced Path C
     non-default ``d_v``/``sm_scale`` dispatch uses a shape-parameterized custom
     VJP wrapper over the same forward/backward kernels.
+
+    Note (kwarg rename from Path B):
+        This entrypoint accepts ``force_path_c`` (raise instead of falling
+        back when the Path C surface is unavailable). The corresponding Path B
+        wrapper ``sparse_mla_apply`` uses ``force_metal``. The rename is
+        intentional — there is no backwards-compatible ``force_metal`` alias
+        on Path C, so callers migrating from Path B must rename the kwarg.
+        AUTO-routed callers do not see this kwarg directly. See
+        ``docs/production_kernel_routing.md``.
     """
 
     shapes = _resolve_shapes(q, kv, indices, d_v=d_v)

@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "kind": "lane_f_path_c_vs_path_b_fp8_profile",
+  "kind": "path_c_vs_path_b_fp8_profile",
   "host": "Davids-Mac-Studio.local",
   "platform": {
     "system": "Darwin",
@@ -13,7 +13,45 @@
   "env_contract": {
     "MAKEFLAGS": null,
     "CMAKE_BUILD_PARALLEL_LEVEL": null,
-    "PYTHONPATH": null
+    "PYTHONPATH": null,
+    "TVM_LIBRARY_PATH": "/tmp/tl_apache_tvm_swap/build/lib:/tmp/tl_apache_tvm_swap/build/tvm",
+    "DYLD_LIBRARY_PATH": "/tmp/tl_apache_tvm_swap/build/lib:/tmp/tl_apache_tvm_swap/build/tvm",
+    "TILELANG_DEV_BUILD_ROOT": "/tmp/tl_apache_tvm_swap/build",
+    "TVM_HOME": "/tmp/tl_apache_tvm_swap/3rdparty/tvm",
+    "TVM_SOURCE_DIR": "/tmp/tl_apache_tvm_swap/3rdparty/tvm",
+    "selected_python_paths": [
+      "/tmp/tl_apache_tvm_swap",
+      "/tmp/tl_apache_tvm_swap/3rdparty/tvm/python",
+      "/private/tmp/cppmega-mlx-tilelang-stack-c/3rdparty/tvm/3rdparty/tvm-ffi/python",
+      "/tmp/tl_apache_tvm_swap/3rdparty/tvm/3rdparty/tvm-ffi/python",
+      "/tmp/tl_apache_tvm_swap/3rdparty/tvm/python",
+      "/tmp/tl_apache_tvm_swap/3rdparty/tvm/3rdparty/tvm-ffi/python"
+    ],
+    "selected_library_paths": [
+      "/tmp/tl_apache_tvm_swap/build/lib",
+      "/tmp/tl_apache_tvm_swap/build/tvm"
+    ]
+  },
+  "module_origins": {
+    "tilelang": {
+      "importable": true,
+      "file": "/private/tmp/tl_apache_tvm_swap/tilelang/__init__.py",
+      "version": "0.1.9+git1d3b44ba"
+    },
+    "tvm": {
+      "importable": true,
+      "file": "/private/tmp/tl_apache_tvm_swap/3rdparty/tvm/python/tvm/__init__.py",
+      "version": "0.25.dev0"
+    },
+    "tvm_ffi": {
+      "importable": true,
+      "file": "/private/tmp/cppmega-mlx-tilelang-stack-c/3rdparty/tvm/3rdparty/tvm-ffi/python/tvm_ffi/__init__.py",
+      "version": "0.0.0.dev0"
+    },
+    "removed_import_finders": [
+      "_tilelang_editable.ScikitBuildRedirectingFinder",
+      "_apache_tvm_ffi_editable.ScikitBuildRedirectingFinder"
+    ]
   },
   "repos": {
     "cppmega_mlx": {
@@ -22,45 +60,45 @@
       "head": {
         "ok": true,
         "returncode": 0,
-        "stdout": "8a1b3bbf898562fe68a4d80d3416df5bb1413370",
+        "stdout": "ad5179ee8e20dc3e1651986fddece9dc6504de59",
         "stderr": ""
       },
       "status_short": {
         "ok": true,
         "returncode": 0,
-        "stdout": "M bench/tilelang_ports/fp8_path_c_vs_path_b.json\n M bench/tilelang_ports/sparse_mla.json\n M bench/tilelang_ports/sparse_mla_blockscaled.json\n M bench/tilelang_ports/sparse_mla_fp8.json\n M bench/tilelang_ports/topk_selector.json\n M cppmega_mlx/__init__.py\n M cppmega_mlx/models/hybrid_lm.py\n M cppmega_mlx/nn/_tilelang/__init__.py\n M cppmega_mlx/nn/_tilelang/_msl_transform.py\n M cppmega_mlx/nn/_tilelang/fp8_vecmat_path_c.py\n M cppmega_mlx/nn/_tilelang/sparse_mla_blockscaled.py\n M cppmega_mlx/nn/_tilelang/sparse_mla_blockscaled_path_c.py\n M cppmega_mlx/nn/_tilelang/sparse_mla_fp8_path_c.py\n M cppmega_mlx/nn/_tilelang/sparse_mla_path_c.py\n M cppmega_mlx/nn/_tilelang/topk_selector.py\n M cppmega_mlx/nn/sparse_mla.py\n M docs/mlx_buy_vs_build.md\n M docs/mlx_port_master_plan.md\n M docs/production_kernel_routing.md\n M docs/tilelang_ports/sparse_mla.md\n M docs/tilelang_ports/sparse_mla_blockscaled.md\n M docs/tilelang_ports/sparse_mla_fp8.md\n M docs/tilelang_ports/topk_selector.md\n M docs/upstream/_path_c_blockers_tracker.md\n M scripts/bench_tilelang_fp8_path_c.py\n M scripts/bench_tilelang_sparse_mla.py\n M scripts/bench_tilelang_sparse_mla_fp8.py\n M scripts/bench_tilelang_topk.py\n M scripts/m04_train_step.py\n M tests/test_hybrid_lm.py\n M tests/test_m04_train_step.py\n M tests/test_package_exports.py\n M tests/test_sparse_mla_dispatch.py\n M tests/test_tilelang_fp8_vecmat_path_c.py\n M tests/test_tilelang_sparse_mla.py\n M tests/test_tilelang_sparse_mla_blockscaled.py\n M tests/test_tilelang_sparse_mla_fp8.py\n M tests/test_tilelang_topk.py\n M tests/test_tokenizer_loader.py\n?? bench/tilelang_ports/fp8_path_c.json\n?? cppmega_mlx/inference/\n?? tests/test_inference_engine.py\n?? tests/test_inference_generation.py\n?? tests/test_inference_infilling.py\n?? tests/test_inference_quantization.py\n?? tests/test_inference_sampling.py\n?? tests/test_inference_serving.py\n?? tests/test_inference_speculative_decode.py\n?? tests/test_mhc_integration.py\n?? tests/test_tilelang_bench_harness.py\n?? tests/test_tilelang_fp8_matmul_path_c_bench.py\n?? tests/test_tilelang_msl_transform.py",
+        "stdout": "M cppmega_mlx/nn/_tilelang/_msl_transform.py\n M cppmega_mlx/nn/_tilelang/fp8_vecmat_path_c.py\n M docs/production_kernel_routing.md\n M docs/upstream/_path_c_blockers_tracker.md\n M scripts/bench_tilelang_fp8_path_c.py\n M tests/test_tilelang_bench_harness.py\n M tests/test_tilelang_fp8_vecmat_path_c.py\n M tests/test_tilelang_msl_transform.py\n?? bench/tilelang_ports/fp8_path_c_vs_path_b.current_strict.json\n?? bench/tilelang_ports/fp8_path_c_vs_path_b.live.json\n?? bench/tilelang_ports/fp8_path_c_vs_path_b.quick.after_flat_b_word.json\n?? bench/tilelang_ports/fp8_path_c_vs_path_b.quick.before_new_patch.json\n?? bench/tilelang_ports/fp8_path_c_vs_path_b.quick.current.json\n?? bench/tilelang_ports/fp8_path_c_vs_path_b.quick.json",
         "stderr": ""
       }
     },
     "tilelang": {
-      "path": "/private/tmp/tilelang_apple_head/tilelang",
+      "path": "/tmp/tl_apache_tvm_swap",
       "exists": true,
       "head": {
         "ok": true,
         "returncode": 0,
-        "stdout": "a69d6df75b46d7f0eca2eab205a901bc45c6a6af",
+        "stdout": "1d3b44bad357079be305d33ab48bb3006ddbf56d",
         "stderr": ""
       },
       "status_short": {
         "ok": true,
         "returncode": 0,
-        "stdout": "m 3rdparty/tvm\n M pyproject.toml\n M requirements-dev.txt\n M requirements.txt\n M src/op/builtin.cc\n M src/op/builtin.h\n M src/op/copy.cc\n M src/op/gemm_sp.h\n M src/op/reduce.cc\n M src/target/codegen_metal.cc\n M src/target/codegen_metal.h\n M src/transform/lower_thread_allreduce.cc\n M src/transform/storage_rewrite.cc\n M testing/python/metal/test_metal_simdgroup_store.py\n M testing/python/transform/test_readonly_param_const_codegen.py\n M tilelang/engine/phase.py\n M tilelang/intrinsics/metal_macro_generator.py\n M tilelang/language/__init__.py\n M tilelang/language/builtin.py\n M tilelang/language/loop.py\n M tilelang/tileop/gemm/__init__.py\n M tilelang/tileop/metal_quant.py\n M tilelang/transform/metal_fragment_to_simdgroup.py\n?? testing/python/cpu/test_fp8_scaled_matmul_lowering.py\n?? testing/python/metal/test_fp8_scaled_matmul_metal.py\n?? testing/python/metal/test_metal_fp8_vecmat_packed_lut.py\n?? testing/python/metal/test_metal_sparse_mla_bwd_reduction.py\n?? testing/python/metal/test_metal_sparse_mla_pipeline.py\n?? testing/python/metal/test_metal_topk_selector.py\n?? tilelang/language/fp8_op.py\n?? tilelang/tileop/gemm/gemm_metal_fp8.py\n?? tilelang/transform/fp8_scaled_matmul_to_gemm.py\n?? tmp_fp8_vecmat_probe.py",
+        "stdout": "M 3rdparty/tvm\n M src/op/copy.cc\n M src/transform/legalize_safe_memory_access.cc\n M src/transform/loop_partition.cc\n M src/transform/loop_vectorize.cc\n M tilelang/transform/metal_fragment_to_simdgroup.py\n?? CMakeLists.txt.bak\n?? reports/\n?? uv.lock",
         "stderr": ""
       }
     },
     "tvm": {
-      "path": "/private/tmp/tvm_apple_head/tvm",
+      "path": "/tmp/tl_apache_tvm_swap/3rdparty/tvm",
       "exists": true,
       "head": {
         "ok": true,
         "returncode": 0,
-        "stdout": "fbea96c8b72dbdf528abbf1348e0303fa284ec08",
+        "stdout": "d33b25f3b37fdb890b3cb52573482b30b73db7ea",
         "stderr": ""
       },
       "status_short": {
         "ok": true,
         "returncode": 0,
-        "stdout": "M src/runtime/metal/metal_device_api.mm\n M src/target/metal/codegen_metal.cc\n M src/target/metal/codegen_metal.h\n M tests/python/codegen/test_target_codegen_metal.py\n?? .venv/",
+        "stdout": "",
         "stderr": ""
       }
     }
@@ -94,84 +132,46 @@
           "label": "path_b_msl_fp8_scaled_matmul",
           "bench": {
             "label": "path_b_msl_fp8_scaled_matmul",
-            "ok": true,
-            "median_ms": 0.12268754653632641,
-            "min_ms": 0.1105000264942646,
-            "p90_ms": 0.1473750453442335,
-            "max_ms": 0.20816689357161522,
-            "tflops": 0.03418687648756684,
+            "ok": false,
+            "median_ms": null,
+            "min_ms": null,
+            "p90_ms": null,
+            "max_ms": null,
+            "tflops": null,
+            "calls_per_s": null,
+            "tokens_per_s": null,
             "warmup": 10,
             "iters": 50,
             "paired": true,
-            "error": null
-          },
-          "parity_vs_torch_cpu_dequant": {
-            "max_abs": 0.0,
-            "max_rel": 0.0
+            "error": "Path C setup failed before paired timing: AttributeError: Check failed: (reg != nullptr) is false: Operator tirx.metal.fp8_e4m3_dot4 is not registered",
+            "sample_ms": null,
+            "sample_ms_by_step": null
           }
         },
         {
           "label": "matmul_tl_fp8_scaled_matmul",
           "variant": "T.fp8_scaled_matmul",
-          "source_metrics": {
-            "source_len": 5469,
-            "markers": {
-              "simdgroup_multiply_accumulate": 1,
-              "simdgroup_load": 2,
-              "simdgroup_store": 1,
-              "threadgroup_half": 2,
-              "threadgroup_uchar": 4,
-              "threadgroup_barrier": 2,
-              "fp8_e4m3_decode_helper": 3,
-              "fp8_e5m2_decode_helper": 1,
-              "A_scale_loads": 1,
-              "B_scale_loads": 1,
-              "scalar_float_a_val": 0,
-              "scalar_float_b_val": 0,
-              "tvm_thread_allreduce": 0,
-              "simd_sum": 0,
-              "kernel_void": 1,
-              "packed_uint_loads": 0,
-              "fp8_e4m3_lut": 0
-            }
-          },
-          "xcrun_compile": {
-            "ok": true,
-            "returncode": 0,
-            "stderr": "",
-            "msl_path": null,
-            "air_path": null
-          },
-          "paired_ratios": {
-            "matmul_tl_fp8_scaled_matmul_over_path_b_msl_fp8_scaled_matmul_paired_median": 0.8900230393675586,
-            "matmul_tl_fp8_scaled_matmul_over_path_b_msl_fp8_scaled_matmul_paired_p90": 1.0814934598391828
-          },
           "bench": {
             "label": "matmul_tl_fp8_scaled_matmul",
-            "ok": true,
-            "median_ms": 0.10762503370642662,
-            "min_ms": 0.10091718286275864,
-            "p90_ms": 0.14066696166992188,
-            "max_ms": 0.2730421256273985,
-            "tflops": 0.038971453532279314,
+            "ok": false,
+            "median_ms": null,
+            "min_ms": null,
+            "p90_ms": null,
+            "max_ms": null,
+            "tflops": null,
+            "calls_per_s": null,
+            "tokens_per_s": null,
             "warmup": 10,
             "iters": 50,
             "paired": true,
-            "error": null
+            "error": "AttributeError: Check failed: (reg != nullptr) is false: Operator tirx.metal.fp8_e4m3_dot4 is not registered",
+            "sample_ms": null,
+            "sample_ms_by_step": null
           },
-          "parity_vs_path_b_msl": {
-            "max_abs": 0.0,
-            "max_rel": 0.0
-          },
-          "parity_vs_torch_cpu_dequant": {
-            "max_abs": 0.0,
-            "max_rel": 0.0
-          }
+          "traceback": "Traceback (most recent call last):\n  File \"/Volumes/external/sources/cppmega.mlx/scripts/bench_tilelang_fp8_path_c.py\", line 1051, in _bench_paired_scaled_matmul\n    prim = _make_scaled_matmul_kernel(\n        M=M,\n    ...<5 lines>...\n        num_stages=int(shape.get(\"num_stages\", 0)),\n    )\n  File \"/Volumes/external/sources/cppmega.mlx/scripts/bench_tilelang_fp8_path_c.py\", line 783, in _make_scaled_matmul_kernel\n    return T.prim_func(_fp8_scaled_matmul_kernel_template)\n           ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/tmp/tl_apache_tvm_swap/tilelang/language/eager/builder.py\", line 1284, in prim_func\n    return impl(func) if func is not None else impl\n           ~~~~^^^^^^\n  File \"/tmp/tl_apache_tvm_swap/tilelang/language/eager/builder.py\", line 1282, in impl\n    raise e\n  File \"/tmp/tl_apache_tvm_swap/tilelang/language/eager/builder.py\", line 1275, in impl\n    ir_gen.gen(builder)(**annot)\n    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^\n  File \"/Volumes/external/sources/cppmega.mlx/scripts/bench_tilelang_fp8_path_c.py\", line 426, in _fp8_scaled_matmul_kernel_template\n    T.fp8_scaled_matmul(\n    ~~~~~~~~~~~~~~~~~~~^\n        A_fp8,\n        ^^^^^^\n    ...<10 lines>...\n        outputs_per_block=_BN,\n        ^^^^^^^^^^^^^^^^^^^^^^\n    )\n    ^\n  File \"/tmp/tl_apache_tvm_swap/tilelang/language/fp8_op.py\", line 905, in fp8_scaled_matmul\n    return _fp8_scaled_matmul_trans_b_direct_metal_macro(\n        A_fp8,\n    ...<8 lines>...\n        int(outputs_per_block),\n    )\n  File \"/tmp/tl_apache_tvm_swap/tilelang/language/eager/builder.py\", line 779, in __call__\n    res = self.ir_gen.gen(builder)(*args, **kwargs)\n  File \"/tmp/tl_apache_tvm_swap/tilelang/language/fp8_op.py\", line 645, in _fp8_scaled_matmul_trans_b_direct_metal_macro\n    dot += T.metal_fp8_e4m3_dot4(\n           ~~~~~~~~~~~~~~~~~~~~~^\n        T.access_ptr(A_fp8[row, 0], \"r\", extent=K_dim),\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    ...<2 lines>...\n        word_i,\n        ^^^^^^^\n    )\n    ^\n  File \"/tmp/tl_apache_tvm_swap/tilelang/language/fp8_op.py\", line 137, in metal_fp8_e4m3_dot4\n    return T.call_intrin(\n           ~~~~~~~~~~~~~^\n        \"float32\",\n        ^^^^^^^^^^\n    ...<4 lines>...\n        b_word_idx,\n        ^^^^^^^^^^^\n    )\n    ^\n  File \"/tmp/tl_apache_tvm_swap/tilelang/language/tir/ir.py\", line 156, in wrapped\n    return func(*args, **kwargs)\n  File \"/tmp/tl_apache_tvm_swap/tilelang/language/tir/op.py\", line 148, in call_intrin\n    return _tvm_op.call_intrin(dtype, func_name, *args, annotations=annotations, span=span)\n           ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAttributeError: Check failed: (reg != nullptr) is false: Operator tirx.metal.fp8_e4m3_dot4 is not registered\n"
         }
       ],
-      "ratios": {
-        "matmul_tl_fp8_scaled_matmul_over_path_b": 0.8900230393675586
-      }
+      "ratios": {}
     },
     {
       "shape_name": "vecmat_4096",
@@ -192,15 +192,121 @@
           "bench": {
             "label": "path_b_msl_fp8_scaled_vecmat",
             "ok": true,
-            "median_ms": 0.19658368546515703,
-            "min_ms": 0.16300007700920105,
-            "p90_ms": 0.2282080240547657,
-            "max_ms": 0.6085829809308052,
-            "tflops": 0.17068777564426765,
+            "median_ms": 0.23499949020333588,
+            "min_ms": 0.21741600357927382,
+            "p90_ms": 0.2582909946795553,
+            "max_ms": 0.3328339953441173,
+            "tflops": 0.14278512677183539,
+            "calls_per_s": 4255.328380222183,
+            "tokens_per_s": 4255.328380222183,
             "warmup": 10,
             "iters": 50,
             "paired": true,
-            "error": null
+            "error": null,
+            "sample_ms": [
+              0.2346250112168491,
+              0.24437499814666808,
+              0.24049999774433672,
+              0.24074999964796007,
+              0.2463329874444753,
+              0.23224999313242733,
+              0.2329580020159483,
+              0.26012500165961683,
+              0.24654099252074957,
+              0.23329199757426977,
+              0.2766250108834356,
+              0.21741600357927382,
+              0.21804097923450172,
+              0.23479099036194384,
+              0.24320799275301397,
+              0.230583013035357,
+              0.22845901548862457,
+              0.3328339953441173,
+              0.24029199266806245,
+              0.2582909946795553,
+              0.2916659868787974,
+              0.24641701020300388,
+              0.23679100559093058,
+              0.23379200138151646,
+              0.2337500045541674,
+              0.23520799004472792,
+              0.23379200138151646,
+              0.2313339791726321,
+              0.24429100449196994,
+              0.234166975133121,
+              0.22933399304747581,
+              0.2288340183440596,
+              0.2330839924979955,
+              0.23191701620817184,
+              0.23674999829381704,
+              0.2329580020159483,
+              0.22845802595838904,
+              0.23012500605545938,
+              0.23624999448657036,
+              0.23537501692771912,
+              0.2465830184519291,
+              0.23162498837336898,
+              0.23108397726900876,
+              0.23633401724509895,
+              0.27779198717325926,
+              0.2375839976593852,
+              0.23312499979510903,
+              0.23791598505340517,
+              0.23479099036194384,
+              0.237083004321903
+            ],
+            "sample_ms_by_step": {
+              "0": 0.2346250112168491,
+              "1": 0.24437499814666808,
+              "2": 0.24049999774433672,
+              "3": 0.24074999964796007,
+              "4": 0.2463329874444753,
+              "5": 0.23224999313242733,
+              "6": 0.2329580020159483,
+              "7": 0.26012500165961683,
+              "8": 0.24654099252074957,
+              "9": 0.23329199757426977,
+              "10": 0.2766250108834356,
+              "11": 0.21741600357927382,
+              "12": 0.21804097923450172,
+              "13": 0.23479099036194384,
+              "14": 0.24320799275301397,
+              "15": 0.230583013035357,
+              "16": 0.22845901548862457,
+              "17": 0.3328339953441173,
+              "18": 0.24029199266806245,
+              "19": 0.2582909946795553,
+              "20": 0.2916659868787974,
+              "21": 0.24641701020300388,
+              "22": 0.23679100559093058,
+              "23": 0.23379200138151646,
+              "24": 0.2337500045541674,
+              "25": 0.23520799004472792,
+              "26": 0.23379200138151646,
+              "27": 0.2313339791726321,
+              "28": 0.24429100449196994,
+              "29": 0.234166975133121,
+              "30": 0.22933399304747581,
+              "31": 0.2288340183440596,
+              "32": 0.2330839924979955,
+              "33": 0.23191701620817184,
+              "34": 0.23674999829381704,
+              "35": 0.2329580020159483,
+              "36": 0.22845802595838904,
+              "37": 0.23012500605545938,
+              "38": 0.23624999448657036,
+              "39": 0.23537501692771912,
+              "40": 0.2465830184519291,
+              "41": 0.23162498837336898,
+              "42": 0.23108397726900876,
+              "43": 0.23633401724509895,
+              "44": 0.27779198717325926,
+              "45": 0.2375839976593852,
+              "46": 0.23312499979510903,
+              "47": 0.23791598505340517,
+              "48": 0.23479099036194384,
+              "49": 0.237083004321903
+            }
           },
           "parity_vs_torch_cpu_dequant": {
             "max_abs": 0.0001220703125,
@@ -213,104 +319,27 @@
           "target": "metal -thread_warp_size=32",
           "bench": {
             "label": "path_c_mlx_tilelang_fp8_scaled_vecmat",
-            "ok": true,
-            "median_ms": 0.18262502271682024,
-            "min_ms": 0.15562493354082108,
-            "p90_ms": 0.23154192604124546,
-            "max_ms": 0.6084591150283813,
-            "tflops": 0.18373403327116766,
+            "ok": false,
+            "median_ms": null,
+            "min_ms": null,
+            "p90_ms": null,
+            "max_ms": null,
+            "tflops": null,
+            "calls_per_s": null,
+            "tokens_per_s": null,
             "warmup": 10,
             "iters": 50,
             "paired": true,
-            "error": null
+            "error": "ValueError: Cannot parse target string \"metal -thread_warp_size=32\". CLI target string form (e.g. \"llvm -mcpu=xxx\") is no longer supported. Please use JSON dict form (e.g. {\"kind\": \"llvm\", \"mcpu\": \"xxx\"}) instead.. Target creation from string failed: metal -thread_warp_size=32",
+            "sample_ms": null,
+            "sample_ms_by_step": null
           },
-          "paired_ratios": {
-            "path_c_mlx_tilelang_fp8_scaled_vecmat_over_path_b_msl_fp8_scaled_vecmat_paired_median": 0.9608089092133086,
-            "path_c_mlx_tilelang_fp8_scaled_vecmat_over_path_b_msl_fp8_scaled_vecmat_paired_p90": 1.1419314283421493
-          },
-          "source_metrics": {
-            "source_len": 997,
-            "markers": {
-              "simdgroup_multiply_accumulate": 0,
-              "simdgroup_load": 0,
-              "simdgroup_store": 0,
-              "threadgroup_half": 0,
-              "threadgroup_uchar": 0,
-              "threadgroup_barrier": 0,
-              "fp8_e4m3_decode_helper": 0,
-              "fp8_e5m2_decode_helper": 0,
-              "A_scale_loads": 1,
-              "B_scale_loads": 1,
-              "scalar_float_a_val": 0,
-              "scalar_float_b_val": 0,
-              "tvm_thread_allreduce": 0,
-              "simd_sum": 1,
-              "kernel_void": 0,
-              "packed_uint_loads": 2,
-              "fp8_e4m3_lut": 8
-            },
-            "source": "mlx_runtime_canonical_body"
-          },
-          "diagnostic_tilelang_source_metrics": {
-            "source_len": 6934,
-            "markers": {
-              "simdgroup_multiply_accumulate": 0,
-              "simdgroup_load": 0,
-              "simdgroup_store": 0,
-              "threadgroup_half": 0,
-              "threadgroup_uchar": 0,
-              "threadgroup_barrier": 0,
-              "fp8_e4m3_decode_helper": 1,
-              "fp8_e5m2_decode_helper": 1,
-              "A_scale_loads": 1,
-              "B_scale_loads": 1,
-              "scalar_float_a_val": 0,
-              "scalar_float_b_val": 0,
-              "tvm_thread_allreduce": 0,
-              "simd_sum": 1,
-              "kernel_void": 1,
-              "packed_uint_loads": 2,
-              "fp8_e4m3_lut": 9
-            }
-          },
-          "path_c_blockers": {
-            "path_b_fast_path_ready": true,
-            "missing": [],
-            "generated_features": {
-              "kernel_void": 1,
-              "fp8_e4m3_decode_helper": 1,
-              "tvm_thread_allreduce": 0,
-              "simd_shuffle_down": 0,
-              "simd_sum": 1,
-              "reinterpret_cast": 2,
-              "device_const_uint": 4,
-              "uint_pointer": 4,
-              "uchar4": 0,
-              "fp8_e4m3_lut": 9,
-              "metal_fp8_dot4_helper": 2,
-              "scalar_fp8_byte_decode": 1,
-              "scalar_fp8_byte_decode_calls": 0
-            },
-            "required_fast_path": {
-              "packed_uint32_fp8_loads": "reinterpret_cast<device const uint*> loads for 4 FP8 bytes",
-              "metal_simd_sum_reduction": "literal Metal simd_sum(sum) reduction",
-              "packed_lut_dot4_decode": "fp8_e4m3fn_lut-backed packed dot4 decode in the hot loop",
-              "no_scalar_fp8_helper_calls": "avoid per-byte __tvm_fp8_e4m3_to_half calls in the hot loop"
-            }
-          },
-          "parity_vs_path_b_msl": {
-            "max_abs": 0.0,
-            "max_rel": 0.0
-          },
-          "parity_vs_torch_cpu_dequant": {
-            "max_abs": 0.0001220703125,
-            "max_rel": 3.525330976117402e-05
-          }
+          "paired_ratios": {},
+          "paired_ratio_samples": {},
+          "worst_paired_steps": {}
         }
       ],
-      "ratios": {
-        "path_c_mlx_tilelang_fp8_scaled_vecmat_over_path_b": 0.9608089092133086
-      }
+      "ratios": {}
     }
   ],
   "sparse_mla": {
@@ -318,22 +347,248 @@
       "available": true,
       "reason": "sparse_mla_fp8 direct-MSL kernel built via mx.fast.metal_kernel is available; FP8 e4m3 dequant happens inline inside MSL on uint8 storage. Apple MSL 4.0 has no native float8 simdgroup matrix, so the matmuls run as plain register fma ops (still ~2x faster than the BF16-fallback reference because the dequant fuses with the QK loop)."
     },
+    "path_c_tilelang_qk_status": {
+      "available": false,
+      "reason": "TileLang Path C FP8 Sparse-MLA QK has no safe dispatch surface: qk_reduce=TileLang/MLX lowering failed for FP8 Sparse-MLA QK reducer: AttributeError: Check failed: (reg != nullptr) is false: Operator tirx.metal.fp8_e4m3_dot4 is not registered; T.fp8_scaled_matmul=TileLang Path C FP8 Sparse-MLA QK is not safe to dispatch: no simdgroup_multiply_accumulate; scalar fallback markers present; Sparse-MLA M=1/topk tile violates current Metal FP8 simdgroup tile constraints",
+      "target": "metal",
+      "m": 1,
+      "n": 16,
+      "k": 64,
+      "transpose_B": true,
+      "features": {
+        "dispatch_surface": "unavailable",
+        "runnable_qk_reduce_available": false,
+        "runnable_qk_reduce_reason": "TileLang/MLX lowering failed for FP8 Sparse-MLA QK reducer: AttributeError: Check failed: (reg != nullptr) is false: Operator tirx.metal.fp8_e4m3_dot4 is not registered",
+        "legacy_fp8_scaled_matmul_probe_available": false,
+        "legacy_fp8_scaled_matmul_probe_reason": "TileLang Path C FP8 Sparse-MLA QK is not safe to dispatch: no simdgroup_multiply_accumulate; scalar fallback markers present; Sparse-MLA M=1/topk tile violates current Metal FP8 simdgroup tile constraints",
+        "legacy_fp8_scaled_matmul_probe_kernel_void": 1,
+        "legacy_fp8_scaled_matmul_probe_simdgroup_multiply_accumulate": 0,
+        "legacy_fp8_scaled_matmul_probe_simdgroup_load": 0,
+        "legacy_fp8_scaled_matmul_probe_simdgroup_store": 0,
+        "legacy_fp8_scaled_matmul_probe_fp8_e4m3_decode_helper": 3,
+        "legacy_fp8_scaled_matmul_probe_A_scale_refs": 1,
+        "legacy_fp8_scaled_matmul_probe_B_scale_refs": 1,
+        "legacy_fp8_scaled_matmul_probe_signature_has_A_scale": true,
+        "legacy_fp8_scaled_matmul_probe_signature_has_B_scale": true,
+        "legacy_fp8_scaled_matmul_probe_float_a_val": true,
+        "legacy_fp8_scaled_matmul_probe_float_b_val": true,
+        "legacy_fp8_scaled_matmul_probe_threadgroup_half": false
+      }
+    },
+    "path_c_tilelang_qk_reduce_status": {
+      "available": false,
+      "reason": "TileLang/MLX lowering failed for FP8 Sparse-MLA QK reducer: AttributeError: Check failed: (reg != nullptr) is false: Operator tirx.metal.fp8_e4m3_dot4 is not registered",
+      "target": "metal",
+      "n": 16,
+      "k": 64,
+      "outputs_per_block": 16,
+      "reduce_threads": 32,
+      "vec": 4,
+      "features": {}
+    },
+    "path_c_tilelang_indexed_qk_reduce_status": {
+      "available": false,
+      "reason": "TileLang/MLX lowering failed for indexed FP8 Sparse-MLA QK reducer: AttributeError: Check failed: (reg != nullptr) is false: Operator tirx.metal.fp8_e4m3_dot4 is not registered",
+      "target": "metal",
+      "batch": 1,
+      "seq_len": 1,
+      "heads": 1,
+      "seq_len_kv": 16,
+      "kv_group": 1,
+      "head_kv": 1,
+      "topk": 16,
+      "k": 64,
+      "outputs_per_block": 16,
+      "reduce_threads": 32,
+      "vec": 4,
+      "features": {}
+    },
+    "path_c_tilelang_e8m0_qk_status": {
+      "available": false,
+      "reason": "TileLang Path C E8M0 Sparse-MLA QK has no safe dispatch surface: qk_reduce=TileLang/MLX lowering failed for E8M0 Sparse-MLA QK reducer: AttributeError: Check failed: (reg != nullptr) is false: Operator tirx.metal.fp8_e4m3_dot4 is not registered; T.fp8_scaled_matmul=TileLang Metal lowering failed for E8M0 Sparse-MLA QK shape: AttributeError: 'BufferRegion' object has no attribute 'shape'",
+      "target": "metal",
+      "m": 1,
+      "n": 16,
+      "k": 64,
+      "transpose_B": true,
+      "scale_block_size": 32,
+      "scale_layout": "logical_unswizzled_k_axis_blocks",
+      "features": {
+        "dispatch_surface": "unavailable",
+        "runnable_qk_reduce_available": false,
+        "runnable_qk_reduce_reason": "TileLang/MLX lowering failed for E8M0 Sparse-MLA QK reducer: AttributeError: Check failed: (reg != nullptr) is false: Operator tirx.metal.fp8_e4m3_dot4 is not registered",
+        "legacy_e8m0_scaled_matmul_probe_available": false,
+        "legacy_e8m0_scaled_matmul_probe_reason": "TileLang Metal lowering failed for E8M0 Sparse-MLA QK shape: AttributeError: 'BufferRegion' object has no attribute 'shape'"
+      }
+    },
+    "path_c_tilelang_e8m0_qk_reduce_status": {
+      "available": false,
+      "reason": "TileLang/MLX lowering failed for E8M0 Sparse-MLA QK reducer: AttributeError: Check failed: (reg != nullptr) is false: Operator tirx.metal.fp8_e4m3_dot4 is not registered",
+      "target": "metal",
+      "n": 16,
+      "k": 64,
+      "outputs_per_block": 4,
+      "reduce_threads": 32,
+      "vec": 4,
+      "scale_block_size": 32,
+      "scale_layout": "logical_unswizzled_k_axis_blocks",
+      "features": {}
+    },
     "path_c_status": {
       "available": false,
-      "reason": "No checked-in TileLang DSL Sparse-MLA Path C reference found in this lane."
+      "reason": "TileLang Path C FP8 Sparse-MLA QK has no safe dispatch surface: qk_reduce=TileLang/MLX lowering failed for FP8 Sparse-MLA QK reducer: AttributeError: Check failed: (reg != nullptr) is false: Operator tirx.metal.fp8_e4m3_dot4 is not registered; T.fp8_scaled_matmul=TileLang Path C FP8 Sparse-MLA QK is not safe to dispatch: no simdgroup_multiply_accumulate; scalar fallback markers present; Sparse-MLA M=1/topk tile violates current Metal FP8 simdgroup tile constraints",
+      "target": "metal",
+      "m": 1,
+      "n": 16,
+      "k": 64,
+      "transpose_B": true,
+      "features": {
+        "dispatch_surface": "unavailable",
+        "runnable_qk_reduce_available": false,
+        "runnable_qk_reduce_reason": "TileLang/MLX lowering failed for FP8 Sparse-MLA QK reducer: AttributeError: Check failed: (reg != nullptr) is false: Operator tirx.metal.fp8_e4m3_dot4 is not registered",
+        "legacy_fp8_scaled_matmul_probe_available": false,
+        "legacy_fp8_scaled_matmul_probe_reason": "TileLang Path C FP8 Sparse-MLA QK is not safe to dispatch: no simdgroup_multiply_accumulate; scalar fallback markers present; Sparse-MLA M=1/topk tile violates current Metal FP8 simdgroup tile constraints",
+        "legacy_fp8_scaled_matmul_probe_kernel_void": 1,
+        "legacy_fp8_scaled_matmul_probe_simdgroup_multiply_accumulate": 0,
+        "legacy_fp8_scaled_matmul_probe_simdgroup_load": 0,
+        "legacy_fp8_scaled_matmul_probe_simdgroup_store": 0,
+        "legacy_fp8_scaled_matmul_probe_fp8_e4m3_decode_helper": 3,
+        "legacy_fp8_scaled_matmul_probe_A_scale_refs": 1,
+        "legacy_fp8_scaled_matmul_probe_B_scale_refs": 1,
+        "legacy_fp8_scaled_matmul_probe_signature_has_A_scale": true,
+        "legacy_fp8_scaled_matmul_probe_signature_has_B_scale": true,
+        "legacy_fp8_scaled_matmul_probe_float_a_val": true,
+        "legacy_fp8_scaled_matmul_probe_float_b_val": true,
+        "legacy_fp8_scaled_matmul_probe_threadgroup_half": false
+      }
+    },
+    "strict": {
+      "enabled": true,
+      "scope": "full_path_c_dispatch",
+      "passed": false,
+      "failures": [
+        "path_c_tilelang_qk_status.available=false blocks full Path C FP8 dispatch",
+        "path_c_tilelang_e8m0_qk_status.available=false blocks full Path C blockscaled dispatch"
+      ]
     },
     "path_b_bench": {
       "label": "path_b_sparse_mla_fp8_fwd",
       "ok": true,
-      "median_ms": 0.22858299780637026,
-      "min_ms": 0.21112500689923763,
-      "p90_ms": 0.26995898224413395,
-      "max_ms": 0.32558408565819263,
+      "median_ms": 0.24208350805565715,
+      "min_ms": 0.2257089945487678,
+      "p90_ms": 0.2842080139089376,
+      "max_ms": 0.3537499869707972,
       "tflops": 0.0,
+      "calls_per_s": 4130.805968699409,
+      "tokens_per_s": null,
       "warmup": 10,
       "iters": 50,
       "paired": false,
-      "error": null
+      "error": null,
+      "sample_ms": [
+        0.26441700174473226,
+        0.25270800688304007,
+        0.24891598150134087,
+        0.2842080139089376,
+        0.2508750185370445,
+        0.24049999774433672,
+        0.24716602638363838,
+        0.2907919988501817,
+        0.24324998958036304,
+        0.23841697839088738,
+        0.23070801398716867,
+        0.23183299344964325,
+        0.22800001897849143,
+        0.2257089945487678,
+        0.2296250022482127,
+        0.23812497965991497,
+        0.22995899780653417,
+        0.24204200599342585,
+        0.2607910137157887,
+        0.299708015518263,
+        0.2280420158058405,
+        0.23962502018548548,
+        0.29308299417607486,
+        0.2429999876767397,
+        0.2383330138400197,
+        0.23312499979510903,
+        0.22791698575019836,
+        0.22904097568243742,
+        0.22712501231580973,
+        0.22941699717193842,
+        0.23779101320542395,
+        0.24091600789688528,
+        0.25166699197143316,
+        0.24129200028255582,
+        0.2903339918702841,
+        0.2682920021470636,
+        0.2670000249054283,
+        0.25745798484422266,
+        0.2529580087866634,
+        0.24183301138691604,
+        0.2489580074325204,
+        0.24545800988562405,
+        0.24245798704214394,
+        0.2399160002823919,
+        0.24362499243579805,
+        0.3537499869707972,
+        0.23845798568800092,
+        0.24212501011788845,
+        0.24641701020300388,
+        0.2400000230409205
+      ],
+      "sample_ms_by_step": {
+        "0": 0.26441700174473226,
+        "1": 0.25270800688304007,
+        "2": 0.24891598150134087,
+        "3": 0.2842080139089376,
+        "4": 0.2508750185370445,
+        "5": 0.24049999774433672,
+        "6": 0.24716602638363838,
+        "7": 0.2907919988501817,
+        "8": 0.24324998958036304,
+        "9": 0.23841697839088738,
+        "10": 0.23070801398716867,
+        "11": 0.23183299344964325,
+        "12": 0.22800001897849143,
+        "13": 0.2257089945487678,
+        "14": 0.2296250022482127,
+        "15": 0.23812497965991497,
+        "16": 0.22995899780653417,
+        "17": 0.24204200599342585,
+        "18": 0.2607910137157887,
+        "19": 0.299708015518263,
+        "20": 0.2280420158058405,
+        "21": 0.23962502018548548,
+        "22": 0.29308299417607486,
+        "23": 0.2429999876767397,
+        "24": 0.2383330138400197,
+        "25": 0.23312499979510903,
+        "26": 0.22791698575019836,
+        "27": 0.22904097568243742,
+        "28": 0.22712501231580973,
+        "29": 0.22941699717193842,
+        "30": 0.23779101320542395,
+        "31": 0.24091600789688528,
+        "32": 0.25166699197143316,
+        "33": 0.24129200028255582,
+        "34": 0.2903339918702841,
+        "35": 0.2682920021470636,
+        "36": 0.2670000249054283,
+        "37": 0.25745798484422266,
+        "38": 0.2529580087866634,
+        "39": 0.24183301138691604,
+        "40": 0.2489580074325204,
+        "41": 0.24545800988562405,
+        "42": 0.24245798704214394,
+        "43": 0.2399160002823919,
+        "44": 0.24362499243579805,
+        "45": 0.3537499869707972,
+        "46": 0.23845798568800092,
+        "47": 0.24212501011788845,
+        "48": 0.24641701020300388,
+        "49": 0.2400000230409205
+      }
     },
     "path_b_parity_vs_bf16_reference": {
       "max_abs": 0.00299072265625,
