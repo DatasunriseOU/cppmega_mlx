@@ -75,6 +75,28 @@ import torch
 # under concurrent miss + insert). Both ``_amax_kernel_for`` and
 # ``_quantize_kernel_for`` share a single lock because they both write the
 # same module-globals slots (``N``, ``BLOCK``, ``DTYPE``).
+# Wave-11 #3 (meta wave-10 review MED, NOT FIXED — design constraint):
+# meta flagged ``_FP8_AMAX_LOCK`` as a DoS amplifier (1000 threads with
+# unique signatures all block on one lock). The intuitive fix is a
+# per-signature ``defaultdict(threading.Lock)``, but it is unsafe here
+# because ``_expose_to_globals`` mutates the *module-level* globals
+# (``N``, ``BLOCK``, ``DTYPE``, ``FP8_MAX``) which are shared across
+# every signature. Two threads with different ``(n, dtype)`` would still
+# race on the same globals slots regardless of which lock they hold.
+#
+# Tracked options for a future wave-12 fix:
+#   1. Switch ``_expose_to_globals`` from in-place ``__globals__.update``
+#      to a per-call ``types.FunctionType`` rebuild with private globals
+#      (rejected wave-8 due to tilelang parser source-cache lookup but
+#      worth re-checking against current upstream).
+#   2. Move ``N`` / ``BLOCK`` / ``DTYPE`` from globals to ``T.Var`` /
+#      function parameters so the kernel itself does not read the
+#      module dict during ``@T.prim_func`` decoration.
+#   3. Process-level singletons + ``concurrent.futures`` queue to drop
+#      lock contention from the hot path entirely.
+#
+# Until one of those lands, the global lock is the correct invariant —
+# downgrading to per-signature locks would silently corrupt PrimFuncs.
 _FP8_AMAX_LOCK = threading.Lock()
 
 

@@ -1352,6 +1352,18 @@ def dsa_splitk_indexer_loss_tilelang(
                 "dsa_splitk_indexer_loss_tilelang: topk_indices must have shape "
                 f"(AB={AB}, ASq={ASq}, TOPK); got {tuple(topk_indices.shape)}"
             )
+        # Wave-11 #3 (grok wave-10 review HIGH): TOPK == 0 is silently
+        # destructive — ``scatter_(-1, idx, 0.0)`` becomes a no-op so
+        # ``index_mask`` stays ``-inf`` everywhere; index-softmax produces
+        # NaN; KL loss becomes NaN. Catch at boundary instead of corrupting
+        # training. Pre-wave-10 ASq == 0 / Sk == 0 early-out already covers
+        # the dimension-zero case but TOPK == 0 escapes that check.
+        if topk_indices.shape[2] == 0:
+            raise ValueError(
+                "dsa_splitk_indexer_loss_tilelang: topk_indices.shape[2] (TOPK) "
+                "must be >= 1 when sparse_loss=True; got 0 — would produce "
+                "all-(-inf) index_mask -> NaN softmax -> NaN loss."
+            )
         if topk_indices.dtype not in (torch.int32, torch.int64):
             raise TypeError(
                 "dsa_splitk_indexer_loss_tilelang: topk_indices.dtype must be "
