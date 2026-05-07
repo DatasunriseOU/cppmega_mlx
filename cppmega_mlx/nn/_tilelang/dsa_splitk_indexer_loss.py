@@ -675,9 +675,43 @@ _Q_CACHE_BUDGET_CUDA_BYTES = 64 * 1024
 _Q_CACHE_BUDGET_HIP_BYTES = 32 * 1024
 
 
-def _q_cache_bytes(BLOCK_SQ: int, AH: int, AD: int, in_dtype: str) -> int:
+# Wave-12 #3 (meta MED finding): hardcap each dimension before the
+# four-way multiply so a malicious checkpoint with degenerate shapes
+# (e.g. AH=65536) cannot reach budget-compare with a wrap-around byte
+# count. Python ints don't actually overflow, but `_q_cache_bytes` is
+# also reachable via downstream C/TIR paths where int32 wraparound
+# WOULD turn a 549 GB request into "0 bytes <= 16 KB budget" -> 0-byte
+# `Q_all_heads` alloc -> heap overflow on the kernel's first write.
+# These bounds are 4x the largest legitimate shape we've ever shipped.
+_Q_CACHE_MAX_BLOCK_SQ = 4096
+_Q_CACHE_MAX_AH = 256
+_Q_CACHE_MAX_AD = 1024
+_Q_CACHE_MAX_BYTES = 2**31  # belt + suspenders; reject if product exceeds i32 anyway
+
+
+def _q_cache_bytes(
+    BLOCK_SQ: int, AH: int, AD: int, in_dtype: str
+) -> int | None:
+    """Return the Q-cache size in bytes, or ``None`` if any dimension is
+    out of the legitimate range or the product would overflow int32.
+
+    Callers (`_can_use_q_cache_v5`, `_can_use_q_cache_v5_tiled`) treat
+    ``None`` as "doesn't fit budget" so the kernel falls back to the
+    wave-4 partial-hoist path safely.
+    """
+    if BLOCK_SQ <= 0 or AH <= 0 or AD <= 0:
+        return None
+    if BLOCK_SQ > _Q_CACHE_MAX_BLOCK_SQ:
+        return None
+    if AH > _Q_CACHE_MAX_AH:
+        return None
+    if AD > _Q_CACHE_MAX_AD:
+        return None
     dtype_bytes = {"float16": 2, "bfloat16": 2, "float32": 4}.get(in_dtype, 2)
-    return BLOCK_SQ * AH * AD * dtype_bytes
+    result = BLOCK_SQ * AH * AD * dtype_bytes
+    if result > _Q_CACHE_MAX_BYTES:
+        return None
+    return result
 
 
 def _q_cache_budget_bytes(target: str) -> int:
@@ -699,9 +733,15 @@ def _can_use_q_cache_v5(
 
     Use :func:`_can_use_q_cache_v5_tiled` when you want the largest
     ``BLOCK_SQ`` that fits instead of a yes/no answer at a fixed value.
+
+    Wave-12 #3: ``_q_cache_bytes`` now returns ``None`` for out-of-range
+    or overflowing dimensions; treat that as "doesn't fit budget".
     """
 
-    return _q_cache_bytes(BLOCK_SQ, AH, AD, in_dtype) <= _q_cache_budget_bytes(target)
+    nbytes = _q_cache_bytes(BLOCK_SQ, AH, AD, in_dtype)
+    if nbytes is None:
+        return False
+    return nbytes <= _q_cache_budget_bytes(target)
 
 
 # Wave-8 #3: production DSA decoder shapes (AH>=8, AD>=64) blow the
@@ -729,7 +769,11 @@ def _can_use_q_cache_v5_tiled(
 
     budget = _q_cache_budget_bytes(target)
     for block_sq in _Q_CACHE_TILE_BLOCK_SQ_CHOICES:
-        if _q_cache_bytes(block_sq, AH, AD, in_dtype) <= budget:
+        nbytes = _q_cache_bytes(block_sq, AH, AD, in_dtype)
+        if nbytes is None:
+            # Out-of-range / overflowing dimensions — skip and try next tile.
+            continue
+        if nbytes <= budget:
             return block_sq
     return None
 
