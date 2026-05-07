@@ -56,11 +56,40 @@ API surface
 
 from __future__ import annotations
 
+import types
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, cast
 
 import torch
+
+
+def _expose_to_globals(fn: Any, extra_globals: dict[str, Any]) -> Any:
+    """Mutate ``fn.__globals__`` in place to expose factory-local names.
+
+    Wave-8 #1 fix: ``typing.get_type_hints(fn)`` (called by tilelang's
+    ``@T.prim_func`` PrimFunc parser before / during decorator processing)
+    only inspects ``__globals__`` and an explicit ``localns``; it never
+    walks ``__closure__``. Names rebound in the enclosing factory scope
+    (``DTYPE``, ``N``, ``BLOCK``) become closure cells, so when the parser
+    tries to resolve ``T.Tensor((N,), DTYPE)`` it raises ``NameError``.
+
+    We cannot rebuild the function with ``types.FunctionType`` because
+    tilelang's parser re-runs against the function it receives and the
+    rebound copy breaks the parser's source-cache lookup (the rewriter
+    introduces a nested wrapper that gets called with no arguments).
+
+    Instead we patch the live module ``__globals__`` dict (``fn.__globals__``
+    IS the module globals dict for top-level imports). The downside is
+    that successive factory invocations overwrite each other's exposed
+    values — so per-shape kernel construction must complete before the
+    next call. Acceptable here because ``_amax_kernel_for`` /
+    ``_quantize_kernel_for`` are wrapped in ``@lru_cache`` and run to
+    completion synchronously.
+    """
+
+    fn.__globals__.update(extra_globals)
+    return fn
 
 
 # ---------------------------------------------------------------------------
@@ -304,6 +333,12 @@ def make_fp8_amax_kernel(
     # pattern above. See wave-7 bugfix #1 (NameError 'in_dtype' is not defined).
     DTYPE = in_dtype
 
+    # Wave-8 #1: expose closure-rebind values to the module globals BEFORE
+    # @T.prim_func runs. typing.get_type_hints() ignores __closure__ so the
+    # parser cannot resolve DTYPE/N/BLOCK without this. See
+    # _expose_to_globals docstring for the exact contract.
+    _expose_to_globals(make_fp8_amax_kernel, {"N": N, "BLOCK": BLOCK, "DTYPE": DTYPE})
+
     @T.prim_func
     def fp8_amax_reduce(
         X: T.Tensor((N,), DTYPE),
@@ -381,6 +416,12 @@ def make_fp8_quantize_kernel(
     FP8_MAX = _FP8_E4M3_MAX
     # See _amax_kernel_for closure note above.
     DTYPE = in_dtype
+
+    # Wave-8 #1: see _amax_kernel comment above.
+    _expose_to_globals(
+        make_fp8_quantize_kernel,
+        {"N": N, "BLOCK": BLOCK, "DTYPE": DTYPE, "FP8_MAX": FP8_MAX},
+    )
 
     @T.prim_func
     def fp8_quantize_e4m3(
