@@ -7,7 +7,7 @@
     "system": "Darwin",
     "machine": "arm64",
     "python_version": "3.13.12",
-    "mlx_version": "0.31.1"
+    "mlx_version": "0.31.2"
   },
   "shape": {
     "batch": 2,
@@ -34,44 +34,44 @@
   "timings": {
     "fwd_reference": {
       "label": "fwd_reference",
-      "mean_ms": 15.01639997586608,
-      "median_ms": 15.095958020538092,
-      "min_ms": 14.016291126608849,
-      "max_ms": 15.740958042442799,
-      "iters": 15,
-      "warmup": 5
+      "mean_ms": 13.972416802425869,
+      "median_ms": 13.8737920060521,
+      "min_ms": 13.104083016514778,
+      "max_ms": 15.742332994705066,
+      "iters": 10,
+      "warmup": 3
     },
     "fwd_metal": {
       "label": "fwd_metal",
-      "mean_ms": 0.5889334095021089,
-      "median_ms": 0.5766251124441624,
-      "min_ms": 0.5585828330367804,
-      "max_ms": 0.6690409500151873,
-      "iters": 15,
-      "warmup": 5
+      "mean_ms": 0.5905501078814268,
+      "median_ms": 0.5884794954909012,
+      "min_ms": 0.542209018021822,
+      "max_ms": 0.6958339945413172,
+      "iters": 10,
+      "warmup": 3
     },
     "fwd_bwd_reference": {
       "label": "fwd_bwd_reference",
-      "mean_ms": 116.46697758696973,
-      "median_ms": 113.75637515448034,
-      "min_ms": 109.80929178185761,
-      "max_ms": 152.8458329848945,
-      "iters": 15,
-      "warmup": 5
+      "mean_ms": 112.59329579770565,
+      "median_ms": 108.75060399121139,
+      "min_ms": 106.24195900163613,
+      "max_ms": 146.8464589852374,
+      "iters": 10,
+      "warmup": 3
     },
     "fwd_bwd_metal": {
       "label": "fwd_bwd_metal",
-      "mean_ms": 5.378491664305329,
-      "median_ms": 5.3478749468922615,
-      "min_ms": 5.256708944216371,
-      "max_ms": 5.607499973848462,
-      "iters": 15,
-      "warmup": 5
+      "mean_ms": 5.3883166023297235,
+      "median_ms": 5.172541495994665,
+      "min_ms": 5.066583020379767,
+      "max_ms": 7.127124990802258,
+      "iters": 10,
+      "warmup": 3
     }
   },
   "speedups": {
-    "fwd": 25.497619482245227,
-    "fwd_bwd": 21.654208067274617
+    "fwd": 23.660002116588064,
+    "fwd_bwd": 20.895820366053503
   },
   "matched_run_guard": "Compare M4 Max and GB10 only when both rows were collected with identical kernel inputs and dtype. This is a local_only receipt."
 }

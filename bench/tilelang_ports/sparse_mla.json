@@ -14,14 +14,11 @@
   },
   "strict": {
     "enabled": false,
-    "passed": false,
+    "passed": true,
     "path_c_over_path_b_max_ratio": 1.0,
     "phase": "all",
     "fwd_only": false,
-    "failures": [
-      "B4_S1024_H8_D64: forward strict gate failed paired C/B=1.0018111836229635 path_b_ok=True path_c_ok=True",
-      "B4_S1024_H8_D64: backward strict gate failed paired C/B=1.0814509485342598 path_b_ok=True path_c_ok=True"
-    ]
+    "failures": []
   },
   "path_b_status": {
     "available": true,
@@ -46,66 +43,66 @@
       "fwd_reference_ms": {
         "label": "reference_fwd",
         "ok": true,
-        "median_ms": 0.5502499989233911,
-        "min_ms": 0.36525001632981,
-        "max_ms": 1.0494579910300672,
-        "iters": 10,
-        "warmup": 3
+        "median_ms": 0.3518960002111271,
+        "min_ms": 0.3276249917689711,
+        "max_ms": 1.0917919862549752,
+        "iters": 20,
+        "warmup": 5
       },
       "fwd_apply_ms": {
         "label": "apply_fwd",
         "ok": true,
-        "median_ms": 0.22647948935627937,
-        "min_ms": 0.2145830076187849,
-        "max_ms": 0.23037497885525227,
-        "iters": 10,
-        "warmup": 3
+        "median_ms": 0.2046664885710925,
+        "min_ms": 0.19625001004897058,
+        "max_ms": 0.22283400176092982,
+        "iters": 20,
+        "warmup": 5
       },
       "fwd_msl_ms": {
         "label": "path_b_msl_fwd",
         "ok": true,
-        "median_ms": 0.20879149087704718,
-        "min_ms": 0.19720799173228443,
-        "max_ms": 0.2658749872352928,
-        "iters": 10,
-        "warmup": 3
+        "median_ms": 0.19924950902350247,
+        "min_ms": 0.17537499661557376,
+        "max_ms": 0.7482079963665456,
+        "iters": 20,
+        "warmup": 5
       },
       "fwd_path_c_ms": {
         "label": "path_c_tilelang_fwd",
         "ok": true,
-        "median_ms": 0.20041700918227434,
-        "min_ms": 0.1833749993238598,
-        "max_ms": 0.24216598831117153,
-        "iters": 10,
-        "warmup": 3
+        "median_ms": 0.21225000091362745,
+        "min_ms": 0.19200000679120421,
+        "max_ms": 0.7868749962653965,
+        "iters": 20,
+        "warmup": 5
       },
       "fwd_msl_paired_ms": {
         "label": "path_b_msl_fwd_paired",
         "ok": true,
-        "median_ms": 0.196917011635378,
-        "min_ms": 0.1880000054370612,
-        "max_ms": 0.5675000138580799,
-        "iters": 10,
-        "warmup": 3
+        "median_ms": 0.209937003091909,
+        "min_ms": 0.18962498870678246,
+        "max_ms": 0.88279097690247,
+        "iters": 20,
+        "warmup": 5
       },
       "fwd_path_c_paired_ms": {
         "label": "path_c_tilelang_fwd_paired",
         "ok": true,
-        "median_ms": 0.19395799608901143,
-        "min_ms": 0.18779098172672093,
-        "max_ms": 0.22537499899044633,
-        "iters": 10,
-        "warmup": 3,
-        "pair_ratio_median": 0.9944458545099523,
-        "pair_ratio_min": 0.33759293737491763,
-        "pair_ratio_max": 1.1627277328657093
+        "median_ms": 0.20893701002933085,
+        "min_ms": 0.18433399964123964,
+        "max_ms": 0.31462498009204865,
+        "iters": 20,
+        "warmup": 5,
+        "pair_ratio_median": 0.9821633147840932,
+        "pair_ratio_min": 0.2476044563074939,
+        "pair_ratio_max": 1.6591957749753854
       },
-      "fwd_path_c_over_path_b_ratio": 0.9598906944933671,
-      "fwd_path_c_over_path_b_paired_ratio": 0.9944458545099523,
+      "fwd_path_c_over_path_b_ratio": 1.0652472969887796,
+      "fwd_path_c_over_path_b_paired_ratio": 0.9821633147840932,
       "path_c_over_path_b_max_ratio": 1.0,
       "fwd_path_c_no_worse_than_path_b": true,
       "fwd_path_c_no_worse_than_path_b_paired": true,
-      "fwd_path_c_unpaired_within_max_ratio": true,
+      "fwd_path_c_unpaired_within_max_ratio": false,
       "path_b": {
         "available": true,
         "reason": "sparse_mla direct-MSL kernel built via mx.fast.metal_kernel is available; bypasses TileLang's T.gemm metal blocker."
@@ -117,110 +114,110 @@
       "bwd_reference_ms": {
         "label": "reference_bwd",
         "ok": true,
-        "median_ms": 0.5005830171285197,
-        "min_ms": 0.47154200728982687,
-        "max_ms": 0.5894160130992532,
-        "iters": 10,
-        "warmup": 3
+        "median_ms": 0.5672080151271075,
+        "min_ms": 0.5308330000843853,
+        "max_ms": 1.2553330161608756,
+        "iters": 20,
+        "warmup": 5
       },
       "bwd_msl_ms": {
         "label": "path_b_msl_bwd",
         "ok": true,
-        "median_ms": 0.29656248807441443,
-        "min_ms": 0.2834589977283031,
-        "max_ms": 0.46120898332446814,
-        "iters": 10,
-        "warmup": 3
+        "median_ms": 0.3397084947209805,
+        "min_ms": 0.33154201810248196,
+        "max_ms": 0.4699580022133887,
+        "iters": 20,
+        "warmup": 5
       },
       "bwd_msl_paired_ms": {
         "label": "path_b_msl_bwd_paired",
         "ok": true,
-        "median_ms": 0.354353993316181,
-        "min_ms": 0.3448750067036599,
-        "max_ms": 0.8831250015646219,
-        "iters": 10,
-        "warmup": 3
+        "median_ms": 0.35024998942390084,
+        "min_ms": 0.32387502142228186,
+        "max_ms": 0.495540996780619,
+        "iters": 20,
+        "warmup": 5
       },
       "bwd_msl_kernel_ms": {
         "label": "path_b_msl_bwd_kernel_only",
         "ok": true,
-        "median_ms": 0.22706248273607343,
-        "min_ms": 0.2064580039586872,
-        "max_ms": 0.23708399385213852,
-        "iters": 10,
-        "warmup": 3
+        "median_ms": 0.2582084998721257,
+        "min_ms": 0.24241599021479487,
+        "max_ms": 0.9187910181935877,
+        "iters": 20,
+        "warmup": 5
       },
       "bwd_msl_fresh_reduce_ms": {
         "label": "path_b_msl_bwd_fresh_reduce",
         "ok": true,
-        "median_ms": 0.2862499968614429,
-        "min_ms": 0.2772090083453804,
-        "max_ms": 0.30970899388194084,
-        "iters": 10,
-        "warmup": 3
+        "median_ms": 0.34689600579440594,
+        "min_ms": 0.3268750151619315,
+        "max_ms": 1.0762919846456498,
+        "iters": 20,
+        "warmup": 5
       },
       "bwd_msl_reduce_ms": {
         "label": "path_b_msl_bwd_reduce_only",
         "ok": true,
-        "median_ms": 0.208854500669986,
-        "min_ms": 0.1968329888768494,
-        "max_ms": 0.22112499573267996,
-        "iters": 10,
-        "warmup": 3
+        "median_ms": 0.22727051691617817,
+        "min_ms": 0.2064170257654041,
+        "max_ms": 0.24158298037946224,
+        "iters": 20,
+        "warmup": 5
       },
       "bwd_path_c_ms": {
         "label": "path_c_tilelang_bwd",
         "ok": true,
-        "median_ms": 0.3546874941093847,
-        "min_ms": 0.3393749939277768,
-        "max_ms": 0.8883749833330512,
-        "iters": 10,
-        "warmup": 3
+        "median_ms": 0.3590414999052882,
+        "min_ms": 0.3125829971395433,
+        "max_ms": 0.7361249881796539,
+        "iters": 20,
+        "warmup": 5
       },
       "bwd_path_c_paired_ms": {
         "label": "path_c_tilelang_bwd_paired",
         "ok": true,
-        "median_ms": 0.33920850546564907,
-        "min_ms": 0.3216250042896718,
-        "max_ms": 0.38899999344721437,
-        "iters": 10,
-        "warmup": 3,
-        "pair_ratio_median": 0.9534192757412644,
-        "pair_ratio_min": 0.4044342422988917,
-        "pair_ratio_max": 1.084825536746018
+        "median_ms": 0.3396039974177256,
+        "min_ms": 0.3032080130651593,
+        "max_ms": 0.8836659835651517,
+        "iters": 20,
+        "warmup": 5,
+        "pair_ratio_median": 0.9660529074749789,
+        "pair_ratio_min": 0.6383589405296717,
+        "pair_ratio_max": 2.509224266439544
       },
       "bwd_path_c_kernel_ms": {
         "label": "path_c_tilelang_bwd_kernel_only",
         "ok": true,
-        "median_ms": 0.25154151080641896,
-        "min_ms": 0.23725000210106373,
-        "max_ms": 0.3191670111846179,
-        "iters": 10,
-        "warmup": 3
+        "median_ms": 0.2468544989824295,
+        "min_ms": 0.23045900161378086,
+        "max_ms": 1.0067499824799597,
+        "iters": 20,
+        "warmup": 5
       },
       "bwd_path_c_fresh_reduce_ms": {
         "label": "path_c_tilelang_bwd_fresh_reduce",
         "ok": true,
-        "median_ms": 0.3380205016583204,
-        "min_ms": 0.33195799915120006,
-        "max_ms": 0.3516249998938292,
-        "iters": 10,
-        "warmup": 3
+        "median_ms": 0.3281044773757458,
+        "min_ms": 0.30274997698143125,
+        "max_ms": 0.6586250092368573,
+        "iters": 20,
+        "warmup": 5
       },
       "bwd_path_c_reduce_ms": {
         "label": "path_c_tilelang_bwd_reduce_only",
         "ok": true,
-        "median_ms": 0.23749998945277184,
-        "min_ms": 0.22870799875818193,
-        "max_ms": 0.3897499991580844,
-        "iters": 10,
-        "warmup": 3
+        "median_ms": 0.23118749959394336,
+        "min_ms": 0.20858299103565514,
+        "max_ms": 0.2674999996088445,
+        "iters": 20,
+        "warmup": 5
       },
-      "bwd_path_c_over_path_b_ratio": 1.1959958132681479,
-      "bwd_path_c_over_path_b_paired_ratio": 0.9534192757412644,
-      "bwd_path_c_kernel_over_path_b_kernel_ratio": 1.1078074535932858,
-      "bwd_path_c_fresh_reduce_over_path_b_fresh_reduce_ratio": 1.1808576606620422,
-      "bwd_path_c_reduce_over_path_b_reduce_ratio": 1.1371552381724777,
+      "bwd_path_c_over_path_b_ratio": 1.0569105732848596,
+      "bwd_path_c_over_path_b_paired_ratio": 0.9660529074749789,
+      "bwd_path_c_kernel_over_path_b_kernel_ratio": 0.956027780280978,
+      "bwd_path_c_fresh_reduce_over_path_b_fresh_reduce_ratio": 0.9458295047945946,
+      "bwd_path_c_reduce_over_path_b_reduce_ratio": 1.0172348914012892,
       "bwd_path_c_no_worse_than_path_b": true,
       "bwd_path_c_no_worse_than_path_b_paired": true,
       "bwd_blocker": "none: Path C backward is within strict ratio 1"
@@ -239,66 +236,66 @@
       "fwd_reference_ms": {
         "label": "reference_fwd",
         "ok": true,
-        "median_ms": 0.906853994820267,
-        "min_ms": 0.8248329977504909,
-        "max_ms": 1.3709999911952764,
-        "iters": 10,
-        "warmup": 3
+        "median_ms": 0.8145415049511939,
+        "min_ms": 0.7272080110851675,
+        "max_ms": 1.3929170090705156,
+        "iters": 20,
+        "warmup": 5
       },
       "fwd_apply_ms": {
         "label": "apply_fwd",
         "ok": true,
-        "median_ms": 0.3503124898998067,
-        "min_ms": 0.3339999821037054,
-        "max_ms": 0.3591670247260481,
-        "iters": 10,
-        "warmup": 3
+        "median_ms": 0.3117710002698004,
+        "min_ms": 0.2979580021928996,
+        "max_ms": 0.32108399318531156,
+        "iters": 20,
+        "warmup": 5
       },
       "fwd_msl_ms": {
         "label": "path_b_msl_fwd",
         "ok": true,
-        "median_ms": 0.33222899946849793,
-        "min_ms": 0.3225000109523535,
-        "max_ms": 0.9111670078709722,
-        "iters": 10,
-        "warmup": 3
+        "median_ms": 0.29814598383381963,
+        "min_ms": 0.2818749926518649,
+        "max_ms": 0.690624990966171,
+        "iters": 20,
+        "warmup": 5
       },
       "fwd_path_c_ms": {
         "label": "path_c_tilelang_fwd",
         "ok": true,
-        "median_ms": 0.3493954864097759,
-        "min_ms": 0.26704202173277736,
-        "max_ms": 0.7470420096069574,
-        "iters": 10,
-        "warmup": 3
+        "median_ms": 0.2894584904424846,
+        "min_ms": 0.2796670014504343,
+        "max_ms": 0.7256669923663139,
+        "iters": 20,
+        "warmup": 5
       },
       "fwd_msl_paired_ms": {
         "label": "path_b_msl_fwd_paired",
         "ok": true,
-        "median_ms": 0.293021003017202,
-        "min_ms": 0.28583299717865884,
-        "max_ms": 0.30779201188124716,
-        "iters": 10,
-        "warmup": 3
+        "median_ms": 0.2894380013458431,
+        "min_ms": 0.2813749888446182,
+        "max_ms": 0.30529199284501374,
+        "iters": 20,
+        "warmup": 5
       },
       "fwd_path_c_paired_ms": {
         "label": "path_c_tilelang_fwd_paired",
         "ok": true,
-        "median_ms": 0.2858959778677672,
-        "min_ms": 0.27150000096298754,
-        "max_ms": 0.2998750132974237,
-        "iters": 10,
-        "warmup": 3,
-        "pair_ratio_median": 0.9748266077444726,
-        "pair_ratio_min": 0.8884627743841637,
-        "pair_ratio_max": 1.016032096392376
+        "median_ms": 0.28468799428083,
+        "min_ms": 0.269292009761557,
+        "max_ms": 0.6769589963369071,
+        "iters": 20,
+        "warmup": 5,
+        "pair_ratio_median": 0.9835882935834823,
+        "pair_ratio_min": 0.9320740009783308,
+        "pair_ratio_max": 2.301923767770284
       },
-      "fwd_path_c_over_path_b_ratio": 1.0516706457556115,
-      "fwd_path_c_over_path_b_paired_ratio": 0.9748266077444726,
+      "fwd_path_c_over_path_b_ratio": 0.9708616118868224,
+      "fwd_path_c_over_path_b_paired_ratio": 0.9835882935834823,
       "path_c_over_path_b_max_ratio": 1.0,
       "fwd_path_c_no_worse_than_path_b": true,
       "fwd_path_c_no_worse_than_path_b_paired": true,
-      "fwd_path_c_unpaired_within_max_ratio": false,
+      "fwd_path_c_unpaired_within_max_ratio": true,
       "path_b": {
         "available": true,
         "reason": "sparse_mla direct-MSL kernel built via mx.fast.metal_kernel is available; bypasses TileLang's T.gemm metal blocker."
@@ -310,110 +307,110 @@
       "bwd_reference_ms": {
         "label": "reference_bwd",
         "ok": true,
-        "median_ms": 1.3698755064979196,
-        "min_ms": 1.3008750102017075,
-        "max_ms": 1.7153749940916896,
-        "iters": 10,
-        "warmup": 3
+        "median_ms": 1.2627290125237778,
+        "min_ms": 1.2425830063875765,
+        "max_ms": 1.784166001016274,
+        "iters": 20,
+        "warmup": 5
       },
       "bwd_msl_ms": {
         "label": "path_b_msl_bwd",
         "ok": true,
-        "median_ms": 0.9592704882379621,
-        "min_ms": 0.9210410062223673,
-        "max_ms": 1.3900829944759607,
-        "iters": 10,
-        "warmup": 3
+        "median_ms": 0.9198955085594207,
+        "min_ms": 0.894750002771616,
+        "max_ms": 1.328042009845376,
+        "iters": 20,
+        "warmup": 5
       },
       "bwd_msl_paired_ms": {
         "label": "path_b_msl_bwd_paired",
         "ok": true,
-        "median_ms": 0.9300210076617077,
-        "min_ms": 0.9108330123126507,
-        "max_ms": 1.0267079924233258,
-        "iters": 10,
-        "warmup": 3
+        "median_ms": 0.9452085068915039,
+        "min_ms": 0.9216250036843121,
+        "max_ms": 1.341750001301989,
+        "iters": 20,
+        "warmup": 5
       },
       "bwd_msl_kernel_ms": {
         "label": "path_b_msl_bwd_kernel_only",
         "ok": true,
-        "median_ms": 0.4742504970636219,
-        "min_ms": 0.4540420195553452,
-        "max_ms": 0.8899579988792539,
-        "iters": 10,
-        "warmup": 3
+        "median_ms": 0.4717914998764172,
+        "min_ms": 0.4510830040089786,
+        "max_ms": 0.8392909949179739,
+        "iters": 20,
+        "warmup": 5
       },
       "bwd_msl_fresh_reduce_ms": {
         "label": "path_b_msl_bwd_fresh_reduce",
         "ok": true,
-        "median_ms": 0.9336874936707318,
-        "min_ms": 0.9091669926419854,
-        "max_ms": 1.3217090163379908,
-        "iters": 10,
-        "warmup": 3
+        "median_ms": 0.9341459808638319,
+        "min_ms": 0.8969170157797635,
+        "max_ms": 1.3196669751778245,
+        "iters": 20,
+        "warmup": 5
       },
       "bwd_msl_reduce_ms": {
         "label": "path_b_msl_bwd_reduce_only",
         "ok": true,
-        "median_ms": 0.5586460029007867,
-        "min_ms": 0.5365409888327122,
-        "max_ms": 0.6072089890949428,
-        "iters": 10,
-        "warmup": 3
+        "median_ms": 0.5492704949574545,
+        "min_ms": 0.5249159876257181,
+        "max_ms": 0.9690420120023191,
+        "iters": 20,
+        "warmup": 5
       },
       "bwd_path_c_ms": {
         "label": "path_c_tilelang_bwd",
         "ok": true,
-        "median_ms": 0.9387079771840945,
-        "min_ms": 0.9115000138990581,
-        "max_ms": 1.204208005219698,
-        "iters": 10,
-        "warmup": 3
+        "median_ms": 0.9337285009678453,
+        "min_ms": 0.9116250148508698,
+        "max_ms": 1.330917002633214,
+        "iters": 20,
+        "warmup": 5
       },
       "bwd_path_c_paired_ms": {
         "label": "path_c_tilelang_bwd_paired",
         "ok": true,
-        "median_ms": 0.9164164948742837,
-        "min_ms": 0.9017910051625222,
-        "max_ms": 1.3256660022307187,
-        "iters": 10,
-        "warmup": 3,
-        "pair_ratio_median": 0.9855883398048408,
-        "pair_ratio_min": 0.896067818795582,
-        "pair_ratio_max": 1.38162167877749
+        "median_ms": 0.9246459958376363,
+        "min_ms": 0.8993340015877038,
+        "max_ms": 1.3563329994212836,
+        "iters": 20,
+        "warmup": 5,
+        "pair_ratio_median": 0.9806102655446157,
+        "pair_ratio_min": 0.6819765070106556,
+        "pair_ratio_max": 1.4597316598748977
       },
       "bwd_path_c_kernel_ms": {
         "label": "path_c_tilelang_bwd_kernel_only",
         "ok": true,
-        "median_ms": 0.471104503958486,
-        "min_ms": 0.4621249972842634,
-        "max_ms": 0.8262089977506548,
-        "iters": 10,
-        "warmup": 3
+        "median_ms": 0.4746670019812882,
+        "min_ms": 0.4352919931989163,
+        "max_ms": 1.187625020975247,
+        "iters": 20,
+        "warmup": 5
       },
       "bwd_path_c_fresh_reduce_ms": {
         "label": "path_c_tilelang_bwd_fresh_reduce",
         "ok": true,
-        "median_ms": 0.9618330077501014,
-        "min_ms": 0.9283749968744814,
-        "max_ms": 1.444624998839572,
-        "iters": 10,
-        "warmup": 3
+        "median_ms": 0.9259789949283004,
+        "min_ms": 0.8966659952420741,
+        "max_ms": 1.3737500121351331,
+        "iters": 20,
+        "warmup": 5
       },
       "bwd_path_c_reduce_ms": {
         "label": "path_c_tilelang_bwd_reduce_only",
         "ok": true,
-        "median_ms": 0.5609369982266799,
-        "min_ms": 0.5338329938240349,
-        "max_ms": 0.8909169991966337,
-        "iters": 10,
-        "warmup": 3
+        "median_ms": 0.5551664944505319,
+        "min_ms": 0.5293750145938247,
+        "max_ms": 0.8899590175133198,
+        "iters": 20,
+        "warmup": 5
       },
-      "bwd_path_c_over_path_b_ratio": 0.978564428588189,
-      "bwd_path_c_over_path_b_paired_ratio": 0.9855883398048408,
-      "bwd_path_c_kernel_over_path_b_kernel_ratio": 0.9933663894405707,
-      "bwd_path_c_fresh_reduce_over_path_b_fresh_reduce_ratio": 1.0301444693970543,
-      "bwd_path_c_reduce_over_path_b_reduce_ratio": 1.0041009786412094,
+      "bwd_path_c_over_path_b_ratio": 1.0150375692453237,
+      "bwd_path_c_over_path_b_paired_ratio": 0.9806102655446157,
+      "bwd_path_c_kernel_over_path_b_kernel_ratio": 1.0060948578039752,
+      "bwd_path_c_fresh_reduce_over_path_b_fresh_reduce_ratio": 0.9912572701667256,
+      "bwd_path_c_reduce_over_path_b_reduce_ratio": 1.0107342366779306,
       "bwd_path_c_no_worse_than_path_b": true,
       "bwd_path_c_no_worse_than_path_b_paired": true,
       "bwd_blocker": "none: Path C backward is within strict ratio 1"
@@ -432,65 +429,65 @@
       "fwd_reference_ms": {
         "label": "reference_fwd",
         "ok": true,
-        "median_ms": 1.8706045084400102,
-        "min_ms": 1.8104159971699119,
-        "max_ms": 2.278208005009219,
-        "iters": 10,
-        "warmup": 3
+        "median_ms": 1.8740840023383498,
+        "min_ms": 1.803207996999845,
+        "max_ms": 2.326916001038626,
+        "iters": 20,
+        "warmup": 5
       },
       "fwd_apply_ms": {
         "label": "apply_fwd",
         "ok": true,
-        "median_ms": 0.616979508777149,
-        "min_ms": 0.6067499925848097,
-        "max_ms": 0.6809580081608146,
-        "iters": 10,
-        "warmup": 3
+        "median_ms": 0.6237290072022006,
+        "min_ms": 0.5895830108784139,
+        "max_ms": 0.8606670016888529,
+        "iters": 20,
+        "warmup": 5
       },
       "fwd_msl_ms": {
         "label": "path_b_msl_fwd",
         "ok": true,
-        "median_ms": 0.6237920024432242,
-        "min_ms": 0.6013340025674552,
-        "max_ms": 0.7268750050570816,
-        "iters": 10,
-        "warmup": 3
+        "median_ms": 0.6102080078562722,
+        "min_ms": 0.5919999966863543,
+        "max_ms": 1.0443749779369682,
+        "iters": 20,
+        "warmup": 5
       },
       "fwd_path_c_ms": {
         "label": "path_c_tilelang_fwd",
         "ok": true,
-        "median_ms": 0.6457084964495152,
-        "min_ms": 0.5959169939160347,
-        "max_ms": 1.0181249817833304,
-        "iters": 10,
-        "warmup": 3
+        "median_ms": 0.6164375081425533,
+        "min_ms": 0.5869170126970857,
+        "max_ms": 1.0057500039692968,
+        "iters": 20,
+        "warmup": 5
       },
       "fwd_msl_paired_ms": {
         "label": "path_b_msl_fwd_paired",
         "ok": true,
-        "median_ms": 0.6268335127970204,
-        "min_ms": 0.6045829795766622,
-        "max_ms": 1.0208330058958381,
-        "iters": 10,
-        "warmup": 3
+        "median_ms": 0.6136874872026965,
+        "min_ms": 0.5938329850323498,
+        "max_ms": 0.8577920089010149,
+        "iters": 20,
+        "warmup": 5
       },
       "fwd_path_c_paired_ms": {
         "label": "path_c_tilelang_fwd_paired",
         "ok": true,
-        "median_ms": 0.634854004601948,
-        "min_ms": 0.6107919907663018,
-        "max_ms": 0.7138749933801591,
-        "iters": 10,
-        "warmup": 3,
-        "pair_ratio_median": 1.0018111836229635,
-        "pair_ratio_min": 0.5983270400140497,
-        "pair_ratio_max": 1.1244339279217026
+        "median_ms": 0.6109584937803447,
+        "min_ms": 0.596124998992309,
+        "max_ms": 1.0199170210398734,
+        "iters": 20,
+        "warmup": 5,
+        "pair_ratio_median": 0.9912078549251371,
+        "pair_ratio_min": 0.7151115939401719,
+        "pair_ratio_max": 1.699388713212629
       },
-      "fwd_path_c_over_path_b_ratio": 1.0351342978435922,
-      "fwd_path_c_over_path_b_paired_ratio": 1.0018111836229635,
+      "fwd_path_c_over_path_b_ratio": 1.0102088143814534,
+      "fwd_path_c_over_path_b_paired_ratio": 0.9912078549251371,
       "path_c_over_path_b_max_ratio": 1.0,
-      "fwd_path_c_no_worse_than_path_b": false,
-      "fwd_path_c_no_worse_than_path_b_paired": false,
+      "fwd_path_c_no_worse_than_path_b": true,
+      "fwd_path_c_no_worse_than_path_b_paired": true,
       "fwd_path_c_unpaired_within_max_ratio": false,
       "path_b": {
         "available": true,
@@ -503,113 +500,113 @@
       "bwd_reference_ms": {
         "label": "reference_bwd",
         "ok": true,
-        "median_ms": 3.9911249914439395,
-        "min_ms": 3.800957987550646,
-        "max_ms": 4.367166984593496,
-        "iters": 10,
-        "warmup": 3
+        "median_ms": 4.046770496643148,
+        "min_ms": 3.8359169848263264,
+        "max_ms": 4.473667009733617,
+        "iters": 20,
+        "warmup": 5
       },
       "bwd_msl_ms": {
         "label": "path_b_msl_bwd",
         "ok": true,
-        "median_ms": 3.136082988930866,
-        "min_ms": 3.0271660070866346,
-        "max_ms": 3.647082980023697,
-        "iters": 10,
-        "warmup": 3
+        "median_ms": 3.2136869995156303,
+        "min_ms": 3.03295801859349,
+        "max_ms": 3.6435840011108667,
+        "iters": 20,
+        "warmup": 5
       },
       "bwd_msl_paired_ms": {
         "label": "path_b_msl_bwd_paired",
         "ok": true,
-        "median_ms": 3.0860625120112672,
-        "min_ms": 3.0205000075511634,
-        "max_ms": 3.1896659929770976,
-        "iters": 10,
-        "warmup": 3
+        "median_ms": 3.3261665084864944,
+        "min_ms": 3.036417008843273,
+        "max_ms": 3.9535420073661953,
+        "iters": 20,
+        "warmup": 5
       },
       "bwd_msl_kernel_ms": {
         "label": "path_b_msl_bwd_kernel_only",
         "ok": true,
-        "median_ms": 1.2732289906125516,
-        "min_ms": 1.2442920124158263,
-        "max_ms": 1.6839580202940851,
-        "iters": 10,
-        "warmup": 3
+        "median_ms": 1.2828124890802428,
+        "min_ms": 1.2551660183817148,
+        "max_ms": 1.7550410120747983,
+        "iters": 20,
+        "warmup": 5
       },
       "bwd_msl_fresh_reduce_ms": {
         "label": "path_b_msl_bwd_fresh_reduce",
         "ok": true,
-        "median_ms": 3.200833496521227,
-        "min_ms": 3.0227089882828295,
-        "max_ms": 3.5200840211473405,
-        "iters": 10,
-        "warmup": 3
+        "median_ms": 3.1402294989675283,
+        "min_ms": 2.9907500138506293,
+        "max_ms": 3.6063339794054627,
+        "iters": 20,
+        "warmup": 5
       },
       "bwd_msl_reduce_ms": {
         "label": "path_b_msl_bwd_reduce_only",
         "ok": true,
-        "median_ms": 1.9561255176085979,
-        "min_ms": 1.84304200229235,
-        "max_ms": 2.280916989548132,
-        "iters": 10,
-        "warmup": 3
+        "median_ms": 1.942520510056056,
+        "min_ms": 1.8732919998001307,
+        "max_ms": 2.5217499933205545,
+        "iters": 20,
+        "warmup": 5
       },
       "bwd_path_c_ms": {
         "label": "path_c_tilelang_bwd",
         "ok": true,
-        "median_ms": 3.172333992552012,
-        "min_ms": 2.998083975398913,
-        "max_ms": 3.7057500157970935,
-        "iters": 10,
-        "warmup": 3
+        "median_ms": 3.176938000251539,
+        "min_ms": 2.994540991494432,
+        "max_ms": 3.5243339953012764,
+        "iters": 20,
+        "warmup": 5
       },
       "bwd_path_c_paired_ms": {
         "label": "path_c_tilelang_bwd_paired",
         "ok": true,
-        "median_ms": 3.3463125000707805,
-        "min_ms": 3.1017499859444797,
-        "max_ms": 3.553709015250206,
-        "iters": 10,
-        "warmup": 3,
-        "pair_ratio_median": 1.0814509485342598,
-        "pair_ratio_min": 0.9815225368034229,
-        "pair_ratio_max": 1.1749157357150586
+        "median_ms": 3.150187520077452,
+        "min_ms": 3.041416988708079,
+        "max_ms": 3.6820419772993773,
+        "iters": 20,
+        "warmup": 5,
+        "pair_ratio_median": 0.9658850779042549,
+        "pair_ratio_min": 0.7962480257215794,
+        "pair_ratio_max": 1.131710842020669
       },
       "bwd_path_c_kernel_ms": {
         "label": "path_c_tilelang_bwd_kernel_only",
         "ok": true,
-        "median_ms": 1.3036040036240593,
-        "min_ms": 1.2460830039344728,
-        "max_ms": 1.6750420036260039,
-        "iters": 10,
-        "warmup": 3
+        "median_ms": 1.2379999971017241,
+        "min_ms": 1.2173749855719507,
+        "max_ms": 1.6862500051502138,
+        "iters": 20,
+        "warmup": 5
       },
       "bwd_path_c_fresh_reduce_ms": {
         "label": "path_c_tilelang_bwd_fresh_reduce",
         "ok": true,
-        "median_ms": 3.1531669956166297,
-        "min_ms": 2.98529100837186,
-        "max_ms": 3.71595800970681,
-        "iters": 10,
-        "warmup": 3
+        "median_ms": 3.133895486826077,
+        "min_ms": 2.996291994350031,
+        "max_ms": 3.55295799090527,
+        "iters": 20,
+        "warmup": 5
       },
       "bwd_path_c_reduce_ms": {
         "label": "path_c_tilelang_bwd_reduce_only",
         "ok": true,
-        "median_ms": 1.9890830153599381,
-        "min_ms": 1.901332987472415,
-        "max_ms": 2.2922079951968044,
-        "iters": 10,
-        "warmup": 3
+        "median_ms": 1.9308750052005053,
+        "min_ms": 1.8389580072835088,
+        "max_ms": 2.3501669929828495,
+        "iters": 20,
+        "warmup": 5
       },
-      "bwd_path_c_over_path_b_ratio": 1.011559325358767,
-      "bwd_path_c_over_path_b_paired_ratio": 1.0814509485342598,
-      "bwd_path_c_kernel_over_path_b_kernel_ratio": 1.0238566771849062,
-      "bwd_path_c_fresh_reduce_over_path_b_fresh_reduce_ratio": 0.9851080973263986,
-      "bwd_path_c_reduce_over_path_b_reduce_ratio": 1.0168483553098533,
-      "bwd_path_c_no_worse_than_path_b": false,
-      "bwd_path_c_no_worse_than_path_b_paired": false,
-      "bwd_blocker": "mixed overhead: Path C backward slower without one phase exceeding 10%"
+      "bwd_path_c_over_path_b_ratio": 0.9885648480173613,
+      "bwd_path_c_over_path_b_paired_ratio": 0.9658850779042549,
+      "bwd_path_c_kernel_over_path_b_kernel_ratio": 0.965066997429493,
+      "bwd_path_c_fresh_reduce_over_path_b_fresh_reduce_ratio": 0.9979829461052022,
+      "bwd_path_c_reduce_over_path_b_reduce_ratio": 0.9940049514044952,
+      "bwd_path_c_no_worse_than_path_b": true,
+      "bwd_path_c_no_worse_than_path_b_paired": true,
+      "bwd_blocker": "none: Path C backward is within strict ratio 1"
     }
   ]
 }
