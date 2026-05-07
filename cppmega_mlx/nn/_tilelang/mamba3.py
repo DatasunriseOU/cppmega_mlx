@@ -1,15 +1,29 @@
 """Path B port of mamba_ssm.ops.tilelang.mamba3 fwd/bwd.
 
-.. todo:: Phase-3 unified-pipeline migration (tracked in ``MIGRATION_PLAN.md``).
+.. todo:: wave-6: port to TileLang DSL.
 
-   This file is a raw-MSL Path-B kernel. Migrating it to the unified
-   :func:`cppmega_mlx.nn._tilelang._engine_dispatch.dispatch_lower` path
-   depends on the **MSL-extraction adapter** landing first (parallel agent in
-   the same Phase-3 wave). The adapter will let downstream
-   ``mx.fast.metal_kernel`` callers pull MSL out of an engine artifact, after
-   which the 12 mlx + 2 cppmega call sites of this module can flip to the
-   ``@T.prim_func`` Path-C variant in ``mamba3_path_c.py``. Until then this
-   module stays untouched to preserve numerical parity for downstream callers.
+   Both ``_FWD_KERNEL_SOURCE`` and ``_BWD_KERNEL_SOURCE`` are sequential
+   selective-scan kernels with **per-thread cumulative state** (``float
+   h_state[STATE]`` for fwd, ``float dh[STATE]`` plus a persistent
+   ``h_steps_scratch[tid][t][n]`` slab and reverse iteration for bwd). They do
+   not fit the canonical TileLang DSL idiom (tile-parallel ``T.Parallel`` /
+   ``T.Pipelined`` over a static iteration space) without a non-trivial
+   rewrite that introduces ``T.serial(reverse=True)`` over ``t`` and treats
+   the per-thread carry as a ``T.alloc_fragment`` of static shape.
+
+   The MSL-extraction adapter
+   (:func:`cppmega_mlx.nn._tilelang._msl_extraction.extract_msl_from_engine_artifact`,
+   commit ``00d6d90``) is in tree and the prerequisite ``return_msl=True``
+   kwarg on ``dispatch_lower`` works for the simpler tile-parallel kernels
+   (``topk_selector`` already flipped). Porting these scan kernels remains a
+   wave-6 line item: write ``mamba3_mimo_fwd_prim`` /
+   ``mamba3_mimo_bwd_prim`` ``@T.prim_func`` factories, route through
+   ``dispatch_lower(prim, "metal", return_msl=True)``, then feed the
+   extracted MSL string into the existing ``_msl_transform.make_metal_kernel``
+   call site so the 12 mlx + 2 cppmega call sites stay numerically identical.
+
+   Until then this module stays on its hand-written MSL source to preserve
+   numerical parity. See ``MIGRATION_PLAN.md`` and the wave-6 tracker.
 
 This module implements the Mamba3 MIMO selective-scan kernel in vendor MSL,
 without depending on TileLang's TVM-Metal lowering. The forward kernel is the
@@ -136,6 +150,12 @@ _FWD_KERNEL_HEADER = """
 """
 
 
+# TODO(wave-6): port to TileLang DSL. Sequential time-loop scan with
+# per-thread ``float h_state[STATE]`` cumulative state — does not fit the
+# tile-parallel ``T.Parallel`` idiom cleanly. Once a ``mamba3_mimo_fwd_prim``
+# ``@T.prim_func`` exists, route through
+# ``dispatch_lower(prim, "metal", return_msl=True)`` and feed the extracted
+# MSL into ``make_metal_kernel(source=...)`` to keep the runtime contract.
 _FWD_KERNEL = _msl_transform.make_metal_kernel(
     name="cppmega_mamba3_mimo_fwd",
     input_names=["x", "B_proj", "C_proj", "z", "A", "dt", "D", "h0"],
@@ -307,6 +327,12 @@ _BWD_KERNEL_SOURCE = """
 """
 
 
+# TODO(wave-6): port to TileLang DSL. Reverse-time scan with both per-thread
+# ``float dh[STATE]`` accumulator and a persistent ``h_steps_scratch[tid][t][n]``
+# slab; needs ``T.serial(reverse=True)`` over ``t`` plus careful fragment
+# layout to keep the per-lane partial outputs (dB_partial, dC_partial,
+# dA_partial, ddt_partial) atomics-free. Same flip pattern as the fwd above
+# once the prim_func exists.
 _BWD_KERNEL = _msl_transform.make_metal_kernel(
     name="cppmega_mamba3_mimo_bwd",
     input_names=["dy", "x", "B_proj", "C_proj", "z", "A", "dt", "D", "h0"],
