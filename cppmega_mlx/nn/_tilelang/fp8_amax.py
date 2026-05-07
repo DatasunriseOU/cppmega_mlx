@@ -97,6 +97,14 @@ import torch
 #
 # Until one of those lands, the global lock is the correct invariant —
 # downgrading to per-signature locks would silently corrupt PrimFuncs.
+#
+# Practical DoS surface is small: ``_amax_kernel_for`` and
+# ``_quantize_kernel_for`` are both wrapped in ``@lru_cache(maxsize=256)``
+# so only the FIRST call per signature reaches the locked section; cache
+# hits skip the lock entirely. Production training rotates through
+# 5-20 fixed shapes (not 1000 unique), so worst-case lock contention is
+# bounded by N(unique compiles) and is observed during warmup only, not
+# the steady-state forward/backward path.
 _FP8_AMAX_LOCK = threading.Lock()
 
 
