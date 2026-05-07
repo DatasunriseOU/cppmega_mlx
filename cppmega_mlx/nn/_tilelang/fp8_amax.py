@@ -585,6 +585,8 @@ def fp8_pack_tilelang(tensor: torch.Tensor, *, clamp: bool = False):
     fallback to scale=1.0).
     """
 
+    import math
+
     fp8_dtype = getattr(torch, "float8_e4m3fn", None)
     if fp8_dtype is None:
         raise RuntimeError("torch.float8_e4m3fn is not available in this PyTorch build")
@@ -599,6 +601,17 @@ def fp8_pack_tilelang(tensor: torch.Tensor, *, clamp: bool = False):
 
     amax_buf = fp8_amax_tilelang(tensor)
     amax_val = amax_buf.item()
+    # NaN/Inf in input ``tensor`` propagates through ``T.abs`` -> ``T.reduce_max``
+    # -> ``T.atomic_max`` and yields a non-finite ``amax_val``. Falling through
+    # to ``inv_scale = fp8_max / amax_val`` would produce 0/NaN and silently
+    # poison every output element. Fail loudly so the caller gets a clear
+    # diagnostic instead of garbage FP8 weights downstream.
+    if not math.isfinite(amax_val):
+        raise FloatingPointError(
+            f"fp8_pack_tilelang: input contains non-finite values "
+            f"(amax={amax_val!r}); refuse to derive a degenerate scale. "
+            f"Check the upstream tensor for NaN/Inf before quantization."
+        )
     if amax_val > 0:
         scale_val = amax_val / _FP8_E4M3_MAX
         inv_scale_val = _FP8_E4M3_MAX / amax_val

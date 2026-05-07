@@ -129,7 +129,7 @@ _DSA_STAGE2_THREADS = 256
 _DSA_STAGE2_NUM_STAGES = 3
 
 
-def _metal_block_overrides(stage: int) -> dict[str, int]:
+def _metal_block_overrides(stage: int, AH: int | None = None) -> dict[str, int]:
     """Return Metal-tuned BLOCK_* / threads overrides for *stage*.
 
     Apple Silicon's per-threadgroup memory budget is 32 KB. Beyond the
@@ -145,8 +145,23 @@ def _metal_block_overrides(stage: int) -> dict[str, int]:
     huge slowdowns or compile failures on M-series. 32x32x16 keeps each
     fragment at 4 KB (stage 1: ~8 KB, stage 2: ~16 KB) plus shared 4 KB
     -- comfortably under 32 KB.
+
+    Wave-3 P1 (grok perf #2): on stage 2, the wave-2 ``M_pre`` / ``D_pre``
+    fragments are ``(AH, BLOCK_SQ)`` fp32 = ``AH * BLOCK_SQ * 4`` bytes.
+    At AH=128 / BLOCK_SQ=32 that's 16 KB *just for the pre-loads*, on top
+    of the ~16 KB of (h_scores, softmax_attn, softmax_idx, kl_term) and
+    shared Q/K staging -- well over the 32 KB Metal threadgroup budget,
+    causing register spilling. Threshold math: keep
+    ``AH * BLOCK_SQ * 4 <= 8 KB`` per pre-load fragment so the *pair*
+    ``M_pre + D_pre`` stays at <=16 KB. With BLOCK_SQ=32 that means
+    ``AH <= 64``; for ``AH > 64`` halve BLOCK_SQ to 16 (and BLOCK_D to
+    keep arithmetic intensity, leaving BLOCK_SK=32 for stage 1 since it
+    has no AH-shaped fragments).
     """
 
+    # Stage 1 has no AH-shaped fragments -- the 32/32/16 default is safe
+    # regardless of AH. Keep the existing override unconditionally to
+    # preserve wave-2 behaviour (per "no silent delete" memory rule).
     if stage == 1:
         return dict(
             BLOCK_SQ=32,
@@ -156,6 +171,21 @@ def _metal_block_overrides(stage: int) -> dict[str, int]:
             num_stages=2,
         )
     if stage == 2:
+        # Shape-aware override: AH > 64 means M_pre/D_pre at BLOCK_SQ=32
+        # exceeds the 8 KB / fragment safety threshold -- halve BLOCK_SQ.
+        # AH <= 64 keeps the wave-2 32/32/16 path exactly as before.
+        if AH is not None and AH > 64:
+            return dict(
+                # AH=128, BLOCK_SQ=16 -> M_pre/D_pre = 128*16*4 = 8 KB each
+                # -> pair fits in 16 KB, leaving headroom for the four
+                # BLOCK_SQ*BLOCK_SK*4 = 16*32*4 = 2 KB score fragments
+                # (8 KB total) + shared Q/K (~2 KB) under 32 KB.
+                BLOCK_SQ=16,
+                BLOCK_SK=32,
+                BLOCK_D=16,
+                threads=128,
+                num_stages=2,
+            )
         return dict(
             BLOCK_SQ=32,
             BLOCK_SK=32,
@@ -446,6 +476,19 @@ def make_dsa_splitk_stage1_kernel(
 
                 # Head-0 path: accumulate the index_scores online softmax too.
                 if h == 0:
+                    # Wave-2 P0 fix (grok finding #5): mirror the ``scores_f``
+                    # zeroing pattern with an explicit -INF prime *before* the
+                    # per-position load. The if/else below already writes every
+                    # (i, j) lane (so values aren't strictly stale on a
+                    # well-behaved backend), but on Metal the SIMDgroup register
+                    # allocator can reuse fragment lanes across pipelined
+                    # iterations -- priming with -INF makes the subsequent
+                    # ``T.reduce_max`` numerically safe even if a write is
+                    # elided / reordered: reduce_max(-inf) == -inf, and
+                    # exp(-inf - max) == 0, contributing 0 to ``d1_i``.
+                    for i, j in T.Parallel(BLOCK_SQ, BLOCK_SK):
+                        idx_scores_f[i, j] = T.cast(-3.4028234663852886e38, "float32")
+
                     for i, j in T.Parallel(BLOCK_SQ, BLOCK_SK):
                         sq_idx = sq_block_id * BLOCK_SQ + i
                         sk_idx = sk_tile * BLOCK_SK + j
@@ -556,6 +599,25 @@ def make_dsa_splitk_stage2_kernel(
         with T.Kernel(AB, NUM_SQ_BLOCKS, threads=threads) as (b, sq_block_id):
             Q_s = T.alloc_shared((BLOCK_SQ, BLOCK_D), in_dtype)
             K_s = T.alloc_shared((BLOCK_D, BLOCK_SK), in_dtype)
+            # Wave-3 P1 (grok perf finding #1): partial Q hoist for stage 2.
+            # The sk_tile -> h -> d_tile loop nest re-reads Q from HBM on every
+            # d_tile iteration even though Q[sq_block, b, h, :] is independent
+            # of (sk_tile, d_tile). Caching the full BLOCK_SQ x AD slab per
+            # (sk_tile, h) into shared lets the d_tile inner loop hit shared
+            # instead of HBM, saving (AD/BLOCK_D - 1) HBM reads per (sk_tile, h)
+            # pass. A *full* hoist out of the sk_tile loop would be ideal (saves
+            # SK_TILES-1 reloads too) but requires reordering to h-outer /
+            # sk_tile-inner, which breaks the current per-sk_tile heads-summed
+            # softmax_attn accumulator semantics (softmax_attn averages over AH
+            # heads within a single sk_tile before feeding into the per-tile
+            # KL term -- the Triton reference does the same). TODO(integration-
+            # 06-wave3): full hoist requires either (a) per-h shared Q cache
+            # (~AH * BLOCK_SQ * AD * 2 bytes -- 512 KB at AH=128, infeasible)
+            # or (b) accumulator restructure to materialise softmax_attn as a
+            # (SK_TILES, BLOCK_SQ, BLOCK_SK) buffer (also too large). Partial
+            # hoist below trades a small extra shared (BLOCK_SQ * AD * 2 bytes
+            # = 4 KB at Metal 32x64) for d_tile-level redundancy elimination.
+            Q_full = T.alloc_shared((BLOCK_SQ, AD), in_dtype)
 
             h_scores = T.alloc_fragment((BLOCK_SQ, BLOCK_SK), "float32")
             softmax_attn = T.alloc_fragment((BLOCK_SQ, BLOCK_SK), "float32")
@@ -603,13 +665,10 @@ def make_dsa_splitk_stage2_kernel(
             _max_sq_in_block = sq_block_id * BLOCK_SQ + (BLOCK_SQ - 1)
             _max_useful_sk = T.min(_max_sq_in_block, ASq - 1)
             _active_sk_tiles = T.min(SK_TILES, _max_useful_sk // BLOCK_SK + 1)
-            # TODO(integration-06-wave3): hoist Q out of the sk_tile loop in
-            # stage 2 too. Q depends on (h, sq_block, d_tile) but not sk_tile,
-            # so it could be cached per (sq_block, h) in a shared buffer. The
-            # current sk_tile->h->d_tile nesting makes this a non-trivial
-            # restructure (would need either a per-h shared buffer reset on
-            # each sk_tile, or an outer h-loop with a SK_TILES-deep softmax_attn
-            # accumulator); deferred to next wave.
+            # Wave-3 (grok perf #1): partial Q hoist landed below (per-(sk_tile,
+            # h) full slab into Q_full, d_tile reads shared). Full hoist out of
+            # the sk_tile loop is still TODO -- it would require restructuring
+            # the heads-summed softmax_attn accumulator, see Q_full comment.
             for sk_tile in T.Pipelined(_active_sk_tiles, num_stages=num_stages):
                 # Zero softmax_attn for this tile (we accumulate over heads).
                 for i, j in T.Parallel(BLOCK_SQ, BLOCK_SK):
@@ -621,13 +680,25 @@ def make_dsa_splitk_stage2_kernel(
                     for i, j in T.Parallel(BLOCK_SQ, BLOCK_SK):
                         h_scores[i, j] = T.cast(0, "float32")
 
+                    # Wave-3 P1 (grok perf #1): partial Q hoist -- load the full
+                    # BLOCK_SQ x AD Q slab for this (sq_block, h) once per
+                    # (sk_tile, h) pass, so the d_tile inner loop reads from
+                    # shared instead of HBM. See comment on Q_full alloc above
+                    # for why this is partial (not the full out-of-sk_tile
+                    # hoist done in stage 1).
+                    for i, dd in T.Parallel(BLOCK_SQ, AD):
+                        sq_idx = sq_block_id * BLOCK_SQ + i
+                        if sq_idx < ASq:
+                            Q_full[i, dd] = Q[sq_idx, b, h, dd]
+                        else:
+                            Q_full[i, dd] = T.cast(0, in_dtype)
+
                     # Inner D-loop matmul.
                     for d_tile in T.serial((AD + BLOCK_D - 1) // BLOCK_D):
                         for i, dd in T.Parallel(BLOCK_SQ, BLOCK_D):
-                            sq_idx = sq_block_id * BLOCK_SQ + i
                             d_idx = d_tile * BLOCK_D + dd
-                            if (sq_idx < ASq) and (d_idx < AD):
-                                Q_s[i, dd] = Q[sq_idx, b, h, d_idx]
+                            if d_idx < AD:
+                                Q_s[i, dd] = Q_full[i, d_idx]
                             else:
                                 Q_s[i, dd] = T.cast(0, in_dtype)
 
@@ -832,11 +903,20 @@ def _scale_to_bits(scale: float) -> int:
     return int.from_bytes(struct.pack("<f", float(scale)), "little")
 
 
-def _block_constants_for_target(target: str) -> tuple[dict[str, int], dict[str, int]]:
-    """Return (stage1_kwargs, stage2_kwargs) BLOCK_*/threads constants."""
+def _block_constants_for_target(
+    target: str, AH: int | None = None
+) -> tuple[dict[str, int], dict[str, int]]:
+    """Return (stage1_kwargs, stage2_kwargs) BLOCK_*/threads constants.
+
+    *AH* (attention heads) is forwarded to ``_metal_block_overrides`` so the
+    Metal stage-2 path can downsize BLOCK_SQ when the AH-shaped ``M_pre`` /
+    ``D_pre`` fragments would exceed the threadgroup register budget. CUDA
+    defaults are unchanged (the 96 KB shared budget on Hopper handles all
+    supported AH up to 128 without trouble).
+    """
 
     if _is_metal(target):
-        return _metal_block_overrides(1), _metal_block_overrides(2)
+        return _metal_block_overrides(1, AH=AH), _metal_block_overrides(2, AH=AH)
     return (
         dict(
             BLOCK_SQ=_DSA_STAGE1_BLOCK_SQ,
@@ -922,7 +1002,7 @@ def dsa_splitk_indexer_loss_tilelang(
 
     out_loss = torch.empty((AB, ASq), dtype=torch.float32, device=query.device)
 
-    stage1_kw, stage2_kw = _block_constants_for_target(target)
+    stage1_kw, stage2_kw = _block_constants_for_target(target, AH=AH)
     scale_bits = _scale_to_bits(softmax_scale)
 
     # Ensure contiguous device tensors -- the PrimFunc takes plain Tensor
