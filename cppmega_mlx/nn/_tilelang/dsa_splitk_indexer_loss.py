@@ -564,16 +564,134 @@ def make_dsa_splitk_stage1_kernel(
                         d1_i[i] = d1_i[i] * T.exp(m1_i_prev[i] - m1_i[i]) + row_sum_local[i]
 
             # Persist the (m_i, d_i) statistics back to global memory.
+            # Wave-4 perf #3: M1/D1 writes only when COMPUTE_INDEX (else
+            # the dedicated stage1-idx kernel writes them).
             for i in T.Parallel(BLOCK_SQ):
                 sq_idx = sq_block_id * BLOCK_SQ + i
                 if sq_idx < ASq:
                     M[b, h, sq_idx] = m_i[i]
                     D[b, h, sq_idx] = d_i[i]
-                    if h == 0:
+                    if COMPUTE_INDEX and h == 0:
                         M1[b, sq_idx] = m1_i[i]
                         D1[b, sq_idx] = d1_i[i]
 
     return dsa_stage1
+
+
+def make_dsa_splitk_stage1_idx_kernel(
+    *,
+    AB: int,
+    ASq: int,
+    Sk: int,
+    sparse_loss: bool,
+    BLOCK_SQ: int = _DSA_STAGE1_BLOCK_SQ,
+    BLOCK_SK: int = _DSA_STAGE1_BLOCK_SK,
+    threads: int = _DSA_STAGE1_THREADS,
+    num_stages: int = _DSA_STAGE1_NUM_STAGES,
+) -> Any:
+    """Wave-4 perf #3: dedicated stage-1 kernel for the index-softmax statistics.
+
+    Computes M1 / D1 only -- the index path used to live inside
+    ``make_dsa_splitk_stage1_kernel`` under ``if h == 0``. By splitting it
+    out we (a) drop the index fragments from the AH-1 attn-only blocks,
+    (b) skip the per-block per-h stub writes, and (c) eliminate any
+    accidental coupling between the matmul side (Q/K/M/D) and the pure
+    reduction side (IndexScores -> M1/D1).
+
+    Grid is (AB, ceildiv(ASq, BLOCK_SQ)) -- no AH dimension. The original
+    h==0 specialisation in the unified kernel meant only 1/AH of the AH
+    head blocks ever entered this code path; now we launch exactly that
+    1/AH worth of work (each thread block handles a (b, sq_block)).
+
+    Inputs / outputs intentionally match the unified kernel's slice for
+    these statistics so the wrapper can pass the same buffers to both
+    kernels without rebinding.
+    """
+
+    if AB <= 0 or Sk <= 0 or ASq <= 0:
+        raise ValueError(
+            "make_dsa_splitk_stage1_idx_kernel: all dims must be positive; "
+            f"got AB={AB}, Sk={Sk}, ASq={ASq}"
+        )
+    if BLOCK_SQ <= 0 or BLOCK_SK <= 0 or threads <= 0:
+        raise ValueError(
+            "make_dsa_splitk_stage1_idx_kernel: BLOCK_*/threads must be positive; "
+            f"got BLOCK_SQ={BLOCK_SQ}, BLOCK_SK={BLOCK_SK}, threads={threads}"
+        )
+
+    import tilelang.language as T
+
+    T = cast(Any, T)
+
+    NUM_SQ_BLOCKS = (ASq + BLOCK_SQ - 1) // BLOCK_SQ
+    SK_TILES = (Sk + BLOCK_SK - 1) // BLOCK_SK
+    SPARSE = bool(sparse_loss)
+
+    @T.prim_func
+    def dsa_stage1_idx(
+        IndexScores: T.Tensor((AB, ASq, Sk), "float32"),
+        IndexMask: T.Tensor((AB, ASq, Sk), "float32"),
+        M1: T.Tensor((AB, ASq), "float32"),
+        D1: T.Tensor((AB, ASq), "float32"),
+    ):
+        with T.Kernel(AB, NUM_SQ_BLOCKS, threads=threads) as (b, sq_block_id):
+            idx_scores_f = T.alloc_fragment((BLOCK_SQ, BLOCK_SK), "float32")
+            row_max_local = T.alloc_fragment((BLOCK_SQ,), "float32")
+            row_sum_local = T.alloc_fragment((BLOCK_SQ,), "float32")
+            m1_i = T.alloc_fragment((BLOCK_SQ,), "float32")
+            d1_i = T.alloc_fragment((BLOCK_SQ,), "float32")
+            m1_i_prev = T.alloc_fragment((BLOCK_SQ,), "float32")
+
+            for i in T.Parallel(BLOCK_SQ):
+                m1_i[i] = T.cast(-3.4028234663852886e38, "float32")
+                d1_i[i] = T.cast(0, "float32")
+
+            # Same causal trim as the matmul stage1 (mirrors line ~417).
+            _max_sq_in_block = sq_block_id * BLOCK_SQ + (BLOCK_SQ - 1)
+            _max_useful_sk = T.min(_max_sq_in_block, ASq - 1)
+            _active_sk_tiles = T.max(
+                T.min(SK_TILES, _max_useful_sk // BLOCK_SK + 1), 1
+            )
+
+            for sk_tile in T.Pipelined(_active_sk_tiles, num_stages=num_stages):
+                # Prime with -INF (mirror of unified kernel's wave-2 fix #5).
+                for i, j in T.Parallel(BLOCK_SQ, BLOCK_SK):
+                    idx_scores_f[i, j] = T.cast(-3.4028234663852886e38, "float32")
+
+                for i, j in T.Parallel(BLOCK_SQ, BLOCK_SK):
+                    sq_idx = sq_block_id * BLOCK_SQ + i
+                    sk_idx = sk_tile * BLOCK_SK + j
+                    valid = (sq_idx < ASq) and (sk_idx < Sk)
+                    if valid:
+                        v = IndexScores[b, sq_idx, sk_idx]
+                        if SPARSE:
+                            v = v + IndexMask[b, sq_idx, sk_idx]
+                        idx_scores_f[i, j] = v
+                    else:
+                        idx_scores_f[i, j] = T.cast(-3.4028234663852886e38, "float32")
+
+                T.reduce_max(idx_scores_f, row_max_local, dim=1, clear=True)
+                for i in T.Parallel(BLOCK_SQ):
+                    m1_i_prev[i] = m1_i[i]
+                    new_m = T.max(m1_i[i], row_max_local[i])
+                    if new_m <= T.cast(-3.4028234663852886e38, "float32"):
+                        new_m = T.cast(0, "float32")
+                    m1_i[i] = new_m
+
+                for i, j in T.Parallel(BLOCK_SQ, BLOCK_SK):
+                    idx_scores_f[i, j] = T.exp(idx_scores_f[i, j] - m1_i[i])
+                T.reduce_sum(idx_scores_f, row_sum_local, dim=1, clear=True)
+                for i in T.Parallel(BLOCK_SQ):
+                    d1_i[i] = d1_i[i] * T.exp(m1_i_prev[i] - m1_i[i]) + row_sum_local[i]
+
+            # Persist M1 / D1.
+            for i in T.Parallel(BLOCK_SQ):
+                sq_idx = sq_block_id * BLOCK_SQ + i
+                if sq_idx < ASq:
+                    M1[b, sq_idx] = m1_i[i]
+                    D1[b, sq_idx] = d1_i[i]
+
+    return dsa_stage1_idx
 
 
 def make_dsa_splitk_stage2_kernel(
@@ -920,8 +1038,17 @@ def _stage1_kernel_for(
     BLOCK_D: int,
     threads: int,
     num_stages: int,
+    compute_index_path: bool = True,
 ) -> Any:
-    """Build, JIT-compile, and cache the stage-1 kernel for a (shape, target)."""
+    """Build, JIT-compile, and cache the stage-1 kernel for a (shape, target).
+
+    Wave-4 perf #3: ``compute_index_path`` selects between the unified
+    fwd kernel (computes both attn and index softmax statistics) and the
+    attn-only fwd kernel (drops the index fragments, saves register
+    pressure on Metal/CUDA AH-1 head blocks). Pair compute_index_path=False
+    with a follow-up call to ``_stage1_idx_kernel_for`` to compute M1/D1
+    in a separate, smaller launch.
+    """
 
     import struct
 
@@ -944,6 +1071,36 @@ def _stage1_kernel_for(
         BLOCK_SQ=BLOCK_SQ,
         BLOCK_SK=BLOCK_SK,
         BLOCK_D=BLOCK_D,
+        threads=threads,
+        num_stages=num_stages,
+        compute_index_path=compute_index_path,
+    )
+    return dispatch_lower(prim, target)
+
+
+@lru_cache(maxsize=64)
+def _stage1_idx_kernel_for(
+    AB: int,
+    Sk: int,
+    ASq: int,
+    sparse_loss: bool,
+    target: str,
+    BLOCK_SQ: int,
+    BLOCK_SK: int,
+    threads: int,
+    num_stages: int,
+) -> Any:
+    """Wave-4 perf #3: dedicated stage-1-idx kernel for M1/D1 computation."""
+
+    from cppmega_mlx.nn._tilelang._engine_dispatch import dispatch_lower
+
+    prim = make_dsa_splitk_stage1_idx_kernel(
+        AB=AB,
+        ASq=ASq,
+        Sk=Sk,
+        sparse_loss=sparse_loss,
+        BLOCK_SQ=BLOCK_SQ,
+        BLOCK_SK=BLOCK_SK,
         threads=threads,
         num_stages=num_stages,
     )
@@ -1195,32 +1352,87 @@ def dsa_splitk_indexer_loss_tilelang(
     index_mask_c = index_mask if index_mask.is_contiguous() else index_mask.contiguous()
 
     # Stage 1.
-    stage1 = _stage1_kernel_for(
-        AB,
-        AH,
-        AD,
-        Sk,
-        ASq,
-        bool(sparse_loss),
-        scale_bits,
-        in_dtype,
-        target,
-        stage1_kw["BLOCK_SQ"],
-        stage1_kw["BLOCK_SK"],
-        stage1_kw["BLOCK_D"],
-        stage1_kw["threads"],
-        stage1_kw["num_stages"],
-    )
-    stage1(
-        query_c,
-        key_c,
-        index_scores_c,
-        index_mask_c,
-        softmax_m,
-        softmax_d,
-        softmax_m1,
-        softmax_d1,
-    )
+    # Wave-4 perf #3 (grok wave-3 review): split stage-1 into two specialised
+    # kernels when AH > 1. The unified kernel allocates BLOCK_SQ*BLOCK_SK fp32
+    # of register fragments for the index-softmax path even though only h=0
+    # writes M1/D1 -- 127/128 of the head blocks pay that cost for nothing.
+    # Splitting drops the index path entirely from the AH-block fwd kernel
+    # (compute_index_path=False) and computes M1/D1 in a separate, smaller
+    # kernel without an AH grid axis. AH==1 still uses the unified kernel
+    # (no register-pressure savings, plus the unified path is the well-tested
+    # default).
+    if AH > 1:
+        stage1_attn = _stage1_kernel_for(
+            AB,
+            AH,
+            AD,
+            Sk,
+            ASq,
+            bool(sparse_loss),
+            scale_bits,
+            in_dtype,
+            target,
+            stage1_kw["BLOCK_SQ"],
+            stage1_kw["BLOCK_SK"],
+            stage1_kw["BLOCK_D"],
+            stage1_kw["threads"],
+            stage1_kw["num_stages"],
+            compute_index_path=False,
+        )
+        stage1_attn(
+            query_c,
+            key_c,
+            index_scores_c,
+            index_mask_c,
+            softmax_m,
+            softmax_d,
+            softmax_m1,
+            softmax_d1,
+        )
+        stage1_idx = _stage1_idx_kernel_for(
+            AB,
+            Sk,
+            ASq,
+            bool(sparse_loss),
+            target,
+            stage1_kw["BLOCK_SQ"],
+            stage1_kw["BLOCK_SK"],
+            stage1_kw["threads"],
+            stage1_kw["num_stages"],
+        )
+        stage1_idx(
+            index_scores_c,
+            index_mask_c,
+            softmax_m1,
+            softmax_d1,
+        )
+    else:
+        stage1 = _stage1_kernel_for(
+            AB,
+            AH,
+            AD,
+            Sk,
+            ASq,
+            bool(sparse_loss),
+            scale_bits,
+            in_dtype,
+            target,
+            stage1_kw["BLOCK_SQ"],
+            stage1_kw["BLOCK_SK"],
+            stage1_kw["BLOCK_D"],
+            stage1_kw["threads"],
+            stage1_kw["num_stages"],
+        )
+        stage1(
+            query_c,
+            key_c,
+            index_scores_c,
+            index_mask_c,
+            softmax_m,
+            softmax_d,
+            softmax_m1,
+            softmax_d1,
+        )
 
     # Stage 2.
     stage2 = _stage2_kernel_for(
