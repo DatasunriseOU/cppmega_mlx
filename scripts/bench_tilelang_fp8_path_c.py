@@ -433,7 +433,7 @@ def _require_bench_deps() -> None:
     if fp8_scaled_vecmat_path_c is None:
         from cppmega_mlx.nn._tilelang.fp8_vecmat_path_c import (
             TILELANG_METAL_VECMAT_TARGET as _TILELANG_METAL_VECMAT_TARGET,
-            fp8_vecmat_runtime_msl_source as _fp8_vecmat_runtime_msl_source,
+            lower_fp8_vecmat_msl as _fp8_vecmat_runtime_msl_source,
             fp8_scaled_vecmat_path_c as _fp8_scaled_vecmat_path_c,
             fp8_vecmat_msl_blockers as _fp8_vecmat_msl_blockers,
             make_fp8_vecmat_reduce_kernel as _make_fp8_vecmat_reduce_kernel,
