@@ -262,17 +262,25 @@ def make_blockscaled_sparse_mla_qk_kernel(
                     T.copy(B_fp8[bx * _BSFP8_BN, ko * _BSFP8_BK], B_shared)
                 else:
                     T.copy(B_fp8[ko * _BSFP8_BK, bx * _BSFP8_BN], B_shared)
+                # Pass full scale buffers + offsets instead of slicing — slicing
+                # produces a ``BufferRegion`` that lacks the ``.shape`` attribute
+                # used by the layout-aware validator in ``T.fp8_scaled_matmul``.
+                # The macro expects ``A_scale`` / ``B_scale`` to be the full
+                # ``Buffer`` objects (so per-tensor / per-row dispatch reads
+                # static shape) and uses ``a_scale_offset`` / ``b_scale_offset``
+                # to address the active K-block tile inside the loop.
                 scale_begin = ko * (_BSFP8_BK // E8M0_BLOCK_SIZE)
-                scale_end = scale_begin + (_BSFP8_BK // E8M0_BLOCK_SIZE)
                 T.fp8_scaled_matmul(
                     A_shared,
-                    A_scale[scale_begin:scale_end],
+                    A_scale,
                     B_shared,
-                    B_scale[scale_begin:scale_end],
+                    B_scale,
                     C_local,
                     transpose_B=_BSFP8_TRANSPOSE_B,
                     scale_format=E8M0_SCALE_FORMAT,
                     scale_block_size=E8M0_BLOCK_SIZE,
+                    a_scale_offset=scale_begin,
+                    b_scale_offset=scale_begin,
                 )
             T.copy(C_local, C[by * _BSFP8_BM, bx * _BSFP8_BN])
 

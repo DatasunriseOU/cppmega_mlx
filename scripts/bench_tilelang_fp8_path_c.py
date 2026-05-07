@@ -78,6 +78,8 @@ def _first_existing_path(candidates: Iterable[Path], fallback: Path) -> Path:
 def _default_tilelang_root() -> Path:
     return _first_existing_path(
         (
+            # Active fork-with-Z3 checkout (DatasunriseOU/tilelang).
+            Path("/private/tmp/tl_apache_tvm_swap"),
             Path("/private/tmp/tl_pr_c"),
             Path("/private/tmp/cppmega-mlx-tilelang-stack-c"),
             Path("/private/tmp/tilelang_apple_head/tilelang"),

@@ -242,26 +242,42 @@ def test_path_c_matches_path_b(
 # ---------------------------------------------------------------------------
 
 
-_FP8_DOT4_GLOBAL_FUNC = "tir.metal.fp8_e4m3_dot4"
+# Apache TVM tirx namespace migration (2026-05): the metal FP8 dot4 op was
+# re-registered under ``tirx.metal.*`` when ``tir::*`` moved to ``tirx::*``.
+# We probe both names because older fork tips may still register under
+# ``tir.metal.*``.
+_FP8_DOT4_GLOBAL_FUNC_NAMES = (
+    "tirx.metal.fp8_e4m3_dot4",
+    "tir.metal.fp8_e4m3_dot4",
+)
+_FP8_DOT4_GLOBAL_FUNC = _FP8_DOT4_GLOBAL_FUNC_NAMES[0]
 
 
 def _try_get_global_func(name: str) -> Any | None:
     """Look up a TVM-FFI global func across the several import paths the
     in-tree TileLang/TVM has used. Returns the handle or None."""
 
-    # Newer apache-tvm-ffi
+    # Newer apache-tvm-ffi.
+    # NOTE: ``allow_missing=True`` returns ``None`` for a missing global func
+    # rather than raising, so we must NOT early-return on a ``None`` result —
+    # otherwise the Op.get fallback below never runs and ops registered only
+    # via ``TVM_REGISTER_OP`` (without a separate ``TVM_FFI_REGISTER_GLOBAL``
+    # alias) look unregistered. See apache tirx migration: ``tirx.metal.*``
+    # ops are Op-only, not global-func-registered.
     try:
         import tvm_ffi  # type: ignore
 
         getter = getattr(tvm_ffi, "get_global_func", None)
         if getter is not None:
             try:
-                return getter(name, allow_missing=True)
+                handle = getter(name, allow_missing=True)
             except TypeError:
                 try:
-                    return getter(name)
+                    handle = getter(name)
                 except Exception:
-                    pass
+                    handle = None
+            if handle is not None:
+                return handle
     except Exception:
         pass
 
@@ -274,12 +290,14 @@ def _try_get_global_func(name: str) -> Any | None:
             getter = getattr(ffi, "get_global_func", None)
             if getter is not None:
                 try:
-                    return getter(name, allow_missing=True)
+                    handle = getter(name, allow_missing=True)
                 except TypeError:
                     try:
-                        return getter(name)
+                        handle = getter(name)
                     except Exception:
-                        pass
+                        handle = None
+                if handle is not None:
+                    return handle
     except Exception:
         pass
 
@@ -321,9 +339,13 @@ def test_fp8_e4m3_dot4_intrinsic_is_registered() -> None:
         "tilelang.language.fp8_op.metal_fp8_e4m3_dot4 wrapper is missing"
     )
 
-    handle = _try_get_global_func(_FP8_DOT4_GLOBAL_FUNC)
+    handle = None
+    for name in _FP8_DOT4_GLOBAL_FUNC_NAMES:
+        handle = _try_get_global_func(name)
+        if handle is not None:
+            break
     assert handle is not None, (
-        f"global func {_FP8_DOT4_GLOBAL_FUNC!r} is not registered -- the in-tree "
+        f"global func {_FP8_DOT4_GLOBAL_FUNC_NAMES!r} is not registered -- the in-tree "
         "TileLang/TVM forgot to register the FP8 e4m3 dot4 intrinsic, which "
         "would silently force every Path C FP8 kernel onto the scalar fallback. "
         "(Grok-D P0 trip-wire: see reports/2026-05-06-tilelang-tvm-review.)"
