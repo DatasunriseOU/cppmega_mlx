@@ -66,12 +66,79 @@ import torch
 # ---------------------------------------------------------------------------
 # Kernel-shape defaults -- TileLang resolves these globals while decorating
 # the nested @T.prim_func, mirroring fp8_vecmat_path_c.py's ``_FP8_VM_*``.
+#
+# Per-target (BLOCK_SIZE, THREADS) defaults
+# -----------------------------------------
+#
+# +---------+-----------+----------+--------------------------------+
+# | target  | BLOCK     | THREADS  | rationale                      |
+# +---------+-----------+----------+--------------------------------+
+# | cuda    | 1024      | 128      | warp=32; 4 warps; vector-frnd. |
+# | hip     | 1024      | 256      | warp=64; 4 warps                |
+# | metal   | 256       |  64      | simdgroup=32; 2 simdgroups      |
+# | <other> | 1024      | 128      | conservative fallback           |
+# +---------+-----------+----------+--------------------------------+
+#
+# INVARIANT: BLOCK % THREADS == 0 (the strided inner ``T.Parallel`` loop
+# requires a clean stride; a non-divisible pair leaves a partial tail
+# uncovered on the last block). Enforced in the kernel builders.
 # ---------------------------------------------------------------------------
 
-_FP8_AMAX_BLOCK_SIZE = 1024
+_FP8_AMAX_BLOCK_SIZE = 1024  # legacy default; retained for API compatibility.
 _FP8_AMAX_THREADS = 128
 _FP8_QUANT_BLOCK_SIZE = 1024
 _FP8_QUANT_THREADS = 128
+
+_BLOCK_SIZE_TABLE: dict[str, tuple[int, int]] = {
+    "cuda": (1024, 128),
+    "hip": (1024, 256),
+    "rocm": (1024, 256),  # hip alias
+    "metal": (256, 64),
+}
+
+
+def _target_family(target: str) -> str:
+    if target.startswith("metal"):
+        return "metal"
+    if target.startswith("hip") or target.startswith("rocm"):
+        return "hip"
+    if target.startswith("cuda") or target.startswith("nvptx"):
+        return "cuda"
+    return "cuda"  # conservative default
+
+
+def _pick_block_size(target: str, n_elements: int) -> tuple[int, int]:
+    """Return ``(block_size, threads)`` for *target* and *n_elements*.
+
+    Enforces ``block_size % threads == 0`` and ``block_size >= threads``.
+    Shrinks to the next power-of-two when ``n_elements`` is smaller than the
+    default block (avoids a fully-masked block on tiny inputs).
+    """
+
+    block, threads = _BLOCK_SIZE_TABLE.get(_target_family(target), (1024, 128))
+    if n_elements > 0 and n_elements < block:
+        # round n_elements up to next pow2, clamped to >= threads
+        snapped = 1 << max(1, n_elements - 1).bit_length()
+        block = max(threads, snapped)
+    if block % threads != 0:  # pragma: no cover - table invariant
+        # Snap block up to the next multiple of threads.
+        block = ((block + threads - 1) // threads) * threads
+    return block, threads
+
+
+def _bucket_n(n: int, block_size: int) -> int:
+    """Round *n* up to a power-of-two bucket >= ``block_size``.
+
+    Two close call shapes (e.g. ``N=4097`` and ``N=5000``) bucket to the
+    same kernel (``8192``), eliminating per-shape JIT compile thrashing.
+    The cost is a single allocation + copy of zeros for the tail; the
+    amax of a zero tail is the identity element of ``max`` so the result
+    is unchanged.
+    """
+
+    if n <= block_size:
+        return block_size
+    return 1 << (n - 1).bit_length()
 
 # Triton's _quantize_kernel hard-codes fp8 e4m3fn; max representable value is
 # 448.0 (= torch.finfo(torch.float8_e4m3fn).max).
@@ -110,28 +177,58 @@ def fp8_amax_path_c_status() -> FP8AmaxPathCStatus:
     )
 
 
+def tilelang_supports_with_reason(
+    device: torch.device | str | None,
+) -> tuple[bool, str]:
+    """Return ``(supported, reason)`` for *device*.
+
+    Every return is a 2-tuple ``(bool, str)`` -- both the success and the
+    failure paths carry a human-readable reason for diagnostics. The
+    boolean-only :func:`tilelang_supports` is a thin wrapper over this for
+    backward compatibility with the ``cppmega/megatron/fp8_activations.py``
+    dispatch gate.
+    """
+
+    ok, reason = _tilelang_available()
+    if not ok:
+        return False, reason
+    if device is None:
+        return False, "device is None"
+    if isinstance(device, str):
+        try:
+            dev_type = torch.device(device).type
+        except (RuntimeError, ValueError) as exc:
+            return False, f"unparseable device string {device!r}: {exc}"
+    else:
+        dev_type = device.type
+    if dev_type == "cuda":
+        if torch.cuda.is_available():
+            return True, "cuda available"
+        return False, "cuda requested but torch.cuda.is_available() is False"
+    if dev_type == "mps":
+        has_mps = (
+            hasattr(torch.backends, "mps")
+            and torch.backends.mps.is_available()
+        )
+        if has_mps:
+            return True, "mps available"
+        return False, "mps requested but torch.backends.mps.is_available() is False"
+    return False, f"unsupported device type: {dev_type!r}"
+
+
 def tilelang_supports(device: torch.device | str | None) -> bool:
     """Return True when the TileLang amax/quantize port can dispatch on *device*.
 
     The TileLang JIT supports CUDA (``cuda``) and Apple Metal (``mps`` /
     ``metal``) targets. CPU tensors must continue to use the unfused
     ``tensor.abs().amax()`` PyTorch fallback.
+
+    Thin wrapper over :func:`tilelang_supports_with_reason` that drops the
+    diagnostic reason. Kept as a stable bool API for the
+    ``cppmega/megatron/fp8_activations.py`` dispatch gate.
     """
 
-    ok, _ = _tilelang_available()
-    if not ok:
-        return False
-    if device is None:
-        return False
-    if isinstance(device, str):
-        dev_type = torch.device(device).type
-    else:
-        dev_type = device.type
-    if dev_type == "cuda":
-        return torch.cuda.is_available()
-    if dev_type == "mps":
-        return torch.backends.mps.is_available() if hasattr(torch.backends, "mps") else False
-    return False
+    return tilelang_supports_with_reason(device)[0]
 
 
 def _resolve_target(device: torch.device) -> str:
@@ -184,6 +281,14 @@ def make_fp8_amax_kernel(
         raise ValueError(f"n_elements must be positive; got {n_elements}")
     if block_size <= 0 or threads <= 0:
         raise ValueError(f"block_size/threads must be positive; got {block_size}, {threads}")
+    if block_size % threads != 0:
+        raise RuntimeError(
+            f"fp8_amax: BLOCK_SIZE={block_size} not divisible by THREADS={threads} "
+            f"(N={n_elements}); the strided ``T.Parallel(BLOCK)`` inner loop "
+            f"requires a clean stride, otherwise the last block emits a partial "
+            f"tail that is not covered by any thread. Pick block_size as a "
+            f"multiple of threads (e.g. {((block_size + threads - 1) // threads) * threads})."
+        )
 
     import tilelang.language as T
 
@@ -254,6 +359,11 @@ def make_fp8_quantize_kernel(
         raise ValueError(f"n_elements must be positive; got {n_elements}")
     if block_size <= 0 or threads <= 0:
         raise ValueError(f"block_size/threads must be positive; got {block_size}, {threads}")
+    if block_size % threads != 0:
+        raise RuntimeError(
+            f"fp8_quantize: BLOCK_SIZE={block_size} not divisible by THREADS={threads} "
+            f"(N={n_elements}); see fp8_amax.py BLOCK_SIZE_TABLE invariant."
+        )
 
     import tilelang.language as T
 
@@ -289,23 +399,47 @@ def make_fp8_quantize_kernel(
 # ---------------------------------------------------------------------------
 
 
-@lru_cache(maxsize=64)
-def _amax_kernel_for(n_elements: int, in_dtype: str, target: str) -> Any:
-    """Build, JIT-compile, and cache the amax kernel for a (shape, dtype, target)."""
+@lru_cache(maxsize=256)
+def _amax_kernel_for(bucket_n: int, in_dtype: str, target: str) -> Any:
+    """Build, JIT-compile, and cache the amax kernel keyed on the *bucket* N.
+
+    ``bucket_n`` is :func:`_bucket_n`'s power-of-two rounding so close call
+    shapes share a single compiled kernel. The dispatcher pads the input
+    with zeros up to ``bucket_n`` before launching; ``amax(0) = 0`` is the
+    identity for ``max`` so the result is unchanged.
+    """
 
     import tilelang
 
-    prim = make_fp8_amax_kernel(n_elements=n_elements, in_dtype=in_dtype)
+    block, threads = _pick_block_size(target, bucket_n)
+    prim = make_fp8_amax_kernel(
+        n_elements=bucket_n,
+        in_dtype=in_dtype,
+        block_size=block,
+        threads=threads,
+    )
     return tilelang.compile(prim, target=target, out_idx=None)
 
 
-@lru_cache(maxsize=64)
+@lru_cache(maxsize=256)
 def _quantize_kernel_for(n_elements: int, in_dtype: str, target: str) -> Any:
-    """Build, JIT-compile, and cache the quantize kernel for a (shape, dtype, target)."""
+    """Build, JIT-compile, and cache the quantize kernel for a (shape, dtype, target).
+
+    Quantize is keyed on the *exact* shape -- output sizing and the per-
+    element ``Y[gi]`` write means the kernel must own exactly ``n_elements``
+    output slots. Cache size is bumped to ``256`` to cover realistic LLM
+    training rotations without thrashing.
+    """
 
     import tilelang
 
-    prim = make_fp8_quantize_kernel(n_elements=n_elements, in_dtype=in_dtype)
+    block, threads = _pick_block_size(target, n_elements)
+    prim = make_fp8_quantize_kernel(
+        n_elements=n_elements,
+        in_dtype=in_dtype,
+        block_size=block,
+        threads=threads,
+    )
     return tilelang.compile(prim, target=target, out_idx=None)
 
 
@@ -342,15 +476,45 @@ def fp8_amax_tilelang(x: torch.Tensor) -> torch.Tensor:
         return torch.zeros(1, dtype=torch.float32, device=x.device)
 
     flat = x.reshape(-1).contiguous()
-    n_elements = flat.numel()
+    n_actual = flat.numel()
     in_dtype = _resolve_in_dtype(flat)
     target = _resolve_target(flat.device)
 
-    kernel = _amax_kernel_for(n_elements, in_dtype, target)
+    # Bucket cache key by next-pow2 to avoid per-shape JIT thrashing.
+    # ``amax(zeros) == 0`` is the identity element for ``max`` so padding
+    # the tail with zeros leaves the result unchanged.
+    block, _threads = _pick_block_size(target, n_actual)
+    bucket_n = _bucket_n(n_actual, block)
+
+    if bucket_n != n_actual:
+        padded = torch.zeros(bucket_n, dtype=flat.dtype, device=flat.device)
+        padded[:n_actual] = flat
+        flat = padded
+
+    kernel = _amax_kernel_for(bucket_n, in_dtype, target)
 
     amax = torch.zeros(1, dtype=torch.float32, device=flat.device)
     kernel(flat, amax)
     return amax
+
+
+def precompile_amax_kernel(
+    n_elements: int,
+    *,
+    in_dtype: str = "float16",
+    target: str = "cuda",
+) -> None:
+    """Warm the amax-kernel cache for a known shape/dtype/target.
+
+    Useful for LLM training where the set of activation shapes is known
+    ahead of time -- precompile once at startup, never pay the JIT cost
+    on the hot path. Resolves to the same bucket key as the dispatcher
+    so a single warm-up covers nearby shapes.
+    """
+
+    block, _threads = _pick_block_size(target, n_elements)
+    bucket_n = _bucket_n(n_elements, block)
+    _amax_kernel_for(bucket_n, in_dtype, target)
 
 
 def fp8_quantize_tilelang(
@@ -455,5 +619,7 @@ __all__ = [
     "fp8_quantize_tilelang",
     "make_fp8_amax_kernel",
     "make_fp8_quantize_kernel",
+    "precompile_amax_kernel",
     "tilelang_supports",
+    "tilelang_supports_with_reason",
 ]
