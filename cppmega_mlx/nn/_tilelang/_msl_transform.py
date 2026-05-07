@@ -37,9 +37,11 @@ Z3 roadmap note (cppmega-mlx-cuz wiring):
 from __future__ import annotations
 
 import ctypes
+import functools
 import os
 import re
 import sys
+import warnings
 from dataclasses import dataclass
 from pathlib import Path as _Path
 from typing import Any, Callable, Sequence, cast
@@ -118,26 +120,36 @@ def _preload_libz3_for_dev_tilelang() -> None:
     candidates.append(_Path("/opt/homebrew/lib/libz3.dylib"))
 
     for candidate in candidates:
+        # fix-round-8 (Wave 3 grok-4): drop the exists()-then-CDLL precheck. It
+        # introduced a TOCTOU window where the file could disappear/change
+        # between the stat() and the dlopen(). Calling CDLL directly and
+        # discriminating on the exception type yields the same outcome with
+        # no race. We still preserve the round-5 distinction between "missing
+        # file" (silent skip — not actionable) and "broken dylib" (warn —
+        # surfaces wrong-arch/corrupt-dylib/missing-dep so it doesn't hide
+        # behind the silent retry).
         try:
-            if candidate.exists():
-                ctypes.CDLL(str(candidate), ctypes.RTLD_GLOBAL)
-                # Set _done only AFTER the dlopen actually succeeds.
-                _preload_libz3_for_dev_tilelang._done = True  # type: ignore[attr-defined]
-                return
+            ctypes.CDLL(str(candidate), ctypes.RTLD_GLOBAL)
         except FileNotFoundError:
-            # fix-round-5: TOCTOU — file vanished between exists() and dlopen.
-            # Not actionable; try next candidate silently.
+            # File missing at dlopen time. Not actionable; try next candidate.
             continue
         except OSError as e:
-            # fix-round-5: distinguish a *broken* libz3 (e.g., wrong arch,
-            # corrupt dylib, missing transitive dep) from a missing file.
-            # Surface broken libs so they don't get hidden by the silent retry.
+            # On macOS dyld surfaces "image not found" as OSError (errno=2 in
+            # the message but not always settable on the exception). Detect
+            # that case heuristically and treat it as "missing" (silent skip);
+            # everything else is a *broken* libz3 and gets logged.
+            msg = str(e)
+            if "image not found" in msg or "no such file" in msg.lower():
+                continue
             import logging as _logging
 
             _logging.getLogger(__name__).warning(
                 "libz3 preload at %s failed: %s", candidate, e
             )
             continue
+        # Set _done only AFTER the dlopen actually succeeds.
+        _preload_libz3_for_dev_tilelang._done = True  # type: ignore[attr-defined]
+        return
     # No candidate succeeded — bump the failed-attempts counter so we'll
     # stop retrying once we've tried enough times. _done stays unset so that
     # if the env later changes (e.g., user sets TILELANG_DEV_BUILD_ROOT) we
@@ -145,11 +157,40 @@ def _preload_libz3_for_dev_tilelang() -> None:
     _preload_libz3_for_dev_tilelang._failed_attempts = failed + 1  # type: ignore[attr-defined]
 
 
-# Run the preload eagerly on Darwin so any ``import tilelang`` triggered by
-# downstream Path C modules during their own import inherits a process image
-# that already has libz3 loaded. No-op on non-Darwin platforms.
-if sys.platform == "darwin":
+# fix-round-8 (Wave 3 grok-4): the preload is now *lazy*. Previously this
+# fired at module-import time, which ran *before* tests/conftest.py could
+# mutate ``_LIBZ3_DEV_CANDIDATES`` to inject extra dev candidates — the
+# conftest then had to manually clear the ``_done`` / ``_failed_attempts``
+# flags and re-invoke. With a lazy guard, the first real entry-point call
+# (``lower_tilelang_to_msl_inline`` or the public
+# ``ensure_libz3_preloaded`` below) sees the post-conftest candidate list.
+# Bench scripts that want eager preload should call
+# ``ensure_libz3_preloaded()`` explicitly at the top of ``main``.
+_LIBZ3_PRELOAD_ATTEMPTED = False
+
+
+def _maybe_preload_libz3() -> None:
+    """Lazy entry point: run the preload at most once per process."""
+
+    global _LIBZ3_PRELOAD_ATTEMPTED
+    if _LIBZ3_PRELOAD_ATTEMPTED:
+        return
+    _LIBZ3_PRELOAD_ATTEMPTED = True
+    if sys.platform != "darwin":
+        return
     _preload_libz3_for_dev_tilelang()
+
+
+def ensure_libz3_preloaded() -> None:
+    """Public entry point for bench scripts that want eager libz3 preload.
+
+    Idempotent: calling repeatedly is cheap (the underlying preload uses its
+    own ``_done`` / ``_failed_attempts`` guards). Useful for short-lived
+    scripts that import tilelang directly without going through the lazy
+    ``lower_tilelang_to_msl_inline`` path.
+    """
+
+    _maybe_preload_libz3()
 
 
 MetalKernel = Callable[..., list[mx.array]]
@@ -237,6 +278,22 @@ def dispatch(
     if any(isinstance(x, mx.array) and x.size == 0 for x in inputs):
         raise MSLDispatchUnsupported("empty tensors must use the pure MLX fallback")
     if lowering is not None:
+        # fix-round-8 (Wave 3 grok-4): validate caller-supplied input count
+        # against the parsed buffer names from the lowered kernel signature.
+        # ``buffer_param_names`` enumerates *all* device-qualified buffer
+        # parameters (inputs followed by outputs) in TileLang's emission
+        # order; the input count is therefore total - len(output_dtypes).
+        # Without this check, a caller that gets the order wrong silently
+        # passes a wrong tensor as the kernel's i-th input and we get
+        # garbage numerics with no diagnostic.
+        parsed = lowering.buffer_param_names
+        expected_inputs = len(parsed) - len(output_dtypes)
+        if expected_inputs < 0 or len(inputs) != expected_inputs:
+            raise MSLDispatchUnsupported(
+                f"dispatch input count mismatch: got {len(inputs)}, parsed "
+                f"{expected_inputs} input buffer names from lowering "
+                f"(params={parsed}, output_dtypes={list(output_dtypes)})"
+            )
         launch_grid = metal_grid_for_lowering(lowering)
         launch_threadgroup = lowering.threadgroup
         if grid is not None and grid != launch_grid:
@@ -548,6 +605,42 @@ def metal_grid_for_lowering(
     )
 
 
+# fix-round-8 (Wave 3 grok-4): manual cache for lowering results keyed on
+# ``(id(prim_func), frozenset(pass_configs), target_str)``. We use ``id()``
+# rather than ``hash(prim_func)`` because TVM PrimFunc instances are not
+# generally hash-stable across re-imports (and may not be hashable at all
+# in older builds). ``id()`` is process-lifetime stable for any cached
+# prim_func — sufficient because callers in the cppmega.mlx tree hold a
+# module-level reference to their PrimFunc, so the id stays valid for the
+# full life of the cache.
+_LOWERING_CACHE: dict[
+    tuple[int, frozenset[tuple[str, Any]], str], TileLangMSLLowering
+] = {}
+# Hold strong references so cached ids cannot be reused for a different
+# PrimFunc. (CPython only reuses an id() after the original object is GC'd;
+# keeping a strong reference here pins the PrimFunc and prevents that.)
+_LOWERING_CACHE_KEEPALIVE: list[Any] = []
+
+
+def _lowering_cache_key(
+    prim_func: Any,
+    target: str,
+    pass_configs: dict[str, Any] | None,
+) -> tuple[int, frozenset[tuple[str, Any]], str] | None:
+    """Build a cache key, or return None if the inputs are not cacheable.
+
+    ``pass_configs`` values must be hashable for the frozenset to work; if
+    any value is unhashable (e.g., a dict-of-dicts) we skip caching for
+    that call rather than raising.
+    """
+
+    try:
+        cfg = frozenset((pass_configs or {}).items())
+    except TypeError:
+        return None
+    return (id(prim_func), cfg, target)
+
+
 def lower_tilelang_to_msl_inline(
     prim_func: Any,
     *,
@@ -583,24 +676,63 @@ def lower_tilelang_to_msl_inline(
     candidate key is registered with the active ``libtilelang`` build.
     """
 
+    # fix-round-8 (Wave 3 grok-4): cache lookup. Lowering re-runs a full TVM
+    # pipeline plus several regex passes over the emitted MSL — Path C bench
+    # paths re-enter this for every shape probe, and shipping inference
+    # likely calls it on each kernel-factory invocation. The cache key uses
+    # id(prim_func) (see _lowering_cache_key for the rationale) plus the
+    # frozenset of pass_configs and the target string. If the inputs aren't
+    # hashable for any reason, _lowering_cache_key returns None and we fall
+    # through to the uncached slow path.
+    cache_key = _lowering_cache_key(prim_func, target, pass_configs)
+    if cache_key is not None:
+        cached = _LOWERING_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+    # fix-round-8 (Wave 3 grok-4): trigger the lazy libz3 preload here (instead
+    # of at module-import time). By this point any conftest.py that wanted to
+    # inject extra dev candidates via ``_LIBZ3_DEV_CANDIDATES`` has already
+    # run; the preload sees the post-conftest list on the very first lower
+    # call.
+    _maybe_preload_libz3()
+
+    # fix-round-8 (Wave 3 grok-4): narrow the catch. Previously a bare
+    # ``except Exception`` swallowed *any* failure in the tilelang import as
+    # "tilelang unavailable", including TVM-internal AttributeErrors and
+    # PassContext drift. Now only an honest import failure (module not
+    # installed / dylib not loadable) maps to ``MSLDispatchUnsupported``;
+    # other exceptions propagate so callers see the real chain.
     try:
         from tilelang import tvm  # type: ignore
         from tilelang.engine.lower import lower as tl_lower  # type: ignore
-    except Exception as exc:  # pragma: no cover - guarded by callers
+    except (ImportError, ModuleNotFoundError) as exc:  # pragma: no cover
         raise MSLDispatchUnsupported(
             f"tilelang import failed: {exc}; falling back to pure MLX"
         ) from exc
 
     _ensure_single_libtvm_ffi_image()
     metal_target = _as_metal_target(target)
-    if pass_configs:
-        # opt_level=3 mirrors tilelang.jit.kernel.JitKernel default, so the
-        # only behavioural delta vs. the legacy (no-PassContext) path is the
-        # caller-supplied config dict.
-        with tvm.transform.PassContext(opt_level=3, config=dict(pass_configs)):
+    # fix-round-8 (Wave 3 grok-4): wrap the lowering call so any TVM-internal
+    # error gets a clear ``MSLDispatchUnsupported("lowering failed: ...")``
+    # *with* a ``raise from`` chain. Callers can still inspect ``__cause__``
+    # to see the original TVM error, but the public surface stays consistent
+    # (every dispatch failure is an ``MSLDispatchUnsupported``).
+    try:
+        if pass_configs:
+            # opt_level=3 mirrors tilelang.jit.kernel.JitKernel default, so the
+            # only behavioural delta vs. the legacy (no-PassContext) path is
+            # the caller-supplied config dict.
+            with tvm.transform.PassContext(opt_level=3, config=dict(pass_configs)):
+                artifact = tl_lower(prim_func, target=metal_target)
+        else:
             artifact = tl_lower(prim_func, target=metal_target)
-    else:
-        artifact = tl_lower(prim_func, target=metal_target)
+    except (ImportError, ModuleNotFoundError, MSLDispatchUnsupported):
+        raise
+    except Exception as exc:
+        raise MSLDispatchUnsupported(
+            f"tilelang lowering failed: {exc}"
+        ) from exc
 
     grid = [1, 1, 1]
     block = [1, 1, 1]
@@ -622,7 +754,7 @@ def lower_tilelang_to_msl_inline(
     prelude, sig_text, body_text = _split_kernel_msl(msl_text)
     inner = body_text[1:-1]
     body = _inline_tilelang_kernel_body(inner)
-    return TileLangMSLLowering(
+    result = TileLangMSLLowering(
         header=prelude,
         body=body,
         grid=(grid[0], grid[1], grid[2]),
@@ -631,6 +763,13 @@ def lower_tilelang_to_msl_inline(
         buffer_param_names=_parse_buffer_param_names(sig_text),
         kernel_name=_KERNEL_DEF_RE.search(msl_text).group("name"),  # type: ignore[union-attr]
     )
+    if cache_key is not None:
+        _LOWERING_CACHE[cache_key] = result
+        # Pin a strong ref so the cached id() cannot be reused. Bounded by
+        # the number of distinct (prim_func, pass_configs, target) tuples a
+        # process actually exercises, which is small in practice.
+        _LOWERING_CACHE_KEEPALIVE.append(prim_func)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -775,6 +914,18 @@ def _assert_path_c_metal_fp8_intrinsics_registered() -> None:
         )
 
 
+# fix-round-8 (Wave 3 grok-4): cache resolved Target objects keyed on the
+# string spec. Construction parses the spec and instantiates a
+# ``tvm.target.Target``, which is non-trivial. ``lower_tilelang_to_msl_inline``
+# calls this on every lowering; the active set of distinct target strings is
+# tiny (typically just ``"metal"`` and ``"metal -thread_warp_size=32"``), so
+# a 4-entry LRU is more than enough. Non-string inputs bypass the cache
+# (they may be unhashable dicts) and go straight to the slow path.
+@functools.lru_cache(maxsize=4)
+def _as_metal_target_cached(target: str) -> Any:
+    return _as_metal_target_uncached(target)
+
+
 def _as_metal_target(target: Any) -> Any:
     """Coerce a Metal target spec into a form Apache TVM accepts.
 
@@ -787,6 +938,12 @@ def _as_metal_target(target: Any) -> Any:
     error rather than an opaque import failure here.
     """
 
+    if isinstance(target, str):
+        return _as_metal_target_cached(target)
+    return _as_metal_target_uncached(target)
+
+
+def _as_metal_target_uncached(target: Any) -> Any:
     try:
         from tilelang import tvm  # type: ignore
     except Exception:
@@ -837,12 +994,19 @@ def _as_metal_target(target: Any) -> Any:
             return spec
 
 
-# Auto-register intrinsics at module import. Best-effort only — failures
-# here are tolerated so the module imports cleanly on hosts without TVM.
+# Auto-register intrinsics at module import. fix-round-8 (Wave 3 grok-4):
+# narrow the catch from bare ``Exception``. Only import-time errors (TVM
+# / tilelang not installed) and missing-attribute errors (TVM internals
+# moved) are tolerated as "deferred" with a visible warning. Other
+# exception types propagate so they're not silently swallowed at import.
 try:
     _register_path_c_metal_fp8_intrinsics()
-except Exception:
-    pass
+except (ImportError, ModuleNotFoundError, AttributeError) as _register_exc:
+    warnings.warn(
+        f"Path C intrinsic registration deferred: {_register_exc}",
+        RuntimeWarning,
+        stacklevel=2,
+    )
 
 
 __all__ = [
@@ -855,6 +1019,7 @@ __all__ = [
     "_register_path_c_metal_fp8_intrinsics",
     "can_run_metal",
     "dispatch",
+    "ensure_libz3_preloaded",
     "lower_tilelang_to_msl_inline",
     "make_metal_kernel",
     "metal_grid_for_lowering",
