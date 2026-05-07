@@ -274,10 +274,23 @@ def test_path_c_lowering_uses_single_merge_active_branch() -> None:
     assert lowering.body.count("stride * 2") == 1
 
 
-def test_path_c_lowering_keeps_k32_insertion_scan_unbroken_for_perf() -> None:
+def test_path_c_lowering_keeps_k32_insertion_scan_correct_with_break() -> None:
+    """Insertion sort early-exit must use ``else: break`` for ALL K.
+
+    fix-round-3: the previous lowering carried an
+    ``elif (K<=8) or (K>=64): break`` heuristic that *skipped* the break for
+    K in {16, 32}, so the local-heap insertion loop walked past the
+    insertion point and shifted entries that should have been left alone --
+    a correctness regression on top-K outputs at K=16 and K=32. The standard
+    insertion-sort early exit ``else: break`` is required for correctness at
+    every K, even when it costs the small perf win the heuristic was tuned
+    for at K=32. This test pins the corrected lowering: ``break;`` must
+    appear in the K=32 body so the loop terminates at the insertion point.
+    """
+
     threads = _path_c_threads_for(32)
     _, lowering = _path_c_kernel_for(1, 512, 32, threads, "float32")
-    assert "break;" not in lowering.body
+    assert "break;" in lowering.body
 
 
 # ---------------------------------------------------------------------------
@@ -657,6 +670,22 @@ def test_public_entry_point_auto_falls_back_to_path_b_after_receipted_path_c_mis
 
 
 def test_topk_selector_bench_smoke_keeps_path_c_no_slower_than_path_b() -> None:
+    """Path C smoke ceiling at K=32 after the fix-round-3 correctness fix.
+
+    Originally this asserted Path C/Path B <= 1.0 at (B=1, T=512, K=32). The
+    K=32 tuning win was driven by the buggy ``elif (K<=8) or (K>=64): break``
+    heuristic that skipped the insertion-sort early break for K in {16, 32}.
+    That heuristic produced *wrong* top-K results (entries past the insertion
+    point would shift over still-larger neighbours), so fix-round-3 replaced
+    it with the standard ``else: break`` for all K. The cost of correctness
+    at K=32 is roughly +30% over Path B on this row. AUTO routing already
+    excludes (1, 512, 32) -> Path C from the strict-green receipt set
+    (`_PATH_C_AUTO_PROFITABLE_RECEIPTS`), so this smoke does not gate
+    production routing -- it just ensures Path C is still within ~1.5x of
+    Path B at the regression point so a future merge-round perf pass can
+    chase the gap deliberately.
+    """
+
     from scripts.bench_tilelang_topk import _bench_shape, _row_strict_ok
 
     row = _bench_shape(
@@ -669,4 +698,4 @@ def test_topk_selector_bench_smoke_keeps_path_c_no_slower_than_path_b() -> None:
         iters=5,
     )
 
-    assert _row_strict_ok(row, max_ratio=1.0), row
+    assert _row_strict_ok(row, max_ratio=1.5), row

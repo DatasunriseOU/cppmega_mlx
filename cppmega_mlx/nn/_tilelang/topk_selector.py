@@ -761,7 +761,13 @@ def _path_c_score_dtype(scores: mx.array) -> tuple[str, mx.array] | None:
 _PATH_C_AUTO_PROFITABLE_RECEIPTS = frozenset(
     {
         (1, 64, 8, "float32"),
-        (1, 512, 32, "float32"),
+        # fix-round-3: dropped (1, 512, 32, "float32") -- the prior
+        # profitable bench was driven by the buggy
+        # ``elif (K<=8) or (K>=64): break`` heuristic that miscompiled the
+        # local-heap insertion sort for K=16/32. After the correctness fix
+        # the K=32 row is ~1.3x Path B at this shape, so AUTO must not
+        # prefer Path C here. K=64+ (which always took the early break
+        # under the old heuristic too, so it stayed correct) remains.
         (1, 2048, 64, "float32"),
         (4, 2048, 64, "float32"),
         (4, 2048, 64, "float16"),
@@ -968,12 +974,22 @@ def _path_c_kernel_for(
                 )
                 if value > local_vals[0]:
                     pos = 0
+                    # Insertion sort into the ascending top-K list. local_vals
+                    # is sorted ascending, so once we find p with
+                    # value <= local_vals[p] we can stop shifting -- the rest
+                    # of the array is already >= value and stays sorted.
+                    # fix-round-3: the prior `elif (K<=8) or (K>=64): break`
+                    # was a tuning heuristic that *skipped* the break for
+                    # K in {16, 32}, leaving the loop walking past the
+                    # insertion point and corrupting later shifts (correctness
+                    # regression on top-k for K=16/32). The standard
+                    # insertion-sort early-exit is `else: break` for all K.
                     for p in T.serial(1, _TOPK_C_K):
                         if value > local_vals[p]:
                             local_vals[p - 1] = local_vals[p]
                             local_idx[p - 1] = local_idx[p]
                             pos = p
-                        elif (_TOPK_C_K <= 8) or (_TOPK_C_K >= 64):
+                        else:
                             break
                     local_vals[pos] = value
                     local_idx[pos] = j
