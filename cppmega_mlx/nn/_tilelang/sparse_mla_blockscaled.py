@@ -1,5 +1,26 @@
 """Path B port of cppmega's block-scaled (MXFP8) sparse-MLA fwd/bwd TileLang pair.
 
+.. note::
+    **Wave-6 migration deferred.** This module's fwd/bwd kernels are pure
+    raw-MSL strings (``_FP8_FWD/_BWD_KERNEL_SOURCE`` → ``_msl_transform.
+    make_metal_kernel``), with no ``@T.prim_func`` to feed into
+    ``_engine_dispatch.dispatch_lower``. The MSL-extraction adapter
+    (``_msl_extraction.extract_msl_from_engine_artifact``) bridges
+    ``tilelang.compile`` artifacts to ``TileLangMSLLowering``-shaped
+    objects — it does not synthesise MSL from existing strings.
+
+    For QK-only block-scaled scoring there is already a Path-C sister
+    in :mod:`sparse_mla_blockscaled_path_c` (Phase-2 commit ``3017429``)
+    that routes through ``dispatch_lower`` and supports both engine and
+    shim modes. Callers that only need QK scoring + the
+    `qk_reduce` post-pass should prefer the Path-C entry points:
+    :func:`blockscaled_sparse_mla_qk_path_c_status` and
+    :func:`blockscaled_sparse_mla_qk_reduce_path_c`.
+
+    The fused fwd/bwd MXFP8 kernels in this module await a TileLang
+    Path-C rewrite (wave-6+). Until then the raw-MSL implementation
+    stays the only fused path on Apple Metal.
+
 Source attribution
 ------------------
 

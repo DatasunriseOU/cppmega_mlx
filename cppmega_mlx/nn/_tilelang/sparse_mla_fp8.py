@@ -1,5 +1,25 @@
 """Path B port of cppmega's FP8 sparse-MLA fwd/bwd TileLang pair.
 
+.. note::
+    **Wave-6 migration deferred — FP8 factory blocker.** This module's
+    fwd/bwd kernels are pure raw-MSL strings (``_FP8_FWD/_BWD_KERNEL_SOURCE``
+    → ``_msl_transform.make_metal_kernel``), with no ``@T.prim_func`` to
+    feed into ``_engine_dispatch.dispatch_lower``. There is no Path-C
+    sister: the kernel's whole point is inline ``e4m3`` byte-level
+    dequantisation that has no TileLang DSL equivalent until
+    ``simdgroup_a_fp8`` / ``simdgroup_b_fp8`` ``Fragment`` factories
+    land in ``tilelang/language/extern.py`` AND Apple ships a
+    documented MSL ``float8`` ``simdgroup_matrix`` MMA path.
+
+    Same blocker as :mod:`fp8_msl_kernels` and
+    :mod:`fp8_vecmat_path_c` (the latter routes through ``dispatch_lower``
+    for non-FP8 surrounds and falls back to Path-B FP8 inner). Track the
+    factory work in the migration plan §"FP8 SIMDgroup factories" item.
+
+    Until that lands the raw-MSL kernel here is the only Apple-Metal
+    fused FP8 sparse-MLA path. Public API stays stable so the 4 mlx call
+    sites keep working unchanged.
+
 Source attribution
 ------------------
 
