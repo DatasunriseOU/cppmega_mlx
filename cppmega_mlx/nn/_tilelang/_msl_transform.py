@@ -47,6 +47,15 @@ from typing import Any, Callable, Sequence, cast
 import mlx.core as mx
 
 
+# fix-round-7 finding-5: test-only candidate injection point. Production code
+# leaves this empty; tests that need to load a libz3 from a non-default path
+# (e.g., the in-tree dev tree at ``/tmp/tl_apache_tvm_swap``) populate this
+# list in ``conftest.py``. Replaces the prior approach of hard-coding the
+# /tmp candidate behind ``CPPMEGA_ALLOW_UNSAFE_LIBZ3=1`` — production never
+# touches /tmp now, removing the world-writable-dylib attack surface entirely.
+_LIBZ3_DEV_CANDIDATES: list[_Path] = []
+
+
 def _preload_libz3_for_dev_tilelang() -> None:
     """Preload ``libz3.dylib`` so dev-build ``libtilelang.dylib`` can dlopen.
 
@@ -66,6 +75,14 @@ def _preload_libz3_for_dev_tilelang() -> None:
 
     if getattr(_preload_libz3_for_dev_tilelang, "_done", False):
         return
+    # fix-round-7 finding-6: defensive Darwin-only guard inside the function
+    # itself. The module-level call site below already gates on
+    # ``sys.platform == "darwin"``, but a future caller (e.g., a unit test
+    # invoking the preload directly to reset its state) could otherwise
+    # re-enter this on Linux/Windows where the dlopen-by-basename problem
+    # this routine works around does not apply.
+    if sys.platform != "darwin":
+        return
     # fix-round-4: bail after a small number of full-sweep failures so we
     # don't keep retrying every candidate (and re-stat'ing every path) on
     # every Path C dispatch when libz3 genuinely isn't present.
@@ -84,29 +101,19 @@ def _preload_libz3_for_dev_tilelang() -> None:
         root = os.environ.get(env_var)
         if root:
             candidates.append(_Path(root) / "build" / "lib" / "libz3.dylib")
-    # Last-resort: a checkout layout used by recent benches. /tmp is
-    # world-writable on Unix, so loading a dylib from there is an arbitrary
-    # code execution risk if an attacker plants a malicious libz3.dylib.
-    # fix-round-5: gate behind opt-in env var; production never sets this.
-    # TOCTOU note (fix-round-5, finding 4): we check exists() then dlopen,
-    # leaving a small race window where a candidate path could be swapped
-    # between the stat and the load. Acceptable for the dev/bench-only
-    # paths that survive the gating above (env-rooted dirs the developer
-    # controls, or /opt/homebrew which is root-owned), and the /tmp
-    # candidate is now opt-in. Not fixing the race here — would require
-    # fd-based loading (dlopen has no by-fd variant on macOS).
-    if os.environ.get("CPPMEGA_ALLOW_UNSAFE_LIBZ3") == "1":
-        import warnings as _warnings
-
-        _warnings.warn(
-            "CPPMEGA_ALLOW_UNSAFE_LIBZ3=1 set; including world-writable "
-            "/tmp/tl_apache_tvm_swap/build/lib in libz3 preload candidates. "
-            "This is unsafe outside dev environments — an attacker who can "
-            "write to /tmp could plant a malicious libz3.dylib that gets "
-            "loaded into the process.",
-            stacklevel=2,
-        )
-        candidates.append(_Path("/tmp/tl_apache_tvm_swap/build/lib/libz3.dylib"))
+    # fix-round-7 finding-5: production code no longer hard-codes any
+    # world-writable path (previously /tmp/tl_apache_tvm_swap was added
+    # behind ``CPPMEGA_ALLOW_UNSAFE_LIBZ3=1``, but conftest.py forced that
+    # env var ON for tests, which inverted the security boundary —
+    # production processes that happened to inherit the env from a parent
+    # would silently load a /tmp dylib). Tests that need a non-default
+    # candidate now inject it explicitly via ``_LIBZ3_DEV_CANDIDATES`` (see
+    # tests/conftest.py); production keeps an empty list.
+    # TOCTOU note: exists() → dlopen has a small race; non-mitigatable on
+    # macOS without fd-based dlopen. The remaining candidates are env-rooted
+    # (dev controls them) or /opt/homebrew (root-owned), so the surface is
+    # bounded. The previous /tmp path is removed entirely.
+    candidates.extend(_LIBZ3_DEV_CANDIDATES)
     # Brew-installed z3 (works as a basename-resolution fallback).
     candidates.append(_Path("/opt/homebrew/lib/libz3.dylib"))
 
