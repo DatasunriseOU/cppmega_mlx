@@ -66,6 +66,13 @@ def _preload_libz3_for_dev_tilelang() -> None:
 
     if getattr(_preload_libz3_for_dev_tilelang, "_done", False):
         return
+    # fix-round-4: bail after a small number of full-sweep failures so we
+    # don't keep retrying every candidate (and re-stat'ing every path) on
+    # every Path C dispatch when libz3 genuinely isn't present.
+    _MAX_FAILED_ATTEMPTS = 3
+    failed = getattr(_preload_libz3_for_dev_tilelang, "_failed_attempts", 0)
+    if failed >= _MAX_FAILED_ATTEMPTS:
+        return
 
     candidates: list[_Path] = []
     dev_build_root = os.environ.get("TILELANG_DEV_BUILD_ROOT")
@@ -86,12 +93,16 @@ def _preload_libz3_for_dev_tilelang() -> None:
         try:
             if candidate.exists():
                 ctypes.CDLL(str(candidate), ctypes.RTLD_GLOBAL)
+                # Set _done only AFTER the dlopen actually succeeds.
                 _preload_libz3_for_dev_tilelang._done = True  # type: ignore[attr-defined]
                 return
         except OSError:
             continue
-    # No candidate succeeded — leave _done unset; callers will still see the
-    # original tilelang import error which is the most useful diagnostic.
+    # No candidate succeeded — bump the failed-attempts counter so we'll
+    # stop retrying once we've tried enough times. _done stays unset so that
+    # if the env later changes (e.g., user sets TILELANG_DEV_BUILD_ROOT) we
+    # can still pick up a real lib up to the attempt cap.
+    _preload_libz3_for_dev_tilelang._failed_attempts = failed + 1  # type: ignore[attr-defined]
 
 
 # Run the preload eagerly on Darwin so any ``import tilelang`` triggered by
