@@ -6,6 +6,19 @@ This module implements the M2RNN per-token recurrence in vendor MSL via
 :func:cppmega_mlx.nn.m2rnn.m2rnn_scan (the parity oracle) but does not
 modify it.
 
+TODO(wave-7): unified-pipeline migration deferred — both _FWD_KERNEL and
+_BWD_KERNEL are hand-written MSL constructed via
+``_msl_transform.make_metal_kernel`` (no ``@T.prim_func`` to feed
+``dispatch_lower``). The MSL-extraction adapter (commit 00d6d90) only
+applies to ``tilelang.engine.lower(prim, target)`` artifacts, which is the
+inverse direction. Migrating m2rnn to the unified pipeline therefore
+requires a full TileLang DSL rewrite of both the forward scan (per-kk row-
+of-h fragment + threadgroup-shared W + ``T.serial(S)``) and the backward
+two-pass walk (forward sweep persisting h_{t-1} to scratch, backward time
+loop with cross-thread dW reduction). All required TileLang primitives
+exist; the blocker is the size of the rewrite. See per-kernel TODO blocks
+on _FWD_KERNEL and _BWD_KERNEL below.
+
 Recurrence (per (batch, head) lane, looping over seq):
     z_t   = h_{t-1} @ W + outer(k_t, v_t)
     h_new = tanh(z_t)
@@ -58,6 +71,33 @@ class M2RNNMetalStatus:
 # ---------------------------------------------------------------------------
 # Forward MSL kernel
 # ---------------------------------------------------------------------------
+#
+# TODO(wave-7): port to TileLang DSL — complex-fused.
+#
+# This kernel is hand-written MSL constructed via
+# ``_msl_transform.make_metal_kernel(name=..., source=..., header=...)``,
+# not via ``_msl_transform.lower_tilelang_to_msl_inline(@T.prim_func)``.
+# The MSL-extraction adapter (`_msl_extraction.extract_msl_from_engine_artifact`
+# landed in commit 00d6d90) converts ``@T.prim_func`` engine artifacts INTO
+# MSL — the inverse direction — so it does not apply here. To route this
+# kernel through ``dispatch_lower(prim, target)`` we need a full TileLang
+# DSL rewrite carrying:
+#
+#   * per-kk row-of-h register state (size V scalars per thread, no
+#     cross-thread reduction during matmul) — expressible as
+#     ``T.alloc_fragment((V,), accum_dtype)``;
+#   * threadgroup-shared ``W`` tile (V*V) loaded once per (b,h) lane —
+#     ``T.alloc_shared((V_DIM, V_DIM))``;
+#   * sequential time loop with persistent ``h`` carried across steps —
+#     ``T.serial(S)`` with the fragment surviving across iterations;
+#   * cross-thread reduction over kk for ``y`` per step — TileLang already
+#     supports threadgroup-shared accumulator + barrier;
+#   * ``tanh_cache`` write per step ([B,S,H,K,V]) for bwd.
+#
+# Each piece is supported individually; the blocker is just the size of
+# the rewrite (and the bwd kernel below has the same shape but inverted).
+# Port deferred until at least one production caller demands the unified
+# CUDA + Metal lowering.
 #
 # Parallelism strategy:
 #   - One threadgroup per (batch, head) lane.
@@ -218,6 +258,16 @@ _FWD_KERNEL = _msl_transform.make_metal_kernel(
 # ---------------------------------------------------------------------------
 # Backward MSL kernel
 # ---------------------------------------------------------------------------
+#
+# TODO(wave-7): port to TileLang DSL — complex-fused (same blocker as fwd).
+#
+# This kernel walks the time loop both forward (Pass 1: persist h_{t-1} to
+# scratch) and backward (Pass 2: cross-thread reductions over kk for dv and
+# dW). To migrate, both passes must move into a single ``@T.prim_func`` with
+# ``T.serial(S)`` (forward) followed by a second ``T.serial(S)`` reading the
+# scratch in reverse. The cross-thread dW reduction maps to
+# ``T.alloc_shared((V_DIM, V_DIM))`` + barrier, which TileLang supports.
+# Same scope-of-rewrite reason as the fwd kernel.
 #
 # Parallelism strategy (mirrors fwd):
 #   - One threadgroup per (batch, head) lane.
