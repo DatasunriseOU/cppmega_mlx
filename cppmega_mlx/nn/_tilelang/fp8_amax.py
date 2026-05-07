@@ -56,12 +56,26 @@ API surface
 
 from __future__ import annotations
 
+import threading
 import types
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, cast
 
 import torch
+
+
+# Wave-9 #6: serialise concurrent JIT compile of fp8_amax / fp8_quantize
+# kernels. ``_expose_to_globals`` mutates ``make_fp8_amax_kernel.__globals__``
+# (the *module* globals dict) in place to expose closure-rebound names
+# (``N``, ``DTYPE``, ``BLOCK``, ``FP8_MAX``) to ``typing.get_type_hints``
+# during ``@T.prim_func`` decoration. Two threads compiling kernels for
+# different ``(n, dtype)`` combos race on this dict and on the
+# ``functools.lru_cache`` slot insertion (``lru_cache`` is not thread-safe
+# under concurrent miss + insert). Both ``_amax_kernel_for`` and
+# ``_quantize_kernel_for`` share a single lock because they both write the
+# same module-globals slots (``N``, ``BLOCK``, ``DTYPE``).
+_FP8_AMAX_LOCK = threading.Lock()
 
 
 def _expose_to_globals(fn: Any, extra_globals: dict[str, Any]) -> Any:
@@ -457,18 +471,27 @@ def _amax_kernel_for(bucket_n: int, in_dtype: str, target: str) -> Any:
     shapes share a single compiled kernel. The dispatcher pads the input
     with zeros up to ``bucket_n`` before launching; ``amax(0) = 0`` is the
     identity for ``max`` so the result is unchanged.
+
+    Wave-9 #6: serialised under ``_FP8_AMAX_LOCK`` because the inner
+    ``make_fp8_amax_kernel`` call mutates ``__globals__`` in place via
+    ``_expose_to_globals``. ``functools.lru_cache`` already deduplicates
+    by key but does *not* serialise concurrent misses; so two threads
+    with the same ``(bucket_n, in_dtype, target)`` may both enter the
+    body and stomp each other's globals before either ``@T.prim_func``
+    completes.
     """
 
     from cppmega_mlx.nn._tilelang._engine_dispatch import dispatch_lower
 
-    block, threads = _pick_block_size(target, bucket_n)
-    prim = make_fp8_amax_kernel(
-        n_elements=bucket_n,
-        in_dtype=in_dtype,
-        block_size=block,
-        threads=threads,
-    )
-    return dispatch_lower(prim, target)
+    with _FP8_AMAX_LOCK:
+        block, threads = _pick_block_size(target, bucket_n)
+        prim = make_fp8_amax_kernel(
+            n_elements=bucket_n,
+            in_dtype=in_dtype,
+            block_size=block,
+            threads=threads,
+        )
+        return dispatch_lower(prim, target)
 
 
 @lru_cache(maxsize=256)
@@ -479,18 +502,23 @@ def _quantize_kernel_for(n_elements: int, in_dtype: str, target: str) -> Any:
     element ``Y[gi]`` write means the kernel must own exactly ``n_elements``
     output slots. Cache size is bumped to ``256`` to cover realistic LLM
     training rotations without thrashing.
+
+    Wave-9 #6: serialised under the same ``_FP8_AMAX_LOCK`` as
+    :func:`_amax_kernel_for`; both write the same module-globals slots
+    (``N``, ``BLOCK``, ``DTYPE``) and so cannot run concurrently.
     """
 
     from cppmega_mlx.nn._tilelang._engine_dispatch import dispatch_lower
 
-    block, threads = _pick_block_size(target, n_elements)
-    prim = make_fp8_quantize_kernel(
-        n_elements=n_elements,
-        in_dtype=in_dtype,
-        block_size=block,
-        threads=threads,
-    )
-    return dispatch_lower(prim, target)
+    with _FP8_AMAX_LOCK:
+        block, threads = _pick_block_size(target, n_elements)
+        prim = make_fp8_quantize_kernel(
+            n_elements=n_elements,
+            in_dtype=in_dtype,
+            block_size=block,
+            threads=threads,
+        )
+        return dispatch_lower(prim, target)
 
 
 _TORCH_DTYPE_TO_TL: dict[torch.dtype, str] = {
