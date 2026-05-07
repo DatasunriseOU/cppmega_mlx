@@ -296,10 +296,17 @@ def make_fp8_amax_kernel(
 
     N = n_elements
     BLOCK = block_size
+    # Rebind in_dtype to a local var so the tilelang PrimFunc annotation parser
+    # picks it up via the inner function's closure cell (CPython only creates
+    # closure cells for names that are *bound* in the enclosing scope; outer
+    # parameters that are read but never rebound here would not become cells
+    # under some tilelang parser code paths). Mirrors the N = n_elements
+    # pattern above. See wave-7 bugfix #1 (NameError 'in_dtype' is not defined).
+    DTYPE = in_dtype
 
     @T.prim_func
     def fp8_amax_reduce(
-        X: T.Tensor((N,), in_dtype),
+        X: T.Tensor((N,), DTYPE),
         Amax: T.Tensor((1,), "float32"),
     ):
         with T.Kernel(T.ceildiv(N, BLOCK), threads=threads) as bx:
@@ -372,10 +379,12 @@ def make_fp8_quantize_kernel(
     N = n_elements
     BLOCK = block_size
     FP8_MAX = _FP8_E4M3_MAX
+    # See _amax_kernel_for closure note above.
+    DTYPE = in_dtype
 
     @T.prim_func
     def fp8_quantize_e4m3(
-        X: T.Tensor((N,), in_dtype),
+        X: T.Tensor((N,), DTYPE),
         InvScale: T.Tensor((1,), "float32"),
         Y: T.Tensor((N,), "float8_e4m3"),
     ):
