@@ -953,6 +953,12 @@ _LOWERING_CACHE_KEEPALIVE: collections.OrderedDict[
 ] = collections.OrderedDict()
 
 
+# Phase-2 migration: emit a one-shot DeprecationWarning when callers reach the
+# legacy MSL-inline lowering. New callers should route through
+# ``cppmega_mlx.nn._tilelang.dispatch_lower(prim, target)`` instead.
+_DEPRECATION_WARNED: bool = False
+
+
 # Sentinel returned by ``_freeze_for_hash`` when no stable serialization is
 # possible. ``_lowering_cache_key`` propagates this as ``None`` and the
 # lowering call site falls through to the uncached slow path. Trade-off
@@ -1130,17 +1136,18 @@ def lower_tilelang_to_msl_inline(
     candidate key is registered with the active ``libtilelang`` build.
     """
 
-    # fix-round-8 (Wave 3 grok-4): cache lookup. Lowering re-runs a full TVM
-    # pipeline plus several regex passes over the emitted MSL — Path C bench
-    # paths re-enter this for every shape probe, and shipping inference
-    # likely calls it on each kernel-factory invocation. The cache key uses
-    # id(prim_func) (see _lowering_cache_key for the rationale) plus the
-    # frozenset of pass_configs and the target string. If the inputs aren't
-    # hashable for any reason, _lowering_cache_key returns None and we fall
-    # through to the uncached slow path.
-    # Wave 5 grok finding #5: ``cache_key`` is None when pass_configs contains
-    # a value that has no stable serialization — skip caching entirely on that
-    # call rather than risk a non-deterministic key collision.
+    global _DEPRECATION_WARNED
+    if not _DEPRECATION_WARNED:
+        import warnings
+        warnings.warn(
+            "lower_tilelang_to_msl_inline is deprecated; use "
+            "cppmega_mlx.nn._tilelang.dispatch_lower(prim, target) instead. "
+            "Will be removed in v0.x.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        _DEPRECATION_WARNED = True
+
     cache_key = _lowering_cache_key(prim_func, target, pass_configs)
     if cache_key is not None:
         cached = _LOWERING_CACHE.get(cache_key)
