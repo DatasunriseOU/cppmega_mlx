@@ -198,6 +198,90 @@ kernel void vector_add_kernel(
     assert "arg.n_elements[0]" in adapter.body
 
 
+def test_rewrite_blockidx_to_thread_position_in_grid() -> None:
+    """``blockIdx``/``threadIdx`` identifiers are rewritten to MLX builtins.
+
+    TileLang emits CUDA-style scalar names (``uint blockIdx
+    [[threadgroup_position_in_grid]]``) and references them as bare
+    ``blockIdx`` tokens in the body. ``mx.fast.metal_kernel`` rebuilds
+    the signature itself and only injects MLX's own ``uint3``-typed
+    builtins, so the rewrite must substitute the body identifier.
+    """
+    from cppmega_mlx.nn._tilelang._mlx_runtime import (
+        _rewrite_tilelang_metal_to_mlx,
+    )
+
+    src = """
+kernel void k(
+    device float* arg0 [[ buffer(0) ]],
+    uint blockIdx [[threadgroup_position_in_grid]],
+    uint threadIdx [[thread_position_in_threadgroup]]
+) {
+    int x = ((int)blockIdx) * 256;
+    int y = ((int)threadIdx);
+    arg0[x + y] = 0.0f;
+}
+"""
+    out = _rewrite_tilelang_metal_to_mlx(src)
+    # Both CUDA identifiers must be replaced with the MLX-injected forms.
+    assert "((int)threadgroup_position_in_grid.x)" in out
+    assert "((int)thread_position_in_threadgroup.x)" in out
+    # The bare CUDA tokens must NOT survive in the body. (They survive in
+    # the signature attribute names ``[[threadgroup_position_in_grid]]``,
+    # which is fine because the signature is rebuilt by MLX from
+    # input_names/output_names anyway -- the identifier rewrite only
+    # affects body references.)
+    # We expect zero occurrences of the bare ``blockIdx``/``threadIdx``
+    # tokens (whole-word) outside the signature attribute markers.
+    import re as _re
+
+    body_section = out.split("{", 1)[1] if "{" in out else out
+    assert not _re.search(r"\bblockIdx\b", body_section)
+    assert not _re.search(r"\bthreadIdx\b", body_section)
+
+
+def test_rewrite_inlines_args_struct_fields() -> None:
+    """``arg.<field>[0]`` accesses are inlined to integer literals.
+
+    TileLang packs scalar runtime args into a ``<kernel>_args_t`` struct
+    (e.g. ``int n_elements[2]``) and references them as ``arg.n_elements[0]``
+    in the body. ``mx.fast.metal_kernel`` does NOT carry that struct
+    parameter into its rebuilt signature, so the rewrite must substitute
+    each field access with a literal value supplied by the caller.
+    """
+    from cppmega_mlx.nn._tilelang._mlx_runtime import (
+        _rewrite_tilelang_metal_to_mlx,
+    )
+
+    src = """
+struct k_args_t {
+  int n_elements[2];
+  int gridDim_0[2];
+};
+
+kernel void k(
+    device float* arg0 [[ buffer(0) ]],
+    constant k_args_t& arg [[ buffer(1) ]]
+) {
+    if (some_id < arg.n_elements[0]) {
+        arg0[some_id] = (float)arg.gridDim_0[0];
+    }
+}
+"""
+    out = _rewrite_tilelang_metal_to_mlx(
+        src, args_struct_inline={"n_elements": 256, "gridDim_0": 1}
+    )
+    # The field accesses are substituted with their integer values.
+    assert "256" in out
+    assert "(float)1" in out
+    # The args struct parameter declaration is dropped from the kernel
+    # signature (MLX rebuilds the signature itself).
+    assert "k_args_t" not in out.split("{", 2)[1]  # signature region
+    # No ``arg.<field>`` accesses survive when an inline value is given.
+    assert "arg.n_elements" not in out
+    assert "arg.gridDim_0" not in out
+
+
 def test_wrap_skips_cleanly_when_mlx_unavailable() -> None:
     """When mlx.fast.metal_kernel is missing, build() raises MLXRuntimeError.
 

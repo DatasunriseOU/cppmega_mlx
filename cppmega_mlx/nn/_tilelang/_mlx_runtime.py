@@ -38,6 +38,7 @@ from typing import Any, Callable, Sequence
 __all__ = [
     "MLXRuntimeError",
     "TileLangMetalAdapter",
+    "_rewrite_tilelang_metal_to_mlx",
     "wrap_tilelang_metal_kernel",
 ]
 
@@ -282,6 +283,105 @@ def _rename_identifiers_in_code(
 
 
 # ---------------------------------------------------------------------------
+# CUDA-style identifier rewrite for MLX
+# ---------------------------------------------------------------------------
+
+
+# Map from TileLang's CUDA-style scalar builtin identifiers (declared in the
+# emitted kernel signature as ``uint blockIdx [[threadgroup_position_in_grid]]``
+# and ``uint threadIdx [[thread_position_in_threadgroup]]``) to the
+# expressions ``mx.fast.metal_kernel`` injects into the body scope. MLX
+# always provides the *vector* form (``uint3``) of the position builtins,
+# so we substitute with the ``.x`` component to preserve the original
+# scalar semantics. Callers that need the y/z components can extend this
+# table; for the conformance harness only the .x slice is used.
+_CUDA_BUILTIN_REWRITE: dict[str, str] = {
+    "blockIdx": "threadgroup_position_in_grid.x",
+    "threadIdx": "thread_position_in_threadgroup.x",
+}
+
+
+_ARGS_STRUCT_DECL_RE = re.compile(
+    r"\bconstant\s+\w+_args_t\s*&\s*arg\s*\[\[\s*buffer\s*\(\s*\d+\s*\)\s*\]\]"
+    r"\s*,?\s*",
+    re.MULTILINE,
+)
+
+
+def _rewrite_tilelang_metal_to_mlx(
+    source: str,
+    *,
+    args_struct_inline: dict[str, Any] | None = None,
+) -> str:
+    """Rewrite TileLang's CUDA-style Metal source for ``mx.fast.metal_kernel``.
+
+    TileLang's Metal emitter produces a kernel that
+
+    1. declares ``uint blockIdx [[threadgroup_position_in_grid]]`` and
+       ``uint threadIdx [[thread_position_in_threadgroup]]`` as scalar
+       params, then references them as bare ``blockIdx`` / ``threadIdx``
+       identifiers in the body, and
+    2. accepts a ``constant <kernel>_args_t& arg [[buffer(N)]]`` struct
+       holding scalar runtime args (e.g. ``arg.arg3[0]`` for
+       ``n_elements``).
+
+    ``mx.fast.metal_kernel`` rebuilds the kernel signature itself from
+    ``input_names`` / ``output_names`` and only injects MLX's own builtin
+    bindings (``thread_position_in_grid``, ``thread_position_in_threadgroup``
+    -- both ``uint3``) into the body scope. The kernel-author-declared
+    ``blockIdx`` / ``threadIdx`` / ``arg`` parameters do NOT survive that
+    rebuild, so any reference to them is an undeclared-identifier error
+    when MLX hands the source to Metal's compiler.
+
+    This rewrite bridges the gap textually:
+
+    * ``blockIdx``/``threadIdx`` identifiers (bare or inside casts like
+      ``((int)blockIdx)``) become ``threadgroup_position_in_grid.x`` /
+      ``thread_position_in_threadgroup.x``.
+    * ``arg.<field>[0]`` accesses are inlined to the integer values from
+      ``args_struct_inline`` (mapping field name -> int). When a field has
+      no inline value, we leave the access alone and let the caller see
+      the resulting compile error -- silently dropping the access would
+      hide a real configuration bug.
+
+    Whole-token substitution is used (``\\b`` boundaries) so identifiers
+    like ``arg0``/``arg1`` (the renamed user buffers) are never confused
+    with the scalar-args struct ``arg``.
+    """
+
+    args_struct_inline = args_struct_inline or {}
+
+    # 1) Inline the args-struct field accesses BEFORE we drop the struct
+    # parameter declaration, so we don't lose the field-name information.
+    # Pattern: ``arg.<field>[<index>]`` -- TileLang emits each int field as
+    # a ``int <field>[2]`` array, with the value at index 0.
+    def _inline_field(match: "re.Match[str]") -> str:
+        field = match.group("field")
+        idx = match.group("idx")
+        if field in args_struct_inline and idx == "0":
+            return str(int(args_struct_inline[field]))
+        return match.group(0)
+
+    source = re.sub(
+        r"\barg\.(?P<field>[A-Za-z_]\w*)\s*\[\s*(?P<idx>\d+)\s*\]",
+        _inline_field,
+        source,
+    )
+
+    # 2) Rewrite CUDA-style builtin identifiers via whole-token substitution.
+    source = _rename_identifiers_in_code(source, _CUDA_BUILTIN_REWRITE)
+
+    # 3) Drop the ``constant <kernel>_args_t& arg [[buffer(N)]]`` parameter
+    # from the kernel signature. ``mx.fast.metal_kernel`` synthesizes its
+    # own signature, so leaving this declaration in produces a duplicate-
+    # parameter error when we splice the body. We do this last so the
+    # field-inlining step above sees the original identifiers.
+    source = _ARGS_STRUCT_DECL_RE.sub("", source)
+
+    return source
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -369,6 +469,7 @@ def wrap_tilelang_metal_kernel(
     input_count: int,
     output_count: int,
     name: str | None = None,
+    args_struct_inline: dict[str, Any] | None = None,
 ) -> TileLangMetalAdapter:
     """Adapt a TileLang Metal artifact for ``mx.fast.metal_kernel``.
 
@@ -397,6 +498,16 @@ def wrap_tilelang_metal_kernel(
         raise MLXRuntimeError("kernel must have at least one buffer parameter")
 
     src = _extract_kernel_source(artifact)
+    # Rewrite CUDA-style identifiers and inline scalar-args struct accesses
+    # BEFORE we split the kernel: the rewrite drops the ``_args_t& arg``
+    # parameter from the signature and substitutes ``arg.<field>[0]`` in
+    # the body, which both must happen before ``_parse_buffer_param_names``
+    # runs (so the args struct is gone from the signature) and before the
+    # buffer-rename step (so we don't accidentally rename ``blockIdx``
+    # away while it still looks like a CUDA identifier).
+    src = _rewrite_tilelang_metal_to_mlx(
+        src, args_struct_inline=args_struct_inline
+    )
     prelude, kernel_name, signature, body = _split_kernel(src)
 
     buffer_names = _parse_buffer_param_names(signature)
