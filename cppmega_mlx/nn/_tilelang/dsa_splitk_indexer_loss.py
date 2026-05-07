@@ -102,11 +102,22 @@ API surface
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, cast
 
 import torch
+
+
+# Wave-4 perf #1: validation in dsa_splitk_indexer_loss_tilelang's
+# sparse_loss path forces full GPU->CPU syncs (.item()/.all()) on every
+# forward. In production we skip those checks; opt in via CPPMEGA_MLX_DSA_DEBUG
+# (CI / regression tests / first-run sanity). Bounds violations would silently
+# scatter into adjacent memory, so we keep the option explicit but cheap-to-
+# enable rather than always-on.
+def _dsa_debug_enabled() -> bool:
+    return os.environ.get("CPPMEGA_MLX_DSA_DEBUG", "").lower() in {"1", "true", "yes", "on"}
 
 
 # ---------------------------------------------------------------------------
@@ -286,6 +297,7 @@ def make_dsa_splitk_stage1_kernel(
     BLOCK_D: int = _DSA_STAGE1_BLOCK_D,
     threads: int = _DSA_STAGE1_THREADS,
     num_stages: int = _DSA_STAGE1_NUM_STAGES,
+    compute_index_path: bool = True,
 ) -> Any:
     """Build a shape-specialized stage-1 online-softmax statistics kernel.
 
@@ -338,6 +350,13 @@ def make_dsa_splitk_stage1_kernel(
     SK_TILES = (Sk + BLOCK_SK - 1) // BLOCK_SK
     SCALE = float(softmax_scale)
     SPARSE = bool(sparse_loss)
+    # Wave-4 perf #3: compute_index_path is a build-time flag. When False, the
+    # idx_scores_f / m1_i / d1_i fragments shrink to (1,) stubs and the
+    # ``if h == 0`` index-softmax block is Python-guarded out, eliminating its
+    # register pressure on all AH blocks (vs. paying it for AH-1 unused
+    # blocks before). The wrapper pairs compute_index_path=False with a
+    # separate, smaller stage-1-idx kernel that runs only for h=0.
+    COMPUTE_INDEX = bool(compute_index_path)
 
     @T.prim_func
     def dsa_stage1(
@@ -370,17 +389,29 @@ def make_dsa_splitk_stage1_kernel(
             m_i = T.alloc_fragment((BLOCK_SQ,), "float32")
             d_i = T.alloc_fragment((BLOCK_SQ,), "float32")
             m_i_prev = T.alloc_fragment((BLOCK_SQ,), "float32")
-            m1_i = T.alloc_fragment((BLOCK_SQ,), "float32")
-            d1_i = T.alloc_fragment((BLOCK_SQ,), "float32")
-            m1_i_prev = T.alloc_fragment((BLOCK_SQ,), "float32")
-            idx_scores_f = T.alloc_fragment((BLOCK_SQ, BLOCK_SK), "float32")
+            # Wave-4 perf #3: shrink the index-softmax fragments to size-1
+            # stubs when compute_index_path=False so the AH-1 attn-only
+            # head blocks no longer pay register pressure for buffers they
+            # never touch. The if-guards below make the stub allocations
+            # safe (no read or write reaches them when COMPUTE_INDEX is False).
+            if COMPUTE_INDEX:
+                m1_i = T.alloc_fragment((BLOCK_SQ,), "float32")
+                d1_i = T.alloc_fragment((BLOCK_SQ,), "float32")
+                m1_i_prev = T.alloc_fragment((BLOCK_SQ,), "float32")
+                idx_scores_f = T.alloc_fragment((BLOCK_SQ, BLOCK_SK), "float32")
+            else:
+                m1_i = T.alloc_fragment((1,), "float32")
+                d1_i = T.alloc_fragment((1,), "float32")
+                m1_i_prev = T.alloc_fragment((1,), "float32")
+                idx_scores_f = T.alloc_fragment((1, 1), "float32")
 
-            # Initialise the index-softmax accumulators (head 0 only writes
-            # them out at the end, but we keep the registers live for all
-            # heads to keep the kernel structure uniform).
-            for i in T.Parallel(BLOCK_SQ):
-                m1_i[i] = T.cast(-3.4028234663852886e38, "float32")
-                d1_i[i] = T.cast(0, "float32")
+            # Initialise the index-softmax accumulators. Wave-4 perf #3:
+            # only when COMPUTE_INDEX (else the stub fragments are never
+            # read/written -- skip the init too).
+            if COMPUTE_INDEX:
+                for i in T.Parallel(BLOCK_SQ):
+                    m1_i[i] = T.cast(-3.4028234663852886e38, "float32")
+                    d1_i[i] = T.cast(0, "float32")
 
             # Initialise the attention online-softmax accumulators.
             for i in T.Parallel(BLOCK_SQ):
@@ -484,7 +515,12 @@ def make_dsa_splitk_stage1_kernel(
                     d_i[i] = d_i[i] * T.exp(m_i_prev[i] - m_i[i]) + row_sum_local[i]
 
                 # Head-0 path: accumulate the index_scores online softmax too.
-                if h == 0:
+                # Wave-4 perf #3: completely Python-time guarded out when
+                # COMPUTE_INDEX is False (the wrapper handles M1/D1 via a
+                # separate dedicated kernel). This drops not only the writes
+                # but also the IndexScores HBM traffic + reduce_max/reduce_sum
+                # for AH-1 head blocks that don't need the index path.
+                if COMPUTE_INDEX and h == 0:
                     # Wave-2 P0 fix (grok finding #5): mirror the ``scores_f``
                     # zeroing pattern with an explicit -INF prime *before* the
                     # per-position load. The if/else below already writes every
@@ -707,8 +743,30 @@ def make_dsa_splitk_stage2_kernel(
             )
             # Wave-3 (grok perf #1): partial Q hoist landed below (per-(sk_tile,
             # h) full slab into Q_full, d_tile reads shared). Full hoist out of
-            # the sk_tile loop is still TODO -- it would require restructuring
-            # the heads-summed softmax_attn accumulator, see Q_full comment.
+            # the sk_tile loop remains structurally hard:
+            #
+            #   Current: for sk_tile: { softmax_attn=0; for h: { Q[h] reload from
+            #     HBM; matmul; accum into softmax_attn }; emit per-tile output }
+            #
+            #   Naive swap (h outermost) would load Q[h] AH times instead of
+            #   AH*SK_TILES times, but breaks the accumulator: softmax_attn is
+            #   summed across heads PER (i,j,sk_tile), and per-tile emission
+            #   needs the head-summed value. Swapping requires either:
+            #     (a) Persisting softmax_attn[BLOCK_SQ, Sk] across heads
+            #         (= 128*4096*4B = 2 MB shared / threadgroup -- way over
+            #         Metal's 32 KB and CUDA's 100 KB budgets);
+            #     (b) Writing partial softmax_attn to HBM between heads and
+            #         atomic-adding (replaces ~AH*SK_TILES Q reads with
+            #         AH*SK_TILES writes + reads of softmax_attn -- usually
+            #         worse since softmax_attn is fp32 vs Q which can be fp16);
+            #     (c) Online cross-head softmax recurrence (similar shape to
+            #         FlashAttention v2 but across the head axis instead of
+            #         the K axis -- nontrivial restructure of the kernel).
+            #
+            # Path (c) is the right wave-5 fix; current (partial hoist) is the
+            # local optimum without that restructure. Q reload ratio relative
+            # to optimal is AH*SK_TILES / AH = SK_TILES (~128 on Metal, larger
+            # on CUDA): noticeable but bounded.
             for sk_tile in T.Pipelined(_active_sk_tiles, num_stages=num_stages):
                 # Zero softmax_attn for this tile (we accumulate over heads).
                 for i, j in T.Parallel(BLOCK_SQ, BLOCK_SK):
@@ -1065,8 +1123,14 @@ def dsa_splitk_indexer_loss_tilelang(
         # Wave-1b fix-round-2 (MED sec): bounds-check topk_idx64 before
         # scatter_. PyTorch's CUDA scatter_ wraps negatives but does NOT
         # check the upper bound in release builds, so an OOB index would
-        # silently corrupt adjacent memory. Validate up-front.
-        if topk_idx64.numel() > 0:
+        # silently corrupt adjacent memory.
+        #
+        # Wave-4 perf #1 (grok wave-3 review): the .item() / .all() calls
+        # below force GPU->CPU syncs + extra reduction kernels on every
+        # sparse forward pass (~milliseconds at ASq*TOPK=large). Gate
+        # behind CPPMEGA_MLX_DSA_DEBUG so production training paths skip
+        # them but CI / first-run regressions still catch corruption.
+        if _dsa_debug_enabled() and topk_idx64.numel() > 0:
             _max_idx = int(topk_idx64.max().item())
             _min_idx = int(topk_idx64.min().item())
             if _max_idx >= Sk or _min_idx < 0:
@@ -1085,14 +1149,20 @@ def dsa_splitk_indexer_loss_tilelang(
         # by clearing slot 0 to a safe sentinel for any all-masked row;
         # the kernel's own causal mask still elides invalid (sq < sk)
         # combinations downstream.
-        _row_has_valid = (index_mask == 0.0).any(dim=-1)
-        if not bool(_row_has_valid.all()):
-            _patch = torch.where(
-                _row_has_valid,
-                index_mask[..., 0],
-                torch.zeros((), dtype=torch.float32, device=query.device),
-            )
-            index_mask[..., 0] = _patch
+        #
+        # Wave-4 perf #1 (grok wave-3 review): the .all() forces another
+        # GPU->CPU sync. In production we skip the detection AND the patch;
+        # this trades a rare NaN risk (caller passes degenerate topk) for
+        # zero per-step overhead. Enable via CPPMEGA_MLX_DSA_DEBUG.
+        if _dsa_debug_enabled():
+            _row_has_valid = (index_mask == 0.0).any(dim=-1)
+            if not bool(_row_has_valid.all()):
+                _patch = torch.where(
+                    _row_has_valid,
+                    index_mask[..., 0],
+                    torch.zeros((), dtype=torch.float32, device=query.device),
+                )
+                index_mask[..., 0] = _patch
     else:
         # When sparse_loss is False the constexpr-eliminated kernel branches
         # never read this tensor (and after the bounds-guard fix, even
