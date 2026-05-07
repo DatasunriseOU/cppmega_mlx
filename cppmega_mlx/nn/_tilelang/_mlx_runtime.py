@@ -301,6 +301,61 @@ _CUDA_BUILTIN_REWRITE: dict[str, str] = {
 }
 
 
+# Regex-based substitutions for dotted CUDA builtins (``blockIdx.y``,
+# ``blockDim.x`` etc.) and zero-arg device intrinsics (``__syncthreads()``).
+# These cannot go through ``_rename_identifiers_in_code`` because that
+# helper only matches bare identifiers (``\b<name>\b``); the dotted forms
+# require a multi-token match. We apply this pass BEFORE the bare-identifier
+# rename so the bare ``blockIdx`` rewrite (``-> threadgroup_position_in_grid.x``)
+# does not eagerly rewrite the prefix of ``blockIdx.y``.
+#
+# Coverage rationale (J1.5):
+#   * ``threadIdx.{y,z}`` / ``blockIdx.{y,z}`` -- multi-dim grid kernels.
+#   * ``blockDim.{x,y,z}`` -- threadgroup-size queries (TileLang sometimes
+#     emits these for static shapes; preserve the semantics).
+#   * ``gridDim.{x,y,z}`` -- grid-size queries.
+#   * ``__syncthreads()`` -- CUDA's threadgroup barrier maps to Metal's
+#     ``threadgroup_barrier(metal::mem_flags::mem_threadgroup)``.
+#
+# Warp-shuffle intrinsics (``__shfl_sync``, ``__shfl_xor_sync``,
+# ``__shfl_up_sync``, ``__shfl_down_sync``, ``__ballot_sync``,
+# ``__any_sync``, ``__all_sync``) have a Metal counterpart in the
+# ``simd_shuffle*`` family but the argument shape is incompatible
+# (CUDA's leading mask argument has no Metal equivalent and Metal's
+# ``simd_*`` intrinsics work at SIMD-group granularity, which is 32 on
+# Apple GPUs). The matmul kernels we currently lower do not emit them,
+# so we leave them unrewritten and let the Metal compiler produce a
+# clear "use of undeclared identifier" diagnostic if a future kernel
+# needs them. The diagnostic is louder than a silent miscompile.
+_CUDA_DOTTED_REWRITE: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\bblockIdx\.x\b"), "threadgroup_position_in_grid.x"),
+    (re.compile(r"\bblockIdx\.y\b"), "threadgroup_position_in_grid.y"),
+    (re.compile(r"\bblockIdx\.z\b"), "threadgroup_position_in_grid.z"),
+    (re.compile(r"\bthreadIdx\.x\b"), "thread_position_in_threadgroup.x"),
+    (re.compile(r"\bthreadIdx\.y\b"), "thread_position_in_threadgroup.y"),
+    (re.compile(r"\bthreadIdx\.z\b"), "thread_position_in_threadgroup.z"),
+    (re.compile(r"\bblockDim\.x\b"), "threads_per_threadgroup.x"),
+    (re.compile(r"\bblockDim\.y\b"), "threads_per_threadgroup.y"),
+    (re.compile(r"\bblockDim\.z\b"), "threads_per_threadgroup.z"),
+    (re.compile(r"\bgridDim\.x\b"), "threadgroups_per_grid.x"),
+    (re.compile(r"\bgridDim\.y\b"), "threadgroups_per_grid.y"),
+    (re.compile(r"\bgridDim\.z\b"), "threadgroups_per_grid.z"),
+    (
+        re.compile(r"\b__syncthreads\s*\(\s*\)"),
+        "threadgroup_barrier(metal::mem_flags::mem_threadgroup)",
+    ),
+)
+
+
+# Warp-shuffle intrinsics that we do NOT currently rewrite. If we see one
+# of these we leave the source alone (so the Metal compiler errors out
+# loudly) but the caller can introspect via ``re.search`` if they want
+# to pre-flight the kernel.
+_CUDA_WARP_SHUFFLE_RE = re.compile(
+    r"\b__(?:shfl(?:_xor|_up|_down)?_sync|ballot_sync|any_sync|all_sync)\b"
+)
+
+
 _ARGS_STRUCT_DECL_RE = re.compile(
     r"\bconstant\s+\w+_args_t\s*&\s*arg\s*\[\[\s*buffer\s*\(\s*\d+\s*\)\s*\]\]"
     r"\s*,?\s*",
@@ -368,7 +423,22 @@ def _rewrite_tilelang_metal_to_mlx(
         source,
     )
 
-    # 2) Rewrite CUDA-style builtin identifiers via whole-token substitution.
+    # 2a) Rewrite dotted CUDA builtins (``blockIdx.y``, ``blockDim.x``,
+    # ``gridDim.z``, ...) and zero-arg device intrinsics (``__syncthreads()``)
+    # BEFORE the bare-identifier pass below so the bare ``blockIdx`` rule
+    # (which appends ``.x``) does not eagerly rewrite the prefix of
+    # ``blockIdx.y`` into ``threadgroup_position_in_grid.x.y``.
+    #
+    # We do NOT mask comments/strings here because the dotted patterns are
+    # specific enough that a stray match inside a doc-comment is a non-issue;
+    # if that ever changes, route through ``_rename_identifiers_in_code``'s
+    # masking helper.
+    for pattern, replacement in _CUDA_DOTTED_REWRITE:
+        source = pattern.sub(replacement, source)
+
+    # 2b) Rewrite bare CUDA-style builtin identifiers via whole-token
+    # substitution. After step 2a, only un-suffixed references like
+    # ``blockIdx`` (no ``.x``/``.y``) remain to be rewritten.
     source = _rename_identifiers_in_code(source, _CUDA_BUILTIN_REWRITE)
 
     # 3) Drop the ``constant <kernel>_args_t& arg [[buffer(N)]]`` parameter

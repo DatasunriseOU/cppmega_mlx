@@ -240,6 +240,142 @@ kernel void k(
     assert not _re.search(r"\bthreadIdx\b", body_section)
 
 
+def test_rewrite_dotted_blockidx_threadidx_yz() -> None:
+    """``blockIdx.{y,z}``/``threadIdx.{y,z}`` map to MLX ``uint3`` slots.
+
+    Multi-dim TileLang kernels reference dotted CUDA builtins. The bare
+    ``blockIdx`` rewrite would corrupt them (``blockIdx.y`` ->
+    ``threadgroup_position_in_grid.x.y``) without a dedicated dotted pass.
+    """
+    from cppmega_mlx.nn._tilelang._mlx_runtime import (
+        _rewrite_tilelang_metal_to_mlx,
+    )
+
+    src = """
+kernel void k() {
+    int bx = ((int)blockIdx.x);
+    int by = ((int)blockIdx.y);
+    int bz = ((int)blockIdx.z);
+    int tx = ((int)threadIdx.x);
+    int ty = ((int)threadIdx.y);
+    int tz = ((int)threadIdx.z);
+}
+"""
+    out = _rewrite_tilelang_metal_to_mlx(src)
+    assert "threadgroup_position_in_grid.x" in out
+    assert "threadgroup_position_in_grid.y" in out
+    assert "threadgroup_position_in_grid.z" in out
+    assert "thread_position_in_threadgroup.x" in out
+    assert "thread_position_in_threadgroup.y" in out
+    assert "thread_position_in_threadgroup.z" in out
+    # The original dotted CUDA tokens must NOT survive in the body.
+    body = out.split("{", 1)[1] if "{" in out else out
+    import re as _re
+    assert not _re.search(r"\bblockIdx\.[xyz]\b", body)
+    assert not _re.search(r"\bthreadIdx\.[xyz]\b", body)
+    # The bare ``blockIdx`` rewrite must NOT have eagerly clobbered the
+    # dotted forms into ``threadgroup_position_in_grid.x.y`` etc.
+    assert "threadgroup_position_in_grid.x.y" not in out
+    assert "threadgroup_position_in_grid.x.z" not in out
+    assert "thread_position_in_threadgroup.x.y" not in out
+    assert "thread_position_in_threadgroup.x.z" not in out
+
+
+def test_rewrite_blockdim_griddim_xyz() -> None:
+    """``blockDim.{x,y,z}`` and ``gridDim.{x,y,z}`` map to MLX size builtins.
+
+    CUDA's grid/threadgroup sizes are exposed by Metal as
+    ``threads_per_threadgroup`` (uint3) and ``threadgroups_per_grid``
+    (uint3) -- both are MLX-injected scalars in the kernel body scope.
+    """
+    from cppmega_mlx.nn._tilelang._mlx_runtime import (
+        _rewrite_tilelang_metal_to_mlx,
+    )
+
+    src = """
+kernel void k() {
+    int a = blockDim.x;
+    int b = blockDim.y;
+    int c = blockDim.z;
+    int d = gridDim.x;
+    int e = gridDim.y;
+    int f = gridDim.z;
+}
+"""
+    out = _rewrite_tilelang_metal_to_mlx(src)
+    assert "threads_per_threadgroup.x" in out
+    assert "threads_per_threadgroup.y" in out
+    assert "threads_per_threadgroup.z" in out
+    assert "threadgroups_per_grid.x" in out
+    assert "threadgroups_per_grid.y" in out
+    assert "threadgroups_per_grid.z" in out
+    import re as _re
+    body = out.split("{", 1)[1] if "{" in out else out
+    assert not _re.search(r"\bblockDim\.[xyz]\b", body)
+    assert not _re.search(r"\bgridDim\.[xyz]\b", body)
+
+
+def test_rewrite_syncthreads_to_metal_threadgroup_barrier() -> None:
+    """``__syncthreads()`` becomes Metal's ``threadgroup_barrier`` form."""
+    from cppmega_mlx.nn._tilelang._mlx_runtime import (
+        _rewrite_tilelang_metal_to_mlx,
+    )
+
+    src = """
+kernel void k() {
+    do_stuff();
+    __syncthreads();
+    do_more();
+    __syncthreads ( );
+}
+"""
+    out = _rewrite_tilelang_metal_to_mlx(src)
+    # Both spellings (no-space and spaced parens) collapse to the same
+    # Metal barrier expression.
+    assert (
+        out.count(
+            "threadgroup_barrier(metal::mem_flags::mem_threadgroup)"
+        )
+        == 2
+    )
+    assert "__syncthreads" not in out
+
+
+def test_rewrite_warp_shuffles_left_alone() -> None:
+    """Warp-shuffle intrinsics survive the rewrite unchanged.
+
+    Metal's ``simd_shuffle*`` family has incompatible argument shape
+    (no leading mask, SIMD-group granularity), so naive substitution
+    would miscompile. Until a kernel actually needs them, we leave the
+    CUDA tokens in place and let the Metal compiler emit a clear
+    ``use of undeclared identifier`` diagnostic.
+    """
+    from cppmega_mlx.nn._tilelang._mlx_runtime import (
+        _rewrite_tilelang_metal_to_mlx,
+    )
+
+    src = """
+kernel void k() {
+    float v = __shfl_sync(0xffffffff, x, 0);
+    float w = __shfl_xor_sync(0xffffffff, x, 1);
+    float u = __shfl_down_sync(0xffffffff, x, 2);
+    float t = __shfl_up_sync(0xffffffff, x, 3);
+    int b = __ballot_sync(0xffffffff, pred);
+}
+"""
+    out = _rewrite_tilelang_metal_to_mlx(src)
+    # Each shuffle/ballot intrinsic survives untouched -- the rewrite
+    # is a deliberate no-op so the Metal compile error is loud.
+    for tok in (
+        "__shfl_sync",
+        "__shfl_xor_sync",
+        "__shfl_down_sync",
+        "__shfl_up_sync",
+        "__ballot_sync",
+    ):
+        assert tok in out
+
+
 def test_rewrite_inlines_args_struct_fields() -> None:
     """``arg.<field>[0]`` accesses are inlined to integer literals.
 
