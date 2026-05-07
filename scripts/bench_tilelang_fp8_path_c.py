@@ -24,22 +24,353 @@ import sys
 import tempfile
 import time
 import traceback
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
+from importlib import import_module
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
 
+# Explicit star-import surface.
+#
+# This module uses PEP 562 ``__getattr__`` to expose ``TILELANG_ROOT`` and
+# ``TVM_ROOT`` lazily (so plain ``import bench_tilelang_fp8_path_c`` does not
+# read env vars or touch the filesystem at import time). However, ``from X
+# import *`` bypasses ``__getattr__`` when no ``__all__`` is defined: it walks
+# ``module.__dict__`` and silently drops any name not already bound. Without
+# ``__all__``, ``from bench_tilelang_fp8_path_c import *`` would miss the lazy
+# attributes entirely.
+#
+# Listing the lazy names in ``__all__`` forces the star-import to perform
+# ``from X import TILELANG_ROOT`` (etc.), which DOES go through
+# ``__getattr__`` and therefore correctly resolves the lazy values. Keep this
+# list in sync with the public surface (functions, classes, constants, and
+# every name handled by ``__getattr__``); sort alphabetically.
+__all__ = [
+    "BenchStats",
+    "DEFAULT_PARITY_MAX_ABS",
+    "DEFAULT_PARITY_MAX_REL",
+    "PATH_B_MATMUL_LABEL",
+    "PATH_B_VECMAT_LABEL",
+    "PATH_C_MATMUL_LABEL",
+    "PATH_C_VECMAT_LABEL",
+    "PairedBenchResult",
+    "REPO_ROOT",
+    "SCHEMA_VERSION",
+    "TILELANG_METAL_TARGET",
+    "TILELANG_METAL_VECMAT_TARGET",
+    "TILELANG_ROOT",
+    "TVM_ROOT",
+    "main",
+]
+
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
-TILELANG_ROOT = Path(os.environ.get("TILELANG_ROOT", "/private/tmp/tilelang_apple_head/tilelang"))
-TVM_ROOT = Path(os.environ.get("TVM_ROOT", "/private/tmp/tvm_apple_head/tvm"))
+
+
+def _first_existing_path(candidates: Iterable[Path], fallback: Path) -> Path:
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return fallback
+
+
+def _default_tilelang_root() -> Path:
+    return _first_existing_path(
+        (
+            Path("/private/tmp/tl_pr_c"),
+            Path("/private/tmp/cppmega-mlx-tilelang-stack-c"),
+            Path("/private/tmp/tilelang_apple_head/tilelang"),
+        ),
+        Path("/private/tmp/tilelang_apple_head/tilelang"),
+    )
+
+
+def _default_tvm_root(tilelang_root: Path) -> Path:
+    bundled = tilelang_root / "3rdparty" / "tvm"
+    if bundled.exists():
+        return bundled
+    return Path("/private/tmp/tvm_apple_head/tvm")
+
+
+# Bench JSON schema version. Bumped to 2 when we standardized on the FLAT
+# row layout (e.g. ``fwd_path_c_over_path_b_paired_ratio`` and flat
+# ``path_b``/``path_c`` status keys) instead of the older nested
+# ``ratios.*`` / ``strategies.*`` shape. All future bench writes MUST emit
+# ``schema_version=2`` and the harness gates on this set explicitly.
+SCHEMA_VERSION = 2
+
 TILELANG_METAL_TARGET = "metal"
 TILELANG_METAL_VECMAT_TARGET = "metal -thread_warp_size=32"
 DEFAULT_PARITY_MAX_ABS = 1.0e-5
 DEFAULT_PARITY_MAX_REL = 1.0e-5
 
-sys.path.insert(0, str(REPO_ROOT))
-if TILELANG_ROOT.exists():
-    sys.path.insert(0, str(TILELANG_ROOT))
+_REMOVED_IMPORT_FINDERS: list[str] = []
+_IMPORT_ENV_READY = False
+_RESOLVED_TILELANG_ROOT: Path | None = None
+_RESOLVED_TVM_ROOT: Path | None = None
+
+
+def _resolve_tilelang_root() -> Path:
+    """Resolve the active TileLang checkout from the environment lazily.
+
+    Reading ``TILELANG_ROOT``/``TVM_ROOT`` at import time leaks env state
+    into pytest (importing this module mutated globals). The resolution now
+    runs only when explicitly invoked (e.g. ``main`` or via the lazy
+    module-level attribute), so plain ``import bench_tilelang_fp8_path_c``
+    is side-effect-free.
+    """
+
+    global _RESOLVED_TILELANG_ROOT, _RESOLVED_TVM_ROOT
+    if _RESOLVED_TILELANG_ROOT is None:
+        _RESOLVED_TILELANG_ROOT = Path(
+            os.environ.get("TILELANG_ROOT") or _default_tilelang_root()
+        )
+    if _RESOLVED_TVM_ROOT is None:
+        _RESOLVED_TVM_ROOT = Path(
+            os.environ.get("TVM_ROOT") or _default_tvm_root(_RESOLVED_TILELANG_ROOT)
+        )
+    return _RESOLVED_TILELANG_ROOT
+
+
+def _resolve_tvm_root() -> Path:
+    if _RESOLVED_TVM_ROOT is None:
+        _resolve_tilelang_root()
+    assert _RESOLVED_TVM_ROOT is not None
+    return _RESOLVED_TVM_ROOT
+
+
+def __getattr__(name: str) -> Any:  # PEP 562 — lazy module attributes.
+    if name == "TILELANG_ROOT":
+        return _resolve_tilelang_root()
+    if name == "TVM_ROOT":
+        return _resolve_tvm_root()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def _path_in_roots(path: Path, roots: Iterable[Path]) -> bool:
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = path.absolute()
+    for root in roots:
+        try:
+            if resolved.is_relative_to(root.resolve()):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _prepend_existing_path(path: Path) -> None:
+    if not path.exists():
+        return
+    value = str(path)
+    sys.path[:] = [entry for entry in sys.path if entry != value]
+    sys.path.insert(0, value)
+
+
+def _prepend_existing_env_path(var: str, paths: Iterable[Path]) -> list[str]:
+    existing = [entry for entry in os.environ.get(var, "").split(os.pathsep) if entry]
+    front: list[str] = []
+    seen: set[str] = set()
+    for path in paths:
+        if not path.exists():
+            continue
+        value = str(path)
+        if value not in seen:
+            front.append(value)
+            seen.add(value)
+    rest = [entry for entry in existing if entry not in seen]
+    if front or rest:
+        os.environ[var] = os.pathsep.join(front + rest)
+    return front
+
+
+def _tilelang_python_paths(tilelang_root: Path, tvm_root: Path) -> list[Path]:
+    tvm_ffi_python = tvm_root / "3rdparty" / "tvm-ffi" / "python"
+    # /private/tmp/tl_pr_c currently has the tvm-ffi Python sources but not the
+    # built core.abi3.so extension. Use the sibling stack-c build only for FFI.
+    tvm_ffi_fallback = (
+        Path("/private/tmp/cppmega-mlx-tilelang-stack-c")
+        / "3rdparty"
+        / "tvm"
+        / "3rdparty"
+        / "tvm-ffi"
+        / "python"
+    )
+    paths = [
+        tilelang_root,
+        tvm_root / "python",
+    ]
+    if not (tvm_ffi_python / "tvm_ffi" / "core.abi3.so").exists():
+        paths.append(tvm_ffi_fallback)
+    paths.extend([
+        tvm_ffi_python,
+        tilelang_root / "3rdparty" / "tvm" / "python",
+        tilelang_root / "3rdparty" / "tvm" / "3rdparty" / "tvm-ffi" / "python",
+    ])
+    return paths
+
+
+def _tilelang_library_paths(tilelang_root: Path, tvm_root: Path) -> list[Path]:
+    return [
+        tilelang_root / "build" / "lib",
+        tilelang_root / "build" / "tvm",
+        tilelang_root / "build-metal-m4-codex" / "lib",
+        tilelang_root / "build-metal-m4-codex" / "tvm",
+        tvm_root / "build",
+        tvm_root / "build" / "lib",
+    ]
+
+
+def _selected_import_roots(tilelang_root: Path, tvm_root: Path) -> list[Path]:
+    return [
+        tilelang_root,
+        tvm_root,
+        tvm_root / "python",
+        tvm_root / "3rdparty" / "tvm-ffi" / "python",
+        Path("/private/tmp/cppmega-mlx-tilelang-stack-c")
+        / "3rdparty"
+        / "tvm"
+        / "3rdparty"
+        / "tvm-ffi"
+        / "python",
+        tilelang_root / "3rdparty" / "tvm",
+        tilelang_root / "3rdparty" / "tvm" / "python",
+        tilelang_root / "3rdparty" / "tvm" / "3rdparty" / "tvm-ffi" / "python",
+    ]
+
+
+def _finder_paths(finder: object) -> list[Path]:
+    paths: list[Path] = []
+    for attr in ("path", "src_path", "source_path", "project_root", "install_dir"):
+        value = getattr(finder, attr, None)
+        if isinstance(value, str | os.PathLike):
+            paths.append(Path(value))
+    return paths
+
+
+def _disable_stale_editable_import_finders(tilelang_root: Path, tvm_root: Path) -> None:
+    """Prevent stale editable installs from shadowing the selected source tree."""
+
+    allowed_roots = [root for root in _selected_import_roots(tilelang_root, tvm_root) if root.exists()]
+    kept: list[object] = []
+    for finder in sys.meta_path:
+        finder_type = type(finder)
+        module = finder_type.__module__
+        name = finder_type.__name__
+        is_tilelang_editable = module in {"_tilelang_editable", "_apache_tvm_ffi_editable"}
+        if not is_tilelang_editable:
+            kept.append(finder)
+            continue
+
+        paths = _finder_paths(finder)
+        if paths and all(_path_in_roots(path, allowed_roots) for path in paths):
+            kept.append(finder)
+            continue
+        _REMOVED_IMPORT_FINDERS.append(f"{module}.{name}")
+    sys.meta_path[:] = kept
+
+
+def _module_file(name: str) -> Path | None:
+    module = sys.modules.get(name)
+    file_name = getattr(module, "__file__", None)
+    if not file_name:
+        return None
+    return Path(str(file_name))
+
+
+def _purge_stale_imported_modules(tilelang_root: Path, tvm_root: Path) -> None:
+    allowed_roots = [root for root in _selected_import_roots(tilelang_root, tvm_root) if root.exists()]
+    stale_prefixes: set[str] = set()
+    for name in ("tilelang", "tvm", "tvm_ffi"):
+        module_path = _module_file(name)
+        if module_path is not None and not _path_in_roots(module_path, allowed_roots):
+            stale_prefixes.add(name)
+    if not stale_prefixes:
+        return
+    for name in list(sys.modules):
+        if any(name == prefix or name.startswith(f"{prefix}.") for prefix in stale_prefixes):
+            sys.modules.pop(name, None)
+
+
+def _prepare_tilelang_import_environment() -> None:
+    """Pin TileLang/TVM imports and dynamic-library lookup to this benchmark's roots."""
+
+    global _IMPORT_ENV_READY
+    if _IMPORT_ENV_READY:
+        return
+
+    tilelang_root = _resolve_tilelang_root()
+    tvm_root = _resolve_tvm_root()
+
+    _prepend_existing_path(REPO_ROOT)
+    for path in reversed(_tilelang_python_paths(tilelang_root, tvm_root)):
+        _prepend_existing_path(path)
+
+    lib_paths = _tilelang_library_paths(tilelang_root, tvm_root)
+    selected_lib_paths = _prepend_existing_env_path("TVM_LIBRARY_PATH", lib_paths)
+    _prepend_existing_env_path("DYLD_LIBRARY_PATH", lib_paths)
+    if tilelang_root.exists():
+        build_root = tilelang_root / "build"
+        metal_build_root = tilelang_root / "build-metal-m4-codex"
+        if not build_root.exists() and metal_build_root.exists():
+            build_root = metal_build_root
+        os.environ["TILELANG_DEV_BUILD_ROOT"] = str(build_root)
+    if tvm_root.exists():
+        os.environ["TVM_HOME"] = str(tvm_root)
+        os.environ["TVM_SOURCE_DIR"] = str(tvm_root)
+    if selected_lib_paths:
+        os.environ.setdefault("TVM_LIBRARY_PATH_SELECTED", os.pathsep.join(selected_lib_paths))
+
+    _disable_stale_editable_import_finders(tilelang_root, tvm_root)
+    _purge_stale_imported_modules(tilelang_root, tvm_root)
+    _IMPORT_ENV_READY = True
+
+
+def _module_origin(name: str) -> dict[str, Any]:
+    module = sys.modules.get(name)
+    if module is None:
+        try:
+            module = import_module(name)
+        except Exception as exc:
+            return {"importable": False, "error": f"{type(exc).__name__}: {exc}"}
+    file_name = getattr(module, "__file__", None)
+    origin: dict[str, Any] = {
+        "importable": True,
+        "file": str(Path(str(file_name)).resolve()) if file_name else None,
+    }
+    version = getattr(module, "__version__", None)
+    if version is not None:
+        origin["version"] = str(version)
+    return origin
+
+
+def _tilelang_module_origins() -> dict[str, Any]:
+    _prepare_tilelang_import_environment()
+    return {
+        "tilelang": _module_origin("tilelang"),
+        "tvm": _module_origin("tvm"),
+        "tvm_ffi": _module_origin("tvm_ffi"),
+        "removed_import_finders": list(_REMOVED_IMPORT_FINDERS),
+    }
+
+
+def _validate_module_origin(name: str, allowed_roots: Iterable[Path]) -> None:
+    module_path = _module_file(name)
+    existing_roots = [root for root in allowed_roots if root.exists()]
+    if module_path is None:
+        raise RuntimeError(f"{name} imported without __file__")
+    if not _path_in_roots(module_path, existing_roots):
+        roots = ", ".join(str(root) for root in existing_roots)
+        raise RuntimeError(f"{name} resolved to {module_path.resolve()} outside selected roots: {roots}")
+
+
+# NOTE: Do NOT invoke ``_prepare_tilelang_import_environment()`` at module
+# import time. Tests need to ``import bench_tilelang_fp8_path_c`` without
+# mutating ``sys.path``, ``os.environ``, or ``sys.meta_path``. The function
+# now runs on the first call to ``_require_bench_deps`` / ``_require_runtime``
+# / ``main``, which is the only path that genuinely needs the live env.
 
 np: Any = None
 mx: Any = None
@@ -48,7 +379,7 @@ fp8_msl_status: Any = None
 _FP8_MATMUL_BODY: Any = None
 fp8_scaled_matmul_raw: Any = None
 fp8_scaled_vecmat: Any = None
-canonical_vecmat_runtime_body: Any = None
+fp8_vecmat_runtime_msl_source: Any = None
 fp8_scaled_vecmat_path_c: Any = None
 fp8_vecmat_msl_blockers: Any = None
 make_fp8_vecmat_reduce_kernel: Any = None
@@ -57,12 +388,17 @@ make_fp8_vecmat_reduce_kernel: Any = None
 def _require_bench_deps() -> None:
     """Import GPU/runtime deps only for real benchmarks, not config tests."""
 
+    # Prepare TileLang import environment lazily (was previously a side
+    # effect at module import). Anything that imports tilelang/tvm relies
+    # on the prepared sys.path + env vars below.
+    _prepare_tilelang_import_environment()
+
     global TILELANG_METAL_VECMAT_TARGET
-    global canonical_vecmat_runtime_body
     global _FP8_MATMUL_BODY
     global fp8_msl_status
     global fp8_scaled_matmul_raw
     global fp8_scaled_vecmat
+    global fp8_vecmat_runtime_msl_source
     global fp8_scaled_vecmat_path_c
     global fp8_vecmat_msl_blockers
     global make_fp8_vecmat_reduce_kernel
@@ -97,14 +433,14 @@ def _require_bench_deps() -> None:
     if fp8_scaled_vecmat_path_c is None:
         from cppmega_mlx.nn._tilelang.fp8_vecmat_path_c import (
             TILELANG_METAL_VECMAT_TARGET as _TILELANG_METAL_VECMAT_TARGET,
-            canonical_vecmat_runtime_body as _canonical_vecmat_runtime_body,
+            fp8_vecmat_runtime_msl_source as _fp8_vecmat_runtime_msl_source,
             fp8_scaled_vecmat_path_c as _fp8_scaled_vecmat_path_c,
             fp8_vecmat_msl_blockers as _fp8_vecmat_msl_blockers,
             make_fp8_vecmat_reduce_kernel as _make_fp8_vecmat_reduce_kernel,
         )
 
         TILELANG_METAL_VECMAT_TARGET = _TILELANG_METAL_VECMAT_TARGET
-        canonical_vecmat_runtime_body = _canonical_vecmat_runtime_body
+        fp8_vecmat_runtime_msl_source = _fp8_vecmat_runtime_msl_source
         fp8_scaled_vecmat_path_c = _fp8_scaled_vecmat_path_c
         fp8_vecmat_msl_blockers = _fp8_vecmat_msl_blockers
         make_fp8_vecmat_reduce_kernel = _make_fp8_vecmat_reduce_kernel
@@ -168,20 +504,29 @@ SHAPES: dict[str, Shape] = {
 def _fp8_scaled_matmul_kernel_template(
     A_fp8: T.Tensor((_M, _K), "float8_e4m3"),
     A_scale: T.Tensor((1,), "float32"),
-    B_fp8: T.Tensor((_K, _N), "float8_e4m3"),
+    B_fp8: T.Tensor((_N, _K), "float8_e4m3"),
     B_scale: T.Tensor((1,), "float32"),
     C: T.Tensor((_M, _N), "float32"),
 ):
-    with T.Kernel(T.ceildiv(_N, _BN), T.ceildiv(_M, _BM), threads=128) as (bx, by):
-        A_shared = T.alloc_shared((_BM, _BK), "float8_e4m3", scope="shared")
-        B_shared = T.alloc_shared((_BK, _BN), "float8_e4m3", scope="shared")
-        C_local = T.alloc_fragment((_BM, _BN), "float32")
-        T.clear(C_local)
-        for ko in T.Pipelined(T.ceildiv(_K, _BK), num_stages=_NUM_STAGES):
-            T.copy(A_fp8[by * _BM, ko * _BK], A_shared)
-            T.copy(B_fp8[ko * _BK, bx * _BN], B_shared)
-            T.fp8_scaled_matmul(A_shared, A_scale, B_shared, B_scale, C_local)
-        T.copy(C_local, C[by * _BM, bx * _BN])
+    with T.Kernel(
+        T.ceildiv(_N, _BN),
+        T.ceildiv(_M, _BM),
+        threads=(_BN, _BM),
+    ) as (bx, by):
+        T.fp8_scaled_matmul(
+            A_fp8,
+            A_scale,
+            B_fp8,
+            B_scale,
+            C,
+            transpose_B=True,
+            target=Target("metal"),
+            a_scale_offset=by * _BM,
+            b_scale_offset=bx * _BN,
+            c_row_offset=by * _BM,
+            c_col_offset=bx * _BN,
+            outputs_per_block=_BN,
+        )
 
 
 @dataclass(frozen=True)
@@ -193,16 +538,22 @@ class BenchStats:
     p90_ms: float | None = None
     max_ms: float | None = None
     tflops: float | None = None
+    calls_per_s: float | None = None
+    tokens_per_s: float | None = None
     warmup: int = 0
     iters: int = 0
     paired: bool = False
     error: str | None = None
+    sample_ms: list[float] | None = None
+    sample_ms_by_step: dict[int, float] | None = None
 
 
 @dataclass(frozen=True)
 class PairedBenchResult:
     stats: dict[str, BenchStats]
     paired_ratios: dict[str, float]
+    paired_ratio_samples: dict[str, list[float]] = field(default_factory=dict)
+    worst_paired_steps: dict[str, list[dict[str, float]]] = field(default_factory=dict)
 
 
 def _sync_mlx() -> None:
@@ -238,26 +589,50 @@ def _bench_callable(
     flops: float,
     warmup: int,
     iters: int,
+    tokens_per_call: float | None = None,
 ) -> BenchStats:
     try:
         for _ in range(warmup):
             fn()
             sync()
         samples = []
-        for _ in range(iters):
+        samples_by_step: dict[int, float] = {}
+        for step in range(iters):
             sync()
             t0 = time.perf_counter()
             fn()
             sync()
-            samples.append((time.perf_counter() - t0) * 1000.0)
-        return _stats_from_samples(label, samples, flops=flops, warmup=warmup, iters=iters)
+            elapsed = (time.perf_counter() - t0) * 1000.0
+            samples.append(elapsed)
+            samples_by_step[step] = elapsed
+        return _stats_from_samples(
+            label,
+            samples,
+            flops=flops,
+            warmup=warmup,
+            iters=iters,
+            tokens_per_call=tokens_per_call,
+            samples_by_step=samples_by_step,
+            include_samples=True,
+        )
     except Exception as exc:  # pragma: no cover - used for local profiling receipts
+        # We record ran=False ONLY for known-benign reasons (e.g. peer kernel
+        # not built on this host, MPS/Metal backend missing). Unknown
+        # failures must surface — silently swallowing them is what produced
+        # green CI on broken kernels (Meta-E rec #1, Grok-D ran=False
+        # finding). The TileLang/TVM "not registered" family of errors
+        # signals lowering / target-registration drift and MUST re-raise.
+        message = f"{type(exc).__name__}: {exc}"
+        if "not registered" in str(exc):
+            raise
+        if not isinstance(exc, (RuntimeError, ImportError, AttributeError, OSError)):
+            raise
         return BenchStats(
             label=label,
             ok=False,
             warmup=warmup,
             iters=iters,
-            error=f"{type(exc).__name__}: {exc}",
+            error=message,
         )
 
 
@@ -269,21 +644,55 @@ def _stats_from_samples(
     warmup: int,
     iters: int,
     paired: bool = False,
+    tokens_per_call: float | None = None,
+    samples_by_step: dict[int, float] | None = None,
+    include_samples: bool = False,
 ) -> BenchStats:
-    samples.sort()
-    median = statistics.median(samples)
+    sorted_samples = sorted(samples)
+    median = statistics.median(sorted_samples)
     return BenchStats(
         label=label,
         ok=True,
         median_ms=float(median),
-        min_ms=float(samples[0]),
-        p90_ms=float(_percentile(samples, 0.90)),
-        max_ms=float(samples[-1]),
+        min_ms=float(sorted_samples[0]),
+        p90_ms=float(_percentile(sorted_samples, 0.90)),
+        max_ms=float(sorted_samples[-1]),
         tflops=float(flops / (median / 1000.0) / 1.0e12) if median > 0 else None,
+        calls_per_s=float(1000.0 / median) if median > 0 else None,
+        tokens_per_s=float(tokens_per_call * 1000.0 / median)
+        if median > 0 and tokens_per_call is not None
+        else None,
         warmup=warmup,
         iters=iters,
         paired=paired,
+        sample_ms=[float(value) for value in samples] if include_samples else None,
+        sample_ms_by_step={
+            int(step): float(value) for step, value in sorted(samples_by_step.items())
+        }
+        if include_samples and samples_by_step is not None
+        else None,
     )
+
+
+def _worst_paired_steps(
+    *,
+    label: str,
+    base_label: str,
+    ratios_by_step: dict[int, float],
+    samples_by_step: dict[str, dict[int, float]],
+    limit: int = 10,
+) -> list[dict[str, float]]:
+    out: list[dict[str, float]] = []
+    for step, ratio in sorted(ratios_by_step.items(), key=lambda item: item[1], reverse=True)[:limit]:
+        out.append(
+            {
+                "step": float(step),
+                "ratio": float(ratio),
+                "path_c_ms": float(samples_by_step[label][step]),
+                "path_b_ms": float(samples_by_step[base_label][step]),
+            }
+        )
+    return out
 
 
 def _bench_paired_callables(
@@ -293,6 +702,7 @@ def _bench_paired_callables(
     flops: float,
     warmup: int,
     iters: int,
+    tokens_per_call: float | None = None,
 ) -> PairedBenchResult:
     """Time peer kernels in alternating order to reduce launch-order bias."""
 
@@ -345,23 +755,48 @@ def _bench_paired_callables(
                 warmup=warmup,
                 iters=iters,
                 paired=True,
+                tokens_per_call=tokens_per_call,
+                samples_by_step=samples_by_step[label],
+                include_samples=True,
             )
     paired_ratios: dict[str, float] = {}
+    paired_ratio_samples: dict[str, list[float]] = {}
+    worst_paired_steps: dict[str, list[dict[str, float]]] = {}
     if len(strategies) >= 2:
         base_label = strategies[0][0]
         base_samples = samples_by_step.get(base_label, {})
         for label, _ in strategies[1:]:
-            ratios = [
-                samples_by_step[label][step] / base_samples[step]
+            ratios_by_step = {
+                step: samples_by_step[label][step] / base_samples[step]
                 for step in sorted(base_samples)
                 if step in samples_by_step[label] and base_samples[step] > 0
-            ]
+            }
+            ratios = list(ratios_by_step.values())
             if ratios:
+                sorted_ratios = sorted(ratios)
+                paired_ratio_samples[f"{label}_over_{base_label}"] = [float(value) for value in ratios]
                 paired_ratios[f"{label}_over_{base_label}_paired_median"] = float(statistics.median(ratios))
                 paired_ratios[f"{label}_over_{base_label}_paired_p90"] = float(
-                    _percentile(sorted(ratios), 0.90)
+                    _percentile(sorted_ratios, 0.90)
                 )
-    return PairedBenchResult(stats=out, paired_ratios=paired_ratios)
+                paired_ratios[f"{label}_over_{base_label}_paired_p99"] = float(
+                    _percentile(sorted_ratios, 0.99)
+                )
+                paired_ratios[f"{label}_over_{base_label}_paired_max"] = float(
+                    sorted_ratios[-1]
+                )
+                worst_paired_steps[f"{label}_over_{base_label}"] = _worst_paired_steps(
+                    label=label,
+                    base_label=base_label,
+                    ratios_by_step=ratios_by_step,
+                    samples_by_step=samples_by_step,
+                )
+    return PairedBenchResult(
+        stats=out,
+        paired_ratios=paired_ratios,
+        paired_ratio_samples=paired_ratio_samples,
+        worst_paired_steps=worst_paired_steps,
+    )
 
 
 def _run_cmd(cmd: list[str], *, cwd: Path) -> dict[str, Any]:
@@ -400,12 +835,28 @@ def _require_runtime() -> None:
 
 
 def _import_tilelang() -> tuple[Any, Any, Any, Any]:
+    _prepare_tilelang_import_environment()
     _require_bench_deps()
     import tilelang
     import tilelang.language as T
     from tilelang import tvm
     from tvm.target import Target
 
+    tilelang_root = _resolve_tilelang_root()
+    tvm_root = _resolve_tvm_root()
+    _validate_module_origin(
+        "tilelang",
+        (tilelang_root, tilelang_root / "tilelang"),
+    )
+    _validate_module_origin(
+        "tvm",
+        (
+            tvm_root,
+            tvm_root / "python",
+            tilelang_root / "3rdparty" / "tvm",
+            tilelang_root / "3rdparty" / "tvm" / "python",
+        ),
+    )
     return tilelang, T, tvm, Target
 
 
@@ -419,10 +870,11 @@ def _make_scaled_matmul_kernel(
     BK: int,
     num_stages: int,
 ):
-    _, T, _, _ = _import_tilelang()
+    _, T, _, Target = _import_tilelang()
     g = globals()
     g.update(
         T=T,
+        Target=Target,
         _M=M,
         _N=N,
         _K=K,
@@ -469,15 +921,16 @@ def _source_metrics(src: str) -> dict[str, Any]:
         "kernel_void": src.count("kernel void"),
         "packed_uint_loads": src.count("reinterpret_cast<device const uint*>"),
         "fp8_e4m3_lut": src.count("fp8_e4m3fn_lut"),
+        "metal_fp8_dot4_packed": src.count("__tvm_fp8_e4m3_dot4_packed"),
+        "metal_fp8_dot4_words": src.count("__tvm_fp8_e4m3_dot4_words"),
     }
+    markers["metal_fp8_dot4_helper"] = markers["metal_fp8_dot4_packed"] + markers["metal_fp8_dot4_words"]
     return {"source_len": len(src), "markers": markers}
 
 
-def _path_c_vecmat_runtime_source_metrics(*, N: int, K: int) -> dict[str, Any]:
-    src = canonical_vecmat_runtime_body(N=N, K=K, scale_w_per_row=True)
-    out = _source_metrics(src)
-    out["source"] = "mlx_runtime_canonical_body"
-    return out
+def _path_c_vecmat_runtime_source(*, N: int, K: int) -> str:
+    _require_bench_deps()
+    return str(fp8_vecmat_runtime_msl_source(N=N, K=K, scale_w_per_row=True))
 
 
 def _xcrun_compile(src: str, *, label: str, dump_dir: Path | None) -> dict[str, Any]:
@@ -619,6 +1072,7 @@ def _bench_path_b_matmul(
 ) -> tuple[BenchStats, mx.array | None]:
     M, N, K = int(shape["M"]), int(shape["N"]), int(shape["K"])
     flops = 2.0 * M * N * K
+    tokens_per_call = float(M)
     last: mx.array | None = None
 
     def run() -> None:
@@ -631,7 +1085,15 @@ def _bench_path_b_matmul(
         )
         mx.eval(last)
 
-    stats = _bench_callable("path_b_msl_fp8_scaled_matmul", run, _sync_mlx, flops=flops, warmup=warmup, iters=iters)
+    stats = _bench_callable(
+        "path_b_msl_fp8_scaled_matmul",
+        run,
+        _sync_mlx,
+        flops=flops,
+        warmup=warmup,
+        iters=iters,
+        tokens_per_call=tokens_per_call,
+    )
     return stats, last
 
 
@@ -662,7 +1124,7 @@ def _make_path_c_scaled_matmul_runner(
         compiled(
             inputs["a_fp8_mps"],
             inputs["a_scale_mps"],
-            inputs["b_fp8_mps"],
+            inputs["b_t_fp8_mps"],
             inputs["b_scale_mps"],
             c_out,
         )
@@ -684,6 +1146,7 @@ def _bench_paired_scaled_matmul(
     c_label = "matmul_tl_fp8_scaled_matmul"
     M, N, K = int(shape["M"]), int(shape["N"]), int(shape["K"])
     flops = 2.0 * M * N * K
+    tokens_per_call = float(M)
     row_b: dict[str, Any] = {"label": b_label}
     row_c: dict[str, Any] = {"label": c_label, "variant": "T.fp8_scaled_matmul"}
 
@@ -717,9 +1180,12 @@ def _bench_paired_scaled_matmul(
             flops=flops,
             warmup=warmup,
             iters=iters,
+            tokens_per_call=tokens_per_call,
         )
         stats = paired.stats
         row_c["paired_ratios"] = paired.paired_ratios
+        row_c["paired_ratio_samples"] = paired.paired_ratio_samples
+        row_c["worst_paired_steps"] = paired.worst_paired_steps
         row_b["bench"] = asdict(stats[b_label])
         row_c["bench"] = asdict(stats[c_label])
 
@@ -786,7 +1252,15 @@ def _bench_path_b_vecmat(
         )
         mx.eval(last)
 
-    stats = _bench_callable("path_b_msl_fp8_scaled_vecmat", run, _sync_mlx, flops=flops, warmup=warmup, iters=iters)
+    stats = _bench_callable(
+        "path_b_msl_fp8_scaled_vecmat",
+        run,
+        _sync_mlx,
+        flops=flops,
+        warmup=warmup,
+        iters=iters,
+        tokens_per_call=1.0,
+    )
     return stats, last
 
 
@@ -831,9 +1305,12 @@ def _bench_paired_vecmat_mlx(
     *,
     warmup: int,
     iters: int,
+    skip_xcrun: bool,
+    dump_dir: Path | None,
 ) -> tuple[tuple[BenchStats, mx.array | None], tuple[dict[str, Any], mx.array | None]]:
     N, K = int(shape["N"]), int(shape["K"])
     flops = 2.0 * N * K
+    tokens_per_call = 1.0
     b_last_ref: list[mx.array | None] = [None]
     c_last_ref: list[mx.array | None] = [None]
     b_label = "path_b_msl_fp8_scaled_vecmat"
@@ -847,6 +1324,7 @@ def _bench_paired_vecmat_mlx(
         flops=flops,
         warmup=warmup,
         iters=iters,
+        tokens_per_call=tokens_per_call,
     )
     stats = paired.stats
     row_c: dict[str, Any] = {
@@ -855,14 +1333,23 @@ def _bench_paired_vecmat_mlx(
         "target": TILELANG_METAL_VECMAT_TARGET,
         "bench": asdict(stats[c_label]),
         "paired_ratios": paired.paired_ratios,
+        "paired_ratio_samples": paired.paired_ratio_samples,
+        "worst_paired_steps": paired.worst_paired_steps,
     }
     if stats[c_label].ok:
         try:
             prim = make_fp8_vecmat_reduce_kernel(N=N, K=K)
-            src = _lower_source(prim, target=TILELANG_METAL_VECMAT_TARGET)
-            row_c["source_metrics"] = _path_c_vecmat_runtime_source_metrics(N=N, K=K)
-            row_c["diagnostic_tilelang_source_metrics"] = _source_metrics(src)
-            row_c["path_c_blockers"] = fp8_vecmat_msl_blockers(src)
+            diagnostic_src = _lower_source(prim, target=TILELANG_METAL_VECMAT_TARGET)
+            runtime_src = _path_c_vecmat_runtime_source(N=N, K=K)
+            row_c["source_metrics"] = _source_metrics(runtime_src)
+            row_c["source"] = "mlx_runtime_source"
+            row_c["diagnostic_tilelang_source_metrics"] = _source_metrics(diagnostic_src)
+            row_c["path_c_blockers"] = fp8_vecmat_msl_blockers(runtime_src)
+            row_c["xcrun_compile"] = (
+                {"skipped": True, "reason": "--skip-xcrun"}
+                if skip_xcrun
+                else _xcrun_compile(runtime_src, label=c_label, dump_dir=dump_dir)
+            )
         except Exception as exc:  # pragma: no cover - profiling metadata only
             row_c["source_metrics_error"] = f"{type(exc).__name__}: {exc}"
     return (stats[b_label], b_last_ref[0]), (row_c, c_last_ref[0])
@@ -874,6 +1361,8 @@ def _bench_path_c_vecmat_mlx(
     *,
     warmup: int,
     iters: int,
+    skip_xcrun: bool,
+    dump_dir: Path | None,
 ) -> tuple[dict[str, Any], mx.array | None]:
     N, K = int(shape["N"]), int(shape["K"])
     flops = 2.0 * N * K
@@ -893,7 +1382,15 @@ def _bench_path_c_vecmat_mlx(
         last = out
         mx.eval(last)
 
-    stats = _bench_callable(label, run, _sync_mlx, flops=flops, warmup=warmup, iters=iters)
+    stats = _bench_callable(
+        label,
+        run,
+        _sync_mlx,
+        flops=flops,
+        warmup=warmup,
+        iters=iters,
+        tokens_per_call=1.0,
+    )
     row: dict[str, Any] = {
         "label": label,
         "variant": "MLX-dispatched TileLang fp8 vecmat packed dot4",
@@ -903,10 +1400,17 @@ def _bench_path_c_vecmat_mlx(
     if stats.ok:
         try:
             prim = make_fp8_vecmat_reduce_kernel(N=N, K=K)
-            src = _lower_source(prim, target=TILELANG_METAL_VECMAT_TARGET)
-            row["source_metrics"] = _path_c_vecmat_runtime_source_metrics(N=N, K=K)
-            row["diagnostic_tilelang_source_metrics"] = _source_metrics(src)
-            row["path_c_blockers"] = fp8_vecmat_msl_blockers(src)
+            diagnostic_src = _lower_source(prim, target=TILELANG_METAL_VECMAT_TARGET)
+            runtime_src = _path_c_vecmat_runtime_source(N=N, K=K)
+            row["source_metrics"] = _source_metrics(runtime_src)
+            row["source"] = "mlx_runtime_source"
+            row["diagnostic_tilelang_source_metrics"] = _source_metrics(diagnostic_src)
+            row["path_c_blockers"] = fp8_vecmat_msl_blockers(runtime_src)
+            row["xcrun_compile"] = (
+                {"skipped": True, "reason": "--skip-xcrun"}
+                if skip_xcrun
+                else _xcrun_compile(runtime_src, label=label, dump_dir=dump_dir)
+            )
         except Exception as exc:  # pragma: no cover - profiling metadata only
             row["source_metrics_error"] = f"{type(exc).__name__}: {exc}"
     return row, last
@@ -926,6 +1430,7 @@ def _bench_path_c_scaled_matmul(
     label = f"{shape['kind']}_tl_fp8_scaled_matmul"
     M, N, K = int(shape["M"]), int(shape["N"]), int(shape["K"])
     flops = 2.0 * M * N * K
+    tokens_per_call = float(M)
     result: dict[str, Any] = {"label": label, "variant": "T.fp8_scaled_matmul"}
     try:
         prim = _make_scaled_matmul_kernel(
@@ -951,12 +1456,20 @@ def _bench_path_c_scaled_matmul(
             compiled(
                 inputs["a_fp8_mps"],
                 inputs["a_scale_mps"],
-                inputs["b_fp8_mps"],
+                inputs["b_t_fp8_mps"],
                 inputs["b_scale_mps"],
                 c_out,
             )
 
-        stats = _bench_callable(label, run, _sync_torch_mps, flops=flops, warmup=warmup, iters=iters)
+        stats = _bench_callable(
+            label,
+            run,
+            _sync_torch_mps,
+            flops=flops,
+            warmup=warmup,
+            iters=iters,
+            tokens_per_call=tokens_per_call,
+        )
         result["bench"] = asdict(stats)
         if stats.ok and bool(shape.get("parity", False)):
             _sync_torch_mps()
@@ -1013,7 +1526,15 @@ def _bench_path_c_vecmat_reduce(
                 c_out,
             )
 
-        stats = _bench_callable(label, run, _sync_torch_mps, flops=flops, warmup=warmup, iters=iters)
+        stats = _bench_callable(
+            label,
+            run,
+            _sync_torch_mps,
+            flops=flops,
+            warmup=warmup,
+            iters=iters,
+            tokens_per_call=1.0,
+        )
         result["bench"] = asdict(stats)
         if stats.ok and bool(shape.get("parity", False)):
             _sync_torch_mps()
@@ -1069,6 +1590,24 @@ def _finite_float(value: Any) -> bool:
 
 def _bench_ok(labels: dict[str, dict[str, Any]], label: str) -> bool:
     return bool(labels.get(label, {}).get("bench", {}).get("ok"))
+
+
+def _tokens_per_s_no_worse(
+    labels: dict[str, dict[str, Any]],
+    *,
+    path_b_label: str,
+    path_c_label: str,
+    max_ratio: float,
+) -> bool:
+    path_b_tokens = labels.get(path_b_label, {}).get("bench", {}).get("tokens_per_s")
+    path_c_tokens = labels.get(path_c_label, {}).get("bench", {}).get("tokens_per_s")
+    if not _finite_float(path_b_tokens) or not _finite_float(path_c_tokens):
+        return False
+    if path_b_tokens <= 0.0 or path_c_tokens <= 0.0:
+        return False
+    if not _finite_float(max_ratio) or max_ratio <= 0.0:
+        return False
+    return path_c_tokens + 1.0e-9 >= path_b_tokens / max_ratio
 
 
 def _status_payload(status: Any, fields: Iterable[str] | None = None) -> dict[str, Any]:
@@ -1229,6 +1768,29 @@ def _shape_row_strict_ok(
             ratio = paired_ratio
     if not _bench_ok(labels, path_b_label) or not _bench_ok(labels, path_c_label):
         return False
+    if not _tokens_per_s_no_worse(
+        labels,
+        path_b_label=path_b_label,
+        path_c_label=path_c_label,
+        max_ratio=max_ratio,
+    ):
+        return False
+
+    paired_ratios = labels.get(path_c_label, {}).get("paired_ratios", {})
+    if isinstance(paired_ratios, dict):
+        paired_prefix = f"{path_c_label}_over_{path_b_label}_paired_"
+        required_stats = {"median", "p90", "p99", "max"}
+        seen_stats: set[str] = set()
+        for key, value in paired_ratios.items():
+            if not isinstance(key, str) or not key.startswith(paired_prefix):
+                continue
+            stat = key.removeprefix(paired_prefix)
+            seen_stats.add(stat)
+            if not _finite_float(value) or value > max_ratio:
+                return False
+        if paired_ratios and not required_stats.issubset(seen_stats):
+            return False
+
     if not _finite_float(ratio) or ratio > max_ratio:
         return False
 
@@ -1272,6 +1834,8 @@ def _bench_shape(
             inputs,
             warmup=warmup,
             iters=iters,
+            skip_xcrun=skip_xcrun,
+            dump_dir=dump_dir,
         )
         row_b = {"label": "path_b_msl_fp8_scaled_vecmat", "bench": asdict(b_stats)}
         if b_stats.ok and b_last is not None and bool(shape.get("parity", False)):
@@ -1422,7 +1986,8 @@ def _print_summary(payload: dict[str, Any]) -> None:
             if bench.get("ok"):
                 print(
                     f"  {item['label']}: median={bench['median_ms']:.6f} ms "
-                    f"p90={bench['p90_ms']:.6f} ms tflops={bench['tflops']:.6f}"
+                    f"p90={bench['p90_ms']:.6f} ms tflops={bench['tflops']:.6f} "
+                    f"tok/s={bench.get('tokens_per_s')}"
                 )
             else:
                 print(f"  {item['label']}: FAIL {bench.get('error')}")
@@ -1436,6 +2001,7 @@ def _print_summary(payload: dict[str, Any]) -> None:
                     f"allreduce={metrics['tvm_thread_allreduce']} "
                     f"packed_uint={metrics['packed_uint_loads']} "
                     f"lut={metrics['fp8_e4m3_lut']} "
+                    f"dot4={metrics.get('metal_fp8_dot4_helper')} "
                     f"simd_sum={metrics['simd_sum']} "
                     f"scalar_a={metrics['scalar_float_a_val']}"
                 )
@@ -1512,8 +2078,10 @@ def main() -> int:
 
     _require_runtime()
 
+    tilelang_root = _resolve_tilelang_root()
+    tvm_root = _resolve_tvm_root()
     payload: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": SCHEMA_VERSION,
         "kind": "path_c_vs_path_b_fp8_profile",
         "host": socket.gethostname(),
         "platform": {
@@ -1528,11 +2096,27 @@ def main() -> int:
             "MAKEFLAGS": os.environ.get("MAKEFLAGS"),
             "CMAKE_BUILD_PARALLEL_LEVEL": os.environ.get("CMAKE_BUILD_PARALLEL_LEVEL"),
             "PYTHONPATH": os.environ.get("PYTHONPATH"),
+            "TVM_LIBRARY_PATH": os.environ.get("TVM_LIBRARY_PATH"),
+            "DYLD_LIBRARY_PATH": os.environ.get("DYLD_LIBRARY_PATH"),
+            "TILELANG_DEV_BUILD_ROOT": os.environ.get("TILELANG_DEV_BUILD_ROOT"),
+            "TVM_HOME": os.environ.get("TVM_HOME"),
+            "TVM_SOURCE_DIR": os.environ.get("TVM_SOURCE_DIR"),
+            "selected_python_paths": [
+                str(path)
+                for path in _tilelang_python_paths(tilelang_root, tvm_root)
+                if path.exists()
+            ],
+            "selected_library_paths": [
+                str(path)
+                for path in _tilelang_library_paths(tilelang_root, tvm_root)
+                if path.exists()
+            ],
         },
+        "module_origins": _tilelang_module_origins(),
         "repos": {
             "cppmega_mlx": _git_meta(REPO_ROOT),
-            "tilelang": _git_meta(TILELANG_ROOT),
-            "tvm": _git_meta(TVM_ROOT),
+            "tilelang": _git_meta(tilelang_root),
+            "tvm": _git_meta(tvm_root),
         },
         "path_b_status": asdict(fp8_msl_status()),
         "strict_policy": {
@@ -1564,6 +2148,7 @@ def main() -> int:
     if not args.skip_sparse:
         payload["sparse_mla"] = _bench_sparse_status(warmup=args.warmup, iters=args.iters, seed=args.seed)
 
+    strict_failed = False
     if args.strict:
         for shape_row in payload["results"]:
             if not _shape_row_strict_ok(
@@ -1577,12 +2162,12 @@ def main() -> int:
                     f"{shape_row['shape_name']} ratios={shape_row.get('ratios', {})}",
                     file=sys.stderr,
                 )
-                return 2
+                strict_failed = True
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(payload, indent=2))
     _print_summary(payload)
     print(f"\nwrote {args.out}")
-    return 0
+    return 2 if strict_failed else 0
 
 
 if __name__ == "__main__":

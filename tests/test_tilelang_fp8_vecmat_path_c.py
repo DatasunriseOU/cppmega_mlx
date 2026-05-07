@@ -114,8 +114,43 @@ def test_runtime_kernel_uses_canonical_input_order_for_fast_tuple_dispatch() -> 
         True,
     )
     assert input_names == ["A", "A_scale", "B", "B_scale"]
-    assert output_shape == (24,)
+    # Fix-1 + Fix-A re-application: vec=4 + K%4==0 selects the packed dot4
+    # macro PrimFunc, which declares ``C: T.Tensor((1, N), float32)``. The
+    # caller (``fp8_scaled_vecmat_path_c``) always reshapes the result back
+    # to flat ``(n,)`` for the public-API contract.
+    assert output_shape == (1, 24)
     assert threadgroup == (128, 1, 1)
+
+
+def test_fp8_e4m3_dot4_intrinsic_is_registered() -> None:
+    """Fix-1 + Fix-A trip-wire: ``tirx.metal.fp8_e4m3_dot4`` must exist.
+
+    The Path C FP8 vecmat macro PrimFunc emits a ``T.metal_fp8_e4m3_dot4``
+    call which is lowered to the ``tirx.metal.fp8_e4m3_dot4`` op. If the
+    op is not registered (Grok-D P0 from the 2026-05-06 audit), every
+    Path C FP8 kernel silently falls back to scalar decode and CI stays
+    green. This test makes that regression a hard failure on hosts with
+    TVM available.
+
+    Skips on hosts where TVM is not importable so CI without libz3 stays
+    informative rather than red.
+    """
+
+    pytest.importorskip("tvm")
+    try:
+        from tvm.ir import Op  # type: ignore
+    except Exception:
+        try:
+            from tilelang.tvm.ir import Op  # type: ignore
+        except Exception as exc:
+            pytest.skip(f"TVM Op import unavailable: {exc}")
+
+    op = Op.get("tirx.metal.fp8_e4m3_dot4")
+    assert op is not None, (
+        "tirx.metal.fp8_e4m3_dot4 must be registered for Path C FP8 macro "
+        "lowering. See cppmega_mlx.nn._tilelang._msl_transform."
+        "_register_path_c_metal_fp8_intrinsics."
+    )
 
 
 def test_vectorized_probe_remains_scalar_fallback() -> None:

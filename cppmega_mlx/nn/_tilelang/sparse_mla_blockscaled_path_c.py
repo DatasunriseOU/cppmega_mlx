@@ -1,5 +1,14 @@
 """Path C E8M0 block-scaled Sparse-MLA QK probe via TileLang DSL.
 
+PROBE-ONLY status — no ``sparse_mla_blockscaled_path_c_apply`` exists in
+this module. The exported ``blockscaled_sparse_mla_qk_reduce_path_c`` is a
+real-shape QK reducer apply, not a full Sparse-MLA attention apply. Because
+there is no Path C ``apply`` here, the ``force_metal`` -> ``force_path_c``
+kwarg rename used by the BF16 sparse-MLA pair does not apply to this op:
+the only callable Path B wrapper (``sparse_mla_blockscaled_apply``) keeps
+``force_metal``. See ``docs/production_kernel_routing.md`` for the routing
+contract.
+
 This module is intentionally a lowering/status surface, not a production
 Sparse-MLA forward. Path B already ships the direct-MSL MXFP8 Sparse-MLA
 kernel in ``sparse_mla_blockscaled.py``. Path C becomes eligible only when the

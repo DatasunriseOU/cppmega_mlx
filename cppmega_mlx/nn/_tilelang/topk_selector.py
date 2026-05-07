@@ -119,7 +119,9 @@ from __future__ import annotations
 
 # pyright: reportInvalidTypeForm=false
 
+import os
 import re
+import sys
 from dataclasses import dataclass, replace
 from functools import lru_cache
 from typing import Any
@@ -127,6 +129,85 @@ from typing import Any
 import mlx.core as mx
 
 from cppmega_mlx.nn._tilelang import _msl_transform
+
+
+# CPPMEGA Z3 wiring (beads cppmega-mlx-cuz):
+#
+# Two surfaces live in this module:
+#   * The Path B direct-MSL kernel (``mx.fast.metal_kernel`` with hand-written
+#     MSL strings) -- TileLang lowering does NOT run for these so PassConfigs
+#     do not apply. Z3 idea #11 (intra-warp barrier elision) would require
+#     either porting the Path B kernel onto the TileLang DSL or adding a
+#     post-MSL textual barrier-elision pass; neither is in scope for the
+#     ``cppmega-mlx-cuz`` wiring task.
+#   * The Path C TileLang DSL kernel built in ``_path_c_kernel_for`` -- this
+#     one *does* go through ``_msl_transform.lower_tilelang_to_msl_inline``
+#     and can opt into the Z3 PassConfigs registered in the active
+#     libtilelang build.
+#
+# Idea #4 (``tl.drop_provable_bound_checks``) is the PassConfig we expect to
+# materially affect codegen on the Path C topk merge kernel: the
+# ``lane + stride < THREADS`` guard inside the merge-tree is the kind of
+# bound check the analyzer-or-Z3 prover discharges. Idea #9
+# (``tl.simd_lift_reductions``) is declared in the TileLang source tree but
+# may not yet be registered in every in-tree libtilelang build; we filter
+# unsupported keys at runtime.
+_TOPK_PATH_C_CANDIDATE_PASS_CONFIGS: dict[str, Any] = {
+    "tl.drop_provable_bound_checks": True,
+    "tl.simd_lift_reductions": True,  # filtered out at runtime if not registered
+}
+
+_TOPK_PATH_C_FILTERED_KEYS_LOGGED: set[str] = set()
+_TOPK_PATH_C_PASS_CONFIGS_CACHE: dict[str, Any] | None = None
+
+
+def _topk_filter_supported_pass_configs(candidates: dict[str, Any]) -> dict[str, Any]:
+    """Drop PassConfig keys not registered in the active libtilelang build."""
+
+    try:
+        from tilelang import tvm  # type: ignore
+    except Exception:
+        return {}
+
+    supported: dict[str, Any] = {}
+    for key, value in candidates.items():
+        try:
+            with tvm.transform.PassContext(opt_level=3, config={key: value}):
+                pass
+        except Exception:
+            if key not in _TOPK_PATH_C_FILTERED_KEYS_LOGGED:
+                _TOPK_PATH_C_FILTERED_KEYS_LOGGED.add(key)
+                print(
+                    f"[cppmega-mlx-cuz] dropping unsupported PassConfig "
+                    f"key {key!r} from topk_selector path-c lowering "
+                    f"(not registered in active libtilelang).",
+                    file=sys.stderr,
+                )
+            continue
+        supported[key] = value
+    return supported
+
+
+def _topk_path_c_pass_configs() -> dict[str, Any]:
+    """Return the PassConfig dict to thread through this kernel's lowering.
+
+    The env var ``CPPMEGA_TOPK_PATH_C_NO_Z3`` forces the legacy lowering
+    (no PassContext) for parity tests / debug.
+    """
+
+    if os.environ.get("CPPMEGA_TOPK_PATH_C_NO_Z3", "0") not in (
+        "0",
+        "",
+        "false",
+        "False",
+    ):
+        return {}
+    global _TOPK_PATH_C_PASS_CONFIGS_CACHE
+    if _TOPK_PATH_C_PASS_CONFIGS_CACHE is None:
+        _TOPK_PATH_C_PASS_CONFIGS_CACHE = _topk_filter_supported_pass_configs(
+            _TOPK_PATH_C_CANDIDATE_PASS_CONFIGS
+        )
+    return dict(_TOPK_PATH_C_PASS_CONFIGS_CACHE)
 
 
 # TileLang's eager builder reads these module globals after _path_c_kernel_for
@@ -933,7 +1014,10 @@ def _path_c_kernel_for(
                     indices[bx, i] = pair_idx[0, _TOPK_C_K - 1 - i]
 
     lowering = _path_c_rewrite_merge_round(
-        _msl_transform.lower_tilelang_to_msl_inline(topk_selector_kernel)
+        _msl_transform.lower_tilelang_to_msl_inline(
+            topk_selector_kernel,
+            pass_configs=_topk_path_c_pass_configs(),
+        )
     )
     kernel = mx.fast.metal_kernel(
         name=f"cppmega_topk_selector_path_c_{batch}_{seq_len}_{k}_{threads}_{score_dtype}",

@@ -13,6 +13,8 @@ MSL on the same hot-loop shape as Path B's hand-written vecmat kernel.
 
 from __future__ import annotations
 
+import os
+import sys
 from dataclasses import dataclass, replace
 from functools import lru_cache
 from typing import Any, cast
@@ -22,12 +24,96 @@ import mlx.core as mx
 from cppmega_mlx.nn._tilelang import _msl_transform
 from cppmega_mlx.nn._tilelang._msl_transform import (
     MSLDispatchUnsupported,
+    _as_metal_target,
+    _assert_path_c_metal_fp8_intrinsics_registered,
     can_run_metal,
     lower_tilelang_to_msl_inline,
 )
 
 
 TILELANG_METAL_VECMAT_TARGET = "metal -thread_warp_size=32"
+
+
+# CPPMEGA Z3 wiring (beads cppmega-mlx-cuz): per-kernel PassConfig opt-in.
+#
+# The TileLang source tree declares several Z3-roadmap PassConfig keys; only a
+# subset are actually registered with TVM's ``transform.PassContext`` in the
+# in-tree built ``libtilelang.dylib``. We probe each candidate the first time
+# we build the active config dict and silently drop any unsupported keys so
+# the kernel doesn't fail to lower on builds that haven't picked up the
+# latest config registration. Idea #10 (fp8 dot4 legality) is NOT a
+# PassConfig — it is enforced inside ``T.fp8_scaled_matmul`` directly and
+# toggled by the env var ``TILELANG_DISABLE_FP8_DOT4_AUTO``; we don't
+# override that env var here.
+_FP8_VECMAT_PATH_C_CANDIDATE_PASS_CONFIGS: dict[str, Any] = {
+    # Z3 idea #4 — discharges ``if (i < N)`` guards the analyzer can prove.
+    # The M=1 vecmat hot loop has tight static extents so the prover tends
+    # to succeed; if not, the guard stays.
+    "tl.drop_provable_bound_checks": True,
+    # Z3 idea #9 (detection-only today) — flag is registered in the source
+    # tree but may not be in the active built libtilelang yet. Filtered out
+    # at runtime if not registered. Kept here so we get receipts the moment
+    # the pass flips to a rewrite upstream.
+    "tl.simd_lift_reductions": True,
+}
+
+_FP8_VECMAT_PATH_C_FILTERED_KEYS_LOGGED: set[str] = set()
+_FP8_VECMAT_PATH_C_PASS_CONFIGS_CACHE: dict[str, Any] | None = None
+
+
+def _filter_supported_pass_configs(candidates: dict[str, Any]) -> dict[str, Any]:
+    """Drop PassConfig keys not registered in the active libtilelang build.
+
+    Each candidate is probed by attempting to construct a minimal
+    ``tvm.transform.PassContext`` with it; an FFI ``AttributeError``
+    indicates the key is unknown to the live runtime registry. We log a
+    one-shot warning per unsupported key.
+    """
+
+    try:
+        from tilelang import tvm  # type: ignore
+    except Exception:
+        return {}
+
+    supported: dict[str, Any] = {}
+    for key, value in candidates.items():
+        try:
+            with tvm.transform.PassContext(opt_level=3, config={key: value}):
+                pass
+        except Exception:
+            if key not in _FP8_VECMAT_PATH_C_FILTERED_KEYS_LOGGED:
+                _FP8_VECMAT_PATH_C_FILTERED_KEYS_LOGGED.add(key)
+                print(
+                    f"[cppmega-mlx-cuz] dropping unsupported PassConfig "
+                    f"key {key!r} from fp8_vecmat_path_c lowering "
+                    f"(not registered in active libtilelang).",
+                    file=sys.stderr,
+                )
+            continue
+        supported[key] = value
+    return supported
+
+
+def _fp8_vecmat_pass_configs() -> dict[str, Any]:
+    """Return the PassConfig dict to thread through this kernel's lowering.
+
+    The env var ``CPPMEGA_FP8_VECMAT_PATH_C_NO_Z3`` forces the legacy
+    (no-PassContext) lowering for parity tests / debug.
+    """
+
+    if os.environ.get("CPPMEGA_FP8_VECMAT_PATH_C_NO_Z3", "0") not in (
+        "0",
+        "",
+        "false",
+        "False",
+    ):
+        return {}
+    global _FP8_VECMAT_PATH_C_PASS_CONFIGS_CACHE
+    if _FP8_VECMAT_PATH_C_PASS_CONFIGS_CACHE is None:
+        _FP8_VECMAT_PATH_C_PASS_CONFIGS_CACHE = _filter_supported_pass_configs(
+            _FP8_VECMAT_PATH_C_CANDIDATE_PASS_CONFIGS
+        )
+    return dict(_FP8_VECMAT_PATH_C_PASS_CONFIGS_CACHE)
 
 # TileLang resolves these globals while decorating the nested @T.prim_func.
 # Defaults keep static tooling aligned with the runtime-specialized contract.
@@ -193,7 +279,14 @@ def make_fp8_vecmat_reduce_kernel(
                     else:
                         C[col] = reduced[0] * A_scale[0] * B_scale[col]
 
-    elif vec == 4 and K % 4 == 0:
+    elif _uses_fp8_dot4_packed_macro(vec=vec, K=K):
+
+        # Fix-1 + Fix-A re-application: ensure the Path C Metal FP8 ops
+        # (notably ``tirx.metal.fp8_e4m3_dot4``) are registered before we
+        # parse the macro PrimFunc. Without this we get an opaque FFI
+        # ``AttributeError`` deep in the lowering pipeline; with it we get
+        # a clear ``RuntimeError`` naming the missing intrinsic.
+        _assert_path_c_metal_fp8_intrinsics_registered()
 
         @T.prim_func
         def fp8_vecmat_reduce(
@@ -201,7 +294,7 @@ def make_fp8_vecmat_reduce_kernel(
             A_scale: T.Tensor((1,), "float32"),
             B: T.Tensor((_FP8_VM_N, _FP8_VM_K), "float8_e4m3"),
             B_scale: T.Tensor((_FP8_VM_SW,), "float32"),
-            C: T.Tensor((_FP8_VM_N,), "float32"),
+            C: T.Tensor((1, _FP8_VM_N), "float32"),
         ):
             with T.Kernel(T.ceildiv(_FP8_VM_N, _FP8_VM_NP), threads=_FP8_VM_RT * _FP8_VM_NP) as bx:
                 accum = T.alloc_local((1,), "float32")
@@ -222,9 +315,9 @@ def make_fp8_vecmat_reduce_kernel(
                 reduced = T.call_intrin("float32", "tir.metal.simd_sum", accum[0])
                 if kr == 0 and col < _FP8_VM_N:
                     if _FP8_VM_SW == 1:
-                        C[col] = reduced * A_scale[0] * B_scale[0]
+                        C[0, col] = reduced * A_scale[0] * B_scale[0]
                     else:
-                        C[col] = reduced * A_scale[0] * B_scale[col]
+                        C[0, col] = reduced * A_scale[0] * B_scale[col]
 
     else:
 
@@ -283,6 +376,52 @@ def make_fp8_vecmat_reduce_kernel(
         return fp8_vecmat_reduce
 
 
+def _uses_fp8_dot4_packed_macro(*, vec: int, K: int) -> bool:
+    """Decide whether to emit the packed FP8 dot4 PrimFunc branch.
+
+    CPPMEGA Z3 idea #10 wiring (beads cppmega-mlx-cuz):
+
+    The legality predicate ``K % 4 == 0`` here is *load-bearing* because the
+    packed branch calls ``T.metal_fp8_e4m3_dot4`` directly with packed
+    uint32 (4 bytes per word) — it cannot run on unaligned K. (This is in
+    contrast to ``T.fp8_scaled_matmul``, where TileLang's
+    ``_z3_prove_dot4_legal_for_buffers`` already discharges the same
+    predicate and falls back to a legacy macro on UNKNOWN.) We therefore
+    keep the runtime check, but route it through this single named helper
+    so that:
+      * Future regressions are easy to grep for.
+      * A debug-only env var (``CPPMEGA_FP8_VECMAT_PATH_C_DEBUG``) raises
+        loudly instead of silently routing to the scalar fallback when a
+        prover-discharged path becomes available upstream.
+      * The PassContext that ``lower_fp8_vecmat_msl`` threads through still
+        wraps the lowering, so any future Z3-driven idea (#4 bound checks,
+        #9 simdgroup lift) discharged by the in-tree TileLang build will
+        rewrite this branch's IR with no Python-side change.
+    """
+
+    structural_match = vec == 4
+    if not structural_match:
+        return False
+    k_aligned = (K % 4 == 0)
+    if not k_aligned:
+        debug = os.environ.get("CPPMEGA_FP8_VECMAT_PATH_C_DEBUG", "0")
+        if debug not in ("0", "", "false", "False"):
+            # Debug-only assertion: surfaces the dot4 legality contract
+            # violation loudly when a developer forces this path with
+            # unaligned K. The public-API ``_normalize_vecmat_inputs``
+            # already rejects unaligned K, so the only way to reach this
+            # branch is by direct ``make_fp8_vecmat_reduce_kernel`` calls.
+            raise AssertionError(
+                f"fp8_vecmat_path_c: packed dot4 branch expects K % 4 == 0 "
+                f"(Z3 idea #10 legality), got K={K}. The scalar PrimFunc "
+                f"fallback still handles this correctly; unset "
+                f"CPPMEGA_FP8_VECMAT_PATH_C_DEBUG to re-enable that "
+                f"silent fallback."
+            )
+        return False
+    return True
+
+
 def lower_fp8_vecmat_msl(
     *,
     N: int = 4096,
@@ -308,7 +447,16 @@ def lower_fp8_vecmat_msl(
         vectorized_loads=vectorized_loads,
         scale_w_per_row=scale_w_per_row,
     )
-    artifact = tilelang.lower(prim, target=tvm.target.Target(target))
+    # Route through ``_as_metal_target`` so the legacy CLI-form spec
+    # ``"metal -thread_warp_size=32"`` is normalised to the dict form Apache
+    # TVM requires post-#2143.
+    metal_target = _as_metal_target(target)
+    pass_configs = _fp8_vecmat_pass_configs()
+    if pass_configs:
+        with tvm.transform.PassContext(opt_level=3, config=pass_configs):
+            artifact = tilelang.lower(prim, target=metal_target)
+    else:
+        artifact = tilelang.lower(prim, target=metal_target)
     if hasattr(artifact, "kernel_source"):
         return str(artifact.kernel_source)
     rt_mod = getattr(artifact, "rt_mod", None)
@@ -421,7 +569,11 @@ def _fp8_vecmat_kernel_for(
         vec=vec,
         scale_w_per_row=scale_w_per_row,
     )
-    lowering = lower_tilelang_to_msl_inline(prim, target=TILELANG_METAL_VECMAT_TARGET)
+    lowering = lower_tilelang_to_msl_inline(
+        prim,
+        target=TILELANG_METAL_VECMAT_TARGET,
+        pass_configs=_fp8_vecmat_pass_configs(),
+    )
     tilelang_input_names = [name for name in lowering.buffer_param_names if name != "C"]
     if set(tilelang_input_names) != {"A", "A_scale", "B", "B_scale"}:
         raise MSLDispatchUnsupported(
@@ -432,7 +584,15 @@ def _fp8_vecmat_kernel_for(
     source = lowering.body
     threadgroup = lowering.threadgroup
     grid = _grid_for_lowering(lowering)
-    output_shape: tuple[int, ...] = (N,)
+    # Fix-1 + Fix-A re-application: the packed-dot4 macro PrimFunc declares
+    # ``C: T.Tensor((1, N), float32)`` so its lowered output is two-dim;
+    # scalar / vectorized fallbacks declare ``C: T.Tensor((N,), float32)``.
+    # Caller always reshapes back to ``(n,)``.
+    output_shape: tuple[int, ...]
+    if _uses_fp8_dot4_packed_macro(vec=vec, K=K):
+        output_shape = (1, N)
+    else:
+        output_shape = (N,)
     kernel = mx.fast.metal_kernel(
         name=(
             f"cppmega_fp8_vecmat_path_c_{N}_{K}_{outputs_per_block}_"
@@ -590,7 +750,10 @@ def fp8_scaled_vecmat_path_c(
     except MSLDispatchUnsupported:
         return None
 
-    if output_shape == (n,) and input_names == ["A", "A_scale", "B", "B_scale"]:
+    if input_names == ["A", "A_scale", "B", "B_scale"] and output_shape in (
+        (n,),
+        (1, n),
+    ):
         outputs = cast(_msl_transform.MetalKernel, kernel)(
             inputs=(A, A_scale, B, B_scale),
             template=None,
@@ -600,7 +763,10 @@ def fp8_scaled_vecmat_path_c(
             threadgroup=threadgroup,
             stream=mx.gpu,
         )
-        return outputs[0]
+        out = outputs[0]
+        # Macro path declares C as (1, N); fallbacks as (N,). Caller
+        # contract returns flat (n,).
+        return out if out.ndim == 1 else out.reshape((n,))
 
     input_map = {
         "A": A.reshape((1, k)),

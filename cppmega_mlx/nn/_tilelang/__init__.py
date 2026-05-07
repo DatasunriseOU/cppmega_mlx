@@ -21,6 +21,32 @@ Membership:
 
 Path B emits MSL directly via mx.fast.metal_kernel. Path C lowers TileLang DSL
 to Metal when the in-tree lowering bridge supports the shape/kernel.
+
+Public Path C surface — what is *exported here* vs what only lives in submodules:
+
+- ``sparse_mla_path_c.py`` (full apply): exports the ``_fwd``/``_bwd`` raw
+  kernels, ``_status``, and lowering dumps. The ``sparse_mla_path_c_apply``
+  user wrapper is **intentionally not re-exported** — callers go through the
+  AUTO gate in ``sparse_mla_apply``. ``test_package_exports`` enforces this.
+- ``sparse_mla_blockscaled_path_c.py`` (PROBE-ONLY): exports only the E8M0 QK
+  probe / real-shape QK reducer surfaces (``..._reduce_path_c`` is a reducer
+  apply, not a full attention apply). There is no
+  ``sparse_mla_blockscaled_path_c_apply`` because the file is a
+  lowering/status surface — see its module docstring.
+- ``sparse_mla_fp8_path_c.py`` (REDUCERS-ONLY): not imported here at all.
+  Tests reach the QK / indexed-QK reducer surfaces via the submodule path.
+  Currently broken at runtime — ``tirx.metal.fp8_e4m3_dot4`` not registered.
+  See ``docs/production_kernel_routing.md`` and
+  ``reports/2026-05-06-tilelang-tvm-review/agent-D-planning-vs-reality/``.
+- ``fp8_vecmat_path_c.py`` (full apply lives in submodule):
+  ``fp8_scaled_vecmat_path_c`` exists in code but is **not** exported here.
+  Only the status/feature/lowering helpers are re-exported. Callers must
+  ``from cppmega_mlx.nn._tilelang.fp8_vecmat_path_c import fp8_scaled_vecmat_path_c``
+  if they want the apply, and accept that runtime dispatch is currently broken
+  pending the FP8 dot4 intrinsic landing in TileLang/TVM.
+- ``mamba3_path_c.py`` (full apply): not imported here. The Path B
+  ``mamba3_mimo_apply`` is the production entrypoint; Mamba3 Path C is a
+  proof/override surface reached via the submodule import.
 """
 
 from cppmega_mlx.nn._tilelang import (
@@ -54,13 +80,6 @@ from cppmega_mlx.nn._tilelang.fp8_msl_kernels import (
     fp8_scaled_vecmat,
     fp8_to_half,
     half_to_fp8,
-)
-from cppmega_mlx.nn._tilelang.fp8_vecmat_path_c import (
-    FP8VecmatPathCStatus,
-    fp8_vecmat_msl_features,
-    fp8_vecmat_path_c_status,
-    lower_fp8_vecmat_msl,
-    make_fp8_vecmat_reduce_kernel,
 )
 from cppmega_mlx.nn._tilelang.m2rnn import (
     M2RNNMetalStatus,
@@ -103,23 +122,6 @@ from cppmega_mlx.nn._tilelang.sparse_mla_blockscaled import (
     sparse_mla_blockscaled_metal_status,
     sparse_mla_blockscaled_reference,
 )
-from cppmega_mlx.nn._tilelang.sparse_mla_blockscaled_path_c import (
-    E8M0_BLOCK_SIZE,
-    E8M0_LAYOUT,
-    E8M0_SCALE_FORMAT,
-    SparseMLABlockScaledQKReducePathCStatus,
-    SparseMLABlockScaledPathCStatus,
-    blockscaled_sparse_mla_qk_msl_features,
-    blockscaled_sparse_mla_qk_path_c_status,
-    blockscaled_sparse_mla_qk_reduce_msl_features,
-    blockscaled_sparse_mla_qk_reduce_path_c,
-    blockscaled_sparse_mla_qk_reduce_path_c_status,
-    blockscaled_sparse_mla_qk_scaled_matmul_probe_status,
-    lower_blockscaled_sparse_mla_qk_msl,
-    lower_blockscaled_sparse_mla_qk_reduce_msl,
-    make_blockscaled_sparse_mla_qk_reduce_kernel,
-    make_blockscaled_sparse_mla_qk_kernel,
-)
 from cppmega_mlx.nn._tilelang.sparse_mla_fp8 import (
     SparseMLAFp8MetalStatus,
     sparse_mla_fp8_apply,
@@ -135,6 +137,10 @@ from cppmega_mlx.nn._tilelang.topk_selector import (
     topk_selector_reference,
 )
 from cppmega_mlx.nn._tilelang.topk_selector import topk_selector as topk_selector_fn
+
+# PROBE-ONLY / REDUCERS-ONLY surface — re-exported via _experimental for organization
+from cppmega_mlx.nn._tilelang import _experimental
+from cppmega_mlx.nn._tilelang._experimental import *  # noqa: F401,F403
 
 __all__ = [
     "FP8MSLKernelStatus",

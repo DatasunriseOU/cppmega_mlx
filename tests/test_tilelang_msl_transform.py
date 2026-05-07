@@ -250,3 +250,153 @@ def test_single_libtvm_ffi_image_check_rejects_mixed_images(
 
     with pytest.raises(MSLDispatchUnsupported, match="multiple libtvm_ffi.dylib images"):
         _ensure_single_libtvm_ffi_image()
+
+
+# ---------------------------------------------------------------------------
+# Fix-3 + Fix-C: xfail coverage for transforms not yet wired into
+# `_inline_tilelang_kernel_body`. Originally identified by Meta agent E
+# (reports/2026-05-06-tilelang-tvm-review/agent-E-tests-benches/
+#  meta__correctness__20260506T170721.md, gaps 1–5) and tightened by
+# gpt-5-pro G4 with `raises=AssertionError` so non-AssertionError failures
+# (NameError / ImportError / TypeError) surface loudly instead of silently
+# satisfying `strict=True`. See agent-G4-correctness-fix-a-c/
+#  chatgpt__correctness__cli__20260506T2310.md Q4.
+# ---------------------------------------------------------------------------
+
+
+def _lower_minimal_kernel_to_msl(kernel_src: str) -> str:
+    """Run a minimal kernel snippet through the source-level MSL transform.
+
+    Today the only public transform on the source side is
+    `_inline_tilelang_kernel_body`, which is what every existing test in this
+    file already exercises. The helper exists as a single point of truth so
+    that when the lowering pipeline grows a real "lower kernel -> MSL" entry
+    point, the xfail tests below can be retargeted by editing one function
+    instead of five.
+    """
+
+    return _inline_tilelang_kernel_body(kernel_src)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="future work: prefix threadgroup_barrier with metal:: namespace",
+    raises=AssertionError,
+)
+def test_inline_body_prefixes_threadgroup_barrier_with_metal_namespace() -> None:
+    """threadgroup_barrier: assert that the lowered MSL contains the
+    fully-qualified Metal builtin.
+
+    raises=AssertionError so any non-AssertionError (NameError if helper goes
+    away, ImportError, TypeError on signature change) surfaces loudly instead
+    of silently satisfying strict-xfail (gpt-5-pro G4 Q4).
+    """
+    body = _lower_minimal_kernel_to_msl(
+        """
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    C[((int)threadIdx.x)] = A[((int)threadIdx.x)];
+"""
+    )
+    assert "metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup)" in body
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="future work: surface simdgroup_matrix + simdgroup_multiply_accumulate",
+    raises=AssertionError,
+)
+def test_inline_body_handles_simdgroup_matrix_and_mma() -> None:
+    """simdgroup MMA: assert that the lowered MSL contains both
+    `simdgroup_matrix` and `simdgroup_multiply_accumulate`.
+
+    raises=AssertionError so any non-AssertionError (NameError if helper goes
+    away, ImportError, TypeError on signature change) surfaces loudly instead
+    of silently satisfying strict-xfail (gpt-5-pro G4 Q4).
+    """
+    body = _lower_minimal_kernel_to_msl(
+        """
+    simdgroup_float8x8 a;
+    simdgroup_float8x8 b;
+    simdgroup_float8x8 c;
+    simdgroup_load(a, A, 8);
+    simdgroup_load(b, B, 8);
+    simdgroup_multiply_accumulate(c, a, b, c);
+    simdgroup_store(c, C, 8);
+"""
+    )
+    assert "simdgroup_matrix" in body
+    assert "simdgroup_multiply_accumulate" in body
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="future work: prefix bfloat / half4 with metal:: namespace",
+    raises=AssertionError,
+)
+def test_inline_body_prefixes_metal_namespace_for_bfloat_and_half4() -> None:
+    """bfloat / half4: assert that the lowered MSL namespace-qualifies both
+    Metal scalar/vector types.
+
+    raises=AssertionError so any non-AssertionError (NameError if helper goes
+    away, ImportError, TypeError on signature change) surfaces loudly instead
+    of silently satisfying strict-xfail (gpt-5-pro G4 Q4).
+    """
+    body = _lower_minimal_kernel_to_msl(
+        """
+    bfloat scale = (bfloat)1.0;
+    half4 packed = half4(A[0], A[1], A[2], A[3]);
+    C[((int)threadIdx.x)] = (float)(packed.x) * (float)scale;
+"""
+    )
+    assert "metal::bfloat" in body
+    assert "metal::half4" in body
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="future work: preserve device vs threadgroup address-space qualifiers across casts",
+    raises=AssertionError,
+)
+def test_inline_body_canonicalizes_device_vs_threadgroup_address_space_casts() -> None:
+    """address-space casts: assert that both `device` and `threadgroup`
+    qualifiers survive the lowering (no implicit demotion to a single space).
+
+    raises=AssertionError so any non-AssertionError (NameError if helper goes
+    away, ImportError, TypeError on signature change) surfaces loudly instead
+    of silently satisfying strict-xfail (gpt-5-pro G4 Q4).
+    """
+    body = _lower_minimal_kernel_to_msl(
+        """
+    float* tg_ptr = (float*)smem;
+    float* dev_ptr = (float*)C;
+    dev_ptr[((int)threadIdx.x)] = tg_ptr[((int)threadIdx.x)];
+"""
+    )
+    # Future canonicalization must re-attach address-space qualifiers that
+    # were dropped on the input side; today the transform is a pass-through
+    # and does not synthesize them, so both literals are absent.
+    assert "static_cast<threadgroup float*>" in body
+    assert "static_cast<device float*>" in body
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="future work: prefix atomic_fetch_* helpers with metal:: namespace",
+    raises=AssertionError,
+)
+def test_inline_body_prefixes_atomics_with_metal_namespace() -> None:
+    """atomics: assert that the lowered MSL emits the fully-qualified
+    `metal::atomic_fetch_add_explicit` form (and analogous min/max).
+
+    raises=AssertionError so any non-AssertionError (NameError if helper goes
+    away, ImportError, TypeError on signature change) surfaces loudly instead
+    of silently satisfying strict-xfail (gpt-5-pro G4 Q4).
+    """
+    body = _lower_minimal_kernel_to_msl(
+        """
+    atomic_fetch_add_explicit(&C[((int)blockIdx.x)], 1u, memory_order_relaxed);
+    atomic_fetch_min_explicit(&C[((int)blockIdx.x)], 1u, memory_order_relaxed);
+    atomic_fetch_max_explicit(&C[((int)blockIdx.x)], 1u, memory_order_relaxed);
+"""
+    )
+    assert "metal::atomic_fetch_add_explicit" in body

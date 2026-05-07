@@ -73,6 +73,30 @@ from cppmega_mlx.nn.sparse_mla import (
 )
 
 
+# CPPMEGA Z3 wiring (beads cppmega-mlx-cuz):
+#
+# This module is a *direct-MSL* port: the forward and backward kernels are
+# hand-written MSL strings dispatched via ``mx.fast.metal_kernel``. They do
+# not pass through ``tilelang.engine.lower``, so TileLang ``PassConfig``
+# entries (Z3 ideas #4, #9, #10, #11) cannot apply -- there is no IR layer
+# left to rewrite by the time the kernel reaches MLX.
+#
+# Idea #11 (intra-warp barrier elision) was specifically called out in the
+# ``cppmega-mlx-cuz`` task spec because the forward/backward kernels emit
+# ``threadgroup_barrier(mem_flags::mem_threadgroup)`` calls inside reduce
+# / shuffle patterns. Those barriers are *correct* on Apple Metal even
+# inside a single simdgroup -- the threadgroup spans 4 simdgroups for the
+# forward path, and the barrier sequences cross simdgroup boundaries. To
+# elide them we would need either:
+#   (a) port the kernel to the TileLang DSL so the in-tree pass can run, or
+#   (b) write a post-MSL textual barrier-elision pass that mirrors #11.
+# Both are out of scope for this wiring task; flagged as TODO so the
+# next wave can pick it up. -- DG, beads cppmega-mlx-cuz, 2026-05-07.
+# TODO(z3-idea-11): port direct-MSL barrier-elision when #11 lands a
+# rewrite-mode pass upstream, or migrate the forward/backward to TileLang
+# DSL and then opt this kernel into the PassConfig.
+
+
 # ---------------------------------------------------------------------------
 # Public status surface
 # ---------------------------------------------------------------------------
