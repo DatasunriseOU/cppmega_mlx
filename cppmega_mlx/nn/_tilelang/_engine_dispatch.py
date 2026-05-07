@@ -29,9 +29,10 @@ import warnings
 from typing import Any
 
 
-_VALID_MODES = ("auto", "engine", "shim")
+_VALID_MODES = ("auto", "engine", "shim", "engine_with_msl_extraction")
 _FLAG_ENV = "CPPMEGA_MLX_TILELANG_ENGINE"
 _FALLBACK_WARNED = False
+_MSL_EXTRACTION_FALLBACK_WARNED = False
 
 
 def tilelang_engine_mode() -> str:
@@ -80,7 +81,12 @@ def _shim_lower(prim_func: Any, target: str) -> Any:
     return lower_tilelang_to_msl_inline(prim_func, target="metal")
 
 
-def dispatch_lower(prim_func: Any, target: str) -> Any:
+def dispatch_lower(
+    prim_func: Any,
+    target: str,
+    *,
+    return_msl: bool = False,
+) -> Any:
     """Lower ``prim_func`` for ``target`` per the active engine mode.
 
     Returns either a ``tilelang.compile`` artifact (engine path; carries
@@ -88,13 +94,32 @@ def dispatch_lower(prim_func: Any, target: str) -> Any:
     (shim path; carries ``msl_text``). Callers that always need the
     runtime-callable (CompiledArtifact) should set
     ``CPPMEGA_MLX_TILELANG_ENGINE=engine``.
+
+    Phase-3 MSL bridging: if ``return_msl=True`` (or env mode is
+    ``"engine_with_msl_extraction"``) the dispatcher routes through the
+    engine but extracts a :class:`TileLangMSLLowering`-shaped result via
+    :func:`cppmega_mlx.nn._tilelang._msl_extraction.extract_msl_from_engine_artifact`,
+    so legacy ``mx.fast.metal_kernel(...)`` callers can adopt the engine
+    path without code churn. If extraction fails (target is not metal, or
+    the artifact has no ``kernel_source``), falls back to the legacy shim
+    with a one-shot warning so callers don't silently lose MSL text.
     """
 
     mode = tilelang_engine_mode()
-    if mode == "engine":
-        return _engine_compile(prim_func, target)
+    msl_requested = return_msl or mode == "engine_with_msl_extraction"
+
     if mode == "shim":
         return _shim_lower(prim_func, target)
+
+    if mode == "engine" and not msl_requested:
+        return _engine_compile(prim_func, target)
+
+    if msl_requested:
+        # engine path with required MSL extraction. On any failure (engine
+        # error, non-metal target, no kernel_source), fall back to the shim
+        # exactly once with a UserWarning.
+        return _engine_with_msl_extraction(prim_func, target)
+
     # auto: prefer engine, fall back to shim on import failure with a
     # one-shot warning. Other engine errors propagate (see _engine_compile
     # docstring rationale: silently swallowing TVM AttributeErrors and
@@ -116,15 +141,97 @@ def dispatch_lower(prim_func: Any, target: str) -> Any:
         return _shim_lower(prim_func, target)
 
 
-def _reset_fallback_warning_for_tests() -> None:
-    """Test hook: re-arm the one-shot fallback warning."""
+def _engine_with_msl_extraction(prim_func: Any, target: str) -> Any:
+    """Engine path that extracts an MSL-shaped lowering from the artifact.
 
-    global _FALLBACK_WARNED
+    On any failure (ImportError, non-metal target, no ``kernel_source``,
+    parse failure) falls back to ``_shim_lower`` with a one-shot
+    ``UserWarning`` so callers see *one* signal that the new path didn't
+    work and they're back on the legacy shim.
+    """
+
+    global _MSL_EXTRACTION_FALLBACK_WARNED
+
+    from cppmega_mlx.nn._tilelang._msl_extraction import (
+        extract_msl_from_engine_artifact,
+    )
+
+    try:
+        artifact = _engine_compile(prim_func, target)
+    except (ImportError, ModuleNotFoundError) as exc:
+        if not _MSL_EXTRACTION_FALLBACK_WARNED:
+            warnings.warn(
+                "cppmega_mlx._tilelang: engine_with_msl_extraction requested "
+                f"but tilelang unavailable ({exc.__class__.__name__}: {exc}); "
+                "falling back to MSL shim.",
+                UserWarning,
+                stacklevel=2,
+            )
+            _MSL_EXTRACTION_FALLBACK_WARNED = True
+        return _shim_lower(prim_func, target)
+
+    lowering = extract_msl_from_engine_artifact(artifact, target=target)
+    if lowering is None:
+        if not _MSL_EXTRACTION_FALLBACK_WARNED:
+            warnings.warn(
+                "cppmega_mlx._tilelang: engine_with_msl_extraction returned "
+                "None (non-metal target or artifact had no kernel_source); "
+                "falling back to MSL shim.",
+                UserWarning,
+                stacklevel=2,
+            )
+            _MSL_EXTRACTION_FALLBACK_WARNED = True
+        return _shim_lower(prim_func, target)
+    return lowering
+
+
+def dispatch_lower_supports_msl_extraction() -> bool:
+    """Return True iff the engine_with_msl_extraction path is reachable.
+
+    Thin wrapper over :func:`_msl_extraction.supports_msl_extraction` —
+    importable from caller modules without dragging in the whole
+    ``_msl_extraction`` namespace.
+    """
+
+    try:
+        from cppmega_mlx.nn._tilelang._msl_extraction import supports_msl_extraction
+    except ImportError:
+        return False
+    return supports_msl_extraction()
+
+
+def _reset_fallback_warning_for_tests() -> None:
+    """Test hook: re-arm the one-shot fallback warnings (auto + msl-extraction)."""
+
+    global _FALLBACK_WARNED, _MSL_EXTRACTION_FALLBACK_WARNED
     _FALLBACK_WARNED = False
+    _MSL_EXTRACTION_FALLBACK_WARNED = False
+
+
+def artifact_to_source(artifact: Any) -> str:
+    """Return rendered kernel source from a ``tilelang.compile`` / engine artifact.
+
+    Works for both engine artifacts (CUDA/HIP/Metal source via
+    ``kernel_source`` or ``rt_mod.get_source()``) and shim
+    :class:`TileLangMSLLowering` instances (returns ``msl_text``). Phase-3
+    callers use this to extract a single source string from whichever artifact
+    :func:`dispatch_lower` produced for the active engine mode.
+    """
+
+    if hasattr(artifact, "msl_text"):
+        return str(artifact.msl_text)
+    if hasattr(artifact, "kernel_source"):
+        return str(artifact.kernel_source)
+    rt_mod = getattr(artifact, "rt_mod", None)
+    if rt_mod is not None and hasattr(rt_mod, "get_source"):
+        return str(rt_mod.get_source())
+    return str(artifact)
 
 
 __all__ = [
     "dispatch_lower",
+    "dispatch_lower_supports_msl_extraction",
     "tilelang_engine_mode",
+    "artifact_to_source",
     "_reset_fallback_warning_for_tests",
 ]

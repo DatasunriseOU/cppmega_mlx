@@ -1781,6 +1781,223 @@ def _mlx_total_thread_grid(lowering: _msl_transform.TileLangMSLLowering) -> tupl
     )
 
 
+def _make_sparse_mla_fwd_prim(
+    BATCH: int,
+    SEQ_LEN: int,
+    HEADS: int,
+    QK_DIM: int,
+    KV_GROUP: int,
+    HEAD_KV: int,
+    TOPK: int,
+    SEQ_LEN_KV: int,
+    D_V: int,
+    THREADS: int,
+) -> Any:
+    """Build the Sparse-MLA fwd PrimFunc only (no MLX kernel wrap).
+
+    Shared between the legacy MSL-shim builder (:func:`_fwd_kernel_for`) and
+    the engine-path builder (:func:`_fwd_kernel_engine_for`). Pure TileLang
+    DSL; no T.gemm / no transposed matmul / no inline MSL.
+    """
+
+    import tilelang.language as T
+
+    Q_SIZE = BATCH * SEQ_LEN * HEADS * QK_DIM
+    KV_SIZE = BATCH * SEQ_LEN_KV * KV_GROUP * QK_DIM
+    IDX_SIZE = BATCH * SEQ_LEN * KV_GROUP * TOPK
+    OUT_SIZE = BATCH * SEQ_LEN * HEADS * D_V
+    LSE_SIZE = BATCH * SEQ_LEN * HEADS
+    LANES = BATCH * SEQ_LEN * HEADS
+    LOG_THREADS = THREADS.bit_length() - 1
+
+    @T.prim_func
+    def sparse_mla_fwd(
+        q: T.Tensor((Q_SIZE,), "float16"),
+        kv: T.Tensor((KV_SIZE,), "float16"),
+        indices: T.Tensor((IDX_SIZE,), "int32"),
+        sm_scale_buf: T.Tensor((1,), "float32"),
+        out: T.Tensor((OUT_SIZE,), "float16"),
+        lse: T.Tensor((LSE_SIZE,), "float32"),
+    ):
+        with T.Kernel(LANES, threads=THREADS) as bx:
+            lane = T.get_thread_binding()
+            scores = T.alloc_shared((TOPK,), "float32", scope="shared")
+            reduce_buf = T.alloc_shared((THREADS,), "float32", scope="shared")
+            acc = T.alloc_local((1,), "float32")
+            local = T.alloc_local((1,), "float32")
+            inv_sum = T.alloc_local((1,), "float32")
+            stride = T.alloc_local((1,), "int32")
+            gather_idx = T.alloc_local((1,), "int32")
+
+            h = bx % HEADS
+            b = bx // (HEADS * SEQ_LEN)
+            g = h // HEAD_KV
+            q_row_base = bx * QK_DIM
+            kv_b_base = b * (SEQ_LEN_KV * KV_GROUP * QK_DIM)
+            idx_base = ((bx // HEADS) * KV_GROUP + g) * TOPK
+            out_row = bx * D_V
+            sm_scale = sm_scale_buf[0]
+
+            for k in T.serial(lane, TOPK, step=THREADS):
+                gather_idx[0] = indices[idx_base + k]
+                if gather_idx[0] < 0:
+                    scores[k] = T.float32(-1.0e38)
+                else:
+                    acc[0] = 0.0
+                    kv_row_base = kv_b_base + (gather_idx[0] * KV_GROUP + g) * QK_DIM
+                    for d in T.serial(QK_DIM):
+                        acc[0] = acc[0] + T.cast(q[q_row_base + d], "float32") * T.cast(
+                            kv[kv_row_base + d], "float32"
+                        )
+                    scores[k] = acc[0] * sm_scale
+            T.sync_threads()
+
+            local[0] = T.float32(-1.0e38)
+            for k in T.serial(lane, TOPK, step=THREADS):
+                if scores[k] > local[0]:
+                    local[0] = scores[k]
+            reduce_buf[lane] = local[0]
+            T.sync_threads()
+            for round_id in T.serial(LOG_THREADS):
+                stride[0] = T.shift_right(THREADS, round_id + 1)
+                if lane < stride[0]:
+                    if reduce_buf[lane + stride[0]] > reduce_buf[lane]:
+                        reduce_buf[lane] = reduce_buf[lane + stride[0]]
+                T.sync_threads()
+            row_max = reduce_buf[0]
+
+            for k in T.serial(lane, TOPK, step=THREADS):
+                if scores[k] == T.float32(-1.0e38):
+                    scores[k] = 0.0
+                else:
+                    scores[k] = T.exp(scores[k] - row_max)
+            T.sync_threads()
+
+            local[0] = 0.0
+            for k in T.serial(lane, TOPK, step=THREADS):
+                local[0] = local[0] + scores[k]
+            reduce_buf[lane] = local[0]
+            T.sync_threads()
+            for round_id in T.serial(LOG_THREADS):
+                stride[0] = T.shift_right(THREADS, round_id + 1)
+                if lane < stride[0]:
+                    reduce_buf[lane] = reduce_buf[lane] + reduce_buf[lane + stride[0]]
+                T.sync_threads()
+            sumexp = reduce_buf[0]
+
+            inv_sum[0] = 0.0
+            if sumexp > 0.0:
+                inv_sum[0] = 1.0 / sumexp
+
+            for d in T.serial(lane, D_V, step=THREADS):
+                acc[0] = 0.0
+                for k in T.serial(TOPK):
+                    gather_idx[0] = indices[idx_base + k]
+                    if gather_idx[0] >= 0:
+                        kv_row_base = kv_b_base + (gather_idx[0] * KV_GROUP + g) * QK_DIM
+                        acc[0] = acc[0] + scores[k] * T.cast(
+                            kv[kv_row_base + d], "float32"
+                        )
+                out[out_row + d] = acc[0] * inv_sum[0]
+
+            if lane == 0:
+                if sumexp > 0.0:
+                    lse[bx] = row_max + T.log(sumexp)
+                else:
+                    lse[bx] = 0.0
+
+    return sparse_mla_fwd
+
+
+@lru_cache(maxsize=128)
+def _fwd_kernel_engine_for(
+    BATCH: int,
+    SEQ_LEN: int,
+    HEADS: int,
+    QK_DIM: int,
+    KV_GROUP: int,
+    HEAD_KV: int,
+    TOPK: int,
+    SEQ_LEN_KV: int,
+    D_V: int,
+    THREADS: int,
+    target: str = "metal",
+) -> Any:
+    """Build the Sparse-MLA fwd kernel through the unified engine dispatcher.
+
+    Returns whatever :func:`dispatch_lower` returns for the active mode:
+    a ``tilelang.compile`` artifact carrying ``_tilelang_engine_target``
+    (engine path; backend-portable across CUDA / HIP / Metal), or a
+    :class:`TileLangMSLLowering` (shim path). Used by parity tests and by
+    callers that want a backend-portable artifact.
+
+    The legacy :func:`_fwd_kernel_for` is preserved verbatim because the MLX
+    runtime path needs ``lowering.body`` / ``lowering.header`` strings; the
+    full flip will land alongside the Phase-3 MSL-extraction adapter.
+    """
+
+    from cppmega_mlx.nn._tilelang._engine_dispatch import dispatch_lower
+
+    prim = _make_sparse_mla_fwd_prim(
+        BATCH=BATCH,
+        SEQ_LEN=SEQ_LEN,
+        HEADS=HEADS,
+        QK_DIM=QK_DIM,
+        KV_GROUP=KV_GROUP,
+        HEAD_KV=HEAD_KV,
+        TOPK=TOPK,
+        SEQ_LEN_KV=SEQ_LEN_KV,
+        D_V=D_V,
+        THREADS=THREADS,
+    )
+    return dispatch_lower(prim, target)
+
+
+def lower_sparse_mla_fwd_msl(
+    *,
+    BATCH: int,
+    SEQ_LEN: int,
+    HEADS: int,
+    QK_DIM: int,
+    KV_GROUP: int,
+    HEAD_KV: int,
+    TOPK: int,
+    SEQ_LEN_KV: int,
+    D_V: int,
+    THREADS: int,
+    target: str = "metal",
+) -> str:
+    """Lower the Path C Sparse-MLA fwd kernel and return rendered source.
+
+    Routes through :func:`_engine_dispatch.dispatch_lower` so the env var
+    ``CPPMEGA_MLX_TILELANG_ENGINE`` selects between the unified
+    ``tilelang.compile`` engine and the legacy MSL shim. Under ``engine`` mode
+    the returned source can be CUDA / HIP / Metal depending on ``target``;
+    under ``shim`` mode it is always the legacy MSL string. Used by parity
+    tests in ``cppmega/tests/test_sparse_mla_path_c_engine.py``.
+    """
+
+    from cppmega_mlx.nn._tilelang._engine_dispatch import (
+        artifact_to_source,
+        dispatch_lower,
+    )
+
+    prim = _make_sparse_mla_fwd_prim(
+        BATCH=BATCH,
+        SEQ_LEN=SEQ_LEN,
+        HEADS=HEADS,
+        QK_DIM=QK_DIM,
+        KV_GROUP=KV_GROUP,
+        HEAD_KV=HEAD_KV,
+        TOPK=TOPK,
+        SEQ_LEN_KV=SEQ_LEN_KV,
+        D_V=D_V,
+        THREADS=THREADS,
+    )
+    artifact = dispatch_lower(prim, target)
+    return artifact_to_source(artifact)
+
+
 @lru_cache(maxsize=128)
 def _fwd_kernel_for(
     BATCH: int,
@@ -1954,6 +2171,261 @@ def _fwd_kernel_for(
         ensure_row_contiguous=True,
     )
     return kernel, lowering
+
+
+def _make_sparse_mla_bwd_prim(
+    BATCH: int,
+    SEQ_LEN: int,
+    HEADS: int,
+    QK_DIM: int,
+    KV_GROUP: int,
+    HEAD_KV: int,
+    TOPK: int,
+    SEQ_LEN_KV: int,
+    D_V: int,
+    THREADS: int,
+) -> Any:
+    """Build the Sparse-MLA bwd PrimFunc only (no MLX kernel wrap).
+
+    Shared between the legacy MSL-shim builder (:func:`_bwd_kernel_for`) and
+    the engine-path builder (:func:`_bwd_kernel_engine_for`). Pure TileLang
+    DSL; no T.gemm / no transposed matmul / no inline MSL.
+    """
+
+    import tilelang.language as T
+
+    LANES = BATCH * SEQ_LEN * HEADS
+    Q_SIZE = BATCH * SEQ_LEN * HEADS * QK_DIM
+    KV_SIZE = BATCH * SEQ_LEN_KV * KV_GROUP * QK_DIM
+    DOUT_SIZE = BATCH * SEQ_LEN * HEADS * D_V
+    IDX_SIZE = BATCH * SEQ_LEN * KV_GROUP * TOPK
+    DKV_PARTIAL_SIZE = BATCH * SEQ_LEN * HEADS * TOPK * QK_DIM
+    LOG_THREADS = THREADS.bit_length() - 1
+
+    @T.prim_func
+    def sparse_mla_bwd(
+        q: T.Tensor((Q_SIZE,), "float16"),
+        kv: T.Tensor((KV_SIZE,), "float16"),
+        d_out: T.Tensor((DOUT_SIZE,), "float16"),
+        indices: T.Tensor((IDX_SIZE,), "int32"),
+        sm_scale_buf: T.Tensor((1,), "float32"),
+        dq: T.Tensor((Q_SIZE,), "float16"),
+        dkv_partial: T.Tensor((DKV_PARTIAL_SIZE,), "float16"),
+    ):
+        with T.Kernel(LANES, threads=THREADS) as bx:
+            lane = T.get_thread_binding()
+            scores = T.alloc_shared((TOPK,), "float32", scope="shared")
+            p = T.alloc_shared((TOPK,), "float32", scope="shared")
+            dp = T.alloc_shared((TOPK,), "float32", scope="shared")
+            ds = T.alloc_shared((TOPK,), "float32", scope="shared")
+            reduce_buf = T.alloc_shared((THREADS,), "float32", scope="shared")
+            acc = T.alloc_local((1,), "float32")
+            local = T.alloc_local((1,), "float32")
+            inv_sum = T.alloc_local((1,), "float32")
+            stride = T.alloc_local((1,), "int32")
+            gather_idx = T.alloc_local((1,), "int32")
+
+            h = bx % HEADS
+            b = bx // (HEADS * SEQ_LEN)
+            g = h // HEAD_KV
+            q_row_base = bx * QK_DIM
+            d_out_row = bx * D_V
+            kv_b_base = b * (SEQ_LEN_KV * KV_GROUP * QK_DIM)
+            idx_base = ((bx // HEADS) * KV_GROUP + g) * TOPK
+            dkv_partial_base = bx * TOPK * QK_DIM
+            sm_scale = sm_scale_buf[0]
+
+            for k in T.serial(lane, TOPK, step=THREADS):
+                gather_idx[0] = indices[idx_base + k]
+                if gather_idx[0] < 0:
+                    scores[k] = T.float32(-1.0e38)
+                else:
+                    acc[0] = 0.0
+                    kv_row_base = kv_b_base + (gather_idx[0] * KV_GROUP + g) * QK_DIM
+                    for d in T.serial(QK_DIM):
+                        acc[0] = acc[0] + T.cast(q[q_row_base + d], "float32") * T.cast(
+                            kv[kv_row_base + d], "float32"
+                        )
+                    scores[k] = acc[0] * sm_scale
+            T.sync_threads()
+
+            local[0] = T.float32(-1.0e38)
+            for k in T.serial(lane, TOPK, step=THREADS):
+                if scores[k] > local[0]:
+                    local[0] = scores[k]
+            reduce_buf[lane] = local[0]
+            T.sync_threads()
+            for round_id in T.serial(LOG_THREADS):
+                stride[0] = T.shift_right(THREADS, round_id + 1)
+                if lane < stride[0]:
+                    if reduce_buf[lane + stride[0]] > reduce_buf[lane]:
+                        reduce_buf[lane] = reduce_buf[lane + stride[0]]
+                T.sync_threads()
+            row_max = reduce_buf[0]
+
+            for k in T.serial(lane, TOPK, step=THREADS):
+                gather_idx[0] = indices[idx_base + k]
+                if gather_idx[0] < 0:
+                    p[k] = 0.0
+                else:
+                    p[k] = T.exp(scores[k] - row_max)
+            T.sync_threads()
+
+            local[0] = 0.0
+            for k in T.serial(lane, TOPK, step=THREADS):
+                local[0] = local[0] + p[k]
+            reduce_buf[lane] = local[0]
+            T.sync_threads()
+            for round_id in T.serial(LOG_THREADS):
+                stride[0] = T.shift_right(THREADS, round_id + 1)
+                if lane < stride[0]:
+                    reduce_buf[lane] = reduce_buf[lane] + reduce_buf[lane + stride[0]]
+                T.sync_threads()
+            sumexp = reduce_buf[0]
+            inv_sum[0] = 0.0
+            if sumexp > 0.0:
+                inv_sum[0] = 1.0 / sumexp
+
+            for k in T.serial(lane, TOPK, step=THREADS):
+                p[k] = p[k] * inv_sum[0]
+            T.sync_threads()
+
+            for k in T.serial(lane, TOPK, step=THREADS):
+                gather_idx[0] = indices[idx_base + k]
+                if gather_idx[0] < 0:
+                    dp[k] = 0.0
+                else:
+                    acc[0] = 0.0
+                    kv_row_base = kv_b_base + (gather_idx[0] * KV_GROUP + g) * QK_DIM
+                    for d in T.serial(D_V):
+                        acc[0] = acc[0] + T.cast(
+                            kv[kv_row_base + d], "float32"
+                        ) * T.cast(d_out[d_out_row + d], "float32")
+                    dp[k] = acc[0]
+            T.sync_threads()
+
+            local[0] = 0.0
+            for k in T.serial(lane, TOPK, step=THREADS):
+                local[0] = local[0] + p[k] * dp[k]
+            reduce_buf[lane] = local[0]
+            T.sync_threads()
+            for round_id in T.serial(LOG_THREADS):
+                stride[0] = T.shift_right(THREADS, round_id + 1)
+                if lane < stride[0]:
+                    reduce_buf[lane] = reduce_buf[lane] + reduce_buf[lane + stride[0]]
+                T.sync_threads()
+            rowsum = reduce_buf[0]
+
+            for k in T.serial(lane, TOPK, step=THREADS):
+                ds[k] = p[k] * (dp[k] - rowsum)
+            T.sync_threads()
+
+            for d in T.serial(lane, QK_DIM, step=THREADS):
+                acc[0] = 0.0
+                for k in T.serial(TOPK):
+                    gather_idx[0] = indices[idx_base + k]
+                    if gather_idx[0] >= 0:
+                        kv_row_base = kv_b_base + (gather_idx[0] * KV_GROUP + g) * QK_DIM
+                        acc[0] = acc[0] + ds[k] * T.cast(
+                            kv[kv_row_base + d], "float32"
+                        )
+                dq[q_row_base + d] = acc[0] * sm_scale
+
+            for kd in T.serial(lane, TOPK * QK_DIM, step=THREADS):
+                k = kd // QK_DIM
+                d = kd % QK_DIM
+                gather_idx[0] = indices[idx_base + k]
+                if gather_idx[0] < 0:
+                    dkv_partial[dkv_partial_base + kd] = 0.0
+                else:
+                    acc[0] = sm_scale * ds[k] * T.cast(q[q_row_base + d], "float32")
+                    if d < D_V:
+                        dkv_partial[dkv_partial_base + kd] = p[k] * T.cast(
+                            d_out[d_out_row + d], "float32"
+                        ) + acc[0]
+                    else:
+                        dkv_partial[dkv_partial_base + kd] = acc[0]
+
+    return sparse_mla_bwd
+
+
+@lru_cache(maxsize=128)
+def _bwd_kernel_engine_for(
+    BATCH: int,
+    SEQ_LEN: int,
+    HEADS: int,
+    QK_DIM: int,
+    KV_GROUP: int,
+    HEAD_KV: int,
+    TOPK: int,
+    SEQ_LEN_KV: int,
+    D_V: int,
+    THREADS: int,
+    target: str = "metal",
+) -> Any:
+    """Build the Sparse-MLA bwd kernel through the unified engine dispatcher.
+
+    See :func:`_fwd_kernel_engine_for` for engine/shim semantics. The legacy
+    :func:`_bwd_kernel_for` is preserved verbatim for the MLX runtime path.
+    """
+
+    from cppmega_mlx.nn._tilelang._engine_dispatch import dispatch_lower
+
+    prim = _make_sparse_mla_bwd_prim(
+        BATCH=BATCH,
+        SEQ_LEN=SEQ_LEN,
+        HEADS=HEADS,
+        QK_DIM=QK_DIM,
+        KV_GROUP=KV_GROUP,
+        HEAD_KV=HEAD_KV,
+        TOPK=TOPK,
+        SEQ_LEN_KV=SEQ_LEN_KV,
+        D_V=D_V,
+        THREADS=THREADS,
+    )
+    return dispatch_lower(prim, target)
+
+
+def lower_sparse_mla_bwd_msl(
+    *,
+    BATCH: int,
+    SEQ_LEN: int,
+    HEADS: int,
+    QK_DIM: int,
+    KV_GROUP: int,
+    HEAD_KV: int,
+    TOPK: int,
+    SEQ_LEN_KV: int,
+    D_V: int,
+    THREADS: int,
+    target: str = "metal",
+) -> str:
+    """Lower the Path C Sparse-MLA bwd kernel and return rendered source.
+
+    Routes through :func:`_engine_dispatch.dispatch_lower`; see
+    :func:`lower_sparse_mla_fwd_msl` for engine/shim semantics. Used by parity
+    tests in ``cppmega/tests/test_sparse_mla_path_c_engine.py``.
+    """
+
+    from cppmega_mlx.nn._tilelang._engine_dispatch import (
+        artifact_to_source,
+        dispatch_lower,
+    )
+
+    prim = _make_sparse_mla_bwd_prim(
+        BATCH=BATCH,
+        SEQ_LEN=SEQ_LEN,
+        HEADS=HEADS,
+        QK_DIM=QK_DIM,
+        KV_GROUP=KV_GROUP,
+        HEAD_KV=HEAD_KV,
+        TOPK=TOPK,
+        SEQ_LEN_KV=SEQ_LEN_KV,
+        D_V=D_V,
+        THREADS=THREADS,
+    )
+    artifact = dispatch_lower(prim, target)
+    return artifact_to_source(artifact)
 
 
 @lru_cache(maxsize=128)

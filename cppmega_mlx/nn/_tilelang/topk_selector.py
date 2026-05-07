@@ -1078,6 +1078,27 @@ def _path_c_kernel_for(
     if getattr(artifact, "_tilelang_engine_target", None) is not None:
         return artifact, None  # engine path: caller invokes the artifact directly
 
+    # Phase-3 MSL-extraction bridge: if the unified engine is reachable
+    # AND the caller is not relying on the legacy shim's pass_configs
+    # threading, prefer the engine path with MSL extraction. This produces
+    # a :class:`TileLangMSLLowering` from a ``tilelang.compile`` artifact
+    # so the existing ``mx.fast.metal_kernel`` wrapping below works
+    # unchanged. Falls back to the shim transparently on any extraction
+    # failure (the helper itself emits the warning).
+    from cppmega_mlx.nn._tilelang._engine_dispatch import (
+        dispatch_lower_supports_msl_extraction,
+    )
+    if (
+        not _topk_path_c_pass_configs()
+        and dispatch_lower_supports_msl_extraction()
+        and not hasattr(artifact, "msl_text")
+    ):
+        bridged = dispatch_lower(
+            topk_selector_kernel, target="metal", return_msl=True
+        )
+        if hasattr(bridged, "msl_text"):
+            artifact = bridged
+
     # Shim path: rewrite the merge round + wrap in mx.fast.metal_kernel as before.
     lowering = _path_c_rewrite_merge_round(artifact)
     if _topk_path_c_pass_configs() and getattr(artifact, "pass_configs", None) is None:

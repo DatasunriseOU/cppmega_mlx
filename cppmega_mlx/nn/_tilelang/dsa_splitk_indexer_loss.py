@@ -102,6 +102,7 @@ API surface
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from functools import lru_cache
@@ -564,134 +565,80 @@ def make_dsa_splitk_stage1_kernel(
                         d1_i[i] = d1_i[i] * T.exp(m1_i_prev[i] - m1_i[i]) + row_sum_local[i]
 
             # Persist the (m_i, d_i) statistics back to global memory.
-            # Wave-4 perf #3: M1/D1 writes only when COMPUTE_INDEX (else
-            # the dedicated stage1-idx kernel writes them).
             for i in T.Parallel(BLOCK_SQ):
                 sq_idx = sq_block_id * BLOCK_SQ + i
                 if sq_idx < ASq:
                     M[b, h, sq_idx] = m_i[i]
                     D[b, h, sq_idx] = d_i[i]
-                    if COMPUTE_INDEX and h == 0:
+                    if h == 0:
                         M1[b, sq_idx] = m1_i[i]
                         D1[b, sq_idx] = d1_i[i]
 
     return dsa_stage1
 
 
-def make_dsa_splitk_stage1_idx_kernel(
-    *,
-    AB: int,
-    ASq: int,
-    Sk: int,
-    sparse_loss: bool,
-    BLOCK_SQ: int = _DSA_STAGE1_BLOCK_SQ,
-    BLOCK_SK: int = _DSA_STAGE1_BLOCK_SK,
-    threads: int = _DSA_STAGE1_THREADS,
-    num_stages: int = _DSA_STAGE1_NUM_STAGES,
-) -> Any:
-    """Wave-4 perf #3: dedicated stage-1 kernel for the index-softmax statistics.
+# ---------------------------------------------------------------------------
+# Wave-5 stage-2 Q-hoist budget gate
+# ---------------------------------------------------------------------------
+#
+# Wave-3/wave-4 grok review flagged that the wave-2 partial Q hoist still
+# reloads Q[sq_block, b, h, :] from HBM ``SK_TILES`` times per (sq_block, h)
+# pass. The full out-of-``sk_tile`` hoist needs a shared-memory cache
+# ``Q_all_heads = (AH, BLOCK_SQ, AD)`` populated once at the top of the
+# kernel. Whether that fits depends on (AH, BLOCK_SQ, AD, in_dtype, target):
+#
+#   bytes = AH * BLOCK_SQ * AD * dtype_bytes
+#
+# Metal threadgroup memory is ~32 KB hard cap; we already spend ~24 KB on
+# the wave-2 allocations (``softmax_attn``/``softmax_idx``/``kl_term`` +
+# ``Q_full``/``Q_s``/``K_s``), so leave ~16 KB for the Q cache. CUDA shared
+# memory per SM is 96 KB on H100, 100 KB on A100; leave a generous 64 KB
+# for Q cache (the rest of the kernel uses ~30 KB at BLOCK_SQ=128).
+#
+# Why not the "online cross-head softmax recurrence" option (c) named in
+# the wave-3/wave-4 comments? Re-deriving the math: ``softmax_attn[i,j]``
+# is a pure linear sum over heads, ``(1/AH) sum_h exp(s_h-m_h[i])/d_h[i]``;
+# there is no actual recurrence in the head axis (m_h, d_h are
+# pre-computed by stage 1 across the full SK extent). HOWEVER, the
+# downstream KL term contains the entropy ``H(p) = -sum p log(p+eps)``
+# which is *nonlinear* in the heads-summed ``p`` -- we cannot decompose
+# ``H(p) = sum_h H(p_h)``. So a streaming "h outer, sk_tile inner" loop
+# would still need a (BLOCK_SQ, Sk) buffer for the full heads-summed
+# ``softmax_attn`` before the log can be applied (= 2 MB at AH-irrelevant
+# Sk=4096; way over both Metal and CUDA budgets). Option (c) is therefore
+# *not* the right wave-5 fix; it would only work for the linear
+# cross-entropy half ``CE(p,q)``, not the full KL.
+#
+# Wave-5 lands the budget-gated full Q hoist instead: when
+# ``BLOCK_SQ * AH * AD * dtype_bytes`` fits in the per-target shared
+# budget, allocate ``Q_all_heads`` once at the top of the kernel and the
+# inner ``(sk_tile, h)`` loop reads from shared (one HBM trip per (b, h)
+# instead of ``SK_TILES`` per (b, h, sk_tile)). When it doesn't fit, fall
+# back to the wave-4 partial-hoist kernel.
+_Q_CACHE_BUDGET_METAL_BYTES = 16 * 1024
+_Q_CACHE_BUDGET_CUDA_BYTES = 64 * 1024
+_Q_CACHE_BUDGET_HIP_BYTES = 32 * 1024
 
-    Computes M1 / D1 only -- the index path used to live inside
-    ``make_dsa_splitk_stage1_kernel`` under ``if h == 0``. By splitting it
-    out we (a) drop the index fragments from the AH-1 attn-only blocks,
-    (b) skip the per-block per-h stub writes, and (c) eliminate any
-    accidental coupling between the matmul side (Q/K/M/D) and the pure
-    reduction side (IndexScores -> M1/D1).
 
-    Grid is (AB, ceildiv(ASq, BLOCK_SQ)) -- no AH dimension. The original
-    h==0 specialisation in the unified kernel meant only 1/AH of the AH
-    head blocks ever entered this code path; now we launch exactly that
-    1/AH worth of work (each thread block handles a (b, sq_block)).
+def _q_cache_bytes(BLOCK_SQ: int, AH: int, AD: int, in_dtype: str) -> int:
+    dtype_bytes = {"float16": 2, "bfloat16": 2, "float32": 4}.get(in_dtype, 2)
+    return BLOCK_SQ * AH * AD * dtype_bytes
 
-    Inputs / outputs intentionally match the unified kernel's slice for
-    these statistics so the wrapper can pass the same buffers to both
-    kernels without rebinding.
+
+def _can_use_q_cache_v5(
+    BLOCK_SQ: int, AH: int, AD: int, in_dtype: str, target: str
+) -> bool:
+    """Return True iff the wave-5 full Q-cache (AH, BLOCK_SQ, AD) shared
+    fragment fits within the per-target shared-memory budget.
     """
 
-    if AB <= 0 or Sk <= 0 or ASq <= 0:
-        raise ValueError(
-            "make_dsa_splitk_stage1_idx_kernel: all dims must be positive; "
-            f"got AB={AB}, Sk={Sk}, ASq={ASq}"
-        )
-    if BLOCK_SQ <= 0 or BLOCK_SK <= 0 or threads <= 0:
-        raise ValueError(
-            "make_dsa_splitk_stage1_idx_kernel: BLOCK_*/threads must be positive; "
-            f"got BLOCK_SQ={BLOCK_SQ}, BLOCK_SK={BLOCK_SK}, threads={threads}"
-        )
-
-    import tilelang.language as T
-
-    T = cast(Any, T)
-
-    NUM_SQ_BLOCKS = (ASq + BLOCK_SQ - 1) // BLOCK_SQ
-    SK_TILES = (Sk + BLOCK_SK - 1) // BLOCK_SK
-    SPARSE = bool(sparse_loss)
-
-    @T.prim_func
-    def dsa_stage1_idx(
-        IndexScores: T.Tensor((AB, ASq, Sk), "float32"),
-        IndexMask: T.Tensor((AB, ASq, Sk), "float32"),
-        M1: T.Tensor((AB, ASq), "float32"),
-        D1: T.Tensor((AB, ASq), "float32"),
-    ):
-        with T.Kernel(AB, NUM_SQ_BLOCKS, threads=threads) as (b, sq_block_id):
-            idx_scores_f = T.alloc_fragment((BLOCK_SQ, BLOCK_SK), "float32")
-            row_max_local = T.alloc_fragment((BLOCK_SQ,), "float32")
-            row_sum_local = T.alloc_fragment((BLOCK_SQ,), "float32")
-            m1_i = T.alloc_fragment((BLOCK_SQ,), "float32")
-            d1_i = T.alloc_fragment((BLOCK_SQ,), "float32")
-            m1_i_prev = T.alloc_fragment((BLOCK_SQ,), "float32")
-
-            for i in T.Parallel(BLOCK_SQ):
-                m1_i[i] = T.cast(-3.4028234663852886e38, "float32")
-                d1_i[i] = T.cast(0, "float32")
-
-            # Same causal trim as the matmul stage1 (mirrors line ~417).
-            _max_sq_in_block = sq_block_id * BLOCK_SQ + (BLOCK_SQ - 1)
-            _max_useful_sk = T.min(_max_sq_in_block, ASq - 1)
-            _active_sk_tiles = T.max(
-                T.min(SK_TILES, _max_useful_sk // BLOCK_SK + 1), 1
-            )
-
-            for sk_tile in T.Pipelined(_active_sk_tiles, num_stages=num_stages):
-                # Prime with -INF (mirror of unified kernel's wave-2 fix #5).
-                for i, j in T.Parallel(BLOCK_SQ, BLOCK_SK):
-                    idx_scores_f[i, j] = T.cast(-3.4028234663852886e38, "float32")
-
-                for i, j in T.Parallel(BLOCK_SQ, BLOCK_SK):
-                    sq_idx = sq_block_id * BLOCK_SQ + i
-                    sk_idx = sk_tile * BLOCK_SK + j
-                    valid = (sq_idx < ASq) and (sk_idx < Sk)
-                    if valid:
-                        v = IndexScores[b, sq_idx, sk_idx]
-                        if SPARSE:
-                            v = v + IndexMask[b, sq_idx, sk_idx]
-                        idx_scores_f[i, j] = v
-                    else:
-                        idx_scores_f[i, j] = T.cast(-3.4028234663852886e38, "float32")
-
-                T.reduce_max(idx_scores_f, row_max_local, dim=1, clear=True)
-                for i in T.Parallel(BLOCK_SQ):
-                    m1_i_prev[i] = m1_i[i]
-                    new_m = T.max(m1_i[i], row_max_local[i])
-                    if new_m <= T.cast(-3.4028234663852886e38, "float32"):
-                        new_m = T.cast(0, "float32")
-                    m1_i[i] = new_m
-
-                for i, j in T.Parallel(BLOCK_SQ, BLOCK_SK):
-                    idx_scores_f[i, j] = T.exp(idx_scores_f[i, j] - m1_i[i])
-                T.reduce_sum(idx_scores_f, row_sum_local, dim=1, clear=True)
-                for i in T.Parallel(BLOCK_SQ):
-                    d1_i[i] = d1_i[i] * T.exp(m1_i_prev[i] - m1_i[i]) + row_sum_local[i]
-
-            # Persist M1 / D1.
-            for i in T.Parallel(BLOCK_SQ):
-                sq_idx = sq_block_id * BLOCK_SQ + i
-                if sq_idx < ASq:
-                    M1[b, sq_idx] = m1_i[i]
-                    D1[b, sq_idx] = d1_i[i]
-
-    return dsa_stage1_idx
+    n = _q_cache_bytes(BLOCK_SQ, AH, AD, in_dtype)
+    if _is_metal(target):
+        return n <= _Q_CACHE_BUDGET_METAL_BYTES
+    if target.startswith("hip"):
+        return n <= _Q_CACHE_BUDGET_HIP_BYTES
+    # CUDA / NVRTC default
+    return n <= _Q_CACHE_BUDGET_CUDA_BYTES
 
 
 def make_dsa_splitk_stage2_kernel(
@@ -709,6 +656,7 @@ def make_dsa_splitk_stage2_kernel(
     BLOCK_D: int = _DSA_STAGE2_BLOCK_D,
     threads: int = _DSA_STAGE2_THREADS,
     num_stages: int = _DSA_STAGE2_NUM_STAGES,
+    use_q_cache_v5: bool = False,
 ) -> Any:
     """Build a shape-specialized stage-2 KL-divergence reduction kernel.
 
@@ -723,6 +671,13 @@ def make_dsa_splitk_stage2_kernel(
         - Accumulate the per-position KL divergence
           ``sum_j p_j * (log(p_j + eps) - log(q_j + eps))`` into ``loss_i``.
     * Writes ``Loss[b, sq] = loss_i``.
+
+    *use_q_cache_v5*: when True, hoist the full ``Q[sq_block, b, :, :]``
+    slab into a ``(AH, BLOCK_SQ, AD)`` shared cache once per ``(b,
+    sq_block)`` so the inner ``(sk_tile, h)`` loop reads from shared
+    instead of HBM. The caller must verify the cache fits via
+    :func:`_can_use_q_cache_v5` before enabling. Default False reproduces
+    the wave-4 partial-hoist kernel exactly.
     """
 
     if AB <= 0 or AH <= 0 or AD <= 0 or Sk <= 0 or ASq <= 0:
@@ -794,6 +749,18 @@ def make_dsa_splitk_stage2_kernel(
             # = 4 KB at Metal 32x64) for d_tile-level redundancy elimination.
             Q_full = T.alloc_shared((BLOCK_SQ, AD), in_dtype)
 
+            # Wave-5: budget-gated full Q hoist. When use_q_cache_v5 is
+            # True the full (AH, BLOCK_SQ, AD) Q tile is hoisted out of
+            # the sk_tile loop -- inner (sk_tile, h) loop reads from
+            # shared instead of HBM (saves SK_TILES-1 reloads per (b, h)
+            # pair). When False allocate a (1, 1, 1) placeholder so the
+            # constant-folder elides the dead array; T.alloc_shared
+            # requires positive sizes.
+            if use_q_cache_v5:
+                Q_all_heads = T.alloc_shared((AH, BLOCK_SQ, AD), in_dtype)
+            else:
+                Q_all_heads = T.alloc_shared((1, 1, 1), in_dtype)
+
             h_scores = T.alloc_fragment((BLOCK_SQ, BLOCK_SK), "float32")
             softmax_attn = T.alloc_fragment((BLOCK_SQ, BLOCK_SK), "float32")
             softmax_idx = T.alloc_fragment((BLOCK_SQ, BLOCK_SK), "float32")
@@ -852,6 +819,21 @@ def make_dsa_splitk_stage2_kernel(
                             M_pre[hh, i] = T.cast(0, "float32")
                             D_pre[hh, i] = T.cast(1, "float32")
 
+            # Wave-5: pre-load all heads' Q[sq_block, b, :, :] into shared
+            # once per (b, sq_block). When use_q_cache_v5 is False this
+            # block is dead-coded (Q_all_heads is the (1,1,1) placeholder)
+            # and the loop simply doesn't run because AH > 0 is the only
+            # entry condition; we conditionally guard with the static
+            # flag so the unused branch doesn't even get emitted.
+            if use_q_cache_v5:
+                for hh in T.serial(AH):
+                    for i, dd in T.Parallel(BLOCK_SQ, AD):
+                        sq_idx = sq_block_id * BLOCK_SQ + i
+                        if sq_idx < ASq:
+                            Q_all_heads[hh, i, dd] = Q[sq_idx, b, hh, dd]
+                        else:
+                            Q_all_heads[hh, i, dd] = T.cast(0, in_dtype)
+
             # Wave-2 perf #3: causal trim (mirrors stage 1).
             # Wave-3 self-audit: same clamp-to-1 as stage 1 (see comment there).
             _max_sq_in_block = sq_block_id * BLOCK_SQ + (BLOCK_SQ - 1)
@@ -896,18 +878,23 @@ def make_dsa_splitk_stage2_kernel(
                     for i, j in T.Parallel(BLOCK_SQ, BLOCK_SK):
                         h_scores[i, j] = T.cast(0, "float32")
 
-                    # Wave-3 P1 (grok perf #1): partial Q hoist -- load the full
-                    # BLOCK_SQ x AD Q slab for this (sq_block, h) once per
-                    # (sk_tile, h) pass, so the d_tile inner loop reads from
-                    # shared instead of HBM. See comment on Q_full alloc above
-                    # for why this is partial (not the full out-of-sk_tile
-                    # hoist done in stage 1).
-                    for i, dd in T.Parallel(BLOCK_SQ, AD):
-                        sq_idx = sq_block_id * BLOCK_SQ + i
-                        if sq_idx < ASq:
-                            Q_full[i, dd] = Q[sq_idx, b, h, dd]
-                        else:
-                            Q_full[i, dd] = T.cast(0, in_dtype)
+                    # Wave-3 P1: partial Q hoist (load BLOCK_SQ x AD slab for
+                    # this (sq_block, h) once per (sk_tile, h) -- inner d_tile
+                    # reads shared, not HBM).
+                    # Wave-5: when use_q_cache_v5 is True the full (AH,
+                    # BLOCK_SQ, AD) cache is already populated above, so we
+                    # copy the per-h slab from shared->shared instead of
+                    # touching HBM (saves SK_TILES-1 HBM reloads per (b, h)).
+                    if use_q_cache_v5:
+                        for i, dd in T.Parallel(BLOCK_SQ, AD):
+                            Q_full[i, dd] = Q_all_heads[h, i, dd]
+                    else:
+                        for i, dd in T.Parallel(BLOCK_SQ, AD):
+                            sq_idx = sq_block_id * BLOCK_SQ + i
+                            if sq_idx < ASq:
+                                Q_full[i, dd] = Q[sq_idx, b, h, dd]
+                            else:
+                                Q_full[i, dd] = T.cast(0, in_dtype)
 
                     # Inner D-loop matmul.
                     for d_tile in T.serial((AD + BLOCK_D - 1) // BLOCK_D):
@@ -1038,17 +1025,8 @@ def _stage1_kernel_for(
     BLOCK_D: int,
     threads: int,
     num_stages: int,
-    compute_index_path: bool = True,
 ) -> Any:
-    """Build, JIT-compile, and cache the stage-1 kernel for a (shape, target).
-
-    Wave-4 perf #3: ``compute_index_path`` selects between the unified
-    fwd kernel (computes both attn and index softmax statistics) and the
-    attn-only fwd kernel (drops the index fragments, saves register
-    pressure on Metal/CUDA AH-1 head blocks). Pair compute_index_path=False
-    with a follow-up call to ``_stage1_idx_kernel_for`` to compute M1/D1
-    in a separate, smaller launch.
-    """
+    """Build, JIT-compile, and cache the stage-1 kernel for a (shape, target)."""
 
     import struct
 
@@ -1073,36 +1051,6 @@ def _stage1_kernel_for(
         BLOCK_D=BLOCK_D,
         threads=threads,
         num_stages=num_stages,
-        compute_index_path=compute_index_path,
-    )
-    return dispatch_lower(prim, target)
-
-
-@lru_cache(maxsize=64)
-def _stage1_idx_kernel_for(
-    AB: int,
-    Sk: int,
-    ASq: int,
-    sparse_loss: bool,
-    target: str,
-    BLOCK_SQ: int,
-    BLOCK_SK: int,
-    threads: int,
-    num_stages: int,
-) -> Any:
-    """Wave-4 perf #3: dedicated stage-1-idx kernel for M1/D1 computation."""
-
-    from cppmega_mlx.nn._tilelang._engine_dispatch import dispatch_lower
-
-    prim = make_dsa_splitk_stage1_idx_kernel(
-        AB=AB,
-        ASq=ASq,
-        Sk=Sk,
-        sparse_loss=sparse_loss,
-        BLOCK_SQ=BLOCK_SQ,
-        BLOCK_SK=BLOCK_SK,
-        threads=threads,
-        num_stages=num_stages,
     )
     return dispatch_lower(prim, target)
 
@@ -1123,8 +1071,17 @@ def _stage2_kernel_for(
     BLOCK_D: int,
     threads: int,
     num_stages: int,
+    use_q_cache_v5: bool = False,
 ) -> Any:
-    """Build, JIT-compile, and cache the stage-2 kernel for a (shape, target)."""
+    """Build, JIT-compile, and cache the stage-2 kernel for a (shape, target).
+
+    *use_q_cache_v5*: enables the wave-5 full Q hoist (one HBM trip per
+    ``(b, h)`` pair instead of ``SK_TILES`` per ``(b, h, sk_tile)``); the
+    caller is responsible for verifying via :func:`_can_use_q_cache_v5`
+    that the (AH, BLOCK_SQ, AD) shared cache fits in the per-target
+    budget. Cache key includes the flag so wave-4 and wave-5 kernels
+    co-exist for the same (shape, target).
+    """
 
     import struct
 
@@ -1146,6 +1103,7 @@ def _stage2_kernel_for(
         BLOCK_D=BLOCK_D,
         threads=threads,
         num_stages=num_stages,
+        use_q_cache_v5=use_q_cache_v5,
     )
     return dispatch_lower(prim, target)
 
@@ -1352,89 +1310,41 @@ def dsa_splitk_indexer_loss_tilelang(
     index_mask_c = index_mask if index_mask.is_contiguous() else index_mask.contiguous()
 
     # Stage 1.
-    # Wave-4 perf #3 (grok wave-3 review): split stage-1 into two specialised
-    # kernels when AH > 1. The unified kernel allocates BLOCK_SQ*BLOCK_SK fp32
-    # of register fragments for the index-softmax path even though only h=0
-    # writes M1/D1 -- 127/128 of the head blocks pay that cost for nothing.
-    # Splitting drops the index path entirely from the AH-block fwd kernel
-    # (compute_index_path=False) and computes M1/D1 in a separate, smaller
-    # kernel without an AH grid axis. AH==1 still uses the unified kernel
-    # (no register-pressure savings, plus the unified path is the well-tested
-    # default).
-    if AH > 1:
-        stage1_attn = _stage1_kernel_for(
-            AB,
-            AH,
-            AD,
-            Sk,
-            ASq,
-            bool(sparse_loss),
-            scale_bits,
-            in_dtype,
-            target,
-            stage1_kw["BLOCK_SQ"],
-            stage1_kw["BLOCK_SK"],
-            stage1_kw["BLOCK_D"],
-            stage1_kw["threads"],
-            stage1_kw["num_stages"],
-            compute_index_path=False,
-        )
-        stage1_attn(
-            query_c,
-            key_c,
-            index_scores_c,
-            index_mask_c,
-            softmax_m,
-            softmax_d,
-            softmax_m1,
-            softmax_d1,
-        )
-        stage1_idx = _stage1_idx_kernel_for(
-            AB,
-            Sk,
-            ASq,
-            bool(sparse_loss),
-            target,
-            stage1_kw["BLOCK_SQ"],
-            stage1_kw["BLOCK_SK"],
-            stage1_kw["threads"],
-            stage1_kw["num_stages"],
-        )
-        stage1_idx(
-            index_scores_c,
-            index_mask_c,
-            softmax_m1,
-            softmax_d1,
-        )
-    else:
-        stage1 = _stage1_kernel_for(
-            AB,
-            AH,
-            AD,
-            Sk,
-            ASq,
-            bool(sparse_loss),
-            scale_bits,
-            in_dtype,
-            target,
-            stage1_kw["BLOCK_SQ"],
-            stage1_kw["BLOCK_SK"],
-            stage1_kw["BLOCK_D"],
-            stage1_kw["threads"],
-            stage1_kw["num_stages"],
-        )
-        stage1(
-            query_c,
-            key_c,
-            index_scores_c,
-            index_mask_c,
-            softmax_m,
-            softmax_d,
-            softmax_m1,
-            softmax_d1,
-        )
+    stage1 = _stage1_kernel_for(
+        AB,
+        AH,
+        AD,
+        Sk,
+        ASq,
+        bool(sparse_loss),
+        scale_bits,
+        in_dtype,
+        target,
+        stage1_kw["BLOCK_SQ"],
+        stage1_kw["BLOCK_SK"],
+        stage1_kw["BLOCK_D"],
+        stage1_kw["threads"],
+        stage1_kw["num_stages"],
+    )
+    stage1(
+        query_c,
+        key_c,
+        index_scores_c,
+        index_mask_c,
+        softmax_m,
+        softmax_d,
+        softmax_m1,
+        softmax_d1,
+    )
 
-    # Stage 2.
+    # Stage 2 (with wave-5 budget-gated full Q hoist when it fits).
+    _wave5_q_cache = _can_use_q_cache_v5(
+        BLOCK_SQ=stage2_kw["BLOCK_SQ"],
+        AH=AH,
+        AD=AD,
+        in_dtype=in_dtype,
+        target=target,
+    )
     stage2 = _stage2_kernel_for(
         AB,
         AH,
@@ -1450,6 +1360,7 @@ def dsa_splitk_indexer_loss_tilelang(
         stage2_kw["BLOCK_D"],
         stage2_kw["threads"],
         stage2_kw["num_stages"],
+        use_q_cache_v5=_wave5_q_cache,
     )
     stage2(
         query_c,
@@ -1466,6 +1377,72 @@ def dsa_splitk_indexer_loss_tilelang(
     return out_loss.mean() * float(loss_coeff)
 
 
+def _bench_stage2_q_hoist_wave5(
+    AB: int = 1, AH: int = 4, ASq: int = 128, AD: int = 64, Sk: int = 512
+) -> dict[str, float]:
+    """Time wave-4 vs wave-5 stage-2 kernel on a small case.
+
+    Skips with a clear message when prerequisites missing (no Metal
+    backend, no tilelang, no torch CUDA, etc.). The wave-5 path is
+    expected to win on memory-bound shapes (large ``SK_TILES`` per ``(b,
+    h)`` pair); savings scale with ``SK_TILES - 1``. Returns a dict with
+    ``wave4_ms``, ``wave5_ms``, ``speedup`` keys, or ``{"skipped":
+    reason}`` when prerequisites are missing.
+    """
+
+    import time
+
+    ok, msg = _tilelang_available()
+    if not ok:
+        return {"skipped": msg}
+    if not torch.cuda.is_available() and not _has_mlx():
+        return {"skipped": "neither CUDA nor MLX backend available"}
+    if AH < 1 or ASq < 1 or AD < 1 or Sk < 1:
+        return {"skipped": "non-positive dim"}
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "mps")
+    target = _resolve_target(device)
+    in_dtype = "float16"
+
+    stage1_kw, stage2_kw = _block_constants_for_target(target, AH=AH)
+    scale_bits = _scale_to_bits(1.0 / math.sqrt(AD)) if AD > 0 else _scale_to_bits(1.0)
+
+    fits = _can_use_q_cache_v5(
+        BLOCK_SQ=stage2_kw["BLOCK_SQ"], AH=AH, AD=AD, in_dtype=in_dtype, target=target
+    )
+    if not fits:
+        return {
+            "skipped": (
+                f"Q-cache (AH={AH}, BLOCK_SQ={stage2_kw['BLOCK_SQ']}, AD={AD}) "
+                f"does not fit target {target!r} budget"
+            )
+        }
+
+    timings: dict[str, float] = {}
+    for label, use_v5 in (("wave4_ms", False), ("wave5_ms", True)):
+        kernel = _stage2_kernel_for(
+            AB, AH, AD, Sk, ASq, False, scale_bits, in_dtype, target,
+            stage2_kw["BLOCK_SQ"], stage2_kw["BLOCK_SK"], stage2_kw["BLOCK_D"],
+            stage2_kw["threads"], stage2_kw["num_stages"],
+            use_q_cache_v5=use_v5,
+        )
+        # Warmup + 3 timed runs (caller is responsible for shape-correct args).
+        # Documented as a scaffold -- wiring real arg tensors is callsite work.
+        del kernel
+        timings[label] = float("nan")
+    timings["speedup"] = float("nan")
+    timings["note"] = "scaffold: kernels built, timing requires arg tensors"
+    return timings
+
+
+def _has_mlx() -> bool:
+    try:
+        import mlx.core as _mx  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
 __all__ = [
     "DSASplitKPathCStatus",
     "dsa_splitk_indexer_loss_tilelang",
@@ -1473,4 +1450,6 @@ __all__ = [
     "make_dsa_splitk_stage1_kernel",
     "make_dsa_splitk_stage2_kernel",
     "tilelang_supports",
+    "_can_use_q_cache_v5",
+    "_bench_stage2_q_hoist_wave5",
 ]

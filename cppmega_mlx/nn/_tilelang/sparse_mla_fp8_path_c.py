@@ -1,4 +1,11 @@
 # pyright: reportInvalidTypeForm=false, reportMissingImports=false
+# TODO(migration-phase-3-fp8): unified `_engine_dispatch.dispatch_lower` flip
+# deferred to wave-6. The FP8 reducers depend on `tirx.metal.fp8_e4m3_dot4`
+# which is not yet registered in the in-tree TileLang/TVM build (see status
+# note below); dispatching them through the unified engine surfaces the same
+# AttributeError. The broader migration also needs `simdgroup_a_fp8` /
+# `simdgroup_b_fp8` Fragment factories (extension of #08 simdgroup_a/b/c
+# factories at `tilelang/language/extern.py`). Track wave-6.
 """Path C FP8 Sparse-MLA QK TileLang DSL surfaces.
 
 REDUCERS-ONLY status — there is no ``sparse_mla_fp8_path_c_apply`` here.

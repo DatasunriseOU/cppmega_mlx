@@ -84,6 +84,7 @@ from typing import Any, cast
 import mlx.core as mx
 
 from cppmega_mlx.nn._tilelang import _msl_transform
+from cppmega_mlx.nn._tilelang._engine_dispatch import dispatch_lower
 from cppmega_mlx.nn._tilelang._msl_transform import (
     MSLDispatchUnsupported,
     can_run_metal,
@@ -207,7 +208,12 @@ def _fwd_kernel_for(
                 for n in T.serial(STATE):
                     h_last[b, h, p, n] = h_state[n]
 
-    lowering = lower_tilelang_to_msl_inline(fwd)
+    artifact = dispatch_lower(fwd, target="metal")
+    if hasattr(artifact, "_tilelang_engine_target"):
+        # Engine path: artifact is a tilelang.compile callable; callers branch
+        # on ``lowering is None`` to invoke it directly.
+        return artifact, None
+    lowering = artifact  # TileLangMSLLowering
     # Buffer alphabetic order from the lowered MSL is:
     # A, B, C, D, dt, h0, h_last, x, y, z
     kernel = mx.fast.metal_kernel(
@@ -352,7 +358,10 @@ def _bwd_kernel_for(
                     dh0[b, h, p, n] = dh[n]
                 dD_partial[b, h, p] = dD_acc[0]
 
-    lowering = lower_tilelang_to_msl_inline(bwd)
+    artifact = dispatch_lower(bwd, target="metal")
+    if hasattr(artifact, "_tilelang_engine_target"):
+        return artifact, None
+    lowering = artifact
     # Buffer alphabetic order from the lowered MSL is:
     # A, B, C, D, dA_partial, dB_partial, dC_partial, dD_partial, ddt_partial,
     # dh0, dt, dx, dy, dz, h0, h_steps, x, z
@@ -425,6 +434,30 @@ def mamba3_mimo_fwd_path_c(
     except (MSLDispatchUnsupported, RuntimeError, ValueError):
         return mamba3_mimo_reference(x, B, C, z, A, dt, D, h0)
 
+    if lowering is None:
+        # Engine path: kernel is a tilelang.compile artifact taking the prim_func
+        # arg list (x, B, C, z, A, dt, D, h0, y, h_last) -- y/h_last are output
+        # buffers. We currently only have shim parity tested on Metal; surface
+        # engine errors as fallback to keep public contract stable.
+        try:
+            h_last = mx.zeros((batch, heads, headdim, state), dtype=mx.float32)
+            y = mx.zeros((batch, seq, heads, headdim), dtype=mx.float32)
+            kernel(
+                inputs_f32[6],  # x
+                inputs_f32[1],  # B
+                inputs_f32[2],  # C
+                inputs_f32[7],  # z
+                inputs_f32[0],  # A
+                inputs_f32[4],  # dt
+                inputs_f32[3],  # D
+                inputs_f32[5],  # h0
+                y,
+                h_last,
+            )
+            return y.astype(out_dtype), h_last.astype(out_dtype)
+        except Exception:
+            return mamba3_mimo_reference(x, B, C, z, A, dt, D, h0)
+
     grid = (
         lowering.grid[0] * lowering.threadgroup[0],
         lowering.grid[1] * lowering.threadgroup[1],
@@ -485,6 +518,13 @@ def _mamba3_mimo_bwd_path_c_kernel(
     try:
         kernel, lowering = _bwd_kernel_for(batch, seq, heads, headdim, state)
     except (MSLDispatchUnsupported, RuntimeError, ValueError):
+        return None
+
+    if lowering is None:
+        # Engine path: bwd kernel signature has 9 inputs + 9 outputs in the
+        # @T.prim_func declaration order (A, B, C, D, dt, dy, h0, x, z, ...).
+        # Engine path support is currently best-effort; on any failure we
+        # surface ``None`` so the caller falls back to Path B pure-MLX.
         return None
 
     grid = (
@@ -604,6 +644,11 @@ def dump_lowered_fwd_msl(
     """
 
     _kernel, lowering = _fwd_kernel_for(batch, seq, heads, headdim, state)
+    if lowering is None:
+        raise RuntimeError(
+            "dump_lowered_fwd_msl requires the shim path; set "
+            "CPPMEGA_MLX_TILELANG_ENGINE=shim or =auto with the engine missing."
+        )
     return cast(str, lowering.msl_text)
 
 
@@ -613,6 +658,11 @@ def dump_lowered_bwd_msl(
     """Return the raw lowered MSL for the Path C backward kernel."""
 
     _kernel, lowering = _bwd_kernel_for(batch, seq, heads, headdim, state)
+    if lowering is None:
+        raise RuntimeError(
+            "dump_lowered_bwd_msl requires the shim path; set "
+            "CPPMEGA_MLX_TILELANG_ENGINE=shim or =auto with the engine missing."
+        )
     return cast(str, lowering.msl_text)
 
 

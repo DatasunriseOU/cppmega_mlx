@@ -1109,6 +1109,19 @@ def lower_tilelang_to_msl_inline(
 ) -> TileLangMSLLowering:
     """Lower a TileLang PrimFunc to MSL and prepare an inline body for MLX.
 
+    .. deprecated:: phase-3
+        Use ``dispatch_lower(prim, target, return_msl=True)`` from
+        :mod:`cppmega_mlx.nn._tilelang._engine_dispatch` instead — it is the
+        canonical engine-extraction path. The new dispatcher routes through
+        ``tilelang.compile`` (the unified pipeline) and, when ``return_msl=True``
+        (or env ``CPPMEGA_MLX_TILELANG_ENGINE=engine_with_msl_extraction``),
+        extracts a :class:`TileLangMSLLowering`-shaped object so existing
+        ``mx.fast.metal_kernel(...)`` callers keep working unchanged. Probe via
+        :func:`dispatch_lower_supports_msl_extraction` for a runtime switch.
+        This function remains for environments where the unified engine is
+        not importable (``ImportError`` fallback path) and for test corpus
+        snapshots.
+
     The TileLang ``kernel void`` body is inlined and MLX-compatible
     ``blockIdx``/``threadIdx`` aliases are removed when all uses can be safely
     rewritten to Metal builtins. Buffer references stay in the order TileLang

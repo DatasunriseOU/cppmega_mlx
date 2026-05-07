@@ -21,6 +21,45 @@ Current status:
 - package-root exports for local MLX subpackages and helper surfaces, not
   foreign trainer/runtime aliases
 
+## Unified TileLang fused-kernel pipeline integration (waves 1-5)
+
+The `_tilelang/` kernel directory is being migrated from hand-written Apple
+Metal-only TileLang into the unified fused-kernel compiler maintained at
+`DatasunriseOU/tilelang` (branch `poc-integrations-review`). The new pipeline
+ingests Triton TTIR / torch.fx / cute-dsl / raw CUDA, normalises into TileLang
+TIR, fuses register/shared-resident across former source boundaries, and
+lowers to a single CUDA / HIP / Apple Metal SIMDgroup kernel. See
+[`MIGRATION_PLAN.md`](./MIGRATION_PLAN.md) for the full inventory and phasing.
+
+What landed (5 waves of agent-driven review-fix loops with grok-4):
+
+- **Phase 1 unblockers**: `tl.sync_threads_partial`, `tt.dot trans_a/trans_b`,
+  and a feature-flagged `_engine_dispatch.dispatch_lower(prim, target)` shim
+  (env: `CPPMEGA_MLX_TILELANG_ENGINE=auto|engine|shim|engine_with_msl_extraction`).
+- **Phase 2 migrations**: `topk_selector.py`, `sparse_mla_blockscaled_path_c.py`
+  routed through the engine path; `_msl_transform.lower_tilelang_to_msl_inline`
+  marked deprecated with a one-shot `DeprecationWarning`.
+- **Phase 3 migrations**: `sparse_mla_path_c.py` (2611 LOC fwd+bwd),
+  `mamba3_path_c.py` and `_mamba3_helpers_tilelang.py`, `fp8_vecmat_path_c.py`
+  consolidation. `mamba3.py` and `fp8_msl_kernels.py` (Path-B raw MSL) keep
+  legacy emission until FP8 SIMDgroup factories land.
+- **MSL-extraction adapter** (Phase 3 keystone): `_msl_extraction.py` reads
+  `artifact.kernel_source` from a `tilelang.engine.lower(...)` artifact and
+  reconstructs a `TileLangMSLLowering`-compatible object via the existing
+  `_msl_transform` text helpers. Unblocks the remaining 16 callers; flip them
+  one-by-one with `dispatch_lower(..., return_msl=True)`.
+- **DSA splitK perf hardening (waves 1-5)**: NaN/Inf guard, JIT bucket cache,
+  dynamic `BLOCK_SIZE` picker, partial-block invariant, sparse-mask sign
+  convention coverage, debug-gated GPU↔CPU sync (`CPPMEGA_MLX_DSA_DEBUG`),
+  stage-1 head-0 fragment alloc gate, **wave-5** budget-gated full Q-cache
+  (`use_q_cache_v5=True`, auto on Metal ≤16 KB / CUDA ≤64 KB / HIP ≤32 KB).
+- **FP8 amax perf hardening**: pow-of-two shape buckets, target-aware block
+  picker, partial-block guard, `tilelang_supports_with_reason` 2-tuple API.
+
+Use `from cppmega_mlx.nn._tilelang import dispatch_lower, tilelang_engine_mode`
+to opt-in via env or programmatically. The shim path is preserved verbatim for
+correctness fallback.
+
 Repo hygiene:
 
 - Keep .venv, __pycache__, pytest caches, .beads, agent logs, and

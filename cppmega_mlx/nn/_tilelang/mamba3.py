@@ -1,5 +1,16 @@
 """Path B port of mamba_ssm.ops.tilelang.mamba3 fwd/bwd.
 
+.. todo:: Phase-3 unified-pipeline migration (tracked in ``MIGRATION_PLAN.md``).
+
+   This file is a raw-MSL Path-B kernel. Migrating it to the unified
+   :func:`cppmega_mlx.nn._tilelang._engine_dispatch.dispatch_lower` path
+   depends on the **MSL-extraction adapter** landing first (parallel agent in
+   the same Phase-3 wave). The adapter will let downstream
+   ``mx.fast.metal_kernel`` callers pull MSL out of an engine artifact, after
+   which the 12 mlx + 2 cppmega call sites of this module can flip to the
+   ``@T.prim_func`` Path-C variant in ``mamba3_path_c.py``. Until then this
+   module stays untouched to preserve numerical parity for downstream callers.
+
 This module implements the Mamba3 MIMO selective-scan kernel in vendor MSL,
 without depending on TileLang's TVM-Metal lowering. The forward kernel is the
 core of Path B verified by the cppmega.mlx port research; the backward is a
