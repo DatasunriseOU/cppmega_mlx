@@ -50,6 +50,7 @@ Public Path C surface — what is *exported here* vs what only lives in submodul
 """
 
 from cppmega_mlx.nn._tilelang import (
+    _engine_dispatch,
     _mamba3_helpers,
     _mamba3_helpers_tilelang,
     _msl_transform,
@@ -61,6 +62,10 @@ from cppmega_mlx.nn._tilelang import (
     sparse_mla_blockscaled,
     sparse_mla_fp8,
     topk_selector,
+)
+from cppmega_mlx.nn._tilelang._engine_dispatch import (
+    dispatch_lower,
+    tilelang_engine_mode,
 )
 from cppmega_mlx.nn._tilelang._mamba3_helpers import (
     bwd_dadt_fused,
@@ -143,6 +148,9 @@ from cppmega_mlx.nn._tilelang import _experimental
 from cppmega_mlx.nn._tilelang._experimental import *  # noqa: F401,F403
 
 __all__ = [
+    "dispatch_lower",
+    "tilelang_engine_mode",
+    "_engine_dispatch",
     "FP8MSLKernelStatus",
     "FP8VecmatPathCStatus",
     "E8M0_BLOCK_SIZE",

@@ -409,7 +409,7 @@ def _amax_kernel_for(bucket_n: int, in_dtype: str, target: str) -> Any:
     identity for ``max`` so the result is unchanged.
     """
 
-    import tilelang
+    from cppmega_mlx.nn._tilelang._engine_dispatch import dispatch_lower
 
     block, threads = _pick_block_size(target, bucket_n)
     prim = make_fp8_amax_kernel(
@@ -418,7 +418,7 @@ def _amax_kernel_for(bucket_n: int, in_dtype: str, target: str) -> Any:
         block_size=block,
         threads=threads,
     )
-    return tilelang.compile(prim, target=target, out_idx=None)
+    return dispatch_lower(prim, target)
 
 
 @lru_cache(maxsize=256)
@@ -431,7 +431,7 @@ def _quantize_kernel_for(n_elements: int, in_dtype: str, target: str) -> Any:
     training rotations without thrashing.
     """
 
-    import tilelang
+    from cppmega_mlx.nn._tilelang._engine_dispatch import dispatch_lower
 
     block, threads = _pick_block_size(target, n_elements)
     prim = make_fp8_quantize_kernel(
@@ -440,7 +440,7 @@ def _quantize_kernel_for(n_elements: int, in_dtype: str, target: str) -> Any:
         block_size=block,
         threads=threads,
     )
-    return tilelang.compile(prim, target=target, out_idx=None)
+    return dispatch_lower(prim, target)
 
 
 _TORCH_DTYPE_TO_TL: dict[torch.dtype, str] = {

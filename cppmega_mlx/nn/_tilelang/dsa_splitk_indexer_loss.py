@@ -865,8 +865,9 @@ def _stage1_kernel_for(
 ) -> Any:
     """Build, JIT-compile, and cache the stage-1 kernel for a (shape, target)."""
 
-    import tilelang
     import struct
+
+    from cppmega_mlx.nn._tilelang._engine_dispatch import dispatch_lower
 
     # Recover the original fp32 from the bit-pattern key (we use bits because
     # ``lru_cache`` requires a hashable scalar key and floats are fine but the
@@ -888,7 +889,7 @@ def _stage1_kernel_for(
         threads=threads,
         num_stages=num_stages,
     )
-    return tilelang.compile(prim, target=target, out_idx=None)
+    return dispatch_lower(prim, target)
 
 
 @lru_cache(maxsize=64)
@@ -910,8 +911,9 @@ def _stage2_kernel_for(
 ) -> Any:
     """Build, JIT-compile, and cache the stage-2 kernel for a (shape, target)."""
 
-    import tilelang
     import struct
+
+    from cppmega_mlx.nn._tilelang._engine_dispatch import dispatch_lower
 
     softmax_scale = struct.unpack("<f", struct.pack("<I", softmax_scale_bits))[0]
 
@@ -930,7 +932,7 @@ def _stage2_kernel_for(
         threads=threads,
         num_stages=num_stages,
     )
-    return tilelang.compile(prim, target=target, out_idx=None)
+    return dispatch_lower(prim, target)
 
 
 _TORCH_DTYPE_TO_TL: dict[torch.dtype, str] = {
