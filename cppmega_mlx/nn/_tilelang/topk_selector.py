@@ -956,7 +956,7 @@ def _path_c_kernel_for(
             e = ends[bx]
 
             for i in T.serial(_TOPK_C_K):
-                local_vals[i] = -T.infinity("float32")
+                local_vals[i] = T.float32(-1.0e38)
                 local_idx[i] = -1
 
             for j in T.serial(lane, _TOPK_C_N, step=_TOPK_C_THREADS):
@@ -964,7 +964,7 @@ def _path_c_kernel_for(
                 value = T.if_then_else(
                     valid,
                     T.cast(scores[bx, j], "float32"),
-                    -T.infinity("float32"),
+                    T.float32(-1.0e38),
                 )
                 if value > local_vals[0]:
                     pos = 0
@@ -991,8 +991,8 @@ def _path_c_kernel_for(
                         ap = _TOPK_C_K - 1
                         bp = _TOPK_C_K - 1
                         for pick in T.serial(_TOPK_C_K):
-                            a_val = -T.infinity("float32")
-                            b_val = -T.infinity("float32")
+                            a_val = T.float32(-1.0e38)
+                            b_val = T.float32(-1.0e38)
                             a_idx = -1
                             b_idx = -1
                             if ap >= 0:

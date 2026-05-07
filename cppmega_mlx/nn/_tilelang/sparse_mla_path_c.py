@@ -1741,7 +1741,7 @@ def _fwd_kernel_for(
             for k in T.serial(lane, TOPK, step=THREADS):
                 gather_idx[0] = indices[idx_base + k]
                 if gather_idx[0] < 0:
-                    scores[k] = -T.infinity("float32")
+                    scores[k] = T.float32(-1.0e38)
                 else:
                     acc[0] = 0.0
                     kv_row_base = kv_b_base + (gather_idx[0] * KV_GROUP + g) * QK_DIM
@@ -1752,7 +1752,7 @@ def _fwd_kernel_for(
                     scores[k] = acc[0] * sm_scale
             T.sync_threads()
 
-            local[0] = -T.infinity("float32")
+            local[0] = T.float32(-1.0e38)
             for k in T.serial(lane, TOPK, step=THREADS):
                 if scores[k] > local[0]:
                     local[0] = scores[k]
@@ -1767,7 +1767,7 @@ def _fwd_kernel_for(
             row_max = reduce_buf[0]
 
             for k in T.serial(lane, TOPK, step=THREADS):
-                if scores[k] == -T.infinity("float32"):
+                if scores[k] == T.float32(-1.0e38):
                     scores[k] = 0.0
                 else:
                     scores[k] = T.exp(scores[k] - row_max)
@@ -1921,7 +1921,7 @@ def _bwd_kernel_for(
             for k in T.serial(lane, TOPK, step=THREADS):
                 gather_idx[0] = indices[idx_base + k]
                 if gather_idx[0] < 0:
-                    scores[k] = -T.infinity("float32")
+                    scores[k] = T.float32(-1.0e38)
                 else:
                     acc[0] = 0.0
                     kv_row_base = kv_b_base + (gather_idx[0] * KV_GROUP + g) * QK_DIM
@@ -1932,7 +1932,7 @@ def _bwd_kernel_for(
                     scores[k] = acc[0] * sm_scale
             T.sync_threads()
 
-            local[0] = -T.infinity("float32")
+            local[0] = T.float32(-1.0e38)
             for k in T.serial(lane, TOPK, step=THREADS):
                 if scores[k] > local[0]:
                     local[0] = scores[k]

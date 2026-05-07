@@ -41,9 +41,64 @@ import os
 import re
 import sys
 from dataclasses import dataclass
+from pathlib import Path as _Path
 from typing import Any, Callable, Sequence, cast
 
 import mlx.core as mx
+
+
+def _preload_libz3_for_dev_tilelang() -> None:
+    """Preload ``libz3.dylib`` so dev-build ``libtilelang.dylib`` can dlopen.
+
+    The in-tree dev build ``libtilelang.dylib`` records ``libz3.dylib`` as a
+    bare basename rather than ``@rpath/libz3.dylib`` (or ``@loader_path/...``).
+    On macOS this means dyld will not find the libz3 shipped *next to it* in
+    the build directory. The result is that ``import tilelang`` raises
+    ``OSError: Library not loaded: libz3.dylib`` and every Path C kernel then
+    silently returns ``None`` in its dispatch try/except — bench scripts log
+    "did not dispatch" with no actionable signal.
+
+    Workaround: explicitly ``dlopen`` the libz3 that is already shipped next to
+    the tilelang dev build. Once the lib is in the process image, dyld will
+    satisfy the basename-only reference for libtilelang.dylib's later load.
+    Idempotent and silent on success / when libz3 is already present.
+    """
+
+    if getattr(_preload_libz3_for_dev_tilelang, "_done", False):
+        return
+
+    candidates: list[_Path] = []
+    dev_build_root = os.environ.get("TILELANG_DEV_BUILD_ROOT")
+    if dev_build_root:
+        candidates.append(_Path(dev_build_root) / "lib" / "libz3.dylib")
+    # Fallback: every tilelang dev tree we've seen drops libz3.dylib at
+    # ``<root>/build/lib`` next to libtilelang.dylib.
+    for env_var in ("TILELANG_ROOT",):
+        root = os.environ.get(env_var)
+        if root:
+            candidates.append(_Path(root) / "build" / "lib" / "libz3.dylib")
+    # Last-resort: a checkout layout used by recent benches.
+    candidates.append(_Path("/tmp/tl_apache_tvm_swap/build/lib/libz3.dylib"))
+    # Brew-installed z3 (works as a basename-resolution fallback).
+    candidates.append(_Path("/opt/homebrew/lib/libz3.dylib"))
+
+    for candidate in candidates:
+        try:
+            if candidate.exists():
+                ctypes.CDLL(str(candidate), ctypes.RTLD_GLOBAL)
+                _preload_libz3_for_dev_tilelang._done = True  # type: ignore[attr-defined]
+                return
+        except OSError:
+            continue
+    # No candidate succeeded — leave _done unset; callers will still see the
+    # original tilelang import error which is the most useful diagnostic.
+
+
+# Run the preload eagerly on Darwin so any ``import tilelang`` triggered by
+# downstream Path C modules during their own import inherits a process image
+# that already has libz3 loaded. No-op on non-Darwin platforms.
+if sys.platform == "darwin":
+    _preload_libz3_for_dev_tilelang()
 
 
 MetalKernel = Callable[..., list[mx.array]]
