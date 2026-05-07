@@ -1067,37 +1067,38 @@ def _path_c_kernel_for(
                 for i in T.serial(_TOPK_C_K):
                     indices[bx, i] = pair_idx[0, _TOPK_C_K - 1 - i]
 
-    # Migration phase-2: route the lowering through the shared
-    # ``dispatch_lower`` helper. In ``shim``/``auto`` modes (default) this
-    # returns a :class:`TileLangMSLLowering`, preserving the existing
-    # ``mx.fast.metal_kernel`` path. In ``engine`` mode it returns a
-    # ``tilelang.compile`` artifact stamped with ``_tilelang_engine_target``;
-    # the engine artifact is returned directly so callers can dispatch via the
-    # unified runtime instead of MLX's MSL kernel wrapper.
-    artifact = dispatch_lower(topk_selector_kernel, target="metal")
-    if getattr(artifact, "_tilelang_engine_target", None) is not None:
-        return artifact, None  # engine path: caller invokes the artifact directly
-
-    # Phase-3 MSL-extraction bridge: if the unified engine is reachable
-    # AND the caller is not relying on the legacy shim's pass_configs
-    # threading, prefer the engine path with MSL extraction. This produces
-    # a :class:`TileLangMSLLowering` from a ``tilelang.compile`` artifact
-    # so the existing ``mx.fast.metal_kernel`` wrapping below works
-    # unchanged. Falls back to the shim transparently on any extraction
-    # failure (the helper itself emits the warning).
-    from cppmega_mlx.nn._tilelang._engine_dispatch import (
-        dispatch_lower_supports_msl_extraction,
-    )
-    if (
-        not _topk_path_c_pass_configs()
-        and dispatch_lower_supports_msl_extraction()
-        and not hasattr(artifact, "msl_text")
-    ):
-        bridged = dispatch_lower(
+    # Migration phase-2/3: route the lowering through the shared
+    # ``dispatch_lower`` helper. MLX on Metal requires MSL text wrapped via
+    # ``mx.fast.metal_kernel`` — the engine artifact's runtime-callable
+    # contract takes torch tensors and is not invokable from MLX. So if the
+    # engine path returns a bare artifact, attempt MSL extraction; on any
+    # failure fall back to the shim. ``return_msl=True`` already encodes
+    # this preference, so prefer it directly when not threading PassConfigs.
+    if not _topk_path_c_pass_configs():
+        artifact = dispatch_lower(
             topk_selector_kernel, target="metal", return_msl=True
         )
-        if hasattr(bridged, "msl_text"):
+    else:
+        artifact = dispatch_lower(topk_selector_kernel, target="metal")
+    if getattr(artifact, "_tilelang_engine_target", None) is not None and not hasattr(
+        artifact, "msl_text"
+    ):
+        # Engine path returned a bare artifact (no msl_text). Try MSL
+        # extraction; on failure fall back to the shim so the
+        # ``mx.fast.metal_kernel`` wrapping below has a body to compile.
+        from cppmega_mlx.nn._tilelang._msl_extraction import (
+            extract_msl_from_engine_artifact,
+        )
+
+        bridged = extract_msl_from_engine_artifact(artifact, target="metal")
+        if bridged is not None and hasattr(bridged, "msl_text"):
             artifact = bridged
+        else:
+            artifact = _msl_transform.lower_tilelang_to_msl_inline(
+                topk_selector_kernel,
+                pass_configs=_topk_path_c_pass_configs() or None,
+                target="metal",
+            )
 
     # Shim path: rewrite the merge round + wrap in mx.fast.metal_kernel as before.
     lowering = _path_c_rewrite_merge_round(artifact)
