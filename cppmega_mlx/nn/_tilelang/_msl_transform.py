@@ -39,6 +39,7 @@ from __future__ import annotations
 import collections
 import ctypes
 import functools
+import json
 import os
 import re
 import sys
@@ -194,6 +195,29 @@ def ensure_libz3_preloaded() -> None:
     _maybe_preload_libz3()
 
 
+def reset_libz3_preload_state() -> None:
+    """Reset all libz3 preload state so a future lower call re-attempts.
+
+    Wave 5 grok finding #6: ``_LIBZ3_PRELOAD_ATTEMPTED`` and the
+    ``_failed_attempts`` counter on ``_preload_libz3_for_dev_tilelang`` persist
+    once set. If the host environment changes mid-process (e.g. the user sets
+    ``TILELANG_DEV_BUILD_ROOT`` after a failed attempt, or ``conftest.py``
+    populates ``_LIBZ3_DEV_CANDIDATES`` after the lazy guard already fired),
+    no retry would otherwise happen and Path C silently falls back to pure
+    MLX. Tests/bench scripts call this to force a clean slate.
+
+    Clears: the module-level ``_LIBZ3_PRELOAD_ATTEMPTED`` guard, plus the
+    ``_done`` and ``_failed_attempts`` attributes on
+    ``_preload_libz3_for_dev_tilelang``.
+    """
+
+    global _LIBZ3_PRELOAD_ATTEMPTED
+    _LIBZ3_PRELOAD_ATTEMPTED = False
+    for attr in ("_done", "_failed_attempts"):
+        if hasattr(_preload_libz3_for_dev_tilelang, attr):
+            delattr(_preload_libz3_for_dev_tilelang, attr)
+
+
 MetalKernel = Callable[..., list[mx.array]]
 
 
@@ -236,6 +260,16 @@ def msl_dispatch_status(*arrays: mx.array) -> MSLDispatchStatus:
     return MSLDispatchStatus(True, "MSL dispatch path is available")
 
 
+# Wave 5 grok finding #4: the most recent reason ``make_metal_kernel`` returned
+# None, exposed so ``dispatch()``'s None-guard can surface a specific cause
+# instead of a generic "metal_kernel is None" message. Module-level singleton
+# is intentional — there's no concurrent ``make_metal_kernel`` call pattern in
+# this codebase (kernels are constructed at module-import or first-dispatch
+# time, both serial), and we want the latest failure visible to the next
+# ``dispatch()`` on the same thread.
+_LAST_MAKE_METAL_KERNEL_REASON: str | None = None
+
+
 def make_metal_kernel(
     *,
     name: str,
@@ -245,13 +279,28 @@ def make_metal_kernel(
     header: str = "",
     ensure_row_contiguous: bool = True,
 ) -> MetalKernel | None:
-    """Create a cached mx.fast.metal_kernel handle, or None if unavailable."""
+    """Create a cached mx.fast.metal_kernel handle, or None if unavailable.
 
+    On every None-return path we set ``_LAST_MAKE_METAL_KERNEL_REASON`` to a
+    short human-readable reason (Wave 5 grok finding #4) so the downstream
+    ``dispatch()`` None-guard can include it in its ``MSLDispatchUnsupported``
+    message instead of the previous generic "metal_kernel is None".
+    """
+
+    global _LAST_MAKE_METAL_KERNEL_REASON
     if not can_run_metal():
+        _LAST_MAKE_METAL_KERNEL_REASON = (
+            f"can_run_metal() is False (default_device={mx.default_device()}, "
+            f"metal_available={getattr(getattr(mx, 'metal', None), 'is_available', lambda: False)()})"
+        )
         return None
     constructor = _metal_kernel_constructor()
     if constructor is None:
+        _LAST_MAKE_METAL_KERNEL_REASON = (
+            "mx.fast.metal_kernel constructor is unavailable on this MLX build"
+        )
         return None
+    _LAST_MAKE_METAL_KERNEL_REASON = None
     return cast(
         MetalKernel,
         constructor(
@@ -285,9 +334,12 @@ def dispatch(
     # type as every other dispatch failure so callers can continue to use a
     # single ``except MSLDispatchUnsupported`` to fall back to Path B.
     if kernel is None:
+        # Wave 5 grok finding #4: surface the *specific* reason
+        # ``make_metal_kernel`` returned None instead of a generic message.
+        # Reads the module-level singleton populated on each None-return path.
+        reason = _LAST_MAKE_METAL_KERNEL_REASON or "unknown"
         raise MSLDispatchUnsupported(
-            "metal_kernel is None — check can_run_metal() and "
-            "mx.fast.metal_kernel availability"
+            f"metal_kernel is None — {reason}"
         )
     if any(isinstance(x, mx.array) and x.size == 0 for x in inputs):
         raise MSLDispatchUnsupported("empty tensors must use the pure MLX fallback")
@@ -542,6 +594,99 @@ _METAL_BUILTIN_PARAM_NAMES = frozenset({
     "gridDim",
     "blockDim",
 })
+
+
+# Wave 5 grok finding #1: full multi-parameter signature corpus. The
+# single-decl ``_TEST_PARSE_SIGNATURES`` above exercises ``_strip_attribute_markers``
+# / ``_extract_param_identifier`` per-decl, but did NOT exercise
+# ``_split_signature_decls`` against realistic full kernel signatures. The
+# entries below are realistic-shape examples covering:
+#
+#   * Comma inside a balanced ``[[...]]`` attribute (Metal allows
+#     ``[[buffer(0), function_constant(...)]]``).
+#   * Multiple device-qualified buffers with different qualifier orderings
+#     (``device const T*`` vs ``const device T*``).
+#   * Mixed ``device`` / ``constant`` address spaces.
+#   * Trailing Metal builtin params (threadgroup_position_in_grid / thread_*).
+#   * A leading threadgroup-local buffer that should be skipped.
+#
+# Each entry is ``(full_signature_string, expected_buffer_names_in_order)``.
+# Validate via ``_validate_test_full_signatures()`` (called manually or under
+# ``CPPMEGA_VALIDATE_PARSE_TESTS=1`` at module import; tests are not modified
+# in this file's scope).
+_TEST_PARSE_FULL_SIGNATURES: tuple[tuple[str, list[str]], ...] = (
+    # Realistic mamba3-shape fwd_kernel: 4 device buffers + builtin grid/thread
+    # params. The qualifier orderings exercise both ``device const T*`` and
+    # bare ``device T*``.
+    (
+        "device const half* A [[buffer(0)]], "
+        "device const half* B [[buffer(1)]], "
+        "device float* C [[buffer(2)]], "
+        "device const float* D [[buffer(3)]], "
+        "uint3 blockIdx [[threadgroup_position_in_grid]], "
+        "uint3 threadIdx [[thread_position_in_threadgroup]]",
+        ["A", "B", "C", "D"],
+    ),
+    # FP8 path: ``device const float8_e4m3 *`` mixed with a constant-address-
+    # space scalar buffer for shape parameters, plus an output buffer.
+    (
+        "device const float8_e4m3 *X [[buffer(0)]], "
+        "constant uint* shape [[buffer(1)]], "
+        "device float* Y [[buffer(2)]], "
+        "uint3 blockIdx [[threadgroup_position_in_grid]]",
+        ["X", "shape", "Y"],
+    ),
+    # ``const device`` ordering (matmul backwards-compat) + ``__restrict``
+    # modifier + a threadgroup-local scratch buffer that must be skipped.
+    (
+        "const device half *A [[buffer(0)]], "
+        "const device half *B [[buffer(1)]], "
+        "device float* __restrict C [[buffer(2)]], "
+        "threadgroup float* scratch, "
+        "uint3 threadIdx [[thread_position_in_threadgroup]], "
+        "uint simd_lane [[thread_index_in_simdgroup]]",
+        ["A", "B", "C"],
+    ),
+    # Comma INSIDE a ``[[...]]`` attribute marker — must not split the decl.
+    # Synthesized but valid Metal: ``[[buffer(0), function_constant(2)]]``.
+    (
+        "device const float* A [[buffer(0), function_constant(2)]], "
+        "device float* B [[buffer(1)]], "
+        "uint3 blockIdx [[threadgroup_position_in_grid]]",
+        ["A", "B"],
+    ),
+    # Single-buffer signature (degenerate but legal — verifies trailing-decl
+    # handling when there is no terminating comma).
+    (
+        "device float* only [[buffer(0)]]",
+        ["only"],
+    ),
+)
+
+
+def _validate_test_full_signatures() -> list[tuple[str, list[str], list[str]]]:
+    """Self-test: parse every ``_TEST_PARSE_FULL_SIGNATURES`` entry.
+
+    Returns a list of ``(sig_text, expected, actual)`` triples for entries
+    where the parser output diverges from the expected list. Empty list = all
+    pass. Wave 5 grok finding #1: the previous test corpus only had
+    single-decl strings, so ``_split_signature_decls`` was never exercised in
+    the pinned corpus. Run via:
+
+        from cppmega_mlx.nn._tilelang._msl_transform import (
+            _validate_test_full_signatures,
+        )
+        assert _validate_test_full_signatures() == []
+
+    or set ``CPPMEGA_VALIDATE_PARSE_TESTS=1`` to run automatically at import.
+    """
+
+    mismatches: list[tuple[str, list[str], list[str]]] = []
+    for sig, expected in _TEST_PARSE_FULL_SIGNATURES:
+        actual = _parse_buffer_param_names(sig)
+        if actual != expected:
+            mismatches.append((sig, list(expected), actual))
+    return mismatches
 
 
 def _split_signature_decls(sig_text: str) -> list[str]:
@@ -808,45 +953,108 @@ _LOWERING_CACHE_KEEPALIVE: collections.OrderedDict[
 ] = collections.OrderedDict()
 
 
-def _freeze_for_hash(obj: Any) -> Any:
-    """Recursively convert ``obj`` into a hashable, structural representation.
+# Sentinel returned by ``_freeze_for_hash`` when no stable serialization is
+# possible. ``_lowering_cache_key`` propagates this as ``None`` and the
+# lowering call site falls through to the uncached slow path. Trade-off
+# (Wave 5 grok finding #5): we lose caching for that one call rather than
+# risk a non-deterministic cache key colliding across structurally distinct
+# pass_configs.
+_FREEZE_UNSTABLE = object()
 
-    fix-round-9 (Wave 4 grok finding #4): the previous ``frozenset(items())``
-    silently bypassed caching on any unhashable nested value (e.g., a
-    dict-of-dicts pass_config), causing repeated full lowering on the hot
-    path. This recurses into mappings/sequences/sets and stringifies anything
-    that's still unhashable at the leaves so we always get *some* stable key.
+
+def _freeze_for_hash(obj: Any) -> Any:
+    """Recursively convert ``obj`` into a deterministic hashable representation.
+
+    Wave 5 grok finding #5: ``repr(obj)`` for arbitrary TVM objects is not
+    deterministic — it can include memory addresses, depend on internal dict
+    ordering, or vary across processes. Using it as a cache key risked the
+    *worst* outcome: a same-config-different-repr miss is just a perf hit, but
+    a different-config-same-repr collision would return a wrong lowering for a
+    structurally distinct PrimFunc. Strategy now, in order:
+
+    1. Containers (dict / list / tuple / set / frozenset) recurse.
+    2. Hashable primitives are returned as-is.
+    3. Objects exposing TVM-idiomatic stable serializers
+       (``_serialize_to_str()`` or ``to_json()``) are serialized via those.
+    4. ``json.dumps(obj, sort_keys=True, default=str)`` — deterministic for
+       JSON-compatible primitives and sorted dicts.
+    5. Last resort: return the ``_FREEZE_UNSTABLE`` sentinel so the caller
+       can skip caching rather than risk a non-deterministic key.
+
+    Returning the sentinel is preferred over returning ``repr(obj)`` because
+    cache **correctness** beats cache hit rate — a wrong-cache hit yields
+    silent wrong numerics; a cache skip just costs a re-lowering.
     """
 
     if isinstance(obj, dict):
-        return frozenset(
-            (_freeze_for_hash(k), _freeze_for_hash(v)) for k, v in obj.items()
-        )
+        # Sort frozenset entries by their hashable key representation so
+        # iteration order can never affect equality. (frozenset already
+        # ignores construction order for ``hash()`` / ``==``, but freezing the
+        # key first guarantees nested unhashables don't bubble up.)
+        frozen_items = []
+        for k, v in obj.items():
+            fk = _freeze_for_hash(k)
+            fv = _freeze_for_hash(v)
+            if fk is _FREEZE_UNSTABLE or fv is _FREEZE_UNSTABLE:
+                return _FREEZE_UNSTABLE
+            frozen_items.append((fk, fv))
+        return frozenset(frozen_items)
     if isinstance(obj, (list, tuple)):
-        return tuple(_freeze_for_hash(x) for x in obj)
+        out = []
+        for x in obj:
+            fx = _freeze_for_hash(x)
+            if fx is _FREEZE_UNSTABLE:
+                return _FREEZE_UNSTABLE
+            out.append(fx)
+        return tuple(out)
     if isinstance(obj, (set, frozenset)):
-        return frozenset(_freeze_for_hash(x) for x in obj)
+        out_set = []
+        for x in obj:
+            fx = _freeze_for_hash(x)
+            if fx is _FREEZE_UNSTABLE:
+                return _FREEZE_UNSTABLE
+            out_set.append(fx)
+        return frozenset(out_set)
     try:
         hash(obj)
         return obj
     except TypeError:
-        # Last-resort stringification — not pretty, but stable per-process and
-        # avoids the alternative of skipping the cache entirely.
-        return repr(obj)
+        pass
+    # Try TVM-idiomatic stable serializers before falling back to JSON.
+    for serializer_name in ("_serialize_to_str", "to_json"):
+        serializer = getattr(obj, serializer_name, None)
+        if callable(serializer):
+            try:
+                return (serializer_name, serializer())
+            except Exception:
+                continue
+    # Deterministic JSON fallback for things that look JSON-able. Catches
+    # primitives we somehow missed plus simple containers; ``default=str``
+    # prevents TypeError on unknown leaves but only as a *last* leaf step
+    # (not at the top level — top-level recursion is handled above). If even
+    # this raises, return the unstable sentinel.
+    try:
+        return ("json", json.dumps(obj, sort_keys=True, default=str))
+    except (TypeError, ValueError):
+        return _FREEZE_UNSTABLE
 
 
 def _lowering_cache_key(
     prim_func: Any,
     target: str,
     pass_configs: dict[str, Any] | None,
-) -> tuple[int, Any, str]:
-    """Build a cache key for the lowering cache.
+) -> tuple[int, Any, str] | None:
+    """Build a cache key for the lowering cache, or None if unstable.
 
-    Always succeeds: ``_freeze_for_hash`` falls back to ``repr()`` for any
-    leaf value that cannot be hashed, so we never silently skip caching.
+    Wave 5 grok finding #5: returns ``None`` instead of falling back to
+    ``repr()`` when ``_freeze_for_hash`` cannot produce a deterministic key.
+    The caller skips cache lookup/store for that lowering — losing the perf
+    win on that one call but preserving correctness across the cache.
     """
 
     cfg = _freeze_for_hash(pass_configs or {})
+    if cfg is _FREEZE_UNSTABLE:
+        return None
     return (id(prim_func), cfg, target)
 
 
@@ -855,10 +1063,16 @@ def clear_lowering_cache() -> None:
 
     Drops every cached lowering result and the strong refs that pinned the
     associated PrimFunc objects, allowing GC to reclaim them.
+
+    Wave 5 grok finding #6 cascade: also resets the libz3 preload state.
+    "Clear cached state" means *all* cached state — leaving the libz3 preload
+    flags pinned would defeat the purpose for tests that mutate the candidate
+    list and then call ``clear_lowering_cache`` to reset.
     """
 
     _LOWERING_CACHE.clear()
     _LOWERING_CACHE_KEEPALIVE.clear()
+    reset_libz3_preload_state()
 
 
 def _store_lowering_in_cache(
@@ -924,13 +1138,17 @@ def lower_tilelang_to_msl_inline(
     # frozenset of pass_configs and the target string. If the inputs aren't
     # hashable for any reason, _lowering_cache_key returns None and we fall
     # through to the uncached slow path.
+    # Wave 5 grok finding #5: ``cache_key`` is None when pass_configs contains
+    # a value that has no stable serialization — skip caching entirely on that
+    # call rather than risk a non-deterministic key collision.
     cache_key = _lowering_cache_key(prim_func, target, pass_configs)
-    cached = _LOWERING_CACHE.get(cache_key)
-    if cached is not None:
-        # fix-round-9 (Wave 4 grok finding #4): refresh LRU position on hit.
-        _LOWERING_CACHE.move_to_end(cache_key)
-        _LOWERING_CACHE_KEEPALIVE.move_to_end(cache_key)
-        return cached
+    if cache_key is not None:
+        cached = _LOWERING_CACHE.get(cache_key)
+        if cached is not None:
+            # fix-round-9 (Wave 4 grok finding #4): refresh LRU position on hit.
+            _LOWERING_CACHE.move_to_end(cache_key)
+            _LOWERING_CACHE_KEEPALIVE.move_to_end(cache_key)
+            return cached
 
     # fix-round-8 (Wave 3 grok-4): trigger the lazy libz3 preload here (instead
     # of at module-import time). By this point any conftest.py that wanted to
@@ -1007,7 +1225,9 @@ def lower_tilelang_to_msl_inline(
     )
     # fix-round-9 (Wave 4 grok finding #4): bounded LRU store. Pins a strong
     # ref to ``prim_func`` under the same key so eviction releases both.
-    _store_lowering_in_cache(cache_key, prim_func, result)
+    # Wave 5 grok finding #5: skip the store when the key is unstable.
+    if cache_key is not None:
+        _store_lowering_in_cache(cache_key, prim_func, result)
     return result
 
 
@@ -1233,6 +1453,23 @@ def _as_metal_target_uncached(target: Any) -> Any:
             return spec
 
 
+# Wave 5 grok finding #1: optional self-validation of the full-signature
+# corpus at import time. Off by default to keep import fast; enable in CI or
+# during local development by setting ``CPPMEGA_VALIDATE_PARSE_TESTS=1``.
+if os.environ.get("CPPMEGA_VALIDATE_PARSE_TESTS") == "1":
+    _parse_test_mismatches = _validate_test_full_signatures()
+    if _parse_test_mismatches:
+        warnings.warn(
+            "_TEST_PARSE_FULL_SIGNATURES mismatches: "
+            + "; ".join(
+                f"sig={sig!r} expected={exp} got={act}"
+                for sig, exp, act in _parse_test_mismatches
+            ),
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+
 # Auto-register intrinsics at module import. fix-round-8 (Wave 3 grok-4):
 # narrow the catch from bare ``Exception``. Only import-time errors (TVM
 # / tilelang not installed) and missing-attribute errors (TVM internals
@@ -1264,4 +1501,5 @@ __all__ = [
     "make_metal_kernel",
     "metal_grid_for_lowering",
     "msl_dispatch_status",
+    "reset_libz3_preload_state",
 ]
