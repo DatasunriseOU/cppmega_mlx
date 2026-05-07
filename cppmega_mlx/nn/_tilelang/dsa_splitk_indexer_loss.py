@@ -489,8 +489,22 @@ def make_dsa_splitk_stage1_kernel(
                     # (last sq_block / last sk_tile when ASq % BLOCK_SQ != 0
                     # or Sk % BLOCK_SK != 0). Triton uses tl.load(..., mask=...)
                     # for the equivalent guard; here we predicate the read.
-                    if SPARSE and in_bounds:
-                        s = s + IndexMask[b, sq_idx, sk_idx]
+                    #
+                    # Wave-7 fix: rebinding ``s`` inside ``if SPARSE and
+                    # in_bounds:`` opens an IR IfFrame on the runtime
+                    # ``in_bounds`` vector predicate. The new ``s`` is scoped
+                    # to that IfFrame, so reading it on line 495 below trips
+                    # ``Immutable variable 's' is used outside its defining
+                    # region``. ``SPARSE`` is a Python-level constexpr (set
+                    # from ``sparse_loss`` at trace time) so we can keep the
+                    # constexpr branch and inline the runtime predicate via
+                    # ``T.if_then_else`` so no IfFrame opens around ``s``.
+                    if SPARSE:
+                        s = s + T.if_then_else(
+                            in_bounds,
+                            IndexMask[b, sq_idx, sk_idx],
+                            T.cast(0, "float32"),
+                        )
                     if valid:
                         scores_f[i, j] = s
                     else:
@@ -946,8 +960,23 @@ def make_dsa_splitk_stage2_kernel(
                         s = h_scores[i, j] * T.cast(SCALE, "float32")
                         # Predicate the IndexMask read on bounds to avoid OOB
                         # on boundary tiles (Triton uses `tl.load(..., mask=...)`).
-                        if SPARSE and in_bounds:
-                            s = s + IndexMask[b, sq_idx, sk_idx]
+                        #
+                        # Wave-7 fix: ``if SPARSE and in_bounds: s = s + ...``
+                        # rebinds ``s`` inside a runtime-vector IfFrame; the
+                        # subsequent ``T.exp(s - m_h[i])`` outside the frame
+                        # then trips ``Immutable variable 's' is used outside
+                        # its defining region`` and (co-trips) ``Only the last
+                        # index of a buffer access may be a vector type`` on
+                        # the same path. ``SPARSE`` is a Python constexpr,
+                        # so the branch can stay; the runtime ``in_bounds``
+                        # predicate moves into ``T.if_then_else`` so ``s`` is
+                        # single-assigned at the trace level.
+                        if SPARSE:
+                            s = s + T.if_then_else(
+                                in_bounds,
+                                IndexMask[b, sq_idx, sk_idx],
+                                T.cast(0, "float32"),
+                            )
                         if valid:
                             denom = d_h[i]
                             if denom <= T.cast(0, "float32"):
