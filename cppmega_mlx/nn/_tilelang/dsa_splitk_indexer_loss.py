@@ -104,11 +104,52 @@ from __future__ import annotations
 
 import math
 import os
+import threading
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any, cast
+from typing import Any, Dict, Tuple, cast
 
 import torch
+
+
+# Wave-9 #5 (grok wave-7/8 review HIGH perf): the sparse_loss path used to
+# allocate a fresh ``torch.full((AB, ASq, Sk), -inf)`` scratch tensor on
+# *every* forward pass. For DSA-style production shapes (AB=8, ASq=2048,
+# Sk=4096, fp32) this is ~256 MB of allocator traffic per step before the
+# scatter_ even fires — a classic N+1 hot-path regression vs. the original
+# Triton path that reused a per-process buffer. Cache the scratch by
+# (shape, device, dtype); zero_() on reuse beats a fresh allocation.
+_SCATTER_SCRATCH_CACHE: Dict[Tuple[Tuple[int, ...], str, str], torch.Tensor] = {}
+_SCATTER_SCRATCH_LOCK = threading.Lock()
+_SCATTER_SCRATCH_LRU_MAX = 8
+
+
+def _get_scatter_scratch(
+    shape: Tuple[int, ...],
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Return a reusable scratch buffer for the sparse_loss scatter, refilled
+    with ``-inf`` (matching the original ``torch.full(..., -inf)`` semantics).
+
+    Cache cap is FIFO-evicted at ``_SCATTER_SCRATCH_LRU_MAX`` entries so a
+    pathological caller that varies shapes wildly cannot leak memory.
+    """
+    key = (shape, str(device), str(dtype))
+    with _SCATTER_SCRATCH_LOCK:
+        buf = _SCATTER_SCRATCH_CACHE.get(key)
+        if buf is None:
+            buf = torch.full(shape, float("-inf"), device=device, dtype=dtype)
+            _SCATTER_SCRATCH_CACHE[key] = buf
+            if len(_SCATTER_SCRATCH_CACHE) > _SCATTER_SCRATCH_LRU_MAX:
+                _evict_key = next(iter(_SCATTER_SCRATCH_CACHE))
+                _SCATTER_SCRATCH_CACHE.pop(_evict_key, None)
+        else:
+            # Reuse: refill with -inf so the subsequent ``scatter_`` produces
+            # the same logical mask. ``Tensor.fill_`` is in-place and avoids
+            # the allocator entirely.
+            buf.fill_(float("-inf"))
+        return buf
 
 
 # Wave-4 perf #1: validation in dsa_splitk_indexer_loss_tilelang's
@@ -1330,8 +1371,13 @@ def dsa_splitk_indexer_loss_tilelang(
                     "dsa_splitk_indexer_loss_tilelang: topk_indices out of "
                     f"range [0, {Sk}); got [{_min_idx}, {_max_idx}]."
                 )
-        index_mask = torch.full(
-            (AB, ASq, Sk), float("-inf"), dtype=torch.float32, device=query.device,
+        # Wave-9 #5 (grok wave-7/8 review HIGH perf): reuse the scatter
+        # scratch buffer instead of allocating ``torch.full(... -inf)``
+        # every forward. ``_get_scatter_scratch`` returns an -inf-filled
+        # tensor (cached / refilled in-place); ``scatter_`` then writes
+        # 0.0 at topk positions exactly as the previous expression.
+        index_mask = _get_scatter_scratch(
+            (AB, ASq, Sk), query.device, torch.float32
         ).scatter_(-1, topk_idx64, 0.0)
         # Wave-1b fix-round-2 (MED sec): NaN poisoning guard for fully-
         # masked rows. If a row's topk_indices contained no in-range
