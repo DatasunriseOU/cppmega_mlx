@@ -655,8 +655,20 @@ def make_dsa_splitk_stage2_kernel(
             # so the inner sk_tile->h double loop reads them from registers
             # instead of HBM on every pass. Cost: AH*BLOCK_SQ fp32 fragments
             # (CUDA 128*128*4 = 64 KB worst case; Metal 128*32*4 = 16 KB).
-            M_pre = T.alloc_fragment((AH, BLOCK_SQ), "float32")
-            D_pre = T.alloc_fragment((AH, BLOCK_SQ), "float32")
+            # Wave-1b fix-round-2 (HIGH perf): when AH*BLOCK_SQ*8 exceeds
+            # the per-block register budget (>32 KB combined) the
+            # fragments spill to local mem, hurting more than the saved
+            # HBM reads. In that case skip the prefetch entirely and
+            # re-read M/D inside the per-(sk_tile, h) loop. Allocate
+            # tiny placeholders so the constant-folder elides the dead
+            # array when USE_MD_PRE is False (alloc_fragment requires
+            # positive sizes).
+            if USE_MD_PRE:
+                M_pre = T.alloc_fragment((AH, BLOCK_SQ), "float32")
+                D_pre = T.alloc_fragment((AH, BLOCK_SQ), "float32")
+            else:
+                M_pre = T.alloc_fragment((1, 1), "float32")
+                D_pre = T.alloc_fragment((1, 1), "float32")
 
             # Load stage-1 index-softmax statistics for this sq block.
             for i in T.Parallel(BLOCK_SQ):
@@ -672,15 +684,19 @@ def make_dsa_splitk_stage2_kernel(
             # Wave-2 perf #5: pre-load M[b, h, sq], D[b, h, sq] for all h once
             # per sq_block, before the sk_tile loop. The inner per-sk_tile
             # h-loop reads M_pre[h, i] / D_pre[h, i] from registers.
-            for hh in T.serial(AH):
-                for i in T.Parallel(BLOCK_SQ):
-                    sq_idx = sq_block_id * BLOCK_SQ + i
-                    if sq_idx < ASq:
-                        M_pre[hh, i] = M[b, hh, sq_idx]
-                        D_pre[hh, i] = D[b, hh, sq_idx]
-                    else:
-                        M_pre[hh, i] = T.cast(0, "float32")
-                        D_pre[hh, i] = T.cast(1, "float32")
+            # Wave-1b fix-round-2: only when within the 32 KB combined
+            # register budget; otherwise the per-(sk_tile, h) loop reads
+            # M/D from HBM directly (see m_h/d_h load below).
+            if USE_MD_PRE:
+                for hh in T.serial(AH):
+                    for i in T.Parallel(BLOCK_SQ):
+                        sq_idx = sq_block_id * BLOCK_SQ + i
+                        if sq_idx < ASq:
+                            M_pre[hh, i] = M[b, hh, sq_idx]
+                            D_pre[hh, i] = D[b, hh, sq_idx]
+                        else:
+                            M_pre[hh, i] = T.cast(0, "float32")
+                            D_pre[hh, i] = T.cast(1, "float32")
 
             # Wave-2 perf #3: causal trim (mirrors stage 1).
             # Wave-3 self-audit: same clamp-to-1 as stage 1 (see comment there).
@@ -739,9 +755,22 @@ def make_dsa_splitk_stage2_kernel(
                     # Wave-2 perf #5: copy from the hoisted M_pre/D_pre
                     # fragments (loaded once outside the sk_tile loop) instead
                     # of re-reading M[b, h, sq] / D[b, h, sq] from HBM.
-                    for i in T.Parallel(BLOCK_SQ):
-                        m_h[i] = M_pre[h, i]
-                        d_h[i] = D_pre[h, i]
+                    # Wave-1b fix-round-2: when the prefetch was disabled
+                    # (USE_MD_PRE=False) read directly from HBM here; the
+                    # extra HBM traffic is preferable to register spill.
+                    if USE_MD_PRE:
+                        for i in T.Parallel(BLOCK_SQ):
+                            m_h[i] = M_pre[h, i]
+                            d_h[i] = D_pre[h, i]
+                    else:
+                        for i in T.Parallel(BLOCK_SQ):
+                            sq_idx = sq_block_id * BLOCK_SQ + i
+                            if sq_idx < ASq:
+                                m_h[i] = M[b, h, sq_idx]
+                                d_h[i] = D[b, h, sq_idx]
+                            else:
+                                m_h[i] = T.cast(0, "float32")
+                                d_h[i] = T.cast(1, "float32")
 
                     # Scale + causal mask + (optional) sparse mask + add to
                     # accumulated softmax_attn (averaged over heads at the
@@ -1031,9 +1060,37 @@ def dsa_splitk_indexer_loss_tilelang(
         topk_idx64 = topk_indices.to(dtype=torch.int64, copy=False)
         if not topk_idx64.is_contiguous():
             topk_idx64 = topk_idx64.contiguous()
+        # Wave-1b fix-round-2 (MED sec): bounds-check topk_idx64 before
+        # scatter_. PyTorch's CUDA scatter_ wraps negatives but does NOT
+        # check the upper bound in release builds, so an OOB index would
+        # silently corrupt adjacent memory. Validate up-front.
+        if topk_idx64.numel() > 0:
+            _max_idx = int(topk_idx64.max().item())
+            _min_idx = int(topk_idx64.min().item())
+            if _max_idx >= Sk or _min_idx < 0:
+                raise ValueError(
+                    "dsa_splitk_indexer_loss_tilelang: topk_indices out of "
+                    f"range [0, {Sk}); got [{_min_idx}, {_max_idx}]."
+                )
         index_mask = torch.full(
             (AB, ASq, Sk), float("-inf"), dtype=torch.float32, device=query.device,
         ).scatter_(-1, topk_idx64, 0.0)
+        # Wave-1b fix-round-2 (MED sec): NaN poisoning guard for fully-
+        # masked rows. If a row's topk_indices contained no in-range
+        # entries (e.g. all duplicates in a sparse setup, or an upstream
+        # bug), every IndexMask slot stays -inf and downstream softmax
+        # produces NaN that propagates into the loss. Detect and patch
+        # by clearing slot 0 to a safe sentinel for any all-masked row;
+        # the kernel's own causal mask still elides invalid (sq < sk)
+        # combinations downstream.
+        _row_has_valid = (index_mask == 0.0).any(dim=-1)
+        if not bool(_row_has_valid.all()):
+            _patch = torch.where(
+                _row_has_valid,
+                index_mask[..., 0],
+                torch.zeros((), dtype=torch.float32, device=query.device),
+            )
+            index_mask[..., 0] = _patch
     else:
         # When sparse_loss is False the constexpr-eliminated kernel branches
         # never read this tensor (and after the bounds-guard fix, even
