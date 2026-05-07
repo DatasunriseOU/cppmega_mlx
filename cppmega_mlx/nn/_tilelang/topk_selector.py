@@ -910,8 +910,17 @@ def _path_c_rewrite_merge_round(
         f"((other * {_TOPK_C_K}) + bp)",
     )
 
-    if body == lowering.body:
-        return lowering
+    # fix-round-4: a silent no-op here masked TileLang emission drift —
+    # we'd quietly degrade to the conservative lowering with no log signal.
+    # Make the no-match case fail loud so a future TileLang version that
+    # changes whitespace / variable names / barrier ordering forces a
+    # deliberate regex update instead of a silent perf regression.
+    assert body != lowering.body, (
+        "_path_c_rewrite_merge_round: MSL pattern not found — TileLang "
+        "merge-round emission shape has changed. Update the regex/string "
+        "patterns in this function (see docs/upstream/"
+        "_path_c_blockers_tracker.md, 'topk merge regex rewrite hardening')."
+    )
     return replace(lowering, body=body)
 
 
