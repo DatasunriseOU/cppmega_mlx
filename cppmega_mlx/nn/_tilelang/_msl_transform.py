@@ -84,8 +84,29 @@ def _preload_libz3_for_dev_tilelang() -> None:
         root = os.environ.get(env_var)
         if root:
             candidates.append(_Path(root) / "build" / "lib" / "libz3.dylib")
-    # Last-resort: a checkout layout used by recent benches.
-    candidates.append(_Path("/tmp/tl_apache_tvm_swap/build/lib/libz3.dylib"))
+    # Last-resort: a checkout layout used by recent benches. /tmp is
+    # world-writable on Unix, so loading a dylib from there is an arbitrary
+    # code execution risk if an attacker plants a malicious libz3.dylib.
+    # fix-round-5: gate behind opt-in env var; production never sets this.
+    # TOCTOU note (fix-round-5, finding 4): we check exists() then dlopen,
+    # leaving a small race window where a candidate path could be swapped
+    # between the stat and the load. Acceptable for the dev/bench-only
+    # paths that survive the gating above (env-rooted dirs the developer
+    # controls, or /opt/homebrew which is root-owned), and the /tmp
+    # candidate is now opt-in. Not fixing the race here — would require
+    # fd-based loading (dlopen has no by-fd variant on macOS).
+    if os.environ.get("CPPMEGA_ALLOW_UNSAFE_LIBZ3") == "1":
+        import warnings as _warnings
+
+        _warnings.warn(
+            "CPPMEGA_ALLOW_UNSAFE_LIBZ3=1 set; including world-writable "
+            "/tmp/tl_apache_tvm_swap/build/lib in libz3 preload candidates. "
+            "This is unsafe outside dev environments — an attacker who can "
+            "write to /tmp could plant a malicious libz3.dylib that gets "
+            "loaded into the process.",
+            stacklevel=2,
+        )
+        candidates.append(_Path("/tmp/tl_apache_tvm_swap/build/lib/libz3.dylib"))
     # Brew-installed z3 (works as a basename-resolution fallback).
     candidates.append(_Path("/opt/homebrew/lib/libz3.dylib"))
 

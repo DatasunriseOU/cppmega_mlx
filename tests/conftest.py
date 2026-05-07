@@ -21,6 +21,20 @@ import os
 import pytest
 
 
+# fix-round-5: the libz3 preload helper in
+# ``cppmega_mlx.nn._tilelang._msl_transform`` gates its world-writable
+# /tmp/tl_apache_tvm_swap dylib candidate behind ``CPPMEGA_ALLOW_UNSAFE_LIBZ3=1``
+# (security HIGH: /tmp is world-writable; an attacker who can write there
+# could plant a malicious libz3.dylib that gets dlopen'd into the process).
+# That preload runs at module-import time on Darwin, which means we must set
+# the opt-in here at conftest-import time -- BEFORE pytest collects any
+# test file that does ``from cppmega_mlx.nn._tilelang...``. Setting it via
+# the autouse ``monkeypatch.setenv`` fixture below would be too late, since
+# the import (and the preload) already fired during collection. Production
+# code, bench harnesses, and CI keep the secure default (gated, off).
+os.environ.setdefault("CPPMEGA_ALLOW_UNSAFE_LIBZ3", "1")
+
+
 # Environment variables that influence TileLang / TVM import resolution and
 # Metal/MPS dispatch. Any test that reads or writes these must be explicit.
 _TILELANG_TVM_ENV_VARS = (
@@ -73,3 +87,12 @@ def _isolate_tilelang_tvm_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for var in list(os.environ):
         if var.startswith(_VOLATILE_ENV_PREFIXES):
             monkeypatch.delenv(var, raising=False)
+
+    # fix-round-5: the libz3 preload helper now gates its world-writable
+    # /tmp/tl_apache_tvm_swap candidate behind ``CPPMEGA_ALLOW_UNSAFE_LIBZ3=1``
+    # (security HIGH: /tmp is world-writable; an attacker dropping a
+    # libz3.dylib there would otherwise be loaded into the test process).
+    # Tests run in a developer-controlled sandbox where /tmp is the
+    # canonical TileLang dev-build location, so opt in here. Production
+    # inherits the secure default (gated, off).
+    monkeypatch.setenv("CPPMEGA_ALLOW_UNSAFE_LIBZ3", "1")
