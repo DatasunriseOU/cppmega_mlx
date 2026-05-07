@@ -127,3 +127,59 @@ rm -rf "$TMP_DIR"
 
 See docs/porting_plan.md for the implemented / wave-next / blocked roadmap
 and docs/perf_baseline.md for the M4 Max vs GB10 comparison protocol.
+
+## TileLang Z3 roadmap integration (2026-05-07)
+
+Wired Z3-driven optimization passes (12 ideas total) from
+`DatasunriseOU/tilelang` branch `z3-final` into MLX-side TileLang kernels.
+All passes default OFF; opt-in via PassConfig. Conservative-by-default —
+every Z3 query runs under try/catch with fallback to the slow path.
+
+**Mac Metal performance (apples-to-apples, default-on):**
+
+| Kernel                          | Path B   | Path C   | Speedup |
+|---------------------------------|----------|----------|---------|
+| `mamba3` fwd+bwd                | 7.577 ms | 5.950 ms | -21.5%  |
+| `mamba3` bwd                    | 6.557 ms | 4.945 ms | -24.6%  |
+| `topk_selector` B4·T4096·K256   | 9.009 ms | 5.087 ms | -43.5%  |
+| `topk_selector` 6/7 shapes      | —        | —        | -34%..-44% |
+| `sparse_mla` fp16 B4 S1024      | 0.610 ms | 0.616 ms | tie (gate passed) |
+
+**Per-kernel wiring (this branch, `mlx-z3-wiring` merged into `main`):**
+
+- `cppmega_mlx/nn/_tilelang/fp8_vecmat_path_c.py` — opt-in
+  `tl.drop_provable_bound_checks` (#4) + filtered `tl.simd_lift_reductions`
+  (#9, runtime probe). `K > 0` precondition + narrow exception in
+  `_filter_supported_pass_configs`. `threading.Lock` on the PassConfig cache.
+- `cppmega_mlx/nn/_tilelang/sparse_mla_path_c.py` — hoist-aware
+  `_canonicalize_*_lane_indexing` + `_strip_z3_hoisted_address_decls` so
+  z3-final's algebraic rewrites compile cleanly to MSL.
+- `cppmega_mlx/nn/_tilelang/topk_selector.py` — dual-gated Path B / Path C
+  with auto-routing receipts (`_PATH_C_AUTO_PROFITABLE_RECEIPTS`); fixed
+  insertion-sort early-break correctness regression on K=16/32; hard
+  assertion in `_path_c_rewrite_merge_round` so MSL emission drift fails
+  loud.
+- `cppmega_mlx/nn/_tilelang/_msl_transform.py` — libz3 dev preload on
+  Darwin gated by `CPPMEGA_ALLOW_UNSAFE_LIBZ3=1` (security: `/tmp` is
+  world-writable; opt-in only). `OSError` vs `FileNotFoundError`
+  distinguished; `_failed_attempts` retry cap = 3.
+- `cppmega_mlx/nn/_tilelang/dsa_splitk_indexer_loss.py` — 32 KB shared-mem
+  budget gate on `M_pre/D_pre` fragments (avoids CUDA register spill);
+  `topk_indices` bounds-check before `scatter_`; NaN guard for
+  fully-masked rows.
+
+**Safety env vars (forwarded from TileLang fork):**
+
+- `TILELANG_DISABLE_Z3=1` — global Z3 kill-switch (CUDA / gb10 workaround).
+- `TILELANG_DISABLE_Z3_<NAME>=1` — per-pass kill (VECTORIZE,
+  PREDICATE_FUSION, DROP_BOUND_CHECKS, TMA_LEGALITY, BARRIER_ELISION,
+  INT24, DOT4_LEGALITY, SIMDGROUP).
+- `CPPMEGA_ALLOW_UNSAFE_LIBZ3=1` — opt-in libz3 preload from
+  `/tmp/tl_apache_tvm_swap/build/lib`.
+
+Quality: 7 fix-rounds + 5 review-waves with grok+meta cross-LLM
+corroboration. Bench receipts at `bench/tilelang_ports/*.json` (gate
+threshold `paired_ratio ≤ 1.0`; auto-routing falls back to Path B for
+non-profitable shapes). See the upstream
+[TileLang README](https://github.com/DatasunriseOU/tilelang/blob/z3-final/README.md)
+for the full pass index and design notes.
