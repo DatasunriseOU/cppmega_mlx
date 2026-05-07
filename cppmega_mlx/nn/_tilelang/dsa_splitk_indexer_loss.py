@@ -407,7 +407,16 @@ def make_dsa_splitk_stage1_kernel(
             # only needs sk_tile==0).
             _max_sq_in_block = sq_block_id * BLOCK_SQ + (BLOCK_SQ - 1)
             _max_useful_sk = T.min(_max_sq_in_block, ASq - 1)
-            _active_sk_tiles = T.min(SK_TILES, _max_useful_sk // BLOCK_SK + 1)
+            # Wave-3 self-audit: clamp to >=1. When ASq <= sq_block_id*BLOCK_SQ
+            # (last Q-block in a non-divisible shape, or pathological ASq=0),
+            # _max_useful_sk goes negative and floor-div-then-+1 yields 0 which
+            # would skip the loop entirely and leave out-buffers uninitialised
+            # (the tile is then entirely OOB so the per-position guards already
+            # produce no writes; the clamp just guarantees the loop body runs
+            # once so accumulator-init paths execute deterministically).
+            _active_sk_tiles = T.max(
+                T.min(SK_TILES, _max_useful_sk // BLOCK_SK + 1), 1
+            )
             for sk_tile in T.Pipelined(_active_sk_tiles, num_stages=num_stages):
                 # Initialise the score accumulator for this tile.
                 for i, j in T.Parallel(BLOCK_SQ, BLOCK_SK):
@@ -583,6 +592,18 @@ def make_dsa_splitk_stage2_kernel(
     SCALE = float(softmax_scale)
     SPARSE = bool(sparse_loss)
     INV_AH = 1.0 / float(AH)
+    # Wave-1b fix-round-2 (HIGH perf): the M_pre/D_pre fragments are
+    # `(AH, BLOCK_SQ)` fp32 == AH*BLOCK_SQ*4 bytes each, total 8*AH*BLOCK_SQ
+    # bytes per thread block. At AH=128, BLOCK_SQ=128 (CUDA worst case)
+    # that's 128 KB combined — far above per-block register budgets and
+    # causes spill-to-local-mem (-30/-40% on 2k seqlen). Gate the prefetch
+    # behind a 32 KB combined budget; when over, the per-(sk_tile, h)
+    # path re-reads M[b, h, sq] / D[b, h, sq] from HBM (the original
+    # behaviour pre-Wave-2 perf #5). The threshold matches Metal's
+    # threadgroup register budget and CUDA's per-block fragment limit.
+    _MD_PRE_BUDGET_BYTES = 32 * 1024
+    _MD_PRE_BYTES = 8 * AH * BLOCK_SQ
+    USE_MD_PRE = _MD_PRE_BYTES <= _MD_PRE_BUDGET_BYTES
 
     @T.prim_func
     def dsa_stage2(
@@ -662,9 +683,12 @@ def make_dsa_splitk_stage2_kernel(
                         D_pre[hh, i] = T.cast(1, "float32")
 
             # Wave-2 perf #3: causal trim (mirrors stage 1).
+            # Wave-3 self-audit: same clamp-to-1 as stage 1 (see comment there).
             _max_sq_in_block = sq_block_id * BLOCK_SQ + (BLOCK_SQ - 1)
             _max_useful_sk = T.min(_max_sq_in_block, ASq - 1)
-            _active_sk_tiles = T.min(SK_TILES, _max_useful_sk // BLOCK_SK + 1)
+            _active_sk_tiles = T.max(
+                T.min(SK_TILES, _max_useful_sk // BLOCK_SK + 1), 1
+            )
             # Wave-3 (grok perf #1): partial Q hoist landed below (per-(sk_tile,
             # h) full slab into Q_full, d_tile reads shared). Full hoist out of
             # the sk_tile loop is still TODO -- it would require restructuring
@@ -983,9 +1007,33 @@ def dsa_splitk_indexer_loss_tilelang(
     # Build the sparse mask on the host (matches the wrapper-side branch in
     # the Triton reference: ``index_mask = scatter(-inf, topk_indices, 0)``).
     if sparse_loss:
+        # Wave-3 self-audit: explicit topk_indices validation. PyTorch scatter
+        # requires int64 indices; int32 input would raise a RuntimeError deep
+        # in the C++ stack ("expected scalar type Long"). We promote here so
+        # callers can pass either int32 (Triton convention) or int64 (PyTorch
+        # convention). Also enforce shape, contiguity, and device parity to
+        # surface mismatches at the wrapper boundary instead of mid-kernel.
+        if topk_indices.device != query.device:
+            raise ValueError(
+                "dsa_splitk_indexer_loss_tilelang: topk_indices.device "
+                f"({topk_indices.device}) != query.device ({query.device})"
+            )
+        if topk_indices.dim() != 3 or topk_indices.shape[:2] != (AB, ASq):
+            raise ValueError(
+                "dsa_splitk_indexer_loss_tilelang: topk_indices must have shape "
+                f"(AB={AB}, ASq={ASq}, TOPK); got {tuple(topk_indices.shape)}"
+            )
+        if topk_indices.dtype not in (torch.int32, torch.int64):
+            raise TypeError(
+                "dsa_splitk_indexer_loss_tilelang: topk_indices.dtype must be "
+                f"int32 or int64; got {topk_indices.dtype}"
+            )
+        topk_idx64 = topk_indices.to(dtype=torch.int64, copy=False)
+        if not topk_idx64.is_contiguous():
+            topk_idx64 = topk_idx64.contiguous()
         index_mask = torch.full(
             (AB, ASq, Sk), float("-inf"), dtype=torch.float32, device=query.device,
-        ).scatter_(-1, topk_indices, 0.0)
+        ).scatter_(-1, topk_idx64, 0.0)
     else:
         # When sparse_loss is False the constexpr-eliminated kernel branches
         # never read this tensor (and after the bounds-guard fix, even
