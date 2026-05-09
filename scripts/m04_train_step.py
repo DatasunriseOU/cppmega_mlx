@@ -9,6 +9,7 @@ grad-checkpoint target-parquet gate is captured.
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 import json
 import math
 from pathlib import Path
@@ -27,15 +28,19 @@ if str(ROOT) not in sys.path:
 import mlx.core as mx  # noqa: E402
 import mlx.nn as nn  # noqa: E402
 
+from cppmega_mlx.data.parquet_dataset import TokenParquetDataset  # noqa: E402
 from cppmega_mlx.runtime.memory import (  # noqa: E402
     DEFAULT_METAL_RATIO,
     DEFAULT_WIRED_RATIO,
+    maybe_clear_cache_after_step,
     memory_limit_api_status,
 )
 from cppmega_mlx.recipes.model_factory import (  # noqa: E402
     local_gb10_quarter,
     local_gb10_quarter_profile,
 )
+from cppmega_mlx.training.compiled import CompiledPretrainingStep  # noqa: E402
+from cppmega_mlx.training.loss import next_token_cut_cross_entropy  # noqa: E402
 from cppmega_mlx.training.optimizers import (  # noqa: E402
     ADAMW_BASE_CLASS,
     ADAMW_FP32_MOMENTS_CLASS,
@@ -45,10 +50,18 @@ from cppmega_mlx.training.optimizers import (  # noqa: E402
     make_adamw,
 )
 from scripts.train_hybrid_tiny import (  # noqa: E402
+    DTYPES,
     TrainHybridTinyConfig,
+    compile_payload,
+    dataset_payload,
     device_info,
     dry_run_payload,
+    memory_limit_payload as train_memory_limit_payload,
+    parameter_count,
+    route_backend_payload,
     train_hybrid_tiny,
+    validate_dataset_for_training,
+    validate_side_channel_contract,
     validation_dataset_path,
     validate_config,
 )
@@ -93,6 +106,8 @@ UNSUPPORTED_REQUIRED_MODEL_PROFILE_ROUTE_REASON = (
 )
 REQUIRED_OPTIMIZER_NAME = "AdamW"
 REQUIRED_ADAMW_MASTER_MOMENT_DTYPE = "float32"
+DEFAULT_SMOKE_LR = 1e-3
+DEFAULT_LOCAL_GB10_QUARTER_LR = 1e-4
 OBSERVED_OPTIMIZER_IDENTITY = {
     "name": REQUIRED_OPTIMIZER_NAME,
     "class": ADAMW_FP32_MOMENTS_CLASS,
@@ -154,7 +169,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument("--dtype", choices=("float32", "float16", "bfloat16"), default="bfloat16")
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=None,
+        help=(
+            "AdamW learning rate. Defaults to 1e-3 for tiny smoke routes and "
+            "1e-4 for local_gb10_quarter unless set explicitly."
+        ),
+    )
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=1004)
     parser.add_argument("--vocab-size", type=int, default=131_072)
@@ -256,7 +279,7 @@ def config_from_args(args: argparse.Namespace, *, data_path: Path) -> TrainHybri
         dtype=args.dtype,
         compile=args.compile,
         seed=args.seed,
-        learning_rate=args.lr,
+        learning_rate=learning_rate_from_args(args),
         weight_decay=args.weight_decay,
         vocab_size=args.vocab_size,
         hidden_size=args.hidden_size,
@@ -276,6 +299,14 @@ def config_from_args(args: argparse.Namespace, *, data_path: Path) -> TrainHybri
         apply_memory_limit_plan=args.apply_memory_limit_plan,
         clear_cache_every_steps=args.clear_cache_every_steps,
     )
+
+
+def learning_rate_from_args(args: argparse.Namespace) -> float:
+    if args.lr is not None:
+        return float(args.lr)
+    if args.model_profile == REQUIRED_MODEL_PROFILE:
+        return DEFAULT_LOCAL_GB10_QUARTER_LR
+    return DEFAULT_SMOKE_LR
 
 
 def write_synthetic_npz(path: Path, *, steps: int, batch_size: int, seq_len: int, vocab_size: int) -> None:
@@ -420,21 +451,319 @@ def run_local_gb10_quarter_training(
     config: TrainHybridTinyConfig,
     data_path: Path,
 ) -> tuple[dict[str, Any], int]:
-    """Training-route seam for the full local_gb10_quarter M0.4 target.
+    """Run the real full-profile M0.4 parquet training route."""
 
-    The default implementation remains allocation-free and fail-closed. Tests
-    and future route work can monkeypatch this symbol without touching the
-    HybridTinyLM smoke path or allocating the full profile in normal pytest.
-    """
+    if config.data_format != "parquet":
+        return (
+            blocked_receipt(
+                args,
+                "local_gb10_quarter training requires --data-format parquet; "
+                f"got {config.data_format!r}",
+                "unsupported_data_format",
+                probe_allocation=False,
+            ),
+            2,
+        )
+    profile = local_gb10_quarter_profile()
+    if config.seq_len > profile.max_seq_length:
+        return (
+            blocked_receipt(
+                args,
+                "local_gb10_quarter seq_len must not exceed "
+                f"{profile.max_seq_length}; got {config.seq_len}",
+                "invalid_cli",
+                probe_allocation=False,
+            ),
+            2,
+        )
+    if config.dtype not in DTYPES:
+        return (
+            blocked_receipt(
+                args,
+                f"unsupported dtype={config.dtype!r}",
+                "invalid_cli",
+                probe_allocation=False,
+            ),
+            2,
+        )
 
-    return (
-        blocked_receipt(
+    model: Any | None = None
+    optimizer: Any | None = None
+    try:
+        memory_limit = train_memory_limit_payload(config, apply=True)
+        mx.random.seed(config.seed)
+        dataset = TokenParquetDataset(
+            data_path,
+            seq_len=config.seq_len,
+            batch_size=config.batch_size,
+            token_key=config.token_key,
+            shuffle=config.shuffle,
+            seed=config.seed,
+            loop=True,
+        )
+        validate_side_channel_contract(config, dataset)
+        validate_dataset_for_training(dataset, profile.vocab_size)
+
+        device = device_info()
+        compile_plan = compile_payload(config, device)
+        peak_memory_reset = bool(reset_peak_memory())
+        memory_before = metal_memory_payload()
+
+        model = local_gb10_quarter(
+            dtype=DTYPES[config.dtype],
+            grad_checkpoint=config.grad_checkpoint,
+        )
+        route_backend = route_backend_payload(model)
+        mx.eval(model.parameters())
+        mx.synchronize()
+        memory_after_parameters = metal_memory_payload()
+        local_gb10_preflight = local_gb10_preflight_from_allocated_model(
+            model,
+            memory_before=memory_before,
+            memory_after=memory_after_parameters,
+        )
+
+        optimizer = make_adamw(
+            learning_rate=config.learning_rate,
+            weight_decay=config.weight_decay,
+        )
+        optimizer.init(model.trainable_parameters())
+        mx.eval(model.parameters(), optimizer.state)
+
+        def loss_fn(model_arg: nn.Module, batch: Any) -> tuple[mx.array, mx.array]:
+            return next_token_cut_cross_entropy(
+                model_arg,
+                batch,
+                chunk_rows=config.cce_chunk_rows,
+            )
+
+        stepper = CompiledPretrainingStep(
+            model,
+            optimizer,
+            state={"step": 0, "trained_tokens": 0},
+            loss_fn=loss_fn,
+            compile=bool(compile_plan["enabled"]),
+        )
+        clear_cache_events: list[dict[str, Any]] = []
+        step_metrics: list[dict[str, Any]] = []
+        batches = dataset.iter_batches(loop=True)
+        for _ in range(config.steps):
+            metrics = stepper(next(batches))
+            step_metrics.append(asdict(metrics))
+            mx.synchronize()
+            clear_cache_event = maybe_clear_cache_after_step(
+                metrics.step,
+                config.clear_cache_every_steps,
+                mx_module=mx,
+                synchronize=False,
+            )
+            if clear_cache_event is not None:
+                clear_cache_events.append(clear_cache_event.to_dict())
+
+        if not step_metrics:
+            raise RuntimeError("local_gb10_quarter route completed zero steps")
+        losses = [float(item["loss"]) for item in step_metrics]
+        step_times = [float(item["seconds"]) for item in step_metrics]
+        tps_values = [float(item["tokens_per_second"]) for item in step_metrics]
+        final = step_metrics[-1]
+        for index, item in enumerate(step_metrics, start=1):
+            if not math.isfinite(float(item["loss"])):
+                raise ValueError(f"step_metrics[{index}].loss must be finite")
+            if int(item["ntokens"]) <= 0:
+                raise ValueError(f"step_metrics[{index}].ntokens must be positive")
+            if not math.isfinite(float(item["tokens_per_second"])):
+                raise ValueError(
+                    f"step_metrics[{index}].tokens_per_second must be finite"
+                )
+
+        mx.synchronize()
+        memory_after = metal_memory_payload()
+        optimizer_evidence = optimizer_identity(
+            config,
+            optimizer_updated=True,
+            master_moment_evidence=adamw_moment_evidence_from_optimizer(
+                optimizer,
+                model,
+            ),
+        )
+        train_payload = {
+            "status": "ok",
+            "config": asdict(config),
+            "model_name": REQUIRED_MODEL_PROFILE,
+            "model_profile": REQUIRED_MODEL_PROFILE,
+            "model_source": REQUIRED_MODEL_SOURCE,
+            "model_config": local_gb10_quarter_model_config_payload(model),
+            "route_symbols": route_backend["route_symbols"],
+            "route_roles": route_backend["route_roles"],
+            "backend_plan": route_backend,
+            "parameter_count": parameter_count(model),
+            "tokens_per_step": final["ntokens"],
+            "trained_tokens": final["trained_tokens"],
+            "final_loss": final["loss"],
+            "mean_loss": statistics.fmean(losses),
+            "mean_step_time_s": statistics.fmean(step_times),
+            "median_step_time_s": statistics.median(step_times),
+            "tokens_per_second": statistics.fmean(tps_values),
+            "step_metrics": step_metrics,
+            "compile": config.compile,
+            "compile_enabled": compile_plan["enabled"],
+            "compile_plan": compile_plan,
+            "dtype": config.dtype,
+            "dataset": dataset_payload(dataset, config),
+            "device": device,
+            "memory_limit": memory_limit,
+            "memory": {
+                "before": memory_before,
+                "after": memory_after,
+                "allocation_after_parameters": memory_after_parameters,
+                "peak_memory_bytes": memory_after.get("peak_memory_bytes"),
+                "peak_memory_reset": peak_memory_reset,
+                "clear_cache_every_steps": config.clear_cache_every_steps,
+                "clear_cache_events": clear_cache_events,
+                "clear_cache_event_count": len(clear_cache_events),
+            },
+            "optimizer_identity": optimizer_evidence,
+            "local_gb10_quarter_preflight": local_gb10_preflight,
+        }
+        receipt = receipt_from_train_payload(
             args,
-            UNSUPPORTED_REQUIRED_MODEL_PROFILE_ROUTE_REASON,
-            "unsupported_model_profile_route",
-        ),
-        2,
+            config=config,
+            train_payload=train_payload,
+            memory_before=memory_before,
+            memory_after=memory_after,
+        )
+        if args.require_loss_decrease and not receipt["training"]["loss_decreased"]:
+            return enforce_loss_decrease_requirement(args, receipt)
+        return receipt, 0
+    except Exception as exc:
+        return (
+            blocked_receipt(
+                args,
+                str(exc),
+                type(exc).__name__,
+                probe_allocation=False,
+            ),
+            2,
+        )
+    finally:
+        if optimizer is not None:
+            del optimizer
+        if model is not None:
+            del model
+        try:
+            mx.synchronize()
+        except Exception:
+            pass
+
+
+def local_gb10_preflight_from_allocated_model(
+    model: Any,
+    *,
+    memory_before: dict[str, Any],
+    memory_after: dict[str, Any],
+) -> dict[str, Any]:
+    profile_geometry = _local_gb10_quarter_profile_geometry()
+    allocation_probe = {
+        "status": "ok",
+        "allocation_ready": True,
+        "source": REQUIRED_MODEL_SOURCE,
+        "allocation_mode": FULL_PROFILE_ALLOCATION_MODE,
+        "required_geometry": REQUIRED_MODEL_GEOMETRY,
+        "profile_geometry": profile_geometry,
+        "geometry_matches_required": profile_geometry == REQUIRED_MODEL_GEOMETRY,
+        "profile_name": REQUIRED_MODEL_PROFILE,
+        "model_class": type(model).__name__,
+        "eval_scope": ALLOCATION_PROBE_EVAL_SCOPE,
+        "forward_executed": False,
+        "training_executed": False,
+        "memory_before": memory_before,
+        "memory_after": memory_after,
+    }
+    return local_gb10_quarter_preflight_payload(
+        allocation_attempted=True,
+        allocation_ready=True,
+        allocation_mode=FULL_PROFILE_ALLOCATION_MODE,
+        allocation_probe=allocation_probe,
     )
+
+
+def local_gb10_quarter_model_config_payload(model: Any) -> dict[str, Any]:
+    profile = local_gb10_quarter_profile()
+    geometry = _local_gb10_quarter_profile_geometry()
+    model_config = getattr(model, "config", None)
+    to_dict = getattr(model_config, "to_dict", None)
+    config_payload = to_dict() if callable(to_dict) else None
+    return {
+        "profile": REQUIRED_MODEL_PROFILE,
+        "source": REQUIRED_MODEL_SOURCE,
+        "max_seq_length": profile.max_seq_length,
+        "dsa_a_layer_ranks": list(profile.dsa_a_layer_ranks),
+        **geometry,
+        "mtp_profile": geometry["mtp"],
+        "config": config_payload,
+    }
+
+
+def adamw_moment_evidence_from_optimizer(
+    optimizer: Any,
+    model: Any,
+) -> dict[str, Any]:
+    try:
+        moment_dtypes = collect_adamw_moment_dtypes(optimizer.state)
+        sampled_moment_dtypes = dict(sorted(moment_dtypes.items())[:64])
+        ok = bool(
+            moment_dtypes
+            and all(
+                dtype == REQUIRED_ADAMW_MASTER_MOMENT_DTYPE
+                for dtype in moment_dtypes.values()
+            )
+        )
+        state = optimizer.state if isinstance(optimizer.state, dict) else {}
+        return {
+            "required_dtype": REQUIRED_ADAMW_MASTER_MOMENT_DTYPE,
+            "observed_parameter_dtype": first_parameter_dtype(model),
+            "observed_moment_dtypes": sampled_moment_dtypes,
+            "observed_moment_dtype_count": len(moment_dtypes),
+            "observed_moment_dtypes_sampled": len(sampled_moment_dtypes),
+            "observed_moment_dtypes_truncated": (
+                len(sampled_moment_dtypes) < len(moment_dtypes)
+            ),
+            "optimizer_class": OBSERVED_OPTIMIZER_IDENTITY["class"],
+            "optimizer_base_class": OBSERVED_OPTIMIZER_IDENTITY["base_class"],
+            "state_keys": sorted(str(key) for key in state),
+            "ok": ok,
+        }
+    except Exception as exc:
+        return {
+            "required_dtype": REQUIRED_ADAMW_MASTER_MOMENT_DTYPE,
+            "observed_parameter_dtype": first_parameter_dtype(model),
+            "observed_moment_dtypes": {},
+            "optimizer_class": OBSERVED_OPTIMIZER_IDENTITY["class"],
+            "optimizer_base_class": OBSERVED_OPTIMIZER_IDENTITY["base_class"],
+            "state_keys": [],
+            "ok": False,
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+        }
+
+
+def first_parameter_dtype(model: Any) -> str | None:
+    for array in iter_mx_arrays(getattr(model, "parameters", lambda: {})()):
+        return dtype_name(array)
+    return None
+
+
+def iter_mx_arrays(tree: Any):
+    if isinstance(tree, mx.array):
+        yield tree
+        return
+    if isinstance(tree, dict):
+        for value in tree.values():
+            yield from iter_mx_arrays(value)
+        return
+    if isinstance(tree, list | tuple):
+        for value in tree:
+            yield from iter_mx_arrays(value)
 
 
 def enforce_loss_decrease_requirement(
@@ -485,10 +814,21 @@ def receipt_from_train_payload(
     applied_memory_limit_api_path = applied_memory_limit_api_path_from_payload(
         memory_limit
     )
-    optimizer = optimizer_identity(config, optimizer_updated=optimizer_updated)
+    optimizer_payload = train_payload.get("optimizer_identity")
+    optimizer = (
+        optimizer_payload
+        if isinstance(optimizer_payload, dict)
+        else optimizer_identity(config, optimizer_updated=optimizer_updated)
+    )
     grad_checkpoint = grad_checkpoint_payload(config)
-    local_gb10_preflight = local_gb10_quarter_preflight_from_args(args)
+    preflight_payload = train_payload.get("local_gb10_quarter_preflight")
+    local_gb10_preflight = (
+        preflight_payload
+        if isinstance(preflight_payload, dict)
+        else local_gb10_quarter_preflight_from_args(args)
+    )
     observed_model_profile = train_payload.get("model_profile")
+    observed_model_name = train_payload.get("model_name") or CURRENT_MODEL_NAME
     model_config_for_gate = dict(model_config)
     if isinstance(observed_model_profile, str):
         model_config_for_gate.setdefault("profile", observed_model_profile)
@@ -502,13 +842,16 @@ def receipt_from_train_payload(
         loss_decreased=loss_decreased,
         all_finite=all_finite,
         optimizer_updated=optimizer_updated,
-        model_name=CURRENT_MODEL_NAME,
+        model_name=observed_model_name,
         model_source=train_payload.get("model_source"),
         model_config=model_config_for_gate,
         optimizer=optimizer,
         grad_checkpoint=grad_checkpoint,
         device=train_payload.get("device", device_info()),
         local_gb10_quarter_preflight=local_gb10_preflight,
+    )
+    full_acceptance_claim = bool(
+        acceptance_gate.get("full_local_gb10_quarter_gate_completed")
     )
 
     receipt = {
@@ -520,10 +863,10 @@ def receipt_from_train_payload(
             "title": "M0.4: one bf16 training step + 100-step loss decrease on local parquet samples",
         },
         "local_only": True,
-        "gb10_training_correctness_claim": False,
+        "gb10_training_correctness_claim": full_acceptance_claim,
         "m4_vs_gb10_throughput_parity_claim": False,
-        "full_m0_4_acceptance_claim": False,
-        "acceptance_blockers": list(OPEN_M0_BLOCKERS),
+        "full_m0_4_acceptance_claim": full_acceptance_claim,
+        "acceptance_blockers": [] if full_acceptance_claim else list(OPEN_M0_BLOCKERS),
         "local_gb10_quarter_preflight": local_gb10_preflight,
         "acceptance_gate": acceptance_gate,
         "workload": {
@@ -537,6 +880,7 @@ def receipt_from_train_payload(
             "seq_len": config.seq_len,
             "tokens_per_step": train_payload.get("tokens_per_step"),
             "compile_requested": config.compile,
+            "learning_rate": config.learning_rate,
             "model_profile": config.model_profile,
             "grad_checkpoint": config.grad_checkpoint,
             "mode": mode,
@@ -597,7 +941,7 @@ def receipt_from_train_payload(
         "dataset": dataset,
         "model": {
             "source": train_payload.get("model_source"),
-            "name": CURRENT_MODEL_NAME,
+            "name": observed_model_name,
             "required_profile": REQUIRED_MODEL_PROFILE,
             "profile": observed_model_profile,
             "profile_matches_required": observed_model_profile == REQUIRED_MODEL_PROFILE,
@@ -1070,6 +1414,7 @@ def local_gb10_quarter_metadata_dry_run_receipt(
             "seq_len": config.seq_len,
             "tokens_per_step": config.batch_size * max(config.seq_len - 1, 0),
             "compile_requested": config.compile,
+            "learning_rate": config.learning_rate,
             "model_profile": config.model_profile,
             "grad_checkpoint": config.grad_checkpoint,
             "mode": "metadata_only_no_forward_no_training",
@@ -1487,6 +1832,7 @@ def blocked_receipt(
             "batch_size": args.batch_size,
             "seq_len": args.seq_len,
             "compile_requested": bool(args.compile),
+            "learning_rate": learning_rate_from_args(args),
             "model_profile": args.model_profile,
             "grad_checkpoint": bool(args.grad_checkpoint),
             "require_loss_decrease": bool(args.require_loss_decrease),
@@ -1554,7 +1900,7 @@ def baseline_row(
         "batch_size": config.batch_size,
         "seq_len": config.seq_len,
         "route": str(train_payload.get("route_symbols") or "unknown"),
-        "model": "HybridTinyLM",
+        "model": str(train_payload.get("model_name") or CURRENT_MODEL_NAME),
         "mode": mode,
         "tokens_per_second": float(train_payload.get("tokens_per_second") or 0.0),
         "local_only": True,

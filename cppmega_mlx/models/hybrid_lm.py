@@ -436,6 +436,31 @@ class HybridTinyLM(nn.Module):
         document_ids: mx.array | None = None,
         kv_cache: ContiguousKVCache | None = None,
     ) -> mx.array:
+        return self.lm_head(
+            self.decoder_hidden_states(
+                input_ids,
+                structure_ids=structure_ids,
+                dep_levels=dep_levels,
+                ast_depth_ids=ast_depth_ids,
+                sibling_index_ids=sibling_index_ids,
+                node_type_ids=node_type_ids,
+                document_ids=document_ids,
+                kv_cache=kv_cache,
+            )
+        )
+
+    def decoder_hidden_states(
+        self,
+        input_ids: mx.array,
+        *,
+        structure_ids: mx.array | None = None,
+        dep_levels: mx.array | None = None,
+        ast_depth_ids: mx.array | None = None,
+        sibling_index_ids: mx.array | None = None,
+        node_type_ids: mx.array | None = None,
+        document_ids: mx.array | None = None,
+        kv_cache: ContiguousKVCache | None = None,
+    ) -> mx.array:
         if input_ids.ndim != 2:
             raise ValueError(f"input_ids must be shaped (B, S), got {input_ids.shape}")
 
@@ -524,7 +549,7 @@ class HybridTinyLM(nn.Module):
                     attention_layer_idx += 1
                 else:
                     hidden_states = layer(hidden_states, mask)
-        return self.lm_head(self.norm(hidden_states))
+        return self.norm(hidden_states)
 
 
 def _validate_side_channel_shape(

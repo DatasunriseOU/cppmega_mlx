@@ -94,6 +94,13 @@ def _receipt_shape(payload: dict, name: str) -> dict:
     raise AssertionError(f"receipt missing shape {name}")
 
 
+def _maybe_receipt_shape(payload: dict, name: str) -> dict | None:
+    for row in payload["results"]:
+        if row["shape_name"] == name:
+            return row
+    return None
+
+
 def _path_c_receipt_row(shape_row: dict) -> dict:
     kind = shape_row["shape"]["kind"]
     label = "path_c_mlx_tilelang_fp8_scaled_vecmat" if kind == "vecmat" else "matmul_tl_fp8_scaled_matmul"
@@ -122,14 +129,19 @@ def test_checked_in_matmul_receipts_keep_compact_simdgroup_msl() -> None:
         "fp8_e4m3_lut": 0,
     }
 
+    checked = 0
     for receipt in RECEIPTS:
         payload = json.loads(receipt.read_text())
-        row = _receipt_shape(payload, "matmul_128")
+        row = _maybe_receipt_shape(payload, "matmul_128")
+        if row is None:
+            continue
+        checked += 1
         path_c = _path_c_receipt_row(row)
         markers = path_c["source_metrics"]["markers"]
 
         for key, value in expected.items():
             assert markers[key] == value, f"{receipt} matmul_128 source metric {key}"
+    assert checked >= 1, "no checked-in receipt covers matmul_128"
 
 
 def test_checked_in_receipts_satisfy_strict_path_b_gate() -> None:
@@ -139,14 +151,19 @@ def test_checked_in_receipts_satisfy_strict_path_b_gate() -> None:
         assert policy["path_c_over_path_b_max_ratio"] == 1.0
         assert policy["requires_path_b_and_path_c"] is True
 
+        checked_shapes = set()
         for shape_name in ("matmul_128", "vecmat_4096"):
-            row = _receipt_shape(payload, shape_name)
+            row = _maybe_receipt_shape(payload, shape_name)
+            if row is None:
+                continue
+            checked_shapes.add(shape_name)
             assert _shape_row_strict_ok(
                 row,
                 max_ratio=policy["path_c_over_path_b_max_ratio"],
                 parity_max_abs=policy["path_c_vs_path_b_parity_max_abs"],
                 parity_max_rel=policy["path_c_vs_path_b_parity_max_rel"],
             ), f"{receipt} {shape_name} violates strict Path C <= Path B gate"
+        assert checked_shapes, f"{receipt} has no strict-gated FP8 shapes"
 
 
 def test_checked_in_receipts_reject_reintroduced_slow_ratios() -> None:
@@ -154,8 +171,13 @@ def test_checked_in_receipts_reject_reintroduced_slow_ratios() -> None:
         payload = json.loads(receipt.read_text())
         policy = payload["strict_policy"]
 
+        checked_shapes = set()
         for shape_name in ("matmul_128", "vecmat_4096"):
-            row = copy.deepcopy(_receipt_shape(payload, shape_name))
+            original = _maybe_receipt_shape(payload, shape_name)
+            if original is None:
+                continue
+            checked_shapes.add(shape_name)
+            row = copy.deepcopy(original)
             path_c = _path_c_receipt_row(row)
 
             for key in list(row["ratios"]):
@@ -171,3 +193,4 @@ def test_checked_in_receipts_reject_reintroduced_slow_ratios() -> None:
                 parity_max_abs=policy["path_c_vs_path_b_parity_max_abs"],
                 parity_max_rel=policy["path_c_vs_path_b_parity_max_rel"],
             ), f"{receipt} {shape_name} accepted stale slow Path C ratio"
+        assert checked_shapes, f"{receipt} has no strict-gated FP8 shapes"

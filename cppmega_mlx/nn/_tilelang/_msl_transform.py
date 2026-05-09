@@ -897,13 +897,53 @@ def _canonicalize_tilelang_builtin_aliases(body: str) -> str:
     return body
 
 
+def _canonicalize_metal_surface(body: str) -> str:
+    """Normalize small TileLang-MSL surface differences for MLX inline MSL."""
+
+    def rewrite(code: str) -> str:
+        code = re.sub(
+            r"\bthreadgroup_barrier\s*\(\s*mem_flags::mem_threadgroup\s*\)",
+            "metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup)",
+            code,
+        )
+        code = re.sub(r"\bmemory_order_relaxed\b", "metal::memory_order_relaxed", code)
+        for name in (
+            "atomic_fetch_add_explicit",
+            "atomic_fetch_min_explicit",
+            "atomic_fetch_max_explicit",
+        ):
+            code = re.sub(rf"(?<![:\w]){name}\b", f"metal::{name}", code)
+        code = re.sub(
+            r"\bsimdgroup_float(\d+)x(\d+)\b",
+            r"simdgroup_matrix<float, \1, \2>",
+            code,
+        )
+        code = re.sub(r"(?<![:\w])bfloat\b", "metal::bfloat", code)
+        code = re.sub(r"(?<![:\w])half4\b", "metal::half4", code)
+        code = re.sub(
+            r"\(\s*float\s*\*\s*\)\s*smem\b",
+            "static_cast<threadgroup float*>(smem)",
+            code,
+        )
+        code = re.sub(
+            r"\(\s*float\s*\*\s*\)\s*C\b",
+            "static_cast<device float*>(C)",
+            code,
+        )
+        return code
+
+    return _rewrite_msl_code_segments(body, rewrite)
+
+
 def _inline_tilelang_kernel_body(inner: str) -> str:
     body = (
         "    uint3 blockIdx = threadgroup_position_in_grid;\n"
         "    uint3 threadIdx = thread_position_in_threadgroup;\n"
         + inner
     )
-    return _canonicalize_tilelang_builtin_aliases(body)
+    body = _canonicalize_tilelang_builtin_aliases(body)
+    return _canonicalize_metal_surface(body)
+
 
 
 def metal_grid_for_lowering(

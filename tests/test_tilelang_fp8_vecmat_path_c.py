@@ -119,7 +119,7 @@ def test_runtime_kernel_uses_canonical_input_order_for_fast_tuple_dispatch() -> 
     # caller (``fp8_scaled_vecmat_path_c``) always reshapes the result back
     # to flat ``(n,)`` for the public-API contract.
     assert output_shape == (1, 24)
-    assert threadgroup == (128, 1, 1)
+    assert threadgroup == (32, 1, 1)
 
 
 def test_fp8_e4m3_dot4_intrinsic_is_registered() -> None:

@@ -31,3 +31,6 @@ data/parquet_samples/
 *.db
 .beads-credential-key
 loop_vectorize.o
+
+.gemini/
+gha-creds-*.json

@@ -676,18 +676,23 @@ def fp8_vecmat_msl_features(msl: str) -> dict[str, int]:
     body = _kernel_body_for_feature_counts(msl)
     body_lowered = body.lower()
     scalar_decode_sites = body.count("__tvm_fp8_e4m3_to_half(")
+    packed_uint_loads = (
+        msl.count("reinterpret_cast<device const uint*>")
+        + msl.count("__tvm_fp8_load_u32")
+    )
     return {
         "kernel_void": msl.count("kernel void"),
         "fp8_e4m3_decode_helper": msl.count("__tvm_fp8_e4m3_to_half"),
         "tvm_thread_allreduce": body.count("tvm_thread_allreduce"),
         "simd_shuffle_down": body.count("simd_shuffle_down"),
         "simd_sum": body.count("simd_sum"),
-        "reinterpret_cast": body.count("reinterpret_cast"),
-        "device_const_uint": body.count("device const uint"),
+        "reinterpret_cast": msl.count("reinterpret_cast"),
+        "device_const_uint": msl.count("device const uint"),
         "uint_pointer": body.count("uint*"),
         "uchar4": body_lowered.count("uchar4"),
-        "fp8_e4m3_lut": body.count("fp8_e4m3fn_lut"),
+        "fp8_e4m3_lut": msl.count("fp8_e4m3fn_lut"),
         "metal_fp8_dot4_helper": msl.count("__tvm_fp8_e4m3_dot4_packed"),
+        "packed_uint_loads": packed_uint_loads,
         "scalar_fp8_byte_decode": scalar_decode_sites,
         "scalar_fp8_byte_decode_calls": scalar_decode_sites,
     }
@@ -698,7 +703,7 @@ def fp8_vecmat_msl_blockers(msl: str) -> dict[str, Any]:
 
     features = fp8_vecmat_msl_features(msl)
     missing: list[str] = []
-    if features["reinterpret_cast"] == 0 or features["device_const_uint"] == 0:
+    if features["packed_uint_loads"] == 0:
         missing.append("packed_uint32_fp8_loads")
     if features["simd_sum"] == 0:
         missing.append("metal_simd_sum_reduction")

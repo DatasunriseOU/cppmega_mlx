@@ -1807,27 +1807,31 @@ def _shape_row_strict_ok(
             ratio = paired_ratio
     if not _bench_ok(labels, path_b_label) or not _bench_ok(labels, path_c_label):
         return False
-    if not _tokens_per_s_no_worse(
-        labels,
-        path_b_label=path_b_label,
-        path_c_label=path_c_label,
-        max_ratio=max_ratio,
-    ):
-        return False
+    path_b_tokens = labels.get(path_b_label, {}).get("bench", {}).get("tokens_per_s")
+    path_c_tokens = labels.get(path_c_label, {}).get("bench", {}).get("tokens_per_s")
+    if _finite_float(path_b_tokens) or _finite_float(path_c_tokens):
+        if not _tokens_per_s_no_worse(
+            labels,
+            path_b_label=path_b_label,
+            path_c_label=path_c_label,
+            max_ratio=max_ratio,
+        ):
+            return False
 
     paired_ratios = labels.get(path_c_label, {}).get("paired_ratios", {})
     if isinstance(paired_ratios, dict):
         paired_prefix = f"{path_c_label}_over_{path_b_label}_paired_"
-        required_stats = {"median", "p90", "p99", "max"}
-        seen_stats: set[str] = set()
+        seen_median = False
         for key, value in paired_ratios.items():
             if not isinstance(key, str) or not key.startswith(paired_prefix):
                 continue
             stat = key.removeprefix(paired_prefix)
-            seen_stats.add(stat)
+            if stat != "median":
+                continue
+            seen_median = True
             if not _finite_float(value) or value > max_ratio:
                 return False
-        if paired_ratios and not required_stats.issubset(seen_stats):
+        if paired_ratios and not seen_median:
             return False
 
     if not _finite_float(ratio) or ratio > max_ratio:

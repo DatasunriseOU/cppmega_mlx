@@ -278,11 +278,6 @@ def _lower_minimal_kernel_to_msl(kernel_src: str) -> str:
     return _inline_tilelang_kernel_body(kernel_src)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="future work: prefix threadgroup_barrier with metal:: namespace",
-    raises=AssertionError,
-)
 def test_inline_body_prefixes_threadgroup_barrier_with_metal_namespace() -> None:
     """threadgroup_barrier: assert that the lowered MSL contains the
     fully-qualified Metal builtin.
@@ -300,11 +295,6 @@ def test_inline_body_prefixes_threadgroup_barrier_with_metal_namespace() -> None
     assert "metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup)" in body
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="future work: surface simdgroup_matrix + simdgroup_multiply_accumulate",
-    raises=AssertionError,
-)
 def test_inline_body_handles_simdgroup_matrix_and_mma() -> None:
     """simdgroup MMA: assert that the lowered MSL contains both
     `simdgroup_matrix` and `simdgroup_multiply_accumulate`.
@@ -328,11 +318,6 @@ def test_inline_body_handles_simdgroup_matrix_and_mma() -> None:
     assert "simdgroup_multiply_accumulate" in body
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="future work: prefix bfloat / half4 with metal:: namespace",
-    raises=AssertionError,
-)
 def test_inline_body_prefixes_metal_namespace_for_bfloat_and_half4() -> None:
     """bfloat / half4: assert that the lowered MSL namespace-qualifies both
     Metal scalar/vector types.
@@ -352,11 +337,6 @@ def test_inline_body_prefixes_metal_namespace_for_bfloat_and_half4() -> None:
     assert "metal::half4" in body
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="future work: preserve device vs threadgroup address-space qualifiers across casts",
-    raises=AssertionError,
-)
 def test_inline_body_canonicalizes_device_vs_threadgroup_address_space_casts() -> None:
     """address-space casts: assert that both `device` and `threadgroup`
     qualifiers survive the lowering (no implicit demotion to a single space).
@@ -379,11 +359,6 @@ def test_inline_body_canonicalizes_device_vs_threadgroup_address_space_casts() -
     assert "static_cast<device float*>" in body
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="future work: prefix atomic_fetch_* helpers with metal:: namespace",
-    raises=AssertionError,
-)
 def test_inline_body_prefixes_atomics_with_metal_namespace() -> None:
     """atomics: assert that the lowered MSL emits the fully-qualified
     `metal::atomic_fetch_add_explicit` form (and analogous min/max).
