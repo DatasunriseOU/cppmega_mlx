@@ -42,12 +42,23 @@ from cppmega_mlx.recipes.model_factory import (  # noqa: E402
 from cppmega_mlx.training.compiled import CompiledPretrainingStep  # noqa: E402
 from cppmega_mlx.training.loss import next_token_cut_cross_entropy  # noqa: E402
 from cppmega_mlx.training.optimizers import (  # noqa: E402
+    ADAM8BIT_CLASS,
+    ADAM8BIT_SOURCE,
     ADAMW_BASE_CLASS,
     ADAMW_FP32_MOMENTS_CLASS,
     ADAMW_FP32_MOMENTS_SOURCE,
+    LION8BIT_CLASS,
+    LION8BIT_SOURCE,
+    MUON_ADAMW_MULTI_CLASS,
+    MUON_ADAMW_MULTI_SOURCE,
+    MUON_QUANTIZED_MOMENTUM_SCHEMES,
     collect_adamw_moment_dtypes,
     dtype_name,
+    make_adam8bit,
     make_adamw,
+    make_lion,
+    make_lion8bit,
+    make_muon,
 )
 from scripts.train_hybrid_tiny import (  # noqa: E402
     DTYPES,
@@ -106,6 +117,19 @@ UNSUPPORTED_REQUIRED_MODEL_PROFILE_ROUTE_REASON = (
 )
 REQUIRED_OPTIMIZER_NAME = "AdamW"
 REQUIRED_ADAMW_MASTER_MOMENT_DTYPE = "float32"
+OPTIMIZER_CHOICES = (
+    "adamw",
+    "muon_adamw",
+    "muon",
+    "nam56r",
+    "lion",
+    "adam8bit",
+    "lion8bit",
+    "int8",
+)
+LION_FP32_MOMENTS_CLASS = "cppmega_mlx.training.optimizers.LionFP32Moments"
+LION_FP32_MOMENTS_SOURCE = "cppmega_mlx.training.optimizers.make_lion"
+MUON_INT8_SOURCE = "cppmega_mlx.training.optimizers.make_muon(int8_state)"
 DEFAULT_SMOKE_LR = 1e-3
 DEFAULT_LOCAL_GB10_QUARTER_LR = 1e-4
 OBSERVED_OPTIMIZER_IDENTITY = {
@@ -179,6 +203,26 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument(
+        "--optimizer",
+        choices=OPTIMIZER_CHOICES,
+        default="adamw",
+        help=(
+            "Optimizer for the real local_gb10_quarter route. AdamW remains "
+            "the default M0.4 acceptance optimizer; non-AdamW choices are "
+            "recorded as optimizer-matrix variants."
+        ),
+    )
+    parser.add_argument(
+        "--optimizer-quant-scheme",
+        choices=MUON_QUANTIZED_MOMENTUM_SCHEMES,
+        default="dynamic_int8_v1",
+        help=(
+            "Blockwise int8 codec for adam8bit, lion8bit, and int8 "
+            "optimizer variants. The default uses the bitsandbytes-style "
+            "dynamic LUT; pass symmetric_int8_v1 for the older local codec."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=1004)
     parser.add_argument("--vocab-size", type=int, default=131_072)
     parser.add_argument("--hidden-size", type=int, default=8)
@@ -309,6 +353,26 @@ def learning_rate_from_args(args: argparse.Namespace) -> float:
     return DEFAULT_SMOKE_LR
 
 
+def optimizer_key_from_args(args: argparse.Namespace) -> str:
+    key = str(getattr(args, "optimizer", "adamw")).strip().lower()
+    if key == "muon":
+        return "muon_adamw"
+    if key == "nam56r":
+        return "muon_adamw"
+    return key
+
+
+def optimizer_variant_payload(args: argparse.Namespace) -> dict[str, Any]:
+    requested = str(getattr(args, "optimizer", "adamw")).strip().lower()
+    key = optimizer_key_from_args(args)
+    return {
+        "requested": requested,
+        "key": key,
+        "quant_scheme": getattr(args, "optimizer_quant_scheme", None),
+        "source": "cli" if requested != "adamw" else "default",
+    }
+
+
 def write_synthetic_npz(path: Path, *, steps: int, batch_size: int, seq_len: int, vocab_size: int) -> None:
     samples = max(batch_size * max(steps, 1), batch_size, 4)
     base = np.arange(seq_len, dtype=np.int32) % max(vocab_size, 2)
@@ -410,6 +474,16 @@ def _run_existing_training(args: argparse.Namespace, *, data_path: Path) -> tupl
             args,
             config=config,
             data_path=data_path,
+        )
+    if optimizer_key_from_args(args) != "adamw":
+        return (
+            blocked_receipt(
+                args,
+                "non-default --optimizer choices are supported only with "
+                "--model-profile local_gb10_quarter in this receipt path",
+                "unsupported_optimizer_route",
+            ),
+            2,
         )
 
     reset_peak_memory()
@@ -523,7 +597,8 @@ def run_local_gb10_quarter_training(
             memory_after=memory_after_parameters,
         )
 
-        optimizer = make_adamw(
+        optimizer = make_local_gb10_optimizer(
+            args,
             learning_rate=config.learning_rate,
             weight_decay=config.weight_decay,
         )
@@ -578,13 +653,12 @@ def run_local_gb10_quarter_training(
 
         mx.synchronize()
         memory_after = metal_memory_payload()
-        optimizer_evidence = optimizer_identity(
+        optimizer_evidence = optimizer_identity_for_selected_optimizer(
+            args,
             config,
+            optimizer,
+            model,
             optimizer_updated=True,
-            master_moment_evidence=adamw_moment_evidence_from_optimizer(
-                optimizer,
-                model,
-            ),
         )
         train_payload = {
             "status": "ok",
@@ -654,6 +728,240 @@ def run_local_gb10_quarter_training(
             mx.synchronize()
         except Exception:
             pass
+
+
+def make_local_gb10_optimizer(
+    args: argparse.Namespace,
+    *,
+    learning_rate: float,
+    weight_decay: float,
+) -> Any:
+    key = optimizer_key_from_args(args)
+    quant_scheme = str(getattr(args, "optimizer_quant_scheme", "dynamic_int8_v1"))
+    if key == "adamw":
+        return make_adamw(learning_rate=learning_rate, weight_decay=weight_decay)
+    if key == "muon_adamw":
+        return make_muon(
+            lr_muon=learning_rate,
+            lr_adamw=learning_rate,
+            weight_decay=weight_decay,
+            cppmega_cuda_parity=True,
+        )
+    if key == "lion":
+        return make_lion(learning_rate=learning_rate, weight_decay=weight_decay)
+    if key == "adam8bit":
+        return make_adam8bit(
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+            quant_scheme=quant_scheme,
+            min_8bit_size=4096,
+        )
+    if key == "lion8bit":
+        return make_lion8bit(
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+            quant_scheme=quant_scheme,
+        )
+    if key == "int8":
+        return make_muon(
+            lr_muon=learning_rate,
+            lr_adamw=learning_rate,
+            weight_decay=weight_decay,
+            cppmega_cuda_parity=True,
+            quantize_momentum=True,
+            quantize_momentum_scheme=quant_scheme,
+            scalar_optimizer="adam8bit",
+            adam8bit_quant_scheme=quant_scheme,
+            adam8bit_min_8bit_size=4096,
+        )
+    raise ValueError(f"unsupported optimizer={key!r}")
+
+
+def selected_optimizer_static_identity(args: argparse.Namespace) -> dict[str, Any]:
+    variant = optimizer_variant_payload(args)
+    key = variant["key"]
+    if key == "adamw":
+        return {
+            **OBSERVED_OPTIMIZER_IDENTITY,
+            "key": key,
+            "variant": variant,
+            "adamw_family": True,
+            "quantized_state": False,
+        }
+    if key == "muon_adamw":
+        return {
+            "name": "MuonAdamW",
+            "key": key,
+            "class": MUON_ADAMW_MULTI_CLASS,
+            "base_class": "mlx.optimizers.Optimizer",
+            "source": MUON_ADAMW_MULTI_SOURCE,
+            "construction": (
+                "repo-local make_muon(cppmega_cuda_parity=True, "
+                "lr_muon=config.learning_rate, lr_adamw=config.learning_rate)"
+            ),
+            "variant": variant,
+            "adamw_family": False,
+            "quantized_state": False,
+            "nam56r_style": True,
+        }
+    if key == "lion":
+        return {
+            "name": "Lion",
+            "key": key,
+            "class": LION_FP32_MOMENTS_CLASS,
+            "base_class": "mlx.optimizers.Lion",
+            "source": LION_FP32_MOMENTS_SOURCE,
+            "construction": (
+                "repo-local make_lion(learning_rate=config.learning_rate, "
+                "weight_decay=config.weight_decay) with fp32 momentum"
+            ),
+            "variant": variant,
+            "adamw_family": False,
+            "quantized_state": False,
+        }
+    if key == "adam8bit":
+        return {
+            "name": "Adam8bit",
+            "key": key,
+            "class": ADAM8BIT_CLASS,
+            "base_class": "mlx.optimizers.Optimizer",
+            "source": ADAM8BIT_SOURCE,
+            "construction": (
+                "repo-local make_adam8bit(learning_rate=config.learning_rate, "
+                "weight_decay=config.weight_decay, quant_scheme=..., "
+                "min_8bit_size=4096)"
+            ),
+            "variant": variant,
+            "adamw_family": True,
+            "quantized_state": True,
+        }
+    if key == "lion8bit":
+        return {
+            "name": "Lion8bit",
+            "key": key,
+            "class": LION8BIT_CLASS,
+            "base_class": "mlx.optimizers.Optimizer",
+            "source": LION8BIT_SOURCE,
+            "construction": (
+                "repo-local make_lion8bit(learning_rate=config.learning_rate, "
+                "weight_decay=config.weight_decay, quant_scheme=...)"
+            ),
+            "variant": variant,
+            "adamw_family": False,
+            "quantized_state": True,
+        }
+    if key == "int8":
+        return {
+            "name": "MuonAdamWInt8",
+            "key": key,
+            "class": MUON_ADAMW_MULTI_CLASS,
+            "base_class": "mlx.optimizers.Optimizer",
+            "source": MUON_INT8_SOURCE,
+            "construction": (
+                "repo-local make_muon(cppmega_cuda_parity=True, "
+                "quantize_momentum=True, scalar_optimizer='adam8bit', "
+                "adam8bit_min_8bit_size=4096)"
+            ),
+            "variant": variant,
+            "adamw_family": False,
+            "quantized_state": True,
+            "nam56r_style": True,
+        }
+    raise ValueError(f"unsupported optimizer={key!r}")
+
+
+def optimizer_state_dtype_breakdown(state: Any) -> dict[str, dict[str, int]]:
+    breakdown: dict[str, dict[str, int]] = {}
+
+    def walk(path: tuple[str, ...], value: Any) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                walk((*path, str(key)), item)
+            return
+        if isinstance(value, list | tuple):
+            for index, item in enumerate(value):
+                walk((*path, str(index)), item)
+            return
+        if isinstance(value, mx.array):
+            leaf = path[-1] if path else "<root>"
+            dtype = dtype_name(value)
+            by_dtype = breakdown.setdefault(leaf, {})
+            by_dtype[dtype] = by_dtype.get(dtype, 0) + int(value.nbytes)
+
+    walk((), state)
+    return breakdown
+
+
+def optimizer_state_evidence(optimizer: Any, model: Any) -> dict[str, Any]:
+    state = optimizer.state if isinstance(optimizer.state, dict) else {}
+    moment_dtypes = collect_adamw_moment_dtypes(state)
+    sampled_moment_dtypes = dict(sorted(moment_dtypes.items())[:64])
+    return {
+        "observed_parameter_dtype": first_parameter_dtype(model),
+        "state_keys": sorted(str(key) for key in state),
+        "state_dtype_breakdown_bytes": optimizer_state_dtype_breakdown(state),
+        "observed_adamw_moment_dtypes": sampled_moment_dtypes,
+        "observed_adamw_moment_dtype_count": len(moment_dtypes),
+        "observed_adamw_moment_dtypes_sampled": len(sampled_moment_dtypes),
+        "observed_adamw_moment_dtypes_truncated": (
+            len(sampled_moment_dtypes) < len(moment_dtypes)
+        ),
+    }
+
+
+def optimizer_identity_for_selected_optimizer(
+    args: argparse.Namespace,
+    config: TrainHybridTinyConfig | argparse.Namespace,
+    optimizer: Any,
+    model: Any,
+    *,
+    optimizer_updated: bool,
+) -> dict[str, Any]:
+    if optimizer_key_from_args(args) == "adamw":
+        return optimizer_identity(
+            config,
+            optimizer_updated=optimizer_updated,
+            master_moment_evidence=adamw_moment_evidence_from_optimizer(
+                optimizer,
+                model,
+            ),
+        )
+    identity = selected_optimizer_static_identity(args)
+    state_evidence = optimizer_state_evidence(optimizer, model)
+    return {
+        **identity,
+        "required_name": REQUIRED_OPTIMIZER_NAME,
+        "name_matches_required": False,
+        "adamw": False,
+        "learning_rate": getattr(config, "learning_rate", getattr(config, "lr", None)),
+        "weight_decay": getattr(config, "weight_decay", None),
+        "update_observed": optimizer_updated,
+        "required_master_moment_dtype": REQUIRED_ADAMW_MASTER_MOMENT_DTYPE,
+        "master_moment_evidence": {
+            "required_dtype": REQUIRED_ADAMW_MASTER_MOMENT_DTYPE,
+            "observed_parameter_dtype": state_evidence["observed_parameter_dtype"],
+            "observed_moment_dtypes": state_evidence["observed_adamw_moment_dtypes"],
+            "observed_moment_dtype_count": state_evidence[
+                "observed_adamw_moment_dtype_count"
+            ],
+            "observed_moment_dtypes_sampled": state_evidence[
+                "observed_adamw_moment_dtypes_sampled"
+            ],
+            "observed_moment_dtypes_truncated": state_evidence[
+                "observed_adamw_moment_dtypes_truncated"
+            ],
+            "optimizer_class": identity["class"],
+            "optimizer_base_class": identity["base_class"],
+            "state_keys": state_evidence["state_keys"],
+            "ok": False,
+            "reason": (
+                "M0.4 acceptance still requires repo-local AdamW fp32 moments; "
+                "this receipt records an optimizer-matrix variant."
+            ),
+        },
+        "master_moment_dtype_ok": False,
+        "state_evidence": state_evidence,
+    }
 
 
 def local_gb10_preflight_from_allocated_model(
@@ -882,6 +1190,7 @@ def receipt_from_train_payload(
             "compile_requested": config.compile,
             "learning_rate": config.learning_rate,
             "model_profile": config.model_profile,
+            "optimizer": optimizer_variant_payload(args),
             "grad_checkpoint": config.grad_checkpoint,
             "mode": mode,
             "require_loss_decrease": bool(args.require_loss_decrease),
@@ -1253,6 +1562,15 @@ def optimizer_identity(
     moment_evidence = master_moment_evidence or adamw_master_moment_evidence()
     return {
         **OBSERVED_OPTIMIZER_IDENTITY,
+        "key": "adamw",
+        "variant": {
+            "requested": "adamw",
+            "key": "adamw",
+            "quant_scheme": getattr(config, "optimizer_quant_scheme", None),
+            "source": "default",
+        },
+        "adamw_family": True,
+        "quantized_state": False,
         "required_name": REQUIRED_OPTIMIZER_NAME,
         "name_matches_required": OBSERVED_OPTIMIZER_IDENTITY["name"] == REQUIRED_OPTIMIZER_NAME,
         "adamw": OBSERVED_OPTIMIZER_IDENTITY["name"] == "AdamW",
@@ -1333,23 +1651,48 @@ def grad_checkpoint_payload(
 
 
 def metadata_only_optimizer_identity(
+    args: argparse.Namespace,
     config: TrainHybridTinyConfig | argparse.Namespace,
 ) -> dict[str, Any]:
-    return optimizer_identity(
-        config,
-        optimizer_updated=False,
-        master_moment_evidence={
-            "required_dtype": REQUIRED_ADAMW_MASTER_MOMENT_DTYPE,
+    identity = selected_optimizer_static_identity(args)
+    moment_evidence = {
+        "required_dtype": REQUIRED_ADAMW_MASTER_MOMENT_DTYPE,
+        "observed_parameter_dtype": None,
+        "observed_moment_dtypes": {},
+        "optimizer_class": identity["class"],
+        "optimizer_base_class": identity["base_class"],
+        "state_keys": [],
+        "ok": False,
+        "skipped": True,
+        "reason": "metadata-only dry-run does not allocate optimizer state",
+    }
+    if optimizer_key_from_args(args) == "adamw":
+        return optimizer_identity(
+            config,
+            optimizer_updated=False,
+            master_moment_evidence=moment_evidence,
+        )
+    return {
+        **identity,
+        "required_name": REQUIRED_OPTIMIZER_NAME,
+        "name_matches_required": False,
+        "adamw": False,
+        "learning_rate": getattr(config, "learning_rate", getattr(config, "lr", None)),
+        "weight_decay": getattr(config, "weight_decay", None),
+        "update_observed": False,
+        "required_master_moment_dtype": REQUIRED_ADAMW_MASTER_MOMENT_DTYPE,
+        "master_moment_evidence": moment_evidence,
+        "master_moment_dtype_ok": False,
+        "state_evidence": {
             "observed_parameter_dtype": None,
-            "observed_moment_dtypes": {},
-            "optimizer_class": OBSERVED_OPTIMIZER_IDENTITY["class"],
-            "optimizer_base_class": OBSERVED_OPTIMIZER_IDENTITY["base_class"],
             "state_keys": [],
-            "ok": False,
-            "skipped": True,
-            "reason": "metadata-only dry-run does not allocate optimizer state",
+            "state_dtype_breakdown_bytes": {},
+            "observed_adamw_moment_dtypes": {},
+            "observed_adamw_moment_dtype_count": 0,
+            "observed_adamw_moment_dtypes_sampled": 0,
+            "observed_adamw_moment_dtypes_truncated": False,
         },
-    )
+    }
 
 
 def local_gb10_quarter_metadata_dry_run_receipt(
@@ -1365,7 +1708,7 @@ def local_gb10_quarter_metadata_dry_run_receipt(
     """
 
     local_gb10_preflight = local_gb10_quarter_preflight_from_args(args)
-    optimizer = metadata_only_optimizer_identity(config)
+    optimizer = metadata_only_optimizer_identity(args, config)
     grad_checkpoint = grad_checkpoint_payload(config)
     memory_snapshot = metal_memory_payload()
     device = device_info()
@@ -1416,6 +1759,7 @@ def local_gb10_quarter_metadata_dry_run_receipt(
             "compile_requested": config.compile,
             "learning_rate": config.learning_rate,
             "model_profile": config.model_profile,
+            "optimizer": optimizer_variant_payload(args),
             "grad_checkpoint": config.grad_checkpoint,
             "mode": "metadata_only_no_forward_no_training",
             "require_loss_decrease": bool(args.require_loss_decrease),
@@ -1783,6 +2127,7 @@ def blocked_receipt(
         args,
         probe_allocation=probe_allocation,
     )
+    optimizer = metadata_only_optimizer_identity(args, args)
     return {
         "receipt_schema_version": RECEIPT_SCHEMA_VERSION,
         "receipt_scope": RECEIPT_SCOPE,
@@ -1809,7 +2154,7 @@ def blocked_receipt(
             model_name=None,
             model_source=None,
             model_config=None,
-            optimizer=optimizer_identity(args, optimizer_updated=False),
+            optimizer=optimizer,
             grad_checkpoint=grad_checkpoint_payload(args),
             device=device_info(),
             local_gb10_quarter_preflight=local_gb10_preflight,
@@ -1834,6 +2179,7 @@ def blocked_receipt(
             "compile_requested": bool(args.compile),
             "learning_rate": learning_rate_from_args(args),
             "model_profile": args.model_profile,
+            "optimizer": optimizer_variant_payload(args),
             "grad_checkpoint": bool(args.grad_checkpoint),
             "require_loss_decrease": bool(args.require_loss_decrease),
             "memory_limit_total_bytes": args.memory_limit_total_bytes,
@@ -1848,7 +2194,7 @@ def blocked_receipt(
         "training": {
             "steps_completed": 0,
             "optimizer_updated": False,
-            "optimizer": optimizer_identity(args, optimizer_updated=False),
+            "optimizer": optimizer,
             "grad_checkpoint": grad_checkpoint_payload(args),
             "all_finite": False,
             "losses": [],

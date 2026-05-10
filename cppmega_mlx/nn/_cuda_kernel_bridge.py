@@ -43,6 +43,7 @@ cpu / no CUDA       no       no        no       no
 from __future__ import annotations
 
 import functools
+import importlib
 import warnings
 from typing import Any, FrozenSet, Mapping
 
@@ -217,7 +218,7 @@ def dispatch_kernel_bridge(kind: str, /, **kwargs: Any) -> Any:
     # exist that we haven't grepped; instead we surface a precise error.
     if kind in {"mxfp8", "mxfp8_grouped"}:
         try:
-            from cppmega_mlx.nn import _mxfp8_bridge  # type: ignore[attr-defined]
+            _mxfp8_bridge = importlib.import_module("cppmega_mlx.nn._mxfp8_bridge")
         except ImportError as exc:
             raise CUDABridgeUnsupported(
                 f"MXFP8 bridge ({kind!r}) requested on arch {arch!r} but "

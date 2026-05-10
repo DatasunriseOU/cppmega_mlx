@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import importlib
+import subprocess
 import sys
 
 import mlx.core as mx
@@ -19,13 +19,15 @@ from cppmega_mlx.data import dataloader_bridge
 
 
 def test_bridge_module_does_not_import_torch_on_package_import() -> None:
-    sys.modules.pop("torch", None)
-    sys.modules.pop("torch.utils.data", None)
-
-    importlib.reload(dataloader_bridge)
-
-    assert "torch" not in sys.modules
-    assert "torch.utils.data" not in sys.modules
+    script = "\n".join(
+        [
+            "import sys",
+            "import cppmega_mlx.data.dataloader_bridge",
+            "assert 'torch' not in sys.modules",
+            "assert 'torch.utils.data' not in sys.modules",
+        ]
+    )
+    subprocess.run([sys.executable, "-c", script], check=True)
 
 
 def test_local_token_batch_dataset_materializes_numpy_batches() -> None:

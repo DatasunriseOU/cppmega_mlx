@@ -24,7 +24,6 @@ Per the codebase rule ``feedback_no_silent_delete`` we test for *loud* failure
 from __future__ import annotations
 
 import platform
-import sys
 
 import pytest
 
@@ -265,17 +264,16 @@ def test_mxfp8_bridge_rejects_non_128_multiple_shape_on_gb10() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Compile-only smoke (Mac-friendly): bypass the cppmega + arch probes via
+# Backend-gated IR smoke (Mac-friendly): bypass the cppmega + arch probes via
 # monkeypatch to verify the TIR shape end-to-end on Mac. We DO NOT launch the
 # kernel; we only verify (a) extern_intrinsic registers, (b) the prim_func
 # uses it without a TIR build error during prim_func construction, and (c)
-# the lowered TIR `tir.call_extern` references the documented intrinsic name.
+# the backend-specific body is registered only for the CUDA cppmega extern.
 #
-# When the host's libtilelang has the CUDA codegen target builder available
-# (registers ``target.build.tilelang_cuda``), we additionally run
-# ``tilelang.compile`` for ``target='cuda'`` to confirm the metadata-level
-# compile succeeds. Mac builds typically lack the CUDA backend, in which case
-# we xfail with the precise ``Cannot find global function`` reason.
+# This is not a high-level "MXFP8 is CUDA-only" contract. It is a low-level
+# bridge to cppmega's pre-built Blackwell CUDA .so. High-level TileLang /
+# torch / MLX routes should select a native lower backend for the current
+# device and must not force a CUDA compile on Metal.
 # ---------------------------------------------------------------------------
 
 
@@ -382,19 +380,17 @@ def test_mxfp8_extern_intrinsic_registers_and_emits_call_extern(
     assert names == ["A_u8", "SFA_u8", "B_u8", "SFB_u8", "out"]
 
 
-def test_mxfp8_compile_smoke_sm120(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Compile-only smoke: build a TileLang ``@T.prim_func`` that calls the
-    intrinsic and run ``tilelang.compile(target='cuda')``. No real GPU launch.
+def test_mxfp8_ir_smoke_is_backend_gated(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Build a TileLang ``@T.prim_func`` that calls the intrinsic.
 
-    On Mac dev hosts the libtilelang dylib usually does NOT register
-    ``target.build.tilelang_cuda`` (CUDA codegen requires nvcc + a CUDA build
-    flag), so this test xfails cleanly with the precise
-    ``Cannot find global function target.build.tilelang_cuda`` reason rather
-    than pretending to test what it can't.
+    Non-CUDA hosts only validate the IR-level bridge contract. The CUDA codegen
+    smoke is meaningful only when the *real* bridge prereqs are present before
+    monkeypatching (GB10 + cppmega CUDA extension + TileLang CUDA builder).
     """
 
     pytest.importorskip("tilelang", reason="tilelang missing")
     pytest.importorskip("tvm", reason="tvm missing")
+    real_bridge_ok, real_bridge_reason = mxfp8_bridge_available()
     _mock_bridge_probes(monkeypatch)
     _unregister_mxfp8_intrinsics_if_registered()
 
@@ -417,20 +413,27 @@ def test_mxfp8_compile_smoke_sm120(monkeypatch: pytest.MonkeyPatch) -> None:
         with T.Kernel(1, 1) as (bx, by):
             intrin(A, SFA, B, SFB, Out)
 
-    # If the host's libtilelang doesn't have the CUDA codegen builder,
-    # tilelang.compile fails at the dispatch step (NOT inside our bridge).
-    # That is a host-build limitation, not a bridge bug — xfail with a
-    # precise reason so reviewers know exactly what's missing.
+    from tilelang.language import extern_registry
+
+    entry = extern_registry.lookup(MXFP8_INTRINSIC_NAME)
+    assert entry is not None, "intrinsic not registered after wiring"
+    assert entry.has_target("cuda"), "cppmega CUDA extern body missing"
+    assert not entry.has_target("metal"), (
+        "this bridge wraps cppmega's CUDA .so; Metal must be reached through "
+        "the high-level backend route, not by compiling this extern body"
+    )
+
     cuda_builder = tvm.ffi.get_global_func(
         "target.build.tilelang_cuda", allow_missing=True
     )
-    if cuda_builder is None:
-        pytest.xfail(
-            "host libtilelang does not register target.build.tilelang_cuda "
-            "(no CUDA backend in this build); bridge wiring is verified by "
-            "test_mxfp8_extern_intrinsic_registers_and_emits_call_extern, "
-            "which does not require a CUDA codegen target."
-        )
+    if not real_bridge_ok:
+        assert cuda_builder is None or real_bridge_reason
+        return
+
+    assert cuda_builder is not None, (
+        "MXFP8 bridge prereqs are available, but host libtilelang does not "
+        "register target.build.tilelang_cuda"
+    )
 
     compiled = tilelang.compile(mxfp8_kernel, target="cuda")
     assert compiled is not None

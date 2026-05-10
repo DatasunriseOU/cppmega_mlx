@@ -79,16 +79,15 @@ the closure-walk path entirely.
 
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any, cast
+from typing import Any
 
 import mlx.core as mx
 
 from cppmega_mlx.nn._tilelang import _msl_transform
-from cppmega_mlx.nn._tilelang._engine_dispatch import dispatch_lower
+from cppmega_mlx.nn._tilelang._engine_dispatch import artifact_to_source, dispatch_lower
 from cppmega_mlx.nn._tilelang._msl_transform import (
     MSLDispatchUnsupported,
     can_run_metal,
-    lower_tilelang_to_msl_inline,
 )
 from cppmega_mlx.nn._tilelang.mamba3 import (
     _validate_inputs,
@@ -156,8 +155,14 @@ def _threads_for(lanes: int) -> int:
 
 @lru_cache(maxsize=128)
 def _fwd_kernel_for(
-    BATCH: int, SEQ: int, HEADS: int, HEADDIM: int, STATE: int
-) -> tuple[Any, _msl_transform.TileLangMSLLowering]:
+    BATCH: int,
+    SEQ: int,
+    HEADS: int,
+    HEADDIM: int,
+    STATE: int,
+    *,
+    return_msl: bool = False,
+) -> tuple[Any, _msl_transform.TileLangMSLLowering | None]:
     """Build & cache the Path C TileLang fwd kernel for a given (B, T, H, P, N)."""
 
     import tilelang.language as T
@@ -208,7 +213,7 @@ def _fwd_kernel_for(
                 for n in T.serial(STATE):
                     h_last[b, h, p, n] = h_state[n]
 
-    artifact = dispatch_lower(fwd, target="metal")
+    artifact = dispatch_lower(fwd, target="metal", return_msl=return_msl)
     if hasattr(artifact, "_tilelang_engine_target"):
         # Engine path: artifact is a tilelang.compile callable; callers branch
         # on ``lowering is None`` to invoke it directly.
@@ -229,8 +234,14 @@ def _fwd_kernel_for(
 
 @lru_cache(maxsize=128)
 def _bwd_kernel_for(
-    BATCH: int, SEQ: int, HEADS: int, HEADDIM: int, STATE: int
-) -> tuple[Any, _msl_transform.TileLangMSLLowering]:
+    BATCH: int,
+    SEQ: int,
+    HEADS: int,
+    HEADDIM: int,
+    STATE: int,
+    *,
+    return_msl: bool = False,
+) -> tuple[Any, _msl_transform.TileLangMSLLowering | None]:
     """Build & cache the Path C TileLang bwd kernel for a given (B, T, H, P, N).
 
     Mirrors the Path B MSL bwd kernel: rematerialises ``h[t]`` per lane on the
@@ -358,7 +369,7 @@ def _bwd_kernel_for(
                     dh0[b, h, p, n] = dh[n]
                 dD_partial[b, h, p] = dD_acc[0]
 
-    artifact = dispatch_lower(bwd, target="metal")
+    artifact = dispatch_lower(bwd, target="metal", return_msl=return_msl)
     if hasattr(artifact, "_tilelang_engine_target"):
         return artifact, None
     lowering = artifact
@@ -643,13 +654,10 @@ def dump_lowered_fwd_msl(
     ``docs/tilelang_ports/mamba3_path_c_lowered.metal`` artifact.
     """
 
-    _kernel, lowering = _fwd_kernel_for(batch, seq, heads, headdim, state)
-    if lowering is None:
-        raise RuntimeError(
-            "dump_lowered_fwd_msl requires the shim path; set "
-            "CPPMEGA_MLX_TILELANG_ENGINE=shim or =auto with the engine missing."
-        )
-    return cast(str, lowering.msl_text)
+    kernel, lowering = _fwd_kernel_for(
+        batch, seq, heads, headdim, state, return_msl=True
+    )
+    return artifact_to_source(kernel if lowering is None else lowering)
 
 
 def dump_lowered_bwd_msl(
@@ -657,13 +665,10 @@ def dump_lowered_bwd_msl(
 ) -> str:
     """Return the raw lowered MSL for the Path C backward kernel."""
 
-    _kernel, lowering = _bwd_kernel_for(batch, seq, heads, headdim, state)
-    if lowering is None:
-        raise RuntimeError(
-            "dump_lowered_bwd_msl requires the shim path; set "
-            "CPPMEGA_MLX_TILELANG_ENGINE=shim or =auto with the engine missing."
-        )
-    return cast(str, lowering.msl_text)
+    kernel, lowering = _bwd_kernel_for(
+        batch, seq, heads, headdim, state, return_msl=True
+    )
+    return artifact_to_source(kernel if lowering is None else lowering)
 
 
 __all__ = [

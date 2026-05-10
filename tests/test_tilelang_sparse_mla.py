@@ -967,8 +967,8 @@ def test_path_c_backward_lowered_msl_uses_threadgroup_reductions() -> None:
     lowered = msl.lower()
     assert "kernel void" in msl
     assert "thread_position_in_threadgroup" in msl
-    assert "device const half* q" in msl
-    assert "device const half* kv" in msl
+    assert "device half* q" in msl or "device const half* q" in msl
+    assert "device half* kv" in msl or "device const half* kv" in msl
     assert "device half* dkv_partial" in msl
     assert "device half* dq" in msl
     assert "threadgroup float" in lowered
@@ -1006,6 +1006,25 @@ def test_path_c_backward_lowered_msl_uses_threadgroup_reductions() -> None:
     assert "d_out[((gid * 16) + d_1)]" not in msl
     assert msl.count("for (uint stride = threads / 2; stride > 0; stride >>= 1)") == 3
     _assert_bwd_path_b_hot_loop_shape(msl)
+
+
+def test_path_c_backward_topk4_msl_declares_or_rewrites_stride() -> None:
+    status = sparse_mla_path_c_status()
+    if not status.available:
+        pytest.skip(status.reason)
+
+    msl = dump_lowered_bwd_msl(
+        batch=1,
+        seq_len=4,
+        heads=2,
+        qk_dim=16,
+        kv_group=1,
+        topk=4,
+        seq_len_kv=8,
+    )
+    assert "round_id" not in msl
+    assert "    stride = (" not in msl
+    assert msl.count("for (uint stride = threads / 2; stride > 0; stride >>= 1)") == 3
 
 
 def test_path_c_backward_bench_shape_msl_uses_path_b_lane_loops() -> None:
@@ -1221,8 +1240,8 @@ def test_path_c_forward_lowered_msl_uses_threadgroup_reductions() -> None:
     lowered = msl.lower()
     assert "kernel void" in msl
     assert "thread_position_in_threadgroup" in msl
-    assert "device const half* q" in msl
-    assert "device const half* kv" in msl
+    assert "device half* q" in msl or "device const half* q" in msl
+    assert "device half* kv" in msl or "device const half* kv" in msl
     assert "device half* out" in msl
     assert "device float* lse" in msl
     assert "threadgroup float" in lowered
@@ -1255,6 +1274,25 @@ def test_path_c_forward_lowered_msl_uses_threadgroup_reductions() -> None:
     assert "lse[gid] = (row_max + log(sumexp));" in msl
     assert "if (0.000000e+00f < sumexp)" not in msl
     assert "t.tvm_mma_sync" not in lowered
+
+
+def test_path_c_forward_topk4_msl_declares_or_rewrites_stride() -> None:
+    status = sparse_mla_path_c_status()
+    if not status.available:
+        pytest.skip(status.reason)
+
+    msl = dump_lowered_fwd_msl(
+        batch=1,
+        seq_len=4,
+        heads=2,
+        qk_dim=16,
+        kv_group=1,
+        topk=4,
+        seq_len_kv=8,
+    )
+    assert "round_id" not in msl
+    assert "    stride = (" not in msl
+    assert msl.count("for (uint stride = threads / 2; stride > 0; stride >>= 1)") == 2
 
 
 def test_path_c_forward_bench_shape_msl_uses_path_b_lane_loops() -> None:

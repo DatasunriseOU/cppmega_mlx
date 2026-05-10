@@ -87,11 +87,13 @@ _FUSED_SOURCE = """
         int v_signed = (int)v_quant_in[elem] - 128;
         m_prev = ((float)m_signed) * (1.0f / 127.0f) * m_absmax_prev;
         v_prev = ((float)v_signed) * (1.0f / 127.0f) * v_absmax_prev;
+        if (v_prev < 0.0f) v_prev = 0.0f;
     }
 
     // ----- Stage B: AdamW math in fp32 -----
     float m_new = beta1 * m_prev + (1.0f - beta1) * grad_fp;
     float v_new = beta2 * v_prev + (1.0f - beta2) * grad_fp * grad_fp;
+    if (v_new < 0.0f) v_new = 0.0f;
 
     // Stash in scratch so we can both reduce |m|, |v| and re-load post-reduce.
     m_scratch[tid] = active ? m_new : 0.0f;

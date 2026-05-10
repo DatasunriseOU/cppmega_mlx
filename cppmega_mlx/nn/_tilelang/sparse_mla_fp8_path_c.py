@@ -6,14 +6,14 @@
 # AttributeError. The broader migration also needs `simdgroup_a_fp8` /
 # `simdgroup_b_fp8` Fragment factories (extension of #08 simdgroup_a/b/c
 # factories at `tilelang/language/extern.py`). Track wave-6.
-"""Path C FP8 Sparse-MLA QK TileLang DSL surfaces.
+"""Path C FP8 Sparse-MLA TileLang DSL surfaces.
 
-REDUCERS-ONLY status — there is no ``sparse_mla_fp8_path_c_apply`` here.
-This module exposes only QK / indexed-QK reducer surfaces, not an end-to-end
-FP8 sparse-MLA forward. The only full callable wrapper for FP8 sparse-MLA is
-the Path B ``sparse_mla_fp8_apply`` (in ``sparse_mla_fp8.py``), so the
-``force_metal`` -> ``force_path_c`` kwarg rename used by the BF16 sparse-MLA
-pair does not apply here. See ``docs/production_kernel_routing.md``.
+This module owns the FP8 Sparse-MLA Path C kernels over the *prepared* ABI:
+``q_fp8/q_scale/kv_fp8/kv_scale/indices`` are existing GPU buffers already
+created by the upstream graph. The public ``sparse_mla_fp8_path_c_apply`` does
+not quantize, gather, cast, or allocate staging tensors; if callers have
+float carriers they should route through the higher-level graph planner so the
+producer emits FP8 buffers directly, or use the existing Path B wrapper.
 
 Runtime status: currently broken — ``tirx.metal.fp8_e4m3_dot4`` is not
 registered in the in-tree TileLang/TVM build, so dispatching the lowered FP8
@@ -106,6 +106,26 @@ _SMFP8_IQKR_RT = _SMFP8_QKR_DEFAULT_REDUCE_THREADS
 _SMFP8_IQKR_VEC = _SMFP8_QKR_DEFAULT_VEC
 _SMFP8_IQKR_BLOCK_K = _SMFP8_IQKR_RT * _SMFP8_IQKR_VEC
 _SMFP8_IQKR_K_WORDS = _SMFP8_IQKR_K // 4
+
+_SMFP8_APPLY_B = 1
+_SMFP8_APPLY_S = 1
+_SMFP8_APPLY_H = 1
+_SMFP8_APPLY_SKV = 16
+_SMFP8_APPLY_G = 1
+_SMFP8_APPLY_HEAD_KV = 1
+_SMFP8_APPLY_TOPK = 16
+_SMFP8_APPLY_K = 64
+_SMFP8_APPLY_DV = 64
+_SMFP8_APPLY_THREADS = 16
+_SMFP8_APPLY_LOG_THREADS = 4
+_SMFP8_APPLY_LANES = _SMFP8_APPLY_B * _SMFP8_APPLY_S * _SMFP8_APPLY_H
+_SMFP8_APPLY_Q_SIZE = _SMFP8_APPLY_LANES * _SMFP8_APPLY_K
+_SMFP8_APPLY_KV_SIZE = _SMFP8_APPLY_B * _SMFP8_APPLY_SKV * _SMFP8_APPLY_G * _SMFP8_APPLY_K
+_SMFP8_APPLY_Q_SCALE_SIZE = _SMFP8_APPLY_LANES
+_SMFP8_APPLY_KV_SCALE_SIZE = _SMFP8_APPLY_B * _SMFP8_APPLY_SKV * _SMFP8_APPLY_G
+_SMFP8_APPLY_IDX_SIZE = _SMFP8_APPLY_B * _SMFP8_APPLY_S * _SMFP8_APPLY_G * _SMFP8_APPLY_TOPK
+_SMFP8_APPLY_OUT_SIZE = _SMFP8_APPLY_LANES * _SMFP8_APPLY_DV
+_SMFP8_APPLY_LSE_SIZE = _SMFP8_APPLY_LANES
 
 
 @dataclass(frozen=True)
@@ -1282,7 +1302,7 @@ def _normalize_indexed_qk_reduce_inputs(
         raise ValueError(f"q_fp8/kv_fp8 K mismatch: q={tuple(q_fp8.shape)} kv={tuple(kv_fp8.shape)}")
     if idx_group != kv_group:
         raise ValueError(f"indices kv_group mismatch: indices={tuple(indices.shape)} kv={tuple(kv_fp8.shape)}")
-    head_kv = _validate_indexed_reduce_shape(
+    _validate_indexed_reduce_shape(
         batch=batch,
         seq_len=seq_len,
         heads=heads,
@@ -1452,6 +1472,355 @@ def fp8_sparse_mla_indexed_qk_reduce_path_c(
         threadgroup=lowering.threadgroup,
     )
     return outputs[0]
+
+
+def _threads_for_topk(topk: int) -> int:
+    threads = min(64, max(1, int(topk)))
+    power = 1
+    while (power << 1) <= threads:
+        power <<= 1
+    return max(1, power)
+
+
+def _validate_fp8_apply_inputs(
+    q_fp8: mx.array,
+    q_scale: mx.array,
+    kv_fp8: mx.array,
+    kv_scale: mx.array,
+    indices: mx.array,
+    *,
+    d_v: int | None,
+) -> tuple[int, int, int, int, int, int, int, int, int, int]:
+    if q_fp8.ndim != 4:
+        raise ValueError(f"q_fp8 must have shape (B, S, H, K); got {tuple(q_fp8.shape)}")
+    if kv_fp8.ndim != 4:
+        raise ValueError(f"kv_fp8 must have shape (B, S_kv, G, K); got {tuple(kv_fp8.shape)}")
+    if indices.ndim != 4:
+        raise ValueError(f"indices must have shape (B, S, G, TOPK); got {tuple(indices.shape)}")
+    if q_fp8.dtype != mx.uint8 or kv_fp8.dtype != mx.uint8:
+        raise TypeError(f"q_fp8/kv_fp8 must be uint8 FP8 storage; got {q_fp8.dtype}, {kv_fp8.dtype}")
+    if q_scale.dtype != mx.float32 or kv_scale.dtype != mx.float32:
+        raise TypeError(f"q_scale/kv_scale must be float32; got {q_scale.dtype}, {kv_scale.dtype}")
+    if indices.dtype != mx.int32:
+        raise TypeError(f"indices must be int32; got {indices.dtype}")
+
+    batch, seq_len, heads, qk_dim = (int(x) for x in q_fp8.shape)
+    kv_batch, seq_len_kv, kv_group, kv_dim = (int(x) for x in kv_fp8.shape)
+    idx_batch, idx_seq, idx_group, topk = (int(x) for x in indices.shape)
+    if kv_batch != batch or idx_batch != batch or idx_seq != seq_len:
+        raise ValueError(
+            "q_fp8/kv_fp8/indices batch or sequence mismatch: "
+            f"q={tuple(q_fp8.shape)} kv={tuple(kv_fp8.shape)} indices={tuple(indices.shape)}"
+        )
+    if kv_dim != qk_dim:
+        raise ValueError(f"q_fp8/kv_fp8 K mismatch: q={tuple(q_fp8.shape)} kv={tuple(kv_fp8.shape)}")
+    if idx_group != kv_group:
+        raise ValueError(f"indices kv_group mismatch: indices={tuple(indices.shape)} kv={tuple(kv_fp8.shape)}")
+    if heads % kv_group != 0:
+        raise ValueError(f"heads {heads} must be divisible by kv_group {kv_group}")
+    if tuple(q_scale.shape) != (batch, seq_len, heads):
+        raise ValueError(f"q_scale must have shape {(batch, seq_len, heads)}; got {tuple(q_scale.shape)}")
+    if tuple(kv_scale.shape) != (batch, seq_len_kv, kv_group):
+        raise ValueError(f"kv_scale must have shape {(batch, seq_len_kv, kv_group)}; got {tuple(kv_scale.shape)}")
+    d_v_resolved = qk_dim if d_v is None else int(d_v)
+    if d_v_resolved <= 0 or d_v_resolved > qk_dim:
+        raise ValueError(f"d_v must be in (0, {qk_dim}], got {d_v_resolved}")
+    return (
+        batch,
+        seq_len,
+        heads,
+        seq_len_kv,
+        kv_group,
+        heads // kv_group,
+        topk,
+        qk_dim,
+        d_v_resolved,
+        _threads_for_topk(topk),
+    )
+
+
+def _make_fp8_sparse_mla_apply_kernel(
+    *,
+    batch: int,
+    seq_len: int,
+    heads: int,
+    seq_len_kv: int,
+    kv_group: int,
+    head_kv: int,
+    topk: int,
+    K: int,
+    d_v: int,
+    threads: int,
+) -> Any:
+    import tilelang.language as T
+
+    T = cast(Any, T)
+
+    lanes = batch * seq_len * heads
+    g = globals()
+    g.update(
+        _SMFP8_APPLY_B=batch,
+        _SMFP8_APPLY_S=seq_len,
+        _SMFP8_APPLY_H=heads,
+        _SMFP8_APPLY_SKV=seq_len_kv,
+        _SMFP8_APPLY_G=kv_group,
+        _SMFP8_APPLY_HEAD_KV=head_kv,
+        _SMFP8_APPLY_TOPK=topk,
+        _SMFP8_APPLY_K=K,
+        _SMFP8_APPLY_DV=d_v,
+        _SMFP8_APPLY_THREADS=threads,
+        _SMFP8_APPLY_LOG_THREADS=threads.bit_length() - 1,
+        _SMFP8_APPLY_LANES=lanes,
+        _SMFP8_APPLY_Q_SIZE=lanes * K,
+        _SMFP8_APPLY_KV_SIZE=batch * seq_len_kv * kv_group * K,
+        _SMFP8_APPLY_Q_SCALE_SIZE=lanes,
+        _SMFP8_APPLY_KV_SCALE_SIZE=batch * seq_len_kv * kv_group,
+        _SMFP8_APPLY_IDX_SIZE=batch * seq_len * kv_group * topk,
+        _SMFP8_APPLY_OUT_SIZE=lanes * d_v,
+        _SMFP8_APPLY_LSE_SIZE=lanes,
+    )
+
+    @T.prim_func
+    def fp8_sparse_mla_apply_kernel(
+        q_fp8: T.Tensor((_SMFP8_APPLY_Q_SIZE,), "float8_e4m3"),
+        q_scale: T.Tensor((_SMFP8_APPLY_Q_SCALE_SIZE,), "float32"),
+        kv_fp8: T.Tensor((_SMFP8_APPLY_KV_SIZE,), "float8_e4m3"),
+        kv_scale: T.Tensor((_SMFP8_APPLY_KV_SCALE_SIZE,), "float32"),
+        indices: T.Tensor((_SMFP8_APPLY_IDX_SIZE,), "int32"),
+        sm_scale_buf: T.Tensor((1,), "float32"),
+        out: T.Tensor((_SMFP8_APPLY_OUT_SIZE,), "float16"),
+        lse: T.Tensor((_SMFP8_APPLY_LSE_SIZE,), "float32"),
+    ):
+        with T.Kernel(_SMFP8_APPLY_LANES, threads=_SMFP8_APPLY_THREADS) as bx:
+            lane = T.get_thread_binding()
+            scores = T.alloc_shared((_SMFP8_APPLY_TOPK,), "float32", scope="shared")
+            reduce_buf = T.alloc_shared((_SMFP8_APPLY_THREADS,), "float32", scope="shared")
+            acc = T.alloc_local((1,), "float32")
+            local = T.alloc_local((1,), "float32")
+            inv_sum = T.alloc_local((1,), "float32")
+            stride = T.alloc_local((1,), "int32")
+            gather_idx = T.alloc_local((1,), "int32")
+
+            h = bx % _SMFP8_APPLY_H
+            b = bx // (_SMFP8_APPLY_H * _SMFP8_APPLY_S)
+            gidx = h // _SMFP8_APPLY_HEAD_KV
+            q_row_base = bx * _SMFP8_APPLY_K
+            q_scale_idx = bx
+            kv_b_base = b * (_SMFP8_APPLY_SKV * _SMFP8_APPLY_G * _SMFP8_APPLY_K)
+            kv_scale_b_base = b * (_SMFP8_APPLY_SKV * _SMFP8_APPLY_G)
+            idx_base = ((bx // _SMFP8_APPLY_H) * _SMFP8_APPLY_G + gidx) * _SMFP8_APPLY_TOPK
+            out_row = bx * _SMFP8_APPLY_DV
+            sm_scale = sm_scale_buf[0]
+
+            for k_top in T.serial(lane, _SMFP8_APPLY_TOPK, step=_SMFP8_APPLY_THREADS):
+                gather_idx[0] = indices[idx_base + k_top]
+                if gather_idx[0] < 0 or gather_idx[0] >= _SMFP8_APPLY_SKV:
+                    scores[k_top] = T.float32(_SMFP8_INVALID_SCORE_SENTINEL)
+                else:
+                    acc[0] = 0.0
+                    kv_row_base = kv_b_base + (gather_idx[0] * _SMFP8_APPLY_G + gidx) * _SMFP8_APPLY_K
+                    kv_scale_idx = kv_scale_b_base + gather_idx[0] * _SMFP8_APPLY_G + gidx
+                    for d in T.serial(_SMFP8_APPLY_K):
+                        acc[0] = acc[0] + T.cast(q_fp8[q_row_base + d], "float32") * T.cast(
+                            kv_fp8[kv_row_base + d],
+                            "float32",
+                        )
+                    scores[k_top] = acc[0] * q_scale[q_scale_idx] * kv_scale[kv_scale_idx] * sm_scale
+            T.sync_threads()
+
+            local[0] = T.float32(_SMFP8_INVALID_SCORE_SENTINEL)
+            for k_top in T.serial(lane, _SMFP8_APPLY_TOPK, step=_SMFP8_APPLY_THREADS):
+                if scores[k_top] > local[0]:
+                    local[0] = scores[k_top]
+            reduce_buf[lane] = local[0]
+            T.sync_threads()
+            for round_id in T.serial(_SMFP8_APPLY_LOG_THREADS):
+                stride[0] = T.shift_right(_SMFP8_APPLY_THREADS, round_id + 1)
+                if lane < stride[0]:
+                    if reduce_buf[lane + stride[0]] > reduce_buf[lane]:
+                        reduce_buf[lane] = reduce_buf[lane + stride[0]]
+                T.sync_threads()
+            row_max = reduce_buf[0]
+
+            for k_top in T.serial(lane, _SMFP8_APPLY_TOPK, step=_SMFP8_APPLY_THREADS):
+                if scores[k_top] == T.float32(_SMFP8_INVALID_SCORE_SENTINEL):
+                    scores[k_top] = 0.0
+                else:
+                    scores[k_top] = T.exp(scores[k_top] - row_max)
+            T.sync_threads()
+
+            local[0] = 0.0
+            for k_top in T.serial(lane, _SMFP8_APPLY_TOPK, step=_SMFP8_APPLY_THREADS):
+                local[0] = local[0] + scores[k_top]
+            reduce_buf[lane] = local[0]
+            T.sync_threads()
+            for round_id in T.serial(_SMFP8_APPLY_LOG_THREADS):
+                stride[0] = T.shift_right(_SMFP8_APPLY_THREADS, round_id + 1)
+                if lane < stride[0]:
+                    reduce_buf[lane] = reduce_buf[lane] + reduce_buf[lane + stride[0]]
+                T.sync_threads()
+            sumexp = reduce_buf[0]
+
+            inv_sum[0] = 0.0
+            if sumexp > 0.0:
+                inv_sum[0] = 1.0 / sumexp
+
+            for d in T.serial(lane, _SMFP8_APPLY_DV, step=_SMFP8_APPLY_THREADS):
+                acc[0] = 0.0
+                for k_top in T.serial(_SMFP8_APPLY_TOPK):
+                    gather_idx[0] = indices[idx_base + k_top]
+                    if gather_idx[0] >= 0 and gather_idx[0] < _SMFP8_APPLY_SKV:
+                        kv_row_base = kv_b_base + (gather_idx[0] * _SMFP8_APPLY_G + gidx) * _SMFP8_APPLY_K
+                        kv_scale_idx = kv_scale_b_base + gather_idx[0] * _SMFP8_APPLY_G + gidx
+                        acc[0] = acc[0] + scores[k_top] * T.cast(
+                            kv_fp8[kv_row_base + d],
+                            "float32",
+                        ) * kv_scale[kv_scale_idx]
+                out[out_row + d] = T.cast(acc[0] * inv_sum[0], "float16")
+
+            if lane == 0:
+                if sumexp > 0.0:
+                    lse[bx] = row_max + T.log(sumexp)
+                else:
+                    lse[bx] = 0.0
+
+    try:
+        from tilelang.transform.simplify import apply_simplify
+
+        return apply_simplify(fp8_sparse_mla_apply_kernel)
+    except Exception:
+        return fp8_sparse_mla_apply_kernel
+
+
+@lru_cache(maxsize=128)
+def _fp8_apply_kernel_for(
+    batch: int,
+    seq_len: int,
+    heads: int,
+    seq_len_kv: int,
+    kv_group: int,
+    head_kv: int,
+    topk: int,
+    K: int,
+    d_v: int,
+    threads: int,
+) -> tuple[Any, _msl_transform.TileLangMSLLowering, list[str]]:
+    prim = _make_fp8_sparse_mla_apply_kernel(
+        batch=batch,
+        seq_len=seq_len,
+        heads=heads,
+        seq_len_kv=seq_len_kv,
+        kv_group=kv_group,
+        head_kv=head_kv,
+        topk=topk,
+        K=K,
+        d_v=d_v,
+        threads=threads,
+    )
+    lowering = lower_tilelang_to_msl_inline(prim)
+    input_names = [name for name in lowering.buffer_param_names if name not in {"out", "lse"}]
+    if set(input_names) != {"q_fp8", "q_scale", "kv_fp8", "kv_scale", "indices", "sm_scale_buf"}:
+        raise MSLDispatchUnsupported(
+            "unexpected TileLang FP8 apply buffer signature: "
+            + ", ".join(lowering.buffer_param_names)
+        )
+    kernel = mx.fast.metal_kernel(
+        name=(
+            "cppmega_sparse_mla_fp8_apply_path_c_"
+            f"{batch}_{seq_len}_{heads}_{seq_len_kv}_{kv_group}_{topk}_{K}_{d_v}_{threads}"
+        ),
+        input_names=input_names,
+        output_names=["out", "lse"],
+        source=lowering.body,
+        header=lowering.header,
+        ensure_row_contiguous=True,
+    )
+    return kernel, lowering, input_names
+
+
+def sparse_mla_fp8_path_c_apply(
+    q_fp8: mx.array,
+    q_scale: mx.array,
+    kv_fp8: mx.array,
+    kv_scale: mx.array,
+    indices: mx.array,
+    *,
+    sm_scale: float,
+    d_v: int | None = None,
+    return_lse: bool = False,
+    force_path_c: bool = False,
+) -> mx.array | tuple[mx.array, mx.array] | None:
+    """Run fused FP8 Sparse-MLA Path C over prepared GPU buffers.
+
+    The function consumes existing FP8/scales buffers directly. It deliberately
+    does not quantize float tensors, cast scales, pre-gather KV, or materialize
+    a score tensor in Python.
+    """
+
+    if not can_run_metal():
+        if force_path_c:
+            raise RuntimeError("sparse_mla_fp8_path_c_apply: MLX Metal backend is unavailable")
+        return None
+    (
+        batch,
+        seq_len,
+        heads,
+        seq_len_kv,
+        kv_group,
+        head_kv,
+        topk,
+        K,
+        d_v_resolved,
+        threads,
+    ) = _validate_fp8_apply_inputs(
+        q_fp8,
+        q_scale,
+        kv_fp8,
+        kv_scale,
+        indices,
+        d_v=d_v,
+    )
+    try:
+        kernel, lowering, input_names = _fp8_apply_kernel_for(
+            batch,
+            seq_len,
+            heads,
+            seq_len_kv,
+            kv_group,
+            head_kv,
+            topk,
+            K,
+            d_v_resolved,
+            threads,
+        )
+    except Exception as exc:
+        if force_path_c:
+            raise RuntimeError(f"sparse_mla_fp8_path_c_apply: Path C lowering failed: {exc}") from exc
+        return None
+
+    sm_scale_buf = mx.array([float(sm_scale)], dtype=mx.float32)
+    input_map = {
+        "q_fp8": q_fp8,
+        "q_scale": q_scale,
+        "kv_fp8": kv_fp8,
+        "kv_scale": kv_scale,
+        "indices": indices,
+        "sm_scale_buf": sm_scale_buf,
+    }
+    outputs = _msl_transform.dispatch(
+        cast(_msl_transform.MetalKernel, kernel),
+        inputs=[input_map[name] for name in input_names],
+        output_shapes=[
+            (batch, seq_len, heads, d_v_resolved),
+            (batch, seq_len, heads),
+        ],
+        output_dtypes=[mx.float16, mx.float32],
+        lowering=lowering,
+    )
+    out, lse = outputs
+    if return_lse:
+        return out, lse
+    return out
 
 
 def fp8_sparse_mla_qk_reduce_path_c_status(
@@ -1764,4 +2133,5 @@ __all__ = [
     "make_fp8_sparse_mla_indexed_qk_reduce_kernel",
     "make_fp8_sparse_mla_qk_reduce_kernel",
     "make_fp8_sparse_mla_qk_kernel",
+    "sparse_mla_fp8_path_c_apply",
 ]

@@ -115,7 +115,7 @@ def frontend_available() -> bool:
         sys.path.insert(0, root_str)
     try:
         import poc.triton_frontend  # noqa: F401
-    except ImportError as exc:
+    except (ImportError, OSError) as exc:
         warnings.warn(
             "cppmega_mlx._triton_bridge: poc.triton_frontend import failed "
             f"(root={root_str!r}, error={exc!r}). Bridge is unavailable.",

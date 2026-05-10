@@ -103,8 +103,8 @@ def test_tilelang_imports_resolve_to_local_tree_and_pinned_ffi() -> None:
 
     assert tilelang_path.is_relative_to(tilelang_root)
     assert tvm_path.is_relative_to(tilelang_root / "3rdparty" / "tvm" / "python")
-    assert getattr(tvm_ffi, "__version__", None) == "0.1.11rc2"
-    assert importlib_metadata.version("apache-tvm-ffi") == "0.1.11rc2"
+    assert getattr(tvm_ffi, "__version__", None) == "0.1.12.dev0+g3c35034fd.d20260509"
+    assert importlib_metadata.version("apache-tvm-ffi") == "0.1.12.dev0+g3c35034fd.d20260509"
 
 
 def test_topk_strict_requires_both_paths_and_ratio_no_worse() -> None:

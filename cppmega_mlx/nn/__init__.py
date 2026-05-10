@@ -1,6 +1,15 @@
 """MLX neural-network building blocks."""
 
-from cppmega_mlx.nn.attention import AttentionConfig, AttentionRouteInfo, CausalSelfAttention
+from importlib import import_module
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from cppmega_mlx.nn.attention import (
+        AttentionConfig as AttentionConfig,
+        AttentionRouteInfo as AttentionRouteInfo,
+        CausalSelfAttention as CausalSelfAttention,
+    )
+
 from cppmega_mlx.nn.engram import (
     CppMegaEngramBranch,
     EngramBranch,
@@ -57,6 +66,14 @@ from cppmega_mlx.nn.structure_embedding import (
     StructureEmbedding,
 )
 
+_ATTENTION_EXPORTS = frozenset(
+    {
+        "AttentionConfig",
+        "AttentionRouteInfo",
+        "CausalSelfAttention",
+    }
+)
+
 __all__ = [
     "AttentionConfig",
     "AttentionRouteInfo",
@@ -101,3 +118,16 @@ __all__ = [
     "sparse_mla_attention",
     "sparse_mla_attention_reference",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    if name in _ATTENTION_EXPORTS:
+        module = import_module("cppmega_mlx.nn.attention")
+        for export in _ATTENTION_EXPORTS:
+            globals()[export] = getattr(module, export)
+        return globals()[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))

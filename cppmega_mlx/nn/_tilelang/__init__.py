@@ -37,16 +37,14 @@ Public Path C surface — what is *exported here* vs what only lives in submodul
   kernels, ``_status``, and lowering dumps. The ``sparse_mla_path_c_apply``
   user wrapper is **intentionally not re-exported** — callers go through the
   AUTO gate in ``sparse_mla_apply``. ``test_package_exports`` enforces this.
-- ``sparse_mla_blockscaled_path_c.py`` (PROBE-ONLY): exports only the E8M0 QK
-  probe / real-shape QK reducer surfaces (``..._reduce_path_c`` is a reducer
-  apply, not a full attention apply). There is no
-  ``sparse_mla_blockscaled_path_c_apply`` because the file is a
-  lowering/status surface — see its module docstring.
-- ``sparse_mla_fp8_path_c.py`` (REDUCERS-ONLY): not imported here at all.
-  Tests reach the QK / indexed-QK reducer surfaces via the submodule path.
-  Currently broken at runtime — ``tirx.metal.fp8_e4m3_dot4`` not registered.
-  See ``docs/production_kernel_routing.md`` and
-  ``reports/2026-05-06-tilelang-tvm-review/agent-D-planning-vs-reality/``.
+- ``sparse_mla_blockscaled_path_c.py`` (prepared-buffer apply): the submodule
+  exposes E8M0 QK probes/reducers and ``sparse_mla_blockscaled_path_c_apply``
+  for existing FP8/scales buffers. It is **not** a high-level float-tensor
+  wrapper and is intentionally not re-exported here.
+- ``sparse_mla_fp8_path_c.py`` (prepared-buffer apply): not imported here.
+  Tests reach QK reducers and ``sparse_mla_fp8_path_c_apply`` via the
+  submodule path. The apply consumes prepared FP8/scales buffers; high-level
+  float carriers still route through Path B or the graph planner.
 - ``fp8_vecmat_path_c.py`` (full apply lives in submodule):
   ``fp8_scaled_vecmat_path_c`` exists in code but is **not** exported here.
   Only the status/feature/lowering helpers are re-exported. Callers must
@@ -152,9 +150,29 @@ from cppmega_mlx.nn._tilelang.topk_selector import (
 )
 from cppmega_mlx.nn._tilelang.topk_selector import topk_selector as topk_selector_fn
 
-# PROBE-ONLY / REDUCERS-ONLY surface — re-exported via _experimental for organization
-from cppmega_mlx.nn._tilelang import _experimental
-from cppmega_mlx.nn._tilelang._experimental import *  # noqa: F401,F403
+# Experimental status/lowering helpers — re-exported via _experimental for organization.
+from cppmega_mlx.nn._tilelang._experimental import (
+    E8M0_BLOCK_SIZE,
+    E8M0_LAYOUT,
+    E8M0_SCALE_FORMAT,
+    FP8VecmatPathCStatus,
+    SparseMLABlockScaledPathCStatus,
+    SparseMLABlockScaledQKReducePathCStatus,
+    blockscaled_sparse_mla_qk_msl_features,
+    blockscaled_sparse_mla_qk_path_c_status,
+    blockscaled_sparse_mla_qk_reduce_msl_features,
+    blockscaled_sparse_mla_qk_reduce_path_c,
+    blockscaled_sparse_mla_qk_reduce_path_c_status,
+    blockscaled_sparse_mla_qk_scaled_matmul_probe_status,
+    fp8_vecmat_msl_features,
+    fp8_vecmat_path_c_status,
+    lower_blockscaled_sparse_mla_qk_msl,
+    lower_blockscaled_sparse_mla_qk_reduce_msl,
+    lower_fp8_vecmat_msl,
+    make_blockscaled_sparse_mla_qk_kernel,
+    make_blockscaled_sparse_mla_qk_reduce_kernel,
+    make_fp8_vecmat_reduce_kernel,
+)
 
 __all__ = [
     "dispatch_lower",

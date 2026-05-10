@@ -38,9 +38,9 @@ This document is the authoritative source for **which kernel implementation each
       <code>cppmega_mlx/nn/_tilelang/sparse_mla_path_c.py</code> (full apply)<br>
       <code>cppmega_mlx/nn/_tilelang/topk_selector.py</code> (backend="auto")<br>
       <code>cppmega_mlx/nn/_tilelang/sparse_mla_blockscaled_path_c.py</code>
-      (PROBE-ONLY; E8M0 QK reducer, no full apply)<br>
+      (prepared-buffer full apply + E8M0 QK reducer)<br>
       <code>cppmega_mlx/nn/_tilelang/sparse_mla_fp8_path_c.py</code>
-      (REDUCERS-ONLY; QK + indexed-QK reducers, no full apply)<br>
+      (prepared-buffer full apply + QK/indexed-QK reducers)<br>
       <code>cppmega_mlx/nn/_tilelang/fp8_vecmat_path_c.py</code>
       (full apply <code>fp8_scaled_vecmat_path_c</code>; <strong>broken at runtime</strong>
       until <code>tirx.metal.fp8_e4m3_dot4</code> is registered in TileLang/TVM
@@ -157,36 +157,24 @@ Default behavior on Apple Silicon is in the **"Production"** column. Override vi
       <td><strong>Sparse-MLA fwd FP8</strong></td>
       <td><strong>B</strong> — <code>cppmega_mlx.nn._tilelang.sparse_mla_fp8_apply</code></td>
       <td><code>sparse_mla_fp8_reference</code></td>
-      <td><strong>REDUCERS-ONLY (no apply)</strong> — Path C exposes only QK-reduce
-      and indexed-QK-reduce surfaces (<code>fp8_sparse_mla_qk_reduce_path_c</code>
-      and <code>fp8_sparse_mla_indexed_qk_reduce_path_c</code> in
-      <code>sparse_mla_fp8_path_c.py:826</code>). There is no
-      <code>sparse_mla_fp8_path_c_apply</code> — full Path C QK is unavailable
-      and the full-dispatch gate is red. Bench partial reducers C/B 0.864 and
-      indexed C/B 0.696.<br>
-      <strong>BROKEN at runtime:</strong> the FP8 e4m3 dot4 intrinsic
-      (<code>tirx.metal.fp8_e4m3_dot4</code>) is not registered in the in-tree
-      TileLang/TVM build — see agent-D report
-      <code>reports/2026-05-06-tilelang-tvm-review/agent-D-planning-vs-reality/grok__design__20260506T171408.md</code>
-      finding #1. Until the intrinsic lands the FP8 reducers are non-dispatchable
-      and Path B is the only callable surface.</td>
+      <td><strong>Prepared-buffer Path C apply.</strong>
+      <code>sparse_mla_fp8_path_c_apply</code> consumes existing
+      <code>q_fp8/q_scale/kv_fp8/kv_scale</code> GPU buffers and performs QK,
+      softmax, and SV in one lowered kernel. It is not a high-level
+      float-carrier wrapper; float inputs still route through Path B or a
+      graph-level FP8 producer.</td>
       <td>FP8 path is software-emulated via uchar storage<br>+ LUT decode (Apple Silicon has no native FP8 ALU).</td>
     </tr>
     <tr>
       <td><strong>Sparse-MLA fwd<br>blockscaled (e8m0)</strong></td>
       <td><strong>B</strong> — <code>sparse_mla_blockscaled_apply</code></td>
       <td><code>sparse_mla_blockscaled_reference</code></td>
-      <td><strong>PROBE-ONLY (E8M0 QK)</strong> —
-      <code>sparse_mla_blockscaled_path_c.py:25</code> exposes only the E8M0 QK
-      probe and a real-shape QK reducer
-      (<code>blockscaled_sparse_mla_qk_reduce_path_c</code>). There is no public
-      <code>sparse_mla_blockscaled_path_c_apply</code>; the file's own docstring
-      states it is "intentionally a lowering/status surface, not a production
-      Sparse-MLA forward" (<code>sparse_mla_blockscaled_path_c.py:1-23</code>).
-      Earlier revisions of this routing doc advertised "Path C available" for
-      this op — that claim is retracted. The QK reducer parity/timing receipt
-      stands (C/B 0.4364) but the full-dispatch gate stays red and there is no
-      end-to-end Path C attention path.</td>
+      <td><strong>Prepared-buffer Path C apply.</strong>
+      <code>sparse_mla_blockscaled_path_c_apply</code> consumes existing FP8
+      byte tensors and E8M0 K/32 scale tensors, then performs QK, softmax, and
+      SV in one lowered kernel. It is not a high-level float-carrier wrapper;
+      Path B still owns MXFP8 quantization/unpacking unless the graph creates
+      those buffers directly.</td>
       <td>mxfp8 block-scale is a software emulation;<br>Path B handles the 16-element scale tile bookkeeping.</td>
     </tr>
     <tr>
@@ -358,11 +346,8 @@ The dispatch decision is recorded in a process-wide ring buffer (last 256 record
       <td>Sparse-MLA FP8 indexed QK reduce</td>
       <td>n/a</td>
       <td>Path B fwd</td>
-      <td><strong>REDUCERS-ONLY (no apply).</strong> Path C partial reducers
-      C/B 0.864 and 0.696; full QK unavailable and full-dispatch gate red.
-      Currently <strong>broken at runtime</strong> — <code>tirx.metal.fp8_e4m3_dot4</code>
-      not registered in local TileLang/TVM build (agent-D report
-      <code>grok__design__20260506T171408.md</code> finding #1).</td>
+      <td>Reducer remains available for direct QK tests; full prepared-buffer
+      apply is covered separately by <code>sparse_mla_fp8_path_c_apply</code>.</td>
       <td>—</td>
       <td>partial only</td>
     </tr>
@@ -370,10 +355,9 @@ The dispatch decision is recorded in a process-wide ring buffer (last 256 record
       <td>Sparse-MLA blockscaled e8m0 QK reduce</td>
       <td>n/a</td>
       <td>Path B blockscaled fwd</td>
-      <td><strong>PROBE-ONLY (E8M0 QK).</strong> Path C partial reducer C/B 0.4364;
-      full QK unavailable and full-dispatch gate red. No
-      <code>sparse_mla_blockscaled_path_c_apply</code> exists — file is a
-      lowering/status surface only.</td>
+      <td>Reducer remains available for direct QK tests; full prepared-buffer
+      apply is covered separately by
+      <code>sparse_mla_blockscaled_path_c_apply</code>.</td>
       <td>—</td>
       <td>partial only</td>
     </tr>

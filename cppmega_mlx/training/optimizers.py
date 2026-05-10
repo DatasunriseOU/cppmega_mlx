@@ -13,14 +13,11 @@ from mlx.utils import tree_flatten, tree_merge, tree_unflatten
 
 from cppmega_mlx.training._quantize_8bit import (
     DEFAULT_BLOCK_SIZE as MUON_QUANTIZED_MOMENTUM_BLOCK_SIZE,
-    QUANT_SCHEME_DYNAMIC,
     QUANT_SCHEME_SYMMETRIC,
     QUANT_SCHEMES,
     dequantize_blockwise,
-    dequantize_dynamic_blockwise,
     num_blocks as _quant_num_blocks,
     quantize_blockwise,
-    quantize_dynamic_blockwise,
 )
 from cppmega_mlx.training.optimizers_quantized import (
     ADAM8BIT_CLASS,
@@ -626,6 +623,7 @@ def make_muon(
     quantize_momentum: bool = False,
     quantize_momentum_scheme: MuonQuantScheme = QUANT_SCHEME_SYMMETRIC,
     adam8bit_quant_scheme: Adam8bitQuantScheme = QUANT_SCHEME_SYMMETRIC,
+    adam8bit_min_8bit_size: int = 0,
     lion8bit_quant_scheme: Lion8bitQuantScheme = QUANT_SCHEME_SYMMETRIC,
 ) -> MuonAdamWMulti:
     """Construct a Muon + AdamW chained optimizer with cppmega CUDA-style routing.
@@ -673,7 +671,10 @@ def make_muon(
     ``adam8bit_quant_scheme`` does the same for the Adam8bit scalar group
     when ``scalar_optimizer="adam8bit"``. ``lion8bit_quant_scheme`` does the
     same for the Lion8bit scalar group when ``scalar_optimizer="lion8bit"``.
-    All three default to symmetric for backwards compatibility.
+    ``adam8bit_min_8bit_size`` keeps tensors smaller than that threshold in
+    fp32 Adam state, mirroring bitsandbytes' stability escape hatch for norms
+    and biases when production callers opt in. The quantized schemes default
+    to symmetric for backwards compatibility.
     """
 
     ns_carrier = _normalize_muon_ns_carrier(
@@ -728,6 +729,7 @@ def make_muon(
             betas=list(betas_adamw),
             eps=eps,
             quant_scheme=adam8bit_quant_scheme,
+            min_8bit_size=adam8bit_min_8bit_size,
         )
     elif scalar_optimizer == "lion":
         # Lion ignores eps; betas are Lion's (b1, b2) per Chen et al. The

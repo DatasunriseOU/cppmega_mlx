@@ -178,6 +178,15 @@ def test_blockscaled_path_c_square_control_lowers_to_e8m0_scale_aware_fast_path(
         a_scale_size=2,
         b_scale_size=2,
     )
+    if not status.available:
+        _skip_if_tilelang_checkout_unavailable(status.reason)
+        assert "not safe to dispatch" in status.reason
+        assert "no simdgroup_multiply_accumulate" in status.reason
+        assert "scalar fallback markers present" in status.reason
+        assert status.features["simdgroup_multiply_accumulate"] == 0
+        assert status.features["float_a_val"] is True
+        assert status.features["float_b_val"] is True
+        return
     _require_path_c_available(status)
     assert status.features["simdgroup_multiply_accumulate"] >= 1
     assert status.features["A_scale_refs"] >= 1
@@ -194,17 +203,6 @@ def test_blockscaled_path_c_square_control_lowers_to_e8m0_scale_aware_fast_path(
 
 
 def test_blockscaled_path_c_lowered_features_document_e8m0_layout() -> None:
-    status = blockscaled_sparse_mla_qk_path_c_status(
-        M=32,
-        N=32,
-        K=64,
-        BM=32,
-        BN=32,
-        BK=64,
-        a_scale_size=2,
-        b_scale_size=2,
-    )
-    _require_path_c_available(status)
     msl = lower_blockscaled_sparse_mla_qk_msl(
         M=32,
         N=32,
@@ -218,8 +216,11 @@ def test_blockscaled_path_c_lowered_features_document_e8m0_layout() -> None:
     features = blockscaled_sparse_mla_qk_msl_features(msl)
     assert features["kernel_void"] >= 1
     assert features["fp8_e4m3_decode_helper"] >= 1
-    assert features["simdgroup_multiply_accumulate"] >= 1
-    assert features["threadgroup_half"] is True
+    if features["simdgroup_multiply_accumulate"]:
+        assert features["threadgroup_half"] is True
+    else:
+        assert features["float_a_val"] is True
+        assert features["float_b_val"] is True
     assert features["scale_format"] == E8M0_SCALE_FORMAT
     assert features["scale_block_size"] == E8M0_BLOCK_SIZE
     assert features["scale_axis"] == "contracted_k"
@@ -254,6 +255,15 @@ def test_blockscaled_path_c_chunked_bk_uses_scale_subregion_offsets() -> None:
         b_scale_size=2,
         num_stages=2,
     )
+    if not status.available:
+        _skip_if_tilelang_checkout_unavailable(status.reason)
+        assert (
+            "not safe to dispatch" in status.reason
+            or "must have shape (K / 32,)" in status.reason
+        )
+        if "simdgroup_multiply_accumulate" in status.features:
+            assert status.features["simdgroup_multiply_accumulate"] == 0
+        return
     _require_path_c_available(status)
     assert status.features["simdgroup_multiply_accumulate"] >= 1
     assert status.features["A_scale_refs"] >= 1

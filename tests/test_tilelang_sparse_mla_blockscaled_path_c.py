@@ -1,27 +1,11 @@
-"""Coverage for the Path C TileLang DSL Sparse-MLA blockscaled (E8M0) port.
-
-Per the Path B/C routing audit, ``sparse_mla_blockscaled_path_c`` does *not*
-yet expose a public ``apply``-shaped end-to-end entry point: only the QK probe
-and the partial reducer are dispatchable. The routing doc refers to
-"Path C partial reducer C/B 0.4364 / full QK unavailable", and Meta agent F's
-design report (``reports/2026-05-06-tilelang-tvm-review/agent-F-path-b-vs-c/``)
-captures this as a gap, not a bug.
-
-This test file therefore:
-
-  * pins the public surface that exists today (status probes + reducer +
-    QK lowering + MSL feature inspection) so a silent removal would fail CI;
-  * uses ``xfail(strict=True)`` -- not plain ``skip`` -- for the missing
-    public ``sparse_mla_blockscaled_path_c_apply`` so the test will start
-    catching real divergence the moment that apply lands. (Memory rule:
-    prefer ``importorskip``/``xfail(strict=True)`` to plain ``skip``.)
-"""
+"""Coverage for the Path C TileLang DSL Sparse-MLA blockscaled (E8M0) port."""
 
 # pyright: reportMissingImports=false
 
 from __future__ import annotations
 
 import pytest
+import numpy as np
 
 import mlx.core as mx
 
@@ -38,6 +22,12 @@ from cppmega_mlx.nn._tilelang.sparse_mla_blockscaled_path_c import (
     blockscaled_sparse_mla_qk_scaled_matmul_probe_status,
     lower_blockscaled_sparse_mla_qk_msl,
     lower_blockscaled_sparse_mla_qk_reduce_msl,
+    sparse_mla_blockscaled_path_c_apply,
+)
+from cppmega_mlx.nn._tilelang.sparse_mla_blockscaled import (
+    _quantize_mxfp8,
+    _unpack_mxfp8_to_uint8,
+    sparse_mla_blockscaled_fwd_metal,
 )
 
 
@@ -170,29 +160,40 @@ def test_qk_reduce_path_c_returns_none_when_metal_missing_or_correct_shape() -> 
     assert out.dtype == mx.float32
 
 
-# ---------------------------------------------------------------------------
-# Future numeric-parity placeholder.
-#
-# Path C does not yet expose a public ``sparse_mla_blockscaled_path_c_apply``;
-# Meta-F flagged this as the routing gap. The day Fix-2 lands the apply, this
-# xfail flips to PASS and we get real numeric coverage instead of a quiet
-# skip. ``strict=True`` makes the flip a CI signal, not a silent change.
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "sparse_mla_blockscaled_path_c has no public apply yet -- only QK "
-        "probe + partial reducer are exposed. See routing doc / Meta agent F."
-    ),
-)
 def test_blockscaled_path_c_apply_matches_path_b() -> None:
-    """When the path_c apply lands, this test must turn green automatically."""
+    if not _metal_available():
+        pytest.skip("Metal backend not available on this host")
 
-    from cppmega_mlx.nn._tilelang import sparse_mla_blockscaled_path_c as path_c_mod
+    rng = np.random.RandomState(12)
+    batch, seq, heads, kv_group, seq_kv, topk, dim = 1, 2, 2, 1, 8, 4, 64
+    q = mx.array((rng.standard_normal((batch, seq, heads, dim)) * 0.1).astype(np.float16))
+    kv = mx.array((rng.standard_normal((batch, seq_kv, kv_group, dim)) * 0.1).astype(np.float16))
+    indices = mx.array(rng.randint(0, seq_kv, size=(batch, seq, kv_group, topk)).astype(np.int32))
+    sm_scale = dim ** -0.5
 
-    apply_fn = getattr(path_c_mod, "sparse_mla_blockscaled_path_c_apply", None)
-    assert apply_fn is not None, (
-        "sparse_mla_blockscaled_path_c_apply not yet exposed by the path_c module"
+    q_packed, q_scales = _quantize_mxfp8(q)
+    kv_packed, kv_scales = _quantize_mxfp8(kv)
+    q_fp8 = _unpack_mxfp8_to_uint8(q_packed, dim)
+    kv_fp8 = _unpack_mxfp8_to_uint8(kv_packed, dim)
+
+    path_b = sparse_mla_blockscaled_fwd_metal(q, kv, indices, sm_scale=sm_scale, d_v=dim)
+    if path_b is None:
+        pytest.skip("Path B blockscaled Metal unavailable on this host")
+    out_b, _lse_b = path_b
+    out_c = sparse_mla_blockscaled_path_c_apply(
+        q_fp8,
+        q_scales,
+        kv_fp8,
+        kv_scales,
+        indices,
+        sm_scale=sm_scale,
+        d_v=dim,
+        force_path_c=True,
+    )
+    assert out_c is not None
+    np.testing.assert_allclose(
+        np.asarray(out_c.astype(mx.float32)),
+        np.asarray(out_b.astype(mx.float32)),
+        atol=2e-2,
+        rtol=5e-2,
     )

@@ -390,6 +390,42 @@ def test_next_token_cut_cross_entropy_matches_hybrid_tiny_ce() -> None:
     assert math.isclose(_scalar(cce_loss), _scalar(ce_loss), abs_tol=1e-5)
 
 
+def test_next_token_cut_cross_entropy_uses_hybrid_decoder_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CCE must use HybridTinyLM's decoder path, including grad checkpointing."""
+
+    mx.random.seed(13)
+    model = HybridTinyLM(
+        HybridTinyConfig(
+            vocab_size=16,
+            hidden_size=8,
+            max_seq_length=6,
+            pattern="A",
+            depth=1,
+            num_attention_heads=1,
+            grad_checkpoint=True,
+        )
+    )
+    checkpointed_layers: list[object] = []
+
+    def checkpoint_spy(fn):
+        checkpointed_layers.append(fn)
+
+        def wrapped(*args, **kwargs):
+            return fn(*args, **kwargs)
+
+        return wrapped
+
+    monkeypatch.setattr(mx, "checkpoint", checkpoint_spy)
+    loss, ntokens = next_token_cut_cross_entropy(model, _hybrid_tiny_batch(), chunk_rows=2)
+    mx.eval(loss, ntokens)
+
+    assert checkpointed_layers == list(model.layers)
+    assert math.isfinite(_scalar(loss))
+    assert _scalar(ntokens) > 0
+
+
 def test_next_token_cut_cross_entropy_works_under_value_and_grad() -> None:
     """CompiledPretrainingStep-style MLX autograd can consume the CCE loss."""
 

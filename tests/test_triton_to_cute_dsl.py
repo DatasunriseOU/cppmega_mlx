@@ -249,6 +249,43 @@ def test_chain_module_surface() -> None:
     assert "1421" in (chain_mod.__doc__ or "")
 
 
+def test_frontend_available_handles_frontend_dylib_load_failure(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """POC frontend availability checks must not leak native import errors."""
+
+    bridge_mod = _load_module_by_path(
+        "cppmega_mlx.nn._triton_bridge",
+        "cppmega_mlx/nn/_triton_bridge.py",
+    )
+    frontend_pkg = tmp_path / "poc" / "triton_frontend"
+    frontend_pkg.mkdir(parents=True)
+    (tmp_path / "poc" / "__init__.py").write_text("")
+    (frontend_pkg / "__init__.py").write_text(
+        "raise OSError('fake dylib load failure')\n"
+    )
+
+    monkeypatch.setenv(bridge_mod.TRITON_FRONTEND_PATH_ENV, str(tmp_path))
+    old_path = list(sys.path)
+    old_poc_modules = {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "poc" or name.startswith("poc.")
+    }
+    for name in old_poc_modules:
+        sys.modules.pop(name, None)
+
+    try:
+        with pytest.warns(UserWarning, match="poc.triton_frontend import failed"):
+            assert bridge_mod.frontend_available() is False
+    finally:
+        sys.path[:] = old_path
+        for name in list(sys.modules):
+            if name == "poc" or name.startswith("poc."):
+                sys.modules.pop(name, None)
+        sys.modules.update(old_poc_modules)
+
+
 def test_triton_kernel_lowers_to_cute_dsl_source() -> None:
     """End-to-end: tiny @triton.jit -> non-empty CuTeDSL Python source.
 

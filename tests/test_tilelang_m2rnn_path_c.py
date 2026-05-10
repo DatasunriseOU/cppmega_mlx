@@ -1,23 +1,4 @@
-"""Coverage for the (currently missing) Path C TileLang DSL m2rnn port.
-
-The routing doc references an m2rnn Path C variant, but no
-``cppmega_mlx/nn/_tilelang/m2rnn_path_c.py`` exists yet -- and the bench
-script ``scripts/bench_tilelang_m2rnn`` is also absent. This file pins the
-*shape* of that future module so the day it lands we get parity coverage
-without anyone needing to remember to author tests.
-
-Strategy:
-
-  * If ``cppmega_mlx.nn._tilelang.m2rnn_path_c`` does not import yet, we
-    ``xfail(strict=True)`` -- not plain ``skip`` -- so the test will flip
-    to PASS the moment the module lands, surfacing the change to CI.
-  * If it does import, we run a small forward-parity smoke test against
-    the existing Path B ``m2rnn_apply``. The shape is intentionally tiny
-    so the test stays fast on Metal hardware.
-
-Tolerance follows the cppmega.mlx convention from
-``tests/test_tilelang_mamba3_path_c.py``: atol=1e-4 / rtol=1e-3 on fp32.
-"""
+"""Coverage for the Path C TileLang DSL m2rnn forward surface."""
 
 # pyright: reportMissingImports=false
 
@@ -61,28 +42,9 @@ def _make_m2rnn_inputs(
     return q, k, v, W, xf, h0
 
 
-# ---------------------------------------------------------------------------
-# Path C module presence guard.
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "cppmega_mlx.nn._tilelang.m2rnn_path_c does not exist yet. When the "
-        "Path C m2rnn lands (kernel + bench script), this test flips to PASS "
-        "and the parity smoke test below starts gating regressions."
-    ),
-)
 def test_m2rnn_path_c_module_imports() -> None:
-    """Trip-wire: passes the moment the path_c module lands."""
-
-    importlib.import_module("cppmega_mlx.nn._tilelang.m2rnn_path_c")
-
-
-# ---------------------------------------------------------------------------
-# Forward-parity smoke (gated on the path_c module's existence).
-# ---------------------------------------------------------------------------
+    module = importlib.import_module("cppmega_mlx.nn._tilelang.m2rnn_path_c")
+    assert hasattr(module, "m2rnn_apply_path_c")
 
 
 def _try_import_m2rnn_path_c():  # type: ignore[no-untyped-def]
@@ -110,6 +72,6 @@ def test_m2rnn_path_c_forward_matches_path_b_when_available() -> None:
         pytest.skip("m2rnn Metal Path B is not available on this host")
 
     inputs = _make_m2rnn_inputs(dtype=mx.float32)
-    y_pc = apply_path_c(*inputs)
+    y_pc = apply_path_c(*inputs, force_path_c=True)
     y_pb = m2rnn_apply(*inputs)
     np.testing.assert_allclose(_np(y_pc), _np(y_pb), rtol=1e-3, atol=1e-4)

@@ -927,16 +927,13 @@ def sparse_mla_blockscaled_apply(
 ) -> mx.array | Tuple[mx.array, mx.array]:
     """Apply block-scaled FP8 sparse MLA, preferring Path B.
 
-    Note (Path C status — PROBE-ONLY):
-        There is intentionally no ``sparse_mla_blockscaled_path_c_apply``
-        counterpart. ``sparse_mla_blockscaled_path_c.py`` is a lowering /
-        status surface — it exposes only the E8M0 QK probe and a real-shape
-        QK reducer (``blockscaled_sparse_mla_qk_reduce_path_c``), not an
-        end-to-end attention apply. Path B is the only callable surface for
-        the full block-scaled forward today. Therefore there is no
-        ``force_metal``/``force_path_c`` kwarg rename to worry about for this
-        op — but the routing doc keeps the row in the table for honesty
-        rather than pruning it. See ``docs/production_kernel_routing.md``.
+    Note (Path C prepared-buffer status):
+        ``sparse_mla_blockscaled_path_c.py`` exposes a prepared-buffer
+        ``sparse_mla_blockscaled_path_c_apply`` for existing FP8 byte tensors
+        and E8M0 scale tensors. This high-level Path B wrapper keeps
+        ``force_metal`` and owns MXFP8 quantization/unpacking; it does not
+        proxy through Path C because that would hide large staging copies in
+        an adapter.
     """
 
     shapes = _resolve_shapes(q, kv, indices, d_v=d_v)

@@ -158,7 +158,7 @@ through `tilelang.compile`.
 
 Smoke output on M4 Max, `warmup=10`, `iters=50`, Python `3.13.12`,
 `mlx 0.31.1`, `mlx-metal 0.31.1`, `tilelang 0.1.9+gita69d6df7`,
-`apache-tvm-ffi 0.1.11rc2`, `numpy 2.4.4`:
+`apache-tvm-ffi 0.1.12.dev0+g3c35034fd.d20260509`, `numpy 2.4.4`:
 
 ```text
 B    T       k      dtype      argpart_ms    argsort_ms    fused_ms      path_b_ms     path_c_ms     C/B

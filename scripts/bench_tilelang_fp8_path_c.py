@@ -25,6 +25,7 @@ import tempfile
 import threading
 import time
 import traceback
+import inspect
 from dataclasses import asdict, dataclass, field
 from importlib import import_module
 from pathlib import Path
@@ -838,6 +839,35 @@ def _bench_paired_callables(
     )
 
 
+def _bench_paired_callables_with_optional_tokens_per_call(
+    strategies: tuple[tuple[str, Callable[[], Any]], ...],
+    sync: Callable[[], None],
+    *,
+    flops: float,
+    warmup: int,
+    iters: int,
+    tokens_per_call: float | None,
+) -> PairedBenchResult:
+    """Call the paired bench helper across old and new test-double signatures."""
+
+    kwargs: dict[str, Any] = {
+        "flops": flops,
+        "warmup": warmup,
+        "iters": iters,
+    }
+    try:
+        params = inspect.signature(_bench_paired_callables).parameters
+    except (TypeError, ValueError):
+        params = {}
+    accepts_tokens = (
+        "tokens_per_call" in params
+        or any(param.kind is inspect.Parameter.VAR_KEYWORD for param in params.values())
+    )
+    if accepts_tokens:
+        kwargs["tokens_per_call"] = tokens_per_call
+    return _bench_paired_callables(strategies, sync, **kwargs)
+
+
 def _run_cmd(cmd: list[str], *, cwd: Path) -> dict[str, Any]:
     try:
         res = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=30)
@@ -1158,12 +1188,15 @@ def _make_path_c_scaled_matmul_runner(
     last_ref: list[torch.Tensor | None],
 ) -> Callable[[], None]:
     c_out = inputs["c_out_mps"]
+    b_fp8 = inputs.get("b_t_fp8_mps", inputs.get("b_fp8_mps"))
+    if b_fp8 is None:
+        raise KeyError("expected b_t_fp8_mps or b_fp8_mps in FP8 matmul inputs")
 
     def run() -> None:
         compiled(
             inputs["a_fp8_mps"],
             inputs["a_scale_mps"],
-            inputs["b_t_fp8_mps"],
+            b_fp8,
             inputs["b_scale_mps"],
             c_out,
         )
@@ -1210,7 +1243,7 @@ def _bench_paired_scaled_matmul(
 
         b_last_ref: list[mx.array | None] = [None]
         c_last_ref: list[torch.Tensor | None] = [None]
-        paired = _bench_paired_callables(
+        paired = _bench_paired_callables_with_optional_tokens_per_call(
             (
                 (b_label, _make_path_b_matmul_runner(inputs, b_last_ref)),
                 (c_label, _make_path_c_scaled_matmul_runner(compiled, inputs, c_last_ref)),
@@ -1354,7 +1387,7 @@ def _bench_paired_vecmat_mlx(
     c_last_ref: list[mx.array | None] = [None]
     b_label = "path_b_msl_fp8_scaled_vecmat"
     c_label = "path_c_mlx_tilelang_fp8_scaled_vecmat"
-    paired = _bench_paired_callables(
+    paired = _bench_paired_callables_with_optional_tokens_per_call(
         (
             (b_label, _make_path_b_vecmat_runner(inputs, b_last_ref)),
             (c_label, _make_path_c_vecmat_runner(inputs, c_last_ref)),
@@ -2206,6 +2239,9 @@ def main() -> int:
                     file=sys.stderr,
                 )
                 strict_failed = True
+    if strict_failed:
+        _print_summary(payload)
+        return 2
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(payload, indent=2))
     _print_summary(payload)

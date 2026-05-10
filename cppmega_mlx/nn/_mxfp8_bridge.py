@@ -23,15 +23,19 @@ module ``grouped_mxfp8_gemm`` (with its own pybind exports ``dgrad_nn`` /
 
 Direction supported
 -------------------
-TileLang IR -> raw CUDA call into cppmega's pre-built ``.so``. The body emitted
-into the kernel calls a thin C++ trampoline via ``tir.call_extern("handle",
+TileLang IR -> raw CUDA call into cppmega's pre-built ``.so``. This module is
+not the high-level MXFP8 matmul contract and must not be used as proof that
+MXFP8 itself is "CUDA-only"; it is only the optional adapter for cppmega's
+Blackwell CUDA extension. The body emitted into the kernel calls a thin C++
+trampoline via ``tir.call_extern("handle",
 "tl.extern_intrinsic.cppmega_sm120_blockscaled_mma_tma", access_ptr(A,"r"), ...)``.
 This is the same "tile-typed contract" pattern used by
 ``poc/extern_intrinsic_examples/simdgroup_mma.py`` and documented in
 ``RFC_unified_fused_kernel.md`` §6. The actual CUDA body string MUST be
 materialised by codegen; on Mac (no CUDA, no cppmega ``.so``) we register a
 stub body and surface a loud ``MXFP8BridgeUnsupported`` if anyone tries to
-*invoke* the resulting callable.
+*invoke* the resulting callable. High-level TileLang / torch / MLX routing is
+responsible for selecting the native backend for the current device.
 
 Caller responsibilities (NOT auto-applied)
 ------------------------------------------

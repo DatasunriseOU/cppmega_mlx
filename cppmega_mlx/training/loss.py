@@ -236,6 +236,13 @@ def _decoder_hidden_states_for_mtp(
     module attributes and fails closed for unsupported model surfaces.
     """
 
+    decoder_hidden_states = getattr(model, "decoder_hidden_states", None)
+    if callable(decoder_hidden_states):
+        model_kwargs = batch.model_kwargs()
+        if document_ids is not None:
+            model_kwargs["document_ids"] = document_ids
+        return decoder_hidden_states(batch.inputs, **model_kwargs)
+
     token_embedding = getattr(model, "token_embedding", None)
     position_embedding = getattr(model, "position_embedding", None)
     layers = getattr(model, "layers", None)

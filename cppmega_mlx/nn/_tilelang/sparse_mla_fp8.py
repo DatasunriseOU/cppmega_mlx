@@ -1029,17 +1029,12 @@ def sparse_mla_fp8_apply(
 ) -> mx.array | Tuple[mx.array, mx.array]:
     """Apply FP8 sparse MLA. Prefers the direct-MSL kernel.
 
-    Note (Path C status — REDUCERS-ONLY):
-        There is intentionally no ``sparse_mla_fp8_path_c_apply`` counterpart.
-        ``sparse_mla_fp8_path_c.py`` exposes only QK / indexed-QK reducer
-        surfaces, not an end-to-end attention apply. Therefore there is no
-        ``force_metal`` -> ``force_path_c`` kwarg rename for FP8 sparse-MLA;
-        the only callable wrapper is this Path B one and it keeps
-        ``force_metal``. The FP8 Path C reducers are also currently broken at
-        runtime — the ``tirx.metal.fp8_e4m3_dot4`` intrinsic is not registered
-        in the in-tree TileLang/TVM build (agent-D report
-        ``reports/2026-05-06-tilelang-tvm-review/agent-D-planning-vs-reality/grok__design__20260506T171408.md``
-        finding #1). See ``docs/production_kernel_routing.md``.
+    Note (Path C prepared-buffer status):
+        ``sparse_mla_fp8_path_c.py`` exposes ``sparse_mla_fp8_path_c_apply``
+        for callers that already have ``q_fp8/q_scale/kv_fp8/kv_scale`` GPU
+        buffers. This high-level Path B wrapper keeps ``force_metal`` and owns
+        float-carrier quantization; it does not proxy through Path C because
+        that would hide large staging copies in an adapter.
     """
 
     shapes = _resolve_shapes(q, kv, indices, d_v=d_v)

@@ -1272,6 +1272,8 @@ def lower_tilelang_to_msl_inline(
 
     msl_text = str(artifact.kernel_source)
     prelude, sig_text, body_text = _split_kernel_msl(msl_text)
+    if prelude and not prelude.endswith("\n"):
+        prelude += "\n"
     inner = body_text[1:-1]
     body = _inline_tilelang_kernel_body(inner)
     result = TileLangMSLLowering(
@@ -1404,6 +1406,7 @@ def _assert_path_c_metal_fp8_intrinsics_registered() -> None:
     ``AttributeError`` from the FFI lowering pipeline.
     """
 
+    _register_path_c_metal_fp8_intrinsics()
     try:
         from tilelang.tvm.ir import Op  # type: ignore
     except Exception:
@@ -1530,19 +1533,10 @@ if os.environ.get("CPPMEGA_VALIDATE_PARSE_TESTS") == "1":
         )
 
 
-# Auto-register intrinsics at module import. fix-round-8 (Wave 3 grok-4):
-# narrow the catch from bare ``Exception``. Only import-time errors (TVM
-# / tilelang not installed) and missing-attribute errors (TVM internals
-# moved) are tolerated as "deferred" with a visible warning. Other
-# exception types propagate so they're not silently swallowed at import.
-try:
-    _register_path_c_metal_fp8_intrinsics()
-except (ImportError, ModuleNotFoundError, AttributeError) as _register_exc:
-    warnings.warn(
-        f"Path C intrinsic registration deferred: {_register_exc}",
-        RuntimeWarning,
-        stacklevel=2,
-    )
+# Path C FP8 intrinsics are registered lazily by
+# ``_assert_path_c_metal_fp8_intrinsics_registered``. Importing TileLang here
+# preloads torch in current TileLang wheels, which makes lightweight MLX/Metal
+# probe imports pay for the CUDA/PyTorch runtime unnecessarily.
 
 
 __all__ = [

@@ -27,6 +27,9 @@ from cppmega_mlx.nn._tilelang.fp8_vecmat_path_c import (
     fp8_vecmat_path_c_status,
     lower_fp8_vecmat_msl,
 )
+from cppmega_mlx.nn._tilelang._msl_transform import (
+    _assert_path_c_metal_fp8_intrinsics_registered,
+)
 
 
 def _metal_available() -> bool:
@@ -145,6 +148,7 @@ def test_fp8_e4m3_dot4_intrinsic_is_registered() -> None:
         except Exception as exc:
             pytest.skip(f"TVM Op import unavailable: {exc}")
 
+    _assert_path_c_metal_fp8_intrinsics_registered()
     op = Op.get("tirx.metal.fp8_e4m3_dot4")
     assert op is not None, (
         "tirx.metal.fp8_e4m3_dot4 must be registered for Path C FP8 macro "

@@ -119,6 +119,7 @@ from __future__ import annotations
 
 # pyright: reportInvalidTypeForm=false
 
+import importlib
 import os
 import re
 import sys
@@ -132,7 +133,6 @@ import mlx.core as mx
 from cppmega_mlx.nn._tilelang import _msl_transform
 from cppmega_mlx.nn._tilelang._engine_dispatch import (
     dispatch_lower,
-    tilelang_engine_mode,
 )
 
 
@@ -712,13 +712,33 @@ _PATH_C_OK_REASON = (
 
 @lru_cache(maxsize=1)
 def _tilelang_available() -> tuple[bool, str]:
+    def _try_import_tilelang() -> tuple[bool, str]:
+        try:
+            import tilelang  # type: ignore[reportMissingImports]  # noqa: F401
+            from tilelang import tvm as _tvm  # type: ignore[reportMissingImports]  # noqa: F401
+            import tilelang.language as _T  # type: ignore[reportMissingImports]  # noqa: F401
+        except Exception as exc:  # pragma: no cover - host without TileLang build
+            return False, f"tilelang import failed: {exc}"
+        return True, "tilelang importable"
+
+    ok, reason = _try_import_tilelang()
+    if ok:
+        return ok, reason
+
+    # The cppmega test/bench environment keeps TileLang in a sibling dev tree,
+    # and tests deliberately scrub TILELANG_ROOT/PYTHONPATH between cases.
+    # Reuse the bench harness bootstrap once before treating Path C as absent.
     try:
-        import tilelang  # type: ignore[reportMissingImports]  # noqa: F401
-        from tilelang import tvm as _tvm  # type: ignore[reportMissingImports]  # noqa: F401
-        import tilelang.language as _T  # type: ignore[reportMissingImports]  # noqa: F401
-    except Exception as exc:  # pragma: no cover - host without TileLang build
-        return False, f"tilelang import failed: {exc}"
-    return True, "tilelang importable"
+        from scripts.bench_tilelang_fp8_path_c import (
+            _prepare_tilelang_import_environment,
+        )
+
+        _prepare_tilelang_import_environment()
+        importlib.invalidate_caches()
+    except Exception as prep_exc:  # pragma: no cover - host without dev tree
+        return False, f"{reason}; TileLang dev import bootstrap failed: {prep_exc}"
+
+    return _try_import_tilelang()
 
 
 @lru_cache(maxsize=1)
@@ -882,14 +902,14 @@ def _path_c_rewrite_merge_round(
     lane_expr = "((int)thread_position_in_threadgroup.x)"
     active_mod = f"({lane_expr} % (stride * 2)) == 0"
     active_mask = f"({lane_expr} & ((stride * 2) - 1)) == 0"
-    prewrite_barrier = (
-        "\n    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-        f"    if ({active_mod}) {{"
+    barrier_call = r"(?:metal::)?threadgroup_barrier\((?:metal::)?mem_flags::mem_threadgroup\);"
+    prewrite_barrier = re.compile(
+        rf"\n    {barrier_call}\n"
+        rf"    if \({re.escape(active_mod)}\) \{{"
     )
     replacement = f"\n    if ({active_mod}) {{"
     body = lowering.body
-    if body.count(prewrite_barrier) == 1:
-        body = body.replace(prewrite_barrier, replacement, 1)
+    body = prewrite_barrier.sub(replacement, body, count=1)
 
     body = body.replace(
         active_mod,
@@ -899,7 +919,7 @@ def _path_c_rewrite_merge_round(
     second_branch = re.compile(
         r"      \}\n"
         r"    \}\n"
-        r"(?:    threadgroup_barrier\(mem_flags::mem_threadgroup\);\n)?"
+        rf"(?:    {barrier_call}\n)?"
         rf"    if \({active_branch}\) \{{\n"
         rf"      if \(other < {_TOPK_C_THREADS}\) \{{\n"
         r"        for \(int i_2 = 0;"
@@ -946,6 +966,10 @@ def _path_c_kernel_for(
         raise ValueError(
             f"topk selector shared merge buffer exceeds 32KiB: threads={threads}, k={k}"
         )
+
+    ok, reason = _tilelang_available()
+    if not ok:
+        raise RuntimeError(reason)
 
     import tilelang.language as T  # type: ignore[reportMissingImports]
 
@@ -1117,7 +1141,7 @@ def _path_c_kernel_for(
         input_names=["ends", "scores", "starts"],
         output_names=["indices"],
         source=lowering.body,
-        header=lowering.header,
+        header=lowering.header.rstrip() + "\n",
         ensure_row_contiguous=True,
     )
     return kernel, lowering

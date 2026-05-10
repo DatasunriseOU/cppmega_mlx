@@ -1,4 +1,4 @@
-"""Experimental Path C kernels — PROBE-ONLY / REDUCERS-ONLY surface.
+"""Experimental Path C kernels — submodule-only experimental surface.
 
 These are not stable user APIs. See ``docs/production_kernel_routing.md`` for
 routing status.
@@ -10,9 +10,9 @@ What lives here:
   remains reachable via the submodule path. Runtime dispatch is currently
   broken pending ``tirx.metal.fp8_e4m3_dot4`` landing in the in-tree
   TileLang/TVM. See ``reports/2026-05-06-tilelang-tvm-review/agent-D-planning-vs-reality/``.
-- ``sparse_mla_blockscaled_path_c`` E8M0 QK probe surfaces and the real-shape
-  QK reducer apply (``..._reduce_path_c`` is a reducer apply, NOT a full
-  end-to-end attention apply — there is no ``sparse_mla_blockscaled_path_c_apply``).
+- ``sparse_mla_blockscaled_path_c`` E8M0 QK probe/reducer surfaces. The
+  prepared-buffer ``sparse_mla_blockscaled_path_c_apply`` lives in the
+  submodule and is intentionally not re-exported here.
 
 Everything re-exported below is also surfaced from
 ``cppmega_mlx.nn._tilelang`` via ``from ._experimental import *`` so existing
@@ -34,11 +34,9 @@ from cppmega_mlx.nn._tilelang.fp8_vecmat_path_c import (
     make_fp8_vecmat_reduce_kernel,
 )
 
-# Blockscaled (E8M0) Sparse-MLA Path C is PROBE-ONLY — there is no full
-# `sparse_mla_blockscaled_path_c_apply`. The exported `..._reduce_path_c` is
-# a real-shape QK reducer apply, not an end-to-end attention apply. See the
-# module docstring of `sparse_mla_blockscaled_path_c.py` and the routing doc
-# (`docs/production_kernel_routing.md`) for the honest status.
+# Blockscaled (E8M0) Sparse-MLA Path C exports status / QK reducer helpers
+# here. The prepared-buffer full apply lives in the submodule and is not
+# re-exported from the package-level experimental namespace.
 from cppmega_mlx.nn._tilelang.sparse_mla_blockscaled_path_c import (
     E8M0_BLOCK_SIZE,
     E8M0_LAYOUT,
@@ -58,13 +56,13 @@ from cppmega_mlx.nn._tilelang.sparse_mla_blockscaled_path_c import (
 )
 
 __all__ = [
-    # fp8_vecmat_path_c (REDUCERS-ONLY surface)
+    # fp8_vecmat_path_c status/lowering helpers
     "FP8VecmatPathCStatus",
     "fp8_vecmat_msl_features",
     "fp8_vecmat_path_c_status",
     "lower_fp8_vecmat_msl",
     "make_fp8_vecmat_reduce_kernel",
-    # sparse_mla_blockscaled_path_c (PROBE-ONLY + reducer apply)
+    # sparse_mla_blockscaled_path_c status/lowering/QK reducer helpers
     "E8M0_BLOCK_SIZE",
     "E8M0_LAYOUT",
     "E8M0_SCALE_FORMAT",

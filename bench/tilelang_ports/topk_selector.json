@@ -43,12 +43,6 @@
       },
       {
         "batch": 1,
-        "seq_len": 512,
-        "k": 32,
-        "dtype": "float32"
-      },
-      {
-        "batch": 1,
         "seq_len": 2048,
         "k": 64,
         "dtype": "float32"
@@ -144,72 +138,6 @@
       },
       "ratios": {
         "path_c_over_path_b": 0.8949978296801958
-      }
-    },
-    {
-      "batch": 1,
-      "seq_len": 512,
-      "k": 32,
-      "dtype": "float32",
-      "strategies": {
-        "argpartition": {
-          "iters": 50,
-          "warmup": 10,
-          "ran": true,
-          "paired": false,
-          "median_ms": 0.16162500833161175,
-          "min_ms": 0.13650002074427903,
-          "max_ms": 0.4955829936079681,
-          "mean_ms": 0.17141828022431582,
-          "peak_gib": 5.904585123062134e-06
-        },
-        "argsort_slice": {
-          "iters": 50,
-          "warmup": 10,
-          "ran": true,
-          "paired": false,
-          "median_ms": 0.1526455016573891,
-          "min_ms": 0.13479101471602917,
-          "max_ms": 0.4402089980430901,
-          "mean_ms": 0.1627649401780218,
-          "peak_gib": 5.7443976402282715e-06
-        },
-        "topk_take_along": {
-          "iters": 50,
-          "warmup": 10,
-          "ran": true,
-          "paired": false,
-          "median_ms": 0.14816649490967393,
-          "min_ms": 0.13995799235999584,
-          "max_ms": 0.6422910082619637,
-          "mean_ms": 0.163997458294034,
-          "peak_gib": 6.023794412612915e-06
-        },
-        "path_b_msl": {
-          "iters": 50,
-          "warmup": 10,
-          "ran": true,
-          "paired": true,
-          "median_ms": 0.31549998675473034,
-          "min_ms": 0.2700829936657101,
-          "max_ms": 0.7760419975966215,
-          "mean_ms": 0.3304399404441938,
-          "peak_gib": 2.0712614059448242e-06
-        },
-        "path_c_tilelang": {
-          "iters": 50,
-          "warmup": 10,
-          "ran": true,
-          "paired": true,
-          "median_ms": 0.355791999027133,
-          "min_ms": 0.3108329838141799,
-          "max_ms": 0.4604579880833626,
-          "mean_ms": 0.3561416995944455,
-          "peak_gib": 2.0563602447509766e-06
-        }
-      },
-      "ratios": {
-        "path_c_over_path_b": 1.1277084436257858
       }
     },
     {

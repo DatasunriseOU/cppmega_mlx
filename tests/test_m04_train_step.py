@@ -632,6 +632,65 @@ def test_local_gb10_quarter_dry_run_cli_writes_requested_output_only(
         assert BASELINE_RECEIPT.read_text(encoding="utf-8") == baseline_before
 
 
+def test_local_gb10_quarter_dry_run_records_non_default_optimizer_metadata(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "m04_local_gb10_lion.json"
+    result = run_script(
+        "--synthetic",
+        "--model-profile",
+        "local_gb10_quarter",
+        "--dry-run-json",
+        "--optimizer",
+        "lion",
+        "--output",
+        str(output),
+        "--json",
+    )
+
+    payload = load_json_result(result)
+    assert json.loads(output.read_text(encoding="utf-8")) == payload
+    assert_local_gb10_metadata_dry_run_contract(payload)
+    assert payload["workload"]["optimizer"] == {
+        "requested": "lion",
+        "key": "lion",
+        "quant_scheme": "dynamic_int8_v1",
+        "source": "cli",
+    }
+    optimizer = payload["training"]["optimizer"]
+    assert optimizer["name"] == "Lion"
+    assert optimizer["key"] == "lion"
+    assert optimizer["class"] == "cppmega_mlx.training.optimizers.LionFP32Moments"
+    assert optimizer["adamw"] is False
+    assert optimizer["master_moment_evidence"]["skipped"] is True
+    assert payload["acceptance_gate"]["observed_optimizer_name"] == "Lion"
+    assert payload["acceptance_gate"]["optimizer_identity_ok"] is False
+    assert payload["acceptance_gate"]["adamw_ok"] is False
+
+
+def test_non_default_optimizer_is_blocked_outside_local_gb10_route(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "m04_hybrid_lion.json"
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--synthetic",
+            "--optimizer",
+            "lion",
+            "--output",
+            str(output),
+        ]
+    )
+
+    payload, exit_code = m04_train_step.run_receipt(args)
+
+    assert exit_code == 2
+    assert payload["status"] == "blocked"
+    assert payload["blockers"][0]["type"] == "unsupported_optimizer_route"
+    assert payload["workload"]["optimizer"]["key"] == "lion"
+    assert payload["training"]["optimizer"]["name"] == "Lion"
+
+
 def test_local_gb10_quarter_training_routes_to_monkeypatchable_seam(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -916,6 +975,69 @@ def _run_bf16_probe_update(
     optimizer.update(model, grads)
     mx.eval(model.parameters(), optimizer.state)
     return model, collect_adamw_moment_dtypes(optimizer.state)
+
+
+@pytest.mark.parametrize(
+    ("optimizer_key", "expected_key", "expected_name", "quantized"),
+    [
+        ("adamw", "adamw", "AdamW", False),
+        ("muon_adamw", "muon_adamw", "MuonAdamW", False),
+        ("nam56r", "muon_adamw", "MuonAdamW", False),
+        ("lion", "lion", "Lion", False),
+        ("adam8bit", "adam8bit", "Adam8bit", True),
+        ("lion8bit", "lion8bit", "Lion8bit", True),
+        ("int8", "int8", "MuonAdamWInt8", True),
+    ],
+)
+def test_local_gb10_optimizer_selector_initializes_supported_variants(
+    optimizer_key: str,
+    expected_key: str,
+    expected_name: str,
+    quantized: bool,
+) -> None:
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--model-profile",
+            "local_gb10_quarter",
+            "--optimizer",
+            optimizer_key,
+        ]
+    )
+    config = m04_train_step.config_from_args(args, data_path=GB10_SAMPLE)
+    model = _Bf16Probe()
+
+    optimizer = m04_train_step.make_local_gb10_optimizer(
+        args,
+        learning_rate=config.learning_rate,
+        weight_decay=config.weight_decay,
+    )
+    optimizer.init(model.trainable_parameters())
+    mx.eval(model.parameters(), optimizer.state)
+    identity = m04_train_step.optimizer_identity_for_selected_optimizer(
+        args,
+        config,
+        optimizer,
+        model,
+        optimizer_updated=True,
+    )
+
+    assert identity["key"] == expected_key
+    assert identity["name"] == expected_name
+    assert identity["quantized_state"] is quantized
+    assert identity["learning_rate"] == config.learning_rate
+    assert identity["weight_decay"] == config.weight_decay
+    assert identity["variant"]["requested"] == optimizer_key
+    expected_quant_scheme = None if optimizer_key == "adamw" else "dynamic_int8_v1"
+    assert identity["variant"]["quant_scheme"] == expected_quant_scheme
+    if optimizer_key == "adamw":
+        assert identity["adamw"] is True
+        assert identity["name_matches_required"] is True
+        assert identity["master_moment_dtype_ok"] is True
+    else:
+        assert identity["adamw"] is False
+        assert identity["name_matches_required"] is False
+        assert identity["master_moment_dtype_ok"] is False
+        assert identity["state_evidence"]["state_dtype_breakdown_bytes"]
 
 
 def test_stock_mlx_adamw_uses_bf16_moments_for_bf16_params() -> None:

@@ -31,6 +31,8 @@ from cppmega_mlx.training._quantize_8bit import (
     quantize_dynamic_blockwise,
     quantize_dynamic_lut_blockwise,
 )
+from cppmega_mlx.training._fused_adam8bit_kernel import fused_adam8bit_step
+from cppmega_mlx.training._fused_dynamic8bit_kernel import fused_adam8bit_dynamic_step
 from cppmega_mlx.training.optimizers import (
     AdamWFP32Moments,
     LionFP32Moments,
@@ -242,6 +244,79 @@ def test_adam8bit_first_step_noise_floor_uses_fresh_v_absmax() -> None:
     tiny_update = float(abs(updated["w"][1]).item())
     assert tiny_update < 1e-3
     assert float(optimizer.state["w"]["v_absmax"][0].item()) > 999.0
+
+
+def test_adam8bit_second_moment_is_nonnegative_after_quant_dequant() -> None:
+    """Adam's ``v`` is a squared-gradient moment, so old quantized state that
+    decodes negative must be clamped before sqrt in both fused codecs.
+    """
+
+    n = DEFAULT_BLOCK_SIZE
+    param = mx.ones((n,), dtype=mx.float32)
+    grad = mx.zeros((n,), dtype=mx.float32)
+
+    for fused_step, zero_byte in (
+        (fused_adam8bit_step, 128),
+        (fused_adam8bit_dynamic_step, 127),
+    ):
+        m_quant = mx.full((n,), zero_byte, dtype=mx.uint8)
+        m_absmax = mx.zeros((1,), dtype=mx.float32)
+        # Byte zero decodes negative for both symmetric and signed dynamic LUT.
+        v_quant = mx.zeros((n,), dtype=mx.uint8)
+        v_absmax = mx.ones((1,), dtype=mx.float32)
+        param_out, _, _, v_quant_out, v_absmax_out = fused_step(
+            param,
+            grad,
+            m_quant,
+            m_absmax,
+            v_quant,
+            v_absmax,
+            learning_rate=mx.array(1e-3, dtype=mx.float32),
+            beta1=0.9,
+            beta2=0.999,
+            eps=1e-8,
+            weight_decay=0.0,
+            step=mx.array(1, dtype=mx.uint64),
+            bias_correction=False,
+        )
+        mx.eval(param_out, v_quant_out, v_absmax_out)
+
+        assert bool(mx.all(mx.isfinite(param_out)).item())
+        assert float(mx.max(mx.abs(param_out - param)).item()) == 0.0
+        assert float(mx.max(v_absmax_out).item()) == 0.0
+
+    for scheme in (QUANT_SCHEME_SYMMETRIC, QUANT_SCHEME_DYNAMIC):
+        optimizer = make_adam8bit(
+            learning_rate=1e-3,
+            weight_decay=0.0,
+            use_fused_kernel=False,
+            quant_scheme=scheme,
+        )
+        params = {"w": param}
+        optimizer.init(params)
+        optimizer.state["w"]["v_quant"] = mx.zeros((n,), dtype=mx.uint8)
+        optimizer.state["w"]["v_absmax"] = mx.ones((1,), dtype=mx.float32)
+        updated = optimizer.apply_gradients({"w": grad}, params)
+        mx.eval(updated, optimizer.state)
+
+        assert bool(mx.all(mx.isfinite(updated["w"])).item())
+        assert float(mx.max(mx.abs(updated["w"] - param)).item()) == 0.0
+
+
+def test_adam8bit_min_8bit_size_keeps_small_tensors_fp32() -> None:
+    optimizer = make_adam8bit(learning_rate=1e-3, min_8bit_size=4096)
+    params = {
+        "small": mx.ones((8,), dtype=mx.bfloat16),
+        "large": mx.ones((4096,), dtype=mx.bfloat16),
+    }
+    optimizer.init(params)
+    mx.eval(optimizer.state)
+
+    assert optimizer.state["small"]["m"].dtype == mx.float32
+    assert optimizer.state["small"]["v"].dtype == mx.float32
+    assert "m_quant" not in optimizer.state["small"]
+    assert optimizer.state["large"]["m_quant"].dtype == mx.uint8
+    assert optimizer.state["large"]["v_quant"].dtype == mx.uint8
 
 
 # -----------------------------------------------------------------------------

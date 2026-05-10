@@ -67,8 +67,8 @@ These files in ../cppmega are the current source references for parity:
     </tr>
     <tr>
       <td>cppmega/recipes/nam56r_megatron.py</td>
-      <td>Full source parser accepts A, M, D, E, G, R, and pipe-<br>
-      delimited patterns, and reports whether a recipe is fully<br>
+      <td>Full source parser accepts A, M, D, E, G, R, and pipe-delimited patterns,<br>
+      and reports whether a recipe is fully<br>
       native Megatron.</td>
       <td>Local MLX pattern parsing intentionally accepts only A/E/M/R<br>
       and fails closed on upstream-only symbols.</td>

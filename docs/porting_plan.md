@@ -176,7 +176,10 @@ The current collected test files are:
 - tests/test_compiled_train.py
 - tests/test_config.py
 - tests/test_cppmega_parity_anchors.py
+- tests/test_cuda_kernel_bridge.py
 - tests/test_cut_cross_entropy.py
+- tests/test_cute_bridge.py
+- tests/test_cute_to_tilelang_bridge.py
 - tests/test_data_pipeline_doc.py
 - tests/test_data_smoke_script.py
 - tests/test_dataloader_bridge.py
@@ -188,10 +191,18 @@ The current collected test files are:
 - tests/test_external_research_contract.py
 - tests/test_fim_transform.py
 - tests/test_fp8_msl_kernels.py
+- tests/test_fusion_patterns_extended.py
 - tests/test_grad_buffer_no_aliasing.py
 - tests/test_grad_dtype_contract.py
 - tests/test_hybrid_lm.py
 - tests/test_hybrid_lm_gradients.py
+- tests/test_inference_engine.py
+- tests/test_inference_generation.py
+- tests/test_inference_infilling.py
+- tests/test_inference_quantization.py
+- tests/test_inference_sampling.py
+- tests/test_inference_serving.py
+- tests/test_inference_speculative_decode.py
 - tests/test_kernel_policy.py
 - tests/test_lint_mlx.py
 - tests/test_m03_forward_parity_manifest_script.py
@@ -206,12 +217,16 @@ The current collected test files are:
 - tests/test_memory_runtime.py
 - tests/test_metal_ops.py
 - tests/test_mhc.py
+- tests/test_mhc_integration.py
 - tests/test_mlx_lm_adapter.py
+- tests/test_mlx_runtime.py
 - tests/test_model_factory.py
 - tests/test_moe.py
+- tests/test_msl_extraction.py
 - tests/test_mtp_loss.py
 - tests/test_muon_group_splitter.py
 - tests/test_muon_ns_carrier_bench.py
+- tests/test_mxfp8_bridge.py
 - tests/test_nam56r_pattern.py
 - tests/test_ngram_hash.py
 - tests/test_optimizer_no_master_contract.py
@@ -232,12 +247,20 @@ The current collected test files are:
 - tests/test_stp_loss.py
 - tests/test_structure_embedding.py
 - tests/test_system_requirements_doc.py
+- tests/test_tilelang_bench_harness.py
+- tests/test_tilelang_experimental_imports.py
+- tests/test_tilelang_fp8_matmul_path_c_bench.py
+- tests/test_tilelang_fp8_vecmat_path_c.py
 - tests/test_tilelang_m2rnn.py
+- tests/test_tilelang_m2rnn_path_c.py
 - tests/test_tilelang_mamba3.py
 - tests/test_tilelang_mamba3_helpers.py
 - tests/test_tilelang_mamba3_path_c.py
+- tests/test_tilelang_msl_transform.py
+- tests/test_tilelang_path_c_vs_b_parity.py
 - tests/test_tilelang_sparse_mla.py
 - tests/test_tilelang_sparse_mla_blockscaled.py
+- tests/test_tilelang_sparse_mla_blockscaled_path_c.py
 - tests/test_tilelang_sparse_mla_fp8.py
 - tests/test_tilelang_topk.py
 - tests/test_tiny_train.py
@@ -247,6 +270,8 @@ The current collected test files are:
 - tests/test_train_hybrid_tiny_script.py
 - tests/test_train_tiny_npz_script.py
 - tests/test_training_exports.py
+- tests/test_triton_to_cute_dsl.py
+- tests/test_triton_to_tilelang_bridge.py
 
 ## Wave-Next Work
 

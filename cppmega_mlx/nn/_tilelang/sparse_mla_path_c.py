@@ -252,6 +252,50 @@ def _canonicalize_fwd_lane_indexing(
 def _canonicalize_fwd_reductions(msl: str, *, threads: int) -> str:
     """Use Path-B-style stride reductions instead of TileLang round loops."""
 
+    barrier = r"(?:metal::)?threadgroup_barrier\(metal::mem_flags::mem_threadgroup\);"
+    rounds = threads.bit_length() - 1
+    max_reduction_re = re.compile(
+        rf"  for \(int round_id = 0; round_id < {rounds}; \+\+round_id\) \{{\n"
+        rf"    stride = \({threads} >> \(round_id \+ 1\)\);\n"
+        r"    if \(tid < stride\) \{\n"
+        r"      if \(reduce_buf\[tid\] < reduce_buf\[tid \+ stride\]\) \{\n"
+        r"        reduce_buf\[tid\] = reduce_buf\[tid \+ stride\];\n"
+        r"      \}\n"
+        r"    \}\n"
+        rf"    {barrier}\n"
+        r"  \}"
+    )
+    max_replacement = (
+        "  for (int stride = threads / 2; stride > 0; stride >>= 1) {\n"
+        "    if (tid < stride) {\n"
+        "      float a = reduce_buf[tid];\n"
+        "      float b_v = reduce_buf[tid + stride];\n"
+        "      if (b_v > a) reduce_buf[tid] = b_v;\n"
+        "    }\n"
+        "    metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);\n"
+        "  }"
+    )
+    msl = max_reduction_re.sub(max_replacement, msl, count=1)
+
+    sum_reduction_re = re.compile(
+        rf"  for \(int round_id_1 = 0; round_id_1 < {rounds}; \+\+round_id_1\) \{{\n"
+        rf"    stride = \({threads} >> \(round_id_1 \+ 1\)\);\n"
+        r"    if \(tid < stride\) \{\n"
+        r"      reduce_buf\[tid\] (?:= \(reduce_buf\[tid\] \+ reduce_buf\[tid \+ stride\]\)|\+= reduce_buf\[tid \+ stride\]);\n"
+        r"    \}\n"
+        rf"    {barrier}\n"
+        r"  \}"
+    )
+    sum_replacement = (
+        "  for (int stride = threads / 2; stride > 0; stride >>= 1) {\n"
+        "    if (tid < stride) {\n"
+        "      reduce_buf[tid] += reduce_buf[tid + stride];\n"
+        "    }\n"
+        "    metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);\n"
+        "  }"
+    )
+    msl = sum_reduction_re.sub(sum_replacement, msl, count=1)
+
     max_reduction = (
         f"  for (int round_id = 0; round_id < {threads.bit_length() - 1}; ++round_id) {{\n"
         f"    stride = ({threads} >> (round_id + 1));\n"
@@ -329,6 +373,8 @@ def _canonicalize_fwd_hot_loops(msl: str) -> str:
     """Remove residual TileLang scalarization overhead from forward hot loops."""
 
     msl = msl.replace("  int stride;\n", "")
+    if "    stride = (" in msl:
+        msl = msl.replace("  uint threads =", "  uint stride;\n  uint threads =", 1)
 
     msl = re.sub(
         r"(?P<indent>[ \t]*)gather_idx = (?P<idx>indices\[[^\n]+]);\n"
@@ -919,6 +965,50 @@ def _canonicalize_bwd_reductions(msl: str, *, threads: int) -> str:
     """Use Path-B-style stride reductions for backward max/sum/rowsum."""
 
     log_threads = threads.bit_length() - 1
+    barrier = r"(?:metal::)?threadgroup_barrier\(metal::mem_flags::mem_threadgroup\);"
+    max_reduction_re = re.compile(
+        rf"  for \(int round_id = 0; round_id < {log_threads}; \+\+round_id\) \{{\n"
+        rf"    stride = \({threads} >> \(round_id \+ 1\)\);\n"
+        r"    if \(tid < stride\) \{\n"
+        r"      if \(reduce_buf\[tid\] < reduce_buf\[tid \+ stride\]\) \{\n"
+        r"        reduce_buf\[tid\] = reduce_buf\[tid \+ stride\];\n"
+        r"      \}\n"
+        r"    \}\n"
+        rf"    {barrier}\n"
+        r"  \}"
+    )
+    max_replacement = (
+        "  for (int stride = threads / 2; stride > 0; stride >>= 1) {\n"
+        "    if (tid < stride) {\n"
+        "      float a = reduce_buf[tid];\n"
+        "      float b_v = reduce_buf[tid + stride];\n"
+        "      if (b_v > a) reduce_buf[tid] = b_v;\n"
+        "    }\n"
+        "    metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);\n"
+        "  }"
+    )
+    msl = max_reduction_re.sub(max_replacement, msl, count=1)
+
+    for name in ("round_id_1", "round_id_2"):
+        sum_reduction_re = re.compile(
+            rf"  for \(int {name} = 0; {name} < {log_threads}; \+\+{name}\) \{{\n"
+            rf"    stride = \({threads} >> \({name} \+ 1\)\);\n"
+            r"    if \(tid < stride\) \{\n"
+            r"      reduce_buf\[tid\] (?:= \(reduce_buf\[tid\] \+ reduce_buf\[tid \+ stride\]\)|\+= reduce_buf\[tid \+ stride\]);\n"
+            r"    \}\n"
+            rf"    {barrier}\n"
+            r"  \}"
+        )
+        sum_replacement = (
+            "  for (int stride = threads / 2; stride > 0; stride >>= 1) {\n"
+            "    if (tid < stride) {\n"
+            "      reduce_buf[tid] += reduce_buf[tid + stride];\n"
+            "    }\n"
+            "    metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);\n"
+            "  }"
+        )
+        msl = sum_reduction_re.sub(sum_replacement, msl, count=1)
+
     max_reduction = (
         f"  for (int round_id = 0; round_id < {log_threads}; ++round_id) {{\n"
         f"    stride = ({threads} >> (round_id + 1));\n"
@@ -2701,19 +2791,7 @@ def sparse_mla_fwd_path_c(
     try:
         outputs = kernel(
             inputs=[q16, kv16, indices_i32, sm_scale_buf],
-            template=[
-                ("T_OUT", mx.float16),
-                ("BATCH", shapes.batch),
-                ("SEQ_LEN", shapes.seq_len),
-                ("SEQ_LEN_KV", shapes.seq_len_kv),
-                ("HEADS", shapes.heads),
-                ("HEAD_KV", shapes.head_kv),
-                ("KV_GROUP", shapes.kv_group),
-                ("QK_DIM", shapes.qk_dim),
-                ("D_V", shapes.d_v),
-                ("TOPK", shapes.topk),
-                ("BLOCK_SIZE", threads),
-            ],
+            template=None,
             output_shapes=[
                 (shapes.batch, shapes.seq_len, shapes.heads, shapes.d_v),
                 (shapes.batch, shapes.seq_len, shapes.heads),

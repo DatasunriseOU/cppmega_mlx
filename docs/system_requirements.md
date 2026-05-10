@@ -2,7 +2,7 @@
 
 This document is the fail-closed readiness slice for local cppmega.mlx training
 on Apple Silicon Macs. It is a preflight checklist, not a performance receipt.
-Fail closed means report NOT READY and do not start a training run when a
+Fail closed means report `NOT READY` and do not start a training run when a
 required probe is missing, stale, ambiguous, or below the threshold.
 
 ## Scope And Non-Claims
@@ -52,9 +52,9 @@ for another machine.
 
 ## Host Requirements
 
-- macOS on Apple Silicon (arm64) with the Metal backend available is required
+- macOS on Apple Silicon (`arm64`) with the Metal backend available is required
   for local Mac training readiness. CPU-only fallback can be useful for import
-  tests, but it is NOT READY for a Mac training receipt.
+  tests, but it is `NOT READY` for a Mac training receipt.
 - Unified RAM must fit the model weights, gradients, optimizer state,
   activations, compilation/cache overhead, dataloader buffers, and OS headroom.
   If the budget does not fit under the configured MLX limits with headroom, the
@@ -120,13 +120,13 @@ Current MLX documentation exposes mx.set_wired_limit(limit_bytes) and
 mx.set_memory_limit(limit_bytes). The current local install and helper also
 support mx.metal.set_memory_limit(limit_bytes) as the compatibility Metal
 allocator path. A training preflight must report which API path is present and
-fail closed if mx.set_wired_limit is unavailable or if no supported memory
+fail closed if `mx.set_wired_limit` is unavailable or if no supported memory
 limit setter is available.
 
 Use mx.device_info()["memory_size"] for total device memory and
 mx.device_info()["max_recommended_working_set_size"] for the system wired
 limit guidance. Keep the wired limit strictly below total memory.
-Do not raise iogpu.wired_limit_mb inside a training script; if an operator
+Do not raise `iogpu.wired_limit_mb` inside a training script; if an operator
 changes the system wired limit, record it in the receipt and re-run the
 preflight.
 
@@ -191,7 +191,7 @@ with:
   not distributed Megatron parity.
 
 Until those receipts exist, JACCL remains a future backend candidate and
-all distributed training readiness is NOT READY.
+all distributed training readiness is `NOT READY`.
 
 ## Source Notes
 

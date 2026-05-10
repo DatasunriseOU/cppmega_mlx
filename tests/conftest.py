@@ -29,12 +29,25 @@ import pytest
 # inject the candidate path directly into the preload helper's private
 # candidate list and leave the env var unset, so production never resolves
 # /tmp regardless of caller env.
+import sys
 from pathlib import Path as _Path
+
+
+_TILELANG_DEV_ROOT = _Path("/private/tmp/tl_apache_tvm_swap")
+_TILELANG_DEV_PYTHONPATH = (
+    _TILELANG_DEV_ROOT,
+    _TILELANG_DEV_ROOT / "3rdparty" / "tvm" / "python",
+)
+for _path in reversed(_TILELANG_DEV_PYTHONPATH):
+    if _path.exists():
+        _value = str(_path)
+        if _value not in sys.path:
+            sys.path.insert(0, _value)
 
 import cppmega_mlx.nn._tilelang._msl_transform as _msl  # noqa: E402
 
 _msl._LIBZ3_DEV_CANDIDATES = [
-    _Path("/tmp/tl_apache_tvm_swap/build/lib/libz3.dylib"),
+    _TILELANG_DEV_ROOT / "build" / "lib" / "libz3.dylib",
 ]
 # The module-level preload at the bottom of _msl_transform.py runs at
 # import time -- BEFORE we set the candidate list above. So the first

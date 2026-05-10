@@ -264,7 +264,7 @@
     "path_c_indexed_qk_reduce_over_path_b_fwd": 0.6548418081595456
   },
   "qk_reducer_strict": {
-    "enabled": false,
+    "enabled": true,
     "scope": "qk_reducer_dispatch",
     "passed": true,
     "max_abs_err": 1e-05,
@@ -272,7 +272,7 @@
     "failures": []
   },
   "strict": {
-    "enabled": false,
+    "enabled": true,
     "scope": "full_path_c_dispatch",
     "passed": false,
     "max_abs_err": 1e-05,

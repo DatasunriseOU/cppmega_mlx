@@ -1,0 +1,1490 @@
+{
+  "acceptance_blockers": [
+    {
+      "id": "cppmega-mlx-t8f.4.local_gb10_quarter_gate",
+      "impact": "HybridTinyLM receipts remain training-plumbing evidence only",
+      "title": "full local_gb10_quarter bf16 AdamW + grad-checkpoint 100-step target-parquet receipt is not captured"
+    }
+  ],
+  "acceptance_gate": {
+    "adamw_ok": false,
+    "all_finite_ok": true,
+    "dataset_format_ok": true,
+    "dataset_name_ok": true,
+    "dtype_ok": true,
+    "fp32_adamw_master_moments_ok": false,
+    "full_local_gb10_quarter_gate_blockers": [
+      "adamw_ok",
+      "fp32_adamw_master_moments_ok",
+      "optimizer_identity_ok",
+      "step_count_ok"
+    ],
+    "full_local_gb10_quarter_gate_completed": false,
+    "full_local_gb10_quarter_gate_required": true,
+    "full_target_dataset": "data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet",
+    "full_target_dataset_100_step_completed": false,
+    "full_target_dataset_100_step_required": true,
+    "full_target_dataset_blocker": "receipt did not complete >=100 decreasing steps on the full target parquet; treat this as a partial training-plumbing smoke only",
+    "grad_checkpoint_expectation_ok": true,
+    "grad_checkpoint_identity": {
+      "expectation_satisfied": true,
+      "observed_enabled": true,
+      "ok": true,
+      "required": true,
+      "source": "TrainHybridTinyConfig.grad_checkpoint -> HybridTinyConfig.grad_checkpoint -> HybridTinyLM mx.checkpoint block wrapper"
+    },
+    "grad_checkpoint_observed_enabled": true,
+    "grad_checkpoint_required": true,
+    "local_gb10_quarter_preflight": {
+      "allocation_attempted": true,
+      "allocation_mode": "full_profile_allocation_probe",
+      "allocation_probe": {
+        "allocation_mode": "full_profile_allocation_probe",
+        "allocation_ready": true,
+        "eval_scope": "parameters_only_no_forward_no_training",
+        "forward_executed": false,
+        "geometry_matches_required": true,
+        "memory_after": {
+          "active_memory_bytes": 3593123236,
+          "cache_memory_bytes": 2253944008,
+          "peak_memory_bytes": 4887988604
+        },
+        "memory_before": {
+          "active_memory_bytes": 8,
+          "cache_memory_bytes": 8,
+          "peak_memory_bytes": 0
+        },
+        "model_class": "HybridTinyLM",
+        "profile_geometry": {
+          "depth": 13,
+          "ffn_hidden_size": 18944,
+          "head_dim": 128,
+          "hidden_size": 3584,
+          "mtp": {
+            "beta": 0.6,
+            "depth": 2,
+            "loss_weight": 0.3
+          },
+          "num_attention_heads": 28,
+          "pattern": "AEMEAEMEAEMR",
+          "vocab_size": 65536
+        },
+        "profile_name": "local_gb10_quarter",
+        "required_geometry": {
+          "depth": 13,
+          "ffn_hidden_size": 18944,
+          "head_dim": 128,
+          "hidden_size": 3584,
+          "mtp": {
+            "beta": 0.6,
+            "depth": 2,
+            "loss_weight": 0.3
+          },
+          "num_attention_heads": 28,
+          "pattern": "AEMEAEMEAEMR",
+          "vocab_size": 65536
+        },
+        "source": "cppmega_mlx.recipes.model_factory",
+        "status": "ok",
+        "training_executed": false
+      },
+      "allocation_ready": true,
+      "blockers": [],
+      "geometry_matches_required": true,
+      "ok": true,
+      "profile_geometry": {
+        "depth": 13,
+        "ffn_hidden_size": 18944,
+        "head_dim": 128,
+        "hidden_size": 3584,
+        "mtp": {
+          "beta": 0.6,
+          "depth": 2,
+          "loss_weight": 0.3
+        },
+        "num_attention_heads": 28,
+        "pattern": "AEMEAEMEAEMR",
+        "vocab_size": 65536
+      },
+      "profile_name": "local_gb10_quarter",
+      "required_geometry": {
+        "depth": 13,
+        "ffn_hidden_size": 18944,
+        "head_dim": 128,
+        "hidden_size": 3584,
+        "mtp": {
+          "beta": 0.6,
+          "depth": 2,
+          "loss_weight": 0.3
+        },
+        "num_attention_heads": 28,
+        "pattern": "AEMEAEMEAEMR",
+        "vocab_size": 65536
+      },
+      "source": "cppmega_mlx.recipes.model_factory",
+      "tokenizer_contract": {
+        "blocker_id": "cppmega-mlx-t8f.1",
+        "expected_vocab_size": 65536,
+        "milestone": "M0.1",
+        "reason": "M0.1 is closed: the deployed GB10 65K tokenizer is vendored with id 7=<CODE_START>, id 45=<FIM_INSTRUCTION>, id 46=<SPACE>, and id 47=<NL>; MLX and upstream wrappers use explicit whitespace-sentinel encode/decode with Mac-vs-upstream parity receipts",
+        "required_special_tokens": {
+          "<BOS>": 2,
+          "<CODE_START>": 7,
+          "<EOS>": 3,
+          "<FIM_INSTRUCTION>": 45,
+          "<FIM_MIDDLE>": 5,
+          "<FIM_PREFIX>": 4,
+          "<FIM_SUFFIX>": 6,
+          "<NL>": 47,
+          "<SPACE>": 46
+        },
+        "resolved": true
+      }
+    },
+    "local_gb10_quarter_preflight_ok": true,
+    "local_gb10_quarter_required": true,
+    "loss_decrease_ok": true,
+    "loss_fields_ok": true,
+    "m4_runtime_metadata": {
+      "metal_available": true,
+      "observed_device_name": "Apple M4 Max",
+      "observed_machine": "arm64",
+      "observed_memory_size": 137438953472,
+      "observed_platform": "macOS-26.4.1-arm64-arm-64bit-Mach-O",
+      "ok": true,
+      "required_device_family": "Apple M4"
+    },
+    "m4_runtime_metadata_ok": true,
+    "model_identity": {
+      "geometry_ok": true,
+      "observed_geometry": {
+        "depth": 13,
+        "ffn_hidden_size": 18944,
+        "head_dim": 128,
+        "hidden_size": 3584,
+        "mtp": {
+          "beta": 0.6,
+          "depth": 2,
+          "loss_weight": 0.3
+        },
+        "num_attention_heads": 28,
+        "pattern": "AEMEAEMEAEMR",
+        "vocab_size": 65536
+      },
+      "observed_name": "local_gb10_quarter",
+      "observed_profile": "local_gb10_quarter",
+      "observed_source": "cppmega_mlx.recipes.model_factory",
+      "ok": true,
+      "profile_ok": true,
+      "required_geometry": {
+        "depth": 13,
+        "ffn_hidden_size": 18944,
+        "head_dim": 128,
+        "hidden_size": 3584,
+        "mtp": {
+          "beta": 0.6,
+          "depth": 2,
+          "loss_weight": 0.3
+        },
+        "num_attention_heads": 28,
+        "pattern": "AEMEAEMEAEMR",
+        "vocab_size": 65536
+      },
+      "required_name": "local_gb10_quarter",
+      "required_profile": "local_gb10_quarter",
+      "required_source": "cppmega_mlx.recipes.model_factory",
+      "source_ok": true
+    },
+    "model_identity_ok": true,
+    "observed_adamw_master_moment_dtypes": {
+      "layers/0/block/rope_inv_freq/m": "float32",
+      "layers/0/block/rope_inv_freq/v": "float32",
+      "layers/0/norm/weight/m": "float32",
+      "layers/0/norm/weight/v": "float32",
+      "layers/1/norm/weight/m": "float32",
+      "layers/1/norm/weight/v": "float32",
+      "layers/10/block/B_bias/m": "float32",
+      "layers/10/block/B_bias/v": "float32",
+      "layers/10/block/B_norm_weight/m": "float32",
+      "layers/10/block/B_norm_weight/v": "float32",
+      "layers/10/block/C_bias/m": "float32",
+      "layers/10/block/C_bias/v": "float32",
+      "layers/10/block/C_norm_weight/m": "float32",
+      "layers/10/block/C_norm_weight/v": "float32",
+      "layers/10/block/D/m": "float32",
+      "layers/10/block/D/v": "float32",
+      "layers/10/block/dt_bias/m": "float32",
+      "layers/10/block/dt_bias/v": "float32",
+      "layers/10/norm/weight/m": "float32",
+      "layers/10/norm/weight/v": "float32",
+      "layers/11/block/A_log/m": "float32",
+      "layers/11/block/A_log/v": "float32",
+      "layers/11/block/D/m": "float32",
+      "layers/11/block/D/v": "float32",
+      "layers/11/block/conv_bias/m": "float32",
+      "layers/11/block/conv_bias/v": "float32",
+      "layers/11/block/conv_weight/m": "float32",
+      "layers/11/block/conv_weight/v": "float32",
+      "layers/11/block/dt_bias/m": "float32",
+      "layers/11/block/dt_bias/v": "float32",
+      "layers/11/block/g_norm/weight/m": "float32",
+      "layers/11/block/g_norm/weight/v": "float32",
+      "layers/11/block/state_weight/m": "float32",
+      "layers/11/block/state_weight/v": "float32",
+      "layers/11/norm/weight/m": "float32",
+      "layers/11/norm/weight/v": "float32",
+      "layers/12/block/rope_inv_freq/m": "float32",
+      "layers/12/block/rope_inv_freq/v": "float32",
+      "layers/12/norm/weight/m": "float32",
+      "layers/12/norm/weight/v": "float32",
+      "layers/2/block/B_bias/m": "float32",
+      "layers/2/block/B_bias/v": "float32",
+      "layers/2/block/B_norm_weight/m": "float32",
+      "layers/2/block/B_norm_weight/v": "float32",
+      "layers/2/block/C_bias/m": "float32",
+      "layers/2/block/C_bias/v": "float32",
+      "layers/2/block/C_norm_weight/m": "float32",
+      "layers/2/block/C_norm_weight/v": "float32",
+      "layers/2/block/D/m": "float32",
+      "layers/2/block/D/v": "float32",
+      "layers/2/block/dt_bias/m": "float32",
+      "layers/2/block/dt_bias/v": "float32",
+      "layers/2/norm/weight/m": "float32",
+      "layers/2/norm/weight/v": "float32",
+      "layers/3/norm/weight/m": "float32",
+      "layers/3/norm/weight/v": "float32",
+      "layers/4/block/rope_inv_freq/m": "float32",
+      "layers/4/block/rope_inv_freq/v": "float32",
+      "layers/4/norm/weight/m": "float32",
+      "layers/4/norm/weight/v": "float32",
+      "layers/5/norm/weight/m": "float32",
+      "layers/5/norm/weight/v": "float32",
+      "layers/6/block/B_bias/m": "float32",
+      "layers/6/block/B_bias/v": "float32"
+    },
+    "observed_dtype": "bfloat16",
+    "observed_model_name": "local_gb10_quarter",
+    "observed_model_profile": "local_gb10_quarter",
+    "observed_model_source": "cppmega_mlx.recipes.model_factory",
+    "observed_optimizer_name": "Adam8bit",
+    "optimizer_identity": {
+      "master_moment_dtype_ok": false,
+      "master_moment_evidence": {
+        "observed_moment_dtype_count": 90,
+        "observed_moment_dtypes": {
+          "layers/0/block/rope_inv_freq/m": "float32",
+          "layers/0/block/rope_inv_freq/v": "float32",
+          "layers/0/norm/weight/m": "float32",
+          "layers/0/norm/weight/v": "float32",
+          "layers/1/norm/weight/m": "float32",
+          "layers/1/norm/weight/v": "float32",
+          "layers/10/block/B_bias/m": "float32",
+          "layers/10/block/B_bias/v": "float32",
+          "layers/10/block/B_norm_weight/m": "float32",
+          "layers/10/block/B_norm_weight/v": "float32",
+          "layers/10/block/C_bias/m": "float32",
+          "layers/10/block/C_bias/v": "float32",
+          "layers/10/block/C_norm_weight/m": "float32",
+          "layers/10/block/C_norm_weight/v": "float32",
+          "layers/10/block/D/m": "float32",
+          "layers/10/block/D/v": "float32",
+          "layers/10/block/dt_bias/m": "float32",
+          "layers/10/block/dt_bias/v": "float32",
+          "layers/10/norm/weight/m": "float32",
+          "layers/10/norm/weight/v": "float32",
+          "layers/11/block/A_log/m": "float32",
+          "layers/11/block/A_log/v": "float32",
+          "layers/11/block/D/m": "float32",
+          "layers/11/block/D/v": "float32",
+          "layers/11/block/conv_bias/m": "float32",
+          "layers/11/block/conv_bias/v": "float32",
+          "layers/11/block/conv_weight/m": "float32",
+          "layers/11/block/conv_weight/v": "float32",
+          "layers/11/block/dt_bias/m": "float32",
+          "layers/11/block/dt_bias/v": "float32",
+          "layers/11/block/g_norm/weight/m": "float32",
+          "layers/11/block/g_norm/weight/v": "float32",
+          "layers/11/block/state_weight/m": "float32",
+          "layers/11/block/state_weight/v": "float32",
+          "layers/11/norm/weight/m": "float32",
+          "layers/11/norm/weight/v": "float32",
+          "layers/12/block/rope_inv_freq/m": "float32",
+          "layers/12/block/rope_inv_freq/v": "float32",
+          "layers/12/norm/weight/m": "float32",
+          "layers/12/norm/weight/v": "float32",
+          "layers/2/block/B_bias/m": "float32",
+          "layers/2/block/B_bias/v": "float32",
+          "layers/2/block/B_norm_weight/m": "float32",
+          "layers/2/block/B_norm_weight/v": "float32",
+          "layers/2/block/C_bias/m": "float32",
+          "layers/2/block/C_bias/v": "float32",
+          "layers/2/block/C_norm_weight/m": "float32",
+          "layers/2/block/C_norm_weight/v": "float32",
+          "layers/2/block/D/m": "float32",
+          "layers/2/block/D/v": "float32",
+          "layers/2/block/dt_bias/m": "float32",
+          "layers/2/block/dt_bias/v": "float32",
+          "layers/2/norm/weight/m": "float32",
+          "layers/2/norm/weight/v": "float32",
+          "layers/3/norm/weight/m": "float32",
+          "layers/3/norm/weight/v": "float32",
+          "layers/4/block/rope_inv_freq/m": "float32",
+          "layers/4/block/rope_inv_freq/v": "float32",
+          "layers/4/norm/weight/m": "float32",
+          "layers/4/norm/weight/v": "float32",
+          "layers/5/norm/weight/m": "float32",
+          "layers/5/norm/weight/v": "float32",
+          "layers/6/block/B_bias/m": "float32",
+          "layers/6/block/B_bias/v": "float32"
+        },
+        "observed_moment_dtypes_sampled": 64,
+        "observed_moment_dtypes_truncated": true,
+        "observed_parameter_dtype": "bfloat16",
+        "ok": false,
+        "optimizer_base_class": "mlx.optimizers.Optimizer",
+        "optimizer_class": "cppmega_mlx.training.optimizers_quantized.Adam8bit",
+        "reason": "M0.4 acceptance still requires repo-local AdamW fp32 moments; this receipt records an optimizer-matrix variant.",
+        "required_dtype": "float32",
+        "state_keys": [
+          "layers",
+          "learning_rate",
+          "lm_head",
+          "norm",
+          "position_embedding",
+          "step",
+          "structure_embedding",
+          "token_embedding"
+        ]
+      },
+      "observed_adamw": false,
+      "observed_class": "cppmega_mlx.training.optimizers_quantized.Adam8bit",
+      "observed_name": "Adam8bit",
+      "observed_source": "cppmega_mlx.training.optimizers_quantized.make_adam8bit",
+      "observed_update": true,
+      "ok": false,
+      "required_master_moment_dtype": "float32",
+      "required_name": "AdamW"
+    },
+    "optimizer_identity_ok": false,
+    "optimizer_update_ok": true,
+    "real_parquet_source_identity": {
+      "observed_data_format": "parquet",
+      "observed_data_path": "data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet",
+      "observed_dataset_format": "parquet",
+      "observed_dataset_name": "clang_semantic_4k_v10",
+      "observed_dataset_source_path": "data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet",
+      "ok": true,
+      "required_dataset_name": "clang_semantic_4k_v10",
+      "required_format": "parquet",
+      "required_path": "data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet"
+    },
+    "required_adamw_master_moment_dtype": "float32",
+    "required_dtype": "bfloat16",
+    "required_model_profile": "local_gb10_quarter",
+    "required_optimizer_name": "AdamW",
+    "step_count_ok": false,
+    "target_parquet_path_ok": true,
+    "uses_full_target_dataset": true
+  },
+  "baseline_row": {
+    "batch_size": 1,
+    "commit": "0bc8460",
+    "dtype": "bfloat16",
+    "gb10_parity_claim": false,
+    "hardware": "Apple M4 Max",
+    "local_only": true,
+    "mode": "eager",
+    "model": "local_gb10_quarter",
+    "route": "AEMEAEMEAEMRA",
+    "seq_len": 4096,
+    "tokens_per_second": 880.7878590487965
+  },
+  "dataset": {
+    "batch_size": 1,
+    "dataset_receipt": {
+      "batch_size": 1,
+      "dropped_samples": 0,
+      "num_batches": 3738,
+      "num_samples": 3738,
+      "parquet_receipt": {
+        "column_types": {
+          "actual_token_count": "int32",
+          "build_info": "large_string",
+          "call_edges": "large_list<element: struct<from: int32, to: int32>>",
+          "chunk_boundaries": "large_list<element: struct<start: int32, end: int32, kind: int8, dep_level: int32, name: string>>",
+          "commit": "large_string",
+          "constituent_provenance": "large_list<element: struct<filepath: string, language_info: string, build_info: string>>",
+          "constituent_provenance_json": "large_string",
+          "language_info": "large_string",
+          "platform_info": "large_string",
+          "repo": "large_string",
+          "structure_ids": "large_list<element: int8>",
+          "text": "large_string",
+          "timestamp": "large_string",
+          "token_ids": "large_list<element: uint32>",
+          "type_edges": "large_list<element: struct<from: int32, to: int32>>"
+        },
+        "columns": [
+          "actual_token_count",
+          "build_info",
+          "call_edges",
+          "chunk_boundaries",
+          "commit",
+          "constituent_provenance",
+          "constituent_provenance_json",
+          "language_info",
+          "platform_info",
+          "repo",
+          "structure_ids",
+          "text",
+          "timestamp",
+          "token_ids",
+          "type_edges"
+        ],
+        "side_channel_sources": {},
+        "skipped_side_channel_columns": [
+          {
+            "column": "structure_ids",
+            "field": "structure_ids",
+            "reason": "not_token_aligned",
+            "type": "large_list<element: int8>"
+          }
+        ],
+        "source_format": "parquet",
+        "token_source": {
+          "column": "token_ids",
+          "mode": "token_column",
+          "type": "large_list<element: uint32>"
+        }
+      },
+      "seq_len": 4096,
+      "side_channels": [],
+      "source_dataset_name": "clang_semantic_4k_v10",
+      "source_format": "parquet",
+      "source_path": "data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet",
+      "token_key": "token_ids"
+    },
+    "dropped_samples": 0,
+    "loop": true,
+    "metadata": {
+      "local_profile_vocab_size": 65536,
+      "megacpp_tokenizer_vocab_size": 131072,
+      "source_format": "parquet",
+      "tokenizer_contract": "megacpp",
+      "vocab_size": 131072
+    },
+    "num_batches": 3738,
+    "num_samples": 3738,
+    "path": "data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet",
+    "seq_len": 4096,
+    "shuffle": false,
+    "side_channel_contract": {
+      "ngram_hash": {
+        "batch_slice": "tokens[:, :-1]",
+        "enabled": false,
+        "heads": 8,
+        "model_derived": true,
+        "orders": [
+          2,
+          3
+        ],
+        "sidecars_supported": false,
+        "source": "input_ids",
+        "threaded_to_model": "HybridTinyLM.__call__(input_ids)"
+      },
+      "structure_side_channels": {
+        "attention_mask_is_loss_only": false,
+        "batch_slice": "tokens[:, :-1]",
+        "model_kwarg_names": [
+          "structure_ids",
+          "dep_levels",
+          "ast_depth_ids",
+          "sibling_index_ids",
+          "node_type_ids"
+        ],
+        "threaded_to_model": []
+      },
+      "unsupported_sidecars_fail_closed": true
+    },
+    "side_channels": [],
+    "token_key": "token_ids"
+  },
+  "full_m0_4_acceptance_claim": false,
+  "gb10_training_correctness_claim": false,
+  "issue": {
+    "id": "cppmega-mlx-t8f.4",
+    "title": "M0.4: one bf16 training step + 100-step loss decrease on local parquet samples"
+  },
+  "local_gb10_quarter_preflight": {
+    "allocation_attempted": true,
+    "allocation_mode": "full_profile_allocation_probe",
+    "allocation_probe": {
+      "allocation_mode": "full_profile_allocation_probe",
+      "allocation_ready": true,
+      "eval_scope": "parameters_only_no_forward_no_training",
+      "forward_executed": false,
+      "geometry_matches_required": true,
+      "memory_after": {
+        "active_memory_bytes": 3593123236,
+        "cache_memory_bytes": 2253944008,
+        "peak_memory_bytes": 4887988604
+      },
+      "memory_before": {
+        "active_memory_bytes": 8,
+        "cache_memory_bytes": 8,
+        "peak_memory_bytes": 0
+      },
+      "model_class": "HybridTinyLM",
+      "profile_geometry": {
+        "depth": 13,
+        "ffn_hidden_size": 18944,
+        "head_dim": 128,
+        "hidden_size": 3584,
+        "mtp": {
+          "beta": 0.6,
+          "depth": 2,
+          "loss_weight": 0.3
+        },
+        "num_attention_heads": 28,
+        "pattern": "AEMEAEMEAEMR",
+        "vocab_size": 65536
+      },
+      "profile_name": "local_gb10_quarter",
+      "required_geometry": {
+        "depth": 13,
+        "ffn_hidden_size": 18944,
+        "head_dim": 128,
+        "hidden_size": 3584,
+        "mtp": {
+          "beta": 0.6,
+          "depth": 2,
+          "loss_weight": 0.3
+        },
+        "num_attention_heads": 28,
+        "pattern": "AEMEAEMEAEMR",
+        "vocab_size": 65536
+      },
+      "source": "cppmega_mlx.recipes.model_factory",
+      "status": "ok",
+      "training_executed": false
+    },
+    "allocation_ready": true,
+    "blockers": [],
+    "geometry_matches_required": true,
+    "ok": true,
+    "profile_geometry": {
+      "depth": 13,
+      "ffn_hidden_size": 18944,
+      "head_dim": 128,
+      "hidden_size": 3584,
+      "mtp": {
+        "beta": 0.6,
+        "depth": 2,
+        "loss_weight": 0.3
+      },
+      "num_attention_heads": 28,
+      "pattern": "AEMEAEMEAEMR",
+      "vocab_size": 65536
+    },
+    "profile_name": "local_gb10_quarter",
+    "required_geometry": {
+      "depth": 13,
+      "ffn_hidden_size": 18944,
+      "head_dim": 128,
+      "hidden_size": 3584,
+      "mtp": {
+        "beta": 0.6,
+        "depth": 2,
+        "loss_weight": 0.3
+      },
+      "num_attention_heads": 28,
+      "pattern": "AEMEAEMEAEMR",
+      "vocab_size": 65536
+    },
+    "source": "cppmega_mlx.recipes.model_factory",
+    "tokenizer_contract": {
+      "blocker_id": "cppmega-mlx-t8f.1",
+      "expected_vocab_size": 65536,
+      "milestone": "M0.1",
+      "reason": "M0.1 is closed: the deployed GB10 65K tokenizer is vendored with id 7=<CODE_START>, id 45=<FIM_INSTRUCTION>, id 46=<SPACE>, and id 47=<NL>; MLX and upstream wrappers use explicit whitespace-sentinel encode/decode with Mac-vs-upstream parity receipts",
+      "required_special_tokens": {
+        "<BOS>": 2,
+        "<CODE_START>": 7,
+        "<EOS>": 3,
+        "<FIM_INSTRUCTION>": 45,
+        "<FIM_MIDDLE>": 5,
+        "<FIM_PREFIX>": 4,
+        "<FIM_SUFFIX>": 6,
+        "<NL>": 47,
+        "<SPACE>": 46
+      },
+      "resolved": true
+    }
+  },
+  "local_only": true,
+  "m4_vs_gb10_throughput_parity_claim": false,
+  "memory": {
+    "after": {
+      "active_memory_bytes": 7251171956,
+      "cache_memory_bytes": 63609851535,
+      "peak_memory_bytes": 38769497053
+    },
+    "applied_memory_limit_api_path": null,
+    "before": {
+      "active_memory_bytes": 8,
+      "cache_memory_bytes": 8,
+      "peak_memory_bytes": 0
+    },
+    "clear_cache_cadence_recorded": false,
+    "clear_cache_event": null,
+    "clear_cache_event_count": 0,
+    "clear_cache_event_recorded": false,
+    "clear_cache_event_scope": null,
+    "clear_cache_events": [],
+    "clear_cache_every_steps": null,
+    "memory_limit": {
+      "applied": false,
+      "apply_requested": false,
+      "metal_limit_api_path": null,
+      "mode": "off",
+      "plan": null,
+      "previous_metal_limit_bytes": null,
+      "previous_wired_limit_bytes": null,
+      "total_bytes_source": null
+    },
+    "memory_limit_api_status": {
+      "metal_memory_limit_available": true,
+      "preferred_memory_limit_api_path": "mx.metal.set_memory_limit",
+      "root_memory_limit_available": true,
+      "supported_memory_limit_api_paths": [
+        "mx.metal.set_memory_limit",
+        "mx.set_memory_limit"
+      ],
+      "wired_limit_available": true
+    },
+    "peak_memory_bytes": 38769497053,
+    "trainer_memory": {
+      "after": {
+        "active_memory_bytes": 7251171956,
+        "cache_memory_bytes": 63609851535,
+        "peak_memory_bytes": 38769497053
+      },
+      "allocation_after_parameters": {
+        "active_memory_bytes": 3593123236,
+        "cache_memory_bytes": 2253944008,
+        "peak_memory_bytes": 4887988604
+      },
+      "before": {
+        "active_memory_bytes": 8,
+        "cache_memory_bytes": 8,
+        "peak_memory_bytes": 0
+      },
+      "clear_cache_event_count": 0,
+      "clear_cache_events": [],
+      "clear_cache_every_steps": null,
+      "peak_memory_bytes": 38769497053,
+      "peak_memory_reset": false
+    }
+  },
+  "model": {
+    "backend_plan": {
+      "attention_backends": [
+        "mlx.fast.sdpa",
+        "mlx.fast.sdpa",
+        "mlx.fast.sdpa",
+        "mlx.fast.sdpa"
+      ],
+      "backend_summary": {
+        "attention": 4,
+        "m2rnn": 1,
+        "mamba3": 3,
+        "moe": 5
+      },
+      "execution_backend": "mlx+mlx.fast.sdpa",
+      "layer_backends": [
+        "attention",
+        "moe",
+        "mamba3",
+        "moe",
+        "attention",
+        "moe",
+        "mamba3",
+        "moe",
+        "attention",
+        "moe",
+        "mamba3",
+        "m2rnn",
+        "attention"
+      ],
+      "route_roles": [
+        "attention",
+        "moe",
+        "mamba3",
+        "moe",
+        "attention",
+        "moe",
+        "mamba3",
+        "moe",
+        "attention",
+        "moe",
+        "mamba3",
+        "m2rnn",
+        "attention"
+      ],
+      "route_symbols": "AEMEAEMEAEMRA"
+    },
+    "config": {
+      "config": {
+        "depth": 13,
+        "dsa_a_layer_ranks": [
+          1,
+          2,
+          3
+        ],
+        "grad_checkpoint": true,
+        "hidden_size": 3584,
+        "m2rnn_chunk_size": 64,
+        "m2rnn_conv_kernel": 4,
+        "m2rnn_k_head_dim": 64,
+        "m2rnn_num_f_heads": 2,
+        "m2rnn_num_k_heads": 1,
+        "m2rnn_num_q_heads": 1,
+        "m2rnn_num_v_heads": 2,
+        "m2rnn_num_weight_heads": 1,
+        "m2rnn_v_head_dim": 16,
+        "mamba_chunk_size": 64,
+        "mamba_conv_kernel": 3,
+        "mamba_expand": 2,
+        "mamba_groups": 8,
+        "mamba_head_dim": 64,
+        "mamba_is_mimo": true,
+        "mamba_mimo_rank": 4,
+        "mamba_rope_fraction": 0.5,
+        "mamba_state_dim": 64,
+        "max_seq_length": 4096,
+        "mhc_enabled": false,
+        "moe_activation": "swiglu",
+        "moe_expert_hidden_size": 896,
+        "moe_num_experts": 16,
+        "moe_shared_expert_hidden_size": 1024,
+        "moe_top_k": 4,
+        "ngram_hash_dropout": 0.0,
+        "ngram_hash_embed_dim": 16,
+        "ngram_hash_enabled": false,
+        "ngram_hash_heads": 8,
+        "ngram_hash_orders": [
+          2,
+          3
+        ],
+        "ngram_hash_seed": null,
+        "ngram_hash_table_size": 500000,
+        "num_attention_heads": 28,
+        "pattern": "AEMEAEMEAEMR",
+        "structure_bottleneck_dim": 64,
+        "structure_components": "core",
+        "structure_max_ast_depth": 64,
+        "structure_max_dep_level": 16,
+        "structure_max_sibling_index": 64,
+        "structure_num_categories": 9,
+        "structure_num_node_types": 256,
+        "structure_vocab_size": 32,
+        "vocab_size": 65536
+      },
+      "depth": 13,
+      "dsa_a_layer_ranks": [
+        1,
+        2,
+        3
+      ],
+      "ffn_hidden_size": 18944,
+      "head_dim": 128,
+      "hidden_size": 3584,
+      "max_seq_length": 4096,
+      "mtp": {
+        "beta": 0.6,
+        "depth": 2,
+        "loss_weight": 0.3
+      },
+      "mtp_profile": {
+        "beta": 0.6,
+        "depth": 2,
+        "loss_weight": 0.3
+      },
+      "num_attention_heads": 28,
+      "pattern": "AEMEAEMEAEMR",
+      "profile": "local_gb10_quarter",
+      "source": "cppmega_mlx.recipes.model_factory",
+      "vocab_size": 65536
+    },
+    "local_gb10_quarter_preflight": {
+      "allocation_attempted": true,
+      "allocation_mode": "full_profile_allocation_probe",
+      "allocation_probe": {
+        "allocation_mode": "full_profile_allocation_probe",
+        "allocation_ready": true,
+        "eval_scope": "parameters_only_no_forward_no_training",
+        "forward_executed": false,
+        "geometry_matches_required": true,
+        "memory_after": {
+          "active_memory_bytes": 3593123236,
+          "cache_memory_bytes": 2253944008,
+          "peak_memory_bytes": 4887988604
+        },
+        "memory_before": {
+          "active_memory_bytes": 8,
+          "cache_memory_bytes": 8,
+          "peak_memory_bytes": 0
+        },
+        "model_class": "HybridTinyLM",
+        "profile_geometry": {
+          "depth": 13,
+          "ffn_hidden_size": 18944,
+          "head_dim": 128,
+          "hidden_size": 3584,
+          "mtp": {
+            "beta": 0.6,
+            "depth": 2,
+            "loss_weight": 0.3
+          },
+          "num_attention_heads": 28,
+          "pattern": "AEMEAEMEAEMR",
+          "vocab_size": 65536
+        },
+        "profile_name": "local_gb10_quarter",
+        "required_geometry": {
+          "depth": 13,
+          "ffn_hidden_size": 18944,
+          "head_dim": 128,
+          "hidden_size": 3584,
+          "mtp": {
+            "beta": 0.6,
+            "depth": 2,
+            "loss_weight": 0.3
+          },
+          "num_attention_heads": 28,
+          "pattern": "AEMEAEMEAEMR",
+          "vocab_size": 65536
+        },
+        "source": "cppmega_mlx.recipes.model_factory",
+        "status": "ok",
+        "training_executed": false
+      },
+      "allocation_ready": true,
+      "blockers": [],
+      "geometry_matches_required": true,
+      "ok": true,
+      "profile_geometry": {
+        "depth": 13,
+        "ffn_hidden_size": 18944,
+        "head_dim": 128,
+        "hidden_size": 3584,
+        "mtp": {
+          "beta": 0.6,
+          "depth": 2,
+          "loss_weight": 0.3
+        },
+        "num_attention_heads": 28,
+        "pattern": "AEMEAEMEAEMR",
+        "vocab_size": 65536
+      },
+      "profile_name": "local_gb10_quarter",
+      "required_geometry": {
+        "depth": 13,
+        "ffn_hidden_size": 18944,
+        "head_dim": 128,
+        "hidden_size": 3584,
+        "mtp": {
+          "beta": 0.6,
+          "depth": 2,
+          "loss_weight": 0.3
+        },
+        "num_attention_heads": 28,
+        "pattern": "AEMEAEMEAEMR",
+        "vocab_size": 65536
+      },
+      "source": "cppmega_mlx.recipes.model_factory",
+      "tokenizer_contract": {
+        "blocker_id": "cppmega-mlx-t8f.1",
+        "expected_vocab_size": 65536,
+        "milestone": "M0.1",
+        "reason": "M0.1 is closed: the deployed GB10 65K tokenizer is vendored with id 7=<CODE_START>, id 45=<FIM_INSTRUCTION>, id 46=<SPACE>, and id 47=<NL>; MLX and upstream wrappers use explicit whitespace-sentinel encode/decode with Mac-vs-upstream parity receipts",
+        "required_special_tokens": {
+          "<BOS>": 2,
+          "<CODE_START>": 7,
+          "<EOS>": 3,
+          "<FIM_INSTRUCTION>": 45,
+          "<FIM_MIDDLE>": 5,
+          "<FIM_PREFIX>": 4,
+          "<FIM_SUFFIX>": 6,
+          "<NL>": 47,
+          "<SPACE>": 46
+        },
+        "resolved": true
+      }
+    },
+    "name": "local_gb10_quarter",
+    "parameter_count": 1796521610,
+    "profile": "local_gb10_quarter",
+    "profile_matches_required": true,
+    "required_profile": "local_gb10_quarter",
+    "route_roles": [
+      "attention",
+      "moe",
+      "mamba3",
+      "moe",
+      "attention",
+      "moe",
+      "mamba3",
+      "moe",
+      "attention",
+      "moe",
+      "mamba3",
+      "m2rnn",
+      "attention"
+    ],
+    "route_symbols": "AEMEAEMEAEMRA",
+    "source": "cppmega_mlx.recipes.model_factory"
+  },
+  "receipt_schema_version": 1,
+  "receipt_scope": "local_mlx_m04_train_step",
+  "software": {
+    "device": {
+      "default_device": "Device(gpu, 0)",
+      "machine": "arm64",
+      "metal_available": true,
+      "mlx": "0.32.0.dev20260509+85a0e7e4a",
+      "mlx_device_info": {
+        "architecture": "applegpu_g16s",
+        "device_name": "Apple M4 Max",
+        "max_buffer_length": 86586540032,
+        "max_recommended_working_set_size": 115448725504,
+        "memory_size": 137438953472,
+        "resource_limit": 499000
+      },
+      "mlx_disable_compile": null,
+      "mlx_lm": "0.31.3",
+      "mlx_metal": "0.31.2",
+      "platform": "macOS-26.4.1-arm64-arm-64bit-Mach-O",
+      "python": "3.13.12"
+    },
+    "git_commit": "0bc8460"
+  },
+  "status": "ok",
+  "timing": {
+    "mean_step_time_s": 4.659559912595432,
+    "median_step_time_s": 4.594491166470107,
+    "step_times_s": [
+      5.429720625048503,
+      5.267622915911488,
+      4.602690458996221,
+      4.575258833006956,
+      4.592135124956258,
+      4.552917875000276,
+      4.5708098750328645,
+      4.5657415830064565,
+      4.623022667015903,
+      4.522951832972467,
+      4.596847207983956,
+      4.626796041964553,
+      4.6091452919645235,
+      4.646065084030852,
+      4.596884708967991,
+      4.533546417020261,
+      4.554731542011723,
+      4.566139833070338,
+      4.604550041956827,
+      4.553620291990228
+    ],
+    "tokens_per_second": 880.7878590487965
+  },
+  "training": {
+    "all_finite": true,
+    "final_loss": 6.727241516113281,
+    "grad_checkpoint": {
+      "expectation_satisfied": true,
+      "observed_enabled": true,
+      "required": true,
+      "source": "TrainHybridTinyConfig.grad_checkpoint -> HybridTinyConfig.grad_checkpoint -> HybridTinyLM mx.checkpoint block wrapper"
+    },
+    "initial_loss": 11.369969367980957,
+    "loss_decrease_required": false,
+    "loss_decrease_satisfied": true,
+    "loss_decreased": true,
+    "losses": [
+      11.369969367980957,
+      11.13786792755127,
+      11.005134582519531,
+      10.652419090270996,
+      10.467569351196289,
+      10.003692626953125,
+      9.838236808776855,
+      9.448952674865723,
+      9.087677001953125,
+      8.98627758026123,
+      8.899813652038574,
+      9.127203941345215,
+      8.826567649841309,
+      7.819733619689941,
+      7.6061015129089355,
+      7.29116678237915,
+      6.8199262619018555,
+      7.032783031463623,
+      7.11243200302124,
+      6.727241516113281
+    ],
+    "mean_loss": 8.963038349151612,
+    "optimizer": {
+      "adamw": false,
+      "adamw_family": true,
+      "base_class": "mlx.optimizers.Optimizer",
+      "class": "cppmega_mlx.training.optimizers_quantized.Adam8bit",
+      "construction": "repo-local make_adam8bit(learning_rate=config.learning_rate, weight_decay=config.weight_decay, quant_scheme=..., min_8bit_size=4096)",
+      "key": "adam8bit",
+      "learning_rate": 1e-05,
+      "master_moment_dtype_ok": false,
+      "master_moment_evidence": {
+        "observed_moment_dtype_count": 90,
+        "observed_moment_dtypes": {
+          "layers/0/block/rope_inv_freq/m": "float32",
+          "layers/0/block/rope_inv_freq/v": "float32",
+          "layers/0/norm/weight/m": "float32",
+          "layers/0/norm/weight/v": "float32",
+          "layers/1/norm/weight/m": "float32",
+          "layers/1/norm/weight/v": "float32",
+          "layers/10/block/B_bias/m": "float32",
+          "layers/10/block/B_bias/v": "float32",
+          "layers/10/block/B_norm_weight/m": "float32",
+          "layers/10/block/B_norm_weight/v": "float32",
+          "layers/10/block/C_bias/m": "float32",
+          "layers/10/block/C_bias/v": "float32",
+          "layers/10/block/C_norm_weight/m": "float32",
+          "layers/10/block/C_norm_weight/v": "float32",
+          "layers/10/block/D/m": "float32",
+          "layers/10/block/D/v": "float32",
+          "layers/10/block/dt_bias/m": "float32",
+          "layers/10/block/dt_bias/v": "float32",
+          "layers/10/norm/weight/m": "float32",
+          "layers/10/norm/weight/v": "float32",
+          "layers/11/block/A_log/m": "float32",
+          "layers/11/block/A_log/v": "float32",
+          "layers/11/block/D/m": "float32",
+          "layers/11/block/D/v": "float32",
+          "layers/11/block/conv_bias/m": "float32",
+          "layers/11/block/conv_bias/v": "float32",
+          "layers/11/block/conv_weight/m": "float32",
+          "layers/11/block/conv_weight/v": "float32",
+          "layers/11/block/dt_bias/m": "float32",
+          "layers/11/block/dt_bias/v": "float32",
+          "layers/11/block/g_norm/weight/m": "float32",
+          "layers/11/block/g_norm/weight/v": "float32",
+          "layers/11/block/state_weight/m": "float32",
+          "layers/11/block/state_weight/v": "float32",
+          "layers/11/norm/weight/m": "float32",
+          "layers/11/norm/weight/v": "float32",
+          "layers/12/block/rope_inv_freq/m": "float32",
+          "layers/12/block/rope_inv_freq/v": "float32",
+          "layers/12/norm/weight/m": "float32",
+          "layers/12/norm/weight/v": "float32",
+          "layers/2/block/B_bias/m": "float32",
+          "layers/2/block/B_bias/v": "float32",
+          "layers/2/block/B_norm_weight/m": "float32",
+          "layers/2/block/B_norm_weight/v": "float32",
+          "layers/2/block/C_bias/m": "float32",
+          "layers/2/block/C_bias/v": "float32",
+          "layers/2/block/C_norm_weight/m": "float32",
+          "layers/2/block/C_norm_weight/v": "float32",
+          "layers/2/block/D/m": "float32",
+          "layers/2/block/D/v": "float32",
+          "layers/2/block/dt_bias/m": "float32",
+          "layers/2/block/dt_bias/v": "float32",
+          "layers/2/norm/weight/m": "float32",
+          "layers/2/norm/weight/v": "float32",
+          "layers/3/norm/weight/m": "float32",
+          "layers/3/norm/weight/v": "float32",
+          "layers/4/block/rope_inv_freq/m": "float32",
+          "layers/4/block/rope_inv_freq/v": "float32",
+          "layers/4/norm/weight/m": "float32",
+          "layers/4/norm/weight/v": "float32",
+          "layers/5/norm/weight/m": "float32",
+          "layers/5/norm/weight/v": "float32",
+          "layers/6/block/B_bias/m": "float32",
+          "layers/6/block/B_bias/v": "float32"
+        },
+        "observed_moment_dtypes_sampled": 64,
+        "observed_moment_dtypes_truncated": true,
+        "observed_parameter_dtype": "bfloat16",
+        "ok": false,
+        "optimizer_base_class": "mlx.optimizers.Optimizer",
+        "optimizer_class": "cppmega_mlx.training.optimizers_quantized.Adam8bit",
+        "reason": "M0.4 acceptance still requires repo-local AdamW fp32 moments; this receipt records an optimizer-matrix variant.",
+        "required_dtype": "float32",
+        "state_keys": [
+          "layers",
+          "learning_rate",
+          "lm_head",
+          "norm",
+          "position_embedding",
+          "step",
+          "structure_embedding",
+          "token_embedding"
+        ]
+      },
+      "name": "Adam8bit",
+      "name_matches_required": false,
+      "quantized_state": true,
+      "required_master_moment_dtype": "float32",
+      "required_name": "AdamW",
+      "source": "cppmega_mlx.training.optimizers_quantized.make_adam8bit",
+      "state_evidence": {
+        "observed_adamw_moment_dtype_count": 90,
+        "observed_adamw_moment_dtypes": {
+          "layers/0/block/rope_inv_freq/m": "float32",
+          "layers/0/block/rope_inv_freq/v": "float32",
+          "layers/0/norm/weight/m": "float32",
+          "layers/0/norm/weight/v": "float32",
+          "layers/1/norm/weight/m": "float32",
+          "layers/1/norm/weight/v": "float32",
+          "layers/10/block/B_bias/m": "float32",
+          "layers/10/block/B_bias/v": "float32",
+          "layers/10/block/B_norm_weight/m": "float32",
+          "layers/10/block/B_norm_weight/v": "float32",
+          "layers/10/block/C_bias/m": "float32",
+          "layers/10/block/C_bias/v": "float32",
+          "layers/10/block/C_norm_weight/m": "float32",
+          "layers/10/block/C_norm_weight/v": "float32",
+          "layers/10/block/D/m": "float32",
+          "layers/10/block/D/v": "float32",
+          "layers/10/block/dt_bias/m": "float32",
+          "layers/10/block/dt_bias/v": "float32",
+          "layers/10/norm/weight/m": "float32",
+          "layers/10/norm/weight/v": "float32",
+          "layers/11/block/A_log/m": "float32",
+          "layers/11/block/A_log/v": "float32",
+          "layers/11/block/D/m": "float32",
+          "layers/11/block/D/v": "float32",
+          "layers/11/block/conv_bias/m": "float32",
+          "layers/11/block/conv_bias/v": "float32",
+          "layers/11/block/conv_weight/m": "float32",
+          "layers/11/block/conv_weight/v": "float32",
+          "layers/11/block/dt_bias/m": "float32",
+          "layers/11/block/dt_bias/v": "float32",
+          "layers/11/block/g_norm/weight/m": "float32",
+          "layers/11/block/g_norm/weight/v": "float32",
+          "layers/11/block/state_weight/m": "float32",
+          "layers/11/block/state_weight/v": "float32",
+          "layers/11/norm/weight/m": "float32",
+          "layers/11/norm/weight/v": "float32",
+          "layers/12/block/rope_inv_freq/m": "float32",
+          "layers/12/block/rope_inv_freq/v": "float32",
+          "layers/12/norm/weight/m": "float32",
+          "layers/12/norm/weight/v": "float32",
+          "layers/2/block/B_bias/m": "float32",
+          "layers/2/block/B_bias/v": "float32",
+          "layers/2/block/B_norm_weight/m": "float32",
+          "layers/2/block/B_norm_weight/v": "float32",
+          "layers/2/block/C_bias/m": "float32",
+          "layers/2/block/C_bias/v": "float32",
+          "layers/2/block/C_norm_weight/m": "float32",
+          "layers/2/block/C_norm_weight/v": "float32",
+          "layers/2/block/D/m": "float32",
+          "layers/2/block/D/v": "float32",
+          "layers/2/block/dt_bias/m": "float32",
+          "layers/2/block/dt_bias/v": "float32",
+          "layers/2/norm/weight/m": "float32",
+          "layers/2/norm/weight/v": "float32",
+          "layers/3/norm/weight/m": "float32",
+          "layers/3/norm/weight/v": "float32",
+          "layers/4/block/rope_inv_freq/m": "float32",
+          "layers/4/block/rope_inv_freq/v": "float32",
+          "layers/4/norm/weight/m": "float32",
+          "layers/4/norm/weight/v": "float32",
+          "layers/5/norm/weight/m": "float32",
+          "layers/5/norm/weight/v": "float32",
+          "layers/6/block/B_bias/m": "float32",
+          "layers/6/block/B_bias/v": "float32"
+        },
+        "observed_adamw_moment_dtypes_sampled": 64,
+        "observed_adamw_moment_dtypes_truncated": true,
+        "observed_parameter_dtype": "bfloat16",
+        "state_dtype_breakdown_bytes": {
+          "learning_rate": {
+            "float32": 4
+          },
+          "m": {
+            "float32": 313896
+          },
+          "m_absmax": {
+            "float32": 28069424
+          },
+          "m_quant": {
+            "uint8": 1796443136
+          },
+          "step": {
+            "uint64": 8
+          },
+          "v": {
+            "float32": 313896
+          },
+          "v_absmax": {
+            "float32": 28069424
+          },
+          "v_quant": {
+            "uint8": 1796443136
+          }
+        },
+        "state_keys": [
+          "layers",
+          "learning_rate",
+          "lm_head",
+          "norm",
+          "position_embedding",
+          "step",
+          "structure_embedding",
+          "token_embedding"
+        ]
+      },
+      "update_observed": true,
+      "variant": {
+        "key": "adam8bit",
+        "quant_scheme": "symmetric_int8_v1",
+        "requested": "adam8bit",
+        "source": "cli"
+      },
+      "weight_decay": 0.0
+    },
+    "optimizer_updated": true,
+    "step_metrics": [
+      {
+        "compiled": false,
+        "loss": 11.369969367980957,
+        "ntokens": 4095,
+        "seconds": 5.429720625048503,
+        "step": 1,
+        "tokens_per_second": 754.1824492974571,
+        "trained_tokens": 4095,
+        "updated": true
+      },
+      {
+        "compiled": false,
+        "loss": 11.13786792755127,
+        "ntokens": 4095,
+        "seconds": 5.267622915911488,
+        "step": 2,
+        "tokens_per_second": 777.3904976437399,
+        "trained_tokens": 8190,
+        "updated": true
+      },
+      {
+        "compiled": false,
+        "loss": 11.005134582519531,
+        "ntokens": 4095,
+        "seconds": 4.602690458996221,
+        "step": 3,
+        "tokens_per_second": 889.6970231826232,
+        "trained_tokens": 12285,
+        "updated": true
+      },
+      {
+        "compiled": false,
+        "loss": 10.652419090270996,
+        "ntokens": 4095,
+        "seconds": 4.575258833006956,
+        "step": 4,
+        "tokens_per_second": 895.0313303496057,
+        "trained_tokens": 16380,
+        "updated": true
+      },
+      {
+        "compiled": false,
+        "loss": 10.467569351196289,
+        "ntokens": 4095,
+        "seconds": 4.592135124956258,
+        "step": 5,
+        "tokens_per_second": 891.742052132886,
+        "trained_tokens": 20475,
+        "updated": true
+      },
+      {
+        "compiled": false,
+        "loss": 10.003692626953125,
+        "ntokens": 4095,
+        "seconds": 4.552917875000276,
+        "step": 6,
+        "tokens_per_second": 899.4232078037982,
+        "trained_tokens": 24570,
+        "updated": true
+      },
+      {
+        "compiled": false,
+        "loss": 9.838236808776855,
+        "ntokens": 4095,
+        "seconds": 4.5708098750328645,
+        "step": 7,
+        "tokens_per_second": 895.9025012981002,
+        "trained_tokens": 28665,
+        "updated": true
+      },
+      {
+        "compiled": false,
+        "loss": 9.448952674865723,
+        "ntokens": 4095,
+        "seconds": 4.5657415830064565,
+        "step": 8,
+        "tokens_per_second": 896.8970156439555,
+        "trained_tokens": 32760,
+        "updated": true
+      },
+      {
+        "compiled": false,
+        "loss": 9.087677001953125,
+        "ntokens": 4095,
+        "seconds": 4.623022667015903,
+        "step": 9,
+        "tokens_per_second": 885.7841059739527,
+        "trained_tokens": 36855,
+        "updated": true
+      },
+      {
+        "compiled": false,
+        "loss": 8.98627758026123,
+        "ntokens": 4095,
+        "seconds": 4.522951832972467,
+        "step": 10,
+        "tokens_per_second": 905.3821820845661,
+        "trained_tokens": 40950,
+        "updated": true
+      },
+      {
+        "compiled": false,
+        "loss": 8.899813652038574,
+        "ntokens": 4095,
+        "seconds": 4.596847207983956,
+        "step": 11,
+        "tokens_per_second": 890.8279554925534,
+        "trained_tokens": 45045,
+        "updated": true
+      },
+      {
+        "compiled": false,
+        "loss": 9.127203941345215,
+        "ntokens": 4095,
+        "seconds": 4.626796041964553,
+        "step": 12,
+        "tokens_per_second": 885.061706385754,
+        "trained_tokens": 49140,
+        "updated": true
+      },
+      {
+        "compiled": false,
+        "loss": 8.826567649841309,
+        "ntokens": 4095,
+        "seconds": 4.6091452919645235,
+        "step": 13,
+        "tokens_per_second": 888.4510555870581,
+        "trained_tokens": 53235,
+        "updated": true
+      },
+      {
+        "compiled": false,
+        "loss": 7.819733619689941,
+        "ntokens": 4095,
+        "seconds": 4.646065084030852,
+        "step": 14,
+        "tokens_per_second": 881.3910106586892,
+        "trained_tokens": 57330,
+        "updated": true
+      },
+      {
+        "compiled": false,
+        "loss": 7.6061015129089355,
+        "ntokens": 4095,
+        "seconds": 4.596884708967991,
+        "step": 15,
+        "tokens_per_second": 890.8206881958836,
+        "trained_tokens": 61425,
+        "updated": true
+      },
+      {
+        "compiled": false,
+        "loss": 7.29116678237915,
+        "ntokens": 4095,
+        "seconds": 4.533546417020261,
+        "step": 16,
+        "tokens_per_second": 903.2663666188947,
+        "trained_tokens": 65520,
+        "updated": true
+      },
+      {
+        "compiled": false,
+        "loss": 6.8199262619018555,
+        "ntokens": 4095,
+        "seconds": 4.554731542011723,
+        "step": 17,
+        "tokens_per_second": 899.0650628316351,
+        "trained_tokens": 69615,
+        "updated": true
+      },
+      {
+        "compiled": false,
+        "loss": 7.032783031463623,
+        "ntokens": 4095,
+        "seconds": 4.566139833070338,
+        "step": 18,
+        "tokens_per_second": 896.8187899857775,
+        "trained_tokens": 73710,
+        "updated": true
+      },
+      {
+        "compiled": false,
+        "loss": 7.11243200302124,
+        "ntokens": 4095,
+        "seconds": 4.604550041956827,
+        "step": 19,
+        "tokens_per_second": 889.3377121947229,
+        "trained_tokens": 77805,
+        "updated": true
+      },
+      {
+        "compiled": false,
+        "loss": 6.727241516113281,
+        "ntokens": 4095,
+        "seconds": 4.553620291990228,
+        "step": 20,
+        "tokens_per_second": 899.2844676142769,
+        "trained_tokens": 81900,
+        "updated": true
+      }
+    ],
+    "steps_completed": 20,
+    "trained_tokens": 81900
+  },
+  "workload": {
+    "apply_memory_limit_plan": false,
+    "batch_size": 1,
+    "clear_cache_every_steps": null,
+    "compile_requested": false,
+    "data_format": "parquet",
+    "data_path": "data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet",
+    "dtype": "bfloat16",
+    "grad_checkpoint": true,
+    "learning_rate": 1e-05,
+    "memory_limit_metal_ratio": 0.85,
+    "memory_limit_total_bytes": null,
+    "memory_limit_wired_ratio": 0.7,
+    "mode": "eager",
+    "model_profile": "local_gb10_quarter",
+    "optimizer": {
+      "key": "adam8bit",
+      "quant_scheme": "symmetric_int8_v1",
+      "requested": "adam8bit",
+      "source": "cli"
+    },
+    "probe_local_gb10_quarter_allocation": false,
+    "require_loss_decrease": false,
+    "seq_len": 4096,
+    "steps_requested": 20,
+    "synthetic": false,
+    "target_data_path": "data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet",
+    "tokens_per_step": 4095
+  }
+}

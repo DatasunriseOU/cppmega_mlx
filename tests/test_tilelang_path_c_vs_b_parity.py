@@ -7,11 +7,8 @@ agent E flagged this as the path C vs path B coverage hole; Meta agent F's
 design audit confirmed the divergence between the two surfaces.
 
 This file consolidates parity into one parametrized sweep so any divergence
-shows up in one place. For pairs where the Path C module does not yet expose
-a public ``apply`` (per Meta-F: blockscaled, sparse_mla_fp8 today), the
-parametrize entry uses ``pytest.xfail(strict=True)`` -- per the cppmega
-memory rule preferring strict-xfail to plain skip -- so the test will
-auto-flip to a real numeric check the day Path C lands its apply.
+shows up in one place. Quantized Path C entries use prepared FP8/scales
+buffers so the test does not bless hidden high-level staging copies.
 
 Tolerance convention follows ``test_tilelang_mamba3_path_c.py``:
 ``atol=1e-4 / rtol=1e-3`` on fp32 paths; looser on bf16/fp8 carriers.
@@ -169,15 +166,101 @@ def _drive_fp8_vecmat(shape: str) -> tuple[np.ndarray, np.ndarray, float, float]
     return _np(cast(mx.array, out_b)), _np(cast(mx.array, out_c)), atol, rtol
 
 
-def _drive_path_c_only(_shape: str) -> tuple[np.ndarray, np.ndarray, float, float]:
-    """Used for kernel pairs where Path C exposes only probes / partial
-    reducers, not a public end-to-end apply. The harness wraps callers of
-    this driver in xfail(strict=True), so when the apply lands the test
-    flips to PASS and we get real coverage."""
-
-    raise NotImplementedError(
-        "path c only exposes QK probe / reducers -- no apply yet (see routing doc)"
+def _drive_sparse_mla_fp8(shape: str) -> tuple[np.ndarray, np.ndarray, float, float]:
+    from cppmega_mlx.nn.sparse_mla import _resolve_shapes
+    from cppmega_mlx.nn._tilelang.sparse_mla_fp8 import (
+        _to_fp8_with_per_tensor_scale,
+        sparse_mla_fp8_fwd_metal_impl,
     )
+    from cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c import (
+        sparse_mla_fp8_path_c_apply,
+    )
+
+    rng = np.random.RandomState(4)
+    if shape == "prepared-small":
+        B, S, H, D, G, topk, Skv = 1, 2, 2, 64, 1, 4, 8
+    else:
+        raise ValueError(f"unknown sparse_mla_fp8 shape: {shape}")
+
+    q = mx.array((rng.standard_normal((B, S, H, D)) * 0.1).astype(np.float16))
+    kv = mx.array((rng.standard_normal((B, Skv, G, D)) * 0.1).astype(np.float16))
+    indices = mx.array(rng.randint(0, Skv, size=(B, S, G, topk)).astype(np.int32))
+    sm_scale = D ** -0.5
+    q_fp8, q_scale = _to_fp8_with_per_tensor_scale(q)
+    kv_fp8, kv_scale = _to_fp8_with_per_tensor_scale(kv)
+    shapes = _resolve_shapes(q, kv, indices, d_v=D)
+    path_b = sparse_mla_fp8_fwd_metal_impl(
+        q_fp8,
+        q_scale,
+        kv_fp8,
+        kv_scale,
+        indices,
+        sm_scale=sm_scale,
+        d_v=D,
+        shapes=shapes,
+    )
+    if path_b is None:
+        raise NotImplementedError("sparse_mla_fp8 Path B prepared-buffer kernel unavailable")
+    out_b, _lse_b = path_b
+    out_c = sparse_mla_fp8_path_c_apply(
+        q_fp8,
+        q_scale,
+        kv_fp8,
+        kv_scale,
+        indices,
+        sm_scale=sm_scale,
+        d_v=D,
+        force_path_c=True,
+    )
+    if out_c is None:
+        raise NotImplementedError("sparse_mla_fp8_path_c_apply returned None")
+    atol, rtol = _TOLERANCE_BY_DTYPE["fp8"]
+    return _np(out_b.astype(mx.float32)), _np(cast(mx.array, out_c).astype(mx.float32)), atol, rtol
+
+
+def _drive_sparse_mla_blockscaled(shape: str) -> tuple[np.ndarray, np.ndarray, float, float]:
+    from cppmega_mlx.nn._tilelang.sparse_mla_blockscaled import (
+        _quantize_mxfp8,
+        _unpack_mxfp8_to_uint8,
+        sparse_mla_blockscaled_fwd_metal,
+    )
+    from cppmega_mlx.nn._tilelang.sparse_mla_blockscaled_path_c import (
+        sparse_mla_blockscaled_path_c_apply,
+    )
+
+    rng = np.random.RandomState(5)
+    if shape == "prepared-small":
+        B, S, H, D, G, topk, Skv = 1, 2, 2, 64, 1, 4, 8
+    else:
+        raise ValueError(f"unknown sparse_mla_blockscaled shape: {shape}")
+
+    q = mx.array((rng.standard_normal((B, S, H, D)) * 0.1).astype(np.float16))
+    kv = mx.array((rng.standard_normal((B, Skv, G, D)) * 0.1).astype(np.float16))
+    indices = mx.array(rng.randint(0, Skv, size=(B, S, G, topk)).astype(np.int32))
+    sm_scale = D ** -0.5
+
+    q_packed, q_scales = _quantize_mxfp8(q)
+    kv_packed, kv_scales = _quantize_mxfp8(kv)
+    q_fp8 = _unpack_mxfp8_to_uint8(q_packed, D)
+    kv_fp8 = _unpack_mxfp8_to_uint8(kv_packed, D)
+    path_b = sparse_mla_blockscaled_fwd_metal(q, kv, indices, sm_scale=sm_scale, d_v=D)
+    if path_b is None:
+        raise NotImplementedError("sparse_mla_blockscaled Path B kernel unavailable")
+    out_b, _lse_b = path_b
+    out_c = sparse_mla_blockscaled_path_c_apply(
+        q_fp8,
+        q_scales,
+        kv_fp8,
+        kv_scales,
+        indices,
+        sm_scale=sm_scale,
+        d_v=D,
+        force_path_c=True,
+    )
+    if out_c is None:
+        raise NotImplementedError("sparse_mla_blockscaled_path_c_apply returned None")
+    atol, rtol = _TOLERANCE_BY_DTYPE["fp8"]
+    return _np(out_b.astype(mx.float32)), _np(cast(mx.array, out_c).astype(mx.float32)), atol, rtol
 
 
 # Each entry is (kernel_pair, shape, driver, expect_xfail_with_reason_or_None).
@@ -187,18 +270,8 @@ PARITY_CASES: list[tuple[str, str, Callable[[str], Any], str | None]] = [
     ("mamba3", "small", _drive_mamba3, None),
     ("mamba3", "carryover", _drive_mamba3, None),
     ("fp8_vecmat", "small", _drive_fp8_vecmat, None),
-    (
-        "sparse_mla_blockscaled",
-        "qk_probe_only",
-        _drive_path_c_only,
-        "blockscaled path c exposes only QK probe + partial reducer (no apply)",
-    ),
-    (
-        "sparse_mla_fp8",
-        "qk_probe_only",
-        _drive_path_c_only,
-        "sparse_mla_fp8 path c exposes only partial reducers (no apply)",
-    ),
+    ("sparse_mla_blockscaled", "prepared-small", _drive_sparse_mla_blockscaled, None),
+    ("sparse_mla_fp8", "prepared-small", _drive_sparse_mla_fp8, None),
 ]
 
 

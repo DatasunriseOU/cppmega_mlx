@@ -17,7 +17,7 @@ cppmega_mlx.data accepts token IDs from three local ingress paths:
   threading after the SPACE/NL retokenize: source-level structure_ids is
   recorded as not_token_aligned and skipped, while future regenerated
   token_* aliases remain supported when their rows match token_ids.
-- Megatron Indexed .bin/.idx datasets through open_megatron_indexed_dataset,
+- Megatron Indexed `.bin/.idx` datasets through open_megatron_indexed_dataset,
   using the standalone reader seam without importing Megatron runtime code into
   the Mac path.
 

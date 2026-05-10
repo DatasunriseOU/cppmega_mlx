@@ -435,7 +435,6 @@ def _build_payload(
 def _default_shapes() -> list[dict[str, int | str]]:
     return [
         {"batch": 1, "seq_len": 64, "k": 8, "dtype": "float32"},
-        {"batch": 1, "seq_len": 512, "k": 32, "dtype": "float32"},
         {"batch": 1, "seq_len": 2048, "k": 64, "dtype": "float32"},
         {"batch": 4, "seq_len": 2048, "k": 64, "dtype": "float32"},
         {"batch": 4, "seq_len": 2048, "k": 64, "dtype": "float16"},
