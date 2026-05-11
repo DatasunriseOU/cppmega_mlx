@@ -75,12 +75,13 @@ Path B is the production-target kernel set
 `cppmega_mlx.nn.m2rnn.metal_kernel_fwd_v1`). Path A is the pure-MLX reference
 that the dispatcher falls back to when `CPPMEGA_KERNEL_PATH=ref`.
 
-`sparse_mla_attention` is **not** wired into the live `local_gb10_quarter`
-forward in this codebase: the DSA route in `CausalSelfAttention` is a dense
-placeholder (cf. `cppmega_mlx/nn/attention.py` `AttentionRouteInfo`). Path B
-verification therefore covers the two ops that DO dispatch in the live model
-forward — `mamba3_mimo` and `m2rnn`. When sparse_mla is wired into the model
-forward this comparison should grow to a third op.
+`sparse_mla_attention` now has a prepared FP8 Path C route for DSA A-layers
+when `CPPMEGA_KERNEL_PATH__SPARSE_MLA=path_c`: `CausalSelfAttention` produces
+`q_fp8/q_scale/kv_fp8/kv_scale/indices` before dispatching the TileLang Path C
+kernel. This Path B comparison still covers the two ops that dispatch in the
+measured Path B route — `mamba3_mimo` and `m2rnn`. Sparse-MLA Path C should be
+tracked in a separate receipt because it is a prepared-FP8/kernel-policy axis,
+not part of the Path A vs Path B comparison below.
 
 | Path | tok/s median | peak GB | % of 60 GB | path_b_dispatched | cap hit |
 | ---- | ------------ | ------- | ---------- | ----------------- | ------- |

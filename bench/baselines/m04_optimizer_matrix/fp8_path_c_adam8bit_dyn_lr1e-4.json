@@ -1,0 +1,570 @@
+{
+  "acceptance_gate": {
+    "adamw_ok": false,
+    "all_finite_ok": false,
+    "dataset_format_ok": false,
+    "dataset_name_ok": false,
+    "dtype_ok": false,
+    "fp32_adamw_master_moments_ok": false,
+    "full_local_gb10_quarter_gate_blockers": [
+      "adamw_ok",
+      "all_finite_ok",
+      "dataset_format_ok",
+      "dataset_name_ok",
+      "dtype_ok",
+      "fp32_adamw_master_moments_ok",
+      "local_gb10_quarter_preflight_ok",
+      "loss_decrease_ok",
+      "loss_fields_ok",
+      "model_identity_ok",
+      "optimizer_identity_ok",
+      "optimizer_update_ok",
+      "real_parquet_source_identity_ok",
+      "step_count_ok",
+      "target_parquet_path_ok"
+    ],
+    "full_local_gb10_quarter_gate_completed": false,
+    "full_local_gb10_quarter_gate_required": true,
+    "full_target_dataset": "data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet",
+    "full_target_dataset_100_step_completed": false,
+    "full_target_dataset_100_step_required": true,
+    "full_target_dataset_blocker": "receipt did not complete >=100 decreasing steps on the full target parquet; treat this as a partial training-plumbing smoke only",
+    "grad_checkpoint_expectation_ok": true,
+    "grad_checkpoint_identity": {
+      "expectation_satisfied": true,
+      "observed_enabled": true,
+      "ok": true,
+      "required": true,
+      "source": "TrainHybridTinyConfig.grad_checkpoint -> HybridTinyConfig.grad_checkpoint -> HybridTinyLM mx.checkpoint block wrapper"
+    },
+    "grad_checkpoint_observed_enabled": true,
+    "grad_checkpoint_required": true,
+    "local_gb10_quarter_preflight": {
+      "allocation_attempted": false,
+      "allocation_mode": "allocation_free_preflight",
+      "allocation_ready": false,
+      "blockers": [
+        "allocation_attempted",
+        "allocation_ready",
+        "allocation_mode"
+      ],
+      "geometry_matches_required": true,
+      "ok": false,
+      "profile_geometry": {
+        "depth": 13,
+        "ffn_hidden_size": 18944,
+        "head_dim": 128,
+        "hidden_size": 3584,
+        "mtp": {
+          "beta": 0.6,
+          "depth": 2,
+          "loss_weight": 0.3
+        },
+        "num_attention_heads": 28,
+        "pattern": "AEMEAEMEAEMR",
+        "vocab_size": 65536
+      },
+      "profile_name": "local_gb10_quarter",
+      "required_geometry": {
+        "depth": 13,
+        "ffn_hidden_size": 18944,
+        "head_dim": 128,
+        "hidden_size": 3584,
+        "mtp": {
+          "beta": 0.6,
+          "depth": 2,
+          "loss_weight": 0.3
+        },
+        "num_attention_heads": 28,
+        "pattern": "AEMEAEMEAEMR",
+        "vocab_size": 65536
+      },
+      "source": "cppmega_mlx.recipes.model_factory",
+      "tokenizer_contract": {
+        "blocker_id": "cppmega-mlx-t8f.1",
+        "expected_vocab_size": 65536,
+        "milestone": "M0.1",
+        "reason": "M0.1 is closed: the deployed GB10 65K tokenizer is vendored with id 7=<CODE_START>, id 45=<FIM_INSTRUCTION>, id 46=<SPACE>, and id 47=<NL>; MLX and upstream wrappers use explicit whitespace-sentinel encode/decode with Mac-vs-upstream parity receipts",
+        "required_special_tokens": {
+          "<BOS>": 2,
+          "<CODE_START>": 7,
+          "<EOS>": 3,
+          "<FIM_INSTRUCTION>": 45,
+          "<FIM_MIDDLE>": 5,
+          "<FIM_PREFIX>": 4,
+          "<FIM_SUFFIX>": 6,
+          "<NL>": 47,
+          "<SPACE>": 46
+        },
+        "resolved": true
+      }
+    },
+    "local_gb10_quarter_preflight_ok": false,
+    "local_gb10_quarter_required": true,
+    "loss_decrease_ok": false,
+    "loss_fields_ok": false,
+    "m4_runtime_metadata": {
+      "metal_available": true,
+      "observed_device_name": "Apple M4 Max",
+      "observed_machine": "arm64",
+      "observed_memory_size": 137438953472,
+      "observed_platform": "macOS-26.4.1-arm64-arm-64bit-Mach-O",
+      "ok": true,
+      "required_device_family": "Apple M4"
+    },
+    "m4_runtime_metadata_ok": true,
+    "model_identity": {
+      "geometry_ok": false,
+      "observed_geometry": {
+        "depth": null,
+        "ffn_hidden_size": null,
+        "head_dim": null,
+        "hidden_size": null,
+        "mtp": {
+          "beta": null,
+          "depth": null,
+          "loss_weight": null
+        },
+        "num_attention_heads": null,
+        "pattern": null,
+        "vocab_size": null
+      },
+      "observed_name": null,
+      "observed_profile": null,
+      "observed_source": null,
+      "ok": false,
+      "profile_ok": false,
+      "required_geometry": {
+        "depth": 13,
+        "ffn_hidden_size": 18944,
+        "head_dim": 128,
+        "hidden_size": 3584,
+        "mtp": {
+          "beta": 0.6,
+          "depth": 2,
+          "loss_weight": 0.3
+        },
+        "num_attention_heads": 28,
+        "pattern": "AEMEAEMEAEMR",
+        "vocab_size": 65536
+      },
+      "required_name": "local_gb10_quarter",
+      "required_profile": "local_gb10_quarter",
+      "required_source": "cppmega_mlx.recipes.model_factory",
+      "source_ok": false
+    },
+    "model_identity_ok": false,
+    "observed_adamw_master_moment_dtypes": {},
+    "observed_dtype": "fp8_path_c",
+    "observed_model_name": null,
+    "observed_model_profile": null,
+    "observed_model_source": null,
+    "observed_optimizer_name": "Adam8bit",
+    "optimizer_identity": {
+      "master_moment_dtype_ok": false,
+      "master_moment_evidence": {
+        "observed_moment_dtypes": {},
+        "observed_parameter_dtype": null,
+        "ok": false,
+        "optimizer_base_class": "mlx.optimizers.Optimizer",
+        "optimizer_class": "cppmega_mlx.training.optimizers_quantized.Adam8bit",
+        "reason": "metadata-only dry-run does not allocate optimizer state",
+        "required_dtype": "float32",
+        "skipped": true,
+        "state_keys": []
+      },
+      "observed_adamw": false,
+      "observed_class": "cppmega_mlx.training.optimizers_quantized.Adam8bit",
+      "observed_name": "Adam8bit",
+      "observed_source": "cppmega_mlx.training.optimizers_quantized.make_adam8bit",
+      "observed_update": false,
+      "ok": false,
+      "required_master_moment_dtype": "float32",
+      "required_name": "AdamW"
+    },
+    "optimizer_identity_ok": false,
+    "optimizer_update_ok": false,
+    "real_parquet_source_identity": {
+      "observed_data_format": "parquet",
+      "observed_data_path": "data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet",
+      "observed_dataset_format": null,
+      "observed_dataset_name": null,
+      "observed_dataset_source_path": null,
+      "ok": false,
+      "required_dataset_name": "clang_semantic_4k_v10",
+      "required_format": "parquet",
+      "required_path": "data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet"
+    },
+    "required_adamw_master_moment_dtype": "float32",
+    "required_dtype": "bfloat16",
+    "required_model_profile": "local_gb10_quarter",
+    "required_optimizer_name": "AdamW",
+    "step_count_ok": false,
+    "target_parquet_path_ok": false,
+    "uses_full_target_dataset": true
+  },
+  "blockers": [
+    {
+      "reason": "FP8 Path C is requested as an end-to-end training route, but cppmega.mlx does not yet wire a full model producer/autograd route through the DLPack/tvm-ffi bridge to supply already-prepared FP8 GPU buffers to the M>1 Path C matmul surface. Directly calling the TileLang engine artifact with mx.array buffers is not the route; local APIs expose MLX DLPack export and tvm_ffi.from_dlpack, so the staged target is that zero-copy bridge. Until it is wired and proven for m04, the route fails closed instead of allocating/copying/casting large bf16/fp32 tensors into temporary FP8 staging buffers or silently falling back to Path B.",
+      "recoverable": true,
+      "type": "fp8_path_c_training_route_unavailable"
+    },
+    {
+      "id": "cppmega-mlx-t8f.4.local_gb10_quarter_gate",
+      "impact": "HybridTinyLM receipts remain training-plumbing evidence only",
+      "title": "full local_gb10_quarter bf16 AdamW + grad-checkpoint 100-step target-parquet receipt is not captured"
+    }
+  ],
+  "full_m0_4_acceptance_claim": false,
+  "gb10_training_correctness_claim": false,
+  "issue": {
+    "id": "cppmega-mlx-t8f.4",
+    "title": "M0.4: one bf16 training step + 100-step loss decrease on local parquet samples"
+  },
+  "local_gb10_quarter_preflight": {
+    "allocation_attempted": false,
+    "allocation_mode": "allocation_free_preflight",
+    "allocation_ready": false,
+    "blockers": [
+      "allocation_attempted",
+      "allocation_ready",
+      "allocation_mode"
+    ],
+    "geometry_matches_required": true,
+    "ok": false,
+    "profile_geometry": {
+      "depth": 13,
+      "ffn_hidden_size": 18944,
+      "head_dim": 128,
+      "hidden_size": 3584,
+      "mtp": {
+        "beta": 0.6,
+        "depth": 2,
+        "loss_weight": 0.3
+      },
+      "num_attention_heads": 28,
+      "pattern": "AEMEAEMEAEMR",
+      "vocab_size": 65536
+    },
+    "profile_name": "local_gb10_quarter",
+    "required_geometry": {
+      "depth": 13,
+      "ffn_hidden_size": 18944,
+      "head_dim": 128,
+      "hidden_size": 3584,
+      "mtp": {
+        "beta": 0.6,
+        "depth": 2,
+        "loss_weight": 0.3
+      },
+      "num_attention_heads": 28,
+      "pattern": "AEMEAEMEAEMR",
+      "vocab_size": 65536
+    },
+    "source": "cppmega_mlx.recipes.model_factory",
+    "tokenizer_contract": {
+      "blocker_id": "cppmega-mlx-t8f.1",
+      "expected_vocab_size": 65536,
+      "milestone": "M0.1",
+      "reason": "M0.1 is closed: the deployed GB10 65K tokenizer is vendored with id 7=<CODE_START>, id 45=<FIM_INSTRUCTION>, id 46=<SPACE>, and id 47=<NL>; MLX and upstream wrappers use explicit whitespace-sentinel encode/decode with Mac-vs-upstream parity receipts",
+      "required_special_tokens": {
+        "<BOS>": 2,
+        "<CODE_START>": 7,
+        "<EOS>": 3,
+        "<FIM_INSTRUCTION>": 45,
+        "<FIM_MIDDLE>": 5,
+        "<FIM_PREFIX>": 4,
+        "<FIM_SUFFIX>": 6,
+        "<NL>": 47,
+        "<SPACE>": 46
+      },
+      "resolved": true
+    }
+  },
+  "local_only": true,
+  "m4_vs_gb10_throughput_parity_claim": false,
+  "memory": {
+    "after": {
+      "active_memory_bytes": 8,
+      "cache_memory_bytes": 0,
+      "peak_memory_bytes": 8
+    },
+    "before": {
+      "active_memory_bytes": 8,
+      "cache_memory_bytes": 0,
+      "peak_memory_bytes": 8
+    },
+    "clear_cache_cadence_recorded": false,
+    "clear_cache_event": null,
+    "clear_cache_event_recorded": false,
+    "clear_cache_event_scope": null,
+    "clear_cache_every_steps": null,
+    "memory_limit": null,
+    "memory_limit_api_status": {
+      "metal_memory_limit_available": true,
+      "preferred_memory_limit_api_path": "mx.metal.set_memory_limit",
+      "root_memory_limit_available": true,
+      "supported_memory_limit_api_paths": [
+        "mx.metal.set_memory_limit",
+        "mx.set_memory_limit"
+      ],
+      "wired_limit_available": true
+    },
+    "peak_memory_bytes": null
+  },
+  "receipt_schema_version": 1,
+  "receipt_scope": "local_mlx_m04_train_step",
+  "software": {
+    "device": {
+      "default_device": "Device(gpu, 0)",
+      "machine": "arm64",
+      "metal_available": true,
+      "mlx": "0.32.0.dev20260509+85a0e7e4a",
+      "mlx_device_info": {
+        "architecture": "applegpu_g16s",
+        "device_name": "Apple M4 Max",
+        "max_buffer_length": 86586540032,
+        "max_recommended_working_set_size": 115448725504,
+        "memory_size": 137438953472,
+        "resource_limit": 499000
+      },
+      "mlx_disable_compile": null,
+      "mlx_lm": "0.31.3",
+      "mlx_metal": "0.31.2",
+      "platform": "macOS-26.4.1-arm64-arm-64bit-Mach-O",
+      "python": "3.13.12"
+    },
+    "git_commit": "74b9065"
+  },
+  "status": "blocked",
+  "timing": {
+    "mean_step_time_s": null,
+    "median_step_time_s": null,
+    "step_times_s": [],
+    "tokens_per_second": null
+  },
+  "training": {
+    "all_finite": false,
+    "final_loss": null,
+    "fp8_path_c_training_route": {
+      "available_path_c_surfaces": [
+        {
+          "module": "cppmega_mlx.nn._tilelang.fp8_vecmat_path_c",
+          "name": "fp8_scaled_vecmat_path_c",
+          "shape_surface": "M=1, W=(N,K), forward prepared buffers",
+          "training_surface": false
+        },
+        {
+          "module": "cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c",
+          "name": "sparse_mla_fp8_path_c_apply",
+          "shape_surface": "prepared q_fp8/q_scale/kv_fp8/kv_scale sparse-MLA buffers",
+          "training_surface": false
+        },
+        {
+          "kernel_surface_available": true,
+          "module": "scripts.bench_tilelang_fp8_path_c",
+          "name": "matmul_tl_fp8_scaled_matmul",
+          "reason": "prepared-buffer kernel surface is available, but m04 has no model producer/autograd route wired through DLPack/tvm-ffi to reach it without hidden large tensor staging",
+          "shape_surface": "M>1 T.fp8_scaled_matmul prepared A_fp8/A_scale/B_fp8/B_scale buffers",
+          "training_surface": false
+        }
+      ],
+      "blocker_type": "fp8_path_c_training_route_unavailable",
+      "bridge_evidence": {
+        "m04_bridge_wired": false,
+        "mlx_array_exports_dlpack": true,
+        "mlx_public_from_dlpack_available": false,
+        "tvm_ffi_from_dlpack_available": true
+      },
+      "bridge_status": "candidate_available_not_wired_to_m04",
+      "bridge_target": "dlpack_tvm_ffi_prepared_buffer_bridge",
+      "contract": "end_to_end_training_route_over_existing_gpu_buffers",
+      "direct_mx_array_artifact_call_status": "blocked_unsupported_argument_type",
+      "dtype": "fp8_path_c",
+      "end_to_end_training_status": "e2e_training_blocked",
+      "fallback_to_path_b_allowed": false,
+      "full_end_to_end_training_available": false,
+      "hidden_dtype_cast_allowed": false,
+      "hidden_shape_staging_allowed": false,
+      "kernel_surface_available": true,
+      "kernel_surface_status": "prepared_buffer_path_c_available",
+      "large_tensor_staging_allowed": false,
+      "missing_training_surfaces": [
+        "FP8 parameter/activation producers that create the required dtype/layout before the kernel boundary",
+        "DLPack/tvm-ffi bridge from MLX-owned prepared buffers into the TileLang engine artifact",
+        "backward/update path that consumes existing FP8 GPU buffers without per-step large tensor staging",
+        "m04 end-to-end autograd route wired to prepared-buffer M>1 Path C matmul"
+      ],
+      "reason": "FP8 Path C is requested as an end-to-end training route, but cppmega.mlx does not yet wire a full model producer/autograd route through the DLPack/tvm-ffi bridge to supply already-prepared FP8 GPU buffers to the M>1 Path C matmul surface. Directly calling the TileLang engine artifact with mx.array buffers is not the route; local APIs expose MLX DLPack export and tvm_ffi.from_dlpack, so the staged target is that zero-copy bridge. Until it is wired and proven for m04, the route fails closed instead of allocating/copying/casting large bf16/fp32 tensors into temporary FP8 staging buffers or silently falling back to Path B.",
+      "requested": true,
+      "selected_action": "fail_closed",
+      "status": "e2e_training_blocked",
+      "zero_copy_required": true
+    },
+    "grad_checkpoint": {
+      "expectation_satisfied": true,
+      "observed_enabled": true,
+      "required": true,
+      "source": "TrainHybridTinyConfig.grad_checkpoint -> HybridTinyConfig.grad_checkpoint -> HybridTinyLM mx.checkpoint block wrapper"
+    },
+    "initial_loss": null,
+    "loss_decrease_required": false,
+    "loss_decrease_satisfied": false,
+    "loss_decreased": false,
+    "losses": [],
+    "optimizer": {
+      "adamw": false,
+      "adamw_family": true,
+      "base_class": "mlx.optimizers.Optimizer",
+      "class": "cppmega_mlx.training.optimizers_quantized.Adam8bit",
+      "construction": "repo-local make_adam8bit(learning_rate=config.learning_rate, weight_decay=config.weight_decay, quant_scheme=..., min_8bit_size=4096)",
+      "key": "adam8bit",
+      "learning_rate": 0.0001,
+      "master_moment_dtype_ok": false,
+      "master_moment_evidence": {
+        "observed_moment_dtypes": {},
+        "observed_parameter_dtype": null,
+        "ok": false,
+        "optimizer_base_class": "mlx.optimizers.Optimizer",
+        "optimizer_class": "cppmega_mlx.training.optimizers_quantized.Adam8bit",
+        "reason": "metadata-only dry-run does not allocate optimizer state",
+        "required_dtype": "float32",
+        "skipped": true,
+        "state_keys": []
+      },
+      "name": "Adam8bit",
+      "name_matches_required": false,
+      "quantized_state": true,
+      "required_master_moment_dtype": "float32",
+      "required_name": "AdamW",
+      "source": "cppmega_mlx.training.optimizers_quantized.make_adam8bit",
+      "state_evidence": {
+        "observed_adamw_moment_dtype_count": 0,
+        "observed_adamw_moment_dtypes": {},
+        "observed_adamw_moment_dtypes_sampled": 0,
+        "observed_adamw_moment_dtypes_truncated": false,
+        "observed_parameter_dtype": null,
+        "state_dtype_breakdown_bytes": {},
+        "state_keys": []
+      },
+      "update_observed": false,
+      "variant": {
+        "key": "adam8bit",
+        "quant_scheme": "dynamic_int8_v1",
+        "requested": "adam8bit",
+        "source": "cli"
+      },
+      "weight_decay": 0.0
+    },
+    "optimizer_updated": false,
+    "precision_route": {
+      "blocker_type": "fp8_path_c_training_route_unavailable",
+      "bridge_status": "candidate_available_not_wired_to_m04",
+      "bridge_target": "dlpack_tvm_ffi_prepared_buffer_bridge",
+      "full_end_to_end_training_available": false,
+      "kernel_surface_available": true,
+      "kernel_surface_status": "prepared_buffer_path_c_available",
+      "kind": "fp8_path_c",
+      "large_tensor_staging_allowed": false,
+      "requested": "fp8_path_c",
+      "status": "e2e_training_blocked",
+      "zero_copy_required": true
+    },
+    "steps_completed": 0
+  },
+  "workload": {
+    "apply_memory_limit_plan": false,
+    "batch_size": 1,
+    "clear_cache_every_steps": null,
+    "compile_requested": false,
+    "data_format": "parquet",
+    "data_path": "data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet",
+    "dtype": "fp8_path_c",
+    "fp8_path_c_training_route": {
+      "available_path_c_surfaces": [
+        {
+          "module": "cppmega_mlx.nn._tilelang.fp8_vecmat_path_c",
+          "name": "fp8_scaled_vecmat_path_c",
+          "shape_surface": "M=1, W=(N,K), forward prepared buffers",
+          "training_surface": false
+        },
+        {
+          "module": "cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c",
+          "name": "sparse_mla_fp8_path_c_apply",
+          "shape_surface": "prepared q_fp8/q_scale/kv_fp8/kv_scale sparse-MLA buffers",
+          "training_surface": false
+        },
+        {
+          "kernel_surface_available": true,
+          "module": "scripts.bench_tilelang_fp8_path_c",
+          "name": "matmul_tl_fp8_scaled_matmul",
+          "reason": "prepared-buffer kernel surface is available, but m04 has no model producer/autograd route wired through DLPack/tvm-ffi to reach it without hidden large tensor staging",
+          "shape_surface": "M>1 T.fp8_scaled_matmul prepared A_fp8/A_scale/B_fp8/B_scale buffers",
+          "training_surface": false
+        }
+      ],
+      "blocker_type": "fp8_path_c_training_route_unavailable",
+      "bridge_evidence": {
+        "m04_bridge_wired": false,
+        "mlx_array_exports_dlpack": true,
+        "mlx_public_from_dlpack_available": false,
+        "tvm_ffi_from_dlpack_available": true
+      },
+      "bridge_status": "candidate_available_not_wired_to_m04",
+      "bridge_target": "dlpack_tvm_ffi_prepared_buffer_bridge",
+      "contract": "end_to_end_training_route_over_existing_gpu_buffers",
+      "direct_mx_array_artifact_call_status": "blocked_unsupported_argument_type",
+      "dtype": "fp8_path_c",
+      "end_to_end_training_status": "e2e_training_blocked",
+      "fallback_to_path_b_allowed": false,
+      "full_end_to_end_training_available": false,
+      "hidden_dtype_cast_allowed": false,
+      "hidden_shape_staging_allowed": false,
+      "kernel_surface_available": true,
+      "kernel_surface_status": "prepared_buffer_path_c_available",
+      "large_tensor_staging_allowed": false,
+      "missing_training_surfaces": [
+        "FP8 parameter/activation producers that create the required dtype/layout before the kernel boundary",
+        "DLPack/tvm-ffi bridge from MLX-owned prepared buffers into the TileLang engine artifact",
+        "backward/update path that consumes existing FP8 GPU buffers without per-step large tensor staging",
+        "m04 end-to-end autograd route wired to prepared-buffer M>1 Path C matmul"
+      ],
+      "reason": "FP8 Path C is requested as an end-to-end training route, but cppmega.mlx does not yet wire a full model producer/autograd route through the DLPack/tvm-ffi bridge to supply already-prepared FP8 GPU buffers to the M>1 Path C matmul surface. Directly calling the TileLang engine artifact with mx.array buffers is not the route; local APIs expose MLX DLPack export and tvm_ffi.from_dlpack, so the staged target is that zero-copy bridge. Until it is wired and proven for m04, the route fails closed instead of allocating/copying/casting large bf16/fp32 tensors into temporary FP8 staging buffers or silently falling back to Path B.",
+      "requested": true,
+      "selected_action": "fail_closed",
+      "status": "e2e_training_blocked",
+      "zero_copy_required": true
+    },
+    "grad_checkpoint": true,
+    "learning_rate": 0.0001,
+    "memory_limit_metal_ratio": 0.85,
+    "memory_limit_total_bytes": null,
+    "memory_limit_wired_ratio": 0.7,
+    "model_profile": "local_gb10_quarter",
+    "optimizer": {
+      "key": "adam8bit",
+      "quant_scheme": "dynamic_int8_v1",
+      "requested": "adam8bit",
+      "source": "cli"
+    },
+    "precision_route": {
+      "blocker_type": "fp8_path_c_training_route_unavailable",
+      "bridge_status": "candidate_available_not_wired_to_m04",
+      "bridge_target": "dlpack_tvm_ffi_prepared_buffer_bridge",
+      "full_end_to_end_training_available": false,
+      "kernel_surface_available": true,
+      "kernel_surface_status": "prepared_buffer_path_c_available",
+      "kind": "fp8_path_c",
+      "large_tensor_staging_allowed": false,
+      "requested": "fp8_path_c",
+      "status": "e2e_training_blocked",
+      "zero_copy_required": true
+    },
+    "probe_local_gb10_quarter_allocation": false,
+    "require_loss_decrease": false,
+    "seq_len": 4096,
+    "steps_requested": 20,
+    "synthetic": false,
+    "target_data_path": "data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet"
+  }
+}

@@ -23,6 +23,7 @@ from cppmega_mlx.nn.moe import ActivationName, MoEConfig, ReferenceMoE
 from cppmega_mlx.nn.ngram_hash import NgramHashEmbedding
 from cppmega_mlx.nn.structure_embedding import CppMegaStructureEmbedding
 from cppmega_mlx.recipes.pattern import ExpandedNamPattern, NamLayer, expand_nam_pattern
+from cppmega_mlx.runtime.kernel_policy import KernelPath, selected_path
 
 HybridBackend = Literal["attention", "mamba3", "moe", "m2rnn"]
 HybridBlockModule = CausalSelfAttention | Mamba3ReferenceBlock | ReferenceMoE | M2RNNMixer
@@ -61,6 +62,8 @@ class HybridTinyConfig:
     depth: int = 4
     dsa_a_layer_ranks: tuple[int, ...] = ()
     num_attention_heads: int = 4
+    num_attention_kv_heads: int | None = None
+    attention_sparse_topk: int = 16
     max_seq_length: int = 16
     structure_vocab_size: int = 32
     structure_components: str = "core"
@@ -112,8 +115,17 @@ class HybridTinyConfig:
             raise ValueError("depth must be positive")
         if self.num_attention_heads <= 0:
             raise ValueError("num_attention_heads must be positive")
+        if self.num_attention_kv_heads is not None and self.num_attention_kv_heads <= 0:
+            raise ValueError("num_attention_kv_heads must be positive")
+        if (
+            self.num_attention_kv_heads is not None
+            and self.num_attention_heads % self.num_attention_kv_heads != 0
+        ):
+            raise ValueError("num_attention_heads must be divisible by num_attention_kv_heads")
         if self.hidden_size % self.num_attention_heads != 0:
             raise ValueError("hidden_size must be divisible by num_attention_heads")
+        if self.attention_sparse_topk <= 0:
+            raise ValueError("attention_sparse_topk must be positive")
         if self.max_seq_length < 2:
             raise ValueError("max_seq_length must be at least 2")
         if self.structure_vocab_size < 2:
@@ -143,7 +155,9 @@ class HybridTinyConfig:
         return AttentionConfig(
             d_model=self.hidden_size,
             num_q_heads=self.num_attention_heads,
+            num_kv_heads=self.num_attention_kv_heads,
             mode=mode,
+            sparse_topk=self.attention_sparse_topk,
         )
 
     def mamba3_config(self) -> Mamba3Config:
@@ -519,14 +533,23 @@ class HybridTinyLM(nn.Module):
             batch_size=batch_size,
             seq_length=seq_length,
         )
-        mask = None
+        mask: mx.array | Literal["causal"] | None = None
         if any(layer.backend == "attention" for layer in self.layers):
             if document_ids is None:
                 if kv_cache is None:
-                    mask = nn.MultiHeadAttention.create_additive_causal_mask(
-                        seq_length,
-                        dtype=hidden_states.dtype,
+                    dsa_path_c = selected_path("sparse_mla") is KernelPath.PATH_C and any(
+                        layer.backend == "attention"
+                        and isinstance(layer.block, CausalSelfAttention)
+                        and layer.block.config.mode == "dsa"
+                        for layer in self.layers
                     )
+                    if dsa_path_c:
+                        mask = "causal"
+                    else:
+                        mask = nn.MultiHeadAttention.create_additive_causal_mask(
+                            seq_length,
+                            dtype=hidden_states.dtype,
+                        )
             else:
                 mask = mlx_document_boundary_mask(
                     document_ids,

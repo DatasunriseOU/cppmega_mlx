@@ -8,7 +8,14 @@ import mlx.nn as nn
 import mlx.optimizers as optim
 
 from cppmega_mlx.inference.engine import ContiguousKVCacheConfig, make_contiguous_kv_cache
-from cppmega_mlx.nn.attention import AttentionConfig, CausalSelfAttention, causal_sdpa_mask
+from cppmega_mlx.nn.attention import (
+    AttentionConfig,
+    CausalSelfAttention,
+    SparseMLAFp8Prepared,
+    causal_sparse_indices,
+    causal_sdpa_mask,
+)
+from cppmega_mlx.runtime.kernel_policy import clear_dispatch_log, get_dispatch_log
 
 
 def _rand(shape: tuple[int, ...], seed: int = 0) -> mx.array:
@@ -44,6 +51,8 @@ def test_attention_config_validation_fails_closed() -> None:
         AttentionConfig(d_model=16, num_q_heads=4, num_kv_heads=3)
     with pytest.raises(ValueError, match="sliding_window"):
         AttentionConfig(d_model=16, num_q_heads=4, sliding_window=0)
+    with pytest.raises(ValueError, match="sparse_topk"):
+        AttentionConfig(d_model=16, num_q_heads=4, sparse_topk=0)
 
 
 def test_causal_sdpa_mask_is_boolean_and_sliding_windowed() -> None:
@@ -99,6 +108,139 @@ def test_causal_sdpa_mask_supports_cached_decode_offsets() -> None:
             dtype=np.bool_,
         ),
     )
+
+
+def test_causal_sparse_indices_match_causal_topk_window() -> None:
+    indices = causal_sparse_indices(2, 5, 2, 3)
+    mx.eval(indices)
+
+    assert indices.shape == (2, 5, 2, 3)
+    assert indices.dtype == mx.int32
+    np.testing.assert_array_equal(
+        np.array(indices[0, :, 0, :]),
+        np.array(
+            [
+                [0, -1, -1],
+                [1, 0, -1],
+                [2, 1, 0],
+                [3, 2, 1],
+                [4, 3, 2],
+            ],
+            dtype=np.int32,
+        ),
+    )
+
+
+def test_dsa_prepare_sparse_mla_fp8_emits_first_class_buffers() -> None:
+    cfg = AttentionConfig(
+        d_model=16,
+        num_q_heads=4,
+        num_kv_heads=2,
+        mode="dsa",
+        sparse_topk=3,
+    )
+    attn = CausalSelfAttention(cfg)
+    x = _rand((2, 5, 16), seed=31)
+
+    prepared = attn.prepare_sparse_mla_fp8(x)
+    mx.eval(
+        prepared.q_fp8,
+        prepared.q_scale,
+        prepared.kv_fp8,
+        prepared.kv_scale,
+        prepared.indices,
+    )
+
+    assert isinstance(prepared, SparseMLAFp8Prepared)
+    assert prepared.q_fp8.shape == (2, 5, 4, 4)
+    assert prepared.kv_fp8.shape == (2, 5, 2, 4)
+    assert prepared.q_scale.shape == (2, 5, 4)
+    assert prepared.kv_scale.shape == (2, 5, 2)
+    assert prepared.indices.shape == (2, 5, 2, 3)
+    assert prepared.q_fp8.dtype == mx.uint8
+    assert prepared.kv_fp8.dtype == mx.uint8
+    assert prepared.q_scale.dtype == mx.float32
+    assert prepared.kv_scale.dtype == mx.float32
+    assert prepared.indices.dtype == mx.int32
+    assert prepared.d_v == cfg.q_head_dim
+    assert prepared.sm_scale == pytest.approx(cfg.q_head_dim**-0.5)
+
+
+def test_dsa_path_c_routes_through_sparse_mla_fp8_prepared(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c as fp8_path_c
+
+    cfg = AttentionConfig(
+        d_model=16,
+        num_q_heads=4,
+        num_kv_heads=2,
+        mode="dsa",
+        sparse_topk=2,
+    )
+    attn = CausalSelfAttention(cfg)
+    x = _rand((1, 4, 16), seed=32)
+    calls: list[dict[str, object]] = []
+
+    def fake_apply(
+        q_fp8: mx.array,
+        q_scale: mx.array,
+        kv_fp8: mx.array,
+        kv_scale: mx.array,
+        indices: mx.array,
+        *,
+        sm_scale: float,
+        d_v: int | None = None,
+        return_lse: bool = False,
+        force_path_c: bool = False,
+    ) -> mx.array:
+        del return_lse
+        calls.append(
+            {
+                "q_fp8": q_fp8,
+                "q_scale": q_scale,
+                "kv_fp8": kv_fp8,
+                "kv_scale": kv_scale,
+                "indices": indices,
+                "sm_scale": sm_scale,
+                "force_path_c": force_path_c,
+            }
+        )
+        assert d_v == cfg.q_head_dim
+        return mx.zeros((1, 4, 4, cfg.q_head_dim), dtype=mx.float16)
+
+    monkeypatch.setenv("CPPMEGA_KERNEL_PATH__SPARSE_MLA", "path_c")
+    monkeypatch.setattr(fp8_path_c, "sparse_mla_fp8_path_c_apply", fake_apply)
+    clear_dispatch_log()
+
+    out = attn(x, mask="causal")
+    mx.eval(out)
+
+    assert out.shape == x.shape
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["force_path_c"] is True
+    assert call["q_fp8"].dtype == mx.uint8
+    assert call["kv_fp8"].dtype == mx.uint8
+    assert call["q_scale"].dtype == mx.float32
+    assert call["kv_scale"].dtype == mx.float32
+    assert call["indices"].dtype == mx.int32
+    assert get_dispatch_log()[-1] == {
+        "op_name": "sparse_mla",
+        "path": "path_c",
+        "kernel_used": "tilelang_fp8_prepared_path_c_fwd",
+    }
+
+
+def test_dsa_path_c_fails_closed_for_explicit_masks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CPPMEGA_KERNEL_PATH__SPARSE_MLA", "path_c")
+    attn = CausalSelfAttention(AttentionConfig(d_model=16, num_q_heads=4, mode="dsa"))
+    x = _rand((1, 4, 16), seed=33)
+
+    with pytest.raises(NotImplementedError, match="document masks"):
+        attn(x, mask=causal_sdpa_mask(4))
 
 
 @pytest.mark.parametrize("mode", ["mla", "dsa"])

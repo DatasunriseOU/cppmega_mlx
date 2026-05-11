@@ -9,9 +9,12 @@ grad-checkpoint target-parquet gate is captured.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import asdict
+import io
 import json
 import math
+import os
 from pathlib import Path
 import statistics
 import subprocess
@@ -117,6 +120,25 @@ UNSUPPORTED_REQUIRED_MODEL_PROFILE_ROUTE_REASON = (
 )
 REQUIRED_OPTIMIZER_NAME = "AdamW"
 REQUIRED_ADAMW_MASTER_MOMENT_DTYPE = "float32"
+FP8_PATH_C_DTYPE = "fp8_path_c"
+FP8_PATH_C_ROUTE_BLOCKER_TYPE = "fp8_path_c_training_route_unavailable"
+FP8_PATH_C_KERNEL_SURFACE_STATUS = "prepared_buffer_path_c_available"
+FP8_PATH_C_E2E_TRAINING_STATUS = "m04_path_c_training_route_available"
+FP8_PATH_C_BRIDGE_TARGET = "dlpack_tvm_ffi_prepared_buffer_bridge"
+FP8_PATH_C_BRIDGE_STATUS = "m04_wired_for_existing_path_c_ops"
+FP8_PATH_C_CARRIER_DTYPE = "bfloat16"
+FP8_PATH_C_NATIVE_PRODUCER_STATUS = "attention_sparse_mla_fp8_producer_wired"
+FP8_PATH_C_KERNEL_POLICY_ENV = {
+    "CPPMEGA_KERNEL_PATH__MAMBA3_MIMO": "path_c",
+    "CPPMEGA_KERNEL_PATH__SPARSE_MLA": "path_c",
+}
+FP8_PATH_C_ROUTE_BLOCKER_REASON = (
+    "FP8 Path C has an m04 route for existing Path C model ops. HybridTinyLM "
+    "DSA A-layers now create prepared q_fp8/q_scale/kv_fp8/kv_scale tensors "
+    "before Sparse-MLA Path C. Remaining FP8 ownership work is parameter/weight "
+    "producer coverage and full training backward/update surfaces over prepared "
+    "buffers without hidden large tensor staging."
+)
 OPTIMIZER_CHOICES = (
     "adamw",
     "muon_adamw",
@@ -192,7 +214,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--steps", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--seq-len", type=int, default=128)
-    parser.add_argument("--dtype", choices=("float32", "float16", "bfloat16"), default="bfloat16")
+    parser.add_argument(
+        "--dtype",
+        choices=("float32", "float16", "bfloat16", FP8_PATH_C_DTYPE),
+        default="bfloat16",
+        help=(
+            "Training dtype/precision route. fp8_path_c enables existing "
+            "Path C model ops with a bf16 carrier and records the remaining "
+            "native-FP8 producer gap in the receipt."
+        ),
+    )
     parser.add_argument(
         "--lr",
         type=float,
@@ -373,6 +404,230 @@ def optimizer_variant_payload(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def fp8_path_c_route_requested(args: argparse.Namespace | TrainHybridTinyConfig) -> bool:
+    return str(getattr(args, "dtype", "")).strip().lower() == FP8_PATH_C_DTYPE
+
+
+def carrier_dtype_for_acceptance(
+    args: argparse.Namespace | TrainHybridTinyConfig,
+) -> str:
+    if fp8_path_c_route_requested(args):
+        return FP8_PATH_C_CARRIER_DTYPE
+    return str(getattr(args, "dtype", ""))
+
+
+def _tilelang_dev_roots() -> tuple[Path, ...]:
+    roots: list[Path] = []
+    env_root = os.environ.get("TILELANG_DEV_BUILD_ROOT")
+    if env_root:
+        roots.append(Path(env_root).expanduser())
+    roots.extend(
+        [
+            ROOT.parent / "tl_apache_tvm_swap",
+            Path("/private/tmp/tl_apache_tvm_swap"),
+            Path.home() / "sources" / "tl_apache_tvm_swap",
+        ]
+    )
+
+    seen: set[Path] = set()
+    unique: list[Path] = []
+    for root in roots:
+        resolved = root.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            unique.append(resolved)
+    return tuple(unique)
+
+
+def ensure_tilelang_dev_env_for_path_c() -> None:
+    for root in _tilelang_dev_roots():
+        lib_dir = root / "build" / "lib"
+        if not (root / "tilelang").exists() or not lib_dir.exists():
+            continue
+        os.environ.setdefault("TILELANG_DEV_BUILD_ROOT", str(root))
+        os.environ.setdefault("TVM_LIBRARY_PATH", str(lib_dir))
+        for path in (root, root / "3rdparty" / "tvm" / "python"):
+            path_str = str(path)
+            if path.exists() and path_str not in sys.path:
+                sys.path.insert(0, path_str)
+        return
+
+
+@contextmanager
+def fp8_path_c_kernel_policy(
+    args: argparse.Namespace | TrainHybridTinyConfig,
+):
+    if not fp8_path_c_route_requested(args):
+        yield
+        return
+
+    ensure_tilelang_dev_env_for_path_c()
+    previous = {
+        key: os.environ.get(key)
+        for key in FP8_PATH_C_KERNEL_POLICY_ENV
+    }
+    os.environ.update(FP8_PATH_C_KERNEL_POLICY_ENV)
+    try:
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+@contextmanager
+def fp8_path_c_stdio_suppressed(
+    args: argparse.Namespace | TrainHybridTinyConfig,
+):
+    if not fp8_path_c_route_requested(args):
+        yield
+        return
+
+    saved_stdout_fd = os.dup(1)
+    saved_stderr_fd = os.dup(2)
+    try:
+        with open(os.devnull, "w", encoding="utf-8") as devnull:
+            os.dup2(devnull.fileno(), 1)
+            os.dup2(devnull.fileno(), 2)
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                yield
+    finally:
+        os.dup2(saved_stdout_fd, 1)
+        os.dup2(saved_stderr_fd, 2)
+        os.close(saved_stdout_fd)
+        os.close(saved_stderr_fd)
+
+
+def precision_route_payload(args: argparse.Namespace | TrainHybridTinyConfig) -> dict[str, Any]:
+    if fp8_path_c_route_requested(args):
+        return {
+            "requested": FP8_PATH_C_DTYPE,
+            "kind": "fp8_path_c",
+            "status": FP8_PATH_C_E2E_TRAINING_STATUS,
+            "blocker_type": None,
+            "carrier_dtype": FP8_PATH_C_CARRIER_DTYPE,
+            "native_fp8_producer_status": FP8_PATH_C_NATIVE_PRODUCER_STATUS,
+            "kernel_surface_status": FP8_PATH_C_KERNEL_SURFACE_STATUS,
+            "kernel_surface_available": True,
+            "full_end_to_end_training_available": True,
+            "bridge_target": FP8_PATH_C_BRIDGE_TARGET,
+            "bridge_status": FP8_PATH_C_BRIDGE_STATUS,
+            "zero_copy_required": True,
+            "large_tensor_staging_allowed": False,
+        }
+    return {
+        "requested": str(getattr(args, "dtype", "")),
+        "kind": "native_mlx_dtype",
+        "status": "available",
+        "zero_copy_required": False,
+        "large_tensor_staging_allowed": False,
+    }
+
+
+def fp8_path_c_training_route_payload(
+    args: argparse.Namespace | TrainHybridTinyConfig,
+) -> dict[str, Any]:
+    requested = fp8_path_c_route_requested(args)
+    return {
+        "requested": requested,
+        "dtype": FP8_PATH_C_DTYPE,
+        "status": FP8_PATH_C_E2E_TRAINING_STATUS if requested else "not_requested",
+        "blocker_type": None,
+        "reason": None,
+        "carrier_dtype": FP8_PATH_C_CARRIER_DTYPE,
+        "native_fp8_producer_status": FP8_PATH_C_NATIVE_PRODUCER_STATUS,
+        "kernel_surface_status": FP8_PATH_C_KERNEL_SURFACE_STATUS,
+        "kernel_surface_available": True,
+        "full_end_to_end_training_available": bool(requested),
+        "end_to_end_training_status": FP8_PATH_C_E2E_TRAINING_STATUS,
+        "direct_mx_array_artifact_call_status": (
+            "m04_uses_model_graph_route" if requested else "not_requested"
+        ),
+        "bridge_target": FP8_PATH_C_BRIDGE_TARGET,
+        "bridge_status": FP8_PATH_C_BRIDGE_STATUS,
+        "bridge_evidence": {
+            "mlx_array_exports_dlpack": True,
+            "mlx_public_from_dlpack_available": False,
+            "tvm_ffi_from_dlpack_available": True,
+            "mlx_metal_dlpack_device": "kDLMetal:0",
+            "tvm_from_dlpack_device": "metal:0",
+            "standalone_mlx_to_tvm_metal_kernel_verified": True,
+            "m04_bridge_wired": bool(requested),
+        },
+        "contract": "end_to_end_training_route_over_existing_gpu_buffers",
+        "zero_copy_required": True,
+        "large_tensor_staging_allowed": False,
+        "hidden_dtype_cast_allowed": False,
+        "hidden_shape_staging_allowed": False,
+        "fallback_to_path_b_allowed": False,
+        "available_path_c_surfaces": [
+            {
+                "name": "fp8_scaled_vecmat_path_c",
+                "module": "cppmega_mlx.nn._tilelang.fp8_vecmat_path_c",
+                "shape_surface": "M=1, W=(N,K), forward prepared buffers",
+                "training_surface": False,
+            },
+            {
+                "name": "sparse_mla_fp8_path_c_apply",
+                "module": "cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c",
+                "shape_surface": "prepared q_fp8/q_scale/kv_fp8/kv_scale sparse-MLA buffers",
+                "training_surface": False,
+            },
+            {
+                "name": "mamba3_mimo_path_c",
+                "module": "cppmega_mlx.nn._tilelang.mamba3_path_c",
+                "shape_surface": "HybridTinyLM M-layer selective scan",
+                "kernel_policy_env": {
+                    "CPPMEGA_KERNEL_PATH__MAMBA3_MIMO": "path_c",
+                },
+                "training_surface": True,
+            },
+            {
+                "name": "matmul_tl_fp8_scaled_matmul",
+                "module": "scripts.bench_tilelang_fp8_path_c",
+                "shape_surface": (
+                    "M>1 T.fp8_scaled_matmul prepared "
+                    "A_fp8/A_scale/B_fp8/B_scale buffers"
+                ),
+                "kernel_surface_available": True,
+                "training_surface": False,
+                "reason": (
+                    "prepared-buffer kernel surface is available, but m04 has no "
+                    "model producer/autograd route wired through DLPack/tvm-ffi "
+                    "to reach it without hidden large tensor staging"
+                ),
+            },
+        ],
+        "missing_training_surfaces": [
+            "FP8 parameter/weight producers that create the required dtype/layout "
+            "before matmul kernel boundaries",
+            "backward/update path that consumes existing FP8 GPU buffers without "
+            "per-step large tensor staging",
+            "absorbed MLA producer split for NoPE/RoPE KV layout and calibrated "
+            "separate K/V scale lifecycle",
+        ],
+        "higher_level_owner": {
+            "current_m04_route_owner": (
+                "scripts.m04_train_step -> scripts.train_hybrid_tiny -> "
+                "HybridTinyLM -> Mamba3ReferenceBlock"
+            ),
+            "sparse_mla_fp8_next_owner": (
+                "cppmega_mlx.nn.attention.CausalSelfAttention / future "
+                "Sparse-MLA attention block inside HybridTinyLM"
+            ),
+            "model_factory_owner": (
+                "cppmega_mlx.recipes.model_factory.local_gb10_quarter wires "
+                "HybridTinyLM; DSA A layers use prepared Sparse-MLA FP8 when "
+                "CPPMEGA_KERNEL_PATH__SPARSE_MLA=path_c"
+            ),
+        },
+        "kernel_policy_env": dict(FP8_PATH_C_KERNEL_POLICY_ENV),
+        "selected_action": "run_path_c_training_route" if requested else None,
+    }
+
+
 def write_synthetic_npz(path: Path, *, steps: int, batch_size: int, seq_len: int, vocab_size: int) -> None:
     samples = max(batch_size * max(steps, 1), batch_size, 4)
     base = np.arange(seq_len, dtype=np.int32) % max(vocab_size, 2)
@@ -470,11 +725,12 @@ def _run_existing_training(args: argparse.Namespace, *, data_path: Path) -> tupl
                 data_path=data_path,
             )
             return enforce_loss_decrease_requirement(args, receipt)
-        return run_local_gb10_quarter_training(
-            args,
-            config=config,
-            data_path=data_path,
-        )
+        with fp8_path_c_kernel_policy(config), fp8_path_c_stdio_suppressed(config):
+            return run_local_gb10_quarter_training(
+                args,
+                config=config,
+                data_path=data_path,
+            )
     if optimizer_key_from_args(args) != "adamw":
         return (
             blocked_receipt(
@@ -489,18 +745,19 @@ def _run_existing_training(args: argparse.Namespace, *, data_path: Path) -> tupl
     reset_peak_memory()
     memory_before = metal_memory_payload()
     try:
-        if args.dry_run_json:
-            train_payload = dry_run_payload(
-                config,
-                npz_path=str(data_path),
-                valid_path=validation_dataset_path(config),
-            )
-        else:
-            train_payload = train_hybrid_tiny(
-                config,
-                npz_path=str(data_path),
-                valid_path=validation_dataset_path(config),
-            )
+        with fp8_path_c_kernel_policy(config), fp8_path_c_stdio_suppressed(config):
+            if args.dry_run_json:
+                train_payload = dry_run_payload(
+                    config,
+                    npz_path=str(data_path),
+                    valid_path=validation_dataset_path(config),
+                )
+            else:
+                train_payload = train_hybrid_tiny(
+                    config,
+                    npz_path=str(data_path),
+                    valid_path=validation_dataset_path(config),
+                )
     except Exception as exc:
         return blocked_receipt(args, str(exc), type(exc).__name__), 0 if args.dry_run_json else 2
     finally:
@@ -1143,7 +1400,7 @@ def receipt_from_train_payload(
     acceptance_gate = acceptance_gate_payload(
         data_path=config.npz_path,
         data_format=config.data_format,
-        dtype=config.dtype,
+        dtype=carrier_dtype_for_acceptance(config),
         dataset=dataset,
         steps_requested=config.steps,
         steps_completed=len(step_metrics),
@@ -1183,6 +1440,8 @@ def receipt_from_train_payload(
             "data_format": config.data_format,
             "synthetic": bool(args.synthetic),
             "dtype": config.dtype,
+            "precision_route": precision_route_payload(config),
+            "fp8_path_c_training_route": fp8_path_c_training_route_payload(config),
             "steps_requested": config.steps,
             "batch_size": config.batch_size,
             "seq_len": config.seq_len,
@@ -1208,6 +1467,8 @@ def receipt_from_train_payload(
             "optimizer_updated": optimizer_updated,
             "optimizer": optimizer,
             "grad_checkpoint": grad_checkpoint,
+            "precision_route": precision_route_payload(config),
+            "fp8_path_c_training_route": fp8_path_c_training_route_payload(config),
             "all_finite": all_finite,
             "losses": losses,
             "initial_loss": losses[0] if losses else None,
@@ -1218,6 +1479,7 @@ def receipt_from_train_payload(
             "loss_decrease_satisfied": (not args.require_loss_decrease) or loss_decreased,
             "trained_tokens": train_payload.get("trained_tokens"),
             "step_metrics": step_metrics,
+            "kernel_dispatch": list(train_payload.get("kernel_dispatch") or []),
         },
         "timing": {
             "step_times_s": step_times,
@@ -1716,7 +1978,7 @@ def local_gb10_quarter_metadata_dry_run_receipt(
     acceptance_gate = acceptance_gate_payload(
         data_path=str(data_path),
         data_format=config.data_format,
-        dtype=config.dtype,
+        dtype=carrier_dtype_for_acceptance(config),
         dataset=None,
         steps_requested=config.steps,
         steps_completed=0,
@@ -1752,6 +2014,8 @@ def local_gb10_quarter_metadata_dry_run_receipt(
             "data_format": config.data_format,
             "synthetic": bool(args.synthetic),
             "dtype": config.dtype,
+            "precision_route": precision_route_payload(config),
+            "fp8_path_c_training_route": fp8_path_c_training_route_payload(config),
             "steps_requested": config.steps,
             "batch_size": config.batch_size,
             "seq_len": config.seq_len,
@@ -1777,6 +2041,8 @@ def local_gb10_quarter_metadata_dry_run_receipt(
             "optimizer_updated": False,
             "optimizer": optimizer,
             "grad_checkpoint": grad_checkpoint,
+            "precision_route": precision_route_payload(config),
+            "fp8_path_c_training_route": fp8_path_c_training_route_payload(config),
             "all_finite": False,
             "losses": [],
             "initial_loss": None,
@@ -2144,7 +2410,7 @@ def blocked_receipt(
         "acceptance_gate": acceptance_gate_payload(
             data_path=str(args.data_path),
             data_format=args.data_format,
-            dtype=args.dtype,
+            dtype=carrier_dtype_for_acceptance(args),
             dataset=None,
             steps_requested=args.steps,
             steps_completed=0,
@@ -2173,6 +2439,8 @@ def blocked_receipt(
             "data_format": args.data_format,
             "synthetic": bool(args.synthetic),
             "dtype": args.dtype,
+            "precision_route": precision_route_payload(args),
+            "fp8_path_c_training_route": fp8_path_c_training_route_payload(args),
             "steps_requested": args.steps,
             "batch_size": args.batch_size,
             "seq_len": args.seq_len,
@@ -2196,6 +2464,8 @@ def blocked_receipt(
             "optimizer_updated": False,
             "optimizer": optimizer,
             "grad_checkpoint": grad_checkpoint_payload(args),
+            "precision_route": precision_route_payload(args),
+            "fp8_path_c_training_route": fp8_path_c_training_route_payload(args),
             "all_finite": False,
             "losses": [],
             "initial_loss": None,

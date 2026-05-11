@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, cast
 
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.cache import QuantizedKVCache
 
 from cppmega_mlx.inference.engine import ContiguousKVCache
+from cppmega_mlx.runtime.kernel_policy import KernelPath, record_dispatch, selected_path
 
 AttentionMode = Literal["mla", "dsa"]
 RopeType = Literal["standard", "llama3", "yarn"]
@@ -20,9 +21,9 @@ RopeType = Literal["standard", "llama3", "yarn"]
 class AttentionRouteInfo:
     """Runtime marker for cppmega A-layer routing.
 
-    dsa currently uses the same dense causal reference path as mla.
-    The marker keeps NAM56R layer intent visible until sparse DSA/MLA Metal
-    kernels are wired in.
+    ``mode='dsa'`` defaults to the dense causal SDPA reference unless
+    ``CPPMEGA_KERNEL_PATH__SPARSE_MLA=path_c`` selects the prepared FP8
+    Sparse-MLA route.
     """
 
     mode: AttentionMode
@@ -52,6 +53,7 @@ class AttentionConfig:
     attn_softcap: float = 0.0
     bias: bool = False
     sliding_window: int | None = None
+    sparse_topk: int = 16
 
     def __post_init__(self) -> None:
         if self.mode not in ("mla", "dsa"):
@@ -123,6 +125,8 @@ class AttentionConfig:
             )
         if self.sliding_window is not None and self.sliding_window <= 0:
             raise ValueError(f"sliding_window must be positive, got {self.sliding_window}")
+        if self.sparse_topk <= 0:
+            raise ValueError(f"sparse_topk must be positive, got {self.sparse_topk}")
 
     @property
     def kv_heads(self) -> int:
@@ -143,6 +147,19 @@ class AttentionConfig:
     @property
     def is_gqa(self) -> bool:
         return self.kv_heads != self.num_q_heads
+
+
+@dataclass(frozen=True)
+class SparseMLAFp8Prepared:
+    """First-class DSA/Sparse-MLA FP8 carrier produced by the attention layer."""
+
+    q_fp8: mx.array
+    q_scale: mx.array
+    kv_fp8: mx.array
+    kv_scale: mx.array
+    indices: mx.array
+    sm_scale: float
+    d_v: int
 
 
 def causal_sdpa_mask(
@@ -180,6 +197,55 @@ def causal_sdpa_mask(
     if expand_heads:
         return mask[None, None, :, :]
     return mask
+
+
+def causal_sparse_indices(
+    batch_size: int,
+    seq_length: int,
+    kv_group: int,
+    topk: int,
+    *,
+    query_offset: int = 0,
+    key_length: int | None = None,
+) -> mx.array:
+    """Return token-level causal sparse indices shaped ``[B, S, G, topk]``."""
+
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
+    if seq_length <= 0:
+        raise ValueError(f"seq_length must be positive, got {seq_length}")
+    if kv_group <= 0:
+        raise ValueError(f"kv_group must be positive, got {kv_group}")
+    if topk <= 0:
+        raise ValueError(f"topk must be positive, got {topk}")
+    if query_offset < 0:
+        raise ValueError(f"query_offset must be non-negative, got {query_offset}")
+    key_length = seq_length if key_length is None else key_length
+    if key_length <= 0:
+        raise ValueError(f"key_length must be positive, got {key_length}")
+
+    query_positions = (query_offset + mx.arange(seq_length, dtype=mx.int32))[:, None]
+    offsets = mx.arange(topk, dtype=mx.int32)[None, :]
+    indices = query_positions - offsets
+    valid = cast(mx.array, (indices >= 0) & (indices < key_length))
+    indices = mx.where(valid, indices, mx.zeros_like(indices) - 1)
+    indices = indices.reshape(1, seq_length, 1, topk)
+    return mx.broadcast_to(indices, (batch_size, seq_length, kv_group, topk)).astype(mx.int32)
+
+
+def _to_fp8_with_per_token_scale(x: mx.array) -> tuple[mx.array, mx.array]:
+    """Quantize a producer tensor to e4m3 with one fp32 scale per final-dim row."""
+
+    if x.ndim < 2:
+        raise ValueError(f"FP8 producer input must be at least 2D, got {x.shape}")
+    if x.size == 0:
+        return mx.zeros(x.shape, dtype=mx.uint8), mx.ones(x.shape[:-1], dtype=mx.float32)
+    amax = mx.max(mx.abs(x), axis=-1).astype(mx.float32)
+    fp8_max = mx.array(448.0, dtype=mx.float32)
+    min_scale = mx.array(1.0e-12, dtype=mx.float32)
+    scale = mx.maximum(amax / fp8_max, min_scale)
+    scaled = x / scale.astype(x.dtype)[..., None]
+    return mx.to_fp8(scaled), scale
 
 
 def _validate_attention_sinks(sinks: mx.array | None, num_q_heads: int) -> mx.array | None:
@@ -337,9 +403,9 @@ class CausalSelfAttention(nn.Module):
     """Correctness-first MLX causal self-attention for cppmega A-layers.
 
     The module uses MLX fast SDPA with tensors in (B, heads, S, D) form.
-    mode='dsa' intentionally remains a dense causal placeholder/reference:
-    it preserves the layer route marker but does not implement sparse DSA top-k
-    indexing or production MLA absorbed projections.
+    ``mode='dsa'`` can additionally produce first-class FP8 Sparse-MLA buffers
+    and call the prepared Path C kernel when the sparse_mla policy selects
+    ``path_c``.
     """
 
     def __init__(self, config: AttentionConfig):
@@ -384,6 +450,115 @@ class CausalSelfAttention(nn.Module):
             k = apply_rotary_emb(k, cos, sin)
         return q, k, v
 
+    def _project_qkv_bshd(
+        self,
+        hidden_states: mx.array,
+        *,
+        rope_offset: int = 0,
+    ) -> tuple[mx.array, mx.array, mx.array]:
+        q, k, v = self._project_qkv(hidden_states, rope_offset=rope_offset)
+        return (
+            mx.transpose(q, (0, 2, 1, 3)),
+            mx.transpose(k, (0, 2, 1, 3)),
+            mx.transpose(v, (0, 2, 1, 3)),
+        )
+
+    def prepare_sparse_mla_fp8(
+        self,
+        hidden_states: mx.array,
+        *,
+        rope_offset: int = 0,
+        key_length: int | None = None,
+    ) -> SparseMLAFp8Prepared:
+        """Produce first-class FP8 buffers consumed by Sparse-MLA Path C."""
+
+        if hidden_states.ndim != 3:
+            raise ValueError(f"hidden_states must be shaped (B,S,D), got {hidden_states.shape}")
+        cfg = self.config
+        batch, seq, _ = hidden_states.shape
+        q, k, v = self._project_qkv_bshd(hidden_states, rope_offset=rope_offset)
+
+        # The current sparse-MLA ABI stores K and V in one packed KV row.  Until
+        # absorbed MLA projections are added, combine the local K/V producers at
+        # graph level so both projections remain trainable without hidden kernel
+        # staging or adapter copies.
+        kv = (k + v) * mx.array(0.5, dtype=k.dtype)
+        q_fp8, q_scale = _to_fp8_with_per_token_scale(q)
+        kv_fp8, kv_scale = _to_fp8_with_per_token_scale(kv)
+        sparse_window = key_length if key_length is not None else seq
+        if cfg.sliding_window is not None:
+            sparse_window = min(sparse_window, cfg.sliding_window)
+        effective_topk = min(cfg.sparse_topk, sparse_window)
+        indices = causal_sparse_indices(
+            batch,
+            seq,
+            cfg.kv_heads,
+            effective_topk,
+            query_offset=rope_offset,
+            key_length=key_length,
+        )
+        return SparseMLAFp8Prepared(
+            q_fp8=q_fp8,
+            q_scale=q_scale,
+            kv_fp8=kv_fp8,
+            kv_scale=kv_scale,
+            indices=indices,
+            sm_scale=(cfg.q_head_dim**-0.5) / self.rope_attention_factor,
+            d_v=cfg.q_head_dim,
+        )
+
+    def _call_sparse_mla_fp8_path_c(
+        self,
+        hidden_states: mx.array,
+        *,
+        rope_offset: int = 0,
+        key_length: int | None = None,
+    ) -> mx.array:
+        from cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c import (
+            sparse_mla_fp8_path_c_apply,
+        )
+
+        prepared = self.prepare_sparse_mla_fp8(
+            hidden_states,
+            rope_offset=rope_offset,
+            key_length=key_length,
+        )
+        out = sparse_mla_fp8_path_c_apply(
+            prepared.q_fp8,
+            prepared.q_scale,
+            prepared.kv_fp8,
+            prepared.kv_scale,
+            prepared.indices,
+            sm_scale=prepared.sm_scale,
+            d_v=prepared.d_v,
+            force_path_c=True,
+        )
+        if out is None:
+            raise RuntimeError("sparse_mla_fp8_path_c_apply returned None under forced Path C")
+        record_dispatch("sparse_mla", KernelPath.PATH_C, "tilelang_fp8_prepared_path_c_fwd")
+        out = out.astype(hidden_states.dtype)
+        out = out.reshape(
+            hidden_states.shape[0],
+            hidden_states.shape[1],
+            self.config.q_proj_dim,
+        )
+        return self.out_proj(out)
+
+    def _use_sparse_mla_fp8_path_c(
+        self,
+        mask: mx.array | Literal["causal"] | None,
+        *,
+        sinks: mx.array | None,
+        kv_cache: ContiguousKVCache | None,
+    ) -> bool:
+        return (
+            self.config.mode == "dsa"
+            and selected_path("sparse_mla") is KernelPath.PATH_C
+            and (mask is None or (isinstance(mask, str) and mask == "causal"))
+            and sinks is None
+            and kv_cache is None
+        )
+
     def __call__(
         self,
         hidden_states: mx.array,
@@ -398,6 +573,15 @@ class CausalSelfAttention(nn.Module):
         if hidden_states.shape[-1] != self.config.d_model:
             raise ValueError(
                 f"hidden_states last dim must be {self.config.d_model}, got {hidden_states.shape[-1]}"
+            )
+        if (
+            self.config.mode == "dsa"
+            and selected_path("sparse_mla") is KernelPath.PATH_C
+            and not self._use_sparse_mla_fp8_path_c(mask, sinks=sinks, kv_cache=kv_cache)
+        ):
+            raise NotImplementedError(
+                "DSA Sparse-MLA Path C currently supports only uncached causal attention "
+                "without sinks or explicit document masks"
             )
 
         cache_position = 0
@@ -414,6 +598,9 @@ class CausalSelfAttention(nn.Module):
                     "quantized KV cache is not integrated with MLX SDPA attention yet"
                 )
             cache_position = int(layer_cache.offset)
+
+        if self._use_sparse_mla_fp8_path_c(mask, sinks=sinks, kv_cache=kv_cache):
+            return self._call_sparse_mla_fp8_path_c(hidden_states, rope_offset=cache_position)
 
         q, k, v = self._project_qkv(hidden_states, rope_offset=cache_position)
         if kv_cache is not None:
@@ -457,7 +644,9 @@ __all__ = [
     "AttentionRouteInfo",
     "CausalSelfAttention",
     "RopeType",
+    "SparseMLAFp8Prepared",
     "apply_rotary_emb",
+    "causal_sparse_indices",
     "causal_sdpa_mask",
     "precompute_rotary_embeddings",
     "rotary_inv_freq",

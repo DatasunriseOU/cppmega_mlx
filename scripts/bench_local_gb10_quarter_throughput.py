@@ -58,10 +58,9 @@ from cppmega_mlx.recipes.model_factory import (  # noqa: E402
     LOCAL_GB10_QUARTER_VOCAB_SIZE,
     local_gb10_quarter,
 )
-from cppmega_mlx.runtime.kernel_policy import get_dispatch_log
-from cppmega_mlx.training.loss import next_token_cut_cross_entropy
-from cppmega_mlx.training.optimizers import (
-    MuonAdamWMulti,
+from cppmega_mlx.runtime.kernel_policy import get_dispatch_log  # noqa: E402
+from cppmega_mlx.training.loss import next_token_cut_cross_entropy  # noqa: E402
+from cppmega_mlx.training.optimizers import (  # noqa: E402
     make_lion,
     make_muon,
 )
@@ -87,11 +86,12 @@ LION_KWARGS: dict[str, Any] = {
 MUON_KWARGS: dict[str, Any] = {"cppmega_cuda_parity": True}
 
 REQUIRED_PATH_B_OPS = ("mamba3_mimo", "m2rnn")
-# sparse_mla is not yet wired into the local_gb10_quarter forward (DSA mode
-# is a dense placeholder in CausalSelfAttention; cf. cppmega_mlx/nn/attention.py
-# AttentionRouteInfo). Path B verification therefore covers the two ops that
-# DO dispatch in the live model forward: mamba3_mimo (M layers) and m2rnn
-# (R layers). When sparse_mla is wired into model forward we should add it.
+# sparse_mla FP8 Path C is wired for DSA A-layers when
+# CPPMEGA_KERNEL_PATH__SPARSE_MLA=path_c. This Path B throughput bench still
+# covers the two production Path B ops that dispatch in the measured route:
+# mamba3_mimo (M layers) and m2rnn (R layers). Path C Sparse-MLA belongs in a
+# separate receipt because its prepared FP8 producer/kernel policy is a
+# different axis from this Path A vs Path B comparison.
 
 
 @dataclass(frozen=True)
@@ -526,7 +526,6 @@ def run_bench_one(
     optimizer_state_size = 0
     dispatch_snapshot: tuple[dict[str, str], ...] = ()
     peak_bytes = 0
-    steps_completed = 0
     cap_hit_early = False
 
     model = None
@@ -541,7 +540,9 @@ def run_bench_one(
 
         optimizer_state_size = optimizer_state_bytes(optimizer)
 
-        loss_fn = lambda m, batch: loss_with_cce(m, batch, cce_chunk_rows)
+        def loss_fn(m: nn.Module, batch: dict[str, mx.array]):
+            return loss_with_cce(m, batch, cce_chunk_rows)
+
         loss_and_grad = nn.value_and_grad(model, loss_fn)
 
         cap_bytes = int(memory_cap_gb * (1024**3))
@@ -570,7 +571,6 @@ def run_bench_one(
             losses.append(float(loss.item()))
             if step >= warmup:
                 step_tps.append(tps)
-            steps_completed = step + 1
 
             current_peak = get_peak_memory_bytes()
             peak_bytes = max(peak_bytes, current_peak)

@@ -64,6 +64,9 @@ DTYPES = {
     "float32": mx.float32,
     "float16": mx.float16,
     "bfloat16": mx.bfloat16,
+    # Route label used by m04_train_step. Parameters/activations stay bf16
+    # until the model graph owns native FP8 producers.
+    "fp8_path_c": mx.bfloat16,
 }
 STRUCTURE_MODEL_KWARG_NAMES = (
     "structure_ids",
@@ -1487,6 +1490,9 @@ def train_hybrid_tiny(
     validate_config(config)
     memory_limit = memory_limit_payload(config, apply=True)
     mx.random.seed(config.seed)
+    from cppmega_mlx.runtime.kernel_policy import clear_dispatch_log, get_dispatch_log
+
+    clear_dispatch_log()
 
     resume_metadata: dict[str, Any] | None = None
     resume_metadata_path: Path | None = None
@@ -1724,6 +1730,7 @@ def train_hybrid_tiny(
         "median_step_time_s": statistics.median(step_times),
         "tokens_per_second": statistics.fmean(tps_values),
         "step_metrics": step_metrics,
+        "kernel_dispatch": get_dispatch_log(),
         "evaluation": evaluation,
         "resume": {
             "path": config.resume_from,

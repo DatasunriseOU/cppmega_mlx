@@ -100,13 +100,28 @@ B4_S1024_H8_D64; unreceipted shapes stay on Path B.
       <td>Partial qk reducers have parity/timing receipts (QK-reduce<br>
       C/B 0.975, indexed QK-reduce C/B 0.655), but they are not<br>
       the strict full-dispatch gate. Standalone scaled matmul/vecmat<br>
-      parity is now closed in the TileLang Metal worktree; full<br>
-      Sparse-MLA FP8 Path C composition remains unavailable, so<br>
-      sparse_mla_fp8.json keeps the full Path C gate red.</td>
+      parity is now closed in the TileLang Metal worktree. Full<br>
+      Sparse-MLA FP8 forward composition is wired as a prepared-buffer<br>
+      DSA A-layer route; the strict training gate remains red until<br>
+      prepared-buffer backward/update coverage lands.</td>
       <td>Keep the real packed-dot4 QK reducer as the dispatchable partial<br>
       path, then add full Path C FP8 fwd/bwd composition using the<br>
       direct-global packed-dot4 scaled-matmul lowering as the<br>
       building block.</td>
+    </tr>
+    <tr>
+      <td>FP8 Path C end-to-end training dtype route</td>
+      <td>scripts/m04_train_step.py accepts dtype=fp8_path_c as an<br>
+      explicit optimizer-matrix route. DSA A-layers now produce<br>
+      prepared q_fp8/q_scale/kv_fp8/kv_scale tensors before calling<br>
+      Sparse-MLA Path C. The remaining public Path C gap is M&gt;1<br>
+      T.fp8_scaled_matmul as an MLX custom_function/VJP training op.<br>
+      Adapters must not quantize/copy large bf16/fp32 tensors into<br>
+      temporary FP8 staging buffers.</td>
+      <td>Add a differentiated MLX-callable M&gt;1 FP8 Path C matmul that<br>
+      consumes existing FP8 GPU buffers, then extend the prepared-buffer<br>
+      ownership pattern from DSA activations to trainable parameters,<br>
+      absorbed MLA KV layout, and backward/update kernels.</td>
     </tr>
     <tr>
       <td>Sparse-MLA blockscaled fwd/bwd (e8m0)</td>
@@ -141,6 +156,12 @@ decode. The win path is **real FP8 Metal scheduler/codegen**, not an algebraic
 rewrite of the same scalar multiply. As of the 2026-05-05 TileLang worktree
 receipt, standalone full matmul and M==1 vecmat both lower through packed
 dot4/direct-global Metal code and match or beat the audiohacking MSL receipts.
+As of the 2026-05-11 local MLX patch, MLX Metal tensors also export DLPack
+as `kDLMetal:0`, `tvm.runtime.from_dlpack` maps them to TVM `metal:0`, and a
+standalone TVM Metal kernel can read/write the same MLX buffers. That proves
+the bridge substrate; it does not yet prove the m04 end-to-end FP8 training
+route, which still needs graph wiring over prepared FP8 buffers with no hidden
+large tensor staging.
 
 <table>
   <thead>

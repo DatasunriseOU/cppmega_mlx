@@ -463,7 +463,7 @@ throughput claim.
 41. Refactor attention.py to support GQA explicitly: kv_repeat = num_q_heads // num_kv_heads in QKV projection; assert configs.
 42. Add MQA path (num_kv_heads=1).
 43. Add full MHA path (num_kv_heads=num_q_heads).
-44. Promote mode='dsa' from dense placeholder to actual sparse top-k indexing; mirror cppmega CUDA dsa_indexer_fused_patch.py.
+44. Promote mode='dsa' from dense placeholder to actual sparse top-k indexing; mirror cppmega CUDA dsa_indexer_fused_patch.py. Partial: DSA A-layers now produce prepared FP8 Sparse-MLA buffers and causal top-k indices when `CPPMEGA_KERNEL_PATH__SPARSE_MLA=path_c`; learned/top-k indexer parity is still open.
 45. Implement DSA indexer with per-head BMM accumulation (no [sq,b,h,sk] intermediate), per cppmega Patch 3.
 46. Verify Mamba3 reference matches CUDA mamba3_te_mixer.py numerics within tolerance on golden batch.
 47. Verify M2RNN reference matches Megatron M2RNN numerics on golden batch.

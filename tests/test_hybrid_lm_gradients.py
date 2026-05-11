@@ -248,6 +248,68 @@ def test_hybrid_lm_skips_causal_mask_allocation_for_non_attention_routes(
     assert calls == [(4, mx.float32)]
 
 
+def test_hybrid_lm_dsa_path_c_uses_sparse_causal_sentinel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c as fp8_path_c
+
+    mask_calls: list[tuple[int, mx.Dtype]] = []
+    apply_calls: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
+    original = nn.MultiHeadAttention.create_additive_causal_mask
+
+    def recording_mask(seq_length: int, *, dtype: mx.Dtype):
+        mask_calls.append((seq_length, dtype))
+        return original(seq_length, dtype=dtype)
+
+    def fake_apply(
+        q_fp8: mx.array,
+        q_scale: mx.array,
+        kv_fp8: mx.array,
+        kv_scale: mx.array,
+        indices: mx.array,
+        *,
+        sm_scale: float,
+        d_v: int | None = None,
+        return_lse: bool = False,
+        force_path_c: bool = False,
+    ) -> mx.array:
+        del q_scale, kv_scale, indices, sm_scale, return_lse
+        assert force_path_c is True
+        d_v_resolved = int(q_fp8.shape[-1] if d_v is None else d_v)
+        apply_calls.append((tuple(q_fp8.shape), tuple(kv_fp8.shape)))
+        return mx.zeros(
+            (q_fp8.shape[0], q_fp8.shape[1], q_fp8.shape[2], d_v_resolved),
+            dtype=mx.float16,
+        )
+
+    monkeypatch.setenv("CPPMEGA_KERNEL_PATH__SPARSE_MLA", "path_c")
+    monkeypatch.setattr(
+        nn.MultiHeadAttention,
+        "create_additive_causal_mask",
+        recording_mask,
+    )
+    monkeypatch.setattr(fp8_path_c, "sparse_mla_fp8_path_c_apply", fake_apply)
+
+    model = HybridTinyLM(
+        _hybrid_config(
+            pattern="A",
+            depth=1,
+            dsa_a_layer_ranks=(0,),
+            hidden_size=16,
+            num_attention_heads=4,
+            num_attention_kv_heads=2,
+            attention_sparse_topk=2,
+            max_seq_length=8,
+        )
+    )
+    out = model(mx.array([[1, 2, 3, 4]], dtype=mx.int32))
+    mx.eval(out)
+
+    assert out.shape == (1, 4, model.config.vocab_size)
+    assert mask_calls == []
+    assert apply_calls == [((1, 4, 4, 4), (1, 4, 2, 4))]
+
+
 def test_hybrid_lm_document_ids_mask_cross_document_attention() -> None:
     mx.random.seed(461)
     model = HybridTinyLM(_single_route_config("A"))

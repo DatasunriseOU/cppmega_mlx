@@ -250,7 +250,7 @@ def conclusions(receipt: dict[str, Any]) -> str:
                 f"({fmt(best_muon['tokens_per_second_median'], kind='f0')} vs "
                 f"{fmt(path_a['tokens_per_second_median'], kind='f0')} tok/s). "
                 "Path B fires `metal_kernel_fwd_v1` for `mamba3_mimo` and `m2rnn`; "
-                "`sparse_mla` is not yet wired into the model forward."
+                "`sparse_mla` has a separate prepared-FP8 Path C receipt axis."
             )
 
     error_rows = [r for r in rows if r.get("error") is not None]

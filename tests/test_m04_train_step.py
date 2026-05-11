@@ -473,6 +473,107 @@ def test_missing_dataset_dry_run_reports_blocked_receipt(tmp_path: Path) -> None
     assert payload["acceptance_gate"]["full_local_gb10_quarter_gate_completed"] is False
 
 
+def test_fp8_path_c_training_dtype_route_runs_mamba3_path_c_without_staging(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "m04_train_step.json"
+
+    result = run_script(
+        *tiny_args(output),
+        "--dtype",
+        "fp8_path_c",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not result.stderr
+    payload = json.loads(result.stdout)
+    assert json.loads(output.read_text()) == payload
+    assert payload["status"] == "ok"
+    assert payload["training"]["steps_completed"] == 1
+    assert payload["workload"]["dtype"] == "fp8_path_c"
+    assert payload["workload"]["optimizer"]["key"] == "adamw"
+    assert payload["workload"]["precision_route"] == {
+        "requested": "fp8_path_c",
+        "kind": "fp8_path_c",
+        "status": m04_train_step.FP8_PATH_C_E2E_TRAINING_STATUS,
+        "blocker_type": None,
+        "carrier_dtype": "bfloat16",
+        "native_fp8_producer_status": (
+            m04_train_step.FP8_PATH_C_NATIVE_PRODUCER_STATUS
+        ),
+        "kernel_surface_status": m04_train_step.FP8_PATH_C_KERNEL_SURFACE_STATUS,
+        "kernel_surface_available": True,
+        "full_end_to_end_training_available": True,
+        "bridge_target": m04_train_step.FP8_PATH_C_BRIDGE_TARGET,
+        "bridge_status": m04_train_step.FP8_PATH_C_BRIDGE_STATUS,
+        "zero_copy_required": True,
+        "large_tensor_staging_allowed": False,
+    }
+    route = payload["training"]["fp8_path_c_training_route"]
+    assert route["requested"] is True
+    assert route["status"] == m04_train_step.FP8_PATH_C_E2E_TRAINING_STATUS
+    assert route["blocker_type"] is None
+    assert route["carrier_dtype"] == "bfloat16"
+    assert route["native_fp8_producer_status"] == (
+        m04_train_step.FP8_PATH_C_NATIVE_PRODUCER_STATUS
+    )
+    assert route["kernel_surface_status"] == (
+        m04_train_step.FP8_PATH_C_KERNEL_SURFACE_STATUS
+    )
+    assert route["kernel_surface_available"] is True
+    assert route["full_end_to_end_training_available"] is True
+    assert route["end_to_end_training_status"] == (
+        m04_train_step.FP8_PATH_C_E2E_TRAINING_STATUS
+    )
+    assert route["direct_mx_array_artifact_call_status"] == "m04_uses_model_graph_route"
+    assert route["bridge_target"] == m04_train_step.FP8_PATH_C_BRIDGE_TARGET
+    assert route["bridge_status"] == m04_train_step.FP8_PATH_C_BRIDGE_STATUS
+    assert route["bridge_evidence"] == {
+        "mlx_array_exports_dlpack": True,
+        "mlx_public_from_dlpack_available": False,
+        "tvm_ffi_from_dlpack_available": True,
+        "mlx_metal_dlpack_device": "kDLMetal:0",
+        "tvm_from_dlpack_device": "metal:0",
+        "standalone_mlx_to_tvm_metal_kernel_verified": True,
+        "m04_bridge_wired": True,
+    }
+    assert route["zero_copy_required"] is True
+    assert route["large_tensor_staging_allowed"] is False
+    assert route["hidden_dtype_cast_allowed"] is False
+    assert route["hidden_shape_staging_allowed"] is False
+    assert route["fallback_to_path_b_allowed"] is False
+    assert route["selected_action"] == "run_path_c_training_route"
+    assert {
+        "fp8_scaled_vecmat_path_c",
+        "mamba3_mimo_path_c",
+        "sparse_mla_fp8_path_c_apply",
+        "matmul_tl_fp8_scaled_matmul",
+    } == {surface["name"] for surface in route["available_path_c_surfaces"]}
+    surfaces = {
+        surface["name"]: surface for surface in route["available_path_c_surfaces"]
+    }
+    assert surfaces["matmul_tl_fp8_scaled_matmul"]["kernel_surface_available"] is True
+    assert surfaces["mamba3_mimo_path_c"]["training_surface"] is True
+    assert surfaces["sparse_mla_fp8_path_c_apply"]["training_surface"] is False
+    assert (
+        "FP8 parameter/weight producers that create the required dtype/layout "
+        "before matmul kernel boundaries"
+        in route["missing_training_surfaces"]
+    )
+    assert (
+        "absorbed MLA producer split for NoPE/RoPE KV layout and calibrated "
+        "separate K/V scale lifecycle"
+        in route["missing_training_surfaces"]
+    )
+    assert route["higher_level_owner"]["current_m04_route_owner"].endswith(
+        "HybridTinyLM -> Mamba3ReferenceBlock"
+    )
+    assert any(
+        item["op_name"] == "mamba3_mimo" and item["path"] == "path_c"
+        for item in payload["training"]["kernel_dispatch"]
+    )
+
+
 def assert_local_gb10_metadata_dry_run_contract(payload: dict[str, Any]) -> None:
     status = payload["status"]
     assert status in {"dry_run", "failed"}
