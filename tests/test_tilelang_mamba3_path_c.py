@@ -150,6 +150,21 @@ def test_lowered_bwd_bench_shape_uses_simd_p_reduction() -> None:
     assert "dD_batch" in msl
 
 
+def test_metal_simd_sum_op_has_tscript_printer_name() -> None:
+    _msl_transform._register_path_c_metal_fp8_intrinsics()
+    try:
+        from tilelang.tvm.ir import Op  # type: ignore
+    except Exception:
+        try:
+            from tvm.ir import Op  # type: ignore
+        except Exception as exc:
+            pytest.skip(f"TVM unavailable: {exc}")
+
+    op = Op.get("tirx.metal.simd_sum")
+    assert op.has_attr("TScriptPrinterName")
+    assert str(op.get_attr("TScriptPrinterName")) == "metal.simd_sum"
+
+
 def test_lowered_msl_reuses_hot_scalar_temporaries() -> None:
     """TileLang CSE plus scalar binding reuse avoids hot exp/sigmoid recompute."""
 

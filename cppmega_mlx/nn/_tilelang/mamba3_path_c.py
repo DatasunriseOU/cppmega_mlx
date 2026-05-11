@@ -825,10 +825,6 @@ def _bwd_kernel_for(
                     dz[b, t, h, p] = d_silu * silu_dz
                     dD_acc += d_y_skipped * x_val
 
-                    # dh accumulates the y_state contribution.
-                    for n in T.serial(STATE):
-                        dh[n] = dh[n] + d_y_skipped * C[b, t, h, n]
-
                     # Per-lane partials and h_prev reconstruction. Host sums
                     # partials over P later; h_state is updated in-place to
                     # h_{t-1} for the next reverse step.
@@ -836,30 +832,32 @@ def _bwd_kernel_for(
                     d_decay = T.alloc_var(T.float32, init=0.0)
                     if t == 0:
                         for n in T.serial(STATE):
+                            C_val = C[b, t, h, n]
                             B_val = B[b, t, h, n]
+                            dh_n = dh[n] + d_y_skipped * C_val
                             dC_partial[b, t, h, n, p] = d_y_skipped * h_state[n]
-                            dB_partial[b, t, h, n, p] = dh[n] * x_val
-                            dx_inp += dh[n] * B_val
-                            d_decay += dh[n] * h0[b, h, p, n]
+                            dB_partial[b, t, h, n, p] = dh_n * x_val
+                            dx_inp += dh_n * B_val
+                            d_decay += dh_n * h0[b, h, p, n]
+                            dh[n] = dh_n * decay
                     else:
                         for n in T.serial(STATE):
+                            C_val = C[b, t, h, n]
                             B_val = B[b, t, h, n]
+                            dh_n = dh[n] + d_y_skipped * C_val
                             dC_partial[b, t, h, n, p] = d_y_skipped * h_state[n]
-                            dB_partial[b, t, h, n, p] = dh[n] * x_val
-                            dx_inp += dh[n] * B_val
+                            dB_partial[b, t, h, n, p] = dh_n * x_val
+                            dx_inp += dh_n * B_val
                             h_prev = (h_state[n] - x_val * B_val) * inv_decay
-                            d_decay += dh[n] * h_prev
+                            d_decay += dh_n * h_prev
                             h_state[n] = h_prev
+                            dh[n] = dh_n * decay
                     dx_skip = d_y_skipped * D_h
                     dx[b, t, h, p] = dx_skip + dx_inp
 
                     d_logdecay = d_decay * decay
                     dA_partial[b, t, h, p] = d_logdecay * dt_val
                     ddt_partial[b, t, h, p] = d_logdecay * A_val
-
-                    # Propagate dh through decay for the next reverse step.
-                    for n in T.serial(STATE):
-                        dh[n] = dh[n] * decay
 
                 # After the backward sweep, dh is dh0 for this lane.
                 for n in T.serial(STATE):
@@ -1001,14 +999,13 @@ def _bwd_simd_reduce_kernel_for(
                     dz[b, t, h, p] = d_silu * silu_dz
                     dD_acc += d_y_skipped * x_val
 
-                    for n in T.serial(STATE):
-                        dh[n] = dh[n] + d_y_skipped * C[b, t, h, n]
-
                     dx_inp = T.alloc_var(T.float32, init=0.0)
                     d_decay = T.alloc_var(T.float32, init=0.0)
                     if t == 0:
                         for n in T.serial(STATE):
+                            C_val = C[b, t, h, n]
                             B_val = B[b, t, h, n]
+                            dh_n = dh[n] + d_y_skipped * C_val
                             dC_sum = T.call_intrin(
                                 "float32",
                                 "tir.metal.simd_sum",
@@ -1017,16 +1014,19 @@ def _bwd_simd_reduce_kernel_for(
                             dB_sum = T.call_intrin(
                                 "float32",
                                 "tir.metal.simd_sum",
-                                dh[n] * x_val,
+                                dh_n * x_val,
                             )
                             if p == 0:
                                 dC[b, t, h, n] = dC_sum
                                 dB[b, t, h, n] = dB_sum
-                            dx_inp += dh[n] * B_val
-                            d_decay += dh[n] * h0[b, h, p, n]
+                            dx_inp += dh_n * B_val
+                            d_decay += dh_n * h0[b, h, p, n]
+                            dh[n] = dh_n * decay
                     else:
                         for n in T.serial(STATE):
+                            C_val = C[b, t, h, n]
                             B_val = B[b, t, h, n]
+                            dh_n = dh[n] + d_y_skipped * C_val
                             dC_sum = T.call_intrin(
                                 "float32",
                                 "tir.metal.simd_sum",
@@ -1035,15 +1035,16 @@ def _bwd_simd_reduce_kernel_for(
                             dB_sum = T.call_intrin(
                                 "float32",
                                 "tir.metal.simd_sum",
-                                dh[n] * x_val,
+                                dh_n * x_val,
                             )
                             if p == 0:
                                 dC[b, t, h, n] = dC_sum
                                 dB[b, t, h, n] = dB_sum
-                            dx_inp += dh[n] * B_val
+                            dx_inp += dh_n * B_val
                             h_prev = (h_state[n] - x_val * B_val) * inv_decay
-                            d_decay += dh[n] * h_prev
+                            d_decay += dh_n * h_prev
                             h_state[n] = h_prev
+                            dh[n] = dh_n * decay
                     dx_skip = d_y_skipped * D_h
                     dx[b, t, h, p] = dx_skip + dx_inp
 
@@ -1055,9 +1056,6 @@ def _bwd_simd_reduce_kernel_for(
                     if p == 0:
                         dA[b, t, h] = dA_sum
                         ddt[b, t, h] = ddt_sum
-
-                    for n in T.serial(STATE):
-                        dh[n] = dh[n] * decay
 
                 for n in T.serial(STATE):
                     dh0[b, h, p, n] = dh[n]

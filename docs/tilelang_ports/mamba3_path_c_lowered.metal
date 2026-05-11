@@ -382,25 +382,25 @@ kernel void fwd_kernel(  device float* A [[ buffer(0) ]],
 ) {
   thread float h_state[64];
   float y_acc = 0.000000e+00f;
-  int cse_v1 = (((int)threadIdx.x) * 64);
+  int cse_v3 = (((int)threadIdx.x) * 64);
   for (int n = 0; n < 64; ++n) {
-    h_state[n] = h0[(cse_v1 + n)];
+    h_state[n] = h0[(cse_v3 + n)];
   }
   for (int t = 0; t < 512; ++t) {
-    int cse_v2 = (((int)threadIdx.x) & 127);
-    int cse_v3 = (((int)threadIdx.x) >> 7);
-    int cse_v4 = (cse_v2 >> 5);
-    int cse_v6 = (((cse_v3 * 2048) + (t * 4)) + cse_v4);
+    int cse_v1 = (((int)threadIdx.x) & 127);
+    int cse_v2 = (((int)threadIdx.x) >> 7);
+    int cse_v4 = (cse_v1 >> 5);
+    int cse_v6 = (((cse_v2 * 2048) + (t * 4)) + cse_v4);
     float A_val = A[cse_v6];
     float dt_val = dt[cse_v6];
     float cse_v2_1 = (A_val * dt_val);
     float decay = exp(cse_v2_1);
-    int cse_v5 = (((cse_v3 * 65536) + (t * 128)) + cse_v2);
+    int cse_v5 = (((cse_v2 * 65536) + (t * 128)) + cse_v1);
     float x_val = x[cse_v5];
     float z_val = z[cse_v5];
     y_acc = 0.000000e+00f;
     for (int n_1 = 0; n_1 < 64; ++n_1) {
-      int cse_v7 = ((((cse_v3 * 131072) + (t * 256)) + (cse_v4 * 64)) + n_1);
+      int cse_v7 = ((((cse_v2 * 131072) + (t * 256)) + (cse_v4 * 64)) + n_1);
       float new_h = ((decay * h_state[n_1]) + (x_val * B[cse_v7]));
       h_state[n_1] = new_h;
       y_acc = (y_acc + (new_h * C[cse_v7]));
@@ -412,7 +412,7 @@ kernel void fwd_kernel(  device float* A [[ buffer(0) ]],
     y[cse_v5] = ((z_val * sig_z) * y_skipped);
   }
   for (int n_2 = 0; n_2 < 64; ++n_2) {
-    h_last[(cse_v1 + n_2)] = h_state[n_2];
+    h_last[(cse_v3 + n_2)] = h_state[n_2];
   }
 }
 
@@ -809,24 +809,24 @@ kernel void bwd_simd_kernel(  device float* A [[ buffer(0) ]],
   float y_state = 0.000000e+00f;
   float dx_inp = 0.000000e+00f;
   float d_decay = 0.000000e+00f;
-  int cse_v4 = (((int)threadIdx.x) * 64);
+  int cse_v5 = (((int)threadIdx.x) * 64);
   for (int n = 0; n < 64; ++n) {
-    h_state[n] = h0[(cse_v4 + n)];
+    h_state[n] = h0[(cse_v5 + n)];
   }
-  int cse_v2 = (((int)threadIdx.x) & 127);
-  int cse_v5 = (((int)threadIdx.x) >> 7);
-  int cse_v6 = (cse_v5 * 65536);
-  int cse_v7 = (cse_v5 * 131072);
-  int cse_v8 = (cse_v5 * 2048);
-  int cse_v9 = (cse_v2 >> 5);
+  int cse_v1 = (((int)threadIdx.x) >> 7);
+  int cse_v3 = (((int)threadIdx.x) & 127);
+  int cse_v6 = (cse_v1 * 65536);
+  int cse_v7 = (cse_v1 * 131072);
+  int cse_v8 = (cse_v1 * 2048);
+  int cse_v9 = (cse_v3 >> 5);
   int cse_v10 = (cse_v9 * 64);
   for (int t = 0; t < 512; ++t) {
     int cse_v11 = ((cse_v8 + (t * 4)) + cse_v9);
     float A_val = A[cse_v11];
     float dt_val = dt[cse_v11];
-    float cse_v1 = (A_val * dt_val);
-    float decay = exp(cse_v1);
-    float x_val = x[((cse_v6 + (t * 128)) + cse_v2)];
+    float cse_v2 = (A_val * dt_val);
+    float decay = exp(cse_v2);
+    float x_val = x[((cse_v6 + (t * 128)) + cse_v3)];
     for (int n_1 = 0; n_1 < 64; ++n_1) {
       h_state[n_1] = ((decay * h_state[n_1]) + (x_val * B[(((cse_v7 + (t * 256)) + cse_v10) + n_1)]));
     }
@@ -836,65 +836,68 @@ kernel void bwd_simd_kernel(  device float* A [[ buffer(0) ]],
   }
   dD_acc = 0.000000e+00f;
   float D_h = D[cse_v9];
-  int cse_v3 = (((int)threadIdx.x) & 31);
+  int cse_v2_1 = (((int)threadIdx.x) & 31);
   for (int r = 0; r < 512; ++r) {
     int cse_v14 = (((cse_v8 + cse_v9) + 2044) - (r * 4));
     float A_val_1 = A[cse_v14];
     float dt_val_1 = dt[cse_v14];
-    float cse_v3_1 = (A_val_1 * dt_val_1);
-    float decay_1 = exp(cse_v3_1);
+    float cse_v1_1 = (A_val_1 * dt_val_1);
+    float decay_1 = exp(cse_v1_1);
     inv_decay = (1.000000e+00f / decay_1);
-    int cse_v13 = (((cse_v6 + cse_v2) + 65408) - (r * 128));
+    int cse_v13 = (((cse_v6 + cse_v3) + 65408) - (r * 128));
     float x_val_1 = x[cse_v13];
     float z_val = z[cse_v13];
     float dY = dy[cse_v13];
     y_state = 0.000000e+00f;
-    int cse_v1_1 = (r * 256);
+    int cse_v4 = (r * 256);
     int cse_v12 = (cse_v7 + cse_v10);
     for (int n_3 = 0; n_3 < 64; ++n_3) {
-      y_state = (y_state + (h_state[n_3] * C[(((cse_v12 + n_3) + 130816) - cse_v1_1)]));
+      y_state = (y_state + (h_state[n_3] * C[(((cse_v12 + n_3) + 130816) - cse_v4)]));
     }
     float y_skipped = (y_state + (D_h * x_val_1));
-    float cse_v2_1 = (z_val * -1.000000e+00f);
-    float sig_z = (1.000000e+00f / (1.000000e+00f + exp(cse_v2_1)));
+    float cse_v3_1 = (z_val * -1.000000e+00f);
+    float sig_z = (1.000000e+00f / (1.000000e+00f + exp(cse_v3_1)));
     float silu_z = (z_val * sig_z);
     float silu_dz = (sig_z * (1.000000e+00f + (z_val * (1.000000e+00f - sig_z))));
     float d_silu = (dY * y_skipped);
     float d_y_skipped = (dY * silu_z);
     dz[cse_v13] = (d_silu * silu_dz);
     dD_acc = (dD_acc + (d_y_skipped * x_val_1));
-    for (int n_4 = 0; n_4 < 64; ++n_4) {
-      dh[n_4] = (dh[n_4] + (d_y_skipped * C[(((cse_v12 + n_4) + 130816) - cse_v1_1)]));
-    }
     dx_inp = 0.000000e+00f;
     d_decay = 0.000000e+00f;
     if (r == 511) {
-      for (int n_5 = 0; n_5 < 64; ++n_5) {
-        int cse_v16 = (((cse_v12 + n_5) + 130816) - cse_v1_1);
-        float B_val = B[cse_v16];
-        float dC_sum = simd_sum((d_y_skipped * h_state[n_5]));
-        float dB_sum = simd_sum((dh[n_5] * x_val_1));
-        if (cse_v3 == 0) {
-          dC[cse_v16] = dC_sum;
-          dB[cse_v16] = dB_sum;
+      for (int n_4 = 0; n_4 < 64; ++n_4) {
+        int cse_v15 = (((cse_v12 + n_4) + 130816) - cse_v4);
+        float C_val = C[cse_v15];
+        float B_val = B[cse_v15];
+        float dh_n = (dh[n_4] + (d_y_skipped * C_val));
+        float dC_sum = simd_sum((d_y_skipped * h_state[n_4]));
+        float dB_sum = simd_sum((dh_n * x_val_1));
+        if (cse_v2_1 == 0) {
+          dC[cse_v15] = dC_sum;
+          dB[cse_v15] = dB_sum;
         }
-        dx_inp = (dx_inp + (dh[n_5] * B_val));
-        d_decay = (d_decay + (dh[n_5] * h0[(cse_v4 + n_5)]));
+        dx_inp = (dx_inp + (dh_n * B_val));
+        d_decay = (d_decay + (dh_n * h0[(cse_v5 + n_4)]));
+        dh[n_4] = (dh_n * decay_1);
       }
     } else {
-      for (int n_6 = 0; n_6 < 64; ++n_6) {
-        int cse_v15 = (((cse_v12 + n_6) + 130816) - cse_v1_1);
-        float B_val_1 = B[cse_v15];
-        float dC_sum_1 = simd_sum((d_y_skipped * h_state[n_6]));
-        float dB_sum_1 = simd_sum((dh[n_6] * x_val_1));
-        if (cse_v3 == 0) {
-          dC[cse_v15] = dC_sum_1;
-          dB[cse_v15] = dB_sum_1;
+      for (int n_5 = 0; n_5 < 64; ++n_5) {
+        int cse_v16 = (((cse_v12 + n_5) + 130816) - cse_v4);
+        float C_val_1 = C[cse_v16];
+        float B_val_1 = B[cse_v16];
+        float dh_n_1 = (dh[n_5] + (d_y_skipped * C_val_1));
+        float dC_sum_1 = simd_sum((d_y_skipped * h_state[n_5]));
+        float dB_sum_1 = simd_sum((dh_n_1 * x_val_1));
+        if (cse_v2_1 == 0) {
+          dC[cse_v16] = dC_sum_1;
+          dB[cse_v16] = dB_sum_1;
         }
-        dx_inp = (dx_inp + (dh[n_6] * B_val_1));
-        float h_prev = ((h_state[n_6] - (x_val_1 * B_val_1)) * inv_decay);
-        d_decay = (d_decay + (dh[n_6] * h_prev));
-        h_state[n_6] = h_prev;
+        dx_inp = (dx_inp + (dh_n_1 * B_val_1));
+        float h_prev = ((h_state[n_5] - (x_val_1 * B_val_1)) * inv_decay);
+        d_decay = (d_decay + (dh_n_1 * h_prev));
+        h_state[n_5] = h_prev;
+        dh[n_5] = (dh_n_1 * decay_1);
       }
     }
     float dx_skip = (d_y_skipped * D_h);
@@ -904,19 +907,16 @@ kernel void bwd_simd_kernel(  device float* A [[ buffer(0) ]],
     float ddt_lane = (d_logdecay * A_val_1);
     float dA_sum = simd_sum(dA_lane);
     float ddt_sum = simd_sum(ddt_lane);
-    if (cse_v3 == 0) {
+    if (cse_v2_1 == 0) {
       dA[cse_v14] = dA_sum;
       ddt[cse_v14] = ddt_sum;
     }
-    for (int n_7 = 0; n_7 < 64; ++n_7) {
-      dh[n_7] = (dh[n_7] * decay_1);
-    }
   }
-  for (int n_8 = 0; n_8 < 64; ++n_8) {
-    dh0[(cse_v4 + n_8)] = dh[n_8];
+  for (int n_6 = 0; n_6 < 64; ++n_6) {
+    dh0[(cse_v5 + n_6)] = dh[n_6];
   }
   float dD_sum = simd_sum(dD_acc);
-  if (cse_v3 == 0) {
+  if (cse_v2_1 == 0) {
     dD_batch[(((int)threadIdx.x) >> 5)] = dD_sum;
   }
 }

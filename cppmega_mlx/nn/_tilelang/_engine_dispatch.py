@@ -60,6 +60,17 @@ def _with_pass_context(pass_configs: dict[str, Any] | None):
     return tvm.transform.PassContext(opt_level=3, config=dict(pass_configs))
 
 
+def _ensure_path_c_metal_intrinsics_registered() -> None:
+    try:
+        from cppmega_mlx.nn._tilelang._msl_transform import (
+            _register_path_c_metal_fp8_intrinsics,
+        )
+
+        _register_path_c_metal_fp8_intrinsics()
+    except Exception:
+        pass
+
+
 def _engine_compile(
     prim_func: Any,
     target: str,
@@ -77,6 +88,7 @@ def _engine_compile(
     """
 
     import tilelang  # noqa: F401  - intentional eager import for ImportError surfacing
+    _ensure_path_c_metal_intrinsics_registered()
 
     compile_target: Any = target
     if isinstance(target, str) and target.startswith("metal") and "-" in target:
@@ -115,6 +127,7 @@ def _engine_lower_for_msl_extraction(
 
     import tilelang  # noqa: F401  - intentional eager import for ImportError surfacing
     from tilelang.engine.lower import lower as tl_lower
+    _ensure_path_c_metal_intrinsics_registered()
 
     lower_target: Any = target
     if isinstance(target, str) and target.startswith("metal") and "-" in target:

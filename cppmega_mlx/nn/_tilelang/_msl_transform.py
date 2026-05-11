@@ -1230,6 +1230,7 @@ def lower_tilelang_to_msl_inline(
         raise MSLDispatchUnsupported(
             f"tilelang import failed: {exc}; falling back to pure MLX"
         ) from exc
+    _register_path_c_metal_fp8_intrinsics()
 
     _ensure_single_libtvm_ffi_image()
     metal_target = _as_metal_target(target)
@@ -1322,17 +1323,24 @@ def lower_tilelang_to_msl_inline(
 _EFFECT_KIND_PURE = 0
 _EFFECT_KIND_READ_STATE = 1
 
-# (op_name, num_inputs, description, effect_kind)
-_PATH_C_METAL_FP8_INTRINSICS: tuple[tuple[str, int, str, int], ...] = (
+# (op_name, num_inputs, description, effect_kind, TScriptPrinterName)
+_PATH_C_METAL_FP8_INTRINSICS: tuple[tuple[str, int, str, int, str], ...] = (
+    ("tirx.metal.simd_sum", 1,
+     "Metal simdgroup sum reduction.",
+     _EFFECT_KIND_PURE,
+     "metal.simd_sum"),
     ("tirx.metal.fp8_e4m3_dot4", 4,
      "FP8 e4m3 packed dot4 (deterministic — CSE-able).",
-     _EFFECT_KIND_PURE),
+     _EFFECT_KIND_PURE,
+     "metal.fp8_e4m3_dot4"),
     ("tirx.metal.thread_position_in_grid_x", 0,
      "Reads kernel-arg with [[thread_position_in_grid]] — kReadState to block CSE/hoist.",
-     _EFFECT_KIND_READ_STATE),
+     _EFFECT_KIND_READ_STATE,
+     "metal.thread_position_in_grid_x"),
     ("tirx.metal.thread_index_in_simdgroup", 0,
      "Reads kernel-arg with [[thread_index_in_simdgroup]] — kReadState to block CSE/hoist.",
-     _EFFECT_KIND_READ_STATE),
+     _EFFECT_KIND_READ_STATE,
+     "metal.thread_index_in_simdgroup"),
 )
 
 _effect_kind_imm: dict[int, Any] = {
@@ -1373,29 +1381,44 @@ def _register_path_c_metal_fp8_intrinsics() -> None:
         if _effect_kind_imm[kind] is None:
             _effect_kind_imm[kind] = IntImm("int32", kind)
 
-    for name, num_inputs, description, effect_kind in _PATH_C_METAL_FP8_INTRINSICS:
+    for (
+        name,
+        num_inputs,
+        description,
+        effect_kind,
+        tscript_printer_name,
+    ) in _PATH_C_METAL_FP8_INTRINSICS:
         try:
             existing = Op.get(name)
         except Exception:
             existing = None
         if existing is not None:
-            continue
+            op = existing
+            registered_now = False
+        else:
+            try:
+                register_op(name, description)
+                op = Op.get(name)
+                registered_now = True
+            except Exception:
+                # Best-effort: a partial failure here should not block module
+                # import. The assertion helper will surface it loudly when a
+                # caller actually needs the op.
+                continue
         try:
-            register_op(name, description)
-            op = Op.get(name)
-            try:
+            if registered_now:
                 op.set_num_inputs(num_inputs)
-            except Exception:
-                pass
-            try:
-                op.set_attr("TCallEffectKind", _effect_kind_imm[effect_kind])
-            except Exception:
-                pass
         except Exception:
-            # Best-effort: a partial failure here should not block module
-            # import. The assertion helper will surface it loudly when a
-            # caller actually needs the op.
-            continue
+            pass
+        try:
+            if registered_now:
+                op.set_attr("TCallEffectKind", _effect_kind_imm[effect_kind])
+        except Exception:
+            pass
+        try:
+            op.set_attr("TScriptPrinterName", tscript_printer_name, 100)
+        except Exception:
+            pass
 
 
 def _assert_path_c_metal_fp8_intrinsics_registered() -> None:
@@ -1420,7 +1443,7 @@ def _assert_path_c_metal_fp8_intrinsics_registered() -> None:
             ) from exc
 
     missing: list[str] = []
-    for name, _num_inputs, _desc, _effect_kind in _PATH_C_METAL_FP8_INTRINSICS:
+    for name, _num_inputs, _desc, _effect_kind, _printer_name in _PATH_C_METAL_FP8_INTRINSICS:
         try:
             Op.get(name)
         except Exception:

@@ -449,25 +449,25 @@
 +) {
 +  thread float h_state[64];
 +  float y_acc = 0.000000e+00f;
-+  int cse_v1 = (((int)threadIdx.x) * 64);
++  int cse_v3 = (((int)threadIdx.x) * 64);
 +  for (int n = 0; n < 64; ++n) {
-+    h_state[n] = h0[(cse_v1 + n)];
++    h_state[n] = h0[(cse_v3 + n)];
 +  }
 +  for (int t = 0; t < 512; ++t) {
-+    int cse_v2 = (((int)threadIdx.x) & 127);
-+    int cse_v3 = (((int)threadIdx.x) >> 7);
-+    int cse_v4 = (cse_v2 >> 5);
-+    int cse_v6 = (((cse_v3 * 2048) + (t * 4)) + cse_v4);
++    int cse_v1 = (((int)threadIdx.x) & 127);
++    int cse_v2 = (((int)threadIdx.x) >> 7);
++    int cse_v4 = (cse_v1 >> 5);
++    int cse_v6 = (((cse_v2 * 2048) + (t * 4)) + cse_v4);
 +    float A_val = A[cse_v6];
 +    float dt_val = dt[cse_v6];
 +    float cse_v2_1 = (A_val * dt_val);
 +    float decay = exp(cse_v2_1);
-+    int cse_v5 = (((cse_v3 * 65536) + (t * 128)) + cse_v2);
++    int cse_v5 = (((cse_v2 * 65536) + (t * 128)) + cse_v1);
 +    float x_val = x[cse_v5];
 +    float z_val = z[cse_v5];
 +    y_acc = 0.000000e+00f;
 +    for (int n_1 = 0; n_1 < 64; ++n_1) {
-+      int cse_v7 = ((((cse_v3 * 131072) + (t * 256)) + (cse_v4 * 64)) + n_1);
++      int cse_v7 = ((((cse_v2 * 131072) + (t * 256)) + (cse_v4 * 64)) + n_1);
 +      float new_h = ((decay * h_state[n_1]) + (x_val * B[cse_v7]));
 +      h_state[n_1] = new_h;
 +      y_acc = (y_acc + (new_h * C[cse_v7]));
@@ -479,6 +479,6 @@
 +    y[cse_v5] = ((z_val * sig_z) * y_skipped);
 +  }
 +  for (int n_2 = 0; n_2 < 64; ++n_2) {
-+    h_last[(cse_v1 + n_2)] = h_state[n_2];
++    h_last[(cse_v3 + n_2)] = h_state[n_2];
 +  }
 +}
