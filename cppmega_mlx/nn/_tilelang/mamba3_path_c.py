@@ -528,13 +528,10 @@ def _mamba3_fwd_owner_outputs(
     heads: int,
     headdim: int,
     state: int,
-) -> Mamba3FwdOwnerOutputs:
+) -> Mamba3FwdOwnerOutputs | None:
     op_name = "mamba3_mimo_fwd_path_c"
     if out is None:
-        return (
-            mx.zeros((batch, seq, heads, headdim), dtype=mx.float32),
-            mx.zeros((batch, heads, headdim, state), dtype=mx.float32),
-        )
+        return None
     if not isinstance(out, tuple) or len(out) != 2:
         raise TypeError(
             f"{op_name}: out must be a (y, h_last) owner-output tuple"
@@ -564,20 +561,10 @@ def _mamba3_bwd_owner_outputs(
     heads: int,
     headdim: int,
     state: int,
-) -> Mamba3BwdOwnerOutputs:
+) -> Mamba3BwdOwnerOutputs | None:
     op_name = "mamba3_mimo_bwd_path_c"
     if out is None:
-        return (
-            mx.zeros((batch, heads, headdim, seq, state), dtype=mx.float32),
-            mx.zeros((batch, seq, heads, headdim), dtype=mx.float32),
-            mx.zeros((batch, seq, heads, headdim), dtype=mx.float32),
-            mx.zeros((batch, seq, heads, headdim, state), dtype=mx.float32),
-            mx.zeros((batch, seq, heads, headdim, state), dtype=mx.float32),
-            mx.zeros((batch, seq, heads, headdim), dtype=mx.float32),
-            mx.zeros((batch, seq, heads, headdim), dtype=mx.float32),
-            mx.zeros((batch, heads, headdim), dtype=mx.float32),
-            mx.zeros((batch, heads, headdim, state), dtype=mx.float32),
-        )
+        return None
     if not isinstance(out, tuple) or len(out) != len(_BWD_OUTPUT_NAMES):
         raise TypeError(
             f"{op_name}: out must be a tuple matching {_BWD_OUTPUT_NAMES!r}"
@@ -616,8 +603,9 @@ def _raise_if_dlpack_boundary_failure(op_name: str, exc: Exception) -> None:
         raise RuntimeError(
             f"{op_name} requires DLPack-exportable, contiguous caller-owned MLX "
             "input/output buffers; Path C will not copy, cast, or materialize "
-            "broadcast/slice views implicitly, and it cannot run inside MLX "
-            "graph transformations that block __dlpack__ export"
+            "broadcast/slice views implicitly. If this fires inside an MLX "
+            "graph transform, the producer has to expose a graph-safe DLPack "
+            "view or stay in the existing fused graph path."
         ) from exc
 
 
@@ -664,7 +652,7 @@ def mamba3_mimo_fwd_path_c(
     except (MSLDispatchUnsupported, RuntimeError, ValueError) as exc:
         raise RuntimeError("mamba3_mimo_fwd_path_c lowering failed") from exc
 
-    y, h_last = _mamba3_fwd_owner_outputs(
+    owner_outputs = _mamba3_fwd_owner_outputs(
         out,
         batch=batch,
         seq=seq,
@@ -673,28 +661,37 @@ def mamba3_mimo_fwd_path_c(
         state=state,
     )
     try:
-        out_list = kernel(
-            x,
-            B,
-            C,
-            z,
-            A,
-            dt,
-            D,
-            h0,
-            out=(y, h_last),
-        )
+        if owner_outputs is None:
+            out_list = kernel(x, B, C, z, A, dt, D, h0)
+        else:
+            y, h_last = owner_outputs
+            out_list = kernel(
+                x,
+                B,
+                C,
+                z,
+                A,
+                dt,
+                D,
+                h0,
+                out=(y, h_last),
+            )
     except Exception as exc:
         _raise_if_dlpack_boundary_failure("mamba3_mimo_fwd_path_c", exc)
         raise RuntimeError("mamba3_mimo_fwd_path_c dispatch failed") from exc
 
-    if not all(
-        got is expected
-        for got, expected in zip(out_list, (y, h_last), strict=True)
-    ):
-        raise RuntimeError(
-            "Mamba3 Path C fwd tvm-ffi did not return caller-owned outputs"
-        )
+    if not isinstance(out_list, (list, tuple)) or len(out_list) != 2:
+        raise RuntimeError("Mamba3 Path C fwd tvm-ffi returned an invalid output tuple")
+    if owner_outputs is not None:
+        y, h_last = owner_outputs
+        if not all(
+            got is expected
+            for got, expected in zip(out_list, (y, h_last), strict=True)
+        ):
+            raise RuntimeError(
+                "Mamba3 Path C fwd tvm-ffi did not return caller-owned outputs"
+            )
+    y, h_last = cast(tuple[mx.array, mx.array], tuple(out_list))
     del lowering
     return y, h_last
 
@@ -753,7 +750,7 @@ def _mamba3_mimo_bwd_path_c_kernel(
     except (MSLDispatchUnsupported, RuntimeError, ValueError) as exc:
         raise RuntimeError("mamba3_mimo_bwd_path_c lowering failed") from exc
 
-    expected_outputs = _mamba3_bwd_owner_outputs(
+    owner_outputs = _mamba3_bwd_owner_outputs(
         out,
         batch=batch,
         seq=seq,
@@ -761,29 +758,11 @@ def _mamba3_mimo_bwd_path_c_kernel(
         headdim=headdim,
         state=state,
     )
-    (
-        h_steps,
-        dx,
-        dz,
-        dB_partial,
-        dC_partial,
-        dA_partial,
-        ddt_partial,
-        dD_partial,
-        dh0,
-    ) = expected_outputs
     try:
-        out_list = kernel(
-            dy,
-            x,
-            B,
-            C,
-            z,
-            A,
-            dt,
-            D,
-            h0,
-            out=(
+        if owner_outputs is None:
+            out_list = kernel(dy, x, B, C, z, A, dt, D, h0)
+        else:
+            (
                 h_steps,
                 dx,
                 dz,
@@ -793,30 +772,43 @@ def _mamba3_mimo_bwd_path_c_kernel(
                 ddt_partial,
                 dD_partial,
                 dh0,
-            ),
-        )
+            ) = owner_outputs
+            out_list = kernel(
+                dy,
+                x,
+                B,
+                C,
+                z,
+                A,
+                dt,
+                D,
+                h0,
+                out=(
+                    h_steps,
+                    dx,
+                    dz,
+                    dB_partial,
+                    dC_partial,
+                    dA_partial,
+                    ddt_partial,
+                    dD_partial,
+                    dh0,
+                ),
+            )
     except Exception as exc:
         _raise_if_dlpack_boundary_failure("mamba3_mimo_bwd_path_c", exc)
         raise RuntimeError("mamba3_mimo_bwd_path_c dispatch failed") from exc
 
-    expected_outputs = (
-        h_steps,
-        dx,
-        dz,
-        dB_partial,
-        dC_partial,
-        dA_partial,
-        ddt_partial,
-        dD_partial,
-        dh0,
-    )
-    if not all(
-        got is expected
-        for got, expected in zip(out_list, expected_outputs, strict=True)
-    ):
-        raise RuntimeError(
-            "Mamba3 Path C bwd tvm-ffi did not return caller-owned outputs"
-        )
+    if not isinstance(out_list, (list, tuple)) or len(out_list) != len(_BWD_OUTPUT_NAMES):
+        raise RuntimeError("Mamba3 Path C bwd tvm-ffi returned an invalid output tuple")
+    if owner_outputs is not None:
+        if not all(
+            got is expected
+            for got, expected in zip(out_list, owner_outputs, strict=True)
+        ):
+            raise RuntimeError(
+                "Mamba3 Path C bwd tvm-ffi did not return caller-owned outputs"
+            )
     _h_scratch, dx_pc, dz_pc, dB_p, dC_p, dA_p, ddt_p, dD_p, dh0_pc = out_list
     del lowering, _h_scratch
     # Reduce P-dim partials into final shapes.
@@ -876,9 +868,10 @@ def mamba3_mimo_apply_path_c(
         Mamba3 is a proof / override path; Path B is the production
         entrypoint. See ``docs/production_kernel_routing.md``.
 
-        The direct tvm-ffi/DLPack call boundary is not currently callable from
-        MLX graph transformations such as ``mx.grad``; backward parity is
-        covered by :func:`mamba3_mimo_bwd_path_c` directly.
+        The direct tvm-ffi path is graph-transform callable when MLX exposes
+        graph-safe DLPack export. TileLang owns output allocation through
+        ``out_idx`` metadata; explicit ``out=`` remains the full-ABI
+        caller-owned route.
     """
 
     y, _ = mamba3_mimo_fwd_path_c(x, B, C, z, A, dt, D, h0)
@@ -909,9 +902,8 @@ def mamba3_mimo_apply_with_state_path_c(
 ) -> tuple[mx.array, mx.array]:
     """Path C forward returning ``(y, h_last)``.
 
-    Gradients are blocked today by the MLX graph-transform DLPack boundary; the
-    VJP definition remains as the intended ABI for when tvm-ffi can be invoked
-    from those graph transformations.
+    The VJP delegates to the TileLang backward kernel and uses the same
+    ``out_idx`` output policy as the y-only surface.
     """
 
     return mamba3_mimo_fwd_path_c(x, B, C, z, A, dt, D, h0)

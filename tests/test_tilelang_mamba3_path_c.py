@@ -244,6 +244,23 @@ def test_fwd_path_c_owner_outputs_avoid_hidden_zero_alloc(
     assert h_last is h_out
 
 
+def test_fwd_path_c_default_outputs_use_tilelang_write_only_alloc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _require_mamba3_path_c()
+    inputs = _make_inputs(batch=1, seq=6, heads=2, headdim=4, state=4, dtype=mx.float32)
+
+    def fail_zero_alloc(*_args: object, **_kwargs: object) -> mx.array:
+        raise AssertionError("default fwd route must not allocate mx.zeros")
+
+    monkeypatch.setattr(mamba3_path_c.mx, "zeros", fail_zero_alloc)
+
+    y, h_last = mamba3_mimo_fwd_path_c(*inputs)
+    mx.eval(y, h_last)
+    assert y.shape == (1, 6, 2, 4)
+    assert h_last.shape == (1, 2, 4, 4)
+
+
 def test_bwd_path_c_owner_outputs_avoid_hidden_zero_alloc(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -274,6 +291,26 @@ def test_bwd_path_c_owner_outputs_avoid_hidden_zero_alloc(
     assert grads[0] is owner_outputs[1]
     assert grads[3] is owner_outputs[2]
     assert grads[7] is owner_outputs[8]
+
+
+def test_bwd_path_c_default_outputs_use_tilelang_write_only_alloc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _require_mamba3_path_c()
+    inputs = _make_inputs(batch=1, seq=6, heads=2, headdim=4, state=4, dtype=mx.float32)
+    x, B, C, z, A, dt, D, h0 = inputs
+    dy = mx.ones(x.shape, dtype=mx.float32)
+    mx.eval(dy)
+
+    def fail_zero_alloc(*_args: object, **_kwargs: object) -> mx.array:
+        raise AssertionError("default bwd route must not allocate mx.zeros")
+
+    monkeypatch.setattr(mamba3_path_c.mx, "zeros", fail_zero_alloc)
+
+    grads = mamba3_mimo_bwd_path_c(dy, x, B, C, z, A, dt, D, h0)
+    mx.eval(*grads)
+    assert grads[0].shape == x.shape
+    assert grads[7].shape == h0.shape
 
 
 def test_fwd_path_c_unavailable_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -374,8 +411,8 @@ def test_bwd_path_c_matches_path_b_fp32_small_shape() -> None:
                                     err_msg=f"grad mismatch on {name}")
 
 
-def test_apply_path_c_vjp_fails_closed_inside_mlx_graph_transform() -> None:
-    """tvm-ffi/DLPack dispatch is not currently callable from ``mx.grad``."""
+def test_apply_path_c_vjp_matches_reference_inside_mlx_graph_transform() -> None:
+    """TileLang Path C is callable from ``mx.grad`` and uses its custom VJP."""
 
     _require_mamba3_path_c()
     inputs = _make_inputs(batch=1, seq=6, heads=2, headdim=4, state=4, dtype=mx.float32)
@@ -389,13 +426,21 @@ def test_apply_path_c_vjp_fails_closed_inside_mlx_graph_transform() -> None:
         return mx.sum(y * y) * 0.5
 
     g_ref = mx.grad(ref_loss, argnums=tuple(range(8)))(*inputs)
-    mx.eval(*g_ref)
-    with pytest.raises(RuntimeError, match="graph transformations"):
-        mx.grad(pc_loss, argnums=tuple(range(8)))(*inputs)
+    g_pc = mx.grad(pc_loss, argnums=tuple(range(8)))(*inputs)
+    mx.eval(*g_ref, *g_pc)
+    names = ["dx", "dB", "dC", "dz", "dA", "ddt", "dD", "dh0"]
+    for name, got, expected in zip(names, g_pc, g_ref, strict=True):
+        np.testing.assert_allclose(
+            _np(got),
+            _np(expected),
+            rtol=1e-3,
+            atol=1e-4,
+            err_msg=f"graph VJP mismatch on {name}",
+        )
 
 
-def test_apply_with_state_path_c_matches_forward_and_vjp_fails_closed() -> None:
-    """Tuple Path C surface matches fwd while VJP stays fail-closed."""
+def test_apply_with_state_path_c_matches_forward_and_vjp_works() -> None:
+    """Tuple Path C surface matches fwd and its VJP uses the TileLang bwd."""
 
     _require_mamba3_path_c()
     inputs = _make_inputs(batch=1, seq=6, heads=2, headdim=4, state=4, dtype=mx.float32)
@@ -413,14 +458,22 @@ def test_apply_with_state_path_c_matches_forward_and_vjp_fails_closed() -> None:
         y = cast(mx.array, mamba3_mimo_apply_path_c(x, B, C, z, A, dt, D, h0))
         return mx.sum(y * y) * 0.5
 
-    with pytest.raises(RuntimeError, match="graph transformations"):
-        mx.grad(state_loss, argnums=tuple(range(8)))(*inputs)
-    with pytest.raises(RuntimeError, match="graph transformations"):
-        mx.grad(y_only_loss, argnums=tuple(range(8)))(*inputs)
+    g_state = mx.grad(state_loss, argnums=tuple(range(8)))(*inputs)
+    g_y_only = mx.grad(y_only_loss, argnums=tuple(range(8)))(*inputs)
+    mx.eval(*g_state, *g_y_only)
+    names = ["dx", "dB", "dC", "dz", "dA", "ddt", "dD", "dh0"]
+    for name, got, expected in zip(names, g_state, g_y_only, strict=True):
+        np.testing.assert_allclose(
+            _np(got),
+            _np(expected),
+            rtol=1e-6,
+            atol=1e-6,
+            err_msg=f"state/y-only VJP mismatch on {name}",
+        )
 
 
-def test_apply_path_c_vjp_fails_closed_at_bench_shape() -> None:
-    """Bench-shape VJP stays fail-closed until the tvm-ffi graph boundary exists."""
+def test_apply_path_c_vjp_runs_at_bench_shape() -> None:
+    """Bench-shape VJP runs through the TileLang graph/autograd boundary."""
 
     _require_mamba3_path_c()
     inputs = _make_inputs(
@@ -431,8 +484,10 @@ def test_apply_path_c_vjp_fails_closed_at_bench_shape() -> None:
         y = cast(mx.array, mamba3_mimo_apply_path_c(x, B, C, z, A, dt, D, h0))
         return mx.sum(y * y) * 0.5
 
-    with pytest.raises(RuntimeError, match="graph transformations"):
-        mx.grad(pc_loss, argnums=tuple(range(8)))(*inputs)
+    grads = mx.grad(pc_loss, argnums=tuple(range(8)))(*inputs)
+    mx.eval(*grads)
+    assert grads[0].shape == inputs[0].shape
+    assert grads[7].shape == inputs[7].shape
 
 
 def test_bwd_path_c_returns_correct_zero_seq_shapes() -> None:
