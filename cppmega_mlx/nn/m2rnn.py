@@ -485,9 +485,10 @@ class M2RNNMixer(nn.Module):
         self.conv_bias = mx.zeros((self.conv_dim,))
         self.g_norm = nn.RMSNorm(config.num_heads * config.v_head_dim)
         self.out_proj = nn.Linear(config.num_heads * config.v_head_dim, config.d_model, bias=False)
-        self.state_weight = mx.broadcast_to(
-            mx.eye(config.v_head_dim)[None, :, :],
-            (config.num_weight_heads, config.v_head_dim, config.v_head_dim),
+        eye = mx.eye(config.v_head_dim)
+        self.state_weight = mx.stack(
+            [eye for _ in range(config.num_weight_heads)],
+            axis=0,
         )
         self.A_log = self._init_A_log(config)
         self.dt_bias = self._init_dt_bias(config)
@@ -627,21 +628,72 @@ class M2RNNMixer(nn.Module):
         q_end = self.q_dim
         k_end = q_end + self.k_dim
         v_end = k_end + self.v_dim
-        q = conv_input[:, :, :q_end].reshape(batch, seq, cfg.num_q_heads, cfg.k_head_dim)
-        k = conv_input[:, :, q_end:k_end].reshape(batch, seq, cfg.num_k_heads, cfg.k_head_dim)
-        v = conv_input[:, :, k_end:v_end].reshape(batch, seq, cfg.num_v_heads, cfg.v_head_dim)
         xf = m2rnn_softplus_decay_gate(projected[:, :, conv_end:f_end], self.A_log, self.dt_bias)
         g = projected[:, :, f_end:].reshape(batch, seq, cfg.num_g_heads, cfg.v_head_dim)
 
-        out, h = _dispatch_m2rnn_scan(
-            q,
-            k,
-            v,
-            self.state_weight.astype(q.dtype),
-            xf,
-            h0=scan_h0,
-            chunk_size=cfg.chunk_size if chunk_size is None else chunk_size,
-        )
+        from cppmega_mlx.runtime.kernel_policy import KernelPath, record_dispatch, selected_path
+
+        path = selected_path("m2rnn")
+        if path is KernelPath.PATH_C:
+            from cppmega_mlx.nn._tilelang.m2rnn_path_c import (
+                m2rnn_apply_packed_with_state_path_c,
+                m2rnn_path_c_status,
+            )
+
+            status = m2rnn_path_c_status()
+            if not status.available:
+                raise RuntimeError(f"m2rnn: Path C kernel unavailable ({status.reason})")
+            head_counts = (
+                cfg.num_q_heads,
+                cfg.num_k_heads,
+                cfg.num_v_heads,
+                cfg.num_f_heads,
+                cfg.num_weight_heads,
+            )
+            if len(set(head_counts)) != 1:
+                raise RuntimeError(
+                    "m2rnn: Path C requires pre-aligned q/k/v/W/xf head counts; "
+                    "refusing to broadcast or repeat tensors implicitly"
+                )
+            if scan_h0 is None:
+                raise RuntimeError(
+                    "m2rnn: Path C requires an existing h0 tensor; "
+                    "refusing to allocate initial state implicitly"
+                )
+            h0_full = _initial_m2rnn_state(
+                scan_h0,
+                batch=batch,
+                heads=cfg.num_heads,
+                k_dim=cfg.k_head_dim,
+                v_dim=cfg.v_head_dim,
+                dtype=conv_input.dtype,
+            )
+            out, h = m2rnn_apply_packed_with_state_path_c(
+                conv_input,
+                self.state_weight.astype(conv_input.dtype),
+                xf,
+                h0_full,
+            )
+            record_dispatch("m2rnn", path, "path_c_tilelang_dsl_packed")
+            v = conv_input[:, :, k_end:v_end].reshape(
+                batch,
+                seq,
+                cfg.num_v_heads,
+                cfg.v_head_dim,
+            )
+        else:
+            q = conv_input[:, :, :q_end].reshape(batch, seq, cfg.num_q_heads, cfg.k_head_dim)
+            k = conv_input[:, :, q_end:k_end].reshape(batch, seq, cfg.num_k_heads, cfg.k_head_dim)
+            v = conv_input[:, :, k_end:v_end].reshape(batch, seq, cfg.num_v_heads, cfg.v_head_dim)
+            out, h = _dispatch_m2rnn_scan(
+                q,
+                k,
+                v,
+                self.state_weight.astype(q.dtype),
+                xf,
+                h0=scan_h0,
+                chunk_size=cfg.chunk_size if chunk_size is None else chunk_size,
+            )
         if self.D is not None:
             v_broadcast = _broadcast_heads(v, cfg.num_heads, -2, "v")
             out = out + v_broadcast * self.D.astype(out.dtype)

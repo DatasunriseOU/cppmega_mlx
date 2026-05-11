@@ -14,7 +14,7 @@ import pytest
 
 import mlx.core as mx
 
-from cppmega_mlx.nn.m2rnn import M2RNNConfig, M2RNNMixer
+from cppmega_mlx.nn.m2rnn import M2RNNConfig, M2RNNMixer, M2RNNMixerState
 from cppmega_mlx.runtime.kernel_policy import (
     KernelPath,
     clear_dispatch_log,
@@ -159,6 +159,98 @@ def test_path_c_dispatch_requires_existing_h0_without_allocating(
     assert not matches, f"failed Path C dispatch should not log success: {matches}"
 
 
+def test_path_c_dispatch_uses_packed_state_without_qkv_materialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not _METAL_AVAILABLE:
+        pytest.skip("Metal not available")
+    pytest.importorskip("tilelang")
+    from cppmega_mlx.nn._tilelang.m2rnn_path_c import m2rnn_path_c_status
+
+    status = m2rnn_path_c_status()
+    if not status.available:
+        pytest.skip(f"m2rnn Path C unavailable on this host: {status.reason}")
+
+    monkeypatch.setenv("CPPMEGA_KERNEL_PATH", "path_c")
+    cfg = M2RNNConfig(
+        d_model=16,
+        k_head_dim=4,
+        v_head_dim=4,
+        num_q_heads=2,
+        num_k_heads=2,
+        num_v_heads=2,
+        num_f_heads=2,
+        num_g_heads=2,
+        num_weight_heads=2,
+        conv_kernel=1,
+        chunk_size=8,
+    )
+    mx.random.seed(13)
+    block = M2RNNMixer(cfg)
+    hidden = mx.random.normal((1, 4, cfg.d_model), dtype=mx.float32) * 0.1
+    mixer_state = M2RNNMixerState(
+        h=mx.zeros((1, cfg.num_heads, cfg.k_head_dim, cfg.v_head_dim), dtype=mx.float32),
+        conv_state=mx.zeros((1, cfg.conv_kernel - 1, block.conv_dim), dtype=mx.float32),
+    )
+
+    out, next_state = block(hidden, mixer_state=mixer_state, return_state=True)
+    mx.eval(out, next_state.h, next_state.conv_state)
+    assert out.shape == hidden.shape
+    assert next_state.h.shape == mixer_state.h.shape
+    assert next_state.conv_state.shape == mixer_state.conv_state.shape
+    matches = [e for e in get_dispatch_log() if e["op_name"] == "m2rnn"]
+    assert matches[-1]["path"] == "path_c"
+    assert matches[-1]["kernel_used"] == "path_c_tilelang_dsl_packed"
+
+
+def test_block_grad_flows_through_path_c_with_explicit_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not _METAL_AVAILABLE:
+        pytest.skip("Metal not available")
+    pytest.importorskip("tilelang")
+    from mlx.utils import tree_flatten
+    from cppmega_mlx.nn._tilelang.m2rnn_path_c import m2rnn_path_c_status
+
+    status = m2rnn_path_c_status()
+    if not status.available:
+        pytest.skip(f"m2rnn Path C unavailable on this host: {status.reason}")
+
+    monkeypatch.setenv("CPPMEGA_KERNEL_PATH", "path_c")
+    cfg = M2RNNConfig(
+        d_model=16,
+        k_head_dim=4,
+        v_head_dim=4,
+        num_q_heads=2,
+        num_k_heads=2,
+        num_v_heads=2,
+        num_f_heads=2,
+        num_g_heads=2,
+        num_weight_heads=2,
+        conv_kernel=1,
+        chunk_size=8,
+    )
+    mx.random.seed(14)
+    block = M2RNNMixer(cfg)
+    hidden = mx.random.normal((1, 4, cfg.d_model), dtype=mx.float32) * 0.1
+    mixer_state = M2RNNMixerState(
+        h=mx.zeros((1, cfg.num_heads, cfg.k_head_dim, cfg.v_head_dim), dtype=mx.float32),
+        conv_state=mx.zeros((1, cfg.conv_kernel - 1, block.conv_dim), dtype=mx.float32),
+    )
+
+    def loss_fn(params, hidden_):
+        block.update(params)
+        out, _state = block(hidden_, mixer_state=mixer_state, return_state=True)
+        return mx.mean(out * out)
+
+    loss, grads = mx.value_and_grad(loss_fn)(block.trainable_parameters(), hidden)
+    mx.eval(loss, grads)
+    flat_grads = tree_flatten(grads)
+    assert flat_grads, "expected at least one trainable parameter"
+    for _, grad in flat_grads:
+        assert np.isfinite(np.array(grad)).all()
+
+
 def test_per_op_override_selects_reference(monkeypatch: pytest.MonkeyPatch) -> None:
     if not _METAL_AVAILABLE:
         pytest.skip("Metal not available")
@@ -256,7 +348,12 @@ def test_hybrid_lm_e2e_with_r_block_trains_loss_decreases(
     if not _METAL_AVAILABLE:
         pytest.skip("Metal not available")
 
-    from cppmega_mlx.models.hybrid_lm import HybridTinyLM, HybridTinyConfig
+    try:
+        from cppmega_mlx.models.hybrid_lm import HybridTinyLM, HybridTinyConfig
+    except ValueError as exc:
+        if "Unable to compare versions" in str(exc):
+            pytest.skip(f"broken package version metadata in this venv: {exc}")
+        raise
     import mlx.optimizers as optim
 
     monkeypatch.delenv("CPPMEGA_KERNEL_PATH", raising=False)

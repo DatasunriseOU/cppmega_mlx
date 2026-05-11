@@ -21,6 +21,7 @@ from cppmega_mlx.nn._tilelang.m2rnn import (
 )
 from cppmega_mlx.nn._tilelang.m2rnn_path_c import (
     M2RNNPathCStatus,
+    m2rnn_apply_packed_with_state_path_c,
     m2rnn_apply_path_c,
     m2rnn_apply_with_state_path_c,
     m2rnn_apply_with_state_path_c_or_fallback,
@@ -185,6 +186,57 @@ def test_m2rnn_path_c_with_state_matches_raw_forward() -> None:
     np.testing.assert_allclose(_np(h_state), _np(h_raw), rtol=1e-6, atol=1e-6)
 
 
+def test_m2rnn_packed_path_c_matches_unpacked_forward_and_grad() -> None:
+    _require_m2rnn_path_c()
+    inputs = _make_m2rnn_inputs(dtype=mx.float32)
+    q, k, v, W, xf, h0 = inputs
+    conv_input = mx.concatenate(
+        [
+            q.reshape(q.shape[0], q.shape[1], -1),
+            k.reshape(k.shape[0], k.shape[1], -1),
+            v.reshape(v.shape[0], v.shape[1], -1),
+        ],
+        axis=-1,
+    )
+    y_packed, h_packed = m2rnn_apply_packed_with_state_path_c(conv_input, W, xf, h0)
+    y_raw, h_raw = m2rnn_apply_with_state_path_c(q, k, v, W, xf, h0)
+    mx.eval(y_packed, h_packed, y_raw, h_raw)
+    np.testing.assert_allclose(_np(y_packed), _np(y_raw), rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(_np(h_packed), _np(h_raw), rtol=1e-6, atol=1e-6)
+
+    def packed_loss(conv_input_, W_, xf_, h0_):  # type: ignore[no-untyped-def]
+        y, _h = m2rnn_apply_packed_with_state_path_c(conv_input_, W_, xf_, h0_)
+        return mx.sum(y * y) * 0.5
+
+    def unpacked_loss(q_, k_, v_, W_, xf_, h0_):  # type: ignore[no-untyped-def]
+        y = m2rnn_apply_path_c(q_, k_, v_, W_, xf_, h0_, force_path_c=True)
+        return mx.sum(y * y) * 0.5
+
+    dconv, dW_p, dxf_p, dh0_p = mx.grad(packed_loss, argnums=(0, 1, 2, 3))(
+        conv_input,
+        W,
+        xf,
+        h0,
+    )
+    dq, dk, dv, dW_u, dxf_u, dh0_u = mx.grad(
+        unpacked_loss,
+        argnums=tuple(range(6)),
+    )(*inputs)
+    dconv_expected = mx.concatenate(
+        [
+            dq.reshape(q.shape[0], q.shape[1], -1),
+            dk.reshape(k.shape[0], k.shape[1], -1),
+            dv.reshape(v.shape[0], v.shape[1], -1),
+        ],
+        axis=-1,
+    )
+    mx.eval(dconv, dW_p, dxf_p, dh0_p, dconv_expected, dW_u, dxf_u, dh0_u)
+    np.testing.assert_allclose(_np(dconv), _np(dconv_expected), rtol=2e-3, atol=2e-4)
+    np.testing.assert_allclose(_np(dW_p), _np(dW_u), rtol=2e-3, atol=2e-4)
+    np.testing.assert_allclose(_np(dxf_p), _np(dxf_u), rtol=2e-3, atol=2e-4)
+    np.testing.assert_allclose(_np(dh0_p), _np(dh0_u), rtol=2e-3, atol=2e-4)
+
+
 def test_m2rnn_path_c_forward_backward_use_tvm_ffi_not_mx_fast(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -341,9 +393,10 @@ def test_m2rnn_path_c_backward_matches_path_b_when_available() -> None:
         np.testing.assert_allclose(_np(got), _np(expected), rtol=2e-3, atol=2e-4)
 
 
-def test_m2rnn_path_c_vjp_fails_closed_under_mlx_graph_transform() -> None:
+def test_m2rnn_path_c_vjp_runs_under_mlx_graph_transform() -> None:
     _require_m2rnn_path_c()
-    from tilelang.contrib.mlx_interop import DLPackConversionError
+    if not m2rnn_metal_status().available:
+        pytest.skip("m2rnn Metal Path B is not available on this host")
 
     inputs = _make_m2rnn_inputs(dtype=mx.float32)
 
@@ -351,5 +404,14 @@ def test_m2rnn_path_c_vjp_fails_closed_under_mlx_graph_transform() -> None:
         y = m2rnn_apply_path_c(q, k, v, W, xf, h0, force_path_c=True)
         return mx.sum(y * y) * 0.5
 
-    with pytest.raises(DLPackConversionError, match="graph transformation"):
-        mx.grad(path_c_loss, argnums=tuple(range(6)))(*inputs)
+    def path_b_loss(q, k, v, W, xf, h0):  # type: ignore[no-untyped-def]
+        y = m2rnn_apply(q, k, v, W, xf, h0)
+        return mx.sum(y * y) * 0.5
+
+    grads_pc = mx.grad(path_c_loss, argnums=tuple(range(6)))(*inputs)
+    grads_pb = mx.grad(path_b_loss, argnums=tuple(range(6)))(*inputs)
+    mx.eval(*grads_pc, *grads_pb)
+    for got, expected in zip(grads_pc, grads_pb, strict=True):
+        got_np = _np(got)
+        assert np.isfinite(got_np).all()
+        np.testing.assert_allclose(got_np, _np(expected), rtol=2e-3, atol=2e-4)
