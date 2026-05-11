@@ -197,6 +197,7 @@ def test_dsa_prepare_sparse_mla_fp8_emits_first_class_buffers() -> None:
     assert prepared.indices.dtype == mx.int32
     assert prepared.d_v == cfg.q_head_dim
     assert prepared.sm_scale == pytest.approx(cfg.q_head_dim**-0.5)
+    assert prepared.causal is True
 
 
 def test_dsa_path_c_routes_through_sparse_mla_fp8_prepared(
@@ -318,7 +319,9 @@ def test_dsa_path_c_routes_explicit_masks_as_sparse_indices(
     out = attn(x, mask=explicit_mask)
     mx.eval(out, seen_indices[0])
 
+    prepared = attn.prepare_sparse_mla_fp8(x, mask=explicit_mask)
     assert out.shape == x.shape
+    assert prepared.causal is True
     np.testing.assert_array_equal(
         np.sort(np.array(seen_indices[0][0, :, 0, :]), axis=-1),
         np.array([[-1, 0], [0, 1], [1, 2], [2, 3]], dtype=np.int32),

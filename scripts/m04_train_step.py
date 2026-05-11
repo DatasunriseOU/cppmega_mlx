@@ -129,15 +129,14 @@ FP8_PATH_C_BRIDGE_STATUS = "m04_wired_for_existing_path_c_ops"
 FP8_PATH_C_CARRIER_DTYPE = "bfloat16"
 FP8_PATH_C_NATIVE_PRODUCER_STATUS = "attention_sparse_mla_fp8_producer_wired"
 FP8_PATH_C_KERNEL_POLICY_ENV = {
-    "CPPMEGA_KERNEL_PATH__MAMBA3_MIMO": "path_c",
     "CPPMEGA_KERNEL_PATH__SPARSE_MLA": "path_c",
 }
 FP8_PATH_C_ROUTE_BLOCKER_REASON = (
-    "FP8 Path C has an m04 route for existing Path C model ops. HybridTinyLM "
+    "FP8 Path C has an m04 route for prepared Sparse-MLA Path C model ops. HybridTinyLM "
     "DSA A-layers now create prepared q_fp8/q_scale/kv_fp8/kv_scale tensors "
-    "before Sparse-MLA Path C. Remaining FP8 ownership work is parameter/weight "
-    "producer coverage and full training backward/update surfaces over prepared "
-    "buffers without hidden large tensor staging."
+    "before Sparse-MLA Path C and the backward path scatters into final owner "
+    "buffers. Remaining FP8 ownership work is parameter/weight producer coverage "
+    "without hidden large tensor staging."
 )
 OPTIMIZER_CHOICES = (
     "adamw",
@@ -576,7 +575,8 @@ def fp8_path_c_training_route_payload(
                 "name": "sparse_mla_fp8_path_c_apply",
                 "module": "cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c",
                 "shape_surface": "prepared q_fp8/q_scale/kv_fp8/kv_scale sparse-MLA buffers",
-                "training_surface": False,
+                "training_surface": True,
+                "backward_surface": "direct_owner_buffer_scatter",
             },
             {
                 "name": "mamba3_mimo_path_c",
@@ -585,6 +585,11 @@ def fp8_path_c_training_route_payload(
                 "kernel_policy_env": {
                     "CPPMEGA_KERNEL_PATH__MAMBA3_MIMO": "path_c",
                 },
+                "fp8_route_auto_selected": False,
+                "fp8_route_reason": (
+                    "stage profiling shows Path B/Metal is faster for the Mamba3 "
+                    "carrier path, so fp8_path_c only forces Sparse-MLA"
+                ),
                 "training_surface": True,
             },
             {
@@ -606,8 +611,6 @@ def fp8_path_c_training_route_payload(
         "missing_training_surfaces": [
             "FP8 parameter/weight producers that create the required dtype/layout "
             "before matmul kernel boundaries",
-            "backward/update path that consumes existing FP8 GPU buffers without "
-            "per-step large tensor staging",
             "absorbed MLA producer split for NoPE/RoPE KV layout and calibrated "
             "separate K/V scale lifecycle",
         ],

@@ -68,6 +68,10 @@ from cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c import (  # noqa: E402
     sparse_mla_fp8_path_c_apply_from_float,
     sparse_mla_fp8_path_c_apply_prepared_float,
 )
+from cppmega_mlx.nn.attention import (  # noqa: E402
+    causal_sparse_indices,
+    sparse_indices_from_attention_mask,
+)
 from cppmega_mlx.nn.sparse_mla import sparse_mla_attention_reference  # noqa: E402
 
 
@@ -1120,6 +1124,159 @@ def test_fp8_path_c_backward_accepts_bf16_dout_without_host_cast() -> None:
     assert dkv_path_c.dtype == mx.float32
     assert np.all(np.isfinite(np.asarray(dq_path_c)))
     assert np.all(np.isfinite(np.asarray(dkv_path_c)))
+
+
+def test_fp8_path_c_causal_backward_skips_partial_reduce(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c as path_c_module
+
+    q, kv, _indices, d_v = _make_inputs(scale=0.1, topk=4)
+    indices = causal_sparse_indices(
+        q.shape[0],
+        q.shape[1],
+        kv.shape[2],
+        4,
+    )
+    q_fp8, q_scale = _to_fp8_with_per_token_scale(q)
+    kv_fp8, kv_scale = _to_fp8_with_per_token_scale(kv)
+
+    rng = np.random.default_rng(121)
+    d_out = mx.array(
+        (rng.standard_normal(tuple(q.shape[:3]) + (d_v,)) * 0.1).astype(np.float32)
+    )
+
+    def fail_reduce(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("causal Path C backward must not allocate dkv_partial")
+
+    monkeypatch.setattr(path_c_module, "_reduce_fp8_dkv_partial_path_c", fail_reduce)
+    dq_buffer = mx.zeros(q.shape, dtype=mx.float32)
+    dkv_buffer = mx.zeros(kv.shape, dtype=mx.float32)
+    grads = sparse_mla_fp8_bwd_path_c(
+        q_fp8,
+        q_scale,
+        kv_fp8,
+        kv_scale,
+        d_out,
+        indices,
+        sm_scale=q.shape[-1] ** -0.5,
+        d_v=d_v,
+        force_path_c=True,
+        causal=True,
+        dq_buffer=dq_buffer,
+        dkv_buffer=dkv_buffer,
+    )
+    assert grads is not None
+    dq_path_c, dkv_path_c = grads
+    mx.eval(dq_path_c, dkv_path_c, dq_buffer, dkv_buffer)
+    np.testing.assert_allclose(
+        np.asarray(dq_buffer).astype(np.float32),
+        np.asarray(dq_path_c).astype(np.float32),
+    )
+    np.testing.assert_allclose(
+        np.asarray(dkv_buffer).astype(np.float32),
+        np.asarray(dkv_path_c).astype(np.float32),
+    )
+
+    q_rec = mx.from_fp8(q_fp8, dtype=mx.float32) * q_scale[..., None]
+    kv_rec = mx.from_fp8(kv_fp8, dtype=mx.float32) * kv_scale[..., None]
+
+    def loss(q_in: mx.array, kv_in: mx.array) -> mx.array:
+        out = _array_only(sparse_mla_attention_reference(q_in, kv_in, indices, d_v=d_v))
+        return mx.sum(out * d_out)
+
+    dq_ref, dkv_ref = mx.grad(loss, argnums=(0, 1))(q_rec, kv_rec)
+    mx.eval(dq_ref, dkv_ref)
+    np.testing.assert_allclose(
+        np.asarray(dq_path_c).astype(np.float32),
+        np.asarray(dq_ref).astype(np.float32),
+        rtol=1e-2,
+        atol=5e-3,
+    )
+    np.testing.assert_allclose(
+        np.asarray(dkv_path_c).astype(np.float32),
+        np.asarray(dkv_ref).astype(np.float32),
+        rtol=1e-2,
+        atol=5e-3,
+    )
+
+
+def test_fp8_path_c_explicit_mask_backward_skips_partial_reduce(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c as path_c_module
+
+    q, kv, _indices, d_v = _make_inputs(scale=0.1, topk=2)
+    explicit_mask = mx.array(
+        [
+            [
+                [True, False, False, False],
+                [True, True, False, False],
+                [False, False, True, False],
+                [False, False, True, True],
+            ]
+        ],
+        dtype=mx.bool_,
+    )
+    indices = sparse_indices_from_attention_mask(
+        explicit_mask,
+        batch_size=q.shape[0],
+        seq_length=q.shape[1],
+        kv_group=kv.shape[2],
+        topk=2,
+        key_length=kv.shape[1],
+    )
+    q_fp8, q_scale = _to_fp8_with_per_token_scale(q)
+    kv_fp8, kv_scale = _to_fp8_with_per_token_scale(kv)
+
+    rng = np.random.default_rng(122)
+    d_out = mx.array(
+        (rng.standard_normal(tuple(q.shape[:3]) + (d_v,)) * 0.1).astype(np.float32)
+    )
+
+    def fail_reduce(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("explicit-mask Path C backward must not allocate dkv_partial")
+
+    monkeypatch.setattr(path_c_module, "_reduce_fp8_dkv_partial_path_c", fail_reduce)
+    grads = sparse_mla_fp8_bwd_path_c(
+        q_fp8,
+        q_scale,
+        kv_fp8,
+        kv_scale,
+        d_out,
+        indices,
+        sm_scale=q.shape[-1] ** -0.5,
+        d_v=d_v,
+        force_path_c=True,
+        causal=True,
+    )
+    assert grads is not None
+    dq_path_c, dkv_path_c = grads
+    mx.eval(dq_path_c, dkv_path_c)
+
+    q_rec = mx.from_fp8(q_fp8, dtype=mx.float32) * q_scale[..., None]
+    kv_rec = mx.from_fp8(kv_fp8, dtype=mx.float32) * kv_scale[..., None]
+
+    def loss(q_in: mx.array, kv_in: mx.array) -> mx.array:
+        out = _array_only(sparse_mla_attention_reference(q_in, kv_in, indices, d_v=d_v))
+        return mx.sum(out * d_out)
+
+    dq_ref, dkv_ref = mx.grad(loss, argnums=(0, 1))(q_rec, kv_rec)
+    mx.eval(dq_ref, dkv_ref)
+    np.testing.assert_allclose(
+        np.asarray(dq_path_c).astype(np.float32),
+        np.asarray(dq_ref).astype(np.float32),
+        rtol=1e-2,
+        atol=5e-3,
+    )
+    np.testing.assert_allclose(
+        np.asarray(dkv_path_c).astype(np.float32),
+        np.asarray(dkv_ref).astype(np.float32),
+        rtol=1e-2,
+        atol=5e-3,
+    )
 
 
 def test_fp8_reference_matches_bf16_within_fp8_tolerance() -> None:

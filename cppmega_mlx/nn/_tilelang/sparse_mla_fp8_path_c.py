@@ -224,6 +224,200 @@ _FP8_PER_TOKEN_QUANT_SOURCE_TEMPLATE = """
 """
 
 
+_FP8_CAUSAL_BWD_HEADER = """
+    #include <metal_stdlib>
+    using namespace metal;
+
+    inline float cppmega_fp8_e4m3_to_float(uchar b) {
+        uint sign = (b >> 7) & 0x1u;
+        uint exp_bits  = (b >> 3) & 0xFu;
+        uint mant = b & 0x7u;
+        uint result_bits;
+        if (exp_bits == 0u) {
+            if (mant == 0u) {
+                result_bits = sign << 31;
+                return as_type<float>(result_bits);
+            }
+            float v = float(mant) * (1.0f / 8.0f) * 0.015625f;
+            return sign ? -v : v;
+        }
+        if (exp_bits == 0xFu && mant == 0x7u) {
+            return sign ? -448.0f : 448.0f;
+        }
+        uint exp32 = exp_bits + 120u;
+        uint mant32 = mant << 20u;
+        result_bits = (sign << 31) | (exp32 << 23) | mant32;
+        return as_type<float>(result_bits);
+    }
+"""
+
+
+_FP8_CAUSAL_BWD_ATOMIC_SOURCE = """
+    threadgroup float scores[TOPK];
+    threadgroup float p_local[TOPK];
+    threadgroup float dp[TOPK];
+    threadgroup float ds_local[TOPK];
+    threadgroup float reduce_buf[BLOCK_SIZE];
+
+    uint gid = threadgroup_position_in_grid.x;
+    uint tid = thread_position_in_threadgroup.x;
+    uint threads = BLOCK_SIZE;
+
+    uint h = gid % uint(HEADS);
+    uint s = (gid / uint(HEADS)) % uint(SEQ_LEN);
+    uint b = gid / (uint(HEADS) * uint(SEQ_LEN));
+    if (b >= uint(BATCH)) {
+        return;
+    }
+
+    uint g = h / uint(HEAD_KV);
+    uint q_row_base = gid * uint(QK_DIM);
+    uint q_scale_idx = gid;
+    uint d_out_row = gid * uint(D_V);
+    uint kv_b_base = b * (uint(SEQ_LEN_KV) * uint(KV_GROUP) * uint(QK_DIM));
+    uint kv_scale_b_base = b * (uint(SEQ_LEN_KV) * uint(KV_GROUP));
+    uint idx_base = ((b * uint(SEQ_LEN) + s) * uint(KV_GROUP) + g) * uint(TOPK);
+    float qs = float(q_scale[q_scale_idx]);
+    float sm_scale = float(sm_scale_buf[0]);
+
+    for (uint k = tid; k < uint(TOPK); k += threads) {
+        int gather_idx = indices[idx_base + k];
+        if (gather_idx < 0 || gather_idx >= int(SEQ_LEN_KV)) {
+            scores[k] = -INFINITY;
+            continue;
+        }
+        uint kv_pos = uint(gather_idx);
+        uint kv_row_base = kv_b_base + (kv_pos * uint(KV_GROUP) + g) * uint(QK_DIM);
+        float ks = float(kv_scale[kv_scale_b_base + kv_pos * uint(KV_GROUP) + g]);
+        float acc = 0.0f;
+        for (uint d = 0; d < uint(QK_DIM); ++d) {
+            float qv = cppmega_fp8_e4m3_to_float(q_fp8[q_row_base + d]);
+            float kvv = cppmega_fp8_e4m3_to_float(kv_fp8[kv_row_base + d]);
+            acc += qv * kvv;
+        }
+        scores[k] = acc * qs * ks * sm_scale;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float local_max = -INFINITY;
+    for (uint k = tid; k < uint(TOPK); k += threads) {
+        if (scores[k] > local_max) local_max = scores[k];
+    }
+    reduce_buf[tid] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride && reduce_buf[tid + stride] > reduce_buf[tid]) {
+            reduce_buf[tid] = reduce_buf[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float row_max = reduce_buf[0];
+
+    for (uint k = tid; k < uint(TOPK); k += threads) {
+        float score = scores[k];
+        p_local[k] = (score == -INFINITY) ? 0.0f : exp(score - row_max);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float local_sum = 0.0f;
+    for (uint k = tid; k < uint(TOPK); k += threads) {
+        local_sum += p_local[k];
+    }
+    reduce_buf[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            reduce_buf[tid] += reduce_buf[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float sumexp = reduce_buf[0];
+    if (sumexp <= 0.0f) {
+        for (uint d = tid; d < uint(QK_DIM); d += threads) {
+            atomic_store_explicit(&dq_dequant[q_row_base + d], 0.0f, memory_order_relaxed);
+        }
+        return;
+    }
+
+    float inv_sum = 1.0f / sumexp;
+    for (uint k = tid; k < uint(TOPK); k += threads) {
+        p_local[k] *= inv_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint k = tid; k < uint(TOPK); k += threads) {
+        int gather_idx = indices[idx_base + k];
+        if (gather_idx < 0 || gather_idx >= int(SEQ_LEN_KV)) {
+            dp[k] = 0.0f;
+            continue;
+        }
+        uint kv_pos = uint(gather_idx);
+        uint kv_row_base = kv_b_base + (kv_pos * uint(KV_GROUP) + g) * uint(QK_DIM);
+        float ks = float(kv_scale[kv_scale_b_base + kv_pos * uint(KV_GROUP) + g]);
+        float acc = 0.0f;
+        for (uint d = 0; d < uint(D_V); ++d) {
+            float v = cppmega_fp8_e4m3_to_float(kv_fp8[kv_row_base + d]) * ks;
+            acc += v * float(d_out[d_out_row + d]);
+        }
+        dp[k] = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float local_rowsum = 0.0f;
+    for (uint k = tid; k < uint(TOPK); k += threads) {
+        local_rowsum += p_local[k] * dp[k];
+    }
+    reduce_buf[tid] = local_rowsum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            reduce_buf[tid] += reduce_buf[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float rowsum = reduce_buf[0];
+
+    for (uint k = tid; k < uint(TOPK); k += threads) {
+        float ds = p_local[k] * (dp[k] - rowsum);
+        ds_local[k] = ds;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint d = tid; d < uint(QK_DIM); d += threads) {
+        float acc = 0.0f;
+        for (uint k = 0; k < uint(TOPK); ++k) {
+            int gather_idx = indices[idx_base + k];
+            if (gather_idx < 0 || gather_idx >= int(SEQ_LEN_KV)) {
+                continue;
+            }
+            uint kv_pos = uint(gather_idx);
+            uint kv_row_base = kv_b_base + (kv_pos * uint(KV_GROUP) + g) * uint(QK_DIM);
+            float ks = float(kv_scale[kv_scale_b_base + kv_pos * uint(KV_GROUP) + g]);
+            float kvv = cppmega_fp8_e4m3_to_float(kv_fp8[kv_row_base + d]) * ks;
+            acc += ds_local[k] * kvv;
+        }
+        atomic_store_explicit(&dq_dequant[q_row_base + d], acc * sm_scale, memory_order_relaxed);
+    }
+
+    for (uint kd = tid; kd < uint(TOPK) * uint(QK_DIM); kd += threads) {
+        uint k = kd / uint(QK_DIM);
+        uint d = kd % uint(QK_DIM);
+        int gather_idx = indices[idx_base + k];
+        if (gather_idx < 0 || gather_idx >= int(SEQ_LEN_KV)) {
+            continue;
+        }
+        float qv = cppmega_fp8_e4m3_to_float(q_fp8[q_row_base + d]) * qs;
+        float val = sm_scale * ds_local[k] * qv;
+        if (d < uint(D_V)) {
+            val += p_local[k] * float(d_out[d_out_row + d]);
+        }
+        uint dkv_idx = (b * uint(SEQ_LEN_KV) * uint(KV_GROUP)
+            + uint(gather_idx) * uint(KV_GROUP) + g) * uint(QK_DIM) + d;
+        atomic_fetch_add_explicit(&dkv_dequant[dkv_idx], val, memory_order_relaxed);
+    }
+"""
+
+
 @dataclass(frozen=True)
 class SparseMLAFp8PathCStatus:
     """Lowering status for the Path C TileLang FP8 Sparse-MLA QK tile."""
@@ -2280,6 +2474,50 @@ def _fp8_bwd_kernel_for(
     return kernel, lowering, input_names
 
 
+@lru_cache(maxsize=128)
+def _fp8_causal_bwd_atomic_kernel_for(
+    batch: int,
+    seq_len: int,
+    heads: int,
+    seq_len_kv: int,
+    kv_group: int,
+    head_kv: int,
+    topk: int,
+    K: int,
+    d_v: int,
+    threads: int,
+    d_out_dtype: str,
+) -> Any:
+    if seq_len_kv != seq_len:
+        raise MSLDispatchUnsupported(
+            "causal atomic backward currently requires full training windows "
+            f"(seq_len_kv == seq_len); got {seq_len_kv} != {seq_len}"
+        )
+    return mx.fast.metal_kernel(
+        name=(
+            "cppmega_sparse_mla_fp8_bwd_path_c_causal_atomic_"
+            f"{batch}_{seq_len}_{heads}_{seq_len_kv}_{kv_group}_{topk}_{K}_{d_v}_{threads}_{d_out_dtype}"
+        ),
+        input_names=[
+            "q_fp8",
+            "q_scale",
+            "kv_fp8",
+            "kv_scale",
+            "d_out",
+            "indices",
+            "sm_scale_buf",
+            "dq_buffer",
+            "dkv_buffer",
+        ],
+        output_names=["dq_dequant", "dkv_dequant"],
+        source=_FP8_CAUSAL_BWD_ATOMIC_SOURCE,
+        header=_FP8_CAUSAL_BWD_HEADER,
+        ensure_row_contiguous=True,
+        atomic_outputs=True,
+        output_to_input_aliases=[7, 8],
+    )
+
+
 def _reduce_fp8_dkv_partial_path_c(
     dkv_partial: mx.array,
     indices_i32: mx.array,
@@ -2486,6 +2724,9 @@ def sparse_mla_fp8_bwd_path_c(
     sm_scale: float,
     d_v: int | None = None,
     force_path_c: bool = False,
+    causal: bool = False,
+    dq_buffer: mx.array | None = None,
+    dkv_buffer: mx.array | None = None,
 ) -> tuple[mx.array, mx.array] | None:
     """Run the TileLang Path C FP8 Sparse-MLA backward over prepared buffers."""
 
@@ -2519,8 +2760,84 @@ def sparse_mla_fp8_bwd_path_c(
         raise ValueError(
             f"d_out must have shape {expected_d_out_shape}; got {tuple(d_out.shape)}"
         )
+    sm_scale_buf = mx.array([float(sm_scale)], dtype=mx.float32)
+    indices_i32 = indices if indices.dtype == mx.int32 else indices.astype(mx.int32)
+    d_out_dtype = _tilelang_float_dtype(d_out.dtype)
+    if causal:
+        dq_shape = (batch, seq_len, heads, K)
+        dkv_shape = (batch, seq_len_kv, kv_group, K)
+        if dq_buffer is None:
+            dq_buffer = mx.zeros(dq_shape, dtype=mx.float32)
+        elif tuple(dq_buffer.shape) != dq_shape or dq_buffer.dtype != mx.float32:
+            raise ValueError(
+                "dq_buffer must be the final float32 Path C gradient buffer "
+                f"with shape {dq_shape}; got shape {tuple(dq_buffer.shape)} "
+                f"and dtype {dq_buffer.dtype}"
+            )
+        if dkv_buffer is None:
+            dkv_buffer = mx.zeros(dkv_shape, dtype=mx.float32)
+        elif tuple(dkv_buffer.shape) != dkv_shape or dkv_buffer.dtype != mx.float32:
+            raise ValueError(
+                "dkv_buffer must be the final float32 Path C gradient buffer "
+                f"with shape {dkv_shape}; got shape {tuple(dkv_buffer.shape)} "
+                f"and dtype {dkv_buffer.dtype}"
+            )
+        try:
+            kernel = _fp8_causal_bwd_atomic_kernel_for(
+                batch,
+                seq_len,
+                heads,
+                seq_len_kv,
+                kv_group,
+                head_kv,
+                topk,
+                K,
+                d_v_resolved,
+                threads,
+                d_out_dtype,
+            )
+            outputs = kernel(
+                inputs=[
+                    q_fp8,
+                    q_scale,
+                    kv_fp8,
+                    kv_scale,
+                    d_out,
+                    indices_i32,
+                    sm_scale_buf,
+                    dq_buffer,
+                    dkv_buffer,
+                ],
+                output_shapes=[
+                    dq_shape,
+                    dkv_shape,
+                ],
+                output_dtypes=[mx.float32, mx.float32],
+                grid=(batch * seq_len * heads * threads, 1, 1),
+                threadgroup=(threads, 1, 1),
+                template=[
+                    ("BATCH", batch),
+                    ("SEQ_LEN", seq_len),
+                    ("SEQ_LEN_KV", seq_len_kv),
+                    ("HEADS", heads),
+                    ("HEAD_KV", head_kv),
+                    ("KV_GROUP", kv_group),
+                    ("QK_DIM", K),
+                    ("D_V", d_v_resolved),
+                    ("TOPK", topk),
+                    ("BLOCK_SIZE", threads),
+                ],
+            )
+        except Exception as exc:
+            if force_path_c:
+                raise RuntimeError(
+                    "sparse_mla_fp8_bwd_path_c: causal atomic Path C dispatch "
+                    f"failed: {exc}"
+                ) from exc
+            return None
+        dq, dkv = outputs
+        return dq, dkv
     try:
-        d_out_dtype = _tilelang_float_dtype(d_out.dtype)
         kernel, lowering, input_names = _fp8_bwd_kernel_for(
             batch,
             seq_len,
@@ -2541,8 +2858,6 @@ def sparse_mla_fp8_bwd_path_c(
             ) from exc
         return None
 
-    sm_scale_buf = mx.array([float(sm_scale)], dtype=mx.float32)
-    indices_i32 = indices if indices.dtype == mx.int32 else indices.astype(mx.int32)
     input_map = {
         "q_fp8": q_fp8,
         "q_scale": q_scale,
@@ -2617,6 +2932,7 @@ def _prepared_fp8_bwd_ste(
     sm_scale: float,
     d_v: int | None,
     force_path_c: bool,
+    causal: bool,
 ) -> tuple[mx.array, mx.array] | None:
     """Run the Path C FP8 sparse-MLA backward over per-token prepared buffers."""
 
@@ -2630,6 +2946,7 @@ def _prepared_fp8_bwd_ste(
         sm_scale=sm_scale,
         d_v=d_v,
         force_path_c=force_path_c,
+        causal=causal,
     )
     if result is None:
         return None
@@ -2650,6 +2967,7 @@ def sparse_mla_fp8_path_c_apply_prepared_float(
     d_v: int | None = None,
     sinks: mx.array | None = None,
     force_path_c: bool = False,
+    causal: bool = False,
 ) -> mx.array:
     """Differentiable owner wrapper for prepared-buffer FP8 Path C apply.
 
@@ -2717,6 +3035,7 @@ def sparse_mla_fp8_path_c_apply_prepared_float(
             sm_scale=sm_scale,
             d_v=d_v,
             force_path_c=force_path_c,
+            causal=causal,
         )
         if grads is None:
             if force_path_c:

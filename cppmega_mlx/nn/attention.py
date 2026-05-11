@@ -174,6 +174,11 @@ class SparseMLAFp8Prepared:
     d_v: int
     q: mx.array | None = None
     kv: mx.array | None = None
+    # Historical field name retained for the Path C VJP ABI.  True means the
+    # backward can scatter directly into full-window owner buffers and skip the
+    # dkv_partial materialization; the sparse indices may come from causal or
+    # explicit document masks.
+    causal: bool = False
 
 
 def causal_sdpa_mask(
@@ -633,7 +638,8 @@ class CausalSelfAttention(nn.Module):
         if cfg.sliding_window is not None:
             sparse_window = min(sparse_window, cfg.sliding_window)
         effective_topk = min(cfg.sparse_topk, sparse_window)
-        if mask is None or (isinstance(mask, str) and mask == "causal"):
+        is_causal_sparse = mask is None or (isinstance(mask, str) and mask == "causal")
+        if is_causal_sparse:
             indices = causal_sparse_indices(
                 batch,
                 seq,
@@ -653,6 +659,11 @@ class CausalSelfAttention(nn.Module):
                 topk=effective_topk,
                 key_length=key_length if key_length is not None else seq,
             )
+        full_window_owner_buffers = (
+            kv_cache is None
+            and rope_offset == 0
+            and (key_length is None or key_length == seq)
+        )
         return SparseMLAFp8Prepared(
             q_fp8=q_fp8,
             q_scale=q_scale,
@@ -663,6 +674,7 @@ class CausalSelfAttention(nn.Module):
             d_v=cfg.q_head_dim,
             q=q,
             kv=kv,
+            causal=full_window_owner_buffers,
         )
 
     def _call_sparse_mla_fp8_path_c(
@@ -705,6 +717,7 @@ class CausalSelfAttention(nn.Module):
                 d_v=prepared.d_v,
                 sinks=sinks,
                 force_path_c=True,
+                causal=prepared.causal,
             )
         else:
             out = sparse_mla_fp8_path_c_apply(

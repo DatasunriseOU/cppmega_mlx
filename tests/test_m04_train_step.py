@@ -535,7 +535,7 @@ def test_missing_dataset_dry_run_reports_blocked_receipt(tmp_path: Path) -> None
     assert payload["acceptance_gate"]["full_local_gb10_quarter_gate_completed"] is False
 
 
-def test_fp8_path_c_training_dtype_route_runs_mamba3_path_c_without_staging(
+def test_fp8_path_c_training_dtype_route_forces_sparse_mla_only_without_staging(
     tmp_path: Path,
 ) -> None:
     output = tmp_path / "m04_train_step.json"
@@ -605,6 +605,9 @@ def test_fp8_path_c_training_dtype_route_runs_mamba3_path_c_without_staging(
     assert route["hidden_shape_staging_allowed"] is False
     assert route["fallback_to_path_b_allowed"] is False
     assert route["selected_action"] == "run_path_c_training_route"
+    assert route["kernel_policy_env"] == {
+        "CPPMEGA_KERNEL_PATH__SPARSE_MLA": "path_c",
+    }
     assert {
         "fp8_scaled_vecmat_path_c",
         "mamba3_mimo_path_c",
@@ -616,7 +619,12 @@ def test_fp8_path_c_training_dtype_route_runs_mamba3_path_c_without_staging(
     }
     assert surfaces["matmul_tl_fp8_scaled_matmul"]["kernel_surface_available"] is True
     assert surfaces["mamba3_mimo_path_c"]["training_surface"] is True
-    assert surfaces["sparse_mla_fp8_path_c_apply"]["training_surface"] is False
+    assert surfaces["mamba3_mimo_path_c"]["fp8_route_auto_selected"] is False
+    assert surfaces["sparse_mla_fp8_path_c_apply"]["training_surface"] is True
+    assert (
+        surfaces["sparse_mla_fp8_path_c_apply"]["backward_surface"]
+        == "direct_owner_buffer_scatter"
+    )
     assert (
         "FP8 parameter/weight producers that create the required dtype/layout "
         "before matmul kernel boundaries" in route["missing_training_surfaces"]
@@ -628,7 +636,7 @@ def test_fp8_path_c_training_dtype_route_runs_mamba3_path_c_without_staging(
     assert route["higher_level_owner"]["current_m04_route_owner"].endswith(
         "HybridTinyLM -> Mamba3ReferenceBlock"
     )
-    assert any(
+    assert not any(
         item["op_name"] == "mamba3_mimo" and item["path"] == "path_c"
         for item in payload["training"]["kernel_dispatch"]
     )
