@@ -7,13 +7,17 @@ import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
 
-from cppmega_mlx.inference.engine import ContiguousKVCacheConfig, make_contiguous_kv_cache
+from cppmega_mlx.inference.engine import (
+    ContiguousKVCacheConfig,
+    make_contiguous_kv_cache,
+)
 from cppmega_mlx.nn.attention import (
     AttentionConfig,
     CausalSelfAttention,
     SparseMLAFp8Prepared,
     causal_sparse_indices,
     causal_sdpa_mask,
+    sparse_indices_from_attention_mask,
 )
 from cppmega_mlx.runtime.kernel_policy import clear_dispatch_log, get_dispatch_log
 
@@ -131,6 +135,35 @@ def test_causal_sparse_indices_match_causal_topk_window() -> None:
     )
 
 
+def test_sparse_indices_from_attention_mask_selects_newest_valid_keys() -> None:
+    mask = mx.array(
+        [
+            [
+                [True, False, False, False],
+                [True, True, False, False],
+                [False, True, True, False],
+            ]
+        ],
+        dtype=mx.bool_,
+    )
+
+    indices = sparse_indices_from_attention_mask(
+        mask,
+        batch_size=1,
+        seq_length=3,
+        kv_group=2,
+        topk=2,
+        key_length=4,
+    )
+    mx.eval(indices)
+
+    assert indices.shape == (1, 3, 2, 2)
+    np.testing.assert_array_equal(
+        np.sort(np.array(indices[0, :, 0, :]), axis=-1),
+        np.array([[-1, 0], [0, 1], [1, 2]], dtype=np.int32),
+    )
+
+
 def test_dsa_prepare_sparse_mla_fp8_emits_first_class_buffers() -> None:
     cfg = AttentionConfig(
         d_model=16,
@@ -191,9 +224,11 @@ def test_dsa_path_c_routes_through_sparse_mla_fp8_prepared(
         *,
         sm_scale: float,
         d_v: int | None = None,
+        sinks: mx.array | None = None,
         return_lse: bool = False,
         force_path_c: bool = False,
     ) -> mx.array:
+        assert sinks is None
         del return_lse
         calls.append(
             {
@@ -232,15 +267,104 @@ def test_dsa_path_c_routes_through_sparse_mla_fp8_prepared(
     }
 
 
-def test_dsa_path_c_fails_closed_for_explicit_masks(
+def test_dsa_path_c_routes_explicit_masks_as_sparse_indices(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("CPPMEGA_KERNEL_PATH__SPARSE_MLA", "path_c")
-    attn = CausalSelfAttention(AttentionConfig(d_model=16, num_q_heads=4, mode="dsa"))
-    x = _rand((1, 4, 16), seed=33)
+    import cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c as fp8_path_c
 
-    with pytest.raises(NotImplementedError, match="document masks"):
-        attn(x, mask=causal_sdpa_mask(4))
+    monkeypatch.setenv("CPPMEGA_KERNEL_PATH__SPARSE_MLA", "path_c")
+    attn = CausalSelfAttention(
+        AttentionConfig(
+            d_model=16, num_q_heads=4, num_kv_heads=2, mode="dsa", sparse_topk=2
+        )
+    )
+    x = _rand((1, 4, 16), seed=33)
+    explicit_mask = mx.array(
+        [
+            [
+                [True, False, False, False],
+                [True, True, False, False],
+                [False, True, True, False],
+                [False, False, True, True],
+            ]
+        ],
+        dtype=mx.bool_,
+    )
+    seen_indices: list[mx.array] = []
+
+    def fake_apply(
+        q_fp8: mx.array,
+        q_scale: mx.array,
+        kv_fp8: mx.array,
+        kv_scale: mx.array,
+        indices: mx.array,
+        *,
+        sm_scale: float,
+        d_v: int | None = None,
+        sinks: mx.array | None = None,
+        return_lse: bool = False,
+        force_path_c: bool = False,
+    ) -> mx.array:
+        del q_scale, kv_fp8, kv_scale, sm_scale, sinks, return_lse
+        assert force_path_c is True
+        seen_indices.append(indices)
+        return mx.zeros(
+            (q_fp8.shape[0], q_fp8.shape[1], q_fp8.shape[2], d_v or q_fp8.shape[-1]),
+            dtype=mx.float16,
+        )
+
+    monkeypatch.setattr(fp8_path_c, "sparse_mla_fp8_path_c_apply", fake_apply)
+
+    out = attn(x, mask=explicit_mask)
+    mx.eval(out, seen_indices[0])
+
+    assert out.shape == x.shape
+    np.testing.assert_array_equal(
+        np.sort(np.array(seen_indices[0][0, :, 0, :]), axis=-1),
+        np.array([[-1, 0], [0, 1], [1, 2], [2, 3]], dtype=np.int32),
+    )
+
+
+def test_dsa_path_c_routes_sinks_to_sparse_mla_fp8_apply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c as fp8_path_c
+
+    monkeypatch.setenv("CPPMEGA_KERNEL_PATH__SPARSE_MLA", "path_c")
+    cfg = AttentionConfig(d_model=16, num_q_heads=4, num_kv_heads=2, mode="dsa")
+    attn = CausalSelfAttention(cfg)
+    x = _rand((1, 3, 16), seed=34)
+    sinks = mx.array([0.0, 0.1, -0.2, 0.3], dtype=mx.float32)
+    sink_calls: list[mx.array | None] = []
+
+    def fake_apply(
+        q_fp8: mx.array,
+        q_scale: mx.array,
+        kv_fp8: mx.array,
+        kv_scale: mx.array,
+        indices: mx.array,
+        *,
+        sm_scale: float,
+        d_v: int | None = None,
+        sinks: mx.array | None = None,
+        return_lse: bool = False,
+        force_path_c: bool = False,
+    ) -> mx.array:
+        del q_scale, kv_fp8, kv_scale, indices, sm_scale, return_lse
+        assert force_path_c is True
+        sink_calls.append(sinks)
+        return mx.zeros(
+            (q_fp8.shape[0], q_fp8.shape[1], q_fp8.shape[2], d_v or q_fp8.shape[-1]),
+            dtype=mx.float16,
+        )
+
+    monkeypatch.setattr(fp8_path_c, "sparse_mla_fp8_path_c_apply", fake_apply)
+
+    out = attn(x, sinks=sinks)
+    mx.eval(out)
+
+    assert out.shape == x.shape
+    assert sink_calls == [sinks]
 
 
 @pytest.mark.parametrize("mode", ["mla", "dsa"])
@@ -367,7 +491,9 @@ def test_causal_attention_contiguous_kv_cache_matches_full_prefix_last_token() -
 
 
 def test_causal_attention_kv_cache_requires_layer_idx() -> None:
-    attn = CausalSelfAttention(AttentionConfig(d_model=16, num_q_heads=4, num_kv_heads=2))
+    attn = CausalSelfAttention(
+        AttentionConfig(d_model=16, num_q_heads=4, num_kv_heads=2)
+    )
     cache = make_contiguous_kv_cache(
         num_layers=1,
         batch_size=1,
@@ -379,8 +505,72 @@ def test_causal_attention_kv_cache_requires_layer_idx() -> None:
         attn(_rand((1, 2, 16), seed=23), kv_cache=cache)
 
 
-def test_causal_attention_rejects_quantized_kv_cache_until_sdpa_path_lands() -> None:
-    attn = CausalSelfAttention(AttentionConfig(d_model=16, num_q_heads=4, num_kv_heads=2))
+def test_dsa_path_c_kv_cache_keeps_fp8_buffers_in_mlx_kv_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c as fp8_path_c
+
+    monkeypatch.setenv("CPPMEGA_KERNEL_PATH__SPARSE_MLA", "path_c")
+    cfg = AttentionConfig(
+        d_model=16,
+        num_q_heads=4,
+        num_kv_heads=2,
+        mode="dsa",
+        sparse_topk=2,
+    )
+    attn = CausalSelfAttention(cfg)
+    cache = make_contiguous_kv_cache(
+        num_layers=1,
+        batch_size=1,
+        num_kv_heads=2,
+        head_dim=4,
+        max_seq_len=8,
+    )
+    calls: list[tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]] = []
+
+    def fake_apply(
+        q_fp8: mx.array,
+        q_scale: mx.array,
+        kv_fp8: mx.array,
+        kv_scale: mx.array,
+        indices: mx.array,
+        *,
+        sm_scale: float,
+        d_v: int | None = None,
+        sinks: mx.array | None = None,
+        return_lse: bool = False,
+        force_path_c: bool = False,
+    ) -> mx.array:
+        del q_scale, kv_scale, sm_scale, sinks, return_lse
+        assert force_path_c is True
+        calls.append((tuple(q_fp8.shape), tuple(kv_fp8.shape), tuple(indices.shape)))
+        return mx.zeros(
+            (q_fp8.shape[0], q_fp8.shape[1], q_fp8.shape[2], d_v or q_fp8.shape[-1]),
+            dtype=mx.float16,
+        )
+
+    monkeypatch.setattr(fp8_path_c, "sparse_mla_fp8_path_c_apply", fake_apply)
+
+    prefix = _rand((1, 3, 16), seed=35)
+    next_token = _rand((1, 1, 16), seed=36)
+    first = attn(prefix, mask="causal", kv_cache=cache, layer_idx=0)
+    second = attn(next_token, mask="causal", kv_cache=cache, layer_idx=0)
+    mx.eval(first, second)
+
+    assert cache.position() == 4
+    assert cache.layers[0].empty()
+    assert cache.sparse_fp8_layers[0].offset == 4
+    assert calls == [
+        ((1, 3, 4, 4), (1, 3, 2, 4), (1, 3, 2, 2)),
+        ((1, 1, 4, 4), (1, 4, 2, 4), (1, 1, 2, 2)),
+    ]
+
+
+@pytest.mark.parametrize("bits", [4, 8])
+def test_causal_attention_uses_mlx_lm_quantized_kv_cache(bits: int) -> None:
+    attn = CausalSelfAttention(
+        AttentionConfig(d_model=256, num_q_heads=4, num_kv_heads=2)
+    )
     cache = make_contiguous_kv_cache(
         num_layers=1,
         batch_size=1,
@@ -388,10 +578,16 @@ def test_causal_attention_rejects_quantized_kv_cache_until_sdpa_path_lands() -> 
         head_dim=64,
         quantized=True,
         kv_group_size=64,
+        kv_bits=bits,
     )
+    x = _rand((1, 2, 256), seed=24 + bits)
 
-    with pytest.raises(NotImplementedError, match="quantized KV cache"):
-        attn(_rand((1, 2, 16), seed=24), kv_cache=cache, layer_idx=0)
+    out = attn(x, kv_cache=cache, layer_idx=0)
+    mx.eval(out)
+
+    assert out.shape == x.shape
+    assert cache.position() == 2
+    assert np.isfinite(np.array(out)).all()
 
 
 def test_attention_sinks_are_forwarded_to_fast_sdpa() -> None:

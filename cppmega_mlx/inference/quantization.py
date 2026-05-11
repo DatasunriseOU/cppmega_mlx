@@ -102,29 +102,20 @@ def quantize_module_for_inference(
             mode=mode,
         )
 
-    replacements: dict[str, object] = {}
-    for name, child in module.named_modules():
-        if name == "":
-            continue
-        if not isinstance(child, nn.Linear):
-            continue
-        if _should_skip_module(name, child, skip_names, skip_predicate):
-            continue
-        if not _can_quantize_linear(child, group_size):
-            continue
-        _insert_module_replacement(
-            replacements,
-            name,
-            quantize_linear_for_inference(
-                child,
-                bits=bits,
-                group_size=group_size,
-                mode=mode,
-            ),
+    def class_predicate(path: str, child: nn.Module) -> bool:
+        return (
+            isinstance(child, nn.Linear)
+            and _can_quantize_linear(child, group_size)
+            and not _should_skip_module(path, child, skip_names, skip_predicate)
         )
 
-    if replacements:
-        module.update_modules(replacements)
+    nn.quantize(
+        module,
+        group_size=group_size,
+        bits=bits,
+        mode=mode,
+        class_predicate=class_predicate,
+    )
     return module
 
 
@@ -150,7 +141,9 @@ def quantize_kv_cache(
     _validate_quant_args(bits=bits, group_size=group_size, mode="affine")
     if isinstance(cache, QuantizedKVCache):
         if cache.bits != bits or cache.group_size != group_size:
-            raise ValueError("existing QuantizedKVCache has incompatible bits/group_size")
+            raise ValueError(
+                "existing QuantizedKVCache has incompatible bits/group_size"
+            )
         return cache
     if not isinstance(cache, KVCache):
         raise TypeError("quantize_kv_cache expects an mlx_lm.models.cache.KVCache")
@@ -211,39 +204,6 @@ def _should_skip_module(
     if skip_predicate is not None and skip_predicate(name, module):
         return True
     return False
-
-
-def _insert_module_replacement(
-    replacements: dict[str, object],
-    name: str,
-    replacement: nn.Module,
-) -> None:
-    node: dict[str, object] | list[object] = replacements
-    parts = name.split(".")
-    for index, part in enumerate(parts):
-        is_last = index == len(parts) - 1
-        next_is_list = not is_last and parts[index + 1].isdigit()
-        if part.isdigit():
-            if not isinstance(node, list):
-                raise ValueError(f'invalid module path "{name}"')
-            list_index = int(part)
-            while len(node) <= list_index:
-                node.append({})
-            if is_last:
-                node[list_index] = replacement
-            else:
-                if not isinstance(node[list_index], (dict, list)):
-                    node[list_index] = [] if next_is_list else {}
-                node = node[list_index]  # type: ignore[assignment]
-        else:
-            if not isinstance(node, dict):
-                raise ValueError(f'invalid module path "{name}"')
-            if is_last:
-                node[part] = replacement
-            else:
-                if part not in node:
-                    node[part] = [] if next_is_list else {}
-                node = node[part]  # type: ignore[assignment]
 
 
 __all__ = [

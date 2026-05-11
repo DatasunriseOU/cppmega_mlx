@@ -870,7 +870,9 @@ def test_stream_generate_tokens_rejects_eager_kv_config_without_kv_mode() -> Non
         )
 
 
-def test_stream_generate_tokens_with_kv_cache_prefills_then_decodes_one_token_steps() -> None:
+def test_stream_generate_tokens_with_kv_cache_prefills_then_decodes_one_token_steps() -> (
+    None
+):
     model = _KVScriptedLogitsModel([[4], [5], [6]])
     prompt = mx.array([[1, 2, 3]], dtype=mx.int32)
     cache = _make_cache()
@@ -922,7 +924,9 @@ def test_stream_generate_tokens_with_kv_cache_handles_batched_rows() -> None:
     assert model.seen_cache_ids == [id(cache), id(cache)]
 
 
-def test_stream_generate_tokens_with_kv_cache_can_build_cache_from_shape_kwargs() -> None:
+def test_stream_generate_tokens_with_kv_cache_can_build_cache_from_shape_kwargs() -> (
+    None
+):
     model = _KVScriptedLogitsModel([[4], [5]])
 
     chunks = list(
@@ -945,24 +949,43 @@ def test_stream_generate_tokens_with_kv_cache_can_build_cache_from_shape_kwargs(
     assert len(set(model.seen_cache_ids)) == 1
 
 
-def test_stream_generate_tokens_quantized_kv_stays_fail_closed_at_attention() -> None:
-    model = _tiny_attention_lm()
-
-    with pytest.raises(NotImplementedError, match="quantized KV cache"):
-        list(
-            stream_generate_tokens(
-                model,
-                mx.array([[1, 2]], dtype=mx.int32),
-                max_new_tokens=1,
-                use_kv_cache=True,
-                num_layers=1,
-                num_kv_heads=1,
-                head_dim=64,
-                max_seq_len=8,
-                quantized=True,
-                temperature=0.0,
-            )
+def test_stream_generate_tokens_supports_quantized_kv_attention() -> None:
+    model = HybridTinyLM(
+        HybridTinyConfig(
+            vocab_size=17,
+            hidden_size=64,
+            pattern="A",
+            depth=1,
+            dsa_a_layer_ranks=(),
+            num_attention_heads=1,
+            max_seq_length=8,
+            structure_vocab_size=8,
+            structure_bottleneck_dim=8,
+            structure_num_categories=4,
+            structure_max_dep_level=4,
+            structure_max_ast_depth=4,
+            structure_max_sibling_index=4,
+            structure_num_node_types=8,
         )
+    )
+    chunks = list(
+        stream_generate_tokens(
+            model,
+            mx.array([[1, 2]], dtype=mx.int32),
+            max_new_tokens=1,
+            use_kv_cache=True,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=64,
+            max_seq_len=8,
+            quantized=True,
+            kv_group_size=64,
+            temperature=0.0,
+        )
+    )
+
+    assert len(chunks) == 1
+    assert chunks[0].tokens.shape == (1, 3)
 
 
 def test_inference_root_exports_generate_tokens() -> None:
@@ -978,7 +1001,9 @@ def test_inference_root_exports_generate_tokens_with_kv_cache() -> None:
 def test_inference_root_exports_prompt_cache_generation() -> None:
     assert inference.PromptCacheEntry is PromptCacheEntry
     assert inference.build_prompt_cache is build_prompt_cache
-    assert inference.generate_tokens_with_prompt_cache is generate_tokens_with_prompt_cache
+    assert (
+        inference.generate_tokens_with_prompt_cache is generate_tokens_with_prompt_cache
+    )
     assert "PromptCacheEntry" in inference.__all__
     assert "build_prompt_cache" in inference.__all__
     assert "generate_tokens_with_prompt_cache" in inference.__all__

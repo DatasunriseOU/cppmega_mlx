@@ -8,7 +8,7 @@ from typing import Literal, cast
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.cache import QuantizedKVCache
+from mlx_lm.models.base import scaled_dot_product_attention
 
 from cppmega_mlx.inference.engine import ContiguousKVCache
 from cppmega_mlx.runtime.kernel_policy import KernelPath, record_dispatch, selected_path
@@ -62,7 +62,9 @@ class AttentionConfig:
             raise ValueError(f"d_model must be positive, got {self.d_model}")
         if self.num_q_heads <= 0:
             raise ValueError(f"num_q_heads must be positive, got {self.num_q_heads}")
-        num_kv_heads = self.num_q_heads if self.num_kv_heads is None else self.num_kv_heads
+        num_kv_heads = (
+            self.num_q_heads if self.num_kv_heads is None else self.num_kv_heads
+        )
         if num_kv_heads <= 0:
             raise ValueError(f"num_kv_heads must be positive, got {num_kv_heads}")
         if self.num_q_heads % num_kv_heads != 0:
@@ -70,7 +72,9 @@ class AttentionConfig:
                 f"num_q_heads {self.num_q_heads} must be divisible by "
                 f"num_kv_heads {num_kv_heads}"
             )
-        head_dim = self.d_model // self.num_q_heads if self.head_dim is None else self.head_dim
+        head_dim = (
+            self.d_model // self.num_q_heads if self.head_dim is None else self.head_dim
+        )
         if head_dim <= 0:
             raise ValueError(f"head_dim must be positive, got {head_dim}")
         if self.head_dim is None and self.d_model % self.num_q_heads != 0:
@@ -86,7 +90,9 @@ class AttentionConfig:
                 f"got {self.rope_type!r}"
             )
         if self.use_rope and head_dim % 2 != 0:
-            raise ValueError(f"head_dim must be even when use_rope=True, got {head_dim}")
+            raise ValueError(
+                f"head_dim must be even when use_rope=True, got {head_dim}"
+            )
         if self.rope_factor <= 0:
             raise ValueError(f"rope_factor must be positive, got {self.rope_factor}")
         if self.rope_low_freq_factor <= 0:
@@ -118,13 +124,17 @@ class AttentionConfig:
                 f"got {self.rope_beta_fast} <= {self.rope_beta_slow}"
             )
         if self.attn_softcap < 0:
-            raise ValueError(f"attn_softcap must be non-negative, got {self.attn_softcap}")
+            raise ValueError(
+                f"attn_softcap must be non-negative, got {self.attn_softcap}"
+            )
         if self.attn_softcap > 0:
             raise NotImplementedError(
                 "attn_softcap is not supported by the MLX fast SDPA path yet"
             )
         if self.sliding_window is not None and self.sliding_window <= 0:
-            raise ValueError(f"sliding_window must be positive, got {self.sliding_window}")
+            raise ValueError(
+                f"sliding_window must be positive, got {self.sliding_window}"
+            )
         if self.sparse_topk <= 0:
             raise ValueError(f"sparse_topk must be positive, got {self.sparse_topk}")
 
@@ -134,7 +144,9 @@ class AttentionConfig:
 
     @property
     def q_head_dim(self) -> int:
-        return self.d_model // self.num_q_heads if self.head_dim is None else self.head_dim
+        return (
+            self.d_model // self.num_q_heads if self.head_dim is None else self.head_dim
+        )
 
     @property
     def q_proj_dim(self) -> int:
@@ -230,7 +242,85 @@ def causal_sparse_indices(
     valid = cast(mx.array, (indices >= 0) & (indices < key_length))
     indices = mx.where(valid, indices, mx.zeros_like(indices) - 1)
     indices = indices.reshape(1, seq_length, 1, topk)
-    return mx.broadcast_to(indices, (batch_size, seq_length, kv_group, topk)).astype(mx.int32)
+    return mx.broadcast_to(indices, (batch_size, seq_length, kv_group, topk)).astype(
+        mx.int32
+    )
+
+
+def sparse_indices_from_attention_mask(
+    mask: mx.array,
+    *,
+    batch_size: int,
+    seq_length: int,
+    kv_group: int,
+    topk: int,
+    key_length: int,
+) -> mx.array:
+    """Convert an explicit attention mask to Path C sparse indices.
+
+    Path C consumes token indices rather than a dense mask.  This keeps
+    document-boundary masks in metadata form and selects the newest valid keys
+    per query/group without materializing K/V copies.
+    """
+
+    if not isinstance(mask, mx.array):
+        raise TypeError("attention mask must be an mlx.core.array")
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
+    if seq_length <= 0:
+        raise ValueError(f"seq_length must be positive, got {seq_length}")
+    if kv_group <= 0:
+        raise ValueError(f"kv_group must be positive, got {kv_group}")
+    if topk <= 0:
+        raise ValueError(f"topk must be positive, got {topk}")
+    if key_length <= 0:
+        raise ValueError(f"key_length must be positive, got {key_length}")
+
+    if mask.ndim == 2:
+        valid = mask[None, None, :, :]
+    elif mask.ndim == 3:
+        valid = mask[:, None, :, :]
+    elif mask.ndim == 4:
+        valid = mask
+    else:
+        raise ValueError(
+            "attention mask must have shape (S,K), (B,S,K), or (B,H,S,K), "
+            f"got {mask.shape}"
+        )
+
+    if valid.shape[-2:] != (seq_length, key_length):
+        raise ValueError(
+            f"attention mask trailing dims must be ({seq_length}, {key_length}), "
+            f"got {valid.shape[-2:]}"
+        )
+    if valid.shape[0] not in (1, batch_size):
+        raise ValueError(
+            f"attention mask batch dimension must be 1 or {batch_size}, got {valid.shape[0]}"
+        )
+    if valid.shape[1] not in (1, kv_group):
+        raise ValueError(
+            f"Path C sparse masks must be shared across heads or have {kv_group} kv groups, "
+            f"got head/group dimension {valid.shape[1]}"
+        )
+
+    if valid.dtype == mx.bool_:
+        valid_mask = valid
+    else:
+        valid_mask = mx.isfinite(valid.astype(mx.float32))
+    valid_mask = mx.broadcast_to(
+        valid_mask,
+        (batch_size, kv_group, seq_length, key_length),
+    )
+    valid_mask = mx.transpose(valid_mask, (0, 2, 1, 3))
+
+    key_positions = mx.arange(key_length, dtype=mx.int32)
+    scores = mx.where(valid_mask, key_positions, mx.zeros_like(key_positions) - 1)
+    ordered = mx.argsort(scores, axis=-1)
+    selected = ordered[..., -min(topk, key_length) :].astype(mx.int32)
+    selected_scores = mx.take_along_axis(scores, selected, axis=-1)
+    return mx.where(selected_scores >= 0, selected, mx.zeros_like(selected) - 1).astype(
+        mx.int32
+    )
 
 
 def _to_fp8_with_per_token_scale(x: mx.array) -> tuple[mx.array, mx.array]:
@@ -239,7 +329,9 @@ def _to_fp8_with_per_token_scale(x: mx.array) -> tuple[mx.array, mx.array]:
     if x.ndim < 2:
         raise ValueError(f"FP8 producer input must be at least 2D, got {x.shape}")
     if x.size == 0:
-        return mx.zeros(x.shape, dtype=mx.uint8), mx.ones(x.shape[:-1], dtype=mx.float32)
+        return mx.zeros(x.shape, dtype=mx.uint8), mx.ones(
+            x.shape[:-1], dtype=mx.float32
+        )
     amax = mx.max(mx.abs(x), axis=-1).astype(mx.float32)
     fp8_max = mx.array(448.0, dtype=mx.float32)
     min_scale = mx.array(1.0e-12, dtype=mx.float32)
@@ -248,7 +340,9 @@ def _to_fp8_with_per_token_scale(x: mx.array) -> tuple[mx.array, mx.array]:
     return mx.to_fp8(scaled), scale
 
 
-def _validate_attention_sinks(sinks: mx.array | None, num_q_heads: int) -> mx.array | None:
+def _validate_attention_sinks(
+    sinks: mx.array | None, num_q_heads: int
+) -> mx.array | None:
     if sinks is None:
         return None
     if sinks.ndim != 1:
@@ -277,8 +371,12 @@ def _base_inv_freq(head_dim: int, theta: float) -> mx.array:
 def _llama3_inv_freq(config: AttentionConfig) -> mx.array:
     inv_freq = _base_inv_freq(config.q_head_dim, config.rope_theta)
     wavelen = (2.0 * math.pi) / inv_freq
-    low_freq_wavelen = float(config.rope_original_max_position) / config.rope_low_freq_factor
-    high_freq_wavelen = float(config.rope_original_max_position) / config.rope_high_freq_factor
+    low_freq_wavelen = (
+        float(config.rope_original_max_position) / config.rope_low_freq_factor
+    )
+    high_freq_wavelen = (
+        float(config.rope_original_max_position) / config.rope_high_freq_factor
+    )
     smooth = (
         float(config.rope_original_max_position) / wavelen - config.rope_low_freq_factor
     ) / (config.rope_high_freq_factor - config.rope_low_freq_factor)
@@ -414,6 +512,11 @@ class CausalSelfAttention(nn.Module):
         self.q_proj = nn.Linear(config.d_model, config.q_proj_dim, bias=config.bias)
         self.k_proj = nn.Linear(config.d_model, config.kv_proj_dim, bias=config.bias)
         self.v_proj = nn.Linear(config.d_model, config.kv_proj_dim, bias=config.bias)
+        self.sparse_kv_proj = (
+            nn.Linear(config.d_model, config.kv_proj_dim, bias=config.bias)
+            if config.mode == "dsa"
+            else None
+        )
         self.out_proj = nn.Linear(config.q_proj_dim, config.d_model, bias=config.bias)
         self.rope_inv_freq = rotary_inv_freq(config) if config.use_rope else None
         self.rope_attention_factor = (
@@ -438,7 +541,9 @@ class CausalSelfAttention(nn.Module):
     ) -> tuple[mx.array, mx.array, mx.array]:
         batch, seq, _ = hidden_states.shape
         cfg = self.config
-        q = self.q_proj(hidden_states).reshape(batch, seq, cfg.num_q_heads, cfg.q_head_dim)
+        q = self.q_proj(hidden_states).reshape(
+            batch, seq, cfg.num_q_heads, cfg.q_head_dim
+        )
         k = self.k_proj(hidden_states).reshape(batch, seq, cfg.kv_heads, cfg.q_head_dim)
         v = self.v_proj(hidden_states).reshape(batch, seq, cfg.kv_heads, cfg.q_head_dim)
         q = mx.transpose(q, (0, 2, 1, 3))
@@ -463,40 +568,92 @@ class CausalSelfAttention(nn.Module):
             mx.transpose(v, (0, 2, 1, 3)),
         )
 
+    def _project_sparse_mla_qkv_bshd(
+        self,
+        hidden_states: mx.array,
+        *,
+        rope_offset: int = 0,
+    ) -> tuple[mx.array, mx.array]:
+        batch, seq, _ = hidden_states.shape
+        cfg = self.config
+        q = self.q_proj(hidden_states).reshape(
+            batch, seq, cfg.num_q_heads, cfg.q_head_dim
+        )
+        if self.sparse_kv_proj is None:
+            kv = self.k_proj(hidden_states).reshape(
+                batch, seq, cfg.kv_heads, cfg.q_head_dim
+            )
+        else:
+            kv = self.sparse_kv_proj(hidden_states).reshape(
+                batch,
+                seq,
+                cfg.kv_heads,
+                cfg.q_head_dim,
+            )
+        q = mx.transpose(q, (0, 2, 1, 3))
+        kv = mx.transpose(kv, (0, 2, 1, 3))
+        if self.rope_inv_freq is not None:
+            cos, sin = self._rotary_tables(seq, rope_offset)
+            q = apply_rotary_emb(q, cos, sin)
+            kv = apply_rotary_emb(kv, cos, sin)
+        return mx.transpose(q, (0, 2, 1, 3)), mx.transpose(kv, (0, 2, 1, 3))
+
     def prepare_sparse_mla_fp8(
         self,
         hidden_states: mx.array,
         *,
         rope_offset: int = 0,
         key_length: int | None = None,
+        mask: mx.array | Literal["causal"] | None = None,
+        kv_cache: ContiguousKVCache | None = None,
+        layer_idx: int | None = None,
     ) -> SparseMLAFp8Prepared:
         """Produce first-class FP8 buffers consumed by Sparse-MLA Path C."""
 
         if hidden_states.ndim != 3:
-            raise ValueError(f"hidden_states must be shaped (B,S,D), got {hidden_states.shape}")
+            raise ValueError(
+                f"hidden_states must be shaped (B,S,D), got {hidden_states.shape}"
+            )
         cfg = self.config
         batch, seq, _ = hidden_states.shape
-        q, k, v = self._project_qkv_bshd(hidden_states, rope_offset=rope_offset)
-
-        # The current sparse-MLA ABI stores K and V in one packed KV row.  Until
-        # absorbed MLA projections are added, combine the local K/V producers at
-        # graph level so both projections remain trainable without hidden kernel
-        # staging or adapter copies.
-        kv = (k + v) * mx.array(0.5, dtype=k.dtype)
+        q, kv = self._project_sparse_mla_qkv_bshd(
+            hidden_states, rope_offset=rope_offset
+        )
         q_fp8, q_scale = _to_fp8_with_per_token_scale(q)
         kv_fp8, kv_scale = _to_fp8_with_per_token_scale(kv)
+        if kv_cache is not None:
+            if layer_idx is None:
+                raise ValueError("layer_idx is required when kv_cache is provided")
+            kv_fp8, kv_scale = kv_cache.update_and_fetch_sparse_fp8(
+                layer_idx,
+                kv_fp8,
+                kv_scale,
+            )
+            key_length = int(kv_fp8.shape[1])
         sparse_window = key_length if key_length is not None else seq
         if cfg.sliding_window is not None:
             sparse_window = min(sparse_window, cfg.sliding_window)
         effective_topk = min(cfg.sparse_topk, sparse_window)
-        indices = causal_sparse_indices(
-            batch,
-            seq,
-            cfg.kv_heads,
-            effective_topk,
-            query_offset=rope_offset,
-            key_length=key_length,
-        )
+        if mask is None or (isinstance(mask, str) and mask == "causal"):
+            indices = causal_sparse_indices(
+                batch,
+                seq,
+                cfg.kv_heads,
+                effective_topk,
+                query_offset=rope_offset,
+                key_length=key_length,
+            )
+        elif isinstance(mask, str):
+            raise ValueError(f"unsupported attention mask sentinel {mask!r}")
+        else:
+            indices = sparse_indices_from_attention_mask(
+                mask,
+                batch_size=batch,
+                seq_length=seq,
+                kv_group=cfg.kv_heads,
+                topk=effective_topk,
+                key_length=key_length if key_length is not None else seq,
+            )
         return SparseMLAFp8Prepared(
             q_fp8=q_fp8,
             q_scale=q_scale,
@@ -513,15 +670,23 @@ class CausalSelfAttention(nn.Module):
         *,
         rope_offset: int = 0,
         key_length: int | None = None,
+        mask: mx.array | Literal["causal"] | None = None,
+        sinks: mx.array | None = None,
+        kv_cache: ContiguousKVCache | None = None,
+        layer_idx: int | None = None,
     ) -> mx.array:
         from cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c import (
             sparse_mla_fp8_path_c_apply,
         )
 
+        sinks = _validate_attention_sinks(sinks, self.config.num_q_heads)
         prepared = self.prepare_sparse_mla_fp8(
             hidden_states,
             rope_offset=rope_offset,
             key_length=key_length,
+            mask=mask,
+            kv_cache=kv_cache,
+            layer_idx=layer_idx,
         )
         out = sparse_mla_fp8_path_c_apply(
             prepared.q_fp8,
@@ -531,11 +696,16 @@ class CausalSelfAttention(nn.Module):
             prepared.indices,
             sm_scale=prepared.sm_scale,
             d_v=prepared.d_v,
+            sinks=sinks,
             force_path_c=True,
         )
         if out is None:
-            raise RuntimeError("sparse_mla_fp8_path_c_apply returned None under forced Path C")
-        record_dispatch("sparse_mla", KernelPath.PATH_C, "tilelang_fp8_prepared_path_c_fwd")
+            raise RuntimeError(
+                "sparse_mla_fp8_path_c_apply returned None under forced Path C"
+            )
+        record_dispatch(
+            "sparse_mla", KernelPath.PATH_C, "tilelang_fp8_prepared_path_c_fwd"
+        )
         out = out.astype(hidden_states.dtype)
         out = out.reshape(
             hidden_states.shape[0],
@@ -551,12 +721,11 @@ class CausalSelfAttention(nn.Module):
         sinks: mx.array | None,
         kv_cache: ContiguousKVCache | None,
     ) -> bool:
+        del sinks, kv_cache
         return (
             self.config.mode == "dsa"
             and selected_path("sparse_mla") is KernelPath.PATH_C
-            and (mask is None or (isinstance(mask, str) and mask == "causal"))
-            and sinks is None
-            and kv_cache is None
+            and (not isinstance(mask, str) or mask == "causal")
         )
 
     def __call__(
@@ -569,21 +738,13 @@ class CausalSelfAttention(nn.Module):
         layer_idx: int | None = None,
     ) -> mx.array:
         if hidden_states.ndim != 3:
-            raise ValueError(f"hidden_states must be shaped (B,S,D), got {hidden_states.shape}")
+            raise ValueError(
+                f"hidden_states must be shaped (B,S,D), got {hidden_states.shape}"
+            )
         if hidden_states.shape[-1] != self.config.d_model:
             raise ValueError(
                 f"hidden_states last dim must be {self.config.d_model}, got {hidden_states.shape[-1]}"
             )
-        if (
-            self.config.mode == "dsa"
-            and selected_path("sparse_mla") is KernelPath.PATH_C
-            and not self._use_sparse_mla_fp8_path_c(mask, sinks=sinks, kv_cache=kv_cache)
-        ):
-            raise NotImplementedError(
-                "DSA Sparse-MLA Path C currently supports only uncached causal attention "
-                "without sinks or explicit document masks"
-            )
-
         cache_position = 0
         cache_layer_idx: int | None = None
         if kv_cache is not None:
@@ -592,40 +753,42 @@ class CausalSelfAttention(nn.Module):
             if layer_idx < 0 or layer_idx >= len(kv_cache.layers):
                 raise IndexError("layer_idx out of range")
             cache_layer_idx = layer_idx
-            layer_cache = kv_cache.layers[cache_layer_idx]
-            if isinstance(layer_cache, QuantizedKVCache):
-                raise NotImplementedError(
-                    "quantized KV cache is not integrated with MLX SDPA attention yet"
-                )
-            cache_position = int(layer_cache.offset)
+            cache_position = kv_cache.layer_position(cache_layer_idx)
 
         if self._use_sparse_mla_fp8_path_c(mask, sinks=sinks, kv_cache=kv_cache):
-            return self._call_sparse_mla_fp8_path_c(hidden_states, rope_offset=cache_position)
+            return self._call_sparse_mla_fp8_path_c(
+                hidden_states,
+                rope_offset=cache_position,
+                mask=mask,
+                sinks=sinks,
+                kv_cache=kv_cache,
+                layer_idx=cache_layer_idx,
+            )
 
         q, k, v = self._project_qkv(hidden_states, rope_offset=cache_position)
         if kv_cache is not None:
             if cache_layer_idx is None:
                 raise ValueError("layer_idx is required when kv_cache is provided")
             updated_k, updated_v = kv_cache.update_and_fetch(cache_layer_idx, k, v)
-            if not isinstance(updated_k, mx.array) or not isinstance(updated_v, mx.array):
-                raise NotImplementedError(
-                    "quantized KV cache is not integrated with MLX SDPA attention yet"
-                )
             k = updated_k
             v = updated_v
 
+        key_length = k[0].shape[-2] if isinstance(k, tuple) else k.shape[2]
         if mask is None or (isinstance(mask, str) and mask == "causal"):
             mask = causal_sdpa_mask(
                 hidden_states.shape[1],
                 sliding_window=self.config.sliding_window,
                 query_offset=cache_position,
-                key_length=k.shape[2],
+                key_length=key_length,
             )
         sinks = _validate_attention_sinks(sinks, self.config.num_q_heads)
-        out = mx.fast.scaled_dot_product_attention(
+        out = scaled_dot_product_attention(
             q,
             k,
             v,
+            cache=kv_cache.layers[cache_layer_idx]
+            if cache_layer_idx is not None
+            else None,
             scale=(self.config.q_head_dim**-0.5) / self.rope_attention_factor,
             mask=mask,
             sinks=sinks,
@@ -650,5 +813,6 @@ __all__ = [
     "causal_sdpa_mask",
     "precompute_rotary_embeddings",
     "rotary_inv_freq",
+    "sparse_indices_from_attention_mask",
     "yarn_attention_factor",
 ]

@@ -22,7 +22,8 @@ from cppmega_mlx.inference import (
 
 
 def _array_pair(
-    value: tuple[mx.array, mx.array] | tuple[tuple[mx.array, ...], tuple[mx.array, ...]],
+    value: tuple[mx.array, mx.array]
+    | tuple[tuple[mx.array, ...], tuple[mx.array, ...]],
 ) -> tuple[mx.array, mx.array]:
     first, second = value
     assert isinstance(first, mx.array)
@@ -257,12 +258,39 @@ def test_quantized_contiguous_kv_cache_uses_mlx_lm_quantized_layers() -> None:
 
     assert isinstance(cache.layers[0], QuantizedKVCache)
     assert cache.position() == 3
-    assert [part.shape for part in packed_keys] == [(1, 2, 3, 4), (1, 2, 3, 1), (1, 2, 3, 1)]
+    assert [part.shape for part in packed_keys] == [
+        (1, 2, 3, 4),
+        (1, 2, 3, 1),
+        (1, 2, 3, 1),
+    ]
     assert [part.shape for part in packed_values] == [
         (1, 2, 3, 4),
         (1, 2, 3, 1),
         (1, 2, 3, 1),
     ]
+
+
+def test_sparse_fp8_cache_reuses_mlx_lm_kv_cache_storage() -> None:
+    cache = make_contiguous_kv_cache(
+        num_layers=1,
+        batch_size=1,
+        num_kv_heads=2,
+        head_dim=4,
+        max_seq_len=8,
+    )
+    kv_fp8 = mx.arange(1 * 3 * 2 * 4, dtype=mx.uint8).reshape(1, 3, 2, 4)
+    kv_scale = mx.ones((1, 3, 2), dtype=mx.float32)
+
+    cached_fp8, cached_scale = cache.update_and_fetch_sparse_fp8(0, kv_fp8, kv_scale)
+    mx.eval(cached_fp8, cached_scale)
+
+    assert isinstance(cache.sparse_fp8_layers[0], KVCache)
+    assert cache.layers[0].empty()
+    assert cache.position() == 3
+    assert cached_fp8.shape == (1, 3, 2, 4)
+    assert cached_scale.shape == (1, 3, 2)
+    np.testing.assert_array_equal(np.array(cached_fp8), np.array(kv_fp8))
+    np.testing.assert_allclose(np.array(cached_scale), np.array(kv_scale))
 
 
 def test_quantized_prefill_preserves_quantized_meta_state() -> None:

@@ -57,6 +57,9 @@ class ContiguousKVCache:
         self.layers: list[_LayerCache] = [
             _make_layer_cache(config) for _ in range(config.num_layers)
         ]
+        self.sparse_fp8_layers: list[KVCache] = [
+            KVCache() for _ in range(config.num_layers)
+        ]
 
     def update_and_fetch(
         self,
@@ -70,10 +73,40 @@ class ContiguousKVCache:
         _validate_kv_update(self.config, layer, keys, values)
         return layer.update_and_fetch(keys, values)
 
+    def update_and_fetch_sparse_fp8(
+        self,
+        layer_idx: int,
+        kv_fp8: mx.array,
+        kv_scale: mx.array,
+    ) -> tuple[mx.array, mx.array]:
+        """Append Path C FP8 KV/scales using MLX-LM KVCache storage.
+
+        The cache stores the ready FP8 KV buffer as ``keys`` and the per-row
+        fp32 scales as ``values`` with a singleton value head dimension.  That
+        keeps the ABI as references to existing GPU buffers and avoids expanding
+        scale to the KV feature width.
+        """
+
+        layer = self._sparse_fp8_layer(layer_idx)
+        _validate_sparse_fp8_update(self.config, layer, kv_fp8, kv_scale)
+        keys = mx.transpose(kv_fp8, (0, 2, 1, 3))
+        values = mx.transpose(kv_scale[..., None], (0, 2, 1, 3))
+        cached_kv, cached_scale = layer.update_and_fetch(keys, values)
+        return (
+            mx.transpose(cached_kv, (0, 2, 1, 3)),
+            mx.transpose(cached_scale[..., 0], (0, 2, 1)),
+        )
+
     def position(self) -> int:
         """Return the aligned decode position for all cache layers."""
 
         return kv_cache_position(self)
+
+    def layer_position(self, layer_idx: int) -> int:
+        """Return the active dense or sparse FP8 offset for one layer."""
+
+        self._layer(layer_idx)
+        return _active_layer_offset(self, layer_idx)
 
     def trim(self, num_tokens: int) -> int:
         """Trim up to ``num_tokens`` from all layers, matching MLX-LM semantics."""
@@ -96,6 +129,13 @@ class ContiguousKVCache:
         if layer_idx < 0 or layer_idx >= len(self.layers):
             raise IndexError("layer_idx out of range")
         return self.layers[layer_idx]
+
+    def _sparse_fp8_layer(self, layer_idx: int) -> KVCache:
+        if not isinstance(layer_idx, int):
+            raise TypeError("layer_idx must be an int")
+        if layer_idx < 0 or layer_idx >= len(self.sparse_fp8_layers):
+            raise IndexError("layer_idx out of range")
+        return self.sparse_fp8_layers[layer_idx]
 
 
 def make_contiguous_kv_cache(
@@ -126,7 +166,9 @@ def make_contiguous_kv_cache(
         or num_kv_heads is None
         or head_dim is None
     ):
-        raise ValueError("num_layers, batch_size, num_kv_heads, and head_dim are required")
+        raise ValueError(
+            "num_layers, batch_size, num_kv_heads, and head_dim are required"
+        )
     return ContiguousKVCache(
         ContiguousKVCacheConfig(
             num_layers=num_layers,
@@ -170,7 +212,7 @@ def kv_cache_position(cache: ContiguousKVCache) -> int:
     """Return the aligned offset for all layers, failing closed on drift."""
 
     _validate_cache(cache)
-    offsets = [int(layer.offset) for layer in cache.layers]
+    offsets = [_active_layer_offset(cache, idx) for idx in range(len(cache.layers))]
     first = offsets[0]
     if any(offset != first for offset in offsets):
         raise RuntimeError("contiguous KV cache layer offsets are not aligned")
@@ -210,7 +252,12 @@ def trim_contiguous_kv_cache(cache: ContiguousKVCache, num_tokens: int) -> int:
 
     _validate_cache(cache)
     _validate_non_negative_int("num_tokens", num_tokens)
-    trimmed = [int(layer.trim(num_tokens)) for layer in cache.layers]
+    trimmed = [
+        _trim_active_layer_pair(layer, sparse_layer, num_tokens)
+        for layer, sparse_layer in zip(
+            cache.layers, cache.sparse_fp8_layers, strict=True
+        )
+    ]
     first = trimmed[0]
     if any(count != first for count in trimmed):
         raise RuntimeError("contiguous KV cache layers trimmed different token counts")
@@ -244,10 +291,17 @@ def prefill_contiguous_kv_cache(
     ):
         raise RuntimeError("prefill source exceeds destination max_seq_len")
 
-    for dst_layer, src_layer in zip(destination.layers, source.layers, strict=True):
+    for dst_layer, src_layer, src_sparse_layer in zip(
+        destination.layers,
+        source.layers,
+        source.sparse_fp8_layers,
+        strict=True,
+    ):
         if src_layer.empty():
-            if source_position != 0:
-                raise RuntimeError("source cache has an empty layer at non-zero position")
+            if source_position != 0 and src_sparse_layer.empty():
+                raise RuntimeError(
+                    "source cache has an empty layer at non-zero position"
+                )
             continue
         state = src_layer.state
         if state is None:
@@ -260,16 +314,66 @@ def prefill_contiguous_kv_cache(
         if isinstance(dst_layer, QuantizedKVCache):
             dst_layer.meta_state = src_layer.meta_state
 
+    for dst_layer, src_layer, src_dense_layer in zip(
+        destination.sparse_fp8_layers,
+        source.sparse_fp8_layers,
+        source.layers,
+        strict=True,
+    ):
+        if src_layer.empty():
+            if source_position != 0 and src_dense_layer.empty():
+                raise RuntimeError(
+                    "source sparse FP8 cache has an empty layer at non-zero position"
+                )
+            continue
+        state = src_layer.state
+        if state is None:
+            raise RuntimeError("source sparse FP8 cache layer has no state")
+        dst_layer.state = _copy_state_for_batch(
+            cast(_StateTree, state),
+            destination.config.batch_size,
+        )
+
 
 def _make_layer_cache(config: ContiguousKVCacheConfig) -> _LayerCache:
     if config.quantized:
-        return make_quantized_kv_cache(bits=config.kv_bits, group_size=config.kv_group_size)
+        return make_quantized_kv_cache(
+            bits=config.kv_bits, group_size=config.kv_group_size
+        )
     return KVCache()
 
 
 def _validate_cache(cache: ContiguousKVCache) -> None:
     if not isinstance(cache, ContiguousKVCache):
         raise TypeError("expected a ContiguousKVCache")
+    if len(cache.sparse_fp8_layers) != len(cache.layers):
+        raise RuntimeError("contiguous KV cache sparse FP8 layer count drifted")
+
+
+def _active_layer_offset(cache: ContiguousKVCache, layer_idx: int) -> int:
+    dense_offset = int(cache.layers[layer_idx].offset)
+    sparse_offset = int(cache.sparse_fp8_layers[layer_idx].offset)
+    if dense_offset and sparse_offset and dense_offset != sparse_offset:
+        raise RuntimeError("contiguous KV cache dense and sparse FP8 offsets drifted")
+    return sparse_offset if sparse_offset else dense_offset
+
+
+def _trim_active_layer_pair(
+    layer: _LayerCache, sparse_layer: KVCache, num_tokens: int
+) -> int:
+    dense_offset = int(layer.offset)
+    sparse_offset = int(sparse_layer.offset)
+    if dense_offset and sparse_offset:
+        dense_trimmed = int(layer.trim(num_tokens))
+        sparse_trimmed = int(sparse_layer.trim(num_tokens))
+        if dense_trimmed != sparse_trimmed:
+            raise RuntimeError(
+                "dense and sparse FP8 cache layers trimmed different token counts"
+            )
+        return dense_trimmed
+    if sparse_offset:
+        return int(sparse_layer.trim(num_tokens))
+    return int(layer.trim(num_tokens))
 
 
 def _validate_prefill_configs(
@@ -279,15 +383,21 @@ def _validate_prefill_configs(
     if destination.num_layers != source.num_layers:
         raise ValueError("prefill source and destination must have the same num_layers")
     if destination.num_kv_heads != source.num_kv_heads:
-        raise ValueError("prefill source and destination must have the same num_kv_heads")
+        raise ValueError(
+            "prefill source and destination must have the same num_kv_heads"
+        )
     if destination.head_dim != source.head_dim:
         raise ValueError("prefill source and destination must have the same head_dim")
     if destination.quantized != source.quantized:
-        raise ValueError("prefill source and destination must have the same quantized mode")
+        raise ValueError(
+            "prefill source and destination must have the same quantized mode"
+        )
     if destination.kv_bits != source.kv_bits:
         raise ValueError("prefill source and destination must have the same kv_bits")
     if destination.kv_group_size != source.kv_group_size:
-        raise ValueError("prefill source and destination must have the same kv_group_size")
+        raise ValueError(
+            "prefill source and destination must have the same kv_group_size"
+        )
     if source.batch_size not in (1, destination.batch_size):
         raise ValueError("prefill source batch_size must be 1 or match destination")
 
@@ -301,7 +411,9 @@ def _validate_kv_update(
     if not isinstance(keys, mx.array) or not isinstance(values, mx.array):
         raise TypeError("keys and values must be mlx.core.array instances")
     if len(keys.shape) != 4 or len(values.shape) != 4:
-        raise ValueError("keys and values must have shape (batch, kv_heads, sequence, head_dim)")
+        raise ValueError(
+            "keys and values must have shape (batch, kv_heads, sequence, head_dim)"
+        )
     if keys.shape != values.shape:
         raise ValueError("keys and values must have matching shapes")
     if keys.dtype != values.dtype:
@@ -319,6 +431,39 @@ def _validate_kv_update(
         raise ValueError("keys head_dim dimension must match cache config head_dim")
     if config.max_seq_len is not None and layer.offset + sequence > config.max_seq_len:
         raise RuntimeError("contiguous KV cache update would exceed max_seq_len")
+
+
+def _validate_sparse_fp8_update(
+    config: ContiguousKVCacheConfig,
+    layer: KVCache,
+    kv_fp8: mx.array,
+    kv_scale: mx.array,
+) -> None:
+    if not isinstance(kv_fp8, mx.array) or not isinstance(kv_scale, mx.array):
+        raise TypeError("kv_fp8 and kv_scale must be mlx.core.array instances")
+    if len(kv_fp8.shape) != 4:
+        raise ValueError("kv_fp8 must have shape (batch, sequence, kv_heads, head_dim)")
+    if len(kv_scale.shape) != 3:
+        raise ValueError("kv_scale must have shape (batch, sequence, kv_heads)")
+    if kv_fp8.shape[:-1] != kv_scale.shape:
+        raise ValueError("kv_fp8 and kv_scale must agree on batch/sequence/kv_heads")
+    if kv_fp8.dtype != mx.uint8:
+        raise ValueError("kv_fp8 must be an FP8 byte buffer with dtype uint8")
+    if kv_scale.dtype != mx.float32:
+        raise ValueError("kv_scale must be float32")
+
+    batch, sequence, num_kv_heads, head_dim = (int(dim) for dim in kv_fp8.shape)
+    if batch != config.batch_size:
+        raise ValueError("kv_fp8 batch dimension must match cache config batch_size")
+    _validate_positive_int("sequence", sequence)
+    if num_kv_heads != config.num_kv_heads:
+        raise ValueError(
+            "kv_fp8 kv_heads dimension must match cache config num_kv_heads"
+        )
+    if head_dim != config.head_dim:
+        raise ValueError("kv_fp8 head_dim dimension must match cache config head_dim")
+    if config.max_seq_len is not None and layer.offset + sequence > config.max_seq_len:
+        raise RuntimeError("sparse FP8 cache update would exceed max_seq_len")
 
 
 def _copy_state_for_batch(state: _StateTree, batch_size: int) -> _StateTree:

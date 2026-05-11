@@ -9,12 +9,20 @@ import numpy as np
 import pytest
 from mlx.utils import tree_flatten
 
-from cppmega_mlx.config.model import DSAConfig, M2RNNConfig, Mamba3Config, Nam56RModelConfig
+from cppmega_mlx.config.model import (
+    DSAConfig,
+    M2RNNConfig,
+    Mamba3Config,
+    Nam56RModelConfig,
+)
 from cppmega_mlx.data.batch import synthetic_token_batch
 from cppmega_mlx.models.hybrid_lm import HybridTinyConfig, HybridTinyLM
 from cppmega_mlx.recipes.nam56r import build_hybrid_tiny_config_from_nam56r
 from cppmega_mlx.training.compiled import CompiledPretrainingStep
-from cppmega_mlx.training.loss import next_token_cross_entropy, next_token_cross_entropy_with_mtp
+from cppmega_mlx.training.loss import (
+    next_token_cross_entropy,
+    next_token_cross_entropy_with_mtp,
+)
 
 
 def _hybrid_config(**overrides) -> HybridTinyConfig:
@@ -88,16 +96,24 @@ def test_hybrid_lm_single_route_compiled_eager_train_matrix_with_side_channels(
         seed=171,
         include_structure=True,
     )
-    assert {"structure_ids", "dep_levels", "ast_depth_ids", "sibling_index_ids", "node_type_ids"} <= set(
-        batch.as_dict()
-    )
+    assert {
+        "structure_ids",
+        "dep_levels",
+        "ast_depth_ids",
+        "sibling_index_ids",
+        "node_type_ids",
+    } <= set(batch.as_dict())
 
-    def run_step(*, compile: bool) -> tuple[float, int, np.ndarray, dict[str, np.ndarray]]:
+    def run_step(
+        *, compile: bool
+    ) -> tuple[float, int, np.ndarray, dict[str, np.ndarray]]:
         mx.random.seed(173)
         model = HybridTinyLM(_single_route_config(symbol))
         optimizer = optim.AdamW(learning_rate=1e-3, weight_decay=0.0)
         before = _flat_tree(model.parameters())
-        metrics = CompiledPretrainingStep(model, optimizer, compile=compile)(batch.as_dict())
+        metrics = CompiledPretrainingStep(model, optimizer, compile=compile)(
+            batch.as_dict()
+        )
         after = _flat_tree(model.parameters())
         optimizer_state = _flat_tree(optimizer.state)
         delta = after[param_name] - before[param_name]
@@ -193,7 +209,10 @@ def test_hybrid_lm_single_route_train_steps_update_route_specific_sentinels() ->
         assert float(loss.item()) > 0
         assert int(ntokens.item()) == 10
         _assert_finite_nonzero(flat_grads, param_name)
-        assert _max_abs({param_name: after[param_name] - before[param_name]}, param_name) > 0
+        assert (
+            _max_abs({param_name: after[param_name] - before[param_name]}, param_name)
+            > 0
+        )
         _assert_adamw_state_for(optimizer_state, param_name)
 
 
@@ -270,9 +289,11 @@ def test_hybrid_lm_dsa_path_c_uses_sparse_causal_sentinel(
         *,
         sm_scale: float,
         d_v: int | None = None,
+        sinks: mx.array | None = None,
         return_lse: bool = False,
         force_path_c: bool = False,
     ) -> mx.array:
+        assert sinks is None
         del q_scale, kv_scale, indices, sm_scale, return_lse
         assert force_path_c is True
         d_v_resolved = int(q_fp8.shape[-1] if d_v is None else d_v)
@@ -308,6 +329,63 @@ def test_hybrid_lm_dsa_path_c_uses_sparse_causal_sentinel(
     assert out.shape == (1, 4, model.config.vocab_size)
     assert mask_calls == []
     assert apply_calls == [((1, 4, 4, 4), (1, 4, 2, 4))]
+
+
+def test_hybrid_lm_dsa_path_c_threads_document_mask_to_sparse_indices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c as fp8_path_c
+
+    seen_indices: list[mx.array] = []
+
+    def fake_apply(
+        q_fp8: mx.array,
+        q_scale: mx.array,
+        kv_fp8: mx.array,
+        kv_scale: mx.array,
+        indices: mx.array,
+        *,
+        sm_scale: float,
+        d_v: int | None = None,
+        sinks: mx.array | None = None,
+        return_lse: bool = False,
+        force_path_c: bool = False,
+    ) -> mx.array:
+        del q_scale, kv_fp8, kv_scale, sm_scale, sinks, return_lse
+        assert force_path_c is True
+        seen_indices.append(indices)
+        d_v_resolved = int(q_fp8.shape[-1] if d_v is None else d_v)
+        return mx.zeros(
+            (q_fp8.shape[0], q_fp8.shape[1], q_fp8.shape[2], d_v_resolved),
+            dtype=mx.float16,
+        )
+
+    monkeypatch.setenv("CPPMEGA_KERNEL_PATH__SPARSE_MLA", "path_c")
+    monkeypatch.setattr(fp8_path_c, "sparse_mla_fp8_path_c_apply", fake_apply)
+
+    model = HybridTinyLM(
+        _hybrid_config(
+            pattern="A",
+            depth=1,
+            dsa_a_layer_ranks=(0,),
+            hidden_size=16,
+            num_attention_heads=4,
+            num_attention_kv_heads=2,
+            attention_sparse_topk=2,
+            max_seq_length=8,
+        )
+    )
+    input_ids = mx.array([[1, 2, 3, 4]], dtype=mx.int32)
+    document_ids = mx.array([[0, 0, 1, 1]], dtype=mx.int32)
+
+    out = model(input_ids, document_ids=document_ids)
+    mx.eval(out, seen_indices[0])
+
+    assert out.shape == (1, 4, model.config.vocab_size)
+    np.testing.assert_array_equal(
+        np.sort(np.array(seen_indices[0][0, :, 0, :]), axis=-1),
+        np.array([[-1, 0], [0, 1], [-1, 2], [2, 3]], dtype=np.int32),
+    )
 
 
 def test_hybrid_lm_document_ids_mask_cross_document_attention() -> None:
@@ -664,7 +742,9 @@ def test_nam56r_lite_recipe_instantiates_custom_routes_and_backpropagates() -> N
     assert _max_abs(flat_grads, "layers.3.block.state_weight") > 0
 
 
-def test_hybrid_lm_structure_embedding_receives_gradients_when_projection_enabled() -> None:
+def test_hybrid_lm_structure_embedding_receives_gradients_when_projection_enabled() -> (
+    None
+):
     mx.random.seed(17)
     model = HybridTinyLM(
         _hybrid_config(
@@ -743,11 +823,17 @@ def test_hybrid_lm_optimizer_step_updates_representative_route_params() -> None:
     for name in representative:
         assert _max_abs(flat_grads, name) > 0, name
         assert _max_abs({name: after[name] - before[name]}, name) > 0, name
-        if ".block.router." in name or ".block.experts." in name or ".block.shared_expert." in name:
+        if (
+            ".block.router." in name
+            or ".block.experts." in name
+            or ".block.shared_expert." in name
+        ):
             _assert_adamw_state_for(optimizer_state, name)
 
 
-def test_hybrid_lm_aemr_compiled_and_eager_train_steps_match_and_update_routes() -> None:
+def test_hybrid_lm_aemr_compiled_and_eager_train_steps_match_and_update_routes() -> (
+    None
+):
     config = _hybrid_config(
         hidden_size=8,
         num_attention_heads=1,
@@ -813,7 +899,9 @@ def test_hybrid_lm_aemr_compiled_and_eager_train_steps_match_and_update_routes()
         return metrics.loss, metrics.ntokens, before, after
 
     eager_loss, eager_ntokens, eager_before, eager_after = run_step(compile=False)
-    compiled_loss, compiled_ntokens, compiled_before, compiled_after = run_step(compile=True)
+    compiled_loss, compiled_ntokens, compiled_before, compiled_after = run_step(
+        compile=True
+    )
 
     assert eager_ntokens == compiled_ntokens == 6
     assert math.isclose(compiled_loss, eager_loss, rel_tol=1e-5, abs_tol=1e-6)
