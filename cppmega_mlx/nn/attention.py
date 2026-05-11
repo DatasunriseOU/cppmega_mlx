@@ -172,6 +172,8 @@ class SparseMLAFp8Prepared:
     indices: mx.array
     sm_scale: float
     d_v: int
+    q: mx.array | None = None
+    kv: mx.array | None = None
 
 
 def causal_sdpa_mask(
@@ -326,18 +328,11 @@ def sparse_indices_from_attention_mask(
 def _to_fp8_with_per_token_scale(x: mx.array) -> tuple[mx.array, mx.array]:
     """Quantize a producer tensor to e4m3 with one fp32 scale per final-dim row."""
 
-    if x.ndim < 2:
-        raise ValueError(f"FP8 producer input must be at least 2D, got {x.shape}")
-    if x.size == 0:
-        return mx.zeros(x.shape, dtype=mx.uint8), mx.ones(
-            x.shape[:-1], dtype=mx.float32
-        )
-    amax = mx.max(mx.abs(x), axis=-1).astype(mx.float32)
-    fp8_max = mx.array(448.0, dtype=mx.float32)
-    min_scale = mx.array(1.0e-12, dtype=mx.float32)
-    scale = mx.maximum(amax / fp8_max, min_scale)
-    scaled = x / scale.astype(x.dtype)[..., None]
-    return mx.to_fp8(scaled), scale
+    from cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c import (
+        _to_fp8_with_per_token_scale as _path_c_to_fp8_with_per_token_scale,
+    )
+
+    return _path_c_to_fp8_with_per_token_scale(x)
 
 
 def _validate_attention_sinks(
@@ -616,6 +611,10 @@ class CausalSelfAttention(nn.Module):
             )
         cfg = self.config
         batch, seq, _ = hidden_states.shape
+        from cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c import (
+            _to_fp8_with_per_token_scale,
+        )
+
         q, kv = self._project_sparse_mla_qkv_bshd(
             hidden_states, rope_offset=rope_offset
         )
@@ -662,6 +661,8 @@ class CausalSelfAttention(nn.Module):
             indices=indices,
             sm_scale=(cfg.q_head_dim**-0.5) / self.rope_attention_factor,
             d_v=cfg.q_head_dim,
+            q=q,
+            kv=kv,
         )
 
     def _call_sparse_mla_fp8_path_c(
@@ -677,6 +678,7 @@ class CausalSelfAttention(nn.Module):
     ) -> mx.array:
         from cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c import (
             sparse_mla_fp8_path_c_apply,
+            sparse_mla_fp8_path_c_apply_prepared_float,
         )
 
         sinks = _validate_attention_sinks(sinks, self.config.num_q_heads)
@@ -688,17 +690,34 @@ class CausalSelfAttention(nn.Module):
             kv_cache=kv_cache,
             layer_idx=layer_idx,
         )
-        out = sparse_mla_fp8_path_c_apply(
-            prepared.q_fp8,
-            prepared.q_scale,
-            prepared.kv_fp8,
-            prepared.kv_scale,
-            prepared.indices,
-            sm_scale=prepared.sm_scale,
-            d_v=prepared.d_v,
-            sinks=sinks,
-            force_path_c=True,
-        )
+        if kv_cache is None:
+            if prepared.q is None or prepared.kv is None:
+                raise RuntimeError("prepared Path C buffers are missing float owners")
+            out = sparse_mla_fp8_path_c_apply_prepared_float(
+                prepared.q,
+                prepared.kv,
+                prepared.q_fp8,
+                prepared.q_scale,
+                prepared.kv_fp8,
+                prepared.kv_scale,
+                prepared.indices,
+                sm_scale=prepared.sm_scale,
+                d_v=prepared.d_v,
+                sinks=sinks,
+                force_path_c=True,
+            )
+        else:
+            out = sparse_mla_fp8_path_c_apply(
+                prepared.q_fp8,
+                prepared.q_scale,
+                prepared.kv_fp8,
+                prepared.kv_scale,
+                prepared.indices,
+                sm_scale=prepared.sm_scale,
+                d_v=prepared.d_v,
+                sinks=sinks,
+                force_path_c=True,
+            )
         if out is None:
             raise RuntimeError(
                 "sparse_mla_fp8_path_c_apply returned None under forced Path C"

@@ -145,6 +145,28 @@ model.state plus optimizer.state. The compiled path captures
 Do not manually assign optimizer.state or pass parameter dictionaries through
 the benchmark loop when changing this script.
 
+### M0.4 Train-Step Token/Sec Interpretation
+
+`scripts/m04_train_step.py` reports `timing.tokens_per_second` using the
+loss denominator, not the raw input-token count. For dense next-token LM
+batches this means `batch_size * (seq_len - 1)` target tokens per step after
+the one-token shift. The receipt now records this explicitly under
+`timing.throughput_interpretation`, including the input-token denominator for
+comparison.
+
+The m04 step timer covers the synchronized MLX training step
+(`value_and_grad`, `optimizer.update`, `mx.eval`, and scalar metric
+materialization). It excludes dataset construction, `next(batches)` Parquet/NPZ
+fetch, model allocation, optimizer initialization, cache-clear cadence, and
+receipt serialization. A low number from `seq_len < 4096`, synthetic data, or a
+tiny HybridTinyLM smoke is therefore a short-sequence/training-plumbing latency
+receipt, not production local_gb10_quarter throughput evidence.
+
+Use the local_gb10_quarter 4k throughput sweep or matched matrix receipts for
+production throughput claims. M0.4 remains the correctness/acceptance receipt:
+real target Parquet, full local_gb10_quarter, bf16 AdamW fp32 moments,
+grad-checkpointing, and 100 decreasing finite steps.
+
 The benchmark prefers the local cppmega_mlx.models.tiny_lm and
 cppmega_mlx.data.batch.synthetic_token_batch APIs when they are present. It keeps a
 self-contained fallback model for partial checkouts; always record

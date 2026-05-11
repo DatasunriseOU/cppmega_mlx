@@ -50,18 +50,23 @@ from cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c import (  # noqa: E402
     SparseMLAFp8IndexedQKReducePathCStatus,
     SparseMLAFp8QKReducePathCStatus,
     SparseMLAFp8PathCStatus,
+    _to_fp8_with_per_token_scale,
     fp8_sparse_mla_indexed_qk_reduce_msl_features,
     fp8_sparse_mla_indexed_qk_reduce_path_c,
     fp8_sparse_mla_indexed_qk_reduce_path_c_status,
     fp8_sparse_mla_qk_reduce_msl_features,
     fp8_sparse_mla_qk_reduce_path_c,
     fp8_sparse_mla_qk_reduce_path_c_status,
+    fp8_sparse_mla_qk_reduce_sync_plan,
     fp8_sparse_mla_qk_msl_features,
     fp8_sparse_mla_qk_path_c_status,
     fp8_sparse_mla_qk_scaled_matmul_probe_status,
     lower_fp8_sparse_mla_indexed_qk_reduce_msl,
     lower_fp8_sparse_mla_qk_reduce_msl,
     lower_fp8_sparse_mla_qk_msl,
+    sparse_mla_fp8_bwd_path_c,
+    sparse_mla_fp8_path_c_apply_from_float,
+    sparse_mla_fp8_path_c_apply_prepared_float,
 )
 from cppmega_mlx.nn.sparse_mla import sparse_mla_attention_reference  # noqa: E402
 
@@ -84,14 +89,22 @@ def _make_inputs(
     scale: float = 0.1,
 ):
     rng = np.random.default_rng(seed)
-    q = mx.array((rng.standard_normal((batch, seq_len, heads, qk_dim)) * scale).astype(np.float32))
-    kv = mx.array((rng.standard_normal((batch, seq_len, kv_group, qk_dim)) * scale).astype(np.float32))
+    q = mx.array(
+        (rng.standard_normal((batch, seq_len, heads, qk_dim)) * scale).astype(
+            np.float32
+        )
+    )
+    kv = mx.array(
+        (rng.standard_normal((batch, seq_len, kv_group, qk_dim)) * scale).astype(
+            np.float32
+        )
+    )
     ind_np = np.tile(
         np.arange(topk, dtype=np.int32).reshape(1, 1, 1, topk),
         (batch, seq_len, kv_group, 1),
     )
     # Mark the second half of the topk as masked (-1 sentinel).
-    ind_np[:, :, :, topk // 2:] = -1
+    ind_np[:, :, :, topk // 2 :] = -1
     indices = mx.array(ind_np)
     return q, kv, indices, d_v
 
@@ -108,8 +121,14 @@ def _array_only(value: object) -> mx.array:
 
 
 def _load_fp8_bench_module():
-    script_path = Path(__file__).resolve().parents[1] / "scripts" / "bench_tilelang_sparse_mla_fp8.py"
-    spec = importlib.util.spec_from_file_location("bench_tilelang_sparse_mla_fp8_for_test", script_path)
+    script_path = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "bench_tilelang_sparse_mla_fp8.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "bench_tilelang_sparse_mla_fp8_for_test", script_path
+    )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -117,7 +136,11 @@ def _load_fp8_bench_module():
 
 
 def _finite_positive_float(value: object) -> bool:
-    return isinstance(value, int | float) and math.isfinite(float(value)) and float(value) > 0.0
+    return (
+        isinstance(value, int | float)
+        and math.isfinite(float(value))
+        and float(value) > 0.0
+    )
 
 
 def _indexed_qk_score_oracle_np(
@@ -149,7 +172,10 @@ def _indexed_qk_score_oracle_np(
                     kv_pos = int(indices_np[b, s, group, col])
                     if 0 <= kv_pos < kv_np.shape[1]:
                         scores[b, s, h, col] = float(
-                            np.dot(q_np[b, s, h, :k_dim], kv_np[b, kv_pos, group, :k_dim]) * sm_scale
+                            np.dot(
+                                q_np[b, s, h, :k_dim], kv_np[b, kv_pos, group, :k_dim]
+                            )
+                            * sm_scale
                         )
     return scores
 
@@ -204,12 +230,20 @@ def test_fp8_sparse_mla_path_c_status_reports_dispatchable_qk_reducer() -> None:
     assert _feature_int(status.features, "B_scale_refs") >= 1
     assert _feature_int(status.features, "scalar_fp8_byte_decode_calls") == 0
     assert _feature_int(status.features, "metal_fp8_dot4_helper") >= 1
-    assert _feature_int(status.features, "legacy_fp8_scaled_matmul_probe_simdgroup_multiply_accumulate") == 0
+    assert (
+        _feature_int(
+            status.features,
+            "legacy_fp8_scaled_matmul_probe_simdgroup_multiply_accumulate",
+        )
+        == 0
+    )
     assert status.features["legacy_fp8_scaled_matmul_probe_float_a_val"] is False
     assert status.features["legacy_fp8_scaled_matmul_probe_float_b_val"] is False
 
 
-def test_fp8_sparse_mla_path_c_legacy_scaled_matmul_probe_visible_and_fail_closed() -> None:
+def test_fp8_sparse_mla_path_c_legacy_scaled_matmul_probe_visible_and_fail_closed() -> (
+    None
+):
     status = fp8_sparse_mla_qk_scaled_matmul_probe_status()
     assert isinstance(status, SparseMLAFp8PathCStatus)
     assert status.m == 1
@@ -231,7 +265,9 @@ def test_fp8_sparse_mla_path_c_scale_semantics_fail_closed() -> None:
     if not status.features:
         assert status.available is False
         return
-    scale_refs_present = bool(status.features["A_scale_refs"]) and bool(status.features["B_scale_refs"])
+    scale_refs_present = bool(status.features["A_scale_refs"]) and bool(
+        status.features["B_scale_refs"]
+    )
     scale_signature_present = bool(status.features["signature_has_A_scale"]) and bool(
         status.features["signature_has_B_scale"]
     )
@@ -239,7 +275,9 @@ def test_fp8_sparse_mla_path_c_scale_semantics_fail_closed() -> None:
         assert scale_refs_present and scale_signature_present
         assert _feature_int(status.features, "scalar_fp8_byte_decode_calls") == 0
     else:
-        assert (scale_refs_present and scale_signature_present) or "scale operands disappeared" in status.reason
+        assert (
+            scale_refs_present and scale_signature_present
+        ) or "scale operands disappeared" in status.reason
 
 
 def test_fp8_sparse_mla_path_c_square_control_lowers_to_scale_aware_fast_path() -> None:
@@ -264,7 +302,9 @@ def test_fp8_sparse_mla_path_c_square_control_lowers_to_scale_aware_fast_path() 
 
 
 def test_fp8_sparse_mla_path_c_lowered_features_are_reported() -> None:
-    msl = lower_fp8_sparse_mla_qk_msl(M=32, N=32, K=64, BM=32, BN=32, BK=64, b_scale_size=32)
+    msl = lower_fp8_sparse_mla_qk_msl(
+        M=32, N=32, K=64, BM=32, BN=32, BK=64, b_scale_size=32
+    )
     features = fp8_sparse_mla_qk_msl_features(msl)
     assert _feature_int(features, "kernel_void") >= 1
     assert _feature_int(features, "fp8_e4m3_decode_helper") >= 1
@@ -287,6 +327,9 @@ def test_fp8_sparse_mla_path_c_qk_reduce_status_reports_available() -> None:
         assert status.features["signature_has_B_scale"] is True
         assert _feature_int(status.features, "A_scale_refs") >= 1
         assert _feature_int(status.features, "B_scale_refs") >= 1
+        assert status.features["sync_plan_strategy"] == "simdgroup_async"
+        assert status.features["sync_plan_barrier_count"] == 0
+        assert status.features["sync_plan_reduction_isolated"] is True
     else:
         assert status.available is False
 
@@ -302,8 +345,18 @@ def test_fp8_sparse_mla_path_c_qk_reduce_status_preserves_explicit_schedule() ->
     assert status.outputs_per_block == 4
     assert status.reduce_threads == 4
     assert status.vec == 4
+    plan = fp8_sparse_mla_qk_reduce_sync_plan(
+        N=16,
+        K=64,
+        outputs_per_block=4,
+        reduce_threads=4,
+        vec=4,
+    )
+    assert plan.strategy == "threadgroup_sync"
     if mx.metal.is_available():
         assert status.available is True
+        assert status.features["sync_plan_strategy"] == "threadgroup_sync"
+        assert _feature_int(status.features, "sync_plan_barrier_count") >= 1
     else:
         assert status.available is False
 
@@ -331,7 +384,9 @@ def test_fp8_sparse_mla_path_c_qk_reduce_lowered_features_are_reported() -> None
 
 
 def test_fp8_sparse_mla_path_c_qk_reduce_matches_dequant_oracle() -> None:
-    q, kv, _indices, _d_v = _make_inputs(seq_len=16, heads=2, qk_dim=64, topk=16, scale=0.1)
+    q, kv, _indices, _d_v = _make_inputs(
+        seq_len=16, heads=2, qk_dim=64, topk=16, scale=0.1
+    )
     q_fp8, q_scale = _to_fp8_with_per_tensor_scale(q)
     kv_fp8, kv_scale = _to_fp8_with_per_tensor_scale(kv)
     mx.eval(q_fp8, q_scale, kv_fp8, kv_scale)
@@ -347,7 +402,11 @@ def test_fp8_sparse_mla_path_c_qk_reduce_matches_dequant_oracle() -> None:
         mx.from_fp8(A_fp8, dtype=mx.float32),
         mx.swapaxes(mx.from_fp8(B_fp8, dtype=mx.float32), 0, 1),
     )
-    oracle = oracle * A_scale.reshape((1, 1)).astype(mx.float32) * B_scale.reshape((1, 16)).astype(mx.float32)
+    oracle = (
+        oracle
+        * A_scale.reshape((1, 1)).astype(mx.float32)
+        * B_scale.reshape((1, 16)).astype(mx.float32)
+    )
     mx.eval(out, oracle)
     np.testing.assert_allclose(
         np.asarray(out).astype(np.float32),
@@ -358,7 +417,9 @@ def test_fp8_sparse_mla_path_c_qk_reduce_matches_dequant_oracle() -> None:
 
 
 def test_fp8_sparse_mla_path_c_qk_reduce_supports_scalar_b_scale_broadcast() -> None:
-    q, kv, _indices, _d_v = _make_inputs(seq_len=16, heads=2, qk_dim=64, topk=16, scale=0.1, seed=11)
+    q, kv, _indices, _d_v = _make_inputs(
+        seq_len=16, heads=2, qk_dim=64, topk=16, scale=0.1, seed=11
+    )
     q_fp8, q_scale = _to_fp8_with_per_tensor_scale(q)
     kv_fp8, kv_scale = _to_fp8_with_per_tensor_scale(kv)
     mx.eval(q_fp8, q_scale, kv_fp8, kv_scale)
@@ -374,7 +435,11 @@ def test_fp8_sparse_mla_path_c_qk_reduce_supports_scalar_b_scale_broadcast() -> 
         mx.from_fp8(A_fp8, dtype=mx.float32),
         mx.swapaxes(mx.from_fp8(B_fp8, dtype=mx.float32), 0, 1),
     )
-    oracle = oracle * A_scale.reshape((1, 1)).astype(mx.float32) * B_scale_scalar.reshape((1, 1)).astype(mx.float32)
+    oracle = (
+        oracle
+        * A_scale.reshape((1, 1)).astype(mx.float32)
+        * B_scale_scalar.reshape((1, 1)).astype(mx.float32)
+    )
     path_b = fp8_scaled_vecmat(
         A_fp8.reshape((64,)),
         B_fp8,
@@ -435,7 +500,9 @@ def test_fp8_sparse_mla_path_c_indexed_qk_reduce_status_and_features() -> None:
     assert _feature_int(status.features, "metal_fp8_dot4_helper") >= 1
 
 
-def test_fp8_sparse_mla_path_c_indexed_qk_reduce_status_tunes_default_topk16_schedule() -> None:
+def test_fp8_sparse_mla_path_c_indexed_qk_reduce_status_tunes_default_topk16_schedule() -> (
+    None
+):
     status = fp8_sparse_mla_indexed_qk_reduce_path_c_status(
         batch=1,
         seq_len=1,
@@ -454,7 +521,9 @@ def test_fp8_sparse_mla_path_c_indexed_qk_reduce_status_tunes_default_topk16_sch
         assert status.available is False
 
 
-def test_fp8_sparse_mla_path_c_indexed_qk_reduce_lowered_features_are_reported() -> None:
+def test_fp8_sparse_mla_path_c_indexed_qk_reduce_lowered_features_are_reported() -> (
+    None
+):
     status = fp8_sparse_mla_indexed_qk_reduce_path_c_status(
         batch=1,
         seq_len=2,
@@ -500,7 +569,9 @@ def test_fp8_sparse_mla_path_c_indexed_qk_reduce_lowered_features_are_reported()
     ) >= 1
 
 
-def test_fp8_sparse_mla_path_c_indexed_qk_reduce_matches_path_b_index_contract() -> None:
+def test_fp8_sparse_mla_path_c_indexed_qk_reduce_matches_path_b_index_contract() -> (
+    None
+):
     status = fp8_sparse_mla_indexed_qk_reduce_path_c_status(
         batch=1,
         seq_len=4,
@@ -516,7 +587,9 @@ def test_fp8_sparse_mla_path_c_indexed_qk_reduce_matches_path_b_index_contract()
     if not status.available:
         pytest.skip(status.reason)
 
-    q, kv, indices, _d_v = _make_inputs(seq_len=4, heads=2, qk_dim=64, topk=4, scale=0.1, seed=21)
+    q, kv, indices, _d_v = _make_inputs(
+        seq_len=4, heads=2, qk_dim=64, topk=4, scale=0.1, seed=21
+    )
     q_fp8, q_scale = _to_fp8_with_per_tensor_scale(q)
     kv_fp8, kv_scale = _to_fp8_with_per_tensor_scale(kv)
     sm_scale = 0.125
@@ -536,7 +609,9 @@ def test_fp8_sparse_mla_path_c_indexed_qk_reduce_matches_path_b_index_contract()
     assert out is not None
     mx.eval(out)
 
-    oracle = _indexed_qk_score_oracle_np(q_fp8, q_scale, kv_fp8, kv_scale, indices, sm_scale=sm_scale)
+    oracle = _indexed_qk_score_oracle_np(
+        q_fp8, q_scale, kv_fp8, kv_scale, indices, sm_scale=sm_scale
+    )
     actual = np.asarray(out).astype(np.float32)
     indices_np = np.asarray(indices).astype(np.int32)
     head_kv = actual.shape[2] // indices_np.shape[2]
@@ -562,7 +637,9 @@ def test_fp8_sparse_mla_path_c_indexed_qk_reduce_masks_oob_indices() -> None:
     if not status.available:
         pytest.skip(status.reason)
 
-    q, kv, indices, _d_v = _make_inputs(seq_len=4, heads=2, qk_dim=64, topk=4, scale=0.1, seed=23)
+    q, kv, indices, _d_v = _make_inputs(
+        seq_len=4, heads=2, qk_dim=64, topk=4, scale=0.1, seed=23
+    )
     indices_np = np.asarray(indices).astype(np.int32)
     indices_np[0, 0, 0, 1] = 99
     indices = mx.array(indices_np, dtype=mx.int32)
@@ -585,11 +662,15 @@ def test_fp8_sparse_mla_path_c_indexed_qk_reduce_masks_oob_indices() -> None:
     assert out is not None
     mx.eval(out)
 
-    oracle = _indexed_qk_score_oracle_np(q_fp8, q_scale, kv_fp8, kv_scale, indices, sm_scale=sm_scale)
+    oracle = _indexed_qk_score_oracle_np(
+        q_fp8, q_scale, kv_fp8, kv_scale, indices, sm_scale=sm_scale
+    )
     actual = np.asarray(out).astype(np.float32)
     indices_np = np.asarray(indices).astype(np.int32)
     head_kv = actual.shape[2] // indices_np.shape[2]
-    invalid = np.repeat((indices_np < 0) | (indices_np >= kv.shape[1]), repeats=head_kv, axis=2)
+    invalid = np.repeat(
+        (indices_np < 0) | (indices_np >= kv.shape[1]), repeats=head_kv, axis=2
+    )
     assert invalid.shape == actual.shape
     assert np.all(actual[invalid] <= -3.0e38)
     np.testing.assert_allclose(actual[~invalid], oracle[~invalid], rtol=1e-5, atol=1e-5)
@@ -617,9 +698,13 @@ def test_fp8_sparse_mla_bench_strict_gate_enforces_path_c_perf_and_parity() -> N
     assert bench._strict_failures(payload, max_abs_err=1e-5, max_ratio=1.0) == []
 
     payload["ratios"]["path_c_qk_reduce_over_path_b_qk_vecmat"] = 1.01
-    payload["parity"]["path_c_indexed_qk_reduce_vs_oracle"]["invalid_mismatch_count"] = 1
+    payload["parity"]["path_c_indexed_qk_reduce_vs_oracle"][
+        "invalid_mismatch_count"
+    ] = 1
     failures = bench._strict_failures(payload, max_abs_err=1e-5, max_ratio=1.0)
-    assert any("path_c_qk_reduce_over_path_b_qk_vecmat" in failure for failure in failures)
+    assert any(
+        "path_c_qk_reduce_over_path_b_qk_vecmat" in failure for failure in failures
+    )
     assert any("invalid_mismatch_count=1" in failure for failure in failures)
 
 
@@ -673,7 +758,9 @@ def test_fp8_sparse_mla_full_dispatch_gate_rejects_reducer_only_e8m0_status() ->
     ]
 
 
-def test_fp8_sparse_mla_full_dispatch_gate_requires_full_fwd_bwd_available_flag() -> None:
+def test_fp8_sparse_mla_full_dispatch_gate_requires_full_fwd_bwd_available_flag() -> (
+    None
+):
     bench = _load_fp8_bench_module()
     payload = {
         "path_c_tilelang_qk_status": {
@@ -694,7 +781,12 @@ def test_fp8_sparse_mla_full_dispatch_gate_requires_full_fwd_bwd_available_flag(
 
 
 def test_fp8_sparse_mla_checked_receipt_keeps_path_c_qk_claims_honest() -> None:
-    receipt_path = Path(__file__).resolve().parents[1] / "bench" / "tilelang_ports" / "sparse_mla_fp8.json"
+    receipt_path = (
+        Path(__file__).resolve().parents[1]
+        / "bench"
+        / "tilelang_ports"
+        / "sparse_mla_fp8.json"
+    )
     payload = json.loads(receipt_path.read_text())
 
     assert payload["shape"]["q_shape"] == [1, 64, 4, 64]
@@ -720,7 +812,9 @@ def test_fp8_sparse_mla_checked_receipt_keeps_path_c_qk_claims_honest() -> None:
     assert dispatch_status["features"]["dispatch_surface"] == "qk_reduce"
     assert dispatch_status["features"].get("full_fwd_bwd_available") is not True
     assert dispatch_status["features"]["runnable_qk_reduce_available"] is True
-    assert dispatch_status["features"]["legacy_fp8_scaled_matmul_probe_available"] is False
+    assert (
+        dispatch_status["features"]["legacy_fp8_scaled_matmul_probe_available"] is False
+    )
     assert scaled_matmul_probe["available"] is False
     assert scaled_matmul_probe["m"] == 1
     assert scaled_matmul_probe["n"] == 16
@@ -764,6 +858,33 @@ def test_fp8_bwd_metal_returns_outputs() -> None:
     mx.eval(dq, dkv)
     assert tuple(dq.shape) == tuple(q.shape)
     assert tuple(dkv.shape) == tuple(kv.shape)
+
+
+def test_fp8_path_c_bwd_returns_outputs_over_prepared_buffers() -> None:
+    q, kv, indices, d_v = _make_inputs(scale=0.1)
+    q_fp8, q_scale = _to_fp8_with_per_token_scale(q)
+    kv_fp8, kv_scale = _to_fp8_with_per_token_scale(kv)
+    d_out = mx.zeros(tuple(q.shape[:3]) + (d_v,), dtype=mx.float32)
+
+    grads = sparse_mla_fp8_bwd_path_c(
+        q_fp8,
+        q_scale,
+        kv_fp8,
+        kv_scale,
+        d_out,
+        indices,
+        sm_scale=q.shape[-1] ** -0.5,
+        d_v=d_v,
+        force_path_c=True,
+    )
+
+    assert grads is not None
+    dq, dkv = grads
+    mx.eval(dq, dkv)
+    assert tuple(dq.shape) == tuple(q.shape)
+    assert tuple(dkv.shape) == tuple(kv.shape)
+    assert np.all(np.isfinite(np.asarray(dq)))
+    assert np.all(np.isfinite(np.asarray(dkv)))
 
 
 def test_fp8_apply_force_metal_dispatches_kernel() -> None:
@@ -840,7 +961,9 @@ def test_fp8_path_b_backward_parity() -> None:
     q, kv, indices, d_v = _make_inputs(scale=0.1)
 
     rng = np.random.default_rng(31)
-    d_out = mx.array((rng.standard_normal(tuple(q.shape[:3]) + (d_v,)) * 0.1).astype(np.float32))
+    d_out = mx.array(
+        (rng.standard_normal(tuple(q.shape[:3]) + (d_v,)) * 0.1).astype(np.float32)
+    )
 
     grads = sparse_mla_fp8_bwd_metal(q, kv, d_out, indices, d_v=d_v)
     assert grads is not None
@@ -866,6 +989,137 @@ def test_fp8_path_b_backward_parity() -> None:
         rtol=1e-2,
         atol=5e-3,
     )
+
+
+def test_fp8_path_c_backward_parity_against_prepared_dequant_reference() -> None:
+    """TileLang Path C FP8 backward must match the prepared-buffer semantics."""
+
+    q, kv, indices, d_v = _make_inputs(scale=0.1)
+    q_fp8, q_scale = _to_fp8_with_per_token_scale(q)
+    kv_fp8, kv_scale = _to_fp8_with_per_token_scale(kv)
+
+    rng = np.random.default_rng(117)
+    d_out = mx.array(
+        (rng.standard_normal(tuple(q.shape[:3]) + (d_v,)) * 0.1).astype(np.float32)
+    )
+
+    grads = sparse_mla_fp8_bwd_path_c(
+        q_fp8,
+        q_scale,
+        kv_fp8,
+        kv_scale,
+        d_out,
+        indices,
+        sm_scale=q.shape[-1] ** -0.5,
+        d_v=d_v,
+        force_path_c=True,
+    )
+    assert grads is not None
+    dq_path_c, dkv_path_c = grads
+    mx.eval(dq_path_c, dkv_path_c)
+
+    q_rec = mx.from_fp8(q_fp8, dtype=mx.float32) * q_scale[..., None]
+    kv_rec = mx.from_fp8(kv_fp8, dtype=mx.float32) * kv_scale[..., None]
+    mx.eval(q_rec, kv_rec)
+
+    def loss(q_in: mx.array, kv_in: mx.array) -> mx.array:
+        out = _array_only(sparse_mla_attention_reference(q_in, kv_in, indices, d_v=d_v))
+        return mx.sum(out * d_out)
+
+    dq_ref, dkv_ref = mx.grad(loss, argnums=(0, 1))(q_rec, kv_rec)
+    mx.eval(dq_ref, dkv_ref)
+
+    np.testing.assert_allclose(
+        np.asarray(dq_path_c).astype(np.float32),
+        np.asarray(dq_ref).astype(np.float32),
+        rtol=1e-2,
+        atol=5e-3,
+    )
+    np.testing.assert_allclose(
+        np.asarray(dkv_path_c).astype(np.float32),
+        np.asarray(dkv_ref).astype(np.float32),
+        rtol=1e-2,
+        atol=5e-3,
+    )
+
+
+def test_fp8_per_token_quant_producer_uses_single_metal_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not mx.metal.is_available():
+        pytest.skip("requires MLX Metal")
+
+    q, _kv, _indices, _d_v = _make_inputs(scale=0.1)
+
+    def fail_to_fp8(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError(
+            "producer must not materialize scaled tensor via mx.to_fp8"
+        )
+
+    monkeypatch.setattr(mx, "to_fp8", fail_to_fp8)
+
+    q_fp8, q_scale = _to_fp8_with_per_token_scale(q)
+    mx.eval(q_fp8, q_scale)
+
+    assert q_fp8.dtype == mx.uint8
+    assert q_scale.dtype == mx.float32
+    assert tuple(q_fp8.shape) == tuple(q.shape)
+    assert tuple(q_scale.shape) == tuple(q.shape[:-1])
+    assert np.all(np.isfinite(np.asarray(q_scale)))
+
+
+def test_fp8_per_token_quant_producer_has_no_scaled_tensor_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c as path_c_module
+
+    q, _kv, _indices, _d_v = _make_inputs(scale=0.1)
+
+    def fail_to_fp8(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("producer fallback must not call mx.to_fp8")
+
+    monkeypatch.setattr(mx, "to_fp8", fail_to_fp8)
+    monkeypatch.setattr(
+        path_c_module, "_to_fp8_with_per_token_scale_metal", lambda x: None
+    )
+
+    with pytest.raises(
+        RuntimeError, match="must not materialize a full-size scaled tensor"
+    ):
+        _to_fp8_with_per_token_scale(q)
+
+
+def test_fp8_path_c_backward_accepts_bf16_dout_without_host_cast() -> None:
+    q, kv, indices, d_v = _make_inputs(scale=0.1)
+    q_fp8, q_scale = _to_fp8_with_per_token_scale(q)
+    kv_fp8, kv_scale = _to_fp8_with_per_token_scale(kv)
+
+    rng = np.random.default_rng(119)
+    d_out = mx.array(
+        (rng.standard_normal(tuple(q.shape[:3]) + (d_v,)) * 0.1).astype(np.float32)
+    ).astype(mx.bfloat16)
+
+    grads = sparse_mla_fp8_bwd_path_c(
+        q_fp8,
+        q_scale,
+        kv_fp8,
+        kv_scale,
+        d_out,
+        indices,
+        sm_scale=q.shape[-1] ** -0.5,
+        d_v=d_v,
+        force_path_c=True,
+    )
+    assert grads is not None
+    dq_path_c, dkv_path_c = grads
+    mx.eval(dq_path_c, dkv_path_c)
+
+    assert dq_path_c.dtype == mx.float32
+    assert dkv_path_c.dtype == mx.float32
+    assert np.all(np.isfinite(np.asarray(dq_path_c)))
+    assert np.all(np.isfinite(np.asarray(dkv_path_c)))
 
 
 def test_fp8_reference_matches_bf16_within_fp8_tolerance() -> None:
@@ -937,7 +1191,9 @@ def test_fp8_reference_backward_matches_bf16_over_recovered_inputs() -> None:
         return mx.sum(out * out)
 
     def bf16_loss_on_recovered(q_in, kv_in):
-        out = _array_only(sparse_mla_attention_reference(q_in, kv_in, indices_bound, d_v=d_v))
+        out = _array_only(
+            sparse_mla_attention_reference(q_in, kv_in, indices_bound, d_v=d_v)
+        )
         return mx.sum(out * out)
 
     fp8_grad = mx.grad(fp8_loss, argnums=(0, 1))(q, kv)
@@ -971,6 +1227,91 @@ def test_fp8_reference_backward_through_apply_finite() -> None:
     for g in grads:
         g_np = np.asarray(g)
         assert np.all(np.isfinite(g_np)), "apply backward grads must be finite"
+
+
+def test_fp8_path_c_float_wrapper_refuses_hidden_quantization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c as path_c_module
+
+    q, kv, indices, d_v = _make_inputs(scale=0.1)
+
+    def fail_quantize(x: mx.array) -> tuple[mx.array, mx.array]:
+        raise AssertionError(f"unexpected wrapper quantization for {tuple(x.shape)}")
+
+    monkeypatch.setattr(path_c_module, "_to_fp8_with_per_token_scale", fail_quantize)
+
+    with pytest.raises(RuntimeError, match="requires prepared FP8 buffers"):
+        sparse_mla_fp8_path_c_apply_from_float(
+            q,
+            kv,
+            indices,
+            sm_scale=q.shape[-1] ** -0.5,
+            d_v=d_v,
+            force_path_c=True,
+        )
+
+
+def test_fp8_path_c_prepared_float_wrapper_does_not_quantize(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c as path_c_module
+
+    q, kv, indices, d_v = _make_inputs(scale=0.1)
+    q_fp8 = mx.zeros(tuple(q.shape), dtype=mx.uint8)
+    kv_fp8 = mx.zeros(tuple(kv.shape), dtype=mx.uint8)
+    q_scale = mx.ones(tuple(q.shape[:-1]), dtype=mx.float32)
+    kv_scale = mx.ones(tuple(kv.shape[:-1]), dtype=mx.float32)
+    calls: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
+
+    def fail_quantize(x: mx.array) -> tuple[mx.array, mx.array]:
+        raise AssertionError(f"unexpected wrapper quantization for {tuple(x.shape)}")
+
+    def fake_apply(
+        q_fp8_in: mx.array,
+        q_scale_in: mx.array,
+        kv_fp8_in: mx.array,
+        kv_scale_in: mx.array,
+        indices_in: mx.array,
+        *,
+        sm_scale: float,
+        d_v: int | None = None,
+        sinks: mx.array | None = None,
+        return_lse: bool = False,
+        force_path_c: bool = False,
+    ) -> mx.array:
+        del q_scale_in, kv_scale_in, indices_in, sm_scale, sinks, return_lse
+        assert force_path_c is True
+        calls.append((tuple(q_fp8_in.shape), tuple(kv_fp8_in.shape)))
+        return mx.zeros(
+            (
+                q_fp8_in.shape[0],
+                q_fp8_in.shape[1],
+                q_fp8_in.shape[2],
+                d_v or q_fp8_in.shape[-1],
+            ),
+            dtype=mx.float16,
+        )
+
+    monkeypatch.setattr(path_c_module, "_to_fp8_with_per_token_scale", fail_quantize)
+    monkeypatch.setattr(path_c_module, "sparse_mla_fp8_path_c_apply", fake_apply)
+
+    out = sparse_mla_fp8_path_c_apply_prepared_float(
+        q,
+        kv,
+        q_fp8,
+        q_scale,
+        kv_fp8,
+        kv_scale,
+        indices,
+        sm_scale=q.shape[-1] ** -0.5,
+        d_v=d_v,
+        force_path_c=True,
+    )
+    mx.eval(out)
+
+    assert calls == [(tuple(q.shape), tuple(kv.shape))]
+    assert tuple(out.shape) == tuple(q.shape[:3]) + (d_v,)
 
 
 # ---------------------------------------------------------------------------

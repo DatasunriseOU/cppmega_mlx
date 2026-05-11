@@ -107,7 +107,9 @@ def load_json_result(result: subprocess.CompletedProcess[str]) -> dict[str, Any]
     return payload
 
 
-def copy_real_parquet_head(source_path: Path, sample_path: Path, *, row_count: int = 4) -> None:
+def copy_real_parquet_head(
+    source_path: Path, sample_path: Path, *, row_count: int = 4
+) -> None:
     pa = pytest.importorskip("pyarrow")
     pq = pytest.importorskip("pyarrow.parquet")
     parquet_file = pq.ParquetFile(source_path)
@@ -192,7 +194,9 @@ def assert_m04_receipt_contract(payload: dict[str, Any]) -> None:
     ):
         assert key in gate
     assert gate["real_parquet_source_identity"]["required_path"] == TARGET_PARQUET
-    assert payload["local_gb10_quarter_preflight"] == gate["local_gb10_quarter_preflight"]
+    assert (
+        payload["local_gb10_quarter_preflight"] == gate["local_gb10_quarter_preflight"]
+    )
     preflight = payload["local_gb10_quarter_preflight"]
     assert preflight["profile_name"] == "local_gb10_quarter"
     assert preflight["source"] == REQUIRED_MODEL_SOURCE
@@ -203,7 +207,10 @@ def assert_m04_receipt_contract(payload: dict[str, Any]) -> None:
     assert preflight["tokenizer_contract"]["expected_vocab_size"] == 65_536
     assert preflight["tokenizer_contract"]["blocker_id"] == "cppmega-mlx-t8f.1"
     assert preflight["tokenizer_contract"]["milestone"] == "M0.1"
-    assert "<FIM_INSTRUCTION>" in preflight["tokenizer_contract"]["required_special_tokens"]
+    assert (
+        "<FIM_INSTRUCTION>"
+        in preflight["tokenizer_contract"]["required_special_tokens"]
+    )
     assert "CODE_START" in preflight["tokenizer_contract"]["reason"]
     assert "M0.1 is closed" in preflight["tokenizer_contract"]["reason"]
     if payload["workload"]["probe_local_gb10_quarter_allocation"]:
@@ -262,8 +269,9 @@ def assert_m04_receipt_contract(payload: dict[str, Any]) -> None:
     assert optimizer_identity["master_moment_evidence"]["required_dtype"] == (
         REQUIRED_ADAMW_MASTER_MOMENT_DTYPE
     )
-    assert optimizer_identity["master_moment_dtype_ok"] is (
-        gate["fp32_adamw_master_moments_ok"]
+    assert (
+        optimizer_identity["master_moment_dtype_ok"]
+        is (gate["fp32_adamw_master_moments_ok"])
     )
     assert payload["workload"]["dtype"] == "bfloat16"
     model_payload = payload["model"]
@@ -284,16 +292,15 @@ def assert_m04_receipt_contract(payload: dict[str, Any]) -> None:
         assert model_payload["profile_matches_required"] is False
         assert model_payload["local_gb10_quarter_preflight"] == preflight
     assert payload["training"]["optimizer"]["name"] == "AdamW"
-    assert payload["training"]["optimizer"]["class"] == (
-        ADAMW_FP32_MOMENTS_CLASS
-    )
+    assert payload["training"]["optimizer"]["class"] == (ADAMW_FP32_MOMENTS_CLASS)
     assert payload["training"]["optimizer"]["base_class"] == ADAMW_BASE_CLASS
     assert payload["training"]["optimizer"]["adamw"] is True
     assert payload["training"]["optimizer"]["required_master_moment_dtype"] == (
         REQUIRED_ADAMW_MASTER_MOMENT_DTYPE
     )
-    assert payload["training"]["optimizer"]["master_moment_evidence"] == (
-        optimizer_identity["master_moment_evidence"]
+    assert (
+        payload["training"]["optimizer"]["master_moment_evidence"]
+        == (optimizer_identity["master_moment_evidence"])
     )
     grad_checkpoint_expected = bool(payload["workload"].get("grad_checkpoint", False))
     assert payload["training"]["grad_checkpoint"]["required"] is True
@@ -407,9 +414,62 @@ def test_synthetic_one_step_writes_finite_receipt(tmp_path: Path) -> None:
     assert payload["acceptance_gate"]["full_target_dataset_blocker"]
     assert payload["training"]["final_loss"] > 0
     assert payload["training"]["step_metrics"][0]["updated"] is True
+    interpretation = payload["timing"]["throughput_interpretation"]
+    assert interpretation["reported_tokens_per_second_kind"] == (
+        "loss_target_tokens_per_second"
+    )
+    assert interpretation["denominator"] == "sum(step_metrics[].ntokens)"
+    assert interpretation["input_tokens_per_step"] == 4
+    assert interpretation["nominal_target_tokens_per_step"] == 3
+    assert interpretation["measured_target_tokens_per_step"] == [3]
+    assert interpretation["workload_scope"] == "tiny_or_hybrid_smoke"
+    assert interpretation["production_shape"] is False
+    assert interpretation["excluded_from_step_timer"] == [
+        "dataset construction",
+        "next(batches) parquet/npz batch fetch",
+        "model allocation",
+        "optimizer initialization",
+        "receipt JSON serialization",
+        "post-step cache clear cadence",
+    ]
     assert payload["memory"]["peak_memory_bytes"] is None or (
         payload["memory"]["peak_memory_bytes"] >= 0
     )
+
+
+def test_throughput_interpretation_marks_short_local_gb10_sequence() -> None:
+    config = m04_train_step.TrainHybridTinyConfig(
+        model_profile="local_gb10_quarter",
+        data_format="parquet",
+        batch_size=1,
+        seq_len=1024,
+        steps=1,
+        dtype="bfloat16",
+        grad_checkpoint=True,
+    )
+    interpretation = m04_train_step.throughput_interpretation_payload(
+        config,
+        train_payload={"tokens_per_second": 480.0},
+        step_metrics=[
+            {
+                "ntokens": 1023,
+                "seconds": 2.0,
+                "tokens_per_second": 511.5,
+            }
+        ],
+        tokens_per_second_values=[511.5],
+    )
+
+    assert interpretation["workload_scope"] == "short_sequence_full_profile_smoke"
+    assert interpretation["production_seq_len"] == 4096
+    assert interpretation["production_shape"] is False
+    assert interpretation["input_tokens_per_step"] == 1024
+    assert interpretation["nominal_target_tokens_per_step"] == 1023
+    assert interpretation["total_input_tokens"] == 1024
+    assert interpretation["total_target_tokens"] == 1023
+    assert interpretation["input_tokens_per_second"] == 512.0
+    assert interpretation["target_tokens_per_second"] == 511.5
+    assert "underfills" in interpretation["warning"]
 
 
 def test_synthetic_grad_checkpoint_receipt_marks_gate_without_m0_4_claim(
@@ -435,7 +495,9 @@ def test_synthetic_grad_checkpoint_receipt_marks_gate_without_m0_4_claim(
     }.issubset(set(payload["acceptance_gate"]["full_local_gb10_quarter_gate_blockers"]))
 
 
-def test_require_loss_decrease_fails_single_step_but_writes_receipt(tmp_path: Path) -> None:
+def test_require_loss_decrease_fails_single_step_but_writes_receipt(
+    tmp_path: Path,
+) -> None:
     output = tmp_path / "m04_train_step.json"
     result = run_script(*tiny_args(output), "--require-loss-decrease")
 
@@ -557,13 +619,11 @@ def test_fp8_path_c_training_dtype_route_runs_mamba3_path_c_without_staging(
     assert surfaces["sparse_mla_fp8_path_c_apply"]["training_surface"] is False
     assert (
         "FP8 parameter/weight producers that create the required dtype/layout "
-        "before matmul kernel boundaries"
-        in route["missing_training_surfaces"]
+        "before matmul kernel boundaries" in route["missing_training_surfaces"]
     )
     assert (
         "absorbed MLA producer split for NoPE/RoPE KV layout and calibrated "
-        "separate K/V scale lifecycle"
-        in route["missing_training_surfaces"]
+        "separate K/V scale lifecycle" in route["missing_training_surfaces"]
     )
     assert route["higher_level_owner"]["current_m04_route_owner"].endswith(
         "HybridTinyLM -> Mamba3ReferenceBlock"
@@ -845,7 +905,9 @@ def test_local_gb10_quarter_training_routes_to_monkeypatchable_seam(
     assert payload["status"] == "blocked"
     assert payload["full_m0_4_acceptance_claim"] is False
     assert payload["blockers"][0]["type"] == "unit_test_route_called"
-    assert payload["blockers"][0]["reason"] == "unit-test local_gb10_quarter route called"
+    assert (
+        payload["blockers"][0]["reason"] == "unit-test local_gb10_quarter route called"
+    )
     assert payload["workload"]["model_profile"] == "local_gb10_quarter"
     assert payload["workload"]["grad_checkpoint"] is False
     assert payload["training"]["steps_completed"] == 0
@@ -915,9 +977,7 @@ def test_local_gb10_quarter_grad_checkpoint_routes_to_monkeypatchable_seam(
     assert payload["training"]["grad_checkpoint"]["observed_enabled"] is True
     assert payload["acceptance_gate"]["grad_checkpoint_expectation_ok"] is True
     assert payload["acceptance_gate"]["model_identity_ok"] is False
-    assert (
-        payload["acceptance_gate"]["full_local_gb10_quarter_gate_completed"] is False
-    )
+    assert payload["acceptance_gate"]["full_local_gb10_quarter_gate_completed"] is False
 
 
 def test_local_gb10_quarter_dry_run_with_allocation_probe_is_preflight_only(
@@ -934,7 +994,9 @@ def test_local_gb10_quarter_dry_run_with_allocation_probe_is_preflight_only(
     def fail_route(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
         raise AssertionError("training and dry-run routes must not be called")
 
-    monkeypatch.setattr(m04_train_step, "probe_local_gb10_quarter_allocation", fake_probe)
+    monkeypatch.setattr(
+        m04_train_step, "probe_local_gb10_quarter_allocation", fake_probe
+    )
     monkeypatch.setattr(m04_train_step, "dry_run_payload", fail_route)
     monkeypatch.setattr(m04_train_step, "train_hybrid_tiny", fail_route)
     args = m04_train_step.build_parser().parse_args(
@@ -975,7 +1037,9 @@ def test_local_gb10_allocation_probe_success_is_preflight_only(
     def fake_probe() -> dict[str, Any]:
         return canonical_allocation_probe()
 
-    monkeypatch.setattr(m04_train_step, "probe_local_gb10_quarter_allocation", fake_probe)
+    monkeypatch.setattr(
+        m04_train_step, "probe_local_gb10_quarter_allocation", fake_probe
+    )
     args = m04_train_step.build_parser().parse_args(
         [
             "--probe-local-gb10-quarter-allocation",
@@ -1019,7 +1083,9 @@ def test_local_gb10_allocation_probe_failure_fails_closed(
             error="synthetic allocation failure",
         )
 
-    monkeypatch.setattr(m04_train_step, "probe_local_gb10_quarter_allocation", fake_probe)
+    monkeypatch.setattr(
+        m04_train_step, "probe_local_gb10_quarter_allocation", fake_probe
+    )
     args = m04_train_step.build_parser().parse_args(
         [
             "--probe-local-gb10-quarter-allocation",
@@ -1040,8 +1106,9 @@ def test_local_gb10_allocation_probe_failure_fails_closed(
     assert preflight["blockers"] == ["allocation_ready"]
     assert gate["local_gb10_quarter_preflight_ok"] is False
     assert gate["full_local_gb10_quarter_gate_completed"] is False
-    assert "local_gb10_quarter_preflight_ok" in (
-        gate["full_local_gb10_quarter_gate_blockers"]
+    assert (
+        "local_gb10_quarter_preflight_ok"
+        in (gate["full_local_gb10_quarter_gate_blockers"])
     )
 
 
@@ -1558,9 +1625,17 @@ def test_acceptance_gate_fail_closes_on_fake_or_incomplete_evidence(
         {"allocation_probe": None},
         {"allocation_probe": canonical_allocation_probe(status="blocked")},
         {"allocation_probe": canonical_allocation_probe(allocation_ready=False)},
-        {"allocation_probe": canonical_allocation_probe(source="fake.local_gb10_quarter")},
+        {
+            "allocation_probe": canonical_allocation_probe(
+                source="fake.local_gb10_quarter"
+            )
+        },
         {"allocation_probe": canonical_allocation_probe(source=None)},
-        {"allocation_probe": canonical_allocation_probe(allocation_mode="caller_supplied_allocation_evidence")},
+        {
+            "allocation_probe": canonical_allocation_probe(
+                allocation_mode="caller_supplied_allocation_evidence"
+            )
+        },
         {"allocation_probe": canonical_allocation_probe(allocation_mode=None)},
         {"allocation_probe": canonical_allocation_probe(profile_name="HybridTinyLM")},
         {"allocation_probe": canonical_allocation_probe(model_class="FakeTinyLM")},
@@ -1568,7 +1643,11 @@ def test_acceptance_gate_fail_closes_on_fake_or_incomplete_evidence(
         {"allocation_probe": canonical_allocation_probe(eval_scope="forward_smoke")},
         {"allocation_probe": canonical_allocation_probe(forward_executed=True)},
         {"allocation_probe": canonical_allocation_probe(training_executed=True)},
-        {"allocation_probe": canonical_allocation_probe(geometry_matches_required=False)},
+        {
+            "allocation_probe": canonical_allocation_probe(
+                geometry_matches_required=False
+            )
+        },
         {
             "allocation_probe": canonical_allocation_probe(
                 required_geometry={**REQUIRED_MODEL_GEOMETRY, "hidden_size": 16}
@@ -1596,6 +1675,7 @@ def test_acceptance_gate_requires_canonical_allocation_probe(
 
     assert gate["local_gb10_quarter_preflight_ok"] is False
     assert gate["full_local_gb10_quarter_gate_completed"] is False
-    assert "local_gb10_quarter_preflight_ok" in (
-        gate["full_local_gb10_quarter_gate_blockers"]
+    assert (
+        "local_gb10_quarter_preflight_ok"
+        in (gate["full_local_gb10_quarter_gate_blockers"])
     )

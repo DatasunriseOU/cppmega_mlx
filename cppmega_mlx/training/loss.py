@@ -65,6 +65,7 @@ def next_token_cut_cross_entropy(
     batch: LMTokenBatch | Mapping[str, mx.array] | mx.array,
     *,
     chunk_rows: int = DEFAULT_CHUNK_ROWS,
+    eval_chunks: bool = True,
 ) -> tuple[mx.array, mx.array]:
     """Return masked next-token CE via the MLX-native chunked linear path.
 
@@ -99,6 +100,7 @@ def next_token_cut_cross_entropy(
         targets,
         reduction="none",
         chunk_rows=chunk_rows,
+        eval_chunks=eval_chunks,
     )
     mask = lm_batch.target_mask
     ntokens = mask.sum()
@@ -135,13 +137,17 @@ def next_token_cross_entropy_with_mtp(
             mtp_loss,
             loss_weight=cfg.loss_weight,
         )
-        return total_loss, ntokens, MTPLossMetrics(
-            next_token_loss=next_token_loss,
-            mtp_loss=mtp_loss,
-            total_loss=total_loss,
-            per_depth_losses=(),
-            depth_weights=depth_weights,
-            loss_weight=cfg.loss_weight,
+        return (
+            total_loss,
+            ntokens,
+            MTPLossMetrics(
+                next_token_loss=next_token_loss,
+                mtp_loss=mtp_loss,
+                total_loss=total_loss,
+                per_depth_losses=(),
+                depth_weights=depth_weights,
+                loss_weight=cfg.loss_weight,
+            ),
         )
 
     head = get_or_attach_mtp_head(model, config=cfg)
@@ -160,13 +166,17 @@ def next_token_cross_entropy_with_mtp(
         mtp_loss,
         loss_weight=cfg.loss_weight,
     )
-    return total_loss, ntokens, MTPLossMetrics(
-        next_token_loss=next_token_loss,
-        mtp_loss=mtp_loss,
-        total_loss=total_loss,
-        per_depth_losses=per_depth_losses,
-        depth_weights=depth_weights,
-        loss_weight=cfg.loss_weight,
+    return (
+        total_loss,
+        ntokens,
+        MTPLossMetrics(
+            next_token_loss=next_token_loss,
+            mtp_loss=mtp_loss,
+            total_loss=total_loss,
+            per_depth_losses=per_depth_losses,
+            depth_weights=depth_weights,
+            loss_weight=cfg.loss_weight,
+        ),
     )
 
 
@@ -197,12 +207,16 @@ def next_token_cross_entropy_with_stp(
         stp_loss,
         loss_weight=cfg.loss_weight,
     )
-    return total_loss, ntokens, STPLossMetrics(
-        next_token_loss=next_token_loss,
-        stp_loss=stp_loss,
-        total_loss=total_loss,
-        n_spans=cfg.n_spans,
-        loss_weight=cfg.loss_weight,
+    return (
+        total_loss,
+        ntokens,
+        STPLossMetrics(
+            next_token_loss=next_token_loss,
+            stp_loss=stp_loss,
+            total_loss=total_loss,
+            n_spans=cfg.n_spans,
+            loss_weight=cfg.loss_weight,
+        ),
     )
 
 
@@ -250,7 +264,9 @@ def _decoder_hidden_states_for_mtp(
     if not isinstance(token_embedding, nn.Embedding):
         raise TypeError("MTP loss requires model.token_embedding to be an nn.Embedding")
     if not isinstance(position_embedding, nn.Embedding):
-        raise TypeError("MTP loss requires model.position_embedding to be an nn.Embedding")
+        raise TypeError(
+            "MTP loss requires model.position_embedding to be an nn.Embedding"
+        )
     if not isinstance(layers, list):
         raise TypeError("MTP loss requires model.layers to be a list of decoder blocks")
     if not callable(norm):
@@ -310,13 +326,21 @@ def _structure_hidden_state_delta(
 
     if isinstance(structure_embedding, StructureEmbedding):
         structure_embeddings = structure_embedding(
-            structure_ids=batch.structure_ids[:, :-1] if batch.structure_ids is not None else None,
-            dep_levels=batch.dep_levels[:, :-1] if batch.dep_levels is not None else None,
-            ast_depth_ids=batch.ast_depth_ids[:, :-1] if batch.ast_depth_ids is not None else None,
+            structure_ids=batch.structure_ids[:, :-1]
+            if batch.structure_ids is not None
+            else None,
+            dep_levels=batch.dep_levels[:, :-1]
+            if batch.dep_levels is not None
+            else None,
+            ast_depth_ids=batch.ast_depth_ids[:, :-1]
+            if batch.ast_depth_ids is not None
+            else None,
             sibling_index_ids=batch.sibling_index_ids[:, :-1]
             if batch.sibling_index_ids is not None
             else None,
-            node_type_ids=batch.node_type_ids[:, :-1] if batch.node_type_ids is not None else None,
+            node_type_ids=batch.node_type_ids[:, :-1]
+            if batch.node_type_ids is not None
+            else None,
             target_dtype=hidden_dtype,
         )
         if structure_embeddings.ndim == 3:
@@ -390,11 +414,15 @@ def _validate_document_id_batch(
     if document_ids.ndim != 2:
         raise ValueError(f"{alias} must be shaped (B, S), got {document_ids.shape}")
     if document_ids.shape != tokens.shape:
-        raise ValueError(f"{alias} must match tokens shape {tokens.shape}, got {document_ids.shape}")
+        raise ValueError(
+            f"{alias} must match tokens shape {tokens.shape}, got {document_ids.shape}"
+        )
     _raise_if_negative_document_ids(document_ids, alias=alias)
 
 
-def _raise_if_negative_document_ids(document_ids: mx.array, *, alias: str = "document_ids") -> None:
+def _raise_if_negative_document_ids(
+    document_ids: mx.array, *, alias: str = "document_ids"
+) -> None:
     has_negative = mx.any(document_ids.astype(mx.int32) < 0)
     mx.eval(has_negative)
     if bool(has_negative.item()):

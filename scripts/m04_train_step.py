@@ -343,7 +343,9 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def config_from_args(args: argparse.Namespace, *, data_path: Path) -> TrainHybridTinyConfig:
+def config_from_args(
+    args: argparse.Namespace, *, data_path: Path
+) -> TrainHybridTinyConfig:
     return TrainHybridTinyConfig(
         npz_path=str(data_path),
         data_format=args.data_format,
@@ -404,7 +406,9 @@ def optimizer_variant_payload(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def fp8_path_c_route_requested(args: argparse.Namespace | TrainHybridTinyConfig) -> bool:
+def fp8_path_c_route_requested(
+    args: argparse.Namespace | TrainHybridTinyConfig,
+) -> bool:
     return str(getattr(args, "dtype", "")).strip().lower() == FP8_PATH_C_DTYPE
 
 
@@ -462,10 +466,7 @@ def fp8_path_c_kernel_policy(
         return
 
     ensure_tilelang_dev_env_for_path_c()
-    previous = {
-        key: os.environ.get(key)
-        for key in FP8_PATH_C_KERNEL_POLICY_ENV
-    }
+    previous = {key: os.environ.get(key) for key in FP8_PATH_C_KERNEL_POLICY_ENV}
     os.environ.update(FP8_PATH_C_KERNEL_POLICY_ENV)
     try:
         yield
@@ -500,7 +501,9 @@ def fp8_path_c_stdio_suppressed(
         os.close(saved_stderr_fd)
 
 
-def precision_route_payload(args: argparse.Namespace | TrainHybridTinyConfig) -> dict[str, Any]:
+def precision_route_payload(
+    args: argparse.Namespace | TrainHybridTinyConfig,
+) -> dict[str, Any]:
     if fp8_path_c_route_requested(args):
         return {
             "requested": FP8_PATH_C_DTYPE,
@@ -628,7 +631,9 @@ def fp8_path_c_training_route_payload(
     }
 
 
-def write_synthetic_npz(path: Path, *, steps: int, batch_size: int, seq_len: int, vocab_size: int) -> None:
+def write_synthetic_npz(
+    path: Path, *, steps: int, batch_size: int, seq_len: int, vocab_size: int
+) -> None:
     samples = max(batch_size * max(steps, 1), batch_size, 4)
     base = np.arange(seq_len, dtype=np.int32) % max(vocab_size, 2)
     tokens = np.tile(base.reshape(1, seq_len), (samples, 1))
@@ -711,12 +716,16 @@ def run_receipt(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     return _run_existing_training(args, data_path=data_path)
 
 
-def _run_existing_training(args: argparse.Namespace, *, data_path: Path) -> tuple[dict[str, Any], int]:
+def _run_existing_training(
+    args: argparse.Namespace, *, data_path: Path
+) -> tuple[dict[str, Any], int]:
     config = config_from_args(args, data_path=data_path)
     try:
         validate_config(config)
     except Exception as exc:
-        return blocked_receipt(args, str(exc), type(exc).__name__), 0 if args.dry_run_json else 2
+        return blocked_receipt(
+            args, str(exc), type(exc).__name__
+        ), 0 if args.dry_run_json else 2
     if config.model_profile == REQUIRED_MODEL_PROFILE:
         if args.dry_run_json:
             receipt = local_gb10_quarter_metadata_dry_run_receipt(
@@ -759,7 +768,9 @@ def _run_existing_training(args: argparse.Namespace, *, data_path: Path) -> tupl
                     valid_path=validation_dataset_path(config),
                 )
     except Exception as exc:
-        return blocked_receipt(args, str(exc), type(exc).__name__), 0 if args.dry_run_json else 2
+        return blocked_receipt(
+            args, str(exc), type(exc).__name__
+        ), 0 if args.dry_run_json else 2
     finally:
         mx.synchronize()
 
@@ -867,6 +878,7 @@ def run_local_gb10_quarter_training(
                 model_arg,
                 batch,
                 chunk_rows=config.cce_chunk_rows,
+                eval_chunks=not bool(compile_plan["enabled"]),
             )
 
         stepper = CompiledPretrainingStep(
@@ -882,7 +894,6 @@ def run_local_gb10_quarter_training(
         for _ in range(config.steps):
             metrics = stepper(next(batches))
             step_metrics.append(asdict(metrics))
-            mx.synchronize()
             clear_cache_event = maybe_clear_cache_after_step(
                 metrics.step,
                 config.clear_cache_every_steps,
@@ -1364,7 +1375,9 @@ def receipt_from_train_payload(
         if "tokens_per_second" in item
     ]
     all_finite = bool(losses) and all(math.isfinite(value) for value in losses)
-    optimizer_updated = bool(step_metrics) and all(bool(item.get("updated")) for item in step_metrics)
+    optimizer_updated = bool(step_metrics) and all(
+        bool(item.get("updated")) for item in step_metrics
+    )
     loss_decreased = bool(len(losses) >= 2 and losses[-1] < losses[0])
     status = "dry_run" if train_payload.get("status") == "dry_run" else "ok"
     dataset = train_payload.get("dataset", {})
@@ -1476,7 +1489,8 @@ def receipt_from_train_payload(
             "mean_loss": train_payload.get("mean_loss"),
             "loss_decreased": loss_decreased,
             "loss_decrease_required": bool(args.require_loss_decrease),
-            "loss_decrease_satisfied": (not args.require_loss_decrease) or loss_decreased,
+            "loss_decrease_satisfied": (not args.require_loss_decrease)
+            or loss_decreased,
             "trained_tokens": train_payload.get("trained_tokens"),
             "step_metrics": step_metrics,
             "kernel_dispatch": list(train_payload.get("kernel_dispatch") or []),
@@ -1488,6 +1502,12 @@ def receipt_from_train_payload(
             "tokens_per_second": statistics.fmean(tokens_per_second)
             if tokens_per_second
             else train_payload.get("tokens_per_second"),
+            "throughput_interpretation": throughput_interpretation_payload(
+                config,
+                train_payload=train_payload,
+                step_metrics=step_metrics,
+                tokens_per_second_values=tokens_per_second,
+            ),
         },
         "memory": {
             "before": memory_before,
@@ -1503,9 +1523,7 @@ def receipt_from_train_payload(
             "clear_cache_event": clear_cache_events[-1] if clear_cache_events else None,
             "clear_cache_event_recorded": bool(clear_cache_events),
             "clear_cache_event_scope": (
-                "train_hybrid_tiny_step_loop"
-                if clear_cache_events
-                else None
+                "train_hybrid_tiny_step_loop" if clear_cache_events else None
             ),
             "trainer_memory": trainer_memory or None,
         },
@@ -1515,7 +1533,8 @@ def receipt_from_train_payload(
             "name": observed_model_name,
             "required_profile": REQUIRED_MODEL_PROFILE,
             "profile": observed_model_profile,
-            "profile_matches_required": observed_model_profile == REQUIRED_MODEL_PROFILE,
+            "profile_matches_required": observed_model_profile
+            == REQUIRED_MODEL_PROFILE,
             "local_gb10_quarter_preflight": local_gb10_preflight,
             "parameter_count": train_payload.get("parameter_count"),
             "route_symbols": train_payload.get("route_symbols"),
@@ -1613,7 +1632,9 @@ def _model_config_value(model_config: dict[str, Any], key: str) -> Any:
     return None
 
 
-def _model_geometry_matches(model_config: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+def _model_geometry_matches(
+    model_config: dict[str, Any],
+) -> tuple[bool, dict[str, Any]]:
     observed = {
         key: _model_config_value(model_config, key)
         for key in REQUIRED_MODEL_GEOMETRY
@@ -1667,7 +1688,9 @@ def local_gb10_quarter_preflight_payload(
     profile_geometry = _local_gb10_quarter_profile_geometry()
     geometry_matches_required = profile_geometry == REQUIRED_MODEL_GEOMETRY
     tokenizer_resolved = bool(tokenizer_contract.is_resolved)
-    resolved_allocation_ready = bool(allocation_ready) if allocation_ready is not None else False
+    resolved_allocation_ready = (
+        bool(allocation_ready) if allocation_ready is not None else False
+    )
     resolved_allocation_mode = allocation_mode
     if resolved_allocation_mode is None:
         resolved_allocation_mode = (
@@ -1834,7 +1857,8 @@ def optimizer_identity(
         "adamw_family": True,
         "quantized_state": False,
         "required_name": REQUIRED_OPTIMIZER_NAME,
-        "name_matches_required": OBSERVED_OPTIMIZER_IDENTITY["name"] == REQUIRED_OPTIMIZER_NAME,
+        "name_matches_required": OBSERVED_OPTIMIZER_IDENTITY["name"]
+        == REQUIRED_OPTIMIZER_NAME,
         "adamw": OBSERVED_OPTIMIZER_IDENTITY["name"] == "AdamW",
         "learning_rate": getattr(config, "learning_rate", getattr(config, "lr", None)),
         "weight_decay": getattr(config, "weight_decay", None),
@@ -2059,6 +2083,12 @@ def local_gb10_quarter_metadata_dry_run_receipt(
             "mean_step_time_s": None,
             "median_step_time_s": None,
             "tokens_per_second": None,
+            "throughput_interpretation": throughput_interpretation_payload(
+                config,
+                train_payload={},
+                step_metrics=[],
+                tokens_per_second_values=[],
+            ),
         },
         "memory": {
             "before": memory_snapshot,
@@ -2176,7 +2206,9 @@ def acceptance_gate_payload(
     if isinstance(model_config_payload.get("profile"), str):
         model_profile = str(model_config_payload["profile"])
     model_source_ok = model_source == REQUIRED_MODEL_SOURCE
-    model_geometry_ok, observed_model_geometry = _model_geometry_matches(model_config_payload)
+    model_geometry_ok, observed_model_geometry = _model_geometry_matches(
+        model_config_payload
+    )
     model_identity_ok = bool(
         model_name == REQUIRED_MODEL_PROFILE
         and model_source_ok
@@ -2206,8 +2238,10 @@ def acceptance_gate_payload(
         and preflight_allocation_probe.get("forward_executed") is False
         and preflight_allocation_probe.get("training_executed") is False
         and preflight_allocation_probe.get("geometry_matches_required") is True
-        and preflight_allocation_probe.get("required_geometry") == REQUIRED_MODEL_GEOMETRY
-        and preflight_allocation_probe.get("profile_geometry") == REQUIRED_MODEL_GEOMETRY
+        and preflight_allocation_probe.get("required_geometry")
+        == REQUIRED_MODEL_GEOMETRY
+        and preflight_allocation_probe.get("profile_geometry")
+        == REQUIRED_MODEL_GEOMETRY
         and preflight_payload.get("geometry_matches_required") is True
         and preflight_payload.get("required_geometry") == REQUIRED_MODEL_GEOMETRY
         and preflight_payload.get("profile_geometry") == REQUIRED_MODEL_GEOMETRY
@@ -2479,6 +2513,12 @@ def blocked_receipt(
             "mean_step_time_s": None,
             "median_step_time_s": None,
             "tokens_per_second": None,
+            "throughput_interpretation": throughput_interpretation_payload(
+                args,
+                train_payload={},
+                step_metrics=[],
+                tokens_per_second_values=[],
+            ),
         },
         "memory": {
             "before": metal_memory_payload(),
@@ -2522,6 +2562,130 @@ def baseline_row(
         "local_only": True,
         "gb10_parity_claim": False,
     }
+
+
+def throughput_interpretation_payload(
+    config: TrainHybridTinyConfig | argparse.Namespace,
+    *,
+    train_payload: dict[str, Any],
+    step_metrics: list[dict[str, Any]],
+    tokens_per_second_values: list[float],
+) -> dict[str, Any]:
+    """Explain what m04 token/sec does and does not measure."""
+
+    batch_size = int(getattr(config, "batch_size", 0) or 0)
+    seq_len = int(getattr(config, "seq_len", 0) or 0)
+    model_profile = str(getattr(config, "model_profile", ""))
+    synthetic = bool(getattr(config, "synthetic", False))
+    if not synthetic:
+        synthetic = bool(train_payload.get("synthetic_npz", False))
+    production_seq_len = int(local_gb10_quarter_profile().max_seq_length)
+    input_tokens_per_step = (
+        batch_size * seq_len if batch_size > 0 and seq_len > 0 else None
+    )
+    nominal_target_tokens_per_step = (
+        batch_size * max(seq_len - 1, 0) if batch_size > 0 and seq_len > 0 else None
+    )
+    measured_target_tokens = [
+        int(item["ntokens"])
+        for item in step_metrics
+        if isinstance(item, dict) and "ntokens" in item
+    ]
+    measured_seconds = [
+        float(item["seconds"])
+        for item in step_metrics
+        if isinstance(item, dict) and "seconds" in item
+    ]
+    total_measured_seconds = sum(measured_seconds)
+    total_target_tokens = sum(measured_target_tokens)
+    total_input_tokens = (
+        input_tokens_per_step * len(step_metrics)
+        if input_tokens_per_step is not None
+        else None
+    )
+    input_tokens_per_second = (
+        total_input_tokens / total_measured_seconds
+        if total_input_tokens is not None and total_measured_seconds > 0
+        else None
+    )
+    target_tokens_per_second = (
+        statistics.fmean(tokens_per_second_values)
+        if tokens_per_second_values
+        else train_payload.get("tokens_per_second")
+    )
+    if target_tokens_per_second is not None:
+        target_tokens_per_second = float(target_tokens_per_second)
+
+    production_shape = (
+        model_profile == REQUIRED_MODEL_PROFILE
+        and seq_len == production_seq_len
+        and not synthetic
+    )
+    if model_profile != REQUIRED_MODEL_PROFILE:
+        scope = "tiny_or_hybrid_smoke"
+        warning = (
+            "This is a tiny/hybrid training-plumbing smoke, not local_gb10_quarter "
+            "throughput evidence."
+        )
+    elif synthetic:
+        scope = "synthetic_full_profile_smoke"
+        warning = (
+            "This uses synthetic data; it can isolate model/optimizer cost but does "
+            "not prove target-parquet acceptance."
+        )
+    elif seq_len < production_seq_len:
+        scope = "short_sequence_full_profile_smoke"
+        warning = (
+            f"seq_len={seq_len} underfills the local_gb10_quarter production "
+            f"shape ({production_seq_len}); low tok/sec here is a short-sequence "
+            "latency smoke, not the 4k production throughput denominator."
+        )
+    else:
+        scope = "production_sequence_full_profile"
+        warning = None
+
+    return json_ready(
+        {
+            "reported_tokens_per_second_kind": "loss_target_tokens_per_second",
+            "denominator": "sum(step_metrics[].ntokens)",
+            "denominator_note": (
+                "ntokens is the number of next-token loss targets after shifting; "
+                "for an unmasked dense batch it is batch_size * (seq_len - 1)."
+            ),
+            "input_tokens_per_step": input_tokens_per_step,
+            "nominal_target_tokens_per_step": nominal_target_tokens_per_step,
+            "measured_target_tokens_per_step": measured_target_tokens,
+            "total_input_tokens": total_input_tokens,
+            "total_target_tokens": total_target_tokens,
+            "total_measured_seconds": (
+                total_measured_seconds if measured_seconds else None
+            ),
+            "input_tokens_per_second": input_tokens_per_second,
+            "target_tokens_per_second": target_tokens_per_second,
+            "timed_scope": (
+                "CompiledPretrainingStep.__call__: loss/value_and_grad, "
+                "optimizer.update, mx.eval(model.state, optimizer.state, "
+                "mx.random.state, loss, ntokens, grad_accum), and scalar "
+                "loss/ntokens materialization."
+            ),
+            "excluded_from_step_timer": [
+                "dataset construction",
+                "next(batches) parquet/npz batch fetch",
+                "model allocation",
+                "optimizer initialization",
+                "receipt JSON serialization",
+                "post-step cache clear cadence",
+            ],
+            "post_step_loop_synchronize": "not_needed_after_step_metrics_materialize",
+            "compile_first_call_included_when_compile_enabled": bool(
+                getattr(config, "compile", False)
+            ),
+            "production_seq_len": production_seq_len,
+            "production_shape": production_shape,
+            "workload_scope": scope,
+            "warning": warning,
+        }
+    )
 
 
 def reset_peak_memory() -> None:
@@ -2579,7 +2743,9 @@ def git_commit() -> str | None:
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
 
 
 def json_ready(value: Any) -> Any:

@@ -75,6 +75,7 @@ def _chunked_forward(
     *,
     chunk: int,
     reduction: str,
+    eval_chunks: bool,
 ) -> mx.array:
     """Chunked forward pass with per-chunk eval to bound peak memory."""
 
@@ -88,11 +89,13 @@ def _chunked_forward(
             logits, targets[start:stop], reduction="none"
         )
         if reduction == "none":
-            mx.eval(chunk_loss)
+            if eval_chunks:
+                mx.eval(chunk_loss)
             pieces.append(chunk_loss)
         else:
             chunk_scalar = chunk_loss.sum().astype(mx.float32)
-            mx.eval(chunk_scalar)
+            if eval_chunks:
+                mx.eval(chunk_scalar)
             pieces.append(chunk_scalar)
 
     if reduction == "none":
@@ -113,21 +116,28 @@ def linear_cross_entropy(
     *,
     chunk_rows: int = DEFAULT_CHUNK_ROWS,
     reduction: str = "mean",
+    eval_chunks: bool = True,
 ) -> mx.array:
     """Chunked forward equivalent of ``cross_entropy(e @ c.T, targets)``.
 
-    The forward pass evaluates each ``[chunk_rows, V]`` tile in isolation, so
-    forward peak memory tracks the chunk size rather than the full ``[N, V]``
-    logits tensor. ``mx.grad`` applied to this function still works but keeps
-    activations for every chunk live (MLX's autograd records the trace before
-    eval), so no backward memory savings; use
+    By default the forward pass evaluates each ``[chunk_rows, V]`` tile in
+    isolation, so forward peak memory tracks the chunk size rather than the
+    full ``[N, V]`` logits tensor. Set ``eval_chunks=False`` when calling from
+    ``mx.compile`` because MLX forbids explicit evaluation inside transformed
+    functions. ``mx.grad`` applied to this function still works but keeps
+    activations for every chunk live, so no backward memory savings; use
     :func:`linear_cross_entropy_value_and_grad` for chunked backward.
     """
 
     reduction = _validate_reduction(reduction)
     flat_e, flat_t, target_shape = _flatten_inputs(e, targets)
     loss = _chunked_forward(
-        flat_e, c, flat_t, chunk=chunk_rows, reduction=reduction
+        flat_e,
+        c,
+        flat_t,
+        chunk=chunk_rows,
+        reduction=reduction,
+        eval_chunks=eval_chunks,
     )
     if reduction == "none":
         return loss.reshape(target_shape)
@@ -170,9 +180,7 @@ def linear_cross_entropy_value_and_grad(
         t_chunk = flat_t[start:stop]
         logits = (e_chunk @ c.T).astype(mx.float32)
         lse = mx.logsumexp(logits, axis=-1)
-        gathered = mx.take_along_axis(
-            logits, t_chunk[:, None], axis=-1
-        ).squeeze(-1)
+        gathered = mx.take_along_axis(logits, t_chunk[:, None], axis=-1).squeeze(-1)
         total = total + (lse - gathered).sum()
 
         probs = mx.softmax(logits, axis=-1)

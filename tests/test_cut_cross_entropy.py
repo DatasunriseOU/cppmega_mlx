@@ -98,16 +98,30 @@ def test_chunked_forward_matches_materialized_fp32() -> None:
     assert math.isclose(_scalar(expected), _scalar(chunked), abs_tol=1e-6)
 
 
+def test_chunked_forward_can_run_inside_mx_compile_without_eval() -> None:
+    e, c, targets = _make_inputs(seed=21, batch=1, seq=4, hidden=8, vocab=16)
+    expected = linear_cross_entropy(e, c, targets, chunk_rows=2)
+
+    @mx.compile
+    def compiled_loss(e_arg: mx.array, c_arg: mx.array, t_arg: mx.array) -> mx.array:
+        return linear_cross_entropy(
+            e_arg,
+            c_arg,
+            t_arg,
+            chunk_rows=2,
+            eval_chunks=False,
+        )
+
+    actual = compiled_loss(e, c, targets)
+    assert math.isclose(_scalar(actual), _scalar(expected), abs_tol=1e-6)
+
+
 def test_chunked_forward_supports_sum_and_none_reductions() -> None:
     e, c, targets = _make_inputs()
     sum_expected = materialized_cross_entropy(e, c, targets, reduction="sum")
-    sum_chunked = linear_cross_entropy(
-        e, c, targets, chunk_rows=4, reduction="sum"
-    )
+    sum_chunked = linear_cross_entropy(e, c, targets, chunk_rows=4, reduction="sum")
     none_expected = materialized_cross_entropy(e, c, targets, reduction="none")
-    none_chunked = linear_cross_entropy(
-        e, c, targets, chunk_rows=4, reduction="none"
-    )
+    none_chunked = linear_cross_entropy(e, c, targets, chunk_rows=4, reduction="none")
     assert math.isclose(_scalar(sum_expected), _scalar(sum_chunked), abs_tol=1e-6)
     assert none_chunked.shape == none_expected.shape
     assert _max_abs(none_chunked, none_expected) < 1e-5
@@ -138,7 +152,9 @@ def test_eager_value_and_grad_matches_materialized_grad_fp32() -> None:
 def test_eager_value_and_grad_matches_materialized_grad_bf16() -> None:
     """At bf16 we accept rtol=1e-4 / atol=1e-3 on the gradients."""
 
-    e, c, targets = _make_inputs(dtype=mx.bfloat16, batch=1, seq=16, hidden=64, vocab=128)
+    e, c, targets = _make_inputs(
+        dtype=mx.bfloat16, batch=1, seq=16, hidden=64, vocab=128
+    )
 
     def loss_mat(e: mx.array, c: mx.array, targets: mx.array) -> mx.array:
         return materialized_cross_entropy(e, c, targets)
@@ -418,7 +434,9 @@ def test_next_token_cut_cross_entropy_uses_hybrid_decoder_checkpoint(
         return wrapped
 
     monkeypatch.setattr(mx, "checkpoint", checkpoint_spy)
-    loss, ntokens = next_token_cut_cross_entropy(model, _hybrid_tiny_batch(), chunk_rows=2)
+    loss, ntokens = next_token_cut_cross_entropy(
+        model, _hybrid_tiny_batch(), chunk_rows=2
+    )
     mx.eval(loss, ntokens)
 
     assert checkpointed_layers == list(model.layers)
@@ -444,7 +462,9 @@ def test_next_token_cut_cross_entropy_works_under_value_and_grad() -> None:
             mamba_chunk_size=4,
         )
     )
-    batch = LMTokenBatch(**{k: v for k, v in _hybrid_tiny_batch().items() if k != "document_ids"})
+    batch = LMTokenBatch(
+        **{k: v for k, v in _hybrid_tiny_batch().items() if k != "document_ids"}
+    )
 
     def loss_fn(model: HybridTinyLM, batch: LMTokenBatch) -> tuple[mx.array, mx.array]:
         return next_token_cut_cross_entropy(model, batch, chunk_rows=2)

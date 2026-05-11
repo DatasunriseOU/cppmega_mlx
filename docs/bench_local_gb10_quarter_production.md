@@ -104,6 +104,12 @@ parity reference.
 
 Caveats:
 
+- `scripts/m04_train_step.py` is a correctness receipt, not this throughput
+  sweep. Its `timing.tokens_per_second` denominator is loss target tokens
+  (`B * (S - 1)` for dense next-token batches), and short `seq_len` runs such
+  as 1024 or smaller are latency smokes that underfill the 4k production
+  shape. Do not compare those rows to the 4k sweep or the GB10 ~4000 tok/s
+  reference.
 - **Budget asymmetry — the M4 Max is running with ~70 GB removed by Docker.**
   The 58 GB cap forces B=1 on this M4 Max receipt; the historical 88 GB-cap
   receipt at this same model shape (when Docker was not present) fit larger
