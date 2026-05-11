@@ -45,6 +45,9 @@ from cppmega_mlx.nn._tilelang.mamba3 import (  # noqa: E402
     mamba3_mimo_metal_status,
 )
 from cppmega_mlx.nn._tilelang.mamba3_path_c import (  # noqa: E402
+    _mamba3_mimo_bwd_path_c_partials,
+    _mamba3_mimo_bwd_path_c_simd_kernel,
+    _reduce_mamba3_bwd_partials,
     dump_lowered_bwd_msl,
     dump_lowered_fwd_msl,
     mamba3_mimo_apply_path_c,
@@ -93,8 +96,7 @@ def _run_one(fn: Callable[[], Any]) -> float:
 
 def _bench(label: str, fn: Callable[[], Any], *, warmup: int, iters: int) -> dict[str, Any]:
     for _ in range(warmup):
-        fn()
-        mx.synchronize()
+        _run_one(fn)
     samples: list[float] = []
     for _ in range(iters):
         samples.append(_run_one(fn))
@@ -122,15 +124,11 @@ def _bench_pair(
 
     for i in range(warmup):
         if i % 2 == 0:
-            fn_a()
-            mx.synchronize()
-            fn_b()
-            mx.synchronize()
+            _run_one(fn_a)
+            _run_one(fn_b)
         else:
-            fn_b()
-            mx.synchronize()
-            fn_a()
-            mx.synchronize()
+            _run_one(fn_b)
+            _run_one(fn_a)
 
     samples_a: list[float] = []
     samples_b: list[float] = []
@@ -352,6 +350,49 @@ def main() -> int:
     _run_one(lambda: grad_pc(*inputs))
     peak_pc_fb = _peak_memory_bytes()
 
+    # ------------------------------------------------------------------
+    # Path C bwd profiler: split the TileLang reverse scan from partial
+    # reductions, and measure the simdgroup P-reduced kernel separately.
+    # ------------------------------------------------------------------
+    dy_profile = y_pc
+    mx.eval(dy_profile)
+    bwd_profile: dict[str, Any] = {}
+    try:
+        simd_bwd = _bench(
+            "bwd_path_c_simd_p_reduce",
+            lambda: _mamba3_mimo_bwd_path_c_simd_kernel(dy_profile, *inputs),
+            warmup=args.warmup,
+            iters=args.iters,
+        )
+        bwd_profile["simd_p_reduce_kernel"] = simd_bwd
+    except Exception as exc:
+        bwd_profile["simd_p_reduce_error"] = f"{type(exc).__name__}: {exc}"
+
+    try:
+        partials_once = _mamba3_mimo_bwd_path_c_partials(dy_profile, *inputs)
+        mx.eval(*partials_once)
+        partial_kernel = _bench(
+            "bwd_path_c_partial_kernel",
+            lambda: _mamba3_mimo_bwd_path_c_partials(dy_profile, *inputs),
+            warmup=args.warmup,
+            iters=args.iters,
+        )
+        partial_reduce = _bench(
+            "bwd_path_c_partial_reduce",
+            lambda: _reduce_mamba3_bwd_partials(partials_once),
+            warmup=args.warmup,
+            iters=args.iters,
+        )
+        bwd_profile["partial_kernel"] = partial_kernel
+        bwd_profile["partial_reduce"] = partial_reduce
+        total = partial_kernel["median_ms"] + partial_reduce["median_ms"]
+        bwd_profile["partial_reduce_share"] = _safe_ratio(
+            partial_reduce["median_ms"],
+            total,
+        )
+    except Exception as exc:
+        bwd_profile["partial_profile_error"] = f"{type(exc).__name__}: {exc}"
+
     # Derive bwd-only timings.
     bwd_pb_ms = max(0.0, fwd_bwd_pb["median_ms"] - fwd_pb["median_ms"])
     bwd_pc_ms = max(0.0, fwd_bwd_pc["median_ms"] - fwd_pc["median_ms"])
@@ -410,6 +451,21 @@ def main() -> int:
     if peak_pb_fb is not None and peak_pc_fb is not None:
         _row("fwd+bwd peak MB", peak_pb_fb / (1024 * 1024),
              peak_pc_fb / (1024 * 1024), fmt="{:.2f}", suffix=" MB")
+    if "simd_p_reduce_kernel" in bwd_profile:
+        simd = bwd_profile["simd_p_reduce_kernel"]
+        print(f"{'bwd C simd profile':22} {'':>14} {simd['median_ms']:>10.3f} ms {'':>11}")
+    if "partial_kernel" in bwd_profile and "partial_reduce" in bwd_profile:
+        partial_kernel = bwd_profile["partial_kernel"]
+        partial_reduce = bwd_profile["partial_reduce"]
+        print(
+            f"{'bwd C partial scan':22} {'':>14} "
+            f"{partial_kernel['median_ms']:>10.3f} ms {'':>11}"
+        )
+        print(
+            f"{'bwd C partial reduce':22} {'':>14} "
+            f"{partial_reduce['median_ms']:>10.3f} ms "
+            f"{bwd_profile['partial_reduce_share']:>10.3f}"
+        )
     print()
 
     # Recommendation logic from the task spec.
@@ -458,14 +514,16 @@ def main() -> int:
         ),
         "blocked_path_c_codegen_gaps": [
             "lowered Path C fwd still recomputes some lane-derived indices inside the t loop",
-            "lowered Path C fwd still reloads D[h] inside the t loop",
-            "Path C bwd still pays per-lane partial writes plus host P-axis reductions",
+            "Path C bwd still performs the reverse recurrence serially over T and N per lane",
+            "non-P=32 bwd shapes still fall back to per-lane partial writes plus host reductions",
         ],
         "remembered_optimizations": [
             "TileLang local.var scalar y_acc instead of thread float[1]",
             "TileLang Metal local.var PrintExpr statement-order fix",
             "Bench harness uses paired alternating samples to avoid order/warmup drift",
             "Path C bwd reconstructs h_prev in-place from h_t instead of writing global h_steps",
+            "Path C bwd uses Metal simd_sum P-reductions for P=32 instead of global dB/dC partial buffers",
+            "Bench harness profiles Path C bwd kernel and partial reductions separately",
             "AUTO selects full Path C only when fwd, bwd, and fwd+bwd receipts are no-worse",
             "AUTO can still select Path C forward with Path B backward when only fwd is no-worse",
         ],
@@ -559,6 +617,7 @@ def main() -> int:
             "bwd_path_b_median_ms": bwd_pb_ms,
             "bwd_path_c_median_ms": bwd_pc_ms,
         },
+        "bwd_profile": bwd_profile,
         "gflops": {
             "fwd_path_b": fwd_pb_gflops,
             "fwd_path_c": fwd_pc_gflops,
@@ -628,7 +687,12 @@ def _safe_version(pkg: str) -> str | None:
     try:
         return metadata.version(pkg)
     except Exception:
-        return None
+        try:
+            module = __import__(pkg)
+        except Exception:
+            return None
+        version = getattr(module, "__version__", None)
+        return str(version) if version is not None else None
 
 
 if __name__ == "__main__":

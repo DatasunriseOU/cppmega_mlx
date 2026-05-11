@@ -141,6 +141,15 @@ def test_lowered_bwd_msl_contains_kernel_void() -> None:
         assert name in msl, f"output buffer {name!r} missing from lowered MSL"
 
 
+def test_lowered_bwd_bench_shape_uses_simd_p_reduction() -> None:
+    msl = dump_lowered_bwd_msl(batch=1, seq=4, heads=1, headdim=32, state=4)
+    assert "kernel void" in msl
+    assert "simd_sum" in msl
+    assert "dB_partial" not in msl
+    assert "dC_partial" not in msl
+    assert "dD_batch" in msl
+
+
 def test_lowered_msl_reuses_hot_scalar_temporaries() -> None:
     """TileLang CSE plus scalar binding reuse avoids hot exp/sigmoid recompute."""
 
@@ -421,14 +430,14 @@ def test_bwd_path_c_owner_outputs_avoid_hidden_zero_alloc(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _require_mamba3_path_c()
-    inputs = _make_inputs(batch=1, seq=6, heads=2, headdim=4, state=4, dtype=mx.float32)
+    inputs = _make_inputs(batch=1, seq=6, heads=2, headdim=4, state=5, dtype=mx.float32)
     x, B, C, z, A, dt, D, h0 = inputs
     dy = mx.ones(x.shape, dtype=mx.float32)
     owner_outputs = (
         mx.zeros(x.shape, dtype=mx.float32),
         mx.zeros(z.shape, dtype=mx.float32),
-        mx.zeros((1, 6, 2, 4, 4), dtype=mx.float32),
-        mx.zeros((1, 6, 2, 4, 4), dtype=mx.float32),
+        mx.zeros((1, 6, 2, 5, 4), dtype=mx.float32),
+        mx.zeros((1, 6, 2, 5, 4), dtype=mx.float32),
         mx.zeros((1, 6, 2, 4), dtype=mx.float32),
         mx.zeros((1, 6, 2, 4), dtype=mx.float32),
         mx.zeros((1, 2, 4), dtype=mx.float32),
