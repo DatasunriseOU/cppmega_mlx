@@ -7,8 +7,8 @@
     "system": "Darwin",
     "machine": "arm64",
     "python_version": "3.13.12",
-    "mlx_version": "0.31.2",
-    "tilelang_version": "0.1.9+gitcab1a7db"
+    "mlx_version": "0.32.0.dev20260511+85a0e7e4a",
+    "tilelang_version": "0.1.9+gitd669bcee"
   },
   "shape": {
     "batch": 2,
@@ -18,63 +18,125 @@
     "state": 64,
     "dtype": "float32"
   },
+  "path_b_status": {
+    "available": true,
+    "reason": "MSL dispatch path is available"
+  },
+  "path_c_status": {
+    "available": true,
+    "reason": "Path C TileLang DSL ready"
+  },
   "parity": {
-    "y_max_abs": 0.0,
-    "h_max_abs": 0.0
+    "y_max_abs": 2.9802322387695312e-08,
+    "h_max_abs": 2.384185791015625e-07
   },
   "timings": {
     "fwd_path_b": {
       "label": "fwd_path_b",
-      "mean_ms": 1.0903741378569975,
-      "median_ms": 1.0196875082328916,
-      "min_ms": 0.9729999874252826,
-      "max_ms": 2.27237498620525,
+      "mean_ms": 1.0821525240316987,
+      "median_ms": 1.057708461303264,
+      "min_ms": 0.9942920878529549,
+      "max_ms": 1.4027919387444854,
       "iters": 50,
-      "warmup": 5
+      "warmup": 5,
+      "measurement": "paired_alternating"
     },
     "fwd_path_c": {
       "label": "fwd_path_c",
-      "mean_ms": 1.0216184193268418,
-      "median_ms": 1.005353988148272,
-      "min_ms": 0.9633339941501617,
-      "max_ms": 1.2104170164093375,
+      "mean_ms": 1.1843224382027984,
+      "median_ms": 1.1561459978111088,
+      "min_ms": 1.111124991439283,
+      "max_ms": 1.5131660038605332,
       "iters": 50,
-      "warmup": 5
+      "warmup": 5,
+      "measurement": "paired_alternating"
     },
     "fwd_bwd_path_b": {
       "label": "fwd_bwd_path_b",
-      "mean_ms": 7.858181623741984,
-      "median_ms": 7.576832998893224,
-      "min_ms": 7.276249991264194,
-      "max_ms": 20.377167005790398,
+      "mean_ms": 7.4003691133111715,
+      "median_ms": 7.359457958955318,
+      "min_ms": 7.240416947752237,
+      "max_ms": 8.281375048682094,
       "iters": 50,
-      "warmup": 5
+      "warmup": 5,
+      "measurement": "paired_alternating"
     },
     "fwd_bwd_path_c": {
       "label": "fwd_bwd_path_c",
-      "mean_ms": 9.844281559926458,
-      "median_ms": 5.950332983047701,
-      "min_ms": 5.760582978837192,
-      "max_ms": 200.7697919907514,
+      "mean_ms": 8.536860716994852,
+      "median_ms": 8.530562045052648,
+      "min_ms": 8.366790949366987,
+      "max_ms": 8.818833041004837,
       "iters": 50,
-      "warmup": 5
+      "warmup": 5,
+      "measurement": "paired_alternating"
     },
-    "bwd_path_b_median_ms": 6.557145490660332,
-    "bwd_path_c_median_ms": 4.944978994899429
+    "bwd_path_b_median_ms": 6.301749497652054,
+    "bwd_path_c_median_ms": 7.374416047241539
   },
   "gflops": {
-    "fwd_path_b": 42.41864262410976,
-    "fwd_path_c": 43.023413155865285,
-    "fwd_bwd_path_b": 22.834743754451623,
-    "fwd_bwd_path_c": 29.076530757675922
+    "fwd_path_b": 40.89383944863648,
+    "fwd_path_c": 37.41202242786884,
+    "fwd_bwd_path_b": 23.50920964083606,
+    "fwd_bwd_path_c": 20.281786720060392
   },
   "memory_bytes_peak": {
     "fwd_path_b": 5013536,
     "fwd_path_c": 5013536,
     "fwd_bwd_path_b": 111543876,
-    "fwd_bwd_path_c": 111543876
+    "fwd_bwd_path_c": 109347884
   },
-  "ratio_path_c_over_path_b_fwd_bwd": 0.7853324712207447,
-  "verdict": "Path C is >20% faster than Path B; recommend switching to Path C and archiving Path B's MSL as a fallback.",
+  "strict_policy": {
+    "phase": "fwd",
+    "requires_path_b_and_path_c": true,
+    "path_c_fwd_over_path_b_max_ratio": 1.0,
+    "path_c_fwd_bwd_over_path_b_max_ratio": 1.0,
+    "path_c_bwd_over_path_b_max_ratio": 1.0
+  },
+  "scheduler_decision": {
+    "source": "rule_z3_test_receipt",
+    "mode": "path_b",
+    "selected_forward_kernel": "metal_kernel_fwd_v1",
+    "selected_backward_kernel": "metal_kernel_bwd_v1",
+    "rule_z3_plan": {
+      "batch": 2,
+      "seq": 512,
+      "heads": 4,
+      "headdim": 32,
+      "state": 64,
+      "dtype": "float32",
+      "lanes": 256,
+      "threads": 256,
+      "grid_blocks": 1,
+      "fwd_path_c_candidate": true,
+      "bwd_path_c_candidate": false,
+      "mode": "path_c_fwd_path_b_bwd",
+      "z3_used": true,
+      "z3_proved": true,
+      "reason": "rule: fp32 per-lane scan with 256 threads over 1 blocks; z3 proved per-lane index decomposition and buffer bounds; bwd remains Path B until bench receipt proves Path C bwd no-worse"
+    },
+    "ratios": {
+      "fwd_path_c_over_path_b": 1.093066794971607,
+      "bwd_path_c_over_path_b": 1.1702172626806486,
+      "fwd_bwd_path_c_over_path_b": 1.1591291223659044
+    },
+    "optimization_policy": "AUTO only promotes a Path C phase when the rule/Z3 plan is safe and paired bench receipt median is no-worse than Path B.",
+    "blocked_path_c_codegen_gaps": [
+      "lowered Path C fwd still recomputes some lane-derived indices inside the t loop",
+      "lowered Path C fwd still reloads D[h] inside the t loop",
+      "Path C bwd rematerializes h_steps through the DSL route and is slower on this receipt"
+    ],
+    "remembered_optimizations": [
+      "TileLang local.var scalar y_acc instead of thread float[1]",
+      "TileLang Metal local.var PrintExpr statement-order fix",
+      "Bench harness uses paired alternating samples to avoid order/warmup drift",
+      "Path C forward auto-promotes only on receipt-covered no-worse fwd",
+      "Path B backward remains selected until Path C bwd receipt is no-worse"
+    ]
+  },
+  "ratio_path_c_over_path_b_fwd": 1.093066794971607,
+  "ratio_path_c_over_path_b_bwd": 1.1702172626806486,
+  "ratio_path_c_over_path_b_fwd_bwd": 1.1591291223659044,
+  "verdict": "Path C is between 10% and 20% slower than Path B; close enough to Path B that it is best kept as a documentation artifact; not in the hot path.",
   "matched_run_guard": "Compare Path B and Path C only when both rows were collected on the same hardware with identical kernel inputs. This is a local_only receipt."
 }

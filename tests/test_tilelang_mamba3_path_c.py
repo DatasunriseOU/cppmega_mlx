@@ -18,6 +18,7 @@ The "bit-exact" expectation is a property of the M4 Max instance running this
 test; the conservative atol/rtol budget is what we ship as the contract.
 """
 
+import json
 import re
 from typing import cast
 
@@ -34,14 +35,18 @@ from cppmega_mlx.nn._tilelang import (
     mamba3_mimo_reference,
 )
 from cppmega_mlx.nn._tilelang.mamba3_path_c import (
+    Mamba3PathCSchedulePlan,
     Mamba3PathCStatus,
     dump_lowered_bwd_msl,
     dump_lowered_fwd_msl,
     mamba3_mimo_apply_path_c,
     mamba3_mimo_apply_with_state_path_c,
+    mamba3_mimo_apply_with_state_path_c_fwd_path_b_bwd,
     mamba3_mimo_bwd_path_c,
     mamba3_mimo_fwd_path_c,
     mamba3_mimo_path_c_status,
+    mamba3_path_c_receipt_allows_auto_promotion,
+    mamba3_path_c_schedule_plan,
 )
 
 
@@ -178,6 +183,115 @@ def test_path_c_launch_geometry_comes_from_tilelang_lowering() -> None:
     assert lowering.grid == (14, 1, 1)
     assert lowering.threadgroup == (256, 1, 1)
     assert _msl_transform.metal_grid_for_lowering(lowering) == (3584, 1, 1)
+
+
+def test_mamba3_path_c_schedule_plan_uses_rule_and_z3_for_spec_shape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("z3")
+    for name in (
+        "TILELANG_DISABLE_Z3",
+        "CPPMEGA_DISABLE_Z3",
+        "CPPMEGA_DISABLE_MAMBA3_PATH_C_Z3",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    mamba3_path_c_schedule_plan.cache_clear()
+
+    plan = mamba3_path_c_schedule_plan(
+        batch=2,
+        seq=512,
+        heads=4,
+        headdim=32,
+        state=64,
+        dtype="float32",
+    )
+
+    assert isinstance(plan, Mamba3PathCSchedulePlan)
+    assert plan.threads == 256
+    assert plan.grid_blocks == 1
+    assert plan.fwd_path_c_candidate is True
+    assert plan.bwd_path_c_candidate is False
+    assert plan.mode == "path_c_fwd_path_b_bwd"
+    assert plan.z3_used is True
+    assert plan.z3_proved is True
+
+
+def test_mamba3_path_c_receipt_gate_requires_matching_shape_and_fwd_win(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("z3")
+    for name in (
+        "TILELANG_DISABLE_Z3",
+        "CPPMEGA_DISABLE_Z3",
+        "CPPMEGA_DISABLE_MAMBA3_PATH_C_Z3",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    mamba3_path_c_schedule_plan.cache_clear()
+
+    receipt = {
+        "kernel": "mamba3_mimo_path_c_vs_path_b",
+        "shape": {
+            "batch": 2,
+            "seq": 512,
+            "heads": 4,
+            "headdim": 32,
+            "state": 64,
+            "dtype": "float32",
+        },
+        "strict_policy": {
+            "phase": "fwd",
+            "requires_path_b_and_path_c": True,
+            "path_c_fwd_over_path_b_max_ratio": 1.0,
+        },
+        "scheduler_decision": {
+            "mode": "path_c_fwd_path_b_bwd",
+            "selected_forward_kernel": "path_c_tilelang_dsl",
+            "selected_backward_kernel": "metal_kernel_bwd_v1",
+        },
+        "timings": {
+            "fwd_path_b": {"median_ms": 2.0},
+            "fwd_path_c": {"median_ms": 1.5},
+        },
+    }
+    receipt_path = tmp_path / "mamba3_path_c.json"
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+    assert mamba3_path_c_receipt_allows_auto_promotion(
+        receipt_path,
+        batch=2,
+        seq=512,
+        heads=4,
+        headdim=32,
+        state=64,
+        dtype="float32",
+    )
+
+    wrong_shape = json.loads(json.dumps(receipt))
+    wrong_shape["shape"]["seq"] = 256
+    receipt_path.write_text(json.dumps(wrong_shape), encoding="utf-8")
+    assert not mamba3_path_c_receipt_allows_auto_promotion(
+        receipt_path,
+        batch=2,
+        seq=512,
+        heads=4,
+        headdim=32,
+        state=64,
+        dtype="float32",
+    )
+
+    slow_path_c = json.loads(json.dumps(receipt))
+    slow_path_c["timings"]["fwd_path_c"]["median_ms"] = 2.1
+    receipt_path.write_text(json.dumps(slow_path_c), encoding="utf-8")
+    assert not mamba3_path_c_receipt_allows_auto_promotion(
+        receipt_path,
+        batch=2,
+        seq=512,
+        heads=4,
+        headdim=32,
+        state=64,
+        dtype="float32",
+    )
 
 
 def test_fwd_path_c_dispatch_failure_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -471,6 +585,36 @@ def test_apply_with_state_path_c_matches_forward_and_vjp_works() -> None:
             rtol=1e-6,
             atol=1e-6,
             err_msg=f"state/y-only VJP mismatch on {name}",
+        )
+
+
+def test_apply_with_state_path_c_fwd_path_b_bwd_vjp_matches_path_b() -> None:
+    _require_mamba3_path_c()
+    inputs = _make_inputs(batch=1, seq=6, heads=2, headdim=4, state=4, dtype=mx.float32)
+
+    y_hybrid, h_hybrid = mamba3_mimo_apply_with_state_path_c_fwd_path_b_bwd(*inputs)
+    y_pc, h_pc = mamba3_mimo_fwd_path_c(*inputs)
+    mx.eval(y_hybrid, h_hybrid, y_pc, h_pc)
+    np.testing.assert_allclose(_np(y_hybrid), _np(y_pc), rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(_np(h_hybrid), _np(h_pc), rtol=1e-6, atol=1e-6)
+
+    def hybrid_loss(x, B, C, z, A, dt, D, h0):  # type: ignore[no-untyped-def]
+        y, _ = mamba3_mimo_apply_with_state_path_c_fwd_path_b_bwd(
+            x, B, C, z, A, dt, D, h0
+        )
+        return mx.sum(y * y) * 0.5
+
+    g_hybrid = mx.grad(hybrid_loss, argnums=tuple(range(8)))(*inputs)
+    g_path_b = mamba3_mimo_bwd_metal(y_hybrid, *inputs)
+    mx.eval(*g_hybrid, *g_path_b)
+    names = ["dx", "dB", "dC", "dz", "dA", "ddt", "dD", "dh0"]
+    for name, got, expected in zip(names, g_hybrid, g_path_b, strict=True):
+        np.testing.assert_allclose(
+            _np(got),
+            _np(expected),
+            rtol=1e-6,
+            atol=1e-6,
+            err_msg=f"hybrid VJP mismatch on {name}",
         )
 
 

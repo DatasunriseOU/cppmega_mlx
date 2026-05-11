@@ -166,6 +166,58 @@ def test_path_c_policy_without_legacy_debug_wrapper_env_runs_or_explains_kernel_
     assert matches[-1]["kernel_used"] == "path_c_tilelang_dsl"
 
 
+def test_auto_dispatch_promotes_receipted_path_c_forward_with_path_b_backward(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not _METAL_AVAILABLE:
+        pytest.skip("Metal not available")
+    from cppmega_mlx.nn._tilelang import mamba3_path_c
+    import cppmega_mlx.nn.mamba3 as mamba3_module
+
+    x, B, C, z, A, dt, D, h0 = _make_scan_inputs(seed=13)
+
+    def fail_path_b(*_args: object, **_kwargs: object) -> tuple[mx.array, mx.array]:
+        raise AssertionError("receipted AUTO Path C forward fell back to Path B")
+
+    def fake_hybrid(*args: mx.array) -> tuple[mx.array, mx.array]:
+        x_arg, *_rest, h0_arg = args
+        return mx.zeros_like(x_arg), h0_arg
+
+    monkeypatch.setattr(mamba3_module, "_mamba3_mimo_apply_with_state", fail_path_b)
+    monkeypatch.setattr(
+        mamba3_path_c,
+        "mamba3_mimo_path_c_status",
+        lambda: mamba3_path_c.Mamba3PathCStatus(True, "forced available"),
+    )
+    monkeypatch.setattr(
+        mamba3_path_c,
+        "mamba3_path_c_auto_fwd_path_b_bwd_allowed",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        mamba3_path_c,
+        "mamba3_mimo_apply_with_state_path_c_fwd_path_b_bwd",
+        fake_hybrid,
+    )
+
+    y, h_last = mamba3_module._dispatch_mamba3_scan(
+        x=x,
+        B=B,
+        C=C,
+        z=z,
+        A=A,
+        dt=dt,
+        D=D,
+        h0=h0,
+        chunk_size=8,
+    )
+    mx.eval(y, h_last)
+
+    matches = [e for e in get_dispatch_log() if e["op_name"] == "mamba3_mimo"]
+    assert matches[-1]["path"] == "auto"
+    assert matches[-1]["kernel_used"] == "path_c_tilelang_dsl_fwd_path_b_bwd"
+
+
 def test_path_c_block_route_rejects_non_contiguous_views_without_copy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

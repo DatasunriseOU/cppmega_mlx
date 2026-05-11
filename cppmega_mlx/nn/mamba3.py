@@ -406,11 +406,11 @@ def _dispatch_mamba3_scan(
 ) -> tuple[mx.array, mx.array]:
     """Route the Mamba3 selective scan according to :class:`KernelPath`.
 
-    AUTO/PATH_B uses :func:`_mamba3_mimo_apply_with_state` (Path B Metal
-    kernel) when available; the wrapper preserves grad through ``y`` via
-    the manual VJP shipped with the kernel and exposes ``h_last`` for
-    cache assembly. REFERENCE always uses the pure-MLX chunked scan.
-    PATH_C routes to the lowered TileLang DSL kernel.
+    AUTO may promote receipt-covered FP32 shapes to a hybrid route: Path C
+    TileLang DSL forward with Path B Metal backward. Unreceipted or failed
+    hybrid dispatch falls back to Path B Metal. REFERENCE always uses the
+    pure-MLX chunked scan. PATH_C routes to the lowered TileLang DSL fwd+bwd
+    kernel and fails closed if unavailable.
     """
 
     from cppmega_mlx.nn._tilelang.mamba3 import mamba3_mimo_metal_status
@@ -447,6 +447,35 @@ def _dispatch_mamba3_scan(
         raise RuntimeError(
             f"mamba3_mimo: Path B kernel unavailable ({status.reason})"
         )
+    if path is KernelPath.AUTO and status.available:
+        from cppmega_mlx.nn._tilelang.mamba3_path_c import (
+            mamba3_mimo_apply_with_state_path_c_fwd_path_b_bwd,
+            mamba3_mimo_path_c_status,
+            mamba3_path_c_auto_fwd_path_b_bwd_allowed,
+        )
+
+        path_c_status = mamba3_mimo_path_c_status()
+        if (
+            path_c_status.available
+            and mamba3_path_c_auto_fwd_path_b_bwd_allowed(
+                x, B, C, z, A, dt, D, h0
+            )
+        ):
+            try:
+                y, h_last = mamba3_mimo_apply_with_state_path_c_fwd_path_b_bwd(
+                    x, B, C, z, A, dt, D, h0
+                )
+            except RuntimeError:
+                # AUTO is fail-closed: graph/DLPack boundary failures keep the
+                # production Path B route rather than allocating staging buffers.
+                pass
+            else:
+                record_dispatch(
+                    "mamba3_mimo",
+                    path,
+                    "path_c_tilelang_dsl_fwd_path_b_bwd",
+                )
+                return y, h_last
     if status.available:
         record_dispatch("mamba3_mimo", path, "metal_kernel_fwd_v1")
         y, h_last = _mamba3_mimo_apply_with_state(x, B, C, z, A, dt, D, h0)

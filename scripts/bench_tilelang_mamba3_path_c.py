@@ -40,13 +40,17 @@ from cppmega_mlx.nn._tilelang import (  # noqa: E402
     mamba3_mimo_apply,
     mamba3_mimo_fwd_metal,
 )
-from cppmega_mlx.nn._tilelang.mamba3 import _FWD_KERNEL_SOURCE  # noqa: E402
+from cppmega_mlx.nn._tilelang.mamba3 import (  # noqa: E402
+    _FWD_KERNEL_SOURCE,
+    mamba3_mimo_metal_status,
+)
 from cppmega_mlx.nn._tilelang.mamba3_path_c import (  # noqa: E402
     dump_lowered_bwd_msl,
     dump_lowered_fwd_msl,
     mamba3_mimo_apply_path_c,
     mamba3_mimo_fwd_path_c,
     mamba3_mimo_path_c_status,
+    mamba3_path_c_schedule_plan,
 )
 
 
@@ -105,6 +109,54 @@ def _bench(label: str, fn: Callable[[], Any], *, warmup: int, iters: int) -> dic
     }
 
 
+def _bench_pair(
+    label_a: str,
+    fn_a: Callable[[], Any],
+    label_b: str,
+    fn_b: Callable[[], Any],
+    *,
+    warmup: int,
+    iters: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Bench two candidates as paired samples with alternating order."""
+
+    for i in range(warmup):
+        if i % 2 == 0:
+            fn_a()
+            mx.synchronize()
+            fn_b()
+            mx.synchronize()
+        else:
+            fn_b()
+            mx.synchronize()
+            fn_a()
+            mx.synchronize()
+
+    samples_a: list[float] = []
+    samples_b: list[float] = []
+    for i in range(iters):
+        if i % 2 == 0:
+            samples_a.append(_run_one(fn_a))
+            samples_b.append(_run_one(fn_b))
+        else:
+            samples_b.append(_run_one(fn_b))
+            samples_a.append(_run_one(fn_a))
+
+    def summary(label: str, samples: list[float]) -> dict[str, Any]:
+        return {
+            "label": label,
+            "mean_ms": statistics.mean(samples) * 1000.0,
+            "median_ms": statistics.median(samples) * 1000.0,
+            "min_ms": min(samples) * 1000.0,
+            "max_ms": max(samples) * 1000.0,
+            "iters": iters,
+            "warmup": warmup,
+            "measurement": "paired_alternating",
+        }
+
+    return summary(label_a, samples_a), summary(label_b, samples_b)
+
+
 def _gflops(*, batch: int, seq: int, heads: int, headdim: int, state: int, ms: float) -> float:
     """Approximate GFLOP/s for the Mamba3 selective scan.
 
@@ -151,6 +203,12 @@ def _reset_peak_memory() -> None:
             fn()
         except Exception:
             pass
+
+
+def _safe_ratio(numerator: float, denominator: float) -> float:
+    if denominator <= 0.0:
+        return float("inf")
+    return numerator / denominator
 
 
 def _write_msl_diff(*, path_b_source: str, path_c_source: str, out_path: Path) -> None:
@@ -211,10 +269,22 @@ def main() -> int:
         dtype=dtype,
         seed=args.seed,
     )
-    status = mamba3_mimo_path_c_status()
-    if not status.available:
-        print(f"Path C not available: {status.reason}", file=sys.stderr)
+    path_b_status = mamba3_mimo_metal_status(inputs[0])
+    path_c_status = mamba3_mimo_path_c_status()
+    if not path_b_status.available:
+        print(f"Path B not available: {path_b_status.reason}", file=sys.stderr)
         return 1
+    if not path_c_status.available:
+        print(f"Path C not available: {path_c_status.reason}", file=sys.stderr)
+        return 1
+    schedule_plan = mamba3_path_c_schedule_plan(
+        batch=args.batch,
+        seq=args.seq,
+        heads=args.heads,
+        headdim=args.headdim,
+        state=args.state,
+        dtype=args.dtype,
+    )
 
     # ------------------------------------------------------------------
     # Parity check first (FP32 path is bit-exact on this hardware).
@@ -230,21 +300,19 @@ def main() -> int:
     # ------------------------------------------------------------------
     # Fwd benches
     # ------------------------------------------------------------------
-    _reset_peak_memory()
-    fwd_pb = _bench(
+    fwd_pb, fwd_pc = _bench_pair(
         "fwd_path_b",
         lambda: mamba3_mimo_fwd_metal(*inputs),
-        warmup=args.warmup,
-        iters=args.iters,
-    )
-    peak_pb_fwd = _peak_memory_bytes()
-    _reset_peak_memory()
-    fwd_pc = _bench(
         "fwd_path_c",
         lambda: mamba3_mimo_fwd_path_c(*inputs),
         warmup=args.warmup,
         iters=args.iters,
     )
+    _reset_peak_memory()
+    _run_one(lambda: mamba3_mimo_fwd_metal(*inputs))
+    peak_pb_fwd = _peak_memory_bytes()
+    _reset_peak_memory()
+    _run_one(lambda: mamba3_mimo_fwd_path_c(*inputs))
     peak_pc_fwd = _peak_memory_bytes()
 
     # ------------------------------------------------------------------
@@ -267,27 +335,31 @@ def main() -> int:
     grad_pb = mx.value_and_grad(loss_pb, argnums=tuple(range(8)))
     grad_pc = mx.value_and_grad(loss_pc, argnums=tuple(range(8)))
 
-    _reset_peak_memory()
-    fwd_bwd_pb = _bench(
+    fwd_bwd_pb, fwd_bwd_pc = _bench_pair(
         "fwd_bwd_path_b",
         lambda: grad_pb(*inputs),
-        warmup=args.warmup,
-        iters=args.iters,
-    )
-    peak_pb_fb = _peak_memory_bytes()
-
-    _reset_peak_memory()
-    fwd_bwd_pc = _bench(
         "fwd_bwd_path_c",
         lambda: grad_pc(*inputs),
         warmup=args.warmup,
         iters=args.iters,
     )
+    _reset_peak_memory()
+    _run_one(lambda: grad_pb(*inputs))
+    peak_pb_fb = _peak_memory_bytes()
+
+    _reset_peak_memory()
+    _run_one(lambda: grad_pc(*inputs))
     peak_pc_fb = _peak_memory_bytes()
 
     # Derive bwd-only timings.
     bwd_pb_ms = max(0.0, fwd_bwd_pb["median_ms"] - fwd_pb["median_ms"])
     bwd_pc_ms = max(0.0, fwd_bwd_pc["median_ms"] - fwd_pc["median_ms"])
+    fwd_ratio = _safe_ratio(fwd_pc["median_ms"], fwd_pb["median_ms"])
+    bwd_ratio = _safe_ratio(bwd_pc_ms, bwd_pb_ms)
+    fwd_bwd_ratio = _safe_ratio(
+        fwd_bwd_pc["median_ms"],
+        fwd_bwd_pb["median_ms"],
+    )
     fwd_pb_gflops = _gflops(
         batch=args.batch, seq=args.seq, heads=args.heads,
         headdim=args.headdim, state=args.state, ms=fwd_pb["median_ms"],
@@ -340,8 +412,57 @@ def main() -> int:
     print()
 
     # Recommendation logic from the task spec.
-    ratio = fwd_bwd_pc["median_ms"] / fwd_bwd_pb["median_ms"] if fwd_bwd_pb["median_ms"] > 0 else float("inf")
-    if ratio < 0.8:
+    strict_policy = {
+        "phase": "fwd",
+        "requires_path_b_and_path_c": True,
+        "path_c_fwd_over_path_b_max_ratio": 1.0,
+        "path_c_fwd_bwd_over_path_b_max_ratio": 1.0,
+        "path_c_bwd_over_path_b_max_ratio": 1.0,
+    }
+    auto_promotes_fwd = (
+        schedule_plan.fwd_path_c_candidate
+        and fwd_ratio <= strict_policy["path_c_fwd_over_path_b_max_ratio"]
+    )
+    scheduler_mode = "path_c_fwd_path_b_bwd" if auto_promotes_fwd else "path_b"
+    scheduler_decision = {
+        "source": "rule_z3_test_receipt",
+        "mode": scheduler_mode,
+        "selected_forward_kernel": (
+            "path_c_tilelang_dsl" if auto_promotes_fwd else "metal_kernel_fwd_v1"
+        ),
+        "selected_backward_kernel": "metal_kernel_bwd_v1",
+        "rule_z3_plan": schedule_plan.as_feature_dict(),
+        "ratios": {
+            "fwd_path_c_over_path_b": fwd_ratio,
+            "bwd_path_c_over_path_b": bwd_ratio,
+            "fwd_bwd_path_c_over_path_b": fwd_bwd_ratio,
+        },
+        "optimization_policy": (
+            "AUTO only promotes a Path C phase when the rule/Z3 plan is safe "
+            "and paired bench receipt median is no-worse than Path B."
+        ),
+        "blocked_path_c_codegen_gaps": [
+            "lowered Path C fwd still recomputes some lane-derived indices inside the t loop",
+            "lowered Path C fwd still reloads D[h] inside the t loop",
+            "Path C bwd rematerializes h_steps through the DSL route and is slower on this receipt",
+        ],
+        "remembered_optimizations": [
+            "TileLang local.var scalar y_acc instead of thread float[1]",
+            "TileLang Metal local.var PrintExpr statement-order fix",
+            "Bench harness uses paired alternating samples to avoid order/warmup drift",
+            "Path C forward auto-promotes only on receipt-covered no-worse fwd",
+            "Path B backward remains selected until Path C bwd receipt is no-worse",
+        ],
+    }
+
+    ratio = fwd_bwd_ratio
+    if auto_promotes_fwd and ratio > 1.0:
+        verdict = (
+            "Path C forward is no-worse than Path B and is eligible for AUTO "
+            "promotion, but Path C backward is slower; scheduler selects Path C "
+            "forward with Path B backward."
+        )
+    elif ratio < 0.8:
         verdict = (
             "Path C is >20% faster than Path B; recommend switching to Path C "
             "and archiving Path B's MSL as a fallback."
@@ -370,6 +491,12 @@ def main() -> int:
             "scheduler bug."
         )
     print(f"verdict: {verdict}")
+    print(
+        "scheduler: "
+        f"{scheduler_decision['mode']} "
+        f"(fwd C/B={fwd_ratio:.3f}, bwd C/B={bwd_ratio:.3f}, "
+        f"fwd+bwd C/B={fwd_bwd_ratio:.3f})"
+    )
 
     # ------------------------------------------------------------------
     # Receipt + artifacts
@@ -394,6 +521,14 @@ def main() -> int:
             "state": args.state,
             "dtype": args.dtype,
         },
+        "path_b_status": {
+            "available": path_b_status.available,
+            "reason": path_b_status.reason,
+        },
+        "path_c_status": {
+            "available": path_c_status.available,
+            "reason": path_c_status.reason,
+        },
         "parity": parity,
         "timings": {
             "fwd_path_b": fwd_pb,
@@ -415,6 +550,10 @@ def main() -> int:
             "fwd_bwd_path_b": peak_pb_fb,
             "fwd_bwd_path_c": peak_pc_fb,
         },
+        "strict_policy": strict_policy,
+        "scheduler_decision": scheduler_decision,
+        "ratio_path_c_over_path_b_fwd": fwd_ratio,
+        "ratio_path_c_over_path_b_bwd": bwd_ratio,
         "ratio_path_c_over_path_b_fwd_bwd": ratio,
         "verdict": verdict,
         "matched_run_guard": (

@@ -38,6 +38,9 @@ Public surface
 * :func:`mamba3_mimo_apply_path_c` — convenience fwd surface returning ``y``.
 * :func:`mamba3_mimo_apply_with_state_path_c` — returns ``(y, h_last)`` so
   model dispatch does not re-run forward just to assemble the inference cache.
+* :func:`mamba3_mimo_apply_with_state_path_c_fwd_path_b_bwd` — AUTO-only
+  hybrid surface: TileLang DSL forward, proven/receipted shape gate, Path B
+  backward until Path C backward earns the same no-worse receipt.
 * :func:`mamba3_mimo_path_c_status` — preflight check for the lowered TileLang
   DSL kernel; explicit Path C dispatch fails closed when TileLang cannot lower.
 
@@ -77,7 +80,11 @@ the closure-walk path entirely.
 
 from dataclasses import dataclass
 from functools import lru_cache
+import json
+import math
+import os
 import re
+from pathlib import Path
 from typing import Any, cast
 
 import mlx.core as mx
@@ -117,6 +124,15 @@ _BWD_OUTPUT_NAMES = (
     "dh0",
 )
 _BWD_OUTPUT_IDX = (9, 10, 11, 12, 13, 14, 15, 16, 17)
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_PATH_C_AUTO_PROMOTION_RECEIPT = (
+    _REPO_ROOT / "bench" / "tilelang_ports" / "mamba3_path_c.json"
+)
+_Z3_DISABLE_ENV = (
+    "TILELANG_DISABLE_Z3",
+    "CPPMEGA_DISABLE_Z3",
+    "CPPMEGA_DISABLE_MAMBA3_PATH_C_Z3",
+)
 
 Mamba3FwdOwnerOutputs = tuple[mx.array, mx.array]
 Mamba3BwdOwnerOutputs = tuple[
@@ -182,6 +198,53 @@ class Mamba3PathCStatus:
     reason: str
 
 
+@dataclass(frozen=True)
+class Mamba3PathCSchedulePlan:
+    """Rule/proof plan for one Mamba3 Path C shape."""
+
+    batch: int
+    seq: int
+    heads: int
+    headdim: int
+    state: int
+    dtype: str
+    lanes: int
+    threads: int
+    grid_blocks: int
+    fwd_path_c_candidate: bool
+    bwd_path_c_candidate: bool
+    z3_used: bool
+    z3_proved: bool
+    reason: str
+
+    @property
+    def mode(self) -> str:
+        if self.fwd_path_c_candidate and self.bwd_path_c_candidate:
+            return "path_c_fwd_bwd"
+        if self.fwd_path_c_candidate:
+            return "path_c_fwd_path_b_bwd"
+        return "path_b"
+
+    def as_feature_dict(self) -> dict[str, bool | int | str]:
+        return {
+            "batch": self.batch,
+            "seq": self.seq,
+            "heads": self.heads,
+            "headdim": self.headdim,
+            "state": self.state,
+            "dtype": self.dtype,
+            "lanes": self.lanes,
+            "threads": self.threads,
+            "grid_blocks": self.grid_blocks,
+            "fwd_path_c_candidate": self.fwd_path_c_candidate,
+            "bwd_path_c_candidate": self.bwd_path_c_candidate,
+            "mode": self.mode,
+            "z3_used": self.z3_used,
+            "z3_proved": self.z3_proved,
+            "reason": self.reason,
+        }
+
+
 def _tilelang_available() -> tuple[bool, str]:
     try:
         import tilelang  # noqa: F401
@@ -191,6 +254,249 @@ def _tilelang_available() -> tuple[bool, str]:
     except Exception as exc:  # pragma: no cover - macOS without tilelang
         return False, f"tilelang import failed: {exc}"
     return True, "tilelang importable"
+
+
+def _z3_disabled() -> bool:
+    return any(
+        os.environ.get(name, "").strip().lower() in {"1", "true", "yes"}
+        for name in _Z3_DISABLE_ENV
+    )
+
+
+def _z3_proves_mamba3_lane_mapping(
+    *,
+    batch: int,
+    seq: int,
+    heads: int,
+    headdim: int,
+    state: int,
+) -> tuple[bool, bool, str]:
+    """Prove that the per-lane schedule's derived indices stay in-bounds."""
+
+    if _z3_disabled():
+        return False, False, "z3 disabled by environment"
+    try:
+        import z3  # type: ignore[import-not-found]
+    except Exception as exc:  # pragma: no cover - optional local dependency
+        return False, False, f"z3 unavailable: {type(exc).__name__}: {exc}"
+
+    lane = z3.Int("lane")
+    t = z3.Int("t")
+    n = z3.Int("n")
+    lanes = batch * heads * headdim
+    p = lane % headdim
+    h = (lane / headdim) % heads
+    b = lane / (headdim * heads)
+    xz_idx = ((b * seq + t) * heads + h) * headdim + p
+    bc_idx = ((b * seq + t) * heads + h) * state + n
+    h_idx = ((b * heads + h) * headdim + p) * state + n
+
+    solver = z3.Solver()
+    solver.set("timeout", 50)
+    solver.add(0 <= lane, lane < lanes)
+    solver.add(0 <= t, t < seq)
+    solver.add(0 <= n, n < state)
+    solver.add(
+        z3.Or(
+            p < 0,
+            p >= headdim,
+            h < 0,
+            h >= heads,
+            b < 0,
+            b >= batch,
+            xz_idx < 0,
+            xz_idx >= batch * seq * heads * headdim,
+            bc_idx < 0,
+            bc_idx >= batch * seq * heads * state,
+            h_idx < 0,
+            h_idx >= batch * heads * headdim * state,
+        )
+    )
+    try:
+        result = solver.check()
+    except Exception as exc:  # pragma: no cover - defensive z3 boundary
+        return True, False, f"z3 raised {type(exc).__name__}: {exc}"
+    if result == z3.unsat:
+        return True, True, "z3 proved per-lane index decomposition and buffer bounds"
+    if result == z3.unknown:
+        return True, False, "z3 returned unknown for per-lane index proof"
+    return True, False, "z3 found an out-of-bounds lane/index witness"
+
+
+@lru_cache(maxsize=128)
+def mamba3_path_c_schedule_plan(
+    *,
+    batch: int,
+    seq: int,
+    heads: int,
+    headdim: int,
+    state: int,
+    dtype: str = "float32",
+) -> Mamba3PathCSchedulePlan:
+    """Return the rule + Z3 schedule plan used by the automatic Path C gate."""
+
+    lanes = batch * heads * headdim
+    threads = _threads_for(lanes)
+    grid_blocks = 0 if lanes <= 0 else math.ceil(lanes / threads)
+    positive_shape = all(value > 0 for value in (batch, seq, heads, headdim, state))
+    if not positive_shape:
+        return Mamba3PathCSchedulePlan(
+            batch=batch,
+            seq=seq,
+            heads=heads,
+            headdim=headdim,
+            state=state,
+            dtype=dtype,
+            lanes=lanes,
+            threads=threads,
+            grid_blocks=grid_blocks,
+            fwd_path_c_candidate=False,
+            bwd_path_c_candidate=False,
+            z3_used=False,
+            z3_proved=False,
+            reason="non-positive Mamba3 Path C shape",
+        )
+    z3_used, z3_proved, z3_reason = _z3_proves_mamba3_lane_mapping(
+        batch=batch,
+        seq=seq,
+        heads=heads,
+        headdim=headdim,
+        state=state,
+    )
+    fwd_candidate = dtype == "float32" and threads <= 256 and z3_proved
+    # Current local receipt data shows Path C bwd is not consistently no-worse
+    # than Path B. Keep bwd on Path B until the test/bench memory flips this.
+    bwd_candidate = False
+    reason = (
+        f"rule: fp32 per-lane scan with {threads} threads over {grid_blocks} "
+        f"blocks; {z3_reason}; bwd remains Path B until bench receipt proves "
+        "Path C bwd no-worse"
+    )
+    return Mamba3PathCSchedulePlan(
+        batch=batch,
+        seq=seq,
+        heads=heads,
+        headdim=headdim,
+        state=state,
+        dtype=dtype,
+        lanes=lanes,
+        threads=threads,
+        grid_blocks=grid_blocks,
+        fwd_path_c_candidate=fwd_candidate,
+        bwd_path_c_candidate=bwd_candidate,
+        z3_used=z3_used,
+        z3_proved=z3_proved,
+        reason=reason,
+    )
+
+
+def mamba3_path_c_receipt_allows_auto_promotion(
+    receipt_path: Path = _PATH_C_AUTO_PROMOTION_RECEIPT,
+    *,
+    batch: int,
+    seq: int,
+    heads: int,
+    headdim: int,
+    state: int,
+    dtype: str,
+) -> bool:
+    """Fail-closed automatic Path C promotion gate backed by bench memory."""
+
+    plan = mamba3_path_c_schedule_plan(
+        batch=batch,
+        seq=seq,
+        heads=heads,
+        headdim=headdim,
+        state=state,
+        dtype=dtype,
+    )
+    if not plan.fwd_path_c_candidate or not plan.z3_proved:
+        return False
+    try:
+        data = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    if data.get("kernel") != "mamba3_mimo_path_c_vs_path_b":
+        return False
+    strict_policy = data.get("strict_policy")
+    if not isinstance(strict_policy, dict):
+        return False
+    if strict_policy.get("requires_path_b_and_path_c") is not True:
+        return False
+    if strict_policy.get("phase") != "fwd":
+        return False
+
+    decision = data.get("scheduler_decision")
+    if not isinstance(decision, dict):
+        return False
+    if decision.get("mode") != "path_c_fwd_path_b_bwd":
+        return False
+    if decision.get("selected_forward_kernel") != "path_c_tilelang_dsl":
+        return False
+    if decision.get("selected_backward_kernel") != "metal_kernel_bwd_v1":
+        return False
+
+    shape = data.get("shape")
+    expected_shape = {
+        "batch": batch,
+        "seq": seq,
+        "heads": heads,
+        "headdim": headdim,
+        "state": state,
+        "dtype": dtype,
+    }
+    if not isinstance(shape, dict) or any(shape.get(k) != v for k, v in expected_shape.items()):
+        return False
+
+    timings = data.get("timings")
+    if not isinstance(timings, dict):
+        return False
+    fwd_b = timings.get("fwd_path_b")
+    fwd_c = timings.get("fwd_path_c")
+    if not isinstance(fwd_b, dict) or not isinstance(fwd_c, dict):
+        return False
+    try:
+        fwd_b_ms = float(fwd_b["median_ms"])
+        fwd_c_ms = float(fwd_c["median_ms"])
+        max_ratio = float(strict_policy["path_c_fwd_over_path_b_max_ratio"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if not (math.isfinite(fwd_b_ms) and math.isfinite(fwd_c_ms) and fwd_b_ms > 0):
+        return False
+    return (fwd_c_ms / fwd_b_ms) <= max_ratio
+
+
+def mamba3_path_c_auto_fwd_path_b_bwd_allowed(
+    x: mx.array,
+    B: mx.array,
+    C: mx.array,
+    z: mx.array,
+    A: mx.array,
+    dt: mx.array,
+    D: mx.array,
+    h0: mx.array,
+    *,
+    receipt_path: Path = _PATH_C_AUTO_PROMOTION_RECEIPT,
+) -> bool:
+    """Return whether AUTO may use Path C fwd with Path B bwd for these inputs."""
+
+    try:
+        batch, seq, heads, headdim, state = _validate_inputs(x, B, C, z, A, dt, D, h0)
+    except Exception:
+        return False
+    if x.dtype != mx.float32:
+        return False
+    return mamba3_path_c_receipt_allows_auto_promotion(
+        receipt_path,
+        batch=batch,
+        seq=seq,
+        heads=heads,
+        headdim=headdim,
+        state=state,
+        dtype="float32",
+    )
 
 
 def mamba3_mimo_path_c_status() -> Mamba3PathCStatus:
@@ -920,6 +1226,42 @@ def _mamba3_mimo_apply_with_state_path_c_vjp(
     return mamba3_mimo_bwd_path_c(dy, x, B, C, z, A, dt, D, h0)
 
 
+@mx.custom_function
+def mamba3_mimo_apply_with_state_path_c_fwd_path_b_bwd(
+    x: mx.array,
+    B: mx.array,
+    C: mx.array,
+    z: mx.array,
+    A: mx.array,
+    dt: mx.array,
+    D: mx.array,
+    h0: mx.array,
+) -> tuple[mx.array, mx.array]:
+    """Hybrid AUTO surface: Path C TileLang fwd, Path B Metal bwd.
+
+    This is intentionally separate from forced Path C. The forward is only
+    selected by the dispatcher after the rule/Z3/bench-receipt gate accepts the
+    exact shape. The backward remains the production Path B VJP until Path C
+    bwd has a checked-in no-worse receipt.
+    """
+
+    return mamba3_mimo_fwd_path_c(x, B, C, z, A, dt, D, h0)
+
+
+@mamba3_mimo_apply_with_state_path_c_fwd_path_b_bwd.vjp
+def _mamba3_mimo_apply_with_state_path_c_fwd_path_b_bwd_vjp(
+    primals: tuple[mx.array, ...],
+    cotangent: tuple[mx.array, mx.array],
+    output: tuple[mx.array, mx.array],
+) -> tuple[mx.array, ...]:
+    from cppmega_mlx.nn._tilelang.mamba3 import mamba3_mimo_bwd_metal
+
+    del output
+    x, B, C, z, A, dt, D, h0 = primals
+    dy = cotangent[0]
+    return mamba3_mimo_bwd_metal(dy, x, B, C, z, A, dt, D, h0)
+
+
 # Convenience: dump the lowered MSL for the bench shape so reviewers can diff
 # Path B's hand-written MSL against Path C's machine-emitted MSL without
 # having to re-run the lowering pipeline.
@@ -952,11 +1294,16 @@ def dump_lowered_bwd_msl(
 
 
 __all__ = [
+    "Mamba3PathCSchedulePlan",
     "Mamba3PathCStatus",
     "dump_lowered_bwd_msl",
     "dump_lowered_fwd_msl",
     "mamba3_mimo_apply_path_c",
     "mamba3_mimo_apply_with_state_path_c",
+    "mamba3_mimo_apply_with_state_path_c_fwd_path_b_bwd",
+    "mamba3_path_c_auto_fwd_path_b_bwd_allowed",
+    "mamba3_path_c_receipt_allows_auto_promotion",
+    "mamba3_path_c_schedule_plan",
     "mamba3_mimo_bwd_path_c",
     "mamba3_mimo_fwd_path_c",
     "mamba3_mimo_path_c_status",
