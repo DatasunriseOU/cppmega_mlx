@@ -73,9 +73,11 @@ The MSL bwd kernel emits per-(b, h, p) lane partials:
 - dD_partial (B, H, P) — host sums over (B, P).
 - dh0 (B, H, P, N) — direct.
 
-h_steps_scratch (B*H*P, T, N) is allocated as an output buffer that the
-kernel writes during its forward sweep and reads during the reverse sweep.
-This is the kernel's own scratch — the host ignores it.
+Path B still allocates `h_steps_scratch` (B*H*P, T, N) as an ignored output
+buffer. Path C no longer does: its backward kernel computes `h_T` in a forward
+register prepass, then reconstructs `h_{t-1}` from the current `h_t` in-place
+inside the reverse pass. That removes the global `h_steps` scratch boundary
+from the TileLang/TVM-FFI ABI.
 
 ## Bench
 
@@ -143,6 +145,7 @@ mamba3_mimo_fwd_metal directly.
   slow (about 1.2x faster than the reference loop). Real training should
   use backend='auto' to select the Metal kernel.
 - The forward kernel scales well as T grows (each lane keeps a register
-  of N=64 fp32 state values). Above T=4096 the scratch buffer for the
-  bwd kernel grows linearly; we did not tune for very long contexts in
-  this port.
+  of N=64 fp32 state values). Path B backward still has scratch that grows
+  linearly with T; Path C backward removes that scratch but pays extra reverse
+  recurrence math, so AUTO keeps Path B unless the bench receipt proves
+  Path C no-worse for the exact shape.

@@ -34,7 +34,10 @@ Public surface
 
 * :func:`mamba3_mimo_fwd_path_c` — fwd lane scan returning ``(y, h_last)``.
 * :func:`mamba3_mimo_bwd_path_c` — bwd lane scan returning grads w.r.t.
-  ``(x, B, C, z, A, dt, D, h0)`` after host-side P-axis reductions.
+  ``(x, B, C, z, A, dt, D, h0)`` after host-side P-axis reductions. The
+  reverse pass carries ``h_t`` in per-lane registers and reconstructs
+  ``h_{t-1}`` in place, so Path C does not allocate a global ``h_steps``
+  scratch tensor.
 * :func:`mamba3_mimo_apply_path_c` — convenience fwd surface returning ``y``.
 * :func:`mamba3_mimo_apply_with_state_path_c` — returns ``(y, h_last)`` so
   model dispatch does not re-run forward just to assemble the inference cache.
@@ -113,7 +116,6 @@ _FLOAT_BINDING_RE = re.compile(r"\bfloat (?P<name>[A-Za-z_]\w*) = (?P<expr>.*);"
 _FWD_OUTPUT_NAMES = ("y", "h_last")
 _FWD_OUTPUT_IDX = (8, 9)
 _BWD_OUTPUT_NAMES = (
-    "h_steps",
     "dx",
     "dz",
     "dB_partial",
@@ -123,7 +125,7 @@ _BWD_OUTPUT_NAMES = (
     "dD_partial",
     "dh0",
 )
-_BWD_OUTPUT_IDX = (9, 10, 11, 12, 13, 14, 15, 16, 17)
+_BWD_OUTPUT_IDX = (9, 10, 11, 12, 13, 14, 15, 16)
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _PATH_C_AUTO_PROMOTION_RECEIPT = (
     _REPO_ROOT / "bench" / "tilelang_ports" / "mamba3_path_c.json"
@@ -136,7 +138,6 @@ _Z3_DISABLE_ENV = (
 
 Mamba3FwdOwnerOutputs = tuple[mx.array, mx.array]
 Mamba3BwdOwnerOutputs = tuple[
-    mx.array,
     mx.array,
     mx.array,
     mx.array,
@@ -364,13 +365,11 @@ def mamba3_path_c_schedule_plan(
         state=state,
     )
     fwd_candidate = dtype == "float32" and threads <= 256 and z3_proved
-    # Current local receipt data shows Path C bwd is not consistently no-worse
-    # than Path B. Keep bwd on Path B until the test/bench memory flips this.
-    bwd_candidate = False
+    bwd_candidate = fwd_candidate
     reason = (
         f"rule: fp32 per-lane scan with {threads} threads over {grid_blocks} "
-        f"blocks; {z3_reason}; bwd remains Path B until bench receipt proves "
-        "Path C bwd no-worse"
+        f"blocks; {z3_reason}; bwd reverse pass reconstructs h_prev in "
+        "per-lane registers without global h_steps scratch"
     )
     return Mamba3PathCSchedulePlan(
         batch=batch,
@@ -390,6 +389,108 @@ def mamba3_path_c_schedule_plan(
     )
 
 
+def mamba3_path_c_receipt_auto_mode(
+    receipt_path: Path = _PATH_C_AUTO_PROMOTION_RECEIPT,
+    *,
+    batch: int,
+    seq: int,
+    heads: int,
+    headdim: int,
+    state: int,
+    dtype: str,
+) -> str:
+    """Return the fail-closed AUTO mode selected by the bench receipt."""
+
+    plan = mamba3_path_c_schedule_plan(
+        batch=batch,
+        seq=seq,
+        heads=heads,
+        headdim=headdim,
+        state=state,
+        dtype=dtype,
+    )
+    if not plan.fwd_path_c_candidate or not plan.z3_proved:
+        return "path_b"
+    try:
+        data = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "path_b"
+    if not isinstance(data, dict):
+        return "path_b"
+    if data.get("kernel") != "mamba3_mimo_path_c_vs_path_b":
+        return "path_b"
+    strict_policy = data.get("strict_policy")
+    if not isinstance(strict_policy, dict):
+        return "path_b"
+    if strict_policy.get("requires_path_b_and_path_c") is not True:
+        return "path_b"
+    if strict_policy.get("phase") != "fwd":
+        return "path_b"
+
+    decision = data.get("scheduler_decision")
+    if not isinstance(decision, dict):
+        return "path_b"
+    mode = decision.get("mode")
+    if mode not in {"path_c_fwd_path_b_bwd", "path_c_fwd_bwd"}:
+        return "path_b"
+    if decision.get("selected_forward_kernel") != "path_c_tilelang_dsl":
+        return "path_b"
+    expected_bwd = (
+        "path_c_tilelang_dsl" if mode == "path_c_fwd_bwd" else "metal_kernel_bwd_v1"
+    )
+    if decision.get("selected_backward_kernel") != expected_bwd:
+        return "path_b"
+
+    shape = data.get("shape")
+    expected_shape = {
+        "batch": batch,
+        "seq": seq,
+        "heads": heads,
+        "headdim": headdim,
+        "state": state,
+        "dtype": dtype,
+    }
+    if not isinstance(shape, dict) or any(shape.get(k) != v for k, v in expected_shape.items()):
+        return "path_b"
+
+    timings = data.get("timings")
+    if not isinstance(timings, dict):
+        return "path_b"
+    fwd_b = timings.get("fwd_path_b")
+    fwd_c = timings.get("fwd_path_c")
+    if not isinstance(fwd_b, dict) or not isinstance(fwd_c, dict):
+        return "path_b"
+    try:
+        fwd_b_ms = float(fwd_b["median_ms"])
+        fwd_c_ms = float(fwd_c["median_ms"])
+        max_ratio = float(strict_policy["path_c_fwd_over_path_b_max_ratio"])
+    except (KeyError, TypeError, ValueError):
+        return "path_b"
+    if not (math.isfinite(fwd_b_ms) and math.isfinite(fwd_c_ms) and fwd_b_ms > 0):
+        return "path_b"
+    if (fwd_c_ms / fwd_b_ms) > max_ratio:
+        return "path_b"
+
+    if mode == "path_c_fwd_bwd":
+        if not plan.bwd_path_c_candidate:
+            return "path_b"
+        try:
+            bwd_ratio = float(decision["ratios"]["bwd_path_c_over_path_b"])
+            fwd_bwd_ratio = float(decision["ratios"]["fwd_bwd_path_c_over_path_b"])
+            max_bwd = float(strict_policy["path_c_bwd_over_path_b_max_ratio"])
+            max_fwd_bwd = float(
+                strict_policy["path_c_fwd_bwd_over_path_b_max_ratio"]
+            )
+        except (KeyError, TypeError, ValueError):
+            return "path_b"
+        if not (math.isfinite(bwd_ratio) and math.isfinite(fwd_bwd_ratio)):
+            return "path_b"
+        if bwd_ratio > max_bwd or fwd_bwd_ratio > max_fwd_bwd:
+            return "path_b"
+
+    return cast(str, mode)
+
+
 def mamba3_path_c_receipt_allows_auto_promotion(
     receipt_path: Path = _PATH_C_AUTO_PROMOTION_RECEIPT,
     *,
@@ -402,70 +503,18 @@ def mamba3_path_c_receipt_allows_auto_promotion(
 ) -> bool:
     """Fail-closed automatic Path C promotion gate backed by bench memory."""
 
-    plan = mamba3_path_c_schedule_plan(
-        batch=batch,
-        seq=seq,
-        heads=heads,
-        headdim=headdim,
-        state=state,
-        dtype=dtype,
+    return (
+        mamba3_path_c_receipt_auto_mode(
+            receipt_path,
+            batch=batch,
+            seq=seq,
+            heads=heads,
+            headdim=headdim,
+            state=state,
+            dtype=dtype,
+        )
+        != "path_b"
     )
-    if not plan.fwd_path_c_candidate or not plan.z3_proved:
-        return False
-    try:
-        data = json.loads(receipt_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return False
-    if not isinstance(data, dict):
-        return False
-    if data.get("kernel") != "mamba3_mimo_path_c_vs_path_b":
-        return False
-    strict_policy = data.get("strict_policy")
-    if not isinstance(strict_policy, dict):
-        return False
-    if strict_policy.get("requires_path_b_and_path_c") is not True:
-        return False
-    if strict_policy.get("phase") != "fwd":
-        return False
-
-    decision = data.get("scheduler_decision")
-    if not isinstance(decision, dict):
-        return False
-    if decision.get("mode") != "path_c_fwd_path_b_bwd":
-        return False
-    if decision.get("selected_forward_kernel") != "path_c_tilelang_dsl":
-        return False
-    if decision.get("selected_backward_kernel") != "metal_kernel_bwd_v1":
-        return False
-
-    shape = data.get("shape")
-    expected_shape = {
-        "batch": batch,
-        "seq": seq,
-        "heads": heads,
-        "headdim": headdim,
-        "state": state,
-        "dtype": dtype,
-    }
-    if not isinstance(shape, dict) or any(shape.get(k) != v for k, v in expected_shape.items()):
-        return False
-
-    timings = data.get("timings")
-    if not isinstance(timings, dict):
-        return False
-    fwd_b = timings.get("fwd_path_b")
-    fwd_c = timings.get("fwd_path_c")
-    if not isinstance(fwd_b, dict) or not isinstance(fwd_c, dict):
-        return False
-    try:
-        fwd_b_ms = float(fwd_b["median_ms"])
-        fwd_c_ms = float(fwd_c["median_ms"])
-        max_ratio = float(strict_policy["path_c_fwd_over_path_b_max_ratio"])
-    except (KeyError, TypeError, ValueError):
-        return False
-    if not (math.isfinite(fwd_b_ms) and math.isfinite(fwd_c_ms) and fwd_b_ms > 0):
-        return False
-    return (fwd_c_ms / fwd_b_ms) <= max_ratio
 
 
 def mamba3_path_c_auto_fwd_path_b_bwd_allowed(
@@ -488,7 +537,41 @@ def mamba3_path_c_auto_fwd_path_b_bwd_allowed(
         return False
     if x.dtype != mx.float32:
         return False
-    return mamba3_path_c_receipt_allows_auto_promotion(
+    return (
+        mamba3_path_c_receipt_auto_mode(
+            receipt_path,
+            batch=batch,
+            seq=seq,
+            heads=heads,
+            headdim=headdim,
+            state=state,
+            dtype="float32",
+        )
+        == "path_c_fwd_path_b_bwd"
+    )
+
+
+def mamba3_path_c_auto_mode_for_inputs(
+    x: mx.array,
+    B: mx.array,
+    C: mx.array,
+    z: mx.array,
+    A: mx.array,
+    dt: mx.array,
+    D: mx.array,
+    h0: mx.array,
+    *,
+    receipt_path: Path = _PATH_C_AUTO_PROMOTION_RECEIPT,
+) -> str:
+    """Return AUTO's Path C mode for these inputs, or ``path_b``."""
+
+    try:
+        batch, seq, heads, headdim, state = _validate_inputs(x, B, C, z, A, dt, D, h0)
+    except Exception:
+        return "path_b"
+    if x.dtype != mx.float32:
+        return "path_b"
+    return mamba3_path_c_receipt_auto_mode(
         receipt_path,
         batch=batch,
         seq=seq,
@@ -639,10 +722,11 @@ def _bwd_kernel_for(
 ) -> tuple[Any, _msl_transform.TileLangMSLLowering]:
     """Build & cache the Path C TileLang bwd kernel for a given (B, T, H, P, N).
 
-    Mirrors the Path B MSL bwd kernel: rematerialises ``h[t]`` per lane on the
-    forward pass (writing into ``h_steps``) then walks the reverse pass to
-    accumulate per-lane partials. The host reduces partials to the final
-    gradient shapes (no atomics needed).
+    The forward prepass computes only the final ``h_T`` per lane in registers.
+    The reverse pass reconstructs ``h_{t-1}`` from the current ``h_t`` in place,
+    avoiding the global ``h_steps`` scratch tensor used by the legacy Path B
+    MSL kernel. The host reduces per-lane partials to the final gradient shapes
+    without atomics.
     """
 
     import tilelang.language as T
@@ -661,7 +745,6 @@ def _bwd_kernel_for(
         dt: T.Tensor((BATCH, SEQ, HEADS), "float32"),
         D: T.Tensor((HEADS,), "float32"),
         h0: T.Tensor((BATCH, HEADS, HEADDIM, STATE), "float32"),
-        h_steps: T.Tensor((BATCH, HEADS, HEADDIM, SEQ, STATE), "float32"),
         dx: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), "float32"),
         dz: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), "float32"),
         dB_partial: T.Tensor((BATCH, SEQ, HEADS, HEADDIM, STATE), "float32"),
@@ -676,13 +759,12 @@ def _bwd_kernel_for(
             global_lane = bx * THREADS + tid
             h_state = T.alloc_local((STATE,), "float32")
             dh = T.alloc_local((STATE,), "float32")
-            dD_acc = T.alloc_local((1,), "float32")
             if global_lane < LANES:
                 p = global_lane % HEADDIM
                 h = (global_lane // HEADDIM) % HEADS
                 b = global_lane // (HEADDIM * HEADS)
 
-                # Forward pass: rematerialise h[t] for this lane into h_steps.
+                # Forward prepass: keep only h_T in registers.
                 for n in T.serial(STATE):
                     h_state[n] = h0[b, h, p, n]
                 for t in T.serial(SEQ):
@@ -693,28 +775,28 @@ def _bwd_kernel_for(
                     for n in T.serial(STATE):
                         new_h = decay * h_state[n] + x_val * B[b, t, h, n]
                         h_state[n] = new_h
-                        h_steps[b, h, p, t, n] = new_h
 
-                # Reverse pass.
+                # Reverse pass. h_state[n] is h_t for the current t and is
+                # overwritten with h_{t-1} before the next reverse iteration.
                 for n in T.serial(STATE):
                     dh[n] = 0.0
-                dD_acc[0] = 0.0
+                dD_acc = T.alloc_var(T.float32, init=0.0)
                 D_h = D[h]
                 for r in T.serial(SEQ):
                     t = SEQ - 1 - r
                     A_val = A[b, t, h]
                     dt_val = dt[b, t, h]
                     decay = T.exp(A_val * dt_val)
+                    inv_decay = T.alloc_var(T.float32, init=1.0 / decay)
                     x_val = x[b, t, h, p]
                     z_val = z[b, t, h, p]
                     dY = dy[b, t, h, p]
 
-                    # y_state[t] = sum_n h_steps[t,n] * C[t,n]
-                    y_state = T.alloc_local((1,), "float32")
-                    y_state[0] = 0.0
+                    # y_state[t] = sum_n h_t[n] * C[t,n]
+                    y_state = T.alloc_var(T.float32, init=0.0)
                     for n in T.serial(STATE):
-                        y_state[0] = y_state[0] + h_steps[b, h, p, t, n] * C[b, t, h, n]
-                    y_skipped = y_state[0] + D_h * x_val
+                        y_state += h_state[n] * C[b, t, h, n]
+                    y_skipped = y_state + D_h * x_val
                     sig_z = 1.0 / (1.0 + T.exp(-z_val))
                     silu_z = z_val * sig_z
                     silu_dz = sig_z * (1.0 + z_val * (1.0 - sig_z))
@@ -723,35 +805,37 @@ def _bwd_kernel_for(
                     d_y_skipped = dY * silu_z
 
                     dz[b, t, h, p] = d_silu * silu_dz
-                    dD_acc[0] = dD_acc[0] + d_y_skipped * x_val
+                    dD_acc += d_y_skipped * x_val
 
                     # dh accumulates the y_state contribution.
                     for n in T.serial(STATE):
                         dh[n] = dh[n] + d_y_skipped * C[b, t, h, n]
 
-                    # Per-lane partials for B and C; host sums over P later.
-                    for n in T.serial(STATE):
-                        dC_partial[b, t, h, p, n] = d_y_skipped * h_steps[b, h, p, t, n]
-                        dB_partial[b, t, h, p, n] = dh[n] * x_val
-
-                    # dx contribution comes from the input branch + skip.
-                    dx_inp = T.alloc_local((1,), "float32")
-                    dx_inp[0] = 0.0
-                    for n in T.serial(STATE):
-                        dx_inp[0] = dx_inp[0] + dh[n] * B[b, t, h, n]
-                    dx_skip = d_y_skipped * D_h
-                    dx[b, t, h, p] = dx_skip + dx_inp[0]
-
-                    # Decay backward: pulls from h_prev (or h0 at t == 0).
-                    d_decay = T.alloc_local((1,), "float32")
-                    d_decay[0] = 0.0
+                    # Per-lane partials and h_prev reconstruction. Host sums
+                    # partials over P later; h_state is updated in-place to
+                    # h_{t-1} for the next reverse step.
+                    dx_inp = T.alloc_var(T.float32, init=0.0)
+                    d_decay = T.alloc_var(T.float32, init=0.0)
                     if t == 0:
                         for n in T.serial(STATE):
-                            d_decay[0] = d_decay[0] + dh[n] * h0[b, h, p, n]
+                            B_val = B[b, t, h, n]
+                            dC_partial[b, t, h, p, n] = d_y_skipped * h_state[n]
+                            dB_partial[b, t, h, p, n] = dh[n] * x_val
+                            dx_inp += dh[n] * B_val
+                            d_decay += dh[n] * h0[b, h, p, n]
                     else:
                         for n in T.serial(STATE):
-                            d_decay[0] = d_decay[0] + dh[n] * h_steps[b, h, p, t - 1, n]
-                    d_logdecay = d_decay[0] * decay
+                            B_val = B[b, t, h, n]
+                            dC_partial[b, t, h, p, n] = d_y_skipped * h_state[n]
+                            dB_partial[b, t, h, p, n] = dh[n] * x_val
+                            dx_inp += dh[n] * B_val
+                            h_prev = (h_state[n] - x_val * B_val) * inv_decay
+                            d_decay += dh[n] * h_prev
+                            h_state[n] = h_prev
+                    dx_skip = d_y_skipped * D_h
+                    dx[b, t, h, p] = dx_skip + dx_inp
+
+                    d_logdecay = d_decay * decay
                     dA_partial[b, t, h, p] = d_logdecay * dt_val
                     ddt_partial[b, t, h, p] = d_logdecay * A_val
 
@@ -762,7 +846,7 @@ def _bwd_kernel_for(
                 # After the backward sweep, dh is dh0 for this lane.
                 for n in T.serial(STATE):
                     dh0[b, h, p, n] = dh[n]
-                dD_partial[b, h, p] = dD_acc[0]
+                dD_partial[b, h, p] = dD_acc
 
     artifact = dispatch_lower(bwd, target="metal", return_msl=True)
     if hasattr(artifact, "_tilelang_engine_target"):
@@ -875,7 +959,6 @@ def _mamba3_bwd_owner_outputs(
             f"{op_name}: out must be a tuple matching {_BWD_OUTPUT_NAMES!r}"
         )
     expected_shapes = (
-        (batch, heads, headdim, seq, state),
         (batch, seq, heads, headdim),
         (batch, seq, heads, headdim),
         (batch, seq, heads, headdim, state),
@@ -1068,7 +1151,6 @@ def _mamba3_mimo_bwd_path_c_kernel(
             out_list = kernel(dy, x, B, C, z, A, dt, D, h0)
         else:
             (
-                h_steps,
                 dx,
                 dz,
                 dB_partial,
@@ -1089,7 +1171,6 @@ def _mamba3_mimo_bwd_path_c_kernel(
                 D,
                 h0,
                 out=(
-                    h_steps,
                     dx,
                     dz,
                     dB_partial,
@@ -1114,8 +1195,8 @@ def _mamba3_mimo_bwd_path_c_kernel(
             raise RuntimeError(
                 "Mamba3 Path C bwd tvm-ffi did not return caller-owned outputs"
             )
-    _h_scratch, dx_pc, dz_pc, dB_p, dC_p, dA_p, ddt_p, dD_p, dh0_pc = out_list
-    del lowering, _h_scratch
+    dx_pc, dz_pc, dB_p, dC_p, dA_p, ddt_p, dD_p, dh0_pc = out_list
+    del lowering
     # Reduce P-dim partials into final shapes.
     dB_pc = mx.sum(dB_p, axis=3)         # -> (B, T, H, N)
     dC_pc = mx.sum(dC_p, axis=3)         # -> (B, T, H, N)
@@ -1302,7 +1383,9 @@ __all__ = [
     "mamba3_mimo_apply_with_state_path_c",
     "mamba3_mimo_apply_with_state_path_c_fwd_path_b_bwd",
     "mamba3_path_c_auto_fwd_path_b_bwd_allowed",
+    "mamba3_path_c_auto_mode_for_inputs",
     "mamba3_path_c_receipt_allows_auto_promotion",
+    "mamba3_path_c_receipt_auto_mode",
     "mamba3_path_c_schedule_plan",
     "mamba3_mimo_bwd_path_c",
     "mamba3_mimo_fwd_path_c",

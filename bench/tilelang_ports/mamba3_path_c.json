@@ -33,58 +33,58 @@
   "timings": {
     "fwd_path_b": {
       "label": "fwd_path_b",
-      "mean_ms": 1.0821525240316987,
-      "median_ms": 1.057708461303264,
-      "min_ms": 0.9942920878529549,
-      "max_ms": 1.4027919387444854,
+      "mean_ms": 1.0798392607830465,
+      "median_ms": 1.0521250078454614,
+      "min_ms": 0.995374983176589,
+      "max_ms": 1.7915830248966813,
       "iters": 50,
       "warmup": 5,
       "measurement": "paired_alternating"
     },
     "fwd_path_c": {
       "label": "fwd_path_c",
-      "mean_ms": 1.1843224382027984,
-      "median_ms": 1.1561459978111088,
-      "min_ms": 1.111124991439283,
-      "max_ms": 1.5131660038605332,
+      "mean_ms": 1.1757891066372395,
+      "median_ms": 1.1604784522205591,
+      "min_ms": 1.0975829791277647,
+      "max_ms": 1.4729578979313374,
       "iters": 50,
       "warmup": 5,
       "measurement": "paired_alternating"
     },
     "fwd_bwd_path_b": {
       "label": "fwd_bwd_path_b",
-      "mean_ms": 7.4003691133111715,
-      "median_ms": 7.359457958955318,
-      "min_ms": 7.240416947752237,
-      "max_ms": 8.281375048682094,
+      "mean_ms": 7.489335818681866,
+      "median_ms": 7.47664604568854,
+      "min_ms": 7.227416965179145,
+      "max_ms": 8.520583040080965,
       "iters": 50,
       "warmup": 5,
       "measurement": "paired_alternating"
     },
     "fwd_bwd_path_c": {
       "label": "fwd_bwd_path_c",
-      "mean_ms": 8.536860716994852,
-      "median_ms": 8.530562045052648,
-      "min_ms": 8.366790949366987,
-      "max_ms": 8.818833041004837,
+      "mean_ms": 12.46490741148591,
+      "median_ms": 12.467021006159484,
+      "min_ms": 12.124791042879224,
+      "max_ms": 12.913750018924475,
       "iters": 50,
       "warmup": 5,
       "measurement": "paired_alternating"
     },
-    "bwd_path_b_median_ms": 6.301749497652054,
-    "bwd_path_c_median_ms": 7.374416047241539
+    "bwd_path_b_median_ms": 6.424521037843078,
+    "bwd_path_c_median_ms": 11.306542553938925
   },
   "gflops": {
-    "fwd_path_b": 40.89383944863648,
-    "fwd_path_c": 37.41202242786884,
-    "fwd_bwd_path_b": 23.50920964083606,
-    "fwd_bwd_path_c": 20.281786720060392
+    "fwd_path_b": 41.11085629318414,
+    "fwd_path_c": 37.27235082843162,
+    "fwd_bwd_path_b": 23.14072900371823,
+    "fwd_bwd_path_c": 13.877817316143112
   },
   "memory_bytes_peak": {
     "fwd_path_b": 5013536,
     "fwd_path_c": 5013536,
     "fwd_bwd_path_b": 111543876,
-    "fwd_bwd_path_c": 109347884
+    "fwd_bwd_path_c": 76875324
   },
   "strict_policy": {
     "phase": "fwd",
@@ -109,34 +109,35 @@
       "threads": 256,
       "grid_blocks": 1,
       "fwd_path_c_candidate": true,
-      "bwd_path_c_candidate": false,
-      "mode": "path_c_fwd_path_b_bwd",
+      "bwd_path_c_candidate": true,
+      "mode": "path_c_fwd_bwd",
       "z3_used": true,
       "z3_proved": true,
-      "reason": "rule: fp32 per-lane scan with 256 threads over 1 blocks; z3 proved per-lane index decomposition and buffer bounds; bwd remains Path B until bench receipt proves Path C bwd no-worse"
+      "reason": "rule: fp32 per-lane scan with 256 threads over 1 blocks; z3 proved per-lane index decomposition and buffer bounds; bwd reverse pass reconstructs h_prev in per-lane registers without global h_steps scratch"
     },
     "ratios": {
-      "fwd_path_c_over_path_b": 1.093066794971607,
-      "bwd_path_c_over_path_b": 1.1702172626806486,
-      "fwd_bwd_path_c_over_path_b": 1.1591291223659044
+      "fwd_path_c_over_path_b": 1.1029853330803188,
+      "bwd_path_c_over_path_b": 1.7599043551011393,
+      "fwd_bwd_path_c_over_path_b": 1.6674617107691863
     },
     "optimization_policy": "AUTO only promotes a Path C phase when the rule/Z3 plan is safe and paired bench receipt median is no-worse than Path B.",
     "blocked_path_c_codegen_gaps": [
       "lowered Path C fwd still recomputes some lane-derived indices inside the t loop",
       "lowered Path C fwd still reloads D[h] inside the t loop",
-      "Path C bwd rematerializes h_steps through the DSL route and is slower on this receipt"
+      "Path C bwd still pays per-lane partial writes plus host P-axis reductions"
     ],
     "remembered_optimizations": [
       "TileLang local.var scalar y_acc instead of thread float[1]",
       "TileLang Metal local.var PrintExpr statement-order fix",
       "Bench harness uses paired alternating samples to avoid order/warmup drift",
-      "Path C forward auto-promotes only on receipt-covered no-worse fwd",
-      "Path B backward remains selected until Path C bwd receipt is no-worse"
+      "Path C bwd reconstructs h_prev in-place from h_t instead of writing global h_steps",
+      "AUTO selects full Path C only when fwd, bwd, and fwd+bwd receipts are no-worse",
+      "AUTO can still select Path C forward with Path B backward when only fwd is no-worse"
     ]
   },
-  "ratio_path_c_over_path_b_fwd": 1.093066794971607,
-  "ratio_path_c_over_path_b_bwd": 1.1702172626806486,
-  "ratio_path_c_over_path_b_fwd_bwd": 1.1591291223659044,
-  "verdict": "Path C is between 10% and 20% slower than Path B; close enough to Path B that it is best kept as a documentation artifact; not in the hot path.",
+  "ratio_path_c_over_path_b_fwd": 1.1029853330803188,
+  "ratio_path_c_over_path_b_bwd": 1.7599043551011393,
+  "ratio_path_c_over_path_b_fwd_bwd": 1.6674617107691863,
+  "verdict": "Path C is >20% slower than Path B; recommend keeping Path B as primary, KEEPING Path C as a reproducibility artifact (proves the DSL path works), and flagging the perf gap as a future TileLang scheduler bug.",
   "matched_run_guard": "Compare Path B and Path C only when both rows were collected on the same hardware with identical kernel inputs. This is a local_only receipt."
 }

@@ -118,15 +118,17 @@ The lowered MSL is structurally the same per-lane scan:
 - Time is serial inside the thread.
 - State dimension is serial inside the thread with `thread float h_state[64]`.
 - Forward uses per-timestep `exp` for decay and another `exp` for the sigmoid.
-- Backward rematerializes `h_steps` into global scratch, then performs a serial
-  reverse scan and emits per-lane partial gradients.
+- Backward computes only `h_T` in a forward register prepass, then reconstructs
+  `h_{t-1}` in-place from `h_t` during the serial reverse scan and emits
+  per-lane partial gradients.
 - Host-side MLX reductions over the `P` axis are still needed for `dB`, `dC`,
   `dA`, `ddt`, and `dD`.
 
 The dominant cost is therefore the same in Path B and Path C: serial recurrent
-work per lane plus large backward scratch traffic. The current Path C win comes
-from avoiding the register-pressure/occupancy cliff in the backward replay and
-reverse-scan kernel, not from a different algorithm.
+work per lane plus partial-gradient traffic. The in-place Path C backward
+removes global `h_steps` scratch from the TileLang ABI, but it pays extra
+reverse recurrence math, so AUTO still requires a no-worse bench receipt before
+selecting it.
 
 ## Threadgroup Tuning
 

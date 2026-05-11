@@ -165,7 +165,8 @@ def _gflops(*, batch: int, seq: int, heads: int, headdim: int, state: int, ms: f
       - sigmoid + silu and skip path: ~10 extra flops per timestep.
 
     Total flops ~= batch * heads * headdim * seq * (5 * state + 10).
-    For the bwd pass the cost is roughly 3x the fwd cost (replay h_steps + reverse pass).
+    For the bwd pass the cost is roughly 2x the fwd cost plus gradient math:
+    one forward register prepass to h_T, then an in-place reverse recurrence.
     """
 
     if ms <= 0.0:
@@ -419,18 +420,32 @@ def main() -> int:
         "path_c_fwd_bwd_over_path_b_max_ratio": 1.0,
         "path_c_bwd_over_path_b_max_ratio": 1.0,
     }
+    auto_promotes_full = (
+        schedule_plan.fwd_path_c_candidate
+        and schedule_plan.bwd_path_c_candidate
+        and fwd_ratio <= strict_policy["path_c_fwd_over_path_b_max_ratio"]
+        and bwd_ratio <= strict_policy["path_c_bwd_over_path_b_max_ratio"]
+        and fwd_bwd_ratio <= strict_policy["path_c_fwd_bwd_over_path_b_max_ratio"]
+    )
     auto_promotes_fwd = (
         schedule_plan.fwd_path_c_candidate
         and fwd_ratio <= strict_policy["path_c_fwd_over_path_b_max_ratio"]
     )
-    scheduler_mode = "path_c_fwd_path_b_bwd" if auto_promotes_fwd else "path_b"
+    if auto_promotes_full:
+        scheduler_mode = "path_c_fwd_bwd"
+    elif auto_promotes_fwd:
+        scheduler_mode = "path_c_fwd_path_b_bwd"
+    else:
+        scheduler_mode = "path_b"
     scheduler_decision = {
         "source": "rule_z3_test_receipt",
         "mode": scheduler_mode,
         "selected_forward_kernel": (
             "path_c_tilelang_dsl" if auto_promotes_fwd else "metal_kernel_fwd_v1"
         ),
-        "selected_backward_kernel": "metal_kernel_bwd_v1",
+        "selected_backward_kernel": (
+            "path_c_tilelang_dsl" if auto_promotes_full else "metal_kernel_bwd_v1"
+        ),
         "rule_z3_plan": schedule_plan.as_feature_dict(),
         "ratios": {
             "fwd_path_c_over_path_b": fwd_ratio,
@@ -444,19 +459,25 @@ def main() -> int:
         "blocked_path_c_codegen_gaps": [
             "lowered Path C fwd still recomputes some lane-derived indices inside the t loop",
             "lowered Path C fwd still reloads D[h] inside the t loop",
-            "Path C bwd rematerializes h_steps through the DSL route and is slower on this receipt",
+            "Path C bwd still pays per-lane partial writes plus host P-axis reductions",
         ],
         "remembered_optimizations": [
             "TileLang local.var scalar y_acc instead of thread float[1]",
             "TileLang Metal local.var PrintExpr statement-order fix",
             "Bench harness uses paired alternating samples to avoid order/warmup drift",
-            "Path C forward auto-promotes only on receipt-covered no-worse fwd",
-            "Path B backward remains selected until Path C bwd receipt is no-worse",
+            "Path C bwd reconstructs h_prev in-place from h_t instead of writing global h_steps",
+            "AUTO selects full Path C only when fwd, bwd, and fwd+bwd receipts are no-worse",
+            "AUTO can still select Path C forward with Path B backward when only fwd is no-worse",
         ],
     }
 
     ratio = fwd_bwd_ratio
-    if auto_promotes_fwd and ratio > 1.0:
+    if auto_promotes_full:
+        verdict = (
+            "Path C forward and backward are no-worse than Path B; scheduler "
+            "selects full Path C."
+        )
+    elif auto_promotes_fwd and ratio > 1.0:
         verdict = (
             "Path C forward is no-worse than Path B and is eligible for AUTO "
             "promotion, but Path C backward is slower; scheduler selects Path C "

@@ -46,6 +46,7 @@ from cppmega_mlx.nn._tilelang.mamba3_path_c import (
     mamba3_mimo_fwd_path_c,
     mamba3_mimo_path_c_status,
     mamba3_path_c_receipt_allows_auto_promotion,
+    mamba3_path_c_receipt_auto_mode,
     mamba3_path_c_schedule_plan,
 )
 
@@ -123,9 +124,10 @@ def test_lowered_fwd_msl_contains_kernel_void() -> None:
 def test_lowered_bwd_msl_contains_kernel_void() -> None:
     msl = dump_lowered_bwd_msl(batch=1, seq=4, heads=1, headdim=2, state=4)
     assert "kernel void" in msl
-    # The bwd kernel emits the partials, dh0, dx, dz, etc. plus the scratch.
-    for name in ("A", "B", "C", "D", "dt", "dy", "h0", "h_steps", "x", "z"):
+    # The bwd kernel emits partials, dh0, dx, dz, etc. without global h_steps scratch.
+    for name in ("A", "B", "C", "D", "dt", "dy", "h0", "x", "z"):
         assert name in msl, f"input buffer {name!r} missing from lowered MSL"
+    assert "h_steps" not in msl
     for name in (
         "dA_partial",
         "dB_partial",
@@ -210,8 +212,8 @@ def test_mamba3_path_c_schedule_plan_uses_rule_and_z3_for_spec_shape(
     assert plan.threads == 256
     assert plan.grid_blocks == 1
     assert plan.fwd_path_c_candidate is True
-    assert plan.bwd_path_c_candidate is False
-    assert plan.mode == "path_c_fwd_path_b_bwd"
+    assert plan.bwd_path_c_candidate is True
+    assert plan.mode == "path_c_fwd_bwd"
     assert plan.z3_used is True
     assert plan.z3_proved is True
 
@@ -265,6 +267,44 @@ def test_mamba3_path_c_receipt_gate_requires_matching_shape_and_fwd_win(
         headdim=32,
         state=64,
         dtype="float32",
+    )
+    assert (
+        mamba3_path_c_receipt_auto_mode(
+            receipt_path,
+            batch=2,
+            seq=512,
+            heads=4,
+            headdim=32,
+            state=64,
+            dtype="float32",
+        )
+        == "path_c_fwd_path_b_bwd"
+    )
+
+    full_path_c = json.loads(json.dumps(receipt))
+    full_path_c["scheduler_decision"] = {
+        "mode": "path_c_fwd_bwd",
+        "selected_forward_kernel": "path_c_tilelang_dsl",
+        "selected_backward_kernel": "path_c_tilelang_dsl",
+        "ratios": {
+            "bwd_path_c_over_path_b": 0.9,
+            "fwd_bwd_path_c_over_path_b": 0.95,
+        },
+    }
+    full_path_c["strict_policy"]["path_c_bwd_over_path_b_max_ratio"] = 1.0
+    full_path_c["strict_policy"]["path_c_fwd_bwd_over_path_b_max_ratio"] = 1.0
+    receipt_path.write_text(json.dumps(full_path_c), encoding="utf-8")
+    assert (
+        mamba3_path_c_receipt_auto_mode(
+            receipt_path,
+            batch=2,
+            seq=512,
+            heads=4,
+            headdim=32,
+            state=64,
+            dtype="float32",
+        )
+        == "path_c_fwd_bwd"
     )
 
     wrong_shape = json.loads(json.dumps(receipt))
@@ -385,7 +425,6 @@ def test_bwd_path_c_owner_outputs_avoid_hidden_zero_alloc(
     x, B, C, z, A, dt, D, h0 = inputs
     dy = mx.ones(x.shape, dtype=mx.float32)
     owner_outputs = (
-        mx.zeros((1, 2, 4, 6, 4), dtype=mx.float32),
         mx.zeros(x.shape, dtype=mx.float32),
         mx.zeros(z.shape, dtype=mx.float32),
         mx.zeros((1, 6, 2, 4, 4), dtype=mx.float32),
@@ -404,9 +443,9 @@ def test_bwd_path_c_owner_outputs_avoid_hidden_zero_alloc(
 
     grads = mamba3_mimo_bwd_path_c(dy, x, B, C, z, A, dt, D, h0, out=owner_outputs)
     mx.eval(*grads)
-    assert grads[0] is owner_outputs[1]
-    assert grads[3] is owner_outputs[2]
-    assert grads[7] is owner_outputs[8]
+    assert grads[0] is owner_outputs[0]
+    assert grads[3] is owner_outputs[1]
+    assert grads[7] is owner_outputs[7]
 
 
 def test_bwd_path_c_default_outputs_use_tilelang_write_only_alloc(
