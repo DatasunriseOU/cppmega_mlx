@@ -286,14 +286,13 @@ def _fwd_kernel_for(
                     decay = T.exp(A_val * dt_val)
                     x_val = x[b, t, h, p]
                     z_val = z[b, t, h, p]
-                    y_acc = T.alloc_local((1,), "float32")
-                    y_acc[0] = 0.0
+                    y_acc = T.alloc_var(T.float32, init=0.0)
                     for n in T.serial(STATE):
                         new_h = decay * h_state[n] + x_val * B[b, t, h, n]
                         h_state[n] = new_h
-                        y_acc[0] = y_acc[0] + new_h * C[b, t, h, n]
+                        y_acc += new_h * C[b, t, h, n]
                     D_h = D[h]
-                    y_skipped = y_acc[0] + D_h * x_val
+                    y_skipped = y_acc + D_h * x_val
                     sig_z = 1.0 / (1.0 + T.exp(-z_val))
                     y[b, t, h, p] = z_val * sig_z * y_skipped
                 for n in T.serial(STATE):

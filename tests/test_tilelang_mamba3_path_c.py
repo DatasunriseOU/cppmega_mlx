@@ -138,6 +138,8 @@ def test_lowered_msl_reuses_hot_scalar_temporaries() -> None:
     """TileLang CSE plus scalar binding reuse avoids hot exp/sigmoid recompute."""
 
     fwd = dump_lowered_fwd_msl(batch=1, seq=4, heads=1, headdim=2, state=4)
+    assert "float y_acc = " in fwd
+    assert "thread float y_acc[1]" not in fwd
     assert len(re.findall(r"float decay = exp\(", fwd)) == 1
     assert re.search(r"exp\([^;\n]+\) \* h_state", fwd) is None
     assert len(re.findall(r"float sig_z = .*exp\(", fwd)) == 1
