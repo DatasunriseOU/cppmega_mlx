@@ -15,6 +15,16 @@ from cppmega_mlx.runtime.kernel_policy import KernelPath, record_dispatch, selec
 
 AttentionMode = Literal["mla", "dsa"]
 RopeType = Literal["standard", "llama3", "yarn"]
+SPARSE_MLA_FP8_PRODUCER_OWNER = (
+    "cppmega_mlx.nn.attention.CausalSelfAttention.prepare_sparse_mla_fp8"
+)
+SPARSE_MLA_FP8_PRODUCER_STAGE = "attention_qkv_projection"
+SPARSE_MLA_FP8_PREPARED_BUFFER_NAMES = (
+    "q_fp8",
+    "q_scale",
+    "kv_fp8",
+    "kv_scale",
+)
 
 
 @dataclass(frozen=True)
@@ -179,6 +189,10 @@ class SparseMLAFp8Prepared:
     # dkv_partial materialization; the sparse indices may come from causal or
     # explicit document masks.
     causal: bool = False
+    producer_owner: str = SPARSE_MLA_FP8_PRODUCER_OWNER
+    producer_stage: str = SPARSE_MLA_FP8_PRODUCER_STAGE
+    prepared_buffer_names: tuple[str, ...] = SPARSE_MLA_FP8_PREPARED_BUFFER_NAMES
+    hidden_wrapper_quantization_allowed: bool = False
 
 
 def causal_sdpa_mask(
@@ -616,9 +630,6 @@ class CausalSelfAttention(nn.Module):
             )
         cfg = self.config
         batch, seq, _ = hidden_states.shape
-        from cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c import (
-            _to_fp8_with_per_token_scale,
-        )
 
         q, kv = self._project_sparse_mla_qkv_bshd(
             hidden_states, rope_offset=rope_offset
@@ -677,16 +688,12 @@ class CausalSelfAttention(nn.Module):
             causal=full_window_owner_buffers,
         )
 
-    def _call_sparse_mla_fp8_path_c(
+    def _apply_sparse_mla_fp8_path_c_prepared(
         self,
-        hidden_states: mx.array,
+        prepared: SparseMLAFp8Prepared,
         *,
-        rope_offset: int = 0,
-        key_length: int | None = None,
-        mask: mx.array | Literal["causal"] | None = None,
+        output_shape: tuple[int, int, int],
         sinks: mx.array | None = None,
-        kv_cache: ContiguousKVCache | None = None,
-        layer_idx: int | None = None,
     ) -> mx.array:
         from cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c import (
             sparse_mla_fp8_path_c_apply,
@@ -694,17 +701,12 @@ class CausalSelfAttention(nn.Module):
         )
 
         sinks = _validate_attention_sinks(sinks, self.config.num_q_heads)
-        prepared = self.prepare_sparse_mla_fp8(
-            hidden_states,
-            rope_offset=rope_offset,
-            key_length=key_length,
-            mask=mask,
-            kv_cache=kv_cache,
-            layer_idx=layer_idx,
-        )
-        if kv_cache is None:
-            if prepared.q is None or prepared.kv is None:
-                raise RuntimeError("prepared Path C buffers are missing float owners")
+        if prepared.hidden_wrapper_quantization_allowed:
+            raise RuntimeError(
+                "Sparse-MLA FP8 Path C requires producer-owned prepared buffers; "
+                "wrapper quantization is not allowed"
+            )
+        if prepared.q is not None and prepared.kv is not None:
             out = sparse_mla_fp8_path_c_apply_prepared_float(
                 prepared.q,
                 prepared.kv,
@@ -738,12 +740,9 @@ class CausalSelfAttention(nn.Module):
         record_dispatch(
             "sparse_mla", KernelPath.PATH_C, "tilelang_fp8_prepared_path_c_fwd"
         )
-        out = out.astype(hidden_states.dtype)
-        out = out.reshape(
-            hidden_states.shape[0],
-            hidden_states.shape[1],
-            self.config.q_proj_dim,
-        )
+        # out_proj consumes the Path C output directly; do not stage a
+        # full-tensor dtype cast at this boundary.
+        out = out.reshape(output_shape)
         return self.out_proj(out)
 
     def _use_sparse_mla_fp8_path_c(
@@ -788,13 +787,22 @@ class CausalSelfAttention(nn.Module):
             cache_position = kv_cache.layer_position(cache_layer_idx)
 
         if self._use_sparse_mla_fp8_path_c(mask, sinks=sinks, kv_cache=kv_cache):
-            return self._call_sparse_mla_fp8_path_c(
+            prepared = self.prepare_sparse_mla_fp8(
                 hidden_states,
                 rope_offset=cache_position,
+                key_length=None,
                 mask=mask,
-                sinks=sinks,
                 kv_cache=kv_cache,
                 layer_idx=cache_layer_idx,
+            )
+            return self._apply_sparse_mla_fp8_path_c_prepared(
+                prepared,
+                output_shape=(
+                    hidden_states.shape[0],
+                    hidden_states.shape[1],
+                    self.config.q_proj_dim,
+                ),
+                sinks=sinks,
             )
 
         q, k, v = self._project_qkv(hidden_states, rope_offset=cache_position)
@@ -840,6 +848,9 @@ __all__ = [
     "CausalSelfAttention",
     "RopeType",
     "SparseMLAFp8Prepared",
+    "SPARSE_MLA_FP8_PREPARED_BUFFER_NAMES",
+    "SPARSE_MLA_FP8_PRODUCER_OWNER",
+    "SPARSE_MLA_FP8_PRODUCER_STAGE",
     "apply_rotary_emb",
     "causal_sparse_indices",
     "causal_sdpa_mask",

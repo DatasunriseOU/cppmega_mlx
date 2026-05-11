@@ -80,10 +80,19 @@ cppmega_mlx/nn/_tilelang/sparse_mla_blockscaled.py provides:
    — High-level entry that prefers direct-MSL Path B, falls back to the
    reference, and supports force_metal=True to fail closed when Metal is
    unavailable.
-5. Path C E8M0 QK reducer in sparse_mla_blockscaled_path_c.py
-   — Experimental TileLang-DSL reducer. The checked-in receipt has the partial
-   reducer faster than Path B forward, but it is not a full QK/dispatch path
-   and is not production AUTO.
+5. Path C E8M0 prepared-buffer surfaces in sparse_mla_blockscaled_path_c.py
+   — TileLang-DSL QK reducer plus a fused prepared-buffer forward entry point.
+   The public Path C ABI consumes existing raw e4m3 bytes and E8M0 scale
+   tensors; it does not quantize float carriers or unpack packed MXFP8 words
+   inside the wrapper. The owner-output route
+   `sparse_mla_blockscaled_path_c_apply(..., out=..., lse=...)` compiles the
+   TileLang apply kernel with `execution_backend="tvm_ffi"` and returns the
+   same caller-owned `out`/`lse` MLX arrays instead of building an
+   `mx.fast.metal_kernel` wrapper. Reducer lowering failures now fail closed
+   instead of building a serial `mx.fast.metal_kernel` fallback; only the
+   non-dispatch legacy `T.fp8_scaled_matmul` probe can emit diagnostic MSL.
+   The checked-in receipt covers reducer timing only, so the full blockscaled
+   Path C route is not production AUTO.
 
 ## Scale tensor handling
 
@@ -160,18 +169,25 @@ receipt because E8M0 scale decode and e4m3 byte decode are fused into the sparse
 QK/SV loops. This is software FP8 emulation, not a CUDA/H100/H200-style native
 FP8 tensor-core claim. The Path C E8M0 reducer is faster than Path B forward on
 the partial QK-only receipt (`path_c_e8m0_qk_reduce_over_path_b_blockscaled_fwd
-=0.8168`), but full QK/layout dispatch is still unavailable. The checked-in
-receipt intentionally has `qk_reducer_strict.passed=true` and
-`strict.passed=false`: reducer-only support is available, full Path C
-blockscaled dispatch is not.
+=0.8168`). The checked-in receipt intentionally has
+`qk_reducer_strict.passed=true` and `strict.passed=false`: reducer support is
+available, while full Path C blockscaled AUTO promotion still needs a passing
+full-dispatch receipt.
 
 ## Next steps
 
 1. Keep production/default dispatch on Path B direct MSL.
 2. Keep native TileLang FP8/E8M0 `T.gemm` lowering fail-closed until float8
    storage, E8M0 scale plumbing, and Metal GEMM lowering are present together.
-3. Extend Path C from partial reducers to full-layout kernels only with paired
-   correctness and timing receipts.
+3. Keep full blockscaled Path C on the prepared-buffer API until paired
+   correctness and timing receipts clear the strict full-dispatch gate. Do not
+   add hidden quantization, casts, CPU staging, or serial fallback kernels in
+   the wrapper; prepared FP8 bytes and E8M0 scales stay as existing GPU buffers.
+   Data movement rule: the owner-output Path C forward consumes existing
+   `q_fp8`, `q_scale`, `kv_fp8`, `kv_scale`, and `indices` GPU buffers, writes
+   into caller-owned `out`/`lse`, and creates only the scalar `sm_scale`
+   control buffer. It does not allocate large outputs, stage CPU data, cast FP8
+   carriers, cast E8M0 scales, or quantize inside the wrapper.
 4. When tile-ai/tilelang HEAD lands FP8 + simdgroup support, verify the native
    path against Path B before changing dispatch policy:
 

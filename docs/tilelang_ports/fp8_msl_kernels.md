@@ -103,55 +103,54 @@ Headline numbers:
 
 ## Path C comparison
 
-The Path C bench harness is `scripts/bench_tilelang_fp8_path_c.py`; its strict
-gate requires Path C and Path B to run, Path C median ratio to be `<= 1.0`, and
-Path C vs Path B parity to stay within `1e-5` max abs/rel for parity-enabled
-shapes.
+The Path C bench harness is `scripts/bench_tilelang_fp8_path_c.py`. Older
+packed-dot4 and raw-MSL probe receipts showed useful correctness and scheduler
+signals for `matmul_128` and M=1 vecmat, but those receipts are no longer the
+production promotion gate.
 
-Current checked and live receipts for `matmul_128` use the compact simdgroup
-MSL path, not the older scalar fallback:
+The current production gate is the owner-output/tvm-ffi route that passes
+existing MLX Metal buffers through DLPack and writes into caller-owned outputs.
+That route is correctness-useful but still too slow for AUTO promotion:
 
-| Receipt | Path B median ms | Path C median ms | Paired Path C / Path B | Parity max abs / rel | Source markers |
-| --- | ---: | ---: | ---: | ---: | --- |
-| `bench/tilelang_ports/fp8_path_c_vs_path_b.json` | 0.1227 | 0.1076 | 0.890x | 0.0 / 0.0 | `simdgroup_multiply_accumulate=1`, `threadgroup_half=2`, `fp8_e4m3_lut=0` |
-| `bench/tilelang_ports/fp8_path_c.json` | 0.1521 | 0.1362 | 0.896x | 0.0 / 0.0 | same |
-| `/tmp/fp8_path_c_matmul128_before.json` (Lane 6 live run, 3 warmups / 8 iters, `--skip-xcrun`) | 0.2068 | 0.1738 | 0.835x | 0.0 / 0.0 | same |
+| Surface | Current production status |
+| --- | --- |
+| `fp8_scaled_matmul_path_c(..., out=...)` | about 14x slower than the shipped Path B/audiohacking-style MSL route |
+| `fp8_scaled_vecmat_path_c(..., out=...)` | about 1.7x slower than the shipped M=1 Path B `simd_sum` reducer |
 
-Path B remains valuable as the generic direct-MLX MSL fallback and correctness
-oracle. Path C is the preferred measured route only for the shapes and scale
-layouts covered by the strict receipts; larger or per-row/per-block shapes
-still need fresh receipts before claiming the same performance relationship.
+Path B remains the production route and correctness oracle for generic FP8
+matmul/vecmat. Path C must recover no-worse paired timing on the owner-output
+tvm-ffi path before it can be used as an AUTO route. The B[K,N] FP8 matmul
+layout remains a slow/diagnostic path; production callers should not infer that
+the transpose-B or packed-dot4 probe receipts close the B[K,N] gate.
 
-## Path C vecmat gate (Lane 7)
+## Path C owner-output ABI
 
-Path C now matches the Path B M=1 vecmat hot loop for the 4096x4096 gate:
+The production prepared-buffer ABI is the `out=` route:
 
-- Runtime body: `thread_index_in_simdgroup`, `reinterpret_cast<device const uint*>`
-  packed FP8 loads, LUT-backed dot4 decode, and literal `simd_sum(sum)`.
-- Launch shape: four SIMD groups per threadgroup, `threadgroup=(128, 1, 1)`,
-  with one SIMD group producing one output row.
-- Dispatch shape: direct MLX tuple dispatch returns `(N,)`, avoiding the older
-  TileLang buffer-map reshape path for the production reducer.
-- Strict local receipt:
-  `bench/tilelang_ports/lane7_fp8_vecmat_4096.json`, generated with
-  `scripts/bench_tilelang_fp8_path_c.py --shapes vecmat_4096 --warmup 10
-  --iters 50 --skip-sparse --strict --max-ratio 1.0`.
+- `fp8_scaled_matmul_path_c(..., out=existing_mx_array)`
+- `fp8_scaled_vecmat_path_c(..., out=existing_mx_array)`
 
-Latest strict result on Davids-Mac-Studio.local (MLX 0.31.1):
+Those calls compile TileLang with `execution_backend="tvm_ffi"` and pass the
+existing MLX buffers through DLPack. The wrapper does not allocate, copy, or
+cast the output. Supported output dtypes are `mx.float32` and `mx.float16`;
+unsupported shapes/dtypes fail before dispatch. `mx.bfloat16` is intentionally
+rejected for now because the current TileLang Metal codegen emits invalid MSL
+`bfloat` pointer/cast syntax for bf16 owner outputs. Direct-route DLPack
+ownership/device failures propagate as typed TileLang DLPack errors, and the
+direct route does not build `mx.fast.metal_kernel`.
 
-| Shape | Path B median ms | Path C median ms | Paired median ratio | Parity vs Path B |
-| --- | ---: | ---: | ---: | --- |
-| M=1,N=4096,K=4096 | 0.242562 | 0.238667 | 0.980702x | max_abs=0.0, max_rel=0.0 |
+The historical no-`out` APIs remain for legacy parity/bench callers and still
+use MLX allocation semantics, so they are fail-closed by default. To exercise
+them intentionally, set `CPPMEGA_FP8_PATH_C_LEGACY_MLX_FAST=1` in the test or
+benchmark process. New production call sites must pass `out=`; the no-`out`
+Path C route is non-owner-output legacy/debug only.
 
-The blocker list is empty for this gate:
-`path_b_fast_path_ready=true`, `missing=[]`, with runtime markers
-`packed_uint_loads=2`, `fp8_e4m3_lut=8`, and `simd_sum=1`.
-
-External check: current MLX custom Metal kernels support the raw MSL body/header
-path used here, and TileLang's public Metal backend landed separately upstream
-in `tile-ai/tilelang` PR #799. There is still no native Apple FP8 MMA path, so
-this gate is about matching the scalar-LUT vecmat reducer, not turning FP8
-matmul into a tensor-core-style path.
+Data movement note: the owner-output Path C routes require prepared `mx.uint8`
+e4m3 input buffers, existing `mx.float32` scale tensors, and an existing
+`mx.float32`/`mx.float16` output buffer. They do not allocate, copy, or cast
+large tensors at the Python wrapper boundary. The legacy no-`out` opt-in path
+necessarily allocates the returned MLX output because that is the
+`mx.fast.metal_kernel` API contract.
 
 ## How this complements the existing FP8 path
 

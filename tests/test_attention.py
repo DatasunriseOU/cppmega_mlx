@@ -14,6 +14,9 @@ from cppmega_mlx.inference.engine import (
 from cppmega_mlx.nn.attention import (
     AttentionConfig,
     CausalSelfAttention,
+    SPARSE_MLA_FP8_PREPARED_BUFFER_NAMES,
+    SPARSE_MLA_FP8_PRODUCER_OWNER,
+    SPARSE_MLA_FP8_PRODUCER_STAGE,
     SparseMLAFp8Prepared,
     causal_sparse_indices,
     causal_sdpa_mask,
@@ -198,6 +201,81 @@ def test_dsa_prepare_sparse_mla_fp8_emits_first_class_buffers() -> None:
     assert prepared.d_v == cfg.q_head_dim
     assert prepared.sm_scale == pytest.approx(cfg.q_head_dim**-0.5)
     assert prepared.causal is True
+    assert prepared.producer_owner == SPARSE_MLA_FP8_PRODUCER_OWNER
+    assert prepared.producer_stage == SPARSE_MLA_FP8_PRODUCER_STAGE
+    assert prepared.prepared_buffer_names == SPARSE_MLA_FP8_PREPARED_BUFFER_NAMES
+    assert prepared.hidden_wrapper_quantization_allowed is False
+
+
+def test_dsa_path_c_consumes_existing_prepared_buffers_without_wrapper_quantization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c as fp8_path_c
+
+    cfg = AttentionConfig(
+        d_model=16,
+        num_q_heads=4,
+        num_kv_heads=2,
+        mode="dsa",
+        sparse_topk=2,
+    )
+    attn = CausalSelfAttention(cfg)
+    x = _rand((1, 4, 16), seed=132)
+    prepared = attn.prepare_sparse_mla_fp8(x)
+    calls: list[dict[str, object]] = []
+
+    def fail_quantization(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise AssertionError("kernel-boundary quantization must not run")
+
+    def fake_apply(
+        q_fp8: mx.array,
+        q_scale: mx.array,
+        kv_fp8: mx.array,
+        kv_scale: mx.array,
+        indices: mx.array,
+        *,
+        sm_scale: float,
+        d_v: int | None = None,
+        sinks: mx.array | None = None,
+        return_lse: bool = False,
+        force_path_c: bool = False,
+    ) -> mx.array:
+        del sm_scale, d_v, sinks, return_lse
+        calls.append(
+            {
+                "q_fp8": q_fp8,
+                "q_scale": q_scale,
+                "kv_fp8": kv_fp8,
+                "kv_scale": kv_scale,
+                "indices": indices,
+                "force_path_c": force_path_c,
+            }
+        )
+        return mx.zeros((1, 4, 4, cfg.q_head_dim), dtype=mx.float16)
+
+    monkeypatch.setenv("CPPMEGA_KERNEL_PATH__SPARSE_MLA", "path_c")
+    monkeypatch.setattr(
+        fp8_path_c, "_to_fp8_with_per_token_scale", fail_quantization
+    )
+    monkeypatch.setattr(fp8_path_c, "sparse_mla_fp8_path_c_apply", fake_apply)
+    monkeypatch.setattr(
+        attn,
+        "prepare_sparse_mla_fp8",
+        lambda *args, **kwargs: prepared,
+    )
+
+    out = attn(x, mask="causal")
+    mx.eval(out)
+
+    assert out.shape == x.shape
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["q_fp8"] is prepared.q_fp8
+    assert call["q_scale"] is prepared.q_scale
+    assert call["kv_fp8"] is prepared.kv_fp8
+    assert call["kv_scale"] is prepared.kv_scale
+    assert call["indices"] is prepared.indices
+    assert call["force_path_c"] is True
 
 
 def test_dsa_path_c_routes_through_sparse_mla_fp8_prepared(

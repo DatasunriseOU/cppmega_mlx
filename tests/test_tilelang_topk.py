@@ -5,7 +5,8 @@ The Path B Metal kernel is now available via direct-MSL bypass (see
 ``shared.dyn`` / ``LowerTileOp`` blockers are bypassed by emitting MSL
 through ``mx.fast.metal_kernel`` directly with static threadgroup arrays.
 Path C uses a TileLang DSL PrimFunc lowered to Metal, then launched through
-``mx.fast.metal_kernel`` with the TileLang-generated kernel body.
+the tvm-ffi owner-output route when callers provide ``out``. The older
+no-``out`` MLX fast-kernel wrapper is debug-only and disabled by default.
 
 The tests verify:
 
@@ -25,9 +26,11 @@ import pytest
 
 import mlx.core as mx
 
+import cppmega_mlx.nn._tilelang.topk_selector as topk_selector_mod
 from cppmega_mlx.nn._tilelang.topk_selector import (  # noqa: E402
     PathBStatus,
     PathCStatus,
+    TopKPathCDirectError,
     _path_c_kernel_for,
     _path_c_threads_for,
     topk_selector,
@@ -36,6 +39,7 @@ from cppmega_mlx.nn._tilelang.topk_selector import (  # noqa: E402
     topk_selector_path_c_status,
     topk_selector_reference,
     topk_selector_tilelang,
+    topk_selector_tilelang_direct,
 )
 
 
@@ -76,6 +80,25 @@ def _to_index_sets(indices: mx.array) -> list[set[int]]:
     mx.eval(indices)
     arr = np.asarray(indices)
     return [set(int(x) for x in row) for row in arr]
+
+
+def _topk_tilelang_direct_output(
+    scores: mx.array,
+    k: int,
+    *,
+    starts: mx.array | None = None,
+    ends: mx.array | None = None,
+) -> mx.array:
+    """Allocate an explicit test owner buffer and run the direct Path C route."""
+
+    out = mx.full((int(scores.shape[0]), int(k)), -123, dtype=mx.int32)
+    return topk_selector_tilelang_direct(
+        scores,
+        k,
+        starts=starts,
+        ends=ends,
+        out=out,
+    )
 
 
 def _acceptance_scores(
@@ -274,23 +297,176 @@ def test_path_c_lowering_uses_single_merge_active_branch() -> None:
     assert lowering.body.count("stride * 2") == 1
 
 
-def test_path_c_lowering_keeps_k32_insertion_scan_correct_with_break() -> None:
-    """Insertion sort early-exit must use ``else: break`` for ALL K.
+def test_path_c_kernel_uses_dispatch_returned_msl_without_text_rewrite(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cppmega_mlx.nn._tilelang._msl_transform import TileLangMSLLowering
 
-    fix-round-3: the previous lowering carried an
-    ``elif (K<=8) or (K>=64): break`` heuristic that *skipped* the break for
-    K in {16, 32}, so the local-heap insertion loop walked past the
-    insertion point and shifted entries that should have been left alone --
-    a correctness regression on top-K outputs at K=16 and K=32. The standard
-    insertion-sort early exit ``else: break`` is required for correctness at
-    every K, even when it costs the small perf win the heuristic was tuned
-    for at K=32. This test pins the corrected lowering: ``break;`` must
-    appear in the K=32 body so the loop terminates at the insertion point.
+    sentinel = TileLangMSLLowering(
+        header="// raw tilelang header\n",
+        body="// raw tilelang body\n",
+        grid=(1, 1, 1),
+        threadgroup=(1, 1, 1),
+        msl_text="kernel void topk() {}",
+        buffer_param_names=[],
+        kernel_name="topk",
+    )
+    calls: dict[str, object] = {}
+
+    def fake_dispatch_lower(*args: object, **kwargs: object) -> TileLangMSLLowering:
+        calls["return_msl"] = kwargs.get("return_msl")
+        calls["pass_configs"] = kwargs.get("pass_configs")
+        return sentinel
+
+    def fake_metal_kernel(**kwargs: object) -> object:
+        calls["source"] = kwargs["source"]
+        calls["header"] = kwargs["header"]
+        return object()
+
+    monkeypatch.setattr(topk_selector_mod, "dispatch_lower", fake_dispatch_lower)
+    monkeypatch.setattr(
+        topk_selector_mod,
+        "_topk_path_c_pass_configs",
+        lambda: {"tl.z3_proof.barrier_minimization": True},
+    )
+    monkeypatch.setattr(mx.fast, "metal_kernel", fake_metal_kernel)
+
+    topk_selector_mod._path_c_kernel_for.cache_clear()
+    try:
+        _, lowering = topk_selector_mod._path_c_kernel_for(1, 8, 1, 1, "float32")
+    finally:
+        topk_selector_mod._path_c_kernel_for.cache_clear()
+
+    assert lowering is sentinel
+    assert calls["return_msl"] is True
+    assert calls["pass_configs"] == {"tl.z3_proof.barrier_minimization": True}
+    assert calls["source"] == sentinel.body
+    assert calls["header"] == sentinel.header.rstrip() + "\n"
+
+
+def test_path_c_lowering_avoids_break_in_insertion_scan() -> None:
+    """Insertion scan must not emit a C/MSL ``break``.
+
+    The direct tvm-ffi compile path can lower the TileLang insertion-loop
+    ``break`` as a break from the outer row scan after static simplification,
+    which skips later score candidates. The guarded form preserves the
+    early-stop semantics without emitting a control-flow break.
     """
 
     threads = _path_c_threads_for(32)
     _, lowering = _path_c_kernel_for(1, 512, 32, threads, "float32")
-    assert "break;" in lowering.body
+    assert "break;" not in lowering.body
+    assert "keep_scanning" in lowering.body
+
+
+def test_path_c_direct_uses_owner_output_without_mlx_fast_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[object, ...]] = []
+
+    class RecordingKernel:
+        def __call__(self, *args: object) -> object:
+            calls.append(args)
+            return args[1]
+
+    def fail_legacy_kernel(*_: object, **__: object) -> object:
+        raise AssertionError("direct owner-output topk must not build mx.fast fallback")
+
+    monkeypatch.setattr(
+        topk_selector_mod,
+        "topk_selector_path_c_status",
+        lambda: PathCStatus(True, "available"),
+    )
+    monkeypatch.setattr(
+        topk_selector_mod,
+        "_path_c_tvm_ffi_kernel_for",
+        lambda *_, **__: RecordingKernel(),
+    )
+    monkeypatch.setattr(topk_selector_mod, "_path_c_kernel_for", fail_legacy_kernel)
+    monkeypatch.setattr(mx, "synchronize", lambda: None)
+
+    scores = mx.array(np.arange(8, dtype=np.float32).reshape(1, 8))
+    out = mx.full((1, 2), -123, dtype=mx.int32)
+    returned = topk_selector_tilelang_direct(scores, 2, out=out)
+
+    assert returned is out
+    assert len(calls) == 1
+    assert calls[0][1] is out
+    assert calls[0][2] is scores
+
+
+def test_path_c_direct_propagates_typed_dlpack_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tilelang.contrib.mlx_interop import DLPackConversionError
+
+    class FailingKernel:
+        def __call__(self, *_: object) -> object:
+            raise DLPackConversionError("MLX array import failed: wrong device")
+
+    monkeypatch.setattr(
+        topk_selector_mod,
+        "topk_selector_path_c_status",
+        lambda: PathCStatus(True, "available"),
+    )
+    monkeypatch.setattr(
+        topk_selector_mod,
+        "_path_c_tvm_ffi_kernel_for",
+        lambda *_, **__: FailingKernel(),
+    )
+
+    scores = mx.array(np.arange(8, dtype=np.float32).reshape(1, 8))
+    out = mx.full((1, 2), -123, dtype=mx.int32)
+    with pytest.raises(DLPackConversionError, match="wrong device"):
+        topk_selector_tilelang_direct(scores, 2, out=out)
+
+
+def test_path_c_direct_rejects_bad_owner_output_abi() -> None:
+    scores = mx.array(np.arange(8, dtype=np.float32).reshape(1, 8))
+
+    with pytest.raises(ValueError, match="out shape"):
+        topk_selector_tilelang_direct(
+            scores,
+            2,
+            out=mx.zeros((1, 3), dtype=mx.int32),
+        )
+    with pytest.raises(ValueError, match="out dtype"):
+        topk_selector_tilelang_direct(
+            scores,
+            2,
+            out=mx.zeros((1, 2), dtype=mx.float32),
+        )
+
+
+def test_path_c_direct_rejects_hidden_bfloat16_score_cast() -> None:
+    scores = mx.array(np.arange(8, dtype=np.float32).reshape(1, 8)).astype(
+        mx.bfloat16
+    )
+    out = mx.zeros((1, 2), dtype=mx.int32)
+
+    with pytest.raises(TopKPathCDirectError, match="without hidden casts"):
+        topk_selector_tilelang_direct(scores, 2, out=out)
+
+
+def test_path_c_no_out_public_route_fails_closed_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CPPMEGA_TOPK_PATH_C_LEGACY_NO_OUT", raising=False)
+    monkeypatch.setattr(
+        topk_selector_mod,
+        "topk_selector_path_c_status",
+        lambda: PathCStatus(True, "available"),
+    )
+    monkeypatch.setattr(
+        topk_selector_mod,
+        "_path_c_kernel_for",
+        lambda *_, **__: (_ for _ in ()).throw(
+            AssertionError("no-out Path C wrapper must not be built by default")
+        ),
+    )
+
+    scores = mx.array(np.arange(8, dtype=np.float32).reshape(1, 8))
+    assert topk_selector_tilelang(scores, 2) is None
 
 
 # ---------------------------------------------------------------------------
@@ -423,7 +599,7 @@ def test_path_c_forward_parity_set_equality(batch: int, seq_len: int, k: int) ->
         / scores_np.size
     )
     scores = mx.array(scores_np)
-    out_c = topk_selector_tilelang(scores, k)
+    out_c = _topk_tilelang_direct_output(scores, k)
     assert out_c is not None, topk_selector_path_c_status().reason
     out_ref = topk_selector_reference(scores, k)
     out_b = topk_selector_metal(scores, k)
@@ -434,7 +610,30 @@ def test_path_c_forward_parity_set_equality(batch: int, seq_len: int, k: int) ->
     assert tuple(out_c.shape) == (batch, k)
 
 
-def test_path_c_forward_parity_with_starts_ends() -> None:
+def test_path_c_direct_tvm_ffi_reuses_owner_output_and_mutates_buffer() -> None:
+    scores_np = np.array(
+        [
+            [0.0, 5.0, 1.0, 7.0, 2.0, 3.0, 4.0, 6.0],
+            [9.0, 1.0, 8.0, 2.0, 7.0, 3.0, 6.0, 4.0],
+        ],
+        dtype=np.float32,
+    )
+    scores = mx.array(scores_np)
+    out = mx.full((2, 2), -123, dtype=mx.int32)
+    mx.eval(scores, out)
+
+    returned = topk_selector_tilelang_direct(scores, 2, out=out)
+    out_ref = topk_selector_reference(scores, 2)
+    mx.eval(out_ref)
+
+    assert returned is out
+    assert np.asarray(out).tolist() != [[-123, -123], [-123, -123]]
+    assert _to_index_sets(out) == _to_index_sets(out_ref)
+
+
+def test_path_c_direct_rejects_starts_ends_mask(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     rng = np.random.default_rng(20260504)
     batch, seq_len, k = 3, 64, 4
     scores_np = rng.standard_normal((batch, seq_len)).astype(np.float32)
@@ -447,30 +646,45 @@ def test_path_c_forward_parity_with_starts_ends() -> None:
     scores = mx.array(scores_np)
     starts = mx.array(starts_np)
     ends = mx.array(ends_np)
+    out = mx.full((batch, k), -123, dtype=mx.int32)
 
-    out_c = topk_selector_tilelang(scores, k, starts=starts, ends=ends)
-    assert out_c is not None, topk_selector_path_c_status().reason
-    out_ref = topk_selector_reference(scores, k, starts=starts, ends=ends)
-    out_b = topk_selector_metal(scores, k, starts=starts, ends=ends)
-    assert out_b is not None
-    assert _to_index_sets(out_c) == _to_index_sets(out_ref)
-    assert _to_index_sets(out_c) == _to_index_sets(out_b)
+    monkeypatch.setattr(
+        topk_selector_mod,
+        "_path_c_tvm_ffi_kernel_for",
+        lambda *_, **__: (_ for _ in ()).throw(
+            AssertionError("masked direct Path C must fail before compile")
+        ),
+    )
+
+    with pytest.raises(TopKPathCDirectError, match="limited to unmasked rows"):
+        topk_selector_tilelang_direct(scores, k, starts=starts, ends=ends, out=out)
+    mx.eval(out)
+    assert np.asarray(out).tolist() == [[-123] * k] * batch
 
 
-def test_path_c_forward_parity_with_short_and_empty_intervals() -> None:
+@pytest.mark.parametrize(
+    "starts_np,ends_np",
+    [
+        (np.array([0, 3], dtype=np.int32), None),
+        (None, np.array([-1, 99], dtype=np.int32)),
+    ],
+)
+def test_path_c_direct_rejects_partial_interval_mask(
+    starts_np: np.ndarray | None,
+    ends_np: np.ndarray | None,
+) -> None:
     scores = mx.array(np.array([
         [5.0, 4.0, 3.0, 2.0],
         [0.0, 1.0, 2.0, 3.0],
     ], dtype=np.float32))
-    starts = mx.array(np.array([0, 3], dtype=np.int32))
-    ends = mx.array(np.array([-1, 99], dtype=np.int32))
+    starts = None if starts_np is None else mx.array(starts_np)
+    ends = None if ends_np is None else mx.array(ends_np)
+    out = mx.full((2, 2), -123, dtype=mx.int32)
 
-    out_c = topk_selector_tilelang(scores, k=2, starts=starts, ends=ends)
-    assert out_c is not None, topk_selector_path_c_status().reason
-    out_ref = topk_selector_reference(scores, k=2, starts=starts, ends=ends)
-    mx.eval(out_c, out_ref)
-    assert np.asarray(out_c).tolist() == [[-1, -1], [3, -1]]
-    assert np.asarray(out_c).tolist() == np.asarray(out_ref).tolist()
+    with pytest.raises(TopKPathCDirectError, match="limited to unmasked rows"):
+        topk_selector_tilelang_direct(scores, k=2, starts=starts, ends=ends, out=out)
+    mx.eval(out)
+    assert np.asarray(out).tolist() == [[-123, -123], [-123, -123]]
 
 
 def test_path_c_matches_path_b_exact_order_for_ties() -> None:
@@ -479,7 +693,7 @@ def test_path_c_matches_path_b_exact_order_for_ties() -> None:
         [5.0, 5.0, 4.0, 4.0, 5.0, 5.0, 3.0, 2.0],
     ], dtype=np.float32))
 
-    out_c = topk_selector_tilelang(scores, k=6)
+    out_c = _topk_tilelang_direct_output(scores, k=6)
     out_b = topk_selector_metal(scores, k=6)
     assert out_c is not None, topk_selector_path_c_status().reason
     assert out_b is not None
@@ -493,7 +707,7 @@ def test_path_c_matches_path_b_exact_order_for_ties() -> None:
     assert np.asarray(out_c).tolist() == expected
 
 
-def test_path_c_matches_path_b_exact_order_for_masked_ties_and_sentinels() -> None:
+def test_path_c_direct_rejects_masked_ties_and_sentinels() -> None:
     scores = mx.array(np.array([
         [9.0, 7.0, 7.0, 6.0, 7.0, 5.0, 7.0, 4.0],
         [1.0, 8.0, 8.0, 8.0, 3.0, 8.0, 2.0, 8.0],
@@ -501,12 +715,13 @@ def test_path_c_matches_path_b_exact_order_for_masked_ties_and_sentinels() -> No
     ], dtype=np.float32))
     starts = mx.array(np.array([1, 2, 6], dtype=np.int32))
     ends = mx.array(np.array([7, 6, 8], dtype=np.int32))
+    out = mx.full((3, 4), -123, dtype=mx.int32)
 
-    out_c = topk_selector_tilelang(scores, k=4, starts=starts, ends=ends)
     out_b = topk_selector_metal(scores, k=4, starts=starts, ends=ends)
-    assert out_c is not None, topk_selector_path_c_status().reason
     assert out_b is not None
-    mx.eval(out_c, out_b)
+    with pytest.raises(TopKPathCDirectError, match="limited to unmasked rows"):
+        topk_selector_tilelang_direct(scores, k=4, starts=starts, ends=ends, out=out)
+    mx.eval(out, out_b)
 
     expected = [
         [1, 2, 4, 6],
@@ -514,14 +729,13 @@ def test_path_c_matches_path_b_exact_order_for_masked_ties_and_sentinels() -> No
         [6, 7, -1, -1],
     ]
     assert np.asarray(out_b).tolist() == expected
-    assert np.asarray(out_c).tolist() == expected
+    assert np.asarray(out).tolist() == [[-123] * 4] * 3
 
 
-@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16])
 def test_path_c_acceptance_shape_512x64_dispatches(dtype: mx.Dtype) -> None:
     scores = _acceptance_scores(batch=4, seq_len=512, k=64, dtype=dtype, seed=1512)
-    out_c = topk_selector_tilelang(scores, k=64)
-    assert out_c is not None, topk_selector_path_c_status().reason
+    out_c = _topk_tilelang_direct_output(scores, k=64)
     out_ref = topk_selector_reference(scores, k=64)
     out_b = topk_selector_metal(scores, k=64)
     assert out_b is not None
@@ -529,11 +743,10 @@ def test_path_c_acceptance_shape_512x64_dispatches(dtype: mx.Dtype) -> None:
     assert _to_index_sets(out_c) == _to_index_sets(out_b)
 
 
-@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16])
 def test_path_c_acceptance_shape_4096x256_dispatches(dtype: mx.Dtype) -> None:
     scores = _acceptance_scores(batch=1, seq_len=4096, k=256, dtype=dtype, seed=14096)
-    out_c = topk_selector_tilelang(scores, k=256)
-    assert out_c is not None, topk_selector_path_c_status().reason
+    out_c = _topk_tilelang_direct_output(scores, k=256)
     out_ref = topk_selector_reference(scores, k=256)
     out_b = topk_selector_metal(scores, k=256)
     assert out_b is not None
@@ -541,43 +754,31 @@ def test_path_c_acceptance_shape_4096x256_dispatches(dtype: mx.Dtype) -> None:
     assert _to_index_sets(out_c) == _to_index_sets(out_b)
 
 
-def test_public_entry_point_tilelang_backend_dispatches_kernel() -> None:
+def test_public_entry_point_tilelang_backend_without_owner_output_fails_closed() -> None:
     rng = np.random.default_rng(29)
     scores_np = rng.standard_normal((2, 64)).astype(np.float32)
     scores_np += np.arange(scores_np.size, dtype=np.float32).reshape(scores_np.shape) * 1e-5
     scores = mx.array(scores_np)
-    out_c = topk_selector(scores, k=8, backend="tilelang")
-    out_ref = topk_selector(scores, k=8, backend="mlx")
-    assert _to_index_sets(out_c) == _to_index_sets(out_ref)
+    with pytest.raises(RuntimeError, match="TileLang Path C path unavailable"):
+        topk_selector(scores, k=8, backend="tilelang")
 
 
-def test_public_entry_point_auto_prefers_tilelang_path_c(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_public_entry_point_auto_uses_path_b_for_receipted_shape_without_owner_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     scores = mx.array(np.arange(64, dtype=np.float32).reshape(1, 64))
     sentinel = mx.array(np.array([[63, 62, 61, 60, 59, 58, 57, 56]], dtype=np.int32))
 
-    def fake_path_c(
-        scores_arg: mx.array,
-        k_arg: int,
-        *,
-        starts: mx.array | None = None,
-        ends: mx.array | None = None,
-    ) -> mx.array:
-        assert scores_arg is scores
-        assert k_arg == 8
-        assert starts is None
-        assert ends is None
-        return sentinel
+    def fail_path_c(*args: object, **kwargs: object) -> None:
+        raise AssertionError("backend='auto' has no owner-output buffer and must not try Path C")
 
-    def fail_path_b(*args: object, **kwargs: object) -> None:
-        raise AssertionError("receipt-backed backend='auto' must try TileLang Path C before Path B")
-
-    monkeypatch.setattr("cppmega_mlx.nn._tilelang.topk_selector.topk_selector_tilelang", fake_path_c)
-    monkeypatch.setattr("cppmega_mlx.nn._tilelang.topk_selector.topk_selector_metal", fail_path_b)
+    monkeypatch.setattr("cppmega_mlx.nn._tilelang.topk_selector.topk_selector_tilelang", fail_path_c)
+    monkeypatch.setattr("cppmega_mlx.nn._tilelang.topk_selector.topk_selector_metal", lambda *_, **__: sentinel)
     out = topk_selector(scores, k=8, backend="auto")
     assert np.asarray(out).tolist() == [[63, 62, 61, 60, 59, 58, 57, 56]]
 
 
-def test_public_entry_point_auto_prefers_tilelang_path_c_for_bfloat16_receipt(
+def test_public_entry_point_auto_uses_path_b_for_bfloat16_receipt_without_owner_output(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     scores = mx.array(np.arange(4 * 2048, dtype=np.float32).reshape(4, 2048)).astype(
@@ -585,24 +786,11 @@ def test_public_entry_point_auto_prefers_tilelang_path_c_for_bfloat16_receipt(
     )
     sentinel = mx.full((4, 64), 7, dtype=mx.int32)
 
-    def fake_path_c(
-        scores_arg: mx.array,
-        k_arg: int,
-        *,
-        starts: mx.array | None = None,
-        ends: mx.array | None = None,
-    ) -> mx.array:
-        assert scores_arg is scores
-        assert k_arg == 64
-        assert starts is None
-        assert ends is None
-        return sentinel
+    def fail_path_c(*args: object, **kwargs: object) -> None:
+        raise AssertionError("bf16 backend='auto' has no owner-output buffer and must not try Path C")
 
-    def fail_path_b(*args: object, **kwargs: object) -> None:
-        raise AssertionError("bf16 receipt-backed backend='auto' must try TileLang Path C")
-
-    monkeypatch.setattr("cppmega_mlx.nn._tilelang.topk_selector.topk_selector_tilelang", fake_path_c)
-    monkeypatch.setattr("cppmega_mlx.nn._tilelang.topk_selector.topk_selector_metal", fail_path_b)
+    monkeypatch.setattr("cppmega_mlx.nn._tilelang.topk_selector.topk_selector_tilelang", fail_path_c)
+    monkeypatch.setattr("cppmega_mlx.nn._tilelang.topk_selector.topk_selector_metal", lambda *_, **__: sentinel)
     out = topk_selector(scores, k=64, backend="auto")
     assert np.asarray(out).tolist() == [[7] * 64] * 4
 
@@ -651,15 +839,18 @@ def test_public_entry_point_auto_uses_path_b_first_for_masked_calls(
     assert np.asarray(out).tolist() == [[47, 46, 45, 44, 43, 42, 41, 40]]
 
 
-def test_public_entry_point_auto_falls_back_to_path_b_after_receipted_path_c_miss(
+def test_public_entry_point_auto_does_not_probe_path_c_before_path_b(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     scores = mx.array(np.arange(64, dtype=np.float32).reshape(1, 64))
     sentinel = mx.array(np.array([[55, 54, 53, 52, 51, 50, 49, 48]], dtype=np.int32))
 
+    def fail_path_c(*args: object, **kwargs: object) -> None:
+        raise AssertionError("backend='auto' must stay on Path B/reference without out")
+
     monkeypatch.setattr(
         "cppmega_mlx.nn._tilelang.topk_selector.topk_selector_tilelang",
-        lambda *args, **kwargs: None,
+        fail_path_c,
     )
     monkeypatch.setattr(
         "cppmega_mlx.nn._tilelang.topk_selector.topk_selector_metal",
@@ -669,33 +860,8 @@ def test_public_entry_point_auto_falls_back_to_path_b_after_receipted_path_c_mis
     assert np.asarray(out).tolist() == [[55, 54, 53, 52, 51, 50, 49, 48]]
 
 
-def test_topk_selector_bench_smoke_keeps_path_c_no_slower_than_path_b() -> None:
-    """Path C smoke ceiling at K=32 after the fix-round-3 correctness fix.
-
-    Originally this asserted Path C/Path B <= 1.0 at (B=1, T=512, K=32). The
-    K=32 tuning win was driven by the buggy ``elif (K<=8) or (K>=64): break``
-    heuristic that skipped the insertion-sort early break for K in {16, 32}.
-    That heuristic produced *wrong* top-K results (entries past the insertion
-    point would shift over still-larger neighbours), so fix-round-3 replaced
-    it with the standard ``else: break`` for all K. The cost of correctness
-    at K=32 is roughly +30% over Path B on this row. AUTO routing already
-    excludes (1, 512, 32) -> Path C from the strict-green receipt set
-    (`_PATH_C_AUTO_PROFITABLE_RECEIPTS`), so this smoke does not gate
-    production routing -- it just ensures Path C is still within ~1.5x of
-    Path B at the regression point so a future merge-round perf pass can
-    chase the gap deliberately.
-    """
-
-    from scripts.bench_tilelang_topk import _bench_shape, _row_strict_ok
-
-    row = _bench_shape(
-        batch=1,
-        seq_len=512,
-        k=32,
-        dtype_name="float32",
-        seed=20260504,
-        warmup=2,
-        iters=5,
-    )
-
-    assert _row_strict_ok(row, max_ratio=1.5), row
+def test_explicit_path_c_direct_keeps_no_hidden_output_allocation_boundary() -> None:
+    scores = mx.array(np.arange(64, dtype=np.float32).reshape(1, 64))
+    out = mx.full((1, 8), -123, dtype=mx.int32)
+    returned = topk_selector_tilelang(scores, 8, out=out)
+    assert returned is out

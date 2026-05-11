@@ -34,19 +34,25 @@ This document is the authoritative source for **which kernel implementation each
       <td><strong>Path C</strong></td>
       <td>TileLang DSL <code>@T.prim_func</code> lowered to MSL via the<br>
       patched apple-head TileLang on Metal target.</td>
-      <td><code>cppmega_mlx/nn/_tilelang/mamba3_path_c.py</code> (full apply)<br>
+      <td><code>cppmega_mlx/nn/_tilelang/mamba3_path_c.py</code>
+      (direct tvm-ffi owner-output apply for DLPack-exportable contiguous FP32 buffers)<br>
       <code>cppmega_mlx/nn/_tilelang/sparse_mla_path_c.py</code> (full apply)<br>
-      <code>cppmega_mlx/nn/_tilelang/topk_selector.py</code> (backend="auto")<br>
+      <code>cppmega_mlx/nn/_tilelang/topk_selector.py</code>
+      (receipt-gated AUTO plus direct tvm-ffi owner-output entrypoint for
+      float32/float16 <code>topk_selector_tilelang_direct(..., out=...)</code>)<br>
       <code>cppmega_mlx/nn/_tilelang/sparse_mla_blockscaled_path_c.py</code>
       (prepared-buffer full apply + E8M0 QK reducer)<br>
       <code>cppmega_mlx/nn/_tilelang/sparse_mla_fp8_path_c.py</code>
       (prepared-buffer full apply + QK/indexed-QK reducers)<br>
+      <code>cppmega_mlx/nn/_tilelang/m2rnn_path_c.py</code>
+      (owner-output forward/backward; opt-in fail-closed route)<br>
+      <code>cppmega_mlx/nn/_tilelang/fp8_matmul_path_c.py</code> and
       <code>cppmega_mlx/nn/_tilelang/fp8_vecmat_path_c.py</code>
-      (full apply <code>fp8_scaled_vecmat_path_c</code>; <strong>broken at runtime</strong>
-      until <code>tirx.metal.fp8_e4m3_dot4</code> is registered in TileLang/TVM
-      — see agent-D report)</td>
-      <td>Yes — via <code>mx.custom_function</code><br>
-      wrapper around the lowered MSL.</td>
+      (standalone owner-output surfaces; correctness is useful, but current
+      production-speed receipts are not green)</td>
+      <td>Mixed: direct owner-output tvm-ffi surfaces are not callable from
+      MLX graph transformations yet; legacy <code>mx.custom_function</code>
+      MSL-wrapper surfaces remain differentiable where still used.</td>
     </tr>
   </tbody>
 </table>
@@ -112,8 +118,10 @@ Default behavior on Apple Silicon is in the **"Production"** column. Override vi
       <td><strong>Mamba3 main<br>(chunked SSD fwd+bwd)</strong></td>
       <td><strong>B</strong> — <code>cppmega_mlx.nn._tilelang.mamba3_mimo_apply</code></td>
       <td><code>_chunked_mamba3_diagonal_scan</code><br>(pure MLX in <code>nn/mamba3.py</code>)</td>
-      <td><code>mamba3_path_c.py</code><br>(1.5% faster than B but not in hot path<br>— kept as proof)</td>
-      <td>No SSM in MLX; Path B is 25.5× faster than reference;<br>Path C parity-validates the DSL but doesn't justify swap.</td>
+      <td><code>mamba3_path_c.py</code><br>(direct tvm-ffi owner-output for
+      contiguous FP32 buffers; full block route fails closed on non-contiguous
+      broadcast/slice views rather than copying)</td>
+      <td>No SSM in MLX; Path B is 25.5× faster than reference;<br>Path C parity-validates the DSL through direct owner-output, but MLX graph-transform VJP remains blocked by DLPack export.</td>
     </tr>
     <tr>
       <td><strong>Sparse-MLA fwd BF16</strong></td>
@@ -138,18 +146,11 @@ Default behavior on Apple Silicon is in the **"Production"** column. Override vi
       <code>x_fp8 (K,) uint8 e4m3</code>,
       <code>W_fp8 (N, K) uint8 e4m3</code>,
       <code>scale_x</code> scalar, <code>scale_w</code> scalar or <code>(N,)</code>.<br>
-      Mirrors Path B's vecmat contract. <strong>Status:</strong> entrypoint exists in
-      code but is <em>not</em> exported from
-      <code>cppmega_mlx.nn._tilelang.__init__.py</code> — callers must import the
-      module directly. Bench receipt: 0.82× vs Path B at M=1 N=K=4096.<br>
-      <strong>BROKEN at runtime today</strong> when the underlying TileLang FP8
-      lowering is exercised: the
-      <code>tirx.metal.fp8_e4m3_dot4</code> intrinsic is not registered in the
-      local TileLang/TVM build, so dispatch raises
-      <code>AttributeError: Operator tirx.metal.fp8_e4m3_dot4 is not registered</code>.
-      See agent-D report
-      <code>reports/2026-05-06-tilelang-tvm-review/agent-D-planning-vs-reality/grok__design__20260506T171408.md</code>
-      finding #1.</td>
+      Mirrors Path B's vecmat contract. <strong>Status:</strong> opt-in only.
+      Current TL-W owner-output/tvm-ffi production-path timing is still about
+      1.7x slower than the shipped Path B/audiohacking-style reducer, so AUTO
+      must not promote it. Older packed-dot4 probe receipts that showed parity
+      or speed parity are diagnostic history, not the current production gate.</td>
       <td>Listed for accuracy — earlier revisions of this table omitted FP8 vecmat
       Path C even though the entrypoint exists in the tree.</td>
     </tr>
@@ -191,7 +192,14 @@ Default behavior on Apple Silicon is in the **"Production"** column. Override vi
       <td><strong>topk_selector</strong><br>(per-row top-k indices<br>for sparse-MLA)</td>
       <td><strong>C</strong> — <code>topk_selector(..., backend="auto")</code></td>
       <td><code>topk_selector_reference</code></td>
-      <td>Default Path C with Path B fallback via <code>backend="metal"</code>.</td>
+      <td>Receipt-gated Path C with Path B fallback via
+      <code>backend="metal"</code>.<br>
+      <code>topk_selector_tilelang_direct(..., out=...)</code> is the
+      tvm-ffi owner-output surface for float32/float16 scores: it mutates the
+      caller-provided <code>mx.int32</code> output and returns that owner array.
+      Direct bf16 fails closed to avoid hidden casts. Public AUTO should not be
+      read as a generic owner-output guarantee because compatibility wrapper
+      paths still exist.</td>
       <td>Checked-in topk receipt runs both B and C on every row and<br>
       keeps all C/B ratios <= 1.0.</td>
     </tr>
@@ -199,7 +207,11 @@ Default behavior on Apple Silicon is in the **"Production"** column. Override vi
       <td><strong>M2RNN main scan<br>(R blocks, fwd+bwd)</strong></td>
       <td><strong>B</strong> — <code>cppmega_mlx.nn._tilelang.m2rnn_apply_with_state</code></td>
       <td><code>chunked_m2rnn_scan</code><br>(pure MLX in <code>nn/m2rnn.py</code>)</td>
-      <td>❌ not implemented (Mamba3-only proof artifact)</td>
+      <td><code>m2rnn_path_c.py</code> owner-output/tvm-ffi forward/backward.<br>
+      Opt-in only: it requires pre-aligned head counts and caller-provided
+      <code>h0</code>, and fails closed instead of broadcasting, allocating
+      state, or falling back to Path B. Result/cache/scratch tensors are
+      explicit tvm-ffi <code>out=</code> buffers, not input staging.</td>
       <td>One MSL kernel per fwd / bwd; 1 threadgroup per (B, H) lane,<br><code>K_DIM</code> threads per group sharing <code>W</code> via threadgroup memory.<br>fp16 carrier; bf16 upcast to fp16 to dodge simdgroup MSL bugs.</td>
     </tr>
     <tr>
@@ -215,10 +227,11 @@ Default behavior on Apple Silicon is in the **"Production"** column. Override vi
       <td><strong>FP8 scaled matmul /<br>vecmat</strong> (when used in<br>custom paths)</td>
       <td><strong>B</strong> — <code>cppmega_mlx.nn._tilelang.fp8_scaled_matmul</code><br>(audiohacking-style)</td>
       <td>dequant + <code>mx.matmul</code></td>
-      <td><code>T.fp8_scaled_matmul</code> now has packed-dot4 Metal<br>
-      lowering receipts: 0.95× for 128³ matmul, 0.82× for vecmat</td>
-      <td>Standalone parity is closed in the TileLang worktree;<br>
-      production sparse-MLA FP8 still waits on full fwd/bwd composition.</td>
+      <td><code>T.fp8_scaled_matmul</code> owner-output/tvm-ffi path exists,<br>
+      but current TL-W timing is not production-green: matmul is about 14x
+      slower and vecmat about 1.7x slower than the shipped Path B kernels.</td>
+      <td>Standalone correctness is useful, but AUTO remains on Path B until
+      strict current receipts show no-worse speed and full fwd/bwd composition.</td>
     </tr>
   </tbody>
 </table>
@@ -232,7 +245,7 @@ The hybrid mini config (1.2B params, calibrated quarter from 4.8B) at training t
    - **A blocks** (HybridBackend="attention"): RMSNorm (A) → Linear projections (A — mx.matmul) → RoPE (A — mx.fast.rope) → **sparse-MLA (per-shape AUTO: green receipt rows use C, otherwise B)** → output projection (A) → residual.
    - **M blocks** (HybridBackend="mamba3"): RMSNorm (A) → in-projections (A) → causal depthwise conv1d (A) → **Mamba3 main scan (B)** → out projection (A) → residual.
    - **E blocks** (HybridBackend="moe"): RMSNorm (A) → router (A) → **gather_mm SwitchGLU (A)** → residual.
-   - **R blocks** (HybridBackend="m2rnn"): RMSNorm (A) → in-proj (A) → causal depthwise conv1d (A) → **M2RNN main scan (B)** → out projection (A) → residual. Reference fallback: <code>chunked_m2rnn_scan</code> via <code>CPPMEGA_KERNEL_PATH=ref</code>.
+   - **R blocks** (HybridBackend="m2rnn"): RMSNorm (A) → in-proj (A) → causal depthwise conv1d (A) → **M2RNN main scan (B)** → out projection (A) → residual. Reference fallback: <code>chunked_m2rnn_scan</code> via <code>CPPMEGA_KERNEL_PATH=ref</code>. Path C is an explicit no-copy/tvm-ffi audit route and fails closed unless tensors are already in the required head layout with caller-owned <code>h0</code>.
 3. **Final RMSNorm** → A.
 4. **lm_head projection** → A — mx.matmul.
 5. **Loss** → default **A/reference** — nn.losses.cross_entropy; opt-in **CCE** — next_token_cut_cross_entropy when the recipe passes --loss-backend cce.
@@ -240,7 +253,7 @@ The hybrid mini config (1.2B params, calibrated quarter from 4.8B) at training t
 ### What this means for a typical training step (mini, B=4 T=2048):
 - **Path A** dominates raw FLOPs (every Linear, every RoPE, every RMSNorm, every attention QKV, every gather_mm).
 - **Path B** carries the sequence-dimension reductions (Mamba3 scan, sparse-MLA attention). Chunked CE is opt-in recipe behavior, not the default production loss.
-- **Path C** is hit by topk_selector(..., backend="auto") when that selector is used and the TileLang path is available. Sparse-MLA BF16 uses a per-shape fail-closed AUTO gate: checked green rows use Path C, unreceipted rows stay Path B. Mamba3 Path C remains a proof/override path.
+- **Path C** is hit by topk_selector(..., backend="auto") when that selector is used and the TileLang path is available. The explicit `topk_selector_tilelang_direct(..., out=...)` surface is now a real tvm-ffi owner-output route for float32/float16 scores and caller-owned `mx.int32` outputs; direct bf16 fails closed to avoid hidden casts. Sparse-MLA BF16 uses a per-shape fail-closed AUTO gate: checked green rows use Path C, unreceipted rows stay Path B. Mamba3 remains a proof/override path. M2RNN Path C is opt-in and fails closed rather than broadcasting heads, allocating initial state, or re-entering Path B.
 
 ## Override mechanism
 
@@ -254,9 +267,13 @@ export CPPMEGA_KERNEL_PATH=ref
 # Force Path B; raise if Metal unavailable
 export CPPMEGA_KERNEL_PATH=path_b
 
-# Force Path C for ops wired to the env policy (Mamba3 and sparse-MLA today);
+# Force Path C for ops wired to the env policy (Mamba3, sparse-MLA, and M2RNN today);
 # ops without a Path C implementation still fail closed.
 export CPPMEGA_KERNEL_PATH=path_c
+
+# Mamba3 Path C uses direct tvm-ffi owner-output for DLPack-exportable
+# contiguous FP32 buffers. It fails closed instead of copying broadcast/slice
+# views or running inside MLX graph transformations that block __dlpack__.
 
 # topk_selector is selected by its explicit backend argument, not this env var:
 # topk_selector(scores, k) / backend="auto" prefers Path C, then Path B.
@@ -364,20 +381,18 @@ The dispatch decision is recorded in a process-wide ring buffer (last 256 record
     <tr>
       <td>FP8 matmul 128×128×128 e4m3</td>
       <td>n/a</td>
-      <td>0.142 ms / 0.029 TFLOPS</td>
-      <td>0.135 ms / 0.031 TFLOPS</td>
+      <td>shipped Path B/audiohacking-style FP8 MSL route</td>
+      <td>owner-output/tvm-ffi Path C route is currently about 14x slower</td>
       <td>n/a</td>
-      <td>0.95×</td>
+      <td>blocked</td>
     </tr>
     <tr>
       <td>FP8 vecmat M=1 N=K=4096</td>
       <td>n/a</td>
-      <td>0.254 ms / 0.132 TFLOPS</td>
-      <td>0.209 ms / 0.160 TFLOPS (bench history; runtime currently broken,<br>
-      see <code>tirx.metal.fp8_e4m3_dot4</code> not-registered note above and
-      agent-D <code>grok__design__20260506T171408.md</code>)</td>
+      <td>shipped M=1 simd_sum reducer</td>
+      <td>owner-output/tvm-ffi Path C route is currently about 1.7x slower</td>
       <td>n/a</td>
-      <td>0.82×</td>
+      <td>blocked</td>
     </tr>
     <tr>
       <td>Cross-entropy chunked V=65536 fwd peak</td>
@@ -425,10 +440,11 @@ The dispatch decision is recorded in a process-wide ring buffer (last 256 record
 ## Honest limitations
 
 - **R (m2rnn) blocks now ship a Path B port** (cppmega_mlx/nn/_tilelang/m2rnn.py). Both forward and backward run as hand-written MSL via mx.fast.metal_kernel; the chunked-scan reference remains as the parity oracle and is reachable via CPPMEGA_KERNEL_PATH=ref. The kernel uses one threadgroup per (batch, head) with K_DIM threads per group; W is loaded into threadgroup memory once per (B, H). The fp16 carrier dodges the bf16 simdgroup MSL codegen bugs that Mamba3 also worked around.
-- **Path C is narrow, not global.** It is the default for topk_selector where the checked-in receipt proves C no worse than B. Sparse-MLA BF16 uses a per-shape fail-closed AUTO gate backed by bench/tilelang_ports/sparse_mla.json: green checked rows promote, unreceipted rows stay Path B. Mamba3 Path C remains a proof/override path.
+- **Path C is narrow, not global.** It is the default for topk_selector where the checked-in receipt proves C no worse than B, and `topk_selector_tilelang_direct(..., out=...)` now closes the float32/float16 owner-output case. That does not make public AUTO a generic owner-output route: compatibility wrapper paths still exist, and direct bf16 fails closed to avoid hidden casts. Sparse-MLA BF16 uses a per-shape fail-closed AUTO gate backed by bench/tilelang_ports/sparse_mla.json: green checked rows promote, unreceipted rows stay Path B. Mamba3 Path C remains a proof/override path. M2RNN Path C is available through owner-output/tvm-ffi, but only for already-aligned tensors with explicit <code>h0</code>; otherwise it raises before data movement.
 - **FP8 paths are software emulation.** Apple Silicon (M1–M4) has no native FP8 ALU. The uchar storage + LUT decode + fp32 fma loop pattern (vendored from audiohacking/fp8-mps-metal Apache 2.0) is what we ship. Native FP8 is M5/M6 territory.
 - **TileLang DSL on Metal works for FP16/FP32 GEMM, Mamba3, topk_selector, and BF16 sparse-MLA today.** The stale 32×32 T.Pipelined blocker no longer describes the in-tree sparse BF16 port. Remaining Sparse-MLA gaps are FP8 scheduler composition, e8m0 full-layout coverage, and unreceipted BF16 shapes outside the checked routing table.
-- **CPPMEGA_KERNEL_PATH=path_c is not a complete global path.** It redirects env-policy ops that have Path C wiring, currently Mamba3 and sparse-MLA. topk_selector uses its explicit backend argument. Other ops without Path C support must stay on Path A/B or fail closed.
+- **CPPMEGA_KERNEL_PATH=path_c is not a complete global path.** It redirects env-policy ops that have Path C wiring, currently Mamba3, sparse-MLA, and M2RNN. Mamba3 and M2RNN Path C routes use owner-output/tvm-ffi and fail closed before hidden broadcast/repeat/state allocation or graph-transform DLPack export. topk_selector uses its explicit backend argument. Other ops without Path C support must stay on Path A/B or fail closed.
+- **Remaining fast-kernel wrappers are intentional debt.** The current list is `_mlx_runtime.py`, `_msl_transform.py`, `_mamba3_helpers_tilelang.py`, `m2rnn.py`, `fp8_msl_kernels.py`, `fp8_matmul_path_c.py`, `fp8_vecmat_path_c.py`, `topk_selector.py` compatibility paths, `sparse_mla.py`, `sparse_mla_path_c.py`, `sparse_mla_fp8.py`, `sparse_mla_fp8_path_c.py`, `sparse_mla_blockscaled.py`, and `sparse_mla_blockscaled_path_c.py`. Removing them requires a no-hidden-copy tvm-ffi route plus equal-or-better receipts.
 
 ## Receipts
 

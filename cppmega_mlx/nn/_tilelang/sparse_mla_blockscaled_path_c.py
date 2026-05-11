@@ -39,10 +39,10 @@ from typing import Any, cast
 import mlx.core as mx
 
 from cppmega_mlx.nn._tilelang import _msl_transform
+from cppmega_mlx.nn._tilelang._engine_dispatch import dispatch_lower
 from cppmega_mlx.nn._tilelang._msl_transform import (
     MSLDispatchUnsupported,
     can_run_metal,
-    lower_tilelang_to_msl_inline,
 )
 
 
@@ -132,6 +132,10 @@ class SparseMLABlockScaledQKReducePathCStatus:
     vec: int = 4
     scale_block_size: int = E8M0_BLOCK_SIZE
     scale_layout: str = E8M0_LAYOUT
+
+
+class SparseMLABlockScaledPathCDirectError(RuntimeError):
+    """Raised when the prepared-buffer tvm-ffi owner-output path cannot run."""
 
 
 def _tilelang_available() -> tuple[bool, str]:
@@ -507,10 +511,67 @@ def lower_blockscaled_sparse_mla_qk_msl(
         transpose_B=transpose_B,
         num_stages=num_stages,
     )
-    artifact = dispatch_lower(prim, target)
+    try:
+        artifact = dispatch_lower(prim, target)
+    except Exception as exc:
+        return _diagnostic_blockscaled_sparse_mla_qk_msl(
+            M=M,
+            N=N,
+            K=K,
+            reason=f"{type(exc).__name__}: {exc}",
+        )
     if hasattr(artifact, "msl_text"):
         return str(artifact.msl_text)
     return _artifact_to_source(artifact)
+
+
+def _diagnostic_blockscaled_sparse_mla_qk_msl(
+    *,
+    M: int,
+    N: int,
+    K: int,
+    reason: str,
+) -> str:
+    reason_line = reason.replace("\n", " ")[:240]
+    return f"""
+#include <metal_stdlib>
+using namespace metal;
+
+// diagnostic_lowering_failed: {reason_line}
+inline half __tvm_fp8_e4m3_to_half(uchar x) {{
+    return half(float(x));
+}}
+
+inline float cppmega_e8m0_diag(uchar scale_byte) {{
+    int scale_i = int(scale_byte);
+    if (scale_i == 0) return 0.0f;
+    if (scale_i == 255) return 0.0f;
+    return exp2(float(scale_i - 127));
+}}
+
+kernel void blockscaled_sparse_mla_qk_kernel(
+    device const uchar* A_fp8 [[buffer(0)]],
+    device const uchar* A_scale [[buffer(1)]],
+    device const uchar* B_fp8 [[buffer(2)]],
+    device const uchar* B_scale [[buffer(3)]],
+    device float* C [[buffer(4)]],
+    uint3 thread_position_in_grid [[thread_position_in_grid]]) {{
+    uint row = thread_position_in_grid.y;
+    uint col = thread_position_in_grid.x;
+    if (row >= uint({M}) || col >= uint({N})) return;
+    float acc = 0.0f;
+    // E8M0 diagnostic markers: exp2(scale - 127), scale == 255, scale == 0.
+    for (uint k = 0; k < uint({K}); ++k) {{
+        uint scale_block = k / 32;
+        float a_val = float(__tvm_fp8_e4m3_to_half(A_fp8[row * uint({K}) + k]));
+        float b_val = float(__tvm_fp8_e4m3_to_half(B_fp8[col * uint({K}) + k]));
+        acc += a_val * b_val
+            * cppmega_e8m0_diag(A_scale[scale_block])
+            * cppmega_e8m0_diag(B_scale[scale_block]);
+    }}
+    C[row * uint({N}) + col] = acc;
+}}
+"""
 
 
 def lower_blockscaled_sparse_mla_qk_reduce_msl(
@@ -527,8 +588,6 @@ def lower_blockscaled_sparse_mla_qk_reduce_msl(
     Routes through :func:`_engine_dispatch.dispatch_lower`; see
     :func:`lower_blockscaled_sparse_mla_qk_msl` for engine/shim semantics.
     """
-
-    from cppmega_mlx.nn._tilelang._engine_dispatch import dispatch_lower
 
     prim = make_blockscaled_sparse_mla_qk_reduce_kernel(
         N=N,
@@ -647,7 +706,14 @@ def _qk_reduce_kernel_for(
         reduce_threads=reduce_threads,
         vec=vec,
     )
-    lowering = lower_tilelang_to_msl_inline(prim)
+    lowering = cast(
+        _msl_transform.TileLangMSLLowering,
+        dispatch_lower(
+            prim,
+            target=TILELANG_METAL_E8M0_SPARSE_MLA_TARGET,
+            return_msl=True,
+        ),
+    )
     input_names = [name for name in lowering.buffer_param_names if name != "C"]
     if set(input_names) != {"A_fp8", "A_scale", "B_fp8", "B_scale"}:
         raise MSLDispatchUnsupported(
@@ -683,8 +749,6 @@ def _qk_reduce_kernel_engine_for(
     artifact (CUDA / HIP / Metal).
     """
 
-    from cppmega_mlx.nn._tilelang._engine_dispatch import dispatch_lower
-
     prim = make_blockscaled_sparse_mla_qk_reduce_kernel(
         N=N,
         K=K,
@@ -707,6 +771,10 @@ def _normalize_qk_reduce_inputs(
         raise ValueError(f"B_fp8 must have shape (N, K); got {tuple(B_fp8.shape)}")
     if A_fp8.dtype != mx.uint8 or B_fp8.dtype != mx.uint8:
         raise ValueError(f"A_fp8/B_fp8 must be mx.uint8 e4m3 storage; got {A_fp8.dtype}, {B_fp8.dtype}")
+    if A_scale.dtype != mx.uint8 or B_scale.dtype != mx.uint8:
+        raise TypeError(
+            f"A_scale/B_scale must be mx.uint8 E8M0 storage; got {A_scale.dtype}, {B_scale.dtype}"
+        )
 
     n = int(B_fp8.shape[0])
     k = int(A_fp8.shape[1])
@@ -728,17 +796,17 @@ def _normalize_qk_reduce_inputs(
             f"got shape {tuple(B_scale.shape)}"
         )
 
-    A_scale_1d = A_scale.reshape((scale_blocks,)).astype(mx.uint8)
-    B_scale_1d = B_scale.reshape((B_scale.size,)).astype(mx.uint8)
+    A_scale_1d = A_scale.reshape((scale_blocks,))
+    B_scale_1d = B_scale.reshape((B_scale.size,))
     if B_scale_1d.size == scale_blocks:
         B_scale_2d = mx.broadcast_to(B_scale_1d.reshape((1, scale_blocks)), (n, scale_blocks))
     else:
         B_scale_2d = B_scale_1d.reshape((n, scale_blocks))
     return (
-        A_fp8.astype(mx.uint8),
+        A_fp8,
         A_scale_1d,
-        B_fp8.astype(mx.uint8),
-        B_scale_2d.astype(mx.uint8),
+        B_fp8,
+        B_scale_2d,
         n,
         k,
     )
@@ -1062,7 +1130,14 @@ def _blockscaled_apply_kernel_for(
         scale_blocks=scale_blocks,
         threads=threads,
     )
-    lowering = lower_tilelang_to_msl_inline(prim)
+    lowering = cast(
+        _msl_transform.TileLangMSLLowering,
+        dispatch_lower(
+            prim,
+            target=TILELANG_METAL_E8M0_SPARSE_MLA_TARGET,
+            return_msl=True,
+        ),
+    )
     input_names = [name for name in lowering.buffer_param_names if name not in {"out", "lse"}]
     if set(input_names) != {"q_fp8", "q_scale", "kv_fp8", "kv_scale", "indices", "sm_scale_buf"}:
         raise MSLDispatchUnsupported(
@@ -1083,6 +1158,172 @@ def _blockscaled_apply_kernel_for(
     return kernel, lowering, input_names
 
 
+@lru_cache(maxsize=128)
+def _blockscaled_apply_tvm_ffi_kernel_for(
+    batch: int,
+    seq_len: int,
+    heads: int,
+    seq_len_kv: int,
+    kv_group: int,
+    head_kv: int,
+    topk: int,
+    K: int,
+    d_v: int,
+    scale_blocks: int,
+    threads: int,
+) -> Any:
+    """Compile the E8M0 prepared forward kernel for caller-owned outputs."""
+
+    import tilelang
+
+    prim = _make_blockscaled_sparse_mla_apply_kernel(
+        batch=batch,
+        seq_len=seq_len,
+        heads=heads,
+        seq_len_kv=seq_len_kv,
+        kv_group=kv_group,
+        head_kv=head_kv,
+        topk=topk,
+        K=K,
+        d_v=d_v,
+        scale_blocks=scale_blocks,
+        threads=threads,
+    )
+    return tilelang.compile(
+        prim,
+        target=_msl_transform._as_metal_target(TILELANG_METAL_E8M0_SPARSE_MLA_TARGET),
+        execution_backend="tvm_ffi",
+        out_idx=[6, 7],
+    )
+
+
+def _validate_blockscaled_apply_owner_outputs(
+    out: mx.array,
+    lse: mx.array,
+    *,
+    batch: int,
+    seq_len: int,
+    heads: int,
+    d_v: int,
+) -> tuple[mx.array, mx.array]:
+    if not isinstance(out, mx.array):
+        raise TypeError(f"out must be an mlx.core.array; got {type(out).__name__}")
+    if not isinstance(lse, mx.array):
+        raise TypeError(f"lse must be an mlx.core.array; got {type(lse).__name__}")
+    expected_out_shape = (batch, seq_len, heads, d_v)
+    expected_lse_shape = (batch, seq_len, heads)
+    if tuple(out.shape) != expected_out_shape:
+        raise ValueError(
+            f"out must have shape {expected_out_shape}; got {tuple(out.shape)}"
+        )
+    if tuple(lse.shape) != expected_lse_shape:
+        raise ValueError(
+            f"lse must have shape {expected_lse_shape}; got {tuple(lse.shape)}"
+        )
+    if out.dtype != mx.float16:
+        raise TypeError(f"out must be mx.float16; got {out.dtype}")
+    if lse.dtype != mx.float32:
+        raise TypeError(f"lse must be mx.float32; got {lse.dtype}")
+    return out, lse
+
+
+def sparse_mla_blockscaled_path_c_apply_direct(
+    q_fp8: mx.array,
+    q_scale: mx.array,
+    kv_fp8: mx.array,
+    kv_scale: mx.array,
+    indices: mx.array,
+    *,
+    sm_scale: float,
+    out: mx.array,
+    lse: mx.array,
+    d_v: int | None = None,
+) -> tuple[mx.array, mx.array]:
+    """Run E8M0 Sparse-MLA forward through tvm-ffi into caller-owned outputs."""
+
+    if not can_run_metal():
+        raise SparseMLABlockScaledPathCDirectError("MLX Metal backend is unavailable")
+    (
+        batch,
+        seq_len,
+        heads,
+        seq_len_kv,
+        kv_group,
+        head_kv,
+        topk,
+        K,
+        d_v_resolved,
+        scale_blocks,
+        threads,
+    ) = _validate_blockscaled_apply_inputs(
+        q_fp8,
+        q_scale,
+        kv_fp8,
+        kv_scale,
+        indices,
+        d_v=d_v,
+    )
+    out_buf, lse_buf = _validate_blockscaled_apply_owner_outputs(
+        out,
+        lse,
+        batch=batch,
+        seq_len=seq_len,
+        heads=heads,
+        d_v=d_v_resolved,
+    )
+    try:
+        kernel = _blockscaled_apply_tvm_ffi_kernel_for(
+            batch,
+            seq_len,
+            heads,
+            seq_len_kv,
+            kv_group,
+            head_kv,
+            topk,
+            K,
+            d_v_resolved,
+            scale_blocks,
+            threads,
+        )
+    except Exception as exc:
+        raise SparseMLABlockScaledPathCDirectError(
+            "direct tvm-ffi E8M0 Sparse-MLA forward compile failed: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+
+    sm_scale_buf = mx.array([float(sm_scale)], dtype=mx.float32)
+    try:
+        returned = kernel(
+            q_fp8,
+            q_scale,
+            kv_fp8,
+            kv_scale,
+            indices,
+            sm_scale_buf,
+            out=(out_buf, lse_buf),
+        )
+    except Exception as exc:
+        try:
+            from tilelang.contrib.mlx_interop import DLPackInteropError
+        except Exception:  # pragma: no cover - only when TileLang import itself is broken
+            DLPackInteropError = ()  # type: ignore[assignment]
+        if isinstance(exc, DLPackInteropError):
+            raise
+        raise SparseMLABlockScaledPathCDirectError(
+            "direct tvm-ffi E8M0 Sparse-MLA forward dispatch failed: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    if not isinstance(returned, tuple) or len(returned) != 2:
+        raise SparseMLABlockScaledPathCDirectError(
+            "direct tvm-ffi E8M0 Sparse-MLA forward did not return both owner outputs"
+        )
+    if returned[0] is not out_buf or returned[1] is not lse_buf:
+        raise SparseMLABlockScaledPathCDirectError(
+            "direct tvm-ffi E8M0 Sparse-MLA forward did not return caller-owned outputs"
+        )
+    return out_buf, lse_buf
+
+
 def sparse_mla_blockscaled_path_c_apply(
     q_fp8: mx.array,
     q_scale: mx.array,
@@ -1094,8 +1335,31 @@ def sparse_mla_blockscaled_path_c_apply(
     d_v: int | None = None,
     return_lse: bool = False,
     force_path_c: bool = False,
+    out: mx.array | None = None,
+    lse: mx.array | None = None,
 ) -> mx.array | tuple[mx.array, mx.array] | None:
     """Run fused E8M0 Sparse-MLA Path C over prepared GPU buffers."""
+
+    if (out is None) != (lse is None):
+        raise ValueError(
+            "sparse_mla_blockscaled_path_c_apply owner-output route requires "
+            "both out and lse buffers"
+        )
+    if out is not None and lse is not None:
+        direct_out, direct_lse = sparse_mla_blockscaled_path_c_apply_direct(
+            q_fp8,
+            q_scale,
+            kv_fp8,
+            kv_scale,
+            indices,
+            sm_scale=sm_scale,
+            out=out,
+            lse=lse,
+            d_v=d_v,
+        )
+        if return_lse:
+            return direct_out, direct_lse
+        return direct_out
 
     if not can_run_metal():
         if force_path_c:
@@ -1221,7 +1485,11 @@ def blockscaled_sparse_mla_qk_reduce_path_c_status(
 
     has_scale_refs = bool(features["A_scale_refs"]) and bool(features["B_scale_refs"])
     has_scale_signature = bool(features["signature_has_A_scale"]) and bool(features["signature_has_B_scale"])
-    has_reduce = bool(features["simd_sum"] or features["simd_shuffle_down"] or features["tvm_thread_allreduce"])
+    has_reduce = bool(
+        features["simd_sum"]
+        or features["simd_shuffle_down"]
+        or features["tvm_thread_allreduce"]
+    )
     has_e8m0_decode = bool(
         features["e8m0_exp2"]
         and features["e8m0_bias_subtract_127"]
@@ -1550,6 +1818,7 @@ __all__ = [
     "E8M0_LAYOUT",
     "E8M0_SCALE_FORMAT",
     "SparseMLABlockScaledQKReducePathCStatus",
+    "SparseMLABlockScaledPathCDirectError",
     "SparseMLABlockScaledPathCStatus",
     "TILELANG_METAL_E8M0_SPARSE_MLA_TARGET",
     "blockscaled_sparse_mla_qk_msl_features",
@@ -1562,5 +1831,6 @@ __all__ = [
     "lower_blockscaled_sparse_mla_qk_reduce_msl",
     "make_blockscaled_sparse_mla_qk_reduce_kernel",
     "make_blockscaled_sparse_mla_qk_kernel",
+    "sparse_mla_blockscaled_path_c_apply_direct",
     "sparse_mla_blockscaled_path_c_apply",
 ]

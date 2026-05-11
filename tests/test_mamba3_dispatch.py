@@ -36,6 +36,21 @@ def _make_block(seed: int = 0) -> tuple[Mamba3ReferenceBlock, mx.array]:
     return block, hidden
 
 
+def _make_scan_inputs(seed: int = 11) -> tuple[mx.array, ...]:
+    mx.random.seed(seed)
+    batch, seq, heads, headdim, state = 1, 4, 2, 4, 4
+    x = (mx.random.normal((batch, seq, heads, headdim)) * 0.1).astype(mx.float32)
+    B = (mx.random.normal((batch, seq, heads, state)) * 0.1).astype(mx.float32)
+    C = (mx.random.normal((batch, seq, heads, state)) * 0.1).astype(mx.float32)
+    z = (mx.random.normal((batch, seq, heads, headdim)) * 0.1).astype(mx.float32)
+    A = (-mx.random.uniform(0.01, 0.5, (batch, seq, heads))).astype(mx.float32)
+    dt = (mx.random.uniform(0.001, 0.05, (batch, seq, heads))).astype(mx.float32)
+    D = mx.ones((heads,), dtype=mx.float32)
+    h0 = mx.zeros((batch, heads, headdim, state), dtype=mx.float32)
+    mx.eval(x, B, C, z, A, dt, D, h0)
+    return x, B, C, z, A, dt, D, h0
+
+
 @pytest.fixture(autouse=True)
 def _reset(monkeypatch: pytest.MonkeyPatch):
     clear_dispatch_log()
@@ -84,17 +99,90 @@ def test_path_b_policy_forces_metal(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_path_c_dispatches_tilelang_dsl(monkeypatch: pytest.MonkeyPatch) -> None:
     """Path C is the only op-level kernel that supports the TileLang DSL."""
 
+    if not _METAL_AVAILABLE:
+        pytest.skip("Metal not available")
     pytest.importorskip("tilelang")
+    from cppmega_mlx.nn._tilelang import mamba3_path_c
+    import cppmega_mlx.nn.mamba3 as mamba3_module
+
+    status = mamba3_path_c.mamba3_mimo_path_c_status()
+    if not status.available:
+        pytest.skip(f"mamba3 Path C unavailable on this host: {status.reason}")
+
+    def fail_path_b(*_args: object, **_kwargs: object) -> tuple[mx.array, mx.array]:
+        raise AssertionError("Path C dispatch fell back to Path B")
+
+    monkeypatch.setattr(mamba3_module, "_mamba3_mimo_apply_with_state", fail_path_b)
     monkeypatch.setenv("CPPMEGA_KERNEL_PATH", "path_c")
-    block, hidden = _make_block()
-    try:
-        out, _ = block(hidden)
-        mx.eval(out)
-    except Exception as exc:  # pragma: no cover - tilelang path may degrade.
-        pytest.skip(f"tilelang DSL path unavailable on this host: {exc}")
+    x, B, C, z, A, dt, D, h0 = _make_scan_inputs()
+    out, _ = mamba3_module._dispatch_mamba3_scan(
+        x=x,
+        B=B,
+        C=C,
+        z=z,
+        A=A,
+        dt=dt,
+        D=D,
+        h0=h0,
+        chunk_size=8,
+    )
+    mx.eval(out)
     matches = [e for e in get_dispatch_log() if e["op_name"] == "mamba3_mimo"]
     assert matches, "expected at least one mamba3_mimo dispatch"
     assert matches[-1]["path"] == "path_c"
+    assert matches[-1]["kernel_used"] == "path_c_tilelang_dsl"
+
+
+def test_path_c_policy_without_legacy_debug_wrapper_env_runs_or_explains_kernel_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not _METAL_AVAILABLE:
+        pytest.skip("Metal not available")
+    pytest.importorskip("tilelang")
+    from cppmega_mlx.nn._tilelang import mamba3_path_c
+
+    status = mamba3_path_c.mamba3_mimo_path_c_status()
+    if not status.available:
+        assert "CPPMEGA_ENABLE_MAMBA3_PATH_C_FAST_KERNEL_WRAPPER" not in status.reason
+        pytest.skip(f"mamba3 Path C unavailable on this host: {status.reason}")
+
+    monkeypatch.setenv("CPPMEGA_KERNEL_PATH", "path_c")
+    import cppmega_mlx.nn.mamba3 as mamba3_module
+
+    x, B, C, z, A, dt, D, h0 = _make_scan_inputs(seed=12)
+    out, _ = mamba3_module._dispatch_mamba3_scan(
+        x=x,
+        B=B,
+        C=C,
+        z=z,
+        A=A,
+        dt=dt,
+        D=D,
+        h0=h0,
+        chunk_size=8,
+    )
+    mx.eval(out)
+    matches = [e for e in get_dispatch_log() if e["op_name"] == "mamba3_mimo"]
+    assert matches[-1]["kernel_used"] == "path_c_tilelang_dsl"
+
+
+def test_path_c_block_route_rejects_non_contiguous_views_without_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not _METAL_AVAILABLE:
+        pytest.skip("Metal not available")
+    pytest.importorskip("tilelang")
+    from cppmega_mlx.nn._tilelang import mamba3_path_c
+
+    status = mamba3_path_c.mamba3_mimo_path_c_status()
+    if not status.available:
+        pytest.skip(f"mamba3 Path C unavailable on this host: {status.reason}")
+
+    monkeypatch.setenv("CPPMEGA_KERNEL_PATH", "path_c")
+    block, hidden = _make_block()
+    with pytest.raises(RuntimeError, match="DLPack-exportable"):
+        block(hidden)
+    assert [e for e in get_dispatch_log() if e["op_name"] == "mamba3_mimo"] == []
 
 
 def test_per_op_override_selects_reference(monkeypatch: pytest.MonkeyPatch) -> None:

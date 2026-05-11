@@ -10,27 +10,24 @@ The default Metal lowering uses a TileLang intrinsic for packed uint32 e4m3
 dot4 decode plus ``tvm_thread_allreduce`` across K. That keeps the generated
 MSL on the same hot-loop shape as Path B's hand-written vecmat kernel.
 
-Migration phase-3 (2026-05-07)
-------------------------------
+Migration phase-3 (2026-05-07 / 2026-05-11)
+--------------------------------------------
 ``_fp8_vecmat_kernel_for`` now routes its lowering through
 :func:`cppmega_mlx.nn._tilelang._engine_dispatch.dispatch_lower`, mirroring
 the topk_selector / sparse_mla_blockscaled migrations. In the default
 ``shim``/``auto`` modes the cache still returns the historical 6-tuple
 ``(kernel, lowering, input_names, output_shape, grid, threadgroup)`` so
-existing call sites are unchanged. Setting
-``CPPMEGA_MLX_TILELANG_ENGINE=engine`` makes ``dispatch_lower`` return a
-``tilelang.compile`` artifact directly; the cache then exposes
-``(artifact, None, ["A","A_scale","B","B_scale"], (n,), grid, threadgroup)``
-and ``fp8_scaled_vecmat_path_c`` invokes the artifact's ``__call__``
-contract instead of going through ``mx.fast.metal_kernel``. The
-shim path still re-lowers via ``lower_tilelang_to_msl_inline`` so the
-PassConfigs (Z3 idea #4 / #9) actually apply in the legacy emission.
+existing call sites are unchanged. MLX dispatch requests
+``return_msl=True`` because the current unified engine artifact is not
+``mx.array`` callable; per-kernel PassConfigs are still threaded through
+``dispatch_lower`` and into the engine/shim lowering path.
 
-The vendored FP8 MSL inner kernel (``fp8_msl_kernels.fp8_scaled_vecmat``)
-keeps using the legacy ``mx.fast.metal_kernel`` path because the proper
-FP8 SIMDgroup fragment factories (``simdgroup_a_fp8`` / ``simdgroup_b_fp8``)
-do not exist yet in ``tilelang/language/extern.py``. See
-``MIGRATION_PLAN.md §2.4`` gap #7 — TODO(fp8-factories).
+The legacy no-``out`` API still returns an allocated MLX result for existing
+bench/parity callers only when explicitly enabled with
+``CPPMEGA_FP8_PATH_C_LEGACY_MLX_FAST=1``. The production owner-output API is
+``fp8_scaled_vecmat_path_c(..., out=existing_array)``: it compiles a tvm-ffi
+kernel and passes the caller-owned MLX buffers through DLPack without building
+``mx.fast.metal_kernel`` or allocating/casting the output in Python.
 """
 
 from __future__ import annotations
@@ -45,15 +42,16 @@ from typing import Any, cast
 import mlx.core as mx
 
 from cppmega_mlx.nn._tilelang import _msl_transform
+from cppmega_mlx.nn._tilelang._engine_dispatch import dispatch_lower
 from cppmega_mlx.nn._tilelang._msl_transform import (
     MSLDispatchUnsupported,
     _assert_path_c_metal_fp8_intrinsics_registered,
     can_run_metal,
-    lower_tilelang_to_msl_inline,
 )
 
 
 TILELANG_METAL_VECMAT_TARGET = "metal -thread_warp_size=32"
+FP8_PATH_C_LEGACY_MLX_FAST_ENV = "CPPMEGA_FP8_PATH_C_LEGACY_MLX_FAST"
 
 
 # CPPMEGA Z3 wiring (beads cppmega-mlx-cuz): per-kernel PassConfig opt-in.
@@ -68,15 +66,16 @@ TILELANG_METAL_VECMAT_TARGET = "metal -thread_warp_size=32"
 # toggled by the env var ``TILELANG_DISABLE_FP8_DOT4_AUTO``; we don't
 # override that env var here.
 _FP8_VECMAT_PATH_C_CANDIDATE_PASS_CONFIGS: dict[str, Any] = {
+    # The current Metal scalar/CSE pipeline can produce an invalid one-element
+    # SeqStmt around the canonical C[col] write in this reducer. This kernel
+    # does not need CSE: the legacy route replaces the body with the canonical
+    # packed hot loop, and the direct route already emits one dot4/simd_sum
+    # body. Keep the gate per-kernel rather than disabling CSE globally.
+    "tirx.disable_cse_tir": True,
     # Z3 idea #4 — discharges ``if (i < N)`` guards the analyzer can prove.
     # The M=1 vecmat hot loop has tight static extents so the prover tends
     # to succeed; if not, the guard stays.
     "tl.drop_provable_bound_checks": True,
-    # Z3 idea #9 (detection-only today) — flag is registered in the source
-    # tree but may not be in the active built libtilelang yet. Filtered out
-    # at runtime if not registered. Kept here so we get receipts the moment
-    # the pass flips to a rewrite upstream.
-    "tl.simd_lift_reductions": True,
 }
 
 _FP8_VECMAT_PATH_C_FILTERED_KEYS_LOGGED: set[str] = set()
@@ -169,6 +168,7 @@ _FP8_VM_VEC = 4
 _FP8_VM_BLOCK_K = _FP8_VM_RT * _FP8_VM_VEC
 _FP8_VM_K_WORDS = _FP8_VM_K // 4
 _FP8_VM_SW = _FP8_VM_N
+_FP8_VM_C_DTYPE = "float32"
 
 
 @dataclass(frozen=True)
@@ -180,6 +180,36 @@ class FP8VecmatPathCStatus:
     target: str = TILELANG_METAL_VECMAT_TARGET
     transpose_B: bool = True
     m_equals_1: bool = True
+
+
+class FP8VecmatPathCDirectError(RuntimeError):
+    """Raised when the owner-output tvm-ffi vecmat path cannot run safely."""
+
+
+class FP8VecmatPathCLegacyError(RuntimeError):
+    """Raised when the legacy no-out MLX allocation path is not enabled."""
+
+
+def _legacy_mlx_fast_enabled() -> bool:
+    return os.environ.get(FP8_PATH_C_LEGACY_MLX_FAST_ENV, "0") in (
+        "1",
+        "true",
+        "True",
+        "yes",
+        "YES",
+    )
+
+
+def _require_legacy_mlx_fast_enabled(op_name: str) -> None:
+    if _legacy_mlx_fast_enabled():
+        return
+    raise FP8VecmatPathCLegacyError(
+        f"{op_name}: no-out Path C dispatch is a legacy/debug-only "
+        "mx.fast.metal_kernel path that allocates an MLX output. Production "
+        "callers must pass out=existing_mx_array to use the tvm-ffi "
+        f"owner-output route. Set {FP8_PATH_C_LEGACY_MLX_FAST_ENV}=1 only "
+        "for parity tests or benchmarks."
+    )
 
 
 def _tilelang_available() -> tuple[bool, str]:
@@ -578,9 +608,9 @@ def _uses_fp8_dot4_packed_macro(*, vec: int, K: int) -> bool:
         loudly instead of silently routing to the scalar fallback when a
         prover-discharged path becomes available upstream.
       * The PassContext that ``lower_fp8_vecmat_msl`` threads through still
-        wraps the lowering, so any future Z3-driven idea (#4 bound checks,
-        #9 simdgroup lift) discharged by the in-tree TileLang build will
-        rewrite this branch's IR with no Python-side change.
+        wraps the lowering, so current Z3-driven bound-check proofs and future
+        registered rewrites can update this branch's IR with no Python-side
+        change.
     """
 
     structural_match = vec == 4
@@ -631,10 +661,14 @@ def lower_fp8_vecmat_msl(
         scale_w_per_row=scale_w_per_row,
     )
     pass_configs = _fp8_vecmat_pass_configs()
-    lowering = lower_tilelang_to_msl_inline(
-        prim,
-        target=target,
-        pass_configs=pass_configs,
+    lowering = cast(
+        _msl_transform.TileLangMSLLowering,
+        dispatch_lower(
+            prim,
+            target=target,
+            return_msl=True,
+            pass_configs=pass_configs or None,
+        ),
     )
     lowering, _output_shape = _fuse_canonical_vecmat_runtime_body(
         lowering,
@@ -772,6 +806,11 @@ _FP8_VECMAT_KERNEL_CACHE: dict[
     ],
 ] = {}
 _FP8_VECMAT_KERNEL_CACHE_LOCK = threading.RLock()
+_FP8_VECMAT_TVM_FFI_KERNEL_CACHE: dict[
+    tuple[int, int, int, int, int, bool, str],
+    Any,
+] = {}
+_FP8_VECMAT_TVM_FFI_KERNEL_CACHE_LOCK = threading.RLock()
 
 
 def _fp8_vecmat_kernel_for(
@@ -823,59 +862,16 @@ def _fp8_vecmat_kernel_for(
         vectorized_loads=vectorized_loads,
         scale_w_per_row=scale_w_per_row,
     )
-    # Migration phase-3: route the lowering decision through ``dispatch_lower``.
-    # In ``shim``/``auto`` modes (default) it returns a
-    # :class:`TileLangMSLLowering`; in ``engine`` mode it returns a
-    # ``tilelang.compile`` artifact stamped with ``_tilelang_engine_target``.
-    #
-    # 2026-05-07 fix: tilelang engine artifacts are NOT mx.array-callable —
-    # invoking ``kernel(A, A_scale, B, B_scale, output)`` on a
-    # ``CompiledArtifact`` raises ``RuntimeError: Unsupported argument type``
-    # because the engine expects DLPack/torch-style tensors, not mx.array.
-    # Until a proper MLX↔engine bridge lands, force shim mode for this kernel
-    # so the lowered MSL goes through ``mx.fast.metal_kernel`` (which DOES
-    # accept mx.array).
-    from cppmega_mlx.nn._tilelang._engine_dispatch import dispatch_lower
-    import os as _os
-
-    _saved_engine_mode = _os.environ.get("CPPMEGA_MLX_TILELANG_ENGINE")
-    _os.environ["CPPMEGA_MLX_TILELANG_ENGINE"] = "shim"
-    try:
-        artifact = dispatch_lower(prim, target=TILELANG_METAL_VECMAT_TARGET)
-    finally:
-        if _saved_engine_mode is None:
-            _os.environ.pop("CPPMEGA_MLX_TILELANG_ENGINE", None)
-        else:
-            _os.environ["CPPMEGA_MLX_TILELANG_ENGINE"] = _saved_engine_mode
-
-    if getattr(artifact, "_tilelang_engine_target", None) is not None:
-        # Engine path: return the artifact directly. Callers branch on
-        # ``lowering is None`` to dispatch via the unified runtime instead of
-        # ``mx.fast.metal_kernel``. Output shape is always flat (n,) on the
-        # engine path because the artifact owns its own buffer layout.
-        input_names = ["A", "A_scale", "B", "B_scale"]
-        output_shape: tuple[int, ...] = (N,)
-        # Engine artifacts manage their own grid / threadgroup launch — we
-        # report ``(0, 0, 0)`` placeholders so callers know to invoke
-        # ``artifact.__call__`` rather than thread these through MLX.
-        result = (artifact, None, input_names, output_shape, (0, 0, 0), (0, 0, 0))
-        with _FP8_VECMAT_KERNEL_CACHE_LOCK:
-            _FP8_VECMAT_KERNEL_CACHE[cache_key] = result
-        return result
-
-    # Shim path: ``dispatch_lower`` already produced a TileLangMSLLowering
-    # for us, but the shim helper does not currently thread ``pass_configs``
-    # through (Z3 idea #4 / #9), so re-lower through ``_msl_transform`` to
-    # ensure the tuned PassConfigs actually apply on the legacy MSL emission.
     pass_configs = _fp8_vecmat_pass_configs()
-    if pass_configs and getattr(artifact, "pass_configs", None) is None:
-        lowering = lower_tilelang_to_msl_inline(
+    lowering = cast(
+        _msl_transform.TileLangMSLLowering,
+        dispatch_lower(
             prim,
             target=TILELANG_METAL_VECMAT_TARGET,
-            pass_configs=pass_configs,
-        )
-    else:
-        lowering = artifact
+            return_msl=True,
+            pass_configs=pass_configs or None,
+        ),
+    )
     tilelang_input_names = [name for name in lowering.buffer_param_names if name != "C"]
     if set(tilelang_input_names) != {"A", "A_scale", "B", "B_scale"}:
         raise MSLDispatchUnsupported(
@@ -913,6 +909,153 @@ def _fp8_vecmat_kernel_for(
         # both producers built the same PrimFunc for the same key.
         _FP8_VECMAT_KERNEL_CACHE[cache_key] = result
     return result
+
+
+def _make_fp8_vecmat_direct_kernel(
+    *,
+    N: int,
+    K: int,
+    outputs_per_block: int,
+    reduce_threads: int,
+    vec: int,
+    scale_w_per_row: bool,
+    c_dtype: str,
+) -> Any:
+    """Build the owner-output tvm-ffi vecmat kernel.
+
+    The ABI is intentionally flat:
+
+    * ``A`` is the existing ``(K,)`` MLX uint8/e4m3 buffer.
+    * ``B`` is the existing ``(N, K)`` MLX uint8/e4m3 buffer.
+    * ``C`` is the caller-owned ``(N,)`` output buffer.
+
+    No reshape, allocation, or Python-side cast is needed before the DLPack
+    handoff.
+    """
+
+    _validate_shape(
+        N=N,
+        K=K,
+        outputs_per_block=outputs_per_block,
+        reduce_threads=reduce_threads,
+        vec=vec,
+    )
+    if not _uses_fp8_dot4_packed_macro(vec=vec, K=K):
+        raise FP8VecmatPathCDirectError(
+            "direct tvm-ffi FP8 vecmat requires vec=4 and K multiple of 4 "
+            "so the packed e4m3 dot4 ABI is legal"
+        )
+    _ensure_path_c_metal_fp8_intrinsics_registered()
+
+    import tilelang.language as T
+
+    T = cast(Any, T)
+    g = globals()
+    g.update(
+        _FP8_VM_N=int(N),
+        _FP8_VM_K=int(K),
+        _FP8_VM_NP=int(outputs_per_block),
+        _FP8_VM_RT=int(reduce_threads),
+        _FP8_VM_VEC=int(vec),
+        _FP8_VM_BLOCK_K=int(reduce_threads) * int(vec),
+        _FP8_VM_K_WORDS=int(K) // 4,
+        _FP8_VM_SW=int(N) if scale_w_per_row else 1,
+        _FP8_VM_C_DTYPE=str(c_dtype),
+    )
+
+    @T.prim_func
+    def fp8_vecmat_reduce_direct(
+        A: T.Tensor((_FP8_VM_K,), "float8_e4m3"),
+        A_scale: T.Tensor((1,), "float32"),
+        B: T.Tensor((_FP8_VM_N, _FP8_VM_K), "float8_e4m3"),
+        B_scale: T.Tensor((_FP8_VM_SW,), "float32"),
+        C: T.Tensor((_FP8_VM_N,), _FP8_VM_C_DTYPE),
+    ):
+        with T.Kernel(
+            T.ceildiv(_FP8_VM_N, _FP8_VM_NP),
+            threads=_FP8_VM_RT * _FP8_VM_NP,
+        ) as bx:
+            accum = T.alloc_local((1,), "float32")
+            lane = T.get_thread_binding(0)
+            kr = T.floormod(lane, _FP8_VM_RT)
+            ni = T.floordiv(lane, _FP8_VM_RT)
+            col = bx * _FP8_VM_NP + ni
+            T.clear(accum)
+            for ko in T.unroll(
+                0,
+                T.ceildiv(_FP8_VM_K_WORDS, _FP8_VM_RT),
+                explicit=False,
+                unroll_factor=4,
+            ):
+                word_i = ko * _FP8_VM_RT + kr
+                if col < _FP8_VM_N and word_i < _FP8_VM_K_WORDS:
+                    accum[0] += T.metal_fp8_e4m3_dot4(
+                        T.access_ptr(A[0], "r", extent=_FP8_VM_K),
+                        T.access_ptr(B[col, 0], "r", extent=_FP8_VM_K),
+                        word_i,
+                        word_i,
+                    )
+            reduced = T.call_intrin("float32", "tir.metal.simd_sum", accum[0])
+            if kr == 0 and col < _FP8_VM_N:
+                if _FP8_VM_SW == 1:
+                    C[col] = reduced * A_scale[0] * B_scale[0]
+                else:
+                    C[col] = reduced * A_scale[0] * B_scale[col]
+
+    try:
+        from tilelang.transform.simplify import apply_simplify
+
+        return apply_simplify(fp8_vecmat_reduce_direct)
+    except Exception as exc:
+        _warn_apply_simplify_failed(exc)
+        return fp8_vecmat_reduce_direct
+
+
+def _fp8_vecmat_tvm_ffi_kernel_for(
+    *,
+    N: int,
+    K: int,
+    outputs_per_block: int,
+    reduce_threads: int,
+    vec: int,
+    scale_w_per_row: bool,
+    c_dtype: str,
+) -> Any:
+    cache_key = (
+        int(N),
+        int(K),
+        int(outputs_per_block),
+        int(reduce_threads),
+        int(vec),
+        bool(scale_w_per_row),
+        str(c_dtype),
+    )
+    with _FP8_VECMAT_TVM_FFI_KERNEL_CACHE_LOCK:
+        cached = _FP8_VECMAT_TVM_FFI_KERNEL_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+    import tilelang
+
+    prim = _make_fp8_vecmat_direct_kernel(
+        N=N,
+        K=K,
+        outputs_per_block=outputs_per_block,
+        reduce_threads=reduce_threads,
+        vec=vec,
+        scale_w_per_row=scale_w_per_row,
+        c_dtype=c_dtype,
+    )
+    kernel = tilelang.compile(
+        prim,
+        target=_msl_transform._as_metal_target(TILELANG_METAL_VECMAT_TARGET),
+        execution_backend="tvm_ffi",
+        out_idx=-1,
+        pass_configs=_fp8_vecmat_pass_configs() or None,
+    )
+    with _FP8_VECMAT_TVM_FFI_KERNEL_CACHE_LOCK:
+        _FP8_VECMAT_TVM_FFI_KERNEL_CACHE[cache_key] = kernel
+    return kernel
 
 
 def canonical_vecmat_runtime_body(*, N: int, K: int, scale_w_per_row: bool) -> str:
@@ -1023,6 +1166,23 @@ def _grid_for_lowering(
     return _msl_transform.metal_grid_for_lowering(lowering)
 
 
+def _tilelang_output_dtype_for_mlx(dtype: Any, *, op_name: str) -> str:
+    if dtype == mx.float32:
+        return "float32"
+    if dtype == mx.float16:
+        return "float16"
+    mx_bfloat16 = getattr(mx, "bfloat16", None)
+    if mx_bfloat16 is not None and dtype == mx_bfloat16:
+        raise ValueError(
+            f"{op_name}: mx.bfloat16 owner-output is not supported by the "
+            "current TileLang Metal ABI because codegen emits MSL `bfloat`; "
+            "use mx.float32/mx.float16 or fix TileLang CodeGenMetal first"
+        )
+    raise ValueError(
+        f"{op_name}: out dtype must be mx.float32 or mx.float16; got {dtype}"
+    )
+
+
 def _resolve_vecmat_scale(
     scale: mx.array | float,
     *,
@@ -1071,6 +1231,37 @@ def _resolve_vecmat_scale(
     )
 
 
+def _resolve_vecmat_scale_direct(
+    scale: mx.array | float,
+    *,
+    length: int,
+    name: str,
+    scalar_only: bool = False,
+) -> mx.array:
+    """Validate a direct-route scale tensor without allocating/casting."""
+
+    if isinstance(scale, (int, float)):
+        raise TypeError(
+            f"fp8_scaled_vecmat_path_c direct owner-output route requires {name} "
+            "as an existing mx.float32 tensor; Python scalars would allocate "
+            "a new MLX tensor at the wrapper boundary"
+        )
+    if scale.ndim != 1 or scale.dtype != mx.float32:
+        raise ValueError(
+            f"fp8_scaled_vecmat_path_c direct owner-output route expects {name} "
+            f"as 1D mx.float32; got shape={tuple(scale.shape)} dtype={scale.dtype}"
+        )
+    if scale.size == 1:
+        return scale
+    if not scalar_only and scale.size == length:
+        return scale
+    expected = "1" if scalar_only else f"1 or {length}"
+    raise ValueError(
+        f"fp8_scaled_vecmat_path_c direct owner-output route expected {name} "
+        f"size {expected}; got shape {tuple(scale.shape)}"
+    )
+
+
 def _normalize_vecmat_inputs(
     x_fp8: mx.array,
     W_fp8: mx.array,
@@ -1113,6 +1304,121 @@ def _normalize_vecmat_inputs(
     )
 
 
+def _normalize_vecmat_inputs_direct(
+    x_fp8: mx.array,
+    W_fp8: mx.array,
+    scale_x: mx.array | float,
+    scale_w: mx.array | float,
+) -> tuple[mx.array, mx.array, mx.array, mx.array, int, int, bool]:
+    if x_fp8.ndim != 1 or W_fp8.ndim != 2:
+        raise ValueError(
+            f"fp8_scaled_vecmat_path_c direct owner-output route expects 1D x "
+            f"and 2D W; got x.ndim={x_fp8.ndim}, W.ndim={W_fp8.ndim}"
+        )
+    if x_fp8.dtype != mx.uint8 or W_fp8.dtype != mx.uint8:
+        raise ValueError(
+            "fp8_scaled_vecmat_path_c direct owner-output route expects "
+            f"mx.uint8 e4m3 storage; got {x_fp8.dtype}, {W_fp8.dtype}"
+        )
+    (k,) = x_fp8.shape
+    n, k_w = W_fp8.shape
+    if k != k_w:
+        raise ValueError(
+            f"fp8_scaled_vecmat_path_c direct owner-output route shape mismatch: "
+            f"x=(K={k}), W=(N={n}, K={k_w})"
+        )
+    if k % 4 != 0:
+        raise ValueError(
+            f"fp8_scaled_vecmat_path_c direct owner-output route requires "
+            f"K multiple of 4; got K={k}"
+        )
+    scale_x_arr = _resolve_vecmat_scale_direct(
+        scale_x,
+        length=1,
+        name="scale_x",
+        scalar_only=True,
+    )
+    scale_w_arr = _resolve_vecmat_scale_direct(
+        scale_w,
+        length=n,
+        name="scale_w",
+    )
+    return x_fp8, scale_x_arr, W_fp8, scale_w_arr, int(n), int(k), scale_w_arr.size == n
+
+
+def _validate_vecmat_owner_output(out: mx.array, *, n: int) -> tuple[mx.array, str]:
+    if not isinstance(out, mx.array):
+        raise TypeError(
+            f"fp8_scaled_vecmat_path_c: out must be an mlx.core.array; "
+            f"got {type(out).__name__}"
+        )
+    if out.shape != (n,):
+        raise ValueError(
+            f"fp8_scaled_vecmat_path_c: out shape must be ({n},); "
+            f"got {tuple(out.shape)}"
+        )
+    return out, _tilelang_output_dtype_for_mlx(
+        out.dtype,
+        op_name="fp8_scaled_vecmat_path_c",
+    )
+
+
+def fp8_scaled_vecmat_path_c_direct(
+    x_fp8: mx.array,
+    W_fp8: mx.array,
+    *,
+    scale_x: mx.array | float,
+    scale_w: mx.array | float,
+    out: mx.array,
+    outputs_per_block: int = 2,
+    reduce_threads: int = 32,
+    vec: int = 4,
+) -> mx.array:
+    """Run FP8 vecmat Path C through tvm-ffi into caller-owned ``out``."""
+
+    if not can_run_metal():
+        raise FP8VecmatPathCDirectError("MLX Metal unavailable")
+    A, A_scale, B, B_scale, n, k, scale_w_per_row = _normalize_vecmat_inputs_direct(
+        x_fp8,
+        W_fp8,
+        scale_x,
+        scale_w,
+    )
+    C, c_dtype = _validate_vecmat_owner_output(out, n=n)
+    try:
+        kernel = _fp8_vecmat_tvm_ffi_kernel_for(
+            N=n,
+            K=k,
+            outputs_per_block=int(outputs_per_block),
+            reduce_threads=int(reduce_threads),
+            vec=int(vec),
+            scale_w_per_row=scale_w_per_row,
+            c_dtype=c_dtype,
+        )
+    except Exception as exc:
+        raise FP8VecmatPathCDirectError(
+            f"direct tvm-ffi FP8 vecmat compile failed: {type(exc).__name__}: {exc}"
+        ) from exc
+
+    try:
+        returned = kernel(A, A_scale, B, B_scale, C)
+    except Exception as exc:
+        try:
+            from tilelang.contrib.mlx_interop import DLPackInteropError
+        except Exception:  # pragma: no cover - only when TileLang import itself is broken
+            DLPackInteropError = ()  # type: ignore[assignment]
+        if isinstance(exc, DLPackInteropError):
+            raise
+        raise FP8VecmatPathCDirectError(
+            f"direct tvm-ffi FP8 vecmat dispatch failed: {type(exc).__name__}: {exc}"
+        ) from exc
+    if returned is not C:
+        raise FP8VecmatPathCDirectError(
+            "direct tvm-ffi FP8 vecmat did not return the caller-owned output"
+        )
+    return C
+
+
 def fp8_scaled_vecmat_path_c(
     x_fp8: mx.array,
     W_fp8: mx.array,
@@ -1122,14 +1428,30 @@ def fp8_scaled_vecmat_path_c(
     outputs_per_block: int = 2,
     reduce_threads: int = 32,
     vec: int = 4,
+    out: mx.array | None = None,
 ) -> mx.array | None:
     """Run Path C TileLang FP8 vecmat through MLX Metal.
 
     ``x_fp8`` is ``(K,)`` uint8 e4m3 storage and ``W_fp8`` is transposed
     ``(N, K)`` storage, matching Path B. ``scale_x`` is scalar; ``scale_w`` may
-    be scalar or per-output ``(N,)``. Returns ``None`` only when the TileLang
-    Metal dispatch surface is unavailable.
+    be scalar or per-output ``(N,)``. When ``out`` is provided, dispatches via
+    tvm-ffi into that caller-owned output and returns the same object. Without
+    ``out``, this function fail-closes unless
+    ``CPPMEGA_FP8_PATH_C_LEGACY_MLX_FAST=1`` is set; that opt-in path is
+    legacy/debug-only because MLX allocates the output.
     """
+
+    if out is not None:
+        return fp8_scaled_vecmat_path_c_direct(
+            x_fp8,
+            W_fp8,
+            scale_x=scale_x,
+            scale_w=scale_w,
+            out=out,
+            outputs_per_block=outputs_per_block,
+            reduce_threads=reduce_threads,
+            vec=vec,
+        )
 
     if not can_run_metal():
         # grok correctness P1 (silent failure): warn once so callers know why
@@ -1138,6 +1460,7 @@ def fp8_scaled_vecmat_path_c(
         # Metal usable here", so we don't have a richer reason string to log.
         _warn_path_c_unavailable("can_run_metal() returned False")
         return None
+    _require_legacy_mlx_fast_enabled("fp8_scaled_vecmat_path_c")
     A, A_scale, B, B_scale, n, k, scale_w_per_row = _normalize_vecmat_inputs(
         x_fp8,
         W_fp8,
@@ -1218,9 +1541,13 @@ def fp8_scaled_vecmat_path_c(
 
 
 __all__ = [
+    "FP8VecmatPathCDirectError",
+    "FP8VecmatPathCLegacyError",
     "FP8VecmatPathCStatus",
+    "FP8_PATH_C_LEGACY_MLX_FAST_ENV",
     "TILELANG_METAL_VECMAT_TARGET",
     "canonical_vecmat_runtime_body",
+    "fp8_scaled_vecmat_path_c_direct",
     "fp8_scaled_vecmat_path_c",
     "fp8_vecmat_msl_blockers",
     "fp8_vecmat_msl_features",

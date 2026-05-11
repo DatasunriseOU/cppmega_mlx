@@ -160,6 +160,186 @@ def test_qk_reduce_path_c_returns_none_when_metal_missing_or_correct_shape() -> 
     assert out.dtype == mx.float32
 
 
+def test_qk_reduce_path_c_fail_closes_without_serial_metal_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lowering failure must not build a hand-written mx.fast fallback."""
+
+    import cppmega_mlx.nn._tilelang.sparse_mla_blockscaled_path_c as path_c_module
+
+    path_c_module._qk_reduce_kernel_for.cache_clear()
+
+    def fail_lower(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("synthetic TileLang lowering failure")
+
+    def fail_metal_kernel(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("lowering failure must not build mx.fast.metal_kernel")
+
+    monkeypatch.setattr(path_c_module, "can_run_metal", lambda: True)
+    monkeypatch.setattr(path_c_module, "dispatch_lower", fail_lower)
+    monkeypatch.setattr(path_c_module.mx.fast, "metal_kernel", fail_metal_kernel)
+
+    status = path_c_module.blockscaled_sparse_mla_qk_reduce_path_c_status(N=16, K=64)
+    assert status.available is False
+    assert "synthetic TileLang lowering failure" in status.reason
+    assert status.features == {}
+
+    n, k = 16, 64
+    A_fp8 = mx.zeros((1, k), dtype=mx.uint8)
+    A_scale = mx.zeros((k // E8M0_BLOCK_SIZE,), dtype=mx.uint8)
+    B_fp8 = mx.zeros((n, k), dtype=mx.uint8)
+    B_scale = mx.zeros((n, k // E8M0_BLOCK_SIZE), dtype=mx.uint8)
+    assert (
+        path_c_module.blockscaled_sparse_mla_qk_reduce_path_c(
+            A_fp8,
+            A_scale,
+            B_fp8,
+            B_scale,
+        )
+        is None
+    )
+
+
+def test_qk_reduce_path_c_rejects_non_e8m0_scale_dtype(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cppmega_mlx.nn._tilelang.sparse_mla_blockscaled_path_c as path_c_module
+
+    monkeypatch.setattr(path_c_module, "can_run_metal", lambda: True)
+    n, k = 16, 64
+    A_fp8 = mx.zeros((1, k), dtype=mx.uint8)
+    A_scale = mx.zeros((k // E8M0_BLOCK_SIZE,), dtype=mx.float32)
+    B_fp8 = mx.zeros((n, k), dtype=mx.uint8)
+    B_scale = mx.zeros((n, k // E8M0_BLOCK_SIZE), dtype=mx.uint8)
+
+    with pytest.raises(TypeError, match="E8M0 storage"):
+        path_c_module.blockscaled_sparse_mla_qk_reduce_path_c(
+            A_fp8,
+            A_scale,
+            B_fp8,
+            B_scale,
+        )
+
+
+def test_blockscaled_path_c_forward_uses_tvm_ffi_owner_outputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cppmega_mlx.nn._tilelang.sparse_mla_blockscaled_path_c as path_c_module
+
+    batch, seq, heads, kv_group, seq_kv, topk, dim = 1, 2, 2, 1, 8, 4, 64
+    scale_blocks = dim // E8M0_BLOCK_SIZE
+    q_fp8 = mx.zeros((batch, seq, heads, dim), dtype=mx.uint8)
+    q_scale = mx.zeros((batch, seq, heads, scale_blocks), dtype=mx.uint8)
+    kv_fp8 = mx.zeros((batch, seq_kv, kv_group, dim), dtype=mx.uint8)
+    kv_scale = mx.zeros((batch, seq_kv, kv_group, scale_blocks), dtype=mx.uint8)
+    indices = mx.zeros((batch, seq, kv_group, topk), dtype=mx.int32)
+    out = mx.zeros((batch, seq, heads, dim), dtype=mx.float16)
+    lse = mx.zeros((batch, seq, heads), dtype=mx.float32)
+    calls: list[tuple[tuple[object, ...], tuple[mx.array, mx.array]]] = []
+
+    def fake_tvm_ffi_kernel_for(*args: object, **kwargs: object):
+        del args, kwargs
+
+        def fake_kernel(*kernel_args: object, out: tuple[mx.array, mx.array]):
+            calls.append((kernel_args, out))
+            return out
+
+        return fake_kernel
+
+    def fail_legacy_kernel(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise AssertionError("owner-output forward must not build mx.fast wrapper")
+
+    monkeypatch.setattr(path_c_module, "can_run_metal", lambda: True)
+    monkeypatch.setattr(
+        path_c_module,
+        "_blockscaled_apply_tvm_ffi_kernel_for",
+        fake_tvm_ffi_kernel_for,
+    )
+    monkeypatch.setattr(path_c_module, "_blockscaled_apply_kernel_for", fail_legacy_kernel)
+    monkeypatch.setattr(path_c_module.mx.fast, "metal_kernel", fail_legacy_kernel)
+
+    result = path_c_module.sparse_mla_blockscaled_path_c_apply(
+        q_fp8,
+        q_scale,
+        kv_fp8,
+        kv_scale,
+        indices,
+        sm_scale=dim ** -0.5,
+        d_v=dim,
+        return_lse=True,
+        force_path_c=True,
+        out=out,
+        lse=lse,
+    )
+
+    assert result == (out, lse)
+    assert len(calls) == 1
+    kernel_args, owner_outputs = calls[0]
+    assert kernel_args[0] is q_fp8
+    assert kernel_args[1] is q_scale
+    assert kernel_args[2] is kv_fp8
+    assert kernel_args[3] is kv_scale
+    assert kernel_args[4] is indices
+    assert owner_outputs == (out, lse)
+
+
+def test_blockscaled_path_c_forward_owner_output_abi_is_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cppmega_mlx.nn._tilelang.sparse_mla_blockscaled_path_c as path_c_module
+
+    batch, seq, heads, kv_group, seq_kv, topk, dim = 1, 2, 2, 1, 8, 4, 64
+    scale_blocks = dim // E8M0_BLOCK_SIZE
+    q_fp8 = mx.zeros((batch, seq, heads, dim), dtype=mx.uint8)
+    q_scale = mx.zeros((batch, seq, heads, scale_blocks), dtype=mx.uint8)
+    kv_fp8 = mx.zeros((batch, seq_kv, kv_group, dim), dtype=mx.uint8)
+    kv_scale = mx.zeros((batch, seq_kv, kv_group, scale_blocks), dtype=mx.uint8)
+    indices = mx.zeros((batch, seq, kv_group, topk), dtype=mx.int32)
+    out = mx.zeros((batch, seq, heads, dim), dtype=mx.float32)
+    lse = mx.zeros((batch, seq, heads), dtype=mx.float32)
+
+    monkeypatch.setattr(path_c_module, "can_run_metal", lambda: True)
+    with pytest.raises(ValueError, match="requires both out and lse"):
+        path_c_module.sparse_mla_blockscaled_path_c_apply(
+            q_fp8,
+            q_scale,
+            kv_fp8,
+            kv_scale,
+            indices,
+            sm_scale=dim ** -0.5,
+            d_v=dim,
+            out=out,
+        )
+    with pytest.raises(TypeError, match="out must be mx.float16"):
+        path_c_module.sparse_mla_blockscaled_path_c_apply(
+            q_fp8,
+            q_scale,
+            kv_fp8,
+            kv_scale,
+            indices,
+            sm_scale=dim ** -0.5,
+            d_v=dim,
+            out=out,
+            lse=lse,
+        )
+    with pytest.raises(TypeError, match="q_scale/kv_scale must be uint8 E8M0"):
+        bad_q_scale = mx.zeros((batch, seq, heads, scale_blocks), dtype=mx.float32)
+        path_c_module.sparse_mla_blockscaled_path_c_apply(
+            q_fp8,
+            bad_q_scale,
+            kv_fp8,
+            kv_scale,
+            indices,
+            sm_scale=dim ** -0.5,
+            d_v=dim,
+            out=mx.zeros((batch, seq, heads, dim), dtype=mx.float16),
+            lse=lse,
+        )
+
+
 def test_blockscaled_path_c_apply_matches_path_b() -> None:
     if not _metal_available():
         pytest.skip("Metal backend not available on this host")

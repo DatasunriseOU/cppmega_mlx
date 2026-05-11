@@ -107,9 +107,44 @@ def _drive_sparse_mla(shape: str) -> tuple[np.ndarray, np.ndarray, float, float]
     return _np(cast(mx.array, out_b)), _np(cast(mx.array, out_c)), atol, rtol
 
 
+def test_sparse_mla_fwd_tilelang_scalar_pass_removes_stale_cse_gap() -> None:
+    if not _metal_available():
+        pytest.skip("Metal backend not available on this host")
+
+    from cppmega_mlx.nn._tilelang import sparse_mla_path_c as path_c
+
+    status = path_c.sparse_mla_path_c_status()
+    if not status.available:
+        pytest.skip(status.reason)
+
+    path_c._fwd_kernel_for.cache_clear()
+    try:
+        msl = path_c.dump_lowered_fwd_msl(
+            batch=2,
+            seq_len=8,
+            heads=4,
+            qk_dim=32,
+            kv_group=1,
+            topk=4,
+            seq_len_kv=16,
+        )
+    finally:
+        path_c._fwd_kernel_for.cache_clear()
+
+    assert "kv[(((((long)_tmp_4)" not in msl
+    if "kv_row_base_1" in msl:
+        decl_pos = msl.find("uint kv_row_base_1 =")
+        use_pos = msl.find("kv[((cse_")
+        assert decl_pos >= 0
+        assert use_pos < 0 or decl_pos < use_pos
+    assert not hasattr(path_c, "_repair_fwd_cse_msl")
+
+
 def _drive_mamba3(shape: str) -> tuple[np.ndarray, np.ndarray, float, float]:
     from cppmega_mlx.nn._tilelang import mamba3_mimo_apply
-    from cppmega_mlx.nn._tilelang.mamba3_path_c import mamba3_mimo_apply_path_c
+    from cppmega_mlx.nn._tilelang.mamba3_path_c import (
+        mamba3_mimo_apply_path_c,
+    )
 
     mx.random.seed(31)
     if shape == "small":
@@ -154,13 +189,18 @@ def _drive_fp8_vecmat(shape: str) -> tuple[np.ndarray, np.ndarray, float, float]
     n, k = (128, 128) if shape == "small" else (256, 128)
     x_fp8 = mx.array(rng.randint(0, 255, size=(k,)).astype(np.uint8))
     W_fp8 = mx.array(rng.randint(0, 255, size=(n, k)).astype(np.uint8))
-    sx = 1.0
+    sx = mx.array([1.0], dtype=mx.float32)
     sw = mx.array(np.full((n,), 1.0, dtype=np.float32))
 
     out_b = fp8_scaled_vecmat(x_fp8, W_fp8, scale_x=sx, scale_w=sw)
-    out_c = fp8_scaled_vecmat_path_c(x_fp8, W_fp8, scale_x=sx, scale_w=sw)
-    if out_c is None:
-        raise NotImplementedError("fp8_scaled_vecmat_path_c returned None on this host")
+    out_c_buf = mx.zeros((n,), dtype=mx.float32)
+    out_c = fp8_scaled_vecmat_path_c(
+        x_fp8,
+        W_fp8,
+        scale_x=sx,
+        scale_w=sw,
+        out=out_c_buf,
+    )
     # FP8 dot4 carrier -- quantization error dominates, use fp8 tolerance.
     atol, rtol = _TOLERANCE_BY_DTYPE["fp8"]
     return _np(cast(mx.array, out_b)), _np(cast(mx.array, out_c)), atol, rtol

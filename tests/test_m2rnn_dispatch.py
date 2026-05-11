@@ -91,13 +91,72 @@ def test_path_b_policy_forces_metal(monkeypatch: pytest.MonkeyPatch) -> None:
     assert matches[-1]["kernel_used"] == "metal_kernel_fwd_v1"
 
 
-def test_path_c_raises_not_implemented(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Path C is reserved for Mamba3 only; m2rnn must surface NotImplementedError."""
+def test_path_c_dispatch_fails_closed_before_broadcast_or_state_allocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit Path C refuses mixer broadcast/state allocation instead of copying."""
 
+    if not _METAL_AVAILABLE:
+        pytest.skip("Metal not available")
+    pytest.importorskip("tilelang")
+    from cppmega_mlx.nn._tilelang import m2rnn as m2rnn_path_b
+    from cppmega_mlx.nn._tilelang.m2rnn_path_c import m2rnn_path_c_status
+
+    status = m2rnn_path_c_status()
+    if not status.available:
+        pytest.skip(f"m2rnn Path C unavailable on this host: {status.reason}")
+
+    def fail_path_b(*_args: object, **_kwargs: object) -> tuple[mx.array, mx.array]:
+        raise AssertionError("Path C dispatch fell back to Path B")
+
+    monkeypatch.setattr(m2rnn_path_b, "m2rnn_apply_with_state", fail_path_b)
     monkeypatch.setenv("CPPMEGA_KERNEL_PATH", "path_c")
     block, hidden = _make_block()
-    with pytest.raises(NotImplementedError, match="m2rnn Path C not implemented"):
+    with pytest.raises(RuntimeError, match="pre-aligned.*head counts"):
         block(hidden)
+    matches = [e for e in get_dispatch_log() if e["op_name"] == "m2rnn"]
+    assert not matches, f"failed Path C dispatch should not log success: {matches}"
+
+
+def test_path_c_dispatch_requires_existing_h0_without_allocating(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cppmega_mlx.nn._tilelang import m2rnn_path_c
+
+    monkeypatch.setattr(
+        m2rnn_path_c,
+        "m2rnn_path_c_status",
+        lambda: m2rnn_path_c.M2RNNPathCStatus(True, "forced available"),
+    )
+
+    def fail_path_c_kernel(*_args: object, **_kwargs: object) -> tuple[mx.array, mx.array]:
+        raise AssertionError("Path C should fail before allocating h0 or launching")
+
+    monkeypatch.setattr(
+        m2rnn_path_c,
+        "m2rnn_apply_with_state_path_c",
+        fail_path_c_kernel,
+    )
+    monkeypatch.setenv("CPPMEGA_KERNEL_PATH", "path_c")
+    cfg = M2RNNConfig(
+        d_model=16,
+        k_head_dim=4,
+        v_head_dim=3,
+        num_q_heads=2,
+        num_k_heads=2,
+        num_v_heads=2,
+        num_f_heads=2,
+        num_g_heads=2,
+        num_weight_heads=2,
+        conv_kernel=4,
+        chunk_size=8,
+    )
+    block = M2RNNMixer(cfg)
+    hidden = mx.random.normal((1, 8, cfg.d_model), dtype=mx.float32) * 0.1
+    with pytest.raises(RuntimeError, match="existing h0 tensor"):
+        block(hidden)
+    matches = [e for e in get_dispatch_log() if e["op_name"] == "m2rnn"]
+    assert not matches, f"failed Path C dispatch should not log success: {matches}"
 
 
 def test_per_op_override_selects_reference(monkeypatch: pytest.MonkeyPatch) -> None:

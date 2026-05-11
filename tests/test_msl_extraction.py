@@ -182,7 +182,7 @@ def test_dispatch_lower_engine_with_msl_mode_falls_back_on_import_error(
     def _raise(*_args, **_kwargs):
         raise ImportError("tilelang unavailable in this test")
 
-    monkeypatch.setattr(_engine_dispatch, "_engine_compile", _raise)
+    monkeypatch.setattr(_engine_dispatch, "_engine_lower_for_msl_extraction", _raise)
 
     class _FakeMSLLowering(TileLangMSLLowering):
         pass
@@ -230,7 +230,7 @@ def test_dispatch_lower_return_msl_kwarg_falls_back_on_extraction_failure(
 
     monkeypatch.setattr(
         _engine_dispatch,
-        "_engine_compile",
+        "_engine_lower_for_msl_extraction",
         lambda *_a, **_kw: _NoSourceArtifact(),
     )
 
@@ -273,7 +273,7 @@ def test_dispatch_lower_return_msl_kwarg_returns_extracted_lowering(
 
     monkeypatch.setattr(
         _engine_dispatch,
-        "_engine_compile",
+        "_engine_lower_for_msl_extraction",
         lambda *_a, **_kw: _StubArtifact(),
     )
     # Sentinel: shim must NOT be reached on the happy path.

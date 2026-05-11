@@ -1421,15 +1421,17 @@ def _make_path_c_vecmat_runner(
     inputs: dict[str, Any],
     last_ref: list[mx.array | None],
 ) -> Callable[[], None]:
+    out_buf = mx.zeros((int(inputs["b_t_mx"].shape[0]),), dtype=mx.float32)
+    mx.eval(out_buf)
+
     def run() -> None:
         out = fp8_scaled_vecmat_path_c(
             inputs["x_mx"],
             inputs["b_t_mx"],
             scale_x=inputs["scale_a_mx"],
             scale_w=inputs["scale_b_mx"],
+            out=out_buf,
         )
-        if out is None:
-            raise RuntimeError("fp8_scaled_vecmat_path_c returned None")
         last_ref[0] = out
         mx.eval(last_ref[0])
 
@@ -1466,7 +1468,7 @@ def _bench_paired_vecmat_mlx(
     stats = paired.stats
     row_c: dict[str, Any] = {
         "label": c_label,
-        "variant": "MLX-dispatched TileLang fp8 vecmat packed dot4",
+        "variant": "tvm-ffi owner-output TileLang fp8 vecmat packed dot4",
         "target": TILELANG_METAL_VECMAT_TARGET,
         "bench": asdict(stats[c_label]),
         "paired_ratios": paired.paired_ratios,
@@ -1516,6 +1518,8 @@ def _bench_path_c_vecmat_mlx(
     flops = 2.0 * N * K
     last: mx.array | None = None
     label = "path_c_mlx_tilelang_fp8_scaled_vecmat"
+    out_buf = mx.zeros((N,), dtype=mx.float32)
+    mx.eval(out_buf)
 
     def run() -> None:
         nonlocal last
@@ -1524,9 +1528,8 @@ def _bench_path_c_vecmat_mlx(
             inputs["b_t_mx"],
             scale_x=inputs["scale_a_mx"],
             scale_w=inputs["scale_b_mx"],
+            out=out_buf,
         )
-        if out is None:
-            raise RuntimeError("fp8_scaled_vecmat_path_c returned None")
         last = out
         mx.eval(last)
 
@@ -1541,7 +1544,7 @@ def _bench_path_c_vecmat_mlx(
     )
     row: dict[str, Any] = {
         "label": label,
-        "variant": "MLX-dispatched TileLang fp8 vecmat packed dot4",
+        "variant": "tvm-ffi owner-output TileLang fp8 vecmat packed dot4",
         "target": TILELANG_METAL_VECMAT_TARGET,
         "bench": asdict(stats),
     }

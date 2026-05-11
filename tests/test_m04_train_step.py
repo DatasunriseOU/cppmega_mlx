@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import subprocess
 import sys
@@ -344,6 +345,363 @@ def assert_m04_receipt_contract(payload: dict[str, Any]) -> None:
     }
 
 
+def assert_regression_report_matches_payload(payload: dict[str, Any]) -> None:
+    report = payload["regression_report"]
+    route_dispatch = report["route_dispatch"]
+    producer_gate = report["fp8_path_c_producer_gate"]
+
+    assert route_dispatch["raw"] == payload["training"].get("kernel_dispatch", [])
+    assert "fallback_reason" in route_dispatch
+    assert report["fallback_reason"] == route_dispatch["fallback_reason"]
+    assert report["dtype"]["requested"] == payload["workload"]["dtype"]
+    assert report["optimizer"]["key"] == payload["workload"]["optimizer"]["key"]
+    assert report["memory"]["peak_memory_bytes"] == payload["memory"][
+        "peak_memory_bytes"
+    ]
+    assert report["training"]["all_finite"] == payload["training"]["all_finite"]
+    assert report["training"]["initial_loss"] == payload["training"]["initial_loss"]
+    assert report["training"]["final_loss"] == payload["training"]["final_loss"]
+    assert report["training"]["mean_loss"] == payload["training"].get("mean_loss")
+    assert report["training"]["loss_decreased"] == payload["training"][
+        "loss_decreased"
+    ]
+    assert report["gate_summary"]["dtype"] == payload["workload"]["dtype"]
+    assert report["gate_summary"]["optimizer"] == payload["workload"]["optimizer"][
+        "key"
+    ]
+    assert report["gate_summary"]["fallback_reason"] == route_dispatch[
+        "fallback_reason"
+    ]
+    assert report["gate_summary"]["fp8_path_c_producer_status"] == producer_gate[
+        "status"
+    ]
+    assert report["gate_summary"]["fp8_path_c_producer_ok"] == producer_gate["ok"]
+    assert producer_gate["name"] == "fp8_path_c_sparse_mla_producer"
+    assert producer_gate["large_tensor_staging_allowed"] is False
+    assert producer_gate["hidden_wrapper_quantization_allowed"] is False
+    assert producer_gate["kernel_boundary_quantization_allowed"] is False
+    assert "regression_report.fp8_path_c_producer_gate" in producer_gate[
+        "receipt_field_paths"
+    ]
+    if payload["workload"]["dtype"] == "fp8_path_c":
+        assert producer_gate["required"] is True
+        assert producer_gate["fallback_to_path_b_allowed"] is False
+    else:
+        assert producer_gate["required"] is False
+        assert producer_gate["status"] == "not_requested"
+    assert "path_b_observed" in route_dispatch
+    assert "path_c_observed" in route_dispatch
+    assert "path_summary" in route_dispatch
+    assert report["throughput"]["tokens_per_second"] == payload["timing"][
+        "tokens_per_second"
+    ]
+    assert report["throughput"]["claim_gate"]["ok"] is True
+    assert report["gate_summary"]["tokens_per_second_claim_ok"] is True
+    assert report["gate_summary"]["bogus_tok_sec_claim_detected"] is False
+    assert report["visibility_gate"] == {
+        "route_dispatch_visible": True,
+        "dtype_visible": True,
+        "optimizer_visible": True,
+        "memory_peak_visible": True,
+        "tokens_per_second_visible": payload["timing"]["tokens_per_second"]
+        is not None,
+        "finite_visible": True,
+        "loss_visible": True,
+        "fallback_reason_visible": True,
+    }
+
+
+def assert_m04_20step_matrix_plan(payload: dict[str, Any]) -> None:
+    matrix = payload["m04_20step_matrix"]
+
+    assert matrix["name"] == "m04_local_gb10_20step_dtype_optimizer_matrix"
+    assert matrix["status"] == "commands_prepared_not_executed_by_this_receipt"
+    assert matrix["profile"] == "local_gb10_quarter"
+    assert matrix["dataset"] == TARGET_PARQUET
+    assert matrix["steps"] == 20
+    assert matrix["acceptance_steps"] == 100
+    assert matrix["batch_size"] == 1
+    assert matrix["seq_len"] == 4096
+    assert matrix["dtype_routes"] == ["bf16", "fp8_path_c", "int8"]
+    assert matrix["optimizers"] == [
+        "adamw",
+        "muon",
+        "muon_adamw",
+        "lion",
+        "lion8bit",
+        "adam8bit",
+    ]
+    baseline = matrix["baseline_comparison"]
+    assert baseline["baseline_tokens_per_second"] == 900.0
+    assert baseline["baseline_kind"] == (
+        "existing_real_parquet_bs1_seq4096_20step_receipts"
+    )
+    assert baseline["baseline_scope"] == "local_m4_only_not_gb10_parity"
+    assert {
+        row["case_id"] for row in baseline["reference_receipts"]
+    } == {
+        "lion8bit_sym_lr1e-4",
+        "adam8bit_sym_lr1e-4",
+        "adam8bit_dyn_lr1e-4",
+    }
+    assert any(
+        row["meets_900_tok_s_baseline"] is True
+        for row in baseline["reference_receipts"]
+    )
+    assert matrix["command_sets"] == [
+        "dry_run",
+        "smoke_1step",
+        "real_20step",
+        "real_100step",
+    ]
+    cases = {case["case_id"]: case for case in matrix["cases"]}
+    assert len(cases) == 18
+    assert len(matrix["real_20step_commands"]) == 16
+    assert len(matrix["real_100step_commands"]) == 16
+    assert len(matrix["dry_run_commands"]) == 16
+    assert len(matrix["smoke_commands"]) == 16
+    assert cases["bf16_adamw_20step"]["supported"] is True
+    assert "--dtype bfloat16" in cases["bf16_adamw_20step"]["command"]
+    assert "--optimizer adamw" in cases["bf16_adamw_20step"]["command"]
+    assert "--dry-run-json" in cases["bf16_adamw_20step"]["dry_run_command"]
+    assert "--steps 1" in cases["bf16_adamw_20step"]["smoke_command"]
+    assert "--steps 20" in cases["bf16_adamw_20step"]["real_20step_command"]
+    assert "--steps 100" in matrix["real_100step_commands"][0]
+    assert "--require-loss-decrease" in matrix["real_100step_commands"][0]
+    assert cases["bf16_muon_20step"]["supported"] is True
+    assert "--optimizer muon" in cases["bf16_muon_20step"]["command"]
+    assert cases["fp8_path_c_muon_adamw_20step"]["supported"] is True
+    assert "--dtype fp8_path_c" in cases["fp8_path_c_muon_adamw_20step"]["command"]
+    assert "--optimizer muon_adamw" in cases[
+        "fp8_path_c_muon_adamw_20step"
+    ]["command"]
+    assert cases["fp8_path_c_muon_20step"]["supported"] is True
+    assert "--dtype fp8_path_c" in cases["fp8_path_c_muon_20step"]["command"]
+    assert "--optimizer muon" in cases["fp8_path_c_muon_20step"]["command"]
+    assert cases["int8_muon_20step"]["supported"] is True
+    assert "--dtype bfloat16" in cases["int8_muon_20step"]["command"]
+    assert "--optimizer int8" in cases["int8_muon_20step"]["command"]
+    assert cases["int8_muon_adamw_20step"]["supported"] is True
+    assert "--dtype bfloat16" in cases["int8_muon_adamw_20step"]["command"]
+    assert "--optimizer int8" in cases["int8_muon_adamw_20step"]["command"]
+    assert cases["int8_adam8bit_20step"]["supported"] is True
+    assert cases["int8_lion8bit_20step"]["supported"] is True
+    assert cases["int8_adamw_20step"]["supported"] is False
+    assert cases["int8_lion_20step"]["supported"] is False
+    assert "optimizer-state precision" in cases["int8_adamw_20step"][
+        "unsupported_reason"
+    ]
+
+
+def _receipt_args_for_regression_report(
+    tmp_path: Path,
+    *,
+    dtype: str = "bfloat16",
+    optimizer: str = "adamw",
+    pattern: str = "M",
+    depth: str = "1",
+    dsa_a_layer_ranks: str = "",
+) -> argparse.Namespace:
+    return m04_train_step.build_parser().parse_args(
+        [
+            "--synthetic",
+            "--dtype",
+            dtype,
+            "--optimizer",
+            optimizer,
+            "--pattern",
+            pattern,
+            "--depth",
+            depth,
+            "--dsa-a-layer-ranks",
+            dsa_a_layer_ranks,
+            "--output",
+            str(tmp_path / "receipt.json"),
+        ]
+    )
+
+
+def test_regression_report_rejects_bogus_tokens_per_second_claim(
+    tmp_path: Path,
+) -> None:
+    args = _receipt_args_for_regression_report(tmp_path)
+    train_payload = {
+        "step_metrics": [
+            {
+                "loss": 2.0,
+                "seconds": 1.0,
+                "ntokens": 128,
+                "tokens_per_second": 999_999.0,
+                "updated": True,
+            }
+        ],
+        "kernel_dispatch": [
+            {
+                "op_name": "mamba3_mimo",
+                "path": "path_b",
+                "kernel_used": "metal_kernel_fwd_v1",
+            }
+        ],
+    }
+
+    report = m04_train_step.regression_report_payload(
+        args,
+        config=args,
+        train_payload=train_payload,
+        optimizer=adamw_identity(),
+        memory_after={"peak_memory_bytes": 4096},
+        tokens_per_second=999_999.0,
+        status="ok",
+    )
+
+    claim_gate = report["throughput"]["claim_gate"]
+    step_check = claim_gate["step_checks"][0]
+    assert claim_gate["ok"] is False
+    assert claim_gate["bogus_tok_sec_claim_detected"] is True
+    assert claim_gate["reported_tokens_per_second_finite"] is True
+    assert claim_gate["step_rates_consistent"] is False
+    assert step_check["expected_tokens_per_second"] == 128.0
+    assert step_check["reported_tokens_per_second"] == 999_999.0
+    assert step_check["rate_consistent_with_ntokens_and_seconds"] is False
+    assert report["gate_summary"]["tokens_per_second_claim_ok"] is False
+    assert report["gate_summary"]["bogus_tok_sec_claim_detected"] is True
+
+
+@pytest.mark.parametrize(
+    (
+        "dtype",
+        "optimizer",
+        "pattern",
+        "depth",
+        "dsa_a_layer_ranks",
+        "kernel_dispatch",
+        "expected_path_b",
+        "expected_path_c",
+        "expected_fallback",
+    ),
+    [
+        (
+            "bfloat16",
+            "adamw",
+            "M",
+            "1",
+            "",
+            [
+                {
+                    "op_name": "mamba3_mimo",
+                    "path": "path_b",
+                    "kernel_used": "metal_kernel_fwd_v1",
+                }
+            ],
+            True,
+            False,
+            None,
+        ),
+        (
+            "fp8_path_c",
+            "lion",
+            "A",
+            "1",
+            "0",
+            [
+                {
+                    "op_name": "mamba3_mimo",
+                    "path": "path_c",
+                    "kernel_used": "mamba3_mimo_path_c",
+                },
+                {
+                    "op_name": "sparse_mla",
+                    "path": "path_c",
+                    "kernel_used": "sparse_mla_fp8_path_c_apply",
+                },
+            ],
+            False,
+            True,
+            None,
+        ),
+    ],
+)
+def test_regression_report_records_path_b_vs_path_c_receipt_gate_fields(
+    tmp_path: Path,
+    dtype: str,
+    optimizer: str,
+    pattern: str,
+    depth: str,
+    dsa_a_layer_ranks: str,
+    kernel_dispatch: list[dict[str, Any]],
+    expected_path_b: bool,
+    expected_path_c: bool,
+    expected_fallback: str | None,
+) -> None:
+    args = _receipt_args_for_regression_report(
+        tmp_path,
+        dtype=dtype,
+        optimizer=optimizer,
+        pattern=pattern,
+        depth=depth,
+        dsa_a_layer_ranks=dsa_a_layer_ranks,
+    )
+    train_payload = {
+        "mean_loss": 1.5,
+        "step_metrics": [
+            {
+                "loss": 2.0,
+                "seconds": 0.5,
+                "ntokens": 128,
+                "tokens_per_second": 256.0,
+                "updated": True,
+            },
+            {
+                "loss": 1.0,
+                "seconds": 0.25,
+                "ntokens": 128,
+                "tokens_per_second": 512.0,
+                "updated": True,
+            },
+        ],
+        "kernel_dispatch": kernel_dispatch,
+    }
+
+    report = m04_train_step.regression_report_payload(
+        args,
+        config=args,
+        train_payload=train_payload,
+        optimizer=adamw_identity(name="Lion" if optimizer == "lion" else "AdamW"),
+        memory_after={"peak_memory_bytes": 123_456},
+        tokens_per_second=384.0,
+        status="ok",
+    )
+
+    route = report["route_dispatch"]
+    summary = report["gate_summary"]
+    assert report["dtype"]["requested"] == dtype
+    assert report["optimizer"]["key"] == optimizer
+    assert report["memory"]["peak_memory_bytes"] == 123_456
+    assert route["path_b_observed"] is expected_path_b
+    assert route["path_c_observed"] is expected_path_c
+    assert route["fallback_reason"] == expected_fallback
+    assert summary["dtype"] == dtype
+    assert summary["optimizer"] == optimizer
+    assert summary["path_b_observed"] is expected_path_b
+    assert summary["path_c_observed"] is expected_path_c
+    assert summary["fallback_reason"] == expected_fallback
+    assert summary["tokens_per_second_claim_ok"] is True
+    assert summary["bogus_tok_sec_claim_detected"] is False
+    if dtype == "fp8_path_c":
+        assert route["requested_path_c_ops"] == ["mamba3_mimo", "sparse_mla"]
+        assert route["unobserved_requested_path_c_ops"] == []
+        assert route["producer_missing"] is False
+        assert route["producer_unobserved"] is False
+        assert report["fp8_path_c_producer_gate"]["ok"] is True
+        assert summary["fp8_path_c_producer_status"] == (
+            m04_train_step.FP8_PATH_C_NATIVE_PRODUCER_STATUS
+        )
+    else:
+        assert route["requested_path_c_ops"] == []
+        assert report["fp8_path_c_producer_gate"]["required"] is False
+        assert summary["fp8_path_c_producer_status"] == "not_requested"
+
+
 def test_checked_in_receipt_records_parquet_smoke_without_m0_4_claim() -> None:
     payload = json.loads(BASELINE_RECEIPT.read_text())
 
@@ -397,6 +755,8 @@ def test_synthetic_one_step_writes_finite_receipt(tmp_path: Path) -> None:
     assert output.exists()
     assert json.loads(output.read_text()) == payload
     assert_m04_receipt_contract(payload)
+    assert_regression_report_matches_payload(payload)
+    assert_m04_20step_matrix_plan(payload)
     assert payload["status"] == "ok"
     assert payload["workload"]["synthetic"] is True
     assert payload["workload"]["data_format"] == "npz"
@@ -527,6 +887,11 @@ def test_missing_dataset_dry_run_reports_blocked_receipt(tmp_path: Path) -> None
 
     assert json.loads(output.read_text()) == payload
     assert payload["status"] == "blocked"
+    assert_regression_report_matches_payload(payload)
+    assert_m04_20step_matrix_plan(payload)
+    assert payload["regression_report"]["fallback_reason"].startswith(
+        "missing_dataset:"
+    )
     assert payload["blockers"][0]["type"] == "missing_dataset"
     assert payload["training"]["steps_completed"] == 0
     assert payload["workload"]["data_path"] == str(missing)
@@ -535,7 +900,7 @@ def test_missing_dataset_dry_run_reports_blocked_receipt(tmp_path: Path) -> None
     assert payload["acceptance_gate"]["full_local_gb10_quarter_gate_completed"] is False
 
 
-def test_fp8_path_c_training_dtype_route_forces_sparse_mla_only_without_staging(
+def test_fp8_path_c_training_dtype_route_blocks_missing_sparse_mla_producer(
     tmp_path: Path,
 ) -> None:
     output = tmp_path / "m04_train_step.json"
@@ -546,48 +911,81 @@ def test_fp8_path_c_training_dtype_route_forces_sparse_mla_only_without_staging(
         "fp8_path_c",
     )
 
-    assert result.returncode == 0, result.stderr
+    assert result.returncode == 2, result.stderr
     assert not result.stderr
     payload = json.loads(result.stdout)
     assert json.loads(output.read_text()) == payload
-    assert payload["status"] == "ok"
-    assert payload["training"]["steps_completed"] == 1
+    assert payload["status"] == "blocked"
+    assert_regression_report_matches_payload(payload)
+    assert_m04_20step_matrix_plan(payload)
+    assert payload["blockers"][0]["type"] == (
+        m04_train_step.FP8_PATH_C_PRODUCER_MISSING_STATUS
+    )
+    assert payload["blockers"][0]["reason"].startswith("fp8_path_c requested")
+    assert payload["training"]["steps_completed"] == 0
+    assert payload["training"]["kernel_dispatch"] == []
     assert payload["workload"]["dtype"] == "fp8_path_c"
     assert payload["workload"]["optimizer"]["key"] == "adamw"
-    assert payload["workload"]["precision_route"] == {
-        "requested": "fp8_path_c",
-        "kind": "fp8_path_c",
-        "status": m04_train_step.FP8_PATH_C_E2E_TRAINING_STATUS,
-        "blocker_type": None,
-        "carrier_dtype": "bfloat16",
-        "native_fp8_producer_status": (
-            m04_train_step.FP8_PATH_C_NATIVE_PRODUCER_STATUS
-        ),
-        "kernel_surface_status": m04_train_step.FP8_PATH_C_KERNEL_SURFACE_STATUS,
-        "kernel_surface_available": True,
-        "full_end_to_end_training_available": True,
-        "bridge_target": m04_train_step.FP8_PATH_C_BRIDGE_TARGET,
-        "bridge_status": m04_train_step.FP8_PATH_C_BRIDGE_STATUS,
-        "zero_copy_required": True,
-        "large_tensor_staging_allowed": False,
-    }
+    precision_route = payload["workload"]["precision_route"]
+    assert precision_route["requested"] == "fp8_path_c"
+    assert precision_route["kind"] == "fp8_path_c"
+    assert precision_route["status"] == m04_train_step.FP8_PATH_C_PRODUCER_MISSING_STATUS
+    assert precision_route["blocker_type"] == (
+        m04_train_step.FP8_PATH_C_PRODUCER_MISSING_STATUS
+    )
+    assert precision_route["carrier_dtype"] == "bfloat16"
+    assert precision_route["native_fp8_producer_status"] == (
+        m04_train_step.FP8_PATH_C_PRODUCER_MISSING_STATUS
+    )
+    assert precision_route["kernel_surface_status"] == (
+        m04_train_step.FP8_PATH_C_KERNEL_SURFACE_STATUS
+    )
+    assert precision_route["kernel_surface_available"] is True
+    assert precision_route["full_end_to_end_training_available"] is False
+    assert precision_route["bridge_target"] == m04_train_step.FP8_PATH_C_BRIDGE_TARGET
+    assert precision_route["bridge_status"] == m04_train_step.FP8_PATH_C_BRIDGE_STATUS
+    assert precision_route["zero_copy_required"] is True
+    assert precision_route["large_tensor_staging_allowed"] is False
+    assert precision_route["hidden_wrapper_quantization_allowed"] is False
+    assert precision_route["kernel_boundary_quantization_allowed"] is False
+    assert precision_route["prepared_buffers_configured"] is False
+    producer = precision_route["sparse_mla_fp8_producer"]
+    assert producer["configured"] is False
+    assert producer["prepared_buffers_configured"] is False
+    assert producer["status"] == m04_train_step.FP8_PATH_C_PRODUCER_MISSING_STATUS
+    assert producer["required_prepared_buffers"] == [
+        "q_fp8",
+        "q_scale",
+        "kv_fp8",
+        "kv_scale",
+    ]
+    assert producer["hidden_wrapper_quantization_allowed"] is False
+    assert producer["kernel_boundary_quantization_allowed"] is False
+    assert producer["producer_stage"] == m04_train_step.FP8_PATH_C_PRODUCER_STAGE
+    assert producer["producer_quantization"] == (
+        m04_train_step.FP8_PATH_C_PRODUCER_QUANTIZATION
+    )
     route = payload["training"]["fp8_path_c_training_route"]
     assert route["requested"] is True
-    assert route["status"] == m04_train_step.FP8_PATH_C_E2E_TRAINING_STATUS
-    assert route["blocker_type"] is None
+    assert route["status"] == m04_train_step.FP8_PATH_C_PRODUCER_MISSING_STATUS
+    assert route["blocker_type"] == m04_train_step.FP8_PATH_C_PRODUCER_MISSING_STATUS
+    assert route["reason"].startswith("producer_missing:")
     assert route["carrier_dtype"] == "bfloat16"
     assert route["native_fp8_producer_status"] == (
-        m04_train_step.FP8_PATH_C_NATIVE_PRODUCER_STATUS
+        m04_train_step.FP8_PATH_C_PRODUCER_MISSING_STATUS
     )
+    assert route["sparse_mla_fp8_producer"] == producer
     assert route["kernel_surface_status"] == (
         m04_train_step.FP8_PATH_C_KERNEL_SURFACE_STATUS
     )
     assert route["kernel_surface_available"] is True
-    assert route["full_end_to_end_training_available"] is True
+    assert route["full_end_to_end_training_available"] is False
     assert route["end_to_end_training_status"] == (
-        m04_train_step.FP8_PATH_C_E2E_TRAINING_STATUS
+        m04_train_step.FP8_PATH_C_PRODUCER_MISSING_STATUS
     )
-    assert route["direct_mx_array_artifact_call_status"] == "m04_uses_model_graph_route"
+    assert route["direct_mx_array_artifact_call_status"] == (
+        m04_train_step.FP8_PATH_C_PRODUCER_MISSING_STATUS
+    )
     assert route["bridge_target"] == m04_train_step.FP8_PATH_C_BRIDGE_TARGET
     assert route["bridge_status"] == m04_train_step.FP8_PATH_C_BRIDGE_STATUS
     assert route["bridge_evidence"] == {
@@ -601,11 +999,15 @@ def test_fp8_path_c_training_dtype_route_forces_sparse_mla_only_without_staging(
     }
     assert route["zero_copy_required"] is True
     assert route["large_tensor_staging_allowed"] is False
+    assert route["hidden_wrapper_quantization_allowed"] is False
+    assert route["kernel_boundary_quantization_allowed"] is False
+    assert route["prepared_buffers_configured"] is False
     assert route["hidden_dtype_cast_allowed"] is False
     assert route["hidden_shape_staging_allowed"] is False
     assert route["fallback_to_path_b_allowed"] is False
-    assert route["selected_action"] == "run_path_c_training_route"
+    assert route["selected_action"] == "fail_closed_producer_missing"
     assert route["kernel_policy_env"] == {
+        "CPPMEGA_KERNEL_PATH__MAMBA3_MIMO": "path_c",
         "CPPMEGA_KERNEL_PATH__SPARSE_MLA": "path_c",
     }
     assert {
@@ -618,9 +1020,13 @@ def test_fp8_path_c_training_dtype_route_forces_sparse_mla_only_without_staging(
         surface["name"]: surface for surface in route["available_path_c_surfaces"]
     }
     assert surfaces["matmul_tl_fp8_scaled_matmul"]["kernel_surface_available"] is True
-    assert surfaces["mamba3_mimo_path_c"]["training_surface"] is True
-    assert surfaces["mamba3_mimo_path_c"]["fp8_route_auto_selected"] is False
-    assert surfaces["sparse_mla_fp8_path_c_apply"]["training_surface"] is True
+    assert surfaces["mamba3_mimo_path_c"]["training_surface"] is False
+    assert surfaces["mamba3_mimo_path_c"]["fp8_route_auto_selected"] is True
+    assert surfaces["sparse_mla_fp8_path_c_apply"]["training_surface"] is False
+    assert surfaces["sparse_mla_fp8_path_c_apply"]["producer_required"] is True
+    assert surfaces["sparse_mla_fp8_path_c_apply"]["producer_status"] == (
+        m04_train_step.FP8_PATH_C_PRODUCER_MISSING_STATUS
+    )
     assert (
         surfaces["sparse_mla_fp8_path_c_apply"]["backward_surface"]
         == "direct_owner_buffer_scatter"
@@ -633,13 +1039,118 @@ def test_fp8_path_c_training_dtype_route_forces_sparse_mla_only_without_staging(
         "absorbed MLA producer split for NoPE/RoPE KV layout and calibrated "
         "separate K/V scale lifecycle" in route["missing_training_surfaces"]
     )
-    assert route["higher_level_owner"]["current_m04_route_owner"].endswith(
-        "HybridTinyLM -> Mamba3ReferenceBlock"
+    assert (
+        route["higher_level_owner"]["sparse_mla_fp8_next_owner"]
+        == m04_train_step.FP8_PATH_C_PRODUCER_OWNER
     )
-    assert not any(
-        item["op_name"] == "mamba3_mimo" and item["path"] == "path_c"
-        for item in payload["training"]["kernel_dispatch"]
+    assert "without DSA Sparse-MLA producer" in (
+        route["higher_level_owner"]["current_m04_route_owner"]
     )
+    dispatch_report = payload["regression_report"]["route_dispatch"]
+    assert dispatch_report["requested_path_c_ops"] == ["mamba3_mimo", "sparse_mla"]
+    assert dispatch_report["observed_path_c_ops"] == []
+    assert dispatch_report["unobserved_requested_path_c_ops"] == [
+        "mamba3_mimo",
+        "sparse_mla",
+    ]
+    assert dispatch_report["producer_missing"] is True
+    assert dispatch_report["fp8_sparse_mla_producer"] == producer
+    assert dispatch_report["fallback_detected"] is True
+    assert dispatch_report["fallback_reason"].startswith("producer_missing:")
+    producer_gate = payload["regression_report"]["fp8_path_c_producer_gate"]
+    assert producer_gate["required"] is True
+    assert producer_gate["ok"] is False
+    assert producer_gate["status"] == m04_train_step.FP8_PATH_C_PRODUCER_MISSING_STATUS
+    assert producer_gate["fail_closed"] is True
+    assert producer_gate["producer"] == producer
+    assert producer_gate["reason"].startswith("producer_missing:")
+
+
+def test_fp8_path_c_dsa_attention_route_metadata_is_configured(
+    tmp_path: Path,
+) -> None:
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--synthetic",
+            "--dtype",
+            "fp8_path_c",
+            "--pattern",
+            "A",
+            "--depth",
+            "1",
+            "--dsa-a-layer-ranks",
+            "0",
+            "--output",
+            str(tmp_path / "receipt.json"),
+        ]
+    )
+    config = m04_train_step.config_from_args(args, data_path=tmp_path / "tokens.npz")
+
+    producer = m04_train_step.sparse_mla_fp8_producer_payload(config)
+    producer_gate = m04_train_step.fp8_path_c_producer_gate_payload(config)
+    route = m04_train_step.fp8_path_c_training_route_payload(config)
+
+    assert config.dsa_a_layer_ranks == (0,)
+    assert producer["configured"] is True
+    assert producer["status"] == m04_train_step.FP8_PATH_C_NATIVE_PRODUCER_STATUS
+    assert producer["dsa_layer_numbers"] == [1]
+    assert producer["owner"] == m04_train_step.FP8_PATH_C_PRODUCER_OWNER
+    assert producer["prepared_buffers_configured"] is True
+    assert producer["producer_stage"] == m04_train_step.FP8_PATH_C_PRODUCER_STAGE
+    assert producer["producer_quantization"] == (
+        m04_train_step.FP8_PATH_C_PRODUCER_QUANTIZATION
+    )
+    assert producer["hidden_wrapper_quantization_allowed"] is False
+    assert producer["kernel_boundary_quantization_allowed"] is False
+    assert producer["required_prepared_buffers"] == [
+        "q_fp8",
+        "q_scale",
+        "kv_fp8",
+        "kv_scale",
+    ]
+    assert route["status"] == m04_train_step.FP8_PATH_C_E2E_TRAINING_STATUS
+    assert route["blocker_type"] is None
+    assert route["prepared_buffers_configured"] is True
+    assert route["hidden_wrapper_quantization_allowed"] is False
+    assert route["kernel_boundary_quantization_allowed"] is False
+    assert route["full_end_to_end_training_available"] is True
+    assert route["direct_mx_array_artifact_call_status"] == "m04_uses_model_graph_route"
+    assert route["selected_action"] == "run_path_c_training_route"
+    assert producer_gate["required"] is True
+    assert producer_gate["ok"] is True
+    assert producer_gate["status"] == m04_train_step.FP8_PATH_C_NATIVE_PRODUCER_STATUS
+    assert producer_gate["fail_closed"] is False
+    assert producer_gate["producer"] == producer
+
+
+def test_fp8_path_c_local_gb10_profile_uses_model_factory_dsa_producer() -> None:
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--model-profile",
+            "local_gb10_quarter",
+            "--dtype",
+            "fp8_path_c",
+        ]
+    )
+
+    producer = m04_train_step.sparse_mla_fp8_producer_payload(args)
+    producer_gate = m04_train_step.fp8_path_c_producer_gate_payload(args)
+
+    assert producer["configured"] is True
+    assert producer["route_source"] == (
+        "cppmega_mlx.recipes.model_factory.local_gb10_quarter"
+    )
+    assert producer["status"] == m04_train_step.FP8_PATH_C_NATIVE_PRODUCER_STATUS
+    assert producer["dsa_a_layer_ranks"] == [1, 2, 3]
+    assert producer["dsa_layer_numbers"] == [5, 9, 13]
+    assert producer["prepared_buffers_configured"] is True
+    assert producer["hidden_wrapper_quantization_allowed"] is False
+    assert producer["kernel_boundary_quantization_allowed"] is False
+    assert producer["reason"] is None
+    assert producer_gate["required"] is True
+    assert producer_gate["ok"] is True
+    assert producer_gate["status"] == m04_train_step.FP8_PATH_C_NATIVE_PRODUCER_STATUS
+    assert producer_gate["producer"] == producer
 
 
 def assert_local_gb10_metadata_dry_run_contract(payload: dict[str, Any]) -> None:
@@ -652,6 +1163,8 @@ def assert_local_gb10_metadata_dry_run_contract(payload: dict[str, Any]) -> None
     assert payload["m4_vs_gb10_throughput_parity_claim"] is False
     assert payload["full_m0_4_acceptance_claim"] is False
     assert "blockers" not in payload
+    assert_regression_report_matches_payload(payload)
+    assert_m04_20step_matrix_plan(payload)
     assert {item["id"] for item in payload["acceptance_blockers"]} == {
         "cppmega-mlx-t8f.4.local_gb10_quarter_gate",
     }

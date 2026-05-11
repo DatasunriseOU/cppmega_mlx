@@ -34,7 +34,10 @@ authoritative scoreboard. This doc explains the **why** for each ❌.
       <td>C/B ratios 0.510-0.880 across the checked shapes</td>
       <td>✅ production AUTO</td>
       <td>topk_selector(..., backend="auto") prefers Path C where<br>
-      available, then falls back to Path B and pure MLX.</td>
+      available, then falls back to Path B and pure MLX.<br>
+      The direct float32/float16 <code>topk_selector_tilelang_direct(..., out=...)</code>
+      route is tvm-ffi owner-output and mutates caller-owned
+      <code>mx.int32</code>; direct bf16 fails closed.</td>
     </tr>
     <tr>
       <td>**Mamba3 main fwd+bwd** (B=2 T=512 H=4 P=32 N=64 FP32)</td>
@@ -146,22 +149,32 @@ uses Path C when available, and the checked-in receipt keeps every C/B ratio
 ergonomics and FP8 vecmat specialization, but it is not required to select
 Path C for topk today.
 
-### FP8 ops (standalone matmul/vecmat parity closed; composition still blocked)
+The owner-output closure claim is now narrow but real:
+`topk_selector_tilelang_direct(..., out=...)` lowers the TileLang DSL route
+through tvm-ffi for float32/float16 scores, mutates the caller-provided
+`mx.int32` output, and returns that same owner array. Direct bf16 dispatch
+fails closed to avoid hidden casts. This does not mean public
+`topk_selector(..., backend="auto")` is a generic owner-output route: AUTO is
+still receipt-gated and compatibility wrapper paths remain in the public Path C
+surface.
 
-These technically work via Path C. The hand-written Metal reference split
+### FP8 ops (standalone correctness useful; current production speed blocked)
+
+These technically work via Path C, but the current TL-W production gate is
+performance, not just compile/parity. The hand-written Metal reference split
 matters: `/tmp/fp8-mps-metal` provides byte FP8 decode, 4-way K unroll,
 scale-after-accumulated-dot, and the M==1 `simd_sum` vecmat reducer; the
 cppmega.mlx/AppMana fast path adds packed `uint32` loads plus LUT-backed dot4
-decode. The win path is **real FP8 Metal scheduler/codegen**, not an algebraic
-rewrite of the same scalar multiply. As of the 2026-05-05 TileLang worktree
-receipt, standalone full matmul and M==1 vecmat both lower through packed
-dot4/direct-global Metal code and match or beat the audiohacking MSL receipts.
-As of the 2026-05-11 local MLX patch, MLX Metal tensors also export DLPack
-as `kDLMetal:0`, `tvm.runtime.from_dlpack` maps them to TVM `metal:0`, and a
-standalone TVM Metal kernel can read/write the same MLX buffers. That proves
-the bridge substrate; it does not yet prove the m04 end-to-end FP8 training
-route, which still needs graph wiring over prepared FP8 buffers with no hidden
-large tensor staging.
+decode. Older packed-dot4 probe receipts showed parity or speed parity in
+isolated harnesses. Do not use those as the current production gate.
+
+As of the 2026-05-11 TL-W owner-output/tvm-ffi path, MLX Metal tensors can
+cross DLPack as `kDLMetal:0` and a standalone TVM Metal kernel can read/write
+the same buffers. That proves the bridge substrate. The current production
+timing is still red: FP8 matmul is about 14x slower than the shipped
+Path B/audiohacking-style MSL route, and vecmat is about 1.7x slower. The m04
+end-to-end FP8 training route also still needs graph wiring over prepared FP8
+buffers with no hidden large tensor staging.
 
 <table>
   <thead>
@@ -174,19 +187,19 @@ large tensor staging.
   <tbody>
     <tr>
       <td>FP8 scaled matmul (128³ e4m3 per-tensor)</td>
-      <td>✅ 0.135 ms (audiohacking 0.142 ms — 0.95×)</td>
-      <td>Parity closed locally: TileLang now emits direct-global<br>
-      transpose_B matmul with one output cell per Metal thread,<br>
-      packed FP8 dot4 over K/4 words, 4-way K unroll, no shared C<br>
-      staging/barrier, and scales applied after the packed dot loop.</td>
+      <td>❌ current TL-W owner-output/tvm-ffi route is about 14x slower<br>
+      than the shipped Path B MSL route.</td>
+      <td>Keep Path B for production. Rework the real packed-dot4<br>
+      scheduler/codegen path until the current strict receipt is no worse,<br>
+      then reconnect it to full Sparse-MLA FP8 fwd/bwd composition.</td>
     </tr>
     <tr>
       <td>FP8 scaled vecmat (M=1 N=K=4096 e4m3)</td>
-      <td>✅ 0.209 ms (audiohacking 0.254 ms — 0.82×)</td>
-      <td>Parity closed locally: TileLang now emits direct-global<br>
-      transpose_B vecmat with packed FP8 dot4, 4-way K unroll,<br>
-      simdgroup_sum reduction, no C_shared staging/barrier, and scales<br>
-      applied after the SIMD dot reduction.</td>
+      <td>❌ current TL-W owner-output/tvm-ffi route is about 1.7x slower<br>
+      than the shipped M=1 Path B simd_sum reducer.</td>
+      <td>Keep Path B for production. Rework the direct-global vecmat<br>
+      lowering and wrapper boundary until strict current receipts are no<br>
+      worse and stable across paired p90/p99 samples.</td>
     </tr>
   </tbody>
 </table>
@@ -210,11 +223,11 @@ packed `__tvm_fp8_e4m3_dot4_packed` Metal path, applies scales after the dot,
 uses a finite fp32-min sentinel for invalid indices because current TileLang
 Metal cannot lower `T.infinity`, and the refreshed M4 Max receipt reports
 QK-reduce C/B=0.975 and indexed-QK C/B=0.655 with zero invalid-index mismatch.
-The TileLang `/private/tmp/tl_pr_c` scaled-matmul receipts now report full
-matmul `0.135 ms` versus audiohacking `0.142 ms` (`0.95×`) and M==1 vecmat
-`0.209 ms` versus audiohacking `0.254 ms` (`0.82×`) on the same M4 Max path.
-The full-dispatch sparse FP8 gate intentionally stays red until fwd/bwd
-composition is implemented and receipted.
+2026-05-11 TL-W update: those older standalone scaled-matmul/vecmat receipts
+are superseded for production planning by the owner-output/tvm-ffi gate, where
+FP8 matmul is still about 14x slow and vecmat about 1.7x slow. The
+full-dispatch sparse FP8 gate intentionally stays red until fwd/bwd composition
+is implemented and current strict receipts are green.
 
 <table>
   <thead>
@@ -243,8 +256,8 @@ composition is implemented and receipted.
       active packed FP8 Metal scheduler/codegen path)</td>
       <td>Standalone FP8 matmul/vecmat speed parity and the building<br>
       block for Sparse-MLA FP8 Path C composition</td>
-      <td>medium/high (continue from the local direct-global packed-dot4<br>
-      lowering into full Sparse-MLA FP8 fwd/bwd composition)</td>
+      <td>medium/high (first recover current owner-output/tvm-ffi speed,<br>
+      then continue into full Sparse-MLA FP8 fwd/bwd composition)</td>
       <td>**HIGH** — remaining full-composition Sparse-MLA FP8 blocker</td>
     </tr>
     <tr>
@@ -278,7 +291,7 @@ scaled-operands patch. It is not applyable scheduler/codegen work.
 The filing pack should explicitly say:
 - "Current filed patches are the foundation; Path C ports surfaced A/B/C follow-up gaps"
 - "Each A/B/C follow-up has a local docs/upstream/<name>/ artifact/probe directory with current status"
-- "Patch B's #2146 macro rewrite is retired; real FP8 speed parity is closed locally by packed-dot4 Metal scheduler/codegen work, while full Sparse-MLA FP8 composition still needs filing"
+- "Patch B's #2146 macro rewrite is retired; packed-dot4 probes remain useful diagnostics, but current owner-output/tvm-ffi FP8 speed parity is still red and full Sparse-MLA FP8 composition still needs filing"
 - "All of them stack on PR #2130 / #2142 (or whatever upstream Apple Metal PR series eventually merges)"
 
 ---
@@ -323,5 +336,5 @@ upstream tile-ai/tilelang main
   Our: tilelang_metal_shared_dyn       (no-op investigation artifact, not a code PR)
   ↑ LOCAL ARTIFACTS / PROBES EXIST; TRACK CURRENT FOLLOW-UP STATUS
   Patch A: tilelang_metal_pipelined_32x32           (local shipped)
-  Patch B: tilelang_metal_fp8_scaled_matmul_fused_scheduler  (FILED #2146, RETIRED LOCALLY 2026-05-04 — the algebraic scaled-operands patch is not applyable here and did not close the local Path B FP8 MSL gap. The replacement local TileLang worktree path is scale-after-dot plus packed uint32/LUT dot4 decode, 4-way K stride, direct-global full matmul, and simd_sum vecmat reduction. Standalone matmul/vecmat speed parity is closed locally; the remaining upstream work is filing this real packed FP8 Metal scheduler/codegen path and composing it into Sparse-MLA FP8 fwd/bwd.)
+  Patch B: tilelang_metal_fp8_scaled_matmul_fused_scheduler  (FILED #2146, RETIRED LOCALLY 2026-05-04 — the algebraic scaled-operands patch is not applyable here and did not close the local Path B FP8 MSL gap. The replacement local TileLang worktree path is scale-after-dot plus packed uint32/LUT dot4 decode, 4-way K stride, direct-global full matmul, and simd_sum vecmat reduction. As of TL-W, the owner-output/tvm-ffi production gate is still red: matmul about 14x slow and vecmat about 1.7x slow. Recover that speed before composing it into Sparse-MLA FP8 fwd/bwd.)
   Patch C: tilelang_metal_blockscaled_e8m0          (FILED #2147; keep apply checks against the active prereq stack)

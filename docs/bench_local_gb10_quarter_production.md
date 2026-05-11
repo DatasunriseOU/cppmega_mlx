@@ -141,6 +141,136 @@ Caveats:
 - **Bench wall time:** 1467s (~24.5 min) total across both optimizer sweeps and the Path A comparison.
 - **Surprise:** Lion at lr=3e-3 on synthetic random tokens diverged (loss[0]=11.26 -> mean_last10=71.18); this bench measures throughput only, not loss-quality, so divergence on synthetic uniform tokens is expected and does not reflect on Lion at a real corpus.
 
+## M0.4 20-Step Receipt Matrix
+
+Existing local_gb10_quarter optimizer-matrix receipts live under
+`bench/baselines/m04_optimizer_matrix/`. The checked-in
+`summary_20step.json` currently covers 20-step bf16 rows for AdamW,
+Muon/Muon+AdamW, Lion, Lion8bit, Adam8bit, and MuonAdamWInt8 variants, plus
+per-case receipts for dynamic/symmetric 8-bit codecs. A historical
+`fp8_path_c_adam8bit_dyn_lr1e-4.json` receipt is present but records the
+older fail-closed FP8 route.
+
+`scripts/m04_train_step.py` now writes two TL-8 receipt sections:
+
+- `regression_report`: normalized route dispatch, dtype/carrier, optimizer,
+  Path B/C observation, peak memory, finite/loss fields, tokens/sec, and
+  fallback reason.
+- `regression_report.fp8_path_c_producer_gate`: fail-closed FP8 producer gate
+  with `status`, `ok`, `configured`, owner, required prepared buffers, and
+  `producer_missing` reason when `fp8_path_c` has no DSA Sparse-MLA producer.
+- `m04_20step_matrix`: generated commands for the 20-step matrix across
+  `bf16`, `fp8_path_c`, and `int8` routes with AdamW, Muon, MuonAdamW,
+  Lion, Lion8bit, and Adam8bit where supported. Each supported row records
+  `dry_run_command`, `smoke_command`, `real_20step_command`, and the receipt
+  also lists `real_100step_commands`.
+- `m04_20step_matrix.baseline_comparison`: the 900 tok/s-class comparison
+  target from existing real-parquet bs=1 seq=4096 20-step receipts. The
+  reference receipts are `lion8bit_sym_lr1e-4.json` (900.6977 tok/s),
+  `adam8bit_sym_lr1e-4.json` (894.2882 tok/s), and
+  `adam8bit_dyn_lr1e-4.json` (890.0727 tok/s). These are local M4 receipts,
+  not GB10 parity claims.
+
+Current TL-W lane status:
+
+- Real 20-step matrix readiness: commands are prepared for the supported rows,
+  and partial real receipts were run on May 11, 2026. This is not the complete
+  final 20-step matrix, and no 100-step real-parquet matrix has been run.
+- Current green bf16 20-step receipts from `/tmp/cppmega_e2e_matrix_20260511`:
+  `adamw` 314.14 tok/s, `muon_adamw` 40.26 tok/s, `nam56r` 40.51 tok/s,
+  `lion` 370.82 tok/s, `adam8bit` 629.65 tok/s, `lion8bit` 686.21 tok/s, and
+  `int8` 40.58 tok/s. Each completed 20/20 steps, stayed finite, and decreased
+  loss.
+- After the VJP fix, current green `fp8_path_c` 20-step receipts from
+  `/tmp/cppmega_e2e_matrix_20260511/after_vjp` are: `adamw` 255.02 tok/s,
+  `muon_adamw` 36.73 tok/s, `nam56r` 36.72 tok/s, `lion` 293.15 tok/s,
+  `adam8bit` 452.72 tok/s, `lion8bit` 482.59 tok/s, and `int8` 36.71 tok/s.
+  These prove finite 20-step behavior for those rows only.
+- Remaining matrix blocker: the matched bf16-vs-fp8_path_c lion8bit repro in
+  `/tmp/cppmega_repro_bf16_vs_fp8_path_c_20step_20260511` has bf16 green at
+  916.56 tok/s, while the matching fp8_path_c run was stopped after 1216.9s
+  (`returncode=-15`). Do not claim a full real 20-step matrix until that and the
+  other supported rows are rerun under the final code.
+- Dry-run smoke previously executed:
+  `.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 4096 --dtype bfloat16 --optimizer adamw --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --dry-run-json --output /tmp/m04_bf16_adamw_20step_dryrun.json --json`
+- Dry-run result: exit 0, receipt `status=dry_run`,
+  `workload.model_profile=local_gb10_quarter`, `workload.batch_size=1`,
+  `workload.seq_len=4096`, `timing.throughput_interpretation.production_shape=true`,
+  and `m04_20step_matrix.baseline_comparison` present. It does not allocate
+  optimizer state, run model forward/backward, or produce tok/s.
+- Focused receipt tests: `.venv/bin/python -m pytest tests/test_m04_train_step.py -q`
+  passed (77 tests).
+
+Base command shape for supported cases:
+
+```
+.venv/bin/python scripts/m04_train_step.py \
+  --model-profile local_gb10_quarter \
+  --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet \
+  --data-format parquet \
+  --token-key token_ids \
+  --steps 20 \
+  --batch-size 1 \
+  --seq-len 4096 \
+  --dtype bfloat16 \
+  --optimizer adamw \
+  --optimizer-quant-scheme dynamic_int8_v1 \
+  --lr 1e-4 \
+  --grad-checkpoint \
+  --output bench/baselines/m04_optimizer_matrix/bf16_adamw_20step.json \
+  --json
+```
+
+For `fp8_path_c`, change `--dtype fp8_path_c`; the receipt records the bf16
+carrier and Path C policy overrides. For `int8`, keep `--dtype bfloat16`
+and use one of `--optimizer int8`, `--optimizer adam8bit`, or
+`--optimizer lion8bit`; both `muon` and `muon_adamw` map to the
+MuonAdamWInt8 route under `int8`. Plain AdamW and Lion are deliberately
+marked unsupported for the int8 route because they keep fp32 optimizer state.
+
+Generated real 20-step receipt commands:
+
+```
+.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 4096 --dtype bfloat16 --optimizer adamw --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output bench/baselines/m04_optimizer_matrix/bf16_adamw_20step.json --json
+.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 4096 --dtype bfloat16 --optimizer muon --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output bench/baselines/m04_optimizer_matrix/bf16_muon_20step.json --json
+.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 4096 --dtype bfloat16 --optimizer muon_adamw --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output bench/baselines/m04_optimizer_matrix/bf16_muon_adamw_20step.json --json
+.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 4096 --dtype bfloat16 --optimizer lion --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output bench/baselines/m04_optimizer_matrix/bf16_lion_20step.json --json
+.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 4096 --dtype bfloat16 --optimizer lion8bit --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output bench/baselines/m04_optimizer_matrix/bf16_lion8bit_20step.json --json
+.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 4096 --dtype bfloat16 --optimizer adam8bit --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output bench/baselines/m04_optimizer_matrix/bf16_adam8bit_20step.json --json
+.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 4096 --dtype fp8_path_c --optimizer adamw --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output bench/baselines/m04_optimizer_matrix/fp8_path_c_adamw_20step.json --json
+.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 4096 --dtype fp8_path_c --optimizer muon --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output bench/baselines/m04_optimizer_matrix/fp8_path_c_muon_20step.json --json
+.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 4096 --dtype fp8_path_c --optimizer muon_adamw --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output bench/baselines/m04_optimizer_matrix/fp8_path_c_muon_adamw_20step.json --json
+.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 4096 --dtype fp8_path_c --optimizer lion --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output bench/baselines/m04_optimizer_matrix/fp8_path_c_lion_20step.json --json
+.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 4096 --dtype fp8_path_c --optimizer lion8bit --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output bench/baselines/m04_optimizer_matrix/fp8_path_c_lion8bit_20step.json --json
+.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 4096 --dtype fp8_path_c --optimizer adam8bit --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output bench/baselines/m04_optimizer_matrix/fp8_path_c_adam8bit_20step.json --json
+.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 4096 --dtype bfloat16 --optimizer int8 --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output bench/baselines/m04_optimizer_matrix/int8_muon_20step.json --json
+.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 4096 --dtype bfloat16 --optimizer int8 --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output bench/baselines/m04_optimizer_matrix/int8_muon_adamw_20step.json --json
+.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 4096 --dtype bfloat16 --optimizer lion8bit --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output bench/baselines/m04_optimizer_matrix/int8_lion8bit_20step.json --json
+.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 4096 --dtype bfloat16 --optimizer adam8bit --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output bench/baselines/m04_optimizer_matrix/int8_adam8bit_20step.json --json
+```
+
+Generated real 100-step gate commands use the same matrix and add
+`--require-loss-decrease` so non-decreasing rows fail closed:
+
+```
+.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 100 --batch-size 1 --seq-len 4096 --dtype bfloat16 --optimizer adamw --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --require-loss-decrease --output bench/baselines/m04_optimizer_matrix/bf16_adamw_100step.json --json
+.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 100 --batch-size 1 --seq-len 4096 --dtype bfloat16 --optimizer muon --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --require-loss-decrease --output bench/baselines/m04_optimizer_matrix/bf16_muon_100step.json --json
+.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 100 --batch-size 1 --seq-len 4096 --dtype bfloat16 --optimizer muon_adamw --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --require-loss-decrease --output bench/baselines/m04_optimizer_matrix/bf16_muon_adamw_100step.json --json
+.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 100 --batch-size 1 --seq-len 4096 --dtype bfloat16 --optimizer lion --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --require-loss-decrease --output bench/baselines/m04_optimizer_matrix/bf16_lion_100step.json --json
+.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 100 --batch-size 1 --seq-len 4096 --dtype bfloat16 --optimizer lion8bit --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --require-loss-decrease --output bench/baselines/m04_optimizer_matrix/bf16_lion8bit_100step.json --json
+.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 100 --batch-size 1 --seq-len 4096 --dtype bfloat16 --optimizer adam8bit --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --require-loss-decrease --output bench/baselines/m04_optimizer_matrix/bf16_adam8bit_100step.json --json
+.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 100 --batch-size 1 --seq-len 4096 --dtype fp8_path_c --optimizer adamw --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --require-loss-decrease --output bench/baselines/m04_optimizer_matrix/fp8_path_c_adamw_100step.json --json
+.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 100 --batch-size 1 --seq-len 4096 --dtype fp8_path_c --optimizer muon --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --require-loss-decrease --output bench/baselines/m04_optimizer_matrix/fp8_path_c_muon_100step.json --json
+.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 100 --batch-size 1 --seq-len 4096 --dtype fp8_path_c --optimizer muon_adamw --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --require-loss-decrease --output bench/baselines/m04_optimizer_matrix/fp8_path_c_muon_adamw_100step.json --json
+.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 100 --batch-size 1 --seq-len 4096 --dtype fp8_path_c --optimizer lion --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --require-loss-decrease --output bench/baselines/m04_optimizer_matrix/fp8_path_c_lion_100step.json --json
+.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 100 --batch-size 1 --seq-len 4096 --dtype fp8_path_c --optimizer lion8bit --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --require-loss-decrease --output bench/baselines/m04_optimizer_matrix/fp8_path_c_lion8bit_100step.json --json
+.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 100 --batch-size 1 --seq-len 4096 --dtype fp8_path_c --optimizer adam8bit --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --require-loss-decrease --output bench/baselines/m04_optimizer_matrix/fp8_path_c_adam8bit_100step.json --json
+.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 100 --batch-size 1 --seq-len 4096 --dtype bfloat16 --optimizer int8 --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --require-loss-decrease --output bench/baselines/m04_optimizer_matrix/int8_muon_100step.json --json
+.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 100 --batch-size 1 --seq-len 4096 --dtype bfloat16 --optimizer int8 --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --require-loss-decrease --output bench/baselines/m04_optimizer_matrix/int8_muon_adamw_100step.json --json
+.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 100 --batch-size 1 --seq-len 4096 --dtype bfloat16 --optimizer lion8bit --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --require-loss-decrease --output bench/baselines/m04_optimizer_matrix/int8_lion8bit_100step.json --json
+.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 100 --batch-size 1 --seq-len 4096 --dtype bfloat16 --optimizer adam8bit --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --require-loss-decrease --output bench/baselines/m04_optimizer_matrix/int8_adam8bit_100step.json --json
+```
+
 ## Reproducibility
 
 ```

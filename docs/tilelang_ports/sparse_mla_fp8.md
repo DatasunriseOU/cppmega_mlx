@@ -99,12 +99,21 @@ cppmega_mlx/nn/_tilelang/sparse_mla_fp8.py provides:
    — High-level entry that prefers direct-MSL Path B, falls back to the
    reference, and supports force_metal=True to fail closed when Metal is
    unavailable.
-6. Path C QK reducers in sparse_mla_fp8_path_c.py
-   — TileLang-DSL QK reducer and full-shape indexed QK reducer. The checked-in
-   receipt has both reducers dispatchable, parity-clean, and not slower than
-   their Path B comparison rows for the current smoke shape. They cover the QK
-   score tile only; full FP8 forward/backward production dispatch remains Path B
-   until the complete Path C sparse-MLA layout is wired and measured.
+6. Path C prepared-buffer surfaces in sparse_mla_fp8_path_c.py
+   — TileLang-DSL QK reducers plus fused prepared-buffer forward/backward entry
+   points. The public Path C ABI consumes existing
+   `q_fp8/q_scale/kv_fp8/kv_scale/indices` buffers; it does not quantize float
+   Q/KV inside the wrapper. The forward owner-output route
+   `sparse_mla_fp8_path_c_apply(..., out=..., lse=...)` compiles the TileLang
+   apply kernel with `execution_backend="tvm_ffi"` and returns the same
+   caller-owned `out`/`lse` MLX arrays instead of building an
+   `mx.fast.metal_kernel` wrapper. Backward is fail-closed in production until
+   the atomic scatter has a stable TileLang `execution_backend="tvm_ffi"`
+   lowering. The public ABI already requires final float32 `dq_buffer` and
+   `dkv_buffer` arrays; without them it returns unavailable or raises under
+   `force_path_c=True`. It no longer allocates `dq`/`dkv`, builds hidden
+   `mx.fast.metal_kernel` clear/atomic wrappers, or materializes the old
+   `dkv_partial` reduction tensor.
 
 ## FP8 dtype lowering surprises
 
@@ -137,10 +146,11 @@ following caveat: input magnitude matters.
   err — that is real e4m3 quantization noise propagated through softmax + V
   matmul, not a port bug. Tests use scale=0.1 to stay inside the brief's
   rtol budget.
-- Backward parity uses a **dequantize-then-BF16 oracle**: we run the BF16
-  reference on the same FP8-recovered Q/KV that the FP8 reference produces
-  internally, and compare gradients. This isolates the attention math from
-  the quantization noise. With STE the two grads match to within rtol=1e-2.
+- Path B backward parity uses a **dequantize-then-BF16 oracle**: we run the
+  BF16 reference on the same FP8-recovered Q/KV that the FP8 reference produces
+  internally, and compare gradients. This isolates the attention math from the
+  quantization noise. Path C backward is not promoted to parity dispatch while
+  the owner-output atomic scatter remains fail-closed.
 
 ## Bench (current Apple M-series)
 
@@ -160,20 +170,31 @@ From bench/tilelang_ports/sparse_mla_fp8.json on the current
 The direct-MSL Path B kernel is faster than the references on this local M4
 receipt because e4m3 byte decode is fused into the sparse QK/SV loops. This is
 software FP8 emulation, not a CUDA/H100/H200-style native FP8 tensor-core
-claim. Path C is correctness-live for QK: the checked ratios are
+claim. Path C is correctness-live for QK and has prepared-buffer forward
+owner-output smoke coverage. Backward coverage verifies fail-closed behavior and
+the owner-output ABI while atomic scatter lowering remains blocked. The checked
+ratios are
 `path_c_qk_reduce_over_path_b_qk_vecmat=0.9551` and
 `path_c_indexed_qk_reduce_over_path_b_fwd=0.5721`, with
 `invalid_mismatch_count=0` for masked/OOB indices. This is a QK reducer receipt,
-not a claim that full Sparse-MLA FP8 forward/backward has moved from Path B to
-Path C.
+not a promotion receipt for full Sparse-MLA FP8 AUTO dispatch.
 
 ## Next steps
 
 1. Keep production/default dispatch on Path B direct MSL.
 2. Keep native TileLang FP8 `T.gemm` lowering fail-closed until float8 storage
    and Metal GEMM lowering are both present.
-3. Extend Path C only with measured reducers/full-layout kernels; do not AUTO
-   promote until the strict full forward/backward gate is green.
+3. Keep Path C full forward/backward as a prepared-buffer, owner-output route until the
+   strict full-dispatch receipt is parity-clean and not slower than Path B.
+   Data movement rule: the owner-output Path C forward consumes existing
+   `q_fp8`, `q_scale`, `kv_fp8`, `kv_scale`, and `indices` GPU buffers, writes
+   into caller-owned `out`/`lse`, and creates only scalar control buffers for
+   `sm_scale` / sink presence. Owner-output backward will consume the same
+   prepared buffers plus caller-owned float32 `dq_buffer`/`dkv_buffer` once the
+   TileLang Metal atomic-add lowering is stable; until then it fails closed
+   before compiling the unsafe route. These wrappers do not allocate large
+   outputs, stage CPU data, cast FP8 carriers, cast owner outputs back to
+   another dtype, or quantize inside the wrapper.
 4. When tile-ai/tilelang HEAD lands the Apple PRs:
 
 1. Verify that T.gemm(A_fp8, B_fp8, C_fp32, ...) lowers to MSL with
@@ -181,8 +202,8 @@ Path C.
 2. Build the FP8 PrimFunc with fp8_dtype = T.float8_e4m3, accum_dtype =
    T.float32, out_dtype = T.bfloat16. Mirror the gb10 fwd_fp8 PrimFunc
    but skip the tile.PassConfigKey.TL_DISABLE_TMA_LOWER (no TMA on Apple).
-3. Lower with target='metal', strip kernel signature using the Path B
-   helper, and dispatch through mx.fast.metal_kernel.
+3. Lower with target='metal' and dispatch Path C production surfaces through
+   `execution_backend="tvm_ffi"` owner outputs, not hidden `mx.fast` wrappers.
 4. Add a manual VJP via mx.custom_function that wires forward outputs to
-   the FP8 backward PrimFunc.
+   the FP8 backward PrimFunc and requires caller-owned `dq`/`dkv` buffers.
 5. Compare it against Path B before changing dispatch policy.

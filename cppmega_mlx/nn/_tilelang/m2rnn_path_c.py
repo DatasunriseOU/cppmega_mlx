@@ -1,11 +1,11 @@
-"""Path C TileLang DSL forward surface for cppmega M2RNN.
+"""Path C TileLang DSL forward/backward surface for cppmega M2RNN.
 
 The Path B module owns the optimized hand-written MSL forward/backward pair.
-This module supplies the missing Path C public apply surface by lowering a
-TileLang ``@T.prim_func`` to Metal MSL and dispatching it through MLX. The
-first implementation is intentionally forward-only: it computes the same
-``y`` tensor as Path B, while public callers that need gradients should keep
-using Path B until the backward DSL port lands.
+This module supplies the Path C public apply surface by lowering TileLang
+``@T.prim_func`` kernels to Metal MSL and dispatching them through MLX. It keeps
+the same explicit tensor contract as Path B: callers provide ``h0`` up front,
+forward returns TileLang-owned outputs, and backward uses explicit partial
+output buffers for reductions/scratch instead of CPU staging.
 """
 
 from dataclasses import dataclass
@@ -15,11 +15,10 @@ from typing import Any, cast
 import mlx.core as mx
 
 from cppmega_mlx.nn._tilelang import _msl_transform
+from cppmega_mlx.nn._tilelang._engine_dispatch import dispatch_lower
 from cppmega_mlx.nn._tilelang._msl_transform import MSLDispatchUnsupported
-from cppmega_mlx.nn._tilelang._msl_transform import lower_tilelang_to_msl_inline
 from cppmega_mlx.nn._tilelang.m2rnn import (
     _validate_inputs,
-    m2rnn_apply,
 )
 
 
@@ -47,6 +46,170 @@ def _validate_same_dtype(reference: mx.array, *arrays: mx.array) -> bool:
     return all(x.dtype == reference.dtype for x in arrays)
 
 
+def _path_c_inputs_eligible(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    W: mx.array,
+    xf: mx.array,
+    h0: mx.array | None,
+) -> bool:
+    if not _msl_transform.can_run_metal() or h0 is None:
+        return False
+    if not _validate_same_dtype(q, k, v, W, xf, h0):
+        return False
+    if _tl_dtype_for(q.dtype) is None:
+        return False
+    try:
+        _validate_inputs(q, k, v, W, xf, h0)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+_FWD_OUTPUT_NAMES = ("h_last", "tanh_cache", "y")
+_FWD_OUTPUT_IDX = (6, 7, 8)
+_BWD_OUTPUT_NAMES = (
+    "dW_partial",
+    "dh0",
+    "dk",
+    "dq",
+    "dv",
+    "dxf",
+    "h_steps_scratch",
+)
+_BWD_OUTPUT_IDX = (8, 9, 10, 11, 12, 13, 14)
+
+M2RNNFwdOwnerOutputs = tuple[mx.array, mx.array, mx.array]
+M2RNNBwdOwnerOutputs = tuple[
+    mx.array,
+    mx.array,
+    mx.array,
+    mx.array,
+    mx.array,
+    mx.array,
+    mx.array,
+]
+
+
+def _require_owner_array(
+    op_name: str,
+    name: str,
+    array: mx.array,
+    *,
+    shape: tuple[int, ...],
+    dtype: mx.Dtype,
+) -> mx.array:
+    if not isinstance(array, mx.array):
+        raise TypeError(
+            f"{op_name}: owner output {name} must be an mlx.core.array; "
+            f"got {type(array).__name__}"
+        )
+    if tuple(array.shape) != shape:
+        raise ValueError(
+            f"{op_name}: owner output {name} must have shape {shape}; "
+            f"got {tuple(array.shape)}"
+        )
+    if array.dtype != dtype:
+        raise TypeError(
+            f"{op_name}: owner output {name} must have dtype {dtype}; got {array.dtype}"
+        )
+    return array
+
+
+def _m2rnn_fwd_owner_outputs(
+    out: M2RNNFwdOwnerOutputs | None,
+    *,
+    batch: int,
+    seq: int,
+    heads: int,
+    k_dim: int,
+    v_dim: int,
+    dtype: mx.Dtype,
+) -> M2RNNFwdOwnerOutputs:
+    op_name = "m2rnn_fwd_path_c"
+    if out is None:
+        return (
+            mx.zeros((batch, seq, heads, v_dim), dtype=dtype),
+            mx.zeros((batch, heads, k_dim, v_dim), dtype=dtype),
+            mx.zeros((batch, seq, heads, k_dim, v_dim), dtype=dtype),
+        )
+    if not isinstance(out, tuple) or len(out) != 3:
+        raise TypeError(
+            f"{op_name}: out must be a (y, h_last, tanh_cache) owner-output tuple"
+        )
+    y, h_last, tanh_cache = out
+    return (
+        _require_owner_array(
+            op_name,
+            "y",
+            y,
+            shape=(batch, seq, heads, v_dim),
+            dtype=dtype,
+        ),
+        _require_owner_array(
+            op_name,
+            "h_last",
+            h_last,
+            shape=(batch, heads, k_dim, v_dim),
+            dtype=dtype,
+        ),
+        _require_owner_array(
+            op_name,
+            "tanh_cache",
+            tanh_cache,
+            shape=(batch, seq, heads, k_dim, v_dim),
+            dtype=dtype,
+        ),
+    )
+
+
+def _m2rnn_bwd_owner_outputs(
+    out: M2RNNBwdOwnerOutputs | None,
+    *,
+    batch: int,
+    seq: int,
+    heads: int,
+    k_dim: int,
+    v_dim: int,
+    dtype: mx.Dtype,
+) -> M2RNNBwdOwnerOutputs:
+    op_name = "m2rnn_bwd_path_c"
+    if out is None:
+        return (
+            mx.zeros((batch, seq, heads, k_dim), dtype=dtype),
+            mx.zeros((batch, seq, heads, k_dim), dtype=dtype),
+            mx.zeros((batch, seq, heads, v_dim), dtype=dtype),
+            mx.zeros((batch, heads, v_dim, v_dim), dtype=dtype),
+            mx.zeros((batch, seq, heads), dtype=dtype),
+            mx.zeros((batch, heads, k_dim, v_dim), dtype=dtype),
+            mx.zeros((batch, heads, seq, k_dim, v_dim), dtype=dtype),
+        )
+    if not isinstance(out, tuple) or len(out) != 7:
+        raise TypeError(
+            "m2rnn_bwd_path_c: out must be a "
+            "(dq, dk, dv, dW_partial, dxf, dh0, h_steps_scratch) "
+            "owner-output tuple"
+        )
+    names = ("dq", "dk", "dv", "dW_partial", "dxf", "dh0", "h_steps_scratch")
+    expected_shapes = (
+        (batch, seq, heads, k_dim),
+        (batch, seq, heads, k_dim),
+        (batch, seq, heads, v_dim),
+        (batch, heads, v_dim, v_dim),
+        (batch, seq, heads),
+        (batch, heads, k_dim, v_dim),
+        (batch, heads, seq, k_dim, v_dim),
+    )
+    return cast(
+        M2RNNBwdOwnerOutputs,
+        tuple(
+            _require_owner_array(op_name, name, array, shape=shape, dtype=dtype)
+            for name, array, shape in zip(names, out, expected_shapes, strict=True)
+        ),
+    )
+
+
 @lru_cache(maxsize=128)
 def _fwd_kernel_for(
     batch: int,
@@ -72,6 +235,8 @@ def _fwd_kernel_for(
         W: T.Tensor((heads, v_dim, v_dim), carrier_dtype),
         xf: T.Tensor((batch, seq, heads), carrier_dtype),
         h0: T.Tensor((batch, heads, k_dim, v_dim), carrier_dtype),
+        h_last: T.Tensor((batch, heads, k_dim, v_dim), carrier_dtype),
+        tanh_cache: T.Tensor((batch, seq, heads, k_dim, v_dim), carrier_dtype),
         y: T.Tensor((batch, seq, heads, v_dim), carrier_dtype),
     ):
         with T.Kernel(T.ceildiv(lanes, threads), threads=threads) as bx:
@@ -107,6 +272,11 @@ def _fwd_kernel_for(
                                 )
                             z = acc[0] + k_val * T.cast(v[b, t, h, vv], accum_dtype)
                             tz = T.tanh(z)
+                            if vv_out == 0:
+                                tanh_cache[b, t, h, kk, vv] = T.cast(
+                                    tz,
+                                    carrier_dtype,
+                                )
                             h_next[kk, vv] = f_val * h_state[kk, vv] + one_minus_f * tz
                         y_acc[0] = y_acc[0] + q_val * h_next[kk, vv_out]
 
@@ -114,21 +284,218 @@ def _fwd_kernel_for(
                     for kk in T.serial(k_dim):
                         for vv in T.serial(v_dim):
                             h_state[kk, vv] = h_next[kk, vv]
+                if vv_out == 0:
+                    for kk in T.serial(k_dim):
+                        for vv in T.serial(v_dim):
+                            h_last[b, h, kk, vv] = T.cast(
+                                h_state[kk, vv],
+                                carrier_dtype,
+                            )
 
-    lowering = lower_tilelang_to_msl_inline(fwd)
-    input_names = [name for name in lowering.buffer_param_names if name != "y"]
+    lowering = dispatch_lower(fwd, target="metal", return_msl=True)
+    input_names = [
+        name for name in lowering.buffer_param_names if name not in _FWD_OUTPUT_NAMES
+    ]
     if set(input_names) != {"q", "k", "v", "W", "xf", "h0"}:
         raise MSLDispatchUnsupported(
             "unexpected M2RNN Path C buffer signature: "
             + ", ".join(lowering.buffer_param_names)
         )
-    kernel = mx.fast.metal_kernel(
-        name=f"cppmega_m2rnn_path_c_fwd_{carrier_dtype}_{batch}_{seq}_{heads}_{k_dim}_{v_dim}",
-        input_names=input_names,
-        output_names=["y"],
-        source=lowering.body,
-        header=lowering.header,
-        ensure_row_contiguous=True,
+    import tilelang
+
+    kernel = tilelang.compile(
+        fwd,
+        target=_msl_transform._as_metal_target("metal"),
+        execution_backend="tvm_ffi",
+        out_idx=list(_FWD_OUTPUT_IDX),
+    )
+    return kernel, lowering
+
+
+@lru_cache(maxsize=128)
+def _bwd_kernel_for(
+    batch: int,
+    seq: int,
+    heads: int,
+    k_dim: int,
+    v_dim: int,
+    carrier_dtype: str,
+    *,
+    return_msl: bool = False,
+) -> tuple[Any, _msl_transform.TileLangMSLLowering]:
+    import tilelang.language as T
+
+    lanes = batch * heads
+    threads = _threads_for(lanes)
+    accum_dtype = "float32"
+
+    @T.prim_func
+    def bwd(
+        dy: T.Tensor((batch, seq, heads, v_dim), carrier_dtype),
+        q: T.Tensor((batch, seq, heads, k_dim), carrier_dtype),
+        k: T.Tensor((batch, seq, heads, k_dim), carrier_dtype),
+        v: T.Tensor((batch, seq, heads, v_dim), carrier_dtype),
+        W: T.Tensor((heads, v_dim, v_dim), carrier_dtype),
+        xf: T.Tensor((batch, seq, heads), carrier_dtype),
+        h0: T.Tensor((batch, heads, k_dim, v_dim), carrier_dtype),
+        tanh_cache: T.Tensor((batch, seq, heads, k_dim, v_dim), carrier_dtype),
+        dW_partial: T.Tensor((batch, heads, v_dim, v_dim), carrier_dtype),
+        dh0: T.Tensor((batch, heads, k_dim, v_dim), carrier_dtype),
+        dk: T.Tensor((batch, seq, heads, k_dim), carrier_dtype),
+        dq: T.Tensor((batch, seq, heads, k_dim), carrier_dtype),
+        dv: T.Tensor((batch, seq, heads, v_dim), carrier_dtype),
+        dxf: T.Tensor((batch, seq, heads), carrier_dtype),
+        h_steps_scratch: T.Tensor((batch, heads, seq, k_dim, v_dim), carrier_dtype),
+    ):
+        with T.Kernel(T.ceildiv(lanes, threads), threads=threads) as bx:
+            tid = T.get_thread_binding(0)
+            lane = bx * threads + tid
+            h_state = T.alloc_local((k_dim, v_dim), accum_dtype)
+            dh = T.alloc_local((k_dim, v_dim), accum_dtype)
+            dz = T.alloc_local((k_dim, v_dim), accum_dtype)
+            dh_next = T.alloc_local((k_dim, v_dim), accum_dtype)
+            dW_acc = T.alloc_local((v_dim, v_dim), accum_dtype)
+            if lane < lanes:
+                h = lane % heads
+                b = lane // heads
+
+                for kk in T.serial(k_dim):
+                    for vv in T.serial(v_dim):
+                        h_state[kk, vv] = T.cast(h0[b, h, kk, vv], accum_dtype)
+                        dh[kk, vv] = 0.0
+                for v0 in T.serial(v_dim):
+                    for vv in T.serial(v_dim):
+                        dW_acc[v0, vv] = 0.0
+
+                for t in T.serial(seq):
+                    f_val = T.cast(xf[b, t, h], accum_dtype)
+                    one_minus_f = 1.0 - f_val
+                    for kk in T.serial(k_dim):
+                        for vv in T.serial(v_dim):
+                            h_steps_scratch[b, h, t, kk, vv] = T.cast(
+                                h_state[kk, vv],
+                                carrier_dtype,
+                            )
+                            tz = T.cast(tanh_cache[b, t, h, kk, vv], accum_dtype)
+                            h_state[kk, vv] = (
+                                f_val * h_state[kk, vv] + one_minus_f * tz
+                            )
+
+                for r in T.serial(seq):
+                    t = seq - 1 - r
+                    f_val = T.cast(xf[b, t, h], accum_dtype)
+                    one_minus_f = 1.0 - f_val
+
+                    for kk in T.serial(k_dim):
+                        q_val = T.cast(q[b, t, h, kk], accum_dtype)
+                        dq_acc = T.alloc_local((1,), accum_dtype)
+                        dq_acc[0] = 0.0
+                        for vv in T.serial(v_dim):
+                            dY = T.cast(dy[b, t, h, vv], accum_dtype)
+                            h_prev = T.cast(
+                                h_steps_scratch[b, h, t, kk, vv],
+                                accum_dtype,
+                            )
+                            tz = T.cast(
+                                tanh_cache[b, t, h, kk, vv],
+                                accum_dtype,
+                            )
+                            h_t = f_val * h_prev + one_minus_f * tz
+                            dq_acc[0] = dq_acc[0] + dY * h_t
+                            dh[kk, vv] = dh[kk, vv] + q_val * dY
+                        dq[b, t, h, kk] = T.cast(dq_acc[0], carrier_dtype)
+
+                    df_acc = T.alloc_local((1,), accum_dtype)
+                    df_acc[0] = 0.0
+                    for kk in T.serial(k_dim):
+                        for vv in T.serial(v_dim):
+                            h_prev = T.cast(
+                                h_steps_scratch[b, h, t, kk, vv],
+                                accum_dtype,
+                            )
+                            tz = T.cast(
+                                tanh_cache[b, t, h, kk, vv],
+                                accum_dtype,
+                            )
+                            dh_kv = dh[kk, vv]
+                            df_acc[0] = df_acc[0] + dh_kv * (h_prev - tz)
+                            dz[kk, vv] = (
+                                one_minus_f * dh_kv * (1.0 - tz * tz)
+                            )
+                    dxf[b, t, h] = T.cast(df_acc[0], carrier_dtype)
+
+                    for kk in T.serial(k_dim):
+                        dk_acc = T.alloc_local((1,), accum_dtype)
+                        dk_acc[0] = 0.0
+                        for vv in T.serial(v_dim):
+                            dk_acc[0] = dk_acc[0] + dz[kk, vv] * T.cast(
+                                v[b, t, h, vv],
+                                accum_dtype,
+                            )
+                        dk[b, t, h, kk] = T.cast(dk_acc[0], carrier_dtype)
+
+                    for vv in T.serial(v_dim):
+                        dv_acc = T.alloc_local((1,), accum_dtype)
+                        dv_acc[0] = 0.0
+                        for kk in T.serial(k_dim):
+                            dv_acc[0] = dv_acc[0] + dz[kk, vv] * T.cast(
+                                k[b, t, h, kk],
+                                accum_dtype,
+                            )
+                        dv[b, t, h, vv] = T.cast(dv_acc[0], carrier_dtype)
+
+                    for v0 in T.serial(v_dim):
+                        for vv in T.serial(v_dim):
+                            w_acc = T.alloc_local((1,), accum_dtype)
+                            w_acc[0] = 0.0
+                            for kk in T.serial(k_dim):
+                                h_prev = T.cast(
+                                    h_steps_scratch[b, h, t, kk, v0],
+                                    accum_dtype,
+                                )
+                                w_acc[0] = w_acc[0] + h_prev * dz[kk, vv]
+                            dW_acc[v0, vv] = dW_acc[v0, vv] + w_acc[0]
+
+                    for kk in T.serial(k_dim):
+                        for v_in in T.serial(v_dim):
+                            acc = T.alloc_local((1,), accum_dtype)
+                            acc[0] = f_val * dh[kk, v_in]
+                            for v_out in T.serial(v_dim):
+                                acc[0] = acc[0] + dz[kk, v_out] * T.cast(
+                                    W[h, v_in, v_out],
+                                    accum_dtype,
+                                )
+                            dh_next[kk, v_in] = acc[0]
+                    for kk in T.serial(k_dim):
+                        for vv in T.serial(v_dim):
+                            dh[kk, vv] = dh_next[kk, vv]
+
+                for kk in T.serial(k_dim):
+                    for vv in T.serial(v_dim):
+                        dh0[b, h, kk, vv] = T.cast(dh[kk, vv], carrier_dtype)
+                for v0 in T.serial(v_dim):
+                    for vv in T.serial(v_dim):
+                        dW_partial[b, h, v0, vv] = T.cast(
+                            dW_acc[v0, vv],
+                            carrier_dtype,
+                        )
+
+    lowering = dispatch_lower(bwd, target="metal", return_msl=True)
+    input_names = [
+        name for name in lowering.buffer_param_names if name not in _BWD_OUTPUT_NAMES
+    ]
+    if set(input_names) != {"dy", "q", "k", "v", "W", "xf", "h0", "tanh_cache"}:
+        raise MSLDispatchUnsupported(
+            "unexpected M2RNN Path C bwd buffer signature: "
+            + ", ".join(lowering.buffer_param_names)
+        )
+    import tilelang
+
+    kernel = tilelang.compile(
+        bwd,
+        target=_msl_transform._as_metal_target("metal"),
+        execution_backend="tvm_ffi",
+        out_idx=list(_BWD_OUTPUT_IDX),
     )
     return kernel, lowering
 
@@ -137,27 +504,34 @@ def m2rnn_path_c_status() -> M2RNNPathCStatus:
     if not _msl_transform.can_run_metal():
         return M2RNNPathCStatus(False, "MLX Metal backend is not available")
     try:
-        kernel, lowering = _fwd_kernel_for(1, 4, 2, 4, 4, "float32")
-        del kernel
-        source = lowering.msl_text
+        fwd_kernel, fwd_lowering = _fwd_kernel_for(1, 4, 2, 4, 4, "float32")
+        bwd_kernel, bwd_lowering = _bwd_kernel_for(1, 4, 2, 4, 4, "float32")
+        del fwd_kernel, bwd_kernel
     except Exception as exc:
         return M2RNNPathCStatus(
             False,
-            f"TileLang/MLX lowering failed for M2RNN Path C forward: {type(exc).__name__}: {exc}",
+            f"TileLang/MLX lowering failed for M2RNN Path C: {type(exc).__name__}: {exc}",
         )
-    if "kernel void" not in source:
-        return M2RNNPathCStatus(False, "lowered M2RNN Path C source has no kernel")
-    return M2RNNPathCStatus(True, "M2RNN TileLang DSL Path C forward is dispatchable")
+    if "kernel void" not in fwd_lowering.msl_text:
+        return M2RNNPathCStatus(False, "lowered M2RNN Path C fwd source has no kernel")
+    if "kernel void" not in bwd_lowering.msl_text:
+        return M2RNNPathCStatus(False, "lowered M2RNN Path C bwd source has no kernel")
+    return M2RNNPathCStatus(
+        True,
+        "M2RNN TileLang DSL Path C forward/backward is dispatchable",
+    )
 
 
-def m2rnn_fwd_path_c(
+def _m2rnn_fwd_path_c_full(
     q: mx.array,
     k: mx.array,
     v: mx.array,
     W: mx.array,
     xf: mx.array,
     h0: mx.array | None = None,
-) -> mx.array | None:
+    *,
+    out: M2RNNFwdOwnerOutputs | None = None,
+) -> tuple[mx.array, mx.array, mx.array] | None:
     if not _msl_transform.can_run_metal():
         return None
     if h0 is None:
@@ -169,28 +543,303 @@ def m2rnn_fwd_path_c(
         return None
     batch, seq, heads, k_dim, v_dim = _validate_inputs(q, k, v, W, xf, h0)
     if seq == 0:
-        return mx.zeros((batch, 0, heads, v_dim), dtype=q.dtype)
+        if out is not None:
+            raise RuntimeError(
+                "m2rnn_fwd_path_c owner-output route is not dispatchable "
+                "for seq=0; return h0 directly instead of copying it"
+            )
+        return (
+            mx.zeros((batch, 0, heads, v_dim), dtype=q.dtype),
+            h0,
+            mx.zeros((batch, 0, heads, k_dim, v_dim), dtype=q.dtype),
+        )
     try:
         kernel, lowering = _fwd_kernel_for(batch, seq, heads, k_dim, v_dim, carrier_dtype)
     except Exception:
         return None
 
-    input_map = {
-        "q": q,
-        "k": k,
-        "v": v,
-        "W": W,
-        "xf": xf,
-        "h0": h0,
-    }
-    outputs = _msl_transform.dispatch(
-        cast(_msl_transform.MetalKernel, kernel),
-        inputs=[input_map[name] for name in lowering.buffer_param_names if name != "y"],
-        output_shapes=[(batch, seq, heads, v_dim)],
-        output_dtypes=[q.dtype],
-        lowering=lowering,
+    del lowering
+    y, h_last, tanh_cache = _m2rnn_fwd_owner_outputs(
+        out,
+        batch=batch,
+        seq=seq,
+        heads=heads,
+        k_dim=k_dim,
+        v_dim=v_dim,
+        dtype=q.dtype,
     )
-    return outputs[0]
+    outputs = kernel(
+        q,
+        k,
+        v,
+        W,
+        xf,
+        h0,
+        out=(h_last, tanh_cache, y),
+    )
+    if not all(
+        got is expected
+        for got, expected in zip(outputs, (h_last, tanh_cache, y), strict=True)
+    ):
+        raise RuntimeError("M2RNN Path C fwd tvm-ffi did not return caller-owned outputs")
+    return y, h_last, tanh_cache
+
+
+def m2rnn_fwd_path_c(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    W: mx.array,
+    xf: mx.array,
+    h0: mx.array | None = None,
+    *,
+    out: M2RNNFwdOwnerOutputs | None = None,
+) -> mx.array | None:
+    full = _m2rnn_fwd_path_c_full(q, k, v, W, xf, h0, out=out)
+    if full is None:
+        return None
+    return full[0]
+
+
+def m2rnn_fwd_with_state_path_c(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    W: mx.array,
+    xf: mx.array,
+    h0: mx.array | None = None,
+    *,
+    out: M2RNNFwdOwnerOutputs | None = None,
+) -> tuple[mx.array, mx.array] | None:
+    full = _m2rnn_fwd_path_c_full(q, k, v, W, xf, h0, out=out)
+    if full is None:
+        return None
+    y, h_last, _ = full
+    return y, h_last
+
+
+def _m2rnn_bwd_path_c_kernel(
+    dy: mx.array,
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    W: mx.array,
+    xf: mx.array,
+    tanh_cache: mx.array,
+    h0: mx.array | None = None,
+    *,
+    out: M2RNNBwdOwnerOutputs | None = None,
+) -> tuple[mx.array, mx.array, mx.array, mx.array, mx.array, mx.array] | None:
+    if not _msl_transform.can_run_metal():
+        return None
+    if h0 is None:
+        return None
+    if not _validate_same_dtype(q, k, v, W, xf, h0, dy, tanh_cache):
+        return None
+    carrier_dtype = _tl_dtype_for(q.dtype)
+    if carrier_dtype is None:
+        return None
+    batch, seq, heads, k_dim, v_dim = _validate_inputs(q, k, v, W, xf, h0)
+    if dy.shape != (batch, seq, heads, v_dim):
+        raise ValueError(f"dy must be {(batch, seq, heads, v_dim)}, got {dy.shape}")
+    if tanh_cache.shape != (batch, seq, heads, k_dim, v_dim):
+        raise ValueError(
+            "tanh_cache must be "
+            f"{(batch, seq, heads, k_dim, v_dim)}, got {tanh_cache.shape}"
+        )
+    if seq == 0:
+        if out is not None:
+            raise RuntimeError(
+                "m2rnn_bwd_path_c owner-output route is not dispatchable "
+                "for seq=0 because no TileLang kernel runs to initialize buffers"
+            )
+        return (
+            mx.zeros_like(q),
+            mx.zeros_like(k),
+            mx.zeros_like(v),
+            mx.zeros_like(W),
+            mx.zeros_like(xf),
+            mx.zeros_like(h0),
+        )
+    try:
+        kernel, lowering = _bwd_kernel_for(batch, seq, heads, k_dim, v_dim, carrier_dtype)
+    except Exception:
+        return None
+
+    del lowering
+    (
+        dq,
+        dk,
+        dv,
+        dW_partial,
+        dxf,
+        dh0,
+        h_steps_scratch,
+    ) = _m2rnn_bwd_owner_outputs(
+        out,
+        batch=batch,
+        seq=seq,
+        heads=heads,
+        k_dim=k_dim,
+        v_dim=v_dim,
+        dtype=q.dtype,
+    )
+    outputs = kernel(
+        dy,
+        q,
+        k,
+        v,
+        W,
+        xf,
+        h0,
+        tanh_cache,
+        out=(dW_partial, dh0, dk, dq, dv, dxf, h_steps_scratch),
+    )
+    if not all(
+        got is expected
+        for got, expected in zip(
+            outputs,
+            (dW_partial, dh0, dk, dq, dv, dxf, h_steps_scratch),
+            strict=True,
+        )
+    ):
+        raise RuntimeError("M2RNN Path C bwd tvm-ffi did not return caller-owned outputs")
+    dW_partial, dh0, dk, dq, dv, dxf, _scratch = outputs
+    dW = mx.sum(dW_partial, axis=0)
+    return dq, dk, dv, dW, dxf, dh0
+
+
+def m2rnn_bwd_path_c(
+    dy: mx.array,
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    W: mx.array,
+    xf: mx.array,
+    tanh_cache: mx.array,
+    h0: mx.array | None = None,
+    *,
+    force_path_c: bool = False,
+    out: M2RNNBwdOwnerOutputs | None = None,
+) -> tuple[mx.array, mx.array, mx.array, mx.array, mx.array, mx.array]:
+    del force_path_c
+    if out is None:
+        grads = _m2rnn_bwd_path_c_kernel(dy, q, k, v, W, xf, tanh_cache, h0)
+    else:
+        grads = _m2rnn_bwd_path_c_kernel(
+            dy,
+            q,
+            k,
+            v,
+            W,
+            xf,
+            tanh_cache,
+            h0,
+            out=out,
+        )
+    if grads is not None:
+        return grads
+    raise RuntimeError(f"m2rnn_bwd_path_c unavailable: {m2rnn_path_c_status().reason}")
+
+
+def _raise_path_c_unavailable() -> None:
+    raise RuntimeError(f"m2rnn_apply_path_c unavailable: {m2rnn_path_c_status().reason}")
+
+
+@mx.custom_function
+def _m2rnn_apply_path_c_checked(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    W: mx.array,
+    xf: mx.array,
+    h0: mx.array,
+) -> mx.array:
+    full = _m2rnn_fwd_path_c_full(q, k, v, W, xf, h0)
+    if full is None:
+        _raise_path_c_unavailable()
+    y, _h_last, _tanh_cache = full
+    return y
+
+
+@_m2rnn_apply_path_c_checked.vjp
+def _m2rnn_apply_path_c_checked_vjp(
+    primals: tuple[mx.array, ...],
+    cotangent: mx.array,
+    output: mx.array,
+) -> tuple[mx.array, ...]:
+    del output
+    q, k, v, W, xf, h0 = primals
+    full = _m2rnn_fwd_path_c_full(q, k, v, W, xf, h0)
+    if full is None:
+        _raise_path_c_unavailable()
+    _y, _h_last, tanh_cache = full
+    return m2rnn_bwd_path_c(
+        cotangent,
+        q,
+        k,
+        v,
+        W,
+        xf,
+        tanh_cache,
+        h0,
+        force_path_c=True,
+    )
+
+
+@mx.custom_function
+def m2rnn_apply_with_state_path_c(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    W: mx.array,
+    xf: mx.array,
+    h0: mx.array,
+) -> tuple[mx.array, mx.array]:
+    try:
+        full = _m2rnn_fwd_path_c_full(q, k, v, W, xf, h0)
+    except Exception as exc:
+        try:
+            from tilelang.contrib.mlx_interop import DLPackConversionError
+        except Exception:  # pragma: no cover - only when TileLang import itself is broken
+            DLPackConversionError = ()  # type: ignore[assignment]
+        if isinstance(exc, DLPackConversionError):
+            raise RuntimeError(
+                "m2rnn_apply_with_state_path_c requires DLPack-contiguous "
+                "caller-owned MLX input/output buffers; Path C will not copy "
+                "or materialize broadcast/slice views implicitly"
+            ) from exc
+        raise
+    if full is None:
+        _raise_path_c_unavailable()
+    y, h_last, _tanh_cache = full
+    return y, h_last
+
+
+@m2rnn_apply_with_state_path_c.vjp
+def _m2rnn_apply_with_state_path_c_vjp(
+    primals: tuple[mx.array, ...],
+    cotangent: tuple[mx.array, mx.array],
+    output: tuple[mx.array, mx.array],
+) -> tuple[mx.array, ...]:
+    del output
+    q, k, v, W, xf, h0 = primals
+    dy = cotangent[0]
+    full = _m2rnn_fwd_path_c_full(q, k, v, W, xf, h0)
+    if full is None:
+        _raise_path_c_unavailable()
+    _y, _h_last, tanh_cache = full
+    return m2rnn_bwd_path_c(
+        dy,
+        q,
+        k,
+        v,
+        W,
+        xf,
+        tanh_cache,
+        h0,
+        force_path_c=True,
+    )
 
 
 def m2rnn_apply_path_c(
@@ -203,22 +852,41 @@ def m2rnn_apply_path_c(
     *,
     force_path_c: bool = False,
 ) -> mx.array:
-    out = m2rnn_fwd_path_c(q, k, v, W, xf, h0)
-    if out is not None:
-        return out
-    if force_path_c:
-        raise RuntimeError(f"m2rnn_apply_path_c unavailable: {m2rnn_path_c_status().reason}")
     if h0 is None:
         raise RuntimeError(
-            "m2rnn_apply_path_c fallback requires an existing h0 tensor; "
-            "the adapter will not allocate one implicitly"
+            "m2rnn_apply_path_c requires an existing h0 tensor; "
+            "Path C will not allocate one implicitly"
         )
-    return m2rnn_apply(q, k, v, W, xf, h0)
+    if _path_c_inputs_eligible(q, k, v, W, xf, h0):
+        return _m2rnn_apply_path_c_checked(q, k, v, W, xf, h0)
+    raise RuntimeError(f"m2rnn_apply_path_c unavailable: {m2rnn_path_c_status().reason}")
+
+
+def m2rnn_apply_with_state_path_c_or_fallback(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    W: mx.array,
+    xf: mx.array,
+    h0: mx.array,
+    *,
+    force_path_c: bool = False,
+) -> tuple[mx.array, mx.array]:
+    if _path_c_inputs_eligible(q, k, v, W, xf, h0):
+        return m2rnn_apply_with_state_path_c(q, k, v, W, xf, h0)
+    del force_path_c
+    raise RuntimeError(
+        f"m2rnn_apply_with_state_path_c unavailable: {m2rnn_path_c_status().reason}"
+    )
 
 
 __all__ = [
     "M2RNNPathCStatus",
+    "m2rnn_apply_with_state_path_c",
+    "m2rnn_apply_with_state_path_c_or_fallback",
     "m2rnn_apply_path_c",
+    "m2rnn_bwd_path_c",
     "m2rnn_fwd_path_c",
+    "m2rnn_fwd_with_state_path_c",
     "m2rnn_path_c_status",
 ]

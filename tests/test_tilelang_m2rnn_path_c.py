@@ -1,4 +1,4 @@
-"""Coverage for the Path C TileLang DSL m2rnn forward surface."""
+"""Coverage for the Path C TileLang DSL m2rnn forward/backward surface."""
 
 # pyright: reportMissingImports=false
 
@@ -11,7 +11,23 @@ import pytest
 
 import mlx.core as mx
 
-from cppmega_mlx.nn._tilelang.m2rnn import m2rnn_apply, m2rnn_metal_status
+import cppmega_mlx.nn._tilelang.m2rnn_path_c as m2rnn_path_c
+from cppmega_mlx.nn._tilelang import _msl_transform
+from cppmega_mlx.nn._tilelang.m2rnn import (
+    m2rnn_apply,
+    m2rnn_bwd_metal,
+    m2rnn_fwd_metal,
+    m2rnn_metal_status,
+)
+from cppmega_mlx.nn._tilelang.m2rnn_path_c import (
+    M2RNNPathCStatus,
+    m2rnn_apply_path_c,
+    m2rnn_apply_with_state_path_c,
+    m2rnn_apply_with_state_path_c_or_fallback,
+    m2rnn_bwd_path_c,
+    m2rnn_fwd_with_state_path_c,
+    m2rnn_path_c_status,
+)
 
 
 def _np(x: mx.array) -> np.ndarray:
@@ -45,6 +61,81 @@ def _make_m2rnn_inputs(
 def test_m2rnn_path_c_module_imports() -> None:
     module = importlib.import_module("cppmega_mlx.nn._tilelang.m2rnn_path_c")
     assert hasattr(module, "m2rnn_apply_path_c")
+    assert hasattr(module, "m2rnn_bwd_path_c")
+
+
+def test_m2rnn_path_c_status_surface_includes_backward() -> None:
+    status = m2rnn_path_c_status()
+    assert isinstance(status, M2RNNPathCStatus)
+    assert status.reason
+
+
+def test_m2rnn_path_c_launch_geometry_comes_from_tilelang_lowering() -> None:
+    _require_m2rnn_path_c()
+
+    _fwd_kernel, fwd_lowering = m2rnn_path_c._fwd_kernel_for(
+        1, 4, 2, 4, 4, "float32"
+    )
+    assert fwd_lowering.grid == (1, 1, 1)
+    assert fwd_lowering.threadgroup == (8, 1, 1)
+    assert _msl_transform.metal_grid_for_lowering(fwd_lowering) == (8, 1, 1)
+
+    _bwd_kernel, bwd_lowering = m2rnn_path_c._bwd_kernel_for(
+        1, 4, 2, 4, 4, "float32"
+    )
+    assert bwd_lowering.grid == (1, 1, 1)
+    assert bwd_lowering.threadgroup == (2, 1, 1)
+    assert _msl_transform.metal_grid_for_lowering(bwd_lowering) == (2, 1, 1)
+
+
+def test_m2rnn_apply_path_c_fails_closed_instead_of_path_b(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(m2rnn_path_c, "_path_c_inputs_eligible", lambda *_args: False)
+    monkeypatch.setattr(
+        m2rnn_path_c,
+        "m2rnn_path_c_status",
+        lambda: M2RNNPathCStatus(False, "forced unavailable"),
+    )
+    inputs = _make_m2rnn_inputs(dtype=mx.float32)
+    with pytest.raises(RuntimeError, match="forced unavailable"):
+        m2rnn_apply_path_c(*inputs)
+
+
+def test_m2rnn_path_c_or_fallback_fails_closed_instead_of_path_b(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(m2rnn_path_c, "_path_c_inputs_eligible", lambda *_args: False)
+    monkeypatch.setattr(
+        m2rnn_path_c,
+        "m2rnn_path_c_status",
+        lambda: M2RNNPathCStatus(False, "forced unavailable"),
+    )
+
+    def fail_path_b(*_args: object, **_kwargs: object) -> tuple[mx.array, mx.array]:
+        raise AssertionError("M2RNN Path C helper silently fell back to Path B")
+
+    monkeypatch.setattr(m2rnn_path_c, "m2rnn_apply_with_state", fail_path_b, raising=False)
+    inputs = _make_m2rnn_inputs(dtype=mx.float32)
+    with pytest.raises(RuntimeError, match="forced unavailable"):
+        m2rnn_apply_with_state_path_c_or_fallback(*inputs)
+
+
+def test_m2rnn_bwd_path_c_fails_closed_instead_of_path_b(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(m2rnn_path_c, "_m2rnn_bwd_path_c_kernel", lambda *_args: None)
+    monkeypatch.setattr(
+        m2rnn_path_c,
+        "m2rnn_path_c_status",
+        lambda: M2RNNPathCStatus(False, "forced bwd unavailable"),
+    )
+    inputs = _make_m2rnn_inputs(dtype=mx.float32)
+    q, k, v, W, xf, h0 = inputs
+    dy = mx.zeros((1, 4, 2, 4), dtype=mx.float32)
+    tanh_cache = mx.zeros((1, 4, 2, 4, 4), dtype=mx.float32)
+    with pytest.raises(RuntimeError, match="forced bwd unavailable"):
+        m2rnn_bwd_path_c(dy, q, k, v, W, xf, tanh_cache, h0)
 
 
 def _try_import_m2rnn_path_c():  # type: ignore[no-untyped-def]
@@ -52,6 +143,12 @@ def _try_import_m2rnn_path_c():  # type: ignore[no-untyped-def]
         return importlib.import_module("cppmega_mlx.nn._tilelang.m2rnn_path_c")
     except Exception:
         return None
+
+
+def _require_m2rnn_path_c() -> None:
+    status = m2rnn_path_c_status()
+    if not status.available:
+        pytest.skip(f"m2rnn Path C unavailable on this host: {status.reason}")
 
 
 def test_m2rnn_path_c_forward_matches_path_b_when_available() -> None:
@@ -68,10 +165,191 @@ def test_m2rnn_path_c_forward_matches_path_b_when_available() -> None:
             "m2rnn_path_c module exists but does not expose m2rnn_apply_path_c yet"
         )
 
-    if not m2rnn_metal_status().available:
-        pytest.skip("m2rnn Metal Path B is not available on this host")
+    _require_m2rnn_path_c()
 
     inputs = _make_m2rnn_inputs(dtype=mx.float32)
     y_pc = apply_path_c(*inputs, force_path_c=True)
     y_pb = m2rnn_apply(*inputs)
     np.testing.assert_allclose(_np(y_pc), _np(y_pb), rtol=1e-3, atol=1e-4)
+
+
+def test_m2rnn_path_c_with_state_matches_raw_forward() -> None:
+    _require_m2rnn_path_c()
+    inputs = _make_m2rnn_inputs(dtype=mx.float32)
+    y_state, h_state = m2rnn_apply_with_state_path_c(*inputs)
+    raw = m2rnn_fwd_with_state_path_c(*inputs)
+    assert raw is not None
+    y_raw, h_raw = raw
+    mx.eval(y_state, h_state, y_raw, h_raw)
+    np.testing.assert_allclose(_np(y_state), _np(y_raw), rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(_np(h_state), _np(h_raw), rtol=1e-6, atol=1e-6)
+
+
+def test_m2rnn_path_c_forward_backward_use_tvm_ffi_not_mx_fast(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _require_m2rnn_path_c()
+    m2rnn_path_c._fwd_kernel_for.cache_clear()
+    m2rnn_path_c._bwd_kernel_for.cache_clear()
+
+    def fail_mx_fast_wrapper(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("M2RNN Path C production path must not build mx.fast wrapper")
+
+    monkeypatch.setattr(mx.fast, "metal_kernel", fail_mx_fast_wrapper)
+
+    inputs = _make_m2rnn_inputs(dtype=mx.float32)
+    full = m2rnn_path_c._m2rnn_fwd_path_c_full(*inputs)
+    assert full is not None
+    y, h_last, tanh_cache = full
+
+    q, k, v, W, xf, h0 = inputs
+    dy = mx.ones(y.shape, dtype=mx.float32)
+    grads = m2rnn_bwd_path_c(
+        dy,
+        q,
+        k,
+        v,
+        W,
+        xf,
+        tanh_cache,
+        h0,
+        force_path_c=True,
+    )
+    mx.eval(y, h_last, tanh_cache, *grads)
+    assert y.shape == (1, 4, 2, 4)
+    assert h_last.shape == (1, 2, 4, 4)
+    assert [grad.shape for grad in grads] == [
+        q.shape,
+        k.shape,
+        v.shape,
+        W.shape,
+        xf.shape,
+        h0.shape,
+    ]
+
+
+def test_m2rnn_fwd_path_c_owner_outputs_avoid_hidden_zero_alloc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _require_m2rnn_path_c()
+    inputs = _make_m2rnn_inputs(dtype=mx.float32)
+    y_out = mx.zeros((1, 4, 2, 4), dtype=mx.float32)
+    h_out = mx.zeros((1, 2, 4, 4), dtype=mx.float32)
+    tanh_out = mx.zeros((1, 4, 2, 4, 4), dtype=mx.float32)
+    mx.eval(y_out, h_out, tanh_out)
+
+    def fail_zero_alloc(*_args: object, **_kwargs: object) -> mx.array:
+        raise AssertionError("owner-output fwd route must not allocate mx.zeros")
+
+    monkeypatch.setattr(m2rnn_path_c.mx, "zeros", fail_zero_alloc)
+
+    full = m2rnn_path_c._m2rnn_fwd_path_c_full(
+        *inputs,
+        out=(y_out, h_out, tanh_out),
+    )
+    assert full is not None
+    y, h_last, tanh_cache = full
+    mx.eval(y, h_last, tanh_cache)
+    assert y is y_out
+    assert h_last is h_out
+    assert tanh_cache is tanh_out
+
+
+def test_m2rnn_bwd_path_c_owner_outputs_avoid_hidden_zero_alloc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _require_m2rnn_path_c()
+    inputs = _make_m2rnn_inputs(dtype=mx.float32)
+    full = m2rnn_path_c._m2rnn_fwd_path_c_full(*inputs)
+    assert full is not None
+    y, _h_last, tanh_cache = full
+    q, k, v, W, xf, h0 = inputs
+    dy = mx.ones(y.shape, dtype=mx.float32)
+    owner_outputs = (
+        mx.zeros(q.shape, dtype=mx.float32),
+        mx.zeros(k.shape, dtype=mx.float32),
+        mx.zeros(v.shape, dtype=mx.float32),
+        mx.zeros((1, 2, 4, 4), dtype=mx.float32),
+        mx.zeros(xf.shape, dtype=mx.float32),
+        mx.zeros(h0.shape, dtype=mx.float32),
+        mx.zeros((1, 2, 4, 4, 4), dtype=mx.float32),
+    )
+    mx.eval(dy, tanh_cache, *owner_outputs)
+
+    def fail_zero_alloc(*_args: object, **_kwargs: object) -> mx.array:
+        raise AssertionError("owner-output bwd route must not allocate mx.zeros")
+
+    monkeypatch.setattr(m2rnn_path_c.mx, "zeros", fail_zero_alloc)
+
+    grads = m2rnn_bwd_path_c(
+        dy,
+        q,
+        k,
+        v,
+        W,
+        xf,
+        tanh_cache,
+        h0,
+        force_path_c=True,
+        out=owner_outputs,
+    )
+    mx.eval(*grads)
+    assert grads[0] is owner_outputs[0]
+    assert grads[1] is owner_outputs[1]
+    assert grads[2] is owner_outputs[2]
+    assert grads[4] is owner_outputs[4]
+    assert grads[5] is owner_outputs[5]
+
+
+def test_m2rnn_path_c_mixed_dtype_fails_closed_without_hidden_casts() -> None:
+    inputs = _make_m2rnn_inputs(dtype=mx.float32)
+    q, k, v, W, xf, h0 = inputs
+    assert m2rnn_path_c._m2rnn_fwd_path_c_full(
+        q,
+        k,
+        v,
+        W,
+        xf,
+        h0.astype(mx.float16),
+    ) is None
+
+
+def test_m2rnn_path_c_backward_matches_path_b_when_available() -> None:
+    _require_m2rnn_path_c()
+    if not m2rnn_metal_status().available:
+        pytest.skip("m2rnn Metal Path B is not available on this host")
+
+    inputs = _make_m2rnn_inputs(dtype=mx.float32)
+    q, k, v, W, xf, h0 = inputs
+    mx.random.seed(11)
+    dy = (mx.random.normal((1, 4, 2, 4)) * 0.1).astype(mx.float32)
+    _y, _h, tanh_cache = m2rnn_fwd_metal(*inputs)
+    grads_pc = m2rnn_bwd_path_c(
+        dy,
+        q,
+        k,
+        v,
+        W,
+        xf,
+        tanh_cache,
+        h0,
+        force_path_c=True,
+    )
+    grads_pb = m2rnn_bwd_metal(dy, q, k, v, W, xf, tanh_cache, h0)
+    mx.eval(*grads_pc, *grads_pb)
+    for got, expected in zip(grads_pc, grads_pb):
+        np.testing.assert_allclose(_np(got), _np(expected), rtol=2e-3, atol=2e-4)
+
+
+def test_m2rnn_path_c_vjp_fails_closed_under_mlx_graph_transform() -> None:
+    _require_m2rnn_path_c()
+    from tilelang.contrib.mlx_interop import DLPackConversionError
+
+    inputs = _make_m2rnn_inputs(dtype=mx.float32)
+
+    def path_c_loss(q, k, v, W, xf, h0):  # type: ignore[no-untyped-def]
+        y = m2rnn_apply_path_c(q, k, v, W, xf, h0, force_path_c=True)
+        return mx.sum(y * y) * 0.5
+
+    with pytest.raises(DLPackConversionError, match="graph transformation"):
+        mx.grad(path_c_loss, argnums=tuple(range(6)))(*inputs)

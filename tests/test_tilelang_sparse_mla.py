@@ -34,6 +34,7 @@ import mlx.core as mx
 from typing import cast
 
 import cppmega_mlx.nn._tilelang.sparse_mla as sparse_mla_path_b  # noqa: E402
+import cppmega_mlx.nn._tilelang.sparse_mla_path_c as sparse_mla_path_c  # noqa: E402
 from cppmega_mlx.nn._tilelang.sparse_mla import (  # noqa: E402
     SparseMLAMetalStatus,
     sparse_mla_apply,
@@ -49,6 +50,8 @@ from cppmega_mlx.nn._tilelang.sparse_mla_path_c import (  # noqa: E402
     _threadgroup_size,
     dump_lowered_bwd_msl,
     dump_lowered_fwd_msl,
+    SparseMLAPathCDirectError,
+    SparseMLAPathCStatus,
     sparse_mla_bwd_path_c,
     sparse_mla_fwd_path_c,
     sparse_mla_path_c_status,
@@ -533,6 +536,118 @@ def test_path_c_forward_bf16_invalid_indices_zero_output() -> None:
     assert lse_np[0, 0, 0] == 0.0
 
 
+def test_path_c_forward_direct_owner_output_reuses_buffers_without_mlx_fast_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_legacy_kernel(*_: object, **__: object) -> object:
+        raise AssertionError("owner-output Sparse-MLA fwd must not build mx.fast fallback")
+
+    monkeypatch.setattr(
+        sparse_mla_path_c,
+        "sparse_mla_path_c_status",
+        lambda: SparseMLAPathCStatus(True, "test"),
+    )
+    monkeypatch.setattr(sparse_mla_path_c, "_fwd_kernel_for", fail_legacy_kernel)
+
+    rng = np.random.default_rng(67)
+    B, S, H, D, G, topk, Skv = 1, 2, 2, 16, 1, 4, 8
+    q = mx.array(rng.standard_normal((B, S, H, D)).astype(np.float16))
+    kv = mx.array(rng.standard_normal((B, Skv, G, D)).astype(np.float16))
+    indices = mx.array(rng.integers(0, Skv, size=(B, S, G, topk)).astype(np.int32))
+    sm_scale_buf = mx.array([0.25], dtype=mx.float32)
+    out = mx.zeros((B, S, H, D), dtype=mx.float16)
+    lse = mx.zeros((B, S, H), dtype=mx.float32)
+
+    returned = sparse_mla_fwd_path_c(
+        q,
+        kv,
+        indices,
+        sm_scale_buf=sm_scale_buf,
+        out=out,
+        lse=lse,
+    )
+
+    assert returned is not None
+    returned_out, returned_lse = returned
+    assert returned_out is out
+    assert returned_lse is lse
+    mx.eval(out, lse)
+    ref_out, ref_lse = sparse_mla_attention_reference(
+        q,
+        kv,
+        indices,
+        sm_scale=0.25,
+        return_lse=True,
+    )
+    mx.eval(ref_out, ref_lse)
+    np.testing.assert_allclose(
+        np.array(out).astype(np.float32),
+        np.array(ref_out).astype(np.float32),
+        rtol=1e-3,
+        atol=2e-3,
+    )
+    np.testing.assert_allclose(
+        np.array(lse).astype(np.float32),
+        np.array(ref_lse).astype(np.float32),
+        rtol=1e-3,
+        atol=2e-3,
+    )
+
+
+def test_path_c_forward_direct_bf16_owner_output_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_legacy_kernel(*_: object, **__: object) -> object:
+        raise AssertionError("BF16 owner-output gate must not fall back to mx.fast")
+
+    monkeypatch.setattr(
+        sparse_mla_path_c,
+        "sparse_mla_path_c_status",
+        lambda: SparseMLAPathCStatus(True, "test"),
+    )
+    monkeypatch.setattr(sparse_mla_path_c, "_fwd_kernel_for", fail_legacy_kernel)
+
+    B, S, H, D, G, topk, Skv = 1, 2, 2, 16, 1, 4, 8
+    q = mx.zeros((B, S, H, D), dtype=mx.bfloat16)
+    kv = mx.zeros((B, Skv, G, D), dtype=mx.bfloat16)
+    indices = mx.zeros((B, S, G, topk), dtype=mx.int32)
+    sm_scale_buf = mx.array([0.25], dtype=mx.float32)
+    out = mx.zeros((B, S, H, D), dtype=mx.float16)
+    lse = mx.zeros((B, S, H), dtype=mx.float32)
+
+    with pytest.raises(SparseMLAPathCDirectError, match="BF16 owner-output"):
+        sparse_mla_fwd_path_c(
+            q,
+            kv,
+            indices,
+            sm_scale_buf=sm_scale_buf,
+            out=out,
+            lse=lse,
+        )
+
+
+def test_path_c_forward_rejects_non_int32_indices_without_hidden_cast(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_legacy_kernel(*_: object, **__: object) -> object:
+        raise AssertionError("non-int32 indices must fail before Path C lowering")
+
+    monkeypatch.setattr(
+        sparse_mla_path_c,
+        "sparse_mla_path_c_status",
+        lambda: SparseMLAPathCStatus(True, "test"),
+    )
+    monkeypatch.setattr(sparse_mla_path_c, "_fwd_kernel_for", fail_legacy_kernel)
+
+    B, S, H, D, G, topk, Skv = 1, 2, 2, 16, 1, 4, 8
+    q = mx.zeros((B, S, H, D), dtype=mx.float16)
+    kv = mx.zeros((B, Skv, G, D), dtype=mx.float16)
+    indices = mx.array(np.zeros((B, S, G, topk), dtype=np.int64))
+
+    with pytest.raises(TypeError, match="will not cast or copy sparse index"):
+        sparse_mla_fwd_path_c(q, kv, indices)
+
+
 def test_path_b_backward_parity() -> None:
     rng = np.random.default_rng(23)
     B, S, H, D = 2, 8, 4, 32
@@ -752,6 +867,29 @@ def test_path_c_backward_reuses_int32_indices_for_partial_reduce() -> None:
     mx.eval(dkv_partial, dq)
 
     assert indices_i32 is indices
+
+
+def test_path_c_backward_rejects_non_int32_indices_without_hidden_cast(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_legacy_kernel(*_: object, **__: object) -> object:
+        raise AssertionError("non-int32 indices must fail before Path C lowering")
+
+    monkeypatch.setattr(
+        sparse_mla_path_c,
+        "sparse_mla_path_c_status",
+        lambda: SparseMLAPathCStatus(True, "test"),
+    )
+    monkeypatch.setattr(sparse_mla_path_c, "_bwd_kernel_for", fail_legacy_kernel)
+
+    B, S, H, D, G, topk, Skv = 1, 2, 2, 16, 1, 4, 8
+    q = mx.zeros((B, S, H, D), dtype=mx.float16)
+    kv = mx.zeros((B, Skv, G, D), dtype=mx.float16)
+    d_out = mx.zeros((B, S, H, D), dtype=mx.float16)
+    indices = mx.array(np.zeros((B, S, G, topk), dtype=np.int64))
+
+    with pytest.raises(TypeError, match="will not cast or copy sparse index"):
+        _sparse_mla_bwd_path_c_partial(q, kv, d_out, indices)
 
 
 def test_path_c_topk32_matches_path_b_direct_msl() -> None:

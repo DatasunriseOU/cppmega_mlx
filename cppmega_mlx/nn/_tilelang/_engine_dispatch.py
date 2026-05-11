@@ -52,7 +52,20 @@ def tilelang_engine_mode() -> str:
     return "auto"
 
 
-def _engine_compile(prim_func: Any, target: str) -> Any:
+def _with_pass_context(pass_configs: dict[str, Any] | None):
+    if not pass_configs:
+        return None
+    from tilelang import tvm
+
+    return tvm.transform.PassContext(opt_level=3, config=dict(pass_configs))
+
+
+def _engine_compile(
+    prim_func: Any,
+    target: str,
+    *,
+    pass_configs: dict[str, Any] | None = None,
+) -> Any:
     """Run ``tilelang.compile`` and stamp the result with the target tag.
 
     Normalizes legacy CLI-form metal targets (e.g.
@@ -71,7 +84,12 @@ def _engine_compile(prim_func: Any, target: str) -> Any:
 
         compile_target = _as_metal_target(target)
 
-    artifact = tilelang.compile(prim_func, target=compile_target, out_idx=None)
+    pass_context = _with_pass_context(pass_configs)
+    if pass_context is None:
+        artifact = tilelang.compile(prim_func, target=compile_target, out_idx=None)
+    else:
+        with pass_context:
+            artifact = tilelang.compile(prim_func, target=compile_target, out_idx=None)
     try:
         setattr(artifact, "_tilelang_engine_target", target)
     except (AttributeError, TypeError):
@@ -81,7 +99,42 @@ def _engine_compile(prim_func: Any, target: str) -> Any:
     return artifact
 
 
-def _shim_lower(prim_func: Any, target: str) -> Any:
+def _engine_lower_for_msl_extraction(
+    prim_func: Any,
+    target: str,
+    *,
+    pass_configs: dict[str, Any] | None = None,
+) -> Any:
+    """Run TileLang lowering directly for MSL text plus launch metadata.
+
+    ``tilelang.compile`` may return a disk-cached JITKernel whose source is
+    intact but whose lowered ``device_mod`` is not retained. The MLX
+    ``mx.fast.metal_kernel`` bridge needs both the MSL text and TileLang's
+    launch extents, so MSL extraction uses ``tilelang.lower`` directly.
+    """
+
+    import tilelang  # noqa: F401  - intentional eager import for ImportError surfacing
+    from tilelang.engine.lower import lower as tl_lower
+
+    lower_target: Any = target
+    if isinstance(target, str) and target.startswith("metal") and "-" in target:
+        from cppmega_mlx.nn._tilelang._msl_transform import _as_metal_target
+
+        lower_target = _as_metal_target(target)
+
+    pass_context = _with_pass_context(pass_configs)
+    if pass_context is None:
+        return tl_lower(prim_func, target=lower_target)
+    with pass_context:
+        return tl_lower(prim_func, target=lower_target)
+
+
+def _shim_lower(
+    prim_func: Any,
+    target: str,
+    *,
+    pass_configs: dict[str, Any] | None = None,
+) -> Any:
     """Lower via the legacy MSL-string shim. Always targets metal."""
 
     from cppmega_mlx.nn._tilelang._msl_transform import lower_tilelang_to_msl_inline
@@ -92,7 +145,11 @@ def _shim_lower(prim_func: Any, target: str) -> Any:
             UserWarning,
             stacklevel=2,
         )
-    return lower_tilelang_to_msl_inline(prim_func, target="metal")
+    return lower_tilelang_to_msl_inline(
+        prim_func,
+        target="metal",
+        pass_configs=pass_configs,
+    )
 
 
 def dispatch_lower(
@@ -100,6 +157,7 @@ def dispatch_lower(
     target: str,
     *,
     return_msl: bool = False,
+    pass_configs: dict[str, Any] | None = None,
 ) -> Any:
     """Lower ``prim_func`` for ``target`` per the active engine mode.
 
@@ -123,23 +181,27 @@ def dispatch_lower(
     msl_requested = return_msl or mode == "engine_with_msl_extraction"
 
     if mode == "shim":
-        return _shim_lower(prim_func, target)
+        return _shim_lower(prim_func, target, pass_configs=pass_configs)
 
     if mode == "engine" and not msl_requested:
-        return _engine_compile(prim_func, target)
+        return _engine_compile(prim_func, target, pass_configs=pass_configs)
 
     if msl_requested:
         # engine path with required MSL extraction. On any failure (engine
         # error, non-metal target, no kernel_source), fall back to the shim
         # exactly once with a UserWarning.
-        return _engine_with_msl_extraction(prim_func, target)
+        return _engine_with_msl_extraction(
+            prim_func,
+            target,
+            pass_configs=pass_configs,
+        )
 
     # auto: prefer engine, fall back to shim on import failure with a
     # one-shot warning. Other engine errors propagate (see _engine_compile
     # docstring rationale: silently swallowing TVM AttributeErrors and
     # PassContext drift previously masked real bugs).
     try:
-        return _engine_compile(prim_func, target)
+        return _engine_compile(prim_func, target, pass_configs=pass_configs)
     except (ImportError, ModuleNotFoundError) as exc:
         global _FALLBACK_WARNED
         if not _FALLBACK_WARNED:
@@ -152,10 +214,15 @@ def dispatch_lower(
                 stacklevel=2,
             )
             _FALLBACK_WARNED = True
-        return _shim_lower(prim_func, target)
+        return _shim_lower(prim_func, target, pass_configs=pass_configs)
 
 
-def _engine_with_msl_extraction(prim_func: Any, target: str) -> Any:
+def _engine_with_msl_extraction(
+    prim_func: Any,
+    target: str,
+    *,
+    pass_configs: dict[str, Any] | None = None,
+) -> Any:
     """Engine path that extracts an MSL-shaped lowering from the artifact.
 
     On any failure (ImportError, non-metal target, no ``kernel_source``,
@@ -171,7 +238,11 @@ def _engine_with_msl_extraction(prim_func: Any, target: str) -> Any:
     )
 
     try:
-        artifact = _engine_compile(prim_func, target)
+        artifact = _engine_lower_for_msl_extraction(
+            prim_func,
+            target,
+            pass_configs=pass_configs,
+        )
     except (ImportError, ModuleNotFoundError) as exc:
         if not _MSL_EXTRACTION_FALLBACK_WARNED:
             warnings.warn(
@@ -182,7 +253,7 @@ def _engine_with_msl_extraction(prim_func: Any, target: str) -> Any:
                 stacklevel=2,
             )
             _MSL_EXTRACTION_FALLBACK_WARNED = True
-        return _shim_lower(prim_func, target)
+        return _shim_lower(prim_func, target, pass_configs=pass_configs)
 
     lowering = extract_msl_from_engine_artifact(artifact, target=target)
     if lowering is None:
@@ -195,7 +266,7 @@ def _engine_with_msl_extraction(prim_func: Any, target: str) -> Any:
                 stacklevel=2,
             )
             _MSL_EXTRACTION_FALLBACK_WARNED = True
-        return _shim_lower(prim_func, target)
+        return _shim_lower(prim_func, target, pass_configs=pass_configs)
     return lowering
 
 

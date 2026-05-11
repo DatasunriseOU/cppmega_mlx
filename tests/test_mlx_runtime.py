@@ -51,7 +51,12 @@ kernel void vector_add(
 }
 """
 
-    adapter = wrap_tilelang_metal_kernel(src, input_count=2, output_count=1)
+    adapter = wrap_tilelang_metal_kernel(
+        src,
+        input_count=2,
+        output_count=1,
+        allow_mx_fast_metal_kernel=True,
+    )
     # Renaming must have happened in the body: ``A`` -> ``inp0``,
     # ``B`` -> ``inp1``, ``C`` -> ``out0``.
     assert "inp0[id]" in adapter.body
@@ -111,7 +116,12 @@ kernel void sum_and_diff(
 }
 """
 
-    adapter = wrap_tilelang_metal_kernel(src, input_count=2, output_count=2)
+    adapter = wrap_tilelang_metal_kernel(
+        src,
+        input_count=2,
+        output_count=2,
+        allow_mx_fast_metal_kernel=True,
+    )
     assert adapter.input_names == ("inp0", "inp1")
     assert adapter.output_names == ("out0", "out1")
     assert adapter.buffer_names == ("A", "B", "C", "D")
@@ -182,7 +192,12 @@ kernel void vector_add_kernel(
 
     # 3 user data buffers (a, b, c) + the args struct. The wrapper must
     # see only the 3 user buffers; the ``_args_t&`` is filtered out.
-    adapter = wrap_tilelang_metal_kernel(src, input_count=2, output_count=1)
+    adapter = wrap_tilelang_metal_kernel(
+        src,
+        input_count=2,
+        output_count=1,
+        allow_mx_fast_metal_kernel=True,
+    )
     assert adapter.buffer_names == ("arg0", "arg1", "arg2")
     assert adapter.input_names == ("inp0", "inp1")
     assert adapter.output_names == ("out0",)
@@ -238,6 +253,26 @@ kernel void k(
     body_section = out.split("{", 1)[1] if "{" in out else out
     assert not _re.search(r"\bblockIdx\b", body_section)
     assert not _re.search(r"\bthreadIdx\b", body_section)
+
+
+def test_wrap_fail_closes_raw_mx_fast_bridge_by_default() -> None:
+    """Production callers must not silently build the raw MLX fast bridge."""
+    from cppmega_mlx.nn._tilelang._mlx_runtime import (
+        MLXRuntimeError,
+        wrap_tilelang_metal_kernel,
+    )
+
+    src = """
+kernel void k(
+    device const float* A,
+    device float* C
+) {
+    C[0] = A[0];
+}
+"""
+
+    with pytest.raises(MLXRuntimeError, match="fail-closed for production"):
+        wrap_tilelang_metal_kernel(src, input_count=1, output_count=1)
 
 
 def test_rewrite_dotted_blockidx_threadidx_yz() -> None:
@@ -449,7 +484,12 @@ kernel void k(
     C[id] = A[id];
 }
 """
-    adapter = wrap_tilelang_metal_kernel(src, input_count=1, output_count=1)
+    adapter = wrap_tilelang_metal_kernel(
+        src,
+        input_count=1,
+        output_count=1,
+        allow_mx_fast_metal_kernel=True,
+    )
 
     # Construction must succeed regardless of MLX availability.
     assert "inp0" in adapter.body

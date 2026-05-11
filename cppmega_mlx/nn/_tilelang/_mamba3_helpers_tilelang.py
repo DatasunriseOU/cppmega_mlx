@@ -67,7 +67,6 @@ from cppmega_mlx.nn._tilelang._engine_dispatch import dispatch_lower
 from cppmega_mlx.nn._tilelang._msl_transform import (
     MSLDispatchUnsupported,
     can_run_metal,
-    lower_tilelang_to_msl_inline,
 )
 
 

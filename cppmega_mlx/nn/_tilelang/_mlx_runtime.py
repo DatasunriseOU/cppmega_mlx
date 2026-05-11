@@ -540,6 +540,7 @@ def wrap_tilelang_metal_kernel(
     output_count: int,
     name: str | None = None,
     args_struct_inline: dict[str, Any] | None = None,
+    allow_mx_fast_metal_kernel: bool = False,
 ) -> TileLangMetalAdapter:
     """Adapt a TileLang Metal artifact for ``mx.fast.metal_kernel``.
 
@@ -552,11 +553,25 @@ def wrap_tilelang_metal_kernel(
     PrimFunc declaration order with outputs *last* by convention, so the
     caller is responsible for asserting that ordering matches their kernel.
 
+    This raw MLX fast-kernel bridge is fail-closed by default because the
+    production Path C boundary is tvm-ffi/owner-output. Tests and explicit
+    proof harnesses must pass ``allow_mx_fast_metal_kernel=True`` so they
+    cannot accidentally become a silent production fallback.
+
     Returns a :class:`TileLangMetalAdapter` whose ``__call__`` dispatches
     on Mac GPU. The ``mx.fast.metal_kernel`` instance is built lazily on
     first ``__call__`` so this function can be invoked on hosts without
     MLX (it will only fail when actually launched).
     """
+
+    if not allow_mx_fast_metal_kernel:
+        raise MLXRuntimeError(
+            "wrap_tilelang_metal_kernel is fail-closed for production: "
+            "the supported production Path C boundary is tvm-ffi/owner-output, "
+            "not a raw mx.fast.metal_kernel wrapper. Pass "
+            "allow_mx_fast_metal_kernel=True only from tests, POC harnesses, "
+            "or explicit migration tooling."
+        )
 
     if input_count < 0 or output_count < 0:
         raise MLXRuntimeError(

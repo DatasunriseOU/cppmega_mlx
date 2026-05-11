@@ -424,14 +424,15 @@ def _dispatch_mamba3_scan(
 
     if path is KernelPath.PATH_C:
         from cppmega_mlx.nn._tilelang.mamba3_path_c import (
-            mamba3_mimo_apply_path_c,
-            mamba3_mimo_fwd_path_c,
+            mamba3_mimo_apply_with_state_path_c,
+            mamba3_mimo_path_c_status,
         )
 
+        status = mamba3_mimo_path_c_status()
+        if not status.available:
+            raise RuntimeError(f"mamba3_mimo: Path C kernel unavailable ({status.reason})")
+        y, h_last = mamba3_mimo_apply_with_state_path_c(x, B, C, z, A, dt, D, h0)
         record_dispatch("mamba3_mimo", path, "path_c_tilelang_dsl")
-        y = mamba3_mimo_apply_path_c(x, B, C, z, A, dt, D, h0)
-        # Path C apply returns y only; recover h_last via the non-grad fwd.
-        _, h_last = mamba3_mimo_fwd_path_c(x, B, C, z, A, dt, D, h0)
         return y, h_last
 
     if path is KernelPath.REFERENCE:

@@ -10,17 +10,28 @@ literal Metal ``simd_sum``.
 
 from __future__ import annotations
 
+from typing import Any, cast
+
 import numpy as np
 import pytest
-from typing import Any, cast
 
 import mlx.core as mx
 
+import cppmega_mlx.nn._tilelang.fp8_matmul_path_c as fp8_matmul_mod
+import cppmega_mlx.nn._tilelang.fp8_vecmat_path_c as fp8_vecmat_mod
+from cppmega_mlx.nn._tilelang.fp8_matmul_path_c import (
+    FP8MatmulPathCLegacyError,
+    fp8_scaled_matmul_path_c,
+)
 from cppmega_mlx.nn._tilelang.fp8_msl_kernels import fp8_scaled_vecmat
 from cppmega_mlx.nn._tilelang.fp8_vecmat_path_c import (
+    FP8_PATH_C_LEGACY_MLX_FAST_ENV,
     FP8VecmatPathCStatus,
+    FP8VecmatPathCDirectError,
+    FP8VecmatPathCLegacyError,
     _fp8_vecmat_kernel_for,
     canonical_vecmat_runtime_body,
+    fp8_scaled_vecmat_path_c_direct,
     fp8_scaled_vecmat_path_c,
     fp8_vecmat_msl_blockers,
     fp8_vecmat_msl_features,
@@ -35,6 +46,14 @@ from cppmega_mlx.nn._tilelang._msl_transform import (
 def _metal_available() -> bool:
     metal = getattr(mx, "metal", None)
     return mx.default_device() == mx.gpu and metal is not None and metal.is_available()
+
+
+def _owner_output_dtypes() -> list[Any]:
+    return [mx.float32, mx.float16]
+
+
+def _bfloat16_dtype() -> Any | None:
+    return getattr(mx, "bfloat16", None)
 
 
 def test_status_reports_available_or_explains_why() -> None:
@@ -188,7 +207,10 @@ def test_invalid_shapes_raise(kwargs: dict[str, object]) -> None:
 
 
 @pytest.mark.skipif(not _metal_available(), reason="Metal unavailable")
-def test_path_c_vecmat_matches_path_b_scalar_scale() -> None:
+def test_path_c_vecmat_matches_path_b_scalar_scale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(FP8_PATH_C_LEGACY_MLX_FAST_ENV, "1")
     rng = np.random.default_rng(23)
     N, K = 24, 64
     x = mx.array((rng.standard_normal((K,)) * 0.1).astype(np.float32))
@@ -211,7 +233,10 @@ def test_path_c_vecmat_matches_path_b_scalar_scale() -> None:
 
 
 @pytest.mark.skipif(not _metal_available(), reason="Metal unavailable")
-def test_path_c_vecmat_matches_path_b_per_row_scale() -> None:
+def test_path_c_vecmat_matches_path_b_per_row_scale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(FP8_PATH_C_LEGACY_MLX_FAST_ENV, "1")
     rng = np.random.default_rng(24)
     N, K = 24, 64
     x = mx.array((rng.standard_normal((K,)) * 0.1).astype(np.float32))
@@ -234,8 +259,394 @@ def test_path_c_vecmat_matches_path_b_per_row_scale() -> None:
 
 
 @pytest.mark.skipif(not _metal_available(), reason="Metal unavailable")
-def test_path_c_vecmat_rejects_invalid_shapes() -> None:
+def test_path_c_vecmat_rejects_invalid_shapes(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(FP8_PATH_C_LEGACY_MLX_FAST_ENV, "1")
     x_fp8 = mx.zeros((33,), dtype=mx.uint8)
     W_fp8 = mx.zeros((8, 33), dtype=mx.uint8)
     with pytest.raises(ValueError, match="multiple of 4"):
         fp8_scaled_vecmat_path_c(x_fp8, W_fp8, scale_x=1.0, scale_w=1.0)
+
+
+def test_fp8_matmul_no_out_path_is_legacy_debug_gated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_legacy_kernel(**_: object) -> object:
+        raise AssertionError("gated no-out path must not build mx.fast fallback")
+
+    monkeypatch.delenv(FP8_PATH_C_LEGACY_MLX_FAST_ENV, raising=False)
+    monkeypatch.setattr(fp8_matmul_mod, "can_run_metal", lambda: True)
+    monkeypatch.setattr(fp8_matmul_mod, "_fp8_matmul_kernel_for", fail_legacy_kernel)
+
+    A = mx.zeros((16, 32), dtype=mx.uint8)
+    B = mx.zeros((16, 32), dtype=mx.uint8)
+    scale_a = mx.ones((1,), dtype=mx.float32)
+    scale_b = mx.ones((1,), dtype=mx.float32)
+
+    with pytest.raises(
+        FP8MatmulPathCLegacyError,
+        match="Production callers must pass out=",
+    ):
+        fp8_scaled_matmul_path_c(A, B, scale_a=scale_a, scale_b=scale_b)
+
+
+def test_fp8_vecmat_no_out_path_is_legacy_debug_gated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_legacy_kernel(*_: object, **__: object) -> object:
+        raise AssertionError("gated no-out path must not build mx.fast fallback")
+
+    monkeypatch.delenv(FP8_PATH_C_LEGACY_MLX_FAST_ENV, raising=False)
+    monkeypatch.setattr(fp8_vecmat_mod, "can_run_metal", lambda: True)
+    monkeypatch.setattr(fp8_vecmat_mod, "_fp8_vecmat_kernel_for", fail_legacy_kernel)
+
+    x = mx.zeros((32,), dtype=mx.uint8)
+    W = mx.zeros((16, 32), dtype=mx.uint8)
+    scale_x = mx.ones((1,), dtype=mx.float32)
+    scale_w = mx.ones((16,), dtype=mx.float32)
+
+    with pytest.raises(
+        FP8VecmatPathCLegacyError,
+        match="Production callers must pass out=",
+    ):
+        fp8_scaled_vecmat_path_c(x, W, scale_x=scale_x, scale_w=scale_w)
+
+
+def test_fp8_matmul_direct_path_uses_owner_output_without_mlx_fast_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[object, ...]] = []
+
+    class RecordingKernel:
+        def __call__(self, *args: object) -> object:
+            calls.append(args)
+            return args[-1]
+
+    def fail_legacy_kernel(**_: object) -> object:
+        raise AssertionError("direct owner-output path must not build mx.fast fallback")
+
+    monkeypatch.setattr(fp8_matmul_mod, "can_run_metal", lambda: True)
+    monkeypatch.setattr(
+        fp8_matmul_mod,
+        "_fp8_matmul_tvm_ffi_kernel_for",
+        lambda **_: RecordingKernel(),
+    )
+    monkeypatch.setattr(fp8_matmul_mod, "_fp8_matmul_kernel_for", fail_legacy_kernel)
+
+    A = mx.zeros((16, 32), dtype=mx.uint8)
+    B = mx.zeros((16, 32), dtype=mx.uint8)
+    scale_a = mx.ones((1,), dtype=mx.float32)
+    scale_b = mx.ones((1,), dtype=mx.float32)
+
+    for dtype in _owner_output_dtypes():
+        out = mx.zeros((16, 16), dtype=dtype)
+        returned = fp8_scaled_matmul_path_c(
+            A,
+            B,
+            scale_a=scale_a,
+            scale_b=scale_b,
+            out=out,
+        )
+
+        assert returned is out
+
+    assert len(calls) == len(_owner_output_dtypes())
+    for call in calls:
+        assert call[0] is A
+        assert call[1] is scale_a
+        assert call[2] is B
+        assert call[3] is scale_b
+    assert [call[-1].dtype for call in calls] == _owner_output_dtypes()
+
+
+def test_fp8_matmul_direct_path_propagates_typed_dlpack_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tilelang.contrib.mlx_interop import DLPackConversionError
+
+    class FailingKernel:
+        def __call__(self, *_: object) -> object:
+            raise DLPackConversionError("MLX array import failed: dtype mismatch")
+
+    def fail_legacy_kernel(**_: object) -> object:
+        raise AssertionError("typed direct failure must not silently fall back")
+
+    monkeypatch.setattr(fp8_matmul_mod, "can_run_metal", lambda: True)
+    monkeypatch.setattr(
+        fp8_matmul_mod,
+        "_fp8_matmul_tvm_ffi_kernel_for",
+        lambda **_: FailingKernel(),
+    )
+    monkeypatch.setattr(fp8_matmul_mod, "_fp8_matmul_kernel_for", fail_legacy_kernel)
+
+    A = mx.zeros((16, 32), dtype=mx.uint8)
+    B = mx.zeros((16, 32), dtype=mx.uint8)
+    scale_a = mx.ones((1,), dtype=mx.float32)
+    scale_b = mx.ones((1,), dtype=mx.float32)
+    out = mx.zeros((16, 16), dtype=mx.float32)
+
+    with pytest.raises(DLPackConversionError, match="dtype mismatch"):
+        fp8_scaled_matmul_path_c(A, B, scale_a=scale_a, scale_b=scale_b, out=out)
+
+
+def test_fp8_matmul_direct_path_rejects_bad_owner_output_abi(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(fp8_matmul_mod, "can_run_metal", lambda: True)
+
+    A = mx.zeros((16, 32), dtype=mx.uint8)
+    B = mx.zeros((16, 32), dtype=mx.uint8)
+    scale_a = mx.ones((1,), dtype=mx.float32)
+    scale_b = mx.ones((1,), dtype=mx.float32)
+
+    with pytest.raises(ValueError, match="out shape"):
+        fp8_scaled_matmul_path_c(
+            A,
+            B,
+            scale_a=scale_a,
+            scale_b=scale_b,
+            out=mx.zeros((16, 15), dtype=mx.float32),
+        )
+
+    with pytest.raises(ValueError, match="out dtype"):
+        fp8_scaled_matmul_path_c(
+            A,
+            B,
+            scale_a=scale_a,
+            scale_b=scale_b,
+            out=mx.zeros((16, 16), dtype=mx.int32),
+        )
+
+    bfloat16 = _bfloat16_dtype()
+    if bfloat16 is not None:
+        with pytest.raises(ValueError, match="MSL `bfloat`"):
+            fp8_scaled_matmul_path_c(
+                A,
+                B,
+                scale_a=scale_a,
+                scale_b=scale_b,
+                out=mx.zeros((16, 16), dtype=bfloat16),
+            )
+
+    with pytest.raises(TypeError, match="Python scalars would allocate"):
+        fp8_scaled_matmul_path_c(A, B, scale_a=1.0, scale_b=scale_b, out=mx.zeros((16, 16)))
+
+
+@pytest.mark.skipif(not _metal_available(), reason="Metal unavailable")
+def test_fp8_matmul_direct_tvm_ffi_reuses_owner_output_and_matches_reference() -> None:
+    rng = np.random.default_rng(25)
+    M, N, K = 16, 16, 32
+    A32 = mx.array((rng.standard_normal((M, K)) * 0.1).astype(np.float32))
+    B32 = mx.array((rng.standard_normal((N, K)) * 0.1).astype(np.float32))
+    A = mx.to_fp8(A32)
+    B = mx.to_fp8(B32)
+    scale_a = mx.array([1.0], dtype=mx.float32)
+    scale_b = mx.array([1.0], dtype=mx.float32)
+    reference = mx.matmul(mx.from_fp8(A, mx.float32), mx.transpose(mx.from_fp8(B, mx.float32)))
+
+    for dtype in _owner_output_dtypes():
+        out = mx.zeros((M, N), dtype=dtype)
+        mx.eval(A, B, scale_a, scale_b, out)
+
+        returned = fp8_scaled_matmul_path_c(
+            A,
+            B,
+            scale_a=scale_a,
+            scale_b=scale_b,
+            out=out,
+        )
+        expected = reference.astype(dtype).astype(mx.float32)
+        mx.eval(expected, out)
+
+        assert returned is out
+        np.testing.assert_allclose(
+            np.asarray(out.astype(mx.float32)),
+            np.asarray(expected),
+            rtol=1e-2,
+            atol=1e-2,
+        )
+
+
+def test_fp8_vecmat_direct_path_uses_owner_output_without_mlx_fast_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[object, ...]] = []
+
+    class RecordingKernel:
+        def __call__(self, *args: object) -> object:
+            calls.append(args)
+            return args[-1]
+
+    def fail_legacy_kernel(*_: object, **__: object) -> object:
+        raise AssertionError("direct owner-output vecmat must not build mx.fast fallback")
+
+    monkeypatch.setattr(fp8_vecmat_mod, "can_run_metal", lambda: True)
+    monkeypatch.setattr(
+        fp8_vecmat_mod,
+        "_fp8_vecmat_tvm_ffi_kernel_for",
+        lambda **_: RecordingKernel(),
+    )
+    monkeypatch.setattr(fp8_vecmat_mod, "_fp8_vecmat_kernel_for", fail_legacy_kernel)
+
+    x = mx.zeros((32,), dtype=mx.uint8)
+    W = mx.zeros((16, 32), dtype=mx.uint8)
+    scale_x = mx.ones((1,), dtype=mx.float32)
+    scale_w = mx.ones((16,), dtype=mx.float32)
+
+    for dtype in _owner_output_dtypes():
+        out = mx.zeros((16,), dtype=dtype)
+        returned = fp8_scaled_vecmat_path_c(
+            x,
+            W,
+            scale_x=scale_x,
+            scale_w=scale_w,
+            out=out,
+        )
+        assert returned is out
+
+    assert len(calls) == len(_owner_output_dtypes())
+    for call in calls:
+        assert call[0] is x
+        assert call[1] is scale_x
+        assert call[2] is W
+        assert call[3] is scale_w
+    assert [call[-1].dtype for call in calls] == _owner_output_dtypes()
+
+
+def test_fp8_vecmat_direct_path_propagates_typed_dlpack_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tilelang.contrib.mlx_interop import DLPackConversionError
+
+    class FailingKernel:
+        def __call__(self, *_: object) -> object:
+            raise DLPackConversionError("MLX array import failed: wrong device")
+
+    def fail_legacy_kernel(*_: object, **__: object) -> object:
+        raise AssertionError("typed direct vecmat failure must not silently fall back")
+
+    monkeypatch.setattr(fp8_vecmat_mod, "can_run_metal", lambda: True)
+    monkeypatch.setattr(
+        fp8_vecmat_mod,
+        "_fp8_vecmat_tvm_ffi_kernel_for",
+        lambda **_: FailingKernel(),
+    )
+    monkeypatch.setattr(fp8_vecmat_mod, "_fp8_vecmat_kernel_for", fail_legacy_kernel)
+
+    x = mx.zeros((32,), dtype=mx.uint8)
+    W = mx.zeros((16, 32), dtype=mx.uint8)
+    scale_x = mx.ones((1,), dtype=mx.float32)
+    scale_w = mx.ones((16,), dtype=mx.float32)
+    out = mx.zeros((16,), dtype=mx.float32)
+
+    with pytest.raises(DLPackConversionError, match="wrong device"):
+        fp8_scaled_vecmat_path_c(x, W, scale_x=scale_x, scale_w=scale_w, out=out)
+
+
+def test_fp8_vecmat_direct_path_rejects_bad_owner_output_abi(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(fp8_vecmat_mod, "can_run_metal", lambda: True)
+
+    x = mx.zeros((32,), dtype=mx.uint8)
+    W = mx.zeros((16, 32), dtype=mx.uint8)
+    scale_x = mx.ones((1,), dtype=mx.float32)
+    scale_w = mx.ones((16,), dtype=mx.float32)
+
+    with pytest.raises(ValueError, match="out shape"):
+        fp8_scaled_vecmat_path_c(
+            x,
+            W,
+            scale_x=scale_x,
+            scale_w=scale_w,
+            out=mx.zeros((1, 16), dtype=mx.float32),
+        )
+
+    with pytest.raises(ValueError, match="out dtype"):
+        fp8_scaled_vecmat_path_c(
+            x,
+            W,
+            scale_x=scale_x,
+            scale_w=scale_w,
+            out=mx.zeros((16,), dtype=mx.int32),
+        )
+
+    bfloat16 = _bfloat16_dtype()
+    if bfloat16 is not None:
+        with pytest.raises(ValueError, match="MSL `bfloat`"):
+            fp8_scaled_vecmat_path_c(
+                x,
+                W,
+                scale_x=scale_x,
+                scale_w=scale_w,
+                out=mx.zeros((16,), dtype=bfloat16),
+            )
+
+    with pytest.raises(TypeError, match="Python scalars would allocate"):
+        fp8_scaled_vecmat_path_c(
+            x,
+            W,
+            scale_x=1.0,
+            scale_w=scale_w,
+            out=mx.zeros((16,), dtype=mx.float32),
+        )
+
+
+def test_fp8_vecmat_direct_compile_failure_is_typed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(fp8_vecmat_mod, "can_run_metal", lambda: True)
+    monkeypatch.setattr(
+        fp8_vecmat_mod,
+        "_fp8_vecmat_tvm_ffi_kernel_for",
+        lambda **_: (_ for _ in ()).throw(RuntimeError("shape ABI mismatch")),
+    )
+
+    x = mx.zeros((32,), dtype=mx.uint8)
+    W = mx.zeros((16, 32), dtype=mx.uint8)
+    scale_x = mx.ones((1,), dtype=mx.float32)
+    scale_w = mx.ones((16,), dtype=mx.float32)
+    out = mx.zeros((16,), dtype=mx.float32)
+
+    with pytest.raises(FP8VecmatPathCDirectError, match="shape ABI mismatch"):
+        fp8_scaled_vecmat_path_c_direct(
+            x,
+            W,
+            scale_x=scale_x,
+            scale_w=scale_w,
+            out=out,
+        )
+
+
+@pytest.mark.skipif(not _metal_available(), reason="Metal unavailable")
+def test_fp8_vecmat_direct_tvm_ffi_reuses_owner_output_and_matches_path_b() -> None:
+    rng = np.random.default_rng(26)
+    N, K = 24, 64
+    x = mx.array((rng.standard_normal((K,)) * 0.1).astype(np.float32))
+    W = mx.array((rng.standard_normal((N, K)) * 0.1).astype(np.float32))
+    x_fp8 = mx.to_fp8(x)
+    W_fp8 = mx.to_fp8(W)
+    scale_x = mx.array([1.25], dtype=mx.float32)
+    scale_w = mx.array(rng.uniform(0.5, 2.0, size=N).astype(np.float32))
+    path_b = fp8_scaled_vecmat(x_fp8, W_fp8, scale_x=scale_x, scale_w=scale_w)
+
+    for dtype in _owner_output_dtypes():
+        out = mx.zeros((N,), dtype=dtype)
+        mx.eval(x_fp8, W_fp8, scale_x, scale_w, out)
+
+        returned = fp8_scaled_vecmat_path_c(
+            x_fp8,
+            W_fp8,
+            scale_x=scale_x,
+            scale_w=scale_w,
+            out=out,
+        )
+        expected = path_b.astype(dtype).astype(mx.float32)
+        mx.eval(out, expected)
+
+        assert returned is out
+        np.testing.assert_allclose(
+            np.asarray(out.astype(mx.float32)),
+            np.asarray(expected),
+            rtol=1e-2,
+            atol=1e-2,
+        )

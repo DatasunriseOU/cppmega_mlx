@@ -311,8 +311,8 @@ def _dispatch_m2rnn_scan(
     :func:`cppmega_mlx.nn._tilelang.m2rnn_apply_with_state` when available;
     the wrapper preserves grad through ``y`` via the manual VJP shipped with
     the kernel and exposes ``h_last`` for cache assembly. REFERENCE always
-    uses the pure-MLX :func:`chunked_m2rnn_scan`. PATH_C is not implemented
-    for m2rnn (Path C is a Mamba3-only proof-of-DSL artifact).
+    uses the pure-MLX :func:`chunked_m2rnn_scan`. PATH_C is the TileLang DSL
+    port and remains opt-in until receipt-backed performance promotion.
     """
 
     from cppmega_mlx.runtime.kernel_policy import (
@@ -329,7 +329,38 @@ def _dispatch_m2rnn_scan(
     path = selected_path("m2rnn")
 
     if path is KernelPath.PATH_C:
-        raise NotImplementedError("m2rnn Path C not implemented; use Path B")
+        from cppmega_mlx.nn._tilelang.m2rnn_path_c import (
+            m2rnn_apply_with_state_path_c,
+            m2rnn_path_c_status,
+        )
+
+        status = m2rnn_path_c_status()
+        if not status.available:
+            raise RuntimeError(f"m2rnn: Path C kernel unavailable ({status.reason})")
+        head_counts = (q.shape[-2], k.shape[-2], v.shape[-2], W.shape[0], xf.shape[-1])
+        if len(set(head_counts)) != 1:
+            raise RuntimeError(
+                "m2rnn: Path C requires pre-aligned q/k/v/W/xf head counts; "
+                "refusing to broadcast or repeat tensors implicitly"
+            )
+        if h0 is None:
+            raise RuntimeError(
+                "m2rnn: Path C requires an existing h0 tensor; "
+                "refusing to allocate initial state implicitly"
+            )
+        batch, _seq, heads, k_dim = q.shape
+        v_dim = v.shape[-1]
+        h0_full = _initial_m2rnn_state(
+            h0,
+            batch=batch,
+            heads=heads,
+            k_dim=k_dim,
+            v_dim=v_dim,
+            dtype=q.dtype,
+        )
+        out, h = m2rnn_apply_with_state_path_c(q, k, v, W, xf, h0_full)
+        record_dispatch("m2rnn", path, "path_c_tilelang_dsl")
+        return out, h
 
     if path is KernelPath.REFERENCE:
         record_dispatch("m2rnn", path, "reference_pure_mlx")
