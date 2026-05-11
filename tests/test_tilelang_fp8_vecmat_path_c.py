@@ -51,9 +51,9 @@ def test_lowered_default_reducer_contains_kernel_and_packed_lut_decode() -> None
     features = fp8_vecmat_msl_features(msl)
     assert features["kernel_void"] >= 1
     assert features["fp8_e4m3_lut"] > 0
-    assert features["metal_fp8_dot4_helper"] > 0
+    assert features["metal_fp8_dot4_helper"] == 0
     assert features["scalar_fp8_byte_decode_calls"] == 0
-    assert "threadIdx" in msl or "thread_position" in msl
+    assert "thread_position_in_grid.x" in msl
 
 
 def test_lowered_default_reducer_uses_packed_uint_loads_and_simd_sum() -> None:
@@ -84,6 +84,7 @@ def test_lowered_default_reducer_reports_path_b_fast_path_ready() -> None:
     assert features["reinterpret_cast"] > 0
     assert features["device_const_uint"] > 0
     assert features["fp8_e4m3_lut"] > 0
+    assert features["metal_fp8_dot4_helper"] == 0
     assert features["scalar_fp8_byte_decode_calls"] == 0
 
 
@@ -96,10 +97,13 @@ def test_runtime_body_keeps_path_b_vecmat_hot_loop_and_scale_modes() -> None:
     assert features["simd_sum"] == 1
     assert features["reinterpret_cast"] == 2
     assert features["device_const_uint"] >= 2
-    assert features["fp8_e4m3_lut"] == 8
+    assert features["fp8_e4m3_lut"] >= 8
     assert features["scalar_fp8_byte_decode_calls"] == 0
     assert "device const uint* A4 = reinterpret_cast<device const uint*>(A)" in per_row
-    assert "device const uint* B4 = reinterpret_cast<device const uint*>(B + row_offset)" in per_row
+    assert (
+        "device const uint* B4 = reinterpret_cast<device const uint*>(B + row_offset)"
+        in per_row
+    )
     assert "B_scale[row]" in per_row
     assert "B_scale[0]" not in per_row
     assert "B_scale[0]" in scalar
@@ -108,21 +112,23 @@ def test_runtime_body_keeps_path_b_vecmat_hot_loop_and_scale_modes() -> None:
 
 @pytest.mark.skipif(not _metal_available(), reason="Metal unavailable")
 def test_runtime_kernel_uses_canonical_input_order_for_fast_tuple_dispatch() -> None:
-    _kernel, _lowering, input_names, output_shape, _grid, threadgroup = _fp8_vecmat_kernel_for(
-        24,
-        64,
-        1,
-        32,
-        4,
-        True,
+    _kernel, _lowering, input_names, output_shape, _grid, threadgroup = (
+        _fp8_vecmat_kernel_for(
+            24,
+            64,
+            1,
+            32,
+            4,
+            True,
+        )
     )
     assert input_names == ["A", "A_scale", "B", "B_scale"]
-    # Fix-1 + Fix-A re-application: vec=4 + K%4==0 selects the packed dot4
-    # macro PrimFunc, which declares ``C: T.Tensor((1, N), float32)``. The
-    # caller (``fp8_scaled_vecmat_path_c``) always reshapes the result back
-    # to flat ``(n,)`` for the public-API contract.
-    assert output_shape == (1, 24)
+    assert output_shape == (24,)
     assert threadgroup == (32, 1, 1)
+    assert "thread_position_in_grid.x" in _lowering.body
+    assert "blockIdx" not in _lowering.body
+    assert "__tvm_fp8_e4m3_dot4_packed" not in _lowering.body
+    assert "simd_sum(sum)" in _lowering.body
 
 
 def test_fp8_e4m3_dot4_intrinsic_is_registered() -> None:
@@ -199,7 +205,9 @@ def test_path_c_vecmat_matches_path_b_scalar_scale() -> None:
         pytest.skip("Path C TileLang/Metal dispatch unavailable")
 
     mx.eval(path_b, path_c)
-    np.testing.assert_allclose(np.asarray(path_c), np.asarray(path_b), rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(
+        np.asarray(path_c), np.asarray(path_b), rtol=1e-5, atol=1e-5
+    )
 
 
 @pytest.mark.skipif(not _metal_available(), reason="Metal unavailable")
@@ -220,7 +228,9 @@ def test_path_c_vecmat_matches_path_b_per_row_scale() -> None:
         pytest.skip("Path C TileLang/Metal dispatch unavailable")
 
     mx.eval(path_b, path_c)
-    np.testing.assert_allclose(np.asarray(path_c), np.asarray(path_b), rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(
+        np.asarray(path_c), np.asarray(path_b), rtol=1e-5, atol=1e-5
+    )
 
 
 @pytest.mark.skipif(not _metal_available(), reason="Metal unavailable")

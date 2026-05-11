@@ -1,4 +1,5 @@
 # pyright: reportInvalidTypeForm=false, reportMissingImports=false, reportUndefinedVariable=false
+# ruff: noqa: F821,F822
 """Profile TileLang Path C FP8 kernels against Path B hand-written MSL.
 
 This is the local Apple-Silicon/Metal Path C FP8 harness. It intentionally
@@ -208,11 +209,13 @@ def _tilelang_python_paths(tilelang_root: Path, tvm_root: Path) -> list[Path]:
     ]
     if not (tvm_ffi_python / "tvm_ffi" / "core.abi3.so").exists():
         paths.append(tvm_ffi_fallback)
-    paths.extend([
-        tvm_ffi_python,
-        tilelang_root / "3rdparty" / "tvm" / "python",
-        tilelang_root / "3rdparty" / "tvm" / "3rdparty" / "tvm-ffi" / "python",
-    ])
+    paths.extend(
+        [
+            tvm_ffi_python,
+            tilelang_root / "3rdparty" / "tvm" / "python",
+            tilelang_root / "3rdparty" / "tvm" / "3rdparty" / "tvm-ffi" / "python",
+        ]
+    )
     return paths
 
 
@@ -257,13 +260,20 @@ def _finder_paths(finder: object) -> list[Path]:
 def _disable_stale_editable_import_finders(tilelang_root: Path, tvm_root: Path) -> None:
     """Prevent stale editable installs from shadowing the selected source tree."""
 
-    allowed_roots = [root for root in _selected_import_roots(tilelang_root, tvm_root) if root.exists()]
+    allowed_roots = [
+        root
+        for root in _selected_import_roots(tilelang_root, tvm_root)
+        if root.exists()
+    ]
     kept: list[object] = []
     for finder in sys.meta_path:
         finder_type = type(finder)
         module = finder_type.__module__
         name = finder_type.__name__
-        is_tilelang_editable = module in {"_tilelang_editable", "_apache_tvm_ffi_editable"}
+        is_tilelang_editable = module in {
+            "_tilelang_editable",
+            "_apache_tvm_ffi_editable",
+        }
         if not is_tilelang_editable:
             kept.append(finder)
             continue
@@ -285,7 +295,11 @@ def _module_file(name: str) -> Path | None:
 
 
 def _purge_stale_imported_modules(tilelang_root: Path, tvm_root: Path) -> None:
-    allowed_roots = [root for root in _selected_import_roots(tilelang_root, tvm_root) if root.exists()]
+    allowed_roots = [
+        root
+        for root in _selected_import_roots(tilelang_root, tvm_root)
+        if root.exists()
+    ]
     stale_prefixes: set[str] = set()
     for name in ("tilelang", "tvm", "tvm_ffi"):
         module_path = _module_file(name)
@@ -294,7 +308,9 @@ def _purge_stale_imported_modules(tilelang_root: Path, tvm_root: Path) -> None:
     if not stale_prefixes:
         return
     for name in list(sys.modules):
-        if any(name == prefix or name.startswith(f"{prefix}.") for prefix in stale_prefixes):
+        if any(
+            name == prefix or name.startswith(f"{prefix}.") for prefix in stale_prefixes
+        ):
             sys.modules.pop(name, None)
 
 
@@ -342,7 +358,9 @@ def _prepare_tilelang_import_environment() -> None:
             os.environ["TVM_HOME"] = str(tvm_root)
             os.environ["TVM_SOURCE_DIR"] = str(tvm_root)
         if selected_lib_paths:
-            os.environ.setdefault("TVM_LIBRARY_PATH_SELECTED", os.pathsep.join(selected_lib_paths))
+            os.environ.setdefault(
+                "TVM_LIBRARY_PATH_SELECTED", os.pathsep.join(selected_lib_paths)
+            )
 
         _disable_stale_editable_import_finders(tilelang_root, tvm_root)
         _purge_stale_imported_modules(tilelang_root, tvm_root)
@@ -403,7 +421,9 @@ def _validate_module_origin(name: str, allowed_roots: Iterable[Path]) -> None:
         raise RuntimeError(f"{name} imported without __file__")
     if not _path_in_roots(module_path, existing_roots):
         roots = ", ".join(str(root) for root in existing_roots)
-        raise RuntimeError(f"{name} resolved to {module_path.resolve()} outside selected roots: {roots}")
+        raise RuntimeError(
+            f"{name} resolved to {module_path.resolve()} outside selected roots: {roots}"
+        )
 
 
 # NOTE: Do NOT invoke ``_prepare_tilelang_import_environment()`` at module
@@ -617,7 +637,9 @@ def _sync_all() -> None:
 def _percentile(sorted_samples: list[float], pct: float) -> float:
     if not sorted_samples:
         raise ValueError("empty samples")
-    idx = min(len(sorted_samples) - 1, max(0, int(round((len(sorted_samples) - 1) * pct))))
+    idx = min(
+        len(sorted_samples) - 1, max(0, int(round((len(sorted_samples) - 1) * pct)))
+    )
     return sorted_samples[idx]
 
 
@@ -723,7 +745,9 @@ def _worst_paired_steps(
     limit: int = 10,
 ) -> list[dict[str, float]]:
     out: list[dict[str, float]] = []
-    for step, ratio in sorted(ratios_by_step.items(), key=lambda item: item[1], reverse=True)[:limit]:
+    for step, ratio in sorted(
+        ratios_by_step.items(), key=lambda item: item[1], reverse=True
+    )[:limit]:
         out.append(
             {
                 "step": float(step),
@@ -759,7 +783,9 @@ def _bench_paired_callables(
                 failed[label] = f"{type(exc).__name__}: {exc}"
 
     samples: dict[str, list[float]] = {label: [] for label, _ in strategies}
-    samples_by_step: dict[str, dict[int, float]] = {label: {} for label, _ in strategies}
+    samples_by_step: dict[str, dict[int, float]] = {
+        label: {} for label, _ in strategies
+    }
     for step in range(iters):
         order = strategies if step % 2 == 0 else tuple(reversed(strategies))
         for label, fn in order:
@@ -814,8 +840,12 @@ def _bench_paired_callables(
             ratios = list(ratios_by_step.values())
             if ratios:
                 sorted_ratios = sorted(ratios)
-                paired_ratio_samples[f"{label}_over_{base_label}"] = [float(value) for value in ratios]
-                paired_ratios[f"{label}_over_{base_label}_paired_median"] = float(statistics.median(ratios))
+                paired_ratio_samples[f"{label}_over_{base_label}"] = [
+                    float(value) for value in ratios
+                ]
+                paired_ratios[f"{label}_over_{base_label}_paired_median"] = float(
+                    statistics.median(ratios)
+                )
                 paired_ratios[f"{label}_over_{base_label}_paired_p90"] = float(
                     _percentile(sorted_ratios, 0.90)
                 )
@@ -859,9 +889,8 @@ def _bench_paired_callables_with_optional_tokens_per_call(
         params = inspect.signature(_bench_paired_callables).parameters
     except (TypeError, ValueError):
         params = {}
-    accepts_tokens = (
-        "tokens_per_call" in params
-        or any(param.kind is inspect.Parameter.VAR_KEYWORD for param in params.values())
+    accepts_tokens = "tokens_per_call" in params or any(
+        param.kind is inspect.Parameter.VAR_KEYWORD for param in params.values()
     )
     if accepts_tokens:
         kwargs["tokens_per_call"] = tokens_per_call
@@ -993,13 +1022,23 @@ def _source_metrics(src: str) -> dict[str, Any]:
         "metal_fp8_dot4_packed": src.count("__tvm_fp8_e4m3_dot4_packed"),
         "metal_fp8_dot4_words": src.count("__tvm_fp8_e4m3_dot4_words"),
     }
-    markers["metal_fp8_dot4_helper"] = markers["metal_fp8_dot4_packed"] + markers["metal_fp8_dot4_words"]
+    markers["metal_fp8_dot4_helper"] = (
+        markers["metal_fp8_dot4_packed"] + markers["metal_fp8_dot4_words"]
+    )
     return {"source_len": len(src), "markers": markers}
 
 
-def _path_c_vecmat_runtime_source(*, N: int, K: int) -> str:
+def _path_c_vecmat_runtime_source(
+    *, N: int, K: int, scale_w_per_row: bool = True
+) -> str:
     _require_bench_deps()
-    return str(fp8_vecmat_runtime_msl_source(N=N, K=K, scale_w_per_row=True))
+    return str(
+        fp8_vecmat_runtime_msl_source(
+            N=N,
+            K=K,
+            scale_w_per_row=scale_w_per_row,
+        )
+    )
 
 
 def _xcrun_compile(src: str, *, label: str, dump_dir: Path | None) -> dict[str, Any]:
@@ -1036,7 +1075,16 @@ def _xcrun_compile(src: str, *, label: str, dump_dir: Path | None) -> dict[str, 
     env.setdefault("CMAKE_BUILD_PARALLEL_LEVEL", "4")
     try:
         res = subprocess.run(
-            ["xcrun", "--sdk", "macosx", "metal", "-c", str(msl_path), "-o", str(air_path)],
+            [
+                "xcrun",
+                "--sdk",
+                "macosx",
+                "metal",
+                "-c",
+                str(msl_path),
+                "-o",
+                str(air_path),
+            ],
             capture_output=True,
             text=True,
             env=env,
@@ -1046,7 +1094,9 @@ def _xcrun_compile(src: str, *, label: str, dump_dir: Path | None) -> dict[str, 
             "returncode": res.returncode,
             "stderr": res.stderr.strip(),
             "msl_path": str(msl_path) if dump_dir is not None else None,
-            "air_path": str(air_path) if dump_dir is not None and air_path.exists() else None,
+            "air_path": str(air_path)
+            if dump_dir is not None and air_path.exists()
+            else None,
         }
     finally:
         if cleanup:
@@ -1086,7 +1136,9 @@ def _build_inputs(
 
     a_mx = mx.array(a_fp8_cpu.view(torch.uint8).numpy())
     b_t_mx = mx.array(np.ascontiguousarray(b_fp8_cpu.view(torch.uint8).numpy().T))
-    x_mx = mx.array(np.ascontiguousarray(a_fp8_cpu[:1].view(torch.uint8).numpy().reshape(K)))
+    x_mx = mx.array(
+        np.ascontiguousarray(a_fp8_cpu[:1].view(torch.uint8).numpy().reshape(K))
+    )
     scale_a_mx = mx.array([scale_a], dtype=mx.float32)
     scale_b_mx = mx.array([scale_b], dtype=mx.float32)
     mx.eval(a_mx, b_t_mx, x_mx, scale_a_mx, scale_b_mx)
@@ -1120,7 +1172,9 @@ def _max_error(a: np.ndarray, b: np.ndarray) -> dict[str, float]:
     return {"max_abs": float(diff.max()), "max_rel": float((diff / denom).max())}
 
 
-def _parity_for_matmul(inputs: dict[str, Any], actual: torch.Tensor | mx.array) -> dict[str, Any]:
+def _parity_for_matmul(
+    inputs: dict[str, Any], actual: torch.Tensor | mx.array
+) -> dict[str, Any]:
     _require_bench_deps()
     a_ref = inputs["a_fp8_cpu"].to(torch.float32)
     b_ref = inputs["b_fp8_cpu"].to(torch.float32)
@@ -1246,7 +1300,10 @@ def _bench_paired_scaled_matmul(
         paired = _bench_paired_callables_with_optional_tokens_per_call(
             (
                 (b_label, _make_path_b_matmul_runner(inputs, b_last_ref)),
-                (c_label, _make_path_c_scaled_matmul_runner(compiled, inputs, c_last_ref)),
+                (
+                    c_label,
+                    _make_path_c_scaled_matmul_runner(compiled, inputs, c_last_ref),
+                ),
             ),
             _sync_all,
             flops=flops,
@@ -1261,8 +1318,14 @@ def _bench_paired_scaled_matmul(
         row_b["bench"] = asdict(stats[b_label])
         row_c["bench"] = asdict(stats[c_label])
 
-        if stats[b_label].ok and b_last_ref[0] is not None and bool(shape.get("parity", False)):
-            row_b["parity_vs_torch_cpu_dequant"] = _parity_for_matmul(inputs, b_last_ref[0])
+        if (
+            stats[b_label].ok
+            and b_last_ref[0] is not None
+            and bool(shape.get("parity", False))
+        ):
+            row_b["parity_vs_torch_cpu_dequant"] = _parity_for_matmul(
+                inputs, b_last_ref[0]
+            )
         if (
             stats[c_label].ok
             and c_last_ref[0] is not None
@@ -1274,7 +1337,9 @@ def _bench_paired_scaled_matmul(
                 c_last_ref[0].detach().cpu().numpy(),
                 np.asarray(b_last_ref[0]),
             )
-            row_c["parity_vs_torch_cpu_dequant"] = _parity_for_matmul(inputs, c_last_ref[0])
+            row_c["parity_vs_torch_cpu_dequant"] = _parity_for_matmul(
+                inputs, c_last_ref[0]
+            )
     except Exception as exc:
         row_b.setdefault(
             "bench",
@@ -1410,12 +1475,23 @@ def _bench_paired_vecmat_mlx(
     }
     if stats[c_label].ok:
         try:
-            prim = make_fp8_vecmat_reduce_kernel(N=N, K=K)
-            diagnostic_src = _lower_source(prim, target=TILELANG_METAL_VECMAT_TARGET)
-            runtime_src = _path_c_vecmat_runtime_source(N=N, K=K)
+            scale_w_per_row = bool(getattr(inputs["scale_b_mx"], "size", 0) == N)
+            prim = make_fp8_vecmat_reduce_kernel(
+                N=N,
+                K=K,
+                scale_w_per_row=scale_w_per_row,
+            )
+            diagnostic_src = _lower_source(prim, target=TILELANG_METAL_TARGET)
+            runtime_src = _path_c_vecmat_runtime_source(
+                N=N,
+                K=K,
+                scale_w_per_row=scale_w_per_row,
+            )
             row_c["source_metrics"] = _source_metrics(runtime_src)
             row_c["source"] = "mlx_runtime_source"
-            row_c["diagnostic_tilelang_source_metrics"] = _source_metrics(diagnostic_src)
+            row_c["diagnostic_tilelang_source_metrics"] = _source_metrics(
+                diagnostic_src
+            )
             row_c["path_c_blockers"] = fp8_vecmat_msl_blockers(runtime_src)
             row_c["xcrun_compile"] = (
                 {"skipped": True, "reason": "--skip-xcrun"}
@@ -1471,9 +1547,18 @@ def _bench_path_c_vecmat_mlx(
     }
     if stats.ok:
         try:
-            prim = make_fp8_vecmat_reduce_kernel(N=N, K=K)
-            diagnostic_src = _lower_source(prim, target=TILELANG_METAL_VECMAT_TARGET)
-            runtime_src = _path_c_vecmat_runtime_source(N=N, K=K)
+            scale_w_per_row = bool(getattr(inputs["scale_b_mx"], "size", 0) == N)
+            prim = make_fp8_vecmat_reduce_kernel(
+                N=N,
+                K=K,
+                scale_w_per_row=scale_w_per_row,
+            )
+            diagnostic_src = _lower_source(prim, target=TILELANG_METAL_TARGET)
+            runtime_src = _path_c_vecmat_runtime_source(
+                N=N,
+                K=K,
+                scale_w_per_row=scale_w_per_row,
+            )
             row["source_metrics"] = _source_metrics(runtime_src)
             row["source"] = "mlx_runtime_source"
             row["diagnostic_tilelang_source_metrics"] = _source_metrics(diagnostic_src)
@@ -1553,7 +1638,13 @@ def _bench_path_c_scaled_matmul(
             result["parity_vs_torch_cpu_dequant"] = _parity_for_matmul(inputs, c_out)
     except Exception as exc:
         result["bench"] = asdict(
-            BenchStats(label=label, ok=False, warmup=warmup, iters=iters, error=f"{type(exc).__name__}: {exc}")
+            BenchStats(
+                label=label,
+                ok=False,
+                warmup=warmup,
+                iters=iters,
+                error=f"{type(exc).__name__}: {exc}",
+            )
         )
         result["traceback"] = traceback.format_exc(limit=12)
     return result
@@ -1578,7 +1669,7 @@ def _bench_path_c_vecmat_reduce(
     }
     try:
         prim = make_fp8_vecmat_reduce_kernel(N=N, K=K)
-        src = _lower_source(prim, target=TILELANG_METAL_VECMAT_TARGET)
+        src = _lower_source(prim, target=TILELANG_METAL_TARGET)
         result["source_metrics"] = _source_metrics(src)
         result["path_c_blockers"] = fp8_vecmat_msl_blockers(src)
         result["xcrun_compile"] = (
@@ -1586,7 +1677,7 @@ def _bench_path_c_vecmat_reduce(
             if skip_xcrun
             else _xcrun_compile(src, label=label, dump_dir=dump_dir)
         )
-        compiled = _compile_tilelang(prim, target=TILELANG_METAL_VECMAT_TARGET)
+        compiled = _compile_tilelang(prim, target=TILELANG_METAL_TARGET)
         c_out = inputs["c_out_mps"]
 
         def run() -> None:
@@ -1613,7 +1704,13 @@ def _bench_path_c_vecmat_reduce(
             result["parity_vs_torch_cpu_dequant"] = _parity_for_matmul(inputs, c_out)
     except Exception as exc:
         result["bench"] = asdict(
-            BenchStats(label=label, ok=False, warmup=warmup, iters=iters, error=f"{type(exc).__name__}: {exc}")
+            BenchStats(
+                label=label,
+                ok=False,
+                warmup=warmup,
+                iters=iters,
+                error=f"{type(exc).__name__}: {exc}",
+            )
         )
         result["traceback"] = traceback.format_exc(limit=12)
     return result
@@ -1626,7 +1723,9 @@ def _compare_ratios(rows: Iterable[dict[str, Any]]) -> dict[str, float]:
         label = str(row.get("label", ""))
         bench = row.get("bench") or {}
         if bench.get("ok") and bench.get("median_ms") is not None:
-            benches[str(row.get("label", bench.get("label")))] = float(bench["median_ms"])
+            benches[str(row.get("label", bench.get("label")))] = float(
+                bench["median_ms"]
+            )
         paired_ratios = row.get("paired_ratios") or {}
         if isinstance(paired_ratios, dict):
             paired[label] = {
@@ -1688,7 +1787,9 @@ def _status_payload(status: Any, fields: Iterable[str] | None = None) -> dict[st
     elif fields is None:
         data = asdict(status)
     else:
-        data = {field: getattr(status, field) for field in fields if hasattr(status, field)}
+        data = {
+            field: getattr(status, field) for field in fields if hasattr(status, field)
+        }
     if "available" in data:
         data["available"] = bool(data["available"])
     features = data.get("features")
@@ -1706,7 +1807,9 @@ def _full_dispatch_strict_failures(
     status = payload[status_key]
     failures: list[str] = []
     if not status["available"]:
-        failures.append(f"{status_key}.available=false blocks full Path C {label} dispatch")
+        failures.append(
+            f"{status_key}.available=false blocks full Path C {label} dispatch"
+        )
         return failures
     features = status.get("features", {})
     dispatch_surface = features.get("dispatch_surface")
@@ -1731,11 +1834,30 @@ def _sparse_path_c_status_payload(
     payload = {
         "path_c_tilelang_qk_status": _status_payload(
             fp8_qk_status,
-            fields=("available", "reason", "target", "m", "n", "k", "transpose_B", "features"),
+            fields=(
+                "available",
+                "reason",
+                "target",
+                "m",
+                "n",
+                "k",
+                "transpose_B",
+                "features",
+            ),
         ),
         "path_c_tilelang_qk_reduce_status": _status_payload(
             fp8_qk_reduce_status,
-            fields=("available", "reason", "target", "n", "k", "outputs_per_block", "reduce_threads", "vec", "features"),
+            fields=(
+                "available",
+                "reason",
+                "target",
+                "n",
+                "k",
+                "outputs_per_block",
+                "reduce_threads",
+                "vec",
+                "features",
+            ),
         ),
         "path_c_tilelang_indexed_qk_reduce_status": _status_payload(
             fp8_indexed_qk_reduce_status,
@@ -1833,8 +1955,8 @@ def _shape_row_strict_ok(
         # loop. Use that paired median for the strict gate so launch-order
         # jitter cannot fail an otherwise faster paired run.
         paired_ratio_key = f"{path_c_label}_over_{path_b_label}_paired_median"
-        paired_ratio = labels.get(path_c_label, {}).get("paired_ratios", {}).get(
-            paired_ratio_key
+        paired_ratio = (
+            labels.get(path_c_label, {}).get("paired_ratios", {}).get(paired_ratio_key)
         )
         if _finite_float(paired_ratio):
             ratio = paired_ratio
@@ -1900,8 +2022,12 @@ def _bench_shape(
     dump_dir: Path | None,
     include_vecmat_diagnostics: bool,
 ) -> dict[str, Any]:
-    print(f"[bench] {shape_name}: M={shape['M']} N={shape['N']} K={shape['K']} kind={shape['kind']}")
-    inputs = _build_inputs(shape, seed=seed, input_scale=input_scale, scale_a=scale_a, scale_b=scale_b)
+    print(
+        f"[bench] {shape_name}: M={shape['M']} N={shape['N']} K={shape['K']} kind={shape['kind']}"
+    )
+    inputs = _build_inputs(
+        shape, seed=seed, input_scale=input_scale, scale_a=scale_a, scale_b=scale_b
+    )
     rows: list[dict[str, Any]] = []
 
     if shape["kind"] == "vecmat":
@@ -1924,7 +2050,9 @@ def _bench_shape(
             and b_last is not None
             and bool(shape.get("parity", False))
         ):
-            row_c_mlx["parity_vs_path_b_msl"] = _max_error(np.asarray(c_mlx_last), np.asarray(b_last))
+            row_c_mlx["parity_vs_path_b_msl"] = _max_error(
+                np.asarray(c_mlx_last), np.asarray(b_last)
+            )
             row_c_mlx["parity_vs_torch_cpu_dequant"] = _parity_for_matmul(
                 inputs,
                 c_mlx_last.reshape(1, int(shape["N"])),
@@ -2002,7 +2130,9 @@ def _bench_sparse_status(*, warmup: int, iters: int, seed: int) -> dict[str, Any
         rng = np.random.default_rng(seed)
         q = mx.array((rng.standard_normal((1, 64, 4, 64)) * 0.1).astype(np.float16))
         kv = mx.array((rng.standard_normal((1, 64, 1, 64)) * 0.1).astype(np.float16))
-        indices_np = np.tile(np.arange(16, dtype=np.int32).reshape(1, 1, 1, 16), (1, 64, 1, 1))
+        indices_np = np.tile(
+            np.arange(16, dtype=np.int32).reshape(1, 1, 1, 16), (1, 64, 1, 1)
+        )
         indices_np[:, :, :, 8:] = -1
         indices = mx.array(indices_np)
         mx.eval(q, kv, indices)
@@ -2013,6 +2143,7 @@ def _bench_sparse_status(*, warmup: int, iters: int, seed: int) -> dict[str, Any
             **path_c_payload,
         }
         if status.available:
+
             def run_b() -> None:
                 out = sparse_mla_fp8_fwd_metal(q, kv, indices, d_v=32)
                 if out is None:
@@ -2032,16 +2163,24 @@ def _bench_sparse_status(*, warmup: int, iters: int, seed: int) -> dict[str, Any
             metal = sparse_mla_fp8_fwd_metal(q, kv, indices, d_v=32)
             if metal is not None:
                 mx.eval(ref, metal[0])
-                result["path_b_parity_vs_bf16_reference"] = _max_error(np.asarray(metal[0]), np.asarray(ref))
+                result["path_b_parity_vs_bf16_reference"] = _max_error(
+                    np.asarray(metal[0]), np.asarray(ref)
+                )
         return result
     except Exception as exc:
         unavailable = {
             "available": False,
             "reason": f"{type(exc).__name__}: {exc}",
-            "features": {"dispatch_surface": "unavailable", "full_fwd_bwd_available": False},
+            "features": {
+                "dispatch_surface": "unavailable",
+                "full_fwd_bwd_available": False,
+            },
         }
         return {
-            "path_b_status": {"available": False, "reason": f"{type(exc).__name__}: {exc}"},
+            "path_b_status": {
+                "available": False,
+                "reason": f"{type(exc).__name__}: {exc}",
+            },
             **_sparse_path_c_status_payload(
                 fp8_qk_status=unavailable,
                 fp8_qk_reduce_status=unavailable,
@@ -2091,14 +2230,24 @@ def _print_summary(payload: dict[str, Any]) -> None:
         print("\nSparse-MLA FP8:")
         print(f"  Path B: {sparse['path_b_status']}")
         print(f"  Path C full FP8 dispatch: {sparse.get('path_c_tilelang_qk_status')}")
-        print(f"  Path C FP8 QK reducer: {sparse.get('path_c_tilelang_qk_reduce_status')}")
-        print(f"  Path C FP8 indexed QK reducer: {sparse.get('path_c_tilelang_indexed_qk_reduce_status')}")
-        print(f"  Path C e8m0 full dispatch: {sparse.get('path_c_tilelang_e8m0_qk_status')}")
-        print(f"  Path C e8m0 QK reducer: {sparse.get('path_c_tilelang_e8m0_qk_reduce_status')}")
+        print(
+            f"  Path C FP8 QK reducer: {sparse.get('path_c_tilelang_qk_reduce_status')}"
+        )
+        print(
+            f"  Path C FP8 indexed QK reducer: {sparse.get('path_c_tilelang_indexed_qk_reduce_status')}"
+        )
+        print(
+            f"  Path C e8m0 full dispatch: {sparse.get('path_c_tilelang_e8m0_qk_status')}"
+        )
+        print(
+            f"  Path C e8m0 QK reducer: {sparse.get('path_c_tilelang_e8m0_qk_reduce_status')}"
+        )
         print(f"  Full Path C strict gate: {sparse.get('strict')}")
         bench = sparse.get("path_b_bench")
         if bench and bench.get("ok"):
-            print(f"  Path B median={bench['median_ms']:.6f} ms p90={bench['p90_ms']:.6f} ms")
+            print(
+                f"  Path B median={bench['median_ms']:.6f} ms p90={bench['p90_ms']:.6f} ms"
+            )
 
 
 def main() -> int:
@@ -2123,15 +2272,32 @@ def main() -> int:
         type=Path,
         default=REPO_ROOT / "bench" / "tilelang_ports" / "fp8_path_c_vs_path_b.json",
     )
-    parser.add_argument("--dump-msl", type=Path, default=None, help="Directory for emitted .metal/.air files.")
-    parser.add_argument("--skip-xcrun", action="store_true", help="Skip offline xcrun Metal compilation.")
-    parser.add_argument("--skip-sparse", action="store_true", help="Skip Sparse-MLA Path B status/bench probe.")
+    parser.add_argument(
+        "--dump-msl",
+        type=Path,
+        default=None,
+        help="Directory for emitted .metal/.air files.",
+    )
+    parser.add_argument(
+        "--skip-xcrun",
+        action="store_true",
+        help="Skip offline xcrun Metal compilation.",
+    )
+    parser.add_argument(
+        "--skip-sparse",
+        action="store_true",
+        help="Skip Sparse-MLA Path B status/bench probe.",
+    )
     parser.add_argument(
         "--include-vecmat-diagnostics",
         action="store_true",
         help="Also run legacy Torch/TileLang vecmat diagnostic routes; off by default because they do not match production Path C dispatch.",
     )
-    parser.add_argument("--strict", action="store_true", help="Exit non-zero if any requested Path C benchmark fails.")
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Exit non-zero if any requested Path C benchmark fails.",
+    )
     parser.add_argument(
         "--max-ratio",
         type=float,
@@ -2222,7 +2388,9 @@ def main() -> int:
         )
 
     if not args.skip_sparse:
-        payload["sparse_mla"] = _bench_sparse_status(warmup=args.warmup, iters=args.iters, seed=args.seed)
+        payload["sparse_mla"] = _bench_sparse_status(
+            warmup=args.warmup, iters=args.iters, seed=args.seed
+        )
 
     strict_failed = False
     if args.strict:
