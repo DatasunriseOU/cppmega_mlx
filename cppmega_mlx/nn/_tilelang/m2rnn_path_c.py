@@ -47,6 +47,8 @@ def _tl_dtype_for(dtype: mx.Dtype) -> str | None:
         return "float32"
     if dtype == mx.float16:
         return "float16"
+    if dtype == mx.bfloat16:
+        return "bfloat16"
     return None
 
 
@@ -143,6 +145,21 @@ def _packed_path_c_inputs_eligible(
     xf: mx.array,
     h0: mx.array | None,
 ) -> bool:
+    return m2rnn_packed_path_c_status(
+        conv_input,
+        W,
+        xf,
+        h0,
+        require_backward=False,
+    ).available
+
+
+def _packed_path_c_inputs_well_formed(
+    conv_input: mx.array,
+    W: mx.array,
+    xf: mx.array,
+    h0: mx.array | None,
+) -> bool:
     if not _msl_transform.can_run_metal() or h0 is None:
         return False
     if not _validate_same_dtype(conv_input, W, xf, h0):
@@ -164,6 +181,23 @@ def _packed_path_c_inputs_eligible(
         return conv_dim == heads * (2 * k_dim + v_dim)
     except (TypeError, ValueError):
         return False
+
+
+def _kernel_lowering_status(
+    label: str,
+    kernel_factory: Any,
+    *args: Any,
+) -> M2RNNPathCStatus:
+    try:
+        _kernel, lowering = kernel_factory(*args)
+    except Exception as exc:
+        return M2RNNPathCStatus(
+            False,
+            f"{label} lowering failed: {type(exc).__name__}: {exc}",
+        )
+    if "kernel void" not in lowering.msl_text:
+        return M2RNNPathCStatus(False, f"{label} source has no kernel")
+    return M2RNNPathCStatus(True, f"{label} lowers to a Metal kernel")
 
 
 def _m2rnn_fwd_owner_outputs(
@@ -1265,42 +1299,111 @@ def _packed_bwd_kernel_for(
 def m2rnn_path_c_status() -> M2RNNPathCStatus:
     if not _msl_transform.can_run_metal():
         return M2RNNPathCStatus(False, "MLX Metal backend is not available")
-    try:
-        fwd_kernel, fwd_lowering = _fwd_kernel_for(1, 4, 2, 4, 4, "float32")
-        bwd_kernel, bwd_lowering = _bwd_kernel_for(1, 4, 2, 4, 4, "float32")
-        packed_fwd_kernel, packed_fwd_lowering = _packed_fwd_kernel_for(
-            1,
-            4,
-            2,
-            4,
-            4,
-            "float32",
-        )
-        packed_bwd_kernel, packed_bwd_lowering = _packed_bwd_kernel_for(
-            1,
-            4,
-            2,
-            4,
-            4,
-            "float32",
-        )
-        del fwd_kernel, bwd_kernel, packed_fwd_kernel, packed_bwd_kernel
-    except Exception as exc:
-        return M2RNNPathCStatus(
-            False,
-            f"TileLang/MLX lowering failed for M2RNN Path C: {type(exc).__name__}: {exc}",
-        )
-    if "kernel void" not in fwd_lowering.msl_text:
-        return M2RNNPathCStatus(False, "lowered M2RNN Path C fwd source has no kernel")
-    if "kernel void" not in bwd_lowering.msl_text:
-        return M2RNNPathCStatus(False, "lowered M2RNN Path C bwd source has no kernel")
-    if "kernel void" not in packed_fwd_lowering.msl_text:
-        return M2RNNPathCStatus(False, "lowered packed M2RNN Path C fwd source has no kernel")
-    if "kernel void" not in packed_bwd_lowering.msl_text:
-        return M2RNNPathCStatus(False, "lowered packed M2RNN Path C bwd source has no kernel")
+    probes = (
+        (
+            "M2RNN Path C fwd",
+            _fwd_kernel_for,
+            (1, 4, 2, 4, 4, "float32"),
+        ),
+        (
+            "M2RNN Path C bwd",
+            _bwd_kernel_for,
+            (1, 4, 2, 4, 4, "float32"),
+        ),
+        (
+            "packed M2RNN Path C fwd",
+            _packed_fwd_kernel_for,
+            (1, 4, 2, 4, 4, "float32"),
+        ),
+        (
+            "packed M2RNN Path C bwd",
+            _packed_bwd_kernel_for,
+            (1, 4, 2, 4, 4, "float32"),
+        ),
+        (
+            "packed M2RNN Path C bf16 K=16 fwd",
+            _packed_fwd_kernel_for,
+            (1, 4, 2, 16, 4, "bfloat16"),
+        ),
+        (
+            "packed M2RNN Path C bf16 K=16 bwd",
+            _packed_bwd_kernel_for,
+            (1, 4, 2, 16, 4, "bfloat16"),
+        ),
+    )
+    for label, kernel_factory, args in probes:
+        status = _kernel_lowering_status(label, kernel_factory, *args)
+        if not status.available:
+            return M2RNNPathCStatus(
+                False,
+                f"TileLang/MLX lowering failed for {status.reason}",
+            )
     return M2RNNPathCStatus(
         True,
-        "M2RNN TileLang DSL Path C forward/backward is dispatchable",
+        "M2RNN TileLang DSL Path C forward/backward is dispatchable, including packed bf16 K=16",
+    )
+
+
+def m2rnn_packed_path_c_status(
+    conv_input: mx.array,
+    W: mx.array,
+    xf: mx.array,
+    h0: mx.array | None,
+    *,
+    require_backward: bool = True,
+) -> M2RNNPathCStatus:
+    if not _msl_transform.can_run_metal():
+        return M2RNNPathCStatus(False, "MLX Metal backend is not available")
+    if h0 is None:
+        return M2RNNPathCStatus(False, "packed M2RNN Path C requires h0")
+    if not _validate_same_dtype(conv_input, W, xf, h0):
+        return M2RNNPathCStatus(False, "packed M2RNN Path C inputs must share dtype")
+    carrier_dtype = _tl_dtype_for(conv_input.dtype)
+    if carrier_dtype is None:
+        return M2RNNPathCStatus(
+            False,
+            f"packed M2RNN Path C unsupported dtype {conv_input.dtype}",
+        )
+    if not _packed_path_c_inputs_well_formed(conv_input, W, xf, h0):
+        return M2RNNPathCStatus(
+            False,
+            "packed M2RNN Path C requires conv_input=(B,S,H*(2K+V)), "
+            "W=(H,V,V), xf=(B,S,H), h0=(B,H,K,V), and matching dtype",
+        )
+    batch, seq, heads, k_dim, v_dim, _conv_dim = _packed_shape(conv_input, W, h0)
+    if seq == 0:
+        return M2RNNPathCStatus(
+            True,
+            "packed M2RNN Path C seq=0 is handled without launching a kernel",
+        )
+    fwd_status = _kernel_lowering_status(
+        f"packed M2RNN Path C {carrier_dtype} K={k_dim} fwd",
+        _packed_fwd_kernel_for,
+        batch,
+        seq,
+        heads,
+        k_dim,
+        v_dim,
+        carrier_dtype,
+    )
+    if not fwd_status.available:
+        return fwd_status
+    if require_backward:
+        bwd_status = _kernel_lowering_status(
+            f"packed M2RNN Path C {carrier_dtype} K={k_dim} bwd",
+            _packed_bwd_kernel_for,
+            batch,
+            seq,
+            heads,
+            k_dim,
+            v_dim,
+            carrier_dtype,
+        )
+        if not bwd_status.available:
+            return bwd_status
+    return M2RNNPathCStatus(
+        True,
+        f"packed M2RNN Path C {carrier_dtype} K={k_dim} is dispatchable",
     )
 
 
@@ -1710,9 +1813,21 @@ def _raise_path_c_unavailable() -> None:
     raise RuntimeError(f"m2rnn_apply_path_c unavailable: {m2rnn_path_c_status().reason}")
 
 
-def _raise_packed_path_c_unavailable() -> None:
+def _raise_packed_path_c_unavailable(
+    conv_input: mx.array,
+    W: mx.array,
+    xf: mx.array,
+    h0: mx.array | None,
+) -> None:
+    status = m2rnn_packed_path_c_status(
+        conv_input,
+        W,
+        xf,
+        h0,
+        require_backward=False,
+    )
     raise RuntimeError(
-        f"m2rnn_apply_packed_with_state_path_c unavailable: {m2rnn_path_c_status().reason}"
+        f"m2rnn_apply_packed_with_state_path_c unavailable: {status.reason}"
     )
 
 
@@ -1725,7 +1840,7 @@ def m2rnn_apply_packed_with_state_path_c(
 ) -> tuple[mx.array, mx.array]:
     full = _m2rnn_packed_fwd_path_c_full(conv_input, W, xf, h0)
     if full is None:
-        _raise_packed_path_c_unavailable()
+        _raise_packed_path_c_unavailable(conv_input, W, xf, h0)
     y, h_last, _tanh_cache = full
     return y, h_last
 
@@ -1741,7 +1856,7 @@ def _m2rnn_apply_packed_with_state_path_c_vjp(
     dy = cotangent[0]
     full = _m2rnn_packed_fwd_path_c_full(conv_input, W, xf, h0)
     if full is None:
-        _raise_packed_path_c_unavailable()
+        _raise_packed_path_c_unavailable(conv_input, W, xf, h0)
     _y, _h_last, tanh_cache = full
     return m2rnn_packed_bwd_path_c(
         dy,
@@ -1897,5 +2012,6 @@ __all__ = [
     "m2rnn_fwd_path_c",
     "m2rnn_fwd_with_state_path_c",
     "m2rnn_packed_bwd_path_c",
+    "m2rnn_packed_path_c_status",
     "m2rnn_path_c_status",
 ]

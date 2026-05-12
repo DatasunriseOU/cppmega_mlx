@@ -123,38 +123,157 @@ def test_path_c_dispatch_requires_existing_h0_without_allocating(
 ) -> None:
     from cppmega_mlx.nn._tilelang import m2rnn_path_c
 
-    monkeypatch.setattr(
-        m2rnn_path_c,
-        "m2rnn_path_c_status",
-        lambda: m2rnn_path_c.M2RNNPathCStatus(True, "forced available"),
-    )
+    def fail_path_c_status(*_args: object, **_kwargs: object) -> m2rnn_path_c.M2RNNPathCStatus:
+        raise AssertionError("Path C status should not run before explicit h0 exists")
 
     def fail_path_c_kernel(*_args: object, **_kwargs: object) -> tuple[mx.array, mx.array]:
         raise AssertionError("Path C should fail before allocating h0 or launching")
 
     monkeypatch.setattr(
         m2rnn_path_c,
-        "m2rnn_apply_with_state_path_c",
-        fail_path_c_kernel,
+        "m2rnn_packed_path_c_status",
+        fail_path_c_status,
     )
+    monkeypatch.setattr(m2rnn_path_c, "m2rnn_apply_packed_with_state_path_c", fail_path_c_kernel)
     monkeypatch.setenv("CPPMEGA_KERNEL_PATH", "path_c")
     cfg = M2RNNConfig(
         d_model=16,
         k_head_dim=4,
-        v_head_dim=3,
+        v_head_dim=4,
         num_q_heads=2,
         num_k_heads=2,
         num_v_heads=2,
         num_f_heads=2,
         num_g_heads=2,
         num_weight_heads=2,
-        conv_kernel=4,
+        conv_kernel=1,
         chunk_size=8,
     )
     block = M2RNNMixer(cfg)
-    hidden = mx.random.normal((1, 8, cfg.d_model), dtype=mx.float32) * 0.1
+    hidden = mx.random.normal((1, 4, cfg.d_model), dtype=mx.float32) * 0.1
+
     with pytest.raises(RuntimeError, match="existing h0 tensor"):
         block(hidden)
+    matches = [e for e in get_dispatch_log() if e["op_name"] == "m2rnn"]
+    assert not matches, f"failed Path C dispatch should not log success: {matches}"
+
+
+def test_path_c_dispatch_accepts_explicit_initial_h0(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cppmega_mlx.nn._tilelang import m2rnn_path_c
+
+    seen: dict[str, tuple[int, ...]] = {}
+
+    monkeypatch.setattr(
+        m2rnn_path_c,
+        "m2rnn_packed_path_c_status",
+        lambda *_args, **_kwargs: m2rnn_path_c.M2RNNPathCStatus(
+            True,
+            "forced packed available",
+        ),
+    )
+
+    def fake_path_c_kernel(
+        conv_input: mx.array,
+        W: mx.array,
+        xf: mx.array,
+        h0: mx.array,
+    ) -> tuple[mx.array, mx.array]:
+        batch, seq, _conv_dim = conv_input.shape
+        heads, v_dim, _ = W.shape
+        seen["conv_input"] = tuple(conv_input.shape)
+        seen["xf"] = tuple(xf.shape)
+        seen["h0"] = tuple(h0.shape)
+        return mx.zeros((batch, seq, heads, v_dim), dtype=conv_input.dtype), h0
+
+    monkeypatch.setattr(
+        m2rnn_path_c,
+        "m2rnn_apply_packed_with_state_path_c",
+        fake_path_c_kernel,
+    )
+    monkeypatch.setenv("CPPMEGA_KERNEL_PATH", "path_c")
+    cfg = M2RNNConfig(
+        d_model=16,
+        k_head_dim=4,
+        v_head_dim=4,
+        num_q_heads=2,
+        num_k_heads=2,
+        num_v_heads=2,
+        num_f_heads=2,
+        num_g_heads=2,
+        num_weight_heads=2,
+        conv_kernel=1,
+        chunk_size=8,
+    )
+    mx.random.seed(17)
+    block = M2RNNMixer(cfg)
+    hidden = mx.random.normal((1, 4, cfg.d_model), dtype=mx.float32) * 0.1
+    h0 = block.initial_h0(hidden.shape[0], hidden.dtype)
+    out, h = block(hidden, h0=h0)
+    mx.eval(out, h)
+    assert out.shape == hidden.shape
+    assert seen["conv_input"] == (1, 4, 24)
+    assert seen["xf"] == (1, 4, 2)
+    assert seen["h0"] == (1, 2, 4, 4)
+    assert h.shape == seen["h0"]
+    matches = [e for e in get_dispatch_log() if e["op_name"] == "m2rnn"]
+    assert matches[-1]["path"] == "path_c"
+    assert matches[-1]["kernel_used"] == "path_c_tilelang_dsl_packed"
+
+
+def test_path_c_dispatch_checks_packed_status_before_callable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cppmega_mlx.nn._tilelang import m2rnn_path_c
+
+    seen: dict[str, object] = {}
+
+    def forced_unavailable(
+        conv_input: mx.array,
+        *_args: object,
+        **_kwargs: object,
+    ) -> m2rnn_path_c.M2RNNPathCStatus:
+        seen["shape"] = tuple(conv_input.shape)
+        seen["dtype"] = conv_input.dtype
+        return m2rnn_path_c.M2RNNPathCStatus(False, "forced K=16 bf16 unavailable")
+
+    def fail_path_c_kernel(*_args: object, **_kwargs: object) -> tuple[mx.array, mx.array]:
+        raise AssertionError("Path C callable must not run after unavailable status")
+
+    monkeypatch.setattr(
+        m2rnn_path_c,
+        "m2rnn_packed_path_c_status",
+        forced_unavailable,
+    )
+    monkeypatch.setattr(
+        m2rnn_path_c,
+        "m2rnn_apply_packed_with_state_path_c",
+        fail_path_c_kernel,
+    )
+    monkeypatch.setenv("CPPMEGA_KERNEL_PATH", "path_c")
+    cfg = M2RNNConfig(
+        d_model=16,
+        k_head_dim=16,
+        v_head_dim=4,
+        num_q_heads=2,
+        num_k_heads=2,
+        num_v_heads=2,
+        num_f_heads=2,
+        num_g_heads=2,
+        num_weight_heads=2,
+        conv_kernel=1,
+        chunk_size=8,
+    )
+    block = M2RNNMixer(cfg)
+    block.set_dtype(mx.bfloat16)
+    hidden = (mx.random.normal((1, 4, cfg.d_model)) * 0.1).astype(mx.bfloat16)
+    h0 = block.initial_h0(hidden.shape[0], hidden.dtype)
+
+    with pytest.raises(RuntimeError, match="forced K=16 bf16 unavailable"):
+        block(hidden, h0=h0)
+    assert seen["shape"] == (1, 4, cfg.num_heads * (2 * cfg.k_head_dim + cfg.v_head_dim))
+    assert seen["dtype"] == mx.bfloat16
     matches = [e for e in get_dispatch_log() if e["op_name"] == "m2rnn"]
     assert not matches, f"failed Path C dispatch should not log success: {matches}"
 

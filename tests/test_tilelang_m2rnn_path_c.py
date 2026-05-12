@@ -18,6 +18,7 @@ from cppmega_mlx.nn._tilelang.m2rnn import (
     m2rnn_bwd_metal,
     m2rnn_fwd_metal,
     m2rnn_metal_status,
+    m2rnn_reference,
 )
 from cppmega_mlx.nn._tilelang.m2rnn_path_c import (
     M2RNNPathCStatus,
@@ -28,6 +29,7 @@ from cppmega_mlx.nn._tilelang.m2rnn_path_c import (
     m2rnn_bwd_path_c,
     m2rnn_fwd_with_state_path_c,
     m2rnn_packed_bwd_path_c,
+    m2rnn_packed_path_c_status,
     m2rnn_path_c_status,
 )
 
@@ -313,6 +315,55 @@ def test_m2rnn_packed_path_c_k_parallel_matches_path_b_backward() -> None:
     np.testing.assert_allclose(_np(h_packed), _np(h_path_b), rtol=1e-6, atol=1e-6)
     for got, expected in zip(packed_parts, grads_path_b, strict=True):
         np.testing.assert_allclose(_np(got), _np(expected), rtol=2e-3, atol=2e-4)
+
+
+def test_m2rnn_packed_path_c_k16_bfloat16_status_matches_callable() -> None:
+    inputs = _make_m2rnn_inputs(seq=4, k_dim=16, v_dim=4, dtype=mx.bfloat16)
+    q, k, v, W, xf, h0 = inputs
+    conv_input = mx.concatenate(
+        [
+            q.reshape(q.shape[0], q.shape[1], -1),
+            k.reshape(k.shape[0], k.shape[1], -1),
+            v.reshape(v.shape[0], v.shape[1], -1),
+        ],
+        axis=-1,
+    )
+    status = m2rnn_packed_path_c_status(
+        conv_input,
+        W,
+        xf,
+        h0,
+        require_backward=False,
+    )
+    assert (
+        m2rnn_path_c._packed_path_c_inputs_eligible(conv_input, W, xf, h0)
+        is status.available
+    )
+
+    if not status.available:
+        assert (
+            m2rnn_path_c._m2rnn_packed_fwd_path_c_full(conv_input, W, xf, h0)
+            is None
+        )
+        with pytest.raises(
+            RuntimeError,
+            match="m2rnn_apply_packed_with_state_path_c unavailable",
+        ):
+            m2rnn_apply_packed_with_state_path_c(conv_input, W, xf, h0)
+        return
+
+    full = m2rnn_path_c._m2rnn_packed_fwd_path_c_full(conv_input, W, xf, h0)
+    assert full is not None
+    y_full, h_full, _tanh_cache = full
+    y_call, h_call = m2rnn_apply_packed_with_state_path_c(conv_input, W, xf, h0)
+    y_ref, h_ref = m2rnn_reference(q, k, v, W, xf, h0=h0)
+    mx.eval(y_full, h_full, y_call, h_call, y_ref, h_ref)
+    assert y_call.dtype == mx.bfloat16
+    assert h_call.dtype == mx.bfloat16
+    np.testing.assert_allclose(_np(y_full), _np(y_call), rtol=0.0, atol=0.0)
+    np.testing.assert_allclose(_np(h_full), _np(h_call), rtol=0.0, atol=0.0)
+    np.testing.assert_allclose(_np(y_call), _np(y_ref), rtol=3e-2, atol=3e-2)
+    np.testing.assert_allclose(_np(h_call), _np(h_ref), rtol=3e-2, atol=3e-2)
 
 
 def test_m2rnn_path_c_forward_backward_use_tvm_ffi_not_mx_fast(

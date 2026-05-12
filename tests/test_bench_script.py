@@ -6,6 +6,8 @@ import sys
 from types import SimpleNamespace
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "bench_tiny.py"
@@ -303,6 +305,72 @@ def test_minimal_real_benchmark_reports_core_metrics() -> None:
     assert memory["after_measured_steps"]["measured"] is True
     assert memory["wired_limit"]["mode"] == "off"
     assert memory["wired_limit"]["applied"] is False
+
+
+def test_hybrid_r_path_c_benchmark_startup_uses_explicit_m2rnn_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mlx.core as mx
+
+    from cppmega_mlx.nn._tilelang import m2rnn_path_c
+    from scripts import bench_tiny
+
+    seen: list[dict[str, tuple[int, ...]]] = []
+
+    monkeypatch.setenv("CPPMEGA_KERNEL_PATH", "path_c")
+    monkeypatch.setattr(
+        m2rnn_path_c,
+        "m2rnn_packed_path_c_status",
+        lambda *_args, **_kwargs: m2rnn_path_c.M2RNNPathCStatus(True, "forced available"),
+    )
+
+    def fake_path_c(
+        conv_input: mx.array,
+        W: mx.array,
+        xf: mx.array,
+        h0: mx.array,
+    ) -> tuple[mx.array, mx.array]:
+        batch, seq, _conv_dim = conv_input.shape
+        heads, _v_in, v_dim = W.shape
+        seen.append(
+            {
+                "W": tuple(W.shape),
+                "xf": tuple(xf.shape),
+                "h0": tuple(h0.shape),
+            }
+        )
+        return mx.zeros((batch, seq, heads, v_dim), dtype=conv_input.dtype), h0
+
+    monkeypatch.setattr(
+        m2rnn_path_c,
+        "m2rnn_apply_packed_with_state_path_c",
+        fake_path_c,
+    )
+
+    payload = bench_tiny.run_benchmark(
+        bench_tiny.BenchConfig(
+            batch_size=1,
+            seq_len=4,
+            vocab_size=32,
+            d_model=8,
+            n_heads=1,
+            n_layers=1,
+            mlp_dim=16,
+            dtype="float32",
+            warmup_steps=0,
+            steps=1,
+            compile=False,
+            model_route="hybrid-r",
+            include_structure=True,
+        )
+    )
+
+    assert payload["status"] == "ok"
+    assert payload["model_route"] == "hybrid-r"
+    assert seen
+    assert {item["W"] for item in seen} == {(1, 8, 8)}
+    assert {item["xf"] for item in seen} == {(1, 3, 1)}
+    assert {item["h0"] for item in seen} == {(1, 1, 8, 8)}
 
 
 def test_compiled_project_tiny_path_if_available() -> None:

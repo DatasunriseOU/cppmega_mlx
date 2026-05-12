@@ -504,6 +504,31 @@ class M2RNNMixer(nn.Module):
     def _empty_conv_state(self, batch: int, dtype: mx.Dtype) -> mx.array:
         return mx.zeros((batch, self.config.conv_kernel - 1, self.conv_dim), dtype=dtype)
 
+    def _path_c_recurrence_heads(self) -> int:
+        cfg = self.config
+        head_counts = (
+            cfg.num_q_heads,
+            cfg.num_k_heads,
+            cfg.num_v_heads,
+            cfg.num_f_heads,
+            cfg.num_g_heads,
+            cfg.num_weight_heads,
+        )
+        if len(set(head_counts)) != 1:
+            raise RuntimeError(
+                "m2rnn: Path C requires pre-aligned q/k/v/W/xf/g head counts; "
+                "refusing to broadcast or repeat tensors implicitly"
+            )
+        return head_counts[0]
+
+    def initial_h0(self, batch: int, dtype: mx.Dtype) -> mx.array:
+        _require_positive_int("batch", batch)
+        heads = self._path_c_recurrence_heads()
+        return mx.zeros(
+            (batch, heads, self.config.k_head_dim, self.config.v_head_dim),
+            dtype=dtype,
+        )
+
     def _validate_conv_state(
         self,
         conv_state: mx.array,
@@ -583,6 +608,17 @@ class M2RNNMixer(nn.Module):
             raise ValueError("pass either h0 or mixer_state, not both")
 
         cfg = self.config
+        from cppmega_mlx.runtime.kernel_policy import KernelPath, record_dispatch, selected_path
+
+        path = selected_path("m2rnn")
+        if path is KernelPath.PATH_C:
+            self._path_c_recurrence_heads()
+            if h0 is None and mixer_state is None:
+                raise RuntimeError(
+                    "m2rnn: Path C requires an existing h0 tensor; "
+                    "refusing to allocate initial state implicitly"
+                )
+
         projected = self.in_proj(hidden_states)
         conv_end = self.conv_dim
         f_end = conv_end + self.f_dim
@@ -631,35 +667,16 @@ class M2RNNMixer(nn.Module):
         xf = m2rnn_softplus_decay_gate(projected[:, :, conv_end:f_end], self.A_log, self.dt_bias)
         g = projected[:, :, f_end:].reshape(batch, seq, cfg.num_g_heads, cfg.v_head_dim)
 
-        from cppmega_mlx.runtime.kernel_policy import KernelPath, record_dispatch, selected_path
-
-        path = selected_path("m2rnn")
         if path is KernelPath.PATH_C:
             from cppmega_mlx.nn._tilelang.m2rnn_path_c import (
                 m2rnn_apply_packed_with_state_path_c,
+                m2rnn_packed_path_c_status,
             )
 
-            head_counts = (
-                cfg.num_q_heads,
-                cfg.num_k_heads,
-                cfg.num_v_heads,
-                cfg.num_f_heads,
-                cfg.num_weight_heads,
-            )
-            if len(set(head_counts)) != 1:
-                raise RuntimeError(
-                    "m2rnn: Path C requires pre-aligned q/k/v/W/xf head counts; "
-                    "refusing to broadcast or repeat tensors implicitly"
-                )
-            if scan_h0 is None:
-                raise RuntimeError(
-                    "m2rnn: Path C requires an existing h0 tensor; "
-                    "refusing to allocate initial state implicitly"
-                )
             h0_full = _initial_m2rnn_state(
                 scan_h0,
                 batch=batch,
-                heads=cfg.num_heads,
+                heads=cfg.num_q_heads,
                 k_dim=cfg.k_head_dim,
                 v_dim=cfg.v_head_dim,
                 dtype=conv_input.dtype,
@@ -669,6 +686,16 @@ class M2RNNMixer(nn.Module):
                 if self.state_weight.dtype == conv_input.dtype
                 else self.state_weight.astype(conv_input.dtype)
             )
+            status = m2rnn_packed_path_c_status(
+                conv_input,
+                state_weight,
+                xf,
+                h0_full,
+            )
+            if not status.available:
+                raise RuntimeError(
+                    f"m2rnn: Path C packed kernel unavailable ({status.reason})"
+                )
             out, h = m2rnn_apply_packed_with_state_path_c(
                 conv_input,
                 state_weight,

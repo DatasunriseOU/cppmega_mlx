@@ -430,6 +430,8 @@ def hybrid_config_from_bench(config: BenchConfig) -> Any:
         m2rnn_v_head_dim=m2rnn_v_head_dim,
         m2rnn_num_v_heads=1,
         m2rnn_num_f_heads=1,
+        m2rnn_num_g_heads=1,
+        m2rnn_num_weight_heads=1,
         m2rnn_chunk_size=min(max(config.seq_len, 1), 8),
     )
 

@@ -93,6 +93,7 @@ class HybridTinyConfig:
     m2rnn_num_k_heads: int = 1
     m2rnn_num_v_heads: int = 2
     m2rnn_num_f_heads: int = 2
+    m2rnn_num_g_heads: int = 4
     m2rnn_num_weight_heads: int = 1
     m2rnn_conv_kernel: int = 4
     m2rnn_chunk_size: int = 8
@@ -183,6 +184,7 @@ class HybridTinyConfig:
             num_k_heads=self.m2rnn_num_k_heads,
             num_v_heads=self.m2rnn_num_v_heads,
             num_f_heads=self.m2rnn_num_f_heads,
+            num_g_heads=self.m2rnn_num_g_heads,
             num_weight_heads=self.m2rnn_num_weight_heads,
             conv_kernel=self.m2rnn_conv_kernel,
             chunk_size=self.m2rnn_chunk_size,
@@ -389,7 +391,14 @@ class HybridTinyBlock(nn.Module):
         elif self.backend == "moe":
             delta = cast(ReferenceMoE, self.block)(x).output
         elif self.backend == "m2rnn":
-            delta, _ = cast(M2RNNMixer, self.block)(x)
+            m2rnn = cast(M2RNNMixer, self.block)
+            if selected_path("m2rnn") is KernelPath.PATH_C:
+                delta, _ = m2rnn(
+                    x,
+                    h0=m2rnn.initial_h0(x.shape[0], x.dtype),
+                )
+            else:
+                delta, _ = m2rnn(x)
         else:  # pragma: no cover - self.backend is fixed during construction.
             raise ValueError(f"unsupported hybrid backend {self.backend!r}")
         return delta
