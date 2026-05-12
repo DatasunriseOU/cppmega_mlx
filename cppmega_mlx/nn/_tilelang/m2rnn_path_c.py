@@ -34,6 +34,14 @@ def _threads_for(lanes: int) -> int:
     return min(32, lanes)
 
 
+def _threadgroup_threads_for(*lanes: int) -> int:
+    target = max(1, *lanes)
+    threads = 1
+    while threads < target:
+        threads <<= 1
+    return min(256, threads)
+
+
 def _tl_dtype_for(dtype: mx.Dtype) -> str | None:
     if dtype == mx.float32:
         return "float32"
@@ -88,6 +96,8 @@ _PACKED_BWD_OUTPUT_NAMES = (
     "h_steps_scratch",
 )
 _PACKED_BWD_OUTPUT_IDX = (6, 7, 8, 9, 10)
+_PACKED_FWD_K_PARALLEL_MIN_K = 16
+_PACKED_BWD_K_PARALLEL_MIN_K = 16
 
 M2RNNFwdOwnerOutputs = tuple[mx.array, mx.array, mx.array]
 M2RNNBwdOwnerOutputs = tuple[
@@ -583,6 +593,127 @@ def _bwd_kernel_for(
 
 
 @lru_cache(maxsize=128)
+def _packed_fwd_k_parallel_kernel_for(
+    batch: int,
+    seq: int,
+    heads: int,
+    k_dim: int,
+    v_dim: int,
+    carrier_dtype: str,
+    *,
+    return_msl: bool = False,
+) -> tuple[Any, _msl_transform.TileLangMSLLowering]:
+    import tilelang.language as T
+
+    del return_msl
+    conv_dim = heads * (2 * k_dim + v_dim)
+    k_offset = heads * k_dim
+    v_offset = k_offset + heads * k_dim
+    groups = batch * heads
+    threads = _threadgroup_threads_for(k_dim, v_dim)
+    if threads < k_dim or threads < v_dim:
+        raise MSLDispatchUnsupported(
+            f"packed M2RNN k-parallel Path C needs one thread per K/V lane; "
+            f"got K={k_dim}, V={v_dim}, threads={threads}"
+        )
+    accum_dtype = "float32"
+
+    @T.prim_func
+    def fwd(
+        conv_input: T.Tensor((batch, seq, conv_dim), carrier_dtype),
+        W: T.Tensor((heads, v_dim, v_dim), carrier_dtype),
+        xf: T.Tensor((batch, seq, heads), carrier_dtype),
+        h0: T.Tensor((batch, heads, k_dim, v_dim), carrier_dtype),
+        h_last: T.Tensor((batch, heads, k_dim, v_dim), carrier_dtype),
+        tanh_cache: T.Tensor((batch, seq, heads, k_dim, v_dim), carrier_dtype),
+        y: T.Tensor((batch, seq, heads, v_dim), carrier_dtype),
+    ):
+        with T.Kernel(groups, threads=threads) as group_id:
+            tid = T.get_thread_binding(0)
+            h = group_id % heads
+            b = group_id // heads
+            q_head_offset = h * k_dim
+            k_head_offset = k_offset + h * k_dim
+            v_head_offset = v_offset + h * v_dim
+            h_row = T.alloc_local((v_dim,), accum_dtype)
+            h_next = T.alloc_local((v_dim,), accum_dtype)
+            w_shared = T.alloc_shared((v_dim, v_dim), accum_dtype, scope="shared")
+            y_shared = T.alloc_shared((k_dim, v_dim), accum_dtype, scope="shared")
+
+            for i in T.serial(tid, v_dim * v_dim, step=threads):
+                w_shared[i // v_dim, i % v_dim] = T.cast(
+                    W[h, i // v_dim, i % v_dim],
+                    accum_dtype,
+                )
+            T.sync_threads()
+
+            if tid < k_dim:
+                for vv in T.serial(v_dim):
+                    h_row[vv] = T.cast(h0[b, h, tid, vv], accum_dtype)
+
+            for t in T.serial(seq):
+                if tid < k_dim:
+                    f_val = T.cast(xf[b, t, h], accum_dtype)
+                    one_minus_f = 1.0 - f_val
+                    k_val = T.cast(
+                        conv_input[b, t, k_head_offset + tid],
+                        accum_dtype,
+                    )
+                    q_val = T.cast(
+                        conv_input[b, t, q_head_offset + tid],
+                        accum_dtype,
+                    )
+                    for vv in T.serial(v_dim):
+                        acc = T.alloc_local((1,), accum_dtype)
+                        acc[0] = 0.0
+                        for v0 in T.serial(v_dim):
+                            acc[0] = acc[0] + h_row[v0] * w_shared[v0, vv]
+                        z = acc[0] + k_val * T.cast(
+                            conv_input[b, t, v_head_offset + vv],
+                            accum_dtype,
+                        )
+                        tz = T.tanh(z)
+                        tanh_cache[b, t, h, tid, vv] = T.cast(tz, carrier_dtype)
+                        h_new = f_val * h_row[vv] + one_minus_f * tz
+                        h_next[vv] = h_new
+                        y_shared[tid, vv] = q_val * h_new
+                    for vv in T.serial(v_dim):
+                        h_row[vv] = h_next[vv]
+                T.sync_threads()
+
+                if tid < v_dim:
+                    y_acc = T.alloc_local((1,), accum_dtype)
+                    y_acc[0] = 0.0
+                    for kk in T.serial(k_dim):
+                        y_acc[0] = y_acc[0] + y_shared[kk, tid]
+                    y[b, t, h, tid] = T.cast(y_acc[0], carrier_dtype)
+                T.sync_threads()
+
+            if tid < k_dim:
+                for vv in T.serial(v_dim):
+                    h_last[b, h, tid, vv] = T.cast(h_row[vv], carrier_dtype)
+
+    lowering = dispatch_lower(fwd, target="metal", return_msl=True)
+    input_names = [
+        name for name in lowering.buffer_param_names if name not in _FWD_OUTPUT_NAMES
+    ]
+    if set(input_names) != {"conv_input", "W", "xf", "h0"}:
+        raise MSLDispatchUnsupported(
+            "unexpected packed M2RNN Path C k-parallel buffer signature: "
+            + ", ".join(lowering.buffer_param_names)
+        )
+    import tilelang
+
+    kernel = tilelang.compile(
+        fwd,
+        target=_msl_transform._as_metal_target("metal"),
+        execution_backend="tvm_ffi",
+        out_idx=list(_PACKED_FWD_OUTPUT_IDX),
+    )
+    return kernel, lowering
+
+
+@lru_cache(maxsize=128)
 def _packed_fwd_kernel_for(
     batch: int,
     seq: int,
@@ -593,6 +724,17 @@ def _packed_fwd_kernel_for(
     *,
     return_msl: bool = False,
 ) -> tuple[Any, _msl_transform.TileLangMSLLowering]:
+    if k_dim >= _PACKED_FWD_K_PARALLEL_MIN_K and max(k_dim, v_dim) <= 256:
+        return _packed_fwd_k_parallel_kernel_for(
+            batch,
+            seq,
+            heads,
+            k_dim,
+            v_dim,
+            carrier_dtype,
+            return_msl=return_msl,
+        )
+
     import tilelang.language as T
 
     del return_msl
@@ -699,6 +841,214 @@ def _packed_fwd_kernel_for(
 
 
 @lru_cache(maxsize=128)
+def _packed_bwd_k_parallel_kernel_for(
+    batch: int,
+    seq: int,
+    heads: int,
+    k_dim: int,
+    v_dim: int,
+    carrier_dtype: str,
+    *,
+    return_msl: bool = False,
+) -> tuple[Any, _msl_transform.TileLangMSLLowering]:
+    import tilelang.language as T
+
+    del return_msl
+    conv_dim = heads * (2 * k_dim + v_dim)
+    k_offset = heads * k_dim
+    v_offset = k_offset + heads * k_dim
+    groups = batch * heads
+    threads = _threadgroup_threads_for(k_dim, v_dim)
+    if threads < k_dim or threads < v_dim:
+        raise MSLDispatchUnsupported(
+            f"packed M2RNN k-parallel bwd Path C needs one thread per K/V lane; "
+            f"got K={k_dim}, V={v_dim}, threads={threads}"
+        )
+    accum_dtype = "float32"
+
+    @T.prim_func
+    def bwd(
+        dy: T.Tensor((batch, seq, heads, v_dim), carrier_dtype),
+        conv_input: T.Tensor((batch, seq, conv_dim), carrier_dtype),
+        W: T.Tensor((heads, v_dim, v_dim), carrier_dtype),
+        xf: T.Tensor((batch, seq, heads), carrier_dtype),
+        h0: T.Tensor((batch, heads, k_dim, v_dim), carrier_dtype),
+        tanh_cache: T.Tensor((batch, seq, heads, k_dim, v_dim), carrier_dtype),
+        dconv_input: T.Tensor((batch, seq, conv_dim), carrier_dtype),
+        dW_partial: T.Tensor((batch, heads, v_dim, v_dim), carrier_dtype),
+        dxf: T.Tensor((batch, seq, heads), carrier_dtype),
+        dh0: T.Tensor((batch, heads, k_dim, v_dim), carrier_dtype),
+        h_steps_scratch: T.Tensor((batch, heads, seq, k_dim, v_dim), carrier_dtype),
+    ):
+        with T.Kernel(groups, threads=threads) as group_id:
+            tid = T.get_thread_binding(0)
+            h = group_id % heads
+            b = group_id // heads
+            q_head_offset = h * k_dim
+            k_head_offset = k_offset + h * k_dim
+            v_head_offset = v_offset + h * v_dim
+            h_row = T.alloc_local((v_dim,), accum_dtype)
+            dh_row = T.alloc_local((v_dim,), accum_dtype)
+            dz_row = T.alloc_local((v_dim,), accum_dtype)
+            dh_next_row = T.alloc_local((v_dim,), accum_dtype)
+            w_shared = T.alloc_shared((v_dim, v_dim), accum_dtype, scope="shared")
+            dz_shared = T.alloc_shared((k_dim, v_dim), accum_dtype, scope="shared")
+            h_prev_shared = T.alloc_shared((k_dim, v_dim), accum_dtype, scope="shared")
+            dxf_partial = T.alloc_shared((k_dim,), accum_dtype, scope="shared")
+            dW_shared = T.alloc_shared((v_dim, v_dim), accum_dtype, scope="shared")
+
+            for i in T.serial(tid, v_dim * v_dim, step=threads):
+                w_shared[i // v_dim, i % v_dim] = T.cast(
+                    W[h, i // v_dim, i % v_dim],
+                    accum_dtype,
+                )
+                dW_shared[i // v_dim, i % v_dim] = 0.0
+            T.sync_threads()
+
+            if tid < k_dim:
+                for vv in T.serial(v_dim):
+                    h_row[vv] = T.cast(h0[b, h, tid, vv], accum_dtype)
+                    dh_row[vv] = 0.0
+
+            for t in T.serial(seq):
+                if tid < k_dim:
+                    f_val = T.cast(xf[b, t, h], accum_dtype)
+                    one_minus_f = 1.0 - f_val
+                    for vv in T.serial(v_dim):
+                        h_steps_scratch[b, h, t, tid, vv] = T.cast(
+                            h_row[vv],
+                            carrier_dtype,
+                        )
+                        tz = T.cast(tanh_cache[b, t, h, tid, vv], accum_dtype)
+                        h_row[vv] = f_val * h_row[vv] + one_minus_f * tz
+            T.sync_threads()
+
+            for r in T.serial(seq):
+                t = seq - 1 - r
+                f_val = T.cast(xf[b, t, h], accum_dtype)
+                one_minus_f = 1.0 - f_val
+
+                if tid < k_dim:
+                    q_val = T.cast(
+                        conv_input[b, t, q_head_offset + tid],
+                        accum_dtype,
+                    )
+                    dq_acc = T.alloc_local((1,), accum_dtype)
+                    dq_acc[0] = 0.0
+                    df_kk = T.alloc_local((1,), accum_dtype)
+                    df_kk[0] = 0.0
+                    for vv in T.serial(v_dim):
+                        dY = T.cast(dy[b, t, h, vv], accum_dtype)
+                        h_prev = T.cast(
+                            h_steps_scratch[b, h, t, tid, vv],
+                            accum_dtype,
+                        )
+                        tz = T.cast(
+                            tanh_cache[b, t, h, tid, vv],
+                            accum_dtype,
+                        )
+                        h_t = f_val * h_prev + one_minus_f * tz
+                        dq_acc[0] = dq_acc[0] + dY * h_t
+                        dh_row[vv] = dh_row[vv] + q_val * dY
+                        df_kk[0] = df_kk[0] + dh_row[vv] * (h_prev - tz)
+                        dz_val = one_minus_f * dh_row[vv] * (1.0 - tz * tz)
+                        dz_row[vv] = dz_val
+                        dz_shared[tid, vv] = dz_val
+                        h_prev_shared[tid, vv] = h_prev
+                    dconv_input[b, t, q_head_offset + tid] = T.cast(
+                        dq_acc[0],
+                        carrier_dtype,
+                    )
+                    dxf_partial[tid] = df_kk[0]
+
+                    dk_acc = T.alloc_local((1,), accum_dtype)
+                    dk_acc[0] = 0.0
+                    for vv in T.serial(v_dim):
+                        dk_acc[0] = dk_acc[0] + dz_row[vv] * T.cast(
+                            conv_input[b, t, v_head_offset + vv],
+                            accum_dtype,
+                        )
+                    dconv_input[b, t, k_head_offset + tid] = T.cast(
+                        dk_acc[0],
+                        carrier_dtype,
+                    )
+                T.sync_threads()
+
+                if tid == 0:
+                    df_total = T.alloc_local((1,), accum_dtype)
+                    df_total[0] = 0.0
+                    for kk in T.serial(k_dim):
+                        df_total[0] = df_total[0] + dxf_partial[kk]
+                    dxf[b, t, h] = T.cast(df_total[0], carrier_dtype)
+
+                if tid < v_dim:
+                    dv_acc = T.alloc_local((1,), accum_dtype)
+                    dv_acc[0] = 0.0
+                    for kk in T.serial(k_dim):
+                        dv_acc[0] = dv_acc[0] + dz_shared[kk, tid] * T.cast(
+                            conv_input[b, t, k_head_offset + kk],
+                            accum_dtype,
+                        )
+                    dconv_input[b, t, v_head_offset + tid] = T.cast(
+                        dv_acc[0],
+                        carrier_dtype,
+                    )
+
+                for pair in T.serial(tid, v_dim * v_dim, step=threads):
+                    v0 = pair // v_dim
+                    vv = pair % v_dim
+                    w_acc = T.alloc_local((1,), accum_dtype)
+                    w_acc[0] = 0.0
+                    for kk in T.serial(k_dim):
+                        w_acc[0] = (
+                            w_acc[0] + h_prev_shared[kk, v0] * dz_shared[kk, vv]
+                        )
+                    dW_shared[v0, vv] = dW_shared[v0, vv] + w_acc[0]
+                T.sync_threads()
+
+                if tid < k_dim:
+                    for v_in in T.serial(v_dim):
+                        acc = T.alloc_local((1,), accum_dtype)
+                        acc[0] = f_val * dh_row[v_in]
+                        for v_out in T.serial(v_dim):
+                            acc[0] = acc[0] + dz_row[v_out] * w_shared[v_in, v_out]
+                        dh_next_row[v_in] = acc[0]
+                    for vv in T.serial(v_dim):
+                        dh_row[vv] = dh_next_row[vv]
+                T.sync_threads()
+
+            if tid < k_dim:
+                for vv in T.serial(v_dim):
+                    dh0[b, h, tid, vv] = T.cast(dh_row[vv], carrier_dtype)
+            for i in T.serial(tid, v_dim * v_dim, step=threads):
+                dW_partial[b, h, i // v_dim, i % v_dim] = T.cast(
+                    dW_shared[i // v_dim, i % v_dim],
+                    carrier_dtype,
+                )
+
+    lowering = dispatch_lower(bwd, target="metal", return_msl=True)
+    input_names = [
+        name
+        for name in lowering.buffer_param_names
+        if name not in _PACKED_BWD_OUTPUT_NAMES
+    ]
+    if set(input_names) != {"dy", "conv_input", "W", "xf", "h0", "tanh_cache"}:
+        raise MSLDispatchUnsupported(
+            "unexpected packed M2RNN Path C bwd buffer signature: "
+            + ", ".join(lowering.buffer_param_names)
+        )
+    import tilelang
+
+    kernel = tilelang.compile(
+        bwd,
+        target=_msl_transform._as_metal_target("metal"),
+        execution_backend="tvm_ffi",
+        out_idx=list(_PACKED_BWD_OUTPUT_IDX),
+    )
+    return kernel, lowering
+
+
+@lru_cache(maxsize=128)
 def _packed_bwd_kernel_for(
     batch: int,
     seq: int,
@@ -709,6 +1059,17 @@ def _packed_bwd_kernel_for(
     *,
     return_msl: bool = False,
 ) -> tuple[Any, _msl_transform.TileLangMSLLowering]:
+    if k_dim >= _PACKED_BWD_K_PARALLEL_MIN_K and max(k_dim, v_dim) <= 256:
+        return _packed_bwd_k_parallel_kernel_for(
+            batch,
+            seq,
+            heads,
+            k_dim,
+            v_dim,
+            carrier_dtype,
+            return_msl=return_msl,
+        )
+
     import tilelang.language as T
 
     del return_msl
@@ -814,9 +1175,7 @@ def _packed_bwd_kernel_for(
                             )
                             dh_kv = dh[kk, vv]
                             df_acc[0] = df_acc[0] + dh_kv * (h_prev - tz)
-                            dz[kk, vv] = (
-                                one_minus_f * dh_kv * (1.0 - tz * tz)
-                            )
+                            dz[kk, vv] = one_minus_f * dh_kv * (1.0 - tz * tz)
                     dxf[b, t, h] = T.cast(df_acc[0], carrier_dtype)
 
                     for kk in T.serial(k_dim):

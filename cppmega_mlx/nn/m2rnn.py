@@ -637,12 +637,8 @@ class M2RNNMixer(nn.Module):
         if path is KernelPath.PATH_C:
             from cppmega_mlx.nn._tilelang.m2rnn_path_c import (
                 m2rnn_apply_packed_with_state_path_c,
-                m2rnn_path_c_status,
             )
 
-            status = m2rnn_path_c_status()
-            if not status.available:
-                raise RuntimeError(f"m2rnn: Path C kernel unavailable ({status.reason})")
             head_counts = (
                 cfg.num_q_heads,
                 cfg.num_k_heads,
@@ -668,9 +664,14 @@ class M2RNNMixer(nn.Module):
                 v_dim=cfg.v_head_dim,
                 dtype=conv_input.dtype,
             )
+            state_weight = (
+                self.state_weight
+                if self.state_weight.dtype == conv_input.dtype
+                else self.state_weight.astype(conv_input.dtype)
+            )
             out, h = m2rnn_apply_packed_with_state_path_c(
                 conv_input,
-                self.state_weight.astype(conv_input.dtype),
+                state_weight,
                 xf,
                 h0_full,
             )

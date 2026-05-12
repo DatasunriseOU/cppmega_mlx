@@ -27,6 +27,7 @@ from cppmega_mlx.nn._tilelang.m2rnn_path_c import (
     m2rnn_apply_with_state_path_c_or_fallback,
     m2rnn_bwd_path_c,
     m2rnn_fwd_with_state_path_c,
+    m2rnn_packed_bwd_path_c,
     m2rnn_path_c_status,
 )
 
@@ -87,6 +88,24 @@ def test_m2rnn_path_c_launch_geometry_comes_from_tilelang_lowering() -> None:
     assert bwd_lowering.grid == (1, 1, 1)
     assert bwd_lowering.threadgroup == (2, 1, 1)
     assert _msl_transform.metal_grid_for_lowering(bwd_lowering) == (2, 1, 1)
+
+
+def test_m2rnn_packed_path_c_large_k_uses_k_parallel_lowering() -> None:
+    _require_m2rnn_path_c()
+
+    _fwd_kernel, fwd_lowering = m2rnn_path_c._packed_fwd_kernel_for(
+        1, 4, 2, 16, 4, "float32"
+    )
+    assert fwd_lowering.grid == (2, 1, 1)
+    assert fwd_lowering.threadgroup == (16, 1, 1)
+    assert _msl_transform.metal_grid_for_lowering(fwd_lowering) == (32, 1, 1)
+
+    _bwd_kernel, bwd_lowering = m2rnn_path_c._packed_bwd_kernel_for(
+        1, 4, 2, 16, 4, "float32"
+    )
+    assert bwd_lowering.grid == (2, 1, 1)
+    assert bwd_lowering.threadgroup == (16, 1, 1)
+    assert _msl_transform.metal_grid_for_lowering(bwd_lowering) == (32, 1, 1)
 
 
 def test_m2rnn_apply_path_c_fails_closed_instead_of_path_b(
@@ -235,6 +254,65 @@ def test_m2rnn_packed_path_c_matches_unpacked_forward_and_grad() -> None:
     np.testing.assert_allclose(_np(dW_p), _np(dW_u), rtol=2e-3, atol=2e-4)
     np.testing.assert_allclose(_np(dxf_p), _np(dxf_u), rtol=2e-3, atol=2e-4)
     np.testing.assert_allclose(_np(dh0_p), _np(dh0_u), rtol=2e-3, atol=2e-4)
+
+
+def test_m2rnn_packed_path_c_k_parallel_matches_path_b_backward() -> None:
+    _require_m2rnn_path_c()
+    if not m2rnn_metal_status().available:
+        pytest.skip("m2rnn Metal Path B is not available on this host")
+
+    inputs = _make_m2rnn_inputs(seq=4, k_dim=16, v_dim=4, dtype=mx.float32)
+    q, k, v, W, xf, h0 = inputs
+    conv_input = mx.concatenate(
+        [
+            q.reshape(q.shape[0], q.shape[1], -1),
+            k.reshape(k.shape[0], k.shape[1], -1),
+            v.reshape(v.shape[0], v.shape[1], -1),
+        ],
+        axis=-1,
+    )
+    mx.random.seed(13)
+    dy = (mx.random.normal((1, 4, 2, 4)) * 0.1).astype(mx.float32)
+
+    packed_full = m2rnn_path_c._m2rnn_packed_fwd_path_c_full(
+        conv_input,
+        W,
+        xf,
+        h0,
+    )
+    assert packed_full is not None
+    y_packed, h_packed, tanh_packed = packed_full
+    y_path_b, h_path_b, tanh_path_b = m2rnn_fwd_metal(*inputs)
+    grads_packed = m2rnn_packed_bwd_path_c(
+        dy,
+        conv_input,
+        W,
+        xf,
+        tanh_packed,
+        h0,
+    )
+    grads_path_b = m2rnn_bwd_metal(dy, q, k, v, W, xf, tanh_path_b, h0)
+    mx.eval(y_packed, h_packed, y_path_b, h_path_b, *grads_packed, *grads_path_b)
+
+    dconv, dW_packed, dxf_packed, dh0_packed = grads_packed
+    dq_packed = dconv[:, :, : q.shape[2] * q.shape[3]].reshape(q.shape)
+    dk_start = q.shape[2] * q.shape[3]
+    dk_stop = dk_start + k.shape[2] * k.shape[3]
+    dk_packed = dconv[:, :, dk_start:dk_stop].reshape(k.shape)
+    dv_packed = dconv[:, :, dk_stop:].reshape(v.shape)
+    packed_parts = (
+        dq_packed,
+        dk_packed,
+        dv_packed,
+        dW_packed,
+        dxf_packed,
+        dh0_packed,
+    )
+
+    np.testing.assert_allclose(_np(y_packed), _np(y_path_b), rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(_np(h_packed), _np(h_path_b), rtol=1e-6, atol=1e-6)
+    for got, expected in zip(packed_parts, grads_path_b, strict=True):
+        np.testing.assert_allclose(_np(got), _np(expected), rtol=2e-3, atol=2e-4)
 
 
 def test_m2rnn_path_c_forward_backward_use_tvm_ffi_not_mx_fast(
