@@ -222,6 +222,80 @@ def test_path_c_dispatch_accepts_explicit_initial_h0(
     assert matches[-1]["kernel_used"] == "path_c_tilelang_dsl_packed"
 
 
+def test_path_c_transform_dlpack_boundary_falls_back_to_path_b(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cppmega_mlx.nn._tilelang import m2rnn as m2rnn_path_b
+    from cppmega_mlx.nn._tilelang import m2rnn_path_c
+
+    def fail_inside_mlx_transform(*_args: object, **_kwargs: object) -> tuple[mx.array, mx.array]:
+        raise RuntimeError(
+            "MLX array import failed: [eval] Attempting to eval an array during "
+            "function transformations like compile or vmap is not allowed."
+        )
+
+    def fake_path_b(
+        q: mx.array,
+        _k: mx.array,
+        v: mx.array,
+        _W: mx.array,
+        _xf: mx.array,
+        h0: mx.array,
+    ) -> tuple[mx.array, mx.array]:
+        batch, seq, heads, _k_dim = q.shape
+        return mx.zeros((batch, seq, heads, v.shape[-1]), dtype=q.dtype), h0
+
+    monkeypatch.setattr(
+        m2rnn_path_c,
+        "m2rnn_packed_path_c_status",
+        lambda *_args, **_kwargs: m2rnn_path_c.M2RNNPathCStatus(
+            True,
+            "forced packed available",
+        ),
+    )
+    monkeypatch.setattr(
+        m2rnn_path_c,
+        "m2rnn_apply_packed_with_state_path_c",
+        fail_inside_mlx_transform,
+    )
+    monkeypatch.setattr(
+        m2rnn_path_b,
+        "m2rnn_metal_status",
+        lambda *_args, **_kwargs: m2rnn_path_b.M2RNNMetalStatus(
+            True,
+            "forced Metal available",
+        ),
+    )
+    monkeypatch.setattr(m2rnn_path_b, "m2rnn_apply_with_state", fake_path_b)
+    monkeypatch.setenv("CPPMEGA_KERNEL_PATH", "path_c")
+
+    cfg = M2RNNConfig(
+        d_model=16,
+        k_head_dim=4,
+        v_head_dim=4,
+        num_q_heads=2,
+        num_k_heads=2,
+        num_v_heads=2,
+        num_f_heads=2,
+        num_g_heads=2,
+        num_weight_heads=2,
+        conv_kernel=1,
+        chunk_size=8,
+    )
+    mx.random.seed(19)
+    block = M2RNNMixer(cfg)
+    hidden = mx.random.normal((1, 4, cfg.d_model), dtype=mx.float32) * 0.1
+    h0 = block.initial_h0(hidden.shape[0], hidden.dtype)
+
+    out, h = block(hidden, h0=h0)
+    mx.eval(out, h)
+    assert out.shape == hidden.shape
+    assert h.shape == h0.shape
+    matches = [e for e in get_dispatch_log() if e["op_name"] == "m2rnn"]
+    assert matches[-1]["path"] == "path_c"
+    assert matches[-1]["kernel_used"] == "path_c_mlx_transform_boundary_path_b"
+
+
 def test_path_c_dispatch_checks_packed_status_before_callable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -400,6 +400,16 @@ def _dispatch_m2rnn_scan(
     return chunked_m2rnn_scan(q, k, v, W, xf, h0=h0, chunk_size=chunk_size)
 
 
+def _is_mlx_transform_dlpack_boundary_error(exc: Exception) -> bool:
+    """Return whether Path C tried to export DLPack while MLX is tracing."""
+
+    message = str(exc)
+    return (
+        "MLX array import failed" in message
+        and "Attempting to eval an array during function transformations" in message
+    )
+
+
 def chunked_m2rnn_scan(
     q: mx.array,
     k: mx.array,
@@ -696,19 +706,68 @@ class M2RNNMixer(nn.Module):
                 raise RuntimeError(
                     f"m2rnn: Path C packed kernel unavailable ({status.reason})"
                 )
-            out, h = m2rnn_apply_packed_with_state_path_c(
-                conv_input,
-                state_weight,
-                xf,
-                h0_full,
-            )
-            record_dispatch("m2rnn", path, "path_c_tilelang_dsl_packed")
-            v = conv_input[:, :, k_end:v_end].reshape(
-                batch,
-                seq,
-                cfg.num_v_heads,
-                cfg.v_head_dim,
-            )
+            try:
+                out, h = m2rnn_apply_packed_with_state_path_c(
+                    conv_input,
+                    state_weight,
+                    xf,
+                    h0_full,
+                )
+            except Exception as exc:
+                if not _is_mlx_transform_dlpack_boundary_error(exc):
+                    raise
+                q = conv_input[:, :, :q_end].reshape(batch, seq, cfg.num_q_heads, cfg.k_head_dim)
+                k = conv_input[:, :, q_end:k_end].reshape(
+                    batch,
+                    seq,
+                    cfg.num_k_heads,
+                    cfg.k_head_dim,
+                )
+                v = conv_input[:, :, k_end:v_end].reshape(
+                    batch,
+                    seq,
+                    cfg.num_v_heads,
+                    cfg.v_head_dim,
+                )
+                from cppmega_mlx.nn._tilelang.m2rnn import (
+                    m2rnn_apply_with_state,
+                    m2rnn_metal_status,
+                )
+
+                q_b, k_b, v_b, W_b, xf_b = broadcast_m2rnn_heads(q, k, v, state_weight, xf)
+                batch_b, _seq_b, heads_b, k_dim_b = q_b.shape
+                h0_b = _initial_m2rnn_state(
+                    scan_h0,
+                    batch=batch_b,
+                    heads=heads_b,
+                    k_dim=k_dim_b,
+                    v_dim=v_b.shape[-1],
+                    dtype=q_b.dtype,
+                )
+                path_b_status = m2rnn_metal_status(q_b)
+                if path_b_status.available:
+                    out, h = m2rnn_apply_with_state(q_b, k_b, v_b, W_b, xf_b, h0_b)
+                    fallback_kernel = "path_c_mlx_transform_boundary_path_b"
+                else:
+                    out, h = chunked_m2rnn_scan(
+                        q_b,
+                        k_b,
+                        v_b,
+                        W_b,
+                        xf_b,
+                        h0=h0_b,
+                        chunk_size=cfg.chunk_size if chunk_size is None else chunk_size,
+                    )
+                    fallback_kernel = "path_c_mlx_transform_boundary_reference"
+                record_dispatch("m2rnn", path, fallback_kernel)
+            else:
+                record_dispatch("m2rnn", path, "path_c_tilelang_dsl_packed")
+                v = conv_input[:, :, k_end:v_end].reshape(
+                    batch,
+                    seq,
+                    cfg.num_v_heads,
+                    cfg.v_head_dim,
+                )
         else:
             q = conv_input[:, :, :q_end].reshape(batch, seq, cfg.num_q_heads, cfg.k_head_dim)
             k = conv_input[:, :, q_end:k_end].reshape(batch, seq, cfg.num_k_heads, cfg.k_head_dim)
