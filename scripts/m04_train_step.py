@@ -994,8 +994,10 @@ def matrix_case_payload(
         dtype_route = "int8"
         if optimizer_name in {"muon", "muon_adamw"}:
             cli_optimizer = "int8"
-        elif optimizer_name in {"adam8bit", "lion8bit"}:
-            cli_optimizer = optimizer_name
+        elif optimizer_name in {"adamw", "adam8bit"}:
+            cli_optimizer = "adam8bit"
+        elif optimizer_name in {"lion", "lion8bit"}:
+            cli_optimizer = "lion8bit"
         else:
             unsupported_reason = (
                 "int8 is an optimizer-state precision route; use "
@@ -1172,8 +1174,8 @@ def m04_20step_matrix_payload() -> dict[str, Any]:
             "the requested dtype route; fp8_path_c uses a bf16 carrier plus "
             "Path C policy overrides for prepared-buffer ops.",
             "int8 is optimizer-state precision, so the model dtype remains "
-            "bfloat16 and only MuonAdamWInt8 (via muon or muon_adamw), "
-            "Adam8bit, and Lion8bit are listed as supported int8 commands.",
+            "bfloat16. Logical adamw/lion int8 rows map to Adam8bit/Lion8bit, "
+            "and muon/muon_adamw int8 rows map to MuonAdamWInt8.",
             "These 20-step receipts are regression evidence only; the M0.4 "
             "acceptance gate still requires the 100-step bf16 AdamW "
             "grad-checkpoint target-parquet receipt.",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -38,6 +39,8 @@ from scripts.m04_train_step import (
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "m04_train_step.py"
 PYTHON = ROOT / ".venv" / "bin" / "python"
+LOCAL_MLX_PYTHON = Path("/Volumes/external/sources/mlx/python")
+LOCAL_MLX_LIB = LOCAL_MLX_PYTHON / "mlx" / "lib"
 BASELINE_RECEIPT = ROOT / "bench" / "baselines" / "m04_train_step.json"
 GB10_SAMPLE = (
     ROOT
@@ -57,6 +60,19 @@ REAL_PARQUET_COLUMNS = (
     "token_sibling_index",
     "token_ast_node_type",
 )
+
+
+def strip_known_tvm_stderr_noise(stderr: str) -> str:
+    lines = [
+        line
+        for line in stderr.splitlines()
+        if not (
+            "arm_aprofile.cc:125: Warning: Cannot parse Arm(R)-based target features"
+            in line
+            and "without LLVM support" in line
+        )
+    ]
+    return "\n".join(lines) + ("\n" if lines else "")
 
 
 def canonical_allocation_probe(**overrides: Any) -> dict[str, Any]:
@@ -90,13 +106,32 @@ def test_m04_import_preserves_recipes_package_exports() -> None:
 
 
 def run_script(*args: str, timeout: int = 60) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+    env = dict(os.environ)
+    pythonpath = [str(ROOT)]
+    if LOCAL_MLX_PYTHON.exists():
+        pythonpath.insert(0, str(LOCAL_MLX_PYTHON))
+    if env.get("PYTHONPATH"):
+        pythonpath.append(env["PYTHONPATH"])
+    env["PYTHONPATH"] = os.pathsep.join(pythonpath)
+    if LOCAL_MLX_LIB.exists():
+        dyld_path = [str(LOCAL_MLX_LIB)]
+        if env.get("DYLD_LIBRARY_PATH"):
+            dyld_path.append(env["DYLD_LIBRARY_PATH"])
+        env["DYLD_LIBRARY_PATH"] = os.pathsep.join(dyld_path)
+    result = subprocess.run(
         [str(PYTHON if PYTHON.exists() else sys.executable), str(SCRIPT), *args],
         cwd=ROOT,
+        env=env,
         text=True,
         capture_output=True,
         timeout=timeout,
         check=False,
+    )
+    return subprocess.CompletedProcess(
+        args=result.args,
+        returncode=result.returncode,
+        stdout=result.stdout,
+        stderr=strip_known_tvm_stderr_noise(result.stderr),
     )
 
 
@@ -456,10 +491,10 @@ def assert_m04_20step_matrix_plan(payload: dict[str, Any]) -> None:
     ]
     cases = {case["case_id"]: case for case in matrix["cases"]}
     assert len(cases) == 18
-    assert len(matrix["real_20step_commands"]) == 16
-    assert len(matrix["real_100step_commands"]) == 16
-    assert len(matrix["dry_run_commands"]) == 16
-    assert len(matrix["smoke_commands"]) == 16
+    assert len(matrix["real_20step_commands"]) == 18
+    assert len(matrix["real_100step_commands"]) == 18
+    assert len(matrix["dry_run_commands"]) == 18
+    assert len(matrix["smoke_commands"]) == 18
     assert cases["bf16_adamw_20step"]["supported"] is True
     assert "--dtype bfloat16" in cases["bf16_adamw_20step"]["command"]
     assert "--optimizer adamw" in cases["bf16_adamw_20step"]["command"]
@@ -486,11 +521,12 @@ def assert_m04_20step_matrix_plan(payload: dict[str, Any]) -> None:
     assert "--optimizer int8" in cases["int8_muon_adamw_20step"]["command"]
     assert cases["int8_adam8bit_20step"]["supported"] is True
     assert cases["int8_lion8bit_20step"]["supported"] is True
-    assert cases["int8_adamw_20step"]["supported"] is False
-    assert cases["int8_lion_20step"]["supported"] is False
-    assert "optimizer-state precision" in cases["int8_adamw_20step"][
-        "unsupported_reason"
-    ]
+    assert cases["int8_adamw_20step"]["supported"] is True
+    assert "--dtype bfloat16" in cases["int8_adamw_20step"]["command"]
+    assert "--optimizer adam8bit" in cases["int8_adamw_20step"]["command"]
+    assert cases["int8_lion_20step"]["supported"] is True
+    assert "--dtype bfloat16" in cases["int8_lion_20step"]["command"]
+    assert "--optimizer lion8bit" in cases["int8_lion_20step"]["command"]
 
 
 def _receipt_args_for_regression_report(
