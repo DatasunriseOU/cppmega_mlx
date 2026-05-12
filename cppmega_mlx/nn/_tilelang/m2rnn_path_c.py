@@ -1444,6 +1444,10 @@ def _m2rnn_fwd_path_c_full(
         return None
 
     del lowering
+    if out is None:
+        h_last, tanh_cache, y = kernel(q, k, v, W, xf, h0)
+        return y, h_last, tanh_cache
+
     y, h_last, tanh_cache = _m2rnn_fwd_owner_outputs(
         out,
         batch=batch,
@@ -1552,6 +1556,20 @@ def _m2rnn_bwd_path_c_kernel(
         return None
 
     del lowering
+    if out is None:
+        dW_partial, dh0, dk, dq, dv, dxf, _scratch = kernel(
+            dy,
+            q,
+            k,
+            v,
+            W,
+            xf,
+            h0,
+            tanh_cache,
+        )
+        dW = mx.sum(dW_partial, axis=0)
+        return dq, dk, dv, dW, dxf, dh0
+
     (
         dq,
         dk,
@@ -1672,6 +1690,10 @@ def _m2rnn_packed_fwd_path_c_full(
         return None
 
     del lowering
+    if out is None:
+        h_last, tanh_cache, y = kernel(conv_input, W, xf, h0)
+        return y, h_last, tanh_cache
+
     y, h_last, tanh_cache = _m2rnn_fwd_owner_outputs(
         out,
         batch=batch,
@@ -1746,6 +1768,18 @@ def _m2rnn_packed_bwd_path_c_kernel(
         return None
 
     del lowering
+    if out is None:
+        dconv_input, dW_partial, dxf, dh0, _scratch = kernel(
+            dy,
+            conv_input,
+            W,
+            xf,
+            h0,
+            tanh_cache,
+        )
+        dW = mx.sum(dW_partial, axis=0)
+        return dconv_input, dW, dxf, dh0
+
     (
         dconv_input,
         dW_partial,

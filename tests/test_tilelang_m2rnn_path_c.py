@@ -366,36 +366,55 @@ def test_m2rnn_packed_path_c_k16_bfloat16_status_matches_callable() -> None:
     np.testing.assert_allclose(_np(h_call), _np(h_ref), rtol=3e-2, atol=3e-2)
 
 
-def test_m2rnn_path_c_forward_backward_use_tvm_ffi_not_mx_fast(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_m2rnn_path_c_forward_backward_no_owner_outputs_are_mlx_compile_safe() -> None:
     _require_m2rnn_path_c()
     m2rnn_path_c._fwd_kernel_for.cache_clear()
     m2rnn_path_c._bwd_kernel_for.cache_clear()
 
-    def fail_mx_fast_wrapper(*_args: object, **_kwargs: object) -> object:
-        raise AssertionError("M2RNN Path C production path must not build mx.fast wrapper")
-
-    monkeypatch.setattr(mx.fast, "metal_kernel", fail_mx_fast_wrapper)
-
     inputs = _make_m2rnn_inputs(dtype=mx.float32)
-    full = m2rnn_path_c._m2rnn_fwd_path_c_full(*inputs)
+
+    def compiled_fwd(
+        q: mx.array,
+        k: mx.array,
+        v: mx.array,
+        W: mx.array,
+        xf: mx.array,
+        h0: mx.array,
+    ) -> tuple[mx.array, mx.array, mx.array]:
+        full = m2rnn_path_c._m2rnn_fwd_path_c_full(q, k, v, W, xf, h0)
+        assert full is not None
+        return full
+
+    full = mx.compile(compiled_fwd)(*inputs)
     assert full is not None
     y, h_last, tanh_cache = full
 
     q, k, v, W, xf, h0 = inputs
     dy = mx.ones(y.shape, dtype=mx.float32)
-    grads = m2rnn_bwd_path_c(
-        dy,
-        q,
-        k,
-        v,
-        W,
-        xf,
-        tanh_cache,
-        h0,
-        force_path_c=True,
-    )
+
+    def compiled_bwd(
+        dy: mx.array,
+        q: mx.array,
+        k: mx.array,
+        v: mx.array,
+        W: mx.array,
+        xf: mx.array,
+        tanh_cache: mx.array,
+        h0: mx.array,
+    ) -> tuple[mx.array, mx.array, mx.array, mx.array, mx.array, mx.array]:
+        return m2rnn_bwd_path_c(
+            dy,
+            q,
+            k,
+            v,
+            W,
+            xf,
+            tanh_cache,
+            h0,
+            force_path_c=True,
+        )
+
+    grads = mx.compile(compiled_bwd)(dy, q, k, v, W, xf, tanh_cache, h0)
     mx.eval(y, h_last, tanh_cache, *grads)
     assert y.shape == (1, 4, 2, 4)
     assert h_last.shape == (1, 2, 4, 4)

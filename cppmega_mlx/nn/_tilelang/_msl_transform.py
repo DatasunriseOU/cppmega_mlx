@@ -897,6 +897,47 @@ def _canonicalize_tilelang_builtin_aliases(body: str) -> str:
     return body
 
 
+def _rewrite_bfloat_cstyle_casts(code: str) -> str:
+    """Rewrite TileLang C-style bf16 casts after Metal namespace canonicalization.
+
+    TileLang emits casts like ``((bfloat)expr)``. After we map ``bfloat`` to
+    ``metal::bfloat``, that becomes ``((metal::bfloat)expr)``, which Apple's
+    MSL frontend rejects in C-style cast position. MLX's Metal prelude exposes
+    ``bfloat``/``bfloat16_t`` in the global namespace, so convert only the
+    balanced outer cast expression to ``static_cast<bfloat>(expr)``.
+    """
+
+    needles = ("((metal::bfloat)", "((bfloat)")
+    out: list[str] = []
+    i = 0
+    n = len(code)
+    while i < n:
+        needle = next((candidate for candidate in needles if code.startswith(candidate, i)), None)
+        if needle is None:
+            out.append(code[i])
+            i += 1
+            continue
+        expr_start = i + len(needle)
+        depth = 1
+        j = expr_start
+        while j < n:
+            ch = code[j]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        if depth != 0:
+            out.append(code[i])
+            i += 1
+            continue
+        out.append(f"static_cast<bfloat>({code[expr_start:j]})")
+        i = j + 1
+    return "".join(out)
+
+
 def _canonicalize_metal_surface(body: str) -> str:
     """Normalize small TileLang-MSL surface differences for MLX inline MSL."""
 
@@ -920,6 +961,7 @@ def _canonicalize_metal_surface(body: str) -> str:
         )
         code = re.sub(r"(?<![:\w])bfloat\b", "metal::bfloat", code)
         code = re.sub(r"(?<![:\w])half4\b", "metal::half4", code)
+        code = _rewrite_bfloat_cstyle_casts(code)
         code = re.sub(
             r"\(\s*float\s*\*\s*\)\s*smem\b",
             "static_cast<threadgroup float*>(smem)",
