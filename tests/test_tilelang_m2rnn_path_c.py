@@ -38,7 +38,7 @@ def _np(x: mx.array) -> np.ndarray:
     if x.dtype == mx.bfloat16:
         x = x.astype(mx.float32)
     mx.eval(x)
-    return np.asarray(x)
+    return np.array(x, copy=True)
 
 
 def _make_m2rnn_inputs(
@@ -108,6 +108,24 @@ def test_m2rnn_packed_path_c_large_k_uses_k_parallel_lowering() -> None:
     assert bwd_lowering.grid == (2, 1, 1)
     assert bwd_lowering.threadgroup == (16, 1, 1)
     assert _msl_transform.metal_grid_for_lowering(bwd_lowering) == (32, 1, 1)
+
+
+def test_m2rnn_packed_path_c_small_k_uses_k_parallel_lowering() -> None:
+    _require_m2rnn_path_c()
+
+    _fwd_kernel, fwd_lowering = m2rnn_path_c._packed_fwd_kernel_for(
+        1, 4, 2, 4, 4, "float32"
+    )
+    assert fwd_lowering.grid == (2, 1, 1)
+    assert fwd_lowering.threadgroup == (4, 1, 1)
+    assert _msl_transform.metal_grid_for_lowering(fwd_lowering) == (8, 1, 1)
+
+    _bwd_kernel, bwd_lowering = m2rnn_path_c._packed_bwd_kernel_for(
+        1, 4, 2, 4, 4, "float32"
+    )
+    assert bwd_lowering.grid == (2, 1, 1)
+    assert bwd_lowering.threadgroup == (4, 1, 1)
+    assert _msl_transform.metal_grid_for_lowering(bwd_lowering) == (8, 1, 1)
 
 
 def test_m2rnn_apply_path_c_fails_closed_instead_of_path_b(

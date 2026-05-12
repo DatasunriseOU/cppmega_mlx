@@ -98,8 +98,8 @@ _PACKED_BWD_OUTPUT_NAMES = (
     "h_steps_scratch",
 )
 _PACKED_BWD_OUTPUT_IDX = (6, 7, 8, 9, 10)
-_PACKED_FWD_K_PARALLEL_MIN_K = 16
-_PACKED_BWD_K_PARALLEL_MIN_K = 16
+_PACKED_FWD_K_PARALLEL_MIN_K = 4
+_PACKED_BWD_K_PARALLEL_MIN_K = 4
 
 M2RNNFwdOwnerOutputs = tuple[mx.array, mx.array, mx.array]
 M2RNNBwdOwnerOutputs = tuple[

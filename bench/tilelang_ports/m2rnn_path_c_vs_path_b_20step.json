@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "scope": "local_only",
+  "kernel": "m2rnn_full_hybrid_r_train",
+  "hardware_label": "M4 Max local",
+  "workload": {
+    "profile": "hybrid-smoke",
+    "route": "m2rnn",
+    "model_route": "hybrid-r",
+    "batch_size": 2,
+    "seq_len": 64,
+    "dtype": "bfloat16",
+    "compile": true,
+    "warmup_steps": 2,
+    "measured_steps": 20,
+    "tokens_per_step": 128,
+    "data_contract": "synthetic_tokens"
+  },
+  "results": [
+    {
+      "path": "path_b",
+      "kernel_used": "metal_kernel_fwd_v1",
+      "tokens_per_second": 129382.75128422497,
+      "mean_step_ms": 0.9893127076793461,
+      "median_step_ms": 0.9652710286900401,
+      "compile_time_s": 0.1551910419948399
+    },
+    {
+      "path": "path_c",
+      "kernel_used": "path_c_tilelang_dsl_packed",
+      "scheduler": "serial_packed_before_k_parallel_threshold_fix",
+      "tokens_per_second": 25961.985865299168,
+      "mean_step_ms": 4.930285405134782,
+      "median_step_ms": 4.864290996920317,
+      "compile_time_s": 4.640729499980807
+    },
+    {
+      "path": "path_c",
+      "kernel_used": "path_c_tilelang_dsl_packed",
+      "scheduler": "k_parallel_k4",
+      "tokens_per_second": 126674.93,
+      "mean_step_ms": 1.0105,
+      "median_step_ms": 1.0372,
+      "compile_time_s": 3.9039
+    }
+  ],
+  "speed": {
+    "path_c_k_parallel_vs_path_b_tokens_per_second_ratio": 0.9790712347313265,
+    "path_c_k_parallel_mean_step_slowdown_percent": 2.141615218708076
+  },
+  "matched_run_guard": "Compare only rows with identical workload, software stack, hardware label, warmup, and measured step counts."
+}
