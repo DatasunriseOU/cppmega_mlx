@@ -7,49 +7,47 @@
     "machine": "arm64",
     "platform": "macOS-26.4.1-arm64-arm-64bit-Mach-O",
     "python": "3.13.12",
-    "mlx": "0.31.2",
+    "mlx": "0.32.0",
     "torch": "2.13.0.dev20260503"
   },
   "env_contract": {
     "MAKEFLAGS": null,
     "CMAKE_BUILD_PARALLEL_LEVEL": null,
-    "PYTHONPATH": null,
-    "TVM_LIBRARY_PATH": "/private/tmp/tl_pr_c/build/lib:/private/tmp/tl_pr_c/build/tvm",
-    "DYLD_LIBRARY_PATH": "/private/tmp/tl_pr_c/build/lib:/private/tmp/tl_pr_c/build/tvm",
-    "TILELANG_DEV_BUILD_ROOT": "/private/tmp/tl_pr_c/build",
-    "TVM_HOME": "/private/tmp/tl_pr_c/3rdparty/tvm",
-    "TVM_SOURCE_DIR": "/private/tmp/tl_pr_c/3rdparty/tvm",
+    "PYTHONPATH": "/private/tmp/tl_apache_tvm_swap/3rdparty/tvm/3rdparty/tvm-ffi/python",
+    "TVM_LIBRARY_PATH": "/private/tmp/tl_apache_tvm_swap/build/lib:/private/tmp/tl_apache_tvm_swap/build/tvm",
+    "DYLD_LIBRARY_PATH": "/private/tmp/tl_apache_tvm_swap/build/lib:/private/tmp/tl_apache_tvm_swap/build/tvm",
+    "TILELANG_DEV_BUILD_ROOT": "/private/tmp/tl_apache_tvm_swap/build",
+    "TVM_HOME": "/private/tmp/tl_apache_tvm_swap/3rdparty/tvm",
+    "TVM_SOURCE_DIR": "/private/tmp/tl_apache_tvm_swap/3rdparty/tvm",
     "selected_python_paths": [
-      "/private/tmp/tl_pr_c",
-      "/private/tmp/tl_pr_c/3rdparty/tvm/python",
-      "/private/tmp/cppmega-mlx-tilelang-stack-c/3rdparty/tvm/3rdparty/tvm-ffi/python",
-      "/private/tmp/tl_pr_c/3rdparty/tvm/3rdparty/tvm-ffi/python",
-      "/private/tmp/tl_pr_c/3rdparty/tvm/python",
-      "/private/tmp/tl_pr_c/3rdparty/tvm/3rdparty/tvm-ffi/python"
+      "/private/tmp/tl_apache_tvm_swap",
+      "/private/tmp/tl_apache_tvm_swap/3rdparty/tvm/python",
+      "/private/tmp/tl_apache_tvm_swap/3rdparty/tvm/3rdparty/tvm-ffi/python",
+      "/private/tmp/tl_apache_tvm_swap/3rdparty/tvm/python",
+      "/private/tmp/tl_apache_tvm_swap/3rdparty/tvm/3rdparty/tvm-ffi/python"
     ],
     "selected_library_paths": [
-      "/private/tmp/tl_pr_c/build/lib",
-      "/private/tmp/tl_pr_c/build/tvm"
+      "/private/tmp/tl_apache_tvm_swap/build/lib",
+      "/private/tmp/tl_apache_tvm_swap/build/tvm"
     ]
   },
   "module_origins": {
     "tilelang": {
       "importable": true,
-      "file": "/private/tmp/tl_pr_c/tilelang/__init__.py",
-      "version": "0.1.9+gitcab1a7db"
+      "file": "/private/tmp/tl_apache_tvm_swap/tilelang/__init__.py",
+      "version": "0.1.9+gite23ca8fb"
     },
     "tvm": {
       "importable": true,
-      "file": "/private/tmp/tl_pr_c/3rdparty/tvm/python/tvm/__init__.py",
-      "version": "0.23.dev0"
+      "file": "/private/tmp/tl_apache_tvm_swap/3rdparty/tvm/python/tvm/__init__.py",
+      "version": "0.25.dev0"
     },
     "tvm_ffi": {
       "importable": true,
-      "file": "/private/tmp/cppmega-mlx-tilelang-stack-c/3rdparty/tvm/3rdparty/tvm-ffi/python/tvm_ffi/__init__.py",
-      "version": "0.0.0.dev0"
+      "file": "/private/tmp/tl_apache_tvm_swap/3rdparty/tvm/3rdparty/tvm-ffi/python/tvm_ffi/__init__.py",
+      "version": "0.1.12.dev0+g3c35034fd.d20260509"
     },
     "removed_import_finders": [
-      "_tilelang_editable.ScikitBuildRedirectingFinder",
       "_apache_tvm_ffi_editable.ScikitBuildRedirectingFinder"
     ]
   },
@@ -60,45 +58,45 @@
       "head": {
         "ok": true,
         "returncode": 0,
-        "stdout": "8d385c882c0cbf3e4e1a148330b66a1f5fdc5048",
+        "stdout": "3144c6226a30817cfcb8a7b11c85512a06c4689a",
         "stderr": ""
       },
       "status_short": {
         "ok": true,
         "returncode": 0,
-        "stdout": "M bench/tilelang_ports/fp8_path_c_vs_path_b.json\n M cppmega_mlx/nn/_tilelang/_engine_dispatch.py\n M cppmega_mlx/nn/_tilelang/fp8_vecmat_path_c.py\n?? loop_vectorize.o",
+        "stdout": "",
         "stderr": ""
       }
     },
     "tilelang": {
-      "path": "/private/tmp/tl_pr_c",
+      "path": "/private/tmp/tl_apache_tvm_swap",
       "exists": true,
       "head": {
         "ok": true,
         "returncode": 0,
-        "stdout": "cab1a7db0f9ef07a00048811b51aff477b518361",
+        "stdout": "e23ca8fb753da7e28bbdcaac282d985f73521f9c",
         "stderr": ""
       },
       "status_short": {
         "ok": true,
         "returncode": 0,
-        "stdout": "m 3rdparty/tvm\n M CMakeLists.txt\n M src/op/builtin.cc\n M src/target/codegen_cuda.cc\n M src/target/codegen_metal.cc\n M src/target/codegen_metal.h\n M src/transform/lower_access_ptr.cc\n M testing/python/cpu/test_fp8_scaled_matmul_lowering.py\n M testing/python/metal/test_fp8_scaled_matmul_metal.py\n M testing/python/metal/test_metal_internal_scaffolding.py\n M tilelang/engine/lower.py\n M tilelang/engine/phase.py\n M tilelang/env.py\n M tilelang/intrinsics/tcgen05_macro_generator.py\n M tilelang/language/__init__.py\n M tilelang/language/ast/_ffi_api.py\n M tilelang/language/ast/ir.py\n M tilelang/language/eager/builder.py\n M tilelang/language/fp8_op.py\n M tilelang/language/parser/entry.py\n M tilelang/language/parser/operation.py\n M tilelang/language/tir/ir.py\n M tilelang/language/tir/op.py\n M tilelang/tileop/gemm/gemm_metal.py\n M tilelang/tileop/metal_quant.py\n?? CMakeLists.txt.bak\n?? CMakeLists.txt.bak2\n?? src/runtime/tilelang_logging_impl.cc",
+        "stdout": "?? RFC_upstream_tvm_migration.md",
         "stderr": ""
       }
     },
     "tvm": {
-      "path": "/private/tmp/tl_pr_c/3rdparty/tvm",
+      "path": "/private/tmp/tl_apache_tvm_swap/3rdparty/tvm",
       "exists": true,
       "head": {
         "ok": true,
         "returncode": 0,
-        "stdout": "0e15b274bce8b46f971abf5ac390e844aa6acee5",
+        "stdout": "c747da46f3a2b1cebad944a97240002333717926",
         "stderr": ""
       },
       "status_short": {
         "ok": true,
         "returncode": 0,
-        "stdout": "M src/target/source/codegen_metal.cc\n M src/target/source/codegen_metal.h\n M src/target/source/intrin_rule_metal.cc",
+        "stdout": "",
         "stderr": ""
       }
     }
@@ -114,6 +112,552 @@
     "requires_path_b_and_path_c": true
   },
   "results": [
+    {
+      "shape_name": "matmul_128",
+      "shape": {
+        "kind": "matmul",
+        "M": 128,
+        "N": 128,
+        "K": 128,
+        "BM": 16,
+        "BN": 16,
+        "BK": 16,
+        "num_stages": 0
+      },
+      "parity_required": true,
+      "rows": [
+        {
+          "label": "path_b_msl_fp8_scaled_matmul",
+          "bench": {
+            "label": "path_b_msl_fp8_scaled_matmul",
+            "ok": true,
+            "median_ms": 0.16733346274122596,
+            "min_ms": 0.1426249509677291,
+            "p90_ms": 0.21520897280424833,
+            "max_ms": 0.2821669913828373,
+            "tflops": 0.0250655423684521,
+            "calls_per_s": 5976.090995896363,
+            "tokens_per_s": 764939.6474747345,
+            "warmup": 5,
+            "iters": 20,
+            "paired": true,
+            "error": null,
+            "sample_ms": [
+              0.19120797514915466,
+              0.18312502652406693,
+              0.2821669913828373,
+              0.19912503194063902,
+              0.2095840172842145,
+              0.17245800700038671,
+              0.222250004298985,
+              0.16654201317578554,
+              0.15720806550234556,
+              0.16195792704820633,
+              0.21520897280424833,
+              0.16812491230666637,
+              0.1582079567015171,
+              0.15316600911319256,
+              0.16908394172787666,
+              0.1625420991331339,
+              0.1450410345569253,
+              0.15041697770357132,
+              0.1426249509677291,
+              0.16262498684227467
+            ],
+            "sample_ms_by_step": {
+              "0": 0.19120797514915466,
+              "1": 0.18312502652406693,
+              "2": 0.2821669913828373,
+              "3": 0.19912503194063902,
+              "4": 0.2095840172842145,
+              "5": 0.17245800700038671,
+              "6": 0.222250004298985,
+              "7": 0.16654201317578554,
+              "8": 0.15720806550234556,
+              "9": 0.16195792704820633,
+              "10": 0.21520897280424833,
+              "11": 0.16812491230666637,
+              "12": 0.1582079567015171,
+              "13": 0.15316600911319256,
+              "14": 0.16908394172787666,
+              "15": 0.1625420991331339,
+              "16": 0.1450410345569253,
+              "17": 0.15041697770357132,
+              "18": 0.1426249509677291,
+              "19": 0.16262498684227467
+            }
+          },
+          "parity_vs_torch_cpu_dequant": {
+            "max_abs": 0.0,
+            "max_rel": 0.0
+          }
+        },
+        {
+          "label": "matmul_tl_fp8_scaled_matmul",
+          "variant": "T.fp8_scaled_matmul",
+          "source_metrics": {
+            "source_len": 20332,
+            "markers": {
+              "simdgroup_multiply_accumulate": 0,
+              "simdgroup_load": 0,
+              "simdgroup_store": 0,
+              "threadgroup_half": 0,
+              "threadgroup_uchar": 0,
+              "threadgroup_barrier": 2,
+              "fp8_e4m3_decode_helper": 1,
+              "fp8_e5m2_decode_helper": 0,
+              "A_scale_loads": 1,
+              "B_scale_loads": 1,
+              "scalar_float_a_val": 0,
+              "scalar_float_b_val": 0,
+              "tvm_thread_allreduce": 0,
+              "simd_sum": 2,
+              "kernel_void": 1,
+              "packed_uint_loads": 1,
+              "fp8_e4m3_lut": 9,
+              "metal_fp8_dot4_packed": 10,
+              "metal_fp8_dot4_words": 10,
+              "metal_fp8_dot4_helper": 20
+            }
+          },
+          "xcrun_compile": {
+            "skipped": true,
+            "reason": "--skip-xcrun"
+          },
+          "paired_ratios": {
+            "matmul_tl_fp8_scaled_matmul_over_path_b_msl_fp8_scaled_matmul_paired_median": 0.8686767939657484,
+            "matmul_tl_fp8_scaled_matmul_over_path_b_msl_fp8_scaled_matmul_paired_p90": 1.047147305805168,
+            "matmul_tl_fp8_scaled_matmul_over_path_b_msl_fp8_scaled_matmul_paired_p99": 3.2482187475168414,
+            "matmul_tl_fp8_scaled_matmul_over_path_b_msl_fp8_scaled_matmul_paired_max": 3.2482187475168414
+          },
+          "paired_ratio_samples": {
+            "matmul_tl_fp8_scaled_matmul_over_path_b_msl_fp8_scaled_matmul": [
+              0.7385099460323027,
+              0.9378836539879671,
+              0.4388644918961827,
+              0.7254639219255983,
+              0.838765814611126,
+              0.8634969687519196,
+              0.6674193722425021,
+              0.9314469255584255,
+              0.8868252312080728,
+              0.9127865854710439,
+              0.7413350744415732,
+              0.8738566191795771,
+              1.047147305805168,
+              1.0250310484416494,
+              0.6880193057104694,
+              0.8246544613837588,
+              3.2482187475168414,
+              0.8545646063067693,
+              1.0534616888369401,
+              0.890343021665958
+            ]
+          },
+          "worst_paired_steps": {
+            "matmul_tl_fp8_scaled_matmul_over_path_b_msl_fp8_scaled_matmul": [
+              {
+                "step": 16.0,
+                "ratio": 3.2482187475168414,
+                "path_c_ms": 0.4711250076070428,
+                "path_b_ms": 0.1450410345569253
+              },
+              {
+                "step": 18.0,
+                "ratio": 1.0534616888369401,
+                "path_c_ms": 0.15024992171674967,
+                "path_b_ms": 0.1426249509677291
+              },
+              {
+                "step": 12.0,
+                "ratio": 1.047147305805168,
+                "path_c_ms": 0.1656670356169343,
+                "path_b_ms": 0.1582079567015171
+              },
+              {
+                "step": 13.0,
+                "ratio": 1.0250310484416494,
+                "path_c_ms": 0.156999914906919,
+                "path_b_ms": 0.15316600911319256
+              },
+              {
+                "step": 1.0,
+                "ratio": 0.9378836539879671,
+                "path_c_ms": 0.1717499690130353,
+                "path_b_ms": 0.18312502652406693
+              },
+              {
+                "step": 7.0,
+                "ratio": 0.9314469255584255,
+                "path_c_ms": 0.15512504614889622,
+                "path_b_ms": 0.16654201317578554
+              },
+              {
+                "step": 9.0,
+                "ratio": 0.9127865854710439,
+                "path_c_ms": 0.14783302322030067,
+                "path_b_ms": 0.16195792704820633
+              },
+              {
+                "step": 19.0,
+                "ratio": 0.890343021665958,
+                "path_c_ms": 0.14479202218353748,
+                "path_b_ms": 0.16262498684227467
+              },
+              {
+                "step": 8.0,
+                "ratio": 0.8868252312080728,
+                "path_c_ms": 0.13941607903689146,
+                "path_b_ms": 0.15720806550234556
+              },
+              {
+                "step": 11.0,
+                "ratio": 0.8738566191795771,
+                "path_c_ms": 0.14691706746816635,
+                "path_b_ms": 0.16812491230666637
+              }
+            ]
+          },
+          "bench": {
+            "label": "matmul_tl_fp8_scaled_matmul",
+            "ok": true,
+            "median_ms": 0.14808349078521132,
+            "min_ms": 0.11633301619440317,
+            "p90_ms": 0.1717499690130353,
+            "max_ms": 0.4711250076070428,
+            "tflops": 0.028323913609543793,
+            "calls_per_s": 6752.947237382839,
+            "tokens_per_s": 864377.2463850034,
+            "warmup": 5,
+            "iters": 20,
+            "paired": true,
+            "error": null,
+            "sample_ms": [
+              0.14120899140834808,
+              0.1717499690130353,
+              0.12383307330310345,
+              0.144458026625216,
+              0.17579190898686647,
+              0.14891696628183126,
+              0.14833395835012197,
+              0.15512504614889622,
+              0.13941607903689146,
+              0.14783302322030067,
+              0.15954195987433195,
+              0.14691706746816635,
+              0.1656670356169343,
+              0.156999914906919,
+              0.11633301619440317,
+              0.13404106721282005,
+              0.4711250076070428,
+              0.12854102533310652,
+              0.15024992171674967,
+              0.14479202218353748
+            ],
+            "sample_ms_by_step": {
+              "0": 0.14120899140834808,
+              "1": 0.1717499690130353,
+              "2": 0.12383307330310345,
+              "3": 0.144458026625216,
+              "4": 0.17579190898686647,
+              "5": 0.14891696628183126,
+              "6": 0.14833395835012197,
+              "7": 0.15512504614889622,
+              "8": 0.13941607903689146,
+              "9": 0.14783302322030067,
+              "10": 0.15954195987433195,
+              "11": 0.14691706746816635,
+              "12": 0.1656670356169343,
+              "13": 0.156999914906919,
+              "14": 0.11633301619440317,
+              "15": 0.13404106721282005,
+              "16": 0.4711250076070428,
+              "17": 0.12854102533310652,
+              "18": 0.15024992171674967,
+              "19": 0.14479202218353748
+            }
+          },
+          "parity_vs_path_b_msl": {
+            "max_abs": 0.0,
+            "max_rel": 0.0
+          },
+          "parity_vs_torch_cpu_dequant": {
+            "max_abs": 0.0,
+            "max_rel": 0.0
+          }
+        }
+      ],
+      "ratios": {
+        "matmul_tl_fp8_scaled_matmul_over_path_b": 0.8686767939657484
+      }
+    },
+    {
+      "shape_name": "matmul_512",
+      "shape": {
+        "kind": "matmul",
+        "M": 512,
+        "N": 512,
+        "K": 512,
+        "BM": 32,
+        "BN": 32,
+        "BK": 32,
+        "num_stages": 0
+      },
+      "parity_required": false,
+      "rows": [
+        {
+          "label": "path_b_msl_fp8_scaled_matmul",
+          "bench": {
+            "label": "path_b_msl_fp8_scaled_matmul",
+            "ok": true,
+            "median_ms": 0.569937052205205,
+            "min_ms": 0.5154999671503901,
+            "p90_ms": 0.6296249339357018,
+            "max_ms": 0.6693750619888306,
+            "tflops": 0.47099141029937847,
+            "calls_per_s": 1754.5797314471695,
+            "tokens_per_s": 898344.8225009508,
+            "warmup": 5,
+            "iters": 20,
+            "paired": true,
+            "error": null,
+            "sample_ms": [
+              0.6005410104990005,
+              0.6296249339357018,
+              0.5731669953092933,
+              0.6335419602692127,
+              0.6693750619888306,
+              0.5682080518454313,
+              0.5622919416055083,
+              0.5789999850094318,
+              0.5568340420722961,
+              0.5716660525649786,
+              0.5566669860854745,
+              0.5575839895755053,
+              0.5602079909294844,
+              0.5173339741304517,
+              0.5154999671503901,
+              0.6203330121934414,
+              0.5752079887315631,
+              0.5435830680653453,
+              0.5985000170767307,
+              0.5535420496016741
+            ],
+            "sample_ms_by_step": {
+              "0": 0.6005410104990005,
+              "1": 0.6296249339357018,
+              "2": 0.5731669953092933,
+              "3": 0.6335419602692127,
+              "4": 0.6693750619888306,
+              "5": 0.5682080518454313,
+              "6": 0.5622919416055083,
+              "7": 0.5789999850094318,
+              "8": 0.5568340420722961,
+              "9": 0.5716660525649786,
+              "10": 0.5566669860854745,
+              "11": 0.5575839895755053,
+              "12": 0.5602079909294844,
+              "13": 0.5173339741304517,
+              "14": 0.5154999671503901,
+              "15": 0.6203330121934414,
+              "16": 0.5752079887315631,
+              "17": 0.5435830680653453,
+              "18": 0.5985000170767307,
+              "19": 0.5535420496016741
+            }
+          }
+        },
+        {
+          "label": "matmul_tl_fp8_scaled_matmul",
+          "variant": "T.fp8_scaled_matmul",
+          "source_metrics": {
+            "source_len": 20335,
+            "markers": {
+              "simdgroup_multiply_accumulate": 0,
+              "simdgroup_load": 0,
+              "simdgroup_store": 0,
+              "threadgroup_half": 0,
+              "threadgroup_uchar": 0,
+              "threadgroup_barrier": 2,
+              "fp8_e4m3_decode_helper": 1,
+              "fp8_e5m2_decode_helper": 0,
+              "A_scale_loads": 1,
+              "B_scale_loads": 1,
+              "scalar_float_a_val": 0,
+              "scalar_float_b_val": 0,
+              "tvm_thread_allreduce": 0,
+              "simd_sum": 2,
+              "kernel_void": 1,
+              "packed_uint_loads": 1,
+              "fp8_e4m3_lut": 9,
+              "metal_fp8_dot4_packed": 10,
+              "metal_fp8_dot4_words": 10,
+              "metal_fp8_dot4_helper": 20
+            }
+          },
+          "xcrun_compile": {
+            "skipped": true,
+            "reason": "--skip-xcrun"
+          },
+          "paired_ratios": {
+            "matmul_tl_fp8_scaled_matmul_over_path_b_msl_fp8_scaled_matmul_paired_median": 0.9804824585474672,
+            "matmul_tl_fp8_scaled_matmul_over_path_b_msl_fp8_scaled_matmul_paired_p90": 1.0232783234205285,
+            "matmul_tl_fp8_scaled_matmul_over_path_b_msl_fp8_scaled_matmul_paired_p99": 1.4728038008968622,
+            "matmul_tl_fp8_scaled_matmul_over_path_b_msl_fp8_scaled_matmul_paired_max": 1.4728038008968622
+          },
+          "paired_ratio_samples": {
+            "matmul_tl_fp8_scaled_matmul_over_path_b_msl_fp8_scaled_matmul": [
+              0.9669048316910298,
+              0.9715433497699982,
+              1.0027618749145673,
+              1.4728038008968622,
+              0.8321195125887669,
+              0.999339871785153,
+              0.9747302875269847,
+              0.947034646326624,
+              0.9843597381484406,
+              0.9766051789464938,
+              1.0414665561627972,
+              1.0092650549836,
+              1.0189661585777667,
+              1.0016895202712053,
+              1.0232783234205285,
+              0.9087182047134155,
+              1.003696013700873,
+              0.9153007178954299,
+              0.8657059339328965,
+              0.9577716834669151
+            ]
+          },
+          "worst_paired_steps": {
+            "matmul_tl_fp8_scaled_matmul_over_path_b_msl_fp8_scaled_matmul": [
+              {
+                "step": 3.0,
+                "ratio": 1.4728038008968622,
+                "path_c_ms": 0.9330830071121454,
+                "path_b_ms": 0.6335419602692127
+              },
+              {
+                "step": 10.0,
+                "ratio": 1.0414665561627972,
+                "path_c_ms": 0.5797500489279628,
+                "path_b_ms": 0.5566669860854745
+              },
+              {
+                "step": 14.0,
+                "ratio": 1.0232783234205285,
+                "path_c_ms": 0.5274999421089888,
+                "path_b_ms": 0.5154999671503901
+              },
+              {
+                "step": 12.0,
+                "ratio": 1.0189661585777667,
+                "path_c_ms": 0.570832984521985,
+                "path_b_ms": 0.5602079909294844
+              },
+              {
+                "step": 11.0,
+                "ratio": 1.0092650549836,
+                "path_c_ms": 0.5627500358968973,
+                "path_b_ms": 0.5575839895755053
+              },
+              {
+                "step": 16.0,
+                "ratio": 1.003696013700873,
+                "path_c_ms": 0.5773339653387666,
+                "path_b_ms": 0.5752079887315631
+              },
+              {
+                "step": 2.0,
+                "ratio": 1.0027618749145673,
+                "path_c_ms": 0.5747500108554959,
+                "path_b_ms": 0.5731669953092933
+              },
+              {
+                "step": 13.0,
+                "ratio": 1.0016895202712053,
+                "path_c_ms": 0.5182080203667283,
+                "path_b_ms": 0.5173339741304517
+              },
+              {
+                "step": 5.0,
+                "ratio": 0.999339871785153,
+                "path_c_ms": 0.5678329616785049,
+                "path_b_ms": 0.5682080518454313
+              },
+              {
+                "step": 8.0,
+                "ratio": 0.9843597381484406,
+                "path_c_ms": 0.5481250118464231,
+                "path_b_ms": 0.5568340420722961
+              }
+            ]
+          },
+          "bench": {
+            "label": "matmul_tl_fp8_scaled_matmul",
+            "ok": true,
+            "median_ms": 0.560521031729877,
+            "min_ms": 0.49754197243601084,
+            "p90_ms": 0.5806660046800971,
+            "max_ms": 0.9330830071121454,
+            "tflops": 0.4789034501908982,
+            "calls_per_s": 1784.0543768960915,
+            "tokens_per_s": 913435.8409707989,
+            "warmup": 5,
+            "iters": 20,
+            "paired": true,
+            "error": null,
+            "sample_ms": [
+              0.5806660046800971,
+              0.6117079174146056,
+              0.5747500108554959,
+              0.9330830071121454,
+              0.5570000503212214,
+              0.5678329616785049,
+              0.5480829859152436,
+              0.5483330460265279,
+              0.5481250118464231,
+              0.5582920275628567,
+              0.5797500489279628,
+              0.5627500358968973,
+              0.570832984521985,
+              0.5182080203667283,
+              0.5274999421089888,
+              0.5637079011648893,
+              0.5773339653387666,
+              0.49754197243601084,
+              0.5181250162422657,
+              0.530166900716722
+            ],
+            "sample_ms_by_step": {
+              "0": 0.5806660046800971,
+              "1": 0.6117079174146056,
+              "2": 0.5747500108554959,
+              "3": 0.9330830071121454,
+              "4": 0.5570000503212214,
+              "5": 0.5678329616785049,
+              "6": 0.5480829859152436,
+              "7": 0.5483330460265279,
+              "8": 0.5481250118464231,
+              "9": 0.5582920275628567,
+              "10": 0.5797500489279628,
+              "11": 0.5627500358968973,
+              "12": 0.570832984521985,
+              "13": 0.5182080203667283,
+              "14": 0.5274999421089888,
+              "15": 0.5637079011648893,
+              "16": 0.5773339653387666,
+              "17": 0.49754197243601084,
+              "18": 0.5181250162422657,
+              "19": 0.530166900716722
+            }
+          }
+        }
+      ],
+      "ratios": {
+        "matmul_tl_fp8_scaled_matmul_over_path_b": 0.9804824585474672
+      }
+    },
     {
       "shape_name": "vecmat_4096",
       "shape": {
@@ -133,60 +677,60 @@
           "bench": {
             "label": "path_b_msl_fp8_scaled_vecmat",
             "ok": true,
-            "median_ms": 0.2181665040552616,
-            "min_ms": 0.20633300300687551,
-            "p90_ms": 0.2377909841015935,
-            "max_ms": 0.2471249899826944,
-            "tflops": 0.15380194198601935,
-            "calls_per_s": 4583.65505892096,
-            "tokens_per_s": 4583.65505892096,
+            "median_ms": 0.2921255072578788,
+            "min_ms": 0.2587920753285289,
+            "p90_ms": 0.3552499692887068,
+            "max_ms": 0.5897079827263951,
+            "tflops": 0.11486306798392396,
+            "calls_per_s": 3423.1861824966654,
+            "tokens_per_s": 3423.1861824966654,
             "warmup": 5,
             "iters": 20,
             "paired": true,
             "error": null,
             "sample_ms": [
-              0.22245800937525928,
-              0.2147089981008321,
-              0.21295799524523318,
-              0.21033399389125407,
-              0.22508398978970945,
-              0.22604200057685375,
-              0.21054199896752834,
-              0.20633300300687551,
-              0.2097910037264228,
-              0.21820800611749291,
-              0.21058300626464188,
-              0.2084170118905604,
-              0.2181250019930303,
-              0.2290419943165034,
-              0.2120420103892684,
-              0.23854197934269905,
-              0.2471249899826944,
-              0.2377909841015935,
-              0.2250840188935399,
-              0.22216601064428687
+              0.2825839910656214,
+              0.4059169441461563,
+              0.32512506004422903,
+              0.35066704731434584,
+              0.29254204127937555,
+              0.2847079886123538,
+              0.27662492357194424,
+              0.3235829062759876,
+              0.5897079827263951,
+              0.3552499692887068,
+              0.2899579703807831,
+              0.2792919985949993,
+              0.27133303228765726,
+              0.2672920236364007,
+              0.2587920753285289,
+              0.291708973236382,
+              0.2946669701486826,
+              0.2948750043287873,
+              0.2796670887619257,
+              0.3023340832442045
             ],
             "sample_ms_by_step": {
-              "0": 0.22245800937525928,
-              "1": 0.2147089981008321,
-              "2": 0.21295799524523318,
-              "3": 0.21033399389125407,
-              "4": 0.22508398978970945,
-              "5": 0.22604200057685375,
-              "6": 0.21054199896752834,
-              "7": 0.20633300300687551,
-              "8": 0.2097910037264228,
-              "9": 0.21820800611749291,
-              "10": 0.21058300626464188,
-              "11": 0.2084170118905604,
-              "12": 0.2181250019930303,
-              "13": 0.2290419943165034,
-              "14": 0.2120420103892684,
-              "15": 0.23854197934269905,
-              "16": 0.2471249899826944,
-              "17": 0.2377909841015935,
-              "18": 0.2250840188935399,
-              "19": 0.22216601064428687
+              "0": 0.2825839910656214,
+              "1": 0.4059169441461563,
+              "2": 0.32512506004422903,
+              "3": 0.35066704731434584,
+              "4": 0.29254204127937555,
+              "5": 0.2847079886123538,
+              "6": 0.27662492357194424,
+              "7": 0.3235829062759876,
+              "8": 0.5897079827263951,
+              "9": 0.3552499692887068,
+              "10": 0.2899579703807831,
+              "11": 0.2792919985949993,
+              "12": 0.27133303228765726,
+              "13": 0.2672920236364007,
+              "14": 0.2587920753285289,
+              "15": 0.291708973236382,
+              "16": 0.2946669701486826,
+              "17": 0.2948750043287873,
+              "18": 0.2796670887619257,
+              "19": 0.3023340832442045
             }
           },
           "parity_vs_torch_cpu_dequant": {
@@ -196,163 +740,163 @@
         },
         {
           "label": "path_c_mlx_tilelang_fp8_scaled_vecmat",
-          "variant": "MLX-dispatched TileLang fp8 vecmat packed dot4",
+          "variant": "tvm-ffi owner-output TileLang fp8 vecmat packed dot4",
           "target": "metal -thread_warp_size=32",
           "bench": {
             "label": "path_c_mlx_tilelang_fp8_scaled_vecmat",
             "ok": true,
-            "median_ms": 0.21414601360447705,
-            "min_ms": 0.20362500799819827,
-            "p90_ms": 0.3172909782733768,
-            "max_ms": 2.2282499994616956,
-            "tflops": 0.15668950094011228,
-            "calls_per_s": 4669.711021784314,
-            "tokens_per_s": 4669.711021784314,
+            "median_ms": 0.27227052487432957,
+            "min_ms": 0.24795799981802702,
+            "p90_ms": 0.3113750135526061,
+            "max_ms": 0.6220419891178608,
+            "tflops": 0.12323931139989368,
+            "calls_per_s": 3672.8176891772055,
+            "tokens_per_s": 3672.8176891772055,
             "warmup": 5,
             "iters": 20,
             "paired": true,
             "error": null,
             "sample_ms": [
-              0.21433300571516156,
-              0.2126250183209777,
-              0.21083297906443477,
-              0.3215840260963887,
-              0.21829199977219105,
-              0.21341702085919678,
-              0.2468339807819575,
-              0.2118749835062772,
-              0.30166699434630573,
-              0.21025000023655593,
-              0.20833400776609778,
-              0.20362500799819827,
-              0.21358300000429153,
-              0.21312499302439392,
-              2.2282499994616956,
-              0.3172909782733768,
-              0.23512498592026532,
-              0.234208011534065,
-              0.2202909963671118,
-              0.21395902149379253
+              0.2633330877870321,
+              0.26154203806072474,
+              0.25220809038728476,
+              0.29037497006356716,
+              0.3113750135526061,
+              0.3333339700475335,
+              0.2514999359846115,
+              0.25204208213835955,
+              0.2745829988270998,
+              0.29029196593910456,
+              0.2876659855246544,
+              0.2865410642698407,
+              0.2827499993145466,
+              0.24795799981802702,
+              0.26995805092155933,
+              0.25500007905066013,
+              0.26758399326354265,
+              0.28358399868011475,
+              0.6220419891178608,
+              0.2625000197440386
             ],
             "sample_ms_by_step": {
-              "0": 0.21433300571516156,
-              "1": 0.2126250183209777,
-              "2": 0.21083297906443477,
-              "3": 0.3215840260963887,
-              "4": 0.21829199977219105,
-              "5": 0.21341702085919678,
-              "6": 0.2468339807819575,
-              "7": 0.2118749835062772,
-              "8": 0.30166699434630573,
-              "9": 0.21025000023655593,
-              "10": 0.20833400776609778,
-              "11": 0.20362500799819827,
-              "12": 0.21358300000429153,
-              "13": 0.21312499302439392,
-              "14": 2.2282499994616956,
-              "15": 0.3172909782733768,
-              "16": 0.23512498592026532,
-              "17": 0.234208011534065,
-              "18": 0.2202909963671118,
-              "19": 0.21395902149379253
+              "0": 0.2633330877870321,
+              "1": 0.26154203806072474,
+              "2": 0.25220809038728476,
+              "3": 0.29037497006356716,
+              "4": 0.3113750135526061,
+              "5": 0.3333339700475335,
+              "6": 0.2514999359846115,
+              "7": 0.25204208213835955,
+              "8": 0.2745829988270998,
+              "9": 0.29029196593910456,
+              "10": 0.2876659855246544,
+              "11": 0.2865410642698407,
+              "12": 0.2827499993145466,
+              "13": 0.24795799981802702,
+              "14": 0.26995805092155933,
+              "15": 0.25500007905066013,
+              "16": 0.26758399326354265,
+              "17": 0.28358399868011475,
+              "18": 0.6220419891178608,
+              "19": 0.2625000197440386
             }
           },
           "paired_ratios": {
-            "path_c_mlx_tilelang_fp8_scaled_vecmat_over_path_b_msl_fp8_scaled_vecmat_paired_median": 0.9820546645448254,
-            "path_c_mlx_tilelang_fp8_scaled_vecmat_over_path_b_msl_fp8_scaled_vecmat_paired_p90": 1.437940564599679,
-            "path_c_mlx_tilelang_fp8_scaled_vecmat_over_path_b_msl_fp8_scaled_vecmat_paired_p99": 10.508530811281485,
-            "path_c_mlx_tilelang_fp8_scaled_vecmat_over_path_b_msl_fp8_scaled_vecmat_paired_max": 10.508530811281485
+            "path_c_mlx_tilelang_fp8_scaled_vecmat_over_path_b_msl_fp8_scaled_vecmat_paired_median": 0.9184200629496149,
+            "path_c_mlx_tilelang_fp8_scaled_vecmat_over_path_b_msl_fp8_scaled_vecmat_paired_p90": 1.0643769770350553,
+            "path_c_mlx_tilelang_fp8_scaled_vecmat_over_path_b_msl_fp8_scaled_vecmat_paired_p99": 2.224223064185401,
+            "path_c_mlx_tilelang_fp8_scaled_vecmat_over_path_b_msl_fp8_scaled_vecmat_paired_max": 2.224223064185401
           },
           "paired_ratio_samples": {
             "path_c_mlx_tilelang_fp8_scaled_vecmat_over_path_b_msl_fp8_scaled_vecmat": [
-              0.9634762367832221,
-              0.9902939336577048,
-              0.9900214303841876,
-              1.5289208375069063,
-              0.9698246417976507,
-              0.9441476376715906,
-              1.172374072595494,
-              1.026859399216988,
-              1.437940564599679,
-              0.9635301837795446,
-              0.9893201330039055,
-              0.9770076163702107,
-              0.979177068436731,
-              0.9305061880044825,
-              10.508530811281485,
-              1.3301263750207413,
-              0.9514415597416134,
-              0.9849322606529198,
-              0.9787056293468125,
-              0.9630592045709698
+              0.9318754639780042,
+              0.6443240220259263,
+              0.7757263938774056,
+              0.8280646051217596,
+              1.0643769770350553,
+              1.1707924729199881,
+              0.9091730880106389,
+              0.7789103727357894,
+              0.4656253719978845,
+              0.8171484617446603,
+              0.9920954583413631,
+              1.0259551498478596,
+              1.0420773207398701,
+              0.9276670378885907,
+              1.0431465128090014,
+              0.8741591875681679,
+              0.9080895396200176,
+              0.9617091802190089,
+              2.224223064185401,
+              0.868244879727997
             ]
           },
           "worst_paired_steps": {
             "path_c_mlx_tilelang_fp8_scaled_vecmat_over_path_b_msl_fp8_scaled_vecmat": [
               {
+                "step": 18.0,
+                "ratio": 2.224223064185401,
+                "path_c_ms": 0.6220419891178608,
+                "path_b_ms": 0.2796670887619257
+              },
+              {
+                "step": 5.0,
+                "ratio": 1.1707924729199881,
+                "path_c_ms": 0.3333339700475335,
+                "path_b_ms": 0.2847079886123538
+              },
+              {
+                "step": 4.0,
+                "ratio": 1.0643769770350553,
+                "path_c_ms": 0.3113750135526061,
+                "path_b_ms": 0.29254204127937555
+              },
+              {
                 "step": 14.0,
-                "ratio": 10.508530811281485,
-                "path_c_ms": 2.2282499994616956,
-                "path_b_ms": 0.2120420103892684
+                "ratio": 1.0431465128090014,
+                "path_c_ms": 0.26995805092155933,
+                "path_b_ms": 0.2587920753285289
               },
               {
-                "step": 3.0,
-                "ratio": 1.5289208375069063,
-                "path_c_ms": 0.3215840260963887,
-                "path_b_ms": 0.21033399389125407
+                "step": 12.0,
+                "ratio": 1.0420773207398701,
+                "path_c_ms": 0.2827499993145466,
+                "path_b_ms": 0.27133303228765726
               },
               {
-                "step": 8.0,
-                "ratio": 1.437940564599679,
-                "path_c_ms": 0.30166699434630573,
-                "path_b_ms": 0.2097910037264228
-              },
-              {
-                "step": 15.0,
-                "ratio": 1.3301263750207413,
-                "path_c_ms": 0.3172909782733768,
-                "path_b_ms": 0.23854197934269905
-              },
-              {
-                "step": 6.0,
-                "ratio": 1.172374072595494,
-                "path_c_ms": 0.2468339807819575,
-                "path_b_ms": 0.21054199896752834
-              },
-              {
-                "step": 7.0,
-                "ratio": 1.026859399216988,
-                "path_c_ms": 0.2118749835062772,
-                "path_b_ms": 0.20633300300687551
-              },
-              {
-                "step": 1.0,
-                "ratio": 0.9902939336577048,
-                "path_c_ms": 0.2126250183209777,
-                "path_b_ms": 0.2147089981008321
-              },
-              {
-                "step": 2.0,
-                "ratio": 0.9900214303841876,
-                "path_c_ms": 0.21083297906443477,
-                "path_b_ms": 0.21295799524523318
+                "step": 11.0,
+                "ratio": 1.0259551498478596,
+                "path_c_ms": 0.2865410642698407,
+                "path_b_ms": 0.2792919985949993
               },
               {
                 "step": 10.0,
-                "ratio": 0.9893201330039055,
-                "path_c_ms": 0.20833400776609778,
-                "path_b_ms": 0.21058300626464188
+                "ratio": 0.9920954583413631,
+                "path_c_ms": 0.2876659855246544,
+                "path_b_ms": 0.2899579703807831
               },
               {
                 "step": 17.0,
-                "ratio": 0.9849322606529198,
-                "path_c_ms": 0.234208011534065,
-                "path_b_ms": 0.2377909841015935
+                "ratio": 0.9617091802190089,
+                "path_c_ms": 0.28358399868011475,
+                "path_b_ms": 0.2948750043287873
+              },
+              {
+                "step": 0.0,
+                "ratio": 0.9318754639780042,
+                "path_c_ms": 0.2633330877870321,
+                "path_b_ms": 0.2825839910656214
+              },
+              {
+                "step": 13.0,
+                "ratio": 0.9276670378885907,
+                "path_c_ms": 0.24795799981802702,
+                "path_b_ms": 0.2672920236364007
               }
             ]
           },
           "source_metrics": {
-            "source_len": 7179,
+            "source_len": 8022,
             "markers": {
               "simdgroup_multiply_accumulate": 0,
               "simdgroup_load": 0,
@@ -360,7 +904,7 @@
               "threadgroup_half": 0,
               "threadgroup_uchar": 0,
               "threadgroup_barrier": 0,
-              "fp8_e4m3_decode_helper": 1,
+              "fp8_e4m3_decode_helper": 0,
               "fp8_e5m2_decode_helper": 0,
               "A_scale_loads": 1,
               "B_scale_loads": 1,
@@ -369,23 +913,23 @@
               "tvm_thread_allreduce": 0,
               "simd_sum": 1,
               "kernel_void": 1,
-              "packed_uint_loads": 3,
-              "fp8_e4m3_lut": 9,
-              "metal_fp8_dot4_packed": 9,
-              "metal_fp8_dot4_words": 11,
-              "metal_fp8_dot4_helper": 20
+              "packed_uint_loads": 2,
+              "fp8_e4m3_lut": 10,
+              "metal_fp8_dot4_packed": 0,
+              "metal_fp8_dot4_words": 0,
+              "metal_fp8_dot4_helper": 0
             }
           },
           "source": "mlx_runtime_source",
           "diagnostic_tilelang_source_metrics": {
-            "source_len": 7179,
+            "source_len": 20370,
             "markers": {
               "simdgroup_multiply_accumulate": 0,
               "simdgroup_load": 0,
               "simdgroup_store": 0,
               "threadgroup_half": 0,
               "threadgroup_uchar": 0,
-              "threadgroup_barrier": 0,
+              "threadgroup_barrier": 2,
               "fp8_e4m3_decode_helper": 1,
               "fp8_e5m2_decode_helper": 0,
               "A_scale_loads": 1,
@@ -393,52 +937,48 @@
               "scalar_float_a_val": 0,
               "scalar_float_b_val": 0,
               "tvm_thread_allreduce": 0,
-              "simd_sum": 1,
+              "simd_sum": 3,
               "kernel_void": 1,
-              "packed_uint_loads": 3,
+              "packed_uint_loads": 1,
               "fp8_e4m3_lut": 9,
-              "metal_fp8_dot4_packed": 9,
-              "metal_fp8_dot4_words": 11,
+              "metal_fp8_dot4_packed": 10,
+              "metal_fp8_dot4_words": 10,
               "metal_fp8_dot4_helper": 20
             }
           },
           "path_c_blockers": {
-            "path_b_fast_path_ready": false,
-            "missing": [
-              "packed_lut_dot4_decode"
-            ],
+            "path_b_fast_path_ready": true,
+            "missing": [],
             "generated_features": {
               "kernel_void": 1,
-              "fp8_e4m3_decode_helper": 1,
+              "fp8_e4m3_decode_helper": 0,
               "tvm_thread_allreduce": 0,
               "simd_shuffle_down": 0,
               "simd_sum": 1,
               "reinterpret_cast": 2,
-              "device_const_uint": 2,
-              "uint_pointer": 2,
+              "device_const_uint": 4,
+              "uint_pointer": 4,
               "uchar4": 0,
-              "fp8_e4m3_lut": 0,
-              "metal_fp8_dot4_helper": 9,
+              "fp8_e4m3_lut": 8,
+              "metal_fp8_dot4_helper": 0,
+              "packed_uint_loads": 2,
               "scalar_fp8_byte_decode": 0,
               "scalar_fp8_byte_decode_calls": 0
             },
             "required_fast_path": {
               "packed_uint32_fp8_loads": "reinterpret_cast<device const uint*> loads for 4 FP8 bytes",
               "metal_simd_sum_reduction": "literal Metal simd_sum(sum) reduction",
-              "packed_lut_dot4_decode": "fp8_e4m3fn_lut-backed packed dot4 decode in the hot loop",
+              "packed_lut_dot4_decode": "fp8_e4m3fn_lut-backed direct decode or TileLang packed dot4 helper in the hot loop",
               "no_scalar_fp8_helper_calls": "avoid per-byte __tvm_fp8_e4m3_to_half calls in the hot loop"
             }
           },
           "xcrun_compile": {
-            "ok": true,
-            "returncode": 0,
-            "stderr": "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/tmp2p6ctbcj/path_c_mlx_tilelang_fp8_scaled_vecmat.metal:9:20: warning: unused function '__tvm_fp8_e4m3_to_half' [-Wunused-function]\nstatic inline half __tvm_fp8_e4m3_to_half(uchar x) {\n                   ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/tmp2p6ctbcj/path_c_mlx_tilelang_fp8_scaled_vecmat.metal:74:21: warning: unused function '__tvm_fp8_e4m3_dot4_packed' [-Wunused-function]\nstatic inline float __tvm_fp8_e4m3_dot4_packed(device const uchar* a, device const uchar* b, uint a_word_idx, uint b_word_idx) {\n                    ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/tmp2p6ctbcj/path_c_mlx_tilelang_fp8_scaled_vecmat.metal:77:21: warning: unused function '__tvm_fp8_e4m3_dot4_packed' [-Wunused-function]\nstatic inline float __tvm_fp8_e4m3_dot4_packed(device const uchar* a, threadgroup const uchar* b, uint a_word_idx, uint b_word_idx) {\n                    ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/tmp2p6ctbcj/path_c_mlx_tilelang_fp8_scaled_vecmat.metal:80:21: warning: unused function '__tvm_fp8_e4m3_dot4_packed' [-Wunused-function]\nstatic inline float __tvm_fp8_e4m3_dot4_packed(device const uchar* a, constant const uchar* b, uint a_word_idx, uint b_word_idx) {\n                    ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/tmp2p6ctbcj/path_c_mlx_tilelang_fp8_scaled_vecmat.metal:83:21: warning: unused function '__tvm_fp8_e4m3_dot4_packed' [-Wunused-function]\nstatic inline float __tvm_fp8_e4m3_dot4_packed(threadgroup const uchar* a, device const uchar* b, uint a_word_idx, uint b_word_idx) {\n                    ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/tmp2p6ctbcj/path_c_mlx_tilelang_fp8_scaled_vecmat.metal:86:21: warning: unused function '__tvm_fp8_e4m3_dot4_packed' [-Wunused-function]\nstatic inline float __tvm_fp8_e4m3_dot4_packed(threadgroup const uchar* a, threadgroup const uchar* b, uint a_word_idx, uint b_word_idx) {\n                    ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/tmp2p6ctbcj/path_c_mlx_tilelang_fp8_scaled_vecmat.metal:89:21: warning: unused function '__tvm_fp8_e4m3_dot4_packed' [-Wunused-function]\nstatic inline float __tvm_fp8_e4m3_dot4_packed(threadgroup const uchar* a, constant const uchar* b, uint a_word_idx, uint b_word_idx) {\n                    ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/tmp2p6ctbcj/path_c_mlx_tilelang_fp8_scaled_vecmat.metal:92:21: warning: unused function '__tvm_fp8_e4m3_dot4_packed' [-Wunused-function]\nstatic inline float __tvm_fp8_e4m3_dot4_packed(constant const uchar* a, device const uchar* b, uint a_word_idx, uint b_word_idx) {\n                    ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/tmp2p6ctbcj/path_c_mlx_tilelang_fp8_scaled_vecmat.metal:95:21: warning: unused function '__tvm_fp8_e4m3_dot4_packed' [-Wunused-function]\nstatic inline float __tvm_fp8_e4m3_dot4_packed(constant const uchar* a, threadgroup const uchar* b, uint a_word_idx, uint b_word_idx) {\n                    ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/tmp2p6ctbcj/path_c_mlx_tilelang_fp8_scaled_vecmat.metal:98:21: warning: unused function '__tvm_fp8_e4m3_dot4_packed' [-Wunused-function]\nstatic inline float __tvm_fp8_e4m3_dot4_packed(constant const uchar* a, constant const uchar* b, uint a_word_idx, uint b_word_idx) {\n                    ^\n10 warnings generated.",
-            "msl_path": null,
-            "air_path": null
+            "skipped": true,
+            "reason": "--skip-xcrun"
           },
           "parity_vs_path_b_msl": {
-            "max_abs": 0.0,
-            "max_rel": 0.0
+            "max_abs": 1.52587890625e-05,
+            "max_rel": 1.0227543612018053e-07
           },
           "parity_vs_torch_cpu_dequant": {
             "max_abs": 0.0001220703125,
@@ -447,344 +987,8 @@
         }
       ],
       "ratios": {
-        "path_c_mlx_tilelang_fp8_scaled_vecmat_over_path_b": 0.9820546645448254
+        "path_c_mlx_tilelang_fp8_scaled_vecmat_over_path_b": 0.9184200629496149
       }
     }
-  ],
-  "sparse_mla": {
-    "path_b_status": {
-      "available": true,
-      "reason": "sparse_mla_fp8 direct-MSL kernel built via mx.fast.metal_kernel is available; FP8 e4m3 dequant happens inline inside MSL on uint8 storage. Apple MSL 4.0 has no native float8 simdgroup matrix, so the matmuls run as plain register fma ops (still ~2x faster than the BF16-fallback reference because the dequant fuses with the QK loop)."
-    },
-    "path_c_tilelang_qk_status": {
-      "available": true,
-      "reason": "TileLang Path C FP8 Sparse-MLA QK dispatches through the real M=1/topk reducer; T.fp8_scaled_matmul remains probe-only for this shape",
-      "target": "metal",
-      "m": 1,
-      "n": 16,
-      "k": 64,
-      "transpose_B": true,
-      "features": {
-        "kernel_void": 1,
-        "fp8_e4m3_decode_helper": 1,
-        "scalar_fp8_byte_decode": 0,
-        "scalar_fp8_byte_decode_calls": 0,
-        "tvm_thread_allreduce": 0,
-        "simd_sum": 0,
-        "simd_shuffle_down": 5,
-        "A_scale_refs": 1,
-        "B_scale_refs": 1,
-        "signature_has_A_scale": true,
-        "signature_has_B_scale": true,
-        "per_row_B_scale": true,
-        "reinterpret_cast": 2,
-        "device_const_uint": 2,
-        "uchar4": 0,
-        "fp8_e4m3_lut": 0,
-        "metal_fp8_dot4_helper": 9,
-        "threadgroup_half": false,
-        "qk_shape": "m1_n_topk_k",
-        "dispatch_surface": "qk_reduce",
-        "runnable_qk_reduce_available": true,
-        "runnable_qk_reduce_reason": "TileLang Path C FP8 Sparse-MLA real QK reducer is dispatchable for M=1/topk with per-row B scales",
-        "legacy_fp8_scaled_matmul_probe_available": false,
-        "legacy_fp8_scaled_matmul_probe_reason": "TileLang Path C FP8 Sparse-MLA QK is not safe to dispatch: no simdgroup_multiply_accumulate; scalar fallback markers present; Sparse-MLA M=1/topk tile violates current Metal FP8 simdgroup tile constraints",
-        "legacy_fp8_scaled_matmul_probe_kernel_void": 1,
-        "legacy_fp8_scaled_matmul_probe_simdgroup_multiply_accumulate": 0,
-        "legacy_fp8_scaled_matmul_probe_simdgroup_load": 0,
-        "legacy_fp8_scaled_matmul_probe_simdgroup_store": 0,
-        "legacy_fp8_scaled_matmul_probe_fp8_e4m3_decode_helper": 3,
-        "legacy_fp8_scaled_matmul_probe_A_scale_refs": 1,
-        "legacy_fp8_scaled_matmul_probe_B_scale_refs": 1,
-        "legacy_fp8_scaled_matmul_probe_signature_has_A_scale": true,
-        "legacy_fp8_scaled_matmul_probe_signature_has_B_scale": true,
-        "legacy_fp8_scaled_matmul_probe_float_a_val": true,
-        "legacy_fp8_scaled_matmul_probe_float_b_val": true,
-        "legacy_fp8_scaled_matmul_probe_threadgroup_half": false
-      }
-    },
-    "path_c_tilelang_qk_reduce_status": {
-      "available": true,
-      "reason": "TileLang Path C FP8 Sparse-MLA real QK reducer is dispatchable for M=1/topk with per-row B scales",
-      "target": "metal",
-      "n": 16,
-      "k": 64,
-      "outputs_per_block": 16,
-      "reduce_threads": 32,
-      "vec": 4,
-      "features": {
-        "kernel_void": 1,
-        "fp8_e4m3_decode_helper": 1,
-        "scalar_fp8_byte_decode": 0,
-        "scalar_fp8_byte_decode_calls": 0,
-        "tvm_thread_allreduce": 0,
-        "simd_sum": 0,
-        "simd_shuffle_down": 5,
-        "A_scale_refs": 1,
-        "B_scale_refs": 1,
-        "signature_has_A_scale": true,
-        "signature_has_B_scale": true,
-        "per_row_B_scale": true,
-        "reinterpret_cast": 2,
-        "device_const_uint": 2,
-        "uchar4": 0,
-        "fp8_e4m3_lut": 0,
-        "metal_fp8_dot4_helper": 9,
-        "threadgroup_half": false,
-        "qk_shape": "m1_n_topk_k"
-      }
-    },
-    "path_c_tilelang_indexed_qk_reduce_status": {
-      "available": true,
-      "reason": "TileLang Path C FP8 Sparse-MLA indexed QK reducer is dispatchable without host pre-gather and uses packed FP8 dot4 decode",
-      "target": "metal",
-      "batch": 1,
-      "seq_len": 1,
-      "heads": 1,
-      "seq_len_kv": 16,
-      "kv_group": 1,
-      "head_kv": 1,
-      "topk": 16,
-      "k": 64,
-      "outputs_per_block": 16,
-      "reduce_threads": 32,
-      "vec": 4,
-      "features": {
-        "kernel_void": 1,
-        "fp8_e4m3_decode_helper": 1,
-        "scalar_fp8_byte_decode": 0,
-        "scalar_fp8_byte_decode_calls": 0,
-        "tvm_thread_allreduce": 0,
-        "simd_sum": 0,
-        "simd_shuffle_down": 5,
-        "q_scale_refs": 1,
-        "kv_scale_refs": 1,
-        "indices_refs": 2,
-        "sm_scale_refs": 1,
-        "signature_has_q_scale": true,
-        "signature_has_kv_scale": true,
-        "signature_has_indices": true,
-        "signature_has_sm_scale": true,
-        "invalid_index_guard": true,
-        "reinterpret_cast": 0,
-        "device_const_uint": 0,
-        "uchar4": 0,
-        "fp8_e4m3_lut": 0,
-        "metal_fp8_dot4_helper": 10,
-        "threadgroup_half": false,
-        "qk_shape": "indexed_b_s_h_topk_k"
-      }
-    },
-    "path_c_tilelang_e8m0_qk_status": {
-      "available": true,
-      "reason": "TileLang Path C E8M0 Sparse-MLA QK dispatches through the real M=1/topk reducer; T.fp8_scaled_matmul remains probe-only for this shape",
-      "target": "metal",
-      "m": 1,
-      "n": 16,
-      "k": 64,
-      "transpose_B": true,
-      "scale_block_size": 32,
-      "scale_layout": "logical_unswizzled_k_axis_blocks",
-      "features": {
-        "kernel_void": 1,
-        "fp8_e4m3_decode_helper": 1,
-        "fp8_e4m3_lut": 9,
-        "metal_fp8_dot4_helper": 9,
-        "scalar_fp8_byte_decode": 1,
-        "scalar_fp8_byte_decode_calls": 0,
-        "simdgroup_multiply_accumulate": 0,
-        "tvm_thread_allreduce": 0,
-        "simd_sum": 0,
-        "simd_shuffle_down": 5,
-        "A_scale_refs": 3,
-        "B_scale_refs": 3,
-        "A_scale_collapsed_zero": 0,
-        "B_scale_collapsed_zero": 0,
-        "signature_has_A_scale": true,
-        "signature_has_B_scale": true,
-        "per_row_B_scale": true,
-        "e8m0_exp2": 2,
-        "e8m0_bias_subtract_127": 2,
-        "e8m0_sentinel_255": 2,
-        "e8m0_zero_sentinel": 5,
-        "k_block_shift_5": 0,
-        "k_block_div_32": 0,
-        "scale_block_index_shift": 7,
-        "scale_format": "e8m0_block_k32",
-        "scale_block_size": 32,
-        "scale_axis": "contracted_k",
-        "scale_layout": "logical_unswizzled_k_axis_blocks",
-        "qk_shape": "m1_n_topk_k",
-        "dispatch_surface": "qk_reduce",
-        "runnable_qk_reduce_available": true,
-        "runnable_qk_reduce_reason": "TileLang Path C E8M0 Sparse-MLA real QK reducer is dispatchable for M=1/topk with per-row K/32 E8M0 scales",
-        "legacy_e8m0_scaled_matmul_probe_available": false,
-        "legacy_e8m0_scaled_matmul_probe_reason": "TileLang Metal lowering failed for E8M0 Sparse-MLA QK shape: AttributeError: 'BufferRegion' object has no attribute 'shape'"
-      }
-    },
-    "path_c_tilelang_e8m0_qk_reduce_status": {
-      "available": true,
-      "reason": "TileLang Path C E8M0 Sparse-MLA real QK reducer is dispatchable for M=1/topk with per-row K/32 E8M0 scales",
-      "target": "metal",
-      "n": 16,
-      "k": 64,
-      "outputs_per_block": 4,
-      "reduce_threads": 32,
-      "vec": 4,
-      "scale_block_size": 32,
-      "scale_layout": "logical_unswizzled_k_axis_blocks",
-      "features": {
-        "kernel_void": 1,
-        "fp8_e4m3_decode_helper": 1,
-        "fp8_e4m3_lut": 9,
-        "metal_fp8_dot4_helper": 9,
-        "scalar_fp8_byte_decode": 1,
-        "scalar_fp8_byte_decode_calls": 0,
-        "simdgroup_multiply_accumulate": 0,
-        "tvm_thread_allreduce": 0,
-        "simd_sum": 0,
-        "simd_shuffle_down": 5,
-        "A_scale_refs": 3,
-        "B_scale_refs": 3,
-        "A_scale_collapsed_zero": 0,
-        "B_scale_collapsed_zero": 0,
-        "signature_has_A_scale": true,
-        "signature_has_B_scale": true,
-        "per_row_B_scale": true,
-        "e8m0_exp2": 2,
-        "e8m0_bias_subtract_127": 2,
-        "e8m0_sentinel_255": 2,
-        "e8m0_zero_sentinel": 5,
-        "k_block_shift_5": 0,
-        "k_block_div_32": 0,
-        "scale_block_index_shift": 7,
-        "scale_format": "e8m0_block_k32",
-        "scale_block_size": 32,
-        "scale_axis": "contracted_k",
-        "scale_layout": "logical_unswizzled_k_axis_blocks",
-        "qk_shape": "m1_n_topk_k"
-      }
-    },
-    "path_c_status": {
-      "available": true,
-      "reason": "TileLang Path C FP8 Sparse-MLA QK dispatches through the real M=1/topk reducer; T.fp8_scaled_matmul remains probe-only for this shape",
-      "target": "metal",
-      "m": 1,
-      "n": 16,
-      "k": 64,
-      "transpose_B": true,
-      "features": {
-        "kernel_void": 1,
-        "fp8_e4m3_decode_helper": 1,
-        "scalar_fp8_byte_decode": 0,
-        "scalar_fp8_byte_decode_calls": 0,
-        "tvm_thread_allreduce": 0,
-        "simd_sum": 0,
-        "simd_shuffle_down": 5,
-        "A_scale_refs": 1,
-        "B_scale_refs": 1,
-        "signature_has_A_scale": true,
-        "signature_has_B_scale": true,
-        "per_row_B_scale": true,
-        "reinterpret_cast": 2,
-        "device_const_uint": 2,
-        "uchar4": 0,
-        "fp8_e4m3_lut": 0,
-        "metal_fp8_dot4_helper": 9,
-        "threadgroup_half": false,
-        "qk_shape": "m1_n_topk_k",
-        "dispatch_surface": "qk_reduce",
-        "runnable_qk_reduce_available": true,
-        "runnable_qk_reduce_reason": "TileLang Path C FP8 Sparse-MLA real QK reducer is dispatchable for M=1/topk with per-row B scales",
-        "legacy_fp8_scaled_matmul_probe_available": false,
-        "legacy_fp8_scaled_matmul_probe_reason": "TileLang Path C FP8 Sparse-MLA QK is not safe to dispatch: no simdgroup_multiply_accumulate; scalar fallback markers present; Sparse-MLA M=1/topk tile violates current Metal FP8 simdgroup tile constraints",
-        "legacy_fp8_scaled_matmul_probe_kernel_void": 1,
-        "legacy_fp8_scaled_matmul_probe_simdgroup_multiply_accumulate": 0,
-        "legacy_fp8_scaled_matmul_probe_simdgroup_load": 0,
-        "legacy_fp8_scaled_matmul_probe_simdgroup_store": 0,
-        "legacy_fp8_scaled_matmul_probe_fp8_e4m3_decode_helper": 3,
-        "legacy_fp8_scaled_matmul_probe_A_scale_refs": 1,
-        "legacy_fp8_scaled_matmul_probe_B_scale_refs": 1,
-        "legacy_fp8_scaled_matmul_probe_signature_has_A_scale": true,
-        "legacy_fp8_scaled_matmul_probe_signature_has_B_scale": true,
-        "legacy_fp8_scaled_matmul_probe_float_a_val": true,
-        "legacy_fp8_scaled_matmul_probe_float_b_val": true,
-        "legacy_fp8_scaled_matmul_probe_threadgroup_half": false
-      }
-    },
-    "strict": {
-      "enabled": true,
-      "scope": "full_path_c_dispatch",
-      "passed": false,
-      "failures": [
-        "path_c_tilelang_qk_status.features.dispatch_surface='qk_reduce' is not full_fwd_bwd Path C FP8 dispatch",
-        "path_c_tilelang_qk_status.features.full_fwd_bwd_available is not true",
-        "path_c_tilelang_e8m0_qk_status.features.dispatch_surface='qk_reduce' is not full_fwd_bwd Path C blockscaled dispatch",
-        "path_c_tilelang_e8m0_qk_status.features.full_fwd_bwd_available is not true"
-      ]
-    },
-    "path_b_bench": {
-      "label": "path_b_sparse_mla_fp8_fwd",
-      "ok": true,
-      "median_ms": 0.24887549807317555,
-      "min_ms": 0.23549998877570033,
-      "p90_ms": 0.28308399487286806,
-      "max_ms": 0.35554097848944366,
-      "tflops": 0.0,
-      "calls_per_s": 4018.073324783363,
-      "tokens_per_s": null,
-      "warmup": 5,
-      "iters": 20,
-      "paired": false,
-      "error": null,
-      "sample_ms": [
-        0.28308399487286806,
-        0.2711669949349016,
-        0.2539579872973263,
-        0.25224999990314245,
-        0.3376669774297625,
-        0.24125000345520675,
-        0.26083298143930733,
-        0.25145799736492336,
-        0.24241700884886086,
-        0.2482089912518859,
-        0.2406249986961484,
-        0.2367089909967035,
-        0.24054202367551625,
-        0.2360840153414756,
-        0.23549998877570033,
-        0.2377500059083104,
-        0.2495420048944652,
-        0.35554097848944366,
-        0.23754200083203614,
-        0.28133299201726913
-      ],
-      "sample_ms_by_step": {
-        "0": 0.28308399487286806,
-        "1": 0.2711669949349016,
-        "2": 0.2539579872973263,
-        "3": 0.25224999990314245,
-        "4": 0.3376669774297625,
-        "5": 0.24125000345520675,
-        "6": 0.26083298143930733,
-        "7": 0.25145799736492336,
-        "8": 0.24241700884886086,
-        "9": 0.2482089912518859,
-        "10": 0.2406249986961484,
-        "11": 0.2367089909967035,
-        "12": 0.24054202367551625,
-        "13": 0.2360840153414756,
-        "14": 0.23549998877570033,
-        "15": 0.2377500059083104,
-        "16": 0.2495420048944652,
-        "17": 0.35554097848944366,
-        "18": 0.23754200083203614,
-        "19": 0.28133299201726913
-      }
-    },
-    "path_b_parity_vs_bf16_reference": {
-      "max_abs": 0.00299072265625,
-      "max_rel": 68.86324310302734
-    }
-  }
+  ]
 }
