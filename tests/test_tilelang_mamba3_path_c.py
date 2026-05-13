@@ -12,7 +12,7 @@ Coverage:
   - backward parity vs Path B Metal kernel (bit-exact at FP32);
   - VJP-through-mx.custom_function parity vs autograd-through-Path-B-reference
     at FP32 / bench shape;
-  - small fp16 carrier shape (FP32 internal accumulator preserves precision).
+  - small bf16 carrier shape (FP32 internal accumulator preserves precision).
 
 The "bit-exact" expectation is a property of the M4 Max instance running this
 test; the conservative atol/rtol budget is what we ship as the contract.
@@ -240,6 +240,18 @@ def test_mamba3_path_c_schedule_plan_uses_rule_and_z3_for_spec_shape(
     assert plan.mode == "path_c_fwd_bwd"
     assert plan.z3_used is True
     assert plan.z3_proved is True
+
+    bf16_plan = mamba3_path_c_schedule_plan(
+        batch=2,
+        seq=512,
+        heads=4,
+        headdim=32,
+        state=64,
+        dtype="bfloat16",
+    )
+    assert bf16_plan.fwd_path_c_candidate is True
+    assert bf16_plan.bwd_path_c_candidate is True
+    assert bf16_plan.mode == "path_c_fwd_bwd"
 
 
 def test_mamba3_path_c_receipt_gate_requires_matching_shape_and_fwd_win(
@@ -519,6 +531,20 @@ def test_fwd_path_c_matches_path_b_fp32_small_shape() -> None:
     np.testing.assert_allclose(_np(h_pc), _np(h_pb), rtol=1e-3, atol=1e-4)
 
 
+def test_fwd_path_c_matches_path_b_bf16_small_shape() -> None:
+    """Path C fwd consumes bf16 owner buffers directly with FP32 accumulators."""
+
+    _require_mamba3_path_c()
+    inputs = _make_inputs(batch=1, seq=6, heads=2, headdim=4, state=4, dtype=mx.bfloat16)
+    y_pc, h_pc = mamba3_mimo_fwd_path_c(*inputs)
+    y_pb, h_pb = mamba3_mimo_fwd_metal(*inputs)
+    mx.eval(y_pc, h_pc, y_pb, h_pb)
+    assert y_pc.dtype == mx.bfloat16
+    assert h_pc.dtype == mx.bfloat16
+    np.testing.assert_allclose(_np(y_pc), _np(y_pb), rtol=1e-3, atol=1e-4)
+    np.testing.assert_allclose(_np(h_pc), _np(h_pb), rtol=1e-3, atol=1e-4)
+
+
 def test_fwd_path_c_matches_reference_fp32_small_shape() -> None:
     """Path C fwd also matches the pure-MLX reference."""
 
@@ -543,7 +569,7 @@ def test_fwd_path_c_matches_path_b_at_bench_shape_fp32() -> None:
 
 
 def test_fwd_path_c_rejects_fp16_without_hidden_casts() -> None:
-    """Path C must not materialize large hidden cast buffers for non-FP32 inputs."""
+    """Path C must not materialize large hidden cast buffers for unsupported inputs."""
 
     _require_mamba3_path_c()
     inputs = _make_inputs(
@@ -554,7 +580,7 @@ def test_fwd_path_c_rejects_fp16_without_hidden_casts() -> None:
 
 
 def test_bwd_path_c_rejects_fp16_without_hidden_casts() -> None:
-    """Backward follows the same FP32-only no-hidden-cast ABI as forward."""
+    """Backward follows the same FP32/BF16 no-hidden-cast ABI as forward."""
 
     _require_mamba3_path_c()
     inputs = _make_inputs(
@@ -588,6 +614,32 @@ def test_bwd_path_c_matches_path_b_fp32_small_shape() -> None:
     for name, gpc, gpb in zip(names, g_pc, g_pb):
         np.testing.assert_allclose(_np(gpc), _np(gpb), rtol=1e-3, atol=1e-4,
                                     err_msg=f"grad mismatch on {name}")
+
+
+def test_bwd_path_c_matches_path_b_bf16_small_shape() -> None:
+    """Path C bwd consumes/returns bf16 owner buffers without hidden casts."""
+
+    _require_mamba3_path_c()
+    inputs = _make_inputs(batch=1, seq=6, heads=2, headdim=4, state=4, dtype=mx.bfloat16)
+    x, B, C, z, A, dt, D, h0 = inputs
+    mx.random.seed(123)
+    dy = (mx.random.normal(x.shape) * 0.1).astype(mx.bfloat16)
+    mx.eval(dy)
+
+    g_pc = mamba3_mimo_bwd_path_c(dy, x, B, C, z, A, dt, D, h0)
+    g_pb = mamba3_mimo_bwd_metal(dy, x, B, C, z, A, dt, D, h0)
+    mx.eval(*g_pc, *g_pb)
+
+    names = ["dx", "dB", "dC", "dz", "dA", "ddt", "dD", "dh0"]
+    for name, gpc, gpb in zip(names, g_pc, g_pb):
+        assert gpc.dtype == gpb.dtype == mx.bfloat16
+        np.testing.assert_allclose(
+            _np(gpc),
+            _np(gpb),
+            rtol=1e-2,
+            atol=1e-5,
+            err_msg=f"bf16 grad mismatch on {name}",
+        )
 
 
 def test_apply_path_c_vjp_matches_reference_inside_mlx_graph_transform() -> None:

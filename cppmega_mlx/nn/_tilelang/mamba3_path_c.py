@@ -24,10 +24,12 @@ Path B is the shipped hand-written Metal baseline. Path C is intentionally the
 Numerical contract
 ------------------
 
-The kernels operate on FP32 carriers. Non-FP32 callers fail closed instead of
-silently materializing large cast buffers. At FP32 the Path C and Path B kernels
-are *bit identical* on the tested shapes. The parity budget retained in tests is
-the conservative atol=1e-4 / rtol=1e-3.
+The kernels accept FP32 and BF16 carrier buffers directly. Recurrence state,
+reverse-scan state, and scalar reductions stay in FP32 registers; stores cast
+back to the dtype of the corresponding caller-owned buffer. Unsupported dtypes
+still fail closed instead of silently materializing large cast buffers. At FP32
+the Path C and Path B kernels are *bit identical* on the tested shapes. The
+parity budget retained in tests is the conservative atol=1e-4 / rtol=1e-3.
 
 Public surface
 --------------
@@ -160,6 +162,18 @@ Mamba3BwdOwnerOutputs = tuple[
 ]
 
 
+def _tl_dtype_for(dtype: mx.Dtype) -> str | None:
+    if dtype == mx.float32:
+        return "float32"
+    if dtype == mx.bfloat16:
+        return "bfloat16"
+    return None
+
+
+def _tl_dtype_for_auto(array: mx.array) -> str | None:
+    return _tl_dtype_for(array.dtype)
+
+
 def _reuse_tilelang_scalar_bindings(body: str) -> str:
     """Reuse scalar bindings that TileLang already emitted in the lowered body."""
 
@@ -258,6 +272,7 @@ class Mamba3PathCSchedulePlan:
 
 
 def _tilelang_available() -> tuple[bool, str]:
+    _msl_transform.ensure_libz3_preloaded()
     try:
         import tilelang  # noqa: F401
         from tilelang import tvm as _tvm  # noqa: F401
@@ -375,7 +390,7 @@ def mamba3_path_c_schedule_plan(
         headdim=headdim,
         state=state,
     )
-    fwd_candidate = dtype == "float32" and threads <= 256 and z3_proved
+    fwd_candidate = dtype in {"float32", "bfloat16"} and threads <= 256 and z3_proved
     simd_p_reduce = headdim == 32 and threads % 32 == 0
     bwd_candidate = fwd_candidate and simd_p_reduce
     bwd_reason = (
@@ -385,7 +400,8 @@ def mamba3_path_c_schedule_plan(
         else "bwd falls back to per-lane partial outputs until P maps to one simdgroup"
     )
     reason = (
-        f"rule: fp32 per-lane scan with {threads} threads over {grid_blocks} "
+        f"rule: fp32-accumulating {dtype} per-lane scan with {threads} "
+        f"threads over {grid_blocks} "
         f"blocks; {z3_reason}; bwd reverse pass reconstructs h_prev in "
         f"per-lane registers without global h_steps scratch; {bwd_reason}"
     )
@@ -553,7 +569,8 @@ def mamba3_path_c_auto_fwd_path_b_bwd_allowed(
         batch, seq, heads, headdim, state = _validate_inputs(x, B, C, z, A, dt, D, h0)
     except Exception:
         return False
-    if x.dtype != mx.float32:
+    dtype = _tl_dtype_for_auto(x)
+    if dtype is None:
         return False
     return (
         mamba3_path_c_receipt_auto_mode(
@@ -563,7 +580,7 @@ def mamba3_path_c_auto_fwd_path_b_bwd_allowed(
             heads=heads,
             headdim=headdim,
             state=state,
-            dtype="float32",
+            dtype=dtype,
         )
         == "path_c_fwd_path_b_bwd"
     )
@@ -587,7 +604,8 @@ def mamba3_path_c_auto_mode_for_inputs(
         batch, seq, heads, headdim, state = _validate_inputs(x, B, C, z, A, dt, D, h0)
     except Exception:
         return "path_b"
-    if x.dtype != mx.float32:
+    dtype = _tl_dtype_for_auto(x)
+    if dtype is None:
         return "path_b"
     return mamba3_path_c_receipt_auto_mode(
         receipt_path,
@@ -596,7 +614,7 @@ def mamba3_path_c_auto_mode_for_inputs(
         heads=heads,
         headdim=headdim,
         state=state,
-        dtype="float32",
+        dtype=dtype,
     )
 
 
@@ -653,6 +671,16 @@ def _fwd_kernel_for(
     HEADS: int,
     HEADDIM: int,
     STATE: int,
+    x_dtype: str = "float32",
+    B_dtype: str = "float32",
+    C_dtype: str = "float32",
+    z_dtype: str = "float32",
+    A_dtype: str = "float32",
+    dt_dtype: str = "float32",
+    D_dtype: str = "float32",
+    h0_dtype: str = "float32",
+    y_dtype: str = "float32",
+    h_last_dtype: str = "float32",
     *,
     return_msl: bool = False,
 ) -> tuple[Any, _msl_transform.TileLangMSLLowering]:
@@ -662,48 +690,52 @@ def _fwd_kernel_for(
 
     LANES = BATCH * HEADS * HEADDIM
     THREADS = _threads_for(LANES)
+    accum_dtype = "float32"
 
     @T.prim_func
     def fwd(
-        x: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), "float32"),
-        B: T.Tensor((BATCH, SEQ, HEADS, STATE), "float32"),
-        C: T.Tensor((BATCH, SEQ, HEADS, STATE), "float32"),
-        z: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), "float32"),
-        A: T.Tensor((BATCH, SEQ, HEADS), "float32"),
-        dt: T.Tensor((BATCH, SEQ, HEADS), "float32"),
-        D: T.Tensor((HEADS,), "float32"),
-        h0: T.Tensor((BATCH, HEADS, HEADDIM, STATE), "float32"),
-        y: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), "float32"),
-        h_last: T.Tensor((BATCH, HEADS, HEADDIM, STATE), "float32"),
+        x: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), x_dtype),
+        B: T.Tensor((BATCH, SEQ, HEADS, STATE), B_dtype),
+        C: T.Tensor((BATCH, SEQ, HEADS, STATE), C_dtype),
+        z: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), z_dtype),
+        A: T.Tensor((BATCH, SEQ, HEADS), A_dtype),
+        dt: T.Tensor((BATCH, SEQ, HEADS), dt_dtype),
+        D: T.Tensor((HEADS,), D_dtype),
+        h0: T.Tensor((BATCH, HEADS, HEADDIM, STATE), h0_dtype),
+        y: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), y_dtype),
+        h_last: T.Tensor((BATCH, HEADS, HEADDIM, STATE), h_last_dtype),
     ):
         with T.Kernel(T.ceildiv(LANES, THREADS), threads=THREADS) as bx:
             tid_in_block = T.get_thread_binding(0)
             global_lane = bx * THREADS + tid_in_block
             # Per-lane state lives in registers (size N).
-            h_state = T.alloc_local((STATE,), "float32")
+            h_state = T.alloc_local((STATE,), accum_dtype)
             if global_lane < LANES:
                 p = global_lane % HEADDIM
                 h = (global_lane // HEADDIM) % HEADS
                 b = global_lane // (HEADDIM * HEADS)
                 for n in T.serial(STATE):
-                    h_state[n] = h0[b, h, p, n]
+                    h_state[n] = T.cast(h0[b, h, p, n], accum_dtype)
                 for t in T.serial(SEQ):
-                    A_val = A[b, t, h]
-                    dt_val = dt[b, t, h]
+                    A_val = T.cast(A[b, t, h], accum_dtype)
+                    dt_val = T.cast(dt[b, t, h], accum_dtype)
                     decay = T.exp(A_val * dt_val)
-                    x_val = x[b, t, h, p]
-                    z_val = z[b, t, h, p]
+                    x_val = T.cast(x[b, t, h, p], accum_dtype)
+                    z_val = T.cast(z[b, t, h, p], accum_dtype)
                     y_acc = T.alloc_var(T.float32, init=0.0)
                     for n in T.serial(STATE):
-                        new_h = decay * h_state[n] + x_val * B[b, t, h, n]
+                        new_h = decay * h_state[n] + x_val * T.cast(
+                            B[b, t, h, n],
+                            accum_dtype,
+                        )
                         h_state[n] = new_h
-                        y_acc += new_h * C[b, t, h, n]
-                    D_h = D[h]
+                        y_acc += new_h * T.cast(C[b, t, h, n], accum_dtype)
+                    D_h = T.cast(D[h], accum_dtype)
                     y_skipped = y_acc + D_h * x_val
                     sig_z = 1.0 / (1.0 + T.exp(-z_val))
-                    y[b, t, h, p] = z_val * sig_z * y_skipped
+                    y[b, t, h, p] = T.cast(z_val * sig_z * y_skipped, y_dtype)
                 for n in T.serial(STATE):
-                    h_last[b, h, p, n] = h_state[n]
+                    h_last[b, h, p, n] = T.cast(h_state[n], h_last_dtype)
 
     artifact = dispatch_lower(fwd, target="metal", return_msl=True)
     if hasattr(artifact, "_tilelang_engine_target"):
@@ -735,6 +767,23 @@ def _bwd_kernel_for(
     HEADS: int,
     HEADDIM: int,
     STATE: int,
+    dy_dtype: str = "float32",
+    x_dtype: str = "float32",
+    B_dtype: str = "float32",
+    C_dtype: str = "float32",
+    z_dtype: str = "float32",
+    A_dtype: str = "float32",
+    dt_dtype: str = "float32",
+    D_dtype: str = "float32",
+    h0_dtype: str = "float32",
+    dx_dtype: str = "float32",
+    dz_dtype: str = "float32",
+    dB_dtype: str = "float32",
+    dC_dtype: str = "float32",
+    dA_dtype: str = "float32",
+    ddt_dtype: str = "float32",
+    dD_dtype: str = "float32",
+    dh0_dtype: str = "float32",
     *,
     return_msl: bool = False,
 ) -> tuple[Any, _msl_transform.TileLangMSLLowering]:
@@ -751,32 +800,33 @@ def _bwd_kernel_for(
 
     LANES = BATCH * HEADS * HEADDIM
     THREADS = _threads_for(LANES)
+    accum_dtype = "float32"
 
     @T.prim_func
     def bwd(
-        dy: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), "float32"),
-        x: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), "float32"),
-        B: T.Tensor((BATCH, SEQ, HEADS, STATE), "float32"),
-        C: T.Tensor((BATCH, SEQ, HEADS, STATE), "float32"),
-        z: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), "float32"),
-        A: T.Tensor((BATCH, SEQ, HEADS), "float32"),
-        dt: T.Tensor((BATCH, SEQ, HEADS), "float32"),
-        D: T.Tensor((HEADS,), "float32"),
-        h0: T.Tensor((BATCH, HEADS, HEADDIM, STATE), "float32"),
-        dx: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), "float32"),
-        dz: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), "float32"),
-        dB_partial: T.Tensor((BATCH, SEQ, HEADS, STATE, HEADDIM), "float32"),
-        dC_partial: T.Tensor((BATCH, SEQ, HEADS, STATE, HEADDIM), "float32"),
-        dA_partial: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), "float32"),
-        ddt_partial: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), "float32"),
-        dD_partial: T.Tensor((BATCH, HEADS, HEADDIM), "float32"),
-        dh0: T.Tensor((BATCH, HEADS, HEADDIM, STATE), "float32"),
+        dy: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), dy_dtype),
+        x: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), x_dtype),
+        B: T.Tensor((BATCH, SEQ, HEADS, STATE), B_dtype),
+        C: T.Tensor((BATCH, SEQ, HEADS, STATE), C_dtype),
+        z: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), z_dtype),
+        A: T.Tensor((BATCH, SEQ, HEADS), A_dtype),
+        dt: T.Tensor((BATCH, SEQ, HEADS), dt_dtype),
+        D: T.Tensor((HEADS,), D_dtype),
+        h0: T.Tensor((BATCH, HEADS, HEADDIM, STATE), h0_dtype),
+        dx: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), dx_dtype),
+        dz: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), dz_dtype),
+        dB_partial: T.Tensor((BATCH, SEQ, HEADS, STATE, HEADDIM), dB_dtype),
+        dC_partial: T.Tensor((BATCH, SEQ, HEADS, STATE, HEADDIM), dC_dtype),
+        dA_partial: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), dA_dtype),
+        ddt_partial: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), ddt_dtype),
+        dD_partial: T.Tensor((BATCH, HEADS, HEADDIM), dD_dtype),
+        dh0: T.Tensor((BATCH, HEADS, HEADDIM, STATE), dh0_dtype),
     ):
         with T.Kernel(T.ceildiv(LANES, THREADS), threads=THREADS) as bx:
             tid = T.get_thread_binding(0)
             global_lane = bx * THREADS + tid
-            h_state = T.alloc_local((STATE,), "float32")
-            dh = T.alloc_local((STATE,), "float32")
+            h_state = T.alloc_local((STATE,), accum_dtype)
+            dh = T.alloc_local((STATE,), accum_dtype)
             if global_lane < LANES:
                 p = global_lane % HEADDIM
                 h = (global_lane // HEADDIM) % HEADS
@@ -784,14 +834,17 @@ def _bwd_kernel_for(
 
                 # Forward prepass: keep only h_T in registers.
                 for n in T.serial(STATE):
-                    h_state[n] = h0[b, h, p, n]
+                    h_state[n] = T.cast(h0[b, h, p, n], accum_dtype)
                 for t in T.serial(SEQ):
-                    A_val = A[b, t, h]
-                    dt_val = dt[b, t, h]
+                    A_val = T.cast(A[b, t, h], accum_dtype)
+                    dt_val = T.cast(dt[b, t, h], accum_dtype)
                     decay = T.exp(A_val * dt_val)
-                    x_val = x[b, t, h, p]
+                    x_val = T.cast(x[b, t, h, p], accum_dtype)
                     for n in T.serial(STATE):
-                        new_h = decay * h_state[n] + x_val * B[b, t, h, n]
+                        new_h = decay * h_state[n] + x_val * T.cast(
+                            B[b, t, h, n],
+                            accum_dtype,
+                        )
                         h_state[n] = new_h
 
                 # Reverse pass. h_state[n] is h_t for the current t and is
@@ -799,21 +852,21 @@ def _bwd_kernel_for(
                 for n in T.serial(STATE):
                     dh[n] = 0.0
                 dD_acc = T.alloc_var(T.float32, init=0.0)
-                D_h = D[h]
+                D_h = T.cast(D[h], accum_dtype)
                 for r in T.serial(SEQ):
                     t = SEQ - 1 - r
-                    A_val = A[b, t, h]
-                    dt_val = dt[b, t, h]
+                    A_val = T.cast(A[b, t, h], accum_dtype)
+                    dt_val = T.cast(dt[b, t, h], accum_dtype)
                     decay = T.exp(A_val * dt_val)
                     inv_decay = T.alloc_var(T.float32, init=1.0 / decay)
-                    x_val = x[b, t, h, p]
-                    z_val = z[b, t, h, p]
-                    dY = dy[b, t, h, p]
+                    x_val = T.cast(x[b, t, h, p], accum_dtype)
+                    z_val = T.cast(z[b, t, h, p], accum_dtype)
+                    dY = T.cast(dy[b, t, h, p], accum_dtype)
 
                     # y_state[t] = sum_n h_t[n] * C[t,n]
                     y_state = T.alloc_var(T.float32, init=0.0)
                     for n in T.serial(STATE):
-                        y_state += h_state[n] * C[b, t, h, n]
+                        y_state += h_state[n] * T.cast(C[b, t, h, n], accum_dtype)
                     y_skipped = y_state + D_h * x_val
                     sig_z = 1.0 / (1.0 + T.exp(-z_val))
                     silu_z = z_val * sig_z
@@ -822,7 +875,7 @@ def _bwd_kernel_for(
                     d_silu = dY * y_skipped
                     d_y_skipped = dY * silu_z
 
-                    dz[b, t, h, p] = d_silu * silu_dz
+                    dz[b, t, h, p] = T.cast(d_silu * silu_dz, dz_dtype)
                     dD_acc += d_y_skipped * x_val
 
                     # Per-lane partials and h_prev reconstruction. Host sums
@@ -832,37 +885,55 @@ def _bwd_kernel_for(
                     d_decay = T.alloc_var(T.float32, init=0.0)
                     if t == 0:
                         for n in T.serial(STATE):
-                            C_val = C[b, t, h, n]
-                            B_val = B[b, t, h, n]
+                            C_val = T.cast(C[b, t, h, n], accum_dtype)
+                            B_val = T.cast(B[b, t, h, n], accum_dtype)
                             dh_n = dh[n] + d_y_skipped * C_val
-                            dC_partial[b, t, h, n, p] = d_y_skipped * h_state[n]
-                            dB_partial[b, t, h, n, p] = dh_n * x_val
+                            dC_partial[b, t, h, n, p] = T.cast(
+                                d_y_skipped * h_state[n],
+                                dC_dtype,
+                            )
+                            dB_partial[b, t, h, n, p] = T.cast(
+                                dh_n * x_val,
+                                dB_dtype,
+                            )
                             dx_inp += dh_n * B_val
-                            d_decay += dh_n * h0[b, h, p, n]
+                            d_decay += dh_n * T.cast(h0[b, h, p, n], accum_dtype)
                             dh[n] = dh_n * decay
                     else:
                         for n in T.serial(STATE):
-                            C_val = C[b, t, h, n]
-                            B_val = B[b, t, h, n]
+                            C_val = T.cast(C[b, t, h, n], accum_dtype)
+                            B_val = T.cast(B[b, t, h, n], accum_dtype)
                             dh_n = dh[n] + d_y_skipped * C_val
-                            dC_partial[b, t, h, n, p] = d_y_skipped * h_state[n]
-                            dB_partial[b, t, h, n, p] = dh_n * x_val
+                            dC_partial[b, t, h, n, p] = T.cast(
+                                d_y_skipped * h_state[n],
+                                dC_dtype,
+                            )
+                            dB_partial[b, t, h, n, p] = T.cast(
+                                dh_n * x_val,
+                                dB_dtype,
+                            )
                             dx_inp += dh_n * B_val
                             h_prev = (h_state[n] - x_val * B_val) * inv_decay
                             d_decay += dh_n * h_prev
                             h_state[n] = h_prev
                             dh[n] = dh_n * decay
                     dx_skip = d_y_skipped * D_h
-                    dx[b, t, h, p] = dx_skip + dx_inp
+                    dx[b, t, h, p] = T.cast(dx_skip + dx_inp, dx_dtype)
 
                     d_logdecay = d_decay * decay
-                    dA_partial[b, t, h, p] = d_logdecay * dt_val
-                    ddt_partial[b, t, h, p] = d_logdecay * A_val
+                    dA_partial[b, t, h, p] = T.cast(
+                        d_logdecay * dt_val,
+                        dA_dtype,
+                    )
+                    ddt_partial[b, t, h, p] = T.cast(
+                        d_logdecay * A_val,
+                        ddt_dtype,
+                    )
 
                 # After the backward sweep, dh is dh0 for this lane.
                 for n in T.serial(STATE):
-                    dh0[b, h, p, n] = dh[n]
-                dD_partial[b, h, p] = dD_acc
+                    dh0[b, h, p, n] = T.cast(dh[n], dh0_dtype)
+                dD_partial[b, h, p] = T.cast(dD_acc, dD_dtype)
 
     artifact = dispatch_lower(bwd, target="metal", return_msl=True)
     if hasattr(artifact, "_tilelang_engine_target"):
@@ -904,6 +975,23 @@ def _bwd_simd_reduce_kernel_for(
     HEADS: int,
     HEADDIM: int,
     STATE: int,
+    dy_dtype: str = "float32",
+    x_dtype: str = "float32",
+    B_dtype: str = "float32",
+    C_dtype: str = "float32",
+    z_dtype: str = "float32",
+    A_dtype: str = "float32",
+    dt_dtype: str = "float32",
+    D_dtype: str = "float32",
+    h0_dtype: str = "float32",
+    dx_dtype: str = "float32",
+    dz_dtype: str = "float32",
+    dB_dtype: str = "float32",
+    dC_dtype: str = "float32",
+    dA_dtype: str = "float32",
+    ddt_dtype: str = "float32",
+    dD_dtype: str = "float32",
+    dh0_dtype: str = "float32",
     *,
     return_msl: bool = False,
 ) -> tuple[Any, _msl_transform.TileLangMSLLowering]:
@@ -930,64 +1018,68 @@ def _bwd_simd_reduce_kernel_for(
 
     LANES = BATCH * HEADS * HEADDIM
     THREADS = _threads_for(LANES)
+    accum_dtype = "float32"
 
     @T.prim_func
     def bwd_simd(
-        dy: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), "float32"),
-        x: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), "float32"),
-        B: T.Tensor((BATCH, SEQ, HEADS, STATE), "float32"),
-        C: T.Tensor((BATCH, SEQ, HEADS, STATE), "float32"),
-        z: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), "float32"),
-        A: T.Tensor((BATCH, SEQ, HEADS), "float32"),
-        dt: T.Tensor((BATCH, SEQ, HEADS), "float32"),
-        D: T.Tensor((HEADS,), "float32"),
-        h0: T.Tensor((BATCH, HEADS, HEADDIM, STATE), "float32"),
-        dx: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), "float32"),
-        dz: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), "float32"),
-        dB: T.Tensor((BATCH, SEQ, HEADS, STATE), "float32"),
-        dC: T.Tensor((BATCH, SEQ, HEADS, STATE), "float32"),
-        dA: T.Tensor((BATCH, SEQ, HEADS), "float32"),
-        ddt: T.Tensor((BATCH, SEQ, HEADS), "float32"),
-        dD_batch: T.Tensor((BATCH, HEADS), "float32"),
-        dh0: T.Tensor((BATCH, HEADS, HEADDIM, STATE), "float32"),
+        dy: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), dy_dtype),
+        x: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), x_dtype),
+        B: T.Tensor((BATCH, SEQ, HEADS, STATE), B_dtype),
+        C: T.Tensor((BATCH, SEQ, HEADS, STATE), C_dtype),
+        z: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), z_dtype),
+        A: T.Tensor((BATCH, SEQ, HEADS), A_dtype),
+        dt: T.Tensor((BATCH, SEQ, HEADS), dt_dtype),
+        D: T.Tensor((HEADS,), D_dtype),
+        h0: T.Tensor((BATCH, HEADS, HEADDIM, STATE), h0_dtype),
+        dx: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), dx_dtype),
+        dz: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), dz_dtype),
+        dB: T.Tensor((BATCH, SEQ, HEADS, STATE), dB_dtype),
+        dC: T.Tensor((BATCH, SEQ, HEADS, STATE), dC_dtype),
+        dA: T.Tensor((BATCH, SEQ, HEADS), dA_dtype),
+        ddt: T.Tensor((BATCH, SEQ, HEADS), ddt_dtype),
+        dD_batch: T.Tensor((BATCH, HEADS), dD_dtype),
+        dh0: T.Tensor((BATCH, HEADS, HEADDIM, STATE), dh0_dtype),
     ):
         with T.Kernel(T.ceildiv(LANES, THREADS), threads=THREADS) as bx:
             tid = T.get_thread_binding(0)
             global_lane = bx * THREADS + tid
-            h_state = T.alloc_local((STATE,), "float32")
-            dh = T.alloc_local((STATE,), "float32")
+            h_state = T.alloc_local((STATE,), accum_dtype)
+            dh = T.alloc_local((STATE,), accum_dtype)
             if global_lane < LANES:
                 p = global_lane % HEADDIM
                 h = (global_lane // HEADDIM) % HEADS
                 b = global_lane // (HEADDIM * HEADS)
 
                 for n in T.serial(STATE):
-                    h_state[n] = h0[b, h, p, n]
+                    h_state[n] = T.cast(h0[b, h, p, n], accum_dtype)
                 for t in T.serial(SEQ):
-                    A_val = A[b, t, h]
-                    dt_val = dt[b, t, h]
+                    A_val = T.cast(A[b, t, h], accum_dtype)
+                    dt_val = T.cast(dt[b, t, h], accum_dtype)
                     decay = T.exp(A_val * dt_val)
-                    x_val = x[b, t, h, p]
+                    x_val = T.cast(x[b, t, h, p], accum_dtype)
                     for n in T.serial(STATE):
-                        h_state[n] = decay * h_state[n] + x_val * B[b, t, h, n]
+                        h_state[n] = decay * h_state[n] + x_val * T.cast(
+                            B[b, t, h, n],
+                            accum_dtype,
+                        )
 
                 for n in T.serial(STATE):
                     dh[n] = 0.0
                 dD_acc = T.alloc_var(T.float32, init=0.0)
-                D_h = D[h]
+                D_h = T.cast(D[h], accum_dtype)
                 for r in T.serial(SEQ):
                     t = SEQ - 1 - r
-                    A_val = A[b, t, h]
-                    dt_val = dt[b, t, h]
+                    A_val = T.cast(A[b, t, h], accum_dtype)
+                    dt_val = T.cast(dt[b, t, h], accum_dtype)
                     decay = T.exp(A_val * dt_val)
                     inv_decay = T.alloc_var(T.float32, init=1.0 / decay)
-                    x_val = x[b, t, h, p]
-                    z_val = z[b, t, h, p]
-                    dY = dy[b, t, h, p]
+                    x_val = T.cast(x[b, t, h, p], accum_dtype)
+                    z_val = T.cast(z[b, t, h, p], accum_dtype)
+                    dY = T.cast(dy[b, t, h, p], accum_dtype)
 
                     y_state = T.alloc_var(T.float32, init=0.0)
                     for n in T.serial(STATE):
-                        y_state += h_state[n] * C[b, t, h, n]
+                        y_state += h_state[n] * T.cast(C[b, t, h, n], accum_dtype)
                     y_skipped = y_state + D_h * x_val
                     sig_z = 1.0 / (1.0 + T.exp(-z_val))
                     silu_z = z_val * sig_z
@@ -996,15 +1088,15 @@ def _bwd_simd_reduce_kernel_for(
                     d_silu = dY * y_skipped
                     d_y_skipped = dY * silu_z
 
-                    dz[b, t, h, p] = d_silu * silu_dz
+                    dz[b, t, h, p] = T.cast(d_silu * silu_dz, dz_dtype)
                     dD_acc += d_y_skipped * x_val
 
                     dx_inp = T.alloc_var(T.float32, init=0.0)
                     d_decay = T.alloc_var(T.float32, init=0.0)
                     if t == 0:
                         for n in T.serial(STATE):
-                            C_val = C[b, t, h, n]
-                            B_val = B[b, t, h, n]
+                            C_val = T.cast(C[b, t, h, n], accum_dtype)
+                            B_val = T.cast(B[b, t, h, n], accum_dtype)
                             dh_n = dh[n] + d_y_skipped * C_val
                             dC_sum = T.call_intrin(
                                 "float32",
@@ -1017,15 +1109,15 @@ def _bwd_simd_reduce_kernel_for(
                                 dh_n * x_val,
                             )
                             if p == 0:
-                                dC[b, t, h, n] = dC_sum
-                                dB[b, t, h, n] = dB_sum
+                                dC[b, t, h, n] = T.cast(dC_sum, dC_dtype)
+                                dB[b, t, h, n] = T.cast(dB_sum, dB_dtype)
                             dx_inp += dh_n * B_val
-                            d_decay += dh_n * h0[b, h, p, n]
+                            d_decay += dh_n * T.cast(h0[b, h, p, n], accum_dtype)
                             dh[n] = dh_n * decay
                     else:
                         for n in T.serial(STATE):
-                            C_val = C[b, t, h, n]
-                            B_val = B[b, t, h, n]
+                            C_val = T.cast(C[b, t, h, n], accum_dtype)
+                            B_val = T.cast(B[b, t, h, n], accum_dtype)
                             dh_n = dh[n] + d_y_skipped * C_val
                             dC_sum = T.call_intrin(
                                 "float32",
@@ -1038,15 +1130,15 @@ def _bwd_simd_reduce_kernel_for(
                                 dh_n * x_val,
                             )
                             if p == 0:
-                                dC[b, t, h, n] = dC_sum
-                                dB[b, t, h, n] = dB_sum
+                                dC[b, t, h, n] = T.cast(dC_sum, dC_dtype)
+                                dB[b, t, h, n] = T.cast(dB_sum, dB_dtype)
                             dx_inp += dh_n * B_val
                             h_prev = (h_state[n] - x_val * B_val) * inv_decay
                             d_decay += dh_n * h_prev
                             h_state[n] = h_prev
                             dh[n] = dh_n * decay
                     dx_skip = d_y_skipped * D_h
-                    dx[b, t, h, p] = dx_skip + dx_inp
+                    dx[b, t, h, p] = T.cast(dx_skip + dx_inp, dx_dtype)
 
                     d_logdecay = d_decay * decay
                     dA_lane = d_logdecay * dt_val
@@ -1054,14 +1146,14 @@ def _bwd_simd_reduce_kernel_for(
                     dA_sum = T.call_intrin("float32", "tir.metal.simd_sum", dA_lane)
                     ddt_sum = T.call_intrin("float32", "tir.metal.simd_sum", ddt_lane)
                     if p == 0:
-                        dA[b, t, h] = dA_sum
-                        ddt[b, t, h] = ddt_sum
+                        dA[b, t, h] = T.cast(dA_sum, dA_dtype)
+                        ddt[b, t, h] = T.cast(ddt_sum, ddt_dtype)
 
                 for n in T.serial(STATE):
-                    dh0[b, h, p, n] = dh[n]
+                    dh0[b, h, p, n] = T.cast(dh[n], dh0_dtype)
                 dD_sum = T.call_intrin("float32", "tir.metal.simd_sum", dD_acc)
                 if p == 0:
-                    dD_batch[b, h] = dD_sum
+                    dD_batch[b, h] = T.cast(dD_sum, dD_dtype)
 
     artifact = dispatch_lower(bwd_simd, target="metal", return_msl=True)
     if hasattr(artifact, "_tilelang_engine_target"):
@@ -1091,13 +1183,25 @@ def _bwd_simd_reduce_kernel_for(
 # ---------------------------------------------------------------------------
 
 
-def _require_fp32_no_hidden_casts(op_name: str, *arrays: mx.array) -> None:
-    bad = [str(array.dtype) for array in arrays if array.dtype != mx.float32]
+def _require_supported_no_hidden_casts(
+    op_name: str,
+    *named_arrays: tuple[str, mx.array],
+) -> dict[str, str]:
+    dtypes: dict[str, str] = {}
+    bad: list[str] = []
+    for name, array in named_arrays:
+        dtype = _tl_dtype_for(array.dtype)
+        if dtype is None:
+            bad.append(f"{name}={array.dtype}")
+        else:
+            dtypes[name] = dtype
     if bad:
         raise RuntimeError(
             f"{op_name} direct tvm-ffi owner-output route supports mx.float32 "
-            f"inputs without hidden casts; got non-fp32 dtypes {bad}"
+            "and mx.bfloat16 buffers without hidden casts; got unsupported "
+            f"dtypes {bad}"
         )
+    return dtypes
 
 
 def _require_owner_array(
@@ -1106,6 +1210,7 @@ def _require_owner_array(
     array: mx.array,
     *,
     shape: tuple[int, ...],
+    dtype: mx.Dtype,
 ) -> mx.array:
     if not isinstance(array, mx.array):
         raise TypeError(
@@ -1117,9 +1222,9 @@ def _require_owner_array(
             f"{op_name}: owner output {name} must have shape {shape}; "
             f"got {tuple(array.shape)}"
         )
-    if array.dtype != mx.float32:
+    if array.dtype != dtype:
         raise TypeError(
-            f"{op_name}: owner output {name} must be mx.float32; got {array.dtype}"
+            f"{op_name}: owner output {name} must be {dtype}; got {array.dtype}"
         )
     return array
 
@@ -1132,6 +1237,8 @@ def _mamba3_fwd_owner_outputs(
     heads: int,
     headdim: int,
     state: int,
+    y_dtype: mx.Dtype,
+    h_last_dtype: mx.Dtype,
 ) -> Mamba3FwdOwnerOutputs | None:
     op_name = "mamba3_mimo_fwd_path_c"
     if out is None:
@@ -1147,12 +1254,14 @@ def _mamba3_fwd_owner_outputs(
             "y",
             y,
             shape=(batch, seq, heads, headdim),
+            dtype=y_dtype,
         ),
         _require_owner_array(
             op_name,
             "h_last",
             h_last,
             shape=(batch, heads, headdim, state),
+            dtype=h_last_dtype,
         ),
     )
 
@@ -1165,6 +1274,7 @@ def _mamba3_bwd_owner_outputs(
     heads: int,
     headdim: int,
     state: int,
+    dtypes: tuple[mx.Dtype, ...],
 ) -> Mamba3BwdOwnerOutputs | None:
     op_name = "mamba3_mimo_bwd_path_c"
     if out is None:
@@ -1186,11 +1296,12 @@ def _mamba3_bwd_owner_outputs(
     return cast(
         Mamba3BwdOwnerOutputs,
         tuple(
-            _require_owner_array(op_name, name, array, shape=shape)
-            for name, array, shape in zip(
+            _require_owner_array(op_name, name, array, shape=shape, dtype=dtype)
+            for name, array, shape, dtype in zip(
                 _BWD_OUTPUT_NAMES,
                 out,
                 expected_shapes,
+                dtypes,
                 strict=True,
             )
         ),
@@ -1231,16 +1342,16 @@ def mamba3_mimo_fwd_path_c(
         raise RuntimeError(f"mamba3_mimo_fwd_path_c unavailable: {status.reason}")
 
     batch, seq, heads, headdim, state = _validate_inputs(x, B, C, z, A, dt, D, h0)
-    _require_fp32_no_hidden_casts(
+    dtypes = _require_supported_no_hidden_casts(
         "mamba3_mimo_fwd_path_c",
-        x,
-        B,
-        C,
-        z,
-        A,
-        dt,
-        D,
-        h0,
+        ("x", x),
+        ("B", B),
+        ("C", C),
+        ("z", z),
+        ("A", A),
+        ("dt", dt),
+        ("D", D),
+        ("h0", h0),
     )
     if seq == 0:
         if out is not None:
@@ -1248,10 +1359,26 @@ def mamba3_mimo_fwd_path_c(
                 "mamba3_mimo_fwd_path_c owner-output route is not dispatchable "
                 "for seq=0; return h0 directly instead of copying it"
             )
-        return mx.zeros((batch, 0, heads, headdim), dtype=mx.float32), h0
+        return mx.zeros((batch, 0, heads, headdim), dtype=x.dtype), h0
 
     try:
-        kernel, lowering = _fwd_kernel_for(batch, seq, heads, headdim, state)
+        kernel, lowering = _fwd_kernel_for(
+            batch,
+            seq,
+            heads,
+            headdim,
+            state,
+            dtypes["x"],
+            dtypes["B"],
+            dtypes["C"],
+            dtypes["z"],
+            dtypes["A"],
+            dtypes["dt"],
+            dtypes["D"],
+            dtypes["h0"],
+            dtypes["x"],
+            dtypes["h0"],
+        )
     except (MSLDispatchUnsupported, RuntimeError, ValueError) as exc:
         raise RuntimeError("mamba3_mimo_fwd_path_c lowering failed") from exc
 
@@ -1262,6 +1389,8 @@ def mamba3_mimo_fwd_path_c(
         heads=heads,
         headdim=headdim,
         state=state,
+        y_dtype=x.dtype,
+        h_last_dtype=h0.dtype,
     )
     try:
         if owner_outputs is None:
@@ -1317,17 +1446,17 @@ def _mamba3_mimo_bwd_path_c_simd_kernel(
         raise RuntimeError(f"mamba3_mimo_bwd_path_c unavailable: {status.reason}")
 
     batch, seq, heads, headdim, state = _validate_inputs(x, B, C, z, A, dt, D, h0)
-    _require_fp32_no_hidden_casts(
+    dtypes = _require_supported_no_hidden_casts(
         "mamba3_mimo_bwd_path_c",
-        dy,
-        x,
-        B,
-        C,
-        z,
-        A,
-        dt,
-        D,
-        h0,
+        ("dy", dy),
+        ("x", x),
+        ("B", B),
+        ("C", C),
+        ("z", z),
+        ("A", A),
+        ("dt", dt),
+        ("D", D),
+        ("h0", h0),
     )
     if seq == 0:
         raise RuntimeError(
@@ -1350,6 +1479,23 @@ def _mamba3_mimo_bwd_path_c_simd_kernel(
             heads,
             headdim,
             state,
+            dtypes["dy"],
+            dtypes["x"],
+            dtypes["B"],
+            dtypes["C"],
+            dtypes["z"],
+            dtypes["A"],
+            dtypes["dt"],
+            dtypes["D"],
+            dtypes["h0"],
+            dtypes["x"],
+            dtypes["z"],
+            dtypes["B"],
+            dtypes["C"],
+            dtypes["A"],
+            dtypes["dt"],
+            dtypes["D"],
+            dtypes["h0"],
         )
     except (MSLDispatchUnsupported, RuntimeError, ValueError) as exc:
         raise RuntimeError("mamba3_mimo_bwd_path_c simd lowering failed") from exc
@@ -1397,17 +1543,17 @@ def _mamba3_mimo_bwd_path_c_partials(
         raise RuntimeError(f"mamba3_mimo_bwd_path_c unavailable: {status.reason}")
 
     batch, seq, heads, headdim, state = _validate_inputs(x, B, C, z, A, dt, D, h0)
-    _require_fp32_no_hidden_casts(
+    dtypes = _require_supported_no_hidden_casts(
         "mamba3_mimo_bwd_path_c",
-        dy,
-        x,
-        B,
-        C,
-        z,
-        A,
-        dt,
-        D,
-        h0,
+        ("dy", dy),
+        ("x", x),
+        ("B", B),
+        ("C", C),
+        ("z", z),
+        ("A", A),
+        ("dt", dt),
+        ("D", D),
+        ("h0", h0),
     )
     if seq == 0:
         raise RuntimeError(
@@ -1416,7 +1562,30 @@ def _mamba3_mimo_bwd_path_c_partials(
         )
 
     try:
-        kernel, lowering = _bwd_kernel_for(batch, seq, heads, headdim, state)
+        kernel, lowering = _bwd_kernel_for(
+            batch,
+            seq,
+            heads,
+            headdim,
+            state,
+            dtypes["dy"],
+            dtypes["x"],
+            dtypes["B"],
+            dtypes["C"],
+            dtypes["z"],
+            dtypes["A"],
+            dtypes["dt"],
+            dtypes["D"],
+            dtypes["h0"],
+            dtypes["x"],
+            dtypes["z"],
+            dtypes["B"],
+            dtypes["C"],
+            dtypes["A"],
+            dtypes["dt"],
+            dtypes["D"],
+            dtypes["h0"],
+        )
     except (MSLDispatchUnsupported, RuntimeError, ValueError) as exc:
         raise RuntimeError("mamba3_mimo_bwd_path_c lowering failed") from exc
 
@@ -1427,6 +1596,7 @@ def _mamba3_mimo_bwd_path_c_partials(
         heads=heads,
         headdim=headdim,
         state=state,
+        dtypes=(x.dtype, z.dtype, B.dtype, C.dtype, A.dtype, dt.dtype, D.dtype, h0.dtype),
     )
     try:
         if owner_outputs is None:
@@ -1522,17 +1692,17 @@ def _mamba3_mimo_bwd_path_c_kernel(
     """Run the lowered Path C bwd kernel and reduce partials to public grads."""
 
     batch, seq, heads, headdim, _state = _validate_inputs(x, B, C, z, A, dt, D, h0)
-    _require_fp32_no_hidden_casts(
+    _require_supported_no_hidden_casts(
         "mamba3_mimo_bwd_path_c",
-        dy,
-        x,
-        B,
-        C,
-        z,
-        A,
-        dt,
-        D,
-        h0,
+        ("dy", dy),
+        ("x", x),
+        ("B", B),
+        ("C", C),
+        ("z", z),
+        ("A", A),
+        ("dt", dt),
+        ("D", D),
+        ("h0", h0),
     )
     if seq == 0:
         if out is not None:
