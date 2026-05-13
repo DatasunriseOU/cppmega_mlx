@@ -21,6 +21,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import traceback
 from typing import Any
 
 import numpy as np
@@ -127,8 +128,8 @@ FP8_PATH_C_DTYPE = "fp8_path_c"
 FP8_PATH_C_ROUTE_BLOCKER_TYPE = "fp8_path_c_training_route_unavailable"
 FP8_PATH_C_KERNEL_SURFACE_STATUS = "prepared_buffer_path_c_available"
 FP8_PATH_C_E2E_TRAINING_STATUS = "m04_path_c_training_route_available"
-FP8_PATH_C_BRIDGE_TARGET = "dlpack_tvm_ffi_prepared_buffer_bridge"
-FP8_PATH_C_BRIDGE_STATUS = "m04_wired_for_existing_path_c_ops"
+FP8_PATH_C_BRIDGE_TARGET = "native_mlx_tvm_ffi_graph_bridge"
+FP8_PATH_C_BRIDGE_STATUS = "m04_wired_for_native_tvm_ffi_graph_outputs"
 FP8_PATH_C_CARRIER_DTYPE = "bfloat16"
 FP8_PATH_C_NATIVE_PRODUCER_STATUS = "attention_sparse_mla_fp8_producer_wired"
 FP8_PATH_C_PRODUCER_MISSING_STATUS = "producer_missing"
@@ -831,6 +832,9 @@ def fp8_path_c_training_route_payload(
             "tvm_ffi_from_dlpack_available": True,
             "mlx_metal_dlpack_device": "kDLMetal:0",
             "tvm_from_dlpack_device": "metal:0",
+            "native_mlx_array_wrapper_linked": True,
+            "native_tvm_ffi_graph_outputs": True,
+            "dlpack_used_for_path_c_graph_bridge": False,
             "standalone_mlx_to_tvm_metal_kernel_verified": True,
             "m04_bridge_wired": bool(requested),
         },
@@ -856,7 +860,7 @@ def fp8_path_c_training_route_payload(
                 "training_surface": producer_configured,
                 "producer_required": True,
                 "producer_status": producer["status"],
-                "backward_surface": "direct_owner_buffer_scatter",
+                "backward_surface": "native_tvm_ffi_graph_output_scatter",
             },
             {
                 "name": "mamba3_mimo_path_c",
@@ -1812,6 +1816,12 @@ def run_local_gb10_quarter_training(
 
         device = device_info()
         compile_plan = compile_payload(config, device)
+        loss_eval_chunks = not bool(compile_plan["enabled"])
+        if fp8_path_c_route_requested(config):
+            # MLX 0.32 rejects explicit evals inside value_and_grad once the
+            # FP8 Path C graph uses custom TileLang-backed nodes. Keep chunking
+            # for memory shape, but let the enclosing eval own scheduling.
+            loss_eval_chunks = False
         peak_memory_reset = bool(reset_peak_memory())
         memory_before = metal_memory_payload()
 
@@ -1842,7 +1852,7 @@ def run_local_gb10_quarter_training(
                 model_arg,
                 batch,
                 chunk_rows=config.cce_chunk_rows,
-                eval_chunks=not bool(compile_plan["enabled"]),
+                eval_chunks=loss_eval_chunks,
             )
 
         stepper = CompiledPretrainingStep(
@@ -1915,6 +1925,7 @@ def run_local_gb10_quarter_training(
             "compile": config.compile,
             "compile_enabled": compile_plan["enabled"],
             "compile_plan": compile_plan,
+            "loss_eval_chunks": loss_eval_chunks,
             "dtype": config.dtype,
             "dataset": dataset_payload(dataset, config),
             "device": device,
@@ -1943,10 +1954,12 @@ def run_local_gb10_quarter_training(
             return enforce_loss_decrease_requirement(args, receipt)
         return receipt, 0
     except Exception as exc:
+        reason = str(exc) or repr(exc)
+        reason = f"{reason}\n{traceback.format_exc()}"
         return (
             blocked_receipt(
                 args,
-                str(exc),
+                reason,
                 type(exc).__name__,
                 probe_allocation=False,
             ),

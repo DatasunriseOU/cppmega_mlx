@@ -720,6 +720,7 @@ class CausalSelfAttention(nn.Module):
                 sinks=sinks,
                 force_path_c=True,
                 causal=prepared.causal,
+                output_dtype=prepared.q.dtype,
             )
         else:
             out = sparse_mla_fp8_path_c_apply(

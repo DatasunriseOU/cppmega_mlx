@@ -1,0 +1,5 @@
+wrote bench/baselines/m04_optimizer_matrix/live_20260513_bf16_adamw_bs1_seq2048_20step.json
+status: ok
+steps_completed: 20
+final_loss: 5.992325782775879
+peak_memory_bytes: 31359131474

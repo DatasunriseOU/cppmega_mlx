@@ -1796,6 +1796,7 @@ def _make_fp8_sparse_mla_apply_kernel(
     K: int,
     d_v: int,
     threads: int,
+    out_dtype: str,
 ) -> Any:
     import tilelang.language as T
     from tilelang.tileop.metal_quant import fp8_e4m3fn_to_float
@@ -1824,6 +1825,7 @@ def _make_fp8_sparse_mla_apply_kernel(
         _SMFP8_APPLY_IDX_SIZE=batch * seq_len * kv_group * topk,
         _SMFP8_APPLY_OUT_SIZE=lanes * d_v,
         _SMFP8_APPLY_LSE_SIZE=lanes,
+        _SMFP8_APPLY_OUT_DTYPE=out_dtype,
     )
 
     @T.prim_func
@@ -1836,7 +1838,7 @@ def _make_fp8_sparse_mla_apply_kernel(
         sm_scale_buf: T.Tensor((1,), "float32"),
         sinks: T.Tensor((_SMFP8_APPLY_H,), "float32"),
         has_sinks: T.Tensor((1,), "int32"),
-        out: T.Tensor((_SMFP8_APPLY_OUT_SIZE,), "float16"),
+        out: T.Tensor((_SMFP8_APPLY_OUT_SIZE,), _SMFP8_APPLY_OUT_DTYPE),
         lse: T.Tensor((_SMFP8_APPLY_LSE_SIZE,), "float32"),
     ):
         with T.Kernel(_SMFP8_APPLY_LANES, threads=_SMFP8_APPLY_THREADS) as bx:
@@ -1953,7 +1955,9 @@ def _make_fp8_sparse_mla_apply_kernel(
                             * fp8_e4m3fn_to_float(kv_fp8[kv_row_base + d])
                             * kv_scale[kv_scale_idx]
                         )
-                out[out_row + d] = T.cast(acc[0] * inv_sum[0], "float16")
+                out[out_row + d] = T.cast(
+                    acc[0] * inv_sum[0], _SMFP8_APPLY_OUT_DTYPE
+                )
 
             if lane == 0:
                 if local[0] > 0.0:
@@ -2287,6 +2291,7 @@ def _fp8_apply_kernel_for(
     K: int,
     d_v: int,
     threads: int,
+    out_dtype: str,
 ) -> tuple[Any, _msl_transform.TileLangMSLLowering, list[str]]:
     prim = _make_fp8_sparse_mla_apply_kernel(
         batch=batch,
@@ -2299,6 +2304,7 @@ def _fp8_apply_kernel_for(
         K=K,
         d_v=d_v,
         threads=threads,
+        out_dtype=out_dtype,
     )
     lowering = cast(
         _msl_transform.TileLangMSLLowering,
@@ -2328,7 +2334,7 @@ def _fp8_apply_kernel_for(
     kernel = mx.fast.metal_kernel(
         name=(
             "cppmega_sparse_mla_fp8_apply_path_c_"
-            f"{batch}_{seq_len}_{heads}_{seq_len_kv}_{kv_group}_{topk}_{K}_{d_v}_{threads}"
+            f"{batch}_{seq_len}_{heads}_{seq_len_kv}_{kv_group}_{topk}_{K}_{d_v}_{threads}_{out_dtype}"
         ),
         input_names=input_names,
         output_names=["out", "lse"],
@@ -2351,6 +2357,7 @@ def _fp8_apply_tvm_ffi_kernel_for(
     K: int,
     d_v: int,
     threads: int,
+    out_dtype: str,
 ) -> Any:
     """Compile the FP8 prepared forward kernel for caller-owned outputs."""
 
@@ -2367,6 +2374,7 @@ def _fp8_apply_tvm_ffi_kernel_for(
         K=K,
         d_v=d_v,
         threads=threads,
+        out_dtype=out_dtype,
     )
     return tilelang.compile(
         prim,
@@ -2498,6 +2506,26 @@ def _flat_1d_view(array: mx.array) -> mx.array:
     return array.reshape((int(array.size),))
 
 
+def _native_owner_output_buffer(shape: tuple[int, ...], dtype: mx.Dtype) -> mx.array:
+    """Allocate a materialized MLX owner-output buffer through TileLang's C++ bridge."""
+
+    try:
+        from tilelang.contrib.mlx_tvm_ffi import owner_output_buffer
+    except Exception as exc:
+        raise SparseMLAFp8PathCDirectError(
+            "native TileLang MLX TVM-FFI owner-output allocator is unavailable"
+        ) from exc
+    return owner_output_buffer(shape, dtype)
+
+
+def _native_mlx_tvm_ffi_available() -> bool:
+    try:
+        from tilelang.contrib.mlx_tvm_ffi import is_available
+    except Exception:
+        return False
+    return bool(is_available())
+
+
 def _clear_fp8_bwd_dkv_buffer(dkv_buffer: mx.array) -> mx.array:
     total = int(dkv_buffer.size)
     if total <= 0:
@@ -2553,6 +2581,57 @@ def _dispatch_fp8_bwd_owner_output_path_c(
 
     dq_shape = (batch, seq_len, heads, K)
     dkv_shape = (batch, seq_len_kv, kv_group, K)
+    if dq_buffer is None and dkv_buffer is None:
+        if not _native_mlx_tvm_ffi_available():
+            if force_path_c:
+                raise RuntimeError(
+                    "sparse_mla_fp8_bwd_path_c requires either caller-owned "
+                    "outputs or the native MLX TVM-FFI graph bridge"
+                )
+            return None
+        try:
+            kernel = _fp8_bwd_tvm_ffi_kernel_for(
+                batch,
+                seq_len,
+                heads,
+                seq_len_kv,
+                kv_group,
+                head_kv,
+                topk,
+                K,
+                d_v,
+                threads,
+                d_out_dtype,
+            )
+            returned = kernel(
+                _flat_1d_view(q_fp8),
+                _flat_1d_view(q_scale),
+                _flat_1d_view(kv_fp8),
+                _flat_1d_view(kv_scale),
+                _flat_1d_view(d_out),
+                _flat_1d_view(indices_i32),
+                sm_scale_buf,
+            )
+        except Exception as exc:
+            if force_path_c:
+                raise RuntimeError(
+                    "sparse_mla_fp8_bwd_path_c: native tvm-ffi graph-output "
+                    f"dispatch failed: {type(exc).__name__}: {exc}"
+                ) from exc
+            return None
+        if not isinstance(returned, (list, tuple)) or len(returned) != 2:
+            raise SparseMLAFp8PathCDirectError(
+                "native tvm-ffi FP8 Sparse-MLA backward did not return "
+                "dq/dkv graph outputs"
+            )
+        dq = cast(mx.array, returned[0]).reshape(dq_shape)
+        dkv = cast(mx.array, returned[1]).reshape(dkv_shape)
+        return dq, dkv
+    if (dq_buffer is None) != (dkv_buffer is None):
+        raise SparseMLAFp8PathCDirectError(
+            "sparse_mla_fp8_bwd_path_c owner-output route requires both "
+            "dq_buffer and dkv_buffer"
+        )
     try:
         dq_owner, dkv_owner = _validate_fp8_bwd_owner_outputs(
             dq_buffer,
@@ -2607,14 +2686,20 @@ def _dispatch_fp8_bwd_owner_output_path_c(
     return dq_owner, dkv_owner
 
 
-def _tilelang_float_dtype(dtype: mx.Dtype) -> str:
+def _tilelang_float_dtype(dtype: mx.Dtype, *, name: str = "dtype") -> str:
     if dtype == mx.float32:
         return "float32"
     if dtype == mx.float16:
         return "float16"
     if dtype == mx.bfloat16:
         return "bfloat16"
-    raise TypeError(f"d_out must be float32, float16, or bfloat16; got {dtype}")
+    raise TypeError(f"{name} must be float32, float16, or bfloat16; got {dtype}")
+
+
+def _mx_float_dtype(dtype: mx.Dtype | None, *, default: mx.Dtype) -> mx.Dtype:
+    resolved = default if dtype is None else dtype
+    _tilelang_float_dtype(resolved, name="output_dtype")
+    return resolved
 
 
 def _validate_fp8_apply_owner_outputs(
@@ -2625,6 +2710,7 @@ def _validate_fp8_apply_owner_outputs(
     seq_len: int,
     heads: int,
     d_v: int,
+    out_dtype: mx.Dtype,
 ) -> tuple[mx.array, mx.array]:
     if not isinstance(out, mx.array):
         raise TypeError(f"out must be an mlx.core.array; got {type(out).__name__}")
@@ -2640,8 +2726,8 @@ def _validate_fp8_apply_owner_outputs(
         raise ValueError(
             f"lse must have shape {expected_lse_shape}; got {tuple(lse.shape)}"
         )
-    if out.dtype != mx.float16:
-        raise TypeError(f"out must be mx.float16; got {out.dtype}")
+    if out.dtype != out_dtype:
+        raise TypeError(f"out must be {out_dtype}; got {out.dtype}")
     if lse.dtype != mx.float32:
         raise TypeError(f"lse must be mx.float32; got {lse.dtype}")
     return out, lse
@@ -2696,6 +2782,7 @@ def sparse_mla_fp8_path_c_apply_direct(
     lse: mx.array,
     d_v: int | None = None,
     sinks: mx.array | None = None,
+    output_dtype: mx.Dtype | None = None,
 ) -> tuple[mx.array, mx.array]:
     """Run FP8 Sparse-MLA forward through tvm-ffi into caller-owned outputs."""
 
@@ -2727,7 +2814,9 @@ def sparse_mla_fp8_path_c_apply_direct(
         seq_len=seq_len,
         heads=heads,
         d_v=d_v_resolved,
+        out_dtype=_mx_float_dtype(output_dtype, default=out.dtype),
     )
+    out_dtype = _tilelang_float_dtype(out_buf.dtype, name="output_dtype")
     try:
         kernel = _fp8_apply_tvm_ffi_kernel_for(
             batch,
@@ -2740,6 +2829,7 @@ def sparse_mla_fp8_path_c_apply_direct(
             K,
             d_v_resolved,
             threads,
+            out_dtype,
         )
     except Exception as exc:
         raise SparseMLAFp8PathCDirectError(
@@ -2808,6 +2898,7 @@ def sparse_mla_fp8_path_c_apply(
     force_path_c: bool = False,
     out: mx.array | None = None,
     lse: mx.array | None = None,
+    output_dtype: mx.Dtype | None = None,
 ) -> mx.array | tuple[mx.array, mx.array] | None:
     """Run fused FP8 Sparse-MLA Path C over prepared GPU buffers.
 
@@ -2833,6 +2924,7 @@ def sparse_mla_fp8_path_c_apply(
             lse=lse,
             d_v=d_v,
             sinks=sinks,
+            output_dtype=output_dtype,
         )
         if return_lse:
             return direct_out, direct_lse
@@ -2863,6 +2955,38 @@ def sparse_mla_fp8_path_c_apply(
         indices,
         d_v=d_v,
     )
+    output_dtype_resolved = _mx_float_dtype(output_dtype, default=mx.float16)
+    output_dtype_tl = _tilelang_float_dtype(output_dtype_resolved, name="output_dtype")
+    if _native_mlx_tvm_ffi_available():
+        out_buf = _native_owner_output_buffer(
+            (batch, seq_len, heads, d_v_resolved), output_dtype_resolved
+        )
+        lse_buf = _native_owner_output_buffer(
+            (batch, seq_len, heads), mx.float32
+        )
+        direct_out, direct_lse = sparse_mla_fp8_path_c_apply_direct(
+            q_fp8,
+            q_scale,
+            kv_fp8,
+            kv_scale,
+            indices,
+            sm_scale=sm_scale,
+            out=out_buf,
+            lse=lse_buf,
+            d_v=d_v_resolved,
+            sinks=sinks,
+            output_dtype=output_dtype_resolved,
+        )
+        if return_lse:
+            return direct_out, direct_lse
+        return direct_out
+    if output_dtype_resolved == mx.bfloat16:
+        if force_path_c:
+            raise RuntimeError(
+                "sparse_mla_fp8_path_c_apply: bfloat16 Path C output requires "
+                "the native MLX TVM-FFI bridge"
+            )
+        return None
     try:
         kernel, lowering, input_names = _fp8_apply_kernel_for(
             batch,
@@ -2875,6 +2999,7 @@ def sparse_mla_fp8_path_c_apply(
             K,
             d_v_resolved,
             threads,
+            output_dtype_tl,
         )
     except Exception as exc:
         if force_path_c:
@@ -2916,7 +3041,7 @@ def sparse_mla_fp8_path_c_apply(
             (batch, seq_len, heads, d_v_resolved),
             (batch, seq_len, heads),
         ],
-        output_dtypes=[mx.float16, mx.float32],
+        output_dtypes=[output_dtype_resolved, mx.float32],
         lowering=lowering,
     )
     out, lse = outputs
@@ -3070,6 +3195,7 @@ def sparse_mla_fp8_path_c_apply_prepared_float(
     sinks: mx.array | None = None,
     force_path_c: bool = False,
     causal: bool = False,
+    output_dtype: mx.Dtype | None = None,
 ) -> mx.array:
     """Differentiable owner wrapper for prepared-buffer FP8 Path C apply.
 
@@ -3094,6 +3220,7 @@ def sparse_mla_fp8_path_c_apply_prepared_float(
             d_v=d_v,
             sinks=sinks,
             force_path_c=force_path_c,
+            output_dtype=_mx_float_dtype(output_dtype, default=q_in.dtype),
         )
         if out is None:
             if force_path_c:
@@ -3162,6 +3289,10 @@ def sparse_mla_fp8_path_c_apply_prepared_float(
             _, vjps = mx.vjp(_ref_apply, (q_in, kv_in), (cotangent,))
             return vjps[0], vjps[1]
         dq, dkv = grads
+        if dq.dtype != q_in.dtype:
+            dq = dq.astype(q_in.dtype)
+        if dkv.dtype != kv_in.dtype:
+            dkv = dkv.astype(kv_in.dtype)
         return dq, dkv
 
     return _apply(q, kv)

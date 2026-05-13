@@ -47,6 +47,7 @@ from cppmega_mlx.nn._tilelang.sparse_mla_fp8 import (  # noqa: E402
 )
 from cppmega_mlx.nn._tilelang.fp8_msl_kernels import fp8_scaled_vecmat  # noqa: E402
 from cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c import (  # noqa: E402
+    SparseMLAFp8PathCDirectError,
     SparseMLAFp8IndexedQKReducePathCStatus,
     SparseMLAFp8QKReducePathCStatus,
     SparseMLAFp8PathCStatus,
@@ -869,9 +870,7 @@ def test_fp8_bwd_metal_returns_outputs() -> None:
     assert tuple(dkv.shape) == tuple(kv.shape)
 
 
-def test_fp8_path_c_bwd_without_owner_outputs_fails_closed(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_fp8_path_c_bwd_owner_outputs_must_be_passed_as_a_pair() -> None:
     import cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c as path_c_module
 
     q, kv, indices, d_v = _make_inputs(scale=0.1)
@@ -880,33 +879,14 @@ def test_fp8_path_c_bwd_without_owner_outputs_fails_closed(
     q_scale = mx.ones(tuple(q.shape[:-1]), dtype=mx.float32)
     kv_scale = mx.ones(tuple(kv.shape[:-1]), dtype=mx.float32)
     d_out = mx.zeros(tuple(q.shape[:3]) + (d_v,), dtype=mx.float32)
-
-    def fail_large_zero(*args: object, **kwargs: object) -> object:
-        del args, kwargs
-        raise AssertionError("Path C backward must not allocate owner buffers")
-
-    def fail_mx_fast(*args: object, **kwargs: object) -> object:
-        del args, kwargs
-        raise AssertionError("Path C backward must not build mx.fast wrappers")
-
-    monkeypatch.setattr(path_c_module, "can_run_metal", lambda: True)
-    monkeypatch.setattr(path_c_module.mx, "zeros", fail_large_zero)
-    monkeypatch.setattr(path_c_module.mx.fast, "metal_kernel", fail_mx_fast)
-
-    assert (
-        sparse_mla_fp8_bwd_path_c(
-            q_fp8,
-            q_scale,
-            kv_fp8,
-            kv_scale,
-            d_out,
-            indices,
-            sm_scale=q.shape[-1] ** -0.5,
-            d_v=d_v,
-        )
-        is None
+    dq_buffer = path_c_module._native_owner_output_buffer(
+        tuple(q.shape), mx.float32
     )
-    with pytest.raises(RuntimeError, match="caller-owned dq_buffer and dkv_buffer"):
+
+    with pytest.raises(
+        SparseMLAFp8PathCDirectError,
+        match="requires both dq_buffer and dkv_buffer",
+    ):
         sparse_mla_fp8_bwd_path_c(
             q_fp8,
             q_scale,
@@ -916,19 +896,25 @@ def test_fp8_path_c_bwd_without_owner_outputs_fails_closed(
             indices,
             sm_scale=q.shape[-1] ** -0.5,
             d_v=d_v,
-            force_path_c=True,
+            dq_buffer=dq_buffer,
         )
 
 
 def test_fp8_path_c_bwd_owner_outputs_run_through_atomic_tvm_ffi() -> None:
+    import cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c as path_c_module
+
     q, kv, indices, d_v = _make_inputs(scale=0.1)
     q_fp8 = mx.zeros(tuple(q.shape), dtype=mx.uint8)
     kv_fp8 = mx.zeros(tuple(kv.shape), dtype=mx.uint8)
     q_scale = mx.ones(tuple(q.shape[:-1]), dtype=mx.float32)
     kv_scale = mx.ones(tuple(kv.shape[:-1]), dtype=mx.float32)
     d_out = mx.zeros(tuple(q.shape[:3]) + (d_v,), dtype=mx.float32)
-    dq_buffer = mx.zeros(q.shape, dtype=mx.float32)
-    dkv_buffer = mx.zeros(kv.shape, dtype=mx.float32)
+    dq_buffer = path_c_module._native_owner_output_buffer(
+        tuple(q.shape), mx.float32
+    )
+    dkv_buffer = path_c_module._native_owner_output_buffer(
+        tuple(kv.shape), mx.float32
+    )
 
     result = sparse_mla_fp8_bwd_path_c(
         q_fp8,
@@ -961,6 +947,81 @@ def test_fp8_path_c_bwd_owner_outputs_run_through_atomic_tvm_ffi() -> None:
     mx.eval(dq_buffer, dkv_buffer)
     assert np.all(np.isfinite(np.asarray(dq_buffer)))
     assert np.all(np.isfinite(np.asarray(dkv_buffer)))
+
+
+def test_fp8_path_c_bwd_without_owner_outputs_uses_native_graph_outputs() -> None:
+    q, kv, indices, d_v = _make_inputs(scale=0.1)
+    q_fp8 = mx.zeros(tuple(q.shape), dtype=mx.uint8)
+    kv_fp8 = mx.zeros(tuple(kv.shape), dtype=mx.uint8)
+    q_scale = mx.ones(tuple(q.shape[:-1]), dtype=mx.float32)
+    kv_scale = mx.ones(tuple(kv.shape[:-1]), dtype=mx.float32)
+    d_out = mx.zeros(tuple(q.shape[:3]) + (d_v,), dtype=mx.float32)
+
+    result = sparse_mla_fp8_bwd_path_c(
+        q_fp8,
+        q_scale,
+        kv_fp8,
+        kv_scale,
+        d_out,
+        indices,
+        sm_scale=q.shape[-1] ** -0.5,
+        d_v=d_v,
+        force_path_c=True,
+    )
+
+    assert result is not None
+    dq, dkv = result
+    assert tuple(dq.shape) == tuple(q.shape)
+    assert tuple(dkv.shape) == tuple(kv.shape)
+    assert dq.dtype == mx.float32
+    assert dkv.dtype == mx.float32
+    mx.eval(dq, dkv)
+    assert np.all(np.isfinite(np.asarray(dq)))
+    assert np.all(np.isfinite(np.asarray(dkv)))
+
+
+def test_fp8_path_c_prepared_float_vjp_uses_native_graph_outputs() -> None:
+    q, kv, indices, d_v = _make_inputs(scale=0.1)
+    q = q.astype(mx.bfloat16)
+    kv = kv.astype(mx.bfloat16)
+    q_fp8 = mx.zeros(tuple(q.shape), dtype=mx.uint8)
+    kv_fp8 = mx.zeros(tuple(kv.shape), dtype=mx.uint8)
+    q_scale = mx.ones(tuple(q.shape[:-1]), dtype=mx.float32)
+    kv_scale = mx.ones(tuple(kv.shape[:-1]), dtype=mx.float32)
+
+    def loss_fn(q_in: mx.array, kv_in: mx.array) -> mx.array:
+        out = sparse_mla_fp8_path_c_apply_prepared_float(
+            q_in,
+            kv_in,
+            q_fp8,
+            q_scale,
+            kv_fp8,
+            kv_scale,
+            indices,
+            sm_scale=q.shape[-1] ** -0.5,
+            d_v=d_v,
+            force_path_c=True,
+        )
+        return mx.sum(out.astype(mx.float32))
+
+    loss, grads = mx.value_and_grad(loss_fn, argnums=(0, 1))(q, kv)
+    dq, dkv = grads
+    mx.eval(loss, dq, dkv)
+    assert tuple(dq.shape) == tuple(q.shape)
+    assert tuple(dkv.shape) == tuple(kv.shape)
+    assert dq.dtype == q.dtype
+    assert dkv.dtype == kv.dtype
+    assert np.all(np.isfinite(np.asarray(dq.astype(mx.float32))))
+    assert np.all(np.isfinite(np.asarray(dkv.astype(mx.float32))))
+
+
+def test_fp8_path_c_native_owner_output_allocator_returns_mlx_array() -> None:
+    import cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c as path_c_module
+
+    out = path_c_module._native_owner_output_buffer((2, 3), mx.float32)
+    assert isinstance(out, mx.array)
+    assert tuple(out.shape) == (2, 3)
+    assert out.dtype == mx.float32
 
 
 def _assert_fp8_path_c_bwd_runs_with_owner_buffers(
@@ -1184,7 +1245,7 @@ def test_fp8_path_c_forward_owner_output_abi_is_fail_closed(
     kv_fp8 = mx.zeros(tuple(kv.shape), dtype=mx.uint8)
     q_scale = mx.ones(tuple(q.shape[:-1]), dtype=mx.float32)
     kv_scale = mx.ones(tuple(kv.shape[:-1]), dtype=mx.float32)
-    out = mx.zeros(tuple(q.shape[:3]) + (d_v,), dtype=mx.float32)
+    out = mx.zeros(tuple(q.shape[:3]) + (d_v,), dtype=mx.int32)
     lse = mx.zeros(tuple(q.shape[:3]), dtype=mx.float32)
 
     monkeypatch.setattr(path_c_module, "can_run_metal", lambda: True)
@@ -1199,7 +1260,7 @@ def test_fp8_path_c_forward_owner_output_abi_is_fail_closed(
             d_v=d_v,
             out=out,
         )
-    with pytest.raises(TypeError, match="out must be mx.float16"):
+    with pytest.raises(TypeError, match="output_dtype must be float32, float16, or bfloat16"):
         path_c_module.sparse_mla_fp8_path_c_apply(
             q_fp8,
             q_scale,
@@ -1691,6 +1752,8 @@ def test_fp8_path_c_prepared_float_wrapper_does_not_quantize(
     import cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c as path_c_module
 
     q, kv, indices, d_v = _make_inputs(scale=0.1)
+    q = q.astype(mx.bfloat16)
+    kv = kv.astype(mx.bfloat16)
     q_fp8 = mx.zeros(tuple(q.shape), dtype=mx.uint8)
     kv_fp8 = mx.zeros(tuple(kv.shape), dtype=mx.uint8)
     q_scale = mx.ones(tuple(q.shape[:-1]), dtype=mx.float32)
@@ -1712,9 +1775,11 @@ def test_fp8_path_c_prepared_float_wrapper_does_not_quantize(
         sinks: mx.array | None = None,
         return_lse: bool = False,
         force_path_c: bool = False,
+        output_dtype: mx.Dtype | None = None,
     ) -> mx.array:
         del q_scale_in, kv_scale_in, indices_in, sm_scale, sinks, return_lse
         assert force_path_c is True
+        assert output_dtype == q.dtype
         calls.append((tuple(q_fp8_in.shape), tuple(kv_fp8_in.shape)))
         return mx.zeros(
             (
@@ -1723,7 +1788,7 @@ def test_fp8_path_c_prepared_float_wrapper_does_not_quantize(
                 q_fp8_in.shape[2],
                 d_v or q_fp8_in.shape[-1],
             ),
-            dtype=mx.float16,
+            dtype=q.dtype,
         )
 
     monkeypatch.setattr(path_c_module, "_to_fp8_with_per_token_scale", fail_quantize)

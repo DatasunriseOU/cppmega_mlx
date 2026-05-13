@@ -132,8 +132,14 @@ _FWD_KERNEL_SOURCE = """
             y_acc += new_h * C_val;
         }
         float y_skipped = y_acc + D_h * x_val;
-        // SiLU: z * sigmoid(z)
-        float sig_z = 1.0f / (1.0f + exp(-z_val));
+        // Stable SiLU: avoid exp(-z) overflow and 0 * inf for large negative gates.
+        float sig_z;
+        if (z_val >= 0.0f) {
+            sig_z = 1.0f / (1.0f + exp(-z_val));
+        } else {
+            float exp_z = exp(z_val);
+            sig_z = exp_z / (1.0f + exp_z);
+        }
         y[xz_idx] = T_OUT(z_val * sig_z * y_skipped);
     }
 
@@ -262,7 +268,13 @@ _BWD_KERNEL_SOURCE = """
             y_state += float(h_steps_scratch[scratch_t + n]) * float(C_proj[bc_idx + n]);
         }
         float y_skipped = y_state + D_h * x_val;
-        float sig_z = 1.0f / (1.0f + exp(-z_val));
+        float sig_z;
+        if (z_val >= 0.0f) {
+            sig_z = 1.0f / (1.0f + exp(-z_val));
+        } else {
+            float exp_z = exp(z_val);
+            sig_z = exp_z / (1.0f + exp_z);
+        }
         float silu_z = z_val * sig_z;
         float silu_dz = sig_z * (1.0f + z_val * (1.0f - sig_z));
 

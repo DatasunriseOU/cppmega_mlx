@@ -173,7 +173,8 @@ def test_lowered_msl_reuses_hot_scalar_temporaries() -> None:
     assert "thread float y_acc[1]" not in fwd
     assert len(re.findall(r"float decay = exp\(", fwd)) == 1
     assert re.search(r"exp\([^;\n]+\) \* h_state", fwd) is None
-    assert len(re.findall(r"float sig_z = .*exp\(", fwd)) == 1
+    assert len(re.findall(r"sig_z = .*exp\(", fwd)) == 2
+    assert "sig_z = exp(z_val)" in fwd
     assert re.search(r"z_val \* \([^;\n]+exp\(", fwd) is None
 
     bwd = dump_lowered_bwd_msl(batch=1, seq=4, heads=1, headdim=2, state=4)
@@ -181,8 +182,13 @@ def test_lowered_msl_reuses_hot_scalar_temporaries() -> None:
     assert len(re.findall(r"float decay_1 = exp\(", bwd)) == 1
     assert re.search(r"d_decay\[0\] \* exp\(", bwd) is None
     assert re.search(r"dh\[n_\d+\] = \(dh\[n_\d+\] \* exp\(", bwd) is None
-    assert len(re.findall(r"float sig_z = .*exp\(", bwd)) == 1
+    assert len(re.findall(r"sig_z = .*exp\(", bwd)) == 2
+    assert "sig_z = exp(z_val)" in bwd
     assert re.search(r"dY \* \(z_val \* \([^;\n]+exp\(", bwd) is None
+    assert "y_state = sig_z" not in bwd
+    assert "dx_inp = sig_z" not in bwd
+    assert "d_decay = sig_z" not in bwd
+    assert "sig_z = sig_z" not in bwd
 
 
 def test_raw_lowering_uses_tilelang_metal_scalar_pipeline() -> None:
@@ -556,6 +562,24 @@ def test_fwd_path_c_matches_reference_fp32_small_shape() -> None:
     np.testing.assert_allclose(_np(h_pc), _np(h_ref), rtol=1e-4, atol=1e-5)
 
 
+def test_fwd_path_c_stable_silu_handles_large_negative_gate() -> None:
+    """Path C emits a sign-split SiLU and avoids exp(-z) overflow in-kernel."""
+
+    _require_mamba3_path_c()
+    inputs = list(_make_inputs(batch=1, seq=8, heads=2, headdim=4, state=4, dtype=mx.float32))
+    inputs[3] = mx.full(inputs[3].shape, -200.0, dtype=mx.float32)
+    mx.eval(*inputs)
+
+    y_pc, h_pc = mamba3_mimo_fwd_path_c(*inputs)
+    y_ref, h_ref = mamba3_mimo_reference(*inputs)
+    y_pc_np = _np(y_pc)
+    h_pc_np = _np(h_pc)
+    assert np.isfinite(y_pc_np).all()
+    assert np.isfinite(h_pc_np).all()
+    np.testing.assert_allclose(y_pc_np, _np(y_ref), rtol=1e-4, atol=1e-5)
+    np.testing.assert_allclose(h_pc_np, _np(h_ref), rtol=1e-4, atol=1e-5)
+
+
 def test_fwd_path_c_matches_path_b_at_bench_shape_fp32() -> None:
     """At the spec bench shape (B=2,T=512,H=4,P=32,N=64) Path C matches Path B."""
 
@@ -639,6 +663,102 @@ def test_bwd_path_c_matches_path_b_bf16_small_shape() -> None:
             rtol=1e-2,
             atol=1e-5,
             err_msg=f"bf16 grad mismatch on {name}",
+        )
+
+
+def test_bwd_path_c_headdim64_bf16_uses_skip_D_tensor() -> None:
+    """Regression for full-tensor bf16 bwd lowering at the model headdim."""
+
+    _require_mamba3_path_c()
+    batch, seq, heads, headdim, state = 1, 8, 2, 64, 64
+    x = mx.full((batch, seq, heads, headdim), 0.125, dtype=mx.bfloat16)
+    B = mx.zeros((batch, seq, heads, state), dtype=mx.bfloat16)
+    C = mx.zeros((batch, seq, heads, state), dtype=mx.bfloat16)
+    z = mx.full((batch, seq, heads, headdim), 0.25, dtype=mx.bfloat16)
+    A = mx.full((batch, seq, heads), -0.1, dtype=mx.bfloat16)
+    dt = mx.full((batch, seq, heads), 0.01, dtype=mx.bfloat16)
+    D = mx.array([1.0, 2.0], dtype=mx.bfloat16)
+    h0 = mx.zeros((batch, heads, headdim, state), dtype=mx.bfloat16)
+    dy = mx.ones_like(x)
+
+    g_pc = mamba3_mimo_bwd_path_c(dy, x, B, C, z, A, dt, D, h0)
+    g_pb = mamba3_mimo_bwd_metal(dy, x, B, C, z, A, dt, D, h0)
+    mx.eval(*g_pc, *g_pb)
+
+    names = ["dx", "dB", "dC", "dz", "dA", "ddt", "dD", "dh0"]
+    for name, gpc, gpb in zip(names, g_pc, g_pb, strict=True):
+        assert bool(mx.all(mx.isfinite(gpc.astype(mx.float32))).item())
+        np.testing.assert_allclose(
+            _np(gpc),
+            _np(gpb),
+            rtol=1e-2,
+            atol=1e-5,
+            err_msg=f"headdim64 bf16 D-path grad mismatch on {name}",
+        )
+
+
+def test_bwd_path_c_snapshot_route_keeps_long_headdim64_bf16_finite() -> None:
+    """Long bf16 reverse recurrence uses tensor snapshots instead of T-wide inversion."""
+
+    _require_mamba3_path_c()
+    seq = mamba3_path_c._BWD_SNAPSHOT_BLOCK + 32
+    inputs = _make_inputs(
+        batch=1,
+        seq=seq,
+        heads=1,
+        headdim=64,
+        state=64,
+        dtype=mx.bfloat16,
+        seed=29,
+    )
+    x, B, C, z, A, dt, D, h0 = inputs
+    dy = mx.ones_like(x)
+
+    g_pc = mamba3_mimo_bwd_path_c(dy, x, B, C, z, A, dt, D, h0)
+    g_pb = mamba3_mimo_bwd_metal(dy, x, B, C, z, A, dt, D, h0)
+    mx.eval(*g_pc, *g_pb)
+
+    names = ["dx", "dB", "dC", "dz", "dA", "ddt", "dD", "dh0"]
+    for name, gpc, gpb in zip(names, g_pc, g_pb, strict=True):
+        assert bool(mx.all(mx.isfinite(gpc.astype(mx.float32))).item())
+        np.testing.assert_allclose(
+            _np(gpc),
+            _np(gpb),
+            rtol=1e-1,
+            atol=5e-3,
+            err_msg=f"snapshot bwd grad mismatch on {name}",
+        )
+
+
+def test_bwd_path_c_snapshot_route_survives_decay_underflow() -> None:
+    """Snapshot bwd must not reconstruct h_prev via 1 / decay when decay underflows."""
+
+    _require_mamba3_path_c()
+    batch, heads, headdim, state = 1, 1, 4, 4
+    seq = mamba3_path_c._BWD_SNAPSHOT_BLOCK + 3
+    x = mx.full((batch, seq, heads, headdim), 0.125, dtype=mx.float32)
+    B = mx.full((batch, seq, heads, state), 0.5, dtype=mx.float32)
+    C = mx.full((batch, seq, heads, state), 0.25, dtype=mx.float32)
+    z = mx.full((batch, seq, heads, headdim), 0.1, dtype=mx.float32)
+    A = mx.full((batch, seq, heads), -200.0, dtype=mx.float32)
+    dt = mx.full((batch, seq, heads), 5.0, dtype=mx.float32)
+    D = mx.ones((heads,), dtype=mx.float32)
+    h0 = mx.zeros((batch, heads, headdim, state), dtype=mx.float32)
+    dy = mx.ones_like(x)
+
+    g_pc = mamba3_mimo_bwd_path_c(dy, x, B, C, z, A, dt, D, h0)
+    g_pb = mamba3_mimo_bwd_metal(dy, x, B, C, z, A, dt, D, h0)
+    mx.eval(*g_pc, *g_pb)
+
+    names = ["dx", "dB", "dC", "dz", "dA", "ddt", "dD", "dh0"]
+    for name, gpc, gpb in zip(names, g_pc, g_pb, strict=True):
+        assert bool(mx.all(mx.isfinite(gpc.astype(mx.float32))).item())
+        np.testing.assert_allclose(
+            _np(gpc),
+            _np(gpb),
+            rtol=1e-3,
+            atol=1e-4,
+            err_msg=f"underflow snapshot bwd grad mismatch on {name}",
         )
 
 
