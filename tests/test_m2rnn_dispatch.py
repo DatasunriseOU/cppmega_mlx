@@ -91,10 +91,10 @@ def test_path_b_policy_forces_metal(monkeypatch: pytest.MonkeyPatch) -> None:
     assert matches[-1]["kernel_used"] == "metal_kernel_fwd_v1"
 
 
-def test_path_c_dispatch_fails_closed_before_broadcast_or_state_allocation(
+def test_path_c_dispatches_grouped_heads_without_path_b_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Explicit Path C refuses mixer broadcast/state allocation instead of copying."""
+    """Explicit Path C lowers grouped production heads inside TileLang."""
 
     if not _METAL_AVAILABLE:
         pytest.skip("Metal not available")
@@ -112,10 +112,19 @@ def test_path_c_dispatch_fails_closed_before_broadcast_or_state_allocation(
     monkeypatch.setattr(m2rnn_path_b, "m2rnn_apply_with_state", fail_path_b)
     monkeypatch.setenv("CPPMEGA_KERNEL_PATH", "path_c")
     block, hidden = _make_block()
-    with pytest.raises(RuntimeError, match="pre-aligned.*head counts"):
-        block(hidden)
+    h0 = block.initial_h0(hidden.shape[0], hidden.dtype)
+    out, h = block(hidden, h0=h0)
+    mx.eval(out, h)
+    assert out.shape == hidden.shape
+    assert h.shape == (
+        1,
+        block.config.num_heads,
+        block.config.k_head_dim,
+        block.config.v_head_dim,
+    )
     matches = [e for e in get_dispatch_log() if e["op_name"] == "m2rnn"]
-    assert not matches, f"failed Path C dispatch should not log success: {matches}"
+    assert matches[-1]["path"] == "path_c"
+    assert matches[-1]["kernel_used"] == "path_c_tilelang_dsl_packed_post"
 
 
 def test_path_c_dispatch_requires_existing_h0_without_allocating(
@@ -131,10 +140,14 @@ def test_path_c_dispatch_requires_existing_h0_without_allocating(
 
     monkeypatch.setattr(
         m2rnn_path_c,
-        "m2rnn_packed_path_c_status",
+        "m2rnn_mapped_packed_path_c_status",
         fail_path_c_status,
     )
-    monkeypatch.setattr(m2rnn_path_c, "m2rnn_apply_packed_with_state_path_c", fail_path_c_kernel)
+    monkeypatch.setattr(
+        m2rnn_path_c,
+        "m2rnn_apply_mapped_packed_with_state_path_c",
+        fail_path_c_kernel,
+    )
     monkeypatch.setenv("CPPMEGA_KERNEL_PATH", "path_c")
     cfg = M2RNNConfig(
         d_model=16,
@@ -167,7 +180,7 @@ def test_path_c_dispatch_accepts_explicit_initial_h0(
 
     monkeypatch.setattr(
         m2rnn_path_c,
-        "m2rnn_packed_path_c_status",
+        "m2rnn_mapped_packed_path_c_status",
         lambda *_args, **_kwargs: m2rnn_path_c.M2RNNPathCStatus(
             True,
             "forced packed available",
@@ -179,9 +192,11 @@ def test_path_c_dispatch_accepts_explicit_initial_h0(
         W: mx.array,
         xf: mx.array,
         h0: mx.array,
+        **_kwargs: object,
     ) -> tuple[mx.array, mx.array]:
         batch, seq, _conv_dim = conv_input.shape
-        heads, v_dim, _ = W.shape
+        heads = h0.shape[1]
+        v_dim = W.shape[-1]
         seen["conv_input"] = tuple(conv_input.shape)
         seen["xf"] = tuple(xf.shape)
         seen["h0"] = tuple(h0.shape)
@@ -189,8 +204,29 @@ def test_path_c_dispatch_accepts_explicit_initial_h0(
 
     monkeypatch.setattr(
         m2rnn_path_c,
-        "m2rnn_apply_packed_with_state_path_c",
+        "m2rnn_apply_mapped_packed_with_state_path_c",
         fake_path_c_kernel,
+    )
+
+    def fake_post_kernel(
+        y: mx.array,
+        *_args: object,
+        **_kwargs: object,
+    ) -> mx.array:
+        return y.reshape(y.shape[0], y.shape[1], -1)
+
+    monkeypatch.setattr(
+        m2rnn_path_c,
+        "m2rnn_post_residual_gate_path_c_status",
+        lambda *_args, **_kwargs: m2rnn_path_c.M2RNNPathCStatus(
+            True,
+            "forced post available",
+        ),
+    )
+    monkeypatch.setattr(
+        m2rnn_path_c,
+        "m2rnn_apply_post_residual_gate_path_c",
+        fake_post_kernel,
     )
     monkeypatch.setenv("CPPMEGA_KERNEL_PATH", "path_c")
     cfg = M2RNNConfig(
@@ -219,13 +255,121 @@ def test_path_c_dispatch_accepts_explicit_initial_h0(
     assert h.shape == seen["h0"]
     matches = [e for e in get_dispatch_log() if e["op_name"] == "m2rnn"]
     assert matches[-1]["path"] == "path_c"
-    assert matches[-1]["kernel_used"] == "path_c_tilelang_dsl_packed"
+    assert matches[-1]["kernel_used"] == "path_c_tilelang_dsl_packed_post"
 
 
-def test_path_c_transform_dlpack_boundary_falls_back_to_path_b(
+def test_path_c_dispatch_uses_fused_post_without_v_g_broadcast_materialization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from cppmega_mlx.nn._tilelang import m2rnn as m2rnn_path_b
+    from cppmega_mlx.nn import m2rnn as m2rnn_mod
+    from cppmega_mlx.nn._tilelang import m2rnn_path_c
+
+    seen: dict[str, tuple[int, ...] | int] = {}
+
+    monkeypatch.setattr(
+        m2rnn_path_c,
+        "m2rnn_mapped_packed_path_c_status",
+        lambda *_args, **_kwargs: m2rnn_path_c.M2RNNPathCStatus(
+            True,
+            "forced recurrence available",
+        ),
+    )
+    monkeypatch.setattr(
+        m2rnn_path_c,
+        "m2rnn_post_residual_gate_path_c_status",
+        lambda *_args, **_kwargs: m2rnn_path_c.M2RNNPathCStatus(
+            True,
+            "forced post available",
+        ),
+    )
+
+    def fake_recurrence(
+        conv_input: mx.array,
+        _W: mx.array,
+        _xf: mx.array,
+        h0: mx.array,
+        **_kwargs: object,
+    ) -> tuple[mx.array, mx.array]:
+        batch, seq, _conv_dim = conv_input.shape
+        seen["conv_input"] = tuple(conv_input.shape)
+        return (
+            mx.zeros((batch, seq, h0.shape[1], h0.shape[-1]), dtype=conv_input.dtype),
+            h0,
+        )
+
+    def fake_post(
+        y: mx.array,
+        conv_input: mx.array,
+        D: mx.array,
+        projected: mx.array,
+        **kwargs: object,
+    ) -> mx.array:
+        seen["post_y"] = tuple(y.shape)
+        seen["post_conv_input"] = tuple(conv_input.shape)
+        seen["post_D"] = tuple(D.shape)
+        seen["post_projected"] = tuple(projected.shape)
+        seen["post_v_heads"] = int(kwargs["v_heads"])
+        seen["post_g_heads"] = int(kwargs["g_heads"])
+        return mx.zeros((y.shape[0], y.shape[1], y.shape[2] * y.shape[3]), dtype=y.dtype)
+
+    def fail_broadcast(*_args: object, **_kwargs: object) -> mx.array:
+        raise AssertionError("Path C post route must not materialize v head broadcast in MLX")
+
+    def fail_repeat(*_args: object, **_kwargs: object) -> mx.array:
+        raise AssertionError("Path C post route must not materialize g repeat in MLX")
+
+    monkeypatch.setattr(
+        m2rnn_path_c,
+        "m2rnn_apply_mapped_packed_with_state_path_c",
+        fake_recurrence,
+    )
+    monkeypatch.setattr(
+        m2rnn_path_c,
+        "m2rnn_apply_post_residual_gate_path_c",
+        fake_post,
+    )
+    monkeypatch.setattr(m2rnn_mod, "_broadcast_heads", fail_broadcast)
+    monkeypatch.setattr(m2rnn_mod.mx, "repeat", fail_repeat)
+    monkeypatch.setenv("CPPMEGA_KERNEL_PATH", "path_c")
+
+    cfg = M2RNNConfig(
+        d_model=16,
+        k_head_dim=4,
+        v_head_dim=3,
+        num_q_heads=1,
+        num_k_heads=1,
+        num_v_heads=2,
+        num_f_heads=4,
+        num_g_heads=2,
+        num_weight_heads=1,
+        conv_kernel=1,
+        chunk_size=8,
+    )
+    mx.random.seed(31)
+    block = M2RNNMixer(cfg)
+    hidden = mx.random.normal((1, 4, cfg.d_model), dtype=mx.float32) * 0.1
+    h0 = block.initial_h0(hidden.shape[0], hidden.dtype)
+
+    out, h = block(hidden, h0=h0)
+    mx.eval(out, h)
+
+    assert out.shape == hidden.shape
+    assert h.shape == h0.shape
+    assert seen["conv_input"] == (1, 4, 14)
+    assert seen["post_y"] == (1, 4, 4, 3)
+    assert seen["post_conv_input"] == (1, 4, 14)
+    assert seen["post_D"] == (4, 3)
+    assert seen["post_projected"] == (1, 4, 24)
+    assert seen["post_v_heads"] == 2
+    assert seen["post_g_heads"] == 2
+    matches = [e for e in get_dispatch_log() if e["op_name"] == "m2rnn"]
+    assert matches[-1]["path"] == "path_c"
+    assert matches[-1]["kernel_used"] == "path_c_tilelang_dsl_packed_post"
+
+
+def test_path_c_transform_dlpack_boundary_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from cppmega_mlx.nn._tilelang import m2rnn_path_c
 
     def fail_inside_mlx_transform(*_args: object, **_kwargs: object) -> tuple[mx.array, mx.array]:
@@ -234,20 +378,9 @@ def test_path_c_transform_dlpack_boundary_falls_back_to_path_b(
             "function transformations like compile or vmap is not allowed."
         )
 
-    def fake_path_b(
-        q: mx.array,
-        _k: mx.array,
-        v: mx.array,
-        _W: mx.array,
-        _xf: mx.array,
-        h0: mx.array,
-    ) -> tuple[mx.array, mx.array]:
-        batch, seq, heads, _k_dim = q.shape
-        return mx.zeros((batch, seq, heads, v.shape[-1]), dtype=q.dtype), h0
-
     monkeypatch.setattr(
         m2rnn_path_c,
-        "m2rnn_packed_path_c_status",
+        "m2rnn_mapped_packed_path_c_status",
         lambda *_args, **_kwargs: m2rnn_path_c.M2RNNPathCStatus(
             True,
             "forced packed available",
@@ -255,18 +388,9 @@ def test_path_c_transform_dlpack_boundary_falls_back_to_path_b(
     )
     monkeypatch.setattr(
         m2rnn_path_c,
-        "m2rnn_apply_packed_with_state_path_c",
+        "m2rnn_apply_mapped_packed_with_state_path_c",
         fail_inside_mlx_transform,
     )
-    monkeypatch.setattr(
-        m2rnn_path_b,
-        "m2rnn_metal_status",
-        lambda *_args, **_kwargs: m2rnn_path_b.M2RNNMetalStatus(
-            True,
-            "forced Metal available",
-        ),
-    )
-    monkeypatch.setattr(m2rnn_path_b, "m2rnn_apply_with_state", fake_path_b)
     monkeypatch.setenv("CPPMEGA_KERNEL_PATH", "path_c")
 
     cfg = M2RNNConfig(
@@ -287,13 +411,10 @@ def test_path_c_transform_dlpack_boundary_falls_back_to_path_b(
     hidden = mx.random.normal((1, 4, cfg.d_model), dtype=mx.float32) * 0.1
     h0 = block.initial_h0(hidden.shape[0], hidden.dtype)
 
-    out, h = block(hidden, h0=h0)
-    mx.eval(out, h)
-    assert out.shape == hidden.shape
-    assert h.shape == h0.shape
+    with pytest.raises(RuntimeError, match="MLX array import failed"):
+        block(hidden, h0=h0)
     matches = [e for e in get_dispatch_log() if e["op_name"] == "m2rnn"]
-    assert matches[-1]["path"] == "path_c"
-    assert matches[-1]["kernel_used"] == "path_c_mlx_transform_boundary_path_b"
+    assert not matches, f"failed Path C dispatch should not log success: {matches}"
 
 
 def test_path_c_dispatch_checks_packed_status_before_callable(
@@ -317,12 +438,12 @@ def test_path_c_dispatch_checks_packed_status_before_callable(
 
     monkeypatch.setattr(
         m2rnn_path_c,
-        "m2rnn_packed_path_c_status",
+        "m2rnn_mapped_packed_path_c_status",
         forced_unavailable,
     )
     monkeypatch.setattr(
         m2rnn_path_c,
-        "m2rnn_apply_packed_with_state_path_c",
+        "m2rnn_apply_mapped_packed_with_state_path_c",
         fail_path_c_kernel,
     )
     monkeypatch.setenv("CPPMEGA_KERNEL_PATH", "path_c")
@@ -393,7 +514,7 @@ def test_path_c_dispatch_uses_packed_state_without_qkv_materialization(
     assert next_state.conv_state.shape == mixer_state.conv_state.shape
     matches = [e for e in get_dispatch_log() if e["op_name"] == "m2rnn"]
     assert matches[-1]["path"] == "path_c"
-    assert matches[-1]["kernel_used"] == "path_c_tilelang_dsl_packed"
+    assert matches[-1]["kernel_used"] == "path_c_tilelang_dsl_packed_post"
 
 
 def test_block_grad_flows_through_path_c_with_explicit_state(

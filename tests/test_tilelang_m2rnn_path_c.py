@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 
 import mlx.core as mx
+import mlx.nn as nn
 
 import cppmega_mlx.nn._tilelang.m2rnn_path_c as m2rnn_path_c
 from cppmega_mlx.nn._tilelang import _msl_transform
@@ -22,14 +23,18 @@ from cppmega_mlx.nn._tilelang.m2rnn import (
 )
 from cppmega_mlx.nn._tilelang.m2rnn_path_c import (
     M2RNNPathCStatus,
+    m2rnn_apply_mapped_packed_with_state_path_c,
+    m2rnn_apply_post_residual_gate_path_c,
     m2rnn_apply_packed_with_state_path_c,
     m2rnn_apply_path_c,
     m2rnn_apply_with_state_path_c,
     m2rnn_apply_with_state_path_c_or_fallback,
     m2rnn_bwd_path_c,
     m2rnn_fwd_with_state_path_c,
+    m2rnn_mapped_packed_path_c_status,
     m2rnn_packed_bwd_path_c,
     m2rnn_packed_path_c_status,
+    m2rnn_post_residual_gate_path_c_status,
     m2rnn_path_c_status,
 )
 
@@ -274,6 +279,202 @@ def test_m2rnn_packed_path_c_matches_unpacked_forward_and_grad() -> None:
     np.testing.assert_allclose(_np(dW_p), _np(dW_u), rtol=2e-3, atol=2e-4)
     np.testing.assert_allclose(_np(dxf_p), _np(dxf_u), rtol=2e-3, atol=2e-4)
     np.testing.assert_allclose(_np(dh0_p), _np(dh0_u), rtol=2e-3, atol=2e-4)
+
+
+def test_m2rnn_mapped_packed_path_c_matches_grouped_reference_and_grad() -> None:
+    _require_m2rnn_path_c()
+    batch, seq, k_dim, v_dim = 1, 4, 4, 3
+    q_heads, k_heads, v_heads = 1, 1, 2
+    total_heads, w_heads, f_heads = 4, 1, 2
+    mx.random.seed(23)
+    q = (mx.random.normal((batch, seq, q_heads, k_dim)) * 0.1).astype(mx.float32)
+    k = (mx.random.normal((batch, seq, k_heads, k_dim)) * 0.1).astype(mx.float32)
+    v = (mx.random.normal((batch, seq, v_heads, v_dim)) * 0.1).astype(mx.float32)
+    W = (mx.random.normal((w_heads, v_dim, v_dim)) * 0.1).astype(mx.float32)
+    xf = (mx.random.uniform(0.001, 0.05, (batch, seq, f_heads))).astype(mx.float32)
+    h0 = mx.zeros((batch, total_heads, k_dim, v_dim), dtype=mx.float32)
+    conv_input = mx.concatenate(
+        [
+            q.reshape(batch, seq, -1),
+            k.reshape(batch, seq, -1),
+            v.reshape(batch, seq, -1),
+        ],
+        axis=-1,
+    )
+
+    status = m2rnn_mapped_packed_path_c_status(
+        conv_input,
+        W,
+        xf,
+        h0,
+        q_heads=q_heads,
+        k_heads=k_heads,
+        v_heads=v_heads,
+    )
+    if not status.available:
+        pytest.skip(f"mapped packed m2rnn Path C unavailable: {status.reason}")
+
+    y_mapped, h_mapped = m2rnn_apply_mapped_packed_with_state_path_c(
+        conv_input,
+        W,
+        xf,
+        h0,
+        q_heads=q_heads,
+        k_heads=k_heads,
+        v_heads=v_heads,
+    )
+
+    def expand_heads(x: mx.array, axis: int) -> mx.array:
+        heads = x.shape[axis]
+        if heads == total_heads:
+            return x
+        if heads == 1:
+            target_shape = list(x.shape)
+            target_shape[axis] = total_heads
+            return mx.broadcast_to(x, tuple(target_shape))
+        return mx.repeat(x, repeats=total_heads // heads, axis=axis)
+
+    y_ref, h_ref = m2rnn_reference(
+        expand_heads(q, -2),
+        expand_heads(k, -2),
+        expand_heads(v, -2),
+        expand_heads(W, 0),
+        expand_heads(xf, -1),
+        h0=h0,
+    )
+    mx.eval(y_mapped, h_mapped, y_ref, h_ref)
+    np.testing.assert_allclose(_np(y_mapped), _np(y_ref), rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(_np(h_mapped), _np(h_ref), rtol=1e-6, atol=1e-6)
+
+    q_stop = q_heads * k_dim
+    k_stop = q_stop + k_heads * k_dim
+
+    def mapped_loss(conv_input_, W_, xf_, h0_):  # type: ignore[no-untyped-def]
+        y, _h = m2rnn_apply_mapped_packed_with_state_path_c(
+            conv_input_,
+            W_,
+            xf_,
+            h0_,
+            q_heads=q_heads,
+            k_heads=k_heads,
+            v_heads=v_heads,
+        )
+        return mx.sum(y * y) * 0.5
+
+    def reference_loss(conv_input_, W_, xf_, h0_):  # type: ignore[no-untyped-def]
+        q_ = conv_input_[:, :, :q_stop].reshape(batch, seq, q_heads, k_dim)
+        k_ = conv_input_[:, :, q_stop:k_stop].reshape(batch, seq, k_heads, k_dim)
+        v_ = conv_input_[:, :, k_stop:].reshape(batch, seq, v_heads, v_dim)
+        y, _h = m2rnn_reference(
+            expand_heads(q_, -2),
+            expand_heads(k_, -2),
+            expand_heads(v_, -2),
+            expand_heads(W_, 0),
+            expand_heads(xf_, -1),
+            h0=h0_,
+        )
+        return mx.sum(y * y) * 0.5
+
+    mapped_grads = mx.grad(mapped_loss, argnums=(0, 1, 2, 3))(
+        conv_input,
+        W,
+        xf,
+        h0,
+    )
+    ref_grads = mx.grad(reference_loss, argnums=(0, 1, 2, 3))(
+        conv_input,
+        W,
+        xf,
+        h0,
+    )
+    mx.eval(*mapped_grads, *ref_grads)
+    for got, expected in zip(mapped_grads, ref_grads, strict=True):
+        np.testing.assert_allclose(_np(got), _np(expected), rtol=2e-3, atol=2e-4)
+
+
+def test_m2rnn_post_residual_gate_path_c_matches_grouped_mlx_and_grad() -> None:
+    _require_m2rnn_path_c()
+    batch, seq, total_heads, k_dim, v_dim = 1, 4, 4, 4, 3
+    q_heads, k_heads, v_heads, g_heads = 1, 1, 2, 2
+    conv_dim = q_heads * k_dim + k_heads * k_dim + v_heads * v_dim
+    projected_dim = conv_dim + total_heads + g_heads * v_dim
+    mx.random.seed(41)
+    y = (mx.random.normal((batch, seq, total_heads, v_dim)) * 0.1).astype(mx.float32)
+    conv_input = (mx.random.normal((batch, seq, conv_dim)) * 0.1).astype(mx.float32)
+    D = (mx.random.normal((total_heads, v_dim)) * 0.1).astype(mx.float32)
+    projected = (mx.random.normal((batch, seq, projected_dim)) * 0.1).astype(mx.float32)
+
+    status = m2rnn_post_residual_gate_path_c_status(
+        y,
+        conv_input,
+        D,
+        projected,
+        q_heads=q_heads,
+        k_heads=k_heads,
+        v_heads=v_heads,
+        g_heads=g_heads,
+    )
+    if not status.available:
+        pytest.skip(f"m2rnn post residual/gate Path C unavailable: {status.reason}")
+
+    v_offset = q_heads * k_dim + k_heads * k_dim
+    g_offset = projected_dim - g_heads * v_dim
+
+    def reference(y_, conv_input_, D_, projected_):  # type: ignore[no-untyped-def]
+        v = conv_input_[:, :, v_offset:].reshape(batch, seq, v_heads, v_dim)
+        v_broadcast = mx.repeat(v, repeats=total_heads // v_heads, axis=-2)
+        skipped = y_ + v_broadcast * D_.astype(y_.dtype)
+        flat = skipped.reshape(batch, seq, total_heads * v_dim)
+        g_flat = projected_[:, :, g_offset:]
+        g_repeat = mx.repeat(g_flat, repeats=total_heads // g_heads, axis=-1)
+        return flat * nn.silu(g_repeat).astype(flat.dtype)
+
+    path_c = m2rnn_apply_post_residual_gate_path_c(
+        y,
+        conv_input,
+        D,
+        projected,
+        q_heads=q_heads,
+        k_heads=k_heads,
+        v_heads=v_heads,
+        g_heads=g_heads,
+    )
+    ref = reference(y, conv_input, D, projected)
+    mx.eval(path_c, ref)
+    np.testing.assert_allclose(_np(path_c), _np(ref), rtol=1e-6, atol=1e-6)
+
+    def path_c_loss(y_, conv_input_, D_, projected_):  # type: ignore[no-untyped-def]
+        out = m2rnn_apply_post_residual_gate_path_c(
+            y_,
+            conv_input_,
+            D_,
+            projected_,
+            q_heads=q_heads,
+            k_heads=k_heads,
+            v_heads=v_heads,
+            g_heads=g_heads,
+        )
+        return mx.sum(out * out) * 0.5
+
+    def reference_loss(y_, conv_input_, D_, projected_):  # type: ignore[no-untyped-def]
+        out = reference(y_, conv_input_, D_, projected_)
+        return mx.sum(out * out) * 0.5
+
+    path_c_grads = mx.grad(path_c_loss, argnums=(0, 1, 2, 3))(
+        y,
+        conv_input,
+        D,
+        projected,
+    )
+    ref_grads = mx.grad(reference_loss, argnums=(0, 1, 2, 3))(
+        y,
+        conv_input,
+        D,
+        projected,
+    )
+    mx.eval(*path_c_grads, *ref_grads)
+    for got, expected in zip(path_c_grads, ref_grads, strict=True):
+        np.testing.assert_allclose(_np(got), _np(expected), rtol=2e-3, atol=2e-4)
 
 
 def test_m2rnn_packed_path_c_k_parallel_matches_path_b_backward() -> None:

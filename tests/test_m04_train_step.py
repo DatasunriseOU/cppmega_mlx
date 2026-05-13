@@ -646,6 +646,11 @@ def test_regression_report_rejects_bogus_tokens_per_second_claim(
                     "kernel_used": "mamba3_mimo_path_c",
                 },
                 {
+                    "op_name": "m2rnn",
+                    "path": "path_c",
+                    "kernel_used": "path_c_tilelang_dsl_packed",
+                },
+                {
                     "op_name": "sparse_mla",
                     "path": "path_c",
                     "kernel_used": "sparse_mla_fp8_path_c_apply",
@@ -724,7 +729,7 @@ def test_regression_report_records_path_b_vs_path_c_receipt_gate_fields(
     assert summary["tokens_per_second_claim_ok"] is True
     assert summary["bogus_tok_sec_claim_detected"] is False
     if dtype == "fp8_path_c":
-        assert route["requested_path_c_ops"] == ["mamba3_mimo", "sparse_mla"]
+        assert route["requested_path_c_ops"] == ["m2rnn", "mamba3_mimo", "sparse_mla"]
         assert route["unobserved_requested_path_c_ops"] == []
         assert route["producer_missing"] is False
         assert route["producer_unobserved"] is False
@@ -1030,6 +1035,9 @@ def test_fp8_path_c_training_dtype_route_blocks_missing_sparse_mla_producer(
         "tvm_ffi_from_dlpack_available": True,
         "mlx_metal_dlpack_device": "kDLMetal:0",
         "tvm_from_dlpack_device": "metal:0",
+        "native_mlx_array_wrapper_linked": True,
+        "native_tvm_ffi_graph_outputs": True,
+        "dlpack_used_for_path_c_graph_bridge": False,
         "standalone_mlx_to_tvm_metal_kernel_verified": True,
         "m04_bridge_wired": True,
     }
@@ -1044,11 +1052,13 @@ def test_fp8_path_c_training_dtype_route_blocks_missing_sparse_mla_producer(
     assert route["selected_action"] == "fail_closed_producer_missing"
     assert route["kernel_policy_env"] == {
         "CPPMEGA_KERNEL_PATH__MAMBA3_MIMO": "path_c",
+        "CPPMEGA_KERNEL_PATH__M2RNN": "path_c",
         "CPPMEGA_KERNEL_PATH__SPARSE_MLA": "path_c",
     }
     assert {
         "fp8_scaled_vecmat_path_c",
         "mamba3_mimo_path_c",
+        "m2rnn_path_c",
         "sparse_mla_fp8_path_c_apply",
         "matmul_tl_fp8_scaled_matmul",
     } == {surface["name"] for surface in route["available_path_c_surfaces"]}
@@ -1058,6 +1068,9 @@ def test_fp8_path_c_training_dtype_route_blocks_missing_sparse_mla_producer(
     assert surfaces["matmul_tl_fp8_scaled_matmul"]["kernel_surface_available"] is True
     assert surfaces["mamba3_mimo_path_c"]["training_surface"] is False
     assert surfaces["mamba3_mimo_path_c"]["fp8_route_auto_selected"] is True
+    assert surfaces["m2rnn_path_c"]["training_surface"] is True
+    assert surfaces["m2rnn_path_c"]["fallback_to_path_b_allowed"] is False
+    assert surfaces["m2rnn_path_c"]["fp8_route_auto_selected"] is True
     assert surfaces["sparse_mla_fp8_path_c_apply"]["training_surface"] is False
     assert surfaces["sparse_mla_fp8_path_c_apply"]["producer_required"] is True
     assert surfaces["sparse_mla_fp8_path_c_apply"]["producer_status"] == (
@@ -1065,7 +1078,7 @@ def test_fp8_path_c_training_dtype_route_blocks_missing_sparse_mla_producer(
     )
     assert (
         surfaces["sparse_mla_fp8_path_c_apply"]["backward_surface"]
-        == "direct_owner_buffer_scatter"
+        == "native_tvm_ffi_graph_output_scatter"
     )
     assert (
         "FP8 parameter/weight producers that create the required dtype/layout "
@@ -1083,9 +1096,10 @@ def test_fp8_path_c_training_dtype_route_blocks_missing_sparse_mla_producer(
         route["higher_level_owner"]["current_m04_route_owner"]
     )
     dispatch_report = payload["regression_report"]["route_dispatch"]
-    assert dispatch_report["requested_path_c_ops"] == ["mamba3_mimo", "sparse_mla"]
+    assert dispatch_report["requested_path_c_ops"] == ["m2rnn", "mamba3_mimo", "sparse_mla"]
     assert dispatch_report["observed_path_c_ops"] == []
     assert dispatch_report["unobserved_requested_path_c_ops"] == [
+        "m2rnn",
         "mamba3_mimo",
         "sparse_mla",
     ]

@@ -217,16 +217,8 @@ def test_path_c_launch_geometry_comes_from_tilelang_lowering() -> None:
     assert _msl_transform.metal_grid_for_lowering(lowering) == (3584, 1, 1)
 
 
-def test_mamba3_path_c_schedule_plan_uses_rule_and_z3_for_spec_shape(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_mamba3_path_c_schedule_plan_uses_rule_and_z3_for_spec_shape() -> None:
     pytest.importorskip("z3")
-    for name in (
-        "TILELANG_DISABLE_Z3",
-        "CPPMEGA_DISABLE_Z3",
-        "CPPMEGA_DISABLE_MAMBA3_PATH_C_Z3",
-    ):
-        monkeypatch.delenv(name, raising=False)
     mamba3_path_c_schedule_plan.cache_clear()
 
     plan = mamba3_path_c_schedule_plan(
@@ -236,6 +228,7 @@ def test_mamba3_path_c_schedule_plan_uses_rule_and_z3_for_spec_shape(
         headdim=32,
         state=64,
         dtype="float32",
+        z3_policy="enabled",
     )
 
     assert isinstance(plan, Mamba3PathCSchedulePlan)
@@ -254,23 +247,37 @@ def test_mamba3_path_c_schedule_plan_uses_rule_and_z3_for_spec_shape(
         headdim=32,
         state=64,
         dtype="bfloat16",
+        z3_policy="enabled",
     )
     assert bf16_plan.fwd_path_c_candidate is True
     assert bf16_plan.bwd_path_c_candidate is True
     assert bf16_plan.mode == "path_c_fwd_bwd"
 
 
+def test_mamba3_path_c_schedule_plan_accepts_explicit_z3_policy() -> None:
+    mamba3_path_c_schedule_plan.cache_clear()
+
+    plan = mamba3_path_c_schedule_plan(
+        batch=2,
+        seq=512,
+        heads=4,
+        headdim=32,
+        state=64,
+        dtype="float32",
+        z3_policy="disabled",
+    )
+
+    assert plan.z3_used is False
+    assert plan.z3_proved is False
+    assert plan.fwd_path_c_candidate is False
+    assert plan.bwd_path_c_candidate is False
+    assert "z3 disabled by policy" in plan.reason
+
+
 def test_mamba3_path_c_receipt_gate_requires_matching_shape_and_fwd_win(
     tmp_path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     pytest.importorskip("z3")
-    for name in (
-        "TILELANG_DISABLE_Z3",
-        "CPPMEGA_DISABLE_Z3",
-        "CPPMEGA_DISABLE_MAMBA3_PATH_C_Z3",
-    ):
-        monkeypatch.delenv(name, raising=False)
     mamba3_path_c_schedule_plan.cache_clear()
 
     receipt = {
@@ -309,6 +316,7 @@ def test_mamba3_path_c_receipt_gate_requires_matching_shape_and_fwd_win(
         headdim=32,
         state=64,
         dtype="float32",
+        z3_policy="enabled",
     )
     assert (
         mamba3_path_c_receipt_auto_mode(
@@ -319,6 +327,7 @@ def test_mamba3_path_c_receipt_gate_requires_matching_shape_and_fwd_win(
             headdim=32,
             state=64,
             dtype="float32",
+            z3_policy="enabled",
         )
         == "path_c_fwd_path_b_bwd"
     )
@@ -345,6 +354,7 @@ def test_mamba3_path_c_receipt_gate_requires_matching_shape_and_fwd_win(
             headdim=32,
             state=64,
             dtype="float32",
+            z3_policy="enabled",
         )
         == "path_c_fwd_bwd"
     )
@@ -360,6 +370,7 @@ def test_mamba3_path_c_receipt_gate_requires_matching_shape_and_fwd_win(
         headdim=32,
         state=64,
         dtype="float32",
+        z3_policy="enabled",
     )
 
     slow_path_c = json.loads(json.dumps(receipt))
@@ -373,6 +384,7 @@ def test_mamba3_path_c_receipt_gate_requires_matching_shape_and_fwd_win(
         headdim=32,
         state=64,
         dtype="float32",
+        z3_policy="enabled",
     )
 
 

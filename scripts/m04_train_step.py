@@ -147,15 +147,17 @@ FP8_PATH_C_REQUIRED_PREPARED_BUFFERS = (
 )
 FP8_PATH_C_KERNEL_POLICY_ENV = {
     "CPPMEGA_KERNEL_PATH__MAMBA3_MIMO": "path_c",
+    "CPPMEGA_KERNEL_PATH__M2RNN": "path_c",
     "CPPMEGA_KERNEL_PATH__SPARSE_MLA": "path_c",
 }
 FP8_PATH_C_RUNTIME_ENV: dict[str, str] = {}
 FP8_PATH_C_ROUTE_BLOCKER_REASON = (
-    "FP8 Path C has an m04 route for prepared Sparse-MLA Path C model ops and "
-    "Mamba3 TileLang Path C selective scan. HybridTinyLM DSA A-layers now create "
-    "prepared q_fp8/q_scale/kv_fp8/kv_scale tensors before Sparse-MLA Path C and "
-    "the backward path scatters into final owner buffers. Remaining FP8 ownership "
-    "work is parameter/weight producer coverage without hidden large tensor staging."
+    "FP8 Path C has an m04 route for prepared Sparse-MLA Path C model ops, "
+    "Mamba3 TileLang Path C selective scan, and M2RNN TileLang Path C recurrence. "
+    "HybridTinyLM DSA A-layers now create prepared q_fp8/q_scale/kv_fp8/kv_scale "
+    "tensors before Sparse-MLA Path C and the backward path scatters into final "
+    "owner buffers. Remaining FP8 ownership work is parameter/weight producer "
+    "coverage without hidden large tensor staging."
 )
 OPTIMIZER_CHOICES = (
     "adamw",
@@ -876,6 +878,25 @@ def fp8_path_c_training_route_payload(
                     "geometry on that explicit boundary"
                 ),
                 "training_surface": False,
+            },
+            {
+                "name": "m2rnn_path_c",
+                "module": "cppmega_mlx.nn._tilelang.m2rnn_path_c",
+                "shape_surface": (
+                    "HybridTinyLM R-layer packed recurrence with explicit h0 "
+                    "and TileLang owner-output forward/backward"
+                ),
+                "kernel_policy_env": {
+                    "CPPMEGA_KERNEL_PATH__M2RNN": "path_c",
+                },
+                "fp8_route_auto_selected": True,
+                "fp8_route_reason": (
+                    "Path C uses the packed TileLang DSL recurrence through "
+                    "the native MLX/tvm-ffi graph bridge; transform-boundary "
+                    "fallback to Path B is not allowed"
+                ),
+                "training_surface": True,
+                "fallback_to_path_b_allowed": False,
             },
             {
                 "name": "matmul_tl_fp8_scaled_matmul",

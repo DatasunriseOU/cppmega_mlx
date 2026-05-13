@@ -400,16 +400,6 @@ def _dispatch_m2rnn_scan(
     return chunked_m2rnn_scan(q, k, v, W, xf, h0=h0, chunk_size=chunk_size)
 
 
-def _is_mlx_transform_dlpack_boundary_error(exc: Exception) -> bool:
-    """Return whether Path C tried to export DLPack while MLX is tracing."""
-
-    message = str(exc)
-    return (
-        "MLX array import failed" in message
-        and "Attempting to eval an array during function transformations" in message
-    )
-
-
 def chunked_m2rnn_scan(
     q: mx.array,
     k: mx.array,
@@ -515,21 +505,7 @@ class M2RNNMixer(nn.Module):
         return mx.zeros((batch, self.config.conv_kernel - 1, self.conv_dim), dtype=dtype)
 
     def _path_c_recurrence_heads(self) -> int:
-        cfg = self.config
-        head_counts = (
-            cfg.num_q_heads,
-            cfg.num_k_heads,
-            cfg.num_v_heads,
-            cfg.num_f_heads,
-            cfg.num_g_heads,
-            cfg.num_weight_heads,
-        )
-        if len(set(head_counts)) != 1:
-            raise RuntimeError(
-                "m2rnn: Path C requires pre-aligned q/k/v/W/xf/g head counts; "
-                "refusing to broadcast or repeat tensors implicitly"
-            )
-        return head_counts[0]
+        return self.config.num_heads
 
     def initial_h0(self, batch: int, dtype: mx.Dtype) -> mx.array:
         _require_positive_int("batch", batch)
@@ -622,7 +598,6 @@ class M2RNNMixer(nn.Module):
 
         path = selected_path("m2rnn")
         if path is KernelPath.PATH_C:
-            self._path_c_recurrence_heads()
             if h0 is None and mixer_state is None:
                 raise RuntimeError(
                     "m2rnn: Path C requires an existing h0 tensor; "
@@ -675,18 +650,25 @@ class M2RNNMixer(nn.Module):
         k_end = q_end + self.k_dim
         v_end = k_end + self.v_dim
         xf = m2rnn_softplus_decay_gate(projected[:, :, conv_end:f_end], self.A_log, self.dt_bias)
-        g = projected[:, :, f_end:].reshape(batch, seq, cfg.num_g_heads, cfg.v_head_dim)
 
         if path is KernelPath.PATH_C:
             from cppmega_mlx.nn._tilelang.m2rnn_path_c import (
-                m2rnn_apply_packed_with_state_path_c,
-                m2rnn_packed_path_c_status,
+                m2rnn_apply_mapped_packed_with_state_path_c,
+                m2rnn_apply_post_residual_gate_path_c,
+                m2rnn_mapped_packed_path_c_status,
+                m2rnn_post_residual_gate_path_c_status,
             )
 
+            if scan_h0 is None:
+                raise RuntimeError(
+                    "m2rnn: Path C requires an existing h0 tensor; pass h0 "
+                    "or mixer_state.h so the TileLang/tvm-ffi call receives "
+                    "a real state buffer"
+                )
             h0_full = _initial_m2rnn_state(
                 scan_h0,
                 batch=batch,
-                heads=cfg.num_q_heads,
+                heads=cfg.num_heads,
                 k_dim=cfg.k_head_dim,
                 v_dim=cfg.v_head_dim,
                 dtype=conv_input.dtype,
@@ -696,78 +678,60 @@ class M2RNNMixer(nn.Module):
                 if self.state_weight.dtype == conv_input.dtype
                 else self.state_weight.astype(conv_input.dtype)
             )
-            status = m2rnn_packed_path_c_status(
+            status = m2rnn_mapped_packed_path_c_status(
                 conv_input,
                 state_weight,
                 xf,
                 h0_full,
+                q_heads=cfg.num_q_heads,
+                k_heads=cfg.num_k_heads,
+                v_heads=cfg.num_v_heads,
             )
             if not status.available:
                 raise RuntimeError(
                     f"m2rnn: Path C packed kernel unavailable ({status.reason})"
                 )
-            try:
-                out, h = m2rnn_apply_packed_with_state_path_c(
-                    conv_input,
-                    state_weight,
-                    xf,
-                    h0_full,
+            out, h = m2rnn_apply_mapped_packed_with_state_path_c(
+                conv_input,
+                state_weight,
+                xf,
+                h0_full,
+                q_heads=cfg.num_q_heads,
+                k_heads=cfg.num_k_heads,
+                v_heads=cfg.num_v_heads,
+            )
+            if self.D is None:
+                raise RuntimeError(
+                    "m2rnn: Path C fused post residual/gate requires residual D; "
+                    "use_residual=False is not yet implemented for this TileLang route"
                 )
-            except Exception as exc:
-                if not _is_mlx_transform_dlpack_boundary_error(exc):
-                    raise
-                q = conv_input[:, :, :q_end].reshape(batch, seq, cfg.num_q_heads, cfg.k_head_dim)
-                k = conv_input[:, :, q_end:k_end].reshape(
-                    batch,
-                    seq,
-                    cfg.num_k_heads,
-                    cfg.k_head_dim,
+            D = self.D if self.D.dtype == out.dtype else self.D.astype(out.dtype)
+            post_status = m2rnn_post_residual_gate_path_c_status(
+                out,
+                conv_input,
+                D,
+                projected,
+                q_heads=cfg.num_q_heads,
+                k_heads=cfg.num_k_heads,
+                v_heads=cfg.num_v_heads,
+                g_heads=cfg.num_g_heads,
+            )
+            if not post_status.available:
+                raise RuntimeError(
+                    f"m2rnn: Path C post residual/gate kernel unavailable "
+                    f"({post_status.reason})"
                 )
-                v = conv_input[:, :, k_end:v_end].reshape(
-                    batch,
-                    seq,
-                    cfg.num_v_heads,
-                    cfg.v_head_dim,
-                )
-                from cppmega_mlx.nn._tilelang.m2rnn import (
-                    m2rnn_apply_with_state,
-                    m2rnn_metal_status,
-                )
-
-                q_b, k_b, v_b, W_b, xf_b = broadcast_m2rnn_heads(q, k, v, state_weight, xf)
-                batch_b, _seq_b, heads_b, k_dim_b = q_b.shape
-                h0_b = _initial_m2rnn_state(
-                    scan_h0,
-                    batch=batch_b,
-                    heads=heads_b,
-                    k_dim=k_dim_b,
-                    v_dim=v_b.shape[-1],
-                    dtype=q_b.dtype,
-                )
-                path_b_status = m2rnn_metal_status(q_b)
-                if path_b_status.available:
-                    out, h = m2rnn_apply_with_state(q_b, k_b, v_b, W_b, xf_b, h0_b)
-                    fallback_kernel = "path_c_mlx_transform_boundary_path_b"
-                else:
-                    out, h = chunked_m2rnn_scan(
-                        q_b,
-                        k_b,
-                        v_b,
-                        W_b,
-                        xf_b,
-                        h0=h0_b,
-                        chunk_size=cfg.chunk_size if chunk_size is None else chunk_size,
-                    )
-                    fallback_kernel = "path_c_mlx_transform_boundary_reference"
-                record_dispatch("m2rnn", path, fallback_kernel)
-            else:
-                record_dispatch("m2rnn", path, "path_c_tilelang_dsl_packed")
-                v = conv_input[:, :, k_end:v_end].reshape(
-                    batch,
-                    seq,
-                    cfg.num_v_heads,
-                    cfg.v_head_dim,
-                )
+            out = m2rnn_apply_post_residual_gate_path_c(
+                out,
+                conv_input,
+                D,
+                projected,
+                q_heads=cfg.num_q_heads,
+                k_heads=cfg.num_k_heads,
+                v_heads=cfg.num_v_heads,
+                g_heads=cfg.num_g_heads,
+            )
+            record_dispatch("m2rnn", path, "path_c_tilelang_dsl_packed_post")
         else:
             q = conv_input[:, :, :q_end].reshape(batch, seq, cfg.num_q_heads, cfg.k_head_dim)
             k = conv_input[:, :, q_end:k_end].reshape(batch, seq, cfg.num_k_heads, cfg.k_head_dim)
@@ -781,14 +745,15 @@ class M2RNNMixer(nn.Module):
                 h0=scan_h0,
                 chunk_size=cfg.chunk_size if chunk_size is None else chunk_size,
             )
-        if self.D is not None:
-            v_broadcast = _broadcast_heads(v, cfg.num_heads, -2, "v")
-            out = out + v_broadcast * self.D.astype(out.dtype)
-        out = out.reshape(batch, seq, cfg.num_heads * cfg.v_head_dim)
-        g = g.reshape(batch, seq, self.g_dim)
-        if cfg.num_g_heads != cfg.num_heads:
-            g = mx.repeat(g, repeats=cfg.num_heads // cfg.num_g_heads, axis=-1)
-        out = out * nn.silu(g).astype(out.dtype)
+            g = projected[:, :, f_end:].reshape(batch, seq, cfg.num_g_heads, cfg.v_head_dim)
+            if self.D is not None:
+                v_broadcast = _broadcast_heads(v, cfg.num_heads, -2, "v")
+                out = out + v_broadcast * self.D.astype(out.dtype)
+            out = out.reshape(batch, seq, cfg.num_heads * cfg.v_head_dim)
+            g = g.reshape(batch, seq, self.g_dim)
+            if cfg.num_g_heads != cfg.num_heads:
+                g = mx.repeat(g, repeats=cfg.num_heads // cfg.num_g_heads, axis=-1)
+            out = out * nn.silu(g).astype(out.dtype)
         out = self.g_norm(out)
         out = self.out_proj(out)
         if return_state:

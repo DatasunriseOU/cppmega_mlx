@@ -320,7 +320,7 @@ def test_hybrid_r_path_c_benchmark_startup_uses_explicit_m2rnn_state(
     monkeypatch.setenv("CPPMEGA_KERNEL_PATH", "path_c")
     monkeypatch.setattr(
         m2rnn_path_c,
-        "m2rnn_packed_path_c_status",
+        "m2rnn_mapped_packed_path_c_status",
         lambda *_args, **_kwargs: m2rnn_path_c.M2RNNPathCStatus(True, "forced available"),
     )
 
@@ -329,9 +329,11 @@ def test_hybrid_r_path_c_benchmark_startup_uses_explicit_m2rnn_state(
         W: mx.array,
         xf: mx.array,
         h0: mx.array,
+        **_kwargs: object,
     ) -> tuple[mx.array, mx.array]:
         batch, seq, _conv_dim = conv_input.shape
-        heads, _v_in, v_dim = W.shape
+        heads = h0.shape[1]
+        v_dim = W.shape[-1]
         seen.append(
             {
                 "W": tuple(W.shape),
@@ -343,7 +345,7 @@ def test_hybrid_r_path_c_benchmark_startup_uses_explicit_m2rnn_state(
 
     monkeypatch.setattr(
         m2rnn_path_c,
-        "m2rnn_apply_packed_with_state_path_c",
+        "m2rnn_apply_mapped_packed_with_state_path_c",
         fake_path_c,
     )
 

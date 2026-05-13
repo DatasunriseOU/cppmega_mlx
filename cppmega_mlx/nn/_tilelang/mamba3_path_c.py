@@ -90,7 +90,7 @@ import math
 import os
 import re
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import mlx.core as mx
 
@@ -154,6 +154,7 @@ _Z3_DISABLE_ENV = (
     "CPPMEGA_DISABLE_Z3",
     "CPPMEGA_DISABLE_MAMBA3_PATH_C_Z3",
 )
+Mamba3PathCZ3Policy = Literal["env", "enabled", "disabled"]
 
 Mamba3FwdOwnerOutputs = tuple[mx.array, mx.array]
 Mamba3BwdOwnerOutputs = tuple[
@@ -289,7 +290,13 @@ def _tilelang_available() -> tuple[bool, str]:
     return True, "tilelang importable"
 
 
-def _z3_disabled() -> bool:
+def _z3_disabled(policy: Mamba3PathCZ3Policy = "env") -> bool:
+    if policy == "enabled":
+        return False
+    if policy == "disabled":
+        return True
+    if policy != "env":
+        raise ValueError(f"invalid Mamba3 Path C Z3 policy: {policy!r}")
     return any(
         os.environ.get(name, "").strip().lower() in {"1", "true", "yes"}
         for name in _Z3_DISABLE_ENV
@@ -303,11 +310,15 @@ def _z3_proves_mamba3_lane_mapping(
     heads: int,
     headdim: int,
     state: int,
+    z3_policy: Mamba3PathCZ3Policy = "env",
 ) -> tuple[bool, bool, str]:
     """Prove that the per-lane schedule's derived indices stay in-bounds."""
 
-    if _z3_disabled():
-        return False, False, "z3 disabled by environment"
+    if _z3_disabled(z3_policy):
+        reason = "z3 disabled by policy"
+        if z3_policy == "env":
+            reason = "z3 disabled by environment"
+        return False, False, reason
     try:
         import z3  # type: ignore[import-not-found]
     except Exception as exc:  # pragma: no cover - optional local dependency
@@ -365,6 +376,7 @@ def mamba3_path_c_schedule_plan(
     headdim: int,
     state: int,
     dtype: str = "float32",
+    z3_policy: Mamba3PathCZ3Policy = "env",
 ) -> Mamba3PathCSchedulePlan:
     """Return the rule + Z3 schedule plan used by the automatic Path C gate."""
 
@@ -395,6 +407,7 @@ def mamba3_path_c_schedule_plan(
         heads=heads,
         headdim=headdim,
         state=state,
+        z3_policy=z3_policy,
     )
     fwd_candidate = dtype in {"float32", "bfloat16"} and threads <= 256 and z3_proved
     simd_p_reduce = headdim == 32 and threads % 32 == 0
@@ -439,6 +452,7 @@ def mamba3_path_c_receipt_auto_mode(
     headdim: int,
     state: int,
     dtype: str,
+    z3_policy: Mamba3PathCZ3Policy = "env",
 ) -> str:
     """Return the fail-closed AUTO mode selected by the bench receipt."""
 
@@ -449,6 +463,7 @@ def mamba3_path_c_receipt_auto_mode(
         headdim=headdim,
         state=state,
         dtype=dtype,
+        z3_policy=z3_policy,
     )
     if not plan.fwd_path_c_candidate or not plan.z3_proved:
         return "path_b"
@@ -541,6 +556,7 @@ def mamba3_path_c_receipt_allows_auto_promotion(
     headdim: int,
     state: int,
     dtype: str,
+    z3_policy: Mamba3PathCZ3Policy = "env",
 ) -> bool:
     """Fail-closed automatic Path C promotion gate backed by bench memory."""
 
@@ -553,6 +569,7 @@ def mamba3_path_c_receipt_allows_auto_promotion(
             headdim=headdim,
             state=state,
             dtype=dtype,
+            z3_policy=z3_policy,
         )
         != "path_b"
     )
@@ -569,6 +586,7 @@ def mamba3_path_c_auto_fwd_path_b_bwd_allowed(
     h0: mx.array,
     *,
     receipt_path: Path = _PATH_C_AUTO_PROMOTION_RECEIPT,
+    z3_policy: Mamba3PathCZ3Policy = "env",
 ) -> bool:
     """Return whether AUTO may use Path C fwd with Path B bwd for these inputs."""
 
@@ -588,6 +606,7 @@ def mamba3_path_c_auto_fwd_path_b_bwd_allowed(
             headdim=headdim,
             state=state,
             dtype=dtype,
+            z3_policy=z3_policy,
         )
         == "path_c_fwd_path_b_bwd"
     )
@@ -604,6 +623,7 @@ def mamba3_path_c_auto_mode_for_inputs(
     h0: mx.array,
     *,
     receipt_path: Path = _PATH_C_AUTO_PROMOTION_RECEIPT,
+    z3_policy: Mamba3PathCZ3Policy = "env",
 ) -> str:
     """Return AUTO's Path C mode for these inputs, or ``path_b``."""
 
@@ -622,6 +642,7 @@ def mamba3_path_c_auto_mode_for_inputs(
         headdim=headdim,
         state=state,
         dtype=dtype,
+        z3_policy=z3_policy,
     )
 
 
@@ -2384,6 +2405,7 @@ def dump_lowered_bwd_msl(
 __all__ = [
     "Mamba3PathCSchedulePlan",
     "Mamba3PathCStatus",
+    "Mamba3PathCZ3Policy",
     "dump_lowered_bwd_msl",
     "dump_lowered_fwd_msl",
     "mamba3_mimo_apply_path_c",
