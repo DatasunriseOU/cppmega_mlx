@@ -51,6 +51,15 @@ from cppmega_mlx.nn._tilelang.mamba3_path_c import (
 )
 
 
+_BWD_PARTIAL_OUTPUT_TOKENS = (
+    "dA_partial",
+    "dB_partial",
+    "dC_partial",
+    "dD_partial",
+    "ddt_partial",
+)
+
+
 def _np(x: mx.array) -> np.ndarray:
     if x.dtype == mx.bfloat16:
         x = x.astype(mx.float32)
@@ -111,6 +120,11 @@ def _require_mamba3_path_c() -> None:
         pytest.skip(f"mamba3 Path C unavailable on this host: {status.reason}")
 
 
+def _assert_no_bwd_partial_outputs(msl: str) -> None:
+    for name in _BWD_PARTIAL_OUTPUT_TOKENS:
+        assert name not in msl
+
+
 def test_lowered_fwd_msl_contains_kernel_void() -> None:
     """Lowering emits a self-contained MSL kernel string."""
 
@@ -145,24 +159,22 @@ def test_lowered_bwd_bench_shape_uses_simd_p_reduction() -> None:
     msl = dump_lowered_bwd_msl(batch=1, seq=4, heads=1, headdim=32, state=4)
     assert "kernel void" in msl
     assert "simd_shuffle_down" in msl
-    assert "dB_partial" not in msl
-    assert "dC_partial" not in msl
-    assert "dA_partial" not in msl
-    assert "ddt_partial" not in msl
-    assert "dD_partial" not in msl
+    _assert_no_bwd_partial_outputs(msl)
     assert "dD_batch" in msl
 
 
-def test_lowered_bwd_headdim64_uses_split_thread_allreduce() -> None:
-    msl = dump_lowered_bwd_msl(batch=1, seq=4, heads=1, headdim=64, state=4)
+@pytest.mark.parametrize("headdim", [64, 96, 128, 256])
+def test_lowered_bwd_aligned_headdims_use_split_thread_allreduce(
+    headdim: int,
+) -> None:
+    assert mamba3_path_c._bwd_simd_p_reduction_supported(
+        batch=1, heads=1, headdim=headdim
+    )
+    msl = dump_lowered_bwd_msl(batch=1, seq=2, heads=1, headdim=headdim, state=2)
     assert "kernel void" in msl
     assert "simd_shuffle_down" in msl
     assert "red_buf_staging" in msl
-    assert "dB_partial" not in msl
-    assert "dC_partial" not in msl
-    assert "dA_partial" not in msl
-    assert "ddt_partial" not in msl
-    assert "dD_partial" not in msl
+    _assert_no_bwd_partial_outputs(msl)
     assert "dD_batch" in msl
 
 
@@ -268,6 +280,19 @@ def test_mamba3_path_c_schedule_plan_uses_rule_and_z3_for_spec_shape() -> None:
     assert bf16_plan.fwd_path_c_candidate is True
     assert bf16_plan.bwd_path_c_candidate is True
     assert bf16_plan.mode == "path_c_fwd_bwd"
+
+    wide_p_plan = mamba3_path_c_schedule_plan(
+        batch=1,
+        seq=512,
+        heads=1,
+        headdim=128,
+        state=64,
+        dtype="float32",
+        z3_policy="enabled",
+    )
+    assert wide_p_plan.fwd_path_c_candidate is True
+    assert wide_p_plan.bwd_path_c_candidate is True
+    assert wide_p_plan.mode == "path_c_fwd_bwd"
 
 
 def test_mamba3_path_c_schedule_plan_accepts_explicit_z3_policy() -> None:
