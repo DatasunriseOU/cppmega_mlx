@@ -1,11 +1,4 @@
-"""Unsupported fused dynamic-LUT optimizer-kernel seams.
-
-The dynamic Adam8bit/Lion8bit fast paths used to compile direct-MSL kernels via
-``mx.fast.metal_kernel``. There is no native MLX fused 8-bit optimizer API with
-the same zero-copy contract today, so these symbols now report an explicit
-unsupported status. The optimizers preserve behavior by using the native MLX
-dynamic-LUT quantize/dequantize path.
-"""
+"""Native fused dynamic-LUT optimizer kernel wrappers."""
 
 from __future__ import annotations
 
@@ -13,9 +6,16 @@ from dataclasses import dataclass
 
 import mlx.core as mx
 
+from cppmega_mlx.training._quantize_8bit import _get_lut
+from cppmega_mlx.training.native_optim import (
+    fused_adam8bit_step as _native_fused_adam8bit_step,
+    fused_lion8bit_step as _native_fused_lion8bit_step,
+    status as _native_status,
+)
+
 
 FUSED_BLOCK_SIZE = 256
-"""Historical fused-kernel block size; still matches the 8-bit codec layout."""
+"""Native fused-kernel block size; still matches the 8-bit codec layout."""
 
 
 class FusedOptimizerKernelUnsupported(RuntimeError):
@@ -28,31 +28,24 @@ class FusedOptimizerKernelStatus:
     reason: str
 
 
-_ADAM_UNSUPPORTED_REASON = (
-    "Adam8bit dynamic-LUT fused direct-MSL optimizer kernel is unsupported: "
-    "MLX exposes custom Metal through mx.fast.metal_kernel, not a native "
-    "zero-copy fused 8-bit optimizer API. Use the native MLX unfused "
-    "optimizer path."
-)
-
-_LION_UNSUPPORTED_REASON = (
-    "Lion8bit dynamic-LUT fused direct-MSL optimizer kernel is unsupported: "
-    "MLX exposes custom Metal through mx.fast.metal_kernel, not a native "
-    "zero-copy fused 8-bit optimizer API. Use the native MLX unfused "
-    "optimizer path."
-)
+def _status() -> FusedOptimizerKernelStatus:
+    native = _native_status()
+    return FusedOptimizerKernelStatus(
+        bool(native.get("available")),
+        str(native.get("reason")),
+    )
 
 
 def fused_adam8bit_dynamic_status() -> FusedOptimizerKernelStatus:
     """Return the availability status for the dynamic Adam8bit fast path."""
 
-    return FusedOptimizerKernelStatus(False, _ADAM_UNSUPPORTED_REASON)
+    return _status()
 
 
 def fused_lion8bit_dynamic_status() -> FusedOptimizerKernelStatus:
     """Return the availability status for the dynamic Lion8bit fast path."""
 
-    return FusedOptimizerKernelStatus(False, _LION_UNSUPPORTED_REASON)
+    return _status()
 
 
 def fused_adam8bit_dynamic_step(
@@ -72,9 +65,34 @@ def fused_adam8bit_dynamic_step(
     bias_correction: bool,
     block_size: int = FUSED_BLOCK_SIZE,
 ) -> tuple[mx.array, mx.array, mx.array, mx.array, mx.array]:
-    """Reject the removed direct-MSL fused dynamic Adam8bit path."""
+    """Run the native fused dynamic-LUT Adam8bit kernel."""
 
-    raise FusedOptimizerKernelUnsupported(_ADAM_UNSUPPORTED_REASON)
+    status = _status()
+    if not status.available:
+        raise FusedOptimizerKernelUnsupported(status.reason)
+    if block_size != FUSED_BLOCK_SIZE:
+        raise NotImplementedError(
+            f"block_size={block_size} not supported by the fused kernel; "
+            f"only block_size={FUSED_BLOCK_SIZE} is wired through."
+        )
+    outputs = _native_fused_adam8bit_step(
+        param,
+        grad,
+        m_quant,
+        m_absmax,
+        v_quant,
+        v_absmax,
+        learning_rate,
+        step,
+        _get_lut(),
+        True,
+        float(beta1),
+        float(beta2),
+        float(eps),
+        float(weight_decay),
+        bool(bias_correction),
+    )
+    return tuple(outputs)  # type: ignore[return-value]
 
 
 def fused_lion8bit_dynamic_step(
@@ -89,9 +107,29 @@ def fused_lion8bit_dynamic_step(
     weight_decay: float,
     block_size: int = FUSED_BLOCK_SIZE,
 ) -> tuple[mx.array, mx.array, mx.array]:
-    """Reject the removed direct-MSL fused dynamic Lion8bit path."""
+    """Run the native fused dynamic-LUT Lion8bit kernel."""
 
-    raise FusedOptimizerKernelUnsupported(_LION_UNSUPPORTED_REASON)
+    status = _status()
+    if not status.available:
+        raise FusedOptimizerKernelUnsupported(status.reason)
+    if block_size != FUSED_BLOCK_SIZE:
+        raise NotImplementedError(
+            f"block_size={block_size} not supported by the fused kernel; "
+            f"only block_size={FUSED_BLOCK_SIZE} is wired through."
+        )
+    outputs = _native_fused_lion8bit_step(
+        param,
+        grad,
+        m_quant,
+        m_absmax,
+        learning_rate,
+        _get_lut(),
+        True,
+        float(beta1),
+        float(beta2),
+        float(weight_decay),
+    )
+    return tuple(outputs)  # type: ignore[return-value]
 
 
 __all__ = [

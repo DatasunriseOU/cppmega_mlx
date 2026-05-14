@@ -270,7 +270,55 @@ def test_auto_dispatch_promotes_full_receipted_path_c(
     assert matches[-1]["kernel_used"] == "path_c_tilelang_dsl"
 
 
-def test_path_c_block_route_rejects_non_contiguous_views_without_copy(
+def test_auto_dispatch_does_not_probe_path_c_when_receipt_selects_path_b(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cppmega_mlx.nn._tilelang import mamba3 as path_b_mamba3
+    from cppmega_mlx.nn._tilelang import mamba3_path_c
+    import cppmega_mlx.nn.mamba3 as mamba3_module
+
+    x, B, C, z, A, dt, D, h0 = _make_scan_inputs(seed=15)
+
+    monkeypatch.setattr(
+        path_b_mamba3,
+        "mamba3_mimo_metal_status",
+        lambda _x=None: path_b_mamba3.Mamba3MetalStatus(True, "forced available"),
+    )
+    monkeypatch.setattr(
+        mamba3_path_c,
+        "mamba3_path_c_auto_mode_for_inputs",
+        lambda *_args, **_kwargs: "path_b",
+    )
+
+    def fail_path_c_status() -> mamba3_path_c.Mamba3PathCStatus:
+        raise AssertionError("AUTO should not compile/probe Path C when receipt selects Path B")
+
+    def fake_path_b(*args: mx.array) -> tuple[mx.array, mx.array]:
+        x_arg, *_rest, h0_arg = args
+        return mx.zeros_like(x_arg), h0_arg
+
+    monkeypatch.setattr(mamba3_path_c, "mamba3_mimo_path_c_status", fail_path_c_status)
+    monkeypatch.setattr(mamba3_module, "_mamba3_mimo_apply_with_state", fake_path_b)
+
+    y, h_last = mamba3_module._dispatch_mamba3_scan(
+        x=x,
+        B=B,
+        C=C,
+        z=z,
+        A=A,
+        dt=dt,
+        D=D,
+        h0=h0,
+        chunk_size=8,
+    )
+    mx.eval(y, h_last)
+
+    matches = [e for e in get_dispatch_log() if e["op_name"] == "mamba3_mimo"]
+    assert matches[-1]["path"] == "auto"
+    assert matches[-1]["kernel_used"] == "metal_kernel_fwd_v1"
+
+
+def test_path_c_block_route_dispatches_without_staging_copy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     if not _METAL_AVAILABLE:
@@ -284,9 +332,12 @@ def test_path_c_block_route_rejects_non_contiguous_views_without_copy(
 
     monkeypatch.setenv("CPPMEGA_KERNEL_PATH", "path_c")
     block, hidden = _make_block()
-    with pytest.raises(RuntimeError, match="DLPack-exportable"):
-        block(hidden)
-    assert [e for e in get_dispatch_log() if e["op_name"] == "mamba3_mimo"] == []
+    out, _ = block(hidden)
+    mx.eval(out)
+    assert out.shape == hidden.shape
+    matches = [e for e in get_dispatch_log() if e["op_name"] == "mamba3_mimo"]
+    assert matches[-1]["path"] == "path_c"
+    assert matches[-1]["kernel_used"] == "path_c_tilelang_dsl"
 
 
 def test_per_op_override_selects_reference(monkeypatch: pytest.MonkeyPatch) -> None:

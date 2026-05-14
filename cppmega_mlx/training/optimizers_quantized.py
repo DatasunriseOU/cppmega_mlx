@@ -23,10 +23,9 @@ Numerical policy:
     precision on the round-trip.
 
   Default stays symmetric for backward compatibility; ``bitsandbytes``
-  defaults to the dynamic LUT on the CUDA stack. Direct-MSL fused optimizer
-  kernels are intentionally unsupported until MLX exposes a native fused
-  optimizer API with the required zero-copy contract, so optimizer updates use
-  the native MLX codec path.
+  defaults to the dynamic LUT on the CUDA stack. Large tensors use the native
+  MLX C++/Metal fused optimizer primitive when available; otherwise they fall
+  back to the native MLX codec path.
 * The internal optimizer math runs in fp32 inline: every ``apply_single``
   call dequantizes the moment state to fp32, performs the standard update,
   then re-quantizes. The parameter is read in fp32 and cast back to whatever
@@ -51,13 +50,17 @@ import mlx.optimizers as optim
 
 from cppmega_mlx.training._fused_adam8bit_kernel import (
     FUSED_BLOCK_SIZE,
+    fused_adam8bit_step,
     fused_adam8bit_status,
 )
 from cppmega_mlx.training._fused_dynamic8bit_kernel import (
+    fused_adam8bit_dynamic_step,
     fused_adam8bit_dynamic_status,
+    fused_lion8bit_dynamic_step,
     fused_lion8bit_dynamic_status,
 )
 from cppmega_mlx.training._fused_lion8bit_kernel import (
+    fused_lion8bit_step,
     fused_lion8bit_status,
 )
 from cppmega_mlx.training._quantize_8bit import (
@@ -364,6 +367,48 @@ class Adam8bit(optim.Optimizer):
             decayed = parameter.astype(mx.float32) * (1.0 - lr_fp32 * self.weight_decay)
             return (decayed - update).astype(param_dtype)
 
+        scheme = self.quant_scheme
+        if self.use_fused_kernel:
+            if scheme == QUANT_SCHEME_DYNAMIC:
+                updated, m_q, m_absmax, v_q, v_absmax = fused_adam8bit_dynamic_step(
+                    parameter,
+                    gradient,
+                    state["m_quant"],
+                    state["m_absmax"],
+                    state["v_quant"],
+                    state["v_absmax"],
+                    learning_rate=lr_fp32,
+                    beta1=b1,
+                    beta2=b2,
+                    eps=eps,
+                    weight_decay=self.weight_decay,
+                    step=self.step,
+                    bias_correction=self.bias_correction,
+                    block_size=self.block_size,
+                )
+            else:
+                updated, m_q, m_absmax, v_q, v_absmax = fused_adam8bit_step(
+                    parameter,
+                    gradient,
+                    state["m_quant"],
+                    state["m_absmax"],
+                    state["v_quant"],
+                    state["v_absmax"],
+                    learning_rate=lr_fp32,
+                    beta1=b1,
+                    beta2=b2,
+                    eps=eps,
+                    weight_decay=self.weight_decay,
+                    step=self.step,
+                    bias_correction=self.bias_correction,
+                    block_size=self.block_size,
+                )
+            state["m_quant"] = m_q
+            state["m_absmax"] = m_absmax
+            state["v_quant"] = v_q
+            state["v_absmax"] = v_absmax
+            return updated
+
         # 1) Dequantize current moments to fp32. For the symmetric path the
         # dequant introduces rounding error bounded by ``absmax / (2 * 127)``
         # per block; the dynamic LUT path bounds the error by half the
@@ -373,7 +418,6 @@ class Adam8bit(optim.Optimizer):
         # that, the ``sqrt(v) + eps`` denominator would underflow and the
         # update would diverge whenever ``v`` was small relative to its block
         # absmax (e.g. tail of a fat-tailed gradient distribution).
-        scheme = self.quant_scheme
         m_prev = dequantize_blockwise(
             state["m_quant"], state["m_absmax"], scheme=scheme, out_dtype=mx.float32
         )
@@ -452,9 +496,10 @@ def make_adam8bit(
     256-element blockwise default; only that value is supported by the native
     MLX codec today (other sizes raise ``NotImplementedError``).
 
-    ``use_fused_kernel`` is retained as a compatibility request flag, but the
-    direct-MSL fused optimizer kernels are unsupported and resolve to the
-    native MLX codec path. ``optimizer.fused_kernel_status`` records why.
+    ``use_fused_kernel`` requests the native MLX C++/Metal fused primitive for
+    the dequant -> update -> requant -> apply path. If the extension is not
+    built, ``optimizer.fused_kernel_status`` records the fallback reason and
+    the optimizer uses the native MLX codec path.
 
     ``quant_scheme`` selects the 8-bit codec:
 
@@ -529,9 +574,10 @@ class Lion8bit(optim.Optimizer):
     ``sign()``, and ``beta2`` for the persistent momentum update. Both bnb's
     ``Lion8bit`` and the MLX upstream ``optim.Lion`` follow this scheme.
 
-    ``use_fused_kernel`` is retained as a compatibility request flag, but the
-    direct-MSL fused optimizer kernels are unsupported and resolve to the
-    native MLX codec path. ``optimizer.fused_kernel_status`` records why.
+    ``use_fused_kernel`` requests the native MLX C++/Metal fused primitive for
+    the dequant -> update -> requant -> apply path. If the extension is not
+    built, ``optimizer.fused_kernel_status`` records the fallback reason and
+    the optimizer uses the native MLX codec path.
 
     ``quant_scheme`` selects the codec used for the ``m`` buffer, dispatched
     through :func:`cppmega_mlx.training._quantize_8bit.quantize_blockwise`:
@@ -595,6 +641,35 @@ class Lion8bit(optim.Optimizer):
         param_dtype = parameter.dtype
         scheme = self.quant_scheme
 
+        if self.use_fused_kernel:
+            if scheme == QUANT_SCHEME_DYNAMIC:
+                updated, m_q, m_absmax = fused_lion8bit_dynamic_step(
+                    parameter,
+                    gradient,
+                    state["m_quant"],
+                    state["m_absmax"],
+                    learning_rate=lr_fp32,
+                    beta1=b1,
+                    beta2=b2,
+                    weight_decay=self.weight_decay,
+                    block_size=self.block_size,
+                )
+            else:
+                updated, m_q, m_absmax = fused_lion8bit_step(
+                    parameter,
+                    gradient,
+                    state["m_quant"],
+                    state["m_absmax"],
+                    learning_rate=lr_fp32,
+                    beta1=b1,
+                    beta2=b2,
+                    weight_decay=self.weight_decay,
+                    block_size=self.block_size,
+                )
+            state["m_quant"] = m_q
+            state["m_absmax"] = m_absmax
+            return updated
+
         # 1) Dequantize the persistent momentum to fp32 for the inner math.
         # Lion's update is sign-based, so symmetric int8 quant noise on m
         # only flips the sign on elements within ~absmax/127 of zero -- those
@@ -655,9 +730,10 @@ def make_lion8bit(
     that value is supported by the native MLX codec today (other sizes raise
     ``NotImplementedError``).
 
-    ``use_fused_kernel`` is retained as a compatibility request flag, but the
-    direct-MSL fused optimizer kernels are unsupported and resolve to the
-    native MLX codec path. ``optimizer.fused_kernel_status`` records why.
+    ``use_fused_kernel`` requests the native MLX C++/Metal fused primitive for
+    the dequant -> update -> requant -> apply path. If the extension is not
+    built, ``optimizer.fused_kernel_status`` records the fallback reason and
+    the optimizer uses the native MLX codec path.
 
     ``quant_scheme`` selects the 8-bit codec:
 

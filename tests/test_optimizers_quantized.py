@@ -275,22 +275,24 @@ def test_adam8bit_second_moment_is_nonnegative_after_quant_dequant() -> None:
         m_absmax = mx.zeros((1,), dtype=mx.float32)
         v_quant = mx.zeros((n,), dtype=mx.uint8)
         v_absmax = mx.ones((1,), dtype=mx.float32)
-        with pytest.raises(RuntimeError, match="unsupported"):
-            fused_step(
-                param,
-                grad,
-                m_quant,
-                m_absmax,
-                v_quant,
-                v_absmax,
-                learning_rate=mx.array(1e-3, dtype=mx.float32),
-                beta1=0.9,
-                beta2=0.999,
-                eps=1e-8,
-                weight_decay=0.0,
-                step=mx.array(1, dtype=mx.uint64),
-                bias_correction=False,
-            )
+        updated, _, _, _, _ = fused_step(
+            param,
+            grad,
+            m_quant,
+            m_absmax,
+            v_quant,
+            v_absmax,
+            learning_rate=mx.array(1e-3, dtype=mx.float32),
+            beta1=0.9,
+            beta2=0.999,
+            eps=1e-8,
+            weight_decay=0.0,
+            step=mx.array(1, dtype=mx.uint64),
+            bias_correction=False,
+        )
+        mx.eval(updated)
+        assert bool(mx.all(mx.isfinite(updated)).item())
+        assert float(mx.max(mx.abs(updated - param)).item()) == 0.0
 
     for scheme in (QUANT_SCHEME_SYMMETRIC, QUANT_SCHEME_DYNAMIC):
         optimizer = make_adam8bit(
@@ -490,7 +492,7 @@ def test_muon_scalar_optimizer_constants_are_frozen() -> None:
 
 
 # -----------------------------------------------------------------------------
-# Fused optimizer request: explicit unsupported status + native MLX fallback
+# Fused optimizer request: native MLX C++/Metal fast path + explicit fallback
 # -----------------------------------------------------------------------------
 
 
@@ -502,15 +504,28 @@ def _flat_state_arrays(state: object) -> dict[str, mx.array]:
     }
 
 
-def test_fused_adam8bit_default_falls_back_to_native_mlx() -> None:
-    """``use_fused_kernel`` is a request; direct-MSL is unsupported for training."""
+def _assert_arrays_close_or_equal(
+    actual: mx.array,
+    expected: mx.array,
+    key: str = "",
+) -> None:
+    assert actual.shape == expected.shape, key
+    assert actual.dtype == expected.dtype, key
+    if actual.dtype == mx.uint8:
+        diff = mx.abs(actual.astype(mx.int32) - expected.astype(mx.int32))
+        assert int(mx.max(diff).item()) <= 1, key
+    else:
+        assert bool(mx.allclose(actual, expected, rtol=1e-5, atol=1e-6).item()), key
+
+
+def test_fused_adam8bit_default_uses_native_mlx_extension() -> None:
+    """``use_fused_kernel`` requests the native MLX C++/Metal primitive."""
 
     optimizer = make_adam8bit(learning_rate=1e-3)
     assert isinstance(optimizer, Adam8bit)
-    assert optimizer.use_fused_kernel is False
-    assert optimizer.fused_kernel_status.available is False
-    assert "direct-MSL" in optimizer.fused_kernel_status.reason
-    assert "native MLX" in optimizer.fused_kernel_status.reason
+    assert optimizer.use_fused_kernel is True
+    assert optimizer.fused_kernel_status.available is True
+    assert "native MLX C++/Metal" in optimizer.fused_kernel_status.reason
 
 
 def test_fused_adam8bit_can_be_disabled_for_parity_runs() -> None:
@@ -570,9 +585,8 @@ def _run_n_steps(
 def test_fused_adam8bit_matches_unfused_within_tolerance() -> None:
     """A fused request must preserve native path parameter and state behavior.
 
-    Direct-MSL fused kernels are unsupported, so requesting fused execution
-    resolves to the same native MLX dequant -> AdamW -> quant -> apply path as
-    the explicit unfused configuration.
+    The native C++/Metal primitive uses a threadgroup reduction for block
+    absmax, so exact bitwise equality is not required for fp32 leaves.
     """
 
     steps = 1
@@ -586,8 +600,8 @@ def test_fused_adam8bit_matches_unfused_within_tolerance() -> None:
     )
     mx.eval(fused_w, fused_b, unfused_w, unfused_b)
 
-    assert mx.array_equal(fused_w, unfused_w)
-    assert mx.array_equal(fused_b, unfused_b)
+    _assert_arrays_close_or_equal(fused_w, unfused_w, "weight")
+    _assert_arrays_close_or_equal(fused_b, unfused_b, "bias")
 
     # State: every leaf must match. m_quant/v_quant are uint8; allow off-by-1
     # since the per-block absmax tree reduction can swap order vs Python's
@@ -596,9 +610,7 @@ def test_fused_adam8bit_matches_unfused_within_tolerance() -> None:
     for key in fused_state:
         f = fused_state[key]
         u = unfused_state[key]
-        assert f.shape == u.shape
-        assert f.dtype == u.dtype
-        assert mx.array_equal(f, u), key
+        _assert_arrays_close_or_equal(f, u, key)
 
 
 def test_fused_adam8bit_loss_matches_unfused_over_50_steps() -> None:
@@ -679,29 +691,30 @@ def test_fused_adam8bit_loss_matches_fp32_within_tolerance() -> None:
     )
 
 
-def test_fused_adam8bit_direct_call_reports_unsupported() -> None:
+def test_fused_adam8bit_direct_call_runs_native_extension() -> None:
     status = fused_adam8bit_status()
-    assert status.available is False
-    assert "direct-MSL" in status.reason
-    assert "native MLX" in status.reason
+    assert status.available is True
+    assert "native MLX C++/Metal" in status.reason
 
     n = DEFAULT_BLOCK_SIZE
-    with pytest.raises(RuntimeError, match="direct-MSL optimizer kernel is unsupported"):
-        fused_adam8bit_step(
-            mx.zeros((n,), dtype=mx.float32),
-            mx.zeros((n,), dtype=mx.float32),
-            mx.full((n,), 128, dtype=mx.uint8),
-            mx.zeros((1,), dtype=mx.float32),
-            mx.full((n,), 128, dtype=mx.uint8),
-            mx.zeros((1,), dtype=mx.float32),
-            learning_rate=mx.array(1e-3, dtype=mx.float32),
-            beta1=0.9,
-            beta2=0.999,
-            eps=1e-8,
-            weight_decay=0.0,
-            step=mx.array(1, dtype=mx.uint64),
-            bias_correction=False,
-        )
+    outputs = fused_adam8bit_step(
+        mx.zeros((n,), dtype=mx.float32),
+        mx.zeros((n,), dtype=mx.float32),
+        mx.full((n,), 128, dtype=mx.uint8),
+        mx.zeros((1,), dtype=mx.float32),
+        mx.full((n,), 128, dtype=mx.uint8),
+        mx.zeros((1,), dtype=mx.float32),
+        learning_rate=mx.array(1e-3, dtype=mx.float32),
+        beta1=0.9,
+        beta2=0.999,
+        eps=1e-8,
+        weight_decay=0.0,
+        step=mx.array(1, dtype=mx.uint64),
+        bias_correction=False,
+    )
+    mx.eval(outputs)
+    assert len(outputs) == 5
+    assert outputs[0].shape == (n,)
 
 
 def test_fused_adam8bit_state_keys_match_unfused() -> None:
@@ -875,11 +888,9 @@ def test_adam8bit_dynamic_quant_scheme_state_dtypes() -> None:
     optimizer.init(model.trainable_parameters())
     mx.eval(optimizer.state)
     assert optimizer.quant_scheme == QUANT_SCHEME_DYNAMIC
-    # Direct-MSL fused optimizer kernels are unsupported, so the constructor
-    # records the status and falls back to the native MLX codec path.
-    assert optimizer.use_fused_kernel is False
-    assert optimizer.fused_kernel_status.available is False
-    assert "direct-MSL" in optimizer.fused_kernel_status.reason
+    assert optimizer.use_fused_kernel is True
+    assert optimizer.fused_kernel_status.available is True
+    assert "native MLX C++/Metal" in optimizer.fused_kernel_status.reason
 
     flat = _flatten_state(optimizer.state)
     assert flat["linear.weight.m_quant"].dtype == mx.uint8
@@ -939,8 +950,8 @@ def test_make_adam8bit_default_scheme_is_symmetric_for_backcompat() -> None:
 
     optimizer = make_adam8bit(learning_rate=1e-3)
     assert optimizer.quant_scheme == QUANT_SCHEME_SYMMETRIC
-    assert optimizer.use_fused_kernel is False
-    assert "direct-MSL" in optimizer.fused_kernel_status.reason
+    assert optimizer.use_fused_kernel is True
+    assert "native MLX C++/Metal" in optimizer.fused_kernel_status.reason
 
 
 def test_adam8bit_rejects_unknown_quant_scheme() -> None:
@@ -1198,19 +1209,18 @@ def test_make_muon_lion8bit_quant_scheme_propagates() -> None:
 
 
 # -----------------------------------------------------------------------------
-# Fused optimizer request for Lion8bit: unsupported + native MLX fallback
+# Fused optimizer request for Lion8bit: native MLX C++/Metal fast path
 # -----------------------------------------------------------------------------
 
 
-def test_fused_lion8bit_default_falls_back_to_native_mlx() -> None:
-    """``use_fused_kernel`` is a request; direct-MSL is unsupported for training."""
+def test_fused_lion8bit_default_uses_native_mlx_extension() -> None:
+    """``use_fused_kernel`` requests the native MLX C++/Metal primitive."""
 
     optimizer = make_lion8bit(learning_rate=1e-4)
     assert isinstance(optimizer, Lion8bit)
-    assert optimizer.use_fused_kernel is False
-    assert optimizer.fused_kernel_status.available is False
-    assert "direct-MSL" in optimizer.fused_kernel_status.reason
-    assert "native MLX" in optimizer.fused_kernel_status.reason
+    assert optimizer.use_fused_kernel is True
+    assert optimizer.fused_kernel_status.available is True
+    assert "native MLX C++/Metal" in optimizer.fused_kernel_status.reason
 
 
 def test_fused_lion8bit_can_be_disabled_for_parity_runs() -> None:
@@ -1222,8 +1232,8 @@ def test_fused_lion8bit_can_be_disabled_for_parity_runs() -> None:
     assert "disabled by caller" in optimizer.fused_kernel_status.reason
 
 
-def test_fused_lion8bit_symmetric_default_reports_unsupported() -> None:
-    """Symmetric scheme + fused request must fail closed to native MLX."""
+def test_fused_lion8bit_symmetric_default_uses_native_extension() -> None:
+    """Symmetric scheme + fused request resolves to the native extension."""
 
     optimizer = make_lion8bit(
         learning_rate=1e-4,
@@ -1231,8 +1241,8 @@ def test_fused_lion8bit_symmetric_default_reports_unsupported() -> None:
         use_fused_kernel=True,
     )
     assert optimizer.quant_scheme == "symmetric_int8_v1"
-    assert optimizer.use_fused_kernel is False
-    assert "direct-MSL" in optimizer.fused_kernel_status.reason
+    assert optimizer.use_fused_kernel is True
+    assert "native MLX C++/Metal" in optimizer.fused_kernel_status.reason
 
 
 def test_fused_lion8bit_non_default_block_size_falls_back_to_unfused() -> None:
@@ -1297,9 +1307,8 @@ def _run_lion_n_steps(
 def test_fused_lion8bit_matches_unfused_within_tolerance() -> None:
     """A fused request must preserve native path parameter and state behavior.
 
-    Direct-MSL fused kernels are unsupported, so requesting fused execution
-    resolves to the same native MLX dequant -> Lion -> quant -> apply path as
-    the explicit unfused configuration.
+    The native C++/Metal primitive uses a threadgroup reduction for block
+    absmax, so exact bitwise equality is not required for fp32 leaves.
     """
 
     steps = 1
@@ -1313,8 +1322,8 @@ def test_fused_lion8bit_matches_unfused_within_tolerance() -> None:
     )
     mx.eval(fused_w, fused_b, unfused_w, unfused_b)
 
-    assert mx.array_equal(fused_w, unfused_w)
-    assert mx.array_equal(fused_b, unfused_b)
+    _assert_arrays_close_or_equal(fused_w, unfused_w, "weight")
+    _assert_arrays_close_or_equal(fused_b, unfused_b, "bias")
 
     # State: every leaf must match. m_quant is uint8; allow off-by-1 since
     # the per-block absmax tree reduction can swap order vs Python's
@@ -1323,9 +1332,7 @@ def test_fused_lion8bit_matches_unfused_within_tolerance() -> None:
     for key in fused_state:
         f = fused_state[key]
         u = unfused_state[key]
-        assert f.shape == u.shape
-        assert f.dtype == u.dtype
-        assert mx.array_equal(f, u), key
+        _assert_arrays_close_or_equal(f, u, key)
 
 
 def test_fused_lion8bit_loss_matches_unfused_over_50_steps() -> None:
@@ -1406,24 +1413,25 @@ def test_fused_lion8bit_loss_matches_lion_fp32_within_tolerance() -> None:
     )
 
 
-def test_fused_lion8bit_direct_call_reports_unsupported() -> None:
+def test_fused_lion8bit_direct_call_runs_native_extension() -> None:
     status = fused_lion8bit_status()
-    assert status.available is False
-    assert "direct-MSL" in status.reason
-    assert "native MLX" in status.reason
+    assert status.available is True
+    assert "native MLX C++/Metal" in status.reason
 
     n = DEFAULT_BLOCK_SIZE
-    with pytest.raises(RuntimeError, match="direct-MSL optimizer kernel is unsupported"):
-        fused_lion8bit_step(
-            mx.zeros((n,), dtype=mx.float32),
-            mx.zeros((n,), dtype=mx.float32),
-            mx.full((n,), 128, dtype=mx.uint8),
-            mx.zeros((1,), dtype=mx.float32),
-            learning_rate=mx.array(1e-4, dtype=mx.float32),
-            beta1=0.9,
-            beta2=0.99,
-            weight_decay=0.0,
-        )
+    outputs = fused_lion8bit_step(
+        mx.zeros((n,), dtype=mx.float32),
+        mx.zeros((n,), dtype=mx.float32),
+        mx.full((n,), 128, dtype=mx.uint8),
+        mx.zeros((1,), dtype=mx.float32),
+        learning_rate=mx.array(1e-4, dtype=mx.float32),
+        beta1=0.9,
+        beta2=0.99,
+        weight_decay=0.0,
+    )
+    mx.eval(outputs)
+    assert len(outputs) == 3
+    assert outputs[0].shape == (n,)
 
 
 def test_fused_lion8bit_state_keys_match_unfused() -> None:
@@ -1451,7 +1459,7 @@ def test_fused_lion8bit_state_keys_match_unfused() -> None:
 
 
 # -----------------------------------------------------------------------------
-# Fused dynamic-LUT requests (Adam8bit + Lion8bit): unsupported + fallback.
+# Fused dynamic-LUT requests (Adam8bit + Lion8bit): native extension path.
 # -----------------------------------------------------------------------------
 
 
@@ -1586,16 +1594,14 @@ def test_fused_dynamic_adam8bit_matches_unfused_within_tolerance() -> None:
     )
     mx.eval(fused_w, fused_b, unfused_w, unfused_b)
 
-    assert mx.array_equal(fused_w, unfused_w)
-    assert mx.array_equal(fused_b, unfused_b)
+    _assert_arrays_close_or_equal(fused_w, unfused_w, "weight")
+    _assert_arrays_close_or_equal(fused_b, unfused_b, "bias")
 
     assert set(fused_state.keys()) == set(unfused_state.keys())
     for key in fused_state:
         f = fused_state[key]
         u = unfused_state[key]
-        assert f.shape == u.shape
-        assert f.dtype == u.dtype
-        assert mx.array_equal(f, u), key
+        _assert_arrays_close_or_equal(f, u, key)
 
 
 def test_fused_dynamic_adam8bit_loss_matches_fp32_within_tolerance() -> None:
@@ -1634,29 +1640,30 @@ def test_fused_dynamic_adam8bit_loss_matches_fp32_within_tolerance() -> None:
     )
 
 
-def test_fused_dynamic_adam8bit_direct_call_reports_unsupported() -> None:
+def test_fused_dynamic_adam8bit_direct_call_runs_native_extension() -> None:
     status = fused_adam8bit_dynamic_status()
-    assert status.available is False
-    assert "direct-MSL" in status.reason
-    assert "native MLX" in status.reason
+    assert status.available is True
+    assert "native MLX C++/Metal" in status.reason
 
     n = DEFAULT_BLOCK_SIZE
-    with pytest.raises(RuntimeError, match="direct-MSL optimizer kernel is unsupported"):
-        fused_adam8bit_dynamic_step(
-            mx.zeros((n,), dtype=mx.float32),
-            mx.zeros((n,), dtype=mx.float32),
-            mx.full((n,), 127, dtype=mx.uint8),
-            mx.zeros((1,), dtype=mx.float32),
-            mx.full((n,), 127, dtype=mx.uint8),
-            mx.zeros((1,), dtype=mx.float32),
-            learning_rate=mx.array(1e-3, dtype=mx.float32),
-            beta1=0.9,
-            beta2=0.999,
-            eps=1e-8,
-            weight_decay=0.0,
-            step=mx.array(1, dtype=mx.uint64),
-            bias_correction=False,
-        )
+    outputs = fused_adam8bit_dynamic_step(
+        mx.zeros((n,), dtype=mx.float32),
+        mx.zeros((n,), dtype=mx.float32),
+        mx.full((n,), 127, dtype=mx.uint8),
+        mx.zeros((1,), dtype=mx.float32),
+        mx.full((n,), 127, dtype=mx.uint8),
+        mx.zeros((1,), dtype=mx.float32),
+        learning_rate=mx.array(1e-3, dtype=mx.float32),
+        beta1=0.9,
+        beta2=0.999,
+        eps=1e-8,
+        weight_decay=0.0,
+        step=mx.array(1, dtype=mx.uint64),
+        bias_correction=False,
+    )
+    mx.eval(outputs)
+    assert len(outputs) == 5
+    assert outputs[0].shape == (n,)
 
 
 def test_fused_dynamic_lion8bit_matches_unfused_within_tolerance() -> None:
@@ -1673,16 +1680,14 @@ def test_fused_dynamic_lion8bit_matches_unfused_within_tolerance() -> None:
     )
     mx.eval(fused_w, fused_b, unfused_w, unfused_b)
 
-    assert mx.array_equal(fused_w, unfused_w)
-    assert mx.array_equal(fused_b, unfused_b)
+    _assert_arrays_close_or_equal(fused_w, unfused_w, "weight")
+    _assert_arrays_close_or_equal(fused_b, unfused_b, "bias")
 
     assert set(fused_state.keys()) == set(unfused_state.keys())
     for key in fused_state:
         f = fused_state[key]
         u = unfused_state[key]
-        assert f.shape == u.shape
-        assert f.dtype == u.dtype
-        assert mx.array_equal(f, u), key
+        _assert_arrays_close_or_equal(f, u, key)
 
 
 def test_fused_dynamic_lion8bit_loss_matches_fp32_within_tolerance() -> None:
@@ -1721,21 +1726,22 @@ def test_fused_dynamic_lion8bit_loss_matches_fp32_within_tolerance() -> None:
     )
 
 
-def test_fused_dynamic_lion8bit_direct_call_reports_unsupported() -> None:
+def test_fused_dynamic_lion8bit_direct_call_runs_native_extension() -> None:
     status = fused_lion8bit_dynamic_status()
-    assert status.available is False
-    assert "direct-MSL" in status.reason
-    assert "native MLX" in status.reason
+    assert status.available is True
+    assert "native MLX C++/Metal" in status.reason
 
     n = DEFAULT_BLOCK_SIZE
-    with pytest.raises(RuntimeError, match="direct-MSL optimizer kernel is unsupported"):
-        fused_lion8bit_dynamic_step(
-            mx.zeros((n,), dtype=mx.float32),
-            mx.zeros((n,), dtype=mx.float32),
-            mx.full((n,), 127, dtype=mx.uint8),
-            mx.zeros((1,), dtype=mx.float32),
-            learning_rate=mx.array(1e-4, dtype=mx.float32),
-            beta1=0.9,
-            beta2=0.99,
-            weight_decay=0.0,
-        )
+    outputs = fused_lion8bit_dynamic_step(
+        mx.zeros((n,), dtype=mx.float32),
+        mx.zeros((n,), dtype=mx.float32),
+        mx.full((n,), 127, dtype=mx.uint8),
+        mx.zeros((1,), dtype=mx.float32),
+        learning_rate=mx.array(1e-4, dtype=mx.float32),
+        beta1=0.9,
+        beta2=0.99,
+        weight_decay=0.0,
+    )
+    mx.eval(outputs)
+    assert len(outputs) == 3
+    assert outputs[0].shape == (n,)

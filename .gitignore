@@ -13,6 +13,10 @@ __pycache__/
 
 # Build artifacts.
 *.egg-info/
+build/
+cppmega_mlx/training/native_optim/*.so
+cppmega_mlx/training/native_optim/*.dylib
+cppmega_mlx/training/native_optim/*.metallib
 
 # Local Metal GPU traces (multi-hundred-MB Apple Xcode capture bundles).
 *.gputrace

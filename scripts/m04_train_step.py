@@ -477,6 +477,19 @@ def fp8_path_c_route_requested(
     return str(getattr(args, "dtype", "")).strip().lower() == FP8_PATH_C_DTYPE
 
 
+def path_c_kernel_policy_requested() -> bool:
+    path_c_values = {"path_c", "c"}
+    for env_name in (
+        "CPPMEGA_KERNEL_PATH",
+        "CPPMEGA_KERNEL_PATH__MAMBA3_MIMO",
+        "CPPMEGA_KERNEL_PATH__M2RNN",
+        "CPPMEGA_KERNEL_PATH__SPARSE_MLA",
+    ):
+        if os.environ.get(env_name, "").strip().lower() in path_c_values:
+            return True
+    return False
+
+
 def carrier_dtype_for_acceptance(
     args: argparse.Namespace | TrainHybridTinyConfig,
 ) -> str:
@@ -1689,6 +1702,8 @@ def run_receipt(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
 def _run_existing_training(
     args: argparse.Namespace, *, data_path: Path
 ) -> tuple[dict[str, Any], int]:
+    if path_c_kernel_policy_requested():
+        ensure_tilelang_dev_env_for_path_c()
     config = config_from_args(args, data_path=data_path)
     try:
         validate_config(config)
