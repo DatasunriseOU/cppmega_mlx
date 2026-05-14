@@ -292,9 +292,10 @@ def test_hybrid_lm_dsa_path_c_uses_sparse_causal_sentinel(
         sinks: mx.array | None = None,
         return_lse: bool = False,
         force_path_c: bool = False,
+        output_dtype: mx.Dtype | None = None,
     ) -> mx.array:
         assert sinks is None
-        del q_scale, kv_scale, indices, sm_scale, return_lse
+        del q_scale, kv_scale, indices, sm_scale, return_lse, output_dtype
         assert force_path_c is True
         d_v_resolved = int(q_fp8.shape[-1] if d_v is None else d_v)
         apply_calls.append((tuple(q_fp8.shape), tuple(kv_fp8.shape)))
@@ -350,8 +351,9 @@ def test_hybrid_lm_dsa_path_c_threads_document_mask_to_sparse_indices(
         sinks: mx.array | None = None,
         return_lse: bool = False,
         force_path_c: bool = False,
+        output_dtype: mx.Dtype | None = None,
     ) -> mx.array:
-        del q_scale, kv_fp8, kv_scale, sm_scale, sinks, return_lse
+        del q_scale, kv_fp8, kv_scale, sm_scale, sinks, return_lse, output_dtype
         assert force_path_c is True
         seen_indices.append(indices)
         d_v_resolved = int(q_fp8.shape[-1] if d_v is None else d_v)

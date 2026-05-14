@@ -135,7 +135,10 @@ def test_describe_mlx_lm_trainer_apis_fails_closed_when_signatures_drift(
 def test_installed_training_args_exposes_memory_and_adapter_save_contract() -> None:
     from dataclasses import fields
 
-    from mlx_lm.tuner.trainer import TrainingArgs
+    from cppmega_mlx._mlx_lm_imports import suppress_sentencepiece_swig_warnings
+
+    with suppress_sentencepiece_swig_warnings():
+        from mlx_lm.tuner.trainer import TrainingArgs
 
     field_names = {field.name for field in fields(TrainingArgs)}
     for name in TRAINING_ARGS_MEMORY_POLICY_FIELDS:

@@ -20,8 +20,11 @@
       header at codegen time -- TileLang would need a constant-table
       extern declaration that ``codegen_metal.cc`` knows to materialise.
 
-   Until both land, callers stay on ``mx.fast.metal_kernel`` directly. The
-   3-kernel classification below survives in source comments per kernel.
+   Until both land, this module remains a Path B direct-MSL implementation.
+   ``fp8_msl_status()`` reports that the normal TileLang/tvm-ffi/native route
+   is blocked with this exact reason rather than implying the engine flip has
+   landed. The 3-kernel classification below survives in source comments per
+   kernel.
 
    TODO(wave-7): once Metal-target ``extern_intrinsic`` ships, wrap each
    kernel body in a thin ``@T.prim_func`` calling ``T.extern_intrinsic``
@@ -452,6 +455,9 @@ class FP8MSLKernelStatus:
 
     available: bool
     reason: str
+    dispatch_surface: str = "mx.fast.metal_kernel_direct_msl"
+    normal_path_available: bool = False
+    normal_path_reason: str = ""
 
 
 def fp8_msl_status() -> FP8MSLKernelStatus:
@@ -461,6 +467,7 @@ def fp8_msl_status() -> FP8MSLKernelStatus:
         return FP8MSLKernelStatus(
             available=False,
             reason="MLX Metal backend is not available on the default GPU device",
+            normal_path_reason=_wave7_engine_flip_blocked_reason(),
         )
     if (
         _FP8_TO_HALF_KERNEL is None
@@ -474,6 +481,7 @@ def fp8_msl_status() -> FP8MSLKernelStatus:
                 "mx.fast.metal_kernel is unavailable; FP8 MSL kernels did not "
                 "compile in this environment."
             ),
+            normal_path_reason=_wave7_engine_flip_blocked_reason(),
         )
     return FP8MSLKernelStatus(
         available=True,
@@ -481,6 +489,7 @@ def fp8_msl_status() -> FP8MSLKernelStatus:
             "Vendored FP8 e4m3fn MSL kernels (LUT-based decode + integer-bit "
             "encode) are compiled and ready to dispatch."
         ),
+        normal_path_reason=_wave7_engine_flip_blocked_reason(),
     )
 
 

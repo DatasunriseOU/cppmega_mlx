@@ -274,6 +274,13 @@ def test_path_b_status_reason_is_stable() -> None:
     assert s1.reason == s2.reason
 
 
+def test_path_b_status_documents_legacy_owner_output_blocker() -> None:
+    reason = topk_selector_mod._PATH_B_OK_REASON
+    assert "legacy direct-MSL" in reason
+    assert "tvm-ffi owner outputs" in reason
+    assert "masked/no-out" in reason
+
+
 def test_path_c_status_reports_tilelang_metal_state() -> None:
     status = topk_selector_path_c_status()
     assert isinstance(status, PathCStatus)

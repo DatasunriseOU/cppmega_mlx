@@ -8,8 +8,8 @@ from typing import Literal, cast
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.base import scaled_dot_product_attention
 
+from cppmega_mlx._mlx_lm_imports import scaled_dot_product_attention
 from cppmega_mlx.inference.engine import ContiguousKVCache
 from cppmega_mlx.runtime.kernel_policy import KernelPath, record_dispatch, selected_path
 

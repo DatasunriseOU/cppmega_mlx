@@ -93,7 +93,7 @@ def _make_inputs(
 
 
 def _skip_if_tilelang_checkout_unavailable(reason: str) -> None:
-    if "tilelang import failed" in reason:
+    if "tilelang import failed" in reason or "native MLX TVM-FFI" in reason:
         pytest.skip(reason)
 
 
@@ -377,7 +377,7 @@ def test_blockscaled_path_c_e8m0_qk_reduce_matches_blockscale_oracle() -> None:
     )
 
 
-def test_blockscaled_path_c_e8m0_qk_reduce_accepts_broadcast_b_scale() -> None:
+def test_blockscaled_path_c_e8m0_qk_reduce_supports_broadcast_b_scale() -> None:
     status = blockscaled_sparse_mla_qk_reduce_path_c_status(N=16, K=64)
     _require_path_c_available(status)
     q, kv, _indices, _d_v = _make_inputs(seq_len=16, heads=2, qk_dim=64, topk=16, scale=0.1)

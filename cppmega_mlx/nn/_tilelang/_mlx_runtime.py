@@ -1,5 +1,5 @@
 # pyright: reportInvalidTypeForm=false, reportMissingImports=false
-"""TileLang Metal kernel -> ``mx.fast.metal_kernel`` runtime adapter.
+"""TileLang Metal runtime adapters.
 
 The Triton -> TileLang -> Metal -> MLX numeric harness emits a complete
 Metal Shading Language (MSL) function with positional buffer parameters
@@ -10,7 +10,8 @@ kernel signature itself from caller-supplied ``input_names`` /
 ``output_names`` and only takes the *body* of the kernel; by convention
 those names must be ``inp0``, ``inp1``, ..., ``out0``, ``out1``, ...
 
-This module bridges the two worlds. ``wrap_tilelang_metal_kernel`` takes
+The legacy helper in this module bridges those two worlds.
+``wrap_tilelang_metal_kernel`` takes
 a TileLang compile artifact (with ``.kernel_source`` / ``.rt_mod``),
 parses the device-qualified parameter names out of the emitted ``kernel
 void`` signature, renames the first ``input_count`` to ``inp0..inpN-1``
@@ -26,6 +27,12 @@ kernel via ``_msl_transform`` (its body is hand-authored / IR-rewritten
 with the right ``inp*`` / ``out*`` names already, so the rename is a
 no-op there). For TileLang's stock Metal emitter the names are positional,
 so we rename them here.
+
+New production Path C code should use the native TVM-FFI boundary instead:
+``NativeTileLangKernel`` wraps a TileLang
+``tilelang.compile(..., execution_backend="tvm_ffi", out_idx=...)`` artifact
+and requires caller-owned outputs by default. It does not rewrite MSL and does
+not build ``mx.fast.metal_kernel``.
 """
 
 from __future__ import annotations
@@ -37,7 +44,10 @@ from typing import Any, Callable, Sequence
 
 __all__ = [
     "MLXRuntimeError",
+    "NativeTileLangKernel",
+    "NativeTileLangRuntimeError",
     "TileLangMetalAdapter",
+    "normalize_out_idx",
     "_rewrite_tilelang_metal_to_mlx",
     "wrap_tilelang_metal_kernel",
 ]
@@ -45,6 +55,164 @@ __all__ = [
 
 class MLXRuntimeError(RuntimeError):
     """Raised when the TileLang Metal source cannot be adapted to MLX."""
+
+
+class NativeTileLangRuntimeError(RuntimeError):
+    """Raised when the native TileLang TVM-FFI boundary is misused."""
+
+
+def normalize_out_idx(
+    out_idx: int | Sequence[int] | None,
+    *,
+    num_params: int | None = None,
+) -> tuple[int, ...]:
+    """Normalize TileLang ``out_idx`` values to positive parameter indices."""
+
+    if out_idx is None:
+        return ()
+    if isinstance(out_idx, int):
+        raw_indices = (out_idx,)
+    else:
+        raw_indices = tuple(int(idx) for idx in out_idx)
+
+    normalized: list[int] = []
+    for idx in raw_indices:
+        if idx < 0:
+            if num_params is None:
+                normalized.append(idx)
+                continue
+            idx = num_params + idx
+        if num_params is not None and (idx < 0 or idx >= num_params):
+            raise NativeTileLangRuntimeError(
+                f"out_idx {idx} is outside the PrimFunc parameter range "
+                f"[0, {num_params})"
+            )
+        normalized.append(idx)
+    if len(set(normalized)) != len(normalized):
+        raise NativeTileLangRuntimeError(
+            f"out_idx contains duplicate result positions: {tuple(normalized)}"
+        )
+    return tuple(normalized)
+
+
+def _owner_output_sequence(out: Any, expected_count: int) -> tuple[Any, ...]:
+    if expected_count == 0:
+        return ()
+    if expected_count == 1:
+        if isinstance(out, (list, tuple)):
+            if len(out) != 1:
+                raise NativeTileLangRuntimeError(
+                    f"kernel expects 1 owner output, got {len(out)}"
+                )
+            return (out[0],)
+        return (out,)
+    if not isinstance(out, (list, tuple)):
+        raise NativeTileLangRuntimeError(
+            f"kernel expects {expected_count} owner outputs, but out= is not a sequence"
+        )
+    if len(out) != expected_count:
+        raise NativeTileLangRuntimeError(
+            f"kernel expects {expected_count} owner outputs, got {len(out)}"
+        )
+    return tuple(out)
+
+
+def _validate_owner_result(result: Any, expected_outputs: tuple[Any, ...]) -> Any:
+    """Fail if a native call did not return the caller-owned output objects."""
+
+    if not expected_outputs:
+        return result
+    if len(expected_outputs) == 1:
+        expected = expected_outputs[0]
+        if result is expected:
+            return result
+        if isinstance(result, (list, tuple)) and len(result) == 1 and result[0] is expected:
+            return result
+        raise NativeTileLangRuntimeError(
+            "native TileLang TVM-FFI call did not return the caller-owned output"
+        )
+    if not isinstance(result, (list, tuple)) or len(result) != len(expected_outputs):
+        raise NativeTileLangRuntimeError(
+            "native TileLang TVM-FFI call returned an unexpected output shape"
+        )
+    for pos, (got, expected) in enumerate(zip(result, expected_outputs, strict=True)):
+        if got is not expected:
+            raise NativeTileLangRuntimeError(
+                "native TileLang TVM-FFI call did not return caller-owned "
+                f"output at result position {pos}"
+            )
+    return result
+
+
+@dataclass(frozen=True)
+class NativeTileLangKernel:
+    """Strict native wrapper for TileLang ``execution_backend="tvm_ffi"``.
+
+    The wrapper deliberately requires caller-owned ``out=`` buffers whenever
+    the PrimFunc has result indices. That keeps the boundary honest: no MSL
+    text rewrite, no ``mx.fast.metal_kernel`` allocation semantics, and no
+    hidden Python-side staging to satisfy a wrapper ABI.
+    """
+
+    artifact: Any
+    result_indices: tuple[int, ...]
+    num_params: int
+    target: Any
+    allow_graph_outputs: bool = False
+
+    def __call__(
+        self,
+        *inputs: Any,
+        out: Any | None = None,
+        _tilelang_metal_command_buffer_domain: Any | None = None,
+    ) -> Any:
+        expected_inputs = self.num_params - len(self.result_indices)
+        using_full_abi_outputs = (
+            out is None and bool(self.result_indices) and len(inputs) == self.num_params
+        )
+        if (
+            self.result_indices
+            and out is None
+            and not using_full_abi_outputs
+            and not self.allow_graph_outputs
+        ):
+            raise NativeTileLangRuntimeError(
+                "native TileLang TVM-FFI kernels require caller-owned out= "
+                "buffers by default; pass allow_graph_outputs=True only for "
+                "an explicit native MLX graph-output route"
+            )
+
+        if out is not None and len(inputs) != expected_inputs:
+            raise NativeTileLangRuntimeError(
+                f"native TileLang TVM-FFI kernel expected {expected_inputs} "
+                f"inputs with out=, got {len(inputs)}"
+            )
+        if out is None and len(inputs) not in {expected_inputs, self.num_params}:
+            raise NativeTileLangRuntimeError(
+                f"native TileLang TVM-FFI kernel expected {expected_inputs} "
+                f"inputs, or {self.num_params} full-ABI arguments including "
+                f"outputs, got {len(inputs)}"
+            )
+
+        kwargs: dict[str, Any] = {}
+        expected_outputs: tuple[Any, ...] = ()
+        if out is not None:
+            expected_outputs = _owner_output_sequence(out, len(self.result_indices))
+            kwargs["out"] = out
+        elif self.result_indices and len(inputs) == self.num_params:
+            expected_outputs = tuple(inputs[idx] for idx in self.result_indices)
+        if _tilelang_metal_command_buffer_domain is not None:
+            kwargs["_tilelang_metal_command_buffer_domain"] = (
+                _tilelang_metal_command_buffer_domain
+            )
+
+        try:
+            result = self.artifact(*inputs, **kwargs)
+        except Exception as exc:  # noqa: BLE001 -- preserve the original cause
+            raise NativeTileLangRuntimeError(
+                f"native TileLang TVM-FFI dispatch failed: {type(exc).__name__}: {exc}"
+            ) from exc
+        return _validate_owner_result(result, expected_outputs)
 
 
 # ---------------------------------------------------------------------------

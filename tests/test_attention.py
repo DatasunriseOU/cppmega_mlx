@@ -239,8 +239,9 @@ def test_dsa_path_c_consumes_existing_prepared_buffers_without_wrapper_quantizat
         sinks: mx.array | None = None,
         return_lse: bool = False,
         force_path_c: bool = False,
+        output_dtype: mx.Dtype | None = None,
     ) -> mx.array:
-        del sm_scale, d_v, sinks, return_lse
+        del sm_scale, d_v, sinks, return_lse, output_dtype
         calls.append(
             {
                 "q_fp8": q_fp8,
@@ -306,9 +307,10 @@ def test_dsa_path_c_routes_through_sparse_mla_fp8_prepared(
         sinks: mx.array | None = None,
         return_lse: bool = False,
         force_path_c: bool = False,
+        output_dtype: mx.Dtype | None = None,
     ) -> mx.array:
         assert sinks is None
-        del return_lse
+        del return_lse, output_dtype
         calls.append(
             {
                 "q_fp8": q_fp8,
@@ -383,8 +385,9 @@ def test_dsa_path_c_routes_explicit_masks_as_sparse_indices(
         sinks: mx.array | None = None,
         return_lse: bool = False,
         force_path_c: bool = False,
+        output_dtype: mx.Dtype | None = None,
     ) -> mx.array:
-        del q_scale, kv_fp8, kv_scale, sm_scale, sinks, return_lse
+        del q_scale, kv_fp8, kv_scale, sm_scale, sinks, return_lse, output_dtype
         assert force_path_c is True
         seen_indices.append(indices)
         return mx.zeros(
@@ -430,8 +433,9 @@ def test_dsa_path_c_routes_sinks_to_sparse_mla_fp8_apply(
         sinks: mx.array | None = None,
         return_lse: bool = False,
         force_path_c: bool = False,
+        output_dtype: mx.Dtype | None = None,
     ) -> mx.array:
-        del q_scale, kv_fp8, kv_scale, indices, sm_scale, return_lse
+        del q_scale, kv_fp8, kv_scale, indices, sm_scale, return_lse, output_dtype
         assert force_path_c is True
         sink_calls.append(sinks)
         return mx.zeros(
@@ -621,8 +625,9 @@ def test_dsa_path_c_kv_cache_keeps_fp8_buffers_in_mlx_kv_cache(
         sinks: mx.array | None = None,
         return_lse: bool = False,
         force_path_c: bool = False,
+        output_dtype: mx.Dtype | None = None,
     ) -> mx.array:
-        del q_scale, kv_scale, sm_scale, sinks, return_lse
+        del q_scale, kv_scale, sm_scale, sinks, return_lse, output_dtype
         assert force_path_c is True
         calls.append((tuple(q_fp8.shape), tuple(kv_fp8.shape), tuple(indices.shape)))
         return mx.zeros(

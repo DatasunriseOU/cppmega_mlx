@@ -9,6 +9,8 @@ Coverage:
 
 from __future__ import annotations
 
+import importlib
+
 from typing import cast
 
 import numpy as np
@@ -164,6 +166,14 @@ def test_status_is_available_or_explains_why() -> None:
     assert isinstance(status, Mamba3MetalStatus)
     assert isinstance(status.available, bool)
     assert isinstance(status.reason, str) and status.reason
+
+
+def test_legacy_mamba3_blocker_points_to_native_tvm_ffi_route() -> None:
+    mod = importlib.import_module("cppmega_mlx.nn._tilelang.mamba3")
+    assert mod.__doc__ is not None
+    assert "no safe inverse transform" in mod.__doc__
+    assert 'execution_backend="tvm_ffi"' in mod.__doc__
+    assert "legacy direct-MSL fallback" in mod.__doc__
 
 
 def test_fwd_metal_matches_reference_at_fp32() -> None:

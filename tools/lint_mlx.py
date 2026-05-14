@@ -6,12 +6,35 @@ import ast
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
+import re
 
 
 _PYTHON_SUFFIX = ".py"
-_OWNED_METAL_KERNEL_PATH = ("cppmega_mlx", "kernels", "metal_ops.py")
+_DIRECT_MSL_LEGACY_DEBUG_PATHS = {
+    ("cppmega_mlx", "nn", "_tilelang", "fp8_msl_kernels.py"),
+    ("cppmega_mlx", "nn", "_tilelang", "m2rnn.py"),
+    ("cppmega_mlx", "nn", "_tilelang", "mamba3.py"),
+    ("cppmega_mlx", "nn", "_tilelang", "sparse_mla.py"),
+    ("cppmega_mlx", "nn", "_tilelang", "sparse_mla_blockscaled.py"),
+    ("cppmega_mlx", "nn", "_tilelang", "topk_selector.py"),
+}
+_DIRECT_MSL_MARKER = re.compile(
+    r"\b(legacy|debug|path\s+b|direct[- ]msl|raw[- ]msl)\b",
+    re.IGNORECASE,
+)
 _AUTODIFF_NAMES = {"grad", "jvp", "value_and_grad", "vjp"}
 _CUSTOM_GRADIENT_NAMES = {"jvp", "vjp"}
+_MONKEYPATCH_METHOD_NAMES = {
+    "setattr",
+    "delattr",
+    "setenv",
+    "delenv",
+    "setitem",
+    "delitem",
+    "syspath_prepend",
+    "chdir",
+    "context",
+}
 _THROUGHPUT_COMPILE_TIMING_NAMES = {
     "compile_time_s",
     "compile_profile",
@@ -31,6 +54,11 @@ _COMPILE_FROM_STEADY_TIMING_NAMES = {
     "warmup_step_times_s",
     "warmup_times",
 }
+_FORBIDDEN_NATIVE_TVM_FFI_MODULES = {
+    "_tilelang_mlx_tvm_ffi",
+    "tilelang.contrib.mlx_tvm_ffi",
+    "tilelang.jit.adapter._mlx_tvm_ffi",
+}
 
 
 @dataclass(frozen=True)
@@ -45,14 +73,21 @@ class Finding:
 
 
 class _MlxLintVisitor(ast.NodeVisitor):
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, source: str) -> None:
         self._path = path
+        self._source = source
         self._mlx_core_aliases: set[str] = set()
         self._mlx_fast_aliases: set[str] = set()
         self._mlx_nn_aliases: set[str] = set()
+        self._msl_transform_aliases: set[str] = set()
+        self._msl_dispatch_names: set[str] = set()
         self._metal_kernel_names: set[str] = set()
         self._custom_function_names: set[str] = set()
         self._autodiff_names: set[str] = set()
+        self._importlib_aliases: set[str] = {"importlib"}
+        self._import_module_names: set[str] = set()
+        self._monkeypatch_aliases: set[str] = {"monkeypatch"}
+        self._mock_patch_names: set[str] = set()
         self._metal_kernel_lines: list[int] = []
         self._uses_autodiff = False
         self._uses_custom_function = False
@@ -61,12 +96,28 @@ class _MlxLintVisitor(ast.NodeVisitor):
 
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
+            imported_name = alias.asname or alias.name
             if alias.name == "mlx.core":
-                self._mlx_core_aliases.add(alias.asname or "mlx.core")
+                self._mlx_core_aliases.add(imported_name)
             elif alias.name == "mlx.core.fast":
-                self._mlx_fast_aliases.add(alias.asname or "mlx.core.fast")
+                self._mlx_fast_aliases.add(imported_name)
             elif alias.name == "mlx.nn":
-                self._mlx_nn_aliases.add(alias.asname or "mlx.nn")
+                self._mlx_nn_aliases.add(imported_name)
+            elif alias.name == "cppmega_mlx.nn._tilelang._msl_transform":
+                self._msl_transform_aliases.add(imported_name)
+            elif alias.name == "importlib":
+                self._importlib_aliases.add(imported_name)
+            if self._is_production_module() and (
+                alias.name == "pytest"
+                or alias.name == "unittest.mock"
+                or alias.name.startswith("unittest.mock.")
+            ):
+                self._add_monkeypatch_finding(node.lineno)
+            if (
+                self._is_production_module()
+                and self._is_forbidden_native_tvm_ffi_module(alias.name)
+            ):
+                self._add_native_tvm_ffi_import_finding(node.lineno)
         self.generic_visit(node)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
@@ -88,13 +139,43 @@ class _MlxLintVisitor(ast.NodeVisitor):
                 self._metal_kernel_names.add(imported_name)
             elif node.module == "mlx.nn" and alias.name == "value_and_grad":
                 self._autodiff_names.add(imported_name)
+            elif (
+                node.module == "cppmega_mlx.nn._tilelang"
+                and alias.name == "_msl_transform"
+            ):
+                self._msl_transform_aliases.add(imported_name)
+            elif node.module == "cppmega_mlx.nn._tilelang._msl_transform":
+                if alias.name == "dispatch":
+                    self._msl_dispatch_names.add(imported_name)
+            elif node.module == "importlib" and alias.name == "import_module":
+                self._import_module_names.add(imported_name)
+            if self._is_production_module() and (
+                node.module == "pytest"
+                or node.module == "unittest.mock"
+                or node.module == "mock"
+            ):
+                self._add_monkeypatch_finding(node.lineno)
+                if alias.name == "patch":
+                    self._mock_patch_names.add(imported_name)
+            if (
+                self._is_production_module()
+                and (
+                    self._is_forbidden_native_tvm_ffi_module(node.module)
+                    or self._is_forbidden_native_tvm_ffi_module(
+                        f"{node.module}.{alias.name}" if node.module else alias.name
+                    )
+                )
+            ):
+                self._add_native_tvm_ffi_import_finding(node.lineno)
         self.generic_visit(node)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._check_monkeypatch_args(node)
         self._visit_decorators(node.decorator_list)
         self.generic_visit(node)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self._check_monkeypatch_args(node)
         self._visit_decorators(node.decorator_list)
         self.generic_visit(node)
 
@@ -111,15 +192,28 @@ class _MlxLintVisitor(ast.NodeVisitor):
             )
         if self._is_metal_kernel_call(node.func):
             self._metal_kernel_lines.append(node.lineno)
-            if not self._is_owned_metal_kernel_module():
+            if not self._is_direct_msl_allowed_module():
                 self.findings.append(
                     Finding(
                         self._path,
                         node.lineno,
                         "MLX002",
-                        "construct custom mx.fast.metal_kernel only in "
-                        "cppmega_mlx/kernels/metal_ops.py behind the owned "
-                        "fallback/parity/VJP/JVP/profile-evidence policy seam",
+                        "construct raw mx.fast.metal_kernel only in explicitly "
+                        "allowlisted legacy/debug direct-MSL modules; new "
+                        "production paths must use native TileLang/TVM-FFI "
+                        "or an owned fail-closed wrapper",
+                    )
+                )
+        if self._is_msl_transform_dispatch_call(node.func):
+            if not self._is_direct_msl_allowed_module():
+                self.findings.append(
+                    Finding(
+                        self._path,
+                        node.lineno,
+                        "MLX005",
+                        "call _msl_transform.dispatch only from explicitly "
+                        "allowlisted legacy/debug direct-MSL modules; new "
+                        "production paths must use native TileLang/TVM-FFI",
                     )
                 )
         if self._is_autodiff_call(node.func):
@@ -128,6 +222,10 @@ class _MlxLintVisitor(ast.NodeVisitor):
             self._uses_custom_function = True
         if self._is_custom_gradient_marker(node.func):
             self._defines_custom_gradient = True
+        if self._is_production_monkeypatch_call(node.func):
+            self._add_monkeypatch_finding(node.lineno)
+        if self._is_native_tvm_ffi_dynamic_import_call(node):
+            self._add_native_tvm_ffi_import_finding(node.lineno)
         self.generic_visit(node)
 
     def visit_Assign(self, node: ast.Assign) -> None:
@@ -190,6 +288,17 @@ class _MlxLintVisitor(ast.NodeVisitor):
             return False
         return self._is_mlx_fast_chain(chain[:-1])
 
+    def _is_msl_transform_dispatch_call(self, func: ast.expr) -> bool:
+        if isinstance(func, ast.Name):
+            return func.id in self._msl_dispatch_names
+        chain = _attribute_chain(func)
+        if chain is None or chain[-1] != "dispatch":
+            return False
+        owner = chain[:-1]
+        if len(owner) == 1 and owner[0] in self._msl_transform_aliases:
+            return True
+        return owner == ("cppmega_mlx", "nn", "_tilelang", "_msl_transform")
+
     def _is_autodiff_call(self, func: ast.expr) -> bool:
         if isinstance(func, ast.Name):
             return func.id in self._autodiff_names
@@ -230,8 +339,98 @@ class _MlxLintVisitor(ast.NodeVisitor):
             return True
         return chain == ("mlx", "nn")
 
-    def _is_owned_metal_kernel_module(self) -> bool:
-        return self._path.parts[-len(_OWNED_METAL_KERNEL_PATH) :] == _OWNED_METAL_KERNEL_PATH
+    def _is_direct_msl_allowed_module(self) -> bool:
+        return (
+            _path_matches_any_tail(self._path, _DIRECT_MSL_LEGACY_DEBUG_PATHS)
+            and _DIRECT_MSL_MARKER.search(self._source) is not None
+        )
+
+    def _is_production_module(self) -> bool:
+        return "cppmega_mlx" in self._path.parts
+
+    @staticmethod
+    def _is_forbidden_native_tvm_ffi_module(module: str | None) -> bool:
+        if module is None:
+            return False
+        return any(
+            module == forbidden or module.startswith(f"{forbidden}.")
+            for forbidden in _FORBIDDEN_NATIVE_TVM_FFI_MODULES
+        )
+
+    def _is_native_tvm_ffi_dynamic_import_call(self, node: ast.Call) -> bool:
+        if not self._is_production_module() or not node.args:
+            return False
+        module_arg = node.args[0]
+        if not isinstance(module_arg, ast.Constant) or not isinstance(module_arg.value, str):
+            return False
+        func = node.func
+        if isinstance(func, ast.Name):
+            is_import_call = func.id == "__import__" or func.id in self._import_module_names
+        else:
+            chain = _attribute_chain(func)
+            is_import_call = (
+                chain is not None
+                and len(chain) == 2
+                and chain[0] in self._importlib_aliases
+                and chain[1] == "import_module"
+            )
+        return is_import_call and self._is_forbidden_native_tvm_ffi_module(module_arg.value)
+
+    def _check_monkeypatch_args(
+        self,
+        node: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> None:
+        if not self._is_production_module():
+            return
+        args = [
+            *node.args.posonlyargs,
+            *node.args.args,
+            *node.args.kwonlyargs,
+        ]
+        if node.args.vararg is not None:
+            args.append(node.args.vararg)
+        if node.args.kwarg is not None:
+            args.append(node.args.kwarg)
+        if any(arg.arg == "monkeypatch" for arg in args):
+            self._add_monkeypatch_finding(node.lineno)
+
+    def _is_production_monkeypatch_call(self, func: ast.expr) -> bool:
+        if not self._is_production_module():
+            return False
+        if isinstance(func, ast.Name):
+            return func.id in self._mock_patch_names
+        chain = _attribute_chain(func)
+        if chain is None:
+            return False
+        if chain[0] in self._monkeypatch_aliases and chain[-1] in _MONKEYPATCH_METHOD_NAMES:
+            return True
+        return chain in {
+            ("unittest", "mock", "patch"),
+            ("mock", "patch"),
+        }
+
+    def _add_monkeypatch_finding(self, line: int) -> None:
+        self.findings.append(
+            Finding(
+                self._path,
+                line,
+                "MLX006",
+                "do not use pytest monkeypatch or mock.patch patterns in "
+                "production code; expose explicit fail-closed seams instead",
+            )
+        )
+
+    def _add_native_tvm_ffi_import_finding(self, line: int) -> None:
+        self.findings.append(
+            Finding(
+                self._path,
+                line,
+                "MLX007",
+                "production code must not import the native MLX TVM-FFI bridge "
+                "directly; call compiled TileLang kernels through the standard "
+                "tilelang -> tvm -> tvm-ffi adapter",
+            )
+        )
 
     def _check_timing_assignment(
         self,
@@ -303,6 +502,14 @@ def _referenced_names(node: ast.AST) -> set[str]:
     return names
 
 
+def _path_matches_tail(path: Path, tail: tuple[str, ...]) -> bool:
+    return path.parts[-len(tail) :] == tail
+
+
+def _path_matches_any_tail(path: Path, tails: Iterable[tuple[str, ...]]) -> bool:
+    return any(_path_matches_tail(path, tail) for tail in tails)
+
+
 def _iter_python_files(paths: Iterable[Path]) -> Iterable[Path]:
     for path in paths:
         if path.is_dir():
@@ -318,22 +525,42 @@ def _iter_python_files(paths: Iterable[Path]) -> Iterable[Path]:
 def lint_file(path: Path) -> list[Finding]:
     source = path.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(path))
-    visitor = _MlxLintVisitor(path)
+    visitor = _MlxLintVisitor(path, source)
     visitor.visit(tree)
     visitor.finalize()
     return visitor.findings
 
 
-def lint_paths(paths: Iterable[Path]) -> list[Finding]:
+def lint_paths(paths: Iterable[Path], *, select: set[str] | None = None) -> list[Finding]:
     findings: list[Finding] = []
     for path in _iter_python_files(paths):
-        findings.extend(lint_file(path))
+        findings.extend(
+            finding
+            for finding in lint_file(path)
+            if select is None or finding.rule in select
+        )
     return findings
+
+
+def _parse_select(values: Iterable[str]) -> set[str] | None:
+    rules = {
+        rule.strip().upper()
+        for value in values
+        for rule in value.split(",")
+        if rule.strip()
+    }
+    return rules or None
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Lint MLX anti-patterns for scalar dtype, custom Metal, and timing guardrails.",
+    )
+    parser.add_argument(
+        "--select",
+        action="append",
+        default=[],
+        help="Comma-separated rule ids to report, for example MLX002,MLX005.",
     )
     parser.add_argument(
         "paths",
@@ -343,7 +570,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    findings = lint_paths(args.paths)
+    findings = lint_paths(args.paths, select=_parse_select(args.select))
     for finding in findings:
         print(finding.format())
     return 1 if findings else 0

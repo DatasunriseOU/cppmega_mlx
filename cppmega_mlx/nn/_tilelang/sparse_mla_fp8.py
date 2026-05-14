@@ -1,24 +1,13 @@
-"""Path B port of cppmega's FP8 sparse-MLA fwd/bwd TileLang pair.
+"""FP8 sparse-MLA reference and retired direct-MSL compatibility surface.
 
 .. note::
-    **Wave-6 migration deferred — FP8 factory blocker.** This module's
-    fwd/bwd kernels are pure raw-MSL strings (``_FP8_FWD/_BWD_KERNEL_SOURCE``
-    → ``_msl_transform.make_metal_kernel``), with no ``@T.prim_func`` to
-    feed into ``_engine_dispatch.dispatch_lower``. There is no Path-C
-    sister: the kernel's whole point is inline ``e4m3`` byte-level
-    dequantisation that has no TileLang DSL equivalent until
-    ``simdgroup_a_fp8`` / ``simdgroup_b_fp8`` ``Fragment`` factories
-    land in ``tilelang/language/extern.py`` AND Apple ships a
-    documented MSL ``float8`` ``simdgroup_matrix`` MMA path.
-
-    Same blocker as :mod:`fp8_msl_kernels` and
-    :mod:`fp8_vecmat_path_c` (the latter routes through ``dispatch_lower``
-    for non-FP8 surrounds and falls back to Path-B FP8 inner). Track the
-    factory work in the migration plan §"FP8 SIMDgroup factories" item.
-
-    Until that lands the raw-MSL kernel here is the only Apple-Metal
-    fused FP8 sparse-MLA path. Public API stays stable so the 4 mlx call
-    sites keep working unchanged.
+    **Direct-MSL route retired.** This module used to construct raw
+    ``mx.fast.metal_kernel`` wrappers for the FP8 sparse-MLA fwd/bwd kernels.
+    Lane 4 deliberately disables that production route: new callable kernels
+    must go through the standard TileLang → TVM → tvm-ffi/native bridge in
+    :mod:`sparse_mla_fp8_path_c`, and any remaining direct-MSL surface reports
+    an explicit unsupported status instead of silently allocating or staging
+    tensors behind an adapter.
 
 Source attribution
 ------------------
@@ -43,11 +32,10 @@ type or a ``simdgroup_matrix<float8>`` MMA path. M4 Pro/Max silicon has FP8
 hardware but no documented MSL surface as of Metal 4.0 / MLX 0.31. We
 therefore can't dispatch a "real" FP8 simdgroup MMA from MSL.
 
-Direct-MSL bypass (this module)
--------------------------------
+Retired direct-MSL bypass
+-------------------------
 
-Instead of waiting on hardware FP8 in MSL, we implement the FP8 forward
-and backward by:
+The historical direct-MSL forward and backward implemented:
 
 1. Storing the quantized Q and KV tensors as ``uint8`` arrays carrying
    ``e4m3`` bit patterns (the same storage layout ``mx.to_fp8`` produces).
@@ -59,10 +47,11 @@ and backward by:
    numerical contract of the gb10 kernel which also keeps ``acc_s`` in fp32
    and emits BF16 output.
 
-The backward dequantizes Q/KV the same way and runs the same gradient flow
-as the BF16 sparse-MLA backward. Gradients from FP8 inputs are propagated
-through MLX autograd's straight-through estimator (the ``mx.from_fp8`` op
-has no autograd VJP in MLX 0.31, so we apply STE explicitly when needed).
+Those raw MSL sources are kept only as source attribution context for now.
+They are not wrapped with ``mx.fast.metal_kernel`` in production. Gradients
+from FP8 reference inputs are still propagated through MLX autograd's
+straight-through estimator (the ``mx.from_fp8`` op has no autograd VJP in MLX
+0.31, so we apply STE explicitly when needed).
 
 Numerical behavior
 ~~~~~~~~~~~~~~~~~~
@@ -88,14 +77,12 @@ bf16 simdgroup miscompiles do not affect this path.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Tuple, cast
+from typing import Tuple
 
 import mlx.core as mx
 
-from cppmega_mlx.nn._tilelang import _msl_transform
 from cppmega_mlx.nn._tilelang._msl_transform import (
     can_run_metal,
-    msl_dispatch_status,
 )
 from cppmega_mlx.nn.sparse_mla import (
     SparseMLAShapes,
@@ -111,23 +98,20 @@ from cppmega_mlx.nn.sparse_mla import (
 
 @dataclass(frozen=True)
 class SparseMLAFp8MetalStatus:
-    """Runtime status of the Path B FP8 sparse-MLA kernel."""
+    """Runtime status of the retired direct-MSL FP8 sparse-MLA kernel."""
 
     available: bool
     reason: str
     fp8_dtype: str = "float8_e4m3"
 
 
-_DIRECT_MSL_OK_REASON = (
-    "sparse_mla_fp8 direct-MSL kernel built via mx.fast.metal_kernel is "
-    "available; FP8 e4m3 dequant happens inline inside MSL on uint8 storage. "
-    "Apple MSL 4.0 has no native float8 simdgroup matrix, so the matmuls run "
-    "as plain register fma ops (still ~2x faster than the BF16-fallback "
-    "reference because the dequant fuses with the QK loop)."
-)
 _DIRECT_MSL_BLOCKER_REASON = (
-    "sparse_mla_fp8 direct-MSL kernel could not be constructed: "
-    "mx.fast.metal_kernel is unavailable on this device."
+    "sparse_mla_fp8 direct-MSL Path B is retired for production cleanup: "
+    "raw _msl_transform.dispatch/mx.fast.metal_kernel callsites are no longer "
+    "constructed. Use sparse_mla_fp8_path_c_apply over prepared "
+    "q_fp8/q_scale/kv_fp8/kv_scale buffers through TileLang/tvm-ffi; "
+    "float-carrier callers fall back to the explicit MLX reference unless "
+    "force_metal=True."
 )
 
 
@@ -386,20 +370,7 @@ _FP8_FWD_KERNEL_SOURCE = """
 """
 
 
-_FP8_FWD_KERNEL = _msl_transform.make_metal_kernel(
-    name="cppmega_sparse_mla_fp8_fwd",
-    input_names=[
-        "q_fp8",
-        "q_scale",
-        "kv_fp8",
-        "kv_scale",
-        "indices",
-        "sm_scale_buf",
-    ],
-    output_names=["out", "lse"],
-    source=_FP8_FWD_KERNEL_SOURCE,
-    header=_FP8_DEQUANT_HEADER,
-)
+_FP8_FWD_KERNEL = None
 
 
 # ---------------------------------------------------------------------------
@@ -595,21 +566,7 @@ _FP8_BWD_KERNEL_SOURCE = """
 """
 
 
-_FP8_BWD_KERNEL = _msl_transform.make_metal_kernel(
-    name="cppmega_sparse_mla_fp8_bwd",
-    input_names=[
-        "q_fp8",
-        "q_scale",
-        "kv_fp8",
-        "kv_scale",
-        "indices",
-        "d_out",
-        "sm_scale_buf",
-    ],
-    output_names=["dq_dequant", "dkv_partial"],
-    source=_FP8_BWD_KERNEL_SOURCE,
-    header=_FP8_DEQUANT_HEADER,
-)
+_FP8_BWD_KERNEL = None
 
 
 # ---------------------------------------------------------------------------
@@ -618,21 +575,15 @@ _FP8_BWD_KERNEL = _msl_transform.make_metal_kernel(
 
 
 def sparse_mla_fp8_metal_status(*arrays: mx.array) -> SparseMLAFp8MetalStatus:
-    """Return whether the Path B FP8 kernel is currently dispatchable."""
+    """Return whether the retired direct-MSL FP8 kernel is dispatchable."""
 
+    del arrays
     if not can_run_metal():
         return SparseMLAFp8MetalStatus(
             available=False,
             reason="MLX Metal backend is not available on the default GPU device",
         )
-    if _FP8_FWD_KERNEL is None or _FP8_BWD_KERNEL is None:
-        return SparseMLAFp8MetalStatus(available=False, reason=_DIRECT_MSL_BLOCKER_REASON)
-    float_arrays = [a for a in arrays if a.dtype in (mx.float16, mx.float32, mx.bfloat16)]
-    if float_arrays:
-        runtime = msl_dispatch_status(*float_arrays)
-        if not runtime.available:
-            return SparseMLAFp8MetalStatus(available=False, reason=runtime.reason)
-    return SparseMLAFp8MetalStatus(available=True, reason=_DIRECT_MSL_OK_REASON)
+    return SparseMLAFp8MetalStatus(available=False, reason=_DIRECT_MSL_BLOCKER_REASON)
 
 
 # ---------------------------------------------------------------------------
@@ -664,54 +615,8 @@ def sparse_mla_fp8_fwd_metal_impl(
         (out_fp16, lse_fp32) or None.
     """
 
-    if _FP8_FWD_KERNEL is None or not can_run_metal():
-        return None
-
-    threads = min(64, max(1, shapes.topk))
-    p = 1
-    while (p << 1) <= threads:
-        p <<= 1
-    threads = p
-    if threads < 1:
-        threads = 1
-
-    template = [
-        ("T_OUT", mx.float16),
-        ("BATCH", shapes.batch),
-        ("SEQ_LEN", shapes.seq_len),
-        ("SEQ_LEN_KV", shapes.seq_len_kv),
-        ("HEADS", shapes.heads),
-        ("HEAD_KV", shapes.head_kv),
-        ("KV_GROUP", shapes.kv_group),
-        ("QK_DIM", shapes.qk_dim),
-        ("D_V", shapes.d_v),
-        ("TOPK", shapes.topk),
-        ("BLOCK_SIZE", threads),
-    ]
-
-    sm_scale_buf = mx.array([float(sm_scale)], dtype=mx.float32)
-    grid_x = shapes.batch * shapes.seq_len * shapes.heads
-    outputs = _msl_transform.dispatch(
-        cast(_msl_transform.MetalKernel, _FP8_FWD_KERNEL),
-        inputs=[
-            q_fp8.astype(mx.uint8),
-            q_scale.astype(mx.float32),
-            kv_fp8.astype(mx.uint8),
-            kv_scale.astype(mx.float32),
-            indices.astype(mx.int32),
-            sm_scale_buf,
-        ],
-        output_shapes=[
-            (shapes.batch, shapes.seq_len, shapes.heads, shapes.d_v),
-            (shapes.batch, shapes.seq_len, shapes.heads),
-        ],
-        output_dtypes=[mx.float16, mx.float32],
-        grid=(grid_x * threads, 1, 1),
-        threadgroup=(threads, 1, 1),
-        template=template,
-    )
-    out, lse = outputs
-    return out, lse
+    del q_fp8, q_scale, kv_fp8, kv_scale, indices, sm_scale, d_v, shapes
+    return None
 
 
 def sparse_mla_fp8_bwd_metal_impl(
@@ -733,54 +638,8 @@ def sparse_mla_fp8_bwd_metal_impl(
         back to the upstream input tensors.
     """
 
-    if _FP8_BWD_KERNEL is None or not can_run_metal():
-        return None
-
-    threads = min(64, max(1, shapes.topk))
-    p = 1
-    while (p << 1) <= threads:
-        p <<= 1
-    threads = p
-    if threads < 1:
-        threads = 1
-
-    template = [
-        ("BATCH", shapes.batch),
-        ("SEQ_LEN", shapes.seq_len),
-        ("SEQ_LEN_KV", shapes.seq_len_kv),
-        ("HEADS", shapes.heads),
-        ("HEAD_KV", shapes.head_kv),
-        ("KV_GROUP", shapes.kv_group),
-        ("QK_DIM", shapes.qk_dim),
-        ("D_V", shapes.d_v),
-        ("TOPK", shapes.topk),
-        ("BLOCK_SIZE", threads),
-    ]
-
-    sm_scale_buf = mx.array([float(sm_scale)], dtype=mx.float32)
-    grid_x = shapes.batch * shapes.seq_len * shapes.heads
-    outputs = _msl_transform.dispatch(
-        cast(_msl_transform.MetalKernel, _FP8_BWD_KERNEL),
-        inputs=[
-            q_fp8.astype(mx.uint8),
-            q_scale.astype(mx.float32),
-            kv_fp8.astype(mx.uint8),
-            kv_scale.astype(mx.float32),
-            indices.astype(mx.int32),
-            d_out.astype(mx.float32),
-            sm_scale_buf,
-        ],
-        output_shapes=[
-            (shapes.batch, shapes.seq_len, shapes.heads, shapes.qk_dim),
-            (shapes.batch, shapes.seq_len, shapes.heads, shapes.topk, shapes.qk_dim),
-        ],
-        output_dtypes=[mx.float32, mx.float32],
-        grid=(grid_x * threads, 1, 1),
-        threadgroup=(threads, 1, 1),
-        template=template,
-    )
-    dq_dequant, dkv_partial = outputs
-    return dq_dequant, dkv_partial
+    del q_fp8, q_scale, kv_fp8, kv_scale, d_out, indices, sm_scale, d_v, shapes
+    return None
 
 
 # ---------------------------------------------------------------------------

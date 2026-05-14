@@ -1,0 +1,1179 @@
+Analysis of sampling Python (pid 32857) every 1 millisecond
+Process:         Python [32857]
+Path:            /opt/homebrew/*/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python
+Load Address:    0x102fcc000
+Identifier:      org.python.python
+Version:         3.13.12 (3.13.12)
+Code Type:       ARM64
+Platform:        macOS
+Parent Process:  Python [1246]
+Target Type:     live task
+
+Date/Time:       2026-05-14 14:34:16.879 +0200
+Launch Time:     2026-05-14 14:25:34.467 +0200
+OS Version:      macOS 26.4.1 (25E253)
+Report Version:  7
+Analysis Tool:   /usr/bin/sample
+
+Physical footprint:         71.4G
+Physical footprint (peak):  71.8G
+Idle exit:                  untracked
+----
+
+Call graph:
+    1923 Thread_74468260   DispatchQueue_1: com.apple.main-thread  (serial)
+    + 1923 start  (in dyld) + 6992  [0x18d4c7da4]
+    +   1923 Py_BytesMain  (in Python) + 40  [0x1039107d8]
+    +     1923 pymain_main  (in Python) + 304  [0x103910738]
+    +       1923 Py_RunMain  (in Python) + 968  [0x10391013c]
+    +         1923 pymain_run_file  (in Python) + 76  [0x103910ecc]
+    +           1923 pymain_run_file_obj  (in Python) + 164  [0x103911220]
+    +             1923 _PyRun_AnyFileObject  (in Python) + 80  [0x1038e9400]
+    +               1923 _PyRun_SimpleFileObject  (in Python) + 256  [0x1038e97c8]
+    +                 1923 pyrun_file  (in Python) + 164  [0x1038ea48c]
+    +                   1923 run_mod  (in Python) + 168  [0x1038ebde4]
+    +                     1923 run_eval_code_obj  (in Python) + 104  [0x1038ec490]
+    +                       1923 PyEval_EvalCode  (in Python) + 200  [0x10387c5d0]
+    +                         1923 _PyEval_EvalFrameDefault  (in Python) + 6752  [0x10387e2ac]
+    +                           1923 _PyObject_MakeTpCall  (in Python) + 120  [0x103757268]
+    +                             1923 slot_tp_call  (in Python) + 128  [0x1037e8578]
+    +                               1923 _PyObject_Call_Prepend  (in Python) + 136  [0x10375866c]
+    +                                 1923 _PyObject_VectorcallDictTstate  (in Python) + 92  [0x103757070]
+    +                                   1923 _PyEval_EvalFrameDefault  (in Python) + 6752  [0x10387e2ac]
+    +                                     1923 PyObject_Vectorcall  (in Python) + 92  [0x103757de4]
+    +                                       1923 ???  (in core.cpython-313-darwin.so)  load address 0x109190000 + 0x53d4  [0x1091953d4]
+    +                                         1923 ???  (in core.cpython-313-darwin.so)  load address 0x109190000 + 0xced94  [0x10925ed94]
+    +                                           1923 mlx::core::eval(std::vector<mlx::core::array>)  (in libmlx.dylib) + 132  [0x10a90193c]
+    +                                             1825 mlx::core::eval_impl(std::vector<mlx::core::array>, bool)  (in libmlx.dylib) + 5440  [0x10a900db0]
+    +                                             ! 1825 std::condition_variable::wait(std::unique_lock<std::mutex>&)  (in libc++.1.dylib) + 32  [0x18d799858]
+    +                                             !   1825 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x18d884128]
+    +                                             !     1825 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18d84350c]
+    +                                             86 mlx::core::eval_impl(std::vector<mlx::core::array>, bool)  (in libmlx.dylib) + 4168  [0x10a9008b8]
+    +                                             ! 62 mlx::core::gpu::eval(mlx::core::array&)  (in libmlx.dylib) + 200  [0x10b55c0e8]
+    +                                             ! : 26 mlx::core::binary_op_gpu(std::vector<mlx::core::array> const&, mlx::core::array&, char const*, mlx::core::Stream const&)  (in libmlx.dylib) + 288  [0x10b52283c]
+    +                                             ! : | 25 mlx::core::binary_op_gpu_inplace(std::vector<mlx::core::array> const&, mlx::core::array&, char const*, mlx::core::Stream const&)  (in libmlx.dylib) + 172  [0x10b522684]
+    +                                             ! : | + 12 mlx::core::binary_op_gpu_inplace(std::vector<mlx::core::array> const&, std::vector<mlx::core::array>&, char const*, mlx::core::Stream const&)  (in libmlx.dylib) + 840  [0x10b521ecc]
+    +                                             ! : | + ! 9 mlx::core::metal::CommandEncoder::get_command_encoder()  (in libmlx.dylib) + 64  [0x10b54a420]
+    +                                             ! : | + ! : 9 -[AGXG16XFamilyCommandBuffer computeCommandEncoderWithDispatchType:]  (in AGXMetalG16X) + 276  [0x10f8c956c]
+    +                                             ! : | + ! :   7 -[AGXG16XFamilyCommandBuffer computeCommandEncoderWithConfig:]  (in AGXMetalG16X) + 164  [0x10f8c9768]
+    +                                             ! : | + ! :   | 4 -[AGXG16XFamilyComputeContext initWithCommandBuffer:config:]  (in AGXMetalG16X) + 536  [0x10f94b4ac]
+    +                                             ! : | + ! :   | + 3 AGX::ComputeContext<AGX::HAL200::Encoders, AGX::HAL200::Classes, AGX::HAL200::ObjClasses, AGX::HAL200::CommandEncoding, AGX::HAL200::EncoderComputeServiceClasses>::beginComputePass(bool, eAGXDataBufferPools)  (in AGXMetalG16X) + 2648  [0x10f93fab4]
+    +                                             ! : | + ! :   | + ! 3 AGX::ComputeContext<AGX::HAL200::Encoders, AGX::HAL200::Classes, AGX::HAL200::ObjClasses, AGX::HAL200::CommandEncoding, AGX::HAL200::EncoderComputeServiceClasses>::insertIndirectTGOptKernel(eAGXDataBufferPools, indirectTGOptParams*&, unsigned short*&, AGX::CDMEncoderGen6<AGX::HAL200::ESLEncoder, AGX::HAL200::DeviceConstants>::InstanceTokenImproved*&, AGX::CDMEncoderGen6<AGX::HAL200::ESLEncoder, AGX::HAL200::DeviceConstants>::FenceToken*&)  (in AGXMetalG16X) + 456  [0x10f9401f4]
+    +                                             ! : | + ! :   | + !   2 AGX::ComputeContext<AGX::HAL200::Encoders, AGX::HAL200::Classes, AGX::HAL200::ObjClasses, AGX::HAL200::CommandEncoding, AGX::HAL200::EncoderComputeServiceClasses>::performEnqueueKernel(eAGXDataBufferPools, unsigned long long, unsigned int, unsigned long long*)  (in AGXMetalG16X) + 1040  [0x10f940f44]
+    +                                             ! : | + ! :   | + !   : 1 AGX::ComputeContext<AGX::HAL200::Encoders, AGX::HAL200::Classes, AGX::HAL200::ObjClasses, AGX::HAL200::CommandEncoding, AGX::HAL200::EncoderComputeServiceClasses>::bindBufferResourceToCommand(unsigned int, bool)  (in AGXMetalG16X) + 392  [0x10f942b7c]
+    +                                             ! : | + ! :   | + !   : | 1 AGX::HAL200::ComputeCoalescingResourceTracker::ComputeCoalescingResourceTracker()  (in AGXMetalG16X) + 0  [0x10f9433d8]
+    +                                             ! : | + ! :   | + !   : 1 AGX::ComputeContext<AGX::HAL200::Encoders, AGX::HAL200::Classes, AGX::HAL200::ObjClasses, AGX::HAL200::CommandEncoding, AGX::HAL200::EncoderComputeServiceClasses>::bindBufferResourceToCommand(unsigned int, bool)  (in AGXMetalG16X) + 416  [0x10f942b94]
+    +                                             ! : | + ! :   | + !   :   1 AGX::ComputeCoalescingResourceTracker<AGX::HAL200::Encoders, AGX::HAL200::Classes>::addResource(unsigned int, unsigned int)  (in AGXMetalG16X) + 0  [0x10f8e8924]
+    +                                             ! : | + ! :   | + !   1 AGX::ComputeContext<AGX::HAL200::Encoders, AGX::HAL200::Classes, AGX::HAL200::ObjClasses, AGX::HAL200::CommandEncoding, AGX::HAL200::EncoderComputeServiceClasses>::performEnqueueKernel(eAGXDataBufferPools, unsigned long long, unsigned int, unsigned long long*)  (in AGXMetalG16X) + 1752  [0x10f94120c]
+    +                                             ! : | + ! :   | + !     1 AGX::ESLInstructionEncoderGen3<AGX::HAL200::Encoders>::AGX3EncodedInstr<AGXIotoInstruction_SPECLM_0>::AGX3EncodedInstr(AGX::ESLInstructionEncoderGen3<AGX::HAL200::Encoders>::AGX3Instr<AGXIotoInstruction_SPECLM_0> const&)  (in AGXMetalG16X) + 552  [0x10f8c3998]
+    +                                             ! : | + ! :   | + 1 AGX::ComputeContext<AGX::HAL200::Encoders, AGX::HAL200::Classes, AGX::HAL200::ObjClasses, AGX::HAL200::CommandEncoding, AGX::HAL200::EncoderComputeServiceClasses>::beginComputePass(bool, eAGXDataBufferPools)  (in AGXMetalG16X) + 204  [0x10f93f128]
+    +                                             ! : | + ! :   | +   1 AGX::ContextCommon<AGX::HAL200::Encoders, AGX::HAL200::Classes, AGX::HAL200::ObjClasses, AGX::HAL200::DataBufferAllocator>::newCommand(unsigned long, bool)  (in AGXMetalG16X) + 792  [0x10f8fdda0]
+    +                                             ! : | + ! :   | +     1 IOGPUResourceListAddResource  (in IOGPU) + 172  [0x1b2975a04]
+    +                                             ! : | + ! :   | 3 -[AGXG16XFamilyComputeContext initWithCommandBuffer:config:]  (in AGXMetalG16X) + 460  [0x10f94b460]
+    +                                             ! : | + ! :   |   1 AGX::ComputeContext<AGX::HAL200::Encoders, AGX::HAL200::Classes, AGX::HAL200::ObjClasses, AGX::HAL200::CommandEncoding, AGX::HAL200::EncoderComputeServiceClasses>::ComputeContext<AGX::HAL200::EncoderComputeServiceConfigA>(ComputeContextConfig, AGX::HAL200::EncoderComputeServiceConfigA)  (in AGXMetalG16X) + 88  [0x10f8ae6e0]
+    +                                             ! : | + ! :   |   ! 1 -[_MTLCommandBuffer globalTraceObjectID]  (in Metal) + 0  [0x19a0a8f48]
+    +                                             ! : | + ! :   |   1 AGX::ComputeContext<AGX::HAL200::Encoders, AGX::HAL200::Classes, AGX::HAL200::ObjClasses, AGX::HAL200::CommandEncoding, AGX::HAL200::EncoderComputeServiceClasses>::ComputeContext<AGX::HAL200::EncoderComputeServiceConfigA>(ComputeContextConfig, AGX::HAL200::EncoderComputeServiceConfigA)  (in AGXMetalG16X) + 1144  [0x10f8aeb00]
+    +                                             ! : | + ! :   |   ! 1 AGX::SpillInfoGen3<AGX::HAL200::Encoders, AGX::HAL200::Classes, AGX::HAL200::ObjClasses>::SpillInfoGen3(AGX::HAL200::Device*, AGX::DeviceInternalBuffer<AGX::USCSpillBufferResourceInfo>*)  (in AGXMetalG16X) + 84  [0x10fe295b8]
+    +                                             ! : | + ! :   |   1 AGX::ComputeContext<AGX::HAL200::Encoders, AGX::HAL200::Classes, AGX::HAL200::ObjClasses, AGX::HAL200::CommandEncoding, AGX::HAL200::EncoderComputeServiceClasses>::ComputeContext<AGX::HAL200::EncoderComputeServiceConfigA>(ComputeContextConfig, AGX::HAL200::EncoderComputeServiceConfigA)  (in AGXMetalG16X) + 1356  [0x10f8aebd4]
+    +                                             ! : | + ! :   |     1 -[_MTLCommandBuffer privateDataOffset]  (in Metal) + 0  [0x19a0a8f74]
+    +                                             ! : | + ! :   1 -[AGXG16XFamilyCommandBuffer computeCommandEncoderWithConfig:]  (in AGXMetalG16X) + 68  [0x10f8c9708]
+    +                                             ! : | + ! :   | 1 DYLD-STUB$$objc_opt_class  (in AGXMetalG16X) + 0  [0x10fe4d9a4]
+    +                                             ! : | + ! :   1 -[AGXG16XFamilyCommandBuffer computeCommandEncoderWithConfig:]  (in AGXMetalG16X) + 84  [0x10f8c9718]
+    +                                             ! : | + ! :     1 -[AGXG16XFamilyCommandBuffer tryCoalescingPreviousComputeCommandEncoderWithConfig:nextEncoderClass:]  (in AGXMetalG16X) + 0  [0x10f8c9780]
+    +                                             ! : | + ! 3 mlx::core::metal::CommandEncoder::get_command_encoder()  (in libmlx.dylib) + 152  [0x10b54a478]
+    +                                             ! : | + !   3 -[IOGPUMetalFence initWithDevice:]  (in IOGPU) + 120  [0x1b2964fd8]
+    +                                             ! : | + !     3 -[IOGPUMTLFence initWithDevice:]  (in IOGPU) + 136  [0x1b29749a8]
+    +                                             ! : | + !       3 IOConnectCallMethod  (in IOKit) + 236  [0x191bdcdc0]
+    +                                             ! : | + !         3 io_connect_method  (in IOKit) + 520  [0x191bdcff4]
+    +                                             ! : | + !           3 mach_msg2_internal  (in libsystem_kernel.dylib) + 76  [0x18d852574]
+    +                                             ! : | + !             3 mach_msg2_trap  (in libsystem_kernel.dylib) + 8  [0x18d83fc34]
+    +                                             ! : | + 7 mlx::core::binary_op_gpu_inplace(std::vector<mlx::core::array> const&, std::vector<mlx::core::array>&, char const*, mlx::core::Stream const&)  (in libmlx.dylib) + 1440  [0x10b522124]
+    +                                             ! : | + ! 4 mlx::core::metal::CommandEncoder::dispatch_threads(MTL::Size, MTL::Size)  (in libmlx.dylib) + 108  [0x10b54a9a4]
+    +                                             ! : | + ! : 3 -[AGXG16XFamilyComputeContext dispatchThreads:threadsPerThreadgroup:]  (in AGXMetalG16X) + 304  [0x10f94758c]
+    +                                             ! : | + ! : | 3 AGX::ComputeContext<AGX::HAL200::Encoders, AGX::HAL200::Classes, AGX::HAL200::ObjClasses, AGX::HAL200::CommandEncoding, AGX::HAL200::EncoderComputeServiceClasses>::performEnqueueKernel(eAGXDataBufferPools, unsigned long long, unsigned int, unsigned long long*)  (in AGXMetalG16X) + 1040  [0x10f940f44]
+    +                                             ! : | + ! : |   3 AGX::ComputeContext<AGX::HAL200::Encoders, AGX::HAL200::Classes, AGX::HAL200::ObjClasses, AGX::HAL200::CommandEncoding, AGX::HAL200::EncoderComputeServiceClasses>::bindBufferResourceToCommand(unsigned int, bool)  (in AGXMetalG16X) + 292  [0x10f942b18]
+    +                                             ! : | + ! : |     3 AGX::PassiveResourceGroupUsage<AGX::HAL200::Encoders, AGX::HAL200::Classes, AGX::HAL200::ObjClasses>::bindPassiveResource(_PassiveResourceInfo const&)  (in AGXMetalG16X) + 260,284,...  [0x10fe25a5c,0x10fe25a74,...]
+    +                                             ! : | + ! : 1 -[AGXG16XFamilyComputeContext dispatchThreads:threadsPerThreadgroup:]  (in AGXMetalG16X) + 56  [0x10f947494]
+    +                                             ! : | + ! 3 mlx::core::metal::CommandEncoder::dispatch_threads(MTL::Size, MTL::Size)  (in libmlx.dylib) + 36  [0x10b54a95c]
+    +                                             ! : | + !   3 mlx::core::metal::CommandEncoder::maybeInsertBarrier()  (in libmlx.dylib) + 52  [0x10b54a83c]
+    +                                             ! : | + !     2 -[AGXG16XFamilyComputeContext memoryBarrierWithScope:]  (in AGXMetalG16X) + 144  [0x10f945e38]
+    +                                             ! : | + !     | 2 AGX::ComputeContext<AGX::HAL200::Encoders, AGX::HAL200::Classes, AGX::HAL200::ObjClasses, AGX::HAL200::CommandEncoding, AGX::HAL200::EncoderComputeServiceClasses>::insertIndirectTGOptKernel(eAGXDataBufferPools, indirectTGOptParams*&, unsigned short*&, AGX::CDMEncoderGen6<AGX::HAL200::ESLEncoder, AGX::HAL200::DeviceConstants>::InstanceTokenImproved*&, AGX::CDMEncoderGen6<AGX::HAL200::ESLEncoder, AGX::HAL200::DeviceConstants>::FenceToken*&)  (in AGXMetalG16X) + 456  [0x10f9401f4]
+    +                                             ! : | + !     |   2 AGX::ComputeContext<AGX::HAL200::Encoders, AGX::HAL200::Classes, AGX::HAL200::ObjClasses, AGX::HAL200::CommandEncoding, AGX::HAL200::EncoderComputeServiceClasses>::performEnqueueKernel(eAGXDataBufferPools, unsigned long long, unsigned int, unsigned long long*)  (in AGXMetalG16X) + 640  [0x10f940db4]
+    +                                             ! : | + !     |     2 AGX::ComputePipeline<AGX::HAL200::ObjClasses, AGX::HAL200::Classes, AGX::HAL200::Encoders>::bindResources(MTLResourceList*, IOGPUResourceList*)  (in AGXMetalG16X) + 108  [0x10f8f8cf0]
+    +                                             ! : | + !     |       2 IOGPUResourceListAddResource  (in IOGPU) + 0,164  [0x1b2975958,0x1b29759fc]
+    +                                             ! : | + !     1 objc_msgSend$memoryBarrierNotificationWithScope:  (in AGXMetalG16X) + 0  [0x10feb97a0]
+    +                                             ! : | + 2 mlx::core::binary_op_gpu_inplace(std::vector<mlx::core::array> const&, std::vector<mlx::core::array>&, char const*, mlx::core::Stream const&)  (in libmlx.dylib) + 900  [0x10b521f08]
+    +                                             ! : | + ! 1 mlx::core::metal::CommandEncoder::set_input_array(mlx::core::array const&, int, long long)  (in libmlx.dylib) + 124  [0x10b54a594]
+    +                                             ! : | + ! : 1 <deduplicated_symbol>  (in libmlx.dylib) + 260  [0x10b486da4]
+    +                                             ! : | + ! 1 mlx::core::metal::CommandEncoder::set_input_array(mlx::core::array const&, int, long long)  (in libmlx.dylib) + 192  [0x10b54a5d8]
+    +                                             ! : | + !   1 AGX::ComputeContext<AGX::HAL200::Encoders, AGX::HAL200::Classes, AGX::HAL200::ObjClasses, AGX::HAL200::CommandEncoding, AGX::HAL200::EncoderComputeServiceClasses>::setBuffer_impl<AGXBuffer>(AGXBuffer const*, unsigned long, unsigned int, unsigned long)  (in AGXMetalG16X) + 356  [0x10f895718]
+    +                                             ! : | + 1 mlx::core::binary_op_gpu_inplace(std::vector<mlx::core::array> const&, std::vector<mlx::core::array>&, char const*, mlx::core::Stream const&)  (in libmlx.dylib) + 260  [0x10b521c88]
+    +                                             ! : | + ! 1 mlx::core::array::~array()  (in libmlx.dylib) + 176  [0x10a7bffe0]
+    +                                             ! : | + 1 mlx::core::binary_op_gpu_inplace(std::vector<mlx::core::array> const&, std::vector<mlx::core::array>&, char const*, mlx::core::Stream const&)  (in libmlx.dylib) + 732  [0x10b521e60]
+    +                                             ! : | + ! 1 mlx::core::get_kernel_name(mlx::core::BinaryOpType, char const*, mlx::core::array const&, bool, int, int)  (in libmlx.dylib) + 408  [0x10b521944]
+    +                                             ! : | + !   1 mlx::core::concatenate<char const*, char const*, std::basic_string<char>>(std::basic_string<char>&, char const*, char const*, std::basic_string<char>)  (in libmlx.dylib) + 116  [0x10b521b30]
+    +                                             ! : | + !     1 mlx::core::concatenate<char const*, std::basic_string<char>>(std::basic_string<char>&, char const*, std::basic_string<char>)  (in libmlx.dylib) + 40  [0x10b521a0c]
+    +                                             ! : | + !       1 _platform_strlen  (in libsystem_platform.dylib) + 52  [0x18d88ab14]
+    +                                             ! : | + 1 mlx::core::binary_op_gpu_inplace(std::vector<mlx::core::array> const&, std::vector<mlx::core::array>&, char const*, mlx::core::Stream const&)  (in libmlx.dylib) + 920  [0x10b521f1c]
+    +                                             ! : | + ! 1 mlx::core::metal::CommandEncoder::set_output_array(mlx::core::array&, int, long long)  (in libmlx.dylib) + 72  [0x10b54a638]
+    +                                             ! : | + !   1 std::__hash_table<void const*>::__emplace_unique_key_args<void const*, void const*>(void const* const&, void const*&&)  (in libmlx.dylib) + 140  [0x10b54ed18]
+    +                                             ! : | + 1 mlx::core::binary_op_gpu_inplace(std::vector<mlx::core::array> const&, std::vector<mlx::core::array>&, char const*, mlx::core::Stream const&)  (in libmlx.dylib) + 1276  [0x10b522080]
+    +                                             ! : | 1 mlx::core::binary_op_gpu_inplace(std::vector<mlx::core::array> const&, mlx::core::array&, char const*, mlx::core::Stream const&)  (in libmlx.dylib) + 204  [0x10b5226a4]
+    +                                             ! : |   1 mlx::core::array::~array()  (in libmlx.dylib) + 108  [0x10a7bff9c]
+    +                                             ! : 9 mlx::core::binary_op_gpu(std::vector<mlx::core::array> const&, mlx::core::array&, char const*, mlx::core::Stream const&)  (in libmlx.dylib) + 228  [0x10b522800]
+    +                                             ! : | 3 mlx::core::set_binary_op_output_data(mlx::core::array const&, mlx::core::array const&, mlx::core::array&, mlx::core::BinaryOpType, std::function<mlx::core::allocator::Buffer (unsigned long)>)  (in libmlx.dylib) + 784  [0x10a93b9a4]
+    +                                             ! : | + 3 mlx::core::metal::MetalAllocator::malloc(unsigned long)  (in libmlx.dylib) + 120  [0x10b5202e4]
+    +                                             ! : | +   1 mlx::core::BufferCache<MTL::Buffer>::reuse_from_cache(unsigned long)  (in libmlx.dylib) + 360  [0x10b520860]
+    +                                             ! : | +   ! 1 std::__tree_remove[abi:nqe210106]<std::__tree_node_base<void*>*>(std::__tree_node_base<void*>*, std::__tree_node_base<void*>*)  (in libmlx.dylib) + 88  [0x10b4b4184]
+    +                                             ! : | +   1 mlx::core::BufferCache<MTL::Buffer>::reuse_from_cache(unsigned long)  (in libmlx.dylib) + 368  [0x10b520868]
+    +                                             ! : | +   ! 1 _xzm_free  (in libsystem_malloc.dylib) + 352  [0x18d6a11cc]
+    +                                             ! : | +   !   1 _platform_memset  (in libsystem_platform.dylib) + 176  [0x18d88d1a0]
+    +                                             ! : | +   1 mlx::core::BufferCache<MTL::Buffer>::reuse_from_cache(unsigned long)  (in libmlx.dylib) + 36  [0x10b52071c]
+    +                                             ! : | 3 mlx::core::set_binary_op_output_data(mlx::core::array const&, mlx::core::array const&, mlx::core::array&, mlx::core::BinaryOpType, std::function<mlx::core::allocator::Buffer (unsigned long)>)  (in libmlx.dylib) + 1396  [0x10a93bc08]
+    +                                             ! : | + 3 mlx::core::metal::MetalAllocator::malloc(unsigned long)  (in libmlx.dylib) + 120  [0x10b5202e4]
+    +                                             ! : | +   3 mlx::core::BufferCache<MTL::Buffer>::reuse_from_cache(unsigned long)  (in libmlx.dylib) + 60,292  [0x10b520734,0x10b52081c]
+    +                                             ! : | 1 mlx::core::set_binary_op_output_data(mlx::core::array const&, mlx::core::array const&, mlx::core::array&, mlx::core::BinaryOpType, std::function<mlx::core::allocator::Buffer (unsigned long)>)  (in libmlx.dylib) + 1560  [0x10a93bcac]
+    +                                             ! : | + 1 mlx::core::metal::MetalAllocator::malloc(unsigned long)  (in libmlx.dylib) + 120  [0x10b5202e4]
+    +                                             ! : | +   1 mlx::core::BufferCache<MTL::Buffer>::reuse_from_cache(unsigned long)  (in libmlx.dylib) + 292  [0x10b52081c]
+    +                                             ! : | 1 mlx::core::set_binary_op_output_data(mlx::core::array const&, mlx::core::array const&, mlx::core::array&, mlx::core::BinaryOpType, std::function<mlx::core::allocator::Buffer (unsigned long)>)  (in libmlx.dylib) + 2084  [0x10a93beb8]
+    +                                             ! : | + 1 mlx::core::array::set_data(mlx::core::allocator::Buffer, unsigned long, mlx::core::SmallVector<long long, 10ul>, mlx::core::array::Flags, std::function<void (mlx::core::allocator::Buffer)>)  (in libmlx.dylib) + 60  [0x10a7bccd0]
+    +                                             ! : | +   1 operator new(unsigned long)  (in libc++abi.dylib) + 52  [0x18d83a7e8]
+    +                                             ! : | +     1 malloc_type_malloc  (in libsystem_malloc.dylib) + 64  [0x18d694024]
+    +                                             ! : | 1 mlx::core::set_binary_op_output_data(mlx::core::array const&, mlx::core::array const&, mlx::core::array&, mlx::core::BinaryOpType, std::function<mlx::core::allocator::Buffer (unsigned long)>)  (in libmlx.dylib) + 2048  [0x10a93be94]
+    +                                             ! : 9 mlx::core::ternary_op_gpu(std::vector<mlx::core::array> const&, mlx::core::array&, char const*, mlx::core::Stream const&)  (in libmlx.dylib) + 364  [0x10b5b84f0]
+    +                                             ! : | 7 mlx::core::ternary_op_gpu_inplace(std::vector<mlx::core::array> const&, mlx::core::array&, char const*, mlx::core::Stream const&)  (in libmlx.dylib) + 1204  [0x10b5b7ee0]
+    +                                             ! : | + 4 mlx::core::metal::CommandEncoder::get_command_encoder()  (in libmlx.dylib) + 64  [0x10b54a420]
+    +                                             ! : | + ! 4 -[AGXG16XFamilyCommandBuffer computeCommandEncoderWithDispatchType:]  (in AGXMetalG16X) + 276  [0x10f8c956c]
+    +                                             ! : | + !   2 -[AGXG16XFamilyCommandBuffer computeCommandEncoderWithConfig:]  (in AGXMetalG16X) + 164  [0x10f8c9768]
+    +                                             ! : | + !   : 1 -[AGXG16XFamilyComputeContext initWithCommandBuffer:config:]  (in AGXMetalG16X) + 520  [0x10f94b49c]
+    +                                             ! : | + !   : | 1 IOGPUDeviceTraceEvent  (in IOGPU) + 0  [0x1b2971c44]
+    +                                             ! : | + !   : 1 -[AGXG16XFamilyComputeContext initWithCommandBuffer:config:]  (in AGXMetalG16X) + 536  [0x10f94b4ac]
+    +                                             ! : | + !   :   1 AGX::ComputeContext<AGX::HAL200::Encoders, AGX::HAL200::Classes, AGX::HAL200::ObjClasses, AGX::HAL200::CommandEncoding, AGX::HAL200::EncoderComputeServiceClasses>::beginComputePass(bool, eAGXDataBufferPools)  (in AGXMetalG16X) + 204  [0x10f93f128]
+    +                                             ! : | + !   :     1 AGX::ContextCommon<AGX::HAL200::Encoders, AGX::HAL200::Classes, AGX::HAL200::ObjClasses, AGX::HAL200::DataBufferAllocator>::newCommand(unsigned long, bool)  (in AGXMetalG16X) + 160  [0x10f8fdb28]
+    +                                             ! : | + !   :       1 IOGPUMetalCommandBufferStorageBeginSegment  (in IOGPU) + 132  [0x1b296806c]
+    +                                             ! : | + !   :         1 IOGPUResourceListReset  (in IOGPU) + 128  [0x1b2975b80]
+    +                                             ! : | + !   :           1 _platform_memset  (in libsystem_platform.dylib) + 140  [0x18d88d17c]
+    +                                             ! : | + !   1 -[AGXG16XFamilyCommandBuffer computeCommandEncoderWithConfig:]  (in AGXMetalG16X) + 84  [0x10f8c9718]
+    +                                             ! : | + !   : 1 objc_msgSend$tryCoalescingPreviousComputeCommandEncoderWithConfig:nextEncoderClass:  (in AGXMetalG16X) + 0  [0x10febd940]
+    +                                             ! : | + !   1 -[AGXG16XFamilyCommandBuffer computeCommandEncoderWithConfig:]  (in AGXMetalG16X) + 120  [0x10f8c973c]
+    +                                             ! : | + !     1 objc_msgSend$commitEncoder  (in AGXMetalG16X) + 0  [0x10feb5e20]
+    +                                             ! : | + 3 mlx::core::metal::CommandEncoder::get_command_encoder()  (in libmlx.dylib) + 152  [0x10b54a478]
+    +                                             ! : | +   3 -[IOGPUMetalFence initWithDevice:]  (in IOGPU) + 120  [0x1b2964fd8]
+    +                                             ! : | +     3 -[IOGPUMTLFence initWithDevice:]  (in IOGPU) + 136  [0x1b29749a8]
+    +                                             ! : | +       3 IOConnectCallMethod  (in IOKit) + 236  [0x191bdcdc0]
+    +                                             ! : | +         3 io_connect_method  (in IOKit) + 520  [0x191bdcff4]
+    +                                             ! : | +           3 mach_msg2_internal  (in libsystem_kernel.dylib) + 76  [0x18d852574]
+    +                                             ! : | +             3 mach_msg2_trap  (in libsystem_kernel.dylib) + 8  [0x18d83fc34]
+    +                                             ! : | 1 mlx::core::ternary_op_gpu_inplace(std::vector<mlx::core::array> const&, mlx::core::array&, char const*, mlx::core::Stream const&)  (in libmlx.dylib) + 1108  [0x10b5b7e80]
+    +                                             ! : | + 1 mlx::core::type_to_name(mlx::core::array const&)  (in libmlx.dylib) + 24  [0x10b5bd2f4]
+    +                                             ! : | 1 mlx::core::ternary_op_gpu_inplace(std::vector<mlx::core::array> const&, mlx::core::array&, char const*, mlx::core::Stream const&)  (in libmlx.dylib) + 1304  [0x10b5b7f44]
+    +                                             ! : |   1 mlx::core::metal::CommandEncoder::set_output_array(mlx::core::array&, int, long long)  (in libmlx.dylib) + 224  [0x10b54a6d0]
+    +                                             ! : |     1 std::__hash_table<void const*>::__emplace_unique_key_args<void const*, void const*>(void const* const&, void const*&&)  (in libmlx.dylib) + 164  [0x10b54ed30]
+    +                                             ! : 2 mlx::core::Full::eval_gpu(std::vector<mlx::core::array> const&, mlx::core::array&)  (in libmlx.dylib) + 104  [0x10b5beb18]
+    +                                             ! : | 1 mlx::core::copy_gpu(mlx::core::array const&, mlx::core::array&, mlx::core::CopyType, mlx::core::Stream const&)  (in libmlx.dylib) + 96  [0x10b534e18]
+    +                                             ! : | + 1 mlx::core::set_copy_output_data(mlx::core::array const&, mlx::core::array&, mlx::core::CopyType, std::function<mlx::core::allocator::Buffer (unsigned long)>)  (in libmlx.dylib) + 384  [0x10aec40fc]
+    +                                             ! : | +   1 mlx::core::metal::MetalAllocator::malloc(unsigned long)  (in libmlx.dylib) + 120  [0x10b5202e4]
+    +                                             ! : | +     1 mlx::core::BufferCache<MTL::Buffer>::reuse_from_cache(unsigned long)  (in libmlx.dylib) + 268  [0x10b520804]
+    +                                             ! : | +       1 _free  (in libsystem_malloc.dylib) + 0  [0x18d6b0c4c]
+    +                                             ! : | 1 mlx::core::copy_gpu(mlx::core::array const&, mlx::core::array&, mlx::core::CopyType, mlx::core::Stream const&)  (in libmlx.dylib) + 196  [0x10b534e7c]
+    +                                             ! : |   1 mlx::core::copy_gpu_inplace(mlx::core::array const&, mlx::core::array&, mlx::core::CopyType, mlx::core::Stream const&)  (in libmlx.dylib) + 80  [0x10b5bd670]
+    +                                             ! : |     1 mlx::core::copy_gpu_inplace(mlx::core::array const&, mlx::core::array&, mlx::core::SmallVector<int, 10ul> const&, mlx::core::SmallVector<long long, 10ul> const&, mlx::core::SmallVector<long long, 10ul> const&, long long, long long, mlx::core::CopyType, mlx::core::Stream const&, std::optional<mlx::core::array>, std::optional<mlx::core::array>)  (in libmlx.dylib) + 2264  [0x10b5357d8]
+    +                                             ! : |       1 mlx::core::metal::CommandEncoder::dispatch_threads(MTL::Size, MTL::Size)  (in libmlx.dylib) + 108  [0x10b54a9a4]
+    +                                             ! : |         1 -[AGXG16XFamilyComputeContext dispatchThreads:threadsPerThreadgroup:]  (in AGXMetalG16X) + 304  [0x10f94758c]
+    +                                             ! : |           1 AGX::ComputeContext<AGX::HAL200::Encoders, AGX::HAL200::Classes, AGX::HAL200::ObjClasses, AGX::HAL200::CommandEncoding, AGX::HAL200::EncoderComputeServiceClasses>::performEnqueueKernel(eAGXDataBufferPools, unsigned long long, unsigned int, unsigned long long*)  (in AGXMetalG16X) + 456  [0x10f940cfc]
+    +                                             ! : |             1 AGX::ComputeUSCStateLoader<AGX::HAL200::Encoders, AGX::HAL200::Classes>::directTGSizeOptimization(AGX::HAL200::ComputeProgramVariant const*, AGX::ComputeDriverArgumentTable<AGX::HAL200::Classes>&, unsigned int&, bool)  (in AGXMetalG16X) + 212  [0x10f8fc648]
+    +                                             ! : 2 mlx::core::Matmul::eval_gpu(std::vector<mlx::core::array> const&, mlx::core::array&)  (in libmlx.dylib) + 1908  [0x10b578c1c]
+    +                                             ! : | 2 mlx::core::steel_matmul(mlx::core::Stream const&, mlx::core::metal::Device&, mlx::core::array const&, mlx::core::array const&, mlx::core::array&, int, int, int, int, int, int, bool, bool, std::vector<mlx::core::array>&, mlx::core::SmallVector<int, 10ul>, mlx::core::SmallVector<long long, 10ul>, mlx::core::SmallVector<long long, 10ul>)  (in libmlx.dylib) + 1068  [0x10b52f8e8]
+    +                                             ! : |   2 mlx::core::steel_matmul_axpby<false>(mlx::core::Stream const&, mlx::core::metal::Device&, mlx::core::array const&, mlx::core::array const&, mlx::core::array const&, mlx::core::array&, int, int, int, int, int, int, bool, bool, std::vector<mlx::core::array>&, mlx::core::SmallVector<int, 10ul>, mlx::core::SmallVector<long long, 10ul>, mlx::core::SmallVector<long long, 10ul>, mlx::core::SmallVector<long long, 10ul>, float, float)  (in libmlx.dylib) + 3220  [0x10b587d9c]
+    +                                             ! : |     1 mlx::core::steel_matmul_regular_axpby<false>(mlx::core::Stream const&, mlx::core::metal::Device&, mlx::core::array const&, mlx::core::array const&, mlx::core::array const&, mlx::core::array&, int, int, int, int, int, int, int, bool, bool, std::vector<mlx::core::array>&, mlx::core::SmallVector<int, 10ul>, mlx::core::SmallVector<long long, 10ul>, long long, long long, long long, long long, float, float)  (in libmlx.dylib) + 440  [0x10b58a4cc]
+    +                                             ! : |     + 1 std::basic_ostringstream<char>::basic_ostringstream[abi:nqe210106]()  (in libmlx.dylib) + 96  [0x10a7c4360]
+    +                                             ! : |     +   1 std::locale::locale()  (in libc++.1.dylib) + 24  [0x18d7947f4]
+    +                                             ! : |     +     1 std::locale::__global()  (in libc++.1.dylib) + 0  [0x18d79482c]
+    +                                             ! : |     1 mlx::core::steel_matmul_regular_axpby<false>(mlx::core::Stream const&, mlx::core::metal::Device&, mlx::core::array const&, mlx::core::array const&, mlx::core::array const&, mlx::core::array&, int, int, int, int, int, int, int, bool, bool, std::vector<mlx::core::array>&, mlx::core::SmallVector<int, 10ul>, mlx::core::SmallVector<long long, 10ul>, long long, long long, long long, long long, float, float)  (in libmlx.dylib) + 1300  [0x10b58a828]
+    +                                             ! : |       1 std::__put_character_sequence[abi:nqe210106]<char>(std::basic_ostream<char>&, char const*, unsigned long)  (in libmlx.dylib) + 240  [0x10a7d0a58]
+    +                                             ! : |         1 std::basic_ostream<char>::sentry::~sentry()  (in libc++.1.dylib) + 32  [0x18d7961c8]
+    +                                             ! : 1 mlx::core::AsType::eval_gpu(std::vector<mlx::core::array> const&, mlx::core::array&)  (in libmlx.dylib) + 0  [0x10b5be414]
+    +                                             ! : 1 mlx::core::Broadcast::eval_gpu(std::vector<mlx::core::array> const&, mlx::core::array&)  (in libmlx.dylib) + 0  [0x10b5be438]
+    +                                             ! : 1 mlx::core::Full::eval_gpu(std::vector<mlx::core::array> const&, mlx::core::array&)  (in libmlx.dylib) + 0  [0x10b5beab0]
+    +                                             ! : 1 mlx::core::Gather::eval_gpu(std::vector<mlx::core::array> const&, mlx::core::array&)  (in libmlx.dylib) + 124  [0x10b56d144]
+    +                                             ! : | 1 mlx::core::metal::MetalAllocator::malloc(unsigned long)  (in libmlx.dylib) + 56  [0x10b5202a4]
+    +                                             ! : |   1 -[IOGPUMetalDevice maxBufferLength]  (in IOGPU) + 40  [0x1b2960908]
+    +                                             ! : |     1 IOGPUDeviceGetMaxResourceSize  (in IOGPU) + 44  [0x1b29719a8]
+    +                                             ! : |       1 CFGetTypeID  (in CoreFoundation) + 172  [0x18d8e3000]
+    +                                             ! : 1 mlx::core::Gather::eval_gpu(std::vector<mlx::core::array> const&, mlx::core::array&)  (in libmlx.dylib) + 2552  [0x10b56dac0]
+    +                                             ! : | 1 _xzm_free  (in libsystem_malloc.dylib) + 352  [0x18d6a11cc]
+    +                                             ! : |   1 _platform_memset  (in libsystem_platform.dylib) + 180  [0x18d88d1a4]
+    +                                             ! : 1 mlx::core::Gather::eval_gpu(std::vector<mlx::core::array> const&, mlx::core::array&)  (in libmlx.dylib) + 2972  [0x10b56dc64]
+    +                                             ! : | 1 mlx::core::metal::CommandEncoder::get_command_encoder()  (in libmlx.dylib) + 64  [0x10b54a420]
+    +                                             ! : |   1 -[AGXG16XFamilyCommandBuffer computeCommandEncoderWithDispatchType:]  (in AGXMetalG16X) + 276  [0x10f8c956c]
+    +                                             ! : |     1 -[AGXG16XFamilyCommandBuffer computeCommandEncoderWithConfig:]  (in AGXMetalG16X) + 164  [0x10f8c9768]
+    +                                             ! : |       1 -[AGXG16XFamilyComputeContext initWithCommandBuffer:config:]  (in AGXMetalG16X) + 72  [0x10f94b2dc]
+    +                                             ! : |         1 objc_msgSendSuper2  (in libobjc.A.dylib) + 24  [0x18d429a38]
+    +                                             ! : 1 mlx::core::Gather::eval_gpu(std::vector<mlx::core::array> const&, mlx::core::array&)  (in libmlx.dylib) + 3104  [0x10b56dce8]
+    +                                             ! : | 1 mlx::core::metal::CommandEncoder::set_output_array(mlx::core::array&, int, long long)  (in libmlx.dylib) + 224  [0x10b54a6d0]
+    +                                             ! : |   1 std::__hash_table<void const*>::__emplace_unique_key_args<void const*, void const*>(void const* const&, void const*&&)  (in libmlx.dylib) + 552  [0x10b54eeb4]
+    +                                             ! : |     1 <deduplicated_symbol>  (in libmlx.dylib) + 48  [0x10a7c1ec8]
+    +                                             ! : |       1 operator new(unsigned long)  (in libc++abi.dylib) + 52  [0x18d83a7e8]
+    +                                             ! : |         1 _xzm_xzone_malloc  (in libsystem_malloc.dylib) + 32  [0x18d6a08e0]
+    +                                             ! : 1 mlx::core::Matmul::eval_gpu(std::vector<mlx::core::array> const&, mlx::core::array&)  (in libmlx.dylib) + 196  [0x10b57856c]
+    +                                             ! : | 1 mlx::core::metal::MetalAllocator::malloc(unsigned long)  (in libmlx.dylib) + 120  [0x10b5202e4]
+    +                                             ! : |   1 mlx::core::BufferCache<MTL::Buffer>::reuse_from_cache(unsigned long)  (in libmlx.dylib) + 280  [0x10b520810]
+    +                                             ! : 1 mlx::core::Reduce::eval_gpu(std::vector<mlx::core::array> const&, mlx::core::array&)  (in libmlx.dylib) + 132  [0x10b5b5f50]
+    +                                             ! : | 1 mlx::core::metal::MetalAllocator::malloc(unsigned long)  (in libmlx.dylib) + 120  [0x10b5202e4]
+    +                                             ! : |   1 mlx::core::BufferCache<MTL::Buffer>::reuse_from_cache(unsigned long)  (in libmlx.dylib) + 36  [0x10b52071c]
+    +                                             ! : 1 mlx::core::Reduce::eval_gpu(std::vector<mlx::core::array> const&, mlx::core::array&)  (in libmlx.dylib) + 552  [0x10b5b60f4]
+    +                                             ! : | 1 mlx::core::get_reduction_plan(mlx::core::array const&, std::vector<int> const&)  (in libmlx.dylib) + 2436  [0x10a929164]
+    +                                             ! : |   1 mlx::core::ReductionPlan::ReductionPlan(mlx::core::ReductionOpType, mlx::core::SmallVector<int, 10ul>, mlx::core::SmallVector<long long, 10ul>)  (in libmlx.dylib) + 80  [0x10a92a480]
+    +                                             ! : 1 mlx::core::Reduce::eval_gpu(std::vector<mlx::core::array> const&, mlx::core::array&)  (in libmlx.dylib) + 1068  [0x10b5b62f8]
+    +                                             ! : | 1 mlx::core::row_reduce_general_dispatch(mlx::core::array const&, mlx::core::array&, std::basic_string<char> const&, mlx::core::ReductionPlan const&, std::vector<int> const&, mlx::core::metal::CommandEncoder&, mlx::core::metal::Device&, mlx::core::Stream const&)  (in libmlx.dylib) + 3908  [0x10b5b2dd8]
+    +                                             ! : |   1 mlx::core::metal::CommandEncoder::set_output_array(mlx::core::array&, int, long long)  (in libmlx.dylib) + 224  [0x10b54a6d0]
+    +                                             ! : |     1 std::__hash_table<void const*>::__emplace_unique_key_args<void const*, void const*>(void const* const&, void const*&&)  (in libmlx.dylib) + 364  [0x10b54edf8]
+    +                                             ! : 1 mlx::core::broadcast(mlx::core::array const&, mlx::core::array&)  (in libmlx.dylib) + 856  [0x10a922928]
+    +                                             ! : 1 mlx::core::copy_gpu(mlx::core::array const&, mlx::core::array&, mlx::core::CopyType, mlx::core::Stream const&)  (in libmlx.dylib) + 96  [0x10b534e18]
+    +                                             ! : | 1 mlx::core::set_copy_output_data(mlx::core::array const&, mlx::core::array&, mlx::core::CopyType, std::function<mlx::core::allocator::Buffer (unsigned long)>)  (in libmlx.dylib) + 124  [0x10aec3ff8]
+    +                                             ! : |   1 mlx::core::metal::MetalAllocator::malloc(unsigned long)  (in libmlx.dylib) + 120  [0x10b5202e4]
+    +                                             ! : |     1 mlx::core::BufferCache<MTL::Buffer>::reuse_from_cache(unsigned long)  (in libmlx.dylib) + 360  [0x10b520860]
+    +                                             ! : |       1 std::__tree_remove[abi:nqe210106]<std::__tree_node_base<void*>*>(std::__tree_node_base<void*>*, std::__tree_node_base<void*>*)  (in libmlx.dylib) + 88  [0x10b4b4184]
+    +                                             ! : 1 mlx::core::copy_gpu(mlx::core::array const&, mlx::core::array&, mlx::core::CopyType, mlx::core::Stream const&)  (in libmlx.dylib) + 196  [0x10b534e7c]
+    +                                             ! :   1 mlx::core::copy_gpu_inplace(mlx::core::array const&, mlx::core::array&, mlx::core::CopyType, mlx::core::Stream const&)  (in libmlx.dylib) + 80  [0x10b5bd670]
+    +                                             ! :     1 mlx::core::copy_gpu_inplace(mlx::core::array const&, mlx::core::array&, mlx::core::SmallVector<int, 10ul> const&, mlx::core::SmallVector<long long, 10ul> const&, mlx::core::SmallVector<long long, 10ul> const&, long long, long long, mlx::core::CopyType, mlx::core::Stream const&, std::optional<mlx::core::array>, std::optional<mlx::core::array>)  (in libmlx.dylib) + 1772  [0x10b5355ec]
+    +                                             ! :       1 mlx::core::metal::CommandEncoder::get_command_encoder()  (in libmlx.dylib) + 64  [0x10b54a420]
+    +                                             ! :         1 -[AGXG16XFamilyCommandBuffer computeCommandEncoderWithDispatchType:]  (in AGXMetalG16X) + 276  [0x10f8c956c]
+    +                                             ! :           1 -[AGXG16XFamilyCommandBuffer computeCommandEncoderWithConfig:]  (in AGXMetalG16X) + 164  [0x10f8c9768]
+    +                                             ! :             1 -[AGXG16XFamilyComputeContext initWithCommandBuffer:config:]  (in AGXMetalG16X) + 536  [0x10f94b4ac]
+    +                                             ! :               1 AGX::ComputeContext<AGX::HAL200::Encoders, AGX::HAL200::Classes, AGX::HAL200::ObjClasses, AGX::HAL200::CommandEncoding, AGX::HAL200::EncoderComputeServiceClasses>::beginComputePass(bool, eAGXDataBufferPools)  (in AGXMetalG16X) + 2648  [0x10f93fab4]
+    +                                             ! :                 1 AGX::ComputeContext<AGX::HAL200::Encoders, AGX::HAL200::Classes, AGX::HAL200::ObjClasses, AGX::HAL200::CommandEncoding, AGX::HAL200::EncoderComputeServiceClasses>::insertIndirectTGOptKernel(eAGXDataBufferPools, indirectTGOptParams*&, unsigned short*&, AGX::CDMEncoderGen6<AGX::HAL200::ESLEncoder, AGX::HAL200::DeviceConstants>::InstanceTokenImproved*&, AGX::CDMEncoderGen6<AGX::HAL200::ESLEncoder, AGX::HAL200::DeviceConstants>::FenceToken*&)  (in AGXMetalG16X) + 456  [0x10f9401f4]
+    +                                             ! :                   1 AGX::ComputeContext<AGX::HAL200::Encoders, AGX::HAL200::Classes, AGX::HAL200::ObjClasses, AGX::HAL200::CommandEncoding, AGX::HAL200::EncoderComputeServiceClasses>::performEnqueueKernel(eAGXDataBufferPools, unsigned long long, unsigned int, unsigned long long*)  (in AGXMetalG16X) + 1040  [0x10f940f44]
+    +                                             ! :                     1 AGX::ComputeContext<AGX::HAL200::Encoders, AGX::HAL200::Classes, AGX::HAL200::ObjClasses, AGX::HAL200::CommandEncoding, AGX::HAL200::EncoderComputeServiceClasses>::bindBufferResourceToCommand(unsigned int, bool)  (in AGXMetalG16X) + 364  [0x10f942b60]
+    +                                             ! :                       1 $_0::operator()() const::'lambda0'(unsigned long, std::__type_descriptor_t)::__invoke(unsigned long, std::__type_descriptor_t)  (in libc++abi.dylib) + 16  [0x18d8394a8]
+    +                                             ! :                         1 operator_new_impl[abi:nqe210106](unsigned long, std::__type_descriptor_t)  (in libc++abi.dylib) + 36  [0x18d8394dc]
+    +                                             ! :                           1 _xzm_xzone_malloc  (in libsystem_malloc.dylib) + 228  [0x18d6a09a4]
+    +                                             ! 6 mlx::core::gpu::eval(mlx::core::array&)  (in libmlx.dylib) + 1908  [0x10b55c794]
+    +                                             ! : 5 mlx::core::metal::CommandEncoder::commit()  (in libmlx.dylib) + 36  [0x10b54b240]
+    +                                             ! : | 4 -[AGXG16XFamilyCommandBuffer commit]  (in AGXMetalG16X) + 564  [0x10f8cb658]
+    +                                             ! : | + 4 -[AGXG16XFamilyCommandBuffer commitEncoder]  (in AGXMetalG16X) + 96  [0x10f8c88a0]
+    +                                             ! : | +   2 -[AGXG16XFamilyComputeContext deferredEndEncoding]  (in AGXMetalG16X) + 128  [0x10f94ab20]
+    +                                             ! : | +   ! 1 AGX::ComputeContext<AGX::HAL200::Encoders, AGX::HAL200::Classes, AGX::HAL200::ObjClasses, AGX::HAL200::CommandEncoding, AGX::HAL200::EncoderComputeServiceClasses>::endComputePass(bool, eAGXDataBufferPools)  (in AGXMetalG16X) + 668  [0x10f93eb14]
+    +                                             ! : | +   ! : 1 FenceEncoder::encode(AGX::SidebandBufferAllocator&, bool, AGXStreamHardwareCommandRec*, AGX::FenceList*, AGX::FenceList*, AGX::FenceList*, AGX::FenceList*)  (in AGXMetalG16X) + 180  [0x10f892cfc]
+    +                                             ! : | +   ! :   1 AGX::SidebandBufferAllocator::allocate(unsigned int, unsigned int, unsigned int*)  (in AGXMetalG16X) + 92  [0x10f893088]
+    +                                             ! : | +   ! :     1 IOGPUMetalCommandBufferStorageAllocSidebandBuffer  (in IOGPU) + 72  [0x1b2968544]
+    +                                             ! : | +   ! :       1 -[IOGPUMetalDeviceShmemPool shmemSize]  (in IOGPU) + 0  [0x1b2961c18]
+    +                                             ! : | +   ! 1 AGX::ComputeContext<AGX::HAL200::Encoders, AGX::HAL200::Classes, AGX::HAL200::ObjClasses, AGX::HAL200::CommandEncoding, AGX::HAL200::EncoderComputeServiceClasses>::endComputePass(bool, eAGXDataBufferPools)  (in AGXMetalG16X) + 1776  [0x10f93ef68]
+    +                                             ! : | +   !   1 AGX::ContextCommon<AGX::HAL200::Encoders, AGX::HAL200::Classes, AGX::HAL200::ObjClasses, AGX::HAL200::DataBufferAllocator>::endCommand()  (in AGXMetalG16X) + 192  [0x10f8fde84]
+    +                                             ! : | +   !     1 AGX::ResourceGroupUsage<AGX::HAL200::Encoders, AGX::HAL200::Classes, AGX::HAL200::ObjClasses>::getUsedResourceGroupsAndWriteRanges(AGX::HAL200::ResourceGroupUsageList&, AGXResourceGroupWriteRange (&) [16], unsigned int&, unsigned int&, unsigned int&, bool&)  (in AGXMetalG16X) + 272  [0x10fe26e88]
+    +                                             ! : | +   1 -[AGXG16XFamilyComputeContext destroyImpl]  (in AGXMetalG16X) + 68  [0x10f94af24]
+    +                                             ! : | +   ! 1 AGX::ComputeContext<AGX::HAL200::Encoders, AGX::HAL200::Classes, AGX::HAL200::ObjClasses, AGX::HAL200::CommandEncoding, AGX::HAL200::EncoderComputeServiceClasses>::~ComputeContext()  (in AGXMetalG16X) + 228  [0x10f94b06c]
+    +                                             ! : | +   !   1 _xzm_free  (in libsystem_malloc.dylib) + 352  [0x18d6a11cc]
+    +                                             ! : | +   !     1 __bzero  (in libsystem_platform.dylib) + 24  [0x18d88d0a8]
+    +                                             ! : | +   1 -[AGXG16XFamilyComputeContext destroyImpl]  (in AGXMetalG16X) + 0  [0x10f94aee0]
+    +                                             ! : | 1 -[AGXG16XFamilyCommandBuffer commit]  (in AGXMetalG16X) + 888  [0x10f8cb79c]
+    +                                             ! : |   1 -[IOGPUMetalCommandBuffer commit]  (in IOGPU) + 228  [0x1b2959478]
+    +                                             ! : |     1 -[_MTLCommandQueue commitCommandBuffer:wake:]  (in Metal) + 268  [0x199eff434]
+    +                                             ! : |       1 dispatch_source_merge_data  (in libdispatch.dylib) + 92  [0x18d6de458]
+    +                                             ! : |         1 _dispatch_event_loop_poke  (in libdispatch.dylib) + 336  [0x18d6eaeb0]
+    +                                             ! : |           1 _dispatch_kq_poll  (in libdispatch.dylib) + 220  [0x18d6eba64]
+    +                                             ! : |             1 kevent_id  (in libsystem_kernel.dylib) + 8  [0x18d841a74]
+    +                                             ! : 1 mlx::core::metal::CommandEncoder::commit()  (in libmlx.dylib) + 52  [0x10b54b250]
+    +                                             ! :   1 -[AGXG16XFamilyCommandQueue commandBufferWithUnretainedReferences]  (in AGXMetalG16X) + 44  [0x10f8ce91c]
+    +                                             ! :     1 objc_msgSend  (in libobjc.A.dylib) + 80  [0x18d429850]
+    +                                             ! 3 mlx::core::gpu::eval(mlx::core::array&)  (in libmlx.dylib) + 756  [0x10b55c314]
+    +                                             ! : 1 mlx::core::metal::CommandEncoder::end_encoding()  (in libmlx.dylib) + 336  [0x10b54ab28]
+    +                                             ! : | 1 std::__hash_table<NS::SharedPtr<MTL::Fence>>::__emplace_unique_key_args<NS::SharedPtr<MTL::Fence>, NS::SharedPtr<MTL::Fence> const&>(NS::SharedPtr<MTL::Fence> const&, NS::SharedPtr<MTL::Fence> const&)  (in libmlx.dylib) + 576  [0x10b54f358]
+    +                                             ! : |   1 <deduplicated_symbol>  (in libmlx.dylib) + 88  [0x10a7c1ef0]
+    +                                             ! : |     1 _platform_memset  (in libsystem_platform.dylib) + 180  [0x18d88d1a4]
+    +                                             ! : 1 mlx::core::metal::CommandEncoder::end_encoding()  (in libmlx.dylib) + 400  [0x10b54ab68]
+    +                                             ! : | 1 std::__hash_table<std::__hash_value_type<void const*, NS::SharedPtr<MTL::Fence>>>::__emplace_unique_key_args<void const*, std::piecewise_construct_t const&, std::tuple<void const* const&>, std::tuple<>>(void const* const&, std::piecewise_construct_t const&, std::tuple<void const* const&>&&, std::tuple<>&&)  (in libmlx.dylib) + 0  [0x10b54f4c8]
+    +                                             ! : 1 mlx::core::metal::CommandEncoder::end_encoding()  (in libmlx.dylib) + 1404  [0x10b54af54]
+    +                                             ! :   1 _xzm_free  (in libsystem_malloc.dylib) + 256  [0x18d6a116c]
+    +                                             ! 2 mlx::core::gpu::eval(mlx::core::array&)  (in libmlx.dylib) + 308  [0x10b55c154]
+    +                                             ! : 1 std::__hash_table<std::shared_ptr<mlx::core::array::Data>>::__emplace_unique_key_args<std::shared_ptr<mlx::core::array::Data>, std::shared_ptr<mlx::core::array::Data> const&>(std::shared_ptr<mlx::core::array::Data> const&, std::shared_ptr<mlx::core::array::Data> const&)  (in libmlx.dylib) + 320  [0x10b4869fc]
+    +                                             ! : | 1 operator new(unsigned long)  (in libc++abi.dylib) + 8  [0x18d83a7bc]
+    +                                             ! : 1 std::__hash_table<std::shared_ptr<mlx::core::array::Data>>::__emplace_unique_key_args<std::shared_ptr<mlx::core::array::Data>, std::shared_ptr<mlx::core::array::Data> const&>(std::shared_ptr<mlx::core::array::Data> const&, std::shared_ptr<mlx::core::array::Data> const&)  (in libmlx.dylib) + 736  [0x10b486b9c]
+    +                                             ! 2 mlx::core::gpu::eval(mlx::core::array&)  (in libmlx.dylib) + 1248,2000  [0x10b55c500,0x10b55c7f0]
+    +                                             ! 1 mlx::core::array::is_tracer() const  (in libmlx.dylib) + 60  [0x10a7bfd3c]
+    +                                             ! 1 mlx::core::gpu::eval(mlx::core::array&)  (in libmlx.dylib) + 64  [0x10b55c060]
+    +                                             ! : 1 mlx::core::metal::new_scoped_memory_pool()  (in libmlx.dylib) + 36  [0x10b549ee8]
+    +                                             ! :   1 +[NSAutoreleasePool allocWithZone:]  (in Foundation) + 0  [0x18f14aa94]
+    +                                             ! 1 mlx::core::gpu::eval(mlx::core::array&)  (in libmlx.dylib) + 92  [0x10b55c07c]
+    +                                             ! : 1 mlx::core::metal::get_command_encoder(mlx::core::Stream)  (in libmlx.dylib) + 0  [0x10b54ddc4]
+    +                                             ! 1 mlx::core::gpu::eval(mlx::core::array&)  (in libmlx.dylib) + 112  [0x10b55c090]
+    +                                             ! : 1 mlx::core::array::outputs() const  (in libmlx.dylib) + 64  [0x10a7c5254]
+    +                                             ! :   1 std::vector<mlx::core::array>::reserve(unsigned long)  (in libmlx.dylib) + 68  [0x10a7c7e8c]
+    +                                             ! :     1 operator new(unsigned long)  (in libc++abi.dylib) + 52  [0x18d83a7e8]
+    +                                             ! :       1 malloc_type_malloc  (in libsystem_malloc.dylib) + 72  [0x18d69402c]
+    +                                             ! 1 mlx::core::gpu::eval(mlx::core::array&)  (in libmlx.dylib) + 744  [0x10b55c308]
+    +                                             ! : 1 mlx::core::metal::CommandEncoder::needs_commit() const  (in libmlx.dylib) + 12  [0x10b54b1f4]
+    +                                             ! 1 mlx::core::gpu::eval(mlx::core::array&)  (in libmlx.dylib) + 1160  [0x10b55c4a8]
+    +                                             ! : 1 std::unordered_set<std::shared_ptr<mlx::core::array::Data>>::unordered_set(std::unordered_set<std::shared_ptr<mlx::core::array::Data>> const&)  (in libmlx.dylib) + 224  [0x10b487410]
+    +                                             ! 1 mlx::core::gpu::eval(mlx::core::array&)  (in libmlx.dylib) + 1244  [0x10b55c4fc]
+    +                                             ! : 1 objc_msgSend  (in libobjc.A.dylib) + 56  [0x18d429838]
+    +                                             ! 1 mlx::core::gpu::eval(mlx::core::array&)  (in libmlx.dylib) + 1256  [0x10b55c508]
+    +                                             ! : 1 _Block_object_dispose  (in libsystem_blocks.dylib) + 8  [0x18d54ec00]
+    +                                             ! 1 mlx::core::gpu::eval(mlx::core::array&)  (in libmlx.dylib) + 1312  [0x10b55c540]
+    +                                             ! : 1 std::__function::__func<mlx::core::gpu::eval(mlx::core::array&)::$_1, void (MTL::CommandBuffer*)>::~__func()  (in libmlx.dylib) + 140  [0x10b55d774]
+    +                                             ! :   1 _xzm_free  (in libsystem_malloc.dylib) + 120  [0x18d6a10e4]
+    +                                             ! 1 mlx::core::gpu::eval(mlx::core::array&)  (in libmlx.dylib) + 1796  [0x10b55c724]
+    +                                             ! : 1 _xzm_free  (in libsystem_malloc.dylib) + 636  [0x18d6a12e8]
+    +                                             ! 1 mlx::core::gpu::eval(mlx::core::array&)  (in libmlx.dylib) + 2088  [0x10b55c848]
+    +                                             !   1 -[NSAutoreleasePool release]  (in Foundation) + 164  [0x18f14c3c4]
+    +                                             6 mlx::core::eval_impl(std::vector<mlx::core::array>, bool)  (in libmlx.dylib) + 5792  [0x10a900f10]
+    +                                             ! 5 mlx::core::array::detach()  (in libmlx.dylib) + 72  [0x10a7bf8b0]
+    +                                             ! : 2 std::__shared_ptr_emplace<mlx::core::Divide>::__on_zero_shared()  (in libmlx.dylib) + 0  [0x10a80b904]
+    +                                             ! : 1 std::__shared_ptr_emplace<mlx::core::Add>::__on_zero_shared()  (in libmlx.dylib) + 0  [0x10a80562c]
+    +                                             ! : 1 std::__shared_ptr_emplace<mlx::core::Full>::__on_zero_shared()  (in libmlx.dylib) + 0  [0x10a80dd14]
+    +                                             ! : 1 std::__shared_ptr_emplace<mlx::core::Subtract>::__on_zero_shared()  (in libmlx.dylib) + 0  [0x10a818664]
+    +                                             ! 1 mlx::core::array::detach()  (in libmlx.dylib) + 352  [0x10a7bf9c8]
+    +                                             3 mlx::core::eval_impl(std::vector<mlx::core::array>, bool)  (in libmlx.dylib) + 5504  [0x10a900df0]
+    +                                             ! 2 mlx::core::gpu::finalize(mlx::core::Stream)  (in libmlx.dylib) + 324  [0x10b55cbc0]
+    +                                             ! : 2 mlx::core::metal::CommandEncoder::commit()  (in libmlx.dylib) + 52  [0x10b54b250]
+    +                                             ! :   2 -[AGXG16XFamilyCommandQueue commandBufferWithUnretainedReferences]  (in AGXMetalG16X) + 44  [0x10f8ce91c]
+    +                                             ! :     2 -[AGXG16XFamilyCommandBuffer initWithQueue:retainedReferences:]  (in AGXMetalG16X) + 296  [0x10f8ca5e0]
+    +                                             ! :       1 AGX::ResourceGroupUsage<AGX::HAL200::Encoders, AGX::HAL200::Classes, AGX::HAL200::ObjClasses>::ResourceGroupUsage(AGX::HAL200::Device*)  (in AGXMetalG16X) + 232  [0x10fe26580]
+    +                                             ! :       | 1 $_0::operator()() const::'lambda0'(unsigned long, std::__type_descriptor_t)::__invoke(unsigned long, std::__type_descriptor_t)  (in libc++abi.dylib) + 16  [0x18d8394a8]
+    +                                             ! :       |   1 operator_new_impl[abi:nqe210106](unsigned long, std::__type_descriptor_t)  (in libc++abi.dylib) + 36  [0x18d8394dc]
+    +                                             ! :       |     1 _xzm_xzone_malloc_tiny  (in libsystem_malloc.dylib) + 420  [0x18d6a6078]
+    +                                             ! :       1 AGX::ResourceGroupUsage<AGX::HAL200::Encoders, AGX::HAL200::Classes, AGX::HAL200::ObjClasses>::ResourceGroupUsage(AGX::HAL200::Device*)  (in AGXMetalG16X) + 232  [0x10fe26580]
+    +                                             ! 1 mlx::core::gpu::finalize(mlx::core::Stream)  (in libmlx.dylib) + 76  [0x10b55cac8]
+    +                                             !   1 mlx::core::metal::CommandEncoder::end_encoding()  (in libmlx.dylib) + 1496  [0x10b54afb0]
+    +                                             1 mlx::core::eval_impl(std::vector<mlx::core::array>, bool)  (in libmlx.dylib) + 5576  [0x10a900e38]
+    +                                             ! 1 std::mutex::unlock()  (in libc++.1.dylib) + 0  [0x18d796028]
+    +                                             1 mlx::core::eval_impl(std::vector<mlx::core::array>, bool)  (in libmlx.dylib) + 3976  [0x10a9007f8]
+    +                                             1 mlx::core::gpu::eval(mlx::core::array&)  (in libmlx.dylib) + 2136  [0x10b55c878]
+    1923 Thread_74468342
+    + 1923 thread_start  (in libsystem_pthread.dylib) + 8  [0x18d87ec1c]
+    +   1923 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x18d883c58]
+    +     1923 std::__thread_proxy[abi:ue170006]<std::tuple<std::unique_ptr<std::__thread_struct>, arrow::internal::ThreadPool::LaunchWorkersUnlocked(int)::$_6>>(void*)  (in libarrow.2100.dylib) + 756  [0x1210b672c]
+    +       1923 std::condition_variable::wait(std::unique_lock<std::mutex>&)  (in libc++.1.dylib) + 32  [0x18d799858]
+    +         1923 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x18d884128]
+    +           1923 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18d84350c]
+    1923 Thread_74468343
+    + 1923 thread_start  (in libsystem_pthread.dylib) + 8  [0x18d87ec1c]
+    +   1923 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x18d883c58]
+    +     1923 std::__thread_proxy[abi:ue170006]<std::tuple<std::unique_ptr<std::__thread_struct>, arrow::internal::ThreadPool::LaunchWorkersUnlocked(int)::$_6>>(void*)  (in libarrow.2100.dylib) + 756  [0x1210b672c]
+    +       1923 std::condition_variable::wait(std::unique_lock<std::mutex>&)  (in libc++.1.dylib) + 32  [0x18d799858]
+    +         1923 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x18d884128]
+    +           1923 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18d84350c]
+    1923 Thread_74468344
+    + 1923 thread_start  (in libsystem_pthread.dylib) + 8  [0x18d87ec1c]
+    +   1923 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x18d883c58]
+    +     1923 std::__thread_proxy[abi:ue170006]<std::tuple<std::unique_ptr<std::__thread_struct>, arrow::internal::ThreadPool::LaunchWorkersUnlocked(int)::$_6>>(void*)  (in libarrow.2100.dylib) + 756  [0x1210b672c]
+    +       1923 std::condition_variable::wait(std::unique_lock<std::mutex>&)  (in libc++.1.dylib) + 32  [0x18d799858]
+    +         1923 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x18d884128]
+    +           1923 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18d84350c]
+    1923 Thread_74468345
+    + 1923 thread_start  (in libsystem_pthread.dylib) + 8  [0x18d87ec1c]
+    +   1923 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x18d883c58]
+    +     1923 std::__thread_proxy[abi:ue170006]<std::tuple<std::unique_ptr<std::__thread_struct>, arrow::internal::ThreadPool::LaunchWorkersUnlocked(int)::$_6>>(void*)  (in libarrow.2100.dylib) + 756  [0x1210b672c]
+    +       1923 std::condition_variable::wait(std::unique_lock<std::mutex>&)  (in libc++.1.dylib) + 32  [0x18d799858]
+    +         1923 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x18d884128]
+    +           1923 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18d84350c]
+    1923 Thread_74468346
+    + 1923 thread_start  (in libsystem_pthread.dylib) + 8  [0x18d87ec1c]
+    +   1923 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x18d883c58]
+    +     1923 std::__thread_proxy[abi:ue170006]<std::tuple<std::unique_ptr<std::__thread_struct>, arrow::internal::ThreadPool::LaunchWorkersUnlocked(int)::$_6>>(void*)  (in libarrow.2100.dylib) + 756  [0x1210b672c]
+    +       1923 std::condition_variable::wait(std::unique_lock<std::mutex>&)  (in libc++.1.dylib) + 32  [0x18d799858]
+    +         1923 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x18d884128]
+    +           1923 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18d84350c]
+    1923 Thread_74468347
+    + 1923 thread_start  (in libsystem_pthread.dylib) + 8  [0x18d87ec1c]
+    +   1923 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x18d883c58]
+    +     1923 std::__thread_proxy[abi:ue170006]<std::tuple<std::unique_ptr<std::__thread_struct>, arrow::internal::ThreadPool::LaunchWorkersUnlocked(int)::$_6>>(void*)  (in libarrow.2100.dylib) + 756  [0x1210b672c]
+    +       1923 std::condition_variable::wait(std::unique_lock<std::mutex>&)  (in libc++.1.dylib) + 32  [0x18d799858]
+    +         1923 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x18d884128]
+    +           1923 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18d84350c]
+    1923 Thread_74468348
+    + 1923 thread_start  (in libsystem_pthread.dylib) + 8  [0x18d87ec1c]
+    +   1923 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x18d883c58]
+    +     1923 std::__thread_proxy[abi:ue170006]<std::tuple<std::unique_ptr<std::__thread_struct>, arrow::internal::ThreadPool::LaunchWorkersUnlocked(int)::$_6>>(void*)  (in libarrow.2100.dylib) + 756  [0x1210b672c]
+    +       1923 std::condition_variable::wait(std::unique_lock<std::mutex>&)  (in libc++.1.dylib) + 32  [0x18d799858]
+    +         1923 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x18d884128]
+    +           1923 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18d84350c]
+    1923 Thread_74468349
+    + 1923 thread_start  (in libsystem_pthread.dylib) + 8  [0x18d87ec1c]
+    +   1923 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x18d883c58]
+    +     1923 std::__thread_proxy[abi:ue170006]<std::tuple<std::unique_ptr<std::__thread_struct>, arrow::internal::ThreadPool::LaunchWorkersUnlocked(int)::$_6>>(void*)  (in libarrow.2100.dylib) + 756  [0x1210b672c]
+    +       1923 std::condition_variable::wait(std::unique_lock<std::mutex>&)  (in libc++.1.dylib) + 32  [0x18d799858]
+    +         1923 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x18d884128]
+    +           1923 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18d84350c]
+    1923 Thread_74468350
+    + 1923 thread_start  (in libsystem_pthread.dylib) + 8  [0x18d87ec1c]
+    +   1923 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x18d883c58]
+    +     1923 std::__thread_proxy[abi:ue170006]<std::tuple<std::unique_ptr<std::__thread_struct>, arrow::internal::ThreadPool::LaunchWorkersUnlocked(int)::$_6>>(void*)  (in libarrow.2100.dylib) + 756  [0x1210b672c]
+    +       1923 std::condition_variable::wait(std::unique_lock<std::mutex>&)  (in libc++.1.dylib) + 32  [0x18d799858]
+    +         1923 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x18d884128]
+    +           1923 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18d84350c]
+    1923 Thread_74468351
+    + 1923 thread_start  (in libsystem_pthread.dylib) + 8  [0x18d87ec1c]
+    +   1923 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x18d883c58]
+    +     1923 std::__thread_proxy[abi:ue170006]<std::tuple<std::unique_ptr<std::__thread_struct>, arrow::internal::ThreadPool::LaunchWorkersUnlocked(int)::$_6>>(void*)  (in libarrow.2100.dylib) + 756  [0x1210b672c]
+    +       1923 std::condition_variable::wait(std::unique_lock<std::mutex>&)  (in libc++.1.dylib) + 32  [0x18d799858]
+    +         1923 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x18d884128]
+    +           1923 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18d84350c]
+    1923 Thread_74468352
+    + 1923 thread_start  (in libsystem_pthread.dylib) + 8  [0x18d87ec1c]
+    +   1923 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x18d883c58]
+    +     1923 std::__thread_proxy[abi:ue170006]<std::tuple<std::unique_ptr<std::__thread_struct>, arrow::internal::ThreadPool::LaunchWorkersUnlocked(int)::$_6>>(void*)  (in libarrow.2100.dylib) + 756  [0x1210b672c]
+    +       1923 std::condition_variable::wait(std::unique_lock<std::mutex>&)  (in libc++.1.dylib) + 32  [0x18d799858]
+    +         1923 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x18d884128]
+    +           1923 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18d84350c]
+    1923 Thread_74468353
+    + 1923 thread_start  (in libsystem_pthread.dylib) + 8  [0x18d87ec1c]
+    +   1923 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x18d883c58]
+    +     1923 std::__thread_proxy[abi:ue170006]<std::tuple<std::unique_ptr<std::__thread_struct>, arrow::internal::ThreadPool::LaunchWorkersUnlocked(int)::$_6>>(void*)  (in libarrow.2100.dylib) + 756  [0x1210b672c]
+    +       1923 std::condition_variable::wait(std::unique_lock<std::mutex>&)  (in libc++.1.dylib) + 32  [0x18d799858]
+    +         1923 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x18d884128]
+    +           1923 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18d84350c]
+    1923 Thread_74468354
+    + 1923 thread_start  (in libsystem_pthread.dylib) + 8  [0x18d87ec1c]
+    +   1923 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x18d883c58]
+    +     1923 std::__thread_proxy[abi:ue170006]<std::tuple<std::unique_ptr<std::__thread_struct>, arrow::internal::ThreadPool::LaunchWorkersUnlocked(int)::$_6>>(void*)  (in libarrow.2100.dylib) + 756  [0x1210b672c]
+    +       1923 std::condition_variable::wait(std::unique_lock<std::mutex>&)  (in libc++.1.dylib) + 32  [0x18d799858]
+    +         1923 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x18d884128]
+    +           1923 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18d84350c]
+    1923 Thread_74468355
+    + 1923 thread_start  (in libsystem_pthread.dylib) + 8  [0x18d87ec1c]
+    +   1923 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x18d883c58]
+    +     1923 std::__thread_proxy[abi:ue170006]<std::tuple<std::unique_ptr<std::__thread_struct>, arrow::internal::ThreadPool::LaunchWorkersUnlocked(int)::$_6>>(void*)  (in libarrow.2100.dylib) + 756  [0x1210b672c]
+    +       1923 std::condition_variable::wait(std::unique_lock<std::mutex>&)  (in libc++.1.dylib) + 32  [0x18d799858]
+    +         1923 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x18d884128]
+    +           1923 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18d84350c]
+    1923 Thread_74468356
+    + 1923 thread_start  (in libsystem_pthread.dylib) + 8  [0x18d87ec1c]
+    +   1923 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x18d883c58]
+    +     1923 std::__thread_proxy[abi:ue170006]<std::tuple<std::unique_ptr<std::__thread_struct>, arrow::internal::ThreadPool::LaunchWorkersUnlocked(int)::$_6>>(void*)  (in libarrow.2100.dylib) + 756  [0x1210b672c]
+    +       1923 std::condition_variable::wait(std::unique_lock<std::mutex>&)  (in libc++.1.dylib) + 32  [0x18d799858]
+    +         1923 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x18d884128]
+    +           1923 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18d84350c]
+    1923 Thread_74468357
+    + 1923 thread_start  (in libsystem_pthread.dylib) + 8  [0x18d87ec1c]
+    +   1923 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x18d883c58]
+    +     1923 std::__thread_proxy[abi:ue170006]<std::tuple<std::unique_ptr<std::__thread_struct>, arrow::internal::ThreadPool::LaunchWorkersUnlocked(int)::$_6>>(void*)  (in libarrow.2100.dylib) + 756  [0x1210b672c]
+    +       1923 std::condition_variable::wait(std::unique_lock<std::mutex>&)  (in libc++.1.dylib) + 32  [0x18d799858]
+    +         1923 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x18d884128]
+    +           1923 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18d84350c]
+    1923 Thread_74468358
+    + 1923 thread_start  (in libsystem_pthread.dylib) + 8  [0x18d87ec1c]
+    +   1923 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x18d883c58]
+    +     1923 std::__thread_proxy[abi:ue170006]<std::tuple<std::unique_ptr<std::__thread_struct>, arrow::internal::ThreadPool::LaunchWorkersUnlocked(int)::$_6>>(void*)  (in libarrow.2100.dylib) + 756  [0x1210b672c]
+    +       1923 std::condition_variable::wait(std::unique_lock<std::mutex>&)  (in libc++.1.dylib) + 32  [0x18d799858]
+    +         1923 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x18d884128]
+    +           1923 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18d84350c]
+    1923 Thread_74468359
+    + 1923 thread_start  (in libsystem_pthread.dylib) + 8  [0x18d87ec1c]
+    +   1923 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x18d883c58]
+    +     1923 std::__thread_proxy[abi:ue170006]<std::tuple<std::unique_ptr<std::__thread_struct>, arrow::internal::ThreadPool::LaunchWorkersUnlocked(int)::$_6>>(void*)  (in libarrow.2100.dylib) + 756  [0x1210b672c]
+    +       1923 std::condition_variable::wait(std::unique_lock<std::mutex>&)  (in libc++.1.dylib) + 32  [0x18d799858]
+    +         1923 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x18d884128]
+    +           1923 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18d84350c]
+    1923 Thread_74468360
+    + 1923 thread_start  (in libsystem_pthread.dylib) + 8  [0x18d87ec1c]
+    +   1923 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x18d883c58]
+    +     1923 std::__thread_proxy[abi:ue170006]<std::tuple<std::unique_ptr<std::__thread_struct>, arrow::internal::ThreadPool::LaunchWorkersUnlocked(int)::$_6>>(void*)  (in libarrow.2100.dylib) + 756  [0x1210b672c]
+    +       1923 std::condition_variable::wait(std::unique_lock<std::mutex>&)  (in libc++.1.dylib) + 32  [0x18d799858]
+    +         1923 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x18d884128]
+    +           1923 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18d84350c]
+    1923 Thread_74468361
+    + 1923 thread_start  (in libsystem_pthread.dylib) + 8  [0x18d87ec1c]
+    +   1923 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x18d883c58]
+    +     1923 std::__thread_proxy[abi:ue170006]<std::tuple<std::unique_ptr<std::__thread_struct>, arrow::internal::ThreadPool::LaunchWorkersUnlocked(int)::$_6>>(void*)  (in libarrow.2100.dylib) + 756  [0x1210b672c]
+    +       1923 std::condition_variable::wait(std::unique_lock<std::mutex>&)  (in libc++.1.dylib) + 32  [0x18d799858]
+    +         1923 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x18d884128]
+    +           1923 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18d84350c]
+    1923 Thread_74474728
+    + 1923 start_wqthread  (in libsystem_pthread.dylib) + 8  [0x18d87ec10]
+    +   1923 _pthread_wqthread  (in libsystem_pthread.dylib) + 368  [0x18d87ff0c]
+    +     1923 __workq_kernreturn  (in libsystem_kernel.dylib) + 8  [0x18d8419f0]
+    1367 Thread_74475218
+    + 1180 start_wqthread  (in libsystem_pthread.dylib) + 8  [0x18d87ec10]
+    + ! 1178 _pthread_wqthread  (in libsystem_pthread.dylib) + 368  [0x18d87ff0c]
+    + ! : 1178 __workq_kernreturn  (in libsystem_kernel.dylib) + 8  [0x18d8419f0]
+    + ! 2 _pthread_wqthread  (in libsystem_pthread.dylib) + 292  [0x18d87fec0]
+    + !   2 _dispatch_workloop_worker_thread  (in libdispatch.dylib) + 688  [0x18d6db714]
+    + !     2 _dispatch_event_loop_merge  (in libdispatch.dylib) + 148  [0x18d6eb6b8]
+    + !       1 _dispatch_mach_merge_msg  (in libdispatch.dylib) + 144  [0x18d6e2b5c]
+    + !       | 1 dispatch_mach_msg_create  (in libdispatch.dylib) + 152  [0x18d6e6290]
+    + !       |   1 _os_object_alloc_realized  (in libdispatch.dylib) + 32  [0x18d6c9850]
+    + !       |     1 class_createInstance  (in libobjc.A.dylib) + 76  [0x18d4277dc]
+    + !       |       1 malloc_type_calloc  (in libsystem_malloc.dylib) + 0  [0x18d694068]
+    + !       1 _dispatch_mach_merge_msg  (in libdispatch.dylib) + 204  [0x18d6e2b98]
+    + !         1 _dispatch_mach_handle_or_push_received_msg  (in libdispatch.dylib) + 172  [0x18d6e2dbc]
+    + 187 start_wqthread  (in libsystem_pthread.dylib) + 0  [0x18d87ec08]
+    1245 Thread_74479369
+    + 1070 start_wqthread  (in libsystem_pthread.dylib) + 8  [0x18d87ec10]
+    + ! 1070 _pthread_wqthread  (in libsystem_pthread.dylib) + 368  [0x18d87ff0c]
+    + !   1070 __workq_kernreturn  (in libsystem_kernel.dylib) + 8  [0x18d8419f0]
+    + 175 start_wqthread  (in libsystem_pthread.dylib) + 0  [0x18d87ec08]
+    1194 Thread_<multiple>   DispatchQueue_78: com.Metal.CommandQueueDispatch  (serial)
+    + 1194 start_wqthread  (in libsystem_pthread.dylib) + 8  [0x18d87ec10]
+    +   1194 _pthread_wqthread  (in libsystem_pthread.dylib) + 292  [0x18d87fec0]
+    +     1194 _dispatch_workloop_worker_thread  (in libdispatch.dylib) + 720  [0x18d6db734]
+    +       1194 _dispatch_root_queue_drain_deferred_wlh  (in libdispatch.dylib) + 284  [0x18d6dbe34]
+    +         1194 _dispatch_lane_invoke  (in libdispatch.dylib) + 392  [0x18d6d1b2c]
+    +           1194 _dispatch_lane_serial_drain  (in libdispatch.dylib) + 332  [0x18d6d0e98]
+    +             1194 _dispatch_source_invoke  (in libdispatch.dylib) + 844  [0x18d6dee84]
+    +               1194 _dispatch_source_latch_and_call  (in libdispatch.dylib) + 392  [0x18d6e01b0]
+    +                 1194 _dispatch_continuation_pop  (in libdispatch.dylib) + 596  [0x18d6cd1c8]
+    +                   1194 _dispatch_client_callout  (in libdispatch.dylib) + 16  [0x18d6e24b0]
+    +                     1191 -[_MTLCommandQueue _submitAvailableCommandBuffers]  (in Metal) + 512  [0x199eff718]
+    +                     ! 1191 -[IOGPUMetalCommandQueue submitCommandBuffers:count:]  (in IOGPU) + 72  [0x1b295b9e8]
+    +                     !   1190 -[IOGPUMetalCommandQueue _submitCommandBuffers:count:]  (in IOGPU) + 360  [0x1b295bb7c]
+    +                     !   : 1127 IOGPUCommandQueueSubmitCommandBuffers  (in IOGPU) + 272  [0x1b29731a0]
+    +                     !   : | 1127 IOConnectCallMethod  (in IOKit) + 176  [0x191bdcd84]
+    +                     !   : |   1126 io_connect_method  (in IOKit) + 520  [0x191bdcff4]
+    +                     !   : |   + 1126 mach_msg2_internal  (in libsystem_kernel.dylib) + 76  [0x18d852574]
+    +                     !   : |   +   1126 mach_msg2_trap  (in libsystem_kernel.dylib) + 8  [0x18d83fc34]
+    +                     !   : |   1 io_connect_method  (in IOKit) + 224  [0x191bdcecc]
+    +                     !   : |     1 __memcpy_chk  (in libsystem_c.dylib) + 20  [0x18d717b78]
+    +                     !   : 62 IOGPUCommandQueueSubmitCommandBuffers  (in IOGPU) + 184  [0x1b2973148]
+    +                     !   : | 62 iokit_user_client_trap  (in IOKit) + 8  [0x191bf8ae0]
+    +                     !   : 1 IOGPUCommandQueueSubmitCommandBuffers  (in IOGPU) + 140  [0x1b297311c]
+    +                     !   :   1 IOGPUNotificationQueueWillSubmit  (in IOGPU) + 32  [0x1b296588c]
+    +                     !   :     1 CFGetTypeID  (in CoreFoundation) + 0  [0x18d8e2f54]
+    +                     !   1 -[IOGPUMetalCommandQueue _submitCommandBuffers:count:]  (in IOGPU) + 248  [0x1b295bb0c]
+    +                     !     1 objc_msgSend  (in libobjc.A.dylib) + 0  [0x18d429800]
+    +                     1 -[_MTLCommandQueue _submitAvailableCommandBuffers]  (in Metal) + 72  [0x199eff560]
+    +                     ! 1 pthread_mutex_lock  (in libsystem_pthread.dylib) + 32  [0x18d87e41c]
+    +                     1 -[_MTLCommandQueue _submitAvailableCommandBuffers]  (in Metal) + 440  [0x199eff6d0]
+    +                     ! 1 -[NSMutableArray replaceObjectsInRange:withObjectsFromArray:range:]  (in CoreFoundation) + 316  [0x18d97bc00]
+    +                     !   1 -[__NSArrayM replaceObjectsInRange:withObjects:count:]  (in CoreFoundation) + 0  [0x18d915850]
+    +                     1 -[_MTLCommandQueue _submitAvailableCommandBuffers]  (in Metal) + 24  [0x199eff530]
+    944 Thread_74504967
+    + 944 start_wqthread  (in libsystem_pthread.dylib) + 8  [0x18d87ec10]
+    +   944 _pthread_wqthread  (in libsystem_pthread.dylib) + 368  [0x18d87ff0c]
+    +     944 __workq_kernreturn  (in libsystem_kernel.dylib) + 8  [0x18d8419f0]
+    40 Thread_<multiple>   DispatchQueue_81: com.Metal.CompletionQueueDispatch  (serial)
+      40 start_wqthread  (in libsystem_pthread.dylib) + 8  [0x18d87ec10]
+        40 _pthread_wqthread  (in libsystem_pthread.dylib) + 292  [0x18d87fec0]
+          40 _dispatch_workloop_worker_thread  (in libdispatch.dylib) + 720  [0x18d6db734]
+            40 _dispatch_root_queue_drain_deferred_wlh  (in libdispatch.dylib) + 284  [0x18d6dbe34]
+              40 _dispatch_lane_invoke  (in libdispatch.dylib) + 392  [0x18d6d1b2c]
+                40 _dispatch_lane_serial_drain  (in libdispatch.dylib) + 332  [0x18d6d0e98]
+                  40 _dispatch_lane_invoke  (in libdispatch.dylib) + 448  [0x18d6d1b64]
+                    40 _dispatch_lane_serial_drain  (in libdispatch.dylib) + 332  [0x18d6d0e98]
+                      40 _dispatch_mach_invoke  (in libdispatch.dylib) + 472  [0x18d6e5bec]
+                        40 _dispatch_lane_serial_drain  (in libdispatch.dylib) + 332  [0x18d6d0e98]
+                          40 _dispatch_mach_msg_invoke  (in libdispatch.dylib) + 480  [0x18d6e4e94]
+                            40 _dispatch_client_callout4  (in libdispatch.dylib) + 16  [0x18d6e24f8]
+                              40 __IOGPUNotificationQueueSetDispatchQueue_block_invoke  (in IOGPU) + 64  [0x1b296576c]
+                                40 IOGPUNotificationQueueDispatchAvailableCompletionNotifications  (in IOGPU) + 136  [0x1b296565c]
+                                  37 -[_MTLCommandQueue commandBufferDidComplete:startTime:completionTime:error:]  (in Metal) + 108  [0x199efff20]
+                                  ! 28 -[IOGPUMetalCommandBuffer didCompleteWithStartTime:endTime:error:]  (in IOGPU) + 220  [0x1b2959230]
+                                  ! : 28 -[_MTLCommandBuffer didCompleteWithStartTime:endTime:error:]  (in Metal) + 612  [0x199f0028c]
+                                  ! :   20 MTLDispatchListApply  (in Metal) + 60  [0x199effe90]
+                                  ! :   | 17 _Block_release  (in libsystem_blocks.dylib) + 236  [0x18d54f1c0]
+                                  ! :   | + 17 _call_dispose_helpers_excp  (in libsystem_blocks.dylib) + 48  [0x18d54f3fc]
+                                  ! :   | +   17 _Block_object_dispose  (in libsystem_blocks.dylib) + 256  [0x18d54ecf8]
+                                  ! :   | +     9 std::__function::__func<mlx::core::gpu::eval(mlx::core::array&)::$_1, void (MTL::CommandBuffer*)>::~__func()  (in libmlx.dylib) + 108  [0x10b55d754]
+                                  ! :   | +     ! 9 std::__shared_ptr_emplace<mlx::core::array::Data>::__on_zero_shared()  (in libmlx.dylib) + 52  [0x10a7c2d0c]
+                                  ! :   | +     !   6 mlx::core::metal::MetalAllocator::free(mlx::core::allocator::Buffer)  (in libmlx.dylib) + 96  [0x10b520d18]
+                                  ! :   | +     !   : 3 mlx::core::BufferCache<MTL::Buffer>::recycle_to_cache(MTL::Buffer*)  (in libmlx.dylib) + 176,180,...  [0x10b520e80,0x10b520e84,...]
+                                  ! :   | +     !   : 2 mlx::core::BufferCache<MTL::Buffer>::recycle_to_cache(MTL::Buffer*)  (in libmlx.dylib) + 240  [0x10b520ec0]
+                                  ! :   | +     !   : | 2 std::__tree_balance_after_insert[abi:nqe210106]<std::__tree_node_base<void*>*>(std::__tree_node_base<void*>*, std::__tree_node_base<void*>*)  (in libmlx.dylib) + 68  [0x10a7d269c]
+                                  ! :   | +     !   : 1 mlx::core::BufferCache<MTL::Buffer>::recycle_to_cache(MTL::Buffer*)  (in libmlx.dylib) + 120  [0x10b520e48]
+                                  ! :   | +     !   :   1 operator new(unsigned long)  (in libc++abi.dylib) + 52  [0x18d83a7e8]
+                                  ! :   | +     !   :     1 _xzm_xzone_malloc_tiny  (in libsystem_malloc.dylib) + 40  [0x18d6a5efc]
+                                  ! :   | +     !   1 mlx::core::metal::MetalAllocator::free(mlx::core::allocator::Buffer)  (in libmlx.dylib) + 56  [0x10b520cf0]
+                                  ! :   | +     !   : 1 DYLD-STUB$$objc_msgSend  (in libmlx.dylib) + 4  [0x10b5c6718]
+                                  ! :   | +     !   1 mlx::core::metal::MetalAllocator::free(mlx::core::allocator::Buffer)  (in libmlx.dylib) + 0  [0x10b520cb8]
+                                  ! :   | +     !   1 std::__function::__func<void (*)(mlx::core::allocator::Buffer), void (mlx::core::allocator::Buffer)>::operator()(mlx::core::allocator::Buffer&&)  (in libmlx.dylib) + 0  [0x10a7c2774]
+                                  ! :   | +     4 std::__function::__func<mlx::core::metal::CommandEncoder::end_encoding()::$_0, void (MTL::CommandBuffer*)>::~__func()  (in libmlx.dylib) + 32  [0x10b54f8bc]
+                                  ! :   | +     ! 3 mlx::core::metal::CommandEncoder::end_encoding()::$_0::~$_0()  (in libmlx.dylib) + 48  [0x10b54b0d8]
+                                  ! :   | +     ! : 3 -[IOGPUMetalFence dealloc]  (in IOGPU) + 40  [0x1b2965054]
+                                  ! :   | +     ! :   1 -[IOGPUMTLFence dealloc]  (in IOGPU) + 84  [0x1b2974a2c]
+                                  ! :   | +     ! :   | 1 IOConnectCallMethod  (in IOKit) + 176  [0x191bdcd84]
+                                  ! :   | +     ! :   |   1 io_connect_method  (in IOKit) + 520  [0x191bdcff4]
+                                  ! :   | +     ! :   |     1 mach_msg2_internal  (in libsystem_kernel.dylib) + 76  [0x18d852574]
+                                  ! :   | +     ! :   |       1 mach_msg2_trap  (in libsystem_kernel.dylib) + 8  [0x18d83fc34]
+                                  ! :   | +     ! :   1 -[IOGPUMTLFence dealloc]  (in IOGPU) + 120  [0x1b2974a50]
+                                  ! :   | +     ! :   | 1 _xzm_free  (in libsystem_malloc.dylib) + 28  [0x18d6a1088]
+                                  ! :   | +     ! :   1 -[IOGPUMTLFence dealloc]  (in IOGPU) + 0  [0x1b29749d8]
+                                  ! :   | +     ! 1 mlx::core::metal::CommandEncoder::end_encoding()::$_0::~$_0()  (in libmlx.dylib) + 96  [0x10b54b108]
+                                  ! :   | +     !   1 _xzm_free  (in libsystem_malloc.dylib) + 28  [0x18d6a1088]
+                                  ! :   | +     2 std::__function::__func<mlx::core::gpu::eval(mlx::core::array&)::$_1, void (MTL::CommandBuffer*)>::~__func()  (in libmlx.dylib) + 52,124  [0x10b55d71c,0x10b55d764]
+                                  ! :   | +     1 std::__function::__func<mlx::core::gpu::eval(mlx::core::array&)::$_0, void (MTL::CommandBuffer*)>::~__func()  (in libmlx.dylib) + 108  [0x10b55d2b4]
+                                  ! :   | +     ! 1 std::__shared_ptr_emplace<mlx::core::array::Data>::__on_zero_shared()  (in libmlx.dylib) + 52  [0x10a7c2d0c]
+                                  ! :   | +     !   1 ???  (in core.cpython-313-darwin.so)  load address 0x109190000 + 0x557b8  [0x1091e57b8]
+                                  ! :   | +     1 std::__function::__func<mlx::core::gpu::eval(mlx::core::array&)::$_1, void (MTL::CommandBuffer*)>::~__func()  (in libmlx.dylib) + 56  [0x10b55d720]
+                                  ! :   | +       1 _xzm_free  (in libsystem_malloc.dylib) + 352  [0x18d6a11cc]
+                                  ! :   | +         1 DYLD-STUB$$_platform_bzero  (in libsystem_malloc.dylib) + 4  [0x18d6b87f0]
+                                  ! :   | 3 _Block_release  (in libsystem_blocks.dylib) + 252  [0x18d54f1d0]
+                                  ! :   |   3 objc_destructInstance  (in libobjc.A.dylib) + 44  [0x18d42b3b8]
+                                  ! :   |     1 objc_destructInstance_nonnull_realized(objc_object*)  (in libobjc.A.dylib) + 92  [0x18d45a114]
+                                  ! :   |     ! 1 objc::DenseMapBase<objc::DenseMap<DisguisedPtr<objc_object>, objc::DenseMap<void const*, objc::ObjcAssociation, objc::DenseMapValueInfo<objc::ObjcAssociation>, objc::DenseMapInfo<void const*>, objc::detail::DenseMapPair<void const*, objc::ObjcAssociation>>, objc::DenseMapValueInfo<objc::DenseMap<void const*, objc::ObjcAssociation, objc::DenseMapValueInfo<objc::ObjcAssociation>, objc::DenseMapInfo<void const*>, objc::detail::DenseMapPair<void const*, objc::ObjcAssociation>>>, objc::DenseMapInfo<DisguisedPtr<objc_object>>, objc::detail::DenseMapPair<DisguisedPtr<objc_object>, objc::DenseMap<void const*, objc::ObjcAssociation, objc::DenseMapValueInfo<objc::ObjcAssociation>, objc::DenseMapInfo<void const*>, objc::detail::DenseMapPair<void const*, objc::ObjcAssociation>>>>, DisguisedPtr<objc_object>, objc::DenseMap<void const*, objc::ObjcAssociation, objc::DenseMapValueInfo<objc::ObjcAssociation>, objc::DenseMapInfo<void const*>, objc::detail::DenseMapPair<void const*, objc::ObjcAssociation>>, objc::DenseMapValueInfo<objc::DenseMap<void const*, objc::ObjcAssociation, objc::DenseMapValueInfo<objc::ObjcAssociation>, objc::DenseMapInfo<void const*>, objc::detail::DenseMapPair<void const*, objc::ObjcAssociation>>>, objc::DenseMapInfo<DisguisedPtr<objc_object>>, objc::detail::DenseMapPair<DisguisedPtr<objc_object>, objc::DenseMap<void const*, objc::ObjcAssociation, objc::DenseMapValueInfo<objc::ObjcAssociation>, objc::DenseMapInfo<void const*>, objc::detail::DenseMapPair<void const*, objc::ObjcAssociation>>>>::find(DisguisedPtr<objc_object> const&)  (in libobjc.A.dylib) + 164  [0x18d45cecc]
+                                  ! :   |     1 objc_destructInstance_nonnull_realized(objc_object*)  (in libobjc.A.dylib) + 152  [0x18d45a150]
+                                  ! :   |     ! 1 objc_object::sidetable_clearDeallocating()  (in libobjc.A.dylib) + 96  [0x18d42b538]
+                                  ! :   |     !   1 objc::DenseMapBase<objc::DenseMap<DisguisedPtr<objc_object const>, unsigned long, (anonymous namespace)::RefcountMapValuePurgeable, objc::DenseMapInfo<DisguisedPtr<objc_object const>>, objc::detail::DenseMapPair<DisguisedPtr<objc_object const>, unsigned long>>, DisguisedPtr<objc_object const>, unsigned long, (anonymous namespace)::RefcountMapValuePurgeable, objc::DenseMapInfo<DisguisedPtr<objc_object const>>, objc::detail::DenseMapPair<DisguisedPtr<objc_object const>, unsigned long>>::find(DisguisedPtr<objc_object const> const&)  (in libobjc.A.dylib) + 36  [0x18d45e834]
+                                  ! :   |     !     1 objc::DenseMapBase<objc::DenseMap<DisguisedPtr<objc_object const>, unsigned long, (anonymous namespace)::RefcountMapValuePurgeable, objc::DenseMapInfo<DisguisedPtr<objc_object const>>, objc::detail::DenseMapPair<DisguisedPtr<objc_object const>, unsigned long>>, DisguisedPtr<objc_object const>, unsigned long, (anonymous namespace)::RefcountMapValuePurgeable, objc::DenseMapInfo<DisguisedPtr<objc_object const>>, objc::detail::DenseMapPair<DisguisedPtr<objc_object const>, unsigned long>>::LookupBucketFor<DisguisedPtr<objc_object const>>(DisguisedPtr<objc_object const> const&, objc::detail::DenseMapPair<DisguisedPtr<objc_object const>, unsigned long>*&)  (in libobjc.A.dylib) + 20  [0x18d45e894]
+                                  ! :   |     1 objc_destructInstance_nonnull_realized(objc_object*)  (in libobjc.A.dylib) + 116  [0x18d45a12c]
+                                  ! :   8 MTLDispatchListApply  (in Metal) + 52  [0x199effe88]
+                                  ! :     7 invocation function for block in MTL::CommandBuffer::addCompletedHandler(std::function<void (MTL::CommandBuffer*)> const&)  (in libmlx.dylib) + 48  [0x10b55cdfc]
+                                  ! :     + 3 std::__function::__func<mlx::core::gpu::eval(mlx::core::array&)::$_0, void (MTL::CommandBuffer*)>::operator()(MTL::CommandBuffer*&&)  (in libmlx.dylib) + 68  [0x10b55d478]
+                                  ! :     + ! 3 std::condition_variable::notify_all()  (in libc++.1.dylib) + 16  [0x18d796054]
+                                  ! :     + !   3 pthread_cond_broadcast  (in libsystem_pthread.dylib) + 696  [0x18d87efbc]
+                                  ! :     + !     3 __psynch_cvbroad  (in libsystem_kernel.dylib) + 8  [0x18d843538]
+                                  ! :     + 1 mlx::core::gpu::check_error(MTL::CommandBuffer*)  (in libmlx.dylib) + 40  [0x10b55d520]
+                                  ! :     + 1 std::__function::__func<mlx::core::gpu::eval(mlx::core::array&)::$_0, void (MTL::CommandBuffer*)>::operator()(MTL::CommandBuffer*&&)  (in libmlx.dylib) + 0  [0x10b55d434]
+                                  ! :     + 1 std::__function::__func<mlx::core::gpu::eval(mlx::core::array&)::$_1, void (MTL::CommandBuffer*)>::operator()(MTL::CommandBuffer*&&)  (in libmlx.dylib) + 0  [0x10b55d8b4]
+                                  ! :     + 1 std::__function::__func<mlx::core::gpu::finalize(mlx::core::Stream)::$_0, void (MTL::CommandBuffer*)>::operator()(MTL::CommandBuffer*&&)  (in libmlx.dylib) + 0  [0x10b55d97c]
+                                  ! :     1 invocation function for block in MTL::CommandBuffer::addCompletedHandler(std::function<void (MTL::CommandBuffer*)> const&)  (in libmlx.dylib) + 48  [0x10b54e26c]
+                                  ! :       1 std::__function::__func<mlx::core::metal::CommandEncoder::end_encoding()::$_0, void (MTL::CommandBuffer*)>::operator()(MTL::CommandBuffer*&&)  (in libmlx.dylib) + 84  [0x10b54f994]
+                                  ! :         1 <deduplicated_symbol>  (in libmlx.dylib) + 204  [0x10b486d6c]
+                                  ! 9 -[IOGPUMetalCommandBuffer didCompleteWithStartTime:endTime:error:]  (in IOGPU) + 240  [0x1b2959244]
+                                  !   8 IOGPUMetalCommandBufferStorageDealloc  (in IOGPU) + 76  [0x1b2967568]
+                                  !   | 7 IOGPUMetalCommandBufferStorageReset  (in IOGPU) + 52  [0x1b29675dc]
+                                  !   | + 6 -[MTLResourceList releaseAllObjectsAndReset]  (in Metal) + 96  [0x199f00550]
+                                  !   | + ! 5 _platform_memset  (in libsystem_platform.dylib) + 140,148  [0x18d88d17c,0x18d88d184]
+                                  !   | + ! 1 __bzero  (in libsystem_platform.dylib) + 24  [0x18d88d0a8]
+                                  !   | + 1 MTLResourceListChunkFreeEntries(MTLResourceListChunk*)  (in Metal) + 92  [0x19a097e94]
+                                  !   | 1 IOGPUMetalCommandBufferStorageReset  (in IOGPU) + 124  [0x1b2967624]
+                                  !   |   1 _iogpuMetalCommandBufferStorageReleaseCurrentResources(IOGPUMetalCommandBufferStorage*)  (in IOGPU) + 60  [0x1b29677d0]
+                                  !   |     1 IOGPUMetalPooledResourceRelease  (in IOGPU) + 252  [0x1b296b4e4]
+                                  !   |       1 mach_absolute_time  (in libsystem_kernel.dylib) + 108  [0x18d84010c]
+                                  !   1 IOGPUMetalCommandBufferStorageDealloc  (in IOGPU) + 36  [0x1b2967540]
+                                  !     1 IOGPUMetalDeviceShmemUpdateTrimLevel  (in IOGPU) + 120  [0x1b296174c]
+                                  2 -[_MTLCommandQueue commandBufferDidComplete:startTime:completionTime:error:]  (in Metal) + 144  [0x199efff44]
+                                  ! 2 -[NSMutableArray removeObject:]  (in CoreFoundation) + 128  [0x18d9311c0]
+                                  !   1 -[__NSArrayM removeObjectAtIndex:]  (in CoreFoundation) + 0  [0x18d91ad90]
+                                  !   1 -[__NSArrayM removeObjectsInRange:]  (in CoreFoundation) + 204  [0x18d91aecc]
+                                  !     1 objc_msgSend$count  (in CoreFoundation) + 0  [0x18de1ba40]
+                                  1 __62-[IOGPUMetalCommandBuffer fillCommandBufferArgs:commandQueue:]_block_invoke.52  (in IOGPU) + 72  [0x1b295a7ec]
+                                    1 -[_MTLCommandBuffer globalTraceObjectID]  (in Metal) + 0  [0x19a0a8f48]
+
+Total number in stack (recursive counted multiple, when >=5):
+        21       __psynch_cvwait  (in libsystem_kernel.dylib) + 0  [0x18d843504]
+        21       _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x18d884128]
+        21       std::condition_variable::wait(std::unique_lock<std::mutex>&)  (in libc++.1.dylib) + 32  [0x18d799858]
+        20       _pthread_start  (in libsystem_pthread.dylib) + 136  [0x18d883c58]
+        20       std::__thread_proxy[abi:ue170006]<std::tuple<std::unique_ptr<std::__thread_struct>, arrow::internal::ThreadPool::LaunchWorkersUnlocked(int)::$_6>>(void*)  (in libarrow.2100.dylib) + 756  [0x1210b672c]
+        20       thread_start  (in libsystem_pthread.dylib) + 8  [0x18d87ec1c]
+        7       mlx::core::metal::MetalAllocator::malloc(unsigned long)  (in libmlx.dylib) + 120  [0x10b5202e4]
+        6       start_wqthread  (in libsystem_pthread.dylib) + 8  [0x18d87ec10]
+        5       _platform_memset  (in libsystem_platform.dylib) + 0  [0x18d88d0f0]
+        5       _xzm_free  (in libsystem_malloc.dylib) + 0  [0x18d6a106c]
+        5       mlx::core::BufferCache<MTL::Buffer>::reuse_from_cache(unsigned long)  (in libmlx.dylib) + 0  [0x10b5206f8]
+
+Sort by top of stack, same collapsed (when >= 5):
+        __psynch_cvwait  (in libsystem_kernel.dylib)        40285
+        __workq_kernreturn  (in libsystem_kernel.dylib)        5115
+        mach_msg2_trap  (in libsystem_kernel.dylib)        1133
+        start_wqthread  (in libsystem_pthread.dylib)        362
+        iokit_user_client_trap  (in IOKit)        62
+        _platform_memset  (in libsystem_platform.dylib)        9
+        mlx::core::BufferCache<MTL::Buffer>::reuse_from_cache(unsigned long)  (in libmlx.dylib)        7
+        _xzm_free  (in libsystem_malloc.dylib)        5
+
+Binary Images:
+       0x102fcc000 -        0x102fcd15f +org.python.python (3.13.12 - 3.13.12) <9209EAD6-58C4-3977-9917-396CDC844F61> /opt/homebrew/*/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python
+       0x103108000 -        0x103109ab7 +grp.cpython-313-darwin.so (0) <901CD3EA-CA8C-300A-8FEF-B35D13AA4456> /opt/homebrew/*/Python.framework/Versions/3.13/lib/python3.13/lib-dynload/grp.cpython-313-darwin.so
+       0x10311c000 -        0x10311ee37 +_bz2.cpython-313-darwin.so (0) <4568FF42-D5DF-3911-8858-D55E7AEA6AA5> /opt/homebrew/*/Python.framework/Versions/3.13/lib/python3.13/lib-dynload/_bz2.cpython-313-darwin.so
+       0x103134000 -        0x10313af13 +zlib.cpython-313-darwin.so (0) <EB2FA8B8-2BAF-37C4-8D10-747EC2646C2C> /opt/homebrew/*/Python.framework/Versions/3.13/lib/python3.13/lib-dynload/zlib.cpython-313-darwin.so
+       0x10314c000 -        0x10314e4e3 +_bisect.cpython-313-darwin.so (0) <CB604BD6-4FA2-3841-9495-0C33A0B8DE53> /opt/homebrew/*/Python.framework/Versions/3.13/lib/python3.13/lib-dynload/_bisect.cpython-313-darwin.so
+       0x103164000 -        0x103169423 +_lzma.cpython-313-darwin.so (0) <5D1565B0-8896-3716-B921-F79F21102A9A> /opt/homebrew/*/Python.framework/Versions/3.13/lib/python3.13/lib-dynload/_lzma.cpython-313-darwin.so
+       0x10317c000 -        0x10317de97 +_random.cpython-313-darwin.so (0) <DE7B07B7-CC7A-36F3-B725-759B10FF89A2> /opt/homebrew/*/Python.framework/Versions/3.13/lib/python3.13/lib-dynload/_random.cpython-313-darwin.so
+       0x103198000 -        0x1031a22d7 +math.cpython-313-darwin.so (0) <37236F96-C7A8-3D40-8BD9-0E003FAEF653> /opt/homebrew/*/Python.framework/Versions/3.13/lib/python3.13/lib-dynload/math.cpython-313-darwin.so
+       0x10352c000 -        0x10352e703 +_opcode.cpython-313-darwin.so (0) <20B3C747-05B5-3C4A-997F-561F077440FE> /opt/homebrew/*/Python.framework/Versions/3.13/lib/python3.13/lib-dynload/_opcode.cpython-313-darwin.so
+       0x103540000 -        0x103542d1b +fcntl.cpython-313-darwin.so (0) <04EC5DF1-E206-37A6-9F32-CA023F51E3E0> /opt/homebrew/*/Python.framework/Versions/3.13/lib/python3.13/lib-dynload/fcntl.cpython-313-darwin.so
+       0x103670000 -        0x10368dd67 +liblzma.5.dylib (0) <57936B02-C7C3-3F09-B4C2-9CC839371091> /opt/homebrew/*/liblzma.5.dylib
+       0x1036a0000 -        0x1036a29df +_posixsubprocess.cpython-313-darwin.so (0) <C9E9D4BF-E6CF-3EFB-BF38-E8DF02147C29> /opt/homebrew/*/Python.framework/Versions/3.13/lib/python3.13/lib-dynload/_posixsubprocess.cpython-313-darwin.so
+       0x1036b4000 -        0x1036b5057 +_statistics.cpython-313-darwin.so (0) <6BCA5611-2E71-34CD-B239-85BB5DE0DF89> /opt/homebrew/*/Python.framework/Versions/3.13/lib/python3.13/lib-dynload/_statistics.cpython-313-darwin.so
+       0x1036cc000 -        0x1036d0b53 +select.cpython-313-darwin.so (0) <759C56DB-E50C-3F29-A308-43D675E11648> /opt/homebrew/*/Python.framework/Versions/3.13/lib/python3.13/lib-dynload/select.cpython-313-darwin.so
+       0x1036e4000 -        0x1036e4aff +_contextvars.cpython-313-darwin.so (0) <DE8CB71A-7F94-3278-99FA-27E57515D188> /opt/homebrew/*/Python.framework/Versions/3.13/lib/python3.13/lib-dynload/_contextvars.cpython-313-darwin.so
+       0x1036f8000 -        0x103a7b1af +org.python.python (3.13.12, [c] 2001-2024 Python Software Foundation. - 3.13.12) <C9C81752-C429-3A5C-89FA-5D685BAE14BB> /opt/homebrew/*/Python.framework/Versions/3.13/Python
+       0x10874c000 -        0x108751af3 +_json.cpython-313-darwin.so (0) <14CCC29C-C364-3BA0-8D26-C2A28A855A2E> /opt/homebrew/*/Python.framework/Versions/3.13/lib/python3.13/lib-dynload/_json.cpython-313-darwin.so
+       0x10877c000 -        0x108781e53 +_struct.cpython-313-darwin.so (0) <9AC37F82-94CF-3A94-B0A8-35A644616F92> /opt/homebrew/*/Python.framework/Versions/3.13/lib/python3.13/lib-dynload/_struct.cpython-313-darwin.so
+       0x108794000 -        0x1087afe9f +_decimal.cpython-313-darwin.so (0) <7F46212C-64E4-3720-96A3-4D9F0812C8F8> /opt/homebrew/*/Python.framework/Versions/3.13/lib/python3.13/lib-dynload/_decimal.cpython-313-darwin.so
+       0x1087c4000 -        0x1087df4e7 +libmpdec.4.0.1.dylib (0) <52D16117-FCF0-3704-984F-CE4454923A78> /opt/homebrew/*/libmpdec.4.0.1.dylib
+       0x1087f4000 -        0x10880300b +_datetime.cpython-313-darwin.so (0) <DDCC1833-3354-3EB1-B0D3-D4B98044CA57> /opt/homebrew/*/Python.framework/Versions/3.13/lib/python3.13/lib-dynload/_datetime.cpython-313-darwin.so
+       0x108934000 -        0x108936097 +libtorch_global_deps.dylib (0) <FE8E7A3C-EA05-3D6A-AFAC-83F36D1AFB38> /Volumes/*/libtorch_global_deps.dylib
+       0x10893c000 -        0x10893ed67 +libtorch.dylib (0) <58A83E6E-3CE0-3B41-B92F-FF3B3D0D6DE5> /Volumes/*/libtorch.dylib
+       0x108944000 -        0x108958263 +_pickle.cpython-313-darwin.so (0) <4E108487-688C-3844-9E51-23701AC07F01> /opt/homebrew/*/Python.framework/Versions/3.13/lib/python3.13/lib-dynload/_pickle.cpython-313-darwin.so
+       0x108970000 -        0x108983d23 +_ctypes.cpython-313-darwin.so (0) <5FCF4528-5C2E-369F-BB00-F338F52AB8E3> /opt/homebrew/*/Python.framework/Versions/3.13/lib/python3.13/lib-dynload/_ctypes.cpython-313-darwin.so
+       0x108a98000 -        0x108aafff3 +_umath_linalg.cpython-313-darwin.so (0) <FF72B3B7-3538-3670-8B97-763B7562B062> /Volumes/*/_umath_linalg.cpython-313-darwin.so
+       0x108ac0000 -        0x108ac80a3 +array.cpython-313-darwin.so (0) <54A15736-0E81-3E5B-A6AF-7563547AE7D0> /opt/homebrew/*/Python.framework/Versions/3.13/lib/python3.13/lib-dynload/array.cpython-313-darwin.so
+       0x108b50000 -        0x108b53d9b +binascii.cpython-313-darwin.so (0) <0E45F447-F889-32A9-848E-E086617598F2> /opt/homebrew/*/Python.framework/Versions/3.13/lib/python3.13/lib-dynload/binascii.cpython-313-darwin.so
+       0x108b64000 -        0x108b65c97 +resource.cpython-313-darwin.so (0) <F005EF83-730B-31AF-A01B-97D13D8CFDD4> /opt/homebrew/*/Python.framework/Versions/3.13/lib/python3.13/lib-dynload/resource.cpython-313-darwin.so
+       0x108b78000 -        0x108e63fff +_multiarray_umath.cpython-313-darwin.so (0) <E27FECD6-F5A7-392C-9E29-2D02ADD2EA8C> /Volumes/*/_multiarray_umath.cpython-313-darwin.so
+       0x109094000 -        0x10909a6a7 +_blake2.cpython-313-darwin.so (0) <C76ED37E-8F35-3B0E-8709-DF084C0D70B7> /opt/homebrew/*/Python.framework/Versions/3.13/lib/python3.13/lib-dynload/_blake2.cpython-313-darwin.so
+       0x1090b0000 -        0x1090b790f +_hashlib.cpython-313-darwin.so (0) <7EC143B8-FA5E-3FFA-A550-DA580A666B13> /opt/homebrew/*/Python.framework/Versions/3.13/lib/python3.13/lib-dynload/_hashlib.cpython-313-darwin.so
+       0x1090cc000 -        0x1090cdae7 +_scproxy.cpython-313-darwin.so (0) <F2665292-3546-39B6-BE2C-F139509BB65B> /opt/homebrew/*/Python.framework/Versions/3.13/lib/python3.13/lib-dynload/_scproxy.cpython-313-darwin.so
+       0x1090e0000 -        0x1090e0ec3 +_speedups.cpython-313-darwin.so (0) <17AB7E07-A7AC-3A0C-84E0-4812FFAB207B> /Volumes/*/_speedups.cpython-313-darwin.so
+       0x1090f0000 -        0x1090fe107 +_socket.cpython-313-darwin.so (0) <76830EC6-404A-352C-8CB9-3A9E15E9B474> /opt/homebrew/*/Python.framework/Versions/3.13/lib/python3.13/lib-dynload/_socket.cpython-313-darwin.so
+       0x109114000 -        0x10911782f +mmap.cpython-313-darwin.so (0) <9AB243BC-6A9F-386F-925A-D80ABC1DF11F> /opt/homebrew/*/Python.framework/Versions/3.13/lib/python3.13/lib-dynload/mmap.cpython-313-darwin.so
+       0x109128000 -        0x10912b4ef +_heapq.cpython-313-darwin.so (0) <3217C9B2-92C3-3831-B468-F9ABF2F343FD> /opt/homebrew/*/Python.framework/Versions/3.13/lib/python3.13/lib-dynload/_heapq.cpython-313-darwin.so
+       0x10914c000 -        0x109164ef7 +_ssl.cpython-313-darwin.so (0) <C311BC44-DC9E-3038-A656-B4C1D1EE8737> /opt/homebrew/*/Python.framework/Versions/3.13/lib/python3.13/lib-dynload/_ssl.cpython-313-darwin.so
+       0x109190000 -        0x1092d681f +core.cpython-313-darwin.so (0) <F23DD1B0-4D24-3088-B3EA-279D5294B3E1> /Volumes/*/core.cpython-313-darwin.so
+       0x10930c000 -        0x1093cf10f +libjaccl.dylib (0) <CD16447E-DE47-348A-A80E-41A2700D4470> /Volumes/*/libjaccl.dylib
+       0x10a3b0000 -        0x10a3b0b6b +_uuid.cpython-313-darwin.so (0) <0AE265BD-8E7A-3451-A63D-2166F2A8762C> /opt/homebrew/*/Python.framework/Versions/3.13/lib/python3.13/lib-dynload/_uuid.cpython-313-darwin.so
+       0x10a3d0000 -        0x10a3d944f +_asyncio.cpython-313-darwin.so (0) <22D4BE3B-788F-34F8-9530-D04B53719911> /opt/homebrew/*/Python.framework/Versions/3.13/lib/python3.13/lib-dynload/_asyncio.cpython-313-darwin.so
+       0x10a3f0000 -        0x10a3f1faf +_queue.cpython-313-darwin.so (0) <8B624A23-B13C-374E-9FDE-30EC06932383> /opt/homebrew/*/Python.framework/Versions/3.13/lib/python3.13/lib-dynload/_queue.cpython-313-darwin.so
+       0x10a404000 -        0x10a4088af +_csv.cpython-313-darwin.so (0) <DFF85F2B-302C-365C-9EA3-92978DCEE0B1> /opt/homebrew/*/Python.framework/Versions/3.13/lib/python3.13/lib-dynload/_csv.cpython-313-darwin.so
+       0x10a41c000 -        0x10a41d963 +libXau.6.dylib (0) <CBBC6AAD-C544-3D83-A1C4-59709F2BDECA> /Volumes/*/libXau.6.dylib
+       0x10a430000 -        0x10a441943 +_sqlite3.cpython-313-darwin.so (0) <DE02057F-D33A-30B9-AE6A-E5C73037B7A3> /opt/homebrew/*/Python.framework/Versions/3.13/lib/python3.13/lib-dynload/_sqlite3.cpython-313-darwin.so
+       0x10a45c000 -        0x10a45c5f3 +_C.cpython-313-darwin.so (0) <65D96032-750E-310F-93B0-703236F45B36> /Volumes/*/_C.cpython-313-darwin.so
+       0x10a46c000 -        0x10a4733cb +libshm.dylib (0) <8A1C1CE3-8607-3BEB-BAEA-E7AC47D19263> /Volumes/*/libshm.dylib
+       0x10a488000 -        0x10a517ba7 +libssl.3.dylib (0) <704BF8E6-0DEC-398E-986F-2EB58F3C6B3C> /opt/homebrew/*/libssl.3.dylib
+       0x10a660000 -        0x10a70607f +unicodedata.cpython-313-darwin.so (0) <4BE0461D-807A-3C8D-B7F8-A52E9231AA7C> /opt/homebrew/*/Python.framework/Versions/3.13/lib/python3.13/lib-dynload/unicodedata.cpython-313-darwin.so
+       0x10a718000 -        0x10a754fdf +_yaml.cpython-313-darwin.so (0) <DAF9015F-72DD-3BFE-B679-377D3B6E39A9> /Volumes/*/_yaml.cpython-313-darwin.so
+       0x10a778000 -        0x10a792ebf +libz.1.3.1.zlib-ng.dylib (0) <A0DBEA0E-227E-3C20-8CEF-DEC8CB0977EB> /Volumes/*/libz.1.3.1.zlib-ng.dylib
+       0x10a7b8000 -        0x10b744b9f +libmlx.dylib (0) <1C1E26E2-4D05-3F2B-8A3B-018F42B1A5D4> /Volumes/*/libmlx.dylib
+       0x10de38000 -        0x10e17710f +libcrypto.3.dylib (0) <6D7E86A1-BA7D-3B61-BFC7-248B1221632E> /opt/homebrew/*/libcrypto.3.dylib
+       0x10e9d8000 -        0x10e9da2b7 +_multiprocessing.cpython-313-darwin.so (0) <3F967EAC-573C-3BF8-950E-27D4C67B9898> /opt/homebrew/*/Python.framework/Versions/3.13/lib/python3.13/lib-dynload/_multiprocessing.cpython-313-darwin.so
+       0x10e9f0000 -        0x10e9f54c7 +cmath.cpython-313-darwin.so (0) <DDBB2828-20F9-3F1B-A776-D369037A14B8> /opt/homebrew/*/Python.framework/Versions/3.13/lib/python3.13/lib-dynload/cmath.cpython-313-darwin.so
+       0x10ea10000 -        0x10eb16f6f +libsqlite3.3.53.0.dylib (0) <2DB78708-D21E-370C-BCE3-ECFAAF8596AE> /opt/homebrew/*/libsqlite3.3.53.0.dylib
+       0x10f048000 -        0x10f048ffb +_posixshmem.cpython-313-darwin.so (0) <FF8BF876-F876-309F-9CE3-17792ADBD750> /opt/homebrew/*/Python.framework/Versions/3.13/lib/python3.13/lib-dynload/_posixshmem.cpython-313-darwin.so
+       0x10f05c000 -        0x10f05f1ff +_lsprof.cpython-313-darwin.so (0) <33A91BAE-2933-31C4-BBA2-5E528B2813D3> /opt/homebrew/*/Python.framework/Versions/3.13/lib/python3.13/lib-dynload/_lsprof.cpython-313-darwin.so
+       0x10f070000 -        0x10f072e77 +termios.cpython-313-darwin.so (0) <6898B736-9701-3C25-BB09-940F79583F8E> /opt/homebrew/*/Python.framework/Versions/3.13/lib/python3.13/lib-dynload/termios.cpython-313-darwin.so
+       0x10f08c000 -        0x10f0b07ff +libxcb.1.1.0.dylib (0) <B8CC0BB4-84BD-3527-9E9B-0B07096D9206> /Volumes/*/libxcb.1.1.0.dylib
+       0x10f0e8000 -        0x10f0f3ffb +_sfc64.cpython-313-darwin.so (0) <52272A3E-641F-3E03-B501-2AC11B6BAC19> /Volumes/*/_sfc64.cpython-313-darwin.so
+       0x10f10c000 -        0x10f1acc47 +_regex.cpython-313-darwin.so (0) <AEA3289B-6BE2-33B4-9818-665047754AC8> /Volumes/*/_regex.cpython-313-darwin.so
+       0x10f4d0000 -        0x10f52df7f +_imaging.cpython-313-darwin.so (0) <5772F509-C9DB-3507-9A28-5340B3339723> /Volumes/*/_imaging.cpython-313-darwin.so
+       0x10f55c000 -        0x10f5fba83 +libtiff.6.dylib (0) <6374B130-FFD6-3443-A718-C6417D6376B2> /Volumes/*/libtiff.6.dylib
+       0x10f61c000 -        0x10f62ffff +_pcg64.cpython-313-darwin.so (0) <711C0BEC-51D9-30BF-9877-62E7C28ABCB7> /Volumes/*/_pcg64.cpython-313-darwin.so
+       0x10f648000 -        0x10febe15f  com.apple.AGXMetalG16X (350.38 - 350.38) <403800AA-B0AF-3E90-99E3-2F4FC4B54053> /System/Library/Extensions/AGXMetalG16X.bundle/Contents/MacOS/AGXMetalG16X
+       0x112050000 -        0x1120d5737 +libjpeg.62.4.0.dylib (0) <E83B74B7-8CA4-320A-BA41-A5FF40C06866> /Volumes/*/libjpeg.62.4.0.dylib
+       0x1120f0000 -        0x11217b2f7 +libopenjp2.2.5.4.dylib (0) <FB411FFE-72B1-30C1-94C9-D579EDFD5808> /Volumes/*/libopenjp2.2.5.4.dylib
+       0x112194000 -        0x1121b3ff3 +bit_generator.cpython-313-darwin.so (0) <90535B9D-A129-3498-B6FD-CDA6FCDE246B> /Volumes/*/bit_generator.cpython-313-darwin.so
+       0x1121c4000 -        0x1121d3ffb +_philox.cpython-313-darwin.so (0) <0A194133-85DE-3E9B-9E88-F2E41E9F12F3> /Volumes/*/_philox.cpython-313-darwin.so
+       0x1121e4000 -        0x11221e587 +liblzma.5.dylib (0) <1269E243-AB01-393C-B865-252735A667D7> /Volumes/*/liblzma.5.dylib
+       0x112234000 -        0x11223bfff +pandas_parser.cpython-313-darwin.so (0) <4AD9346C-7B7B-33E5-9432-0DE7F6F70A41> /Volumes/*/pandas_parser.cpython-313-darwin.so
+       0x1126f0000 -        0x112727ff7 +_bounded_integers.cpython-313-darwin.so (0) <1EA64AEA-E640-3D43-A4AE-060880401371> /Volumes/*/_bounded_integers.cpython-313-darwin.so
+       0x112738000 -        0x11274bfff +_mt19937.cpython-313-darwin.so (0) <F3581A12-92B8-3528-A641-1853C565622F> /Volumes/*/_mt19937.cpython-313-darwin.so
+       0x11275c000 -        0x1127f939b +libc10.dylib (0) <43E63E28-BE65-3C72-87FA-C94C483D13A4> /Volumes/*/libc10.dylib
+       0x112868000 -        0x1128ffffb +libomp.dylib (0) <E56FEBF1-776C-35BB-B9A1-8C978A01425C> /Volumes/*/libomp.dylib
+       0x114140000 -        0x11417ffff +_pocketfft_umath.cpython-313-darwin.so (0) <ED0DB05D-5CE6-33EB-B203-B89A555B4D50> /Volumes/*/_pocketfft_umath.cpython-313-darwin.so
+       0x1141a0000 -        0x115217837 +libtorch_python.dylib (0) <22A0F996-6FD8-3A79-888C-FF9E12095DBC> /Volumes/*/libtorch_python.dylib
+       0x11715c000 -        0x117187fff +_common.cpython-313-darwin.so (0) <856C7322-0A6A-344A-AC8A-21678A041C08> /Volumes/*/_common.cpython-313-darwin.so
+       0x117198000 -        0x1171a0d93 +_psutil_osx.abi3.so (0) <9F38D1A0-1AF2-3062-9683-0E0D0AF4A252> /Volumes/*/_psutil_osx.abi3.so
+       0x1171f4000 -        0x1171fbff7 +pandas_datetime.cpython-313-darwin.so (0) <0E0902EA-AE3C-388F-B29A-11852C840ECC> /Volumes/*/pandas_datetime.cpython-313-darwin.so
+       0x117218000 -        0x11722bffb +_azurefs.cpython-313-darwin.so (0) <5B96DFDB-E9A2-38FA-882F-3CCD8EDB95F7> /Volumes/*/_azurefs.cpython-313-darwin.so
+       0x117240000 -        0x1177c7f8f +tokenizers.abi3.so (0) <D862101D-4549-32CB-B2D9-914D753D9ECA> /Volumes/*/tokenizers.abi3.so
+       0x118a24000 -        0x118aaffff +_generator.cpython-313-darwin.so (0) <56A37631-F001-3DBF-9204-15C597FD8EA3> /Volumes/*/_generator.cpython-313-darwin.so
+       0x118bc8000 -        0x118c37ffb +mtrand.cpython-313-darwin.so (0) <BF5EEFAC-1A22-350E-A36D-A0CA73E10652> /Volumes/*/mtrand.cpython-313-darwin.so
+       0x11a14c000 -        0x11a153fff +base.cpython-313-darwin.so (0) <3DE48E49-EDCB-3E06-901A-94086D1594B8> /Volumes/*/base.cpython-313-darwin.so
+       0x11a160000 -        0x11a167fff +ops_dispatch.cpython-313-darwin.so (0) <45DFF3A9-B37F-30BF-AE08-DCF3FE2109FC> /Volumes/*/ops_dispatch.cpython-313-darwin.so
+       0x11a174000 -        0x11a187fff +_hdfs.cpython-313-darwin.so (0) <C284BAED-093D-3FD9-B44A-0752B3943FD6> /Volumes/*/_hdfs.cpython-313-darwin.so
+       0x11a19c000 -        0x11a1a7ff7 +ccalendar.cpython-313-darwin.so (0) <860F146A-B452-32E0-8068-C4B6C8F3AABD> /Volumes/*/ccalendar.cpython-313-darwin.so
+       0x11a1b8000 -        0x11a1fbffb +_fs.cpython-313-darwin.so (0) <F36FB77F-BB24-35D1-8433-509C1449245A> /Volumes/*/_fs.cpython-313-darwin.so
+       0x11a224000 -        0x11a228cff +_zoneinfo.cpython-313-darwin.so (0) <6C758A8D-F3DD-3D5A-9AF2-7656FB730CE5> /opt/homebrew/*/Python.framework/Versions/3.13/lib/python3.13/lib-dynload/_zoneinfo.cpython-313-darwin.so
+       0x11a244000 -        0x11a2f3ff7 +_safetensors_rust.abi3.so (0) <79CE966F-A30A-365E-85BE-01D8BA336275> /Volumes/*/_safetensors_rust.abi3.so
+       0x11a73c000 -        0x11a797ff3 +_parquet.cpython-313-darwin.so (0) <37C6E949-14A2-3931-8F8C-CE1CE9F9DDC8> /Volumes/*/_parquet.cpython-313-darwin.so
+       0x11a7c8000 -        0x11a7dbffb +_gcsfs.cpython-313-darwin.so (0) <5832E174-D263-3921-9180-F27E0EAACFA2> /Volumes/*/_gcsfs.cpython-313-darwin.so
+       0x11a7f0000 -        0x11a803ffb +_json.cpython-313-darwin.so (0) <DB6FC592-C6CF-3757-8FCB-FCDAE0A4DBEC> /Volumes/*/_json.cpython-313-darwin.so
+       0x11a818000 -        0x11a823ffb +indexing.cpython-313-darwin.so (0) <C3516C54-99BB-3925-9FE1-CAA4C4895553> /Volumes/*/indexing.cpython-313-darwin.so
+       0x11a830000 -        0x11a97ffef +_sentencepiece.cpython-313-darwin.so (0) <BF93109A-D516-33C5-B03E-3BDFD840B56F> /Volumes/*/_sentencepiece.cpython-313-darwin.so
+       0x11ad24000 -        0x11ad3ffff +_s3fs.cpython-313-darwin.so (0) <DB73F46B-1A2A-3D5B-93DA-6D91BC92EA4A> /Volumes/*/_s3fs.cpython-313-darwin.so
+       0x11ad54000 -        0x11ad6bfff +np_datetime.cpython-313-darwin.so (0) <7EB580AC-D99D-3EA7-8903-06B8CE64090A> /Volumes/*/np_datetime.cpython-313-darwin.so
+       0x11ad7c000 -        0x11ad87fff +json.cpython-313-darwin.so (0) <57CEFC64-2B1C-3A91-B701-350A7FBA3002> /Volumes/*/json.cpython-313-darwin.so
+       0x11ad94000 -        0x11ad9bfff +libarrow_python_parquet_encryption.2100.dylib (0) <CB617908-8D9C-3580-88E6-F969CD705A26> /Volumes/*/libarrow_python_parquet_encryption.2100.dylib
+       0x11ada8000 -        0x11add7ffb +_acero.cpython-313-darwin.so (0) <0E01F4A2-DFA3-3364-80FB-90B45E777C3C> /Volumes/*/_acero.cpython-313-darwin.so
+       0x11adfc000 -        0x11af17ffb +libarrow_python.2100.dylib (0) <80E1F9BF-E98D-3ACA-9BE8-B2D16D89BA7C> /Volumes/*/libarrow_python.2100.dylib
+       0x11afe0000 -        0x11b2affff +lib.cpython-313-darwin.so (0) <46D2018C-E9A5-3B0C-BBBE-7E471FE45FB4> /Volumes/*/lib.cpython-313-darwin.so
+       0x11b3a8000 -        0x11b3c7ffb +_substrait.cpython-313-darwin.so (0) <F6AF3FB5-9EC5-35AA-A098-89AFFCE6780E> /Volumes/*/_substrait.cpython-313-darwin.so
+       0x11b3e0000 -        0x11b3ebffb +properties.cpython-313-darwin.so (0) <F4B9F6B9-9B80-311C-8D36-AF92AEE49797> /Volumes/*/properties.cpython-313-darwin.so
+       0x11b400000 -        0x11b43bfff +_csv.cpython-313-darwin.so (0) <DFA78CF6-CC40-34E9-8A42-107CCDF74611> /Volumes/*/_csv.cpython-313-darwin.so
+       0x11b458000 -        0x11b477ff3 +missing.cpython-313-darwin.so (0) <710E5DC1-CF03-3FE1-AAAC-A16BFDF6EF02> /Volumes/*/missing.cpython-313-darwin.so
+       0x11b494000 -        0x11b52ffff +_dataset.cpython-313-darwin.so (0) <ECBB5BBE-7D0D-3A47-ADDA-03BC68C28ADC> /Volumes/*/_dataset.cpython-313-darwin.so
+       0x11b694000 -        0x11b81fffb +libarrow_substrait.2100.dylib (0) <D7C3F7AF-ED29-3170-BD92-7EFDDBA9DDE0> /Volumes/*/libarrow_substrait.2100.dylib
+       0x11b984000 -        0x11babbff3 +libarrow_dataset.2100.dylib (0) <027DB158-1EFE-311D-BEA3-1BE5A19DE1F3> /Volumes/*/libarrow_dataset.2100.dylib
+       0x11bc10000 -        0x11bd2fffb +libarrow_acero.2100.dylib (0) <50FC254E-09F5-37E0-8727-CA51A0A41C44> /Volumes/*/libarrow_acero.2100.dylib
+       0x11be20000 -        0x11be3bfff +dtypes.cpython-313-darwin.so (0) <EBB1F734-AAD6-391B-B554-D6EF0D3C0CB1> /Volumes/*/dtypes.cpython-313-darwin.so
+       0x11be50000 -        0x11be63ffb +arrays.cpython-313-darwin.so (0) <5C152534-D63D-3A94-8780-7ACBB84BEFD2> /Volumes/*/arrays.cpython-313-darwin.so
+       0x11be90000 -        0x11bebbff3 +conversion.cpython-313-darwin.so (0) <C8EAC3CA-046E-3BDF-B07A-D9968E4FA0EA> /Volumes/*/conversion.cpython-313-darwin.so
+       0x11bed0000 -        0x11bef7ffb +nattype.cpython-313-darwin.so (0) <7328533F-BE2B-32FA-B351-2531834A6E79> /Volumes/*/nattype.cpython-313-darwin.so
+       0x11bf24000 -        0x11c003ff3 +interval.cpython-313-darwin.so (0) <794182C8-A6DB-35D3-800A-D7EE512F7481> /Volumes/*/interval.cpython-313-darwin.so
+       0x11c034000 -        0x11c28ffff +libparquet.2100.dylib (0) <BFF9492F-E1F2-30B2-B79E-D9820B4B07B6> /Volumes/*/libparquet.2100.dylib
+       0x11c458000 -        0x11c50bfff +_compute.cpython-313-darwin.so (0) <9C011066-2502-33EE-9BBA-2F7751BCE1B2> /Volumes/*/_compute.cpython-313-darwin.so
+       0x11c584000 -        0x11c5affff +timezones.cpython-313-darwin.so (0) <0D3EFE8E-6FBE-3F21-BE3F-5BE9568671C8> /Volumes/*/timezones.cpython-313-darwin.so
+       0x11c5c4000 -        0x11c5cffff +_dataset_orc.cpython-313-darwin.so (0) <A8EFFF6E-FD04-38A1-B6F5-0A3876A57245> /Volumes/*/_dataset_orc.cpython-313-darwin.so
+       0x11c604000 -        0x11c627fff +vectorized.cpython-313-darwin.so (0) <E757E06A-9A6D-3AEC-AD3E-291084699E67> /Volumes/*/vectorized.cpython-313-darwin.so
+       0x11c648000 -        0x11c677fff +tzconversion.cpython-313-darwin.so (0) <F06C0D3E-A290-3483-9D39-E8C1A514AC28> /Volumes/*/tzconversion.cpython-313-darwin.so
+       0x11c68c000 -        0x11c6f7ffb +timestamps.cpython-313-darwin.so (0) <03F8E30B-D157-3997-A287-8B93B8EFFD5A> /Volumes/*/timestamps.cpython-313-darwin.so
+       0x11c730000 -        0x11c89fffb +hashtable.cpython-313-darwin.so (0) <4012E03D-8996-3B4D-89D0-29C000C2978D> /Volumes/*/hashtable.cpython-313-darwin.so
+       0x11c8e0000 -        0x11c98fff3 +offsets.cpython-313-darwin.so (0) <70D1B77A-5E27-317A-B60B-E82F2B789479> /Volumes/*/offsets.cpython-313-darwin.so
+       0x11cac0000 -        0x11cb1ffff +timedeltas.cpython-313-darwin.so (0) <DF75F99E-7D7E-38DF-B033-92303F37DCB7> /Volumes/*/timedeltas.cpython-313-darwin.so
+       0x11cb3c000 -        0x11cb6fff7 +fields.cpython-313-darwin.so (0) <67BECB9D-C227-32AC-88D1-21F70D0D6DC7> /Volumes/*/fields.cpython-313-darwin.so
+       0x11cb84000 -        0x11cbabff7 +ops.cpython-313-darwin.so (0) <46F4DFA7-E11E-3A2B-BC0F-7C5F99DA8FFD> /Volumes/*/ops.cpython-313-darwin.so
+       0x11cbbc000 -        0x11cbc391f +pyexpat.cpython-313-darwin.so (0) <7033D800-482D-3B78-95BC-ECBE4AD0A3B9> /opt/homebrew/*/Python.framework/Versions/3.13/lib/python3.13/lib-dynload/pyexpat.cpython-313-darwin.so
+       0x11cbdc000 -        0x11cc1fffb +parsing.cpython-313-darwin.so (0) <727730A1-DF2F-35EE-B9A2-FC58B7B0AE5B> /Volumes/*/parsing.cpython-313-darwin.so
+       0x11cc34000 -        0x11cc6fff7 +strptime.cpython-313-darwin.so (0) <B99FAE9D-B1EA-3BB6-962E-E33F3AE992ED> /Volumes/*/strptime.cpython-313-darwin.so
+       0x11cc84000 -        0x11cca3ffb +hashing.cpython-313-darwin.so (0) <D8038828-A510-3415-80D3-37353862765B> /Volumes/*/hashing.cpython-313-darwin.so
+       0x11ccf0000 -        0x11cd43ff3 +period.cpython-313-darwin.so (0) <5DE31507-7F19-3D97-AE2F-5B20E3EC0175> /Volumes/*/period.cpython-313-darwin.so
+       0x11ce5c000 -        0x11ce7fffb +writers.cpython-313-darwin.so (0) <3E46B23A-C599-379C-8EA5-012793330435> /Volumes/*/writers.cpython-313-darwin.so
+       0x11ce94000 -        0x11ceb3fff +indexers.cpython-313-darwin.so (0) <54F265CB-BEC5-3641-9DB3-7102B5DF3162> /Volumes/*/indexers.cpython-313-darwin.so
+       0x11cec4000 -        0x11ced7fff +testing.cpython-313-darwin.so (0) <1CC32289-0739-3C40-A08A-80D5CBCA896B> /Volumes/*/testing.cpython-313-darwin.so
+       0x11cee8000 -        0x11d053ff7 +algos.cpython-313-darwin.so (0) <77A91164-C75F-31D9-A0EB-18FF57ACE0E0> /Volumes/*/algos.cpython-313-darwin.so
+       0x11d078000 -        0x11d0abffb +tslib.cpython-313-darwin.so (0) <541FA33B-B927-3E1C-A0C1-6D12D59E4AC4> /Volumes/*/tslib.cpython-313-darwin.so
+       0x11d0c0000 -        0x11d0fffff +internals.cpython-313-darwin.so (0) <E67226A5-82D2-34D8-BC53-2CD17A8F35FD> /Volumes/*/internals.cpython-313-darwin.so
+       0x11d124000 -        0x11d1afff3 +lib.cpython-313-darwin.so (0) <F60322A1-B05A-3F53-8CC1-4D1286BD75F0> /Volumes/*/lib.cpython-313-darwin.so
+       0x11d2d0000 -        0x11d30fff7 +aggregations.cpython-313-darwin.so (0) <9AA9670F-28F9-3915-B1C0-0FEFB60AE509> /Volumes/*/aggregations.cpython-313-darwin.so
+       0x11d324000 -        0x11d337ffb +_dataset_parquet_encryption.cpython-313-darwin.so (0) <B0110F3C-77D8-3F8E-87C1-9E7BE26025F3> /Volumes/*/_dataset_parquet_encryption.cpython-313-darwin.so
+       0x11d3a4000 -        0x11de8bff7 +libarrow_compute.2100.dylib (0) <80AC3F04-A36C-386E-BA42-50858EAE5662> /Volumes/*/libarrow_compute.2100.dylib
+       0x11e5fc000 -        0x11e693ffb +sparse.cpython-313-darwin.so (0) <6FDB4DE6-CE5F-3727-BEBD-B4054F63DC9F> /Volumes/*/sparse.cpython-313-darwin.so
+       0x11e7a8000 -        0x11e843fff +index.cpython-313-darwin.so (0) <915C7425-D8C5-3649-AB4B-F32FACA05016> /Volumes/*/index.cpython-313-darwin.so
+       0x11e96c000 -        0x11e99bffb +reshape.cpython-313-darwin.so (0) <9D9124C6-F24E-3275-833E-4DF648EE06D8> /Volumes/*/reshape.cpython-313-darwin.so
+       0x11e9b0000 -        0x11ea07ffb +parsers.cpython-313-darwin.so (0) <0F2D28C7-A735-3B76-9BC5-73483A2DE346> /Volumes/*/parsers.cpython-313-darwin.so
+       0x11ea20000 -        0x11ea43fff +_parquet_encryption.cpython-313-darwin.so (0) <48D14024-9E72-3A25-985C-49F253A5CAE8> /Volumes/*/_parquet_encryption.cpython-313-darwin.so
+       0x11ea68000 -        0x11eb4bff7 +join.cpython-313-darwin.so (0) <B47AA758-2CC6-32EF-A688-BA8ECF3C662D> /Volumes/*/join.cpython-313-darwin.so
+       0x11ee64000 -        0x11ee97ff7 +_dataset_parquet.cpython-313-darwin.so (0) <0BBF91AF-8D4C-38FA-A8EF-6FD13E99C7BE> /Volumes/*/_dataset_parquet.cpython-313-darwin.so
+       0x11ef54000 -        0x11f11fff7 +groupby.cpython-313-darwin.so (0) <05F14927-1C3B-38F7-9378-BBBC8CDEC6DF> /Volumes/*/groupby.cpython-313-darwin.so
+       0x1208c0000 -        0x122113927 +libarrow.2100.dylib (0) <4374AE40-BE78-3BE9-ABF5-D02A2E618296> /Volumes/*/libarrow.2100.dylib
+       0x126e04000 -        0x1320af447 +libtorch_cpu.dylib (0) <BFBAC68C-D924-3C65-B13F-16867FFCC476> /Volumes/*/libtorch_cpu.dylib
+       0x145a4c000 -        0x14ccd917f +libtriton.so (0) <3252F207-C269-3087-A2D6-6064DCE4044C> /Volumes/*/libtriton.so
+       0x18d420000 -        0x18d472b4b  libobjc.A.dylib (951.7) <2E858E25-1FF6-3DA6-84F6-911630620512> /usr/lib/libobjc.A.dylib
+       0x18d473000 -        0x18d4a7b34  libdyld.dylib (1376.6) <2C3C5F75-3686-39A1-9202-BD4D2133379D> /usr/lib/system/libdyld.dylib
+       0x18d4a8000 -        0x18d54dec7  dyld (1.0.0 - 1376.6) <9F682DCF-340C-3BFA-BCDD-DD702F30313E> /usr/lib/dyld
+       0x18d54e000 -        0x18d551228  libsystem_blocks.dylib (96) <2EA73169-CF76-3DD1-9869-F23C8B338022> /usr/lib/system/libsystem_blocks.dylib
+       0x18d552000 -        0x18d5a651f  libxpc.dylib (3102.100.102) <618039C8-9965-3782-A7D2-90FD4C3DD66F> /usr/lib/system/libxpc.dylib
+       0x18d5a7000 -        0x18d5c79bf  libsystem_trace.dylib (1861.100.19) <08629650-54FC-3AA6-910E-EACA563804D0> /usr/lib/system/libsystem_trace.dylib
+       0x18d5c8000 -        0x18d675daf  libcorecrypto.dylib (1922.101.2) <D1EC203E-9B2E-391B-8DE3-7C58F0589437> /usr/lib/system/libcorecrypto.dylib
+       0x18d676000 -        0x18d6c61d7  libsystem_malloc.dylib (812.100.31) <2AD21BE3-FFDB-31D5-A3D7-2F7F672D6E92> /usr/lib/system/libsystem_malloc.dylib
+       0x18d6c7000 -        0x18d70e23f  libdispatch.dylib (1542.100.32) <E17AA23F-DB2A-3302-B14C-F6B08C540FCF> /usr/lib/system/libdispatch.dylib
+       0x18d70f000 -        0x18d711ffb  libsystem_featureflags.dylib (103) <0DE01F76-4B36-35A2-98F9-43DD147EDD95> /usr/lib/system/libsystem_featureflags.dylib
+       0x18d712000 -        0x18d792ef7  libsystem_c.dylib (1752.100.10) <66EBD321-6899-3863-BA24-5CFC3076A0CB> /usr/lib/system/libsystem_c.dylib
+       0x18d793000 -        0x18d823ae7  libc++.1.dylib (2100.43) <1E9541EC-C564-38CB-BED6-46F708E8D863> /usr/lib/libc++.1.dylib
+       0x18d824000 -        0x18d83e75f  libc++abi.dylib (2100.43) <E8D325ED-3B97-325E-B494-B1B0FF93D133> /usr/lib/libc++abi.dylib
+       0x18d83f000 -        0x18d87c28f  libsystem_kernel.dylib (12377.101.15) <51565B39-F595-3E96-A217-FEF29815057A> /usr/lib/system/libsystem_kernel.dylib
+       0x18d87d000 -        0x18d889b3b  libsystem_pthread.dylib (539.100.4) <E7A73008-0C09-31E3-9DD9-0C61652F0E85> /usr/lib/system/libsystem_pthread.dylib
+       0x18d88a000 -        0x18d8928f3  libsystem_platform.dylib (375.100.10) <D93EC420-F465-3A3A-916D-A04AF9B023EB> /usr/lib/system/libsystem_platform.dylib
+       0x18d893000 -        0x18d8c26eb  libsystem_info.dylib (600) <201FD67C-3DF6-3788-B132-A69CAA2AA3D7> /usr/lib/system/libsystem_info.dylib
+       0x18d8c3000 -        0x18de20c5f  com.apple.CoreFoundation (6.9 - 4424.1.402) <04941709-2330-3BF8-9213-6D33964DB448> /System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation
+       0x18de21000 -        0x18e13bbdf  com.apple.LaunchServices (1141.1 - 1141.1) <7E01ED2D-7B3A-34D5-87F0-AA2785A5605F> /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/LaunchServices
+       0x18e13c000 -        0x18e3249bf  com.apple.gpusw.MetalTools (1.0 - 1) <287AFB31-4869-3E39-BBD1-3BB410FEA798> /System/Library/PrivateFrameworks/MetalTools.framework/Versions/A/MetalTools
+       0x18e325000 -        0x18eb1f4bf  libBLAS.dylib (1551.100.26) <4FC8C9A8-58C3-35DD-A4D8-F02D57F085ED> /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libBLAS.dylib
+       0x18eb20000 -        0x18ec2f35f  com.apple.Lexicon-framework (1.0 - 195.12) <AE8E0828-1A0B-373D-8A02-1531D08590D7> /System/Library/PrivateFrameworks/Lexicon.framework/Versions/A/Lexicon
+       0x18ec30000 -        0x18ed9d417  libSparse.dylib (184.80.2) <C7D1864B-A800-3452-B01F-CDBBC9EB70CD> /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libSparse.dylib
+       0x18ed9e000 -        0x18ee311df  com.apple.SystemConfiguration (1.21 - 1.21) <E192312E-A963-3625-9E4E-5BAE21807384> /System/Library/Frameworks/SystemConfiguration.framework/Versions/A/SystemConfiguration
+       0x18ee32000 -        0x18ee6657b  libCRFSuite.dylib (55) <33BBBA2B-3BC6-31BB-81A5-03565AF927B3> /usr/lib/libCRFSuite.dylib
+       0x18f12f000 -        0x1901111df  com.apple.Foundation (6.9 - 4424.1.402) <8E9A5C62-7E95-3047-81E7-735AE1AEE5F8> /System/Library/Frameworks/Foundation.framework/Versions/C/Foundation
+       0x1902c1000 -        0x1903e1cbf  com.apple.CoreDisplay (291.3 - 291.3) <193E4CF1-2F3E-3023-BC85-B995752B5290> /System/Library/Frameworks/CoreDisplay.framework/Versions/A/CoreDisplay
+       0x1903e2000 -        0x1907a473f  com.apple.audio.AudioToolboxCore (1.0 - 1556.528) <E04892F4-3ED8-3993-8683-B8D7A40C3A2D> /System/Library/PrivateFrameworks/AudioToolboxCore.framework/Versions/A/AudioToolboxCore
+       0x1907a5000 -        0x1909cdf1f  com.apple.CoreText (877.4.0.7 - 877.4.0.7) <A372F0BF-AC92-39F6-A41C-580158486082> /System/Library/Frameworks/CoreText.framework/Versions/A/CoreText
+       0x1909ce000 -        0x191163e9f  com.apple.audio.CoreAudio (5.0 - 5.0) <72080A9B-8C5B-3E6D-8DE7-0F86C3E698EC> /System/Library/Frameworks/CoreAudio.framework/Versions/A/CoreAudio
+       0x191164000 -        0x191581d1f  com.apple.security (7.0 - 61901.101.4) <4CBBF5DD-B67C-3BE4-9B97-5F113FD01950> /System/Library/Frameworks/Security.framework/Versions/A/Security
+       0x191582000 -        0x191857d33  libicucore.A.dylib (76142.4.7) <BD826EC4-73D6-3F95-ABED-001F02B4A429> /usr/lib/libicucore.A.dylib
+       0x191858000 -        0x191861e5f  libsystem_darwin.dylib (1752.100.10) <D5BA0CAB-F283-3620-AAA9-1EEB718E1BA8> /usr/lib/system/libsystem_darwin.dylib
+       0x191862000 -        0x191b59cbf  com.apple.CoreServices.CarbonCore (1333 - 1333) <9BDEEDD0-75AB-38E6-B9D8-E639A234893A> /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/CarbonCore.framework/Versions/A/CarbonCore
+       0x191b5a000 -        0x191b99a5b  com.apple.CoreServicesInternal (505 - 505) <A460D760-9940-3977-A0D7-900705491053> /System/Library/PrivateFrameworks/CoreServicesInternal.framework/Versions/A/CoreServicesInternal
+       0x191b9a000 -        0x191bd91bf  com.apple.CSStore (1141.1 - 1141.1) <D703C5EE-2AC4-3EB8-9258-08501E1BD733> /System/Library/PrivateFrameworks/CoreServicesStore.framework/Versions/A/CoreServicesStore
+       0x191bda000 -        0x191cc223f  com.apple.framework.IOKit (2.0.2 - 100231.100.18.0.1) <E4D05845-A890-377F-BB68-5972BF638119> /System/Library/Frameworks/IOKit.framework/Versions/A/IOKit
+       0x191cc3000 -        0x191cd4f5b  libsystem_notify.dylib (348.100.7) <9F46F30B-B7C0-3DD7-AC38-57B78C7971FF> /usr/lib/system/libsystem_notify.dylib
+       0x191cd5000 -        0x191d3168f  libsandbox.1.dylib (2680.100.174) <371D12AD-6696-38A6-8BD0-AEC5F095D65F> /usr/lib/libsandbox.1.dylib
+       0x19360e000 -        0x1936243ff  com.apple.UniformTypeIdentifiers (709 - 709) <31BBE997-B323-3535-9ADB-FD7EF7382BAC> /System/Library/Frameworks/UniformTypeIdentifiers.framework/Versions/A/UniformTypeIdentifiers
+       0x193aff000 -        0x193bd729f  libboringssl.dylib (532.101.3) <042D12D8-A8A0-3F41-ABA8-4F0C1BC7B777> /usr/lib/libboringssl.dylib
+       0x193bd8000 -        0x193f8cf1f  com.apple.CFNetwork (1.0 - 3860.500.112) <3D8050B5-4263-3729-AD04-DF521A24CAC9> /System/Library/Frameworks/CFNetwork.framework/Versions/A/CFNetwork
+       0x193f8d000 -        0x193fa7f5b  libsystem_networkextension.dylib (2226.101.1) <85169C7B-48DD-3542-AD38-F1B88EA2A95A> /usr/lib/system/libsystem_networkextension.dylib
+       0x193fa8000 -        0x193fa9067  libenergytrace.dylib (23) <62B33A35-EA5F-3FCA-9FD4-79C4DFB82FC9> /usr/lib/libenergytrace.dylib
+       0x193faa000 -        0x194029c7f  libMobileGestalt.dylib (1484.100.29.0.1) <018D1CC6-9A6F-309C-92CF-A30594FB12A7> /usr/lib/libMobileGestalt.dylib
+       0x19402a000 -        0x194041fdf  libsystem_asl.dylib (406) <6427D987-7938-3278-8C14-10FB9C06BBD5> /usr/lib/system/libsystem_asl.dylib
+       0x194042000 -        0x194065827  com.apple.TCC (1.0 - 1) <BC682334-20A5-3374-9FC6-627EA7921E04> /System/Library/PrivateFrameworks/TCC.framework/Versions/A/TCC
+       0x194066000 -        0x19461ab5f  com.apple.SkyLight (1.600.0 - 921.13.1) <EF82BE18-450B-33FE-9C68-A2C88144F367> /System/Library/PrivateFrameworks/SkyLight.framework/Versions/A/SkyLight
+       0x19461b000 -        0x194d6ffff  com.apple.CoreGraphics (2.0 - 1965.4.5) <B00B63EB-CE38-3544-9C9E-D5309957CE58> /System/Library/Frameworks/CoreGraphics.framework/Versions/A/CoreGraphics
+       0x194d70000 -        0x194f17b8b  com.apple.ColorSync (4.13.0 - 3813.3.3) <5467E64B-022C-3ABE-9D08-A7A433F9FC07> /System/Library/Frameworks/ColorSync.framework/Versions/A/ColorSync
+       0x19536c000 -        0x195759f5f  com.apple.CoreData (120 - 1526) <FC7B6078-A83A-39E4-B4CD-46E46FC71151> /System/Library/Frameworks/CoreData.framework/Versions/A/CoreData
+       0x19575a000 -        0x195775d5f  com.apple.ProtocolBuffer (1 - 310.24.7.28.9) <66E64E0E-00B6-38DA-8A84-A90DA509B284> /System/Library/PrivateFrameworks/ProtocolBuffer.framework/Versions/A/ProtocolBuffer
+       0x195776000 -        0x19595e9ff  libsqlite3.dylib (381) <53ABC511-4939-38EE-9170-BE252A25B254> /usr/lib/libsqlite3.dylib
+       0x195a01000 -        0x195af249f  com.apple.BaseBoard (732.1.1 - 732.1.1) <F3D9ECDD-A111-3EFA-913E-7E15E7BB5318> /System/Library/PrivateFrameworks/BaseBoard.framework/Versions/A/BaseBoard
+       0x195af3000 -        0x195b5e93f  com.apple.RunningBoardServices (1.0 - 1015.100.16) <4937DF6A-027A-3661-A7CC-CCE0F1674A40> /System/Library/PrivateFrameworks/RunningBoardServices.framework/Versions/A/RunningBoardServices
+       0x195b5f000 -        0x195bd2c37  com.apple.AE (944 - 944) <5376E565-7730-3F73-B948-B9D10D08A772> /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/AE.framework/Versions/A/AE
+       0x195bd3000 -        0x195be4d87  libdns_services.dylib (2881.100.56.0.1) <8169DB95-C8DE-322C-99BF-D592F610013E> /usr/lib/libdns_services.dylib
+       0x195be5000 -        0x195bed387  libsystem_symptoms.dylib (2169.100.30) <28B6E34E-9C7D-3437-A3F1-A3C979DE579A> /usr/lib/system/libsystem_symptoms.dylib
+       0x195bee000 -        0x197406cff  com.apple.Network (1.0 - 5812.101.2) <66B895AF-CEE8-378F-ABD8-D4F9738476CA> /System/Library/Frameworks/Network.framework/Versions/A/Network
+       0x197407000 -        0x197436ddf  com.apple.analyticsd (1.0 - 1) <ED4098AC-ECE3-3A22-92F1-A2292DFC13F2> /System/Library/PrivateFrameworks/CoreAnalytics.framework/Versions/A/CoreAnalytics
+       0x197437000 -        0x1974388bb  libDiagnosticMessagesClient.dylib (113) <D5EBC67A-F9F1-3105-A4D0-F1AE518EA2A6> /usr/lib/libDiagnosticMessagesClient.dylib
+       0x197439000 -        0x1974a501f  com.apple.spotlight.metadata.utilities (1.0 - 2418.4.13.404) <0DFEA3CB-1A37-390A-956D-D956B8688AC6> /System/Library/PrivateFrameworks/MetadataUtilities.framework/Versions/A/MetadataUtilities
+       0x1974a6000 -        0x197531b5f  com.apple.Metadata (26.4 - 2418.4.13.404) <9A860898-453E-36F4-9830-6D754A8C7CDC> /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Metadata
+       0x197532000 -        0x19753b1eb  com.apple.DiskArbitration (2.7 - 2.7) <CB2C8249-4DCA-34C5-97C0-368485718E68> /System/Library/Frameworks/DiskArbitration.framework/Versions/A/DiskArbitration
+       0x19753c000 -        0x197960023  com.apple.vImage (8.1 - 632.100.6) <E718351A-2443-3919-8135-67ADB9312327> /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vImage.framework/Versions/A/vImage
+       0x197961000 -        0x197d7659f  com.apple.QuartzCore (1195.9 - 1195.9) <B1C40645-C68A-3850-BBC4-29F74E486DF9> /System/Library/Frameworks/QuartzCore.framework/Versions/A/QuartzCore
+       0x197d77000 -        0x197dc84ff  libFontRegistry.dylib (408.4.0.1) <16C4640D-B9D6-35E1-9813-DD8480382152> /System/Library/Frameworks/ApplicationServices.framework/Versions/A/Frameworks/ATS.framework/Versions/A/Resources/libFontRegistry.dylib
+       0x19808f000 -        0x19809caff  com.apple.OpenDirectory (26.4 - 666.100.1) <C0B8EA4A-22A3-3801-A66E-C42358AC0468> /System/Library/Frameworks/OpenDirectory.framework/Versions/A/OpenDirectory
+       0x19809d000 -        0x1980c627f  com.apple.CFOpenDirectory (26.4 - 666.100.1) <3C2B9FAA-A99C-34B6-AA54-601FF113111D> /System/Library/Frameworks/OpenDirectory.framework/Versions/A/Frameworks/CFOpenDirectory.framework/Versions/A/CFOpenDirectory
+       0x1980c7000 -        0x1980d391b  com.apple.CoreServices.FSEvents (1413.100.6 - 1413.100.6) <EB26C31A-4C42-31CD-B48B-9BFCCFAA7A4B> /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/FSEvents
+       0x1980d4000 -        0x1980fd0df  com.apple.coreservices.SharedFileList (225 - 225) <5BCA48BA-0BDB-355B-9F0A-75E649EC3359> /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/SharedFileList.framework/Versions/A/SharedFileList
+       0x1980fe000 -        0x19810108f  libapp_launch_measurement.dylib (17) <DBB6338E-E92E-364B-8714-9578C3E53B7E> /usr/lib/libapp_launch_measurement.dylib
+       0x198102000 -        0x19814a9bf  com.apple.CoreAutoLayout (1.0 - 34) <EF256F92-D3A3-3C65-97B9-DBAED3A57A8D> /System/Library/PrivateFrameworks/CoreAutoLayout.framework/Versions/A/CoreAutoLayout
+       0x19814b000 -        0x19823113b  libxml2.2.dylib (39.10) <B627FBCA-2F68-3C56-B092-73F62A6FCC92> /usr/lib/libxml2.2.dylib
+       0x198232000 -        0x1982b285f  com.apple.CoreVideo (1.8 - 734.4) <27CE0BA7-202B-34AC-BA6C-56891CCEC5F1> /System/Library/Frameworks/CoreVideo.framework/Versions/A/CoreVideo
+       0x1982b3000 -        0x1982b5f5f  com.apple.loginsupport (3.0 - 264.4.1) <D27E83AC-E64D-3180-ACB3-9FDAC47541DD> /System/Library/PrivateFrameworks/login.framework/Versions/A/Frameworks/loginsupport.framework/Versions/A/loginsupport
+       0x1982f4000 -        0x19832065f  com.apple.UserManagement (1.0 - 1) <0C8B7C6C-CCCD-3EAF-B5E5-D4B6F776123A> /System/Library/PrivateFrameworks/UserManagement.framework/Versions/A/UserManagement
+       0x199e80000 -        0x199eb825f  libsystem_containermanager.dylib (725.100.37) <14750F95-BB3A-3654-8610-A05A454643A8> /usr/lib/system/libsystem_containermanager.dylib
+       0x199eb9000 -        0x199ed525f  com.apple.IOSurface (393.5.7 - 393.5.7) <6A59B8B3-E55E-315B-87BF-260C95008770> /System/Library/Frameworks/IOSurface.framework/Versions/A/IOSurface
+       0x199ed6000 -        0x199ee005f  com.apple.IOAccelerator (487.4.3 - 487.4.3) <D7DC2BD8-513C-3354-ACC0-C3140D9A0A86> /System/Library/PrivateFrameworks/IOAccelerator.framework/Versions/A/IOAccelerator
+       0x199ee1000 -        0x19a1bacdf  com.apple.Metal (372.16 - 372.16) <4E1D8F53-729B-3232-A184-2E9CD18AAD43> /System/Library/Frameworks/Metal.framework/Versions/A/Metal
+       0x19a1bb000 -        0x19a1e403f  com.apple.audio.caulk (1.0 - 214.501) <2BDD6811-CE34-3098-9833-10D9F74B7FFC> /System/Library/PrivateFrameworks/caulk.framework/Versions/A/caulk
+       0x19a1e5000 -        0x19a38601f  com.apple.CoreMedia (1.0 - 3305.24.5.2) <09574F0D-9398-3C09-9DE8-F3834E693B68> /System/Library/Frameworks/CoreMedia.framework/Versions/A/CoreMedia
+       0x19a387000 -        0x19a65625f  libFontParser.dylib (435.4.0.2) <8B98C347-62C7-38F2-92C8-244B6DFD3639> /System/Library/PrivateFrameworks/FontServices.framework/libFontParser.dylib
+       0x19a9ac000 -        0x19aceacff  com.apple.ImageIO (3.3.0 - 2784.4.14) <7FA508AE-1EC7-36B6-AE29-EDD453A34CAD> /System/Library/Frameworks/ImageIO.framework/Versions/A/ImageIO
+       0x19aceb000 -        0x19b1d5eff  com.apple.CoreImage (19.0.0 - 1592.80.2) <8ED0F6C5-AFF1-3217-B13C-DC2FB7090F2D> /System/Library/Frameworks/CoreImage.framework/Versions/A/CoreImage
+       0x19b1d6000 -        0x19b28fddf  com.apple.MetalPerformanceShaders.MPSCore (1.0 - 1) <8E8DEA53-FF92-3DA6-A47E-BA27226D8029> /System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSCore.framework/Versions/A/MPSCore
+       0x19b290000 -        0x19b2945d7  libsystem_configuration.dylib (1405.100.8) <634F597D-F8BD-3C00-B967-86047FC15D14> /usr/lib/system/libsystem_configuration.dylib
+       0x19b295000 -        0x19b29b8cf  libsystem_sandbox.dylib (2680.100.174) <AF76231D-EADC-3399-9414-6AD90FB4EA89> /usr/lib/system/libsystem_sandbox.dylib
+       0x19b29c000 -        0x19b29d17f  com.apple.AggregateDictionary (1.0 - 1) <1178C8EA-95DB-3BBA-A00F-E6D3A647940E> /System/Library/PrivateFrameworks/AggregateDictionary.framework/Versions/A/AggregateDictionary
+       0x19b29e000 -        0x19b2a24d3  com.apple.AppleSystemInfo (3.1.5 - 3.1.5) <450E68B1-E42E-3448-8003-6E070946E9E7> /System/Library/PrivateFrameworks/AppleSystemInfo.framework/Versions/A/AppleSystemInfo
+       0x19b2a3000 -        0x19b2a446b  liblangid.dylib (140) <A5624740-6148-34D2-B600-FB6FD4FB8451> /usr/lib/liblangid.dylib
+       0x19b2a5000 -        0x19b3c445f  com.apple.CoreNLP (1.0 - 313) <1B118152-B1A9-315A-8B44-BDAC6FB589B5> /System/Library/PrivateFrameworks/CoreNLP.framework/Versions/A/CoreNLP
+       0x19b3c5000 -        0x19b3cb91f  com.apple.LinguisticData (1.0 - 483.10) <3273A361-CE08-3AED-91E9-55AB460015F3> /System/Library/PrivateFrameworks/LinguisticData.framework/Versions/A/LinguisticData
+       0x19b3cc000 -        0x19c4407ef  libBNNS.dylib (1961.100.57) <BEA265F4-3EBD-39BD-89B3-39F251359D46> /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libBNNS.dylib
+       0x19c441000 -        0x19c57e46f  libvDSP.dylib (1126.100.7) <7F1C88BC-7C8D-3D5C-B38C-43082CD9C468> /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libvDSP.dylib
+       0x19c5b3000 -        0x19c5ec267  com.apple.IOMobileFramebuffer (343.0.0 - 343.0.0) <4E324CA4-23BF-3216-8749-717D5AD761B3> /System/Library/PrivateFrameworks/IOMobileFramebuffer.framework/Versions/A/IOMobileFramebuffer
+       0x19c7e4000 -        0x19c7fb6df  com.apple.MobileKeyBag (2.0 - 1.0) <F8D5F6A0-E9FC-3CD4-ABDB-C1AE9347AB2B> /System/Library/PrivateFrameworks/MobileKeyBag.framework/Versions/A/MobileKeyBag
+       0x19c7fc000 -        0x19c80a0ff  com.apple.AssertionServices (1.0 - 1015.100.16) <8BDF4215-2AE2-38A1-92D9-8D503B064790> /System/Library/PrivateFrameworks/AssertionServices.framework/Versions/A/AssertionServices
+       0x19c80b000 -        0x19c89da9f  com.apple.securityfoundation (6.0 - 55293) <46DCD2FA-35AA-3CE1-AF5A-CB7D207E4B95> /System/Library/Frameworks/SecurityFoundation.framework/Versions/A/SecurityFoundation
+       0x19c89e000 -        0x19c8cf2ff  com.apple.coreservices.BackgroundTaskManagement (1.0 - 104) <92EFE219-3F5F-31DE-BF8F-A48374CC3A11> /System/Library/PrivateFrameworks/BackgroundTaskManagement.framework/Versions/A/BackgroundTaskManagement
+       0x19c8db000 -        0x19c8de1fb  libquarantine.dylib (196.100.8) <268FEB6E-A237-3050-BFFF-AE3A66B7EAD4> /usr/lib/system/libquarantine.dylib
+       0x19c8df000 -        0x19c8ea2bf  libCheckFix.dylib (33) <01812E54-6AFA-31D0-9ED8-9780885AA285> /usr/lib/libCheckFix.dylib
+       0x19c8eb000 -        0x19c9027ab  libcoretls.dylib (187.100.3) <2CB72424-441F-392D-8F30-40B6DEE19795> /usr/lib/libcoretls.dylib
+       0x19c903000 -        0x19c914273  libbsm.0.dylib (90) <B2A2B623-537B-3853-A317-53DC4943A4D8> /usr/lib/libbsm.0.dylib
+       0x19c915000 -        0x19c973c6b  libmecab.dylib (1121.4.4) <AFC99DD8-D62A-3790-B5AA-537CAF849CDA> /usr/lib/libmecab.dylib
+       0x19c974000 -        0x19c97641b  libgermantok.dylib (31) <F04FD03E-0352-3625-8E4C-BA96210FD966> /usr/lib/libgermantok.dylib
+       0x19c977000 -        0x19c98ae3f  libLinearAlgebra.dylib (1551.100.26) <CD0AE837-ED86-307A-BAB6-69E9B55E809F> /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libLinearAlgebra.dylib
+       0x19c98b000 -        0x19cbe117f  com.apple.MetalPerformanceShaders.MPSNeuralNetwork (1.0 - 1) <891172A3-75F1-325A-A3A9-7CF2E3F31D79> /System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSNeuralNetwork.framework/Versions/A/MPSNeuralNetwork
+       0x19cbe2000 -        0x19cc3619f  com.apple.MetalPerformanceShaders.MPSRayIntersector (1.0 - 1) <F10D9EF3-65A3-3DA6-8336-465E4A4C5076> /System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSRayIntersector.framework/Versions/A/MPSRayIntersector
+       0x19cdca000 -        0x19cdfb57f  com.apple.MetalPerformanceShaders.MPSMatrix (1.0 - 1) <3CAC578C-742A-360E-B6FE-703AB65552A3> /System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSMatrix.framework/Versions/A/MPSMatrix
+       0x19cdfc000 -        0x19cfcbe7f  com.apple.MetalPerformanceShaders.MPSNDArray (1.0 - 1) <93BA8B8F-DD36-370F-B6FF-F47614F314A7> /System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSNDArray.framework/Versions/A/MPSNDArray
+       0x19cfcc000 -        0x19d0601df  com.apple.MetalPerformanceShaders.MPSImage (1.0 - 1) <CB3CEFB0-2E32-3E00-A252-81B8CE6E3DFE> /System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSImage.framework/Versions/A/MPSImage
+       0x19d061000 -        0x19d06c4b3  com.apple.AppleFSCompression (174.100.2 - 1.0) <5E4BD0FD-F038-33D2-AF7E-5DEC574FF457> /System/Library/PrivateFrameworks/AppleFSCompression.framework/Versions/A/AppleFSCompression
+       0x19d06d000 -        0x19d0790a3  libbz2.1.0.dylib (47) <95721BB3-328F-34A5-9567-4BB14DD45268> /usr/lib/libbz2.1.0.dylib
+       0x19d07a000 -        0x19d080d03  libsystem_coreservices.dylib (191.4.5) <7129349D-04F9-3C3C-BF37-3082C1468654> /usr/lib/system/libsystem_coreservices.dylib
+       0x19d081000 -        0x19d0b2adf  com.apple.CoreServices.OSServices (1141.1 - 1141.1) <AE3050F3-46C3-3A20-B1F2-DF7F9400A9F0> /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/OSServices.framework/Versions/A/OSServices
+       0x19d5f0000 -        0x19d5fed87  libz.1.dylib (100) <25DC8186-B2D8-3839-9F10-D89BC289ECFF> /usr/lib/libz.1.dylib
+       0x19d5ff000 -        0x19d63ca77  libsystem_m.dylib (3312.100.1) <83B173CD-7F32-3901-8E67-C0B2676BE015> /usr/lib/system/libsystem_m.dylib
+       0x19d63d000 -        0x19d63dc9b  libcharset.1.dylib (115.100.1) <994633BA-AA7A-31BF-94C5-E31A08CA6243> /usr/lib/libcharset.1.dylib
+       0x19d63e000 -        0x19d641527  libmacho.dylib (1376.6) <9729ECEA-0A08-32E3-8BDB-B42FC15FF258> /usr/lib/system/libmacho.dylib
+       0x19d642000 -        0x19d65adc3  libkxld.dylib (12377.101.15) <6808ADDF-053F-3215-916D-A375A3531661> /usr/lib/system/libkxld.dylib
+       0x19d65b000 -        0x19d6683a7  libcommonCrypto.dylib (600035) <710EC5FA-F77C-3646-A9E3-C037C42E1539> /usr/lib/system/libcommonCrypto.dylib
+       0x19d669000 -        0x19d672ca3  libunwind.dylib (2100.2) <FB0518B9-DF0F-3A03-A74B-AF1B21C26F8B> /usr/lib/system/libunwind.dylib
+       0x19d673000 -        0x19d67a349  liboah.dylib (367.5) <2FC1EF06-04C4-35FC-8DC3-BEA1E9FBD63F> /usr/lib/liboah.dylib
+       0x19d67b000 -        0x19d6857ff  libcopyfile.dylib (240) <0B7FF027-5579-3CBF-A12B-68A4FD36641C> /usr/lib/system/libcopyfile.dylib
+       0x19d686000 -        0x19d689987  libcompiler_rt.dylib (103.3) <65E29E6E-7042-3F73-A1D2-F2C4EBCD7524> /usr/lib/system/libcompiler_rt.dylib
+       0x19d68a000 -        0x19d68e78b  libsystem_collections.dylib (1752.100.10) <B81193DE-3BEC-3340-86D0-DB7F3683D135> /usr/lib/system/libsystem_collections.dylib
+       0x19d68f000 -        0x19d6924cf  libsystem_secinit.dylib (168.100.7) <A6B77B36-195D-33F8-8058-FE0B5BFA9D37> /usr/lib/system/libsystem_secinit.dylib
+       0x19d693000 -        0x19d695bf7  libremovefile.dylib (85.100.6) <BD89B1A3-0D06-3881-B5E1-EFC6CFBDFCC1> /usr/lib/system/libremovefile.dylib
+       0x19d696000 -        0x19d696f27  libkeymgr.dylib (31) <DE8F8219-0072-35C2-8932-C065491ED15D> /usr/lib/system/libkeymgr.dylib
+       0x19d697000 -        0x19d69fe3f  libsystem_dnssd.dylib (2881.100.56.0.1) <DEC8BDD2-366C-3BF9-A123-35744DB06354> /usr/lib/system/libsystem_dnssd.dylib
+       0x19d6a0000 -        0x19d6a509b  libcache.dylib (95) <4D6833A3-C910-3A76-AA8A-303F698B36BF> /usr/lib/system/libcache.dylib
+       0x19d6a6000 -        0x19d6a7ce3  libSystem.B.dylib (1356) <E05F5341-06B7-365E-8014-E9CD64C352FE> /usr/lib/libSystem.B.dylib
+       0x19d6a8000 -        0x19d6a9fcf  libfakelink.dylib (5) <0DECB33A-FC26-3C73-8762-E9C8F15343AD> /usr/lib/libfakelink.dylib
+       0x19d6aa000 -        0x19d6aaa33  com.apple.SoftLinking (1.0 - 71) <FACACD62-537D-3FF8-B1D4-B1685938C303> /System/Library/PrivateFrameworks/SoftLinking.framework/Versions/A/SoftLinking
+       0x19d6e0000 -        0x19d6e71cb  libiconv.2.dylib (115.100.1) <E384E5FE-DFF5-36ED-88C8-0EEF2FBF89CE> /usr/lib/libiconv.2.dylib
+       0x19d6fb000 -        0x19d7f2aaf  libarchive.2.dylib (167) <9F7CC46A-CC71-3EF8-BFE9-ABE40819EA73> /usr/lib/libarchive.2.dylib
+       0x19d7f3000 -        0x19d85885b  com.apple.SearchKit (1.4.2 - 1.4.2) <3E8F0ABC-A863-3A3E-8B0C-D01A44A98468> /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/SearchKit.framework/Versions/A/SearchKit
+       0x19d859000 -        0x19d86118f  libThaiTokenizer.dylib (28) <C2DE957F-29A8-324D-AB0F-1EADC7BB4E89> /usr/lib/libThaiTokenizer.dylib
+       0x19d862000 -        0x19d885f37  com.apple.applesauce (1.0 - 17.7) <8468AF10-88F2-3DD8-9DD4-0BBFCA10B055> /System/Library/PrivateFrameworks/AppleSauce.framework/Versions/A/AppleSauce
+       0x19d886000 -        0x19d89e23b  libapple_nghttp2.dylib (37) <33B20CAF-51C2-32E9-B20B-7F3B137BFFB9> /usr/lib/libapple_nghttp2.dylib
+       0x19d89f000 -        0x19d8c5ac3  libSparseBLAS.dylib (1551.100.26) <1BC4EAAD-4363-31DF-8C91-022B24AD87CD> /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libSparseBLAS.dylib
+       0x19d8c6000 -        0x19d8c763f  com.apple.MetalPerformanceShaders.MetalPerformanceShaders (1.0 - 1) <59D13EAF-0DF5-3A93-9E12-7A1D22B52520> /System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/MetalPerformanceShaders
+       0x19d8c8000 -        0x19d8cdff7  libpam.2.dylib (35) <CF7680E1-7AB2-39A5-B30C-E3AB30A5B0BB> /usr/lib/libpam.2.dylib
+       0x19d8ce000 -        0x19d99d417  libcompression.dylib (193.100.5) <0C99FEA2-9041-3226-9995-046879C3B9B1> /usr/lib/libcompression.dylib
+       0x19d99e000 -        0x19d9a2267  libQuadrature.dylib (8) <B6674817-731D-3178-A928-7963E5EED61C> /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libQuadrature.dylib
+       0x19d9a3000 -        0x19eb7394f  libLAPACK.dylib (1551.100.26) <9170F5E5-6D1E-3667-BDCF-E74CC880EB06> /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libLAPACK.dylib
+       0x19eb74000 -        0x19ebca41f  com.apple.DictionaryServices (1.2 - 373) <EFE68757-B99A-3768-8494-2E54E23C2172> /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/DictionaryServices.framework/Versions/A/DictionaryServices
+       0x19ebcb000 -        0x19ebe94f7  liblzma.5.dylib (21) <7BC382B4-38A9-3054-8D3F-ED10CFBFF192> /usr/lib/liblzma.5.dylib
+       0x19ebea000 -        0x19ebeb85f  libcoretls_cfhelpers.dylib (187.100.3) <67086CB0-340C-3DFD-B1E0-2B4C7C77026A> /usr/lib/libcoretls_cfhelpers.dylib
+       0x19ebec000 -        0x19ec5f6cb  com.apple.APFS (2811.101.1 - 2811.101.1) <86DD0616-A944-3596-8742-36F86E537A74> /System/Library/PrivateFrameworks/APFS.framework/Versions/A/APFS
+       0x19ec60000 -        0x19ec6e693  libxar.1.dylib (503) <A3F96FD4-FBE8-3867-93EE-7FF4F9B3E867> /usr/lib/libxar.1.dylib
+       0x19ec6f000 -        0x19ec7279b  libutil.dylib (73) <4FE4BA84-8B65-343C-9A7C-A174849301F1> /usr/lib/libutil.dylib
+       0x19ec73000 -        0x19ec9dcdf  libxslt.1.dylib (21.13) <D88D4FE7-8B33-3553-9CC8-8C5888B8BAA9> /usr/lib/libxslt.1.dylib
+       0x19eca6000 -        0x19ed1f587  libvMisc.dylib (1126.100.7) <4E031DEB-7FC6-343A-8CCA-61617B5C6DF1> /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libvMisc.dylib
+       0x19ed20000 -        0x19edaf45f  libate.dylib (3.0.9) <18973DAC-3297-3904-B329-A46242C87ABA> /usr/lib/libate.dylib
+       0x19edb9000 -        0x19edcc1bf  com.apple.CrashReporterSupport (10.13 - 15140) <1238D09C-0D64-377F-913D-2DD04FEE8AF2> /System/Library/PrivateFrameworks/CrashReporterSupport.framework/Versions/A/CrashReporterSupport
+       0x19ef10000 -        0x19ef50f9f  com.apple.pluginkit.framework (1.0 - 1) <FB09CB89-BB7F-3085-B035-2D99017521B0> /System/Library/PrivateFrameworks/PlugInKit.framework/Versions/A/PlugInKit
+       0x19ef51000 -        0x19ef58403  libMatch.1.dylib (49) <9C90F41C-F7B9-356C-A2E6-61A6362F7943> /usr/lib/libMatch.1.dylib
+       0x19efc7000 -        0x19f00f9ff  com.apple.AppleVAFramework (6.2.10 - 6.2.10) <860D72AD-8149-3F4E-ACF4-EAED5CB1A85E> /System/Library/PrivateFrameworks/AppleVA.framework/Versions/A/AppleVA
+       0x19f010000 -        0x19f02acbf  libexpat.1.dylib (45) <703912FD-D1AE-310C-BC05-7388D6CED6F5> /usr/lib/libexpat.1.dylib
+       0x19f02b000 -        0x19f034bd3  libheimdal-asn1.dylib (710.100.4) <9DA69DFC-DDCE-3986-8997-B944EE0A9965> /usr/lib/libheimdal-asn1.dylib
+       0x19f155000 -        0x19f21667f  com.apple.MediaExperience (1.0 - 1) <A9DA4BC3-09C2-3E8B-8345-5A53F0D33056> /System/Library/PrivateFrameworks/MediaExperience.framework/Versions/A/MediaExperience
+       0x19f244000 -        0x19f2537ff  com.apple.GraphVisualizer (1.0 - 307) <967136C2-27D1-363D-BB62-7029C00A0FA2> /System/Library/PrivateFrameworks/GraphVisualizer.framework/Versions/A/GraphVisualizer
+       0x19f254000 -        0x19f29351f  com.apple.OTSVG (1.0 - 877.4.0.7) <F032D306-361F-36D7-AB5C-10B81D4326E4> /System/Library/PrivateFrameworks/OTSVG.framework/Versions/A/OTSVG
+       0x19f294000 -        0x19f2a0c7f  com.apple.xpc.AppServerSupport (1.0 - 3102.100.102) <A88EE161-4724-302C-A026-D1B87AD54106> /System/Library/PrivateFrameworks/AppServerSupport.framework/Versions/A/AppServerSupport
+       0x19f2a1000 -        0x19f2a7abf  libspindump.dylib (419.2.4) <7FD26E92-31BB-390A-A80B-29D8AAE9FAD8> /usr/lib/libspindump.dylib
+       0x19f2a8000 -        0x19f368dff  com.apple.Heimdal (4.0 - 2.0) <26F4315D-6DD3-34D6-B479-B1032834C093> /System/Library/PrivateFrameworks/Heimdal.framework/Versions/A/Heimdal
+       0x19f637000 -        0x19f67b6ef  com.apple.AppleJPEG (1.0 - 1) <A67D4167-3070-3F74-AAA3-D026E9B24C20> /System/Library/PrivateFrameworks/AppleJPEG.framework/Versions/A/AppleJPEG
+       0x19f67c000 -        0x19f83c92f  libJP2.dylib (2784.4.14) <04679436-B3A9-3394-ACB5-74AE06684A27> /System/Library/Frameworks/ImageIO.framework/Versions/A/Resources/libJP2.dylib
+       0x19f83d000 -        0x19f83ee1f  com.apple.WatchdogClient.framework (1.0 - 333) <62C8465E-0729-3B6F-A298-6BB40D0BD3ED> /System/Library/PrivateFrameworks/WatchdogClient.framework/Versions/A/WatchdogClient
+       0x19f83f000 -        0x19f884c1f  com.apple.MultitouchSupport.framework (9440.9 - 9440.9) <DBBEDD3D-E0C4-3520-9548-5DD8A346A941> /System/Library/PrivateFrameworks/MultitouchSupport.framework/Versions/A/MultitouchSupport
+       0x19f885000 -        0x19fddb29f  com.apple.VideoToolbox (1.0 - 3305.24.5.2) <C266DA23-A7F3-3D85-81F6-8A9DCD783FD9> /System/Library/Frameworks/VideoToolbox.framework/Versions/A/VideoToolbox
+       0x19fddc000 -        0x19fe0120f  libAudioToolboxUtility.dylib (1556.528) <C2B4CF76-E4A5-32C0-A5F3-8127BDCA92EB> /usr/lib/libAudioToolboxUtility.dylib
+       0x19fe02000 -        0x19fe2c01f  libPng.dylib (2784.4.14) <77ADBD9D-5B48-3588-AB0F-721187BED8EC> /System/Library/Frameworks/ImageIO.framework/Versions/A/Resources/libPng.dylib
+       0x19fe2d000 -        0x19fe8da77  libTIFF.dylib (2784.4.14) <88FF9BDE-4C76-3616-A764-9E8C89F7237B> /System/Library/Frameworks/ImageIO.framework/Versions/A/Resources/libTIFF.dylib
+       0x19fe8e000 -        0x19fead257  com.apple.IOPresentment (67 - 67) <964E964E-0852-3F03-8B48-331B3102CFE9> /System/Library/PrivateFrameworks/IOPresentment.framework/Versions/A/IOPresentment
+       0x19feae000 -        0x19feb27d3  com.apple.GPUWrangler (8.1.12 - 8.1.12) <87A30363-DC91-34AA-9E7F-34CE76339267> /System/Library/PrivateFrameworks/GPUWrangler.framework/Versions/A/GPUWrangler
+       0x19feb3000 -        0x19feb5913  libRadiance.dylib (2784.4.14) <9A06F7A0-3845-30D5-95F6-FD16510B8BA9> /System/Library/Frameworks/ImageIO.framework/Versions/A/Resources/libRadiance.dylib
+       0x19feb6000 -        0x19febb2f3  com.apple.DSExternalDisplay (3.1 - 380) <B9FC4FDF-0C94-3E77-AE41-B204D287F253> /System/Library/PrivateFrameworks/DSExternalDisplay.framework/Versions/A/DSExternalDisplay
+       0x19febc000 -        0x19fee6baf  libJPEG.dylib (2784.4.14) <77A9D581-5B49-3D6D-AF13-3CF5F6B3301E> /System/Library/Frameworks/ImageIO.framework/Versions/A/Resources/libJPEG.dylib
+       0x19ff15000 -        0x19ff1a9fb  libGIF.dylib (2784.4.14) <2C78C162-3F2C-3159-84F4-8E3AE1DDB990> /System/Library/Frameworks/ImageIO.framework/Versions/A/Resources/libGIF.dylib
+       0x19ff1b000 -        0x19ff2b19f  com.apple.CMCaptureCore (1.0 - 665.101.3) <2DE5381F-785A-3983-BBC7-0753BB151F14> /System/Library/PrivateFrameworks/CMCaptureCore.framework/Versions/A/CMCaptureCore
+       0x1a0ea0000 -        0x1a0f0e86f  libusrtcp.dylib (5812.101.2) <923F2A55-C3F5-3D6A-A5FE-F508E9A61204> /usr/lib/libusrtcp.dylib
+       0x1a0f0f000 -        0x1a14b093f  libswiftCore.dylib (6.3.0 - 6.3.0.123.11) <FB6AD37D-0F92-3774-AB61-0323DB22C111> /usr/lib/swift/libswiftCore.dylib
+       0x1a1564000 -        0x1a15b917f  libSessionUtility.dylib (398.516) <5904C1CD-1487-3433-93DE-92DCCAA7CB84> /System/Library/PrivateFrameworks/AudioSession.framework/libSessionUtility.dylib
+       0x1a15ba000 -        0x1a178eb9f  com.apple.audio.toolbox.AudioToolbox (1.14 - 1.14) <0D8B0DA8-C582-3CCA-B648-5EE242E876D8> /System/Library/Frameworks/AudioToolbox.framework/Versions/A/AudioToolbox
+       0x1a178f000 -        0x1a180f7df  com.apple.audio.AudioSession (1.0 - 398.516) <2EB71B02-7180-3007-B6A9-BF5DD3A4F79D> /System/Library/PrivateFrameworks/AudioSession.framework/Versions/A/AudioSession
+       0x1a1810000 -        0x1a182939f  libAudioStatistics.dylib (262.514) <F2A3C791-1F5B-35C2-972B-69785C913B0C> /usr/lib/libAudioStatistics.dylib
+       0x1a18a0000 -        0x1a18bc19b  libresolv.9.dylib (96) <1F96EC72-E8BA-32DD-84AA-13C44654C1FA> /usr/lib/libresolv.9.dylib
+       0x1a18bd000 -        0x1a18cf7e7  libsasl2.2.dylib (215) <A12DC471-B201-359D-9F0D-C8F48BDF5870> /usr/lib/libsasl2.2.dylib
+       0x1a1ab8000 -        0x1a1b98337  libSMC.dylib (38) <22C15CB5-9AD6-3866-837A-8CBE8AF5BFC4> /usr/lib/libSMC.dylib
+       0x1a1bf8000 -        0x1a1c04747  com.apple.NetAuth (6.2 - 6.2) <C9B294F3-C37B-3729-9493-10DCBE2362A6> /System/Library/PrivateFrameworks/NetAuth.framework/Versions/A/NetAuth
+       0x1a1c13000 -        0x1a1c20b1f  com.apple.perfdata (1.0 - 130) <AED99EAC-C348-3326-98F1-97D0AE3CEBAD> /System/Library/PrivateFrameworks/perfdata.framework/Versions/A/perfdata
+       0x1a1c21000 -        0x1a1c2ec9f  libperfcheck.dylib (46) <90EEF798-81FA-38B6-99AF-117D4AB01DE6> /usr/lib/libperfcheck.dylib
+       0x1a1c2f000 -        0x1a1c40187  com.apple.Kerberos (3.0 - 1) <E44B7A34-FE5B-3390-AC49-00907B159390> /System/Library/Frameworks/Kerberos.framework/Versions/A/Kerberos
+       0x1a1c41000 -        0x1a1c92aaf  com.apple.GSS (4.0 - 2.0) <6DD8C0F7-306B-3FCF-AE30-A174E455F142> /System/Library/Frameworks/GSS.framework/Versions/A/GSS
+       0x1a1c93000 -        0x1a1ca3d6f  com.apple.CommonAuth (4.0 - 2.0) <A5F22FD9-D680-3B7C-B7F9-8BE2C58F7DFF> /System/Library/PrivateFrameworks/CommonAuth.framework/Versions/A/CommonAuth
+       0x1a1ca4000 -        0x1a1d87c7f  com.apple.MobileAssets (1.0 - 1837.101.1) <BDDD31D4-3841-302F-A4B8-697F85E50F8F> /System/Library/PrivateFrameworks/MobileAsset.framework/Versions/A/MobileAsset
+       0x1a1e1a000 -        0x1a1e29160  com.apple.CorePhoneNumbers (1.0 - 1) <8E1BEC85-B822-3578-A145-720317FA3F1F> /System/Library/PrivateFrameworks/CorePhoneNumbers.framework/Versions/A/CorePhoneNumbers
+       0x1a1f76000 -        0x1a1f88227  libffi.dylib (40) <A1077614-8CA4-373B-B24D-B7C1E5D239E4> /usr/lib/libffi.dylib
+       0x1a39f3000 -        0x1a3ae6a36  com.apple.combine (1.0 - 3023) <04059A33-C97D-3F63-A2C4-E56496D251DD> /System/Library/Frameworks/Combine.framework/Versions/A/Combine
+       0x1a5d15000 -        0x1a5d1586f  com.apple.Accelerate.vecLib (3.11 - vecLib 3.11) <273012BA-11EF-3A4E-A050-A3A488943FA3> /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/vecLib
+       0x1a5d3a000 -        0x1a5d3a98f  com.apple.CoreServices (1226 - 1226) <95340769-0B35-37EA-9EAF-9A7E1D530910> /System/Library/Frameworks/CoreServices.framework/Versions/A/CoreServices
+       0x1a5fb9000 -        0x1a5fb9417  com.apple.Accelerate (1.11 - Accelerate 1.11) <0A9F7A80-1DC3-369D-AE67-2D21EE9D7C50> /System/Library/Frameworks/Accelerate.framework/Versions/A/Accelerate
+       0x1a6eae000 -        0x1a6ebd53f  com.apple.SymptomDiagnosticReporter (1.0 - 411.100.14) <A1B05E3E-3DF9-33B6-BDB3-E4644931BB69> /System/Library/PrivateFrameworks/SymptomDiagnosticReporter.framework/Versions/A/SymptomDiagnosticReporter
+       0x1a6ebe000 -        0x1a6eec2ff  com.apple.PowerLog (1.0 - 1) <36E48134-17FF-3841-B765-79589A4CFCBA> /System/Library/PrivateFrameworks/PowerLog.framework/Versions/A/PowerLog
+       0x1a6efa000 -        0x1a6fab6df  com.apple.DiscRecording (9.0.3 - 9030.4.5) <79D5F6E9-7FA2-336E-9793-225B4A412D1C> /System/Library/Frameworks/DiscRecording.framework/Versions/A/DiscRecording
+       0x1a6fac000 -        0x1a6fdd137  com.apple.MediaKit (16 - 938) <784D6F29-2E0E-3AB2-8E3E-83009F82812F> /System/Library/PrivateFrameworks/MediaKit.framework/Versions/A/MediaKit
+       0x1a7a9a000 -        0x1a7ab0950  libswiftDispatch.dylib (1542.100.32) <CFCF86C6-4B2C-3D79-A3B2-93B725BCEF2C> /usr/lib/swift/libswiftDispatch.dylib
+       0x1a7dfb000 -        0x1a7e87c3f  com.apple.BoardServices (1.0 - 732.1.1) <00CE20DD-828E-3ECD-92A3-FF88B0DA61CE> /System/Library/PrivateFrameworks/BoardServices.framework/Versions/A/BoardServices
+       0x1a7ec8000 -        0x1a7ed553f  com.apple.GraphicsServices (1.0 - 1.0) <C1833E07-4E3E-3604-9C04-CEF7FA7B55D9> /System/Library/PrivateFrameworks/GraphicsServices.framework/Versions/A/GraphicsServices
+       0x1a81f1000 -        0x1a8212e9f  com.apple.DebugSymbols (216 - 217) <28F7AD5A-D1F0-36D5-9658-BDE3910BEA55> /System/Library/PrivateFrameworks/DebugSymbols.framework/Versions/A/DebugSymbols
+       0x1a8213000 -        0x1a836e5ff  com.apple.CoreSymbolication (16.0 - 64575.51.1) <FDAEC762-CC55-34D9-9951-85382E50F9F5> /System/Library/PrivateFrameworks/CoreSymbolication.framework/Versions/A/CoreSymbolication
+       0x1a836f000 -        0x1a837909f  com.apple.CoreTime (334.0.16.3 - 334.0.16.3) <6B69F2AE-681C-34FE-AF72-5932E6396B76> /System/Library/PrivateFrameworks/CoreTime.framework/Versions/A/CoreTime
+       0x1a9cc7000 -        0x1a9d3959f  com.apple.BackBoardServices (1.0 - 1.0) <1BFBA7A9-B789-3FCB-9C5D-987DE4D1DEE8> /System/Library/PrivateFrameworks/BackBoardServices.framework/Versions/A/BackBoardServices
+       0x1a9d3a000 -        0x1a9d754ef  com.apple.LDAPFramework (2.4.28 - 194.5) <2FEFD34B-DFD5-36E0-9CEE-7EFE6FDA7FD9> /System/Library/Frameworks/LDAP.framework/Versions/A/LDAP
+       0x1a9d76000 -        0x1a9d777b7  com.apple.TrustEvaluationAgent (2.0 - 38) <16ED4F40-C1B7-3F95-8FDD-CDE8DD7FA1A7> /System/Library/PrivateFrameworks/TrustEvaluationAgent.framework/Versions/A/TrustEvaluationAgent
+       0x1a9ea5000 -        0x1a9f5e57f  com.apple.DiskImagesFramework (683.100.3 - 683.100.3) <B870832E-8BB7-3E88-9B9D-A25AEB6FD2B0> /System/Library/PrivateFrameworks/DiskImages.framework/Versions/A/DiskImages
+       0x1a9f9f000 -        0x1a9fb55bf  com.apple.RemoteServiceDiscovery (1.0 - 219.100.6) <F4BB09A4-E464-35B8-968E-8936A4298C48> /System/Library/PrivateFrameworks/RemoteServiceDiscovery.framework/Versions/A/RemoteServiceDiscovery
+       0x1a9fb6000 -        0x1a9fcbc3f  com.apple.xpc.RemoteXPC (1.0 - 3102.100.102) <ED290C70-5627-3D78-98CF-FDDCC7E6176B> /System/Library/PrivateFrameworks/RemoteXPC.framework/Versions/A/RemoteXPC
+       0x1aa060000 -        0x1aa0e0f43  libcurl.4.dylib (164) <E0A4E7B3-7592-39E5-B8B9-D1DB72C95041> /usr/lib/libcurl.4.dylib
+       0x1aa0e7000 -        0x1aa12a25f  com.apple.AppSupport (1.0.0 - 29) <3DE9E998-0707-3635-B57B-1954D8712DFB> /System/Library/PrivateFrameworks/AppSupport.framework/Versions/A/AppSupport
+       0x1aa3fb000 -        0x1aa3fdf3f  com.apple.InternationalTextSearch (1.0 - 1) <33E50974-2591-31C3-9853-2096E37742F3> /System/Library/PrivateFrameworks/InternationalTextSearch.framework/Versions/A/InternationalTextSearch
+       0x1aa9ca000 -        0x1aa9ca3f7  libHeimdalProxy.dylib (88) <4E34BA0D-4F2D-3A97-8A03-0F961CF5A58A> /System/Library/Frameworks/Kerberos.framework/Versions/A/Libraries/libHeimdalProxy.dylib
+       0x1aa9f5000 -        0x1aaa13b9f  com.apple.StreamingZip (1.0 - 1) <4D3F2AFC-034D-30C7-88D1-B7B2DC521310> /System/Library/PrivateFrameworks/StreamingZip.framework/Versions/A/StreamingZip
+       0x1aaa6d000 -        0x1aaa706bf  libswiftObjectiveC.dylib (951.7) <1BF42593-32DC-301E-B8EC-BFDA5DE18F37> /usr/lib/swift/libswiftObjectiveC.dylib
+       0x1aaa71000 -        0x1aaa8e6ff  libswiftos.dylib (1082) <B8E3586E-8FD3-37F9-A004-C0E369A4F650> /usr/lib/swift/libswiftos.dylib
+       0x1ab9a7000 -        0x1ab9d799f  com.apple.ANEServices (9.511 - 9.511) <76555323-AE24-3804-8064-60846E7511C4> /System/Library/PrivateFrameworks/ANEServices.framework/Versions/A/ANEServices
+       0x1ab9d8000 -        0x1aba6685f  com.apple.proactive.support.ProactiveSupport (1.0 - 418.1) <F035491A-8388-3A51-B36A-C3B20C8A0FE8> /System/Library/PrivateFrameworks/ProactiveSupport.framework/Versions/A/ProactiveSupport
+       0x1abb63000 -        0x1abb8729f  com.apple.ASEProcessing (1.55.0 - 1.55.0) <830CFC7B-FEDE-3187-A209-B49966597433> /System/Library/PrivateFrameworks/ASEProcessing.framework/Versions/A/ASEProcessing
+       0x1acc23000 -        0x1acc9087f  com.apple.CoreML.AppleNeuralEngine (1.0 - 1) <342FCCB6-AE2A-3DBA-91A1-44B2D3E5A82D> /System/Library/PrivateFrameworks/AppleNeuralEngine.framework/Versions/A/AppleNeuralEngine
+       0x1acdde000 -        0x1aceacc1f  com.apple.audio.midi.CoreMIDI (2.0 - 88) <03707B1E-A19F-32D7-98A9-E3A7248B1209> /System/Library/Frameworks/CoreMIDI.framework/Versions/A/CoreMIDI
+       0x1adae6000 -        0x1adaea75f  com.apple.IOSurfaceAccelerator (1.0.0 - 1.0.0) <ED79EC5A-409D-39A9-9521-3043C39FE108> /System/Library/PrivateFrameworks/IOSurfaceAccelerator.framework/Versions/A/IOSurfaceAccelerator
+       0x1b2942000 -        0x1b29559ff  com.apple.HID (1.0 - 1) <F7402197-24C0-392F-9137-8681EF9C6670> /System/Library/PrivateFrameworks/HID.framework/Versions/A/HID
+       0x1b2956000 -        0x1b29a73bf  com.apple.IOGPU (130.13 - 130.13) <B601D375-9282-3556-A8A9-E8942FEA0D19> /System/Library/PrivateFrameworks/IOGPU.framework/Versions/A/IOGPU
+       0x1b73e8000 -        0x1b73f71ff  com.apple.NetFS (6.0 - 4.0) <96DF6DA3-4780-3138-8318-2D9292EA4775> /System/Library/Frameworks/NetFS.framework/Versions/A/NetFS
+       0x1b7942000 -        0x1b7944707  libswiftDarwin.dylib (377.100.15) <319E1D29-E697-3ABC-BE2D-B897CD71F3F2> /usr/lib/swift/libswiftDarwin.dylib
+       0x1b9995000 -        0x1b9a7e4bf  libquic.dylib (5812.101.2) <4D5CD3CB-3FDD-38B3-BB26-EBB2582A5AA1> /usr/lib/libquic.dylib
+       0x1b9a8a000 -        0x1b9ab2eff  com.apple.private.SystemPolicy (1.0 - 1) <8618CC84-FA89-362C-AD11-E70A0B62EFF8> /System/Library/PrivateFrameworks/SystemPolicy.framework/Versions/A/SystemPolicy
+       0x1ba95a000 -        0x1ba9e8bff  com.apple.LoggingSupport (1.0 - 1861.100.19) <F1F1C407-6F51-3081-B00F-EA13A5B3DED8> /System/Library/PrivateFrameworks/LoggingSupport.framework/Versions/A/LoggingSupport
+       0x1ba9e9000 -        0x1ba9f5acb  com.apple.MallocStackLogging (1.0 - 65000) <0A1A0710-C15E-3C5D-A67A-B582F40B23F4> /System/Library/PrivateFrameworks/MallocStackLogging.framework/Versions/A/MallocStackLogging
+       0x1baa1b000 -        0x1baa73aff  libmis.dylib (463.100.17) <6709C629-CDF4-3590-94C3-720428D172F5> /usr/lib/libmis.dylib
+       0x1baa74000 -        0x1baa77c5f  com.apple.gpusw.GPURawCounter (34 - 34) <5EB9C19F-7B49-31FC-A0F4-F8DDBD5B2859> /System/Library/PrivateFrameworks/GPURawCounter.framework/Versions/A/GPURawCounter
+       0x1baa78000 -        0x1baa9787f  libswiftCoreAudio.dylib (411.520) <E048689E-9E66-3941-AA17-48B0A441ED26> /usr/lib/swift/libswiftCoreAudio.dylib
+       0x1baa98000 -        0x1baa9e327  libswiftCoreFoundation.dylib (2411) <8160F4BC-FCFC-3847-8912-7D784E814692> /usr/lib/swift/libswiftCoreFoundation.dylib
+       0x1baaab000 -        0x1baaf76d3  libswiftXPC.dylib (128.100.15) <60C33839-9A05-3397-A1FB-CC203B10AB2D> /usr/lib/swift/libswiftXPC.dylib
+       0x1baaf9000 -        0x1baaf98a3  libswiftIOKit.dylib (1) <3609AE97-C1C9-3D5C-995D-1351BE19C532> /usr/lib/swift/libswiftIOKit.dylib
+       0x1bcb25000 -        0x1bcb5e2c7  libbootpolicy.dylib (289.100.5) <906CDC5E-FCE3-3DB4-AC97-46C9373D6C26> /usr/lib/libbootpolicy.dylib
+       0x1be5d3000 -        0x1be5ea88b  libswiftsimd.dylib (23) <BF085F71-EE8E-3791-B258-816A98B1E84B> /usr/lib/swift/libswiftsimd.dylib
+       0x1bfcac000 -        0x1bfce82af  libncurses.5.4.dylib (79) <071B3987-EFA6-3936-B470-B7ECDCD000FB> /usr/lib/libncurses.5.4.dylib
+       0x1bfce9000 -        0x1bfcf237f  com.apple.IOAccelMemoryInfo (1.0 - 1) <AEE0B693-229A-32BD-8CF6-B534B4FB73E1> /System/Library/PrivateFrameworks/IOAccelMemoryInfo.framework/Versions/A/IOAccelMemoryInfo
+       0x1c13a4000 -        0x1c13ad0be  libswiftCoreMIDI.dylib (6) <5E94EF55-3133-3ABB-9C73-E75138953F3D> /usr/lib/swift/libswiftCoreMIDI.dylib
+       0x1c1b80000 -        0x1c1b86bbf  com.apple.MSUDataAccessor (1.0 - 1) <CBF1231F-9088-3855-83B8-9B5196641BBC> /System/Library/PrivateFrameworks/MSUDataAccessor.framework/Versions/A/MSUDataAccessor
+       0x1c1faa000 -        0x1c200ca3f  com.apple.SoftwareUpdateCoreSupport (1.0 - 1) <820532AC-6CC2-352E-95F0-CD31377DA3B4> /System/Library/PrivateFrameworks/SoftwareUpdateCoreSupport.framework/Versions/A/SoftwareUpdateCoreSupport
+       0x1c5ac5000 -        0x1c5b1c39f  com.apple.biome.BiomeFoundation (1.0 - 209.15.0.2) <87FC78C7-6A65-3209-9537-DEE615D84725> /System/Library/PrivateFrameworks/BiomeFoundation.framework/Versions/A/BiomeFoundation
+       0x1c89e5000 -        0x1c89f2a1f  libswiftMetal.dylib (372.16) <D96EF332-F72B-3B75-82E3-5FBDD6882BC4> /usr/lib/swift/libswiftMetal.dylib
+       0x1c89f3000 -        0x1c89f9e05  libswiftCompression.dylib (11) <E0C174A8-CE74-3FF0-81C3-E71693751F76> /usr/lib/swift/libswiftCompression.dylib
+       0x1c9917000 -        0x1c99c1d5f  libFDR.dylib (1499.100.48) <142B6C05-3B93-3A74-89BB-FC0719EDAFD0> /usr/lib/libFDR.dylib
+       0x1c9a43000 -        0x1ca00df5f  com.apple.biome.BiomeStreams (1.0 - 209.15.0.2) <89BE0C47-C549-3DB1-AEEE-8A5DEBEE4688> /System/Library/PrivateFrameworks/BiomeStreams.framework/Versions/A/BiomeStreams
+       0x1ca4e1000 -        0x1ca4f58ff  com.apple.SoftwareUpdateCoreConnect (1.0 - 1) <1C3E0445-FC4C-3BA1-A555-7CBB653840F2> /System/Library/PrivateFrameworks/SoftwareUpdateCoreConnect.framework/Versions/A/SoftwareUpdateCoreConnect
+       0x1cc930000 -        0x1cc99ac1f  com.apple.osanalytics.OSAnalytics (1.0 - 1) <69F29612-5092-3F2F-BA61-5510D4857FA2> /System/Library/PrivateFrameworks/OSAnalytics.framework/Versions/A/OSAnalytics
+       0x1cddc6000 -        0x1cddc7f9f  libswiftQuartzCore.dylib (5) <CCB3028F-09BA-3887-947D-6F8FD47E2B09> /usr/lib/swift/libswiftQuartzCore.dylib
+       0x1ce1b9000 -        0x1ce1be8e7  com.apple.kperf (1.0 - 1) <56910FEC-A3D1-3DF4-9CD3-31C65D4B7B88> /System/Library/PrivateFrameworks/kperf.framework/Versions/A/kperf
+       0x1ce2d0000 -        0x1ce2d563f  com.apple.MobileSystemServices (1.0 - 1) <61161103-8CB4-34CC-8AD6-43F587D2D25B> /System/Library/PrivateFrameworks/MobileSystemServices.framework/Versions/A/MobileSystemServices
+       0x1cf8ba000 -        0x1cf8dc29f  libamsupport.dylib (434.100.4) <0D37C527-DC1F-363A-B4D8-A0E95104DA36> /usr/lib/libamsupport.dylib
+       0x1cfcb8000 -        0x1cfd180bf  com.apple.biome.BiomePubSub (1.0 - 209.15.0.2) <1056981B-EFD4-37A2-8CA3-2691A18A34EF> /System/Library/PrivateFrameworks/BiomePubSub.framework/Versions/A/BiomePubSub
+       0x1cfd19000 -        0x1cfd5c01f  com.apple.biome.BiomeStorage (1.0 - 209.15.0.2) <31E41201-08D1-338B-BDED-CC6A677D7487> /System/Library/PrivateFrameworks/BiomeStorage.framework/Versions/A/BiomeStorage
+       0x1d284e000 -        0x1d285d13f  libswiftUniformTypeIdentifiers.dylib (877.4.9.400) <B08C16EF-8677-3331-B9A6-16294A1A6AA0> /usr/lib/swift/libswiftUniformTypeIdentifiers.dylib
+       0x1d285e000 -        0x1d2923a9b  libswiftAccelerate.dylib (77.100.2) <ADC97387-1D6A-3155-B732-3F5066BD6360> /usr/lib/swift/libswiftAccelerate.dylib
+       0x1d2a76000 -        0x1d2a8711f  libpartition2_dynamic.dylib (3476.100.145) <21D8FFBE-3A8A-3D01-B608-085D50238EE5> /usr/lib/libpartition2_dynamic.dylib
+       0x1d2fe3000 -        0x1d2fedfdf  com.apple.AFKUser (1.0 - 1) <C25CEB23-5EF8-3E11-A260-EDA76C3A7105> /System/Library/PrivateFrameworks/AFKUser.framework/Versions/A/AFKUser
+       0x1d69c7000 -        0x1d6a2875f  libswiftCoreMedia.dylib (3305.24.5.2) <450AA35C-B2E6-3327-827B-ACEB171F87D4> /usr/lib/swift/libswiftCoreMedia.dylib
+       0x1d8175000 -        0x1d8176bbf  libswiftOSLog.dylib (10) <2B310D36-BAAA-346C-860E-2B9FA9EBFE2F> /usr/lib/swift/libswiftOSLog.dylib
+       0x1dc23b000 -        0x1dc347aff  com.apple.Symbolication (16.0 - 64575.69.1) <D18DE969-073E-38CF-BA4F-466045A5818D> /System/Library/PrivateFrameworks/Symbolication.framework/Versions/A/Symbolication
+       0x1e0842000 -        0x1e08523df  com.apple.OSLog (1.0 - 1861.100.19) <D1D8B4E1-367E-3ED0-AD02-37D720B6F1E7> /System/Library/Frameworks/OSLog.framework/Versions/A/OSLog
+       0x1e0b50000 -        0x1e0c6175f  com.apple.InternalSwiftProtobuf (1.0 - 1.26.0) <A510588F-6A70-3706-8E8F-AD186EE908A9> /System/Library/PrivateFrameworks/InternalSwiftProtobuf.framework/Versions/A/InternalSwiftProtobuf
+       0x1e0d27000 -        0x1e0d320bf  com.apple.HIDDisplay (1.0 - 1) <B2053120-9D29-3678-8566-7388E0B5DC33> /System/Library/PrivateFrameworks/HIDDisplay.framework/Versions/A/HIDDisplay
+       0x1e8c86000 -        0x1e8c86af3  com.apple.FeatureFlags (1.0 - 103) <320F2910-E9AD-3A26-A9E5-80709DE442C6> /System/Library/PrivateFrameworks/FeatureFlags.framework/Versions/A/FeatureFlags
+       0x1f22ae000 -        0x1f22b05bf  com.apple.ConfigProfileHelper (18.0 - 1800) <CC0C5D1A-B8D4-31A2-89E1-0EFAC52DCB20> /System/Library/PrivateFrameworks/ConfigProfileHelper.framework/Versions/A/ConfigProfileHelper
+       0x22fc70000 -        0x2312e9067  com.apple.ANECompiler (9.509.0 - 9.509.0) <27B2AFC5-42C2-35A0-8DC0-2B06592B4F15> /System/Library/PrivateFrameworks/ANECompiler.framework/Versions/A/ANECompiler
+       0x2328e6000 -        0x2328ed2a3  libCoreFSCache.dylib (352) <4AC2B004-453D-3053-8CE3-DB02BF78634B> /System/Library/Frameworks/OpenGL.framework/Versions/A/Libraries/libCoreFSCache.dylib
+       0x2328ee000 -        0x2328f3947  libCoreVMClient.dylib (352) <F3F2109F-8C42-3EF3-8E23-69CE9D6D21AC> /System/Library/Frameworks/OpenGL.framework/Versions/A/Libraries/libCoreVMClient.dylib
+       0x2328f4000 -        0x2329042b7  com.apple.opengl (23.1.1 - 23.1.1) <46037BEA-D5A5-3E3F-BB30-1CAC01B5068F> /System/Library/Frameworks/OpenGL.framework/Versions/A/OpenGL
+       0x232905000 -        0x2329077bf  libCVMSPluginSupport.dylib (23.1.1) <484EB0B7-ED7C-312E-B3A6-B64CC93FAA93> /System/Library/Frameworks/OpenGL.framework/Versions/A/Libraries/libCVMSPluginSupport.dylib
+       0x232908000 -        0x2329104ff  libGFXShared.dylib (23.1.1) <7288278F-C62B-38D0-A3B9-5745AA80CE86> /System/Library/Frameworks/OpenGL.framework/Versions/A/Libraries/libGFXShared.dylib
+       0x232911000 -        0x23294454b  libGLImage.dylib (23.1.1) <D1122A05-2EBB-3AD2-8892-C24FF521D310> /System/Library/Frameworks/OpenGL.framework/Versions/A/Libraries/libGLImage.dylib
+       0x232945000 -        0x23297e5bf  libGLU.dylib (23.1.1) <535E6602-2A32-3E9B-9556-AD1D11D2C842> /System/Library/Frameworks/OpenGL.framework/Versions/A/Libraries/libGLU.dylib
+       0x232ad5000 -        0x232adebc7  libGL.dylib (23.1.1) <C7B73037-CD52-3D9D-A485-91245CEFAD48> /System/Library/Frameworks/OpenGL.framework/Versions/A/Libraries/libGL.dylib
+       0x23496a000 -        0x234adc81f  com.apple.ExtensionFoundation (97 - 97) <8414CA2A-21EF-3B0B-A60B-789666C62990> /System/Library/Frameworks/ExtensionFoundation.framework/Versions/A/ExtensionFoundation
+       0x235d55000 -        0x235d97a1f  com.apple.LightweightCodeRequirements (1.0 - 1) <BC31094B-0028-31CE-A0A4-AAAD41DD9AA3> /System/Library/Frameworks/LightweightCodeRequirements.framework/Versions/A/LightweightCodeRequirements
+       0x236bb7000 -        0x236bd51ff  com.apple.MPSBenchmarkLoop (1.0 - 1) <FE426DDE-CE08-3740-8439-2EF901E3576F> /System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSBenchmarkLoop.framework/Versions/A/MPSBenchmarkLoop
+       0x236bd6000 -        0x236be9e7f  com.apple.MPSFunctions (1.0 - 1) <E72A458C-E7CA-3070-983D-DCF1A13856FB> /System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSFunctions.framework/Versions/A/MPSFunctions
+       0x236bea000 -        0x236bef53f  com.apple.MPSHost (1.0 - 1) <EB2488F5-7C40-3E41-AF79-232149835176> /System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSHost.framework/Versions/A/MPSHost
+       0x236bf0000 -        0x237f2767f  com.apple.MetalPerformanceShadersGraph (6.4.2 - 6.4.2) <7A190F03-A6E4-316C-B574-DD383E59751C> /System/Library/Frameworks/MetalPerformanceShadersGraph.framework/Versions/A/MetalPerformanceShadersGraph
+       0x239e97000 -        0x23a0034bf  com.apple.SwiftData (1.0 - 135) <35B80273-CE4A-3CF8-BD6C-7DC17BA20BFB> /System/Library/Frameworks/SwiftData.framework/Versions/A/SwiftData
+       0x240a47000 -        0x240a5babf  com.apple.AppleDeviceQuerySupport (1.0 - 408.100.18) <280507E6-93B0-3DEE-842C-42912C1A394B> /System/Library/PrivateFrameworks/AppleDeviceQuerySupport.framework/Versions/A/AppleDeviceQuerySupport
+       0x2411d2000 -        0x24124ccc6  com.apple.AppleKeyStore (1.0 - 1.0) <67B6D752-B0D2-34AC-9F6B-4368F0CCF674> /System/Library/PrivateFrameworks/AppleKeyStore.framework/Versions/A/AppleKeyStore
+       0x241b75000 -        0x241b8d9df  com.apple.private.AppleMobileFileIntegrity-fmk (1.0 - 1) <8EB88354-07F6-3225-A92E-F7CE8595573B> /System/Library/PrivateFrameworks/AppleMobileFileIntegrity.framework/Versions/A/AppleMobileFileIntegrity
+       0x242086000 -        0x242098799  com.apple.AtomicsInternal (1.1.0 - 154) <407FE060-8C88-3194-A21B-8688FD8EC4E5> /System/Library/PrivateFrameworks/AtomicsInternal.framework/Versions/A/AtomicsInternal
+       0x242155000 -        0x242177dff  com.apple.imgaudio.AudioAnalytics (1.0 - 1) <836137A2-2EFE-35FF-B641-6042C5D72771> /System/Library/PrivateFrameworks/AudioAnalytics.framework/Versions/A/AudioAnalytics
+       0x242747000 -        0x24278f7df  com.apple.BackBoardHIDEventFoundation (1.0 - 1) <BDDBB7D2-5979-3E4D-A110-D6484BE6B63D> /System/Library/PrivateFrameworks/BackBoardHIDEventFoundation.framework/Versions/A/BackBoardHIDEventFoundation
+       0x242828000 -        0x2428418df  com.apple.biome.BiomeDSL (1.0 - 209.15.0.2) <B81F347F-E6B4-3E12-84CA-F9B1B70FF675> /System/Library/PrivateFrameworks/BiomeDSL.framework/Versions/A/BiomeDSL
+       0x242842000 -        0x2430ef15f  com.apple.BiomeLibrary (274.52) <E7A86C30-C81B-3E2E-8C9D-AB0301998890> /System/Library/PrivateFrameworks/BiomeLibrary.framework/Versions/A/BiomeLibrary
+       0x2430f0000 -        0x2430f5b5f  com.apple.biome.BiomeSync (1.0 - 209.15.0.2) <102054CD-90EC-3295-9F9B-F98336CD69B3> /System/Library/PrivateFrameworks/BiomeSync.framework/Versions/A/BiomeSync
+       0x24471e000 -        0x2447b6dbf  com.apple.biome.CascadeSets (1.0 - 209.15.0.2) <6CED7B79-85C6-3ABA-A1D4-691B2031239D> /System/Library/PrivateFrameworks/CascadeSets.framework/Versions/A/CascadeSets
+       0x245b6b000 -        0x245caa2ae  com.apple.CollectionsInternal (1.2.0 - 154) <1A480C96-2A0B-3BDC-BE26-7779B2F282DB> /System/Library/PrivateFrameworks/CollectionsInternal.framework/Versions/A/CollectionsInternal
+       0x24ce67000 -        0x24ce7a49f  com.apple.DeviceRecovery (1.0 - 1) <4B0612CE-7637-3581-B9A1-7EBC923047FC> /System/Library/PrivateFrameworks/DeviceRecovery.framework/Versions/A/DeviceRecovery
+       0x24f100000 -        0x24f1032ff  com.apple.FontServices (1.0 - 1) <2D16E478-3384-3947-8A97-472C8265DEA3> /System/Library/PrivateFrameworks/FontServices.framework/Versions/A/FontServices
+       0x24f104000 -        0x24f1f3e2f  libXTFontStaticRegistryData.dylib (335.4.0.6) <D3CA2DB8-9982-3978-BABC-92B5D3E4528C> /System/Library/PrivateFrameworks/FontServices.framework/libXTFontStaticRegistryData.dylib
+       0x24f1f5000 -        0x24f201c9f  com.apple.FramePacing (1.0 - 1) <94C088E1-45CE-32F2-94E2-D92BE086B6F4> /System/Library/PrivateFrameworks/FramePacing.framework/Versions/A/FramePacing
+       0x250322000 -        0x250327f07  libGPUCompilerUtils.dylib (32023.883.1) <CB93CEE8-91B3-31B0-9EF4-9A2261EE0DC1> /System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/32023/Libraries/libGPUCompilerUtils.dylib
+       0x254795000 -        0x2547d4797  libllvm-flatbuffers.dylib (32023.883.1) <5C724D09-588C-3E79-8D58-209B6147A7AD> /System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/32023/Libraries/libllvm-flatbuffers.dylib
+       0x25c00f000 -        0x25c11829f  com.apple.InstalledContentLibrary (1.0 - 1.0) <B509C80B-393D-34B8-969F-F6C7F3332041> /System/Library/PrivateFrameworks/InstalledContentLibrary.framework/Versions/A/InstalledContentLibrary
+       0x25ea4c000 -        0x25f21a35f  com.apple.IntelligencePlatformLibrary (274.52) <FB23F4B0-47DB-3BB7-86EB-6B155DA406CF> /System/Library/PrivateFrameworks/IntelligencePlatformLibrary.framework/Versions/A/IntelligencePlatformLibrary
+       0x260af5000 -        0x26118b923  com.apple.MIL (3520.4 - 3520.4.1) <AE9BCA7C-3F03-3EEE-9687-F02E8CD6110C> /System/Library/PrivateFrameworks/MIL.framework/Versions/A/MIL
+       0x263ef1000 -        0x263f0831f  com.apple.ggml.ModelAsset (1.0 - 1) <B532BC19-9B2F-3F0B-9945-E9A7014757A3> /System/Library/PrivateFrameworks/MLModelAsset.framework/Versions/A/MLModelAsset
+       0x265cfb000 -        0x265d5ca5f  com.apple.MessageSecurity (1.0 - 195.100.77) <A209D53C-DAD5-3A1F-A8C2-14B0C20A547A> /System/Library/PrivateFrameworks/MessageSecurity.framework/Versions/A/MessageSecurity
+       0x26a977000 -        0x26abef3df  com.apple.mlpt.ODIE (1.0 - 1) <815E9513-4279-3E15-820A-ACB6134C60EB> /System/Library/PrivateFrameworks/ODIE.framework/Versions/A/ODIE
+       0x26abf5000 -        0x26ac1eb1f  com.apple.OSEligibility (319.101.1) <9D45879B-E72F-3EC2-B8BA-F17AF6993AB1> /System/Library/PrivateFrameworks/OSEligibility.framework/Versions/A/OSEligibility
+       0x26b875000 -        0x26b98d85f  com.apple.ParsingInternal (0.0.1 - 154) <AA740584-BC9B-3F37-9A1A-EF0414380CE6> /System/Library/PrivateFrameworks/ParsingInternal.framework/Versions/A/ParsingInternal
+       0x26ed20000 -        0x26ed41e1f  com.apple.accessibility.PhotosensitivityProcessing (1.0 - 1) <3931DECB-C3BB-39E7-BCBF-54CCE20032C7> /System/Library/PrivateFrameworks/PhotosensitivityProcessing.framework/Versions/A/PhotosensitivityProcessing
+       0x26f134000 -        0x26f170a3c  com.apple.PoirotSQLite (1.0 - 1) <B3D3E21E-698D-3C9E-B4DF-7DB6B7A31822> /System/Library/PrivateFrameworks/PoirotSQLite.framework/Versions/A/PoirotSQLite
+       0x26f171000 -        0x26f1de25f  com.apple.PoirotSchematizer (1.0 - 1) <4992FDC0-2A39-37DD-926E-0E9F9CC9B381> /System/Library/PrivateFrameworks/PoirotSchematizer.framework/Versions/A/PoirotSchematizer
+       0x26f1df000 -        0x26f214bff  com.apple.PoirotUDFs (1.0 - 1) <A70FE2AE-430C-30E5-B105-B3DCC294DF37> /System/Library/PrivateFrameworks/PoirotUDFs.framework/Versions/A/PoirotUDFs
+       0x2703a9000 -        0x2704e511f  com.apple.ProDisplayLibrary (10.4.28 - 10.4.28) <085F6583-4A26-3006-8C7A-853A09AD40E0> /System/Library/PrivateFrameworks/ProDisplayLibrary.framework/Versions/A/ProDisplayLibrary
+       0x27147d000 -        0x2714854cf  com.apple.ReflectionInternal (1.0.0 - 154) <FBAA34DB-DCB6-36C6-94C7-DFB542C0A55B> /System/Library/PrivateFrameworks/ReflectionInternal.framework/Versions/A/ReflectionInternal
+       0x2723c5000 -        0x2723d89c7  com.apple.RuntimeInternal (1.0.0 - 154) <0A0F41D4-3475-30F6-8682-3227EC3FE8A8> /System/Library/PrivateFrameworks/RuntimeInternal.framework/Versions/A/RuntimeInternal
+       0x272617000 -        0x272684abf  com.apple.SILManager (53.19 - 53.19) <A1A3D3E5-BB48-318C-A1A2-949DAE63B749> /System/Library/PrivateFrameworks/SILManager.framework/Versions/A/SILManager
+       0x27dad8000 -        0x27db044a1  com.apple.security.SwiftASN1Internal (1.0 - 1) <EDAC3CA1-D139-3B18-941A-86FC1B7E2143> /System/Library/PrivateFrameworks/SwiftASN1Internal.framework/Versions/A/SwiftASN1Internal
+       0x2811eb000 -        0x2812271df  com.apple.tightbeam (1.0 - 483.100.88) <AFDCDFFD-BD5E-3527-B924-8860400C0AD3> /System/Library/PrivateFrameworks/Tightbeam.framework/Versions/A/Tightbeam
+       0x2858f4000 -        0x2858f52cf  com.apple.VideoToolboxParavirtualizationSupport (64.4.7 - 64.4.7) <C020E1A9-FA32-3DDE-A814-761CC904519C> /System/Library/PrivateFrameworks/VideoToolboxParavirtualizationSupport.framework/Versions/A/VideoToolboxParavirtualizationSupport
+       0x28fb36000 -        0x28fbd035f  libAppleArchive.dylib (450.100.4) <F7C3CEC7-1F55-3617-B917-F221A2BCE7B6> /usr/lib/libAppleArchive.dylib
+       0x28fc8b000 -        0x28fc9545f  libCoreEntitlements.dylib (80.100.6) <40E810FC-0D99-3C00-92D7-F0C66D6152FB> /usr/lib/libCoreEntitlements.dylib
+       0x28ff81000 -        0x28ff8887f  libReverseProxyDevice.dylib (104.40.3) <1EE2E566-2280-3B41-B13B-BF71517DC956> /usr/lib/libReverseProxyDevice.dylib
+       0x28ff89000 -        0x28ff90349  libRosetta.dylib (367.5) <2FC1EF06-04C4-35FC-8DC3-BEA1E9FBD63F> /usr/lib/libRosetta.dylib
+       0x28fff8000 -        0x2900013ff  libTLE.dylib (80.100.6) <876EA47E-51E0-39FB-9D49-E6654AD58464> /usr/lib/libTLE.dylib
+       0x2908c5000 -        0x2909d6b17  libcrypto.46.dylib (109.100.2) <DAA12A78-F0F0-30B8-92F4-C9257843E858> /usr/lib/libcrypto.46.dylib
+       0x290b11000 -        0x290b2d762  libhvf.dylib (11) <FA8F5DCD-0A2B-30A9-8BD5-065DF59ED592> /usr/lib/libhvf.dylib
+       0x29145e000 -        0x291496527  libssl.48.dylib (109.100.2) <7BD6E551-5BBF-3AEB-B1A7-BD698770A40E> /usr/lib/libssl.48.dylib
+       0x2914d1000 -        0x2914fee37  libswiftPrespecialized.dylib (0) <A7F970BC-D107-3D9B-A49E-ACA772E588E6> /usr/lib/libswiftPrespecialized.dylib
+       0x29179a000 -        0x2917ac043  libswiftDistributed.dylib (6.3.0 - 6.3.0.123.11) <B39D029A-D50B-3A5F-8ED3-CDB591E7D429> /usr/lib/swift/libswiftDistributed.dylib
+       0x2917c3000 -        0x2917d2ebc  libswiftObservation.dylib (6.3.0 - 6.3.0.123.11) <8A5C9C34-6237-3DAF-B402-7CCBDA47E028> /usr/lib/swift/libswiftObservation.dylib
+       0x2918ff000 -        0x2919128ef  libswiftSynchronization.dylib (6.3.0 - 6.3.0.123.11) <8D3DB366-76F8-3D99-8CC3-326AA513F7B4> /usr/lib/swift/libswiftSynchronization.dylib
+       0x291913000 -        0x29192be60  libswiftSystem.dylib (75) <9808DC7D-BE41-300B-A7E2-BA827446EE0A> /usr/lib/swift/libswiftSystem.dylib
+       0x29192d000 -        0x29194379f  libswiftVideoToolbox.dylib (3305.24.5.2) <3E76FAE6-CDCE-31A2-BC50-3907797972CF> /usr/lib/swift/libswiftVideoToolbox.dylib
+       0x291945000 -        0x291945669  libswift_Builtin_float.dylib (6.3.0.123.11) <86B92BEF-06E8-3E10-A155-E1AB40B3F854> /usr/lib/swift/libswift_Builtin_float.dylib
+       0x291946000 -        0x2919d1095  libswift_Concurrency.dylib (6.3.0 - 6.3.0.123.11) <02634765-CB69-3C2B-9CCE-10103CBEA22A> /usr/lib/swift/libswift_Concurrency.dylib
+       0x2919d2000 -        0x2919d4f83  libswift_DarwinFoundation1.dylib (377.100.15) <251F0C0D-17E0-37BB-A903-BB04A6C99999> /usr/lib/swift/libswift_DarwinFoundation1.dylib
+       0x2919d5000 -        0x2919d5eeb  libswift_DarwinFoundation2.dylib (377.100.15) <D22D6BC3-62DD-314C-8A8E-56CD69ABAB3C> /usr/lib/swift/libswift_DarwinFoundation2.dylib
+       0x2919d6000 -        0x2919d67a7  libswift_DarwinFoundation3.dylib (377.100.15) <02812A8B-CF65-3C0F-A795-C4A03E71D00E> /usr/lib/swift/libswift_DarwinFoundation3.dylib
+       0x2919d7000 -        0x291a7549f  libswift_RegexParser.dylib (6.3 - 6.3.0.123.11) <4AFB7E54-4E3C-351E-A353-9B1C99CBDA36> /usr/lib/swift/libswift_RegexParser.dylib
+       0x291a76000 -        0x291b020bd  libswift_StringProcessing.dylib (6.3 - 6.3.0.123.11) <DC0CDBD3-5AAF-3A71-880F-8E40074817E4> /usr/lib/swift/libswift_StringProcessing.dylib
+       0x291c66000 -        0x291c69a4b  libsystem_darwindirectory.dylib (122) <CCAA2170-32DD-34BD-A927-32DF30893969> /usr/lib/system/libsystem_darwindirectory.dylib
+       0x291c6a000 -        0x291c735a7  libsystem_eligibility.dylib (319.101.1) <2D19994A-87BB-34B8-A343-CB8DD47FF110> /usr/lib/system/libsystem_eligibility.dylib
+       0x291c74000 -        0x291c7b8db  libsystem_sanitizers.dylib (26) <FCB93D2F-4437-3089-A43F-A19BC23DD65B> /usr/lib/system/libsystem_sanitizers.dylib
+       0x291c7c000 -        0x291c7cbb7  libsystem_trial.dylib (474.2.18) <5BB81430-4E33-3160-94D2-1FFB2B614DB2> /usr/lib/system/libsystem_trial.dylib

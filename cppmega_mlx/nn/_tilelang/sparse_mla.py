@@ -618,15 +618,8 @@ def sparse_mla_fwd_metal(
     sm_scale_buf = mx.array([float(sm_scale)], dtype=mx.float32)
 
     grid_x = shapes.batch * shapes.seq_len * shapes.heads
-    # Wave 6 opt-in: engine-extracted Path C kernel (shape-specialized; no
-    # template list passed). Default mode keeps the templated Path B kernel.
-    engine_kernel = _engine_extracted_fwd_kernel(shapes, threads)
-    fwd_kernel = engine_kernel if engine_kernel is not None else _FWD_KERNEL
-    fwd_template: list[tuple[str, object]] | None = (
-        None if engine_kernel is not None else template
-    )
     outputs = _msl_transform.dispatch(
-        cast(_msl_transform.MetalKernel, fwd_kernel),
+        cast(_msl_transform.MetalKernel, _FWD_KERNEL),
         inputs=[q16, kv16, indices_i32, sm_scale_buf],
         output_shapes=[
             (shapes.batch, shapes.seq_len, shapes.heads, shapes.d_v),
@@ -635,7 +628,7 @@ def sparse_mla_fwd_metal(
         output_dtypes=[mx.float16, mx.float32],
         grid=(grid_x * threads, 1, 1),
         threadgroup=(threads, 1, 1),
-        template=fwd_template,
+        template=template,
     )
     out, lse = outputs
     return out, lse
@@ -700,41 +693,19 @@ def sparse_mla_bwd_metal(
     sm_scale_buf = mx.array([float(sm_scale)], dtype=mx.float32)
 
     grid_x = shapes.batch * shapes.seq_len * shapes.heads
-    # Wave 6 opt-in: engine-extracted Path C kernel (input order matches
-    # Path C bwd: ``[d_out, indices, kv, q, sm_scale_buf]`` → outputs
-    # ``[dkv_partial, dq]``). Default Path B keeps its own ordering.
-    engine_kernel = _engine_extracted_bwd_kernel(shapes, threads)
-    bwd_template: list[tuple[str, object]] | None = (
-        None if engine_kernel is not None else template
+    outputs = _msl_transform.dispatch(
+        cast(_msl_transform.MetalKernel, _BWD_KERNEL),
+        inputs=[q16, kv16, indices_i32, d_out16, sm_scale_buf],
+        output_shapes=[
+            (shapes.batch, shapes.seq_len, shapes.heads, shapes.qk_dim),
+            (shapes.batch, shapes.seq_len, shapes.heads, shapes.topk, shapes.qk_dim),
+        ],
+        output_dtypes=[mx.float16, mx.float16],
+        grid=(grid_x * threads, 1, 1),
+        threadgroup=(threads, 1, 1),
+        template=template,
     )
-    if engine_kernel is not None:
-        outputs = _msl_transform.dispatch(
-            cast(_msl_transform.MetalKernel, engine_kernel),
-            inputs=[d_out16, indices_i32, kv16, q16, sm_scale_buf],
-            output_shapes=[
-                (shapes.batch, shapes.seq_len, shapes.heads, shapes.topk, shapes.qk_dim),
-                (shapes.batch, shapes.seq_len, shapes.heads, shapes.qk_dim),
-            ],
-            output_dtypes=[mx.float16, mx.float16],
-            grid=(grid_x * threads, 1, 1),
-            threadgroup=(threads, 1, 1),
-            template=bwd_template,
-        )
-        dkv_partial, dq = outputs
-    else:
-        outputs = _msl_transform.dispatch(
-            cast(_msl_transform.MetalKernel, _BWD_KERNEL),
-            inputs=[q16, kv16, indices_i32, d_out16, sm_scale_buf],
-            output_shapes=[
-                (shapes.batch, shapes.seq_len, shapes.heads, shapes.qk_dim),
-                (shapes.batch, shapes.seq_len, shapes.heads, shapes.topk, shapes.qk_dim),
-            ],
-            output_dtypes=[mx.float16, mx.float16],
-            grid=(grid_x * threads, 1, 1),
-            threadgroup=(threads, 1, 1),
-            template=template,
-        )
-        dq, dkv_partial = outputs
+    dq, dkv_partial = outputs
 
     # Reduce dkv_partial by scatter-add into the full kv shape.
     # dkv_partial: [B, S, H, topk, qk_dim] (fp16)
@@ -749,7 +720,7 @@ def sparse_mla_bwd_metal(
 
 def _reduce_dkv_partial(
     dkv_partial: mx.array,
-    indices_i32: mx.array,
+    indices: mx.array,
     shapes,
 ) -> mx.array:
     """Scatter-add dkv_partial[b, s, h, k, d] into dkv[b, idx[b, s, g, k], g, d].
@@ -778,8 +749,8 @@ def _reduce_dkv_partial(
     # The scatter shape: source = [B, S, G, topk, qk_dim], target = [B, Skv, G, qk_dim].
     # We need to handle invalid (-1) indices by zeroing the corresponding source row.
 
-    valid_mask = indices_i32 != -1  # [B, S, G, topk]
-    safe_idx = mx.maximum(indices_i32, mx.array(0, dtype=mx.int32))  # [B, S, G, topk]
+    valid_mask = indices != -1  # [B, S, G, topk]
+    safe_idx = mx.maximum(indices, mx.array(0, dtype=indices.dtype))  # [B, S, G, topk]
 
     # Apply valid mask to source.
     dkv_per_group_f32 = dkv_per_group.astype(mx.float32)
@@ -790,9 +761,9 @@ def _reduce_dkv_partial(
     # Build full index tensors for each axis:
     # axis0 = b, axis1 = safe_idx, axis2 = g
     # The values to add: dkv_per_group_masked.
-    batch_idx = mx.arange(B, dtype=mx.int32).reshape(B, 1, 1, 1)
+    batch_idx = mx.arange(B, dtype=indices.dtype).reshape(B, 1, 1, 1)
     batch_idx = mx.broadcast_to(batch_idx, (B, S, G, topk))
-    group_idx = mx.arange(G, dtype=mx.int32).reshape(1, 1, G, 1)
+    group_idx = mx.arange(G, dtype=indices.dtype).reshape(1, 1, G, 1)
     group_idx = mx.broadcast_to(group_idx, (B, S, G, topk))
 
     # Initialize dkv as zeros in fp32 for scatter accuracy, cast at the end.
@@ -922,147 +893,6 @@ def sparse_mla_apply(
     return sparse_mla_attention_reference(
         q, kv, indices, sm_scale=sm_scale, d_v=d_v, return_lse=False
     )
-
-
-# ---------------------------------------------------------------------------
-# Wave 6: opt-in Path C engine-extraction bridge
-# ---------------------------------------------------------------------------
-#
-# When ``CPPMEGA_MLX_TILELANG_ENGINE=engine_with_msl_extraction`` is set we
-# route through ``sparse_mla_path_c._fwd_kernel_for`` / ``_bwd_kernel_for`` so
-# the same numerical contract is produced via the unified
-# ``tilelang.engine.lower(target=Target("metal"))`` pipeline plus the
-# MSL-extraction adapter (commit 00d6d90). Default mode keeps Path B
-# unchanged, so the 14 callers do not regress.
-
-_ENGINE_FWD_CACHE: dict[tuple[int, ...], object | None] = {}
-_ENGINE_BWD_CACHE: dict[tuple[int, ...], object | None] = {}
-
-
-def _engine_extracted_fwd_kernel(
-    shapes: "_ShapeInfo", threads: int
-) -> _msl_transform.MetalKernel | None:
-    """Return a per-shape Path C engine-extracted fwd MetalKernel, or None.
-
-    Path C lowering is shape-specialized (no template pass-through at
-    dispatch). When this returns a kernel the caller must dispatch with
-    ``template=None``; ``None`` signals fall-back to the templated Path B
-    ``_FWD_KERNEL`` plus its template list.
-    """
-
-    from cppmega_mlx.nn._tilelang._engine_dispatch import tilelang_engine_mode
-
-    if tilelang_engine_mode() != "engine_with_msl_extraction":
-        return None
-
-    key = (
-        shapes.batch,
-        shapes.seq_len,
-        shapes.heads,
-        shapes.qk_dim,
-        shapes.kv_group,
-        shapes.head_kv,
-        shapes.topk,
-        shapes.seq_len_kv,
-        shapes.d_v,
-        threads,
-    )
-    if key in _ENGINE_FWD_CACHE:
-        return _ENGINE_FWD_CACHE[key]  # type: ignore[return-value]
-    try:
-        from cppmega_mlx.nn._tilelang import sparse_mla_path_c
-    except Exception:  # pragma: no cover - opt-in path only
-        _ENGINE_FWD_CACHE[key] = None
-        return None
-    try:
-        artifact_or_lowering = sparse_mla_path_c._fwd_kernel_for(
-            BATCH=shapes.batch,
-            SEQ_LEN=shapes.seq_len,
-            HEADS=shapes.heads,
-            QK_DIM=shapes.qk_dim,
-            KV_GROUP=shapes.kv_group,
-            HEAD_KV=shapes.head_kv,
-            TOPK=shapes.topk,
-            SEQ_LEN_KV=shapes.seq_len_kv,
-            D_V=shapes.d_v,
-            THREADS=threads,
-        )
-    except Exception:  # pragma: no cover - opt-in path only
-        _ENGINE_FWD_CACHE[key] = None
-        return None
-    body = getattr(artifact_or_lowering, "body", None)
-    header = getattr(artifact_or_lowering, "header", "") or ""
-    if not body:
-        _ENGINE_FWD_CACHE[key] = None
-        return None
-    kernel = _msl_transform.make_metal_kernel(
-        name=f"cppmega_sparse_mla_fwd_engine_{key[0]}_{key[1]}_{key[2]}_{key[6]}",
-        input_names=["q", "kv", "indices", "sm_scale_buf"],
-        output_names=["out", "lse"],
-        source=body,
-        header=header,
-    )
-    _ENGINE_FWD_CACHE[key] = kernel
-    return kernel
-
-
-def _engine_extracted_bwd_kernel(
-    shapes: "_ShapeInfo", threads: int
-) -> _msl_transform.MetalKernel | None:
-    """Return a per-shape Path C engine-extracted bwd MetalKernel, or None."""
-
-    from cppmega_mlx.nn._tilelang._engine_dispatch import tilelang_engine_mode
-
-    if tilelang_engine_mode() != "engine_with_msl_extraction":
-        return None
-
-    key = (
-        shapes.batch,
-        shapes.seq_len,
-        shapes.heads,
-        shapes.qk_dim,
-        shapes.kv_group,
-        shapes.head_kv,
-        shapes.topk,
-        shapes.seq_len_kv,
-        threads,
-    )
-    if key in _ENGINE_BWD_CACHE:
-        return _ENGINE_BWD_CACHE[key]  # type: ignore[return-value]
-    try:
-        from cppmega_mlx.nn._tilelang import sparse_mla_path_c
-    except Exception:  # pragma: no cover
-        _ENGINE_BWD_CACHE[key] = None
-        return None
-    try:
-        artifact_or_lowering = sparse_mla_path_c._bwd_kernel_for(
-            BATCH=shapes.batch,
-            SEQ_LEN=shapes.seq_len,
-            HEADS=shapes.heads,
-            QK_DIM=shapes.qk_dim,
-            KV_GROUP=shapes.kv_group,
-            HEAD_KV=shapes.head_kv,
-            TOPK=shapes.topk,
-            SEQ_LEN_KV=shapes.seq_len_kv,
-            THREADS=threads,
-        )
-    except Exception:  # pragma: no cover
-        _ENGINE_BWD_CACHE[key] = None
-        return None
-    body = getattr(artifact_or_lowering, "body", None)
-    header = getattr(artifact_or_lowering, "header", "") or ""
-    if not body:
-        _ENGINE_BWD_CACHE[key] = None
-        return None
-    kernel = _msl_transform.make_metal_kernel(
-        name=f"cppmega_sparse_mla_bwd_engine_{key[0]}_{key[1]}_{key[2]}_{key[6]}",
-        input_names=["d_out", "indices", "kv", "q", "sm_scale_buf"],
-        output_names=["dkv_partial", "dq"],
-        source=body,
-        header=header,
-    )
-    _ENGINE_BWD_CACHE[key] = kernel
-    return kernel
 
 
 __all__ = [

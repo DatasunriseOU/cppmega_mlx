@@ -112,10 +112,12 @@ def test_lint_blocks_ad_hoc_custom_metal_kernel_construction(tmp_path: Path) -> 
     assert result.returncode == 1
     assert result.stderr == ""
     assert f"{source}:3: MLX002" in result.stdout
-    assert "fallback/parity/VJP/JVP/profile-evidence" in result.stdout
+    assert "allowlisted legacy/debug direct-MSL modules" in result.stdout
 
 
-def test_lint_allows_owned_metal_policy_seam(tmp_path: Path) -> None:
+def test_lint_rejects_raw_metal_kernel_even_in_owned_policy_seam(
+    tmp_path: Path,
+) -> None:
     owned = tmp_path / "cppmega_mlx" / "kernels" / "metal_ops.py"
     owned.parent.mkdir(parents=True)
     owned.write_text(
@@ -135,6 +137,210 @@ def test_lint_allows_owned_metal_policy_seam(tmp_path: Path) -> None:
     )
 
     result = run_lint(owned)
+
+    assert result.returncode == 1
+    assert f"{owned}:3: MLX002" in result.stdout
+    assert result.stderr == ""
+
+
+def test_lint_allows_marked_legacy_debug_direct_msl_module(tmp_path: Path) -> None:
+    source = tmp_path / "cppmega_mlx" / "nn" / "_tilelang" / "topk_selector.py"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        "\n".join(
+            [
+                '"""Legacy/debug Path B direct-MSL module."""',
+                "import mlx.core as mx",
+                "from cppmega_mlx.nn._tilelang import _msl_transform",
+                "",
+                "kernel = mx.fast.metal_kernel(",
+                "    name='legacy_debug',",
+                "    input_names=['x'],",
+                "    output_names=['y'],",
+                "    source='uint elem = thread_position_in_grid.x;'",
+                ")",
+                "",
+                "def launch(x):",
+                "    return _msl_transform.dispatch(",
+                "        kernel,",
+                "        inputs=[x],",
+                "        output_shapes=[x.shape],",
+                "        output_dtypes=[x.dtype],",
+                "    )",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_lint(source)
+
+    assert result.returncode == 0
+    assert result.stdout == ""
+    assert result.stderr == ""
+
+
+def test_lint_blocks_msl_transform_dispatch_outside_legacy_debug_modules(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "cppmega_mlx" / "nn" / "_tilelang" / "new_path_c.py"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        "\n".join(
+            [
+                "from cppmega_mlx.nn._tilelang import _msl_transform",
+                "",
+                "def launch(kernel, x):",
+                "    return _msl_transform.dispatch(",
+                "        kernel,",
+                "        inputs=[x],",
+                "        output_shapes=[x.shape],",
+                "        output_dtypes=[x.dtype],",
+                "    )",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_lint(source)
+
+    assert result.returncode == 1
+    assert f"{source}:4: MLX005" in result.stdout
+    assert "native TileLang/TVM-FFI" in result.stdout
+    assert result.stderr == ""
+
+
+def test_lint_blocks_imported_msl_transform_dispatch_alias(tmp_path: Path) -> None:
+    source = tmp_path / "cppmega_mlx" / "nn" / "_tilelang" / "new_alias.py"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        "\n".join(
+            [
+                "from cppmega_mlx.nn._tilelang._msl_transform import dispatch as msl_dispatch",
+                "",
+                "def launch(kernel, x):",
+                "    return msl_dispatch(",
+                "        kernel,",
+                "        inputs=[x],",
+                "        output_shapes=[x.shape],",
+                "        output_dtypes=[x.dtype],",
+                "    )",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_lint(source)
+
+    assert result.returncode == 1
+    assert f"{source}:4: MLX005" in result.stdout
+    assert result.stderr == ""
+
+
+def test_lint_blocks_direct_native_tvm_ffi_bridge_imports(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "cppmega_mlx" / "nn" / "_tilelang" / "bad_bridge.py"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        "\n".join(
+            [
+                "from tilelang.contrib.mlx_tvm_ffi import owner_output_buffer",
+                "",
+                "def launch(shape, dtype):",
+                "    return owner_output_buffer(shape, dtype)",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_lint(source)
+
+    assert result.returncode == 1
+    assert f"{source}:1: MLX007" in result.stdout
+    assert "tilelang -> tvm -> tvm-ffi adapter" in result.stdout
+    assert result.stderr == ""
+
+
+def test_lint_blocks_native_tvm_ffi_bridge_parent_imports(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "cppmega_mlx" / "nn" / "_tilelang" / "bad_bridge_parent.py"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        "\n".join(
+            [
+                "from tilelang.contrib import mlx_tvm_ffi",
+                "",
+                "def launch(func, inputs):",
+                "    return mlx_tvm_ffi.metal_call(func, inputs=inputs, output_shapes=[], output_dtypes=[], result_indices=[], num_params=0)",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_lint(source)
+
+    assert result.returncode == 1
+    assert f"{source}:1: MLX007" in result.stdout
+    assert result.stderr == ""
+
+
+def test_lint_blocks_dynamic_native_tvm_ffi_bridge_imports(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "cppmega_mlx" / "nn" / "_tilelang" / "bad_bridge_dynamic.py"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        "\n".join(
+            [
+                "import importlib",
+                "",
+                "def load():",
+                "    return importlib.import_module('tilelang.jit.adapter._mlx_tvm_ffi')",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_lint(source)
+
+    assert result.returncode == 1
+    assert f"{source}:4: MLX007" in result.stdout
+    assert result.stderr == ""
+
+
+def test_lint_blocks_monkeypatch_patterns_in_production_modules(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "cppmega_mlx" / "nn" / "bad_patch.py"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        "\n".join(
+            [
+                "import pytest",
+                "",
+                "def configure(monkeypatch: pytest.MonkeyPatch) -> None:",
+                "    monkeypatch.setattr(target, 'value', 1)",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_lint(source)
+
+    assert result.returncode == 1
+    assert f"{source}:1: MLX006" in result.stdout
+    assert f"{source}:3: MLX006" in result.stdout
+    assert f"{source}:4: MLX006" in result.stdout
+    assert result.stderr == ""
+
+
+def test_lint_production_direct_msl_and_monkeypatch_guardrails_are_green() -> None:
+    result = run_lint(
+        "--select",
+        "MLX002,MLX005,MLX006,MLX007",
+        ROOT / "cppmega_mlx",
+    )
 
     assert result.returncode == 0
     assert result.stdout == ""
@@ -175,11 +381,12 @@ def test_lint_requires_custom_gradient_when_metal_kernel_enters_autodiff(
 def test_lint_accepts_custom_gradient_marker_for_differentiable_metal(
     tmp_path: Path,
 ) -> None:
-    owned = tmp_path / "cppmega_mlx" / "kernels" / "metal_ops.py"
+    owned = tmp_path / "cppmega_mlx" / "nn" / "_tilelang" / "mamba3.py"
     owned.parent.mkdir(parents=True)
     owned.write_text(
         "\n".join(
             [
+                '"""Legacy Path B direct-MSL module."""',
                 "import mlx.core as mx",
                 "import mlx.nn as nn",
                 "",

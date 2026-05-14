@@ -8,24 +8,20 @@ dequantize, copy, or cast large tensors at the wrapper boundary.
 
 The production entry point is the owner-output form
 ``fp8_scaled_matmul_path_c(..., out=existing_array)``. The no-``out`` helper
-uses MLX's allocating ``mx.fast.metal_kernel`` API and is legacy/debug-only;
-it requires ``CPPMEGA_FP8_PATH_C_LEGACY_MLX_FAST=1``.
+is retired because any allocation-backed wrapper would hide ownership and
+data-movement semantics at the Python boundary.
 """
 
 from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any
 
 import mlx.core as mx
 
 from cppmega_mlx.nn._tilelang import _msl_transform
-from cppmega_mlx.nn._tilelang._engine_dispatch import dispatch_lower
-from cppmega_mlx.nn._tilelang._msl_transform import (
-    MSLDispatchUnsupported,
-    can_run_metal,
-)
+from cppmega_mlx.nn._tilelang._msl_transform import can_run_metal
 
 
 TILELANG_METAL_MATMUL_TARGET = "metal -thread_warp_size=32"
@@ -56,30 +52,16 @@ class FP8MatmulPathCDirectError(RuntimeError):
 
 
 class FP8MatmulPathCLegacyError(RuntimeError):
-    """Raised when the legacy no-out MLX allocation path is not enabled."""
+    """Raised when callers request the retired no-out allocation path."""
 
 
-def _legacy_mlx_fast_enabled() -> bool:
-    import os
-
-    return os.environ.get(FP8_PATH_C_LEGACY_MLX_FAST_ENV, "0") in (
-        "1",
-        "true",
-        "True",
-        "yes",
-        "YES",
-    )
-
-
-def _require_legacy_mlx_fast_enabled(op_name: str) -> None:
-    if _legacy_mlx_fast_enabled():
-        return
+def _raise_owner_output_required(op_name: str) -> None:
     raise FP8MatmulPathCLegacyError(
-        f"{op_name}: no-out Path C dispatch is a legacy/debug-only "
-        "mx.fast.metal_kernel path that allocates an MLX output. Production "
-        "callers must pass out=existing_mx_array to use the tvm-ffi "
-        f"owner-output route. Set {FP8_PATH_C_LEGACY_MLX_FAST_ENV}=1 only "
-        "for parity tests or benchmarks."
+        f"{op_name}: no-out Path C dispatch is retired. The only supported "
+        "FP8 Path C matmul route is tvm-ffi owner-output dispatch; pass "
+        "out=existing_mx_array. The old mx.fast.metal_kernel allocation "
+        f"path is not re-enabled by {FP8_PATH_C_LEGACY_MLX_FAST_ENV} because "
+        "it would allocate an output outside the caller-owned buffer contract."
     )
 
 
@@ -141,107 +123,11 @@ def _make_scaled_matmul_kernel(
     return tilelang.language.prim_func(_fp8_scaled_matmul_kernel_template)
 
 
-_FP8_MATMUL_KERNEL_CACHE: dict[
-    tuple[int, int, int, int, int, int, int, str],
-    tuple[
-        Any,
-        _msl_transform.TileLangMSLLowering,
-        list[str],
-        tuple[int, int],
-        tuple[int, int, int],
-        tuple[int, int, int],
-    ],
-] = {}
-_FP8_MATMUL_KERNEL_CACHE_LOCK = threading.RLock()
 _FP8_MATMUL_TVM_FFI_KERNEL_CACHE: dict[
     tuple[int, int, int, int, int, int, int, str],
     Any,
 ] = {}
 _FP8_MATMUL_TVM_FFI_KERNEL_CACHE_LOCK = threading.RLock()
-
-
-def _grid_for_lowering(lowering: _msl_transform.TileLangMSLLowering) -> tuple[int, int, int]:
-    return _msl_transform.metal_grid_for_lowering(lowering)
-
-
-def _fp8_matmul_kernel_for(
-    *,
-    M: int,
-    N: int,
-    K: int,
-    BM: int,
-    BN: int,
-    BK: int,
-    num_stages: int,
-    c_dtype: str = "float32",
-) -> tuple[
-    Any,
-    _msl_transform.TileLangMSLLowering,
-    list[str],
-    tuple[int, int],
-    tuple[int, int, int],
-    tuple[int, int, int],
-]:
-    cache_key = (
-        int(M),
-        int(N),
-        int(K),
-        int(BM),
-        int(BN),
-        int(BK),
-        int(num_stages),
-        str(c_dtype),
-    )
-    with _FP8_MATMUL_KERNEL_CACHE_LOCK:
-        cached = _FP8_MATMUL_KERNEL_CACHE.get(cache_key)
-        if cached is not None:
-            return cached
-
-    prim = _make_scaled_matmul_kernel(
-        M=M,
-        N=N,
-        K=K,
-        BM=BM,
-        BN=BN,
-        BK=BK,
-        num_stages=num_stages,
-        c_dtype=c_dtype,
-    )
-    lowering = cast(
-        _msl_transform.TileLangMSLLowering,
-        dispatch_lower(
-            prim,
-            target=TILELANG_METAL_MATMUL_TARGET,
-            return_msl=True,
-        ),
-    )
-    tilelang_input_names = [name for name in lowering.buffer_param_names if name != "C"]
-    if set(tilelang_input_names) != {"A_fp8", "A_scale", "B_fp8", "B_scale"}:
-        raise MSLDispatchUnsupported(
-            "unexpected TileLang FP8 matmul buffer signature: "
-            + ", ".join(lowering.buffer_param_names)
-        )
-    input_names = ["A_fp8", "A_scale", "B_fp8", "B_scale"]
-    output_shape = (int(M), int(N))
-    kernel = mx.fast.metal_kernel(
-        name=f"cppmega_fp8_matmul_path_c_{M}_{N}_{K}_{BM}_{BN}_{BK}_{num_stages}",
-        input_names=input_names,
-        output_names=["C"],
-        source=lowering.body,
-        header=lowering.header,
-        ensure_row_contiguous=True,
-    )
-    result = (
-        kernel,
-        lowering,
-        input_names,
-        output_shape,
-        _grid_for_lowering(lowering),
-        lowering.threadgroup,
-    )
-    with _FP8_MATMUL_KERNEL_CACHE_LOCK:
-        _FP8_MATMUL_KERNEL_CACHE[cache_key] = result
-    return result
 
 
 def _fp8_matmul_tvm_ffi_kernel_for(
@@ -467,9 +353,8 @@ def fp8_scaled_matmul_path_c(
     ``A_fp8`` is ``(M,K)`` uint8 e4m3 storage and ``B_fp8`` is transposed
     ``(N,K)`` storage. Scales are scalar fp32 only in this first prepared-buffer
     surface. When ``out`` is provided, runs the direct tvm-ffi owner-output
-    route and returns that same object. Without ``out``, this function now
-    fail-closes unless ``CPPMEGA_FP8_PATH_C_LEGACY_MLX_FAST=1`` is set; that
-    opt-in path is legacy/debug-only because MLX allocates the output.
+    route and returns that same object. Without ``out``, this function fails
+    explicitly: there is no non-owner-output Path C dispatch surface.
     """
 
     if out is not None:
@@ -485,35 +370,7 @@ def fp8_scaled_matmul_path_c(
             num_stages=num_stages,
         )
 
-    if not can_run_metal():
-        return None
-    _require_legacy_mlx_fast_enabled("fp8_scaled_matmul_path_c")
-    A, A_scale, B, B_scale, M, N, K = _normalize_inputs(A_fp8, B_fp8, scale_a, scale_b)
-    try:
-        kernel, _lowering, input_names, output_shape, grid, threadgroup = _fp8_matmul_kernel_for(
-            M=M,
-            N=N,
-            K=K,
-            BM=int(BM),
-            BN=int(BN),
-            BK=int(BK),
-            num_stages=int(num_stages),
-        )
-    except MSLDispatchUnsupported:
-        return None
-
-    if input_names != ["A_fp8", "A_scale", "B_fp8", "B_scale"]:
-        raise RuntimeError(f"fp8_scaled_matmul_path_c: unexpected input order {input_names!r}")
-    outputs = cast(_msl_transform.MetalKernel, kernel)(
-        inputs=(A, A_scale, B, B_scale),
-        template=None,
-        output_shapes=(output_shape,),
-        output_dtypes=(mx.float32,),
-        grid=grid,
-        threadgroup=threadgroup,
-        stream=mx.gpu,
-    )
-    return outputs[0]
+    _raise_owner_output_required("fp8_scaled_matmul_path_c")
 
 
 def fp8_matmul_path_c_status() -> FP8MatmulPathCStatus:

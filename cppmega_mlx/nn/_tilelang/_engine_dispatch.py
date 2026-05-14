@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import os
 import warnings
-from typing import Any
+from typing import Any, Sequence
 
 
 _VALID_MODES = ("auto", "engine", "shim", "engine_with_msl_extraction")
@@ -109,6 +109,82 @@ def _engine_compile(
         # the artifact unchanged if we cannot stamp it.
         pass
     return artifact
+
+
+def _prim_func_param_count(prim_func: Any) -> int:
+    params = getattr(prim_func, "params", None)
+    if params is None:
+        raise ValueError("PrimFunc-like object must expose a .params sequence")
+    return len(params)
+
+
+def _compile_target_for_native_tvm_ffi(target: Any) -> Any:
+    if isinstance(target, str) and target.startswith("metal") and "-" in target:
+        from cppmega_mlx.nn._tilelang._msl_transform import _as_metal_target
+
+        return _as_metal_target(target)
+    return target
+
+
+def compile_native_tilelang_kernel(
+    prim_func: Any,
+    target: Any,
+    *,
+    out_idx: int | Sequence[int] | None,
+    pass_configs: dict[str, Any] | None = None,
+    allow_graph_outputs: bool = False,
+) -> Any:
+    """Compile ``prim_func`` for the native TileLang TVM-FFI MLX boundary.
+
+    This is the replacement boundary for Path C production callers that should
+    not consume ``TileLangMSLLowering.body`` or build ``mx.fast.metal_kernel``.
+    It always requests ``execution_backend="tvm_ffi"`` from TileLang and wraps
+    the artifact in :class:`NativeTileLangKernel`, whose dispatch contract
+    requires caller-owned ``out=`` buffers by default.
+    """
+
+    import tilelang  # noqa: F401 - intentional eager import for ImportError surfacing
+    from cppmega_mlx.nn._tilelang._mlx_runtime import (
+        NativeTileLangKernel,
+        normalize_out_idx,
+    )
+    from cppmega_mlx.nn._tilelang._msl_transform import _ensure_single_libtvm_ffi_image
+
+    _ensure_path_c_metal_intrinsics_registered()
+    _ensure_single_libtvm_ffi_image()
+
+    num_params = _prim_func_param_count(prim_func)
+    result_indices = normalize_out_idx(out_idx, num_params=num_params)
+    compile_target = _compile_target_for_native_tvm_ffi(target)
+    pass_context = _with_pass_context(pass_configs)
+    if pass_context is None:
+        artifact = tilelang.compile(
+            prim_func,
+            target=compile_target,
+            execution_backend="tvm_ffi",
+            out_idx=out_idx,
+        )
+    else:
+        with pass_context:
+            artifact = tilelang.compile(
+                prim_func,
+                target=compile_target,
+                execution_backend="tvm_ffi",
+                out_idx=out_idx,
+            )
+    try:
+        setattr(artifact, "_tilelang_engine_target", target)
+        setattr(artifact, "_tilelang_execution_backend", "tvm_ffi")
+        setattr(artifact, "_tilelang_result_indices", result_indices)
+    except (AttributeError, TypeError):
+        pass
+    return NativeTileLangKernel(
+        artifact=artifact,
+        result_indices=result_indices,
+        num_params=num_params,
+        target=target,
+        allow_graph_outputs=allow_graph_outputs,
+    )
 
 
 def _engine_lower_for_msl_extraction(
@@ -327,6 +403,7 @@ def artifact_to_source(artifact: Any) -> str:
 
 
 __all__ = [
+    "compile_native_tilelang_kernel",
     "dispatch_lower",
     "dispatch_lower_supports_msl_extraction",
     "tilelang_engine_mode",

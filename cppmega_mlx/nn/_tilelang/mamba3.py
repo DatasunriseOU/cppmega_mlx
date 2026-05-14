@@ -11,16 +11,15 @@
    rewrite that introduces ``T.serial(reverse=True)`` over ``t`` and treats
    the per-thread carry as a ``T.alloc_fragment`` of static shape.
 
-   The MSL-extraction adapter
-   (:func:`cppmega_mlx.nn._tilelang._msl_extraction.extract_msl_from_engine_artifact`,
-   commit ``00d6d90``) is in tree and the prerequisite ``return_msl=True``
-   kwarg on ``dispatch_lower`` works for the simpler tile-parallel kernels
-   (``topk_selector`` already flipped). Porting these scan kernels remains a
-   wave-6 line item: write ``mamba3_mimo_fwd_prim`` /
-   ``mamba3_mimo_bwd_prim`` ``@T.prim_func`` factories, route through
-   ``dispatch_lower(prim, "metal", return_msl=True)``, then feed the
-   extracted MSL string into the existing ``_msl_transform.make_metal_kernel``
-   call site so the 12 mlx + 2 cppmega call sites stay numerically identical.
+   There is no safe inverse transform from these hand-written MSL strings back
+   into TileLang IR, and extracting MSL only helps callers that already start
+   from a ``@T.prim_func``. Porting these scan kernels remains a wave-6 line
+   item: write ``mamba3_mimo_fwd_prim`` / ``mamba3_mimo_bwd_prim``
+   ``@T.prim_func`` factories, then compile them with
+   ``tilelang.compile(..., execution_backend="tvm_ffi", out_idx=...)`` into
+   explicit caller-owned outputs. The sibling ``mamba3_path_c.py`` module is
+   that native route today; this file is the legacy direct-MSL fallback until
+   Path C has the production receipts to replace it for every caller.
 
    Until then this module stays on its hand-written MSL source to preserve
    numerical parity. See ``MIGRATION_PLAN.md`` and the wave-6 tracker.
@@ -160,8 +159,10 @@ _FWD_KERNEL_HEADER = """
 # per-thread ``float h_state[STATE]`` cumulative state — does not fit the
 # tile-parallel ``T.Parallel`` idiom cleanly. Once a ``mamba3_mimo_fwd_prim``
 # ``@T.prim_func`` exists, route through
-# ``dispatch_lower(prim, "metal", return_msl=True)`` and feed the extracted
-# MSL into ``make_metal_kernel(source=...)`` to keep the runtime contract.
+# ``tilelang.compile(..., execution_backend="tvm_ffi", out_idx=...)`` with
+# explicit owner outputs. Do not add an MSL-string shim here: this source is
+# already hand-written MSL, so there is no TileLang lowering artifact to
+# migrate.
 _FWD_KERNEL = _msl_transform.make_metal_kernel(
     name="cppmega_mamba3_mimo_fwd",
     input_names=["x", "B_proj", "C_proj", "z", "A", "dt", "D", "h0"],

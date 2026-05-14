@@ -8,16 +8,20 @@ modify it.
 
 TODO(wave-7): unified-pipeline migration deferred — both _FWD_KERNEL and
 _BWD_KERNEL are hand-written MSL constructed via
-``_msl_transform.make_metal_kernel`` (no ``@T.prim_func`` to feed
-``dispatch_lower``). The MSL-extraction adapter (commit 00d6d90) only
-applies to ``tilelang.engine.lower(prim, target)`` artifacts, which is the
-inverse direction. Migrating m2rnn to the unified pipeline therefore
-requires a full TileLang DSL rewrite of both the forward scan (per-kk row-
-of-h fragment + threadgroup-shared W + ``T.serial(S)``) and the backward
-two-pass walk (forward sweep persisting h_{t-1} to scratch, backward time
-loop with cross-thread dW reduction). All required TileLang primitives
-exist; the blocker is the size of the rewrite. See per-kernel TODO blocks
-on _FWD_KERNEL and _BWD_KERNEL below.
+``_msl_transform.make_metal_kernel`` (no ``@T.prim_func`` to feed the native
+TileLang compile path). The MSL-extraction adapter only applies to
+``tilelang.engine.lower(prim, target)`` artifacts, which is the inverse
+direction; it cannot turn this hand-written MSL back into TileLang IR.
+Migrating m2rnn to the unified pipeline therefore requires a full TileLang DSL
+rewrite of both the forward scan (per-kk row-of-h fragment +
+threadgroup-shared W + ``T.serial(S)``) and the backward two-pass walk
+(forward sweep persisting h_{t-1} to scratch, backward time loop with
+cross-thread dW reduction), then
+``tilelang.compile(..., execution_backend="tvm_ffi", out_idx=...)`` with
+explicit caller-owned outputs. All required TileLang primitives exist; the
+blocker is replacing these legacy entry points with the existing
+``m2rnn_path_c.py`` native route once every production caller has receipts.
+See per-kernel TODO blocks on _FWD_KERNEL and _BWD_KERNEL below.
 
 Recurrence (per (batch, head) lane, looping over seq):
     z_t   = h_{t-1} @ W + outer(k_t, v_t)
@@ -76,12 +80,10 @@ class M2RNNMetalStatus:
 #
 # This kernel is hand-written MSL constructed via
 # ``_msl_transform.make_metal_kernel(name=..., source=..., header=...)``,
-# not via ``_msl_transform.lower_tilelang_to_msl_inline(@T.prim_func)``.
-# The MSL-extraction adapter (`_msl_extraction.extract_msl_from_engine_artifact`
-# landed in commit 00d6d90) converts ``@T.prim_func`` engine artifacts INTO
-# MSL — the inverse direction — so it does not apply here. To route this
-# kernel through ``dispatch_lower(prim, target)`` we need a full TileLang
-# DSL rewrite carrying:
+# not via a TileLang ``@T.prim_func``. The MSL-extraction adapter converts
+# TileLang engine artifacts INTO MSL — the inverse direction — so it does not
+# apply here. To route this kernel through native tvm-ffi we need a full
+# TileLang DSL rewrite carrying:
 #
 #   * per-kk row-of-h register state (size V scalars per thread, no
 #     cross-thread reduction during matmul) — expressible as

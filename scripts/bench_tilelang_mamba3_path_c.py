@@ -5,9 +5,10 @@ Path B (``cppmega_mlx/nn/_tilelang/mamba3.py``) writes MSL by hand and ships
 through ``mx.fast.metal_kernel``. Path C
 (``cppmega_mlx/nn/_tilelang/mamba3_path_c.py``) is the @T.prim_func DSL form of
 the same kernel, lowered through the patched apple-head TileLang Metal backend
-and then handed to the same MLX dispatcher. This script measures fwd, bwd and
-fwd+bwd latency and FLOPS for both paths on identical inputs at the spec bench
-shape (B=2, T=512, H=4, P=32, N=64) and writes a JSON receipt under
+and then launched through TileLang's native tvm-ffi owner-output API. This
+script measures fwd, bwd and fwd+bwd latency and FLOPS for both paths on
+identical inputs at the spec bench shape (B=2, T=512, H=4, P=32, N=64) and
+writes a JSON receipt under
 ``bench/tilelang_ports/mamba3_path_c.json``.
 
 The script also dumps the lowered MSL for the bench shape into

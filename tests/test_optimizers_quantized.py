@@ -31,8 +31,20 @@ from cppmega_mlx.training._quantize_8bit import (
     quantize_dynamic_blockwise,
     quantize_dynamic_lut_blockwise,
 )
-from cppmega_mlx.training._fused_adam8bit_kernel import fused_adam8bit_step
-from cppmega_mlx.training._fused_dynamic8bit_kernel import fused_adam8bit_dynamic_step
+from cppmega_mlx.training._fused_adam8bit_kernel import (
+    fused_adam8bit_status,
+    fused_adam8bit_step,
+)
+from cppmega_mlx.training._fused_dynamic8bit_kernel import (
+    fused_adam8bit_dynamic_status,
+    fused_adam8bit_dynamic_step,
+    fused_lion8bit_dynamic_status,
+    fused_lion8bit_dynamic_step,
+)
+from cppmega_mlx.training._fused_lion8bit_kernel import (
+    fused_lion8bit_status,
+    fused_lion8bit_step,
+)
 from cppmega_mlx.training.optimizers import (
     AdamWFP32Moments,
     LionFP32Moments,
@@ -123,7 +135,7 @@ def test_quantize_dtype_and_block_size_constants_match_layout() -> None:
     assert QUANT_BIAS == 128
 
 
-def test_quantize_rejects_non_default_block_size_until_kernel_is_recompiled() -> None:
+def test_quantize_rejects_non_default_block_size_until_native_codec_supports_it() -> None:
     x = mx.zeros((512,), dtype=mx.float32)
     with pytest.raises(NotImplementedError, match="only block_size=256"):
         quantize_dynamic_blockwise(x, block_size=128)
@@ -248,48 +260,43 @@ def test_adam8bit_first_step_noise_floor_uses_fresh_v_absmax() -> None:
 
 def test_adam8bit_second_moment_is_nonnegative_after_quant_dequant() -> None:
     """Adam's ``v`` is a squared-gradient moment, so old quantized state that
-    decodes negative must be clamped before sqrt in both fused codecs.
+    decodes negative must be clamped before sqrt in both native codecs.
     """
 
     n = DEFAULT_BLOCK_SIZE
     param = mx.ones((n,), dtype=mx.float32)
     grad = mx.zeros((n,), dtype=mx.float32)
 
-    for fused_step, zero_byte in (
-        (fused_adam8bit_step, 128),
-        (fused_adam8bit_dynamic_step, 127),
+    for fused_step in (
+        fused_adam8bit_step,
+        fused_adam8bit_dynamic_step,
     ):
-        m_quant = mx.full((n,), zero_byte, dtype=mx.uint8)
+        m_quant = mx.full((n,), 128, dtype=mx.uint8)
         m_absmax = mx.zeros((1,), dtype=mx.float32)
-        # Byte zero decodes negative for both symmetric and signed dynamic LUT.
         v_quant = mx.zeros((n,), dtype=mx.uint8)
         v_absmax = mx.ones((1,), dtype=mx.float32)
-        param_out, _, _, v_quant_out, v_absmax_out = fused_step(
-            param,
-            grad,
-            m_quant,
-            m_absmax,
-            v_quant,
-            v_absmax,
-            learning_rate=mx.array(1e-3, dtype=mx.float32),
-            beta1=0.9,
-            beta2=0.999,
-            eps=1e-8,
-            weight_decay=0.0,
-            step=mx.array(1, dtype=mx.uint64),
-            bias_correction=False,
-        )
-        mx.eval(param_out, v_quant_out, v_absmax_out)
-
-        assert bool(mx.all(mx.isfinite(param_out)).item())
-        assert float(mx.max(mx.abs(param_out - param)).item()) == 0.0
-        assert float(mx.max(v_absmax_out).item()) == 0.0
+        with pytest.raises(RuntimeError, match="unsupported"):
+            fused_step(
+                param,
+                grad,
+                m_quant,
+                m_absmax,
+                v_quant,
+                v_absmax,
+                learning_rate=mx.array(1e-3, dtype=mx.float32),
+                beta1=0.9,
+                beta2=0.999,
+                eps=1e-8,
+                weight_decay=0.0,
+                step=mx.array(1, dtype=mx.uint64),
+                bias_correction=False,
+            )
 
     for scheme in (QUANT_SCHEME_SYMMETRIC, QUANT_SCHEME_DYNAMIC):
         optimizer = make_adam8bit(
             learning_rate=1e-3,
             weight_decay=0.0,
-            use_fused_kernel=False,
+            use_fused_kernel=True,
             quant_scheme=scheme,
         )
         params = {"w": param}
@@ -483,7 +490,7 @@ def test_muon_scalar_optimizer_constants_are_frozen() -> None:
 
 
 # -----------------------------------------------------------------------------
-# Fused Metal kernel: parity with the unfused chain + step-time speedup
+# Fused optimizer request: explicit unsupported status + native MLX fallback
 # -----------------------------------------------------------------------------
 
 
@@ -495,19 +502,24 @@ def _flat_state_arrays(state: object) -> dict[str, mx.array]:
     }
 
 
-def test_fused_adam8bit_default_is_enabled() -> None:
-    """``use_fused_kernel`` defaults to True so users get the win automatically."""
+def test_fused_adam8bit_default_falls_back_to_native_mlx() -> None:
+    """``use_fused_kernel`` is a request; direct-MSL is unsupported for training."""
 
     optimizer = make_adam8bit(learning_rate=1e-3)
     assert isinstance(optimizer, Adam8bit)
-    assert optimizer.use_fused_kernel is True
+    assert optimizer.use_fused_kernel is False
+    assert optimizer.fused_kernel_status.available is False
+    assert "direct-MSL" in optimizer.fused_kernel_status.reason
+    assert "native MLX" in optimizer.fused_kernel_status.reason
 
 
 def test_fused_adam8bit_can_be_disabled_for_parity_runs() -> None:
-    """Passing ``use_fused_kernel=False`` falls back to the Python chain."""
+    """Passing ``use_fused_kernel=False`` records an explicit disabled status."""
 
     optimizer = make_adam8bit(learning_rate=1e-3, use_fused_kernel=False)
     assert optimizer.use_fused_kernel is False
+    assert optimizer.fused_kernel_status.available is False
+    assert "disabled by caller" in optimizer.fused_kernel_status.reason
 
 
 def _run_n_steps(
@@ -556,14 +568,11 @@ def _run_n_steps(
 
 
 def test_fused_adam8bit_matches_unfused_within_tolerance() -> None:
-    """The fused kernel must agree with the Python chain on parameter and state.
+    """A fused request must preserve native path parameter and state behavior.
 
-    Both paths run through the same dequant -> AdamW -> quant -> apply formula.
-    After a single step both paths produce nearly-identical parameter values
-    (fp32-noise scale). Adam's ``sqrt(v) + eps`` denominator amplifies tiny
-    state differences at low step counts, so we pin parity on the first step
-    (where state is initialized to zero and rounding noise is bounded) and
-    fall back to the looser loss-trajectory comparison for multi-step.
+    Direct-MSL fused kernels are unsupported, so requesting fused execution
+    resolves to the same native MLX dequant -> AdamW -> quant -> apply path as
+    the explicit unfused configuration.
     """
 
     steps = 1
@@ -577,12 +586,8 @@ def test_fused_adam8bit_matches_unfused_within_tolerance() -> None:
     )
     mx.eval(fused_w, fused_b, unfused_w, unfused_b)
 
-    # Parameters: must match within fp32 noise after 1 step.
-    assert mx.allclose(fused_w, unfused_w, atol=1e-4, rtol=1e-3), (
-        f"weight max abs diff = "
-        f"{float(mx.max(mx.abs(fused_w - unfused_w)).item()):.6e}"
-    )
-    assert mx.allclose(fused_b, unfused_b, atol=1e-4, rtol=1e-3)
+    assert mx.array_equal(fused_w, unfused_w)
+    assert mx.array_equal(fused_b, unfused_b)
 
     # State: every leaf must match. m_quant/v_quant are uint8; allow off-by-1
     # since the per-block absmax tree reduction can swap order vs Python's
@@ -593,28 +598,11 @@ def test_fused_adam8bit_matches_unfused_within_tolerance() -> None:
         u = unfused_state[key]
         assert f.shape == u.shape
         assert f.dtype == u.dtype
-        if f.dtype == mx.uint8:
-            diff = mx.abs(f.astype(mx.int32) - u.astype(mx.int32))
-            mismatch = float(mx.mean((diff > 1).astype(mx.float32)).item())
-            assert mismatch <= 0.02, (
-                f"{key}: fused vs unfused quant mismatch fraction "
-                f"{mismatch:.4f} exceeds 2%"
-            )
-        else:
-            assert mx.allclose(f, u, atol=1e-4, rtol=1e-3), (
-                f"{key}: max abs diff "
-                f"{float(mx.max(mx.abs(f.astype(mx.float32) - u.astype(mx.float32))).item()):.6e}"
-            )
+        assert mx.array_equal(f, u), key
 
 
 def test_fused_adam8bit_loss_matches_unfused_over_50_steps() -> None:
-    """Loss-trajectory parity between the fused kernel and the Python chain.
-
-    Adam amplifies fp32 noise through the ``sqrt(v) + eps`` denominator at
-    low step counts, so we cannot pin per-step parameter parity for >1 step.
-    We instead pin the median per-step loss drift between the two paths to
-    <2%, the same gate the unfused-vs-fp32 test uses.
-    """
+    """A fused request must keep the native MLX loss trajectory unchanged."""
 
     seed = 0
     lr = 2e-4
@@ -649,12 +637,7 @@ def test_fused_adam8bit_loss_matches_unfused_over_50_steps() -> None:
 
 
 def test_fused_adam8bit_loss_matches_fp32_within_tolerance() -> None:
-    """50-step smoke: fused Adam8bit holds the same parity contract as unfused.
-
-    Same shape and tolerance as ``test_adam8bit_loss_matches_fp32_within_tolerance``
-    but with the fused kernel explicitly enabled, so a regression in the
-    kernel cannot hide behind the unfused path's coverage.
-    """
+    """50-step smoke: requested-fused Adam8bit keeps the native parity contract."""
 
     seed = 0
     lr = 2e-4
@@ -696,60 +679,29 @@ def test_fused_adam8bit_loss_matches_fp32_within_tolerance() -> None:
     )
 
 
-def test_fused_adam8bit_step_time_faster_than_unfused() -> None:
-    """The fused kernel should be at least 10% faster per step than the
-    Python chain on a moderate-size parameter.
+def test_fused_adam8bit_direct_call_reports_unsupported() -> None:
+    status = fused_adam8bit_status()
+    assert status.available is False
+    assert "direct-MSL" in status.reason
+    assert "native MLX" in status.reason
 
-    The fused path collapses the dequant -> math -> quant -> apply chain
-    (4-5 Metal launches) into a single launch with threadgroup-resident
-    fp32 working tensors. On a 4 MiB parameter (16k blocks) the unfused
-    chain spends most of its time on launch + memory roundtrips; this
-    smoke test pins the speedup gate before we ship.
-    """
-
-    import time
-
-    # Param size: 1024 x 1024 = 1 Mi elements = ~2 MiB in bf16. Big enough
-    # that the kernel-launch overhead dominates the unfused path; small
-    # enough that the test runs in <2 s on a cold M4.
-    shape = (1024, 1024)
-    seed = 0
-
-    def time_one_path(use_fused: bool) -> float:
-        mx.random.seed(seed)
-        param = mx.random.normal(shape).astype(mx.bfloat16)
-        grad = mx.random.normal(shape).astype(mx.bfloat16) * 0.01
-        params = {"w": param}
-        opt = make_adam8bit(learning_rate=1e-3, use_fused_kernel=use_fused)
-        opt.init(params)
-
-        # Warmup: hit the JIT cache and any first-call paths.
-        for _ in range(2):
-            params = opt.apply_gradients({"w": grad}, params)
-            mx.eval(params, opt.state)
-
-        # Time a small budget of steps and take the median to suppress
-        # noise from the macOS scheduler.
-        samples_ms: list[float] = []
-        for _ in range(5):
-            t0 = time.perf_counter()
-            params = opt.apply_gradients({"w": grad}, params)
-            mx.eval(params, opt.state)
-            samples_ms.append((time.perf_counter() - t0) * 1000.0)
-        samples_ms.sort()
-        return samples_ms[len(samples_ms) // 2]
-
-    unfused_ms = time_one_path(use_fused=False)
-    fused_ms = time_one_path(use_fused=True)
-
-    speedup = unfused_ms / max(fused_ms, 1e-6)
-    # Gate at 10% faster (speedup >= 1.10). The wall time difference is
-    # noisy at small param sizes, but 1.10x is well inside the typical
-    # 1.3-2x we measure on a cold cache.
-    assert speedup >= 1.10, (
-        f"fused Adam8bit step time {fused_ms:.3f} ms vs unfused "
-        f"{unfused_ms:.3f} ms; speedup {speedup:.3f}x is below the 1.10x gate."
-    )
+    n = DEFAULT_BLOCK_SIZE
+    with pytest.raises(RuntimeError, match="direct-MSL optimizer kernel is unsupported"):
+        fused_adam8bit_step(
+            mx.zeros((n,), dtype=mx.float32),
+            mx.zeros((n,), dtype=mx.float32),
+            mx.full((n,), 128, dtype=mx.uint8),
+            mx.zeros((1,), dtype=mx.float32),
+            mx.full((n,), 128, dtype=mx.uint8),
+            mx.zeros((1,), dtype=mx.float32),
+            learning_rate=mx.array(1e-3, dtype=mx.float32),
+            beta1=0.9,
+            beta2=0.999,
+            eps=1e-8,
+            weight_decay=0.0,
+            step=mx.array(1, dtype=mx.uint64),
+            bias_correction=False,
+        )
 
 
 def test_fused_adam8bit_state_keys_match_unfused() -> None:
@@ -784,7 +736,7 @@ def test_fused_adam8bit_state_keys_match_unfused() -> None:
 # (``QUANT_SCHEME_DYNAMIC``) added alongside the existing symmetric path.
 # The LUT is the signed dynamic map produced by
 # ``bitsandbytes.functional.create_dynamic_map(signed=True,
-# max_exponent_bits=7, total_bits=8)``; the runtime kernel mirrors
+# max_exponent_bits=7, total_bits=8)``; the runtime codec mirrors
 # ``dDequantizeBlockwise`` in ``bitsandbytes/csrc/kernels.cu``.
 
 
@@ -923,11 +875,11 @@ def test_adam8bit_dynamic_quant_scheme_state_dtypes() -> None:
     optimizer.init(model.trainable_parameters())
     mx.eval(optimizer.state)
     assert optimizer.quant_scheme == QUANT_SCHEME_DYNAMIC
-    # The dynamic-LUT scheme also has its own fused Metal kernel (separate
-    # from the symmetric one); ``use_fused_kernel`` defaults to True and
-    # dispatches to ``fused_adam8bit_dynamic_step``. Pass
-    # ``use_fused_kernel=False`` to opt out for parity comparisons.
-    assert optimizer.use_fused_kernel is True
+    # Direct-MSL fused optimizer kernels are unsupported, so the constructor
+    # records the status and falls back to the native MLX codec path.
+    assert optimizer.use_fused_kernel is False
+    assert optimizer.fused_kernel_status.available is False
+    assert "direct-MSL" in optimizer.fused_kernel_status.reason
 
     flat = _flatten_state(optimizer.state)
     assert flat["linear.weight.m_quant"].dtype == mx.uint8
@@ -987,8 +939,8 @@ def test_make_adam8bit_default_scheme_is_symmetric_for_backcompat() -> None:
 
     optimizer = make_adam8bit(learning_rate=1e-3)
     assert optimizer.quant_scheme == QUANT_SCHEME_SYMMETRIC
-    # Fused kernel must remain enabled on the symmetric default.
-    assert optimizer.use_fused_kernel is True
+    assert optimizer.use_fused_kernel is False
+    assert "direct-MSL" in optimizer.fused_kernel_status.reason
 
 
 def test_adam8bit_rejects_unknown_quant_scheme() -> None:
@@ -1246,27 +1198,32 @@ def test_make_muon_lion8bit_quant_scheme_propagates() -> None:
 
 
 # -----------------------------------------------------------------------------
-# Fused Metal kernel for Lion8bit: parity with the unfused chain + speedup
+# Fused optimizer request for Lion8bit: unsupported + native MLX fallback
 # -----------------------------------------------------------------------------
 
 
-def test_fused_lion8bit_default_is_enabled() -> None:
-    """``use_fused_kernel`` defaults to True so users get the win automatically."""
+def test_fused_lion8bit_default_falls_back_to_native_mlx() -> None:
+    """``use_fused_kernel`` is a request; direct-MSL is unsupported for training."""
 
     optimizer = make_lion8bit(learning_rate=1e-4)
     assert isinstance(optimizer, Lion8bit)
-    assert optimizer.use_fused_kernel is True
+    assert optimizer.use_fused_kernel is False
+    assert optimizer.fused_kernel_status.available is False
+    assert "direct-MSL" in optimizer.fused_kernel_status.reason
+    assert "native MLX" in optimizer.fused_kernel_status.reason
 
 
 def test_fused_lion8bit_can_be_disabled_for_parity_runs() -> None:
-    """Passing ``use_fused_kernel=False`` falls back to the Python chain."""
+    """Passing ``use_fused_kernel=False`` records an explicit disabled status."""
 
     optimizer = make_lion8bit(learning_rate=1e-4, use_fused_kernel=False)
     assert optimizer.use_fused_kernel is False
+    assert optimizer.fused_kernel_status.available is False
+    assert "disabled by caller" in optimizer.fused_kernel_status.reason
 
 
-def test_fused_lion8bit_symmetric_default_uses_fused_kernel() -> None:
-    """Symmetric scheme + fused-kernel default must enable the fused path."""
+def test_fused_lion8bit_symmetric_default_reports_unsupported() -> None:
+    """Symmetric scheme + fused request must fail closed to native MLX."""
 
     optimizer = make_lion8bit(
         learning_rate=1e-4,
@@ -1274,11 +1231,12 @@ def test_fused_lion8bit_symmetric_default_uses_fused_kernel() -> None:
         use_fused_kernel=True,
     )
     assert optimizer.quant_scheme == "symmetric_int8_v1"
-    assert optimizer.use_fused_kernel is True
+    assert optimizer.use_fused_kernel is False
+    assert "direct-MSL" in optimizer.fused_kernel_status.reason
 
 
 def test_fused_lion8bit_non_default_block_size_falls_back_to_unfused() -> None:
-    """The fused kernel hardcodes block_size=256; other sizes must disable it."""
+    """The fused request supports only block_size=256 before status lookup."""
 
     # quantize_blockwise with non-default block_size raises NotImplementedError
     # at runtime, but constructor validation only checks the fused gate.
@@ -1337,14 +1295,11 @@ def _run_lion_n_steps(
 
 
 def test_fused_lion8bit_matches_unfused_within_tolerance() -> None:
-    """The fused kernel must agree with the Python chain on parameter and state.
+    """A fused request must preserve native path parameter and state behavior.
 
-    Both paths run through the same dequant -> Lion math -> quant -> apply
-    formula. After a single step both paths produce nearly-identical
-    parameter values (fp32-noise scale). Lion's sign-update is a hard
-    quantizer at the c=0 boundary, so multi-step parity beyond fp32 noise
-    is fragile; we pin parity on the first step only and let the
-    loss-trajectory test cover multi-step behaviour.
+    Direct-MSL fused kernels are unsupported, so requesting fused execution
+    resolves to the same native MLX dequant -> Lion -> quant -> apply path as
+    the explicit unfused configuration.
     """
 
     steps = 1
@@ -1358,12 +1313,8 @@ def test_fused_lion8bit_matches_unfused_within_tolerance() -> None:
     )
     mx.eval(fused_w, fused_b, unfused_w, unfused_b)
 
-    # Parameters: must match within fp32 noise after 1 step.
-    assert mx.allclose(fused_w, unfused_w, atol=1e-4, rtol=1e-3), (
-        f"weight max abs diff = "
-        f"{float(mx.max(mx.abs(fused_w - unfused_w)).item()):.6e}"
-    )
-    assert mx.allclose(fused_b, unfused_b, atol=1e-4, rtol=1e-3)
+    assert mx.array_equal(fused_w, unfused_w)
+    assert mx.array_equal(fused_b, unfused_b)
 
     # State: every leaf must match. m_quant is uint8; allow off-by-1 since
     # the per-block absmax tree reduction can swap order vs Python's
@@ -1374,28 +1325,11 @@ def test_fused_lion8bit_matches_unfused_within_tolerance() -> None:
         u = unfused_state[key]
         assert f.shape == u.shape
         assert f.dtype == u.dtype
-        if f.dtype == mx.uint8:
-            diff = mx.abs(f.astype(mx.int32) - u.astype(mx.int32))
-            mismatch = float(mx.mean((diff > 1).astype(mx.float32)).item())
-            assert mismatch <= 0.02, (
-                f"{key}: fused vs unfused quant mismatch fraction "
-                f"{mismatch:.4f} exceeds 2%"
-            )
-        else:
-            assert mx.allclose(f, u, atol=1e-4, rtol=1e-3), (
-                f"{key}: max abs diff "
-                f"{float(mx.max(mx.abs(f.astype(mx.float32) - u.astype(mx.float32))).item()):.6e}"
-            )
+        assert mx.array_equal(f, u), key
 
 
 def test_fused_lion8bit_loss_matches_unfused_over_50_steps() -> None:
-    """Loss-trajectory parity between the fused kernel and the Python chain.
-
-    The sign-update boundary (``c == 0``) flips occasionally between the two
-    paths because of fp32 reduction-order noise; we still expect the median
-    per-step loss drift to stay <2%, the same gate the other Lion8bit tests
-    use.
-    """
+    """A fused request must keep the native MLX loss trajectory unchanged."""
 
     seed = 0
     lr = 1e-3
@@ -1430,12 +1364,7 @@ def test_fused_lion8bit_loss_matches_unfused_over_50_steps() -> None:
 
 
 def test_fused_lion8bit_loss_matches_lion_fp32_within_tolerance() -> None:
-    """50-step smoke: fused Lion8bit holds the same parity contract as unfused.
-
-    Same shape and tolerance as ``test_lion8bit_loss_matches_lion_fp32_within_tolerance``
-    but with the fused kernel explicitly enabled, so a regression in the
-    kernel cannot hide behind the unfused path's coverage.
-    """
+    """50-step smoke: requested-fused Lion8bit keeps the native parity contract."""
 
     seed = 0
     lr = 1e-3
@@ -1477,63 +1406,24 @@ def test_fused_lion8bit_loss_matches_lion_fp32_within_tolerance() -> None:
     )
 
 
-def test_fused_lion8bit_step_time_faster_than_unfused() -> None:
-    """The fused kernel should be at least 2x faster per step than the
-    Python chain on a parameter large enough that launch overhead dominates.
+def test_fused_lion8bit_direct_call_reports_unsupported() -> None:
+    status = fused_lion8bit_status()
+    assert status.available is False
+    assert "direct-MSL" in status.reason
+    assert "native MLX" in status.reason
 
-    The fused path collapses the dequant -> math -> quant -> apply chain
-    (3 Metal launches) into a single launch with threadgroup-resident
-    fp32 working tensors. Lion has only one momentum buffer (no ``v``)
-    so the absolute saved-launches count is smaller than Adam's, but the
-    relative speedup on memory-bound parameters is similar -- the unfused
-    chain still issues 3 separate Metal kernels with fp32 round-trips
-    through device memory between each one.
-    """
-
-    import time
-
-    # Param size: 4096 x 4096 = 16 Mi elements = ~32 MiB bf16. The 1024 x 1024
-    # microbench scale (~0.3 ms/step) is dominated by Python dispatch and
-    # macOS scheduler noise; at 16 Mi elements the unfused chain spends most
-    # of its time on the dequant/quant memory traffic and the speedup is
-    # representative of the production 1.797B-param run.
-    shape = (4096, 4096)
-    seed = 0
-
-    def time_one_path(use_fused: bool) -> float:
-        mx.random.seed(seed)
-        param = mx.random.normal(shape).astype(mx.bfloat16)
-        grad = mx.random.normal(shape).astype(mx.bfloat16) * 0.01
-        params = {"w": param}
-        opt = make_lion8bit(learning_rate=1e-4, use_fused_kernel=use_fused)
-        opt.init(params)
-
-        # Warmup: hit the JIT cache and any first-call paths.
-        for _ in range(3):
-            params = opt.apply_gradients({"w": grad}, params)
-            mx.eval(params, opt.state)
-
-        # Time a small budget of steps and take the median to suppress
-        # noise from the macOS scheduler.
-        samples_ms: list[float] = []
-        for _ in range(7):
-            t0 = time.perf_counter()
-            params = opt.apply_gradients({"w": grad}, params)
-            mx.eval(params, opt.state)
-            samples_ms.append((time.perf_counter() - t0) * 1000.0)
-        samples_ms.sort()
-        return samples_ms[len(samples_ms) // 2]
-
-    unfused_ms = time_one_path(use_fused=False)
-    fused_ms = time_one_path(use_fused=True)
-
-    speedup = unfused_ms / max(fused_ms, 1e-6)
-    # Gate at 2x faster (speedup >= 2.0). On the 1.797B-param production model
-    # we measure ~4x; the 16 Mi-element microbench typically lands at 3-5x.
-    assert speedup >= 2.0, (
-        f"fused Lion8bit step time {fused_ms:.3f} ms vs unfused "
-        f"{unfused_ms:.3f} ms; speedup {speedup:.3f}x is below the 2.0x gate."
-    )
+    n = DEFAULT_BLOCK_SIZE
+    with pytest.raises(RuntimeError, match="direct-MSL optimizer kernel is unsupported"):
+        fused_lion8bit_step(
+            mx.zeros((n,), dtype=mx.float32),
+            mx.zeros((n,), dtype=mx.float32),
+            mx.full((n,), 128, dtype=mx.uint8),
+            mx.zeros((1,), dtype=mx.float32),
+            learning_rate=mx.array(1e-4, dtype=mx.float32),
+            beta1=0.9,
+            beta2=0.99,
+            weight_decay=0.0,
+        )
 
 
 def test_fused_lion8bit_state_keys_match_unfused() -> None:
@@ -1561,10 +1451,7 @@ def test_fused_lion8bit_state_keys_match_unfused() -> None:
 
 
 # -----------------------------------------------------------------------------
-# Fused dynamic-LUT kernel (Adam8bit + Lion8bit): parity with the unfused
-# dynamic chain + step-time speedup target. The dynamic kernel reuses the
-# bnb-style 256-entry signed LUT from ``_quantize_8bit._BNB_DYNAMIC_LUT_VALUES``
-# and binary-searches it in threadgroup memory for the quantize step.
+# Fused dynamic-LUT requests (Adam8bit + Lion8bit): unsupported + fallback.
 # -----------------------------------------------------------------------------
 
 
@@ -1686,11 +1573,7 @@ def _train_steps_dynamic(
 
 
 def test_fused_dynamic_adam8bit_matches_unfused_within_tolerance() -> None:
-    """Fused dynamic-LUT Adam8bit must agree with the Python chain on
-    parameter + state values after one step. The fused kernel and unfused
-    chain both call into the same bnb signed LUT (256 fp32 entries) and use
-    identical AdamW math + noise-floor; only the per-block reduction order
-    differs (kernel tree-reduce vs ``mx.max`` along axis 1)."""
+    """A dynamic fused request must preserve native MLX Adam8bit behavior."""
 
     steps = 1
     seed = 7
@@ -1703,11 +1586,8 @@ def test_fused_dynamic_adam8bit_matches_unfused_within_tolerance() -> None:
     )
     mx.eval(fused_w, fused_b, unfused_w, unfused_b)
 
-    assert mx.allclose(fused_w, unfused_w, atol=1e-4, rtol=1e-3), (
-        f"weight max abs diff = "
-        f"{float(mx.max(mx.abs(fused_w - unfused_w)).item()):.6e}"
-    )
-    assert mx.allclose(fused_b, unfused_b, atol=1e-4, rtol=1e-3)
+    assert mx.array_equal(fused_w, unfused_w)
+    assert mx.array_equal(fused_b, unfused_b)
 
     assert set(fused_state.keys()) == set(unfused_state.keys())
     for key in fused_state:
@@ -1715,25 +1595,11 @@ def test_fused_dynamic_adam8bit_matches_unfused_within_tolerance() -> None:
         u = unfused_state[key]
         assert f.shape == u.shape
         assert f.dtype == u.dtype
-        if f.dtype == mx.uint8:
-            diff = mx.abs(f.astype(mx.int32) - u.astype(mx.int32))
-            mismatch = float(mx.mean((diff > 1).astype(mx.float32)).item())
-            assert mismatch <= 0.02, (
-                f"{key}: fused vs unfused dynamic quant mismatch fraction "
-                f"{mismatch:.4f} exceeds 2%"
-            )
-        else:
-            assert mx.allclose(f, u, atol=1e-4, rtol=1e-3), (
-                f"{key}: max abs diff "
-                f"{float(mx.max(mx.abs(f.astype(mx.float32) - u.astype(mx.float32))).item()):.6e}"
-            )
+        assert mx.array_equal(f, u), key
 
 
 def test_fused_dynamic_adam8bit_loss_matches_fp32_within_tolerance() -> None:
-    """50-step trajectory: fused dynamic-LUT Adam8bit must track fp32-moments
-    AdamW within 2% relative loss drift, the same gate the symmetric path
-    holds. The dynamic LUT actually has tighter near-zero precision than
-    symmetric so this should pass at least as easily."""
+    """50-step trajectory: requested-fused dynamic Adam8bit keeps parity."""
 
     seed = 0
     lr = 2e-4
@@ -1768,62 +1634,33 @@ def test_fused_dynamic_adam8bit_loss_matches_fp32_within_tolerance() -> None:
     )
 
 
-def test_fused_dynamic_adam8bit_step_time_faster_than_unfused() -> None:
-    """Fused dynamic Adam8bit must be at least 2x faster per step than the
-    unfused dynamic chain (target: 4x). The unfused chain launches 4-5 Metal
-    kernels per parameter (dequant_m, dequant_v, math, quant_m, quant_v),
-    each pulling the LUT from constant memory. The fused kernel collapses
-    everything into a single launch with the LUT cached in threadgroup
-    memory; on a 1Mi-element parameter that's a 4-5x speedup target."""
+def test_fused_dynamic_adam8bit_direct_call_reports_unsupported() -> None:
+    status = fused_adam8bit_dynamic_status()
+    assert status.available is False
+    assert "direct-MSL" in status.reason
+    assert "native MLX" in status.reason
 
-    import time
-
-    shape = (1024, 1024)  # ~1Mi elements; ~2 MiB bf16
-    seed = 0
-
-    def time_one_path(use_fused: bool) -> float:
-        mx.random.seed(seed)
-        param = mx.random.normal(shape).astype(mx.bfloat16)
-        grad = mx.random.normal(shape).astype(mx.bfloat16) * 0.01
-        params = {"w": param}
-        opt = make_adam8bit(
-            learning_rate=1e-3,
-            use_fused_kernel=use_fused,
-            quant_scheme=QUANT_SCHEME_DYNAMIC,
+    n = DEFAULT_BLOCK_SIZE
+    with pytest.raises(RuntimeError, match="direct-MSL optimizer kernel is unsupported"):
+        fused_adam8bit_dynamic_step(
+            mx.zeros((n,), dtype=mx.float32),
+            mx.zeros((n,), dtype=mx.float32),
+            mx.full((n,), 127, dtype=mx.uint8),
+            mx.zeros((1,), dtype=mx.float32),
+            mx.full((n,), 127, dtype=mx.uint8),
+            mx.zeros((1,), dtype=mx.float32),
+            learning_rate=mx.array(1e-3, dtype=mx.float32),
+            beta1=0.9,
+            beta2=0.999,
+            eps=1e-8,
+            weight_decay=0.0,
+            step=mx.array(1, dtype=mx.uint64),
+            bias_correction=False,
         )
-        opt.init(params)
-
-        for _ in range(2):
-            params = opt.apply_gradients({"w": grad}, params)
-            mx.eval(params, opt.state)
-
-        samples_ms: list[float] = []
-        for _ in range(5):
-            t0 = time.perf_counter()
-            params = opt.apply_gradients({"w": grad}, params)
-            mx.eval(params, opt.state)
-            samples_ms.append((time.perf_counter() - t0) * 1000.0)
-        samples_ms.sort()
-        return samples_ms[len(samples_ms) // 2]
-
-    unfused_ms = time_one_path(use_fused=False)
-    fused_ms = time_one_path(use_fused=True)
-
-    speedup = unfused_ms / max(fused_ms, 1e-6)
-    # Gate at 2x faster (target: 4x). The dynamic-LUT codec adds binary-search
-    # cost on top of the symmetric path, so the gate is conservative; the
-    # unfused chain still has the kernel-launch + LUT-fetch overhead that the
-    # fused path eliminates.
-    assert speedup >= 2.0, (
-        f"fused dynamic Adam8bit step time {fused_ms:.3f} ms vs unfused dynamic "
-        f"{unfused_ms:.3f} ms; speedup {speedup:.3f}x is below the 2.0x gate."
-    )
 
 
 def test_fused_dynamic_lion8bit_matches_unfused_within_tolerance() -> None:
-    """Fused dynamic-LUT Lion8bit must agree with the Python chain on
-    parameter + state values after one step. Same contract as the Adam8bit
-    dynamic parity test, but Lion only has the m moment."""
+    """A dynamic fused request must preserve native MLX Lion8bit behavior."""
 
     steps = 1
     seed = 7
@@ -1836,11 +1673,8 @@ def test_fused_dynamic_lion8bit_matches_unfused_within_tolerance() -> None:
     )
     mx.eval(fused_w, fused_b, unfused_w, unfused_b)
 
-    assert mx.allclose(fused_w, unfused_w, atol=1e-4, rtol=1e-3), (
-        f"weight max abs diff = "
-        f"{float(mx.max(mx.abs(fused_w - unfused_w)).item()):.6e}"
-    )
-    assert mx.allclose(fused_b, unfused_b, atol=1e-4, rtol=1e-3)
+    assert mx.array_equal(fused_w, unfused_w)
+    assert mx.array_equal(fused_b, unfused_b)
 
     assert set(fused_state.keys()) == set(unfused_state.keys())
     for key in fused_state:
@@ -1848,23 +1682,11 @@ def test_fused_dynamic_lion8bit_matches_unfused_within_tolerance() -> None:
         u = unfused_state[key]
         assert f.shape == u.shape
         assert f.dtype == u.dtype
-        if f.dtype == mx.uint8:
-            diff = mx.abs(f.astype(mx.int32) - u.astype(mx.int32))
-            mismatch = float(mx.mean((diff > 1).astype(mx.float32)).item())
-            assert mismatch <= 0.02, (
-                f"{key}: fused vs unfused dynamic Lion quant mismatch fraction "
-                f"{mismatch:.4f} exceeds 2%"
-            )
-        else:
-            assert mx.allclose(f, u, atol=1e-4, rtol=1e-3), (
-                f"{key}: max abs diff "
-                f"{float(mx.max(mx.abs(f.astype(mx.float32) - u.astype(mx.float32))).item()):.6e}"
-            )
+        assert mx.array_equal(f, u), key
 
 
 def test_fused_dynamic_lion8bit_loss_matches_fp32_within_tolerance() -> None:
-    """50-step trajectory: fused dynamic-LUT Lion8bit must track LionFP32Moments
-    within 2% relative loss drift."""
+    """50-step trajectory: requested-fused dynamic Lion8bit keeps parity."""
 
     seed = 0
     lr = 1e-3
@@ -1899,51 +1721,21 @@ def test_fused_dynamic_lion8bit_loss_matches_fp32_within_tolerance() -> None:
     )
 
 
-def test_fused_dynamic_lion8bit_step_time_faster_than_unfused() -> None:
-    """Fused dynamic Lion8bit must be at least 1.5x faster per step than the
-    unfused dynamic chain. Lion only has the m moment so the savings are
-    smaller in absolute terms than Adam (3 launches saved instead of 5);
-    the dynamic LUT codec also adds binary-search cost in the quant step.
-    On tiny params (~1Mi elements) launch overhead dominates and the gate
-    sits at 1.5x; the production gb10_quarter row in
-    ``bench/baselines/lion8bit_state_size_m4.json`` shows the speedup
-    growing past 4x as parameter size grows."""
+def test_fused_dynamic_lion8bit_direct_call_reports_unsupported() -> None:
+    status = fused_lion8bit_dynamic_status()
+    assert status.available is False
+    assert "direct-MSL" in status.reason
+    assert "native MLX" in status.reason
 
-    import time
-
-    shape = (1024, 1024)
-    seed = 0
-
-    def time_one_path(use_fused: bool) -> float:
-        mx.random.seed(seed)
-        param = mx.random.normal(shape).astype(mx.bfloat16)
-        grad = mx.random.normal(shape).astype(mx.bfloat16) * 0.01
-        params = {"w": param}
-        opt = make_lion8bit(
-            learning_rate=1e-4,
-            use_fused_kernel=use_fused,
-            quant_scheme=QUANT_SCHEME_DYNAMIC,
+    n = DEFAULT_BLOCK_SIZE
+    with pytest.raises(RuntimeError, match="direct-MSL optimizer kernel is unsupported"):
+        fused_lion8bit_dynamic_step(
+            mx.zeros((n,), dtype=mx.float32),
+            mx.zeros((n,), dtype=mx.float32),
+            mx.full((n,), 127, dtype=mx.uint8),
+            mx.zeros((1,), dtype=mx.float32),
+            learning_rate=mx.array(1e-4, dtype=mx.float32),
+            beta1=0.9,
+            beta2=0.99,
+            weight_decay=0.0,
         )
-        opt.init(params)
-
-        for _ in range(2):
-            params = opt.apply_gradients({"w": grad}, params)
-            mx.eval(params, opt.state)
-
-        samples_ms: list[float] = []
-        for _ in range(5):
-            t0 = time.perf_counter()
-            params = opt.apply_gradients({"w": grad}, params)
-            mx.eval(params, opt.state)
-            samples_ms.append((time.perf_counter() - t0) * 1000.0)
-        samples_ms.sort()
-        return samples_ms[len(samples_ms) // 2]
-
-    unfused_ms = time_one_path(use_fused=False)
-    fused_ms = time_one_path(use_fused=True)
-
-    speedup = unfused_ms / max(fused_ms, 1e-6)
-    assert speedup >= 1.5, (
-        f"fused dynamic Lion8bit step time {fused_ms:.3f} ms vs unfused dynamic "
-        f"{unfused_ms:.3f} ms; speedup {speedup:.3f}x is below the 1.5x gate."
-    )

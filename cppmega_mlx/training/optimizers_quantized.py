@@ -16,16 +16,17 @@ Numerical policy:
 * Quantization is selectable via ``quant_scheme``:
 
   - ``"symmetric_int8_v1"`` (default): uint8 with +128 bias, the existing
-    M0-grade codec. :class:`Adam8bit` uses a fused Metal kernel for ~best
-    step time on this scheme.
+    M0-grade codec.
   - ``"dynamic_int8_v1"``: opt-in bitsandbytes-style dynamic LUT
     (``dDequantizeBlockwise`` parity for the 256-entry signed dynamic
     map). Denser bins near zero so small Adam ``m, v`` values keep more
-    precision on the round-trip. Falls back to the unfused chain because
-    the fused kernel is symmetric-specific.
+    precision on the round-trip.
 
   Default stays symmetric for backward compatibility; ``bitsandbytes``
-  defaults to the dynamic LUT on the CUDA stack.
+  defaults to the dynamic LUT on the CUDA stack. Direct-MSL fused optimizer
+  kernels are intentionally unsupported until MLX exposes a native fused
+  optimizer API with the required zero-copy contract, so optimizer updates use
+  the native MLX codec path.
 * The internal optimizer math runs in fp32 inline: every ``apply_single``
   call dequantizes the moment state to fp32, performs the standard update,
   then re-quantizes. The parameter is read in fp32 and cast back to whatever
@@ -37,11 +38,12 @@ Numerical policy:
   receipts; production receipt routes opt into ``4096`` to mirror the
   bitsandbytes stability policy for norms and biases.
 
-See :mod:`cppmega_mlx.training._quantize_8bit` for the Metal-backed codecs.
+See :mod:`cppmega_mlx.training._quantize_8bit` for the native MLX codecs.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Callable, Literal
 
 import mlx.core as mx
@@ -49,14 +51,14 @@ import mlx.optimizers as optim
 
 from cppmega_mlx.training._fused_adam8bit_kernel import (
     FUSED_BLOCK_SIZE,
-    fused_adam8bit_step,
+    fused_adam8bit_status,
 )
 from cppmega_mlx.training._fused_dynamic8bit_kernel import (
-    fused_adam8bit_dynamic_step,
-    fused_lion8bit_dynamic_step,
+    fused_adam8bit_dynamic_status,
+    fused_lion8bit_dynamic_status,
 )
 from cppmega_mlx.training._fused_lion8bit_kernel import (
-    fused_lion8bit_step,
+    fused_lion8bit_status,
 )
 from cppmega_mlx.training._quantize_8bit import (
     DEFAULT_BLOCK_SIZE,
@@ -97,15 +99,159 @@ reference (``bitsandbytes.optim.Lion8bit``) uses a dynamic LUT; bumping this
 identifier signals when a dynamic-LUT MLX path lands."""
 
 
-def _block_absmax(x: mx.array, block_size: int) -> mx.array:
-    """Return fp32 absmax per flattened block, with tail zero padding."""
+@dataclass(frozen=True)
+class FusedKernelRequestStatus:
+    available: bool
+    reason: str
 
-    flat = mx.abs(x.reshape(-1).astype(mx.float32))
+
+def _unavailable_fused_status(reason: str) -> FusedKernelRequestStatus:
+    return FusedKernelRequestStatus(False, reason)
+
+
+def _normalize_fused_status(status: Any) -> FusedKernelRequestStatus:
+    return FusedKernelRequestStatus(
+        bool(getattr(status, "available")),
+        str(getattr(status, "reason")),
+    )
+
+
+def _adam_fused_status(
+    *,
+    requested: bool,
+    block_size: int,
+    quant_scheme: str,
+) -> FusedKernelRequestStatus:
+    if not requested:
+        return _unavailable_fused_status("fused optimizer kernel disabled by caller")
+    if block_size != FUSED_BLOCK_SIZE:
+        return _unavailable_fused_status(
+            f"fused optimizer kernel requires block_size={FUSED_BLOCK_SIZE}"
+        )
+    if quant_scheme == QUANT_SCHEME_DYNAMIC:
+        return _normalize_fused_status(fused_adam8bit_dynamic_status())
+    if quant_scheme == QUANT_SCHEME_SYMMETRIC:
+        return _normalize_fused_status(fused_adam8bit_status())
+    return _unavailable_fused_status(f"unsupported quant scheme {quant_scheme!r}")
+
+
+def _lion_fused_status(
+    *,
+    requested: bool,
+    block_size: int,
+    quant_scheme: str,
+) -> FusedKernelRequestStatus:
+    if not requested:
+        return _unavailable_fused_status("fused optimizer kernel disabled by caller")
+    if block_size != FUSED_BLOCK_SIZE:
+        return _unavailable_fused_status(
+            f"fused optimizer kernel requires block_size={FUSED_BLOCK_SIZE}"
+        )
+    if quant_scheme == QUANT_SCHEME_DYNAMIC:
+        return _normalize_fused_status(fused_lion8bit_dynamic_status())
+    if quant_scheme == QUANT_SCHEME_SYMMETRIC:
+        return _normalize_fused_status(fused_lion8bit_status())
+    return _unavailable_fused_status(f"unsupported quant scheme {quant_scheme!r}")
+
+
+def _block_absmax(x: mx.array, block_size: int) -> mx.array:
+    """Return fp32 absmax per flattened block without padding large tensors."""
+
+    flat = x.reshape(-1)
+    if flat.dtype != mx.float32:
+        flat = flat.astype(mx.float32)
+    flat = mx.abs(flat)
     if int(flat.size) == 0:
         return mx.zeros((0,), dtype=mx.float32)
-    nblocks = num_blocks(int(flat.size), block_size)
-    padded = mx.pad(flat, [(0, nblocks * block_size - int(flat.size))])
-    return mx.max(padded.reshape(nblocks, block_size), axis=1)
+    n = int(flat.size)
+    n_full = n // block_size
+    full_size = n_full * block_size
+    parts: list[mx.array] = []
+    if n_full:
+        parts.append(mx.max(flat[:full_size].reshape(n_full, block_size), axis=1))
+    if full_size < n:
+        parts.append(mx.max(flat[full_size:], keepdims=True))
+    if len(parts) == 1:
+        return parts[0]
+    return mx.concatenate(parts, axis=0)
+
+
+def _adam_block_update(
+    m_new: mx.array,
+    v_new: mx.array,
+    parameter: mx.array,
+    v_block_step: mx.array,
+    *,
+    learning_rate: mx.array,
+    beta1: float,
+    beta2: float,
+    eps: float,
+    weight_decay: float,
+    step: mx.array,
+    bias_correction: bool,
+    block_size: int,
+) -> mx.array:
+    """Apply AdamW using per-block noise floors without repeating them."""
+
+    original_shape = parameter.shape
+    param_dtype = parameter.dtype
+    n = int(parameter.size)
+    if n == 0:
+        return parameter
+
+    flat_m = m_new.reshape(-1)
+    flat_v = v_new.reshape(-1)
+    flat_param = parameter.reshape(-1)
+    n_full = n // block_size
+    full_size = n_full * block_size
+
+    if bias_correction:
+        step_fp32 = step.astype(mx.float32)
+        c1 = learning_rate / (
+            1.0 - mx.power(mx.array(beta1, dtype=mx.float32), step_fp32)
+        )
+        c2 = mx.rsqrt(
+            1.0 - mx.power(mx.array(beta2, dtype=mx.float32), step_fp32)
+        )
+    else:
+        c1 = learning_rate
+        c2 = None
+
+    def apply_block(
+        m_block: mx.array,
+        v_block: mx.array,
+        p_block: mx.array,
+        floor: mx.array,
+    ) -> mx.array:
+        p32 = p_block.astype(mx.float32) if p_block.dtype != mx.float32 else p_block
+        if c2 is None:
+            update = learning_rate * m_block / (mx.sqrt(v_block) + floor + eps)
+        else:
+            update = (c1 * m_block) / (mx.sqrt(v_block) * c2 + floor + eps)
+        decayed = p32 * (1.0 - learning_rate * weight_decay)
+        return decayed - update
+
+    parts: list[mx.array] = []
+    if n_full:
+        m_full = flat_m[:full_size].reshape(n_full, block_size)
+        v_full = flat_v[:full_size].reshape(n_full, block_size)
+        p_full = flat_param[:full_size].reshape(n_full, block_size)
+        parts.append(
+            apply_block(m_full, v_full, p_full, v_block_step[:n_full, None]).reshape(-1)
+        )
+
+    if full_size < n:
+        parts.append(
+            apply_block(
+                flat_m[full_size:],
+                flat_v[full_size:],
+                flat_param[full_size:],
+                v_block_step[n_full],
+            )
+        )
+
+    updated = parts[0] if len(parts) == 1 else mx.concatenate(parts, axis=0)
+    return updated.reshape(original_shape).astype(param_dtype)
 
 
 class Adam8bit(optim.Optimizer):
@@ -163,18 +309,12 @@ class Adam8bit(optim.Optimizer):
         if min_8bit_size < 0:
             raise ValueError("min_8bit_size must be >= 0")
         self.min_8bit_size = int(min_8bit_size)
-        # Both the symmetric-int8 and dynamic-LUT schemes have a fused Metal
-        # kernel implementation. The symmetric kernel embeds the +128 bias
-        # inline; the dynamic kernel loads the 256-entry bnb signed LUT into
-        # threadgroup memory once per block and uses a binary search for the
-        # quantize step. Other block sizes fall back to the unfused chain
-        # because both fused kernels hardcode block_size=256 in threadgroup
-        # memory.
-        self.use_fused_kernel = (
-            bool(use_fused_kernel)
-            and self.block_size == FUSED_BLOCK_SIZE
-            and self.quant_scheme in (QUANT_SCHEME_SYMMETRIC, QUANT_SCHEME_DYNAMIC)
+        self.fused_kernel_status = _adam_fused_status(
+            requested=bool(use_fused_kernel),
+            block_size=self.block_size,
+            quant_scheme=self.quant_scheme,
         )
+        self.use_fused_kernel = self.fused_kernel_status.available
 
     def init_single(self, parameter: mx.array, state: dict[str, Any]) -> None:
         if self.min_8bit_size and int(parameter.size) < self.min_8bit_size:
@@ -224,53 +364,6 @@ class Adam8bit(optim.Optimizer):
             decayed = parameter.astype(mx.float32) * (1.0 - lr_fp32 * self.weight_decay)
             return (decayed - update).astype(param_dtype)
 
-        if self.use_fused_kernel:
-            # Fused path: dequant -> AdamW math + noise floor -> quant -> apply
-            # in a single Metal kernel launch. The numerical contract matches
-            # the unfused chain below to within fp32 noise (the only source of
-            # divergence is reduction order in the per-block absmax). Two
-            # codec-specific kernels: symmetric uses inline +128 bias; dynamic
-            # loads the bnb LUT into threadgroup memory and binary-searches it.
-            if self.quant_scheme == QUANT_SCHEME_DYNAMIC:
-                param_out, m_q, m_absmax, v_q, v_absmax = fused_adam8bit_dynamic_step(
-                    parameter,
-                    gradient,
-                    state["m_quant"],
-                    state["m_absmax"],
-                    state["v_quant"],
-                    state["v_absmax"],
-                    learning_rate=lr_fp32,
-                    beta1=b1,
-                    beta2=b2,
-                    eps=eps,
-                    weight_decay=self.weight_decay,
-                    step=self.step,
-                    bias_correction=self.bias_correction,
-                    block_size=self.block_size,
-                )
-            else:
-                param_out, m_q, m_absmax, v_q, v_absmax = fused_adam8bit_step(
-                    parameter,
-                    gradient,
-                    state["m_quant"],
-                    state["m_absmax"],
-                    state["v_quant"],
-                    state["v_absmax"],
-                    learning_rate=lr_fp32,
-                    beta1=b1,
-                    beta2=b2,
-                    eps=eps,
-                    weight_decay=self.weight_decay,
-                    step=self.step,
-                    bias_correction=self.bias_correction,
-                    block_size=self.block_size,
-                )
-            state["m_quant"] = m_q
-            state["m_absmax"] = m_absmax
-            state["v_quant"] = v_q
-            state["v_absmax"] = v_absmax
-            return param_out
-
         # 1) Dequantize current moments to fp32. For the symmetric path the
         # dequant introduces rounding error bounded by ``absmax / (2 * 127)``
         # per block; the dynamic LUT path bounds the error by half the
@@ -300,32 +393,33 @@ class Adam8bit(optim.Optimizer):
         # uniform int8 step). The dynamic LUT path uses ``absmax / 127`` as a
         # safe upper bound; the actual smallest LUT bin is ~5.5e-7 which is
         # much tighter, but using the symmetric bound here is conservative
-        # and avoids needing a per-block LUT-spacing query in the kernel.
+        # and avoids needing a per-block LUT-spacing query in the optimizer.
         # state["v_absmax"] is the absmax from the *previous* step. Use the
         # max of (previous, |v_new| absmax estimate) so the floor reflects
         # whatever round-trip we're about to take.
         v_absmax_estimate = _block_absmax(v_new, self.block_size)
         v_block_step = mx.maximum(state["v_absmax"], v_absmax_estimate) / 127.0
-        # Broadcast the per-block step to a per-element noise floor by
-        # repeating each scale ``block_size`` times and trimming the tail.
-        v_noise_floor = mx.repeat(v_block_step, self.block_size)[: int(v_new.size)].reshape(
-            v_new.shape
-        )
 
         # 3) Compute the update in fp32 before re-quantization, so the round
         # trip through uint8 happens after we already used the fresh moments.
-        # The denominator ``sqrt(v_new) + v_noise_floor + eps`` never
-        # underflows even when v_new has elements that quantize to zero on
-        # the next round trip.
-        if self.bias_correction:
-            step = self.step.astype(mx.float32)
-            c1 = lr_fp32 / (1.0 - mx.power(mx.array(b1, dtype=mx.float32), step))
-            c2 = mx.rsqrt(1.0 - mx.power(mx.array(b2, dtype=mx.float32), step))
-            numerator = c1 * m_new
-            denominator = mx.sqrt(v_new) * c2 + v_noise_floor + eps
-            update = numerator / denominator
-        else:
-            update = lr_fp32 * m_new / (mx.sqrt(v_new) + v_noise_floor + eps)
+        # The denominator ``sqrt(v_new) + block_floor + eps`` never underflows
+        # even when v_new has elements that quantize to zero on the next round
+        # trip. The block floor is broadcast per block/tail rather than
+        # materialized with a full-size repeat tensor.
+        updated = _adam_block_update(
+            m_new,
+            v_new,
+            parameter,
+            v_block_step,
+            learning_rate=lr_fp32,
+            beta1=b1,
+            beta2=b2,
+            eps=eps,
+            weight_decay=self.weight_decay,
+            step=self.step,
+            bias_correction=self.bias_correction,
+            block_size=self.block_size,
+        )
 
         # 4) Re-quantize the updated moments back to uint8 + absmax storage
         # using whichever codec the optimizer was configured for.
@@ -336,10 +430,7 @@ class Adam8bit(optim.Optimizer):
         state["v_quant"] = v_q
         state["v_absmax"] = v_absmax
 
-        # 5) Apply weight decay + step in fp32, then cast back to param dtype.
-        decayed = parameter.astype(mx.float32) * (1.0 - lr_fp32 * self.weight_decay)
-        updated = decayed - update
-        return updated.astype(param_dtype)
+        return updated
 
 
 def make_adam8bit(
@@ -358,17 +449,20 @@ def make_adam8bit(
 
     The defaults mirror :func:`cppmega_mlx.training.optimizers.make_adamw` so
     the Adam8bit path is a drop-in swap. ``block_size`` matches bitsandbytes's
-    256-element blockwise default; only that value is wired through the Metal
-    kernel today (other sizes raise ``NotImplementedError``).
+    256-element blockwise default; only that value is supported by the native
+    MLX codec today (other sizes raise ``NotImplementedError``).
+
+    ``use_fused_kernel`` is retained as a compatibility request flag, but the
+    direct-MSL fused optimizer kernels are unsupported and resolve to the
+    native MLX codec path. ``optimizer.fused_kernel_status`` records why.
 
     ``quant_scheme`` selects the 8-bit codec:
 
     * ``"symmetric_int8_v1"`` (default): the existing symmetric int8 codec
-      with the fused-kernel fast path. Backwards compatible.
+      with +128 bias. Backwards compatible.
     * ``"dynamic_int8_v1"``: the bitsandbytes-style dynamic LUT
       (``dDequantizeBlockwise`` parity for the signed dynamic map). Denser
-      bins near zero so small Adam ``m, v`` values keep more precision;
-      runs through the unfused codec dispatch path.
+      bins near zero so small Adam ``m, v`` values keep more precision.
 
     ``min_8bit_size`` keeps tensors with fewer elements in fp32 ``m``/``v``
     state. Set it to ``4096`` for the bitsandbytes default stability policy;
@@ -435,6 +529,10 @@ class Lion8bit(optim.Optimizer):
     ``sign()``, and ``beta2`` for the persistent momentum update. Both bnb's
     ``Lion8bit`` and the MLX upstream ``optim.Lion`` follow this scheme.
 
+    ``use_fused_kernel`` is retained as a compatibility request flag, but the
+    direct-MSL fused optimizer kernels are unsupported and resolve to the
+    native MLX codec path. ``optimizer.fused_kernel_status`` records why.
+
     ``quant_scheme`` selects the codec used for the ``m`` buffer, dispatched
     through :func:`cppmega_mlx.training._quantize_8bit.quantize_blockwise`:
 
@@ -468,18 +566,12 @@ class Lion8bit(optim.Optimizer):
                 f"quant_scheme must be one of {QUANT_SCHEMES}; got {quant_scheme!r}"
             )
         self.quant_scheme: str = quant_scheme
-        # Both the symmetric-int8 and dynamic-LUT schemes have a fused Metal
-        # kernel implementation. The symmetric kernel embeds the +128 bias
-        # inline; the dynamic kernel loads the 256-entry bnb signed LUT into
-        # threadgroup memory once per block and uses a binary search for the
-        # quantize step. Other block sizes fall back to the unfused chain
-        # because both fused kernels hardcode block_size=256 in threadgroup
-        # memory.
-        self.use_fused_kernel = (
-            bool(use_fused_kernel)
-            and self.block_size == FUSED_BLOCK_SIZE
-            and self.quant_scheme in (QUANT_SCHEME_SYMMETRIC, QUANT_SCHEME_DYNAMIC)
+        self.fused_kernel_status = _lion_fused_status(
+            requested=bool(use_fused_kernel),
+            block_size=self.block_size,
+            quant_scheme=self.quant_scheme,
         )
+        self.use_fused_kernel = self.fused_kernel_status.available
 
     def init_single(self, parameter: mx.array, state: dict[str, Any]) -> None:
         nb = num_blocks(int(parameter.size), self.block_size)
@@ -502,41 +594,6 @@ class Lion8bit(optim.Optimizer):
         lr_fp32 = self.learning_rate.astype(mx.float32)
         param_dtype = parameter.dtype
         scheme = self.quant_scheme
-
-        if self.use_fused_kernel:
-            # Fused path: dequant -> Lion math (sign-update) -> apply -> quant
-            # in a single Metal kernel launch. Numerical contract matches the
-            # unfused chain below to within fp32 noise (only source of
-            # divergence is the per-block absmax tree-reduction order). Two
-            # codec-specific kernels: symmetric uses inline +128 bias; dynamic
-            # loads the bnb LUT into threadgroup memory and binary-searches it.
-            if self.quant_scheme == QUANT_SCHEME_DYNAMIC:
-                param_out, m_q, m_absmax = fused_lion8bit_dynamic_step(
-                    parameter,
-                    gradient,
-                    state["m_quant"],
-                    state["m_absmax"],
-                    learning_rate=lr_fp32,
-                    beta1=b1,
-                    beta2=b2,
-                    weight_decay=self.weight_decay,
-                    block_size=self.block_size,
-                )
-            else:
-                param_out, m_q, m_absmax = fused_lion8bit_step(
-                    parameter,
-                    gradient,
-                    state["m_quant"],
-                    state["m_absmax"],
-                    learning_rate=lr_fp32,
-                    beta1=b1,
-                    beta2=b2,
-                    weight_decay=self.weight_decay,
-                    block_size=self.block_size,
-                )
-            state["m_quant"] = m_q
-            state["m_absmax"] = m_absmax
-            return param_out
 
         # 1) Dequantize the persistent momentum to fp32 for the inner math.
         # Lion's update is sign-based, so symmetric int8 quant noise on m
@@ -595,16 +652,19 @@ def make_lion8bit(
     Chen et al. arXiv 2302.06675, default LR 3-10x smaller than AdamW because
     the sign-based update does not rescale by gradient magnitude.
     ``block_size`` matches bitsandbytes's 256-element blockwise default; only
-    that value is wired through the Metal kernel today (other sizes raise
+    that value is supported by the native MLX codec today (other sizes raise
     ``NotImplementedError``).
+
+    ``use_fused_kernel`` is retained as a compatibility request flag, but the
+    direct-MSL fused optimizer kernels are unsupported and resolve to the
+    native MLX codec path. ``optimizer.fused_kernel_status`` records why.
 
     ``quant_scheme`` selects the 8-bit codec:
 
     * ``"symmetric_int8_v1"`` (default): the existing symmetric int8 codec.
       Backwards compatible.
     * ``"dynamic_int8_v1"``: the bitsandbytes-style dynamic LUT, denser bins
-      near zero so small momentum values keep more precision; runs through
-      the unfused codec dispatch path.
+      near zero so small momentum values keep more precision.
 
     Memory footprint vs ``make_lion`` on a 1.797B-param bf16 model:
 

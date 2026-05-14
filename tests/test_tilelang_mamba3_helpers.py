@@ -1,10 +1,10 @@
-"""Parity tests for the Path B TileLang Mamba3 backward helpers.
+"""Parity tests for the native TileLang Mamba3 backward helpers.
 
-These tests verify that the TileLang/Metal rewrites of the three Mamba3 Triton
-helpers in ``cppmega_mlx.nn._tilelang._mamba3_helpers_tilelang`` agree with
-their pure-MLX siblings (``_mamba3_helpers``) at fp16 carrier tolerance. The
-sibling is the parity oracle on macOS because the upstream Triton reference is
-CUDA-only.
+These tests verify that the TileLang/tvm-ffi rewrites of the three Mamba3
+Triton helpers in ``cppmega_mlx.nn._tilelang._mamba3_helpers_tilelang`` agree
+with their pure-MLX siblings (``_mamba3_helpers``) at fp16 carrier tolerance.
+The sibling is the parity oracle on macOS because the upstream Triton reference
+is CUDA-only.
 
 Coverage:
 
@@ -26,6 +26,7 @@ Skips:
 from __future__ import annotations
 
 import importlib
+import inspect
 
 import numpy as np
 import pytest
@@ -33,11 +34,9 @@ import pytest
 import mlx.core as mx
 
 
-tilelang = pytest.importorskip("tilelang")  # noqa: F841
-
-
 from cppmega_mlx.nn._tilelang import _mamba3_helpers as _pure_helpers  # noqa: E402
 from cppmega_mlx.nn._tilelang._mamba3_helpers_tilelang import (  # noqa: E402
+    TileLangHelperStatus,
     bwd_dadt_fused as tl_bwd_dadt_fused,
     bwd_dtrap_ddt as tl_bwd_dtrap_ddt,
     compute_dacs_segsum as tl_compute_dacs_segsum,
@@ -186,6 +185,103 @@ def test_force_fallback_routes_through_pure_mlx() -> None:
     fallback = tl_compute_dacs_segsum(A, dt, dh, force_fallback=True)
     mx.eval(expected, fallback)
     np.testing.assert_array_equal(_to_fp32_np(fallback), _to_fp32_np(expected))
+
+
+def test_helpers_use_native_tvm_ffi_not_mlx_fast_wrapper() -> None:
+    """TileLang helpers must not regress to extracted-MSL MLX wrappers."""
+
+    mod = importlib.import_module(
+        "cppmega_mlx.nn._tilelang._mamba3_helpers_tilelang"
+    )
+    source = inspect.getsource(mod)
+    assert 'execution_backend="tvm_ffi"' in source
+    assert "mx.fast.metal_kernel(" not in source
+    assert "_msl_transform.dispatch(" not in source
+
+
+def test_compute_dacs_segsum_native_route_uses_owner_output_without_padding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The tvm-ffi route receives the exact K and an explicit output buffer."""
+
+    mod = importlib.import_module(
+        "cppmega_mlx.nn._tilelang._mamba3_helpers_tilelang"
+    )
+    monkeypatch.setattr(
+        mod,
+        "helpers_metal_status",
+        lambda: TileLangHelperStatus(True, "forced native route"),
+    )
+    monkeypatch.setattr(mx, "synchronize", lambda: None)
+    calls: dict[str, object] = {}
+
+    class RecordingKernel:
+        def __call__(
+            self,
+            A: mx.array,
+            dt: mx.array,
+            dh: mx.array,
+            out: mx.array,
+        ) -> mx.array:
+            calls["A_shape"] = tuple(A.shape)
+            calls["dt_shape"] = tuple(dt.shape)
+            calls["dh_shape"] = tuple(dh.shape)
+            calls["out_shape"] = tuple(out.shape)
+            calls["out"] = out
+            return out
+
+    def fake_kernel_for(BH: int, T_: int, K: int, BLOCK_K: int) -> RecordingKernel:
+        calls["factory_args"] = (BH, T_, K, BLOCK_K)
+        return RecordingKernel()
+
+    monkeypatch.setattr(mod, "_segsum_kernel_for", fake_kernel_for)
+
+    A = mx.zeros((1, 2, 1), dtype=mx.float32)
+    dt = mx.ones((1, 2, 1), dtype=mx.float32)
+    dh = mx.zeros((1, 2, 1, 3), dtype=mx.float16)
+    out = mod.compute_dacs_segsum(A, dt, dh)
+
+    assert calls["factory_args"] == (1, 2, 3, 4)
+    assert calls["A_shape"] == (1, 2)
+    assert calls["dt_shape"] == (1, 2)
+    assert calls["dh_shape"] == (1, 2, 3)
+    assert calls["out_shape"] == (1, 2, 3)
+    assert out.shape == dh.shape
+    assert out.dtype == dh.dtype
+
+
+def test_compute_dacs_segsum_fp32_carrier_falls_back_without_hidden_cast(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unsupported carrier dtype must not be silently cast to fit tvm-ffi."""
+
+    mod = importlib.import_module(
+        "cppmega_mlx.nn._tilelang._mamba3_helpers_tilelang"
+    )
+    monkeypatch.setattr(
+        mod,
+        "helpers_metal_status",
+        lambda: TileLangHelperStatus(True, "forced native route"),
+    )
+
+    def fail_kernel_build(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("native kernel must not build for fp32 dh carrier")
+
+    monkeypatch.setattr(mod, "_segsum_kernel_for", fail_kernel_build)
+
+    A, dt, dh_f16 = _make_segsum_inputs(1, 4, 1, 1, 3, seed=123)
+    dh = dh_f16.astype(mx.float32)
+    expected = _pure_helpers.compute_dacs_segsum(A, dt, dh)
+    actual = mod.compute_dacs_segsum(A, dt, dh)
+    mx.eval(expected, actual)
+
+    assert actual.dtype == dh.dtype
+    np.testing.assert_allclose(
+        _to_fp32_np(actual),
+        _to_fp32_np(expected),
+        rtol=0.0,
+        atol=0.0,
+    )
 
 
 def test_module_docstring_references_attribution() -> None:

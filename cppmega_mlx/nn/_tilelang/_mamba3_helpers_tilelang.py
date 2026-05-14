@@ -16,10 +16,10 @@ upstream Triton kernels in
   * ``bwd_dtrap_ddt_triton``        - fused ddt/dtrap from the trapezoidal
     parameterisation.
 
-All three are translated to TileLang ``@T.prim_func`` definitions and lowered
-through TileLang's ``metal`` target. The emitted MSL body is stitched into an
-``mx.fast.metal_kernel`` source so the three helpers ride the same Path B
-codegen path as the main Mamba3 forward/backward kernels.
+All three are translated to TileLang ``@T.prim_func`` definitions and compiled
+through TileLang's native ``tvm_ffi`` execution backend into explicit
+caller-owned MLX output buffers. They no longer extract MSL or build
+``mx.fast.metal_kernel`` wrappers.
 
 API parity
 ----------
@@ -35,10 +35,10 @@ fp16 carrier
 ------------
 
 The Triton originals run in fp32. tilelang 0.1.9's bf16 simdgroup MSL path has
-known issues (cubecl#1202), so this Path B port forces the *carrier* dtype to
-fp16 while keeping the per-step accumulator in fp32. Inputs in bf16 are
-round-tripped through fp32 to avoid mantissa loss; fp32 inputs pass through
-unchanged.
+known issues (cubecl#1202), so the native TileLang helper route only accepts
+the fp16 carrier shapes encoded in the PrimFuncs while keeping per-step
+accumulators in fp32. Inputs outside that exact no-copy ABI fall back to the
+pure-MLX sibling instead of being silently cast or padded.
 
 Per-helper accuracy budget vs the pure-MLX sibling:
   * ``compute_dacs_segsum``  - rtol=1e-4 / atol=1e-3 (fp16 boundary).
@@ -48,26 +48,23 @@ Per-helper accuracy budget vs the pure-MLX sibling:
 Fallback
 --------
 
-When tilelang is not importable, the Metal target rejects an op, or the
-emitted kernel diverges beyond tolerance, callers should route through the
-pure-MLX sibling. Each public helper here exposes a status object so callers
-can pre-flight the dispatch decision.
+When tilelang is not importable, the Metal target rejects an op, the native
+tvm-ffi call cannot consume the buffers directly, or the caller passes an
+unsupported dtype/layout, the public helpers route through the pure-MLX
+sibling. Each public helper here exposes a status object so callers can
+pre-flight the dispatch decision.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Tuple
+from typing import Any, Tuple
 
 import mlx.core as mx
 
 from cppmega_mlx.nn._tilelang import _mamba3_helpers as _pure_helpers
-from cppmega_mlx.nn._tilelang._engine_dispatch import dispatch_lower
-from cppmega_mlx.nn._tilelang._msl_transform import (
-    MSLDispatchUnsupported,
-    can_run_metal,
-)
+from cppmega_mlx.nn._tilelang import _msl_transform
 
 
 # ---------------------------------------------------------------------------
@@ -77,7 +74,7 @@ from cppmega_mlx.nn._tilelang._msl_transform import (
 
 @dataclass(frozen=True)
 class TileLangHelperStatus:
-    """Runtime status of one of the Path B Mamba3 helper kernels."""
+    """Runtime status of one of the native tvm-ffi Mamba3 helper kernels."""
 
     available: bool
     reason: str
@@ -96,9 +93,9 @@ def _tilelang_available() -> tuple[bool, str]:
 
 
 def helpers_metal_status() -> TileLangHelperStatus:
-    """Return whether the Path B Mamba3 helpers can dispatch on this host."""
+    """Return whether the native tvm-ffi Mamba3 helpers can dispatch."""
 
-    if not can_run_metal():
+    if not _msl_transform.can_run_metal():
         return TileLangHelperStatus(
             available=False,
             reason="MLX Metal backend is not available on the default GPU device",
@@ -106,32 +103,93 @@ def helpers_metal_status() -> TileLangHelperStatus:
     ok, reason = _tilelang_available()
     if not ok:
         return TileLangHelperStatus(available=False, reason=reason)
-    return TileLangHelperStatus(available=True, reason="Path B helpers ready")
+    return TileLangHelperStatus(
+        available=True,
+        reason="TileLang tvm-ffi helpers ready",
+    )
 
 
 # ---------------------------------------------------------------------------
-# fp16 carrier helper
+# Native tvm-ffi helper ABI
 # ---------------------------------------------------------------------------
 
 
-def _to_fp16_carrier(x: mx.array) -> mx.array:
-    if x.dtype == mx.float16:
-        return x
-    if x.dtype == mx.bfloat16:
-        return x.astype(mx.float32).astype(mx.float16)
-    return x.astype(mx.float16)
+def _compile_tvm_ffi_kernel(prim_func: Any, *, out_idx: int | list[int]) -> Any:
+    import tilelang
+
+    return tilelang.compile(
+        prim_func,
+        target=_msl_transform._as_metal_target("metal"),
+        execution_backend="tvm_ffi",
+        out_idx=out_idx,
+    )
 
 
-def _to_fp32(x: mx.array) -> mx.array:
-    if x.dtype == mx.float32:
-        return x
-    if x.dtype == mx.bfloat16:
-        return x.astype(mx.float32)
-    return x.astype(mx.float32)
+def _single_owner_output_returned(returned: Any, expected: mx.array) -> bool:
+    if returned is expected:
+        return True
+    if isinstance(returned, (list, tuple)) and len(returned) == 1:
+        return returned[0] is expected
+    return False
+
+
+def _owner_outputs_returned(returned: Any, expected: tuple[mx.array, ...]) -> bool:
+    if not isinstance(returned, (list, tuple)):
+        return False
+    if len(returned) != len(expected):
+        return False
+    return all(got is want for got, want in zip(returned, expected, strict=True))
+
+
+def _fallback_segsum(
+    A: mx.array,
+    dt: mx.array,
+    dh: mx.array,
+    *,
+    accumulate_in_fp32: bool,
+) -> mx.array:
+    return _pure_helpers.compute_dacs_segsum(
+        A,
+        dt,
+        dh,
+        accumulate_in_fp32=accumulate_in_fp32,
+    )
+
+
+def _fallback_dadt(
+    dY: mx.array,
+    A: mx.array,
+    dt: mx.array,
+    h: mx.array,
+    *,
+    accumulate_in_fp32: bool,
+) -> Tuple[mx.array, mx.array]:
+    return _pure_helpers.bwd_dadt_fused(
+        dY,
+        A,
+        dt,
+        h,
+        accumulate_in_fp32=accumulate_in_fp32,
+    )
+
+
+def _fallback_dtrap(
+    dB_scaled: mx.array,
+    dt: mx.array,
+    trap: mx.array,
+    *,
+    accumulate_in_fp32: bool,
+) -> Tuple[mx.array, mx.array]:
+    return _pure_helpers.bwd_dtrap_ddt(
+        dB_scaled,
+        dt,
+        trap,
+        accumulate_in_fp32=accumulate_in_fp32,
+    )
 
 
 # ---------------------------------------------------------------------------
-# Kernel factories (cached) — each returns (kernel, lowering metadata)
+# Kernel factories (cached)
 # ---------------------------------------------------------------------------
 
 
@@ -174,20 +232,7 @@ def _segsum_kernel_for(BH: int, T_: int, K: int, BLOCK_K: int):
                         carrier_dtype,
                     )
 
-    artifact = dispatch_lower(segsum, target="metal")
-    if hasattr(artifact, "_tilelang_engine_target"):
-        return artifact, None
-    lowering = artifact
-    kernel = mx.fast.metal_kernel(
-        name=f"tlmamba3_segsum_{BH}_{T_}_{K}_{BLOCK_K}",
-        # Buffer order in the lowered MSL is alphabetic: A, dh, dt, out.
-        input_names=["A", "dh", "dt"],
-        output_names=["out"],
-        source=lowering.body,
-        header=lowering.header,
-        ensure_row_contiguous=True,
-    )
-    return kernel, lowering
+    return _compile_tvm_ffi_kernel(segsum, out_idx=3)
 
 
 @lru_cache(maxsize=128)
@@ -232,22 +277,7 @@ def _dadt_kernel_for(BH: int, T_: int, K: int, BLOCK_T: int):
                 dA[bh, t_index] = acc[0] * dt[bh, t_index]
                 ddt[bh, t_index] = acc[0] * A[bh, t_index]
 
-    artifact = dispatch_lower(dadt, target="metal")
-    if hasattr(artifact, "_tilelang_engine_target"):
-        return artifact, None
-    lowering = artifact
-    kernel = mx.fast.metal_kernel(
-        name=f"tlmamba3_dadt_{BH}_{T_}_{K}_{BLOCK_T}",
-        # Buffer order alphabetic: A, dA, dY, ddt, dh, dt -> after sort:
-        # actually MSL emits in alphabetic order which is:
-        # A, dA, dY, ddt, dt, h
-        input_names=["A", "dY", "dt", "h"],
-        output_names=["dA", "ddt"],
-        source=lowering.body,
-        header=lowering.header,
-        ensure_row_contiguous=True,
-    )
-    return kernel, lowering
+    return _compile_tvm_ffi_kernel(dadt, out_idx=[4, 5])
 
 
 @lru_cache(maxsize=128)
@@ -314,20 +344,7 @@ def _dtrap_kernel_for(BH: int, T_: int, BLOCK_T: int):
                 ddt_out[bh, t_index] = T.cast(ddt_v[0], carrier_dtype)
                 dtrap_out[bh, t_index] = T.cast(dtrap_v[0], carrier_dtype)
 
-    artifact = dispatch_lower(dtrap, target="metal")
-    if hasattr(artifact, "_tilelang_engine_target"):
-        return artifact, None
-    lowering = artifact
-    kernel = mx.fast.metal_kernel(
-        name=f"tlmamba3_dtrap_{BH}_{T_}_{BLOCK_T}",
-        # Alphabetic order from MSL: dB_scaled, ddt_out, dt, dtrap_out, trap
-        input_names=["dB_scaled", "dt", "trap"],
-        output_names=["ddt_out", "dtrap_out"],
-        source=lowering.body,
-        header=lowering.header,
-        ensure_row_contiguous=True,
-    )
-    return kernel, lowering
+    return _compile_tvm_ffi_kernel(dtrap, out_idx=[3, 4])
 
 
 # ---------------------------------------------------------------------------
@@ -381,10 +398,6 @@ def _ceil_pow2(n: int) -> int:
     return 1 << (n - 1).bit_length()
 
 
-def _round_up(n: int, m: int) -> int:
-    return ((n + m - 1) // m) * m
-
-
 def _validate_segsum_inputs(A: mx.array, dt: mx.array, dh: mx.array) -> None:
     if A.ndim != 3:
         raise ValueError(f"A must be (B,T,H), got {A.shape}")
@@ -412,15 +425,13 @@ def compute_dacs_segsum(
     _validate_segsum_inputs(A, dt, dh)
 
     if dh.size == 0 or dh.shape[-1] == 0:
-        return _pure_helpers.compute_dacs_segsum(
-            A, dt, dh, accumulate_in_fp32=accumulate_in_fp32
-        )
+        return _fallback_segsum(A, dt, dh, accumulate_in_fp32=accumulate_in_fp32)
 
     status = helpers_metal_status()
     if force_fallback or not status.available:
-        return _pure_helpers.compute_dacs_segsum(
-            A, dt, dh, accumulate_in_fp32=accumulate_in_fp32
-        )
+        return _fallback_segsum(A, dt, dh, accumulate_in_fp32=accumulate_in_fp32)
+    if A.dtype != mx.float32 or dt.dtype != mx.float32 or dh.dtype != mx.float16:
+        return _fallback_segsum(A, dt, dh, accumulate_in_fp32=accumulate_in_fp32)
 
     B, T_, H = A.shape
     BH = B * H
@@ -428,62 +439,26 @@ def compute_dacs_segsum(
     dt_flat, _ = _flatten_bh_kt(dt)
     dh_flat, K = _flatten_dh(dh, A.shape)
 
-    A_f32 = _to_fp32(A_flat)
-    dt_f32 = _to_fp32(dt_flat)
-    dh_f16 = _to_fp16_carrier(dh_flat)
-
     BLOCK_K = min(_ceil_pow2(K) if K <= 256 else 64, 64)
     if BLOCK_K < 1:
         BLOCK_K = 1
-    K_padded = _round_up(K, BLOCK_K)
-    if K_padded != K:
-        # Pad the trailing dim so the static TileLang shape matches.
-        pad_zeros = mx.zeros((BH, T_, K_padded - K), dtype=mx.float16)
-        dh_f16 = mx.concatenate([dh_f16, pad_zeros], axis=-1)
 
     try:
-        kernel, lowering = _segsum_kernel_for(BH, T_, K_padded, BLOCK_K)
-    except (MSLDispatchUnsupported, RuntimeError, ValueError) as exc:
-        # Lowering failed -- fall back transparently.
-        _ = exc
-        return _pure_helpers.compute_dacs_segsum(
-            A, dt, dh, accumulate_in_fp32=accumulate_in_fp32
-        )
-
-    if lowering is None:
-        # Engine path: runtime call signature for the engine artifact is not
-        # yet wired through the mlx fast-kernel dispatch (mx.fast.metal_kernel
-        # expects mx.array buffers, the engine artifact takes raw prim args).
-        # Fall back to pure-MLX for parity until Phase-4 plumbs the engine
-        # artifact through the fast-kernel runtime.
-        return _pure_helpers.compute_dacs_segsum(
-            A, dt, dh, accumulate_in_fp32=accumulate_in_fp32
-        )
-
-    grid = (
-        lowering.grid[0] * lowering.threadgroup[0],
-        lowering.grid[1] * lowering.threadgroup[1],
-        lowering.grid[2] * lowering.threadgroup[2],
-    )
-
-    try:
-        out_list = kernel(
-            inputs=[A_f32, dh_f16, dt_f32],
-            output_shapes=[(BH, T_, K_padded)],
-            output_dtypes=[mx.float16],
-            grid=grid,
-            threadgroup=lowering.threadgroup,
-        )
+        kernel = _segsum_kernel_for(BH, T_, K, BLOCK_K)
     except Exception as exc:
         _ = exc
-        return _pure_helpers.compute_dacs_segsum(
-            A, dt, dh, accumulate_in_fp32=accumulate_in_fp32
-        )
-    out_padded = out_list[0]
-    if K_padded != K:
-        out_padded = out_padded[:, :, :K]
-    out_full = _unflatten_dh(out_padded, dh.shape)
-    return out_full.astype(dh.dtype)
+        return _fallback_segsum(A, dt, dh, accumulate_in_fp32=accumulate_in_fp32)
+
+    out_flat = mx.zeros((BH, T_, K), dtype=mx.float16)
+    try:
+        returned = kernel(A_flat, dt_flat, dh_flat, out_flat)
+    except Exception as exc:
+        _ = exc
+        return _fallback_segsum(A, dt, dh, accumulate_in_fp32=accumulate_in_fp32)
+    if not _single_owner_output_returned(returned, out_flat):
+        return _fallback_segsum(A, dt, dh, accumulate_in_fp32=accumulate_in_fp32)
+    mx.synchronize()
+    return _unflatten_dh(out_flat, dh.shape)
 
 
 def bwd_dadt_fused(
@@ -509,15 +484,18 @@ def bwd_dadt_fused(
         )
 
     if dY.size == 0 or h.size == 0:
-        return _pure_helpers.bwd_dadt_fused(
-            dY, A, dt, h, accumulate_in_fp32=accumulate_in_fp32
-        )
+        return _fallback_dadt(dY, A, dt, h, accumulate_in_fp32=accumulate_in_fp32)
 
     status = helpers_metal_status()
     if force_fallback or not status.available:
-        return _pure_helpers.bwd_dadt_fused(
-            dY, A, dt, h, accumulate_in_fp32=accumulate_in_fp32
-        )
+        return _fallback_dadt(dY, A, dt, h, accumulate_in_fp32=accumulate_in_fp32)
+    if (
+        A.dtype != mx.float32
+        or dt.dtype != mx.float32
+        or dY.dtype != mx.float16
+        or h.dtype != mx.float16
+    ):
+        return _fallback_dadt(dY, A, dt, h, accumulate_in_fp32=accumulate_in_fp32)
 
     B, T_, H = A.shape
     BH = B * H
@@ -526,48 +504,25 @@ def bwd_dadt_fused(
     dY_flat, K = _flatten_dh(dY, A.shape)
     h_flat, _ = _flatten_dh(h, A.shape)
 
-    A_f32 = _to_fp32(A_flat)
-    dt_f32 = _to_fp32(dt_flat)
-    dY_f16 = _to_fp16_carrier(dY_flat)
-    h_f16 = _to_fp16_carrier(h_flat)
-
     BLOCK_T = min(64, max(1, _ceil_pow2(T_)))
     BLOCK_T = min(BLOCK_T, 256)
 
     try:
-        kernel, lowering = _dadt_kernel_for(BH, T_, K, BLOCK_T)
-    except (MSLDispatchUnsupported, RuntimeError, ValueError):
-        return _pure_helpers.bwd_dadt_fused(
-            dY, A, dt, h, accumulate_in_fp32=accumulate_in_fp32
-        )
-
-    if lowering is None:
-        # Engine path: not yet wired through fast-kernel runtime — fall back.
-        return _pure_helpers.bwd_dadt_fused(
-            dY, A, dt, h, accumulate_in_fp32=accumulate_in_fp32
-        )
-
-    grid = (
-        lowering.grid[0] * lowering.threadgroup[0],
-        lowering.grid[1] * lowering.threadgroup[1],
-        lowering.grid[2] * lowering.threadgroup[2],
-    )
-
-    try:
-        out_list = kernel(
-            inputs=[A_f32, dY_f16, dt_f32, h_f16],
-            output_shapes=[(BH, T_), (BH, T_)],
-            output_dtypes=[mx.float32, mx.float32],
-            grid=grid,
-            threadgroup=lowering.threadgroup,
-        )
+        kernel = _dadt_kernel_for(BH, T_, K, BLOCK_T)
     except Exception:
-        return _pure_helpers.bwd_dadt_fused(
-            dY, A, dt, h, accumulate_in_fp32=accumulate_in_fp32
-        )
-    dA_flat, ddt_flat = out_list
-    dA = dA_flat.reshape(B, H, T_).transpose(0, 2, 1).astype(A.dtype)
-    ddt = ddt_flat.reshape(B, H, T_).transpose(0, 2, 1).astype(dt.dtype)
+        return _fallback_dadt(dY, A, dt, h, accumulate_in_fp32=accumulate_in_fp32)
+
+    dA_flat = mx.zeros((BH, T_), dtype=mx.float32)
+    ddt_flat = mx.zeros((BH, T_), dtype=mx.float32)
+    try:
+        returned = kernel(A_flat, dY_flat, dt_flat, h_flat, out=(dA_flat, ddt_flat))
+    except Exception:
+        return _fallback_dadt(dY, A, dt, h, accumulate_in_fp32=accumulate_in_fp32)
+    if not _owner_outputs_returned(returned, (dA_flat, ddt_flat)):
+        return _fallback_dadt(dY, A, dt, h, accumulate_in_fp32=accumulate_in_fp32)
+    mx.synchronize()
+    dA = dA_flat.reshape(B, H, T_).transpose(0, 2, 1)
+    ddt = ddt_flat.reshape(B, H, T_).transpose(0, 2, 1)
     return dA, ddt
 
 
@@ -586,16 +541,35 @@ def bwd_dtrap_ddt(
     if dt.shape != dB_scaled.shape:
         raise ValueError(f"dt must match dB_scaled {dB_scaled.shape}, got {dt.shape}")
     if trap.shape != dB_scaled.shape:
-        raise ValueError(f"trap must match dB_scaled {dB_scaled.shape}, got {trap.shape}")
+        raise ValueError(
+            f"trap must match dB_scaled {dB_scaled.shape}, got {trap.shape}"
+        )
     if dB_scaled.size == 0 or dB_scaled.shape[1] == 0:
-        return _pure_helpers.bwd_dtrap_ddt(
-            dB_scaled, dt, trap, accumulate_in_fp32=accumulate_in_fp32
+        return _fallback_dtrap(
+            dB_scaled,
+            dt,
+            trap,
+            accumulate_in_fp32=accumulate_in_fp32,
         )
 
     status = helpers_metal_status()
     if force_fallback or not status.available:
-        return _pure_helpers.bwd_dtrap_ddt(
-            dB_scaled, dt, trap, accumulate_in_fp32=accumulate_in_fp32
+        return _fallback_dtrap(
+            dB_scaled,
+            dt,
+            trap,
+            accumulate_in_fp32=accumulate_in_fp32,
+        )
+    if (
+        dB_scaled.dtype != mx.float16
+        or dt.dtype != mx.float16
+        or trap.dtype != mx.float16
+    ):
+        return _fallback_dtrap(
+            dB_scaled,
+            dt,
+            trap,
+            accumulate_in_fp32=accumulate_in_fp32,
         )
 
     B, T_, H = dB_scaled.shape
@@ -605,47 +579,40 @@ def bwd_dtrap_ddt(
     dt_flat, _ = _flatten_bh_kt(dt)
     trap_flat, _ = _flatten_bh_kt(trap)
 
-    dB_f16 = _to_fp16_carrier(dB_flat)
-    dt_f16 = _to_fp16_carrier(dt_flat)
-    trap_f16 = _to_fp16_carrier(trap_flat)
-
     BLOCK_T = min(64, max(1, _ceil_pow2(T_)))
     BLOCK_T = min(BLOCK_T, 256)
 
     try:
-        kernel, lowering = _dtrap_kernel_for(BH, T_, BLOCK_T)
-    except (MSLDispatchUnsupported, RuntimeError, ValueError):
-        return _pure_helpers.bwd_dtrap_ddt(
-            dB_scaled, dt, trap, accumulate_in_fp32=accumulate_in_fp32
-        )
-
-    if lowering is None:
-        # Engine path: not yet wired through fast-kernel runtime — fall back.
-        return _pure_helpers.bwd_dtrap_ddt(
-            dB_scaled, dt, trap, accumulate_in_fp32=accumulate_in_fp32
-        )
-
-    grid = (
-        lowering.grid[0] * lowering.threadgroup[0],
-        lowering.grid[1] * lowering.threadgroup[1],
-        lowering.grid[2] * lowering.threadgroup[2],
-    )
-
-    try:
-        out_list = kernel(
-            inputs=[dB_f16, dt_f16, trap_f16],
-            output_shapes=[(BH, T_), (BH, T_)],
-            output_dtypes=[mx.float16, mx.float16],
-            grid=grid,
-            threadgroup=lowering.threadgroup,
-        )
+        kernel = _dtrap_kernel_for(BH, T_, BLOCK_T)
     except Exception:
-        return _pure_helpers.bwd_dtrap_ddt(
-            dB_scaled, dt, trap, accumulate_in_fp32=accumulate_in_fp32
+        return _fallback_dtrap(
+            dB_scaled,
+            dt,
+            trap,
+            accumulate_in_fp32=accumulate_in_fp32,
         )
-    ddt_flat, dtrap_flat = out_list
-    ddt = ddt_flat.reshape(B, H, T_).transpose(0, 2, 1).astype(dt.dtype)
-    dtrap = dtrap_flat.reshape(B, H, T_).transpose(0, 2, 1).astype(trap.dtype)
+
+    ddt_flat = mx.zeros((BH, T_), dtype=mx.float16)
+    dtrap_flat = mx.zeros((BH, T_), dtype=mx.float16)
+    try:
+        returned = kernel(dB_flat, dt_flat, trap_flat, out=(ddt_flat, dtrap_flat))
+    except Exception:
+        return _fallback_dtrap(
+            dB_scaled,
+            dt,
+            trap,
+            accumulate_in_fp32=accumulate_in_fp32,
+        )
+    if not _owner_outputs_returned(returned, (ddt_flat, dtrap_flat)):
+        return _fallback_dtrap(
+            dB_scaled,
+            dt,
+            trap,
+            accumulate_in_fp32=accumulate_in_fp32,
+        )
+    mx.synchronize()
+    ddt = ddt_flat.reshape(B, H, T_).transpose(0, 2, 1)
+    dtrap = dtrap_flat.reshape(B, H, T_).transpose(0, 2, 1)
     return ddt, dtrap
 
 

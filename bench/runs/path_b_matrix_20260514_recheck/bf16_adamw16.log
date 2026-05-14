@@ -1,0 +1,5 @@
+wrote /Volumes/external/sources/cppmega.mlx/bench/runs/path_b_matrix_20260514_recheck/bf16_adamw16_path_b_20step_seq2048.json
+status: ok
+steps_completed: 20
+final_loss: 6.054039478302002
+peak_memory_bytes: 31359130454

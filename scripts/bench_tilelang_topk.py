@@ -4,7 +4,7 @@
 The cppmega TileLang ``topk_selector`` kernel returns the indices of the
 ``k`` largest values per batch row. Path B is a hand-written MSL kernel.
 Path C is a TileLang DSL PrimFunc lowered to Metal and launched through
-``mx.fast.metal_kernel`` with the TileLang-generated body.
+TileLang's native tvm-ffi owner-output route.
 
 Strategies:
 
@@ -128,9 +128,10 @@ def _strategy_path_b_msl(scores: mx.array, k: int) -> mx.array:
 
 
 def _strategy_path_c_tilelang(scores: mx.array, k: int) -> mx.array:
-    """TileLang DSL Path C kernel lowered to Metal."""
+    """TileLang DSL Path C kernel launched via tvm-ffi owner output."""
 
-    out = topk_selector_tilelang(scores, k)
+    out_buffer = mx.full((int(scores.shape[0]), int(k)), -1, dtype=mx.int32)
+    out = topk_selector_tilelang(scores, k, out=out_buffer)
     if out is None:
         raise RuntimeError("TileLang DSL Path C kernel did not dispatch")
     return out

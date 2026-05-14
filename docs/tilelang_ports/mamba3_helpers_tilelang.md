@@ -1,6 +1,6 @@
-# Mamba3 backward helpers — TileLang/Metal port
+# Mamba3 backward helpers — TileLang/tvm-ffi port
 
-This note covers the Path B port of the three Triton helpers used by Mamba3's
+This note covers the native TileLang port of the three Triton helpers used by Mamba3's
 backward pass:
 
 1. compute_dacs_segsum_triton — segment cumulative-sum reduction over the
@@ -8,11 +8,11 @@ backward pass:
 2. bwd_dadt_fused_triton — fused dA/ddt computation.
 3. bwd_dtrap_ddt_triton — fused ddt/dtrap from the trapezoidal scale.
 
-The goal of this port is to keep the entire Mamba3 stack inside one DSL
-(TileLang) and ride the same mx.fast.metal_kernel codegen+dispatch path as
-the main mamba3_mimo_fwd/bwd kernels. Pure-MLX rewrites in
+The goal of this port is to keep the helper kernels inside TileLang while
+launching through the standard TileLang -> TVM -> tvm-ffi/native API with
+explicit MLX owner-output buffers. Pure-MLX rewrites in
 cppmega_mlx/nn/_tilelang/_mamba3_helpers.py (sibling agent) remain the
-fallback when the TileLang lowering fails.
+fallback when TileLang cannot compile or consume the buffers directly.
 
 ## Source attribution
 
@@ -40,14 +40,8 @@ fallback when the TileLang lowering fails.
   <tbody>
     <tr>
       <td>cppmega_mlx/nn/_tilelang/_mamba3_helpers_tilelang.py</td>
-      <td>TileLang PrimFunc definitions, MSL lowering, MLX dispatch<br>
-      wrappers, status surface.</td>
-    </tr>
-    <tr>
-      <td>cppmega_mlx/nn/_tilelang/_msl_transform.py</td>
-      <td>Adds lower_tilelang_to_msl_inline() so the kernel body is<br>
-      inlined into MLX's source= (not into an inline void, which<br>
-      Metal forbids for threadgroup allocations).</td>
+      <td>TileLang PrimFunc definitions, native tvm-ffi compile,<br>
+      owner-output dispatch, status surface.</td>
     </tr>
     <tr>
       <td>tests/test_tilelang_mamba3_helpers.py</td>
@@ -64,27 +58,24 @@ fallback when the TileLang lowering fails.
   </tbody>
 </table>
 
-## TileLang DSL → MSL translation notes
+## TileLang DSL → tvm-ffi notes
 
 ### Common pattern
 
-All three kernels share the same Path B pipeline:
+All three kernels share the same native pipeline:
 
 1. Build a @T.prim_func PrimFunc with explicit thread/grid extents.
-2. Lower with tilelang.engine.lower.lower(..., target=tvm.target.Target("metal")).
-3. Extract the kernel void body verbatim and inject blockIdx/threadIdx
-   aliases that map to MLX's threadgroup_position_in_grid /
-   thread_position_in_threadgroup builtins.
-4. Pass input_names + output_names to mx.fast.metal_kernel in the same
-   alphabetic order TileLang's MSL emits (e.g. ["A", "dh", "dt"] even though
-   the PrimFunc declared them as (A, dt, dh)).
+2. Compile with tilelang.compile(..., target="metal",
+   execution_backend="tvm_ffi", out_idx=...).
+3. Allocate the helper's explicit output buffers and pass them as tvm-ffi
+   owner outputs.
+4. If the caller's dtype/layout does not match the no-copy native ABI, fall
+   back to the pure-MLX sibling instead of casting, padding, or staging hidden
+   adapter buffers.
 
-The body-inlining detour is mandatory because Apple MSL does not allow
-threadgroup allocations inside an inline void function (only inside a
-kernel void). The Path B reference in
-/tmp/path_b_msl_mlx/bench_msl_path_b.py worked because its GEMM kernel had
-no threadgroup allocations; Mamba3's segsum kernel does, so the lowering
-helper here returns the body to be inlined directly.
+The previous extracted-MSL + mx.fast.metal_kernel bridge is retired for these
+helpers. MSL extraction remains useful only for debug surfaces that already
+start from TileLang IR but still need a legacy MLX fast-kernel wrapper.
 
 ### Helper 1 — compute_dacs_segsum
 
@@ -155,7 +146,7 @@ else:
 
 ## Lowering surprises
 
-These were the only non-cosmetic changes vs the Path B GEMM template:
+These were the only non-cosmetic changes vs the earlier Path B GEMM template:
 
 * **Metal target rejects shared.dyn**. The default scope produced by
   T.alloc_shared on the Metal target raises

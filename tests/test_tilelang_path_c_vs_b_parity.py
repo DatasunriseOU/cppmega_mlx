@@ -311,7 +311,12 @@ PARITY_CASES: list[tuple[str, str, Callable[[str], Any], str | None]] = [
     ("mamba3", "carryover", _drive_mamba3, None),
     ("fp8_vecmat", "small", _drive_fp8_vecmat, None),
     ("sparse_mla_blockscaled", "prepared-small", _drive_sparse_mla_blockscaled, None),
-    ("sparse_mla_fp8", "prepared-small", _drive_sparse_mla_fp8, None),
+    (
+        "sparse_mla_fp8",
+        "prepared-small",
+        _drive_sparse_mla_fp8,
+        "sparse_mla_fp8 direct-MSL Path B is retired; Path C is covered by prepared-buffer tests",
+    ),
 ]
 
 

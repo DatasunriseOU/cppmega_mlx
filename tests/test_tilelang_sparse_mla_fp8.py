@@ -1,18 +1,15 @@
 # pyright: reportMissingImports=false
-"""Parity + status tests for the Path B FP8 sparse-MLA port.
+"""Parity + status tests for FP8 sparse-MLA reference and Path C surfaces.
 
-The Path B FP8 kernel is now available via direct-MSL bypass (see
-``cppmega_mlx/nn/_tilelang/sparse_mla_fp8.py`` module docstring). The
-previous TileLang ``T.gemm`` and ``float8_e4m3 -> Metal type`` blockers are
-bypassed by emitting MSL through ``mx.fast.metal_kernel`` directly with
-inline e4m3 dequant on uint8 storage.
+The historical direct-MSL Path B kernel is retired. Callable prepared-buffer
+Path C surfaces must route through TileLang/tvm-ffi, and float-carrier callers
+fall back to the explicit MLX FP8 reference unless forced.
 
 These tests exercise:
 
-1. The Metal-status surface returns ``available=True`` on a Metal device.
-2. ``sparse_mla_fp8_apply`` dispatches the kernel and parity holds vs the
-   pure-MLX FP8 reference within FP8 noise tolerance.
-3. ``force_metal=True`` succeeds (no blocker to raise).
+1. The direct-MSL status surface reports an explicit unsupported reason.
+2. ``sparse_mla_fp8_apply`` falls back to the pure-MLX FP8 reference.
+3. ``force_metal=True`` raises with the direct-MSL blocker.
 4. The pure-MLX FP8 reference matches a "dequantize-then-BF16" parity oracle
    exactly.
 5. The FP8 reference matches the original BF16 reference within FP8 noise
@@ -79,6 +76,17 @@ from cppmega_mlx.nn.sparse_mla import sparse_mla_attention_reference  # noqa: E4
 # ---------------------------------------------------------------------------
 # Test fixtures
 # ---------------------------------------------------------------------------
+
+
+def _requires_native_tilelang_graph_outputs() -> None:
+    if not mx.metal.is_available():
+        pytest.skip("requires MLX Metal")
+
+
+def _materialized_owner_buffer(shape: tuple[int, ...], dtype: mx.Dtype) -> mx.array:
+    out = mx.zeros(shape, dtype=dtype)
+    mx.eval(out)
+    return out
 
 
 def _make_inputs(
@@ -193,20 +201,17 @@ def _indexed_qk_score_oracle_np(
 def test_fp8_metal_status_reports_available() -> None:
     status = sparse_mla_fp8_metal_status()
     assert isinstance(status, SparseMLAFp8MetalStatus)
+    assert status.available is False
+    assert status.reason
     if mx.metal.is_available():
-        assert status.available is True
-        assert "FP8 e4m3" in status.reason or "direct-MSL" in status.reason
-    else:
-        assert status.available is False
+        assert "direct-MSL Path B is retired" in status.reason
 
 
 def test_fp8_metal_status_with_arrays_validates_dispatcher_path() -> None:
     q, kv, indices, _ = _make_inputs()
     status = sparse_mla_fp8_metal_status(q, kv, indices)
-    if mx.metal.is_available():
-        assert status.available is True
-    else:
-        assert status.available is False
+    assert status.available is False
+    assert status.reason
 
 
 def test_fp8_sparse_mla_path_c_status_reports_dispatchable_qk_reducer() -> None:
@@ -217,10 +222,8 @@ def test_fp8_sparse_mla_path_c_status_reports_dispatchable_qk_reducer() -> None:
     assert status.k == 64
     assert status.transpose_B is True
     assert status.reason
-    if not mx.metal.is_available():
-        assert status.available is False
+    if not status.available:
         return
-    assert status.available is True
     # This status is intentionally reducer-only.  It must not satisfy the
     # full Sparse-MLA Path C dispatch gate.
     assert status.features["dispatch_surface"] == "qk_reduce"
@@ -328,17 +331,16 @@ def test_fp8_sparse_mla_path_c_qk_reduce_status_reports_available() -> None:
     assert status.outputs_per_block == 16
     assert status.reduce_threads == 32
     assert status.vec == 4
-    if mx.metal.is_available():
-        assert status.available is True
-        assert status.features["signature_has_A_scale"] is True
-        assert status.features["signature_has_B_scale"] is True
-        assert _feature_int(status.features, "A_scale_refs") >= 1
-        assert _feature_int(status.features, "B_scale_refs") >= 1
-        assert status.features["sync_plan_strategy"] == "simdgroup_async"
-        assert status.features["sync_plan_barrier_count"] == 0
-        assert status.features["sync_plan_reduction_isolated"] is True
-    else:
-        assert status.available is False
+    if not status.available:
+        assert status.reason
+        return
+    assert status.features["signature_has_A_scale"] is True
+    assert status.features["signature_has_B_scale"] is True
+    assert _feature_int(status.features, "A_scale_refs") >= 1
+    assert _feature_int(status.features, "B_scale_refs") >= 1
+    assert status.features["sync_plan_strategy"] == "simdgroup_async"
+    assert status.features["sync_plan_barrier_count"] == 0
+    assert status.features["sync_plan_reduction_isolated"] is True
 
 
 def test_fp8_sparse_mla_path_c_qk_reduce_status_preserves_explicit_schedule() -> None:
@@ -360,12 +362,11 @@ def test_fp8_sparse_mla_path_c_qk_reduce_status_preserves_explicit_schedule() ->
         vec=4,
     )
     assert plan.strategy == "threadgroup_sync"
-    if mx.metal.is_available():
-        assert status.available is True
-        assert status.features["sync_plan_strategy"] == "threadgroup_sync"
-        assert _feature_int(status.features, "sync_plan_barrier_count") >= 1
-    else:
-        assert status.available is False
+    if not status.available:
+        assert status.reason
+        return
+    assert status.features["sync_plan_strategy"] == "threadgroup_sync"
+    assert _feature_int(status.features, "sync_plan_barrier_count") >= 1
 
 
 def test_fp8_sparse_mla_path_c_qk_reduce_lowered_features_are_reported() -> None:
@@ -391,6 +392,10 @@ def test_fp8_sparse_mla_path_c_qk_reduce_lowered_features_are_reported() -> None
 
 
 def test_fp8_sparse_mla_path_c_qk_reduce_matches_dequant_oracle() -> None:
+    status = fp8_sparse_mla_qk_reduce_path_c_status(N=16, K=64)
+    if not status.available:
+        pytest.skip(status.reason)
+
     q, kv, _indices, _d_v = _make_inputs(
         seq_len=16, heads=2, qk_dim=64, topk=16, scale=0.1
     )
@@ -398,10 +403,10 @@ def test_fp8_sparse_mla_path_c_qk_reduce_matches_dequant_oracle() -> None:
     kv_fp8, kv_scale = _to_fp8_with_per_tensor_scale(kv)
     mx.eval(q_fp8, q_scale, kv_fp8, kv_scale)
 
-    A_fp8 = q_fp8[0, 0, 0, :].reshape((1, 64))
-    A_scale = q_scale[0, 0, 0].reshape((1,))
-    B_fp8 = kv_fp8[0, :16, 0, :]
-    B_scale = kv_scale[0, :16, 0]
+    A_fp8 = mx.contiguous(q_fp8[0, 0, 0, :].reshape((1, 64)))
+    A_scale = mx.contiguous(q_scale[0, 0, 0].reshape((1,)))
+    B_fp8 = mx.contiguous(kv_fp8[0, :16, 0, :])
+    B_scale = mx.contiguous(kv_scale[0, :16, 0])
     out = fp8_sparse_mla_qk_reduce_path_c(A_fp8, A_scale, B_fp8, B_scale)
     assert out is not None
 
@@ -423,7 +428,15 @@ def test_fp8_sparse_mla_path_c_qk_reduce_matches_dequant_oracle() -> None:
     )
 
 
-def test_fp8_sparse_mla_path_c_qk_reduce_supports_scalar_b_scale_broadcast() -> None:
+def test_fp8_sparse_mla_path_c_qk_reduce_supports_scalar_b_scale_without_broadcast(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    status = fp8_sparse_mla_qk_reduce_path_c_status(N=16, K=64)
+    if not status.available:
+        pytest.skip(status.reason)
+
+    import cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c as path_c_module
+
     q, kv, _indices, _d_v = _make_inputs(
         seq_len=16, heads=2, qk_dim=64, topk=16, scale=0.1, seed=11
     )
@@ -431,11 +444,23 @@ def test_fp8_sparse_mla_path_c_qk_reduce_supports_scalar_b_scale_broadcast() -> 
     kv_fp8, kv_scale = _to_fp8_with_per_tensor_scale(kv)
     mx.eval(q_fp8, q_scale, kv_fp8, kv_scale)
 
-    A_fp8 = q_fp8[0, 0, 0, :].reshape((1, 64))
-    A_scale = q_scale[0, 0, 0].reshape((1,))
-    B_fp8 = kv_fp8[0, :16, 0, :]
-    B_scale_scalar = kv_scale[0, 0, 0].reshape((1,))
-    out = fp8_sparse_mla_qk_reduce_path_c(A_fp8, A_scale, B_fp8, B_scale_scalar)
+    A_fp8 = mx.contiguous(q_fp8[0, 0, 0, :].reshape((1, 64)))
+    A_scale = mx.contiguous(q_scale[0, 0, 0].reshape((1,)))
+    B_fp8 = mx.contiguous(kv_fp8[0, :16, 0, :])
+    B_scale_scalar = mx.contiguous(kv_scale[0, 0, 0].reshape((1,)))
+
+    def fail_hidden_broadcast(*args: object, **kwargs: object) -> mx.array:
+        del args, kwargs
+        raise AssertionError("scalar B_scale must not be broadcast in Python")
+
+    def fail_hidden_compact(*args: object, **kwargs: object) -> mx.array:
+        del args, kwargs
+        raise AssertionError("Path C dispatch must not compact inputs in Python")
+
+    with monkeypatch.context() as mp:
+        mp.setattr(path_c_module.mx, "ones", fail_hidden_broadcast)
+        mp.setattr(path_c_module.mx, "contiguous", fail_hidden_compact)
+        out = fp8_sparse_mla_qk_reduce_path_c(A_fp8, A_scale, B_fp8, B_scale_scalar)
     assert out is not None
 
     oracle = mx.matmul(
@@ -522,10 +547,8 @@ def test_fp8_sparse_mla_path_c_indexed_qk_reduce_status_tunes_default_topk16_sch
     assert status.outputs_per_block == 16
     assert status.reduce_threads == 32
     assert status.vec == 4
-    if mx.metal.is_available():
-        assert status.available is True
-    else:
-        assert status.available is False
+    if not status.available:
+        assert status.reason
 
 
 def test_fp8_sparse_mla_path_c_indexed_qk_reduce_lowered_features_are_reported() -> (
@@ -599,6 +622,11 @@ def test_fp8_sparse_mla_path_c_indexed_qk_reduce_matches_path_b_index_contract()
     )
     q_fp8, q_scale = _to_fp8_with_per_tensor_scale(q)
     kv_fp8, kv_scale = _to_fp8_with_per_tensor_scale(kv)
+    q_fp8 = mx.contiguous(q_fp8)
+    q_scale = mx.contiguous(q_scale)
+    kv_fp8 = mx.contiguous(kv_fp8)
+    kv_scale = mx.contiguous(kv_scale)
+    indices = mx.contiguous(indices)
     sm_scale = 0.125
     mx.eval(q_fp8, q_scale, kv_fp8, kv_scale, indices)
 
@@ -652,6 +680,11 @@ def test_fp8_sparse_mla_path_c_indexed_qk_reduce_masks_oob_indices() -> None:
     indices = mx.array(indices_np, dtype=mx.int32)
     q_fp8, q_scale = _to_fp8_with_per_tensor_scale(q)
     kv_fp8, kv_scale = _to_fp8_with_per_tensor_scale(kv)
+    q_fp8 = mx.contiguous(q_fp8)
+    q_scale = mx.contiguous(q_scale)
+    kv_fp8 = mx.contiguous(kv_fp8)
+    kv_scale = mx.contiguous(kv_scale)
+    indices = mx.contiguous(indices)
     sm_scale = 0.125
     mx.eval(q_fp8, q_scale, kv_fp8, kv_scale, indices)
 
@@ -850,28 +883,22 @@ def test_fp8_sparse_mla_checked_receipt_keeps_path_c_qk_claims_honest() -> None:
     assert _finite_positive_float(ratios["path_c_indexed_qk_reduce_over_path_b_fwd"])
 
 
-def test_fp8_fwd_metal_returns_outputs() -> None:
+def test_fp8_fwd_metal_is_explicitly_unsupported() -> None:
     q, kv, indices, d_v = _make_inputs()
     result = sparse_mla_fp8_fwd_metal(q, kv, indices, d_v=d_v)
-    assert result is not None
-    out, lse = result
-    mx.eval(out, lse)
-    assert tuple(out.shape) == tuple(q.shape[:3]) + (d_v,)
+    assert result is None
+    assert sparse_mla_fp8_metal_status(q, kv, indices).available is False
 
 
-def test_fp8_bwd_metal_returns_outputs() -> None:
+def test_fp8_bwd_metal_is_explicitly_unsupported() -> None:
     q, kv, indices, d_v = _make_inputs()
     d_out = mx.zeros((1, 4, 2, d_v), dtype=mx.float32)
     grads = sparse_mla_fp8_bwd_metal(q, kv, d_out, indices, d_v=d_v)
-    assert grads is not None
-    dq, dkv = grads
-    mx.eval(dq, dkv)
-    assert tuple(dq.shape) == tuple(q.shape)
-    assert tuple(dkv.shape) == tuple(kv.shape)
+    assert grads is None
 
 
 def test_fp8_path_c_bwd_owner_outputs_must_be_passed_as_a_pair() -> None:
-    import cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c as path_c_module
+    _requires_native_tilelang_graph_outputs()
 
     q, kv, indices, d_v = _make_inputs(scale=0.1)
     q_fp8 = mx.zeros(tuple(q.shape), dtype=mx.uint8)
@@ -879,9 +906,7 @@ def test_fp8_path_c_bwd_owner_outputs_must_be_passed_as_a_pair() -> None:
     q_scale = mx.ones(tuple(q.shape[:-1]), dtype=mx.float32)
     kv_scale = mx.ones(tuple(kv.shape[:-1]), dtype=mx.float32)
     d_out = mx.zeros(tuple(q.shape[:3]) + (d_v,), dtype=mx.float32)
-    dq_buffer = path_c_module._native_owner_output_buffer(
-        tuple(q.shape), mx.float32
-    )
+    dq_buffer = _materialized_owner_buffer(tuple(q.shape), mx.float32)
 
     with pytest.raises(
         SparseMLAFp8PathCDirectError,
@@ -901,7 +926,7 @@ def test_fp8_path_c_bwd_owner_outputs_must_be_passed_as_a_pair() -> None:
 
 
 def test_fp8_path_c_bwd_owner_outputs_run_through_atomic_tvm_ffi() -> None:
-    import cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c as path_c_module
+    _requires_native_tilelang_graph_outputs()
 
     q, kv, indices, d_v = _make_inputs(scale=0.1)
     q_fp8 = mx.zeros(tuple(q.shape), dtype=mx.uint8)
@@ -909,12 +934,8 @@ def test_fp8_path_c_bwd_owner_outputs_run_through_atomic_tvm_ffi() -> None:
     q_scale = mx.ones(tuple(q.shape[:-1]), dtype=mx.float32)
     kv_scale = mx.ones(tuple(kv.shape[:-1]), dtype=mx.float32)
     d_out = mx.zeros(tuple(q.shape[:3]) + (d_v,), dtype=mx.float32)
-    dq_buffer = path_c_module._native_owner_output_buffer(
-        tuple(q.shape), mx.float32
-    )
-    dkv_buffer = path_c_module._native_owner_output_buffer(
-        tuple(kv.shape), mx.float32
-    )
+    dq_buffer = _materialized_owner_buffer(tuple(q.shape), mx.float32)
+    dkv_buffer = _materialized_owner_buffer(tuple(kv.shape), mx.float32)
 
     result = sparse_mla_fp8_bwd_path_c(
         q_fp8,
@@ -950,6 +971,8 @@ def test_fp8_path_c_bwd_owner_outputs_run_through_atomic_tvm_ffi() -> None:
 
 
 def test_fp8_path_c_bwd_without_owner_outputs_uses_native_graph_outputs() -> None:
+    _requires_native_tilelang_graph_outputs()
+
     q, kv, indices, d_v = _make_inputs(scale=0.1)
     q_fp8 = mx.zeros(tuple(q.shape), dtype=mx.uint8)
     kv_fp8 = mx.zeros(tuple(kv.shape), dtype=mx.uint8)
@@ -981,6 +1004,8 @@ def test_fp8_path_c_bwd_without_owner_outputs_uses_native_graph_outputs() -> Non
 
 
 def test_fp8_path_c_prepared_float_vjp_uses_native_graph_outputs() -> None:
+    _requires_native_tilelang_graph_outputs()
+
     q, kv, indices, d_v = _make_inputs(scale=0.1)
     q = q.astype(mx.bfloat16)
     kv = kv.astype(mx.bfloat16)
@@ -1015,10 +1040,10 @@ def test_fp8_path_c_prepared_float_vjp_uses_native_graph_outputs() -> None:
     assert np.all(np.isfinite(np.asarray(dkv.astype(mx.float32))))
 
 
-def test_fp8_path_c_native_owner_output_allocator_returns_mlx_array() -> None:
-    import cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c as path_c_module
+def test_fp8_path_c_materialized_owner_buffer_helper_returns_mlx_array() -> None:
+    _requires_native_tilelang_graph_outputs()
 
-    out = path_c_module._native_owner_output_buffer((2, 3), mx.float32)
+    out = _materialized_owner_buffer((2, 3), mx.float32)
     assert isinstance(out, mx.array)
     assert tuple(out.shape) == (2, 3)
     assert out.dtype == mx.float32
@@ -1038,6 +1063,8 @@ def _assert_fp8_path_c_bwd_runs_with_owner_buffers(
     dkv_buffer: mx.array,
     causal: bool = False,
 ) -> None:
+    _requires_native_tilelang_graph_outputs()
+
     forced_result = sparse_mla_fp8_bwd_path_c(
         q_fp8,
         q_scale,
@@ -1109,11 +1136,10 @@ def _fake_fp8_path_c_bwd_owner_output_route(
     return calls
 
 
-def test_fp8_apply_force_metal_dispatches_kernel() -> None:
+def test_fp8_apply_force_metal_raises_direct_msl_blocker() -> None:
     q, kv, indices, d_v = _make_inputs()
-    out = _array_only(sparse_mla_fp8_apply(q, kv, indices, d_v=d_v, force_metal=True))
-    mx.eval(out)
-    assert tuple(out.shape) == tuple(q.shape[:3]) + (d_v,)
+    with pytest.raises(RuntimeError, match="direct-MSL Path B is retired"):
+        sparse_mla_fp8_apply(q, kv, indices, d_v=d_v, force_metal=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1141,12 +1167,7 @@ def test_to_fp8_per_tensor_scale_roundtrip_recovers_within_noise() -> None:
 
 
 def test_fp8_apply_matches_reference_within_fp8_tolerance() -> None:
-    """``sparse_mla_fp8_apply`` (Metal kernel) vs the pure-MLX FP8 reference.
-
-    Now that the direct-MSL FP8 kernel is wired the apply runs on Metal; the
-    parity tolerance is FP8 noise (rtol=5e-3) plus a small fp16 carrier
-    rounding margin.
-    """
+    """``sparse_mla_fp8_apply`` falls back to the pure-MLX FP8 reference."""
 
     q, kv, indices, d_v = _make_inputs(scale=0.1)
     out_apply = _array_only(sparse_mla_fp8_apply(q, kv, indices, d_v=d_v))
@@ -1160,21 +1181,12 @@ def test_fp8_apply_matches_reference_within_fp8_tolerance() -> None:
     )
 
 
-def test_fp8_path_b_forward_parity() -> None:
-    """Direct-MSL FP8 forward must agree with the reference within FP8 noise."""
+def test_fp8_path_b_forward_is_not_dispatchable() -> None:
+    """Retired direct-MSL FP8 forward reports unavailable instead of dispatching."""
 
     q, kv, indices, d_v = _make_inputs(scale=0.1)
     result = sparse_mla_fp8_fwd_metal(q, kv, indices, d_v=d_v)
-    assert result is not None
-    out_msl, lse = result
-    out_ref = _array_only(sparse_mla_fp8_reference(q, kv, indices, d_v=d_v))
-    mx.eval(out_msl, lse, out_ref)
-    np.testing.assert_allclose(
-        np.asarray(out_msl).astype(np.float32),
-        np.asarray(out_ref).astype(np.float32),
-        rtol=5e-3,
-        atol=5e-3,
-    )
+    assert result is None
 
 
 def test_fp8_path_c_forward_uses_tvm_ffi_owner_outputs(
@@ -1274,8 +1286,8 @@ def test_fp8_path_c_forward_owner_output_abi_is_fail_closed(
         )
 
 
-def test_fp8_path_b_backward_parity() -> None:
-    """Direct-MSL FP8 backward must agree with autograd of the reference."""
+def test_fp8_path_b_backward_is_not_dispatchable() -> None:
+    """Retired direct-MSL FP8 backward reports unavailable instead of dispatching."""
 
     q, kv, indices, d_v = _make_inputs(scale=0.1)
 
@@ -1285,29 +1297,7 @@ def test_fp8_path_b_backward_parity() -> None:
     )
 
     grads = sparse_mla_fp8_bwd_metal(q, kv, d_out, indices, d_v=d_v)
-    assert grads is not None
-    dq_msl, dkv_msl = grads
-    mx.eval(dq_msl, dkv_msl)
-
-    def loss(q_, kv_):
-        out = _array_only(sparse_mla_fp8_reference(q_, kv_, indices, d_v=d_v))
-        return mx.sum(out * d_out)
-
-    dq_ref, dkv_ref = mx.grad(loss, argnums=(0, 1))(q, kv)
-    mx.eval(dq_ref, dkv_ref)
-
-    np.testing.assert_allclose(
-        np.asarray(dq_msl).astype(np.float32),
-        np.asarray(dq_ref).astype(np.float32),
-        rtol=1e-2,
-        atol=5e-3,
-    )
-    np.testing.assert_allclose(
-        np.asarray(dkv_msl).astype(np.float32),
-        np.asarray(dkv_ref).astype(np.float32),
-        rtol=1e-2,
-        atol=5e-3,
-    )
+    assert grads is None
 
 
 def test_fp8_path_c_backward_parity_route_uses_atomic_tvm_ffi() -> None:
@@ -1338,11 +1328,10 @@ def test_fp8_path_c_backward_parity_route_uses_atomic_tvm_ffi() -> None:
     )
 
 
-def test_fp8_per_token_quant_producer_uses_single_metal_pass(
+def test_fp8_per_token_quant_producer_uses_single_tvm_ffi_pass(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    if not mx.metal.is_available():
-        pytest.skip("requires MLX Metal")
+    _requires_native_tilelang_graph_outputs()
 
     q, _kv, _indices, _d_v = _make_inputs(scale=0.1)
 

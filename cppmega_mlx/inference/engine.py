@@ -6,8 +6,8 @@ from dataclasses import dataclass, replace
 from typing import TypeAlias, cast
 
 import mlx.core as mx
-from mlx_lm.models.cache import KVCache, QuantizedKVCache
 
+from cppmega_mlx._mlx_lm_imports import KVCache, QuantizedKVCache
 from cppmega_mlx.inference.quantization import make_quantized_kv_cache
 
 _LayerCache: TypeAlias = KVCache | QuantizedKVCache

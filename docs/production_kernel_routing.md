@@ -253,7 +253,7 @@ The hybrid mini config (1.2B params, calibrated quarter from 4.8B) at training t
 ### What this means for a typical training step (mini, B=4 T=2048):
 - **Path A** dominates raw FLOPs (every Linear, every RoPE, every RMSNorm, every attention QKV, every gather_mm).
 - **Path B** carries the sequence-dimension reductions (Mamba3 scan, sparse-MLA attention). Chunked CE is opt-in recipe behavior, not the default production loss.
-- **Path C** is hit by topk_selector(..., backend="auto") when that selector is used and the TileLang path is available. The explicit `topk_selector_tilelang_direct(..., out=...)` surface is now a real tvm-ffi owner-output route for float32/float16 scores and caller-owned `mx.int32` outputs; direct bf16 fails closed to avoid hidden casts. Sparse-MLA BF16 uses a per-shape fail-closed AUTO gate: checked green rows use Path C, unreceipted rows stay Path B. Mamba3 remains a proof/override path. M2RNN Path C is opt-in and fails closed rather than broadcasting heads, allocating initial state, or re-entering Path B.
+- **Path C** is hit by TopK only through the explicit owner-output surface: `topk_selector_tilelang_direct(..., out=...)` or `topk_selector_tilelang(..., out=...)`. The public no-`out` `topk_selector(..., backend="auto")` API remains on Path B/reference because there is no honest caller-owned output buffer to hand to tvm-ffi. The explicit TopK route is a real tvm-ffi owner-output path for float32/float16 scores and caller-owned `mx.int32` outputs; direct bf16 fails closed to avoid hidden casts. Sparse-MLA BF16 uses a per-shape fail-closed AUTO gate: checked green rows use Path C, unreceipted rows stay Path B. Mamba3 remains a proof/override path. M2RNN Path C is opt-in and fails closed rather than broadcasting heads, allocating initial state, or re-entering Path B.
 
 ## Override mechanism
 
@@ -275,8 +275,10 @@ export CPPMEGA_KERNEL_PATH=path_c
 # contiguous FP32 buffers. It fails closed instead of copying broadcast/slice
 # views or running inside MLX graph transformations that block __dlpack__.
 
-# topk_selector is selected by its explicit backend argument, not this env var:
-# topk_selector(scores, k) / backend="auto" prefers Path C, then Path B.
+# topk_selector is selected by its explicit backend argument, not this env var.
+# Native Path C requires an owner output:
+# topk_selector_tilelang(scores, k, out=mx.zeros((B, k), dtype=mx.int32))
+# The no-out topk_selector(scores, k, backend="auto") API stays on Path B/ref.
 
 
 The dispatch decision is recorded in a process-wide ring buffer (last 256 records) accessible via cppmega_mlx.runtime.kernel_policy.get_dispatch_log(). The training profile snapshots this log at step boundaries and exposes it under ProfileMetrics.kernel_dispatch so the receipt JSON shows which kernels actually fired.
@@ -440,11 +442,11 @@ The dispatch decision is recorded in a process-wide ring buffer (last 256 record
 ## Honest limitations
 
 - **R (m2rnn) blocks now ship a Path B port** (cppmega_mlx/nn/_tilelang/m2rnn.py). Both forward and backward run as hand-written MSL via mx.fast.metal_kernel; the chunked-scan reference remains as the parity oracle and is reachable via CPPMEGA_KERNEL_PATH=ref. The kernel uses one threadgroup per (batch, head) with K_DIM threads per group; W is loaded into threadgroup memory once per (B, H). The fp16 carrier dodges the bf16 simdgroup MSL codegen bugs that Mamba3 also worked around.
-- **Path C is narrow, not global.** It is the default for topk_selector where the checked-in receipt proves C no worse than B, and `topk_selector_tilelang_direct(..., out=...)` now closes the float32/float16 owner-output case. That does not make public AUTO a generic owner-output route: compatibility wrapper paths still exist, and direct bf16 fails closed to avoid hidden casts. Sparse-MLA BF16 uses a per-shape fail-closed AUTO gate backed by bench/tilelang_ports/sparse_mla.json: green checked rows promote, unreceipted rows stay Path B. Mamba3 Path C remains a proof/override path. M2RNN Path C is available through owner-output/tvm-ffi, but only for already-aligned tensors with explicit <code>h0</code>; otherwise it raises before data movement.
+- **Path C is narrow, not global.** TopK has a native `topk_selector_tilelang_direct(..., out=...)` route for the float32/float16 owner-output case, but the public no-output AUTO API stays on Path B/reference because tvm-ffi needs a caller-owned output. Direct bf16 fails closed to avoid hidden casts. Sparse-MLA BF16 uses a per-shape fail-closed AUTO gate backed by bench/tilelang_ports/sparse_mla.json: green checked rows promote, unreceipted rows stay Path B. Mamba3 Path C remains a proof/override path. M2RNN Path C is available through owner-output/tvm-ffi, but only for already-aligned tensors with explicit <code>h0</code>; otherwise it raises before data movement.
 - **FP8 paths are software emulation.** Apple Silicon (M1–M4) has no native FP8 ALU. The uchar storage + LUT decode + fp32 fma loop pattern (vendored from audiohacking/fp8-mps-metal Apache 2.0) is what we ship. Native FP8 is M5/M6 territory.
 - **TileLang DSL on Metal works for FP16/FP32 GEMM, Mamba3, topk_selector, and BF16 sparse-MLA today.** The stale 32×32 T.Pipelined blocker no longer describes the in-tree sparse BF16 port. Remaining Sparse-MLA gaps are FP8 scheduler composition, e8m0 full-layout coverage, and unreceipted BF16 shapes outside the checked routing table.
 - **CPPMEGA_KERNEL_PATH=path_c is not a complete global path.** It redirects env-policy ops that have Path C wiring, currently Mamba3, sparse-MLA, and M2RNN. Mamba3 and M2RNN Path C routes use owner-output/tvm-ffi and fail closed before hidden broadcast/repeat/state allocation or graph-transform DLPack export. topk_selector uses its explicit backend argument. Other ops without Path C support must stay on Path A/B or fail closed.
-- **Remaining fast-kernel wrappers are intentional debt.** The current list is `_mlx_runtime.py`, `_msl_transform.py`, `_mamba3_helpers_tilelang.py`, `m2rnn.py`, `fp8_msl_kernels.py`, `fp8_matmul_path_c.py`, `fp8_vecmat_path_c.py`, `topk_selector.py` compatibility paths, `sparse_mla.py`, `sparse_mla_path_c.py`, `sparse_mla_fp8.py`, `sparse_mla_fp8_path_c.py`, `sparse_mla_blockscaled.py`, and `sparse_mla_blockscaled_path_c.py`. Removing them requires a no-hidden-copy tvm-ffi route plus equal-or-better receipts.
+- **Remaining fast-kernel wrappers are intentional debt.** The current list is `_mlx_runtime.py`, `_msl_transform.py`, `m2rnn.py`, `fp8_msl_kernels.py`, `fp8_matmul_path_c.py`, `fp8_vecmat_path_c.py`, `topk_selector.py` compatibility paths, `sparse_mla.py`, `sparse_mla_path_c.py`, `sparse_mla_fp8.py`, `sparse_mla_fp8_path_c.py`, `sparse_mla_blockscaled.py`, and `sparse_mla_blockscaled_path_c.py`. Removing them requires a no-hidden-copy tvm-ffi route plus equal-or-better receipts.
 
 ## Receipts
 

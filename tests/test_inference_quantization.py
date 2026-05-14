@@ -4,8 +4,8 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 import pytest
-from mlx_lm.models.cache import KVCache, QuantizedKVCache
 
+from cppmega_mlx._mlx_lm_imports import KVCache, QuantizedKVCache
 import cppmega_mlx.inference as inference
 from cppmega_mlx.inference import (
     InferenceQuantizationConfig,

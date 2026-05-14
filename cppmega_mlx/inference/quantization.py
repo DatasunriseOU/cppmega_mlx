@@ -6,8 +6,8 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
 import mlx.nn as nn
-from mlx_lm.models.cache import KVCache, QuantizedKVCache
 
+from cppmega_mlx._mlx_lm_imports import KVCache, QuantizedKVCache
 _SUPPORTED_BITS = frozenset({4, 8})
 _SUPPORTED_GROUP_SIZES = frozenset({32, 64, 128})
 _SUPPORTED_MODES = frozenset({"affine"})

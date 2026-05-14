@@ -1,4 +1,4 @@
-"""Tiny helper to wrap mx.fast.metal_kernel dispatch.
+"""Legacy helpers for wrapping ``mx.fast.metal_kernel`` dispatch.
 
 This is the Path B vendor-local equivalent of the TVM-Metal lowering produced
 by TileLang PR tile-ai/tilelang#799. We do not depend on TileLang at runtime;
@@ -12,6 +12,12 @@ The helper only exists so that:
 It is intentionally narrow: no MSL templating, no dynamic shape rewriting.
 The caller writes MSL assuming all dimensions are passed as device buffers
 or threadgroup constants.
+
+For new Path C production code, prefer
+``_engine_dispatch.compile_native_tilelang_kernel(..., out_idx=...)``. That
+API compiles through TileLang's ``execution_backend="tvm_ffi"`` path and
+requires caller-owned outputs by default, avoiding this module's Python MSL
+rewrite and ``mx.fast.metal_kernel`` allocation boundary.
 
 For TileLang-derived MSL the module also exposes an experimental lowering
 helper (``lower_tilelang_to_msl``) that takes a ``@T.prim_func`` PrimFunc and
@@ -325,6 +331,15 @@ def dispatch(
     lowering: TileLangMSLLowering | None = None,
     template: Sequence[tuple[str, object]] | None = None,
 ) -> list[mx.array]:
+    """Dispatch a legacy MLX fast Metal kernel.
+
+    This is intentionally kept as a compatibility boundary for existing Path B
+    and legacy Path C callers. New TileLang Path C production code should use
+    ``compile_native_tilelang_kernel(..., out_idx=...)`` from
+    :mod:`cppmega_mlx.nn._tilelang._engine_dispatch` so outputs cross the
+    native TVM-FFI boundary instead of this allocating ``mx.fast`` wrapper.
+    """
+
     # fix-round-9 (Wave 4 grok finding #2): explicit None-kernel guard. If
     # ``make_metal_kernel`` returned None (because ``can_run_metal()`` is
     # False or ``mx.fast.metal_kernel`` is missing), calling kernel(...) below

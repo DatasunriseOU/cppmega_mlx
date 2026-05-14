@@ -653,10 +653,8 @@ class M2RNNMixer(nn.Module):
 
         if path is KernelPath.PATH_C:
             from cppmega_mlx.nn._tilelang.m2rnn_path_c import (
-                m2rnn_apply_mapped_packed_with_state_path_c,
-                m2rnn_apply_post_residual_gate_path_c,
-                m2rnn_mapped_packed_path_c_status,
-                m2rnn_post_residual_gate_path_c_status,
+                m2rnn_apply_mapped_packed_post_with_state_path_c,
+                m2rnn_mapped_packed_post_path_c_status,
             )
 
             if scan_h0 is None:
@@ -678,37 +676,34 @@ class M2RNNMixer(nn.Module):
                 if self.state_weight.dtype == conv_input.dtype
                 else self.state_weight.astype(conv_input.dtype)
             )
-            status = m2rnn_mapped_packed_path_c_status(
+            if self.D is None:
+                raise RuntimeError(
+                    "m2rnn: Path C inline post residual/gate requires residual D; "
+                    "use_residual=False is not yet implemented for this TileLang route"
+                )
+            D = self.D if self.D.dtype == conv_input.dtype else self.D.astype(conv_input.dtype)
+            status = m2rnn_mapped_packed_post_path_c_status(
                 conv_input,
                 state_weight,
                 xf,
                 h0_full,
+                D,
+                projected,
                 q_heads=cfg.num_q_heads,
                 k_heads=cfg.num_k_heads,
                 v_heads=cfg.num_v_heads,
+                g_heads=cfg.num_g_heads,
             )
             if not status.available:
                 raise RuntimeError(
-                    f"m2rnn: Path C packed kernel unavailable ({status.reason})"
+                    f"m2rnn: Path C inline post residual/gate kernel unavailable "
+                    f"({status.reason})"
                 )
-            out, h = m2rnn_apply_mapped_packed_with_state_path_c(
+            out, h = m2rnn_apply_mapped_packed_post_with_state_path_c(
                 conv_input,
                 state_weight,
                 xf,
                 h0_full,
-                q_heads=cfg.num_q_heads,
-                k_heads=cfg.num_k_heads,
-                v_heads=cfg.num_v_heads,
-            )
-            if self.D is None:
-                raise RuntimeError(
-                    "m2rnn: Path C fused post residual/gate requires residual D; "
-                    "use_residual=False is not yet implemented for this TileLang route"
-                )
-            D = self.D if self.D.dtype == out.dtype else self.D.astype(out.dtype)
-            post_status = m2rnn_post_residual_gate_path_c_status(
-                out,
-                conv_input,
                 D,
                 projected,
                 q_heads=cfg.num_q_heads,
@@ -716,22 +711,7 @@ class M2RNNMixer(nn.Module):
                 v_heads=cfg.num_v_heads,
                 g_heads=cfg.num_g_heads,
             )
-            if not post_status.available:
-                raise RuntimeError(
-                    f"m2rnn: Path C post residual/gate kernel unavailable "
-                    f"({post_status.reason})"
-                )
-            out = m2rnn_apply_post_residual_gate_path_c(
-                out,
-                conv_input,
-                D,
-                projected,
-                q_heads=cfg.num_q_heads,
-                k_heads=cfg.num_k_heads,
-                v_heads=cfg.num_v_heads,
-                g_heads=cfg.num_g_heads,
-            )
-            record_dispatch("m2rnn", path, "path_c_tilelang_dsl_packed_post")
+            record_dispatch("m2rnn", path, "path_c_tilelang_dsl_packed_inline_post")
         else:
             q = conv_input[:, :, :q_end].reshape(batch, seq, cfg.num_q_heads, cfg.k_head_dim)
             k = conv_input[:, :, q_end:k_end].reshape(batch, seq, cfg.num_k_heads, cfg.k_head_dim)

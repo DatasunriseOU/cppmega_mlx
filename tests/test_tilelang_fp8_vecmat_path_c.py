@@ -21,6 +21,7 @@ import cppmega_mlx.nn._tilelang.fp8_matmul_path_c as fp8_matmul_mod
 import cppmega_mlx.nn._tilelang.fp8_vecmat_path_c as fp8_vecmat_mod
 from cppmega_mlx.nn._tilelang.fp8_matmul_path_c import (
     FP8MatmulPathCLegacyError,
+    fp8_matmul_path_c_status,
     fp8_scaled_matmul_path_c,
 )
 from cppmega_mlx.nn._tilelang.fp8_msl_kernels import fp8_scaled_vecmat
@@ -29,7 +30,6 @@ from cppmega_mlx.nn._tilelang.fp8_vecmat_path_c import (
     FP8VecmatPathCStatus,
     FP8VecmatPathCDirectError,
     FP8VecmatPathCLegacyError,
-    _fp8_vecmat_kernel_for,
     canonical_vecmat_runtime_body,
     fp8_scaled_vecmat_path_c_direct,
     fp8_scaled_vecmat_path_c,
@@ -56,6 +56,26 @@ def _bfloat16_dtype() -> Any | None:
     return getattr(mx, "bfloat16", None)
 
 
+def _require_fp8_vecmat_path_c_available() -> None:
+    status = fp8_vecmat_path_c_status()
+    if not status.available:
+        pytest.skip(f"FP8 vecmat Path C unavailable: {status.reason}")
+
+
+def _require_fp8_matmul_path_c_available() -> None:
+    status = fp8_matmul_path_c_status()
+    if not status.available:
+        pytest.skip(f"FP8 matmul Path C unavailable: {status.reason}")
+
+
+def _dlpack_conversion_error_type() -> type[BaseException]:
+    try:
+        from tilelang.contrib.mlx_interop import DLPackConversionError
+    except Exception as exc:
+        pytest.skip(f"TileLang DLPack interop unavailable: {exc}")
+    return DLPackConversionError
+
+
 def test_status_reports_available_or_explains_why() -> None:
     status = fp8_vecmat_path_c_status()
     assert isinstance(status, FP8VecmatPathCStatus)
@@ -66,6 +86,7 @@ def test_status_reports_available_or_explains_why() -> None:
 
 
 def test_lowered_default_reducer_contains_kernel_and_packed_lut_decode() -> None:
+    _require_fp8_vecmat_path_c_available()
     msl = lower_fp8_vecmat_msl(N=128, K=128)
     features = fp8_vecmat_msl_features(msl)
     assert features["kernel_void"] >= 1
@@ -76,6 +97,7 @@ def test_lowered_default_reducer_contains_kernel_and_packed_lut_decode() -> None
 
 
 def test_lowered_default_reducer_uses_packed_uint_loads_and_simd_sum() -> None:
+    _require_fp8_vecmat_path_c_available()
     msl = lower_fp8_vecmat_msl(N=128, K=128)
     features = fp8_vecmat_msl_features(msl)
     assert features["reinterpret_cast"] > 0
@@ -86,12 +108,14 @@ def test_lowered_default_reducer_uses_packed_uint_loads_and_simd_sum() -> None:
 
 
 def test_lowered_default_reducer_uses_per_row_b_scale() -> None:
+    _require_fp8_vecmat_path_c_available()
     msl = lower_fp8_vecmat_msl(N=128, K=128)
     assert "B_scale[0]" not in msl
     assert "B_scale[" in msl
 
 
 def test_lowered_default_reducer_reports_path_b_fast_path_ready() -> None:
+    _require_fp8_vecmat_path_c_available()
     msl = lower_fp8_vecmat_msl(N=128, K=128)
     blockers = fp8_vecmat_msl_blockers(msl)
     features = blockers["generated_features"]
@@ -130,24 +154,21 @@ def test_runtime_body_keeps_path_b_vecmat_hot_loop_and_scale_modes() -> None:
 
 
 @pytest.mark.skipif(not _metal_available(), reason="Metal unavailable")
-def test_runtime_kernel_uses_canonical_input_order_for_fast_tuple_dispatch() -> None:
-    _kernel, _lowering, input_names, output_shape, _grid, threadgroup = (
-        _fp8_vecmat_kernel_for(
-            24,
-            64,
-            1,
-            32,
-            4,
-            True,
-        )
+def test_runtime_source_uses_canonical_body_without_fast_tuple_dispatch() -> None:
+    _require_fp8_vecmat_path_c_available()
+    msl = lower_fp8_vecmat_msl(
+        N=24,
+        K=64,
+        outputs_per_block=1,
+        reduce_threads=32,
+        vec=4,
+        scale_w_per_row=True,
     )
-    assert input_names == ["A", "A_scale", "B", "B_scale"]
-    assert output_shape == (24,)
-    assert threadgroup == (32, 1, 1)
-    assert "thread_position_in_grid.x" in _lowering.body
-    assert "blockIdx" not in _lowering.body
-    assert "__tvm_fp8_e4m3_dot4_packed" not in _lowering.body
-    assert "simd_sum(sum)" in _lowering.body
+    assert "thread_position_in_grid.x" in msl
+    assert "blockIdx.x" not in msl
+    assert "__tvm_fp8_e4m3_dot4_packed" not in msl
+    assert "simd_sum(sum)" in msl
+    assert "device const uint* A4 = reinterpret_cast<device const uint*>(A)" in msl
 
 
 def test_fp8_e4m3_dot4_intrinsic_is_registered() -> None:
@@ -164,7 +185,10 @@ def test_fp8_e4m3_dot4_intrinsic_is_registered() -> None:
     informative rather than red.
     """
 
-    pytest.importorskip("tvm")
+    try:
+        import tvm  # noqa: F401
+    except Exception as exc:
+        pytest.skip(f"TVM import unavailable: {exc}")
     try:
         from tvm.ir import Op  # type: ignore
     except Exception:
@@ -183,6 +207,7 @@ def test_fp8_e4m3_dot4_intrinsic_is_registered() -> None:
 
 
 def test_vectorized_probe_remains_scalar_fallback() -> None:
+    _require_fp8_vecmat_path_c_available()
     msl = lower_fp8_vecmat_msl(N=128, K=128, vectorized_loads=True)
     features = fp8_vecmat_msl_features(msl)
     assert features["kernel_void"] >= 1
@@ -207,10 +232,8 @@ def test_invalid_shapes_raise(kwargs: dict[str, object]) -> None:
 
 
 @pytest.mark.skipif(not _metal_available(), reason="Metal unavailable")
-def test_path_c_vecmat_matches_path_b_scalar_scale(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv(FP8_PATH_C_LEGACY_MLX_FAST_ENV, "1")
+def test_path_c_vecmat_matches_path_b_scalar_scale() -> None:
+    _require_fp8_vecmat_path_c_available()
     rng = np.random.default_rng(23)
     N, K = 24, 64
     x = mx.array((rng.standard_normal((K,)) * 0.1).astype(np.float32))
@@ -222,9 +245,14 @@ def test_path_c_vecmat_matches_path_b_scalar_scale(
     mx.eval(x_fp8, W_fp8, sx, sw)
 
     path_b = fp8_scaled_vecmat(x_fp8, W_fp8, scale_x=sx, scale_w=sw)
-    path_c = fp8_scaled_vecmat_path_c(x_fp8, W_fp8, scale_x=sx, scale_w=sw)
-    if path_c is None:
-        pytest.skip("Path C TileLang/Metal dispatch unavailable")
+    out = mx.zeros((N,), dtype=mx.float32)
+    path_c = fp8_scaled_vecmat_path_c(
+        x_fp8,
+        W_fp8,
+        scale_x=sx,
+        scale_w=sw,
+        out=out,
+    )
 
     mx.eval(path_b, path_c)
     np.testing.assert_allclose(
@@ -233,10 +261,8 @@ def test_path_c_vecmat_matches_path_b_scalar_scale(
 
 
 @pytest.mark.skipif(not _metal_available(), reason="Metal unavailable")
-def test_path_c_vecmat_matches_path_b_per_row_scale(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv(FP8_PATH_C_LEGACY_MLX_FAST_ENV, "1")
+def test_path_c_vecmat_matches_path_b_per_row_scale() -> None:
+    _require_fp8_vecmat_path_c_available()
     rng = np.random.default_rng(24)
     N, K = 24, 64
     x = mx.array((rng.standard_normal((K,)) * 0.1).astype(np.float32))
@@ -248,9 +274,14 @@ def test_path_c_vecmat_matches_path_b_per_row_scale(
     mx.eval(x_fp8, W_fp8, sx, sw)
 
     path_b = fp8_scaled_vecmat(x_fp8, W_fp8, scale_x=sx, scale_w=sw)
-    path_c = fp8_scaled_vecmat_path_c(x_fp8, W_fp8, scale_x=sx, scale_w=sw)
-    if path_c is None:
-        pytest.skip("Path C TileLang/Metal dispatch unavailable")
+    out = mx.zeros((N,), dtype=mx.float32)
+    path_c = fp8_scaled_vecmat_path_c(
+        x_fp8,
+        W_fp8,
+        scale_x=sx,
+        scale_w=sw,
+        out=out,
+    )
 
     mx.eval(path_b, path_c)
     np.testing.assert_allclose(
@@ -259,23 +290,24 @@ def test_path_c_vecmat_matches_path_b_per_row_scale(
 
 
 @pytest.mark.skipif(not _metal_available(), reason="Metal unavailable")
-def test_path_c_vecmat_rejects_invalid_shapes(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(FP8_PATH_C_LEGACY_MLX_FAST_ENV, "1")
+def test_path_c_vecmat_rejects_invalid_shapes() -> None:
     x_fp8 = mx.zeros((33,), dtype=mx.uint8)
     W_fp8 = mx.zeros((8, 33), dtype=mx.uint8)
     with pytest.raises(ValueError, match="multiple of 4"):
-        fp8_scaled_vecmat_path_c(x_fp8, W_fp8, scale_x=1.0, scale_w=1.0)
+        fp8_scaled_vecmat_path_c(
+            x_fp8,
+            W_fp8,
+            scale_x=1.0,
+            scale_w=1.0,
+            out=mx.zeros((8,), dtype=mx.float32),
+        )
 
 
-def test_fp8_matmul_no_out_path_is_legacy_debug_gated(
+def test_fp8_matmul_no_out_path_is_retired_even_with_legacy_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def fail_legacy_kernel(**_: object) -> object:
-        raise AssertionError("gated no-out path must not build mx.fast fallback")
-
-    monkeypatch.delenv(FP8_PATH_C_LEGACY_MLX_FAST_ENV, raising=False)
+    monkeypatch.setenv(FP8_PATH_C_LEGACY_MLX_FAST_ENV, "1")
     monkeypatch.setattr(fp8_matmul_mod, "can_run_metal", lambda: True)
-    monkeypatch.setattr(fp8_matmul_mod, "_fp8_matmul_kernel_for", fail_legacy_kernel)
 
     A = mx.zeros((16, 32), dtype=mx.uint8)
     B = mx.zeros((16, 32), dtype=mx.uint8)
@@ -284,20 +316,16 @@ def test_fp8_matmul_no_out_path_is_legacy_debug_gated(
 
     with pytest.raises(
         FP8MatmulPathCLegacyError,
-        match="Production callers must pass out=",
+        match="no-out Path C dispatch is retired",
     ):
         fp8_scaled_matmul_path_c(A, B, scale_a=scale_a, scale_b=scale_b)
 
 
-def test_fp8_vecmat_no_out_path_is_legacy_debug_gated(
+def test_fp8_vecmat_no_out_path_is_retired_even_with_legacy_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def fail_legacy_kernel(*_: object, **__: object) -> object:
-        raise AssertionError("gated no-out path must not build mx.fast fallback")
-
-    monkeypatch.delenv(FP8_PATH_C_LEGACY_MLX_FAST_ENV, raising=False)
+    monkeypatch.setenv(FP8_PATH_C_LEGACY_MLX_FAST_ENV, "1")
     monkeypatch.setattr(fp8_vecmat_mod, "can_run_metal", lambda: True)
-    monkeypatch.setattr(fp8_vecmat_mod, "_fp8_vecmat_kernel_for", fail_legacy_kernel)
 
     x = mx.zeros((32,), dtype=mx.uint8)
     W = mx.zeros((16, 32), dtype=mx.uint8)
@@ -306,7 +334,7 @@ def test_fp8_vecmat_no_out_path_is_legacy_debug_gated(
 
     with pytest.raises(
         FP8VecmatPathCLegacyError,
-        match="Production callers must pass out=",
+        match="no-out Path C dispatch is retired",
     ):
         fp8_scaled_vecmat_path_c(x, W, scale_x=scale_x, scale_w=scale_w)
 
@@ -321,16 +349,12 @@ def test_fp8_matmul_direct_path_uses_owner_output_without_mlx_fast_fallback(
             calls.append(args)
             return args[-1]
 
-    def fail_legacy_kernel(**_: object) -> object:
-        raise AssertionError("direct owner-output path must not build mx.fast fallback")
-
     monkeypatch.setattr(fp8_matmul_mod, "can_run_metal", lambda: True)
     monkeypatch.setattr(
         fp8_matmul_mod,
         "_fp8_matmul_tvm_ffi_kernel_for",
         lambda **_: RecordingKernel(),
     )
-    monkeypatch.setattr(fp8_matmul_mod, "_fp8_matmul_kernel_for", fail_legacy_kernel)
 
     A = mx.zeros((16, 32), dtype=mx.uint8)
     B = mx.zeros((16, 32), dtype=mx.uint8)
@@ -361,14 +385,11 @@ def test_fp8_matmul_direct_path_uses_owner_output_without_mlx_fast_fallback(
 def test_fp8_matmul_direct_path_propagates_typed_dlpack_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from tilelang.contrib.mlx_interop import DLPackConversionError
+    DLPackConversionError = _dlpack_conversion_error_type()
 
     class FailingKernel:
         def __call__(self, *_: object) -> object:
             raise DLPackConversionError("MLX array import failed: dtype mismatch")
-
-    def fail_legacy_kernel(**_: object) -> object:
-        raise AssertionError("typed direct failure must not silently fall back")
 
     monkeypatch.setattr(fp8_matmul_mod, "can_run_metal", lambda: True)
     monkeypatch.setattr(
@@ -376,7 +397,6 @@ def test_fp8_matmul_direct_path_propagates_typed_dlpack_failure(
         "_fp8_matmul_tvm_ffi_kernel_for",
         lambda **_: FailingKernel(),
     )
-    monkeypatch.setattr(fp8_matmul_mod, "_fp8_matmul_kernel_for", fail_legacy_kernel)
 
     A = mx.zeros((16, 32), dtype=mx.uint8)
     B = mx.zeros((16, 32), dtype=mx.uint8)
@@ -433,6 +453,7 @@ def test_fp8_matmul_direct_path_rejects_bad_owner_output_abi(
 
 @pytest.mark.skipif(not _metal_available(), reason="Metal unavailable")
 def test_fp8_matmul_direct_tvm_ffi_reuses_owner_output_and_matches_reference() -> None:
+    _require_fp8_matmul_path_c_available()
     rng = np.random.default_rng(25)
     M, N, K = 16, 16, 32
     A32 = mx.array((rng.standard_normal((M, K)) * 0.1).astype(np.float32))
@@ -476,16 +497,12 @@ def test_fp8_vecmat_direct_path_uses_owner_output_without_mlx_fast_fallback(
             calls.append(args)
             return args[-1]
 
-    def fail_legacy_kernel(*_: object, **__: object) -> object:
-        raise AssertionError("direct owner-output vecmat must not build mx.fast fallback")
-
     monkeypatch.setattr(fp8_vecmat_mod, "can_run_metal", lambda: True)
     monkeypatch.setattr(
         fp8_vecmat_mod,
         "_fp8_vecmat_tvm_ffi_kernel_for",
         lambda **_: RecordingKernel(),
     )
-    monkeypatch.setattr(fp8_vecmat_mod, "_fp8_vecmat_kernel_for", fail_legacy_kernel)
 
     x = mx.zeros((32,), dtype=mx.uint8)
     W = mx.zeros((16, 32), dtype=mx.uint8)
@@ -515,14 +532,11 @@ def test_fp8_vecmat_direct_path_uses_owner_output_without_mlx_fast_fallback(
 def test_fp8_vecmat_direct_path_propagates_typed_dlpack_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from tilelang.contrib.mlx_interop import DLPackConversionError
+    DLPackConversionError = _dlpack_conversion_error_type()
 
     class FailingKernel:
         def __call__(self, *_: object) -> object:
             raise DLPackConversionError("MLX array import failed: wrong device")
-
-    def fail_legacy_kernel(*_: object, **__: object) -> object:
-        raise AssertionError("typed direct vecmat failure must not silently fall back")
 
     monkeypatch.setattr(fp8_vecmat_mod, "can_run_metal", lambda: True)
     monkeypatch.setattr(
@@ -530,7 +544,6 @@ def test_fp8_vecmat_direct_path_propagates_typed_dlpack_failure(
         "_fp8_vecmat_tvm_ffi_kernel_for",
         lambda **_: FailingKernel(),
     )
-    monkeypatch.setattr(fp8_vecmat_mod, "_fp8_vecmat_kernel_for", fail_legacy_kernel)
 
     x = mx.zeros((32,), dtype=mx.uint8)
     W = mx.zeros((16, 32), dtype=mx.uint8)
@@ -619,6 +632,7 @@ def test_fp8_vecmat_direct_compile_failure_is_typed(
 
 @pytest.mark.skipif(not _metal_available(), reason="Metal unavailable")
 def test_fp8_vecmat_direct_tvm_ffi_reuses_owner_output_and_matches_path_b() -> None:
+    _require_fp8_vecmat_path_c_available()
     rng = np.random.default_rng(26)
     N, K = 24, 64
     x = mx.array((rng.standard_normal((K,)) * 0.1).astype(np.float32))

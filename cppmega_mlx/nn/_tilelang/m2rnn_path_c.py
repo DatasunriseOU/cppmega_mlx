@@ -90,6 +90,8 @@ _BWD_OUTPUT_NAMES = (
 )
 _BWD_OUTPUT_IDX = (8, 9, 10, 11, 12, 13, 14)
 _PACKED_FWD_OUTPUT_IDX = (4, 5, 6)
+_PACKED_POST_FWD_OUTPUT_NAMES = ("h_last", "tanh_cache", "post")
+_PACKED_POST_FWD_OUTPUT_IDX = (6, 7, 8)
 _PACKED_BWD_OUTPUT_NAMES = (
     "dconv_input",
     "dW_partial",
@@ -102,6 +104,7 @@ _POST_FWD_OUTPUT_NAMES = ("post",)
 _POST_FWD_OUTPUT_IDX = (4,)
 _POST_BWD_OUTPUT_NAMES = ("dy_recurrent", "dconv_input", "dD", "dprojected")
 _POST_BWD_OUTPUT_IDX = (5, 6, 7, 8)
+_POST_RECOMPUTE_BWD_OUTPUT_IDX = (7, 8, 9, 10)
 _PACKED_FWD_K_PARALLEL_MIN_K = 4
 _PACKED_BWD_K_PARALLEL_MIN_K = 4
 
@@ -116,6 +119,7 @@ M2RNNBwdOwnerOutputs = tuple[
     mx.array,
 ]
 M2RNNPackedBwdOwnerOutputs = tuple[mx.array, mx.array, mx.array, mx.array, mx.array]
+M2RNNPackedPostFwdOutputs = tuple[mx.array, mx.array, mx.array]
 M2RNNPostBwdOwnerOutputs = tuple[mx.array, mx.array, mx.array, mx.array]
 
 
@@ -1433,6 +1437,164 @@ def _mapped_packed_fwd_kernel_for(
 
 
 @lru_cache(maxsize=128)
+def _mapped_packed_post_fwd_kernel_for(
+    batch: int,
+    seq: int,
+    total_heads: int,
+    q_heads: int,
+    k_heads: int,
+    v_heads: int,
+    g_heads: int,
+    w_heads: int,
+    f_heads: int,
+    k_dim: int,
+    v_dim: int,
+    projected_dim: int,
+    carrier_dtype: str,
+    *,
+    return_msl: bool = False,
+) -> tuple[Any, _msl_transform.TileLangMSLLowering]:
+    import tilelang.language as T
+
+    del return_msl
+    conv_dim = _mapped_conv_dim(q_heads, k_heads, v_heads, k_dim, v_dim)
+    k_offset = q_heads * k_dim
+    v_offset = k_offset + k_heads * k_dim
+    q_group = total_heads // q_heads
+    k_group = total_heads // k_heads
+    v_group = total_heads // v_heads
+    g_repeat = total_heads // g_heads
+    w_group = total_heads // w_heads
+    f_group = total_heads // f_heads
+    g_dim = g_heads * v_dim
+    g_offset = projected_dim - g_dim
+    features = total_heads * v_dim
+    lanes = batch * features
+    threads = _threads_for(lanes)
+    accum_dtype = "float32"
+
+    @T.prim_func
+    def fwd(
+        conv_input: T.Tensor((batch, seq, conv_dim), carrier_dtype),
+        W: T.Tensor((w_heads, v_dim, v_dim), carrier_dtype),
+        xf: T.Tensor((batch, seq, f_heads), carrier_dtype),
+        h0: T.Tensor((batch, total_heads, k_dim, v_dim), carrier_dtype),
+        D: T.Tensor((total_heads, v_dim), carrier_dtype),
+        projected: T.Tensor((batch, seq, projected_dim), carrier_dtype),
+        h_last: T.Tensor((batch, total_heads, k_dim, v_dim), carrier_dtype),
+        tanh_cache: T.Tensor((batch, seq, total_heads, k_dim, v_dim), carrier_dtype),
+        post: T.Tensor((batch, seq, features), carrier_dtype),
+    ):
+        with T.Kernel(T.ceildiv(lanes, threads), threads=threads) as bx:
+            tid = T.get_thread_binding(0)
+            lane = bx * threads + tid
+            h_state = T.alloc_local((k_dim, v_dim), accum_dtype)
+            h_next = T.alloc_local((k_dim, v_dim), accum_dtype)
+            if lane < lanes:
+                feature = lane % features
+                vv_out = feature % v_dim
+                h = feature // v_dim
+                b = lane // features
+                q_src = h // q_group
+                k_src = h // k_group
+                v_src = h // v_group
+                w_src = h // w_group
+                f_src = h // f_group
+                g_flat = feature // g_repeat
+                q_head_offset = q_src * k_dim
+                k_head_offset = k_offset + k_src * k_dim
+                v_head_offset = v_offset + v_src * v_dim
+                v_index = v_head_offset + vv_out
+                g_index = g_offset + g_flat
+                d_val = T.cast(D[h, vv_out], accum_dtype)
+
+                for kk in T.serial(k_dim):
+                    for vv in T.serial(v_dim):
+                        h_state[kk, vv] = T.cast(h0[b, h, kk, vv], accum_dtype)
+
+                for t in T.serial(seq):
+                    f_val = T.cast(xf[b, t, f_src], accum_dtype)
+                    one_minus_f = 1.0 - f_val
+                    y_acc = T.alloc_local((1,), accum_dtype)
+                    y_acc[0] = 0.0
+
+                    for kk in T.serial(k_dim):
+                        k_val = T.cast(
+                            conv_input[b, t, k_head_offset + kk],
+                            accum_dtype,
+                        )
+                        q_val = T.cast(
+                            conv_input[b, t, q_head_offset + kk],
+                            accum_dtype,
+                        )
+                        for vv in T.serial(v_dim):
+                            acc = T.alloc_local((1,), accum_dtype)
+                            acc[0] = 0.0
+                            for v0 in T.serial(v_dim):
+                                acc[0] = acc[0] + h_state[kk, v0] * T.cast(
+                                    W[w_src, v0, vv],
+                                    accum_dtype,
+                                )
+                            z = acc[0] + k_val * T.cast(
+                                conv_input[b, t, v_head_offset + vv],
+                                accum_dtype,
+                            )
+                            tz = T.tanh(z)
+                            if vv_out == 0:
+                                tanh_cache[b, t, h, kk, vv] = T.cast(
+                                    tz,
+                                    carrier_dtype,
+                                )
+                            h_next[kk, vv] = f_val * h_state[kk, vv] + one_minus_f * tz
+                        y_acc[0] = y_acc[0] + q_val * h_next[kk, vv_out]
+
+                    g_val = T.cast(projected[b, t, g_index], accum_dtype)
+                    sig_g = T.alloc_var(T.float32, init=0.0)
+                    if g_val >= 0.0:
+                        sig_g = 1.0 / (1.0 + T.exp(-g_val))
+                    else:
+                        sig_g = T.exp(g_val)
+                        sig_g = sig_g / (1.0 + sig_g)
+                    v_val = T.cast(conv_input[b, t, v_index], accum_dtype)
+                    post[b, t, feature] = T.cast(
+                        (y_acc[0] + v_val * d_val) * g_val * sig_g,
+                        carrier_dtype,
+                    )
+
+                    for kk in T.serial(k_dim):
+                        for vv in T.serial(v_dim):
+                            h_state[kk, vv] = h_next[kk, vv]
+                if vv_out == 0:
+                    for kk in T.serial(k_dim):
+                        for vv in T.serial(v_dim):
+                            h_last[b, h, kk, vv] = T.cast(
+                                h_state[kk, vv],
+                                carrier_dtype,
+                            )
+
+    lowering = dispatch_lower(fwd, target="metal", return_msl=True)
+    input_names = [
+        name
+        for name in lowering.buffer_param_names
+        if name not in _PACKED_POST_FWD_OUTPUT_NAMES
+    ]
+    if set(input_names) != {"conv_input", "W", "xf", "h0", "D", "projected"}:
+        raise MSLDispatchUnsupported(
+            "unexpected mapped packed M2RNN inline post Path C buffer signature: "
+            + ", ".join(lowering.buffer_param_names)
+        )
+    import tilelang
+
+    kernel = tilelang.compile(
+        fwd,
+        target=_msl_transform._as_metal_target("metal"),
+        execution_backend="tvm_ffi",
+        out_idx=list(_PACKED_POST_FWD_OUTPUT_IDX),
+    )
+    return kernel, lowering
+
+
+@lru_cache(maxsize=128)
 def _mapped_packed_bwd_kernel_for(
     batch: int,
     seq: int,
@@ -1445,6 +1607,7 @@ def _mapped_packed_bwd_kernel_for(
     k_dim: int,
     v_dim: int,
     carrier_dtype: str,
+    dy_dtype: str,
     grad_dtype: str,
     *,
     return_msl: bool = False,
@@ -1466,7 +1629,7 @@ def _mapped_packed_bwd_kernel_for(
 
     @T.prim_func
     def bwd(
-        dy: T.Tensor((batch, seq, total_heads, v_dim), carrier_dtype),
+        dy: T.Tensor((batch, seq, total_heads, v_dim), dy_dtype),
         conv_input: T.Tensor((batch, seq, conv_dim), carrier_dtype),
         W: T.Tensor((w_heads, v_dim, v_dim), carrier_dtype),
         xf: T.Tensor((batch, seq, f_heads), carrier_dtype),
@@ -1855,6 +2018,150 @@ def _post_residual_gate_bwd_kernel_for(
     return kernel, lowering
 
 
+@lru_cache(maxsize=128)
+def _post_residual_gate_bwd_from_recurrence_kernel_for(
+    batch: int,
+    seq: int,
+    total_heads: int,
+    q_heads: int,
+    k_heads: int,
+    v_heads: int,
+    g_heads: int,
+    f_heads: int,
+    k_dim: int,
+    v_dim: int,
+    conv_dim: int,
+    projected_dim: int,
+    carrier_dtype: str,
+    grad_dtype: str,
+    *,
+    return_msl: bool = False,
+) -> tuple[Any, _msl_transform.TileLangMSLLowering]:
+    import tilelang.language as T
+
+    del return_msl
+    v_offset = q_heads * k_dim + k_heads * k_dim
+    q_group = total_heads // q_heads
+    v_group = total_heads // v_heads
+    g_repeat = total_heads // g_heads
+    f_group = total_heads // f_heads
+    g_dim = g_heads * v_dim
+    g_offset = projected_dim - g_dim
+    features = total_heads * v_dim
+    lanes = batch * features
+    threads = _threads_for(lanes)
+    accum_dtype = "float32"
+
+    @T.prim_func
+    def bwd(
+        dpost: T.Tensor((batch, seq, features), carrier_dtype),
+        conv_input: T.Tensor((batch, seq, conv_dim), carrier_dtype),
+        xf: T.Tensor((batch, seq, f_heads), carrier_dtype),
+        h0: T.Tensor((batch, total_heads, k_dim, v_dim), carrier_dtype),
+        tanh_cache: T.Tensor((batch, seq, total_heads, k_dim, v_dim), carrier_dtype),
+        D: T.Tensor((total_heads, v_dim), carrier_dtype),
+        projected: T.Tensor((batch, seq, projected_dim), carrier_dtype),
+        dy_recurrent: T.Tensor((batch, seq, total_heads, v_dim), grad_dtype),
+        dconv_input: T.Tensor((batch, seq, conv_dim), grad_dtype),
+        dD: T.Tensor((total_heads, v_dim), grad_dtype),
+        dprojected: T.Tensor((batch, seq, projected_dim), grad_dtype),
+    ):
+        with T.Kernel(T.ceildiv(lanes, threads), threads=threads) as bx:
+            tid = T.get_thread_binding(0)
+            lane = bx * threads + tid
+            h_col = T.alloc_local((k_dim,), accum_dtype)
+            if lane < lanes:
+                feature = lane % features
+                vv = feature % v_dim
+                h = feature // v_dim
+                b = lane // features
+                q_src = h // q_group
+                v_src = h // v_group
+                f_src = h // f_group
+                q_head_offset = q_src * k_dim
+                v_index = v_offset + v_src * v_dim + vv
+                g_flat = feature // g_repeat
+                g_index = g_offset + g_flat
+                d_val = T.cast(D[h, vv], accum_dtype)
+
+                for kk in T.serial(k_dim):
+                    h_col[kk] = T.cast(h0[b, h, kk, vv], accum_dtype)
+
+                for t in T.serial(seq):
+                    f_val = T.cast(xf[b, t, f_src], accum_dtype)
+                    one_minus_f = 1.0 - f_val
+                    y_acc = T.alloc_local((1,), accum_dtype)
+                    y_acc[0] = 0.0
+                    for kk in T.serial(k_dim):
+                        q_val = T.cast(
+                            conv_input[b, t, q_head_offset + kk],
+                            accum_dtype,
+                        )
+                        tz = T.cast(tanh_cache[b, t, h, kk, vv], accum_dtype)
+                        h_col[kk] = f_val * h_col[kk] + one_minus_f * tz
+                        y_acc[0] = y_acc[0] + q_val * h_col[kk]
+
+                    dpost_val = T.cast(dpost[b, t, feature], accum_dtype)
+                    g_val = T.cast(projected[b, t, g_index], accum_dtype)
+                    sig_g = T.alloc_var(T.float32, init=0.0)
+                    if g_val >= 0.0:
+                        sig_g = 1.0 / (1.0 + T.exp(-g_val))
+                    else:
+                        sig_g = T.exp(g_val)
+                        sig_g = sig_g / (1.0 + sig_g)
+                    silu_g = g_val * sig_g
+                    silu_dg = sig_g * (1.0 + g_val * (1.0 - sig_g))
+                    v_val = T.cast(conv_input[b, t, v_index], accum_dtype)
+                    skipped = y_acc[0] + v_val * d_val
+                    dskipped = dpost_val * silu_g
+
+                    dy_recurrent[b, t, h, vv] = T.cast(dskipped, grad_dtype)
+                    T.atomic_add(
+                        dconv_input[b, t, v_index],
+                        dskipped * d_val,
+                        memory_order="relaxed",
+                    )
+                    T.atomic_add(
+                        dD[h, vv],
+                        dskipped * v_val,
+                        memory_order="relaxed",
+                    )
+                    T.atomic_add(
+                        dprojected[b, t, g_index],
+                        dpost_val * skipped * silu_dg,
+                        memory_order="relaxed",
+                    )
+
+    lowering = dispatch_lower(bwd, target="metal", return_msl=True)
+    input_names = [
+        name
+        for name in lowering.buffer_param_names
+        if name not in _POST_BWD_OUTPUT_NAMES
+    ]
+    if set(input_names) != {
+        "dpost",
+        "conv_input",
+        "xf",
+        "h0",
+        "tanh_cache",
+        "D",
+        "projected",
+    }:
+        raise MSLDispatchUnsupported(
+            "unexpected M2RNN inline post bwd buffer signature: "
+            + ", ".join(lowering.buffer_param_names)
+        )
+    import tilelang
+
+    kernel = tilelang.compile(
+        bwd,
+        target=_msl_transform._as_metal_target("metal"),
+        execution_backend="tvm_ffi",
+        out_idx=list(_POST_RECOMPUTE_BWD_OUTPUT_IDX),
+    )
+    return kernel, lowering
+
+
 def m2rnn_path_c_status() -> M2RNNPathCStatus:
     if not _msl_transform.can_run_metal():
         return M2RNNPathCStatus(False, "MLX Metal backend is not available")
@@ -1897,7 +2204,12 @@ def m2rnn_path_c_status() -> M2RNNPathCStatus:
         (
             "mapped packed M2RNN Path C bwd",
             _mapped_packed_bwd_kernel_for,
-            (1, 4, 4, 1, 1, 2, 1, 2, 4, 4, "float32", "float32"),
+            (1, 4, 4, 1, 1, 2, 1, 2, 4, 4, "float32", "float32", "float32"),
+        ),
+        (
+            "mapped packed M2RNN Path C inline post fwd",
+            _mapped_packed_post_fwd_kernel_for,
+            (1, 4, 4, 1, 1, 2, 2, 1, 2, 4, 4, 22, "float32"),
         ),
         (
             "M2RNN post residual/gate Path C fwd",
@@ -1908,6 +2220,11 @@ def m2rnn_path_c_status() -> M2RNNPathCStatus:
             "M2RNN post residual/gate Path C bwd",
             _post_residual_gate_bwd_kernel_for,
             (1, 4, 4, 1, 1, 2, 2, 4, 4, 12, 22, "float32", "float32"),
+        ),
+        (
+            "M2RNN inline post residual/gate Path C bwd",
+            _post_residual_gate_bwd_from_recurrence_kernel_for,
+            (1, 4, 4, 1, 1, 2, 2, 2, 4, 4, 12, 22, "float32", "float32"),
         ),
     )
     for label, kernel_factory, args in probes:
@@ -2069,8 +2386,224 @@ def m2rnn_mapped_packed_path_c_status(
     if not fwd_status.available:
         return fwd_status
     if require_backward:
-        bwd_status = _kernel_lowering_status(
-            f"mapped packed M2RNN Path C {carrier_dtype} K={k_dim} bwd",
+        dy_dtypes = [carrier_dtype]
+        if carrier_dtype != "float32":
+            dy_dtypes.append("float32")
+        for dy_dtype in dy_dtypes:
+            bwd_status = _kernel_lowering_status(
+                f"mapped packed M2RNN Path C {carrier_dtype} K={k_dim} bwd dy={dy_dtype}",
+                _mapped_packed_bwd_kernel_for,
+                batch,
+                seq,
+                total_heads,
+                q_heads,
+                k_heads,
+                v_heads,
+                w_heads,
+                f_heads,
+                k_dim,
+                v_dim,
+                carrier_dtype,
+                dy_dtype,
+                "float32",
+            )
+            if not bwd_status.available:
+                return bwd_status
+    return M2RNNPathCStatus(
+        True,
+        f"mapped packed M2RNN Path C {carrier_dtype} K={k_dim} is dispatchable",
+    )
+
+
+def _mapped_packed_post_shape(
+    conv_input: mx.array,
+    W: mx.array,
+    xf: mx.array,
+    h0: mx.array | None,
+    D: mx.array,
+    projected: mx.array,
+    *,
+    q_heads: int,
+    k_heads: int,
+    v_heads: int,
+    g_heads: int,
+) -> tuple[int, int, int, int, int, int, int, int, int]:
+    if h0 is None:
+        raise ValueError("h0 is required")
+    if not _mapped_packed_path_c_inputs_well_formed(
+        conv_input,
+        W,
+        xf,
+        h0,
+        q_heads=q_heads,
+        k_heads=k_heads,
+        v_heads=v_heads,
+    ):
+        raise ValueError(
+            "conv_input/W/xf/h0 do not match mapped packed M2RNN Path C layout"
+        )
+    if D.ndim != 2:
+        raise ValueError(f"D must be rank 2, got shape {D.shape}")
+    if projected.ndim != 3:
+        raise ValueError(f"projected must be rank 3, got shape {projected.shape}")
+    if not _require_positive_heads(g_heads):
+        raise ValueError(f"g_heads must be positive, got {g_heads}")
+    batch, seq, conv_dim = conv_input.shape
+    total_heads = h0.shape[1]
+    k_dim = h0.shape[2]
+    v_dim = h0.shape[3]
+    w_heads = W.shape[0]
+    f_heads = xf.shape[-1]
+    if D.shape != (total_heads, v_dim):
+        raise ValueError(f"D must have shape {(total_heads, v_dim)}, got {D.shape}")
+    if projected.shape[0] != batch or projected.shape[1] != seq:
+        raise ValueError(
+            "projected must share conv_input batch/sequence dimensions, got "
+            f"{projected.shape[:2]} vs {(batch, seq)}"
+        )
+    if total_heads % g_heads != 0:
+        raise ValueError(f"g_heads={g_heads} must divide total_heads={total_heads}")
+    projected_dim = projected.shape[-1]
+    if projected_dim < g_heads * v_dim:
+        raise ValueError(
+            f"projected width {projected_dim} is too small for g_heads*V={g_heads * v_dim}"
+        )
+    return batch, seq, total_heads, k_dim, v_dim, conv_dim, projected_dim, w_heads, f_heads
+
+
+def _mapped_packed_post_inputs_well_formed(
+    conv_input: mx.array,
+    W: mx.array,
+    xf: mx.array,
+    h0: mx.array | None,
+    D: mx.array,
+    projected: mx.array,
+    *,
+    q_heads: int,
+    k_heads: int,
+    v_heads: int,
+    g_heads: int,
+) -> bool:
+    if not _msl_transform.can_run_metal() or h0 is None:
+        return False
+    if not _validate_same_dtype(conv_input, W, xf, h0, D, projected):
+        return False
+    if _tl_dtype_for(conv_input.dtype) is None:
+        return False
+    try:
+        _mapped_packed_post_shape(
+            conv_input,
+            W,
+            xf,
+            h0,
+            D,
+            projected,
+            q_heads=q_heads,
+            k_heads=k_heads,
+            v_heads=v_heads,
+            g_heads=g_heads,
+        )
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def m2rnn_mapped_packed_post_path_c_status(
+    conv_input: mx.array,
+    W: mx.array,
+    xf: mx.array,
+    h0: mx.array | None,
+    D: mx.array,
+    projected: mx.array,
+    *,
+    q_heads: int,
+    k_heads: int,
+    v_heads: int,
+    g_heads: int,
+    require_backward: bool = True,
+) -> M2RNNPathCStatus:
+    if not _msl_transform.can_run_metal():
+        return M2RNNPathCStatus(False, "MLX Metal backend is not available")
+    if h0 is None:
+        return M2RNNPathCStatus(False, "mapped packed M2RNN inline post Path C requires h0")
+    if not _validate_same_dtype(conv_input, W, xf, h0, D, projected):
+        return M2RNNPathCStatus(
+            False,
+            "mapped packed M2RNN inline post Path C inputs must share dtype",
+        )
+    carrier_dtype = _tl_dtype_for(conv_input.dtype)
+    if carrier_dtype is None:
+        return M2RNNPathCStatus(
+            False,
+            f"mapped packed M2RNN inline post Path C unsupported dtype {conv_input.dtype}",
+        )
+    try:
+        batch, seq, total_heads, k_dim, v_dim, conv_dim, projected_dim, w_heads, f_heads = (
+            _mapped_packed_post_shape(
+                conv_input,
+                W,
+                xf,
+                h0,
+                D,
+                projected,
+                q_heads=q_heads,
+                k_heads=k_heads,
+                v_heads=v_heads,
+                g_heads=g_heads,
+            )
+        )
+    except (TypeError, ValueError) as exc:
+        return M2RNNPathCStatus(
+            False,
+            f"mapped packed M2RNN inline post Path C shape mismatch: {exc}",
+        )
+    if seq == 0:
+        return M2RNNPathCStatus(
+            True,
+            "mapped packed M2RNN inline post Path C seq=0 is handled without launching a kernel",
+        )
+    fwd_status = _kernel_lowering_status(
+        f"mapped packed M2RNN inline post Path C {carrier_dtype} K={k_dim} fwd",
+        _mapped_packed_post_fwd_kernel_for,
+        batch,
+        seq,
+        total_heads,
+        q_heads,
+        k_heads,
+        v_heads,
+        g_heads,
+        w_heads,
+        f_heads,
+        k_dim,
+        v_dim,
+        projected_dim,
+        carrier_dtype,
+    )
+    if not fwd_status.available:
+        return fwd_status
+    if require_backward:
+        post_bwd_status = _kernel_lowering_status(
+            f"mapped packed M2RNN inline post Path C {carrier_dtype} bwd",
+            _post_residual_gate_bwd_from_recurrence_kernel_for,
+            batch,
+            seq,
+            total_heads,
+            q_heads,
+            k_heads,
+            v_heads,
+            g_heads,
+            f_heads,
+            k_dim,
+            v_dim,
+            conv_dim,
+            projected_dim,
+            carrier_dtype,
+            "float32",
+        )
+        if not post_bwd_status.available:
+            return post_bwd_status
+        recurrent_bwd_status = _kernel_lowering_status(
+            f"mapped packed M2RNN Path C {carrier_dtype} K={k_dim} bwd dy=float32",
             _mapped_packed_bwd_kernel_for,
             batch,
             seq,
@@ -2084,12 +2617,13 @@ def m2rnn_mapped_packed_path_c_status(
             v_dim,
             carrier_dtype,
             "float32",
+            "float32",
         )
-        if not bwd_status.available:
-            return bwd_status
+        if not recurrent_bwd_status.available:
+            return recurrent_bwd_status
     return M2RNNPathCStatus(
         True,
-        f"mapped packed M2RNN Path C {carrier_dtype} K={k_dim} is dispatchable",
+        f"mapped packed M2RNN inline post Path C {carrier_dtype} K={k_dim} is dispatchable",
     )
 
 
@@ -3036,10 +3570,13 @@ def _m2rnn_mapped_packed_bwd_path_c_kernel(
         require_backward=True,
     ).available:
         return None
-    if not _validate_same_dtype(conv_input, W, xf, h0, dy, tanh_cache):
+    if not _validate_same_dtype(conv_input, W, xf, h0, tanh_cache):
         return None
     carrier_dtype = _tl_dtype_for(conv_input.dtype)
     if carrier_dtype is None:
+        return None
+    dy_dtype = _tl_dtype_for(dy.dtype)
+    if dy_dtype is None:
         return None
     batch, seq, conv_dim = conv_input.shape
     total_heads = h0.shape[1]
@@ -3079,6 +3616,7 @@ def _m2rnn_mapped_packed_bwd_path_c_kernel(
             k_dim,
             v_dim,
             carrier_dtype,
+            dy_dtype,
             "float32",
         )
     except Exception:
@@ -3164,6 +3702,218 @@ def m2rnn_mapped_packed_bwd_path_c(
         v_heads=v_heads,
     )
     raise RuntimeError(f"m2rnn_mapped_packed_bwd_path_c unavailable: {status.reason}")
+
+
+def _m2rnn_mapped_packed_post_fwd_path_c_full(
+    conv_input: mx.array,
+    W: mx.array,
+    xf: mx.array,
+    h0: mx.array | None,
+    D: mx.array,
+    projected: mx.array,
+    *,
+    q_heads: int,
+    k_heads: int,
+    v_heads: int,
+    g_heads: int,
+) -> M2RNNPackedPostFwdOutputs | None:
+    if h0 is None:
+        return None
+    if not _mapped_packed_post_inputs_well_formed(
+        conv_input,
+        W,
+        xf,
+        h0,
+        D,
+        projected,
+        q_heads=q_heads,
+        k_heads=k_heads,
+        v_heads=v_heads,
+        g_heads=g_heads,
+    ):
+        return None
+    carrier_dtype = _tl_dtype_for(conv_input.dtype)
+    if carrier_dtype is None:
+        return None
+    batch, seq, total_heads, k_dim, v_dim, _conv_dim, projected_dim, w_heads, f_heads = (
+        _mapped_packed_post_shape(
+            conv_input,
+            W,
+            xf,
+            h0,
+            D,
+            projected,
+            q_heads=q_heads,
+            k_heads=k_heads,
+            v_heads=v_heads,
+            g_heads=g_heads,
+        )
+    )
+    if seq == 0:
+        return (
+            mx.zeros((batch, 0, total_heads * v_dim), dtype=conv_input.dtype),
+            h0,
+            mx.zeros((batch, 0, total_heads, k_dim, v_dim), dtype=conv_input.dtype),
+        )
+    try:
+        kernel, lowering = _mapped_packed_post_fwd_kernel_for(
+            batch,
+            seq,
+            total_heads,
+            q_heads,
+            k_heads,
+            v_heads,
+            g_heads,
+            w_heads,
+            f_heads,
+            k_dim,
+            v_dim,
+            projected_dim,
+            carrier_dtype,
+        )
+    except Exception:
+        return None
+
+    del lowering
+    h_last, tanh_cache, post = kernel(conv_input, W, xf, h0, D, projected)
+    return post, h_last, tanh_cache
+
+
+def _m2rnn_inline_post_bwd_path_c_kernel(
+    dpost: mx.array,
+    conv_input: mx.array,
+    xf: mx.array,
+    h0: mx.array | None,
+    tanh_cache: mx.array,
+    D: mx.array,
+    projected: mx.array,
+    *,
+    q_heads: int,
+    k_heads: int,
+    v_heads: int,
+    g_heads: int,
+    out: M2RNNPostBwdOwnerOutputs | None = None,
+) -> tuple[mx.array, mx.array, mx.array, mx.array] | None:
+    if h0 is None:
+        return None
+    if not _msl_transform.can_run_metal():
+        return None
+    if not _validate_same_dtype(conv_input, xf, h0, D, projected):
+        return None
+    if _tl_dtype_for(conv_input.dtype) is None:
+        return None
+    if dpost.dtype != conv_input.dtype:
+        return None
+    carrier_dtype = _tl_dtype_for(conv_input.dtype)
+    if carrier_dtype is None:
+        return None
+    try:
+        if conv_input.ndim != 3 or xf.ndim != 3 or h0.ndim != 4:
+            return None
+        if D.ndim != 2 or projected.ndim != 3:
+            return None
+        if not _require_positive_heads(q_heads, k_heads, v_heads, g_heads):
+            return None
+        batch, seq, conv_dim = conv_input.shape
+        total_heads = h0.shape[1]
+        k_dim = h0.shape[2]
+        v_dim = h0.shape[3]
+        f_heads = xf.shape[-1]
+        projected_dim = projected.shape[-1]
+        if h0.shape[0] != batch:
+            return None
+        if xf.shape[0] != batch or xf.shape[1] != seq:
+            return None
+        if projected.shape[0] != batch or projected.shape[1] != seq:
+            return None
+        if D.shape != (total_heads, v_dim):
+            return None
+        if not _require_positive_heads(total_heads, f_heads):
+            return None
+        for heads in (q_heads, k_heads, v_heads, g_heads, f_heads):
+            if total_heads % heads != 0:
+                return None
+        if conv_dim != _mapped_conv_dim(q_heads, k_heads, v_heads, k_dim, v_dim):
+            return None
+        if projected_dim < g_heads * v_dim:
+            return None
+    except (TypeError, ValueError):
+        return None
+    if dpost.shape != (batch, seq, total_heads * v_dim):
+        raise ValueError(
+            f"dpost must be {(batch, seq, total_heads * v_dim)}, got {dpost.shape}"
+        )
+    if tanh_cache.shape != (batch, seq, total_heads, k_dim, v_dim):
+        raise ValueError(
+            "tanh_cache must be "
+            f"{(batch, seq, total_heads, k_dim, v_dim)}, got {tanh_cache.shape}"
+        )
+    if seq == 0:
+        if out is not None:
+            raise RuntimeError(
+                "m2rnn_inline_post_bwd_path_c owner-output route is not dispatchable "
+                "for seq=0 because no TileLang kernel runs to initialize buffers"
+            )
+        return (
+            mx.zeros((batch, seq, total_heads, v_dim), dtype=mx.float32),
+            mx.zeros(conv_input.shape, dtype=mx.float32),
+            mx.zeros(D.shape, dtype=mx.float32),
+            mx.zeros(projected.shape, dtype=mx.float32),
+        )
+    try:
+        kernel, lowering = _post_residual_gate_bwd_from_recurrence_kernel_for(
+            batch,
+            seq,
+            total_heads,
+            q_heads,
+            k_heads,
+            v_heads,
+            g_heads,
+            f_heads,
+            k_dim,
+            v_dim,
+            conv_dim,
+            projected_dim,
+            carrier_dtype,
+            "float32",
+        )
+    except Exception:
+        return None
+
+    del lowering
+    dy_recurrent, dconv_input, dD, dprojected = _m2rnn_post_bwd_owner_outputs(
+        out,
+        batch=batch,
+        seq=seq,
+        total_heads=total_heads,
+        v_dim=v_dim,
+        conv_dim=conv_dim,
+        projected_dim=projected_dim,
+        grad_dtype=mx.float32,
+    )
+    outputs = kernel(
+        dpost,
+        conv_input,
+        xf,
+        h0,
+        tanh_cache,
+        D,
+        projected,
+        out=(dy_recurrent, dconv_input, dD, dprojected),
+    )
+    if not all(
+        got is expected
+        for got, expected in zip(
+            outputs,
+            (dy_recurrent, dconv_input, dD, dprojected),
+            strict=True,
+        )
+    ):
+        raise RuntimeError(
+            "M2RNN inline post residual/gate Path C bwd tvm-ffi did not return "
+            "caller-owned outputs"
+        )
+    return outputs
 
 
 def _m2rnn_post_residual_gate_fwd_path_c(
@@ -3424,6 +4174,38 @@ def _raise_mapped_packed_path_c_unavailable(
     )
 
 
+def _raise_mapped_packed_post_path_c_unavailable(
+    conv_input: mx.array,
+    W: mx.array,
+    xf: mx.array,
+    h0: mx.array | None,
+    D: mx.array,
+    projected: mx.array,
+    *,
+    q_heads: int,
+    k_heads: int,
+    v_heads: int,
+    g_heads: int,
+) -> None:
+    status = m2rnn_mapped_packed_post_path_c_status(
+        conv_input,
+        W,
+        xf,
+        h0,
+        D,
+        projected,
+        q_heads=q_heads,
+        k_heads=k_heads,
+        v_heads=v_heads,
+        g_heads=g_heads,
+        require_backward=False,
+    )
+    raise RuntimeError(
+        "m2rnn_apply_mapped_packed_post_with_state_path_c unavailable: "
+        f"{status.reason}"
+    )
+
+
 def _raise_post_residual_gate_path_c_unavailable(
     y: mx.array,
     conv_input: mx.array,
@@ -3599,6 +4381,160 @@ def m2rnn_apply_mapped_packed_with_state_path_c(
         return m2rnn_apply_packed_with_state_path_c(conv_input, W, xf, h0)
     apply = _mapped_packed_apply_for_layout(int(q_heads), int(k_heads), int(v_heads))
     return apply(conv_input, W, xf, h0)
+
+
+@lru_cache(maxsize=128)
+def _mapped_packed_post_apply_for_layout(
+    q_heads: int,
+    k_heads: int,
+    v_heads: int,
+    g_heads: int,
+) -> Any:
+    @mx.custom_function
+    def _apply(
+        conv_input: mx.array,
+        W: mx.array,
+        xf: mx.array,
+        h0: mx.array,
+        D: mx.array,
+        projected: mx.array,
+    ) -> tuple[mx.array, mx.array]:
+        full = _m2rnn_mapped_packed_post_fwd_path_c_full(
+            conv_input,
+            W,
+            xf,
+            h0,
+            D,
+            projected,
+            q_heads=q_heads,
+            k_heads=k_heads,
+            v_heads=v_heads,
+            g_heads=g_heads,
+        )
+        if full is None:
+            _raise_mapped_packed_post_path_c_unavailable(
+                conv_input,
+                W,
+                xf,
+                h0,
+                D,
+                projected,
+                q_heads=q_heads,
+                k_heads=k_heads,
+                v_heads=v_heads,
+                g_heads=g_heads,
+            )
+        post, h_last, _tanh_cache = full
+        return post, h_last
+
+    apply_any = cast(Any, _apply)
+
+    @apply_any.vjp
+    def _apply_vjp(
+        primals: tuple[mx.array, ...],
+        cotangent: tuple[mx.array, mx.array],
+        output: tuple[mx.array, mx.array],
+    ) -> tuple[mx.array, ...]:
+        del output
+        conv_input, W, xf, h0, D, projected = primals
+        dpost = cotangent[0]
+        full = _m2rnn_mapped_packed_post_fwd_path_c_full(
+            conv_input,
+            W,
+            xf,
+            h0,
+            D,
+            projected,
+            q_heads=q_heads,
+            k_heads=k_heads,
+            v_heads=v_heads,
+            g_heads=g_heads,
+        )
+        if full is None:
+            _raise_mapped_packed_post_path_c_unavailable(
+                conv_input,
+                W,
+                xf,
+                h0,
+                D,
+                projected,
+                q_heads=q_heads,
+                k_heads=k_heads,
+                v_heads=v_heads,
+                g_heads=g_heads,
+            )
+        _post, _h_last, tanh_cache = full
+        post_grads = _m2rnn_inline_post_bwd_path_c_kernel(
+            dpost,
+            conv_input,
+            xf,
+            h0,
+            tanh_cache,
+            D,
+            projected,
+            q_heads=q_heads,
+            k_heads=k_heads,
+            v_heads=v_heads,
+            g_heads=g_heads,
+        )
+        if post_grads is None:
+            _raise_mapped_packed_post_path_c_unavailable(
+                conv_input,
+                W,
+                xf,
+                h0,
+                D,
+                projected,
+                q_heads=q_heads,
+                k_heads=k_heads,
+                v_heads=v_heads,
+                g_heads=g_heads,
+            )
+        dy_recurrent, dconv_post, dD, dprojected = post_grads
+        dconv_recurrent, dW, dxf, dh0 = m2rnn_mapped_packed_bwd_path_c(
+            dy_recurrent,
+            conv_input,
+            W,
+            xf,
+            tanh_cache,
+            h0,
+            q_heads=q_heads,
+            k_heads=k_heads,
+            v_heads=v_heads,
+        )
+        grads = (
+            dconv_recurrent + dconv_post,
+            dW,
+            dxf,
+            dh0,
+            dD,
+            dprojected,
+        )
+        return _match_primal_gradient_dtypes(grads, primals)
+
+    return _apply
+
+
+def m2rnn_apply_mapped_packed_post_with_state_path_c(
+    conv_input: mx.array,
+    W: mx.array,
+    xf: mx.array,
+    h0: mx.array,
+    D: mx.array,
+    projected: mx.array,
+    *,
+    q_heads: int,
+    k_heads: int,
+    v_heads: int,
+    g_heads: int,
+) -> tuple[mx.array, mx.array]:
+    apply = _mapped_packed_post_apply_for_layout(
+        int(q_heads),
+        int(k_heads),
+        int(v_heads),
+        int(g_heads),
+    )
+    return apply(conv_input, W, xf, h0, D, projected)
 
 
 @lru_cache(maxsize=128)
@@ -3822,6 +4758,7 @@ def m2rnn_apply_with_state_path_c_or_fallback(
 
 __all__ = [
     "M2RNNPathCStatus",
+    "m2rnn_apply_mapped_packed_post_with_state_path_c",
     "m2rnn_apply_mapped_packed_with_state_path_c",
     "m2rnn_apply_post_residual_gate_path_c",
     "m2rnn_apply_packed_with_state_path_c",
@@ -3833,6 +4770,7 @@ __all__ = [
     "m2rnn_fwd_with_state_path_c",
     "m2rnn_mapped_packed_bwd_path_c",
     "m2rnn_mapped_packed_path_c_status",
+    "m2rnn_mapped_packed_post_path_c_status",
     "m2rnn_post_residual_gate_bwd_path_c",
     "m2rnn_post_residual_gate_path_c_status",
     "m2rnn_packed_bwd_path_c",

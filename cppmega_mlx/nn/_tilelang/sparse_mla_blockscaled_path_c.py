@@ -138,6 +138,36 @@ class SparseMLABlockScaledPathCDirectError(RuntimeError):
     """Raised when the prepared-buffer tvm-ffi owner-output path cannot run."""
 
 
+def _owner_output_tuple(
+    returned: Any,
+    *,
+    expected: tuple[mx.array, ...],
+    op_name: str,
+) -> tuple[mx.array, ...]:
+    if not isinstance(returned, (list, tuple)) or len(returned) != len(expected):
+        raise SparseMLABlockScaledPathCDirectError(
+            f"{op_name} did not return {len(expected)} owner outputs"
+        )
+    out = tuple(cast(mx.array, item) for item in returned)
+    if any(got is not want for got, want in zip(out, expected, strict=True)):
+        raise SparseMLABlockScaledPathCDirectError(
+            f"{op_name} did not return caller-owned outputs"
+        )
+    return out
+
+
+def _index_dtype_name(indices: mx.array, *, op_name: str) -> str:
+    if indices.dtype == mx.int32:
+        return "int32"
+    mx_int64 = getattr(mx, "int64", None)
+    if mx_int64 is not None and indices.dtype == mx_int64:
+        return "int64"
+    raise TypeError(
+        f"{op_name} requires mx.int32 or mx.int64 indices; got {indices.dtype}. "
+        "Path C will not cast or copy sparse index tensors at the wrapper boundary."
+    )
+
+
 def _tilelang_available() -> tuple[bool, str]:
     try:
         import tilelang  # noqa: F401
@@ -318,6 +348,7 @@ def make_blockscaled_sparse_mla_qk_reduce_kernel(
     outputs_per_block: int = 4,
     reduce_threads: int = 32,
     vec: int = 4,
+    B_SCALE_ROWS: int | None = None,
 ) -> Any:
     """Build the real Sparse-MLA MXFP8/E8M0 QK tile as a TileLang reducer.
 
@@ -341,9 +372,13 @@ def make_blockscaled_sparse_mla_qk_reduce_kernel(
 
     block_k = reduce_threads * vec
     scale_blocks = K // E8M0_BLOCK_SIZE
+    b_scale_rows = N if B_SCALE_ROWS is None else int(B_SCALE_ROWS)
+    if b_scale_rows not in (1, N):
+        raise ValueError(f"B_SCALE_ROWS must be 1 or N={N}; got {b_scale_rows}")
     g = globals()
     g.update(
         _BSFP8_QKR_N=N,
+        _BSFP8_QKR_BS=b_scale_rows,
         _BSFP8_QKR_K=K,
         _BSFP8_QKR_NP=outputs_per_block,
         _BSFP8_QKR_RT=reduce_threads,
@@ -360,7 +395,7 @@ def make_blockscaled_sparse_mla_qk_reduce_kernel(
             A_fp8: T.Tensor((1, _BSFP8_QKR_K), "float8_e4m3"),
             A_scale: T.Tensor((_BSFP8_QKR_SCALE_BLOCKS,), "uint8"),
             B_fp8: T.Tensor((_BSFP8_QKR_N, _BSFP8_QKR_K), "float8_e4m3"),
-            B_scale: T.Tensor((_BSFP8_QKR_N, _BSFP8_QKR_SCALE_BLOCKS), "uint8"),
+            B_scale: T.Tensor((_BSFP8_QKR_BS, _BSFP8_QKR_SCALE_BLOCKS), "uint8"),
             C: T.Tensor((1, _BSFP8_QKR_N), "float32"),
         ):
             with T.Kernel(
@@ -372,6 +407,7 @@ def make_blockscaled_sparse_mla_qk_reduce_kernel(
                 kr = T.get_thread_binding(0)
                 ni = T.get_thread_binding(1)
                 col = bx * _BSFP8_QKR_NP + ni
+                b_scale_row = 0 if _BSFP8_QKR_BS == 1 else col
                 T.clear(accum)
                 for ko in T.serial(T.ceildiv(_BSFP8_QKR_K_WORDS, _BSFP8_QKR_RT)):
                     i = ko * _BSFP8_QKR_RT + kr
@@ -385,25 +421,27 @@ def make_blockscaled_sparse_mla_qk_reduce_kernel(
                                 i,
                             )
                             * e8m0_to_float(A_scale[kb])
-                            * e8m0_to_float(B_scale[col, kb])
+                            * e8m0_to_float(B_scale[b_scale_row, kb])
                         )
-                with T.attr(
-                    T.comm_reducer(lambda x, y: x + y, [T.cast(0, "float32")]),
-                    "reduce_scope",
-                    T.reinterpret(T.uint64(0), dtype="handle"),
-                ):
-                    T.evaluate(
-                        T.tvm_thread_allreduce(
-                            T.uint32(1),
-                            accum[0],
-                            True,
-                            reduced[0],
-                            kr,
-                            dtype="handle",
-                        )
-                    )
-                if kr == 0 and col < _BSFP8_QKR_N:
-                    C[0, col] = reduced[0]
+                for out_lane in T.unroll(_BSFP8_QKR_NP):
+                    if ni == out_lane:
+                        with T.attr(
+                            T.comm_reducer(lambda x, y: x + y, [T.cast(0, "float32")]),
+                            "reduce_scope",
+                            T.reinterpret(T.uint64(0), dtype="handle"),
+                        ):
+                            T.evaluate(
+                                T.tvm_thread_allreduce(
+                                    T.uint32(1),
+                                    accum[0],
+                                    True,
+                                    reduced[0],
+                                    kr,
+                                    dtype="handle",
+                                )
+                            )
+                        if kr == 0 and col < _BSFP8_QKR_N:
+                            C[0, col] = reduced[0]
 
     else:
 
@@ -412,7 +450,7 @@ def make_blockscaled_sparse_mla_qk_reduce_kernel(
             A_fp8: T.Tensor((1, _BSFP8_QKR_K), "float8_e4m3"),
             A_scale: T.Tensor((_BSFP8_QKR_SCALE_BLOCKS,), "uint8"),
             B_fp8: T.Tensor((_BSFP8_QKR_N, _BSFP8_QKR_K), "float8_e4m3"),
-            B_scale: T.Tensor((_BSFP8_QKR_N, _BSFP8_QKR_SCALE_BLOCKS), "uint8"),
+            B_scale: T.Tensor((_BSFP8_QKR_BS, _BSFP8_QKR_SCALE_BLOCKS), "uint8"),
             C: T.Tensor((1, _BSFP8_QKR_N), "float32"),
         ):
             with T.Kernel(
@@ -424,6 +462,7 @@ def make_blockscaled_sparse_mla_qk_reduce_kernel(
                 kr = T.get_thread_binding(0)
                 ni = T.get_thread_binding(1)
                 col = bx * _BSFP8_QKR_NP + ni
+                b_scale_row = 0 if _BSFP8_QKR_BS == 1 else col
                 T.clear(accum)
                 for ko in T.serial(T.ceildiv(_BSFP8_QKR_K, _BSFP8_QKR_BLOCK_K)):
                     for v in T.serial(_BSFP8_QKR_VEC):
@@ -434,25 +473,27 @@ def make_blockscaled_sparse_mla_qk_reduce_kernel(
                                 T.cast(A_fp8[0, k], "float32")
                                 * T.cast(B_fp8[col, k], "float32")
                                 * e8m0_to_float(A_scale[kb])
-                                * e8m0_to_float(B_scale[col, kb])
+                                * e8m0_to_float(B_scale[b_scale_row, kb])
                             )
-                with T.attr(
-                    T.comm_reducer(lambda x, y: x + y, [T.cast(0, "float32")]),
-                    "reduce_scope",
-                    T.reinterpret(T.uint64(0), dtype="handle"),
-                ):
-                    T.evaluate(
-                        T.tvm_thread_allreduce(
-                            T.uint32(1),
-                            accum[0],
-                            True,
-                            reduced[0],
-                            kr,
-                            dtype="handle",
-                        )
-                    )
-                if kr == 0 and col < _BSFP8_QKR_N:
-                    C[0, col] = reduced[0]
+                for out_lane in T.unroll(_BSFP8_QKR_NP):
+                    if ni == out_lane:
+                        with T.attr(
+                            T.comm_reducer(lambda x, y: x + y, [T.cast(0, "float32")]),
+                            "reduce_scope",
+                            T.reinterpret(T.uint64(0), dtype="handle"),
+                        ):
+                            T.evaluate(
+                                T.tvm_thread_allreduce(
+                                    T.uint32(1),
+                                    accum[0],
+                                    True,
+                                    reduced[0],
+                                    kr,
+                                    dtype="handle",
+                                )
+                            )
+                        if kr == 0 and col < _BSFP8_QKR_N:
+                            C[0, col] = reduced[0]
 
     try:
         from tilelang.transform.simplify import apply_simplify
@@ -581,6 +622,7 @@ def lower_blockscaled_sparse_mla_qk_reduce_msl(
     outputs_per_block: int = 4,
     reduce_threads: int = 32,
     vec: int = 4,
+    B_SCALE_ROWS: int | None = None,
     target: str = TILELANG_METAL_E8M0_SPARSE_MLA_TARGET,
 ) -> str:
     """Lower the real-shape Path C E8M0 Sparse-MLA QK reducer.
@@ -595,6 +637,7 @@ def lower_blockscaled_sparse_mla_qk_reduce_msl(
         outputs_per_block=outputs_per_block,
         reduce_threads=reduce_threads,
         vec=vec,
+        B_SCALE_ROWS=B_SCALE_ROWS,
     )
     artifact = dispatch_lower(prim, target)
     if hasattr(artifact, "msl_text"):
@@ -689,14 +732,13 @@ def _qk_reduce_kernel_for(
     outputs_per_block: int,
     reduce_threads: int,
     vec: int,
+    B_SCALE_ROWS: int,
 ) -> tuple[Any, _msl_transform.TileLangMSLLowering, list[str]]:
-    """Build and cache the MLX-dispatchable E8M0 TileLang QK reducer.
+    """Build and cache the E8M0 QK reducer lowering for inspection/status.
 
-    The MLX runtime requires ``buffer_param_names`` / ``body`` / ``header``
-    fields from :class:`TileLangMSLLowering`, so this cache must use the
-    legacy MSL shim regardless of the engine flag. Engine-mode parity is
-    available via :func:`_qk_reduce_kernel_engine_for` and exposed through
-    :func:`lower_blockscaled_sparse_mla_qk_reduce_msl`.
+    Runtime dispatch uses the tvm-ffi kernel from
+    :func:`_qk_reduce_tvm_ffi_kernel_for`; this helper intentionally does not
+    wrap the lowered body with ``mx.fast.metal_kernel``.
     """
 
     prim = make_blockscaled_sparse_mla_qk_reduce_kernel(
@@ -705,6 +747,7 @@ def _qk_reduce_kernel_for(
         outputs_per_block=outputs_per_block,
         reduce_threads=reduce_threads,
         vec=vec,
+        B_SCALE_ROWS=B_SCALE_ROWS,
     )
     lowering = cast(
         _msl_transform.TileLangMSLLowering,
@@ -720,15 +763,36 @@ def _qk_reduce_kernel_for(
             "unexpected TileLang E8M0 QK reducer buffer signature: "
             + ", ".join(lowering.buffer_param_names)
         )
-    kernel = mx.fast.metal_kernel(
-        name=f"cppmega_sparse_mla_blockscaled_qk_reduce_path_c_{N}_{K}_{outputs_per_block}_{reduce_threads}_{vec}",
-        input_names=input_names,
-        output_names=["C"],
-        source=lowering.body,
-        header=lowering.header,
-        ensure_row_contiguous=True,
+    return None, lowering, input_names
+
+
+@lru_cache(maxsize=128)
+def _qk_reduce_tvm_ffi_kernel_for(
+    N: int,
+    K: int,
+    outputs_per_block: int,
+    reduce_threads: int,
+    vec: int,
+    B_SCALE_ROWS: int,
+) -> Any:
+    """Compile the E8M0 QK reducer for tvm-ffi/native dispatch."""
+
+    import tilelang
+
+    prim = make_blockscaled_sparse_mla_qk_reduce_kernel(
+        N=N,
+        K=K,
+        outputs_per_block=outputs_per_block,
+        reduce_threads=reduce_threads,
+        vec=vec,
+        B_SCALE_ROWS=B_SCALE_ROWS,
     )
-    return kernel, lowering, input_names
+    return tilelang.compile(
+        prim,
+        target=_msl_transform._as_metal_target(TILELANG_METAL_E8M0_SPARSE_MLA_TARGET),
+        execution_backend="tvm_ffi",
+        out_idx=[4],
+    )
 
 
 @lru_cache(maxsize=128)
@@ -738,6 +802,7 @@ def _qk_reduce_kernel_engine_for(
     outputs_per_block: int,
     reduce_threads: int,
     vec: int,
+    B_SCALE_ROWS: int | None = None,
     target: str = TILELANG_METAL_E8M0_SPARSE_MLA_TARGET,
 ) -> Any:
     """Build the QK reducer through the unified engine dispatcher.
@@ -755,6 +820,7 @@ def _qk_reduce_kernel_engine_for(
         outputs_per_block=outputs_per_block,
         reduce_threads=reduce_threads,
         vec=vec,
+        B_SCALE_ROWS=B_SCALE_ROWS,
     )
     return dispatch_lower(prim, target)
 
@@ -764,7 +830,7 @@ def _normalize_qk_reduce_inputs(
     A_scale: mx.array,
     B_fp8: mx.array,
     B_scale: mx.array,
-) -> tuple[mx.array, mx.array, mx.array, mx.array, int, int]:
+) -> tuple[mx.array, mx.array, mx.array, mx.array, int, int, bool]:
     if A_fp8.ndim != 2 or A_fp8.shape[0] != 1:
         raise ValueError(f"A_fp8 must have shape (1, K); got {tuple(A_fp8.shape)}")
     if B_fp8.ndim != 2:
@@ -798,8 +864,9 @@ def _normalize_qk_reduce_inputs(
 
     A_scale_1d = A_scale.reshape((scale_blocks,))
     B_scale_1d = B_scale.reshape((B_scale.size,))
-    if B_scale_1d.size == scale_blocks:
-        B_scale_2d = mx.broadcast_to(B_scale_1d.reshape((1, scale_blocks)), (n, scale_blocks))
+    b_scale_is_broadcast = B_scale_1d.size == scale_blocks
+    if b_scale_is_broadcast:
+        B_scale_2d = B_scale_1d.reshape((1, scale_blocks))
     else:
         B_scale_2d = B_scale_1d.reshape((n, scale_blocks))
     return (
@@ -809,6 +876,7 @@ def _normalize_qk_reduce_inputs(
         B_scale_2d,
         n,
         k,
+        b_scale_is_broadcast,
     )
 
 
@@ -830,39 +898,38 @@ def blockscaled_sparse_mla_qk_reduce_path_c(
 
     if not can_run_metal():
         return None
-    A_fp8_u8, A_scale_u8, B_fp8_u8, B_scale_u8, n, k = _normalize_qk_reduce_inputs(
+    (
+        A_fp8_u8,
+        A_scale_u8,
+        B_fp8_u8,
+        B_scale_u8,
+        n,
+        k,
+        b_scale_is_broadcast,
+    ) = _normalize_qk_reduce_inputs(
         A_fp8,
         A_scale,
         B_fp8,
         B_scale,
     )
     try:
-        kernel, lowering, input_names = _qk_reduce_kernel_for(
+        b_scale_rows = 1 if b_scale_is_broadcast else n
+        kernel = _qk_reduce_tvm_ffi_kernel_for(
             n,
             k,
             outputs_per_block,
             reduce_threads,
             vec,
+            b_scale_rows,
         )
-    except MSLDispatchUnsupported:
-        return None
+        returned = kernel(A_fp8_u8, A_scale_u8, B_fp8_u8, B_scale_u8)
+        if isinstance(returned, (list, tuple)):
+            if len(returned) != 1:
+                return None
+            return cast(mx.array, returned[0])
+        return cast(mx.array, returned)
     except Exception:
         return None
-
-    input_map = {
-        "A_fp8": A_fp8_u8,
-        "A_scale": A_scale_u8,
-        "B_fp8": B_fp8_u8,
-        "B_scale": B_scale_u8,
-    }
-    outputs = _msl_transform.dispatch(
-        cast(_msl_transform.MetalKernel, kernel),
-        inputs=[input_map[name] for name in input_names],
-        output_shapes=[(1, n)],
-        output_dtypes=[mx.float32],
-        lowering=lowering,
-    )
-    return outputs[0]
 
 
 def _threads_for_topk(topk: int) -> int:
@@ -892,8 +959,7 @@ def _validate_blockscaled_apply_inputs(
         raise TypeError(f"q_fp8/kv_fp8 must be uint8 FP8 storage; got {q_fp8.dtype}, {kv_fp8.dtype}")
     if q_scale.dtype != mx.uint8 or kv_scale.dtype != mx.uint8:
         raise TypeError(f"q_scale/kv_scale must be uint8 E8M0 scales; got {q_scale.dtype}, {kv_scale.dtype}")
-    if indices.dtype != mx.int32:
-        raise TypeError(f"indices must be int32; got {indices.dtype}")
+    _index_dtype_name(indices, op_name="blockscaled Sparse-MLA Path C apply")
 
     batch, seq_len, heads, qk_dim = (int(x) for x in q_fp8.shape)
     kv_batch, seq_len_kv, kv_group, kv_dim = (int(x) for x in kv_fp8.shape)
@@ -952,6 +1018,7 @@ def _make_blockscaled_sparse_mla_apply_kernel(
     d_v: int,
     scale_blocks: int,
     threads: int,
+    index_dtype: str = "int32",
 ) -> Any:
     import tilelang.language as T
     from tilelang.tileop.metal_quant import e8m0_to_float
@@ -981,6 +1048,7 @@ def _make_blockscaled_sparse_mla_apply_kernel(
         _BSFP8_APPLY_IDX_SIZE=batch * seq_len * kv_group * topk,
         _BSFP8_APPLY_OUT_SIZE=lanes * d_v,
         _BSFP8_APPLY_LSE_SIZE=lanes,
+        _BSFP8_APPLY_INDEX_DTYPE=str(index_dtype),
     )
 
     @T.prim_func
@@ -989,7 +1057,7 @@ def _make_blockscaled_sparse_mla_apply_kernel(
         q_scale: T.Tensor((_BSFP8_APPLY_Q_SCALE_SIZE,), "uint8"),
         kv_fp8: T.Tensor((_BSFP8_APPLY_KV_SIZE,), "float8_e4m3"),
         kv_scale: T.Tensor((_BSFP8_APPLY_KV_SCALE_SIZE,), "uint8"),
-        indices: T.Tensor((_BSFP8_APPLY_IDX_SIZE,), "int32"),
+        indices: T.Tensor((_BSFP8_APPLY_IDX_SIZE,), _BSFP8_APPLY_INDEX_DTYPE),
         sm_scale_buf: T.Tensor((1,), "float32"),
         out: T.Tensor((_BSFP8_APPLY_OUT_SIZE,), "float16"),
         lse: T.Tensor((_BSFP8_APPLY_LSE_SIZE,), "float32"),
@@ -1016,7 +1084,7 @@ def _make_blockscaled_sparse_mla_apply_kernel(
             sm_scale = sm_scale_buf[0]
 
             for k_top in T.serial(lane, _BSFP8_APPLY_TOPK, step=_BSFP8_APPLY_THREADS):
-                gather_idx[0] = indices[idx_base + k_top]
+                gather_idx[0] = T.cast(indices[idx_base + k_top], "int32")
                 if gather_idx[0] < 0 or gather_idx[0] >= _BSFP8_APPLY_SKV:
                     scores[k_top] = T.float32(-3.4028234663852886e38)
                 else:
@@ -1076,7 +1144,7 @@ def _make_blockscaled_sparse_mla_apply_kernel(
             for d in T.serial(lane, _BSFP8_APPLY_DV, step=_BSFP8_APPLY_THREADS):
                 acc[0] = 0.0
                 for k_top in T.serial(_BSFP8_APPLY_TOPK):
-                    gather_idx[0] = indices[idx_base + k_top]
+                    gather_idx[0] = T.cast(indices[idx_base + k_top], "int32")
                     if gather_idx[0] >= 0 and gather_idx[0] < _BSFP8_APPLY_SKV:
                         kv_row_base = kv_b_base + (gather_idx[0] * _BSFP8_APPLY_G + gidx) * _BSFP8_APPLY_K
                         kv_scale_base = kv_scale_b_base + (
@@ -1116,7 +1184,15 @@ def _blockscaled_apply_kernel_for(
     d_v: int,
     scale_blocks: int,
     threads: int,
+    index_dtype: str = "int32",
 ) -> tuple[Any, _msl_transform.TileLangMSLLowering, list[str]]:
+    """Build and cache the E8M0 apply lowering for inspection/status.
+
+    Runtime dispatch uses ``_blockscaled_apply_tvm_ffi_kernel_for`` and
+    caller/native owner outputs; this helper does not construct an
+    ``mx.fast.metal_kernel`` wrapper.
+    """
+
     prim = _make_blockscaled_sparse_mla_apply_kernel(
         batch=batch,
         seq_len=seq_len,
@@ -1129,6 +1205,7 @@ def _blockscaled_apply_kernel_for(
         d_v=d_v,
         scale_blocks=scale_blocks,
         threads=threads,
+        index_dtype=index_dtype,
     )
     lowering = cast(
         _msl_transform.TileLangMSLLowering,
@@ -1144,18 +1221,7 @@ def _blockscaled_apply_kernel_for(
             "unexpected TileLang E8M0 apply buffer signature: "
             + ", ".join(lowering.buffer_param_names)
         )
-    kernel = mx.fast.metal_kernel(
-        name=(
-            "cppmega_sparse_mla_blockscaled_apply_path_c_"
-            f"{batch}_{seq_len}_{heads}_{seq_len_kv}_{kv_group}_{topk}_{K}_{d_v}_{threads}"
-        ),
-        input_names=input_names,
-        output_names=["out", "lse"],
-        source=lowering.body,
-        header=lowering.header,
-        ensure_row_contiguous=True,
-    )
-    return kernel, lowering, input_names
+    return None, lowering, input_names
 
 
 @lru_cache(maxsize=128)
@@ -1171,6 +1237,7 @@ def _blockscaled_apply_tvm_ffi_kernel_for(
     d_v: int,
     scale_blocks: int,
     threads: int,
+    index_dtype: str,
 ) -> Any:
     """Compile the E8M0 prepared forward kernel for caller-owned outputs."""
 
@@ -1188,6 +1255,7 @@ def _blockscaled_apply_tvm_ffi_kernel_for(
         d_v=d_v,
         scale_blocks=scale_blocks,
         threads=threads,
+        index_dtype=index_dtype,
     )
     return tilelang.compile(
         prim,
@@ -1272,6 +1340,10 @@ def sparse_mla_blockscaled_path_c_apply_direct(
         d_v=d_v_resolved,
     )
     try:
+        index_dtype = _index_dtype_name(
+            indices,
+            op_name="blockscaled Sparse-MLA Path C apply",
+        )
         kernel = _blockscaled_apply_tvm_ffi_kernel_for(
             batch,
             seq_len,
@@ -1284,6 +1356,7 @@ def sparse_mla_blockscaled_path_c_apply_direct(
             d_v_resolved,
             scale_blocks,
             threads,
+            index_dtype,
         )
     except Exception as exc:
         raise SparseMLABlockScaledPathCDirectError(
@@ -1313,14 +1386,11 @@ def sparse_mla_blockscaled_path_c_apply_direct(
             "direct tvm-ffi E8M0 Sparse-MLA forward dispatch failed: "
             f"{type(exc).__name__}: {exc}"
         ) from exc
-    if not isinstance(returned, tuple) or len(returned) != 2:
-        raise SparseMLABlockScaledPathCDirectError(
-            "direct tvm-ffi E8M0 Sparse-MLA forward did not return both owner outputs"
-        )
-    if returned[0] is not out_buf or returned[1] is not lse_buf:
-        raise SparseMLABlockScaledPathCDirectError(
-            "direct tvm-ffi E8M0 Sparse-MLA forward did not return caller-owned outputs"
-        )
+    _owner_output_tuple(
+        returned,
+        expected=(out_buf, lse_buf),
+        op_name="direct tvm-ffi E8M0 Sparse-MLA forward",
+    )
     return out_buf, lse_buf
 
 
@@ -1386,7 +1456,11 @@ def sparse_mla_blockscaled_path_c_apply(
         d_v=d_v,
     )
     try:
-        kernel, lowering, input_names = _blockscaled_apply_kernel_for(
+        index_dtype = _index_dtype_name(
+            indices,
+            op_name="blockscaled Sparse-MLA Path C apply",
+        )
+        kernel = _blockscaled_apply_tvm_ffi_kernel_for(
             batch,
             seq_len,
             heads,
@@ -1398,32 +1472,33 @@ def sparse_mla_blockscaled_path_c_apply(
             d_v_resolved,
             scale_blocks,
             threads,
+            index_dtype,
+        )
+        sm_scale_buf = mx.array([float(sm_scale)], dtype=mx.float32)
+        returned = kernel(
+            q_fp8,
+            q_scale,
+            kv_fp8,
+            kv_scale,
+            indices,
+            sm_scale_buf,
         )
     except Exception as exc:
         if force_path_c:
-            raise RuntimeError(f"sparse_mla_blockscaled_path_c_apply: Path C lowering failed: {exc}") from exc
+            raise RuntimeError(
+                "sparse_mla_blockscaled_path_c_apply: native TileLang "
+                f"tvm-ffi graph-output dispatch failed: {type(exc).__name__}: {exc}"
+            ) from exc
         return None
-
-    sm_scale_buf = mx.array([float(sm_scale)], dtype=mx.float32)
-    input_map = {
-        "q_fp8": q_fp8,
-        "q_scale": q_scale,
-        "kv_fp8": kv_fp8,
-        "kv_scale": kv_scale,
-        "indices": indices,
-        "sm_scale_buf": sm_scale_buf,
-    }
-    outputs = _msl_transform.dispatch(
-        cast(_msl_transform.MetalKernel, kernel),
-        inputs=[input_map[name] for name in input_names],
-        output_shapes=[
-            (batch, seq_len, heads, d_v_resolved),
-            (batch, seq_len, heads),
-        ],
-        output_dtypes=[mx.float16, mx.float32],
-        lowering=lowering,
-    )
-    out, lse = outputs
+    if not isinstance(returned, (list, tuple)) or len(returned) != 2:
+        if force_path_c:
+            raise RuntimeError(
+                "sparse_mla_blockscaled_path_c_apply: native TileLang "
+                "tvm-ffi graph-output dispatch did not return out/lse"
+            )
+        return None
+    out = cast(mx.array, returned[0])
+    lse = cast(mx.array, returned[1])
     if return_lse:
         return out, lse
     return out
@@ -1465,10 +1540,16 @@ def blockscaled_sparse_mla_qk_reduce_path_c_status(
             reduce_threads=reduce_threads,
             vec=vec,
         )
-
     try:
-        kernel, lowering, _ = _qk_reduce_kernel_for(N, K, outputs_per_block, reduce_threads, vec)
-        del kernel
+        _qk_reduce_tvm_ffi_kernel_for(N, K, outputs_per_block, reduce_threads, vec, N)
+        _kernel, lowering, _ = _qk_reduce_kernel_for(
+            N,
+            K,
+            outputs_per_block,
+            reduce_threads,
+            vec,
+            N,
+        )
         features = blockscaled_sparse_mla_qk_reduce_msl_features(lowering.msl_text)
     except Exception as exc:
         return SparseMLABlockScaledQKReducePathCStatus(

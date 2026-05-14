@@ -28,11 +28,8 @@ import mlx.core as mx
 
 from cppmega_mlx.nn._tilelang import _msl_transform
 from cppmega_mlx.nn._tilelang._engine_dispatch import dispatch_lower
-from cppmega_mlx.nn._tilelang._msl_transform import (
-    MSLDispatchUnsupported,
-    can_run_metal,
-)
-from cppmega_mlx.nn._tilelang.sparse_mla import _promote_to_fp16_carrier, _reduce_dkv_partial
+from cppmega_mlx.nn._tilelang._msl_transform import can_run_metal
+from cppmega_mlx.nn._tilelang.sparse_mla import _reduce_dkv_partial
 from cppmega_mlx.nn.sparse_mla import _resolve_shapes, sparse_mla_attention_reference
 
 
@@ -2246,6 +2243,47 @@ class SparseMLAPathCDirectError(RuntimeError):
     """Raised when the owner-output tvm-ffi forward route cannot run safely."""
 
 
+def _owner_output_tuple(
+    returned: Any,
+    *,
+    expected: tuple[mx.array, ...],
+    op_name: str,
+) -> tuple[mx.array, ...]:
+    if not isinstance(returned, (list, tuple)) or len(returned) != len(expected):
+        raise SparseMLAPathCDirectError(
+            f"{op_name} did not return {len(expected)} owner outputs"
+        )
+    out = tuple(cast(mx.array, item) for item in returned)
+    if any(got is not want for got, want in zip(out, expected, strict=True)):
+        raise SparseMLAPathCDirectError(
+            f"{op_name} did not return caller-owned outputs"
+        )
+    return out
+
+
+def _index_dtype_name(indices: mx.array, *, op_name: str) -> str:
+    if indices.dtype == mx.int32:
+        return "int32"
+    mx_int64 = getattr(mx, "int64", None)
+    if mx_int64 is not None and indices.dtype == mx_int64:
+        return "int64"
+    raise TypeError(
+        f"{op_name} requires mx.int32 or mx.int64 indices; got {indices.dtype}. "
+        "Path C will not cast or copy sparse index tensors at the wrapper boundary."
+    )
+
+
+def _require_supported_indices_no_hidden_cast(indices: mx.array, *, op_name: str) -> mx.array:
+    _index_dtype_name(indices, op_name=op_name)
+    return indices
+
+
+def _flat_1d_view(array: mx.array) -> mx.array:
+    if len(array.shape) == 1 and int(array.shape[0]) == int(array.size):
+        return array
+    return array.reshape((int(array.size),))
+
+
 def _require_int32_indices_no_hidden_cast(indices: mx.array, *, op_name: str) -> mx.array:
     if indices.dtype != mx.int32:
         raise TypeError(
@@ -2280,7 +2318,7 @@ def sparse_mla_path_c_status() -> SparseMLAPathCStatus:
         return SparseMLAPathCStatus(available=False, reason=reason)
     return SparseMLAPathCStatus(
         available=True,
-        reason="Sparse-MLA Path C forward/backward TileLang DSL ready",
+        reason="Sparse-MLA Path C forward/backward TileLang tvm-ffi path ready",
     )
 
 
@@ -2443,6 +2481,7 @@ def _make_sparse_mla_fwd_direct_prim(
     SEQ_LEN_KV: int,
     D_V: int,
     THREADS: int,
+    INDEX_DTYPE: str = "int32",
 ) -> Any:
     """Build the owner-output tvm-ffi forward PrimFunc in Metal buffer order.
 
@@ -2461,7 +2500,7 @@ def _make_sparse_mla_fwd_direct_prim(
 
     @T.prim_func
     def sparse_mla_fwd_direct(
-        indices: T.Tensor((BATCH, SEQ_LEN, KV_GROUP, TOPK), "int32"),
+        indices: T.Tensor((BATCH, SEQ_LEN, KV_GROUP, TOPK), INDEX_DTYPE),
         kv: T.Tensor((BATCH, SEQ_LEN_KV, KV_GROUP, QK_DIM), "float16"),
         lse: T.Tensor((BATCH, SEQ_LEN, HEADS), "float32"),
         out: T.Tensor((BATCH, SEQ_LEN, HEADS, D_V), "float16"),
@@ -2485,7 +2524,7 @@ def _make_sparse_mla_fwd_direct_prim(
             sm_scale = sm_scale_buf[0]
 
             for k in T.serial(lane, TOPK, step=THREADS):
-                gather_idx[0] = indices[b, s, g, k]
+                gather_idx[0] = T.cast(indices[b, s, g, k], "int32")
                 if gather_idx[0] < 0:
                     scores[k] = T.float32(-1.0e38)
                 else:
@@ -2537,7 +2576,7 @@ def _make_sparse_mla_fwd_direct_prim(
             for d in T.serial(lane, D_V, step=THREADS):
                 acc[0] = 0.0
                 for k in T.serial(TOPK):
-                    gather_idx[0] = indices[b, s, g, k]
+                    gather_idx[0] = T.cast(indices[b, s, g, k], "int32")
                     if gather_idx[0] >= 0:
                         acc[0] = acc[0] + scores[k] * T.cast(
                             kv[b, gather_idx[0], g, d], "float32"
@@ -2652,8 +2691,13 @@ def _fwd_kernel_for(
     SEQ_LEN_KV: int,
     D_V: int,
     THREADS: int,
-) -> tuple[Any, _msl_transform.TileLangMSLLowering]:
-    """Build and cache a shape-specialized threadgroup Sparse-MLA fwd kernel."""
+) -> tuple[Any | None, _msl_transform.TileLangMSLLowering]:
+    """Build and cache a shape-specialized Sparse-MLA fwd lowering.
+
+    This is a lowering/dump helper. Production Path C dispatch uses the
+    tvm-ffi owner-output kernel from :func:`_fwd_direct_tvm_ffi_kernel_for`
+    instead of wrapping the lowered body with ``mx.fast.metal_kernel``.
+    """
 
     import tilelang.language as T
 
@@ -2804,18 +2848,7 @@ def _fwd_kernel_for(
         buffer_param_names=lowering.buffer_param_names,
         kernel_name=lowering.kernel_name,
     )
-    kernel = mx.fast.metal_kernel(
-        name=(
-            "cppmega_sparse_mla_path_c_fwd_noguard_"
-            f"{BATCH}_{SEQ_LEN}_{HEADS}_{QK_DIM}_{KV_GROUP}_{TOPK}_{SEQ_LEN_KV}_{D_V}_{THREADS}"
-        ),
-        input_names=["q", "kv", "indices", "sm_scale_buf"],
-        output_names=["out", "lse"],
-        source=lowering.body,
-        header=lowering.header,
-        ensure_row_contiguous=True,
-    )
-    return kernel, lowering
+    return None, lowering
 
 
 def _make_sparse_mla_bwd_prim(
@@ -2994,6 +3027,178 @@ def _make_sparse_mla_bwd_prim(
     return sparse_mla_bwd
 
 
+def _make_sparse_mla_bwd_direct_prim(
+    BATCH: int,
+    SEQ_LEN: int,
+    HEADS: int,
+    QK_DIM: int,
+    KV_GROUP: int,
+    HEAD_KV: int,
+    TOPK: int,
+    SEQ_LEN_KV: int,
+    D_V: int,
+    THREADS: int,
+    INDEX_DTYPE: str = "int32",
+) -> Any:
+    """Build the owner-output tvm-ffi backward PrimFunc in Metal buffer order."""
+
+    import tilelang.language as T
+
+    LANES = BATCH * SEQ_LEN * HEADS
+    Q_SIZE = BATCH * SEQ_LEN * HEADS * QK_DIM
+    KV_SIZE = BATCH * SEQ_LEN_KV * KV_GROUP * QK_DIM
+    DOUT_SIZE = BATCH * SEQ_LEN * HEADS * D_V
+    IDX_SIZE = BATCH * SEQ_LEN * KV_GROUP * TOPK
+    DKV_PARTIAL_SIZE = BATCH * SEQ_LEN * HEADS * TOPK * QK_DIM
+    LOG_THREADS = THREADS.bit_length() - 1
+
+    @T.prim_func
+    def sparse_mla_bwd_direct(
+        d_out: T.Tensor((DOUT_SIZE,), "float16"),
+        dkv_partial: T.Tensor((DKV_PARTIAL_SIZE,), "float16"),
+        dq: T.Tensor((Q_SIZE,), "float16"),
+        indices: T.Tensor((IDX_SIZE,), INDEX_DTYPE),
+        kv: T.Tensor((KV_SIZE,), "float16"),
+        q: T.Tensor((Q_SIZE,), "float16"),
+        sm_scale_buf: T.Tensor((1,), "float32"),
+    ):
+        with T.Kernel(LANES, threads=THREADS) as bx:
+            lane = T.get_thread_binding()
+            scores = T.alloc_shared((TOPK,), "float32", scope="shared")
+            p = T.alloc_shared((TOPK,), "float32", scope="shared")
+            dp = T.alloc_shared((TOPK,), "float32", scope="shared")
+            ds = T.alloc_shared((TOPK,), "float32", scope="shared")
+            reduce_buf = T.alloc_shared((THREADS,), "float32", scope="shared")
+            acc = T.alloc_local((1,), "float32")
+            local = T.alloc_local((1,), "float32")
+            inv_sum = T.alloc_local((1,), "float32")
+            stride = T.alloc_local((1,), "int32")
+            gather_idx = T.alloc_local((1,), "int32")
+
+            h = bx % HEADS
+            b = bx // (HEADS * SEQ_LEN)
+            g = h // HEAD_KV
+            q_row_base = bx * QK_DIM
+            d_out_row = bx * D_V
+            kv_b_base = b * (SEQ_LEN_KV * KV_GROUP * QK_DIM)
+            idx_base = ((bx // HEADS) * KV_GROUP + g) * TOPK
+            dkv_partial_base = bx * TOPK * QK_DIM
+            sm_scale = sm_scale_buf[0]
+
+            for k in T.serial(lane, TOPK, step=THREADS):
+                gather_idx[0] = T.cast(indices[idx_base + k], "int32")
+                if gather_idx[0] < 0:
+                    scores[k] = T.float32(-1.0e38)
+                else:
+                    acc[0] = 0.0
+                    kv_row_base = kv_b_base + (gather_idx[0] * KV_GROUP + g) * QK_DIM
+                    for d in T.serial(QK_DIM):
+                        acc[0] = acc[0] + T.cast(q[q_row_base + d], "float32") * T.cast(
+                            kv[kv_row_base + d], "float32"
+                        )
+                    scores[k] = acc[0] * sm_scale
+            T.sync_threads()
+
+            local[0] = T.float32(-1.0e38)
+            for k in T.serial(lane, TOPK, step=THREADS):
+                if scores[k] > local[0]:
+                    local[0] = scores[k]
+            reduce_buf[lane] = local[0]
+            T.sync_threads()
+            for round_id in T.serial(LOG_THREADS):
+                stride[0] = T.shift_right(THREADS, round_id + 1)
+                if lane < stride[0]:
+                    if reduce_buf[lane + stride[0]] > reduce_buf[lane]:
+                        reduce_buf[lane] = reduce_buf[lane + stride[0]]
+                T.sync_threads()
+            row_max = reduce_buf[0]
+
+            for k in T.serial(lane, TOPK, step=THREADS):
+                gather_idx[0] = T.cast(indices[idx_base + k], "int32")
+                if gather_idx[0] < 0:
+                    p[k] = 0.0
+                else:
+                    p[k] = T.exp(scores[k] - row_max)
+            T.sync_threads()
+
+            local[0] = 0.0
+            for k in T.serial(lane, TOPK, step=THREADS):
+                local[0] = local[0] + p[k]
+            reduce_buf[lane] = local[0]
+            T.sync_threads()
+            for round_id in T.serial(LOG_THREADS):
+                stride[0] = T.shift_right(THREADS, round_id + 1)
+                if lane < stride[0]:
+                    reduce_buf[lane] = reduce_buf[lane] + reduce_buf[lane + stride[0]]
+                T.sync_threads()
+            sumexp = reduce_buf[0]
+            inv_sum[0] = 0.0
+            if sumexp > 0.0:
+                inv_sum[0] = 1.0 / sumexp
+
+            for k in T.serial(lane, TOPK, step=THREADS):
+                p[k] = p[k] * inv_sum[0]
+            T.sync_threads()
+
+            for k in T.serial(lane, TOPK, step=THREADS):
+                gather_idx[0] = T.cast(indices[idx_base + k], "int32")
+                if gather_idx[0] < 0:
+                    dp[k] = 0.0
+                else:
+                    acc[0] = 0.0
+                    kv_row_base = kv_b_base + (gather_idx[0] * KV_GROUP + g) * QK_DIM
+                    for d in T.serial(D_V):
+                        acc[0] = acc[0] + T.cast(
+                            kv[kv_row_base + d], "float32"
+                        ) * T.cast(d_out[d_out_row + d], "float32")
+                    dp[k] = acc[0]
+            T.sync_threads()
+
+            local[0] = 0.0
+            for k in T.serial(lane, TOPK, step=THREADS):
+                local[0] = local[0] + p[k] * dp[k]
+            reduce_buf[lane] = local[0]
+            T.sync_threads()
+            for round_id in T.serial(LOG_THREADS):
+                stride[0] = T.shift_right(THREADS, round_id + 1)
+                if lane < stride[0]:
+                    reduce_buf[lane] = reduce_buf[lane] + reduce_buf[lane + stride[0]]
+                T.sync_threads()
+            rowsum = reduce_buf[0]
+
+            for k in T.serial(lane, TOPK, step=THREADS):
+                ds[k] = p[k] * (dp[k] - rowsum)
+            T.sync_threads()
+
+            for d in T.serial(lane, QK_DIM, step=THREADS):
+                acc[0] = 0.0
+                for k in T.serial(TOPK):
+                    gather_idx[0] = T.cast(indices[idx_base + k], "int32")
+                    if gather_idx[0] >= 0:
+                        kv_row_base = kv_b_base + (gather_idx[0] * KV_GROUP + g) * QK_DIM
+                        acc[0] = acc[0] + ds[k] * T.cast(
+                            kv[kv_row_base + d], "float32"
+                        )
+                dq[q_row_base + d] = acc[0] * sm_scale
+
+            for kd in T.serial(lane, TOPK * QK_DIM, step=THREADS):
+                k = kd // QK_DIM
+                d = kd % QK_DIM
+                gather_idx[0] = T.cast(indices[idx_base + k], "int32")
+                if gather_idx[0] < 0:
+                    dkv_partial[dkv_partial_base + kd] = 0.0
+                else:
+                    acc[0] = sm_scale * ds[k] * T.cast(q[q_row_base + d], "float32")
+                    if d < D_V:
+                        dkv_partial[dkv_partial_base + kd] = p[k] * T.cast(
+                            d_out[d_out_row + d], "float32"
+                        ) + acc[0]
+                    else:
+                        dkv_partial[dkv_partial_base + kd] = acc[0]
+
+    return sparse_mla_bwd_direct
+
+
 @lru_cache(maxsize=128)
 def _bwd_kernel_engine_for(
     BATCH: int,
@@ -3085,8 +3290,13 @@ def _bwd_kernel_for(
     SEQ_LEN_KV: int,
     D_V: int,
     THREADS: int,
-) -> tuple[Any, _msl_transform.TileLangMSLLowering]:
-    """Build and cache a shape-specialized threadgroup Sparse-MLA bwd kernel."""
+) -> tuple[Any | None, _msl_transform.TileLangMSLLowering]:
+    """Build and cache a shape-specialized Sparse-MLA bwd lowering.
+
+    This is retained for MSL inspection and parity metadata. Runtime Path C
+    backward uses the tvm-ffi direct kernel so it does not build an
+    ``mx.fast.metal_kernel`` wrapper.
+    """
 
     import tilelang.language as T
 
@@ -3283,18 +3493,7 @@ def _bwd_kernel_for(
         buffer_param_names=lowering.buffer_param_names,
         kernel_name=lowering.kernel_name,
     )
-    kernel = mx.fast.metal_kernel(
-        name=(
-            "cppmega_sparse_mla_path_c_bwd_noguard_"
-            f"{BATCH}_{SEQ_LEN}_{HEADS}_{QK_DIM}_{KV_GROUP}_{TOPK}_{SEQ_LEN_KV}_{D_V}_{THREADS}"
-        ),
-        input_names=["d_out", "indices", "kv", "q", "sm_scale_buf"],
-        output_names=["dkv_partial", "dq"],
-        source=lowering.body,
-        header=lowering.header,
-        ensure_row_contiguous=True,
-    )
-    return kernel, lowering
+    return None, lowering
 
 
 def _validate_fwd_owner_output_buffers(
@@ -3322,10 +3521,10 @@ def _validate_fwd_owner_output_buffers(
             "Sparse-MLA Path C owner-output currently requires fp16-carrier "
             f"q/kv without hidden casts; got q={q.dtype}, kv={kv.dtype}"
         )
-    if indices.dtype != mx.int32:
-        raise SparseMLAPathCDirectError(
-            f"Sparse-MLA Path C owner-output requires int32 indices; got {indices.dtype}"
-        )
+    try:
+        _index_dtype_name(indices, op_name="Sparse-MLA Path C owner-output")
+    except TypeError as exc:
+        raise SparseMLAPathCDirectError(str(exc)) from exc
     if sm_scale_buf.shape != (1,) or sm_scale_buf.dtype != mx.float32:
         raise SparseMLAPathCDirectError(
             "Sparse-MLA Path C owner-output requires caller-owned "
@@ -3361,6 +3560,7 @@ def _fwd_direct_tvm_ffi_kernel_for(
     SEQ_LEN_KV: int,
     D_V: int,
     THREADS: int,
+    INDEX_DTYPE: str,
 ) -> Any:
     """Build and cache the owner-output tvm-ffi Sparse-MLA fwd kernel."""
 
@@ -3377,12 +3577,114 @@ def _fwd_direct_tvm_ffi_kernel_for(
         SEQ_LEN_KV=SEQ_LEN_KV,
         D_V=D_V,
         THREADS=THREADS,
+        INDEX_DTYPE=INDEX_DTYPE,
     )
     return tilelang.compile(
         prim,
         target=_msl_transform._as_metal_target("metal"),
         execution_backend="tvm_ffi",
         out_idx=[2, 3],
+    )
+
+
+def _validate_bwd_owner_output_buffers(
+    q: mx.array,
+    kv: mx.array,
+    d_out: mx.array,
+    indices: mx.array,
+    sm_scale_buf: mx.array,
+    dkv_partial: mx.array,
+    dq: mx.array,
+    *,
+    d_v: int | None,
+) -> Any:
+    shapes = _resolve_shapes(q, kv, indices, d_v=d_v)
+    if q.dtype != mx.float16 or kv.dtype != mx.float16 or d_out.dtype != mx.float16:
+        raise SparseMLAPathCDirectError(
+            "Sparse-MLA Path C backward owner-output currently requires "
+            "fp16-carrier q/kv/d_out without hidden casts; got "
+            f"q={q.dtype}, kv={kv.dtype}, d_out={d_out.dtype}"
+        )
+    try:
+        _index_dtype_name(indices, op_name="Sparse-MLA Path C backward owner-output")
+    except TypeError as exc:
+        raise SparseMLAPathCDirectError(str(exc)) from exc
+    if sm_scale_buf.shape != (1,) or sm_scale_buf.dtype != mx.float32:
+        raise SparseMLAPathCDirectError(
+            "Sparse-MLA Path C backward owner-output requires sm_scale_buf "
+            f"with shape (1,) and dtype mx.float32; got shape={tuple(sm_scale_buf.shape)} "
+            f"dtype={sm_scale_buf.dtype}"
+        )
+    expected_dkv_partial = (
+        shapes.batch,
+        shapes.seq_len,
+        shapes.heads,
+        shapes.topk,
+        shapes.qk_dim,
+    )
+    expected_dq = (shapes.batch, shapes.seq_len, shapes.heads, shapes.qk_dim)
+    expected_dkv_partial_flat = (
+        shapes.batch * shapes.seq_len * shapes.heads * shapes.topk * shapes.qk_dim,
+    )
+    expected_dq_flat = (
+        shapes.batch * shapes.seq_len * shapes.heads * shapes.qk_dim,
+    )
+    if (
+        dkv_partial.shape not in (expected_dkv_partial, expected_dkv_partial_flat)
+        or dkv_partial.dtype != mx.float16
+    ):
+        raise SparseMLAPathCDirectError(
+            "Sparse-MLA Path C backward owner-output requires dkv_partial with "
+            f"shape={expected_dkv_partial} or flat shape={expected_dkv_partial_flat} "
+            f"and dtype mx.float16; got "
+            f"shape={tuple(dkv_partial.shape)} dtype={dkv_partial.dtype}"
+        )
+    if dq.shape not in (expected_dq, expected_dq_flat) or dq.dtype != mx.float16:
+        raise SparseMLAPathCDirectError(
+            "Sparse-MLA Path C backward owner-output requires dq with "
+            f"shape={expected_dq} or flat shape={expected_dq_flat} "
+            f"and dtype mx.float16; got "
+            f"shape={tuple(dq.shape)} dtype={dq.dtype}"
+        )
+    return shapes
+
+
+@lru_cache(maxsize=128)
+def _bwd_direct_tvm_ffi_kernel_for(
+    BATCH: int,
+    SEQ_LEN: int,
+    HEADS: int,
+    QK_DIM: int,
+    KV_GROUP: int,
+    HEAD_KV: int,
+    TOPK: int,
+    SEQ_LEN_KV: int,
+    D_V: int,
+    THREADS: int,
+    INDEX_DTYPE: str,
+) -> Any:
+    """Build and cache the owner-output tvm-ffi Sparse-MLA bwd kernel."""
+
+    import tilelang
+
+    prim = _make_sparse_mla_bwd_direct_prim(
+        BATCH=BATCH,
+        SEQ_LEN=SEQ_LEN,
+        HEADS=HEADS,
+        QK_DIM=QK_DIM,
+        KV_GROUP=KV_GROUP,
+        HEAD_KV=HEAD_KV,
+        TOPK=TOPK,
+        SEQ_LEN_KV=SEQ_LEN_KV,
+        D_V=D_V,
+        THREADS=THREADS,
+        INDEX_DTYPE=INDEX_DTYPE,
+    )
+    return tilelang.compile(
+        prim,
+        target=_msl_transform._as_metal_target("metal"),
+        execution_backend="tvm_ffi",
+        out_idx=[1, 2],
     )
 
 
@@ -3412,6 +3714,10 @@ def sparse_mla_fwd_path_c_direct(
     )
     threads = _threadgroup_size(shapes.topk)
     try:
+        index_dtype = _index_dtype_name(
+            indices,
+            op_name="Sparse-MLA Path C owner-output",
+        )
         kernel = _fwd_direct_tvm_ffi_kernel_for(
             shapes.batch,
             shapes.seq_len,
@@ -3423,6 +3729,7 @@ def sparse_mla_fwd_path_c_direct(
             shapes.seq_len_kv,
             shapes.d_v,
             threads,
+            index_dtype,
         )
     except Exception as exc:
         raise SparseMLAPathCDirectError(
@@ -3430,27 +3737,14 @@ def sparse_mla_fwd_path_c_direct(
             f"{type(exc).__name__}: {exc}"
         ) from exc
 
-    tensor_list = [indices, kv, lse, out, q, sm_scale_buf]
-    expected_dtypes = ["int32", "float16", "float32", "float16", "float16", "float32"]
     try:
-        from tilelang.contrib.mlx_interop import (
-            DLPackInteropError,
-            maybe_mlx_metal_external_command_buffer,
-            mlx_arrays_to_tvm_tensors,
+        returned = kernel(
+            indices,
+            kv,
+            q,
+            sm_scale_buf,
+            out=(lse, out),
         )
-
-        executable = getattr(kernel.adapter, "executable", None)
-        if executable is None:
-            raise SparseMLAPathCDirectError(
-                "Sparse-MLA Path C owner-output tvm-ffi dispatch failed: "
-                "compiled kernel did not expose a TVM executable"
-            )
-        exec_tensor_list = mlx_arrays_to_tvm_tensors(
-            tensor_list,
-            expected_dtypes=expected_dtypes,
-        )
-        with maybe_mlx_metal_external_command_buffer(tensor_list):
-            executable(*exec_tensor_list)
     except Exception as exc:
         try:
             from tilelang.contrib.mlx_interop import DLPackInteropError
@@ -3463,7 +3757,122 @@ def sparse_mla_fwd_path_c_direct(
             f"{type(exc).__name__}: {exc}"
         ) from exc
     mx.synchronize()
+    returned_lse, returned_out = _owner_output_tuple(
+        returned,
+        expected=(lse, out),
+        op_name="Sparse-MLA Path C owner-output tvm-ffi forward",
+    )
+    if returned_out is not out or returned_lse is not lse:
+        raise SparseMLAPathCDirectError(
+            "Sparse-MLA Path C owner-output tvm-ffi forward returned "
+            "unexpected output objects"
+        )
     return out, lse
+
+
+def _sparse_mla_bwd_path_c_partial_direct(
+    q: mx.array,
+    kv: mx.array,
+    d_out: mx.array,
+    indices: mx.array,
+    *,
+    sm_scale_buf: mx.array,
+    d_v: int | None = None,
+) -> tuple[mx.array, mx.array, mx.array, Any]:
+    """Run the fp16-carrier backward partial kernel through tvm-ffi."""
+
+    status = sparse_mla_path_c_status()
+    if not status.available:
+        raise SparseMLAPathCDirectError(status.reason)
+    shapes = _resolve_shapes(q, kv, indices, d_v=d_v)
+    if q.dtype != mx.float16 or kv.dtype != mx.float16 or d_out.dtype != mx.float16:
+        raise SparseMLAPathCDirectError(
+            "Sparse-MLA Path C backward native tvm-ffi currently requires "
+            "fp16-carrier q/kv/d_out without hidden casts; got "
+            f"q={q.dtype}, kv={kv.dtype}, d_out={d_out.dtype}"
+        )
+    try:
+        _index_dtype_name(indices, op_name="Sparse-MLA Path C backward native tvm-ffi")
+    except TypeError as exc:
+        raise SparseMLAPathCDirectError(str(exc)) from exc
+    if sm_scale_buf.shape != (1,) or sm_scale_buf.dtype != mx.float32:
+        raise SparseMLAPathCDirectError(
+            "Sparse-MLA Path C backward native tvm-ffi requires sm_scale_buf "
+            f"with shape (1,) and dtype mx.float32; got shape={tuple(sm_scale_buf.shape)} "
+            f"dtype={sm_scale_buf.dtype}"
+        )
+    threads = _threadgroup_size(shapes.topk)
+    try:
+        index_dtype = _index_dtype_name(
+            indices,
+            op_name="Sparse-MLA Path C backward owner-output",
+        )
+        kernel = _bwd_direct_tvm_ffi_kernel_for(
+            shapes.batch,
+            shapes.seq_len,
+            shapes.heads,
+            shapes.qk_dim,
+            shapes.kv_group,
+            shapes.head_kv,
+            shapes.topk,
+            shapes.seq_len_kv,
+            shapes.d_v,
+            threads,
+            index_dtype,
+        )
+    except Exception as exc:
+        raise SparseMLAPathCDirectError(
+            "Sparse-MLA Path C backward owner-output tvm-ffi compile failed: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+
+    q_flat = _flat_1d_view(q)
+    kv_flat = _flat_1d_view(kv)
+    d_out_flat = _flat_1d_view(d_out)
+    indices_flat = _flat_1d_view(indices)
+    try:
+        returned = kernel(
+            d_out_flat,
+            indices_flat,
+            kv_flat,
+            q_flat,
+            sm_scale_buf,
+        )
+    except Exception as exc:
+        try:
+            from tilelang.contrib.mlx_interop import DLPackInteropError
+        except Exception:  # pragma: no cover - only when TileLang import itself is broken
+            DLPackInteropError = ()  # type: ignore[assignment]
+        if isinstance(exc, DLPackInteropError):
+            raise
+        raise SparseMLAPathCDirectError(
+            "Sparse-MLA Path C backward owner-output tvm-ffi dispatch failed: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    mx.synchronize()
+    if not isinstance(returned, (list, tuple)) or len(returned) != 2:
+        raise SparseMLAPathCDirectError(
+            "Sparse-MLA Path C backward native tvm-ffi did not return "
+            "dkv_partial and dq"
+        )
+    returned_dkv_flat = cast(mx.array, returned[0])
+    returned_dq_flat = cast(mx.array, returned[1])
+    return (
+        returned_dkv_flat.reshape(
+            (
+                shapes.batch,
+                shapes.seq_len,
+                shapes.heads,
+                shapes.topk,
+                shapes.qk_dim,
+            )
+        ),
+        returned_dq_flat.reshape(
+            (shapes.batch, shapes.seq_len, shapes.heads, shapes.qk_dim)
+        ),
+        indices,
+        shapes,
+    )
 
 
 def sparse_mla_fwd_path_c(
@@ -3511,18 +3920,15 @@ def sparse_mla_fwd_path_c(
         sm_scale_value = shapes.qk_dim ** -0.5
     else:
         sm_scale_value = sm_scale
-    threads = _threadgroup_size(shapes.topk)
-
-    indices_i32 = _require_int32_indices_no_hidden_cast(
+    indices_supported = _require_supported_indices_no_hidden_cast(
         indices,
         op_name="sparse_mla_fwd_path_c",
     )
-    q16 = _promote_to_fp16_carrier(q)
-    kv16 = _promote_to_fp16_carrier(kv)
+    if q.dtype != mx.float16 or kv.dtype != mx.float16:
+        return None
     sm_scale_buf = mx.array([float(sm_scale_value)], dtype=mx.float32)
-
     try:
-        kernel, lowering = _fwd_kernel_for(
+        kernel = _fwd_direct_tvm_ffi_kernel_for(
             shapes.batch,
             shapes.seq_len,
             shapes.heads,
@@ -3532,31 +3938,20 @@ def sparse_mla_fwd_path_c(
             shapes.topk,
             shapes.seq_len_kv,
             shapes.d_v,
-            threads,
+            _threadgroup_size(shapes.topk),
+            _index_dtype_name(
+                indices_supported,
+                op_name="Sparse-MLA Path C native forward",
+            ),
         )
-    except (MSLDispatchUnsupported, RuntimeError, ValueError):
-        return None
-
-    grid = _mlx_total_thread_grid(lowering)
-
-    try:
-        outputs = kernel(
-            inputs=[q16, kv16, indices_i32, sm_scale_buf],
-            template=None,
-            output_shapes=[
-                (shapes.batch, shapes.seq_len, shapes.heads, shapes.d_v),
-                (shapes.batch, shapes.seq_len, shapes.heads),
-            ],
-            output_dtypes=[mx.float16, mx.float32],
-            grid=grid,
-            threadgroup=lowering.threadgroup,
-            stream=mx.gpu,
-        )
+        returned = kernel(indices_supported, kv, q, sm_scale_buf)
     except Exception:
         return None
-
-    out, lse = outputs
-    return cast(mx.array, out), cast(mx.array, lse)
+    if not isinstance(returned, (list, tuple)) or len(returned) != 2:
+        return None
+    lse_native = cast(mx.array, returned[0])
+    out_native = cast(mx.array, returned[1])
+    return out_native, lse_native
 
 
 def _sparse_mla_bwd_path_c_partial(
@@ -3583,58 +3978,24 @@ def _sparse_mla_bwd_path_c_partial(
         sm_scale_value = shapes.qk_dim ** -0.5
     else:
         sm_scale_value = sm_scale
-    threads = _threadgroup_size(shapes.topk)
-
-    indices_i32 = _require_int32_indices_no_hidden_cast(
+    indices_supported = _require_supported_indices_no_hidden_cast(
         indices,
         op_name="_sparse_mla_bwd_path_c_partial",
     )
-    q16 = _promote_to_fp16_carrier(q)
-    kv16 = _promote_to_fp16_carrier(kv)
-    d_out16 = _promote_to_fp16_carrier(d_out)
+    if q.dtype != mx.float16 or kv.dtype != mx.float16 or d_out.dtype != mx.float16:
+        return None
     sm_scale_buf = mx.array([float(sm_scale_value)], dtype=mx.float32)
-
     try:
-        kernel, lowering = _bwd_kernel_for(
-            shapes.batch,
-            shapes.seq_len,
-            shapes.heads,
-            shapes.qk_dim,
-            shapes.kv_group,
-            shapes.head_kv,
-            shapes.topk,
-            shapes.seq_len_kv,
-            shapes.d_v,
-            threads,
+        return _sparse_mla_bwd_path_c_partial_direct(
+            q,
+            kv,
+            d_out,
+            indices_supported,
+            sm_scale_buf=sm_scale_buf,
+            d_v=shapes.d_v,
         )
-    except (MSLDispatchUnsupported, RuntimeError, ValueError):
+    except SparseMLAPathCDirectError:
         return None
-
-    grid = _mlx_total_thread_grid(lowering)
-
-    try:
-        outputs = kernel(
-            inputs=[d_out16, indices_i32, kv16, q16, sm_scale_buf],
-            output_shapes=[
-                (
-                    shapes.batch,
-                    shapes.seq_len,
-                    shapes.heads,
-                    shapes.topk,
-                    shapes.qk_dim,
-                ),
-                (shapes.batch, shapes.seq_len, shapes.heads, shapes.qk_dim),
-            ],
-            output_dtypes=[mx.float16, mx.float16],
-            grid=grid,
-            threadgroup=lowering.threadgroup,
-            stream=mx.gpu,
-        )
-    except Exception:
-        return None
-
-    dkv_partial, dq = outputs
-    return cast(mx.array, dkv_partial), cast(mx.array, dq), indices_i32, shapes
 
 
 def sparse_mla_bwd_path_c(
@@ -3817,11 +4178,29 @@ def sparse_mla_path_c_apply(
                 d_v=d_v,
                 return_lse=False,
             )
+        if force_path_c:
+            result = sparse_mla_fwd_path_c(q, kv, indices, sm_scale=sm_scale, d_v=d_v)
+            if result is None:
+                raise RuntimeError(
+                    "sparse_mla_path_c_apply: Path C direct tvm-ffi dispatch "
+                    "is unavailable for these buffers"
+                )
+            out, _lse = result
+            return out.astype(q.dtype)
         out = sparse_mla_path_c_metal_apply(q, kv, indices)
         return cast(mx.array, out).astype(q.dtype)
 
     status = sparse_mla_path_c_status()
     if status.available:
+        if force_path_c:
+            result = sparse_mla_fwd_path_c(q, kv, indices, sm_scale=sm_scale, d_v=d_v)
+            if result is None:
+                raise RuntimeError(
+                    "sparse_mla_path_c_apply: Path C direct tvm-ffi dispatch "
+                    "is unavailable for these buffers"
+                )
+            out, _lse = result
+            return out.astype(q.dtype)
         apply = _sparse_mla_path_c_apply_for_params(float(sm_scale), shapes.d_v)
         out = apply(q, kv, indices)
         return cast(mx.array, out).astype(q.dtype)

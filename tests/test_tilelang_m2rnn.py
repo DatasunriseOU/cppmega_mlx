@@ -13,6 +13,8 @@ Coverage:
 
 from __future__ import annotations
 
+import importlib
+
 from typing import cast
 
 import numpy as np
@@ -70,6 +72,14 @@ def test_status_is_available_or_explains_why() -> None:
     assert isinstance(status, M2RNNMetalStatus)
     assert isinstance(status.available, bool)
     assert isinstance(status.reason, str) and status.reason
+
+
+def test_legacy_m2rnn_blocker_points_to_native_tvm_ffi_route() -> None:
+    mod = importlib.import_module("cppmega_mlx.nn._tilelang.m2rnn")
+    assert mod.__doc__ is not None
+    assert "cannot turn this hand-written MSL back into TileLang IR" in mod.__doc__
+    assert 'execution_backend="tvm_ffi"' in mod.__doc__
+    assert "m2rnn_path_c.py" in mod.__doc__
 
 
 # ---------------------------------------------------------------------------

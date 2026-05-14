@@ -45,6 +45,9 @@ from cppmega_mlx.nn._tilelang.fp8_msl_kernels import (
 def test_fp8_msl_status_returns_dataclass() -> None:
     status = fp8_msl_status()
     assert isinstance(status, FP8MSLKernelStatus)
+    assert status.dispatch_surface == "mx.fast.metal_kernel_direct_msl"
+    assert status.normal_path_available is False
+    assert "constant-table extern" in status.normal_path_reason
     if mx.metal.is_available():
         assert status.available is True
         assert "compiled" in status.reason or "vendored" in status.reason.lower()

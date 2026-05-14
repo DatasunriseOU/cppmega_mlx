@@ -1,4 +1,4 @@
-"""8-bit blockwise quantization helpers backed by Metal kernels.
+"""8-bit blockwise quantization helpers backed by native MLX ops.
 
 This module ships two codec paths for the 8-bit Adam/Muon moment storage:
 
@@ -22,13 +22,16 @@ Layout (matching cppmega/docs/memory_dtype_audit_2026_04_25.md):
         +128 so the on-disk byte is a real uint8 in [1, 255]. For the
         dynamic scheme we store the LUT index 0..255 directly.
 
-The kernel uses one threadgroup per block, block_size threads per group,
-and a tree reduction in threadgroup memory to compute |max|.
+The implementation keeps the block layout identical to the previous Metal
+codec, but uses ordinary MLX array operations. Full 256-element blocks are
+handled as a 2-D view and the tail block, if any, is handled separately so the
+native path does not pad or repeat large tensors just to satisfy a wrapper
+boundary.
 """
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Callable, Optional
 
 import mlx.core as mx
 
@@ -65,101 +68,99 @@ def num_blocks(numel: int, block_size: int = DEFAULT_BLOCK_SIZE) -> int:
     return (numel + block_size - 1) // block_size
 
 
-_QUANTIZE_HEADER = """
-constant constexpr uint BLOCK_SIZE_DEFAULT = 256;
-"""
-
-_QUANTIZE_SOURCE = """
-    threadgroup float scratch[256];
-    uint tid = thread_position_in_threadgroup.x;
-    uint bid = threadgroup_position_in_grid.x;
-    uint total = x_shape[0];
-    uint elem = bid * BLOCK_SIZE_DEFAULT + tid;
-
-    // Stage 1: load |x[elem]| into threadgroup scratch (zero-pad tail).
-    float v = (elem < total) ? metal::abs((float)x[elem]) : 0.0f;
-    scratch[tid] = v;
-    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-
-    // Stage 2: tree reduction over scratch[0 .. BLOCK_SIZE_DEFAULT).
-    for (uint stride = BLOCK_SIZE_DEFAULT / 2u; stride > 0u; stride >>= 1) {
-        if (tid < stride) {
-            float other = scratch[tid + stride];
-            if (other > scratch[tid]) scratch[tid] = other;
-        }
-        threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    }
-    float scale = scratch[0];
-    if (tid == 0) {
-        absmax[bid] = scale;
-    }
-
-    // Stage 3: each thread quantizes its element using the per-block scale.
-    if (elem < total) {
-        float xval = (float)x[elem];
-        float normalized = (scale > 0.0f) ? (xval / scale) : 0.0f;
-        float scaled = normalized * 127.0f;
-        int rounded = (int)metal::round(scaled);
-        if (rounded > 127) rounded = 127;
-        if (rounded < -127) rounded = -127;
-        qdata[elem] = (uint8_t)(rounded + 128);
-    }
-"""
-
-_DEQUANTIZE_SOURCE = """
-    uint elem = thread_position_in_grid.x;
-    if (elem >= qdata_shape[0]) return;
-    uint bid = elem / 256u;
-    float scale = absmax[bid];
-    int signed_val = (int)qdata[elem] - 128;
-    float val = ((float)signed_val) * (1.0f / 127.0f) * scale;
-    out[elem] = (T)val;
-"""
-
-
-_quantize_kernel: Optional[object] = None
-_dequantize_kernel: Optional[object] = None
-
-
-def _can_run_metal() -> bool:
-    metal = getattr(mx, "metal", None)
-    return mx.default_device() == mx.gpu and metal is not None and metal.is_available()
-
-
-def _get_quantize_kernel() -> object:
-    global _quantize_kernel
-    if _quantize_kernel is None:
-        if not _can_run_metal():
-            raise RuntimeError(
-                "Adam8bit symmetric quantization requires the MLX Metal backend; "
-                "default device is not GPU or mx.metal is unavailable."
-            )
-        _quantize_kernel = mx.fast.metal_kernel(
-            name="cppmega_quantize_8bit_symmetric",
-            input_names=["x"],
-            output_names=["absmax", "qdata"],
-            header=_QUANTIZE_HEADER,
-            source=_QUANTIZE_SOURCE,
-            ensure_row_contiguous=True,
+def _require_default_block_size(block_size: int, *, op_name: str) -> None:
+    if block_size != DEFAULT_BLOCK_SIZE:
+        raise NotImplementedError(
+            f"block_size={block_size} is not yet supported; "
+            f"only block_size={DEFAULT_BLOCK_SIZE} is wired through {op_name}."
         )
-    return _quantize_kernel
 
 
-def _get_dequantize_kernel() -> object:
-    global _dequantize_kernel
-    if _dequantize_kernel is None:
-        if not _can_run_metal():
-            raise RuntimeError(
-                "Adam8bit symmetric dequantization requires the MLX Metal backend."
-            )
-        _dequantize_kernel = mx.fast.metal_kernel(
-            name="cppmega_dequantize_8bit_symmetric",
-            input_names=["qdata", "absmax"],
-            output_names=["out"],
-            source=_DEQUANTIZE_SOURCE,
-            ensure_row_contiguous=True,
-        )
-    return _dequantize_kernel
+def _flatten_float32(fp_tensor: mx.array, *, op_name: str) -> mx.array:
+    if fp_tensor.dtype not in {mx.float32, mx.float16, mx.bfloat16}:
+        raise TypeError(f"{op_name} expects a floating dtype, got {fp_tensor.dtype}")
+    flat = fp_tensor.reshape(-1)
+    if flat.dtype != mx.float32:
+        flat = flat.astype(mx.float32)
+    return flat
+
+
+def _concat_parts(parts: list[mx.array]) -> mx.array:
+    if len(parts) == 1:
+        return parts[0]
+    return mx.concatenate(parts, axis=0)
+
+
+def _safe_normalize(values: mx.array, scale: mx.array) -> mx.array:
+    denom = mx.where(scale > 0.0, scale, mx.ones_like(scale))
+    return values / denom
+
+
+def _quantize_symmetric_values(values: mx.array, scale: mx.array) -> mx.array:
+    normalized = _safe_normalize(values, scale)
+    rounded = mx.round(normalized * float(QUANT_RANGE))
+    clipped = mx.clip(rounded, -float(QUANT_RANGE), float(QUANT_RANGE))
+    return (clipped.astype(mx.int32) + QUANT_BIAS).astype(mx.uint8)
+
+
+def _dequantize_symmetric_values(qvalues: mx.array, scale: mx.array) -> mx.array:
+    signed = qvalues.astype(mx.int32) - QUANT_BIAS
+    return signed.astype(mx.float32) * (1.0 / float(QUANT_RANGE)) * scale
+
+
+def _quantize_blockwise_native(
+    flat: mx.array,
+    block_size: int,
+    quantize_values: Callable[[mx.array, mx.array], mx.array],
+) -> tuple[mx.array, mx.array]:
+    n = int(flat.size)
+    n_full = n // block_size
+    full_size = n_full * block_size
+    parts: list[mx.array] = []
+    absmax_parts: list[mx.array] = []
+
+    if n_full:
+        full = flat[:full_size].reshape(n_full, block_size)
+        scales = mx.max(mx.abs(full), axis=1)
+        absmax_parts.append(scales)
+        parts.append(quantize_values(full, scales[:, None]).reshape(-1))
+
+    if full_size < n:
+        tail = flat[full_size:]
+        tail_scale = mx.max(mx.abs(tail), keepdims=True)
+        absmax_parts.append(tail_scale)
+        parts.append(quantize_values(tail, tail_scale))
+
+    return _concat_parts(parts), _concat_parts(absmax_parts)
+
+
+def _dequantize_blockwise_native(
+    flat: mx.array,
+    absmax: mx.array,
+    block_size: int,
+    dequantize_values: Callable[[mx.array, mx.array], mx.array],
+    *,
+    out_dtype: mx.Dtype,
+) -> mx.array:
+    n = int(flat.size)
+    n_full = n // block_size
+    full_size = n_full * block_size
+    parts: list[mx.array] = []
+
+    if n_full:
+        full_q = flat[:full_size].reshape(n_full, block_size)
+        full = dequantize_values(full_q, absmax[:n_full, None]).reshape(-1)
+        parts.append(full)
+
+    if full_size < n:
+        tail_q = flat[full_size:]
+        tail = dequantize_values(tail_q, absmax[n_full]).reshape(-1)
+        parts.append(tail)
+
+    out = _concat_parts(parts)
+    if out.dtype != out_dtype:
+        out = out.astype(out_dtype)
+    return out
 
 
 def quantize_dynamic_blockwise(
@@ -183,23 +184,16 @@ def quantize_dynamic_blockwise(
         ~99% as accurate (loss-trajectory drift <2% on a 50-step smoke).
     """
 
-    if block_size != DEFAULT_BLOCK_SIZE:
-        # The Metal kernel hardcodes BLOCK_SIZE=256 in threadgroup scratch.
-        # Other block sizes need a recompiled kernel; gate that until we add it.
-        raise NotImplementedError(
-            f"block_size={block_size} is not yet supported; "
-            f"only block_size={DEFAULT_BLOCK_SIZE} is wired through the Metal kernel."
-        )
-    if fp_tensor.dtype not in {mx.float32, mx.float16, mx.bfloat16}:
-        raise TypeError(
-            f"quantize_dynamic_blockwise expects a floating dtype, got {fp_tensor.dtype}"
-        )
+    _require_default_block_size(
+        block_size,
+        op_name="the native symmetric 8-bit codec",
+    )
 
     original_shape = fp_tensor.shape
-    flat = fp_tensor.reshape(-1)
-    if flat.dtype != mx.float32:
-        flat = flat.astype(mx.float32)
-    nblocks = num_blocks(int(flat.size), block_size)
+    flat = _flatten_float32(
+        fp_tensor,
+        op_name="quantize_dynamic_blockwise",
+    )
 
     if int(flat.size) == 0:
         return (
@@ -207,17 +201,12 @@ def quantize_dynamic_blockwise(
             mx.zeros((0,), dtype=mx.float32),
         )
 
-    kernel = _get_quantize_kernel()
-    absmax, qdata_flat = kernel(
-        inputs=[flat],
-        output_shapes=[(nblocks,), flat.shape],
-        output_dtypes=[mx.float32, mx.uint8],
-        grid=(nblocks * block_size, 1, 1),
-        threadgroup=(block_size, 1, 1),
-        stream=mx.gpu,
+    qdata_flat, absmax = _quantize_blockwise_native(
+        flat,
+        block_size,
+        _quantize_symmetric_values,
     )
-    qdata = qdata_flat.reshape(original_shape)
-    return qdata, absmax
+    return qdata_flat.reshape(original_shape), absmax
 
 
 def dequantize_dynamic_blockwise(
@@ -242,17 +231,13 @@ def dequantize_dynamic_blockwise(
     if int(flat.size) == 0:
         return mx.zeros(original_shape, dtype=out_dtype)
 
-    kernel = _get_dequantize_kernel()
-    threads = min(256, int(flat.size))
-    out_flat = kernel(
-        inputs=[flat, absmax],
-        template=[("T", out_dtype)],
-        output_shapes=[flat.shape],
-        output_dtypes=[out_dtype],
-        grid=(flat.size, 1, 1),
-        threadgroup=(threads, 1, 1),
-        stream=mx.gpu,
-    )[0]
+    out_flat = _dequantize_blockwise_native(
+        flat,
+        absmax,
+        DEFAULT_BLOCK_SIZE,
+        _dequantize_symmetric_values,
+        out_dtype=out_dtype,
+    )
     return out_flat.reshape(original_shape)
 
 
@@ -276,7 +261,7 @@ def dequantize_dynamic_blockwise(
 # The LUT covers ``[-0.99296875, 1.0]`` with denser bins near zero (e.g. the
 # 16 indices straddling zero step in increments of ~5.5e-7) so that small
 # Adam ``m, v`` values quantize without collapsing to bias=128 the way
-# symmetric int8 does. The runtime kernel uses ``qdata[elem]`` as a direct
+# symmetric int8 does. The runtime codec uses ``qdata[elem]`` as a direct
 # index into this table, exactly matching ``dDequantizeBlockwise`` in
 # bitsandbytes/csrc/kernels.cu.
 _BNB_DYNAMIC_LUT_VALUES: tuple[float, ...] = (
@@ -352,7 +337,7 @@ def create_dynamic_map() -> mx.array:
 
     The LUT is the ``bitsandbytes.functional.create_dynamic_map(signed=True,
     max_exponent_bits=7, total_bits=8)`` table baked at module-load time, so
-    the dequantize kernel's ``code[qdata[elem]]`` lookup matches
+    the dequantizer's ``code[qdata[elem]]`` lookup matches
     ``dDequantizeBlockwise`` in ``bitsandbytes/csrc/kernels.cu`` byte-for-byte.
 
     Returns a fresh ``mx.array`` so callers can keep an immutable reference;
@@ -374,124 +359,30 @@ def _get_lut() -> mx.array:
     return _dynamic_lut
 
 
-# Sorted-LUT binary search: each thread computes |x|/scale (sign preserved),
-# then walks the LUT to find the index whose value is closest. With
-# ``_BNB_DYNAMIC_LUT_VALUES`` monotone non-decreasing, a 8-step binary search
-# nails the upper bound; we then compare the upper and lower neighbours and
-# emit the closer index. The LUT is loaded into threadgroup memory once per
-# block to amortize the constant-buffer fetch cost.
-_QUANTIZE_DYNAMIC_HEADER = """
-constant constexpr uint BLOCK_SIZE_DEFAULT = 256;
-constant constexpr uint LUT_SIZE = 256;
-"""
+def _quantize_dynamic_lut_values(values: mx.array, scale: mx.array) -> mx.array:
+    lut = _get_lut()
+    normalized = mx.clip(_safe_normalize(values, scale), -1.0, 1.0)
+    lo = mx.zeros(normalized.shape, dtype=mx.int32)
+    hi = mx.full(normalized.shape, len(_BNB_DYNAMIC_LUT_VALUES) - 1, dtype=mx.int32)
 
-_QUANTIZE_DYNAMIC_SOURCE = """
-    threadgroup float scratch[256];
-    threadgroup float lut_tg[256];
-    uint tid = thread_position_in_threadgroup.x;
-    uint bid = threadgroup_position_in_grid.x;
-    uint total = x_shape[0];
-    uint elem = bid * BLOCK_SIZE_DEFAULT + tid;
+    for _ in range(8):
+        mid = (lo + hi) // 2
+        mid_values = mx.take(lut, mid)
+        move_right = mid_values < normalized
+        lo = mx.where(move_right, mid + 1, lo)
+        hi = mx.where(move_right, hi, mid)
 
-    // Stage 0: cooperatively load the 256-entry LUT into threadgroup memory.
-    lut_tg[tid] = lut[tid];
-
-    // Stage 1: load |x[elem]| into scratch (zero-pad tail).
-    float v = (elem < total) ? metal::abs((float)x[elem]) : 0.0f;
-    scratch[tid] = v;
-    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-
-    // Stage 2: tree reduction over scratch[0 .. BLOCK_SIZE_DEFAULT).
-    for (uint stride = BLOCK_SIZE_DEFAULT / 2u; stride > 0u; stride >>= 1) {
-        if (tid < stride) {
-            float other = scratch[tid + stride];
-            if (other > scratch[tid]) scratch[tid] = other;
-        }
-        threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    }
-    float scale = scratch[0];
-    if (tid == 0) {
-        absmax[bid] = scale;
-    }
-
-    // Stage 3: per-thread quantization via LUT binary search.
-    if (elem < total) {
-        float xval = (float)x[elem];
-        float normalized = (scale > 0.0f) ? (xval / scale) : 0.0f;
-        // Clamp to LUT-supported range; LUT covers [-0.99296875, 1.0].
-        if (normalized > 1.0f) normalized = 1.0f;
-        if (normalized < -1.0f) normalized = -1.0f;
-        // Binary search for the smallest index i with lut_tg[i] >= normalized.
-        uint lo = 0u;
-        uint hi = LUT_SIZE - 1u;
-        while (lo < hi) {
-            uint mid = (lo + hi) >> 1;
-            if (lut_tg[mid] < normalized) {
-                lo = mid + 1u;
-            } else {
-                hi = mid;
-            }
-        }
-        // Pick the closer of [lo, lo-1] (lo-1 only if lo > 0).
-        uint best = lo;
-        if (lo > 0u) {
-            float d_hi = metal::abs(lut_tg[lo] - normalized);
-            float d_lo = metal::abs(lut_tg[lo - 1u] - normalized);
-            if (d_lo < d_hi) best = lo - 1u;
-        }
-        qdata[elem] = (uint8_t)best;
-    }
-"""
-
-_DEQUANTIZE_DYNAMIC_SOURCE = """
-    uint elem = thread_position_in_grid.x;
-    if (elem >= qdata_shape[0]) return;
-    uint bid = elem / 256u;
-    float scale = absmax[bid];
-    uint idx = (uint)qdata[elem];
-    float val = lut[idx] * scale;
-    out[elem] = (T)val;
-"""
+    lo_values = mx.take(lut, lo)
+    prev = mx.maximum(lo - 1, 0)
+    prev_values = mx.take(lut, prev)
+    use_prev = (lo > 0) & (mx.abs(prev_values - normalized) < mx.abs(lo_values - normalized))
+    best = mx.where(use_prev, prev, lo)
+    return best.astype(mx.uint8)
 
 
-_quantize_dynamic_kernel: Optional[object] = None
-_dequantize_dynamic_kernel: Optional[object] = None
-
-
-def _get_quantize_dynamic_kernel() -> object:
-    global _quantize_dynamic_kernel
-    if _quantize_dynamic_kernel is None:
-        if not _can_run_metal():
-            raise RuntimeError(
-                "Adam8bit dynamic quantization requires the MLX Metal backend; "
-                "default device is not GPU or mx.metal is unavailable."
-            )
-        _quantize_dynamic_kernel = mx.fast.metal_kernel(
-            name="cppmega_quantize_8bit_dynamic",
-            input_names=["x", "lut"],
-            output_names=["absmax", "qdata"],
-            header=_QUANTIZE_DYNAMIC_HEADER,
-            source=_QUANTIZE_DYNAMIC_SOURCE,
-            ensure_row_contiguous=True,
-        )
-    return _quantize_dynamic_kernel
-
-
-def _get_dequantize_dynamic_kernel() -> object:
-    global _dequantize_dynamic_kernel
-    if _dequantize_dynamic_kernel is None:
-        if not _can_run_metal():
-            raise RuntimeError(
-                "Adam8bit dynamic dequantization requires the MLX Metal backend."
-            )
-        _dequantize_dynamic_kernel = mx.fast.metal_kernel(
-            name="cppmega_dequantize_8bit_dynamic",
-            input_names=["qdata", "absmax", "lut"],
-            output_names=["out"],
-            source=_DEQUANTIZE_DYNAMIC_SOURCE,
-            ensure_row_contiguous=True,
-        )
-    return _dequantize_dynamic_kernel
+def _dequantize_dynamic_lut_values(qvalues: mx.array, scale: mx.array) -> mx.array:
+    lut = _get_lut()
+    return mx.take(lut, qvalues.astype(mx.int32)) * scale
 
 
 def quantize_dynamic_lut_blockwise(
@@ -511,21 +402,16 @@ def quantize_dynamic_lut_blockwise(
     without touching state allocation.
     """
 
-    if block_size != DEFAULT_BLOCK_SIZE:
-        raise NotImplementedError(
-            f"block_size={block_size} is not yet supported; "
-            f"only block_size={DEFAULT_BLOCK_SIZE} is wired through the Metal kernel."
-        )
-    if fp_tensor.dtype not in {mx.float32, mx.float16, mx.bfloat16}:
-        raise TypeError(
-            f"quantize_dynamic_lut_blockwise expects a floating dtype, got {fp_tensor.dtype}"
-        )
+    _require_default_block_size(
+        block_size,
+        op_name="the native dynamic-LUT 8-bit codec",
+    )
 
     original_shape = fp_tensor.shape
-    flat = fp_tensor.reshape(-1)
-    if flat.dtype != mx.float32:
-        flat = flat.astype(mx.float32)
-    nblocks = num_blocks(int(flat.size), block_size)
+    flat = _flatten_float32(
+        fp_tensor,
+        op_name="quantize_dynamic_lut_blockwise",
+    )
 
     if int(flat.size) == 0:
         return (
@@ -533,18 +419,12 @@ def quantize_dynamic_lut_blockwise(
             mx.zeros((0,), dtype=mx.float32),
         )
 
-    kernel = _get_quantize_dynamic_kernel()
-    lut = _get_lut()
-    absmax, qdata_flat = kernel(
-        inputs=[flat, lut],
-        output_shapes=[(nblocks,), flat.shape],
-        output_dtypes=[mx.float32, mx.uint8],
-        grid=(nblocks * block_size, 1, 1),
-        threadgroup=(block_size, 1, 1),
-        stream=mx.gpu,
+    qdata_flat, absmax = _quantize_blockwise_native(
+        flat,
+        block_size,
+        _quantize_dynamic_lut_values,
     )
-    qdata = qdata_flat.reshape(original_shape)
-    return qdata, absmax
+    return qdata_flat.reshape(original_shape), absmax
 
 
 def dequantize_dynamic_lut_blockwise(
@@ -569,18 +449,13 @@ def dequantize_dynamic_lut_blockwise(
     if int(flat.size) == 0:
         return mx.zeros(original_shape, dtype=out_dtype)
 
-    kernel = _get_dequantize_dynamic_kernel()
-    lut = _get_lut()
-    threads = min(256, int(flat.size))
-    out_flat = kernel(
-        inputs=[flat, absmax, lut],
-        template=[("T", out_dtype)],
-        output_shapes=[flat.shape],
-        output_dtypes=[out_dtype],
-        grid=(flat.size, 1, 1),
-        threadgroup=(threads, 1, 1),
-        stream=mx.gpu,
-    )[0]
+    out_flat = _dequantize_blockwise_native(
+        flat,
+        absmax,
+        DEFAULT_BLOCK_SIZE,
+        _dequantize_dynamic_lut_values,
+        out_dtype=out_dtype,
+    )
     return out_flat.reshape(original_shape)
 
 

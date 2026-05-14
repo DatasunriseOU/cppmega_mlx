@@ -147,10 +147,11 @@ from cppmega_mlx.nn._tilelang._engine_dispatch import (
 #     either porting the Path B kernel onto the TileLang DSL or adding a
 #     post-MSL textual barrier-elision pass; neither is in scope for the
 #     ``cppmega-mlx-cuz`` wiring task.
-#   * The Path C TileLang DSL kernel built in ``_path_c_kernel_for`` -- this
-#     one *does* request extracted MSL through ``dispatch_lower(...,
-#     return_msl=True)`` and can opt into the Z3 PassConfigs registered in the
-#     active libtilelang build.
+#   * The Path C TileLang DSL kernel built in ``_path_c_tvm_ffi_kernel_for`` --
+#     this compiles through native tvm-ffi for owner-output production calls.
+#     The debug-only ``_path_c_kernel_for`` wrapper still requests extracted
+#     MSL for the legacy no-out probe, and both routes opt into the Z3
+#     PassConfigs registered in the active libtilelang build.
 #
 # Idea #4 (``tl.drop_provable_bound_checks``) is the PassConfig we expect to
 # materially affect codegen on the Path C topk merge kernel: the
@@ -1001,10 +1002,10 @@ def _path_c_lowering_for(
     score_dtype: str,
 ) -> _msl_transform.TileLangMSLLowering:
     topk_selector_kernel = _path_c_prim_func(batch, seq_len, k, threads, score_dtype)
-    # Migration phase-2/3: route the lowering through the shared
-    # ``dispatch_lower`` helper. MLX on Metal still consumes extracted MSL via
-    # ``mx.fast.metal_kernel``, so request ``return_msl=True`` while preserving
-    # per-kernel PassConfigs through the dispatcher.
+    # Legacy debug-only no-out wrapper support. Production Path C dispatches
+    # through ``_path_c_tvm_ffi_kernel_for`` below; this extracted-MSL lowering
+    # exists only when ``CPPMEGA_TOPK_PATH_C_LEGACY_NO_OUT`` enables the old
+    # MLX fast-kernel wrapper for diagnostics.
     artifact = dispatch_lower(
         topk_selector_kernel,
         target="metal",
@@ -1253,17 +1254,19 @@ def topk_selector_tilelang(
 
 @dataclass(frozen=True)
 class PathBStatus:
-    """Why Path B (direct-MSL via ``mx.fast.metal_kernel``) is or isn't available."""
+    """Why legacy Path B direct-MSL is or isn't available."""
 
     available: bool
     reason: str
 
 
 _PATH_B_OK_REASON = (
-    "topk_selector direct-MSL kernel built via mx.fast.metal_kernel is "
-    "available; bypasses the original CUDA-style TileLang schedule that is "
-    "blocked on shared.dyn / LowerTileOp issues, see "
-    "docs/tilelang_ports/topk_selector.md."
+    "topk_selector legacy direct-MSL kernel built via mx.fast.metal_kernel is "
+    "available for no-owner-output and masked calls. Native TileLang Path C "
+    "uses tvm-ffi owner outputs for unmasked calls; this fallback remains "
+    "until the masked/no-out contracts have a no-copy native route. The "
+    "original CUDA-style TileLang schedule is still blocked on shared.dyn / "
+    "LowerTileOp issues, see docs/tilelang_ports/topk_selector.md."
 )
 _PATH_B_BLOCKER_REASON = (
     "topk_selector direct-MSL kernel could not be constructed: "
@@ -1274,9 +1277,12 @@ _PATH_B_BLOCKER_REASON = (
 def topk_selector_path_b_status() -> PathBStatus:
     """Return whether Path B is currently dispatchable.
 
-    With the direct-MSL approach, Path B is available whenever Metal is. The
-    TileLang lowering failures (``shared.dyn``, ``LowerTileOp``) are bypassed
-    by emitting MSL directly through ``mx.fast.metal_kernel``.
+    Path B is an explicit legacy fallback. It is available whenever Metal can
+    build the hand-written MSL, but production TileLang Path C should use
+    ``topk_selector_tilelang_direct(..., out=...)`` so tvm-ffi receives a
+    caller-owned output. The remaining direct-MSL callers are no-output and
+    masked selector contracts that cannot be moved without hidden output/mask
+    staging.
     """
 
     if _TOPK_KERNEL is None or not _msl_transform.can_run_metal():

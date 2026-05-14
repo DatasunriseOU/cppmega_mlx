@@ -18,6 +18,7 @@ from typing import Any, Mapping
 
 import mlx.core as mx
 
+from cppmega_mlx._mlx_lm_imports import suppress_sentencepiece_swig_warnings
 from cppmega_mlx.data.batch import LMTokenBatch, ensure_lm_batch
 
 
@@ -101,7 +102,8 @@ class MLXLMTrainerIntegrationUnsupported(NotImplementedError):
 
 def _load_trainer_module() -> tuple[ModuleType | None, str | None]:
     try:
-        return importlib.import_module(TRAINER_MODULE), None
+        with suppress_sentencepiece_swig_warnings():
+            return importlib.import_module(TRAINER_MODULE), None
     except Exception as exc:  # pragma: no cover - exercised via monkeypatch tests.
         return None, f"{type(exc).__name__}: {exc}"
 
