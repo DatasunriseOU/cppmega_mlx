@@ -410,13 +410,16 @@ def mamba3_path_c_schedule_plan(
         z3_policy=z3_policy,
     )
     fwd_candidate = dtype in {"float32", "bfloat16"} and threads <= 256 and z3_proved
-    simd_p_reduce = headdim == 32 and threads % 32 == 0
+    simd_p_reduce = _bwd_simd_p_reduction_supported(
+        batch=batch,
+        heads=heads,
+        headdim=headdim,
+    )
     bwd_candidate = fwd_candidate and simd_p_reduce
     bwd_reason = (
-        "bwd uses one 32-lane Metal simdgroup per P row and simd_sum "
-        "reductions for dB/dC/dA/ddt/dD"
+        "bwd emits TileLang thread_allreduce_sum over P-axis grads"
         if simd_p_reduce
-        else "bwd falls back to per-lane partial outputs until P maps to one simdgroup"
+        else "bwd falls back to per-lane partial outputs until P maps to full rows"
     )
     reason = (
         f"rule: fp32-accumulating {dtype} per-lane scan with {threads} "
@@ -1264,11 +1267,16 @@ def _bwd_kernel_for_state_snapshots(
 def _bwd_simd_p_reduction_supported(
     *, batch: int, heads: int, headdim: int
 ) -> bool:
-    """Return whether P-axis grads fit one isolated Metal simdgroup."""
+    """Return whether P-axis grads map to TileLang split thread-allreduce."""
 
     lanes = batch * heads * headdim
     threads = _threads_for(lanes)
-    return headdim == 32 and threads % 32 == 0
+    return (
+        headdim > 0
+        and headdim % 32 == 0
+        and threads % headdim == 0
+        and lanes % threads == 0
+    )
 
 
 @lru_cache(maxsize=128)
@@ -1298,13 +1306,12 @@ def _bwd_simd_reduce_kernel_for(
     *,
     return_msl: bool = False,
 ) -> tuple[Any, _msl_transform.TileLangMSLLowering]:
-    """Build a Path C bwd kernel that reduces P inside each Metal simdgroup.
+    """Build a Path C bwd kernel that reduces P through TileLang allreduce IR.
 
-    This is the Mac-style FA pattern applied to Mamba: one hardware simdgroup
-    owns all ``P=32`` lanes for one ``(batch, head)`` row, so ``simd_sum`` can
-    reduce dB/dC/dA/ddt/dD without global partial buffers or threadgroup
-    barriers. Shapes that do not map one full P row to one simdgroup keep using
-    the generic partial-output fallback.
+    The kernel intentionally emits ``T.thread_allreduce_sum`` rather than Metal
+    ``simd_sum``. TileLang lowering chooses same-simdgroup or cross-simdgroup
+    code from the reduce index, so P=32, P=64, and similar aligned P-axis
+    reductions share the same IR path without global partial buffers.
     """
 
     if not _bwd_simd_p_reduction_supported(
@@ -1313,8 +1320,8 @@ def _bwd_simd_reduce_kernel_for(
         headdim=HEADDIM,
     ):
         raise MSLDispatchUnsupported(
-            "Mamba3 Path C simd P-reduction requires HEADDIM=32 with "
-            "threadgroups aligned to 32-lane Metal simdgroups"
+            "Mamba3 Path C P-reduction requires HEADDIM to be a multiple of "
+            "32 with threadgroups aligned to full P rows"
         )
 
     import tilelang.language as T
@@ -1406,19 +1413,15 @@ def _bwd_simd_reduce_kernel_for(
                             C_val = T.cast(C[b, t, h, n], accum_dtype)
                             B_val = T.cast(B[b, t, h, n], accum_dtype)
                             dh_n = dh[n] + d_y_skipped * C_val
-                            dC_sum = T.call_intrin(
-                                "float32",
-                                "tir.metal.simd_sum",
-                                d_y_skipped * h_state[n],
+                            dC_sum = T.alloc_local((1,), accum_dtype)
+                            dB_sum = T.alloc_local((1,), accum_dtype)
+                            T.thread_allreduce_sum(
+                                d_y_skipped * h_state[n], dC_sum[0], p
                             )
-                            dB_sum = T.call_intrin(
-                                "float32",
-                                "tir.metal.simd_sum",
-                                dh_n * x_val,
-                            )
+                            T.thread_allreduce_sum(dh_n * x_val, dB_sum[0], p)
                             if p == 0:
-                                dC[b, t, h, n] = T.cast(dC_sum, dC_dtype)
-                                dB[b, t, h, n] = T.cast(dB_sum, dB_dtype)
+                                dC[b, t, h, n] = T.cast(dC_sum[0], dC_dtype)
+                                dB[b, t, h, n] = T.cast(dB_sum[0], dB_dtype)
                             dx_inp += dh_n * B_val
                             d_decay += dh_n * T.cast(h0[b, h, p, n], accum_dtype)
                             dh[n] = dh_n * decay
@@ -1427,19 +1430,15 @@ def _bwd_simd_reduce_kernel_for(
                             C_val = T.cast(C[b, t, h, n], accum_dtype)
                             B_val = T.cast(B[b, t, h, n], accum_dtype)
                             dh_n = dh[n] + d_y_skipped * C_val
-                            dC_sum = T.call_intrin(
-                                "float32",
-                                "tir.metal.simd_sum",
-                                d_y_skipped * h_state[n],
+                            dC_sum = T.alloc_local((1,), accum_dtype)
+                            dB_sum = T.alloc_local((1,), accum_dtype)
+                            T.thread_allreduce_sum(
+                                d_y_skipped * h_state[n], dC_sum[0], p
                             )
-                            dB_sum = T.call_intrin(
-                                "float32",
-                                "tir.metal.simd_sum",
-                                dh_n * x_val,
-                            )
+                            T.thread_allreduce_sum(dh_n * x_val, dB_sum[0], p)
                             if p == 0:
-                                dC[b, t, h, n] = T.cast(dC_sum, dC_dtype)
-                                dB[b, t, h, n] = T.cast(dB_sum, dB_dtype)
+                                dC[b, t, h, n] = T.cast(dC_sum[0], dC_dtype)
+                                dB[b, t, h, n] = T.cast(dB_sum[0], dB_dtype)
                             dx_inp += dh_n * B_val
                             h_prev = (h_state[n] - x_val * B_val) * inv_decay
                             d_decay += dh_n * h_prev
@@ -1451,17 +1450,20 @@ def _bwd_simd_reduce_kernel_for(
                     d_logdecay = d_decay * decay
                     dA_lane = d_logdecay * dt_val
                     ddt_lane = d_logdecay * A_val
-                    dA_sum = T.call_intrin("float32", "tir.metal.simd_sum", dA_lane)
-                    ddt_sum = T.call_intrin("float32", "tir.metal.simd_sum", ddt_lane)
+                    dA_sum = T.alloc_local((1,), accum_dtype)
+                    ddt_sum = T.alloc_local((1,), accum_dtype)
+                    T.thread_allreduce_sum(dA_lane, dA_sum[0], p)
+                    T.thread_allreduce_sum(ddt_lane, ddt_sum[0], p)
                     if p == 0:
-                        dA[b, t, h] = T.cast(dA_sum, dA_dtype)
-                        ddt[b, t, h] = T.cast(ddt_sum, ddt_dtype)
+                        dA[b, t, h] = T.cast(dA_sum[0], dA_dtype)
+                        ddt[b, t, h] = T.cast(ddt_sum[0], ddt_dtype)
 
                 for n in T.serial(STATE):
                     dh0[b, h, p, n] = T.cast(dh[n], dh0_dtype)
-                dD_sum = T.call_intrin("float32", "tir.metal.simd_sum", dD_acc)
+                dD_sum = T.alloc_local((1,), accum_dtype)
+                T.thread_allreduce_sum(dD_acc, dD_sum[0], p)
                 if p == 0:
-                    dD_batch[b, h] = T.cast(dD_sum, dD_dtype)
+                    dD_batch[b, h] = T.cast(dD_sum[0], dD_dtype)
 
     artifact = dispatch_lower(bwd_simd, target="metal", return_msl=True)
     if hasattr(artifact, "_tilelang_engine_target"):

@@ -144,9 +144,25 @@ def test_lowered_bwd_msl_contains_kernel_void() -> None:
 def test_lowered_bwd_bench_shape_uses_simd_p_reduction() -> None:
     msl = dump_lowered_bwd_msl(batch=1, seq=4, heads=1, headdim=32, state=4)
     assert "kernel void" in msl
-    assert "simd_sum" in msl
+    assert "simd_shuffle_down" in msl
     assert "dB_partial" not in msl
     assert "dC_partial" not in msl
+    assert "dA_partial" not in msl
+    assert "ddt_partial" not in msl
+    assert "dD_partial" not in msl
+    assert "dD_batch" in msl
+
+
+def test_lowered_bwd_headdim64_uses_split_thread_allreduce() -> None:
+    msl = dump_lowered_bwd_msl(batch=1, seq=4, heads=1, headdim=64, state=4)
+    assert "kernel void" in msl
+    assert "simd_shuffle_down" in msl
+    assert "red_buf_staging" in msl
+    assert "dB_partial" not in msl
+    assert "dC_partial" not in msl
+    assert "dA_partial" not in msl
+    assert "ddt_partial" not in msl
+    assert "dD_partial" not in msl
     assert "dD_batch" in msl
 
 
