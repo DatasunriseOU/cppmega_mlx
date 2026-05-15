@@ -3548,6 +3548,21 @@ def _validate_fwd_owner_output_buffers(
     return shapes
 
 
+def _fp16_public_carrier(value: mx.array) -> mx.array | None:
+    """Return a public-wrapper fp16 carrier, or None for unsupported dtypes.
+
+    The owner-output tvm-ffi ABI stays strict and accepts only already-fp16
+    buffers. The higher-level differentiable wrapper is allowed to adapt fp32
+    model tensors into that ABI and cast the result/grads back at the API edge.
+    """
+
+    if value.dtype == mx.float16:
+        return value
+    if value.dtype == mx.float32:
+        return value.astype(mx.float16)
+    return None
+
+
 @lru_cache(maxsize=128)
 def _fwd_direct_tvm_ffi_kernel_for(
     BATCH: int,
@@ -3924,7 +3939,9 @@ def sparse_mla_fwd_path_c(
         indices,
         op_name="sparse_mla_fwd_path_c",
     )
-    if q.dtype != mx.float16 or kv.dtype != mx.float16:
+    q_carrier = _fp16_public_carrier(q)
+    kv_carrier = _fp16_public_carrier(kv)
+    if q_carrier is None or kv_carrier is None:
         return None
     sm_scale_buf = mx.array([float(sm_scale_value)], dtype=mx.float32)
     try:
@@ -3944,7 +3961,7 @@ def sparse_mla_fwd_path_c(
                 op_name="Sparse-MLA Path C native forward",
             ),
         )
-        returned = kernel(indices_supported, kv, q, sm_scale_buf)
+        returned = kernel(indices_supported, kv_carrier, q_carrier, sm_scale_buf)
     except Exception:
         return None
     if not isinstance(returned, (list, tuple)) or len(returned) != 2:
@@ -3982,14 +3999,17 @@ def _sparse_mla_bwd_path_c_partial(
         indices,
         op_name="_sparse_mla_bwd_path_c_partial",
     )
-    if q.dtype != mx.float16 or kv.dtype != mx.float16 or d_out.dtype != mx.float16:
+    q_carrier = _fp16_public_carrier(q)
+    kv_carrier = _fp16_public_carrier(kv)
+    d_out_carrier = _fp16_public_carrier(d_out)
+    if q_carrier is None or kv_carrier is None or d_out_carrier is None:
         return None
     sm_scale_buf = mx.array([float(sm_scale_value)], dtype=mx.float32)
     try:
         return _sparse_mla_bwd_path_c_partial_direct(
-            q,
-            kv,
-            d_out,
+            q_carrier,
+            kv_carrier,
+            d_out_carrier,
             indices_supported,
             sm_scale_buf=sm_scale_buf,
             d_v=shapes.d_v,
@@ -4124,8 +4144,9 @@ def sparse_mla_path_c_apply(
 
     The default ``sm_scale``/``d_v`` path is wrapped in ``mx.custom_function``
     and uses the Path C backward kernel for VJP coverage. Forced Path C
-    non-default ``d_v``/``sm_scale`` dispatch uses a shape-parameterized custom
-    VJP wrapper over the same forward/backward kernels.
+    validates Path C availability but still goes through that differentiable
+    wrapper; the raw forward-only tvm-ffi entrypoint is kept for explicit
+    owner-output callers.
 
     Note (kwarg rename from Path B):
         This entrypoint accepts ``force_path_c`` (raise instead of falling
@@ -4178,29 +4199,11 @@ def sparse_mla_path_c_apply(
                 d_v=d_v,
                 return_lse=False,
             )
-        if force_path_c:
-            result = sparse_mla_fwd_path_c(q, kv, indices, sm_scale=sm_scale, d_v=d_v)
-            if result is None:
-                raise RuntimeError(
-                    "sparse_mla_path_c_apply: Path C direct tvm-ffi dispatch "
-                    "is unavailable for these buffers"
-                )
-            out, _lse = result
-            return out.astype(q.dtype)
         out = sparse_mla_path_c_metal_apply(q, kv, indices)
         return cast(mx.array, out).astype(q.dtype)
 
     status = sparse_mla_path_c_status()
     if status.available:
-        if force_path_c:
-            result = sparse_mla_fwd_path_c(q, kv, indices, sm_scale=sm_scale, d_v=d_v)
-            if result is None:
-                raise RuntimeError(
-                    "sparse_mla_path_c_apply: Path C direct tvm-ffi dispatch "
-                    "is unavailable for these buffers"
-                )
-            out, _lse = result
-            return out.astype(q.dtype)
         apply = _sparse_mla_path_c_apply_for_params(float(sm_scale), shapes.d_v)
         out = apply(q, kv, indices)
         return cast(mx.array, out).astype(q.dtype)

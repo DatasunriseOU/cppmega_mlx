@@ -21,9 +21,12 @@ source, but runtime dispatch no longer builds an MLX fast-kernel wrapper.
 The production owner-output API is
 ``fp8_scaled_vecmat_path_c(..., out=existing_array)``: it compiles a tvm-ffi
 kernel and passes the caller-owned MLX buffers through DLPack without building
-``mx.fast.metal_kernel`` or allocating/casting the output in Python. The
-historical no-``out`` API is retired because it could only be implemented by
-allocating an output through MLX's direct-MSL wrapper.
+``mx.fast.metal_kernel`` or allocating/casting the output in Python. It returns
+the MLX graph output that aliases the caller-owned buffer; evaluating that
+returned value schedules the write, and the caller-owned ``out`` observes the
+same storage afterward. The historical no-``out`` API is retired because it
+could only be implemented by allocating an output through MLX's direct-MSL
+wrapper.
 """
 
 from __future__ import annotations
@@ -61,16 +64,14 @@ FP8_PATH_C_LEGACY_MLX_FAST_ENV = "CPPMEGA_FP8_PATH_C_LEGACY_MLX_FAST"
 # toggled by the env var ``TILELANG_DISABLE_FP8_DOT4_AUTO``; we don't
 # override that env var here.
 _FP8_VECMAT_PATH_C_CANDIDATE_PASS_CONFIGS: dict[str, Any] = {
-    # The current Metal scalar/CSE pipeline can produce an invalid one-element
-    # SeqStmt around the canonical C[col] write in this reducer. This kernel
-    # does not need CSE: diagnostic source inspection fuses in the canonical
-    # packed hot loop, and the owner-output route already emits one
-    # dot4/simd_sum body. Keep the gate per-kernel rather than disabling CSE
-    # globally.
-    "tirx.disable_cse_tir": True,
+    # MLX native TVM-FFI already performs static ABI shape/dtype/layout checks
+    # when binding DLTensor views.  The generated TVM C-host wrapper otherwise
+    # repeats that validation on every tiny GEMV launch and dominates runtime.
+    "tirx.disable_assert": True,
     # Z3 idea #4 — discharges ``if (i < N)`` guards the analyzer can prove.
-    # The M=1 vecmat hot loop has tight static extents so the prover tends
-    # to succeed; if not, the guard stays.
+    # The M=1 vecmat hot loop has tight static extents. Leave CSE enabled so
+    # TileLang hoists the global row and dot4 word index instead of repeating
+    # grid/thread arithmetic in every FP8 dot4 iteration.
     "tl.drop_provable_bound_checks": True,
 }
 
@@ -461,15 +462,10 @@ def make_fp8_vecmat_reduce_kernel(
                         C[col] = reduced[0] * A_scale[0] * B_scale[col]
 
     elif _uses_fp8_dot4_packed_macro(vec=vec, K=K):
-        # Fix-1 + Fix-A re-application: ensure the Path C Metal FP8 ops
-        # (notably ``tirx.metal.fp8_e4m3_dot4``) are registered before we
-        # parse the macro PrimFunc. Without this we get an opaque FFI
-        # ``AttributeError`` deep in the lowering pipeline; with it we get
-        # a clear ``RuntimeError`` naming the missing intrinsic.
-        # grok design P2: cache the result so we run the registration
-        # scan once per process instead of on every kernel build. Failure
-        # still raises (the intrinsic is required for correctness); only
-        # the *successful* check is cached.
+        # Keep the diagnostic reducer on the public TileLang intrinsic surface.
+        # The actual dot4/simd_sum shape is now selected by TileLang's
+        # FP8 marker late-lowerer rather than by spelling Metal intrinsics in
+        # cppmega's Python IR builder.
         _ensure_path_c_metal_fp8_intrinsics_registered()
 
         @T.prim_func
@@ -483,32 +479,18 @@ def make_fp8_vecmat_reduce_kernel(
             with T.Kernel(
                 T.ceildiv(_FP8_VM_N, _FP8_VM_NP), threads=_FP8_VM_RT * _FP8_VM_NP
             ) as bx:
-                accum = T.alloc_local((1,), "float32")
-                lane = T.get_thread_binding(0)
-                kr = T.floormod(lane, _FP8_VM_RT)
-                ni = T.floordiv(lane, _FP8_VM_RT)
-                col = bx * _FP8_VM_NP + ni
-                T.clear(accum)
-                for ko in T.unroll(
-                    0,
-                    T.ceildiv(_FP8_VM_K_WORDS, _FP8_VM_RT),
-                    explicit=False,
-                    unroll_factor=4,
-                ):
-                    i = ko * _FP8_VM_RT + kr
-                    if col < _FP8_VM_N and i < _FP8_VM_K_WORDS:
-                        accum[0] += T.metal_fp8_e4m3_dot4(
-                            T.access_ptr(A[0, 0], "r", extent=_FP8_VM_K),
-                            T.access_ptr(B[col, 0], "r", extent=_FP8_VM_K),
-                            i,
-                            i,
-                        )
-                reduced = T.call_intrin("float32", "tir.metal.simd_sum", accum[0])
-                if kr == 0 and col < _FP8_VM_N:
-                    if _FP8_VM_SW == 1:
-                        C[0, col] = reduced * A_scale[0] * B_scale[0]
-                    else:
-                        C[0, col] = reduced * A_scale[0] * B_scale[col]
+                T.fp8_scaled_matmul(
+                    A,
+                    A_scale,
+                    B,
+                    B_scale,
+                    C,
+                    transpose_B=True,
+                    c_col_offset=bx * _FP8_VM_NP,
+                    simd_group_width=_FP8_VM_RT,
+                    outputs_per_block=_FP8_VM_NP,
+                    accumulate=False,
+                )
 
     else:
 
@@ -654,15 +636,6 @@ def lower_fp8_vecmat_msl(
             pass_configs=pass_configs or None,
         ),
     )
-    lowering, _output_shape = _fuse_canonical_vecmat_runtime_body(
-        lowering,
-        N=N,
-        K=K,
-        reduce_threads=reduce_threads,
-        vec=vec,
-        scale_w_per_row=scale_w_per_row,
-        vectorized_loads=vectorized_loads,
-    )
     return lowering.msl_text
 
 
@@ -704,7 +677,9 @@ def fp8_vecmat_msl_features(msl: str) -> dict[str, int]:
         "uint_pointer": body.count("uint*"),
         "uchar4": body_lowered.count("uchar4"),
         "fp8_e4m3_lut": body.count("fp8_e4m3fn_lut"),
-        "metal_fp8_dot4_helper": body.count("__tvm_fp8_e4m3_dot4_packed"),
+        "metal_fp8_dot4_helper": body.count("__tvm_fp8_e4m3_dot4_packed")
+        + body.count("__tvm_fp8_e4m3_dot4_words")
+        + body.count("__tvm_fp8_e4m3fn_lut["),
         "packed_uint_loads": packed_uint_loads,
         "scalar_fp8_byte_decode": scalar_decode_sites,
         "scalar_fp8_byte_decode_calls": scalar_decode_sites,
@@ -758,12 +733,13 @@ def _make_fp8_vecmat_direct_kernel(
 
     The ABI is intentionally flat:
 
-    * ``A`` is the existing ``(K,)`` MLX uint8/e4m3 buffer.
+    * ``A`` is the existing ``(K,)`` MLX uint8/e4m3 buffer, viewed by the
+      TileLang ABI as ``(1, K)``.
     * ``B`` is the existing ``(N, K)`` MLX uint8/e4m3 buffer.
     * ``C`` is the caller-owned ``(N,)`` output buffer.
 
     No reshape, allocation, or Python-side cast is needed before the DLPack
-    handoff.
+    handoff; the tvm-ffi adapter carries the ABI shape separately.
     """
 
     _validate_shape(
@@ -798,42 +774,28 @@ def _make_fp8_vecmat_direct_kernel(
 
     @T.prim_func
     def fp8_vecmat_reduce_direct(
-        A: T.Tensor((_FP8_VM_K,), "float8_e4m3"),
+        A: T.Tensor((1, _FP8_VM_K), "float8_e4m3"),
         A_scale: T.Tensor((1,), "float32"),
         B: T.Tensor((_FP8_VM_N, _FP8_VM_K), "float8_e4m3"),
         B_scale: T.Tensor((_FP8_VM_SW,), "float32"),
-        C: T.Tensor((_FP8_VM_N,), _FP8_VM_C_DTYPE),
+        C: T.Tensor((1, _FP8_VM_N), _FP8_VM_C_DTYPE),
     ):
         with T.Kernel(
             T.ceildiv(_FP8_VM_N, _FP8_VM_NP),
             threads=_FP8_VM_RT * _FP8_VM_NP,
         ) as bx:
-            accum = T.alloc_local((1,), "float32")
-            lane = T.get_thread_binding(0)
-            kr = T.floormod(lane, _FP8_VM_RT)
-            ni = T.floordiv(lane, _FP8_VM_RT)
-            col = bx * _FP8_VM_NP + ni
-            T.clear(accum)
-            for ko in T.unroll(
-                0,
-                T.ceildiv(_FP8_VM_K_WORDS, _FP8_VM_RT),
-                explicit=False,
-                unroll_factor=4,
-            ):
-                word_i = ko * _FP8_VM_RT + kr
-                if col < _FP8_VM_N and word_i < _FP8_VM_K_WORDS:
-                    accum[0] += T.metal_fp8_e4m3_dot4(
-                        T.access_ptr(A[0], "r", extent=_FP8_VM_K),
-                        T.access_ptr(B[col, 0], "r", extent=_FP8_VM_K),
-                        word_i,
-                        word_i,
-                    )
-            reduced = T.call_intrin("float32", "tir.metal.simd_sum", accum[0])
-            if kr == 0 and col < _FP8_VM_N:
-                if _FP8_VM_SW == 1:
-                    C[col] = reduced * A_scale[0] * B_scale[0]
-                else:
-                    C[col] = reduced * A_scale[0] * B_scale[col]
+            T.fp8_scaled_matmul(
+                A,
+                A_scale,
+                B,
+                B_scale,
+                C,
+                transpose_B=True,
+                c_col_offset=bx * _FP8_VM_NP,
+                simd_group_width=_FP8_VM_RT,
+                outputs_per_block=_FP8_VM_NP,
+                accumulate=False,
+            )
 
     try:
         from tilelang.transform.simplify import apply_simplify
@@ -1120,7 +1082,14 @@ def fp8_scaled_vecmat_path_c_direct(
         ) from exc
 
     try:
-        returned = kernel(A, A_scale, B, B_scale, C)
+        returned = kernel(
+            A,
+            A_scale,
+            B,
+            B_scale,
+            C,
+            _tilelang_mlx_async_owner_outputs=True,
+        )
     except Exception as exc:
         try:
             from tilelang.contrib.mlx_interop import DLPackInteropError
@@ -1131,11 +1100,7 @@ def fp8_scaled_vecmat_path_c_direct(
         raise FP8VecmatPathCDirectError(
             f"direct tvm-ffi FP8 vecmat dispatch failed: {type(exc).__name__}: {exc}"
         ) from exc
-    if returned is not C:
-        raise FP8VecmatPathCDirectError(
-            "direct tvm-ffi FP8 vecmat did not return the caller-owned output"
-        )
-    return C
+    return returned
 
 
 def fp8_scaled_vecmat_path_c(
@@ -1154,9 +1119,10 @@ def fp8_scaled_vecmat_path_c(
     ``x_fp8`` is ``(K,)`` uint8 e4m3 storage and ``W_fp8`` is transposed
     ``(N, K)`` storage, matching Path B. ``scale_x`` is scalar; ``scale_w`` may
     be scalar or per-output ``(N,)``. When ``out`` is provided, dispatches via
-    tvm-ffi into that caller-owned output and returns the same object. Without
-    ``out``, this function fails explicitly: there is no non-owner-output Path C
-    dispatch surface.
+    tvm-ffi into that caller-owned output and returns the MLX graph output that
+    aliases ``out``. Evaluating the returned value schedules the write; reading
+    ``out`` after that observes the same storage. Without ``out``, this function
+    fails explicitly: there is no non-owner-output Path C dispatch surface.
     """
 
     if out is not None:

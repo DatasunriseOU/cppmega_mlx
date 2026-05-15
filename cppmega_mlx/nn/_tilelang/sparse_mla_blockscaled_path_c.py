@@ -1497,8 +1497,8 @@ def sparse_mla_blockscaled_path_c_apply(
                 "tvm-ffi graph-output dispatch did not return out/lse"
             )
         return None
-    out = cast(mx.array, returned[0])
-    lse = cast(mx.array, returned[1])
+    out = cast(mx.array, returned[0]).reshape((batch, seq_len, heads, d_v_resolved))
+    lse = cast(mx.array, returned[1]).reshape((batch, seq_len, heads))
     if return_lse:
         return out, lse
     return out

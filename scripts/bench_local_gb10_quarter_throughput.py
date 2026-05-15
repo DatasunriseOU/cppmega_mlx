@@ -61,8 +61,13 @@ from cppmega_mlx.recipes.model_factory import (  # noqa: E402
 from cppmega_mlx.runtime.kernel_policy import get_dispatch_log  # noqa: E402
 from cppmega_mlx.training.loss import next_token_cut_cross_entropy  # noqa: E402
 from cppmega_mlx.training.optimizers import (  # noqa: E402
+    make_adamw,
     make_lion,
     make_muon,
+)
+from cppmega_mlx.training.optimizers_quantized import (  # noqa: E402
+    make_adam8bit,
+    make_lion8bit,
 )
 
 
@@ -75,7 +80,7 @@ DEFAULT_MEMORY_CAP_GB = 88.0
 DEFAULT_VOCAB_SIZE = LOCAL_GB10_QUARTER_VOCAB_SIZE
 DEFAULT_SEED = 4096
 
-OPTIMIZER_CHOICES = ("lion", "muon_adamw")
+OPTIMIZER_CHOICES = ("lion", "muon_adamw", "adamw", "adam8bit", "lion8bit")
 PATH_CHOICES = ("auto", "ref", "path_b")
 
 LION_KWARGS: dict[str, Any] = {
@@ -368,6 +373,12 @@ def make_optimizer(optimizer_key: str):
         return make_lion(**LION_KWARGS)
     if optimizer_key == "muon_adamw":
         return make_muon(**MUON_KWARGS)
+    if optimizer_key == "adamw":
+        return make_adamw(learning_rate=3e-4, betas=[0.9, 0.95], weight_decay=0.1)
+    if optimizer_key == "adam8bit":
+        return make_adam8bit(learning_rate=3e-4, betas=[0.9, 0.95], weight_decay=0.1)
+    if optimizer_key == "lion8bit":
+        return make_lion8bit(learning_rate=3e-3, betas=[0.9, 0.99], weight_decay=0.1)
     raise ValueError(f"unknown optimizer key {optimizer_key!r}")
 
 

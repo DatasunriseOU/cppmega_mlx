@@ -1309,9 +1309,10 @@ def topk_selector(
         k: number of top entries to select.
         starts: optional (B,) int32 starts for per-row mask.
         ends: optional (B,) int32 ends for per-row mask.
-        backend: ``"auto"`` (default) tries direct-MSL Path B before the
-            pure-MLX reference; it does not route through Path C because this
-            public entry point has no owner-output buffer;
+        backend: ``"auto"`` (default) tries TileLang Path C first, allocating
+            the public result buffer itself when the no-output compatibility
+            route is disabled, then falls back to direct-MSL Path B and the
+            pure-MLX reference;
             ``"metal"`` requires the Path B kernel and raises on fallback;
             ``"tilelang"`` / ``"path_c"`` require the owner-output Path C
             helper and therefore fail closed from this no-``out`` API;
@@ -1332,8 +1333,15 @@ def topk_selector(
         if out is None:
             raise RuntimeError("topk_selector: TileLang Path C path unavailable")
         return out
-    # auto has no owner-output parameter, so it cannot honestly use the direct
-    # Path C tvm-ffi route. Keep no-out AUTO on Path B or the pure-MLX reference.
+    out = topk_selector_tilelang(scores, k, starts=starts, ends=ends)
+    if out is not None:
+        return out
+    if starts is None and ends is None:
+        try:
+            owner_out = mx.zeros((int(scores.shape[0]), int(k)), dtype=mx.int32)
+            return topk_selector_tilelang_direct(scores, k, out=owner_out)
+        except TopKPathCDirectError:
+            pass
     out = topk_selector_metal(scores, k, starts=starts, ends=ends)
     if out is not None:
         return out

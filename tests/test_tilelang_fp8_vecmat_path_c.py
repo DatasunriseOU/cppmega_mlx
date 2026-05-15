@@ -90,21 +90,22 @@ def test_lowered_default_reducer_contains_kernel_and_packed_lut_decode() -> None
     msl = lower_fp8_vecmat_msl(N=128, K=128)
     features = fp8_vecmat_msl_features(msl)
     assert features["kernel_void"] >= 1
-    assert features["fp8_e4m3_lut"] > 0
-    assert features["metal_fp8_dot4_helper"] == 0
+    assert features["metal_fp8_dot4_helper"] > 0
+    assert features["packed_uint_loads"] > 0
     assert features["scalar_fp8_byte_decode_calls"] == 0
-    assert "thread_position_in_grid.x" in msl
+    assert "thread_position_in_grid.x" not in msl
+    assert "blockIdx.x" in msl or "gridThreadIdx.x" in msl
 
 
 def test_lowered_default_reducer_uses_packed_uint_loads_and_simd_sum() -> None:
     _require_fp8_vecmat_path_c_available()
     msl = lower_fp8_vecmat_msl(N=128, K=128)
     features = fp8_vecmat_msl_features(msl)
-    assert features["reinterpret_cast"] > 0
-    assert features["device_const_uint"] > 0
+    assert features["packed_uint_loads"] > 0
+    assert features["metal_fp8_dot4_helper"] > 0
     assert features["simd_sum"] > 0
     assert features["simd_shuffle_down"] == 0
-    assert features["fp8_e4m3_lut"] > 0
+    assert features["scalar_fp8_byte_decode_calls"] == 0
 
 
 def test_lowered_default_reducer_uses_per_row_b_scale() -> None:
@@ -124,10 +125,8 @@ def test_lowered_default_reducer_reports_path_b_fast_path_ready() -> None:
     assert blockers["missing"] == []
     assert features["simd_shuffle_down"] == 0
     assert features["simd_sum"] > 0
-    assert features["reinterpret_cast"] > 0
-    assert features["device_const_uint"] > 0
-    assert features["fp8_e4m3_lut"] > 0
-    assert features["metal_fp8_dot4_helper"] == 0
+    assert features["packed_uint_loads"] > 0
+    assert features["metal_fp8_dot4_helper"] > 0
     assert features["scalar_fp8_byte_decode_calls"] == 0
 
 
@@ -164,11 +163,15 @@ def test_runtime_source_uses_canonical_body_without_fast_tuple_dispatch() -> Non
         vec=4,
         scale_w_per_row=True,
     )
-    assert "thread_position_in_grid.x" in msl
-    assert "blockIdx.x" not in msl
-    assert "__tvm_fp8_e4m3_dot4_packed" not in msl
-    assert "simd_sum(sum)" in msl
-    assert "device const uint* A4 = reinterpret_cast<device const uint*>(A)" in msl
+    assert "thread_position_in_grid.x" not in msl
+    assert "blockIdx.x" in msl or "gridThreadIdx.x" in msl
+    assert (
+        "__tvm_fp8_e4m3_dot4_packed" in msl
+        or "__tvm_fp8_e4m3_dot4_words" in msl
+    )
+    assert "simd_sum(" in msl
+    assert "device const uint* A4 = reinterpret_cast<device const uint*>(A)" not in msl
+    assert "device const uint* B4 = reinterpret_cast<device const uint*>(B" not in msl
 
 
 def test_fp8_e4m3_dot4_intrinsic_is_registered() -> None:
@@ -343,10 +346,12 @@ def test_fp8_matmul_direct_path_uses_owner_output_without_mlx_fast_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[tuple[object, ...]] = []
+    call_kwargs: list[dict[str, object]] = []
 
     class RecordingKernel:
-        def __call__(self, *args: object) -> object:
+        def __call__(self, *args: object, **kwargs: object) -> object:
             calls.append(args)
+            call_kwargs.append(kwargs)
             return args[-1]
 
     monkeypatch.setattr(fp8_matmul_mod, "can_run_metal", lambda: True)
@@ -491,10 +496,12 @@ def test_fp8_vecmat_direct_path_uses_owner_output_without_mlx_fast_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[tuple[object, ...]] = []
+    call_kwargs: list[dict[str, object]] = []
 
     class RecordingKernel:
-        def __call__(self, *args: object) -> object:
+        def __call__(self, *args: object, **kwargs: object) -> object:
             calls.append(args)
+            call_kwargs.append(kwargs)
             return args[-1]
 
     monkeypatch.setattr(fp8_vecmat_mod, "can_run_metal", lambda: True)
@@ -521,6 +528,9 @@ def test_fp8_vecmat_direct_path_uses_owner_output_without_mlx_fast_fallback(
         assert returned is out
 
     assert len(calls) == len(_owner_output_dtypes())
+    assert all(
+        call.get("_tilelang_mlx_async_owner_outputs") is True for call in call_kwargs
+    )
     for call in calls:
         assert call[0] is x
         assert call[1] is scale_x
@@ -535,7 +545,7 @@ def test_fp8_vecmat_direct_path_propagates_typed_dlpack_failure(
     DLPackConversionError = _dlpack_conversion_error_type()
 
     class FailingKernel:
-        def __call__(self, *_: object) -> object:
+        def __call__(self, *_: object, **__: object) -> object:
             raise DLPackConversionError("MLX array import failed: wrong device")
 
     monkeypatch.setattr(fp8_vecmat_mod, "can_run_metal", lambda: True)
@@ -655,9 +665,9 @@ def test_fp8_vecmat_direct_tvm_ffi_reuses_owner_output_and_matches_path_b() -> N
             out=out,
         )
         expected = path_b.astype(dtype).astype(mx.float32)
-        mx.eval(out, expected)
+        mx.eval(returned, expected)
 
-        assert returned is out
+        assert returned is not out
         np.testing.assert_allclose(
             np.asarray(out.astype(mx.float32)),
             np.asarray(expected),
