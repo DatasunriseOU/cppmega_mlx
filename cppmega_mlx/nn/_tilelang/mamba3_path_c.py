@@ -85,6 +85,7 @@ the closure-walk path entirely.
 
 from dataclasses import dataclass
 from functools import lru_cache
+import atexit
 import json
 import math
 import os
@@ -1488,6 +1489,191 @@ def _bwd_simd_reduce_kernel_for(
     return kernel, lowering
 
 
+@lru_cache(maxsize=128)
+def _bwd_simd_reduce_kernel_for_state_snapshots(
+    BATCH: int,
+    SEQ: int,
+    HEADS: int,
+    HEADDIM: int,
+    STATE: int,
+    dy_dtype: str = "float32",
+    x_dtype: str = "float32",
+    B_dtype: str = "float32",
+    C_dtype: str = "float32",
+    z_dtype: str = "float32",
+    A_dtype: str = "float32",
+    dt_dtype: str = "float32",
+    D_dtype: str = "float32",
+    dx_dtype: str = "float32",
+    dz_dtype: str = "float32",
+    dB_dtype: str = "float32",
+    dC_dtype: str = "float32",
+    dA_dtype: str = "float32",
+    ddt_dtype: str = "float32",
+    dD_dtype: str = "float32",
+    dh0_dtype: str = "float32",
+) -> tuple[Any, _msl_transform.TileLangMSLLowering]:
+    """Build a P-reduced bwd kernel that consumes stable state snapshots."""
+
+    if not _bwd_simd_p_reduction_supported(
+        batch=BATCH,
+        heads=HEADS,
+        headdim=HEADDIM,
+    ):
+        raise MSLDispatchUnsupported(
+            "Mamba3 Path C snapshot SIMD P-reduction requires HEADDIM to be a "
+            "multiple of 32 with threadgroups aligned to full P rows"
+        )
+
+    import tilelang.language as T
+
+    LANES = BATCH * HEADS * HEADDIM
+    THREADS = _threads_for(LANES)
+    BLOCK = _BWD_SNAPSHOT_BLOCK
+    BLOCKS = (SEQ + BLOCK - 1) // BLOCK
+    accum_dtype = "float32"
+
+    @T.prim_func
+    def bwd_snap_simd(
+        dy: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), dy_dtype),
+        x: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), x_dtype),
+        B: T.Tensor((BATCH, SEQ, HEADS, STATE), B_dtype),
+        C: T.Tensor((BATCH, SEQ, HEADS, STATE), C_dtype),
+        z: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), z_dtype),
+        A: T.Tensor((BATCH, SEQ, HEADS), A_dtype),
+        dt: T.Tensor((BATCH, SEQ, HEADS), dt_dtype),
+        D: T.Tensor((HEADS,), D_dtype),
+        h_snap: T.Tensor((BATCH, BLOCKS + 1, HEADS, HEADDIM, STATE), "float32"),
+        dx: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), dx_dtype),
+        dz: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), dz_dtype),
+        dB: T.Tensor((BATCH, SEQ, HEADS, STATE), dB_dtype),
+        dC: T.Tensor((BATCH, SEQ, HEADS, STATE), dC_dtype),
+        dA: T.Tensor((BATCH, SEQ, HEADS), dA_dtype),
+        ddt: T.Tensor((BATCH, SEQ, HEADS), ddt_dtype),
+        dD_batch: T.Tensor((BATCH, HEADS), dD_dtype),
+        dh0: T.Tensor((BATCH, HEADS, HEADDIM, STATE), dh0_dtype),
+    ):
+        with T.Kernel(T.ceildiv(LANES, THREADS), threads=THREADS) as bx:
+            tid = T.get_thread_binding(0)
+            global_lane = bx * THREADS + tid
+            h_state = T.alloc_local((STATE,), accum_dtype)
+            dh = T.alloc_local((STATE,), accum_dtype)
+            if global_lane < LANES:
+                p = global_lane % HEADDIM
+                h = (global_lane // HEADDIM) % HEADS
+                b = global_lane // (HEADDIM * HEADS)
+
+                for n in T.serial(STATE):
+                    dh[n] = 0.0
+                dD_acc = T.alloc_var(T.float32, init=0.0)
+                D_h = T.cast(D[h], accum_dtype)
+
+                for rb in T.serial(BLOCKS):
+                    block = BLOCKS - 1 - rb
+                    block_start = block * BLOCK
+                    block_end = (block + 1) * BLOCK
+                    for n in T.serial(STATE):
+                        h_state[n] = h_snap[b, block + 1, h, p, n]
+
+                    for step in T.serial(BLOCK):
+                        t = block_end - 1 - step
+                        if t < SEQ and t >= block_start:
+                            A_val = T.cast(A[b, t, h], accum_dtype)
+                            dt_val = T.cast(dt[b, t, h], accum_dtype)
+                            decay = T.exp(A_val * dt_val)
+                            x_val = T.cast(x[b, t, h, p], accum_dtype)
+                            z_val = T.cast(z[b, t, h, p], accum_dtype)
+                            dY = T.cast(dy[b, t, h, p], accum_dtype)
+
+                            y_state = T.alloc_var(T.float32, init=0.0)
+                            for n in T.serial(STATE):
+                                y_state += h_state[n] * T.cast(
+                                    C[b, t, h, n],
+                                    accum_dtype,
+                                )
+                            y_skipped = y_state + D_h * x_val
+                            sig_z = T.alloc_var(T.float32, init=0.0)
+                            if z_val >= 0.0:
+                                sig_z = 1.0 / (1.0 + T.exp(-z_val))
+                            else:
+                                sig_z = T.exp(z_val)
+                                sig_z = sig_z / (1.0 + sig_z)
+                            silu_z = z_val * sig_z
+                            silu_dz = sig_z * (1.0 + z_val * (1.0 - sig_z))
+
+                            d_silu = dY * y_skipped
+                            d_y_skipped = dY * silu_z
+
+                            dz[b, t, h, p] = T.cast(d_silu * silu_dz, dz_dtype)
+                            dD_acc += d_y_skipped * x_val
+
+                            dx_inp = T.alloc_var(T.float32, init=0.0)
+                            d_decay = T.alloc_var(T.float32, init=0.0)
+                            for n in T.serial(STATE):
+                                C_val = T.cast(C[b, t, h, n], accum_dtype)
+                                B_val = T.cast(B[b, t, h, n], accum_dtype)
+                                h_prev = h_snap[b, block, h, p, n]
+                                dh_n = dh[n] + d_y_skipped * C_val
+                                dC_sum = T.alloc_local((1,), accum_dtype)
+                                dB_sum = T.alloc_local((1,), accum_dtype)
+                                T.thread_allreduce_sum(
+                                    d_y_skipped * h_state[n],
+                                    dC_sum[0],
+                                    p,
+                                )
+                                T.thread_allreduce_sum(dh_n * x_val, dB_sum[0], p)
+                                if p == 0:
+                                    dC[b, t, h, n] = T.cast(dC_sum[0], dC_dtype)
+                                    dB[b, t, h, n] = T.cast(dB_sum[0], dB_dtype)
+                                dx_inp += dh_n * B_val
+                                d_decay += dh_n * h_prev
+                                dh[n] = dh_n * decay
+                                h_state[n] = h_prev
+
+                            dx_skip = d_y_skipped * D_h
+                            dx[b, t, h, p] = T.cast(dx_skip + dx_inp, dx_dtype)
+
+                            d_logdecay = d_decay * decay
+                            dA_lane = d_logdecay * dt_val
+                            ddt_lane = d_logdecay * A_val
+                            dA_sum = T.alloc_local((1,), accum_dtype)
+                            ddt_sum = T.alloc_local((1,), accum_dtype)
+                            T.thread_allreduce_sum(dA_lane, dA_sum[0], p)
+                            T.thread_allreduce_sum(ddt_lane, ddt_sum[0], p)
+                            if p == 0:
+                                dA[b, t, h] = T.cast(dA_sum[0], dA_dtype)
+                                ddt[b, t, h] = T.cast(ddt_sum[0], ddt_dtype)
+
+                for n in T.serial(STATE):
+                    dh0[b, h, p, n] = T.cast(dh[n], dh0_dtype)
+                dD_sum = T.alloc_local((1,), accum_dtype)
+                T.thread_allreduce_sum(dD_acc, dD_sum[0], p)
+                if p == 0:
+                    dD_batch[b, h] = T.cast(dD_sum[0], dD_dtype)
+
+    artifact = dispatch_lower(bwd_snap_simd, target="metal", return_msl=True)
+    if hasattr(artifact, "_tilelang_engine_target"):
+        raise MSLDispatchUnsupported("Mamba3 Path C requires TileLang MSL extraction metadata")
+    lowering = cast(_msl_transform.TileLangMSLLowering, artifact)
+    input_names = [
+        name for name in lowering.buffer_param_names if name not in _BWD_SIMD_OUTPUT_NAMES
+    ]
+    if set(input_names) != {"dy", "x", "B", "C", "z", "A", "dt", "D", "h_snap"}:
+        raise MSLDispatchUnsupported(
+            "unexpected Mamba3 Path C snapshot simd bwd buffer signature: "
+            + ", ".join(lowering.buffer_param_names)
+        )
+    import tilelang
+
+    kernel = tilelang.compile(
+        bwd_snap_simd,
+        target=_msl_transform._as_metal_target("metal"),
+        execution_backend="tvm_ffi",
+        out_idx=list(_BWD_SIMD_OUTPUT_IDX),
+    )
+    return kernel, lowering
+
+
 # ---------------------------------------------------------------------------
 # Public dispatch entry points
 # ---------------------------------------------------------------------------
@@ -1787,35 +1973,86 @@ def _mamba3_mimo_bwd_path_c_simd_kernel(
         )
 
     try:
-        kernel, lowering = _bwd_simd_reduce_kernel_for(
-            batch,
-            seq,
-            heads,
-            headdim,
-            state,
-            dtypes["dy"],
-            dtypes["x"],
-            dtypes["B"],
-            dtypes["C"],
-            dtypes["z"],
-            dtypes["A"],
-            dtypes["dt"],
-            dtypes["D"],
-            dtypes["h0"],
-            "float32",
-            "float32",
-            "float32",
-            "float32",
-            "float32",
-            "float32",
-            "float32",
-            "float32",
-        )
+        if seq > _BWD_SNAPSHOT_BLOCK:
+            snapshot_kernel, snapshot_lowering = _bwd_state_snapshots_kernel_for(
+                batch,
+                seq,
+                heads,
+                headdim,
+                state,
+                dtypes["x"],
+                dtypes["B"],
+                dtypes["A"],
+                dtypes["dt"],
+                dtypes["h0"],
+            )
+            kernel, lowering = _bwd_simd_reduce_kernel_for_state_snapshots(
+                batch,
+                seq,
+                heads,
+                headdim,
+                state,
+                dtypes["dy"],
+                dtypes["x"],
+                dtypes["B"],
+                dtypes["C"],
+                dtypes["z"],
+                dtypes["A"],
+                dtypes["dt"],
+                dtypes["D"],
+                "float32",
+                "float32",
+                "float32",
+                "float32",
+                "float32",
+                "float32",
+                "float32",
+                "float32",
+            )
+        else:
+            snapshot_kernel = None
+            snapshot_lowering = None
+            kernel, lowering = _bwd_simd_reduce_kernel_for(
+                batch,
+                seq,
+                heads,
+                headdim,
+                state,
+                dtypes["dy"],
+                dtypes["x"],
+                dtypes["B"],
+                dtypes["C"],
+                dtypes["z"],
+                dtypes["A"],
+                dtypes["dt"],
+                dtypes["D"],
+                dtypes["h0"],
+                "float32",
+                "float32",
+                "float32",
+                "float32",
+                "float32",
+                "float32",
+                "float32",
+                "float32",
+            )
     except (MSLDispatchUnsupported, RuntimeError, ValueError) as exc:
         raise RuntimeError("mamba3_mimo_bwd_path_c simd lowering failed") from exc
 
     try:
-        out_list = kernel(dy, x, B, C, z, A, dt, D, h0)
+        if snapshot_kernel is None:
+            out_list = kernel(dy, x, B, C, z, A, dt, D, h0)
+        else:
+            snapshot_out = snapshot_kernel(x, B, A, dt, h0)
+            if isinstance(snapshot_out, mx.array):
+                h_snap = snapshot_out
+            elif isinstance(snapshot_out, (list, tuple)) and len(snapshot_out) == 1:
+                h_snap = snapshot_out[0]
+            else:
+                raise RuntimeError(
+                    "Mamba3 Path C snapshot tvm-ffi returned an invalid output tuple"
+                )
+            out_list = kernel(dy, x, B, C, z, A, dt, D, h_snap)
     except Exception as exc:
         _raise_if_dlpack_boundary_failure("mamba3_mimo_bwd_path_c", exc)
         raise RuntimeError("mamba3_mimo_bwd_path_c simd dispatch failed") from exc
@@ -1823,7 +2060,7 @@ def _mamba3_mimo_bwd_path_c_simd_kernel(
     if not isinstance(out_list, (list, tuple)) or len(out_list) != len(_BWD_SIMD_OUTPUT_NAMES):
         raise RuntimeError("Mamba3 Path C simd bwd tvm-ffi returned an invalid output tuple")
     dx_pc, dz_pc, dB_pc, dC_pc, dA_pc, ddt_pc, dD_bh, dh0_pc = out_list
-    del lowering
+    del lowering, snapshot_lowering
     dD_pc = mx.sum(dD_bh, axis=0)        # -> (H,)
     return (
         _astype_if_needed(dx_pc, x.dtype),
@@ -2402,6 +2639,24 @@ def dump_lowered_bwd_msl(
         )
     del kernel
     return _source_with_reused_scalar_bindings(lowering)
+
+
+def _clear_mamba3_path_c_caches() -> None:
+    """Release cached TileLang kernels before native leak checkers run."""
+
+    for cached_fn in (
+        mamba3_path_c_schedule_plan,
+        _fwd_kernel_for,
+        _bwd_kernel_for,
+        _bwd_state_snapshots_kernel_for,
+        _bwd_kernel_for_state_snapshots,
+        _bwd_simd_reduce_kernel_for,
+        _bwd_simd_reduce_kernel_for_state_snapshots,
+    ):
+        cached_fn.cache_clear()
+
+
+atexit.register(_clear_mamba3_path_c_caches)
 
 
 __all__ = [
