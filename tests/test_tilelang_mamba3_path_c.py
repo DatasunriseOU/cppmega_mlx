@@ -26,6 +26,8 @@ import numpy as np
 import pytest
 
 import mlx.core as mx
+import mlx.nn as nn
+from mlx.utils import tree_map
 
 import cppmega_mlx.nn._tilelang.mamba3_path_c as mamba3_path_c
 from cppmega_mlx.nn._tilelang import (
@@ -88,6 +90,84 @@ def _make_inputs(
     h0 = mx.zeros((batch, heads, headdim, state), dtype=dtype)
     mx.eval(x, B, C, z, A, dt, D, h0)
     return x, B, C, z, A, dt, D, h0
+
+
+def _make_mamba3_projection_inputs(
+    *,
+    d_model: int,
+    seq: int,
+    dtype: mx.Dtype,
+) -> tuple[mx.array, ...]:
+    """Build post-projection tensors at the Mamba3 scan contract."""
+
+    from cppmega_mlx.nn.mamba3 import (
+        Mamba3Config,
+        Mamba3ReferenceBlock,
+        _apply_rope_on_state_dim,
+        _broadcast_groups_to_heads,
+        _compute_trapezoidal_scale,
+        _heads_to_group_scale,
+        _split_by_sizes,
+        causal_depthwise_conv1d,
+    )
+
+    cfg = Mamba3Config(
+        d_model=d_model,
+        expand=2,
+        headdim=64,
+        d_state=16,
+        ngroups=1,
+        chunk_size=128,
+    )
+    block = Mamba3ReferenceBlock(cfg)
+    block.update(
+        tree_map(
+            lambda value: value.astype(dtype) if isinstance(value, mx.array) else value,
+            block.parameters(),
+        )
+    )
+
+    mx.random.seed(0)
+    hidden = (mx.random.normal((1, seq, cfg.d_model)) * 0.02).astype(dtype)
+    z, x, B, C, dd_dt, dd_A, trap, angles = block.split_in_proj(
+        block.in_proj(hidden)
+    )
+
+    xBC = mx.concatenate([x, B, C], axis=-1)
+    xBC = causal_depthwise_conv1d(
+        xBC,
+        block.conv_weight.astype(xBC.dtype),
+        block.conv_bias.astype(xBC.dtype),
+    )
+    x, B, C = _split_by_sizes(
+        nn.silu(xBC),
+        [cfg.d_inner, block.dims.d_bc, block.dims.d_bc],
+    )
+    x = x.reshape(1, seq, cfg.nheads, cfg.headdim)
+    z = z.reshape(1, seq, cfg.nheads, cfg.headdim)
+
+    B_mimo = B.reshape(1, seq, cfg.effective_mimo_rank, cfg.ngroups, cfg.d_state)
+    C_mimo = C.reshape(1, seq, cfg.effective_mimo_rank, cfg.ngroups, cfg.d_state)
+    B_mimo, C_mimo = block.transform_bc(B_mimo, C_mimo)
+    B = mx.mean(B_mimo, axis=2)
+    C = mx.mean(C_mimo, axis=2)
+
+    dt = nn.softplus(dd_dt + block.dt_bias.astype(dd_dt.dtype))
+    trap_scale = _compute_trapezoidal_scale(dt, trap)
+    B = B * _heads_to_group_scale(trap_scale, cfg.ngroups)[:, :, :, None]
+
+    angles = mx.broadcast_to(
+        angles[:, :, None, :],
+        (1, seq, cfg.nheads, block.dims.num_rope_angles),
+    )
+    angles_cumsum = mx.cumsum(angles * dt[:, :, :, None], axis=1)
+    B = _apply_rope_on_state_dim(B, angles_cumsum)
+    C = _apply_rope_on_state_dim(C, angles_cumsum)
+    B = _broadcast_groups_to_heads(B, cfg.nheads, "B")
+    C = _broadcast_groups_to_heads(C, cfg.nheads, "C")
+    A = mx.minimum(-nn.softplus(dd_A), -cfg.A_floor)
+    h0 = mx.zeros((1, cfg.nheads, cfg.headdim, cfg.d_state), dtype=dtype)
+    return x, B, C, z, A, dt, block.D.astype(dtype), h0
 
 
 # ---------------------------------------------------------------------------
@@ -812,6 +892,36 @@ def test_bwd_path_c_snapshot_route_survives_decay_underflow() -> None:
             rtol=1e-3,
             atol=1e-4,
             err_msg=f"underflow snapshot bwd grad mismatch on {name}",
+        )
+
+
+def test_bwd_path_c_long_model_bf16_uses_stable_snapshot_simd() -> None:
+    """Long model-shaped bf16 bwd must not use inverse-state SIMD recurrence."""
+
+    _require_mamba3_path_c()
+    inputs = _make_mamba3_projection_inputs(
+        d_model=1024,
+        seq=2048,
+        dtype=mx.bfloat16,
+    )
+    x, B, C, z, A, dt, D, h0 = inputs
+    mx.random.seed(123)
+    dy = (mx.random.normal(x.shape) * 0.01).astype(mx.bfloat16)
+    mx.eval(dy, *inputs)
+
+    g_pc = mamba3_mimo_bwd_path_c(dy, x, B, C, z, A, dt, D, h0)
+    g_pb = mamba3_mimo_bwd_metal(dy, x, B, C, z, A, dt, D, h0)
+    mx.eval(*g_pc, *g_pb)
+
+    names = ["dx", "dB", "dC", "dz", "dA", "ddt", "dD", "dh0"]
+    for name, gpc, gpb in zip(names, g_pc, g_pb, strict=True):
+        assert bool(mx.all(mx.isfinite(gpc.astype(mx.float32))).item())
+        np.testing.assert_allclose(
+            _np(gpc),
+            _np(gpb),
+            rtol=1e-1,
+            atol=5e-3,
+            err_msg=f"long model bf16 grad mismatch on {name}",
         )
 
 
