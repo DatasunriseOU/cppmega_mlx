@@ -897,7 +897,7 @@ def _packed_bwd_k_parallel_kernel_for(
             w_shared = T.alloc_shared((v_dim, v_dim), accum_dtype, scope="shared")
             dz_shared = T.alloc_shared((k_dim, v_dim), accum_dtype, scope="shared")
             h_prev_shared = T.alloc_shared((k_dim, v_dim), accum_dtype, scope="shared")
-            dxf_partial = T.alloc_shared((k_dim,), accum_dtype, scope="shared")
+            dxf_scratch = T.alloc_shared((k_dim,), accum_dtype, scope="shared")
             dW_shared = T.alloc_shared((v_dim, v_dim), accum_dtype, scope="shared")
 
             for i in T.serial(tid, v_dim * v_dim, step=threads):
@@ -962,7 +962,7 @@ def _packed_bwd_k_parallel_kernel_for(
                         dq_acc[0],
                         carrier_dtype,
                     )
-                    dxf_partial[tid] = df_kk[0]
+                    dxf_scratch[tid] = df_kk[0]
 
                     dk_acc = T.alloc_local((1,), accum_dtype)
                     dk_acc[0] = 0.0
@@ -981,7 +981,7 @@ def _packed_bwd_k_parallel_kernel_for(
                     df_total = T.alloc_local((1,), accum_dtype)
                     df_total[0] = 0.0
                     for kk in T.serial(k_dim):
-                        df_total[0] = df_total[0] + dxf_partial[kk]
+                        df_total[0] = df_total[0] + dxf_scratch[kk]
                     dxf[b, t, h] = T.cast(df_total[0], carrier_dtype)
 
                 if tid < v_dim:
@@ -1991,7 +1991,7 @@ def _mapped_packed_bwd_k_parallel_kernel_for(
             w_shared = T.alloc_shared((v_dim, v_dim), accum_dtype, scope="shared")
             dz_shared = T.alloc_shared((k_dim, v_dim), accum_dtype, scope="shared")
             h_prev_shared = T.alloc_shared((k_dim, v_dim), accum_dtype, scope="shared")
-            dxf_partial = T.alloc_shared((k_dim,), accum_dtype, scope="shared")
+            dxf_scratch = T.alloc_shared((k_dim,), accum_dtype, scope="shared")
             dW_shared = T.alloc_shared((v_dim, v_dim), accum_dtype, scope="shared")
 
             for i in T.serial(tid, v_dim * v_dim, step=threads):
@@ -2051,7 +2051,7 @@ def _mapped_packed_bwd_k_parallel_kernel_for(
                         dq_acc[0],
                         memory_order="relaxed",
                     )
-                    dxf_partial[tid] = df_kk[0]
+                    dxf_scratch[tid] = df_kk[0]
 
                     dk_acc = T.alloc_local((1,), accum_dtype)
                     dk_acc[0] = 0.0
@@ -2071,7 +2071,7 @@ def _mapped_packed_bwd_k_parallel_kernel_for(
                     df_total = T.alloc_local((1,), accum_dtype)
                     df_total[0] = 0.0
                     for kk in T.serial(k_dim):
-                        df_total[0] = df_total[0] + dxf_partial[kk]
+                        df_total[0] = df_total[0] + dxf_scratch[kk]
                     T.atomic_add(
                         dxf[b, t, f_src],
                         df_total[0],

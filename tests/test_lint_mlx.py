@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -345,6 +346,27 @@ def test_lint_production_direct_msl_and_monkeypatch_guardrails_are_green() -> No
     assert result.returncode == 0
     assert result.stdout == ""
     assert result.stderr == ""
+
+
+def test_lint_explains_legacy_direct_msl_reduction_allowlist() -> None:
+    result = run_lint("--explain-direct-msl-allowlist")
+
+    assert result.returncode == 0
+    assert result.stderr == ""
+    entries = json.loads(result.stdout)
+    by_path = {entry["path"]: entry for entry in entries}
+    mamba3 = by_path["cppmega_mlx/nn/_tilelang/mamba3.py"]
+    assert mamba3["kind"] == "legacy_path_b_fallback"
+    assert "slower on the checked-in receipt" in mamba3["reason"]
+    assert mamba3["replacement"].endswith("mamba3_path_c.py")
+    assert mamba3["public_partial_outputs"] == [
+        "dB_partial",
+        "dC_partial",
+        "dA_partial",
+        "ddt_partial",
+        "dD_partial",
+    ]
+    assert "host_sum" in mamba3["reduction_surface"]
 
 
 def test_lint_requires_custom_gradient_when_metal_kernel_enters_autodiff(

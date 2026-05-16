@@ -5,19 +5,63 @@ import argparse
 import ast
 from collections.abc import Iterable
 from dataclasses import dataclass
+import json
 from pathlib import Path
 import re
 
 
 _PYTHON_SUFFIX = ".py"
-_DIRECT_MSL_LEGACY_DEBUG_PATHS = {
-    ("cppmega_mlx", "nn", "_tilelang", "fp8_msl_kernels.py"),
-    ("cppmega_mlx", "nn", "_tilelang", "m2rnn.py"),
-    ("cppmega_mlx", "nn", "_tilelang", "mamba3.py"),
-    ("cppmega_mlx", "nn", "_tilelang", "sparse_mla.py"),
-    ("cppmega_mlx", "nn", "_tilelang", "sparse_mla_blockscaled.py"),
-    ("cppmega_mlx", "nn", "_tilelang", "topk_selector.py"),
+_DIRECT_MSL_LEGACY_DEBUG_ALLOWLIST: dict[tuple[str, ...], dict[str, object]] = {
+    ("cppmega_mlx", "nn", "_tilelang", "fp8_msl_kernels.py"): {
+        "kind": "legacy_path_b_baseline",
+        "reason": "Path B FP8 direct-MSL oracle while TileLang Path C owner-output routes are rolled out.",
+        "replacement": "cppmega_mlx/nn/_tilelang/fp8_vecmat_path_c.py and fp8_matmul_path_c.py",
+        "reduction_surface": ["simd_sum"],
+        "public_partial_outputs": [],
+    },
+    ("cppmega_mlx", "nn", "_tilelang", "m2rnn.py"): {
+        "kind": "legacy_path_b_baseline",
+        "reason": "Path B M2RNN fallback until all production shapes have Path C receipts.",
+        "replacement": "cppmega_mlx/nn/_tilelang/m2rnn_path_c.py",
+        "reduction_surface": ["threadgroup_internal_partial"],
+        "public_partial_outputs": [],
+    },
+    ("cppmega_mlx", "nn", "_tilelang", "mamba3.py"): {
+        "kind": "legacy_path_b_fallback",
+        "reason": "Path C Mamba3 bwd is finite but slower on the checked-in receipt, so AUTO keeps Path B.",
+        "replacement": "cppmega_mlx/nn/_tilelang/mamba3_path_c.py",
+        "reduction_surface": ["p_axis_public_partials", "host_sum"],
+        "public_partial_outputs": [
+            "dB_partial",
+            "dC_partial",
+            "dA_partial",
+            "ddt_partial",
+            "dD_partial",
+        ],
+    },
+    ("cppmega_mlx", "nn", "_tilelang", "sparse_mla.py"): {
+        "kind": "legacy_path_b_baseline",
+        "reason": "Path B sparse MLA baseline retained while dispatch/perf receipts transition to Path C.",
+        "replacement": "cppmega_mlx/nn/_tilelang/sparse_mla_path_c.py",
+        "reduction_surface": ["dkv_partial", "host_scatter_reduce"],
+        "public_partial_outputs": ["dkv_partial"],
+    },
+    ("cppmega_mlx", "nn", "_tilelang", "sparse_mla_blockscaled.py"): {
+        "kind": "legacy_path_b_baseline",
+        "reason": "Blockscaled sparse MLA still has direct-MSL fallback while Path C blockscaled routes mature.",
+        "replacement": "cppmega_mlx/nn/_tilelang/sparse_mla_blockscaled_path_c.py",
+        "reduction_surface": ["dkv_partial", "host_scatter_reduce"],
+        "public_partial_outputs": ["dkv_partial"],
+    },
+    ("cppmega_mlx", "nn", "_tilelang", "topk_selector.py"): {
+        "kind": "legacy_debug_baseline",
+        "reason": "Debug/Path B top-k selector baseline; new production paths must use TileLang/TVM-FFI.",
+        "replacement": "TileLang top-k selector Path C route",
+        "reduction_surface": [],
+        "public_partial_outputs": [],
+    },
 }
+_DIRECT_MSL_LEGACY_DEBUG_PATHS = set(_DIRECT_MSL_LEGACY_DEBUG_ALLOWLIST)
 _DIRECT_MSL_MARKER = re.compile(
     r"\b(legacy|debug|path\s+b|direct[- ]msl|raw[- ]msl)\b",
     re.IGNORECASE,
@@ -542,6 +586,18 @@ def lint_paths(paths: Iterable[Path], *, select: set[str] | None = None) -> list
     return findings
 
 
+def direct_msl_allowlist_entries() -> list[dict[str, object]]:
+    entries: list[dict[str, object]] = []
+    for path_tail, metadata in sorted(_DIRECT_MSL_LEGACY_DEBUG_ALLOWLIST.items()):
+        entries.append(
+            {
+                "path": "/".join(path_tail),
+                **metadata,
+            }
+        )
+    return entries
+
+
 def _parse_select(values: Iterable[str]) -> set[str] | None:
     rules = {
         rule.strip().upper()
@@ -563,12 +619,26 @@ def main(argv: list[str] | None = None) -> int:
         help="Comma-separated rule ids to report, for example MLX002,MLX005.",
     )
     parser.add_argument(
+        "--explain-direct-msl-allowlist",
+        action="store_true",
+        help=(
+            "Print the machine-readable reason for every legacy/debug direct-MSL "
+            "allowlist entry and exit."
+        ),
+    )
+    parser.add_argument(
         "paths",
-        nargs="+",
+        nargs="*",
         type=Path,
         help="Python files or directories to scan.",
     )
     args = parser.parse_args(argv)
+
+    if args.explain_direct_msl_allowlist:
+        print(json.dumps(direct_msl_allowlist_entries(), indent=2, sort_keys=True))
+        return 0
+    if not args.paths:
+        parser.error("paths are required unless --explain-direct-msl-allowlist is used")
 
     findings = lint_paths(args.paths, select=_parse_select(args.select))
     for finding in findings:

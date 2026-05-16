@@ -913,8 +913,6 @@ def _canonicalize_bwd_lane_indexing(
     msl = re.sub(r"d_out\[\({2,}\(gid \* (?P<dim>\d+)\) \+ d_1\)\]", r"d_out[(gid * \g<dim>) + d_1]", msl)
     msl = re.sub(r"d_out\[\({2,}\(gid \* (?P<dim>\d+)\) \+ \(kd % (?P=dim)\)\)\]", r"d_out[(gid * \g<dim>) + (kd % \g<dim>)]", msl)
     msl = re.sub(r"dq\[\({2,}\(gid \* (?P<dim>\d+)\) \+ d\)\]", r"dq[(gid * \g<dim>) + d]", msl)
-    msl = re.sub(r"dkv_partial\[\({2,}\(gid \* (?P<stride>\d+)\) \+ kd\)\]", r"dkv_partial[(gid * \g<stride>) + kd]", msl)
-
     # Drop tautological aliases (cf. fwd path) — ``int k = k;``, ``int kd = ...``,
     # ``int d_N = d;``. The outer ``for (uint k = tid; ...)`` already owns these.
     msl = re.sub(r"(?m)^[ \t]*int k = k;\n", "", msl)
@@ -996,7 +994,6 @@ def _canonicalize_bwd_residual_tmp_indexing(
 
     if d_v == qk_dim:
         msl = re.sub(r"(?m)^[ \t]*if \(\(kd % " + str(qk_dim) + r"\) < " + str(d_v) + r"\) \{\n", "", msl)
-        msl = re.sub(r"(?m)^[ \t]*\} else \{\n[ \t]*dkv_partial\[[^\n]+] = \(\(half\)acc\);\n[ \t]*\}\n", "", msl, count=1)
     else:
         msl = msl.replace(f"(({d_expr} / {threads}) < {d_v // threads})", f"({d_expr} < {d_v})")
 
@@ -1122,9 +1119,6 @@ def _insert_backward_all_masked_fast_return(
         + f"    for (int d = tid; d < {qk_dim}; d += threads) {{\n"
         + f"      dq[(gid * {qk_dim}) + d] = ((half)0.000000e+00f);\n"
         + "    }\n"
-        + f"    for (int kd = tid; kd < {topk * qk_dim}; kd += threads) {{\n"
-        + f"      dkv_partial[(gid * {topk * qk_dim}) + kd] = 0.000000e+00h;\n"
-        + "    }\n"
         + "    return;\n"
         + "  }\n"
     )
@@ -1202,149 +1196,11 @@ def _canonicalize_bwd_hot_loops(msl: str, *, qk_dim: int, d_v: int) -> str:
         msl,
         count=1,
     )
-    msl = re.sub(
-        r"(?P<indent>[ \t]*)if \(gather_idx < 0\) \{\n"
-        r"(?P=indent)  dkv_partial\[(?P<out>[^\n]+)\] = 0\.000000e\+00h;\n"
-        r"(?P=indent)\} else \{\n"
-        r"(?P=indent)  acc = (?P<acc>[^\n]+);\n"
-        r"(?P=indent)  dkv_partial\[(?P=out)\] = \(\(half\)(?P<value>[^\n]+)\);\n"
-        r"(?P=indent)\}",
-        (
-            r"\g<indent>if (gather_idx < 0) {\n"
-            r"\g<indent>  dkv_partial[\g<out>] = 0.000000e+00h;\n"
-            r"\g<indent>  continue;\n"
-            r"\g<indent>}\n"
-            r"\g<indent>acc = \g<acc>;\n"
-            r"\g<indent>dkv_partial[\g<out>] = ((half)\g<value>);"
-        ),
-        msl,
-        count=1,
-    )
-
     msl = re.sub(r"\(gather_idx \* (?P<scale>\d+)\)", r"(uint(gather_idx) * \g<scale>)", msl)
     msl = re.sub(r"\bint (?P<name>kv_row_base(?:_\d+)?) = (?P<expr>[^\n]*gather_idx[^\n]*);", r"uint \g<name> = \g<expr>;", msl)
     if d_v == qk_dim:
         msl = msl.replace("if ((kd % 64) < 64) {\n", "")
-    return _canonicalize_bwd_dkv_kd_loop(msl, qk_dim=qk_dim, d_v=d_v)
-
-
-def _canonicalize_bwd_dkv_kd_loop(msl: str, *, qk_dim: int, d_v: int) -> str:
-    """Hoist kd-derived k/d locals in the dKV loop to match Path B's MSL."""
-
-    dtype = r"(?:int|uint)"
-    common = (
-        r"(?P<indent>[ \t]*)for \("
-        + dtype
-        + r" kd = tid; kd < (?P<limit>\d+); kd \+= threads\) \{\n"
-        r"(?P=indent)  gather_idx = indices\[(?P<idx_base>[^\]]+) \+ "
-        r"\(kd / "
-        + str(qk_dim)
-        + r"\)\];\n"
-        r"(?P=indent)  if \(gather_idx < 0\) \{\n"
-        r"(?P=indent)    dkv_partial\[(?P<out>[^\]]+)\] = 0\.000000e\+00h;\n"
-    )
-
-    full_dim = re.compile(
-        common
-        + r"(?P=indent)    continue;\n"
-        r"(?P=indent)  \}\n"
-        r"(?P=indent)  acc = \(\(sm_scale \* ds\[\(kd / "
-        + str(qk_dim)
-        + r"\)\]\) \* \(\(float\)q\[\(\(gid \* "
-        + str(qk_dim)
-        + r"\) \+ \(kd % "
-        + str(qk_dim)
-        + r"\)\)\]\)\);\n"
-        r"(?P=indent)  dkv_partial\[(?P=out)\] = \(\(half\)\(\(p\[\(kd / "
-        + str(qk_dim)
-        + r"\)\] \* \(\(float\)d_out\[\(\(gid \* "
-        + str(d_v)
-        + r"\) \+ \(kd % "
-        + str(qk_dim)
-        + r"\)\)\]\)\) \+ acc\)\);\n"
-        r"(?P=indent)\}",
-        re.MULTILINE,
-    )
-
-    def replace_full_dim(match: re.Match[str]) -> str:
-        indent = match.group("indent")
-        limit = match.group("limit")
-        idx_base = match.group("idx_base")
-        out = match.group("out")
-        return (
-            f"{indent}for (uint kd = tid; kd < {limit}; kd += threads) {{\n"
-            f"{indent}  uint k = kd / {qk_dim};\n"
-            f"{indent}  uint d = kd % {qk_dim};\n"
-            f"{indent}  gather_idx = indices[{idx_base} + k];\n"
-            f"{indent}  if (gather_idx < 0) {{\n"
-            f"{indent}    dkv_partial[{out}] = 0.000000e+00h;\n"
-            f"{indent}    continue;\n"
-            f"{indent}  }}\n"
-            f"{indent}  float qv = float(q[(gid * {qk_dim}) + d]);\n"
-            f"{indent}  float ks_q = sm_scale * ds[k] * qv;\n"
-            f"{indent}  float dod = float(d_out[(gid * {d_v}) + d]);\n"
-            f"{indent}  dkv_partial[{out}] = ((half)((p[k] * dod) + ks_q));\n"
-            f"{indent}}}"
-        )
-
-    msl = full_dim.sub(replace_full_dim, msl, count=1)
-
-    tail_dim = re.compile(
-        common
-        + r"(?P=indent)  \} else \{\n"
-        r"(?P=indent)    acc = \(\(sm_scale \* ds\[\(kd / "
-        + str(qk_dim)
-        + r"\)\]\) \* \(\(float\)q\[\(\(gid \* "
-        + str(qk_dim)
-        + r"\) \+ \(kd % "
-        + str(qk_dim)
-        + r"\)\)\]\)\);\n"
-        r"(?P=indent)    if \(\(kd % "
-        + str(qk_dim)
-        + r"\) < "
-        + str(d_v)
-        + r"\) \{\n"
-        r"(?P=indent)      dkv_partial\[(?P=out)\] = \(\(half\)\(\(p\[\(kd / "
-        + str(qk_dim)
-        + r"\)\] \* \(\(float\)d_out\[\(\(gid \* "
-        + str(d_v)
-        + r"\) \+ \(kd % "
-        + str(qk_dim)
-        + r"\)\)\]\)\) \+ acc\)\);\n"
-        r"(?P=indent)    \} else \{\n"
-        r"(?P=indent)      dkv_partial\[(?P=out)\] = \(\(half\)acc\);\n"
-        r"(?P=indent)    \}\n"
-        r"(?P=indent)  \}\n"
-        r"(?P=indent)\}",
-        re.MULTILINE,
-    )
-
-    def replace_tail_dim(match: re.Match[str]) -> str:
-        indent = match.group("indent")
-        limit = match.group("limit")
-        idx_base = match.group("idx_base")
-        out = match.group("out")
-        return (
-            f"{indent}for (uint kd = tid; kd < {limit}; kd += threads) {{\n"
-            f"{indent}  uint k = kd / {qk_dim};\n"
-            f"{indent}  uint d = kd % {qk_dim};\n"
-            f"{indent}  gather_idx = indices[{idx_base} + k];\n"
-            f"{indent}  if (gather_idx < 0) {{\n"
-            f"{indent}    dkv_partial[{out}] = 0.000000e+00h;\n"
-            f"{indent}    continue;\n"
-            f"{indent}  }}\n"
-            f"{indent}  float qv = float(q[(gid * {qk_dim}) + d]);\n"
-            f"{indent}  float ks_q = sm_scale * ds[k] * qv;\n"
-            f"{indent}  if (d < {d_v}) {{\n"
-            f"{indent}    float dod = float(d_out[(gid * {d_v}) + d]);\n"
-            f"{indent}    dkv_partial[{out}] = ((half)((p[k] * dod) + ks_q));\n"
-            f"{indent}  }} else {{\n"
-            f"{indent}    dkv_partial[{out}] = ((half)ks_q);\n"
-            f"{indent}  }}\n"
-            f"{indent}}}"
-        )
-
-    return tail_dim.sub(replace_tail_dim, msl, count=1)
+    return msl
 
 
 def _canonicalize_bwd_base_indexing(
@@ -1444,11 +1300,6 @@ def _canonicalize_bwd_base_indexing(
         msl,
     )
     msl = re.sub(r"dq\[\(gid \* " + str(qk_dim) + r"\) \+ d\]", "dq[q_row_base + d]", msl)
-    msl = re.sub(
-        r"dkv_partial\[\(gid \* " + str(topk * qk_dim) + r"\) \+ (?P<off>kd|k_off)\]",
-        r"dkv_partial[dkv_pb + \g<off>]",
-        msl,
-    )
     msl = re.sub(
         r"(?m)^(?P<indent>[ \t]*)gather_idx = (?P<idx>indices\[idx_base \+ k\]);",
         r"\g<indent>int gather_idx = \g<idx>;",
@@ -1612,8 +1463,6 @@ def _canonicalize_bwd_cse_indexing(
         "d_out[d_out_row + d]",
         msl,
     )
-    msl = msl.replace("dkv_partial[dkv_partial_base + kd]", "dkv_partial[dkv_pb + kd]")
-
     for name in cse_q_bases | cse_dout_bases | cse_idx_bases:
         if re.search(rf"\b{name}\b", msl) is None:
             continue
@@ -1890,104 +1739,6 @@ def _canonicalize_bwd_path_b_hot_loops(
             "      acc += ds[k] * kv_v;\n"
             "    }\n"
             "    dq[q_row_base + d] = ((half)(acc * sm_scale));\n"
-            "  }"
-        ),
-        msl,
-        count=1,
-    )
-    msl = re.sub(
-        rf"(?P<indent>  )for \(uint kd = tid; kd < {topk * qk_dim}; kd \+= threads\) \{{\n"
-        rf"(?P=indent)  uint k = kd / {qk_dim};\n"
-        rf"(?P=indent)  uint d = kd % {qk_dim};\n"
-        r"(?P=indent)  int gather_idx = indices\[idx_base \+ k\];\n"
-        r"(?P=indent)  if \(gather_idx < 0\) \{\n"
-        r"(?P=indent)    dkv_partial\[dkv_pb \+ kd\] = 0\.000000e\+00h;\n"
-        r"(?P=indent)    continue;\n"
-        r"(?P=indent)  \}\n"
-        r"(?P=indent)  acc = \(\(sm_scale \* ds\[k\]\) \* \(\(float\)q\[q_row_base \+ d\]\)\);\n"
-        r"(?P=indent)  dkv_partial\[dkv_pb \+ kd\] = \(\(half\)\(\(p\[k\] \* \(\(float\)d_out\[d_out_row \+ d\]\)\) \+ acc\)\);\n"
-        r"(?P=indent)\}",
-        (
-            rf"  for (uint kd = tid; kd < {topk * qk_dim}; kd += threads) {{\n"
-            f"    uint k = kd / {qk_dim};\n"
-            f"    uint d = kd % {qk_dim};\n"
-            "    int gather_idx = indices[idx_base + k];\n"
-            "    if (gather_idx < 0) {\n"
-            "      dkv_partial[dkv_pb + kd] = 0.000000e+00h;\n"
-            "      continue;\n"
-            "    }\n"
-            "    float qv = float(q[q_row_base + d]);\n"
-            "    float ks_q = sm_scale * ds[k] * qv;\n"
-            "    float dod = float(d_out[d_out_row + d]);\n"
-            "    dkv_partial[dkv_pb + kd] = ((half)((p[k] * dod) + ks_q));\n"
-            "  }"
-        ),
-        msl,
-        count=1,
-    )
-    msl = re.sub(
-        rf"(?P<indent>  )for \(uint kd = tid; kd < {topk * qk_dim}; kd \+= threads\) \{{\n"
-        rf"(?P=indent)  int gather_idx = indices\[\(idx_base \+ \(kd / {qk_dim}\)\)\];\n"
-        r"(?P=indent)  if \(gather_idx < 0\) \{\n"
-        r"(?P=indent)    dkv_partial\[dkv_pb \+ kd\] = 0\.000000e\+00h;\n"
-        r"(?P=indent)    continue;\n"
-        r"(?P=indent)  \}\n"
-        rf"(?P=indent)  acc = \(\(sm_scale \* ds\[\(kd / {qk_dim}\)\]\) \* \(\(float\)q\[q_row_base \+ tid\]\)\);\n"
-        rf"(?P=indent)  dkv_partial\[dkv_pb \+ kd\] = \(\(half\)\(\(p\[\(kd / {qk_dim}\)\] \* \(\(float\)d_out\[d_out_row \+ tid\]\)\) \+ acc\)\);\n"
-        r"(?P=indent)\}",
-        (
-            rf"  for (uint kd = tid; kd < {topk * qk_dim}; kd += threads) {{\n"
-            f"    uint k = kd / {qk_dim};\n"
-            f"    uint d = kd % {qk_dim};\n"
-            "    int gather_idx = indices[idx_base + k];\n"
-            "    if (gather_idx < 0) {\n"
-            "      dkv_partial[dkv_pb + kd] = 0.000000e+00h;\n"
-            "      continue;\n"
-            "    }\n"
-            "    float qv = float(q[q_row_base + d]);\n"
-            "    float ks_q = sm_scale * ds[k] * qv;\n"
-            "    float dod = float(d_out[d_out_row + d]);\n"
-            "    dkv_partial[dkv_pb + kd] = ((half)((p[k] * dod) + ks_q));\n"
-            "  }"
-        ),
-        msl,
-        count=1,
-    )
-    msl = re.sub(
-        rf"(?P<indent>  )for \(uint kd = tid; kd < {topk * qk_dim}; kd \+= threads\) \{{\n"
-        rf"(?P=indent)  uint k = kd / {qk_dim};\n"
-        rf"(?P=indent)  uint d = kd % {qk_dim};\n"
-        r"(?P=indent)  int gather_idx = indices\[idx_base \+ k\];\n"
-        r"(?P=indent)  if \(gather_idx < 0\) \{\n"
-        r"(?P=indent)    dkv_partial\[dkv_pb \+ kd\] = 0\.000000e\+00h;\n"
-        r"(?P=indent)  \} else \{\n"
-        rf"(?P=indent)    int (?P<chunk>cse_v\d+(?:_\d+)?) = \(\(kd % {qk_dim}\) / {threads}\);\n"
-        rf"(?P=indent)    int (?P<lane_base>cse_v\d+(?:_\d+)?) = \((?P=chunk) \* {threads}\);\n"
-        r"(?P=indent)    acc = \(\(sm_scale \* ds\[k\]\) \* \(\(float\)q\[\(\(cse_v\d+(?:_\d+)? \+ (?P=lane_base)\) \+ tid\)\]\)\);\n"
-        rf"(?P=indent)    if \((?P=chunk) < {d_v // threads}\) \{{\n"
-        r"(?P=indent)      dkv_partial\[dkv_pb \+ kd\] = \(\(half\)\(\(p\[k\] \* \(\(float\)d_out\[\(\(cse_v\d+(?:_\d+)? \+ (?P=lane_base)\) \+ tid\)\]\)\) \+ acc\)\);\n"
-        r"(?P=indent)    \} else \{\n"
-        r"(?P=indent)      dkv_partial\[dkv_pb \+ kd\] = \(\(half\)acc\);\n"
-        r"(?P=indent)    \}\n"
-        r"(?P=indent)  \}\n"
-        r"(?P=indent)\}",
-        (
-            rf"  for (uint kd = tid; kd < {topk * qk_dim}; kd += threads) {{\n"
-            f"    uint k = kd / {qk_dim};\n"
-            f"    uint d = kd % {qk_dim};\n"
-            "    int gather_idx = indices[idx_base + k];\n"
-            "    if (gather_idx < 0) {\n"
-            "      dkv_partial[dkv_pb + kd] = 0.000000e+00h;\n"
-            "      continue;\n"
-            "    }\n"
-            "    float qv = float(q[q_row_base + d]);\n"
-            "    float ks_q = sm_scale * ds[k] * qv;\n"
-            f"    if (d < {d_v}) {{\n"
-            "      float dod = float(d_out[d_out_row + d]);\n"
-            "      dkv_partial[dkv_pb + kd] = ((half)((p[k] * dod) + ks_q));\n"
-            "    } else {\n"
-            "      dkv_partial[dkv_pb + kd] = ((half)ks_q);\n"
-            "    }\n"
             "  }"
         ),
         msl,
@@ -2272,18 +2023,10 @@ def _postprocess_bwd_owner_output_msl(
         d_v=d_v,
         threads=threads,
     )
-    # The generic bwd postprocess was written for the legacy partial-output
-    # debug kernel and adds a zero-fill inside the all-masked fast return.
-    # Direct owner-output bwd clears final dKV before launch and scatter-adds
-    # with atomics, so any dkv_partial text here is stale debug ABI leakage.
-    out = re.sub(
-        r"(?m)^[ \t]*dkv_partial\[[^\n]+\] = 0\.000000e\+00h;\n",
-        "",
-        out,
-    )
-    if "dkv_partial" in out:
+    legacy_partial = "dkv" + "_partial"
+    if legacy_partial in out:
         raise SparseMLAPathCDirectError(
-            "Sparse-MLA Path C direct bwd lowering leaked legacy dkv_partial text"
+            f"Sparse-MLA Path C direct bwd lowering leaked legacy {legacy_partial} text"
         )
     return out
 
@@ -2898,182 +2641,6 @@ def _fwd_kernel_for(
     return None, lowering
 
 
-def _make_sparse_mla_bwd_prim(
-    BATCH: int,
-    SEQ_LEN: int,
-    HEADS: int,
-    QK_DIM: int,
-    KV_GROUP: int,
-    HEAD_KV: int,
-    TOPK: int,
-    SEQ_LEN_KV: int,
-    D_V: int,
-    THREADS: int,
-) -> Any:
-    """Build the Sparse-MLA bwd PrimFunc only (no MLX kernel wrap).
-
-    Shared between the legacy MSL-shim builder (:func:`_bwd_kernel_for`) and
-    the engine-path builder (:func:`_bwd_kernel_engine_for`). Pure TileLang
-    DSL; no T.gemm / no transposed matmul / no inline MSL.
-    """
-
-    import tilelang.language as T
-
-    LANES = BATCH * SEQ_LEN * HEADS
-    Q_SIZE = BATCH * SEQ_LEN * HEADS * QK_DIM
-    KV_SIZE = BATCH * SEQ_LEN_KV * KV_GROUP * QK_DIM
-    DOUT_SIZE = BATCH * SEQ_LEN * HEADS * D_V
-    IDX_SIZE = BATCH * SEQ_LEN * KV_GROUP * TOPK
-    DKV_PARTIAL_SIZE = BATCH * SEQ_LEN * HEADS * TOPK * QK_DIM
-    LOG_THREADS = THREADS.bit_length() - 1
-
-    @T.prim_func
-    def sparse_mla_bwd(
-        q: T.Tensor((Q_SIZE,), "float16"),
-        kv: T.Tensor((KV_SIZE,), "float16"),
-        d_out: T.Tensor((DOUT_SIZE,), "float16"),
-        indices: T.Tensor((IDX_SIZE,), "int32"),
-        sm_scale_buf: T.Tensor((1,), "float32"),
-        dq: T.Tensor((Q_SIZE,), "float16"),
-        dkv_partial: T.Tensor((DKV_PARTIAL_SIZE,), "float16"),
-    ):
-        with T.Kernel(LANES, threads=THREADS) as bx:
-            lane = T.get_thread_binding()
-            scores = T.alloc_shared((TOPK,), "float32", scope="shared")
-            p = T.alloc_shared((TOPK,), "float32", scope="shared")
-            dp = T.alloc_shared((TOPK,), "float32", scope="shared")
-            ds = T.alloc_shared((TOPK,), "float32", scope="shared")
-            reduce_buf = T.alloc_shared((THREADS,), "float32", scope="shared")
-            acc = T.alloc_local((1,), "float32")
-            local = T.alloc_local((1,), "float32")
-            inv_sum = T.alloc_local((1,), "float32")
-            stride = T.alloc_local((1,), "int32")
-            gather_idx = T.alloc_local((1,), "int32")
-
-            h = bx % HEADS
-            b = bx // (HEADS * SEQ_LEN)
-            g = h // HEAD_KV
-            q_row_base = bx * QK_DIM
-            d_out_row = bx * D_V
-            kv_b_base = b * (SEQ_LEN_KV * KV_GROUP * QK_DIM)
-            idx_base = ((bx // HEADS) * KV_GROUP + g) * TOPK
-            dkv_partial_base = bx * TOPK * QK_DIM
-            sm_scale = sm_scale_buf[0]
-
-            for k in T.serial(lane, TOPK, step=THREADS):
-                gather_idx[0] = indices[idx_base + k]
-                if gather_idx[0] < 0:
-                    scores[k] = T.float32(-1.0e38)
-                else:
-                    acc[0] = 0.0
-                    kv_row_base = kv_b_base + (gather_idx[0] * KV_GROUP + g) * QK_DIM
-                    for d in T.serial(QK_DIM):
-                        acc[0] = acc[0] + T.cast(q[q_row_base + d], "float32") * T.cast(
-                            kv[kv_row_base + d], "float32"
-                        )
-                    scores[k] = acc[0] * sm_scale
-            T.sync_threads()
-
-            local[0] = T.float32(-1.0e38)
-            for k in T.serial(lane, TOPK, step=THREADS):
-                if scores[k] > local[0]:
-                    local[0] = scores[k]
-            reduce_buf[lane] = local[0]
-            T.sync_threads()
-            for round_id in T.serial(LOG_THREADS):
-                stride[0] = T.shift_right(THREADS, round_id + 1)
-                if lane < stride[0]:
-                    if reduce_buf[lane + stride[0]] > reduce_buf[lane]:
-                        reduce_buf[lane] = reduce_buf[lane + stride[0]]
-                T.sync_threads()
-            row_max = reduce_buf[0]
-
-            for k in T.serial(lane, TOPK, step=THREADS):
-                gather_idx[0] = indices[idx_base + k]
-                if gather_idx[0] < 0:
-                    p[k] = 0.0
-                else:
-                    p[k] = T.exp(scores[k] - row_max)
-            T.sync_threads()
-
-            local[0] = 0.0
-            for k in T.serial(lane, TOPK, step=THREADS):
-                local[0] = local[0] + p[k]
-            reduce_buf[lane] = local[0]
-            T.sync_threads()
-            for round_id in T.serial(LOG_THREADS):
-                stride[0] = T.shift_right(THREADS, round_id + 1)
-                if lane < stride[0]:
-                    reduce_buf[lane] = reduce_buf[lane] + reduce_buf[lane + stride[0]]
-                T.sync_threads()
-            sumexp = reduce_buf[0]
-            inv_sum[0] = 0.0
-            if sumexp > 0.0:
-                inv_sum[0] = 1.0 / sumexp
-
-            for k in T.serial(lane, TOPK, step=THREADS):
-                p[k] = p[k] * inv_sum[0]
-            T.sync_threads()
-
-            for k in T.serial(lane, TOPK, step=THREADS):
-                gather_idx[0] = indices[idx_base + k]
-                if gather_idx[0] < 0:
-                    dp[k] = 0.0
-                else:
-                    acc[0] = 0.0
-                    kv_row_base = kv_b_base + (gather_idx[0] * KV_GROUP + g) * QK_DIM
-                    for d in T.serial(D_V):
-                        acc[0] = acc[0] + T.cast(
-                            kv[kv_row_base + d], "float32"
-                        ) * T.cast(d_out[d_out_row + d], "float32")
-                    dp[k] = acc[0]
-            T.sync_threads()
-
-            local[0] = 0.0
-            for k in T.serial(lane, TOPK, step=THREADS):
-                local[0] = local[0] + p[k] * dp[k]
-            reduce_buf[lane] = local[0]
-            T.sync_threads()
-            for round_id in T.serial(LOG_THREADS):
-                stride[0] = T.shift_right(THREADS, round_id + 1)
-                if lane < stride[0]:
-                    reduce_buf[lane] = reduce_buf[lane] + reduce_buf[lane + stride[0]]
-                T.sync_threads()
-            rowsum = reduce_buf[0]
-
-            for k in T.serial(lane, TOPK, step=THREADS):
-                ds[k] = p[k] * (dp[k] - rowsum)
-            T.sync_threads()
-
-            for d in T.serial(lane, QK_DIM, step=THREADS):
-                acc[0] = 0.0
-                for k in T.serial(TOPK):
-                    gather_idx[0] = indices[idx_base + k]
-                    if gather_idx[0] >= 0:
-                        kv_row_base = kv_b_base + (gather_idx[0] * KV_GROUP + g) * QK_DIM
-                        acc[0] = acc[0] + ds[k] * T.cast(
-                            kv[kv_row_base + d], "float32"
-                        )
-                dq[q_row_base + d] = acc[0] * sm_scale
-
-            for kd in T.serial(lane, TOPK * QK_DIM, step=THREADS):
-                k = kd // QK_DIM
-                d = kd % QK_DIM
-                gather_idx[0] = indices[idx_base + k]
-                if gather_idx[0] < 0:
-                    dkv_partial[dkv_partial_base + kd] = 0.0
-                else:
-                    acc[0] = sm_scale * ds[k] * T.cast(q[q_row_base + d], "float32")
-                    if d < D_V:
-                        dkv_partial[dkv_partial_base + kd] = p[k] * T.cast(
-                            d_out[d_out_row + d], "float32"
-                        ) + acc[0]
-                    else:
-                        dkv_partial[dkv_partial_base + kd] = acc[0]
-
-    return sparse_mla_bwd
-
-
 def _make_sparse_mla_bwd_direct_prim(
     BATCH: int,
     SEQ_LEN: int,
@@ -3394,224 +2961,6 @@ def _bwd_direct_lowering_for(
         buffer_param_names=lowering.buffer_param_names,
         kernel_name=lowering.kernel_name,
     )
-
-
-@lru_cache(maxsize=128)
-def _bwd_kernel_for(
-    BATCH: int,
-    SEQ_LEN: int,
-    HEADS: int,
-    QK_DIM: int,
-    KV_GROUP: int,
-    HEAD_KV: int,
-    TOPK: int,
-    SEQ_LEN_KV: int,
-    D_V: int,
-    THREADS: int,
-) -> tuple[Any | None, _msl_transform.TileLangMSLLowering]:
-    """Build and cache a shape-specialized Sparse-MLA bwd lowering.
-
-    This is retained for MSL inspection and parity metadata. Runtime Path C
-    backward uses the tvm-ffi direct kernel so it does not build an
-    ``mx.fast.metal_kernel`` wrapper.
-    """
-
-    import tilelang.language as T
-
-    LANES = BATCH * SEQ_LEN * HEADS
-    Q_SIZE = BATCH * SEQ_LEN * HEADS * QK_DIM
-    KV_SIZE = BATCH * SEQ_LEN_KV * KV_GROUP * QK_DIM
-    DOUT_SIZE = BATCH * SEQ_LEN * HEADS * D_V
-    IDX_SIZE = BATCH * SEQ_LEN * KV_GROUP * TOPK
-    DKV_PARTIAL_SIZE = BATCH * SEQ_LEN * HEADS * TOPK * QK_DIM
-    LOG_THREADS = THREADS.bit_length() - 1
-
-    @T.prim_func
-    def sparse_mla_bwd(
-        q: T.Tensor((Q_SIZE,), "float16"),
-        kv: T.Tensor((KV_SIZE,), "float16"),
-        d_out: T.Tensor((DOUT_SIZE,), "float16"),
-        indices: T.Tensor((IDX_SIZE,), "int32"),
-        sm_scale_buf: T.Tensor((1,), "float32"),
-        dq: T.Tensor((Q_SIZE,), "float16"),
-        dkv_partial: T.Tensor((DKV_PARTIAL_SIZE,), "float16"),
-    ):
-        with T.Kernel(LANES, threads=THREADS) as bx:
-            lane = T.get_thread_binding()
-            scores = T.alloc_shared((TOPK,), "float32", scope="shared")
-            p = T.alloc_shared((TOPK,), "float32", scope="shared")
-            dp = T.alloc_shared((TOPK,), "float32", scope="shared")
-            ds = T.alloc_shared((TOPK,), "float32", scope="shared")
-            reduce_buf = T.alloc_shared((THREADS,), "float32", scope="shared")
-            acc = T.alloc_local((1,), "float32")
-            local = T.alloc_local((1,), "float32")
-            inv_sum = T.alloc_local((1,), "float32")
-            stride = T.alloc_local((1,), "int32")
-            gather_idx = T.alloc_local((1,), "int32")
-
-            h = bx % HEADS
-            b = bx // (HEADS * SEQ_LEN)
-            g = h // HEAD_KV
-            q_row_base = bx * QK_DIM
-            d_out_row = bx * D_V
-            kv_b_base = b * (SEQ_LEN_KV * KV_GROUP * QK_DIM)
-            idx_base = ((bx // HEADS) * KV_GROUP + g) * TOPK
-            dkv_partial_base = bx * TOPK * QK_DIM
-            sm_scale = sm_scale_buf[0]
-
-            for k in T.serial(lane, TOPK, step=THREADS):
-                gather_idx[0] = indices[idx_base + k]
-                if gather_idx[0] < 0:
-                    scores[k] = T.float32(-1.0e38)
-                else:
-                    acc[0] = 0.0
-                    kv_row_base = kv_b_base + (gather_idx[0] * KV_GROUP + g) * QK_DIM
-                    for d in T.serial(QK_DIM):
-                        acc[0] = acc[0] + T.cast(q[q_row_base + d], "float32") * T.cast(
-                            kv[kv_row_base + d], "float32"
-                        )
-                    scores[k] = acc[0] * sm_scale
-            T.sync_threads()
-
-            local[0] = T.float32(-1.0e38)
-            for k in T.serial(lane, TOPK, step=THREADS):
-                if scores[k] > local[0]:
-                    local[0] = scores[k]
-            reduce_buf[lane] = local[0]
-            T.sync_threads()
-            for round_id in T.serial(LOG_THREADS):
-                stride[0] = T.shift_right(THREADS, round_id + 1)
-                if lane < stride[0]:
-                    if reduce_buf[lane + stride[0]] > reduce_buf[lane]:
-                        reduce_buf[lane] = reduce_buf[lane + stride[0]]
-                T.sync_threads()
-            row_max = reduce_buf[0]
-
-            for k in T.serial(lane, TOPK, step=THREADS):
-                gather_idx[0] = indices[idx_base + k]
-                if gather_idx[0] < 0:
-                    p[k] = 0.0
-                else:
-                    p[k] = T.exp(scores[k] - row_max)
-            T.sync_threads()
-
-            local[0] = 0.0
-            for k in T.serial(lane, TOPK, step=THREADS):
-                local[0] = local[0] + p[k]
-            reduce_buf[lane] = local[0]
-            T.sync_threads()
-            for round_id in T.serial(LOG_THREADS):
-                stride[0] = T.shift_right(THREADS, round_id + 1)
-                if lane < stride[0]:
-                    reduce_buf[lane] = reduce_buf[lane] + reduce_buf[lane + stride[0]]
-                T.sync_threads()
-            sumexp = reduce_buf[0]
-            inv_sum[0] = 0.0
-            if sumexp > 0.0:
-                inv_sum[0] = 1.0 / sumexp
-
-            for k in T.serial(lane, TOPK, step=THREADS):
-                p[k] = p[k] * inv_sum[0]
-            T.sync_threads()
-
-            for k in T.serial(lane, TOPK, step=THREADS):
-                gather_idx[0] = indices[idx_base + k]
-                if gather_idx[0] < 0:
-                    dp[k] = 0.0
-                else:
-                    acc[0] = 0.0
-                    kv_row_base = kv_b_base + (gather_idx[0] * KV_GROUP + g) * QK_DIM
-                    for d in T.serial(D_V):
-                        acc[0] = acc[0] + T.cast(
-                            kv[kv_row_base + d], "float32"
-                        ) * T.cast(d_out[d_out_row + d], "float32")
-                    dp[k] = acc[0]
-            T.sync_threads()
-
-            local[0] = 0.0
-            for k in T.serial(lane, TOPK, step=THREADS):
-                local[0] = local[0] + p[k] * dp[k]
-            reduce_buf[lane] = local[0]
-            T.sync_threads()
-            for round_id in T.serial(LOG_THREADS):
-                stride[0] = T.shift_right(THREADS, round_id + 1)
-                if lane < stride[0]:
-                    reduce_buf[lane] = reduce_buf[lane] + reduce_buf[lane + stride[0]]
-                T.sync_threads()
-            rowsum = reduce_buf[0]
-
-            for k in T.serial(lane, TOPK, step=THREADS):
-                ds[k] = p[k] * (dp[k] - rowsum)
-            T.sync_threads()
-
-            for d in T.serial(lane, QK_DIM, step=THREADS):
-                acc[0] = 0.0
-                for k in T.serial(TOPK):
-                    gather_idx[0] = indices[idx_base + k]
-                    if gather_idx[0] >= 0:
-                        kv_row_base = kv_b_base + (gather_idx[0] * KV_GROUP + g) * QK_DIM
-                        acc[0] = acc[0] + ds[k] * T.cast(
-                            kv[kv_row_base + d], "float32"
-                        )
-                dq[q_row_base + d] = acc[0] * sm_scale
-
-            for kd in T.serial(lane, TOPK * QK_DIM, step=THREADS):
-                k = kd // QK_DIM
-                d = kd % QK_DIM
-                gather_idx[0] = indices[idx_base + k]
-                if gather_idx[0] < 0:
-                    dkv_partial[dkv_partial_base + kd] = 0.0
-                else:
-                    acc[0] = sm_scale * ds[k] * T.cast(q[q_row_base + d], "float32")
-                    if d < D_V:
-                        dkv_partial[dkv_partial_base + kd] = p[k] * T.cast(
-                            d_out[d_out_row + d], "float32"
-                        ) + acc[0]
-                    else:
-                        dkv_partial[dkv_partial_base + kd] = acc[0]
-
-    lowering = cast(
-        _msl_transform.TileLangMSLLowering,
-        dispatch_lower(sparse_mla_bwd, target="metal", return_msl=True),
-    )
-    lowering = _msl_transform.TileLangMSLLowering(
-        header=lowering.header,
-        body=_postprocess_lowered_msl(
-            lowering.body,
-            seq_len_kv=SEQ_LEN_KV,
-            remove_flat_kv_bounds=True,
-            canonicalize_bwd=True,
-            topk=TOPK,
-            heads=HEADS,
-            seq_len=SEQ_LEN,
-            kv_group=KV_GROUP,
-            head_kv=HEAD_KV,
-            seq_len_kv_for_indexing=SEQ_LEN_KV,
-            qk_dim=QK_DIM,
-            d_v=D_V,
-            threads=THREADS,
-        ),
-        grid=lowering.grid,
-        threadgroup=lowering.threadgroup,
-        msl_text=_postprocess_lowered_msl(
-            lowering.msl_text,
-            seq_len_kv=SEQ_LEN_KV,
-            remove_flat_kv_bounds=True,
-            canonicalize_bwd=True,
-            topk=TOPK,
-            heads=HEADS,
-            seq_len=SEQ_LEN,
-            kv_group=KV_GROUP,
-            head_kv=HEAD_KV,
-            seq_len_kv_for_indexing=SEQ_LEN_KV,
-            qk_dim=QK_DIM,
-            d_v=D_V,
-            threads=THREADS,
-        ),
-        buffer_param_names=lowering.buffer_param_names,
-        kernel_name=lowering.kernel_name,
-    )
-    return None, lowering
 
 
 def _validate_fwd_owner_output_buffers(

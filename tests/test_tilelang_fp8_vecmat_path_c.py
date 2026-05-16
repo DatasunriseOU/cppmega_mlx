@@ -30,7 +30,6 @@ from cppmega_mlx.nn._tilelang.fp8_vecmat_path_c import (
     FP8VecmatPathCStatus,
     FP8VecmatPathCDirectError,
     FP8VecmatPathCLegacyError,
-    canonical_vecmat_runtime_body,
     fp8_scaled_vecmat_path_c_direct,
     fp8_scaled_vecmat_path_c,
     fp8_vecmat_msl_blockers,
@@ -101,6 +100,15 @@ def test_lowered_default_reducer_uses_packed_uint_loads_and_simd_reduction() -> 
     assert features["metal_fp8_dot4_helper"] > 0
     assert features["simd_reduction"] > 0
     assert features["scalar_fp8_byte_decode_calls"] == 0
+    assert "thread float red_buf0[1]" not in msl
+
+
+def test_lowered_vecmat_4096_keeps_direct_simd_sum_and_unroll_hint() -> None:
+    _require_fp8_vecmat_path_c_available()
+    msl = lower_fp8_vecmat_msl(N=4096, K=4096)
+    assert "thread float red_buf0[1]" not in msl
+    assert "simd_sum(dot)" in msl
+    assert "#pragma unroll 4" in msl
 
 
 def test_lowered_default_reducer_uses_per_row_b_scale() -> None:
@@ -122,28 +130,6 @@ def test_lowered_default_reducer_reports_path_b_fast_path_ready() -> None:
     assert features["packed_uint_loads"] > 0
     assert features["metal_fp8_dot4_helper"] > 0
     assert features["scalar_fp8_byte_decode_calls"] == 0
-
-
-def test_runtime_body_keeps_path_b_vecmat_hot_loop_and_scale_modes() -> None:
-    per_row = canonical_vecmat_runtime_body(N=4096, K=4096, scale_w_per_row=True)
-    scalar = canonical_vecmat_runtime_body(N=4096, K=4096, scale_w_per_row=False)
-    features = fp8_vecmat_msl_features(per_row)
-
-    assert "uint row = gid / 32u" in per_row
-    assert features["simd_sum"] == 1
-    assert features["reinterpret_cast"] == 2
-    assert features["device_const_uint"] >= 2
-    assert features["fp8_e4m3_lut"] >= 8
-    assert features["scalar_fp8_byte_decode_calls"] == 0
-    assert "device const uint* A4 = reinterpret_cast<device const uint*>(A)" in per_row
-    assert (
-        "device const uint* B4 = reinterpret_cast<device const uint*>(B + row_offset)"
-        in per_row
-    )
-    assert "B_scale[row]" in per_row
-    assert "B_scale[0]" not in per_row
-    assert "B_scale[0]" in scalar
-    assert "B_scale[row]" not in scalar
 
 
 @pytest.mark.skipif(not _metal_available(), reason="Metal unavailable")

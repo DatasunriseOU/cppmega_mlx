@@ -46,9 +46,7 @@ from cppmega_mlx.nn._tilelang.mamba3 import (  # noqa: E402
     mamba3_mimo_metal_status,
 )
 from cppmega_mlx.nn._tilelang.mamba3_path_c import (  # noqa: E402
-    _mamba3_mimo_bwd_path_c_partials,
     _mamba3_mimo_bwd_path_c_simd_kernel,
-    _reduce_mamba3_bwd_partials,
     dump_lowered_bwd_msl,
     dump_lowered_fwd_msl,
     mamba3_mimo_apply_path_c,
@@ -352,8 +350,9 @@ def main() -> int:
     peak_pc_fb = _peak_memory_bytes()
 
     # ------------------------------------------------------------------
-    # Path C bwd profiler: split the TileLang reverse scan from partial
-    # reductions, and measure the simdgroup P-reduced kernel separately.
+    # Path C bwd profiler: measure the final-gradient SIMD/snapshot kernel.
+    # The old host-reduced partial route was removed; this bench must not
+    # resurrect it as a production or diagnostic dependency.
     # ------------------------------------------------------------------
     dy_profile = y_pc
     mx.eval(dy_profile)
@@ -368,31 +367,6 @@ def main() -> int:
         bwd_profile["simd_p_reduce_kernel"] = simd_bwd
     except Exception as exc:
         bwd_profile["simd_p_reduce_error"] = f"{type(exc).__name__}: {exc}"
-
-    try:
-        partials_once = _mamba3_mimo_bwd_path_c_partials(dy_profile, *inputs)
-        mx.eval(*partials_once)
-        partial_kernel = _bench(
-            "bwd_path_c_partial_kernel",
-            lambda: _mamba3_mimo_bwd_path_c_partials(dy_profile, *inputs),
-            warmup=args.warmup,
-            iters=args.iters,
-        )
-        partial_reduce = _bench(
-            "bwd_path_c_partial_reduce",
-            lambda: _reduce_mamba3_bwd_partials(partials_once),
-            warmup=args.warmup,
-            iters=args.iters,
-        )
-        bwd_profile["partial_kernel"] = partial_kernel
-        bwd_profile["partial_reduce"] = partial_reduce
-        total = partial_kernel["median_ms"] + partial_reduce["median_ms"]
-        bwd_profile["partial_reduce_share"] = _safe_ratio(
-            partial_reduce["median_ms"],
-            total,
-        )
-    except Exception as exc:
-        bwd_profile["partial_profile_error"] = f"{type(exc).__name__}: {exc}"
 
     # Derive bwd-only timings.
     bwd_pb_ms = max(0.0, fwd_bwd_pb["median_ms"] - fwd_pb["median_ms"])
@@ -455,18 +429,6 @@ def main() -> int:
     if "simd_p_reduce_kernel" in bwd_profile:
         simd = bwd_profile["simd_p_reduce_kernel"]
         print(f"{'bwd C simd profile':22} {'':>14} {simd['median_ms']:>10.3f} ms {'':>11}")
-    if "partial_kernel" in bwd_profile and "partial_reduce" in bwd_profile:
-        partial_kernel = bwd_profile["partial_kernel"]
-        partial_reduce = bwd_profile["partial_reduce"]
-        print(
-            f"{'bwd C partial scan':22} {'':>14} "
-            f"{partial_kernel['median_ms']:>10.3f} ms {'':>11}"
-        )
-        print(
-            f"{'bwd C partial reduce':22} {'':>14} "
-            f"{partial_reduce['median_ms']:>10.3f} ms "
-            f"{bwd_profile['partial_reduce_share']:>10.3f}"
-        )
     print()
 
     # Recommendation logic from the task spec.
@@ -516,15 +478,15 @@ def main() -> int:
         "blocked_path_c_codegen_gaps": [
             "lowered Path C fwd still recomputes some lane-derived indices inside the t loop",
             "Path C bwd still performs the reverse recurrence serially over T and N per lane",
-            "non-P=32 bwd shapes still fall back to per-lane partial writes plus host reductions",
+            "unsupported bwd reduction shapes now fail closed until semantic reduction lowering covers them",
         ],
         "remembered_optimizations": [
             "TileLang local.var scalar y_acc instead of thread float[1]",
             "TileLang Metal local.var PrintExpr statement-order fix",
             "Bench harness uses paired alternating samples to avoid order/warmup drift",
-            "Path C bwd reconstructs h_prev in-place from h_t instead of writing global h_steps",
-            "Path C bwd uses Metal simd_sum P-reductions for P=32 instead of global dB/dC partial buffers",
-            "Bench harness profiles Path C bwd kernel and partial reductions separately",
+            "Path C bwd consumes explicit state snapshot boundaries instead of unsafe inverse-state reconstruction",
+            "Path C bwd uses TileLang thread_allreduce P-axis reductions instead of public dB/dC partial buffers",
+            "Bench harness profiles the final-gradient SIMD/snapshot bwd route directly",
             "AUTO selects full Path C only when fwd, bwd, and fwd+bwd receipts are no-worse",
             "AUTO can still select Path C forward with Path B backward when only fwd is no-worse",
         ],

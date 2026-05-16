@@ -35,7 +35,7 @@ import os
 import sys
 import threading
 import warnings
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any, cast
 
 import mlx.core as mx
@@ -873,90 +873,6 @@ def _fp8_vecmat_tvm_ffi_kernel_for(
     return kernel
 
 
-def canonical_vecmat_runtime_body(*, N: int, K: int, scale_w_per_row: bool) -> str:
-    """Path-C runtime body canonicalized to one SIMD-group per output row."""
-
-    k_words = K // 4
-    scale_w_expr = "B_scale[row]" if scale_w_per_row else "B_scale[0]"
-    # Keep the hot loop structurally aligned with Path B, but specialize known
-    # dimensions so Path C does not pay dynamic shape loads in the kernel.
-    return f"""
-    uint gid = thread_position_in_grid.x;
-    uint simd_lane = thread_index_in_simdgroup;
-    uint row = gid / 32u;
-    if (row >= {N}u) return;
-
-    uint row_offset = row * {K}u;
-    float sum = 0.0f;
-
-    device const uint* A4 = reinterpret_cast<device const uint*>(A);
-    device const uint* B4 = reinterpret_cast<device const uint*>(B + row_offset);
-    const uint K4 = {k_words}u;
-    for (uint i = simd_lane; i < K4; i += 32u) {{
-        uint px = A4[i];
-        uint pw = B4[i];
-        sum += fp8_e4m3fn_lut[px & 0xFFu]          * fp8_e4m3fn_lut[pw & 0xFFu]
-             + fp8_e4m3fn_lut[(px >> 8) & 0xFFu]   * fp8_e4m3fn_lut[(pw >> 8) & 0xFFu]
-             + fp8_e4m3fn_lut[(px >> 16) & 0xFFu]  * fp8_e4m3fn_lut[(pw >> 16) & 0xFFu]
-             + fp8_e4m3fn_lut[(px >> 24) & 0xFFu]  * fp8_e4m3fn_lut[(pw >> 24) & 0xFFu];
-    }}
-
-    sum = simd_sum(sum);
-
-    if (simd_lane == 0u) {{
-        float sx = float(A_scale[0]);
-        float sw = float({scale_w_expr});
-        C[row] = sum * sx * sw;
-    }}
-"""
-
-
-def _fuse_canonical_vecmat_runtime_body(
-    lowering: _msl_transform.TileLangMSLLowering,
-    *,
-    N: int,
-    K: int,
-    reduce_threads: int,
-    vec: int,
-    scale_w_per_row: bool,
-    vectorized_loads: bool,
-) -> tuple[_msl_transform.TileLangMSLLowering, tuple[int, ...]]:
-    """Fuse the canonical Path-B hot loop into Path-C's runtime lowering.
-
-    TileLang still owns the ABI/signature/header and launch metadata. For the
-    canonical M=1 FP8 vecmat case, replacing only the body removes an avoidable
-    block/thread indexing layer and the dot4 helper trampoline while keeping
-    the same prepared GPU buffers.
-    """
-
-    if not _is_canonical_vecmat_fast_path(
-        reduce_threads=reduce_threads,
-        vec=vec,
-        K=K,
-        vectorized_loads=vectorized_loads,
-    ):
-        return lowering, (N,)
-
-    body = canonical_vecmat_runtime_body(
-        N=N,
-        K=K,
-        scale_w_per_row=scale_w_per_row,
-    )
-    from cppmega_mlx.nn._tilelang.fp8_msl_kernels import _FP8_HEADER
-
-    _prelude, sig_text, _body_text = _msl_transform._split_kernel_msl(lowering.msl_text)
-    kernel_name = _msl_transform._KERNEL_DEF_RE.search(
-        _msl_transform._mask_msl_comments_and_strings(lowering.msl_text)
-    )
-    if kernel_name is None:
-        return replace(lowering, header=_FP8_HEADER, body=body), (N,)
-    fused_msl = (
-        f"{_FP8_HEADER}\n\n"
-        f"kernel void {kernel_name.group('name')}({sig_text}) {{\n{body}\n}}\n"
-    )
-    return replace(lowering, header=_FP8_HEADER, body=body, msl_text=fused_msl), (N,)
-
-
 def _tilelang_output_dtype_for_mlx(dtype: Any, *, op_name: str) -> str:
     if dtype == mx.float32:
         return "float32"
@@ -1227,7 +1143,6 @@ __all__ = [
     "FP8VecmatPathCStatus",
     "FP8_PATH_C_LEGACY_MLX_FAST_ENV",
     "TILELANG_METAL_VECMAT_TARGET",
-    "canonical_vecmat_runtime_body",
     "fp8_scaled_vecmat_path_c_direct",
     "fp8_scaled_vecmat_path_c",
     "fp8_vecmat_msl_blockers",

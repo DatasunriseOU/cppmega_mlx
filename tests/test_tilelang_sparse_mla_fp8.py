@@ -23,6 +23,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import math
+import re
 from pathlib import Path
 from typing import cast
 
@@ -389,6 +390,15 @@ def test_fp8_sparse_mla_path_c_qk_reduce_lowered_features_are_reported() -> None
     assert _feature_int(features, "device_const_uint") == 0
     assert _feature_int(features, "fp8_e4m3_lut") == 0
     assert _feature_int(features, "metal_fp8_dot4_helper") >= 1
+    tuned_msl = lower_fp8_sparse_mla_qk_reduce_msl(
+        N=16,
+        K=64,
+        outputs_per_block=16,
+        reduce_threads=32,
+        vec=4,
+    )
+    assert re.search(r"red_buf\d+\[0\] = simd_sum\(", tuned_msl)
+    assert not re.search(r"C\[[^\n;]*=\s*[^\n;]*simd_sum\(", tuned_msl)
 
 
 def test_fp8_sparse_mla_path_c_qk_reduce_matches_dequant_oracle() -> None:
@@ -1175,6 +1185,21 @@ def test_fp8_apply_force_metal_raises_direct_msl_blocker() -> None:
     q, kv, indices, d_v = _make_inputs()
     with pytest.raises(RuntimeError, match="direct-MSL Path B is retired"):
         sparse_mla_fp8_apply(q, kv, indices, d_v=d_v, force_metal=True)
+
+
+def test_retired_fp8_direct_msl_backward_has_no_partial_route() -> None:
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "cppmega_mlx"
+        / "nn"
+        / "_tilelang"
+        / "sparse_mla_fp8.py"
+    ).read_text(encoding="utf-8")
+
+    assert "_FP8_BWD_KERNEL_SOURCE" not in source
+    assert "sparse_mla_fp8_bwd_metal_impl" not in source
+    assert "_reduce_dkv_partial_fp32" not in source
+    assert "dkv_partial" not in source
 
 
 # ---------------------------------------------------------------------------
