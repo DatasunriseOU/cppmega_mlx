@@ -970,15 +970,44 @@ def test_fp8_path_c_bwd_owner_outputs_run_through_atomic_tvm_ffi() -> None:
     assert np.all(np.isfinite(np.asarray(dkv_buffer)))
 
 
-def test_fp8_path_c_bwd_without_owner_outputs_uses_native_graph_outputs() -> None:
+def test_fp8_path_c_bwd_without_owner_outputs_clears_atomic_dkv() -> None:
     _requires_native_tilelang_graph_outputs()
 
     q, kv, indices, d_v = _make_inputs(scale=0.1)
-    q_fp8 = mx.zeros(tuple(q.shape), dtype=mx.uint8)
-    kv_fp8 = mx.zeros(tuple(kv.shape), dtype=mx.uint8)
-    q_scale = mx.ones(tuple(q.shape[:-1]), dtype=mx.float32)
-    kv_scale = mx.ones(tuple(kv.shape[:-1]), dtype=mx.float32)
-    d_out = mx.zeros(tuple(q.shape[:3]) + (d_v,), dtype=mx.float32)
+    q = q.astype(mx.bfloat16)
+    kv = kv.astype(mx.bfloat16)
+    q_fp8, q_scale = _to_fp8_with_per_token_scale(q)
+    kv_fp8, kv_scale = _to_fp8_with_per_token_scale(kv)
+    d_out = mx.array(
+        np.linspace(
+            -0.25,
+            0.25,
+            num=int(q.shape[0] * q.shape[1] * q.shape[2] * d_v),
+            dtype=np.float32,
+        ).reshape(tuple(q.shape[:3]) + (d_v,))
+    )
+
+    dq_buffer = _materialized_owner_buffer(tuple(q.shape), mx.float32)
+    dkv_buffer = _materialized_owner_buffer(tuple(kv.shape), mx.float32)
+    owner_result = sparse_mla_fp8_bwd_path_c(
+        q_fp8,
+        q_scale,
+        kv_fp8,
+        kv_scale,
+        d_out,
+        indices,
+        sm_scale=q.shape[-1] ** -0.5,
+        d_v=d_v,
+        force_path_c=True,
+        dq_buffer=dq_buffer,
+        dkv_buffer=dkv_buffer,
+    )
+    assert owner_result == (dq_buffer, dkv_buffer)
+    mx.eval(dq_buffer, dkv_buffer)
+
+    poison = mx.full(tuple(kv.shape), float("nan"), dtype=mx.float32)
+    mx.eval(poison)
+    del poison
 
     result = sparse_mla_fp8_bwd_path_c(
         q_fp8,
@@ -1001,6 +1030,12 @@ def test_fp8_path_c_bwd_without_owner_outputs_uses_native_graph_outputs() -> Non
     mx.eval(dq, dkv)
     assert np.all(np.isfinite(np.asarray(dq)))
     assert np.all(np.isfinite(np.asarray(dkv)))
+    np.testing.assert_allclose(
+        np.asarray(dq), np.asarray(dq_buffer), rtol=1e-5, atol=1e-5
+    )
+    np.testing.assert_allclose(
+        np.asarray(dkv), np.asarray(dkv_buffer), rtol=1e-5, atol=1e-5
+    )
 
 
 def test_fp8_path_c_prepared_float_vjp_uses_native_graph_outputs() -> None:

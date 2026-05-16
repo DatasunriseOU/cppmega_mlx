@@ -89,22 +89,33 @@ def test_tilelang_imports_resolve_to_local_tree_and_pinned_ffi() -> None:
     tilelang_root = fp8_bench.TILELANG_ROOT.resolve()
     local_tilelang_init = tilelang_root / "tilelang" / "__init__.py"
     local_tvm_init = tilelang_root / "3rdparty" / "tvm" / "python" / "tvm" / "__init__.py"
+    local_tvm_ffi_root = tilelang_root / "3rdparty" / "tvm" / "3rdparty" / "tvm-ffi"
+    local_tvm_ffi_init = local_tvm_ffi_root / "python" / "tvm_ffi" / "__init__.py"
     if not local_tilelang_init.is_file() or not local_tvm_init.is_file():
         pytest.skip(f"local apple-head TileLang checkout is not available at {tilelang_root}")
+    if not local_tvm_ffi_init.is_file():
+        pytest.skip(f"local TVM-FFI checkout is not available at {local_tvm_ffi_root}")
 
     tilelang = import_module("tilelang")
     tvm = import_module("tvm")
     tvm_ffi = import_module("tvm_ffi")
     assert isinstance(tilelang.__file__, str)
     assert isinstance(tvm.__file__, str)
+    assert isinstance(tvm_ffi.__file__, str)
 
     tilelang_path = Path(tilelang.__file__).resolve()
     tvm_path = Path(tvm.__file__).resolve()
+    tvm_ffi_path = Path(tvm_ffi.__file__).resolve()
 
     assert tilelang_path.is_relative_to(tilelang_root)
     assert tvm_path.is_relative_to(tilelang_root / "3rdparty" / "tvm" / "python")
-    assert getattr(tvm_ffi, "__version__", None) == "0.1.12.dev0+g3c35034fd.d20260509"
-    assert importlib_metadata.version("apache-tvm-ffi") == "0.1.12.dev0+g3c35034fd.d20260509"
+    assert tvm_ffi_path.is_relative_to(local_tvm_ffi_root / "python")
+
+    ffi_dist = importlib_metadata.distribution("apache-tvm-ffi")
+    direct_url = ffi_dist.read_text("direct_url.json")
+    assert direct_url is not None
+    direct_url_payload = json.loads(direct_url)
+    assert Path(direct_url_payload["url"].removeprefix("file://")).resolve() == local_tvm_ffi_root
 
 
 def test_topk_strict_requires_both_paths_and_ratio_no_worse() -> None:
@@ -737,14 +748,39 @@ def test_fp8_strict_requires_paths_ratio_and_parity_for_matmul_and_vecmat() -> N
         _fp8_shape_row(kind="vecmat", parity={"max_abs": math.nan, "max_rel": 0.0}),
         max_ratio=1.0,
     )
-    assert not fp8_bench._shape_row_strict_ok(
-        _fp8_shape_row(kind="vecmat", parity={"max_abs": 1.0e-3, "max_rel": 0.0}),
+    assert fp8_bench._shape_row_strict_ok(
+        _fp8_shape_row(
+            kind="vecmat",
+            parity={"max_abs": 1.52587890625e-5, "max_rel": 1.0e-7},
+        ),
         max_ratio=1.0,
     )
-    assert not fp8_bench._shape_row_strict_ok(
+    assert fp8_bench._shape_row_strict_ok(
         _fp8_shape_row(kind="vecmat", parity={"max_abs": 0.0, "max_rel": 1.0e-3}),
         max_ratio=1.0,
     )
+    assert not fp8_bench._shape_row_strict_ok(
+        _fp8_shape_row(kind="vecmat", parity={"max_abs": 1.0e-3, "max_rel": 1.0e-3}),
+        max_ratio=1.0,
+    )
+
+
+def test_fp8_vecmat_strict_uses_paired_ratio_over_unpaired_token_jitter() -> None:
+    row = _fp8_shape_row(
+        kind="vecmat",
+        ratio=1.25,
+        parity={"max_abs": 0.0, "max_rel": 0.0},
+    )
+    rows = row["rows"]
+    assert isinstance(rows, list)
+    path_b, path_c = rows
+    path_b["bench"]["tokens_per_s"] = 1000.0
+    path_c["bench"]["tokens_per_s"] = 900.0
+    path_c["paired_ratios"] = {
+        "path_c_mlx_tilelang_fp8_scaled_vecmat_over_path_b_msl_fp8_scaled_vecmat_paired_median": 1.0,
+    }
+
+    assert fp8_bench._shape_row_strict_ok(row, max_ratio=1.0)
 
 
 def test_fp8_strict_fails_when_path_b_or_path_c_bench_failed() -> None:

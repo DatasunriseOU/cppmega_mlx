@@ -3,9 +3,10 @@
 The Path B module owns the optimized hand-written MSL forward/backward pair.
 This module supplies the Path C public apply surface by lowering TileLang
 ``@T.prim_func`` kernels to Metal MSL and dispatching them through MLX. It keeps
-the same explicit tensor contract as Path B: callers provide ``h0`` up front,
-forward returns TileLang-owned outputs, and backward uses explicit partial
-output buffers for reductions/scratch instead of CPU staging.
+the same explicit tensor contract as Path B: callers provide ``h0`` up front
+and forward returns TileLang-owned outputs. Backward produces final-gradient
+``dW`` buffers on supported routes; unsupported multi-batch aligned reductions
+fail closed until semantic reduction lowering can prove and lower them.
 """
 
 from dataclasses import dataclass
@@ -15,7 +16,8 @@ from typing import Any, cast
 import mlx.core as mx
 
 from cppmega_mlx.nn._tilelang import _msl_transform
-from cppmega_mlx.nn._tilelang._engine_dispatch import dispatch_lower
+from cppmega_mlx.nn._tilelang._engine_dispatch import compile_native_tilelang_kernel
+from cppmega_mlx.nn._tilelang._msl_extraction import extract_msl_from_engine_artifact
 from cppmega_mlx.nn._tilelang._msl_transform import MSLDispatchUnsupported
 from cppmega_mlx.nn._tilelang.m2rnn import (
     _validate_inputs,
@@ -40,6 +42,22 @@ def _threadgroup_threads_for(*lanes: int) -> int:
     while threads < target:
         threads <<= 1
     return min(256, threads)
+
+
+def _symbol_part(value: object) -> str:
+    text = str(value)
+    return (
+        text.replace("-", "m")
+        .replace("+", "p")
+        .replace(".", "p")
+        .replace(" ", "_")
+        .replace(",", "_")
+    )
+
+
+def _with_global_symbol(func: Any, prefix: str, *parts: object) -> Any:
+    suffix = "_".join(_symbol_part(part) for part in parts)
+    return func.with_attr({"global_symbol": f"{prefix}_{suffix}"})
 
 
 def _tl_dtype_for(dtype: mx.Dtype) -> str | None:
@@ -80,7 +98,7 @@ def _path_c_inputs_eligible(
 _FWD_OUTPUT_NAMES = ("h_last", "tanh_cache", "y")
 _FWD_OUTPUT_IDX = (6, 7, 8)
 _BWD_OUTPUT_NAMES = (
-    "dW_partial",
+    "dW",
     "dh0",
     "dk",
     "dq",
@@ -94,7 +112,7 @@ _PACKED_POST_FWD_OUTPUT_NAMES = ("h_last", "tanh_cache", "post")
 _PACKED_POST_FWD_OUTPUT_IDX = (6, 7, 8)
 _PACKED_BWD_OUTPUT_NAMES = (
     "dconv_input",
-    "dW_partial",
+    "dW",
     "dxf",
     "dh0",
     "h_steps_scratch",
@@ -107,6 +125,8 @@ _POST_BWD_OUTPUT_IDX = (5, 6, 7, 8)
 _POST_RECOMPUTE_BWD_OUTPUT_IDX = (7, 8, 9, 10)
 _PACKED_FWD_K_PARALLEL_MIN_K = 4
 _PACKED_BWD_K_PARALLEL_MIN_K = 4
+_MAPPED_PACKED_FWD_K_PARALLEL_MIN_K = 8
+_MAPPED_PACKED_BWD_K_PARALLEL_MIN_K = 8
 
 M2RNNFwdOwnerOutputs = tuple[mx.array, mx.array, mx.array]
 M2RNNBwdOwnerOutputs = tuple[
@@ -209,6 +229,36 @@ def _kernel_lowering_status(
     return M2RNNPathCStatus(True, f"{label} lowers to a Metal kernel")
 
 
+def _compile_native_metal_kernel_with_lowering(
+    prim_func: Any,
+    *,
+    out_idx: int | list[int] | tuple[int, ...],
+    target: Any = "metal",
+    pass_configs: dict[str, Any] | None = None,
+) -> tuple[Any, _msl_transform.TileLangMSLLowering]:
+    """Compile one native TVM-FFI kernel and extract diagnostics from it.
+
+    P2 removes the legacy MSL-shim pre-lowering from production Path C routes:
+    the executable kernel is the source of truth, and MSL text is only a
+    diagnostic view of that already-compiled native artifact.
+    """
+
+    kernel = compile_native_tilelang_kernel(
+        prim_func,
+        target,
+        out_idx=out_idx,
+        pass_configs=pass_configs,
+        allow_graph_outputs=True,
+    )
+    lowering = extract_msl_from_engine_artifact(kernel.artifact, target=target)
+    if lowering is None:
+        raise MSLDispatchUnsupported(
+            "native TileLang TVM-FFI artifact did not expose Metal source "
+            "for diagnostics"
+        )
+    return kernel, cast(_msl_transform.TileLangMSLLowering, lowering)
+
+
 def _m2rnn_fwd_owner_outputs(
     out: M2RNNFwdOwnerOutputs | None,
     *,
@@ -252,95 +302,6 @@ def _m2rnn_fwd_owner_outputs(
             tanh_cache,
             shape=(batch, seq, heads, k_dim, v_dim),
             dtype=dtype,
-        ),
-    )
-
-
-def _m2rnn_bwd_owner_outputs(
-    out: M2RNNBwdOwnerOutputs | None,
-    *,
-    batch: int,
-    seq: int,
-    heads: int,
-    k_dim: int,
-    v_dim: int,
-    dtype: mx.Dtype,
-) -> M2RNNBwdOwnerOutputs:
-    op_name = "m2rnn_bwd_path_c"
-    if out is None:
-        return (
-            mx.zeros((batch, seq, heads, k_dim), dtype=dtype),
-            mx.zeros((batch, seq, heads, k_dim), dtype=dtype),
-            mx.zeros((batch, seq, heads, v_dim), dtype=dtype),
-            mx.zeros((batch, heads, v_dim, v_dim), dtype=dtype),
-            mx.zeros((batch, seq, heads), dtype=dtype),
-            mx.zeros((batch, heads, k_dim, v_dim), dtype=dtype),
-            mx.zeros((batch, heads, seq, k_dim, v_dim), dtype=dtype),
-        )
-    if not isinstance(out, tuple) or len(out) != 7:
-        raise TypeError(
-            "m2rnn_bwd_path_c: out must be a "
-            "(dq, dk, dv, dW_partial, dxf, dh0, h_steps_scratch) "
-            "owner-output tuple"
-        )
-    names = ("dq", "dk", "dv", "dW_partial", "dxf", "dh0", "h_steps_scratch")
-    expected_shapes = (
-        (batch, seq, heads, k_dim),
-        (batch, seq, heads, k_dim),
-        (batch, seq, heads, v_dim),
-        (batch, heads, v_dim, v_dim),
-        (batch, seq, heads),
-        (batch, heads, k_dim, v_dim),
-        (batch, heads, seq, k_dim, v_dim),
-    )
-    return cast(
-        M2RNNBwdOwnerOutputs,
-        tuple(
-            _require_owner_array(op_name, name, array, shape=shape, dtype=dtype)
-            for name, array, shape in zip(names, out, expected_shapes, strict=True)
-        ),
-    )
-
-
-def _m2rnn_packed_bwd_owner_outputs(
-    out: M2RNNPackedBwdOwnerOutputs | None,
-    *,
-    batch: int,
-    seq: int,
-    heads: int,
-    conv_dim: int,
-    k_dim: int,
-    v_dim: int,
-    dtype: mx.Dtype,
-) -> M2RNNPackedBwdOwnerOutputs:
-    op_name = "m2rnn_packed_bwd_path_c"
-    if out is None:
-        return (
-            mx.zeros((batch, seq, conv_dim), dtype=dtype),
-            mx.zeros((batch, heads, v_dim, v_dim), dtype=dtype),
-            mx.zeros((batch, seq, heads), dtype=dtype),
-            mx.zeros((batch, heads, k_dim, v_dim), dtype=dtype),
-            mx.zeros((batch, heads, seq, k_dim, v_dim), dtype=dtype),
-        )
-    if not isinstance(out, tuple) or len(out) != 5:
-        raise TypeError(
-            "m2rnn_packed_bwd_path_c: out must be a "
-            "(dconv_input, dW_partial, dxf, dh0, h_steps_scratch) "
-            "owner-output tuple"
-        )
-    names = ("dconv_input", "dW_partial", "dxf", "dh0", "h_steps_scratch")
-    expected_shapes = (
-        (batch, seq, conv_dim),
-        (batch, heads, v_dim, v_dim),
-        (batch, seq, heads),
-        (batch, heads, k_dim, v_dim),
-        (batch, heads, seq, k_dim, v_dim),
-    )
-    return cast(
-        M2RNNPackedBwdOwnerOutputs,
-        tuple(
-            _require_owner_array(op_name, name, array, shape=shape, dtype=dtype)
-            for name, array, shape in zip(names, out, expected_shapes, strict=True)
         ),
     )
 
@@ -427,7 +388,13 @@ def _fwd_kernel_for(
                                 carrier_dtype,
                             )
 
-    lowering = dispatch_lower(fwd, target="metal", return_msl=True)
+    fwd = _with_global_symbol(
+        fwd, "m2rnn_path_c_fwd", batch, seq, heads, k_dim, v_dim, carrier_dtype
+    )
+    kernel, lowering = _compile_native_metal_kernel_with_lowering(
+        fwd,
+        out_idx=list(_FWD_OUTPUT_IDX),
+    )
     input_names = [
         name for name in lowering.buffer_param_names if name not in _FWD_OUTPUT_NAMES
     ]
@@ -436,14 +403,6 @@ def _fwd_kernel_for(
             "unexpected M2RNN Path C buffer signature: "
             + ", ".join(lowering.buffer_param_names)
         )
-    import tilelang
-
-    kernel = tilelang.compile(
-        fwd,
-        target=_msl_transform._as_metal_target("metal"),
-        execution_backend="tvm_ffi",
-        out_idx=list(_FWD_OUTPUT_IDX),
-    )
     return kernel, lowering
 
 
@@ -474,7 +433,7 @@ def _bwd_kernel_for(
         xf: T.Tensor((batch, seq, heads), carrier_dtype),
         h0: T.Tensor((batch, heads, k_dim, v_dim), carrier_dtype),
         tanh_cache: T.Tensor((batch, seq, heads, k_dim, v_dim), carrier_dtype),
-        dW_partial: T.Tensor((batch, heads, v_dim, v_dim), carrier_dtype),
+        dW: T.Tensor((heads, v_dim, v_dim), carrier_dtype),
         dh0: T.Tensor((batch, heads, k_dim, v_dim), carrier_dtype),
         dk: T.Tensor((batch, seq, heads, k_dim), carrier_dtype),
         dq: T.Tensor((batch, seq, heads, k_dim), carrier_dtype),
@@ -610,12 +569,18 @@ def _bwd_kernel_for(
                         dh0[b, h, kk, vv] = T.cast(dh[kk, vv], carrier_dtype)
                 for v0 in T.serial(v_dim):
                     for vv in T.serial(v_dim):
-                        dW_partial[b, h, v0, vv] = T.cast(
+                        dW[h, v0, vv] = T.cast(
                             dW_acc[v0, vv],
                             carrier_dtype,
                         )
 
-    lowering = dispatch_lower(bwd, target="metal", return_msl=True)
+    bwd = _with_global_symbol(
+        bwd, "m2rnn_path_c_bwd", batch, seq, heads, k_dim, v_dim, carrier_dtype
+    )
+    kernel, lowering = _compile_native_metal_kernel_with_lowering(
+        bwd,
+        out_idx=list(_BWD_OUTPUT_IDX),
+    )
     input_names = [
         name for name in lowering.buffer_param_names if name not in _BWD_OUTPUT_NAMES
     ]
@@ -624,14 +589,6 @@ def _bwd_kernel_for(
             "unexpected M2RNN Path C bwd buffer signature: "
             + ", ".join(lowering.buffer_param_names)
         )
-    import tilelang
-
-    kernel = tilelang.compile(
-        bwd,
-        target=_msl_transform._as_metal_target("metal"),
-        execution_backend="tvm_ffi",
-        out_idx=list(_BWD_OUTPUT_IDX),
-    )
     return kernel, lowering
 
 
@@ -736,7 +693,20 @@ def _packed_fwd_k_parallel_kernel_for(
                 for vv in T.serial(v_dim):
                     h_last[b, h, tid, vv] = T.cast(h_row[vv], carrier_dtype)
 
-    lowering = dispatch_lower(fwd, target="metal", return_msl=True)
+    fwd = _with_global_symbol(
+        fwd,
+        "m2rnn_packed_fwd_kp",
+        batch,
+        seq,
+        heads,
+        k_dim,
+        v_dim,
+        carrier_dtype,
+    )
+    kernel, lowering = _compile_native_metal_kernel_with_lowering(
+        fwd,
+        out_idx=list(_PACKED_FWD_OUTPUT_IDX),
+    )
     input_names = [
         name for name in lowering.buffer_param_names if name not in _FWD_OUTPUT_NAMES
     ]
@@ -745,14 +715,6 @@ def _packed_fwd_k_parallel_kernel_for(
             "unexpected packed M2RNN Path C k-parallel buffer signature: "
             + ", ".join(lowering.buffer_param_names)
         )
-    import tilelang
-
-    kernel = tilelang.compile(
-        fwd,
-        target=_msl_transform._as_metal_target("metal"),
-        execution_backend="tvm_ffi",
-        out_idx=list(_PACKED_FWD_OUTPUT_IDX),
-    )
     return kernel, lowering
 
 
@@ -863,7 +825,13 @@ def _packed_fwd_kernel_for(
                                 carrier_dtype,
                             )
 
-    lowering = dispatch_lower(fwd, target="metal", return_msl=True)
+    fwd = _with_global_symbol(
+        fwd, "m2rnn_packed_fwd", batch, seq, heads, k_dim, v_dim, carrier_dtype
+    )
+    kernel, lowering = _compile_native_metal_kernel_with_lowering(
+        fwd,
+        out_idx=list(_PACKED_FWD_OUTPUT_IDX),
+    )
     input_names = [
         name for name in lowering.buffer_param_names if name not in _FWD_OUTPUT_NAMES
     ]
@@ -872,14 +840,6 @@ def _packed_fwd_kernel_for(
             "unexpected packed M2RNN Path C buffer signature: "
             + ", ".join(lowering.buffer_param_names)
         )
-    import tilelang
-
-    kernel = tilelang.compile(
-        fwd,
-        target=_msl_transform._as_metal_target("metal"),
-        execution_backend="tvm_ffi",
-        out_idx=list(_PACKED_FWD_OUTPUT_IDX),
-    )
     return kernel, lowering
 
 
@@ -918,7 +878,7 @@ def _packed_bwd_k_parallel_kernel_for(
         h0: T.Tensor((batch, heads, k_dim, v_dim), carrier_dtype),
         tanh_cache: T.Tensor((batch, seq, heads, k_dim, v_dim), carrier_dtype),
         dconv_input: T.Tensor((batch, seq, conv_dim), carrier_dtype),
-        dW_partial: T.Tensor((batch, heads, v_dim, v_dim), carrier_dtype),
+        dW: T.Tensor((heads, v_dim, v_dim), carrier_dtype),
         dxf: T.Tensor((batch, seq, heads), carrier_dtype),
         dh0: T.Tensor((batch, heads, k_dim, v_dim), carrier_dtype),
         h_steps_scratch: T.Tensor((batch, heads, seq, k_dim, v_dim), carrier_dtype),
@@ -1064,12 +1024,25 @@ def _packed_bwd_k_parallel_kernel_for(
                 for vv in T.serial(v_dim):
                     dh0[b, h, tid, vv] = T.cast(dh_row[vv], carrier_dtype)
             for i in T.serial(tid, v_dim * v_dim, step=threads):
-                dW_partial[b, h, i // v_dim, i % v_dim] = T.cast(
+                dW[h, i // v_dim, i % v_dim] = T.cast(
                     dW_shared[i // v_dim, i % v_dim],
                     carrier_dtype,
                 )
 
-    lowering = dispatch_lower(bwd, target="metal", return_msl=True)
+    bwd = _with_global_symbol(
+        bwd,
+        "m2rnn_packed_bwd_kp",
+        batch,
+        seq,
+        heads,
+        k_dim,
+        v_dim,
+        carrier_dtype,
+    )
+    kernel, lowering = _compile_native_metal_kernel_with_lowering(
+        bwd,
+        out_idx=list(_PACKED_BWD_OUTPUT_IDX),
+    )
     input_names = [
         name
         for name in lowering.buffer_param_names
@@ -1080,14 +1053,6 @@ def _packed_bwd_k_parallel_kernel_for(
             "unexpected packed M2RNN Path C bwd buffer signature: "
             + ", ".join(lowering.buffer_param_names)
         )
-    import tilelang
-
-    kernel = tilelang.compile(
-        bwd,
-        target=_msl_transform._as_metal_target("metal"),
-        execution_backend="tvm_ffi",
-        out_idx=list(_PACKED_BWD_OUTPUT_IDX),
-    )
     return kernel, lowering
 
 
@@ -1132,7 +1097,7 @@ def _packed_bwd_kernel_for(
         h0: T.Tensor((batch, heads, k_dim, v_dim), carrier_dtype),
         tanh_cache: T.Tensor((batch, seq, heads, k_dim, v_dim), carrier_dtype),
         dconv_input: T.Tensor((batch, seq, conv_dim), carrier_dtype),
-        dW_partial: T.Tensor((batch, heads, v_dim, v_dim), carrier_dtype),
+        dW: T.Tensor((heads, v_dim, v_dim), carrier_dtype),
         dxf: T.Tensor((batch, seq, heads), carrier_dtype),
         dh0: T.Tensor((batch, heads, k_dim, v_dim), carrier_dtype),
         h_steps_scratch: T.Tensor((batch, heads, seq, k_dim, v_dim), carrier_dtype),
@@ -1278,12 +1243,18 @@ def _packed_bwd_kernel_for(
                         dh0[b, h, kk, vv] = T.cast(dh[kk, vv], carrier_dtype)
                 for v0 in T.serial(v_dim):
                     for vv in T.serial(v_dim):
-                        dW_partial[b, h, v0, vv] = T.cast(
+                        dW[h, v0, vv] = T.cast(
                             dW_acc[v0, vv],
                             carrier_dtype,
                         )
 
-    lowering = dispatch_lower(bwd, target="metal", return_msl=True)
+    bwd = _with_global_symbol(
+        bwd, "m2rnn_packed_bwd", batch, seq, heads, k_dim, v_dim, carrier_dtype
+    )
+    kernel, lowering = _compile_native_metal_kernel_with_lowering(
+        bwd,
+        out_idx=list(_PACKED_BWD_OUTPUT_IDX),
+    )
     input_names = [
         name
         for name in lowering.buffer_param_names
@@ -1294,14 +1265,6 @@ def _packed_bwd_kernel_for(
             "unexpected packed M2RNN Path C bwd buffer signature: "
             + ", ".join(lowering.buffer_param_names)
         )
-    import tilelang
-
-    kernel = tilelang.compile(
-        bwd,
-        target=_msl_transform._as_metal_target("metal"),
-        execution_backend="tvm_ffi",
-        out_idx=list(_PACKED_BWD_OUTPUT_IDX),
-    )
     return kernel, lowering
 
 
@@ -1415,7 +1378,25 @@ def _mapped_packed_fwd_k_parallel_kernel_for(
                 for vv in T.serial(v_dim):
                     h_last[b, h, tid, vv] = T.cast(h_row[vv], carrier_dtype)
 
-    lowering = dispatch_lower(fwd, target="metal", return_msl=True)
+    fwd = _with_global_symbol(
+        fwd,
+        "m2rnn_mapped_packed_fwd_kp",
+        batch,
+        seq,
+        total_heads,
+        q_heads,
+        k_heads,
+        v_heads,
+        w_heads,
+        f_heads,
+        k_dim,
+        v_dim,
+        carrier_dtype,
+    )
+    kernel, lowering = _compile_native_metal_kernel_with_lowering(
+        fwd,
+        out_idx=list(_PACKED_FWD_OUTPUT_IDX),
+    )
     input_names = [
         name for name in lowering.buffer_param_names if name not in _FWD_OUTPUT_NAMES
     ]
@@ -1424,14 +1405,6 @@ def _mapped_packed_fwd_k_parallel_kernel_for(
             "unexpected mapped packed M2RNN k-parallel Path C buffer signature: "
             + ", ".join(lowering.buffer_param_names)
         )
-    import tilelang
-
-    kernel = tilelang.compile(
-        fwd,
-        target=_msl_transform._as_metal_target("metal"),
-        execution_backend="tvm_ffi",
-        out_idx=list(_PACKED_FWD_OUTPUT_IDX),
-    )
     return kernel, lowering
 
 
@@ -1451,7 +1424,7 @@ def _mapped_packed_fwd_kernel_for(
     *,
     return_msl: bool = False,
 ) -> tuple[Any, _msl_transform.TileLangMSLLowering]:
-    if k_dim >= _PACKED_FWD_K_PARALLEL_MIN_K and max(k_dim, v_dim) <= 256:
+    if k_dim >= _MAPPED_PACKED_FWD_K_PARALLEL_MIN_K and max(k_dim, v_dim) <= 256:
         return _mapped_packed_fwd_k_parallel_kernel_for(
             batch,
             seq,
@@ -1562,7 +1535,25 @@ def _mapped_packed_fwd_kernel_for(
                                 carrier_dtype,
                             )
 
-    lowering = dispatch_lower(fwd, target="metal", return_msl=True)
+    fwd = _with_global_symbol(
+        fwd,
+        "m2rnn_mapped_packed_fwd",
+        batch,
+        seq,
+        total_heads,
+        q_heads,
+        k_heads,
+        v_heads,
+        w_heads,
+        f_heads,
+        k_dim,
+        v_dim,
+        carrier_dtype,
+    )
+    kernel, lowering = _compile_native_metal_kernel_with_lowering(
+        fwd,
+        out_idx=list(_PACKED_FWD_OUTPUT_IDX),
+    )
     input_names = [
         name for name in lowering.buffer_param_names if name not in _FWD_OUTPUT_NAMES
     ]
@@ -1571,14 +1562,6 @@ def _mapped_packed_fwd_kernel_for(
             "unexpected mapped packed M2RNN Path C buffer signature: "
             + ", ".join(lowering.buffer_param_names)
         )
-    import tilelang
-
-    kernel = tilelang.compile(
-        fwd,
-        target=_msl_transform._as_metal_target("metal"),
-        execution_backend="tvm_ffi",
-        out_idx=list(_PACKED_FWD_OUTPUT_IDX),
-    )
     return kernel, lowering
 
 
@@ -1715,7 +1698,27 @@ def _mapped_packed_post_fwd_k_parallel_kernel_for(
                 for vv in T.serial(v_dim):
                     h_last[b, h, tid, vv] = T.cast(h_row[vv], carrier_dtype)
 
-    lowering = dispatch_lower(fwd, target="metal", return_msl=True)
+    fwd = _with_global_symbol(
+        fwd,
+        "m2rnn_mapped_packed_post_fwd_kp",
+        batch,
+        seq,
+        total_heads,
+        q_heads,
+        k_heads,
+        v_heads,
+        g_heads,
+        w_heads,
+        f_heads,
+        k_dim,
+        v_dim,
+        projected_dim,
+        carrier_dtype,
+    )
+    kernel, lowering = _compile_native_metal_kernel_with_lowering(
+        fwd,
+        out_idx=list(_PACKED_POST_FWD_OUTPUT_IDX),
+    )
     input_names = [
         name
         for name in lowering.buffer_param_names
@@ -1726,14 +1729,6 @@ def _mapped_packed_post_fwd_k_parallel_kernel_for(
             "unexpected mapped packed M2RNN inline-post k-parallel buffer signature: "
             + ", ".join(lowering.buffer_param_names)
         )
-    import tilelang
-
-    kernel = tilelang.compile(
-        fwd,
-        target=_msl_transform._as_metal_target("metal"),
-        execution_backend="tvm_ffi",
-        out_idx=list(_PACKED_POST_FWD_OUTPUT_IDX),
-    )
     return kernel, lowering
 
 
@@ -1755,7 +1750,7 @@ def _mapped_packed_post_fwd_kernel_for(
     *,
     return_msl: bool = False,
 ) -> tuple[Any, _msl_transform.TileLangMSLLowering]:
-    if k_dim >= _PACKED_FWD_K_PARALLEL_MIN_K and max(k_dim, v_dim) <= 256:
+    if k_dim >= _MAPPED_PACKED_FWD_K_PARALLEL_MIN_K and max(k_dim, v_dim) <= 256:
         return _mapped_packed_post_fwd_k_parallel_kernel_for(
             batch,
             seq,
@@ -1891,7 +1886,27 @@ def _mapped_packed_post_fwd_kernel_for(
                                 carrier_dtype,
                             )
 
-    lowering = dispatch_lower(fwd, target="metal", return_msl=True)
+    fwd = _with_global_symbol(
+        fwd,
+        "m2rnn_mapped_packed_post_fwd",
+        batch,
+        seq,
+        total_heads,
+        q_heads,
+        k_heads,
+        v_heads,
+        g_heads,
+        w_heads,
+        f_heads,
+        k_dim,
+        v_dim,
+        projected_dim,
+        carrier_dtype,
+    )
+    kernel, lowering = _compile_native_metal_kernel_with_lowering(
+        fwd,
+        out_idx=list(_PACKED_POST_FWD_OUTPUT_IDX),
+    )
     input_names = [
         name
         for name in lowering.buffer_param_names
@@ -1902,14 +1917,6 @@ def _mapped_packed_post_fwd_kernel_for(
             "unexpected mapped packed M2RNN inline post Path C buffer signature: "
             + ", ".join(lowering.buffer_param_names)
         )
-    import tilelang
-
-    kernel = tilelang.compile(
-        fwd,
-        target=_msl_transform._as_metal_target("metal"),
-        execution_backend="tvm_ffi",
-        out_idx=list(_PACKED_POST_FWD_OUTPUT_IDX),
-    )
     return kernel, lowering
 
 
@@ -1960,7 +1967,7 @@ def _mapped_packed_bwd_k_parallel_kernel_for(
         h0: T.Tensor((batch, total_heads, k_dim, v_dim), carrier_dtype),
         tanh_cache: T.Tensor((batch, seq, total_heads, k_dim, v_dim), carrier_dtype),
         dconv_input: T.Tensor((batch, seq, conv_dim), grad_dtype),
-        dW_partial: T.Tensor((batch, w_heads, v_dim, v_dim), grad_dtype),
+        dW: T.Tensor((w_heads, v_dim, v_dim), grad_dtype),
         dxf: T.Tensor((batch, seq, f_heads), grad_dtype),
         dh0: T.Tensor((batch, total_heads, k_dim, v_dim), grad_dtype),
         h_steps_scratch: T.Tensor((batch, total_heads, seq, k_dim, v_dim), carrier_dtype),
@@ -2111,12 +2118,32 @@ def _mapped_packed_bwd_k_parallel_kernel_for(
                     dh0[b, h, tid, vv] = T.cast(dh_row[vv], grad_dtype)
             for i in T.serial(tid, v_dim * v_dim, step=threads):
                 T.atomic_add(
-                    dW_partial[b, w_src, i // v_dim, i % v_dim],
+                    dW[w_src, i // v_dim, i % v_dim],
                     dW_shared[i // v_dim, i % v_dim],
                     memory_order="relaxed",
                 )
 
-    lowering = dispatch_lower(bwd, target="metal", return_msl=True)
+    bwd = _with_global_symbol(
+        bwd,
+        "m2rnn_mapped_packed_bwd_kp",
+        batch,
+        seq,
+        total_heads,
+        q_heads,
+        k_heads,
+        v_heads,
+        w_heads,
+        f_heads,
+        k_dim,
+        v_dim,
+        carrier_dtype,
+        dy_dtype,
+        grad_dtype,
+    )
+    kernel, lowering = _compile_native_metal_kernel_with_lowering(
+        bwd,
+        out_idx=list(_PACKED_BWD_OUTPUT_IDX),
+    )
     input_names = [
         name
         for name in lowering.buffer_param_names
@@ -2127,14 +2154,6 @@ def _mapped_packed_bwd_k_parallel_kernel_for(
             "unexpected mapped packed M2RNN k-parallel bwd buffer signature: "
             + ", ".join(lowering.buffer_param_names)
         )
-    import tilelang
-
-    kernel = tilelang.compile(
-        bwd,
-        target=_msl_transform._as_metal_target("metal"),
-        execution_backend="tvm_ffi",
-        out_idx=list(_PACKED_BWD_OUTPUT_IDX),
-    )
     return kernel, lowering
 
 
@@ -2156,7 +2175,7 @@ def _mapped_packed_bwd_kernel_for(
     *,
     return_msl: bool = False,
 ) -> tuple[Any, _msl_transform.TileLangMSLLowering]:
-    if k_dim >= _PACKED_BWD_K_PARALLEL_MIN_K and max(k_dim, v_dim) <= 256:
+    if k_dim >= _MAPPED_PACKED_BWD_K_PARALLEL_MIN_K and max(k_dim, v_dim) <= 256:
         return _mapped_packed_bwd_k_parallel_kernel_for(
             batch,
             seq,
@@ -2198,7 +2217,7 @@ def _mapped_packed_bwd_kernel_for(
         h0: T.Tensor((batch, total_heads, k_dim, v_dim), carrier_dtype),
         tanh_cache: T.Tensor((batch, seq, total_heads, k_dim, v_dim), carrier_dtype),
         dconv_input: T.Tensor((batch, seq, conv_dim), grad_dtype),
-        dW_partial: T.Tensor((batch, w_heads, v_dim, v_dim), grad_dtype),
+        dW: T.Tensor((w_heads, v_dim, v_dim), grad_dtype),
         dxf: T.Tensor((batch, seq, f_heads), grad_dtype),
         dh0: T.Tensor((batch, total_heads, k_dim, v_dim), grad_dtype),
         h_steps_scratch: T.Tensor((batch, total_heads, seq, k_dim, v_dim), carrier_dtype),
@@ -2355,12 +2374,32 @@ def _mapped_packed_bwd_kernel_for(
                 for v0 in T.serial(v_dim):
                     for vv in T.serial(v_dim):
                         T.atomic_add(
-                            dW_partial[b, w_src, v0, vv],
+                            dW[w_src, v0, vv],
                             dW_acc[v0, vv],
                             memory_order="relaxed",
                         )
 
-    lowering = dispatch_lower(bwd, target="metal", return_msl=True)
+    bwd = _with_global_symbol(
+        bwd,
+        "m2rnn_mapped_packed_bwd",
+        batch,
+        seq,
+        total_heads,
+        q_heads,
+        k_heads,
+        v_heads,
+        w_heads,
+        f_heads,
+        k_dim,
+        v_dim,
+        carrier_dtype,
+        dy_dtype,
+        grad_dtype,
+    )
+    kernel, lowering = _compile_native_metal_kernel_with_lowering(
+        bwd,
+        out_idx=list(_PACKED_BWD_OUTPUT_IDX),
+    )
     input_names = [
         name
         for name in lowering.buffer_param_names
@@ -2371,14 +2410,6 @@ def _mapped_packed_bwd_kernel_for(
             "unexpected mapped packed M2RNN Path C bwd buffer signature: "
             + ", ".join(lowering.buffer_param_names)
         )
-    import tilelang
-
-    kernel = tilelang.compile(
-        bwd,
-        target=_msl_transform._as_metal_target("metal"),
-        execution_backend="tvm_ffi",
-        out_idx=list(_PACKED_BWD_OUTPUT_IDX),
-    )
     return kernel, lowering
 
 
@@ -2449,7 +2480,26 @@ def _post_residual_gate_fwd_kernel_for(
                     carrier_dtype,
                 )
 
-    lowering = dispatch_lower(fwd, target="metal", return_msl=True)
+    fwd = _with_global_symbol(
+        fwd,
+        "m2rnn_post_residual_gate_fwd",
+        batch,
+        seq,
+        total_heads,
+        q_heads,
+        k_heads,
+        v_heads,
+        g_heads,
+        k_dim,
+        v_dim,
+        conv_dim,
+        projected_dim,
+        carrier_dtype,
+    )
+    kernel, lowering = _compile_native_metal_kernel_with_lowering(
+        fwd,
+        out_idx=list(_POST_FWD_OUTPUT_IDX),
+    )
     input_names = [
         name for name in lowering.buffer_param_names if name not in _POST_FWD_OUTPUT_NAMES
     ]
@@ -2458,14 +2508,6 @@ def _post_residual_gate_fwd_kernel_for(
             "unexpected M2RNN post Path C buffer signature: "
             + ", ".join(lowering.buffer_param_names)
         )
-    import tilelang
-
-    kernel = tilelang.compile(
-        fwd,
-        target=_msl_transform._as_metal_target("metal"),
-        execution_backend="tvm_ffi",
-        out_idx=list(_POST_FWD_OUTPUT_IDX),
-    )
     return kernel, lowering
 
 
@@ -2558,7 +2600,27 @@ def _post_residual_gate_bwd_kernel_for(
                     memory_order="relaxed",
                 )
 
-    lowering = dispatch_lower(bwd, target="metal", return_msl=True)
+    bwd = _with_global_symbol(
+        bwd,
+        "m2rnn_post_residual_gate_bwd",
+        batch,
+        seq,
+        total_heads,
+        q_heads,
+        k_heads,
+        v_heads,
+        g_heads,
+        k_dim,
+        v_dim,
+        conv_dim,
+        projected_dim,
+        carrier_dtype,
+        grad_dtype,
+    )
+    kernel, lowering = _compile_native_metal_kernel_with_lowering(
+        bwd,
+        out_idx=list(_POST_BWD_OUTPUT_IDX),
+    )
     input_names = [
         name
         for name in lowering.buffer_param_names
@@ -2569,14 +2631,6 @@ def _post_residual_gate_bwd_kernel_for(
             "unexpected M2RNN post Path C bwd buffer signature: "
             + ", ".join(lowering.buffer_param_names)
         )
-    import tilelang
-
-    kernel = tilelang.compile(
-        bwd,
-        target=_msl_transform._as_metal_target("metal"),
-        execution_backend="tvm_ffi",
-        out_idx=list(_POST_BWD_OUTPUT_IDX),
-    )
     return kernel, lowering
 
 
@@ -2694,7 +2748,28 @@ def _post_residual_gate_bwd_from_recurrence_kernel_for(
                         memory_order="relaxed",
                     )
 
-    lowering = dispatch_lower(bwd, target="metal", return_msl=True)
+    bwd = _with_global_symbol(
+        bwd,
+        "m2rnn_post_residual_gate_recompute_bwd",
+        batch,
+        seq,
+        total_heads,
+        q_heads,
+        k_heads,
+        v_heads,
+        g_heads,
+        f_heads,
+        k_dim,
+        v_dim,
+        conv_dim,
+        projected_dim,
+        carrier_dtype,
+        grad_dtype,
+    )
+    kernel, lowering = _compile_native_metal_kernel_with_lowering(
+        bwd,
+        out_idx=list(_POST_RECOMPUTE_BWD_OUTPUT_IDX),
+    )
     input_names = [
         name
         for name in lowering.buffer_param_names
@@ -2713,14 +2788,6 @@ def _post_residual_gate_bwd_from_recurrence_kernel_for(
             "unexpected M2RNN inline post bwd buffer signature: "
             + ", ".join(lowering.buffer_param_names)
         )
-    import tilelang
-
-    kernel = tilelang.compile(
-        bwd,
-        target=_msl_transform._as_metal_target("metal"),
-        execution_backend="tvm_ffi",
-        out_idx=list(_POST_RECOMPUTE_BWD_OUTPUT_IDX),
-    )
     return kernel, lowering
 
 
@@ -3298,8 +3365,6 @@ def _m2rnn_bwd_path_c_kernel(
     xf: mx.array,
     tanh_cache: mx.array,
     h0: mx.array | None = None,
-    *,
-    out: M2RNNBwdOwnerOutputs | None = None,
 ) -> tuple[mx.array, mx.array, mx.array, mx.array, mx.array, mx.array] | None:
     if not _msl_transform.can_run_metal():
         return None
@@ -3318,12 +3383,9 @@ def _m2rnn_bwd_path_c_kernel(
             "tanh_cache must be "
             f"{(batch, seq, heads, k_dim, v_dim)}, got {tanh_cache.shape}"
         )
+    if batch != 1:
+        return None
     if seq == 0:
-        if out is not None:
-            raise RuntimeError(
-                "m2rnn_bwd_path_c owner-output route is not dispatchable "
-                "for seq=0 because no TileLang kernel runs to initialize buffers"
-            )
         return (
             mx.zeros_like(q),
             mx.zeros_like(k),
@@ -3338,38 +3400,7 @@ def _m2rnn_bwd_path_c_kernel(
         return None
 
     del lowering
-    if out is None:
-        dW_partial, dh0, dk, dq, dv, dxf, _scratch = kernel(
-            dy,
-            q,
-            k,
-            v,
-            W,
-            xf,
-            h0,
-            tanh_cache,
-        )
-        dW = mx.sum(dW_partial, axis=0)
-        return dq, dk, dv, dW, dxf, dh0
-
-    (
-        dq,
-        dk,
-        dv,
-        dW_partial,
-        dxf,
-        dh0,
-        h_steps_scratch,
-    ) = _m2rnn_bwd_owner_outputs(
-        out,
-        batch=batch,
-        seq=seq,
-        heads=heads,
-        k_dim=k_dim,
-        v_dim=v_dim,
-        dtype=q.dtype,
-    )
-    outputs = kernel(
+    dW, dh0, dk, dq, dv, dxf, _scratch = kernel(
         dy,
         q,
         k,
@@ -3378,19 +3409,7 @@ def _m2rnn_bwd_path_c_kernel(
         xf,
         h0,
         tanh_cache,
-        out=(dW_partial, dh0, dk, dq, dv, dxf, h_steps_scratch),
     )
-    if not all(
-        got is expected
-        for got, expected in zip(
-            outputs,
-            (dW_partial, dh0, dk, dq, dv, dxf, h_steps_scratch),
-            strict=True,
-        )
-    ):
-        raise RuntimeError("M2RNN Path C bwd tvm-ffi did not return caller-owned outputs")
-    dW_partial, dh0, dk, dq, dv, dxf, _scratch = outputs
-    dW = mx.sum(dW_partial, axis=0)
     return dq, dk, dv, dW, dxf, dh0
 
 
@@ -3408,20 +3427,12 @@ def m2rnn_bwd_path_c(
     out: M2RNNBwdOwnerOutputs | None = None,
 ) -> tuple[mx.array, mx.array, mx.array, mx.array, mx.array, mx.array]:
     del force_path_c
-    if out is None:
-        grads = _m2rnn_bwd_path_c_kernel(dy, q, k, v, W, xf, tanh_cache, h0)
-    else:
-        grads = _m2rnn_bwd_path_c_kernel(
-            dy,
-            q,
-            k,
-            v,
-            W,
-            xf,
-            tanh_cache,
-            h0,
-            out=out,
+    if out is not None:
+        raise RuntimeError(
+            "m2rnn_bwd_path_c does not expose backward owner-output buffers; "
+            "final-gradient owner-output lowering is not implemented yet"
         )
+    grads = _m2rnn_bwd_path_c_kernel(dy, q, k, v, W, xf, tanh_cache, h0)
     if grads is not None:
         return grads
     raise RuntimeError(f"m2rnn_bwd_path_c unavailable: {m2rnn_path_c_status().reason}")
@@ -3524,7 +3535,7 @@ def _m2rnn_mapped_packed_bwd_owner_outputs(
     if out is None:
         return (
             mx.zeros((batch, seq, conv_dim), dtype=grad_dtype),
-            mx.zeros((batch, w_heads, v_dim, v_dim), dtype=grad_dtype),
+            mx.zeros((w_heads, v_dim, v_dim), dtype=grad_dtype),
             mx.zeros((batch, seq, f_heads), dtype=grad_dtype),
             mx.zeros((batch, total_heads, k_dim, v_dim), dtype=grad_dtype),
             mx.zeros((batch, total_heads, seq, k_dim, v_dim), dtype=carrier_dtype),
@@ -3532,10 +3543,10 @@ def _m2rnn_mapped_packed_bwd_owner_outputs(
     if not isinstance(out, tuple) or len(out) != 5:
         raise TypeError(
             "m2rnn_mapped_packed_bwd_path_c: out must be a "
-            "(dconv_input, dW_partial, dxf, dh0, h_steps_scratch) "
+            "(dconv_input, dW, dxf, dh0, h_steps_scratch) "
             "owner-output tuple"
         )
-    dconv_input, dW_partial, dxf, dh0, h_steps_scratch = out
+    dconv_input, dW, dxf, dh0, h_steps_scratch = out
     return (
         _require_owner_array(
             op_name,
@@ -3546,9 +3557,9 @@ def _m2rnn_mapped_packed_bwd_owner_outputs(
         ),
         _require_owner_array(
             op_name,
-            "dW_partial",
-            dW_partial,
-            shape=(batch, w_heads, v_dim, v_dim),
+            "dW",
+            dW,
+            shape=(w_heads, v_dim, v_dim),
             dtype=grad_dtype,
         ),
         _require_owner_array(
@@ -3876,8 +3887,6 @@ def _m2rnn_packed_bwd_path_c_kernel(
     xf: mx.array,
     tanh_cache: mx.array,
     h0: mx.array | None = None,
-    *,
-    out: M2RNNPackedBwdOwnerOutputs | None = None,
 ) -> tuple[mx.array, mx.array, mx.array, mx.array] | None:
     if h0 is None or not _packed_path_c_inputs_eligible(conv_input, W, xf, h0):
         return None
@@ -3894,12 +3903,9 @@ def _m2rnn_packed_bwd_path_c_kernel(
             "tanh_cache must be "
             f"{(batch, seq, heads, k_dim, v_dim)}, got {tanh_cache.shape}"
         )
+    if batch != 1:
+        return None
     if seq == 0:
-        if out is not None:
-            raise RuntimeError(
-                "m2rnn_packed_bwd_path_c owner-output route is not dispatchable "
-                "for seq=0 because no TileLang kernel runs to initialize buffers"
-            )
         return (
             mx.zeros_like(conv_input),
             mx.zeros_like(W),
@@ -3919,54 +3925,14 @@ def _m2rnn_packed_bwd_path_c_kernel(
         return None
 
     del lowering
-    if out is None:
-        dconv_input, dW_partial, dxf, dh0, _scratch = kernel(
-            dy,
-            conv_input,
-            W,
-            xf,
-            h0,
-            tanh_cache,
-        )
-        dW = mx.sum(dW_partial, axis=0)
-        return dconv_input, dW, dxf, dh0
-
-    (
-        dconv_input,
-        dW_partial,
-        dxf,
-        dh0,
-        h_steps_scratch,
-    ) = _m2rnn_packed_bwd_owner_outputs(
-        out,
-        batch=batch,
-        seq=seq,
-        heads=heads,
-        conv_dim=conv_dim,
-        k_dim=k_dim,
-        v_dim=v_dim,
-        dtype=conv_input.dtype,
-    )
-    outputs = kernel(
+    dconv_input, dW, dxf, dh0, _scratch = kernel(
         dy,
         conv_input,
         W,
         xf,
         h0,
         tanh_cache,
-        out=(dconv_input, dW_partial, dxf, dh0, h_steps_scratch),
     )
-    if not all(
-        got is expected
-        for got, expected in zip(
-            outputs,
-            (dconv_input, dW_partial, dxf, dh0, h_steps_scratch),
-            strict=True,
-        )
-    ):
-        raise RuntimeError("Packed M2RNN Path C bwd tvm-ffi did not return caller-owned outputs")
-    dconv_input, dW_partial, dxf, dh0, _scratch = outputs
-    dW = mx.sum(dW_partial, axis=0)
     return dconv_input, dW, dxf, dh0
 
 
@@ -3980,6 +3946,12 @@ def m2rnn_packed_bwd_path_c(
     *,
     out: M2RNNPackedBwdOwnerOutputs | None = None,
 ) -> tuple[mx.array, mx.array, mx.array, mx.array]:
+    if out is not None:
+        raise RuntimeError(
+            "m2rnn_packed_bwd_path_c does not expose backward owner-output "
+            "buffers; final-gradient owner-output lowering is not implemented "
+            "yet"
+        )
     grads = _m2rnn_packed_bwd_path_c_kernel(
         dy,
         conv_input,
@@ -3987,7 +3959,6 @@ def m2rnn_packed_bwd_path_c(
         xf,
         tanh_cache,
         h0,
-        out=out,
     )
     if grads is not None:
         return grads
@@ -4107,7 +4078,6 @@ def _m2rnn_mapped_packed_bwd_path_c_kernel(
     q_heads: int,
     k_heads: int,
     v_heads: int,
-    out: M2RNNPackedBwdOwnerOutputs | None = None,
 ) -> tuple[mx.array, mx.array, mx.array, mx.array] | None:
     if h0 is None:
         return None
@@ -4120,7 +4090,7 @@ def _m2rnn_mapped_packed_bwd_path_c_kernel(
         k_heads=k_heads,
         v_heads=v_heads,
     ):
-        return _m2rnn_packed_bwd_path_c_kernel(dy, conv_input, W, xf, tanh_cache, h0, out=out)
+        return _m2rnn_packed_bwd_path_c_kernel(dy, conv_input, W, xf, tanh_cache, h0)
     if not m2rnn_mapped_packed_path_c_status(
         conv_input,
         W,
@@ -4154,11 +4124,6 @@ def _m2rnn_mapped_packed_bwd_path_c_kernel(
             f"{(batch, seq, total_heads, k_dim, v_dim)}, got {tanh_cache.shape}"
         )
     if seq == 0:
-        if out is not None:
-            raise RuntimeError(
-                "m2rnn_mapped_packed_bwd_path_c owner-output route is not dispatchable "
-                "for seq=0 because no TileLang kernel runs to initialize buffers"
-            )
         return (
             mx.zeros(conv_input.shape, dtype=mx.float32),
             mx.zeros(W.shape, dtype=mx.float32),
@@ -4187,12 +4152,12 @@ def _m2rnn_mapped_packed_bwd_path_c_kernel(
     del lowering
     (
         dconv_input,
-        dW_partial,
+        dW,
         dxf,
         dh0,
         h_steps_scratch,
     ) = _m2rnn_mapped_packed_bwd_owner_outputs(
-        out,
+        None,
         batch=batch,
         seq=seq,
         total_heads=total_heads,
@@ -4204,6 +4169,7 @@ def _m2rnn_mapped_packed_bwd_path_c_kernel(
         carrier_dtype=conv_input.dtype,
         grad_dtype=mx.float32,
     )
+    _materialize_atomic_add_owner_outputs(dconv_input, dW, dxf, dh0, h_steps_scratch)
     outputs = kernel(
         dy,
         conv_input,
@@ -4211,19 +4177,19 @@ def _m2rnn_mapped_packed_bwd_path_c_kernel(
         xf,
         h0,
         tanh_cache,
-        out=(dconv_input, dW_partial, dxf, dh0, h_steps_scratch),
+        out=(dconv_input, dW, dxf, dh0, h_steps_scratch),
     )
+    mx.synchronize()
     if not all(
         got is expected
         for got, expected in zip(
             outputs,
-            (dconv_input, dW_partial, dxf, dh0, h_steps_scratch),
+            (dconv_input, dW, dxf, dh0, h_steps_scratch),
             strict=True,
         )
     ):
         raise RuntimeError("Mapped packed M2RNN Path C bwd tvm-ffi did not return caller-owned outputs")
-    dconv_input, dW_partial, dxf, dh0, _scratch = outputs
-    dW = mx.sum(dW_partial, axis=0)
+    dconv_input, dW, dxf, dh0, _scratch = outputs
     return dconv_input, dW, dxf, dh0
 
 
@@ -4240,6 +4206,12 @@ def m2rnn_mapped_packed_bwd_path_c(
     v_heads: int,
     out: M2RNNPackedBwdOwnerOutputs | None = None,
 ) -> tuple[mx.array, mx.array, mx.array, mx.array]:
+    if out is not None:
+        raise RuntimeError(
+            "m2rnn_mapped_packed_bwd_path_c does not expose backward "
+            "owner-output buffers; final-gradient owner-output lowering is "
+            "not implemented yet"
+        )
     grads = _m2rnn_mapped_packed_bwd_path_c_kernel(
         dy,
         conv_input,
@@ -4250,7 +4222,6 @@ def m2rnn_mapped_packed_bwd_path_c(
         q_heads=q_heads,
         k_heads=k_heads,
         v_heads=v_heads,
-        out=out,
     )
     if grads is not None:
         return grads
@@ -4453,6 +4424,7 @@ def _m2rnn_inline_post_bwd_path_c_kernel(
         projected_dim=projected_dim,
         grad_dtype=mx.float32,
     )
+    _materialize_atomic_add_owner_outputs(dy_recurrent, dconv_input, dD, dprojected)
     outputs = kernel(
         dpost,
         conv_input,
@@ -4463,6 +4435,7 @@ def _m2rnn_inline_post_bwd_path_c_kernel(
         projected,
         out=(dy_recurrent, dconv_input, dD, dprojected),
     )
+    mx.synchronize()
     if not all(
         got is expected
         for got, expected in zip(
@@ -4626,6 +4599,7 @@ def _m2rnn_post_residual_gate_bwd_path_c_kernel(
         projected_dim=projected_dim,
         grad_dtype=mx.float32,
     )
+    _materialize_atomic_add_owner_outputs(dy_recurrent, dconv_input, dD, dprojected)
     outputs = kernel(
         dpost,
         y,
@@ -4634,6 +4608,7 @@ def _m2rnn_post_residual_gate_bwd_path_c_kernel(
         projected,
         out=(dy_recurrent, dconv_input, dD, dprojected),
     )
+    mx.synchronize()
     if not all(
         got is expected
         for got, expected in zip(
@@ -4803,6 +4778,13 @@ def _match_primal_gradient_dtypes(
         grad if grad.dtype == primal.dtype else grad.astype(primal.dtype)
         for grad, primal in zip(grads, primals, strict=True)
     )
+
+
+def _materialize_atomic_add_owner_outputs(*outputs: mx.array) -> None:
+    # Atomic-add kernels need real zeroed buffers before TVM-FFI starts writing.
+    if outputs:
+        mx.eval(*outputs)
+        mx.synchronize()
 
 
 @mx.custom_function

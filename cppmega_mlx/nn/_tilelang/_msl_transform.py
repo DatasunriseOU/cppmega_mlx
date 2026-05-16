@@ -1287,7 +1287,7 @@ def lower_tilelang_to_msl_inline(
         raise MSLDispatchUnsupported(
             f"tilelang import failed: {exc}; falling back to pure MLX"
         ) from exc
-    _register_path_c_metal_fp8_intrinsics()
+    _assert_path_c_metal_fp8_intrinsics_registered()
 
     _ensure_single_libtvm_ffi_image()
     metal_target = _as_metal_target(target)
@@ -1351,169 +1351,16 @@ def lower_tilelang_to_msl_inline(
     return result
 
 
-# ---------------------------------------------------------------------------
-# Path C Metal FP8 intrinsic registration (Fix-1 + Fix-A re-application)
-# ---------------------------------------------------------------------------
-#
-# The Path C FP8 vecmat / sparse-MLA kernels emit calls to a small set of
-# Metal-specific intrinsics that TileLang's lowering expects to find as TVM
-# ``Op``s. If the in-tree TileLang/TVM forgets to register them we get
-# opaque ``AttributeError``s deep inside the lowering pipeline. We register
-# them defensively at module import so:
-#
-#   * The error surface for a missing intrinsic is a clear ``RuntimeError``
-#     from ``_assert_path_c_metal_fp8_intrinsics_registered`` instead of an
-#     FFI ``AttributeError`` deep in lowering.
-#   * Each op carries a meaningful ``TCallEffectKind`` so CSE / hoisting /
-#     DCE behave correctly. ``thread_position_in_grid_x`` and
-#     ``thread_index_in_simdgroup`` are ``kReadState`` (block CSE / hoist,
-#     allow DCE); ``fp8_e4m3_dot4`` is ``kPure`` (deterministic math,
-#     CSE-able).
-#
-# The whole block is wrapped in try/except so the module imports cleanly on
-# hosts without a working TVM (e.g. CI without libz3).
-
-# Effect-kind enum values as IntImm("int32", N).
-# kPure=0: deterministic, side-effect-free (CSE-able).
-# kReadState=1: reads runtime state (e.g. thread position) — blocks CSE/hoisting,
-#               permits DCE of unused calls.
-_EFFECT_KIND_PURE = 0
-_EFFECT_KIND_READ_STATE = 1
-
-# (op_name, num_inputs, description, effect_kind, TScriptPrinterName)
-_PATH_C_METAL_FP8_INTRINSICS: tuple[tuple[str, int, str, int, str], ...] = (
-    ("tirx.metal.simd_sum", 1,
-     "Metal simdgroup sum reduction.",
-     _EFFECT_KIND_PURE,
-     "metal.simd_sum"),
-    ("tirx.metal.fp8_e4m3_dot4", 4,
-     "FP8 e4m3 packed dot4 (deterministic — CSE-able).",
-     _EFFECT_KIND_PURE,
-     "metal.fp8_e4m3_dot4"),
-    ("tirx.metal.thread_position_in_grid_x", 0,
-     "Reads kernel-arg with [[thread_position_in_grid]] — kReadState to block CSE/hoist.",
-     _EFFECT_KIND_READ_STATE,
-     "metal.thread_position_in_grid_x"),
-    ("tirx.metal.thread_index_in_simdgroup", 0,
-     "Reads kernel-arg with [[thread_index_in_simdgroup]] — kReadState to block CSE/hoist.",
-     _EFFECT_KIND_READ_STATE,
-     "metal.thread_index_in_simdgroup"),
-)
-
-_effect_kind_imm: dict[int, Any] = {
-    _EFFECT_KIND_PURE: None,        # set lazily in _register_path_c_metal_fp8_intrinsics
-    _EFFECT_KIND_READ_STATE: None,
-}
-
-
-def _register_path_c_metal_fp8_intrinsics() -> None:
-    """Register the Path C Metal FP8 intrinsic ops (idempotent).
-
-    On hosts where TVM is not importable (e.g. CI without libz3) this is a
-    no-op so the module imports cleanly. On hosts with TVM, each op in
-    ``_PATH_C_METAL_FP8_INTRINSICS`` is registered iff ``Op.get(name)``
-    fails (i.e. not already registered). The op then has its ``num_inputs``
-    set and a ``TCallEffectKind`` attribute attached.
-    """
-
-    try:
-        from tilelang import tvm  # type: ignore
-        from tilelang.tvm.tir import IntImm  # type: ignore
-        from tilelang.tvm.ir import Op  # type: ignore
-        register_op = tvm.ir._ffi_api.RegisterOp  # type: ignore[attr-defined]
-    except Exception:
-        try:
-            import tvm  # type: ignore
-            from tvm.tir import IntImm  # type: ignore
-            from tvm.ir import Op  # type: ignore
-            register_op = tvm.ir._ffi_api.RegisterOp  # type: ignore[attr-defined]
-        except Exception:
-            # No TVM available — skip registration silently. Callers that
-            # need the ops will get a clear error from
-            # ``_assert_path_c_metal_fp8_intrinsics_registered``.
-            return
-
-    # Lazy-bind effect-kind IntImms once we have a working TVM.
-    for kind in (_EFFECT_KIND_PURE, _EFFECT_KIND_READ_STATE):
-        if _effect_kind_imm[kind] is None:
-            _effect_kind_imm[kind] = IntImm("int32", kind)
-
-    for (
-        name,
-        num_inputs,
-        description,
-        effect_kind,
-        tscript_printer_name,
-    ) in _PATH_C_METAL_FP8_INTRINSICS:
-        try:
-            existing = Op.get(name)
-        except Exception:
-            existing = None
-        if existing is not None:
-            op = existing
-            registered_now = False
-        else:
-            try:
-                register_op(name, description)
-                op = Op.get(name)
-                registered_now = True
-            except Exception:
-                # Best-effort: a partial failure here should not block module
-                # import. The assertion helper will surface it loudly when a
-                # caller actually needs the op.
-                continue
-        try:
-            if registered_now:
-                op.set_num_inputs(num_inputs)
-        except Exception:
-            pass
-        try:
-            if registered_now:
-                op.set_attr("TCallEffectKind", _effect_kind_imm[effect_kind])
-        except Exception:
-            pass
-        try:
-            op.set_attr("TScriptPrinterName", tscript_printer_name, 100)
-        except Exception:
-            pass
-
-
 def _assert_path_c_metal_fp8_intrinsics_registered() -> None:
-    """Raise ``RuntimeError`` if any Path C Metal FP8 intrinsic is missing.
+    """Raise if TileLang's C++ Metal FP8 intrinsic registry is not loaded."""
 
-    Call this *before* the first @T.prim_func parse on the packed-dot4
-    macro path so users see a clear actionable error instead of a deep
-    ``AttributeError`` from the FFI lowering pipeline.
-    """
-
-    _register_path_c_metal_fp8_intrinsics()
     try:
-        from tilelang.tvm.ir import Op  # type: ignore
-    except Exception:
-        try:
-            from tvm.ir import Op  # type: ignore
-        except Exception as exc:
-            raise RuntimeError(
-                "Path C Metal FP8 intrinsic check requires TVM, but TVM is "
-                f"not importable: {exc}. Path C lowering is unavailable on "
-                "this host."
-            ) from exc
-
-    missing: list[str] = []
-    for name, _num_inputs, _desc, _effect_kind, _printer_name in _PATH_C_METAL_FP8_INTRINSICS:
-        try:
-            Op.get(name)
-        except Exception:
-            missing.append(name)
-    if missing:
+        from tilelang.language.fp8_op import assert_metal_fp8_intrinsics_registered
+    except Exception as exc:
         raise RuntimeError(
-            "Path C Metal FP8 intrinsics are not registered: "
-            + ", ".join(missing)
-            + ". The in-tree TileLang/TVM forgot to register these ops; "
-            "see _msl_transform._register_path_c_metal_fp8_intrinsics. "
-            "Without them, Path C FP8 kernels silently fall back to scalar "
-            "decode."
-        )
+            "Path C Metal FP8 intrinsic check requires TileLang's fp8_op API"
+        ) from exc
+    assert_metal_fp8_intrinsics_registered()
 
 
 # fix-round-8 (Wave 3 grok-4): cache resolved Target objects keyed on the
@@ -1613,10 +1460,9 @@ if os.environ.get("CPPMEGA_VALIDATE_PARSE_TESTS") == "1":
         )
 
 
-# Path C FP8 intrinsics are registered lazily by
-# ``_assert_path_c_metal_fp8_intrinsics_registered``. Importing TileLang here
-# preloads torch in current TileLang wheels, which makes lightweight MLX/Metal
-# probe imports pay for the CUDA/PyTorch runtime unnecessarily.
+# Path C FP8 intrinsics are registered by TileLang's C++ Metal backend.
+# ``_assert_path_c_metal_fp8_intrinsics_registered`` only verifies that
+# registry, so cppmega never mutates backend op state.
 
 
 __all__ = [
@@ -1626,7 +1472,6 @@ __all__ = [
     "TileLangMSLLowering",
     "_as_metal_target",
     "_assert_path_c_metal_fp8_intrinsics_registered",
-    "_register_path_c_metal_fp8_intrinsics",
     "can_run_metal",
     "clear_lowering_cache",
     "dispatch",

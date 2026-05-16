@@ -38,7 +38,6 @@ from cppmega_mlx.nn._tilelang.sparse_mla import (
 )
 from cppmega_mlx.nn._tilelang import _msl_transform
 from cppmega_mlx.nn._tilelang.sparse_mla_path_c import (
-    _sparse_mla_bwd_path_c_partial,
     sparse_mla_bwd_path_c,
     sparse_mla_fwd_path_c,
     sparse_mla_path_c_status,
@@ -513,58 +512,35 @@ def _bench_shape(
     )
 
     def bwd_path_c_kernel():
-        result = _sparse_mla_bwd_path_c_partial(
+        result = sparse_mla_bwd_path_c(
             q, kv, d_out, indices, sm_scale=sm_scale, d_v=d_v
         )
         if result is None:
-            raise RuntimeError("Path C backward partial kernel did not dispatch")
-        dkv_partial, dq, _indices_i32, _shapes = result
-        return dkv_partial, dq
+            raise RuntimeError("Path C backward owner-output kernel did not dispatch")
+        return result
 
     bwd_path_c_kernel_bench = _bench_callable(
-        "path_c_tilelang_bwd_kernel_only",
+        "path_c_tilelang_bwd_owner_output_kernel",
         bwd_path_c_kernel,
         warmup=warmup,
         iters=iters,
     )
 
-    def bwd_path_c_fresh_reduce():
-        result = _sparse_mla_bwd_path_c_partial(
-            q, kv, d_out, indices, sm_scale=sm_scale, d_v=d_v
-        )
-        if result is None:
-            raise RuntimeError("Path C backward partial kernel did not dispatch")
-        dkv_partial, dq, indices_i32, shapes = result
-        dkv = _reduce_dkv_partial(dkv_partial, indices_i32, shapes)
-        return dq, dkv
-
-    bwd_path_c_fresh_reduce_bench = _bench_callable(
+    path_c_no_public_reduce = (
+        "not applicable: Path C backward returns final owner-output dKV"
+    )
+    bwd_path_c_fresh_reduce_bench = _bench_failure(
         "path_c_tilelang_bwd_fresh_reduce",
-        bwd_path_c_fresh_reduce,
         warmup=warmup,
         iters=iters,
+        error=path_c_no_public_reduce,
     )
-
-    path_c_partial = _sparse_mla_bwd_path_c_partial(
-        q, kv, d_out, indices, sm_scale=sm_scale, d_v=d_v
+    bwd_path_c_reduce_bench = _bench_failure(
+        "path_c_tilelang_bwd_reduce_only",
+        warmup=warmup,
+        iters=iters,
+        error=path_c_no_public_reduce,
     )
-    if path_c_partial is None:
-        bwd_path_c_reduce_bench = _empty_bench(
-            "path_c_tilelang_bwd_reduce_only", warmup=warmup, iters=iters
-        )
-    else:
-        dkv_partial, _dq, indices_i32, shapes = path_c_partial
-        mx.eval(dkv_partial, indices_i32)
-
-        def bwd_path_c_reduce():
-            return _reduce_dkv_partial(dkv_partial, indices_i32, shapes)
-
-        bwd_path_c_reduce_bench = _bench_callable(
-            "path_c_tilelang_bwd_reduce_only",
-            bwd_path_c_reduce,
-            warmup=warmup,
-            iters=iters,
-        )
 
     bwd_path_c_over_path_b = _bench_ratio(bwd_path_c_bench, bwd_msl_bench)
     bwd_path_c_kernel_over_path_b_kernel = _bench_ratio(
@@ -579,14 +555,25 @@ def _bench_shape(
         bwd_path_c_fresh_reduce_bench,
         bwd_msl_fresh_reduce_bench,
     )
+    path_c_fresh_reduce_ok = bool(bwd_path_c_fresh_reduce_bench.get("ok"))
+    path_c_reduce_ok = bool(bwd_path_c_reduce_bench.get("ok"))
     if paired_bwd_path_c_over_path_b <= max_ratio:
         bwd_blocker = f"none: Path C backward is within strict ratio {max_ratio:.3g}"
     elif bwd_path_c_kernel_over_path_b_kernel > 1.10:
-        bwd_blocker = "TileLang-lowered backward kernel slower than direct-MSL Path B kernel"
-    elif bwd_path_c_fresh_reduce_over_path_b_fresh_reduce > 1.10:
+        bwd_blocker = (
+            "TileLang owner-output backward slower than direct-MSL Path B "
+            "partial kernel"
+        )
+    elif (
+        path_c_fresh_reduce_ok
+        and bwd_path_c_fresh_reduce_over_path_b_fresh_reduce > 1.10
+    ):
         bwd_blocker = "fresh shared dKV scatter-reduction dominates measured Path C backward"
-    elif bwd_path_c_reduce_over_path_b_reduce > 1.10:
-        bwd_blocker = "pre-materialized shared dKV scatter-reduction is slower, but not the fresh total-backward blocker"
+    elif path_c_reduce_ok and bwd_path_c_reduce_over_path_b_reduce > 1.10:
+        bwd_blocker = (
+            "pre-materialized shared dKV scatter-reduction is slower, but not "
+            "the fresh total-backward blocker"
+        )
     else:
         bwd_blocker = "mixed overhead: Path C backward slower without one phase exceeding 10%"
 

@@ -159,7 +159,7 @@ def _fp8_vecmat_pass_configs() -> dict[str, Any]:
 # Defaults keep static tooling aligned with the runtime-specialized contract.
 _FP8_VM_N = 128
 _FP8_VM_K = 128
-_FP8_VM_NP = 2
+_FP8_VM_NP = 4
 _FP8_VM_RT = 32
 _FP8_VM_VEC = 4
 _FP8_VM_BLOCK_K = _FP8_VM_RT * _FP8_VM_VEC
@@ -343,7 +343,7 @@ def make_fp8_vecmat_reduce_kernel(
     *,
     N: int,
     K: int,
-    outputs_per_block: int = 2,
+    outputs_per_block: int = 4,
     reduce_threads: int = 32,
     vec: int = 4,
     vectorized_loads: bool = False,
@@ -357,10 +357,10 @@ def make_fp8_vecmat_reduce_kernel(
     * ``B`` is ``(N, K)`` e4m3, i.e. already transposed.
     * ``C`` is flat ``(N,)`` fp32.
 
-    The default fast path maps two output rows onto two SIMD groups inside
-    one 64-thread Metal threadgroup. This is the fastest sync-measured MLX
-    launch geometry for the 4096x4096 vecmat profile on the current Metal
-    backend. Each SIMD group computes one packed FP8
+    The default fast path maps four output rows onto four SIMD groups inside
+    one 128-thread Metal threadgroup, which is the most stable measured warm
+    schedule for the 4096x4096 vecmat profile on the current Metal backend.
+    Each SIMD group computes one packed FP8
     dot4 reduction, applies ``A_scale * B_scale`` after ``simd_sum``, then lane
     zero writes one row.
 
@@ -608,7 +608,7 @@ def lower_fp8_vecmat_msl(
     *,
     N: int = 4096,
     K: int = 4096,
-    outputs_per_block: int = 2,
+    outputs_per_block: int = 4,
     reduce_threads: int = 32,
     vec: int = 4,
     vectorized_loads: bool = False,
@@ -663,6 +663,9 @@ def fp8_vecmat_msl_features(msl: str) -> dict[str, int]:
     body = _kernel_body_for_feature_counts(msl)
     body_lowered = body.lower()
     scalar_decode_sites = body.count("__tvm_fp8_e4m3_to_half(")
+    simd_sum = body.count("simd_sum")
+    simd_shuffle_down = body.count("simd_shuffle_down")
+    simd_shuffle = body.count("simd_shuffle(")
     packed_uint_loads = body.count("reinterpret_cast<device const uint*>") + body.count(
         "__tvm_fp8_load_u32"
     )
@@ -670,8 +673,10 @@ def fp8_vecmat_msl_features(msl: str) -> dict[str, int]:
         "kernel_void": msl.count("kernel void"),
         "fp8_e4m3_decode_helper": body.count("__tvm_fp8_e4m3_to_half"),
         "tvm_thread_allreduce": body.count("tvm_thread_allreduce"),
-        "simd_shuffle_down": body.count("simd_shuffle_down"),
-        "simd_sum": body.count("simd_sum"),
+        "simd_shuffle_down": simd_shuffle_down,
+        "simd_shuffle": simd_shuffle,
+        "simd_sum": simd_sum,
+        "simd_reduction": simd_sum + simd_shuffle_down + simd_shuffle,
         "reinterpret_cast": body.count("reinterpret_cast"),
         "device_const_uint": body.count("device const uint"),
         "uint_pointer": body.count("uint*"),
@@ -693,8 +698,8 @@ def fp8_vecmat_msl_blockers(msl: str) -> dict[str, Any]:
     missing: list[str] = []
     if features["packed_uint_loads"] == 0:
         missing.append("packed_uint32_fp8_loads")
-    if features["simd_sum"] == 0:
-        missing.append("metal_simd_sum_reduction")
+    if features["simd_reduction"] == 0:
+        missing.append("metal_simd_reduction")
     if features["fp8_e4m3_lut"] == 0 and features["metal_fp8_dot4_helper"] == 0:
         missing.append("packed_lut_dot4_decode")
     if features["scalar_fp8_byte_decode_calls"] > 0:
@@ -705,7 +710,7 @@ def fp8_vecmat_msl_blockers(msl: str) -> dict[str, Any]:
         "generated_features": features,
         "required_fast_path": {
             "packed_uint32_fp8_loads": "reinterpret_cast<device const uint*> loads for 4 FP8 bytes",
-            "metal_simd_sum_reduction": "literal Metal simd_sum(sum) reduction",
+            "metal_simd_reduction": "Metal SIMDgroup reduction via semantic allreduce lowering",
             "packed_lut_dot4_decode": "fp8_e4m3fn_lut-backed direct decode or TileLang packed dot4 helper in the hot loop",
             "no_scalar_fp8_helper_calls": "avoid per-byte __tvm_fp8_e4m3_to_half calls in the hot loop",
         },
@@ -717,6 +722,16 @@ _FP8_VECMAT_TVM_FFI_KERNEL_CACHE: dict[
     Any,
 ] = {}
 _FP8_VECMAT_TVM_FFI_KERNEL_CACHE_LOCK = threading.RLock()
+_FP8_VECMAT_METAL_AVAILABLE: bool | None = None
+
+
+def _fp8_vecmat_can_run_metal_cached() -> bool:
+    """Cache the MLX Metal availability probe for the hot owner-output route."""
+
+    global _FP8_VECMAT_METAL_AVAILABLE
+    if _FP8_VECMAT_METAL_AVAILABLE is None:
+        _FP8_VECMAT_METAL_AVAILABLE = bool(can_run_metal())
+    return _FP8_VECMAT_METAL_AVAILABLE
 
 
 def _make_fp8_vecmat_direct_kernel(
@@ -825,6 +840,10 @@ def _fp8_vecmat_tvm_ffi_kernel_for(
         bool(scale_w_per_row),
         str(c_dtype),
     )
+    cached = _FP8_VECMAT_TVM_FFI_KERNEL_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
     with _FP8_VECMAT_TVM_FFI_KERNEL_CACHE_LOCK:
         cached = _FP8_VECMAT_TVM_FFI_KERNEL_CACHE.get(cache_key)
         if cached is not None:
@@ -848,6 +867,7 @@ def _fp8_vecmat_tvm_ffi_kernel_for(
         out_idx=-1,
         pass_configs=_fp8_vecmat_pass_configs() or None,
     )
+    kernel = getattr(kernel, "torch_function", kernel)
     with _FP8_VECMAT_TVM_FFI_KERNEL_CACHE_LOCK:
         _FP8_VECMAT_TVM_FFI_KERNEL_CACHE[cache_key] = kernel
     return kernel
@@ -1051,14 +1071,75 @@ def fp8_scaled_vecmat_path_c_direct(
     scale_x: mx.array | float,
     scale_w: mx.array | float,
     out: mx.array,
-    outputs_per_block: int = 2,
+    outputs_per_block: int = 4,
     reduce_threads: int = 32,
     vec: int = 4,
 ) -> mx.array:
     """Run FP8 vecmat Path C through tvm-ffi into caller-owned ``out``."""
 
-    if not can_run_metal():
+    if not _fp8_vecmat_can_run_metal_cached():
         raise FP8VecmatPathCDirectError("MLX Metal unavailable")
+    if (
+        isinstance(scale_x, mx.array)
+        and isinstance(scale_w, mx.array)
+        and isinstance(out, mx.array)
+        and x_fp8.ndim == 1
+        and W_fp8.ndim == 2
+        and x_fp8.dtype == mx.uint8
+        and W_fp8.dtype == mx.uint8
+        and scale_x.ndim == 1
+        and scale_w.ndim == 1
+        and scale_x.dtype == mx.float32
+        and scale_w.dtype == mx.float32
+        and scale_x.size == 1
+    ):
+        (k,) = x_fp8.shape
+        n, k_w = W_fp8.shape
+        if (
+            k == k_w
+            and k % 4 == 0
+            and out.shape == (n,)
+            and (out.dtype == mx.float32 or out.dtype == mx.float16)
+            and (scale_w.size == 1 or scale_w.size == n)
+        ):
+            c_dtype = "float32" if out.dtype == mx.float32 else "float16"
+            scale_w_per_row = scale_w.size == n
+            try:
+                kernel = _fp8_vecmat_tvm_ffi_kernel_for(
+                    N=int(n),
+                    K=int(k),
+                    outputs_per_block=int(outputs_per_block),
+                    reduce_threads=int(reduce_threads),
+                    vec=int(vec),
+                    scale_w_per_row=scale_w_per_row,
+                    c_dtype=c_dtype,
+                )
+            except Exception as exc:
+                raise FP8VecmatPathCDirectError(
+                    "direct tvm-ffi FP8 vecmat compile failed: "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
+            try:
+                return kernel(
+                    x_fp8,
+                    scale_x,
+                    W_fp8,
+                    scale_w,
+                    out,
+                    _tilelang_mlx_async_owner_outputs=True,
+                )
+            except Exception as exc:
+                try:
+                    from tilelang.contrib.mlx_interop import DLPackInteropError
+                except Exception:  # pragma: no cover - only when TileLang import itself is broken
+                    DLPackInteropError = ()  # type: ignore[assignment]
+                if isinstance(exc, DLPackInteropError):
+                    raise
+                raise FP8VecmatPathCDirectError(
+                    "direct tvm-ffi FP8 vecmat dispatch failed: "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
+
     A, A_scale, B, B_scale, n, k, scale_w_per_row = _normalize_vecmat_inputs_direct(
         x_fp8,
         W_fp8,
@@ -1109,7 +1190,7 @@ def fp8_scaled_vecmat_path_c(
     *,
     scale_x: mx.array | float,
     scale_w: mx.array | float,
-    outputs_per_block: int = 2,
+    outputs_per_block: int = 4,
     reduce_threads: int = 32,
     vec: int = 4,
     out: mx.array | None = None,

@@ -5,16 +5,16 @@ Sparse-MLA kernels in :mod:`cppmega_mlx.nn._tilelang.sparse_mla`.
 
 The upstream TileLang Sparse-MLA backward examples are CUDA-oriented: they use
 ``T.gemm`` for the attention matmuls and atomics for dKV scatter. Both are
-still the wrong first step on Apple Metal. This Path C kernel instead mirrors
-Path B's partial-output contract:
+still the wrong first step on Apple Metal. This Path C kernel keeps the runtime
+API on final owner outputs:
 
 * compute ``dq`` directly;
-* emit ``dkv_partial[B, S, H, topk, D]`` without atomics;
-* reuse Path B's host-side ``_reduce_dkv_partial`` scatter/reduction.
+* scatter-add final ``dkv[B, S_kv, G, D]`` inside the TileLang kernel;
+* avoid public ``*_partial`` tensors or host-side dKV reduction.
 
 The kernel keeps the TOPK softmax state in static threadgroup buffers and uses
 power-of-two tree reductions for the max/sum/rowsum phases. That mirrors Path
-B's direct-MSL contract while keeping the source in TileLang DSL.
+B's direct-MSL math while keeping the runtime path in TileLang DSL.
 """
 
 # pyright: reportInvalidTypeForm=false, reportMissingImports=false
@@ -29,7 +29,6 @@ import mlx.core as mx
 from cppmega_mlx.nn._tilelang import _msl_transform
 from cppmega_mlx.nn._tilelang._engine_dispatch import dispatch_lower
 from cppmega_mlx.nn._tilelang._msl_transform import can_run_metal
-from cppmega_mlx.nn._tilelang.sparse_mla import _reduce_dkv_partial
 from cppmega_mlx.nn.sparse_mla import _resolve_shapes, sparse_mla_attention_reference
 
 
@@ -2243,12 +2242,60 @@ class SparseMLAPathCDirectError(RuntimeError):
     """Raised when the owner-output tvm-ffi forward route cannot run safely."""
 
 
+def _postprocess_bwd_owner_output_msl(
+    msl: str,
+    *,
+    seq_len_kv: int,
+    topk: int,
+    heads: int,
+    seq_len: int,
+    kv_group: int,
+    head_kv: int,
+    qk_dim: int,
+    d_v: int,
+    threads: int,
+) -> str:
+    """Canonicalize direct bwd MSL without resurrecting legacy partial outputs."""
+
+    out = _postprocess_lowered_msl(
+        msl,
+        seq_len_kv=seq_len_kv,
+        remove_flat_kv_bounds=True,
+        canonicalize_bwd=True,
+        topk=topk,
+        heads=heads,
+        seq_len=seq_len,
+        kv_group=kv_group,
+        head_kv=head_kv,
+        seq_len_kv_for_indexing=seq_len_kv,
+        qk_dim=qk_dim,
+        d_v=d_v,
+        threads=threads,
+    )
+    # The generic bwd postprocess was written for the legacy partial-output
+    # debug kernel and adds a zero-fill inside the all-masked fast return.
+    # Direct owner-output bwd clears final dKV before launch and scatter-adds
+    # with atomics, so any dkv_partial text here is stale debug ABI leakage.
+    out = re.sub(
+        r"(?m)^[ \t]*dkv_partial\[[^\n]+\] = 0\.000000e\+00h;\n",
+        "",
+        out,
+    )
+    if "dkv_partial" in out:
+        raise SparseMLAPathCDirectError(
+            "Sparse-MLA Path C direct bwd lowering leaked legacy dkv_partial text"
+        )
+    return out
+
+
 def _owner_output_tuple(
     returned: Any,
     *,
     expected: tuple[mx.array, ...],
     op_name: str,
 ) -> tuple[mx.array, ...]:
+    if len(expected) == 1 and returned is expected[0]:
+        return expected
     if not isinstance(returned, (list, tuple)) or len(returned) != len(expected):
         raise SparseMLAPathCDirectError(
             f"{op_name} did not return {len(expected)} owner outputs"
@@ -3049,13 +3096,13 @@ def _make_sparse_mla_bwd_direct_prim(
     KV_SIZE = BATCH * SEQ_LEN_KV * KV_GROUP * QK_DIM
     DOUT_SIZE = BATCH * SEQ_LEN * HEADS * D_V
     IDX_SIZE = BATCH * SEQ_LEN * KV_GROUP * TOPK
-    DKV_PARTIAL_SIZE = BATCH * SEQ_LEN * HEADS * TOPK * QK_DIM
+    DKV_SIZE = BATCH * SEQ_LEN_KV * KV_GROUP * QK_DIM
     LOG_THREADS = THREADS.bit_length() - 1
 
     @T.prim_func
     def sparse_mla_bwd_direct(
         d_out: T.Tensor((DOUT_SIZE,), "float16"),
-        dkv_partial: T.Tensor((DKV_PARTIAL_SIZE,), "float16"),
+        dkv: T.Tensor((DKV_SIZE,), "float32"),
         dq: T.Tensor((Q_SIZE,), "float16"),
         indices: T.Tensor((IDX_SIZE,), INDEX_DTYPE),
         kv: T.Tensor((KV_SIZE,), "float16"),
@@ -3082,7 +3129,6 @@ def _make_sparse_mla_bwd_direct_prim(
             d_out_row = bx * D_V
             kv_b_base = b * (SEQ_LEN_KV * KV_GROUP * QK_DIM)
             idx_base = ((bx // HEADS) * KV_GROUP + g) * TOPK
-            dkv_partial_base = bx * TOPK * QK_DIM
             sm_scale = sm_scale_buf[0]
 
             for k in T.serial(lane, TOPK, step=THREADS):
@@ -3185,16 +3231,18 @@ def _make_sparse_mla_bwd_direct_prim(
                 k = kd // QK_DIM
                 d = kd % QK_DIM
                 gather_idx[0] = T.cast(indices[idx_base + k], "int32")
-                if gather_idx[0] < 0:
-                    dkv_partial[dkv_partial_base + kd] = 0.0
-                else:
+                if gather_idx[0] >= 0:
                     acc[0] = sm_scale * ds[k] * T.cast(q[q_row_base + d], "float32")
                     if d < D_V:
-                        dkv_partial[dkv_partial_base + kd] = p[k] * T.cast(
+                        acc[0] = acc[0] + p[k] * T.cast(
                             d_out[d_out_row + d], "float32"
-                        ) + acc[0]
-                    else:
-                        dkv_partial[dkv_partial_base + kd] = acc[0]
+                        )
+                    kv_row_base = kv_b_base + (gather_idx[0] * KV_GROUP + g) * QK_DIM
+                    T.atomic_add(
+                        dkv[kv_row_base + d],
+                        acc[0],
+                        memory_order="relaxed",
+                    )
 
     return sparse_mla_bwd_direct
 
@@ -3215,13 +3263,13 @@ def _bwd_kernel_engine_for(
 ) -> Any:
     """Build the Sparse-MLA bwd kernel through the unified engine dispatcher.
 
-    See :func:`_fwd_kernel_engine_for` for engine/shim semantics. The legacy
-    :func:`_bwd_kernel_for` is preserved verbatim for the MLX runtime path.
+    See :func:`_fwd_kernel_engine_for` for engine/shim semantics. Backward
+    lowering uses the same final-owner-output PrimFunc as the runtime path.
     """
 
     from cppmega_mlx.nn._tilelang._engine_dispatch import dispatch_lower
 
-    prim = _make_sparse_mla_bwd_prim(
+    prim = _make_sparse_mla_bwd_direct_prim(
         BATCH=BATCH,
         SEQ_LEN=SEQ_LEN,
         HEADS=HEADS,
@@ -3232,6 +3280,7 @@ def _bwd_kernel_engine_for(
         SEQ_LEN_KV=SEQ_LEN_KV,
         D_V=D_V,
         THREADS=THREADS,
+        INDEX_DTYPE="int32",
     )
     return dispatch_lower(prim, target)
 
@@ -3262,7 +3311,7 @@ def lower_sparse_mla_bwd_msl(
         dispatch_lower,
     )
 
-    prim = _make_sparse_mla_bwd_prim(
+    prim = _make_sparse_mla_bwd_direct_prim(
         BATCH=BATCH,
         SEQ_LEN=SEQ_LEN,
         HEADS=HEADS,
@@ -3273,9 +3322,78 @@ def lower_sparse_mla_bwd_msl(
         SEQ_LEN_KV=SEQ_LEN_KV,
         D_V=D_V,
         THREADS=THREADS,
+        INDEX_DTYPE="int32",
     )
     artifact = dispatch_lower(prim, target)
     return artifact_to_source(artifact)
+
+
+@lru_cache(maxsize=128)
+def _bwd_direct_lowering_for(
+    BATCH: int,
+    SEQ_LEN: int,
+    HEADS: int,
+    QK_DIM: int,
+    KV_GROUP: int,
+    HEAD_KV: int,
+    TOPK: int,
+    SEQ_LEN_KV: int,
+    D_V: int,
+    THREADS: int,
+    INDEX_DTYPE: str = "int32",
+) -> tuple[Any | None, _msl_transform.TileLangMSLLowering]:
+    """Build and cache lowered MSL for the runtime owner-output bwd kernel."""
+
+    prim = _make_sparse_mla_bwd_direct_prim(
+        BATCH=BATCH,
+        SEQ_LEN=SEQ_LEN,
+        HEADS=HEADS,
+        QK_DIM=QK_DIM,
+        KV_GROUP=KV_GROUP,
+        HEAD_KV=HEAD_KV,
+        TOPK=TOPK,
+        SEQ_LEN_KV=SEQ_LEN_KV,
+        D_V=D_V,
+        THREADS=THREADS,
+        INDEX_DTYPE=INDEX_DTYPE,
+    )
+    lowering = cast(
+        _msl_transform.TileLangMSLLowering,
+        dispatch_lower(prim, target="metal", return_msl=True),
+    )
+    body = _postprocess_bwd_owner_output_msl(
+        lowering.body,
+        seq_len_kv=SEQ_LEN_KV,
+        topk=TOPK,
+        heads=HEADS,
+        seq_len=SEQ_LEN,
+        kv_group=KV_GROUP,
+        head_kv=HEAD_KV,
+        qk_dim=QK_DIM,
+        d_v=D_V,
+        threads=THREADS,
+    )
+    msl_text = _postprocess_bwd_owner_output_msl(
+        lowering.msl_text,
+        seq_len_kv=SEQ_LEN_KV,
+        topk=TOPK,
+        heads=HEADS,
+        seq_len=SEQ_LEN,
+        kv_group=KV_GROUP,
+        head_kv=HEAD_KV,
+        qk_dim=QK_DIM,
+        d_v=D_V,
+        threads=THREADS,
+    )
+    return None, _msl_transform.TileLangMSLLowering(
+        header=lowering.header,
+        body=body,
+        grid=lowering.grid,
+        threadgroup=lowering.threadgroup,
+        msl_text=msl_text,
+        buffer_param_names=lowering.buffer_param_names,
+        kernel_name=lowering.kernel_name,
+    )
 
 
 @lru_cache(maxsize=128)
@@ -3608,7 +3726,7 @@ def _validate_bwd_owner_output_buffers(
     d_out: mx.array,
     indices: mx.array,
     sm_scale_buf: mx.array,
-    dkv_partial: mx.array,
+    dkv: mx.array,
     dq: mx.array,
     *,
     d_v: int | None,
@@ -3630,29 +3748,19 @@ def _validate_bwd_owner_output_buffers(
             f"with shape (1,) and dtype mx.float32; got shape={tuple(sm_scale_buf.shape)} "
             f"dtype={sm_scale_buf.dtype}"
         )
-    expected_dkv_partial = (
-        shapes.batch,
-        shapes.seq_len,
-        shapes.heads,
-        shapes.topk,
-        shapes.qk_dim,
-    )
+    expected_dkv = (shapes.batch, shapes.seq_len_kv, shapes.kv_group, shapes.qk_dim)
     expected_dq = (shapes.batch, shapes.seq_len, shapes.heads, shapes.qk_dim)
-    expected_dkv_partial_flat = (
-        shapes.batch * shapes.seq_len * shapes.heads * shapes.topk * shapes.qk_dim,
+    expected_dkv_flat = (
+        shapes.batch * shapes.seq_len_kv * shapes.kv_group * shapes.qk_dim,
     )
     expected_dq_flat = (
         shapes.batch * shapes.seq_len * shapes.heads * shapes.qk_dim,
     )
-    if (
-        dkv_partial.shape not in (expected_dkv_partial, expected_dkv_partial_flat)
-        or dkv_partial.dtype != mx.float16
-    ):
+    if dkv.shape not in (expected_dkv, expected_dkv_flat) or dkv.dtype != mx.float32:
         raise SparseMLAPathCDirectError(
-            "Sparse-MLA Path C backward owner-output requires dkv_partial with "
-            f"shape={expected_dkv_partial} or flat shape={expected_dkv_partial_flat} "
-            f"and dtype mx.float16; got "
-            f"shape={tuple(dkv_partial.shape)} dtype={dkv_partial.dtype}"
+            "Sparse-MLA Path C backward owner-output requires final dkv with "
+            f"shape={expected_dkv} or flat shape={expected_dkv_flat} and dtype "
+            f"mx.float32; got shape={tuple(dkv.shape)} dtype={dkv.dtype}"
         )
     if dq.shape not in (expected_dq, expected_dq_flat) or dq.dtype != mx.float16:
         raise SparseMLAPathCDirectError(
@@ -3701,6 +3809,75 @@ def _bwd_direct_tvm_ffi_kernel_for(
         execution_backend="tvm_ffi",
         out_idx=[1, 2],
     )
+
+
+def _make_sparse_mla_bwd_clear_dkv_prim(
+    TOTAL: int,
+    THREADS: int,
+) -> Any:
+    """Build the owner-output dKV clear kernel used before atomic scatter."""
+
+    import tilelang.language as T
+
+    @T.prim_func
+    def clear_dkv(
+        dkv: T.Tensor((TOTAL,), "float32"),
+    ):
+        with T.Kernel(T.ceildiv(TOTAL, THREADS), threads=THREADS) as bx:
+            tid = bx * THREADS + T.get_thread_binding()
+            if tid < TOTAL:
+                dkv[tid] = 0.0
+
+    return clear_dkv
+
+
+@lru_cache(maxsize=128)
+def _sparse_mla_bwd_clear_dkv_kernel_for(
+    total: int,
+    threads: int = 256,
+) -> Any:
+    """Compile the owner-output dKV clear kernel used before atomic scatter."""
+
+    import tilelang
+
+    prim = _make_sparse_mla_bwd_clear_dkv_prim(int(total), int(threads))
+    return tilelang.compile(
+        prim,
+        target=_msl_transform._as_metal_target("metal"),
+        execution_backend="tvm_ffi",
+        out_idx=0,
+    )
+
+
+def _empty_sparse_mla_output(shape: tuple[int, ...], dtype: mx.Dtype) -> mx.array:
+    empty = getattr(mx, "empty", None)
+    if empty is None:
+        return mx.zeros(shape, dtype=dtype)
+    return cast(mx.array, empty(shape, dtype=dtype))
+
+
+def _clear_sparse_mla_bwd_dkv_buffer(dkv_buffer: mx.array) -> mx.array:
+    total = int(dkv_buffer.size)
+    if total <= 0:
+        return dkv_buffer
+    if dkv_buffer.dtype != mx.float32:
+        raise SparseMLAPathCDirectError(
+            "Sparse-MLA Path C backward dKV clear requires an mx.float32 buffer; "
+            f"got {dkv_buffer.dtype}"
+        )
+    flat = _flat_1d_view(dkv_buffer)
+    kernel = _sparse_mla_bwd_clear_dkv_kernel_for(
+        total,
+        min(256, max(1, total)),
+    )
+    returned = kernel(out=flat)
+    _owner_output_tuple(
+        returned,
+        expected=(flat,),
+        op_name="Sparse-MLA Path C backward dKV clear",
+    )
+    mx.synchronize()
+    return dkv_buffer
 
 
 def sparse_mla_fwd_path_c_direct(
@@ -3785,7 +3962,7 @@ def sparse_mla_fwd_path_c_direct(
     return out, lse
 
 
-def _sparse_mla_bwd_path_c_partial_direct(
+def _sparse_mla_bwd_path_c_direct(
     q: mx.array,
     kv: mx.array,
     d_out: mx.array,
@@ -3793,8 +3970,8 @@ def _sparse_mla_bwd_path_c_partial_direct(
     *,
     sm_scale_buf: mx.array,
     d_v: int | None = None,
-) -> tuple[mx.array, mx.array, mx.array, Any]:
-    """Run the fp16-carrier backward partial kernel through tvm-ffi."""
+) -> tuple[mx.array, mx.array]:
+    """Run the fp16-carrier backward kernel into final owner outputs."""
 
     status = sparse_mla_path_c_status()
     if not status.available:
@@ -3802,7 +3979,7 @@ def _sparse_mla_bwd_path_c_partial_direct(
     shapes = _resolve_shapes(q, kv, indices, d_v=d_v)
     if q.dtype != mx.float16 or kv.dtype != mx.float16 or d_out.dtype != mx.float16:
         raise SparseMLAPathCDirectError(
-            "Sparse-MLA Path C backward native tvm-ffi currently requires "
+            "Sparse-MLA Path C backward owner-output currently requires "
             "fp16-carrier q/kv/d_out without hidden casts; got "
             f"q={q.dtype}, kv={kv.dtype}, d_out={d_out.dtype}"
         )
@@ -3845,6 +4022,27 @@ def _sparse_mla_bwd_path_c_partial_direct(
     kv_flat = _flat_1d_view(kv)
     d_out_flat = _flat_1d_view(d_out)
     indices_flat = _flat_1d_view(indices)
+    dq_owner = _empty_sparse_mla_output(
+        (shapes.batch, shapes.seq_len, shapes.heads, shapes.qk_dim),
+        mx.float16,
+    )
+    dkv_owner = _empty_sparse_mla_output(
+        (shapes.batch, shapes.seq_len_kv, shapes.kv_group, shapes.qk_dim),
+        mx.float32,
+    )
+    _validate_bwd_owner_output_buffers(
+        q,
+        kv,
+        d_out,
+        indices,
+        sm_scale_buf,
+        dkv_owner,
+        dq_owner,
+        d_v=d_v,
+    )
+    _clear_sparse_mla_bwd_dkv_buffer(dkv_owner)
+    dq_flat = _flat_1d_view(dq_owner)
+    dkv_flat = _flat_1d_view(dkv_owner)
     try:
         returned = kernel(
             d_out_flat,
@@ -3852,6 +4050,7 @@ def _sparse_mla_bwd_path_c_partial_direct(
             kv_flat,
             q_flat,
             sm_scale_buf,
+            out=(dkv_flat, dq_flat),
         )
     except Exception as exc:
         try:
@@ -3864,30 +4063,13 @@ def _sparse_mla_bwd_path_c_partial_direct(
             "Sparse-MLA Path C backward owner-output tvm-ffi dispatch failed: "
             f"{type(exc).__name__}: {exc}"
         ) from exc
-    mx.synchronize()
-    if not isinstance(returned, (list, tuple)) or len(returned) != 2:
-        raise SparseMLAPathCDirectError(
-            "Sparse-MLA Path C backward native tvm-ffi did not return "
-            "dkv_partial and dq"
-        )
-    returned_dkv_flat = cast(mx.array, returned[0])
-    returned_dq_flat = cast(mx.array, returned[1])
-    return (
-        returned_dkv_flat.reshape(
-            (
-                shapes.batch,
-                shapes.seq_len,
-                shapes.heads,
-                shapes.topk,
-                shapes.qk_dim,
-            )
-        ),
-        returned_dq_flat.reshape(
-            (shapes.batch, shapes.seq_len, shapes.heads, shapes.qk_dim)
-        ),
-        indices,
-        shapes,
+    _owner_output_tuple(
+        returned,
+        expected=(dkv_flat, dq_flat),
+        op_name="Sparse-MLA Path C backward owner-output tvm-ffi",
     )
+    mx.synchronize()
+    return dq_owner, dkv_owner
 
 
 def sparse_mla_fwd_path_c(
@@ -3971,7 +4153,7 @@ def sparse_mla_fwd_path_c(
     return out_native, lse_native
 
 
-def _sparse_mla_bwd_path_c_partial(
+def sparse_mla_bwd_path_c(
     q: mx.array,
     kv: mx.array,
     d_out: mx.array,
@@ -3979,11 +4161,12 @@ def _sparse_mla_bwd_path_c_partial(
     *,
     sm_scale: float | None = None,
     d_v: int | None = None,
-) -> tuple[mx.array, mx.array, mx.array, Any] | None:
-    """Run the TileLang backward kernel and return unreduced dKV partials.
+) -> tuple[mx.array, mx.array] | None:
+    """TileLang DSL Path C Sparse-MLA backward.
 
-    This is intentionally private and exists so the benchmark can isolate the
-    TileLang kernel cost from the shared Path B/Path C dKV scatter-reduction.
+    Returns ``(dq, dkv)`` or ``None`` if the Metal/TileLang path cannot be
+    built. The kernel returns final gradients only; dKV scatter/reduction stays
+    inside the TileLang owner-output route.
     """
 
     status = sparse_mla_path_c_status()
@@ -3997,7 +4180,7 @@ def _sparse_mla_bwd_path_c_partial(
         sm_scale_value = sm_scale
     indices_supported = _require_supported_indices_no_hidden_cast(
         indices,
-        op_name="_sparse_mla_bwd_path_c_partial",
+        op_name="sparse_mla_bwd_path_c",
     )
     q_carrier = _fp16_public_carrier(q)
     kv_carrier = _fp16_public_carrier(kv)
@@ -4006,7 +4189,7 @@ def _sparse_mla_bwd_path_c_partial(
         return None
     sm_scale_buf = mx.array([float(sm_scale_value)], dtype=mx.float32)
     try:
-        return _sparse_mla_bwd_path_c_partial_direct(
+        dq, dkv = _sparse_mla_bwd_path_c_direct(
             q_carrier,
             kv_carrier,
             d_out_carrier,
@@ -4016,37 +4199,6 @@ def _sparse_mla_bwd_path_c_partial(
         )
     except SparseMLAPathCDirectError:
         return None
-
-
-def sparse_mla_bwd_path_c(
-    q: mx.array,
-    kv: mx.array,
-    d_out: mx.array,
-    indices: mx.array,
-    *,
-    sm_scale: float | None = None,
-    d_v: int | None = None,
-) -> tuple[mx.array, mx.array] | None:
-    """TileLang DSL Path C Sparse-MLA backward.
-
-    Returns ``(dq, dkv)`` or ``None`` if the Metal/TileLang path cannot be
-    built. The kernel mirrors Path B's fp16 carrier/partial contract while
-    keeping fp32 accumulators inside the TileLang kernel.
-    """
-
-    partial = _sparse_mla_bwd_path_c_partial(
-        q,
-        kv,
-        d_out,
-        indices,
-        sm_scale=sm_scale,
-        d_v=d_v,
-    )
-    if partial is None:
-        return None
-
-    dkv_partial, dq, indices_i32, shapes = partial
-    dkv = _reduce_dkv_partial(dkv_partial, indices_i32, shapes)
     return cast(mx.array, dq), cast(mx.array, dkv)
 
 
@@ -4270,7 +4422,7 @@ def dump_lowered_bwd_msl(
         d_v = qk_dim
     head_kv = heads // kv_group
     threads = _threadgroup_size(topk)
-    _kernel, lowering = _bwd_kernel_for(
+    _kernel, lowering = _bwd_direct_lowering_for(
         batch,
         seq_len,
         heads,

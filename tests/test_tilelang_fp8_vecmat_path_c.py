@@ -5,7 +5,7 @@ Path C targets the same M=1, transpose-B vecmat contract as Path B's
 hand-written ``fp8_scaled_vecmat`` MSL kernel. These tests keep the DSL kernel
 checked in and assert the default Metal lowering uses Path B-style packed
 uint32 loads with a LUT decode. The single-warp allreduce should lower to
-literal Metal ``simd_sum``.
+Metal SIMDgroup reduction code.
 """
 
 from __future__ import annotations
@@ -38,10 +38,6 @@ from cppmega_mlx.nn._tilelang.fp8_vecmat_path_c import (
     fp8_vecmat_path_c_status,
     lower_fp8_vecmat_msl,
 )
-from cppmega_mlx.nn._tilelang._msl_transform import (
-    _assert_path_c_metal_fp8_intrinsics_registered,
-)
-
 
 def _metal_available() -> bool:
     metal = getattr(mx, "metal", None)
@@ -97,14 +93,13 @@ def test_lowered_default_reducer_contains_kernel_and_packed_lut_decode() -> None
     assert "blockIdx.x" in msl or "gridThreadIdx.x" in msl
 
 
-def test_lowered_default_reducer_uses_packed_uint_loads_and_simd_sum() -> None:
+def test_lowered_default_reducer_uses_packed_uint_loads_and_simd_reduction() -> None:
     _require_fp8_vecmat_path_c_available()
     msl = lower_fp8_vecmat_msl(N=128, K=128)
     features = fp8_vecmat_msl_features(msl)
     assert features["packed_uint_loads"] > 0
     assert features["metal_fp8_dot4_helper"] > 0
-    assert features["simd_sum"] > 0
-    assert features["simd_shuffle_down"] == 0
+    assert features["simd_reduction"] > 0
     assert features["scalar_fp8_byte_decode_calls"] == 0
 
 
@@ -123,8 +118,7 @@ def test_lowered_default_reducer_reports_path_b_fast_path_ready() -> None:
 
     assert blockers["path_b_fast_path_ready"] is True
     assert blockers["missing"] == []
-    assert features["simd_shuffle_down"] == 0
-    assert features["simd_sum"] > 0
+    assert features["simd_reduction"] > 0
     assert features["packed_uint_loads"] > 0
     assert features["metal_fp8_dot4_helper"] > 0
     assert features["scalar_fp8_byte_decode_calls"] == 0
@@ -169,7 +163,7 @@ def test_runtime_source_uses_canonical_body_without_fast_tuple_dispatch() -> Non
         "__tvm_fp8_e4m3_dot4_packed" in msl
         or "__tvm_fp8_e4m3_dot4_words" in msl
     )
-    assert "simd_sum(" in msl
+    assert fp8_vecmat_msl_features(msl)["simd_reduction"] > 0
     assert "device const uint* A4 = reinterpret_cast<device const uint*>(A)" not in msl
     assert "device const uint* B4 = reinterpret_cast<device const uint*>(B" not in msl
 
@@ -200,12 +194,14 @@ def test_fp8_e4m3_dot4_intrinsic_is_registered() -> None:
         except Exception as exc:
             pytest.skip(f"TVM Op import unavailable: {exc}")
 
-    _assert_path_c_metal_fp8_intrinsics_registered()
+    from tilelang.language.fp8_op import assert_metal_fp8_intrinsics_registered
+
+    assert_metal_fp8_intrinsics_registered()
     op = Op.get("tirx.metal.fp8_e4m3_dot4")
     assert op is not None, (
         "tirx.metal.fp8_e4m3_dot4 must be registered for Path C FP8 macro "
-        "lowering. See cppmega_mlx.nn._tilelang._msl_transform."
-        "_register_path_c_metal_fp8_intrinsics."
+        "lowering. See tilelang.language.fp8_op."
+        "assert_metal_fp8_intrinsics_registered."
     )
 
 

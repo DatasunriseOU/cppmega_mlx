@@ -2497,6 +2497,13 @@ def _clear_fp8_bwd_dkv_buffer(dkv_buffer: mx.array) -> mx.array:
     return dkv_buffer
 
 
+def _empty_fp8_bwd_output(shape: tuple[int, ...]) -> mx.array:
+    empty = getattr(mx, "empty", None)
+    if empty is None:
+        return mx.zeros(shape, dtype=mx.float32)
+    return cast(mx.array, empty(shape, dtype=mx.float32))
+
+
 def _dispatch_fp8_bwd_owner_output_path_c(
     *,
     q_fp8: mx.array,
@@ -2527,45 +2534,29 @@ def _dispatch_fp8_bwd_owner_output_path_c(
     dkv_shape = (batch, seq_len_kv, kv_group, K)
     index_dtype = _index_dtype_name(indices, op_name="FP8 Sparse-MLA Path C backward")
     if dq_buffer is None and dkv_buffer is None:
-        try:
-            kernel = _fp8_bwd_tvm_ffi_kernel_for(
-                batch,
-                seq_len,
-                heads,
-                seq_len_kv,
-                kv_group,
-                head_kv,
-                topk,
-                K,
-                d_v,
-                threads,
-                d_out_dtype,
-                index_dtype,
-            )
-            returned = kernel(
-                _flat_1d_view(q_fp8),
-                _flat_1d_view(q_scale),
-                _flat_1d_view(kv_fp8),
-                _flat_1d_view(kv_scale),
-                _flat_1d_view(d_out),
-                _flat_1d_view(indices),
-                sm_scale_buf,
-            )
-        except Exception as exc:
-            if force_path_c:
-                raise RuntimeError(
-                "sparse_mla_fp8_bwd_path_c: native TileLang tvm-ffi graph-output "
-                f"dispatch failed: {type(exc).__name__}: {exc}"
-            ) from exc
-            return None
-        if not isinstance(returned, (list, tuple)) or len(returned) != 2:
-            raise SparseMLAFp8PathCDirectError(
-                "native tvm-ffi FP8 Sparse-MLA backward did not return "
-                "dq/dkv graph outputs"
-            )
-        dq = cast(mx.array, returned[0]).reshape(dq_shape)
-        dkv = cast(mx.array, returned[1]).reshape(dkv_shape)
-        return dq, dkv
+        return _dispatch_fp8_bwd_owner_output_path_c(
+            q_fp8=q_fp8,
+            q_scale=q_scale,
+            kv_fp8=kv_fp8,
+            kv_scale=kv_scale,
+            d_out=d_out,
+            indices=indices,
+            sm_scale_buf=sm_scale_buf,
+            batch=batch,
+            seq_len=seq_len,
+            heads=heads,
+            seq_len_kv=seq_len_kv,
+            kv_group=kv_group,
+            head_kv=head_kv,
+            topk=topk,
+            K=K,
+            d_v=d_v,
+            threads=threads,
+            d_out_dtype=d_out_dtype,
+            dq_buffer=_empty_fp8_bwd_output(dq_shape),
+            dkv_buffer=_empty_fp8_bwd_output(dkv_shape),
+            force_path_c=force_path_c,
+        )
     if (dq_buffer is None) != (dkv_buffer is None):
         raise SparseMLAFp8PathCDirectError(
             "sparse_mla_fp8_bwd_path_c owner-output route requires both "

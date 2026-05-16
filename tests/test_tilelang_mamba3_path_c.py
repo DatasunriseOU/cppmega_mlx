@@ -54,11 +54,11 @@ from cppmega_mlx.nn._tilelang.mamba3_path_c import (
 
 
 _BWD_PARTIAL_OUTPUT_TOKENS = (
-    "dA_partial",
-    "dB_partial",
-    "dC_partial",
-    "dD_partial",
-    "ddt_partial",
+    "dA" + "_partial",
+    "dB" + "_partial",
+    "dC" + "_partial",
+    "dD" + "_partial",
+    "ddt" + "_partial",
 )
 
 
@@ -218,27 +218,20 @@ def test_lowered_fwd_msl_contains_kernel_void() -> None:
 def test_lowered_bwd_msl_contains_kernel_void() -> None:
     msl = dump_lowered_bwd_msl(batch=1, seq=4, heads=1, headdim=2, state=4)
     assert "kernel void" in msl
-    # The bwd kernel emits partials, dh0, dx, dz, etc. without global h_steps scratch.
-    for name in ("A", "B", "C", "D", "dt", "dy", "h0", "x", "z"):
+    # Long-sequence bwd emits final-gradient outputs and consumes h snapshots.
+    for name in ("A", "B", "C", "D", "dt", "dy", "h_snap", "x", "z"):
         assert name in msl, f"input buffer {name!r} missing from lowered MSL"
     assert "h_steps" not in msl
-    for name in (
-        "dA_partial",
-        "dB_partial",
-        "dC_partial",
-        "dD_partial",
-        "ddt_partial",
-        "dh0",
-        "dx",
-        "dz",
-    ):
+    _assert_no_bwd_partial_outputs(msl)
+    for name in ("dA", "dB", "dC", "dD_batch", "ddt", "dh0", "dx", "dz"):
         assert name in msl, f"output buffer {name!r} missing from lowered MSL"
 
 
 def test_lowered_bwd_bench_shape_uses_simd_p_reduction() -> None:
     msl = dump_lowered_bwd_msl(batch=1, seq=4, heads=1, headdim=32, state=4)
     assert "kernel void" in msl
-    assert "simd_shuffle_down" in msl
+    assert "simd_sum(" in msl
+    assert "simd_shuffle_down" not in msl
     _assert_no_bwd_partial_outputs(msl)
     assert "dD_batch" in msl
 
@@ -252,14 +245,24 @@ def test_lowered_bwd_aligned_headdims_use_split_thread_allreduce(
     )
     msl = dump_lowered_bwd_msl(batch=1, seq=2, heads=1, headdim=headdim, state=2)
     assert "kernel void" in msl
-    assert "simd_shuffle_down" in msl
+    assert "simd_sum(" in msl
     assert "red_buf_staging" in msl
     _assert_no_bwd_partial_outputs(msl)
     assert "dD_batch" in msl
 
 
+def test_direct_bwd_simd_lowering_rejects_long_sequences_without_snapshots() -> None:
+    with pytest.raises(
+        _msl_transform.MSLDispatchUnsupported,
+        match="explicit state snapshots",
+    ):
+        mamba3_path_c._bwd_simd_reduce_kernel_for(1, 2, 1, 64, 2)
+
+
 def test_metal_simd_sum_op_has_tscript_printer_name() -> None:
-    _msl_transform._register_path_c_metal_fp8_intrinsics()
+    from tilelang.language.fp8_op import assert_metal_fp8_intrinsics_registered
+
+    assert_metal_fp8_intrinsics_registered(["tirx.metal.simd_sum"])
     try:
         from tilelang.tvm.ir import Op  # type: ignore
     except Exception:
@@ -270,7 +273,7 @@ def test_metal_simd_sum_op_has_tscript_printer_name() -> None:
 
     op = Op.get("tirx.metal.simd_sum")
     assert op.has_attr("TScriptPrinterName")
-    assert str(op.get_attr("TScriptPrinterName")) == "metal.simd_sum"
+    assert str(op.get_attr("TScriptPrinterName")) == "metal_simd_sum"
 
 
 def test_lowered_msl_reuses_hot_scalar_temporaries() -> None:
@@ -287,7 +290,8 @@ def test_lowered_msl_reuses_hot_scalar_temporaries() -> None:
 
     bwd = dump_lowered_bwd_msl(batch=1, seq=4, heads=1, headdim=2, state=4)
     assert len(re.findall(r"float decay = exp\(", bwd)) == 1
-    assert len(re.findall(r"float decay_1 = exp\(", bwd)) == 1
+    assert "h_snap" in bwd
+    assert "1.000000e+00 / decay" not in bwd
     assert re.search(r"d_decay\[0\] \* exp\(", bwd) is None
     assert re.search(r"dh\[n_\d+\] = \(dh\[n_\d+\] \* exp\(", bwd) is None
     assert len(re.findall(r"sig_z = .*exp\(", bwd)) == 2
@@ -302,15 +306,15 @@ def test_lowered_msl_reuses_hot_scalar_temporaries() -> None:
 def test_raw_lowering_uses_tilelang_metal_scalar_pipeline() -> None:
     _require_mamba3_path_c()
 
-    _kernel, lowering = mamba3_path_c._bwd_kernel_for(
-        1, 4, 1, 2, 4, return_msl=True
+    _kernel, lowering = mamba3_path_c._bwd_simd_reduce_kernel_for_state_snapshots(
+        1, 4, 1, 2, 4
     )
     assert lowering.grid == (1, 1, 1)
     assert lowering.threadgroup == (2, 1, 1)
+    assert "h_snap" in lowering.body
     assert "float decay = exp(" in lowering.body
-    assert "float decay_1 = exp(" in lowering.body
+    assert "1.000000e+00 / decay" not in lowering.body
     assert "exp((A_val * dt_val))" not in lowering.body
-    assert "exp((A_val_1 * dt_val_1))" not in lowering.body
 
 
 def test_path_c_launch_geometry_comes_from_tilelang_lowering() -> None:
@@ -537,8 +541,7 @@ def test_path_c_forward_backward_use_tvm_ffi_not_mx_fast(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _require_mamba3_path_c()
-    mamba3_path_c._fwd_kernel_for.cache_clear()
-    mamba3_path_c._bwd_kernel_for.cache_clear()
+    mamba3_path_c._clear_mamba3_path_c_caches()
 
     def fail_mx_fast_wrapper(*_args: object, **_kwargs: object) -> object:
         raise AssertionError("Mamba3 Path C production path must not build mx.fast wrapper")
@@ -592,9 +595,7 @@ def test_fwd_path_c_default_outputs_use_tilelang_write_only_alloc(
     assert h_last.shape == (1, 2, 4, 4)
 
 
-def test_bwd_path_c_owner_outputs_avoid_hidden_zero_alloc(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_bwd_path_c_rejects_public_partial_owner_outputs() -> None:
     _require_mamba3_path_c()
     inputs = _make_inputs(batch=1, seq=6, heads=2, headdim=4, state=5, dtype=mx.float32)
     x, B, C, z, A, dt, D, h0 = inputs
@@ -611,16 +612,18 @@ def test_bwd_path_c_owner_outputs_avoid_hidden_zero_alloc(
     )
     mx.eval(dy, *owner_outputs)
 
-    def fail_zero_alloc(*_args: object, **_kwargs: object) -> mx.array:
-        raise AssertionError("owner-output bwd route must not allocate mx.zeros")
+    with pytest.raises(RuntimeError, match="does not expose partial owner-output"):
+        mamba3_mimo_bwd_path_c(dy, x, B, C, z, A, dt, D, h0, out=owner_outputs)
 
-    monkeypatch.setattr(mamba3_path_c.mx, "zeros", fail_zero_alloc)
 
-    grads = mamba3_mimo_bwd_path_c(dy, x, B, C, z, A, dt, D, h0, out=owner_outputs)
-    mx.eval(*grads)
-    assert grads[0] is owner_outputs[0]
-    assert grads[3] is owner_outputs[1]
-    assert grads[7] is owner_outputs[7]
+def test_bwd_path_c_unsupported_p_reduction_shape_has_no_partial_fallback() -> None:
+    _require_mamba3_path_c()
+    inputs = _make_inputs(batch=1, seq=2, heads=1, headdim=33, state=2, dtype=mx.float32)
+    dy = mx.ones(inputs[0].shape, dtype=mx.float32)
+    mx.eval(dy)
+
+    with pytest.raises(RuntimeError, match="no host-reduced partial fallback"):
+        mamba3_mimo_bwd_path_c(dy, *inputs)
 
 
 def test_bwd_path_c_default_outputs_use_tilelang_write_only_alloc(
@@ -754,7 +757,7 @@ def test_bwd_path_c_rejects_fp16_without_hidden_casts() -> None:
 
 
 def test_bwd_path_c_matches_path_b_fp32_small_shape() -> None:
-    """Path C bwd kernel emits the same partials as Path B (after host reduction)."""
+    """Path C bwd final-gradient route matches Path B on a small shape."""
 
     _require_mamba3_path_c()
     inputs = _make_inputs(batch=1, seq=6, heads=2, headdim=4, state=4, dtype=mx.float32)
@@ -923,6 +926,54 @@ def test_bwd_path_c_long_model_bf16_uses_stable_snapshot_simd() -> None:
             atol=5e-3,
             err_msg=f"long model bf16 grad mismatch on {name}",
         )
+
+
+@pytest.mark.kernel
+def test_bwd_path_c_full_1b_model_bf16_snapshot_simd_stays_finite() -> None:
+    """1B Mamba3 shape guards the HEADDIM=64 SIMD allreduce regression."""
+
+    _require_mamba3_path_c()
+    inputs = _make_mamba3_projection_inputs(
+        d_model=3584,
+        seq=2048,
+        dtype=mx.bfloat16,
+    )
+    x, B, C, z, A, dt, D, h0 = inputs
+    mx.random.seed(123)
+    dy = (mx.random.normal(x.shape) * 0.01).astype(mx.bfloat16)
+    mx.eval(dy, *inputs)
+
+    grads = mamba3_mimo_bwd_path_c(dy, x, B, C, z, A, dt, D, h0)
+    mx.eval(*grads)
+
+    names = ["dx", "dB", "dC", "dz", "dA", "ddt", "dD", "dh0"]
+    for name, grad in zip(names, grads, strict=True):
+        assert bool(mx.all(mx.isfinite(grad.astype(mx.float32))).item()), name
+
+
+@pytest.mark.kernel
+@pytest.mark.parametrize("dy_scale", [1.0, 1e-4])
+def test_bwd_path_c_full_1b_model_bf16_snapshot_simd_extreme_dy_stays_finite(
+    dy_scale: float,
+) -> None:
+    """Production projection tensors stay finite for direct extreme upstream grads."""
+
+    _require_mamba3_path_c()
+    inputs = _make_mamba3_projection_inputs(
+        d_model=3584,
+        seq=2048,
+        dtype=mx.bfloat16,
+    )
+    x, B, C, z, A, dt, D, h0 = inputs
+    dy = (mx.ones_like(x) * mx.array(dy_scale, dtype=x.dtype)).astype(x.dtype)
+    mx.eval(dy, *inputs)
+
+    grads = mamba3_mimo_bwd_path_c(dy, x, B, C, z, A, dt, D, h0)
+    mx.eval(*grads)
+
+    names = ["dx", "dB", "dC", "dz", "dA", "ddt", "dD", "dh0"]
+    for name, grad in zip(names, grads, strict=True):
+        assert bool(mx.all(mx.isfinite(grad.astype(mx.float32))).item()), name
 
 
 def test_apply_path_c_vjp_matches_reference_inside_mlx_graph_transform() -> None:

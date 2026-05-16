@@ -280,12 +280,11 @@ _FWD_KERNEL = _msl_transform.make_metal_kernel(
 #         for dv (sum_kk) and dW (sum_kk per (v0, vv)). dq[kk], dk[kk], dxf
 #         contributions stay per-thread.
 #
-# Per-lane partial outputs (caller reduces over (B) for dW; dq/dk/dv/dxf are
-# already (B,S,H,*) so no extra reduction):
+# Outputs:
 #   dq         [B, S, H, K]
 #   dk         [B, S, H, K]
 #   dv         [B, S, H, V]
-#   dW_partial [B, H, V, V]      -- caller sums over B
+#   dW         [H, V, V]         -- supported for B == 1; otherwise fallback
 #   dxf        [B, S, H]
 #   dh0        [B, H, K, V]
 #
@@ -479,10 +478,11 @@ _BWD_KERNEL_SOURCE = """
     for (uint vv = 0; vv < V_DIM; ++vv) {
         dh0[h0_base_row + vv] = T_OUT(dh_row[vv]);
     }
-    // Persist dW per lane: write the threadgroup-shared tile to (b, h, V, V).
-    uint dW_lane_base = (b * uint(HEADS) + h) * V_DIM * V_DIM;
+    // Persist final dW per head. Python only dispatches this route for B == 1;
+    // multi-batch reduction falls back until semantic reduction lowering owns it.
+    uint dW_lane_base = h * V_DIM * V_DIM;
     for (uint i = kk; i < V_DIM * V_DIM; i += K_DIM) {
-        dW_partial[dW_lane_base + i] = T_OUT(dW_shared[i]);
+        dW[dW_lane_base + i] = T_OUT(dW_shared[i]);
     }
 """
 
@@ -494,7 +494,7 @@ _BWD_KERNEL = _msl_transform.make_metal_kernel(
         "dq",
         "dk",
         "dv",
-        "dW_partial",
+        "dW",
         "dxf",
         "dh0",
         "h_steps_scratch",
@@ -847,6 +847,8 @@ def _m2rnn_bwd_metal_kernel(
     v_dim = v.shape[-1]
     if seq == 0:
         return None
+    if batch != 1:
+        return None
 
     inputs = [
         dy.astype(cast_dtype),
@@ -879,7 +881,7 @@ def _m2rnn_bwd_metal_kernel(
                 (batch, seq, heads, k_dim),               # dq
                 (batch, seq, heads, k_dim),               # dk
                 (batch, seq, heads, v_dim),               # dv
-                (batch, heads, v_dim, v_dim),             # dW_partial
+                (heads, v_dim, v_dim),                    # dW
                 (batch, seq, heads),                      # dxf
                 (batch, heads, k_dim, v_dim),             # dh0
                 (batch * heads, seq, k_dim * v_dim),      # h_steps_scratch
@@ -891,9 +893,7 @@ def _m2rnn_bwd_metal_kernel(
         )
     except Exception:
         return None
-    dq, dk, dv, dW_partial, dxf_, dh0, _scratch = outputs
-    # Reduce dW over batch.
-    dW = mx.sum(dW_partial, axis=0)  # (H, V, V)
+    dq, dk, dv, dW, dxf_, dh0, _scratch = outputs
     return dq, dk, dv, dW, dxf_, dh0
 
 

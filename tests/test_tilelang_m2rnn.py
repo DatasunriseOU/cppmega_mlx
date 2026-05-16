@@ -80,6 +80,7 @@ def test_legacy_m2rnn_blocker_points_to_native_tvm_ffi_route() -> None:
     assert "cannot turn this hand-written MSL back into TileLang IR" in mod.__doc__
     assert 'execution_backend="tvm_ffi"' in mod.__doc__
     assert "m2rnn_path_c.py" in mod.__doc__
+    assert "dW" + "_partial" not in mod._BWD_KERNEL_SOURCE
 
 
 # ---------------------------------------------------------------------------

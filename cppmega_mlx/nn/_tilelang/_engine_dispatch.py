@@ -62,11 +62,9 @@ def _with_pass_context(pass_configs: dict[str, Any] | None):
 
 def _ensure_path_c_metal_intrinsics_registered() -> None:
     try:
-        from cppmega_mlx.nn._tilelang._msl_transform import (
-            _register_path_c_metal_fp8_intrinsics,
-        )
+        from tilelang.language.fp8_op import assert_metal_fp8_intrinsics_registered
 
-        _register_path_c_metal_fp8_intrinsics()
+        assert_metal_fp8_intrinsics_registered()
     except Exception:
         pass
 

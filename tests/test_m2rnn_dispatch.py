@@ -124,7 +124,7 @@ def test_path_c_dispatches_grouped_heads_without_path_b_fallback(
     )
     matches = [e for e in get_dispatch_log() if e["op_name"] == "m2rnn"]
     assert matches[-1]["path"] == "path_c"
-    assert matches[-1]["kernel_used"] == "path_c_tilelang_dsl_packed_inline_post"
+    assert matches[-1]["kernel_used"] == "path_c_tilelang_dsl_packed_post"
 
 
 def test_path_c_dispatch_requires_existing_h0_without_allocating(
@@ -140,12 +140,12 @@ def test_path_c_dispatch_requires_existing_h0_without_allocating(
 
     monkeypatch.setattr(
         m2rnn_path_c,
-        "m2rnn_mapped_packed_post_path_c_status",
+        "m2rnn_mapped_packed_path_c_status",
         fail_path_c_status,
     )
     monkeypatch.setattr(
         m2rnn_path_c,
-        "m2rnn_apply_mapped_packed_post_with_state_path_c",
+        "m2rnn_apply_mapped_packed_with_state_path_c",
         fail_path_c_kernel,
     )
     monkeypatch.setenv("CPPMEGA_KERNEL_PATH", "path_c")
@@ -180,20 +180,27 @@ def test_path_c_dispatch_accepts_explicit_initial_h0(
 
     monkeypatch.setattr(
         m2rnn_path_c,
-        "m2rnn_mapped_packed_post_path_c_status",
+        "m2rnn_mapped_packed_path_c_status",
         lambda *_args, **_kwargs: m2rnn_path_c.M2RNNPathCStatus(
             True,
-            "forced inline post available",
+            "forced packed recurrence available",
         ),
     )
 
-    def fake_path_c_kernel(
+    monkeypatch.setattr(
+        m2rnn_path_c,
+        "m2rnn_post_residual_gate_path_c_status",
+        lambda *_args, **_kwargs: m2rnn_path_c.M2RNNPathCStatus(
+            True,
+            "forced post available",
+        ),
+    )
+
+    def fake_recurrence_kernel(
         conv_input: mx.array,
         W: mx.array,
         xf: mx.array,
         h0: mx.array,
-        D: mx.array,
-        projected: mx.array,
         **_kwargs: object,
     ) -> tuple[mx.array, mx.array]:
         batch, seq, _conv_dim = conv_input.shape
@@ -202,14 +209,28 @@ def test_path_c_dispatch_accepts_explicit_initial_h0(
         seen["conv_input"] = tuple(conv_input.shape)
         seen["xf"] = tuple(xf.shape)
         seen["h0"] = tuple(h0.shape)
+        return mx.zeros((batch, seq, heads * v_dim), dtype=conv_input.dtype), h0
+
+    def fake_post_kernel(
+        y: mx.array,
+        conv_input: mx.array,
+        D: mx.array,
+        projected: mx.array,
+        **_kwargs: object,
+    ) -> mx.array:
         seen["D"] = tuple(D.shape)
         seen["projected"] = tuple(projected.shape)
-        return mx.zeros((batch, seq, heads * v_dim), dtype=conv_input.dtype), h0
+        return y
 
     monkeypatch.setattr(
         m2rnn_path_c,
-        "m2rnn_apply_mapped_packed_post_with_state_path_c",
-        fake_path_c_kernel,
+        "m2rnn_apply_mapped_packed_with_state_path_c",
+        fake_recurrence_kernel,
+    )
+    monkeypatch.setattr(
+        m2rnn_path_c,
+        "m2rnn_apply_post_residual_gate_path_c",
+        fake_post_kernel,
     )
     monkeypatch.setenv("CPPMEGA_KERNEL_PATH", "path_c")
     cfg = M2RNNConfig(
@@ -240,10 +261,10 @@ def test_path_c_dispatch_accepts_explicit_initial_h0(
     assert h.shape == seen["h0"]
     matches = [e for e in get_dispatch_log() if e["op_name"] == "m2rnn"]
     assert matches[-1]["path"] == "path_c"
-    assert matches[-1]["kernel_used"] == "path_c_tilelang_dsl_packed_inline_post"
+    assert matches[-1]["kernel_used"] == "path_c_tilelang_dsl_packed_post"
 
 
-def test_path_c_dispatch_uses_fused_post_without_v_g_broadcast_materialization(
+def test_path_c_dispatch_uses_tilelang_post_without_v_g_broadcast_materialization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from cppmega_mlx.nn import m2rnn as m2rnn_mod
@@ -253,20 +274,26 @@ def test_path_c_dispatch_uses_fused_post_without_v_g_broadcast_materialization(
 
     monkeypatch.setattr(
         m2rnn_path_c,
-        "m2rnn_mapped_packed_post_path_c_status",
+        "m2rnn_mapped_packed_path_c_status",
         lambda *_args, **_kwargs: m2rnn_path_c.M2RNNPathCStatus(
             True,
-            "forced inline post available",
+            "forced packed recurrence available",
+        ),
+    )
+    monkeypatch.setattr(
+        m2rnn_path_c,
+        "m2rnn_post_residual_gate_path_c_status",
+        lambda *_args, **_kwargs: m2rnn_path_c.M2RNNPathCStatus(
+            True,
+            "forced post available",
         ),
     )
 
-    def fake_inline_post(
+    def fake_recurrence(
         conv_input: mx.array,
         W: mx.array,
         xf: mx.array,
         h0: mx.array,
-        D: mx.array,
-        projected: mx.array,
         **kwargs: object,
     ) -> tuple[mx.array, mx.array]:
         batch, seq, _conv_dim = conv_input.shape
@@ -274,11 +301,21 @@ def test_path_c_dispatch_uses_fused_post_without_v_g_broadcast_materialization(
         seen["W"] = tuple(W.shape)
         seen["xf"] = tuple(xf.shape)
         seen["h0"] = tuple(h0.shape)
+        seen["recurrence_v_heads"] = int(kwargs["v_heads"])
+        return mx.zeros((batch, seq, h0.shape[1], h0.shape[-1]), dtype=conv_input.dtype), h0
+
+    def fake_post(
+        y: mx.array,
+        conv_input: mx.array,
+        D: mx.array,
+        projected: mx.array,
+        **kwargs: object,
+    ) -> mx.array:
         seen["D"] = tuple(D.shape)
         seen["projected"] = tuple(projected.shape)
         seen["post_v_heads"] = int(kwargs["v_heads"])
         seen["post_g_heads"] = int(kwargs["g_heads"])
-        return mx.zeros((batch, seq, h0.shape[1] * h0.shape[-1]), dtype=conv_input.dtype), h0
+        return y.reshape(y.shape[0], y.shape[1], -1)
 
     def fail_broadcast(*_args: object, **_kwargs: object) -> mx.array:
         raise AssertionError("Path C post route must not materialize v head broadcast in MLX")
@@ -288,8 +325,13 @@ def test_path_c_dispatch_uses_fused_post_without_v_g_broadcast_materialization(
 
     monkeypatch.setattr(
         m2rnn_path_c,
-        "m2rnn_apply_mapped_packed_post_with_state_path_c",
-        fake_inline_post,
+        "m2rnn_apply_mapped_packed_with_state_path_c",
+        fake_recurrence,
+    )
+    monkeypatch.setattr(
+        m2rnn_path_c,
+        "m2rnn_apply_post_residual_gate_path_c",
+        fake_post,
     )
     monkeypatch.setattr(m2rnn_mod, "_broadcast_heads", fail_broadcast)
     monkeypatch.setattr(m2rnn_mod.mx, "repeat", fail_repeat)
@@ -324,11 +366,12 @@ def test_path_c_dispatch_uses_fused_post_without_v_g_broadcast_materialization(
     assert seen["h0"] == (1, 4, 4, 3)
     assert seen["D"] == (4, 3)
     assert seen["projected"] == (1, 4, 24)
+    assert seen["recurrence_v_heads"] == 2
     assert seen["post_v_heads"] == 2
     assert seen["post_g_heads"] == 2
     matches = [e for e in get_dispatch_log() if e["op_name"] == "m2rnn"]
     assert matches[-1]["path"] == "path_c"
-    assert matches[-1]["kernel_used"] == "path_c_tilelang_dsl_packed_inline_post"
+    assert matches[-1]["kernel_used"] == "path_c_tilelang_dsl_packed_post"
 
 
 def test_path_c_transform_dlpack_boundary_fails_closed(
@@ -344,15 +387,15 @@ def test_path_c_transform_dlpack_boundary_fails_closed(
 
     monkeypatch.setattr(
         m2rnn_path_c,
-        "m2rnn_mapped_packed_post_path_c_status",
+        "m2rnn_mapped_packed_path_c_status",
         lambda *_args, **_kwargs: m2rnn_path_c.M2RNNPathCStatus(
             True,
-            "forced inline post available",
+            "forced packed recurrence available",
         ),
     )
     monkeypatch.setattr(
         m2rnn_path_c,
-        "m2rnn_apply_mapped_packed_post_with_state_path_c",
+        "m2rnn_apply_mapped_packed_with_state_path_c",
         fail_inside_mlx_transform,
     )
     monkeypatch.setenv("CPPMEGA_KERNEL_PATH", "path_c")
@@ -402,12 +445,12 @@ def test_path_c_dispatch_checks_packed_status_before_callable(
 
     monkeypatch.setattr(
         m2rnn_path_c,
-        "m2rnn_mapped_packed_post_path_c_status",
+        "m2rnn_mapped_packed_path_c_status",
         forced_unavailable,
     )
     monkeypatch.setattr(
         m2rnn_path_c,
-        "m2rnn_apply_mapped_packed_post_with_state_path_c",
+        "m2rnn_apply_mapped_packed_with_state_path_c",
         fail_path_c_kernel,
     )
     monkeypatch.setenv("CPPMEGA_KERNEL_PATH", "path_c")
@@ -478,7 +521,7 @@ def test_path_c_dispatch_uses_packed_state_without_qkv_materialization(
     assert next_state.conv_state.shape == mixer_state.conv_state.shape
     matches = [e for e in get_dispatch_log() if e["op_name"] == "m2rnn"]
     assert matches[-1]["path"] == "path_c"
-    assert matches[-1]["kernel_used"] == "path_c_tilelang_dsl_packed_inline_post"
+    assert matches[-1]["kernel_used"] == "path_c_tilelang_dsl_packed_post"
 
 
 def test_block_grad_flows_through_path_c_with_explicit_state(

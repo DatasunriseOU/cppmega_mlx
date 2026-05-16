@@ -883,9 +883,7 @@ def test_m2rnn_fwd_path_c_owner_outputs_avoid_hidden_zero_alloc(
     assert tanh_cache is tanh_out
 
 
-def test_m2rnn_bwd_path_c_owner_outputs_avoid_hidden_zero_alloc(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_m2rnn_bwd_path_c_rejects_public_backward_owner_outputs() -> None:
     _require_m2rnn_path_c()
     inputs = _make_m2rnn_inputs(dtype=mx.float32)
     full = m2rnn_path_c._m2rnn_fwd_path_c_full(*inputs)
@@ -897,36 +895,95 @@ def test_m2rnn_bwd_path_c_owner_outputs_avoid_hidden_zero_alloc(
         mx.zeros(q.shape, dtype=mx.float32),
         mx.zeros(k.shape, dtype=mx.float32),
         mx.zeros(v.shape, dtype=mx.float32),
-        mx.zeros((1, 2, 4, 4), dtype=mx.float32),
+        mx.zeros(W.shape, dtype=mx.float32),
         mx.zeros(xf.shape, dtype=mx.float32),
         mx.zeros(h0.shape, dtype=mx.float32),
         mx.zeros((1, 2, 4, 4, 4), dtype=mx.float32),
     )
     mx.eval(dy, tanh_cache, *owner_outputs)
 
-    def fail_zero_alloc(*_args: object, **_kwargs: object) -> mx.array:
-        raise AssertionError("owner-output bwd route must not allocate mx.zeros")
+    with pytest.raises(RuntimeError, match="does not expose backward owner-output"):
+        m2rnn_bwd_path_c(
+            dy,
+            q,
+            k,
+            v,
+            W,
+            xf,
+            tanh_cache,
+            h0,
+            force_path_c=True,
+            out=owner_outputs,
+        )
 
-    monkeypatch.setattr(m2rnn_path_c.mx, "zeros", fail_zero_alloc)
 
-    grads = m2rnn_bwd_path_c(
-        dy,
-        q,
-        k,
-        v,
-        W,
-        xf,
-        tanh_cache,
-        h0,
-        force_path_c=True,
-        out=owner_outputs,
+def test_m2rnn_packed_bwd_path_c_rejects_public_backward_owner_outputs() -> None:
+    inputs = _make_m2rnn_inputs(dtype=mx.float32)
+    q, k, v, W, xf, h0 = inputs
+    conv_input = mx.concatenate(
+        [
+            q.reshape(q.shape[0], q.shape[1], -1),
+            k.reshape(k.shape[0], k.shape[1], -1),
+            v.reshape(v.shape[0], v.shape[1], -1),
+        ],
+        axis=-1,
     )
-    mx.eval(*grads)
-    assert grads[0] is owner_outputs[0]
-    assert grads[1] is owner_outputs[1]
-    assert grads[2] is owner_outputs[2]
-    assert grads[4] is owner_outputs[4]
-    assert grads[5] is owner_outputs[5]
+    dy = mx.ones((1, 4, 2, 4), dtype=mx.float32)
+    tanh_cache = mx.zeros((1, 4, 2, 4, 4), dtype=mx.float32)
+    owner_outputs = (
+        mx.zeros(conv_input.shape, dtype=mx.float32),
+        mx.zeros(W.shape, dtype=mx.float32),
+        mx.zeros(xf.shape, dtype=mx.float32),
+        mx.zeros(h0.shape, dtype=mx.float32),
+        mx.zeros((1, 2, 4, 4, 4), dtype=mx.float32),
+    )
+    mx.eval(dy, tanh_cache, *owner_outputs)
+
+    with pytest.raises(RuntimeError, match="does not expose backward owner-output"):
+        m2rnn_packed_bwd_path_c(
+            dy,
+            conv_input,
+            W,
+            xf,
+            tanh_cache,
+            h0,
+            out=owner_outputs,
+        )
+
+
+def test_m2rnn_mapped_packed_bwd_path_c_rejects_public_backward_owner_outputs() -> None:
+    batch, seq, k_dim, v_dim = 1, 4, 4, 3
+    q_heads, k_heads, v_heads = 1, 1, 2
+    total_heads, w_heads, f_heads = 4, 1, 2
+    conv_dim = q_heads * k_dim + k_heads * k_dim + v_heads * v_dim
+    conv_input = mx.zeros((batch, seq, conv_dim), dtype=mx.float32)
+    W = mx.zeros((w_heads, v_dim, v_dim), dtype=mx.float32)
+    xf = mx.zeros((batch, seq, f_heads), dtype=mx.float32)
+    h0 = mx.zeros((batch, total_heads, k_dim, v_dim), dtype=mx.float32)
+    dy = mx.zeros((batch, seq, total_heads, v_dim), dtype=mx.float32)
+    tanh_cache = mx.zeros((batch, seq, total_heads, k_dim, v_dim), dtype=mx.float32)
+    owner_outputs = (
+        mx.zeros(conv_input.shape, dtype=mx.float32),
+        mx.zeros((w_heads, v_dim, v_dim), dtype=mx.float32),
+        mx.zeros(xf.shape, dtype=mx.float32),
+        mx.zeros(h0.shape, dtype=mx.float32),
+        mx.zeros((batch, total_heads, seq, k_dim, v_dim), dtype=mx.float32),
+    )
+    mx.eval(dy, tanh_cache, *owner_outputs)
+
+    with pytest.raises(RuntimeError, match="does not expose backward owner-output"):
+        m2rnn_path_c.m2rnn_mapped_packed_bwd_path_c(
+            dy,
+            conv_input,
+            W,
+            xf,
+            tanh_cache,
+            h0,
+            q_heads=q_heads,
+            k_heads=k_heads,
+            v_heads=v_heads,
+            out=owner_outputs,
+        )
 
 
 def test_m2rnn_path_c_mixed_dtype_fails_closed_without_hidden_casts() -> None:

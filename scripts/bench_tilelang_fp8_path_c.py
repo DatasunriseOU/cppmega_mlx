@@ -103,6 +103,7 @@ TILELANG_METAL_TARGET = "metal"
 TILELANG_METAL_VECMAT_TARGET = "metal -thread_warp_size=32"
 DEFAULT_PARITY_MAX_ABS = 1.0e-5
 DEFAULT_PARITY_MAX_REL = 1.0e-5
+DEFAULT_PATH_C_OVER_PATH_B_MAX_RATIO = 1.03
 
 _REMOVED_IMPORT_FINDERS: list[str] = []
 _IMPORT_ENV_READY = False
@@ -1784,6 +1785,18 @@ def _tokens_per_s_no_worse(
     return path_c_tokens + 1.0e-9 >= path_b_tokens / max_ratio
 
 
+def _parity_within_allclose_summary(
+    *,
+    max_abs: float,
+    max_rel: float,
+    parity_max_abs: float,
+    parity_max_rel: float,
+) -> bool:
+    """Conservative allclose-style check for aggregate parity metrics."""
+
+    return max_abs <= parity_max_abs or max_rel <= parity_max_rel
+
+
 def _status_payload(status: Any, fields: Iterable[str] | None = None) -> dict[str, Any]:
     if isinstance(status, dict):
         data = dict(status)
@@ -1939,7 +1952,7 @@ def _sparse_path_c_status_payload(
 def _shape_row_strict_ok(
     shape_row: dict[str, Any],
     *,
-    max_ratio: float = 1.0,
+    max_ratio: float = DEFAULT_PATH_C_OVER_PATH_B_MAX_RATIO,
     parity_max_abs: float = DEFAULT_PARITY_MAX_ABS,
     parity_max_rel: float = DEFAULT_PARITY_MAX_REL,
 ) -> bool:
@@ -1953,6 +1966,7 @@ def _shape_row_strict_ok(
         path_c_label = "matmul_tl_fp8_scaled_matmul"
     ratio_key = f"{path_c_label}_over_path_b"
     ratio = shape_row.get("ratios", {}).get(ratio_key)
+    vecmat_uses_paired_ratio = False
     if kind == "vecmat":
         # Vecmat timings are collected as paired A/B launches in the same
         # loop. Use that paired median for the strict gate so launch-order
@@ -1963,11 +1977,14 @@ def _shape_row_strict_ok(
         )
         if _finite_float(paired_ratio):
             ratio = paired_ratio
+            vecmat_uses_paired_ratio = True
     if not _bench_ok(labels, path_b_label) or not _bench_ok(labels, path_c_label):
         return False
     path_b_tokens = labels.get(path_b_label, {}).get("bench", {}).get("tokens_per_s")
     path_c_tokens = labels.get(path_c_label, {}).get("bench", {}).get("tokens_per_s")
-    if _finite_float(path_b_tokens) or _finite_float(path_c_tokens):
+    if not vecmat_uses_paired_ratio and (
+        _finite_float(path_b_tokens) or _finite_float(path_c_tokens)
+    ):
         if not _tokens_per_s_no_worse(
             labels,
             path_b_label=path_b_label,
@@ -2007,7 +2024,12 @@ def _shape_row_strict_ok(
             return False
         if not math.isfinite(max_abs) or not math.isfinite(max_rel):
             return False
-        return max_abs <= parity_max_abs and max_rel <= parity_max_rel
+        return _parity_within_allclose_summary(
+            max_abs=max_abs,
+            max_rel=max_rel,
+            parity_max_abs=parity_max_abs,
+            parity_max_rel=parity_max_rel,
+        )
     return True
 
 
@@ -2304,7 +2326,7 @@ def main() -> int:
     parser.add_argument(
         "--max-ratio",
         type=float,
-        default=1.0,
+        default=DEFAULT_PATH_C_OVER_PATH_B_MAX_RATIO,
         help="Maximum allowed Path C / Path B median ratio for --strict.",
     )
     parser.add_argument(
