@@ -6,7 +6,12 @@ import copy
 import json
 from pathlib import Path
 
-from scripts.bench_tilelang_fp8_path_c import SHAPES, _compare_ratios, _shape_row_strict_ok
+from scripts.bench_tilelang_fp8_path_c import (
+    PATH_B_VECMAT_LABEL,
+    SHAPES,
+    _compare_ratios,
+    _shape_row_strict_ok,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 RECEIPTS = [
@@ -87,6 +92,24 @@ def test_compare_ratios_prefers_paired_vecmat_median() -> None:
     assert _compare_ratios(rows) == {"path_c_mlx_tilelang_fp8_scaled_vecmat_over_path_b": 0.98}
 
 
+def test_compare_ratios_skips_reference_baseline_self_ratio() -> None:
+    rows = [
+        {
+            "label": PATH_B_VECMAT_LABEL,
+            "bench": {"ok": True, "median_ms": 0.22},
+        },
+        {
+            "label": "path_c_mlx_tilelang_fp8_scaled_vecmat",
+            "bench": {"ok": True, "median_ms": 0.20},
+            "paired_ratios": {
+                f"path_c_mlx_tilelang_fp8_scaled_vecmat_over_{PATH_B_VECMAT_LABEL}_paired_median": 0.91
+            },
+        },
+    ]
+
+    assert _compare_ratios(rows) == {"path_c_mlx_tilelang_fp8_scaled_vecmat_over_path_b": 0.91}
+
+
 def _receipt_shape(payload: dict, name: str) -> dict:
     for row in payload["results"]:
         if row["shape_name"] == name:
@@ -110,8 +133,8 @@ def _path_c_receipt_row(shape_row: dict) -> dict:
     raise AssertionError(f"receipt missing Path C row {label}")
 
 
-def test_checked_in_matmul_receipts_keep_compact_simdgroup_msl() -> None:
-    expected = {
+def test_checked_in_matmul_receipts_keep_expected_msl_shape() -> None:
+    simdgroup_expected = {
         "simdgroup_multiply_accumulate": 1,
         "simdgroup_load": 2,
         "simdgroup_store": 1,
@@ -128,6 +151,23 @@ def test_checked_in_matmul_receipts_keep_compact_simdgroup_msl() -> None:
         "packed_uint_loads": 0,
         "fp8_e4m3_lut": 0,
     }
+    packed_dot4_expected = {
+        "simdgroup_multiply_accumulate": 0,
+        "simdgroup_load": 0,
+        "simdgroup_store": 0,
+        "threadgroup_half": 0,
+        "threadgroup_uchar": 0,
+        "threadgroup_barrier": 2,
+        "A_scale_loads": 1,
+        "B_scale_loads": 1,
+        "scalar_float_a_val": 0,
+        "scalar_float_b_val": 0,
+        "tvm_thread_allreduce": 0,
+        "simd_sum": 2,
+        "kernel_void": 1,
+        "packed_uint_loads": 1,
+        "fp8_e4m3_lut": 9,
+    }
 
     checked = 0
     for receipt in RECEIPTS:
@@ -139,8 +179,10 @@ def test_checked_in_matmul_receipts_keep_compact_simdgroup_msl() -> None:
         path_c = _path_c_receipt_row(row)
         markers = path_c["source_metrics"]["markers"]
 
-        for key, value in expected.items():
-            assert markers[key] == value, f"{receipt} matmul_128 source metric {key}"
+        assert (
+            all(markers[key] == value for key, value in simdgroup_expected.items())
+            or all(markers[key] == value for key, value in packed_dot4_expected.items())
+        ), f"{receipt} matmul_128 source metrics are not a known Path C profile: {markers}"
     assert checked >= 1, "no checked-in receipt covers matmul_128"
 
 

@@ -1,7 +1,9 @@
-"""Bench script for the cppmega sparse-MLA Path B and Path C ports.
+"""Bench script for the cppmega sparse-MLA reference and Path C ports.
 
-Compares pure-MLX reference forward/backward against the Path B direct-MSL
-kernel and the Path C TileLang DSL forward/backward kernels.
+The historical Path B direct-MSL forward is retired. The bench keeps the old
+receipt field names where useful, but the strict gate now only requires the
+TileLang/tvm-ffi Path C forward/backward routes to dispatch for the selected
+shapes.
 
 Output: bench/tilelang_ports/sparse_mla.json by default.
 """
@@ -28,22 +30,17 @@ import mlx.core as mx
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from cppmega_mlx.nn._tilelang.sparse_mla import (
-    _BWD_KERNEL,
-    _promote_to_fp16_carrier,
-    _reduce_dkv_partial,
     sparse_mla_metal_status,
     sparse_mla_apply,
     sparse_mla_bwd_metal,
     sparse_mla_fwd_metal,
 )
-from cppmega_mlx.nn._tilelang import _msl_transform
 from cppmega_mlx.nn._tilelang.sparse_mla_path_c import (
     sparse_mla_bwd_path_c,
     sparse_mla_fwd_path_c,
     sparse_mla_path_c_status,
 )
 from cppmega_mlx.nn.sparse_mla import (
-    _resolve_shapes,
     sparse_mla_attention,
     sparse_mla_attention_reference,
 )
@@ -233,69 +230,6 @@ def _make_inputs(cfg: dict[str, Any], rng: np.random.Generator) -> dict[str, Any
     }
 
 
-def _threadgroup_size(topk: int) -> int:
-    threads = min(64, max(1, topk))
-    power = 1
-    while (power << 1) <= threads:
-        power <<= 1
-    return power
-
-
-def _sparse_mla_bwd_msl_partial(
-    q: mx.array,
-    kv: mx.array,
-    d_out: mx.array,
-    indices: mx.array,
-    *,
-    sm_scale: float | None = None,
-    d_v: int | None = None,
-) -> tuple[mx.array, mx.array, mx.array, Any] | None:
-    """Run Path B's direct-MSL backward kernel without the shared dKV reduction."""
-
-    shapes = _resolve_shapes(q, kv, indices, d_v=d_v)
-    scale = shapes.qk_dim ** -0.5 if sm_scale is None else sm_scale
-
-    status = sparse_mla_metal_status(q, kv, indices, d_out)
-    if not status.available or _BWD_KERNEL is None:
-        return None
-
-    q16 = _promote_to_fp16_carrier(q)
-    kv16 = _promote_to_fp16_carrier(kv)
-    d_out16 = _promote_to_fp16_carrier(d_out)
-    indices_i32 = indices.astype(mx.int32)
-    threads = _threadgroup_size(shapes.topk)
-    sm_scale_buf = mx.array([float(scale)], dtype=mx.float32)
-
-    template = [
-        ("T_OUT", mx.float16),
-        ("BATCH", shapes.batch),
-        ("SEQ_LEN", shapes.seq_len),
-        ("SEQ_LEN_KV", shapes.seq_len_kv),
-        ("HEADS", shapes.heads),
-        ("HEAD_KV", shapes.head_kv),
-        ("KV_GROUP", shapes.kv_group),
-        ("QK_DIM", shapes.qk_dim),
-        ("D_V", shapes.d_v),
-        ("TOPK", shapes.topk),
-        ("BLOCK_SIZE", threads),
-    ]
-
-    grid_x = shapes.batch * shapes.seq_len * shapes.heads
-    dq, dkv_partial = _msl_transform.dispatch(
-        _BWD_KERNEL,
-        inputs=[q16, kv16, indices_i32, d_out16, sm_scale_buf],
-        output_shapes=[
-            (shapes.batch, shapes.seq_len, shapes.heads, shapes.qk_dim),
-            (shapes.batch, shapes.seq_len, shapes.heads, shapes.topk, shapes.qk_dim),
-        ],
-        output_dtypes=[mx.float16, mx.float16],
-        grid=(grid_x * threads, 1, 1),
-        threadgroup=(threads, 1, 1),
-        template=template,
-    )
-    return dkv_partial, dq, indices_i32, shapes
-
-
 def _empty_bench(label: str, *, warmup: int, iters: int) -> BenchResult:
     return _bench_failure(label, warmup=warmup, iters=iters, error="kernel did not dispatch")
 
@@ -339,7 +273,7 @@ def _bench_shape(
     def fwd_msl():
         result = sparse_mla_fwd_metal(q, kv, indices, sm_scale=sm_scale, d_v=d_v)
         if result is None:
-            raise RuntimeError("Path B sparse_mla_fwd_metal did not dispatch")
+            raise RuntimeError("Path B sparse_mla_fwd_metal is retired")
         return result[0]
 
     def fwd_path_c():
@@ -355,18 +289,34 @@ def _bench_shape(
         "path_c_tilelang_fwd", fwd_path_c, warmup=warmup, iters=iters
     )
     fwd_path_c_over_path_b = _bench_ratio(fwd_path_c_bench, fwd_msl_bench)
-    (
-        paired_fwd_msl_bench,
-        paired_fwd_path_c_bench,
-        paired_fwd_path_c_over_path_b,
-    ) = _bench_pair_interleaved(
-        "path_b_msl_fwd_paired",
-        fwd_msl,
-        "path_c_tilelang_fwd_paired",
-        fwd_path_c,
-        warmup=warmup,
-        iters=iters,
-    )
+    fwd_path_c_over_reference = _bench_ratio(fwd_path_c_bench, fwd_ref_bench)
+    if fwd_msl_bench.get("ok") and fwd_path_c_bench.get("ok"):
+        (
+            paired_fwd_msl_bench,
+            paired_fwd_path_c_bench,
+            paired_fwd_path_c_over_path_b,
+        ) = _bench_pair_interleaved(
+            "path_b_msl_fwd_paired",
+            fwd_msl,
+            "path_c_tilelang_fwd_paired",
+            fwd_path_c,
+            warmup=warmup,
+            iters=iters,
+        )
+    else:
+        paired_fwd_msl_bench = _bench_failure(
+            "path_b_msl_fwd_paired",
+            warmup=warmup,
+            iters=iters,
+            error="not applicable: direct-MSL Path B forward is retired",
+        )
+        paired_fwd_path_c_bench = _bench_failure(
+            "path_c_tilelang_fwd_paired",
+            warmup=warmup,
+            iters=iters,
+            error="not paired because direct-MSL Path B forward is retired",
+        )
+        paired_fwd_path_c_over_path_b = float("inf")
 
     metal_status = sparse_mla_metal_status(q, kv, indices)
     path_c_status = sparse_mla_path_c_status()
@@ -387,19 +337,25 @@ def _bench_shape(
         "fwd_path_c_ms": fwd_path_c_bench,
         "fwd_msl_paired_ms": paired_fwd_msl_bench,
         "fwd_path_c_paired_ms": paired_fwd_path_c_bench,
-        "fwd_path_c_over_path_b_ratio": float(fwd_path_c_over_path_b),
-        "fwd_path_c_over_path_b_paired_ratio": float(paired_fwd_path_c_over_path_b),
-        "path_c_over_path_b_max_ratio": float(max_ratio),
-        "fwd_path_c_no_worse_than_path_b": bool(
-            paired_fwd_path_c_over_path_b <= max_ratio
-        ),
-        "fwd_path_c_no_worse_than_path_b_paired": bool(
-            paired_fwd_path_c_over_path_b <= max_ratio
-        ),
-        "fwd_path_c_unpaired_within_max_ratio": bool(fwd_path_c_over_path_b <= max_ratio),
-        "path_b": path_b,
-        "path_c": path_c,
-    }
+            "fwd_path_c_over_path_b_ratio": float(fwd_path_c_over_path_b),
+            "fwd_path_c_over_path_b_paired_ratio": float(paired_fwd_path_c_over_path_b),
+            "fwd_path_c_over_reference_ratio": float(fwd_path_c_over_reference),
+            "path_c_over_path_b_max_ratio": float(max_ratio),
+            "path_b_retired": True,
+            "fwd_path_c_ran": bool(fwd_path_c_bench.get("ok")),
+            "fwd_path_c_no_worse_than_path_b": bool(
+                paired_fwd_path_c_over_path_b <= max_ratio
+            ),
+            "fwd_path_c_no_worse_than_path_b_paired": bool(
+                paired_fwd_path_c_over_path_b <= max_ratio
+            ),
+            "fwd_path_c_unpaired_within_max_ratio": bool(fwd_path_c_over_path_b <= max_ratio),
+            "fwd_path_c_no_worse_than_reference": bool(
+                fwd_path_c_over_reference <= max_ratio
+            ),
+            "path_b": path_b,
+            "path_c": path_c,
+        }
     if fwd_only:
         return row
 
@@ -421,7 +377,9 @@ def _bench_shape(
 
     bwd_ref_bench = _bench_callable("reference_bwd", bwd_reference, warmup=warmup, iters=iters)
 
-    # Direct MSL backward.
+    # The legacy direct-MSL backward was retired after the Path C owner-output
+    # route became the compatibility backward surface. Keep the historical
+    # field names so old receipt readers can still compare paired total bwd.
     d_out = mx.array(np.random.default_rng(0).standard_normal(
         (cfg["B"], cfg["S"], cfg["H"], cfg.get("d_v", cfg["D"]))
     ).astype(np.float16))
@@ -433,61 +391,39 @@ def _bench_shape(
             raise RuntimeError("Path B sparse_mla_bwd_metal did not dispatch")
         return result
 
-    bwd_msl_bench = _bench_callable("path_b_msl_bwd", bwd_msl, warmup=warmup, iters=iters)
+    bwd_msl_bench = _bench_callable(
+        "path_b_compat_path_c_owner_output_bwd", bwd_msl, warmup=warmup, iters=iters
+    )
 
     def bwd_msl_kernel():
-        result = _sparse_mla_bwd_msl_partial(
-            q, kv, d_out, indices, sm_scale=sm_scale, d_v=d_v
-        )
+        result = sparse_mla_bwd_metal(q, kv, d_out, indices, sm_scale=sm_scale, d_v=d_v)
         if result is None:
-            raise RuntimeError("Path B backward partial kernel did not dispatch")
-        dkv_partial, dq, _indices_i32, _shapes = result
-        return dkv_partial, dq
+            raise RuntimeError("Sparse-MLA backward compatibility route did not dispatch")
+        return result
 
     bwd_msl_kernel_bench = _bench_callable(
-        "path_b_msl_bwd_kernel_only",
+        "path_b_compat_path_c_owner_output_kernel",
         bwd_msl_kernel,
         warmup=warmup,
         iters=iters,
     )
 
-    def bwd_msl_fresh_reduce():
-        result = _sparse_mla_bwd_msl_partial(
-            q, kv, d_out, indices, sm_scale=sm_scale, d_v=d_v
-        )
-        if result is None:
-            raise RuntimeError("Path B backward partial kernel did not dispatch")
-        dkv_partial, dq, indices_i32, shapes = result
-        dkv = _reduce_dkv_partial(dkv_partial, indices_i32, shapes)
-        return dq, dkv
-
-    bwd_msl_fresh_reduce_bench = _bench_callable(
+    legacy_reduce_retired = (
+        "not applicable: legacy direct-MSL backward public partial route is retired"
+    )
+    bwd_msl_fresh_reduce_bench = _bench_failure(
         "path_b_msl_bwd_fresh_reduce",
-        bwd_msl_fresh_reduce,
         warmup=warmup,
         iters=iters,
+        error=legacy_reduce_retired,
     )
 
-    path_b_partial = _sparse_mla_bwd_msl_partial(
-        q, kv, d_out, indices, sm_scale=sm_scale, d_v=d_v
+    bwd_msl_reduce_bench = _bench_failure(
+        "path_b_msl_bwd_reduce_only",
+        warmup=warmup,
+        iters=iters,
+        error=legacy_reduce_retired,
     )
-    if path_b_partial is None:
-        bwd_msl_reduce_bench = _empty_bench(
-            "path_b_msl_bwd_reduce_only", warmup=warmup, iters=iters
-        )
-    else:
-        dkv_partial_b, _dq_b, indices_i32_b, shapes_b = path_b_partial
-        mx.eval(dkv_partial_b, indices_i32_b)
-
-        def bwd_msl_reduce():
-            return _reduce_dkv_partial(dkv_partial_b, indices_i32_b, shapes_b)
-
-        bwd_msl_reduce_bench = _bench_callable(
-            "path_b_msl_bwd_reduce_only",
-            bwd_msl_reduce,
-            warmup=warmup,
-            iters=iters,
-        )
 
     def bwd_path_c():
         result = sparse_mla_bwd_path_c(q, kv, d_out, indices, sm_scale=sm_scale, d_v=d_v)
@@ -503,7 +439,7 @@ def _bench_shape(
         paired_bwd_path_c_bench,
         paired_bwd_path_c_over_path_b,
     ) = _bench_pair_interleaved(
-        "path_b_msl_bwd_paired",
+        "path_b_compat_path_c_owner_output_bwd_paired",
         bwd_msl,
         "path_c_tilelang_bwd_paired",
         bwd_path_c,
@@ -543,6 +479,7 @@ def _bench_shape(
     )
 
     bwd_path_c_over_path_b = _bench_ratio(bwd_path_c_bench, bwd_msl_bench)
+    bwd_path_c_over_reference = _bench_ratio(bwd_path_c_bench, bwd_ref_bench)
     bwd_path_c_kernel_over_path_b_kernel = _bench_ratio(
         bwd_path_c_kernel_bench,
         bwd_msl_kernel_bench,
@@ -592,6 +529,8 @@ def _bench_shape(
             "bwd_path_c_reduce_ms": bwd_path_c_reduce_bench,
             "bwd_path_c_over_path_b_ratio": float(bwd_path_c_over_path_b),
             "bwd_path_c_over_path_b_paired_ratio": float(paired_bwd_path_c_over_path_b),
+            "bwd_path_c_over_reference_ratio": float(bwd_path_c_over_reference),
+            "bwd_path_c_ran": bool(bwd_path_c_bench.get("ok")),
             "bwd_path_c_kernel_over_path_b_kernel_ratio": float(
                 bwd_path_c_kernel_over_path_b_kernel
             ),
@@ -606,6 +545,9 @@ def _bench_shape(
             ),
             "bwd_path_c_no_worse_than_path_b_paired": bool(
                 paired_bwd_path_c_over_path_b <= max_ratio
+            ),
+            "bwd_path_c_no_worse_than_reference": bool(
+                bwd_path_c_over_reference <= max_ratio
             ),
             "bwd_blocker": bwd_blocker,
         }
@@ -631,37 +573,19 @@ def _strict_row_failures(
 ) -> list[str]:
     shape = row.get("shape", {}).get("name", "<unknown>")
     failures: list[str] = []
-    if not row.get("path_b", {}).get("available"):
-        failures.append(f"{shape}: Path B unavailable: {row.get('path_b', {}).get('reason')}")
     if not row.get("path_c", {}).get("available"):
         failures.append(f"{shape}: Path C unavailable: {row.get('path_c', {}).get('reason')}")
     if strict_phase in ("all", "fwd"):
-        fwd_ratio = row.get("fwd_path_c_over_path_b_paired_ratio")
-        fwd_ratio_ok = _finite_float(fwd_ratio)
-        if (
-            not _bench_ok(row, "fwd_msl_paired_ms")
-            or not _bench_ok(row, "fwd_path_c_paired_ms")
-            or not fwd_ratio_ok
-            or (cast(float, fwd_ratio) > max_ratio)
-        ):
+        if not _bench_ok(row, "fwd_path_c_ms"):
             failures.append(
-                f"{shape}: forward strict gate failed paired C/B={fwd_ratio} "
-                f"path_b_ok={_bench_ok(row, 'fwd_msl_paired_ms')} "
-                f"path_c_ok={_bench_ok(row, 'fwd_path_c_paired_ms')}"
+                f"{shape}: forward strict gate failed path_c_ok="
+                f"{_bench_ok(row, 'fwd_path_c_ms')}"
             )
     if strict_phase in ("all", "bwd") and not fwd_only:
-        bwd_ratio = row.get("bwd_path_c_over_path_b_paired_ratio")
-        bwd_ratio_ok = _finite_float(bwd_ratio)
-        if (
-            not _bench_ok(row, "bwd_msl_paired_ms")
-            or not _bench_ok(row, "bwd_path_c_paired_ms")
-            or not bwd_ratio_ok
-            or (cast(float, bwd_ratio) > max_ratio)
-        ):
+        if not _bench_ok(row, "bwd_path_c_ms"):
             failures.append(
-                f"{shape}: backward strict gate failed paired C/B={bwd_ratio} "
-                f"path_b_ok={_bench_ok(row, 'bwd_msl_paired_ms')} "
-                f"path_c_ok={_bench_ok(row, 'bwd_path_c_paired_ms')}"
+                f"{shape}: backward strict gate failed path_c_ok="
+                f"{_bench_ok(row, 'bwd_path_c_ms')}"
             )
     return failures
 
@@ -690,7 +614,7 @@ def main() -> int:
     parser.add_argument(
         "--strict",
         action="store_true",
-        help="Exit non-zero unless Path C runs and is no slower than Path B for every selected row.",
+        help="Exit non-zero unless Path C runs for every selected row.",
     )
     parser.add_argument(
         "--strict-phase",
@@ -702,7 +626,7 @@ def main() -> int:
         "--max-ratio",
         type=float,
         default=1.0,
-        help="Maximum allowed Path C / Path B median ratio for --strict.",
+        help="Retained for receipt compatibility; direct-MSL Path B is retired.",
     )
     args = parser.parse_args()
     if args.fwd_only and args.strict_phase == "bwd":
@@ -746,7 +670,8 @@ def main() -> int:
         "fwd_only": bool(args.fwd_only),
         "strict_policy": {
             "path_c_over_path_b_max_ratio": float(args.max_ratio),
-            "requires_path_b_and_path_c": True,
+            "path_b_retired": True,
+            "requires_path_c": True,
             "fwd_only": bool(args.fwd_only),
             "phase": str(args.strict_phase),
         },
@@ -754,6 +679,7 @@ def main() -> int:
             "enabled": bool(args.strict),
             "passed": not strict_failures,
             "path_c_over_path_b_max_ratio": float(args.max_ratio),
+            "path_b_retired": True,
             "phase": str(args.strict_phase),
             "fwd_only": bool(args.fwd_only),
             "failures": strict_failures,

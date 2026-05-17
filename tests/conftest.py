@@ -11,7 +11,11 @@ output of one test bleeds into another, masking real configuration bugs
 vars at the start of every test via ``monkeypatch.delenv`` (which is
 auto-restored at teardown), giving each test a hermetic env baseline.
 Tests that need a specific value should ``monkeypatch.setenv`` it
-explicitly inside the test body.
+explicitly inside the test body. The only shared exception is the checked-out
+TileLang dev build path below, which is reintroduced after the scrub so Path C
+tests exercise the local build instead of skipping behind a caller env. The
+fixture also disables TileLang's disk cache for those dev-build tests, because
+cached kernels can outlive lowerer changes in the shared checkout.
 """
 
 from __future__ import annotations
@@ -33,10 +37,21 @@ import sys
 from pathlib import Path as _Path
 
 
-_TILELANG_DEV_ROOT = _Path("/private/tmp/tl_apache_tvm_swap")
+_DEFAULT_TILELANG_DEV_ROOT = _Path(__file__).resolve().parents[2] / "tilelang"
+_TILELANG_DEV_ROOT = _Path(
+    os.environ.get("CPPMEGA_TILELANG_DEV_ROOT", str(_DEFAULT_TILELANG_DEV_ROOT))
+)
+_TILELANG_DEV_BUILD_ROOT = _TILELANG_DEV_ROOT / "build"
+_TILELANG_DEV_LIB_ROOT = _TILELANG_DEV_BUILD_ROOT / "lib"
+if _TILELANG_DEV_LIB_ROOT.exists():
+    os.environ["TILELANG_DEV_BUILD_ROOT"] = str(_TILELANG_DEV_BUILD_ROOT)
+    os.environ["TVM_LIBRARY_PATH"] = str(_TILELANG_DEV_LIB_ROOT)
+    os.environ["DYLD_LIBRARY_PATH"] = str(_TILELANG_DEV_LIB_ROOT)
+    os.environ["TILELANG_DISABLE_CACHE"] = "1"
 _TILELANG_DEV_PYTHONPATH = (
-    _TILELANG_DEV_ROOT,
+    _TILELANG_DEV_ROOT / "3rdparty" / "tvm" / "3rdparty" / "tvm-ffi" / "python",
     _TILELANG_DEV_ROOT / "3rdparty" / "tvm" / "python",
+    _TILELANG_DEV_ROOT,
 )
 for _path in reversed(_TILELANG_DEV_PYTHONPATH):
     if _path.exists():
@@ -76,6 +91,7 @@ _TILELANG_TVM_ENV_VARS = (
     "TVM_LIBRARY_PATH",
     "PYTHONPATH",
     "TILELANG_DEV_BUILD_ROOT",
+    "TILELANG_DISABLE_CACHE",
     "TVM_HOME",
     "TVM_SOURCE_DIR",
     "TVM_LIBRARY_PATH_SELECTED",
@@ -117,6 +133,12 @@ def _isolate_tilelang_tvm_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for var in list(os.environ):
         if var.startswith(_VOLATILE_ENV_PREFIXES):
             monkeypatch.delenv(var, raising=False)
+
+    if _TILELANG_DEV_LIB_ROOT.exists():
+        monkeypatch.setenv("TILELANG_DEV_BUILD_ROOT", str(_TILELANG_DEV_BUILD_ROOT))
+        monkeypatch.setenv("TILELANG_DISABLE_CACHE", "1")
+        monkeypatch.setenv("TVM_LIBRARY_PATH", str(_TILELANG_DEV_LIB_ROOT))
+        monkeypatch.setenv("DYLD_LIBRARY_PATH", str(_TILELANG_DEV_LIB_ROOT))
 
     # fix-round-7 finding-5: the env-var opt-in approach was inverted —
     # we now inject the in-tree /tmp candidate via

@@ -397,7 +397,7 @@ def test_fp8_sparse_mla_path_c_qk_reduce_lowered_features_are_reported() -> None
         reduce_threads=32,
         vec=4,
     )
-    assert re.search(r"red_buf\d+\[0\] = simd_sum\(", tuned_msl)
+    assert "reduced[0] = simd_sum(accum[0])" in tuned_msl
     assert not re.search(r"C\[[^\n;]*=\s*[^\n;]*simd_sum\(", tuned_msl)
 
 

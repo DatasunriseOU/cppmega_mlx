@@ -119,6 +119,43 @@ def test_scheduler_admits_by_priority_fifo_and_groups_by_adapter() -> None:
     assert scheduler.num_running == 3
 
 
+def test_scheduler_rejects_duplicate_waiting_request() -> None:
+    scheduler = ContinuousBatchScheduler(_manager())
+    first = scheduler.add_request(1, [1, 2])
+
+    assert scheduler.get_request(1) is first
+    with pytest.raises(ValueError, match="already waiting"):
+        scheduler.add_request(1, [3, 4])
+
+
+def test_scheduler_abort_waiting_request_updates_lookup() -> None:
+    scheduler = ContinuousBatchScheduler(_manager())
+    first = scheduler.add_request(1, [1, 2])
+
+    assert scheduler.abort_request(1) is True
+    assert first.state == "completed"
+    assert scheduler.get_request(1) is None
+
+    replacement = scheduler.add_request(1, [3, 4])
+    assert replacement.prompt_ids == [3, 4]
+
+
+def test_scheduler_keeps_waiting_lookup_after_partial_schedule() -> None:
+    scheduler = ContinuousBatchScheduler(
+        _manager(num_blocks=1, block_size=4),
+        max_batch_size=1,
+    )
+    scheduler.add_request(1, [1, 2], priority=0)
+    waiting = scheduler.add_request(2, [3, 4], priority=0)
+
+    output = scheduler.schedule_batch()
+
+    assert _flatten_scheduled(output) == [1]
+    assert scheduler.get_request(2) is waiting
+    with pytest.raises(ValueError, match="already waiting"):
+        scheduler.add_request(2, [5, 6])
+
+
 def test_scheduler_preempts_lower_priority_running_request() -> None:
     scheduler = ContinuousBatchScheduler(
         _manager(num_blocks=2, block_size=4),

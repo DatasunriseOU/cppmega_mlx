@@ -3,8 +3,8 @@
   "kernel": "tilelang_topk_selector",
   "source": "cppmega_mlx/nn/_tilelang/topk_selector.py",
   "path_b_status": {
-    "available": true,
-    "reason": "topk_selector direct-MSL kernel built via mx.fast.metal_kernel is available; bypasses the original CUDA-style TileLang schedule that is blocked on shared.dyn / LowerTileOp issues, see docs/tilelang_ports/topk_selector.md."
+    "available": false,
+    "reason": "topk_selector direct-MSL Path B is retired. Unmasked AUTO calls should use the TileLang/tvm-ffi owner-output route; masked or unsupported no-output calls fall back to the pure-MLX reference until masked owner-output Path C parity lands."
   },
   "path_c_status": {
     "available": true,
@@ -18,22 +18,22 @@
     "python": "3.13.12"
   },
   "package_versions": {
-    "mlx": "0.31.2",
-    "mlx_metal": "0.31.2",
-    "tilelang": "0.1.9+gitcab1a7db",
-    "apache_tvm_ffi": "0.1.11",
+    "mlx": "0.32.0",
+    "mlx_metal": "0.31.1",
+    "tilelang": "0.1.9+gitd669bcee",
+    "apache_tvm_ffi": "0.1.12.dev0+g3c35034fd.d20260509",
     "numpy": "2.4.4"
   },
-  "warmup": 10,
-  "iters": 50,
+  "warmup": 2,
+  "iters": 5,
   "seed": 1,
   "strict_policy": {
-    "path_c_over_path_b_max_ratio": 1.0,
-    "requires_path_b_and_path_c": true
+    "path_b_retired": true,
+    "requires_path_c": true
   },
   "auto_routing_policy": {
     "path_c_first_requires_unmasked": true,
-    "path_c_first_requires_strict_green_receipt": true,
+    "path_c_first_requires_owner_output": true,
     "path_c_first_receipts": [
       {
         "batch": 1,
@@ -61,12 +61,6 @@
       },
       {
         "batch": 4,
-        "seq_len": 2048,
-        "k": 64,
-        "dtype": "bfloat16"
-      },
-      {
-        "batch": 4,
         "seq_len": 4096,
         "k": 256,
         "dtype": "float32"
@@ -81,63 +75,63 @@
       "dtype": "float32",
       "strategies": {
         "argpartition": {
-          "iters": 50,
-          "warmup": 10,
+          "iters": 5,
+          "warmup": 2,
           "ran": true,
           "paired": false,
-          "median_ms": 0.16872899141162634,
-          "min_ms": 0.14258400187827647,
-          "max_ms": 0.3145420050714165,
-          "mean_ms": 0.1753432978875935,
+          "median_ms": 0.22108400298748165,
+          "min_ms": 0.19995799812022597,
+          "max_ms": 0.2509580008336343,
+          "mean_ms": 0.22327500046230853,
           "peak_gib": 7.7858567237854e-07
         },
         "argsort_slice": {
-          "iters": 50,
-          "warmup": 10,
+          "iters": 5,
+          "warmup": 2,
           "ran": true,
           "paired": false,
-          "median_ms": 0.1583124976605177,
-          "min_ms": 0.13345800107344985,
-          "max_ms": 0.2907919988501817,
-          "mean_ms": 0.16104331938549876,
+          "median_ms": 0.16383400361519307,
+          "min_ms": 0.15737499779788777,
+          "max_ms": 0.18537500000093132,
+          "mean_ms": 0.16795020055724308,
           "peak_gib": 7.301568984985352e-07
         },
         "topk_take_along": {
-          "iters": 50,
-          "warmup": 10,
+          "iters": 5,
+          "warmup": 2,
           "ran": true,
           "paired": false,
-          "median_ms": 0.17320849292445928,
-          "min_ms": 0.15654199523851275,
-          "max_ms": 0.4502090159803629,
-          "mean_ms": 0.18235418072436005,
+          "median_ms": 0.1917080007842742,
+          "min_ms": 0.18591699335956946,
+          "max_ms": 0.19629099551821128,
+          "mean_ms": 0.1914081978611648,
           "peak_gib": 8.083879947662354e-07
         },
         "path_b_msl": {
-          "iters": 50,
-          "warmup": 10,
-          "ran": true,
-          "paired": true,
-          "median_ms": 0.15535400598309934,
-          "min_ms": 0.1355829881504178,
-          "max_ms": 0.57045798166655,
-          "mean_ms": 0.17042412189766765,
-          "peak_gib": 3.0547380447387695e-07
+          "ran": false,
+          "error": "direct-MSL Path B kernel did not dispatch",
+          "iters": 5,
+          "warmup": 2,
+          "median_ms": null,
+          "min_ms": null,
+          "max_ms": null,
+          "mean_ms": null,
+          "peak_gib": null
         },
         "path_c_tilelang": {
-          "iters": 50,
-          "warmup": 10,
+          "iters": 5,
+          "warmup": 2,
           "ran": true,
-          "paired": true,
-          "median_ms": 0.13904149818699807,
-          "min_ms": 0.11754099978134036,
-          "max_ms": 0.2349170099478215,
-          "mean_ms": 0.14507256099022925,
-          "peak_gib": 2.905726432800293e-07
+          "paired": false,
+          "median_ms": 0.240332999965176,
+          "min_ms": 0.21129200467839837,
+          "max_ms": 0.28233399643795565,
+          "mean_ms": 0.2488670012098737,
+          "peak_gib": 2.942979335784912e-07
         }
       },
       "ratios": {
-        "path_c_over_path_b": 0.8949978296801958
+        "path_c_over_path_b": null
       }
     },
     {
@@ -147,63 +141,63 @@
       "dtype": "float32",
       "strategies": {
         "argpartition": {
-          "iters": 50,
-          "warmup": 10,
+          "iters": 5,
+          "warmup": 2,
           "ran": true,
           "paired": false,
-          "median_ms": 0.1807289954740554,
-          "min_ms": 0.1619999820832163,
-          "max_ms": 0.4182090051472187,
-          "mean_ms": 0.1908125396585092,
-          "peak_gib": 2.3227185010910034e-05
+          "median_ms": 0.27433299692347646,
+          "min_ms": 0.27245800447417423,
+          "max_ms": 0.3032500026165508,
+          "mean_ms": 0.2829247998306528,
+          "peak_gib": 2.321973443031311e-05
         },
         "argsort_slice": {
-          "iters": 50,
-          "warmup": 10,
+          "iters": 5,
+          "warmup": 2,
           "ran": true,
           "paired": false,
-          "median_ms": 0.16158349171746522,
-          "min_ms": 0.14795898459851742,
-          "max_ms": 0.4182499833405018,
-          "mean_ms": 0.1670932787237689,
-          "peak_gib": 2.2917985916137695e-05
+          "median_ms": 0.22070799604989588,
+          "min_ms": 0.21029100025771186,
+          "max_ms": 0.22133399761514738,
+          "mean_ms": 0.21847479656571522,
+          "peak_gib": 2.291053533554077e-05
         },
         "topk_take_along": {
-          "iters": 50,
-          "warmup": 10,
+          "iters": 5,
+          "warmup": 2,
           "ran": true,
           "paired": false,
-          "median_ms": 0.17141649732366204,
-          "min_ms": 0.15445900498889387,
-          "max_ms": 0.5942920106463134,
-          "mean_ms": 0.1806108804885298,
-          "peak_gib": 2.3465603590011597e-05
+          "median_ms": 0.2645409986143932,
+          "min_ms": 0.23408300330629572,
+          "max_ms": 0.81487499846844,
+          "mean_ms": 0.4174079993390478,
+          "peak_gib": 2.3458153009414673e-05
         },
         "path_b_msl": {
-          "iters": 50,
-          "warmup": 10,
-          "ran": true,
-          "paired": true,
-          "median_ms": 0.53879150073044,
-          "min_ms": 0.5234999989625067,
-          "max_ms": 0.8017499931156635,
-          "mean_ms": 0.5476575181819499,
-          "peak_gib": 7.91996717453003e-06
+          "ran": false,
+          "error": "direct-MSL Path B kernel did not dispatch",
+          "iters": 5,
+          "warmup": 2,
+          "median_ms": null,
+          "min_ms": null,
+          "max_ms": null,
+          "mean_ms": null,
+          "peak_gib": null
         },
         "path_c_tilelang": {
-          "iters": 50,
-          "warmup": 10,
+          "iters": 5,
+          "warmup": 2,
           "ran": true,
-          "paired": true,
-          "median_ms": 0.35204150481149554,
-          "min_ms": 0.3359580005053431,
-          "max_ms": 0.49199999193660915,
-          "mean_ms": 0.36293665994890034,
-          "peak_gib": 7.905066013336182e-06
+          "paired": false,
+          "median_ms": 0.7763749963487498,
+          "min_ms": 0.7374580018222332,
+          "max_ms": 0.8615830010967329,
+          "mean_ms": 0.7830000002286397,
+          "peak_gib": 7.90134072303772e-06
         }
       },
       "ratios": {
-        "path_c_over_path_b": 0.653390976535882
+        "path_c_over_path_b": null
       }
     },
     {
@@ -213,63 +207,63 @@
       "dtype": "float32",
       "strategies": {
         "argpartition": {
-          "iters": 50,
-          "warmup": 10,
+          "iters": 5,
+          "warmup": 2,
           "ran": true,
           "paired": false,
-          "median_ms": 0.18027050828095526,
-          "min_ms": 0.16720799612812698,
-          "max_ms": 0.44091700692661107,
-          "mean_ms": 0.18859751871787012,
-          "peak_gib": 9.304285049438477e-05
+          "median_ms": 0.20816700271097943,
+          "min_ms": 0.20008299907203764,
+          "max_ms": 0.2300830019521527,
+          "mean_ms": 0.20982500136597082,
+          "peak_gib": 9.303539991378784e-05
         },
         "argsort_slice": {
-          "iters": 50,
-          "warmup": 10,
+          "iters": 5,
+          "warmup": 2,
           "ran": true,
           "paired": false,
-          "median_ms": 0.16606200370006263,
-          "min_ms": 0.13341600424610078,
-          "max_ms": 0.28045798535458744,
-          "mean_ms": 0.16921836067922413,
-          "peak_gib": 9.254366159439087e-05
+          "median_ms": 0.1880000054370612,
+          "min_ms": 0.17912500334205106,
+          "max_ms": 0.18966700008604676,
+          "mean_ms": 0.18650840065674856,
+          "peak_gib": 9.253621101379395e-05
         },
         "topk_take_along": {
-          "iters": 50,
-          "warmup": 10,
+          "iters": 5,
+          "warmup": 2,
           "ran": true,
           "paired": false,
-          "median_ms": 0.17860399384517223,
-          "min_ms": 0.15712500317022204,
-          "max_ms": 0.5280839977785945,
-          "mean_ms": 0.1896882796427235,
-          "peak_gib": 9.399652481079102e-05
+          "median_ms": 0.21091699454700574,
+          "min_ms": 0.20862499513896182,
+          "max_ms": 0.23604099988006055,
+          "mean_ms": 0.21513319661607966,
+          "peak_gib": 9.398907423019409e-05
         },
         "path_b_msl": {
-          "iters": 50,
-          "warmup": 10,
-          "ran": true,
-          "paired": true,
-          "median_ms": 0.5280835030134767,
-          "min_ms": 0.5122919974382967,
-          "max_ms": 0.6462080054916441,
-          "mean_ms": 0.5348316812887788,
-          "peak_gib": 3.1575560569763184e-05
+          "ran": false,
+          "error": "direct-MSL Path B kernel did not dispatch",
+          "iters": 5,
+          "warmup": 2,
+          "median_ms": null,
+          "min_ms": null,
+          "max_ms": null,
+          "mean_ms": null,
+          "peak_gib": null
         },
         "path_c_tilelang": {
-          "iters": 50,
-          "warmup": 10,
+          "iters": 5,
+          "warmup": 2,
           "ran": true,
-          "paired": true,
-          "median_ms": 0.34587499976623803,
-          "min_ms": 0.3289580054115504,
-          "max_ms": 0.6101670151110739,
-          "mean_ms": 0.35515750176273286,
-          "peak_gib": 3.1538307666778564e-05
+          "paired": false,
+          "median_ms": 0.7939999995869584,
+          "min_ms": 0.7461249988409691,
+          "max_ms": 0.9025420004036278,
+          "mean_ms": 0.8124420011881739,
+          "peak_gib": 3.15345823764801e-05
         }
       },
       "ratios": {
-        "path_c_over_path_b": 0.6549627053155859
+        "path_c_over_path_b": null
       }
     },
     {
@@ -279,129 +273,63 @@
       "dtype": "float16",
       "strategies": {
         "argpartition": {
-          "iters": 50,
-          "warmup": 10,
+          "iters": 5,
+          "warmup": 2,
           "ran": true,
           "paired": false,
-          "median_ms": 0.17464601842220873,
-          "min_ms": 0.1657090033404529,
-          "max_ms": 0.596500001847744,
-          "mean_ms": 0.18966338131576777,
-          "peak_gib": 6.255507469177246e-05
+          "median_ms": 0.19725000311154872,
+          "min_ms": 0.1863329962361604,
+          "max_ms": 0.219541005208157,
+          "mean_ms": 0.20108320168219507,
+          "peak_gib": 6.254762411117554e-05
         },
         "argsort_slice": {
-          "iters": 50,
-          "warmup": 10,
+          "iters": 5,
+          "warmup": 2,
           "ran": true,
           "paired": false,
-          "median_ms": 0.15614551375620067,
-          "min_ms": 0.13837500591762364,
-          "max_ms": 0.28787500923499465,
-          "mean_ms": 0.1584707823349163,
-          "peak_gib": 6.205588579177856e-05
+          "median_ms": 0.1812919945223257,
+          "min_ms": 0.17537500389153138,
+          "max_ms": 0.28450000536395237,
+          "mean_ms": 0.20139180123806,
+          "peak_gib": 6.204843521118164e-05
         },
         "topk_take_along": {
-          "iters": 50,
-          "warmup": 10,
+          "iters": 5,
+          "warmup": 2,
           "ran": true,
           "paired": false,
-          "median_ms": 0.1728329953039065,
-          "min_ms": 0.1594589848536998,
-          "max_ms": 0.5594580143224448,
-          "mean_ms": 0.18218837911263108,
-          "peak_gib": 6.303191184997559e-05
+          "median_ms": 0.20466600108193234,
+          "min_ms": 0.19745899771805853,
+          "max_ms": 0.9813750002649613,
+          "mean_ms": 0.3589997999370098,
+          "peak_gib": 6.302446126937866e-05
         },
         "path_b_msl": {
-          "iters": 50,
-          "warmup": 10,
-          "ran": true,
-          "paired": true,
-          "median_ms": 0.5330415006028488,
-          "min_ms": 0.5166660121176392,
-          "max_ms": 0.6941249885130674,
-          "mean_ms": 0.5396300222491845,
-          "peak_gib": 1.6316771507263184e-05
+          "ran": false,
+          "error": "direct-MSL Path B kernel did not dispatch",
+          "iters": 5,
+          "warmup": 2,
+          "median_ms": null,
+          "min_ms": null,
+          "max_ms": null,
+          "mean_ms": null,
+          "peak_gib": null
         },
         "path_c_tilelang": {
-          "iters": 50,
-          "warmup": 10,
+          "iters": 5,
+          "warmup": 2,
           "ran": true,
-          "paired": true,
-          "median_ms": 0.35018699418287724,
-          "min_ms": 0.33316700137220323,
-          "max_ms": 0.48362501547671854,
-          "mean_ms": 0.35668917989823967,
-          "peak_gib": 1.6279518604278564e-05
+          "paired": false,
+          "median_ms": 0.7829169990145601,
+          "min_ms": 0.756792003812734,
+          "max_ms": 0.8219590017688461,
+          "mean_ms": 0.7874588001868688,
+          "peak_gib": 1.6275793313980103e-05
         }
       },
       "ratios": {
-        "path_c_over_path_b": 0.6569600937015778
-      }
-    },
-    {
-      "batch": 4,
-      "seq_len": 2048,
-      "k": 64,
-      "dtype": "bfloat16",
-      "strategies": {
-        "argpartition": {
-          "iters": 50,
-          "warmup": 10,
-          "ran": true,
-          "paired": false,
-          "median_ms": 0.1793749979697168,
-          "min_ms": 0.15100001473911107,
-          "max_ms": 0.5498339887708426,
-          "mean_ms": 0.18745176203083247,
-          "peak_gib": 6.255507469177246e-05
-        },
-        "argsort_slice": {
-          "iters": 50,
-          "warmup": 10,
-          "ran": true,
-          "paired": false,
-          "median_ms": 0.15916700067464262,
-          "min_ms": 0.14970797928981483,
-          "max_ms": 0.1854579895734787,
-          "mean_ms": 0.16103671689052135,
-          "peak_gib": 6.205588579177856e-05
-        },
-        "topk_take_along": {
-          "iters": 50,
-          "warmup": 10,
-          "ran": true,
-          "paired": false,
-          "median_ms": 0.17591650248505175,
-          "min_ms": 0.15049998182803392,
-          "max_ms": 0.4726249899249524,
-          "mean_ms": 0.184006659546867,
-          "peak_gib": 6.303191184997559e-05
-        },
-        "path_b_msl": {
-          "iters": 50,
-          "warmup": 10,
-          "ran": true,
-          "paired": true,
-          "median_ms": 0.5168334755580872,
-          "min_ms": 0.49945799401029944,
-          "max_ms": 0.8559999987483025,
-          "mean_ms": 0.5329666199395433,
-          "peak_gib": 4.6834349632263184e-05
-        },
-        "path_c_tilelang": {
-          "iters": 50,
-          "warmup": 10,
-          "ran": true,
-          "paired": true,
-          "median_ms": 0.3428539930609986,
-          "min_ms": 0.3241660015191883,
-          "max_ms": 0.5630000086966902,
-          "mean_ms": 0.35044910036958754,
-          "peak_gib": 4.6797096729278564e-05
-        }
-      },
-      "ratios": {
-        "path_c_over_path_b": 0.6633741993797478
+        "path_c_over_path_b": null
       }
     },
     {
@@ -411,72 +339,70 @@
       "dtype": "float32",
       "strategies": {
         "argpartition": {
-          "iters": 50,
-          "warmup": 10,
+          "iters": 5,
+          "warmup": 2,
           "ran": true,
           "paired": false,
-          "median_ms": 0.18985399219673127,
-          "min_ms": 0.16712502110749483,
-          "max_ms": 0.5471250042319298,
-          "mean_ms": 0.19841660163365304,
-          "peak_gib": 0.000433117151260376
+          "median_ms": 0.23866700212238356,
+          "min_ms": 0.21366599685279652,
+          "max_ms": 0.5775419995188713,
+          "mean_ms": 0.30142499890644103,
+          "peak_gib": 0.00043310970067977905
         },
         "argsort_slice": {
-          "iters": 50,
-          "warmup": 10,
+          "iters": 5,
+          "warmup": 2,
           "ran": true,
           "paired": false,
-          "median_ms": 0.17291649419348687,
-          "min_ms": 0.14975000522099435,
-          "max_ms": 0.3106250078417361,
-          "mean_ms": 0.17958830168936402,
-          "peak_gib": 0.0004311874508857727
+          "median_ms": 0.2148749990737997,
+          "min_ms": 0.20916599896736443,
+          "max_ms": 0.21829199977219105,
+          "mean_ms": 0.21424160077003762,
+          "peak_gib": 0.0004311800003051758
         },
         "topk_take_along": {
-          "iters": 50,
-          "warmup": 10,
+          "iters": 5,
+          "warmup": 2,
           "ran": true,
           "paired": false,
-          "median_ms": 0.1907705154735595,
-          "min_ms": 0.17529199249111116,
-          "max_ms": 0.6079160084482282,
-          "mean_ms": 0.2022225596010685,
-          "peak_gib": 0.000436931848526001
+          "median_ms": 0.2358330020797439,
+          "min_ms": 0.22116699983598664,
+          "max_ms": 0.30779199732933193,
+          "mean_ms": 0.24631660053273663,
+          "peak_gib": 0.00043692439794540405
         },
         "path_b_msl": {
-          "iters": 50,
-          "warmup": 10,
-          "ran": true,
-          "paired": true,
-          "median_ms": 9.00941650616005,
-          "min_ms": 8.75641600578092,
-          "max_ms": 9.332624991657212,
-          "mean_ms": 9.01134159648791,
-          "peak_gib": 6.498396396636963e-05
+          "ran": false,
+          "error": "direct-MSL Path B kernel did not dispatch",
+          "iters": 5,
+          "warmup": 2,
+          "median_ms": null,
+          "min_ms": null,
+          "max_ms": null,
+          "mean_ms": null,
+          "peak_gib": null
         },
         "path_c_tilelang": {
-          "iters": 50,
-          "warmup": 10,
+          "iters": 5,
+          "warmup": 2,
           "ran": true,
-          "paired": true,
-          "median_ms": 5.086500008474104,
-          "min_ms": 4.9399579875171185,
-          "max_ms": 5.298665986629203,
-          "mean_ms": 5.095796659006737,
-          "peak_gib": 6.494671106338501e-05
+          "paired": false,
+          "median_ms": 7.296625000890344,
+          "min_ms": 7.260458005475812,
+          "max_ms": 7.398416004434694,
+          "mean_ms": 7.317674800287932,
+          "peak_gib": 6.494298577308655e-05
         }
       },
       "ratios": {
-        "path_c_over_path_b": 0.5645759639368751
+        "path_c_over_path_b": null
       }
     }
   ],
   "strict": {
-    "enabled": false,
-    "passed": false,
-    "path_c_over_path_b_max_ratio": 1.0,
-    "failures": [
-      "strict topk Path C gate failed: B=1 T=512 k=32 dtype=float32 C/B=1.1277084436257858 path_b_ran=True path_c_ran=True"
-    ]
+    "enabled": true,
+    "passed": true,
+    "path_b_retired": true,
+    "failures": []
   }
 }

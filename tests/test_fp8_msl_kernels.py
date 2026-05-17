@@ -1,14 +1,11 @@
-"""Tests for the vendored FP8 (e4m3fn) MSL kernels.
+"""Tests for the retired FP8 (e4m3fn) direct-MSL compatibility helpers.
 
-The kernels live in ``cppmega_mlx/nn/_tilelang/fp8_msl_kernels.py`` and combine
-AppMana-style LUT decode kernels with audiohacking-compatible scalar FP8
-semantics (see module docstring for SHAs and license attribution). These tests
-exercise:
+The helpers live in ``cppmega_mlx/nn/_tilelang/fp8_msl_kernels.py`` and now use
+MLX reference math only. These tests exercise:
 
-1. Compile success: the kernels assemble and produce a non-None handle.
+1. Status: the direct-MSL surface is explicitly retired.
 2. Encode round-trip via the LUT decode is bit-exact against ``mx.from_fp8``
-   modulo the ``-0.0`` sign-of-zero corner (the LUT collapses ``-0.0`` to
-   ``+0.0``).
+   modulo the ``-0.0`` sign-of-zero corner.
 3. ``fp8_scaled_matmul_raw`` matches a "dequant + ``mx.matmul``" oracle
    bit-exactly at fp32 precision (no scale factor).
 4. ``fp8_scaled_vecmat`` matches the same oracle at M=1.
@@ -19,6 +16,9 @@ exercise:
 """
 
 from __future__ import annotations
+
+import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -36,23 +36,22 @@ from cppmega_mlx.nn._tilelang.fp8_msl_kernels import (
     half_to_fp8,
 )
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
 
 # ---------------------------------------------------------------------------
-# Status / compile-time assertions
+# Status assertions
 # ---------------------------------------------------------------------------
 
 
 def test_fp8_msl_status_returns_dataclass() -> None:
     status = fp8_msl_status()
     assert isinstance(status, FP8MSLKernelStatus)
-    assert status.dispatch_surface == "mx.fast.metal_kernel_direct_msl"
+    assert status.dispatch_surface == "retired_direct_msl_pure_mlx_reference"
+    assert status.available is False
+    assert "direct-MSL Path B is retired" in status.reason
     assert status.normal_path_available is False
-    assert "constant-table extern" in status.normal_path_reason
-    if mx.metal.is_available():
-        assert status.available is True
-        assert "compiled" in status.reason or "vendored" in status.reason.lower()
-    else:
-        assert status.available is False
+    assert "fp8_matmul_path_c.py" in status.normal_path_reason
 
 
 def test_fp8_msl_license_notice_present() -> None:
@@ -60,6 +59,23 @@ def test_fp8_msl_license_notice_present() -> None:
     assert "MIT" in __license_notice__
     assert "AppMana" in __license_notice__
     assert "audiohacking" in __license_notice__
+
+
+def test_fp8_msl_source_no_longer_constructs_direct_msl() -> None:
+    source = (REPO_ROOT / "cppmega_mlx/nn/_tilelang/fp8_msl_kernels.py").read_text()
+    assert "make_metal_kernel" not in source
+    assert "_msl_transform" not in source
+    assert "mx.fast.metal_kernel" not in source
+    assert "_FP8_MATMUL_BODY" not in source
+
+
+def test_checked_in_fp8_helper_receipt_reports_retired_status() -> None:
+    receipt = json.loads(
+        (REPO_ROOT / "bench/tilelang_ports/fp8_msl_kernels.json").read_text()
+    )
+    assert receipt["kernel"] == "fp8_reference_helpers"
+    assert receipt["metal_status"]["available"] is False
+    assert "direct-MSL Path B is retired" in receipt["metal_status"]["reason"]
 
 
 # ---------------------------------------------------------------------------
@@ -125,12 +141,7 @@ def test_fp8_round_trip_matches_mx_from_fp8_modulo_signed_zero() -> None:
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="Metal unavailable")
 def test_fp8_zero_inf_nan_handling() -> None:
-    """The kernels must not crash on zero, near-max, or NaN encodings.
-
-    e4m3fn does not have an Inf encoding (max normal is 448.0); 0x7F and
-    0xFF map to NaN. Decode of NaN bytes returns NaN, which the LUT
-    encodes as the IEEE NaN bit pattern.
-    """
+    """The retired helper follows MLX's ``from_fp8`` edge-byte contract."""
 
     # Manually construct uint8 bytes with edge cases.
     bytes_np = np.array(
@@ -146,17 +157,16 @@ def test_fp8_zero_inf_nan_handling() -> None:
     )
     fp8 = mx.array(bytes_np)
     decoded = fp8_to_half(fp8)
-    mx.eval(decoded)
+    expected = mx.from_fp8(fp8, dtype=mx.float16)
+    mx.eval(decoded, expected)
     decoded_np = np.asarray(decoded).astype(np.float32)
 
     # Indices 0..3 are finite.
     assert decoded_np[0] == 0.0
-    assert decoded_np[1] == 0.0  # half can lose sign of zero through LUT
+    assert decoded_np[1] == 0.0
     assert decoded_np[2] == 448.0
     assert decoded_np[3] == -448.0
-    # Indices 4..5 are NaN (LUT carries IEEE NaN).
-    assert np.isnan(decoded_np[4])
-    assert np.isnan(decoded_np[5])
+    np.testing.assert_array_equal(np.asarray(decoded), np.asarray(expected))
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="Metal unavailable")

@@ -26,9 +26,9 @@
     "kv_dtype": "mlx.core.float32"
   },
   "metal_status": {
-    "available": true,
-    "dispatch_reason": "sparse_mla_blockscaled direct-MSL kernel built via mx.fast.metal_kernel is available; block-scaled MXFP8 dequant happens inline inside MSL on uint8 e4m3 storage with E8M0 block-scales. Apple MSL 4.0 has no native float8 simdgroup matrix, so the matmuls run as plain register fma.",
-    "codegen_blocker_reason": "sparse_mla_blockscaled direct-MSL kernel built via mx.fast.metal_kernel is available; block-scaled MXFP8 dequant happens inline inside MSL on uint8 e4m3 storage with E8M0 block-scales. Apple MSL 4.0 has no native float8 simdgroup matrix, so the matmuls run as plain register fma.",
+    "available": false,
+    "dispatch_reason": "sparse_mla_blockscaled direct-MSL Path B is retired for production cleanup: raw _msl_transform.dispatch/mx.fast.metal_kernel callsites are no longer constructed. Use sparse_mla_blockscaled_path_c for prepared FP8 byte/scales owner-output routes, or the pure-MLX MXFP8 reference fallback for float-carrier inputs.",
+    "codegen_blocker_reason": "sparse_mla_blockscaled direct-MSL Path B is retired for production cleanup: raw _msl_transform.dispatch/mx.fast.metal_kernel callsites are no longer constructed. Use sparse_mla_blockscaled_path_c for prepared FP8 byte/scales owner-output routes, or the pure-MLX MXFP8 reference fallback for float-carrier inputs.",
     "block_size": 32
   },
   "path_c_tilelang_e8m0_qk_status": {
@@ -44,13 +44,13 @@
     "features": {
       "kernel_void": 1,
       "fp8_e4m3_decode_helper": 1,
-      "fp8_e4m3_lut": 0,
-      "metal_fp8_dot4_helper": 2,
+      "fp8_e4m3_lut": 9,
+      "metal_fp8_dot4_helper": 9,
       "scalar_fp8_byte_decode": 1,
       "scalar_fp8_byte_decode_calls": 0,
       "simdgroup_multiply_accumulate": 0,
       "tvm_thread_allreduce": 0,
-      "simd_sum": 1,
+      "simd_sum": 3,
       "simd_shuffle_down": 0,
       "A_scale_refs": 3,
       "B_scale_refs": 3,
@@ -65,7 +65,7 @@
       "e8m0_zero_sentinel": 3,
       "k_block_shift_5": 0,
       "k_block_div_32": 0,
-      "scale_block_index_shift": 6,
+      "scale_block_index_shift": 1,
       "scale_format": "e8m0_block_k32",
       "scale_block_size": 32,
       "scale_axis": "contracted_k",
@@ -75,21 +75,21 @@
       "runnable_qk_reduce_available": true,
       "runnable_qk_reduce_reason": "TileLang Path C E8M0 Sparse-MLA real QK reducer is dispatchable for M=1/topk with per-row K/32 E8M0 scales",
       "legacy_e8m0_scaled_matmul_probe_available": false,
-      "legacy_e8m0_scaled_matmul_probe_reason": "TileLang Path C E8M0 Sparse-MLA QK is not safe to dispatch: no simdgroup_multiply_accumulate; scale operands disappeared from emitted MSL; E8M0 exp2(byte - 127) decode markers missing; scale operands are not indexed by K/32; scalar fallback markers present; Sparse-MLA M=1/topk tile violates current Metal FP8 simdgroup tile constraints",
+      "legacy_e8m0_scaled_matmul_probe_reason": "TileLang Path C E8M0 Sparse-MLA QK is not safe to dispatch: no simdgroup_multiply_accumulate; scalar fallback markers present; Sparse-MLA M=1/topk tile violates current Metal FP8 simdgroup tile constraints",
       "legacy_e8m0_scaled_matmul_probe_kernel_void": 1,
       "legacy_e8m0_scaled_matmul_probe_simdgroup_multiply_accumulate": 0,
       "legacy_e8m0_scaled_matmul_probe_simdgroup_load": 0,
       "legacy_e8m0_scaled_matmul_probe_simdgroup_store": 0,
       "legacy_e8m0_scaled_matmul_probe_fp8_e4m3_decode_helper": 3,
-      "legacy_e8m0_scaled_matmul_probe_A_scale_refs": 0,
-      "legacy_e8m0_scaled_matmul_probe_B_scale_refs": 0,
-      "legacy_e8m0_scaled_matmul_probe_signature_has_A_scale": false,
-      "legacy_e8m0_scaled_matmul_probe_signature_has_B_scale": false,
-      "legacy_e8m0_scaled_matmul_probe_e8m0_exp2": 0,
-      "legacy_e8m0_scaled_matmul_probe_e8m0_bias_subtract_127": 0,
-      "legacy_e8m0_scaled_matmul_probe_e8m0_sentinel_255": 0,
-      "legacy_e8m0_scaled_matmul_probe_e8m0_zero_sentinel": 1,
-      "legacy_e8m0_scaled_matmul_probe_k_block_shift_5": 0,
+      "legacy_e8m0_scaled_matmul_probe_A_scale_refs": 3,
+      "legacy_e8m0_scaled_matmul_probe_B_scale_refs": 3,
+      "legacy_e8m0_scaled_matmul_probe_signature_has_A_scale": true,
+      "legacy_e8m0_scaled_matmul_probe_signature_has_B_scale": true,
+      "legacy_e8m0_scaled_matmul_probe_e8m0_exp2": 2,
+      "legacy_e8m0_scaled_matmul_probe_e8m0_bias_subtract_127": 2,
+      "legacy_e8m0_scaled_matmul_probe_e8m0_sentinel_255": 2,
+      "legacy_e8m0_scaled_matmul_probe_e8m0_zero_sentinel": 3,
+      "legacy_e8m0_scaled_matmul_probe_k_block_shift_5": 1,
       "legacy_e8m0_scaled_matmul_probe_k_block_div_32": 0,
       "legacy_e8m0_scaled_matmul_probe_A_scale_collapsed_zero": 0,
       "legacy_e8m0_scaled_matmul_probe_B_scale_collapsed_zero": 0,
@@ -116,13 +116,13 @@
     "features": {
       "kernel_void": 1,
       "fp8_e4m3_decode_helper": 1,
-      "fp8_e4m3_lut": 0,
-      "metal_fp8_dot4_helper": 2,
+      "fp8_e4m3_lut": 9,
+      "metal_fp8_dot4_helper": 9,
       "scalar_fp8_byte_decode": 1,
       "scalar_fp8_byte_decode_calls": 0,
       "simdgroup_multiply_accumulate": 0,
       "tvm_thread_allreduce": 0,
-      "simd_sum": 1,
+      "simd_sum": 3,
       "simd_shuffle_down": 0,
       "A_scale_refs": 3,
       "B_scale_refs": 3,
@@ -137,7 +137,7 @@
       "e8m0_zero_sentinel": 3,
       "k_block_shift_5": 0,
       "k_block_div_32": 0,
-      "scale_block_index_shift": 6,
+      "scale_block_index_shift": 1,
       "scale_format": "e8m0_block_k32",
       "scale_block_size": 32,
       "scale_axis": "contracted_k",
@@ -155,12 +155,12 @@
       "max_rel_err": 0.0
     },
     "msl_blockscaled_vs_bf16": {
-      "max_abs_err": 0.011317778378725052,
-      "max_rel_err": 0.1174739681502098
+      "available": false,
+      "reason": "sparse_mla_blockscaled direct-MSL Path B is retired for production cleanup: raw _msl_transform.dispatch/mx.fast.metal_kernel callsites are no longer constructed. Use sparse_mla_blockscaled_path_c for prepared FP8 byte/scales owner-output routes, or the pure-MLX MXFP8 reference fallback for float-carrier inputs."
     },
     "msl_blockscaled_vs_bs_ref": {
-      "max_abs_err": 3.0465424060821533e-05,
-      "max_rel_err": 0.0003377691831805473
+      "available": false,
+      "reason": "sparse_mla_blockscaled direct-MSL Path B is retired for production cleanup: raw _msl_transform.dispatch/mx.fast.metal_kernel callsites are no longer constructed. Use sparse_mla_blockscaled_path_c for prepared FP8 byte/scales owner-output routes, or the pure-MLX MXFP8 reference fallback for float-carrier inputs."
     },
     "path_c_e8m0_qk_reduce_vs_oracle": {
       "max_abs_err": 0.0,
@@ -170,42 +170,40 @@
   "bench": {
     "bf16_reference": {
       "label": "bf16_reference",
-      "median_ms": 0.2738339826464653,
-      "min_ms": 0.2565840259194374,
-      "max_ms": 0.4980410449206829,
-      "iters": 50
+      "median_ms": 0.30162499751895666,
+      "min_ms": 0.2876250000554137,
+      "max_ms": 0.31333399965660647,
+      "iters": 5
     },
     "blockscaled_reference": {
       "label": "blockscaled_reference",
-      "median_ms": 0.28558308258652687,
-      "min_ms": 0.2714169677346945,
-      "max_ms": 0.4012908320873976,
-      "iters": 50
+      "median_ms": 0.33437499951105565,
+      "min_ms": 0.2775000029942021,
+      "max_ms": 0.36895900120725855,
+      "iters": 5
     },
     "quantized_matmul_reference": {
       "label": "quantized_matmul_reference",
-      "median_ms": 0.2645421773195267,
-      "min_ms": 0.24854205548763275,
-      "max_ms": 0.3612081054598093,
-      "iters": 50
+      "median_ms": 0.3353749998495914,
+      "min_ms": 0.2573749952716753,
+      "max_ms": 0.7479170017177239,
+      "iters": 5
     },
     "path_b_msl_blockscaled_fwd": {
       "label": "path_b_msl_blockscaled_fwd",
-      "median_ms": 0.1668750774115324,
-      "min_ms": 0.1563329715281725,
-      "max_ms": 0.28187502175569534,
-      "iters": 50
+      "available": false,
+      "reason": "sparse_mla_blockscaled direct-MSL Path B is retired for production cleanup: raw _msl_transform.dispatch/mx.fast.metal_kernel callsites are no longer constructed. Use sparse_mla_blockscaled_path_c for prepared FP8 byte/scales owner-output routes, or the pure-MLX MXFP8 reference fallback for float-carrier inputs."
     },
     "path_c_tilelang_e8m0_qk_reduce": {
       "label": "path_c_tilelang_e8m0_qk_reduce",
-      "median_ms": 0.13095885515213013,
-      "min_ms": 0.11108303442597389,
-      "max_ms": 0.2446670550853014,
-      "iters": 50
+      "median_ms": 0.17029199807439,
+      "min_ms": 0.15308299771277234,
+      "max_ms": 0.19120800425298512,
+      "iters": 5
     }
   },
   "ratios": {
-    "path_c_e8m0_qk_reduce_over_path_b_blockscaled_fwd": 0.7847718016583812
+    "path_c_e8m0_qk_reduce_over_blockscaled_reference": 0.5092844809671828
   },
   "qk_reducer_strict": {
     "enabled": true,

@@ -85,6 +85,51 @@ class _FakeMxArray:
         return self._value
 
 
+def test_fp8_env_prep_keeps_active_tvm_ffi_editable_finder(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    tilelang_root = tmp_path / "tilelang"
+    tvm_root = tilelang_root / "3rdparty" / "tvm"
+    tvm_ffi_root = tvm_root / "3rdparty" / "tvm-ffi"
+    (tvm_ffi_root / "python" / "tvm_ffi").mkdir(parents=True)
+    (tvm_ffi_root / "build").mkdir()
+
+    finder_type = type(
+        "ScikitBuildRedirectingFinder",
+        (),
+        {"__module__": "_apache_tvm_ffi_editable"},
+    )
+    active_finder = finder_type()
+    active_finder.path = str(tvm_ffi_root / "build")
+    active_finder.install_dir = "/venv/site-packages/tvm_ffi"
+    active_finder.known_source_files = {
+        "tvm_ffi": str(tvm_ffi_root / "python" / "tvm_ffi" / "__init__.py"),
+    }
+
+    stale_finder = finder_type()
+    stale_finder.path = str(tmp_path / "stale" / "tvm-ffi" / "build")
+    stale_finder.install_dir = "/venv/site-packages/tvm_ffi"
+    stale_finder.known_source_files = {
+        "tvm_ffi": str(
+            tmp_path / "stale" / "tvm-ffi" / "python" / "tvm_ffi" / "__init__.py"
+        ),
+    }
+
+    sentinel_finder = object()
+    monkeypatch.setattr(sys, "meta_path", [active_finder, stale_finder, sentinel_finder])
+    monkeypatch.setattr(fp8_bench, "_REMOVED_IMPORT_FINDERS", [])
+
+    fp8_bench._disable_stale_editable_import_finders(tilelang_root, tvm_root)
+
+    assert active_finder in sys.meta_path
+    assert stale_finder not in sys.meta_path
+    assert sentinel_finder in sys.meta_path
+    assert fp8_bench._REMOVED_IMPORT_FINDERS == [
+        "_apache_tvm_ffi_editable.ScikitBuildRedirectingFinder"
+    ]
+
+
 def test_tilelang_imports_resolve_to_local_tree_and_pinned_ffi() -> None:
     tilelang_root = fp8_bench.TILELANG_ROOT.resolve()
     local_tilelang_init = tilelang_root / "tilelang" / "__init__.py"
@@ -118,30 +163,26 @@ def test_tilelang_imports_resolve_to_local_tree_and_pinned_ffi() -> None:
     assert Path(direct_url_payload["url"].removeprefix("file://")).resolve() == local_tvm_ffi_root
 
 
-def test_topk_strict_requires_both_paths_and_ratio_no_worse() -> None:
+def test_topk_strict_requires_path_c_after_path_b_retirement() -> None:
     row = {
         "strategies": {
-            "path_b_msl": {"ran": True},
+            "path_b_msl": {"ran": False},
             "path_c_tilelang": {"ran": True},
         },
-        "ratios": {"path_c_over_path_b": 1.0},
+        "ratios": {"path_c_over_path_b": None},
     }
 
     assert topk_bench._row_strict_ok(row, max_ratio=1.0)
-
-    row["strategies"]["path_b_msl"]["ran"] = False
-    assert not topk_bench._row_strict_ok(row, max_ratio=1.0)
-    row["strategies"]["path_b_msl"]["ran"] = True
 
     row["strategies"]["path_c_tilelang"]["ran"] = False
     assert not topk_bench._row_strict_ok(row, max_ratio=1.0)
     row["strategies"]["path_c_tilelang"]["ran"] = True
 
     row["ratios"]["path_c_over_path_b"] = math.inf
-    assert not topk_bench._row_strict_ok(row, max_ratio=1.0)
+    assert topk_bench._row_strict_ok(row, max_ratio=1.0)
 
     row["ratios"]["path_c_over_path_b"] = 1.0001
-    assert not topk_bench._row_strict_ok(row, max_ratio=1.0)
+    assert topk_bench._row_strict_ok(row, max_ratio=1.0)
 
 
 def test_topk_timing_records_timed_exception_as_failed_row(monkeypatch) -> None:
@@ -166,14 +207,14 @@ def test_topk_main_strict_exit_2_and_writes_policy_receipt(monkeypatch, tmp_path
     out = tmp_path / "topk.json"
     payload = {
         "schema_version": topk_bench.BENCH_RECEIPT_SCHEMA_VERSION,
-        "path_b_status": {"available": True, "reason": "ok"},
+        "path_b_status": {"available": False, "reason": "retired"},
         "path_c_status": {"available": True, "reason": "ok"},
         "warmup": 1,
         "iters": 1,
         "seed": 1,
         "strict_policy": {
-            "path_c_over_path_b_max_ratio": 1.0,
-            "requires_path_b_and_path_c": True,
+            "path_b_retired": True,
+            "requires_path_c": True,
         },
         "rows": [
             {
@@ -183,9 +224,9 @@ def test_topk_main_strict_exit_2_and_writes_policy_receipt(monkeypatch, tmp_path
                 "dtype": "float32",
                 "strategies": {
                     "path_b_msl": {"ran": True, "median_ms": 1.0},
-                    "path_c_tilelang": {"ran": True, "median_ms": 1.1},
+                    "path_c_tilelang": {"ran": False, "median_ms": None},
                 },
-                "ratios": {"path_c_over_path_b": 1.1},
+                "ratios": {"path_c_over_path_b": None},
             }
         ],
     }
@@ -208,7 +249,7 @@ def test_topk_main_strict_exit_2_and_writes_policy_receipt(monkeypatch, tmp_path
     written = json.loads(out.read_text())
     assert written["schema_version"] == topk_bench.BENCH_RECEIPT_SCHEMA_VERSION
     assert written["strict_policy"] == payload["strict_policy"]
-    assert written["rows"][0]["ratios"]["path_c_over_path_b"] == 1.1
+    assert written["rows"][0]["strategies"]["path_c_tilelang"]["ran"] is False
 
 
 def test_topk_payload_points_to_checked_in_source(monkeypatch) -> None:
@@ -225,7 +266,7 @@ def test_topk_auto_dispatch_prefers_path_c_when_available(monkeypatch) -> None:
     sentinel = object()
     scores = topk_module.mx.zeros((4, 2048), dtype=topk_module.mx.float32)
 
-    def path_c(_scores, _k, *, starts=None, ends=None):
+    def path_c(_scores, _k, *, out=None, starts=None, ends=None):
         calls.append("path_c")
         return sentinel
 
@@ -233,7 +274,7 @@ def test_topk_auto_dispatch_prefers_path_c_when_available(monkeypatch) -> None:
         calls.append("path_b")
         return object()
 
-    monkeypatch.setattr(topk_module, "topk_selector_tilelang", path_c)
+    monkeypatch.setattr(topk_module, "topk_selector_tilelang_direct", path_c)
     monkeypatch.setattr(topk_module, "topk_selector_metal", path_b)
 
     assert topk_module.topk_selector(scores, 64) is sentinel
@@ -247,34 +288,27 @@ def test_checked_in_topk_receipt_keeps_path_c_dispatch_gate_green() -> None:
 
     assert receipt["schema_version"] == topk_bench.BENCH_RECEIPT_SCHEMA_VERSION
     assert receipt["source"] == "cppmega_mlx/nn/_tilelang/topk_selector.py"
-    assert receipt["path_b_status"]["available"] is True
+    assert receipt["path_b_status"]["available"] is False
     assert receipt["path_c_status"]["available"] is True
     assert policy == {
-        "path_c_over_path_b_max_ratio": 1.0,
-        "requires_path_b_and_path_c": True,
+        "path_b_retired": True,
+        "requires_path_c": True,
     }
     assert isinstance(rows, list) and rows
 
-    max_ratio = float(policy["path_c_over_path_b_max_ratio"])
     for row in rows:
         strategies = row["strategies"]
-        ratio = row["ratios"]["path_c_over_path_b"]
-        assert strategies["path_b_msl"]["ran"] is True
+        assert strategies["path_b_msl"]["ran"] is False
         assert strategies["path_c_tilelang"]["ran"] is True
-        assert _finite_positive_float(strategies["path_b_msl"]["median_ms"])
         assert _finite_positive_float(strategies["path_c_tilelang"]["median_ms"])
-        assert _finite_positive_float(ratio)
-        assert float(ratio) <= max_ratio
 
 
 def test_sparse_strict_requires_available_ok_finite_forward() -> None:
     row = {
         "shape": {"name": "synthetic"},
-        "path_b": {"available": True, "reason": "ok"},
+        "path_b": {"available": False, "reason": "retired"},
         "path_c": {"available": True, "reason": "ok"},
-        "fwd_msl_paired_ms": _bench_result(ok=True),
-        "fwd_path_c_paired_ms": _bench_result(ok=True),
-        "fwd_path_c_over_path_b_paired_ratio": 1.0,
+        "fwd_path_c_ms": _bench_result(ok=True),
     }
 
     assert (
@@ -287,15 +321,6 @@ def test_sparse_strict_requires_available_ok_finite_forward() -> None:
         == []
     )
 
-    row["path_b"]["available"] = False
-    assert sparse_bench._strict_row_failures(
-        row,
-        fwd_only=True,
-        max_ratio=1.0,
-        strict_phase="all",
-    )
-    row["path_b"]["available"] = True
-
     row["path_c"]["available"] = False
     assert sparse_bench._strict_row_failures(
         row,
@@ -305,24 +330,7 @@ def test_sparse_strict_requires_available_ok_finite_forward() -> None:
     )
     row["path_c"]["available"] = True
 
-    row["fwd_path_c_paired_ms"] = _bench_result(ok=False, median_ms=None)
-    assert sparse_bench._strict_row_failures(
-        row,
-        fwd_only=True,
-        max_ratio=1.0,
-        strict_phase="all",
-    )
-    row["fwd_path_c_paired_ms"] = _bench_result(ok=True)
-
-    row["fwd_path_c_over_path_b_paired_ratio"] = math.inf
-    assert sparse_bench._strict_row_failures(
-        row,
-        fwd_only=True,
-        max_ratio=1.0,
-        strict_phase="all",
-    )
-
-    row["fwd_path_c_over_path_b_paired_ratio"] = 1.0001
+    row["fwd_path_c_ms"] = _bench_result(ok=False, median_ms=None)
     assert sparse_bench._strict_row_failures(
         row,
         fwd_only=True,
@@ -334,14 +342,10 @@ def test_sparse_strict_requires_available_ok_finite_forward() -> None:
 def test_sparse_strict_checks_backward_when_requested() -> None:
     row = {
         "shape": {"name": "synthetic"},
-        "path_b": {"available": True, "reason": "ok"},
+        "path_b": {"available": False, "reason": "retired"},
         "path_c": {"available": True, "reason": "ok"},
-        "fwd_msl_paired_ms": _bench_result(ok=True),
-        "fwd_path_c_paired_ms": _bench_result(ok=True),
-        "fwd_path_c_over_path_b_paired_ratio": 1.0,
-        "bwd_msl_paired_ms": _bench_result(ok=True),
-        "bwd_path_c_paired_ms": _bench_result(ok=True),
-        "bwd_path_c_over_path_b_paired_ratio": 1.0,
+        "fwd_path_c_ms": _bench_result(ok=True),
+        "bwd_path_c_ms": _bench_result(ok=True),
     }
 
     assert (
@@ -354,16 +358,7 @@ def test_sparse_strict_checks_backward_when_requested() -> None:
         == []
     )
 
-    row["bwd_path_c_paired_ms"] = _bench_result(ok=False, median_ms=None)
-    assert sparse_bench._strict_row_failures(
-        row,
-        fwd_only=False,
-        max_ratio=1.0,
-        strict_phase="all",
-    )
-    row["bwd_path_c_paired_ms"] = _bench_result(ok=True)
-
-    row["bwd_path_c_over_path_b_paired_ratio"] = 1.0001
+    row["bwd_path_c_ms"] = _bench_result(ok=False, median_ms=None)
     assert sparse_bench._strict_row_failures(
         row,
         fwd_only=False,
@@ -376,18 +371,16 @@ def test_sparse_main_strict_exit_2_writes_failed_policy_receipt(monkeypatch, tmp
     out = tmp_path / "sparse.json"
     row = {
         "shape": {"name": "synthetic"},
-        "path_b": {"available": True, "reason": "ok"},
+        "path_b": {"available": False, "reason": "retired"},
         "path_c": {"available": True, "reason": "ok"},
-        "fwd_msl_paired_ms": _bench_result(ok=True),
-        "fwd_path_c_paired_ms": _bench_result(ok=True, median_ms=1.1),
-        "fwd_path_c_over_path_b_paired_ratio": 1.1,
+        "fwd_path_c_ms": _bench_result(ok=False, median_ms=None),
     }
     monkeypatch.setattr(sparse_bench, "DEFAULT_SHAPES", [{"name": "synthetic"}])
     monkeypatch.setattr(sparse_bench, "_bench_shape", lambda *_args, **_kwargs: row)
     monkeypatch.setattr(
         sparse_bench,
         "sparse_mla_metal_status",
-        lambda *_args, **_kwargs: SimpleNamespace(available=True, reason="ok"),
+        lambda *_args, **_kwargs: SimpleNamespace(available=False, reason="retired"),
     )
     monkeypatch.setattr(
         sparse_bench,
@@ -418,10 +411,9 @@ def test_sparse_main_strict_exit_2_writes_failed_policy_receipt(monkeypatch, tmp
     written = json.loads(out.read_text())
     assert written["strict"]["passed"] is False
     assert written["strict"]["failures"] == [
-        "synthetic: forward strict gate failed paired C/B=1.1 "
-        "path_b_ok=True path_c_ok=True"
+        "synthetic: forward strict gate failed path_c_ok=False"
     ]
-    assert written["rows"][0]["fwd_path_c_over_path_b_paired_ratio"] == 1.1
+    assert written["rows"][0]["fwd_path_c_ms"]["ok"] is False
 
 
 def test_sparse_shape_receipt_uses_strict_max_ratio_for_no_worse_flags(monkeypatch) -> None:
@@ -456,7 +448,7 @@ def test_sparse_shape_receipt_uses_strict_max_ratio_for_no_worse_flags(monkeypat
     monkeypatch.setattr(
         sparse_bench,
         "sparse_mla_metal_status",
-        lambda *_args, **_kwargs: SimpleNamespace(available=True, reason="ok"),
+        lambda *_args, **_kwargs: SimpleNamespace(available=False, reason="retired"),
     )
     monkeypatch.setattr(
         sparse_bench,
@@ -476,8 +468,12 @@ def test_sparse_shape_receipt_uses_strict_max_ratio_for_no_worse_flags(monkeypat
     assert row["path_c_over_path_b_max_ratio"] == 1.0
     assert row["fwd_path_c_over_path_b_ratio"] == 1.01
     assert row["fwd_path_c_over_path_b_paired_ratio"] == 1.01
+    assert row["fwd_path_c_over_reference_ratio"] == 1.01
+    assert row["path_b_retired"] is True
+    assert row["fwd_path_c_ran"] is True
     assert row["fwd_path_c_no_worse_than_path_b"] is False
     assert row["fwd_path_c_no_worse_than_path_b_paired"] is False
+    assert row["fwd_path_c_no_worse_than_reference"] is False
 
 
 def test_sparse_shape_receipt_sets_backward_paired_no_worse_flag(monkeypatch) -> None:
@@ -509,7 +505,7 @@ def test_sparse_shape_receipt_sets_backward_paired_no_worse_flag(monkeypatch) ->
     monkeypatch.setattr(
         sparse_bench,
         "sparse_mla_metal_status",
-        lambda *_args, **_kwargs: SimpleNamespace(available=True, reason="ok"),
+        lambda *_args, **_kwargs: SimpleNamespace(available=False, reason="retired"),
     )
     monkeypatch.setattr(
         sparse_bench,
@@ -517,32 +513,6 @@ def test_sparse_shape_receipt_sets_backward_paired_no_worse_flag(monkeypatch) ->
         lambda *_args, **_kwargs: SimpleNamespace(available=True, reason="ok"),
     )
     monkeypatch.setattr(sparse_bench.mx, "eval", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(
-        sparse_bench,
-        "_sparse_mla_bwd_path_c_partial",
-        lambda *_args, **_kwargs: (
-            sparse_bench.mx.zeros((1, 1, 1, 1, 1), dtype=sparse_bench.mx.float16),
-            sparse_bench.mx.zeros((1, 1, 1, 1), dtype=sparse_bench.mx.float16),
-            sparse_bench.mx.zeros((1, 1, 1, 1), dtype=sparse_bench.mx.int32),
-            SimpleNamespace(
-                batch=1,
-                seq_len=1,
-                heads=1,
-                kv_group=1,
-                d_v=1,
-                qk_dim=1,
-                seq_len_kv=1,
-            ),
-        ),
-    )
-    monkeypatch.setattr(
-        sparse_bench,
-        "_reduce_dkv_partial",
-        lambda *_args, **_kwargs: sparse_bench.mx.zeros(
-            (1, 1, 1, 1), dtype=sparse_bench.mx.float16
-        ),
-    )
-
     row = sparse_bench._bench_shape(
         {"name": "synthetic", "B": 1, "S": 1, "H": 1, "D": 1},
         warmup=1,
@@ -552,6 +522,7 @@ def test_sparse_shape_receipt_sets_backward_paired_no_worse_flag(monkeypatch) ->
     )
 
     assert row["bwd_path_c_over_path_b_paired_ratio"] == 1.01
+    assert row["bwd_path_c_ran"] is True
     assert row["bwd_path_c_no_worse_than_path_b"] is False
     assert row["bwd_path_c_no_worse_than_path_b_paired"] is False
 
@@ -562,11 +533,12 @@ def test_checked_in_sparse_mla_forward_paired_receipt_is_no_worse() -> None:
     rows = receipt["rows"]
 
     assert receipt["schema"] == 1
-    assert receipt["path_b_status"]["available"] is True
+    assert receipt["path_b_status"]["available"] is False
     assert receipt["path_c_status"]["available"] is True
     assert policy == {
         "path_c_over_path_b_max_ratio": 1.0,
-        "requires_path_b_and_path_c": True,
+        "path_b_retired": True,
+        "requires_path_c": True,
         "fwd_only": False,
         "phase": "all",
     }
@@ -574,15 +546,17 @@ def test_checked_in_sparse_mla_forward_paired_receipt_is_no_worse() -> None:
 
     max_ratio = float(policy["path_c_over_path_b_max_ratio"])
     for row in rows:
-        assert row["path_b"]["available"] is True
+        assert row["path_b"]["available"] is False
         assert row["path_c"]["available"] is True
-        assert row["fwd_msl_paired_ms"]["ok"] is True
-        assert row["fwd_path_c_paired_ms"]["ok"] is True
-        assert _finite_positive_float(row["fwd_msl_paired_ms"]["median_ms"])
-        assert _finite_positive_float(row["fwd_path_c_paired_ms"]["median_ms"])
-        ratio = row["fwd_path_c_over_path_b_paired_ratio"]
-        assert _finite_positive_float(ratio)
-        assert row["fwd_path_c_no_worse_than_path_b_paired"] is (float(ratio) <= max_ratio)
+        assert row["path_b_retired"] is True
+        assert row["fwd_path_c_ran"] is True
+        assert row["fwd_path_c_ms"]["ok"] is True
+        assert _finite_positive_float(row["fwd_path_c_ms"]["median_ms"])
+        reference_ratio = row["fwd_path_c_over_reference_ratio"]
+        assert _finite_positive_float(reference_ratio)
+        assert row["fwd_path_c_no_worse_than_reference"] is (
+            float(reference_ratio) <= max_ratio
+        )
 
 
 def test_checked_in_sparse_mla_receipt_blocks_auto_path_c_flip() -> None:
@@ -596,13 +570,12 @@ def test_checked_in_sparse_mla_receipt_blocks_auto_path_c_flip() -> None:
     assert isinstance(rows, list) and rows
 
     for row in rows:
-        assert row["bwd_msl_paired_ms"]["ok"] is True
-        assert row["bwd_path_c_paired_ms"]["ok"] is True
-        paired_ratio = row["bwd_path_c_over_path_b_paired_ratio"]
-        assert _finite_positive_float(paired_ratio)
-        assert row["bwd_path_c_no_worse_than_path_b"] is (float(paired_ratio) <= max_ratio)
-        assert row["bwd_path_c_no_worse_than_path_b_paired"] is (
-            float(paired_ratio) <= max_ratio
+        assert row["bwd_path_c_ran"] is True
+        assert row["bwd_path_c_ms"]["ok"] is True
+        reference_ratio = row["bwd_path_c_over_reference_ratio"]
+        assert _finite_positive_float(reference_ratio)
+        assert row["bwd_path_c_no_worse_than_reference"] is (
+            float(reference_ratio) <= max_ratio
         )
 
         row_failures = sparse_bench._strict_row_failures(
@@ -695,7 +668,9 @@ def test_checked_in_sparse_mla_blockscaled_receipt_keeps_full_path_c_blocked() -
     assert receipt["path_c_tilelang_e8m0_qk_reduce_status"]["reason"].startswith(
         "TileLang Path C E8M0 Sparse-MLA real QK reducer"
     )
-    ratio = receipt["ratios"]["path_c_e8m0_qk_reduce_over_path_b_blockscaled_fwd"]
+    assert receipt["metal_status"]["available"] is False
+    assert "direct-MSL Path B is retired" in receipt["metal_status"]["dispatch_reason"]
+    ratio = receipt["ratios"]["path_c_e8m0_qk_reduce_over_blockscaled_reference"]
     assert _finite_positive_float(ratio)
     assert float(ratio) <= float(strict["max_ratio"])
 
@@ -858,7 +833,7 @@ def test_fp8_matmul_shape_uses_paired_timing_not_sequential_helpers(monkeypatch)
 
     def paired(strategies, sync, *, flops, warmup, iters):
         assert [label for label, _fn in strategies] == [
-            "path_b_msl_fp8_scaled_matmul",
+            fp8_bench.PATH_B_MATMUL_LABEL,
             "matmul_tl_fp8_scaled_matmul",
         ]
         assert flops == 2.0
@@ -870,8 +845,8 @@ def test_fp8_matmul_shape_uses_paired_timing_not_sequential_helpers(monkeypatch)
             sync()
         return fp8_bench.PairedBenchResult(
             stats={
-                "path_b_msl_fp8_scaled_matmul": fp8_bench.BenchStats(
-                    label="path_b_msl_fp8_scaled_matmul",
+                fp8_bench.PATH_B_MATMUL_LABEL: fp8_bench.BenchStats(
+                    label=fp8_bench.PATH_B_MATMUL_LABEL,
                     ok=True,
                     median_ms=1.0,
                     paired=True,
@@ -884,8 +859,8 @@ def test_fp8_matmul_shape_uses_paired_timing_not_sequential_helpers(monkeypatch)
                 ),
             },
             paired_ratios={
-                "matmul_tl_fp8_scaled_matmul_over_path_b_msl_fp8_scaled_matmul_paired_median": 0.9,
-                "matmul_tl_fp8_scaled_matmul_over_path_b_msl_fp8_scaled_matmul_paired_p90": 0.9,
+                f"matmul_tl_fp8_scaled_matmul_over_{fp8_bench.PATH_B_MATMUL_LABEL}_paired_median": 0.9,
+                f"matmul_tl_fp8_scaled_matmul_over_{fp8_bench.PATH_B_MATMUL_LABEL}_paired_p90": 0.9,
             },
         )
 
@@ -964,7 +939,7 @@ def test_fp8_matmul_shape_uses_paired_timing_not_sequential_helpers(monkeypatch)
     )
 
     labels = {item["label"]: item for item in row["rows"]}
-    assert labels["path_b_msl_fp8_scaled_matmul"]["bench"]["paired"] is True
+    assert labels[fp8_bench.PATH_B_MATMUL_LABEL]["bench"]["paired"] is True
     assert labels["matmul_tl_fp8_scaled_matmul"]["bench"]["paired"] is True
     assert labels["matmul_tl_fp8_scaled_matmul"]["parity_vs_path_b_msl"] == {
         "max_abs": 0.0,
@@ -972,7 +947,7 @@ def test_fp8_matmul_shape_uses_paired_timing_not_sequential_helpers(monkeypatch)
     }
     assert row["ratios"]["matmul_tl_fp8_scaled_matmul_over_path_b"] == 0.9
     assert calls == [
-        "path_b_msl_fp8_scaled_matmul",
+        fp8_bench.PATH_B_MATMUL_LABEL,
         "matmul_tl_fp8_scaled_matmul",
         "path_c_run",
     ]

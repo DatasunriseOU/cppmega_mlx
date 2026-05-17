@@ -348,6 +348,56 @@ def test_dsa_path_c_routes_through_sparse_mla_fp8_prepared(
     }
 
 
+def test_dsa_path_b_fp8_baseline_routes_through_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cppmega_mlx.nn._tilelang.sparse_mla_fp8 as fp8_path_b
+
+    cfg = AttentionConfig(
+        d_model=16,
+        num_q_heads=4,
+        num_kv_heads=2,
+        mode="dsa",
+        sparse_topk=2,
+    )
+    attn = CausalSelfAttention(cfg)
+    x = _rand((1, 4, 16), seed=132)
+    calls: list[dict[str, object]] = []
+
+    def fake_apply(
+        q: mx.array,
+        kv: mx.array,
+        indices: mx.array,
+        *,
+        sm_scale: float | None = None,
+        d_v: int | None = None,
+        return_lse: bool = False,
+        force_metal: bool = False,
+    ) -> mx.array:
+        del sm_scale, return_lse, force_metal
+        calls.append({"q": q, "kv": kv, "indices": indices, "d_v": d_v})
+        assert d_v == cfg.q_head_dim
+        return mx.zeros((1, 4, 4, cfg.q_head_dim), dtype=q.dtype)
+
+    monkeypatch.setenv("CPPMEGA_KERNEL_PATH__SPARSE_MLA", "path_b")
+    monkeypatch.setattr(fp8_path_b, "sparse_mla_fp8_apply", fake_apply)
+    clear_dispatch_log()
+
+    out = attn(x, mask="causal")
+    mx.eval(out)
+
+    assert out.shape == x.shape
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["q"].dtype == x.dtype
+    assert call["kv"].dtype == x.dtype
+    assert get_dispatch_log()[-1] == {
+        "op_name": "sparse_mla",
+        "path": "path_b",
+        "kernel_used": "sparse_mla_fp8_reference_path_b",
+    }
+
+
 def test_dsa_path_c_routes_explicit_masks_as_sparse_indices(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

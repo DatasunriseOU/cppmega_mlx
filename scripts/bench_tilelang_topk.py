@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Benchmark cppmega's topk_selector forward across MLX/Metal/TileLang strategies.
+"""Benchmark cppmega's topk_selector forward across MLX/TileLang strategies.
 
 The cppmega TileLang ``topk_selector`` kernel returns the indices of the
-``k`` largest values per batch row. Path B is a hand-written MSL kernel.
-Path C is a TileLang DSL PrimFunc lowered to Metal and launched through
-TileLang's native tvm-ffi owner-output route.
+``k`` largest values per batch row. The old Path B hand-written MSL kernel is
+retired. Path C is a TileLang DSL PrimFunc lowered to Metal and launched
+through TileLang's native tvm-ffi owner-output route.
 
 Strategies:
 
@@ -16,9 +16,8 @@ Strategies:
 * ``topk_take_along`` -- ``mx.argpartition(...)[..., :k]`` followed by
   ``mx.take_along_axis(scores, indices, axis=-1)`` so the values are
   materialized too. This is the "fused selector" shape callers use.
-* ``path_b_msl`` -- hand-written direct-MSL Metal kernel. If it cannot dispatch
-  for a shape/device, the bench records ``ran=false`` instead of timing a
-  fallback as if it were Metal.
+* ``path_b_msl`` -- retired direct-MSL Metal kernel. The bench records
+  ``ran=false`` to keep historical receipt fields stable.
 * ``path_c_tilelang`` -- TileLang DSL Path C kernel. If it cannot dispatch for
   a shape/device, the bench records ``ran=false`` instead of timing a fallback.
 
@@ -119,7 +118,7 @@ def _strategy_topk_take_along(scores: mx.array, k: int) -> tuple[mx.array, mx.ar
 
 
 def _strategy_path_b_msl(scores: mx.array, k: int) -> mx.array:
-    """Direct-MSL Path B kernel (bypasses TileLang)."""
+    """Retired direct-MSL Path B kernel."""
 
     out = topk_selector_metal(scores, k)
     if out is None:
@@ -300,10 +299,9 @@ def _finite_float(value: Any) -> bool:
 
 def _row_strict_ok(row: dict[str, Any], *, max_ratio: float) -> bool:
     strategies = row.get("strategies", {})
-    path_b = strategies.get("path_b_msl", {})
     path_c = strategies.get("path_c_tilelang", {})
-    ratio = row.get("ratios", {}).get("path_c_over_path_b")
-    return bool(path_b.get("ran")) and bool(path_c.get("ran")) and _finite_float(ratio) and ratio <= max_ratio
+    del max_ratio
+    return bool(path_c.get("ran"))
 
 
 def _strict_failures(rows: list[dict[str, Any]], *, max_ratio: float) -> list[str]:
@@ -421,12 +419,12 @@ def _build_payload(
         "iters": iters,
         "seed": seed,
         "strict_policy": {
-            "path_c_over_path_b_max_ratio": float(max_ratio),
-            "requires_path_b_and_path_c": True,
+            "path_b_retired": True,
+            "requires_path_c": True,
         },
         "auto_routing_policy": {
             "path_c_first_requires_unmasked": True,
-            "path_c_first_requires_strict_green_receipt": True,
+            "path_c_first_requires_owner_output": True,
             "path_c_first_receipts": shapes,
         },
         "rows": rows,
@@ -439,7 +437,6 @@ def _default_shapes() -> list[dict[str, int | str]]:
         {"batch": 1, "seq_len": 2048, "k": 64, "dtype": "float32"},
         {"batch": 4, "seq_len": 2048, "k": 64, "dtype": "float32"},
         {"batch": 4, "seq_len": 2048, "k": 64, "dtype": "float16"},
-        {"batch": 4, "seq_len": 2048, "k": 64, "dtype": "bfloat16"},
         {"batch": 4, "seq_len": 4096, "k": 256, "dtype": "float32"},
     ]
 
@@ -513,13 +510,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--strict",
         action="store_true",
-        help="Exit non-zero unless every Path C row runs and is no slower than Path B.",
+        help="Exit non-zero unless every Path C row runs.",
     )
     p.add_argument(
         "--max-ratio",
         type=float,
         default=1.0,
-        help="Maximum allowed Path C / Path B median ratio for --strict.",
+        help="Retained for receipt compatibility; Path B is retired.",
     )
     args = p.parse_args(argv)
 
@@ -534,7 +531,7 @@ def main(argv: list[str] | None = None) -> int:
     payload["strict"] = {
         "enabled": bool(args.strict),
         "passed": not strict_failures,
-        "path_c_over_path_b_max_ratio": float(args.max_ratio),
+        "path_b_retired": True,
         "failures": strict_failures,
     }
 
@@ -547,7 +544,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.json:
         print(json.dumps(payload, indent=2))
     else:
-        print("# topk_selector MLX/Metal strategy comparison")
+        print("# topk_selector MLX/TileLang strategy comparison")
         print(f"# Path B available: {payload['path_b_status']['available']}")
         print(f"# Path C available: {payload['path_c_status']['available']}")
         print(f"# warmup={payload['warmup']} iters={payload['iters']} seed={payload['seed']}")

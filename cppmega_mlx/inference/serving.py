@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Literal, Sequence
 
 import mlx.core as mx
+import numpy as np
 
 RequestState = Literal["waiting", "running", "preempted", "completed"]
 
@@ -276,6 +277,7 @@ class ContinuousBatchScheduler:
         self._block_manager = block_manager
         self._max_batch_size = max_batch_size
         self._waiting: list[SequenceRequest] = []
+        self._waiting_by_seq_id: dict[int, SequenceRequest] = {}
         self._running: dict[int, SequenceRequest] = {}
         self._completed_buffer: list[SequenceRequest] = []
         self._arrival_counter = 0
@@ -304,7 +306,7 @@ class ContinuousBatchScheduler:
 
         if seq_id in self._running:
             raise ValueError(f"seq_id {seq_id} is already running")
-        if any(req.seq_id == seq_id for req in self._waiting):
+        if seq_id in self._waiting_by_seq_id:
             raise ValueError(f"seq_id {seq_id} is already waiting")
         req = SequenceRequest(
             seq_id=seq_id,
@@ -316,6 +318,7 @@ class ContinuousBatchScheduler:
         )
         self._arrival_counter += 1
         self._waiting.append(req)
+        self._waiting_by_seq_id[seq_id] = req
         return req
 
     def schedule_batch(self) -> SchedulerOutput:
@@ -337,7 +340,7 @@ class ContinuousBatchScheduler:
 
         waiting_snapshot = list(self._waiting) + preempted_for_retry
         waiting_snapshot.sort(key=_request_sort_key)
-        self._waiting = []
+        self._replace_waiting([])
         still_waiting: list[SequenceRequest] = []
 
         for req in waiting_snapshot:
@@ -367,9 +370,11 @@ class ContinuousBatchScheduler:
 
             still_waiting.append(req)
 
-        self._waiting = _dedupe_waiting(
-            still_waiting + preempted_for_retry,
-            running_seq_ids=set(self._running),
+        self._replace_waiting(
+            _dedupe_waiting(
+                still_waiting + preempted_for_retry,
+                running_seq_ids=set(self._running),
+            )
         )
         groups: defaultdict[str, list[SequenceRequest]] = defaultdict(list)
         for req in admitted:
@@ -405,20 +410,17 @@ class ContinuousBatchScheduler:
             req.block_indices = []
             req.state = "completed"
             return True
-        for index, waiting_req in enumerate(self._waiting):
-            if waiting_req.seq_id == seq_id:
-                waiting_req.state = "completed"
-                self._waiting.pop(index)
-                return True
+        waiting_req = self._waiting_by_seq_id.pop(seq_id, None)
+        if waiting_req is not None:
+            waiting_req.state = "completed"
+            self._waiting = [req for req in self._waiting if req.seq_id != seq_id]
+            return True
         return False
 
     def get_request(self, seq_id: int) -> SequenceRequest | None:
         if seq_id in self._running:
             return self._running[seq_id]
-        for req in self._waiting:
-            if req.seq_id == seq_id:
-                return req
-        return None
+        return self._waiting_by_seq_id.get(seq_id)
 
     def get_completed(self) -> list[SequenceRequest]:
         completed = list(self._completed_buffer)
@@ -482,6 +484,10 @@ class ContinuousBatchScheduler:
         del self._running[req.seq_id]
         return req
 
+    def _replace_waiting(self, requests: Sequence[SequenceRequest]) -> None:
+        self._waiting = list(requests)
+        self._waiting_by_seq_id = {req.seq_id: req for req in self._waiting}
+
 
 def build_paged_block_table(
     block_indices_by_row: Sequence[Sequence[int]],
@@ -502,20 +508,15 @@ def build_paged_block_table(
         rows.append(row_blocks)
 
     width = inferred_width if max_blocks_per_seq is None else max_blocks_per_seq
-    table = mx.zeros((len(rows), width), dtype=mx.int32)
+    table = np.zeros((len(rows), width), dtype=np.int32)
     if width == 0:
-        return table
+        return mx.array(table)
     for row_idx, row_blocks in enumerate(rows):
         if len(row_blocks) > width:
             raise ValueError("row has more blocks than max_blocks_per_seq")
         if row_blocks:
-            table = mx.slice_update(
-                table,
-                mx.array([row_blocks], dtype=mx.int32),
-                mx.array([row_idx, 0]),
-                axes=(0, 1),
-            )
-    return table
+            table[row_idx, : len(row_blocks)] = row_blocks
+    return mx.array(table)
 
 
 def require_model_integrated_paged_attention() -> None:

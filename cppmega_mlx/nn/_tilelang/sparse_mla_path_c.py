@@ -3569,17 +3569,37 @@ def sparse_mla_path_c_metal_apply(
 _sparse_mla_path_c_metal_apply_any = cast(Any, sparse_mla_path_c_metal_apply)
 
 
+def _reference_sparse_mla_vjp(
+    q: mx.array,
+    kv: mx.array,
+    indices: mx.array,
+    cotangent: mx.array,
+    *,
+    sm_scale: float | None = None,
+    d_v: int | None = None,
+) -> tuple[mx.array, mx.array, mx.array]:
+    def _reference_apply(q_: mx.array, kv_: mx.array) -> mx.array:
+        return sparse_mla_attention_reference(
+            q_,
+            kv_,
+            indices,
+            sm_scale=sm_scale,
+            d_v=d_v,
+        )
+
+    _output, vjps = mx.vjp(_reference_apply, [q, kv], [cotangent])
+    return (vjps[0], vjps[1], mx.zeros_like(indices))
+
+
 @_sparse_mla_path_c_metal_apply_any.vjp
 def _sparse_mla_path_c_metal_apply_vjp(primals, cotangent, output):
     del output
     q, kv, indices = primals
+    if q.dtype != mx.float16 or kv.dtype != mx.float16 or cotangent.dtype != mx.float16:
+        return _reference_sparse_mla_vjp(q, kv, indices, cotangent)
     grads = sparse_mla_bwd_path_c(q, kv, cotangent, indices)
     if grads is None:
-        def _reference_apply(q_, kv_):
-            return sparse_mla_attention_reference(q_, kv_, indices)
-
-        _, vjps = mx.vjp(_reference_apply, [q, kv], [cotangent])
-        return (vjps[0], vjps[1], mx.zeros_like(indices))
+        return _reference_sparse_mla_vjp(q, kv, indices, cotangent)
     dq, dkv = grads
     return (dq.astype(q.dtype), dkv.astype(kv.dtype), mx.zeros_like(indices))
 
@@ -3605,6 +3625,15 @@ def _sparse_mla_path_c_apply_for_params(sm_scale: float, d_v: int) -> Any:
     def _apply_vjp(primals, cotangent, output):
         del output
         q, kv, indices = primals
+        if q.dtype != mx.float16 or kv.dtype != mx.float16 or cotangent.dtype != mx.float16:
+            return _reference_sparse_mla_vjp(
+                q,
+                kv,
+                indices,
+                cotangent,
+                sm_scale=sm_scale,
+                d_v=d_v,
+            )
         grads = sparse_mla_bwd_path_c(
             q,
             kv,
@@ -3614,17 +3643,14 @@ def _sparse_mla_path_c_apply_for_params(sm_scale: float, d_v: int) -> Any:
             d_v=d_v,
         )
         if grads is None:
-            def _reference_apply(q_, kv_):
-                return sparse_mla_attention_reference(
-                    q_,
-                    kv_,
-                    indices,
-                    sm_scale=sm_scale,
-                    d_v=d_v,
-                )
-
-            _, vjps = mx.vjp(_reference_apply, [q, kv], [cotangent])
-            return (vjps[0], vjps[1], mx.zeros_like(indices))
+            return _reference_sparse_mla_vjp(
+                q,
+                kv,
+                indices,
+                cotangent,
+                sm_scale=sm_scale,
+                d_v=d_v,
+            )
         dq, dkv = grads
         return (dq.astype(q.dtype), dkv.astype(kv.dtype), mx.zeros_like(indices))
 

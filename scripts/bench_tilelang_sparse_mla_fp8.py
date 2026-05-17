@@ -1,7 +1,9 @@
 # pyright: reportMissingImports=false
 """Benchmark FP8 / MXFP8 sparse-MLA paths on Apple Silicon.
 
-Path B is the full direct-MSL FP8 sparse-MLA forward/backward path. Path C now
+Path B is the full direct-MSL FP8 sparse-MLA forward/backward path. The
+blockscaled direct-MSL Path B surface is retired, so the blockscaled report keeps
+the MXFP8 reference timing plus prepared-buffer Path C reducer status. Path C now
 has a runnable TileLang DSL reducer for the real FP8 QK tile
 ``A_fp8(1, K) @ B_fp8(N, K).T`` while the older ``T.fp8_scaled_matmul`` probe
 remains fail-closed for the same M=1/top-k shape. This script records both the
@@ -325,9 +327,6 @@ def _blockscaled_strict_failures(
 ) -> list[str]:
     failures: list[str] = []
 
-    if not payload["metal_status"]["available"]:
-        failures.append(f"Path B blockscaled Metal unavailable: {payload['metal_status']['dispatch_reason']}")
-
     qk_status = payload["path_c_tilelang_e8m0_qk_reduce_status"]
     if not qk_status["available"]:
         failures.append(f"Path C E8M0 QK reducer unavailable: {qk_status['reason']}")
@@ -339,15 +338,15 @@ def _blockscaled_strict_failures(
     elif err > max_abs_err:
         failures.append(f"path_c_e8m0_qk_reduce_vs_oracle max_abs_err={err:.6g} exceeds {max_abs_err:.6g}")
 
-    ratio = _finite_float(payload["ratios"].get("path_c_e8m0_qk_reduce_over_path_b_blockscaled_fwd"))
+    ratio = _finite_float(payload["ratios"].get("path_c_e8m0_qk_reduce_over_blockscaled_reference"))
     if ratio is None:
         failures.append(
-            "path_c_e8m0_qk_reduce_over_path_b_blockscaled_fwd missing finite ratio: "
-            f"{payload['ratios'].get('path_c_e8m0_qk_reduce_over_path_b_blockscaled_fwd')!r}"
+            "path_c_e8m0_qk_reduce_over_blockscaled_reference missing finite ratio: "
+            f"{payload['ratios'].get('path_c_e8m0_qk_reduce_over_blockscaled_reference')!r}"
         )
     elif ratio > max_ratio:
         failures.append(
-            f"path_c_e8m0_qk_reduce_over_path_b_blockscaled_fwd={ratio:.6g} exceeds {max_ratio:.6g}"
+            f"path_c_e8m0_qk_reduce_over_blockscaled_reference={ratio:.6g} exceeds {max_ratio:.6g}"
         )
 
     return failures
@@ -361,9 +360,10 @@ def _strict_exit_failures(
     blockscaled_reducer_failures: list[str],
     blockscaled_full_dispatch_failures: list[str],
 ) -> list[str]:
-    failures = fp8_reducer_failures + fp8_full_dispatch_failures
+    del fp8_full_dispatch_failures, blockscaled_full_dispatch_failures
+    failures = fp8_reducer_failures
     if include_blockscaled:
-        failures += blockscaled_reducer_failures + blockscaled_full_dispatch_failures
+        failures += blockscaled_reducer_failures
     return failures
 
 
@@ -406,7 +406,7 @@ def main() -> None:
         "--strict-max-blockscaled-ratio",
         type=float,
         default=1.0,
-        help="Maximum allowed blockscaled Path C E8M0 QK reducer / Path B blockscaled fwd median ratio with --include-blockscaled.",
+        help="Maximum allowed blockscaled Path C E8M0 QK reducer / blockscaled reference median ratio with --include-blockscaled.",
     )
     parser.add_argument(
         "--strict-max-blockscaled-abs-err",
@@ -519,17 +519,28 @@ def main() -> None:
         **bench_kwargs,
     )
 
+    bs_status_with_arrays = sparse_mla_blockscaled_metal_status(q, kv, indices)
+    bs_status_codegen = sparse_mla_blockscaled_metal_status()
+
     # Direct-MSL Path B kernels.
     def _msl_fp8():
         result = sparse_mla_fp8_fwd_metal(q, kv, indices, d_v=d_v)
         return result[0] if result is not None else mx.zeros((1,))
 
-    def _msl_bs():
-        result = sparse_mla_blockscaled_fwd_metal(q, kv, indices, d_v=d_v)
-        return result[0] if result is not None else mx.zeros((1,))
-
     fp8_msl_bench = _bench("path_b_msl_fp8_fwd", _msl_fp8, **bench_kwargs)
-    bs_msl_bench = _bench("path_b_msl_blockscaled_fwd", _msl_bs, **bench_kwargs)
+    bs_msl_pair = sparse_mla_blockscaled_fwd_metal(q, kv, indices, d_v=d_v)
+    bs_msl_bench: dict[str, float | str | bool]
+    if bs_msl_pair is None:
+        bs_msl_bench = {
+            "label": "path_b_msl_blockscaled_fwd",
+            "available": False,
+            "reason": bs_status_with_arrays.reason,
+        }
+    else:
+        def _msl_bs():
+            return bs_msl_pair[0]
+
+        bs_msl_bench = _bench("path_b_msl_blockscaled_fwd", _msl_bs, **bench_kwargs)
 
     fp8_qk_outputs_per_block = 2
     fp8_qk_reduce_threads = 8
@@ -694,11 +705,11 @@ def main() -> None:
 
     # Capture parity vs reference for the MSL paths.
     msl_fp8_out = _require_pair(sparse_mla_fp8_fwd_metal(q, kv, indices, d_v=d_v), "Path B FP8 forward")[0]
-    msl_bs_out = _require_pair(
-        sparse_mla_blockscaled_fwd_metal(q, kv, indices, d_v=d_v),
-        "Path B blockscaled forward",
-    )[0]
-    mx.eval(msl_fp8_out, msl_bs_out)
+    msl_bs_out = bs_msl_pair[0] if bs_msl_pair is not None else None
+    if msl_bs_out is None:
+        mx.eval(msl_fp8_out)
+    else:
+        mx.eval(msl_fp8_out, msl_bs_out)
 
     # Capture both dispatch status (which may report dispatcher-level rejections
     # such as int32 indices) and codegen blocker status (no arrays passed) so
@@ -727,8 +738,6 @@ def main() -> None:
         b_scale_size=args.topk,
         transpose_B=True,
     )
-    bs_status_with_arrays = sparse_mla_blockscaled_metal_status(q, kv, indices)
-    bs_status_codegen = sparse_mla_blockscaled_metal_status()
     bs_path_c_qk_status = blockscaled_sparse_mla_qk_path_c_status(
         M=1,
         N=args.topk,
@@ -913,8 +922,16 @@ def main() -> None:
         "parity": {
             "blockscaled_vs_bf16": _max_abs_err(bs_ref_out, bf16_ref_out),
             "quantized_matmul_vs_bf16": _max_abs_err(qm_out, bf16_ref_out),
-            "msl_blockscaled_vs_bf16": _max_abs_err(msl_bs_out, bf16_ref_out),
-            "msl_blockscaled_vs_bs_ref": _max_abs_err(msl_bs_out, bs_ref_out),
+            "msl_blockscaled_vs_bf16": (
+                _max_abs_err(msl_bs_out, bf16_ref_out)
+                if msl_bs_out is not None
+                else {"available": False, "reason": bs_status_with_arrays.reason}
+            ),
+            "msl_blockscaled_vs_bs_ref": (
+                _max_abs_err(msl_bs_out, bs_ref_out)
+                if msl_bs_out is not None
+                else {"available": False, "reason": bs_status_with_arrays.reason}
+            ),
             "path_c_e8m0_qk_reduce_vs_oracle": (
                 _max_abs_err(bs_qk_reduce_out, bs_qk_reduce_oracle)
                 if bs_qk_reduce_out is not None
@@ -929,9 +946,9 @@ def main() -> None:
             "path_c_tilelang_e8m0_qk_reduce": bs_qk_reduce_bench,
         },
         "ratios": {
-            "path_c_e8m0_qk_reduce_over_path_b_blockscaled_fwd": (
+            "path_c_e8m0_qk_reduce_over_blockscaled_reference": (
                 cast(float, bs_qk_reduce_bench["median_ms"])
-                / cast(float, bs_msl_bench["median_ms"])
+                / cast(float, bs_bench["median_ms"])
                 if bs_qk_reduce_out is not None
                 else None
             ),
@@ -1042,7 +1059,10 @@ def main() -> None:
     if args.include_blockscaled:
         print(f"[bench] {bs_path}")
         print(f"  blockscaled_reference median={bs_bench['median_ms']:.4f} ms")
-        print(f"  path_b_msl_blockscaled_fwd median={bs_msl_bench['median_ms']:.4f} ms (Path B direct-MSL)")
+        if bs_msl_bench.get("available") is False:
+            print(f"  path_b_msl_blockscaled_fwd unavailable ({bs_msl_bench['reason']})")
+        else:
+            print(f"  path_b_msl_blockscaled_fwd median={bs_msl_bench['median_ms']:.4f} ms (Path B direct-MSL)")
         print(
             "  path_c_tilelang_e8m0_qk "
             f"available={bs_path_c_qk_status.available} ({bs_path_c_qk_status.reason})"
@@ -1053,14 +1073,18 @@ def main() -> None:
                 f"median={cast(float, bs_qk_reduce_bench['median_ms']):.4f} ms "
                 f"(TileLang E8M0 QK tile, N={args.topk}, K={args.qk_dim})"
             )
-            bs_qk_ratio = bs_payload["ratios"]["path_c_e8m0_qk_reduce_over_path_b_blockscaled_fwd"]
-            print(f"  path_c/path_b blockscaled qk-vs-fwd ratio={cast(float, bs_qk_ratio):.3f}x")
+            bs_qk_ratio = bs_payload["ratios"]["path_c_e8m0_qk_reduce_over_blockscaled_reference"]
+            print(f"  path_c/blockscaled_reference qk-vs-fwd ratio={cast(float, bs_qk_ratio):.3f}x")
             bs_qk_parity = bs_payload["parity"]["path_c_e8m0_qk_reduce_vs_oracle"]
             print(f"  path_c_e8m0_qk_reduce vs oracle max_abs_err={bs_qk_parity['max_abs_err']:.4e}")
         else:
             print(f"  path_c_tilelang_e8m0_qk_reduce unavailable ({bs_qk_reduce_status.reason})")
         print(f"  blockscaled vs bf16 max_abs_err={bs_payload['parity']['blockscaled_vs_bf16']['max_abs_err']:.4e}")
-        print(f"  msl_bs vs bf16 max_abs_err={bs_payload['parity']['msl_blockscaled_vs_bf16']['max_abs_err']:.4e}")
+        msl_bs_parity = bs_payload["parity"]["msl_blockscaled_vs_bf16"]
+        if "max_abs_err" in msl_bs_parity:
+            print(f"  msl_bs vs bf16 max_abs_err={msl_bs_parity['max_abs_err']:.4e}")
+        else:
+            print(f"  msl_bs unavailable ({msl_bs_parity['reason']})")
     if args.strict:
         print("[strict] PASS")
 

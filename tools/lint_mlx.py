@@ -12,52 +12,15 @@ import re
 
 _PYTHON_SUFFIX = ".py"
 _DIRECT_MSL_LEGACY_DEBUG_ALLOWLIST: dict[tuple[str, ...], dict[str, object]] = {
-    ("cppmega_mlx", "nn", "_tilelang", "fp8_msl_kernels.py"): {
-        "kind": "legacy_path_b_baseline",
-        "reason": "Path B FP8 direct-MSL oracle while TileLang Path C owner-output routes are rolled out.",
-        "replacement": "cppmega_mlx/nn/_tilelang/fp8_vecmat_path_c.py and fp8_matmul_path_c.py",
-        "reduction_surface": ["simd_sum"],
-        "public_partial_outputs": [],
-    },
-    ("cppmega_mlx", "nn", "_tilelang", "m2rnn.py"): {
-        "kind": "legacy_path_b_baseline",
-        "reason": "Path B M2RNN fallback until all production shapes have Path C receipts.",
-        "replacement": "cppmega_mlx/nn/_tilelang/m2rnn_path_c.py",
-        "reduction_surface": ["threadgroup_internal_partial"],
-        "public_partial_outputs": [],
-    },
     ("cppmega_mlx", "nn", "_tilelang", "mamba3.py"): {
         "kind": "legacy_path_b_fallback",
-        "reason": "Path C Mamba3 bwd is finite but slower on the checked-in receipt, so AUTO keeps Path B.",
+        "reason": (
+            "Path C Mamba3 bwd is finite but slower on the checked-in receipt, "
+            "so AUTO keeps Path B; Path B bwd writes final owner-output "
+            "gradients with direct-MSL atomic adds instead of public P-axis buffers."
+        ),
         "replacement": "cppmega_mlx/nn/_tilelang/mamba3_path_c.py",
-        "reduction_surface": ["p_axis_public_partials", "host_sum"],
-        "public_partial_outputs": [
-            "dB_partial",
-            "dC_partial",
-            "dA_partial",
-            "ddt_partial",
-            "dD_partial",
-        ],
-    },
-    ("cppmega_mlx", "nn", "_tilelang", "sparse_mla.py"): {
-        "kind": "legacy_path_b_baseline",
-        "reason": "Path B sparse MLA baseline retained while dispatch/perf receipts transition to Path C.",
-        "replacement": "cppmega_mlx/nn/_tilelang/sparse_mla_path_c.py",
-        "reduction_surface": ["dkv_partial", "host_scatter_reduce"],
-        "public_partial_outputs": ["dkv_partial"],
-    },
-    ("cppmega_mlx", "nn", "_tilelang", "sparse_mla_blockscaled.py"): {
-        "kind": "legacy_path_b_baseline",
-        "reason": "Blockscaled sparse MLA still has direct-MSL fallback while Path C blockscaled routes mature.",
-        "replacement": "cppmega_mlx/nn/_tilelang/sparse_mla_blockscaled_path_c.py",
-        "reduction_surface": ["dkv_partial", "host_scatter_reduce"],
-        "public_partial_outputs": ["dkv_partial"],
-    },
-    ("cppmega_mlx", "nn", "_tilelang", "topk_selector.py"): {
-        "kind": "legacy_debug_baseline",
-        "reason": "Debug/Path B top-k selector baseline; new production paths must use TileLang/TVM-FFI.",
-        "replacement": "TileLang top-k selector Path C route",
-        "reduction_surface": [],
+        "reduction_surface": ["atomic_owner_output_p_axis"],
         "public_partial_outputs": [],
     },
 }
@@ -103,6 +66,25 @@ _FORBIDDEN_NATIVE_TVM_FFI_MODULES = {
     "tilelang.contrib.mlx_tvm_ffi",
     "tilelang.jit.adapter._mlx_tvm_ffi",
 }
+_FRAMEWORK_OWNED_BACKEND_PATH_TAILS = {
+    ("cppmega_mlx", "kernels"),
+    ("cppmega_mlx", "nn", "_tilelang"),
+}
+_MODEL_BACKEND_INTRINSIC_NAMES = {
+    "simd_shuffle",
+    "simd_shuffle_down",
+    "simd_sum",
+}
+_MODEL_BACKEND_INTRINSIC_TEXT = re.compile(
+    r"\b(?:tir\.(?:cuda|metal)|simd_(?:shuffle(?:_down)?|sum))\b"
+)
+_PUBLIC_PARTIAL_OUTPUT_RE = re.compile(r"\b[A-Za-z]\w*_partial\b")
+_PUBLIC_OUTPUT_SURFACE_NAMES = {
+    "output_names",
+    "outputs",
+    "public_outputs",
+    "result_names",
+}
 
 
 @dataclass(frozen=True)
@@ -133,6 +115,9 @@ class _MlxLintVisitor(ast.NodeVisitor):
         self._monkeypatch_aliases: set[str] = {"monkeypatch"}
         self._mock_patch_names: set[str] = set()
         self._metal_kernel_lines: list[int] = []
+        self._function_stack: list[str] = []
+        self._model_backend_intrinsic_findings: set[tuple[int, str]] = set()
+        self._public_partial_output_findings: set[tuple[int, str]] = set()
         self._uses_autodiff = False
         self._uses_custom_function = False
         self._defines_custom_gradient = False
@@ -193,6 +178,14 @@ class _MlxLintVisitor(ast.NodeVisitor):
                     self._msl_dispatch_names.add(imported_name)
             elif node.module == "importlib" and alias.name == "import_module":
                 self._import_module_names.add(imported_name)
+            if (
+                self._is_model_level_backend_intrinsic_disallowed_module()
+                and (
+                    alias.name in _MODEL_BACKEND_INTRINSIC_NAMES
+                    or node.module in {"tir.cuda", "tir.metal"}
+                )
+            ):
+                self._add_model_backend_intrinsic_finding(node.lineno, alias.name)
             if self._is_production_module() and (
                 node.module == "pytest"
                 or node.module == "unittest.mock"
@@ -215,15 +208,26 @@ class _MlxLintVisitor(ast.NodeVisitor):
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self._check_monkeypatch_args(node)
+        self._check_public_partial_function_name(node.name, node.lineno)
         self._visit_decorators(node.decorator_list)
-        self.generic_visit(node)
+        self._function_stack.append(node.name)
+        try:
+            self.generic_visit(node)
+        finally:
+            self._function_stack.pop()
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
         self._check_monkeypatch_args(node)
+        self._check_public_partial_function_name(node.name, node.lineno)
         self._visit_decorators(node.decorator_list)
-        self.generic_visit(node)
+        self._function_stack.append(node.name)
+        try:
+            self.generic_visit(node)
+        finally:
+            self._function_stack.pop()
 
     def visit_Call(self, node: ast.Call) -> None:
+        self._check_public_partial_call_outputs(node)
         if self._is_mlx_array_call(node) and self._has_unsafe_scalar_literal_arg(node):
             self.findings.append(
                 Finding(
@@ -274,11 +278,57 @@ class _MlxLintVisitor(ast.NodeVisitor):
 
     def visit_Assign(self, node: ast.Assign) -> None:
         self._check_timing_assignment(node.targets, node.value, node.lineno)
+        self._check_public_partial_assignment(node.targets, node.value, node.lineno)
         self.generic_visit(node)
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
         if node.value is not None:
             self._check_timing_assignment([node.target], node.value, node.lineno)
+            self._check_public_partial_assignment([node.target], node.value, node.lineno)
+        self.generic_visit(node)
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        if self._is_model_level_backend_intrinsic_disallowed_module():
+            chain = _attribute_chain(node)
+            if chain in {("tir", "cuda"), ("tir", "metal")}:
+                self._add_model_backend_intrinsic_finding(node.lineno, ".".join(chain))
+        self.generic_visit(node)
+
+    def visit_Constant(self, node: ast.Constant) -> None:
+        if (
+            self._is_model_level_backend_intrinsic_disallowed_module()
+            and isinstance(node.value, str)
+        ):
+            for match in _MODEL_BACKEND_INTRINSIC_TEXT.finditer(node.value):
+                self._add_model_backend_intrinsic_finding(node.lineno, match.group(0))
+        self.generic_visit(node)
+
+    def visit_Dict(self, node: ast.Dict) -> None:
+        for key, value in zip(node.keys, node.values, strict=False):
+            if (
+                isinstance(key, ast.Constant)
+                and isinstance(key.value, str)
+                and key.value in _PUBLIC_OUTPUT_SURFACE_NAMES
+            ):
+                self._check_public_partial_value(value, node.lineno)
+        self.generic_visit(node)
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if (
+            self._is_model_level_backend_intrinsic_disallowed_module()
+            and node.id in _MODEL_BACKEND_INTRINSIC_NAMES
+        ):
+            self._add_model_backend_intrinsic_finding(node.lineno, node.id)
+        self.generic_visit(node)
+
+    def visit_Return(self, node: ast.Return) -> None:
+        if (
+            self._is_production_module()
+            and self._is_current_function_public()
+            and node.value is not None
+        ):
+            for token in _public_return_partial_tokens(node.value):
+                self._add_public_partial_output_finding(node.lineno, token)
         self.generic_visit(node)
 
     def finalize(self) -> None:
@@ -392,6 +442,15 @@ class _MlxLintVisitor(ast.NodeVisitor):
     def _is_production_module(self) -> bool:
         return "cppmega_mlx" in self._path.parts
 
+    def _is_framework_owned_backend_module(self) -> bool:
+        return _path_contains_any_tail(self._path, _FRAMEWORK_OWNED_BACKEND_PATH_TAILS)
+
+    def _is_model_level_backend_intrinsic_disallowed_module(self) -> bool:
+        return self._is_production_module() and not self._is_framework_owned_backend_module()
+
+    def _is_current_function_public(self) -> bool:
+        return bool(self._function_stack) and not self._function_stack[-1].startswith("_")
+
     @staticmethod
     def _is_forbidden_native_tvm_ffi_module(module: str | None) -> bool:
         if module is None:
@@ -476,6 +535,76 @@ class _MlxLintVisitor(ast.NodeVisitor):
             )
         )
 
+    def _add_model_backend_intrinsic_finding(self, line: int, token: str) -> None:
+        key = (line, token)
+        if key in self._model_backend_intrinsic_findings:
+            return
+        self._model_backend_intrinsic_findings.add(key)
+        self.findings.append(
+            Finding(
+                self._path,
+                line,
+                "MLX008",
+                f"model-level production code must not own backend intrinsic "
+                f"{token!r}; route lowering through framework-owned TileLang "
+                "adapters instead",
+            )
+        )
+
+    def _add_public_partial_output_finding(self, line: int, token: str) -> None:
+        allowed = set(self._allowed_public_partial_outputs())
+        if token in allowed:
+            return
+        key = (line, token)
+        if key in self._public_partial_output_findings:
+            return
+        self._public_partial_output_findings.add(key)
+        self.findings.append(
+            Finding(
+                self._path,
+                line,
+                "MLX009",
+                f"production APIs must not expose public partial output "
+                f"{token!r}; keep reductions internal and return final owner "
+                "outputs",
+            )
+        )
+
+    def _allowed_public_partial_outputs(self) -> Iterable[str]:
+        for path_tail, metadata in _DIRECT_MSL_LEGACY_DEBUG_ALLOWLIST.items():
+            if _path_matches_tail(self._path, path_tail):
+                public_outputs = metadata.get("public_partial_outputs", [])
+                if isinstance(public_outputs, list):
+                    return [value for value in public_outputs if isinstance(value, str)]
+        return []
+
+    def _check_public_partial_function_name(self, name: str, line: int) -> None:
+        if self._is_production_module() and not name.startswith("_") and "_partial" in name:
+            self._add_public_partial_output_finding(line, name)
+
+    def _check_public_partial_call_outputs(self, node: ast.Call) -> None:
+        if not self._is_production_module():
+            return
+        for keyword in node.keywords:
+            if keyword.arg in _PUBLIC_OUTPUT_SURFACE_NAMES:
+                self._check_public_partial_value(keyword.value, node.lineno)
+
+    def _check_public_partial_assignment(
+        self,
+        targets: Iterable[ast.expr],
+        value: ast.expr,
+        line: int,
+    ) -> None:
+        if not self._is_production_module():
+            return
+        assigned_names = {name for target in targets for name in _target_names(target)}
+        if assigned_names & _PUBLIC_OUTPUT_SURFACE_NAMES:
+            self._check_public_partial_value(value, line)
+
+    def _check_public_partial_value(self, node: ast.AST, line: int) -> None:
+        for token in _partial_output_tokens(node):
+            self._add_public_partial_output_finding(line, token)
+
     def _check_timing_assignment(
         self,
         targets: Iterable[ast.expr],
@@ -552,6 +681,54 @@ def _path_matches_tail(path: Path, tail: tuple[str, ...]) -> bool:
 
 def _path_matches_any_tail(path: Path, tails: Iterable[tuple[str, ...]]) -> bool:
     return any(_path_matches_tail(path, tail) for tail in tails)
+
+
+def _path_contains_tail(path: Path, tail: tuple[str, ...]) -> bool:
+    if len(path.parts) < len(tail):
+        return False
+    return any(
+        path.parts[index : index + len(tail)] == tail
+        for index in range(len(path.parts) - len(tail) + 1)
+    )
+
+
+def _path_contains_any_tail(path: Path, tails: Iterable[tuple[str, ...]]) -> bool:
+    return any(_path_contains_tail(path, tail) for tail in tails)
+
+
+def _partial_output_tokens(node: ast.AST) -> set[str]:
+    tokens: set[str] = set()
+    for child in ast.walk(node):
+        if isinstance(child, ast.Name):
+            if _PUBLIC_PARTIAL_OUTPUT_RE.fullmatch(child.id):
+                tokens.add(child.id)
+        elif isinstance(child, ast.Attribute):
+            if _PUBLIC_PARTIAL_OUTPUT_RE.fullmatch(child.attr):
+                tokens.add(child.attr)
+        elif isinstance(child, ast.Constant) and isinstance(child.value, str):
+            tokens.update(_PUBLIC_PARTIAL_OUTPUT_RE.findall(child.value))
+    return tokens
+
+
+def _public_return_partial_tokens(node: ast.AST) -> set[str]:
+    tokens: set[str] = set()
+    if isinstance(node, ast.Name):
+        if _PUBLIC_PARTIAL_OUTPUT_RE.fullmatch(node.id):
+            tokens.add(node.id)
+    elif isinstance(node, ast.Attribute):
+        if _PUBLIC_PARTIAL_OUTPUT_RE.fullmatch(node.attr):
+            tokens.add(node.attr)
+    elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+        tokens.update(_PUBLIC_PARTIAL_OUTPUT_RE.findall(node.value))
+    elif isinstance(node, ast.Tuple | ast.List | ast.Set):
+        for item in node.elts:
+            tokens.update(_public_return_partial_tokens(item))
+    elif isinstance(node, ast.Dict):
+        for key, value in zip(node.keys, node.values, strict=False):
+            if key is not None:
+                tokens.update(_public_return_partial_tokens(key))
+            tokens.update(_public_return_partial_tokens(value))
+    return tokens
 
 
 def _iter_python_files(paths: Iterable[Path]) -> Iterable[Path]:

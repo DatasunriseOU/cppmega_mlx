@@ -10,6 +10,7 @@ Coverage:
 from __future__ import annotations
 
 import importlib
+import inspect
 
 from typing import cast
 
@@ -90,6 +91,34 @@ def test_compute_dacs_segsum_matches_reverse_segment_sum() -> None:
                 seg = float(decay[b, t + 1 :, h].sum()) if t + 1 < seq else 0.0
                 expected[b, t, h, :] = dh_np[b, t, h, :] * np.exp(seg)
     np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-5)
+
+
+def test_compute_dacs_segsum_repeatable_with_reverse_cumsum() -> None:
+    batch, seq, heads = 2, 8, 3
+    rng = np.random.default_rng(11)
+    A_np = -rng.uniform(0.0, 0.1, size=(batch, seq, heads)).astype(np.float32)
+    dt_np = rng.uniform(0.01, 0.05, size=(batch, seq, heads)).astype(np.float32)
+    dh_np = rng.standard_normal((batch, seq, heads, 4)).astype(np.float32)
+    A = mx.array(A_np)
+    dt = mx.array(dt_np)
+    dh = mx.array(dh_np)
+    mx.eval(A, dt, dh)
+
+    decay = A_np * dt_np
+    expected = np.zeros_like(dh_np)
+    for b in range(batch):
+        for h in range(heads):
+            for t in range(seq):
+                seg = float(decay[b, t + 1 :, h].sum()) if t + 1 < seq else 0.0
+                expected[b, t, h, :] = dh_np[b, t, h, :] * np.exp(seg)
+
+    for _ in range(6):
+        np.testing.assert_allclose(
+            _np(compute_dacs_segsum(A, dt, dh)),
+            expected,
+            rtol=1e-4,
+            atol=1e-5,
+        )
 
 
 def test_compute_dacs_segsum_handles_empty_trailing_dim() -> None:
@@ -174,6 +203,22 @@ def test_legacy_mamba3_blocker_points_to_native_tvm_ffi_route() -> None:
     assert "no safe inverse transform" in mod.__doc__
     assert 'execution_backend="tvm_ffi"' in mod.__doc__
     assert "legacy direct-MSL fallback" in mod.__doc__
+
+
+def test_legacy_mamba3_bwd_source_uses_final_owner_outputs() -> None:
+    mod = importlib.import_module("cppmega_mlx.nn._tilelang.mamba3")
+    source = inspect.getsource(mod)
+
+    assert "&dB[bc_idx + n]" in mod._BWD_KERNEL_SOURCE
+    assert '"dB_partial"' not in mod._BWD_KERNEL_SOURCE
+    assert "dB_partial" not in mod._BWD_KERNEL_SOURCE
+    assert "dC_partial" not in mod._BWD_KERNEL_SOURCE
+    assert "dA_partial" not in mod._BWD_KERNEL_SOURCE
+    assert "ddt_partial" not in mod._BWD_KERNEL_SOURCE
+    assert "dD_partial" not in mod._BWD_KERNEL_SOURCE
+    assert "cppmega_atomic_add_float" in source
+    assert "init_value=0" in source
+    assert "atomic_outputs=True" not in source
 
 
 def test_fwd_metal_matches_reference_at_fp32() -> None:

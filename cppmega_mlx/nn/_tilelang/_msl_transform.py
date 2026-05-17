@@ -330,6 +330,7 @@ def dispatch(
     threadgroup: tuple[int, int, int] | None = None,
     lowering: TileLangMSLLowering | None = None,
     template: Sequence[tuple[str, object]] | None = None,
+    init_value: int | float | None = None,
 ) -> list[mx.array]:
     """Dispatch a legacy MLX fast Metal kernel.
 
@@ -358,46 +359,71 @@ def dispatch(
         )
     if any(isinstance(x, mx.array) and x.size == 0 for x in inputs):
         raise MSLDispatchUnsupported("empty tensors must use the pure MLX fallback")
-    if lowering is not None:
-        # fix-round-8 (Wave 3 grok-4): validate caller-supplied input count
-        # against the parsed buffer names from the lowered kernel signature.
-        # ``buffer_param_names`` enumerates *all* device-qualified buffer
-        # parameters (inputs followed by outputs) in TileLang's emission
-        # order; the input count is therefore total - len(output_dtypes).
-        # Without this check, a caller that gets the order wrong silently
-        # passes a wrong tensor as the kernel's i-th input and we get
-        # garbage numerics with no diagnostic.
-        parsed = lowering.buffer_param_names
-        expected_inputs = len(parsed) - len(output_dtypes)
-        if expected_inputs < 0 or len(inputs) != expected_inputs:
-            raise MSLDispatchUnsupported(
-                f"dispatch input count mismatch: got {len(inputs)}, parsed "
-                f"{expected_inputs} input buffer names from lowering "
-                f"(params={parsed}, output_dtypes={list(output_dtypes)})"
-            )
-        launch_grid = metal_grid_for_lowering(lowering)
-        launch_threadgroup = lowering.threadgroup
-        if grid is not None and grid != launch_grid:
-            raise ValueError(f"conflicting dispatch grid: got {grid}, expected {launch_grid}")
-        if threadgroup is not None and threadgroup != launch_threadgroup:
-            raise ValueError(
-                "conflicting dispatch threadgroup: "
-                f"got {threadgroup}, expected {launch_threadgroup}"
-            )
-    elif grid is None or threadgroup is None:
-        raise ValueError("dispatch requires either lowering=... or both grid=... and threadgroup=...")
-    else:
-        launch_grid = grid
-        launch_threadgroup = threadgroup
-    return kernel(
-        inputs=list(inputs),
-        template=list(template) if template else None,
-        grid=launch_grid,
-        threadgroup=launch_threadgroup,
-        output_shapes=[tuple(shape) for shape in output_shapes],
-        output_dtypes=list(output_dtypes),
-        stream=mx.gpu,
+    launch_grid, launch_threadgroup = _resolve_dispatch_launch_shape(
+        input_count=len(inputs),
+        output_count=len(output_dtypes),
+        grid=grid,
+        threadgroup=threadgroup,
+        lowering=lowering,
     )
+    kwargs: dict[str, Any] = {
+        "inputs": list(inputs),
+        "template": list(template) if template else None,
+        "grid": launch_grid,
+        "threadgroup": launch_threadgroup,
+        "output_shapes": [tuple(shape) for shape in output_shapes],
+        "output_dtypes": list(output_dtypes),
+        "stream": mx.gpu,
+    }
+    if init_value is not None:
+        kwargs["init_value"] = init_value
+    return kernel(**kwargs)
+
+
+def _resolve_dispatch_launch_shape(
+    *,
+    input_count: int,
+    output_count: int,
+    grid: tuple[int, int, int] | None = None,
+    threadgroup: tuple[int, int, int] | None = None,
+    lowering: TileLangMSLLowering | None = None,
+) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+    """Resolve the launch shape for a legacy direct-MSL dispatch.
+
+    Kept pure so tests can cover the guardrail without constructing or calling
+    an ``mx.fast.metal_kernel`` wrapper.
+    """
+
+    if lowering is None:
+        if grid is None or threadgroup is None:
+            raise ValueError(
+                "dispatch requires either lowering=... or both grid=... and threadgroup=..."
+            )
+        return grid, threadgroup
+
+    # fix-round-8 (Wave 3 grok-4): validate caller-supplied input count
+    # against the parsed buffer names from the lowered kernel signature.
+    # ``buffer_param_names`` enumerates *all* device-qualified buffer
+    # parameters (inputs followed by outputs) in TileLang's emission order.
+    parsed = lowering.buffer_param_names
+    expected_inputs = len(parsed) - output_count
+    if expected_inputs < 0 or input_count != expected_inputs:
+        raise MSLDispatchUnsupported(
+            f"dispatch input count mismatch: got {input_count}, parsed "
+            f"{expected_inputs} input buffer names from lowering "
+            f"(params={parsed}, output_dtypes count={output_count})"
+        )
+
+    launch_grid = metal_grid_for_lowering(lowering)
+    launch_threadgroup = lowering.threadgroup
+    if grid is not None and grid != launch_grid:
+        raise ValueError(f"conflicting dispatch grid: got {grid}, expected {launch_grid}")
+    if threadgroup is not None and threadgroup != launch_threadgroup:
+        raise ValueError(
+            "conflicting dispatch threadgroup: "
+            f"got {threadgroup}, expected {launch_threadgroup}"
+        )
+    return launch_grid, launch_threadgroup
 
 
 # ---------------------------------------------------------------------------

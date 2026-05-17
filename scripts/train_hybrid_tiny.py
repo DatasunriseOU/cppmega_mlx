@@ -66,6 +66,7 @@ DTYPES = {
     "bfloat16": mx.bfloat16,
     # Route label used by m04_train_step. Parameters/activations stay bf16
     # until the model graph owns native FP8 producers.
+    "fp8_path_b": mx.bfloat16,
     "fp8_path_c": mx.bfloat16,
 }
 STRUCTURE_MODEL_KWARG_NAMES = (

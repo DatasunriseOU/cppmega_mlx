@@ -457,7 +457,7 @@ def assert_m04_20step_matrix_plan(payload: dict[str, Any]) -> None:
     assert matrix["acceptance_steps"] == 100
     assert matrix["batch_size"] == 1
     assert matrix["seq_len"] == 4096
-    assert matrix["dtype_routes"] == ["bf16", "fp8_path_c", "int8"]
+    assert matrix["dtype_routes"] == ["bf16", "fp8_path_b", "fp8_path_c", "int8"]
     assert matrix["optimizers"] == [
         "adamw",
         "muon",
@@ -490,11 +490,11 @@ def assert_m04_20step_matrix_plan(payload: dict[str, Any]) -> None:
         "real_100step",
     ]
     cases = {case["case_id"]: case for case in matrix["cases"]}
-    assert len(cases) == 18
-    assert len(matrix["real_20step_commands"]) == 18
-    assert len(matrix["real_100step_commands"]) == 18
-    assert len(matrix["dry_run_commands"]) == 18
-    assert len(matrix["smoke_commands"]) == 18
+    assert len(cases) == 24
+    assert len(matrix["real_20step_commands"]) == 24
+    assert len(matrix["real_100step_commands"]) == 24
+    assert len(matrix["dry_run_commands"]) == 24
+    assert len(matrix["smoke_commands"]) == 24
     assert cases["bf16_adamw_20step"]["supported"] is True
     assert "--dtype bfloat16" in cases["bf16_adamw_20step"]["command"]
     assert "--optimizer adamw" in cases["bf16_adamw_20step"]["command"]
@@ -505,6 +505,11 @@ def assert_m04_20step_matrix_plan(payload: dict[str, Any]) -> None:
     assert "--require-loss-decrease" in matrix["real_100step_commands"][0]
     assert cases["bf16_muon_20step"]["supported"] is True
     assert "--optimizer muon" in cases["bf16_muon_20step"]["command"]
+    assert cases["fp8_path_b_muon_adamw_20step"]["supported"] is True
+    assert "--dtype fp8_path_b" in cases["fp8_path_b_muon_adamw_20step"]["command"]
+    assert "--optimizer muon_adamw" in cases[
+        "fp8_path_b_muon_adamw_20step"
+    ]["command"]
     assert cases["fp8_path_c_muon_adamw_20step"]["supported"] is True
     assert "--dtype fp8_path_c" in cases["fp8_path_c_muon_adamw_20step"]["command"]
     assert "--optimizer muon_adamw" in cases[

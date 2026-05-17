@@ -1,173 +1,20 @@
 {
   "schema_version": 1,
   "scope": "local_only",
-  "kernel": "fp8_msl_kernels",
-  "license_notice": "Vendored from AppMana/mps-fp8-for-torch-and-comfyui-python-package (commit a902571e, Apache 2.0) and audiohacking/fp8-mps-metal (commit d4fbd40c, MIT).",
+  "kernel": "fp8_reference_helpers",
+  "license_notice": "Historical direct-MSL sources were vendored from AppMana/mps-fp8-for-torch-and-comfyui-python-package (commit a902571e, Apache 2.0) and audiohacking/fp8-mps-metal (commit d4fbd40c, MIT); current helpers are pure MLX references.",
   "hardware_label": "Davids-Mac-Studio.local",
   "platform": {
     "system": "Darwin",
     "machine": "arm64",
     "python_version": "3.13.12",
-    "mlx_version": "0.31.1"
+    "mlx_version": "0.32.0.dev20260514+d168ca5ca"
   },
   "metal_status": {
-    "available": true,
-    "reason": "Vendored FP8 e4m3fn MSL kernels (LUT-based decode + integer-bit encode) are compiled and ready to dispatch."
+    "available": false,
+    "reason": "FP8 direct-MSL Path B is retired for production cleanup: this module no longer constructs or dispatches vendored Metal kernels. Use fp8_matmul_path_c.py or fp8_vecmat_path_c.py for the TileLang/tvm-ffi owner-output route, or these helpers only as pure-MLX reference oracles."
   },
   "shapes": [
-    {
-      "shape_label": "square_4096",
-      "M": 4096,
-      "N": 4096,
-      "K": 4096,
-      "fp8_input_bytes": 33554432,
-      "fp16_input_bytes": 67108864,
-      "memory_savings_pct": 50.0,
-      "rows": [
-        {
-          "label": "square_4096/half_to_fp8 (A 4096x4096)",
-          "median_ms": 1.1150420177727938,
-          "min_ms": 1.015292014926672,
-          "max_ms": 2.0716250874102116,
-          "iters": 10,
-          "warmup": 3
-        },
-        {
-          "label": "square_4096/fp8_to_half (A 4096x4096)",
-          "median_ms": 0.6388330366462469,
-          "min_ms": 0.5903330165892839,
-          "max_ms": 1.3812498655170202,
-          "iters": 10,
-          "warmup": 3
-        },
-        {
-          "label": "square_4096/fp8_scaled_matmul (4096x4096 @ 4096x4096)",
-          "median_ms": 228.22708287276328,
-          "min_ms": 225.1199579332024,
-          "max_ms": 232.51062515191734,
-          "iters": 10,
-          "warmup": 3
-        },
-        {
-          "label": "square_4096/mx_matmul_fp16 (4096x4096 @ 4096x4096)",
-          "median_ms": 9.78454202413559,
-          "min_ms": 9.542542044073343,
-          "max_ms": 12.967708986252546,
-          "iters": 10,
-          "warmup": 3
-        },
-        {
-          "label": "square_4096/fp8_scaled_vecmat (1x4096 @ 4096x4096)",
-          "median_ms": 0.2628329675644636,
-          "min_ms": 0.181916868314147,
-          "max_ms": 0.43816608376801014,
-          "iters": 10,
-          "warmup": 3
-        }
-      ]
-    },
-    {
-      "shape_label": "tall_skinny",
-      "M": 2048,
-      "N": 512,
-      "K": 4096,
-      "fp8_input_bytes": 10485760,
-      "fp16_input_bytes": 20971520,
-      "memory_savings_pct": 50.0,
-      "rows": [
-        {
-          "label": "tall_skinny/half_to_fp8 (A 2048x4096)",
-          "median_ms": 0.6746661383658648,
-          "min_ms": 0.5720830522477627,
-          "max_ms": 0.9097501169890165,
-          "iters": 10,
-          "warmup": 3
-        },
-        {
-          "label": "tall_skinny/fp8_to_half (A 2048x4096)",
-          "median_ms": 0.42091705836355686,
-          "min_ms": 0.3674591425806284,
-          "max_ms": 0.5260000471025705,
-          "iters": 10,
-          "warmup": 3
-        },
-        {
-          "label": "tall_skinny/fp8_scaled_matmul (2048x4096 @ 4096x512)",
-          "median_ms": 17.41487509571016,
-          "min_ms": 17.076958902180195,
-          "max_ms": 17.594290897250175,
-          "iters": 10,
-          "warmup": 3
-        },
-        {
-          "label": "tall_skinny/mx_matmul_fp16 (2048x4096 @ 4096x512)",
-          "median_ms": 0.8477920200675726,
-          "min_ms": 0.810291850939393,
-          "max_ms": 0.9760840330272913,
-          "iters": 10,
-          "warmup": 3
-        },
-        {
-          "label": "tall_skinny/fp8_scaled_vecmat (1x4096 @ 4096x512)",
-          "median_ms": 0.16604107804596424,
-          "min_ms": 0.1437910832464695,
-          "max_ms": 0.21087494678795338,
-          "iters": 10,
-          "warmup": 3
-        }
-      ]
-    },
-    {
-      "shape_label": "fat_K",
-      "M": 512,
-      "N": 512,
-      "K": 8192,
-      "fp8_input_bytes": 8388608,
-      "fp16_input_bytes": 16777216,
-      "memory_savings_pct": 50.0,
-      "rows": [
-        {
-          "label": "fat_K/half_to_fp8 (A 512x8192)",
-          "median_ms": 0.3708750009536743,
-          "min_ms": 0.34129200503230095,
-          "max_ms": 0.42716716416180134,
-          "iters": 10,
-          "warmup": 3
-        },
-        {
-          "label": "fat_K/fp8_to_half (A 512x8192)",
-          "median_ms": 0.30683400109410286,
-          "min_ms": 0.2810410223901272,
-          "max_ms": 0.6989999674260616,
-          "iters": 10,
-          "warmup": 3
-        },
-        {
-          "label": "fat_K/fp8_scaled_matmul (512x8192 @ 8192x512)",
-          "median_ms": 8.045291993767023,
-          "min_ms": 7.845416897907853,
-          "max_ms": 8.394957985728979,
-          "iters": 10,
-          "warmup": 3
-        },
-        {
-          "label": "fat_K/mx_matmul_fp16 (512x8192 @ 8192x512)",
-          "median_ms": 0.5070420447736979,
-          "min_ms": 0.4676659591495991,
-          "max_ms": 0.6057089194655418,
-          "iters": 10,
-          "warmup": 3
-        },
-        {
-          "label": "fat_K/fp8_scaled_vecmat (1x8192 @ 8192x512)",
-          "median_ms": 0.17433403991162777,
-          "min_ms": 0.15616579912602901,
-          "max_ms": 0.2648751251399517,
-          "iters": 10,
-          "warmup": 3
-        }
-      ]
-    },
     {
       "shape_label": "tiny_smoke",
       "M": 64,
@@ -179,43 +26,43 @@
       "rows": [
         {
           "label": "tiny_smoke/half_to_fp8 (A 64x128)",
-          "median_ms": 0.15249988064169884,
-          "min_ms": 0.12258300557732582,
-          "max_ms": 0.3139160107821226,
-          "iters": 10,
-          "warmup": 3
+          "median_ms": 0.1433750003343448,
+          "min_ms": 0.14179099525790662,
+          "max_ms": 0.16500000492669642,
+          "iters": 5,
+          "warmup": 2
         },
         {
           "label": "tiny_smoke/fp8_to_half (A 64x128)",
-          "median_ms": 0.15237508341670036,
-          "min_ms": 0.12087495997548103,
-          "max_ms": 0.19095814786851406,
-          "iters": 10,
-          "warmup": 3
+          "median_ms": 0.13241700071375817,
+          "min_ms": 0.131665998196695,
+          "max_ms": 0.13666599988937378,
+          "iters": 5,
+          "warmup": 2
         },
         {
           "label": "tiny_smoke/fp8_scaled_matmul (64x128 @ 128x64)",
-          "median_ms": 0.1487499102950096,
-          "min_ms": 0.13329205103218555,
-          "max_ms": 0.2335000317543745,
-          "iters": 10,
-          "warmup": 3
+          "median_ms": 0.1732500022626482,
+          "min_ms": 0.16579199291300029,
+          "max_ms": 0.17716600268613547,
+          "iters": 5,
+          "warmup": 2
         },
         {
           "label": "tiny_smoke/mx_matmul_fp16 (64x128 @ 128x64)",
-          "median_ms": 0.17416616901755333,
-          "min_ms": 0.13875006698071957,
-          "max_ms": 0.2495830412954092,
-          "iters": 10,
-          "warmup": 3
+          "median_ms": 0.15145799989113584,
+          "min_ms": 0.14766700041946024,
+          "max_ms": 0.1525410043541342,
+          "iters": 5,
+          "warmup": 2
         },
         {
           "label": "tiny_smoke/fp8_scaled_vecmat (1x128 @ 128x64)",
-          "median_ms": 0.1582079567015171,
-          "min_ms": 0.12612505815923214,
-          "max_ms": 0.24137482978403568,
-          "iters": 10,
-          "warmup": 3
+          "median_ms": 0.1325839984929189,
+          "min_ms": 0.13112500164425,
+          "max_ms": 0.14645800547441468,
+          "iters": 5,
+          "warmup": 2
         }
       ]
     }

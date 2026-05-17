@@ -1,9 +1,8 @@
-"""Tests for the Path B sparse-MLA port + pure-MLX reference parity oracle.
+"""Tests for sparse-MLA Path C + pure-MLX reference parity.
 
-The Path B Metal kernel is now available via direct-MSL bypass (see
-``cppmega_mlx/nn/_tilelang/sparse_mla.py`` module docstring): we emit MSL
-through ``mx.fast.metal_kernel`` directly, skipping TileLang's TVM-Metal
-lowering entirely. The previous T.gemm blocker is bypassed.
+The regular Path B direct-MSL forward surface is retired; the compatibility
+module now reports an explicit unavailable status and falls back to the
+pure-MLX reference unless the production dispatcher selects Path C.
 
 The tests verify:
 
@@ -11,10 +10,10 @@ The tests verify:
    parity oracle).
 2. The reference is differentiable via mx.value_and_grad and gradient norms
    are finite.
-3. The direct-MSL Path B kernel matches the pure-MLX reference within fp16
-   tolerance (forward) and within autograd-grad tolerance (backward).
-4. The metal status helper reports availability and ``sparse_mla_apply``
-   exercises the Metal kernel with a fallback to the reference if needed.
+3. The TileLang/tvm-ffi Path C forward and backward match the pure-MLX
+   reference.
+4. The retired Path B compatibility surface fails closed instead of
+   constructing raw direct-MSL kernels.
 
 Tolerances: rtol=1e-3, atol=1e-3 for fp16 (plus generous fp32 hand checks).
 """
@@ -350,14 +349,14 @@ def test_reference_backward_against_finite_difference() -> None:
 
 
 def test_metal_status_reports_available() -> None:
-    """The direct-MSL bypass should report available on a Metal device."""
+    """The retired direct-MSL bypass should report unavailable on Metal."""
 
     status = sparse_mla_metal_status()
     assert isinstance(status, SparseMLAMetalStatus)
-    # On a Metal-capable host the kernel must be available.
     if mx.metal.is_available():
-        assert status.available is True
+        assert status.available is False
         assert status.fp16_carrier is True
+        assert "direct-MSL Path B is retired" in status.reason
     else:
         assert status.available is False
 
@@ -389,21 +388,19 @@ def test_apply_matches_reference_within_fp16_tolerance() -> None:
     )
 
 
-def test_apply_force_metal_dispatches_kernel() -> None:
-    """force_metal=True must succeed now that the direct-MSL kernel exists."""
+def test_apply_force_metal_raises_for_retired_path_b() -> None:
+    """force_metal=True preserves Path B semantics and raises after retirement."""
 
     rng = np.random.default_rng(6)
     q = mx.array(rng.standard_normal((1, 4, 2, 32)).astype(np.float16))
     kv = mx.array(rng.standard_normal((1, 8, 1, 32)).astype(np.float16))
     indices = mx.array(rng.integers(0, 8, size=(1, 4, 1, 4)).astype(np.int32))
-    out = sparse_mla_apply(q, kv, indices, force_metal=True)
-    out = cast(mx.array, out)
-    mx.eval(out)
-    assert tuple(out.shape) == (1, 4, 2, 32)
+    with pytest.raises(RuntimeError, match="direct-MSL Path B is retired"):
+        sparse_mla_apply(q, kv, indices, force_metal=True)
 
 
 # ---------------------------------------------------------------------------
-# Path B kernel parity (replaces the previous "blocked" placeholders).
+# Retired Path B compatibility surface.
 # ---------------------------------------------------------------------------
 
 
@@ -417,7 +414,7 @@ def test_apply_force_metal_dispatches_kernel() -> None:
     ],
     ids=["small", "medium", "multigroup", "tail_dim"],
 )
-def test_path_b_forward_parity(cfg) -> None:
+def test_path_b_forward_surface_is_retired(cfg) -> None:
     rng = np.random.default_rng(13)
     B, S, H, D = cfg["B"], cfg["S"], cfg["H"], cfg["D"]
     G = cfg["G"]
@@ -430,42 +427,25 @@ def test_path_b_forward_parity(cfg) -> None:
     indices = mx.array(rng.integers(0, Skv, size=(B, S, G, topk)).astype(np.int32))
 
     result = sparse_mla_fwd_metal(q, kv, indices, d_v=d_v)
-    assert result is not None, "direct-MSL Path B kernel must dispatch"
-    out_msl, lse = result
-    mx.eval(out_msl, lse)
-
-    out_ref = sparse_mla_attention_reference(q, kv, indices, d_v=d_v)
-    mx.eval(out_ref)
-
-    np.testing.assert_allclose(
-        np.array(out_msl).astype(np.float32),
-        np.array(out_ref).astype(np.float32),
-        rtol=1e-3,
-        atol=2e-3,
-    )
+    assert result is None
 
 
-def test_path_b_forward_parity_with_invalid_indices() -> None:
-    """Sentinel handling: -1 indices should produce zero output for fully-masked tokens."""
+def test_path_b_forward_retirement_preserves_shape_validation() -> None:
+    """The retired surface still validates inputs before failing closed."""
 
     rng = np.random.default_rng(17)
     B, S, H, D = 2, 4, 2, 32
-    G = 1
+    G = 2
     topk = 4
     Skv = 8
-    q = mx.array(rng.standard_normal((B, S, H, D)).astype(np.float16))
+    q = mx.array(rng.standard_normal((B, S, H + 1, D)).astype(np.float16))
     kv = mx.array(rng.standard_normal((B, Skv, G, D)).astype(np.float16))
     ind_np = rng.integers(0, Skv, size=(B, S, G, topk)).astype(np.int32)
     ind_np[0, 0, 0, :] = -1  # all invalid for first token
     indices = mx.array(ind_np)
 
-    result = sparse_mla_fwd_metal(q, kv, indices)
-    assert result is not None
-    out, _ = result
-    mx.eval(out)
-    out_np = np.array(out)
-    assert not np.isnan(out_np).any()
-    np.testing.assert_array_equal(out_np[0, 0, 0], np.zeros(D, dtype=out_np.dtype))
+    with pytest.raises(ValueError, match="heads .* not divisible"):
+        sparse_mla_fwd_metal(q, kv, indices)
 
 
 @pytest.mark.parametrize(
@@ -503,20 +483,11 @@ def test_path_c_forward_fp16_parity(cfg) -> None:
     out_path_c, lse_path_c = result
     mx.eval(out_path_c, lse_path_c)
 
-    result_b = sparse_mla_fwd_metal(q, kv, indices, d_v=d_v)
-    assert result_b is not None, "Path B forward kernel must dispatch for Path C parity"
-    out_path_b, lse_path_b = result_b
-    out_ref, _lse_ref = sparse_mla_attention_reference(q, kv, indices, d_v=d_v, return_lse=True)
-    mx.eval(out_path_b, lse_path_b, out_ref)
+    out_ref, lse_ref = sparse_mla_attention_reference(q, kv, indices, d_v=d_v, return_lse=True)
+    mx.eval(out_ref, lse_ref)
 
     assert out_path_c.dtype == mx.float16
     assert lse_path_c.dtype == mx.float32
-    np.testing.assert_allclose(
-        np.array(out_path_c.astype(mx.float32)),
-        np.array(out_path_b.astype(mx.float32)),
-        rtol=1e-3,
-        atol=2e-3,
-    )
     np.testing.assert_allclose(
         np.array(out_path_c.astype(mx.float32)),
         np.array(out_ref.astype(mx.float32)),
@@ -525,9 +496,9 @@ def test_path_c_forward_fp16_parity(cfg) -> None:
     )
     np.testing.assert_allclose(
         np.array(lse_path_c).astype(np.float32),
-        np.array(lse_path_b).astype(np.float32),
-        rtol=2e-3,
-        atol=3e-3,
+        np.array(lse_ref).astype(np.float32),
+        rtol=5e-3,
+        atol=8e-3,
     )
 
 
@@ -692,7 +663,7 @@ def test_path_c_forward_accepts_int64_indices_without_hidden_cast() -> None:
     ) is indices
 
 
-def test_path_b_backward_parity() -> None:
+def test_backward_compat_shim_matches_reference() -> None:
     rng = np.random.default_rng(23)
     B, S, H, D = 2, 8, 4, 32
     G = 1
@@ -791,8 +762,8 @@ def test_path_c_backward_parity(cfg) -> None:
     )
 
 
-def test_path_c_backward_matches_reference_and_path_b_direct_msl() -> None:
-    """Path C backward keeps Path B dQ parity and returns final fp32 dKV."""
+def test_sparse_mla_bwd_metal_compat_shim_matches_path_c_and_reference() -> None:
+    """The legacy bwd name delegates to Path C final owner-output gradients."""
 
     status = sparse_mla_path_c_status()
     if not status.available:
@@ -813,29 +784,41 @@ def test_path_c_backward_matches_reference_and_path_b_direct_msl() -> None:
     indices = mx.array(indices_np)
     d_out = mx.array(rng.standard_normal((B, S, H, d_v)).astype(np.float32)).astype(mx.float16)
 
-    path_b = sparse_mla_bwd_metal(q, kv, d_out, indices, d_v=d_v)
+    compat = sparse_mla_bwd_metal(q, kv, d_out, indices, d_v=d_v)
     path_c = sparse_mla_bwd_path_c(q, kv, d_out, indices, d_v=d_v)
-    assert path_b is not None, "Path B backward must dispatch for direct parity"
+    assert compat is not None, "compat backward shim must dispatch through Path C"
     assert path_c is not None, "Path C backward must dispatch for direct parity"
-    dq_b, dkv_b = path_b
+    dq_compat, dkv_compat = compat
     dq_c, dkv_c = path_c
-    mx.eval(dq_b, dkv_b, dq_c, dkv_c)
+    mx.eval(dq_compat, dkv_compat, dq_c, dkv_c)
 
     def loss(q_, kv_):
         out = sparse_mla_attention_reference(q_, kv_, indices, d_v=d_v)
         return mx.sum(out * d_out)
 
-    _dq_ref, dkv_ref = mx.grad(loss, argnums=(0, 1))(q, kv)
-    mx.eval(dkv_ref)
+    dq_ref, dkv_ref = mx.grad(loss, argnums=(0, 1))(q, kv)
+    mx.eval(dq_ref, dkv_ref)
 
     np.testing.assert_allclose(
         np.array(dq_c).astype(np.float32),
-        np.array(dq_b).astype(np.float32),
-        rtol=2e-3,
-        atol=5e-5,
+        np.array(dq_compat).astype(np.float32),
+        rtol=5e-3,
+        atol=5e-3,
     )
-    assert dkv_b.dtype == mx.float16
+    assert dkv_compat.dtype == mx.float32
     assert dkv_c.dtype == mx.float32
+    np.testing.assert_allclose(
+        np.array(dkv_compat).astype(np.float32),
+        np.array(dkv_c).astype(np.float32),
+        rtol=5e-3,
+        atol=5e-3,
+    )
+    np.testing.assert_allclose(
+        np.array(dq_c).astype(np.float32),
+        np.array(dq_ref).astype(np.float32),
+        rtol=5e-3,
+        atol=5e-3,
+    )
     np.testing.assert_allclose(
         np.array(dkv_c).astype(np.float32),
         np.array(dkv_ref).astype(np.float32),
@@ -979,8 +962,8 @@ def test_path_c_backward_accepts_int64_indices_without_hidden_cast() -> None:
     ) is indices
 
 
-def test_path_c_topk32_matches_path_b_direct_msl() -> None:
-    """Path C topk32 keeps fwd/dQ Path B parity and final dKV reference parity."""
+def test_path_c_topk32_matches_reference_and_compat_bwd() -> None:
+    """Path C topk32 keeps fwd/bwd parity with the reference and compat shim."""
 
     status = sparse_mla_path_c_status()
     if not status.available:
@@ -1002,50 +985,54 @@ def test_path_c_topk32_matches_path_b_direct_msl() -> None:
         mx.float16
     )
 
-    fwd_b = sparse_mla_fwd_metal(q, kv, indices)
     fwd_c = sparse_mla_fwd_path_c(q, kv, indices)
-    assert fwd_b is not None, "Path B topk32 forward must dispatch for parity"
     assert fwd_c is not None, "Path C topk32 forward must dispatch"
-    out_b, lse_b = fwd_b
     out_c, lse_c = fwd_c
-    mx.eval(out_b, lse_b, out_c, lse_c)
+    out_ref, lse_ref = sparse_mla_attention_reference(q, kv, indices, return_lse=True)
+    mx.eval(out_ref, lse_ref, out_c, lse_c)
 
     np.testing.assert_allclose(
         np.array(out_c).astype(np.float32),
-        np.array(out_b).astype(np.float32),
-        rtol=1e-3,
-        atol=2e-5,
+        np.array(out_ref).astype(np.float32),
+        rtol=5e-3,
+        atol=8e-3,
     )
     np.testing.assert_allclose(
         np.array(lse_c).astype(np.float32),
-        np.array(lse_b).astype(np.float32),
-        rtol=1e-6,
-        atol=1e-6,
+        np.array(lse_ref).astype(np.float32),
+        rtol=5e-3,
+        atol=8e-3,
     )
 
-    bwd_b = sparse_mla_bwd_metal(q, kv, d_out, indices)
+    bwd_compat = sparse_mla_bwd_metal(q, kv, d_out, indices)
     bwd_c = sparse_mla_bwd_path_c(q, kv, d_out, indices)
-    assert bwd_b is not None, "Path B topk32 backward must dispatch for parity"
+    assert bwd_compat is not None, "compat topk32 backward must dispatch"
     assert bwd_c is not None, "Path C topk32 backward must dispatch"
-    dq_b, dkv_b = bwd_b
+    dq_compat, dkv_compat = bwd_compat
     dq_c, dkv_c = bwd_c
-    mx.eval(dq_b, dkv_b, dq_c, dkv_c)
+    mx.eval(dq_compat, dkv_compat, dq_c, dkv_c)
 
     np.testing.assert_allclose(
         np.array(dq_c).astype(np.float32),
-        np.array(dq_b).astype(np.float32),
-        rtol=2e-3,
-        atol=5e-5,
+        np.array(dq_compat).astype(np.float32),
+        rtol=5e-3,
+        atol=5e-3,
     )
-    assert dkv_b.dtype == mx.float16
+    assert dkv_compat.dtype == mx.float32
     assert dkv_c.dtype == mx.float32
 
     def loss(q_, kv_):
         out = sparse_mla_attention_reference(q_, kv_, indices)
         return mx.sum(out * d_out)
 
-    _dq_ref, dkv_ref = mx.grad(loss, argnums=(0, 1))(q, kv)
-    mx.eval(dkv_ref)
+    dq_ref, dkv_ref = mx.grad(loss, argnums=(0, 1))(q, kv)
+    mx.eval(dq_ref, dkv_ref)
+    np.testing.assert_allclose(
+        np.array(dq_c).astype(np.float32),
+        np.array(dq_ref).astype(np.float32),
+        rtol=5e-3,
+        atol=5e-3,
+    )
     np.testing.assert_allclose(
         np.array(dkv_c).astype(np.float32),
         np.array(dkv_ref).astype(np.float32),
@@ -1054,8 +1041,8 @@ def test_path_c_topk32_matches_path_b_direct_msl() -> None:
     )
 
 
-def test_path_c_topk64_matches_path_b_direct_msl() -> None:
-    """Path C topk64 keeps fwd/dQ Path B parity and final dKV reference parity."""
+def test_path_c_topk64_matches_reference_and_compat_bwd() -> None:
+    """Path C topk64 keeps fwd/bwd parity with the reference and compat shim."""
 
     status = sparse_mla_path_c_status()
     if not status.available:
@@ -1077,50 +1064,54 @@ def test_path_c_topk64_matches_path_b_direct_msl() -> None:
         mx.float16
     )
 
-    fwd_b = sparse_mla_fwd_metal(q, kv, indices)
     fwd_c = sparse_mla_fwd_path_c(q, kv, indices)
-    assert fwd_b is not None, "Path B topk64 forward must dispatch for parity"
     assert fwd_c is not None, "Path C topk64 forward must dispatch"
-    out_b, lse_b = fwd_b
     out_c, lse_c = fwd_c
-    mx.eval(out_b, lse_b, out_c, lse_c)
+    out_ref, lse_ref = sparse_mla_attention_reference(q, kv, indices, return_lse=True)
+    mx.eval(out_ref, lse_ref, out_c, lse_c)
 
     np.testing.assert_allclose(
         np.array(out_c).astype(np.float32),
-        np.array(out_b).astype(np.float32),
-        rtol=1e-3,
-        atol=2e-5,
+        np.array(out_ref).astype(np.float32),
+        rtol=5e-3,
+        atol=8e-3,
     )
     np.testing.assert_allclose(
         np.array(lse_c).astype(np.float32),
-        np.array(lse_b).astype(np.float32),
-        rtol=1e-6,
-        atol=1e-6,
+        np.array(lse_ref).astype(np.float32),
+        rtol=5e-3,
+        atol=8e-3,
     )
 
-    bwd_b = sparse_mla_bwd_metal(q, kv, d_out, indices)
+    bwd_compat = sparse_mla_bwd_metal(q, kv, d_out, indices)
     bwd_c = sparse_mla_bwd_path_c(q, kv, d_out, indices)
-    assert bwd_b is not None, "Path B topk64 backward must dispatch for parity"
+    assert bwd_compat is not None, "compat topk64 backward must dispatch"
     assert bwd_c is not None, "Path C topk64 backward must dispatch"
-    dq_b, dkv_b = bwd_b
+    dq_compat, dkv_compat = bwd_compat
     dq_c, dkv_c = bwd_c
-    mx.eval(dq_b, dkv_b, dq_c, dkv_c)
+    mx.eval(dq_compat, dkv_compat, dq_c, dkv_c)
 
     np.testing.assert_allclose(
         np.array(dq_c).astype(np.float32),
-        np.array(dq_b).astype(np.float32),
-        rtol=2e-3,
-        atol=5e-5,
+        np.array(dq_compat).astype(np.float32),
+        rtol=5e-3,
+        atol=5e-3,
     )
-    assert dkv_b.dtype == mx.float16
+    assert dkv_compat.dtype == mx.float32
     assert dkv_c.dtype == mx.float32
 
     def loss(q_, kv_):
         out = sparse_mla_attention_reference(q_, kv_, indices)
         return mx.sum(out * d_out)
 
-    _dq_ref, dkv_ref = mx.grad(loss, argnums=(0, 1))(q, kv)
-    mx.eval(dkv_ref)
+    dq_ref, dkv_ref = mx.grad(loss, argnums=(0, 1))(q, kv)
+    mx.eval(dq_ref, dkv_ref)
+    np.testing.assert_allclose(
+        np.array(dq_c).astype(np.float32),
+        np.array(dq_ref).astype(np.float32),
+        rtol=5e-3,
+        atol=5e-3,
+    )
     np.testing.assert_allclose(
         np.array(dkv_c).astype(np.float32),
         np.array(dkv_ref).astype(np.float32),
@@ -1134,9 +1125,13 @@ def test_bench_strict_failure_still_writes_receipt(monkeypatch, tmp_path) -> Non
 
     import scripts.bench_tilelang_sparse_mla as bench_sparse_mla
 
-    class _Status:
+    class _PathCStatus:
         available = True
         reason = "test status"
+
+    class _PathBStatus:
+        available = False
+        reason = "retired"
 
     fake_shape = {
         "name": "fake_sparse_mla",
@@ -1152,20 +1147,16 @@ def test_bench_strict_failure_still_writes_receipt(monkeypatch, tmp_path) -> Non
     def fake_bench_shape(*_args, **_kwargs):
         return {
             "shape": fake_shape,
-            "path_b": {"available": True, "reason": "ok"},
+            "path_b": {"available": False, "reason": "retired"},
             "path_c": {"available": True, "reason": "ok"},
-            "fwd_msl_paired_ms": {"ok": True},
-            "fwd_path_c_paired_ms": {"ok": True},
-            "fwd_path_c_over_path_b_paired_ratio": 1.25,
-            # Guard that strict diagnostics use paired ratios, not unpaired row flags.
-            "fwd_path_c_no_worse_than_path_b": True,
+            "fwd_path_c_ms": {"ok": False},
         }
 
     out_path = tmp_path / "strict_fail.json"
     monkeypatch.setattr(bench_sparse_mla, "DEFAULT_SHAPES", [fake_shape])
     monkeypatch.setattr(bench_sparse_mla, "_bench_shape", fake_bench_shape)
-    monkeypatch.setattr(bench_sparse_mla, "sparse_mla_metal_status", lambda: _Status())
-    monkeypatch.setattr(bench_sparse_mla, "sparse_mla_path_c_status", lambda: _Status())
+    monkeypatch.setattr(bench_sparse_mla, "sparse_mla_metal_status", lambda: _PathBStatus())
+    monkeypatch.setattr(bench_sparse_mla, "sparse_mla_path_c_status", lambda: _PathCStatus())
     monkeypatch.setattr(
         sys,
         "argv",
@@ -1187,8 +1178,7 @@ def test_bench_strict_failure_still_writes_receipt(monkeypatch, tmp_path) -> Non
     assert payload["strict"]["enabled"] is True
     assert payload["strict"]["passed"] is False
     assert payload["strict"]["failures"] == [
-        "fake_sparse_mla: forward strict gate failed paired C/B=1.25 "
-        "path_b_ok=True path_c_ok=True"
+        "fake_sparse_mla: forward strict gate failed path_c_ok=False"
     ]
     assert payload["rows"][0]["shape"]["name"] == "fake_sparse_mla"
 
@@ -1682,8 +1672,8 @@ def test_path_c_lowering_dispatch_grid_matches_mlx_total_thread_contract(topk: i
         assert _mlx_total_thread_grid(lowering) == (lanes * threads, 1, 1)
 
 
-def test_apply_backward_through_custom_vjp() -> None:
-    """``sparse_mla_apply`` must propagate gradients via the custom VJP."""
+def test_apply_backward_through_reference_fallback() -> None:
+    """``sparse_mla_apply`` still propagates gradients after Path B retirement."""
 
     rng = np.random.default_rng(29)
     B, S, H, D = 1, 4, 2, 16

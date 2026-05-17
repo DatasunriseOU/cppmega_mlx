@@ -1,17 +1,15 @@
-"""Parity + status tests for the Path B block-scaled (MXFP8) sparse-MLA port.
+"""Parity + status tests for the retired block-scaled sparse-MLA Path B surface.
 
-The Path B block-scaled MXFP8 kernel is now available via direct-MSL bypass
-(see ``cppmega_mlx/nn/_tilelang/sparse_mla_blockscaled.py`` module docstring).
-The previous TileLang ``T.gemm`` and ``float8_e4m3 -> Metal type`` blockers
-are bypassed by emitting MSL through ``mx.fast.metal_kernel`` directly with
-inline e4m3 + E8M0 dequant on the unpacked uint8 byte storage.
+The raw direct-MSL block-scaled MXFP8 runtime is retired. The compatibility
+module keeps the MXFP8 helpers and reference path, while prepared FP8
+byte/scales callers use the Path C owner-output surfaces.
 
 These tests exercise:
 
-1. Metal-status surface returns ``available=True`` on a Metal device.
-2. ``sparse_mla_blockscaled_apply`` dispatches the kernel and parity holds vs
+1. Metal-status surface reports the Path B retirement explicitly.
+2. ``sparse_mla_blockscaled_apply`` stays on the reference path and parity holds vs
    the pure-MLX MXFP8 reference within FP8 noise tolerance.
-3. ``force_metal=True`` succeeds (no blocker to raise).
+3. ``force_metal=True`` fails closed because the old direct-MSL route is gone.
 4. The pure-MLX MXFP8 reference matches a "dequantize-then-BF16" parity oracle
    exactly (because both paths consume the same MXFP8-recovered Q/KV).
 5. The MXFP8 reference matches the original BF16 reference within FP8 noise
@@ -26,6 +24,7 @@ These tests exercise:
 
 from __future__ import annotations
 
+import inspect
 import numpy as np
 import pytest
 
@@ -106,7 +105,7 @@ def _require_path_c_available(
     pytest.fail(status.reason)
 
 
-def test_blockscaled_bench_strict_exit_includes_full_dispatch_scope() -> None:
+def test_blockscaled_bench_strict_exit_uses_reducer_scope() -> None:
     failures = _strict_exit_failures(
         fp8_reducer_failures=[],
         fp8_full_dispatch_failures=["fp8 full dispatch blocked"],
@@ -114,7 +113,7 @@ def test_blockscaled_bench_strict_exit_includes_full_dispatch_scope() -> None:
         blockscaled_reducer_failures=[],
         blockscaled_full_dispatch_failures=["blockscaled full dispatch blocked"],
     )
-    assert failures == ["fp8 full dispatch blocked", "blockscaled full dispatch blocked"]
+    assert failures == []
 
 
 # ---------------------------------------------------------------------------
@@ -126,21 +125,22 @@ def test_block_size_constant_matches_gb10() -> None:
     assert MXFP8_BLOCK_SIZE == 32
 
 
-def test_blockscaled_metal_status_reports_available() -> None:
+def test_blockscaled_metal_status_reports_retired() -> None:
     status = sparse_mla_blockscaled_metal_status()
     assert isinstance(status, SparseMLABlockScaledMetalStatus)
     if mx.metal.is_available():
-        assert status.available is True
-        assert "MXFP8" in status.reason or "direct-MSL" in status.reason
+        assert status.available is False
+        assert "direct-MSL Path B is retired" in status.reason
     else:
         assert status.available is False
 
 
-def test_blockscaled_metal_status_with_arrays_validates_dispatcher_path() -> None:
+def test_blockscaled_metal_status_with_arrays_preserves_shape_validation() -> None:
     q, kv, indices, _ = _make_inputs()
     status = sparse_mla_blockscaled_metal_status(q, kv, indices)
     if mx.metal.is_available():
-        assert status.available is True
+        assert status.available is False
+        assert "direct-MSL Path B is retired" in status.reason
     else:
         assert status.available is False
 
@@ -465,31 +465,38 @@ def test_blockscaled_path_c_e8m0_qk_reduce_handles_tail_n_and_multi_k_chunk() ->
     )
 
 
-def test_blockscaled_fwd_metal_returns_outputs() -> None:
+def test_blockscaled_fwd_metal_surface_is_retired() -> None:
     q, kv, indices, d_v = _make_inputs()
     result = sparse_mla_blockscaled_fwd_metal(q, kv, indices, d_v=d_v)
-    assert result is not None
-    out, lse = result
-    mx.eval(out, lse)
-    assert tuple(out.shape) == tuple(q.shape[:3]) + (d_v,)
+    assert result is None
 
 
-def test_blockscaled_bwd_metal_returns_outputs() -> None:
+def test_blockscaled_bwd_metal_surface_is_retired() -> None:
     q, kv, indices, d_v = _make_inputs()
     d_out = mx.zeros((1, 4, 2, d_v), dtype=mx.float32)
     grads = sparse_mla_blockscaled_bwd_metal(q, kv, d_out, indices, d_v=d_v)
-    assert grads is not None
-    dq, dkv = grads
-    mx.eval(dq, dkv)
-    assert tuple(dq.shape) == tuple(q.shape)
-    assert tuple(dkv.shape) == tuple(kv.shape)
+    assert grads is None
 
 
-def test_blockscaled_apply_force_metal_dispatches_kernel() -> None:
+def test_blockscaled_source_has_no_direct_msl_runtime_surface() -> None:
+    import cppmega_mlx.nn._tilelang.sparse_mla_blockscaled as module
+
+    source = inspect.getsource(module)
+    assert "_BLOCKSCALED_FWD_KERNEL_SOURCE" not in source
+    assert "_BLOCKSCALED_BWD_KERNEL_SOURCE" not in source
+    assert "_BLOCKSCALED_FWD_KERNEL" not in source
+    assert "_BLOCKSCALED_BWD_KERNEL" not in source
+    assert "make_metal_kernel" not in source
+    assert "cppmega_atomic_add_float" not in source
+    assert "atomic_outputs=True" not in source
+    assert "dkv_partial" not in source
+    assert "_reduce_dkv_partial_fp32" not in source
+
+
+def test_blockscaled_apply_force_metal_raises_for_retired_path_b() -> None:
     q, kv, indices, d_v = _make_inputs()
-    out = sparse_mla_blockscaled_apply(q, kv, indices, d_v=d_v, force_metal=True)
-    mx.eval(out)
-    assert tuple(out.shape) == tuple(q.shape[:3]) + (d_v,)
+    with pytest.raises(RuntimeError, match="direct-MSL Path B is retired"):
+        sparse_mla_blockscaled_apply(q, kv, indices, d_v=d_v, force_metal=True)
 
 
 # ---------------------------------------------------------------------------
@@ -542,7 +549,7 @@ def test_mxfp8_ste_roundtrip_returns_finite() -> None:
 
 
 def test_blockscaled_apply_matches_reference_within_fp8_tolerance() -> None:
-    """``sparse_mla_blockscaled_apply`` (Metal kernel) vs the pure-MLX MXFP8 reference."""
+    """``sparse_mla_blockscaled_apply`` vs the pure-MLX MXFP8 reference."""
 
     q, kv, indices, d_v = _make_inputs(scale=0.1)
     out_apply = sparse_mla_blockscaled_apply(q, kv, indices, d_v=d_v)
@@ -556,54 +563,23 @@ def test_blockscaled_apply_matches_reference_within_fp8_tolerance() -> None:
     )
 
 
-def test_blockscaled_path_b_forward_parity() -> None:
-    """Direct-MSL block-scaled forward must agree with the reference."""
+def test_blockscaled_path_b_forward_surface_is_retired() -> None:
+    """The retired direct-MSL block-scaled forward fails closed."""
 
     q, kv, indices, d_v = _make_inputs(scale=0.1)
     result = sparse_mla_blockscaled_fwd_metal(q, kv, indices, d_v=d_v)
-    assert result is not None
-    out_msl, lse = result
-    out_ref = sparse_mla_blockscaled_reference(q, kv, indices, d_v=d_v)
-    mx.eval(out_msl, lse, out_ref)
-    np.testing.assert_allclose(
-        np.asarray(out_msl).astype(np.float32),
-        np.asarray(out_ref).astype(np.float32),
-        rtol=5e-3,
-        atol=5e-3,
-    )
+    assert result is None
 
 
-def test_blockscaled_path_b_backward_parity() -> None:
-    """Direct-MSL block-scaled backward must agree with autograd of the reference."""
+def test_blockscaled_path_b_backward_surface_is_retired() -> None:
+    """The retired direct-MSL block-scaled backward fails closed."""
 
     q, kv, indices, d_v = _make_inputs(scale=0.1)
     rng = np.random.default_rng(31)
     d_out = mx.array((rng.standard_normal(tuple(q.shape[:3]) + (d_v,)) * 0.1).astype(np.float32))
 
     grads = sparse_mla_blockscaled_bwd_metal(q, kv, d_out, indices, d_v=d_v)
-    assert grads is not None
-    dq_msl, dkv_msl = grads
-    mx.eval(dq_msl, dkv_msl)
-
-    def loss(q_, kv_):
-        out = sparse_mla_blockscaled_reference(q_, kv_, indices, d_v=d_v)
-        return mx.sum(out * d_out)
-
-    dq_ref, dkv_ref = mx.grad(loss, argnums=(0, 1))(q, kv)
-    mx.eval(dq_ref, dkv_ref)
-
-    np.testing.assert_allclose(
-        np.asarray(dq_msl).astype(np.float32),
-        np.asarray(dq_ref).astype(np.float32),
-        rtol=1e-2,
-        atol=5e-3,
-    )
-    np.testing.assert_allclose(
-        np.asarray(dkv_msl).astype(np.float32),
-        np.asarray(dkv_ref).astype(np.float32),
-        rtol=1e-2,
-        atol=5e-3,
-    )
+    assert grads is None
 
 
 def test_blockscaled_reference_matches_bf16_within_tolerance() -> None:

@@ -246,12 +246,18 @@ def _sparse_mla_path_c_receipt_allows_auto_promotion(
         return False
     if strict_policy.get("fwd_only") is not fwd_only:
         return False
-    if strict_policy.get("requires_path_b_and_path_c") is not True:
+    path_b_retired_policy = strict_policy.get("path_b_retired") is True
+    old_path_b_comparison_policy = strict_policy.get("requires_path_b_and_path_c") is True
+    if not (path_b_retired_policy or old_path_b_comparison_policy):
         return False
 
     path_b_status = data.get("path_b_status")
     path_c_status = data.get("path_c_status")
-    if not isinstance(path_b_status, dict) or path_b_status.get("available") is not True:
+    if not isinstance(path_b_status, dict):
+        return False
+    if old_path_b_comparison_policy and path_b_status.get("available") is not True:
+        return False
+    if path_b_retired_policy and path_b_status.get("available") is not False:
         return False
     if not isinstance(path_c_status, dict) or path_c_status.get("available") is not True:
         return False
@@ -273,17 +279,22 @@ def _sparse_mla_path_c_receipt_allows_auto_promotion(
             "topk": shapes.topk,
             "Skv": shapes.seq_len_kv,
         }
-    required_row_flags = [
-        "fwd_path_c_no_worse_than_path_b",
-        "fwd_path_c_no_worse_than_path_b_paired",
-    ]
-    if not fwd_only:
-        required_row_flags.extend(
-            [
-                "bwd_path_c_no_worse_than_path_b",
-                "bwd_path_c_no_worse_than_path_b_paired",
-            ]
-        )
+    if path_b_retired_policy:
+        required_row_flags = ["fwd_path_c_ran"]
+        if not fwd_only:
+            required_row_flags.append("bwd_path_c_ran")
+    else:
+        required_row_flags = [
+            "fwd_path_c_no_worse_than_path_b",
+            "fwd_path_c_no_worse_than_path_b_paired",
+        ]
+        if not fwd_only:
+            required_row_flags.extend(
+                [
+                    "bwd_path_c_no_worse_than_path_b",
+                    "bwd_path_c_no_worse_than_path_b_paired",
+                ]
+            )
     matching_rows = []
     for row in rows:
         if not isinstance(row, dict):
@@ -298,9 +309,10 @@ def _sparse_mla_path_c_receipt_allows_auto_promotion(
         for key in required_row_flags:
             if row.get(key) is not True:
                 return False
-        for key, value in row.items():
-            if "no_worse_than_path_b" in key and isinstance(value, bool) and not value:
-                return False
+        if old_path_b_comparison_policy:
+            for key, value in row.items():
+                if "no_worse_than_path_b" in key and isinstance(value, bool) and not value:
+                    return False
     return bool(matching_rows)
 
 
@@ -336,12 +348,11 @@ def sparse_mla_attention(
     Routing rules (controlled by ``CPPMEGA_KERNEL_PATH``):
 
     - ``AUTO`` (default): promote only receipt-covered default-parameter
-      shapes whose Path C receipt row has all no-worse-than-Path-B flags set;
-      otherwise use the Path B Metal kernel via
-      :func:`cppmega_mlx.nn._tilelang.sparse_mla_apply` when available. On
-      hosts without Metal eligibility, fall back to the pure-MLX reference.
+      shapes whose Path C receipt proves the TileLang/tvm-ffi route dispatches;
+      otherwise use the pure-MLX reference.
     - ``REFERENCE``: always run the pure-MLX reference.
-    - ``PATH_B``: force the direct-MSL Metal kernel (raises if unavailable).
+    - ``PATH_B``: force the retired direct-MSL Metal kernel compatibility
+      surface (raises because raw direct-MSL is no longer constructed).
     - ``PATH_C``: force the TileLang-DSL-lowered Path C Metal kernel (raises
       if unavailable). Path C is an experimental proof path with the same
       pure-MLX parity oracle and custom VJP coverage for default parameters
@@ -352,7 +363,6 @@ def sparse_mla_attention(
     # when only the parity oracle is exercised.
     from cppmega_mlx.nn._tilelang.sparse_mla import (
         sparse_mla_apply as _sparse_mla_apply,
-        sparse_mla_metal_status as _sparse_mla_metal_status,
     )
     from cppmega_mlx.nn._tilelang.sparse_mla_path_c import (
         sparse_mla_path_c_apply as _sparse_mla_path_c_apply,
@@ -390,7 +400,7 @@ def sparse_mla_attention(
         )
 
     if path is KernelPath.PATH_B:
-        record_dispatch("sparse_mla", path, "metal_kernel_fwd_v1")
+        record_dispatch("sparse_mla", path, "direct_msl_path_b_retired")
         return _sparse_mla_apply(
             q,
             kv,
@@ -425,17 +435,6 @@ def sparse_mla_attention(
             force_path_c=True,
         )
 
-    status = _sparse_mla_metal_status(q, kv, indices)
-    if status.available:
-        record_dispatch("sparse_mla", path, "metal_kernel_fwd_v1")
-        return _sparse_mla_apply(
-            q,
-            kv,
-            indices,
-            sm_scale=sm_scale,
-            d_v=d_v,
-            return_lse=return_lse,
-        )
     record_dispatch("sparse_mla", path, "reference_pure_mlx")
     return sparse_mla_attention_reference(
         q,

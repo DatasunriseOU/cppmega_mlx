@@ -22,14 +22,18 @@ Membership:
 - _mamba3_helpers.py: pure-MLX rewrites of three Triton helpers
   (compute_dacs_segsum, bwd_dadt_fused, bwd_dtrap_ddt) that have no Metal
   backend in upstream Triton.
-- mamba3.py: Path B port of mamba_ssm.ops.tilelang.mamba3.{fwd,bwd} plus the
-  mx.custom_function wrapper that ties forward to backward.
-- topk_selector.py: Path B/C port for cppmega's tilelang_sparse_mla
-  topk-selector kernel. AUTO prefers Path C where the checked-in bench receipt
-  keeps Path C no worse than Path B, then falls back to Path B and pure MLX.
+- fp8_msl_kernels.py: retired direct-MSL FP8 compatibility names, now pure
+  MLX reference/oracle helpers. Production acceleration must use the Path C
+  owner-output modules.
+- mamba3.py: remaining Path B direct-MSL port of
+  mamba_ssm.ops.tilelang.mamba3.{fwd,bwd} plus the mx.custom_function wrapper
+  that ties forward to backward.
+- topk_selector.py: retired Path B compatibility surface plus Path C direct
+  owner-output entrypoints for cppmega's tilelang_sparse_mla top-k selector.
 
-Path B emits MSL directly via mx.fast.metal_kernel. Path C lowers TileLang DSL
-to Metal when the in-tree lowering bridge supports the shape/kernel.
+The only remaining production direct-MSL allowlist entry is Mamba3. Path C
+lowers TileLang DSL to Metal when the in-tree lowering bridge supports the
+shape/kernel.
 
 Public Path C surface — what is *exported here* vs what only lives in submodules:
 

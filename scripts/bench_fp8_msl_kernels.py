@@ -1,11 +1,11 @@
-"""Benchmark the vendored FP8 MSL kernels against ``mx.matmul`` baselines.
+"""Benchmark the retired FP8 helper surface against ``mx.matmul`` baselines.
 
 Output JSON: ``bench/tilelang_ports/fp8_msl_kernels.json``
 
-The kernels under test live in
-``cppmega_mlx/nn/_tilelang/fp8_msl_kernels.py``. They are direct ports of
-the AppMana / audiohacking Apple Silicon FP8 (e4m3fn) Metal sources --
-see that module's docstring for SHAs and license attribution.
+The helpers under test live in
+``cppmega_mlx/nn/_tilelang/fp8_msl_kernels.py``. The historical direct-MSL
+surface is retired; this script now records the pure-MLX reference timings and
+the explicit unavailable status.
 
 Apple Silicon (through M5 / MSL 4.0) has no native FP8 hardware, so this
 bench measures the realistic overhead of treating FP8 as storage-only:
@@ -21,8 +21,8 @@ projects:
   *  512 x  512 x 8192 -- Mamba-like K-major projection
 
 Each shape is run for: encode (fp16 -> fp8), decode (fp8 -> fp16),
-fp8_scaled_matmul, fp8_scaled_vecmat (M=1 only), and an mx.matmul fp16
-baseline computed on the dequantized inputs.
+reference fp8_scaled_matmul, reference fp8_scaled_vecmat (M=1 only), and an
+mx.matmul fp16 baseline computed on the dequantized inputs.
 """
 
 from __future__ import annotations
@@ -243,11 +243,12 @@ def main() -> None:
     payload: dict[str, Any] = {
         "schema_version": 1,
         "scope": "local_only",
-        "kernel": "fp8_msl_kernels",
+        "kernel": "fp8_reference_helpers",
         "license_notice": (
-            "Vendored from AppMana/mps-fp8-for-torch-and-comfyui-python-package "
+            "Historical direct-MSL sources were vendored from "
+            "AppMana/mps-fp8-for-torch-and-comfyui-python-package "
             "(commit a902571e, Apache 2.0) and audiohacking/fp8-mps-metal "
-            "(commit d4fbd40c, MIT)."
+            "(commit d4fbd40c, MIT); current helpers are pure MLX references."
         ),
         "hardware_label": socket.gethostname(),
         "platform": {

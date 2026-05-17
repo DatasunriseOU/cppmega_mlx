@@ -3,30 +3,32 @@
   "kernel": "sparse_mla",
   "platform": "macOS-26.4.1-arm64-arm-64bit-Mach-O",
   "machine": "arm64",
-  "mlx_version": "0.31.2",
+  "mlx_version": "0.32.0.dev20260514+d168ca5ca",
   "fp16_carrier": true,
   "fwd_only": false,
   "strict_policy": {
     "path_c_over_path_b_max_ratio": 1.0,
-    "requires_path_b_and_path_c": true,
+    "path_b_retired": true,
+    "requires_path_c": true,
     "fwd_only": false,
     "phase": "all"
   },
   "strict": {
-    "enabled": false,
+    "enabled": true,
     "passed": true,
     "path_c_over_path_b_max_ratio": 1.0,
+    "path_b_retired": true,
     "phase": "all",
     "fwd_only": false,
     "failures": []
   },
   "path_b_status": {
-    "available": true,
-    "reason": "sparse_mla direct-MSL kernel built via mx.fast.metal_kernel is available; bypasses TileLang's T.gemm metal blocker."
+    "available": false,
+    "reason": "sparse_mla direct-MSL Path B is retired for production cleanup: raw _msl_transform.dispatch/mx.fast.metal_kernel callsites are no longer constructed. Use sparse_mla_path_c for the TileLang/tvm-ffi owner-output route, or the pure-MLX reference fallback for unsupported shapes."
   },
   "path_c_status": {
     "available": true,
-    "reason": "Sparse-MLA Path C forward/backward TileLang DSL ready"
+    "reason": "Sparse-MLA Path C forward/backward TileLang tvm-ffi path ready"
   },
   "rows": [
     {
@@ -43,183 +45,194 @@
       "fwd_reference_ms": {
         "label": "reference_fwd",
         "ok": true,
-        "median_ms": 0.3518960002111271,
-        "min_ms": 0.3276249917689711,
-        "max_ms": 1.0917919862549752,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 0.42262499482603744,
+        "min_ms": 0.36270800046622753,
+        "max_ms": 0.4458339972188696,
+        "iters": 5,
+        "warmup": 2
       },
       "fwd_apply_ms": {
         "label": "apply_fwd",
         "ok": true,
-        "median_ms": 0.2046664885710925,
-        "min_ms": 0.19625001004897058,
-        "max_ms": 0.22283400176092982,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 0.47095800255192444,
+        "min_ms": 0.3553749993443489,
+        "max_ms": 1.134749996708706,
+        "iters": 5,
+        "warmup": 2
       },
       "fwd_msl_ms": {
         "label": "path_b_msl_fwd",
-        "ok": true,
-        "median_ms": 0.19924950902350247,
-        "min_ms": 0.17537499661557376,
-        "max_ms": 0.7482079963665456,
-        "iters": 20,
-        "warmup": 5
+        "ok": false,
+        "median_ms": null,
+        "min_ms": null,
+        "max_ms": null,
+        "iters": 5,
+        "warmup": 2,
+        "error": "RuntimeError: Path B sparse_mla_fwd_metal is retired"
       },
       "fwd_path_c_ms": {
         "label": "path_c_tilelang_fwd",
         "ok": true,
-        "median_ms": 0.21225000091362745,
-        "min_ms": 0.19200000679120421,
-        "max_ms": 0.7868749962653965,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 0.3072499966947362,
+        "min_ms": 0.27391700132284313,
+        "max_ms": 0.39129100332502276,
+        "iters": 5,
+        "warmup": 2
       },
       "fwd_msl_paired_ms": {
         "label": "path_b_msl_fwd_paired",
-        "ok": true,
-        "median_ms": 0.209937003091909,
-        "min_ms": 0.18962498870678246,
-        "max_ms": 0.88279097690247,
-        "iters": 20,
-        "warmup": 5
+        "ok": false,
+        "median_ms": null,
+        "min_ms": null,
+        "max_ms": null,
+        "iters": 5,
+        "warmup": 2,
+        "error": "not applicable: direct-MSL Path B forward is retired"
       },
       "fwd_path_c_paired_ms": {
         "label": "path_c_tilelang_fwd_paired",
-        "ok": true,
-        "median_ms": 0.20893701002933085,
-        "min_ms": 0.18433399964123964,
-        "max_ms": 0.31462498009204865,
-        "iters": 20,
-        "warmup": 5,
-        "pair_ratio_median": 0.9821633147840932,
-        "pair_ratio_min": 0.2476044563074939,
-        "pair_ratio_max": 1.6591957749753854
+        "ok": false,
+        "median_ms": null,
+        "min_ms": null,
+        "max_ms": null,
+        "iters": 5,
+        "warmup": 2,
+        "error": "not paired because direct-MSL Path B forward is retired"
       },
-      "fwd_path_c_over_path_b_ratio": 1.0652472969887796,
-      "fwd_path_c_over_path_b_paired_ratio": 0.9821633147840932,
+      "fwd_path_c_over_path_b_ratio": Infinity,
+      "fwd_path_c_over_path_b_paired_ratio": Infinity,
+      "fwd_path_c_over_reference_ratio": 0.7270038460957748,
       "path_c_over_path_b_max_ratio": 1.0,
-      "fwd_path_c_no_worse_than_path_b": true,
-      "fwd_path_c_no_worse_than_path_b_paired": true,
+      "path_b_retired": true,
+      "fwd_path_c_ran": true,
+      "fwd_path_c_no_worse_than_path_b": false,
+      "fwd_path_c_no_worse_than_path_b_paired": false,
       "fwd_path_c_unpaired_within_max_ratio": false,
+      "fwd_path_c_no_worse_than_reference": true,
       "path_b": {
-        "available": true,
-        "reason": "sparse_mla direct-MSL kernel built via mx.fast.metal_kernel is available; bypasses TileLang's T.gemm metal blocker."
+        "available": false,
+        "reason": "sparse_mla direct-MSL Path B is retired for production cleanup: raw _msl_transform.dispatch/mx.fast.metal_kernel callsites are no longer constructed. Use sparse_mla_path_c for the TileLang/tvm-ffi owner-output route, or the pure-MLX reference fallback for unsupported shapes."
       },
       "path_c": {
         "available": true,
-        "reason": "Sparse-MLA Path C forward/backward TileLang DSL ready"
+        "reason": "Sparse-MLA Path C forward/backward TileLang tvm-ffi path ready"
       },
       "bwd_reference_ms": {
         "label": "reference_bwd",
         "ok": true,
-        "median_ms": 0.5672080151271075,
-        "min_ms": 0.5308330000843853,
-        "max_ms": 1.2553330161608756,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 0.9264170003007166,
+        "min_ms": 0.7924159945105202,
+        "max_ms": 1.4727500019944273,
+        "iters": 5,
+        "warmup": 2
       },
       "bwd_msl_ms": {
-        "label": "path_b_msl_bwd",
+        "label": "path_b_compat_path_c_owner_output_bwd",
         "ok": true,
-        "median_ms": 0.3397084947209805,
-        "min_ms": 0.33154201810248196,
-        "max_ms": 0.4699580022133887,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 0.7569169974885881,
+        "min_ms": 0.6684580002911389,
+        "max_ms": 0.9347089944640175,
+        "iters": 5,
+        "warmup": 2
       },
       "bwd_msl_paired_ms": {
-        "label": "path_b_msl_bwd_paired",
+        "label": "path_b_compat_path_c_owner_output_bwd_paired",
         "ok": true,
-        "median_ms": 0.35024998942390084,
-        "min_ms": 0.32387502142228186,
-        "max_ms": 0.495540996780619,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 0.6012919984641485,
+        "min_ms": 0.5470830001286231,
+        "max_ms": 0.6319579988485202,
+        "iters": 5,
+        "warmup": 2
       },
       "bwd_msl_kernel_ms": {
-        "label": "path_b_msl_bwd_kernel_only",
+        "label": "path_b_compat_path_c_owner_output_kernel",
         "ok": true,
-        "median_ms": 0.2582084998721257,
-        "min_ms": 0.24241599021479487,
-        "max_ms": 0.9187910181935877,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 0.6273749968386255,
+        "min_ms": 0.5908339953748509,
+        "max_ms": 0.6367080059135333,
+        "iters": 5,
+        "warmup": 2
       },
       "bwd_msl_fresh_reduce_ms": {
         "label": "path_b_msl_bwd_fresh_reduce",
-        "ok": true,
-        "median_ms": 0.34689600579440594,
-        "min_ms": 0.3268750151619315,
-        "max_ms": 1.0762919846456498,
-        "iters": 20,
-        "warmup": 5
+        "ok": false,
+        "median_ms": null,
+        "min_ms": null,
+        "max_ms": null,
+        "iters": 5,
+        "warmup": 2,
+        "error": "not applicable: legacy direct-MSL backward public partial route is retired"
       },
       "bwd_msl_reduce_ms": {
         "label": "path_b_msl_bwd_reduce_only",
-        "ok": true,
-        "median_ms": 0.22727051691617817,
-        "min_ms": 0.2064170257654041,
-        "max_ms": 0.24158298037946224,
-        "iters": 20,
-        "warmup": 5
+        "ok": false,
+        "median_ms": null,
+        "min_ms": null,
+        "max_ms": null,
+        "iters": 5,
+        "warmup": 2,
+        "error": "not applicable: legacy direct-MSL backward public partial route is retired"
       },
       "bwd_path_c_ms": {
         "label": "path_c_tilelang_bwd",
         "ok": true,
-        "median_ms": 0.3590414999052882,
-        "min_ms": 0.3125829971395433,
-        "max_ms": 0.7361249881796539,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 0.6339160026982427,
+        "min_ms": 0.5679999958374538,
+        "max_ms": 0.9757919979165308,
+        "iters": 5,
+        "warmup": 2
       },
       "bwd_path_c_paired_ms": {
         "label": "path_c_tilelang_bwd_paired",
         "ok": true,
-        "median_ms": 0.3396039974177256,
-        "min_ms": 0.3032080130651593,
-        "max_ms": 0.8836659835651517,
-        "iters": 20,
-        "warmup": 5,
-        "pair_ratio_median": 0.9660529074749789,
-        "pair_ratio_min": 0.6383589405296717,
-        "pair_ratio_max": 2.509224266439544
+        "median_ms": 0.5747920004068874,
+        "min_ms": 0.5504590008058585,
+        "max_ms": 0.6773749992134981,
+        "iters": 5,
+        "warmup": 2,
+        "pair_ratio_median": 0.9724412043403603,
+        "pair_ratio_min": 0.9154603790036616,
+        "pair_ratio_max": 1.1542065988369923
       },
       "bwd_path_c_kernel_ms": {
-        "label": "path_c_tilelang_bwd_kernel_only",
+        "label": "path_c_tilelang_bwd_owner_output_kernel",
         "ok": true,
-        "median_ms": 0.2468544989824295,
-        "min_ms": 0.23045900161378086,
-        "max_ms": 1.0067499824799597,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 0.5108339973958209,
+        "min_ms": 0.4826669974136166,
+        "max_ms": 0.7998750006663613,
+        "iters": 5,
+        "warmup": 2
       },
       "bwd_path_c_fresh_reduce_ms": {
         "label": "path_c_tilelang_bwd_fresh_reduce",
-        "ok": true,
-        "median_ms": 0.3281044773757458,
-        "min_ms": 0.30274997698143125,
-        "max_ms": 0.6586250092368573,
-        "iters": 20,
-        "warmup": 5
+        "ok": false,
+        "median_ms": null,
+        "min_ms": null,
+        "max_ms": null,
+        "iters": 5,
+        "warmup": 2,
+        "error": "not applicable: Path C backward returns final owner-output dKV"
       },
       "bwd_path_c_reduce_ms": {
         "label": "path_c_tilelang_bwd_reduce_only",
-        "ok": true,
-        "median_ms": 0.23118749959394336,
-        "min_ms": 0.20858299103565514,
-        "max_ms": 0.2674999996088445,
-        "iters": 20,
-        "warmup": 5
+        "ok": false,
+        "median_ms": null,
+        "min_ms": null,
+        "max_ms": null,
+        "iters": 5,
+        "warmup": 2,
+        "error": "not applicable: Path C backward returns final owner-output dKV"
       },
-      "bwd_path_c_over_path_b_ratio": 1.0569105732848596,
-      "bwd_path_c_over_path_b_paired_ratio": 0.9660529074749789,
-      "bwd_path_c_kernel_over_path_b_kernel_ratio": 0.956027780280978,
-      "bwd_path_c_fresh_reduce_over_path_b_fresh_reduce_ratio": 0.9458295047945946,
-      "bwd_path_c_reduce_over_path_b_reduce_ratio": 1.0172348914012892,
+      "bwd_path_c_over_path_b_ratio": 0.8374973805602774,
+      "bwd_path_c_over_path_b_paired_ratio": 0.9724412043403603,
+      "bwd_path_c_over_reference_ratio": 0.6842663751771313,
+      "bwd_path_c_ran": true,
+      "bwd_path_c_kernel_over_path_b_kernel_ratio": 0.814240286861828,
+      "bwd_path_c_fresh_reduce_over_path_b_fresh_reduce_ratio": Infinity,
+      "bwd_path_c_reduce_over_path_b_reduce_ratio": Infinity,
       "bwd_path_c_no_worse_than_path_b": true,
       "bwd_path_c_no_worse_than_path_b_paired": true,
+      "bwd_path_c_no_worse_than_reference": true,
       "bwd_blocker": "none: Path C backward is within strict ratio 1"
     },
     {
@@ -236,184 +249,195 @@
       "fwd_reference_ms": {
         "label": "reference_fwd",
         "ok": true,
-        "median_ms": 0.8145415049511939,
-        "min_ms": 0.7272080110851675,
-        "max_ms": 1.3929170090705156,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 0.7500409992644563,
+        "min_ms": 0.7013330032350495,
+        "max_ms": 0.7960840011946857,
+        "iters": 5,
+        "warmup": 2
       },
       "fwd_apply_ms": {
         "label": "apply_fwd",
         "ok": true,
-        "median_ms": 0.3117710002698004,
-        "min_ms": 0.2979580021928996,
-        "max_ms": 0.32108399318531156,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 0.7716249965596944,
+        "min_ms": 0.6789170001866296,
+        "max_ms": 0.8556669999961741,
+        "iters": 5,
+        "warmup": 2
       },
       "fwd_msl_ms": {
         "label": "path_b_msl_fwd",
-        "ok": true,
-        "median_ms": 0.29814598383381963,
-        "min_ms": 0.2818749926518649,
-        "max_ms": 0.690624990966171,
-        "iters": 20,
-        "warmup": 5
+        "ok": false,
+        "median_ms": null,
+        "min_ms": null,
+        "max_ms": null,
+        "iters": 5,
+        "warmup": 2,
+        "error": "RuntimeError: Path B sparse_mla_fwd_metal is retired"
       },
       "fwd_path_c_ms": {
         "label": "path_c_tilelang_fwd",
         "ok": true,
-        "median_ms": 0.2894584904424846,
-        "min_ms": 0.2796670014504343,
-        "max_ms": 0.7256669923663139,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 0.6749160020262934,
+        "min_ms": 0.6054589975974523,
+        "max_ms": 0.7186250004451722,
+        "iters": 5,
+        "warmup": 2
       },
       "fwd_msl_paired_ms": {
         "label": "path_b_msl_fwd_paired",
-        "ok": true,
-        "median_ms": 0.2894380013458431,
-        "min_ms": 0.2813749888446182,
-        "max_ms": 0.30529199284501374,
-        "iters": 20,
-        "warmup": 5
+        "ok": false,
+        "median_ms": null,
+        "min_ms": null,
+        "max_ms": null,
+        "iters": 5,
+        "warmup": 2,
+        "error": "not applicable: direct-MSL Path B forward is retired"
       },
       "fwd_path_c_paired_ms": {
         "label": "path_c_tilelang_fwd_paired",
-        "ok": true,
-        "median_ms": 0.28468799428083,
-        "min_ms": 0.269292009761557,
-        "max_ms": 0.6769589963369071,
-        "iters": 20,
-        "warmup": 5,
-        "pair_ratio_median": 0.9835882935834823,
-        "pair_ratio_min": 0.9320740009783308,
-        "pair_ratio_max": 2.301923767770284
+        "ok": false,
+        "median_ms": null,
+        "min_ms": null,
+        "max_ms": null,
+        "iters": 5,
+        "warmup": 2,
+        "error": "not paired because direct-MSL Path B forward is retired"
       },
-      "fwd_path_c_over_path_b_ratio": 0.9708616118868224,
-      "fwd_path_c_over_path_b_paired_ratio": 0.9835882935834823,
+      "fwd_path_c_over_path_b_ratio": Infinity,
+      "fwd_path_c_over_path_b_paired_ratio": Infinity,
+      "fwd_path_c_over_reference_ratio": 0.8998388123958079,
       "path_c_over_path_b_max_ratio": 1.0,
-      "fwd_path_c_no_worse_than_path_b": true,
-      "fwd_path_c_no_worse_than_path_b_paired": true,
-      "fwd_path_c_unpaired_within_max_ratio": true,
+      "path_b_retired": true,
+      "fwd_path_c_ran": true,
+      "fwd_path_c_no_worse_than_path_b": false,
+      "fwd_path_c_no_worse_than_path_b_paired": false,
+      "fwd_path_c_unpaired_within_max_ratio": false,
+      "fwd_path_c_no_worse_than_reference": true,
       "path_b": {
-        "available": true,
-        "reason": "sparse_mla direct-MSL kernel built via mx.fast.metal_kernel is available; bypasses TileLang's T.gemm metal blocker."
+        "available": false,
+        "reason": "sparse_mla direct-MSL Path B is retired for production cleanup: raw _msl_transform.dispatch/mx.fast.metal_kernel callsites are no longer constructed. Use sparse_mla_path_c for the TileLang/tvm-ffi owner-output route, or the pure-MLX reference fallback for unsupported shapes."
       },
       "path_c": {
         "available": true,
-        "reason": "Sparse-MLA Path C forward/backward TileLang DSL ready"
+        "reason": "Sparse-MLA Path C forward/backward TileLang tvm-ffi path ready"
       },
       "bwd_reference_ms": {
         "label": "reference_bwd",
         "ok": true,
-        "median_ms": 1.2627290125237778,
-        "min_ms": 1.2425830063875765,
-        "max_ms": 1.784166001016274,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 1.9968749984400347,
+        "min_ms": 1.8922080053016543,
+        "max_ms": 2.3447499988833442,
+        "iters": 5,
+        "warmup": 2
       },
       "bwd_msl_ms": {
-        "label": "path_b_msl_bwd",
+        "label": "path_b_compat_path_c_owner_output_bwd",
         "ok": true,
-        "median_ms": 0.9198955085594207,
-        "min_ms": 0.894750002771616,
-        "max_ms": 1.328042009845376,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 1.3636250005220063,
+        "min_ms": 1.2471670052036643,
+        "max_ms": 2.7709159985533915,
+        "iters": 5,
+        "warmup": 2
       },
       "bwd_msl_paired_ms": {
-        "label": "path_b_msl_bwd_paired",
+        "label": "path_b_compat_path_c_owner_output_bwd_paired",
         "ok": true,
-        "median_ms": 0.9452085068915039,
-        "min_ms": 0.9216250036843121,
-        "max_ms": 1.341750001301989,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 1.226749998750165,
+        "min_ms": 1.1559589984244667,
+        "max_ms": 1.2271250016056001,
+        "iters": 5,
+        "warmup": 2
       },
       "bwd_msl_kernel_ms": {
-        "label": "path_b_msl_bwd_kernel_only",
+        "label": "path_b_compat_path_c_owner_output_kernel",
         "ok": true,
-        "median_ms": 0.4717914998764172,
-        "min_ms": 0.4510830040089786,
-        "max_ms": 0.8392909949179739,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 1.2840420022257604,
+        "min_ms": 1.2274589971639216,
+        "max_ms": 1.6802499958430417,
+        "iters": 5,
+        "warmup": 2
       },
       "bwd_msl_fresh_reduce_ms": {
         "label": "path_b_msl_bwd_fresh_reduce",
-        "ok": true,
-        "median_ms": 0.9341459808638319,
-        "min_ms": 0.8969170157797635,
-        "max_ms": 1.3196669751778245,
-        "iters": 20,
-        "warmup": 5
+        "ok": false,
+        "median_ms": null,
+        "min_ms": null,
+        "max_ms": null,
+        "iters": 5,
+        "warmup": 2,
+        "error": "not applicable: legacy direct-MSL backward public partial route is retired"
       },
       "bwd_msl_reduce_ms": {
         "label": "path_b_msl_bwd_reduce_only",
-        "ok": true,
-        "median_ms": 0.5492704949574545,
-        "min_ms": 0.5249159876257181,
-        "max_ms": 0.9690420120023191,
-        "iters": 20,
-        "warmup": 5
+        "ok": false,
+        "median_ms": null,
+        "min_ms": null,
+        "max_ms": null,
+        "iters": 5,
+        "warmup": 2,
+        "error": "not applicable: legacy direct-MSL backward public partial route is retired"
       },
       "bwd_path_c_ms": {
         "label": "path_c_tilelang_bwd",
         "ok": true,
-        "median_ms": 0.9337285009678453,
-        "min_ms": 0.9116250148508698,
-        "max_ms": 1.330917002633214,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 1.2718340003630146,
+        "min_ms": 1.1995000022579916,
+        "max_ms": 1.3106669939588755,
+        "iters": 5,
+        "warmup": 2
       },
       "bwd_path_c_paired_ms": {
         "label": "path_c_tilelang_bwd_paired",
         "ok": true,
-        "median_ms": 0.9246459958376363,
-        "min_ms": 0.8993340015877038,
-        "max_ms": 1.3563329994212836,
-        "iters": 20,
-        "warmup": 5,
-        "pair_ratio_median": 0.9806102655446157,
-        "pair_ratio_min": 0.6819765070106556,
-        "pair_ratio_max": 1.4597316598748977
+        "median_ms": 1.2996250006835908,
+        "min_ms": 1.201125000079628,
+        "max_ms": 1.6455829972983338,
+        "iters": 5,
+        "warmup": 2,
+        "pair_ratio_median": 1.1239646372079912,
+        "pair_ratio_min": 0.9788122690270702,
+        "pair_ratio_max": 1.3410068209393609
       },
       "bwd_path_c_kernel_ms": {
-        "label": "path_c_tilelang_bwd_kernel_only",
+        "label": "path_c_tilelang_bwd_owner_output_kernel",
         "ok": true,
-        "median_ms": 0.4746670019812882,
-        "min_ms": 0.4352919931989163,
-        "max_ms": 1.187625020975247,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 1.27841599896783,
+        "min_ms": 1.2207920008222573,
+        "max_ms": 1.4052090045879595,
+        "iters": 5,
+        "warmup": 2
       },
       "bwd_path_c_fresh_reduce_ms": {
         "label": "path_c_tilelang_bwd_fresh_reduce",
-        "ok": true,
-        "median_ms": 0.9259789949283004,
-        "min_ms": 0.8966659952420741,
-        "max_ms": 1.3737500121351331,
-        "iters": 20,
-        "warmup": 5
+        "ok": false,
+        "median_ms": null,
+        "min_ms": null,
+        "max_ms": null,
+        "iters": 5,
+        "warmup": 2,
+        "error": "not applicable: Path C backward returns final owner-output dKV"
       },
       "bwd_path_c_reduce_ms": {
         "label": "path_c_tilelang_bwd_reduce_only",
-        "ok": true,
-        "median_ms": 0.5551664944505319,
-        "min_ms": 0.5293750145938247,
-        "max_ms": 0.8899590175133198,
-        "iters": 20,
-        "warmup": 5
+        "ok": false,
+        "median_ms": null,
+        "min_ms": null,
+        "max_ms": null,
+        "iters": 5,
+        "warmup": 2,
+        "error": "not applicable: Path C backward returns final owner-output dKV"
       },
-      "bwd_path_c_over_path_b_ratio": 1.0150375692453237,
-      "bwd_path_c_over_path_b_paired_ratio": 0.9806102655446157,
-      "bwd_path_c_kernel_over_path_b_kernel_ratio": 1.0060948578039752,
-      "bwd_path_c_fresh_reduce_over_path_b_fresh_reduce_ratio": 0.9912572701667256,
-      "bwd_path_c_reduce_over_path_b_reduce_ratio": 1.0107342366779306,
-      "bwd_path_c_no_worse_than_path_b": true,
-      "bwd_path_c_no_worse_than_path_b_paired": true,
-      "bwd_blocker": "none: Path C backward is within strict ratio 1"
+      "bwd_path_c_over_path_b_ratio": 0.9326860389594989,
+      "bwd_path_c_over_path_b_paired_ratio": 1.1239646372079912,
+      "bwd_path_c_over_reference_ratio": 0.6369121759532147,
+      "bwd_path_c_ran": true,
+      "bwd_path_c_kernel_over_path_b_kernel_ratio": 0.9956185208519829,
+      "bwd_path_c_fresh_reduce_over_path_b_fresh_reduce_ratio": Infinity,
+      "bwd_path_c_reduce_over_path_b_reduce_ratio": Infinity,
+      "bwd_path_c_no_worse_than_path_b": false,
+      "bwd_path_c_no_worse_than_path_b_paired": false,
+      "bwd_path_c_no_worse_than_reference": true,
+      "bwd_blocker": "mixed overhead: Path C backward slower without one phase exceeding 10%"
     },
     {
       "shape": {
@@ -429,184 +453,195 @@
       "fwd_reference_ms": {
         "label": "reference_fwd",
         "ok": true,
-        "median_ms": 1.8740840023383498,
-        "min_ms": 1.803207996999845,
-        "max_ms": 2.326916001038626,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 1.88387500384124,
+        "min_ms": 1.8236249961773865,
+        "max_ms": 2.0186249967082404,
+        "iters": 5,
+        "warmup": 2
       },
       "fwd_apply_ms": {
         "label": "apply_fwd",
         "ok": true,
-        "median_ms": 0.6237290072022006,
-        "min_ms": 0.5895830108784139,
-        "max_ms": 0.8606670016888529,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 1.8497499986551702,
+        "min_ms": 1.7924170024343766,
+        "max_ms": 1.8697089981287718,
+        "iters": 5,
+        "warmup": 2
       },
       "fwd_msl_ms": {
         "label": "path_b_msl_fwd",
-        "ok": true,
-        "median_ms": 0.6102080078562722,
-        "min_ms": 0.5919999966863543,
-        "max_ms": 1.0443749779369682,
-        "iters": 20,
-        "warmup": 5
+        "ok": false,
+        "median_ms": null,
+        "min_ms": null,
+        "max_ms": null,
+        "iters": 5,
+        "warmup": 2,
+        "error": "RuntimeError: Path B sparse_mla_fwd_metal is retired"
       },
       "fwd_path_c_ms": {
         "label": "path_c_tilelang_fwd",
         "ok": true,
-        "median_ms": 0.6164375081425533,
-        "min_ms": 0.5869170126970857,
-        "max_ms": 1.0057500039692968,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 1.469791997806169,
+        "min_ms": 1.0826249999809079,
+        "max_ms": 2.207833000284154,
+        "iters": 5,
+        "warmup": 2
       },
       "fwd_msl_paired_ms": {
         "label": "path_b_msl_fwd_paired",
-        "ok": true,
-        "median_ms": 0.6136874872026965,
-        "min_ms": 0.5938329850323498,
-        "max_ms": 0.8577920089010149,
-        "iters": 20,
-        "warmup": 5
+        "ok": false,
+        "median_ms": null,
+        "min_ms": null,
+        "max_ms": null,
+        "iters": 5,
+        "warmup": 2,
+        "error": "not applicable: direct-MSL Path B forward is retired"
       },
       "fwd_path_c_paired_ms": {
         "label": "path_c_tilelang_fwd_paired",
-        "ok": true,
-        "median_ms": 0.6109584937803447,
-        "min_ms": 0.596124998992309,
-        "max_ms": 1.0199170210398734,
-        "iters": 20,
-        "warmup": 5,
-        "pair_ratio_median": 0.9912078549251371,
-        "pair_ratio_min": 0.7151115939401719,
-        "pair_ratio_max": 1.699388713212629
+        "ok": false,
+        "median_ms": null,
+        "min_ms": null,
+        "max_ms": null,
+        "iters": 5,
+        "warmup": 2,
+        "error": "not paired because direct-MSL Path B forward is retired"
       },
-      "fwd_path_c_over_path_b_ratio": 1.0102088143814534,
-      "fwd_path_c_over_path_b_paired_ratio": 0.9912078549251371,
+      "fwd_path_c_over_path_b_ratio": Infinity,
+      "fwd_path_c_over_path_b_paired_ratio": Infinity,
+      "fwd_path_c_over_reference_ratio": 0.7801961355234549,
       "path_c_over_path_b_max_ratio": 1.0,
-      "fwd_path_c_no_worse_than_path_b": true,
-      "fwd_path_c_no_worse_than_path_b_paired": true,
+      "path_b_retired": true,
+      "fwd_path_c_ran": true,
+      "fwd_path_c_no_worse_than_path_b": false,
+      "fwd_path_c_no_worse_than_path_b_paired": false,
       "fwd_path_c_unpaired_within_max_ratio": false,
+      "fwd_path_c_no_worse_than_reference": true,
       "path_b": {
-        "available": true,
-        "reason": "sparse_mla direct-MSL kernel built via mx.fast.metal_kernel is available; bypasses TileLang's T.gemm metal blocker."
+        "available": false,
+        "reason": "sparse_mla direct-MSL Path B is retired for production cleanup: raw _msl_transform.dispatch/mx.fast.metal_kernel callsites are no longer constructed. Use sparse_mla_path_c for the TileLang/tvm-ffi owner-output route, or the pure-MLX reference fallback for unsupported shapes."
       },
       "path_c": {
         "available": true,
-        "reason": "Sparse-MLA Path C forward/backward TileLang DSL ready"
+        "reason": "Sparse-MLA Path C forward/backward TileLang tvm-ffi path ready"
       },
       "bwd_reference_ms": {
         "label": "reference_bwd",
         "ok": true,
-        "median_ms": 4.046770496643148,
-        "min_ms": 3.8359169848263264,
-        "max_ms": 4.473667009733617,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 4.279375003534369,
+        "min_ms": 4.187457998341415,
+        "max_ms": 4.785750003065914,
+        "iters": 5,
+        "warmup": 2
       },
       "bwd_msl_ms": {
-        "label": "path_b_msl_bwd",
+        "label": "path_b_compat_path_c_owner_output_bwd",
         "ok": true,
-        "median_ms": 3.2136869995156303,
-        "min_ms": 3.03295801859349,
-        "max_ms": 3.6435840011108667,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 3.0103749959380366,
+        "min_ms": 2.917584002716467,
+        "max_ms": 3.323208002257161,
+        "iters": 5,
+        "warmup": 2
       },
       "bwd_msl_paired_ms": {
-        "label": "path_b_msl_bwd_paired",
+        "label": "path_b_compat_path_c_owner_output_bwd_paired",
         "ok": true,
-        "median_ms": 3.3261665084864944,
-        "min_ms": 3.036417008843273,
-        "max_ms": 3.9535420073661953,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 2.9432910014293157,
+        "min_ms": 2.929625006800052,
+        "max_ms": 2.993833004438784,
+        "iters": 5,
+        "warmup": 2
       },
       "bwd_msl_kernel_ms": {
-        "label": "path_b_msl_bwd_kernel_only",
+        "label": "path_b_compat_path_c_owner_output_kernel",
         "ok": true,
-        "median_ms": 1.2828124890802428,
-        "min_ms": 1.2551660183817148,
-        "max_ms": 1.7550410120747983,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 2.933208001195453,
+        "min_ms": 2.8842079991591163,
+        "max_ms": 3.325667006720323,
+        "iters": 5,
+        "warmup": 2
       },
       "bwd_msl_fresh_reduce_ms": {
         "label": "path_b_msl_bwd_fresh_reduce",
-        "ok": true,
-        "median_ms": 3.1402294989675283,
-        "min_ms": 2.9907500138506293,
-        "max_ms": 3.6063339794054627,
-        "iters": 20,
-        "warmup": 5
+        "ok": false,
+        "median_ms": null,
+        "min_ms": null,
+        "max_ms": null,
+        "iters": 5,
+        "warmup": 2,
+        "error": "not applicable: legacy direct-MSL backward public partial route is retired"
       },
       "bwd_msl_reduce_ms": {
         "label": "path_b_msl_bwd_reduce_only",
-        "ok": true,
-        "median_ms": 1.942520510056056,
-        "min_ms": 1.8732919998001307,
-        "max_ms": 2.5217499933205545,
-        "iters": 20,
-        "warmup": 5
+        "ok": false,
+        "median_ms": null,
+        "min_ms": null,
+        "max_ms": null,
+        "iters": 5,
+        "warmup": 2,
+        "error": "not applicable: legacy direct-MSL backward public partial route is retired"
       },
       "bwd_path_c_ms": {
         "label": "path_c_tilelang_bwd",
         "ok": true,
-        "median_ms": 3.176938000251539,
-        "min_ms": 2.994540991494432,
-        "max_ms": 3.5243339953012764,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 2.9663329987670295,
+        "min_ms": 2.8791250006179325,
+        "max_ms": 3.3471249989815988,
+        "iters": 5,
+        "warmup": 2
       },
       "bwd_path_c_paired_ms": {
         "label": "path_c_tilelang_bwd_paired",
         "ok": true,
-        "median_ms": 3.150187520077452,
-        "min_ms": 3.041416988708079,
-        "max_ms": 3.6820419772993773,
-        "iters": 20,
-        "warmup": 5,
-        "pair_ratio_median": 0.9658850779042549,
-        "pair_ratio_min": 0.7962480257215794,
-        "pair_ratio_max": 1.131710842020669
+        "median_ms": 3.019540999957826,
+        "min_ms": 2.9385000016191043,
+        "max_ms": 3.4182499948656186,
+        "iters": 5,
+        "warmup": 2,
+        "pair_ratio_median": 1.0138781399466095,
+        "pair_ratio_min": 1.0023576989263223,
+        "pair_ratio_max": 1.1417637489457748
       },
       "bwd_path_c_kernel_ms": {
-        "label": "path_c_tilelang_bwd_kernel_only",
+        "label": "path_c_tilelang_bwd_owner_output_kernel",
         "ok": true,
-        "median_ms": 1.2379999971017241,
-        "min_ms": 1.2173749855719507,
-        "max_ms": 1.6862500051502138,
-        "iters": 20,
-        "warmup": 5
+        "median_ms": 3.023083001608029,
+        "min_ms": 2.9138329991837963,
+        "max_ms": 3.1780419958522543,
+        "iters": 5,
+        "warmup": 2
       },
       "bwd_path_c_fresh_reduce_ms": {
         "label": "path_c_tilelang_bwd_fresh_reduce",
-        "ok": true,
-        "median_ms": 3.133895486826077,
-        "min_ms": 2.996291994350031,
-        "max_ms": 3.55295799090527,
-        "iters": 20,
-        "warmup": 5
+        "ok": false,
+        "median_ms": null,
+        "min_ms": null,
+        "max_ms": null,
+        "iters": 5,
+        "warmup": 2,
+        "error": "not applicable: Path C backward returns final owner-output dKV"
       },
       "bwd_path_c_reduce_ms": {
         "label": "path_c_tilelang_bwd_reduce_only",
-        "ok": true,
-        "median_ms": 1.9308750052005053,
-        "min_ms": 1.8389580072835088,
-        "max_ms": 2.3501669929828495,
-        "iters": 20,
-        "warmup": 5
+        "ok": false,
+        "median_ms": null,
+        "min_ms": null,
+        "max_ms": null,
+        "iters": 5,
+        "warmup": 2,
+        "error": "not applicable: Path C backward returns final owner-output dKV"
       },
-      "bwd_path_c_over_path_b_ratio": 0.9885648480173613,
-      "bwd_path_c_over_path_b_paired_ratio": 0.9658850779042549,
-      "bwd_path_c_kernel_over_path_b_kernel_ratio": 0.965066997429493,
-      "bwd_path_c_fresh_reduce_over_path_b_fresh_reduce_ratio": 0.9979829461052022,
-      "bwd_path_c_reduce_over_path_b_reduce_ratio": 0.9940049514044952,
-      "bwd_path_c_no_worse_than_path_b": true,
-      "bwd_path_c_no_worse_than_path_b_paired": true,
-      "bwd_blocker": "none: Path C backward is within strict ratio 1"
+      "bwd_path_c_over_path_b_ratio": 0.985369929915564,
+      "bwd_path_c_over_path_b_paired_ratio": 1.0138781399466095,
+      "bwd_path_c_over_reference_ratio": 0.6931696792912778,
+      "bwd_path_c_ran": true,
+      "bwd_path_c_kernel_over_path_b_kernel_ratio": 1.0306405138592103,
+      "bwd_path_c_fresh_reduce_over_path_b_fresh_reduce_ratio": Infinity,
+      "bwd_path_c_reduce_over_path_b_reduce_ratio": Infinity,
+      "bwd_path_c_no_worse_than_path_b": false,
+      "bwd_path_c_no_worse_than_path_b_paired": false,
+      "bwd_path_c_no_worse_than_reference": true,
+      "bwd_blocker": "mixed overhead: Path C backward slower without one phase exceeding 10%"
     }
   ]
 }

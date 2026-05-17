@@ -145,7 +145,7 @@ def test_lint_rejects_raw_metal_kernel_even_in_owned_policy_seam(
 
 
 def test_lint_allows_marked_legacy_debug_direct_msl_module(tmp_path: Path) -> None:
-    source = tmp_path / "cppmega_mlx" / "nn" / "_tilelang" / "topk_selector.py"
+    source = tmp_path / "cppmega_mlx" / "nn" / "_tilelang" / "mamba3.py"
     source.parent.mkdir(parents=True)
     source.write_text(
         "\n".join(
@@ -262,6 +262,152 @@ def test_lint_blocks_direct_native_tvm_ffi_bridge_imports(
     assert result.stderr == ""
 
 
+def test_lint_blocks_model_level_backend_intrinsic_strings(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "cppmega_mlx" / "models" / "bad_backend.py"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        "\n".join(
+            [
+                "def lowered_source() -> str:",
+                "    return 'tir.metal.simd_sum(acc)'",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_lint("--select", "MLX008", source)
+
+    assert result.returncode == 1
+    assert f"{source}:2: MLX008" in result.stdout
+    assert "framework-owned TileLang adapters" in result.stdout
+    assert result.stderr == ""
+
+
+def test_lint_blocks_model_level_backend_intrinsic_imports(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "cppmega_mlx" / "models" / "bad_backend_import.py"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        "\n".join(
+            [
+                "from tir.metal import simd_sum",
+                "",
+                "def lower(acc):",
+                "    return simd_sum(acc)",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_lint("--select", "MLX008", source)
+
+    assert result.returncode == 1
+    assert f"{source}:1: MLX008" in result.stdout
+    assert f"{source}:4: MLX008" in result.stdout
+    assert result.stderr == ""
+
+
+def test_lint_allows_framework_owned_backend_intrinsic_receipts(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "cppmega_mlx" / "nn" / "_tilelang" / "path_c.py"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        "\n".join(
+            [
+                "def features(body: str) -> dict[str, int]:",
+                "    return {'simd_sum': body.count('simd_sum')}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_lint("--select", "MLX008", source)
+
+    assert result.returncode == 0
+    assert result.stdout == ""
+    assert result.stderr == ""
+
+
+def test_lint_blocks_public_partial_output_names(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "cppmega_mlx" / "nn" / "_tilelang" / "bad_partial.py"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        "\n".join(
+            [
+                "import mlx.core as mx",
+                "",
+                "kernel = mx.fast.metal_kernel(",
+                "    name='bad_partial',",
+                "    input_names=['x'],",
+                "    output_names=['dkv_partial'],",
+                "    source='uint elem = thread_position_in_grid.x;'",
+                ")",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_lint("--select", "MLX009", source)
+
+    assert result.returncode == 1
+    assert f"{source}:3: MLX009" in result.stdout
+    assert "final owner outputs" in result.stdout
+    assert result.stderr == ""
+
+
+def test_lint_blocks_public_api_returning_partial_outputs(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "cppmega_mlx" / "nn" / "_tilelang" / "bad_api.py"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        "\n".join(
+            [
+                "def sparse_mla_bwd(x):",
+                "    dkv_partial = x",
+                "    return dkv_partial",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_lint("--select", "MLX009", source)
+
+    assert result.returncode == 1
+    assert f"{source}:3: MLX009" in result.stdout
+    assert result.stderr == ""
+
+
+def test_lint_allows_internal_partial_intermediates(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "cppmega_mlx" / "training" / "ok_partial.py"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        "\n".join(
+            [
+                "def loss_grad(grad_logits, e_chunk):",
+                "    dc = 0",
+                "    dc_partial = grad_logits.T @ e_chunk",
+                "    return dc + dc_partial",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_lint("--select", "MLX009", source)
+
+    assert result.returncode == 0
+    assert result.stdout == ""
+    assert result.stderr == ""
+
+
 def test_lint_blocks_native_tvm_ffi_bridge_parent_imports(
     tmp_path: Path,
 ) -> None:
@@ -339,8 +485,21 @@ def test_lint_blocks_monkeypatch_patterns_in_production_modules(
 def test_lint_production_direct_msl_and_monkeypatch_guardrails_are_green() -> None:
     result = run_lint(
         "--select",
-        "MLX002,MLX005,MLX006,MLX007",
+        "MLX002,MLX005,MLX006,MLX007,MLX008,MLX009",
         ROOT / "cppmega_mlx",
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == ""
+    assert result.stderr == ""
+
+
+def test_lint_direct_msl_and_monkeypatch_guardrails_are_green_with_tests() -> None:
+    result = run_lint(
+        "--select",
+        "MLX002,MLX005,MLX006,MLX007,MLX008,MLX009",
+        ROOT / "cppmega_mlx",
+        ROOT / "tests",
     )
 
     assert result.returncode == 0
@@ -359,14 +518,14 @@ def test_lint_explains_legacy_direct_msl_reduction_allowlist() -> None:
     assert mamba3["kind"] == "legacy_path_b_fallback"
     assert "slower on the checked-in receipt" in mamba3["reason"]
     assert mamba3["replacement"].endswith("mamba3_path_c.py")
-    assert mamba3["public_partial_outputs"] == [
-        "dB_partial",
-        "dC_partial",
-        "dA_partial",
-        "ddt_partial",
-        "dD_partial",
-    ]
-    assert "host_sum" in mamba3["reduction_surface"]
+    assert mamba3["public_partial_outputs"] == []
+    assert mamba3["reduction_surface"] == ["atomic_owner_output_p_axis"]
+    assert "final owner-output" in mamba3["reason"]
+    assert "cppmega_mlx/nn/_tilelang/fp8_msl_kernels.py" not in by_path
+    assert "cppmega_mlx/nn/_tilelang/sparse_mla_blockscaled.py" not in by_path
+    assert "cppmega_mlx/nn/_tilelang/m2rnn.py" not in by_path
+    assert "tests/test_tilelang_msl_transform.py" not in by_path
+    assert "cppmega_mlx/nn/_tilelang/sparse_mla.py" not in by_path
 
 
 def test_lint_requires_custom_gradient_when_metal_kernel_enters_autodiff(

@@ -12,7 +12,6 @@ from typing import Literal, TypedDict, cast
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.nn.utils import checkpoint as nn_checkpoint
 
 from cppmega_mlx.data.packing import mlx_document_boundary_mask
 from cppmega_mlx.inference.engine import ContiguousKVCache, kv_cache_position
@@ -568,7 +567,7 @@ class HybridTinyLM(nn.Module):
                 )
         if self.config.grad_checkpoint:
             for layer in self.layers:
-                hidden_states = nn_checkpoint(layer)(hidden_states, mask)
+                hidden_states = mx.checkpoint(layer)(hidden_states, mask)
         else:
             attention_layer_idx = 0
             for layer in self.layers:

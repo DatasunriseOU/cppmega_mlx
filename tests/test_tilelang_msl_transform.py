@@ -1,4 +1,4 @@
-"""Focused tests for source-level TileLang MSL canonicalization."""
+"""Focused debug direct-MSL tests for source-level TileLang MSL canonicalization."""
 
 from __future__ import annotations
 
@@ -10,8 +10,8 @@ from cppmega_mlx.nn._tilelang._msl_transform import (
     _ensure_single_libtvm_ffi_image,
     _parse_buffer_param_names,
     _inline_tilelang_kernel_body,
+    _resolve_dispatch_launch_shape,
     _split_kernel_msl,
-    dispatch,
     metal_grid_for_lowering,
 )
 
@@ -140,7 +140,7 @@ def test_metal_grid_for_lowering_expands_tilelang_blocks_to_thread_grid() -> Non
     assert metal_grid_for_lowering(lowering) == (16, 48, 4)
 
 
-def test_dispatch_uses_lowering_launch_grid_for_tilelang_blocks() -> None:
+def test_dispatch_launch_shape_uses_lowering_tilelang_blocks() -> None:
     lowering = TileLangMSLLowering(
         header="",
         body="",
@@ -150,25 +150,15 @@ def test_dispatch_uses_lowering_launch_grid_for_tilelang_blocks() -> None:
         buffer_param_names=[],
         kernel_name="k",
     )
-    seen: dict[str, object] = {}
 
-    def fake_kernel(**kwargs: object) -> list[object]:
-        seen.update(kwargs)
-        return []
-
-    assert dispatch(
-        fake_kernel,  # type: ignore[arg-type]
-        inputs=[],
-        output_shapes=[],
-        output_dtypes=[],
+    assert _resolve_dispatch_launch_shape(
+        input_count=0,
+        output_count=0,
         lowering=lowering,
-    ) == []
-
-    assert seen["grid"] == (32, 24, 1)
-    assert seen["threadgroup"] == (16, 8, 1)
+    ) == ((32, 24, 1), (16, 8, 1))
 
 
-def test_dispatch_rejects_conflicting_lowering_launch_grid() -> None:
+def test_dispatch_launch_shape_rejects_conflicting_lowering_grid() -> None:
     lowering = TileLangMSLLowering(
         header="",
         body="",
@@ -180,11 +170,9 @@ def test_dispatch_rejects_conflicting_lowering_launch_grid() -> None:
     )
 
     with pytest.raises(ValueError, match="conflicting dispatch grid"):
-        dispatch(
-            lambda **_: [],  # type: ignore[arg-type]
-            inputs=[],
-            output_shapes=[],
-            output_dtypes=[],
+        _resolve_dispatch_launch_shape(
+            input_count=0,
+            output_count=0,
             grid=(2, 1, 1),
             threadgroup=(16, 1, 1),
             lowering=lowering,

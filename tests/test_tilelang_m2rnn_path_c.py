@@ -13,12 +13,10 @@ import mlx.core as mx
 import mlx.nn as nn
 
 import cppmega_mlx.nn._tilelang.m2rnn_path_c as m2rnn_path_c
-from cppmega_mlx.nn._tilelang import _msl_transform
 from cppmega_mlx.nn._tilelang.m2rnn import (
     m2rnn_apply,
     m2rnn_bwd_metal,
     m2rnn_fwd_metal,
-    m2rnn_metal_status,
     m2rnn_reference,
 )
 from cppmega_mlx.nn._tilelang.m2rnn_path_c import (
@@ -88,15 +86,15 @@ def test_m2rnn_path_c_launch_geometry_comes_from_tilelang_lowering() -> None:
         1, 4, 2, 4, 4, "float32"
     )
     assert fwd_lowering.grid == (1, 1, 1)
-    assert fwd_lowering.threadgroup == (8, 1, 1)
-    assert _msl_transform.metal_grid_for_lowering(fwd_lowering) == (8, 1, 1)
+    assert fwd_lowering.threadgroup == (1, 1, 1)
+    assert "m2rnn_path_c_fwd_1_4_2_4_4_float32" in fwd_lowering.msl_text
 
     _bwd_kernel, bwd_lowering = m2rnn_path_c._bwd_kernel_for(
         1, 4, 2, 4, 4, "float32"
     )
     assert bwd_lowering.grid == (1, 1, 1)
-    assert bwd_lowering.threadgroup == (2, 1, 1)
-    assert _msl_transform.metal_grid_for_lowering(bwd_lowering) == (2, 1, 1)
+    assert bwd_lowering.threadgroup == (1, 1, 1)
+    assert "m2rnn_path_c_bwd_1_4_2_4_4_float32" in bwd_lowering.msl_text
 
 
 def test_m2rnn_packed_path_c_large_k_uses_k_parallel_lowering() -> None:
@@ -105,16 +103,18 @@ def test_m2rnn_packed_path_c_large_k_uses_k_parallel_lowering() -> None:
     _fwd_kernel, fwd_lowering = m2rnn_path_c._packed_fwd_kernel_for(
         1, 4, 2, 16, 4, "float32"
     )
-    assert fwd_lowering.grid == (2, 1, 1)
-    assert fwd_lowering.threadgroup == (16, 1, 1)
-    assert _msl_transform.metal_grid_for_lowering(fwd_lowering) == (32, 1, 1)
+    assert fwd_lowering.grid == (1, 1, 1)
+    assert fwd_lowering.threadgroup == (1, 1, 1)
+    assert "m2rnn_packed_fwd_kp_1_4_2_16_4_float32" in fwd_lowering.msl_text
+    assert "thread_position_in_threadgroup" in fwd_lowering.msl_text
 
     _bwd_kernel, bwd_lowering = m2rnn_path_c._packed_bwd_kernel_for(
         1, 4, 2, 16, 4, "float32"
     )
-    assert bwd_lowering.grid == (2, 1, 1)
-    assert bwd_lowering.threadgroup == (16, 1, 1)
-    assert _msl_transform.metal_grid_for_lowering(bwd_lowering) == (32, 1, 1)
+    assert bwd_lowering.grid == (1, 1, 1)
+    assert bwd_lowering.threadgroup == (1, 1, 1)
+    assert "m2rnn_packed_bwd_kp_1_4_2_16_4_float32" in bwd_lowering.msl_text
+    assert "thread_position_in_threadgroup" in bwd_lowering.msl_text
 
 
 def test_m2rnn_packed_path_c_small_k_uses_k_parallel_lowering() -> None:
@@ -123,16 +123,18 @@ def test_m2rnn_packed_path_c_small_k_uses_k_parallel_lowering() -> None:
     _fwd_kernel, fwd_lowering = m2rnn_path_c._packed_fwd_kernel_for(
         1, 4, 2, 4, 4, "float32"
     )
-    assert fwd_lowering.grid == (2, 1, 1)
-    assert fwd_lowering.threadgroup == (4, 1, 1)
-    assert _msl_transform.metal_grid_for_lowering(fwd_lowering) == (8, 1, 1)
+    assert fwd_lowering.grid == (1, 1, 1)
+    assert fwd_lowering.threadgroup == (1, 1, 1)
+    assert "m2rnn_packed_fwd_kp_1_4_2_4_4_float32" in fwd_lowering.msl_text
+    assert "thread_position_in_threadgroup" in fwd_lowering.msl_text
 
     _bwd_kernel, bwd_lowering = m2rnn_path_c._packed_bwd_kernel_for(
         1, 4, 2, 4, 4, "float32"
     )
-    assert bwd_lowering.grid == (2, 1, 1)
-    assert bwd_lowering.threadgroup == (4, 1, 1)
-    assert _msl_transform.metal_grid_for_lowering(bwd_lowering) == (8, 1, 1)
+    assert bwd_lowering.grid == (1, 1, 1)
+    assert bwd_lowering.threadgroup == (1, 1, 1)
+    assert "m2rnn_packed_bwd_kp_1_4_2_4_4_float32" in bwd_lowering.msl_text
+    assert "thread_position_in_threadgroup" in bwd_lowering.msl_text
 
 
 def test_m2rnn_apply_path_c_fails_closed_instead_of_path_b(
@@ -198,9 +200,8 @@ def _require_m2rnn_path_c() -> None:
         pytest.skip(f"m2rnn Path C unavailable on this host: {status.reason}")
 
 
-def test_m2rnn_path_c_forward_matches_path_b_when_available() -> None:
-    """When ``m2rnn_path_c.m2rnn_apply_path_c`` exists, it must match Path B
-    within fp32 tolerance on a small canonical shape."""
+def test_m2rnn_path_c_forward_matches_reference_compat_surface() -> None:
+    """Path C must match the reference compatibility surface on a small shape."""
 
     module = _try_import_m2rnn_path_c()
     if module is None:
@@ -216,8 +217,8 @@ def test_m2rnn_path_c_forward_matches_path_b_when_available() -> None:
 
     inputs = _make_m2rnn_inputs(dtype=mx.float32)
     y_pc = apply_path_c(*inputs, force_path_c=True)
-    y_pb = m2rnn_apply(*inputs)
-    np.testing.assert_allclose(_np(y_pc), _np(y_pb), rtol=1e-3, atol=1e-4)
+    y_ref = m2rnn_apply(*inputs)
+    np.testing.assert_allclose(_np(y_pc), _np(y_ref), rtol=1e-3, atol=1e-4)
 
 
 def test_m2rnn_path_c_with_state_matches_raw_forward() -> None:
@@ -686,10 +687,8 @@ def test_m2rnn_post_residual_gate_path_c_matches_grouped_mlx_and_grad() -> None:
         np.testing.assert_allclose(_np(got), _np(expected), rtol=2e-3, atol=2e-4)
 
 
-def test_m2rnn_packed_path_c_k_parallel_matches_path_b_backward() -> None:
+def test_m2rnn_packed_path_c_k_parallel_matches_reference_backward() -> None:
     _require_m2rnn_path_c()
-    if not m2rnn_metal_status().available:
-        pytest.skip("m2rnn Metal Path B is not available on this host")
 
     inputs = _make_m2rnn_inputs(seq=4, k_dim=16, v_dim=4, dtype=mx.float32)
     q, k, v, W, xf, h0 = inputs
@@ -712,7 +711,7 @@ def test_m2rnn_packed_path_c_k_parallel_matches_path_b_backward() -> None:
     )
     assert packed_full is not None
     y_packed, h_packed, tanh_packed = packed_full
-    y_path_b, h_path_b, tanh_path_b = m2rnn_fwd_metal(*inputs)
+    y_ref, h_ref, tanh_ref = m2rnn_fwd_metal(*inputs)
     grads_packed = m2rnn_packed_bwd_path_c(
         dy,
         conv_input,
@@ -721,8 +720,8 @@ def test_m2rnn_packed_path_c_k_parallel_matches_path_b_backward() -> None:
         tanh_packed,
         h0,
     )
-    grads_path_b = m2rnn_bwd_metal(dy, q, k, v, W, xf, tanh_path_b, h0)
-    mx.eval(y_packed, h_packed, y_path_b, h_path_b, *grads_packed, *grads_path_b)
+    grads_ref = m2rnn_bwd_metal(dy, q, k, v, W, xf, tanh_ref, h0)
+    mx.eval(y_packed, h_packed, y_ref, h_ref, *grads_packed, *grads_ref)
 
     dconv, dW_packed, dxf_packed, dh0_packed = grads_packed
     dq_packed = dconv[:, :, : q.shape[2] * q.shape[3]].reshape(q.shape)
@@ -739,9 +738,9 @@ def test_m2rnn_packed_path_c_k_parallel_matches_path_b_backward() -> None:
         dh0_packed,
     )
 
-    np.testing.assert_allclose(_np(y_packed), _np(y_path_b), rtol=1e-6, atol=1e-6)
-    np.testing.assert_allclose(_np(h_packed), _np(h_path_b), rtol=1e-6, atol=1e-6)
-    for got, expected in zip(packed_parts, grads_path_b, strict=True):
+    np.testing.assert_allclose(_np(y_packed), _np(y_ref), rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(_np(h_packed), _np(h_ref), rtol=1e-6, atol=1e-6)
+    for got, expected in zip(packed_parts, grads_ref, strict=True):
         np.testing.assert_allclose(_np(got), _np(expected), rtol=2e-3, atol=2e-4)
 
 
@@ -999,10 +998,8 @@ def test_m2rnn_path_c_mixed_dtype_fails_closed_without_hidden_casts() -> None:
     ) is None
 
 
-def test_m2rnn_path_c_backward_matches_path_b_when_available() -> None:
+def test_m2rnn_path_c_backward_matches_reference_compat_surface() -> None:
     _require_m2rnn_path_c()
-    if not m2rnn_metal_status().available:
-        pytest.skip("m2rnn Metal Path B is not available on this host")
 
     inputs = _make_m2rnn_inputs(dtype=mx.float32)
     q, k, v, W, xf, h0 = inputs
@@ -1020,16 +1017,14 @@ def test_m2rnn_path_c_backward_matches_path_b_when_available() -> None:
         h0,
         force_path_c=True,
     )
-    grads_pb = m2rnn_bwd_metal(dy, q, k, v, W, xf, tanh_cache, h0)
-    mx.eval(*grads_pc, *grads_pb)
-    for got, expected in zip(grads_pc, grads_pb):
+    grads_ref = m2rnn_bwd_metal(dy, q, k, v, W, xf, tanh_cache, h0)
+    mx.eval(*grads_pc, *grads_ref)
+    for got, expected in zip(grads_pc, grads_ref):
         np.testing.assert_allclose(_np(got), _np(expected), rtol=2e-3, atol=2e-4)
 
 
 def test_m2rnn_path_c_vjp_runs_under_mlx_graph_transform() -> None:
     _require_m2rnn_path_c()
-    if not m2rnn_metal_status().available:
-        pytest.skip("m2rnn Metal Path B is not available on this host")
 
     inputs = _make_m2rnn_inputs(dtype=mx.float32)
 
@@ -1037,14 +1032,14 @@ def test_m2rnn_path_c_vjp_runs_under_mlx_graph_transform() -> None:
         y = m2rnn_apply_path_c(q, k, v, W, xf, h0, force_path_c=True)
         return mx.sum(y * y) * 0.5
 
-    def path_b_loss(q, k, v, W, xf, h0):  # type: ignore[no-untyped-def]
+    def reference_loss(q, k, v, W, xf, h0):  # type: ignore[no-untyped-def]
         y = m2rnn_apply(q, k, v, W, xf, h0)
         return mx.sum(y * y) * 0.5
 
     grads_pc = mx.grad(path_c_loss, argnums=tuple(range(6)))(*inputs)
-    grads_pb = mx.grad(path_b_loss, argnums=tuple(range(6)))(*inputs)
-    mx.eval(*grads_pc, *grads_pb)
-    for got, expected in zip(grads_pc, grads_pb, strict=True):
+    grads_ref = mx.grad(reference_loss, argnums=tuple(range(6)))(*inputs)
+    mx.eval(*grads_pc, *grads_ref)
+    for got, expected in zip(grads_pc, grads_ref, strict=True):
         got_np = _np(got)
         assert np.isfinite(got_np).all()
         np.testing.assert_allclose(got_np, _np(expected), rtol=2e-3, atol=2e-4)

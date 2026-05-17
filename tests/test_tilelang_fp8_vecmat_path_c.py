@@ -1,8 +1,8 @@
 # pyright: reportMissingImports=false
 """Tests for the Path C TileLang DSL FP8 vecmat reducer.
 
-Path C targets the same M=1, transpose-B vecmat contract as Path B's
-hand-written ``fp8_scaled_vecmat`` MSL kernel. These tests keep the DSL kernel
+Path C targets the same M=1, transpose-B vecmat contract as the retired
+``fp8_scaled_vecmat`` compatibility helper. These tests keep the DSL kernel
 checked in and assert the default Metal lowering uses Path B-style packed
 uint32 loads with a LUT decode. The single-warp allreduce should lower to
 Metal SIMDgroup reduction code.
@@ -217,7 +217,7 @@ def test_invalid_shapes_raise(kwargs: dict[str, object]) -> None:
 
 
 @pytest.mark.skipif(not _metal_available(), reason="Metal unavailable")
-def test_path_c_vecmat_matches_path_b_scalar_scale() -> None:
+def test_path_c_vecmat_matches_reference_scalar_scale() -> None:
     _require_fp8_vecmat_path_c_available()
     rng = np.random.default_rng(23)
     N, K = 24, 64
@@ -229,7 +229,7 @@ def test_path_c_vecmat_matches_path_b_scalar_scale() -> None:
     sw = mx.array([0.75], dtype=mx.float32)
     mx.eval(x_fp8, W_fp8, sx, sw)
 
-    path_b = fp8_scaled_vecmat(x_fp8, W_fp8, scale_x=sx, scale_w=sw)
+    reference = fp8_scaled_vecmat(x_fp8, W_fp8, scale_x=sx, scale_w=sw)
     out = mx.zeros((N,), dtype=mx.float32)
     path_c = fp8_scaled_vecmat_path_c(
         x_fp8,
@@ -239,14 +239,14 @@ def test_path_c_vecmat_matches_path_b_scalar_scale() -> None:
         out=out,
     )
 
-    mx.eval(path_b, path_c)
+    mx.eval(reference, path_c)
     np.testing.assert_allclose(
-        np.asarray(path_c), np.asarray(path_b), rtol=1e-5, atol=1e-5
+        np.asarray(path_c), np.asarray(reference), rtol=1e-5, atol=1e-5
     )
 
 
 @pytest.mark.skipif(not _metal_available(), reason="Metal unavailable")
-def test_path_c_vecmat_matches_path_b_per_row_scale() -> None:
+def test_path_c_vecmat_matches_reference_per_row_scale() -> None:
     _require_fp8_vecmat_path_c_available()
     rng = np.random.default_rng(24)
     N, K = 24, 64
@@ -258,7 +258,7 @@ def test_path_c_vecmat_matches_path_b_per_row_scale() -> None:
     sw = mx.array(rng.uniform(0.5, 2.0, size=N).astype(np.float32))
     mx.eval(x_fp8, W_fp8, sx, sw)
 
-    path_b = fp8_scaled_vecmat(x_fp8, W_fp8, scale_x=sx, scale_w=sw)
+    reference = fp8_scaled_vecmat(x_fp8, W_fp8, scale_x=sx, scale_w=sw)
     out = mx.zeros((N,), dtype=mx.float32)
     path_c = fp8_scaled_vecmat_path_c(
         x_fp8,
@@ -268,9 +268,9 @@ def test_path_c_vecmat_matches_path_b_per_row_scale() -> None:
         out=out,
     )
 
-    mx.eval(path_b, path_c)
+    mx.eval(reference, path_c)
     np.testing.assert_allclose(
-        np.asarray(path_c), np.asarray(path_b), rtol=1e-5, atol=1e-5
+        np.asarray(path_c), np.asarray(reference), rtol=1e-5, atol=1e-5
     )
 
 
@@ -623,7 +623,7 @@ def test_fp8_vecmat_direct_compile_failure_is_typed(
 
 
 @pytest.mark.skipif(not _metal_available(), reason="Metal unavailable")
-def test_fp8_vecmat_direct_tvm_ffi_reuses_owner_output_and_matches_path_b() -> None:
+def test_fp8_vecmat_direct_tvm_ffi_reuses_owner_output_and_matches_reference() -> None:
     _require_fp8_vecmat_path_c_available()
     rng = np.random.default_rng(26)
     N, K = 24, 64
@@ -633,7 +633,7 @@ def test_fp8_vecmat_direct_tvm_ffi_reuses_owner_output_and_matches_path_b() -> N
     W_fp8 = mx.to_fp8(W)
     scale_x = mx.array([1.25], dtype=mx.float32)
     scale_w = mx.array(rng.uniform(0.5, 2.0, size=N).astype(np.float32))
-    path_b = fp8_scaled_vecmat(x_fp8, W_fp8, scale_x=scale_x, scale_w=scale_w)
+    reference = fp8_scaled_vecmat(x_fp8, W_fp8, scale_x=scale_x, scale_w=scale_w)
 
     for dtype in _owner_output_dtypes():
         out = mx.zeros((N,), dtype=dtype)
@@ -646,7 +646,7 @@ def test_fp8_vecmat_direct_tvm_ffi_reuses_owner_output_and_matches_path_b() -> N
             scale_w=scale_w,
             out=out,
         )
-        expected = path_b.astype(dtype).astype(mx.float32)
+        expected = reference.astype(dtype).astype(mx.float32)
         mx.eval(returned, expected)
 
         assert returned is not out

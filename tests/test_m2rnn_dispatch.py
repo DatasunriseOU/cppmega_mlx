@@ -2,9 +2,9 @@
 
 These tests verify that :class:`cppmega_mlx.nn.m2rnn.M2RNNMixer` honors the
 :class:`cppmega_mlx.runtime.kernel_policy.KernelPath` selection and records
-the actual kernel used into the dispatch log. They run on Metal when
-available; on hosts without Metal the AUTO/PATH_B paths gracefully fall
-back to the reference (PATH_B raises in that case).
+the actual kernel used into the dispatch log. M2RNN direct-MSL Path B is
+retired; AUTO uses the correctness-first reference route while explicit
+PATH_C exercises the TileLang route.
 """
 
 from __future__ import annotations
@@ -55,9 +55,7 @@ def _reset(monkeypatch: pytest.MonkeyPatch):
     clear_dispatch_log()
 
 
-def test_default_auto_dispatches_path_b_when_metal_available() -> None:
-    if not _METAL_AVAILABLE:
-        pytest.skip("Metal not available")
+def test_default_auto_dispatches_without_path_b() -> None:
     block, hidden = _make_block()
     assert selected_path("m2rnn") is KernelPath.AUTO
     out, _ = block(hidden)
@@ -66,7 +64,10 @@ def test_default_auto_dispatches_path_b_when_metal_available() -> None:
     matches = [e for e in log if e["op_name"] == "m2rnn"]
     assert matches, f"no m2rnn dispatch recorded: {log}"
     assert matches[-1]["path"] == "auto"
-    assert matches[-1]["kernel_used"] == "metal_kernel_fwd_v1"
+    assert matches[-1]["kernel_used"] in {
+        "path_c_tilelang_dsl_packed_post",
+        "reference_pure_mlx",
+    }
 
 
 def test_reference_policy_forces_pure_mlx(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -79,16 +80,15 @@ def test_reference_policy_forces_pure_mlx(monkeypatch: pytest.MonkeyPatch) -> No
     assert matches[-1]["kernel_used"] == "reference_pure_mlx"
 
 
-def test_path_b_policy_forces_metal(monkeypatch: pytest.MonkeyPatch) -> None:
-    if not _METAL_AVAILABLE:
-        pytest.skip("Metal not available")
+def test_path_b_policy_fails_closed_after_retirement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("CPPMEGA_KERNEL_PATH", "path_b")
     block, hidden = _make_block()
-    out, _ = block(hidden)
-    mx.eval(out)
+    with pytest.raises(RuntimeError, match="Path B direct-MSL kernel is retired"):
+        block(hidden)
     matches = [e for e in get_dispatch_log() if e["op_name"] == "m2rnn"]
-    assert matches[-1]["path"] == "path_b"
-    assert matches[-1]["kernel_used"] == "metal_kernel_fwd_v1"
+    assert not matches
 
 
 def test_path_c_dispatches_grouped_heads_without_path_b_fallback(
@@ -584,9 +584,7 @@ def test_per_op_override_selects_reference(monkeypatch: pytest.MonkeyPatch) -> N
     assert matches[-1]["kernel_used"] == "reference_pure_mlx"
 
 
-def test_block_grad_flows_through_path_b(monkeypatch: pytest.MonkeyPatch) -> None:
-    if not _METAL_AVAILABLE:
-        pytest.skip("Metal not available")
+def test_block_grad_flows_through_auto_route(monkeypatch: pytest.MonkeyPatch) -> None:
     from mlx.utils import tree_flatten
 
     monkeypatch.setenv("CPPMEGA_KERNEL_PATH", "auto")
@@ -608,31 +606,29 @@ def test_block_grad_flows_through_path_b(monkeypatch: pytest.MonkeyPatch) -> Non
         assert np.all(np.isfinite(arr))
 
 
-def test_block_path_b_matches_reference_within_tolerance(
+def test_block_auto_matches_reference_within_tolerance(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Forward equality between Path B and the pure-MLX reference."""
+    """Forward equality between AUTO and the pure-MLX reference."""
 
-    if not _METAL_AVAILABLE:
-        pytest.skip("Metal not available")
     block, hidden = _make_block(seed=4)
 
     monkeypatch.setenv("CPPMEGA_KERNEL_PATH", "ref")
     out_ref, h_ref = block(hidden)
     mx.eval(out_ref, h_ref)
 
-    monkeypatch.setenv("CPPMEGA_KERNEL_PATH", "path_b")
-    out_b, h_b = block(hidden)
-    mx.eval(out_b, h_b)
+    monkeypatch.setenv("CPPMEGA_KERNEL_PATH", "auto")
+    out_auto, h_auto = block(hidden)
+    mx.eval(out_auto, h_auto)
 
     np.testing.assert_allclose(
-        np.array(out_b).astype(np.float32),
+        np.array(out_auto).astype(np.float32),
         np.array(out_ref).astype(np.float32),
         rtol=5e-3,
         atol=5e-3,
     )
     np.testing.assert_allclose(
-        np.array(h_b).astype(np.float32),
+        np.array(h_auto).astype(np.float32),
         np.array(h_ref).astype(np.float32),
         rtol=5e-3,
         atol=5e-3,
@@ -642,16 +638,17 @@ def test_block_path_b_matches_reference_within_tolerance(
 def test_return_state_routes_through_dispatcher(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Cache assembly path also picks up h_last from Path B."""
+    """Cache assembly path also picks up h_last from the selected route."""
 
-    if not _METAL_AVAILABLE:
-        pytest.skip("Metal not available")
-    monkeypatch.setenv("CPPMEGA_KERNEL_PATH", "path_b")
+    monkeypatch.setenv("CPPMEGA_KERNEL_PATH", "auto")
     block, hidden = _make_block(seed=5)
     out, mixer_state = block(hidden, return_state=True)
     mx.eval(out, mixer_state.h, mixer_state.conv_state)
     matches = [e for e in get_dispatch_log() if e["op_name"] == "m2rnn"]
-    assert matches[-1]["kernel_used"] == "metal_kernel_fwd_v1"
+    assert matches[-1]["kernel_used"] in {
+        "path_c_tilelang_dsl_packed_post",
+        "reference_pure_mlx",
+    }
     cfg = block.config
     assert mixer_state.h.shape == (
         1, cfg.num_heads, cfg.k_head_dim, cfg.v_head_dim,
@@ -663,7 +660,7 @@ def test_hybrid_lm_e2e_with_r_block_trains_loss_decreases(
 ) -> None:
     """A tiny HybridLM with an R block trains for 5 steps; loss should decrease.
 
-    Verifies the dispatch log shows m2rnn ran on Path B by default.
+    Verifies the dispatch log shows m2rnn avoided the retired Path B route.
     """
 
     if not _METAL_AVAILABLE:
@@ -712,10 +709,10 @@ def test_hybrid_lm_e2e_with_r_block_trains_loss_decreases(
     # Final loss should be lower than initial (or equal — we use a very small lr).
     assert losses[-1] <= losses[0] + 1e-3, f"loss did not decrease: {losses}"
 
-    # Dispatch should have recorded a Path B m2rnn run.
+    # Dispatch should have recorded an M2RNN run without direct-MSL Path B.
     log = get_dispatch_log()
     matches = [e for e in log if e["op_name"] == "m2rnn"]
     assert matches, f"no m2rnn dispatch in log: {log}"
-    assert any(m["kernel_used"] == "metal_kernel_fwd_v1" for m in matches), (
-        f"expected at least one path_b dispatch, log: {matches}"
+    assert all(m["kernel_used"] != "metal_kernel_fwd_v1" for m in matches), (
+        f"unexpected retired path_b dispatch, log: {matches}"
     )

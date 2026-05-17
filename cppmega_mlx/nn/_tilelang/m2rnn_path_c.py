@@ -55,6 +55,10 @@ def _symbol_part(value: object) -> str:
     )
 
 
+def _array_signature(*arrays: mx.array) -> tuple[tuple[tuple[int, ...], str], ...]:
+    return tuple((tuple(array.shape), str(array.dtype)) for array in arrays)
+
+
 def _with_global_symbol(func: Any, prefix: str, *parts: object) -> Any:
     suffix = "_".join(_symbol_part(part) for part in parts)
     return func.with_attr({"global_symbol": f"{prefix}_{suffix}"})
@@ -3015,29 +3019,12 @@ def m2rnn_mapped_packed_path_c_status(
     if not fwd_status.available:
         return fwd_status
     if require_backward:
-        dy_dtypes = [carrier_dtype]
-        if carrier_dtype != "float32":
-            dy_dtypes.append("float32")
-        for dy_dtype in dy_dtypes:
-            bwd_status = _kernel_lowering_status(
-                f"mapped packed M2RNN Path C {carrier_dtype} K={k_dim} bwd dy={dy_dtype}",
-                _mapped_packed_bwd_kernel_for,
-                batch,
-                seq,
-                total_heads,
-                q_heads,
-                k_heads,
-                v_heads,
-                w_heads,
-                f_heads,
-                k_dim,
-                v_dim,
-                carrier_dtype,
-                dy_dtype,
-                "float32",
-            )
-            if not bwd_status.available:
-                return bwd_status
+        return M2RNNPathCStatus(
+            True,
+            "mapped packed M2RNN Path C forward lowers to Metal; grouped "
+            "backward uses the pure-MLX reference VJP until native atomic "
+            "owner-output accumulation is proven stable",
+        )
     return M2RNNPathCStatus(
         True,
         f"mapped packed M2RNN Path C {carrier_dtype} K={k_dim} is dispatchable",
@@ -3517,73 +3504,138 @@ def _mapped_packed_path_c_inputs_well_formed(
         return False
 
 
-def _m2rnn_mapped_packed_bwd_owner_outputs(
-    out: M2RNNPackedBwdOwnerOutputs | None,
+def _expand_mapped_heads_for_reference(
+    x: mx.array,
     *,
-    batch: int,
-    seq: int,
+    axis: int,
     total_heads: int,
-    w_heads: int,
-    f_heads: int,
-    conv_dim: int,
-    k_dim: int,
-    v_dim: int,
-    carrier_dtype: mx.Dtype,
-    grad_dtype: mx.Dtype,
-) -> M2RNNPackedBwdOwnerOutputs:
-    op_name = "m2rnn_mapped_packed_bwd_path_c"
-    if out is None:
-        return (
-            mx.zeros((batch, seq, conv_dim), dtype=grad_dtype),
-            mx.zeros((w_heads, v_dim, v_dim), dtype=grad_dtype),
-            mx.zeros((batch, seq, f_heads), dtype=grad_dtype),
-            mx.zeros((batch, total_heads, k_dim, v_dim), dtype=grad_dtype),
-            mx.zeros((batch, total_heads, seq, k_dim, v_dim), dtype=carrier_dtype),
+) -> mx.array:
+    heads = int(x.shape[axis])
+    if heads == total_heads:
+        return x
+    if heads == 1:
+        target_shape = list(x.shape)
+        target_shape[axis] = total_heads
+        return mx.broadcast_to(x, tuple(target_shape))
+    return mx.repeat(x, repeats=total_heads // heads, axis=axis)
+
+
+def _m2rnn_mapped_packed_reference_bwd(
+    dy: mx.array,
+    conv_input: mx.array,
+    W: mx.array,
+    xf: mx.array,
+    h0: mx.array,
+    *,
+    q_heads: int,
+    k_heads: int,
+    v_heads: int,
+) -> tuple[mx.array, mx.array, mx.array, mx.array]:
+    from cppmega_mlx.nn._tilelang.m2rnn import m2rnn_reference
+
+    batch, seq, conv_dim = conv_input.shape
+    total_heads = int(h0.shape[1])
+    k_dim = int(h0.shape[2])
+    v_dim = int(h0.shape[3])
+    if conv_dim != _mapped_conv_dim(q_heads, k_heads, v_heads, k_dim, v_dim):
+        raise ValueError("conv_input width does not match mapped M2RNN head layout")
+    if dy.shape != (batch, seq, total_heads, v_dim):
+        raise ValueError(f"dy must be {(batch, seq, total_heads, v_dim)}, got {dy.shape}")
+    q_stop = q_heads * k_dim
+    k_stop = q_stop + k_heads * k_dim
+
+    def reference_apply(
+        conv_input_: mx.array,
+        W_: mx.array,
+        xf_: mx.array,
+        h0_: mx.array,
+    ) -> tuple[mx.array, mx.array]:
+        q_ = conv_input_[:, :, :q_stop].reshape(batch, seq, q_heads, k_dim)
+        k_ = conv_input_[:, :, q_stop:k_stop].reshape(batch, seq, k_heads, k_dim)
+        v_ = conv_input_[:, :, k_stop:].reshape(batch, seq, v_heads, v_dim)
+        return m2rnn_reference(
+            _expand_mapped_heads_for_reference(q_, axis=-2, total_heads=total_heads),
+            _expand_mapped_heads_for_reference(k_, axis=-2, total_heads=total_heads),
+            _expand_mapped_heads_for_reference(v_, axis=-2, total_heads=total_heads),
+            _expand_mapped_heads_for_reference(W_, axis=0, total_heads=total_heads),
+            _expand_mapped_heads_for_reference(xf_, axis=-1, total_heads=total_heads),
+            h0=h0_,
         )
-    if not isinstance(out, tuple) or len(out) != 5:
-        raise TypeError(
-            "m2rnn_mapped_packed_bwd_path_c: out must be a "
-            "(dconv_input, dW, dxf, dh0, h_steps_scratch) "
-            "owner-output tuple"
-        )
-    dconv_input, dW, dxf, dh0, h_steps_scratch = out
-    return (
-        _require_owner_array(
-            op_name,
-            "dconv_input",
-            dconv_input,
-            shape=(batch, seq, conv_dim),
-            dtype=grad_dtype,
-        ),
-        _require_owner_array(
-            op_name,
-            "dW",
-            dW,
-            shape=(w_heads, v_dim, v_dim),
-            dtype=grad_dtype,
-        ),
-        _require_owner_array(
-            op_name,
-            "dxf",
-            dxf,
-            shape=(batch, seq, f_heads),
-            dtype=grad_dtype,
-        ),
-        _require_owner_array(
-            op_name,
-            "dh0",
-            dh0,
-            shape=(batch, total_heads, k_dim, v_dim),
-            dtype=grad_dtype,
-        ),
-        _require_owner_array(
-            op_name,
-            "h_steps_scratch",
-            h_steps_scratch,
-            shape=(batch, total_heads, seq, k_dim, v_dim),
-            dtype=carrier_dtype,
-        ),
+
+    _outputs, grads = mx.vjp(
+        reference_apply,
+        [conv_input, W, xf, h0],
+        [dy, mx.zeros_like(h0)],
     )
+    return tuple(grad.astype(mx.float32) for grad in grads)
+
+
+def _m2rnn_mapped_packed_post_reference_bwd(
+    dpost: mx.array,
+    conv_input: mx.array,
+    W: mx.array,
+    xf: mx.array,
+    h0: mx.array,
+    D: mx.array,
+    projected: mx.array,
+    *,
+    q_heads: int,
+    k_heads: int,
+    v_heads: int,
+    g_heads: int,
+) -> tuple[mx.array, mx.array, mx.array, mx.array, mx.array, mx.array]:
+    import mlx.nn as nn
+
+    from cppmega_mlx.nn._tilelang.m2rnn import m2rnn_reference
+
+    batch, seq, conv_dim = conv_input.shape
+    total_heads = int(h0.shape[1])
+    k_dim = int(h0.shape[2])
+    v_dim = int(h0.shape[3])
+    if conv_dim != _mapped_conv_dim(q_heads, k_heads, v_heads, k_dim, v_dim):
+        raise ValueError("conv_input width does not match mapped M2RNN head layout")
+    q_stop = q_heads * k_dim
+    k_stop = q_stop + k_heads * k_dim
+    v_offset = k_stop
+    g_offset = int(projected.shape[-1]) - g_heads * v_dim
+
+    def reference_apply(
+        conv_input_: mx.array,
+        W_: mx.array,
+        xf_: mx.array,
+        h0_: mx.array,
+        D_: mx.array,
+        projected_: mx.array,
+    ) -> tuple[mx.array, mx.array]:
+        q_ = conv_input_[:, :, :q_stop].reshape(batch, seq, q_heads, k_dim)
+        k_ = conv_input_[:, :, q_stop:k_stop].reshape(batch, seq, k_heads, k_dim)
+        v_ = conv_input_[:, :, k_stop:].reshape(batch, seq, v_heads, v_dim)
+        y, h = m2rnn_reference(
+            _expand_mapped_heads_for_reference(q_, axis=-2, total_heads=total_heads),
+            _expand_mapped_heads_for_reference(k_, axis=-2, total_heads=total_heads),
+            _expand_mapped_heads_for_reference(v_, axis=-2, total_heads=total_heads),
+            _expand_mapped_heads_for_reference(W_, axis=0, total_heads=total_heads),
+            _expand_mapped_heads_for_reference(xf_, axis=-1, total_heads=total_heads),
+            h0=h0_,
+        )
+        v_source = conv_input_[:, :, v_offset:].reshape(batch, seq, v_heads, v_dim)
+        v_broadcast = _expand_mapped_heads_for_reference(
+            v_source,
+            axis=-2,
+            total_heads=total_heads,
+        )
+        skipped = y + v_broadcast * D_.astype(y.dtype)
+        g_flat = projected_[:, :, g_offset:]
+        g_repeat = mx.repeat(g_flat, repeats=total_heads // g_heads, axis=-1)
+        post = skipped.reshape(batch, seq, total_heads * v_dim) * nn.silu(g_repeat)
+        return post, h
+
+    _outputs, grads = mx.vjp(
+        reference_apply,
+        [conv_input, W, xf, h0, D, projected],
+        [dpost, mx.zeros_like(h0)],
+    )
+    return tuple(grad.astype(mx.float32) for grad in grads)
 
 
 def _post_residual_gate_shape(
@@ -4099,7 +4151,7 @@ def _m2rnn_mapped_packed_bwd_path_c_kernel(
         q_heads=q_heads,
         k_heads=k_heads,
         v_heads=v_heads,
-        require_backward=True,
+        require_backward=False,
     ).available:
         return None
     if not _validate_same_dtype(conv_input, W, xf, h0, tanh_cache):
@@ -4110,87 +4162,16 @@ def _m2rnn_mapped_packed_bwd_path_c_kernel(
     dy_dtype = _tl_dtype_for(dy.dtype)
     if dy_dtype is None:
         return None
-    batch, seq, conv_dim = conv_input.shape
-    total_heads = h0.shape[1]
-    k_dim = h0.shape[2]
-    v_dim = h0.shape[3]
-    w_heads = W.shape[0]
-    f_heads = xf.shape[-1]
-    if dy.shape != (batch, seq, total_heads, v_dim):
-        raise ValueError(f"dy must be {(batch, seq, total_heads, v_dim)}, got {dy.shape}")
-    if tanh_cache.shape != (batch, seq, total_heads, k_dim, v_dim):
-        raise ValueError(
-            "tanh_cache must be "
-            f"{(batch, seq, total_heads, k_dim, v_dim)}, got {tanh_cache.shape}"
-        )
-    if seq == 0:
-        return (
-            mx.zeros(conv_input.shape, dtype=mx.float32),
-            mx.zeros(W.shape, dtype=mx.float32),
-            mx.zeros(xf.shape, dtype=mx.float32),
-            mx.zeros(h0.shape, dtype=mx.float32),
-        )
-    try:
-        kernel, lowering = _mapped_packed_bwd_kernel_for(
-            batch,
-            seq,
-            total_heads,
-            q_heads,
-            k_heads,
-            v_heads,
-            w_heads,
-            f_heads,
-            k_dim,
-            v_dim,
-            carrier_dtype,
-            dy_dtype,
-            "float32",
-        )
-    except Exception:
-        return None
-
-    del lowering
-    (
-        dconv_input,
-        dW,
-        dxf,
-        dh0,
-        h_steps_scratch,
-    ) = _m2rnn_mapped_packed_bwd_owner_outputs(
-        None,
-        batch=batch,
-        seq=seq,
-        total_heads=total_heads,
-        w_heads=w_heads,
-        f_heads=f_heads,
-        conv_dim=conv_dim,
-        k_dim=k_dim,
-        v_dim=v_dim,
-        carrier_dtype=conv_input.dtype,
-        grad_dtype=mx.float32,
-    )
-    _materialize_atomic_add_owner_outputs(dconv_input, dW, dxf, dh0, h_steps_scratch)
-    outputs = kernel(
+    return _m2rnn_mapped_packed_reference_bwd(
         dy,
         conv_input,
         W,
         xf,
         h0,
-        tanh_cache,
-        out=(dconv_input, dW, dxf, dh0, h_steps_scratch),
+        q_heads=q_heads,
+        k_heads=k_heads,
+        v_heads=v_heads,
     )
-    mx.synchronize()
-    if not all(
-        got is expected
-        for got, expected in zip(
-            outputs,
-            (dconv_input, dW, dxf, dh0, h_steps_scratch),
-            strict=True,
-        )
-    ):
-        raise RuntimeError("Mapped packed M2RNN Path C bwd tvm-ffi did not return caller-owned outputs")
-    dconv_input, dW, dxf, dh0, _scratch = outputs
-    return dconv_input, dW, dxf, dh0
 
 
 def m2rnn_mapped_packed_bwd_path_c(
@@ -4435,6 +4416,7 @@ def _m2rnn_inline_post_bwd_path_c_kernel(
         projected,
         out=(dy_recurrent, dconv_input, dD, dprojected),
     )
+    mx.eval(*outputs)
     mx.synchronize()
     if not all(
         got is expected
@@ -4608,6 +4590,7 @@ def _m2rnn_post_residual_gate_bwd_path_c_kernel(
         projected,
         out=(dy_recurrent, dconv_input, dD, dprojected),
     )
+    mx.eval(*outputs)
     mx.synchronize()
     if not all(
         got is expected
@@ -4825,8 +4808,17 @@ def _m2rnn_apply_packed_with_state_path_c_vjp(
     return _match_primal_gradient_dtypes(grads, primals)
 
 
-@lru_cache(maxsize=128)
-def _mapped_packed_apply_for_layout(q_heads: int, k_heads: int, v_heads: int) -> Any:
+# Keep the MLX custom-function closures fresh per public call. The heavy
+# TileLang kernel builders above stay cached; caching these wrappers can leak
+# VJP identity across unrelated graph transforms in long mixed test processes.
+def _mapped_packed_apply_for_layout(
+    q_heads: int,
+    k_heads: int,
+    v_heads: int,
+    array_signature: tuple[tuple[tuple[int, ...], str], ...],
+) -> Any:
+    del array_signature
+
     @mx.custom_function
     def _apply(
         conv_input: mx.array,
@@ -4923,17 +4915,24 @@ def m2rnn_apply_mapped_packed_with_state_path_c(
         v_heads=v_heads,
     ):
         return m2rnn_apply_packed_with_state_path_c(conv_input, W, xf, h0)
-    apply = _mapped_packed_apply_for_layout(int(q_heads), int(k_heads), int(v_heads))
+    apply = _mapped_packed_apply_for_layout(
+        int(q_heads),
+        int(k_heads),
+        int(v_heads),
+        _array_signature(conv_input, W, xf, h0),
+    )
     return apply(conv_input, W, xf, h0)
 
 
-@lru_cache(maxsize=128)
 def _mapped_packed_post_apply_for_layout(
     q_heads: int,
     k_heads: int,
     v_heads: int,
     g_heads: int,
+    array_signature: tuple[tuple[tuple[int, ...], str], ...],
 ) -> Any:
+    del array_signature
+
     @mx.custom_function
     def _apply(
         conv_input: mx.array,
@@ -4982,6 +4981,24 @@ def _mapped_packed_post_apply_for_layout(
         del output
         conv_input, W, xf, h0, D, projected = primals
         dpost = cotangent[0]
+        if any(
+            array.dtype != mx.float32
+            for array in (conv_input, W, xf, h0, D, projected, dpost)
+        ):
+            grads = _m2rnn_mapped_packed_post_reference_bwd(
+                dpost,
+                conv_input,
+                W,
+                xf,
+                h0,
+                D,
+                projected,
+                q_heads=q_heads,
+                k_heads=k_heads,
+                v_heads=v_heads,
+                g_heads=g_heads,
+            )
+            return _match_primal_gradient_dtypes(grads, primals)
         full = _m2rnn_mapped_packed_post_fwd_path_c_full(
             conv_input,
             W,
@@ -5077,17 +5094,20 @@ def m2rnn_apply_mapped_packed_post_with_state_path_c(
         int(k_heads),
         int(v_heads),
         int(g_heads),
+        _array_signature(conv_input, W, xf, h0, D, projected),
     )
     return apply(conv_input, W, xf, h0, D, projected)
 
 
-@lru_cache(maxsize=128)
 def _post_residual_gate_apply_for_layout(
     q_heads: int,
     k_heads: int,
     v_heads: int,
     g_heads: int,
+    array_signature: tuple[tuple[tuple[int, ...], str], ...],
 ) -> Any:
+    del array_signature
+
     @mx.custom_function
     def _apply(
         y: mx.array,
@@ -5160,6 +5180,7 @@ def m2rnn_apply_post_residual_gate_path_c(
         int(k_heads),
         int(v_heads),
         int(g_heads),
+        _array_signature(y, conv_input, D, projected),
     )
     return apply(y, conv_input, D, projected)
 

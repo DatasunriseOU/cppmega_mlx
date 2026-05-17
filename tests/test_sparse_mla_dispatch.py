@@ -3,8 +3,8 @@
 These tests verify that :func:`cppmega_mlx.nn.sparse_mla.sparse_mla_attention`
 honors the :class:`cppmega_mlx.runtime.kernel_policy.KernelPath` selection
 and records the actual kernel used into the dispatch log. They run on Metal
-when available; on hosts without Metal the AUTO and PATH_B paths gracefully
-fall back to the reference (PATH_B raises in that case).
+when available; AUTO falls back to the reference for unreceipted shapes and
+PATH_B raises because the regular direct-MSL surface is retired.
 """
 
 from __future__ import annotations
@@ -55,11 +55,9 @@ def _reset(monkeypatch: pytest.MonkeyPatch):
     clear_dispatch_log()
 
 
-def test_default_auto_routes_to_path_b_when_shape_is_not_receipted() -> None:
-    """AUTO stays Path B for shapes that are not covered by the Path C receipt."""
+def test_default_auto_routes_to_reference_when_shape_is_not_receipted() -> None:
+    """AUTO uses the reference for shapes that are not covered by the Path C receipt."""
 
-    if not _METAL_AVAILABLE:
-        pytest.skip("Metal not available")
     q, kv, indices = _make_inputs()
     assert selected_path("sparse_mla") is KernelPath.AUTO
     out = sparse_mla_attention(q, kv, indices)
@@ -68,7 +66,7 @@ def test_default_auto_routes_to_path_b_when_shape_is_not_receipted() -> None:
     assert len(log) == 1
     assert log[0]["op_name"] == "sparse_mla"
     assert log[0]["path"] == "auto"
-    assert log[0]["kernel_used"] == "metal_kernel_fwd_v1"
+    assert log[0]["kernel_used"] == "reference_pure_mlx"
 
 
 def test_sparse_mla_path_c_receipt_blocks_auto_promotion() -> None:
@@ -249,16 +247,14 @@ def test_reference_policy_forces_pure_mlx(monkeypatch: pytest.MonkeyPatch) -> No
     assert log[-1]["kernel_used"] == "reference_pure_mlx"
 
 
-def test_path_b_policy_forces_metal_kernel(monkeypatch: pytest.MonkeyPatch) -> None:
-    if not _METAL_AVAILABLE:
-        pytest.skip("Metal not available")
+def test_path_b_policy_raises_for_retired_direct_msl(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CPPMEGA_KERNEL_PATH", "path_b")
     q, kv, indices = _make_inputs()
-    out = sparse_mla_attention(q, kv, indices)
-    mx.eval(out)
+    with pytest.raises(RuntimeError, match="direct-MSL Path B is retired"):
+        sparse_mla_attention(q, kv, indices)
     log = get_dispatch_log()
     assert log[-1]["path"] == "path_b"
-    assert log[-1]["kernel_used"] == "metal_kernel_fwd_v1"
+    assert log[-1]["kernel_used"] == "direct_msl_path_b_retired"
 
 
 def test_path_c_policy_forces_tilelang_kernel(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -293,9 +289,7 @@ def test_per_op_override_selects_reference(monkeypatch: pytest.MonkeyPatch) -> N
     assert log[-1]["kernel_used"] == "reference_pure_mlx"
 
 
-def test_dispatch_grad_flows_through_path_b(monkeypatch: pytest.MonkeyPatch) -> None:
-    if not _METAL_AVAILABLE:
-        pytest.skip("Metal not available")
+def test_dispatch_grad_flows_through_auto_reference_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CPPMEGA_KERNEL_PATH", "auto")
     rng = np.random.default_rng(2)
     B, S, H, D = 1, 4, 2, 16
@@ -404,11 +398,9 @@ def test_return_lse_path_routes_through_dispatcher(
     assert out.shape[:-1] == lse.shape
 
 
-def test_path_b_and_reference_are_close(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Spot check Path B vs reference parity through the dispatcher."""
+def test_path_b_dispatcher_surface_is_retired(monkeypatch: pytest.MonkeyPatch) -> None:
+    """PATH_B keeps policy semantics and raises after direct-MSL retirement."""
 
-    if not _METAL_AVAILABLE:
-        pytest.skip("Metal not available")
     rng = np.random.default_rng(3)
     B, S, H, D = 1, 4, 2, 32
     q = mx.array(rng.standard_normal((B, S, H, D)).astype(np.float16))
@@ -416,13 +408,5 @@ def test_path_b_and_reference_are_close(monkeypatch: pytest.MonkeyPatch) -> None
     indices = mx.array(rng.integers(0, 8, size=(B, S, 1, 4)).astype(np.int32))
 
     monkeypatch.setenv("CPPMEGA_KERNEL_PATH", "path_b")
-    out_b = sparse_mla_attention(q, kv, indices)
-    mx.eval(out_b)
-    out_ref = sparse_mla_attention_reference(q, kv, indices)
-    mx.eval(out_ref)
-    np.testing.assert_allclose(
-        np.array(out_b).astype(np.float32),
-        np.array(out_ref).astype(np.float32),
-        rtol=1e-3,
-        atol=2e-3,
-    )
+    with pytest.raises(RuntimeError, match="direct-MSL Path B is retired"):
+        sparse_mla_attention(q, kv, indices)

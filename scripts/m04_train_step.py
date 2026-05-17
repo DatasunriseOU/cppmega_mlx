@@ -124,7 +124,9 @@ UNSUPPORTED_REQUIRED_MODEL_PROFILE_ROUTE_REASON = (
 )
 REQUIRED_OPTIMIZER_NAME = "AdamW"
 REQUIRED_ADAMW_MASTER_MOMENT_DTYPE = "float32"
+FP8_PATH_B_DTYPE = "fp8_path_b"
 FP8_PATH_C_DTYPE = "fp8_path_c"
+FP8_PATH_B_E2E_TRAINING_STATUS = "m04_path_b_fp8_reference_baseline_available"
 FP8_PATH_C_ROUTE_BLOCKER_TYPE = "fp8_path_c_training_route_unavailable"
 FP8_PATH_C_KERNEL_SURFACE_STATUS = "prepared_buffer_path_c_available"
 FP8_PATH_C_E2E_TRAINING_STATUS = "m04_path_c_training_route_available"
@@ -149,6 +151,9 @@ FP8_PATH_C_KERNEL_POLICY_ENV = {
     "CPPMEGA_KERNEL_PATH__MAMBA3_MIMO": "path_c",
     "CPPMEGA_KERNEL_PATH__M2RNN": "path_c",
     "CPPMEGA_KERNEL_PATH__SPARSE_MLA": "path_c",
+}
+FP8_PATH_B_KERNEL_POLICY_ENV = {
+    "CPPMEGA_KERNEL_PATH__SPARSE_MLA": "path_b",
 }
 FP8_PATH_C_RUNTIME_ENV: dict[str, str] = {}
 FP8_PATH_C_ROUTE_BLOCKER_REASON = (
@@ -201,7 +206,7 @@ OPEN_M0_BLOCKERS = (
         "impact": "HybridTinyLM receipts remain training-plumbing evidence only",
     },
 )
-MATRIX_DTYPE_ROUTES = ("bf16", "fp8_path_c", "int8")
+MATRIX_DTYPE_ROUTES = ("bf16", "fp8_path_b", "fp8_path_c", "int8")
 MATRIX_OPTIMIZERS = ("adamw", "muon", "muon_adamw", "lion", "lion8bit", "adam8bit")
 MATRIX_STEPS = 20
 MATRIX_ACCEPTANCE_STEPS = 100
@@ -272,12 +277,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument(
         "--dtype",
-        choices=("float32", "float16", "bfloat16", FP8_PATH_C_DTYPE),
+        choices=("float32", "float16", "bfloat16", FP8_PATH_B_DTYPE, FP8_PATH_C_DTYPE),
         default="bfloat16",
         help=(
-            "Training dtype/precision route. fp8_path_c enables existing "
-            "Path C model ops with a bf16 carrier and records the remaining "
-            "native-FP8 producer gap in the receipt."
+            "Training dtype/precision route. fp8_path_b enables the explicit "
+            "non-Path-C FP8 reference baseline; fp8_path_c enables existing "
+            "Path C model ops with a bf16 carrier."
         ),
     )
     parser.add_argument(
@@ -477,6 +482,18 @@ def fp8_path_c_route_requested(
     return str(getattr(args, "dtype", "")).strip().lower() == FP8_PATH_C_DTYPE
 
 
+def fp8_path_b_route_requested(
+    args: argparse.Namespace | TrainHybridTinyConfig,
+) -> bool:
+    return str(getattr(args, "dtype", "")).strip().lower() == FP8_PATH_B_DTYPE
+
+
+def fp8_training_route_requested(
+    args: argparse.Namespace | TrainHybridTinyConfig,
+) -> bool:
+    return fp8_path_b_route_requested(args) or fp8_path_c_route_requested(args)
+
+
 def path_c_kernel_policy_requested() -> bool:
     path_c_values = {"path_c", "c"}
     for env_name in (
@@ -493,7 +510,7 @@ def path_c_kernel_policy_requested() -> bool:
 def carrier_dtype_for_acceptance(
     args: argparse.Namespace | TrainHybridTinyConfig,
 ) -> str:
-    if fp8_path_c_route_requested(args):
+    if fp8_training_route_requested(args):
         return FP8_PATH_C_CARRIER_DTYPE
     return str(getattr(args, "dtype", ""))
 
@@ -735,6 +752,26 @@ def fp8_path_c_kernel_policy(
 
 
 @contextmanager
+def fp8_path_b_kernel_policy(
+    args: argparse.Namespace | TrainHybridTinyConfig,
+):
+    if not fp8_path_b_route_requested(args):
+        yield
+        return
+
+    previous = {key: os.environ.get(key) for key in FP8_PATH_B_KERNEL_POLICY_ENV}
+    os.environ.update(FP8_PATH_B_KERNEL_POLICY_ENV)
+    try:
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+@contextmanager
 def fp8_path_c_stdio_suppressed(
     args: argparse.Namespace | TrainHybridTinyConfig,
 ):
@@ -760,6 +797,21 @@ def fp8_path_c_stdio_suppressed(
 def precision_route_payload(
     args: argparse.Namespace | TrainHybridTinyConfig,
 ) -> dict[str, Any]:
+    if fp8_path_b_route_requested(args):
+        return {
+            "requested": FP8_PATH_B_DTYPE,
+            "kind": "fp8_path_b_reference_baseline",
+            "status": FP8_PATH_B_E2E_TRAINING_STATUS,
+            "carrier_dtype": FP8_PATH_C_CARRIER_DTYPE,
+            "kernel_policy_env": dict(FP8_PATH_B_KERNEL_POLICY_ENV),
+            "baseline_surface": "sparse_mla_fp8_apply",
+            "baseline_module": "cppmega_mlx.nn._tilelang.sparse_mla_fp8",
+            "path_c_used": False,
+            "zero_copy_required": False,
+            "large_tensor_staging_allowed": False,
+            "hidden_wrapper_quantization_allowed": False,
+            "kernel_boundary_quantization_allowed": False,
+        }
     if fp8_path_c_route_requested(args):
         producer = sparse_mla_fp8_producer_payload(args)
         producer_configured = bool(producer["configured"])
@@ -1026,7 +1078,9 @@ def matrix_case_payload(
     cli_optimizer = optimizer_name
     unsupported_reason = None
 
-    if dtype_route == "fp8_path_c":
+    if dtype_route == "fp8_path_b":
+        dtype_arg = FP8_PATH_B_DTYPE
+    elif dtype_route == "fp8_path_c":
         dtype_arg = FP8_PATH_C_DTYPE
     elif dtype_route in {"int8", "int8_state"}:
         dtype_route = "int8"
@@ -1735,7 +1789,11 @@ def _run_existing_training(
                 data_path=data_path,
             )
             return enforce_loss_decrease_requirement(args, receipt)
-        with fp8_path_c_kernel_policy(config), fp8_path_c_stdio_suppressed(config):
+        with (
+            fp8_path_b_kernel_policy(config),
+            fp8_path_c_kernel_policy(config),
+            fp8_path_c_stdio_suppressed(config),
+        ):
             return run_local_gb10_quarter_training(
                 args,
                 config=config,
@@ -1755,7 +1813,11 @@ def _run_existing_training(
     reset_peak_memory()
     memory_before = metal_memory_payload()
     try:
-        with fp8_path_c_kernel_policy(config), fp8_path_c_stdio_suppressed(config):
+        with (
+            fp8_path_b_kernel_policy(config),
+            fp8_path_c_kernel_policy(config),
+            fp8_path_c_stdio_suppressed(config),
+        ):
             if args.dry_run_json:
                 train_payload = dry_run_payload(
                     config,

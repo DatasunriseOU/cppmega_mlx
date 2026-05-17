@@ -152,6 +152,22 @@ _FWD_KERNEL_SOURCE = """
 _FWD_KERNEL_HEADER = """
     #include <metal_stdlib>
     using namespace metal;
+
+    inline float cppmega_atomic_add_float(device float* address, float val) {
+        device atomic_uint* bits = reinterpret_cast<device atomic_uint*>(address);
+        uint old_bits = atomic_load_explicit(bits, memory_order_relaxed);
+        while (true) {
+            float old_val = as_type<float>(old_bits);
+            uint new_bits = as_type<uint>(old_val + val);
+            uint expected = old_bits;
+            if (atomic_compare_exchange_weak_explicit(
+                    bits, &expected, new_bits, memory_order_relaxed,
+                    memory_order_relaxed)) {
+                return old_val;
+            }
+            old_bits = expected;
+        }
+    }
 """
 
 
@@ -189,16 +205,17 @@ _BWD_KERNEL_SOURCE = """
     // Outputs:
     //   dx     [B, T, H, P]
     //   dz     [B, T, H, P]
-    //   dB_partial [B, T, H, P, N]  -- caller sums over P
-    //   dC_partial [B, T, H, P, N]  -- caller sums over P
-    //   dA_partial [B, T, H, P]     -- caller sums over P
-    //   ddt_partial[B, T, H, P]     -- caller sums over P
-    //   dD_partial [B, H, P]        -- caller sums over (B, P)
+    //   dB         [B, T, H, N]     -- atomically summed over P
+    //   dC         [B, T, H, N]     -- atomically summed over P
+    //   dA         [B, T, H]        -- atomically summed over P
+    //   ddt        [B, T, H]        -- atomically summed over P
+    //   dD         [H]              -- atomically summed over (B, P)
     //   dh0        [B, H, P, N]
     //
     // One thread per (b, h, p) lane. The (b, h, p) decomposition keeps each
-    // lane fully owning a single P slice, so per-lane partial outputs do not
-    // need atomics. The caller reduces partials into final shapes.
+    // lane fully owning a single P slice. Cross-P gradients are accumulated
+    // into final owner-output buffers with direct-MSL atomic adds against
+    // zero-initialized outputs.
 
     uint tid = thread_position_in_grid.x;
     uint total_lanes = uint(BATCH) * uint(HEADS) * uint(HEADDIM);
@@ -238,7 +255,7 @@ _BWD_KERNEL_SOURCE = """
             float B_val = float(B_proj[bc_idx + n]);
             float new_h = decay * h_state[n] + x_val * B_val;
             h_state[n] = new_h;
-            h_steps_scratch[scratch_base + t * uint(STATE) + n] = T_OUT(new_h);
+            h_steps_scratch[scratch_base + t * uint(STATE) + n] = new_h;
         }
     }
 
@@ -266,7 +283,7 @@ _BWD_KERNEL_SOURCE = """
 
         float y_state = 0.0f;
         for (uint n = 0; n < uint(STATE); ++n) {
-            y_state += float(h_steps_scratch[scratch_t + n]) * float(C_proj[bc_idx + n]);
+            y_state += h_steps_scratch[scratch_t + n] * float(C_proj[bc_idx + n]);
         }
         float y_skipped = y_state + D_h * x_val;
         float sig_z;
@@ -282,7 +299,7 @@ _BWD_KERNEL_SOURCE = """
         float d_silu = dY * y_skipped;
         float d_y_skipped = dY * silu_z;
 
-        dz[xz_idx] = T_OUT(d_silu * silu_dz);
+        dz[xz_idx] = d_silu * silu_dz;
         dD_acc += d_y_skipped * x_val;
 
         // Update dh from y_state contribution.
@@ -290,12 +307,10 @@ _BWD_KERNEL_SOURCE = """
             dh[n] += d_y_skipped * float(C_proj[bc_idx + n]);
         }
 
-        // Stride for the (B, T, H, P, N) partial buffers.
-        uint partial_n_base = ((b * uint(SEQ) + t) * uint(HEADS) * uint(HEADDIM)
-                              + h * uint(HEADDIM) + p) * uint(STATE);
         for (uint n = 0; n < uint(STATE); ++n) {
-            dC_partial[partial_n_base + n] = T_OUT(d_y_skipped * float(h_steps_scratch[scratch_t + n]));
-            dB_partial[partial_n_base + n] = T_OUT(dh[n] * x_val);
+            float h_cur = h_steps_scratch[scratch_t + n];
+            cppmega_atomic_add_float(&dC[bc_idx + n], d_y_skipped * h_cur);
+            cppmega_atomic_add_float(&dB[bc_idx + n], dh[n] * x_val);
         }
 
         // dx contribution.
@@ -304,7 +319,7 @@ _BWD_KERNEL_SOURCE = """
             dx_inp += dh[n] * float(B_proj[bc_idx + n]);
         }
         float dx_skip = d_y_skipped * D_h;
-        dx[xz_idx] = T_OUT(dx_skip + dx_inp);
+        dx[xz_idx] = dx_skip + dx_inp;
 
         // Decay backward.
         float h_prev_n;
@@ -315,14 +330,14 @@ _BWD_KERNEL_SOURCE = """
             }
         } else {
             for (uint n = 0; n < uint(STATE); ++n) {
-                h_prev_n = float(h_steps_scratch[scratch_base + (t - 1) * uint(STATE) + n]);
+                h_prev_n = h_steps_scratch[scratch_base + (t - 1) * uint(STATE) + n];
                 d_decay += dh[n] * h_prev_n;
             }
         }
         float d_logdecay = d_decay * decay;
-        uint adt_partial_idx = ((b * uint(SEQ) + t) * uint(HEADS) + h) * uint(HEADDIM) + p;
-        dA_partial[adt_partial_idx] = T_OUT(d_logdecay * dt_val);
-        ddt_partial[adt_partial_idx] = T_OUT(d_logdecay * A_val);
+        uint adt_idx_out = (b * uint(SEQ) + t) * uint(HEADS) + h;
+        cppmega_atomic_add_float(&dA[adt_idx_out], d_logdecay * dt_val);
+        cppmega_atomic_add_float(&ddt[adt_idx_out], d_logdecay * A_val);
 
         // Propagate dh through decay.
         for (uint n = 0; n < uint(STATE); ++n) {
@@ -333,30 +348,29 @@ _BWD_KERNEL_SOURCE = """
     // After loop, dh holds the gradient that propagates past t=0; that is dh0
     // for this lane.
     for (uint n = 0; n < uint(STATE); ++n) {
-        dh0[h_base + n] = T_OUT(dh[n]);
+        dh0[h_base + n] = dh[n];
     }
-    uint dD_idx = ((b) * uint(HEADS) + h) * uint(HEADDIM) + p;
-    dD_partial[dD_idx] = T_OUT(dD_acc);
+    cppmega_atomic_add_float(&dD[h], dD_acc);
 """
 
 
 # TODO(wave-6): port to TileLang DSL. Reverse-time scan with both per-thread
 # ``float dh[STATE]`` accumulator and a persistent ``h_steps_scratch[tid][t][n]``
 # slab; needs ``T.serial(reverse=True)`` over ``t`` plus careful fragment
-# layout to keep the per-lane partial outputs (dB_partial, dC_partial,
-# dA_partial, ddt_partial) atomics-free. Same flip pattern as the fwd above
-# once the prim_func exists.
+# layout. The legacy Path B fallback now writes final cross-P gradients with
+# direct-MSL atomic adds; the TileLang rewrite should use semantic reductions
+# instead of recreating this direct-MSL boundary.
 _BWD_KERNEL = _msl_transform.make_metal_kernel(
     name="cppmega_mamba3_mimo_bwd",
     input_names=["dy", "x", "B_proj", "C_proj", "z", "A", "dt", "D", "h0"],
     output_names=[
         "dx",
         "dz",
-        "dB_partial",
-        "dC_partial",
-        "dA_partial",
-        "ddt_partial",
-        "dD_partial",
+        "dB",
+        "dC",
+        "dA",
+        "ddt",
+        "dD",
         "dh0",
         "h_steps_scratch",
     ],
@@ -483,7 +497,7 @@ def mamba3_mimo_fwd_metal(
     total_lanes = batch * heads * headdim
     threads = min(256, total_lanes if total_lanes > 0 else 1)
     template = [
-        ("T_OUT", cast_dtype),
+        ("T_OUT", mx.float32),
         ("BATCH", batch),
         ("SEQ", seq),
         ("HEADS", heads),
@@ -555,17 +569,17 @@ def _mamba3_mimo_bwd_metal_kernel(
         ("STATE", state),
     ]
     output_shapes = [
-        (batch, seq, heads, headdim),                  # dx
-        (batch, seq, heads, headdim),                  # dz
-        (batch, seq, heads, headdim, state),           # dB_partial
-        (batch, seq, heads, headdim, state),           # dC_partial
-        (batch, seq, heads, headdim),                  # dA_partial
-        (batch, seq, heads, headdim),                  # ddt_partial
-        (batch, heads, headdim),                       # dD_partial
-        (batch, heads, headdim, state),                # dh0
-        (batch * heads * headdim, seq, state),         # h_steps_scratch
+        (batch, seq, heads, headdim, 1),               # dx
+        (batch, seq, heads, headdim, 1),               # dz
+        (batch, seq, heads, state, 1),                 # dB
+        (batch, seq, heads, state, 1),                 # dC
+        (batch, seq, heads, 1),                        # dA
+        (batch, seq, heads, 1),                        # ddt
+        (heads, 1),                                    # dD
+        (batch, heads, headdim, state, 1),             # dh0
+        (batch * heads * headdim, seq, state, 1),      # h_steps_scratch
     ]
-    output_dtypes = [cast_dtype] * len(output_shapes)
+    output_dtypes = [mx.float32] * len(output_shapes)
     try:
         outputs = _msl_transform.dispatch(
             cast(_msl_transform.MetalKernel, _BWD_KERNEL),
@@ -575,16 +589,19 @@ def _mamba3_mimo_bwd_metal_kernel(
             grid=(total_lanes, 1, 1),
             threadgroup=(threads, 1, 1),
             template=template,
+            init_value=0,
         )
     except Exception:
         return None
-    dx_, dz_, dB_partial, dC_partial, dA_partial, ddt_partial, dD_partial, dh0_, _h_scratch = outputs
-    # Reduce P-dimension partials.
-    dB = mx.sum(dB_partial, axis=3)         # -> (B, T, H, N)
-    dC = mx.sum(dC_partial, axis=3)         # -> (B, T, H, N)
-    dA = mx.sum(dA_partial, axis=3)         # -> (B, T, H)
-    ddt = mx.sum(ddt_partial, axis=3)       # -> (B, T, H)
-    dD = mx.sum(dD_partial, axis=(0, 2))    # -> (H,)
+    dx_, dz_, dB, dC, dA, ddt, dD, dh0_, _h_scratch = outputs
+    dx_ = dx_.reshape(batch, seq, heads, headdim)
+    dz_ = dz_.reshape(batch, seq, heads, headdim)
+    dB = dB.reshape(batch, seq, heads, state)
+    dC = dC.reshape(batch, seq, heads, state)
+    dA = dA.reshape(batch, seq, heads)
+    ddt = ddt.reshape(batch, seq, heads)
+    dD = dD.reshape(heads)
+    dh0_ = dh0_.reshape(batch, heads, headdim, state)
     return (
         dx_.astype(x.dtype),
         dB.astype(B.dtype),

@@ -746,6 +746,83 @@ class CausalSelfAttention(nn.Module):
         out = out.reshape(output_shape)
         return self.out_proj(out)
 
+    def _prepare_sparse_mla_float_baseline(
+        self,
+        hidden_states: mx.array,
+        *,
+        rope_offset: int = 0,
+        key_length: int | None = None,
+        mask: mx.array | Literal["causal"] | None = None,
+    ) -> tuple[mx.array, mx.array, mx.array, float, int]:
+        cfg = self.config
+        batch, seq, _ = hidden_states.shape
+        q, kv = self._project_sparse_mla_qkv_bshd(
+            hidden_states, rope_offset=rope_offset
+        )
+        sparse_window = key_length if key_length is not None else seq
+        if cfg.sliding_window is not None:
+            sparse_window = min(sparse_window, cfg.sliding_window)
+        effective_topk = min(cfg.sparse_topk, sparse_window)
+        is_causal_sparse = mask is None or (isinstance(mask, str) and mask == "causal")
+        if is_causal_sparse:
+            indices = causal_sparse_indices(
+                batch,
+                seq,
+                cfg.kv_heads,
+                effective_topk,
+                query_offset=rope_offset,
+                key_length=key_length,
+            )
+        elif isinstance(mask, str):
+            raise ValueError(f"unsupported attention mask sentinel {mask!r}")
+        else:
+            indices = sparse_indices_from_attention_mask(
+                mask,
+                batch_size=batch,
+                seq_length=seq,
+                kv_group=cfg.kv_heads,
+                topk=effective_topk,
+                key_length=key_length if key_length is not None else seq,
+            )
+        return (
+            q,
+            kv,
+            indices,
+            (cfg.q_head_dim**-0.5) / self.rope_attention_factor,
+            cfg.q_head_dim,
+        )
+
+    def _apply_sparse_mla_fp8_path_b_baseline(
+        self,
+        q: mx.array,
+        kv: mx.array,
+        indices: mx.array,
+        *,
+        sm_scale: float,
+        d_v: int,
+        output_shape: tuple[int, int, int],
+        sinks: mx.array | None = None,
+    ) -> mx.array:
+        from cppmega_mlx.nn._tilelang.sparse_mla_fp8 import sparse_mla_fp8_apply
+
+        if sinks is not None:
+            raise RuntimeError("Sparse-MLA FP8 Path B baseline does not support sinks")
+        out = sparse_mla_fp8_apply(
+            q,
+            kv,
+            indices,
+            sm_scale=sm_scale,
+            d_v=d_v,
+            force_metal=False,
+        )
+        if isinstance(out, tuple):
+            out = out[0]
+        record_dispatch(
+            "sparse_mla", KernelPath.PATH_B, "sparse_mla_fp8_reference_path_b"
+        )
+        out = out.reshape(output_shape)
+        return self.out_proj(out)
+
     def _use_sparse_mla_fp8_path_c(
         self,
         mask: mx.array | Literal["causal"] | None,
@@ -757,6 +834,21 @@ class CausalSelfAttention(nn.Module):
         return (
             self.config.mode == "dsa"
             and selected_path("sparse_mla") is KernelPath.PATH_C
+            and (not isinstance(mask, str) or mask == "causal")
+        )
+
+    def _use_sparse_mla_fp8_path_b_baseline(
+        self,
+        mask: mx.array | Literal["causal"] | None,
+        *,
+        sinks: mx.array | None,
+        kv_cache: ContiguousKVCache | None,
+    ) -> bool:
+        del sinks
+        return (
+            self.config.mode == "dsa"
+            and kv_cache is None
+            and selected_path("sparse_mla") is KernelPath.PATH_B
             and (not isinstance(mask, str) or mask == "causal")
         )
 
@@ -786,6 +878,29 @@ class CausalSelfAttention(nn.Module):
                 raise IndexError("layer_idx out of range")
             cache_layer_idx = layer_idx
             cache_position = kv_cache.layer_position(cache_layer_idx)
+
+        if self._use_sparse_mla_fp8_path_b_baseline(
+            mask, sinks=sinks, kv_cache=kv_cache
+        ):
+            q, kv, indices, sm_scale, d_v = self._prepare_sparse_mla_float_baseline(
+                hidden_states,
+                rope_offset=cache_position,
+                key_length=None,
+                mask=mask,
+            )
+            return self._apply_sparse_mla_fp8_path_b_baseline(
+                q,
+                kv,
+                indices,
+                sm_scale=sm_scale,
+                d_v=d_v,
+                output_shape=(
+                    hidden_states.shape[0],
+                    hidden_states.shape[1],
+                    self.config.q_proj_dim,
+                ),
+                sinks=sinks,
+            )
 
         if self._use_sparse_mla_fp8_path_c(mask, sinks=sinks, kv_cache=kv_cache):
             prepared = self.prepare_sparse_mla_fp8(

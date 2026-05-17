@@ -329,7 +329,7 @@ From the cppmega CUDA audit, 15 fusions exist. Here is the verdict for each on M
 - F12 — FastMTP shared-block layer → **PORT-FUSED** with shared-weight aliasing (covered by row D above).
 
 **PORT only after profiling justifies (large effort, M4-MSL needed):**
-- F5 — MLA TileLang fused (block-scaled MXFP8 Q-K topk) → **WRITE-METAL / Path B**. Direct-MSL sparse-MLA BF16, tensorwise FP8, and blockscaled MXFP8 kernels now exist as local Path B receipts; keep those production/default where green. Native TileLang Path C remains partial until full-layout fwd/bwd gates pass.
+- F5 — MLA TileLang fused (block-scaled MXFP8 Q-K topk) → **WRITE-METAL / Path C**. Historical direct-MSL sparse-MLA BF16, tensorwise FP8, and blockscaled MXFP8 receipts remain useful as evidence, but the high-level runtime surfaces are being retired/fail-closed. Native TileLang Path C remains partial until full-layout fwd/bwd gates pass.
 - F10 — CuTe DSL Mamba3 MIMO (Hopper WGMMA) → **WRITE-METAL** later. The MIMO recurrence and trapezoidal scan are the actual algorithm; the WGMMA is unportable.
 
 **SKIP (Hopper/SM120-specific or zero M4 delta):**
@@ -417,7 +417,7 @@ Restating, for completeness when this doc is read in isolation:
 
 - **bf16** on M4 Max is supported but slower than fp16; train in bf16 by default for local MLX/Metal stability and cleaner external-reference comparability, accepting the throughput cost until matched local benches say otherwise.
 - **fp16** mixed precision can be faster on M4, but it changes numerics and adds loss-scaling complexity. Skip for default training; reconsider for inference-only acceleration or matched local benchmark lanes.
-- **fp8 / mxfp4 / mxfp8 / nvfp4** — no current M4 MLX/Metal training support gate and no default support claim. Keep fp8-family training off the M0 path; software-emulated direct-MSL FP8 sparse-MLA kernels remain inference/bench/research-only unless local tests and receipts explicitly promote a narrower path.
+- **fp8 / mxfp4 / mxfp8 / nvfp4** — no current M4 MLX/Metal training support gate and no default support claim. Keep fp8-family training off the M0 path; retired direct-MSL FP8 history remains bench/research evidence only, while any promoted path must have current TileLang/tvm-ffi tests and receipts.
 - **q4 affine g64** for inference is 2.5× faster decode than bf16 on M4 Max (mlx-lm bench: Qwen3-4B q5 at 110 tok/s vs bf16 at 52 tok/s).
 - **KV q4 with --quantized-kv-start 256** is the recommended inference default on long context.
 - **JACCL** RDMA over Thunderbolt 5 needs macOS ≥ 26.2 + M3 Ultra/M4 Pro/Max on **both** ends; ring backend (TB4 or mismatched chips) is the fallback.

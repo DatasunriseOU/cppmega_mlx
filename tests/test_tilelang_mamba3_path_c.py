@@ -236,7 +236,7 @@ def test_lowered_bwd_bench_shape_uses_simd_p_reduction() -> None:
     assert "dD_batch" in msl
 
 
-@pytest.mark.parametrize("headdim", [64, 96, 128, 256])
+@pytest.mark.parametrize("headdim", [64, 96, 128, 256, 512, 1024])
 def test_lowered_bwd_aligned_headdims_use_split_thread_allreduce(
     headdim: int,
 ) -> None:
@@ -251,12 +251,68 @@ def test_lowered_bwd_aligned_headdims_use_split_thread_allreduce(
     assert "dD_batch" in msl
 
 
+@pytest.mark.parametrize(
+    ("batch", "heads", "headdim", "threads"),
+    [
+        (1, 1, 256, 256),
+        (1, 1, 512, 512),
+        (1, 1, 1024, 1024),
+        (1, 4, 64, 256),
+    ],
+)
+def test_bwd_p_reduction_threads_cover_large_aligned_rows(
+    batch: int,
+    heads: int,
+    headdim: int,
+    threads: int,
+) -> None:
+    lanes = batch * heads * headdim
+    assert mamba3_path_c._bwd_threads_for(lanes, headdim) == threads
+    assert mamba3_path_c._bwd_simd_p_reduction_supported(
+        batch=batch,
+        heads=heads,
+        headdim=headdim,
+    )
+
+
 def test_direct_bwd_simd_lowering_rejects_long_sequences_without_snapshots() -> None:
     with pytest.raises(
         _msl_transform.MSLDispatchUnsupported,
         match="explicit state snapshots",
     ):
         mamba3_path_c._bwd_simd_reduce_kernel_for(1, 2, 1, 64, 2)
+
+
+def test_bwd_scan_plan_selects_state_snapshots_for_long_reverse_recurrence() -> None:
+    plan = mamba3_path_c._bwd_scan_plan_for(
+        batch=1,
+        seq=8,
+        heads=2,
+        headdim=64,
+        state=16,
+    )
+
+    assert plan.direction == "reverse"
+    assert plan.snapshot_plan.policy == "state-boundary-cache"
+    assert plan.snapshot_plan.snapshot_count == 9
+    assert plan.rematerialization_policy == "reuse-forward-state-snapshots"
+    assert plan.alias_plan.in_place_allowed is False
+    assert plan.host_sync_required is False
+    assert plan.device_event_required is False
+    assert plan.fused_post_ops == ("skip_D", "silu_gate")
+
+
+def test_bwd_scan_plan_keeps_single_step_direct_recompute() -> None:
+    plan = mamba3_path_c._bwd_scan_plan_for(
+        batch=1,
+        seq=1,
+        heads=1,
+        headdim=32,
+        state=8,
+    )
+
+    assert plan.snapshot_plan.policy == "none"
+    assert plan.rematerialization_policy == "direct-recompute"
 
 
 def test_metal_simd_sum_op_has_tscript_printer_name() -> None:
@@ -969,6 +1025,30 @@ def test_bwd_path_c_full_1b_model_bf16_snapshot_simd_extreme_dy_stays_finite(
     mx.eval(dy, *inputs)
 
     grads = mamba3_mimo_bwd_path_c(dy, x, B, C, z, A, dt, D, h0)
+    mx.eval(*grads)
+
+    names = ["dx", "dB", "dC", "dz", "dA", "ddt", "dD", "dh0"]
+    for name, grad in zip(names, grads, strict=True):
+        assert bool(mx.all(mx.isfinite(grad.astype(mx.float32))).item()), name
+
+
+@pytest.mark.kernel
+def test_apply_path_c_full_1b_model_bf16_graph_vjp_stays_finite() -> None:
+    """1B graph VJP must route long-sequence bwd through state snapshots."""
+
+    _require_mamba3_path_c()
+    inputs = _make_mamba3_projection_inputs(
+        d_model=3584,
+        seq=2048,
+        dtype=mx.bfloat16,
+    )
+
+    def pc_loss(x, B, C, z, A, dt, D, h0):  # type: ignore[no-untyped-def]
+        y = cast(mx.array, mamba3_mimo_apply_path_c(x, B, C, z, A, dt, D, h0))
+        y_f32 = y.astype(mx.float32)
+        return mx.sum(y_f32 * y_f32) * 0.5
+
+    grads = mx.grad(pc_loss, argnums=tuple(range(8)))(*inputs)
     mx.eval(*grads)
 
     names = ["dx", "dB", "dC", "dz", "dA", "ddt", "dD", "dh0"]

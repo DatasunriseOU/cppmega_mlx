@@ -1,7 +1,7 @@
-"""Tests for the Path B M2RNN Metal port.
+"""Tests for the retired M2RNN direct-MSL compatibility surface.
 
 Coverage:
-  - :func:`m2rnn_metal_status` reports availability or fail-closed reason.
+  - :func:`m2rnn_metal_status` reports the retired fail-closed reason.
   - Forward parity vs :func:`m2rnn_scan` reference (FP32 atol=1e-4 rtol=1e-3,
     FP16 atol=2e-3 rtol=5e-3).
   - VJP through :func:`m2rnn_apply` matches autograd through the reference.
@@ -70,17 +70,17 @@ def _make_inputs(
 def test_status_is_available_or_explains_why() -> None:
     status = m2rnn_metal_status()
     assert isinstance(status, M2RNNMetalStatus)
-    assert isinstance(status.available, bool)
-    assert isinstance(status.reason, str) and status.reason
+    assert status.available is False
+    assert "direct-MSL Path B is retired" in status.reason
 
 
 def test_legacy_m2rnn_blocker_points_to_native_tvm_ffi_route() -> None:
     mod = importlib.import_module("cppmega_mlx.nn._tilelang.m2rnn")
     assert mod.__doc__ is not None
-    assert "cannot turn this hand-written MSL back into TileLang IR" in mod.__doc__
-    assert 'execution_backend="tvm_ffi"' in mod.__doc__
+    assert "Retired direct-MSL compatibility surface" in mod.__doc__
     assert "m2rnn_path_c.py" in mod.__doc__
-    assert "dW" + "_partial" not in mod._BWD_KERNEL_SOURCE
+    assert not hasattr(mod, "_FWD_KERNEL_SOURCE")
+    assert not hasattr(mod, "_BWD_KERNEL_SOURCE")
 
 
 # ---------------------------------------------------------------------------
@@ -272,7 +272,7 @@ def test_m2rnn_reference_calls_parent_module_unmodified() -> None:
 
 @pytest.mark.parametrize("dtype", [mx.float32, mx.float16])
 def test_metal_kernel_block_parity_at_mini_shape(dtype: mx.Dtype) -> None:
-    """Path B kernel matches the chunked-scan reference at a mini-config shape."""
+    """Compatibility forward matches the chunked-scan reference at a mini shape."""
 
     inputs = _make_inputs(batch=2, seq=64, heads=4, k_dim=8, v_dim=4, dtype=dtype)
     q, k, v, W, xf, h0 = inputs

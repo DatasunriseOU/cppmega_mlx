@@ -307,12 +307,9 @@ def _dispatch_m2rnn_scan(
 ) -> tuple[mx.array, mx.array]:
     """Route the M2RNN scan according to :class:`KernelPath`.
 
-    AUTO/PATH_B uses the Path B Metal kernel via
-    :func:`cppmega_mlx.nn._tilelang.m2rnn_apply_with_state` when available;
-    the wrapper preserves grad through ``y`` via the manual VJP shipped with
-    the kernel and exposes ``h_last`` for cache assembly. REFERENCE always
-    uses the pure-MLX :func:`chunked_m2rnn_scan`. PATH_C is the TileLang DSL
-    port and remains opt-in until receipt-backed performance promotion.
+    REFERENCE and AUTO use the pure-MLX :func:`chunked_m2rnn_scan`. PATH_C is
+    explicit and fail-closed. PATH_B is retired and raises instead of
+    re-entering direct MSL.
     """
 
     from cppmega_mlx.runtime.kernel_policy import (
@@ -321,8 +318,7 @@ def _dispatch_m2rnn_scan(
         selected_path,
     )
 
-    # Validate chunk_size up-front so production parity holds for all paths,
-    # including PATH_B which would otherwise skip the chunked-scan check.
+    # Validate chunk_size up-front so production parity holds for all paths.
     if chunk_size <= 0:
         raise ValueError(f"chunk_size must be positive, got {chunk_size}")
 
@@ -366,36 +362,11 @@ def _dispatch_m2rnn_scan(
         record_dispatch("m2rnn", path, "reference_pure_mlx")
         return chunked_m2rnn_scan(q, k, v, W, xf, h0=h0, chunk_size=chunk_size)
 
-    # AUTO + PATH_B share the Metal-availability check.
-    from cppmega_mlx.nn._tilelang.m2rnn import (
-        m2rnn_apply_with_state,
-        m2rnn_metal_status,
-    )
-
-    status = m2rnn_metal_status(q)
-    if path is KernelPath.PATH_B and not status.available:
+    if path is KernelPath.PATH_B:
         raise RuntimeError(
-            f"m2rnn: Path B kernel unavailable ({status.reason})"
+            "m2rnn: Path B direct-MSL kernel is retired; use Path C or ref"
         )
-    if status.available:
-        # Broadcast heads ahead of the kernel so the dispatch input matches the
-        # contract used by chunked_m2rnn_scan / m2rnn_scan.
-        q_b, k_b, v_b, W_b, xf_b = broadcast_m2rnn_heads(q, k, v, W, xf)
-        batch, seq, heads, k_dim = q_b.shape
-        v_dim = v_b.shape[-1]
-        h0_full = _initial_m2rnn_state(
-            h0,
-            batch=batch,
-            heads=heads,
-            k_dim=k_dim,
-            v_dim=v_dim,
-            dtype=q_b.dtype,
-        )
-        record_dispatch("m2rnn", path, "metal_kernel_fwd_v1")
-        y, h_last = m2rnn_apply_with_state(q_b, k_b, v_b, W_b, xf_b, h0_full)
-        return y, h_last
 
-    # AUTO fallback when Metal is unavailable.
     record_dispatch("m2rnn", path, "reference_pure_mlx")
     return chunked_m2rnn_scan(q, k, v, W, xf, h0=h0, chunk_size=chunk_size)
 
@@ -651,6 +622,7 @@ class M2RNNMixer(nn.Module):
         v_end = k_end + self.v_dim
         xf = m2rnn_softplus_decay_gate(projected[:, :, conv_end:f_end], self.A_log, self.dt_bias)
 
+        used_path_c = False
         if path is KernelPath.PATH_C:
             from cppmega_mlx.nn._tilelang.m2rnn_path_c import (
                 m2rnn_apply_mapped_packed_with_state_path_c,
@@ -660,10 +632,15 @@ class M2RNNMixer(nn.Module):
             )
 
             if scan_h0 is None:
-                raise RuntimeError(
-                    "m2rnn: Path C requires an existing h0 tensor; pass h0 "
-                    "or mixer_state.h so the TileLang/tvm-ffi call receives "
-                    "a real state buffer"
+                if path is KernelPath.PATH_C:
+                    raise RuntimeError(
+                        "m2rnn: Path C requires an existing h0 tensor; pass h0 "
+                        "or mixer_state.h so the TileLang/tvm-ffi call receives "
+                        "a real state buffer"
+                    )
+                scan_h0 = mx.zeros(
+                    (batch, cfg.num_heads, cfg.k_head_dim, cfg.v_head_dim),
+                    dtype=conv_input.dtype,
                 )
             h0_full = _initial_m2rnn_state(
                 scan_h0,
@@ -679,60 +656,81 @@ class M2RNNMixer(nn.Module):
                 else self.state_weight.astype(conv_input.dtype)
             )
             if self.D is None:
-                raise RuntimeError(
-                    "m2rnn: Path C post residual/gate requires residual D; "
-                    "use_residual=False is not yet implemented for this TileLang route"
+                if path is KernelPath.PATH_C:
+                    raise RuntimeError(
+                        "m2rnn: Path C post residual/gate requires residual D; "
+                        "use_residual=False is not yet implemented for this TileLang route"
+                    )
+            else:
+                D = (
+                    self.D
+                    if self.D.dtype == conv_input.dtype
+                    else self.D.astype(conv_input.dtype)
                 )
-            D = self.D if self.D.dtype == conv_input.dtype else self.D.astype(conv_input.dtype)
-            status = m2rnn_mapped_packed_path_c_status(
-                conv_input,
-                state_weight,
-                xf,
-                h0_full,
-                q_heads=cfg.num_q_heads,
-                k_heads=cfg.num_k_heads,
-                v_heads=cfg.num_v_heads,
-            )
-            if not status.available:
-                raise RuntimeError(
-                    f"m2rnn: Path C packed kernel unavailable ({status.reason})"
+                status = m2rnn_mapped_packed_path_c_status(
+                    conv_input,
+                    state_weight,
+                    xf,
+                    h0_full,
+                    q_heads=cfg.num_q_heads,
+                    k_heads=cfg.num_k_heads,
+                    v_heads=cfg.num_v_heads,
                 )
-            out, h = m2rnn_apply_mapped_packed_with_state_path_c(
-                conv_input,
-                state_weight,
-                xf,
-                h0_full,
-                q_heads=cfg.num_q_heads,
-                k_heads=cfg.num_k_heads,
-                v_heads=cfg.num_v_heads,
-            )
-            post_status = m2rnn_post_residual_gate_path_c_status(
-                out,
-                conv_input,
-                D,
-                projected,
-                q_heads=cfg.num_q_heads,
-                k_heads=cfg.num_k_heads,
-                v_heads=cfg.num_v_heads,
-                g_heads=cfg.num_g_heads,
-            )
-            if not post_status.available:
+                if not status.available:
+                    if path is KernelPath.PATH_C:
+                        raise RuntimeError(
+                            f"m2rnn: Path C packed kernel unavailable "
+                            f"({status.reason})"
+                        )
+                else:
+                    out, h = m2rnn_apply_mapped_packed_with_state_path_c(
+                        conv_input,
+                        state_weight,
+                        xf,
+                        h0_full,
+                        q_heads=cfg.num_q_heads,
+                        k_heads=cfg.num_k_heads,
+                        v_heads=cfg.num_v_heads,
+                    )
+                    post_status = m2rnn_post_residual_gate_path_c_status(
+                        out,
+                        conv_input,
+                        D,
+                        projected,
+                        q_heads=cfg.num_q_heads,
+                        k_heads=cfg.num_k_heads,
+                        v_heads=cfg.num_v_heads,
+                        g_heads=cfg.num_g_heads,
+                    )
+                    if not post_status.available:
+                        if path is KernelPath.PATH_C:
+                            raise RuntimeError(
+                                "m2rnn: Path C post residual/gate kernel "
+                                f"unavailable ({post_status.reason})"
+                            )
+                    else:
+                        out = m2rnn_apply_post_residual_gate_path_c(
+                            out,
+                            conv_input,
+                            D,
+                            projected,
+                            q_heads=cfg.num_q_heads,
+                            k_heads=cfg.num_k_heads,
+                            v_heads=cfg.num_v_heads,
+                            g_heads=cfg.num_g_heads,
+                        )
+                        record_dispatch(
+                            "m2rnn",
+                            path,
+                            "path_c_tilelang_dsl_packed_post",
+                        )
+                        used_path_c = True
+
+        if not used_path_c:
+            if path is KernelPath.PATH_B:
                 raise RuntimeError(
-                    f"m2rnn: Path C post residual/gate kernel unavailable "
-                    f"({post_status.reason})"
+                    "m2rnn: Path B direct-MSL kernel is retired; use Path C or ref"
                 )
-            out = m2rnn_apply_post_residual_gate_path_c(
-                out,
-                conv_input,
-                D,
-                projected,
-                q_heads=cfg.num_q_heads,
-                k_heads=cfg.num_k_heads,
-                v_heads=cfg.num_v_heads,
-                g_heads=cfg.num_g_heads,
-            )
-            record_dispatch("m2rnn", path, "path_c_tilelang_dsl_packed_post")
-        else:
             q = conv_input[:, :, :q_end].reshape(batch, seq, cfg.num_q_heads, cfg.k_head_dim)
             k = conv_input[:, :, q_end:k_end].reshape(batch, seq, cfg.num_k_heads, cfg.k_head_dim)
             v = conv_input[:, :, k_end:v_end].reshape(batch, seq, cfg.num_v_heads, cfg.v_head_dim)

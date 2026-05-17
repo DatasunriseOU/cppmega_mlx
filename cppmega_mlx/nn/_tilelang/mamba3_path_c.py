@@ -688,6 +688,150 @@ def _threads_for(lanes: int) -> int:
     return min(256, lanes)
 
 
+def _bwd_threads_for(lanes: int, headdim: int) -> int:
+    """Return a bwd thread count that keeps each P row inside one threadgroup."""
+
+    base = _threads_for(lanes)
+    if (
+        headdim > 0
+        and headdim <= base
+        and base % headdim == 0
+        and lanes % base == 0
+    ):
+        return base
+    upper = min(1024, lanes)
+    for candidate in range(upper - (upper % 32), 0, -32):
+        if (
+            candidate >= headdim
+            and candidate % headdim == 0
+            and lanes % candidate == 0
+        ):
+            return candidate
+    return base
+
+
+@dataclass(frozen=True)
+class _LocalSnapshotPlan:
+    policy: str
+    chunk_size: int
+    chunk_count: int
+    snapshot_count: int
+    state_elements: int
+    snapshot_elements: int
+    state_dtype: str
+
+
+@dataclass(frozen=True)
+class _LocalAliasPlan:
+    input_output_alias: bool
+    in_place_requested: bool
+    in_place_allowed: bool
+    reason: str
+
+
+@dataclass(frozen=True)
+class _LocalScanPlan:
+    direction: str
+    snapshot_plan: _LocalSnapshotPlan
+    rematerialization_policy: str
+    alias_plan: _LocalAliasPlan
+    host_sync_required: bool
+    device_event_required: bool
+    fused_post_ops: tuple[str, ...]
+
+
+def _fallback_recurrence_scan_plan(
+    *,
+    name: str,
+    direction: str,
+    sequence_length: int,
+    state_shape: tuple[int, ...],
+    state_dtype: str,
+    chunk_size: int,
+    decay_may_underflow: bool,
+    input_output_alias: bool,
+    in_place_requested: bool,
+    fused_post_ops: tuple[str, ...],
+) -> _LocalScanPlan:
+    del name
+    chunk_count = (
+        (sequence_length + chunk_size - 1) // chunk_size if sequence_length else 0
+    )
+    state_elements = math.prod(state_shape)
+    needs_snapshots = (
+        direction == "reverse"
+        and sequence_length > chunk_size
+        and decay_may_underflow
+    )
+    snapshot_count = chunk_count + 1 if needs_snapshots else 0
+    return _LocalScanPlan(
+        direction=direction,
+        snapshot_plan=_LocalSnapshotPlan(
+            policy="state-boundary-cache" if needs_snapshots else "none",
+            chunk_size=chunk_size,
+            chunk_count=chunk_count,
+            snapshot_count=snapshot_count,
+            state_elements=state_elements,
+            snapshot_elements=snapshot_count * state_elements,
+            state_dtype=state_dtype,
+        ),
+        rematerialization_policy=(
+            "reuse-forward-state-snapshots"
+            if needs_snapshots
+            else "direct-recompute"
+            if direction == "reverse"
+            else "not-needed"
+        ),
+        alias_plan=_LocalAliasPlan(
+            input_output_alias=input_output_alias,
+            in_place_requested=in_place_requested,
+            in_place_allowed=False,
+            reason=(
+                "input_output_alias_without_in_place_proof"
+                if input_output_alias
+                else "distinct_input_output_buffers"
+            ),
+        ),
+        host_sync_required=False,
+        device_event_required=False,
+        fused_post_ops=fused_post_ops,
+    )
+
+
+def _plan_recurrence_scan_compat(**kwargs):
+    try:
+        from tilelang.analysis.scan_plan import plan_recurrence_scan
+    except ModuleNotFoundError as exc:
+        if exc.name not in {"tilelang.analysis", "tilelang.analysis.scan_plan"}:
+            raise
+        return _fallback_recurrence_scan_plan(**kwargs)
+    return plan_recurrence_scan(**kwargs)
+
+
+def _bwd_scan_plan_for(
+    *,
+    batch: int,
+    seq: int,
+    heads: int,
+    headdim: int,
+    state: int,
+) -> Any:
+    """Plan Mamba3 reverse recurrence state-cache policy."""
+
+    return _plan_recurrence_scan_compat(
+        name="mamba3_path_c_bwd",
+        direction="reverse",
+        sequence_length=seq,
+        state_shape=(batch, heads, headdim, state),
+        state_dtype="float32",
+        chunk_size=_BWD_SNAPSHOT_BLOCK,
+        decay_may_underflow=True,
+        input_output_alias=False,
+        in_place_requested=False,
+        fused_post_ops=("skip_D", "silu_gate"),
+    )
+
+
 @lru_cache(maxsize=128)
 def _fwd_kernel_for(
     BATCH: int,
@@ -815,7 +959,14 @@ def _bwd_state_snapshots_kernel_for(
 
     LANES = BATCH * HEADS * HEADDIM
     THREADS = _threads_for(LANES)
-    BLOCK = _BWD_SNAPSHOT_BLOCK
+    scan_plan = _bwd_scan_plan_for(
+        batch=BATCH,
+        seq=SEQ,
+        heads=HEADS,
+        headdim=HEADDIM,
+        state=STATE,
+    )
+    BLOCK = scan_plan.snapshot_plan.chunk_size
     BLOCKS = (SEQ + BLOCK - 1) // BLOCK
     accum_dtype = "float32"
 
@@ -882,7 +1033,7 @@ def _bwd_simd_p_reduction_supported(
     """Return whether P-axis grads map to TileLang split thread-allreduce."""
 
     lanes = batch * heads * headdim
-    threads = _threads_for(lanes)
+    threads = _bwd_threads_for(lanes, headdim)
     return (
         headdim > 0
         and (headdim <= 32 or headdim % 32 == 0)
@@ -944,7 +1095,7 @@ def _bwd_simd_reduce_kernel_for(
     import tilelang.language as T
 
     LANES = BATCH * HEADS * HEADDIM
-    THREADS = _threads_for(LANES)
+    THREADS = _bwd_threads_for(LANES, HEADDIM)
     accum_dtype = "float32"
 
     @T.prim_func
@@ -1144,8 +1295,15 @@ def _bwd_simd_reduce_kernel_for_state_snapshots(
     import tilelang.language as T
 
     LANES = BATCH * HEADS * HEADDIM
-    THREADS = _threads_for(LANES)
-    BLOCK = _BWD_SNAPSHOT_BLOCK
+    THREADS = _bwd_threads_for(LANES, HEADDIM)
+    scan_plan = _bwd_scan_plan_for(
+        batch=BATCH,
+        seq=SEQ,
+        heads=HEADS,
+        headdim=HEADDIM,
+        state=STATE,
+    )
+    BLOCK = scan_plan.snapshot_plan.chunk_size
     BLOCKS = (SEQ + BLOCK - 1) // BLOCK
     accum_dtype = "float32"
 
@@ -1548,7 +1706,14 @@ def _mamba3_mimo_bwd_path_c_simd_kernel(
         )
 
     try:
-        if seq > _BWD_SNAPSHOT_BLOCK:
+        scan_plan = _bwd_scan_plan_for(
+            batch=batch,
+            seq=seq,
+            heads=heads,
+            headdim=headdim,
+            state=state,
+        )
+        if scan_plan.snapshot_plan.policy == "state-boundary-cache":
             snapshot_kernel, snapshot_lowering = _bwd_state_snapshots_kernel_for(
                 batch,
                 seq,
@@ -1868,7 +2033,14 @@ def dump_lowered_bwd_msl(
             "Mamba3 Path C bwd has no host-reduced partial fallback; "
             "unsupported P-axis reduction shapes must stay on Path B"
         )
-    if seq > _BWD_SNAPSHOT_BLOCK:
+    scan_plan = _bwd_scan_plan_for(
+        batch=batch,
+        seq=seq,
+        heads=heads,
+        headdim=headdim,
+        state=state,
+    )
+    if scan_plan.snapshot_plan.policy == "state-boundary-cache":
         kernel, lowering = _bwd_simd_reduce_kernel_for_state_snapshots(
             batch, seq, heads, headdim, state
         )

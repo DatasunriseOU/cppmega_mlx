@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import pytest
 import numpy as np
 
@@ -27,7 +29,7 @@ from cppmega_mlx.nn._tilelang.sparse_mla_blockscaled_path_c import (
 from cppmega_mlx.nn._tilelang.sparse_mla_blockscaled import (
     _quantize_mxfp8,
     _unpack_mxfp8_to_uint8,
-    sparse_mla_blockscaled_fwd_metal,
+    sparse_mla_blockscaled_reference,
 )
 
 
@@ -343,7 +345,7 @@ def test_blockscaled_path_c_forward_owner_output_abi_is_fail_closed(
         )
 
 
-def test_blockscaled_path_c_apply_matches_path_b() -> None:
+def test_blockscaled_path_c_apply_matches_reference() -> None:
     if not _metal_available():
         pytest.skip("Metal backend not available on this host")
 
@@ -361,10 +363,6 @@ def test_blockscaled_path_c_apply_matches_path_b() -> None:
     q_fp8 = _unpack_mxfp8_to_uint8(q_packed, dim)
     kv_fp8 = _unpack_mxfp8_to_uint8(kv_packed, dim)
 
-    path_b = sparse_mla_blockscaled_fwd_metal(q, kv, indices, sm_scale=sm_scale, d_v=dim)
-    if path_b is None:
-        pytest.skip("Path B blockscaled Metal unavailable on this host")
-    out_b, _lse_b = path_b
     try:
         out_c = sparse_mla_blockscaled_path_c_apply(
             q_fp8,
@@ -379,9 +377,11 @@ def test_blockscaled_path_c_apply_matches_path_b() -> None:
     except RuntimeError as exc:
         pytest.skip(str(exc))
     assert out_c is not None
+    out_ref = sparse_mla_blockscaled_reference(q, kv, indices, sm_scale=sm_scale, d_v=dim)
+    mx.eval(out_c, out_ref)
     np.testing.assert_allclose(
         np.asarray(out_c.astype(mx.float32)),
-        np.asarray(out_b.astype(mx.float32)),
+        np.asarray(cast(mx.array, out_ref).astype(mx.float32)),
         atol=2e-2,
         rtol=5e-2,
     )

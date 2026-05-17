@@ -139,18 +139,17 @@ Default behavior on Apple Silicon is in the **"Production"** column. Override vi
     </tr>
     <tr>
       <td><strong>FP8 vecmat (Path C)</strong><br>(M=1, transpose-B contract)</td>
-      <td>Opt-in only — see Path B FP8 vecmat row below.</td>
-      <td><code>fp8_scaled_vecmat</code> (Path B)</td>
+      <td>Opt-in only — compare against the FP8 reference helper.</td>
+      <td><code>fp8_scaled_vecmat</code> (pure-MLX reference; retired Path B name)</td>
       <td><code>fp8_scaled_vecmat_path_c</code> (in
       <code>cppmega_mlx/nn/_tilelang/fp8_vecmat_path_c.py</code>):<br>
       <code>x_fp8 (K,) uint8 e4m3</code>,
       <code>W_fp8 (N, K) uint8 e4m3</code>,
       <code>scale_x</code> scalar, <code>scale_w</code> scalar or <code>(N,)</code>.<br>
-      Mirrors Path B's vecmat contract. <strong>Status:</strong> opt-in only.
-      Current TL-W owner-output/tvm-ffi production-path timing is still about
-      1.7x slower than the shipped Path B/audiohacking-style reducer, so AUTO
-      must not promote it. Older packed-dot4 probe receipts that showed parity
-      or speed parity are diagnostic history, not the current production gate.</td>
+      Mirrors the historical vecmat contract. <strong>Status:</strong> opt-in only.
+      The old <code>fp8_msl_kernels.py</code> direct-MSL Path B reducer is
+      retired; current comparisons use the pure-MLX FP8 reference helper unless
+      a receipt explicitly says it is historical.</td>
       <td>Listed for accuracy — earlier revisions of this table omitted FP8 vecmat
       Path C even though the entrypoint exists in the tree.</td>
     </tr>
@@ -168,15 +167,16 @@ Default behavior on Apple Silicon is in the **"Production"** column. Override vi
     </tr>
     <tr>
       <td><strong>Sparse-MLA fwd<br>blockscaled (e8m0)</strong></td>
-      <td><strong>B</strong> — <code>sparse_mla_blockscaled_apply</code></td>
+      <td><strong>Reference</strong> — <code>sparse_mla_blockscaled_apply</code><br>
+      retired Path B fails closed</td>
       <td><code>sparse_mla_blockscaled_reference</code></td>
       <td><strong>Prepared-buffer Path C apply.</strong>
       <code>sparse_mla_blockscaled_path_c_apply</code> consumes existing FP8
       byte tensors and E8M0 K/32 scale tensors, then performs QK, softmax, and
       SV in one lowered kernel. It is not a high-level float-carrier wrapper;
-      Path B still owns MXFP8 quantization/unpacking unless the graph creates
-      those buffers directly.</td>
-      <td>mxfp8 block-scale is a software emulation;<br>Path B handles the 16-element scale tile bookkeeping.</td>
+      float inputs stay on the MXFP8 reference unless the graph creates those
+      buffers directly.</td>
+      <td>mxfp8 block-scale is a software emulation;<br>the old direct-MSL Path B runtime no longer dispatches.</td>
     </tr>
     <tr>
       <td><strong>Sparse-MLA bwd</strong><br>(chunked dQ/dK/dV)</td>
@@ -225,13 +225,13 @@ Default behavior on Apple Silicon is in the **"Production"** column. Override vi
     </tr>
     <tr>
       <td><strong>FP8 scaled matmul /<br>vecmat</strong> (when used in<br>custom paths)</td>
-      <td><strong>B</strong> — <code>cppmega_mlx.nn._tilelang.fp8_scaled_matmul</code><br>(audiohacking-style)</td>
-      <td>dequant + <code>mx.matmul</code></td>
+      <td><strong>Reference only</strong> — <code>cppmega_mlx.nn._tilelang.fp8_scaled_matmul</code><br>(pure MLX helper)</td>
+      <td>dequant + <code>mx.matmul</code>; historical direct-MSL Path B is retired</td>
       <td><code>T.fp8_scaled_matmul</code> owner-output/tvm-ffi path exists,<br>
-      but current TL-W timing is not production-green: matmul is about 14x
-      slower and vecmat about 1.7x slower than the shipped Path B kernels.</td>
-      <td>Standalone correctness is useful, but AUTO remains on Path B until
-      strict current receipts show no-worse speed and full fwd/bwd composition.</td>
+      but current production promotion still depends on current receipts and full
+      fwd/bwd composition.</td>
+      <td>Standalone correctness is useful, but AUTO must not use the retired
+      direct-MSL route.</td>
     </tr>
   </tbody>
 </table>
@@ -383,15 +383,15 @@ The dispatch decision is recorded in a process-wide ring buffer (last 256 record
     <tr>
       <td>FP8 matmul 128×128×128 e4m3</td>
       <td>n/a</td>
-      <td>shipped Path B/audiohacking-style FP8 MSL route</td>
-      <td>owner-output/tvm-ffi Path C route is currently about 14x slower</td>
+      <td>pure-MLX FP8 reference helper; historical direct-MSL route retired</td>
+      <td>owner-output/tvm-ffi Path C route remains the production candidate</td>
       <td>n/a</td>
       <td>blocked</td>
     </tr>
     <tr>
       <td>FP8 vecmat M=1 N=K=4096</td>
       <td>n/a</td>
-      <td>shipped M=1 simd_sum reducer</td>
+      <td>pure-MLX FP8 reference helper; historical M=1 simd_sum reducer retired</td>
       <td>owner-output/tvm-ffi Path C route is currently about 1.7x slower</td>
       <td>n/a</td>
       <td>blocked</td>
@@ -441,12 +441,12 @@ The dispatch decision is recorded in a process-wide ring buffer (last 256 record
 
 ## Honest limitations
 
-- **R (m2rnn) blocks now ship a Path B port** (cppmega_mlx/nn/_tilelang/m2rnn.py). Both forward and backward run as hand-written MSL via mx.fast.metal_kernel; the chunked-scan reference remains as the parity oracle and is reachable via CPPMEGA_KERNEL_PATH=ref. The kernel uses one threadgroup per (batch, head) with K_DIM threads per group; W is loaded into threadgroup memory once per (B, H). The fp16 carrier dodges the bf16 simdgroup MSL codegen bugs that Mamba3 also worked around.
+- **R (m2rnn) direct-MSL Path B is retired.** The compatibility module now fails closed for explicit Path B and uses the chunked-scan reference or the owner-output TileLang/tvm-ffi Path C route where supported.
 - **Path C is narrow, not global.** TopK has a native `topk_selector_tilelang_direct(..., out=...)` route for the float32/float16 owner-output case, but the public no-output AUTO API stays on Path B/reference because tvm-ffi needs a caller-owned output. Direct bf16 fails closed to avoid hidden casts. Sparse-MLA BF16 uses a per-shape fail-closed AUTO gate backed by bench/tilelang_ports/sparse_mla.json: green checked rows promote, unreceipted rows stay Path B. Mamba3 Path C remains a proof/override path. M2RNN Path C is available through owner-output/tvm-ffi, but only for already-aligned tensors with explicit <code>h0</code>; otherwise it raises before data movement.
-- **FP8 paths are software emulation.** Apple Silicon (M1–M4) has no native FP8 ALU. The uchar storage + LUT decode + fp32 fma loop pattern (vendored from audiohacking/fp8-mps-metal Apache 2.0) is what we ship. Native FP8 is M5/M6 territory.
+- **FP8 paths are software emulation.** Apple Silicon (M1–M4) has no native FP8 ALU. Current generic FP8 helper code uses MLX encode/decode references, while promoted performance work must go through TileLang/tvm-ffi owner-output routes. Native FP8 is M5/M6 territory.
 - **TileLang DSL on Metal works for FP16/FP32 GEMM, Mamba3, topk_selector, and BF16 sparse-MLA today.** The stale 32×32 T.Pipelined blocker no longer describes the in-tree sparse BF16 port. Remaining Sparse-MLA gaps are FP8 scheduler composition, e8m0 full-layout coverage, and unreceipted BF16 shapes outside the checked routing table.
 - **CPPMEGA_KERNEL_PATH=path_c is not a complete global path.** It redirects env-policy ops that have Path C wiring, currently Mamba3, sparse-MLA, and M2RNN. Mamba3 and M2RNN Path C routes use owner-output/tvm-ffi and fail closed before hidden broadcast/repeat/state allocation or graph-transform DLPack export. topk_selector uses its explicit backend argument. Other ops without Path C support must stay on Path A/B or fail closed.
-- **Remaining fast-kernel wrappers are intentional debt.** The current list is `_mlx_runtime.py`, `_msl_transform.py`, `m2rnn.py`, `fp8_msl_kernels.py`, `fp8_matmul_path_c.py`, `fp8_vecmat_path_c.py`, `topk_selector.py` compatibility paths, `sparse_mla.py`, `sparse_mla_path_c.py`, `sparse_mla_fp8.py`, `sparse_mla_fp8_path_c.py`, `sparse_mla_blockscaled.py`, and `sparse_mla_blockscaled_path_c.py`. Removing them requires a no-hidden-copy tvm-ffi route plus equal-or-better receipts.
+- **Remaining fast-kernel wrappers are intentional debt.** The active routing list includes `_mlx_runtime.py`, `_msl_transform.py`, `mamba3.py`, `fp8_matmul_path_c.py`, `fp8_vecmat_path_c.py`, `topk_selector.py` compatibility paths, `sparse_mla.py`, `sparse_mla_path_c.py`, `sparse_mla_fp8.py`, `sparse_mla_fp8_path_c.py`, `sparse_mla_blockscaled.py`, and `sparse_mla_blockscaled_path_c.py`. Removing them requires a no-hidden-copy tvm-ffi route plus equal-or-better receipts. `fp8_msl_kernels.py` is now a pure reference helper, not a fast-kernel wrapper.
 
 ## Receipts
 

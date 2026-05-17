@@ -1,6 +1,6 @@
 # pyright: reportInvalidTypeForm=false, reportMissingImports=false, reportUndefinedVariable=false
 # ruff: noqa: F821,F822
-"""Profile TileLang Path C FP8 kernels against Path B hand-written MSL.
+"""Profile TileLang Path C FP8 kernels against the FP8 reference baseline.
 
 This is the local Apple-Silicon/Metal Path C FP8 harness. It intentionally
 lives outside the TileLang/TVM trees: the script profiles the current
@@ -236,6 +236,7 @@ def _selected_import_roots(tilelang_root: Path, tvm_root: Path) -> list[Path]:
         tilelang_root,
         tvm_root,
         tvm_root / "python",
+        tvm_root / "3rdparty" / "tvm-ffi",
         tvm_root / "3rdparty" / "tvm-ffi" / "python",
         Path("/private/tmp/cppmega-mlx-tilelang-stack-c")
         / "3rdparty"
@@ -245,17 +246,36 @@ def _selected_import_roots(tilelang_root: Path, tvm_root: Path) -> list[Path]:
         / "python",
         tilelang_root / "3rdparty" / "tvm",
         tilelang_root / "3rdparty" / "tvm" / "python",
+        tilelang_root / "3rdparty" / "tvm" / "3rdparty" / "tvm-ffi",
         tilelang_root / "3rdparty" / "tvm" / "3rdparty" / "tvm-ffi" / "python",
     ]
 
 
 def _finder_paths(finder: object) -> list[Path]:
     paths: list[Path] = []
-    for attr in ("path", "src_path", "source_path", "project_root", "install_dir"):
+    for attr in ("path", "src_path", "source_path", "project_root"):
         value = getattr(finder, attr, None)
         if isinstance(value, str | os.PathLike):
             paths.append(Path(value))
     return paths
+
+
+def _finder_source_file_paths(finder: object) -> list[Path]:
+    paths: list[Path] = []
+    source_files = getattr(finder, "known_source_files", None)
+    if isinstance(source_files, dict):
+        for value in source_files.values():
+            if isinstance(value, str | os.PathLike):
+                paths.append(Path(value))
+    return paths
+
+
+def _editable_finder_is_in_roots(finder: object, roots: list[Path]) -> bool:
+    source_paths = _finder_source_file_paths(finder)
+    if source_paths:
+        return all(_path_in_roots(path, roots) for path in source_paths)
+    paths = _finder_paths(finder)
+    return bool(paths) and all(_path_in_roots(path, roots) for path in paths)
 
 
 def _disable_stale_editable_import_finders(tilelang_root: Path, tvm_root: Path) -> None:
@@ -279,8 +299,7 @@ def _disable_stale_editable_import_finders(tilelang_root: Path, tvm_root: Path) 
             kept.append(finder)
             continue
 
-        paths = _finder_paths(finder)
-        if paths and all(_path_in_roots(path, allowed_roots) for path in paths):
+        if _editable_finder_is_in_roots(finder, allowed_roots):
             kept.append(finder)
             continue
         _REMOVED_IMPORT_FINDERS.append(f"{module}.{name}")
@@ -437,7 +456,6 @@ np: Any = None
 mx: Any = None
 torch: Any = None
 fp8_msl_status: Any = None
-_FP8_MATMUL_BODY: Any = None
 fp8_scaled_matmul_raw: Any = None
 fp8_scaled_vecmat: Any = None
 fp8_vecmat_runtime_msl_source: Any = None
@@ -455,7 +473,6 @@ def _require_bench_deps() -> None:
     _prepare_tilelang_import_environment()
 
     global TILELANG_METAL_VECMAT_TARGET
-    global _FP8_MATMUL_BODY
     global fp8_msl_status
     global fp8_scaled_matmul_raw
     global fp8_scaled_vecmat
@@ -481,13 +498,11 @@ def _require_bench_deps() -> None:
         torch = _torch
     if fp8_msl_status is None:
         from cppmega_mlx.nn._tilelang.fp8_msl_kernels import (
-            _FP8_MATMUL_BODY as _fp8_matmul_body,
             fp8_msl_status as _fp8_msl_status,
             fp8_scaled_matmul_raw as _fp8_scaled_matmul_raw,
             fp8_scaled_vecmat as _fp8_scaled_vecmat,
         )
 
-        _FP8_MATMUL_BODY = _fp8_matmul_body
         fp8_msl_status = _fp8_msl_status
         fp8_scaled_matmul_raw = _fp8_scaled_matmul_raw
         fp8_scaled_vecmat = _fp8_scaled_vecmat
@@ -509,9 +524,11 @@ def _require_bench_deps() -> None:
 
 Shape = dict[str, Any]
 
-PATH_B_MATMUL_LABEL = "path_b_msl_fp8_scaled_matmul"
+LEGACY_PATH_B_MATMUL_LABEL = "path_b_msl_fp8_scaled_matmul"
+LEGACY_PATH_B_VECMAT_LABEL = "path_b_msl_fp8_scaled_vecmat"
+PATH_B_MATMUL_LABEL = "reference_mlx_fp8_scaled_matmul"
 PATH_C_MATMUL_LABEL = "path_c_mlx_metal_fp8_scaled_matmul"
-PATH_B_VECMAT_LABEL = "path_b_msl_fp8_scaled_vecmat"
+PATH_B_VECMAT_LABEL = "reference_mlx_fp8_scaled_vecmat"
 PATH_C_VECMAT_LABEL = "path_c_mlx_tilelang_fp8_scaled_vecmat"
 
 SHAPES: dict[str, Shape] = {
@@ -928,9 +945,7 @@ def _require_runtime() -> None:
         raise RuntimeError(f"MLX default device is not GPU: {mx.default_device()}")
     if not torch.backends.mps.is_available():
         raise RuntimeError("torch.backends.mps.is_available() is false")
-    status = fp8_msl_status()
-    if not status.available:
-        raise RuntimeError(f"Path B FP8 MSL unavailable: {status.reason}")
+    fp8_msl_status()
 
 
 def _import_tilelang() -> tuple[Any, Any, Any, Any]:
@@ -1210,7 +1225,7 @@ def _bench_path_b_matmul(
         mx.eval(last)
 
     stats = _bench_callable(
-        "path_b_msl_fp8_scaled_matmul",
+        PATH_B_MATMUL_LABEL,
         run,
         _sync_mlx,
         flops=flops,
@@ -1269,7 +1284,7 @@ def _bench_paired_scaled_matmul(
     skip_xcrun: bool,
     dump_dir: Path | None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    b_label = "path_b_msl_fp8_scaled_matmul"
+    b_label = PATH_B_MATMUL_LABEL
     c_label = "matmul_tl_fp8_scaled_matmul"
     M, N, K = int(shape["M"]), int(shape["N"]), int(shape["K"])
     flops = 2.0 * M * N * K
@@ -1391,7 +1406,7 @@ def _bench_path_b_vecmat(
         mx.eval(last)
 
     stats = _bench_callable(
-        "path_b_msl_fp8_scaled_vecmat",
+        PATH_B_VECMAT_LABEL,
         run,
         _sync_mlx,
         flops=flops,
@@ -1453,7 +1468,7 @@ def _bench_paired_vecmat_mlx(
     tokens_per_call = 1.0
     b_last_ref: list[mx.array | None] = [None]
     c_last_ref: list[mx.array | None] = [None]
-    b_label = "path_b_msl_fp8_scaled_vecmat"
+    b_label = PATH_B_VECMAT_LABEL
     c_label = "path_c_mlx_tilelang_fp8_scaled_vecmat"
     paired = _bench_paired_callables_with_optional_tokens_per_call(
         (
@@ -1738,16 +1753,31 @@ def _compare_ratios(rows: Iterable[dict[str, Any]]) -> dict[str, float]:
                 if isinstance(value, int | float) and math.isfinite(float(value))
             }
     out: dict[str, float] = {}
-    b_matmul = benches.get("path_b_msl_fp8_scaled_matmul")
-    b_vecmat = benches.get("path_b_msl_fp8_scaled_vecmat")
+    b_matmul = benches.get(PATH_B_MATMUL_LABEL) or benches.get(
+        LEGACY_PATH_B_MATMUL_LABEL
+    )
+    b_vecmat = benches.get(PATH_B_VECMAT_LABEL) or benches.get(
+        LEGACY_PATH_B_VECMAT_LABEL
+    )
     for label, median in benches.items():
-        if label.startswith("path_b_"):
+        if label in {
+            PATH_B_MATMUL_LABEL,
+            PATH_B_VECMAT_LABEL,
+            LEGACY_PATH_B_MATMUL_LABEL,
+            LEGACY_PATH_B_VECMAT_LABEL,
+        } or label.startswith("path_b_"):
             continue
         base_label = (
-            "path_b_msl_fp8_scaled_vecmat"
+            PATH_B_VECMAT_LABEL
             if "vecmat" in label
-            else "path_b_msl_fp8_scaled_matmul"
+            else PATH_B_MATMUL_LABEL
         )
+        if base_label not in benches:
+            base_label = (
+                LEGACY_PATH_B_VECMAT_LABEL
+                if "vecmat" in label
+                else LEGACY_PATH_B_MATMUL_LABEL
+            )
         paired_key = f"{label}_over_{base_label}_paired_median"
         paired_ratio = paired.get(label, {}).get(paired_key)
         if paired_ratio is not None:
@@ -1959,11 +1989,15 @@ def _shape_row_strict_ok(
     labels = {str(row.get("label")): row for row in shape_row.get("rows", [])}
     kind = shape_row.get("shape", {}).get("kind")
     if kind == "vecmat":
-        path_b_label = "path_b_msl_fp8_scaled_vecmat"
+        path_b_label = PATH_B_VECMAT_LABEL
         path_c_label = "path_c_mlx_tilelang_fp8_scaled_vecmat"
+        legacy_path_b_label = LEGACY_PATH_B_VECMAT_LABEL
     else:
-        path_b_label = "path_b_msl_fp8_scaled_matmul"
+        path_b_label = PATH_B_MATMUL_LABEL
         path_c_label = "matmul_tl_fp8_scaled_matmul"
+        legacy_path_b_label = LEGACY_PATH_B_MATMUL_LABEL
+    if path_b_label not in labels and legacy_path_b_label in labels:
+        path_b_label = legacy_path_b_label
     ratio_key = f"{path_c_label}_over_path_b"
     ratio = shape_row.get("ratios", {}).get(ratio_key)
     vecmat_uses_paired_ratio = False
@@ -2064,7 +2098,7 @@ def _bench_shape(
             skip_xcrun=skip_xcrun,
             dump_dir=dump_dir,
         )
-        row_b = {"label": "path_b_msl_fp8_scaled_vecmat", "bench": asdict(b_stats)}
+        row_b = {"label": PATH_B_VECMAT_LABEL, "bench": asdict(b_stats)}
         if b_stats.ok and b_last is not None and bool(shape.get("parity", False)):
             ref = _parity_for_matmul(inputs, b_last.reshape(1, int(shape["N"])))
             row_b["parity_vs_torch_cpu_dequant"] = ref
@@ -2218,7 +2252,7 @@ def _bench_sparse_status(*, warmup: int, iters: int, seed: int) -> dict[str, Any
 
 
 def _print_summary(payload: dict[str, Any]) -> None:
-    print("\n=== Path C vs Path B FP8 Summary ===")
+    print("\n=== Path C vs FP8 Reference Summary ===")
     for row in payload["results"]:
         print(f"\n{row['shape_name']} {row['shape']}")
         for item in row["rows"]:

@@ -65,8 +65,11 @@ def compute_dacs_segsum(
     A_f = A.astype(work_dtype)
     dt_f = dt.astype(work_dtype)
     decay = A_f * dt_f
-    # Reverse cumsum over time axis.
-    rev = mx.cumsum(decay[:, ::-1], axis=1)[:, ::-1]
+    # Reverse cumsum over time axis. Avoid negative-stride cumsum inputs here:
+    # repeated MLX evaluations can reuse the reversed view incorrectly.
+    reverse_t = mx.arange(decay.shape[1] - 1, -1, -1)
+    decay_reversed = mx.take(decay, reverse_t, axis=1)
+    rev = mx.take(mx.cumsum(decay_reversed, axis=1), reverse_t, axis=1)
     # Boundary: rev[t] currently includes decay[t]; subtract so segment is (t, T].
     rev = rev - decay
     weight = mx.exp(rev)
