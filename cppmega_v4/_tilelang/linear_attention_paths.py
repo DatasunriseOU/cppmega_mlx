@@ -61,21 +61,30 @@ def _path_a_call(*args, **kwargs):
 
 
 def _path_b_status() -> PathStatus:
-    # We have the GLA Metal scaffold in mlx-recurrence; the delta-rule extension
-    # is the pending step. Until that lands, declare unavailable.
-    return PathStatus(
-        path="path_b",
-        available=False,
-        reason=(
-            "hand-MSL GDN kernel pending: extend mlx-recurrence/gla_scan.py "
-            "to apply delta_rule term (S -= beta * k (k^T S)) before the "
-            "alpha decay step"
-        ),
-    )
+    try:
+        importlib.import_module("cppmega_v4._tilelang.linear_attention_path_b")
+        # Confirm mx.fast.metal_kernel is callable (Metal available).
+        if not hasattr(mx, "fast") or not hasattr(mx.fast, "metal_kernel"):
+            return PathStatus(
+                path="path_b", available=False,
+                reason="mx.fast.metal_kernel not available on this build",
+            )
+        return PathStatus(
+            path="path_b", available=True,
+            reason="hand-MSL GDN forward via mx.fast.metal_kernel (fwd only; bwd falls back to Path A)",
+        )
+    except Exception as exc:
+        return PathStatus(
+            path="path_b", available=False,
+            reason=f"path_b module not importable: {exc}",
+        )
 
 
 def _path_b_call(*args, **kwargs):
-    return _path_a_call(*args, **kwargs)  # fallback
+    if not _path_b_status().available:
+        return _path_a_call(*args, **kwargs)
+    mod = importlib.import_module("cppmega_v4._tilelang.linear_attention_path_b")
+    return mod.gdn_forward_path_b(*args, **kwargs)
 
 
 # --- Path C (TileLang DSL -> Metal) ---------------------------------------

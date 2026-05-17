@@ -82,21 +82,22 @@ def test_gdn_path_a_always_available():
     assert statuses["path_a"].available
 
 
-def test_gdn_paths_b_c_d_currently_deferred():
+def test_gdn_paths_c_d_currently_deferred():
     statuses = linear_attention_path_statuses()
-    # The deferred paths must still expose a clear reason so users know what's
-    # missing. They all delegate to Path A at dispatch time.
-    for p in ("path_b", "path_c", "path_d"):
+    # Path C/D still deferred (need TileLang/Triton wiring); Path B is now
+    # real Metal kernel as of the path_b ROI commit.
+    for p in ("path_c", "path_d"):
         st = statuses[p]
         assert not st.available
         assert len(st.reason) > 20  # non-empty rationale
 
 
-def test_gdn_auto_mode_default_falls_back_to_path_a(monkeypatch):
+def test_gdn_auto_mode_default_picks_first_available(monkeypatch):
     monkeypatch.delenv(GDN_ENV, raising=False)
     chosen = linear_attention_auto_mode_for_inputs()
-    # Since all B/C/D/E are unavailable in baseline, auto picks path_a.
-    assert chosen == "path_a"
+    # Path B is available (real Metal kernel) — auto picks it before falling
+    # back to A in the preference order (c > b > e > d > a).
+    assert chosen in ("path_a", "path_b")
 
 
 def test_gdn_auto_mode_respects_env(monkeypatch):
@@ -116,7 +117,9 @@ def test_gdn_dispatch_returns_same_as_path_a(monkeypatch):
     g = mx.array(rng.standard_normal((B, T, H)).astype(np.float32) * 0.1)
     o_disp, _ = gated_delta_recurrent_dispatch(q, k, v, beta, g)
     o_ref, _ = naive_recurrent_gated_delta_rule(q, k, v, beta, g)
-    np.testing.assert_array_equal(np.array(o_disp), np.array(o_ref))
+    # Path B (Metal float32) differs from Path A (MLX float64-then-cast) by
+    # ~1e-7. Use atol for the comparison.
+    np.testing.assert_allclose(np.array(o_disp), np.array(o_ref), atol=1e-5)
 
 
 @pytest.mark.parametrize("path", ["path_a", "path_b", "path_c", "path_d", "path_e"])
