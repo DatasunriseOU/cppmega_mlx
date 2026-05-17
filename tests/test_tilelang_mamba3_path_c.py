@@ -205,6 +205,16 @@ def _assert_no_bwd_partial_outputs(msl: str) -> None:
         assert name not in msl
 
 
+def _assert_bwd_partial_outputs(msl: str) -> None:
+    for name in _BWD_PARTIAL_OUTPUT_TOKENS:
+        assert name in msl
+
+
+def _kernel_body(msl: str) -> str:
+    _prelude, _signature, body = _msl_transform._split_kernel_msl(msl)
+    return body
+
+
 def test_lowered_fwd_msl_contains_kernel_void() -> None:
     """Lowering emits a self-contained MSL kernel string."""
 
@@ -218,37 +228,39 @@ def test_lowered_fwd_msl_contains_kernel_void() -> None:
 def test_lowered_bwd_msl_contains_kernel_void() -> None:
     msl = dump_lowered_bwd_msl(batch=1, seq=4, heads=1, headdim=2, state=4)
     assert "kernel void" in msl
-    # Long-sequence bwd emits final-gradient outputs and consumes h snapshots.
+    # Production bwd emits partial outputs and consumes h snapshots.
     for name in ("A", "B", "C", "D", "dt", "dy", "h_snap", "x", "z"):
         assert name in msl, f"input buffer {name!r} missing from lowered MSL"
     assert "h_steps" not in msl
-    _assert_no_bwd_partial_outputs(msl)
-    for name in ("dA", "dB", "dC", "dD_batch", "ddt", "dh0", "dx", "dz"):
+    _assert_bwd_partial_outputs(msl)
+    for name in ("dh0", "dx", "dz"):
         assert name in msl, f"output buffer {name!r} missing from lowered MSL"
 
 
-def test_lowered_bwd_bench_shape_uses_simd_p_reduction() -> None:
+def test_lowered_bwd_bench_shape_uses_partial_outputs_not_hot_allreduce() -> None:
     msl = dump_lowered_bwd_msl(batch=1, seq=4, heads=1, headdim=32, state=4)
+    body = _kernel_body(msl)
     assert "kernel void" in msl
-    assert "simd_sum(" in msl
-    assert "simd_shuffle_down" not in msl
-    _assert_no_bwd_partial_outputs(msl)
-    assert "dD_batch" in msl
+    assert "simd_sum(" not in body
+    assert "simd_shuffle_down" not in body
+    assert "threadgroup_barrier(" not in body
+    assert "red_buf_staging" not in body
+    _assert_bwd_partial_outputs(msl)
+    assert "dD_partial" in msl
 
 
 @pytest.mark.parametrize("headdim", [64, 96, 128, 256, 512, 1024])
-def test_lowered_bwd_aligned_headdims_use_split_thread_allreduce(
+def test_lowered_bwd_aligned_headdims_avoid_split_thread_allreduce(
     headdim: int,
 ) -> None:
-    assert mamba3_path_c._bwd_simd_p_reduction_supported(
-        batch=1, heads=1, headdim=headdim
-    )
     msl = dump_lowered_bwd_msl(batch=1, seq=2, heads=1, headdim=headdim, state=2)
+    body = _kernel_body(msl)
     assert "kernel void" in msl
-    assert "simd_sum(" in msl
-    assert "red_buf_staging" in msl
-    _assert_no_bwd_partial_outputs(msl)
-    assert "dD_batch" in msl
+    assert "simd_sum(" not in body
+    assert "threadgroup_barrier(" not in body
+    assert "red_buf_staging" not in body
+    _assert_bwd_partial_outputs(msl)
+    assert "dD_partial" in msl
 
 
 @pytest.mark.parametrize(
@@ -668,18 +680,20 @@ def test_bwd_path_c_rejects_public_partial_owner_outputs() -> None:
     )
     mx.eval(dy, *owner_outputs)
 
-    with pytest.raises(RuntimeError, match="does not expose partial owner-output"):
+    with pytest.raises(RuntimeError, match="does not expose public owner-output"):
         mamba3_mimo_bwd_path_c(dy, x, B, C, z, A, dt, D, h0, out=owner_outputs)
 
 
-def test_bwd_path_c_unsupported_p_reduction_shape_has_no_partial_fallback() -> None:
+def test_bwd_path_c_unaligned_p_shape_uses_generic_partial_route() -> None:
     _require_mamba3_path_c()
     inputs = _make_inputs(batch=1, seq=2, heads=1, headdim=33, state=2, dtype=mx.float32)
     dy = mx.ones(inputs[0].shape, dtype=mx.float32)
     mx.eval(dy)
 
-    with pytest.raises(RuntimeError, match="no host-reduced partial fallback"):
-        mamba3_mimo_bwd_path_c(dy, *inputs)
+    grads = mamba3_mimo_bwd_path_c(dy, *inputs)
+    mx.eval(*grads)
+    assert grads[0].shape == inputs[0].shape
+    assert grads[1].shape == inputs[1].shape
 
 
 def test_bwd_path_c_default_outputs_use_tilelang_write_only_alloc(

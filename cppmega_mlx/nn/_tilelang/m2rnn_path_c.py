@@ -21,6 +21,7 @@ from cppmega_mlx.nn._tilelang._msl_extraction import extract_msl_from_engine_art
 from cppmega_mlx.nn._tilelang._msl_transform import MSLDispatchUnsupported
 from cppmega_mlx.nn._tilelang.m2rnn import (
     _validate_inputs,
+    m2rnn_bwd_metal,
 )
 
 
@@ -3198,9 +3199,26 @@ def m2rnn_mapped_packed_post_path_c_status(
     if not fwd_status.available:
         return fwd_status
     if require_backward:
+        scan_fwd_status = _kernel_lowering_status(
+            f"mapped packed M2RNN Path C {carrier_dtype} K={k_dim} fwd for bwd cache",
+            _mapped_packed_fwd_kernel_for,
+            batch,
+            seq,
+            total_heads,
+            q_heads,
+            k_heads,
+            v_heads,
+            w_heads,
+            f_heads,
+            k_dim,
+            v_dim,
+            carrier_dtype,
+        )
+        if not scan_fwd_status.available:
+            return scan_fwd_status
         post_bwd_status = _kernel_lowering_status(
-            f"mapped packed M2RNN inline post Path C {carrier_dtype} bwd",
-            _post_residual_gate_bwd_from_recurrence_kernel_for,
+            f"mapped packed M2RNN inline post Path C {carrier_dtype} split bwd",
+            _post_residual_gate_bwd_kernel_for,
             batch,
             seq,
             total_heads,
@@ -3208,7 +3226,6 @@ def m2rnn_mapped_packed_post_path_c_status(
             k_heads,
             v_heads,
             g_heads,
-            f_heads,
             k_dim,
             v_dim,
             conv_dim,
@@ -3518,6 +3535,97 @@ def _expand_mapped_heads_for_reference(
         target_shape[axis] = total_heads
         return mx.broadcast_to(x, tuple(target_shape))
     return mx.repeat(x, repeats=total_heads // heads, axis=axis)
+
+
+def _reduce_expanded_head_gradient(
+    grad: mx.array,
+    *,
+    axis: int,
+    heads: int,
+    total_heads: int,
+) -> mx.array:
+    if heads == total_heads:
+        return grad
+    group = total_heads // heads
+    axis = axis if axis >= 0 else grad.ndim + axis
+    shape = list(grad.shape)
+    shape[axis] = heads
+    shape.insert(axis + 1, group)
+    return mx.sum(grad.reshape(tuple(shape)), axis=axis + 1)
+
+
+def _m2rnn_mapped_packed_bwd_path_b_reduced(
+    dy: mx.array,
+    conv_input: mx.array,
+    W: mx.array,
+    xf: mx.array,
+    tanh_cache: mx.array,
+    h0: mx.array,
+    *,
+    q_heads: int,
+    k_heads: int,
+    v_heads: int,
+) -> tuple[mx.array, mx.array, mx.array, mx.array]:
+    batch, seq, conv_dim = conv_input.shape
+    total_heads = int(h0.shape[1])
+    k_dim = int(h0.shape[2])
+    v_dim = int(h0.shape[3])
+    if conv_dim != _mapped_conv_dim(q_heads, k_heads, v_heads, k_dim, v_dim):
+        raise ValueError("conv_input width does not match mapped M2RNN head layout")
+
+    q_stop = q_heads * k_dim
+    k_stop = q_stop + k_heads * k_dim
+    q = conv_input[:, :, :q_stop].reshape(batch, seq, q_heads, k_dim)
+    k = conv_input[:, :, q_stop:k_stop].reshape(batch, seq, k_heads, k_dim)
+    v = conv_input[:, :, k_stop:].reshape(batch, seq, v_heads, v_dim)
+
+    q_full = _expand_mapped_heads_for_reference(q, axis=-2, total_heads=total_heads)
+    k_full = _expand_mapped_heads_for_reference(k, axis=-2, total_heads=total_heads)
+    v_full = _expand_mapped_heads_for_reference(v, axis=-2, total_heads=total_heads)
+    W_full = _expand_mapped_heads_for_reference(W, axis=0, total_heads=total_heads)
+    xf_full = _expand_mapped_heads_for_reference(xf, axis=-1, total_heads=total_heads)
+
+    dq_full, dk_full, dv_full, dW_full, dxf_full, dh0 = m2rnn_bwd_metal(
+        dy,
+        q_full,
+        k_full,
+        v_full,
+        W_full,
+        xf_full,
+        tanh_cache,
+        h0,
+    )
+    dq = _reduce_expanded_head_gradient(
+        dq_full,
+        axis=-2,
+        heads=q_heads,
+        total_heads=total_heads,
+    ).reshape(batch, seq, q_heads * k_dim)
+    dk = _reduce_expanded_head_gradient(
+        dk_full,
+        axis=-2,
+        heads=k_heads,
+        total_heads=total_heads,
+    ).reshape(batch, seq, k_heads * k_dim)
+    dv = _reduce_expanded_head_gradient(
+        dv_full,
+        axis=-2,
+        heads=v_heads,
+        total_heads=total_heads,
+    ).reshape(batch, seq, v_heads * v_dim)
+    dW = _reduce_expanded_head_gradient(
+        dW_full,
+        axis=0,
+        heads=int(W.shape[0]),
+        total_heads=total_heads,
+    )
+    dxf = _reduce_expanded_head_gradient(
+        dxf_full,
+        axis=-1,
+        heads=int(xf.shape[-1]),
+        total_heads=total_heads,
+    )
+    return mx.concatenate([dq, dk, dv], axis=-1), dW, dxf, dh0
 
 
 def _m2rnn_mapped_packed_reference_bwd(
@@ -4941,7 +5049,7 @@ def _mapped_packed_apply_for_layout(
                 v_heads=v_heads,
             )
         _y, _h_last, tanh_cache = full
-        grads = m2rnn_mapped_packed_bwd_path_c(
+        grads = _m2rnn_mapped_packed_bwd_path_b_reduced(
             dy,
             conv_input,
             W,
@@ -5043,19 +5151,16 @@ def _mapped_packed_post_apply_for_layout(
         del output
         conv_input, W, xf, h0, D, projected = primals
         dpost = cotangent[0]
-        full = _m2rnn_mapped_packed_post_fwd_path_c_full(
+        recurrent_full = _m2rnn_mapped_packed_fwd_path_c_full(
             conv_input,
             W,
             xf,
             h0,
-            D,
-            projected,
             q_heads=q_heads,
             k_heads=k_heads,
             v_heads=v_heads,
-            g_heads=g_heads,
         )
-        if full is None:
+        if recurrent_full is None:
             _raise_mapped_packed_post_path_c_unavailable(
                 conv_input,
                 W,
@@ -5068,16 +5173,14 @@ def _mapped_packed_post_apply_for_layout(
                 v_heads=v_heads,
                 g_heads=g_heads,
             )
-        _post, _h_last, tanh_cache = full
+        y_recurrent, _h_last, tanh_cache = recurrent_full
         dpost_for_kernel = (
             dpost if dpost.dtype == conv_input.dtype else dpost.astype(conv_input.dtype)
         )
-        post_grads = _m2rnn_inline_post_bwd_path_c_kernel(
+        post_grads = _m2rnn_post_residual_gate_bwd_path_c_kernel(
             dpost_for_kernel,
+            y_recurrent,
             conv_input,
-            xf,
-            h0,
-            tanh_cache,
             D,
             projected,
             q_heads=q_heads,
@@ -5101,7 +5204,7 @@ def _mapped_packed_post_apply_for_layout(
             )
             return _match_primal_gradient_dtypes(grads, primals)
         dy_recurrent, dconv_post, dD, dprojected = post_grads
-        dconv_recurrent, dW, dxf, dh0 = m2rnn_mapped_packed_bwd_path_c(
+        dconv_recurrent, dW, dxf, dh0 = _m2rnn_mapped_packed_bwd_path_b_reduced(
             dy_recurrent,
             conv_input,
             W,

@@ -46,6 +46,7 @@ from cppmega_mlx.nn._tilelang.mamba3 import (  # noqa: E402
     mamba3_mimo_metal_status,
 )
 from cppmega_mlx.nn._tilelang.mamba3_path_c import (  # noqa: E402
+    _mamba3_mimo_bwd_path_c_partial_kernel,
     _mamba3_mimo_bwd_path_c_simd_kernel,
     dump_lowered_bwd_msl,
     dump_lowered_fwd_msl,
@@ -350,16 +351,25 @@ def main() -> int:
     peak_pc_fb = _peak_memory_bytes()
 
     # ------------------------------------------------------------------
-    # Path C bwd profiler: measure the final-gradient SIMD/snapshot kernel.
-    # The old host-reduced partial route was removed; this bench must not
-    # resurrect it as a production or diagnostic dependency.
+    # Path C bwd profiler: measure the production generated-partial route and
+    # the old final-gradient SIMD/snapshot route as a diagnostic contrast.
     # ------------------------------------------------------------------
     dy_profile = y_pc
     mx.eval(dy_profile)
     bwd_profile: dict[str, Any] = {}
     try:
+        partial_bwd = _bench(
+            "bwd_path_c_generated_partials",
+            lambda: _mamba3_mimo_bwd_path_c_partial_kernel(dy_profile, *inputs),
+            warmup=args.warmup,
+            iters=args.iters,
+        )
+        bwd_profile["generated_partial_kernel"] = partial_bwd
+    except Exception as exc:
+        bwd_profile["generated_partial_error"] = f"{type(exc).__name__}: {exc}"
+    try:
         simd_bwd = _bench(
-            "bwd_path_c_simd_p_reduce",
+            "bwd_path_c_simd_p_reduce_diagnostic",
             lambda: _mamba3_mimo_bwd_path_c_simd_kernel(dy_profile, *inputs),
             warmup=args.warmup,
             iters=args.iters,
@@ -426,9 +436,12 @@ def main() -> int:
     if peak_pb_fb is not None and peak_pc_fb is not None:
         _row("fwd+bwd peak MB", peak_pb_fb / (1024 * 1024),
              peak_pc_fb / (1024 * 1024), fmt="{:.2f}", suffix=" MB")
+    if "generated_partial_kernel" in bwd_profile:
+        partial = bwd_profile["generated_partial_kernel"]
+        print(f"{'bwd C generated':22} {'':>14} {partial['median_ms']:>10.3f} ms {'':>11}")
     if "simd_p_reduce_kernel" in bwd_profile:
         simd = bwd_profile["simd_p_reduce_kernel"]
-        print(f"{'bwd C simd profile':22} {'':>14} {simd['median_ms']:>10.3f} ms {'':>11}")
+        print(f"{'bwd C simd diag':22} {'':>14} {simd['median_ms']:>10.3f} ms {'':>11}")
     print()
 
     # Recommendation logic from the task spec.
@@ -478,15 +491,15 @@ def main() -> int:
         "blocked_path_c_codegen_gaps": [
             "lowered Path C fwd still recomputes some lane-derived indices inside the t loop",
             "Path C bwd still performs the reverse recurrence serially over T and N per lane",
-            "unsupported bwd reduction shapes now fail closed until semantic reduction lowering covers them",
+            "final-gradient in-kernel P-axis allreduce remains diagnostic only for recurrent bwd hot loops",
         ],
         "remembered_optimizations": [
             "TileLang local.var scalar y_acc instead of thread float[1]",
             "TileLang Metal local.var PrintExpr statement-order fix",
             "Bench harness uses paired alternating samples to avoid order/warmup drift",
             "Path C bwd consumes explicit state snapshot boundaries instead of unsafe inverse-state reconstruction",
-            "Path C bwd uses TileLang thread_allreduce P-axis reductions instead of public dB/dC partial buffers",
-            "Bench harness profiles the final-gradient SIMD/snapshot bwd route directly",
+            "Path C bwd writes generated per-lane partial gradients and moves P-axis reductions outside the recurrent hot loop",
+            "Bench harness profiles generated-partial production bwd and final-gradient SIMD diagnostic bwd separately",
             "AUTO selects full Path C only when fwd, bwd, and fwd+bwd receipts are no-worse",
             "AUTO can still select Path C forward with Path B backward when only fwd is no-worse",
         ],

@@ -42,3 +42,11 @@ bench/runs/*.json
 bench/runs/*
 docs/tilelang_ports/mamba3_path_b_vs_c_b1_t2048.diff
 docs/tilelang_ports/mamba3_path_c_lowered_b1_t2048.metal
+reports/profiling/*.diff
+reports/profiling/*.metal
+reports/profiling/xctrace_*.*/*
+reports/*/*/*.json
+.gitignore
+reports/profiling/xctrace_*.xml
+reports/profiling/xctrace_*.json
+reports/profiling/*.json

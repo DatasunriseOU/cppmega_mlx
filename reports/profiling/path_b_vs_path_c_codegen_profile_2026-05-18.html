@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Path B vs Path C Codegen Profile 2026-05-18</title>
+<style>
+:root{color-scheme:light;--bg:#f6f8fb;--panel:#fff;--ink:#17202a;--muted:#667085;--line:#d7dfeb;--blue:#174a73;--green:#087443;--red:#b42318;--amber:#93640f}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;line-height:1.45}header{background:#fff;border-bottom:1px solid var(--line);padding:30px max(22px,calc((100vw - 1280px)/2)) 24px}main{max-width:1280px;margin:0 auto;padding:22px}h1{margin:0 0 8px;font-size:34px;line-height:1.08;letter-spacing:0}h2{font-size:20px;margin:0}h3{font-size:15px;margin:0 0 8px}p{margin:0;color:var(--muted)}a{color:#0b5cad;text-decoration:none}a:hover{text-decoration:underline}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}section{background:var(--panel);border:1px solid var(--line);border-radius:8px;margin:18px 0;overflow:hidden}.head{display:flex;justify-content:space-between;gap:18px;align-items:baseline;padding:16px 18px;border-bottom:1px solid var(--line)}.body{padding:18px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px}.metric{border:1px solid var(--line);border-radius:8px;background:#fbfcfe;padding:14px}.metric span{display:block;color:var(--muted);font-size:12px}.metric strong{display:block;font-size:24px;margin-top:4px}.good{color:var(--green)}.bad{color:var(--red)}.warn{color:var(--amber)}.callout{border-left:4px solid var(--blue);background:#f2f7fc;border-radius:8px;padding:13px 14px;color:#344054}.table-wrap{overflow-x:auto}table{width:100%;border-collapse:collapse;min-width:900px}th,td{border-bottom:1px solid var(--line);padding:9px 10px;text-align:right;vertical-align:top;font-size:13px;white-space:nowrap}th:first-child,td:first-child{text-align:left}thead th{background:#f0f4f9;color:#475467;font-size:12px;text-transform:uppercase}.two{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px}.panel{border:1px solid var(--line);border-radius:8px;background:#fbfcfe;padding:14px}ul{margin:0;padding-left:20px;color:#344054}li+li{margin-top:7px}@media(max-width:760px){.two{grid-template-columns:1fr}main{padding:14px}.head{display:block}.head p{margin-top:6px}table{min-width:760px}}
+</style>
+</head>
+<body>
+<header>
+<h1>Path B vs Path C Codegen Profile</h1>
+<p>Generated backward audit for Mamba3 and M2RNN after the 2026-05-18 generic codegen fixes. Full 1B optimizer matrix remains linked below.</p>
+</header>
+<main>
+<section>
+<div class="head"><h2>Verdict</h2><p>What actually broke and what changed</p></div>
+<div class="body">
+<div class="grid">
+<div class="metric"><span>Mamba3 bwd C/B</span><strong class="good">1.36x -> 1.05x</strong><p>Hot-loop allreduce removed.</p></div>
+<div class="metric"><span>M2RNN fused fwd+bwd C/B</span><strong class="good">2.08x -> 1.12x</strong><p>Recompute-bwd removed from production VJP.</p></div>
+<div class="metric"><span>M2RNN split memory</span><strong class="good">48.68 MB</strong><p>Path B is 72.12 MB on the same receipt.</p></div>
+<div class="metric"><span>Mamba3 fwd C/B</span><strong class="warn">1.32x</strong><p>Still a forward codegen/schedule gap.</p></div>
+</div>
+<p class="callout" style="margin-top:14px"><strong>Generic rule:</strong> recurrent generated bwd must not put cross-lane final-gradient reductions or feature-wise scan recomputation inside the time/state hot loop. Mamba3 now emits partial gradients and reduces outside the scan kernel; M2RNN fused VJP now reuses the generated recurrent output and ordinary generated post-bwd, while recurrent backward remains the reduced Path B kernel in production.</p>
+</div>
+</section>
+<section>
+<div class="head"><h2>What We Compare</h2><p>Scope and baselines</p></div>
+<div class="body">
+<ul>
+<li><strong>Path B</strong>: hand-written MLX Metal kernels and existing Path B VJP behavior.</li>
+<li><strong>Path C</strong>: TileLang DSL lowered through TVM and launched through tvm-ffi owner-output kernels.</li>
+<li><strong>Mamba3 shape</strong>: B=1, T=2048, H=112, P=64, N=64, dtype=bfloat16.</li>
+<li><strong>M2RNN shape</strong>: B=1, T=2048, total_heads=4, K=64, V=16, dtype=bfloat16.</li>
+<li><strong>Training matrix</strong>: full 1B bf16/fp8 optimizer matrix is in <a href="venv_fixed_8bit_matrix_2026-05-17.html">venv_fixed_8bit_matrix_2026-05-17.html</a>. These model-shape benches isolate the generated-bwd codegen problem found from that matrix.</li>
+</ul>
+</div>
+</section>
+<section>
+<div class="head"><h2>Similar Cases Checked</h2><p>Generated bwd scan</p></div>
+<div class="body">
+<ul>
+<li><strong>Sparse-MLA BF16 Path C bwd</strong>: direct tvm-ffi owner-output path uses atomic dKV accumulation; tests guard against public partial dKV tensors. No Mamba-style hot-loop <code>thread_allreduce</code> pattern found.</li>
+<li><strong>Sparse-MLA FP8 Path C bwd</strong>: direct tvm-ffi owner-output path has explicit dq/dkv owner buffers and clear kernel; tests guard that retired direct-MSL partial routes stay removed.</li>
+</ul>
+</div>
+</section>
+<section>
+<div class="head"><h2>Mamba3 Generated Bwd</h2><p>Before and after partial-gradient codegen</p></div>
+<div class="body">
+<div class="table-wrap">
+<table>
+<thead><tr><th>Stage</th><th>B fwd ms</th><th>C fwd ms</th><th>C/B fwd</th><th>B bwd ms</th><th>C bwd ms</th><th>C/B bwd</th><th>B fwd+bwd ms</th><th>C fwd+bwd ms</th><th>C/B fwd+bwd</th></tr></thead>
+<tbody>
+<tr><td>before fix</td><td>5.575</td><td>7.217</td><td>1.295</td><td>70.041</td><td>95.450</td><td class="bad">1.363</td><td>75.616</td><td>102.667</td><td class="bad">1.358</td></tr>
+<tr><td>after partial bwd</td><td>6.062</td><td>8.011</td><td>1.321</td><td>71.691</td><td>75.241</td><td class="good">1.050</td><td>77.753</td><td>83.252</td><td class="good">1.071</td></tr>
+</tbody>
+</table>
+</div>
+<p class="callout" style="margin-top:14px">The old diagnostic SIMD reduce path still profiles at 101.176 ms. The generated partial route profiles at 79.413 ms, and the matched fwd+bwd receipt derives bwd C/B=1.050. Lowered MSL body has no hot-loop <code>red_buf_staging</code>, <code>threadgroup_barrier</code>, or <code>simd_sum</code> use for the production bwd body.</p>
+</div>
+</section>
+<section>
+<div class="head"><h2>M2RNN Generated Bwd</h2><p>Fused VJP recomputation removed</p></div>
+<div class="body">
+<div class="table-wrap">
+<table>
+<thead><tr><th>Route</th><th>Stage</th><th>B fwd ms</th><th>C fwd ms</th><th>C/B fwd</th><th>B fwd+bwd ms</th><th>C fwd+bwd ms</th><th>C/B fwd+bwd</th><th>B peak MB</th><th>C peak MB</th></tr></thead>
+<tbody>
+<tr><td>fused diagnostic</td><td>before</td><td>7.929</td><td>8.170</td><td>1.030</td><td>29.810</td><td>61.865</td><td class="bad">2.075</td><td>71.86</td><td>49.41</td></tr>
+<tr><td>fused diagnostic</td><td>after</td><td>7.964</td><td>8.112</td><td>1.019</td><td>29.740</td><td>33.324</td><td class="warn">1.121</td><td>71.86</td><td>49.41</td></tr>
+<tr><td>production split</td><td>after</td><td>7.938</td><td>7.572</td><td class="good">0.954</td><td>29.746</td><td>32.335</td><td class="good">1.087</td><td>72.12</td><td>48.68</td></tr>
+</tbody>
+</table>
+</div>
+<p class="callout" style="margin-top:14px">The remaining M2RNN split/fused overhead is launch/split-route overhead plus the mixed recurrent backward boundary, not the previous generated post-bwd collapse. The recompute post-bwd lowering is kept in the MSL dump as <code>path_c_generated_recompute_post_bwd_diagnostic</code>, not as the production VJP route.</p>
+</div>
+</section>
+<section>
+<div class="head"><h2>Changed Code</h2><p>Generic fixes, not shape-specific patches</p></div>
+<div class="body">
+<ul>
+<li><code>cppmega_mlx/nn/_tilelang/mamba3_path_c.py</code>: added the generic partial-output bwd route for Mamba3 and made public Path C bwd dispatch through it.</li>
+<li><code>tests/test_tilelang_mamba3_path_c.py</code>: checks lowered kernel bodies for absence of hot-loop allreduce/barriers and covers unaligned plus aligned headdims.</li>
+<li><code>cppmega_mlx/nn/_tilelang/m2rnn_path_c.py</code>: changed mapped-packed-post VJP to use generated recurrent output plus ordinary post-bwd; recompute-bwd remains diagnostic only.</li>
+<li><code>scripts/bench_tilelang_mamba3_path_c.py</code>: profiles production partial bwd and old SIMD diagnostic bwd separately.</li>
+<li><code>scripts/bench_tilelang_m2rnn_path_c.py</code>: labels recompute post-bwd as diagnostic in report MSL metrics.</li>
+</ul>
+</div>
+</section>
+<section>
+<div class="head"><h2>Verification</h2><p>Commands run</p></div>
+<div class="body">
+<ul>
+<li><code>py_compile</code> for changed Mamba3/M2RNN modules and bench scripts.</li>
+<li><code>pytest tests/test_tilelang_mamba3_path_c.py::...</code>: targeted Mamba3 lowering and bwd parity checks, 12 passed.</li>
+<li><code>pytest tests/test_tilelang_m2rnn_path_c.py::...</code>: targeted M2RNN fused/post grad checks, 3 passed.</li>
+<li>Mamba3 model-shape benchmark before/after generated partial bwd.</li>
+<li>M2RNN split and fused model-shape benchmark after VJP codegen fix.</li>
+</ul>
+</div>
+</section>
+<section>
+<div class="head"><h2>Artifacts</h2><p>Local links</p></div>
+<div class="body">
+<ul>
+<li><a href="path_b_vs_path_c_codegen_profile_2026-05-18.json">Summary JSON</a></li>
+<li><a href="mamba3_model_shape_path_b_vs_c_before_bwd_codegen_fix_2026-05-18.json">Mamba before JSON</a></li>
+<li><a href="mamba3_model_shape_path_b_vs_c_after_bwd_partial_codegen_profiled_2026-05-18.json">Mamba after JSON</a></li>
+<li><a href="mamba3_model_shape_path_c_lowered_after_bwd_partial_codegen_profiled_2026-05-18.metal">Mamba after lowered MSL</a></li>
+<li><a href="m2rnn_model_shape_path_b_vs_c_fused_codegen_audit_2026-05-18.json">M2RNN fused before JSON</a></li>
+<li><a href="m2rnn_model_shape_path_b_vs_c_fused_after_vjp_codegen_fix_2026-05-18.json">M2RNN fused after JSON</a></li>
+<li><a href="m2rnn_model_shape_path_b_vs_c_split_after_vjp_codegen_fix_2026-05-18.json">M2RNN split after JSON</a></li>
+<li><a href="venv_fixed_8bit_matrix_2026-05-17.html">Full 1B optimizer matrix HTML</a></li>
+</ul>
+</div>
+</section>
+</main>
+</body>
+</html>

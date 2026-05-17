@@ -1,0 +1,846 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Kernel Research Findings — DeepSeek V4 & GatedDeltaNet</title>
+<style>
+:root {
+  --bg: #0e0f12;
+  --bg-card: #15171c;
+  --bg-card-hover: #1a1d24;
+  --border: #2a2e38;
+  --border-hover: #3e4350;
+  --text: #e8eaed;
+  --text-muted: #8b9099;
+  --text-dim: #5a6068;
+  --accent: #7aa2f7;
+  --accent-warm: #f7768e;
+  --accent-green: #9ece6a;
+  --accent-yellow: #e0af68;
+  --accent-purple: #bb9af7;
+  --accent-cyan: #7dcfff;
+  --code-bg: #1d2128;
+  --gradient-1: linear-gradient(135deg, #7aa2f7 0%, #bb9af7 100%);
+  --gradient-2: linear-gradient(135deg, #9ece6a 0%, #7dcfff 100%);
+  --gradient-3: linear-gradient(135deg, #f7768e 0%, #e0af68 100%);
+  --gradient-4: linear-gradient(135deg, #bb9af7 0%, #7dcfff 100%);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.6;
+  font-size: 15px;
+  padding: 0;
+  max-width: 100%;
+  overflow-x: hidden;
+}
+.container { max-width: 1400px; margin: 0 auto; padding: 40px 32px; }
+header {
+  background: linear-gradient(180deg, #1a1d24 0%, var(--bg) 100%);
+  border-bottom: 1px solid var(--border);
+  padding: 60px 32px 40px;
+}
+header .container { padding: 0 32px; }
+h1 {
+  font-size: 42px;
+  font-weight: 700;
+  background: var(--gradient-1);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  letter-spacing: -0.02em;
+  margin-bottom: 8px;
+}
+.subtitle {
+  color: var(--text-muted);
+  font-size: 17px;
+  margin-bottom: 24px;
+}
+.meta-strip {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-top: 16px;
+}
+.meta-chip {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  padding: 6px 14px;
+  border-radius: 20px;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+.meta-chip strong { color: var(--text); margin-right: 4px; }
+
+h2 {
+  font-size: 28px;
+  font-weight: 600;
+  margin: 56px 0 20px;
+  padding-bottom: 12px;
+  border-bottom: 2px solid var(--border);
+  letter-spacing: -0.01em;
+}
+h3 {
+  font-size: 20px;
+  font-weight: 600;
+  margin: 32px 0 16px;
+  color: var(--accent);
+}
+h4 {
+  font-size: 16px;
+  font-weight: 600;
+  margin: 20px 0 8px;
+  color: var(--accent-cyan);
+}
+
+p { margin: 12px 0; }
+a { color: var(--accent-cyan); text-decoration: none; border-bottom: 1px dotted var(--accent-cyan); transition: all 0.15s; }
+a:hover { color: var(--text); border-bottom-style: solid; }
+code {
+  background: var(--code-bg);
+  padding: 2px 7px;
+  border-radius: 4px;
+  font-family: 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 13px;
+  color: var(--accent-purple);
+  border: 1px solid var(--border);
+}
+pre {
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px 20px;
+  overflow-x: auto;
+  font-family: 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 13px;
+  color: var(--text);
+  margin: 16px 0;
+  line-height: 1.5;
+}
+pre code { background: transparent; padding: 0; border: none; color: inherit; }
+
+/* Cards grid */
+.grid {
+  display: grid;
+  gap: 16px;
+  margin: 24px 0;
+}
+.grid-2 { grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+.grid-3 { grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+.grid-4 { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+
+.card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 20px 22px;
+  transition: all 0.2s;
+}
+.card:hover {
+  background: var(--bg-card-hover);
+  border-color: var(--border-hover);
+  transform: translateY(-2px);
+}
+.card h4 {
+  margin-top: 0;
+  font-size: 17px;
+  color: var(--text);
+  margin-bottom: 4px;
+}
+.card .meta {
+  display: flex;
+  gap: 8px;
+  margin: 8px 0 12px;
+  flex-wrap: wrap;
+}
+.tag {
+  display: inline-block;
+  padding: 2px 9px;
+  border-radius: 12px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.tag-mit { background: #1d3a2a; color: #9ece6a; border: 1px solid #2d5a42; }
+.tag-apache { background: #2a3a4d; color: #7aa2f7; border: 1px solid #3a5070; }
+.tag-bsd { background: #2d2a4d; color: #bb9af7; border: 1px solid #4a3a78; }
+.tag-nc { background: #4d2a2a; color: #f7768e; border: 1px solid #783a3a; }
+.tag-tilelang { background: #4d3d1d; color: #e0af68; border: 1px solid #785a2d; }
+.tag-mlx { background: #1d3d4d; color: #7dcfff; border: 1px solid #2d5a78; }
+.tag-cuda { background: #2d4a2a; color: #9ece6a; border: 1px solid #4a783a; }
+.tag-triton { background: #4d2a4d; color: #f7afdc; border: 1px solid #783a78; }
+.tag-pytorch { background: #4d3a2a; color: #e0af68; border: 1px solid #785a3a; }
+.tag-metal { background: #2a4d4a; color: #7dcfff; border: 1px solid #3a787a; }
+.tag-hip { background: #4d2a3a; color: #f7768e; border: 1px solid #783a5a; }
+.tag-difficulty-trivial { background: #1d3a2a; color: #9ece6a; }
+.tag-difficulty-low { background: #2a4a2a; color: #b3d68e; }
+.tag-difficulty-moderate { background: #4d3d1d; color: #e0af68; }
+.tag-difficulty-hard { background: #4d2a2a; color: #f7768e; }
+
+.card .desc { color: var(--text-muted); font-size: 13px; }
+.card .url { display: block; margin-top: 10px; font-size: 12px; font-family: 'SF Mono', monospace; color: var(--accent-cyan); word-break: break-all; }
+.card .local { color: var(--accent-green); font-family: 'SF Mono', monospace; font-size: 11px; margin-top: 8px; display: block; }
+
+/* Hero stat cards */
+.stat-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 24px;
+  text-align: center;
+}
+.stat-card .value {
+  font-size: 36px;
+  font-weight: 700;
+  background: var(--gradient-2);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  letter-spacing: -0.02em;
+}
+.stat-card .label {
+  color: var(--text-muted);
+  font-size: 13px;
+  margin-top: 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+/* Tables */
+.table-wrap { overflow-x: auto; margin: 20px 0; border-radius: 8px; border: 1px solid var(--border); }
+table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--bg-card);
+  font-size: 13.5px;
+}
+th {
+  background: #1d2128;
+  text-align: left;
+  padding: 12px 16px;
+  font-weight: 600;
+  color: var(--text);
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+  position: sticky;
+  top: 0;
+}
+td {
+  padding: 11px 16px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-muted);
+}
+td strong { color: var(--text); }
+tr:hover td { background: rgba(122, 162, 247, 0.05); }
+tr:last-child td { border-bottom: none; }
+
+/* Callouts */
+.callout {
+  background: linear-gradient(135deg, rgba(122, 162, 247, 0.08) 0%, rgba(187, 154, 247, 0.04) 100%);
+  border-left: 3px solid var(--accent);
+  border-radius: 6px;
+  padding: 16px 20px;
+  margin: 20px 0;
+  color: var(--text-muted);
+}
+.callout strong { color: var(--accent); }
+.callout-warning {
+  background: linear-gradient(135deg, rgba(247, 118, 142, 0.08) 0%, rgba(224, 175, 104, 0.04) 100%);
+  border-left-color: var(--accent-warm);
+}
+.callout-warning strong { color: var(--accent-warm); }
+.callout-success {
+  background: linear-gradient(135deg, rgba(158, 206, 106, 0.08) 0%, rgba(125, 207, 255, 0.04) 100%);
+  border-left-color: var(--accent-green);
+}
+.callout-success strong { color: var(--accent-green); }
+
+/* TOC */
+.toc {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 20px 24px;
+  margin: 32px 0;
+}
+.toc h3 { color: var(--text); margin: 0 0 12px; font-size: 14px; text-transform: uppercase; letter-spacing: 0.08em; }
+.toc ol { padding-left: 20px; }
+.toc li { margin: 6px 0; }
+.toc a { border-bottom: none; }
+
+/* Banner / hero */
+.hero-callout {
+  background: linear-gradient(135deg, rgba(122, 162, 247, 0.12) 0%, rgba(187, 154, 247, 0.08) 100%);
+  border: 1px solid rgba(122, 162, 247, 0.3);
+  border-radius: 12px;
+  padding: 24px 28px;
+  margin: 24px 0;
+}
+.hero-callout h3 {
+  margin: 0 0 12px;
+  color: var(--text);
+  font-size: 18px;
+}
+.hero-callout p { margin: 6px 0; color: var(--text-muted); }
+
+ul, ol { padding-left: 24px; }
+li { margin: 4px 0; color: var(--text-muted); }
+li::marker { color: var(--accent); }
+
+.footer {
+  margin-top: 80px;
+  padding-top: 32px;
+  border-top: 1px solid var(--border);
+  color: var(--text-dim);
+  font-size: 12px;
+  text-align: center;
+}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="container">
+    <h1>Kernel Research Findings</h1>
+    <p class="subtitle">DeepSeek V4 &amp; GatedDeltaNet landscape — what exists, where, and how to port it</p>
+    <div class="meta-strip">
+      <span class="meta-chip"><strong>Compiled:</strong>May 2026</span>
+      <span class="meta-chip"><strong>Agents:</strong>12 parallel (Perplexity, Gemini 3.1 Pro, Brave, Tavily, Exa, HuggingFace)</span>
+      <span class="meta-chip"><strong>Repos cloned:</strong>10 + 1 symlink + 1 prior</span>
+      <span class="meta-chip"><strong>Location:</strong>/Volumes/external/sources/rent_kernels/</span>
+    </div>
+  </div>
+</header>
+
+<div class="container">
+
+<div class="grid grid-4">
+  <div class="stat-card">
+    <div class="value">10</div>
+    <div class="label">Repos cloned</div>
+  </div>
+  <div class="stat-card">
+    <div class="value">5,341</div>
+    <div class="label">Total commits indexed</div>
+  </div>
+  <div class="stat-card">
+    <div class="value">11</div>
+    <div class="label">ROI items planned</div>
+  </div>
+  <div class="stat-card">
+    <div class="value">4</div>
+    <div class="label">DeepSeek V4 model variants</div>
+  </div>
+</div>
+
+<div class="hero-callout">
+  <h3>🎯 The headline finding</h3>
+  <p><strong>DeepSeek V4 exists</strong> (4 HF repos, 22 April 2026, 3.1M downloads on V4-Pro) and ships with <strong>TileKernels</strong> — a pure-TileLang kernel layer covering MoE, Engram, mHC (Manifold HyperConnection), and Quant. Two of our existing blocks (<code>MHC</code> and <code>N</code>/Engram) have direct DeepSeek equivalents in TileKernels.</p>
+  <p>For <strong>GatedDeltaNet</strong>, <code>mlx-lm PR #1217</code> already provides a Metal fwd+bwd kernel with LoRA-converged training. Cherry-pick that and wrap as our <code>L</code> block.</p>
+</div>
+
+<div class="toc">
+  <h3>Contents</h3>
+  <ol>
+    <li><a href="#deepseek-v4">DeepSeek V4 — confirmed and characterized</a></li>
+    <li><a href="#tilekernels">TileKernels — the V4 kernel layer</a></li>
+    <li><a href="#gdn">GatedDeltaNet — implementation landscape</a></li>
+    <li><a href="#repos">Repository inventory (cloned in rent_kernels)</a></li>
+    <li><a href="#gotchas">Key documents and gotchas</a></li>
+    <li><a href="#strategy">Apple Silicon vs CUDA strategy</a></li>
+    <li><a href="#top5">Top-5 highest-value artifacts</a></li>
+    <li><a href="#plans">Linked integration plans</a></li>
+  </ol>
+</div>
+
+<h2 id="deepseek-v4">1. DeepSeek V4 — confirmed and characterized</h2>
+
+<h3>1.1 Models on HuggingFace (verified)</h3>
+
+<div class="grid grid-2">
+  <div class="card">
+    <h4>DeepSeek-V4-Pro</h4>
+    <div class="meta">
+      <span class="tag tag-mit">MIT</span>
+      <span class="tag tag-pytorch">PyTorch + FP8</span>
+    </div>
+    <p class="desc">1.6T params, 49B active. 1M ctx. 3.1M downloads, 4007 likes. Arch tag <code>deepseek_v4</code>. Released April 22, 2026.</p>
+    <a class="url" href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro">hf.co/deepseek-ai/DeepSeek-V4-Pro</a>
+  </div>
+  <div class="card">
+    <h4>DeepSeek-V4-Pro-Base</h4>
+    <div class="meta">
+      <span class="tag tag-mit">MIT</span>
+      <span class="tag tag-pytorch">PyTorch + FP8</span>
+    </div>
+    <p class="desc">Base model variant of V4-Pro, no instruction tuning. Same arch.</p>
+    <a class="url" href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro-Base">hf.co/deepseek-ai/DeepSeek-V4-Pro-Base</a>
+  </div>
+  <div class="card">
+    <h4>DeepSeek-V4-Flash</h4>
+    <div class="meta">
+      <span class="tag tag-mit">MIT</span>
+      <span class="tag tag-pytorch">PyTorch + FP8</span>
+    </div>
+    <p class="desc">284B params, 13B active. 1M ctx. Realistic Apple-Silicon target.</p>
+    <a class="url" href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash">hf.co/deepseek-ai/DeepSeek-V4-Flash</a>
+  </div>
+  <div class="card">
+    <h4>DeepSeek-V4-Flash-Base</h4>
+    <div class="meta">
+      <span class="tag tag-mit">MIT</span>
+      <span class="tag tag-pytorch">PyTorch + FP8</span>
+    </div>
+    <p class="desc">Base variant of V4-Flash, no instruction tuning.</p>
+    <a class="url" href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Base">hf.co/deepseek-ai/DeepSeek-V4-Flash-Base</a>
+  </div>
+</div>
+
+<h3>1.2 V4 vs V3.2 architectural delta</h3>
+
+<div class="table-wrap">
+<table>
+  <thead>
+    <tr><th>Aspect</th><th>V3.2</th><th>V4</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><strong>Attention</strong></td><td>DSA (sparse-MLA + FP8 indexer)</td><td><strong>CSA + HCA + MLA</strong> hybrid</td></tr>
+    <tr><td><strong>KV cache @ 1M</strong></td><td>baseline</td><td><strong>10%</strong> of V3.2</td></tr>
+    <tr><td><strong>FLOPs/token @ 1M</strong></td><td>baseline</td><td><strong>27%</strong> of V3.2</td></tr>
+    <tr><td><strong>Residual</strong></td><td>x + F(x)</td><td><strong>mHC</strong> (4-way streams, Sinkhorn-projected)</td></tr>
+    <tr><td><strong>Routing score</strong></td><td>sigmoid</td><td><strong>sqrt(softplus(x))</strong></td></tr>
+    <tr><td><strong>First-layer FFNs</strong></td><td>dense</td><td><strong>Hash-routing MoE</strong> (3 layers)</td></tr>
+    <tr><td><strong>Optimizer</strong></td><td>AdamW</td><td><strong>Muon</strong> (Newton-Schulz) hybrid</td></tr>
+    <tr><td><strong>Memory module</strong></td><td>—</td><td><strong>Engram</strong> (HBM↔DRAM static knowledge)</td></tr>
+    <tr><td><strong>Long-ctx attention</strong></td><td>DSA only</td><td><strong>+NSA</strong> (Native Sparse Attention)</td></tr>
+    <tr><td><strong>Experts</strong></td><td>256</td><td><strong>384 routed + 1 shared, top-6</strong></td></tr>
+    <tr><td><strong>Post-training</strong></td><td>R1-style RL</td><td><strong>On-Policy Distillation</strong></td></tr>
+  </tbody>
+</table>
+</div>
+
+<h3>1.3 V4-Pro concrete config</h3>
+
+<pre><code>384 routed experts, top-6, 1 shared
+topk_method=noaux_tc, scoring_func=sqrtsoftplus
+q_lora_rank=1536, qk_rope_head_dim=64
+num_hash_layers=3, hc_sinkhorn_iters=20
+FP8 e4m3, block scale [128, 128], activation_scheme=dynamic</code></pre>
+
+<h2 id="tilekernels">2. TileKernels — the V4 kernel layer</h2>
+
+<div class="callout callout-success">
+  <strong>📦 Clone location:</strong> <code>~/sources/TileKernels/</code> (cloned earlier, separate from rent_kernels)
+</div>
+
+<div class="grid grid-2">
+  <div class="card">
+    <h4>deepseek-ai/TileKernels</h4>
+    <div class="meta">
+      <span class="tag tag-mit">MIT</span>
+      <span class="tag tag-tilelang">TileLang</span>
+      <span class="tag tag-cuda">SM90 + SM100</span>
+    </div>
+    <p class="desc">Released April 22, 2026 (same day as V4). 1,135 stars. TileLang ≥0.1.9, PyTorch ≥2.10, CUDA 13.1+. Authored by Wang/Xu/Cao/Tian/Zhao/Yu/Zhao — overlap with mHC paper authors confirms direct DeepSeek↔TileLang collaboration.</p>
+    <a class="url" href="https://github.com/deepseek-ai/TileKernels">github.com/deepseek-ai/TileKernels</a>
+    <span class="local">→ ~/sources/TileKernels/</span>
+  </div>
+</div>
+
+<h3>2.1 Module layout</h3>
+
+<div class="grid grid-3">
+  <div class="card">
+    <h4>moe/ (12 files)</h4>
+    <p class="desc">Top-k gating, fused expand/reduce, normalize, aux-loss-free routing. Key files: <code>aux_fi_kernel.py</code>, <code>topk_gate_kernel.py</code>, <code>top2_sum_gate_kernel.py</code>, <code>expand_to_fused_kernel.py</code>, <code>reduce_fused_kernel.py</code>, <code>mask_indices_by_tp_kernel.py</code>, <code>normalize_weight_kernel.py</code>, <code>scoring.py</code>.</p>
+  </div>
+  <div class="card">
+    <h4>quant/ (FP8/FP4/E5M6)</h4>
+    <p class="desc">Per-token / per-block / per-channel quantization. Fused SwiGLU + quantize patterns.</p>
+  </div>
+  <div class="card">
+    <h4>engram/ (4 files)</h4>
+    <p class="desc"><code>engram_fused_weight_kernel.py</code>, <code>engram_gate_kernel.py</code>, <code>engram_grad_w_reduce_kernel.py</code>, <code>engram_hash_kernel.py</code>. Fused RMSNorm + gate + grad-reduce + hash routing.</p>
+  </div>
+  <div class="card">
+    <h4>mhc/ (9 files)</h4>
+    <p class="desc"><code>sinkhorn_kernel.py</code> + 8 supporting kernels (<code>expand</code>, <code>head_compute_mix</code>, <code>multilayer_recompute</code>, <code>norm_fn</code>, <code>post</code>, <code>pre_apply_mix</code>, <code>pre_big_fuse</code>, <code>pre_split_mixes</code>). Manifold HyperConnection with Sinkhorn-Knopp Birkhoff projection.</p>
+  </div>
+  <div class="card">
+    <h4>torch/ (golden)</h4>
+    <p class="desc">Pure-PyTorch reference impls. <strong>This is what we port to MLX first</strong> for correctness baselines.</p>
+  </div>
+  <div class="card">
+    <h4>modeling/</h4>
+    <p class="desc"><code>torch.autograd.Function</code> wrappers: <code>engram_gate</code>, <code>mhc_pipeline</code>. The Python-side glue.</p>
+  </div>
+</div>
+
+<h3>2.2 mHC forward math</h3>
+
+<pre><code>X_{l+1} = B_l · X_l + C_l · F_l(A_l · X_l)
+
+  where  X_l shape = (B, S, n=4, D)        — 4 parallel residual streams
+         B_l        — Birkhoff polytope, Sinkhorn-Knopp normalized (20 iters)
+         A_l, C_l   — learnable mix-split / mix-apply matrices
+         F_l        — block's residual function (attention or FFN)</code></pre>
+
+<div class="callout callout-warning">
+  <strong>⚠ Sinkhorn backward gotcha:</strong> The naive backward assumes <code>r=c=1</code> which only holds at full convergence. Use the corrected version from <a href="https://github.com/deepseek-ai/TileKernels/issues/2">TileKernels Issue #2</a> — it solves <code>(diag(c) − Rᵀ·diag(r)⁻¹·R)·β = s_c − Rᵀ·diag(r)⁻¹·s_r</code> via two matvecs, <strong>never materializing</strong> <code>RᵀR</code>.
+</div>
+
+<h2 id="gdn">3. GatedDeltaNet — implementation landscape</h2>
+
+<h3>3.1 The recurrence</h3>
+
+<pre><code>S_t = α_t · (I − β_t · k_t · k_tᵀ) · S_{t-1} + β_t · k_t · v_tᵀ
+y_t = S_tᵀ · q_t</code></pre>
+
+<p>Chunkwise parallel form: 4 phases per chunk — intra-chunk Householder prefix products, inter-chunk state recurrence, intra-chunk output, mirrored backward with <code>solve_tril</code>.</p>
+
+<h3>3.1.5 Two separate blocks: "L" (GDN) and "K" (KDA)</h3>
+
+<div class="hero-callout">
+  <h3>🧩 Why two blocks, not one parametrized?</h3>
+  <p><strong>GDN</strong> (classical Householder recurrence) and <strong>KDA</strong> (DPLR super-set with gated-LA branch) differ in state shape, recurrence inner loop, and test surface. Two distinct blocks in the pattern is cleaner — symbol <code>L</code> for GDN, symbol <code>K</code> for KDA.</p>
+</div>
+
+<div class="grid grid-2">
+  <div class="card">
+    <h4>🔹 Symbol "L" — GatedDeltaNet (5 paths)</h4>
+    <div class="meta">
+      <span class="tag tag-mlx">MLX + Metal</span>
+      <span class="tag tag-mit">MIT</span>
+      <span class="tag tag-difficulty-moderate">~5-6 days (all paths)</span>
+    </div>
+    <p class="desc">Recurrence: <code>S = α(I − β·k·kᵀ)·S + β·k·vᵀ</code>. Land all 5 paths, then auto-mode picks winner per shape.</p>
+    <ul>
+      <li><strong>Path A</strong> pure-MLX from FLA math (golden, ~1d)</li>
+      <li><strong>Path B</strong> hand-written MSL via <code>mx.fast.metal_kernel</code> (~1d)</li>
+      <li><strong>Path C</strong> TileLang DSL via <code>tilelang.compile(target="metal")</code> from <code>examples/gdn/</code> (~1.5d)</li>
+      <li><strong>Path D</strong> Triton frontend lift of FLA Triton kernel (~0.5d)</li>
+      <li><strong>Path E</strong> vendor mlx-lm PR #1217 (~1d)</li>
+      <li><strong>HF parity:</strong> <code>m-a-p/1.3B-100B-GatedDeltaNet-pure</code></li>
+    </ul>
+  </div>
+  <div class="card">
+    <h4>🔸 Symbol "K" — Kimi Delta Attention (4 paths)</h4>
+    <div class="meta">
+      <span class="tag tag-tilelang">TileLang + Metal</span>
+      <span class="tag tag-difficulty-moderate">~4-5 days (all paths)</span>
+    </div>
+    <p class="desc">DPLR: <code>A = αI + β·u·vᵀ</code>. Strict super-set of GDN with gated-LA branch. +2-3% perplexity vs GDN. Already in vLLM.</p>
+    <ul>
+      <li><strong>Path A</strong> pure-MLX from FLA_KDA (~1d)</li>
+      <li><strong>Path B</strong> hand-MSL (~1d)</li>
+      <li><strong>Path C</strong> TileLang DSL from <code>examples/kda/</code> (11 prims, ~1.5d)</li>
+      <li><strong>Path D</strong> Triton frontend (~0.5d)</li>
+      <li><strong>No Path E</strong> — no mlx-lm KDA op exists yet</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h4>📊 Head-to-head benchmark + auto-mode receipt</h4>
+    <div class="meta">
+      <span class="tag tag-tilelang">All paths × all shapes</span>
+      <span class="tag tag-difficulty-low">~1-2 days</span>
+    </div>
+    <p class="desc">Mirror <code>mamba3_path_c_receipt_auto_mode</code> machinery: per-(block, dtype, shape) JSON receipt drives <code>auto_mode_for_inputs</code> dispatch. HTML grid like <code>cppmega_1b_path_matrix.html</code>.</p>
+    <ul>
+      <li>Bench script <code>scripts/bench_linear_attention_path_matrix.py</code></li>
+      <li>Receipt JSON under <code>reports/raw/cppmega_1b_path_matrix_cells/linear_attention_path_*.json</code></li>
+      <li>Color-coded HTML grid of fastest-per-cell</li>
+      <li>Env override: <code>CPPMEGA_KERNEL_PATH__LINEAR_ATTENTION=path_{a,b,c,d,e,auto}</code></li>
+    </ul>
+  </div>
+</div>
+
+<h3>3.1.6 metal_gdn.py — scaffolding, not end-to-end</h3>
+
+<div class="callout callout-warning">
+  <strong>⚠ Maturity check:</strong> <code>tilelang/tilelang/tileop/metal_gdn.py</code> provides 5 low-level Metal Simdgroup macros (<code>kkt_score_tile</code>, <code>kkt_score_tile_accum</code>, <code>apply_kkt_gate_triangular_tile</code>, <code>wu_score_tiles</code>/<code>_strided</code>, <code>wu_linear_element</code>) — these are <strong>building blocks</strong>, tested via <code>testing/python/metal/test_metal_internal_scaffolding.py</code>. <strong>Not a complete Metal GDN kernel.</strong> Listed in <code>RFC_upstream_tvm_migration.md</code> — being migrated to upstream TVM. For prod path use <code>mlx-lm PR #1217</code>; these blocks become useful only if we later write a custom Metal GDN kernel.
+</div>
+
+<h3>3.2 Implementations ranked by port value</h3>
+
+<div class="grid grid-2">
+  <div class="card">
+    <h4>🥇 mlx-lm PR #1217</h4>
+    <div class="meta">
+      <span class="tag tag-mlx">MLX + Metal</span>
+      <span class="tag tag-mit">MIT</span>
+      <span class="tag tag-difficulty-trivial">Trivial port</span>
+    </div>
+    <p class="desc"><strong>Metal VJP for gated_delta_update</strong>, fused fwd+bwd. 8-11× faster than Python VJP. End-to-end LoRA convergence proven. Cherry-pick this and wrap as our "L" block — this is the primary path.</p>
+    <a class="url" href="https://github.com/ml-explore/mlx-lm/pull/1217">github.com/ml-explore/mlx-lm/pull/1217</a>
+  </div>
+  <div class="card">
+    <h4>🥈 mlx-swift-lm PR #257</h4>
+    <div class="meta">
+      <span class="tag tag-metal">MLX-Swift + Metal</span>
+      <span class="tag tag-mit">MIT</span>
+      <span class="tag tag-difficulty-trivial">Trivial</span>
+    </div>
+    <p class="desc">Single-threadgroup time-loop kernel, 25-60× speedup vs ops fallback. Production Qwen3.5/Qwen3-Next decode + prefill on M4 Max. Algorithm reference even if we don't use Swift.</p>
+    <a class="url" href="https://github.com/ml-explore/mlx-swift-lm/pull/257">github.com/ml-explore/mlx-swift-lm/pull/257</a>
+  </div>
+  <div class="card">
+    <h4>🥉 D-CSIL/mlx-recurrence</h4>
+    <div class="meta">
+      <span class="tag tag-mlx">MLX + Metal</span>
+      <span class="tag tag-mit">MIT</span>
+      <span class="tag tag-difficulty-trivial">Trivial template</span>
+    </div>
+    <p class="desc">Fused fwd + custom VJP for SSM and GLA on MLX/Metal. 19-31× fwd+bwd on M3 Max. GDN = GLA + delta term — kernel skeleton extends directly.</p>
+    <a class="url" href="https://github.com/D-CSIL/mlx-recurrence">github.com/D-CSIL/mlx-recurrence</a>
+    <span class="local">→ ~/sources/rent_kernels/mlx-recurrence/ (8 commits)</span>
+  </div>
+  <div class="card">
+    <h4>QwenLM/FlashQLA</h4>
+    <div class="meta">
+      <span class="tag tag-tilelang">TileLang</span>
+      <span class="tag tag-difficulty-moderate">Moderate</span>
+    </div>
+    <p class="desc">TileLang state-of-the-art GDN. 2-3× fwd / 2× bwd vs FLA Triton on H100/H20. Slots into our TileLang dispatch directly. <strong>If we want max perf in TileLang path.</strong></p>
+    <a class="url" href="https://github.com/QwenLM/FlashQLA">github.com/QwenLM/FlashQLA</a>
+    <span class="local">→ ~/sources/rent_kernels/FlashQLA/ (19 commits)</span>
+  </div>
+  <div class="card">
+    <h4>tile-ai/tilelang PR #695</h4>
+    <div class="meta">
+      <span class="tag tag-tilelang">TileLang</span>
+      <span class="tag tag-mit">MIT</span>
+      <span class="tag tag-difficulty-moderate">Moderate</span>
+    </div>
+    <p class="desc">Full TileLang GDN op set: <code>chunk_delta_h</code>, <code>chunk_delta_bwd</code>, <code>chunk_o</code> fwd/bwd, <code>chunk_scaled_dot_kkt</code>, <code>recompute_w_u_fwd/bwd</code>, <code>chunk_local_cumsum_scalar</code>. Merged Aug 2025. <strong>Already in our tilelang fork.</strong></p>
+    <a class="url" href="https://github.com/tile-ai/tilelang/pull/695">github.com/tile-ai/tilelang/pull/695</a>
+    <span class="local">→ ../tilelang/ (your fork, symlinked)</span>
+  </div>
+  <div class="card">
+    <h4>fla-org/flash-linear-attention</h4>
+    <div class="meta">
+      <span class="tag tag-triton">Triton + PyTorch</span>
+      <span class="tag tag-mit">MIT</span>
+      <span class="tag tag-difficulty-moderate">Moderate</span>
+    </div>
+    <p class="desc">Canonical reference. <code>fla/ops/gated_delta_rule/chunk.py</code> is the impl every HF GDN checkpoint uses. <strong>Our numerical parity oracle.</strong></p>
+    <a class="url" href="https://github.com/fla-org/flash-linear-attention">github.com/fla-org/flash-linear-attention</a>
+    <span class="local">→ ~/sources/rent_kernels/flash-linear-attention/ (1,927 commits)</span>
+  </div>
+  <div class="card">
+    <h4>Megatron-Core torch reference</h4>
+    <div class="meta">
+      <span class="tag tag-pytorch">Pure PyTorch</span>
+      <span class="tag tag-apache">Apache</span>
+      <span class="tag tag-difficulty-moderate">Math oracle</span>
+    </div>
+    <p class="desc"><code>core.ssm.gated_delta_net.torch_chunk_gated_delta_rule</code> — no Triton, just <code>torch.matmul</code>. <strong>Best paper-to-code bridge</strong>, maps 1:1 to MLX array ops.</p>
+  </div>
+  <div class="card">
+    <h4>Kaden-Schutt/hipfire</h4>
+    <div class="meta">
+      <span class="tag tag-hip">HIP + Rust</span>
+      <span class="tag tag-difficulty-hard">Hard (HIP→Metal)</span>
+    </div>
+    <p class="desc"><strong>DELTANET.md is the algorithm Rosetta stone</strong>: full math derivation, gotcha <code>S@k</code> vs <code>Sᵀ@k</code>, alpha-gate fusion, state quantization, per-variant grid/block/LDS table. Essential reading.</p>
+    <a class="url" href="https://github.com/Kaden-Schutt/hipfire">github.com/Kaden-Schutt/hipfire</a>
+    <span class="local">→ ~/sources/rent_kernels/hipfire/ (1,121 commits)</span>
+  </div>
+  <div class="card">
+    <h4>alxndrTL/mamba.py</h4>
+    <div class="meta">
+      <span class="tag tag-mlx">MLX</span>
+      <span class="tag tag-difficulty-trivial">Template</span>
+    </div>
+    <p class="desc">MLX folder has <code>mlx/pscan_mlx.py</code> Blelloch parallel scan. The best MLX template for linear-time matrix-state recurrences — directly transferable to GDN's chunk-level scan.</p>
+    <a class="url" href="https://github.com/alxndrTL/mamba.py">github.com/alxndrTL/mamba.py</a>
+    <span class="local">→ ~/sources/rent_kernels/mamba.py/ (222 commits)</span>
+  </div>
+  <div class="card">
+    <h4>flashinfer Blackwell</h4>
+    <div class="meta">
+      <span class="tag tag-cuda">CUDA + PTX</span>
+      <span class="tag tag-bsd">BSD-3</span>
+      <span class="tag tag-difficulty-hard">Hard (Blackwell-specific)</span>
+    </div>
+    <p class="desc">7-GEMM persistent kernel with TMEM, TMA, 12-warp. Header docstring is a precise algorithm spec — useful as porting reference even if kernel isn't.</p>
+  </div>
+  <div class="card">
+    <h4>vLLM PRs #38787, #39563, #40711</h4>
+    <div class="meta">
+      <span class="tag tag-triton">Triton + CUDA</span>
+      <span class="tag tag-apache">Apache</span>
+      <span class="tag tag-difficulty-low">Low (decode reference)</span>
+    </div>
+    <p class="desc">Decode-side GDN fusion (~100 LoC CUDA in #39563), preprocessing fusion (#38787), ROCm AITER fusion (#40711). Cleanest minimal decode kernels.</p>
+  </div>
+  <div class="card">
+    <h4>SGLang PRs #18271, #20074</h4>
+    <div class="meta">
+      <span class="tag tag-triton">Triton</span>
+      <span class="tag tag-apache">Apache</span>
+      <span class="tag tag-difficulty-low">Low</span>
+    </div>
+    <p class="desc">Production <code>fused_sigmoid_gating_delta_rule_update_kernel</code> with tuning numbers (TPOT 35.79→34.64 ms on 4×B200). Pairs g + beta in single launch.</p>
+  </div>
+  <div class="card">
+    <h4>ExecuTorch PR #18878</h4>
+    <div class="meta">
+      <span class="tag tag-metal">Metal shader</span>
+      <span class="tag tag-bsd">BSD-3</span>
+      <span class="tag tag-difficulty-trivial">Trivial (Metal)</span>
+    </div>
+    <p class="desc">Full-sequence single dispatch, grid [32, Dv, B·Hv], in-place state mutation. Metal shader explicitly <strong>derived from MLX delegate</strong> — two-way reference.</p>
+  </div>
+  <div class="card">
+    <h4>NVlabs/GatedDeltaNet ❌</h4>
+    <div class="meta">
+      <span class="tag tag-nc">NVIDIA Non-Commercial</span>
+    </div>
+    <p class="desc">License-restricted. Algorithm reference only — <strong>do not copy code</strong>. The layer just calls FLA anyway.</p>
+  </div>
+</div>
+
+<h3>3.3 HuggingFace checkpoints for validation</h3>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Repo</th><th>Params</th><th>Downloads</th><th>License</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td><a href="https://hf.co/m-a-p/1.3B-100B-GatedDeltaNet-pure">m-a-p/1.3B-100B-GatedDeltaNet-pure</a></td><td>1.3B</td><td>1.6K</td><td>unspec.</td><td>Largest pure-GDN</td></tr>
+    <tr><td><a href="https://hf.co/linear-moe-hub/Gated-Deltanet-1.3B">linear-moe-hub/Gated-Deltanet-1.3B</a></td><td>1.3B</td><td>924</td><td>apache-2.0</td><td>Uses FLA</td></tr>
+    <tr><td><a href="https://hf.co/linear-moe-hub/Gated-Deltanet-340M">linear-moe-hub/Gated-Deltanet-340M</a></td><td>340M</td><td>633</td><td>apache-2.0</td><td>Smaller validation target</td></tr>
+    <tr><td><a href="https://hf.co/Idiap/gated-deltanet-attn-0.4B-10B">Idiap/gated-deltanet-attn-0.4B-10B</a></td><td>0.4B</td><td>3</td><td>MIT</td><td>Latest (Nov 2025), hybrid sparse+linear</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2 id="repos">4. Repository inventory</h2>
+
+<p>All cloned with <strong>full history</strong> (<code>git fetch --unshallow</code> after initial shallow). Location: <code>/Volumes/external/sources/rent_kernels/</code>.</p>
+
+<div class="table-wrap">
+<table>
+  <thead>
+    <tr><th>Path</th><th>Source</th><th>Size</th><th>Commits</th><th>Role</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>FlashMLA/</code></td><td><a href="https://github.com/deepseek-ai/FlashMLA">deepseek-ai/FlashMLA</a></td><td>2.1M</td><td>60</td><td>MLA decode + sparse FP8 kernels (CUDA, Hopper/Blackwell)</td></tr>
+    <tr><td><code>DeepGEMM/</code></td><td><a href="https://github.com/deepseek-ai/DeepGEMM">deepseek-ai/DeepGEMM</a></td><td>3.2M</td><td>190</td><td>FP8/FP4 GEMM, Mega-MoE, HyperConnection kernels (CUDA)</td></tr>
+    <tr><td><code>DeepSeek-V3/</code></td><td><a href="https://github.com/deepseek-ai/DeepSeek-V3">deepseek-ai/DeepSeek-V3</a></td><td>2.3M</td><td>73</td><td>PyTorch ref: MoE + MTP + sigmoid routing + aux-loss-free</td></tr>
+    <tr><td><code>DeepSeek-V3.2-Exp/</code></td><td><a href="https://github.com/deepseek-ai/DeepSeek-V3.2-Exp">deepseek-ai/DeepSeek-V3.2-Exp</a></td><td>2.0M</td><td>18</td><td>V3.2 DSA + Lightning Indexer reference</td></tr>
+    <tr><td><code>flash-linear-attention/</code></td><td><a href="https://github.com/fla-org/flash-linear-attention">fla-org/flash-linear-attention</a></td><td>15M</td><td>1,927</td><td>Canonical GDN Triton kernels + layers</td></tr>
+    <tr><td><code>FlashQLA/</code></td><td><a href="https://github.com/QwenLM/FlashQLA">QwenLM/FlashQLA</a></td><td>572K</td><td>19</td><td><strong>TileLang SoTA GDN</strong>, 2-3× fwd / 2× bwd vs FLA</td></tr>
+    <tr><td><code>mlx-recurrence/</code></td><td><a href="https://github.com/D-CSIL/mlx-recurrence">D-CSIL/mlx-recurrence</a></td><td>860K</td><td>8</td><td>MLX-Metal fused fwd+VJP for SSM and GLA</td></tr>
+    <tr><td><code>hipfire/</code></td><td><a href="https://github.com/Kaden-Schutt/hipfire">Kaden-Schutt/hipfire</a></td><td>81M</td><td>1,121</td><td>HIP/ROCm + <strong>DELTANET.md</strong> (best docs)</td></tr>
+    <tr><td><code>mamba.py/</code></td><td><a href="https://github.com/alxndrTL/mamba.py">alxndrTL/mamba.py</a></td><td>21M</td><td>222</td><td>MLX folder — Blelloch parallel scan template</td></tr>
+    <tr><td><code>tilelang/ (symlink)</code></td><td><code>/Volumes/external/sources/tilelang/</code></td><td>—</td><td>—</td><td>Your TileLang fork with <code>examples/deepseek_v32/</code></td></tr>
+    <tr><td><code>~/sources/TileKernels/</code></td><td><a href="https://github.com/deepseek-ai/TileKernels">deepseek-ai/TileKernels</a></td><td>—</td><td>—</td><td><strong>V4 kernel layer</strong> — mHC, Engram, MoE, Quant</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2 id="gotchas">5. Key documents and gotchas</h2>
+
+<div class="grid grid-2">
+  <div class="card">
+    <h4>📄 FlashMLA absorb trick</h4>
+    <p class="desc">Folds <code>W_UK · W_O</code> into the QK GEMM. Halves decode FLOPs without changing output. Apple Silicon: port the algebra, skip the Hopper kernel.</p>
+    <span class="local">~/sources/rent_kernels/FlashMLA/docs/20250422-new-kernel-deep-dive.md</span>
+  </div>
+  <div class="card">
+    <h4>📄 FlashMLA FP8 sparse decoding</h4>
+    <p class="desc">410 TFLOPS on H800, 350 TFlops on B200. Pipeline + scaling strategy doc.</p>
+    <span class="local">~/sources/rent_kernels/FlashMLA/docs/20250929-hopper-fp8-sparse-deep-dive.md</span>
+  </div>
+  <div class="card">
+    <h4>📄 GDN Rosetta stone</h4>
+    <p class="desc">Full math derivation, gotcha <code>S@k</code> vs <code>Sᵀ@k</code>, alpha-gate fusion, state quantization, per-variant grid/block/LDS table.</p>
+    <span class="local">~/sources/rent_kernels/hipfire/DELTANET.md</span>
+  </div>
+  <div class="card">
+    <h4>⚠ Lightning Indexer RoPE gotcha</h4>
+    <p class="desc">Indexer Q/K use <strong>non-interleaved</strong> RoPE. MLA Q/K use <strong>interleaved</strong> RoPE. Mixing these silently produces wrong indices. V3.2-Exp README flags this explicitly.</p>
+  </div>
+  <div class="card">
+    <h4>⚠ Sinkhorn corrected backward</h4>
+    <p class="desc">Naive backward assumes <code>r=c=1</code> (only true at full convergence). Use TileKernels Issue #2 corrected formula — two matvecs, never materialize <code>RᵀR</code>.</p>
+  </div>
+  <div class="card">
+    <h4>📂 V3.2 indexer split across 3 repos</h4>
+    <p class="desc">Sparse attention kernels in <code>FlashMLA/csrc/</code>; Lightning Indexer logit kernels in <code>DeepGEMM/deep_gemm/include/</code>; readable TileLang reference at <code>tilelang/examples/deepseek_v32/sparse_mla_fwd_seesaw.py</code>.</p>
+  </div>
+</div>
+
+<h2 id="strategy">6. Apple Silicon vs CUDA strategy</h2>
+
+<div class="grid grid-2">
+  <div class="card">
+    <h4>🍎 Apple Silicon (cppmega.mlx)</h4>
+    <p class="desc">Apple Silicon = SM120 desktop Blackwell (<strong>no TMEM, no tcgen05</strong>). Mirror SGLang PR #24692:</p>
+    <ul>
+      <li>Don't lift TileLang kernels directly</li>
+      <li>Use TileKernels <code>torch/</code> golden as MLX correctness baseline</li>
+      <li>Write Metal-shader fallbacks with same fused patterns</li>
+      <li><strong>Engram is "free"</strong>: unified memory natively covers the HBM↔DRAM split</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h4>🚀 CUDA (cppmega for GB10/H200/B200)</h4>
+    <p class="desc">Wire TileKernels via Megatron <code>ModuleSpec</code> machinery:</p>
+    <ul>
+      <li>H200: TileKernels SM90 build (WGMMA FP8, FP32 scales)</li>
+      <li>B200/GB10: SM100 build (TMEM, UE8M0 packed scales, FP4 weights)</li>
+      <li>GB10 unique: Grace LPDDR5X is natural Engram backing store via C2C coherent</li>
+    </ul>
+  </div>
+</div>
+
+<h2 id="top5">7. Top-5 highest-value artifacts overall</h2>
+
+<div class="grid grid-2">
+  <div class="card">
+    <h4>1. ~/sources/TileKernels/</h4>
+    <p class="desc">V4 kernel layer, MIT. mHC + Engram + MoE + Quant in TileLang. Reference for both MLX (use <code>torch/</code>) and CUDA (use direct).</p>
+  </div>
+  <div class="card">
+    <h4>2. tilelang/examples/deepseek_v32/</h4>
+    <p class="desc">DSA sparse MLA fwd/bwd + Lightning Indexer in TileLang. Already in our tilelang fork.</p>
+  </div>
+  <div class="card">
+    <h4>3. mlx-lm PR #1217</h4>
+    <p class="desc">Metal GDN fwd+bwd, MIT, LoRA-converged. Vendor and wrap as "L" block.</p>
+  </div>
+  <div class="card">
+    <h4>4. DeepSeek-V3/inference/model.py</h4>
+    <p class="desc">Single-file PyTorch reference for MoE bias-correction, sigmoid routing, MTP. Cross-check our impls.</p>
+  </div>
+  <div class="card">
+    <h4>5. FlashMLA/docs/</h4>
+    <p class="desc">Algorithmic blueprints for MLA absorb and FP8 sparse decoding — portable as spec.</p>
+  </div>
+</div>
+
+<h2 id="plans">8. Linked integration plans</h2>
+
+<div class="grid grid-2">
+  <div class="card">
+    <h4>📋 cppmega.mlx integration plan</h4>
+    <p class="desc">9 ROI items, step-by-step, with tests, verification, and beads tracking. Wall-clock ~6 weeks.</p>
+    <a class="url" href="./INTEGRATION_PLAN_CPPMEGA_MLX.md">INTEGRATION_PLAN_CPPMEGA_MLX.md</a>
+  </div>
+  <div class="card">
+    <h4>📋 cppmega CUDA integration plan</h4>
+    <p class="desc">10 ROI items targeting GB10, H200, B200 with TileKernels + DeepGEMM + FlashMLA. Wall-clock ~3 months single dev.</p>
+    <a class="url" href="./INTEGRATION_PLAN_CPPMEGA_CUDA.md">INTEGRATION_PLAN_CPPMEGA_CUDA.md</a>
+  </div>
+</div>
+
+<div class="footer">
+  <p>Generated: May 2026 · cppmega.mlx kernel research wave · 12 parallel agents · 10 repos · 5,341 commits indexed</p>
+</div>
+
+</div>
+</body>
+</html>

@@ -1740,6 +1740,11 @@ def regression_report_payload(
         },
         "training": {
             "steps_completed": len(step_metrics),
+            "loss_eval_chunks": train_payload.get("loss_eval_chunks"),
+            "split_grad_update_eval": train_payload.get("split_grad_update_eval"),
+            "split_grad_update_eval_reason": train_payload.get(
+                "split_grad_update_eval_reason"
+            ),
             "all_finite": all_finite,
             "losses": losses,
             "initial_loss": losses[0] if losses else None,
@@ -2715,6 +2720,11 @@ def receipt_from_train_payload(
             "loss_decrease_satisfied": (not args.require_loss_decrease)
             or loss_decreased,
             "trained_tokens": train_payload.get("trained_tokens"),
+            "loss_eval_chunks": train_payload.get("loss_eval_chunks"),
+            "split_grad_update_eval": train_payload.get("split_grad_update_eval"),
+            "split_grad_update_eval_reason": train_payload.get(
+                "split_grad_update_eval_reason"
+            ),
             "step_metrics": step_metrics,
             "kernel_dispatch": list(train_payload.get("kernel_dispatch") or []),
         },
