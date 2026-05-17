@@ -133,25 +133,34 @@ def _path_c_call(*args, **kwargs):
 
 def _path_d_status() -> PathStatus:
     try:
-        importlib.import_module("triton")
-    except Exception:
-        return PathStatus(
-            path="path_d",
-            available=False,
-            reason="triton not importable (CPU/Apple Silicon)",
+        from cppmega_v4._tilelang.linear_attention_path_d import (
+            _path_d_runtime_status,
         )
+    except Exception as exc:
+        return PathStatus(
+            path="path_d", available=False,
+            reason=f"path_d module not importable: {exc}",
+        )
+    ok, reason = _path_d_runtime_status()
     return PathStatus(
-        path="path_d",
-        available=False,
+        path="path_d", available=ok,
         reason=(
-            "Triton frontend wiring pending: tilelang/poc/triton_frontend/"
-            "from_triton_kernel on FLA chunk_gated_delta_rule"
+            "GDN Path D: Triton kernel → tilelang.poc.triton_frontend."
+            f"from_triton_kernel → tilelang.compile. {reason}"
         ),
     )
 
 
 def _path_d_call(*args, **kwargs):
-    return _path_a_call(*args, **kwargs)  # fallback
+    if not _path_d_status().available:
+        return _path_a_call(*args, **kwargs)
+    try:
+        from cppmega_v4._tilelang.linear_attention_path_d import (
+            _gdn_fwd_path_d_call,
+        )
+        return _gdn_fwd_path_d_call(*args, **kwargs)
+    except Exception:
+        return _path_a_call(*args, **kwargs)
 
 
 # --- Path E (vendored mlx-lm PR #1217) ------------------------------------
