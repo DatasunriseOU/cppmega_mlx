@@ -21,6 +21,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import time
 import traceback
 from typing import Any
 
@@ -99,6 +100,7 @@ RECEIPT_SCOPE = "local_mlx_m04_train_step"
 TARGET_DATASET_NAME = "clang_semantic_4k_v10"
 REQUIRED_MODEL_PROFILE = "local_gb10_quarter"
 REQUIRED_MODEL_SOURCE = "cppmega_mlx.recipes.model_factory"
+CACHE_LIMIT_ENV = "CPPMEGA_MLX_CACHE_LIMIT_BYTES"
 REQUIRED_DTYPE = "bfloat16"
 REQUIRED_MODEL_GEOMETRY: dict[str, Any] = {
     "depth": 13,
@@ -155,7 +157,13 @@ FP8_PATH_C_KERNEL_POLICY_ENV = {
 FP8_PATH_B_KERNEL_POLICY_ENV = {
     "CPPMEGA_KERNEL_PATH__SPARSE_MLA": "path_b",
 }
-FP8_PATH_C_RUNTIME_ENV: dict[str, str] = {}
+SPARSE_MLA_FP8_ROUTE_ENV = "CPPMEGA_SPARSE_MLA_FP8_ROUTE"
+MAMBA3_PATH_C_BWD_ENV = "CPPMEGA_MAMBA3_PATH_C_BWD"
+FP8_PATH_C_RUNTIME_ENV: dict[str, str] = {
+    SPARSE_MLA_FP8_ROUTE_ENV: "path_c",
+    MAMBA3_PATH_C_BWD_ENV: "path_b",
+}
+FP8_PATH_B_RUNTIME_ENV: dict[str, str] = {SPARSE_MLA_FP8_ROUTE_ENV: "path_b"}
 FP8_PATH_C_ROUTE_BLOCKER_REASON = (
     "FP8 Path C has an m04 route for prepared Sparse-MLA Path C model ops, "
     "Mamba3 TileLang Path C selective scan, and M2RNN TileLang Path C recurrence. "
@@ -386,6 +394,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Apply the planned MLX memory limits before training.",
     )
     parser.add_argument(
+        "--cache-limit-bytes",
+        type=int,
+        default=None,
+        help=(
+            "Set the MLX allocator cache limit before model allocation. "
+            "Unset keeps MLX defaults except Path C local_gb10_quarter runs, "
+            "which default to 0 to avoid retained IOAccelerator cache pressure. "
+            f"Override with {CACHE_LIMIT_ENV} or this flag."
+        ),
+    )
+    parser.add_argument(
         "--clear-cache-every-steps",
         type=int,
         default=None,
@@ -408,6 +427,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--json",
         action="store_true",
         help="Print compact JSON receipt to stdout. The output file is always written.",
+    )
+    parser.add_argument(
+        "--profile-hold-seconds",
+        type=float,
+        default=0.0,
+        help=(
+            "Sleep after writing the receipt so external memory profilers can "
+            "inspect the live MLX allocator/cache state. Normal runs leave this at 0."
+        ),
     )
     return parser
 
@@ -505,6 +533,68 @@ def path_c_kernel_policy_requested() -> bool:
         if os.environ.get(env_name, "").strip().lower() in path_c_values:
             return True
     return False
+
+
+def _validate_cache_limit_bytes(limit: int, *, source: str) -> int:
+    if not isinstance(limit, int):
+        raise TypeError(f"cache limit from {source} must be an integer byte count")
+    if limit < 0:
+        raise ValueError(f"cache limit from {source} must be >= 0")
+    return limit
+
+
+def resolved_cache_limit_bytes(args: argparse.Namespace) -> tuple[int | None, str]:
+    explicit = getattr(args, "cache_limit_bytes", None)
+    if explicit is not None:
+        return _validate_cache_limit_bytes(explicit, source="cli"), "cli"
+
+    env_value = os.environ.get(CACHE_LIMIT_ENV)
+    if env_value is not None and env_value.strip() != "":
+        try:
+            parsed = int(env_value)
+        except ValueError as exc:
+            raise ValueError(f"{CACHE_LIMIT_ENV} must be an integer byte count") from exc
+        return _validate_cache_limit_bytes(parsed, source=CACHE_LIMIT_ENV), CACHE_LIMIT_ENV
+
+    if (
+        str(getattr(args, "model_profile", "")).strip() == REQUIRED_MODEL_PROFILE
+        and path_c_kernel_policy_requested()
+    ):
+        return 0, "path_c_default"
+    return None, "mlx_default"
+
+
+def apply_cache_limit_payload(
+    args: argparse.Namespace,
+    *,
+    mx_module: Any | None = None,
+) -> dict[str, Any]:
+    limit, source = resolved_cache_limit_bytes(args)
+    payload: dict[str, Any] = {
+        "configured": limit is not None,
+        "applied": False,
+        "limit_bytes": limit,
+        "source": source,
+        "api_path": None,
+        "previous_limit_bytes": None,
+    }
+    if limit is None:
+        return payload
+
+    mx_backend = mx if mx_module is None else mx_module
+    set_cache_limit = getattr(mx_backend, "set_cache_limit", None)
+    if not callable(set_cache_limit):
+        raise RuntimeError("mlx.core.set_cache_limit is unavailable")
+
+    previous = int(set_cache_limit(limit))
+    payload.update(
+        {
+            "applied": True,
+            "api_path": "mx.set_cache_limit",
+            "previous_limit_bytes": previous,
+        }
+    )
+    return payload
 
 
 def carrier_dtype_for_acceptance(
@@ -714,14 +804,39 @@ def _tilelang_dev_roots() -> tuple[Path, ...]:
     return tuple(unique)
 
 
+def _tilelang_source_and_build_root(root: Path) -> tuple[Path, Path] | None:
+    if (root / "tilelang").exists():
+        return root, root / "build"
+    if root.name == "build" and (root.parent / "tilelang").exists():
+        return root.parent, root
+    return None
+
+
+def _prepend_env_path(name: str, path: Path) -> None:
+    path_str = str(path)
+    values = [
+        value
+        for value in os.environ.get(name, "").split(os.pathsep)
+        if value
+    ]
+    if path_str not in values:
+        os.environ[name] = os.pathsep.join([path_str, *values])
+
+
 def ensure_tilelang_dev_env_for_path_c() -> None:
     for root in _tilelang_dev_roots():
-        lib_dir = root / "build" / "lib"
-        if not (root / "tilelang").exists() or not lib_dir.exists():
+        normalized = _tilelang_source_and_build_root(root)
+        if normalized is None:
             continue
-        os.environ.setdefault("TILELANG_DEV_BUILD_ROOT", str(root))
+        source_root, build_root = normalized
+        lib_dir = build_root / "lib"
+        tvm_dir = build_root / "tvm"
+        if not lib_dir.exists() or not tvm_dir.exists():
+            continue
+        os.environ["TILELANG_DEV_BUILD_ROOT"] = str(build_root)
         os.environ.setdefault("TVM_LIBRARY_PATH", str(lib_dir))
-        for path in (root, root / "3rdparty" / "tvm" / "python"):
+        _prepend_env_path("DYLD_LIBRARY_PATH", lib_dir)
+        for path in (source_root, source_root / "3rdparty" / "tvm" / "python"):
             path_str = str(path)
             if path.exists() and path_str not in sys.path:
                 sys.path.insert(0, path_str)
@@ -759,8 +874,10 @@ def fp8_path_b_kernel_policy(
         yield
         return
 
-    previous = {key: os.environ.get(key) for key in FP8_PATH_B_KERNEL_POLICY_ENV}
+    policy_env = {**FP8_PATH_B_KERNEL_POLICY_ENV, **FP8_PATH_B_RUNTIME_ENV}
+    previous = {key: os.environ.get(key) for key in policy_env}
     os.environ.update(FP8_PATH_B_KERNEL_POLICY_ENV)
+    os.environ.update(FP8_PATH_B_RUNTIME_ENV)
     try:
         yield
     finally:
@@ -1899,6 +2016,7 @@ def run_local_gb10_quarter_training(
 
         clear_dispatch_log()
         memory_limit = train_memory_limit_payload(config, apply=True)
+        cache_limit = apply_cache_limit_payload(args, mx_module=mx)
         mx.random.seed(config.seed)
         dataset = TokenParquetDataset(
             data_path,
@@ -2034,6 +2152,7 @@ def run_local_gb10_quarter_training(
                 "allocation_after_parameters": memory_after_parameters,
                 "peak_memory_bytes": memory_after.get("peak_memory_bytes"),
                 "peak_memory_reset": peak_memory_reset,
+                "cache_limit": cache_limit,
                 "clear_cache_every_steps": config.clear_cache_every_steps,
                 "clear_cache_events": clear_cache_events,
                 "clear_cache_event_count": len(clear_cache_events),
@@ -3889,6 +4008,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"steps_completed: {receipt['training']['steps_completed']}")
         print(f"final_loss: {receipt['training']['final_loss']}")
         print(f"peak_memory_bytes: {receipt['memory']['peak_memory_bytes']}")
+    if args.profile_hold_seconds > 0:
+        print(f"profile_hold_seconds: {args.profile_hold_seconds}")
+        sys.stdout.flush()
+        time.sleep(args.profile_hold_seconds)
     return exit_code
 
 

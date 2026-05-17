@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from typing import Literal, cast
 
@@ -25,6 +26,7 @@ SPARSE_MLA_FP8_PREPARED_BUFFER_NAMES = (
     "kv_fp8",
     "kv_scale",
 )
+SPARSE_MLA_FP8_ROUTE_ENV = "CPPMEGA_SPARSE_MLA_FP8_ROUTE"
 
 
 @dataclass(frozen=True)
@@ -367,6 +369,17 @@ def _validate_attention_sinks(
             f"got shape {sinks.shape}"
         )
     return sinks
+
+
+def sparse_mla_fp8_route_enabled(path: KernelPath) -> bool:
+    """Return whether the active dtype route explicitly enables FP8 Sparse-MLA."""
+
+    value = os.environ.get(SPARSE_MLA_FP8_ROUTE_ENV, "").strip().lower()
+    if path is KernelPath.PATH_C:
+        return value in {"path_c", "c", "fp8_path_c"}
+    if path is KernelPath.PATH_B:
+        return value in {"path_b", "b", "fp8_path_b"}
+    return False
 
 
 def yarn_attention_factor(scaling_factor: float) -> float:
@@ -833,6 +846,7 @@ class CausalSelfAttention(nn.Module):
         del sinks, kv_cache
         return (
             self.config.mode == "dsa"
+            and sparse_mla_fp8_route_enabled(KernelPath.PATH_C)
             and selected_path("sparse_mla") is KernelPath.PATH_C
             and (not isinstance(mask, str) or mask == "causal")
         )
@@ -847,6 +861,7 @@ class CausalSelfAttention(nn.Module):
         del sinks
         return (
             self.config.mode == "dsa"
+            and sparse_mla_fp8_route_enabled(KernelPath.PATH_B)
             and kv_cache is None
             and selected_path("sparse_mla") is KernelPath.PATH_B
             and (not isinstance(mask, str) or mask == "causal")
@@ -967,11 +982,13 @@ __all__ = [
     "SPARSE_MLA_FP8_PREPARED_BUFFER_NAMES",
     "SPARSE_MLA_FP8_PRODUCER_OWNER",
     "SPARSE_MLA_FP8_PRODUCER_STAGE",
+    "SPARSE_MLA_FP8_ROUTE_ENV",
     "apply_rotary_emb",
     "causal_sparse_indices",
     "causal_sdpa_mask",
     "precompute_rotary_embeddings",
     "rotary_inv_freq",
     "sparse_indices_from_attention_mask",
+    "sparse_mla_fp8_route_enabled",
     "yarn_attention_factor",
 ]

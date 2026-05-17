@@ -46,6 +46,8 @@ STATUS_FAILED = "failed"
 STATUS_UNSUPPORTED = "unsupported"
 STATUS_NOT_APPLICABLE = "not_applicable"
 STATUS_PLANNED = "planned"
+MAMBA3_PATH_C_BWD_ENV = "CPPMEGA_MAMBA3_PATH_C_BWD"
+SPARSE_MLA_FP8_ROUTE_ENV = "CPPMEGA_SPARSE_MLA_FP8_ROUTE"
 
 
 @dataclass(frozen=True)
@@ -81,11 +83,21 @@ class CellResult:
     mlx_sha: str
     mlx_version: str
     cache_state: dict[str, Any]
+    cli_optimizer: str | None = None
+    optimizer_key: str | None = None
+    optimizer_name: str | None = None
+    optimizer_class: str | None = None
+    optimizer_source: str | None = None
+    steps_completed: int | None = None
+    first_step_sec: float | None = None
+    median_step_sec: float | None = None
     tok_sec: float | None = None
     step_sec: float | None = None
     compile_time_s: float | None = None
     peak_memory_bytes: int | None = None
     peak_memory_gb: float | None = None
+    active_memory_gb: float | None = None
+    cache_memory_gb: float | None = None
     selected_schedule: dict[str, Any] = field(default_factory=dict)
     proof_result: dict[str, Any] = field(default_factory=dict)
     pass_fail_reason: str | None = None
@@ -103,10 +115,20 @@ class CellResult:
             "optimizer": self.optimizer,
             "path": self.path,
             "status": self.status,
+            "cli_optimizer": self.cli_optimizer,
+            "optimizer_key": self.optimizer_key,
+            "optimizer_name": self.optimizer_name,
+            "optimizer_class": self.optimizer_class,
+            "optimizer_source": self.optimizer_source,
+            "steps_completed": self.steps_completed,
+            "first_step_sec": self.first_step_sec,
+            "median_step_sec": self.median_step_sec,
             "tok_sec": self.tok_sec,
             "step_sec": self.step_sec,
             "compile_time_s": self.compile_time_s,
             "peak_memory_gb": self.peak_memory_gb,
+            "active_memory_gb": self.active_memory_gb,
+            "cache_memory_gb": self.cache_memory_gb,
             "cache_hit": self.cache_state.get("cache_hit"),
             "selected_schedule": json.dumps(self.selected_schedule, sort_keys=True),
             "proof_result": json.dumps(self.proof_result, sort_keys=True),
@@ -202,6 +224,7 @@ def path_env_and_support(
             {
                 "CPPMEGA_KERNEL_PATH": "auto",
                 "CPPMEGA_KERNEL_PATH__SPARSE_MLA": "path_b",
+                SPARSE_MLA_FP8_ROUTE_ENV: "path_b",
             },
             True,
             None,
@@ -217,21 +240,21 @@ def path_env_and_support(
             None,
         )
     if path == "path_c_cold":
-        return (
-            {"CPPMEGA_KERNEL_PATH": "path_c"},
-            True,
-            None,
-            "cold",
-            cache_dir,
-        )
+        env = {
+            "CPPMEGA_KERNEL_PATH": "path_c",
+            MAMBA3_PATH_C_BWD_ENV: "path_b",
+        }
+        if dtype == "fp8":
+            env[SPARSE_MLA_FP8_ROUTE_ENV] = "path_c"
+        return (env, True, None, "cold", cache_dir)
     if path == "path_c_warm":
-        return (
-            {"CPPMEGA_KERNEL_PATH": "path_c"},
-            True,
-            None,
-            "warm",
-            cache_dir,
-        )
+        env = {
+            "CPPMEGA_KERNEL_PATH": "path_c",
+            MAMBA3_PATH_C_BWD_ENV: "path_b",
+        }
+        if dtype == "fp8":
+            env[SPARSE_MLA_FP8_ROUTE_ENV] = "path_c"
+        return (env, True, None, "warm", cache_dir)
     return {}, False, f"unknown path {path!r}", "not_applicable", None
 
 
@@ -462,6 +485,7 @@ def unsupported_result(cell: MatrixCell, identity: dict[str, str]) -> CellResult
             "cache_dir": str(cell.cache_dir) if cell.cache_dir else None,
             "cache_hit": None,
         },
+        cli_optimizer=cell.cli_optimizer,
         pass_fail_reason=cell.unsupported_reason,
     )
 
@@ -483,6 +507,7 @@ def planned_result(cell: MatrixCell, identity: dict[str, str]) -> CellResult:
             "cache_dir": str(cell.cache_dir) if cell.cache_dir else None,
             "cache_hit": None,
         },
+        cli_optimizer=cell.cli_optimizer,
         pass_fail_reason="dry-run plan only; cell not executed",
         receipt_path=str(cell.output_json),
     )
@@ -557,10 +582,17 @@ def extract_result(
     memory = receipt.get("memory") if isinstance(receipt, dict) else {}
     training = receipt.get("training") if isinstance(receipt, dict) else {}
     step_times = list(timing.get("step_times_s") or []) if isinstance(timing, dict) else []
-    compile_time_s = float(step_times[0]) if step_times else None
+    first_step_sec = float(step_times[0]) if step_times else None
+    compile_time_s = first_step_sec
     steady_times = [float(value) for value in step_times[1:]] if len(step_times) > 1 else []
     step_sec = (sum(steady_times) / len(steady_times)) if steady_times else (
         float(timing.get("mean_step_time_s")) if isinstance(timing, dict) and timing.get("mean_step_time_s") is not None else None
+    )
+    sorted_steady_times = sorted(steady_times)
+    median_step_sec = (
+        sorted_steady_times[len(sorted_steady_times) // 2]
+        if sorted_steady_times
+        else first_step_sec
     )
     tok_sec = (
         float(timing.get("tokens_per_second"))
@@ -570,6 +602,19 @@ def extract_result(
     peak_bytes = (
         int(memory.get("peak_memory_bytes"))
         if isinstance(memory, dict) and memory.get("peak_memory_bytes") is not None
+        else None
+    )
+    memory_after = memory.get("after") if isinstance(memory, dict) else {}
+    active_bytes = (
+        int(memory_after.get("active_memory_bytes"))
+        if isinstance(memory_after, dict)
+        and memory_after.get("active_memory_bytes") is not None
+        else None
+    )
+    cache_bytes = (
+        int(memory_after.get("cache_memory_bytes"))
+        if isinstance(memory_after, dict)
+        and memory_after.get("cache_memory_bytes") is not None
         else None
     )
     reason = None
@@ -586,6 +631,16 @@ def extract_result(
         reason = "training reported non-finite values"
     else:
         reason = "ok"
+    optimizer_payload = (
+        training.get("optimizer")
+        if isinstance(training, dict) and isinstance(training.get("optimizer"), dict)
+        else {}
+    )
+    steps_completed = (
+        int(training.get("steps_completed"))
+        if isinstance(training, dict) and training.get("steps_completed") is not None
+        else None
+    )
     return CellResult(
         case_id=cell.case_id,
         dtype=cell.dtype,
@@ -598,11 +653,41 @@ def extract_result(
         mlx_sha=identity["mlx_sha"],
         mlx_version=identity["mlx_version"],
         cache_state=cache_state,
+        cli_optimizer=cell.cli_optimizer,
+        optimizer_key=(
+            str(optimizer_payload.get("key"))
+            if optimizer_payload.get("key") is not None
+            else cell.cli_optimizer
+        ),
+        optimizer_name=(
+            str(optimizer_payload.get("name"))
+            if optimizer_payload.get("name") is not None
+            else None
+        ),
+        optimizer_class=(
+            str(optimizer_payload.get("class"))
+            if optimizer_payload.get("class") is not None
+            else None
+        ),
+        optimizer_source=(
+            str(optimizer_payload.get("source"))
+            if optimizer_payload.get("source") is not None
+            else None
+        ),
+        steps_completed=steps_completed,
+        first_step_sec=first_step_sec,
+        median_step_sec=median_step_sec,
         tok_sec=tok_sec,
         step_sec=step_sec,
         compile_time_s=compile_time_s,
         peak_memory_bytes=peak_bytes,
         peak_memory_gb=(peak_bytes / (1024**3)) if peak_bytes is not None else None,
+        active_memory_gb=(
+            active_bytes / (1024**3) if active_bytes is not None else None
+        ),
+        cache_memory_gb=(
+            cache_bytes / (1024**3) if cache_bytes is not None else None
+        ),
         selected_schedule=selected_schedule_from_receipt(receipt),
         proof_result=proof_result_from_receipt(receipt, path=cell.path),
         pass_fail_reason=reason,

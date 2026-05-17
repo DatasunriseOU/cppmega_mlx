@@ -15,7 +15,11 @@ import mlx.nn as nn
 
 from cppmega_mlx.data.packing import mlx_document_boundary_mask
 from cppmega_mlx.inference.engine import ContiguousKVCache, kv_cache_position
-from cppmega_mlx.nn.attention import AttentionConfig, CausalSelfAttention
+from cppmega_mlx.nn.attention import (
+    AttentionConfig,
+    CausalSelfAttention,
+    sparse_mla_fp8_route_enabled,
+)
 from cppmega_mlx.nn.m2rnn import M2RNNConfig, M2RNNMixer
 from cppmega_mlx.nn.mamba3 import Mamba3Config, Mamba3ReferenceBlock
 from cppmega_mlx.nn.mhc import ManifoldBranchMixer, ManifoldBranchMixerConfig
@@ -546,11 +550,15 @@ class HybridTinyLM(nn.Module):
         if any(layer.backend == "attention" for layer in self.layers):
             if document_ids is None:
                 if kv_cache is None:
-                    dsa_path_c = selected_path("sparse_mla") is KernelPath.PATH_C and any(
-                        layer.backend == "attention"
-                        and isinstance(layer.block, CausalSelfAttention)
-                        and layer.block.config.mode == "dsa"
-                        for layer in self.layers
+                    dsa_path_c = (
+                        selected_path("sparse_mla") is KernelPath.PATH_C
+                        and sparse_mla_fp8_route_enabled(KernelPath.PATH_C)
+                        and any(
+                            layer.backend == "attention"
+                            and isinstance(layer.block, CausalSelfAttention)
+                            and layer.block.config.mode == "dsa"
+                            for layer in self.layers
+                        )
                     )
                     if dsa_path_c:
                         mask = "causal"

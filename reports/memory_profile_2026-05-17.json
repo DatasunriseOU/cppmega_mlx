@@ -1,0 +1,192 @@
+{
+  "generated_at": "2026-05-17 15:25:34 CEST",
+  "mamba_profile": {
+    "bwd_profile": {
+      "simd_p_reduce_kernel": {
+        "iters": 1,
+        "label": "bwd_path_c_simd_p_reduce",
+        "max_ms": 19.9205829994753,
+        "mean_ms": 19.9205829994753,
+        "median_ms": 19.9205829994753,
+        "min_ms": 19.9205829994753,
+        "warmup": 0
+      }
+    },
+    "gflops": {
+      "fwd_bwd_path_b": 8.09223306537347,
+      "fwd_bwd_path_c": 1.3331091265547963,
+      "fwd_path_b": 467.86234006192575,
+      "fwd_path_c": 421.73027569807164
+    },
+    "hardware_label": "Davids-Mac-Studio.local",
+    "kernel": "mamba3_mimo_path_c_vs_path_b",
+    "matched_run_guard": "Compare Path B and Path C only when both rows were collected on the same hardware with identical kernel inputs. This is a local_only receipt.",
+    "memory_bytes_peak": {
+      "fwd_bwd_path_b": 1829832836,
+      "fwd_bwd_path_c": 1414530208,
+      "fwd_path_b": 371540656,
+      "fwd_path_c": 163315952
+    },
+    "parity": {
+      "h_max_abs": 0.00048828125,
+      "y_max_abs": 0.0001220703125
+    },
+    "path_b_status": {
+      "available": true,
+      "reason": "MSL dispatch path is available"
+    },
+    "path_c_status": {
+      "available": true,
+      "reason": "Path C TileLang DSL ready"
+    },
+    "platform": {
+      "machine": "arm64",
+      "mlx_version": "0.32.0",
+      "python_version": "3.13.12",
+      "system": "Darwin",
+      "tilelang_version": "0.1.9+gitd669bcee"
+    },
+    "ratio_path_c_over_path_b_bwd": 6.091739451700799,
+    "ratio_path_c_over_path_b_fwd": 1.1093876039311945,
+    "ratio_path_c_over_path_b_fwd_bwd": 6.070195533269306,
+    "scheduler_decision": {
+      "blocked_path_c_codegen_gaps": [
+        "lowered Path C fwd still recomputes some lane-derived indices inside the t loop",
+        "Path C bwd still performs the reverse recurrence serially over T and N per lane",
+        "unsupported bwd reduction shapes now fail closed until semantic reduction lowering covers them"
+      ],
+      "mode": "path_b",
+      "optimization_policy": "AUTO only promotes a Path C phase when the rule/Z3 plan is safe and paired bench receipt median is no-worse than Path B.",
+      "ratios": {
+        "bwd_path_c_over_path_b": 6.091739451700799,
+        "fwd_bwd_path_c_over_path_b": 6.070195533269306,
+        "fwd_path_c_over_path_b": 1.1093876039311945
+      },
+      "remembered_optimizations": [
+        "TileLang local.var scalar y_acc instead of thread float[1]",
+        "TileLang Metal local.var PrintExpr statement-order fix",
+        "Bench harness uses paired alternating samples to avoid order/warmup drift",
+        "Path C bwd consumes explicit state snapshot boundaries instead of unsafe inverse-state reconstruction",
+        "Path C bwd uses TileLang thread_allreduce P-axis reductions instead of public dB/dC partial buffers",
+        "Bench harness profiles the final-gradient SIMD/snapshot bwd route directly",
+        "AUTO selects full Path C only when fwd, bwd, and fwd+bwd receipts are no-worse",
+        "AUTO can still select Path C forward with Path B backward when only fwd is no-worse"
+      ],
+      "rule_z3_plan": {
+        "batch": 1,
+        "bwd_path_c_candidate": true,
+        "dtype": "bfloat16",
+        "fwd_path_c_candidate": true,
+        "grid_blocks": 28,
+        "headdim": 64,
+        "heads": 112,
+        "lanes": 7168,
+        "mode": "path_c_fwd_bwd",
+        "reason": "rule: fp32-accumulating bfloat16 per-lane scan with 256 threads over 28 blocks; z3 proved per-lane index decomposition and buffer bounds; bwd reverse pass consumes explicit state snapshot tensor boundaries instead of inverse h_prev reconstruction; bwd emits TileLang thread_allreduce_sum over P-axis grads",
+        "seq": 2047,
+        "state": 16,
+        "threads": 256,
+        "z3_proved": true,
+        "z3_used": true
+      },
+      "selected_backward_kernel": "metal_kernel_bwd_v1",
+      "selected_forward_kernel": "metal_kernel_fwd_v1",
+      "source": "rule_z3_test_receipt"
+    },
+    "schema_version": 1,
+    "scope": "local_only",
+    "shape": {
+      "batch": 1,
+      "dtype": "bfloat16",
+      "headdim": 64,
+      "heads": 112,
+      "seq": 2047,
+      "state": 16
+    },
+    "strict_policy": {
+      "path_c_bwd_over_path_b_max_ratio": 1.0,
+      "path_c_fwd_bwd_over_path_b_max_ratio": 1.0,
+      "path_c_fwd_over_path_b_max_ratio": 1.0,
+      "phase": "fwd",
+      "requires_path_b_and_path_c": true
+    },
+    "timings": {
+      "bwd_path_b_median_ms": 649.9320839939173,
+      "bwd_path_c_median_ms": 3959.2169169918634,
+      "fwd_bwd_path_b": {
+        "iters": 1,
+        "label": "fwd_bwd_path_b",
+        "max_ms": 652.7546249999432,
+        "mean_ms": 652.7546249999432,
+        "measurement": "paired_alternating",
+        "median_ms": 652.7546249999432,
+        "min_ms": 652.7546249999432,
+        "warmup": 0
+      },
+      "fwd_bwd_path_c": {
+        "iters": 1,
+        "label": "fwd_bwd_path_c",
+        "max_ms": 3962.348208995536,
+        "mean_ms": 3962.348208995536,
+        "measurement": "paired_alternating",
+        "median_ms": 3962.348208995536,
+        "min_ms": 3962.348208995536,
+        "warmup": 0
+      },
+      "fwd_path_b": {
+        "iters": 1,
+        "label": "fwd_path_b",
+        "max_ms": 2.8225410060258582,
+        "mean_ms": 2.8225410060258582,
+        "measurement": "paired_alternating",
+        "median_ms": 2.8225410060258582,
+        "min_ms": 2.8225410060258582,
+        "warmup": 0
+      },
+      "fwd_path_c": {
+        "iters": 1,
+        "label": "fwd_path_c",
+        "max_ms": 3.13129200367257,
+        "mean_ms": 3.13129200367257,
+        "measurement": "paired_alternating",
+        "median_ms": 3.13129200367257,
+        "min_ms": 3.13129200367257,
+        "warmup": 0
+      }
+    },
+    "verdict": "Path C is >20% slower than Path B; recommend keeping Path B as primary, KEEPING Path C as a reproducibility artifact (proves the DSL path works), and flagging the perf gap as a future TileLang scheduler bug."
+  },
+  "new_delta": {
+    "active_gib": -2.1802261471748352e-05,
+    "cache_gib": 10.798162631690502,
+    "peak_gib": 4.514469752088189,
+    "tok_sec": -49.33623163944026
+  },
+  "old_delta": {
+    "active_gib": 8.627306669950485e-05,
+    "cache_gib": 57.518500154837966,
+    "peak_gib": 121.45163111109287,
+    "tok_sec": -67.51291824485796
+  },
+  "snapshot_plan": {
+    "shape": {
+      "batch": 1,
+      "dtype": "bfloat16",
+      "headdim": 64,
+      "heads": 112,
+      "seq": 2047,
+      "state": 16
+    },
+    "snapshot_count": 2048,
+    "snapshot_elements": 234881024,
+    "snapshot_gib_per_mamba_bwd_invocation": 0.875,
+    "state_elements": 114688
+  },
+  "sources": [
+    "/tmp/cppmega_1b_path_matrix_cells/bf16_adamw_path_b.json",
+    "/tmp/cppmega_1b_path_matrix_cells/bf16_adamw_path_c_warm.json",
+    "/tmp/cppmega_1b_path_matrix_cells_fixed/bf16_adamw_path_b.json",
+    "/tmp/cppmega_1b_path_matrix_cells_fixed/bf16_adamw_path_c_warm.json",
+    "/tmp/cppmega_mamba3_1b_allocator_profile.json"
+  ]
+}

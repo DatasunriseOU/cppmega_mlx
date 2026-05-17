@@ -1,0 +1,157 @@
+{
+  "generated_at": "2026-05-17T16:30:00+02:00",
+  "workload": {
+    "model_profile": "local_gb10_quarter",
+    "dtype": "bfloat16",
+    "optimizer": "adamw",
+    "steps": 1,
+    "batch_size": 1,
+    "seq_len": 2048,
+    "grad_checkpoint": true,
+    "data_path": "data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet",
+    "profiler": "MallocStackLogging + vmmap + malloc_history; xctrace Allocations failed before Python startup on this host"
+  },
+  "receipts": {
+    "path_c": "/tmp/cppmega_hold_bf16_adamw_path_c.json",
+    "path_b_auto_baseline": "/tmp/cppmega_hold_bf16_adamw_auto_baseline.json",
+    "path_c_clear_every_step": "/tmp/cppmega_mem_bf16_path_c_clear_every_step.json",
+    "path_c_default_cache_limit0": "/tmp/cppmega_mem_bf16_path_c_default_cache_limit0.json"
+  },
+  "mlx_allocator": {
+    "path_c": {
+      "peak_gib": 33.74784638732672,
+      "active_gib_after": 17.090483790263534,
+      "cache_gib_after": 38.334110219962895,
+      "tokens_per_second": 129.13162214228336
+    },
+    "path_b_auto_baseline": {
+      "peak_gib": 29.233340637758374,
+      "active_gib_after": 17.090505531057715,
+      "cache_gib_after": 27.389679769985378,
+      "tokens_per_second": 193.1361644769707
+    },
+    "path_c_minus_path_b": {
+      "peak_gib": 4.514505749568343,
+      "active_gib_after": -0.00002174079418182373,
+      "cache_gib_after": 10.944430449977517,
+      "tokens_per_second": -64.00454233468733
+    },
+    "path_c_clear_every_step": {
+      "peak_gib": 33.74785980023444,
+      "active_gib_after": 17.09049522317946,
+      "cache_gib_after": 0.0,
+      "clear_events": [
+        {
+          "step": 1,
+          "api_path": "mx.clear_cache",
+          "cache_memory_before_bytes": 41161034713,
+          "cache_memory_after_bytes": 0
+        },
+        {
+          "step": 2,
+          "api_path": "mx.clear_cache",
+          "cache_memory_before_bytes": 41161016147,
+          "cache_memory_after_bytes": 0
+        }
+      ]
+    },
+    "path_c_default_cache_limit0": {
+      "peak_gib": 33.747842900455,
+      "active_gib_after": 17.09046784043312,
+      "cache_gib_after": 0.0,
+      "tokens_per_second": 170.77418280411683,
+      "cache_limit": {
+        "configured": true,
+        "applied": true,
+        "limit_bytes": 0,
+        "source": "path_c_default",
+        "api_path": "mx.set_cache_limit",
+        "previous_limit_bytes": 130567005798
+      }
+    }
+  },
+  "vmmap_live_hold": {
+    "path_c": {
+      "physical_footprint": "58.2G",
+      "physical_footprint_peak": "58.4G",
+      "ioaccelerator_graphics": {
+        "virtual": "55.4G",
+        "resident": "55.4G",
+        "dirty": "41.7G",
+        "swapped": "13.7G",
+        "nonvolatile": "55.4G",
+        "region_count": 3663
+      },
+      "ioaccelerator": {
+        "virtual": "7.0G",
+        "resident": "4.7G",
+        "dirty": "1.1G",
+        "swapped": "139.9M",
+        "nonvolatile": "3.5G",
+        "region_count": 136
+      }
+    },
+    "path_b_auto_baseline": {
+      "physical_footprint": "47.1G",
+      "physical_footprint_peak": "47.3G",
+      "ioaccelerator_graphics": {
+        "virtual": "44.5G",
+        "resident": "44.5G",
+        "dirty": "44.5G",
+        "swapped": "0K",
+        "nonvolatile": "44.5G",
+        "region_count": 3398
+      },
+      "ioaccelerator": {
+        "virtual": "7.0G",
+        "resident": "5.6G",
+        "dirty": "1.3G",
+        "swapped": "0K",
+        "nonvolatile": "3.5G",
+        "region_count": 163
+      }
+    }
+  },
+  "malloc_history_hotspots": [
+    {
+      "kind": "parquet_loader_host_allocation",
+      "evidence": "libarrow/libparquet mmap reserve/resize stacks appear as 2 GiB mmap groups; this is data-loader host allocation evidence, not the MLX Metal cache delta."
+    },
+    {
+      "kind": "mlx_metal_binary_op_buffers",
+      "bytes": 1977679872,
+      "calls": 40,
+      "stack": [
+        "IOGPUResourceCreate",
+        "IOGPUMetalBuffer init",
+        "AGXBuffer init",
+        "mlx::core::metal::MetalAllocator::malloc",
+        "mlx::core::set_binary_op_output_data",
+        "mlx::core::binary_op_gpu",
+        "mlx::core::gpu::eval",
+        "mlx::core::eval"
+      ]
+    },
+    {
+      "kind": "mlx_metal_square_buffers",
+      "bytes": 1977630720,
+      "calls": 39,
+      "stack": [
+        "IOGPUResourceCreate",
+        "IOGPUMetalBuffer init",
+        "AGXBuffer init",
+        "mlx::core::metal::MetalAllocator::malloc",
+        "mlx::core::set_unary_output_data",
+        "mlx::core::Square::eval_gpu",
+        "mlx::core::gpu::eval",
+        "mlx::core::eval"
+      ]
+    }
+  ],
+  "interpretation": {
+    "cache_delta_is_needed_for_correctness": false,
+    "why_it_exists": "MLX keeps freed Metal buffers in its allocator cache for reuse; Path C produces about 10.9 GiB more retained IOAccelerator graphics resources than the auto Path B baseline on this profiled step when the default MLX cache limit is left in place.",
+    "why_it_is_not_live_model_growth": "Post-step active memory is unchanged between Path C and Path B, while mx.clear_cache drops Path C cache to zero after each step.",
+    "who_frees_it": "mx.clear_cache releases the cached buffers; normal process exit also releases them. With the new Path C local_gb10 default, mx.set_cache_limit(0) prevents retaining this cache after the step."
+  }
+}

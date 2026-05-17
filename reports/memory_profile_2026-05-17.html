@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cppmega Path C Memory Profiling</title>
+<style>
+body{margin:0;background:#f6f7f9;color:#17202a;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;line-height:1.45}
+header,main{max-width:1240px;margin:0 auto;padding:24px} header{background:#fff;border-bottom:1px solid #d8dee8;max-width:none;padding-left:max(24px,calc((100vw - 1240px)/2));padding-right:max(24px,calc((100vw - 1240px)/2))}
+h1{margin:0 0 8px;font-size:36px;letter-spacing:0} h2{margin:0 0 8px;font-size:20px;letter-spacing:0} p{color:#667085;margin:0 0 10px}
+.panel{background:#fff;border:1px solid #d8dee8;border-radius:8px;margin:18px 0;padding:18px;overflow:auto} table{width:100%;border-collapse:collapse;font-size:13px} th,td{border-bottom:1px solid #e5e8ee;padding:10px;text-align:left;vertical-align:top} th{background:#f9fafb} code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px} .bad{color:#b42318;font-weight:700} .good{color:#0f7a4f;font-weight:700} .callout{border-left:4px solid #1e3a5f;background:#f3f6fa;padding:12px 14px;border-radius:6px;color:#344054} .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px} .metric{border:1px solid #d8dee8;border-radius:8px;padding:14px;background:#fbfcfe} .metric strong{display:block;font-size:24px}
+</style></head><body>
+<header><h1>cppmega Path C Memory Profiling</h1><p>Allocator-backed evidence for the disputed +121.45 GiB delta. Generated 2026-05-17 15:25:34 CEST.</p></header>
+<main>
+<section class="panel"><h2>Conclusion</h2><div class="callout">The old +121.45 GiB number was an MLX/Metal <strong>peak allocator high-water delta</strong>, not live model memory. It was still a real bug signal: the old bf16 Path C run accidentally used FP8 Sparse-MLA and full Mamba3 Path C backward. After gating FP8 Sparse-MLA by dtype route and forcing Mamba3 training to Path C forward + Path B backward, the same bf16/AdamW 20-step row is <strong>4.51 GiB peak delta</strong> with <strong>-0.0000 GiB active delta</strong>; the remaining delta is allocator cache/TileLang pressure.</div></section>
+<section class="panel"><h2>Full-model allocator receipts</h2><p>Workload: local_gb10_quarter, real parquet, bf16 AdamW, batch=1, seq=2048, 20 steps, grad checkpoint. Values are parsed from m04 JSON receipts.</p><table><thead><tr><th>Run</th><th>tok/s</th><th>peak GiB</th><th>active GiB after</th><th>cache GiB after</th><th>dispatch kernels</th><th>receipt</th></tr></thead><tbody>
+<tr>
+  <th>old Path B baseline</th><td>225.14</td><td>29.23</td><td>17.09</td><td>27.52</td><td>metal_kernel_fwd_v1 x120, reference_pure_mlx x40</td><td><code>/tmp/cppmega_1b_path_matrix_cells/bf16_adamw_path_b.json</code></td>
+</tr>
+
+<tr>
+  <th>old Path C warm broken</th><td>157.63</td><td>150.69</td><td>17.09</td><td>85.04</td><td>path_c_tilelang_dsl x110, path_c_tilelang_dsl_packed_post x36, tilelang_fp8_prepared_path_c_fwd x110</td><td><code>/tmp/cppmega_1b_path_matrix_cells/bf16_adamw_path_c_warm.json</code></td>
+</tr>
+
+<tr>
+  <th>fixed Path B baseline</th><td>222.40</td><td>29.23</td><td>17.09</td><td>27.54</td><td>metal_kernel_fwd_v1 x120, reference_pure_mlx x40</td><td><code>/tmp/cppmega_1b_path_matrix_cells_fixed/bf16_adamw_path_b.json</code></td>
+</tr>
+
+<tr>
+  <th>fixed Path C warm</th><td>173.06</td><td>33.75</td><td>17.09</td><td>38.34</td><td>path_c_tilelang_dsl_fwd_path_b_bwd x120, path_c_tilelang_dsl_packed_post x40</td><td><code>/tmp/cppmega_1b_path_matrix_cells_fixed/bf16_adamw_path_c_warm.json</code></td>
+</tr></tbody></table></section>
+<section class="panel"><h2>Deltas</h2><table><thead><tr><th>Comparison</th><th>throughput delta</th><th>peak allocator delta</th><th>active delta</th><th>cache delta</th></tr></thead><tbody>
+<tr><th>old broken Path C - Path B</th><td>-67.51 tok/s</td><td>121.45 GiB</td><td>0.0001 GiB</td><td>57.52 GiB</td></tr>
+
+
+<tr><th>fixed Path C - Path B</th><td>-49.34 tok/s</td><td>4.51 GiB</td><td>-0.0000 GiB</td><td>10.80 GiB</td></tr>
+</tbody></table></section>
+<section class="panel"><h2>Mamba3 allocator/profiler receipt</h2><p>Focused micro-profile at the actual local_gb10_quarter Mamba3 scan shape: B=1, T=2047, H=112, P=64, N=16, bf16. Source receipt: <code>/tmp/cppmega_mamba3_1b_allocator_profile.json</code>.</p><table><thead><tr><th>Probe</th><th>median time</th><th>peak allocator</th></tr></thead><tbody>
+<tr><th>Path B fwd</th><td>2.823 ms</td><td>354.33 MiB</td></tr>
+<tr><th>Path C fwd</th><td>3.131 ms</td><td>155.75 MiB</td></tr>
+<tr><th>Path B fwd+bwd</th><td>652.755 ms</td><td>1745.06 MiB</td></tr>
+<tr><th>Path C full fwd+bwd</th><td>3962.348 ms</td><td>1349.00 MiB</td></tr>
+<tr><th>Path C bwd SIMD/snapshot kernel direct</th><td>19.921 ms</td><td>see snapshot plan</td></tr>
+</tbody></table><p>Scheduler verdict from the profiler receipt: <code>path_b</code>. Full Path C bwd is 6.09x slower than Path B bwd on this shape.</p></section>
+<section class="panel"><h2>Snapshot allocation model</h2><div class="grid"><div class="metric"><span>Snapshot buffer per full Path C Mamba3 bwd invocation</span><strong>0.875 GiB</strong></div><div class="metric"><span>Snapshot count</span><strong>2048</strong></div><div class="metric"><span>State elements per boundary</span><strong>114,688</strong></div></div><p>The old full Path C backward used a reverse recurrence state-boundary cache. In the 1B training graph, repeated Mamba3 backward/recompute invocations push this into allocator high-water and cache pressure. The fixed training policy keeps Path C forward but delegates Mamba3 backward to Path B, so this snapshot path is no longer selected by default training runs.</p></section>
+<section class="panel"><h2>What changed in the interpretation</h2><ul><li><strong>Peak</strong> is high-water since process start/reset; it can exceed current active memory and can look impossible if read as live RSS.</li><li><strong>Active</strong> is the live MLX allocator footprint after the run; this stayed effectively unchanged between Path B and fixed Path C.</li><li><strong>Cache</strong> is allocator cache retained after kernels/compilation; this is where the pre-cache-limit fixed Path C row still costs about 10.80 GiB versus Path B. The follow-up profiler report <a href="profiling/path_c_cache_delta_profiler_2026-05-17.html">path_c_cache_delta_profiler_2026-05-17.html</a> ties that cache delta to live IOAccelerator/IOGPUMetalBuffer allocations and records the new Path C local_gb10 default: <code>mx.set_cache_limit(0)</code> before model allocation.</li><li>Old bf16 Path C dispatch contained <code>tilelang_fp8_prepared_path_c_fwd</code>; fixed bf16 Path C dispatch does not.</li></ul></section>
+</main></body></html>

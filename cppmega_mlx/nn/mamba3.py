@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from typing import Literal, overload
 
@@ -11,6 +12,21 @@ import mlx.nn as nn
 
 
 DEFAULT_CHUNK_SIZE = 128
+MAMBA3_PATH_C_BWD_ENV = "CPPMEGA_MAMBA3_PATH_C_BWD"
+_MAMBA3_PATH_C_PATH_B_BWD_VALUES = {
+    "path_b",
+    "b",
+    "metal",
+    "fwd_path_b_bwd",
+    "path_c_fwd_path_b_bwd",
+}
+
+
+def _mamba3_path_c_uses_path_b_backward() -> bool:
+    return (
+        os.environ.get(MAMBA3_PATH_C_BWD_ENV, "").strip().lower()
+        in _MAMBA3_PATH_C_PATH_B_BWD_VALUES
+    )
 
 
 @mx.custom_function
@@ -425,12 +441,21 @@ def _dispatch_mamba3_scan(
     if path is KernelPath.PATH_C:
         from cppmega_mlx.nn._tilelang.mamba3_path_c import (
             mamba3_mimo_apply_with_state_path_c,
+            mamba3_mimo_apply_with_state_path_c_fwd_path_b_bwd,
             mamba3_mimo_path_c_status,
         )
 
         status = mamba3_mimo_path_c_status()
         if not status.available:
             raise RuntimeError(f"mamba3_mimo: Path C kernel unavailable ({status.reason})")
+        if _mamba3_path_c_uses_path_b_backward():
+            y, h_last = mamba3_mimo_apply_with_state_path_c_fwd_path_b_bwd(
+                x, B, C, z, A, dt, D, h0
+            )
+            record_dispatch(
+                "mamba3_mimo", path, "path_c_tilelang_dsl_fwd_path_b_bwd"
+            )
+            return y, h_last
         y, h_last = mamba3_mimo_apply_with_state_path_c(x, B, C, z, A, dt, D, h0)
         record_dispatch("mamba3_mimo", path, "path_c_tilelang_dsl")
         return y, h_last
@@ -786,6 +811,7 @@ class Mamba3ReferenceBlock(nn.Module):
 
 __all__ = [
     "DEFAULT_CHUNK_SIZE",
+    "MAMBA3_PATH_C_BWD_ENV",
     "Mamba3CacheState",
     "Mamba3Config",
     "Mamba3InProjDims",

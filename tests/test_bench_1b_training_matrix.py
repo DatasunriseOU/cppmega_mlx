@@ -45,6 +45,7 @@ def test_bench_1b_matrix_plan_covers_dtype_optimizer_path_cells(
     by_case = {cell.case_id: cell for cell in cells}
     assert by_case["bf16_adamw_path_b"].env["CPPMEGA_KERNEL_PATH"] == "auto"
     assert by_case["bf16_adamw_path_c_cold"].env["CPPMEGA_KERNEL_PATH"] == "path_c"
+    assert by_case["bf16_adamw_path_c_cold"].env["CPPMEGA_MAMBA3_PATH_C_BWD"] == "path_b"
     assert by_case["bf16_adamw_path_c_cold"].cache_mode == "cold"
     assert by_case["bf16_adamw_path_c_warm"].cache_mode == "warm"
     assert "--seq-len" in by_case["bf16_adamw_path_b"].command
@@ -55,6 +56,7 @@ def test_bench_1b_matrix_plan_covers_dtype_optimizer_path_cells(
     assert by_case["fp8_adamw_path_b"].dtype_arg == "fp8_path_b"
     assert by_case["fp8_adamw_path_b"].env["CPPMEGA_KERNEL_PATH"] == "auto"
     assert by_case["fp8_adamw_path_b"].env["CPPMEGA_KERNEL_PATH__SPARSE_MLA"] == "path_b"
+    assert by_case["fp8_adamw_path_c_warm"].env["CPPMEGA_SPARSE_MLA_FP8_ROUTE"] == "path_c"
 
 
 def test_bench_1b_matrix_dry_run_writes_markdown_csv_and_json(
@@ -121,7 +123,13 @@ def test_bench_1b_matrix_extracts_m04_receipt_metrics(
                     "mean_step_time_s": 1.5,
                     "tokens_per_second": 2048.0,
                 },
-                "memory": {"peak_memory_bytes": 1 << 30},
+                "memory": {
+                    "peak_memory_bytes": 1 << 30,
+                    "after": {
+                        "active_memory_bytes": 512 << 20,
+                        "cache_memory_bytes": 768 << 20,
+                    },
+                },
                 "training": {
                     "all_finite": True,
                     "kernel_dispatch": [
@@ -164,6 +172,8 @@ def test_bench_1b_matrix_extracts_m04_receipt_metrics(
     assert result.step_sec == 1.25
     assert result.tok_sec == 2048.0
     assert result.peak_memory_gb == 1.0
+    assert result.active_memory_gb == 0.5
+    assert result.cache_memory_gb == 0.75
     assert result.selected_schedule["kernel_counts"] == {"path_c_tilelang_dsl": 1}
     assert result.proof_result["path_c_requested"] is True
 

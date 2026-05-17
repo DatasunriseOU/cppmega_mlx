@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Path C Cache Delta Memory Profiler</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #172026;
+      --muted: #596772;
+      --line: #d9e0e5;
+      --panel: #ffffff;
+      --bg: #f5f7f8;
+      --accent: #0f766e;
+      --warn: #9a3412;
+      --bad: #b91c1c;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: var(--ink);
+      background: var(--bg);
+    }
+    header {
+      padding: 28px 32px 18px;
+      border-bottom: 1px solid var(--line);
+      background: #eef4f3;
+    }
+    h1 { margin: 0 0 8px; font-size: 26px; letter-spacing: 0; }
+    h2 { margin: 0 0 12px; font-size: 18px; letter-spacing: 0; }
+    main { max-width: 1180px; margin: 0 auto; padding: 24px 20px 40px; }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 18px;
+      margin: 0 0 18px;
+    }
+    .callout {
+      border-left: 4px solid var(--accent);
+      background: #ecfdf5;
+      padding: 12px 14px;
+      margin: 0;
+    }
+    .warn {
+      border-left-color: var(--warn);
+      background: #fff7ed;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+      gap: 12px;
+    }
+    .metric {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      background: #fbfcfd;
+    }
+    .metric span {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 4px;
+    }
+    .metric strong {
+      display: block;
+      font-size: 22px;
+      letter-spacing: 0;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      overflow-wrap: anywhere;
+    }
+    th, td {
+      text-align: left;
+      vertical-align: top;
+      padding: 9px 10px;
+      border-bottom: 1px solid var(--line);
+    }
+    th {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      background: #f8fafb;
+    }
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      background: #eef2f5;
+      border-radius: 4px;
+      padding: 1px 4px;
+    }
+    ul { margin: 0; padding-left: 20px; }
+    li + li { margin-top: 6px; }
+    .num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .bad { color: var(--bad); font-weight: 700; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Path C Cache Delta Memory Profiler</h1>
+    <div>bf16 AdamW, local_gb10_quarter, batch=1, seq=2048, grad checkpoint, one profiled training step. Generated 2026-05-17.</div>
+  </header>
+  <main>
+    <section class="panel">
+      <h2>Answer</h2>
+      <p class="callout">The +10.9 GiB cache delta is not needed for correctness. It is retained MLX Metal allocator cache: freed <code>IOGPUMetalBuffer</code> resources kept for reuse. <code>mx.clear_cache</code> drops the Path C cache to 0 after each step, while active memory stays at the same 17.09 GiB.</p>
+    </section>
+
+    <section class="panel">
+      <h2>Profiler Setup</h2>
+      <ul>
+        <li><code>xctrace Allocations</code> was attempted first, but on this host it hung before Python startup in <code>liboainject.dylib</code> and then failed attach; that trace was not used as evidence.</li>
+        <li>The usable profiler run used <code>MallocStackLogging</code>, a live <code>vmmap</code> snapshot during an in-process hold, and <code>malloc_history</code> for allocation stacks.</li>
+        <li>A profiling-only <code>--profile-hold-seconds</code> flag was added to <code>scripts/m04_train_step.py</code> so external profilers can inspect the live MLX cache before process exit.</li>
+      </ul>
+    </section>
+
+    <section class="panel">
+      <h2>MLX Allocator Counters</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Run</th>
+            <th>tok/s</th>
+            <th>peak GiB</th>
+            <th>active GiB after</th>
+            <th>cache GiB after</th>
+            <th>receipt</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Path B auto baseline</td>
+            <td class="num">193.14</td>
+            <td class="num">29.23</td>
+            <td class="num">17.0905</td>
+            <td class="num">27.39</td>
+            <td><code>/tmp/cppmega_hold_bf16_adamw_auto_baseline.json</code></td>
+          </tr>
+          <tr>
+            <td>Path C fixed route</td>
+            <td class="num">129.13</td>
+            <td class="num">33.75</td>
+            <td class="num">17.0905</td>
+            <td class="num">38.33</td>
+            <td><code>/tmp/cppmega_hold_bf16_adamw_path_c.json</code></td>
+          </tr>
+          <tr>
+            <td>Path C - Path B</td>
+            <td class="num bad">-64.00</td>
+            <td class="num bad">+4.51</td>
+            <td class="num">-0.00002</td>
+            <td class="num bad">+10.94</td>
+            <td>computed from receipts</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section class="panel">
+      <h2>Live VMMap During Hold</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Run</th>
+            <th>physical footprint</th>
+            <th>IOAccelerator graphics resident</th>
+            <th>IOAccelerator graphics dirty+swapped</th>
+            <th>graphics regions</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Path B auto baseline</td>
+            <td class="num">47.1G</td>
+            <td class="num">44.5G</td>
+            <td class="num">44.5G</td>
+            <td class="num">3398</td>
+          </tr>
+          <tr>
+            <td>Path C fixed route</td>
+            <td class="num">58.2G</td>
+            <td class="num">55.4G</td>
+            <td class="num">55.4G</td>
+            <td class="num">3663</td>
+          </tr>
+          <tr>
+            <td>Path C - Path B</td>
+            <td class="num bad">+11.1G</td>
+            <td class="num bad">+10.9G</td>
+            <td class="num bad">+10.9G</td>
+            <td class="num bad">+265</td>
+          </tr>
+        </tbody>
+      </table>
+      <p>The live OS view lines up with the MLX cache delta: the extra footprint is almost entirely <code>IOAccelerator (graphics)</code>, not Python malloc heap.</p>
+    </section>
+
+    <section class="panel">
+      <h2>Allocation Stacks</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Hotspot</th>
+            <th>malloc_history evidence</th>
+            <th>Interpretation</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>MLX binary op GPU buffers</td>
+            <td><code>40 calls / 1,977,679,872 bytes</code>: <code>IOGPUResourceCreate -> IOGPUMetalBuffer -> AGXBuffer -> mlx::core::metal::MetalAllocator::malloc -> set_binary_op_output_data -> binary_op_gpu -> gpu::eval -> mx.eval</code></td>
+            <td>Large Metal buffers allocated by MLX evaluation and retained by the MLX Metal allocator.</td>
+          </tr>
+          <tr>
+            <td>MLX square/unary GPU buffers</td>
+            <td><code>39 calls / 1,977,630,720 bytes</code>: <code>IOGPUResourceCreate -> IOGPUMetalBuffer -> AGXBuffer -> mlx::core::metal::MetalAllocator::malloc -> set_unary_output_data -> Square::eval_gpu -> gpu::eval -> mx.eval</code></td>
+            <td>Optimizer/gradient-style unary work contributes Metal buffer churn; it is cacheable, not live model state.</td>
+          </tr>
+          <tr>
+            <td>Parquet/Arrow host allocations</td>
+            <td>Several <code>2 GiB mmap</code> groups under <code>libarrow/libparquet</code> record reader stacks.</td>
+            <td>Separate host-side data-loader noise from stack logging; not the MLX cache delta.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section class="panel">
+      <h2>Release Test</h2>
+      <div class="grid">
+        <div class="metric"><span>Path C no-clear cache after run</span><strong>38.33 GiB</strong></div>
+        <div class="metric"><span>Path C with mx.clear_cache every step</span><strong>0.00 GiB</strong></div>
+        <div class="metric"><span>Path C new default mx.set_cache_limit(0)</span><strong>0.00 GiB</strong></div>
+        <div class="metric"><span>Active memory with clear</span><strong>17.09 GiB</strong></div>
+        <div class="metric"><span>Peak high-water with clear</span><strong>33.75 GiB</strong></div>
+      </div>
+      <p class="callout warn">The peak high-water does not decrease after the fact because it records the maximum allocation reached earlier. The post-run cache decreases to zero with <code>mx.clear_cache</code>, and a new Path C local_gb10 default now applies <code>mx.set_cache_limit(0)</code> before model allocation so this cache is not retained after the step.</p>
+    </section>
+
+    <section class="panel">
+      <h2>Conclusion</h2>
+      <ul>
+        <li>The cache is useful only as a speed/fragmentation tradeoff for reusing Metal buffers. It is not required for correctness.</li>
+        <li>For reports, cache delta must be shown separately from active memory and must not be described as model memory growth.</li>
+        <li>For Path C local_gb10 runs, the runtime now sets <code>mx.set_cache_limit(0)</code> by default; override with <code>CPPMEGA_MLX_CACHE_LIMIT_BYTES</code> or <code>--cache-limit-bytes</code> when measuring cache reuse deliberately.</li>
+      </ul>
+    </section>
+  </main>
+</body>
+</html>

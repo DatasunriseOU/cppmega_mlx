@@ -96,6 +96,58 @@ def canonical_allocation_probe(**overrides: Any) -> dict[str, Any]:
     return probe
 
 
+def test_fp8_path_policies_set_explicit_runtime_routes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(m04_train_step, "ensure_tilelang_dev_env_for_path_c", lambda: None)
+    for key in (
+        "CPPMEGA_KERNEL_PATH__SPARSE_MLA",
+        "CPPMEGA_SPARSE_MLA_FP8_ROUTE",
+        "CPPMEGA_MAMBA3_PATH_C_BWD",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    path_c_args = m04_train_step.build_parser().parse_args(
+        ["--synthetic", "--dtype", "fp8_path_c", "--output", str(tmp_path / "c.json")]
+    )
+    with m04_train_step.fp8_path_c_kernel_policy(path_c_args):
+        assert os.environ["CPPMEGA_KERNEL_PATH__SPARSE_MLA"] == "path_c"
+        assert os.environ["CPPMEGA_SPARSE_MLA_FP8_ROUTE"] == "path_c"
+        assert os.environ["CPPMEGA_MAMBA3_PATH_C_BWD"] == "path_b"
+    assert "CPPMEGA_SPARSE_MLA_FP8_ROUTE" not in os.environ
+    assert "CPPMEGA_MAMBA3_PATH_C_BWD" not in os.environ
+
+    path_b_args = m04_train_step.build_parser().parse_args(
+        ["--synthetic", "--dtype", "fp8_path_b", "--output", str(tmp_path / "b.json")]
+    )
+    with m04_train_step.fp8_path_b_kernel_policy(path_b_args):
+        assert os.environ["CPPMEGA_KERNEL_PATH__SPARSE_MLA"] == "path_b"
+        assert os.environ["CPPMEGA_SPARSE_MLA_FP8_ROUTE"] == "path_b"
+        assert "CPPMEGA_MAMBA3_PATH_C_BWD" not in os.environ
+
+
+def test_tilelang_dev_env_points_to_build_root_and_runtime_libs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "tl_apache_tvm_swap"
+    build_root = source_root / "build"
+    (source_root / "tilelang").mkdir(parents=True)
+    (source_root / "3rdparty" / "tvm" / "python").mkdir(parents=True)
+    (build_root / "lib").mkdir(parents=True)
+    (build_root / "tvm").mkdir(parents=True)
+    monkeypatch.setenv("TILELANG_DEV_BUILD_ROOT", str(source_root))
+    monkeypatch.delenv("TVM_LIBRARY_PATH", raising=False)
+    monkeypatch.delenv("DYLD_LIBRARY_PATH", raising=False)
+
+    m04_train_step.ensure_tilelang_dev_env_for_path_c()
+
+    assert os.environ["TILELANG_DEV_BUILD_ROOT"] == str(build_root)
+    assert os.environ["TVM_LIBRARY_PATH"] == str(build_root / "lib")
+    assert str(build_root / "lib") in os.environ["DYLD_LIBRARY_PATH"].split(os.pathsep)
+
+
 def test_m04_import_preserves_recipes_package_exports() -> None:
     import cppmega_mlx.recipes as recipes
 
@@ -103,6 +155,74 @@ def test_m04_import_preserves_recipes_package_exports() -> None:
     assert isinstance(recipes.__all__, list)
     assert "local_gb10_quarter" in recipes.__all__
     assert hasattr(recipes, "local_gb10_quarter")
+
+
+def test_profile_hold_seconds_is_opt_in(tmp_path: Path) -> None:
+    args = m04_train_step.build_parser().parse_args(
+        ["--synthetic", "--output", str(tmp_path / "receipt.json")]
+    )
+
+    assert args.profile_hold_seconds == 0.0
+
+
+class _FakeCacheLimitMLX:
+    def __init__(self) -> None:
+        self.calls: list[int] = []
+
+    def set_cache_limit(self, limit: int) -> int:
+        self.calls.append(limit)
+        return 987654321
+
+
+def test_path_c_local_gb10_defaults_cache_limit_to_zero(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("CPPMEGA_KERNEL_PATH", "path_c")
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--model-profile",
+            "local_gb10_quarter",
+            "--output",
+            str(tmp_path / "receipt.json"),
+        ]
+    )
+    fake = _FakeCacheLimitMLX()
+
+    payload = m04_train_step.apply_cache_limit_payload(args, mx_module=fake)
+
+    assert fake.calls == [0]
+    assert payload == {
+        "configured": True,
+        "applied": True,
+        "limit_bytes": 0,
+        "source": "path_c_default",
+        "api_path": "mx.set_cache_limit",
+        "previous_limit_bytes": 987654321,
+    }
+
+
+def test_non_path_c_keeps_mlx_cache_default(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.delenv("CPPMEGA_KERNEL_PATH", raising=False)
+    monkeypatch.delenv("CPPMEGA_MLX_CACHE_LIMIT_BYTES", raising=False)
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--model-profile",
+            "local_gb10_quarter",
+            "--output",
+            str(tmp_path / "receipt.json"),
+        ]
+    )
+    fake = _FakeCacheLimitMLX()
+
+    payload = m04_train_step.apply_cache_limit_payload(args, mx_module=fake)
+
+    assert fake.calls == []
+    assert payload["configured"] is False
+    assert payload["source"] == "mlx_default"
 
 
 def run_script(*args: str, timeout: int = 60) -> subprocess.CompletedProcess[str]:

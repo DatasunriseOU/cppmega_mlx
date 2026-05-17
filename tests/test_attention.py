@@ -255,6 +255,7 @@ def test_dsa_path_c_consumes_existing_prepared_buffers_without_wrapper_quantizat
         return mx.zeros((1, 4, 4, cfg.q_head_dim), dtype=mx.float16)
 
     monkeypatch.setenv("CPPMEGA_KERNEL_PATH__SPARSE_MLA", "path_c")
+    monkeypatch.setenv("CPPMEGA_SPARSE_MLA_FP8_ROUTE", "path_c")
     monkeypatch.setattr(
         fp8_path_c, "_to_fp8_with_per_token_scale", fail_quantization
     )
@@ -326,6 +327,7 @@ def test_dsa_path_c_routes_through_sparse_mla_fp8_prepared(
         return mx.zeros((1, 4, 4, cfg.q_head_dim), dtype=mx.float16)
 
     monkeypatch.setenv("CPPMEGA_KERNEL_PATH__SPARSE_MLA", "path_c")
+    monkeypatch.setenv("CPPMEGA_SPARSE_MLA_FP8_ROUTE", "path_c")
     monkeypatch.setattr(fp8_path_c, "sparse_mla_fp8_path_c_apply", fake_apply)
     clear_dispatch_log()
 
@@ -346,6 +348,37 @@ def test_dsa_path_c_routes_through_sparse_mla_fp8_prepared(
         "path": "path_c",
         "kernel_used": "tilelang_fp8_prepared_path_c_fwd",
     }
+
+
+def test_dsa_path_c_without_fp8_route_keeps_dense_attention(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = AttentionConfig(
+        d_model=16,
+        num_q_heads=4,
+        num_kv_heads=2,
+        mode="dsa",
+        sparse_topk=2,
+    )
+    attn = CausalSelfAttention(cfg)
+    x = _rand((1, 4, 16), seed=232)
+
+    monkeypatch.setenv("CPPMEGA_KERNEL_PATH__SPARSE_MLA", "path_c")
+    monkeypatch.delenv("CPPMEGA_SPARSE_MLA_FP8_ROUTE", raising=False)
+    monkeypatch.setattr(
+        attn,
+        "prepare_sparse_mla_fp8",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("BF16/INT8 Path C must not enable FP8 Sparse-MLA")
+        ),
+    )
+    clear_dispatch_log()
+
+    out = attn(x, mask="causal")
+    mx.eval(out)
+
+    assert out.shape == x.shape
+    assert get_dispatch_log() == []
 
 
 def test_dsa_path_b_fp8_baseline_routes_through_reference(
@@ -380,6 +413,7 @@ def test_dsa_path_b_fp8_baseline_routes_through_reference(
         return mx.zeros((1, 4, 4, cfg.q_head_dim), dtype=q.dtype)
 
     monkeypatch.setenv("CPPMEGA_KERNEL_PATH__SPARSE_MLA", "path_b")
+    monkeypatch.setenv("CPPMEGA_SPARSE_MLA_FP8_ROUTE", "path_b")
     monkeypatch.setattr(fp8_path_b, "sparse_mla_fp8_apply", fake_apply)
     clear_dispatch_log()
 
@@ -404,6 +438,7 @@ def test_dsa_path_c_routes_explicit_masks_as_sparse_indices(
     import cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c as fp8_path_c
 
     monkeypatch.setenv("CPPMEGA_KERNEL_PATH__SPARSE_MLA", "path_c")
+    monkeypatch.setenv("CPPMEGA_SPARSE_MLA_FP8_ROUTE", "path_c")
     attn = CausalSelfAttention(
         AttentionConfig(
             d_model=16, num_q_heads=4, num_kv_heads=2, mode="dsa", sparse_topk=2
@@ -465,6 +500,7 @@ def test_dsa_path_c_routes_sinks_to_sparse_mla_fp8_apply(
     import cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c as fp8_path_c
 
     monkeypatch.setenv("CPPMEGA_KERNEL_PATH__SPARSE_MLA", "path_c")
+    monkeypatch.setenv("CPPMEGA_SPARSE_MLA_FP8_ROUTE", "path_c")
     cfg = AttentionConfig(d_model=16, num_q_heads=4, num_kv_heads=2, mode="dsa")
     attn = CausalSelfAttention(cfg)
     x = _rand((1, 3, 16), seed=34)

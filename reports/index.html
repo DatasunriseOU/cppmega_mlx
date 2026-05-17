@@ -253,6 +253,24 @@
     </div>
   </header>
   <main>
+    <section class="panel narrative">
+      <div class="section-head">
+        <h2>Memory Profiling Follow-Up</h2>
+        <p>Allocator-backed analysis of the disputed +121.45 GiB Path C delta.</p>
+      </div>
+      <div class="callout">
+        <strong>Read this with the matrix:</strong>
+        <a href="memory_profile_2026-05-17.html">memory_profile_2026-05-17.html</a>
+        separates MLX peak allocator high-water, active memory, allocator cache,
+        and Mamba3 snapshot profiling. The old full matrix below predates that
+        fix and is retained as historical evidence, not as the current Path C
+        memory result.
+        The follow-up
+        <a href="profiling/path_c_cache_delta_profiler_2026-05-17.html">path_c_cache_delta_profiler_2026-05-17.html</a>
+        adds live <code>vmmap</code> and <code>malloc_history</code> evidence for
+        the remaining Path C cache delta.
+      </div>
+    </section>
     <div class="summary-grid">
       
             <section class="summary-card">

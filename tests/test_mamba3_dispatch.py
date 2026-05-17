@@ -56,6 +56,7 @@ def _reset(monkeypatch: pytest.MonkeyPatch):
     clear_dispatch_log()
     monkeypatch.delenv("CPPMEGA_KERNEL_PATH", raising=False)
     monkeypatch.delenv("CPPMEGA_KERNEL_PATH__MAMBA3_MIMO", raising=False)
+    monkeypatch.delenv("CPPMEGA_MAMBA3_PATH_C_BWD", raising=False)
     yield
     clear_dispatch_log()
 
@@ -131,6 +132,57 @@ def test_path_c_dispatches_tilelang_dsl(monkeypatch: pytest.MonkeyPatch) -> None
     assert matches, "expected at least one mamba3_mimo dispatch"
     assert matches[-1]["path"] == "path_c"
     assert matches[-1]["kernel_used"] == "path_c_tilelang_dsl"
+
+
+def test_path_c_training_mode_can_keep_path_b_backward(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cppmega_mlx.nn._tilelang import mamba3_path_c
+    import cppmega_mlx.nn.mamba3 as mamba3_module
+
+    x, B, C, z, A, dt, D, h0 = _make_scan_inputs(seed=121)
+
+    def fail_full_path_c(*_args: object, **_kwargs: object) -> tuple[mx.array, mx.array]:
+        raise AssertionError("training-safe Path C mode used full Path C backward")
+
+    def fake_hybrid(*args: mx.array) -> tuple[mx.array, mx.array]:
+        x_arg, *_rest, h0_arg = args
+        return mx.zeros_like(x_arg), h0_arg
+
+    monkeypatch.setenv("CPPMEGA_KERNEL_PATH", "path_c")
+    monkeypatch.setenv("CPPMEGA_MAMBA3_PATH_C_BWD", "path_b")
+    monkeypatch.setattr(
+        mamba3_path_c,
+        "mamba3_mimo_path_c_status",
+        lambda: mamba3_path_c.Mamba3PathCStatus(True, "forced available"),
+    )
+    monkeypatch.setattr(
+        mamba3_path_c,
+        "mamba3_mimo_apply_with_state_path_c",
+        fail_full_path_c,
+    )
+    monkeypatch.setattr(
+        mamba3_path_c,
+        "mamba3_mimo_apply_with_state_path_c_fwd_path_b_bwd",
+        fake_hybrid,
+    )
+
+    y, h_last = mamba3_module._dispatch_mamba3_scan(
+        x=x,
+        B=B,
+        C=C,
+        z=z,
+        A=A,
+        dt=dt,
+        D=D,
+        h0=h0,
+        chunk_size=8,
+    )
+    mx.eval(y, h_last)
+
+    matches = [e for e in get_dispatch_log() if e["op_name"] == "mamba3_mimo"]
+    assert matches[-1]["path"] == "path_c"
+    assert matches[-1]["kernel_used"] == "path_c_tilelang_dsl_fwd_path_b_bwd"
 
 
 def test_path_c_policy_without_legacy_debug_wrapper_env_runs_or_explains_kernel_unavailable(

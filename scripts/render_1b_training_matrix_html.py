@@ -14,7 +14,7 @@ from typing import Any
 
 DEFAULT_INPUT = Path("/tmp/cppmega_1b_path_matrix.json")
 DEFAULT_OUTPUT = Path("/tmp/cppmega_1b_path_matrix.html")
-DEFAULT_DTYPES = ("bf16", "fp8")
+DEFAULT_DTYPES = ("bf16", "fp8", "int8")
 PATH_ORDER = ("path_b", "path_c_cold", "path_c_warm")
 
 
@@ -25,10 +25,20 @@ class Row:
     optimizer: str
     path: str
     status: str
+    cli_optimizer: str | None
+    optimizer_key: str | None
+    optimizer_name: str | None
+    optimizer_class: str | None
+    optimizer_source: str | None
+    steps_completed: int | None
+    first_step_sec: float | None
+    median_step_sec: float | None
     tok_sec: float | None
     step_sec: float | None
     compile_time_s: float | None
     peak_memory_gb: float | None
+    active_memory_gb: float | None
+    cache_memory_gb: float | None
     cache_hit: bool | None
     pass_fail_reason: str | None
     command: str
@@ -103,10 +113,44 @@ def parse_rows(payload: dict[str, Any]) -> list[Row]:
                 optimizer=str(raw.get("optimizer") or ""),
                 path=str(raw.get("path") or ""),
                 status=str(raw.get("status") or ""),
+                cli_optimizer=(
+                    str(raw.get("cli_optimizer"))
+                    if raw.get("cli_optimizer") is not None
+                    else None
+                ),
+                optimizer_key=(
+                    str(raw.get("optimizer_key"))
+                    if raw.get("optimizer_key") is not None
+                    else None
+                ),
+                optimizer_name=(
+                    str(raw.get("optimizer_name"))
+                    if raw.get("optimizer_name") is not None
+                    else None
+                ),
+                optimizer_class=(
+                    str(raw.get("optimizer_class"))
+                    if raw.get("optimizer_class") is not None
+                    else None
+                ),
+                optimizer_source=(
+                    str(raw.get("optimizer_source"))
+                    if raw.get("optimizer_source") is not None
+                    else None
+                ),
+                steps_completed=(
+                    int(raw.get("steps_completed"))
+                    if raw.get("steps_completed") is not None
+                    else None
+                ),
+                first_step_sec=_number(raw.get("first_step_sec")),
+                median_step_sec=_number(raw.get("median_step_sec")),
                 tok_sec=_number(raw.get("tok_sec")),
                 step_sec=_number(raw.get("step_sec")),
                 compile_time_s=_number(raw.get("compile_time_s")),
                 peak_memory_gb=_number(raw.get("peak_memory_gb")),
+                active_memory_gb=_number(raw.get("active_memory_gb")),
+                cache_memory_gb=_number(raw.get("cache_memory_gb")),
                 cache_hit=_bool(raw.get("cache_hit")),
                 pass_fail_reason=(
                     str(raw.get("pass_fail_reason"))
@@ -173,6 +217,43 @@ def optimizer_order(rows: Iterable[Row], dtype: str) -> list[str]:
     return [value for value in order if value in present] + sorted(present - set(order))
 
 
+def optimizer_label(row: Row | None, *, dtype: str, optimizer: str) -> str:
+    """Display the real runtime optimizer, not only the matrix axis name."""
+
+    key = (row.optimizer_key if row else None) or (row.cli_optimizer if row else None)
+    name = row.optimizer_name if row else None
+    if dtype == "int8":
+        labels = {
+            "adamw": "adam8bit",
+            "lion": "lion8bit",
+            "muon": "muon-int8",
+            "muon_adamw": "muon-int8",
+        }
+        axis_label = labels.get(optimizer, optimizer)
+    elif optimizer == "lion":
+        axis_label = "lion16"
+    elif optimizer == "adamw":
+        axis_label = "adamw16"
+    else:
+        axis_label = optimizer
+    if key and key != optimizer:
+        return f"{axis_label} ({key})"
+    if name and name.lower() != axis_label.lower():
+        return f"{axis_label} ({name})"
+    return axis_label
+
+
+def optimizer_class_hint(row: Row | None) -> str:
+    if not row:
+        return ""
+    parts = []
+    if row.optimizer_class:
+        parts.append(row.optimizer_class)
+    if row.optimizer_source:
+        parts.append(row.optimizer_source)
+    return " / ".join(parts)
+
+
 def speed_ratio(candidate: Row | None, baseline: Row | None) -> float | None:
     if not candidate or not baseline:
         return None
@@ -181,12 +262,18 @@ def speed_ratio(candidate: Row | None, baseline: Row | None) -> float | None:
     return candidate.tok_sec / baseline.tok_sec
 
 
-def memory_delta(candidate: Row | None, baseline: Row | None) -> float | None:
+def memory_delta(
+    candidate: Row | None,
+    baseline: Row | None,
+    attr: str = "peak_memory_gb",
+) -> float | None:
     if not candidate or not baseline:
         return None
-    if candidate.peak_memory_gb is None or baseline.peak_memory_gb is None:
+    candidate_value = getattr(candidate, attr)
+    baseline_value = getattr(baseline, attr)
+    if candidate_value is None or baseline_value is None:
         return None
-    return candidate.peak_memory_gb - baseline.peak_memory_gb
+    return candidate_value - baseline_value
 
 
 def decision_for(
@@ -264,7 +351,7 @@ def render_summary_cards(rows: list[Row], dtypes: tuple[str, ...], tolerance: fl
                 keep_b=keep_b,
                 na=na,
                 fastest=(
-                    f"{fastest.optimizer} {path_label(fastest.path)} at {fmt_num(fastest.tok_sec)} tok/s"
+                    f"{optimizer_label(fastest, dtype=dtype, optimizer=fastest.optimizer)} {path_label(fastest.path)} at {fmt_num(fastest.tok_sec)} tok/s"
                     if fastest
                     else "-"
                 ),
@@ -282,7 +369,9 @@ def render_comparison_table(rows: list[Row], dtype: str, tolerance: float) -> st
         warm = keyed.get((dtype, optimizer, "path_c_warm"))
         cold_ratio = speed_ratio(cold, baseline)
         warm_ratio = speed_ratio(warm, baseline)
-        mem_delta = memory_delta(warm, baseline)
+        peak_delta = memory_delta(warm, baseline, "peak_memory_gb")
+        active_delta = memory_delta(warm, baseline, "active_memory_gb")
+        cache_delta = memory_delta(warm, baseline, "cache_memory_gb")
         decision, class_name, reason = decision_for(
             warm=warm,
             baseline=baseline,
@@ -291,19 +380,22 @@ def render_comparison_table(rows: list[Row], dtype: str, tolerance: float) -> st
         body.append(
             """
             <tr>
-              <th>{optimizer}</th>
+              <th>{optimizer}<div class="muted">{optimizer_hint}</div></th>
               <td>{b_tok}</td>
               <td>{cold_tok}</td>
               <td>{warm_tok}</td>
               <td class="{cold_ratio_class}">{cold_ratio}</td>
               <td class="{warm_ratio_class}">{warm_ratio}</td>
-              <td>{b_mem}</td>
-              <td>{warm_mem}</td>
-              <td class="{mem_class}">{mem_delta}</td>
+              <td>{b_peak}</td>
+              <td>{warm_peak}</td>
+              <td class="{peak_class}">{peak_delta}</td>
+              <td class="{active_class}">{active_delta}</td>
+              <td class="{cache_class}">{cache_delta}</td>
               <td><span class="decision {class_name}">{decision}</span><div class="muted">{reason}</div></td>
             </tr>
             """.format(
-                optimizer=h(optimizer),
+                optimizer=h(optimizer_label(baseline or warm or cold, dtype=dtype, optimizer=optimizer)),
+                optimizer_hint=h(optimizer_class_hint(baseline or warm or cold)),
                 b_tok=fmt_num(baseline.tok_sec if baseline else None),
                 cold_tok=fmt_num(cold.tok_sec if cold else None),
                 warm_tok=fmt_num(warm.tok_sec if warm else None),
@@ -311,10 +403,14 @@ def render_comparison_table(rows: list[Row], dtype: str, tolerance: float) -> st
                 warm_ratio=fmt_ratio(warm_ratio),
                 cold_ratio_class=ratio_class(cold_ratio, tolerance),
                 warm_ratio_class=ratio_class(warm_ratio, tolerance),
-                b_mem=fmt_num(baseline.peak_memory_gb if baseline else None, 2),
-                warm_mem=fmt_num(warm.peak_memory_gb if warm else None, 2),
-                mem_delta=fmt_signed(mem_delta, " GB"),
-                mem_class="bad-number" if mem_delta is not None and mem_delta > 0 else "",
+                b_peak=fmt_num(baseline.peak_memory_gb if baseline else None, 2),
+                warm_peak=fmt_num(warm.peak_memory_gb if warm else None, 2),
+                peak_delta=fmt_signed(peak_delta, " GiB"),
+                active_delta=fmt_signed(active_delta, " GiB"),
+                cache_delta=fmt_signed(cache_delta, " GiB"),
+                peak_class="bad-number" if peak_delta is not None and peak_delta > 0 else "",
+                active_class="bad-number" if active_delta is not None and active_delta > 0.25 else "",
+                cache_class="bad-number" if cache_delta is not None and cache_delta > 0 else "",
                 class_name=class_name,
                 decision=h(decision),
                 reason=h(reason),
@@ -336,9 +432,11 @@ def render_comparison_table(rows: list[Row], dtype: str, tolerance: float) -> st
                 <th>Path C warm tok/s</th>
                 <th>Cold / B</th>
                 <th>Warm / B</th>
-                <th>Path B GB</th>
-                <th>Warm C GB</th>
-                <th>Memory delta</th>
+                <th>Path B peak GiB</th>
+                <th>Warm C peak GiB</th>
+                <th>Peak allocator delta</th>
+                <th>Active delta</th>
+                <th>Cache delta</th>
                 <th>Default decision</th>
               </tr>
             </thead>
@@ -385,15 +483,16 @@ def render_methodology(payload: dict[str, Any], tolerance: float) -> str:
               <li>Model profile: <code>local_gb10_quarter</code>, the 13-layer hybrid profile used by the M0.4 GB10 work.</li>
               <li>Dataset: real parquet target shard <code>data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet</code>.</li>
               <li>Shape: batch <code>{batch_size}</code>, sequence length <code>{block_size}</code>, measured training steps <code>{steps}</code>, gradient checkpointing enabled by the matrix command.</li>
-              <li>Optimizers: <code>adamw</code>, <code>lion</code>, <code>muon</code>, and <code>muon_adamw</code>.</li>
+              <li>Optimizer axes: <code>adamw</code>, <code>lion</code>, <code>muon</code>, and <code>muon_adamw</code>. The tables also show the runtime optimizer class, so BF16/FP8 Lion appears as <code>lion16</code> and INT8 Lion appears as <code>lion8bit</code>.</li>
             </ul>
           </div>
           <div>
             <h3>Measurements</h3>
             <ul>
               <li><strong>tok/s</strong> is the receipt-level mean target-token throughput from <code>scripts/m04_train_step.py</code>.</li>
-              <li><strong>compile s</strong> is the first recorded step time, used as the compile/warmup cost indicator.</li>
-              <li><strong>peak GB</strong> is MLX/Metal peak memory from the per-cell receipt.</li>
+              <li><strong>first step s</strong> is the first recorded step, used as the compile/warmup cost indicator. <strong>steady s</strong> is the mean over the remaining steps.</li>
+              <li><strong>peak GiB</strong> is MLX/Metal allocator high-water from the per-cell receipt, not live tensor residency.</li>
+              <li><strong>active/cache GiB</strong> are the receipt's post-run active and allocator-cache memory; these separate real live tensor growth from cache/compile pressure.</li>
               <li><strong>Warm / B</strong> is <code>Path C warm tok/s / Path B tok/s</code>. Default promotion requires at least <code>{threshold:.0%}</code>.</li>
             </ul>
           </div>
@@ -438,15 +537,15 @@ def render_route_legend() -> str:
           </div>
           <div class="route-card">
             <h3>BF16 Path C</h3>
-            <p>Runs <code>--dtype bfloat16</code> with <code>CPPMEGA_KERNEL_PATH=path_c</code>. Cold rows clear/use an empty TileLang cache; warm rows reuse the per-dtype optimizer TileLang cache.</p>
+            <p>Runs <code>--dtype bfloat16</code> with <code>CPPMEGA_KERNEL_PATH=path_c</code> and <code>CPPMEGA_MAMBA3_PATH_C_BWD=path_b</code>. Mamba3 uses Path C forward with the production Path B backward to avoid the long-sequence state-snapshot allocator blow-up; M2RNN remains full Path C.</p>
           </div>
           <div class="route-card">
             <h3>FP8 Path B</h3>
-            <p>Runs <code>--dtype fp8_path_b</code> and forces <code>CPPMEGA_KERNEL_PATH__SPARSE_MLA=path_b</code>. The DSA Sparse-MLA baseline dispatch is recorded as <code>sparse_mla_fp8_reference_path_b</code>; it is an honest non-Path-C FP8 training baseline, not a Path C fallback.</p>
+            <p>Runs <code>--dtype fp8_path_b</code> and forces <code>CPPMEGA_KERNEL_PATH__SPARSE_MLA=path_b</code> plus <code>CPPMEGA_SPARSE_MLA_FP8_ROUTE=path_b</code>. The DSA Sparse-MLA baseline dispatch is recorded as <code>sparse_mla_fp8_reference_path_b</code>; it is an honest non-Path-C FP8 training baseline, not a Path C fallback.</p>
           </div>
           <div class="route-card">
             <h3>FP8 Path C</h3>
-            <p>Runs <code>--dtype fp8_path_c</code> and forces Path C for Mamba3, M2RNN, and Sparse-MLA. Sparse-MLA consumes prepared <code>q_fp8/q_scale/kv_fp8/kv_scale</code> buffers through the TileLang/tvm-ffi route.</p>
+            <p>Runs <code>--dtype fp8_path_c</code>, <code>CPPMEGA_SPARSE_MLA_FP8_ROUTE=path_c</code>, and the same Mamba3 Path C forward + Path B backward training policy. Sparse-MLA consumes prepared <code>q_fp8/q_scale/kv_fp8/kv_scale</code> buffers through the TileLang/tvm-ffi route.</p>
           </div>
         </div>
       </section>
@@ -480,13 +579,35 @@ def render_current_findings(rows: list[Row], dtypes: tuple[str, ...], tolerance:
                 </li>
                 """.format(
                     dtype=h(dtype),
-                    optimizer=h(optimizer),
+                    optimizer=h(optimizer_label(baseline or warm, dtype=dtype, optimizer=optimizer)),
                     ratio=fmt_ratio(ratio),
                     class_name=class_name,
                     decision=h(decision),
                     reason=h(reason),
                 )
             )
+    good_rows = []
+    for dtype in dtypes:
+        for optimizer in optimizer_order(rows, dtype):
+            baseline = keyed.get((dtype, optimizer, "path_b"))
+            warm = keyed.get((dtype, optimizer, "path_c_warm"))
+            decision, class_name, _ = decision_for(
+                warm=warm,
+                baseline=baseline,
+                tolerance=tolerance,
+            )
+            if class_name == "decision-good":
+                good_rows.append((dtype, optimizer, decision))
+    if good_rows:
+        headline = (
+            f"{len(good_rows)} row(s) qualify for Path C under the "
+            f"{tolerance:.0%} same-speed rule; see details below."
+        )
+    else:
+        headline = (
+            "No rendered dtype/optimizer row qualifies for Path C as the default "
+            f"under the {tolerance:.0%} same-speed rule."
+        )
     return """
       <section class="panel narrative">
         <div class="section-head">
@@ -494,18 +615,98 @@ def render_current_findings(rows: list[Row], dtypes: tuple[str, ...], tolerance:
           <p>Generated directly from the matrix ratios below.</p>
         </div>
         <div class="callout">
-          <strong>Current result:</strong> no BF16 or FP8 optimizer row qualifies
-          for Path C as the default under the {tolerance:.0%} same-speed rule.
-          Keep Path B as default until warm Path C reaches at least {threshold:.0%}
+          <strong>Current result:</strong> {headline}
+          Default promotion requires warm Path C to reach at least {threshold:.0%}
           of Path B tok/s on the same 1B training workload.
         </div>
         <ul class="finding-list">{items}</ul>
       </section>
     """.format(
-        tolerance=tolerance,
+        headline=h(headline),
         threshold=1.0 - tolerance,
         items="\n".join(lines),
     )
+
+
+def kernel_counts_text(row: Row | None) -> str:
+    if not row:
+        return "-"
+    counts = row.selected_schedule.get("kernel_counts")
+    if not isinstance(counts, dict) or not counts:
+        return "-"
+    return ", ".join(f"{h(key)} x{h(value)}" for key, value in sorted(counts.items()))
+
+
+def render_profile_table(rows: list[Row], dtype: str) -> str:
+    keyed = rows_by_key(rows)
+    body: list[str] = []
+    for optimizer in optimizer_order(rows, dtype):
+        baseline = keyed.get((dtype, optimizer, "path_b"))
+        warm = keyed.get((dtype, optimizer, "path_c_warm"))
+        steady_delta = None
+        if warm and baseline and warm.step_sec is not None and baseline.step_sec is not None:
+            steady_delta = warm.step_sec - baseline.step_sec
+        body.append(
+            """
+            <tr>
+              <th>{optimizer}</th>
+              <td>{b_first}</td>
+              <td>{c_first}</td>
+              <td>{b_step}</td>
+              <td>{c_step}</td>
+              <td>{b_median}</td>
+              <td>{c_median}</td>
+              <td class="{step_class}">{step_delta}</td>
+              <td>{b_kernels}</td>
+              <td>{c_kernels}</td>
+              <td>{active_delta}</td>
+              <td>{cache_delta}</td>
+            </tr>
+            """.format(
+                optimizer=h(optimizer_label(baseline or warm, dtype=dtype, optimizer=optimizer)),
+                b_first=fmt_num(baseline.first_step_sec if baseline else None, 3),
+                c_first=fmt_num(warm.first_step_sec if warm else None, 3),
+                b_step=fmt_num(baseline.step_sec if baseline else None, 3),
+                c_step=fmt_num(warm.step_sec if warm else None, 3),
+                b_median=fmt_num(baseline.median_step_sec if baseline else None, 3),
+                c_median=fmt_num(warm.median_step_sec if warm else None, 3),
+                step_delta=fmt_signed(steady_delta, " s"),
+                step_class="bad-number" if steady_delta is not None and steady_delta > 0 else "good-number",
+                b_kernels=kernel_counts_text(baseline),
+                c_kernels=kernel_counts_text(warm),
+                active_delta=fmt_signed(memory_delta(warm, baseline, "active_memory_gb"), " GiB"),
+                cache_delta=fmt_signed(memory_delta(warm, baseline, "cache_memory_gb"), " GiB"),
+            )
+        )
+    return """
+      <section class="panel">
+        <div class="section-head">
+          <h2>{dtype} dispatch profile</h2>
+          <p>Receipt-level profiling: steady step time, runtime kernel dispatch counts, and active/cache memory deltas. GPU-counter traces are separate artifacts; this table is the parsed training receipt evidence.</p>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Optimizer</th>
+                <th>Path B first step s</th>
+                <th>Warm C first step s</th>
+                <th>Path B steady s</th>
+                <th>Warm C steady s</th>
+                <th>Path B median s</th>
+                <th>Warm C median s</th>
+                <th>Step delta</th>
+                <th>Path B kernels</th>
+                <th>Warm C kernels</th>
+                <th>Active delta</th>
+                <th>Cache delta</th>
+              </tr>
+            </thead>
+            <tbody>{body}</tbody>
+          </table>
+        </div>
+      </section>
+    """.format(dtype=h(dtype.upper()), body="\n".join(body))
 
 
 def render_cell_table(rows: list[Row], dtype: str) -> str:
@@ -524,23 +725,33 @@ def render_cell_table(rows: list[Row], dtype: str) -> str:
             """
             <tr>
               <th>{case_id}</th>
+              <td>{optimizer}</td>
               <td>{path}</td>
               <td><span class="pill {status_class}">{status}</span></td>
+              <td>{steps_completed}</td>
               <td>{tok}</td>
-              <td>{compile}</td>
+              <td>{first_step}</td>
+              <td>{steady_step}</td>
               <td>{peak}</td>
+              <td>{active}</td>
+              <td>{cache_mem}</td>
               <td>{cache}</td>
               <td>{route}</td>
               <td>{reason}</td>
             </tr>
             """.format(
                 case_id=h(row.case_id),
+                optimizer=h(optimizer_label(row, dtype=dtype, optimizer=row.optimizer)),
                 path=h(path_label(row.path)),
                 status_class=css_class_for_status(row.status),
                 status=h(row.status),
+                steps_completed=h(row.steps_completed),
                 tok=fmt_num(row.tok_sec),
-                compile=fmt_num(row.compile_time_s, 2),
+                first_step=fmt_num(row.first_step_sec, 2),
+                steady_step=fmt_num(row.step_sec, 2),
                 peak=fmt_num(row.peak_memory_gb, 2),
+                active=fmt_num(row.active_memory_gb, 2),
+                cache_mem=fmt_num(row.cache_memory_gb, 2),
                 cache=h(row.cache_hit),
                 route=h(route),
                 reason=h(row.pass_fail_reason),
@@ -557,11 +768,16 @@ def render_cell_table(rows: list[Row], dtype: str) -> str:
             <thead>
               <tr>
                 <th>Case</th>
+                <th>Runtime optimizer</th>
                 <th>Path</th>
                 <th>Status</th>
+                <th>Steps</th>
                 <th>tok/s</th>
-                <th>compile s</th>
+                <th>first step s</th>
+                <th>steady step s</th>
                 <th>peak GB</th>
+                <th>active GiB</th>
+                <th>cache GiB</th>
                 <th>cache hit</th>
                 <th>route proof</th>
                 <th>reason</th>
@@ -605,6 +821,11 @@ def render_html(payload: dict[str, Any], rows: list[Row], dtypes: tuple[str, ...
     ]
     sections.extend(
         render_comparison_table(rows, dtype, tolerance)
+        for dtype in dtypes
+        if any(row.dtype == dtype for row in rows)
+    )
+    sections.extend(
+        render_profile_table(rows, dtype)
         for dtype in dtypes
         if any(row.dtype == dtype for row in rows)
     )
