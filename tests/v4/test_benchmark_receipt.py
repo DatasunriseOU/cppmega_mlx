@@ -46,9 +46,9 @@ def test_measure_cell_kda_returns_receipt():
 
 
 def test_measure_cell_deferred_path_marks_unavailable():
-    """Path B is currently unavailable; receipt should reflect that."""
+    """Path C is currently unavailable; receipt should reflect that."""
     shape = CellShape(
-        block="gdn", path="path_b", batch=1, seq_len=2,
+        block="gdn", path="path_c", batch=1, seq_len=2,
         num_heads=2, head_dim_k=4, head_dim_v=4,
     )
     receipt = measure_cell(shape)
