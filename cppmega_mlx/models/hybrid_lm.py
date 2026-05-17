@@ -522,8 +522,18 @@ class HybridTinyBlock(nn.Module):
         *,
         kv_cache: ContiguousKVCache | None = None,
         attention_layer_idx: int | None = None,
+        doc_ids: mx.array | None = None,
     ) -> mx.array:
-        """Return this route's pre-residual contribution for regression tests."""
+        """Return this route's pre-residual contribution for regression tests.
+
+        ``doc_ids`` is the raw ``(B, S)`` int32 document boundary tensor. Only
+        the ``engram`` backend currently consumes it (to prevent n-gram
+        aggregation from crossing packed document boundaries). The
+        ``attention`` backend has its own additive-mask channel (``mask``) for
+        the same purpose, and the remaining backends (``mamba3``, ``moe``,
+        ``m2rnn``, ``concept``) do not yet support document-aware routing in
+        this repo, so they silently ignore ``doc_ids``.
+        """
 
         self.validate_backend()
         if kv_cache is not None and self.backend != "attention":
@@ -550,7 +560,7 @@ class HybridTinyBlock(nn.Module):
             else:
                 delta, _ = m2rnn(x)
         elif self.backend == "engram":
-            delta = cast(EngramBranch, self.block)(x)
+            delta = cast(EngramBranch, self.block)(x, doc_ids=doc_ids)
         elif self.backend == "concept":
             delta = cast(ConceptBlock, self.block)(x)
         else:  # pragma: no cover - self.backend is fixed during construction.
@@ -732,7 +742,12 @@ class HybridTinyLM(nn.Module):
                 )
         if self.config.grad_checkpoint:
             for layer in self.layers:
-                hidden_states = mx.checkpoint(layer)(hidden_states, mask)
+                if layer.backend == "engram" and document_ids is not None:
+                    hidden_states = mx.checkpoint(layer)(
+                        hidden_states, mask, doc_ids=document_ids
+                    )
+                else:
+                    hidden_states = mx.checkpoint(layer)(hidden_states, mask)
         else:
             attention_layer_idx = 0
             for layer in self.layers:
@@ -744,6 +759,10 @@ class HybridTinyLM(nn.Module):
                         attention_layer_idx=attention_layer_idx if kv_cache is not None else None,
                     )
                     attention_layer_idx += 1
+                elif layer.backend == "engram":
+                    hidden_states = layer(
+                        hidden_states, mask, doc_ids=document_ids
+                    )
                 else:
                     hidden_states = layer(hidden_states, mask)
         return self.norm(hidden_states)
