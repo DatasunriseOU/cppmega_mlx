@@ -97,29 +97,35 @@ def _path_b_call(*args, **kwargs):
 
 def _path_c_status() -> PathStatus:
     try:
-        importlib.import_module("tilelang")
+        from cppmega_v4._tilelang.linear_attention_path_c import (
+            _path_c_runtime_status,
+        )
     except Exception as exc:
         return PathStatus(
-            path="path_c",
-            available=False,
-            reason=f"tilelang not importable: {exc}",
+            path="path_c", available=False,
+            reason=f"path_c module not importable: {exc}",
         )
-    # tilelang importable, but the GDN PrimFunc -> Metal lowering isn't wired
-    # through cppmega_v4 yet — mirror mamba3_path_c.py structure when we land it.
+    ok, reason = _path_c_runtime_status()
     return PathStatus(
-        path="path_c",
-        available=False,
+        path="path_c", available=ok,
         reason=(
-            "TileLang importable but GDN Path C wiring pending: copy skeleton "
-            "from cppmega_mlx/nn/_tilelang/mamba3_path_c.py, lift "
-            "tilelang/examples/gdn/example_chunk_delta_h.py etc. via "
-            "tilelang.compile(target='metal', execution_backend='tvm_ffi')"
+            f"GDN Path C: TileLang DSL @T.prim_func → tilelang.compile("
+            f"target='metal', execution_backend='tvm_ffi'). {reason}"
         ),
     )
 
 
 def _path_c_call(*args, **kwargs):
-    return _path_a_call(*args, **kwargs)  # fallback
+    """Try Path C; fall back to Path A on any error (compile, runtime, missing infra)."""
+    if not _path_c_status().available:
+        return _path_a_call(*args, **kwargs)
+    try:
+        from cppmega_v4._tilelang.linear_attention_path_c import (
+            _gdn_fwd_path_c_call,
+        )
+        return _gdn_fwd_path_c_call(*args, **kwargs)
+    except Exception:
+        return _path_a_call(*args, **kwargs)
 
 
 # --- Path D (Triton frontend) ---------------------------------------------
