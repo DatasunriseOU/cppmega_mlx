@@ -307,9 +307,9 @@ def _dispatch_m2rnn_scan(
 ) -> tuple[mx.array, mx.array]:
     """Route the M2RNN scan according to :class:`KernelPath`.
 
-    REFERENCE and AUTO use the pure-MLX :func:`chunked_m2rnn_scan`. PATH_C is
-    explicit and fail-closed. PATH_B is retired and raises instead of
-    re-entering direct MSL.
+    AUTO/PATH_B use the Path B Metal kernel when available. REFERENCE always
+    uses the pure-MLX :func:`chunked_m2rnn_scan`. PATH_C is explicit and
+    fail-closed.
     """
 
     from cppmega_mlx.runtime.kernel_policy import (
@@ -362,10 +362,31 @@ def _dispatch_m2rnn_scan(
         record_dispatch("m2rnn", path, "reference_pure_mlx")
         return chunked_m2rnn_scan(q, k, v, W, xf, h0=h0, chunk_size=chunk_size)
 
-    if path is KernelPath.PATH_B:
+    from cppmega_mlx.nn._tilelang.m2rnn import (
+        m2rnn_apply_with_state,
+        m2rnn_metal_status,
+    )
+
+    status = m2rnn_metal_status(q)
+    if path is KernelPath.PATH_B and not status.available:
         raise RuntimeError(
-            "m2rnn: Path B direct-MSL kernel is retired; use Path C or ref"
+            f"m2rnn: Path B kernel unavailable ({status.reason})"
         )
+    if status.available:
+        q_b, k_b, v_b, W_b, xf_b = broadcast_m2rnn_heads(q, k, v, W, xf)
+        batch, _seq, heads, k_dim = q_b.shape
+        v_dim = v_b.shape[-1]
+        h0_full = _initial_m2rnn_state(
+            h0,
+            batch=batch,
+            heads=heads,
+            k_dim=k_dim,
+            v_dim=v_dim,
+            dtype=q_b.dtype,
+        )
+        out, h = m2rnn_apply_with_state(q_b, k_b, v_b, W_b, xf_b, h0_full)
+        record_dispatch("m2rnn", path, "metal_kernel_fwd_v1")
+        return out, h
 
     record_dispatch("m2rnn", path, "reference_pure_mlx")
     return chunked_m2rnn_scan(q, k, v, W, xf, h0=h0, chunk_size=chunk_size)
@@ -727,10 +748,6 @@ class M2RNNMixer(nn.Module):
                         used_path_c = True
 
         if not used_path_c:
-            if path is KernelPath.PATH_B:
-                raise RuntimeError(
-                    "m2rnn: Path B direct-MSL kernel is retired; use Path C or ref"
-                )
             q = conv_input[:, :, :q_end].reshape(batch, seq, cfg.num_q_heads, cfg.k_head_dim)
             k = conv_input[:, :, q_end:k_end].reshape(batch, seq, cfg.num_k_heads, cfg.k_head_dim)
             v = conv_input[:, :, k_end:v_end].reshape(batch, seq, cfg.num_v_heads, cfg.v_head_dim)

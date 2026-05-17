@@ -470,6 +470,7 @@ class HybridTinyBlock(nn.Module):
         *,
         kv_cache: ContiguousKVCache | None = None,
         attention_layer_idx: int | None = None,
+        doc_ids: mx.array | None = None,
     ) -> mx.array:
         self.validate_backend()
         residual = hidden_states
@@ -478,6 +479,7 @@ class HybridTinyBlock(nn.Module):
             mask,
             kv_cache=kv_cache,
             attention_layer_idx=attention_layer_idx,
+            doc_ids=doc_ids,
         )
         updated = residual + delta
         if self.mhc is not None:

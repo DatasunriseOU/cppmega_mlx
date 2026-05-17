@@ -4162,16 +4162,78 @@ def _m2rnn_mapped_packed_bwd_path_c_kernel(
     dy_dtype = _tl_dtype_for(dy.dtype)
     if dy_dtype is None:
         return None
-    return _m2rnn_mapped_packed_reference_bwd(
+    try:
+        batch, seq, conv_dim = conv_input.shape
+        total_heads = h0.shape[1]
+        k_dim = h0.shape[2]
+        v_dim = h0.shape[3]
+        w_heads = W.shape[0]
+        f_heads = xf.shape[-1]
+        if conv_dim != _mapped_conv_dim(q_heads, k_heads, v_heads, k_dim, v_dim):
+            return None
+        if dy.shape != (batch, seq, total_heads, v_dim):
+            raise ValueError(f"dy must be {(batch, seq, total_heads, v_dim)}, got {dy.shape}")
+        if tanh_cache.shape != (batch, seq, total_heads, k_dim, v_dim):
+            raise ValueError(
+                "tanh_cache must be "
+                f"{(batch, seq, total_heads, k_dim, v_dim)}, got {tanh_cache.shape}"
+            )
+        if batch != 1:
+            return None
+        if seq == 0:
+            return (
+                mx.zeros_like(conv_input).astype(mx.float32),
+                mx.zeros_like(W).astype(mx.float32),
+                mx.zeros_like(xf).astype(mx.float32),
+                mx.zeros_like(h0).astype(mx.float32),
+            )
+        kernel, lowering = _mapped_packed_bwd_kernel_for(
+            batch,
+            seq,
+            total_heads,
+            int(q_heads),
+            int(k_heads),
+            int(v_heads),
+            w_heads,
+            f_heads,
+            k_dim,
+            v_dim,
+            carrier_dtype,
+            dy_dtype,
+            "float32",
+        )
+    except Exception:
+        return None
+
+    del lowering
+    outputs: M2RNNPackedBwdOwnerOutputs = (
+        mx.zeros(conv_input.shape, dtype=mx.float32),
+        mx.zeros(W.shape, dtype=mx.float32),
+        mx.zeros(xf.shape, dtype=mx.float32),
+        mx.zeros(h0.shape, dtype=mx.float32),
+        mx.zeros(
+            (batch, total_heads, seq, k_dim, v_dim),
+            dtype=conv_input.dtype,
+        ),
+    )
+    _materialize_atomic_add_owner_outputs(outputs[0], outputs[1], outputs[2], outputs[3])
+    returned = kernel(
         dy,
         conv_input,
         W,
         xf,
         h0,
-        q_heads=q_heads,
-        k_heads=k_heads,
-        v_heads=v_heads,
+        tanh_cache,
+        out=outputs,
     )
+    mx.eval(*returned)
+    mx.synchronize()
+    if not all(got is expected for got, expected in zip(returned, outputs, strict=True)):
+        raise RuntimeError(
+            "mapped packed M2RNN Path C bwd tvm-ffi did not return caller-owned outputs"
+        )
+    dconv_input, dW, dxf, dh0, _scratch = outputs
+    return dconv_input, dW, dxf, dh0
 
 
 def m2rnn_mapped_packed_bwd_path_c(
@@ -4981,24 +5043,6 @@ def _mapped_packed_post_apply_for_layout(
         del output
         conv_input, W, xf, h0, D, projected = primals
         dpost = cotangent[0]
-        if any(
-            array.dtype != mx.float32
-            for array in (conv_input, W, xf, h0, D, projected, dpost)
-        ):
-            grads = _m2rnn_mapped_packed_post_reference_bwd(
-                dpost,
-                conv_input,
-                W,
-                xf,
-                h0,
-                D,
-                projected,
-                q_heads=q_heads,
-                k_heads=k_heads,
-                v_heads=v_heads,
-                g_heads=g_heads,
-            )
-            return _match_primal_gradient_dtypes(grads, primals)
         full = _m2rnn_mapped_packed_post_fwd_path_c_full(
             conv_input,
             W,
@@ -5025,8 +5069,11 @@ def _mapped_packed_post_apply_for_layout(
                 g_heads=g_heads,
             )
         _post, _h_last, tanh_cache = full
+        dpost_for_kernel = (
+            dpost if dpost.dtype == conv_input.dtype else dpost.astype(conv_input.dtype)
+        )
         post_grads = _m2rnn_inline_post_bwd_path_c_kernel(
-            dpost,
+            dpost_for_kernel,
             conv_input,
             xf,
             h0,
@@ -5039,7 +5086,8 @@ def _mapped_packed_post_apply_for_layout(
             g_heads=g_heads,
         )
         if post_grads is None:
-            _raise_mapped_packed_post_path_c_unavailable(
+            grads = _m2rnn_mapped_packed_post_reference_bwd(
+                dpost,
                 conv_input,
                 W,
                 xf,
@@ -5051,6 +5099,7 @@ def _mapped_packed_post_apply_for_layout(
                 v_heads=v_heads,
                 g_heads=g_heads,
             )
+            return _match_primal_gradient_dtypes(grads, primals)
         dy_recurrent, dconv_post, dD, dprojected = post_grads
         dconv_recurrent, dW, dxf, dh0 = m2rnn_mapped_packed_bwd_path_c(
             dy_recurrent,
@@ -5148,8 +5197,11 @@ def _post_residual_gate_apply_for_layout(
     ) -> tuple[mx.array, ...]:
         del output
         y, conv_input, D, projected = primals
+        cotangent_for_kernel = (
+            cotangent if cotangent.dtype == y.dtype else cotangent.astype(y.dtype)
+        )
         grads = m2rnn_post_residual_gate_bwd_path_c(
-            cotangent,
+            cotangent_for_kernel,
             y,
             conv_input,
             D,

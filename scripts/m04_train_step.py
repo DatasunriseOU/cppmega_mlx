@@ -164,6 +164,11 @@ FP8_PATH_C_RUNTIME_ENV: dict[str, str] = {
     MAMBA3_PATH_C_BWD_ENV: "path_b",
 }
 FP8_PATH_B_RUNTIME_ENV: dict[str, str] = {SPARSE_MLA_FP8_ROUTE_ENV: "path_b"}
+FP8_PATH_C_SPLIT_GRAD_UPDATE_EVAL_REASON = (
+    "Path C runs custom TileLang VJP nodes inside the same eager train step as "
+    "optimizer.update; splitting the eval at the gradient/update boundary keeps "
+    "backward activations out of the optimizer update peak."
+)
 FP8_PATH_C_ROUTE_BLOCKER_REASON = (
     "FP8 Path C has an m04 route for prepared Sparse-MLA Path C model ops, "
     "Mamba3 TileLang Path C selective scan, and M2RNN TileLang Path C recurrence. "
@@ -2077,6 +2082,7 @@ def run_local_gb10_quarter_training(
             state={"step": 0, "trained_tokens": 0},
             loss_fn=loss_fn,
             compile=bool(compile_plan["enabled"]),
+            split_grad_update_eval=fp8_path_c_route_requested(config),
         )
         clear_cache_events: list[dict[str, Any]] = []
         step_metrics: list[dict[str, Any]] = []
@@ -2142,6 +2148,12 @@ def run_local_gb10_quarter_training(
             "compile_enabled": compile_plan["enabled"],
             "compile_plan": compile_plan,
             "loss_eval_chunks": loss_eval_chunks,
+            "split_grad_update_eval": fp8_path_c_route_requested(config),
+            "split_grad_update_eval_reason": (
+                FP8_PATH_C_SPLIT_GRAD_UPDATE_EVAL_REASON
+                if fp8_path_c_route_requested(config)
+                else None
+            ),
             "dtype": config.dtype,
             "dataset": dataset_payload(dataset, config),
             "device": device,
@@ -3926,13 +3938,15 @@ def throughput_interpretation_payload(
     )
 
 
-def reset_peak_memory() -> None:
+def reset_peak_memory() -> bool:
     if hasattr(mx, "reset_peak_memory"):
         mx.reset_peak_memory()
-        return
+        return True
     metal = getattr(mx, "metal", None)
     if metal is not None and hasattr(metal, "reset_peak_memory"):
         metal.reset_peak_memory()
+        return True
+    return False
 
 
 def metal_memory_payload() -> dict[str, Any]:

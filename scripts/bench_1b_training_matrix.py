@@ -38,8 +38,16 @@ DEFAULT_JSON = Path("/tmp/cppmega_1b_path_matrix.json")
 DEFAULT_WORK_DIR = Path("/tmp/cppmega_1b_path_matrix_cells")
 DEFAULT_CACHE_DIR = Path("/tmp/cppmega_1b_path_matrix_tilelang_cache")
 
-DTYPE_CHOICES = ("bf16", "fp8", "int8")
-OPTIMIZER_CHOICES = ("adamw", "lion", "muon", "muon_adamw")
+DTYPE_CHOICES = ("bf16", "fp8")
+OPTIMIZER_CHOICES = (
+    "adamw",
+    "adam8bit",
+    "lion",
+    "lion8bit",
+    "muon",
+    "muon_adamw",
+    "muon_int8",
+)
 PATH_CHOICES = ("path_b", "path_c_cold", "path_c_warm")
 STATUS_OK = "ok"
 STATUS_FAILED = "failed"
@@ -199,17 +207,22 @@ def dtype_optimizer_mapping(
     *,
     path: str,
 ) -> tuple[str, str, bool, str | None]:
+    optimizer_map = {
+        "adamw": "adamw",
+        "adam8bit": "adam8bit",
+        "lion": "lion",
+        "lion8bit": "lion8bit",
+        "muon": "muon",
+        "muon_adamw": "muon_adamw",
+        "muon_int8": "int8",
+    }
+    cli_optimizer = optimizer_map.get(optimizer)
+    if cli_optimizer is None:
+        return "bfloat16", optimizer, False, f"unsupported optimizer {optimizer!r}"
     if dtype == "bf16":
-        return "bfloat16", optimizer, True, None
+        return "bfloat16", cli_optimizer, True, None
     if dtype == "fp8":
-        return ("fp8_path_b" if path == "path_b" else "fp8_path_c"), optimizer, True, None
-    if dtype == "int8":
-        if optimizer in {"muon", "muon_adamw"}:
-            return "bfloat16", "int8", True, None
-        if optimizer == "adamw":
-            return "bfloat16", "adam8bit", True, None
-        if optimizer == "lion":
-            return "bfloat16", "lion8bit", True, None
+        return ("fp8_path_b" if path == "path_b" else "fp8_path_c"), cli_optimizer, True, None
     return "bfloat16", optimizer, False, f"unsupported dtype/optimizer pair {dtype}/{optimizer}"
 
 
@@ -222,7 +235,9 @@ def path_env_and_support(
     if dtype == "fp8" and path == "path_b":
         return (
             {
-                "CPPMEGA_KERNEL_PATH": "auto",
+                "CPPMEGA_KERNEL_PATH": "path_b",
+                "CPPMEGA_KERNEL_PATH__MAMBA3_MIMO": "path_b",
+                "CPPMEGA_KERNEL_PATH__M2RNN": "path_b",
                 "CPPMEGA_KERNEL_PATH__SPARSE_MLA": "path_b",
                 SPARSE_MLA_FP8_ROUTE_ENV: "path_b",
             },
@@ -233,7 +248,12 @@ def path_env_and_support(
         )
     if path == "path_b":
         return (
-            {"CPPMEGA_KERNEL_PATH": "auto"},
+            {
+                "CPPMEGA_KERNEL_PATH": "path_b",
+                "CPPMEGA_KERNEL_PATH__MAMBA3_MIMO": "path_b",
+                "CPPMEGA_KERNEL_PATH__M2RNN": "path_b",
+                "CPPMEGA_KERNEL_PATH__SPARSE_MLA": "path_b",
+            },
             True,
             None,
             "not_applicable",

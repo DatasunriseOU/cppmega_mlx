@@ -14,7 +14,7 @@ from typing import Any
 
 DEFAULT_INPUT = Path("/tmp/cppmega_1b_path_matrix.json")
 DEFAULT_OUTPUT = Path("/tmp/cppmega_1b_path_matrix.html")
-DEFAULT_DTYPES = ("bf16", "fp8", "int8")
+DEFAULT_DTYPES = ("bf16", "fp8")
 PATH_ORDER = ("path_b", "path_c_cold", "path_c_warm")
 
 
@@ -212,7 +212,15 @@ def rows_by_key(rows: Iterable[Row]) -> dict[tuple[str, str, str], Row]:
 
 
 def optimizer_order(rows: Iterable[Row], dtype: str) -> list[str]:
-    order = ("adamw", "lion", "muon", "muon_adamw")
+    order = (
+        "adamw",
+        "adam8bit",
+        "lion",
+        "lion8bit",
+        "muon",
+        "muon_adamw",
+        "muon_int8",
+    )
     present = {row.optimizer for row in rows if row.dtype == dtype}
     return [value for value in order if value in present] + sorted(present - set(order))
 
@@ -222,21 +230,26 @@ def optimizer_label(row: Row | None, *, dtype: str, optimizer: str) -> str:
 
     key = (row.optimizer_key if row else None) or (row.cli_optimizer if row else None)
     name = row.optimizer_name if row else None
-    if dtype == "int8":
-        labels = {
-            "adamw": "adam8bit",
-            "lion": "lion8bit",
-            "muon": "muon-int8",
-            "muon_adamw": "muon-int8",
-        }
-        axis_label = labels.get(optimizer, optimizer)
-    elif optimizer == "lion":
-        axis_label = "lion16"
-    elif optimizer == "adamw":
-        axis_label = "adamw16"
-    else:
-        axis_label = optimizer
-    if key and key != optimizer:
+    labels = {
+        "adamw": "adamw16",
+        "adam8bit": "adam8bit",
+        "lion": "lion16",
+        "lion8bit": "lion8bit",
+        "muon": "muon",
+        "muon_adamw": "muon_adamw",
+        "muon_int8": "muon-int8",
+    }
+    axis_label = labels.get(optimizer, optimizer)
+    expected_keys = {
+        "adamw": {"adamw"},
+        "adam8bit": {"adam8bit"},
+        "lion": {"lion"},
+        "lion8bit": {"lion8bit"},
+        "muon": {"muon", "muon_adamw"},
+        "muon_adamw": {"muon_adamw"},
+        "muon_int8": {"int8"},
+    }
+    if key and key not in expected_keys.get(optimizer, {optimizer}):
         return f"{axis_label} ({key})"
     if name and name.lower() != axis_label.lower():
         return f"{axis_label} ({name})"
@@ -483,7 +496,7 @@ def render_methodology(payload: dict[str, Any], tolerance: float) -> str:
               <li>Model profile: <code>local_gb10_quarter</code>, the 13-layer hybrid profile used by the M0.4 GB10 work.</li>
               <li>Dataset: real parquet target shard <code>data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet</code>.</li>
               <li>Shape: batch <code>{batch_size}</code>, sequence length <code>{block_size}</code>, measured training steps <code>{steps}</code>, gradient checkpointing enabled by the matrix command.</li>
-              <li>Optimizer axes: <code>adamw</code>, <code>lion</code>, <code>muon</code>, and <code>muon_adamw</code>. The tables also show the runtime optimizer class, so BF16/FP8 Lion appears as <code>lion16</code> and INT8 Lion appears as <code>lion8bit</code>.</li>
+              <li>Optimizer axes: <code>adamw</code>, <code>adam8bit</code>, <code>lion</code>, <code>lion8bit</code>, <code>muon</code>, <code>muon_adamw</code>, and <code>muon_int8</code>. The tables also show the runtime optimizer class, so <code>lion</code> means fp32-moment Lion16 while <code>lion8bit</code> is the quantized optimizer that previously reached the 900 tok/s-class baseline.</li>
             </ul>
           </div>
           <div>

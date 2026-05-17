@@ -171,9 +171,12 @@ class CompiledPretrainingStep:
         loss_fn: LossFn = next_token_cross_entropy,
         compile: bool = True,
         grad_accum_steps: int = 1,
+        split_grad_update_eval: bool = False,
     ):
         if not isinstance(compile, bool):
             raise TypeError("compile must be a boolean")
+        if not isinstance(split_grad_update_eval, bool):
+            raise TypeError("split_grad_update_eval must be a boolean")
         grad_accum_steps = _require_positive_int(
             grad_accum_steps,
             name="grad_accum_steps",
@@ -182,6 +185,7 @@ class CompiledPretrainingStep:
         self.optimizer = optimizer
         self.loss_fn = loss_fn
         self.compile = compile
+        self.split_grad_update_eval = split_grad_update_eval
         self.grad_accum_steps = grad_accum_steps
         self.state = (
             state
@@ -354,6 +358,8 @@ class CompiledPretrainingStep:
     ) -> tuple[mx.array, mx.array, Any]:
         loss_batch = cast(Mapping[str, mx.array], batch)
         (loss, ntokens), grads = self._loss_and_grad(self.model, loss_batch)
+        if self.split_grad_update_eval:
+            mx.eval(loss, ntokens, grads)
         grads = self._accumulate_or_update(grads, prev_grad, do_update)
         return loss, ntokens, grads
 

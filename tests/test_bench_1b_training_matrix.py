@@ -41,20 +41,26 @@ def test_bench_1b_matrix_plan_covers_dtype_optimizer_path_cells(
     args = _args(tmp_path)
     cells = matrix.build_cells(args)
 
-    assert len(cells) == 36
+    assert len(cells) == 42
     by_case = {cell.case_id: cell for cell in cells}
-    assert by_case["bf16_adamw_path_b"].env["CPPMEGA_KERNEL_PATH"] == "auto"
+    assert by_case["bf16_adamw_path_b"].env["CPPMEGA_KERNEL_PATH"] == "path_b"
+    assert by_case["bf16_adamw_path_b"].env["CPPMEGA_KERNEL_PATH__MAMBA3_MIMO"] == "path_b"
+    assert by_case["bf16_adamw_path_b"].env["CPPMEGA_KERNEL_PATH__M2RNN"] == "path_b"
     assert by_case["bf16_adamw_path_c_cold"].env["CPPMEGA_KERNEL_PATH"] == "path_c"
     assert by_case["bf16_adamw_path_c_cold"].env["CPPMEGA_MAMBA3_PATH_C_BWD"] == "path_b"
     assert by_case["bf16_adamw_path_c_cold"].cache_mode == "cold"
     assert by_case["bf16_adamw_path_c_warm"].cache_mode == "warm"
     assert "--seq-len" in by_case["bf16_adamw_path_b"].command
     assert "2048" in by_case["bf16_adamw_path_b"].command
-    assert by_case["int8_lion_path_c_warm"].cli_optimizer == "lion8bit"
-    assert by_case["int8_muon_path_c_cold"].cli_optimizer == "int8"
+    assert by_case["bf16_lion_path_b"].cli_optimizer == "lion"
+    assert by_case["bf16_lion8bit_path_b"].cli_optimizer == "lion8bit"
+    assert by_case["bf16_adam8bit_path_b"].cli_optimizer == "adam8bit"
+    assert by_case["bf16_muon_int8_path_c_cold"].cli_optimizer == "int8"
     assert by_case["fp8_adamw_path_b"].supported is True
     assert by_case["fp8_adamw_path_b"].dtype_arg == "fp8_path_b"
-    assert by_case["fp8_adamw_path_b"].env["CPPMEGA_KERNEL_PATH"] == "auto"
+    assert by_case["fp8_lion8bit_path_b"].dtype_arg == "fp8_path_b"
+    assert by_case["fp8_lion8bit_path_b"].cli_optimizer == "lion8bit"
+    assert by_case["fp8_adamw_path_b"].env["CPPMEGA_KERNEL_PATH"] == "path_b"
     assert by_case["fp8_adamw_path_b"].env["CPPMEGA_KERNEL_PATH__SPARSE_MLA"] == "path_b"
     assert by_case["fp8_adamw_path_c_warm"].env["CPPMEGA_SPARSE_MLA_FP8_ROUTE"] == "path_c"
 
