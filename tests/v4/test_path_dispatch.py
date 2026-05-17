@@ -166,7 +166,9 @@ def test_kda_dispatch_returns_same_as_path_a(monkeypatch):
     beta = mx.array(rng.standard_normal((B, T, HV)).astype(np.float32))
     o_disp, _ = kda_recurrent_dispatch(q, k, v, g, beta)
     o_ref, _ = naive_recurrent_kda(q, k, v, g, beta)
-    np.testing.assert_array_equal(np.array(o_disp), np.array(o_ref))
+    # Path B (Metal float32) is now real and differs from Path A
+    # (MLX float64-then-cast) by ~1e-7 — use atol instead of bit-exact.
+    np.testing.assert_allclose(np.array(o_disp), np.array(o_ref), atol=1e-5)
 
 
 @pytest.mark.parametrize("path", ["path_a", "path_b", "path_c", "path_d"])
