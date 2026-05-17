@@ -46,14 +46,14 @@ def test_measure_cell_kda_returns_receipt():
 
 
 def test_measure_cell_deferred_path_marks_unavailable():
-    """Path C is currently unavailable; receipt should reflect that."""
+    """Path D (Triton frontend) is unavailable on Apple Silicon — stable fixture."""
     shape = CellShape(
-        block="gdn", path="path_c", batch=1, seq_len=2,
+        block="gdn", path="path_d", batch=1, seq_len=2,
         num_heads=2, head_dim_k=4, head_dim_v=4,
     )
     receipt = measure_cell(shape)
     assert receipt.backend_available is False
-    assert "pending" in receipt.backend_reason.lower()
+    assert receipt.backend_reason  # non-empty rationale
 
 
 def test_write_receipt_produces_valid_json(tmp_path: Path):

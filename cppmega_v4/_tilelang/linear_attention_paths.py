@@ -19,9 +19,14 @@ Backend status (May 2026):
     - Path D: Triton frontend via ``tilelang.poc.triton_frontend.from_triton_kernel``
       on FLA's ``chunk_gated_delta_rule`` — scaffold; awaits frontend op
       coverage for the FLA kernel.
-    - Path E: vendored mlx-lm ``gated_delta_update`` op (PR #1217) — scaffold;
-      awaits cherry-pick + vendoring under
-      ``cppmega_v4/nn/_external/mlx_lm_gated_delta_update.py``.
+    - Path E: vendored mlx-lm ``gated_delta_update`` op (PR #1217) —
+      verbatim copy under
+      ``cppmega_v4/nn/_external/_mlx_lm_gated_delta_vendored.py`` with adapter
+      ``cppmega_v4/nn/_external/mlx_lm_gated_delta_update.py`` mapping our
+      (q, k, v, beta, g) → upstream (q, k, v, a, b, A_log, dt_bias) by
+      softplus_inverse(-g) for the gate and logit(beta) for the betas.
+      Upstream Metal kernel needs Dk%32==0 & Dv%4==0; smaller dims fall back
+      to the upstream ops path automatically.
 
 When the user wants to validate against a specific backend they set
 ``CPPMEGA_V4_KERNEL_PATH__LINEAR_ATTENTION=path_c`` (or the path of choice);
@@ -151,7 +156,13 @@ def _path_e_status() -> PathStatus:
         importlib.import_module(
             "cppmega_v4.nn._external.mlx_lm_gated_delta_update"
         )
-        return PathStatus(path="path_e", available=True, reason="vendored mlx-lm op present")
+        return PathStatus(
+            path="path_e", available=True,
+            reason=(
+                "vendored mlx-lm PR #1217 gated_delta_update (Metal kernel "
+                "for Dk%32==0 & Dv%4==0; ops fallback otherwise)"
+            ),
+        )
     except Exception:
         return PathStatus(
             path="path_e",
