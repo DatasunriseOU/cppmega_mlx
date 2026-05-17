@@ -20,6 +20,8 @@ from cppmega_mlx.nn.attention import (
     CausalSelfAttention,
     sparse_mla_fp8_route_enabled,
 )
+from cppmega_mlx.nn.concept import ConceptBlock, ConceptBlockConfig
+from cppmega_mlx.nn.engram import EngramBranch, EngramConfig
 from cppmega_mlx.nn.m2rnn import M2RNNConfig, M2RNNMixer
 from cppmega_mlx.nn.mamba3 import Mamba3Config, Mamba3ReferenceBlock
 from cppmega_mlx.nn.mhc import ManifoldBranchMixer, ManifoldBranchMixerConfig
@@ -28,16 +30,28 @@ from cppmega_mlx.nn.ngram_hash import NgramHashEmbedding
 from cppmega_mlx.nn.structure_embedding import CppMegaStructureEmbedding
 from cppmega_mlx.recipes.pattern import ExpandedNamPattern, NamLayer, expand_nam_pattern
 from cppmega_mlx.runtime.kernel_policy import KernelPath, selected_path
+from cppmega_mlx.training.mtp import MinimalMTPHead, MTPLossConfig
 
-HybridBackend = Literal["attention", "mamba3", "moe", "m2rnn"]
-HybridBlockModule = CausalSelfAttention | Mamba3ReferenceBlock | ReferenceMoE | M2RNNMixer
+HybridBackend = Literal["attention", "mamba3", "moe", "m2rnn", "engram", "concept"]
+HybridBlockModule = (
+    CausalSelfAttention
+    | Mamba3ReferenceBlock
+    | ReferenceMoE
+    | M2RNNMixer
+    | EngramBranch
+    | ConceptBlock
+)
 
 _ROUTE_SYMBOL_BACKENDS: dict[str, HybridBackend] = {
     "A": "attention",
     "M": "mamba3",
     "E": "moe",
     "R": "m2rnn",
+    "N": "engram",
+    "C": "concept",
 }
+
+HybridAttentionMode = Literal["mla", "dsa", "full", "gqa"]
 
 
 class StructureEmbeddingConfigKwargs(TypedDict):
@@ -110,6 +124,28 @@ class HybridTinyConfig:
     ngram_hash_seed: int | None = None
     mhc_enabled: bool = False
     grad_checkpoint: bool = False
+    # Attention mode default applied to A-layers that did not get DSA routing.
+    # "mla" preserves the legacy dense path. "full" and "gqa" are explicit
+    # aliases for the same SDPA path with stricter num_kv_heads validation.
+    attention_mode: HybridAttentionMode = "mla"
+    # Engram (symbol "N") — local causal n-gram branch from cppmega_mlx.nn.engram.
+    engram_ngram_orders: tuple[int, ...] = (2, 3, 4)
+    engram_bottleneck_dim: int = 0
+    engram_dropout: float = 0.0
+    engram_gated: bool = False
+    engram_conv_kernel: int = 0
+    # Concept (symbol "C") — concept-retrieval cross-attention ported from
+    # nanochat. ``concept_dim=None`` means use hidden_size.
+    concept_num_concepts: int = 64
+    concept_num_heads: int = 4
+    concept_dim: int | None = None
+    # MTP — Multi-Token Prediction. When enabled, an MTPHead is attached to the
+    # model in HybridTinyLM.__init__ and made reachable as ``model.mtp_head``.
+    mtp_enabled: bool = False
+    mtp_depth: int = 2
+    mtp_decay: float = 0.6
+    mtp_loss_weight: float = 0.3
+    mtp_ignore_index: int = -1
 
     def __post_init__(self) -> None:
         if self.vocab_size < 2:
@@ -141,13 +177,26 @@ class HybridTinyConfig:
         # Validate the route plan at config construction time, including DSA
         # ranks at tiny depths.
         self.expanded_pattern()
-        self.attention_config("mla")
+        # Validate the user-selected dense attention mode end-to-end.
+        if self.attention_mode not in ("mla", "dsa", "full", "gqa"):
+            raise ValueError(
+                f"attention_mode must be one of 'mla', 'dsa', 'full', 'gqa', "
+                f"got {self.attention_mode!r}"
+            )
+        self.attention_config(self.attention_mode)
+        # Always also validate the dsa mode contract because dsa_a_layer_ranks
+        # may pin specific A-layers to dsa regardless of attention_mode.
+        if self.attention_mode != "dsa":
+            self.attention_config("dsa")
         self.mamba3_config()
         self.m2rnn_config()
         self.moe_config()
         self.structure_embedding_config()
         self.ngram_hash_config()
         self.mhc_config()
+        self.engram_config()
+        self.concept_config()
+        self.mtp_config()
 
     def expanded_pattern(self) -> ExpandedNamPattern:
         return expand_nam_pattern(
@@ -156,12 +205,15 @@ class HybridTinyConfig:
             dsa_a_layer_ranks=self.dsa_a_layer_ranks,
         )
 
-    def attention_config(self, mode: Literal["mla", "dsa"]) -> AttentionConfig:
+    def attention_config(
+        self, mode: HybridAttentionMode | None = None
+    ) -> AttentionConfig:
+        active_mode: HybridAttentionMode = mode if mode is not None else self.attention_mode
         return AttentionConfig(
             d_model=self.hidden_size,
             num_q_heads=self.num_attention_heads,
             num_kv_heads=self.num_attention_kv_heads,
-            mode=mode,
+            mode=active_mode,
             sparse_topk=self.attention_sparse_topk,
         )
 
@@ -263,8 +315,79 @@ class HybridTinyConfig:
             return None
         return ManifoldBranchMixerConfig(hidden_size=self.hidden_size, max_branches=2)
 
+    def engram_config(self) -> EngramConfig:
+        return EngramConfig(
+            hidden_size=self.hidden_size,
+            ngram_orders=self.engram_ngram_orders,
+            bottleneck_dim=self.engram_bottleneck_dim,
+            dropout=self.engram_dropout,
+            gated=self.engram_gated,
+            conv_kernel=self.engram_conv_kernel,
+        )
+
+    def concept_config(self) -> ConceptBlockConfig:
+        return ConceptBlockConfig(
+            hidden_size=self.hidden_size,
+            num_concepts=self.concept_num_concepts,
+            num_heads=self.concept_num_heads,
+            concept_dim=self.concept_dim,
+        )
+
+    def mtp_config(self) -> MTPLossConfig | None:
+        if not self.mtp_enabled:
+            return None
+        return MTPLossConfig(
+            depth=self.mtp_depth,
+            decay=self.mtp_decay,
+            loss_weight=self.mtp_loss_weight,
+            ignore_index=self.mtp_ignore_index,
+        )
+
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
+
+    def to_yaml(self) -> str:
+        """Serialize this config to a YAML document.
+
+        Lists are emitted as flow-style for compactness. Use ``from_yaml`` to
+        parse the output back into a ``HybridTinyConfig``.
+        """
+        import yaml  # PyYAML is part of the existing dev requirements.
+
+        return yaml.safe_dump(
+            self.to_dict(),
+            sort_keys=False,
+            default_flow_style=None,
+        )
+
+    @classmethod
+    def from_dict(cls, data: dict[str, object]) -> HybridTinyConfig:
+        """Build a config from a plain dict (e.g., loaded YAML/JSON)."""
+
+        coerced = dict(data)
+        # YAML and JSON lose tuple-ness; coerce sequence-typed fields back.
+        for field_name in (
+            "dsa_a_layer_ranks",
+            "ngram_hash_orders",
+            "engram_ngram_orders",
+        ):
+            if field_name in coerced and coerced[field_name] is not None:
+                coerced[field_name] = tuple(coerced[field_name])  # type: ignore[arg-type]
+        return cls(**coerced)  # type: ignore[arg-type]
+
+    @classmethod
+    def from_yaml(cls, text: str) -> HybridTinyConfig:
+        """Parse a YAML document into a ``HybridTinyConfig`` with validation."""
+
+        import yaml
+
+        loaded = yaml.safe_load(text)
+        if not isinstance(loaded, dict):
+            raise ValueError(
+                "from_yaml expects a YAML mapping at the top level, "
+                f"got {type(loaded).__name__}"
+            )
+        return cls.from_dict(loaded)
 
 
 class HybridTinyBlock(nn.Module):
@@ -290,7 +413,12 @@ class HybridTinyBlock(nn.Module):
         self.block: HybridBlockModule
 
         if layer.symbol == "A":
-            mode = layer.attention_route or "mla"
+            # DSA pinning via dsa_a_layer_ranks always wins. Otherwise the
+            # model-wide attention_mode (default 'mla', or user-chosen
+            # 'full'/'gqa') applies to this A-layer.
+            mode: HybridAttentionMode = (
+                "dsa" if layer.attention_route == "dsa" else config.attention_mode
+            )
             self.backend: HybridBackend = "attention"
             self.block = CausalSelfAttention(config.attention_config(mode))
         elif layer.symbol == "M":
@@ -302,6 +430,12 @@ class HybridTinyBlock(nn.Module):
         elif layer.symbol == "R":
             self.backend = "m2rnn"
             self.block = M2RNNMixer(config.m2rnn_config())
+        elif layer.symbol == "N":
+            self.backend = "engram"
+            self.block = EngramBranch(config.engram_config())
+        elif layer.symbol == "C":
+            self.backend = "concept"
+            self.block = ConceptBlock(config.concept_config())
         else:  # pragma: no cover - expand_nam_pattern rejects this first.
             raise ValueError(f"unsupported hybrid layer symbol {layer.symbol!r}")
 
@@ -320,6 +454,14 @@ class HybridTinyBlock(nn.Module):
     @property
     def m2rnn_block(self) -> M2RNNMixer | None:
         return self.block if self.backend == "m2rnn" else None  # type: ignore[return-value]
+
+    @property
+    def engram_block(self) -> EngramBranch | None:
+        return self.block if self.backend == "engram" else None  # type: ignore[return-value]
+
+    @property
+    def concept_block(self) -> ConceptBlock | None:
+        return self.block if self.backend == "concept" else None  # type: ignore[return-value]
 
     def __call__(
         self,
@@ -362,6 +504,8 @@ class HybridTinyBlock(nn.Module):
             "mamba3": Mamba3ReferenceBlock,
             "moe": ReferenceMoE,
             "m2rnn": M2RNNMixer,
+            "engram": EngramBranch,
+            "concept": ConceptBlock,
         }[self.backend]
         if not isinstance(self.block, expected_cls):
             raise ValueError(
@@ -403,6 +547,10 @@ class HybridTinyBlock(nn.Module):
                 )
             else:
                 delta, _ = m2rnn(x)
+        elif self.backend == "engram":
+            delta = cast(EngramBranch, self.block)(x)
+        elif self.backend == "concept":
+            delta = cast(ConceptBlock, self.block)(x)
         else:  # pragma: no cover - self.backend is fixed during construction.
             raise ValueError(f"unsupported hybrid backend {self.backend!r}")
         return delta
@@ -439,6 +587,13 @@ class HybridTinyLM(nn.Module):
         self.layers = [HybridTinyBlock(layer, cfg) for layer in self.pattern.layers]
         self.norm = nn.RMSNorm(cfg.hidden_size)
         self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
+
+        mtp_config = cfg.mtp_config()
+        self.mtp_head: MinimalMTPHead | None = (
+            MinimalMTPHead(self.token_embedding, self.lm_head, config=mtp_config)
+            if mtp_config is not None
+            else None
+        )
 
         if dtype is not None and dtype != mx.float32:
             self.set_dtype(dtype)
@@ -640,6 +795,7 @@ def _attention_layer_count(layers: list[HybridTinyBlock]) -> int:
     return sum(1 for layer in layers if layer.backend == "attention")
 
 __all__ = [
+    "HybridAttentionMode",
     "HybridBackend",
     "HybridBlockModule",
     "HybridTinyBlock",

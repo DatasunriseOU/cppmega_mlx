@@ -122,12 +122,14 @@ def test_default_nam56r_pattern_matches_cppmega_counts_and_indices():
     m2rnn_layers = (12, 24, 36, 48)
 
     assert expanded.depth == 52
-    assert expanded.counts == {"A": 13, "E": 22, "M": 13, "R": 4}
+    assert expanded.counts == {"A": 13, "E": 22, "M": 13, "R": 4, "N": 0, "C": 0}
     assert expanded.role_counts == {
         "attention": 13,
         "moe": 22,
         "mamba3": 13,
         "m2rnn": 4,
+        "engram": 0,
+        "concept": 0,
     }
     assert expanded.a_layer_numbers == attention_layers
     assert expanded.moe_layer_numbers == moe_layers
@@ -138,6 +140,8 @@ def test_default_nam56r_pattern_matches_cppmega_counts_and_indices():
         "moe": moe_layers,
         "mamba3": mamba3_layers,
         "m2rnn": m2rnn_layers,
+        "engram": (),
+        "concept": (),
     }
     assert expanded.layer_numbers_for_role("attention") == attention_layers
     assert expanded.layer_numbers_for_role("moe") == moe_layers
@@ -208,7 +212,14 @@ def test_nam56r_parity_contract_fails_closed_on_native_megatron_claims():
     contract = build_nam56r_parity_contract()
 
     assert contract.pattern.depth == 52
-    assert contract.locally_covered_roles == ("attention", "moe", "mamba3", "m2rnn")
+    assert contract.locally_covered_roles == (
+        "attention",
+        "moe",
+        "mamba3",
+        "m2rnn",
+        "engram",
+        "concept",
+    )
     assert contract.custom_megatron_roles == ("mamba3", "m2rnn")
     assert contract.unsupported_megatron_symbols == ("D", "G", "|")
     assert contract.megatron_fully_native is False

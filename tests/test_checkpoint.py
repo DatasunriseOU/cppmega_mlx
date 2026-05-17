@@ -1420,6 +1420,7 @@ def test_checkpoint_resume_restores_hybrid_custom_blocks_and_optimizer(tmp_path)
         **config.to_dict(),
         "dsa_a_layer_ranks": [0],
         "ngram_hash_orders": [2, 3],
+        "engram_ngram_orders": [2, 3, 4],
     }
     assert metadata["tokenizer_contract"]["structure_vocab_size"] == config.structure_vocab_size
     assert "layers.1.block.router.gate.weight.m" in metadata["optimizer"]["tensors"]

@@ -85,7 +85,7 @@ def test_nam56r_pattern_depth_counts_and_absolute_layers_match_cppmega():
     assert DEFAULT_NAM56R_PATTERN == CPPMEGA_NAM56R_PATTERN
     assert DEFAULT_NAM56R_DEPTH == CPPMEGA_NAM56R_DEPTH
     assert expanded.symbols == tuple((CPPMEGA_NAM56R_PATTERN * 5)[:CPPMEGA_NAM56R_DEPTH])
-    assert expanded.counts == {"A": 13, "E": 22, "M": 13, "R": 4}
+    assert expanded.counts == {"A": 13, "E": 22, "M": 13, "R": 4, "N": 0, "C": 0}
     assert expanded.r_layer_numbers == (12, 24, 36, 48)
     assert expanded.a_layer_numbers == (
         1,

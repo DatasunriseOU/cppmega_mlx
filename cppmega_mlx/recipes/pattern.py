@@ -10,18 +10,20 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-NamSymbol = Literal["A", "E", "M", "R"]
-LayerRole = Literal["attention", "moe", "mamba3", "m2rnn"]
-AttentionRoute = Literal["dsa", "mla"]
+NamSymbol = Literal["A", "E", "M", "R", "N", "C"]
+LayerRole = Literal["attention", "moe", "mamba3", "m2rnn", "engram", "concept"]
+AttentionRoute = Literal["dsa", "mla", "full", "gqa"]
 
-SUPPORTED_NAM_SYMBOLS = frozenset({"A", "E", "M", "R"})
-ORDERED_NAM_SYMBOLS: tuple[NamSymbol, ...] = ("A", "E", "M", "R")
+SUPPORTED_NAM_SYMBOLS = frozenset({"A", "E", "M", "R", "N", "C"})
+ORDERED_NAM_SYMBOLS: tuple[NamSymbol, ...] = ("A", "E", "M", "R", "N", "C")
 
 _ROLE_BY_SYMBOL: dict[NamSymbol, LayerRole] = {
     "A": "attention",
     "E": "moe",
     "M": "mamba3",
     "R": "m2rnn",
+    "N": "engram",
+    "C": "concept",
 }
 
 
@@ -74,6 +76,14 @@ class ExpandedNamPattern:
         return tuple(layer.number for layer in self.layers if layer.symbol == "E")
 
     @property
+    def engram_layer_numbers(self) -> tuple[int, ...]:
+        return tuple(layer.number for layer in self.layers if layer.symbol == "N")
+
+    @property
+    def concept_layer_numbers(self) -> tuple[int, ...]:
+        return tuple(layer.number for layer in self.layers if layer.symbol == "C")
+
+    @property
     def dsa_layer_numbers(self) -> tuple[int, ...]:
         return tuple(layer.number for layer in self.layers if layer.attention_route == "dsa")
 
@@ -92,6 +102,8 @@ class ExpandedNamPattern:
             "moe": len(self.moe_layer_numbers),
             "mamba3": len(self.mamba3_layer_numbers),
             "m2rnn": len(self.r_layer_numbers),
+            "engram": len(self.engram_layer_numbers),
+            "concept": len(self.concept_layer_numbers),
         }
 
     @property
@@ -101,6 +113,8 @@ class ExpandedNamPattern:
             "moe": self.moe_layer_numbers,
             "mamba3": self.mamba3_layer_numbers,
             "m2rnn": self.r_layer_numbers,
+            "engram": self.engram_layer_numbers,
+            "concept": self.concept_layer_numbers,
         }
 
     def layer_numbers_for_role(self, role: LayerRole) -> tuple[int, ...]:
@@ -112,6 +126,10 @@ class ExpandedNamPattern:
             return self.mamba3_layer_numbers
         if role == "m2rnn":
             return self.r_layer_numbers
+        if role == "engram":
+            return self.engram_layer_numbers
+        if role == "concept":
+            return self.concept_layer_numbers
         raise ValueError(f"unsupported NAM layer role: {role!r}")
 
     def attention_route_for_layer(self, layer_number: int) -> AttentionRoute | None:
@@ -132,7 +150,7 @@ def parse_nam_pattern(pattern: str) -> tuple[NamSymbol, ...]:
     invalid = sorted({char for char in normalized if char not in SUPPORTED_NAM_SYMBOLS})
     if invalid:
         raise ValueError(
-            f"invalid NAM pattern chars {invalid!r}; supported symbols are A, E, M, R"
+            f"invalid NAM pattern chars {invalid!r}; supported symbols are A, E, M, R, N, C"
         )
     return tuple(normalized)  # type: ignore[return-value]
 

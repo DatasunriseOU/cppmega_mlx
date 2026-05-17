@@ -14,7 +14,8 @@ from cppmega_mlx._mlx_lm_imports import scaled_dot_product_attention
 from cppmega_mlx.inference.engine import ContiguousKVCache
 from cppmega_mlx.runtime.kernel_policy import KernelPath, record_dispatch, selected_path
 
-AttentionMode = Literal["mla", "dsa"]
+AttentionMode = Literal["mla", "dsa", "full", "gqa"]
+_DENSE_MODES: frozenset[str] = frozenset({"mla", "full", "gqa"})
 RopeType = Literal["standard", "llama3", "yarn"]
 SPARSE_MLA_FP8_PRODUCER_OWNER = (
     "cppmega_mlx.nn.attention.CausalSelfAttention.prepare_sparse_mla_fp8"
@@ -68,8 +69,21 @@ class AttentionConfig:
     sparse_topk: int = 16
 
     def __post_init__(self) -> None:
-        if self.mode not in ("mla", "dsa"):
-            raise ValueError(f"mode must be 'mla' or 'dsa', got {self.mode!r}")
+        if self.mode not in ("mla", "dsa", "full", "gqa"):
+            raise ValueError(
+                f"mode must be one of 'mla', 'dsa', 'full', 'gqa', got {self.mode!r}"
+            )
+        if self.mode == "gqa":
+            if self.num_kv_heads is None or self.num_kv_heads == self.num_q_heads:
+                raise ValueError(
+                    "mode='gqa' requires num_kv_heads to be set to a value "
+                    "strictly less than num_q_heads"
+                )
+        if self.mode == "full":
+            if self.num_kv_heads is not None and self.num_kv_heads != self.num_q_heads:
+                raise ValueError(
+                    "mode='full' requires num_kv_heads to equal num_q_heads or be None"
+                )
         if self.d_model <= 0:
             raise ValueError(f"d_model must be positive, got {self.d_model}")
         if self.num_q_heads <= 0:
