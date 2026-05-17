@@ -97,10 +97,18 @@ def _gdn_forward_kernel(
             for (int i = 0; i < {dh}; i++) state[i] *= alpha_t;
 
             // Phase 2: kth_S_j = sum_i k[i] * state[i, j]  (own column)
+            // mlx-lm PR #1066: Kahan-compensated summation. Without this,
+            // long-T runs accumulate bf16 rounding into kv_mem and the
+            // delta-corrected state drifts. Compensation costs 3 FLOPs/iter.
             float kth_S_j = 0.0f;
+            float kth_c   = 0.0f;
             for (int i = 0; i < {dh}; i++) {{
                 float k_i = k[kv_base + i];
-                kth_S_j += k_i * state[i];
+                float p   = k_i * state[i];
+                float a   = p - kth_c;
+                float b   = kth_S_j + a;
+                kth_c     = (b - kth_S_j) - a;
+                kth_S_j   = b;
             }}
 
             // Phase 3: v_eff = beta * (v - kth_S)

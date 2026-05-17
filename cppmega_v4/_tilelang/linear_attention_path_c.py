@@ -35,12 +35,15 @@ Recurrence per step ``t``:
     y[b, t, h, v_idx] = out
 """
 
-from __future__ import annotations
-
 from functools import lru_cache
-from typing import Any
+from typing import Any, Optional
 
 import mlx.core as mx
+
+# Deliberately NOT using `from __future__ import annotations` here:
+# tilelang's @T.prim_func builder calls get_type_hints which evaluates
+# the T.Tensor((BATCH, SEQ, ...)) annotations against globals — under
+# PEP 563 the closure locals (BATCH/SEQ/...) become unresolvable strings.
 
 
 def _tilelang_importable() -> tuple[bool, str]:
@@ -171,8 +174,8 @@ def _gdn_fwd_path_c_call(
     beta: mx.array,
     g: mx.array,
     *,
-    scale: float | None = None,
-    initial_state: mx.array | None = None,
+    scale: Optional[float] = None,
+    initial_state: Optional[mx.array] = None,
     output_final_state: bool = False,
 ):
     """Path C entry — same signature as ``naive_recurrent_gated_delta_rule``.

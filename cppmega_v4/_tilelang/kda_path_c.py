@@ -16,12 +16,14 @@ Plugin invariant: imports ``dispatch_lower`` / ``_msl_transform`` from the
 host ``cppmega_mlx`` package read-only — never modifies them.
 """
 
-from __future__ import annotations
-
 from functools import lru_cache
-from typing import Any
+from typing import Any, Optional
 
 import mlx.core as mx
+
+# Deliberately NOT using `from __future__ import annotations`: tilelang's
+# @T.prim_func builder evaluates T.Tensor((BATCH, SEQ, ...)) annotations
+# via get_type_hints; PEP 563 string-annotations break closure-local lookup.
 
 
 def _tilelang_importable() -> tuple[bool, str]:
@@ -139,8 +141,8 @@ def _kda_fwd_path_c_call(
     g: mx.array,
     beta: mx.array,
     *,
-    scale: float | None = None,
-    initial_state: mx.array | None = None,
+    scale: Optional[float] = None,
+    initial_state: Optional[mx.array] = None,
     output_final_state: bool = False,
 ):
     """KDA Path C entry — same signature as ``naive_recurrent_kda``."""

@@ -82,22 +82,26 @@ def test_gdn_path_a_always_available():
     assert statuses["path_a"].available
 
 
-def test_gdn_paths_c_d_currently_deferred():
+def test_gdn_path_d_still_deferred_without_triton():
+    """Path D needs triton — unavailable on Apple Silicon. Path C is now
+    real-or-fallback depending on whether tilelang is importable."""
     statuses = linear_attention_path_statuses()
-    # Path C/D still deferred (need TileLang/Triton wiring); Path B is now
-    # real Metal kernel as of the path_b ROI commit.
-    for p in ("path_c", "path_d"):
-        st = statuses[p]
-        assert not st.available
-        assert len(st.reason) > 20  # non-empty rationale
+    st_d = statuses["path_d"]
+    assert not st_d.available
+    assert len(st_d.reason) > 20
+    # Path C reason must always name the lowering pipeline, regardless of
+    # whether tilelang is reachable.
+    st_c = statuses["path_c"]
+    assert "tvm_ffi" in st_c.reason and "metal" in st_c.reason.lower()
 
 
 def test_gdn_auto_mode_default_picks_first_available(monkeypatch):
     monkeypatch.delenv(GDN_ENV, raising=False)
     chosen = linear_attention_auto_mode_for_inputs()
-    # Path B is available (real Metal kernel) — auto picks it before falling
-    # back to A in the preference order (c > b > e > d > a).
-    assert chosen in ("path_a", "path_b")
+    # Preference order: c > b > e > d > a. Path C wins when tilelang is
+    # available; Path E wins next; Path B (real Metal) wins on Apple Silicon
+    # without tilelang; Path A is the universal floor.
+    assert chosen in ("path_a", "path_b", "path_c", "path_e")
 
 
 def test_gdn_auto_mode_respects_env(monkeypatch):
