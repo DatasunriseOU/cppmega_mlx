@@ -58,13 +58,25 @@ class EngramV4Block(nn.Module):
     def __init__(self, config: EngramV4Config):
         super().__init__()
         self.config = config
-        # Per-layer multipliers for hash mixing.
-        # int64 to avoid overflow during prod * multiplier.
-        rng = mx.random.uniform(
-            low=1, high=2**31 - 1,
-            shape=(config.num_ngram_layers, config.max_ngram_size),
-        ).astype(mx.int64)
-        self.multipliers = rng
+        # Per-layer multipliers for hash mixing. Deterministic large odd primes
+        # / Fibonacci multipliers — random init occasionally gives multipliers
+        # with too many trailing zero bits, which collapses hash%vocab_size to
+        # a constant. 2_654_435_761 is the standard Fibonacci hash multiplier.
+        primes = [
+            2654435761, 40503, 1597334677, 805306457,
+            1357980413, 524287, 786433, 1610612741,
+            2147483647, 1073741827, 1717986919, 858993463,
+        ]
+        flat: list[int] = [0] * (config.num_ngram_layers * config.max_ngram_size)
+        for layer_idx in range(config.num_ngram_layers):
+            offset = (layer_idx * 7) % len(primes)
+            for j in range(config.max_ngram_size):
+                flat[layer_idx * config.max_ngram_size + j] = primes[
+                    (offset + j * 3) % len(primes)
+                ]
+        self.multipliers = mx.array(flat, dtype=mx.int64).reshape(
+            config.num_ngram_layers, config.max_ngram_size,
+        )
         # Per-layer per-ngram embedding table sizes (uniform for simplicity).
         self.vocab_sizes = mx.full(
             (config.num_ngram_layers, config.max_ngram_size - 1,
