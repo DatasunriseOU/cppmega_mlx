@@ -1,10 +1,17 @@
-"""DeepSeek-V3-style Sequential Multi-Token-Prediction head plugin.
+"""Sequential Multi-Token-Prediction head plugin (V3 architecture, inherited in V4).
 
 The existing ``MinimalMTPHead`` (``cppmega_mlx/training/mtp.py``) reuses one
 shared block recursively for every depth — a contracted reference. DeepSeek-V3
 ships D **sequential transformer-style blocks**, one per future-token depth,
 each with its own RMSNorms, projection, and transformer kernel, but sharing the
 model's token embedding and lm head.
+
+V3 vs V4 status (as of May 2026 — public evidence only):
+    The V4-Pro / V4-Flash configs and the available V4 paper (arxiv 2512.24880,
+    which is the mHC paper, not a full V4 tech report) do not document any
+    MTP-architecture change vs V3. V4 inherits this exact Sequential head
+    unchanged. When a V4-specific MTP variant lands (full tech report or vLLM
+    V4 inference path), add a ``SequentialMTPHeadV4`` sibling here.
 
 This plugin lands the V3-faithful surface side-by-side without touching the
 existing ``MinimalMTPHead``.
