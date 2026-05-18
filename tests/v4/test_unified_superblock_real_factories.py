@@ -109,9 +109,15 @@ def test_moe_block_builds_and_runs():
 
 @pytest.mark.parametrize("kind", ["attention", "mla", "mla_absorb"])
 def test_attention_kinds_build_and_run(kind):
-    sb = _mk([BlockSpec(kind=kind, repeat=1, params={
-        "num_heads": 4, "head_dim": 16,
-    })])
+    if kind in ("mla", "mla_absorb"):
+        # MLA block has its own LoRA/RoPE params — use smaller dims for test.
+        params = {
+            "num_heads": 4, "qk_nope_head_dim": 8, "qk_rope_head_dim": 8,
+            "v_head_dim": 16, "q_lora_rank": 16, "kv_lora_rank": 12,
+        }
+    else:
+        params = {"num_heads": 4, "head_dim": 16}
+    sb = _mk([BlockSpec(kind=kind, repeat=1, params=params)])
     tok, h = _inputs()
     out = sb(tok, h)
     assert out.shape == h.shape
@@ -134,15 +140,17 @@ def test_attention_block_zero_init_is_identity():
 
 
 def test_lightning_indexer_builds_and_runs():
+    """LightningIndexer block is bundled with CSA+HCA — residual is the
+    sparse-attention output, not zero."""
     sb = _mk([BlockSpec(kind="lightning_indexer", repeat=1, params={
         "n_heads": 2, "head_dim": 32, "rope_head_dim": 16,
         "q_lora_rank": 64, "index_topk": 16,
+        "m_csa": 2, "m_hca": 4, "csa_num_heads": 4, "csa_head_dim": 16,
     })])
     tok, h = _inputs()
     out = sb(tok, h)
     assert out.shape == h.shape
-    # Lightning indexer residual is zero by design, so output == input.
-    np.testing.assert_array_equal(np.array(out), np.array(h))
+    assert not bool(mx.any(mx.isnan(out)).item())
 
 
 # ----- Full V4 stack: gdn + kda + moe + nsa + csa_hca + engram + mla -----
@@ -167,6 +175,11 @@ def test_full_v4_stack_runs_end_to_end():
             BlockSpec(kind="attention", repeat=1, params={
                 "num_heads": 4, "head_dim": 32,
             }),
+            BlockSpec(kind="mla", repeat=1, params={
+                "num_heads": 4, "qk_nope_head_dim": 16,
+                "qk_rope_head_dim": 16, "v_head_dim": 32,
+                "q_lora_rank": 32, "kv_lora_rank": 24,
+            }),
             BlockSpec(kind="nsa", repeat=1, params={
                 "num_heads": 4, "head_dim": 32,
                 "compress_block_size": 4, "select_topk": 2, "sliding_window": 4,
@@ -182,7 +195,8 @@ def test_full_v4_stack_runs_end_to_end():
     )
     sb = UnifiedSuperblockV4(t)
     assert sb.kinds() == [
-        "engram", "gdn", "kda", "attention", "nsa", "csa_hca", "moe", "mlp",
+        "engram", "gdn", "kda", "attention", "mla",
+        "nsa", "csa_hca", "moe", "mlp",
     ]
     B, S = 1, 8
     tok = mx.array(np.random.randint(1, 50, (B, S)).astype(np.int32))

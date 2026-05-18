@@ -124,10 +124,21 @@ def _build_moe(hidden_size: int, params: dict) -> nn.Module:
     return _MoEWrap()
 
 
+def _build_mla(hidden_size: int, params: dict) -> nn.Module:
+    """Real V3-style MLA block (LoRA Q + LoRA KV + RoPE + absorb fast-path)."""
+    from cppmega_v4.nn.mla_block import MLABlock, MLABlockConfig
+    params.setdefault("num_heads", max(1, hidden_size // 128))
+    params.setdefault("qk_nope_head_dim", 128)
+    params.setdefault("qk_rope_head_dim", 64)
+    params.setdefault("v_head_dim", 128)
+    params.setdefault("q_lora_rank", max(64, hidden_size // 2))
+    params.setdefault("kv_lora_rank", max(32, hidden_size // 4))
+    cfg = MLABlockConfig(hidden_size=hidden_size, **params)
+    return MLABlock(cfg)
+
+
 def _build_attention(hidden_size: int, params: dict) -> nn.Module:
-    """Standard multi-head self-attention (causal). Used for `attention` and
-    as the fallback for `mla` / `mla_absorb` until we land a full MLA block.
-    """
+    """Standard multi-head self-attention (causal). Used for `attention`."""
     num_heads = params.get("num_heads", max(1, hidden_size // 64))
     head_dim = params.get("head_dim", hidden_size // num_heads)
     norm_eps = params.get("norm_eps", 1e-6)
@@ -165,43 +176,80 @@ def _build_attention(hidden_size: int, params: dict) -> nn.Module:
 
 
 def _build_lightning_indexer(hidden_size: int, params: dict) -> nn.Module:
-    """LightningIndexer is a top-k helper, not a residual block. Wrap as a
-    residual no-op for stack composition — the real callsite is inside
-    CSA+HCA. RunTemplate users who want the indexer as an inline gate-pre
-    pass get a configurable hidden-pass-through wrapper.
+    """Lightning Indexer wired into a CSA+HCA block via the production adapter.
+
+    The block as a residual is meaningful only when followed by sparse-KV
+    attention that consumes the top-k indices. We bundle one indexer with
+    one CSA+HCA inside the same nn.Module so the residual output is the
+    actual sparse-attention contribution from `apply_indexer_to_csa_hca`.
+
+    For pure top-k extraction (no CSA+HCA), call LightningIndexerFP8 directly.
     """
+    from cppmega_v4.nn.csa_hca_indexer_adapter import apply_indexer_to_csa_hca
+    from cppmega_v4.nn.csa_hca_v4 import CSAHCAConfig, CSAHCAHybridV4
     from cppmega_v4.nn.lightning_indexer_fp8 import (
         LightningIndexerFP8, LightningIndexerFP8Config,
     )
     n_heads = params.get("n_heads", max(1, hidden_size // 64))
-    cfg = LightningIndexerFP8Config(
+    head_dim = params.get("head_dim", 32)
+    rope_head_dim = params.get("rope_head_dim", 16)
+    q_lora_rank = params.get("q_lora_rank", hidden_size)
+    index_topk = params.get("index_topk", 64)
+    fp8_blocks = params.get("fp8_blocks", True)
+    m_csa = params.get("m_csa", 4)
+    m_hca = params.get("m_hca", 16)
+    # CSA+HCA's num_heads / head_dim use the *hidden* layout (not the
+    # indexer's internal small-head_dim layout).
+    csa_n_heads = params.get("csa_num_heads", max(1, hidden_size // 64))
+    csa_head_dim = params.get("csa_head_dim", hidden_size // csa_n_heads)
+    indexer_cfg = LightningIndexerFP8Config(
         hidden_size=hidden_size,
         n_heads=n_heads,
-        head_dim=params.get("head_dim", 32),
-        rope_head_dim=params.get("rope_head_dim", 16),
-        q_lora_rank=params.get("q_lora_rank", hidden_size),
-        index_topk=params.get("index_topk", 64),
-        fp8_blocks=params.get("fp8_blocks", True),
+        head_dim=head_dim,
+        rope_head_dim=rope_head_dim,
+        q_lora_rank=q_lora_rank,
+        index_topk=index_topk,
+        fp8_blocks=fp8_blocks,
     )
-    indexer = LightningIndexerFP8(cfg)
+    csa_hca_cfg = CSAHCAConfig(
+        hidden_size=hidden_size,
+        num_heads=csa_n_heads, head_dim=csa_head_dim,
+        m_csa=m_csa, m_hca=m_hca,
+    )
 
-    class _IndexerResidualNoOp(nn.Module):
-        """Residual pass-through wrapper for LightningIndexer.
-
-        Lightning Indexer's natural output is top-k indices (int32), not a
-        residual. In a RunTemplate context, the block contributes zero
-        delta — its presence in the stack signals that downstream
-        CSA/HCA / sparse-MLA layers should consume the indexer's outputs.
-        Real wiring lives in CSA+HCA's select_indices argument.
-        """
+    class _IndexerCSAHCABundle(nn.Module):
+        """Lightning Indexer → CSA+HCA bundle: residual = sparse-attn output."""
         def __init__(self):
             super().__init__()
-            self.indexer = indexer
+            self.indexer = LightningIndexerFP8(indexer_cfg)
+            self.csa_hca = CSAHCAHybridV4(csa_hca_cfg)
+            # qr_proj: synthesise qr from x when the caller doesn't pre-LoRA
+            # (the indexer's q_lora_rank is just the bottleneck dim — we
+            # produce qr via a single linear when it's not handed in).
+            self.qr_proj = nn.Linear(hidden_size, q_lora_rank, bias=False)
+            # Precomputed RoPE freqs cached by max-seq length.
+            self._cached_freqs: dict[int, tuple] = {}
+
+        def _freqs(self, seq: int) -> tuple:
+            d = rope_head_dim // 2
+            if seq not in self._cached_freqs:
+                inv_freq = 1.0 / (
+                    10000.0 ** (mx.arange(d, dtype=mx.float32) * 2.0 / rope_head_dim)
+                )
+                t = mx.arange(seq, dtype=mx.float32)
+                f = t[:, None] * inv_freq[None, :]
+                self._cached_freqs[seq] = (mx.cos(f), mx.sin(f))
+            return self._cached_freqs[seq]
 
         def __call__(self, x):
-            return mx.zeros_like(x)
+            B, S, _ = x.shape
+            qr = self.qr_proj(x)
+            cos, sin = self._freqs(S)
+            return apply_indexer_to_csa_hca(
+                self.indexer, self.csa_hca, x, qr, (cos, sin),
+            )
 
-    return _IndexerResidualNoOp()
+    return _IndexerCSAHCABundle()
 
 
 BLOCK_BUILDERS: dict[str, Callable[[int, dict], nn.Module]] = {
@@ -213,10 +261,10 @@ BLOCK_BUILDERS: dict[str, Callable[[int, dict], nn.Module]] = {
     "kda": _build_kda,
     "moe": _build_moe,
     "attention": _build_attention,
-    # mla / mla_absorb fall back to standard attention until we land a
-    # full MLA block (mla_absorb.py is a pure algebra module, not nn.Module).
-    "mla": _build_attention,
-    "mla_absorb": _build_attention,
+    # mla = V3-style with LoRA Q + LoRA KV + RoPE on pe-only split.
+    # mla_absorb = same block, prefers absorb fast-path at decode.
+    "mla": _build_mla,
+    "mla_absorb": _build_mla,
     "lightning_indexer": _build_lightning_indexer,
 }
 
