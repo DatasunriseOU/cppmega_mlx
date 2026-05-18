@@ -361,13 +361,16 @@ def test_lowered_msl_reuses_hot_scalar_temporaries() -> None:
     assert re.search(r"z_val \* \([^;\n]+exp\(", fwd) is None
 
     bwd = dump_lowered_bwd_msl(batch=1, seq=4, heads=1, headdim=2, state=4)
+    assert "gridThreadIdx [[thread_position_in_grid]]" in bwd
+    assert "blockIdx.x) * 256) + (((int)threadIdx.x)" not in bwd
     assert len(re.findall(r"float decay = exp\(", bwd)) == 1
     assert "h_snap" in bwd
     assert "1.000000e+00 / decay" not in bwd
     assert re.search(r"d_decay\[0\] \* exp\(", bwd) is None
     assert re.search(r"dh\[n_\d+\] = \(dh\[n_\d+\] \* exp\(", bwd) is None
-    assert len(re.findall(r"sig_z = .*exp\(", bwd)) == 2
-    assert "sig_z = exp(z_val)" in bwd
+    assert "if (0.000000e+00f <= z_val)" not in bwd
+    assert "sig_z = exp(z_val)" not in bwd
+    assert "1.000000e+00f + exp(" in bwd
     assert re.search(r"dY \* \(z_val \* \([^;\n]+exp\(", bwd) is None
     assert "y_state = sig_z" not in bwd
     assert "dx_inp = sig_z" not in bwd

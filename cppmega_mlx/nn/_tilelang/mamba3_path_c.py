@@ -981,9 +981,8 @@ def _bwd_state_snapshots_kernel_for(
         h0: T.Tensor((BATCH, HEADS, HEADDIM, STATE), h0_dtype),
         h_snap: T.Tensor((BATCH, BLOCKS + 1, HEADS, HEADDIM, STATE), "float32"),
     ):
-        with T.Kernel(T.ceildiv(LANES, THREADS), threads=THREADS) as bx:
-            tid = T.get_thread_binding(0)
-            global_lane = bx * THREADS + tid
+        with T.Kernel(T.ceildiv(LANES, THREADS), threads=THREADS) as _bx:
+            global_lane = T.call_intrin("int32", "tir.metal.thread_position_in_grid_x")
             h_state = T.alloc_local((STATE,), accum_dtype)
             if global_lane < LANES:
                 p = global_lane % HEADDIM
@@ -1120,9 +1119,8 @@ def _bwd_simd_reduce_kernel_for(
         dD_batch: T.Tensor((BATCH, HEADS), dD_dtype),
         dh0: T.Tensor((BATCH, HEADS, HEADDIM, STATE), dh0_dtype),
     ):
-        with T.Kernel(T.ceildiv(LANES, THREADS), threads=THREADS) as bx:
-            tid = T.get_thread_binding(0)
-            global_lane = bx * THREADS + tid
+        with T.Kernel(T.ceildiv(LANES, THREADS), threads=THREADS) as _bx:
+            global_lane = T.call_intrin("int32", "tir.metal.thread_position_in_grid_x")
             h_state = T.alloc_local((STATE,), accum_dtype)
             dh = T.alloc_local((STATE,), accum_dtype)
             if global_lane < LANES:
@@ -1161,12 +1159,7 @@ def _bwd_simd_reduce_kernel_for(
                         y_state += h_state[n] * T.cast(C[b, t, h, n], accum_dtype)
                     D_h = T.cast(D[h], accum_dtype)
                     y_skipped = y_state + D_h * x_val
-                    sig_z = T.alloc_var(T.float32, init=0.0)
-                    if z_val >= 0.0:
-                        sig_z = 1.0 / (1.0 + T.exp(-z_val))
-                    else:
-                        sig_z = T.exp(z_val)
-                        sig_z = sig_z / (1.0 + sig_z)
+                    sig_z = 1.0 / (1.0 + T.exp(-z_val))
                     silu_z = z_val * sig_z
                     silu_dz = sig_z * (1.0 + z_val * (1.0 - sig_z))
 
@@ -1329,9 +1322,8 @@ def _bwd_simd_reduce_kernel_for_state_snapshots(
         dD_batch: T.Tensor((BATCH, HEADS), dD_dtype),
         dh0: T.Tensor((BATCH, HEADS, HEADDIM, STATE), dh0_dtype),
     ):
-        with T.Kernel(T.ceildiv(LANES, THREADS), threads=THREADS) as bx:
-            tid = T.get_thread_binding(0)
-            global_lane = bx * THREADS + tid
+        with T.Kernel(T.ceildiv(LANES, THREADS), threads=THREADS) as _bx:
+            global_lane = T.call_intrin("int32", "tir.metal.thread_position_in_grid_x")
             h_state = T.alloc_local((STATE,), accum_dtype)
             dh = T.alloc_local((STATE,), accum_dtype)
             if global_lane < LANES:
@@ -1368,12 +1360,7 @@ def _bwd_simd_reduce_kernel_for_state_snapshots(
                                     accum_dtype,
                                 )
                             y_skipped = y_state + D_h * x_val
-                            sig_z = T.alloc_var(T.float32, init=0.0)
-                            if z_val >= 0.0:
-                                sig_z = 1.0 / (1.0 + T.exp(-z_val))
-                            else:
-                                sig_z = T.exp(z_val)
-                                sig_z = sig_z / (1.0 + sig_z)
+                            sig_z = 1.0 / (1.0 + T.exp(-z_val))
                             silu_z = z_val * sig_z
                             silu_dz = sig_z * (1.0 + z_val * (1.0 - sig_z))
 
@@ -1515,9 +1502,8 @@ def _bwd_partial_kernel_for_state_snapshots(
         dD_partial: T.Tensor((BATCH, HEADS, HEADDIM), dD_dtype),
         dh0: T.Tensor((BATCH, HEADS, HEADDIM, STATE), dh0_dtype),
     ):
-        with T.Kernel(T.ceildiv(LANES, THREADS), threads=THREADS) as bx:
-            tid = T.get_thread_binding(0)
-            global_lane = bx * THREADS + tid
+        with T.Kernel(T.ceildiv(LANES, THREADS), threads=THREADS) as _bx:
+            global_lane = T.call_intrin("int32", "tir.metal.thread_position_in_grid_x")
             h_state = T.alloc_local((STATE,), accum_dtype)
             dh = T.alloc_local((STATE,), accum_dtype)
             if global_lane < LANES:
@@ -1544,12 +1530,7 @@ def _bwd_partial_kernel_for_state_snapshots(
                         h_state[n] = h_snap[b, t + 1, h, p, n]
                         y_state += h_state[n] * T.cast(C[b, t, h, n], accum_dtype)
                     y_skipped = y_state + D_h * x_val
-                    sig_z = T.alloc_var(T.float32, init=0.0)
-                    if z_val >= 0.0:
-                        sig_z = 1.0 / (1.0 + T.exp(-z_val))
-                    else:
-                        sig_z = T.exp(z_val)
-                        sig_z = sig_z / (1.0 + sig_z)
+                    sig_z = 1.0 / (1.0 + T.exp(-z_val))
                     silu_z = z_val * sig_z
                     silu_dz = sig_z * (1.0 + z_val * (1.0 - sig_z))
 
