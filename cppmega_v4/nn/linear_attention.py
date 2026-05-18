@@ -181,10 +181,17 @@ class LinearAttentionBlock(nn.Module):
         g = mx.log(mx.sigmoid(self.a_proj(x)) + cfg.norm_eps)  # (B, T, num_v_heads)
 
         if doc_ids is None:
-            o, _ = naive_recurrent_gated_delta_rule(q, k, v, beta, g)
+            # Dispatch through the path system: env-overridable via
+            # CPPMEGA_V4_KERNEL_PATH__LINEAR_ATTENTION, auto-mode picks the
+            # fastest available backend (Path B/C/E if Metal/tilelang/mlx-lm
+            # vendored op are reachable; falls back to Path A).
+            from cppmega_v4._tilelang.linear_attention_paths import (
+                gated_delta_recurrent_dispatch,
+            )
+            o, _ = gated_delta_recurrent_dispatch(q, k, v, beta, g)
         else:
             # Document-boundary state reset: split into runs of contiguous
-            # doc_id, recur within each, concatenate outputs.
+            # doc_id, dispatch each run through the path system, concat.
             o = self._recurrent_with_doc_reset(q, k, v, beta, g, doc_ids)
 
         # o has shape [B, T, H_v, V_dim]; flatten head axis for o_proj.
@@ -232,7 +239,10 @@ class LinearAttentionBlock(nn.Module):
                 vb = v[b:b + 1, s:e]
                 bb = beta[b:b + 1, s:e]
                 gb = g[b:b + 1, s:e]
-                ob, _ = naive_recurrent_gated_delta_rule(qb, kb, vb, bb, gb)
+                from cppmega_v4._tilelang.linear_attention_paths import (
+                    gated_delta_recurrent_dispatch,
+                )
+                ob, _ = gated_delta_recurrent_dispatch(qb, kb, vb, bb, gb)
                 run_outputs.append(ob)
             per_batch_outputs.append(mx.concatenate(run_outputs, axis=1))
         return mx.concatenate(per_batch_outputs, axis=0)

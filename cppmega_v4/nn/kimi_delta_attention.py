@@ -150,7 +150,8 @@ class KimiDeltaAttentionBlock(nn.Module):
         g = g.reshape(batch, seq_len, cfg._num_v_heads, cfg.head_k_dim)
 
         if doc_ids is None:
-            o, _ = naive_recurrent_kda(q, k, v, g, beta)
+            from cppmega_v4._tilelang.kda_paths import kda_recurrent_dispatch
+            o, _ = kda_recurrent_dispatch(q, k, v, g, beta)
         else:
             o = self._recurrent_with_doc_reset(q, k, v, g, beta, doc_ids)
 
@@ -178,7 +179,8 @@ class KimiDeltaAttentionBlock(nn.Module):
             runs.append((start, seq_len))
             outs = []
             for s, e in runs:
-                ob, _ = naive_recurrent_kda(
+                from cppmega_v4._tilelang.kda_paths import kda_recurrent_dispatch
+                ob, _ = kda_recurrent_dispatch(
                     q[b:b + 1, s:e],
                     k[b:b + 1, s:e],
                     v[b:b + 1, s:e],
