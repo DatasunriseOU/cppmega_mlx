@@ -489,13 +489,15 @@ def main() -> int:
             "and paired bench receipt median is no-worse than Path B."
         ),
         "blocked_path_c_codegen_gaps": [
-            "lowered Path C fwd still recomputes some lane-derived indices inside the t loop",
-            "Path C bwd still performs the reverse recurrence serially over T and N per lane",
-            "final-gradient in-kernel P-axis allreduce remains diagnostic only for recurrent bwd hot loops",
+            "Path C bwd materializes explicit state snapshots as a separate safety kernel",
+            "Path C bwd returns per-lane partial buffers and relies on external MLX reductions",
+            "final-gradient in-kernel P-axis allreduce remains diagnostic for recurrent bwd hot loops",
         ],
         "remembered_optimizations": [
             "TileLang local.var scalar y_acc instead of thread float[1]",
             "TileLang Metal local.var PrintExpr statement-order fix",
+            "TileLang Mamba3 fwd/bwd uses Metal thread_position_in_grid for absolute lane ids",
+            "TileLang Mamba3 fwd/bwd uses Path-B-equivalent single-expression SiLU",
             "Bench harness uses paired alternating samples to avoid order/warmup drift",
             "Path C bwd consumes explicit state snapshot boundaries instead of unsafe inverse-state reconstruction",
             "Path C bwd writes generated per-lane partial gradients and moves P-axis reductions outside the recurrent hot loop",

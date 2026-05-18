@@ -1120,11 +1120,13 @@ def _bwd_simd_reduce_kernel_for(
         dh0: T.Tensor((BATCH, HEADS, HEADDIM, STATE), dh0_dtype),
     ):
         with T.Kernel(T.ceildiv(LANES, THREADS), threads=THREADS) as _bx:
+            tid = T.get_thread_binding(0)
             global_lane = T.call_intrin("int32", "tir.metal.thread_position_in_grid_x")
             h_state = T.alloc_local((STATE,), accum_dtype)
             dh = T.alloc_local((STATE,), accum_dtype)
             if global_lane < LANES:
                 p = global_lane % HEADDIM
+                reduce_lane = tid % HEADDIM
                 h = (global_lane // HEADDIM) % HEADS
                 b = global_lane // (HEADDIM * HEADS)
 
@@ -1179,10 +1181,10 @@ def _bwd_simd_reduce_kernel_for(
                             dC_sum = T.alloc_local((1,), accum_dtype)
                             dB_sum = T.alloc_local((1,), accum_dtype)
                             T.thread_allreduce_sum(
-                                d_y_skipped * h_state[n], dC_sum[0], p
+                                d_y_skipped * h_state[n], dC_sum[0], reduce_lane
                             )
-                            T.thread_allreduce_sum(dh_n * x_val, dB_sum[0], p)
-                            if p == 0:
+                            T.thread_allreduce_sum(dh_n * x_val, dB_sum[0], reduce_lane)
+                            if reduce_lane == 0:
                                 dC[b, t, h, n] = T.cast(dC_sum[0], dC_dtype)
                                 dB[b, t, h, n] = T.cast(dB_sum[0], dB_dtype)
                             dx_inp += dh_n * B_val
@@ -1196,10 +1198,10 @@ def _bwd_simd_reduce_kernel_for(
                             dC_sum = T.alloc_local((1,), accum_dtype)
                             dB_sum = T.alloc_local((1,), accum_dtype)
                             T.thread_allreduce_sum(
-                                d_y_skipped * h_state[n], dC_sum[0], p
+                                d_y_skipped * h_state[n], dC_sum[0], reduce_lane
                             )
-                            T.thread_allreduce_sum(dh_n * x_val, dB_sum[0], p)
-                            if p == 0:
+                            T.thread_allreduce_sum(dh_n * x_val, dB_sum[0], reduce_lane)
+                            if reduce_lane == 0:
                                 dC[b, t, h, n] = T.cast(dC_sum[0], dC_dtype)
                                 dB[b, t, h, n] = T.cast(dB_sum[0], dB_dtype)
                             dx_inp += dh_n * B_val
@@ -1215,17 +1217,17 @@ def _bwd_simd_reduce_kernel_for(
                     ddt_lane = d_logdecay * A_val
                     dA_sum = T.alloc_local((1,), accum_dtype)
                     ddt_sum = T.alloc_local((1,), accum_dtype)
-                    T.thread_allreduce_sum(dA_lane, dA_sum[0], p)
-                    T.thread_allreduce_sum(ddt_lane, ddt_sum[0], p)
-                    if p == 0:
+                    T.thread_allreduce_sum(dA_lane, dA_sum[0], reduce_lane)
+                    T.thread_allreduce_sum(ddt_lane, ddt_sum[0], reduce_lane)
+                    if reduce_lane == 0:
                         dA[b, t, h] = T.cast(dA_sum[0], dA_dtype)
                         ddt[b, t, h] = T.cast(ddt_sum[0], ddt_dtype)
 
                 for n in T.serial(STATE):
                     dh0[b, h, p, n] = T.cast(dh[n], dh0_dtype)
                 dD_sum = T.alloc_local((1,), accum_dtype)
-                T.thread_allreduce_sum(dD_acc, dD_sum[0], p)
-                if p == 0:
+                T.thread_allreduce_sum(dD_acc, dD_sum[0], reduce_lane)
+                if reduce_lane == 0:
                     dD_batch[b, h] = T.cast(dD_sum[0], dD_dtype)
 
     artifact = dispatch_lower(bwd_simd, target="metal", return_msl=True)
@@ -1323,11 +1325,13 @@ def _bwd_simd_reduce_kernel_for_state_snapshots(
         dh0: T.Tensor((BATCH, HEADS, HEADDIM, STATE), dh0_dtype),
     ):
         with T.Kernel(T.ceildiv(LANES, THREADS), threads=THREADS) as _bx:
+            tid = T.get_thread_binding(0)
             global_lane = T.call_intrin("int32", "tir.metal.thread_position_in_grid_x")
             h_state = T.alloc_local((STATE,), accum_dtype)
             dh = T.alloc_local((STATE,), accum_dtype)
             if global_lane < LANES:
                 p = global_lane % HEADDIM
+                reduce_lane = tid % HEADDIM
                 h = (global_lane // HEADDIM) % HEADS
                 b = global_lane // (HEADDIM * HEADS)
 
@@ -1382,10 +1386,10 @@ def _bwd_simd_reduce_kernel_for_state_snapshots(
                                 T.thread_allreduce_sum(
                                     d_y_skipped * h_state[n],
                                     dC_sum[0],
-                                    p,
+                                    reduce_lane,
                                 )
-                                T.thread_allreduce_sum(dh_n * x_val, dB_sum[0], p)
-                                if p == 0:
+                                T.thread_allreduce_sum(dh_n * x_val, dB_sum[0], reduce_lane)
+                                if reduce_lane == 0:
                                     dC[b, t, h, n] = T.cast(dC_sum[0], dC_dtype)
                                     dB[b, t, h, n] = T.cast(dB_sum[0], dB_dtype)
                                 dx_inp += dh_n * B_val
@@ -1401,17 +1405,17 @@ def _bwd_simd_reduce_kernel_for_state_snapshots(
                             ddt_lane = d_logdecay * A_val
                             dA_sum = T.alloc_local((1,), accum_dtype)
                             ddt_sum = T.alloc_local((1,), accum_dtype)
-                            T.thread_allreduce_sum(dA_lane, dA_sum[0], p)
-                            T.thread_allreduce_sum(ddt_lane, ddt_sum[0], p)
-                            if p == 0:
+                            T.thread_allreduce_sum(dA_lane, dA_sum[0], reduce_lane)
+                            T.thread_allreduce_sum(ddt_lane, ddt_sum[0], reduce_lane)
+                            if reduce_lane == 0:
                                 dA[b, t, h] = T.cast(dA_sum[0], dA_dtype)
                                 ddt[b, t, h] = T.cast(ddt_sum[0], ddt_dtype)
 
                 for n in T.serial(STATE):
                     dh0[b, h, p, n] = T.cast(dh[n], dh0_dtype)
                 dD_sum = T.alloc_local((1,), accum_dtype)
-                T.thread_allreduce_sum(dD_acc, dD_sum[0], p)
-                if p == 0:
+                T.thread_allreduce_sum(dD_acc, dD_sum[0], reduce_lane)
+                if reduce_lane == 0:
                     dD_batch[b, h] = T.cast(dD_sum[0], dD_dtype)
 
     artifact = dispatch_lower(bwd_snap_simd, target="metal", return_msl=True)

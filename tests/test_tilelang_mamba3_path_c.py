@@ -382,14 +382,15 @@ def test_raw_lowering_uses_tilelang_metal_scalar_pipeline() -> None:
     _require_mamba3_path_c()
 
     _kernel, lowering = mamba3_path_c._bwd_simd_reduce_kernel_for_state_snapshots(
-        1, 4, 1, 2, 4
+        1, 4, 1, 64, 4
     )
     assert lowering.grid == (1, 1, 1)
-    assert lowering.threadgroup == (2, 1, 1)
+    assert lowering.threadgroup == (64, 1, 1)
     assert "h_snap" in lowering.body
     assert "float decay = exp(" in lowering.body
     assert "1.000000e+00 / decay" not in lowering.body
     assert "exp((A_val * dt_val))" not in lowering.body
+    assert "T.metal_thread_position_in_grid_x() % 64" not in lowering.body
 
 
 def test_path_c_launch_geometry_comes_from_tilelang_lowering() -> None:

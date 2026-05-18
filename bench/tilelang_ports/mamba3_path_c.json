@@ -33,72 +33,72 @@
   "timings": {
     "fwd_path_b": {
       "label": "fwd_path_b",
-      "mean_ms": 5.522979200759437,
-      "median_ms": 5.502729502040893,
-      "min_ms": 5.456540995510295,
-      "max_ms": 5.6501670042052865,
+      "mean_ms": 5.45246660039993,
+      "median_ms": 5.445874492579605,
+      "min_ms": 5.397458007792011,
+      "max_ms": 5.517917001270689,
       "iters": 10,
       "warmup": 3,
       "measurement": "paired_alternating"
     },
     "fwd_path_c": {
       "label": "fwd_path_c",
-      "mean_ms": 4.618183099955786,
-      "median_ms": 4.619500003173016,
-      "min_ms": 4.545582996797748,
-      "max_ms": 4.678625002270564,
+      "mean_ms": 4.607933398801833,
+      "median_ms": 4.617666992999148,
+      "min_ms": 4.51483299548272,
+      "max_ms": 4.65354100742843,
       "iters": 10,
       "warmup": 3,
       "measurement": "paired_alternating"
     },
     "fwd_bwd_path_b": {
       "label": "fwd_bwd_path_b",
-      "mean_ms": 75.87897090124898,
-      "median_ms": 75.31389550422318,
-      "min_ms": 74.12695899256505,
-      "max_ms": 79.35158400505316,
+      "mean_ms": 74.2388666010811,
+      "median_ms": 74.38910450582625,
+      "min_ms": 73.41383300081361,
+      "max_ms": 74.8265000001993,
       "iters": 10,
       "warmup": 3,
       "measurement": "paired_alternating"
     },
     "fwd_bwd_path_c": {
       "label": "fwd_bwd_path_c",
-      "mean_ms": 81.04167500277981,
-      "median_ms": 80.02666699758265,
-      "min_ms": 76.515417007613,
-      "max_ms": 84.50462500331923,
+      "mean_ms": 78.66660819854587,
+      "median_ms": 78.39095799863571,
+      "min_ms": 74.74725000793114,
+      "max_ms": 85.78729200235102,
       "iters": 10,
       "warmup": 3,
       "measurement": "paired_alternating"
     },
-    "bwd_path_b_median_ms": 69.81116600218229,
-    "bwd_path_c_median_ms": 75.40716699440964
+    "bwd_path_b_median_ms": 68.94323001324665,
+    "bwd_path_c_median_ms": 73.77329100563657
   },
   "bwd_profile": {
     "generated_partial_kernel": {
       "label": "bwd_path_c_generated_partials",
-      "mean_ms": 71.74030839523766,
-      "median_ms": 71.4143749937648,
-      "min_ms": 70.90587499260437,
-      "max_ms": 72.96049999422394,
+      "mean_ms": 70.47153330058791,
+      "median_ms": 70.15604100160999,
+      "min_ms": 69.36979199235793,
+      "max_ms": 74.5268339960603,
       "iters": 10,
       "warmup": 3
     },
     "simd_p_reduce_kernel": {
       "label": "bwd_path_c_simd_p_reduce_diagnostic",
-      "mean_ms": 92.45353759761201,
-      "median_ms": 92.33262499037664,
-      "min_ms": 91.85583400540054,
-      "max_ms": 93.4950830123853,
+      "mean_ms": 88.6143419003929,
+      "median_ms": 88.66360449610511,
+      "min_ms": 88.15495899762027,
+      "max_ms": 89.18954200635199,
       "iters": 10,
       "warmup": 3
     }
   },
   "gflops": {
-    "fwd_path_b": 880.3669375722112,
-    "fwd_path_c": 1048.6894938137225,
-    "fwd_bwd_path_b": 257.2922878343666,
-    "fwd_bwd_path_c": 242.14034155121487
+    "fwd_path_b": 889.5579812940733,
+    "fwd_path_c": 1049.1057772993665,
+    "fwd_bwd_path_b": 260.4908959279422,
+    "fwd_bwd_path_c": 247.19285201664766
   },
   "memory_bytes_peak": {
     "fwd_path_b": 509215408,
@@ -136,19 +136,21 @@
       "reason": "rule: fp32-accumulating bfloat16 per-lane scan with 256 threads over 28 blocks; z3 proved per-lane index decomposition and buffer bounds; bwd reverse pass consumes explicit state snapshot tensor boundaries instead of inverse h_prev reconstruction; bwd emits TileLang per-lane partial gradients and reduces P-axis outside the hot scan kernel"
     },
     "ratios": {
-      "fwd_path_c_over_path_b": 0.8394924739549167,
-      "bwd_path_c_over_path_b": 1.08015911082265,
-      "fwd_bwd_path_c_over_path_b": 1.0625750595133563
+      "fwd_path_c_over_path_b": 0.8479202007484841,
+      "bwd_path_c_over_path_b": 1.070058524839377,
+      "fwd_bwd_path_c_over_path_b": 1.0537962315771126
     },
     "optimization_policy": "AUTO only promotes a Path C phase when the rule/Z3 plan is safe and paired bench receipt median is no-worse than Path B.",
     "blocked_path_c_codegen_gaps": [
-      "lowered Path C fwd still recomputes some lane-derived indices inside the t loop",
-      "Path C bwd still performs the reverse recurrence serially over T and N per lane",
-      "final-gradient in-kernel P-axis allreduce remains diagnostic only for recurrent bwd hot loops"
+      "Path C bwd materializes explicit state snapshots as a separate safety kernel",
+      "Path C bwd returns per-lane partial buffers and relies on external MLX reductions",
+      "final-gradient in-kernel P-axis allreduce remains diagnostic for recurrent bwd hot loops"
     ],
     "remembered_optimizations": [
       "TileLang local.var scalar y_acc instead of thread float[1]",
       "TileLang Metal local.var PrintExpr statement-order fix",
+      "TileLang Mamba3 fwd/bwd uses Metal thread_position_in_grid for absolute lane ids",
+      "TileLang Mamba3 fwd/bwd uses Path-B-equivalent single-expression SiLU",
       "Bench harness uses paired alternating samples to avoid order/warmup drift",
       "Path C bwd consumes explicit state snapshot boundaries instead of unsafe inverse-state reconstruction",
       "Path C bwd writes generated per-lane partial gradients and moves P-axis reductions outside the recurrent hot loop",
@@ -157,9 +159,9 @@
       "AUTO can still select Path C forward with Path B backward when only fwd is no-worse"
     ]
   },
-  "ratio_path_c_over_path_b_fwd": 0.8394924739549167,
-  "ratio_path_c_over_path_b_bwd": 1.08015911082265,
-  "ratio_path_c_over_path_b_fwd_bwd": 1.0625750595133563,
+  "ratio_path_c_over_path_b_fwd": 0.8479202007484841,
+  "ratio_path_c_over_path_b_bwd": 1.070058524839377,
+  "ratio_path_c_over_path_b_fwd_bwd": 1.0537962315771126,
   "verdict": "Path C forward is no-worse than Path B and is eligible for AUTO promotion, but Path C backward is slower; scheduler selects Path C forward with Path B backward.",
   "matched_run_guard": "Compare Path B and Path C only when both rows were collected on the same hardware with identical kernel inputs. This is a local_only receipt."
 }

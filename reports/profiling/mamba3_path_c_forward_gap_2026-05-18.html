@@ -80,7 +80,7 @@
       <div class="head"><h2>Conclusion</h2><p>2026-05-18</p></div>
       <div class="body">
         <div class="callout">
-          The forward regression is fixed for the BF16 1B-model shape: Path C forward moved from <span class="bad">1.29x slower</span> than Path B to <span class="good">0.84x of Path B</span>. The remaining default-training blocker is backward, not forward.
+          The forward regression is fixed for the BF16 1B-model shape: Path C forward moved from <span class="bad">1.29x slower</span> than Path B to <span class="good">0.85x of Path B</span>. Carrying the same lane-id and SiLU fixes into backward reduced BF16 bwd C/B from <span class="bad">1.080</span> to <span class="warn">1.070</span>; the remaining blocker is the safer snapshot/reduction backward route, not forward.
         </div>
       </div>
     </section>
@@ -129,6 +129,15 @@
               <td><a href="mamba3_model_shape_path_b_vs_c_after_grid_tid_bf16_2026-05-18.json">json</a> · <a href="mamba3_model_shape_path_b_vs_c_after_grid_tid_bf16_2026-05-18.metal">msl</a> · <a href="mamba3_model_shape_path_b_vs_c_after_grid_tid_bf16_2026-05-18.diff">diff</a></td>
             </tr>
             <tr>
+              <td>Backward lane + SiLU carry-over</td>
+              <td>bf16</td>
+              <td class="num">5.446 ms</td>
+              <td class="num">4.618 ms</td>
+              <td class="num good">0.848</td>
+              <td><code>path_c_fwd_path_b_bwd</code></td>
+              <td><a href="mamba3_model_shape_path_b_vs_c_after_bwd_grid_tid_bf16_2026-05-18.json">json</a> · <a href="mamba3_model_shape_path_b_vs_c_after_bwd_grid_tid_bf16_2026-05-18.metal">msl</a> · <a href="mamba3_model_shape_path_b_vs_c_after_bwd_grid_tid_bf16_2026-05-18.diff">diff</a></td>
+            </tr>
+            <tr>
               <td>Grid lane intrinsic</td>
               <td>fp32</td>
               <td class="num">4.440 ms</td>
@@ -143,18 +152,21 @@
     </section>
 
     <section>
-      <div class="head"><h2>What Changed</h2><p>forward codegen/schedule</p></div>
+      <div class="head"><h2>What Changed</h2><p>codegen/schedule</p></div>
       <div class="body grid">
-        <div class="metric"><span>BF16 forward C/B</span><strong class="good">0.839</strong></div>
+        <div class="metric"><span>BF16 forward C/B</span><strong class="good">0.848</strong></div>
         <div class="metric"><span>FP32 forward C/B</span><strong>1.050</strong></div>
-        <div class="metric"><span>BF16 fwd+bwd C/B</span><strong>1.063</strong></div>
+        <div class="metric"><span>BF16 bwd C/B</span><strong>1.070</strong></div>
+        <div class="metric"><span>BF16 fwd+bwd C/B</span><strong>1.054</strong></div>
+        <div class="metric"><span>BF16 generated bwd</span><strong>70.156 ms</strong></div>
         <div class="metric"><span>BF16 Path C fwd+bwd peak</span><strong>11.49 GB</strong></div>
       </div>
       <div class="body">
         <ul>
           <li>Replaced the branchy generated forward sigmoid with the Path-B-equivalent single-expression SiLU.</li>
           <li>Hoisted <code>D[h]</code> out of the time loop.</li>
-          <li>Changed forward lane id lowering to use <code>thread_position_in_grid</code>, removing the hot <code>blockIdx * THREADS + threadIdx</code> address arithmetic from Path C.</li>
+          <li>Changed forward and backward lane id lowering to use <code>thread_position_in_grid</code>, removing the hot <code>blockIdx * THREADS + threadIdx</code> address arithmetic from Path C.</li>
+          <li>Carried the Path-B-equivalent SiLU expression into generated backward; the old branchy backward sigmoid is gone from the lowered MSL.</li>
           <li>Reinstalled TileLang into <code>nanochat/.venv</code> with <code>--no-build-isolation</code> so the native MLX/TVM-FFI bridge is present in the benchmark environment.</li>
         </ul>
       </div>
