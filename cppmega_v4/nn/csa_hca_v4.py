@@ -33,6 +33,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from cppmega_v4.nn.nsa_v4 import _apply_mask_and_softmax
+from cppmega_v4.nn.streaming_kv_cache import StreamingPoolCache
 
 
 @dataclass(frozen=True)
@@ -181,6 +182,108 @@ class CSAHCAHybridV4(nn.Module):
         ], axis=-1)                                                # [B,S,H,D,2]
         mixed = (branches * gate[:, :, None, None, :]).sum(axis=-1)
         out = mixed.reshape(B, S, cfg.hidden_size)
+        return self.norm(self.o_proj(out))
+
+
+    def make_streaming_caches(
+        self, batch: int, dtype: mx.Dtype = mx.float32,
+    ) -> tuple[StreamingPoolCache, StreamingPoolCache]:
+        """Construct empty (csa, hca) StreamingPoolCache instances for decode.
+
+        Returns:
+            (csa_cache, hca_cache) — each accepts ``append(k_new, v_new)``
+            with ``k_new`` shaped ``[batch, T_new, num_heads, head_dim]``.
+        """
+        cfg = self.config
+        csa_cache = StreamingPoolCache(
+            m=cfg.m_csa, batch=batch,
+            n_heads=cfg.num_heads, head_dim=cfg.head_dim, dtype=dtype,
+        )
+        hca_cache = StreamingPoolCache(
+            m=cfg.m_hca, batch=batch,
+            n_heads=cfg.num_heads, head_dim=cfg.head_dim, dtype=dtype,
+        )
+        return csa_cache, hca_cache
+
+    def decode_step(
+        self,
+        x_new: mx.array,
+        csa_cache: StreamingPoolCache,
+        hca_cache: StreamingPoolCache,
+        *,
+        csa_select_indices: Optional[mx.array] = None,
+        hca_select_indices: Optional[mx.array] = None,
+    ) -> mx.array:
+        """Streaming decode using StreamingPoolCache.
+
+        For autoregressive decode, the caller appends new K/V to the cache
+        on every call instead of re-pooling the entire history. The cache
+        maintains a running mean per super-token block, so the cost of
+        building the compressed K/V is O(T_new) instead of O(S_total).
+
+        Args:
+            x_new: ``[B, T_new, hidden_size]`` — new hidden states for this
+                step (typically T_new=1 during decode).
+            csa_cache / hca_cache: cache instances from
+                :meth:`make_streaming_caches`; mutated in-place.
+            csa_select_indices / hca_select_indices: optional top-k
+                super-token masks per query.
+
+        Returns:
+            ``[B, T_new, hidden_size]`` output for the new positions only.
+        """
+        cfg = self.config
+        if x_new.ndim != 3 or x_new.shape[-1] != cfg.hidden_size:
+            raise ValueError(
+                f"x_new must be [B, T_new, {cfg.hidden_size}], got {x_new.shape}"
+            )
+        B, T_new, _ = x_new.shape
+        q = self.q_proj(x_new).reshape(B, T_new, cfg.num_heads, cfg.head_dim)
+        k = self.k_proj(x_new).reshape(B, T_new, cfg.num_heads, cfg.head_dim)
+        v = self.v_proj(x_new).reshape(B, T_new, cfg.num_heads, cfg.head_dim)
+
+        # Append the new K/V to both caches, then snapshot to get the
+        # current compressed K/V views.
+        csa_cache.append(k, v)
+        hca_cache.append(k, v)
+        # cache snapshots: [B, n_super, H, D]
+        k_csa_super, v_csa_super = csa_cache.snapshot(include_partial=True)
+        k_hca_super, v_hca_super = hca_cache.snapshot(include_partial=True)
+        # transpose to [B, H, n_super, D] for attention.
+        k_csa = mx.transpose(k_csa_super, (0, 2, 1, 3))
+        v_csa = mx.transpose(v_csa_super, (0, 2, 1, 3))
+        k_hca = mx.transpose(k_hca_super, (0, 2, 1, 3))
+        v_hca = mx.transpose(v_hca_super, (0, 2, 1, 3))
+        q = mx.transpose(q, (0, 2, 1, 3))   # [B, H, T_new, D]
+        scale = cfg.head_dim ** -0.5
+
+        # Plain attention over the (already-compressed) super-tokens.
+        # No causal mask within a single decode step (T_new=1 typically),
+        # but we still enforce causal-in-supertokens vs the cache history.
+        total_tokens = csa_cache.total_tokens
+        start_token = total_tokens - T_new
+        # query at position (start_token + i) can see CSA super-block b iff
+        # b * m_csa <= start_token + i.
+        def _attend(q_, k_super, v_super, m):
+            n_super = k_super.shape[2]
+            rows = mx.arange(T_new)[:, None] + start_token
+            super_start = (mx.arange(n_super)[None, :]) * m
+            mask = (rows >= super_start)[None, None, :, :]
+            scores = mx.matmul(q_, mx.transpose(k_super, (0, 1, 3, 2)))
+            w = _apply_mask_and_softmax(scores, mask, scale)
+            return mx.matmul(w, v_super)
+
+        csa_out = _attend(q, k_csa, v_csa, cfg.m_csa)
+        hca_out = _attend(q, k_hca, v_hca, cfg.m_hca)
+
+        gate_logits = self.branch_gate(x_new)
+        gate = mx.softmax(gate_logits.astype(mx.float32), axis=-1).astype(x_new.dtype)
+        branches = mx.stack([
+            mx.transpose(csa_out, (0, 2, 1, 3)),
+            mx.transpose(hca_out, (0, 2, 1, 3)),
+        ], axis=-1)
+        mixed = (branches * gate[:, :, None, None, :]).sum(axis=-1)
+        out = mixed.reshape(B, T_new, cfg.hidden_size)
         return self.norm(self.o_proj(out))
 
 
