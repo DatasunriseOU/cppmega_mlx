@@ -42,35 +42,50 @@ DEFAULT_PARQUET = (
 
 
 def _make_template(hidden_size: int, layers: int, vocab_size: int) -> RunTemplate:
-    """Build a V4 template close to ~1B params at hidden=2048, layers=12."""
+    """Build a V4 template close to ~1B params at hidden=2048, layers=12.
+
+    Real-factories version: includes GDN (Path A→C dispatchable), KDA,
+    attention, MoE, NSA, CSA+HCA, Engram, MLP — the full V4 cohort.
+    """
+    n_heads = max(1, hidden_size // 64)
+    h_dim = hidden_size // n_heads
+    per_kind = max(1, layers // 6)  # spread layers across 6 attention-like kinds
+    blocks = [
+        BlockSpec(kind="engram", repeat=1, params={
+            "num_ngram_layers": 2, "max_ngram_size": 4,
+            "num_embed_table_per_ngram": 4, "embed_dim": 64,
+            "embed_table_size": 1024,
+        }),
+        BlockSpec(kind="gdn", repeat=per_kind, params={
+            "num_heads": n_heads, "head_dim": h_dim, "use_short_conv": False,
+        }),
+        BlockSpec(kind="kda", repeat=per_kind, params={
+            "num_heads": n_heads, "head_dim": h_dim, "use_short_conv": False,
+        }),
+        BlockSpec(kind="attention", repeat=per_kind, params={
+            "num_heads": n_heads, "head_dim": h_dim,
+        }),
+        BlockSpec(kind="nsa", repeat=per_kind, params={
+            "num_heads": n_heads, "head_dim": h_dim,
+            "compress_block_size": 64, "select_topk": 16,
+            "sliding_window": 256,
+        }),
+        BlockSpec(kind="csa_hca", repeat=per_kind, params={
+            "num_heads": n_heads, "head_dim": h_dim,
+            "m_csa": 4, "m_hca": 16,
+        }),
+        BlockSpec(kind="moe", repeat=per_kind, params={
+            "num_experts": 8, "top_k": 2,
+            "expert_hidden_size": hidden_size * 2,
+        }),
+        BlockSpec(kind="mlp", repeat=max(1, layers - 6 * per_kind),
+                  params={"intermediate_size": hidden_size * 4}),
+    ]
     return RunTemplate(
         name=f"v4_smoke_h{hidden_size}_L{layers}",
         hidden_size=hidden_size,
         vocab_size=vocab_size,
-        blocks=[
-            # Engram boost first (cheap doc-aware n-gram).
-            BlockSpec(kind="engram", repeat=1, params={
-                "num_ngram_layers": 2, "max_ngram_size": 4,
-                "num_embed_table_per_ngram": 4, "embed_dim": 64,
-                "embed_table_size": 1024,
-            }),
-            # NSA × layers/3.
-            BlockSpec(kind="nsa", repeat=max(1, layers // 3), params={
-                "num_heads": max(1, hidden_size // 64),
-                "head_dim": 64,
-                "compress_block_size": 64, "select_topk": 16,
-                "sliding_window": 256,
-            }),
-            # CSA+HCA × layers/3.
-            BlockSpec(kind="csa_hca", repeat=max(1, layers // 3), params={
-                "num_heads": max(1, hidden_size // 64),
-                "head_dim": 64,
-                "m_csa": 4, "m_hca": 16,
-            }),
-            # MLP × remainder.
-            BlockSpec(kind="mlp", repeat=max(1, layers - 2 * (layers // 3)),
-                      params={"intermediate_size": hidden_size * 4}),
-        ],
+        blocks=blocks,
     )
 
 
