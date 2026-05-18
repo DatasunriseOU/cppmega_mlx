@@ -26,10 +26,8 @@ What "real" means here
 
 Constraints
 -----------
-* Caller (the cppmega_v4 dispatcher) must arrange for
-  ``/Volumes/external/sources/tilelang`` to be on ``sys.path`` (or the
-  installed ``tilelang`` wheel must contain ``poc.triton_frontend``).
-  We do not modify ``sys.path`` from this module.
+* Local dev checkouts are discovered via ``_path_d_deps`` so the cppmega
+  runtime adapter can call this module directly.
 * We do not modify the FLA source.
 * We never invoke Metal codegen — the lowering stops at TileLang
   PrimFunc (or degraded coverage report); the caller decides whether
@@ -49,30 +47,83 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Dict, Optional, Tuple
 
+from cppmega_v4._tilelang._path_d_deps import (
+    ensure_fla_root,
+    ensure_triton_frontend_root,
+)
+
+
+def _ensure_path_d_import_roots() -> None:
+    """Make sibling FLA and Triton frontend checkouts importable."""
+
+    ensure_fla_root()
+    ensure_triton_frontend_root()
+
 
 # Default constexpr set used when the caller doesn't pin its own. K=64
 # picks the single-block recurrence (the smallest tractable FLA chunk-h
-# config); the gate / varlen flags are off because Path A handles those
-# cases natively and we want the smoothest reducer exercise here.
+# config); varlen stays off because the runtime adapter binds the fixed
+# recurrent prefill signature first.
 DEFAULT_CONSTEXPRS: Dict[str, Any] = {
-    "H": 1, "HV": 1, "K": 64, "V": 32, "BT": 16, "BV": 32,
-    "USE_G": False, "USE_GK": False,
+    "H": 1, "HV": 1, "K": 64, "V": 32, "BT": 64, "BV": 32,
+    "USE_G": True, "USE_GK": False,
     "USE_INITIAL_STATE": False, "STORE_FINAL_STATE": False,
-    "SAVE_NEW_VALUE": False, "TRANSPOSE_STATE": False,
+    "SAVE_NEW_VALUE": True, "TRANSPOSE_STATE": False,
     "IS_VARLEN": False,
 }
 
 # Explicit Triton signature: pointer params get their real element type
-# (k/v/w/v_new are fp16, gates/state are fp32). The reducer's
+# (k/v/w/v_new/h are fp16, gates/final state are fp32). The reducer's
 # ``_infer_signature`` helper only handles ``_ptr``-suffixed names; FLA
 # names its pointers ``k``, ``v``, ``w`` … so we override.
 DEFAULT_SIGNATURE: Dict[str, str] = {
     "k": "*fp16", "v": "*fp16", "w": "*fp16", "v_new": "*fp16",
     "g": "*fp32", "gk": "*fp32",
-    "h": "*fp32", "h0": "*fp32", "ht": "*fp32",
+    "h": "*fp16", "h0": "*fp32", "ht": "*fp32",
     "cu_seqlens": "*fp32", "chunk_offsets": "*fp32",
     "T": "i32",
 }
+
+DEFAULT_CHUNK_O_CONSTEXPRS: Dict[str, Any] = {
+    "H": 1, "HV": 1, "K": 64, "V": 32,
+    "BT": 64, "BK": 64, "BV": 32,
+    "USE_G": True, "USE_G_GAMMA": False,
+    "TRANSPOSE_STATE": False, "IS_VARLEN": False,
+}
+
+DEFAULT_CHUNK_O_SIGNATURE: Dict[str, str] = {
+    "q": "*fp16", "k": "*fp16", "v": "*fp16", "h": "*fp16",
+    "g": "*fp32", "g_gamma": "*fp32", "o": "*fp16",
+    "cu_seqlens": "*i64", "chunk_indices": "*i64",
+    "scale": "fp32", "T": "i32",
+}
+
+DEFAULT_GDN_KKT_CONSTEXPRS: Dict[str, Any] = {
+    "H": 1, "HV": 1, "K": 64,
+    "BT": 64, "BC": 16, "BK": 64,
+    "USE_G": True, "IS_VARLEN": False,
+}
+
+DEFAULT_GDN_KKT_SIGNATURE: Dict[str, str] = {
+    "k": "*fp16", "g": "*fp32", "beta": "*fp32", "A": "*fp16",
+    "cu_seqlens": "*i64", "chunk_indices": "*i64",
+    "T": "i32",
+}
+
+DEFAULT_GDN_RECOMPUTE_W_U_CONSTEXPRS: Dict[str, Any] = {
+    "H": 1, "HV": 1, "K": 64, "V": 32,
+    "BT": 64, "BK": 64, "BV": 64,
+    "USE_G": True, "IS_VARLEN": False,
+}
+
+DEFAULT_GDN_RECOMPUTE_W_U_SIGNATURE: Dict[str, str] = {
+    "k": "*fp16", "v": "*fp16", "beta": "*fp32",
+    "w": "*fp16", "u": "*fp16", "A": "*fp16", "g": "*fp32",
+    "cu_seqlens": "*i64", "chunk_indices": "*i64",
+    "T": "i32",
+}
+
+DEFAULT_RUNTIME_T = 64
 
 
 @dataclass
@@ -142,109 +193,324 @@ def _cached_lower(constexprs_key: Tuple[Tuple[str, Any], ...]) -> LowerResult:
     return _lower_uncached(dict(constexprs_key))
 
 
-def _lower_uncached(constexprs: Dict[str, Any]) -> LowerResult:
-    """Real lowering driver, no cache. Catches every step's exception so
-    the dispatcher gets a structured ``LowerResult`` instead of a raise."""
-    # Step 0: import the FLA kernel + triton_frontend pieces.
+@lru_cache(maxsize=4)
+def _cached_lower_chunk_o(constexprs_key: Tuple[Tuple[str, Any], ...]) -> LowerResult:
+    return _lower_chunk_o_uncached(dict(constexprs_key))
+
+
+@lru_cache(maxsize=4)
+def _cached_lower_gdn_kkt(constexprs_key: Tuple[Tuple[str, Any], ...]) -> LowerResult:
+    return _lower_gdn_kkt_uncached(dict(constexprs_key))
+
+
+@lru_cache(maxsize=4)
+def _cached_lower_gdn_recompute_w_u(
+    constexprs_key: Tuple[Tuple[str, Any], ...],
+) -> LowerResult:
+    return _lower_gdn_recompute_w_u_uncached(dict(constexprs_key))
+
+
+def _lower_uncached(
+    constexprs: Dict[str, Any],
+    grid: Optional[Tuple[int, ...]] = None,
+) -> LowerResult:
+    _ensure_path_d_import_roots()
     try:
         from fla.ops.common.chunk_delta_h import (
             chunk_gated_delta_rule_fwd_kernel_h_blockdim64 as kfn,
         )
     except Exception as exc:
-        return LowerResult(
-            status="FAILED_PARSE",
-            visited_ops=[],
-            missing_ops=[],
-            prim_func=None,
-            ttir_text_len=0,
-            error_type=type(exc).__name__,
-            error_message=f"FLA import failed: {exc}",
-            constexprs=constexprs,
+        return _failed_lower(
+            "FAILED_PARSE",
+            type(exc).__name__,
+            f"FLA import failed: {exc}",
+            constexprs,
         )
+    return _lower_fla_kernel_uncached(
+        kfn=kfn,
+        constexprs=constexprs,
+        signature=DEFAULT_SIGNATURE,
+        primfunc_name="fla_chunk_delta_h",
+        grid=grid,
+        arg_buffer_shapes=_chunk_h_arg_buffer_shapes(constexprs, grid),
+    )
+
+
+def _lower_chunk_o_uncached(
+    constexprs: Dict[str, Any],
+    grid: Optional[Tuple[int, ...]] = None,
+) -> LowerResult:
+    _ensure_path_d_import_roots()
+    try:
+        from fla.ops.common.chunk_o import chunk_fwd_kernel_o as kfn
+    except Exception as exc:
+        return _failed_lower(
+            "FAILED_PARSE",
+            type(exc).__name__,
+            f"FLA chunk_o import failed: {exc}",
+            constexprs,
+        )
+    return _lower_fla_kernel_uncached(
+        kfn=kfn,
+        constexprs=constexprs,
+        signature=DEFAULT_CHUNK_O_SIGNATURE,
+        primfunc_name="fla_chunk_o",
+        grid=grid,
+        arg_buffer_shapes=_chunk_o_arg_buffer_shapes(constexprs, grid),
+    )
+
+
+def _lower_gdn_kkt_uncached(
+    constexprs: Dict[str, Any],
+    grid: Optional[Tuple[int, ...]] = None,
+) -> LowerResult:
+    _ensure_path_d_import_roots()
+    try:
+        from fla.ops.gated_delta_rule.chunk_fwd import (
+            chunk_gated_delta_rule_fwd_kkt_solve_kernel as kfn,
+        )
+    except Exception as exc:
+        return _failed_lower(
+            "FAILED_PARSE",
+            type(exc).__name__,
+            f"FLA GDN KKT import failed: {exc}",
+            constexprs,
+        )
+    return _lower_fla_kernel_uncached(
+        kfn=kfn,
+        constexprs=constexprs,
+        signature=DEFAULT_GDN_KKT_SIGNATURE,
+        primfunc_name="fla_gdn_kkt_solve",
+        grid=grid,
+        arg_buffer_shapes=_gdn_kkt_arg_buffer_shapes(constexprs, grid),
+    )
+
+
+def _lower_gdn_recompute_w_u_uncached(
+    constexprs: Dict[str, Any],
+    grid: Optional[Tuple[int, ...]] = None,
+) -> LowerResult:
+    _ensure_path_d_import_roots()
+    try:
+        from fla.ops.gated_delta_rule.wy_fast import recompute_w_u_fwd_kernel as kfn
+    except Exception as exc:
+        return _failed_lower(
+            "FAILED_PARSE",
+            type(exc).__name__,
+            f"FLA GDN recompute_w_u import failed: {exc}",
+            constexprs,
+        )
+    return _lower_fla_kernel_uncached(
+        kfn=kfn,
+        constexprs=constexprs,
+        signature=DEFAULT_GDN_RECOMPUTE_W_U_SIGNATURE,
+        primfunc_name="fla_gdn_recompute_w_u",
+        grid=grid,
+        arg_buffer_shapes=_gdn_recompute_arg_buffer_shapes(constexprs, grid),
+    )
+
+
+def _runtime_t(_constexprs: Dict[str, Any]) -> int:
+    """Static T paired with the cppmega Path D scalar specialization."""
+
+    return DEFAULT_RUNTIME_T
+
+
+def _num_chunks(t: int, bt: int) -> int:
+    return max((int(t) + int(bt) - 1) // int(bt), 1)
+
+
+def _batch_from_grid(grid: Optional[Tuple[int, ...]], hv: int) -> int:
+    if grid is None or len(grid) < 2:
+        return 1
+    return max(int(grid[1]) // max(int(hv), 1), 1)
+
+
+def _full_arg(extent: int) -> Tuple[int]:
+    return (max(int(extent), 1),)
+
+
+def _gdn_kkt_arg_buffer_shapes(
+    constexprs: Dict[str, Any],
+    grid: Optional[Tuple[int, ...]],
+) -> Dict[int, Tuple[int]]:
+    t = _runtime_t(constexprs)
+    h = int(constexprs["H"])
+    hv = int(constexprs["HV"])
+    k = int(constexprs["K"])
+    bt = int(constexprs["BT"])
+    b = _batch_from_grid(grid, hv)
+    return {
+        0: _full_arg(b * t * h * k),      # k
+        1: _full_arg(b * t * hv),         # g
+        2: _full_arg(b * t * hv),         # beta
+        3: _full_arg(b * t * hv * bt),    # A
+        4: _full_arg(1),                  # cu_seqlens, unused when IS_VARLEN=False
+        5: _full_arg(1),                  # chunk_indices, unused when IS_VARLEN=False
+    }
+
+
+def _gdn_recompute_arg_buffer_shapes(
+    constexprs: Dict[str, Any],
+    grid: Optional[Tuple[int, ...]],
+) -> Dict[int, Tuple[int]]:
+    t = _runtime_t(constexprs)
+    h = int(constexprs["H"])
+    hv = int(constexprs["HV"])
+    k = int(constexprs["K"])
+    v = int(constexprs["V"])
+    bt = int(constexprs["BT"])
+    b = _batch_from_grid(grid, hv)
+    return {
+        0: _full_arg(b * t * h * k),      # k
+        1: _full_arg(b * t * hv * v),     # v
+        2: _full_arg(b * t * hv),         # beta
+        3: _full_arg(b * t * hv * k),     # w
+        4: _full_arg(b * t * hv * v),     # u
+        5: _full_arg(b * t * hv * bt),    # A
+        6: _full_arg(b * t * hv),         # g
+        7: _full_arg(1),                  # cu_seqlens
+        8: _full_arg(1),                  # chunk_indices
+    }
+
+
+def _chunk_h_arg_buffer_shapes(
+    constexprs: Dict[str, Any],
+    grid: Optional[Tuple[int, ...]],
+) -> Dict[int, Tuple[int]]:
+    t = _runtime_t(constexprs)
+    h = int(constexprs["H"])
+    hv = int(constexprs["HV"])
+    k = int(constexprs["K"])
+    v = int(constexprs["V"])
+    bt = int(constexprs["BT"])
+    nt = _num_chunks(t, bt)
+    b = _batch_from_grid(grid, hv)
+    return {
+        0: _full_arg(b * t * h * k),       # k
+        1: _full_arg(b * t * hv * v),      # v/u
+        2: _full_arg(b * t * hv * k),      # w
+        3: _full_arg(b * t * hv * v),      # v_new
+        4: _full_arg(b * t * hv),          # g
+        5: _full_arg(b * t * hv * k),      # gk
+        6: _full_arg(b * nt * hv * k * v), # h
+        7: _full_arg(b * hv * k * v),      # h0
+        8: _full_arg(b * hv * k * v),      # ht
+        9: _full_arg(1),                   # cu_seqlens
+        10: _full_arg(1),                  # chunk_offsets
+    }
+
+
+def _chunk_o_arg_buffer_shapes(
+    constexprs: Dict[str, Any],
+    grid: Optional[Tuple[int, ...]],
+) -> Dict[int, Tuple[int]]:
+    t = _runtime_t(constexprs)
+    h = int(constexprs["H"])
+    hv = int(constexprs["HV"])
+    k = int(constexprs["K"])
+    v = int(constexprs["V"])
+    bt = int(constexprs["BT"])
+    nt = _num_chunks(t, bt)
+    b = _batch_from_grid(grid[1:] if grid is not None and len(grid) == 3 else grid, hv)
+    if grid is not None and len(grid) >= 3:
+        b = max(int(grid[2]) // max(hv, 1), 1)
+    return {
+        0: _full_arg(b * t * h * k),       # q
+        1: _full_arg(b * t * h * k),       # k
+        2: _full_arg(b * t * hv * v),      # v_new
+        3: _full_arg(b * nt * hv * k * v), # h
+        4: _full_arg(b * t * hv),          # g
+        5: _full_arg(hv),                  # g_gamma
+        6: _full_arg(b * t * hv * v),      # o
+        7: _full_arg(1),                   # cu_seqlens
+        8: _full_arg(1),                   # chunk_indices
+    }
+
+
+def _failed_lower(
+    status: str,
+    error_type: str,
+    error_message: str,
+    constexprs: Dict[str, Any],
+    *,
+    ttir_text_len: int = 0,
+    missing_ops: Optional[list] = None,
+) -> LowerResult:
+    return LowerResult(
+        status=status,
+        visited_ops=[],
+        missing_ops=missing_ops or [],
+        prim_func=None,
+        ttir_text_len=ttir_text_len,
+        error_type=error_type,
+        error_message=error_message,
+        constexprs=constexprs,
+    )
+
+
+def _lower_fla_kernel_uncached(
+    *,
+    kfn: Any,
+    constexprs: Dict[str, Any],
+    signature: Dict[str, str],
+    primfunc_name: str,
+    grid: Optional[Tuple[int, ...]] = None,
+    arg_buffer_shapes: Optional[Dict[int, Tuple[int]]] = None,
+) -> LowerResult:
+    """Real lowering driver, no cache.
+
+    Catches every step's exception so the dispatcher gets a structured
+    ``LowerResult`` instead of a raise. The explicit signature avoids the
+    harness's ``_ptr``-suffix heuristic, which would otherwise type FLA pointer
+    params as i32 and fail at ``tt.addptr``.
+    """
+    _ensure_path_d_import_roots()
     try:
         from poc.triton_frontend._test_harness.jit_to_ttir import (
             TTIRCaptureError,
             TritonUnavailable,
         )
     except Exception as exc:
-        return LowerResult(
-            status="FAILED_OTHER",
-            visited_ops=[],
-            missing_ops=[],
-            prim_func=None,
-            ttir_text_len=0,
-            error_type=type(exc).__name__,
-            error_message=f"poc.triton_frontend import failed: {exc}",
-            constexprs=constexprs,
+        return _failed_lower(
+            "FAILED_OTHER",
+            type(exc).__name__,
+            f"poc.triton_frontend import failed: {exc}",
+            constexprs,
         )
 
-    # Step 1: unwrap heuristics/autotuner to the JITFunction.
     try:
         inner = _unwrap_to_jit_function(kfn)
     except Exception as exc:
-        return LowerResult(
-            status="FAILED_OTHER",
-            visited_ops=[],
-            missing_ops=[],
-            prim_func=None,
-            ttir_text_len=0,
-            error_type=type(exc).__name__,
-            error_message=str(exc),
-            constexprs=constexprs,
+        return _failed_lower(
+            "FAILED_OTHER", type(exc).__name__, str(exc), constexprs,
         )
 
-    # Step 2: capture TTIR via Triton 3.6 make_ir with explicit signature.
-    # We bypass the harness's auto-inferred signature because FLA's
-    # pointer params (k, v, w, …) don't carry the ``_ptr`` suffix the
-    # default inferer keys off, so they'd be typed i32 and the kernel
-    # would fail at the first ``tt.addptr`` with "Expected base to be a
-    # scalar pointer type".
     try:
         ttir_text = _capture_ttir_with_explicit_signature(
-            inner, constexprs, DEFAULT_SIGNATURE,
+            inner, constexprs, signature,
         )
-    except TTIRCaptureError as exc:
-        return LowerResult(
-            status="FAILED_PARSE",
-            visited_ops=[],
-            missing_ops=[],
-            prim_func=None,
-            ttir_text_len=0,
-            error_type=type(exc).__name__,
-            error_message=str(exc),
-            constexprs=constexprs,
-        )
-    except TritonUnavailable as exc:
-        return LowerResult(
-            status="FAILED_PARSE",
-            visited_ops=[],
-            missing_ops=[],
-            prim_func=None,
-            ttir_text_len=0,
-            error_type=type(exc).__name__,
-            error_message=str(exc),
-            constexprs=constexprs,
+    except (TTIRCaptureError, TritonUnavailable) as exc:
+        return _failed_lower(
+            "FAILED_PARSE", type(exc).__name__, str(exc), constexprs,
         )
     except Exception as exc:
-        return LowerResult(
-            status="FAILED_OTHER",
-            visited_ops=[],
-            missing_ops=[],
-            prim_func=None,
-            ttir_text_len=0,
-            error_type=type(exc).__name__,
-            error_message=str(exc),
-            constexprs=constexprs,
+        return _failed_lower(
+            "FAILED_OTHER", type(exc).__name__, str(exc), constexprs,
         )
 
-    # Step 3: thread through the reducer. Prefer ``from_ttir`` directly
-    # so we control the text-vs-mlir routing; ``from_triton_kernel``
-    # would re-capture and double the work.
+    # Prefer ``from_ttir`` directly so we control the text-vs-mlir routing;
+    # ``from_triton_kernel`` would re-capture and double the work.
     try:
         from poc.triton_frontend import from_ttir, _walk_text_ttir
-        from poc.triton_frontend import OP_TABLE
+
         try:
-            prim = from_ttir(ttir_text, name="fla_chunk_delta_h")
+            prim = from_ttir(
+                ttir_text,
+                name=primfunc_name,
+                grid=grid,
+                arg_buffer_shapes=arg_buffer_shapes,
+            )
             return LowerResult(
                 status="LOWERED_FULL",
                 visited_ops=_walk_text_ttir(ttir_text),
@@ -256,35 +522,27 @@ def _lower_uncached(constexprs: Dict[str, Any]) -> LowerResult:
                 constexprs=constexprs,
             )
         except NotImplementedError as exc:
-            # Specific op missing from OP_TABLE -> FAILED_OPS.
-            return LowerResult(
-                status="FAILED_OPS",
-                visited_ops=[],
-                missing_ops=[str(exc)],
-                prim_func=None,
+            return _failed_lower(
+                "FAILED_OPS",
+                type(exc).__name__,
+                str(exc),
+                constexprs,
                 ttir_text_len=len(ttir_text),
-                error_type=type(exc).__name__,
-                error_message=str(exc),
-                constexprs=constexprs,
+                missing_ops=[str(exc)],
             )
         except Exception:
-            # Fall through to text walker for at least op coverage.
             pass
 
-        # Degraded path: text walker. Returns visited op list; raises
-        # NotImplementedError if an op isn't in OP_TABLE.
         try:
             visited = _walk_text_ttir(ttir_text)
         except NotImplementedError as exc:
-            return LowerResult(
-                status="FAILED_OPS",
-                visited_ops=[],
-                missing_ops=[str(exc)],
-                prim_func=None,
+            return _failed_lower(
+                "FAILED_OPS",
+                type(exc).__name__,
+                str(exc),
+                constexprs,
                 ttir_text_len=len(ttir_text),
-                error_type=type(exc).__name__,
-                error_message=str(exc),
-                constexprs=constexprs,
+                missing_ops=[str(exc)],
             )
         return LowerResult(
             status="LOWERED_DEGRADED",
@@ -297,15 +555,12 @@ def _lower_uncached(constexprs: Dict[str, Any]) -> LowerResult:
             constexprs=constexprs,
         )
     except Exception as exc:
-        return LowerResult(
-            status="FAILED_OTHER",
-            visited_ops=[],
-            missing_ops=[],
-            prim_func=None,
+        return _failed_lower(
+            "FAILED_OTHER",
+            type(exc).__name__,
+            str(exc),
+            constexprs,
             ttir_text_len=len(ttir_text),
-            error_type=type(exc).__name__,
-            error_message=str(exc),
-            constexprs=constexprs,
         )
 
 
@@ -364,6 +619,7 @@ def _capture_ttir_with_explicit_signature(
 
 def lower_fla_chunk_h(
     constexprs: Optional[Dict[str, Any]] = None,
+    grid: Optional[Tuple[int, ...]] = None,
 ) -> LowerResult:
     """Real Path D entry — capture FLA chunk-h TTIR and walk via OP_TABLE.
 
@@ -380,9 +636,55 @@ def lower_fla_chunk_h(
         Always returned — the only way this function raises is on a
         truly catastrophic interpreter error.
     """
-    cfg = dict(DEFAULT_CONSTEXPRS) if constexprs is None else dict(constexprs)
+    cfg = dict(DEFAULT_CONSTEXPRS)
+    if constexprs is not None:
+        cfg.update(constexprs)
+    if grid is not None:
+        return _lower_uncached(cfg, tuple(int(x) for x in grid))
     key = tuple(sorted(cfg.items(), key=lambda kv: kv[0]))
     return _cached_lower(key)
+
+
+def lower_fla_chunk_o(
+    constexprs: Optional[Dict[str, Any]] = None,
+    grid: Optional[Tuple[int, ...]] = None,
+) -> LowerResult:
+    """Capture and lower FLA common chunk_o through the Triton frontend."""
+    cfg = dict(DEFAULT_CHUNK_O_CONSTEXPRS)
+    if constexprs is not None:
+        cfg.update(constexprs)
+    if grid is not None:
+        return _lower_chunk_o_uncached(cfg, tuple(int(x) for x in grid))
+    key = tuple(sorted(cfg.items(), key=lambda kv: kv[0]))
+    return _cached_lower_chunk_o(key)
+
+
+def lower_fla_gdn_kkt_solve(
+    constexprs: Optional[Dict[str, Any]] = None,
+    grid: Optional[Tuple[int, ...]] = None,
+) -> LowerResult:
+    """Capture and lower FLA GDN KKT solve through the Triton frontend."""
+    cfg = dict(DEFAULT_GDN_KKT_CONSTEXPRS)
+    if constexprs is not None:
+        cfg.update(constexprs)
+    if grid is not None:
+        return _lower_gdn_kkt_uncached(cfg, tuple(int(x) for x in grid))
+    key = tuple(sorted(cfg.items(), key=lambda kv: kv[0]))
+    return _cached_lower_gdn_kkt(key)
+
+
+def lower_fla_gdn_recompute_w_u(
+    constexprs: Optional[Dict[str, Any]] = None,
+    grid: Optional[Tuple[int, ...]] = None,
+) -> LowerResult:
+    """Capture and lower FLA GDN recompute_w_u through the Triton frontend."""
+    cfg = dict(DEFAULT_GDN_RECOMPUTE_W_U_CONSTEXPRS)
+    if constexprs is not None:
+        cfg.update(constexprs)
+    if grid is not None:
+        return _lower_gdn_recompute_w_u_uncached(cfg, tuple(int(x) for x in grid))
+    key = tuple(sorted(cfg.items(), key=lambda kv: kv[0]))
+    return _cached_lower_gdn_recompute_w_u(key)
 
 
 def gdn_fwd_path_d_real_call(*args, **kwargs):
@@ -404,9 +706,18 @@ def gdn_fwd_path_d_real_call(*args, **kwargs):
 
 
 __all__ = [
+    "DEFAULT_CHUNK_O_CONSTEXPRS",
+    "DEFAULT_CHUNK_O_SIGNATURE",
     "DEFAULT_CONSTEXPRS",
+    "DEFAULT_GDN_KKT_CONSTEXPRS",
+    "DEFAULT_GDN_KKT_SIGNATURE",
+    "DEFAULT_GDN_RECOMPUTE_W_U_CONSTEXPRS",
+    "DEFAULT_GDN_RECOMPUTE_W_U_SIGNATURE",
     "DEFAULT_SIGNATURE",
     "LowerResult",
     "lower_fla_chunk_h",
+    "lower_fla_chunk_o",
+    "lower_fla_gdn_kkt_solve",
+    "lower_fla_gdn_recompute_w_u",
     "gdn_fwd_path_d_real_call",
 ]
