@@ -95,11 +95,19 @@ def _gdn_backward_kernel(
         )
 
     b, t, h, dh = q.shape
-    if dh > _SIMD_WIDTH:
+    if dh > _SIMD_WIDTH * 8:
+        # Cap at 8 simdgroups (Dh up to 256) — beyond that the per-thread
+        # register pressure (state[Dh], dS[Dh], S_t_col[Dh], S_prev[Dh],
+        # S_decayed[Dh]) gets prohibitive.
         raise ValueError(
-            f"Real-MSL GDN bwd currently requires head_dim<=32 (got {dh}); "
+            f"Real-MSL GDN bwd currently requires head_dim<=256 (got {dh}); "
             f"caller should fall back to Path A grad path"
         )
+    # Multi-simdgroup path when dh > 32: pad threadgroup to a 32-multiple
+    # so simd_sum still works (32 lanes per simdgroup), and use
+    # atomic_fetch_add_explicit for cross-simdgroup grad accumulation.
+    use_atomic = dh > _SIMD_WIDTH
+    tg_size = ((dh + _SIMD_WIDTH - 1) // _SIMD_WIDTH) * _SIMD_WIDTH
 
     scale = dh ** -0.5
     q_f = q.astype(mx.float32).reshape(-1)
@@ -231,9 +239,18 @@ def _gdn_backward_kernel(
                 float q_i_scaled = q[kv_base + i] * {scale}f;
                 float contrib = active ? (dY_j * S_t_col[i]) : 0.0f;
                 float dq_i_sum = simd_sum(contrib);
-                if (active && j == 0u) {{
-                    dq[kv_base + i] = dq_i_sum * {scale}f;
-                }}
+                {(
+                    f'''if (active && (j & 31u) == 0u) {{
+                        atomic_fetch_add_explicit(
+                            (device atomic_float*)&dq[kv_base + i],
+                            dq_i_sum * {scale}f, memory_order_relaxed
+                        );
+                    }}'''
+                    if use_atomic else
+                    f'''if (active && j == 0u) {{
+                        dq[kv_base + i] = dq_i_sum * {scale}f;
+                    }}'''
+                )}
                 dS[i] += dY_j * q_i_scaled;
             }}
 
@@ -255,7 +272,16 @@ def _gdn_backward_kernel(
             float dbeta_contrib = active ? (dv_eff_j * (v_j - kth_t)) : 0.0f;
             float dbeta_total = simd_sum(dbeta_contrib);
             if (active) dv[kv_base + j] = dv_j;
-            if (active && j == 0u) dbeta[g_idx] = dbeta_total;
+            {(
+                f'''if (active && (j & 31u) == 0u) {{
+                    atomic_fetch_add_explicit(
+                        (device atomic_float*)&dbeta[g_idx],
+                        dbeta_total, memory_order_relaxed
+                    );
+                }}'''
+                if use_atomic else
+                f'''if (active && j == 0u) dbeta[g_idx] = dbeta_total;'''
+            )}
 
             // ---- (4) kth[j] = sum_i k_i * S_decayed[i,j] ----
             //   dk_i (kth) += sum_j dkth[j] * S_decayed[i,j]
@@ -264,7 +290,16 @@ def _gdn_backward_kernel(
                 float dk_delta = active ? (dS[i] * v_eff_t)        : 0.0f;
                 float dk_kth   = active ? (dkth_j * S_decayed[i])  : 0.0f;
                 float dk_i_sum = simd_sum(dk_delta + dk_kth);
-                if (active && j == 0u) dk[kv_base + i] = dk_i_sum;
+                {(
+                    f'''if (active && (j & 31u) == 0u) {{
+                        atomic_fetch_add_explicit(
+                            (device atomic_float*)&dk[kv_base + i],
+                            dk_i_sum, memory_order_relaxed
+                        );
+                    }}'''
+                    if use_atomic else
+                    f'''if (active && j == 0u) dk[kv_base + i] = dk_i_sum;'''
+                )}
             }}
 
             // dS_decayed[i,j] = dS_t[i,j] + dkth[j] * k_i
@@ -282,7 +317,16 @@ def _gdn_backward_kernel(
                 d_alpha_partial += dS[i] * S_prev[i];
             }}
             float d_alpha_total = simd_sum(active ? d_alpha_partial : 0.0f);
-            if (active && j == 0u) dg[g_idx] = d_alpha_total * alpha_t;
+            {(
+                f'''if (active && (j & 31u) == 0u) {{
+                    atomic_fetch_add_explicit(
+                        (device atomic_float*)&dg[g_idx],
+                        d_alpha_total * alpha_t, memory_order_relaxed
+                    );
+                }}'''
+                if use_atomic else
+                f'''if (active && j == 0u) dg[g_idx] = d_alpha_total * alpha_t;'''
+            )}
 
             // Carry dS to next (earlier) timestep.
             for (int i = 0; i < {dh}; i++) {{
@@ -299,8 +343,8 @@ def _gdn_backward_kernel(
         source=source,
     )
 
-    grid = (_SIMD_WIDTH * b * h, 1, 1)
-    threadgroup = (_SIMD_WIDTH, 1, 1)
+    grid = (tg_size * b * h, 1, 1)
+    threadgroup = (tg_size, 1, 1)
 
     # state_hist workspace: [B*H, T+1, Dh, Dh] flat — written by fwd replay,
     # consumed by reverse pass. Discarded after the kernel returns.
@@ -360,12 +404,13 @@ def _gdn_apply_path_b_vjp(
 ) -> tuple:
     del output
     q, k, v, beta, g = primals
-    # Constraints for the real-MSL bwd kernel.
+    # Constraints for the real-MSL bwd kernel: shapes match + Dh <= 256
+    # (multi-simdgroup path, atomic accumulation for cross-simdgroup grads).
     dh = q.shape[-1]
     bwd_ok = (
         k.shape == q.shape
         and v.shape == q.shape
-        and dh <= _SIMD_WIDTH
+        and dh <= _SIMD_WIDTH * 8
     )
     if not bwd_ok:
         return _path_a_grad_fallback(primals, cotangent)

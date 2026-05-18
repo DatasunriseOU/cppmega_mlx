@@ -81,3 +81,46 @@ def test_chain_through_subsequent_op():
     g_out = mx.grad(loss, argnums=0)(q, k, v, beta, g)
     assert g_out.shape == q.shape
     assert np.all(np.isfinite(np.array(g_out)))
+
+
+# ----- Multi-simdgroup tests (Dh > 32) -----
+
+
+def test_path_b_bwd_dh64_matches_path_a():
+    """Dh=64 → 2 simdgroups, atomic accumulation across simdgroups."""
+    q, k, v, beta, g = _inputs(B=1, T=4, H=2, D=64, seed=64)
+    mx.random.seed(64)
+    cotangent = mx.random.normal(q.shape)
+
+    def loss_b(q_, k_, v_, beta_, g_):
+        y = gdn_apply_path_b(q_, k_, v_, beta_, g_)
+        return (y * cotangent).sum()
+
+    def loss_a(q_, k_, v_, beta_, g_):
+        y, _ = naive_recurrent_gated_delta_rule(q_, k_, v_, beta_, g_)
+        return (y * cotangent).sum()
+
+    grad_b = mx.grad(loss_b, argnums=(0, 1, 2, 3, 4))(q, k, v, beta, g)
+    grad_a = mx.grad(loss_a, argnums=(0, 1, 2, 3, 4))(q, k, v, beta, g)
+    for name, gb, ga in zip(["dq", "dk", "dv", "dbeta", "dg"], grad_b, grad_a):
+        np.testing.assert_allclose(
+            np.array(gb), np.array(ga), atol=2e-4, rtol=2e-3,
+            err_msg=f"{name} mismatch at Dh=64",
+        )
+
+
+def test_path_b_bwd_dh128_runs_and_grads_finite():
+    """Dh=128 → 4 simdgroups; verify no NaN/inf and shape correctness."""
+    q, k, v, beta, g = _inputs(B=1, T=3, H=2, D=128, seed=128)
+    cotangent = mx.random.normal(q.shape)
+
+    def loss(q_, k_, v_, beta_, g_):
+        y = gdn_apply_path_b(q_, k_, v_, beta_, g_)
+        return (y * cotangent).sum()
+
+    grads = mx.grad(loss, argnums=(0, 1, 2, 3, 4))(q, k, v, beta, g)
+    for name, gr in zip(["dq", "dk", "dv", "dbeta", "dg"], grads):
+        arr = np.array(gr)
+        assert arr.shape == (q.shape if name in ("dq", "dk", "dv") else q.shape[:3]) \
+            if name in ("dq", "dk", "dv") else True
+        assert np.all(np.isfinite(arr)), f"{name} non-finite at Dh=128"
