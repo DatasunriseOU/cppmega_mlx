@@ -95,13 +95,27 @@ def _kda_backward_kernel(
     if hv % h != 0:
         raise ValueError(f"HV ({hv}) must be divisible by H ({h})")
     if vdim > _SIMD_WIDTH * 8:
-        # Cap at 8 simdgroups (V up to 256). Beyond that per-thread register
-        # pressure (state[K], dS[K], S_t_col[K], S_prev[K], S_decayed[K],
-        # decay_arr[K]) gets prohibitive for the K dimension too.
+        # Cap at 8 simdgroups (V up to 256).
         raise ValueError(
             f"Real-MSL KDA bwd currently requires V<=256 (got {vdim}); "
             f"caller should fall back to Path A grad path"
         )
+    # K-tiling: the per-timestep scratch arrays (S_t_col, S_prev, S_decayed,
+    # decay_arr) used to be sized [K] per thread, which at K=128 + state[K] +
+    # dS[K] + inner_hist[T] crushed occupancy. We tile those 4 scratch arrays
+    # to K_TILE elements. state[K] and dS[K] still must be full because they
+    # persist across the T scan and the per-step dinner_j reduction requires
+    # the full-K k·dS sum. For small K (<=64) the original layout already fits
+    # comfortably in registers and the recomputation overhead (re-reading
+    # state_hist + re-doing exp(g) in dk/dg passes) is a net loss, so we keep
+    # K_TILE = K in that regime.
+    if kdim > 64 and kdim % 32 == 0:
+        k_tile = 32
+    elif kdim > 64 and kdim % 16 == 0:
+        k_tile = 16
+    else:
+        k_tile = kdim  # no tiling — original behavior
+    n_k_tiles = (kdim + k_tile - 1) // k_tile
     group = hv // h
     # Multi-simdgroup path when V > 32: pad threadgroup to a 32-multiple so
     # simd_sum still works (32 lanes per simdgroup). Cross-simdgroup
@@ -214,48 +228,48 @@ def _kda_backward_kernel(
             float dY_j   = active ? dy[v_idx] : 0.0f;
             float inner_t = inner_hist[ti];
 
-            // Read S_t (after step ti) and S_{{t-1}} (after step ti-1).
-            float S_t_col[{kdim}];
-            float S_prev[{kdim}];
-            for (int i = 0; i < {kdim}; i++) {{
-                int idx_t   = bhv * hist_bh_stride + (ti + 1) * hist_ti_stride + i * {vdim} + (int)vj;
-                int idx_tm1 = bhv * hist_bh_stride + ti       * hist_ti_stride + i * {vdim} + (int)vj;
-                S_t_col[i] = active ? state_hist[idx_t]   : 0.0f;
-                S_prev[i]  = active ? state_hist[idx_tm1] : 0.0f;
-            }}
-
-            // S_decayed[i, vj] = decay_t[i] * S_prev[i, vj]
-            float decay_arr[{kdim}];
-            float S_decayed[{kdim}];
-            for (int i = 0; i < {kdim}; i++) {{
-                decay_arr[i] = exp(g[g_base + i]);
-                S_decayed[i] = decay_arr[i] * S_prev[i];
-            }}
+            // K-tiled scratch: process K in chunks of K_TILE to keep
+            // S_t_col / S_prev / S_decayed / decay_arr small in registers.
+            float S_t_col[{k_tile}];
+            float S_prev[{k_tile}];
+            float decay_arr[{k_tile}];
+            float S_decayed[{k_tile}];
 
             // ---- (1) o_t[j] = sum_i q'_i * S_t[i, j] ----
             //   dq'_i = sum_j dY[j] * S_t[i, j]   (reduce over j == vj axis)
             //   dS_t[i, j] += dY[j] * q'_i
-            // dq writes per-K to (b, t, h_idx, i); groups inside HV share q/k,
-            // so multiple hv lanes in the same (b, t, h_idx) would race.
-            // We restrict the dq write to the first hv in each group via
-            // (hv_idx % group == 0) and multiply by group_size? No — we need
-            // the SUM of grads from all hv in the group. Use atomic_fetch_add.
-            for (int i = 0; i < {kdim}; i++) {{
-                float q_i_scaled = q[qk_base + i] * {scale}f;
-                float contrib = active ? (dY_j * S_t_col[i]) : 0.0f;
-                float dq_i_sum = simd_sum(contrib);
-                {(
-                    f'''if (lane == 0u) tg_vec[i * {n_simd} + simd_id] = dq_i_sum;'''
-                    if use_shared else
-                    f'''if (active && vj == 0u) {{
-                        atomic_fetch_add_explicit(
-                            (device atomic_float*)&dq[qk_base + i],
-                            dq_i_sum * {scale}f,
-                            memory_order_relaxed
-                        );
-                    }}'''
-                )}
-                dS[i] += dY_j * q_i_scaled;
+            // Tiled across K; dS[i] (persistent) updated in-place.
+            for (int kt0 = 0; kt0 < {kdim}; kt0 += {k_tile}) {{
+                for (int ii = 0; ii < {k_tile}; ii++) {{
+                    int i = kt0 + ii;
+                    int idx_t   = bhv * hist_bh_stride + (ti + 1) * hist_ti_stride + i * {vdim} + (int)vj;
+                    int idx_tm1 = bhv * hist_bh_stride + ti       * hist_ti_stride + i * {vdim} + (int)vj;
+                    S_t_col[ii] = active ? state_hist[idx_t]   : 0.0f;
+                    S_prev[ii]  = active ? state_hist[idx_tm1] : 0.0f;
+                    decay_arr[ii] = exp(g[g_base + i]);
+                    S_decayed[ii] = decay_arr[ii] * S_prev[ii];
+                }}
+                for (int ii = 0; ii < {k_tile}; ii++) {{
+                    int i = kt0 + ii;
+                    float q_i_scaled = q[qk_base + i] * {scale}f;
+                    float contrib = active ? (dY_j * S_t_col[ii]) : 0.0f;
+                    float dq_i_sum = simd_sum(contrib);
+                    {(
+                        f'''if (lane == 0u) tg_vec[i * {n_simd} + simd_id] = dq_i_sum;'''
+                        if use_shared else
+                        f'''if (active && vj == 0u) {{
+                            atomic_fetch_add_explicit(
+                                (device atomic_float*)&dq[qk_base + i],
+                                dq_i_sum * {scale}f,
+                                memory_order_relaxed
+                            );
+                        }}'''
+                    )}
+                    dS[i] += dY_j * q_i_scaled;
+                }}
+                // Persist this tile's S_decayed/decay_arr for later passes
+                // via re-derivation. To avoid restoring in registers, we
+                // simply recompute them in the dk/dg passes below.
             }}
             {(
                 f'''threadgroup_barrier(metal::mem_flags::mem_threadgroup);
@@ -335,22 +349,33 @@ def _kda_backward_kernel(
             // dk_i (delta) += sum_j dS_t[i, j] * (beta_t * inner_t)
             //   Note inner_t is a per-j scalar; cannot factor it out of simd_sum.
             // dk_i (kth)   += sum_j dkth[j] * S_decayed[i, j]; dkth[j] = -dinner_j
+            // Tiled across K; recompute S_decayed locally.
             float dkth_j = -dinner_j;
-            for (int i = 0; i < {kdim}; i++) {{
-                float dk_delta = active ? (dS[i] * beta_t * inner_t) : 0.0f;
-                float dk_kth   = active ? (dkth_j * S_decayed[i])    : 0.0f;
-                float dk_i_sum = simd_sum(dk_delta + dk_kth);
-                {(
-                    f'''if (lane == 0u) tg_vec[i * {n_simd} + simd_id] = dk_i_sum;'''
-                    if use_shared else
-                    f'''if (active && vj == 0u) {{
-                        atomic_fetch_add_explicit(
-                            (device atomic_float*)&dk[qk_base + i],
-                            dk_i_sum,
-                            memory_order_relaxed
-                        );
-                    }}'''
-                )}
+            for (int kt0 = 0; kt0 < {kdim}; kt0 += {k_tile}) {{
+                for (int ii = 0; ii < {k_tile}; ii++) {{
+                    int i = kt0 + ii;
+                    int idx_tm1 = bhv * hist_bh_stride + ti * hist_ti_stride + i * {vdim} + (int)vj;
+                    S_prev[ii] = active ? state_hist[idx_tm1] : 0.0f;
+                    decay_arr[ii] = exp(g[g_base + i]);
+                    S_decayed[ii] = decay_arr[ii] * S_prev[ii];
+                }}
+                for (int ii = 0; ii < {k_tile}; ii++) {{
+                    int i = kt0 + ii;
+                    float dk_delta = active ? (dS[i] * beta_t * inner_t) : 0.0f;
+                    float dk_kth   = active ? (dkth_j * S_decayed[ii])   : 0.0f;
+                    float dk_i_sum = simd_sum(dk_delta + dk_kth);
+                    {(
+                        f'''if (lane == 0u) tg_vec[i * {n_simd} + simd_id] = dk_i_sum;'''
+                        if use_shared else
+                        f'''if (active && vj == 0u) {{
+                            atomic_fetch_add_explicit(
+                                (device atomic_float*)&dk[qk_base + i],
+                                dk_i_sum,
+                                memory_order_relaxed
+                            );
+                        }}'''
+                    )}
+                }}
             }}
             {(
                 f'''threadgroup_barrier(metal::mem_flags::mem_threadgroup);
@@ -376,25 +401,35 @@ def _kda_backward_kernel(
             //   ddecay[i] = sum_j dS_decayed[i, j] * S_{{t-1}}[i, j]   (per-i)
             //   dg_t[i]   = ddecay[i] * decay[i]                       (per-K)
             //   dS_{{t-1}}[i, j] = dS_decayed[i, j] * decay[i]
-            // dg[b, t, hv_idx, i] is the per-K dg write at this step.
-            for (int i = 0; i < {kdim}; i++) {{
-                float contrib = active ? (dS[i] * S_prev[i]) : 0.0f;
-                float ddecay_simd = simd_sum(contrib);
-                {(
-                    f'''if (lane == 0u) tg_vec[i * {n_simd} + simd_id] = ddecay_simd;'''
-                    if use_shared else
-                    f'''if (active && vj == 0u) {{
-                        dg[g_base + i] = ddecay_simd * decay_arr[i];
-                    }}'''
-                )}
-                dS[i] = dS[i] * decay_arr[i];
+            // Tiled across K; recompute S_prev + decay locally.
+            for (int kt0 = 0; kt0 < {kdim}; kt0 += {k_tile}) {{
+                for (int ii = 0; ii < {k_tile}; ii++) {{
+                    int i = kt0 + ii;
+                    int idx_tm1 = bhv * hist_bh_stride + ti * hist_ti_stride + i * {vdim} + (int)vj;
+                    S_prev[ii] = active ? state_hist[idx_tm1] : 0.0f;
+                    decay_arr[ii] = exp(g[g_base + i]);
+                }}
+                for (int ii = 0; ii < {k_tile}; ii++) {{
+                    int i = kt0 + ii;
+                    float contrib = active ? (dS[i] * S_prev[ii]) : 0.0f;
+                    float ddecay_simd = simd_sum(contrib);
+                    {(
+                        f'''if (lane == 0u) tg_vec[i * {n_simd} + simd_id] = ddecay_simd;'''
+                        if use_shared else
+                        f'''if (active && vj == 0u) {{
+                            dg[g_base + i] = ddecay_simd * decay_arr[ii];
+                        }}'''
+                    )}
+                    dS[i] = dS[i] * decay_arr[ii];
+                }}
             }}
             {(
                 f'''threadgroup_barrier(metal::mem_flags::mem_threadgroup);
             for (int oi = (int)tid_in_tg; oi < {kdim}; oi += {tg_size}) {{
                 float total = 0.0f;
                 for (int s = 0; s < {n_simd}; s++) total += tg_vec[oi * {n_simd} + s];
-                dg[g_base + oi] = total * decay_arr[oi];
+                // decay_arr is K_TILE-sized; recompute from g for the final write.
+                dg[g_base + oi] = total * exp(g[g_base + oi]);
             }}
             threadgroup_barrier(metal::mem_flags::mem_threadgroup);'''
                 if use_shared else ""
