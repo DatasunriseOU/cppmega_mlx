@@ -15,9 +15,11 @@ Two surfaces:
 
 Numeric tolerance: fp8 e4m3 round-trip ≈ 2% on per-row activations,
 so quant→fp8→dequant→matmul matches the original bf16 matmul to
-atol ~5e-2 on random inputs. Adequate for inference; training-time
-parity is not yet covered (would need fp8 fwd + bf16 master-weight
-optimizer state).
+atol ~5e-2 on random inputs. Training-time pattern is the standard
+"bf16 master weight + fp8 inference" loop: keep the master in bf16,
+re-quantize to fp8 each step for the forward, and take gradients
+through the bf16 master (covered by
+``tests/v4/test_moe_fp8.py::test_fp8_fwd_with_bf16_master_weight_training_step``).
 """
 
 from typing import Optional

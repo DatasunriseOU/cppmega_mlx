@@ -109,6 +109,67 @@ def test_path_b_bwd_dh64_matches_path_a():
         )
 
 
+def test_path_b_bwd_k_neq_v_matches_path_a():
+    """K != V (head_k_dim != head_v_dim) — bwd must produce correct grads."""
+    B, T, H, K, V = 1, 4, 2, 8, 16
+    rng = np.random.default_rng(81)
+    q = mx.array(rng.standard_normal((B, T, H, K)).astype(np.float32))
+    k = mx.array(rng.standard_normal((B, T, H, K)).astype(np.float32))
+    v = mx.array(rng.standard_normal((B, T, H, V)).astype(np.float32))
+    beta = mx.array(rng.uniform(0.1, 0.9, (B, T, H)).astype(np.float32))
+    g = mx.array(-rng.uniform(0.01, 0.5, (B, T, H)).astype(np.float32))
+    mx.random.seed(81)
+    cotangent = mx.random.normal((B, T, H, V))
+
+    def loss_b(q_, k_, v_, beta_, g_):
+        y = gdn_apply_path_b(q_, k_, v_, beta_, g_)
+        return (y * cotangent).sum()
+
+    def loss_a(q_, k_, v_, beta_, g_):
+        y, _ = naive_recurrent_gated_delta_rule(q_, k_, v_, beta_, g_)
+        return (y * cotangent).sum()
+
+    grad_b = mx.grad(loss_b, argnums=(0, 1, 2, 3, 4))(q, k, v, beta, g)
+    grad_a = mx.grad(loss_a, argnums=(0, 1, 2, 3, 4))(q, k, v, beta, g)
+    expected_shapes = {
+        "dq": q.shape, "dk": k.shape, "dv": v.shape,
+        "dbeta": beta.shape, "dg": g.shape,
+    }
+    for name, gb, ga in zip(["dq", "dk", "dv", "dbeta", "dg"], grad_b, grad_a):
+        assert tuple(gb.shape) == expected_shapes[name], \
+            f"{name} shape {tuple(gb.shape)} != {expected_shapes[name]}"
+        np.testing.assert_allclose(
+            np.array(gb), np.array(ga), atol=2e-4, rtol=2e-3,
+            err_msg=f"{name} mismatch with K={K}, V={V}",
+        )
+
+
+def test_path_b_bwd_k_smaller_than_v():
+    """K=32, V=64 — exercises K<V (state rows < cols)."""
+    B, T, H, K, V = 1, 3, 2, 32, 64
+    rng = np.random.default_rng(82)
+    q = mx.array(rng.standard_normal((B, T, H, K)).astype(np.float32))
+    k = mx.array(rng.standard_normal((B, T, H, K)).astype(np.float32))
+    v = mx.array(rng.standard_normal((B, T, H, V)).astype(np.float32))
+    beta = mx.array(rng.uniform(0.1, 0.9, (B, T, H)).astype(np.float32))
+    g = mx.array(-rng.uniform(0.01, 0.2, (B, T, H)).astype(np.float32))
+    cotangent = mx.random.normal((B, T, H, V))
+
+    def loss(q_, k_, v_, beta_, g_):
+        return (gdn_apply_path_b(q_, k_, v_, beta_, g_) * cotangent).sum()
+
+    grads = mx.grad(loss, argnums=(0, 1, 2, 3, 4))(q, k, v, beta, g)
+    for name, gr in zip(["dq", "dk", "dv", "dbeta", "dg"], grads):
+        arr = np.array(gr)
+        assert np.all(np.isfinite(arr)), f"{name} non-finite at K=32,V=64"
+    # Spot-check parity on dq
+    def loss_a(q_, k_, v_, beta_, g_):
+        y, _ = naive_recurrent_gated_delta_rule(q_, k_, v_, beta_, g_)
+        return (y * cotangent).sum()
+    grads_a = mx.grad(loss_a, argnums=(0, 1, 2, 3, 4))(q, k, v, beta, g)
+    np.testing.assert_allclose(np.array(grads[0]), np.array(grads_a[0]), atol=5e-4, rtol=5e-3)
+
+
 def test_path_b_bwd_dh128_runs_and_grads_finite():
     """Dh=128 → 4 simdgroups; verify no NaN/inf and shape correctness."""
     q, k, v, beta, g = _inputs(B=1, T=3, H=2, D=128, seed=128)

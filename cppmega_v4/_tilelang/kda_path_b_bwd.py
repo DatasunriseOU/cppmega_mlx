@@ -42,10 +42,15 @@ Backward algebra (derived from the forward in ``kda_path_b.py``):
       dS_{t-1}[i,j] = dS_decayed[i,j] * decay_t[i]
       dg_t[i]       = ddecay[i] * decay_t[i]                  (per-K)
 
+Threadgroup layout: pad to ``32 * ceil(V / 32)`` lanes so simd_sum spans
+one full simdgroup; ``V > 32`` rides the multi-simdgroup path with
+threadgroup-shared-memory cross-simdgroup reductions (replaces the
+atomic_fetch_add path that serialised at V>=64). Cap is ``V <= 256``.
+
 Falls back to ``mx.grad`` through ``naive_recurrent_kda`` for:
-  - ``V > 32`` (multi-simdgroup not yet implemented)
-  - ``initial_state`` provided
+  - ``V > 256`` (per-thread register pressure exceeds Apple GPU limits)
   - ``HV % H != 0``
+  - ``initial_state`` provided
   - any future shape outside the kernel's domain.
 """
 
