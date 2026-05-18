@@ -308,15 +308,15 @@ def gated_delta_update(
         )
         if can_use_metal:
             try:
-                from .gated_delta_vjp_metal import gated_delta_update_vjp_metal
-
+                from ._mlx_lm_gated_delta_vjp_metal_vendored import (
+                    gated_delta_update_vjp_metal,
+                )
                 return gated_delta_update_vjp_metal(
                     q, k, v, a, b, A_log, dt_bias, state, mask
                 )
             except ImportError:
                 pass
-        from .gated_delta_vjp import gated_delta_update_vjp
-
+        from ._mlx_lm_gated_delta_vjp_vendored import gated_delta_update_vjp
         return gated_delta_update_vjp(q, k, v, a, b, A_log, dt_bias, state, mask)
 
     beta = mx.sigmoid(b)

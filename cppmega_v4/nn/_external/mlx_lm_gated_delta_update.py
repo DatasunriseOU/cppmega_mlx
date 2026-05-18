@@ -56,8 +56,14 @@ def gated_delta_update(
     scale: float | None = None,
     initial_state: mx.array | None = None,
     output_final_state: bool = False,
+    training: bool = False,
 ):
-    """Path E entry — same signature as naive_recurrent_gated_delta_rule."""
+    """Path E entry — same signature as naive_recurrent_gated_delta_rule.
+
+    When ``training=True``, dispatches through the chunked VJP path
+    (``_mlx_lm_gated_delta_vjp_metal_vendored`` on Metal, else the Python
+    reference) so ``mx.grad`` traces a finite-memory graph for T ≥ 2048.
+    """
     # q/k: [B, T, H, K]; v: [B, T, H, V]; beta: [B, T, H]; g: [B, T, H] (log-decay)
     b_size, t_size, h_size = beta.shape
     dk = q.shape[-1]
@@ -83,7 +89,7 @@ def gated_delta_update(
     use_kernel = (dk % 32 == 0) and (dv % 4 == 0)
     y, new_state = _upstream(
         q_scaled, k, v, a_synth, b_synth, A_log, dt_bias,
-        state=state, mask=None, use_kernel=use_kernel, training=False,
+        state=state, mask=None, use_kernel=use_kernel, training=training,
     )
     final = None
     if output_final_state:
