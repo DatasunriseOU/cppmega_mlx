@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang='en'>
+<head>
+<meta charset='utf-8'>
+<meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>Path C Loss Analysis - 1B Matrix - 2026-05-18</title>
+<style>
+:root { --bg:#f6f8fb; --panel:#fff; --text:#17202a; --muted:#667085; --line:#d8dee8; --good:#0f7a4f; --bad:#b42318; --warn:#93640f; --navy:#1f4e79; }
+* { box-sizing:border-box } body { margin:0; background:var(--bg); color:var(--text); font-family:Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; line-height:1.45 }
+header { background:#fff; border-bottom:1px solid var(--line); padding:28px max(24px,calc((100vw - 1280px)/2)) 22px } main { max-width:1280px; margin:0 auto; padding:24px }
+h1 { margin:0 0 8px; font-size:34px; letter-spacing:0 } h2 { margin:0; font-size:20px } h3 { margin:0 0 8px; font-size:16px } p { margin:0; color:var(--muted) } code { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:12px }
+section { background:var(--panel); border:1px solid var(--line); border-radius:8px; margin:18px 0; overflow:hidden } .head { padding:16px 18px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; gap:16px; align-items:baseline } .body { padding:18px }
+.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:12px } .metric { border:1px solid var(--line); border-radius:8px; background:#fbfcfe; padding:14px } .metric span { display:block; color:var(--muted); font-size:12px } .metric strong { display:block; font-size:25px; margin-top:4px }
+.callout { border-left:4px solid var(--navy); background:#f4f7fb; border-radius:8px; padding:13px 14px; color:#344054 } .badbox { border-left-color:var(--bad); background:#fff3f1 } .warnbox { border-left-color:var(--warn); background:#fff8e8 }
+.table-wrap { overflow-x:auto } table { width:100%; border-collapse:collapse; min-width:1040px } th,td { border-bottom:1px solid var(--line); padding:10px 11px; text-align:right; white-space:nowrap; font-size:13px } th:first-child,td:first-child { text-align:left } thead th { background:#f1f4f8; color:#475467; font-size:12px; text-transform:uppercase } .good { color:var(--good); font-weight:700 } .bad { color:var(--bad); font-weight:700 } .warn { color:var(--warn); font-weight:700 } ul { margin:0; padding-left:20px; color:#344054 } li+li { margin-top:7px } a { color:#0b5cad; text-decoration:none } a:hover { text-decoration:underline }
+</style>
+</head>
+<body>
+<header>
+  <h1>Path C Loss Analysis - 1B Training Matrix</h1>
+  <p>Fresh 20-step local_gb10_quarter matrix, batch 1, seq 2048, default production-safe Mamba3 policy: <code>--mamba3-bwd path_b</code>.</p>
+</header>
+<main>
+<section>
+  <div class='head'><h2>Verdict</h2><p>Generated from <code>reports/v4/cppmega_1b_path_matrix_safe_mamba_bwd_20260518.json</code></p></div>
+  <div class='body'>
+    <div class='grid'>
+      <div class='metric'><span>Cells</span><strong>42 / 42 ok</strong></div>
+      <div class='metric'><span>Path C wins</span><strong>4 / 14</strong></div>
+      <div class='metric'><span>BF16 avg C/B</span><strong>0.833x</strong></div>
+      <div class='metric'><span>FP8 avg C/B</span><strong>0.856x</strong></div>
+      <div class='metric'><span>Fast optimizer losses avg C/B</span><strong>0.665x</strong></div>
+      <div class='metric'><span>FP8 avg peak delta</span><strong>+30.49 GiB</strong></div>
+    </div>
+  </div>
+</section>
+<section>
+  <div class='head'><h2>Why Path C Loses</h2><p>Evidence-backed classification</p></div>
+  <div class='body'>
+    <div class='callout badbox'>
+      <strong>Primary loss:</strong> Path C loses on fast optimizer rows where kernel/graph overhead is exposed: BF16 adam8bit/lion8bit and FP8 adam8bit/lion/lion8bit are all around <code>0.65-0.67x</code> C/B. Active memory is unchanged, so this is not live tensor growth.
+    </div>
+    <br>
+    <ul>
+      <li><strong>Mamba3 is not the current kernel loser:</strong> focused BF16 1B bench has Path C fwd+bwd at about <code>0.556x</code> Path B time.</li>
+      <li><strong>M2RNN is not the main isolated loser:</strong> focused BF16 split bench has fwd+bwd C/B about <code>0.988x</code>.</li>
+      <li><strong>Composition is the problem:</strong> in full train-step, Path C adds generated-kernel graph boundaries and compile/cache overhead. On fast optimizer rows this adds roughly <code>+0.9s</code> to <code>+1.2s</code> steady step.</li>
+      <li><strong>FP8 has an additional memory/high-water problem:</strong> active memory matches Path B, but peak memory rises by about <code>+21</code> to <code>+32 GiB</code>, pointing at temporary buffers/compile/graph lifetime, not retained model tensors.</li>
+      <li><strong>Warm cache is incomplete:</strong> many Path C warm rows still have first-step cost from <code>12s</code> to <code>45s</code>; cache metadata says hit, but train graph specialization is still happening.</li>
+    </ul>
+  </div>
+</section>
+<section>
+  <div class='head'><h2>Matrix Ratios</h2><p>* bf16/lion uses the rechecked stable Path B row</p></div>
+  <div class='body table-wrap'>
+    <table>
+      <thead><tr><th>Case</th><th>Path B tok/s</th><th>Path C warm tok/s</th><th>C / B</th><th>Steady delta</th><th>First-step delta</th><th>Peak delta</th><th>Active delta</th><th>Class</th></tr></thead>
+      <tbody>
+<tr>
+  <th>bf16 / adamw</th>
+  <td>555.2</td>
+  <td>447.6</td>
+  <td class='bad'>0.806x</td>
+  <td>+0.151s</td>
+  <td>+7.8s</td>
+  <td>+4.61 GiB</td>
+  <td>-0.00 GiB</td>
+  <td>mixed model/optimizer overhead</td>
+</tr>
+<tr>
+  <th>bf16 / adam8bit</th>
+  <td>1007.6</td>
+  <td>657.1</td>
+  <td class='bad'>0.652x</td>
+  <td>+0.979s</td>
+  <td>+8.9s</td>
+  <td>+2.51 GiB</td>
+  <td>-0.00 GiB</td>
+  <td>fast optimizer exposes kernel overhead</td>
+</tr>
+<tr>
+  <th>bf16 / lion *</th>
+  <td>800.4</td>
+  <td>541.8</td>
+  <td class='bad'>0.677x</td>
+  <td>+1.100s</td>
+  <td>+18.4s</td>
+  <td>-0.00 GiB</td>
+  <td>-0.00 GiB</td>
+  <td>mixed model/optimizer overhead</td>
+</tr>
+<tr>
+  <th>bf16 / lion8bit</th>
+  <td>1011.8</td>
+  <td>681.9</td>
+  <td class='bad'>0.674x</td>
+  <td>+0.875s</td>
+  <td>+8.9s</td>
+  <td>+2.55 GiB</td>
+  <td>-0.00 GiB</td>
+  <td>fast optimizer exposes kernel overhead</td>
+</tr>
+<tr>
+  <th>bf16 / muon</th>
+  <td>209.2</td>
+  <td>220.9</td>
+  <td class='good'>1.056x</td>
+  <td>-0.868s</td>
+  <td>+8.1s</td>
+  <td>+4.13 GiB</td>
+  <td>-0.00 GiB</td>
+  <td>optimizer-heavy path masks or amplifies kernel overhead</td>
+</tr>
+<tr>
+  <th>bf16 / muon_adamw</th>
+  <td>178.8</td>
+  <td>220.1</td>
+  <td class='good'>1.231x</td>
+  <td>-2.574s</td>
+  <td>+8.5s</td>
+  <td>+4.13 GiB</td>
+  <td>-0.00 GiB</td>
+  <td>optimizer-heavy path masks or amplifies kernel overhead</td>
+</tr>
+<tr>
+  <th>bf16 / muon_int8</th>
+  <td>196.7</td>
+  <td>144.7</td>
+  <td class='bad'>0.736x</td>
+  <td>+3.356s</td>
+  <td>+20.1s</td>
+  <td>+4.61 GiB</td>
+  <td>-0.00 GiB</td>
+  <td>optimizer-heavy path masks or amplifies kernel overhead</td>
+</tr>
+<tr>
+  <th>fp8 / adamw</th>
+  <td>187.0</td>
+  <td>236.4</td>
+  <td class='good'>1.264x</td>
+  <td>-3.206s</td>
+  <td>+33.4s</td>
+  <td>+32.47 GiB</td>
+  <td>-0.00 GiB</td>
+  <td>mixed model/optimizer overhead</td>
+</tr>
+<tr>
+  <th>fp8 / adam8bit</th>
+  <td>931.5</td>
+  <td>611.9</td>
+  <td class='bad'>0.657x</td>
+  <td>+1.009s</td>
+  <td>+38.4s</td>
+  <td>+30.90 GiB</td>
+  <td>-0.00 GiB</td>
+  <td>fast optimizer exposes kernel overhead</td>
+</tr>
+<tr>
+  <th>fp8 / lion</th>
+  <td>767.3</td>
+  <td>513.6</td>
+  <td class='bad'>0.669x</td>
+  <td>+1.195s</td>
+  <td>+12.6s</td>
+  <td>+21.74 GiB</td>
+  <td>-0.00 GiB</td>
+  <td>fast optimizer exposes kernel overhead</td>
+</tr>
+<tr>
+  <th>fp8 / lion8bit</th>
+  <td>947.0</td>
+  <td>638.0</td>
+  <td class='bad'>0.674x</td>
+  <td>+0.933s</td>
+  <td>+10.4s</td>
+  <td>+30.93 GiB</td>
+  <td>-0.00 GiB</td>
+  <td>fast optimizer exposes kernel overhead</td>
+</tr>
+<tr>
+  <th>fp8 / muon</th>
+  <td>245.2</td>
+  <td>176.5</td>
+  <td class='bad'>0.720x</td>
+  <td>+3.077s</td>
+  <td>+16.1s</td>
+  <td>+32.47 GiB</td>
+  <td>-0.00 GiB</td>
+  <td>optimizer-heavy path masks or amplifies kernel overhead</td>
+</tr>
+<tr>
+  <th>fp8 / muon_adamw</th>
+  <td>156.6</td>
+  <td>201.9</td>
+  <td class='good'>1.289x</td>
+  <td>-3.442s</td>
+  <td>+9.7s</td>
+  <td>+32.47 GiB</td>
+  <td>-0.00 GiB</td>
+  <td>optimizer-heavy path masks or amplifies kernel overhead</td>
+</tr>
+<tr>
+  <th>fp8 / muon_int8</th>
+  <td>200.5</td>
+  <td>144.6</td>
+  <td class='bad'>0.721x</td>
+  <td>+3.643s</td>
+  <td>+13.8s</td>
+  <td>+32.47 GiB</td>
+  <td>-0.00 GiB</td>
+  <td>optimizer-heavy path masks or amplifies kernel overhead</td>
+</tr></tbody>
+    </table>
+  </div>
+</section>
+<section>
+  <div class='head'><h2>Focused Benches</h2><p>Used to separate kernel codegen from full-graph composition</p></div>
+  <div class='body'>
+    <div class='grid'>
+      <div class='metric'><span>Mamba3 BF16 1B fwd+bwd C/B time</span><strong>0.556x</strong><p><a href='mamba3_path_c_bf16_1b_training_safe_context_20260518.json'>JSON</a></p></div>
+      <div class='metric'><span>M2RNN BF16 1B split fwd+bwd C/B time</span><strong>0.988x</strong><p><a href='m2rnn_path_c_split_bf16_1b_20260518.json'>JSON</a></p></div>
+      <div class='metric'><span>Sparse-MLA FP8 standalone</span><strong>not used</strong><p>Harness expects a retired direct Path B surface; matrix receipts remain valid.</p></div>
+    </div>
+  </div>
+</section>
+<section>
+  <div class='head'><h2>Next Code Targets</h2><p>Ordered by evidence</p></div>
+  <div class='body'>
+    <ul>
+      <li>Profile composed Path C train block, not isolated kernels: Mamba3 Path C forward + Path B backward, M2RNN Path C split, Sparse-MLA FP8 Path C inside one optimizer-fast train step.</li>
+      <li>Fix TileLang/TVM/tvm-ffi cache reuse for FP8 Path C warm cells; warm first-step should not look cold.</li>
+      <li>Reduce FP8 Path C temporary high-water by auditing prepared buffer ownership/lifetime in <code>sparse_mla_fp8_path_c</code>.</li>
+      <li>Use fast optimizer rows as the default-promotion gate; Muon-family rows can hide kernel regressions behind optimizer/update cost.</li>
+    </ul>
+  </div>
+</section>
+<section>
+  <div class='head'><h2>Receipts</h2><p>Raw evidence</p></div>
+  <div class='body'>
+    <ul>
+      <li><a href='cppmega_1b_path_matrix_safe_mamba_bwd_20260518.html'>Full matrix HTML</a></li>
+      <li><a href='cppmega_1b_path_matrix_safe_mamba_bwd_20260518.json'>Full matrix JSON</a></li>
+      <li><a href='path_c_loss_analysis_1b_20260518.json'>This analysis JSON</a></li>
+      <li><a href='cppmega_1b_path_matrix_recheck_lion_20260518.json'>bf16/lion recheck JSON</a></li>
+    </ul>
+  </div>
+</section>
+</main>
+</body>
+</html>

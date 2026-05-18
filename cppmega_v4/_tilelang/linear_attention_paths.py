@@ -16,9 +16,9 @@ Backend status (May 2026):
       execution_backend="tvm_ffi")`` — scaffold; awaits lift of
       ``tilelang/examples/gdn/example_chunk_delta_h.py`` and friends into a
       Path-C wrapper mirroring ``cppmega_mlx/nn/_tilelang/mamba3_path_c.py``.
-    - Path D: Triton frontend via ``tilelang.poc.triton_frontend.from_triton_kernel``
-      on FLA's ``chunk_gated_delta_rule`` — scaffold; awaits frontend op
-      coverage for the FLA kernel.
+    - Path D: Triton frontend via ``poc.triton_frontend.from_triton_kernel``
+      on FLA's ``chunk_gated_delta_rule`` — frontend op coverage is probed;
+      runtime adapter is still pending.
     - Path E: vendored mlx-lm ``gated_delta_update`` op (PR #1217) —
       verbatim copy under
       ``cppmega_v4/nn/_external/_mlx_lm_gated_delta_vendored.py`` with adapter
@@ -145,7 +145,7 @@ def _path_d_status() -> PathStatus:
     return PathStatus(
         path="path_d", available=ok,
         reason=(
-            "GDN Path D: Triton kernel → tilelang.poc.triton_frontend."
+            "GDN Path D: Triton kernel -> poc.triton_frontend."
             f"from_triton_kernel → tilelang.compile. {reason}"
         ),
     )

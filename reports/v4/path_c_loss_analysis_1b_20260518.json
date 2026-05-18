@@ -1,0 +1,343 @@
+{
+  "corrections": {
+    "bf16_lion_path_b": {
+      "matrix_tok_sec": 224.67862147879706,
+      "reason": "matrix Path B row was a visible outlier; same cell rerun restored the stable baseline",
+      "recheck_tok_sec": 800.3664964629596
+    },
+    "bf16_lion_path_c_warm": {
+      "matrix_tok_sec": 529.1122433757099,
+      "reason": "matrix Path B row was a visible outlier; same cell rerun restored the stable baseline",
+      "recheck_tok_sec": 541.7514119834632
+    }
+  },
+  "focused_kernel_benches": {
+    "m2rnn_bf16_1b_split": {
+      "fwd_bwd_c_over_b": 0.9881949277672728,
+      "fwd_c_over_b": 0.897838365374808,
+      "interpretation": "M2RNN Path C split is not the main 1B train-step loser on isolated BF16 kernel bench.",
+      "path": "reports/v4/m2rnn_path_c_split_bf16_1b_20260518.json",
+      "path_b_fwd_bwd_ms": 29.422354011330754,
+      "path_c_fwd_bwd_ms": 29.075020996970125
+    },
+    "mamba3_bf16_1b": {
+      "fwd_bwd_c_over_b": null,
+      "fwd_c_over_b": null,
+      "interpretation": "Mamba3 Path C is faster in isolation; train-step loss is not caused by the fixed Mamba3 full Path C kernel itself.",
+      "path": "reports/v4/mamba3_path_c_bf16_1b_training_safe_context_20260518.json",
+      "timings": {
+        "bwd_path_b_median_ms": 68.51875050051603,
+        "bwd_path_c_median_ms": 36.54489599284716,
+        "fwd_bwd_path_b": {
+          "iters": 10,
+          "label": "fwd_bwd_path_b",
+          "max_ms": 74.6258329891134,
+          "mean_ms": 73.94335830467753,
+          "measurement": "paired_alternating",
+          "median_ms": 74.02812500367872,
+          "min_ms": 73.15233300323598,
+          "warmup": 3
+        },
+        "fwd_bwd_path_c": {
+          "iters": 10,
+          "label": "fwd_bwd_path_c",
+          "max_ms": 41.45741599495523,
+          "mean_ms": 41.1715625989018,
+          "measurement": "paired_alternating",
+          "median_ms": 41.136333500617184,
+          "min_ms": 40.95741698984057,
+          "warmup": 3
+        },
+        "fwd_path_b": {
+          "iters": 10,
+          "label": "fwd_path_b",
+          "max_ms": 5.55579099454917,
+          "mean_ms": 5.50519970129244,
+          "measurement": "paired_alternating",
+          "median_ms": 5.5093745031626895,
+          "min_ms": 5.441249988507479,
+          "warmup": 3
+        },
+        "fwd_path_c": {
+          "iters": 10,
+          "label": "fwd_path_c",
+          "max_ms": 4.641500010620803,
+          "mean_ms": 4.597899998771027,
+          "measurement": "paired_alternating",
+          "median_ms": 4.591437507770024,
+          "min_ms": 4.563374997815117,
+          "warmup": 3
+        }
+      }
+    },
+    "sparse_mla_fp8_standalone": {
+      "path": "reports/v4/sparse_mla_fp8_path_c_1b_20260518",
+      "reason": "standalone harness still expects a retired direct Path B FP8 forward surface and failed; matrix Path B uses sparse_mla_fp8_reference_path_b receipts instead.",
+      "status": "not_used"
+    }
+  },
+  "generated_at": "2026-05-18T17:23:13",
+  "html_matrix": "reports/v4/cppmega_1b_path_matrix_safe_mamba_bwd_20260518.html",
+  "matrix": "reports/v4/cppmega_1b_path_matrix_safe_mamba_bwd_20260518.json",
+  "mode": {
+    "batch_size": 1,
+    "block_size": 2048,
+    "dry_run": false,
+    "dtypes": [
+      "bf16",
+      "fp8"
+    ],
+    "fresh_process": true,
+    "mamba3_bwd": "path_b",
+    "optimizers": [
+      "adamw",
+      "adam8bit",
+      "lion",
+      "lion8bit",
+      "muon",
+      "muon_adamw",
+      "muon_int8"
+    ],
+    "paths": [
+      "path_b",
+      "path_c_cold",
+      "path_c_warm"
+    ],
+    "reuse_existing_ok": false,
+    "steps": 20
+  },
+  "next_code_targets": [
+    "Collapse Path C composed train graph boundaries: profile/evaluate Mamba3 Path C forward + Path B backward, M2RNN Path C split, and Sparse-MLA FP8 Path C in one block-level train graph instead of isolated kernels.",
+    "Fix TileLang/TVM/tvm-ffi cache key reuse for FP8 Path C warm cells; warm first-step should not look cold.",
+    "Reduce FP8 Path C temporary buffers/high-water by auditing prepared q_fp8/q_scale/kv_fp8/kv_scale lifetime and owner-output use in sparse_mla_fp8_path_c.",
+    "Use fast optimizer rows as the acceptance gate because slow Muon rows can hide kernel regressions."
+  ],
+  "rollup": {
+    "bf16_avg_c_over_b": 0.8331704533749574,
+    "cells": 14,
+    "fast_optimizer_avg_c_over_b": 0.665205548399839,
+    "fp8_avg_c_over_b": 0.8562657306625597,
+    "fp8_avg_peak_delta_gib": 30.490078512180066,
+    "losses": 10,
+    "wins": 4
+  },
+  "root_cause_hypothesis": [
+    "Path C losses on fast optimizers are not explained by Mamba3 or M2RNN isolated kernels: Mamba3 is faster and M2RNN is near parity in focused benches.",
+    "The loss appears when generated Path C surfaces are composed inside the full train graph: extra tvm-ffi/MLX graph boundaries, generated helper kernels, and cache misses add roughly 0.9-1.2s per steady step on fast optimizer rows.",
+    "FP8 Path C additionally creates large allocator high-water pressure: active memory is the same as Path B, but peak memory is roughly +21 to +32 GiB, so this is temporary/compile/graph buffer pressure, not live tensor growth.",
+    "Warm cache is incomplete: cache_hit is true in the matrix metadata, but many FP8 Path C warm cells still spend 12-45s in the first step, so kernel compilation or graph specialization is still happening in the train process."
+  ],
+  "schema_version": 1,
+  "summary_rows": [
+    {
+      "active_delta_gib": -3.683008253574371e-05,
+      "cache_delta_gib": -33.93797888047993,
+      "class": "mixed model/optimizer overhead",
+      "dtype": "bf16",
+      "first_step_delta_s": 7.785086124989903,
+      "matrix_case_corrected": false,
+      "optimizer": "adamw",
+      "path_b_tok_sec": 555.152175265852,
+      "path_c_over_b": 0.8062058267076114,
+      "path_c_warm_tok_sec": 447.566918408735,
+      "peak_delta_gib": 4.605946645140648,
+      "step_delta_s": 0.15098045173860886,
+      "verdict": "loss"
+    },
+    {
+      "active_delta_gib": -0.00010695867240428925,
+      "cache_delta_gib": -31.872871953994036,
+      "class": "fast optimizer exposes kernel overhead",
+      "dtype": "bf16",
+      "first_step_delta_s": 8.937342998979148,
+      "matrix_case_corrected": false,
+      "optimizer": "adam8bit",
+      "path_b_tok_sec": 1007.6073307832887,
+      "path_c_over_b": 0.6521736404425297,
+      "path_c_warm_tok_sec": 657.1349410535177,
+      "peak_delta_gib": 2.510742451995611,
+      "step_delta_s": 0.9789026711093212,
+      "verdict": "loss"
+    },
+    {
+      "active_delta_gib": -0.0001236703246831894,
+      "cache_delta_gib": -41.9062117729336,
+      "class": "mixed model/optimizer overhead",
+      "dtype": "bf16",
+      "first_step_delta_s": 18.411027666006703,
+      "matrix_case_corrected": true,
+      "optimizer": "lion",
+      "path_b_tok_sec": 800.3664964629596,
+      "path_c_over_b": 0.6768791727010215,
+      "path_c_warm_tok_sec": 541.7514119834632,
+      "peak_delta_gib": -0.00028996728360652924,
+      "step_delta_s": 1.0999140241014844,
+      "verdict": "loss"
+    },
+    {
+      "active_delta_gib": -0.00011456385254859924,
+      "cache_delta_gib": -31.266495123505592,
+      "class": "fast optimizer exposes kernel overhead",
+      "dtype": "bf16",
+      "first_step_delta_s": 8.90147320899996,
+      "matrix_case_corrected": false,
+      "optimizer": "lion8bit",
+      "path_b_tok_sec": 1011.7816454877229,
+      "path_c_over_b": 0.6739284223549488,
+      "path_c_warm_tok_sec": 681.8684081112352,
+      "peak_delta_gib": 2.5466688629239798,
+      "step_delta_s": 0.8749923091596239,
+      "verdict": "loss"
+    },
+    {
+      "active_delta_gib": -3.483891487121582e-05,
+      "cache_delta_gib": -37.005501829087734,
+      "class": "optimizer-heavy path masks or amplifies kernel overhead",
+      "dtype": "bf16",
+      "first_step_delta_s": 8.122984124987852,
+      "matrix_case_corrected": false,
+      "optimizer": "muon",
+      "path_b_tok_sec": 209.1636934823226,
+      "path_c_over_b": 1.0562483409642216,
+      "path_c_warm_tok_sec": 220.92880423065222,
+      "peak_delta_gib": 4.127121042460203,
+      "step_delta_s": -0.867878616157931,
+      "verdict": "win"
+    },
+    {
+      "active_delta_gib": -3.483891487121582e-05,
+      "cache_delta_gib": -37.005501829087734,
+      "class": "optimizer-heavy path masks or amplifies kernel overhead",
+      "dtype": "bf16",
+      "first_step_delta_s": 8.47995425001136,
+      "matrix_case_corrected": false,
+      "optimizer": "muon_adamw",
+      "path_b_tok_sec": 178.8021515360972,
+      "path_c_over_b": 1.2309371449472826,
+      "path_c_warm_tok_sec": 220.09420992227484,
+      "peak_delta_gib": 4.127121042460203,
+      "step_delta_s": -2.5743822102162284,
+      "verdict": "win"
+    },
+    {
+      "active_delta_gib": -0.0001409277319908142,
+      "cache_delta_gib": -41.57117915619165,
+      "class": "optimizer-heavy path masks or amplifies kernel overhead",
+      "dtype": "bf16",
+      "first_step_delta_s": 20.093944499996724,
+      "matrix_case_corrected": false,
+      "optimizer": "muon_int8",
+      "path_b_tok_sec": 196.65952105682342,
+      "path_c_over_b": 0.7358206255070868,
+      "path_c_warm_tok_sec": 144.7061317959559,
+      "peak_delta_gib": 4.60566570982337,
+      "step_delta_s": 3.3556616141010487,
+      "verdict": "loss"
+    },
+    {
+      "active_delta_gib": -3.4928321838378906e-05,
+      "cache_delta_gib": -37.749602598138154,
+      "class": "mixed model/optimizer overhead",
+      "dtype": "fp8",
+      "first_step_delta_s": 33.436456291994546,
+      "matrix_case_corrected": false,
+      "optimizer": "adamw",
+      "path_b_tok_sec": 186.9943104470639,
+      "path_c_over_b": 1.2641428321352273,
+      "path_c_warm_tok_sec": 236.38751720172527,
+      "peak_delta_gib": 32.46587002556771,
+      "step_delta_s": -3.206343767417005,
+      "verdict": "win"
+    },
+    {
+      "active_delta_gib": -0.0002600494772195816,
+      "cache_delta_gib": -35.63591002486646,
+      "class": "fast optimizer exposes kernel overhead",
+      "dtype": "fp8",
+      "first_step_delta_s": 38.38915154201095,
+      "matrix_case_corrected": false,
+      "optimizer": "adam8bit",
+      "path_b_tok_sec": 931.5203714302363,
+      "path_c_over_b": 0.6569136638915258,
+      "path_c_warm_tok_sec": 611.9284601858316,
+      "peak_delta_gib": 30.897187476046383,
+      "step_delta_s": 1.0093629451523731,
+      "verdict": "loss"
+    },
+    {
+      "active_delta_gib": -0.0001379791647195816,
+      "cache_delta_gib": -45.71608943026513,
+      "class": "fast optimizer exposes kernel overhead",
+      "dtype": "fp8",
+      "first_step_delta_s": 12.599876584019512,
+      "matrix_case_corrected": false,
+      "optimizer": "lion",
+      "path_b_tok_sec": 767.3430508673587,
+      "path_c_over_b": 0.6693671636593919,
+      "path_c_warm_tok_sec": 513.6342415128283,
+      "peak_delta_gib": 21.736973798833787,
+      "step_delta_s": 1.1949665440525248,
+      "verdict": "loss"
+    },
+    {
+      "active_delta_gib": -0.00020172260701656342,
+      "cache_delta_gib": -35.02986675128341,
+      "class": "fast optimizer exposes kernel overhead",
+      "dtype": "fp8",
+      "first_step_delta_s": 10.363562958023977,
+      "matrix_case_corrected": false,
+      "optimizer": "lion8bit",
+      "path_b_tok_sec": 947.019327700788,
+      "path_c_over_b": 0.6736448516507991,
+      "path_c_warm_tok_sec": 637.9546945194369,
+      "peak_delta_gib": 30.93316422123462,
+      "step_delta_s": 0.9333792367879621,
+      "verdict": "loss"
+    },
+    {
+      "active_delta_gib": -3.483891487121582e-05,
+      "cache_delta_gib": -40.800315340049565,
+      "class": "optimizer-heavy path masks or amplifies kernel overhead",
+      "dtype": "fp8",
+      "first_step_delta_s": 16.073210709000705,
+      "matrix_case_corrected": false,
+      "optimizer": "muon",
+      "path_b_tok_sec": 245.21375336672378,
+      "path_c_over_b": 0.7198466654280088,
+      "path_c_warm_tok_sec": 176.5163026781223,
+      "peak_delta_gib": 32.46586939599365,
+      "step_delta_s": 3.0773375614218423,
+      "verdict": "loss"
+    },
+    {
+      "active_delta_gib": -3.483891487121582e-05,
+      "cache_delta_gib": -40.800315340049565,
+      "class": "optimizer-heavy path masks or amplifies kernel overhead",
+      "dtype": "fp8",
+      "first_step_delta_s": 9.69166629301617,
+      "matrix_case_corrected": false,
+      "optimizer": "muon_adamw",
+      "path_b_tok_sec": 156.64106368174163,
+      "path_c_over_b": 1.2889466285407827,
+      "path_c_warm_tok_sec": 201.9019709236229,
+      "peak_delta_gib": 32.46586939599365,
+      "step_delta_s": -3.4416276512630777,
+      "verdict": "win"
+    },
+    {
+      "active_delta_gib": -0.0001561865210533142,
+      "cache_delta_gib": -45.36307868268341,
+      "class": "optimizer-heavy path masks or amplifies kernel overhead",
+      "dtype": "fp8",
+      "first_step_delta_s": 13.837426415993832,
+      "matrix_case_corrected": false,
+      "optimizer": "muon_int8",
+      "path_b_tok_sec": 200.49809802652248,
+      "path_c_over_b": 0.7209983093321825,
+      "path_c_warm_tok_sec": 144.5587897014409,
+      "peak_delta_gib": 32.46561527159065,
+      "step_delta_s": 3.6433911972578095,
+      "verdict": "loss"
+    }
+  ]
+}

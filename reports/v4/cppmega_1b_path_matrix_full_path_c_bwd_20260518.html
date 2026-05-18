@@ -1,0 +1,1880 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>cppmega 1B Path B vs Path C Training Matrix</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --text: #17202a;
+      --muted: #667085;
+      --line: #d8dee8;
+      --line-strong: #b8c0cc;
+      --good: #0f7a4f;
+      --good-bg: #e7f5ee;
+      --bad: #b42318;
+      --bad-bg: #fde8e5;
+      --warn: #93640f;
+      --warn-bg: #fff3d6;
+      --navy: #1e3a5f;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.45;
+    }
+    header {
+      background: #ffffff;
+      border-bottom: 1px solid var(--line);
+      padding: 28px max(24px, calc((100vw - 1240px) / 2)) 22px;
+    }
+    main {
+      max-width: 1240px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: clamp(28px, 4vw, 44px);
+      letter-spacing: 0;
+      line-height: 1.05;
+    }
+    h2 {
+      margin: 0;
+      font-size: 19px;
+      letter-spacing: 0;
+    }
+    p { margin: 0; color: var(--muted); }
+    code, pre {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      font-size: 12px;
+    }
+    pre {
+      margin: 8px 0 0;
+      overflow-x: auto;
+      white-space: pre-wrap;
+      color: #344054;
+    }
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 18px;
+    }
+    .meta span {
+      border: 1px solid var(--line);
+      background: #f9fafb;
+      border-radius: 6px;
+      padding: 7px 9px;
+      color: #344054;
+      font-size: 13px;
+    }
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 14px;
+      margin-bottom: 18px;
+    }
+    .summary-card, .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+    .summary-card { padding: 18px; }
+    .card-kicker {
+      color: var(--navy);
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+    .card-title {
+      margin-top: 4px;
+      font-size: 24px;
+      font-weight: 760;
+    }
+    .card-meta, .card-foot {
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .panel {
+      margin-top: 18px;
+      overflow: hidden;
+    }
+    .narrative {
+      padding-bottom: 2px;
+    }
+    .narrative-grid, .route-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 14px;
+      padding: 18px;
+    }
+    .narrative h3, .route-card h3 {
+      margin: 0 0 8px;
+      font-size: 14px;
+      letter-spacing: 0;
+    }
+    .narrative ul {
+      margin: 0;
+      padding-left: 18px;
+      color: #344054;
+      font-size: 13px;
+    }
+    .narrative li + li {
+      margin-top: 7px;
+    }
+    .route-card {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px;
+      background: #fbfcfe;
+    }
+    .route-card p {
+      font-size: 13px;
+      color: #344054;
+    }
+    .callout {
+      margin: 18px 18px 0;
+      border: 1px solid var(--line-strong);
+      border-left: 4px solid var(--navy);
+      border-radius: 8px;
+      background: #f8fbff;
+      padding: 13px 14px;
+      color: #344054;
+      font-size: 14px;
+    }
+    .finding-list {
+      padding: 16px 24px 18px 38px;
+      margin: 0;
+      color: #344054;
+      font-size: 13px;
+    }
+    .finding-list li + li {
+      margin-top: 8px;
+    }
+    .command-details {
+      border-top: 1px solid var(--line);
+      margin-top: 2px;
+    }
+    .section-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 16px 18px;
+      border-bottom: 1px solid var(--line);
+    }
+    .table-wrap { overflow-x: auto; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 940px;
+    }
+    th, td {
+      border-bottom: 1px solid var(--line);
+      padding: 11px 12px;
+      text-align: right;
+      vertical-align: top;
+      font-size: 13px;
+      white-space: nowrap;
+    }
+    th:first-child, td:first-child { text-align: left; }
+    thead th {
+      background: #f1f4f8;
+      border-bottom: 1px solid var(--line-strong);
+      color: #475467;
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+    tbody th { font-weight: 700; }
+    tbody tr:hover { background: #fafcff; }
+    .detail-table { min-width: 1180px; }
+    .decision {
+      display: inline-block;
+      border-radius: 999px;
+      padding: 4px 8px;
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .decision-good { background: var(--good-bg); color: var(--good); }
+    .decision-bad { background: var(--bad-bg); color: var(--bad); }
+    .decision-warn { background: var(--warn-bg); color: var(--warn); }
+    .pill {
+      display: inline-block;
+      border-radius: 999px;
+      padding: 3px 8px;
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .status-ok { background: var(--good-bg); color: var(--good); }
+    .status-na { background: var(--warn-bg); color: var(--warn); }
+    .status-bad { background: var(--bad-bg); color: var(--bad); }
+    .good-number { color: var(--good); font-weight: 700; }
+    .bad-number { color: var(--bad); font-weight: 700; }
+    .muted { color: var(--muted); font-size: 12px; white-space: normal; }
+    details { padding: 16px 18px; }
+    summary {
+      cursor: pointer;
+      font-weight: 700;
+    }
+    .commands {
+      margin: 12px 0 0;
+      padding-left: 24px;
+    }
+    .commands li { margin-bottom: 12px; }
+    @media (max-width: 720px) {
+      header { padding: 22px 16px; }
+      main { padding: 16px; }
+      .section-head { display: block; }
+      .section-head p { margin-top: 6px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>1B Training Matrix: Path B vs Path C</h1>
+    <p>BF16/FP8 optimizer sweep over the local GB10 quarter profile. The default decision is speed-gated by warm Path C versus Path B.</p>
+    <div class="meta">
+      <span>batch 1</span>
+      <span>seq 2048</span>
+      <span>steps 20</span>
+      <span>cppmega 430983d</span>
+      <span>TileLang 2d23cd19</span>
+      <span>MLX 0.32.0.dev20260514+d168ca5ca</span>
+      <span>tolerance 3%</span>
+    </div>
+  </header>
+  <main>
+    <div class="summary-grid">
+      
+            <section class="summary-card">
+              <div class="card-kicker">BF16</div>
+              <div class="card-title">21 runnable cells</div>
+              <div class="card-meta">Path C candidates: 0 / Keep Path B: 7 / No baseline: 0</div>
+              <div class="card-foot">Fastest: lion8bit Path B at 1027.6 tok/s</div>
+            </section>
+            
+
+            <section class="summary-card">
+              <div class="card-kicker">FP8</div>
+              <div class="card-title">21 runnable cells</div>
+              <div class="card-meta">Path C candidates: 4 / Keep Path B: 3 / No baseline: 0</div>
+              <div class="card-foot">Fastest: adam8bit Path B at 954.6 tok/s</div>
+            </section>
+            
+    </div>
+    
+      <section class="panel narrative">
+        <div class="section-head">
+          <h2>What This Report Compares</h2>
+          <p>Full local 1B-class training matrix, not a microkernel-only bench.</p>
+        </div>
+        <div class="narrative-grid">
+          <div>
+            <h3>Workload</h3>
+            <ul>
+              <li>Model profile: <code>local_gb10_quarter</code>, the 13-layer hybrid profile used by the M0.4 GB10 work.</li>
+              <li>Dataset: real parquet target shard <code>data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet</code>.</li>
+              <li>Shape: batch <code>1</code>, sequence length <code>2048</code>, measured training steps <code>20</code>, gradient checkpointing enabled by the matrix command.</li>
+              <li>Optimizer axes: <code>adamw</code>, <code>adam8bit</code>, <code>lion</code>, <code>lion8bit</code>, <code>muon</code>, <code>muon_adamw</code>, and <code>muon_int8</code>. The tables also show the runtime optimizer class, so <code>lion</code> means fp32-moment Lion16 while <code>lion8bit</code> is the quantized optimizer that previously reached the 900 tok/s-class baseline.</li>
+            </ul>
+          </div>
+          <div>
+            <h3>Measurements</h3>
+            <ul>
+              <li><strong>tok/s</strong> is the receipt-level mean target-token throughput from <code>scripts/m04_train_step.py</code>.</li>
+              <li><strong>first step s</strong> is the first recorded step, used as the compile/warmup cost indicator. <strong>steady s</strong> is the mean over the remaining steps.</li>
+              <li><strong>peak GiB</strong> is MLX/Metal allocator high-water from the per-cell receipt, not live tensor residency.</li>
+              <li><strong>active/cache GiB</strong> are the receipt's post-run active and allocator-cache memory; these separate real live tensor growth from cache/compile pressure.</li>
+              <li><strong>Warm / B</strong> is <code>Path C warm tok/s / Path B tok/s</code>. Default promotion requires at least <code>97%</code>.</li>
+            </ul>
+          </div>
+          <div>
+            <h3>Software Identity</h3>
+            <ul>
+              <li>cppmega: <code>430983d</code></li>
+              <li>TileLang: <code>2d23cd19</code></li>
+              <li>MLX: <code>0.32.0.dev20260514+d168ca5ca</code></li>
+              <li>Renderer source: <code>scripts/render_1b_training_matrix_html.py</code></li>
+            </ul>
+          </div>
+        </div>
+        <details class="command-details">
+          <summary>Matrix command</summary>
+          <pre>scripts/bench_1b_training_matrix.py --batch-size 1 --block-size 2048 --steps 20 --dtypes bf16,fp8 --optimizers adamw,adam8bit,lion,lion8bit,muon,muon_adamw,muon_int8 --paths path_b,path_c_cold,path_c_warm --mamba3-bwd path_c --fresh-process --reuse-existing-ok --work-dir reports/raw/cppmega_1b_path_matrix_cells_20260518_full_path_c --tilelang-cache-dir /tmp/cppmega_1b_path_matrix_tilelang_cache_20260518_full_path_c --out reports/v4/cppmega_1b_path_matrix_full_path_c_bwd_20260518.md --csv reports/v4/cppmega_1b_path_matrix_full_path_c_bwd_20260518.csv --json reports/v4/cppmega_1b_path_matrix_full_path_c_bwd_20260518.json</pre>
+        </details>
+      </section>
+    
+
+      <section class="panel narrative">
+        <div class="section-head">
+          <h2>Route Definitions</h2>
+          <p>The dtype label and path label both matter.</p>
+        </div>
+        <div class="route-grid">
+          <div class="route-card">
+            <h3>BF16 Path B</h3>
+            <p>Runs <code>--dtype bfloat16</code> with <code>CPPMEGA_KERNEL_PATH=auto</code>. This is the current non-forced baseline route. It may use existing Path B or reference surfaces according to the normal runtime policy.</p>
+          </div>
+          <div class="route-card">
+            <h3>BF16 Path C</h3>
+            <p>Runs <code>--dtype bfloat16</code> with <code>CPPMEGA_KERNEL_PATH=path_c</code>. The default matrix keeps Mamba3 on Path C forward plus Path B backward via <code>--mamba3-bwd path_b</code>; pass <code>--mamba3-bwd path_c</code> only for an explicit full-Path-C experiment.</p>
+          </div>
+          <div class="route-card">
+            <h3>FP8 Path B</h3>
+            <p>Runs <code>--dtype fp8_path_b</code> and forces <code>CPPMEGA_KERNEL_PATH__SPARSE_MLA=path_b</code> plus <code>CPPMEGA_SPARSE_MLA_FP8_ROUTE=path_b</code>. The DSA Sparse-MLA baseline dispatch is recorded as <code>sparse_mla_fp8_reference_path_b</code>; it is an honest non-Path-C FP8 training baseline, not a Path C fallback.</p>
+          </div>
+          <div class="route-card">
+            <h3>FP8 Path C</h3>
+            <p>Runs <code>--dtype fp8_path_c</code>, <code>CPPMEGA_SPARSE_MLA_FP8_ROUTE=path_c</code>, and the selected Mamba3 backward policy from the matrix command. Sparse-MLA consumes prepared <code>q_fp8/q_scale/kv_fp8/kv_scale</code> buffers through the TileLang/tvm-ffi route.</p>
+          </div>
+        </div>
+      </section>
+    
+
+      <section class="panel narrative">
+        <div class="section-head">
+          <h2>Current Default Decision</h2>
+          <p>Generated directly from the matrix ratios below.</p>
+        </div>
+        <div class="callout">
+          <strong>Current result:</strong> 4 row(s) qualify for Path C under the 3% same-speed rule; see details below.
+          Default promotion requires warm Path C to reach at least 97%
+          of Path B tok/s on the same 1B training workload.
+        </div>
+        <ul class="finding-list">
+                <li>
+                  <code>bf16 / adamw16 (AdamW)</code>: warm Path C is <strong>0.935x</strong>
+                  of Path B; <span class="decision decision-bad">Keep Path B</span>
+                  <span class="muted">Warm Path C is 6.5% slower than Path B.</span>
+                </li>
+                
+
+                <li>
+                  <code>bf16 / adam8bit</code>: warm Path C is <strong>0.829x</strong>
+                  of Path B; <span class="decision decision-bad">Keep Path B</span>
+                  <span class="muted">Warm Path C is 17.1% slower than Path B.</span>
+                </li>
+                
+
+                <li>
+                  <code>bf16 / lion16 (Lion)</code>: warm Path C is <strong>0.793x</strong>
+                  of Path B; <span class="decision decision-bad">Keep Path B</span>
+                  <span class="muted">Warm Path C is 20.7% slower than Path B.</span>
+                </li>
+                
+
+                <li>
+                  <code>bf16 / lion8bit</code>: warm Path C is <strong>0.825x</strong>
+                  of Path B; <span class="decision decision-bad">Keep Path B</span>
+                  <span class="muted">Warm Path C is 17.5% slower than Path B.</span>
+                </li>
+                
+
+                <li>
+                  <code>bf16 / muon (MuonAdamW)</code>: warm Path C is <strong>0.948x</strong>
+                  of Path B; <span class="decision decision-bad">Keep Path B</span>
+                  <span class="muted">Warm Path C is 5.2% slower than Path B.</span>
+                </li>
+                
+
+                <li>
+                  <code>bf16 / muon_adamw (MuonAdamW)</code>: warm Path C is <strong>0.929x</strong>
+                  of Path B; <span class="decision decision-bad">Keep Path B</span>
+                  <span class="muted">Warm Path C is 7.1% slower than Path B.</span>
+                </li>
+                
+
+                <li>
+                  <code>bf16 / muon-int8 (MuonAdamWInt8)</code>: warm Path C is <strong>0.715x</strong>
+                  of Path B; <span class="decision decision-bad">Keep Path B</span>
+                  <span class="muted">Warm Path C is 28.5% slower than Path B.</span>
+                </li>
+                
+
+                <li>
+                  <code>fp8 / adamw16 (AdamW)</code>: warm Path C is <strong>1.702x</strong>
+                  of Path B; <span class="decision decision-good">Path C default candidate</span>
+                  <span class="muted">Warm Path C is faster than Path B.</span>
+                </li>
+                
+
+                <li>
+                  <code>fp8 / adam8bit</code>: warm Path C is <strong>0.645x</strong>
+                  of Path B; <span class="decision decision-bad">Keep Path B</span>
+                  <span class="muted">Warm Path C is 35.5% slower than Path B.</span>
+                </li>
+                
+
+                <li>
+                  <code>fp8 / lion16 (Lion)</code>: warm Path C is <strong>2.510x</strong>
+                  of Path B; <span class="decision decision-good">Path C default candidate</span>
+                  <span class="muted">Warm Path C is faster than Path B.</span>
+                </li>
+                
+
+                <li>
+                  <code>fp8 / lion8bit</code>: warm Path C is <strong>0.697x</strong>
+                  of Path B; <span class="decision decision-bad">Keep Path B</span>
+                  <span class="muted">Warm Path C is 30.3% slower than Path B.</span>
+                </li>
+                
+
+                <li>
+                  <code>fp8 / muon (MuonAdamW)</code>: warm Path C is <strong>1.107x</strong>
+                  of Path B; <span class="decision decision-good">Path C default candidate</span>
+                  <span class="muted">Warm Path C is faster than Path B.</span>
+                </li>
+                
+
+                <li>
+                  <code>fp8 / muon_adamw (MuonAdamW)</code>: warm Path C is <strong>1.097x</strong>
+                  of Path B; <span class="decision decision-good">Path C default candidate</span>
+                  <span class="muted">Warm Path C is faster than Path B.</span>
+                </li>
+                
+
+                <li>
+                  <code>fp8 / muon-int8 (MuonAdamWInt8)</code>: warm Path C is <strong>0.744x</strong>
+                  of Path B; <span class="decision decision-bad">Keep Path B</span>
+                  <span class="muted">Warm Path C is 25.6% slower than Path B.</span>
+                </li>
+                </ul>
+      </section>
+    
+
+      <section class="panel">
+        <div class="section-head">
+          <h2>BF16 training speed</h2>
+          <p>Default rule: warm Path C must be at least 97% of Path B tok/s.</p>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Optimizer</th>
+                <th>Path B tok/s</th>
+                <th>Path C cold tok/s</th>
+                <th>Path C warm tok/s</th>
+                <th>Cold / B</th>
+                <th>Warm / B</th>
+                <th>Path B peak GiB</th>
+                <th>Warm C peak GiB</th>
+                <th>Peak allocator delta</th>
+                <th>Active delta</th>
+                <th>Cache delta</th>
+                <th>Default decision</th>
+              </tr>
+            </thead>
+            <tbody>
+            <tr>
+              <th>adamw16 (AdamW)<div class="muted">cppmega_mlx.training.optimizers.AdamWFP32Moments / cppmega_mlx.training.optimizers.make_adamw</div></th>
+              <td>603.0</td>
+              <td>549.6</td>
+              <td>564.1</td>
+              <td class="bad-number">0.911x</td>
+              <td class="bad-number">0.935x</td>
+              <td>29.14</td>
+              <td>33.75</td>
+              <td class="bad-number">+4.61 GiB</td>
+              <td class="">-0.00 GiB</td>
+              <td class="">-33.94 GiB</td>
+              <td><span class="decision decision-bad">Keep Path B</span><div class="muted">Warm Path C is 6.5% slower than Path B.</div></td>
+            </tr>
+            
+
+            <tr>
+              <th>adam8bit<div class="muted">cppmega_mlx.training.optimizers_quantized.Adam8bit / cppmega_mlx.training.optimizers_quantized.make_adam8bit</div></th>
+              <td>1007.8</td>
+              <td>845.3</td>
+              <td>835.9</td>
+              <td class="bad-number">0.839x</td>
+              <td class="bad-number">0.829x</td>
+              <td>21.04</td>
+              <td>23.56</td>
+              <td class="bad-number">+2.51 GiB</td>
+              <td class="">-0.00 GiB</td>
+              <td class="">-31.87 GiB</td>
+              <td><span class="decision decision-bad">Keep Path B</span><div class="muted">Warm Path C is 17.1% slower than Path B.</div></td>
+            </tr>
+            
+
+            <tr>
+              <th>lion16 (Lion)<div class="muted">cppmega_mlx.training.optimizers.LionFP32Moments / cppmega_mlx.training.optimizers.make_lion</div></th>
+              <td>791.4</td>
+              <td>636.3</td>
+              <td>627.4</td>
+              <td class="bad-number">0.804x</td>
+              <td class="bad-number">0.793x</td>
+              <td>33.51</td>
+              <td>26.91</td>
+              <td class="">-6.60 GiB</td>
+              <td class="">-0.00 GiB</td>
+              <td class="">-41.91 GiB</td>
+              <td><span class="decision decision-bad">Keep Path B</span><div class="muted">Warm Path C is 20.7% slower than Path B.</div></td>
+            </tr>
+            
+
+            <tr>
+              <th>lion8bit<div class="muted">cppmega_mlx.training.optimizers_quantized.Lion8bit / cppmega_mlx.training.optimizers_quantized.make_lion8bit</div></th>
+              <td>1027.6</td>
+              <td>866.9</td>
+              <td>847.5</td>
+              <td class="bad-number">0.844x</td>
+              <td class="bad-number">0.825x</td>
+              <td>19.27</td>
+              <td>21.82</td>
+              <td class="bad-number">+2.55 GiB</td>
+              <td class="">-0.00 GiB</td>
+              <td class="">-31.27 GiB</td>
+              <td><span class="decision decision-bad">Keep Path B</span><div class="muted">Warm Path C is 17.5% slower than Path B.</div></td>
+            </tr>
+            
+
+            <tr>
+              <th>muon (MuonAdamW)<div class="muted">cppmega_mlx.training.optimizers.MuonAdamWMulti / cppmega_mlx.training.optimizers.make_muon</div></th>
+              <td>252.9</td>
+              <td>234.4</td>
+              <td>239.8</td>
+              <td class="bad-number">0.927x</td>
+              <td class="bad-number">0.948x</td>
+              <td>24.59</td>
+              <td>28.72</td>
+              <td class="bad-number">+4.13 GiB</td>
+              <td class="">-0.00 GiB</td>
+              <td class="">-36.91 GiB</td>
+              <td><span class="decision decision-bad">Keep Path B</span><div class="muted">Warm Path C is 5.2% slower than Path B.</div></td>
+            </tr>
+            
+
+            <tr>
+              <th>muon_adamw (MuonAdamW)<div class="muted">cppmega_mlx.training.optimizers.MuonAdamWMulti / cppmega_mlx.training.optimizers.make_muon</div></th>
+              <td>258.1</td>
+              <td>238.4</td>
+              <td>239.9</td>
+              <td class="bad-number">0.924x</td>
+              <td class="bad-number">0.929x</td>
+              <td>24.59</td>
+              <td>28.72</td>
+              <td class="bad-number">+4.13 GiB</td>
+              <td class="">-0.00 GiB</td>
+              <td class="">-36.91 GiB</td>
+              <td><span class="decision decision-bad">Keep Path B</span><div class="muted">Warm Path C is 7.1% slower than Path B.</div></td>
+            </tr>
+            
+
+            <tr>
+              <th>muon-int8 (MuonAdamWInt8)<div class="muted">cppmega_mlx.training.optimizers.MuonAdamWMulti / cppmega_mlx.training.optimizers.make_muon(int8_state)</div></th>
+              <td>214.1</td>
+              <td>156.1</td>
+              <td>153.0</td>
+              <td class="bad-number">0.729x</td>
+              <td class="bad-number">0.715x</td>
+              <td>17.67</td>
+              <td>22.27</td>
+              <td class="bad-number">+4.61 GiB</td>
+              <td class="">-0.00 GiB</td>
+              <td class="">-41.57 GiB</td>
+              <td><span class="decision decision-bad">Keep Path B</span><div class="muted">Warm Path C is 28.5% slower than Path B.</div></td>
+            </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    
+
+      <section class="panel">
+        <div class="section-head">
+          <h2>FP8 training speed</h2>
+          <p>Default rule: warm Path C must be at least 97% of Path B tok/s.</p>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Optimizer</th>
+                <th>Path B tok/s</th>
+                <th>Path C cold tok/s</th>
+                <th>Path C warm tok/s</th>
+                <th>Cold / B</th>
+                <th>Warm / B</th>
+                <th>Path B peak GiB</th>
+                <th>Warm C peak GiB</th>
+                <th>Peak allocator delta</th>
+                <th>Active delta</th>
+                <th>Cache delta</th>
+                <th>Default decision</th>
+              </tr>
+            </thead>
+            <tbody>
+            <tr>
+              <th>adamw16 (AdamW)<div class="muted">cppmega_mlx.training.optimizers.AdamWFP32Moments / cppmega_mlx.training.optimizers.make_adamw</div></th>
+              <td>145.1</td>
+              <td>230.1</td>
+              <td>247.0</td>
+              <td class="good-number">1.585x</td>
+              <td class="good-number">1.702x</td>
+              <td>30.54</td>
+              <td>63.00</td>
+              <td class="bad-number">+32.47 GiB</td>
+              <td class="">-0.00 GiB</td>
+              <td class="">-37.75 GiB</td>
+              <td><span class="decision decision-good">Path C default candidate</span><div class="muted">Warm Path C is faster than Path B.</div></td>
+            </tr>
+            
+
+            <tr>
+              <th>adam8bit<div class="muted">cppmega_mlx.training.optimizers_quantized.Adam8bit / cppmega_mlx.training.optimizers_quantized.make_adam8bit</div></th>
+              <td>954.6</td>
+              <td>624.3</td>
+              <td>615.7</td>
+              <td class="bad-number">0.654x</td>
+              <td class="bad-number">0.645x</td>
+              <td>21.91</td>
+              <td>52.81</td>
+              <td class="bad-number">+30.90 GiB</td>
+              <td class="">-0.00 GiB</td>
+              <td class="">-35.64 GiB</td>
+              <td><span class="decision decision-bad">Keep Path B</span><div class="muted">Warm Path C is 35.5% slower than Path B.</div></td>
+            </tr>
+            
+
+            <tr>
+              <th>lion16 (Lion)<div class="muted">cppmega_mlx.training.optimizers.LionFP32Moments / cppmega_mlx.training.optimizers.make_lion</div></th>
+              <td>196.2</td>
+              <td>499.9</td>
+              <td>492.4</td>
+              <td class="good-number">2.549x</td>
+              <td class="good-number">2.510x</td>
+              <td>34.43</td>
+              <td>56.17</td>
+              <td class="bad-number">+21.74 GiB</td>
+              <td class="">-0.00 GiB</td>
+              <td class="">-45.72 GiB</td>
+              <td><span class="decision decision-good">Path C default candidate</span><div class="muted">Warm Path C is faster than Path B.</div></td>
+            </tr>
+            
+
+            <tr>
+              <th>lion8bit<div class="muted">cppmega_mlx.training.optimizers_quantized.Lion8bit / cppmega_mlx.training.optimizers_quantized.make_lion8bit</div></th>
+              <td>921.1</td>
+              <td>641.7</td>
+              <td>641.7</td>
+              <td class="bad-number">0.697x</td>
+              <td class="bad-number">0.697x</td>
+              <td>20.14</td>
+              <td>51.07</td>
+              <td class="bad-number">+30.93 GiB</td>
+              <td class="">-0.00 GiB</td>
+              <td class="">-35.03 GiB</td>
+              <td><span class="decision decision-bad">Keep Path B</span><div class="muted">Warm Path C is 30.3% slower than Path B.</div></td>
+            </tr>
+            
+
+            <tr>
+              <th>muon (MuonAdamW)<div class="muted">cppmega_mlx.training.optimizers.MuonAdamWMulti / cppmega_mlx.training.optimizers.make_muon</div></th>
+              <td>179.5</td>
+              <td>195.0</td>
+              <td>198.7</td>
+              <td class="good-number">1.086x</td>
+              <td class="good-number">1.107x</td>
+              <td>25.51</td>
+              <td>57.97</td>
+              <td class="bad-number">+32.47 GiB</td>
+              <td class="">-0.00 GiB</td>
+              <td class="">-40.80 GiB</td>
+              <td><span class="decision decision-good">Path C default candidate</span><div class="muted">Warm Path C is faster than Path B.</div></td>
+            </tr>
+            
+
+            <tr>
+              <th>muon_adamw (MuonAdamW)<div class="muted">cppmega_mlx.training.optimizers.MuonAdamWMulti / cppmega_mlx.training.optimizers.make_muon</div></th>
+              <td>184.5</td>
+              <td>196.6</td>
+              <td>202.3</td>
+              <td class="good-number">1.066x</td>
+              <td class="good-number">1.097x</td>
+              <td>25.51</td>
+              <td>57.97</td>
+              <td class="bad-number">+32.47 GiB</td>
+              <td class="">-0.00 GiB</td>
+              <td class="">-40.80 GiB</td>
+              <td><span class="decision decision-good">Path C default candidate</span><div class="muted">Warm Path C is faster than Path B.</div></td>
+            </tr>
+            
+
+            <tr>
+              <th>muon-int8 (MuonAdamWInt8)<div class="muted">cppmega_mlx.training.optimizers.MuonAdamWMulti / cppmega_mlx.training.optimizers.make_muon(int8_state)</div></th>
+              <td>198.9</td>
+              <td>147.5</td>
+              <td>148.0</td>
+              <td class="bad-number">0.741x</td>
+              <td class="bad-number">0.744x</td>
+              <td>19.06</td>
+              <td>51.53</td>
+              <td class="bad-number">+32.47 GiB</td>
+              <td class="">-0.00 GiB</td>
+              <td class="">-45.36 GiB</td>
+              <td><span class="decision decision-bad">Keep Path B</span><div class="muted">Warm Path C is 25.6% slower than Path B.</div></td>
+            </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    
+
+      <section class="panel">
+        <div class="section-head">
+          <h2>BF16 dispatch profile</h2>
+          <p>Receipt-level profiling: steady step time, runtime kernel dispatch counts, and active/cache memory deltas. GPU-counter traces are separate artifacts; this table is the parsed training receipt evidence.</p>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Optimizer</th>
+                <th>Path B first step s</th>
+                <th>Warm C first step s</th>
+                <th>Path B steady s</th>
+                <th>Warm C steady s</th>
+                <th>Path B median s</th>
+                <th>Warm C median s</th>
+                <th>Step delta</th>
+                <th>Path B kernels</th>
+                <th>Warm C kernels</th>
+                <th>Active delta</th>
+                <th>Cache delta</th>
+              </tr>
+            </thead>
+            <tbody>
+            <tr>
+              <th>adamw16 (AdamW)</th>
+              <td>8.981</td>
+              <td>12.708</td>
+              <td>3.544</td>
+              <td>3.498</td>
+              <td>3.086</td>
+              <td>3.490</td>
+              <td class="good-number">-0.05 s</td>
+              <td>metal_kernel_fwd_v1 x160</td>
+              <td>path_c_tilelang_dsl x120, path_c_tilelang_dsl_packed_post x40</td>
+              <td>-0.00 GiB</td>
+              <td>-33.94 GiB</td>
+            </tr>
+            
+
+            <tr>
+              <th>adam8bit</th>
+              <td>2.223</td>
+              <td>11.740</td>
+              <td>2.024</td>
+              <td>2.351</td>
+              <td>1.995</td>
+              <td>2.354</td>
+              <td class="bad-number">+0.33 s</td>
+              <td>metal_kernel_fwd_v1 x160</td>
+              <td>path_c_tilelang_dsl x120, path_c_tilelang_dsl_packed_post x40</td>
+              <td>-0.00 GiB</td>
+              <td>-31.87 GiB</td>
+            </tr>
+            
+
+            <tr>
+              <th>lion16 (Lion)</th>
+              <td>3.957</td>
+              <td>12.204</td>
+              <td>2.546</td>
+              <td>3.142</td>
+              <td>2.510</td>
+              <td>3.140</td>
+              <td class="bad-number">+0.60 s</td>
+              <td>metal_kernel_fwd_v1 x160</td>
+              <td>path_c_tilelang_dsl x120, path_c_tilelang_dsl_packed_post x40</td>
+              <td>-0.00 GiB</td>
+              <td>-41.91 GiB</td>
+            </tr>
+            
+
+            <tr>
+              <th>lion8bit</th>
+              <td>2.171</td>
+              <td>11.442</td>
+              <td>1.985</td>
+              <td>2.319</td>
+              <td>1.955</td>
+              <td>2.316</td>
+              <td class="bad-number">+0.33 s</td>
+              <td>metal_kernel_fwd_v1 x160</td>
+              <td>path_c_tilelang_dsl x120, path_c_tilelang_dsl_packed_post x40</td>
+              <td>-0.00 GiB</td>
+              <td>-31.27 GiB</td>
+            </tr>
+            
+
+            <tr>
+              <th>muon (MuonAdamW)</th>
+              <td>8.958</td>
+              <td>29.777</td>
+              <td>8.081</td>
+              <td>8.226</td>
+              <td>7.968</td>
+              <td>8.220</td>
+              <td class="bad-number">+0.15 s</td>
+              <td>metal_kernel_fwd_v1 x160</td>
+              <td>path_c_tilelang_dsl x120, path_c_tilelang_dsl_packed_post x40</td>
+              <td>-0.00 GiB</td>
+              <td>-36.91 GiB</td>
+            </tr>
+            
+
+            <tr>
+              <th>muon_adamw (MuonAdamW)</th>
+              <td>8.604</td>
+              <td>17.404</td>
+              <td>7.902</td>
+              <td>8.311</td>
+              <td>7.864</td>
+              <td>8.305</td>
+              <td class="bad-number">+0.41 s</td>
+              <td>metal_kernel_fwd_v1 x160</td>
+              <td>path_c_tilelang_dsl x120, path_c_tilelang_dsl_packed_post x40</td>
+              <td>-0.00 GiB</td>
+              <td>-36.91 GiB</td>
+            </tr>
+            
+
+            <tr>
+              <th>muon-int8 (MuonAdamWInt8)</th>
+              <td>9.839</td>
+              <td>22.593</td>
+              <td>9.548</td>
+              <td>13.100</td>
+              <td>9.580</td>
+              <td>13.101</td>
+              <td class="bad-number">+3.55 s</td>
+              <td>metal_kernel_fwd_v1 x160</td>
+              <td>path_c_tilelang_dsl x120, path_c_tilelang_dsl_packed_post x40</td>
+              <td>-0.00 GiB</td>
+              <td>-41.57 GiB</td>
+            </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    
+
+      <section class="panel">
+        <div class="section-head">
+          <h2>FP8 dispatch profile</h2>
+          <p>Receipt-level profiling: steady step time, runtime kernel dispatch counts, and active/cache memory deltas. GPU-counter traces are separate artifacts; this table is the parsed training receipt evidence.</p>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Optimizer</th>
+                <th>Path B first step s</th>
+                <th>Warm C first step s</th>
+                <th>Path B steady s</th>
+                <th>Warm C steady s</th>
+                <th>Path B median s</th>
+                <th>Warm C median s</th>
+                <th>Step delta</th>
+                <th>Path B kernels</th>
+                <th>Warm C kernels</th>
+                <th>Active delta</th>
+                <th>Cache delta</th>
+              </tr>
+            </thead>
+            <tbody>
+            <tr>
+              <th>adamw16 (AdamW)</th>
+              <td>10.130</td>
+              <td>19.188</td>
+              <td>14.428</td>
+              <td>8.201</td>
+              <td>14.582</td>
+              <td>8.329</td>
+              <td class="good-number">-6.23 s</td>
+              <td>metal_kernel_fwd_v1 x146, sparse_mla_fp8_reference_path_b x110</td>
+              <td>path_c_tilelang_dsl_fwd_path_b_bwd x110, path_c_tilelang_dsl_packed_post x36, tilelang_fp8_prepared_path_c_fwd x110</td>
+              <td>-0.00 GiB</td>
+              <td>-37.75 GiB</td>
+            </tr>
+            
+
+            <tr>
+              <th>adam8bit</th>
+              <td>2.310</td>
+              <td>15.509</td>
+              <td>2.138</td>
+              <td>3.209</td>
+              <td>2.153</td>
+              <td>3.143</td>
+              <td class="bad-number">+1.07 s</td>
+              <td>metal_kernel_fwd_v1 x146, sparse_mla_fp8_reference_path_b x110</td>
+              <td>path_c_tilelang_dsl_fwd_path_b_bwd x110, path_c_tilelang_dsl_packed_post x36, tilelang_fp8_prepared_path_c_fwd x110</td>
+              <td>-0.00 GiB</td>
+              <td>-35.64 GiB</td>
+            </tr>
+            
+
+            <tr>
+              <th>lion16 (Lion)</th>
+              <td>5.621</td>
+              <td>13.935</td>
+              <td>11.000</td>
+              <td>4.131</td>
+              <td>11.096</td>
+              <td>3.870</td>
+              <td class="good-number">-6.87 s</td>
+              <td>metal_kernel_fwd_v1 x146, sparse_mla_fp8_reference_path_b x110</td>
+              <td>path_c_tilelang_dsl_fwd_path_b_bwd x110, path_c_tilelang_dsl_packed_post x36, tilelang_fp8_prepared_path_c_fwd x110</td>
+              <td>-0.00 GiB</td>
+              <td>-45.72 GiB</td>
+            </tr>
+            
+
+            <tr>
+              <th>lion8bit</th>
+              <td>2.418</td>
+              <td>12.997</td>
+              <td>2.214</td>
+              <td>3.069</td>
+              <td>2.221</td>
+              <td>3.065</td>
+              <td class="bad-number">+0.86 s</td>
+              <td>metal_kernel_fwd_v1 x146, sparse_mla_fp8_reference_path_b x110</td>
+              <td>path_c_tilelang_dsl_fwd_path_b_bwd x110, path_c_tilelang_dsl_packed_post x36, tilelang_fp8_prepared_path_c_fwd x110</td>
+              <td>-0.00 GiB</td>
+              <td>-35.03 GiB</td>
+            </tr>
+            
+
+            <tr>
+              <th>muon (MuonAdamW)</th>
+              <td>10.303</td>
+              <td>20.975</td>
+              <td>11.505</td>
+              <td>10.044</td>
+              <td>11.257</td>
+              <td>9.917</td>
+              <td class="good-number">-1.46 s</td>
+              <td>metal_kernel_fwd_v1 x146, sparse_mla_fp8_reference_path_b x110</td>
+              <td>path_c_tilelang_dsl_fwd_path_b_bwd x110, path_c_tilelang_dsl_packed_post x36, tilelang_fp8_prepared_path_c_fwd x110</td>
+              <td>-0.00 GiB</td>
+              <td>-40.80 GiB</td>
+            </tr>
+            
+
+            <tr>
+              <th>muon_adamw (MuonAdamW)</th>
+              <td>8.649</td>
+              <td>19.741</td>
+              <td>11.313</td>
+              <td>9.865</td>
+              <td>11.328</td>
+              <td>9.846</td>
+              <td class="good-number">-1.45 s</td>
+              <td>metal_kernel_fwd_v1 x146, sparse_mla_fp8_reference_path_b x110</td>
+              <td>path_c_tilelang_dsl_fwd_path_b_bwd x110, path_c_tilelang_dsl_packed_post x36, tilelang_fp8_prepared_path_c_fwd x110</td>
+              <td>-0.00 GiB</td>
+              <td>-40.80 GiB</td>
+            </tr>
+            
+
+            <tr>
+              <th>muon-int8 (MuonAdamWInt8)</th>
+              <td>10.529</td>
+              <td>23.446</td>
+              <td>10.278</td>
+              <td>13.537</td>
+              <td>10.285</td>
+              <td>13.522</td>
+              <td class="bad-number">+3.26 s</td>
+              <td>metal_kernel_fwd_v1 x146, sparse_mla_fp8_reference_path_b x110</td>
+              <td>path_c_tilelang_dsl_fwd_path_b_bwd x110, path_c_tilelang_dsl_packed_post x36, tilelang_fp8_prepared_path_c_fwd x110</td>
+              <td>-0.00 GiB</td>
+              <td>-45.36 GiB</td>
+            </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    
+
+      <section class="panel">
+        <div class="section-head">
+          <h2>BF16 cell details</h2>
+          <p>Exact cell statuses from the JSON receipt.</p>
+        </div>
+        <div class="table-wrap">
+          <table class="detail-table">
+            <thead>
+              <tr>
+                <th>Case</th>
+                <th>Runtime optimizer</th>
+                <th>Path</th>
+                <th>Status</th>
+                <th>Steps</th>
+                <th>tok/s</th>
+                <th>first step s</th>
+                <th>steady step s</th>
+                <th>peak GB</th>
+                <th>active GiB</th>
+                <th>cache GiB</th>
+                <th>cache hit</th>
+                <th>route proof</th>
+                <th>reason</th>
+              </tr>
+            </thead>
+            <tbody>
+            <tr>
+              <th>bf16_adam8bit_path_b</th>
+              <td>adam8bit</td>
+              <td>Path B</td>
+              <td><span class="pill status-ok">ok</span></td>
+              <td>20</td>
+              <td>1007.8</td>
+              <td>2.22</td>
+              <td>2.02</td>
+              <td>21.04</td>
+              <td>6.90</td>
+              <td>31.87</td>
+              <td></td>
+              <td>not_requested</td>
+              <td>ok</td>
+            </tr>
+            
+
+            <tr>
+              <th>bf16_adam8bit_path_c_cold</th>
+              <td>adam8bit</td>
+              <td>Path C cold</td>
+              <td><span class="pill status-ok">ok</span></td>
+              <td>20</td>
+              <td>845.3</td>
+              <td>24.03</td>
+              <td>2.31</td>
+              <td>23.56</td>
+              <td>6.90</td>
+              <td>0.00</td>
+              <td>False</td>
+              <td>not_requested</td>
+              <td>ok</td>
+            </tr>
+            
+
+            <tr>
+              <th>bf16_adam8bit_path_c_warm</th>
+              <td>adam8bit</td>
+              <td>Path C warm</td>
+              <td><span class="pill status-ok">ok</span></td>
+              <td>20</td>
+              <td>835.9</td>
+              <td>11.74</td>
+              <td>2.35</td>
+              <td>23.56</td>
+              <td>6.90</td>
+              <td>0.00</td>
+              <td>True</td>
+              <td>not_requested</td>
+              <td>ok</td>
+            </tr>
+            
+
+            <tr>
+              <th>bf16_adamw_path_b</th>
+              <td>adamw16 (AdamW)</td>
+              <td>Path B</td>
+              <td><span class="pill status-ok">ok</span></td>
+              <td>20</td>
+              <td>603.0</td>
+              <td>8.98</td>
+              <td>3.54</td>
+              <td>29.14</td>
+              <td>17.09</td>
+              <td>33.94</td>
+              <td></td>
+              <td>not_requested</td>
+              <td>ok</td>
+            </tr>
+            
+
+            <tr>
+              <th>bf16_adamw_path_c_cold</th>
+              <td>adamw16 (AdamW)</td>
+              <td>Path C cold</td>
+              <td><span class="pill status-ok">ok</span></td>
+              <td>20</td>
+              <td>549.6</td>
+              <td>26.95</td>
+              <td>3.56</td>
+              <td>33.75</td>
+              <td>17.09</td>
+              <td>0.00</td>
+              <td>False</td>
+              <td>not_requested</td>
+              <td>ok</td>
+            </tr>
+            
+
+            <tr>
+              <th>bf16_adamw_path_c_warm</th>
+              <td>adamw16 (AdamW)</td>
+              <td>Path C warm</td>
+              <td><span class="pill status-ok">ok</span></td>
+              <td>20</td>
+              <td>564.1</td>
+              <td>12.71</td>
+              <td>3.50</td>
+              <td>33.75</td>
+              <td>17.09</td>
+              <td>0.00</td>
+              <td>True</td>
+              <td>not_requested</td>
+              <td>ok</td>
+            </tr>
+            
+
+            <tr>
+              <th>bf16_lion_path_b</th>
+              <td>lion16 (Lion)</td>
+              <td>Path B</td>
+              <td><span class="pill status-ok">ok</span></td>
+              <td>20</td>
+              <td>791.4</td>
+              <td>3.96</td>
+              <td>2.55</td>
+              <td>33.51</td>
+              <td>10.25</td>
+              <td>41.91</td>
+              <td></td>
+              <td>not_requested</td>
+              <td>ok</td>
+            </tr>
+            
+
+            <tr>
+              <th>bf16_lion_path_c_cold</th>
+              <td>lion16 (Lion)</td>
+              <td>Path C cold</td>
+              <td><span class="pill status-ok">ok</span></td>
+              <td>20</td>
+              <td>636.3</td>
+              <td>25.40</td>
+              <td>3.08</td>
+              <td>26.91</td>
+              <td>10.25</td>
+              <td>0.00</td>
+              <td>False</td>
+              <td>not_requested</td>
+              <td>ok</td>
+            </tr>
+            
+
+            <tr>
+              <th>bf16_lion_path_c_warm</th>
+              <td>lion16 (Lion)</td>
+              <td>Path C warm</td>
+              <td><span class="pill status-ok">ok</span></td>
+              <td>20</td>
+              <td>627.4</td>
+              <td>12.20</td>
+              <td>3.14</td>
+              <td>26.91</td>
+              <td>10.25</td>
+              <td>0.00</td>
+              <td>True</td>
+              <td>not_requested</td>
+              <td>ok</td>
+            </tr>
+            
+
+            <tr>
+              <th>bf16_lion8bit_path_b</th>
+              <td>lion8bit</td>
+              <td>Path B</td>
+              <td><span class="pill status-ok">ok</span></td>
+              <td>20</td>
+              <td>1027.6</td>
+              <td>2.17</td>
+              <td>1.98</td>
+              <td>19.27</td>
+              <td>5.16</td>
+              <td>31.27</td>
+              <td></td>
+              <td>not_requested</td>
+              <td>ok</td>
+            </tr>
+            
+
+            <tr>
+              <th>bf16_lion8bit_path_c_cold</th>
+              <td>lion8bit</td>
+              <td>Path C cold</td>
+              <td><span class="pill status-ok">ok</span></td>
+              <td>20</td>
+              <td>866.9</td>
+              <td>24.90</td>
+              <td>2.25</td>
+              <td>21.82</td>
+              <td>5.16</td>
+              <td>0.00</td>
+              <td>False</td>
+              <td>not_requested</td>
+              <td>ok</td>
+            </tr>
+            
+
+            <tr>
+              <th>bf16_lion8bit_path_c_warm</th>
+              <td>lion8bit</td>
+              <td>Path C warm</td>
+              <td><span class="pill status-ok">ok</span></td>
+              <td>20</td>
+              <td>847.5</td>
+              <td>11.44</td>
+              <td>2.32</td>
+              <td>21.82</td>
+              <td>5.16</td>
+              <td>0.00</td>
+              <td>True</td>
+              <td>not_requested</td>
+              <td>ok</td>
+            </tr>
+            
+
+            <tr>
+              <th>bf16_muon_path_b</th>
+              <td>muon (MuonAdamW)</td>
+              <td>Path B</td>
+              <td><span class="pill status-ok">ok</span></td>
+              <td>20</td>
+              <td>252.9</td>
+              <td>8.96</td>
+              <td>8.08</td>
+              <td>24.59</td>
+              <td>12.06</td>
+              <td>36.91</td>
+              <td></td>
+              <td>not_requested</td>
+              <td>ok</td>
+            </tr>
+            
+
+            <tr>
+              <th>bf16_muon_path_c_cold</th>
+              <td>muon (MuonAdamW)</td>
+              <td>Path C cold</td>
+              <td><span class="pill status-ok">ok</span></td>
+              <td>20</td>
+              <td>234.4</td>
+              <td>31.24</td>
+              <td>8.42</td>
+              <td>28.72</td>
+              <td>12.06</td>
+              <td>0.00</td>
+              <td>False</td>
+              <td>not_requested</td>
+              <td>ok</td>
+            </tr>
+            
+
+            <tr>
+              <th>bf16_muon_path_c_warm</th>
+              <td>muon (MuonAdamW)</td>
+              <td>Path C warm</td>
+              <td><span class="pill status-ok">ok</span></td>
+              <td>20</td>
+              <td>239.8</td>
+              <td>29.78</td>
+              <td>8.23</td>
+              <td>28.72</td>
+              <td>12.06</td>
+              <td>0.00</td>
+              <td>True</td>
+              <td>not_requested</td>
+              <td>ok</td>
+            </tr>
+            
+
+            <tr>
+              <th>bf16_muon_adamw_path_b</th>
+              <td>muon_adamw (MuonAdamW)</td>
+              <td>Path B</td>
+              <td><span class="pill status-ok">ok</span></td>
+              <td>20</td>
+              <td>258.1</td>
+              <td>8.60</td>
+              <td>7.90</td>
+              <td>24.59</td>
+              <td>12.06</td>
+              <td>36.91</td>
+              <td></td>
+              <td>not_requested</td>
+              <td>ok</td>
+            </tr>
+            
+
+            <tr>
+              <th>bf16_muon_adamw_path_c_cold</th>
+              <td>muon_adamw (MuonAdamW)</td>
+              <td>Path C cold</td>
+              <td><span class="pill status-ok">ok</span></td>
+              <td>20</td>
+              <td>238.4</td>
+              <td>30.12</td>
+              <td>8.27</td>
+              <td>28.72</td>
+              <td>12.06</td>
+              <td>0.00</td>
+              <td>False</td>
+              <td>not_requested</td>
+              <td>ok</td>
+            </tr>
+            
+
+            <tr>
+              <th>bf16_muon_adamw_path_c_warm</th>
+              <td>muon_adamw (MuonAdamW)</td>
+              <td>Path C warm</td>
+              <td><span class="pill status-ok">ok</span></td>
+              <td>20</td>
+              <td>239.9</td>
+              <td>17.40</td>
+              <td>8.31</td>
+              <td>28.72</td>
+              <td>12.06</td>
+              <td>0.00</td>
+              <td>True</td>
+              <td>not_requested</td>
+              <td>ok</td>
+            </tr>
+            
+
+            <tr>
+              <th>bf16_muon_int8_path_b</th>
+              <td>muon-int8 (MuonAdamWInt8)</td>
+              <td>Path B</td>
+              <td><span class="pill status-ok">ok</span></td>
+              <td>20</td>
+              <td>214.1</td>
+              <td>9.84</td>
+              <td>9.55</td>
+              <td>17.67</td>
+              <td>5.62</td>
+              <td>41.57</td>
+              <td></td>
+              <td>not_requested</td>
+              <td>ok</td>
+            </tr>
+            
+
+            <tr>
+              <th>bf16_muon_int8_path_c_cold</th>
+              <td>muon-int8 (MuonAdamWInt8)</td>
+              <td>Path C cold</td>
+              <td><span class="pill status-ok">ok</span></td>
+              <td>20</td>
+              <td>156.1</td>
+              <td>34.75</td>
+              <td>12.70</td>
+              <td>22.27</td>
+              <td>5.62</td>
+              <td>0.00</td>
+              <td>False</td>
+              <td>not_requested</td>
+              <td>ok</td>
+            </tr>
+            
+
+            <tr>
+              <th>bf16_muon_int8_path_c_warm</th>
+              <td>muon-int8 (MuonAdamWInt8)</td>
+              <td>Path C warm</td>
+              <td><span class="pill status-ok">ok</span></td>
+              <td>20</td>
+              <td>153.0</td>
+              <td>22.59</td>
+              <td>13.10</td>
+              <td>22.27</td>
+              <td>5.62</td>
+              <td>0.00</td>
+              <td>True</td>
+              <td>not_requested</td>
+              <td>ok</td>
+            </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    
+
+      <section class="panel">
+        <div class="section-head">
+          <h2>FP8 cell details</h2>
+          <p>Exact cell statuses from the JSON receipt.</p>
+        </div>
+        <div class="table-wrap">
+          <table class="detail-table">
+            <thead>
+              <tr>
+                <th>Case</th>
+                <th>Runtime optimizer</th>
+                <th>Path</th>
+                <th>Status</th>
+                <th>Steps</th>
+                <th>tok/s</th>
+                <th>first step s</th>
+                <th>steady step s</th>
+                <th>peak GB</th>
+                <th>active GiB</th>
+                <th>cache GiB</th>
+                <th>cache hit</th>
+                <th>route proof</th>
+                <th>reason</th>
+              </tr>
+            </thead>
+            <tbody>
+            <tr>
+              <th>fp8_adam8bit_path_b</th>
+              <td>adam8bit</td>
+              <td>Path B</td>
+              <td><span class="pill status-ok">ok</span></td>
+              <td>20</td>
+              <td>954.6</td>
+              <td>2.31</td>
+              <td>2.14</td>
+              <td>21.91</td>
+              <td>6.90</td>
+              <td>35.64</td>
+              <td></td>
+              <td>not_requested</td>
+              <td>ok</td>
+            </tr>
+            
+
+            <tr>
+              <th>fp8_adam8bit_path_c_cold</th>
+              <td>adam8bit</td>
+              <td>Path C cold</td>
+              <td><span class="pill status-ok">ok</span></td>
+              <td>20</td>
+              <td>624.3</td>
+              <td>40.03</td>
+              <td>3.14</td>
+              <td>52.81</td>
+              <td>6.90</td>
+              <td>0.00</td>
+              <td>False</td>
+              <td>m04_path_c_training_route_available</td>
+              <td>ok</td>
+            </tr>
+            
+
+            <tr>
+              <th>fp8_adam8bit_path_c_warm</th>
+              <td>adam8bit</td>
+              <td>Path C warm</td>
+              <td><span class="pill status-ok">ok</span></td>
+              <td>20</td>
+              <td>615.7</td>
+              <td>15.51</td>
+              <td>3.21</td>
+              <td>52.81</td>
+              <td>6.90</td>
+              <td>0.00</td>
+              <td>True</td>
+              <td>m04_path_c_training_route_available</td>
+              <td>ok</td>
+            </tr>
+            
+
+            <tr>
+              <th>fp8_adamw_path_b</th>
+              <td>adamw16 (AdamW)</td>
+              <td>Path B</td>
+              <td><span class="pill status-ok">ok</span></td>
+              <td>20</td>
+              <td>145.1</td>
+              <td>10.13</td>
+              <td>14.43</td>
+              <td>30.54</td>
+              <td>17.09</td>
+              <td>37.75</td>
+              <td></td>
+              <td>not_requested</td>
+              <td>ok</td>
+            </tr>
+            
+
+            <tr>
+              <th>fp8_adamw_path_c_cold</th>
+              <td>adamw16 (AdamW)</td>
+              <td>Path C cold</td>
+              <td><span class="pill status-ok">ok</span></td>
+              <td>20</td>
+              <td>230.1</td>
+              <td>43.81</td>
+              <td>8.62</td>
+              <td>63.00</td>
+              <td>17.09</td>
+              <td>0.00</td>
+              <td>False</td>
+              <td>m04_path_c_training_route_available</td>
+              <td>ok</td>
+            </tr>
+            
+
+            <tr>
+              <th>fp8_adamw_path_c_warm</th>
+              <td>adamw16 (AdamW)</td>
+              <td>Path C warm</td>
+              <td><span class="pill status-ok">ok</span></td>
+              <td>20</td>
+              <td>247.0</td>
+              <td>19.19</td>
+              <td>8.20</td>
+              <td>63.00</td>
+              <td>17.09</td>
+              <td>0.00</td>
+              <td>True</td>
+              <td>m04_path_c_training_route_available</td>
+              <td>ok</td>
+            </tr>
+            
+
+            <tr>
+              <th>fp8_lion_path_b</th>
+              <td>lion16 (Lion)</td>
+              <td>Path B</td>
+              <td><span class="pill status-ok">ok</span></td>
+              <td>20</td>
+              <td>196.2</td>
+              <td>5.62</td>
+              <td>11.00</td>
+              <td>34.43</td>
+              <td>10.25</td>
+              <td>45.72</td>
+              <td></td>
+              <td>not_requested</td>
+              <td>ok</td>
+            </tr>
+            
+
+            <tr>
+              <th>fp8_lion_path_c_cold</th>
+              <td>lion16 (Lion)</td>
+              <td>Path C cold</td>
+              <td><span class="pill status-ok">ok</span></td>
+              <td>20</td>
+              <td>499.9</td>
+              <td>41.64</td>
+              <td>3.95</td>
+              <td>56.17</td>
+              <td>10.25</td>
+              <td>0.00</td>
+              <td>False</td>
+              <td>m04_path_c_training_route_available</td>
+              <td>ok</td>
+            </tr>
+            
+
+            <tr>
+              <th>fp8_lion_path_c_warm</th>
+              <td>lion16 (Lion)</td>
+              <td>Path C warm</td>
+              <td><span class="pill status-ok">ok</span></td>
+              <td>20</td>
+              <td>492.4</td>
+              <td>13.93</td>
+              <td>4.13</td>
+              <td>56.17</td>
+              <td>10.25</td>
+              <td>0.00</td>
+              <td>True</td>
+              <td>m04_path_c_training_route_available</td>
+              <td>ok</td>
+            </tr>
+            
+
+            <tr>
+              <th>fp8_lion8bit_path_b</th>
+              <td>lion8bit</td>
+              <td>Path B</td>
+              <td><span class="pill status-ok">ok</span></td>
+              <td>20</td>
+              <td>921.1</td>
+              <td>2.42</td>
+              <td>2.21</td>
+              <td>20.14</td>
+              <td>5.16</td>
+              <td>35.03</td>
+              <td></td>
+              <td>not_requested</td>
+              <td>ok</td>
+            </tr>
+            
+
+            <tr>
+              <th>fp8_lion8bit_path_c_cold</th>
+              <td>lion8bit</td>
+              <td>Path C cold</td>
+              <td><span class="pill status-ok">ok</span></td>
+              <td>20</td>
+              <td>641.7</td>
+              <td>38.26</td>
+              <td>3.04</td>
+              <td>51.07</td>
+              <td>5.16</td>
+              <td>0.00</td>
+              <td>False</td>
+              <td>m04_path_c_training_route_available</td>
+              <td>ok</td>
+            </tr>
+            
+
+            <tr>
+              <th>fp8_lion8bit_path_c_warm</th>
+              <td>lion8bit</td>
+              <td>Path C warm</td>
+              <td><span class="pill status-ok">ok</span></td>
+              <td>20</td>
+              <td>641.7</td>
+              <td>13.00</td>
+              <td>3.07</td>
+              <td>51.07</td>
+              <td>5.16</td>
+              <td>0.00</td>
+              <td>True</td>
+              <td>m04_path_c_training_route_available</td>
+              <td>ok</td>
+            </tr>
+            
+
+            <tr>
+              <th>fp8_muon_path_b</th>
+              <td>muon (MuonAdamW)</td>
+              <td>Path B</td>
+              <td><span class="pill status-ok">ok</span></td>
+              <td>20</td>
+              <td>179.5</td>
+              <td>10.30</td>
+              <td>11.50</td>
+              <td>25.51</td>
+              <td>12.06</td>
+              <td>40.80</td>
+              <td></td>
+              <td>not_requested</td>
+              <td>ok</td>
+            </tr>
+            
+
+            <tr>
+              <th>fp8_muon_path_c_cold</th>
+              <td>muon (MuonAdamW)</td>
+              <td>Path C cold</td>
+              <td><span class="pill status-ok">ok</span></td>
+              <td>20</td>
+              <td>195.0</td>
+              <td>52.04</td>
+              <td>10.08</td>
+              <td>57.97</td>
+              <td>12.06</td>
+              <td>0.00</td>
+              <td>False</td>
+              <td>m04_path_c_training_route_available</td>
+              <td>ok</td>
+            </tr>
+            
+
+            <tr>
+              <th>fp8_muon_path_c_warm</th>
+              <td>muon (MuonAdamW)</td>
+              <td>Path C warm</td>
+              <td><span class="pill status-ok">ok</span></td>
+              <td>20</td>
+              <td>198.7</td>
+              <td>20.98</td>
+              <td>10.04</td>
+              <td>57.97</td>
+              <td>12.06</td>
+              <td>0.00</td>
+              <td>True</td>
+              <td>m04_path_c_training_route_available</td>
+              <td>ok</td>
+            </tr>
+            
+
+            <tr>
+              <th>fp8_muon_adamw_path_b</th>
+              <td>muon_adamw (MuonAdamW)</td>
+              <td>Path B</td>
+              <td><span class="pill status-ok">ok</span></td>
+              <td>20</td>
+              <td>184.5</td>
+              <td>8.65</td>
+              <td>11.31</td>
+              <td>25.51</td>
+              <td>12.06</td>
+              <td>40.80</td>
+              <td></td>
+              <td>not_requested</td>
+              <td>ok</td>
+            </tr>
+            
+
+            <tr>
+              <th>fp8_muon_adamw_path_c_cold</th>
+              <td>muon_adamw (MuonAdamW)</td>
+              <td>Path C cold</td>
+              <td><span class="pill status-ok">ok</span></td>
+              <td>20</td>
+              <td>196.6</td>
+              <td>43.89</td>
+              <td>10.03</td>
+              <td>57.97</td>
+              <td>12.06</td>
+              <td>0.00</td>
+              <td>False</td>
+              <td>m04_path_c_training_route_available</td>
+              <td>ok</td>
+            </tr>
+            
+
+            <tr>
+              <th>fp8_muon_adamw_path_c_warm</th>
+              <td>muon_adamw (MuonAdamW)</td>
+              <td>Path C warm</td>
+              <td><span class="pill status-ok">ok</span></td>
+              <td>20</td>
+              <td>202.3</td>
+              <td>19.74</td>
+              <td>9.87</td>
+              <td>57.97</td>
+              <td>12.06</td>
+              <td>0.00</td>
+              <td>True</td>
+              <td>m04_path_c_training_route_available</td>
+              <td>ok</td>
+            </tr>
+            
+
+            <tr>
+              <th>fp8_muon_int8_path_b</th>
+              <td>muon-int8 (MuonAdamWInt8)</td>
+              <td>Path B</td>
+              <td><span class="pill status-ok">ok</span></td>
+              <td>20</td>
+              <td>198.9</td>
+              <td>10.53</td>
+              <td>10.28</td>
+              <td>19.06</td>
+              <td>5.62</td>
+              <td>45.36</td>
+              <td></td>
+              <td>not_requested</td>
+              <td>ok</td>
+            </tr>
+            
+
+            <tr>
+              <th>fp8_muon_int8_path_c_cold</th>
+              <td>muon-int8 (MuonAdamWInt8)</td>
+              <td>Path C cold</td>
+              <td><span class="pill status-ok">ok</span></td>
+              <td>20</td>
+              <td>147.5</td>
+              <td>45.98</td>
+              <td>13.39</td>
+              <td>51.53</td>
+              <td>5.62</td>
+              <td>0.00</td>
+              <td>False</td>
+              <td>m04_path_c_training_route_available</td>
+              <td>ok</td>
+            </tr>
+            
+
+            <tr>
+              <th>fp8_muon_int8_path_c_warm</th>
+              <td>muon-int8 (MuonAdamWInt8)</td>
+              <td>Path C warm</td>
+              <td><span class="pill status-ok">ok</span></td>
+              <td>20</td>
+              <td>148.0</td>
+              <td>23.45</td>
+              <td>13.54</td>
+              <td>51.53</td>
+              <td>5.62</td>
+              <td>0.00</td>
+              <td>True</td>
+              <td>m04_path_c_training_route_available</td>
+              <td>ok</td>
+            </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    
+
+      <section class="panel">
+        <details>
+          <summary>Cell commands</summary>
+          <ol class="commands"><li><code>bf16_adamw_path_b</code><pre>/Volumes/external/sources/nanochat/.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 2048 --dtype bfloat16 --optimizer adamw --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output reports/raw/cppmega_1b_path_matrix_cells_20260518_full_path_c/bf16_adamw_path_b.json --json</pre></li>
+<li><code>bf16_adamw_path_c_cold</code><pre>/Volumes/external/sources/nanochat/.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 2048 --dtype bfloat16 --optimizer adamw --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output reports/raw/cppmega_1b_path_matrix_cells_20260518_full_path_c/bf16_adamw_path_c_cold.json --json</pre></li>
+<li><code>bf16_adamw_path_c_warm</code><pre>/Volumes/external/sources/nanochat/.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 2048 --dtype bfloat16 --optimizer adamw --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output reports/raw/cppmega_1b_path_matrix_cells_20260518_full_path_c/bf16_adamw_path_c_warm.json --json</pre></li>
+<li><code>bf16_adam8bit_path_b</code><pre>/Volumes/external/sources/nanochat/.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 2048 --dtype bfloat16 --optimizer adam8bit --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output reports/raw/cppmega_1b_path_matrix_cells_20260518_full_path_c/bf16_adam8bit_path_b.json --json</pre></li>
+<li><code>bf16_adam8bit_path_c_cold</code><pre>/Volumes/external/sources/nanochat/.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 2048 --dtype bfloat16 --optimizer adam8bit --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output reports/raw/cppmega_1b_path_matrix_cells_20260518_full_path_c/bf16_adam8bit_path_c_cold.json --json</pre></li>
+<li><code>bf16_adam8bit_path_c_warm</code><pre>/Volumes/external/sources/nanochat/.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 2048 --dtype bfloat16 --optimizer adam8bit --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output reports/raw/cppmega_1b_path_matrix_cells_20260518_full_path_c/bf16_adam8bit_path_c_warm.json --json</pre></li>
+<li><code>bf16_lion_path_b</code><pre>/Volumes/external/sources/nanochat/.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 2048 --dtype bfloat16 --optimizer lion --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output reports/raw/cppmega_1b_path_matrix_cells_20260518_full_path_c/bf16_lion_path_b.json --json</pre></li>
+<li><code>bf16_lion_path_c_cold</code><pre>/Volumes/external/sources/nanochat/.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 2048 --dtype bfloat16 --optimizer lion --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output reports/raw/cppmega_1b_path_matrix_cells_20260518_full_path_c/bf16_lion_path_c_cold.json --json</pre></li>
+<li><code>bf16_lion_path_c_warm</code><pre>/Volumes/external/sources/nanochat/.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 2048 --dtype bfloat16 --optimizer lion --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output reports/raw/cppmega_1b_path_matrix_cells_20260518_full_path_c/bf16_lion_path_c_warm.json --json</pre></li>
+<li><code>bf16_lion8bit_path_b</code><pre>/Volumes/external/sources/nanochat/.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 2048 --dtype bfloat16 --optimizer lion8bit --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output reports/raw/cppmega_1b_path_matrix_cells_20260518_full_path_c/bf16_lion8bit_path_b.json --json</pre></li>
+<li><code>bf16_lion8bit_path_c_cold</code><pre>/Volumes/external/sources/nanochat/.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 2048 --dtype bfloat16 --optimizer lion8bit --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output reports/raw/cppmega_1b_path_matrix_cells_20260518_full_path_c/bf16_lion8bit_path_c_cold.json --json</pre></li>
+<li><code>bf16_lion8bit_path_c_warm</code><pre>/Volumes/external/sources/nanochat/.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 2048 --dtype bfloat16 --optimizer lion8bit --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output reports/raw/cppmega_1b_path_matrix_cells_20260518_full_path_c/bf16_lion8bit_path_c_warm.json --json</pre></li>
+<li><code>bf16_muon_path_b</code><pre>/Volumes/external/sources/nanochat/.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 2048 --dtype bfloat16 --optimizer muon --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output reports/raw/cppmega_1b_path_matrix_cells_20260518_full_path_c/bf16_muon_path_b.json --json</pre></li>
+<li><code>bf16_muon_path_c_cold</code><pre>/Volumes/external/sources/nanochat/.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 2048 --dtype bfloat16 --optimizer muon --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output reports/raw/cppmega_1b_path_matrix_cells_20260518_full_path_c/bf16_muon_path_c_cold.json --json</pre></li>
+<li><code>bf16_muon_path_c_warm</code><pre>/Volumes/external/sources/nanochat/.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 2048 --dtype bfloat16 --optimizer muon --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output reports/raw/cppmega_1b_path_matrix_cells_20260518_full_path_c/bf16_muon_path_c_warm.json --json</pre></li>
+<li><code>bf16_muon_adamw_path_b</code><pre>/Volumes/external/sources/nanochat/.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 2048 --dtype bfloat16 --optimizer muon_adamw --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output reports/raw/cppmega_1b_path_matrix_cells_20260518_full_path_c/bf16_muon_adamw_path_b.json --json</pre></li>
+<li><code>bf16_muon_adamw_path_c_cold</code><pre>/Volumes/external/sources/nanochat/.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 2048 --dtype bfloat16 --optimizer muon_adamw --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output reports/raw/cppmega_1b_path_matrix_cells_20260518_full_path_c/bf16_muon_adamw_path_c_cold.json --json</pre></li>
+<li><code>bf16_muon_adamw_path_c_warm</code><pre>/Volumes/external/sources/nanochat/.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 2048 --dtype bfloat16 --optimizer muon_adamw --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output reports/raw/cppmega_1b_path_matrix_cells_20260518_full_path_c/bf16_muon_adamw_path_c_warm.json --json</pre></li>
+<li><code>bf16_muon_int8_path_b</code><pre>/Volumes/external/sources/nanochat/.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 2048 --dtype bfloat16 --optimizer int8 --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output reports/raw/cppmega_1b_path_matrix_cells_20260518_full_path_c/bf16_muon_int8_path_b.json --json</pre></li>
+<li><code>bf16_muon_int8_path_c_cold</code><pre>/Volumes/external/sources/nanochat/.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 2048 --dtype bfloat16 --optimizer int8 --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output reports/raw/cppmega_1b_path_matrix_cells_20260518_full_path_c/bf16_muon_int8_path_c_cold.json --json</pre></li>
+<li><code>bf16_muon_int8_path_c_warm</code><pre>/Volumes/external/sources/nanochat/.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 2048 --dtype bfloat16 --optimizer int8 --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output reports/raw/cppmega_1b_path_matrix_cells_20260518_full_path_c/bf16_muon_int8_path_c_warm.json --json</pre></li>
+<li><code>fp8_adamw_path_b</code><pre>/Volumes/external/sources/nanochat/.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 2048 --dtype fp8_path_b --optimizer adamw --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output reports/raw/cppmega_1b_path_matrix_cells_20260518_full_path_c/fp8_adamw_path_b.json --json</pre></li>
+<li><code>fp8_adamw_path_c_cold</code><pre>/Volumes/external/sources/nanochat/.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 2048 --dtype fp8_path_c --optimizer adamw --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output reports/raw/cppmega_1b_path_matrix_cells_20260518_full_path_c/fp8_adamw_path_c_cold.json --json</pre></li>
+<li><code>fp8_adamw_path_c_warm</code><pre>/Volumes/external/sources/nanochat/.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 2048 --dtype fp8_path_c --optimizer adamw --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output reports/raw/cppmega_1b_path_matrix_cells_20260518_full_path_c/fp8_adamw_path_c_warm.json --json</pre></li>
+<li><code>fp8_adam8bit_path_b</code><pre>/Volumes/external/sources/nanochat/.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 2048 --dtype fp8_path_b --optimizer adam8bit --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output reports/raw/cppmega_1b_path_matrix_cells_20260518_full_path_c/fp8_adam8bit_path_b.json --json</pre></li>
+<li><code>fp8_adam8bit_path_c_cold</code><pre>/Volumes/external/sources/nanochat/.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 2048 --dtype fp8_path_c --optimizer adam8bit --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output reports/raw/cppmega_1b_path_matrix_cells_20260518_full_path_c/fp8_adam8bit_path_c_cold.json --json</pre></li>
+<li><code>fp8_adam8bit_path_c_warm</code><pre>/Volumes/external/sources/nanochat/.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 2048 --dtype fp8_path_c --optimizer adam8bit --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output reports/raw/cppmega_1b_path_matrix_cells_20260518_full_path_c/fp8_adam8bit_path_c_warm.json --json</pre></li>
+<li><code>fp8_lion_path_b</code><pre>/Volumes/external/sources/nanochat/.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 2048 --dtype fp8_path_b --optimizer lion --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output reports/raw/cppmega_1b_path_matrix_cells_20260518_full_path_c/fp8_lion_path_b.json --json</pre></li>
+<li><code>fp8_lion_path_c_cold</code><pre>/Volumes/external/sources/nanochat/.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 2048 --dtype fp8_path_c --optimizer lion --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output reports/raw/cppmega_1b_path_matrix_cells_20260518_full_path_c/fp8_lion_path_c_cold.json --json</pre></li>
+<li><code>fp8_lion_path_c_warm</code><pre>/Volumes/external/sources/nanochat/.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 2048 --dtype fp8_path_c --optimizer lion --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output reports/raw/cppmega_1b_path_matrix_cells_20260518_full_path_c/fp8_lion_path_c_warm.json --json</pre></li>
+<li><code>fp8_lion8bit_path_b</code><pre>/Volumes/external/sources/nanochat/.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 2048 --dtype fp8_path_b --optimizer lion8bit --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output reports/raw/cppmega_1b_path_matrix_cells_20260518_full_path_c/fp8_lion8bit_path_b.json --json</pre></li>
+<li><code>fp8_lion8bit_path_c_cold</code><pre>/Volumes/external/sources/nanochat/.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 2048 --dtype fp8_path_c --optimizer lion8bit --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output reports/raw/cppmega_1b_path_matrix_cells_20260518_full_path_c/fp8_lion8bit_path_c_cold.json --json</pre></li>
+<li><code>fp8_lion8bit_path_c_warm</code><pre>/Volumes/external/sources/nanochat/.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 2048 --dtype fp8_path_c --optimizer lion8bit --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output reports/raw/cppmega_1b_path_matrix_cells_20260518_full_path_c/fp8_lion8bit_path_c_warm.json --json</pre></li>
+<li><code>fp8_muon_path_b</code><pre>/Volumes/external/sources/nanochat/.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 2048 --dtype fp8_path_b --optimizer muon --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output reports/raw/cppmega_1b_path_matrix_cells_20260518_full_path_c/fp8_muon_path_b.json --json</pre></li>
+<li><code>fp8_muon_path_c_cold</code><pre>/Volumes/external/sources/nanochat/.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 2048 --dtype fp8_path_c --optimizer muon --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output reports/raw/cppmega_1b_path_matrix_cells_20260518_full_path_c/fp8_muon_path_c_cold.json --json</pre></li>
+<li><code>fp8_muon_path_c_warm</code><pre>/Volumes/external/sources/nanochat/.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 2048 --dtype fp8_path_c --optimizer muon --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output reports/raw/cppmega_1b_path_matrix_cells_20260518_full_path_c/fp8_muon_path_c_warm.json --json</pre></li>
+<li><code>fp8_muon_adamw_path_b</code><pre>/Volumes/external/sources/nanochat/.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 2048 --dtype fp8_path_b --optimizer muon_adamw --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output reports/raw/cppmega_1b_path_matrix_cells_20260518_full_path_c/fp8_muon_adamw_path_b.json --json</pre></li>
+<li><code>fp8_muon_adamw_path_c_cold</code><pre>/Volumes/external/sources/nanochat/.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 2048 --dtype fp8_path_c --optimizer muon_adamw --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output reports/raw/cppmega_1b_path_matrix_cells_20260518_full_path_c/fp8_muon_adamw_path_c_cold.json --json</pre></li>
+<li><code>fp8_muon_adamw_path_c_warm</code><pre>/Volumes/external/sources/nanochat/.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 2048 --dtype fp8_path_c --optimizer muon_adamw --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output reports/raw/cppmega_1b_path_matrix_cells_20260518_full_path_c/fp8_muon_adamw_path_c_warm.json --json</pre></li>
+<li><code>fp8_muon_int8_path_b</code><pre>/Volumes/external/sources/nanochat/.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 2048 --dtype fp8_path_b --optimizer int8 --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output reports/raw/cppmega_1b_path_matrix_cells_20260518_full_path_c/fp8_muon_int8_path_b.json --json</pre></li>
+<li><code>fp8_muon_int8_path_c_cold</code><pre>/Volumes/external/sources/nanochat/.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 2048 --dtype fp8_path_c --optimizer int8 --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output reports/raw/cppmega_1b_path_matrix_cells_20260518_full_path_c/fp8_muon_int8_path_c_cold.json --json</pre></li>
+<li><code>fp8_muon_int8_path_c_warm</code><pre>/Volumes/external/sources/nanochat/.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 2048 --dtype fp8_path_c --optimizer int8 --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output reports/raw/cppmega_1b_path_matrix_cells_20260518_full_path_c/fp8_muon_int8_path_c_warm.json --json</pre></li></ol>
+        </details>
+      </section>
+    
+  </main>
+</body>
+</html>

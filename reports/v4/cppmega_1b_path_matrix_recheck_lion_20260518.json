@@ -1,0 +1,101 @@
+{
+  "command": "scripts/bench_1b_training_matrix.py --batch-size 1 --block-size 2048 --steps 20 --dtypes bf16 --optimizers lion --paths path_b,path_c_warm --mamba3-bwd path_b --fresh-process --work-dir reports/raw/cppmega_1b_path_matrix_recheck_20260518_lion --tilelang-cache-dir /tmp/cppmega_1b_path_matrix_tilelang_cache_20260518_lion_recheck --out reports/v4/cppmega_1b_path_matrix_recheck_lion_20260518.md --csv reports/v4/cppmega_1b_path_matrix_recheck_lion_20260518.csv --json reports/v4/cppmega_1b_path_matrix_recheck_lion_20260518.json",
+  "config": {
+    "batch_size": 1,
+    "block_size": 2048,
+    "dry_run": false,
+    "dtypes": [
+      "bf16"
+    ],
+    "fresh_process": true,
+    "mamba3_bwd": "path_b",
+    "optimizers": [
+      "lion"
+    ],
+    "paths": [
+      "path_b",
+      "path_c_warm"
+    ],
+    "reuse_existing_ok": false,
+    "steps": 20
+  },
+  "results": [
+    {
+      "active_memory_gb": 10.254422707483172,
+      "cache_hit": null,
+      "cache_memory_gb": 41.9062117729336,
+      "case_id": "bf16_lion_path_b",
+      "cli_optimizer": "lion",
+      "command": "/Volumes/external/sources/nanochat/.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 2048 --dtype bfloat16 --optimizer lion --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output reports/raw/cppmega_1b_path_matrix_recheck_20260518_lion/bf16_lion_path_b.json --json",
+      "compile_time_s": 3.6778210419870447,
+      "cppmega_sha": "430983d",
+      "dtype": "bf16",
+      "duration_s": 110.74770750000607,
+      "first_step_sec": 3.6778210419870447,
+      "median_step_sec": 2.5015703340177424,
+      "mlx_sha": "d168ca5ca",
+      "mlx_version": "0.32.0.dev20260514+d168ca5ca",
+      "optimizer": "lion",
+      "optimizer_class": "cppmega_mlx.training.optimizers.LionFP32Moments",
+      "optimizer_key": "lion",
+      "optimizer_name": "Lion",
+      "optimizer_source": "cppmega_mlx.training.optimizers.make_lion",
+      "pass_fail_reason": "ok",
+      "path": "path_b",
+      "peak_memory_gb": 33.513735610991716,
+      "proof_result": "{\"fp8_path_c_route_status\": \"not_requested\", \"kernel_surface_available\": true, \"path\": \"path_b\", \"path_c_requested\": false, \"proof_source\": \"per-kernel TileLang route receipts plus runtime dispatch log\"}",
+      "receipt_path": "reports/raw/cppmega_1b_path_matrix_recheck_20260518_lion/bf16_lion_path_b.json",
+      "returncode": 0,
+      "selected_schedule": "{\"kernel_counts\": {\"metal_kernel_fwd_v1\": 160}, \"op_kernel\": {\"m2rnn\": \"metal_kernel_fwd_v1\", \"mamba3_mimo\": \"metal_kernel_fwd_v1\"}, \"path_counts\": {\"path_b\": 160}}",
+      "status": "ok",
+      "step_sec": 2.5215060612658577,
+      "steps_completed": 20,
+      "tilelang_sha": "2d23cd19",
+      "tok_sec": 800.3664964629596
+    },
+    {
+      "active_memory_gb": 10.25429903715849,
+      "cache_hit": false,
+      "cache_memory_gb": 0.0,
+      "case_id": "bf16_lion_path_c_warm",
+      "cli_optimizer": "lion",
+      "command": "/Volumes/external/sources/nanochat/.venv/bin/python scripts/m04_train_step.py --model-profile local_gb10_quarter --data-path data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet --data-format parquet --token-key token_ids --steps 20 --batch-size 1 --seq-len 2048 --dtype bfloat16 --optimizer lion --optimizer-quant-scheme dynamic_int8_v1 --lr 1e-4 --grad-checkpoint --output reports/raw/cppmega_1b_path_matrix_recheck_20260518_lion/bf16_lion_path_c_warm.json --json",
+      "compile_time_s": 22.088848707993748,
+      "cppmega_sha": "430983d",
+      "dtype": "bf16",
+      "duration_s": 150.70896325001377,
+      "first_step_sec": 22.088848707993748,
+      "median_step_sec": 3.606243167014327,
+      "mlx_sha": "d168ca5ca",
+      "mlx_version": "0.32.0.dev20260514+d168ca5ca",
+      "optimizer": "lion",
+      "optimizer_class": "cppmega_mlx.training.optimizers.LionFP32Moments",
+      "optimizer_key": "lion",
+      "optimizer_name": "Lion",
+      "optimizer_source": "cppmega_mlx.training.optimizers.make_lion",
+      "pass_fail_reason": "ok",
+      "path": "path_c_warm",
+      "peak_memory_gb": 33.51344564370811,
+      "proof_result": "{\"fp8_path_c_route_status\": \"not_requested\", \"kernel_surface_available\": true, \"path\": \"path_c_warm\", \"path_c_requested\": true, \"proof_source\": \"per-kernel TileLang route receipts plus runtime dispatch log\"}",
+      "receipt_path": "reports/raw/cppmega_1b_path_matrix_recheck_20260518_lion/bf16_lion_path_c_warm.json",
+      "returncode": 0,
+      "selected_schedule": "{\"kernel_counts\": {\"path_c_tilelang_dsl_fwd_path_b_bwd\": 120, \"path_c_tilelang_dsl_packed_post\": 40}, \"op_kernel\": {\"m2rnn\": \"path_c_tilelang_dsl_packed_post\", \"mamba3_mimo\": \"path_c_tilelang_dsl_fwd_path_b_bwd\"}, \"path_counts\": {\"path_c\": 160}}",
+      "status": "ok",
+      "step_sec": 3.621420085367342,
+      "steps_completed": 20,
+      "tilelang_sha": "2d23cd19",
+      "tok_sec": 541.7514119834632
+    }
+  ],
+  "schema_version": 1,
+  "scope": "cppmega_1b_path_matrix",
+  "software": {
+    "cppmega_sha": "430983d",
+    "mlx_sha": "d168ca5ca",
+    "mlx_version": "0.32.0.dev20260514+d168ca5ca",
+    "platform": "macOS-26.4.1-arm64-arm-64bit-Mach-O",
+    "python": "3.13.12",
+    "tilelang_root": "/Volumes/external/sources/tilelang",
+    "tilelang_sha": "2d23cd19"
+  }
+}

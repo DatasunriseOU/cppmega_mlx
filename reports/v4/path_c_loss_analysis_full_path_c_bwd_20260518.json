@@ -1,0 +1,323 @@
+{
+  "current_head": "430983d",
+  "dispatch_samples": {
+    "bf16_adam8bit_path_b": {
+      "counts": {
+        "metal_kernel_fwd_v1": 160
+      },
+      "median_step_s": 1.9988823125022464,
+      "receipt": "reports/raw/cppmega_1b_path_matrix_cells_20260518_full_path_c/bf16_adam8bit_path_b.json",
+      "tok_sec": 1007.7570550310787
+    },
+    "bf16_adam8bit_path_c_warm": {
+      "counts": {
+        "path_c_tilelang_dsl": 120,
+        "path_c_tilelang_dsl_packed_post": 40
+      },
+      "median_step_s": 2.3545103750075214,
+      "receipt": "reports/raw/cppmega_1b_path_matrix_cells_20260518_full_path_c/bf16_adam8bit_path_c_warm.json",
+      "tok_sec": 835.9151376737507
+    },
+    "fp8_adam8bit_path_b": {
+      "counts": {
+        "metal_kernel_fwd_v1": 146,
+        "sparse_mla_fp8_reference_path_b": 110
+      },
+      "median_step_s": 2.1568613540002843,
+      "receipt": "reports/raw/cppmega_1b_path_matrix_cells_20260518_full_path_c/fp8_adam8bit_path_b.json",
+      "tok_sec": 954.5900214939666
+    },
+    "fp8_adam8bit_path_c_warm": {
+      "counts": {
+        "path_c_tilelang_dsl_fwd_path_b_bwd": 110,
+        "path_c_tilelang_dsl_packed_post": 36,
+        "tilelang_fp8_prepared_path_c_fwd": 110
+      },
+      "median_step_s": 3.1436769374849973,
+      "receipt": "reports/raw/cppmega_1b_path_matrix_cells_20260518_full_path_c/fp8_adam8bit_path_c_warm.json",
+      "tok_sec": 615.7290830242971
+    }
+  },
+  "generated_at": "2026-05-18T19:31:31",
+  "html_matrix": "reports/v4/cppmega_1b_path_matrix_full_path_c_bwd_20260518.html",
+  "matrix": "reports/v4/cppmega_1b_path_matrix_full_path_c_bwd_20260518.json",
+  "mode": {
+    "batch_size": 1,
+    "block_size": 2048,
+    "dry_run": false,
+    "dtypes": [
+      "bf16",
+      "fp8"
+    ],
+    "fresh_process": true,
+    "mamba3_bwd": "path_c",
+    "optimizers": [
+      "adamw",
+      "adam8bit",
+      "lion",
+      "lion8bit",
+      "muon",
+      "muon_adamw",
+      "muon_int8"
+    ],
+    "paths": [
+      "path_b",
+      "path_c_cold",
+      "path_c_warm"
+    ],
+    "reuse_existing_ok": true,
+    "steps": 20
+  },
+  "next_code_targets": [
+    "Generate/fuse the composed Path C train block so recurrence surfaces do not cross extra MLX/tvm-ffi graph boundaries per layer.",
+    "Fix TileLang/TVM/tvm-ffi cache key reuse so warm Path C cells do not pay cold-like first-step costs.",
+    "Audit sparse_mla_fp8_path_c prepared q_fp8/q_scale/kv_fp8/kv_scale ownership and release points to remove FP8 peak high-water.",
+    "Investigate current HEAD fp8/lion Path B regression separately before treating that row as a Path C win."
+  ],
+  "recheck": "reports/v4/cppmega_1b_path_matrix_recheck_fp8_lion_full_path_c_20260518.json",
+  "rollup": {
+    "bf16_avg_c_over_b": 0.853563067400537,
+    "cells": 14,
+    "fast_8bit_avg_c_over_b": 0.7489600002204158,
+    "fast_optimizer_avg_c_over_b_excluding_unstable_fp8_lion": 0.7577204162640033,
+    "fp8_avg_c_over_b": 1.189191516538379,
+    "fp8_avg_peak_delta_gib": 30.490078510051326,
+    "losses": 10,
+    "wins": 4
+  },
+  "root_cause": [
+    "On current HEAD, full Path C backward improves BF16 fast rows versus the safe forward-C/backward-B route, but still loses to Path B on the main fast 8-bit acceptance rows.",
+    "The remaining BF16 loss is not explained by isolated Mamba3 or M2RNN kernels; the full train graph still pays composition overhead across generated TileLang/tvm-ffi surfaces.",
+    "Path B uses one established Metal dispatch family for BF16 recurrence rows, while Path C composes path_c_tilelang_dsl_fwd_path_b_bwd plus path_c_tilelang_dsl_packed_post; FP8 adds tilelang_fp8_prepared_path_c_fwd.",
+    "FP8 Path C active memory stays essentially equal to Path B, but peak memory rises by roughly 21-32 GiB on most rows, pointing at temporary/high-water lifetime around prepared FP8 buffers and graph specialization, not retained model tensors.",
+    "Warm Path C first steps are still high, so cache reuse is incomplete; this is a codegen/cache-key and graph-specialization target, separate from steady-state kernel speed.",
+    "The fp8/lion Path B baseline changed between e3926e8 and current f49a7e4; current recheck confirms the slow baseline, so it is marked unstable and should not be used as evidence that Path C generally wins."
+  ],
+  "schema_version": 1,
+  "summary_rows": [
+    {
+      "active_delta_gib": -3.5880133509635925e-05,
+      "class": "optimizer-heavy or mixed row",
+      "corrected_by_recheck": false,
+      "dtype": "bf16",
+      "first_step_delta_s": 3.726941375003662,
+      "median_step_delta_s": 0.40377958299359307,
+      "note": "",
+      "optimizer": "adamw",
+      "path_b_tok_sec": 603.0452641210798,
+      "path_c_over_b": 0.9354567759510636,
+      "path_c_warm_tok_sec": 564.1227785272629,
+      "peak_delta_gib": 4.605946645140648,
+      "verdict": "loss",
+      "warm_first_step_minus_cold_s": -14.237269998993725
+    },
+    {
+      "active_delta_gib": -0.00010795146226882935,
+      "class": "fast optimizer/codegen overhead",
+      "corrected_by_recheck": false,
+      "dtype": "bf16",
+      "first_step_delta_s": 9.5170209989883,
+      "median_step_delta_s": 0.3585650419990998,
+      "note": "",
+      "optimizer": "adam8bit",
+      "path_b_tok_sec": 1007.7570550310787,
+      "path_c_over_b": 0.8294808093881034,
+      "path_c_warm_tok_sec": 835.9151376737507,
+      "peak_delta_gib": 2.5107403732836246,
+      "verdict": "loss",
+      "warm_first_step_minus_cold_s": -12.2943155009998
+    },
+    {
+      "active_delta_gib": -0.0001236703246831894,
+      "class": "fast optimizer/codegen overhead",
+      "corrected_by_recheck": false,
+      "dtype": "bf16",
+      "first_step_delta_s": 8.246681875985814,
+      "median_step_delta_s": 0.6296522929915227,
+      "note": "",
+      "optimizer": "lion",
+      "path_b_tok_sec": 791.4325020397375,
+      "path_c_over_b": 0.7927620804383535,
+      "path_c_warm_tok_sec": 627.4176768435537,
+      "peak_delta_gib": -6.602060563862324,
+      "verdict": "loss",
+      "warm_first_step_minus_cold_s": -13.198912041989388
+    },
+    {
+      "active_delta_gib": -0.00011456385254859924,
+      "class": "fast optimizer/codegen overhead",
+      "corrected_by_recheck": false,
+      "dtype": "bf16",
+      "first_step_delta_s": 9.27153154197731,
+      "median_step_delta_s": 0.36112737501389347,
+      "note": "",
+      "optimizer": "lion8bit",
+      "path_b_tok_sec": 1027.635096660219,
+      "path_c_over_b": 0.8247558081809874,
+      "path_c_warm_tok_sec": 847.548014661146,
+      "peak_delta_gib": 2.5466688629239798,
+      "verdict": "loss",
+      "warm_first_step_minus_cold_s": -13.454581042024074
+    },
+    {
+      "active_delta_gib": -3.483891487121582e-05,
+      "class": "optimizer-heavy or mixed row",
+      "corrected_by_recheck": false,
+      "dtype": "bf16",
+      "first_step_delta_s": 20.818652041984024,
+      "median_step_delta_s": 0.25264337498811074,
+      "note": "",
+      "optimizer": "muon",
+      "path_b_tok_sec": 252.8842861021203,
+      "path_c_over_b": 0.9483882375677303,
+      "path_c_warm_tok_sec": 239.83248240496354,
+      "peak_delta_gib": 4.127121042460203,
+      "verdict": "loss",
+      "warm_first_step_minus_cold_s": -1.45890224899631
+    },
+    {
+      "active_delta_gib": -3.483891487121582e-05,
+      "class": "optimizer-heavy or mixed row",
+      "corrected_by_recheck": false,
+      "dtype": "bf16",
+      "first_step_delta_s": 8.799901291000424,
+      "median_step_delta_s": 0.44146133301546797,
+      "note": "",
+      "optimizer": "muon_adamw",
+      "path_b_tok_sec": 258.0707960382147,
+      "path_c_over_b": 0.9294718460736094,
+      "path_c_warm_tok_sec": 239.86953921132536,
+      "peak_delta_gib": 4.127121042460203,
+      "verdict": "loss",
+      "warm_first_step_minus_cold_s": -12.714343750005355
+    },
+    {
+      "active_delta_gib": -0.0001409277319908142,
+      "class": "optimizer-heavy or mixed row",
+      "corrected_by_recheck": false,
+      "dtype": "bf16",
+      "first_step_delta_s": 12.75416316598421,
+      "median_step_delta_s": 3.5208520000160206,
+      "note": "",
+      "optimizer": "muon_int8",
+      "path_b_tok_sec": 214.0731766390091,
+      "path_c_over_b": 0.7146259142039114,
+      "path_c_warm_tok_sec": 152.9822395621873,
+      "peak_delta_gib": 4.60566570982337,
+      "verdict": "loss",
+      "warm_first_step_minus_cold_s": -12.155894999974407
+    },
+    {
+      "active_delta_gib": -3.4928321838378906e-05,
+      "class": "optimizer-heavy or mixed row",
+      "corrected_by_recheck": false,
+      "dtype": "fp8",
+      "first_step_delta_s": 9.057912833988667,
+      "median_step_delta_s": -6.253059749986278,
+      "note": "FP8 Path C peak is temporary/high-water pressure; active memory is unchanged.",
+      "optimizer": "adamw",
+      "path_b_tok_sec": 145.147329159116,
+      "path_c_over_b": 1.701551566637428,
+      "path_c_warm_tok_sec": 246.97566532393225,
+      "peak_delta_gib": 32.46587002556771,
+      "verdict": "win",
+      "warm_first_step_minus_cold_s": -24.626164457993582
+    },
+    {
+      "active_delta_gib": -0.0002604946494102478,
+      "class": "fast optimizer/codegen overhead",
+      "corrected_by_recheck": false,
+      "dtype": "fp8",
+      "first_step_delta_s": 13.199245041992981,
+      "median_step_delta_s": 0.98986329199397,
+      "note": "FP8 Path C peak is temporary/high-water pressure; active memory is unchanged.",
+      "optimizer": "adam8bit",
+      "path_b_tok_sec": 954.5900214939666,
+      "path_c_over_b": 0.6450194001197076,
+      "path_c_warm_tok_sec": 615.7290830242971,
+      "peak_delta_gib": 30.897187461145222,
+      "verdict": "loss",
+      "warm_first_step_minus_cold_s": -24.52218625001842
+    },
+    {
+      "active_delta_gib": -0.0001389291137456894,
+      "class": "fast optimizer/codegen overhead",
+      "corrected_by_recheck": true,
+      "dtype": "fp8",
+      "first_step_delta_s": 33.289427540963516,
+      "median_step_delta_s": -6.0276932080159895,
+      "note": "Path B baseline regressed on current HEAD; recheck confirms current slow baseline. Do not compare with e3926e8 safe-matrix row. FP8 Path C peak is temporary/high-water pressure; active memory is unchanged.",
+      "optimizer": "lion",
+      "path_b_tok_sec": 222.925986769444,
+      "path_c_over_b": 2.3329710264665153,
+      "path_c_warm_tok_sec": 520.0798681795706,
+      "peak_delta_gib": 21.736973798833787,
+      "verdict": "win",
+      "warm_first_step_minus_cold_s": -3.580686250992585
+    },
+    {
+      "active_delta_gib": -0.0002474989742040634,
+      "class": "fast optimizer/codegen overhead",
+      "corrected_by_recheck": false,
+      "dtype": "fp8",
+      "first_step_delta_s": 10.579406999982893,
+      "median_step_delta_s": 0.8436827090044972,
+      "note": "FP8 Path C peak is temporary/high-water pressure; active memory is unchanged.",
+      "optimizer": "lion8bit",
+      "path_b_tok_sec": 921.1418293423425,
+      "path_c_over_b": 0.6965839831928646,
+      "path_c_warm_tok_sec": 641.6526445688509,
+      "peak_delta_gib": 30.93316422123462,
+      "verdict": "loss",
+      "warm_first_step_minus_cold_s": -25.260374749981565
+    },
+    {
+      "active_delta_gib": -3.483891487121582e-05,
+      "class": "optimizer-heavy or mixed row",
+      "corrected_by_recheck": false,
+      "dtype": "fp8",
+      "first_step_delta_s": 10.671829666011035,
+      "median_step_delta_s": -1.3394429990148637,
+      "note": "FP8 Path C peak is temporary/high-water pressure; active memory is unchanged.",
+      "optimizer": "muon",
+      "path_b_tok_sec": 179.49652572167417,
+      "path_c_over_b": 1.1071393966058143,
+      "path_c_warm_tok_sec": 198.72767518033436,
+      "peak_delta_gib": 32.46586939599365,
+      "verdict": "win",
+      "warm_first_step_minus_cold_s": -31.06149983400246
+    },
+    {
+      "active_delta_gib": -3.483891487121582e-05,
+      "class": "optimizer-heavy or mixed row",
+      "corrected_by_recheck": false,
+      "dtype": "fp8",
+      "first_step_delta_s": 11.092694207996828,
+      "median_step_delta_s": -1.481910499976948,
+      "note": "FP8 Path C peak is temporary/high-water pressure; active memory is unchanged.",
+      "optimizer": "muon_adamw",
+      "path_b_tok_sec": 184.45348267077716,
+      "path_c_over_b": 1.096960068642632,
+      "path_c_warm_tok_sec": 202.33810501190823,
+      "peak_delta_gib": 32.46586939599365,
+      "verdict": "win",
+      "warm_first_step_minus_cold_s": -24.1478751260438
+    },
+    {
+      "active_delta_gib": -0.0001561865210533142,
+      "class": "optimizer-heavy or mixed row",
+      "corrected_by_recheck": false,
+      "dtype": "fp8",
+      "first_step_delta_s": 12.917145708983298,
+      "median_step_delta_s": 3.236289749998832,
+      "note": "FP8 Path C peak is temporary/high-water pressure; active memory is unchanged.",
+      "optimizer": "muon_int8",
+      "path_b_tok_sec": 198.92600295698904,
+      "path_c_over_b": 0.7441151741036915,
+      "path_c_warm_tok_sec": 148.02385732409135,
+      "peak_delta_gib": 32.46561527159065,
+      "verdict": "loss",
+      "warm_first_step_minus_cold_s": -22.533757375000278
+    }
+  ]
+}

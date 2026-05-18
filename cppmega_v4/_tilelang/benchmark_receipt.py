@@ -12,6 +12,7 @@ in incrementally.
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -63,34 +64,46 @@ class CellReceipt:
 
 def measure_cell(shape: CellShape) -> CellReceipt:
     """Run a single forward and emit a receipt."""
+    from cppmega_v4._tilelang.kda_paths import ENV_VAR as KDA_ENV
     from cppmega_v4._tilelang.kda_paths import kda_path_statuses
+    from cppmega_v4._tilelang.linear_attention_paths import ENV_VAR as GDN_ENV
     from cppmega_v4._tilelang.linear_attention_paths import linear_attention_path_statuses
 
     statuses = (
         linear_attention_path_statuses() if shape.block == "gdn" else kda_path_statuses()
     )
     st = statuses[shape.path]
-    if shape.block == "gdn":
-        q = mx.random.normal((shape.batch, shape.seq_len, shape.num_heads, shape.head_dim_k))
-        k = mx.random.normal((shape.batch, shape.seq_len, shape.num_heads, shape.head_dim_k))
-        v = mx.random.normal((shape.batch, shape.seq_len, shape.num_heads, shape.head_dim_v))
-        beta = mx.random.normal((shape.batch, shape.seq_len, shape.num_heads))
-        g = mx.random.normal((shape.batch, shape.seq_len, shape.num_heads)) * 0.1
-        t0 = time.perf_counter()
-        o, _ = gated_delta_recurrent_dispatch(q, k, v, beta, g)
-        mx.eval(o)
-        elapsed = time.perf_counter() - t0
-    else:  # kda
-        hv = shape.num_v_heads if shape.num_v_heads is not None else shape.num_heads
-        q = mx.random.normal((shape.batch, shape.seq_len, shape.num_heads, shape.head_dim_k))
-        k = mx.random.normal((shape.batch, shape.seq_len, shape.num_heads, shape.head_dim_k))
-        v = mx.random.normal((shape.batch, shape.seq_len, hv, shape.head_dim_v))
-        g = mx.random.normal((shape.batch, shape.seq_len, hv, shape.head_dim_k)) * 0.05
-        beta = mx.random.normal((shape.batch, shape.seq_len, hv))
-        t0 = time.perf_counter()
-        o, _ = kda_recurrent_dispatch(q, k, v, g, beta)
-        mx.eval(o)
-        elapsed = time.perf_counter() - t0
+
+    env_var = GDN_ENV if shape.block == "gdn" else KDA_ENV
+    prev = os.environ.get(env_var)
+    os.environ[env_var] = shape.path
+    try:
+        if shape.block == "gdn":
+            q = mx.random.normal((shape.batch, shape.seq_len, shape.num_heads, shape.head_dim_k))
+            k = mx.random.normal((shape.batch, shape.seq_len, shape.num_heads, shape.head_dim_k))
+            v = mx.random.normal((shape.batch, shape.seq_len, shape.num_heads, shape.head_dim_v))
+            beta = mx.random.normal((shape.batch, shape.seq_len, shape.num_heads))
+            g = mx.random.normal((shape.batch, shape.seq_len, shape.num_heads)) * 0.1
+            t0 = time.perf_counter()
+            o, _ = gated_delta_recurrent_dispatch(q, k, v, beta, g)
+            mx.eval(o)
+            elapsed = time.perf_counter() - t0
+        else:  # kda
+            hv = shape.num_v_heads if shape.num_v_heads is not None else shape.num_heads
+            q = mx.random.normal((shape.batch, shape.seq_len, shape.num_heads, shape.head_dim_k))
+            k = mx.random.normal((shape.batch, shape.seq_len, shape.num_heads, shape.head_dim_k))
+            v = mx.random.normal((shape.batch, shape.seq_len, hv, shape.head_dim_v))
+            g = mx.random.normal((shape.batch, shape.seq_len, hv, shape.head_dim_k)) * 0.05
+            beta = mx.random.normal((shape.batch, shape.seq_len, hv))
+            t0 = time.perf_counter()
+            o, _ = kda_recurrent_dispatch(q, k, v, g, beta)
+            mx.eval(o)
+            elapsed = time.perf_counter() - t0
+    finally:
+        if prev is None:
+            os.environ.pop(env_var, None)
+        else:
+            os.environ[env_var] = prev
 
     return CellReceipt(
         cell_shape=shape,

@@ -1,13 +1,10 @@
 """GDN Path D (Triton frontend → TileLang) tests.
 
-Path D wraps ``tilelang.poc.triton_frontend.from_triton_kernel`` over FLA's
-``chunk_gated_delta_rule`` kernels. The frontend is currently Tier-1
-(elementwise only) — FLA's kernel uses ``tl.dot`` and multi-stage
-pipelines, so the lowering raises ``NotImplementedError`` until
-``op_mapping.OP_TABLE`` gains matmul/exp emitters. Path D therefore
-reports unavailable on every box right now, but the wiring + fallback
-must be correct, the blocker must be precisely named in the status, and
-the dispatch must fall back to Path A without raising.
+Path D wraps ``poc.triton_frontend.from_triton_kernel`` over FLA's
+``chunk_gated_delta_rule`` kernels. The frontend now routes the real
+chunk-delta-h TTIR op surface through OP_TABLE on dev hosts, but Path D
+is still unavailable as a runtime backend until cppmega_v4 wires a
+runnable PrimFunc/compiled artifact to the recurrent call signature.
 """
 
 from __future__ import annotations
@@ -94,8 +91,14 @@ def test_path_d_fallback_matches_path_a_when_unavailable(monkeypatch):
     np.testing.assert_array_equal(np.array(o_disp), np.array(o_ref))
 
 
-def test_try_lower_returns_none_until_op_mapping_extended():
-    """Until op_mapping covers tl.dot, the lowering seam returns (None, msg)."""
+def test_try_lower_reports_real_coverage_or_concrete_blocker():
     result, msg = _try_lower_fla_chunk_kernel(target="metal")
-    assert result is None
+    assert result is None or hasattr(result, "with_attr")
     assert isinstance(msg, str) and msg
+    assert (
+        "status=LOWERED_DEGRADED" in msg
+        or "status=LOWERED_FULL" in msg
+        or "not importable" in msg
+        or "failed" in msg.lower()
+        or "missing" in msg.lower()
+    )

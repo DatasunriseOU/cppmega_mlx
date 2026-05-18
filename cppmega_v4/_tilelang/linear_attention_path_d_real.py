@@ -1,5 +1,5 @@
 """GDN Path D (bumped-to-real) — FLA chunk_delta_h Triton kernel through
-the ``tilelang.poc.triton_frontend`` reducer end-to-end.
+the ``poc.triton_frontend`` reducer end-to-end.
 
 Distinct from ``linear_attention_path_d.py``, which was the *gated*
 seam that returned the actionable "not yet runnable" message while
@@ -16,21 +16,13 @@ What "real" means here
   against the ``apple/mps`` backend (triton-pr9701) — never invokes
   Metal codegen so the Apple metal-as / metal-ll quirks stay out of
   the way.
-* **Reducer is live**. ``from_triton_kernel()`` parses the captured
-  TTIR with ``mlir.ir`` (when bindings present) or the text walker
-  (fallback) and dispatches each op through the OP_TABLE emitters.
-* **Status is degraded, not full**. The Mac dev box has
-  ``MLIR_WALKER_AVAILABLE == False`` (mlir.ir python bindings absent),
-  so we land at ``LOWERED_DEGRADED``: every op routes through OP_TABLE
-  without raising, but the walker never populates ``ctx.value_map`` /
-  ``ctx.buffers`` because the regex walker is coverage-only by design.
-  That's the documented Tier-2 contract, not a silent failure.
-
-When the MLIR bindings become available (e.g. ``MLIR_PYTHON_PACKAGE_PREFIX``
-points at jaxlib's bundled ``mlir.ir`` or brew-llvm), this same call
-path produces a real ``TileLangPrimFunc`` and lands at
-``LOWERED_FULL``. No code changes needed here — the seam is identical
-across degraded / full status.
+* **Reducer is live**. ``from_ttir()`` parses the captured TTIR through
+  the POC's C++ generic-form round trip plus jaxlib ``mlir.ir`` fallback
+  and dispatches each op through the OP_TABLE emitters.
+* **Status is full for the real FLA chunk-h capture**. The reducer now
+  returns a real ``TileLangPrimFunc`` and lands at ``LOWERED_FULL`` on
+  this Mac. If those dependencies disappear, the function still reports
+  ``LOWERED_DEGRADED`` rather than pretending the runtime path is ready.
 
 Constraints
 -----------
@@ -251,40 +243,33 @@ def _lower_uncached(constexprs: Dict[str, Any]) -> LowerResult:
     try:
         from poc.triton_frontend import from_ttir, _walk_text_ttir
         from poc.triton_frontend import OP_TABLE
-        # Try the MLIR walker first; fall back to text walker.
         try:
-            from poc.triton_frontend import mlir_walker as _mw  # noqa: F401
-            mlir_ok = bool(getattr(_mw, "MLIR_WALKER_AVAILABLE", False))
+            prim = from_ttir(ttir_text, name="fla_chunk_delta_h")
+            return LowerResult(
+                status="LOWERED_FULL",
+                visited_ops=_walk_text_ttir(ttir_text),
+                missing_ops=[],
+                prim_func=prim,
+                ttir_text_len=len(ttir_text),
+                error_type=None,
+                error_message=None,
+                constexprs=constexprs,
+            )
+        except NotImplementedError as exc:
+            # Specific op missing from OP_TABLE -> FAILED_OPS.
+            return LowerResult(
+                status="FAILED_OPS",
+                visited_ops=[],
+                missing_ops=[str(exc)],
+                prim_func=None,
+                ttir_text_len=len(ttir_text),
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+                constexprs=constexprs,
+            )
         except Exception:
-            mlir_ok = False
-        if mlir_ok:
-            try:
-                prim = from_ttir(ttir_text, name="fla_chunk_delta_h")
-                return LowerResult(
-                    status="LOWERED_FULL",
-                    visited_ops=[],  # mlir walker doesn't return op list here
-                    missing_ops=[],
-                    prim_func=prim,
-                    ttir_text_len=len(ttir_text),
-                    error_type=None,
-                    error_message=None,
-                    constexprs=constexprs,
-                )
-            except NotImplementedError as exc:
-                # Specific op missing from OP_TABLE -> FAILED_OPS.
-                return LowerResult(
-                    status="FAILED_OPS",
-                    visited_ops=[],
-                    missing_ops=[str(exc)],
-                    prim_func=None,
-                    ttir_text_len=len(ttir_text),
-                    error_type=type(exc).__name__,
-                    error_message=str(exc),
-                    constexprs=constexprs,
-                )
-            except Exception as exc:
-                # Fall through to text walker for at least op coverage.
-                pass
+            # Fall through to text walker for at least op coverage.
+            pass
 
         # Degraded path: text walker. Returns visited op list; raises
         # NotImplementedError if an op isn't in OP_TABLE.
@@ -413,9 +398,8 @@ def gdn_fwd_path_d_real_call(*args, **kwargs):
         f"GDN Path D (real) status={res.status}; "
         f"visited={len(res.visited_ops)} ops; missing={res.missing_ops!r}; "
         f"error={res.error_type}: {res.error_message}. "
-        "Install mlir.ir python bindings (brew llvm or "
-        "MLIR_PYTHON_PACKAGE_PREFIX) to escalate from LOWERED_DEGRADED "
-        "to LOWERED_FULL."
+        "Path D runtime still needs the cppmega_v4 compile/launch adapter "
+        "that maps this PrimFunc back to the recurrent call signature."
     )
 
 

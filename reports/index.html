@@ -218,7 +218,7 @@
 <body>
     <header>
         <h1>cppmega Reports</h1>
-        <p>Training matrix and profiling artifacts generated from the 2026-05-17 Path B/C investigation.</p>
+        <p>Training matrix and profiling artifacts generated from the 2026-05-17/18 Path B/C investigation.</p>
     </header>
     <main>
         <section>
@@ -228,6 +228,30 @@
             </div>
             <div class="body">
                 <div class="grid">
+                    <div class="metric"><span>Fresh 2026-05-18 matrix</span><strong><a
+                                href="v4/cppmega_1b_path_matrix_safe_mamba_bwd_20260518.html">Safe Matrix
+                                HTML</a></strong>
+                        <p>Fresh 42/42 1B cells: bf16/fp8 x 7 optimizers x Path B/Path C cold/Path C warm, with
+                            Mamba3 Path C forward and the production-safe Path B backward route.</p>
+                    </div>
+                    <div class="metric"><span>Explicit full Path C backward</span><strong><a
+                                href="v4/cppmega_1b_path_matrix_full_path_c_bwd_20260518.html">Full-C Matrix
+                                HTML</a></strong>
+                        <p>Fresh current-HEAD 42/42 1B cells with <code>--mamba3-bwd path_c</code>; use this for the
+                            explicit full Path C experiment.</p>
+                    </div>
+                    <div class="metric"><span>Full-C current analysis</span><strong><a
+                                href="v4/path_c_loss_analysis_full_path_c_bwd_20260518.html">Full-C Analysis
+                                HTML</a></strong>
+                        <p>Current <code>f49a7e4</code> loss/win table, FP8 Lion recheck, dispatch samples, and
+                            codegen/cache/lifetime targets.</p>
+                    </div>
+                    <div class="metric"><span>Why Path C loses</span><strong><a
+                                href="v4/path_c_loss_analysis_1b_20260518.html">Loss Analysis
+                                HTML</a></strong>
+                        <p>Corrected BF16 Lion outlier, focused Mamba3/M2RNN benches, FP8 high-water deltas, and the
+                            next codegen/cache/lifetime targets.</p>
+                    </div>
                     <div class="metric"><span>Full Path B/C matrix</span><strong><a
                                 href="cppmega_1b_path_matrix.html">Matrix HTML</a></strong>
                         <p>42/42 cells: bf16/fp8 x 7 optimizers x Path B/Path C cold/Path C warm.</p>
@@ -327,10 +351,10 @@
             </div>
             <div class="body">
                 <div class="grid">
-                    <div class="metric"><span>FP8 Lion8bit Path B</span><strong>973.44 tok/s</strong></div>
-                    <div class="metric"><span>BF16 Lion8bit Path B</span><strong>1011.43 tok/s</strong></div>
-                    <div class="metric"><span>BF16 Adam8bit Path C warm</span><strong>678.10 tok/s</strong></div>
-                    <div class="metric"><span>FP8 Adam8bit Path C peak</span><strong>52.76 GiB</strong></div>
+                    <div class="metric"><span>Fresh matrix cells</span><strong>42/42 passed</strong></div>
+                    <div class="metric"><span>Fast optimizer Path C ratio</span><strong>0.665x C/B</strong></div>
+                    <div class="metric"><span>FP8 Path C average peak delta</span><strong>+30.49 GiB</strong></div>
+                    <div class="metric"><span>Corrected BF16 Lion C/B</span><strong>0.677x</strong></div>
                 </div>
             </div>
         </section>

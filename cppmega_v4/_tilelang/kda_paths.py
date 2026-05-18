@@ -11,9 +11,9 @@ Backend status (May 2026):
     - Path C: TileLang DSL @T.prim_func → tilelang.compile(target='metal',
       execution_backend='tvm_ffi'). Per-lane recurrent scan modeled on
       mamba3_path_c.py. Available iff tilelang + host MSL infra reachable.
-    - Path D: tilelang.poc.triton_frontend.from_triton_kernel over FLA KDA
-      chunk kernels. Currently blocked on op_mapping coverage
-      (tl.dot, tl.exp, masked-load).
+    - Path D: ``poc.triton_frontend.from_triton_kernel`` over FLA KDA
+      chunk kernels. Frontend op coverage is probed; runtime adapter is
+      still pending.
 
 Env override: ``CPPMEGA_V4_KERNEL_PATH__KDA``.
 """
@@ -118,7 +118,7 @@ def _path_d_status() -> PathStatus:
     return PathStatus(
         path="path_d", available=ok,
         reason=(
-            "KDA Path D: Triton kernel → tilelang.poc.triton_frontend."
+            "KDA Path D: Triton kernel -> poc.triton_frontend."
             f"from_triton_kernel → tilelang.compile. {reason}"
         ),
     )
