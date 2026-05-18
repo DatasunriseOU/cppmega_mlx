@@ -9,18 +9,20 @@ is extended to the GDN recurrence (FLA naive form)
     h[i]       += k[i] * v_eff[j]
     o[j]        = sum_i q[i] * h[i,j]
 
-Per-thread layout (j fixed, i varies in registers) matches the GLA kernel:
-each thread owns column j of the H_k x H_v state for one (batch, head).
+Per-thread layout (j fixed, i varies in registers): each thread owns
+column j of the K x V state for one (batch, head). K is the key dim
+(loop length in registers), V is the value dim (grid x-axis).
+
+Supports:
+    - ``head_k_dim != head_v_dim`` (separate K and V dimensions).
+    - ``initial_state`` of shape [B, H, K, V] for streaming decode.
+    - ``scale`` parameter (defaults to 1/sqrt(K)).
 
 Backward pass: not implemented in this revision — calls fall back to the
 Path A reference for autograd. Forward kernel can still be used for
 inference benchmarking via the dispatch table.
 
 API matches ``naive_recurrent_gated_delta_rule`` (returns ``(o, final_state)``).
-Constraints (relaxed in future versions):
-    - head_k_dim must equal head_v_dim (same shape per head — matches the
-      GLA scan assumption inherited from mlx-recurrence).
-    - dtype: all inputs cast to float32 internally (matches FLA naive).
 """
 
 from __future__ import annotations
@@ -36,31 +38,47 @@ def _gdn_forward_kernel(
     v: mx.array,
     beta: mx.array,
     g: mx.array,
+    *,
+    scale: float | None = None,
+    h0: mx.array | None = None,
 ) -> tuple[mx.array, mx.array]:
     """Metal forward for GDN recurrence.
 
     Args:
-        q, k: [B, T, H, Dh]
-        v:    [B, T, H, Dh]   — must match k's head dim for this kernel
+        q, k: [B, T, H, K]
+        v:    [B, T, H, V]
         beta: [B, T, H]
-        g:    [B, T, H]       — gate-decay logit (alpha = exp(g))
+        g:    [B, T, H]
+        scale: optional float — defaults to 1/sqrt(K)
+        h0:   optional [B, H, K, V] initial state
 
     Returns:
-        o: [B, T, H, Dh]
-        h_final: [B, H, Dh, Dh]   (only the last timestep's state)
+        o:       [B, T, H, V]
+        h_final: [B, H, K, V]   (final timestep's state)
     """
-    if q.ndim != 4 or k.shape != q.shape or v.shape != q.shape:
+    if q.ndim != 4 or k.shape != q.shape:
         raise ValueError(
-            f"q/k/v must match shape [B, T, H, Dh]; got q={q.shape}, k={k.shape}, v={v.shape}"
+            f"q/k must match shape [B, T, H, K]; got q={q.shape}, k={k.shape}"
+        )
+    if v.ndim != 4 or v.shape[:3] != q.shape[:3]:
+        raise ValueError(
+            f"v must be [B, T, H, V] with matching B,T,H; got v={v.shape}, q={q.shape}"
         )
     if beta.shape != q.shape[:3] or g.shape != q.shape[:3]:
         raise ValueError(
             f"beta/g must be [B, T, H]; got beta={beta.shape}, g={g.shape}"
         )
 
-    b, t, h, dh = q.shape
-    # Match FLA naive: cast to float32, apply 1/sqrt(Dh) scale to q.
-    q = q.astype(mx.float32) * (dh ** -0.5)
+    b, t, h, kdim = q.shape
+    vdim = v.shape[-1]
+
+    if h0 is not None and tuple(h0.shape) != (b, h, kdim, vdim):
+        raise ValueError(
+            f"initial_state must be [B={b}, H={h}, K={kdim}, V={vdim}]; got {h0.shape}"
+        )
+
+    sc = float(scale) if scale is not None else (kdim ** -0.5)
+    q = q.astype(mx.float32) * sc
     k = k.astype(mx.float32)
     v = v.astype(mx.float32)
     beta = beta.astype(mx.float32)
@@ -72,43 +90,58 @@ def _gdn_forward_kernel(
     beta_flat = beta.reshape(-1)
     g_flat = g.reshape(-1)
 
+    has_h0 = h0 is not None
+    if has_h0:
+        h0_flat = h0.astype(mx.float32).reshape(-1)
+
+    init_state_block = (
+        f"""
+        // Init from h0[bb, head, i, vj]
+        int h0_base = (bb * {h} + head) * {kdim * vdim} + vj;
+        for (int i = 0; i < {kdim}; i++) {{
+            state[i] = h0[h0_base + i * {vdim}];
+        }}
+        """
+        if has_h0
+        else f"""
+        for (int i = 0; i < {kdim}; i++) state[i] = 0.0f;
+        """
+    )
+
     source = f"""
-        uint j  = thread_position_in_grid.x;
+        uint vj = thread_position_in_grid.x;
         uint bh = thread_position_in_grid.y;
 
-        if (j >= {dh}u || bh >= {b * h}u) return;
+        if (vj >= {vdim}u || bh >= {b * h}u) return;
 
         uint bb   = bh / {h}u;
         uint head = bh % {h}u;
 
-        // Thread-local state: one column of the Dh x Dh state matrix
-        float state[{dh}];
-        for (int i = 0; i < {dh}; i++) state[i] = 0.0f;
+        // Thread-local state: one column of the K x V state matrix (length K)
+        float state[{kdim}];
+        {init_state_block}
 
         for (int ti = 0; ti < {t}; ti++) {{
             int g_idx     = bb * {t * h} + ti * {h} + head;
             float alpha_t = exp(g[g_idx]);
             float beta_t  = beta[g_idx];
 
-            int kv_base = (bb * {t} + ti) * {h * dh} + head * {dh};
-            float v_j   = v[kv_base + j];
+            int qk_base   = ((bb * {t} + ti) * {h} + head) * {kdim};
+            int v_base    = ((bb * {t} + ti) * {h} + head) * {vdim};
+            float v_j     = v[v_base + vj];
 
             // Phase 1: alpha decay (per FLA naive: applied BEFORE delta)
-            for (int i = 0; i < {dh}; i++) state[i] *= alpha_t;
+            for (int i = 0; i < {kdim}; i++) state[i] *= alpha_t;
 
-            // Phase 2: kth_S_j = sum_i k[i] * state[i, j]  (own column)
-            // mlx-lm PR #1066: Kahan-compensated summation. Without this,
-            // long-T runs accumulate bf16 rounding into kv_mem and the
-            // delta-corrected state drifts. Compensation costs 3 FLOPs/iter.
+            // Phase 2: kth_S_j = sum_i k[i] * state[i, j]  (Kahan-compensated)
             float kth_S_j = 0.0f;
             float kth_c   = 0.0f;
-            for (int i = 0; i < {dh}; i++) {{
-                float k_i = k[kv_base + i];
-                float p   = k_i * state[i];
-                float a   = p - kth_c;
-                float b   = kth_S_j + a;
-                kth_c     = (b - kth_S_j) - a;
-                kth_S_j   = b;
+            for (int i = 0; i < {kdim}; i++) {{
+                float p = k[qk_base + i] * state[i];
+                float a = p - kth_c;
+                float b = kth_S_j + a;
+                kth_c   = (b - kth_S_j) - a;
+                kth_S_j = b;
             }}
 
             // Phase 3: v_eff = beta * (v - kth_S)
@@ -116,47 +149,53 @@ def _gdn_forward_kernel(
 
             // Phase 4: state[i] += k[i] * v_eff_j  and  o[j] = sum_i q[i] * state[i]
             float o_j = 0.0f;
-            for (int i = 0; i < {dh}; i++) {{
-                float k_i = k[kv_base + i];
-                float q_i = q[kv_base + i];
+            for (int i = 0; i < {kdim}; i++) {{
+                float k_i = k[qk_base + i];
+                float q_i = q[qk_base + i];
                 state[i] += k_i * v_eff_j;
                 o_j += q_i * state[i];
             }}
 
-            output[kv_base + j] = o_j;
+            output[v_base + vj] = o_j;
         }}
 
-        // Write final state column for this thread (if requested by caller)
-        int sf_base = (bb * {h} + head) * {dh * dh} + j;
-        for (int i = 0; i < {dh}; i++) {{
-            state_final[sf_base + i * {dh}] = state[i];
+        // Write final state column: state_final[bb, head, :, vj]
+        int sf_base = (bb * {h} + head) * {kdim * vdim} + vj;
+        for (int i = 0; i < {kdim}; i++) {{
+            state_final[sf_base + i * {vdim}] = state[i];
         }}
     """
 
-    kernel_name = f"v4_gdn_fwd_{b}_{t}_{h}_{dh}"
+    h0_tag = "h0" if has_h0 else "noh0"
+    kernel_name = f"v4_gdn_fwd_{b}_{t}_{h}_{kdim}_{vdim}_{h0_tag}"
+    input_names = ["q", "k", "v", "beta", "g"] + (["h0"] if has_h0 else [])
     kernel = get_or_build_kernel(
         name=kernel_name,
-        input_names=["q", "k", "v", "beta", "g"],
+        input_names=input_names,
         output_names=["output", "state_final"],
         source=source,
     )
 
-    grid = (dh, b * h, 1)
-    tg_x = min(dh, 64)
+    grid = (vdim, b * h, 1)
+    tg_x = min(vdim, 64)
     threadgroup = (tg_x, 1, 1)
 
+    inputs = [q_flat, k_flat, v_flat, beta_flat, g_flat]
+    if has_h0:
+        inputs.append(h0_flat)
+
     results = kernel(
-        inputs=[q_flat, k_flat, v_flat, beta_flat, g_flat],
+        inputs=inputs,
         output_shapes=[
-            (b * t * h * dh,),
-            (b * h * dh * dh,),
+            (b * t * h * vdim,),
+            (b * h * kdim * vdim,),
         ],
         output_dtypes=[mx.float32, mx.float32],
         grid=grid,
         threadgroup=threadgroup,
     )
-    o = results[0].reshape(b, t, h, dh)
-    state_final = results[1].reshape(b, h, dh, dh)
+    o = results[0].reshape(b, t, h, vdim)
+    state_final = results[1].reshape(b, h, kdim, vdim)
     return o, state_final
 
 
@@ -173,26 +212,12 @@ def gdn_forward_path_b(
 ):
     """Path B forward, signature matching ``naive_recurrent_gated_delta_rule``.
 
-    Constraints:
-        - ``initial_state`` not supported in this revision (must be None);
-          falls back to zero-init inside the kernel.
-        - ``scale`` not supported (uses 1/sqrt(Dh) per FLA convention).
-        - ``head_k_dim == head_v_dim`` required.
-
-    On unsupported configs returns the Path A reference output instead so
-    the dispatch never silently produces wrong numerics.
+    Supports:
+        - ``initial_state`` shape [B, H, K, V] (streaming decode).
+        - Custom ``scale`` (defaults to 1/sqrt(K) per FLA convention).
+        - ``head_k_dim != head_v_dim``.
     """
-    if initial_state is not None or scale is not None or v.shape[-1] != k.shape[-1]:
-        # Fall through to Path A for cases this kernel doesn't yet cover.
-        from cppmega_v4.nn._external.fla_naive_gated_delta_rule import (
-            naive_recurrent_gated_delta_rule,
-        )
-        return naive_recurrent_gated_delta_rule(
-            q, k, v, beta, g,
-            scale=scale, initial_state=initial_state,
-            output_final_state=output_final_state,
-        )
-    o, sf = _gdn_forward_kernel(q, k, v, beta, g)
+    o, sf = _gdn_forward_kernel(q, k, v, beta, g, scale=scale, h0=initial_state)
     return o, (sf if output_final_state else None)
 
 

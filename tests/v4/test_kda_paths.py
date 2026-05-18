@@ -62,6 +62,68 @@ def test_kda_path_b_output_final_state():
     assert S.shape == (B, HV, K, V)
 
 
+def test_kda_path_b_initial_state_parity():
+    """Streaming-decode: feeding nonzero h0 must match Path A."""
+    B, T, H, HV, K, V = 1, 4, 2, 4, 6, 8
+    rng = np.random.default_rng(51)
+    q = mx.array(rng.standard_normal((B, T, H, K)).astype(np.float32))
+    k = mx.array(rng.standard_normal((B, T, H, K)).astype(np.float32))
+    v = mx.array(rng.standard_normal((B, T, HV, V)).astype(np.float32))
+    g = mx.array(-rng.uniform(0.01, 0.2, (B, T, HV, K)).astype(np.float32))
+    beta = mx.array(rng.uniform(0.1, 0.9, (B, T, HV)).astype(np.float32))
+    h0 = mx.array(rng.standard_normal((B, HV, K, V)).astype(np.float32) * 0.5)
+    o_b, sf_b = kda_forward_path_b(
+        q, k, v, g, beta, initial_state=h0, output_final_state=True,
+    )
+    o_a, sf_a = naive_recurrent_kda(
+        q, k, v, g, beta, initial_state=h0, output_final_state=True,
+    )
+    mx.eval(o_b, o_a, sf_b, sf_a)
+    np.testing.assert_allclose(np.array(o_b), np.array(o_a), atol=1e-4, rtol=1e-4)
+    np.testing.assert_allclose(np.array(sf_b), np.array(sf_a), atol=1e-4, rtol=1e-4)
+
+
+def test_kda_path_b_streaming_chunks_match_full_run():
+    B, H, HV, K, V = 1, 2, 4, 6, 6
+    T1, T2 = 3, 4
+    T = T1 + T2
+    rng = np.random.default_rng(57)
+    q = mx.array(rng.standard_normal((B, T, H, K)).astype(np.float32))
+    k = mx.array(rng.standard_normal((B, T, H, K)).astype(np.float32))
+    v = mx.array(rng.standard_normal((B, T, HV, V)).astype(np.float32))
+    g = mx.array(-rng.uniform(0.01, 0.2, (B, T, HV, K)).astype(np.float32))
+    beta = mx.array(rng.uniform(0.1, 0.9, (B, T, HV)).astype(np.float32))
+
+    o_full, sf_full = kda_forward_path_b(q, k, v, g, beta, output_final_state=True)
+
+    o1, sf_mid = kda_forward_path_b(
+        q[:, :T1], k[:, :T1], v[:, :T1], g[:, :T1], beta[:, :T1],
+        output_final_state=True,
+    )
+    o2, sf_end = kda_forward_path_b(
+        q[:, T1:], k[:, T1:], v[:, T1:], g[:, T1:], beta[:, T1:],
+        initial_state=sf_mid, output_final_state=True,
+    )
+    o_stream = mx.concatenate([o1, o2], axis=1)
+    mx.eval(o_full, o_stream, sf_full, sf_end)
+    np.testing.assert_allclose(np.array(o_stream), np.array(o_full), atol=1e-4, rtol=1e-4)
+    np.testing.assert_allclose(np.array(sf_end), np.array(sf_full), atol=1e-4, rtol=1e-4)
+
+
+def test_kda_path_b_custom_scale_parity():
+    B, T, H, HV, K, V = 1, 3, 2, 4, 8, 8
+    rng = np.random.default_rng(61)
+    q = mx.array(rng.standard_normal((B, T, H, K)).astype(np.float32))
+    k = mx.array(rng.standard_normal((B, T, H, K)).astype(np.float32))
+    v = mx.array(rng.standard_normal((B, T, HV, V)).astype(np.float32))
+    g = mx.array(-rng.uniform(0.01, 0.2, (B, T, HV, K)).astype(np.float32))
+    beta = mx.array(rng.uniform(0.1, 0.9, (B, T, HV)).astype(np.float32))
+    custom_scale = 0.125
+    o_b, _ = kda_forward_path_b(q, k, v, g, beta, scale=custom_scale)
+    o_a, _ = naive_recurrent_kda(q, k, v, g, beta, scale=custom_scale)
+    np.testing.assert_allclose(np.array(o_b), np.array(o_a), atol=1e-4, rtol=1e-4)
+
+
 def test_kda_path_b_dispatch(monkeypatch):
     monkeypatch.setenv(KDA_ENV, "path_b")
     B, T, H, HV, K, V = 1, 4, 2, 4, 8, 8
@@ -110,10 +172,15 @@ def test_kda_path_c_forced_via_env_returns_valid_output(monkeypatch):
 
 
 def test_kda_path_c_fallback_matches_path_a(monkeypatch):
-    ok, _ = kda_tilelang_importable()
-    if ok:
-        pytest.skip("tilelang available — fallback not exercised here")
+    """Path C fallback parity. Always runs: if tilelang is reachable, we force
+    the runtime status to ``unavailable`` so the dispatcher exercises Path A."""
     monkeypatch.setenv(KDA_ENV, "path_c")
+    from cppmega_v4._tilelang import kda_path_c as kda_path_c_mod
+    monkeypatch.setattr(
+        kda_path_c_mod,
+        "_path_c_runtime_status",
+        lambda: (False, "forced unavailable for fallback parity test"),
+    )
     B, T, H, HV, K, V = 1, 4, 2, 4, 6, 6
     rng = np.random.default_rng(41)
     q = mx.array(rng.standard_normal((B, T, H, K)).astype(np.float32))
@@ -170,6 +237,12 @@ def test_kda_path_d_try_lower_returns_seam_message():
     result, msg = _try_lower_fla_kda_kernel(target="metal")
     assert result is None
     assert isinstance(msg, str) and msg
+    assert (
+        "coverage complete" in msg
+        or "not importable" in msg
+        or "failed" in msg.lower()
+        or "coverage gap" in msg.lower()
+    )
 
 
 # ----- Dispatch sanity -----

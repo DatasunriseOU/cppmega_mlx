@@ -20,6 +20,10 @@ serially while reducing over K for state-derived quantities.
 
 Group expansion (HV / H): each ``hv`` maps to ``h = hv // G`` for indexing
 into q and k. The kernel performs that mapping inline.
+
+Supports:
+    - ``initial_state`` of shape [B, HV, K, V] (streaming decode).
+    - Custom ``scale`` (defaults to 1/sqrt(K)).
 """
 
 from __future__ import annotations
@@ -35,6 +39,9 @@ def _kda_forward_kernel(
     v: mx.array,
     g: mx.array,
     beta: mx.array,
+    *,
+    scale: float | None = None,
+    h0: mx.array | None = None,
 ) -> tuple[mx.array, mx.array]:
     """Metal forward for KDA recurrence.
 
@@ -43,6 +50,8 @@ def _kda_forward_kernel(
         v:    [B, T, HV, V]
         g:    [B, T, HV, K]   per-K vectorized log-gate
         beta: [B, T, HV]
+        scale: optional float — defaults to 1/sqrt(K)
+        h0:   optional [B, HV, K, V] initial state
 
     Returns:
         o: [B, T, HV, V]
@@ -63,7 +72,13 @@ def _kda_forward_kernel(
         raise ValueError(f"HV ({hv}) must be divisible by H ({h})")
     group = hv // h
 
-    q = q.astype(mx.float32) * (kdim ** -0.5)
+    if h0 is not None and tuple(h0.shape) != (b, hv, kdim, vdim):
+        raise ValueError(
+            f"initial_state must be [B={b}, HV={hv}, K={kdim}, V={vdim}]; got {h0.shape}"
+        )
+
+    sc = float(scale) if scale is not None else (kdim ** -0.5)
+    q = q.astype(mx.float32) * sc
     k = k.astype(mx.float32)
     v = v.astype(mx.float32)
     g = g.astype(mx.float32)
@@ -74,6 +89,24 @@ def _kda_forward_kernel(
     v_flat = v.reshape(-1)
     g_flat = g.reshape(-1)
     beta_flat = beta.reshape(-1)
+
+    has_h0 = h0 is not None
+    if has_h0:
+        h0_flat = h0.astype(mx.float32).reshape(-1)
+
+    init_state_block = (
+        f"""
+        // Init from h0[bb, hv_idx, i, vj]
+        int h0_base = (bb * {hv} + hv_idx) * {kdim * vdim} + vj;
+        for (int i = 0; i < {kdim}; i++) {{
+            state[i] = h0[h0_base + i * {vdim}];
+        }}
+        """
+        if has_h0
+        else f"""
+        for (int i = 0; i < {kdim}; i++) state[i] = 0.0f;
+        """
+    )
 
     source = f"""
         uint vj  = thread_position_in_grid.x;
@@ -87,7 +120,7 @@ def _kda_forward_kernel(
 
         // Per-thread state column: S[bb, hv_idx, :, vj]  size K
         float state[{kdim}];
-        for (int i = 0; i < {kdim}; i++) state[i] = 0.0f;
+        {init_state_block}
 
         for (int ti = 0; ti < {t}; ti++) {{
             // g_base: g[bb, ti, hv_idx, 0]
@@ -134,10 +167,12 @@ def _kda_forward_kernel(
         }}
     """
 
-    name = f"v4_kda_fwd_{b}_{t}_{h}_{hv}_{kdim}_{vdim}"
+    h0_tag = "h0" if has_h0 else "noh0"
+    name = f"v4_kda_fwd_{b}_{t}_{h}_{hv}_{kdim}_{vdim}_{h0_tag}"
+    input_names = ["q", "k", "v", "g", "beta"] + (["h0"] if has_h0 else [])
     kernel = get_or_build_kernel(
         name=name,
-        input_names=["q", "k", "v", "g", "beta"],
+        input_names=input_names,
         output_names=["output", "state_final"],
         source=source,
     )
@@ -146,8 +181,12 @@ def _kda_forward_kernel(
     tg_x = min(vdim, 64)
     threadgroup = (tg_x, 1, 1)
 
+    inputs = [q_flat, k_flat, v_flat, g_flat, beta_flat]
+    if has_h0:
+        inputs.append(h0_flat)
+
     out, sf = kernel(
-        inputs=[q_flat, k_flat, v_flat, g_flat, beta_flat],
+        inputs=inputs,
         output_shapes=[
             (b * t * hv * vdim,),
             (b * hv * kdim * vdim,),
@@ -172,22 +211,17 @@ def kda_forward_path_b(
 ):
     """KDA Path B forward, signature matching ``naive_recurrent_kda``.
 
-    Falls back to Path A for unsupported configs (initial_state, custom
-    scale, or HV not divisible by H) so the dispatch never produces wrong
-    numerics silently.
+    Falls back to Path A only when HV is not divisible by H (architectural
+    mismatch). Supports ``initial_state`` and custom ``scale``.
     """
-    if (
-        initial_state is not None
-        or scale is not None
-        or v.shape[2] % q.shape[2] != 0
-    ):
+    if v.shape[2] % q.shape[2] != 0:
         from cppmega_v4.nn._external.fla_naive_kda import naive_recurrent_kda
         return naive_recurrent_kda(
             q, k, v, g, beta,
             scale=scale, initial_state=initial_state,
             output_final_state=output_final_state,
         )
-    o, sf = _kda_forward_kernel(q, k, v, g, beta)
+    o, sf = _kda_forward_kernel(q, k, v, g, beta, scale=scale, h0=initial_state)
     return o, (sf if output_final_state else None)
 
 

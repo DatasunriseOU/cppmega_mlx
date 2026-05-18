@@ -71,11 +71,18 @@ def test_path_c_forced_via_env_returns_valid_output(monkeypatch):
 
 
 def test_path_c_fallback_matches_path_a_when_unavailable(monkeypatch):
-    """When the real kernel isn't available, dispatch must equal Path A bit-for-bit."""
-    ok, _ = _tilelang_importable()
-    if ok:
-        pytest.skip("tilelang available — fallback path not exercised here")
+    """When the real kernel isn't available, dispatch must equal Path A bit-for-bit.
+
+    Runs unconditionally: if tilelang is reachable, we force the runtime status
+    to ``unavailable`` so the dispatcher exercises the Path A fallback either way.
+    """
     monkeypatch.setenv(GDN_ENV, "path_c")
+    from cppmega_v4._tilelang import linear_attention_path_c as path_c_mod
+    monkeypatch.setattr(
+        path_c_mod,
+        "_path_c_runtime_status",
+        lambda: (False, "forced unavailable for fallback parity test"),
+    )
     B, T, H, K, V = 1, 5, 2, 8, 8
     rng = np.random.default_rng(7)
     q = mx.array(rng.standard_normal((B, T, H, K)).astype(np.float32))
