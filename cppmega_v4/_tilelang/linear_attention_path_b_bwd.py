@@ -104,10 +104,19 @@ def _gdn_backward_kernel(
             f"caller should fall back to Path A grad path"
         )
     # Multi-simdgroup path when dh > 32: pad threadgroup to a 32-multiple
-    # so simd_sum still works (32 lanes per simdgroup), and use
-    # atomic_fetch_add_explicit for cross-simdgroup grad accumulation.
-    use_atomic = dh > _SIMD_WIDTH
+    # so simd_sum still works (32 lanes per simdgroup). Cross-simdgroup
+    # reductions go through a threadgroup-shared-memory tile instead of
+    # atomic_fetch_add_explicit (atomics serialised badly at Dh>=64 and
+    # killed the multi-simdgroup speedup).
+    use_shared = dh > _SIMD_WIDTH
     tg_size = ((dh + _SIMD_WIDTH - 1) // _SIMD_WIDTH) * _SIMD_WIDTH
+    n_simd = tg_size // _SIMD_WIDTH  # number of simdgroups in a threadgroup
+    # Shared-memory budget: one batched "[dh, n_simd]" tile reused across the
+    # three vector reductions (dq, dk, propagation) plus tiny [n_simd] tiles
+    # for the two scalar reductions (dbeta, d_alpha). Worst case Dh=256 with
+    # 8 simdgroups → 256*8*4 = 8192 bytes vector tile + 32+32 = 8256 bytes
+    # total per threadgroup, well below the 32KB M-series limit.
+    shared_bytes = (dh * n_simd + 2 * n_simd) * 4 if use_shared else 0
 
     scale = dh ** -0.5
     q_f = q.astype(mx.float32).reshape(-1)
@@ -132,15 +141,26 @@ def _gdn_backward_kernel(
     #   and after T~64 steps tiny rounding errors blow up to inf / NaN.
     #   Mirroring mamba3_path_c's switch from inverse-walk to cached
     #   snapshots (see _bwd_state_snapshots_kernel_for).
+    # Shared-mem declarations only emitted in the multi-simdgroup path.
+    shared_decls = (
+        f"""
+        threadgroup float tg_vec[{dh * n_simd}];   // batched per-i partials
+        threadgroup float tg_scalar0[{n_simd}];    // scalar reduction A
+        threadgroup float tg_scalar1[{n_simd}];    // scalar reduction B
+        """ if use_shared else ""
+    )
+
     source = f"""
         uint tid_in_tg = thread_position_in_threadgroup.x;
         uint bh        = threadgroup_position_in_grid.x;
         uint j         = tid_in_tg;
         bool active    = (j < {dh}u) && (bh < {b * h}u);
+        uint simd_id   = tid_in_tg / 32u;
+        uint lane      = tid_in_tg & 31u;
 
         uint bb   = bh / {h}u;
         uint head = bh % {h}u;
-
+        {shared_decls}
         float state[{dh}];
         float dS[{dh}];
         float v_eff_hist[{max(t, 1)}];
@@ -240,19 +260,28 @@ def _gdn_backward_kernel(
                 float contrib = active ? (dY_j * S_t_col[i]) : 0.0f;
                 float dq_i_sum = simd_sum(contrib);
                 {(
-                    f'''if (active && (j & 31u) == 0u) {{
-                        atomic_fetch_add_explicit(
-                            (device atomic_float*)&dq[kv_base + i],
-                            dq_i_sum * {scale}f, memory_order_relaxed
-                        );
-                    }}'''
-                    if use_atomic else
+                    f'''// Stash this simdgroup's partial; one barrier amortises
+                    // all dh writes (no atomic contention).
+                    if (lane == 0u) tg_vec[i * {n_simd} + simd_id] = dq_i_sum;'''
+                    if use_shared else
                     f'''if (active && j == 0u) {{
                         dq[kv_base + i] = dq_i_sum * {scale}f;
                     }}'''
                 )}
                 dS[i] += dY_j * q_i_scaled;
             }}
+            {(
+                f'''threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+            // Reduce: one thread per output cell; lanes >= dh idle.
+            if (tid_in_tg < {dh}u) {{
+                int oi = (int)tid_in_tg;
+                float total = 0.0f;
+                for (int s = 0; s < {n_simd}; s++) total += tg_vec[oi * {n_simd} + s];
+                dq[kv_base + oi] = total * {scale}f;
+            }}
+            threadgroup_barrier(metal::mem_flags::mem_threadgroup);'''
+                if use_shared else ""
+            )}
 
             // ---- (2) S_t[i,j] = S_decayed[i,j] + k_i * v_eff_t ----
             //   dv_eff[j]      = sum_i dS_t[i,j] * k_i        (per-j scalar)
@@ -270,17 +299,19 @@ def _gdn_backward_kernel(
             float dv_j   = dv_eff_j * beta_t;
             float dkth_j = -dv_eff_j * beta_t;
             float dbeta_contrib = active ? (dv_eff_j * (v_j - kth_t)) : 0.0f;
-            float dbeta_total = simd_sum(dbeta_contrib);
+            float dbeta_simd = simd_sum(dbeta_contrib);
             if (active) dv[kv_base + j] = dv_j;
             {(
-                f'''if (active && (j & 31u) == 0u) {{
-                    atomic_fetch_add_explicit(
-                        (device atomic_float*)&dbeta[g_idx],
-                        dbeta_total, memory_order_relaxed
-                    );
-                }}'''
-                if use_atomic else
-                f'''if (active && j == 0u) dbeta[g_idx] = dbeta_total;'''
+                f'''if (lane == 0u) tg_scalar0[simd_id] = dbeta_simd;
+            threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+            if (tid_in_tg == 0u) {{
+                float total = 0.0f;
+                for (int s = 0; s < {n_simd}; s++) total += tg_scalar0[s];
+                dbeta[g_idx] = total;
+            }}
+            threadgroup_barrier(metal::mem_flags::mem_threadgroup);'''
+                if use_shared else
+                f'''if (active && j == 0u) dbeta[g_idx] = dbeta_simd;'''
             )}
 
             // ---- (4) kth[j] = sum_i k_i * S_decayed[i,j] ----
@@ -291,16 +322,22 @@ def _gdn_backward_kernel(
                 float dk_kth   = active ? (dkth_j * S_decayed[i])  : 0.0f;
                 float dk_i_sum = simd_sum(dk_delta + dk_kth);
                 {(
-                    f'''if (active && (j & 31u) == 0u) {{
-                        atomic_fetch_add_explicit(
-                            (device atomic_float*)&dk[kv_base + i],
-                            dk_i_sum, memory_order_relaxed
-                        );
-                    }}'''
-                    if use_atomic else
+                    f'''if (lane == 0u) tg_vec[i * {n_simd} + simd_id] = dk_i_sum;'''
+                    if use_shared else
                     f'''if (active && j == 0u) dk[kv_base + i] = dk_i_sum;'''
                 )}
             }}
+            {(
+                f'''threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+            if (tid_in_tg < {dh}u) {{
+                int oi = (int)tid_in_tg;
+                float total = 0.0f;
+                for (int s = 0; s < {n_simd}; s++) total += tg_vec[oi * {n_simd} + s];
+                dk[kv_base + oi] = total;
+            }}
+            threadgroup_barrier(metal::mem_flags::mem_threadgroup);'''
+                if use_shared else ""
+            )}
 
             // dS_decayed[i,j] = dS_t[i,j] + dkth[j] * k_i
             for (int i = 0; i < {dh}; i++) {{
@@ -316,16 +353,18 @@ def _gdn_backward_kernel(
             for (int i = 0; i < {dh}; i++) {{
                 d_alpha_partial += dS[i] * S_prev[i];
             }}
-            float d_alpha_total = simd_sum(active ? d_alpha_partial : 0.0f);
+            float d_alpha_simd = simd_sum(active ? d_alpha_partial : 0.0f);
             {(
-                f'''if (active && (j & 31u) == 0u) {{
-                    atomic_fetch_add_explicit(
-                        (device atomic_float*)&dg[g_idx],
-                        d_alpha_total * alpha_t, memory_order_relaxed
-                    );
-                }}'''
-                if use_atomic else
-                f'''if (active && j == 0u) dg[g_idx] = d_alpha_total * alpha_t;'''
+                f'''if (lane == 0u) tg_scalar1[simd_id] = d_alpha_simd;
+            threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+            if (tid_in_tg == 0u) {{
+                float total = 0.0f;
+                for (int s = 0; s < {n_simd}; s++) total += tg_scalar1[s];
+                dg[g_idx] = total * alpha_t;
+            }}
+            threadgroup_barrier(metal::mem_flags::mem_threadgroup);'''
+                if use_shared else
+                f'''if (active && j == 0u) dg[g_idx] = d_alpha_simd * alpha_t;'''
             )}
 
             // Carry dS to next (earlier) timestep.
@@ -405,7 +444,8 @@ def _gdn_apply_path_b_vjp(
     del output
     q, k, v, beta, g = primals
     # Constraints for the real-MSL bwd kernel: shapes match + Dh <= 256
-    # (multi-simdgroup path, atomic accumulation for cross-simdgroup grads).
+    # (multi-simdgroup path, threadgroup-shared-memory accumulation across
+    # simdgroups — replaced atomic_fetch_add to remove serialisation).
     dh = q.shape[-1]
     bwd_ok = (
         k.shape == q.shape
