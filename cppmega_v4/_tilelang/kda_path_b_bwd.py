@@ -94,12 +94,29 @@ def _kda_backward_kernel(
     hv, vdim = v.shape[2], v.shape[-1]
     if hv % h != 0:
         raise ValueError(f"HV ({hv}) must be divisible by H ({h})")
-    if vdim > _SIMD_WIDTH:
+    if vdim > _SIMD_WIDTH * 8:
+        # Cap at 8 simdgroups (V up to 256). Beyond that per-thread register
+        # pressure (state[K], dS[K], S_t_col[K], S_prev[K], S_decayed[K],
+        # decay_arr[K]) gets prohibitive for the K dimension too.
         raise ValueError(
-            f"Real-MSL KDA bwd currently requires V<=32 (got {vdim}); "
+            f"Real-MSL KDA bwd currently requires V<=256 (got {vdim}); "
             f"caller should fall back to Path A grad path"
         )
     group = hv // h
+    # Multi-simdgroup path when V > 32: pad threadgroup to a 32-multiple so
+    # simd_sum still works (32 lanes per simdgroup). Cross-simdgroup
+    # reductions go through threadgroup-shared-memory tiles (the previous
+    # revision used atomic_fetch_add inside the threadgroup which serialised
+    # at V >= 64). Inter-HV-group dq/dk/dbeta races (different threadgroups
+    # touching the same (b,t,h_idx)/(b,t,hv) cells through HV expansion) still
+    # need atomic_fetch_add — those live in device memory.
+    use_shared = vdim > _SIMD_WIDTH
+    tg_size = ((vdim + _SIMD_WIDTH - 1) // _SIMD_WIDTH) * _SIMD_WIDTH
+    n_simd = tg_size // _SIMD_WIDTH
+    # Shared-memory: one [kdim, n_simd] vector tile (reused across the three
+    # K-vector reductions: dq, dk, ddecay) + a few [n_simd] scalar tiles.
+    # Worst case kdim=256, n_simd=8 → 256*8*4 = 8192 bytes + ~64 bytes scalars.
+    shared_bytes = (kdim * n_simd + 2 * n_simd) * 4 if use_shared else 0
 
     scale = kdim ** -0.5
     q_f = q.astype(mx.float32).reshape(-1)
@@ -109,15 +126,25 @@ def _kda_backward_kernel(
     beta_f = beta.astype(mx.float32).reshape(-1)
     dy_f = dy.astype(mx.float32).reshape(-1)
 
+    shared_decls = (
+        f"""
+        threadgroup float tg_vec[{kdim * n_simd}];   // batched per-i partials
+        threadgroup float tg_scalar0[{n_simd}];      // scalar reduction A
+        """ if use_shared else ""
+    )
+
     source = f"""
         uint tid_in_tg = thread_position_in_threadgroup.x;
         uint bhv       = threadgroup_position_in_grid.x;
         uint vj        = tid_in_tg;
         bool active    = (vj < {vdim}u) && (bhv < {b * hv}u);
+        uint simd_id   = tid_in_tg / 32u;
+        uint lane      = tid_in_tg & 31u;
 
         uint bb     = bhv / {hv}u;
         uint hv_idx = bhv % {hv}u;
         uint h_idx  = hv_idx / {group}u;
+        {shared_decls}
 
         // Per-thread registers:
         //   state[K], dS[K], inner_hist[T]
@@ -217,15 +244,35 @@ def _kda_backward_kernel(
                 float q_i_scaled = q[qk_base + i] * {scale}f;
                 float contrib = active ? (dY_j * S_t_col[i]) : 0.0f;
                 float dq_i_sum = simd_sum(contrib);
-                if (active && vj == 0u) {{
-                    atomic_fetch_add_explicit(
-                        (device atomic_float*)&dq[qk_base + i],
-                        dq_i_sum * {scale}f,
-                        memory_order_relaxed
-                    );
-                }}
+                {(
+                    f'''if (lane == 0u) tg_vec[i * {n_simd} + simd_id] = dq_i_sum;'''
+                    if use_shared else
+                    f'''if (active && vj == 0u) {{
+                        atomic_fetch_add_explicit(
+                            (device atomic_float*)&dq[qk_base + i],
+                            dq_i_sum * {scale}f,
+                            memory_order_relaxed
+                        );
+                    }}'''
+                )}
                 dS[i] += dY_j * q_i_scaled;
             }}
+            {(
+                f'''threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+            // Reduce per-i across simdgroups, then single atomic_fetch_add
+            // to handle the inter-HV-group race on dq[(b,t,h_idx,i)].
+            for (int oi = (int)tid_in_tg; oi < {kdim}; oi += {tg_size}) {{
+                float total = 0.0f;
+                for (int s = 0; s < {n_simd}; s++) total += tg_vec[oi * {n_simd} + s];
+                atomic_fetch_add_explicit(
+                    (device atomic_float*)&dq[qk_base + oi],
+                    total * {scale}f,
+                    memory_order_relaxed
+                );
+            }}
+            threadgroup_barrier(metal::mem_flags::mem_threadgroup);'''
+                if use_shared else ""
+            )}
 
             // ---- (2) S_t = S_decayed + beta * k * inner ----
             //   dinner[j] = beta_t * sum_i dS_t[i, j] * k_i   (per-j scalar)
@@ -238,17 +285,37 @@ def _kda_backward_kernel(
             }}
             float dinner_j = beta_t * sum_k_dS;
 
-            // dv[j] = dinner_j
+            // dv[j] = dinner_j — unique per (b,t,hv,vj), no race.
             if (active) {{
-                atomic_fetch_add_explicit(
-                    (device atomic_float*)&dv[v_idx],
-                    dinner_j,
-                    memory_order_relaxed
-                );
+                dv[v_idx] = dinner_j;
             }}
 
             // dbeta_t = sum_i k_i * (sum_j dS_t[i,j] * inner_t)
-            float dbeta_partial = 0.0f;
+            {(
+                f'''// Stash per-simdgroup term_sum[i] into tg_vec, then one
+            // thread combines across simdgroups and i.
+            for (int i = 0; i < {kdim}; i++) {{
+                float term = active ? (dS[i] * inner_t) : 0.0f;
+                float term_sum = simd_sum(term);
+                if (lane == 0u) tg_vec[i * {n_simd} + simd_id] = term_sum;
+            }}
+            threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+            if (tid_in_tg == 0u) {{
+                float dbeta_partial = 0.0f;
+                for (int i = 0; i < {kdim}; i++) {{
+                    float total_i = 0.0f;
+                    for (int s = 0; s < {n_simd}; s++) total_i += tg_vec[i * {n_simd} + s];
+                    dbeta_partial += k[qk_base + i] * total_i;
+                }}
+                atomic_fetch_add_explicit(
+                    (device atomic_float*)&dbeta[beta_idx],
+                    dbeta_partial,
+                    memory_order_relaxed
+                );
+            }}
+            threadgroup_barrier(metal::mem_flags::mem_threadgroup);'''
+                if use_shared else
+                f'''float dbeta_partial = 0.0f;
             for (int i = 0; i < {kdim}; i++) {{
                 float term = active ? (dS[i] * inner_t) : 0.0f;
                 float term_sum = simd_sum(term);  // sum over j
@@ -262,7 +329,8 @@ def _kda_backward_kernel(
                     dbeta_partial,
                     memory_order_relaxed
                 );
-            }}
+            }}'''
+            )}
 
             // dk_i (delta) += sum_j dS_t[i, j] * (beta_t * inner_t)
             //   Note inner_t is a per-j scalar; cannot factor it out of simd_sum.
@@ -272,14 +340,32 @@ def _kda_backward_kernel(
                 float dk_delta = active ? (dS[i] * beta_t * inner_t) : 0.0f;
                 float dk_kth   = active ? (dkth_j * S_decayed[i])    : 0.0f;
                 float dk_i_sum = simd_sum(dk_delta + dk_kth);
-                if (active && vj == 0u) {{
-                    atomic_fetch_add_explicit(
-                        (device atomic_float*)&dk[qk_base + i],
-                        dk_i_sum,
-                        memory_order_relaxed
-                    );
-                }}
+                {(
+                    f'''if (lane == 0u) tg_vec[i * {n_simd} + simd_id] = dk_i_sum;'''
+                    if use_shared else
+                    f'''if (active && vj == 0u) {{
+                        atomic_fetch_add_explicit(
+                            (device atomic_float*)&dk[qk_base + i],
+                            dk_i_sum,
+                            memory_order_relaxed
+                        );
+                    }}'''
+                )}
             }}
+            {(
+                f'''threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+            for (int oi = (int)tid_in_tg; oi < {kdim}; oi += {tg_size}) {{
+                float total = 0.0f;
+                for (int s = 0; s < {n_simd}; s++) total += tg_vec[oi * {n_simd} + s];
+                atomic_fetch_add_explicit(
+                    (device atomic_float*)&dk[qk_base + oi],
+                    total,
+                    memory_order_relaxed
+                );
+            }}
+            threadgroup_barrier(metal::mem_flags::mem_threadgroup);'''
+                if use_shared else ""
+            )}
 
             // ---- (3) dS_decayed[i, j] = dS_t[i, j] + dkth[j] * k_i ----
             for (int i = 0; i < {kdim}; i++) {{
@@ -293,12 +379,26 @@ def _kda_backward_kernel(
             // dg[b, t, hv_idx, i] is the per-K dg write at this step.
             for (int i = 0; i < {kdim}; i++) {{
                 float contrib = active ? (dS[i] * S_prev[i]) : 0.0f;
-                float ddecay_i = simd_sum(contrib);
-                if (active && vj == 0u) {{
-                    dg[g_base + i] = ddecay_i * decay_arr[i];
-                }}
+                float ddecay_simd = simd_sum(contrib);
+                {(
+                    f'''if (lane == 0u) tg_vec[i * {n_simd} + simd_id] = ddecay_simd;'''
+                    if use_shared else
+                    f'''if (active && vj == 0u) {{
+                        dg[g_base + i] = ddecay_simd * decay_arr[i];
+                    }}'''
+                )}
                 dS[i] = dS[i] * decay_arr[i];
             }}
+            {(
+                f'''threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+            for (int oi = (int)tid_in_tg; oi < {kdim}; oi += {tg_size}) {{
+                float total = 0.0f;
+                for (int s = 0; s < {n_simd}; s++) total += tg_vec[oi * {n_simd} + s];
+                dg[g_base + oi] = total * decay_arr[oi];
+            }}
+            threadgroup_barrier(metal::mem_flags::mem_threadgroup);'''
+                if use_shared else ""
+            )}
         }}
     """
 
@@ -310,8 +410,8 @@ def _kda_backward_kernel(
         source=source,
     )
 
-    grid = (_SIMD_WIDTH * b * hv, 1, 1)
-    threadgroup = (_SIMD_WIDTH, 1, 1)
+    grid = (tg_size * b * hv, 1, 1)
+    threadgroup = (tg_size, 1, 1)
 
     dq_flat, dk_flat, dv_flat, dg_flat, dbeta_flat, _ = kernel(
         inputs=[q_f, k_f, v_f, g_f, beta_f, dy_f],
@@ -372,7 +472,7 @@ def _kda_apply_path_b_vjp(primals, cotangent, output):
         and g.shape == (*v.shape[:3], k.shape[-1])
         and beta.shape == v.shape[:3]
         and hv % h == 0
-        and vdim <= _SIMD_WIDTH
+        and vdim <= _SIMD_WIDTH * 8
     )
     if not bwd_ok:
         return _path_a_grad_fallback(primals, cotangent)
