@@ -172,11 +172,13 @@ class EngramV4Block(nn.Module):
             # itself (the current token — guaranteed in-doc).
             current_pos = mx.broadcast_to(mx.arange(S)[None, :, None], (B, S, max_n))
             clamped_pos = mx.where(same_doc, positions[None, :, :], current_pos)
-            # Gather token_ids at clamped positions: [B, S, max_n]
-            ngrams_per_b = []
-            for b_i in range(B):
-                ngrams_per_b.append(mx.take(token_ids[b_i], clamped_pos[b_i], axis=0))
-            return mx.stack(ngrams_per_b, axis=0)
+            # Gather token_ids at clamped positions: [B, S, max_n].
+            # Vectorized over batch via take_along_axis: tok_b expanded
+            # to [B, S*max_n] for fancy-indexing along axis=1 with the
+            # flattened clamped_pos.
+            flat_pos = clamped_pos.reshape(B, S * max_n)
+            ngrams_flat = mx.take_along_axis(token_ids, flat_pos, axis=1)
+            return ngrams_flat.reshape(B, S, max_n)
         # No doc_ids: simple gather (with the >=0 clamp).
         ngrams = token_ids[:, positions]
         return ngrams
