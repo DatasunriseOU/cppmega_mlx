@@ -350,10 +350,14 @@ def test_lowered_msl_reuses_hot_scalar_temporaries() -> None:
     fwd = dump_lowered_fwd_msl(batch=1, seq=4, heads=1, headdim=2, state=4)
     assert "float y_acc = " in fwd
     assert "thread float y_acc[1]" not in fwd
+    assert "gridThreadIdx [[thread_position_in_grid]]" in fwd
+    assert "blockIdx.x) * 256) + (((int)threadIdx.x)" not in fwd
     assert len(re.findall(r"float decay = exp\(", fwd)) == 1
     assert re.search(r"exp\([^;\n]+\) \* h_state", fwd) is None
-    assert len(re.findall(r"sig_z = .*exp\(", fwd)) == 2
-    assert "sig_z = exp(z_val)" in fwd
+    assert fwd.index("float D_h =") < fwd.index("for (int t =")
+    assert "if (0.000000e+00f <= z_val)" not in fwd
+    assert "sig_z = exp(z_val)" not in fwd
+    assert "1.000000e+00f + exp(" in fwd
     assert re.search(r"z_val \* \([^;\n]+exp\(", fwd) is None
 
     bwd = dump_lowered_bwd_msl(batch=1, seq=4, heads=1, headdim=2, state=4)
@@ -769,7 +773,7 @@ def test_fwd_path_c_matches_reference_fp32_small_shape() -> None:
 
 
 def test_fwd_path_c_stable_silu_handles_large_negative_gate() -> None:
-    """Path C emits a sign-split SiLU and avoids exp(-z) overflow in-kernel."""
+    """Path C follows Path B SiLU and remains finite for saturated gates."""
 
     _require_mamba3_path_c()
     inputs = list(_make_inputs(batch=1, seq=8, heads=2, headdim=4, state=4, dtype=mx.float32))

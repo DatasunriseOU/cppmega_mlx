@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Mamba3 Path C Forward Gap - 2026-05-18</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f8fb;
+      --panel: #fff;
+      --text: #17202a;
+      --muted: #667085;
+      --line: #d8dee8;
+      --good: #0f7a4f;
+      --bad: #b42318;
+      --warn: #93640f;
+      --navy: #1e3a5f;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.45;
+    }
+    header {
+      background: #fff;
+      border-bottom: 1px solid var(--line);
+      padding: 28px max(24px, calc((100vw - 1180px) / 2)) 22px;
+    }
+    main { max-width: 1180px; margin: 0 auto; padding: 24px; }
+    h1 { margin: 0 0 8px; font-size: 34px; line-height: 1.1; letter-spacing: 0; }
+    h2 { margin: 0; font-size: 20px; letter-spacing: 0; }
+    p { margin: 0; color: var(--muted); }
+    a { color: #0b5cad; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+    section {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      margin: 18px 0;
+      overflow: hidden;
+    }
+    .head {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: baseline;
+      padding: 16px 18px;
+      border-bottom: 1px solid var(--line);
+    }
+    .body { padding: 18px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+    .metric { border: 1px solid var(--line); border-radius: 8px; background: #fbfcfe; padding: 14px; }
+    .metric span { display: block; color: var(--muted); font-size: 12px; }
+    .metric strong { display: block; font-size: 24px; margin-top: 4px; }
+    .callout { border-left: 4px solid var(--navy); background: #f4f7fb; border-radius: 8px; padding: 13px 14px; color: #344054; }
+    .good { color: var(--good); font-weight: 700; }
+    .bad { color: var(--bad); font-weight: 700; }
+    .warn { color: var(--warn); font-weight: 700; }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; min-width: 980px; }
+    th, td { border-bottom: 1px solid var(--line); padding: 10px 12px; text-align: left; vertical-align: top; }
+    th { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0; background: #fbfcfe; }
+    td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+    ul { margin: 0; padding-left: 20px; }
+    li + li { margin-top: 6px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Mamba3 Path C Forward Gap</h1>
+    <p>Local Mac Studio receipt for B=1, T=2048, H=112, P=64, N=64. Path B is hand-written MSL via <code>mx.fast.metal_kernel</code>. Path C is TileLang DSL lowered through TVM/Metal and launched through the native MLX/TVM-FFI bridge.</p>
+  </header>
+  <main>
+    <section>
+      <div class="head"><h2>Conclusion</h2><p>2026-05-18</p></div>
+      <div class="body">
+        <div class="callout">
+          The forward regression is fixed for the BF16 1B-model shape: Path C forward moved from <span class="bad">1.29x slower</span> than Path B to <span class="good">0.84x of Path B</span>. The remaining default-training blocker is backward, not forward.
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="head"><h2>Forward Results</h2><p>median wall time, paired alternating samples</p></div>
+      <div class="body table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Stage</th>
+              <th>Dtype</th>
+              <th>Path B fwd</th>
+              <th>Path C fwd</th>
+              <th>C/B</th>
+              <th>Scheduler</th>
+              <th>Receipt</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Before this fix</td>
+              <td>bf16</td>
+              <td class="num">5.575 ms</td>
+              <td class="num">7.217 ms</td>
+              <td class="num bad">1.295</td>
+              <td><code>path_b</code></td>
+              <td><a href="mamba3_model_shape_path_b_vs_c_before_bwd_codegen_fix_2026-05-18.json">json</a></td>
+            </tr>
+            <tr>
+              <td>Sigmoid + D hoist only</td>
+              <td>bf16</td>
+              <td class="num">5.626 ms</td>
+              <td class="num">7.069 ms</td>
+              <td class="num bad">1.257</td>
+              <td><code>path_b</code></td>
+              <td><a href="mamba3_model_shape_path_b_vs_c_after_fwd_codegen_fix_bf16_2026-05-18.json">json</a></td>
+            </tr>
+            <tr>
+              <td>Grid lane intrinsic</td>
+              <td>bf16</td>
+              <td class="num">5.503 ms</td>
+              <td class="num">4.620 ms</td>
+              <td class="num good">0.839</td>
+              <td><code>path_c_fwd_path_b_bwd</code></td>
+              <td><a href="mamba3_model_shape_path_b_vs_c_after_grid_tid_bf16_2026-05-18.json">json</a> · <a href="mamba3_model_shape_path_b_vs_c_after_grid_tid_bf16_2026-05-18.metal">msl</a> · <a href="mamba3_model_shape_path_b_vs_c_after_grid_tid_bf16_2026-05-18.diff">diff</a></td>
+            </tr>
+            <tr>
+              <td>Grid lane intrinsic</td>
+              <td>fp32</td>
+              <td class="num">4.440 ms</td>
+              <td class="num">4.660 ms</td>
+              <td class="num warn">1.050</td>
+              <td><code>path_b</code></td>
+              <td><a href="mamba3_model_shape_path_b_vs_c_after_grid_tid_fp32_2026-05-18.json">json</a> · <a href="mamba3_model_shape_path_b_vs_c_after_grid_tid_fp32_2026-05-18.metal">msl</a> · <a href="mamba3_model_shape_path_b_vs_c_after_grid_tid_fp32_2026-05-18.diff">diff</a></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <div class="head"><h2>What Changed</h2><p>forward codegen/schedule</p></div>
+      <div class="body grid">
+        <div class="metric"><span>BF16 forward C/B</span><strong class="good">0.839</strong></div>
+        <div class="metric"><span>FP32 forward C/B</span><strong>1.050</strong></div>
+        <div class="metric"><span>BF16 fwd+bwd C/B</span><strong>1.063</strong></div>
+        <div class="metric"><span>BF16 Path C fwd+bwd peak</span><strong>11.49 GB</strong></div>
+      </div>
+      <div class="body">
+        <ul>
+          <li>Replaced the branchy generated forward sigmoid with the Path-B-equivalent single-expression SiLU.</li>
+          <li>Hoisted <code>D[h]</code> out of the time loop.</li>
+          <li>Changed forward lane id lowering to use <code>thread_position_in_grid</code>, removing the hot <code>blockIdx * THREADS + threadIdx</code> address arithmetic from Path C.</li>
+          <li>Reinstalled TileLang into <code>nanochat/.venv</code> with <code>--no-build-isolation</code> so the native MLX/TVM-FFI bridge is present in the benchmark environment.</li>
+        </ul>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

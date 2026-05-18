@@ -879,14 +879,17 @@ def _fwd_kernel_for(
         h_last: T.Tensor((BATCH, HEADS, HEADDIM, STATE), h_last_dtype),
     ):
         with T.Kernel(T.ceildiv(LANES, THREADS), threads=THREADS) as bx:
-            tid_in_block = T.get_thread_binding(0)
-            global_lane = bx * THREADS + tid_in_block
+            # Metal already exposes the absolute 1-D lane id. Use it directly
+            # so the lowered hot loop matches Path B and does not repeatedly
+            # carry blockIdx * THREADS + threadIdx address arithmetic.
+            global_lane = T.call_intrin("int32", "tir.metal.thread_position_in_grid_x")
             # Per-lane state lives in registers (size N).
             h_state = T.alloc_local((STATE,), accum_dtype)
             if global_lane < LANES:
                 p = global_lane % HEADDIM
                 h = (global_lane // HEADDIM) % HEADS
                 b = global_lane // (HEADDIM * HEADS)
+                D_h = T.cast(D[h], accum_dtype)
                 for n in T.serial(STATE):
                     h_state[n] = T.cast(h0[b, h, p, n], accum_dtype)
                 for t in T.serial(SEQ):
@@ -903,14 +906,8 @@ def _fwd_kernel_for(
                         )
                         h_state[n] = new_h
                         y_acc += new_h * T.cast(C[b, t, h, n], accum_dtype)
-                    D_h = T.cast(D[h], accum_dtype)
                     y_skipped = y_acc + D_h * x_val
-                    sig_z = T.alloc_var(T.float32, init=0.0)
-                    if z_val >= 0.0:
-                        sig_z = 1.0 / (1.0 + T.exp(-z_val))
-                    else:
-                        sig_z = T.exp(z_val)
-                        sig_z = sig_z / (1.0 + sig_z)
+                    sig_z = 1.0 / (1.0 + T.exp(-z_val))
                     y[b, t, h, p] = T.cast(z_val * sig_z * y_skipped, y_dtype)
                 for n in T.serial(STATE):
                     h_last[b, h, p, n] = T.cast(h_state[n], h_last_dtype)
@@ -2271,7 +2268,13 @@ def _mamba3_mimo_apply_with_state_path_c_fwd_path_b_bwd_vjp(
 # Path B's hand-written MSL against Path C's machine-emitted MSL without
 # having to re-run the lowering pipeline.
 def dump_lowered_fwd_msl(
-    *, batch: int, seq: int, heads: int, headdim: int, state: int
+    *,
+    batch: int,
+    seq: int,
+    heads: int,
+    headdim: int,
+    state: int,
+    dtype: str = "float32",
 ) -> str:
     """Return the raw lowered MSL for the Path C forward kernel.
 
@@ -2280,19 +2283,60 @@ def dump_lowered_fwd_msl(
     """
 
     kernel, lowering = _fwd_kernel_for(
-        batch, seq, heads, headdim, state, return_msl=True
+        batch,
+        seq,
+        heads,
+        headdim,
+        state,
+        dtype,
+        dtype,
+        dtype,
+        dtype,
+        dtype,
+        dtype,
+        dtype,
+        dtype,
+        dtype,
+        dtype,
+        return_msl=True,
     )
     del kernel
     return _source_with_reused_scalar_bindings(lowering)
 
 
 def dump_lowered_bwd_msl(
-    *, batch: int, seq: int, heads: int, headdim: int, state: int
+    *,
+    batch: int,
+    seq: int,
+    heads: int,
+    headdim: int,
+    state: int,
+    dtype: str = "float32",
 ) -> str:
     """Return the raw lowered MSL for the production Path C backward kernel."""
 
     kernel, lowering = _bwd_partial_kernel_for_state_snapshots(
-        batch, seq, heads, headdim, state
+        batch,
+        seq,
+        heads,
+        headdim,
+        state,
+        dtype,
+        dtype,
+        dtype,
+        dtype,
+        dtype,
+        dtype,
+        dtype,
+        dtype,
+        dtype,
+        dtype,
+        dtype,
+        dtype,
+        dtype,
+        dtype,
+        dtype,
+        dtype,
     )
     del kernel
     return _source_with_reused_scalar_bindings(lowering)

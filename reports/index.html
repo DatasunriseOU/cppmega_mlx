@@ -1,4 +1,286 @@
-<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>cppmega Reports</title><style>
-:root{color-scheme:light;--bg:#f5f7fa;--panel:#fff;--text:#17202a;--muted:#667085;--line:#d8dee8;--good:#0f7a4f;--bad:#b42318;--warn:#93640f;--navy:#1e3a5f}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;line-height:1.45}header{background:#fff;border-bottom:1px solid var(--line);padding:28px max(24px,calc((100vw - 1240px)/2)) 22px}main{max-width:1240px;margin:0 auto;padding:24px}h1{margin:0 0 8px;font-size:38px;letter-spacing:0;line-height:1.08}h2{margin:0;font-size:19px;letter-spacing:0}p{margin:0;color:var(--muted)}a{color:#0b5cad;text-decoration:none}a:hover{text-decoration:underline}code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}section{background:var(--panel);border:1px solid var(--line);border-radius:8px;margin:18px 0;overflow:hidden}.head{display:flex;justify-content:space-between;gap:16px;align-items:baseline;padding:16px 18px;border-bottom:1px solid var(--line)}.body{padding:18px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px}.metric{border:1px solid var(--line);border-radius:8px;background:#fbfcfe;padding:14px}.metric span{display:block;color:var(--muted);font-size:12px}.metric strong{display:block;font-size:24px;margin-top:4px}.callout{border-left:4px solid var(--navy);background:#f4f7fb;border-radius:8px;padding:13px 14px;color:#344054}.warn{border-left-color:var(--warn);background:#fff8e8}.good{color:var(--good);font-weight:700}.bad{color:var(--bad);font-weight:700}.table-wrap{overflow-x:auto}table{width:100%;border-collapse:collapse;min-width:980px}th,td{border-bottom:1px solid var(--line);padding:10px 11px;text-align:right;vertical-align:top;font-size:13px;white-space:nowrap}th:first-child,td:first-child{text-align:left}thead th{background:#f1f4f8;color:#475467;font-size:12px;text-transform:uppercase}tbody th{font-weight:700}.muted{color:var(--muted)}.pill{display:inline-block;border-radius:999px;padding:3px 8px;font-size:12px;font-weight:700}.ok{background:#e7f5ee;color:var(--good)}.no{background:#fde8e5;color:var(--bad)}ul{margin:0;padding-left:20px;color:#344054}li+li{margin-top:7px}
-</style></head><body><header><h1>cppmega Reports</h1><p>Training matrix and profiling artifacts generated from the 2026-05-17 Path B/C investigation.</p></header><main><section><div class="head"><h2>Main Reports</h2><p>All files are local to <code>/Users/dave/sources/cppmega.mlx/reports</code>.</p></div><div class="body"><div class="grid"><div class="metric"><span>Full Path B/C matrix</span><strong><a href="cppmega_1b_path_matrix.html">Matrix HTML</a></strong><p>42/42 cells: bf16/fp8 x 7 optimizers x Path B/Path C cold/Path C warm.</p></div><div class="metric"><span>Corrected venv 8-bit matrix</span><strong><a href="profiling/venv_fixed_8bit_matrix_2026-05-17.html">Venv Fixed HTML</a></strong><p>Fresh 20-step bf16/fp8 adam8bit/lion8bit Path B/Path C cold/warm after reinstalling local MLX/TileLang/TVM/tvm-ffi.</p></div><div class="metric"><span>Profiling and memory root cause</span><strong><a href="profiling/cppmega_path_profile_2026-05-17.html">Profiling HTML</a></strong><p>Historical Lion8bit baseline, bottleneck table, FP8 Path C memory before/after, vmmap evidence.</p></div><div class="metric"><span>MSL and xctrace comparison</span><strong><a href="profiling/path_b_vs_path_c_msl_profile_2026-05-17.html">MSL Profile HTML</a></strong><p>Path B hand MSL vs TileLang/TVM/tvm-ffi generated MSL, Time Profiler summaries, and M2RNN mixed-backward fix evidence.</p></div><div class="metric"><span>Full profiled matrix</span><strong><a href="profiling/cppmega_1b_profiled_matrix_2026-05-17.html">Profiled Matrix HTML</a></strong><p>All 42 cells with timing, MLX/Metal memory counters, dispatch counts, and receipt links.</p></div><div class="metric"><span>Cache delta profiler</span><strong><a href="profiling/path_c_cache_delta_profiler_2026-05-17.html">Cache HTML</a></strong><p>Allocator-cache explanation for retained MLX/Metal buffers.</p></div></div></div></section><section><div class="head"><h2>Key Numbers</h2><p>Parsed from current receipts.</p></div><div class="body"><div class="grid"><div class="metric"><span>FP8 Lion8bit Path B</span><strong>973.44 tok/s</strong></div><div class="metric"><span>BF16 Lion8bit Path B</span><strong>1011.43 tok/s</strong></div><div class="metric"><span>BF16 Adam8bit Path C warm</span><strong>678.10 tok/s</strong></div><div class="metric"><span>FP8 Adam8bit Path C peak</span><strong>52.76 GiB</strong></div></div></div></section></main></body></html>
+<!doctype html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>cppmega Reports</title>
+    <style>
+        :root {
+            color-scheme: light;
+            --bg: #f5f7fa;
+            --panel: #fff;
+            --text: #17202a;
+            --muted: #667085;
+            --line: #d8dee8;
+            --good: #0f7a4f;
+            --bad: #b42318;
+            --warn: #93640f;
+            --navy: #1e3a5f
+        }
+
+        * {
+            box-sizing: border-box
+        }
+
+        body {
+            margin: 0;
+            background: var(--bg);
+            color: var(--text);
+            font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            line-height: 1.45
+        }
+
+        header {
+            background: #fff;
+            border-bottom: 1px solid var(--line);
+            padding: 28px max(24px, calc((100vw - 1240px)/2)) 22px
+        }
+
+        main {
+            max-width: 1240px;
+            margin: 0 auto;
+            padding: 24px
+        }
+
+        h1 {
+            margin: 0 0 8px;
+            font-size: 38px;
+            letter-spacing: 0;
+            line-height: 1.08
+        }
+
+        h2 {
+            margin: 0;
+            font-size: 19px;
+            letter-spacing: 0
+        }
+
+        p {
+            margin: 0;
+            color: var(--muted)
+        }
+
+        a {
+            color: #0b5cad;
+            text-decoration: none
+        }
+
+        a:hover {
+            text-decoration: underline
+        }
+
+        code,
+        pre {
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            font-size: 12px
+        }
+
+        section {
+            background: var(--panel);
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            margin: 18px 0;
+            overflow: hidden
+        }
+
+        .head {
+            display: flex;
+            justify-content: space-between;
+            gap: 16px;
+            align-items: baseline;
+            padding: 16px 18px;
+            border-bottom: 1px solid var(--line)
+        }
+
+        .body {
+            padding: 18px
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 12px
+        }
+
+        .metric {
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            background: #fbfcfe;
+            padding: 14px
+        }
+
+        .metric span {
+            display: block;
+            color: var(--muted);
+            font-size: 12px
+        }
+
+        .metric strong {
+            display: block;
+            font-size: 24px;
+            margin-top: 4px
+        }
+
+        .callout {
+            border-left: 4px solid var(--navy);
+            background: #f4f7fb;
+            border-radius: 8px;
+            padding: 13px 14px;
+            color: #344054
+        }
+
+        .warn {
+            border-left-color: var(--warn);
+            background: #fff8e8
+        }
+
+        .good {
+            color: var(--good);
+            font-weight: 700
+        }
+
+        .bad {
+            color: var(--bad);
+            font-weight: 700
+        }
+
+        .table-wrap {
+            overflow-x: auto
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            min-width: 980px
+        }
+
+        th,
+        td {
+            border-bottom: 1px solid var(--line);
+            padding: 10px 11px;
+            text-align: right;
+            vertical-align: top;
+            font-size: 13px;
+            white-space: nowrap
+        }
+
+        th:first-child,
+        td:first-child {
+            text-align: left
+        }
+
+        thead th {
+            background: #f1f4f8;
+            color: #475467;
+            font-size: 12px;
+            text-transform: uppercase
+        }
+
+        tbody th {
+            font-weight: 700
+        }
+
+        .muted {
+            color: var(--muted)
+        }
+
+        .pill {
+            display: inline-block;
+            border-radius: 999px;
+            padding: 3px 8px;
+            font-size: 12px;
+            font-weight: 700
+        }
+
+        .ok {
+            background: #e7f5ee;
+            color: var(--good)
+        }
+
+        .no {
+            background: #fde8e5;
+            color: var(--bad)
+        }
+
+        ul {
+            margin: 0;
+            padding-left: 20px;
+            color: #344054
+        }
+
+        li+li {
+            margin-top: 7px
+        }
+    </style>
+</head>
+
+<body>
+    <header>
+        <h1>cppmega Reports</h1>
+        <p>Training matrix and profiling artifacts generated from the 2026-05-17 Path B/C investigation.</p>
+    </header>
+    <main>
+        <section>
+            <div class="head">
+                <h2>Main Reports</h2>
+                <p>All files are local to <code>/Users/dave/sources/cppmega.mlx/reports</code>.</p>
+            </div>
+            <div class="body">
+                <div class="grid">
+                    <div class="metric"><span>Full Path B/C matrix</span><strong><a
+                                href="cppmega_1b_path_matrix.html">Matrix HTML</a></strong>
+                        <p>42/42 cells: bf16/fp8 x 7 optimizers x Path B/Path C cold/Path C warm.</p>
+                    </div>
+                    <div class="metric"><span>Corrected venv 8-bit matrix</span><strong><a
+                                href="profiling/venv_fixed_8bit_matrix_2026-05-17.html">Venv Fixed HTML</a></strong>
+                        <p>Fresh 20-step bf16/fp8 adam8bit/lion8bit Path B/Path C cold/warm after reinstalling local
+                            MLX/TileLang/TVM/tvm-ffi.</p>
+                    </div>
+                    <div class="metric"><span>Profiling and memory root cause</span><strong><a
+                                href="profiling/cppmega_path_profile_2026-05-17.html">Profiling HTML</a></strong>
+                        <p>Historical Lion8bit baseline, bottleneck table, FP8 Path C memory before/after, vmmap
+                            evidence.</p>
+                    </div>
+                    <div class="metric"><span>MSL and xctrace comparison</span><strong><a
+                                href="profiling/path_b_vs_path_c_msl_profile_2026-05-17.html">MSL Profile
+                                HTML</a></strong>
+                        <p>Path B hand MSL vs TileLang/TVM/tvm-ffi generated MSL, Time Profiler summaries, and M2RNN
+                            mixed-backward fix evidence.</p>
+                    </div>
+                    <div class="metric"><span>Mamba3 Path C forward gap</span><strong><a
+                                href="profiling/mamba3_path_c_forward_gap_2026-05-18.html">Mamba3 Forward
+                                HTML</a></strong>
+                        <p>1B-shape BF16/FP32 Path B vs Path C forward timings after the grid-lane codegen fix, with
+                            JSON/MSL/diff receipts.</p>
+                    </div>
+                    <div class="metric"><span>Full profiled matrix</span><strong><a
+                                href="profiling/cppmega_1b_profiled_matrix_2026-05-17.html">Profiled Matrix
+                                HTML</a></strong>
+                        <p>All 42 cells with timing, MLX/Metal memory counters, dispatch counts, and receipt links.</p>
+                    </div>
+                    <div class="metric"><span>Cache delta profiler</span><strong><a
+                                href="profiling/path_c_cache_delta_profiler_2026-05-17.html">Cache HTML</a></strong>
+                        <p>Allocator-cache explanation for retained MLX/Metal buffers.</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+        <section>
+            <div class="head">
+                <h2>Key Numbers</h2>
+                <p>Parsed from current receipts.</p>
+            </div>
+            <div class="body">
+                <div class="grid">
+                    <div class="metric"><span>FP8 Lion8bit Path B</span><strong>973.44 tok/s</strong></div>
+                    <div class="metric"><span>BF16 Lion8bit Path B</span><strong>1011.43 tok/s</strong></div>
+                    <div class="metric"><span>BF16 Adam8bit Path C warm</span><strong>678.10 tok/s</strong></div>
+                    <div class="metric"><span>FP8 Adam8bit Path C peak</span><strong>52.76 GiB</strong></div>
+                </div>
+            </div>
+        </section>
+    </main>
+</body>
+
+</html>

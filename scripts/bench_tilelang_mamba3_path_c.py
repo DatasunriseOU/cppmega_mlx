@@ -627,11 +627,11 @@ def main() -> int:
         # Dump the lowered MSL for the bench shape.
         lowered_fwd = dump_lowered_fwd_msl(
             batch=args.batch, seq=args.seq, heads=args.heads,
-            headdim=args.headdim, state=args.state,
+            headdim=args.headdim, state=args.state, dtype=args.dtype,
         )
         lowered_bwd = dump_lowered_bwd_msl(
             batch=args.batch, seq=args.seq, heads=args.heads,
-            headdim=args.headdim, state=args.state,
+            headdim=args.headdim, state=args.state, dtype=args.dtype,
         )
         args.msl_dump.parent.mkdir(parents=True, exist_ok=True)
         combined = (
