@@ -49,7 +49,7 @@ def test_bench_1b_matrix_plan_covers_dtype_optimizer_path_cells(
     assert by_case["bf16_adamw_path_c_cold"].env["CPPMEGA_KERNEL_PATH"] == "path_c"
     assert by_case["bf16_adamw_path_c_cold"].env["CPPMEGA_KERNEL_PATH__MAMBA3_MIMO"] == "path_c"
     assert by_case["bf16_adamw_path_c_cold"].env["CPPMEGA_KERNEL_PATH__M2RNN"] == "path_c"
-    assert by_case["bf16_adamw_path_c_cold"].env["CPPMEGA_MAMBA3_PATH_C_BWD"] == "path_c"
+    assert by_case["bf16_adamw_path_c_cold"].env["CPPMEGA_MAMBA3_PATH_C_BWD"] == "path_b"
     assert by_case["bf16_adamw_path_c_cold"].cache_mode == "cold"
     assert by_case["bf16_adamw_path_c_warm"].cache_mode == "warm"
     assert "--seq-len" in by_case["bf16_adamw_path_b"].command
@@ -65,6 +65,26 @@ def test_bench_1b_matrix_plan_covers_dtype_optimizer_path_cells(
     assert by_case["fp8_adamw_path_b"].env["CPPMEGA_KERNEL_PATH"] == "path_b"
     assert by_case["fp8_adamw_path_b"].env["CPPMEGA_KERNEL_PATH__SPARSE_MLA"] == "path_b"
     assert by_case["fp8_adamw_path_c_warm"].env["CPPMEGA_SPARSE_MLA_FP8_ROUTE"] == "path_c"
+
+
+def test_bench_1b_matrix_can_explicitly_force_full_mamba3_path_c_bwd(
+    tmp_path: Path,
+) -> None:
+    args = _args(
+        tmp_path,
+        "--dtypes",
+        "bf16",
+        "--optimizers",
+        "adamw",
+        "--paths",
+        "path_c_warm",
+        "--mamba3-bwd",
+        "path_c",
+    )
+    cell = matrix.build_cells(args)[0]
+
+    assert cell.env["CPPMEGA_KERNEL_PATH__MAMBA3_MIMO"] == "path_c"
+    assert cell.env["CPPMEGA_MAMBA3_PATH_C_BWD"] == "path_c"
 
 
 def test_bench_1b_matrix_dry_run_writes_markdown_csv_and_json(
@@ -106,6 +126,7 @@ def test_bench_1b_matrix_dry_run_writes_markdown_csv_and_json(
     payload = json.loads((tmp_path / "matrix.json").read_text(encoding="utf-8"))
     assert payload["scope"] == "cppmega_1b_path_matrix"
     assert payload["config"]["block_size"] == 2048
+    assert payload["config"]["mamba3_bwd"] == "path_b"
 
 
 def test_bench_1b_matrix_extracts_m04_receipt_metrics(

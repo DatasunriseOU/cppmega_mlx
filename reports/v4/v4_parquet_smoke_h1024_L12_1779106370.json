@@ -1,0 +1,36 @@
+{
+  "template_name": "v4_smoke_h1024_L12",
+  "hidden_size": 1024,
+  "layers": 12,
+  "seq_len": 256,
+  "batch_size": 1,
+  "steps": 3,
+  "parquet_path": "/Volumes/external/sources/cppmega.mlx/data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet",
+  "fwd_median_ms": 59.37258299672976,
+  "bwd_median_ms": 27.799417002825066,
+  "total_median_ms": 90.63329198397696,
+  "tokens_per_sec": 2824.569144473514,
+  "per_step": [
+    {
+      "step": 0,
+      "fwd_ms": 96.77291702246293,
+      "bwd_ms": 7.3932919767685235,
+      "total_ms": 104.16620899923146,
+      "loss": 11.183396339416504
+    },
+    {
+      "step": 1,
+      "fwd_ms": 56.313292006962,
+      "bwd_ms": 34.31999997701496,
+      "total_ms": 90.63329198397696,
+      "loss": 11.018841743469238
+    },
+    {
+      "step": 2,
+      "fwd_ms": 59.37258299672976,
+      "bwd_ms": 27.799417002825066,
+      "total_ms": 87.17199999955483,
+      "loss": 10.956659317016602
+    }
+  ]
+}

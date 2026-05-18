@@ -178,6 +178,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dtypes", default=",".join(DTYPE_CHOICES))
     parser.add_argument("--optimizers", default=",".join(OPTIMIZER_CHOICES))
     parser.add_argument("--paths", default=",".join(PATH_CHOICES))
+    parser.add_argument(
+        "--mamba3-bwd",
+        choices=("path_b", "path_c"),
+        default="path_b",
+        help=(
+            "Backward route for Mamba3 inside Path C cells. The default keeps "
+            "the performance-safe Path C forward + Path B backward route; use "
+            "--mamba3-bwd path_c only for an explicit full-Path-C experiment."
+        ),
+    )
     parser.add_argument("--fresh-process", action="store_true", default=False)
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
     parser.add_argument("--csv", type=Path, default=DEFAULT_CSV)
@@ -231,6 +241,7 @@ def path_env_and_support(
     dtype: str,
     path: str,
     cache_dir: Path,
+    mamba3_bwd: str,
 ) -> tuple[dict[str, str], bool, str | None, str, Path | None]:
     if dtype == "fp8" and path == "path_b":
         return (
@@ -265,7 +276,7 @@ def path_env_and_support(
             "CPPMEGA_KERNEL_PATH__MAMBA3_MIMO": "path_c",
             "CPPMEGA_KERNEL_PATH__M2RNN": "path_c",
             "CPPMEGA_KERNEL_PATH__SPARSE_MLA": "path_c",
-            MAMBA3_PATH_C_BWD_ENV: "path_c",
+            MAMBA3_PATH_C_BWD_ENV: mamba3_bwd,
         }
         if dtype == "fp8":
             env[SPARSE_MLA_FP8_ROUTE_ENV] = "path_c"
@@ -276,7 +287,7 @@ def path_env_and_support(
             "CPPMEGA_KERNEL_PATH__MAMBA3_MIMO": "path_c",
             "CPPMEGA_KERNEL_PATH__M2RNN": "path_c",
             "CPPMEGA_KERNEL_PATH__SPARSE_MLA": "path_c",
-            MAMBA3_PATH_C_BWD_ENV: "path_c",
+            MAMBA3_PATH_C_BWD_ENV: mamba3_bwd,
         }
         if dtype == "fp8":
             env[SPARSE_MLA_FP8_ROUTE_ENV] = "path_c"
@@ -301,6 +312,7 @@ def build_cell(
         dtype=dtype,
         path=path,
         cache_dir=cache_dir,
+        mamba3_bwd=args.mamba3_bwd,
     )
     if not path_supported:
         supported = False
@@ -858,6 +870,7 @@ def main(argv: list[str] | None = None) -> int:
                 "dtypes": list(parse_csv_list(args.dtypes, DTYPE_CHOICES)),
                 "optimizers": list(parse_csv_list(args.optimizers, OPTIMIZER_CHOICES)),
                 "paths": list(parse_csv_list(args.paths, PATH_CHOICES)),
+                "mamba3_bwd": args.mamba3_bwd,
                 "fresh_process": bool(args.fresh_process),
                 "dry_run": bool(args.dry_run),
                 "reuse_existing_ok": bool(args.reuse_existing_ok),

@@ -550,7 +550,7 @@ def render_route_legend() -> str:
           </div>
           <div class="route-card">
             <h3>BF16 Path C</h3>
-            <p>Runs <code>--dtype bfloat16</code> with <code>CPPMEGA_KERNEL_PATH=path_c</code> and <code>CPPMEGA_MAMBA3_PATH_C_BWD=path_c</code>. Mamba3, M2RNN, and Sparse-MLA are all requested through Path C; no Path B backward fallback is allowed in these cells.</p>
+            <p>Runs <code>--dtype bfloat16</code> with <code>CPPMEGA_KERNEL_PATH=path_c</code>. The default matrix keeps Mamba3 on Path C forward plus Path B backward via <code>--mamba3-bwd path_b</code>; pass <code>--mamba3-bwd path_c</code> only for an explicit full-Path-C experiment.</p>
           </div>
           <div class="route-card">
             <h3>FP8 Path B</h3>
@@ -558,7 +558,7 @@ def render_route_legend() -> str:
           </div>
           <div class="route-card">
             <h3>FP8 Path C</h3>
-            <p>Runs <code>--dtype fp8_path_c</code>, <code>CPPMEGA_SPARSE_MLA_FP8_ROUTE=path_c</code>, and the same Mamba3 Path C forward + Path B backward training policy. Sparse-MLA consumes prepared <code>q_fp8/q_scale/kv_fp8/kv_scale</code> buffers through the TileLang/tvm-ffi route.</p>
+            <p>Runs <code>--dtype fp8_path_c</code>, <code>CPPMEGA_SPARSE_MLA_FP8_ROUTE=path_c</code>, and the selected Mamba3 backward policy from the matrix command. Sparse-MLA consumes prepared <code>q_fp8/q_scale/kv_fp8/kv_scale</code> buffers through the TileLang/tvm-ffi route.</p>
           </div>
         </div>
       </section>

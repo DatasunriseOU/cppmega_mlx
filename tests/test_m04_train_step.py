@@ -114,7 +114,7 @@ def test_fp8_path_policies_set_explicit_runtime_routes(
     with m04_train_step.fp8_path_c_kernel_policy(path_c_args):
         assert os.environ["CPPMEGA_KERNEL_PATH__SPARSE_MLA"] == "path_c"
         assert os.environ["CPPMEGA_SPARSE_MLA_FP8_ROUTE"] == "path_c"
-        assert os.environ["CPPMEGA_MAMBA3_PATH_C_BWD"] == "path_c"
+        assert os.environ["CPPMEGA_MAMBA3_PATH_C_BWD"] == "path_b"
     assert "CPPMEGA_SPARSE_MLA_FP8_ROUTE" not in os.environ
     assert "CPPMEGA_MAMBA3_PATH_C_BWD" not in os.environ
 
@@ -1191,7 +1191,9 @@ def test_fp8_path_c_training_dtype_route_blocks_missing_sparse_mla_producer(
         surface["name"]: surface for surface in route["available_path_c_surfaces"]
     }
     assert surfaces["matmul_tl_fp8_scaled_matmul"]["kernel_surface_available"] is True
-    assert surfaces["mamba3_mimo_path_c"]["training_surface"] is True
+    assert surfaces["mamba3_mimo_path_c"]["training_surface"] is False
+    assert surfaces["mamba3_mimo_path_c"]["full_path_c_backward_available"] is True
+    assert surfaces["mamba3_mimo_path_c"]["default_backward_route"] == "path_b"
     assert surfaces["mamba3_mimo_path_c"]["fp8_route_auto_selected"] is True
     assert surfaces["m2rnn_path_c"]["training_surface"] is True
     assert surfaces["m2rnn_path_c"]["fallback_to_path_b_allowed"] is False

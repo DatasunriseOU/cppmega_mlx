@@ -161,7 +161,7 @@ SPARSE_MLA_FP8_ROUTE_ENV = "CPPMEGA_SPARSE_MLA_FP8_ROUTE"
 MAMBA3_PATH_C_BWD_ENV = "CPPMEGA_MAMBA3_PATH_C_BWD"
 FP8_PATH_C_RUNTIME_ENV: dict[str, str] = {
     SPARSE_MLA_FP8_ROUTE_ENV: "path_c",
-    MAMBA3_PATH_C_BWD_ENV: "path_c",
+    MAMBA3_PATH_C_BWD_ENV: "path_b",
 }
 FP8_PATH_B_RUNTIME_ENV: dict[str, str] = {SPARSE_MLA_FP8_ROUTE_ENV: "path_b"}
 FP8_PATH_C_SPLIT_GRAD_UPDATE_EVAL_REASON = (
@@ -1061,10 +1061,13 @@ def fp8_path_c_training_route_payload(
                 "fp8_route_auto_selected": True,
                 "fp8_route_reason": (
                     "Path C now uses direct tvm-ffi owner-output for contiguous "
-                    "selective-scan buffers, including Path C backward, and "
-                    "matches Path B dispatch geometry on that explicit boundary"
+                    "selective-scan forward buffers and keeps the performance-safe "
+                    "Path B backward route until full Path C backward wins the "
+                    "1B training matrix"
                 ),
-                "training_surface": True,
+                "training_surface": False,
+                "full_path_c_backward_available": True,
+                "default_backward_route": "path_b",
             },
             {
                 "name": "m2rnn_path_c",
