@@ -47,7 +47,9 @@ def test_bench_1b_matrix_plan_covers_dtype_optimizer_path_cells(
     assert by_case["bf16_adamw_path_b"].env["CPPMEGA_KERNEL_PATH__MAMBA3_MIMO"] == "path_b"
     assert by_case["bf16_adamw_path_b"].env["CPPMEGA_KERNEL_PATH__M2RNN"] == "path_b"
     assert by_case["bf16_adamw_path_c_cold"].env["CPPMEGA_KERNEL_PATH"] == "path_c"
-    assert by_case["bf16_adamw_path_c_cold"].env["CPPMEGA_MAMBA3_PATH_C_BWD"] == "path_b"
+    assert by_case["bf16_adamw_path_c_cold"].env["CPPMEGA_KERNEL_PATH__MAMBA3_MIMO"] == "path_c"
+    assert by_case["bf16_adamw_path_c_cold"].env["CPPMEGA_KERNEL_PATH__M2RNN"] == "path_c"
+    assert by_case["bf16_adamw_path_c_cold"].env["CPPMEGA_MAMBA3_PATH_C_BWD"] == "path_c"
     assert by_case["bf16_adamw_path_c_cold"].cache_mode == "cold"
     assert by_case["bf16_adamw_path_c_warm"].cache_mode == "warm"
     assert "--seq-len" in by_case["bf16_adamw_path_b"].command

@@ -50,3 +50,6 @@ reports/*/*/*.json
 reports/profiling/xctrace_*.xml
 reports/profiling/xctrace_*.json
 reports/profiling/*.json
+reports/v4/m*
+docs/tilelang_ports/mamba3_path_b_vs_c.diff
+docs/tilelang_ports/mamba3_path_c_lowered.metal

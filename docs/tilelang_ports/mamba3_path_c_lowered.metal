@@ -1,5 +1,5 @@
 // === Path C (TileLang DSL) lowered MSL ===
-// Bench shape: B=2 T=512 H=4 P=32 N=64
+// Bench shape: B=1 T=2048 H=112 P=64 N=64
 
 // ---- Forward ----
 // Function: fwd_kernel
@@ -177,24 +177,27 @@ struct AllReduceSimdgroupCross {
     }
     for (int i = 0; i < batch_size; ++i) {
       if (lane == 0) {
-        red_buf[simdgroup_id + i * workspace_stride] = x[i];
+        const int batch_offset = i * workspace_stride;
+        red_buf[simdgroup_id + batch_offset] = x[i];
       }
     }
     Barrier::template sync<1>();
     if (simdgroup_id == 0) {
       for (int i = 0; i < batch_size; ++i) {
+        const int batch_offset = i * workspace_stride;
         T result = lane < uint(simdgroup_count)
-                       ? red_buf[lane + i * workspace_stride]
-                       : red_buf[i * workspace_stride];
+                       ? red_buf[lane + batch_offset]
+                       : red_buf[batch_offset];
         result = reduce_partials(result, lane);
         if (lane == 0) {
-          red_buf[final_slot + i * workspace_stride] = result;
+          red_buf[final_slot + batch_offset] = result;
         }
       }
     }
     Barrier::template sync<2>();
     for (int i = 0; i < batch_size; ++i) {
-      x[i] = red_buf[final_slot + i * workspace_stride];
+      const int batch_offset = i * workspace_stride;
+      x[i] = red_buf[final_slot + batch_offset];
     }
   }
   template <typename T>
@@ -209,24 +212,27 @@ struct AllReduceSimdgroupCross {
     }
     for (int i = 0; i < batch_size; ++i) {
       if (lane == 0) {
-        red_buf[simdgroup_id + i * workspace_stride] = x[i];
+        const int batch_offset = i * workspace_stride;
+        red_buf[simdgroup_id + batch_offset] = x[i];
       }
     }
     Barrier::template sync<1>();
     if (simdgroup_id == 0) {
       for (int i = 0; i < batch_size; ++i) {
+        const int batch_offset = i * workspace_stride;
         T result = lane < uint(simdgroup_count)
-                       ? red_buf[lane + i * workspace_stride]
-                       : red_buf[i * workspace_stride];
+                       ? red_buf[lane + batch_offset]
+                       : red_buf[batch_offset];
         result = reduce_partials(result, lane);
         if (lane == 0) {
-          red_buf[final_slot + i * workspace_stride] = result;
+          red_buf[final_slot + batch_offset] = result;
         }
       }
     }
     Barrier::template sync<2>();
     for (int i = 0; i < batch_size; ++i) {
-      x[i] = red_buf[final_slot + i * workspace_stride];
+      const int batch_offset = i * workspace_stride;
+      x[i] = red_buf[final_slot + batch_offset];
     }
   }
 };
@@ -278,12 +284,13 @@ struct AllReduceStep<Reducer, threads, scale, thread_offset, Barrier,
     if (offset >= 32) {
       Barrier::template sync<1>();
       for (int i = 0; i < batch_size; ++i) {
-        red_buf[local_tid + i * workspace_stride] = x[i];
+        const int batch_offset = i * workspace_stride;
+        red_buf[local_tid + batch_offset] = x[i];
       }
       Barrier::template sync<2>();
       for (int i = 0; i < batch_size; ++i) {
-        x[i] = Reducer()(x[i], red_buf[(local_tid ^ offset) +
-                                      i * workspace_stride]);
+        const int batch_offset = i * workspace_stride;
+        x[i] = Reducer()(x[i], red_buf[(local_tid ^ offset) + batch_offset]);
       }
     } else {
       for (int i = 0; i < batch_size; ++i) {
@@ -302,12 +309,13 @@ struct AllReduceStep<Reducer, threads, scale, thread_offset, Barrier,
     if (offset >= 32) {
       Barrier::template sync<1>();
       for (int i = 0; i < batch_size; ++i) {
-        red_buf[local_tid + i * workspace_stride] = x[i];
+        const int batch_offset = i * workspace_stride;
+        red_buf[local_tid + batch_offset] = x[i];
       }
       Barrier::template sync<2>();
       for (int i = 0; i < batch_size; ++i) {
-        x[i] = Reducer()(x[i], red_buf[(local_tid ^ offset) +
-                                      i * workspace_stride]);
+        const int batch_offset = i * workspace_stride;
+        x[i] = Reducer()(x[i], red_buf[(local_tid ^ offset) + batch_offset]);
       }
     } else {
       for (int i = 0; i < batch_size; ++i) {
@@ -378,46 +386,49 @@ kernel void fwd_kernel(  device float* A [[ buffer(0) ]],
   device float* y [[ buffer(8) ]],
   device float* z [[ buffer(9) ]],
   uint3 blockIdx [[threadgroup_position_in_grid]],
-  uint3 threadIdx [[thread_position_in_threadgroup]]
+  uint3 threadIdx [[thread_position_in_threadgroup]],
+  uint3 gridThreadIdx [[thread_position_in_grid]]
 ) {
+  int grid_tid = gridThreadIdx.x;
   thread float h_state[64];
+  float decay = 0.000000e+00f;
   float y_acc = 0.000000e+00f;
-  int cse_v3 = (((int)threadIdx.x) * 64);
+  int cse_v1 = (gridThreadIdx.x / 64);
+  float D_h = D[cse_v1];
+  int cse_v2 = (gridThreadIdx.x * 64);
   for (int n = 0; n < 64; ++n) {
-    h_state[n] = h0[(cse_v3 + n)];
+    h_state[n] = h0[(cse_v2 + n)];
   }
-  for (int t = 0; t < 512; ++t) {
-    int cse_v1 = (((int)threadIdx.x) & 127);
-    int cse_v2 = (((int)threadIdx.x) >> 7);
-    int cse_v4 = (cse_v1 >> 5);
-    int cse_v6 = (((cse_v2 * 2048) + (t * 4)) + cse_v4);
-    float A_val = A[cse_v6];
-    float dt_val = dt[cse_v6];
-    float cse_v2_1 = (A_val * dt_val);
-    float decay = exp(cse_v2_1);
-    int cse_v5 = (((cse_v2 * 65536) + (t * 128)) + cse_v1);
+  for (int t = 0; t < 2048; ++t) {
+    int cse_v4 = ((t * 112) + cse_v1);
+    float A_val = A[cse_v4];
+    float dt_val = dt[cse_v4];
+    decay = exp((A_val * dt_val));
+    int cse_v3 = (t * 7168);
+    int cse_v5 = (cse_v3 + gridThreadIdx.x);
     float x_val = x[cse_v5];
     float z_val = z[cse_v5];
     y_acc = 0.000000e+00f;
     for (int n_1 = 0; n_1 < 64; ++n_1) {
-      int cse_v7 = ((((cse_v2 * 131072) + (t * 256)) + (cse_v4 * 64)) + n_1);
-      float new_h = ((decay * h_state[n_1]) + (x_val * B[cse_v7]));
+      int cse_v6 = ((cse_v3 + (cse_v1 * 64)) + n_1);
+      float B_val = B[cse_v6];
+      float C_val = C[cse_v6];
+      float new_h = ((decay * h_state[n_1]) + (x_val * B_val));
       h_state[n_1] = new_h;
-      y_acc = (y_acc + (new_h * C[cse_v7]));
+      y_acc = (y_acc + (new_h * C_val));
     }
-    float D_h = D[cse_v4];
     float y_skipped = (y_acc + (D_h * x_val));
     float cse_v1_1 = (z_val * -1.000000e+00f);
-    float sig_z = (1.000000e+00f / (1.000000e+00f + exp(cse_v1_1)));
-    y[cse_v5] = ((z_val * sig_z) * y_skipped);
+    float cse_v1_2 = (1.000000e+00f / (1.000000e+00f + exp(cse_v1_1)));
+    y[cse_v5] = ((z_val * cse_v1_2) * y_skipped);
   }
   for (int n_2 = 0; n_2 < 64; ++n_2) {
-    h_last[(cse_v3 + n_2)] = h_state[n_2];
+    h_last[(cse_v2 + n_2)] = h_state[n_2];
   }
 }
 
 // ---- Backward ----
-// Function: bwd_simd_kernel
+// Function: bwd_partial_kernel
 #include <metal_stdlib>
 #include <metal_simdgroup>
 using namespace metal;
@@ -592,24 +603,27 @@ struct AllReduceSimdgroupCross {
     }
     for (int i = 0; i < batch_size; ++i) {
       if (lane == 0) {
-        red_buf[simdgroup_id + i * workspace_stride] = x[i];
+        const int batch_offset = i * workspace_stride;
+        red_buf[simdgroup_id + batch_offset] = x[i];
       }
     }
     Barrier::template sync<1>();
     if (simdgroup_id == 0) {
       for (int i = 0; i < batch_size; ++i) {
+        const int batch_offset = i * workspace_stride;
         T result = lane < uint(simdgroup_count)
-                       ? red_buf[lane + i * workspace_stride]
-                       : red_buf[i * workspace_stride];
+                       ? red_buf[lane + batch_offset]
+                       : red_buf[batch_offset];
         result = reduce_partials(result, lane);
         if (lane == 0) {
-          red_buf[final_slot + i * workspace_stride] = result;
+          red_buf[final_slot + batch_offset] = result;
         }
       }
     }
     Barrier::template sync<2>();
     for (int i = 0; i < batch_size; ++i) {
-      x[i] = red_buf[final_slot + i * workspace_stride];
+      const int batch_offset = i * workspace_stride;
+      x[i] = red_buf[final_slot + batch_offset];
     }
   }
   template <typename T>
@@ -624,24 +638,27 @@ struct AllReduceSimdgroupCross {
     }
     for (int i = 0; i < batch_size; ++i) {
       if (lane == 0) {
-        red_buf[simdgroup_id + i * workspace_stride] = x[i];
+        const int batch_offset = i * workspace_stride;
+        red_buf[simdgroup_id + batch_offset] = x[i];
       }
     }
     Barrier::template sync<1>();
     if (simdgroup_id == 0) {
       for (int i = 0; i < batch_size; ++i) {
+        const int batch_offset = i * workspace_stride;
         T result = lane < uint(simdgroup_count)
-                       ? red_buf[lane + i * workspace_stride]
-                       : red_buf[i * workspace_stride];
+                       ? red_buf[lane + batch_offset]
+                       : red_buf[batch_offset];
         result = reduce_partials(result, lane);
         if (lane == 0) {
-          red_buf[final_slot + i * workspace_stride] = result;
+          red_buf[final_slot + batch_offset] = result;
         }
       }
     }
     Barrier::template sync<2>();
     for (int i = 0; i < batch_size; ++i) {
-      x[i] = red_buf[final_slot + i * workspace_stride];
+      const int batch_offset = i * workspace_stride;
+      x[i] = red_buf[final_slot + batch_offset];
     }
   }
 };
@@ -693,12 +710,13 @@ struct AllReduceStep<Reducer, threads, scale, thread_offset, Barrier,
     if (offset >= 32) {
       Barrier::template sync<1>();
       for (int i = 0; i < batch_size; ++i) {
-        red_buf[local_tid + i * workspace_stride] = x[i];
+        const int batch_offset = i * workspace_stride;
+        red_buf[local_tid + batch_offset] = x[i];
       }
       Barrier::template sync<2>();
       for (int i = 0; i < batch_size; ++i) {
-        x[i] = Reducer()(x[i], red_buf[(local_tid ^ offset) +
-                                      i * workspace_stride]);
+        const int batch_offset = i * workspace_stride;
+        x[i] = Reducer()(x[i], red_buf[(local_tid ^ offset) + batch_offset]);
       }
     } else {
       for (int i = 0; i < batch_size; ++i) {
@@ -717,12 +735,13 @@ struct AllReduceStep<Reducer, threads, scale, thread_offset, Barrier,
     if (offset >= 32) {
       Barrier::template sync<1>();
       for (int i = 0; i < batch_size; ++i) {
-        red_buf[local_tid + i * workspace_stride] = x[i];
+        const int batch_offset = i * workspace_stride;
+        red_buf[local_tid + batch_offset] = x[i];
       }
       Barrier::template sync<2>();
       for (int i = 0; i < batch_size; ++i) {
-        x[i] = Reducer()(x[i], red_buf[(local_tid ^ offset) +
-                                      i * workspace_stride]);
+        const int batch_offset = i * workspace_stride;
+        x[i] = Reducer()(x[i], red_buf[(local_tid ^ offset) + batch_offset]);
       }
     } else {
       for (int i = 0; i < batch_size; ++i) {
@@ -782,141 +801,145 @@ struct AllReduce {
   }
 };
 } /* namespace tl */
-kernel void bwd_simd_kernel(  device float* A [[ buffer(0) ]],
+kernel void bwd_partial_kernel(  device float* A [[ buffer(0) ]],
   device float* B [[ buffer(1) ]],
   device float* C [[ buffer(2) ]],
   device float* D [[ buffer(3) ]],
-  device float* dA [[ buffer(4) ]],
-  device float* dB [[ buffer(5) ]],
-  device float* dC [[ buffer(6) ]],
-  device float* dD_batch [[ buffer(7) ]],
-  device float* ddt [[ buffer(8) ]],
+  device float* dA_partial [[ buffer(4) ]],
+  device float* dB_partial [[ buffer(5) ]],
+  device float* dC_partial [[ buffer(6) ]],
+  device float* dD_partial [[ buffer(7) ]],
+  device float* ddt_partial [[ buffer(8) ]],
   device float* dh0 [[ buffer(9) ]],
   device float* dt [[ buffer(10) ]],
   device float* dx [[ buffer(11) ]],
   device float* dy [[ buffer(12) ]],
   device float* dz [[ buffer(13) ]],
-  device float* h0 [[ buffer(14) ]],
+  device float* h_snap [[ buffer(14) ]],
   device float* x [[ buffer(15) ]],
   device float* z [[ buffer(16) ]],
   uint3 blockIdx [[threadgroup_position_in_grid]],
-  uint3 threadIdx [[thread_position_in_threadgroup]]
+  uint3 threadIdx [[thread_position_in_threadgroup]],
+  uint3 gridThreadIdx [[thread_position_in_grid]]
 ) {
+  int grid_tid = gridThreadIdx.x;
+  int p = 0;
   thread float h_state[64];
   thread float dh[64];
   float dD_acc = 0.000000e+00f;
-  float inv_decay = 0.000000e+00f;
+  float decay = 0.000000e+00f;
   float y_state = 0.000000e+00f;
   float dx_inp = 0.000000e+00f;
   float d_decay = 0.000000e+00f;
-  int cse_v5 = (((int)threadIdx.x) * 64);
+  p = (gridThreadIdx.x & 63);
+  int cse_v1 = (gridThreadIdx.x / 64);
+  int cse_v4 = (cse_v1 * 4096);
   for (int n = 0; n < 64; ++n) {
-    h_state[n] = h0[(cse_v5 + n)];
-  }
-  int cse_v1 = (((int)threadIdx.x) >> 7);
-  int cse_v3 = (((int)threadIdx.x) & 127);
-  int cse_v6 = (cse_v1 * 65536);
-  int cse_v7 = (cse_v1 * 131072);
-  int cse_v8 = (cse_v1 * 2048);
-  int cse_v9 = (cse_v3 >> 5);
-  int cse_v10 = (cse_v9 * 64);
-  for (int t = 0; t < 512; ++t) {
-    int cse_v11 = ((cse_v8 + (t * 4)) + cse_v9);
-    float A_val = A[cse_v11];
-    float dt_val = dt[cse_v11];
-    float cse_v2 = (A_val * dt_val);
-    float decay = exp(cse_v2);
-    float x_val = x[((cse_v6 + (t * 128)) + cse_v3)];
-    for (int n_1 = 0; n_1 < 64; ++n_1) {
-      h_state[n_1] = ((decay * h_state[n_1]) + (x_val * B[(((cse_v7 + (t * 256)) + cse_v10) + n_1)]));
+    float condval;
+    if (((0 <= p) && (p < 64))) {
+      condval = h_snap[(((cse_v4 + (p * 64)) + n) + 939524096)];
+    } else {
+      condval = 0.000000e+00f;
     }
-  }
-  for (int n_2 = 0; n_2 < 64; ++n_2) {
-    dh[n_2] = 0.000000e+00f;
+    h_state[n] = condval;
+    dh[n] = 0.000000e+00f;
   }
   dD_acc = 0.000000e+00f;
-  float D_h = D[cse_v9];
-  int cse_v2_1 = (((int)threadIdx.x) & 31);
-  for (int r = 0; r < 512; ++r) {
-    int cse_v14 = (((cse_v8 + cse_v9) + 2044) - (r * 4));
-    float A_val_1 = A[cse_v14];
-    float dt_val_1 = dt[cse_v14];
-    float cse_v1_1 = (A_val_1 * dt_val_1);
-    float decay_1 = exp(cse_v1_1);
-    inv_decay = (1.000000e+00f / decay_1);
-    int cse_v13 = (((cse_v6 + cse_v3) + 65408) - (r * 128));
-    float x_val_1 = x[cse_v13];
-    float z_val = z[cse_v13];
-    float dY = dy[cse_v13];
-    y_state = 0.000000e+00f;
-    int cse_v4 = (r * 256);
-    int cse_v12 = (cse_v7 + cse_v10);
-    for (int n_3 = 0; n_3 < 64; ++n_3) {
-      y_state = (y_state + (h_state[n_3] * C[(((cse_v12 + n_3) + 130816) - cse_v4)]));
+  float D_h = D[cse_v1];
+  int cse_v5 = (cse_v1 * 64);
+  for (int rt = 0; rt < 2048; ++rt) {
+    int cse_v7 = ((cse_v1 + 229264) - (rt * 112));
+    float A_val = A[cse_v7];
+    float dt_val = dt[cse_v7];
+    decay = exp((A_val * dt_val));
+    int cse_v2 = (rt * 7168);
+    float condval_1;
+    if (((0 <= p) && (p < 64))) {
+      condval_1 = x[(((cse_v5 + p) + 14672896) - cse_v2)];
+    } else {
+      condval_1 = 0.000000e+00f;
     }
-    float y_skipped = (y_state + (D_h * x_val_1));
-    float cse_v3_1 = (z_val * -1.000000e+00f);
-    float sig_z = (1.000000e+00f / (1.000000e+00f + exp(cse_v3_1)));
-    float silu_z = (z_val * sig_z);
-    float silu_dz = (sig_z * (1.000000e+00f + (z_val * (1.000000e+00f - sig_z))));
+    float x_val = condval_1;
+    float condval_2;
+    if (((0 <= p) && (p < 64))) {
+      condval_2 = z[(((cse_v5 + p) + 14672896) - cse_v2)];
+    } else {
+      condval_2 = 0.000000e+00f;
+    }
+    float z_val = condval_2;
+    float condval_3;
+    if (((0 <= p) && (p < 64))) {
+      condval_3 = dy[(((cse_v5 + p) + 14672896) - cse_v2)];
+    } else {
+      condval_3 = 0.000000e+00f;
+    }
+    float dY = condval_3;
+    y_state = 0.000000e+00f;
+    for (int n_1 = 0; n_1 < 64; ++n_1) {
+      y_state = (y_state + (h_state[n_1] * C[(((cse_v5 + n_1) + 14672896) - cse_v2)]));
+    }
+    float y_skipped = (y_state + (D_h * x_val));
+    float cse_v1_1 = (z_val * -1.000000e+00f);
+    float cse_v1_2 = (1.000000e+00f / (1.000000e+00f + exp(cse_v1_1)));
+    float cse_v2_1 = (z_val * cse_v1_2);
+    float cse_v5_1 = (cse_v1_2 * (1.000000e+00f + (z_val * (1.000000e+00f - cse_v1_2))));
     float d_silu = (dY * y_skipped);
-    float d_y_skipped = (dY * silu_z);
-    dz[cse_v13] = (d_silu * silu_dz);
-    dD_acc = (dD_acc + (d_y_skipped * x_val_1));
+    float cse_v3 = (dY * cse_v2_1);
+    if (0 <= p) {
+      if (p < 64) {
+        dz[(((cse_v5 + p) + 14672896) - cse_v2)] = (d_silu * cse_v5_1);
+      }
+    }
+    dD_acc = (dD_acc + (cse_v3 * x_val));
     dx_inp = 0.000000e+00f;
     d_decay = 0.000000e+00f;
-    if (r == 511) {
-      for (int n_4 = 0; n_4 < 64; ++n_4) {
-        int cse_v15 = (((cse_v12 + n_4) + 130816) - cse_v4);
-        float C_val = C[cse_v15];
-        float B_val = B[cse_v15];
-        float dh_n = (dh[n_4] + (d_y_skipped * C_val));
-        float dC_sum = simd_sum((d_y_skipped * h_state[n_4]));
-        float dB_sum = simd_sum((dh_n * x_val_1));
-        if (cse_v2_1 == 0) {
-          dC[cse_v15] = dC_sum;
-          dB[cse_v15] = dB_sum;
-        }
-        dx_inp = (dx_inp + (dh_n * B_val));
-        d_decay = (d_decay + (dh_n * h0[(cse_v5 + n_4)]));
-        dh[n_4] = (dh_n * decay_1);
+    for (int n_2 = 0; n_2 < 64; ++n_2) {
+      int cse_v8 = (((cse_v5 + n_2) + 14672896) - cse_v2);
+      float C_val = C[cse_v8];
+      float B_val = B[cse_v8];
+      int cse_v3_1 = (rt * 458752);
+      float condval_4;
+      if (((0 <= p) && (p < 64))) {
+        condval_4 = h_snap[((((cse_v4 + (p * 64)) + n_2) + 939065344) - cse_v3_1)];
+      } else {
+        condval_4 = 0.000000e+00f;
       }
-    } else {
-      for (int n_5 = 0; n_5 < 64; ++n_5) {
-        int cse_v16 = (((cse_v12 + n_5) + 130816) - cse_v4);
-        float C_val_1 = C[cse_v16];
-        float B_val_1 = B[cse_v16];
-        float dh_n_1 = (dh[n_5] + (d_y_skipped * C_val_1));
-        float dC_sum_1 = simd_sum((d_y_skipped * h_state[n_5]));
-        float dB_sum_1 = simd_sum((dh_n_1 * x_val_1));
-        if (cse_v2_1 == 0) {
-          dC[cse_v16] = dC_sum_1;
-          dB[cse_v16] = dB_sum_1;
+      float h_prev = condval_4;
+      float dh_n = (dh[n_2] + (cse_v3 * C_val));
+      if (0 <= p) {
+        if (p < 64) {
+          int cse_v6 = (cse_v4 + (n_2 * 64));
+          dC_partial[(((cse_v6 + p) + 939065344) - cse_v3_1)] = (cse_v3 * h_state[n_2]);
+          dB_partial[(((cse_v6 + p) + 939065344) - cse_v3_1)] = (dh_n * x_val);
         }
-        dx_inp = (dx_inp + (dh_n_1 * B_val_1));
-        float h_prev = ((h_state[n_5] - (x_val_1 * B_val_1)) * inv_decay);
-        d_decay = (d_decay + (dh_n_1 * h_prev));
-        h_state[n_5] = h_prev;
-        dh[n_5] = (dh_n_1 * decay_1);
+      }
+      dx_inp = (dx_inp + (dh_n * B_val));
+      d_decay = (d_decay + (dh_n * h_prev));
+      dh[n_2] = (dh_n * decay);
+      h_state[n_2] = h_prev;
+    }
+    float cse_v4_1 = (cse_v3 * D_h);
+    if (0 <= p) {
+      if (p < 64) {
+        dx[(((cse_v5 + p) + 14672896) - cse_v2)] = (cse_v4_1 + dx_inp);
       }
     }
-    float dx_skip = (d_y_skipped * D_h);
-    dx[cse_v13] = ((d_y_skipped * D_h) + dx_inp);
-    float d_logdecay = (d_decay * decay_1);
-    float dA_lane = (d_logdecay * dt_val_1);
-    float ddt_lane = (d_logdecay * A_val_1);
-    float dA_sum = simd_sum(dA_lane);
-    float ddt_sum = simd_sum(ddt_lane);
-    if (cse_v2_1 == 0) {
-      dA[cse_v14] = dA_sum;
-      ddt[cse_v14] = ddt_sum;
+    float d_logdecay = (d_decay * decay);
+    if (0 <= p) {
+      if (p < 64) {
+        dA_partial[(((cse_v5 + p) + 14672896) - cse_v2)] = (d_logdecay * dt_val);
+        ddt_partial[(((cse_v5 + p) + 14672896) - cse_v2)] = (d_logdecay * A_val);
+      }
     }
   }
-  for (int n_6 = 0; n_6 < 64; ++n_6) {
-    dh0[(cse_v5 + n_6)] = dh[n_6];
-  }
-  float dD_sum = simd_sum(dD_acc);
-  if (cse_v2_1 == 0) {
-    dD_batch[(((int)threadIdx.x) >> 5)] = dD_sum;
+  if (0 <= p) {
+    for (int n_3 = 0; n_3 < 64; ++n_3) {
+      if (p < 64) {
+        dh0[((cse_v4 + (p * 64)) + n_3)] = dh[n_3];
+      }
+    }
+    if (p < 64) {
+      dD_partial[(cse_v5 + p)] = dD_acc;
+    }
   }
 }

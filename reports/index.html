@@ -254,6 +254,60 @@
                         <p>1B-shape BF16/FP32 Path B vs Path C forward timings after the grid-lane codegen fix, with
                             JSON/MSL/diff receipts.</p>
                     </div>
+                    <div class="metric"><span>Mamba3 Path C dtype-aware reducer</span><strong><a
+                                href="v4/mamba3_path_c_dtype_aware_reduce_20260518.html">Reducer Policy
+                                HTML</a></strong>
+                        <p>BF16 compact partials use the serial TileLang reducer, FP32 uses threaded TileLang reduce;
+                            full Path C fwd+bwd is 0.558x BF16 and 0.884x FP32 versus Path B.</p>
+                    </div>
+                    <div class="metric"><span>Mamba3 Path C post-reduce</span><strong><a
+                                href="v4/mamba3_path_c_post_reduce_20260518.html">Post-Reduce
+                                HTML</a></strong>
+                        <p>Standalone TileLang bwd post-reduction candidate vs existing MLX reductions on the 1B BF16
+                            shape; BF16 production now uses the TileLang reducer.</p>
+                    </div>
+                    <div class="metric"><span>Mamba3 Path C FP32 reducer</span><strong><a
+                                href="v4/mamba3_path_c_fp32_tl_reduce_20260518.html">FP32 Reducer
+                                HTML</a></strong>
+                        <p>FP32 production backward now uses the TileLang post-reduce kernel. Full FP32 fwd+bwd is
+                            1.013x Path B; BF16 full Path C remains faster at 0.750x Path B.</p>
+                    </div>
+                    <div class="metric"><span>Mamba3 Path C BF16 bwd outputs</span><strong><a
+                                href="v4/mamba3_path_c_bf16_final_outputs_20260518.html">BF16 Outputs
+                                HTML</a></strong>
+                        <p>BF16 <code>dx/dz/dh0</code> owner outputs, BF16 state snapshots, innermost-P dB/dC
+                            partials, and BF16 TileLang reducer: full Path C is 0.810x Path B.</p>
+                    </div>
+                    <div class="metric"><span>Mamba3 Path C BF16 compact partials</span><strong><a
+                                href="v4/mamba3_path_c_bf16_compact_partials_20260518.html">Compact Partials
+                                HTML</a></strong>
+                        <p>BF16 <code>dB/dC</code> partial buffers now store as BF16 at the TileLang producer.
+                            Full Path C is 0.569x Path B with 5.887 GB peak.</p>
+                    </div>
+                    <div class="metric"><span>Mamba3 Path C FP32 unsigned index</span><strong><a
+                                href="v4/mamba3_path_c_fp32_forward_unsigned_index_20260518.html">Unsigned Index
+                                HTML</a></strong>
+                        <p>Generic TileLang/Metal cleanup: raw runtime MSL no longer emits signed floor corrections
+                            for non-power thread-position lane decomposition; FP32 speed gap remains.</p>
+                    </div>
+                    <div class="metric"><span>Mamba3 Path C FP32 forward guard</span><strong><a
+                                href="v4/mamba3_path_c_fp32_forward_unsigned_guard_20260518.html">FP32 Guard
+                                HTML</a></strong>
+                        <p>Unsigned/non-negative lane-index codegen candidate: removes signed div/mod correction in
+                            MSL but slows the 1B FP32 forward bench, so it is not promoted.</p>
+                    </div>
+                    <div class="metric"><span>Mamba3 Path C FP32 batch-one index</span><strong><a
+                                href="v4/mamba3_path_c_fp32_forward_batch_one_20260518.html">Batch-One
+                                HTML</a></strong>
+                        <p><code>B=1</code> pure-FP32 forward specialization: removes hot-loop div/mod work and improves
+                            the 1B FP32 forward ratio from 1.092x to 1.036x C/B; BF16 keeps the stable lane form.</p>
+                    </div>
+                    <div class="metric"><span>Mamba3 Path C FP32 runtime decay</span><strong><a
+                                href="v4/mamba3_path_c_fp32_forward_runtime_decay_20260518.html">Runtime Decay
+                                HTML</a></strong>
+                        <p>Raw tvm-ffi source now reuses <code>decay</code> in the forward hot loop; kept as a
+                            regression fix, but the FP32 speed gap remains.</p>
+                    </div>
                     <div class="metric"><span>Full profiled matrix</span><strong><a
                                 href="profiling/cppmega_1b_profiled_matrix_2026-05-17.html">Profiled Matrix
                                 HTML</a></strong>

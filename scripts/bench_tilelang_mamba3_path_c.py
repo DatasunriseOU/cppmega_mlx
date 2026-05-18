@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import difflib
 import json
+import os
 import platform
 import statistics
 import sys
@@ -35,6 +36,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+# This script is used to compare generated Metal code during codegen work.
+# TileLang's disk cache key does not include the backend/codegen revision, so
+# leave it off unless the caller explicitly picked a cache policy.
+os.environ.setdefault("TILELANG_DISABLE_CACHE", "1")
+
 import mlx.core as mx  # noqa: E402
 
 from cppmega_mlx.nn._tilelang import (  # noqa: E402
@@ -46,11 +52,24 @@ from cppmega_mlx.nn._tilelang.mamba3 import (  # noqa: E402
     mamba3_mimo_metal_status,
 )
 from cppmega_mlx.nn._tilelang.mamba3_path_c import (  # noqa: E402
+    _bwd_partial_kernel_for_state_snapshots,
+    _bwd_partial_dtypes_for_input_dtypes,
+    _bwd_state_snapshots_kernel_for,
+    _mamba3_mimo_bwd_path_c_from_snapshots_kernel,
     _mamba3_mimo_bwd_path_c_partial_kernel,
+    _mamba3_mimo_bwd_path_c_partial_outputs,
+    _mamba3_mimo_bwd_path_c_partial_threaded_reduce_kernel,
+    _mamba3_mimo_bwd_path_c_partial_tl_reduce_kernel,
+    _mamba3_mimo_bwd_path_c_scratch_kernel,
+    _mamba3_mimo_bwd_path_c_scratch_mlx_reduce_kernel,
     _mamba3_mimo_bwd_path_c_simd_kernel,
+    _mamba3_mimo_fwd_path_c_with_snapshots,
+    _reduce_bwd_partials_path_c_threaded_kernel,
+    _tl_dtype_for,
     dump_lowered_bwd_msl,
     dump_lowered_fwd_msl,
     mamba3_mimo_apply_path_c,
+    mamba3_mimo_apply_with_state_training_path_c,
     mamba3_mimo_fwd_path_c,
     mamba3_mimo_path_c_status,
     mamba3_path_c_schedule_plan,
@@ -86,7 +105,7 @@ def _make_inputs(
 def _run_one(fn: Callable[[], Any]) -> float:
     start = time.perf_counter()
     out = fn()
-    if isinstance(out, tuple):
+    if isinstance(out, (list, tuple)):
         mx.eval(*out)
     elif isinstance(out, mx.array):
         mx.eval(out)
@@ -210,11 +229,176 @@ def _safe_ratio(numerator: float, denominator: float) -> float:
     return numerator / denominator
 
 
+def _profile_path_c_bwd_components(
+    dy: mx.array,
+    inputs: tuple[mx.array, ...],
+    *,
+    warmup: int,
+    iters: int,
+) -> dict[str, Any]:
+    """Break generated-partial Path C bwd into snapshot, scan, and reductions."""
+
+    x, B, C, z, A, dt, D, h0 = inputs
+    batch, seq, heads, headdim = map(int, x.shape)
+    state = int(B.shape[-1])
+    dtypes = {
+        "dy": _tl_dtype_for(dy.dtype),
+        "x": _tl_dtype_for(x.dtype),
+        "B": _tl_dtype_for(B.dtype),
+        "C": _tl_dtype_for(C.dtype),
+        "z": _tl_dtype_for(z.dtype),
+        "A": _tl_dtype_for(A.dtype),
+        "dt": _tl_dtype_for(dt.dtype),
+        "D": _tl_dtype_for(D.dtype),
+        "h0": _tl_dtype_for(h0.dtype),
+    }
+    if any(dtype is None for dtype in dtypes.values()):
+        raise RuntimeError(f"unsupported dtype in Path C bwd component profile: {dtypes}")
+    partial_dtypes = _bwd_partial_dtypes_for_input_dtypes(
+        cast(dict[str, str], dtypes)
+    )
+    snapshot_dtype = (
+        "bfloat16"
+        if all(array.dtype == mx.bfloat16 for array in (dy, x, B, C, z, A, dt, D, h0))
+        else "float32"
+    )
+
+    snapshot_kernel, _snapshot_lowering = _bwd_state_snapshots_kernel_for(
+        batch,
+        seq,
+        heads,
+        headdim,
+        state,
+        cast(str, dtypes["x"]),
+        cast(str, dtypes["B"]),
+        cast(str, dtypes["A"]),
+        cast(str, dtypes["dt"]),
+        cast(str, dtypes["h0"]),
+        snapshot_dtype,
+    )
+    partial_kernel, _partial_lowering = _bwd_partial_kernel_for_state_snapshots(
+        batch,
+        seq,
+        heads,
+        headdim,
+        state,
+        cast(str, dtypes["dy"]),
+        cast(str, dtypes["x"]),
+        cast(str, dtypes["B"]),
+        cast(str, dtypes["C"]),
+        cast(str, dtypes["z"]),
+        cast(str, dtypes["A"]),
+        cast(str, dtypes["dt"]),
+        cast(str, dtypes["D"]),
+        cast(str, dtypes["h0"]),
+        cast(str, dtypes["x"]),
+        cast(str, dtypes["z"]),
+        partial_dtypes[0],
+        partial_dtypes[1],
+        partial_dtypes[2],
+        partial_dtypes[3],
+        partial_dtypes[4],
+        cast(str, dtypes["h0"]),
+        snapshot_dtype,
+    )
+
+    snapshot_out = snapshot_kernel(x, B, A, dt, h0)
+    h_snap = snapshot_out[0] if isinstance(snapshot_out, (list, tuple)) else snapshot_out
+    mx.eval(h_snap)
+    partials = partial_kernel(dy, x, B, C, z, A, dt, D, h_snap)
+    mx.eval(*partials)
+
+    def snapshot_only() -> Any:
+        out = snapshot_kernel(x, B, A, dt, h0)
+        return tuple(out) if isinstance(out, (list, tuple)) else out
+
+    def partial_from_cached_snapshot() -> Any:
+        return partial_kernel(dy, x, B, C, z, A, dt, D, h_snap)
+
+    def reductions_from_cached_partials() -> tuple[mx.array, ...]:
+        dx_pc, dz_pc, dB_partial, dC_partial, dA_partial, ddt_partial, dD_partial, dh0_pc = partials
+        return (
+            dx_pc,
+            mx.sum(dB_partial, axis=4),
+            mx.sum(dC_partial, axis=4),
+            dz_pc,
+            mx.sum(dA_partial, axis=3),
+            mx.sum(ddt_partial, axis=3),
+            mx.sum(dD_partial, axis=(0, 2)),
+            dh0_pc,
+        )
+
+    def threaded_reductions_from_cached_partials() -> tuple[mx.array, ...]:
+        dx_pc, dz_pc, dB_partial, dC_partial, dA_partial, ddt_partial, dD_partial, dh0_pc = partials
+        output_dtypes = (
+            ("bfloat16", "bfloat16", "bfloat16", "bfloat16", "bfloat16")
+            if all(array.dtype == mx.bfloat16 for array in (*inputs, dy))
+            else None
+        )
+        dB_pc, dC_pc, dA_pc, ddt_pc, dD_pc = _reduce_bwd_partials_path_c_threaded_kernel(
+            dB_partial,
+            dC_partial,
+            dA_partial,
+            ddt_partial,
+            dD_partial,
+            output_dtypes=output_dtypes,
+        )
+        return (
+            dx_pc,
+            dB_pc,
+            dC_pc,
+            dz_pc,
+            dA_pc,
+            ddt_pc,
+            dD_pc,
+            dh0_pc,
+        )
+
+    def snapshot_plus_partial_no_reduce() -> Any:
+        return _mamba3_mimo_bwd_path_c_partial_outputs(dy, x, B, C, z, A, dt, D, h0)
+
+    return {
+        "snapshot_only": _bench(
+            "bwd_path_c_snapshot_only",
+            snapshot_only,
+            warmup=warmup,
+            iters=iters,
+        ),
+        "partial_from_cached_snapshot_no_reduce": _bench(
+            "bwd_path_c_partial_from_cached_snapshot_no_reduce",
+            partial_from_cached_snapshot,
+            warmup=warmup,
+            iters=iters,
+        ),
+        "mlx_reductions_from_cached_partials": _bench(
+            "bwd_path_c_mlx_reductions_from_cached_partials",
+            reductions_from_cached_partials,
+            warmup=warmup,
+            iters=iters,
+        ),
+        "threaded_reductions_from_cached_partials": _bench(
+            "bwd_path_c_threaded_reductions_from_cached_partials",
+            threaded_reductions_from_cached_partials,
+            warmup=warmup,
+            iters=iters,
+        ),
+        "snapshot_plus_partial_no_reduce": _bench(
+            "bwd_path_c_snapshot_plus_partial_no_reduce",
+            snapshot_plus_partial_no_reduce,
+            warmup=warmup,
+            iters=iters,
+        ),
+    }
+
+
 def _write_msl_diff(*, path_b_source: str, path_c_source: str, out_path: Path) -> None:
     """Write a unified diff between Path B's hand-written MSL and Path C's lowered MSL."""
 
-    b_lines = path_b_source.splitlines(keepends=True)
-    c_lines = path_c_source.splitlines(keepends=True)
+    def normalized_lines(source: str) -> list[str]:
+        return [line.rstrip(" \t") + "\n" for line in source.splitlines()]
+
+    b_lines = normalized_lines(path_b_source)
+    c_lines = normalized_lines(path_c_source)
     diff = difflib.unified_diff(
         b_lines,
         c_lines,
@@ -222,7 +406,10 @@ def _write_msl_diff(*, path_b_source: str, path_c_source: str, out_path: Path) -
         tofile="path_c_lowered_msl",
         n=3,
     )
-    out_path.write_text("".join(diff), encoding="utf-8")
+    out_path.write_text(
+        "".join(line.rstrip(" \t\r\n") + "\n" for line in diff),
+        encoding="utf-8",
+    )
 
 
 def main() -> int:
@@ -331,8 +518,28 @@ def main() -> int:
         y = cast(mx.array, mamba3_mimo_apply_path_c(x, B, C, z, A, dt, D, h0))
         return mx.sum(y * y) * 0.5
 
+    def loss_pc_training_reuse(
+        x: mx.array, B: mx.array, C: mx.array, z: mx.array,
+        A: mx.array, dt: mx.array, D: mx.array, h0: mx.array,
+    ) -> mx.array:
+        y, _h_last = mamba3_mimo_apply_with_state_training_path_c(
+            x,
+            B,
+            C,
+            z,
+            A,
+            dt,
+            D,
+            h0,
+        )
+        return mx.sum(y * y) * 0.5
+
     grad_pb = mx.value_and_grad(loss_pb, argnums=tuple(range(8)))
     grad_pc = mx.value_and_grad(loss_pc, argnums=tuple(range(8)))
+    grad_pc_training_reuse = mx.value_and_grad(
+        loss_pc_training_reuse,
+        argnums=tuple(range(8)),
+    )
 
     fwd_bwd_pb, fwd_bwd_pc = _bench_pair(
         "fwd_bwd_path_b",
@@ -368,6 +575,29 @@ def main() -> int:
     except Exception as exc:
         bwd_profile["generated_partial_error"] = f"{type(exc).__name__}: {exc}"
     try:
+        tl_reduce_bwd = _bench(
+            "bwd_path_c_tilelang_post_reduce_candidate",
+            lambda: _mamba3_mimo_bwd_path_c_partial_tl_reduce_kernel(dy_profile, *inputs),
+            warmup=args.warmup,
+            iters=args.iters,
+        )
+        bwd_profile["tilelang_post_reduce_candidate"] = tl_reduce_bwd
+    except Exception as exc:
+        bwd_profile["tilelang_post_reduce_error"] = f"{type(exc).__name__}: {exc}"
+    try:
+        threaded_reduce_bwd = _bench(
+            "bwd_path_c_threaded_post_reduce_candidate",
+            lambda: _mamba3_mimo_bwd_path_c_partial_threaded_reduce_kernel(
+                dy_profile,
+                *inputs,
+            ),
+            warmup=args.warmup,
+            iters=args.iters,
+        )
+        bwd_profile["threaded_post_reduce_candidate"] = threaded_reduce_bwd
+    except Exception as exc:
+        bwd_profile["threaded_post_reduce_error"] = f"{type(exc).__name__}: {exc}"
+    try:
         simd_bwd = _bench(
             "bwd_path_c_simd_p_reduce_diagnostic",
             lambda: _mamba3_mimo_bwd_path_c_simd_kernel(dy_profile, *inputs),
@@ -377,6 +607,72 @@ def main() -> int:
         bwd_profile["simd_p_reduce_kernel"] = simd_bwd
     except Exception as exc:
         bwd_profile["simd_p_reduce_error"] = f"{type(exc).__name__}: {exc}"
+    try:
+        scratch_bwd = _bench(
+            "bwd_path_c_single_kernel_scratch_candidate",
+            lambda: _mamba3_mimo_bwd_path_c_scratch_kernel(dy_profile, *inputs),
+            warmup=args.warmup,
+            iters=args.iters,
+        )
+        bwd_profile["single_kernel_scratch_candidate"] = scratch_bwd
+    except Exception as exc:
+        bwd_profile["single_kernel_scratch_error"] = f"{type(exc).__name__}: {exc}"
+    try:
+        scratch_mlx_bwd = _bench(
+            "bwd_path_c_single_kernel_scratch_mlx_reduce_candidate",
+            lambda: _mamba3_mimo_bwd_path_c_scratch_mlx_reduce_kernel(
+                dy_profile,
+                *inputs,
+            ),
+            warmup=args.warmup,
+            iters=args.iters,
+        )
+        bwd_profile["single_kernel_scratch_mlx_reduce_candidate"] = scratch_mlx_bwd
+    except Exception as exc:
+        bwd_profile["single_kernel_scratch_mlx_reduce_error"] = (
+            f"{type(exc).__name__}: {exc}"
+        )
+    try:
+        snapshot_dtype = "bfloat16" if args.dtype == "bfloat16" else "float32"
+
+        def fwd_snapshot_bwd_reuse() -> tuple[mx.array, ...]:
+            y_snap, h_last_snap, h_snap = _mamba3_mimo_fwd_path_c_with_snapshots(
+                *inputs,
+                snapshot_dtype=snapshot_dtype,
+            )
+            grads = _mamba3_mimo_bwd_path_c_from_snapshots_kernel(
+                y_snap,
+                *inputs,
+                h_snap,
+            )
+            return (y_snap, h_last_snap, *grads)
+
+        bwd_profile["fwd_snapshot_bwd_reuse_candidate"] = _bench(
+            "fwd_path_c_snapshot_bwd_reuse_candidate",
+            fwd_snapshot_bwd_reuse,
+            warmup=args.warmup,
+            iters=args.iters,
+        )
+    except Exception as exc:
+        bwd_profile["fwd_snapshot_bwd_reuse_error"] = f"{type(exc).__name__}: {exc}"
+    try:
+        bwd_profile["training_best_vjp"] = _bench(
+            "fwd_bwd_path_c_training_best_vjp",
+            lambda: grad_pc_training_reuse(*inputs),
+            warmup=args.warmup,
+            iters=args.iters,
+        )
+    except Exception as exc:
+        bwd_profile["training_best_vjp_error"] = f"{type(exc).__name__}: {exc}"
+    try:
+        bwd_profile["component_breakdown"] = _profile_path_c_bwd_components(
+            dy_profile,
+            inputs,
+            warmup=args.warmup,
+            iters=args.iters,
+        )
+    except Exception as exc:
+        bwd_profile["component_breakdown_error"] = f"{type(exc).__name__}: {exc}"
 
     # Derive bwd-only timings.
     bwd_pb_ms = max(0.0, fwd_bwd_pb["median_ms"] - fwd_pb["median_ms"])
@@ -439,9 +735,39 @@ def main() -> int:
     if "generated_partial_kernel" in bwd_profile:
         partial = bwd_profile["generated_partial_kernel"]
         print(f"{'bwd C generated':22} {'':>14} {partial['median_ms']:>10.3f} ms {'':>11}")
+    if "tilelang_post_reduce_candidate" in bwd_profile:
+        tl_reduce = bwd_profile["tilelang_post_reduce_candidate"]
+        print(f"{'bwd C TL reduce':22} {'':>14} {tl_reduce['median_ms']:>10.3f} ms {'':>11}")
+    if "threaded_post_reduce_candidate" in bwd_profile:
+        threaded_reduce = bwd_profile["threaded_post_reduce_candidate"]
+        print(f"{'bwd C threaded reduce':22} {'':>14} {threaded_reduce['median_ms']:>10.3f} ms {'':>11}")
     if "simd_p_reduce_kernel" in bwd_profile:
         simd = bwd_profile["simd_p_reduce_kernel"]
         print(f"{'bwd C simd diag':22} {'':>14} {simd['median_ms']:>10.3f} ms {'':>11}")
+    if "single_kernel_scratch_candidate" in bwd_profile:
+        scratch = bwd_profile["single_kernel_scratch_candidate"]
+        print(f"{'bwd C scratch diag':22} {'':>14} {scratch['median_ms']:>10.3f} ms {'':>11}")
+    if "single_kernel_scratch_mlx_reduce_candidate" in bwd_profile:
+        scratch_mlx = bwd_profile["single_kernel_scratch_mlx_reduce_candidate"]
+        print(f"{'bwd C scratch+MLX':22} {'':>14} {scratch_mlx['median_ms']:>10.3f} ms {'':>11}")
+    if "fwd_snapshot_bwd_reuse_candidate" in bwd_profile:
+        snap_reuse = bwd_profile["fwd_snapshot_bwd_reuse_candidate"]
+        print(f"{'fwd C snap+bwd reuse':22} {'':>14} {snap_reuse['median_ms']:>10.3f} ms {'':>11}")
+    if "training_best_vjp" in bwd_profile:
+        training_best = bwd_profile["training_best_vjp"]
+        print(f"{'fwd+bwd C train best':22} {'':>14} {training_best['median_ms']:>10.3f} ms {'':>11}")
+    components = bwd_profile.get("component_breakdown")
+    if isinstance(components, dict):
+        for label, key in (
+            ("bwd C snapshot", "snapshot_only"),
+            ("bwd C scan cached", "partial_from_cached_snapshot_no_reduce"),
+            ("bwd C reductions", "mlx_reductions_from_cached_partials"),
+            ("bwd C threaded reds", "threaded_reductions_from_cached_partials"),
+            ("bwd C snap+scan", "snapshot_plus_partial_no_reduce"),
+        ):
+            metric = components.get(key)
+            if isinstance(metric, dict):
+                print(f"{label:22} {'':>14} {metric['median_ms']:>10.3f} ms {'':>11}")
     print()
 
     # Recommendation logic from the task spec.
@@ -489,19 +815,29 @@ def main() -> int:
             "and paired bench receipt median is no-worse than Path B."
         ),
         "blocked_path_c_codegen_gaps": [
-            "Path C bwd materializes explicit state snapshots as a separate safety kernel",
-            "Path C bwd returns per-lane partial buffers and relies on external MLX reductions",
+            "Path C default bwd materializes explicit state snapshots as a separate safety kernel; FP32 training-only surface can reuse fwd-produced snapshots",
+            "Path C bwd still returns per-lane partial buffers before a separate post-reduce step",
             "final-gradient in-kernel P-axis allreduce remains diagnostic for recurrent bwd hot loops",
         ],
         "remembered_optimizations": [
             "TileLang local.var scalar y_acc instead of thread float[1]",
             "TileLang Metal local.var PrintExpr statement-order fix",
+            "TileLang Mamba3 recurrent kernels materialize decay as a runtime scalar so Metal source reuses exp(A*dt)",
             "TileLang Mamba3 fwd/bwd uses Metal thread_position_in_grid for absolute lane ids",
+            "TileLang Metal canonicalizes non-negative thread-position div/mod so non-power lane decompositions avoid signed floor corrections",
+            "TileLang Mamba3 fwd specializes BATCH==1 batch index and pure-FP32 lane decomposition to avoid redundant hot-loop div/mod",
             "TileLang Mamba3 fwd/bwd uses Path-B-equivalent single-expression SiLU",
             "Bench harness uses paired alternating samples to avoid order/warmup drift",
             "Path C bwd consumes explicit state snapshot boundaries instead of unsafe inverse-state reconstruction",
             "Path C bwd writes generated per-lane partial gradients and moves P-axis reductions outside the recurrent hot loop",
-            "Bench harness profiles generated-partial production bwd and final-gradient SIMD diagnostic bwd separately",
+            "BF16 Path C bwd writes dx/dz/dh0 owner outputs directly as BF16 and stores bandwidth-dominant dB/dC partials as BF16",
+            "BF16 Path C bwd stores state snapshots as BF16 after full-shape Path B parity stayed within BF16 absolute error",
+            "Path C bwd stores dB/dC partials as (B,T,H,N,P) so the P reduction axis is innermost",
+            "Path C bwd uses a separate post-reduce step; BF16 and FP32 production keep the TileLang reducer after value_and_grad showed it is faster for training",
+            "Bench harness profiles generated-partial production bwd, serial/threaded TileLang post-reduce candidates, final-gradient SIMD diagnostic bwd, single-kernel scratch diagnostics, and the scratch+MLX comparison route separately",
+            "BF16 default bwd uses the single-kernel scratch producer with the profiled serial TileLang post-reducer",
+            "Post-reduce selection is dtype-aware: current Metal thread_reduce wins for FP32 partials, while the serial TileLang reducer wins for compact BF16 dB/dC partials",
+            "Path C training surface reuses fwd-produced snapshots for FP32 and keeps BF16 on the faster production bwd route",
             "AUTO selects full Path C only when fwd, bwd, and fwd+bwd receipts are no-worse",
             "AUTO can still select Path C forward with Path B backward when only fwd is no-worse",
         ],

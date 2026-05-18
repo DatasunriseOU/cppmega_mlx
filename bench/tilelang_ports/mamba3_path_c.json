@@ -16,7 +16,7 @@
     "heads": 112,
     "headdim": 64,
     "state": 64,
-    "dtype": "bfloat16"
+    "dtype": "float32"
   },
   "path_b_status": {
     "available": true,
@@ -27,84 +27,185 @@
     "reason": "Path C TileLang DSL ready"
   },
   "parity": {
-    "y_max_abs": 0.000244140625,
-    "h_max_abs": 0.0009765625
+    "y_max_abs": 4.470348358154297e-08,
+    "h_max_abs": 3.5762786865234375e-07
   },
   "timings": {
     "fwd_path_b": {
       "label": "fwd_path_b",
-      "mean_ms": 5.45246660039993,
-      "median_ms": 5.445874492579605,
-      "min_ms": 5.397458007792011,
-      "max_ms": 5.517917001270689,
-      "iters": 10,
-      "warmup": 3,
+      "mean_ms": 4.453716793796048,
+      "median_ms": 4.478541988646612,
+      "min_ms": 4.373417003080249,
+      "max_ms": 4.532582999672741,
+      "iters": 5,
+      "warmup": 2,
       "measurement": "paired_alternating"
     },
     "fwd_path_c": {
       "label": "fwd_path_c",
-      "mean_ms": 4.607933398801833,
-      "median_ms": 4.617666992999148,
-      "min_ms": 4.51483299548272,
-      "max_ms": 4.65354100742843,
-      "iters": 10,
-      "warmup": 3,
+      "mean_ms": 4.332316399086267,
+      "median_ms": 4.326583002693951,
+      "min_ms": 4.300333006540313,
+      "max_ms": 4.375749995233491,
+      "iters": 5,
+      "warmup": 2,
       "measurement": "paired_alternating"
     },
     "fwd_bwd_path_b": {
       "label": "fwd_bwd_path_b",
-      "mean_ms": 74.2388666010811,
-      "median_ms": 74.38910450582625,
-      "min_ms": 73.41383300081361,
-      "max_ms": 74.8265000001993,
-      "iters": 10,
-      "warmup": 3,
+      "mean_ms": 72.74643340497278,
+      "median_ms": 73.04379201377742,
+      "min_ms": 71.52883399976417,
+      "max_ms": 73.30895800259896,
+      "iters": 5,
+      "warmup": 2,
       "measurement": "paired_alternating"
     },
     "fwd_bwd_path_c": {
       "label": "fwd_bwd_path_c",
-      "mean_ms": 78.66660819854587,
-      "median_ms": 78.39095799863571,
-      "min_ms": 74.74725000793114,
-      "max_ms": 85.78729200235102,
-      "iters": 10,
-      "warmup": 3,
+      "mean_ms": 64.69835839816369,
+      "median_ms": 64.54316599410959,
+      "min_ms": 64.21458401018754,
+      "max_ms": 65.59141699108295,
+      "iters": 5,
+      "warmup": 2,
       "measurement": "paired_alternating"
     },
-    "bwd_path_b_median_ms": 68.94323001324665,
-    "bwd_path_c_median_ms": 73.77329100563657
+    "bwd_path_b_median_ms": 68.56525002513081,
+    "bwd_path_c_median_ms": 60.216582991415635
   },
   "bwd_profile": {
     "generated_partial_kernel": {
       "label": "bwd_path_c_generated_partials",
-      "mean_ms": 70.47153330058791,
-      "median_ms": 70.15604100160999,
-      "min_ms": 69.36979199235793,
-      "max_ms": 74.5268339960603,
-      "iters": 10,
-      "warmup": 3
+      "mean_ms": 60.934516397537664,
+      "median_ms": 61.04420800693333,
+      "min_ms": 60.202166001545265,
+      "max_ms": 61.42358298529871,
+      "iters": 5,
+      "warmup": 2
+    },
+    "tilelang_post_reduce_candidate": {
+      "label": "bwd_path_c_tilelang_post_reduce_candidate",
+      "mean_ms": 61.16239999537356,
+      "median_ms": 61.221416981425136,
+      "min_ms": 60.49683300079778,
+      "max_ms": 61.723749997327104,
+      "iters": 5,
+      "warmup": 2
+    },
+    "threaded_post_reduce_candidate": {
+      "label": "bwd_path_c_threaded_post_reduce_candidate",
+      "mean_ms": 61.11869160667993,
+      "median_ms": 61.01170901092701,
+      "min_ms": 60.50491600763053,
+      "max_ms": 61.840334004955366,
+      "iters": 5,
+      "warmup": 2
     },
     "simd_p_reduce_kernel": {
       "label": "bwd_path_c_simd_p_reduce_diagnostic",
-      "mean_ms": 88.6143419003929,
-      "median_ms": 88.66360449610511,
-      "min_ms": 88.15495899762027,
-      "max_ms": 89.18954200635199,
-      "iters": 10,
-      "warmup": 3
+      "mean_ms": 91.35865819407627,
+      "median_ms": 91.32166599738412,
+      "min_ms": 91.19991699117236,
+      "max_ms": 91.63570799864829,
+      "iters": 5,
+      "warmup": 2
+    },
+    "single_kernel_scratch_candidate": {
+      "label": "bwd_path_c_single_kernel_scratch_candidate",
+      "mean_ms": 67.27615819545463,
+      "median_ms": 67.09924997994676,
+      "min_ms": 66.90812500892207,
+      "max_ms": 67.83508299849927,
+      "iters": 5,
+      "warmup": 2
+    },
+    "single_kernel_scratch_mlx_reduce_candidate": {
+      "label": "bwd_path_c_single_kernel_scratch_mlx_reduce_candidate",
+      "mean_ms": 70.19899999722838,
+      "median_ms": 70.12083299923688,
+      "min_ms": 69.80808300431818,
+      "max_ms": 70.76970799244009,
+      "iters": 5,
+      "warmup": 2
+    },
+    "fwd_snapshot_bwd_reuse_candidate": {
+      "label": "fwd_path_c_snapshot_bwd_reuse_candidate",
+      "mean_ms": 61.552900000242516,
+      "median_ms": 61.42120901495218,
+      "min_ms": 61.26329198013991,
+      "max_ms": 61.8998330028262,
+      "iters": 5,
+      "warmup": 2
+    },
+    "training_best_vjp": {
+      "label": "fwd_bwd_path_c_training_best_vjp",
+      "mean_ms": 63.09969999128953,
+      "median_ms": 63.17316700005904,
+      "min_ms": 62.70658297580667,
+      "max_ms": 63.31712499377318,
+      "iters": 5,
+      "warmup": 2
+    },
+    "component_breakdown": {
+      "snapshot_only": {
+        "label": "bwd_path_c_snapshot_only",
+        "mean_ms": 11.20784980012104,
+        "median_ms": 11.245165980653837,
+        "min_ms": 11.109291983302683,
+        "max_ms": 11.315875017317012,
+        "iters": 5,
+        "warmup": 2
+      },
+      "partial_from_cached_snapshot_no_reduce": {
+        "label": "bwd_path_c_partial_from_cached_snapshot_no_reduce",
+        "mean_ms": 34.69288320047781,
+        "median_ms": 35.030457976972684,
+        "min_ms": 33.75629099900834,
+        "max_ms": 35.29379199608229,
+        "iters": 5,
+        "warmup": 2
+      },
+      "mlx_reductions_from_cached_partials": {
+        "label": "bwd_path_c_mlx_reductions_from_cached_partials",
+        "mean_ms": 18.125941790640354,
+        "median_ms": 18.114499980583787,
+        "min_ms": 18.10129199293442,
+        "max_ms": 18.15849999547936,
+        "iters": 5,
+        "warmup": 2
+      },
+      "threaded_reductions_from_cached_partials": {
+        "label": "bwd_path_c_threaded_reductions_from_cached_partials",
+        "mean_ms": 15.879508602665737,
+        "median_ms": 15.879959013545886,
+        "min_ms": 15.793084021424875,
+        "max_ms": 15.951332985423505,
+        "iters": 5,
+        "warmup": 2
+      },
+      "snapshot_plus_partial_no_reduce": {
+        "label": "bwd_path_c_snapshot_plus_partial_no_reduce",
+        "mean_ms": 46.34375019813888,
+        "median_ms": 46.40958399977535,
+        "min_ms": 45.70499999681488,
+        "max_ms": 47.00929200043902,
+        "iters": 5,
+        "warmup": 2
+      }
     }
   },
   "gflops": {
-    "fwd_path_b": 889.5579812940733,
-    "fwd_path_c": 1049.1057772993665,
-    "fwd_bwd_path_b": 260.4908959279422,
-    "fwd_bwd_path_c": 247.19285201664766
+    "fwd_path_b": 1081.6960368532696,
+    "fwd_path_c": 1119.6875495012152,
+    "fwd_bwd_path_b": 265.28858847231,
+    "fwd_bwd_path_c": 300.22829189644136
   },
   "memory_bytes_peak": {
-    "fwd_path_b": 509215408,
-    "fwd_path_c": 210108656,
-    "fwd_bwd_path_b": 12643240030,
-    "fwd_bwd_path_c": 12049613984
+    "fwd_path_b": 420217296,
+    "fwd_path_c": 420217296,
+    "fwd_bwd_path_b": 12226692516,
+    "fwd_bwd_path_c": 12228527524
   },
   "strict_policy": {
     "phase": "fwd",
@@ -115,16 +216,16 @@
   },
   "scheduler_decision": {
     "source": "rule_z3_test_receipt",
-    "mode": "path_c_fwd_path_b_bwd",
+    "mode": "path_c_fwd_bwd",
     "selected_forward_kernel": "path_c_tilelang_dsl",
-    "selected_backward_kernel": "metal_kernel_bwd_v1",
+    "selected_backward_kernel": "path_c_tilelang_dsl",
     "rule_z3_plan": {
       "batch": 1,
       "seq": 2048,
       "heads": 112,
       "headdim": 64,
       "state": 64,
-      "dtype": "bfloat16",
+      "dtype": "float32",
       "lanes": 7168,
       "threads": 256,
       "grid_blocks": 28,
@@ -133,35 +234,45 @@
       "mode": "path_c_fwd_bwd",
       "z3_used": true,
       "z3_proved": true,
-      "reason": "rule: fp32-accumulating bfloat16 per-lane scan with 256 threads over 28 blocks; z3 proved per-lane index decomposition and buffer bounds; bwd reverse pass consumes explicit state snapshot tensor boundaries instead of inverse h_prev reconstruction; bwd emits TileLang per-lane partial gradients and reduces P-axis outside the hot scan kernel"
+      "reason": "rule: fp32-accumulating float32 per-lane scan with 256 threads over 28 blocks; z3 proved per-lane index decomposition and buffer bounds; bwd reverse pass consumes explicit state snapshot tensor boundaries instead of inverse h_prev reconstruction; bwd emits TileLang per-lane partial gradients and reduces P-axis outside the hot scan kernel"
     },
     "ratios": {
-      "fwd_path_c_over_path_b": 0.8479202007484841,
-      "bwd_path_c_over_path_b": 1.070058524839377,
-      "fwd_bwd_path_c_over_path_b": 1.0537962315771126
+      "fwd_path_c_over_path_b": 0.966069540859975,
+      "bwd_path_c_over_path_b": 0.8782376345064711,
+      "fwd_bwd_path_c_over_path_b": 0.8836228817629778
     },
     "optimization_policy": "AUTO only promotes a Path C phase when the rule/Z3 plan is safe and paired bench receipt median is no-worse than Path B.",
     "blocked_path_c_codegen_gaps": [
-      "Path C bwd materializes explicit state snapshots as a separate safety kernel",
-      "Path C bwd returns per-lane partial buffers and relies on external MLX reductions",
+      "Path C default bwd materializes explicit state snapshots as a separate safety kernel; FP32 training-only surface can reuse fwd-produced snapshots",
+      "Path C bwd still returns per-lane partial buffers before a separate post-reduce step",
       "final-gradient in-kernel P-axis allreduce remains diagnostic for recurrent bwd hot loops"
     ],
     "remembered_optimizations": [
       "TileLang local.var scalar y_acc instead of thread float[1]",
       "TileLang Metal local.var PrintExpr statement-order fix",
+      "TileLang Mamba3 recurrent kernels materialize decay as a runtime scalar so Metal source reuses exp(A*dt)",
       "TileLang Mamba3 fwd/bwd uses Metal thread_position_in_grid for absolute lane ids",
+      "TileLang Metal canonicalizes non-negative thread-position div/mod so non-power lane decompositions avoid signed floor corrections",
+      "TileLang Mamba3 fwd specializes BATCH==1 batch index and pure-FP32 lane decomposition to avoid redundant hot-loop div/mod",
       "TileLang Mamba3 fwd/bwd uses Path-B-equivalent single-expression SiLU",
       "Bench harness uses paired alternating samples to avoid order/warmup drift",
       "Path C bwd consumes explicit state snapshot boundaries instead of unsafe inverse-state reconstruction",
       "Path C bwd writes generated per-lane partial gradients and moves P-axis reductions outside the recurrent hot loop",
-      "Bench harness profiles generated-partial production bwd and final-gradient SIMD diagnostic bwd separately",
+      "BF16 Path C bwd writes dx/dz/dh0 owner outputs directly as BF16 and stores bandwidth-dominant dB/dC partials as BF16",
+      "BF16 Path C bwd stores state snapshots as BF16 after full-shape Path B parity stayed within BF16 absolute error",
+      "Path C bwd stores dB/dC partials as (B,T,H,N,P) so the P reduction axis is innermost",
+      "Path C bwd uses a separate post-reduce step; BF16 and FP32 production keep the TileLang reducer after value_and_grad showed it is faster for training",
+      "Bench harness profiles generated-partial production bwd, serial/threaded TileLang post-reduce candidates, final-gradient SIMD diagnostic bwd, single-kernel scratch diagnostics, and the scratch+MLX comparison route separately",
+      "BF16 default bwd uses the single-kernel scratch producer with the profiled serial TileLang post-reducer",
+      "Post-reduce selection is dtype-aware: current Metal thread_reduce wins for FP32 partials, while the serial TileLang reducer wins for compact BF16 dB/dC partials",
+      "Path C training surface reuses fwd-produced snapshots for FP32 and keeps BF16 on the faster production bwd route",
       "AUTO selects full Path C only when fwd, bwd, and fwd+bwd receipts are no-worse",
       "AUTO can still select Path C forward with Path B backward when only fwd is no-worse"
     ]
   },
-  "ratio_path_c_over_path_b_fwd": 0.8479202007484841,
-  "ratio_path_c_over_path_b_bwd": 1.070058524839377,
-  "ratio_path_c_over_path_b_fwd_bwd": 1.0537962315771126,
-  "verdict": "Path C forward is no-worse than Path B and is eligible for AUTO promotion, but Path C backward is slower; scheduler selects Path C forward with Path B backward.",
+  "ratio_path_c_over_path_b_fwd": 0.966069540859975,
+  "ratio_path_c_over_path_b_bwd": 0.8782376345064711,
+  "ratio_path_c_over_path_b_fwd_bwd": 0.8836228817629778,
+  "verdict": "Path C forward and backward are no-worse than Path B; scheduler selects full Path C.",
   "matched_run_guard": "Compare Path B and Path C only when both rows were collected on the same hardware with identical kernel inputs. This is a local_only receipt."
 }

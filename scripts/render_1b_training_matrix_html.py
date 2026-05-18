@@ -550,7 +550,7 @@ def render_route_legend() -> str:
           </div>
           <div class="route-card">
             <h3>BF16 Path C</h3>
-            <p>Runs <code>--dtype bfloat16</code> with <code>CPPMEGA_KERNEL_PATH=path_c</code> and <code>CPPMEGA_MAMBA3_PATH_C_BWD=path_b</code>. Mamba3 uses Path C forward with the production Path B backward to avoid the long-sequence state-snapshot allocator blow-up; M2RNN remains full Path C.</p>
+            <p>Runs <code>--dtype bfloat16</code> with <code>CPPMEGA_KERNEL_PATH=path_c</code> and <code>CPPMEGA_MAMBA3_PATH_C_BWD=path_c</code>. Mamba3, M2RNN, and Sparse-MLA are all requested through Path C; no Path B backward fallback is allowed in these cells.</p>
           </div>
           <div class="route-card">
             <h3>FP8 Path B</h3>

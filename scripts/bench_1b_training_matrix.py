@@ -262,7 +262,10 @@ def path_env_and_support(
     if path == "path_c_cold":
         env = {
             "CPPMEGA_KERNEL_PATH": "path_c",
-            MAMBA3_PATH_C_BWD_ENV: "path_b",
+            "CPPMEGA_KERNEL_PATH__MAMBA3_MIMO": "path_c",
+            "CPPMEGA_KERNEL_PATH__M2RNN": "path_c",
+            "CPPMEGA_KERNEL_PATH__SPARSE_MLA": "path_c",
+            MAMBA3_PATH_C_BWD_ENV: "path_c",
         }
         if dtype == "fp8":
             env[SPARSE_MLA_FP8_ROUTE_ENV] = "path_c"
@@ -270,7 +273,10 @@ def path_env_and_support(
     if path == "path_c_warm":
         env = {
             "CPPMEGA_KERNEL_PATH": "path_c",
-            MAMBA3_PATH_C_BWD_ENV: "path_b",
+            "CPPMEGA_KERNEL_PATH__MAMBA3_MIMO": "path_c",
+            "CPPMEGA_KERNEL_PATH__M2RNN": "path_c",
+            "CPPMEGA_KERNEL_PATH__SPARSE_MLA": "path_c",
+            MAMBA3_PATH_C_BWD_ENV: "path_c",
         }
         if dtype == "fp8":
             env[SPARSE_MLA_FP8_ROUTE_ENV] = "path_c"

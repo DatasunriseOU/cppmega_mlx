@@ -1,6 +1,6 @@
 --- path_b_handwritten_msl_body
 +++ path_c_lowered_msl
-@@ -1,72 +1,413 @@
+@@ -1,72 +1,424 @@
 -// Inputs (all fp32 carriers after up-cast in Python wrapper):
 -    //   x      [B, T, H, P]
 -    //   B_proj [B, T, H, N]
@@ -19,7 +19,7 @@
 +#include <metal_stdlib>
 +#include <metal_simdgroup>
 +using namespace metal;
- 
+
 -    uint tid = thread_position_in_grid.x;
 -    uint total_lanes = uint(BATCH) * uint(HEADS) * uint(HEADDIM);
 -    if (tid >= total_lanes) {
@@ -31,7 +31,7 @@
 +union __TVMArgUnion {
 + int v_int[2];
 +};
- 
+
 -    // Per-lane state lives in registers (size N), accumulated as fp32.
 -    float h_state[STATE];
 -    uint h_base = ((b * uint(HEADS) + h) * uint(HEADDIM) + p) * uint(STATE);
@@ -58,7 +58,7 @@
 +  threadgroup const char* s = (threadgroup const char*)src;
 +  for (int i = 0; i < bytes; ++i) { d[i] = s[i]; }
 +}
- 
+
 -    uint xz_stride_t = uint(HEADS) * uint(HEADDIM);
 -    uint bc_stride_t = uint(HEADS) * uint(STATE);
 -    uint adt_stride_t = uint(HEADS);
@@ -234,18 +234,20 @@
 +    }
 +    for (int i = 0; i < batch_size; ++i) {
 +      if (lane == 0) {
-+        red_buf[simdgroup_id + i * workspace_stride] = x[i];
++        const int batch_offset = i * workspace_stride;
++        red_buf[simdgroup_id + batch_offset] = x[i];
 +      }
 +    }
 +    Barrier::template sync<1>();
 +    if (simdgroup_id == 0) {
 +      for (int i = 0; i < batch_size; ++i) {
++        const int batch_offset = i * workspace_stride;
 +        T result = lane < uint(simdgroup_count)
-+                       ? red_buf[lane + i * workspace_stride]
-+                       : red_buf[i * workspace_stride];
++                       ? red_buf[lane + batch_offset]
++                       : red_buf[batch_offset];
 +        result = reduce_partials(result, lane);
 +        if (lane == 0) {
-+          red_buf[final_slot + i * workspace_stride] = result;
++          red_buf[final_slot + batch_offset] = result;
          }
 -        float y_skipped = y_acc + D_h * x_val;
 -        // SiLU: z * sigmoid(z)
@@ -261,7 +263,8 @@
 +    }
 +    Barrier::template sync<2>();
 +    for (int i = 0; i < batch_size; ++i) {
-+      x[i] = red_buf[final_slot + i * workspace_stride];
++      const int batch_offset = i * workspace_stride;
++      x[i] = red_buf[final_slot + batch_offset];
 +    }
 +  }
 +  template <typename T>
@@ -276,24 +279,27 @@
 +    }
 +    for (int i = 0; i < batch_size; ++i) {
 +      if (lane == 0) {
-+        red_buf[simdgroup_id + i * workspace_stride] = x[i];
++        const int batch_offset = i * workspace_stride;
++        red_buf[simdgroup_id + batch_offset] = x[i];
 +      }
 +    }
 +    Barrier::template sync<1>();
 +    if (simdgroup_id == 0) {
 +      for (int i = 0; i < batch_size; ++i) {
++        const int batch_offset = i * workspace_stride;
 +        T result = lane < uint(simdgroup_count)
-+                       ? red_buf[lane + i * workspace_stride]
-+                       : red_buf[i * workspace_stride];
++                       ? red_buf[lane + batch_offset]
++                       : red_buf[batch_offset];
 +        result = reduce_partials(result, lane);
 +        if (lane == 0) {
-+          red_buf[final_slot + i * workspace_stride] = result;
++          red_buf[final_slot + batch_offset] = result;
 +        }
 +      }
 +    }
 +    Barrier::template sync<2>();
 +    for (int i = 0; i < batch_size; ++i) {
-+      x[i] = red_buf[final_slot + i * workspace_stride];
++      const int batch_offset = i * workspace_stride;
++      x[i] = red_buf[final_slot + batch_offset];
 +    }
 +  }
 +};
@@ -345,12 +351,13 @@
 +    if (offset >= 32) {
 +      Barrier::template sync<1>();
 +      for (int i = 0; i < batch_size; ++i) {
-+        red_buf[local_tid + i * workspace_stride] = x[i];
++        const int batch_offset = i * workspace_stride;
++        red_buf[local_tid + batch_offset] = x[i];
 +      }
 +      Barrier::template sync<2>();
 +      for (int i = 0; i < batch_size; ++i) {
-+        x[i] = Reducer()(x[i], red_buf[(local_tid ^ offset) +
-+                                      i * workspace_stride]);
++        const int batch_offset = i * workspace_stride;
++        x[i] = Reducer()(x[i], red_buf[(local_tid ^ offset) + batch_offset]);
 +      }
 +    } else {
 +      for (int i = 0; i < batch_size; ++i) {
@@ -369,12 +376,13 @@
 +    if (offset >= 32) {
 +      Barrier::template sync<1>();
 +      for (int i = 0; i < batch_size; ++i) {
-+        red_buf[local_tid + i * workspace_stride] = x[i];
++        const int batch_offset = i * workspace_stride;
++        red_buf[local_tid + batch_offset] = x[i];
 +      }
 +      Barrier::template sync<2>();
 +      for (int i = 0; i < batch_size; ++i) {
-+        x[i] = Reducer()(x[i], red_buf[(local_tid ^ offset) +
-+                                      i * workspace_stride]);
++        const int batch_offset = i * workspace_stride;
++        x[i] = Reducer()(x[i], red_buf[(local_tid ^ offset) + batch_offset]);
 +      }
 +    } else {
 +      for (int i = 0; i < batch_size; ++i) {
@@ -445,40 +453,43 @@
 +  device float* y [[ buffer(8) ]],
 +  device float* z [[ buffer(9) ]],
 +  uint3 blockIdx [[threadgroup_position_in_grid]],
-+  uint3 threadIdx [[thread_position_in_threadgroup]]
++  uint3 threadIdx [[thread_position_in_threadgroup]],
++  uint3 gridThreadIdx [[thread_position_in_grid]]
 +) {
++  int grid_tid = gridThreadIdx.x;
 +  thread float h_state[64];
++  float decay = 0.000000e+00f;
 +  float y_acc = 0.000000e+00f;
-+  int cse_v3 = (((int)threadIdx.x) * 64);
++  int cse_v1 = (gridThreadIdx.x / 64);
++  float D_h = D[cse_v1];
++  int cse_v2 = (gridThreadIdx.x * 64);
 +  for (int n = 0; n < 64; ++n) {
-+    h_state[n] = h0[(cse_v3 + n)];
++    h_state[n] = h0[(cse_v2 + n)];
 +  }
-+  for (int t = 0; t < 512; ++t) {
-+    int cse_v1 = (((int)threadIdx.x) & 127);
-+    int cse_v2 = (((int)threadIdx.x) >> 7);
-+    int cse_v4 = (cse_v1 >> 5);
-+    int cse_v6 = (((cse_v2 * 2048) + (t * 4)) + cse_v4);
-+    float A_val = A[cse_v6];
-+    float dt_val = dt[cse_v6];
-+    float cse_v2_1 = (A_val * dt_val);
-+    float decay = exp(cse_v2_1);
-+    int cse_v5 = (((cse_v2 * 65536) + (t * 128)) + cse_v1);
++  for (int t = 0; t < 2048; ++t) {
++    int cse_v4 = ((t * 112) + cse_v1);
++    float A_val = A[cse_v4];
++    float dt_val = dt[cse_v4];
++    decay = exp((A_val * dt_val));
++    int cse_v3 = (t * 7168);
++    int cse_v5 = (cse_v3 + gridThreadIdx.x);
 +    float x_val = x[cse_v5];
 +    float z_val = z[cse_v5];
 +    y_acc = 0.000000e+00f;
 +    for (int n_1 = 0; n_1 < 64; ++n_1) {
-+      int cse_v7 = ((((cse_v2 * 131072) + (t * 256)) + (cse_v4 * 64)) + n_1);
-+      float new_h = ((decay * h_state[n_1]) + (x_val * B[cse_v7]));
++      int cse_v6 = ((cse_v3 + (cse_v1 * 64)) + n_1);
++      float B_val = B[cse_v6];
++      float C_val = C[cse_v6];
++      float new_h = ((decay * h_state[n_1]) + (x_val * B_val));
 +      h_state[n_1] = new_h;
-+      y_acc = (y_acc + (new_h * C[cse_v7]));
++      y_acc = (y_acc + (new_h * C_val));
 +    }
-+    float D_h = D[cse_v4];
 +    float y_skipped = (y_acc + (D_h * x_val));
 +    float cse_v1_1 = (z_val * -1.000000e+00f);
-+    float sig_z = (1.000000e+00f / (1.000000e+00f + exp(cse_v1_1)));
-+    y[cse_v5] = ((z_val * sig_z) * y_skipped);
++    float cse_v1_2 = (1.000000e+00f / (1.000000e+00f + exp(cse_v1_1)));
++    y[cse_v5] = ((z_val * cse_v1_2) * y_skipped);
 +  }
 +  for (int n_2 = 0; n_2 < 64; ++n_2) {
-+    h_last[(cse_v3 + n_2)] = h_state[n_2];
++    h_last[(cse_v2 + n_2)] = h_state[n_2];
 +  }
 +}

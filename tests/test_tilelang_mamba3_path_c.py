@@ -42,7 +42,9 @@ from cppmega_mlx.nn._tilelang.mamba3_path_c import (
     dump_lowered_bwd_msl,
     dump_lowered_fwd_msl,
     mamba3_mimo_apply_path_c,
+    mamba3_mimo_apply_training_path_c,
     mamba3_mimo_apply_with_state_path_c,
+    mamba3_mimo_apply_with_state_training_path_c,
     mamba3_mimo_apply_with_state_path_c_fwd_path_b_bwd,
     mamba3_mimo_bwd_path_c,
     mamba3_mimo_fwd_path_c,
@@ -225,6 +227,20 @@ def test_lowered_fwd_msl_contains_kernel_void() -> None:
         assert name in msl, f"buffer {name!r} missing from lowered MSL"
 
 
+def test_fwd_snapshot_route_lowers_h_snap_as_output() -> None:
+    """Training fwd can materialize bwd snapshots without a separate kernel."""
+
+    _require_mamba3_path_c()
+
+    _kernel, lowering = mamba3_path_c._fwd_with_snapshots_kernel_for(
+        1, 4, 1, 2, 4
+    )
+
+    assert "h_snap" in lowering.buffer_param_names
+    assert "device float* h_snap" in lowering.msl_text
+    assert "h_snap[" in lowering.msl_text
+
+
 def test_lowered_bwd_msl_contains_kernel_void() -> None:
     msl = dump_lowered_bwd_msl(batch=1, seq=4, heads=1, headdim=2, state=4)
     assert "kernel void" in msl
@@ -235,6 +251,277 @@ def test_lowered_bwd_msl_contains_kernel_void() -> None:
     _assert_bwd_partial_outputs(msl)
     for name in ("dh0", "dx", "dz"):
         assert name in msl, f"output buffer {name!r} missing from lowered MSL"
+
+
+def test_bwd_scratch_route_lowering_owns_scratch_without_h_snap_input() -> None:
+    _require_mamba3_path_c()
+
+    _kernel, lowering = mamba3_path_c._bwd_scratch_partial_kernel_for(
+        1, 4, 1, 2, 4
+    )
+
+    assert "h_steps_scratch" in lowering.buffer_param_names
+    assert "h_snap" not in lowering.buffer_param_names
+    assert "device float* h_steps_scratch" in lowering.msl_text
+    assert "device float* h_snap" not in lowering.msl_text
+    _assert_bwd_partial_outputs(lowering.msl_text)
+
+
+def test_bwd_scratch_route_lowering_compacts_bf16_partials() -> None:
+    _require_mamba3_path_c()
+
+    dtype_args = (
+        "bfloat16",  # dy
+        "bfloat16",  # x
+        "bfloat16",  # B
+        "bfloat16",  # C
+        "bfloat16",  # z
+        "bfloat16",  # A
+        "bfloat16",  # dt
+        "bfloat16",  # D
+        "bfloat16",  # h0
+        "bfloat16",  # dx
+        "bfloat16",  # dz
+        "bfloat16",  # dB_partial
+        "bfloat16",  # dC_partial
+        "float32",  # dA_partial
+        "float32",  # ddt_partial
+        "float32",  # dD_partial
+        "bfloat16",  # dh0
+        "bfloat16",  # h_steps_scratch
+    )
+    _kernel, lowering = mamba3_path_c._bwd_scratch_partial_kernel_for(
+        1, 4, 1, 4, 4, *dtype_args
+    )
+
+    assert "device tvm_bfloat16* h_steps_scratch" in lowering.msl_text
+    assert "device tvm_bfloat16* dB_partial" in lowering.msl_text
+    assert "device tvm_bfloat16* dC_partial" in lowering.msl_text
+    assert "device float* dA_partial" in lowering.msl_text
+    assert "device float* ddt_partial" in lowering.msl_text
+    assert "device float* dD_partial" in lowering.msl_text
+
+
+def test_dump_lowered_bwd_msl_matches_bf16_partial_dtype_policy() -> None:
+    _require_mamba3_path_c()
+
+    msl = dump_lowered_bwd_msl(
+        batch=1,
+        seq=4,
+        heads=1,
+        headdim=4,
+        state=4,
+        dtype="bfloat16",
+    )
+
+    assert "device tvm_bfloat16* dB_partial" in msl
+    assert "device tvm_bfloat16* dC_partial" in msl
+    assert "device float* dA_partial" in msl
+    assert "device float* ddt_partial" in msl
+    assert "device float* dD_partial" in msl
+
+
+def test_bwd_partial_reduce_kernel_matches_mlx_sum_small_shape() -> None:
+    """Standalone TileLang P-reducer matches the MLX reductions it may replace."""
+
+    _require_mamba3_path_c()
+    batch, seq, heads, headdim, state = 1, 3, 2, 4, 5
+    mx.random.seed(71)
+    dB_partial = mx.random.normal((batch, seq, heads, state, headdim)).astype(mx.float32)
+    dC_partial = mx.random.normal((batch, seq, heads, state, headdim)).astype(mx.float32)
+    dA_partial = mx.random.normal((batch, seq, heads, headdim)).astype(mx.float32)
+    ddt_partial = mx.random.normal((batch, seq, heads, headdim)).astype(mx.float32)
+    dD_partial = mx.random.normal((batch, heads, headdim)).astype(mx.float32)
+    mx.eval(dB_partial, dC_partial, dA_partial, ddt_partial, dD_partial)
+
+    reduced = mamba3_path_c._reduce_bwd_partials_path_c_kernel(
+        dB_partial,
+        dC_partial,
+        dA_partial,
+        ddt_partial,
+        dD_partial,
+    )
+    expected = (
+        mx.sum(dB_partial, axis=4),
+        mx.sum(dC_partial, axis=4),
+        mx.sum(dA_partial, axis=3),
+        mx.sum(ddt_partial, axis=3),
+        mx.sum(dD_partial, axis=(0, 2)),
+    )
+    mx.eval(*reduced, *expected)
+    for name, got, want in zip(("dB", "dC", "dA", "ddt", "dD"), reduced, expected, strict=True):
+        np.testing.assert_allclose(
+            _np(got),
+            _np(want),
+            rtol=1e-5,
+            atol=1e-5,
+            err_msg=f"partial reducer mismatch on {name}",
+        )
+
+
+def test_bwd_partial_reduce_kernel_can_write_bf16_outputs() -> None:
+    """Diagnostic reducer can write final BF16 grads without hidden MLX casts."""
+
+    _require_mamba3_path_c()
+    batch, seq, heads, headdim, state = 1, 3, 2, 4, 5
+    mx.random.seed(74)
+    dB_partial = mx.random.normal((batch, seq, heads, state, headdim)).astype(mx.float32)
+    dC_partial = mx.random.normal((batch, seq, heads, state, headdim)).astype(mx.float32)
+    dA_partial = mx.random.normal((batch, seq, heads, headdim)).astype(mx.float32)
+    ddt_partial = mx.random.normal((batch, seq, heads, headdim)).astype(mx.float32)
+    dD_partial = mx.random.normal((batch, heads, headdim)).astype(mx.float32)
+    mx.eval(dB_partial, dC_partial, dA_partial, ddt_partial, dD_partial)
+
+    reduced = mamba3_path_c._reduce_bwd_partials_path_c_kernel(
+        dB_partial,
+        dC_partial,
+        dA_partial,
+        ddt_partial,
+        dD_partial,
+        output_dtypes=("bfloat16", "bfloat16", "bfloat16", "bfloat16", "bfloat16"),
+    )
+    expected = (
+        mx.sum(dB_partial, axis=4).astype(mx.bfloat16),
+        mx.sum(dC_partial, axis=4).astype(mx.bfloat16),
+        mx.sum(dA_partial, axis=3).astype(mx.bfloat16),
+        mx.sum(ddt_partial, axis=3).astype(mx.bfloat16),
+        mx.sum(dD_partial, axis=(0, 2)).astype(mx.bfloat16),
+    )
+    mx.eval(*reduced, *expected)
+
+    for got in reduced:
+        assert got.dtype == mx.bfloat16
+    for name, got, want in zip(("dB", "dC", "dA", "ddt", "dD"), reduced, expected, strict=True):
+        np.testing.assert_allclose(
+            _np(got),
+            _np(want),
+            rtol=0,
+            atol=0,
+            err_msg=f"bf16 partial reducer mismatch on {name}",
+        )
+
+
+def test_bwd_threaded_partial_reduce_kernel_matches_mlx_sum_small_shape() -> None:
+    """Threaded P-reducer is a candidate for replacing serial post-reduce."""
+
+    _require_mamba3_path_c()
+    batch, seq, heads, headdim, state = 1, 3, 2, 4, 5
+    mx.random.seed(75)
+    dB_partial = mx.random.normal((batch, seq, heads, state, headdim)).astype(mx.float32)
+    dC_partial = mx.random.normal((batch, seq, heads, state, headdim)).astype(mx.float32)
+    dA_partial = mx.random.normal((batch, seq, heads, headdim)).astype(mx.float32)
+    ddt_partial = mx.random.normal((batch, seq, heads, headdim)).astype(mx.float32)
+    dD_partial = mx.random.normal((batch, heads, headdim)).astype(mx.float32)
+    mx.eval(dB_partial, dC_partial, dA_partial, ddt_partial, dD_partial)
+
+    reduced = mamba3_path_c._reduce_bwd_partials_path_c_threaded_kernel(
+        dB_partial,
+        dC_partial,
+        dA_partial,
+        ddt_partial,
+        dD_partial,
+    )
+    expected = (
+        mx.sum(dB_partial, axis=4),
+        mx.sum(dC_partial, axis=4),
+        mx.sum(dA_partial, axis=3),
+        mx.sum(ddt_partial, axis=3),
+        mx.sum(dD_partial, axis=(0, 2)),
+    )
+    mx.eval(*reduced, *expected)
+    for name, got, want in zip(("dB", "dC", "dA", "ddt", "dD"), reduced, expected, strict=True):
+        np.testing.assert_allclose(
+            _np(got),
+            _np(want),
+            rtol=1e-5,
+            atol=1e-5,
+            err_msg=f"threaded partial reducer mismatch on {name}",
+        )
+
+
+def test_bwd_threaded_partial_reduce_kernel_lowers_thread_reduce() -> None:
+    _require_mamba3_path_c()
+
+    _kernel, lowering = mamba3_path_c._bwd_partial_reduce_threaded_kernel_for(
+        1, 3, 2, 4, 5
+    )
+
+    assert lowering.threadgroup == (4, 256, 1)
+    assert "thread_position_in_threadgroup" in lowering.msl_text
+    assert "simd_sum" in lowering.msl_text
+
+
+def test_bwd_partial_outputs_compact_large_reduction_partials_for_bf16() -> None:
+    """BF16 bwd stores bandwidth-dominant dB/dC partials as BF16."""
+
+    _require_mamba3_path_c()
+    inputs = _make_inputs(batch=1, seq=4, heads=2, headdim=4, state=8, dtype=mx.bfloat16)
+    x, B, C, z, A, dt, D, h0 = inputs
+    mx.random.seed(72)
+    dy = (mx.random.normal(x.shape) * 0.1).astype(mx.bfloat16)
+    mx.eval(dy)
+
+    (
+        dx_pc,
+        dz_pc,
+        dB_partial,
+        dC_partial,
+        dA_partial,
+        ddt_partial,
+        dD_partial,
+        dh0_pc,
+    ) = mamba3_path_c._mamba3_mimo_bwd_path_c_partial_outputs(
+        dy, x, B, C, z, A, dt, D, h0
+    )
+    mx.eval(dx_pc, dz_pc, dB_partial, dC_partial, dA_partial, ddt_partial, dD_partial, dh0_pc)
+
+    assert dx_pc.dtype == mx.bfloat16
+    assert dz_pc.dtype == mx.bfloat16
+    assert dh0_pc.dtype == mx.bfloat16
+    assert dB_partial.dtype == mx.bfloat16
+    assert dC_partial.dtype == mx.bfloat16
+    assert dA_partial.dtype == mx.float32
+    assert ddt_partial.dtype == mx.float32
+    assert dD_partial.dtype == mx.float32
+
+
+def test_bwd_partial_outputs_store_bc_reduction_axis_innermost() -> None:
+    """dB/dC partials should make the P reduction contiguous for post-reduce."""
+
+    _require_mamba3_path_c()
+    batch, seq, heads, headdim, state = 1, 4, 2, 4, 8
+    inputs = _make_inputs(
+        batch=batch,
+        seq=seq,
+        heads=heads,
+        headdim=headdim,
+        state=state,
+        dtype=mx.float32,
+    )
+    x, B, C, z, A, dt, D, h0 = inputs
+    mx.random.seed(73)
+    dy = (mx.random.normal(x.shape) * 0.1).astype(mx.float32)
+    mx.eval(dy)
+
+    (
+        _dx_pc,
+        _dz_pc,
+        dB_partial,
+        dC_partial,
+        dA_partial,
+        ddt_partial,
+        dD_partial,
+        _dh0_pc,
+    ) = mamba3_path_c._mamba3_mimo_bwd_path_c_partial_outputs(
+        dy, x, B, C, z, A, dt, D, h0
+    )
+    mx.eval(dB_partial, dC_partial, dA_partial, ddt_partial, dD_partial)
+
+    assert tuple(dB_partial.shape) == (batch, seq, heads, state, headdim)
+    assert tuple(dC_partial.shape) == (batch, seq, heads, state, headdim)
+    assert tuple(dA_partial.shape) == (batch, seq, heads, headdim)
+    assert tuple(ddt_partial.shape) == (batch, seq, heads, headdim)
+    assert tuple(dD_partial.shape) == (batch, heads, headdim)
 
 
 def test_lowered_bwd_bench_shape_uses_partial_outputs_not_hot_allreduce() -> None:
@@ -352,7 +639,7 @@ def test_lowered_msl_reuses_hot_scalar_temporaries() -> None:
     assert "thread float y_acc[1]" not in fwd
     assert "gridThreadIdx [[thread_position_in_grid]]" in fwd
     assert "blockIdx.x) * 256) + (((int)threadIdx.x)" not in fwd
-    assert len(re.findall(r"float decay = exp\(", fwd)) == 1
+    assert len(re.findall(r"\bdecay = exp\(", fwd)) == 1
     assert re.search(r"exp\([^;\n]+\) \* h_state", fwd) is None
     assert fwd.index("float D_h =") < fwd.index("for (int t =")
     assert "if (0.000000e+00f <= z_val)" not in fwd
@@ -363,7 +650,7 @@ def test_lowered_msl_reuses_hot_scalar_temporaries() -> None:
     bwd = dump_lowered_bwd_msl(batch=1, seq=4, heads=1, headdim=2, state=4)
     assert "gridThreadIdx [[thread_position_in_grid]]" in bwd
     assert "blockIdx.x) * 256) + (((int)threadIdx.x)" not in bwd
-    assert len(re.findall(r"float decay = exp\(", bwd)) == 1
+    assert len(re.findall(r"\bdecay = exp\(", bwd)) == 1
     assert "h_snap" in bwd
     assert "1.000000e+00 / decay" not in bwd
     assert re.search(r"d_decay\[0\] \* exp\(", bwd) is None
@@ -378,6 +665,112 @@ def test_lowered_msl_reuses_hot_scalar_temporaries() -> None:
     assert "sig_z = sig_z" not in bwd
 
 
+def test_runtime_fwd_msl_reuses_decay_scalar_without_dump_postprocess() -> None:
+    """The tvm-ffi fwd runtime source must not rely on report-only MSL cleanup."""
+
+    _require_mamba3_path_c()
+    _fwd_kernel, fwd_lowering = mamba3_path_c._fwd_kernel_for(1, 4, 1, 2, 4)
+
+    assert re.search(r"\bdecay = exp\(", fwd_lowering.msl_text)
+    assert re.search(r"new_h = [^;\n]*exp\(", fwd_lowering.msl_text) is None
+
+
+def test_runtime_fwd_msl_omits_signed_grid_mod_corrections_for_full_lane_shape() -> None:
+    """Full-shape lane decomposition must use unsigned Metal thread ids."""
+
+    _require_mamba3_path_c()
+    _fwd_kernel, fwd_lowering = mamba3_path_c._fwd_kernel_for(2, 2048, 112, 64, 64)
+    body = fwd_lowering.msl_text.split("kernel void", 1)[1]
+
+    assert "gridThreadIdx.x % 7168" in body
+    assert "gridThreadIdx.x / 7168" in body
+    assert ">> 31" not in body
+    assert ">>31" not in body
+    assert "7168 &" not in body
+
+
+def test_runtime_fwd_msl_specializes_batch_one_index_base_for_full_lane_shape() -> None:
+    """Batch-one forward should not recompute a zero batch index in the T loop."""
+
+    _require_mamba3_path_c()
+    _fwd_kernel, fwd_lowering = mamba3_path_c._fwd_kernel_for(1, 2048, 112, 64, 64)
+    body = fwd_lowering.msl_text.split("kernel void", 1)[1]
+    t_loop = body.split("for (int t = 0; t < 2048; ++t)", 1)[1]
+
+    assert "gridThreadIdx.x % 7168" not in body
+    assert "gridThreadIdx.x / 7168" not in t_loop
+    assert "* 14680064" not in t_loop
+
+
+def test_runtime_bwd_msl_reuses_decay_scalar_without_dump_postprocess() -> None:
+    """The tvm-ffi bwd runtime source must not rely on report-only MSL cleanup."""
+
+    _require_mamba3_path_c()
+    _bwd_kernel, bwd_lowering = mamba3_path_c._bwd_partial_kernel_for_state_snapshots(
+        1, 4, 1, 2, 4
+    )
+
+    assert re.search(r"\bdecay = exp\(", bwd_lowering.msl_text)
+    assert re.search(r"dh\[[^\]]+\] = [^;\n]*exp\(", bwd_lowering.msl_text) is None
+    assert re.search(r"d_logdecay = [^;\n]*exp\(", bwd_lowering.msl_text) is None
+
+
+def test_runtime_bwd_msl_specializes_batch_one_index_base_for_full_lane_shape() -> None:
+    """Batch-one backward should not recompute a zero batch index in the T loop."""
+
+    _require_mamba3_path_c()
+    dtype_args = ("bfloat16",) * 18
+    _bwd_kernel, bwd_lowering = mamba3_path_c._bwd_partial_kernel_for_state_snapshots(
+        1,
+        2048,
+        112,
+        64,
+        64,
+        *dtype_args,
+    )
+    body = bwd_lowering.msl_text.split("kernel void", 1)[1]
+    rt_loop = body.split("for (int rt = 0; rt < 2048; ++rt)", 1)[1]
+
+    assert "gridThreadIdx.x % 7168" not in body
+    assert "gridThreadIdx.x / 7168" not in rt_loop
+    assert "* 14680064" not in rt_loop
+
+
+def test_runtime_bwd_msl_elides_full_lane_guard_for_aligned_model_shape() -> None:
+    """Aligned 1B bwd kernels should not branch around every recurrent step."""
+
+    _require_mamba3_path_c()
+    _snap_kernel, snap_lowering = mamba3_path_c._bwd_state_snapshots_kernel_for(
+        1, 2048, 112, 64, 64
+    )
+    _partial_kernel, partial_lowering = mamba3_path_c._bwd_partial_kernel_for_state_snapshots(
+        1, 2048, 112, 64, 64
+    )
+    _scratch_kernel, scratch_lowering = mamba3_path_c._bwd_scratch_partial_kernel_for(
+        1, 2048, 112, 64, 64
+    )
+
+    for lowering in (snap_lowering, partial_lowering, scratch_lowering):
+        body = lowering.msl_text.split("kernel void", 1)[1]
+        assert "gridThreadIdx.x < 7168" not in body
+
+    for lowering in (partial_lowering, scratch_lowering):
+        hot_loop = lowering.msl_text.split("for (int rt = 0; rt < 2048; ++rt)", 1)[1]
+        assert "gridThreadIdx.x % 64" not in hot_loop
+
+
+def test_runtime_bwd_msl_keeps_lane_guard_for_unaligned_shape() -> None:
+    """The exact-lane cleanup must not remove OOB protection on ragged grids."""
+
+    _require_mamba3_path_c()
+    _partial_kernel, partial_lowering = mamba3_path_c._bwd_partial_kernel_for_state_snapshots(
+        1, 4, 5, 65, 4
+    )
+    body = partial_lowering.msl_text.split("kernel void", 1)[1]
+
+    assert "gridThreadIdx.x < 325" in body
+
+
 def test_raw_lowering_uses_tilelang_metal_scalar_pipeline() -> None:
     _require_mamba3_path_c()
 
@@ -387,9 +780,10 @@ def test_raw_lowering_uses_tilelang_metal_scalar_pipeline() -> None:
     assert lowering.grid == (1, 1, 1)
     assert lowering.threadgroup == (64, 1, 1)
     assert "h_snap" in lowering.body
-    assert "float decay = exp(" in lowering.body
+    assert re.search(r"\bdecay = exp\(", lowering.body)
     assert "1.000000e+00 / decay" not in lowering.body
-    assert "exp((A_val * dt_val))" not in lowering.body
+    assert re.search(r"dh\[[^\]]+\] = [^;\n]*exp\(", lowering.body) is None
+    assert re.search(r"d_logdecay = [^;\n]*exp\(", lowering.body) is None
     assert "T.metal_thread_position_in_grid_x() % 64" not in lowering.body
 
 
@@ -806,6 +1200,31 @@ def test_fwd_path_c_matches_path_b_at_bench_shape_fp32() -> None:
     np.testing.assert_allclose(_np(y_pc), _np(y_pb), rtol=1e-3, atol=1e-4)
 
 
+def test_fwd_snapshot_route_matches_fwd_and_snapshot_kernel_fp32() -> None:
+    """Training fwd snapshots match the standalone snapshot kernel exactly enough."""
+
+    _require_mamba3_path_c()
+    inputs = _make_inputs(batch=1, seq=5, heads=2, headdim=4, state=8, dtype=mx.float32)
+    x, B, C, z, A, dt, D, h0 = inputs
+
+    y_snap, h_last_snap, h_snap = mamba3_path_c._mamba3_mimo_fwd_path_c_with_snapshots(
+        x, B, C, z, A, dt, D, h0
+    )
+    y_ref, h_last_ref = mamba3_mimo_fwd_path_c(x, B, C, z, A, dt, D, h0)
+    snapshot_kernel, _lowering = mamba3_path_c._bwd_state_snapshots_kernel_for(
+        1, 5, 2, 4, 8
+    )
+    snapshot_out = snapshot_kernel(x, B, A, dt, h0)
+    h_snap_ref = snapshot_out[0] if isinstance(snapshot_out, (list, tuple)) else snapshot_out
+    mx.eval(y_snap, h_last_snap, h_snap, y_ref, h_last_ref, h_snap_ref)
+
+    np.testing.assert_allclose(_np(y_snap), _np(y_ref), rtol=1e-3, atol=1e-4)
+    np.testing.assert_allclose(_np(h_last_snap), _np(h_last_ref), rtol=1e-4, atol=1e-5)
+    np.testing.assert_allclose(_np(h_snap), _np(h_snap_ref), rtol=1e-4, atol=1e-5)
+    np.testing.assert_allclose(_np(h_snap[:, 0]), _np(h0), rtol=1e-4, atol=1e-5)
+    np.testing.assert_allclose(_np(h_snap[:, -1]), _np(h_last_snap), rtol=1e-4, atol=1e-5)
+
+
 def test_fwd_path_c_rejects_fp16_without_hidden_casts() -> None:
     """Path C must not materialize large hidden cast buffers for unsupported inputs."""
 
@@ -854,6 +1273,384 @@ def test_bwd_path_c_matches_path_b_fp32_small_shape() -> None:
                                     err_msg=f"grad mismatch on {name}")
 
 
+def test_bwd_scratch_route_matches_path_b_fp32_small_shape() -> None:
+    """Single-kernel scratch bwd route matches Path B before it is promoted."""
+
+    _require_mamba3_path_c()
+    inputs = _make_inputs(batch=1, seq=5, heads=2, headdim=4, state=8, dtype=mx.float32)
+    x, B, C, z, A, dt, D, h0 = inputs
+    mx.random.seed(321)
+    dy = (mx.random.normal(x.shape) * 0.1).astype(mx.float32)
+    mx.eval(dy)
+
+    g_pc = mamba3_path_c._mamba3_mimo_bwd_path_c_scratch_kernel(
+        dy, x, B, C, z, A, dt, D, h0
+    )
+    g_pb = mamba3_mimo_bwd_metal(dy, x, B, C, z, A, dt, D, h0)
+    mx.eval(*g_pc, *g_pb)
+
+    names = ["dx", "dB", "dC", "dz", "dA", "ddt", "dD", "dh0"]
+    for name, gpc, gpb in zip(names, g_pc, g_pb, strict=True):
+        np.testing.assert_allclose(
+            _np(gpc),
+            _np(gpb),
+            rtol=1e-3,
+            atol=1e-4,
+            err_msg=f"scratch bwd grad mismatch on {name}",
+        )
+
+
+def test_bwd_scratch_route_matches_path_b_bf16_small_shape() -> None:
+    """BF16 scratch route keeps final grads in BF16 and matches Path B tolerance."""
+
+    _require_mamba3_path_c()
+    inputs = _make_inputs(batch=1, seq=5, heads=2, headdim=4, state=8, dtype=mx.bfloat16)
+    x, B, C, z, A, dt, D, h0 = inputs
+    mx.random.seed(327)
+    dy = (mx.random.normal(x.shape) * 0.1).astype(mx.bfloat16)
+    mx.eval(dy)
+
+    g_pc = mamba3_path_c._mamba3_mimo_bwd_path_c_scratch_kernel(
+        dy, x, B, C, z, A, dt, D, h0
+    )
+    g_pb = mamba3_mimo_bwd_metal(dy, x, B, C, z, A, dt, D, h0)
+    mx.eval(*g_pc, *g_pb)
+
+    names = ["dx", "dB", "dC", "dz", "dA", "ddt", "dD", "dh0"]
+    for name, gpc, gpb in zip(names, g_pc, g_pb, strict=True):
+        assert gpc.dtype == gpb.dtype == mx.bfloat16
+        np.testing.assert_allclose(
+            _np(gpc),
+            _np(gpb),
+            rtol=8e-3,
+            atol=2e-3,
+            err_msg=f"bf16 scratch bwd grad mismatch on {name}",
+        )
+
+
+def test_bwd_scratch_mlx_reduce_route_matches_path_b_bf16_small_shape() -> None:
+    """BF16 scratch+MLX-reduce route matches Path B before default promotion."""
+
+    _require_mamba3_path_c()
+    inputs = _make_inputs(batch=1, seq=5, heads=2, headdim=4, state=8, dtype=mx.bfloat16)
+    x, B, C, z, A, dt, D, h0 = inputs
+    mx.random.seed(330)
+    dy = (mx.random.normal(x.shape) * 0.1).astype(mx.bfloat16)
+    mx.eval(dy)
+
+    g_pc = mamba3_path_c._mamba3_mimo_bwd_path_c_scratch_mlx_reduce_kernel(
+        dy, x, B, C, z, A, dt, D, h0
+    )
+    g_pb = mamba3_mimo_bwd_metal(dy, x, B, C, z, A, dt, D, h0)
+    mx.eval(*g_pc, *g_pb)
+
+    names = ["dx", "dB", "dC", "dz", "dA", "ddt", "dD", "dh0"]
+    for name, gpc, gpb in zip(names, g_pc, g_pb, strict=True):
+        assert gpc.dtype == gpb.dtype == mx.bfloat16
+        np.testing.assert_allclose(
+            _np(gpc),
+            _np(gpb),
+            rtol=8e-3,
+            atol=2e-3,
+            err_msg=f"bf16 scratch+mlx-reduce bwd grad mismatch on {name}",
+        )
+
+
+def test_bwd_scratch_route_uses_tilelang_post_reduce(monkeypatch) -> None:
+    """Scratch route must use the same fast TileLang reduction tail."""
+
+    _require_mamba3_path_c()
+    calls: list[tuple[str, ...] | None] = []
+    original_reduce = mamba3_path_c._reduce_bwd_partials_path_c_threaded_kernel
+
+    def wrapped_reduce(*args, **kwargs):
+        output_dtypes = kwargs.get("output_dtypes")
+        calls.append(output_dtypes)
+        return original_reduce(*args, **kwargs)
+
+    monkeypatch.setattr(
+        mamba3_path_c,
+        "_reduce_bwd_partials_path_c_threaded_kernel",
+        wrapped_reduce,
+    )
+
+    inputs = _make_inputs(batch=1, seq=5, heads=2, headdim=4, state=8, dtype=mx.float32)
+    x, B, C, z, A, dt, D, h0 = inputs
+    mx.random.seed(326)
+    dy = (mx.random.normal(x.shape) * 0.1).astype(mx.float32)
+    mx.eval(dy)
+
+    grads = mamba3_path_c._mamba3_mimo_bwd_path_c_scratch_kernel(
+        dy, x, B, C, z, A, dt, D, h0
+    )
+    mx.eval(*grads)
+
+    assert calls == [None]
+
+
+def test_bwd_scratch_route_uses_compact_partials_for_bf16(monkeypatch) -> None:
+    """BF16 scratch diagnostic should compare against production dtype policy."""
+
+    _require_mamba3_path_c()
+    seen_partial_dtypes: list[tuple[str, str, str, str, str]] = []
+    original_kernel_for = mamba3_path_c._bwd_scratch_partial_kernel_for
+
+    def wrapped_kernel_for(*args, **kwargs):
+        del kwargs
+        seen_partial_dtypes.append(tuple(args[16:21]))
+        return original_kernel_for(*args)
+
+    monkeypatch.setattr(
+        mamba3_path_c,
+        "_bwd_scratch_partial_kernel_for",
+        wrapped_kernel_for,
+    )
+
+    inputs = _make_inputs(batch=1, seq=5, heads=2, headdim=4, state=8, dtype=mx.bfloat16)
+    x, B, C, z, A, dt, D, h0 = inputs
+    mx.random.seed(329)
+    dy = (mx.random.normal(x.shape) * 0.1).astype(mx.bfloat16)
+    mx.eval(dy)
+
+    grads = mamba3_path_c._mamba3_mimo_bwd_path_c_scratch_kernel(
+        dy, x, B, C, z, A, dt, D, h0
+    )
+    mx.eval(*grads)
+
+    assert seen_partial_dtypes == [
+        ("bfloat16", "bfloat16", "float32", "float32", "float32")
+    ]
+
+
+def test_bwd_scratch_bf16_uses_serial_tilelang_post_reduce(monkeypatch) -> None:
+    """BF16 compact partials should not take the slower threaded reducer."""
+
+    _require_mamba3_path_c()
+    serial_calls: list[tuple[str, ...] | None] = []
+    threaded_calls = 0
+    original_serial = mamba3_path_c._reduce_bwd_partials_path_c_kernel
+
+    def wrapped_serial(*args, **kwargs):
+        output_dtypes = kwargs.get("output_dtypes")
+        serial_calls.append(output_dtypes)
+        return original_serial(*args, **kwargs)
+
+    def fail_threaded(*_args, **_kwargs):
+        nonlocal threaded_calls
+        threaded_calls += 1
+        raise AssertionError("BF16 compact partials should use the serial reducer")
+
+    monkeypatch.setattr(
+        mamba3_path_c,
+        "_reduce_bwd_partials_path_c_kernel",
+        wrapped_serial,
+    )
+    monkeypatch.setattr(
+        mamba3_path_c,
+        "_reduce_bwd_partials_path_c_threaded_kernel",
+        fail_threaded,
+    )
+
+    inputs = _make_inputs(batch=1, seq=5, heads=2, headdim=4, state=8, dtype=mx.bfloat16)
+    x, B, C, z, A, dt, D, h0 = inputs
+    mx.random.seed(330)
+    dy = (mx.random.normal(x.shape) * 0.1).astype(mx.bfloat16)
+    mx.eval(dy)
+
+    grads = mamba3_path_c._mamba3_mimo_bwd_path_c_scratch_kernel(
+        dy, x, B, C, z, A, dt, D, h0
+    )
+    mx.eval(*grads)
+
+    assert serial_calls == [
+        ("bfloat16", "bfloat16", "bfloat16", "bfloat16", "bfloat16")
+    ]
+    assert threaded_calls == 0
+
+
+def test_bwd_from_training_fwd_snapshots_matches_path_b_fp32(monkeypatch) -> None:
+    """Bwd can consume fwd-produced snapshots without launching snapshot kernel."""
+
+    _require_mamba3_path_c()
+    inputs = _make_inputs(batch=1, seq=5, heads=2, headdim=4, state=8, dtype=mx.float32)
+    x, B, C, z, A, dt, D, h0 = inputs
+    mx.random.seed(327)
+    dy = (mx.random.normal(x.shape) * 0.1).astype(mx.float32)
+    mx.eval(dy)
+
+    _y, _h_last, h_snap = mamba3_path_c._mamba3_mimo_fwd_path_c_with_snapshots(
+        x, B, C, z, A, dt, D, h0
+    )
+    mx.eval(h_snap)
+
+    def fail_snapshot_builder(*_args, **_kwargs):
+        raise AssertionError("snapshot kernel must not be built for snapshot-reuse bwd")
+
+    monkeypatch.setattr(
+        mamba3_path_c,
+        "_bwd_state_snapshots_kernel_for",
+        fail_snapshot_builder,
+    )
+
+    g_pc = mamba3_path_c._mamba3_mimo_bwd_path_c_from_snapshots_kernel(
+        dy, x, B, C, z, A, dt, D, h0, h_snap
+    )
+    g_pb = mamba3_mimo_bwd_metal(dy, x, B, C, z, A, dt, D, h0)
+    mx.eval(*g_pc, *g_pb)
+
+    names = ["dx", "dB", "dC", "dz", "dA", "ddt", "dD", "dh0"]
+    for name, gpc, gpb in zip(names, g_pc, g_pb, strict=True):
+        np.testing.assert_allclose(
+            _np(gpc),
+            _np(gpb),
+            rtol=1e-3,
+            atol=1e-4,
+            err_msg=f"snapshot-reuse bwd grad mismatch on {name}",
+        )
+
+
+def test_bwd_tilelang_post_reduce_route_matches_path_b_fp32_small_shape() -> None:
+    """TileLang post-reduce bwd diagnostic route matches Path B before promotion."""
+
+    _require_mamba3_path_c()
+    inputs = _make_inputs(batch=1, seq=5, heads=2, headdim=4, state=8, dtype=mx.float32)
+    x, B, C, z, A, dt, D, h0 = inputs
+    mx.random.seed(322)
+    dy = (mx.random.normal(x.shape) * 0.1).astype(mx.float32)
+    mx.eval(dy)
+
+    g_pc = mamba3_path_c._mamba3_mimo_bwd_path_c_partial_tl_reduce_kernel(
+        dy, x, B, C, z, A, dt, D, h0
+    )
+    g_pb = mamba3_mimo_bwd_metal(dy, x, B, C, z, A, dt, D, h0)
+    mx.eval(*g_pc, *g_pb)
+
+    names = ["dx", "dB", "dC", "dz", "dA", "ddt", "dD", "dh0"]
+    for name, gpc, gpb in zip(names, g_pc, g_pb, strict=True):
+        np.testing.assert_allclose(
+            _np(gpc),
+            _np(gpb),
+            rtol=1e-3,
+            atol=1e-4,
+            err_msg=f"tilelang post-reduce bwd grad mismatch on {name}",
+        )
+
+
+def test_bwd_threaded_post_reduce_route_matches_path_b_fp32_small_shape() -> None:
+    """Threaded TileLang post-reduce route matches Path B before promotion."""
+
+    _require_mamba3_path_c()
+    inputs = _make_inputs(batch=1, seq=5, heads=2, headdim=4, state=8, dtype=mx.float32)
+    x, B, C, z, A, dt, D, h0 = inputs
+    mx.random.seed(328)
+    dy = (mx.random.normal(x.shape) * 0.1).astype(mx.float32)
+    mx.eval(dy)
+
+    g_pc = mamba3_path_c._mamba3_mimo_bwd_path_c_partial_threaded_reduce_kernel(
+        dy, x, B, C, z, A, dt, D, h0
+    )
+    g_pb = mamba3_mimo_bwd_metal(dy, x, B, C, z, A, dt, D, h0)
+    mx.eval(*g_pc, *g_pb)
+
+    names = ["dx", "dB", "dC", "dz", "dA", "ddt", "dD", "dh0"]
+    for name, gpc, gpb in zip(names, g_pc, g_pb, strict=True):
+        np.testing.assert_allclose(
+            _np(gpc),
+            _np(gpb),
+            rtol=1e-3,
+            atol=1e-4,
+            err_msg=f"threaded post-reduce bwd grad mismatch on {name}",
+        )
+
+
+def test_bwd_tilelang_post_reduce_route_matches_path_b_bf16_small_shape() -> None:
+    """BF16 TileLang post-reduce route can write final reducer outputs as BF16."""
+
+    _require_mamba3_path_c()
+    inputs = _make_inputs(batch=1, seq=5, heads=2, headdim=4, state=8, dtype=mx.bfloat16)
+    x, B, C, z, A, dt, D, h0 = inputs
+    mx.random.seed(323)
+    dy = (mx.random.normal(x.shape) * 0.1).astype(mx.bfloat16)
+    mx.eval(dy)
+
+    g_pc = mamba3_path_c._mamba3_mimo_bwd_path_c_partial_tl_reduce_kernel(
+        dy, x, B, C, z, A, dt, D, h0
+    )
+    g_pb = mamba3_mimo_bwd_metal(dy, x, B, C, z, A, dt, D, h0)
+    mx.eval(*g_pc, *g_pb)
+
+    names = ["dx", "dB", "dC", "dz", "dA", "ddt", "dD", "dh0"]
+    for name, gpc, gpb in zip(names, g_pc, g_pb, strict=True):
+        assert gpc.dtype == gpb.dtype == mx.bfloat16
+        np.testing.assert_allclose(
+            _np(gpc),
+            _np(gpb),
+            rtol=2e-2,
+            atol=2e-3,
+            err_msg=f"bf16 tilelang post-reduce bwd grad mismatch on {name}",
+        )
+
+
+def test_bwd_path_c_bf16_production_uses_scratch_tilelang_reduce(monkeypatch) -> None:
+    """BF16 production bwd uses the promoted scratch producer plus TileLang reducer."""
+
+    _require_mamba3_path_c()
+    calls = 0
+    original_reduce = mamba3_path_c._mamba3_mimo_bwd_path_c_scratch_kernel
+
+    def wrapped_reduce(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_reduce(*args, **kwargs)
+
+    monkeypatch.setattr(
+        mamba3_path_c,
+        "_mamba3_mimo_bwd_path_c_scratch_kernel",
+        wrapped_reduce,
+    )
+
+    inputs = _make_inputs(batch=1, seq=5, heads=2, headdim=4, state=8, dtype=mx.bfloat16)
+    x, B, C, z, A, dt, D, h0 = inputs
+    mx.random.seed(324)
+    dy = (mx.random.normal(x.shape) * 0.1).astype(mx.bfloat16)
+    mx.eval(dy)
+
+    grads = mamba3_mimo_bwd_path_c(dy, x, B, C, z, A, dt, D, h0)
+    mx.eval(*grads)
+
+    assert calls == 1
+
+
+def test_bwd_path_c_fp32_production_uses_tilelang_post_reduce(monkeypatch) -> None:
+    """FP32 production bwd uses the profiled threaded TileLang post-reduce policy."""
+
+    _require_mamba3_path_c()
+    calls: list[tuple[str, ...] | None] = []
+    original_reduce = mamba3_path_c._reduce_bwd_partials_path_c_threaded_kernel
+
+    def wrapped_reduce(*args, **kwargs):
+        output_dtypes = kwargs.get("output_dtypes")
+        calls.append(output_dtypes)
+        return original_reduce(*args, **kwargs)
+
+    monkeypatch.setattr(
+        mamba3_path_c,
+        "_reduce_bwd_partials_path_c_threaded_kernel",
+        wrapped_reduce,
+    )
+
+    inputs = _make_inputs(batch=1, seq=5, heads=2, headdim=4, state=8, dtype=mx.float32)
+    x, B, C, z, A, dt, D, h0 = inputs
+    mx.random.seed(325)
+    dy = (mx.random.normal(x.shape) * 0.1).astype(mx.float32)
+    mx.eval(dy)
+
+    grads = mamba3_mimo_bwd_path_c(dy, x, B, C, z, A, dt, D, h0)
+    mx.eval(*grads)
+
+    assert calls == [None]
+
+
 def test_bwd_path_c_matches_path_b_bf16_small_shape() -> None:
     """Path C bwd consumes/returns bf16 owner buffers without hidden casts."""
 
@@ -877,6 +1674,34 @@ def test_bwd_path_c_matches_path_b_bf16_small_shape() -> None:
             rtol=1e-2,
             atol=1e-5,
             err_msg=f"bf16 grad mismatch on {name}",
+        )
+
+
+def test_bwd_bf16_snapshot_route_matches_path_b_bf16_small_shape() -> None:
+    """Diagnostic BF16 snapshot route must stay within the BF16 bwd contract."""
+
+    _require_mamba3_path_c()
+    inputs = _make_inputs(batch=1, seq=6, heads=2, headdim=4, state=4, dtype=mx.bfloat16)
+    x, B, C, z, A, dt, D, h0 = inputs
+    mx.random.seed(124)
+    dy = (mx.random.normal(x.shape) * 0.1).astype(mx.bfloat16)
+    mx.eval(dy)
+
+    g_pc = mamba3_path_c._mamba3_mimo_bwd_path_c_bf16_snapshot_kernel(
+        dy, x, B, C, z, A, dt, D, h0
+    )
+    g_pb = mamba3_mimo_bwd_metal(dy, x, B, C, z, A, dt, D, h0)
+    mx.eval(*g_pc, *g_pb)
+
+    names = ["dx", "dB", "dC", "dz", "dA", "ddt", "dD", "dh0"]
+    for name, gpc, gpb in zip(names, g_pc, g_pb, strict=True):
+        assert gpc.dtype == gpb.dtype == mx.bfloat16
+        np.testing.assert_allclose(
+            _np(gpc),
+            _np(gpb),
+            rtol=1e-2,
+            atol=1e-5,
+            err_msg=f"bf16 snapshot route grad mismatch on {name}",
         )
 
 
@@ -1103,6 +1928,98 @@ def test_apply_path_c_vjp_matches_reference_inside_mlx_graph_transform() -> None
             rtol=1e-3,
             atol=1e-4,
             err_msg=f"graph VJP mismatch on {name}",
+        )
+
+
+def test_apply_training_path_c_vjp_reuses_forward_snapshots(monkeypatch) -> None:
+    """Training surface VJP must not launch the old standalone snapshot pass."""
+
+    _require_mamba3_path_c()
+    inputs = _make_inputs(batch=1, seq=6, heads=2, headdim=4, state=8, dtype=mx.float32)
+
+    def fail_snapshot_builder(*_args, **_kwargs):
+        raise AssertionError("training VJP must reuse forward snapshots")
+
+    monkeypatch.setattr(
+        mamba3_path_c,
+        "_bwd_state_snapshots_kernel_for",
+        fail_snapshot_builder,
+    )
+
+    y_training = mamba3_mimo_apply_training_path_c(*inputs)
+    y_state_training, h_state_training = mamba3_mimo_apply_with_state_training_path_c(
+        *inputs
+    )
+    y_fwd, h_fwd = mamba3_mimo_fwd_path_c(*inputs)
+    mx.eval(y_training, y_state_training, h_state_training, y_fwd, h_fwd)
+    np.testing.assert_allclose(_np(y_training), _np(y_fwd), rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(_np(y_state_training), _np(y_fwd), rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(_np(h_state_training), _np(h_fwd), rtol=1e-6, atol=1e-6)
+
+    def training_loss(x, B, C, z, A, dt, D, h0):  # type: ignore[no-untyped-def]
+        y, _h = mamba3_mimo_apply_with_state_training_path_c(
+            x,
+            B,
+            C,
+            z,
+            A,
+            dt,
+            D,
+            h0,
+        )
+        return mx.sum(y * y) * 0.5
+
+    g_training = mx.grad(training_loss, argnums=tuple(range(8)))(*inputs)
+    g_path_b = mamba3_mimo_bwd_metal(y_training, *inputs)
+    mx.eval(*g_training, *g_path_b)
+
+    names = ["dx", "dB", "dC", "dz", "dA", "ddt", "dD", "dh0"]
+    for name, got, expected in zip(names, g_training, g_path_b, strict=True):
+        np.testing.assert_allclose(
+            _np(got),
+            _np(expected),
+            rtol=1e-3,
+            atol=1e-4,
+            err_msg=f"training snapshot-reuse VJP mismatch on {name}",
+        )
+
+
+def test_apply_training_path_c_bf16_vjp_matches_path_b() -> None:
+    """BF16 training surface keeps the faster production Path C VJP route."""
+
+    _require_mamba3_path_c()
+    inputs = _make_inputs(batch=1, seq=5, heads=2, headdim=4, state=8, dtype=mx.bfloat16)
+
+    y_training, _h_training = mamba3_mimo_apply_with_state_training_path_c(*inputs)
+    mx.eval(y_training)
+
+    def training_loss(x, B, C, z, A, dt, D, h0):  # type: ignore[no-untyped-def]
+        y, _h = mamba3_mimo_apply_with_state_training_path_c(
+            x,
+            B,
+            C,
+            z,
+            A,
+            dt,
+            D,
+            h0,
+        )
+        y_f32 = y.astype(mx.float32)
+        return mx.sum(y_f32 * y_f32) * 0.5
+
+    g_training = mx.grad(training_loss, argnums=tuple(range(8)))(*inputs)
+    g_path_b = mamba3_mimo_bwd_metal(y_training, *inputs)
+    mx.eval(*g_training, *g_path_b)
+
+    names = ["dx", "dB", "dC", "dz", "dA", "ddt", "dD", "dh0"]
+    for name, got, expected in zip(names, g_training, g_path_b, strict=True):
+        assert got.dtype == expected.dtype == mx.bfloat16
+        np.testing.assert_allclose(
+            _np(got),
+            _np(expected),
+            rtol=2e-2,
+            atol=2e-3,
+            err_msg=f"bf16 training snapshot-reuse VJP mismatch on {name}",
         )
 
 
