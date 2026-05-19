@@ -137,6 +137,56 @@ def _build_mla(hidden_size: int, params: dict) -> nn.Module:
     return MLABlock(cfg)
 
 
+def _build_mistral4_mla(hidden_size: int, params: dict) -> nn.Module:
+    """Mistral Small 4 absorbed MLA + INT4 latent cache (mlx-lm PR #1037)."""
+    from cppmega_v4.nn.mlx_lm_bricks import Mistral4MLABlock, Mistral4MLAConfig
+    cfg = Mistral4MLAConfig(hidden_size=hidden_size, **{
+        k: v for k, v in params.items()
+        if k in Mistral4MLAConfig.__dataclass_fields__
+    })
+    return Mistral4MLABlock(cfg)
+
+
+def _build_dsv4_attention(hidden_size: int, params: dict) -> nn.Module:
+    """DeepSeek-V4 (Flash) hash-indexed sparse attention (mlx-lm PR #1201)."""
+    from cppmega_v4.nn.mlx_lm_bricks import DSv4AttentionBlock, DSv4AttentionConfig
+    cfg = DSv4AttentionConfig(hidden_size=hidden_size, **{
+        k: v for k, v in params.items()
+        if k in DSv4AttentionConfig.__dataclass_fields__
+    })
+    return DSv4AttentionBlock(cfg)
+
+
+def _build_bailing_linear(hidden_size: int, params: dict) -> nn.Module:
+    """Ling-2.6-flash linear attention (mlx-lm PR #1227)."""
+    from cppmega_v4.nn.mlx_lm_bricks import BailingLinearAttnBlock, BailingLinearConfig
+    cfg = BailingLinearConfig(hidden_size=hidden_size, **{
+        k: v for k, v in params.items()
+        if k in BailingLinearConfig.__dataclass_fields__
+    })
+    return BailingLinearAttnBlock(cfg)
+
+
+def _build_bailing_mla(hidden_size: int, params: dict) -> nn.Module:
+    """Ling-2.6-flash multi-latent attention (mlx-lm PR #1227)."""
+    from cppmega_v4.nn.mlx_lm_bricks import BailingMLABlock, BailingMLAConfig
+    cfg = BailingMLAConfig(hidden_size=hidden_size, **{
+        k: v for k, v in params.items()
+        if k in BailingMLAConfig.__dataclass_fields__
+    })
+    return BailingMLABlock(cfg)
+
+
+def _build_bailing_moe(hidden_size: int, params: dict) -> nn.Module:
+    """Ling-2.6-flash sparse MoE block (mlx-lm PR #1227)."""
+    from cppmega_v4.nn.mlx_lm_bricks import BailingMoEBlock, BailingMoEConfig
+    cfg = BailingMoEConfig(hidden_size=hidden_size, **{
+        k: v for k, v in params.items()
+        if k in BailingMoEConfig.__dataclass_fields__
+    })
+    return BailingMoEBlock(cfg)
+
+
 def _build_gated_attention(hidden_size: int, params: dict) -> nn.Module:
     """Qwen3-Next / Qwen3.5 / Qwen3.6 Gated Attention.
 
@@ -299,6 +349,17 @@ BLOCK_BUILDERS: dict[str, Callable[[int, dict], nn.Module]] = {
     "mla": _build_mla,
     "mla_absorb": _build_mla,
     "lightning_indexer": _build_lightning_indexer,
+    # ----- bricks imported from open mlx-lm PRs (cppmega-integration branch) -----
+    # mistral4_mla       = Mistral Small 4 absorbed MLA + INT4 latent cache (PR #1037)
+    # dsv4_attention     = DeepSeek-V4 (Flash) hash-indexed sparse attention (PR #1201)
+    # bailing_linear     = Ling-2.6-flash linear attention (PR #1227)
+    # bailing_mla        = Ling-2.6-flash multi-latent attention (PR #1227)
+    # bailing_moe        = Ling-2.6-flash sparse MoE block (PR #1227)
+    "mistral4_mla": _build_mistral4_mla,
+    "dsv4_attention": _build_dsv4_attention,
+    "bailing_linear": _build_bailing_linear,
+    "bailing_mla": _build_bailing_mla,
+    "bailing_moe": _build_bailing_moe,
 }
 
 
