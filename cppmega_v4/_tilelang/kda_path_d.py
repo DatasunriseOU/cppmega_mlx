@@ -3,13 +3,16 @@
 Mirrors ``linear_attention_path_d.py`` but the KDA forward path fans out
 through several FLA kernels: token-parallel intra, safe-gate intra,
 inter/solve, common chunk_delta_h, and common chunk_o. Path D probes that
-forward TTIR op surface through OP_TABLE, but remains unavailable as a
-runtime backend until the frontend produces a runnable PrimFunc and
-cppmega_v4 wires the compiled artifact to the KDA recurrent signature.
+forward TTIR op surface through OP_TABLE and uses cppmega's runtime adapter
+for the fixed prefill slice that has a non-degraded PrimFunc plus Metal
+compile/launch coverage. The runtime adapter now covers the FLA forward
+multi-kernel path for shape-specialized fp16 q/k/v inputs, fp32 gates,
+custom scale, initial/final recurrent state, and packed varlen metadata.
 
 Status therefore distinguishes "frontend ops are covered" from "backend
-is runnable". Dispatch falls back to Path A. Host TileLang frontend and
-FLA are read-only imports.
+is runnable for the current signature". Host TileLang frontend and FLA are
+read-only imports; cppmega owns compile/cache/launch and recurrent
+signature binding.
 """
 
 from __future__ import annotations
@@ -87,167 +90,71 @@ def _kda_forward_op_coverage() -> tuple[bool, str]:
     """Capture representative KDA forward TTIR and check OP_TABLE coverage."""
 
     try:
-        from poc.triton_frontend import _walk_text_ttir
         from cppmega_v4._tilelang.linear_attention_path_d_real import (
-            _capture_ttir_with_explicit_signature,
-            _unwrap_to_jit_function,
             lower_fla_chunk_h,
-        )
-        from fla.ops.common.chunk_o import chunk_fwd_kernel_o
-        from fla.ops.kda.chunk_intra import (
-            chunk_kda_fwd_kernel_inter_solve_fused,
-            chunk_kda_fwd_kernel_intra_sub_chunk,
-        )
-        from fla.ops.kda.chunk_intra_token_parallel import (
-            chunk_kda_fwd_kernel_intra_token_parallel,
+            lower_fla_kda_chunk_o,
+            lower_fla_kda_inter_solve,
+            lower_fla_kda_intra_token_parallel,
+            lower_fla_kda_recompute_w_u,
         )
     except Exception as exc:
         return False, f"KDA Path D coverage probe imports failed: {exc}"
 
-    gdn_res = lower_fla_chunk_h()
-    if gdn_res.status == "FAILED_OPS":
-        return False, (
-            "KDA Path D common chunk_delta_h coverage missing ops: "
-            f"{gdn_res.missing_ops!r}"
-        )
-    if gdn_res.status not in {"LOWERED_DEGRADED", "LOWERED_FULL"}:
-        return False, (
-            "KDA Path D common chunk_delta_h probe failed: "
-            f"status={gdn_res.status}; error={gdn_res.error_type}: "
-            f"{gdn_res.error_message}"
-        )
-
     cases = (
         (
             "kda_intra_token_parallel",
-            chunk_kda_fwd_kernel_intra_token_parallel,
-            {
-                "H": 1,
-                "HV": 1,
-                "K": 64,
-                "BT": 64,
-                "BC": 16,
-                "BH": 1,
-                "IS_VARLEN": False,
-            },
-            {
-                "q": "*fp16",
-                "k": "*fp16",
-                "g": "*fp32",
-                "beta": "*fp32",
-                "Aqk": "*fp32",
-                "Akk": "*fp32",
-                "scale": "fp32",
-                "cu_seqlens": "*i64",
-                "N": "i32",
-                "T": "i32",
-            },
-        ),
-        (
-            "kda_intra_sub_chunk",
-            chunk_kda_fwd_kernel_intra_sub_chunk,
-            {
-                "H": 1,
-                "HV": 1,
-                "K": 64,
-                "BT": 64,
-                "BC": 16,
-                "BK": 64,
-                "IS_VARLEN": False,
-                "USE_GATHER": False,
-            },
-            {
-                "q": "*fp16",
-                "k": "*fp16",
-                "g": "*fp32",
-                "beta": "*fp32",
-                "Aqk": "*fp32",
-                "Akk": "*fp32",
-                "scale": "fp32",
-                "cu_seqlens": "*i64",
-                "chunk_indices": "*i64",
-                "T": "i32",
-            },
+            lambda: lower_fla_kda_intra_token_parallel(grid=(64, 1)),
         ),
         (
             "kda_inter_solve",
-            chunk_kda_fwd_kernel_inter_solve_fused,
-            {
-                "H": 1,
-                "HV": 1,
-                "K": 64,
-                "BT": 64,
-                "BC": 16,
-                "NC": 4,
-                "BK": 64,
-                "IS_VARLEN": False,
-                "USE_SAFE_GATE": False,
-            },
-            {
-                "q": "*fp16",
-                "k": "*fp16",
-                "g": "*fp32",
-                "beta": "*fp32",
-                "Aqk": "*fp32",
-                "Akkd": "*fp32",
-                "Akk": "*fp32",
-                "scale": "fp32",
-                "cu_seqlens": "*i64",
-                "chunk_indices": "*i64",
-                "T": "i32",
-            },
+            lambda: lower_fla_kda_inter_solve(grid=(2, 1)),
         ),
         (
-            "chunk_o",
-            chunk_fwd_kernel_o,
-            {
-                "H": 1,
-                "HV": 1,
-                "K": 64,
-                "V": 32,
-                "BT": 64,
-                "BK": 64,
-                "BV": 32,
-                "USE_G": False,
-                "USE_G_GAMMA": False,
-                "TRANSPOSE_STATE": False,
-                "IS_VARLEN": False,
-            },
-            {
-                "q": "*fp16",
-                "k": "*fp16",
-                "v": "*fp16",
-                "h": "*fp16",
-                "g": "*fp32",
-                "g_gamma": "*fp32",
-                "o": "*fp32",
-                "cu_seqlens": "*i64",
-                "chunk_indices": "*i64",
-                "scale": "fp32",
-                "T": "i32",
-            },
+            "kda_recompute_w_u",
+            lambda: lower_fla_kda_recompute_w_u(grid=(2, 1)),
+        ),
+        (
+            "kda_chunk_delta_h",
+            lambda: lower_fla_chunk_h(
+                {
+                    "BT": 32,
+                    "BV": 16,
+                    "USE_G": False,
+                    "USE_GK": True,
+                    "STORE_FINAL_STATE": True,
+                    "SAVE_NEW_VALUE": True,
+                },
+                grid=(1, 1),
+            ),
+        ),
+        (
+            "kda_chunk_o_gk",
+            lambda: lower_fla_kda_chunk_o(grid=(2, 2, 1)),
         ),
     )
 
-    unique_ops = set(gdn_res.visited_ops)
-    for name, fn, constexprs, signature in cases:
-        try:
-            inner = _unwrap_to_jit_function(fn)
-            ttir = _capture_ttir_with_explicit_signature(
-                inner, constexprs, signature,
-            )
-            unique_ops.update(_walk_text_ttir(ttir))
-        except NotImplementedError as exc:
-            return False, f"KDA Path D OP_TABLE coverage gap in {name}: {exc}"
-        except Exception as exc:
+    unique_ops = set()
+    for name, lower_case in cases:
+        res = lower_case()
+        if res.status == "FAILED_OPS":
             return False, (
-                f"KDA Path D TTIR capture failed in {name}: "
-                f"{exc.__class__.__name__}: {exc}"
+                f"KDA Path D coverage missing ops in {name}: "
+                f"{res.missing_ops!r}"
             )
+        if res.status != "LOWERED_FULL" or res.prim_func is None:
+            return False, (
+                f"KDA Path D lowering failed in {name}: status={res.status}; "
+                f"error={res.error_type}: {res.error_message}"
+            )
+        if "DEGRADED" in res.prim_func.script():
+            return False, (
+                f"KDA Path D lowering produced DEGRADED markers in {name}"
+            )
+        unique_ops.update(res.visited_ops)
 
     return True, (
-        "KDA Path D forward TTIR OP_TABLE coverage complete "
-        f"({len(cases) + 1} kernels, {len(unique_ops)} unique ops, missing=0)"
+        "KDA Path D forward lowering coverage complete "
+        f"({len(cases)} kernels, {len(unique_ops)} unique ops, missing=0)"
     )
 
 

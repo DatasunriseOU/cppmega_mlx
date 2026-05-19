@@ -233,6 +233,84 @@ def test_kda_path_d_forced_falls_back_cleanly(monkeypatch):
     assert not bool(mx.any(mx.isnan(o)).item())
 
 
+def test_kda_path_d_forced_fixed_prefill_uses_runtime_adapter(monkeypatch):
+    pytest.importorskip("tilelang")
+    ok, reason = kda_path_d_runtime()
+    if not ok:
+        pytest.skip(reason)
+
+    from cppmega_v4._tilelang import kda_paths as kda_paths_mod
+
+    monkeypatch.setenv(KDA_ENV, "path_d")
+
+    def fail_path_a(*args, **kwargs):
+        raise AssertionError("Path D fixed prefill unexpectedly fell back to Path A")
+
+    monkeypatch.setattr(kda_paths_mod, "_path_a_call", fail_path_a)
+
+    q = mx.zeros((1, 64, 1, 64), dtype=mx.float16)
+    k = mx.zeros((1, 64, 1, 64), dtype=mx.float16)
+    v = mx.zeros((1, 64, 1, 32), dtype=mx.float16)
+    g = mx.zeros((1, 64, 1, 64), dtype=mx.float32)
+    beta = mx.zeros((1, 64, 1), dtype=mx.float32)
+
+    y, final_state = kda_paths_mod.kda_recurrent_dispatch(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        output_final_state=True,
+    )
+    mx.eval(y, final_state)
+
+    assert y.shape == (1, 64, 1, 32)
+    assert y.dtype == mx.float16
+    assert final_state is not None
+    assert final_state.shape == (1, 1, 64, 32)
+
+
+def test_kda_path_d_forced_varlen_uses_runtime_adapter(monkeypatch):
+    pytest.importorskip("tilelang")
+    ok, reason = kda_path_d_runtime()
+    if not ok:
+        pytest.skip(reason)
+
+    from cppmega_v4._tilelang import kda_paths as kda_paths_mod
+
+    monkeypatch.setenv(KDA_ENV, "path_d")
+
+    def fail_path_a(*args, **kwargs):
+        raise AssertionError("Path D varlen unexpectedly fell back to Path A")
+
+    monkeypatch.setattr(kda_paths_mod, "_path_a_call", fail_path_a)
+
+    q = mx.zeros((1, 64, 1, 64), dtype=mx.float16)
+    k = mx.zeros((1, 64, 1, 64), dtype=mx.float16)
+    v = mx.zeros((1, 64, 1, 32), dtype=mx.float16)
+    g = mx.zeros((1, 64, 1, 64), dtype=mx.float32)
+    beta = mx.zeros((1, 64, 1), dtype=mx.float32)
+    cu_seqlens = mx.array([0, 16, 64], dtype=mx.int64)
+    h0 = mx.zeros((2, 1, 64, 32), dtype=mx.float32)
+
+    y, final_state = kda_paths_mod.kda_recurrent_dispatch(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        cu_seqlens=cu_seqlens,
+        initial_state=h0,
+        output_final_state=True,
+    )
+    mx.eval(y, final_state)
+
+    assert y.shape == (1, 64, 1, 32)
+    assert y.dtype == mx.float16
+    assert final_state is not None
+    assert final_state.shape == (2, 1, 64, 32)
+
+
 def test_kda_path_d_try_lower_returns_seam_message():
     result, msg = _try_lower_fla_kda_kernel(target="metal")
     assert result is None

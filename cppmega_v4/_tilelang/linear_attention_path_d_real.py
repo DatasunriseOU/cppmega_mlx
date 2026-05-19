@@ -80,7 +80,7 @@ DEFAULT_SIGNATURE: Dict[str, str] = {
     "k": "*fp16", "v": "*fp16", "w": "*fp16", "v_new": "*fp16",
     "g": "*fp32", "gk": "*fp32",
     "h": "*fp16", "h0": "*fp32", "ht": "*fp32",
-    "cu_seqlens": "*fp32", "chunk_offsets": "*fp32",
+    "cu_seqlens": "*i64", "chunk_offsets": "*i64",
     "T": "i32",
 }
 
@@ -121,6 +121,59 @@ DEFAULT_GDN_RECOMPUTE_W_U_SIGNATURE: Dict[str, str] = {
     "w": "*fp16", "u": "*fp16", "A": "*fp16", "g": "*fp32",
     "cu_seqlens": "*i64", "chunk_indices": "*i64",
     "T": "i32",
+}
+
+DEFAULT_KDA_INTRA_TOKEN_CONSTEXPRS: Dict[str, Any] = {
+    "H": 1, "HV": 1, "K": 64,
+    "BT": 32, "BC": 16, "BH": 1,
+    "IS_VARLEN": False,
+}
+
+DEFAULT_KDA_INTRA_TOKEN_SIGNATURE: Dict[str, str] = {
+    "q": "*fp16", "k": "*fp16", "g": "*fp32", "beta": "*fp32",
+    "Aqk": "*fp16", "Akk": "*fp32",
+    "scale": "fp32", "cu_seqlens": "*i64",
+    "N": "i32", "T": "i32",
+}
+
+DEFAULT_KDA_INTER_SOLVE_CONSTEXPRS: Dict[str, Any] = {
+    "H": 1, "HV": 1, "K": 64,
+    "BT": 32, "BC": 16, "NC": 2, "BK": 32,
+    "IS_VARLEN": False, "USE_SAFE_GATE": False,
+}
+
+DEFAULT_KDA_INTER_SOLVE_SIGNATURE: Dict[str, str] = {
+    "q": "*fp16", "k": "*fp16", "g": "*fp32", "beta": "*fp32",
+    "Aqk": "*fp16", "Akkd": "*fp32", "Akk": "*fp16",
+    "scale": "fp32", "cu_seqlens": "*i64",
+    "chunk_indices": "*i64", "T": "i32",
+}
+
+DEFAULT_KDA_RECOMPUTE_W_U_CONSTEXPRS: Dict[str, Any] = {
+    "H": 1, "HV": 1, "K": 64, "V": 32,
+    "BT": 32, "BK": 64, "BV": 64,
+    "STORE_QG": True, "STORE_KG": True, "IS_VARLEN": False,
+}
+
+DEFAULT_KDA_RECOMPUTE_W_U_SIGNATURE: Dict[str, str] = {
+    "q": "*fp16", "k": "*fp16", "qg": "*fp16", "kg": "*fp16",
+    "v": "*fp16", "beta": "*fp32",
+    "w": "*fp16", "u": "*fp16", "A": "*fp16", "gk": "*fp32",
+    "cu_seqlens": "*i64", "chunk_indices": "*i64",
+    "T": "i32",
+}
+
+DEFAULT_KDA_CHUNK_O_CONSTEXPRS: Dict[str, Any] = {
+    "H": 1, "HV": 1, "K": 64, "V": 32,
+    "BT": 32, "BK": 64, "BV": 16,
+    "TRANSPOSE_STATE": False, "IS_VARLEN": False,
+}
+
+DEFAULT_KDA_CHUNK_O_SIGNATURE: Dict[str, str] = {
+    "q": "*fp16", "v": "*fp16", "g": "*fp32", "h": "*fp16",
+    "o": "*fp16", "A": "*fp16",
+    "cu_seqlens": "*i64", "chunk_indices": "*i64",
+    "scale": "fp32", "T": "i32",
 }
 
 DEFAULT_RUNTIME_T = 64
@@ -208,6 +261,34 @@ def _cached_lower_gdn_recompute_w_u(
     constexprs_key: Tuple[Tuple[str, Any], ...],
 ) -> LowerResult:
     return _lower_gdn_recompute_w_u_uncached(dict(constexprs_key))
+
+
+@lru_cache(maxsize=4)
+def _cached_lower_kda_intra_token(
+    constexprs_key: Tuple[Tuple[str, Any], ...],
+) -> LowerResult:
+    return _lower_kda_intra_token_uncached(dict(constexprs_key))
+
+
+@lru_cache(maxsize=4)
+def _cached_lower_kda_inter_solve(
+    constexprs_key: Tuple[Tuple[str, Any], ...],
+) -> LowerResult:
+    return _lower_kda_inter_solve_uncached(dict(constexprs_key))
+
+
+@lru_cache(maxsize=4)
+def _cached_lower_kda_recompute_w_u(
+    constexprs_key: Tuple[Tuple[str, Any], ...],
+) -> LowerResult:
+    return _lower_kda_recompute_w_u_uncached(dict(constexprs_key))
+
+
+@lru_cache(maxsize=4)
+def _cached_lower_kda_chunk_o(
+    constexprs_key: Tuple[Tuple[str, Any], ...],
+) -> LowerResult:
+    return _lower_kda_chunk_o_uncached(dict(constexprs_key))
 
 
 def _lower_uncached(
@@ -310,10 +391,126 @@ def _lower_gdn_recompute_w_u_uncached(
     )
 
 
+def _lower_kda_intra_token_uncached(
+    constexprs: Dict[str, Any],
+    grid: Optional[Tuple[int, ...]] = None,
+) -> LowerResult:
+    _ensure_path_d_import_roots()
+    try:
+        from fla.ops.kda.chunk_intra_token_parallel import (
+            chunk_kda_fwd_kernel_intra_token_parallel as kfn,
+        )
+    except Exception as exc:
+        return _failed_lower(
+            "FAILED_PARSE",
+            type(exc).__name__,
+            f"FLA KDA intra-token import failed: {exc}",
+            constexprs,
+        )
+    return _lower_fla_kernel_uncached(
+        kfn=kfn,
+        constexprs=constexprs,
+        signature=DEFAULT_KDA_INTRA_TOKEN_SIGNATURE,
+        primfunc_name="fla_kda_intra_token_parallel",
+        grid=grid,
+        arg_buffer_shapes=_kda_intra_token_arg_buffer_shapes(constexprs, grid),
+    )
+
+
+def _lower_kda_inter_solve_uncached(
+    constexprs: Dict[str, Any],
+    grid: Optional[Tuple[int, ...]] = None,
+) -> LowerResult:
+    _ensure_path_d_import_roots()
+    try:
+        from fla.ops.kda.chunk_intra import (
+            chunk_kda_fwd_kernel_inter_solve_fused as kfn,
+        )
+    except Exception as exc:
+        return _failed_lower(
+            "FAILED_PARSE",
+            type(exc).__name__,
+            f"FLA KDA inter-solve import failed: {exc}",
+            constexprs,
+        )
+    return _lower_fla_kernel_uncached(
+        kfn=kfn,
+        constexprs=constexprs,
+        signature=DEFAULT_KDA_INTER_SOLVE_SIGNATURE,
+        primfunc_name="fla_kda_inter_solve",
+        grid=grid,
+        arg_buffer_shapes=_kda_inter_solve_arg_buffer_shapes(constexprs, grid),
+    )
+
+
+def _lower_kda_recompute_w_u_uncached(
+    constexprs: Dict[str, Any],
+    grid: Optional[Tuple[int, ...]] = None,
+) -> LowerResult:
+    _ensure_path_d_import_roots()
+    try:
+        from fla.ops.kda.wy_fast import recompute_w_u_fwd_kda_kernel as kfn
+    except Exception as exc:
+        return _failed_lower(
+            "FAILED_PARSE",
+            type(exc).__name__,
+            f"FLA KDA recompute_w_u import failed: {exc}",
+            constexprs,
+        )
+    return _lower_fla_kernel_uncached(
+        kfn=kfn,
+        constexprs=constexprs,
+        signature=DEFAULT_KDA_RECOMPUTE_W_U_SIGNATURE,
+        primfunc_name="fla_kda_recompute_w_u",
+        grid=grid,
+        arg_buffer_shapes=_kda_recompute_arg_buffer_shapes(constexprs, grid),
+    )
+
+
+def _lower_kda_chunk_o_uncached(
+    constexprs: Dict[str, Any],
+    grid: Optional[Tuple[int, ...]] = None,
+) -> LowerResult:
+    _ensure_path_d_import_roots()
+    try:
+        from fla.ops.gla.chunk import chunk_gla_fwd_kernel_o as kfn
+    except Exception as exc:
+        return _failed_lower(
+            "FAILED_PARSE",
+            type(exc).__name__,
+            f"FLA KDA/GLA chunk_o import failed: {exc}",
+            constexprs,
+        )
+    return _lower_fla_kernel_uncached(
+        kfn=kfn,
+        constexprs=constexprs,
+        signature=DEFAULT_KDA_CHUNK_O_SIGNATURE,
+        primfunc_name="fla_kda_chunk_o_gk",
+        grid=grid,
+        arg_buffer_shapes=_kda_chunk_o_arg_buffer_shapes(constexprs, grid),
+    )
+
+
 def _runtime_t(_constexprs: Dict[str, Any]) -> int:
     """Static T paired with the cppmega Path D scalar specialization."""
 
-    return DEFAULT_RUNTIME_T
+    return int(_constexprs.get("_RUNTIME_T", DEFAULT_RUNTIME_T))
+
+
+def _runtime_n(constexprs: Dict[str, Any], fallback: int) -> int:
+    return int(constexprs.get("_RUNTIME_N", fallback))
+
+
+def _runtime_batch(constexprs: Dict[str, Any], fallback: int) -> int:
+    return int(constexprs.get("_RUNTIME_BATCH", fallback))
+
+
+def _runtime_num_chunks(constexprs: Dict[str, Any], fallback: int) -> int:
+    return int(constexprs.get("_RUNTIME_NT", fallback))
+
+
+def _runtime_cu_len(constexprs: Dict[str, Any], fallback: int) -> int:
+    return int(constexprs.get("_RUNTIME_CU_LEN", fallback))
 
 
 def _num_chunks(t: int, bt: int) -> int:
@@ -324,6 +521,12 @@ def _batch_from_grid(grid: Optional[Tuple[int, ...]], hv: int) -> int:
     if grid is None or len(grid) < 2:
         return 1
     return max(int(grid[1]) // max(int(hv), 1), 1)
+
+
+def _batch_from_token_grid(grid: Optional[Tuple[int, ...]], t: int) -> int:
+    if grid is None or len(grid) < 1:
+        return 1
+    return max(int(grid[0]) // max(int(t), 1), 1)
 
 
 def _full_arg(extent: int) -> Tuple[int]:
@@ -384,20 +587,29 @@ def _chunk_h_arg_buffer_shapes(
     k = int(constexprs["K"])
     v = int(constexprs["V"])
     bt = int(constexprs["BT"])
-    nt = _num_chunks(t, bt)
     b = _batch_from_grid(grid, hv)
+    if bool(constexprs.get("IS_VARLEN", False)):
+        b_data = _runtime_batch(constexprs, 1)
+        n = _runtime_n(constexprs, b)
+        nt = _runtime_num_chunks(constexprs, _num_chunks(t, bt))
+        cu_len = _runtime_cu_len(constexprs, n + 1)
+    else:
+        b_data = b
+        n = b_data
+        nt = b * _num_chunks(t, bt)
+        cu_len = 1
     return {
-        0: _full_arg(b * t * h * k),       # k
-        1: _full_arg(b * t * hv * v),      # v/u
-        2: _full_arg(b * t * hv * k),      # w
-        3: _full_arg(b * t * hv * v),      # v_new
-        4: _full_arg(b * t * hv),          # g
-        5: _full_arg(b * t * hv * k),      # gk
-        6: _full_arg(b * nt * hv * k * v), # h
-        7: _full_arg(b * hv * k * v),      # h0
-        8: _full_arg(b * hv * k * v),      # ht
-        9: _full_arg(1),                   # cu_seqlens
-        10: _full_arg(1),                  # chunk_offsets
+        0: _full_arg(b_data * t * h * k),  # k
+        1: _full_arg(b_data * t * hv * v), # v/u
+        2: _full_arg(b_data * t * hv * k), # w
+        3: _full_arg(b_data * t * hv * v), # v_new
+        4: _full_arg(b_data * t * hv),     # g
+        5: _full_arg(b_data * t * hv * k), # gk
+        6: _full_arg(nt * hv * k * v),     # h
+        7: _full_arg(n * hv * k * v),      # h0
+        8: _full_arg(n * hv * k * v),      # ht
+        9: _full_arg(cu_len),              # cu_seqlens
+        10: _full_arg(cu_len),             # chunk_offsets
     }
 
 
@@ -411,20 +623,159 @@ def _chunk_o_arg_buffer_shapes(
     k = int(constexprs["K"])
     v = int(constexprs["V"])
     bt = int(constexprs["BT"])
-    nt = _num_chunks(t, bt)
     b = _batch_from_grid(grid[1:] if grid is not None and len(grid) == 3 else grid, hv)
     if grid is not None and len(grid) >= 3:
         b = max(int(grid[2]) // max(hv, 1), 1)
+    if bool(constexprs.get("IS_VARLEN", False)):
+        b = _runtime_batch(constexprs, b)
+        n = _runtime_n(constexprs, b)
+        nt = _runtime_num_chunks(constexprs, _num_chunks(t, bt))
+        cu_len = _runtime_cu_len(constexprs, n + 1)
+        chunk_indices_len = nt * 2
+    else:
+        nt = b * _num_chunks(t, bt)
+        cu_len = 1
+        chunk_indices_len = 1
     return {
         0: _full_arg(b * t * h * k),       # q
         1: _full_arg(b * t * h * k),       # k
         2: _full_arg(b * t * hv * v),      # v_new
-        3: _full_arg(b * nt * hv * k * v), # h
+        3: _full_arg(nt * hv * k * v),     # h
         4: _full_arg(b * t * hv),          # g
         5: _full_arg(hv),                  # g_gamma
         6: _full_arg(b * t * hv * v),      # o
-        7: _full_arg(1),                   # cu_seqlens
-        8: _full_arg(1),                   # chunk_indices
+        7: _full_arg(cu_len),              # cu_seqlens
+        8: _full_arg(chunk_indices_len),   # chunk_indices
+    }
+
+
+def _kda_intra_token_arg_buffer_shapes(
+    constexprs: Dict[str, Any],
+    grid: Optional[Tuple[int, ...]],
+) -> Dict[int, Tuple[int]]:
+    t = _runtime_t(constexprs)
+    h = int(constexprs["H"])
+    hv = int(constexprs["HV"])
+    k = int(constexprs["K"])
+    bt = int(constexprs["BT"])
+    bc = int(constexprs["BC"])
+    b = _batch_from_token_grid(grid, t)
+    cu_len = 1
+    if bool(constexprs.get("IS_VARLEN", False)):
+        n = _runtime_n(constexprs, b)
+        cu_len = _runtime_cu_len(constexprs, n + 1)
+    return {
+        0: _full_arg(b * t * h * k),       # q
+        1: _full_arg(b * t * h * k),       # k
+        2: _full_arg(b * t * hv * k),      # g cumulative
+        3: _full_arg(b * t * hv),          # beta
+        4: _full_arg(b * t * hv * bt),     # Aqk
+        5: _full_arg(b * t * hv * bc),     # Akk diagonal blocks
+        7: _full_arg(cu_len),              # cu_seqlens
+    }
+
+
+def _kda_inter_solve_arg_buffer_shapes(
+    constexprs: Dict[str, Any],
+    grid: Optional[Tuple[int, ...]],
+) -> Dict[int, Tuple[int]]:
+    t = _runtime_t(constexprs)
+    h = int(constexprs["H"])
+    hv = int(constexprs["HV"])
+    k = int(constexprs["K"])
+    bt = int(constexprs["BT"])
+    bc = int(constexprs["BC"])
+    b = _batch_from_grid(grid, hv)
+    if bool(constexprs.get("IS_VARLEN", False)):
+        n = _runtime_n(constexprs, b)
+        cu_len = _runtime_cu_len(constexprs, n + 1)
+        chunk_indices_len = _runtime_num_chunks(
+            constexprs, _num_chunks(t, bt)
+        ) * 2
+    else:
+        cu_len = 1
+        chunk_indices_len = 1
+    return {
+        0: _full_arg(b * t * h * k),       # q
+        1: _full_arg(b * t * h * k),       # k
+        2: _full_arg(b * t * hv * k),      # g cumulative
+        3: _full_arg(b * t * hv),          # beta
+        4: _full_arg(b * t * hv * bt),     # Aqk
+        5: _full_arg(b * t * hv * bc),     # Akkd
+        6: _full_arg(b * t * hv * bt),     # Akk
+        8: _full_arg(cu_len),              # cu_seqlens
+        9: _full_arg(chunk_indices_len),   # chunk_indices
+    }
+
+
+def _kda_recompute_arg_buffer_shapes(
+    constexprs: Dict[str, Any],
+    grid: Optional[Tuple[int, ...]],
+) -> Dict[int, Tuple[int]]:
+    t = _runtime_t(constexprs)
+    h = int(constexprs["H"])
+    hv = int(constexprs["HV"])
+    k = int(constexprs["K"])
+    v = int(constexprs["V"])
+    bt = int(constexprs["BT"])
+    b = _batch_from_grid(grid, hv)
+    if bool(constexprs.get("IS_VARLEN", False)):
+        n = _runtime_n(constexprs, b)
+        cu_len = _runtime_cu_len(constexprs, n + 1)
+        chunk_indices_len = _runtime_num_chunks(
+            constexprs, _num_chunks(t, bt)
+        ) * 2
+    else:
+        cu_len = 1
+        chunk_indices_len = 1
+    return {
+        0: _full_arg(b * t * h * k),       # q
+        1: _full_arg(b * t * h * k),       # k
+        2: _full_arg(b * t * hv * k),      # qg
+        3: _full_arg(b * t * hv * k),      # kg
+        4: _full_arg(b * t * hv * v),      # v
+        5: _full_arg(b * t * hv),          # beta
+        6: _full_arg(b * t * hv * k),      # w
+        7: _full_arg(b * t * hv * v),      # u
+        8: _full_arg(b * t * hv * bt),     # Akk
+        9: _full_arg(b * t * hv * k),      # gk cumulative
+        10: _full_arg(cu_len),             # cu_seqlens
+        11: _full_arg(chunk_indices_len),  # chunk_indices
+    }
+
+
+def _kda_chunk_o_arg_buffer_shapes(
+    constexprs: Dict[str, Any],
+    grid: Optional[Tuple[int, ...]],
+) -> Dict[int, Tuple[int]]:
+    t = _runtime_t(constexprs)
+    h = int(constexprs["H"])
+    hv = int(constexprs["HV"])
+    k = int(constexprs["K"])
+    v = int(constexprs["V"])
+    bt = int(constexprs["BT"])
+    b = 1
+    if grid is not None and len(grid) >= 3:
+        b = max(int(grid[2]) // max(hv, 1), 1)
+    if bool(constexprs.get("IS_VARLEN", False)):
+        b = _runtime_batch(constexprs, b)
+        n = _runtime_n(constexprs, b)
+        nt = _runtime_num_chunks(constexprs, _num_chunks(t, bt))
+        cu_len = _runtime_cu_len(constexprs, n + 1)
+        chunk_indices_len = nt * 2
+    else:
+        nt = b * _num_chunks(t, bt)
+        cu_len = 1
+        chunk_indices_len = 1
+    return {
+        0: _full_arg(b * t * h * k),       # q
+        1: _full_arg(b * t * hv * v),      # v_new
+        2: _full_arg(b * t * hv * k),      # g cumulative
+        3: _full_arg(nt * hv * k * v),     # h
+        4: _full_arg(b * t * hv * v),      # o
+        5: _full_arg(b * t * hv * bt),     # Aqk
+        6: _full_arg(cu_len),              # cu_seqlens
+        7: _full_arg(chunk_indices_len),   # chunk_indices
     }
 
 
@@ -488,7 +839,9 @@ def _lower_fla_kernel_uncached(
 
     try:
         ttir_text = _capture_ttir_with_explicit_signature(
-            inner, constexprs, signature,
+            inner,
+            {k: v for k, v in constexprs.items() if not str(k).startswith("_")},
+            signature,
         )
     except (TTIRCaptureError, TritonUnavailable) as exc:
         return _failed_lower(
@@ -687,6 +1040,62 @@ def lower_fla_gdn_recompute_w_u(
     return _cached_lower_gdn_recompute_w_u(key)
 
 
+def lower_fla_kda_intra_token_parallel(
+    constexprs: Optional[Dict[str, Any]] = None,
+    grid: Optional[Tuple[int, ...]] = None,
+) -> LowerResult:
+    """Capture and lower FLA KDA token-parallel diagonal blocks."""
+    cfg = dict(DEFAULT_KDA_INTRA_TOKEN_CONSTEXPRS)
+    if constexprs is not None:
+        cfg.update(constexprs)
+    if grid is not None:
+        return _lower_kda_intra_token_uncached(cfg, tuple(int(x) for x in grid))
+    key = tuple(sorted(cfg.items(), key=lambda kv: kv[0]))
+    return _cached_lower_kda_intra_token(key)
+
+
+def lower_fla_kda_inter_solve(
+    constexprs: Optional[Dict[str, Any]] = None,
+    grid: Optional[Tuple[int, ...]] = None,
+) -> LowerResult:
+    """Capture and lower FLA KDA fused inter-subchunk solve."""
+    cfg = dict(DEFAULT_KDA_INTER_SOLVE_CONSTEXPRS)
+    if constexprs is not None:
+        cfg.update(constexprs)
+    if grid is not None:
+        return _lower_kda_inter_solve_uncached(cfg, tuple(int(x) for x in grid))
+    key = tuple(sorted(cfg.items(), key=lambda kv: kv[0]))
+    return _cached_lower_kda_inter_solve(key)
+
+
+def lower_fla_kda_recompute_w_u(
+    constexprs: Optional[Dict[str, Any]] = None,
+    grid: Optional[Tuple[int, ...]] = None,
+) -> LowerResult:
+    """Capture and lower FLA KDA recompute_w_u through the Triton frontend."""
+    cfg = dict(DEFAULT_KDA_RECOMPUTE_W_U_CONSTEXPRS)
+    if constexprs is not None:
+        cfg.update(constexprs)
+    if grid is not None:
+        return _lower_kda_recompute_w_u_uncached(cfg, tuple(int(x) for x in grid))
+    key = tuple(sorted(cfg.items(), key=lambda kv: kv[0]))
+    return _cached_lower_kda_recompute_w_u(key)
+
+
+def lower_fla_kda_chunk_o(
+    constexprs: Optional[Dict[str, Any]] = None,
+    grid: Optional[Tuple[int, ...]] = None,
+) -> LowerResult:
+    """Capture and lower the GLA output kernel used by KDA Path D."""
+    cfg = dict(DEFAULT_KDA_CHUNK_O_CONSTEXPRS)
+    if constexprs is not None:
+        cfg.update(constexprs)
+    if grid is not None:
+        return _lower_kda_chunk_o_uncached(cfg, tuple(int(x) for x in grid))
+    key = tuple(sorted(cfg.items(), key=lambda kv: kv[0]))
+    return _cached_lower_kda_chunk_o(key)
+
+
 def gdn_fwd_path_d_real_call(*args, **kwargs):
     """Dispatcher-shaped entry. Returns the lowered PrimFunc when
     ``LOWERED_FULL``; raises with the structured reason otherwise.
@@ -713,11 +1122,23 @@ __all__ = [
     "DEFAULT_GDN_KKT_SIGNATURE",
     "DEFAULT_GDN_RECOMPUTE_W_U_CONSTEXPRS",
     "DEFAULT_GDN_RECOMPUTE_W_U_SIGNATURE",
+    "DEFAULT_KDA_CHUNK_O_CONSTEXPRS",
+    "DEFAULT_KDA_CHUNK_O_SIGNATURE",
+    "DEFAULT_KDA_INTER_SOLVE_CONSTEXPRS",
+    "DEFAULT_KDA_INTER_SOLVE_SIGNATURE",
+    "DEFAULT_KDA_INTRA_TOKEN_CONSTEXPRS",
+    "DEFAULT_KDA_INTRA_TOKEN_SIGNATURE",
+    "DEFAULT_KDA_RECOMPUTE_W_U_CONSTEXPRS",
+    "DEFAULT_KDA_RECOMPUTE_W_U_SIGNATURE",
     "DEFAULT_SIGNATURE",
     "LowerResult",
     "lower_fla_chunk_h",
     "lower_fla_chunk_o",
     "lower_fla_gdn_kkt_solve",
     "lower_fla_gdn_recompute_w_u",
+    "lower_fla_kda_chunk_o",
+    "lower_fla_kda_inter_solve",
+    "lower_fla_kda_intra_token_parallel",
+    "lower_fla_kda_recompute_w_u",
     "gdn_fwd_path_d_real_call",
 ]

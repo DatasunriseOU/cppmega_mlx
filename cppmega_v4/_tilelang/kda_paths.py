@@ -12,8 +12,8 @@ Backend status (May 2026):
       execution_backend='tvm_ffi'). Per-lane recurrent scan modeled on
       mamba3_path_c.py. Available iff tilelang + host MSL infra reachable.
     - Path D: ``poc.triton_frontend.from_triton_kernel`` over FLA KDA
-      chunk kernels. Frontend op coverage is probed; runtime adapter is
-      still pending.
+      chunk kernels. cppmega owns the runtime adapter for FLA's forward
+      multi-kernel launch, including packed varlen metadata.
 
 Env override: ``CPPMEGA_V4_KERNEL_PATH__KDA``.
 """

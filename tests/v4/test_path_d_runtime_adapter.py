@@ -87,6 +87,21 @@ class _CompileRecorder:
         return object()
 
 
+def _count_named_buffer_loads(prim_func, names: set[str]) -> int:
+    from tvm.tir import stmt_functor
+
+    count = 0
+
+    def visit(node):
+        nonlocal count
+        buffer = getattr(node, "buffer", None)
+        if buffer is not None and str(getattr(buffer, "name", "")) in names:
+            count += 1
+
+    stmt_functor.post_order_visit(prim_func.body, visit)
+    return count
+
+
 def test_runtime_adapter_specializes_grid_params_before_compile():
     from cppmega_v4._tilelang.path_d_runtime_adapter import (
         PathDKernelPlan,
@@ -178,6 +193,104 @@ def test_runtime_adapter_specializes_scale_and_static_t():
     assert prim.specialized == {"scale": 0.125, "T": 64}
 
 
+def test_kda_topology_policy_promotes_only_repeated_varlen_layout(monkeypatch):
+    from cppmega_v4._tilelang.path_d_runtime_adapter import (
+        KDA_TOPOLOGY_SPECIALIZATION_THRESHOLD_ENV,
+        _kda_varlen_topology_key,
+        _record_kda_topology_hit,
+        _reset_kda_topology_cache_for_tests,
+    )
+
+    monkeypatch.setenv(KDA_TOPOLOGY_SPECIALIZATION_THRESHOLD_ENV, "2")
+    _reset_kda_topology_cache_for_tests()
+    key = _kda_varlen_topology_key(
+        cu_values=(0, 16, 64),
+        chunk_indices=(0, 0, 1, 0, 1, 1),
+        chunk_offsets=(0, 1, 3),
+        total_tokens=64,
+        h_heads=1,
+        hv_heads=1,
+        k_dim=64,
+        v_dim=32,
+        scale=0.125,
+        use_initial_state=True,
+        output_final_state=True,
+    )
+
+    first = _record_kda_topology_hit(key)
+    second = _record_kda_topology_hit(key)
+    other = _record_kda_topology_hit(
+        _kda_varlen_topology_key(
+            cu_values=(0, 32, 64),
+            chunk_indices=(0, 0, 1, 0),
+            chunk_offsets=(0, 1, 2),
+            total_tokens=64,
+            h_heads=1,
+            hv_heads=1,
+            k_dim=64,
+            v_dim=32,
+            scale=0.125,
+            use_initial_state=True,
+            output_final_state=True,
+        )
+    )
+
+    assert first.hits == 1
+    assert first.use_specialized is False
+    assert second.hits == 2
+    assert second.use_specialized is True
+    assert other.hits == 1
+    assert other.use_specialized is False
+
+
+def test_kda_compact_topology_invariants_are_not_exact_arrays():
+    from cppmega_v4._tilelang.path_d_runtime_adapter import (
+        _kda_compact_topology_invariants,
+    )
+
+    invariants = _kda_compact_topology_invariants(
+        cu_values=(0, 16, 64),
+        chunk_offsets=(0, 1, 3),
+        total_tokens=64,
+        chunk_size=32,
+    )
+
+    assert invariants.bounds_valid is True
+    assert invariants.cu_monotonic is True
+    assert invariants.chunk_offsets_monotonic is True
+    assert invariants.total_tokens == 64
+    assert invariants.num_sequences == 2
+    assert invariants.num_chunks == 3
+    assert invariants.max_sequence_tokens == 48
+    assert invariants.max_chunk_id == 2
+
+
+def test_runtime_adapter_specializes_topology_metadata_loads():
+    pytest.importorskip("tvm")
+    from tvm import tir
+
+    from cppmega_v4._tilelang.path_d_runtime_adapter import (
+        specialize_primfunc_for_topology_metadata,
+    )
+
+    cu_data = tir.Var("cu_seqlens", "handle")
+    cu_buffer = tir.decl_buffer((3,), "int64", name="cu_seqlens", data=cu_data)
+    idx = tir.Var("idx", "int64")
+    func = tir.PrimFunc(
+        [cu_data, idx],
+        tir.Evaluate(tir.BufferLoad(cu_buffer, [idx])),
+        buffer_map={cu_data: cu_buffer},
+    )
+
+    specialized = specialize_primfunc_for_topology_metadata(
+        func,
+        {"cu_seqlens": (0, 16, 64)},
+    )
+
+    assert _count_named_buffer_loads(func, {"cu_seqlens"}) == 1
+    assert _count_named_buffer_loads(specialized, {"cu_seqlens"}) == 0
+
+
 def test_runtime_adapter_blocks_degraded_primfunc_before_compile():
     from cppmega_v4._tilelang.path_d_runtime_adapter import (
         PathDKernelPlan,
@@ -202,7 +315,7 @@ def test_path_d_statuses_are_runtime_adapter_driven():
     ok_kda, reason_kda = kda_status()
 
     assert isinstance(ok_gdn, bool)
-    assert ok_kda is False
+    assert isinstance(ok_kda, bool)
     assert "runtime adapter" in reason_gdn
     assert "runtime adapter" in reason_kda
 
@@ -260,6 +373,122 @@ def test_gdn_runtime_adapter_launches_fixed_prefill_smoke():
         v,
         beta,
         g,
+        output_final_state=True,
+    )
+    mx.eval(y, final_state)
+
+    assert y.shape == (1, 64, 1, 32)
+    assert y.dtype == mx.float16
+    assert final_state is not None
+    assert final_state.shape == (1, 1, 64, 32)
+    assert final_state.dtype == mx.float32
+
+
+def test_kda_runtime_adapter_launches_fixed_prefill_smoke():
+    pytest.importorskip("tilelang")
+    import mlx.core as mx
+
+    from cppmega_v4._tilelang.path_d_runtime_adapter import (
+        kda_fwd_runtime_call,
+        kda_runtime_adapter_status,
+    )
+
+    ok, reason = kda_runtime_adapter_status("test coverage complete")
+    assert ok, reason
+
+    q = mx.zeros((1, 64, 1, 64), dtype=mx.float16)
+    k = mx.zeros((1, 64, 1, 64), dtype=mx.float16)
+    v = mx.zeros((1, 64, 1, 32), dtype=mx.float16)
+    g = mx.zeros((1, 64, 1, 64), dtype=mx.float32)
+    beta = mx.zeros((1, 64, 1), dtype=mx.float32)
+
+    y, final_state = kda_fwd_runtime_call(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        output_final_state=True,
+    )
+    mx.eval(y, final_state)
+
+    assert y.shape == (1, 64, 1, 32)
+    assert y.dtype == mx.float16
+    assert final_state is not None
+    assert final_state.shape == (1, 1, 64, 32)
+    assert final_state.dtype == mx.float32
+
+
+def test_kda_runtime_adapter_launches_dynamic_shape_custom_scale_smoke():
+    pytest.importorskip("tilelang")
+    import mlx.core as mx
+
+    from cppmega_v4._tilelang.path_d_runtime_adapter import kda_fwd_runtime_call
+
+    q = mx.zeros((1, 32, 1, 8), dtype=mx.float16)
+    k = mx.zeros((1, 32, 1, 8), dtype=mx.float16)
+    v = mx.zeros((1, 32, 1, 8), dtype=mx.float16)
+    g = mx.zeros((1, 32, 1, 8), dtype=mx.float32)
+    beta = mx.zeros((1, 32, 1), dtype=mx.float32)
+
+    y, final_state = kda_fwd_runtime_call(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        scale=0.25,
+        output_final_state=True,
+    )
+    mx.eval(y, final_state)
+
+    assert y.shape == (1, 32, 1, 8)
+    assert y.dtype == mx.float16
+    assert final_state is not None
+    assert final_state.shape == (1, 1, 8, 8)
+    assert final_state.dtype == mx.float32
+
+
+def test_kda_runtime_adapter_launches_varlen_smoke():
+    pytest.importorskip("tilelang")
+    import mlx.core as mx
+
+    from cppmega_v4._tilelang.path_d_runtime_adapter import kda_fwd_runtime_call
+
+    q = mx.zeros((1, 64, 1, 64), dtype=mx.float16)
+    k = mx.zeros((1, 64, 1, 64), dtype=mx.float16)
+    v = mx.zeros((1, 64, 1, 32), dtype=mx.float16)
+    g = mx.zeros((1, 64, 1, 64), dtype=mx.float32)
+    beta = mx.zeros((1, 64, 1), dtype=mx.float32)
+    cu_seqlens = mx.array([0, 16, 64], dtype=mx.int64)
+    initial_state = mx.zeros((2, 1, 64, 32), dtype=mx.float32)
+
+    y, final_state = kda_fwd_runtime_call(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        cu_seqlens=cu_seqlens,
+        initial_state=initial_state,
+        output_final_state=True,
+    )
+    mx.eval(y, final_state)
+
+    assert y.shape == (1, 64, 1, 32)
+    assert y.dtype == mx.float16
+    assert final_state is not None
+    assert final_state.shape == (2, 1, 64, 32)
+    assert final_state.dtype == mx.float32
+
+    initial_state = mx.zeros((1, 1, 64, 32), dtype=mx.float32)
+    y, final_state = kda_fwd_runtime_call(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state=initial_state,
         output_final_state=True,
     )
     mx.eval(y, final_state)
