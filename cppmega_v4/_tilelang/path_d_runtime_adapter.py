@@ -16,7 +16,6 @@ from typing import Any, Callable, Optional
 
 
 ALLOW_DEGRADED_ENV = "CPPMEGA_V4_PATH_D_ALLOW_DEGRADED_PRIMFUNC"
-ENABLE_KKT_COMPILE_ENV = "CPPMEGA_V4_PATH_D_ENABLE_KKT_COMPILE"
 RCP_LN2 = 1.4426950408889634
 GDN_FIXED_T = 64
 GDN_FIXED_H = 1
@@ -382,63 +381,6 @@ def _compile_gdn_kkt_cached(
 
 
 @lru_cache(maxsize=16)
-def _probe_gdn_kkt_cached(
-    constexprs_key: tuple[tuple[str, Any], ...],
-    grid: tuple[int, ...],
-    allow_degraded_primfunc: bool,
-) -> PathDCompileResult:
-    from cppmega_v4._tilelang.linear_attention_path_d_real import (
-        lower_fla_gdn_kkt_solve,
-    )
-
-    lowered = lower_fla_gdn_kkt_solve(dict(constexprs_key), grid=grid)
-    if lowered.status != "LOWERED_FULL" or lowered.prim_func is None:
-        return PathDCompileResult(
-            available=False,
-            reason=(
-                "runtime adapter gdn.kkt_solve: frontend did not produce "
-                f"a runnable PrimFunc; status={lowered.status}; "
-                f"error={lowered.error_type}: {lowered.error_message}"
-            ),
-            plan=GDN_KKT_PLAN,
-            error_type=lowered.error_type,
-        )
-    plan = PathDKernelPlan(
-        name=GDN_KKT_PLAN.name,
-        out_idx=GDN_KKT_PLAN.out_idx,
-        grid=grid,
-        scalar_specializations=GDN_KKT_PLAN.scalar_specializations,
-        target=GDN_KKT_PLAN.target,
-        execution_backend=GDN_KKT_PLAN.execution_backend,
-        allow_degraded_primfunc=allow_degraded_primfunc,
-    )
-    degraded = primfunc_has_degraded_markers(lowered.prim_func)
-    allow_degraded = allow_degraded_primfunc or _env_allows_degraded()
-    if degraded and not allow_degraded:
-        return PathDCompileResult(
-            available=False,
-            reason=(
-                "runtime adapter gdn.kkt_solve: PrimFunc contains DEGRADED "
-                "pointer-lowering markers; refusing to compile/launch until "
-                "PtrAnalysis-backed addressing is clean"
-            ),
-            plan=plan,
-            degraded_primfunc=True,
-        )
-    return PathDCompileResult(
-        available=False,
-        reason=(
-            "runtime adapter gdn.kkt_solve: non-degraded PrimFunc is "
-            "available, but Metal compile is gated because current "
-            "TileLang/Metal codegen does not complete this kernel; set "
-            f"{ENABLE_KKT_COMPILE_ENV}=1 to force the experimental compile"
-        ),
-        plan=plan,
-        degraded_primfunc=degraded,
-    )
-
-
-@lru_cache(maxsize=16)
 def _compile_gdn_recompute_w_u_cached(
     constexprs_key: tuple[tuple[str, Any], ...],
     grid: tuple[int, ...],
@@ -491,12 +433,6 @@ def compile_gdn_kkt_artifact(
     if constexprs:
         cfg.update(constexprs)
     grid_tuple = tuple(int(x) for x in grid)
-    if not _env_flag(ENABLE_KKT_COMPILE_ENV):
-        return _probe_gdn_kkt_cached(
-            _freeze_items(cfg),
-            grid_tuple,
-            bool(allow_degraded_primfunc),
-        )
     return _compile_gdn_kkt_cached(
         _freeze_items(cfg),
         grid_tuple,
@@ -884,7 +820,6 @@ def kda_fwd_runtime_call(*args: Any, coverage_reason: str = "", **kwargs: Any) -
 
 __all__ = [
     "ALLOW_DEGRADED_ENV",
-    "ENABLE_KKT_COMPILE_ENV",
     "GDN_RECURRENT_PLAN",
     "KDA_RECURRENT_PLAN",
     "PathDCompileResult",
