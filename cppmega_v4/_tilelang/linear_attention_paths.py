@@ -76,7 +76,12 @@ def _path_b_status() -> PathStatus:
             )
         return PathStatus(
             path="path_b", available=True,
-            reason="hand-MSL GDN forward via mx.fast.metal_kernel (fwd only; bwd falls back to Path A)",
+            reason=(
+                "hand-MSL GDN forward via mx.fast.metal_kernel; the "
+                "autograd-aware wrapper gdn_apply_path_b in "
+                "linear_attention_path_b_bwd.py also provides a real Metal "
+                "backward (max(K, V) <= 256)"
+            ),
         )
     except Exception as exc:
         return PathStatus(

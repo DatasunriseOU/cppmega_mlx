@@ -5,9 +5,11 @@ has no mlx-lm equivalent op (no Path E).
 
 Backend status (May 2026):
     - Path A: pure-MLX naive recurrent KDA (golden) — always available.
-    - Path B: hand-MSL KDA forward via mx.fast.metal_kernel (fwd only;
-      bwd falls back to Path A). Supports any (B, T, H, HV, K, V) with
-      HV % H == 0.
+    - Path B: hand-MSL KDA fwd + real Metal bwd via mx.fast.metal_kernel.
+      Forward supports initial_state, custom scale, any (B, T, H, HV, K, V)
+      with HV % H == 0. Backward runs the snapshot-based recurrent
+      scan with multi-simdgroup shared-memory reductions for V > 32,
+      capped at V <= 256.
     - Path C: TileLang DSL @T.prim_func → tilelang.compile(target='metal',
       execution_backend='tvm_ffi'). Per-lane recurrent scan modeled on
       mamba3_path_c.py. Available iff tilelang + host MSL infra reachable.
@@ -54,8 +56,9 @@ def _path_b_status() -> PathStatus:
         return PathStatus(
             path="path_b", available=True,
             reason=(
-                "hand-MSL KDA forward via mx.fast.metal_kernel (fwd only; "
-                "bwd falls back to Path A)"
+                "hand-MSL KDA forward via mx.fast.metal_kernel; the "
+                "autograd-aware wrapper kda_apply_path_b in kda_path_b_bwd.py "
+                "also provides a real Metal backward (V <= 256)"
             ),
         )
     except Exception as exc:
