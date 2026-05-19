@@ -16,6 +16,12 @@ from cppmega_v4.spec.adapters import (
     insert_adapter_chain,
     suggest_adapter_chain,
 )
+from cppmega_v4.spec.memory_report import (
+    BrickMemoryRow,
+    MemoryReport,
+    RegionMemoryRow,
+    estimate_memory,
+)
 from cppmega_v4.spec.resolver import (
     DiagnosticSeverity,
     ResolvedBrickGraph,
@@ -36,14 +42,18 @@ __all__ = [
     "ADAPTER_RULES",
     "AdapterRule",
     "AdapterSuggestion",
+    "BrickMemoryRow",
     "BrickShapeContract",
     "DiagnosticSeverity",
+    "MemoryReport",
+    "RegionMemoryRow",
     "ResolveError",
     "ResolvedBrickGraph",
     "ResolvedEdge",
     "ShapeDiagnostic",
     "ShapeExpr",
     "contract_for",
+    "estimate_memory",
     "insert_adapter_chain",
     "register_contract",
     "registered_kinds",
