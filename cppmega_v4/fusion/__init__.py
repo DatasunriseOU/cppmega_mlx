@@ -27,6 +27,10 @@ from cppmega_v4.fusion.compatibility import (
     FusionEligibility,
     can_fuse_pair,
 )
+from cppmega_v4.fusion.descriptor_synthesizer import (
+    build_v4_extended_registry,
+    synthesize_descriptor_for_brick,
+)
 from cppmega_v4.fusion.dlpack_bridge import (
     dlpack_available,
     host_copy_fallback,
@@ -38,11 +42,13 @@ __all__ = [
     "BrickGraph",
     "BrickNode",
     "FusionEligibility",
+    "build_v4_extended_registry",
     "can_fuse_pair",
     "dlpack_available",
     "from_block_specs",
     "from_mlx_model",
     "host_copy_fallback",
     "mlx_to_tilelang",
+    "synthesize_descriptor_for_brick",
     "tilelang_to_mlx",
 ]
