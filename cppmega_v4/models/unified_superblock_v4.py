@@ -137,6 +137,34 @@ def _build_mla(hidden_size: int, params: dict) -> nn.Module:
     return MLABlock(cfg)
 
 
+def _build_gated_attention(hidden_size: int, params: dict) -> nn.Module:
+    """Qwen3-Next / Qwen3.5 / Qwen3.6 Gated Attention.
+
+    Directly re-exports ``mlx_lm.models.qwen3_next.Qwen3NextAttention`` via
+    ``cppmega_v4.nn.gated_attention.GatedAttentionBlock`` — no vendoring,
+    no re-implementation. Under the hood: ``mx.fast.scaled_dot_product_attention``
+    (Apple MPS) + sigmoid output gate + partial RoPE + asymmetric GQA +
+    Q/K RMSNorm. See cppmega_v4/nn/gated_attention.py for the wrapper.
+    """
+    from cppmega_v4.nn.gated_attention import GatedAttentionBlock, GatedAttentionConfig
+    cfg = GatedAttentionConfig(
+        hidden_size=hidden_size,
+        num_attention_heads=params.get("num_attention_heads", max(1, hidden_size // 64)),
+        num_key_value_heads=params.get(
+            "num_key_value_heads",
+            max(1, params.get("num_attention_heads", max(1, hidden_size // 64)) // 8),
+        ),
+        head_dim=params.get("head_dim", 64),
+        rms_norm_eps=params.get("rms_norm_eps", 1e-6),
+        rope_theta=params.get("rope_theta", 1_000_000.0),
+        partial_rotary_factor=params.get("partial_rotary_factor", 0.25),
+        max_position_embeddings=params.get("max_position_embeddings", 262_144),
+        attention_bias=params.get("attention_bias", False),
+        rope_scaling=params.get("rope_scaling"),
+    )
+    return GatedAttentionBlock(cfg)
+
+
 def _build_attention(hidden_size: int, params: dict) -> nn.Module:
     """Standard multi-head self-attention (causal). Used for `attention`."""
     num_heads = params.get("num_heads", max(1, hidden_size // 64))
@@ -261,6 +289,11 @@ BLOCK_BUILDERS: dict[str, Callable[[int, dict], nn.Module]] = {
     "kda": _build_kda,
     "moe": _build_moe,
     "attention": _build_attention,
+    # gated_attention = Qwen3-Next / Qwen3.6 25%-softmax slot. Direct
+    # re-export of mlx_lm.models.qwen3_next.Qwen3NextAttention; output gate
+    # + partial RoPE + asymmetric GQA + Q/K RMSNorm. Underlying compute is
+    # mx.fast.scaled_dot_product_attention (Apple MPS Metal SDPA).
+    "gated_attention": _build_gated_attention,
     # mla = V3-style with LoRA Q + LoRA KV + RoPE on pe-only split.
     # mla_absorb = same block, prefers absorb fast-path at decode.
     "mla": _build_mla,
