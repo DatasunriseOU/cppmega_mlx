@@ -28,6 +28,7 @@ from cppmega_v4.fusion.auto_planner import (
     DEFAULT_MAX_REGION_SIZE,
     DEFAULT_MAX_SHARED_MEM_BYTES,
     FusionRegionPlan,
+    auto_fuse_block_specs,
     auto_fuse_model,
     plan_fusion_regions,
 )
@@ -63,6 +64,7 @@ __all__ = [
     "RegionPattern",
     "auto_compile_plan",
     "auto_compile_region",
+    "auto_fuse_block_specs",
     "auto_fuse_model",
     "build_v4_extended_registry",
     "can_fuse_pair",

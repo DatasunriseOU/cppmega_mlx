@@ -314,10 +314,36 @@ def auto_fuse_model(
     return model
 
 
+def auto_fuse_block_specs(
+    specs: Sequence[dict],
+    *,
+    hidden_size: int,
+    max_region_size: int = DEFAULT_MAX_REGION_SIZE,
+    max_shared_mem_bytes: int = DEFAULT_MAX_SHARED_MEM_BYTES,
+    instantiate: bool = True,
+) -> tuple[BrickGraph, tuple[FusionRegionPlan, ...]]:
+    """JSON-spec entry point — counterpart of :func:`auto_fuse_model`.
+
+    Builds the BrickGraph from JSON-shaped block specs (the same surface
+    the future GUI emits) and returns the graph alongside its planned
+    fusion regions. ``instantiate=False`` is the cheap path for planners
+    that only need the kind/params layout.
+    """
+    from cppmega_v4.fusion.brick_graph import from_block_specs as _fbs
+    graph = _fbs(specs, hidden_size=hidden_size, instantiate=instantiate)
+    plan = plan_fusion_regions(
+        graph,
+        max_region_size=max_region_size,
+        max_shared_mem_bytes=max_shared_mem_bytes,
+    )
+    return graph, tuple(plan)
+
+
 __all__ = [
     "DEFAULT_MAX_REGION_SIZE",
     "DEFAULT_MAX_SHARED_MEM_BYTES",
     "FusionRegionPlan",
+    "auto_fuse_block_specs",
     "auto_fuse_model",
     "plan_fusion_regions",
 ]
