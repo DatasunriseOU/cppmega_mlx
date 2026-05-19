@@ -17,6 +17,13 @@ Stages B-E are TBD (see roadmap).
 
 from __future__ import annotations
 
+from cppmega_v4.fusion.auto_compile import (
+    AutoCompiledRegion,
+    RegionPattern,
+    auto_compile_plan,
+    auto_compile_region,
+    detect_region_pattern,
+)
 from cppmega_v4.fusion.auto_planner import (
     DEFAULT_MAX_REGION_SIZE,
     DEFAULT_MAX_SHARED_MEM_BYTES,
@@ -48,13 +55,18 @@ from cppmega_v4.fusion.dlpack_bridge import (
 __all__ = [
     "DEFAULT_MAX_REGION_SIZE",
     "DEFAULT_MAX_SHARED_MEM_BYTES",
+    "AutoCompiledRegion",
     "BrickGraph",
     "BrickNode",
     "FusionEligibility",
     "FusionRegionPlan",
+    "RegionPattern",
+    "auto_compile_plan",
+    "auto_compile_region",
     "auto_fuse_model",
     "build_v4_extended_registry",
     "can_fuse_pair",
+    "detect_region_pattern",
     "dlpack_available",
     "from_block_specs",
     "from_mlx_model",
