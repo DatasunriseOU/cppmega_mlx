@@ -8,7 +8,7 @@ implementation and does not claim production kernel performance.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Literal, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -31,6 +31,9 @@ from cppmega_mlx.nn.structure_embedding import CppMegaStructureEmbedding
 from cppmega_mlx.recipes.pattern import ExpandedNamPattern, NamLayer, expand_nam_pattern
 from cppmega_mlx.runtime.kernel_policy import KernelPath, selected_path
 from cppmega_mlx.training.mtp import MinimalMTPHead, MTPLossConfig
+
+if TYPE_CHECKING:
+    from cppmega_mlx.runtime.path_c_fusion import PathCFusionRegion
 
 HybridBackend = Literal["attention", "mamba3", "moe", "m2rnn", "engram", "concept"]
 HybridBlockModule = (
@@ -617,6 +620,36 @@ class HybridTinyLM(nn.Module):
     @property
     def route_roles(self) -> tuple[str, ...]:
         return tuple(layer.role for layer in self.pattern.layers)
+
+    @property
+    def path_c_bricks(self) -> tuple[dict[str, str], ...]:
+        return tuple(
+            {
+                "name": f"layer_{index}_{block.layer.symbol.lower()}",
+                "kind": block.backend,
+                "route_symbol": block.layer.symbol,
+            }
+            for index, block in enumerate(self.layers)
+        )
+
+    def path_c_fusion_regions(
+        self,
+        *,
+        include_backward: bool = False,
+        min_route_bricks: int = 2,
+    ) -> tuple[PathCFusionRegion, ...]:
+        """Return Path C fusion candidate regions derived from this model."""
+
+        from cppmega_mlx.runtime.path_c_fusion import (
+            build_path_c_model_regions_from_model,
+        )
+
+        return build_path_c_model_regions_from_model(
+            self,
+            region_prefix="hybrid_tiny_lm_path_c",
+            include_backward=include_backward,
+            min_route_bricks=min_route_bricks,
+        )
 
     def __call__(
         self,

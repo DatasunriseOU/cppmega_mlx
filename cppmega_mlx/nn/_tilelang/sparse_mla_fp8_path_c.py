@@ -146,6 +146,12 @@ _SMFP8_BWD_DOUT_DTYPE = "float32"
 _SMFP8_BWD_CLEAR_TOTAL = _SMFP8_BWD_B * _SMFP8_BWD_SKV * _SMFP8_BWD_G * _SMFP8_BWD_K
 _SMFP8_BWD_CLEAR_THREADS = 256
 _SMFP8_PER_TOKEN_QUANT_THREADS = 256
+_SMFP8_PREPARE_Q_ROWS = 1
+_SMFP8_PREPARE_KV_ROWS = 1
+_SMFP8_PREPARE_ROWS = _SMFP8_PREPARE_Q_ROWS + _SMFP8_PREPARE_KV_ROWS
+_SMFP8_PREPARE_K = 64
+_SMFP8_PREPARE_INPUT_DTYPE = "float32"
+_SMFP8_PREPARE_STORAGE_DTYPE = "uint8"
 
 
 @dataclass(frozen=True)
@@ -2709,6 +2715,100 @@ def _make_fp8_per_token_quant_kernel(
     return fp8_per_token_quant
 
 
+def make_fp8_sparse_mla_prepare_kernel(
+    *,
+    q_rows: int,
+    kv_rows: int,
+    K: int,
+    in_dtype: str,
+    storage_dtype: str = "uint8",
+) -> Any:
+    """Build the FP8 prepare producer PrimFunc for fused train-block schedules.
+
+    ``post_y`` is a flat q-then-kv carrier. The kernel emits first-class
+    prepared Sparse-MLA FP8 buffers and per-token scales so the downstream
+    apply node can stay inside the same TileLang/TVM region.
+    """
+
+    if q_rows <= 0 or kv_rows <= 0 or K <= 0:
+        raise ValueError("q_rows, kv_rows, and K must be positive")
+    if storage_dtype not in {"uint8", "float8_e4m3"}:
+        raise ValueError(
+            "storage_dtype must be 'uint8' or 'float8_e4m3'; "
+            f"got {storage_dtype!r}"
+        )
+
+    import tilelang.language as T
+    from tilelang.tileop.metal_quant import float_to_fp8_e4m3fn_bits
+
+    T = cast(Any, T)
+    g = globals()
+    g.update(
+        _SMFP8_PREPARE_Q_ROWS=int(q_rows),
+        _SMFP8_PREPARE_KV_ROWS=int(kv_rows),
+        _SMFP8_PREPARE_ROWS=int(q_rows) + int(kv_rows),
+        _SMFP8_PREPARE_K=int(K),
+        _SMFP8_PREPARE_INPUT_DTYPE=str(in_dtype),
+        _SMFP8_PREPARE_STORAGE_DTYPE=str(storage_dtype),
+    )
+
+    def encode_fp8(normalized):
+        if storage_dtype == "uint8":
+            return float_to_fp8_e4m3fn_bits(normalized)
+        return T.cast(normalized, "float8_e4m3")
+
+    @T.prim_func
+    def fp8_sparse_mla_prepare(
+        post_y: T.Tensor(
+            (_SMFP8_PREPARE_ROWS * _SMFP8_PREPARE_K,),
+            _SMFP8_PREPARE_INPUT_DTYPE,
+        ),
+        q_fp8: T.Tensor(
+            (_SMFP8_PREPARE_Q_ROWS * _SMFP8_PREPARE_K,),
+            _SMFP8_PREPARE_STORAGE_DTYPE,
+        ),
+        q_scale: T.Tensor((_SMFP8_PREPARE_Q_ROWS,), "float32"),
+        kv_fp8: T.Tensor(
+            (_SMFP8_PREPARE_KV_ROWS * _SMFP8_PREPARE_K,),
+            _SMFP8_PREPARE_STORAGE_DTYPE,
+        ),
+        kv_scale: T.Tensor((_SMFP8_PREPARE_KV_ROWS,), "float32"),
+    ):
+        with T.Kernel(_SMFP8_PREPARE_ROWS, threads=_SMFP8_PER_TOKEN_QUANT_THREADS) as row:
+            x_abs = T.alloc_fragment((_SMFP8_PREPARE_K,), "float32")
+            row_amax = T.alloc_fragment((1,), "float32")
+            base = row * _SMFP8_PREPARE_K
+            for k in T.Parallel(_SMFP8_PREPARE_K):
+                x_abs[k] = T.abs(T.cast(post_y[base + k], "float32"))
+            T.reduce_max(x_abs, row_amax, dim=0, clear=True)
+            row_scale = T.max(
+                row_amax[0] * T.cast(1.0 / 448.0, "float32"),
+                T.cast(1.0e-12, "float32"),
+            )
+            if row < _SMFP8_PREPARE_Q_ROWS:
+                if T.get_thread_binding(0) == 0:
+                    q_scale[row] = row_scale
+                for k in T.Parallel(_SMFP8_PREPARE_K):
+                    normalized = T.alloc_var("float32")
+                    normalized = T.cast(post_y[base + k], "float32") / row_scale
+                    normalized = T.max(normalized, T.cast(-448.0, "float32"))
+                    normalized = T.min(normalized, T.cast(448.0, "float32"))
+                    q_fp8[base + k] = encode_fp8(normalized)
+            else:
+                kv_row = row - _SMFP8_PREPARE_Q_ROWS
+                kv_base = kv_row * _SMFP8_PREPARE_K
+                if T.get_thread_binding(0) == 0:
+                    kv_scale[kv_row] = row_scale
+                for k in T.Parallel(_SMFP8_PREPARE_K):
+                    normalized = T.alloc_var("float32")
+                    normalized = T.cast(post_y[base + k], "float32") / row_scale
+                    normalized = T.max(normalized, T.cast(-448.0, "float32"))
+                    normalized = T.min(normalized, T.cast(448.0, "float32"))
+                    kv_fp8[kv_base + k] = encode_fp8(normalized)
+
+    return fp8_sparse_mla_prepare
+
+
 @lru_cache(maxsize=128)
 def _fp8_per_token_quant_tvm_ffi_kernel_for(
     rows: int,
@@ -3619,6 +3719,7 @@ __all__ = [
     "lower_fp8_sparse_mla_indexed_qk_reduce_msl",
     "lower_fp8_sparse_mla_qk_reduce_msl",
     "lower_fp8_sparse_mla_qk_msl",
+    "make_fp8_sparse_mla_prepare_kernel",
     "make_fp8_sparse_mla_indexed_qk_reduce_kernel",
     "make_fp8_sparse_mla_qk_reduce_kernel",
     "make_fp8_sparse_mla_qk_kernel",

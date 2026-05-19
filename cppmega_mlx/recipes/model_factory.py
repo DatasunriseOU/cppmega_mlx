@@ -254,6 +254,19 @@ class ModelFactoryProfile:
         params.update(overrides)
         return HybridTinyConfig(**params)
 
+    @property
+    def path_c_bricks(self) -> tuple[dict[str, str], ...]:
+        """Return allocation-free brick descriptors for Path C auto-discovery."""
+
+        return tuple(
+            {
+                "name": f"{self.name}_brick_{index}_{symbol}",
+                "kind": symbol,
+                "route_symbol": symbol,
+            }
+            for index, symbol in enumerate(self.pattern)
+        )
+
     def build_model(
         self,
         *,

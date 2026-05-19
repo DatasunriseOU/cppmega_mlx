@@ -6,7 +6,7 @@ import pytest
 
 from cppmega_v4.models.unified_superblock_v4 import UnifiedSuperblockV4
 from cppmega_v4.nn.engram_v4 import EngramV4Block, EngramV4Config
-from cppmega_v4.run_template import BlockSpec, MTPSpec, RunTemplate
+from cppmega_v4.run_template import BlockSpec, RunTemplate
 
 
 # ----- EngramV4Block standalone -----
@@ -88,6 +88,30 @@ def test_unified_superblock_builds_from_template():
     sb = UnifiedSuperblockV4(t)
     assert len(sb.blocks) == 2
     assert sb.kinds() == ["mlp", "engram"]
+    assert sb.path_c_bricks == (
+        {"name": "block_0_mlp", "kind": "mlp"},
+        {"name": "block_1_engram", "kind": "engram"},
+    )
+
+
+def test_unified_superblock_path_c_discovery_uses_brick_stack():
+    t = RunTemplate(
+        name="v4_path_c_discovery",
+        hidden_size=16,
+        blocks=[
+            BlockSpec(kind="mlp", repeat=1, params={}),
+            BlockSpec(kind="engram", repeat=1, params={
+                "num_ngram_layers": 1,
+                "max_ngram_size": 3,
+                "num_embed_table_per_ngram": 2,
+                "embed_dim": 8,
+                "embed_table_size": 32,
+            }),
+        ],
+    )
+    sb = UnifiedSuperblockV4(t)
+
+    assert sb.path_c_fusion_regions() == ()
 
 
 def test_unified_superblock_forward_shape():

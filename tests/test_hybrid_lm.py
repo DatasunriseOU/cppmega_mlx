@@ -280,6 +280,31 @@ def test_route_construction_from_nam56r_constants_at_tiny_scale() -> None:
     assert last_route.mode == "mla"
 
 
+def test_hybrid_tiny_lm_exposes_path_c_fusion_regions_from_route_symbols() -> None:
+    model = HybridTinyLM(
+        _hybrid_config(
+            pattern="AEMR",
+            depth=4,
+            dsa_a_layer_ranks=(0,),
+        )
+    )
+
+    regions = model.path_c_fusion_regions()
+
+    assert model.path_c_bricks[2] == {
+        "name": "layer_2_m",
+        "kind": "mamba3",
+        "route_symbol": "M",
+    }
+    assert len(regions) == 1
+    assert regions[0].name == "hybrid_tiny_lm_path_c_2_3"
+    assert tuple(node.op_name for node in regions[0].nodes) == (
+        "mamba3_mimo",
+        "residual_rmsnorm",
+        "m2rnn",
+    )
+
+
 def test_full_aemr_route_direct_forward_exercises_all_backend_modules() -> None:
     mx.random.seed(501)
     model = HybridTinyLM(

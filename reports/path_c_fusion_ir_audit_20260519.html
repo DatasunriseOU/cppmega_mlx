@@ -1,0 +1,402 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Path C Fusion IR Audit - 2026-05-19</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f7f8fa;
+      --fg: #18202a;
+      --muted: #657181;
+      --panel: #ffffff;
+      --line: #d9dee7;
+      --pass: #0b7a45;
+      --warn: #9b5c00;
+      --fail: #b3261e;
+      --code: #f0f3f7;
+    }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--fg);
+      font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 28px;
+    }
+    h1, h2 {
+      margin: 0 0 12px;
+      letter-spacing: 0;
+    }
+    h1 {
+      font-size: 28px;
+    }
+    h2 {
+      margin-top: 28px;
+      font-size: 19px;
+    }
+    p {
+      margin: 8px 0;
+    }
+    code {
+      background: var(--code);
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      padding: 1px 5px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      overflow: hidden;
+    }
+    th, td {
+      border-bottom: 1px solid var(--line);
+      padding: 9px 10px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      background: #eef2f6;
+      font-weight: 650;
+    }
+    tr:last-child td {
+      border-bottom: 0;
+    }
+    .summary {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 14px 16px;
+    }
+    .status {
+      display: inline-block;
+      min-width: 72px;
+      border-radius: 999px;
+      padding: 2px 8px;
+      color: white;
+      font-size: 12px;
+      font-weight: 650;
+      text-align: center;
+    }
+    .pass { background: var(--pass); }
+    .warn { background: var(--warn); }
+    .fail { background: var(--fail); }
+    .muted { color: var(--muted); }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Path C Fusion IR Audit</h1>
+  <div class="summary">
+    <p><strong>Date:</strong> 2026-05-19</p>
+    <p><strong>Scope:</strong> current high-level Path C fusion infrastructure for
+      model-route brick chains such as
+      <code>mamba3_scan + residual/RMSNorm + m2rnn_packed_post + residual/RMSNorm + attention_qkv_projection + sparse_mla_fp8_apply</code>.</p>
+    <p><strong>Bottom line:</strong> the IR-level graph, descriptor-driven single-entry schedule
+      generator, explicit production schedule contract, semantic fail-closed gate, cache/audit gates,
+      Z3 pass attachment, and TileLang lowerer path are in place. The named Mamba3 schedule is now a
+      tagged acceptance preset over reusable brick descriptors, while generic model-route chains
+      derive their loop extent and external ABI shapes from the concrete model config carried in
+      <code>PathCModelShapeEnv</code>. The selected <code>local_gb10_quarter</code> model-route path currently
+      resolves to <code>buffer_extent=4096</code> and row-local hidden storage for internal edge buffers
+      (<code>schedule_generator_status=loop_per_brick_descriptor_fragments</code>), but it
+      is still untrusted and Path C fusion must not be defaulted. The schedule contract and compile
+      cache key now include a <code>shape_env_key</code>, so two models with the same brick chain but
+      different sequence/model dimensions cannot silently reuse the same fused schedule contract.</p>
+  </div>
+
+  <h2>Objective Checklist</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Requirement</th>
+        <th>Status</th>
+        <th>Evidence</th>
+        <th>Remaining Work</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Do not fuse already lowered MSL kernels</td>
+        <td><span class="status pass">PASS</span></td>
+        <td><code>PathCFusionRegionBuilder.add_msl_kernel</code> rejects MSL strings. TileLang fusion rejects source-text schedules.</td>
+        <td>Keep this gate in place for every future fused template.</td>
+      </tr>
+      <tr>
+        <td>Build fusion at TileLang/TVM IR boundary</td>
+        <td><span class="status pass">PASS</span></td>
+        <td><code>compile_path_c_region</code> and <code>compile_fusion_region</code> produce a TileLang IR graph plan with <code>lowering_boundary=tilelang_tvm_ir</code>.</td>
+        <td>Production template must be written as TileLang/TIR, not MSL.</td>
+      </tr>
+      <tr>
+        <td>FX-like graph with dynamic kernel addition</td>
+        <td><span class="status pass">PASS</span></td>
+        <td><code>PathCFusionScheduleOptimizer</code> now wraps dynamic surface addition, graph construction, optional AOT backward graph creation, descriptor-backed schedule-registry selection, compile-plan generation, and explicit compile through the selected schedule template. It still uses <code>build_path_c_fusion_region</code>, <code>PathCFusionRegionBuilder.add_kernels</code>, TileLang <code>build_fusion_region</code>/<code>FusionRegionBuilder.add_nodes</code>, inferred edges from <code>outputs -> inputs</code>, and topological dependency ordering. <code>PathCFusionScheduleRegistry</code> now builds targets from the live region graph for every supported brick chain; a named Mamba3 acceptance profile applies only when the region carries the explicit <code>mamba3_fp8_train_acceptance</code> tag, so arbitrary matching op signatures get descriptor-generated targets instead of a hidden <code>local_gb10</code> preset. Full model patterns now flow through allocation-free <code>path_c_bricks</code> / <code>PathCModelBrick</code> discovery first; <code>build_path_c_model_regions_from_model</code> reads <code>path_c_bricks</code>, then <code>kinds()</code>, and only then the legacy <code>route_symbols</code> fallback. Unsupported bricks split candidate regions fail-closed instead of being silently rewritten. <code>HybridTinyLM.path_c_fusion_regions()</code> and <code>UnifiedSuperblockV4.path_c_fusion_regions()</code> expose candidates from their brick stacks. The descriptor generator now asks each <code>PathCBrickScheduleDescriptor</code> for its fragment emitter, so new bricks can register generation behavior without adding another hardcoded <code>op_name</code> branch in the central generator. Flat descriptor schedules now emit a lane-parallel TileLang kernel with <code>blocks * threads</code> and an <code>if i &lt; loop_extent</code> guard instead of one serial loop inside a single thread; row-phased schedules keep their ordered row reductions. External buffer ABI extents come from <code>PathCModelShapeEnv</code>, while internal edge buffers remain named in the entry IR and use scalar or row-local storage instead of extent-sized staging arrays.</td>
+        <td><code>build_mamba3_fp8_train_region</code> is now only a diagnostic preset wrapper. The static MRA helper has been renamed to <code>build_mamba3_fp8_train_acceptance_fixture_region</code> and is reserved for tagged acceptance tests. Production-oriented planning uses <code>plan_path_c_fusion_schedules_for_model(model)</code>: it discovers <code>path_c_bricks</code>, splits supported contiguous chains, and resolves each chain through descriptor-generated schedule targets without consulting the Mamba3 acceptance fixture. The local GB10 pattern <code>AEMEAEMEAEMR</code> currently exposes one automatic model-derived candidate segment, <code>local_gb10_quarter_path_c_10_11</code>, with op signature <code>mamba3_mimo -> residual_rmsnorm -> m2rnn</code>; the receipt also records its descriptor-generated prototype schedule target <code>path_c_descriptor_chain_3c54b055a185</code> and <code>attested_non_production_schedule</code> plan status.</td>
+      </tr>
+      <tr>
+        <td>Z3 sync/async optimization attachment</td>
+        <td><span class="status pass">PASS</span></td>
+        <td><code>Z3SyncSpec.minimize_sync_async</code> propagates into TileLang pass config and cache key material.</td>
+        <td>Actual schedule still needs sync/async candidate points for Z3 to optimize.</td>
+      </tr>
+      <tr>
+        <td>AOTAutograd backward graph planning</td>
+        <td><span class="status warn">PARTIAL</span></td>
+        <td><code>build_path_c_aot_autograd_region</code> now appends symbolic <code>_bwd</code> surfaces and gradient edges for the model-semantic train block; the receipt reports <code>autograd_status=ready</code>.</td>
+        <td>Backward schedule codegen/lowering is still part of the missing production fused schedule.</td>
+      </tr>
+      <tr>
+        <td>Clean Path B acceptance gate</td>
+        <td><span class="status pass">PASS</span></td>
+        <td><code>fused_path_c_plan_default_eligible</code> requires clean Path B rows, real C/B win, memory non-regression, <code>schedule_status=ready</code>, ready AOT backward, no semantic blockers, and <code>schedule_contract.status=verified</code>. The current named target reports <code>descriptor_scaffold_untrusted</code>, not <code>ready</code>, because <code>production_fragments_complete=false</code>.</td>
+        <td>Run the full matrix only after the production schedule body exists and the schedule status can honestly become <code>ready</code>.</td>
+      </tr>
+      <tr>
+        <td>Cache-key and warm-cache audit</td>
+        <td><span class="status pass">PASS</span></td>
+        <td><code>audit_fusion_cache_key</code> and <code>audit_warm_cache_reuse</code> classify changed keys, same-key recompiles, and warm first-step misses. Equivalent dynamic graph insertion orders now produce the same cache key. <code>FusionScheduleRegistry</code> no longer mutates shared callable objects with accumulated schedule-key prefixes.</td>
+        <td>Attach real compile receipts once production schedule is benchmarked.</td>
+      </tr>
+      <tr>
+        <td>Descriptor-generated schedule target for the selected model-route region</td>
+        <td><span class="status warn">UNTRUSTED</span></td>
+        <td>The model-semantic plan now reports <code>attested_non_production_schedule</code> with <code>declared_implementation_kind=prototype</code>, has no semantic blockers, and exposes a <code>single_entry_contract</code> listing required internal and external buffers. The <code>m04</code> receipt records the real <code>local_gb10_quarter</code> allocation-free brick graph, selects the largest supported contiguous model region <code>local_gb10_quarter_path_c_10_11</code>, and uses its descriptor-generated schedule target <code>path_c_descriptor_chain_3c54b055a185</code> as the reported schedule. The MRA train-block remains only a tagged named acceptance fixture and is not selected for this model route. Untagged model regions with the same supported bricks resolve to <code>path_c_descriptor_chain_*</code> schedule targets with model-derived extents, not the Mamba3 acceptance schedule ID. Regression tests now cover both sides: untagged dynamic regions stay generic, while tagged acceptance regions use <code>mamba3_m2rnn_attention_fp8_train_block_fwd_bwd_v1</code> and derive shapes such as <code>hidden=(4096*3584)</code> and <code>attention_q_proj_weight=(3584*3584)</code> from the model config. The selected model-route target exposes instance-prefixed real Mamba3, residual/RMSNorm, and M2RNN ABI buffers from actual brick names such as <code>local_gb10_quarter_brick_10_M_mamba3_in_proj_weight</code>, <code>local_gb10_quarter_brick_10_M_residual_norm_weight</code>, and <code>local_gb10_quarter_brick_11_R_m2rnn_in_proj_weight</code>, plus concrete shape summaries such as <code>local_gb10_quarter_brick_10_M_mamba3_in_proj_weight:(67321856,)</code> and <code>local_gb10_quarter_brick_10_M_residual_norm_weight:(3584,)</code>, so <code>real_abi_contract_complete=true</code>. Generated dynamic sources consume prefixed optional ABI buffers inside the fragment body: the selected local route uses <code>local_gb10_quarter_brick_10_M_mamba3_D</code> and <code>local_gb10_quarter_brick_11_R_m2rnn_D</code>, while the untagged synthetic MRA regression uses <code>route_2_A_qkv_projection_q_fp8</code>/<code>q_scale</code> and <code>route_2_A_sparse_mla_fp8_apply_sparse_mla_sm_scale</code>. It still cannot become default because <code>production_fragments_complete=false</code>, the selected schedule is prototype-attested, and no full 1B benchmark/profile/memory receipt exists. The old diagnostic raw-ABI preset still emits semantic blockers for the missing residual/RMSNorm bridge and the missing <code>attention_qkv_projection</code> FP8 producer.</td>
+        <td>Replace the generic descriptor fragments with the full optimized loop/schedule fragments from the existing Path C kernels, then trust the schedule only after native compile, profile, memory, cache, and 1B matrix receipts pass.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>Schedule Contract</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Contract</th>
+        <th>Required Internal Buffers</th>
+        <th>Required External Buffers</th>
+        <th>Current Status</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>local_gb10_quarter_path_c_10_11:single_entry_contract</code></td>
+        <td><code>local_gb10_quarter_brick_10_M_delta</code>, <code>local_gb10_quarter_brick_10_M_residual_norm_hidden</code>, <code>local_gb10_quarter_brick_10_M_residual_norm_hidden_grad</code>, <code>local_gb10_quarter_brick_10_M_delta_grad</code>.</td>
+        <td><code>hidden</code>, <code>local_gb10_quarter_brick_10_M_state_in</code>, instance-prefixed real Mamba3 weights/state, <code>local_gb10_quarter_brick_10_M_residual_norm_weight</code>, instance-prefixed real M2RNN weights/state, external M2RNN output/grad buffers, and external backward-gradient ABI buffers for the selected train graph.</td>
+        <td><span class="status warn">PROTOTYPE</span> <code>attested_non_production_schedule</code>; the real ABI gate is complete for the selected model-route region, but the default gate still requires a trusted production-attested, lowered <code>verified</code> contract.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>Production Schedule Target</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Schedule ID</th>
+        <th>Schedule Name</th>
+        <th>Required Codegen Pieces</th>
+        <th>Status</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>path_c_descriptor_chain_3c54b055a185</code></td>
+        <td><code>local_gb10_quarter_path_c_10_11:descriptor_generated_fwd_bwd</code></td>
+        <td><code>dynamic_region_graph_walk</code>, <code>brick_descriptor_chain_resolution</code>, <code>single_entry_tilelang_region</code>, <code>mamba3_scan_descriptor</code>, <code>residual_rmsnorm_descriptor</code>, <code>m2rnn_descriptor</code>, <code>m2rnn_bwd_descriptor</code>, <code>residual_rmsnorm_bwd_recompute_descriptor</code>, <code>mamba3_mimo_bwd_descriptor</code>, <code>real_model_parameter_abi_contract</code>, <code>z3_sync_async_schedule_points</code>, <code>cache_key_shape_specialization_audit</code>.</td>
+        <td><span class="status warn">PROTOTYPE</span> descriptor-generated single-entry template for the selected model-route region with model-derived external ABI shapes, a row-phased forward loop, native-verified row-phased recompute for its single full-hidden <code>residual_rmsnorm_bwd</code> bridge, row-local hidden internal-edge storage, and <code>schedule_generator_status=loop_per_brick_descriptor_fragments</code>. The receipt now reports both <code>buffer_extent=4096</code> for sequence specialization and <code>loop_extent=14680064</code> for <code>seq * hidden</code> activation coverage. It is blocked by <code>selected_model_schedule_not_default</code> and <code>production_schedule_uses_descriptor_loop_fragments</code>. The contract/cache boundary records <code>shape_env_key</code>; regression tests prove changing the model sequence length changes both the schedule contract key and the compile cache key material. The receipt exposes <code>production_fragments_complete=false</code> and per-brick production fragment statuses; the generated TileLang source repeats those statuses as comments next to each node, so scaffold code cannot be confused with inlined production schedules during profiling.</td>
+      </tr>
+      <tr>
+        <td><code>prototype_fwd_bwd</code></td>
+        <td><code>mamba3_m2rnn_attention_fp8_train_block:prototype_fwd_bwd</code></td>
+        <td>Descriptor-generated single-entry contract scaffold that structurally stores and loads all forward and backward internal edge buffers inside one entry PrimFunc.</td>
+        <td><span class="status warn">PROTOTYPE</span> passes structural single-entry validation as <code>attested_non_production_schedule</code>. The native <code>tilelang.compile</code> smoke remains opt-in because it exercises the native Triton frontend path; after the vendored <code>MaskState::parseCmp</code> assert fix the fail-closed descriptor scaffold passes. A full-hidden MR probe with one <code>residual_rmsnorm_bwd</code> bridge compiles natively, but removing the occurrence gate for the full MRA train-block caused <code>test_mamba3_fp8_train_prototype_template_compiles_with_tilelang_lowerer</code> to hit a 90s timeout. Multiple full-hidden residual/RMSNorm backward bridges therefore stay non-production until the native compile-time regression is fixed.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>Real ABI Gate</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Input Group</th>
+        <th>Required Real ABI Inputs</th>
+        <th>Status</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Mamba3</td>
+        <td>For selected model regions, instance-prefixed names such as <code>local_gb10_quarter_brick_10_M_mamba3_in_proj_weight</code>, <code>local_gb10_quarter_brick_10_M_mamba3_out_proj_weight</code>, and <code>local_gb10_quarter_brick_10_M_mamba3_h0</code>. The named MRA acceptance fixture uses the unprefixed aliases.</td>
+        <td><span class="status pass">PRESENT</span> carried as external inputs on the selected <code>local_gb10_quarter_brick_10_M</code> fusion node with concrete shape summaries.</td>
+      </tr>
+      <tr>
+        <td>M2RNN</td>
+        <td>For selected model regions, instance-prefixed names such as <code>local_gb10_quarter_brick_11_R_m2rnn_in_proj_weight</code>, <code>local_gb10_quarter_brick_11_R_m2rnn_state_weight</code>, and <code>local_gb10_quarter_brick_11_R_m2rnn_conv_state</code>. The named MRA acceptance fixture uses the unprefixed aliases.</td>
+        <td><span class="status pass">PRESENT</span> carried as external inputs on the selected <code>local_gb10_quarter_brick_11_R</code> fusion node with concrete shape summaries.</td>
+      </tr>
+      <tr>
+        <td>Attention and Sparse-MLA</td>
+        <td><code>attention_q_proj_weight</code>, <code>attention_q_proj_bias</code>, <code>attention_sparse_kv_proj_weight</code>, <code>attention_sparse_kv_proj_bias</code>, <code>attention_rope_inv_freq</code>, <code>attention_out_proj_weight</code>, <code>attention_out_proj_bias</code>, <code>sparse_mla_sm_scale</code>, <code>sparse_mla_sinks</code>, <code>sparse_mla_has_sinks</code>.</td>
+        <td><span class="status warn">ACCEPTANCE ONLY</span> present on the tagged MRA acceptance fixture. The currently selected <code>local_gb10_quarter_path_c_10_11</code> model segment is <code>M -> R</code>, so attention/Sparse-MLA is not part of that selected region.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>Current Blockers</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Edge</th>
+        <th>Observed Raw ABI</th>
+        <th>Why It Blocks Auto Fusion</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>mamba3_scan -> m2rnn_packed_post : scan_y</code></td>
+        <td>Mamba3 raw candidate <code>y:1x2x2x4:float32</code>; M2RNN raw candidate <code>conv_input:1x2x12:float32</code>.</td>
+        <td>The logical <code>scan_y</code> edge is not exposed by both raw PrimFunc ABIs and the candidate shapes do not match.</td>
+      </tr>
+      <tr>
+        <td><code>m2rnn_packed_post -> fp8_prepare : post_y</code></td>
+        <td>M2RNN raw candidate <code>post:1x2x4:float32</code>; FP8 prepare input <code>post_y:96:float32</code>.</td>
+        <td>This is not the real model edge. The production FP8 producer consumes the attention-normalized hidden state after residual add and RMSNorm, then runs attention Q/KV projection before quantization.</td>
+      </tr>
+      <tr>
+        <td><code>mamba3_scan -> m2rnn_packed_post</code></td>
+        <td><code>HybridTinyBlock</code> uses pre-norm residual blocks: each route sees <code>RMSNorm(hidden)</code>, and each output is added back to the residual stream.</td>
+        <td>The fused schedule must include a <code>mamba3_residual_to_m2rnn_norm</code> style bridge. Raw mamba3 output cannot be treated as direct m2rnn input.</td>
+      </tr>
+      <tr>
+        <td><code>m2rnn_packed_post -> fp8_prepare</code></td>
+        <td><code>CausalSelfAttention.prepare_sparse_mla_fp8</code> owns <code>attention_qkv_projection</code>: Q projection, sparse KV projection, optional RoPE, per-token FP8 quant, and sparse indices.</td>
+        <td>The fused graph needs an explicit <code>attention_qkv_projection</code> producer node. A generic <code>post_y</code> prepare node is only a shape-specialized helper, not the production edge.</td>
+      </tr>
+      <tr>
+        <td><code>fp8_prepare -> sparse_mla_fp8_apply : q_fp8/q_scale/kv_fp8/kv_scale</code></td>
+        <td>Resolved for the fused prepare producer: <code>q_fp8</code> and <code>kv_fp8</code> now expose <code>uint8</code> e4m3fn storage, matching the prepared apply ABI.</td>
+        <td>This edge no longer blocks on raw dtype. The production schedule still must keep these prepared buffers internal and keep <code>indices</code> as an external input or add a real indices producer.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>Production Fragment Audit</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Brick</th>
+        <th>Existing Source</th>
+        <th>Fused Region Status</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>mamba3_mimo</code></td>
+        <td><code>cppmega_mlx.nn._tilelang.mamba3_path_c</code> forward/backward scan kernels</td>
+        <td><span class="status warn">INLINED, UNOPTIMIZED</span> the fused region emits a Mamba3 descriptor fragment, but it is still scaffold code rather than the production shape-specialized scan schedule. The existing Path C scan kernel expects pre-projected <code>x/B/C/z/A/dt</code> tensors; the model-region node still starts from block-level <code>in_proj/conv/norm</code> parameters, so the missing codegen is the pre-scan projection/conv/BC-transform stage plus scan inlining.</td>
+      </tr>
+      <tr>
+        <td><code>residual_rmsnorm</code></td>
+        <td><code>cppmega_mlx.runtime.path_c_fusion_schedules:_emit_residual_rmsnorm_source</code></td>
+        <td><span class="status warn">INLINED, UNOPTIMIZED</span> graph node is emitted into the fused TileLang region with explicit norm-weight ABI, but it is still scalar descriptor code rather than a tuned vector RMSNorm schedule.</td>
+      </tr>
+      <tr>
+        <td><code>residual_rmsnorm_bwd</code></td>
+        <td><code>cppmega_mlx.runtime.path_c_fusion_schedules:_append_row_phased_residual_rmsnorm_bwd_body</code></td>
+        <td><span class="status warn">PARTIAL PRODUCTION-INLINED</span> one full-hidden residual/RMSNorm backward bridge is native-compile verified and emitted as row-phased recompute; train-blocks with multiple full-hidden residual/RMSNorm backward bridges stay fail-closed because the MRA acceptance compile timed out when that occurrence gate was removed.</td>
+      </tr>
+      <tr>
+        <td><code>m2rnn</code></td>
+        <td><code>cppmega_mlx.nn._tilelang.m2rnn_path_c</code> mapped packed/post kernels</td>
+        <td><span class="status warn">INLINED, UNOPTIMIZED</span> the fused region emits an M2RNN descriptor fragment, but it is still scaffold code rather than the production recurrence/post schedule. The existing mapped-packed Path C kernels expect <code>conv_input/xf/projected</code> tensors; the model-region node still starts from block-level projection/conv/state parameters, so the missing codegen is in-projection, causal depthwise conv, decay gate, mapped recurrent scan, post residual/gate, norm, and out projection as one fused fragment.</td>
+      </tr>
+      <tr>
+        <td><code>attention_qkv_projection</code></td>
+        <td><code>CausalSelfAttention.prepare_sparse_mla_fp8</code></td>
+        <td><span class="status warn">INLINED, UNOPTIMIZED</span> the fused region emits an attention projection descriptor fragment with real ABI, but it is still scaffold code rather than the production q/kv projection, RoPE, and FP8 prepare schedule.</td>
+      </tr>
+      <tr>
+        <td><code>sparse_mla_fp8_apply</code></td>
+        <td><code>cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c</code> prepare/apply kernels</td>
+        <td><span class="status warn">INLINED, UNOPTIMIZED</span> the fused region emits a Sparse-MLA FP8 apply descriptor fragment, but it is still scaffold code rather than the production prepared apply schedule.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>Model-Semantic Target</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Region</th>
+        <th>Nodes</th>
+        <th>Status</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>local_gb10_quarter_path_c_10_11</code></td>
+        <td><code>local_gb10_quarter_brick_10_M -> local_gb10_quarter_brick_10_M_residual_norm -> local_gb10_quarter_brick_11_R</code>, plus symbolic <code>local_gb10_quarter_brick_11_R_bwd -> local_gb10_quarter_brick_10_M_bwd</code>.</td>
+        <td>This is the selected model-derived region in the <code>m04</code> receipt. It resolves to <code>path_c_descriptor_chain_3c54b055a185</code>, <code>declared_implementation_kind=prototype</code>, and complete instance-prefixed real ABI inputs.</td>
+      </tr>
+      <tr>
+        <td><code>mamba3_m2rnn_attention_fp8_train_block</code></td>
+        <td><code>mamba3_scan -> mamba3_residual_to_m2rnn_norm -> m2rnn_packed_post -> m2rnn_residual_to_attention_norm -> attention_qkv_projection -> sparse_mla_fp8_apply</code>, plus symbolic <code>attention_qkv_projection_bwd -> ... -> mamba3_scan_bwd</code>.</td>
+        <td>This is a tagged named acceptance fixture. It removes the semantic blockers from the old diagnostic preset and resolves to the MRA schedule id only when the region carries <code>mamba3_fp8_train_acceptance</code>; it is not the source of truth for arbitrary models.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>Verification</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Check</th>
+        <th>Result</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>pytest tests/test_path_c_fusion_ir.py tests/test_path_c_fusion_templates.py tests/test_m04_train_step.py tests/test_hybrid_lm.py::test_hybrid_tiny_lm_exposes_path_c_fusion_regions_from_route_symbols tests/v4/test_unified_superblock_v4.py::test_unified_superblock_builds_from_template tests/v4/test_unified_superblock_v4.py::test_unified_superblock_path_c_discovery_uses_brick_stack tests/v4/test_fusion_stage_a.py -q</code></td>
+        <td><span class="status pass">PASS</span> 186 passed, 2 skipped</td>
+      </tr>
+      <tr>
+        <td><code>CPPMEGA_RUN_NATIVE_TILELANG_COMPILE_SMOKE=1 ... pytest tests/test_path_c_fusion_ir.py::test_mamba3_fp8_train_prototype_template_compiles_with_tilelang_lowerer -q</code></td>
+        <td><span class="status pass">PASS</span> descriptor-generated PrimFunc compiled through native TileLang lowerer</td>
+      </tr>
+      <tr>
+        <td><code>CPPMEGA_RUN_NATIVE_TILELANG_COMPILE_SMOKE=1 ... pytest tests/test_path_c_fusion_ir.py::test_model_derived_descriptor_template_compiles_with_tilelang_lowerer -q</code></td>
+        <td><span class="status pass">PASS</span> selected <code>local_gb10_quarter</code> brick-derived descriptor region compiled through native TileLang lowerer</td>
+      </tr>
+      <tr>
+        <td><code>ninja -C poc/triton_frontend/_cxx/build _triton_frontend_cxx</code> and <code>pytest poc/triton_frontend/tests/test_ptr_analysis.py -q</code></td>
+        <td><span class="status pass">PASS</span> vendored Triton <code>MaskState::parseCmp</code> unsupported-mask case returns failure instead of aborting</td>
+      </tr>
+      <tr>
+        <td><code>pytest testing/python/metal/test_metal_fp8_quant_helpers.py testing/python/engine/test_tilelang_fusion_region.py -q</code></td>
+        <td><span class="status pass">PASS</span> 34 passed</td>
+      </tr>
+      <tr>
+        <td>Regression checks: structural internal-edge materialization, equivalent-order cache key stability, unattested, diagnostic-attested, and untrusted-production schedules staying non-production, and semantic blockers preventing diagnostic graphs from claiming <code>single_kernel_fused=True</code></td>
+        <td><span class="status pass">PASS</span></td>
+      </tr>
+      <tr>
+        <td><code>ruff</code>, <code>py_compile</code>, <code>git diff --check</code></td>
+        <td><span class="status pass">PASS</span></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p class="muted">This report is intentionally not a performance matrix. The full Path B/Path C
+    benchmark matrix should be rerun only after the descriptor-generated production schedule is
+    replaced with optimized per-brick lowering and trusted; otherwise it would measure generic
+    descriptor loop fragments rather than the schedule meant to compete with Path B.</p>
+</main>
+</body>
+</html>

@@ -14,6 +14,9 @@ import mlx.optimizers as optim
 import pytest
 
 import scripts.m04_train_step as m04_train_step
+from cppmega_mlx.runtime.path_c_fusion_schedules import (
+    PATH_C_DESCRIPTOR_SCHEDULE_GENERATOR,
+)
 from cppmega_mlx.training.optimizers import (
     ADAMW_BASE_CLASS,
     ADAMW_FP32_MOMENTS_CLASS,
@@ -1296,40 +1299,308 @@ def test_fp8_path_c_dsa_attention_route_metadata_is_configured(
     assert route["direct_mx_array_artifact_call_status"] == "m04_uses_model_graph_route"
     assert route["selected_action"] == "run_path_c_training_route"
     assert route["path_c_fusion"]["mode"] == "auto"
-    assert route["path_c_fusion"]["status"] == "plan_ready_not_default"
+    assert route["path_c_fusion"]["status"] == "plan_scaffold_not_default"
     assert route["path_c_fusion"]["lowering_boundary"] == "tilelang_tvm_ir"
     assert route["path_c_fusion"]["compiler"] == "tilelang.engine.fusion"
     assert route["path_c_fusion"]["requires_msl_post_fusion"] is False
     assert route["path_c_fusion"]["large_tensor_staging_allowed"] is False
+    assert route["path_c_fusion"]["graph_construction"] == {
+        "builder": "PathCFusionScheduleOptimizer",
+        "input_model": "local_gb10_quarter_profile_path_c_bricks",
+        "route_symbols": list("AEMEAEMEAEMR"),
+        "region_source": "build_path_c_model_regions_from_model",
+        "edge_policy": "infer_from_outputs_to_inputs",
+        "dependency_ordering": "topological",
+        "schedule_construction": "dynamic_brick_descriptors",
+        "optimization_scope": "all_discovered_supported_path_c_brick_segments",
+        "static_acceptance_fixture_used_for_selection": False,
+        "selected_model_region": "local_gb10_quarter_path_c_10_11",
+        "selected_model_region_op_signature": [
+            "mamba3_mimo",
+            "residual_rmsnorm",
+            "m2rnn",
+        ],
+        "selected_model_region_schedule_id": "path_c_descriptor_chain_3c54b055a185",
+        "preset_only": False,
+    }
+    model_route_candidates = route["path_c_fusion"]["model_route_candidates"]
+    assert model_route_candidates["profile"] == "local_gb10_quarter"
+    assert "".join(model_route_candidates["route_symbols"]) == "AEMEAEMEAEMR"
+    assert model_route_candidates["region_source"] == (
+        "build_path_c_model_regions_from_model"
+    )
+    assert model_route_candidates["selection_policy"] == (
+        "largest_supported_contiguous_route_segment"
+    )
+    assert model_route_candidates["selected_candidate"]["name"] == (
+        "local_gb10_quarter_path_c_10_11"
+    )
+    assert len(model_route_candidates["candidate_regions"]) == 1
+    candidate = model_route_candidates["candidate_regions"][0]
+    assert candidate["name"] == "local_gb10_quarter_path_c_10_11"
+    assert candidate["brick_names"] == [
+        "local_gb10_quarter_brick_10_M",
+        "local_gb10_quarter_brick_11_R",
+    ]
+    assert candidate["brick_kinds"] == ["M", "R"]
+    assert candidate["brick_route_symbols"] == ["M", "R"]
+    assert candidate["node_names"] == [
+        "local_gb10_quarter_brick_10_M",
+        "local_gb10_quarter_brick_10_M_residual_norm",
+        "local_gb10_quarter_brick_11_R",
+    ]
+    assert candidate["op_signature"] == [
+        "mamba3_mimo",
+        "residual_rmsnorm",
+        "m2rnn",
+    ]
+    assert candidate["edge_count"] == 2
+    assert candidate["z3_sync"] == {
+        "enabled": True,
+        "objective": "minimize_sync_async",
+        "proof_required": True,
+    }
+    assert candidate["schedule_target"]["schedule_id"].startswith(
+        "path_c_descriptor_chain_"
+    )
+    assert candidate["schedule_target"]["implementation_kind"] == "prototype"
+    assert candidate["schedule_target"]["schedule_generator"] == (
+        PATH_C_DESCRIPTOR_SCHEDULE_GENERATOR
+    )
+    assert "local_gb10_quarter_brick_10_M_mamba3_in_proj_weight" in (
+        candidate["schedule_target"]["required_real_abi_inputs"]
+    )
+    assert candidate["plan"]["schedule_contract_status"] == (
+        "attested_non_production_schedule"
+    )
+    assert candidate["plan"]["autograd_status"] == "ready"
     assert route["path_c_fusion"]["fullgraph_required"] is True
     assert route["path_c_fusion"]["graph_break_policy"] == "fail_closed"
-    assert [blocker["kind"] for blocker in route["path_c_fusion"]["schedule_blockers"]] == [
-        "missing_single_entry_train_block_schedule",
-        "fp8_prepare_tilelang_prim_func_missing",
-    ]
-    assert route["path_c_fusion"]["autograd_plan"]["status"] == (
-        "requires_aot_autograd_codegen"
+    assert route["path_c_fusion"]["schedule_name"] == (
+        "local_gb10_quarter_path_c_10_11:descriptor_generated_fwd_bwd"
     )
-    assert route["path_c_fusion"]["autograd_plan"]["missing_backward_nodes"] == [
-        "mamba3_scan_bwd",
-        "m2rnn_packed_post_bwd",
+    assert route["path_c_fusion"]["schedule_status"] == (
+        "descriptor_codegen_scaffold"
+    )
+    assert route["path_c_fusion"]["schedule_registry"] == {
+        "selector": "PathCFusionScheduleRegistry",
+        "match_policy": "op_signature_or_descriptor_chain",
+        "selected_schedule_id": "path_c_descriptor_chain_3c54b055a185",
+        "selected_schedule_name": (
+            "local_gb10_quarter_path_c_10_11:descriptor_generated_fwd_bwd"
+        ),
+        "selected_from": "selected_model_region",
+    }
+    assert route["path_c_fusion"]["schedule_contract"]["status"] == (
+        "attested_non_production_schedule"
+    )
+    assert route["path_c_fusion"]["schedule_contract"][
+        "declared_implementation_kind"
+    ] == "prototype"
+    assert route["path_c_fusion"]["schedule_contract"][
+        "declared_schedule_id"
+    ] == ""
+    assert "local_gb10_quarter_brick_10_M_mamba3_in_proj_weight" in (
+        route["path_c_fusion"]["schedule_contract"][
+            "declared_required_real_abi_inputs"
+        ]
+    )
+    assert route["path_c_fusion"]["production_schedule"]["schedule_id"] == (
+        "path_c_descriptor_chain_3c54b055a185"
+    )
+    assert route["path_c_fusion"]["production_schedule"]["schedule_name"] == (
+        "local_gb10_quarter_path_c_10_11:descriptor_generated_fwd_bwd"
+    )
+    assert route["path_c_fusion"]["production_schedule"]["source"] == (
+        "selected_model_region"
+    )
+    assert route["path_c_fusion"]["production_schedule"]["shape_env_key"]
+    assert route["path_c_fusion"]["schedule_contract"]["shape_env_key"] == (
+        route["path_c_fusion"]["production_schedule"]["shape_env_key"]
+    )
+    assert route["path_c_fusion"]["production_schedule"]["implementation_kind"] == (
+        "prototype"
+    )
+    assert route["path_c_fusion"]["production_schedule"]["implementation_status"] == (
+        "descriptor_codegen_scaffold"
+    )
+    assert route["path_c_fusion"]["production_schedule"]["trusted_by_default"] is False
+    required_codegen_steps = route["path_c_fusion"]["production_schedule"][
+        "required_codegen_steps"
     ]
+    assert required_codegen_steps[:3] == [
+        "dynamic_region_graph_walk",
+        "brick_descriptor_chain_resolution",
+        "single_entry_tilelang_region",
+    ]
+    assert "real_model_parameter_abi_contract" in required_codegen_steps
+    assert "mamba3_scan_descriptor" in required_codegen_steps
+    assert "m2rnn_descriptor" in required_codegen_steps
+    assert "m2rnn_bwd_descriptor" in required_codegen_steps
+    assert "m2rnn_bwd_final_gradient_owner_outputs" in required_codegen_steps
+    assert "z3_sync_async_schedule_points" in required_codegen_steps
+    assert "cache_key_shape_specialization_audit" in required_codegen_steps
+    assert (
+        route["path_c_fusion"]["production_schedule"]["schedule_generator"]
+        == PATH_C_DESCRIPTOR_SCHEDULE_GENERATOR
+    )
+    assert (
+        route["path_c_fusion"]["production_schedule"][
+            "schedule_generator_status"
+        ]
+        == "loop_per_brick_descriptor_fragments"
+    )
+    assert route["path_c_fusion"]["production_schedule"]["internal_buffer_policy"] == (
+        "row_local_hidden"
+    )
+    assert route["path_c_fusion"]["production_schedule"]["loop_policy"] == (
+        "row_phased_hidden"
+    )
+    assert route["path_c_fusion"]["production_schedule"]["buffer_extent"] == (
+        m04_train_step.MATRIX_SEQ_LEN
+    )
+    assert route["path_c_fusion"]["production_schedule"]["loop_extent"] == (
+        m04_train_step.MATRIX_SEQ_LEN
+        * m04_train_step.REQUIRED_MODEL_GEOMETRY["hidden_size"]
+    )
+    assert route["path_c_fusion"]["production_schedule"]["brick_ops"] == (
+        route["path_c_fusion"]["schedule_contract"]["op_signature"]
+    )
+    assert set(
+        route["path_c_fusion"]["production_schedule"]["brick_schedule_families"]
+    ) == {"loop_descriptor_dataflow"}
+    assert "mamba3_mimo:descriptor_codegen_ready" in (
+        route["path_c_fusion"]["production_schedule"]["brick_descriptor_statuses"]
+    )
+    fragment_statuses = route["path_c_fusion"]["production_schedule"][
+        "brick_production_fragment_statuses"
+    ]
+    fragment_reasons = route["path_c_fusion"]["production_schedule"][
+        "brick_production_fragment_reasons"
+    ]
+    fragment_blockers = route["path_c_fusion"]["production_schedule"][
+        "brick_production_fragment_blockers"
+    ]
+    assert route["path_c_fusion"]["production_schedule"][
+        "production_fragments_complete"
+    ] is False
+    assert len(fragment_blockers) == 4
+    assert any(
+        status.startswith("mamba3_mimo:region_fragment_inlined_unoptimized:")
+        for status in fragment_statuses
+    )
+    assert any(
+        status.startswith("residual_rmsnorm:production_region_inlined:")
+        for status in fragment_statuses
+    )
+    assert any(
+        status.startswith("residual_rmsnorm_bwd:production_region_inlined:")
+        for status in fragment_statuses
+    )
+    assert any(
+        reason.startswith(
+            "residual_rmsnorm_bwd:production_region_inlined:"
+            "row-phased descriptor codegen recomputes residual/RMSNorm"
+        )
+        for reason in fragment_reasons
+    )
+    assert not any(
+        blocker.startswith("residual_rmsnorm_bwd:")
+        for blocker in fragment_blockers
+    )
+    assert any(
+        reason.startswith(
+            "residual_rmsnorm:production_region_inlined:"
+            "row-phased descriptor codegen emits the residual bridge"
+        )
+        for reason in fragment_reasons
+    )
+    assert not any(
+        blocker.startswith("residual_rmsnorm:production_region_inlined:")
+        for blocker in fragment_blockers
+    )
+    assert any(
+        status.startswith("m2rnn:region_fragment_inlined_unoptimized:")
+        for status in fragment_statuses
+    )
+    assert (
+        route["path_c_fusion"]["production_schedule"][
+            "real_abi_contract_complete"
+        ]
+        is True
+    )
+    assert (
+        route["path_c_fusion"]["production_schedule"]["missing_real_abi_inputs"]
+        == []
+    )
+    assert "local_gb10_quarter_brick_10_M_mamba3_in_proj_weight" in (
+        route["path_c_fusion"]["production_schedule"]["required_external_buffers"]
+    )
+    assert "local_gb10_quarter_brick_10_M_residual_norm_weight" in (
+        route["path_c_fusion"]["production_schedule"][
+            "required_real_abi_inputs"
+        ]
+    )
+    assert "local_gb10_quarter_brick_10_M_mamba3_in_proj_weight:(67321856,)" in (
+        route["path_c_fusion"]["production_schedule"][
+            "required_real_abi_input_shapes"
+        ]
+    )
+    assert "local_gb10_quarter_brick_10_M_residual_norm_weight:(3584,)" in (
+        route["path_c_fusion"]["production_schedule"][
+            "required_real_abi_input_shapes"
+        ]
+    )
+    assert (
+        route["path_c_fusion"]["production_schedule"]["contract_key"]
+        == route["path_c_fusion"]["schedule_contract"]["key"]
+    )
+    assert route["path_c_fusion"]["schedule_contract"]["required_internal_buffers"] == [
+        "local_gb10_quarter_brick_10_M_delta",
+        "local_gb10_quarter_brick_10_M_residual_norm_hidden",
+        "local_gb10_quarter_brick_10_M_residual_norm_hidden_grad",
+        "local_gb10_quarter_brick_10_M_delta_grad",
+    ]
+    assert [blocker["kind"] for blocker in route["path_c_fusion"]["schedule_blockers"]] == [
+        "selected_model_schedule_not_default",
+        "production_schedule_uses_descriptor_loop_fragments",
+        "production_schedule_not_compile_verified",
+        "production_1b_matrix_profile_missing",
+    ]
+    assert route["path_c_fusion"]["schedule_blockers"][0]["schedule_id"] == (
+        "path_c_descriptor_chain_3c54b055a185"
+    )
+    assert route["path_c_fusion"]["schedule_blockers"][0]["schedule_generator"] == (
+        PATH_C_DESCRIPTOR_SCHEDULE_GENERATOR
+    )
+    assert route["path_c_fusion"]["semantic_blockers"] == []
+    assert "diagnostic_raw_abi_region" not in route["path_c_fusion"]
+    assert route["path_c_fusion"]["autograd_plan"]["status"] == "ready"
+    assert route["path_c_fusion"]["autograd_plan"]["missing_backward_nodes"] == []
     assert route["path_c_fusion"]["autograd_plan"]["backward_nodes"] == [
-        "m2rnn_packed_post_bwd",
-        "mamba3_scan_bwd",
+        "local_gb10_quarter_brick_11_R_bwd",
+        "local_gb10_quarter_brick_10_M_residual_norm_bwd",
+        "local_gb10_quarter_brick_10_M_bwd",
     ]
     assert route["path_c_fusion"]["autograd_plan"]["backward_edges"] == [
         [
-            "m2rnn_packed_post_bwd",
-            "mamba3_scan_bwd",
-            "scan_y_grad",
+            "local_gb10_quarter_brick_11_R_bwd",
+            "local_gb10_quarter_brick_10_M_residual_norm_bwd",
+            "local_gb10_quarter_brick_10_M_residual_norm_hidden_grad",
+        ],
+        [
+            "local_gb10_quarter_brick_10_M_residual_norm_bwd",
+            "local_gb10_quarter_brick_10_M_bwd",
+            "local_gb10_quarter_brick_10_M_delta_grad",
         ]
     ]
     assert route["path_c_fusion"]["node_names"] == [
-        "mamba3_scan",
-        "m2rnn_packed_post",
-        "fp8_prepare",
-        "sparse_mla_fp8_apply",
+        "local_gb10_quarter_brick_10_M",
+        "local_gb10_quarter_brick_10_M_residual_norm",
+        "local_gb10_quarter_brick_11_R",
+        "local_gb10_quarter_brick_11_R_bwd",
+        "local_gb10_quarter_brick_10_M_residual_norm_bwd",
+        "local_gb10_quarter_brick_10_M_bwd",
     ]
     assert route["path_c_fusion"]["z3_sync"] == {
         "enabled": True,
@@ -1339,6 +1610,20 @@ def test_fp8_path_c_dsa_attention_route_metadata_is_configured(
     }
     assert route["path_c_fusion"]["acceptance_gate"]["ignores_bad_path_b"] is True
     assert route["path_c_fusion"]["acceptance_gate"]["requires_ready_fusion_plan"] is True
+    assert (
+        route["path_c_fusion"]["acceptance_gate"]["requires_compile_verified_single_kernel"]
+        is True
+    )
+    assert (
+        route["path_c_fusion"]["acceptance_gate"]["requires_verified_schedule_contract"]
+        is True
+    )
+    assert (
+        route["path_c_fusion"]["acceptance_gate"][
+            "requires_complete_real_abi_contract"
+        ]
+        is True
+    )
     assert route["path_c_fusion"]["acceptance_gate"]["current_plan_default_eligible"] is False
     assert route["path_c_fusion"]["cache_audit_required"] is True
     assert producer_gate["required"] is True
@@ -1348,7 +1633,7 @@ def test_fp8_path_c_dsa_attention_route_metadata_is_configured(
     assert producer_gate["producer"] == producer
 
 
-def test_path_c_fusion_force_mode_fails_closed_until_real_schedule_exists(
+def test_path_c_fusion_force_mode_fails_closed_until_real_schedule_is_verified(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("CPPMEGA_PATH_C_FUSION", "force")
@@ -1356,15 +1641,58 @@ def test_path_c_fusion_force_mode_fails_closed_until_real_schedule_exists(
     payload = m04_train_step.path_c_fusion_payload()
 
     assert payload["mode"] == "force"
-    assert payload["status"] == "force_blocked_schedule_missing"
+    assert payload["status"] == "force_blocked_schedule_unverified"
     assert payload["single_kernel_fused"] is False
     assert payload["fullgraph_required"] is True
     assert payload["graph_break_policy"] == "fail_closed"
-    assert payload["autograd_plan"]["status"] == "requires_aot_autograd_codegen"
-    assert payload["schedule_status"] == "missing_real_fused_schedule_template"
-    assert payload["schedule_blockers"][1]["kind"] == "fp8_prepare_tilelang_prim_func_missing"
+    assert payload["autograd_plan"]["status"] == "ready"
+    assert payload["schedule_name"] == (
+        "local_gb10_quarter_path_c_10_11:descriptor_generated_fwd_bwd"
+    )
+    assert payload["schedule_status"] == "descriptor_codegen_scaffold"
+    assert payload["schedule_contract"]["status"] == "attested_non_production_schedule"
+    assert payload["schedule_contract"]["declared_implementation_kind"] == "prototype"
+    assert payload["schedule_contract"]["declared_schedule_id"] == ""
+    assert payload["production_schedule"]["schedule_id"] == (
+        "path_c_descriptor_chain_3c54b055a185"
+    )
+    assert payload["production_schedule"]["implementation_status"] == (
+        "descriptor_codegen_scaffold"
+    )
+    assert (
+        payload["production_schedule"]["schedule_generator_status"]
+        == "loop_per_brick_descriptor_fragments"
+    )
+    assert payload["production_schedule"]["internal_buffer_policy"] == (
+        "row_local_hidden"
+    )
+    assert payload["production_schedule"]["loop_policy"] == "row_phased_hidden"
+    assert payload["production_schedule"]["real_abi_contract_complete"] is True
+    assert payload["production_schedule"]["missing_real_abi_inputs"] == []
+    assert payload["production_schedule"]["production_fragments_complete"] is False
+    assert any(
+        status.startswith("m2rnn:region_fragment_inlined_unoptimized:")
+        for status in payload["production_schedule"][
+            "brick_production_fragment_statuses"
+        ]
+    )
+    assert "selected_model_schedule_not_default" in {
+        blocker["kind"] for blocker in payload["schedule_blockers"]
+    }
+    assert "production_1b_matrix_profile_missing" in {
+        blocker["kind"] for blocker in payload["schedule_blockers"]
+    }
+    assert "production_schedule_uses_descriptor_loop_fragments" in {
+        blocker["kind"] for blocker in payload["schedule_blockers"]
+    }
+    assert "missing_real_abi_inputs" not in {
+        blocker["kind"] for blocker in payload["schedule_blockers"]
+    }
+    assert payload["semantic_blockers"] == []
+    assert "diagnostic_raw_abi_region" not in payload
     assert payload["default_allowed"] is False
-    assert "real fused train-block schedule" in payload["reason"]
+    assert "model-route-derived single-entry schedule scaffold" in payload["reason"]
+    assert "production body is not complete" in payload["reason"]
 
 
 def test_fp8_path_c_local_gb10_profile_uses_model_factory_dsa_producer() -> None:

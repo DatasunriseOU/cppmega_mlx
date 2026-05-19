@@ -23,6 +23,7 @@ import sys
 import tempfile
 import time
 import traceback
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -42,11 +43,14 @@ from cppmega_mlx.runtime.memory import (  # noqa: E402
     memory_limit_api_status,
 )
 from cppmega_mlx.runtime.path_c_fusion import (  # noqa: E402
-    FusionCompilePlan,
     PathCFusionMode,
-    build_mamba3_fp8_train_region,
-    compile_path_c_region,
+    build_path_c_model_regions_from_model,
     selected_path_c_fusion_mode,
+)
+from cppmega_mlx.runtime.path_c_fusion_schedules import (  # noqa: E402
+    PATH_C_DESCRIPTOR_SCHEDULE_GENERATOR,
+    path_c_fusion_schedule_spec,
+    plan_path_c_fusion_schedule_for_region,
 )
 from cppmega_mlx.recipes.model_factory import (  # noqa: E402
     local_gb10_quarter,
@@ -1152,25 +1156,57 @@ def path_c_fusion_payload() -> dict[str, Any]:
     """Return receipt metadata for the high-level Path C fusion planner."""
 
     mode = selected_path_c_fusion_mode()
-    region = build_mamba3_fp8_train_region()
-    plan = compile_path_c_region(region)
-    if not isinstance(plan, FusionCompilePlan):
-        raise TypeError("compile_path_c_region unexpectedly returned an artifact")
-    real_schedule_missing = not plan.single_kernel_fused
-    force_blocked = mode is PathCFusionMode.FORCE and real_schedule_missing
+    profile, route_symbols, model_regions = _local_gb10_path_c_model_regions()
+    selected_region = _select_path_c_model_route_region(model_regions)
+    if selected_region is None:
+        raise RuntimeError("local_gb10_quarter did not expose any Path C model region")
+    model_route_candidates = _path_c_model_route_candidates_payload(
+        profile_name=profile.name,
+        route_symbols=route_symbols,
+        regions=model_regions,
+        selected_region=selected_region,
+    )
+    selected_model_region = model_route_candidates["selected_candidate"]
+    scheduled = plan_path_c_fusion_schedule_for_region(
+        selected_region,
+        include_backward=True,
+    )
+    if scheduled.schedule_target is None:
+        raise RuntimeError(
+            "selected Path C model region did not resolve to a schedule target"
+        )
+    region = scheduled.region
+    plan = scheduled.plan
+    schedule_spec = path_c_fusion_schedule_spec(
+        region,
+        contract=plan.schedule_contract,
+        target=scheduled.schedule_target,
+    )
+    real_schedule_unverified = not plan.single_kernel_fused
+    force_blocked = mode is PathCFusionMode.FORCE and real_schedule_unverified
+    scaffold_blocked = not schedule_spec.production_fragments_complete
     status = (
         "off"
         if mode is PathCFusionMode.OFF
-        else "force_blocked_schedule_missing"
+        else "force_blocked_schedule_unverified"
         if force_blocked
+        else "plan_scaffold_not_default"
+        if scaffold_blocked
         else "plan_ready_not_default"
     )
-    reason = (
-        "real fused train-block schedule is not available yet; graph capture "
-        "must not be defaulted as single-kernel fusion"
-        if real_schedule_missing
-        else None
-    )
+    if scaffold_blocked:
+        reason = (
+            "Path C fusion selected a model-route-derived single-entry schedule "
+            "scaffold, but the production body is not complete because at least "
+            "one brick fragment is not production-inlined"
+        )
+    elif real_schedule_unverified:
+        reason = (
+            "real fused train-block schedule is registered but is not yet trusted, "
+            "compile-verified, benchmarked, and memory-profiled for default use"
+        )
+    else:
+        reason = None
     return {
         "mode": mode.value,
         "status": status,
@@ -1180,25 +1216,236 @@ def path_c_fusion_payload() -> dict[str, Any]:
         "backend": plan.backend,
         "compiler": plan.compiler,
         "fusion_kind": plan.fusion_kind,
+        "graph_construction": {
+            "builder": "PathCFusionScheduleOptimizer",
+            "input_model": f"{profile.name}_profile_path_c_bricks",
+            "route_symbols": model_route_candidates["route_symbols"],
+            "region_source": model_route_candidates["region_source"],
+            "edge_policy": "infer_from_outputs_to_inputs",
+            "dependency_ordering": "topological",
+            "schedule_construction": "dynamic_brick_descriptors",
+            "optimization_scope": "all_discovered_supported_path_c_brick_segments",
+            "static_acceptance_fixture_used_for_selection": False,
+            "selected_model_region": (
+                selected_model_region["name"] if selected_model_region else None
+            ),
+            "selected_model_region_op_signature": (
+                selected_model_region["op_signature"]
+                if selected_model_region
+                else []
+            ),
+            "selected_model_region_schedule_id": (
+                selected_model_region["schedule_target"]["schedule_id"]
+                if selected_model_region
+                and selected_model_region["schedule_target"] is not None
+                else None
+            ),
+            "preset_only": False,
+        },
+        "model_route_candidates": model_route_candidates,
+        "schedule_name": plan.schedule_name,
         "schedule_status": plan.schedule_status,
+        "schedule_registry": {
+            "selector": "PathCFusionScheduleRegistry",
+            "match_policy": "op_signature_or_descriptor_chain",
+            "selected_schedule_id": schedule_spec.schedule_id,
+            "selected_schedule_name": schedule_spec.schedule_name,
+            "selected_from": "selected_model_region",
+        },
+        "production_schedule": {
+            "source": "selected_model_region",
+            "schedule_id": schedule_spec.schedule_id,
+            "schedule_name": schedule_spec.schedule_name,
+            "implementation_kind": schedule_spec.implementation_kind,
+            "implementation_status": schedule_spec.implementation_status,
+            "missing_reason": schedule_spec.missing_reason,
+            "trusted_by_default": schedule_spec.trusted_by_default,
+            "contract_name": schedule_spec.contract_name,
+            "contract_key": schedule_spec.contract_key,
+            "shape_env_key": schedule_spec.shape_env_key,
+            "op_signature": list(schedule_spec.op_signature),
+            "required_internal_buffers": list(
+                schedule_spec.required_internal_buffers
+            ),
+            "required_external_buffers": list(
+                schedule_spec.required_external_buffers
+            ),
+            "required_real_abi_inputs": list(
+                schedule_spec.required_real_abi_inputs
+            ),
+            "required_real_abi_input_shapes": list(
+                schedule_spec.required_real_abi_input_shapes
+            ),
+            "missing_real_abi_inputs": list(
+                schedule_spec.missing_real_abi_inputs
+            ),
+            "real_abi_contract_complete": (
+                schedule_spec.real_abi_contract_complete
+            ),
+            "required_codegen_steps": list(
+                schedule_spec.required_codegen_steps
+            ),
+            "schedule_generator": schedule_spec.schedule_generator,
+            "schedule_generator_status": (
+                schedule_spec.schedule_generator_status
+            ),
+            "internal_buffer_policy": schedule_spec.internal_buffer_policy,
+            "loop_policy": schedule_spec.loop_policy,
+            "buffer_extent": schedule_spec.buffer_extent,
+            "loop_extent": schedule_spec.loop_extent,
+            "brick_ops": list(schedule_spec.brick_ops),
+            "brick_schedule_families": list(
+                schedule_spec.brick_schedule_families
+            ),
+            "brick_descriptor_statuses": list(
+                schedule_spec.brick_descriptor_statuses
+            ),
+            "brick_production_fragment_statuses": list(
+                schedule_spec.brick_production_fragment_statuses
+            ),
+            "brick_production_fragment_reasons": list(
+                schedule_spec.brick_production_fragment_reasons
+            ),
+            "brick_production_fragment_blockers": list(
+                schedule_spec.brick_production_fragment_blockers
+            ),
+            "production_fragments_complete": (
+                schedule_spec.production_fragments_complete
+            ),
+        },
+        "schedule_contract": (
+            {
+                "name": plan.schedule_contract.name,
+                "key": plan.schedule_contract.key,
+                "status": plan.schedule_contract.status,
+                "reason": plan.schedule_contract.reason,
+                "shape_env_key": plan.schedule_contract.shape_env_key,
+                "declared_key": plan.schedule_contract.declared_key,
+                "declared_implementation_kind": (
+                    plan.schedule_contract.declared_implementation_kind
+                ),
+                "declared_schedule_id": plan.schedule_contract.declared_schedule_id,
+                "declared_required_real_abi_inputs": list(
+                    plan.schedule_contract.declared_required_real_abi_inputs
+                ),
+                "missing_real_abi_inputs": list(
+                    plan.schedule_contract.missing_real_abi_inputs
+                ),
+                "op_signature": list(plan.schedule_contract.op_signature),
+                "required_internal_buffers": list(
+                    plan.schedule_contract.required_internal_buffers
+                ),
+                "required_external_buffers": list(
+                    plan.schedule_contract.required_external_buffers
+                ),
+            }
+            if plan.schedule_contract is not None
+            else None
+        ),
         "schedule_blockers": [
             {
-                "kind": "missing_single_entry_train_block_schedule",
+                "kind": (
+                    "production_schedule_scaffold_not_default"
+                    if schedule_spec.implementation_kind == "scaffold"
+                    else "selected_model_schedule_not_default"
+                ),
+                "schedule_id": schedule_spec.schedule_id,
+                "schedule_name": schedule_spec.schedule_name,
                 "reason": (
-                    "no real TileLang/TIR schedule template currently lowers "
-                    "mamba3_scan + m2rnn_packed_post + fp8_prepare/apply into "
-                    "one entry PrimFunc"
+                    "the selected model-route schedule is only a scaffold because "
+                    "at least one brick fragment is not production-inlined"
+                    if schedule_spec.implementation_kind == "scaffold"
+                    else (
+                        "the descriptor-generated schedule is selected from the "
+                        "model route graph, but it is not a trusted default until "
+                        "compile, benchmark, profiling, and memory receipts pass"
+                    )
+                ),
+                "schedule_generator": PATH_C_DESCRIPTOR_SCHEDULE_GENERATOR,
+            },
+            {
+                "kind": "production_schedule_uses_descriptor_loop_fragments",
+                "schedule_id": schedule_spec.schedule_id,
+                "schedule_name": schedule_spec.schedule_name,
+                "schedule_generator": schedule_spec.schedule_generator,
+                "schedule_generator_status": (
+                    schedule_spec.schedule_generator_status
+                ),
+                "brick_schedule_families": list(
+                    schedule_spec.brick_schedule_families
+                ),
+                "brick_production_fragment_statuses": list(
+                    schedule_spec.brick_production_fragment_statuses
+                ),
+                "brick_production_fragment_reasons": list(
+                    schedule_spec.brick_production_fragment_reasons
+                ),
+                "brick_production_fragment_blockers": list(
+                    schedule_spec.brick_production_fragment_blockers
+                ),
+                "production_fragments_complete": (
+                    schedule_spec.production_fragments_complete
+                ),
+                "reason": (
+                    "the selected schedule is dynamically assembled from Path C "
+                    "brick descriptors and emits per-brick TileLang loop fragments, "
+                    "but those fragments are still generic descriptor bodies rather "
+                    "than the performance-tuned schedules from the production Path C "
+                    "kernels"
                 ),
             },
             {
-                "kind": "fp8_prepare_tilelang_prim_func_missing",
+                "kind": "production_schedule_not_compile_verified",
+                "schedule_id": schedule_spec.schedule_id,
+                "schedule_name": schedule_spec.schedule_name,
+                "schedule_contract_status": plan.schedule_contract.status
+                if plan.schedule_contract is not None
+                else "missing",
                 "reason": (
-                    "the fusion IR now models fp8_prepare as the producer, but "
-                    "there is not yet a real TileLang PrimFunc/schedule that "
-                    "projects post_y and emits q_fp8/q_scale/kv_fp8/kv_scale "
-                    "inside the fused train block"
+                    "the planner has not produced a trusted lowered production "
+                    "compile receipt with schedule_contract.status=verified"
                 ),
             },
+            {
+                "kind": "production_1b_matrix_profile_missing",
+                "schedule_id": schedule_spec.schedule_id,
+                "schedule_name": schedule_spec.schedule_name,
+                "reason": (
+                    "the full 1B Path B/Path C matrix, profiling traces, memory "
+                    "non-regression evidence, and cache receipts have not been "
+                    "captured for this production schedule"
+                ),
+            },
+            *(
+                [
+                    {
+                        "kind": "missing_real_abi_inputs",
+                        "schedule_id": schedule_spec.schedule_id,
+                        "schedule_name": schedule_spec.schedule_name,
+                        "missing_inputs": list(
+                            schedule_spec.missing_real_abi_inputs
+                        ),
+                        "reason": (
+                            "the model-semantic fusion contract still exposes "
+                            "symbolic buffers instead of the real Mamba3, M2RNN, "
+                            "attention projection, and Sparse-MLA apply inputs "
+                            "needed by a production train-block schedule"
+                        ),
+                    }
+                ]
+                if schedule_spec.missing_real_abi_inputs
+                else []
+            ),
+            *[
+                {
+                    "kind": blocker.kind,
+                    "producer": blocker.producer,
+                    "consumer": blocker.consumer,
+                    "required_node": blocker.required_node,
+                    "reason": blocker.reason,
+                }
+                for blocker in plan.semantic_blockers
+            ],
         ],
         "single_kernel_fused": plan.single_kernel_fused,
         "fullgraph_required": True,
@@ -1212,6 +1459,16 @@ def path_c_fusion_payload() -> dict[str, Any]:
             ],
             "missing_backward_nodes": list(plan.autograd_missing_backward_nodes),
         },
+        "semantic_blockers": [
+            {
+                "kind": blocker.kind,
+                "producer": blocker.producer,
+                "consumer": blocker.consumer,
+                "required_node": blocker.required_node,
+                "reason": blocker.reason,
+            }
+            for blocker in plan.semantic_blockers
+        ],
         "default_allowed": False,
         "node_names": list(region.node_names),
         "fusion_groups": [
@@ -1235,11 +1492,134 @@ def path_c_fusion_payload() -> dict[str, Any]:
             "ignores_bad_path_b": True,
             "requires_clean_path_b_baseline": True,
             "requires_ready_fusion_plan": True,
+            "requires_compile_verified_single_kernel": True,
+            "requires_verified_schedule_contract": True,
+            "requires_complete_real_abi_contract": True,
             "current_plan_default_eligible": False,
             "requires_real_c_over_b_win": True,
             "requires_peak_memory_non_regression": True,
         },
         "cache_audit_required": True,
+    }
+
+
+def path_c_model_route_candidates_payload() -> dict[str, Any]:
+    """Return Path C fusion candidate regions derived from local_gb10_quarter."""
+
+    profile, route_symbols, regions = _local_gb10_path_c_model_regions()
+    return _path_c_model_route_candidates_payload(
+        profile_name=profile.name,
+        route_symbols=route_symbols,
+        regions=regions,
+        selected_region=_select_path_c_model_route_region(regions),
+    )
+
+
+def _local_gb10_path_c_model_regions() -> tuple[Any, tuple[str, ...], tuple[Any, ...]]:
+    profile = local_gb10_quarter_profile()
+    route_symbols = tuple(profile.pattern)
+    model_descriptor = SimpleNamespace(
+        name=profile.name,
+        path_c_bricks=profile.path_c_bricks,
+        config=profile.hybrid_config(),
+    )
+    regions = build_path_c_model_regions_from_model(
+        model_descriptor,
+        region_prefix=f"{profile.name}_path_c",
+    )
+    return profile, route_symbols, regions
+
+
+def _path_c_model_route_candidates_payload(
+    *,
+    profile_name: str,
+    route_symbols: tuple[str, ...],
+    regions: tuple[Any, ...],
+    selected_region: Any | None,
+) -> dict[str, Any]:
+    candidate_regions = [
+        _path_c_model_route_candidate_payload(region)
+        for region in regions
+    ]
+    selected_name = getattr(selected_region, "name", None)
+    selected_candidate = next(
+        (
+            candidate
+            for candidate in candidate_regions
+            if candidate["name"] == selected_name
+        ),
+        None,
+    )
+    return {
+        "profile": profile_name,
+        "route_symbols": list(route_symbols),
+        "region_source": "build_path_c_model_regions_from_model",
+        "selection_policy": "largest_supported_contiguous_route_segment",
+        "selected_candidate": selected_candidate,
+        "candidate_regions": candidate_regions,
+    }
+
+
+def _select_path_c_model_route_region(
+    regions: tuple[Any, ...],
+) -> Any | None:
+    if not regions:
+        return None
+    return max(
+        regions,
+        key=lambda region: (
+            len(region.nodes),
+            len(region.edges),
+            region.name,
+        ),
+    )
+
+
+def _path_c_model_route_candidate_payload(region: Any) -> dict[str, Any]:
+    planned = plan_path_c_fusion_schedule_for_region(
+        region,
+        include_backward=True,
+    )
+    target = planned.schedule_target
+    contract = planned.plan.schedule_contract
+    metadata = getattr(region, "metadata", {})
+    bricks = (
+        metadata.get("path_c_bricks", ())
+        if isinstance(metadata, dict)
+        else ()
+    )
+    return {
+        "name": region.name,
+        "brick_names": [brick.get("name") for brick in bricks],
+        "brick_kinds": [brick.get("kind") for brick in bricks],
+        "brick_route_symbols": [brick.get("route_symbol") for brick in bricks],
+        "node_names": list(region.node_names),
+        "op_signature": [node.op_name for node in region.nodes],
+        "edge_count": len(region.edges),
+        "z3_sync": {
+            "enabled": region.z3_sync.enabled,
+            "objective": region.z3_sync.objective,
+            "proof_required": region.z3_sync.proof_required,
+        },
+        "schedule_target": None
+        if target is None
+        else {
+            "schedule_id": target.schedule_id,
+            "schedule_name": target.schedule_name,
+            "schedule_status": target.schedule_status,
+            "implementation_kind": target.implementation_kind,
+            "schedule_generator": target.schedule_generator,
+            "required_real_abi_inputs": list(target.required_real_abi_inputs),
+            "brick_ops": [descriptor.op_name for descriptor in target.brick_descriptors],
+        },
+        "plan": {
+            "schedule_name": planned.plan.schedule_name,
+            "schedule_status": planned.plan.schedule_status,
+            "schedule_contract_status": contract.status if contract is not None else None,
+            "single_kernel_fused": planned.plan.single_kernel_fused,
+            "backward_graph": planned.plan.backward_graph,
+            "autograd_status": planned.plan.autograd_status,
+        },
     }
 
 
