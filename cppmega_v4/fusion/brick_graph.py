@@ -173,6 +173,10 @@ def _brick_kind_of(module: nn.Module) -> str | None:
         "Gemma4DrafterLayerBlock": "gemma4_drafter",
         "NemotronHMTPBlockWrapper": "nemotron_h_mtp",
         "MLABlock": "mla",
+        # Stage D additions
+        "GQAWithSlidingWindowBlock": "gqa_sliding",
+        "CCAAttentionBlock": "cca_attention",
+        "Mamba3ReferenceBlock": "mamba3",
         # gdn / kda / nsa / csa_hca / moe / mlp / engram / attention /
         # lightning_indexer are local closures in unified_superblock_v4.py
         # so their _SelfAttn / _MLP class names aren't unique. Callers
@@ -203,7 +207,7 @@ def from_mlx_model(
     children = (
         list(attr_order)
         if attr_order is not None
-        else [name for name, _ in model.named_modules() if "." not in name and name]
+        else [name for name, val in model.items() if isinstance(val, nn.Module)]
     )
     used_names: set[str] = set()
     for child_name in children:

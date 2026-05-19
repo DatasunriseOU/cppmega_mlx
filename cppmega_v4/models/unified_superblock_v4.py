@@ -20,7 +20,7 @@ HybridTinyLM-style outer loop can wrap it for an actual training run.
 """
 
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Callable, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -235,6 +235,77 @@ def _build_gated_attention(hidden_size: int, params: dict) -> nn.Module:
     return GatedAttentionBlock(cfg)
 
 
+def _build_gqa_sliding(hidden_size: int, params: dict) -> nn.Module:
+    """Gemma 4-style GQA with sliding causal window.
+
+    Used by the 5:1 sliding/global Gemma 4 and Arcee Trinity Large presets.
+    Wraps ``cppmega_v4.nn.sliding_attention.GQAWithSlidingWindowBlock``.
+    """
+    from cppmega_v4.nn.sliding_attention import (
+        GQASlidingConfig, GQAWithSlidingWindowBlock,
+    )
+    cfg = GQASlidingConfig(
+        hidden_size=hidden_size,
+        num_attention_heads=params.get(
+            "num_attention_heads", max(1, hidden_size // 64)
+        ),
+        num_key_value_heads=params.get(
+            "num_key_value_heads",
+            max(1, params.get("num_attention_heads",
+                              max(1, hidden_size // 64)) // 8),
+        ),
+        head_dim=params.get("head_dim", 64),
+        sliding_window_size=params.get("sliding_window_size", 4096),
+        rms_norm_eps=params.get("rms_norm_eps", 1e-6),
+        rope_theta=params.get("rope_theta", 1_000_000.0),
+        qk_norm=params.get("qk_norm", True),
+    )
+    return GQAWithSlidingWindowBlock(cfg)
+
+
+def _build_cca_attention(hidden_size: int, params: dict) -> nn.Module:
+    """ZAYA1 Coarse Causal Attention — compressed-context attention.
+
+    Wraps ``cppmega_v4.nn.cca_attention.CCAAttentionBlock``.
+    """
+    from cppmega_v4.nn.cca_attention import (
+        CCAAttentionBlock, CCAAttentionConfig,
+    )
+    cfg = CCAAttentionConfig(
+        hidden_size=hidden_size,
+        num_attention_heads=params.get(
+            "num_attention_heads", max(1, hidden_size // 64)
+        ),
+        num_key_value_heads=params.get(
+            "num_key_value_heads",
+            max(1, params.get("num_attention_heads",
+                              max(1, hidden_size // 64)) // 8),
+        ),
+        head_dim=params.get("head_dim", 64),
+        fine_window=params.get("fine_window", 256),
+        coarse_block_size=params.get("coarse_block_size", 16),
+        rms_norm_eps=params.get("rms_norm_eps", 1e-6),
+    )
+    return CCAAttentionBlock(cfg)
+
+
+def _build_mamba3(hidden_size: int, params: dict) -> nn.Module:
+    """Mamba-3 SSM reference block (from ``cppmega_mlx.nn.mamba3``).
+
+    Thin re-export so v4 architectures (Nemotron 3 Super) can compose
+    a Mamba-2/3 block alongside attention/MoE bricks without modifying
+    the plugin. Only ``d_model`` is required; everything else takes the
+    Mamba3Config dataclass defaults unless overridden via params.
+    """
+    from cppmega_mlx.nn.mamba3 import Mamba3Config, Mamba3ReferenceBlock
+    cfg_kwargs = {"d_model": hidden_size}
+    cfg_kwargs.update(
+        {k: v for k, v in params.items()
+         if k in Mamba3Config.__dataclass_fields__ and k != "d_model"}
+    )
+    return Mamba3ReferenceBlock(Mamba3Config(**cfg_kwargs))
+
+
 def _build_attention(hidden_size: int, params: dict) -> nn.Module:
     """Standard multi-head self-attention (causal). Used for `attention`."""
     num_heads = params.get("num_heads", max(1, hidden_size // 64))
@@ -384,6 +455,13 @@ BLOCK_BUILDERS: dict[str, Callable[[int, dict], nn.Module]] = {
     # nemotron_h_mtp = Nemotron-H Multi-Token-Prediction block (PR #1161)
     "gemma4_drafter": _build_gemma4_drafter,
     "nemotron_h_mtp": _build_nemotron_h_mtp,
+    # ----- Stage D additions (Auto-Fusion architecture presets) -----
+    # gqa_sliding   = Gemma 4 / Arcee Trinity 5:1 sliding-window GQA slot
+    # cca_attention = ZAYA1 Coarse-Causal-Attention (compressed context)
+    # mamba3        = Nemotron 3 Super SSM block (re-export from cppmega_mlx)
+    "gqa_sliding": _build_gqa_sliding,
+    "cca_attention": _build_cca_attention,
+    "mamba3": _build_mamba3,
 }
 
 
@@ -440,6 +518,37 @@ class UnifiedSuperblockV4(nn.Module):
         # discovery: register under deterministic names.
         for i, b in enumerate(self.blocks):
             setattr(self, f"block_{i}_{b.kind}", b.module)
+
+    @property
+    def path_c_bricks(self) -> tuple[dict[str, str], ...]:
+        """Return allocation-free brick descriptors for Path C auto-discovery."""
+
+        return tuple(
+            {
+                "name": f"block_{index}_{block.kind}",
+                "kind": block.kind,
+            }
+            for index, block in enumerate(self.blocks)
+        )
+
+    def path_c_fusion_regions(
+        self,
+        *,
+        include_backward: bool = False,
+        min_route_bricks: int = 2,
+    ):
+        """Return Path C candidate regions discovered from this brick stack."""
+
+        from cppmega_mlx.runtime.path_c_fusion import (
+            build_path_c_model_regions_from_model,
+        )
+
+        return build_path_c_model_regions_from_model(
+            self,
+            region_prefix=f"{self.template.name}_path_c",
+            include_backward=include_backward,
+            min_route_bricks=min_route_bricks,
+        )
 
     def __call__(
         self,

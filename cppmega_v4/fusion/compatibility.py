@@ -54,6 +54,9 @@ _CATEGORY_BY_KIND: dict[str, str] = {
     "mistral4_mla": "sdpa_attention",
     "dsv4_attention": "sdpa_attention",
     "bailing_mla": "sdpa_attention",
+    # Stage D — new SDPA-backed bricks (sliding GQA, coarse causal attn)
+    "gqa_sliding": "sdpa_attention",
+    "cca_attention": "sdpa_attention",
     # cross attention drafter
     "gemma4_drafter": "cross_attn",
     # MTP block — opaque, treat like attention for fusion purposes
