@@ -75,10 +75,15 @@ def test_path_d_forced_via_env_falls_back_cleanly(monkeypatch):
 
 
 def test_path_d_fallback_matches_path_a_when_unavailable(monkeypatch):
-    ok, _ = _path_d_runtime_status()
-    if ok:
-        pytest.skip("Path D actually available — fallback path not exercised")
+    """Path D fallback parity. Always runs: if Path D is reachable, we force
+    the runtime status to ``unavailable`` so the dispatcher exercises Path A."""
     monkeypatch.setenv(GDN_ENV, "path_d")
+    from cppmega_v4._tilelang import linear_attention_path_d as path_d_mod
+    monkeypatch.setattr(
+        path_d_mod,
+        "_path_d_runtime_status",
+        lambda: (False, "forced unavailable for fallback parity test"),
+    )
     B, T, H, K, V = 1, 5, 2, 8, 8
     rng = np.random.default_rng(13)
     q = mx.array(rng.standard_normal((B, T, H, K)).astype(np.float32))
