@@ -143,8 +143,10 @@ def _kda_forward_op_coverage() -> tuple[bool, str]:
             )
         if res.status != "LOWERED_FULL" or res.prim_func is None:
             return False, (
-                f"KDA Path D lowering failed in {name}: status={res.status}; "
-                f"error={res.error_type}: {res.error_message}"
+                f"KDA Path D runtime adapter installed; lowering failed in "
+                f"{name}: status={res.status}; error={res.error_type}: "
+                f"{res.error_message}. Run shim-dependent lowering in a "
+                "subprocess (pytest-forked) or fresh interpreter."
             )
         if "DEGRADED" in res.prim_func.script():
             return False, (

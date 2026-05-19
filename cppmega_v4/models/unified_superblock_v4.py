@@ -187,6 +187,26 @@ def _build_bailing_moe(hidden_size: int, params: dict) -> nn.Module:
     return BailingMoEBlock(cfg)
 
 
+def _build_gemma4_drafter(hidden_size: int, params: dict) -> nn.Module:
+    """Gemma 4 MTP-drafter decoder layer (mlx-lm PR #1276)."""
+    from cppmega_v4.nn.mlx_lm_bricks import Gemma4DrafterLayerBlock, Gemma4DrafterLayerConfig
+    cfg = Gemma4DrafterLayerConfig(hidden_size=hidden_size, **{
+        k: v for k, v in params.items()
+        if k in Gemma4DrafterLayerConfig.__dataclass_fields__
+    })
+    return Gemma4DrafterLayerBlock(cfg)
+
+
+def _build_nemotron_h_mtp(hidden_size: int, params: dict) -> nn.Module:
+    """Nemotron-H Multi-Token-Prediction block (mlx-lm PR #1161)."""
+    from cppmega_v4.nn.mlx_lm_bricks import NemotronHMTPBlockWrapper, NemotronHMTPConfig
+    cfg = NemotronHMTPConfig(hidden_size=hidden_size, **{
+        k: v for k, v in params.items()
+        if k in NemotronHMTPConfig.__dataclass_fields__
+    })
+    return NemotronHMTPBlockWrapper(cfg)
+
+
 def _build_gated_attention(hidden_size: int, params: dict) -> nn.Module:
     """Qwen3-Next / Qwen3.5 / Qwen3.6 Gated Attention.
 
@@ -360,6 +380,10 @@ BLOCK_BUILDERS: dict[str, Callable[[int, dict], nn.Module]] = {
     "bailing_linear": _build_bailing_linear,
     "bailing_mla": _build_bailing_mla,
     "bailing_moe": _build_bailing_moe,
+    # gemma4_drafter = Gemma 4 MTP-drafter decoder layer (cross-attn) (PR #1276)
+    # nemotron_h_mtp = Nemotron-H Multi-Token-Prediction block (PR #1161)
+    "gemma4_drafter": _build_gemma4_drafter,
+    "nemotron_h_mtp": _build_nemotron_h_mtp,
 }
 
 

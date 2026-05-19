@@ -52,6 +52,15 @@ from mlx_lm.models.bailing_hybrid import (
     SparseMoeBlock as _BailingMoE,
     ModelArgs as _BailingArgs,
 )
+from mlx_lm.models.turbo_cache import TurboQuantKVCache as _TurboQuantKVCache
+from mlx_lm.models.gemma4_assistant import (
+    AssistantDecoderLayer as _Gemma4AssistantLayer,
+    ModelArgs as _Gemma4AssistantArgs,
+)
+from mlx_lm.models.nemotron_h import (
+    NemotronHMTPBlock as _NemotronHMTPBlock,
+    ModelArgs as _NemotronHArgs,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +320,133 @@ class BailingMoEBlock(nn.Module):
         return self.inner(x)
 
 
+# ---------------------------------------------------------------------------
+# TurboQuantKVCache  (PR #1202)  — cross-cutting cache utility
+# ---------------------------------------------------------------------------
+
+
+def make_turbo_quant_kv_cache(bits: int = 3) -> _TurboQuantKVCache:
+    """3-bit / 4-bit KV cache compression for generation.
+
+    Drop-in replacement for the standard KVCache in any attention block
+    at decode time. Direct construction; no V4 nn.Module wrapper because
+    caches are passed as plain ``cache=...`` arguments to attention calls.
+    """
+    return _TurboQuantKVCache(bits=bits)
+
+
+# ---------------------------------------------------------------------------
+# Gemma 4 Assistant (MTP drafter)  (PR #1276)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Gemma4DrafterLayerConfig:
+    hidden_size: int
+    num_attention_heads: int = 4
+    num_key_value_heads: int = 1
+    head_dim: int = 128
+    intermediate_size: Optional[int] = None
+    layer_type: str = "sliding_attention"  # or "full_attention"
+
+
+class Gemma4DrafterLayerBlock(nn.Module):
+    """Gemma 4 assistant (MTP drafter) decoder layer.
+
+    This is a CROSS-ATTENTION layer: the drafter attends to the
+    backbone's already-computed K/V cache. ``__call__`` therefore takes
+    ``(x, keys, values)`` rather than the usual ``(x, mask, cache)``;
+    weight loaders that walk Gemma 4's MTP drafter checkpoint will find
+    the upstream parameter paths on ``self.inner.*``.
+    """
+
+    def __init__(self, cfg: Gemma4DrafterLayerConfig):
+        super().__init__()
+        self.cfg = cfg
+        text_config = dict(
+            model_type="gemma4_assistant_text",
+            hidden_size=cfg.hidden_size,
+            num_hidden_layers=1,
+            intermediate_size=cfg.intermediate_size or cfg.hidden_size * 4,
+            num_attention_heads=cfg.num_attention_heads,
+            num_key_value_heads=cfg.num_key_value_heads,
+            head_dim=cfg.head_dim,
+            vocab_size=1,
+            rms_norm_eps=1e-6,
+            sliding_window=512,
+            rope_theta=10_000.0,
+            rope_local_base_freq=10_000.0,
+        )
+        args = _Gemma4AssistantArgs(
+            model_type="gemma4_assistant",
+            backbone_hidden_size=cfg.hidden_size,
+            num_centroids=1,
+            centroid_intermediate_top_k=1,
+            use_ordered_embeddings=False,
+            tie_word_embeddings=False,
+            text_config=text_config,
+            vocab_size=1,
+        )
+        self.inner = _Gemma4AssistantLayer(args, layer_type=cfg.layer_type)
+
+    def __call__(self, x, keys, values, position_ids=None, mask=None):
+        return self.inner(x, keys, values, position_ids=position_ids, mask=mask)
+
+
+# ---------------------------------------------------------------------------
+# Nemotron-H MTP block  (PR #1161)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class NemotronHMTPConfig:
+    hidden_size: int
+    num_attention_heads: int = 8
+    num_key_value_heads: int = 2
+    head_dim: int = 128
+    intermediate_size: Optional[int] = None
+    # Nemotron-H uses single-char block tags matching the upstream
+    # ``hybrid_override_pattern`` schema:
+    #   "*" = attention   "E" = MoE   "-" = MLP   "M" = Mamba SSM
+    block_type: str = "*"
+
+
+class NemotronHMTPBlockWrapper(nn.Module):
+    """Nemotron-H Multi-Token-Prediction block."""
+
+    def __init__(self, cfg: NemotronHMTPConfig):
+        super().__init__()
+        self.cfg = cfg
+        args = _NemotronHArgs(
+            model_type="nemotron_h",
+            vocab_size=1,
+            hidden_size=cfg.hidden_size,
+            intermediate_size=cfg.intermediate_size or cfg.hidden_size * 4,
+            num_hidden_layers=1,
+            max_position_embeddings=131_072,
+            num_attention_heads=cfg.num_attention_heads,
+            num_key_value_heads=cfg.num_key_value_heads,
+            attention_bias=False,
+            mamba_num_heads=cfg.num_attention_heads,
+            mamba_head_dim=cfg.head_dim,
+            mamba_proj_bias=False,
+            ssm_state_size=128,
+            conv_kernel=4,
+            n_groups=1,
+            mlp_bias=False,
+            layer_norm_epsilon=1e-5,
+            use_bias=False,
+            use_conv_bias=True,
+            hybrid_override_pattern=cfg.block_type,
+            layers_block_type=[cfg.block_type],
+            head_dim=cfg.head_dim,
+        )
+        self.inner = _NemotronHMTPBlock(args, block_type=cfg.block_type)
+
+    def __call__(self, x, mask=None, cache=None):
+        return self.inner(x, mask=mask, cache=cache)
+
+
 __all__ = [
     "BailingLinearAttnBlock",
     "BailingLinearConfig",
@@ -320,6 +456,11 @@ __all__ = [
     "BailingMoEConfig",
     "DSv4AttentionBlock",
     "DSv4AttentionConfig",
+    "Gemma4DrafterLayerBlock",
+    "Gemma4DrafterLayerConfig",
     "Mistral4MLABlock",
     "Mistral4MLAConfig",
+    "NemotronHMTPBlockWrapper",
+    "NemotronHMTPConfig",
+    "make_turbo_quant_kv_cache",
 ]

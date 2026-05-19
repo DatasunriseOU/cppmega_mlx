@@ -16,7 +16,10 @@ from cppmega_v4.nn.mlx_lm_bricks import (
     BailingMLABlock, BailingMLAConfig,
     BailingMoEBlock, BailingMoEConfig,
     DSv4AttentionBlock, DSv4AttentionConfig,
+    Gemma4DrafterLayerBlock, Gemma4DrafterLayerConfig,
     Mistral4MLABlock, Mistral4MLAConfig,
+    NemotronHMTPBlockWrapper, NemotronHMTPConfig,
+    make_turbo_quant_kv_cache,
 )
 from cppmega_v4.models.unified_superblock_v4 import BLOCK_BUILDERS
 
@@ -25,10 +28,11 @@ _H = 256
 _X = mx.random.normal((1, 8, _H))
 
 
-def test_all_5_bricks_registered_in_block_builders():
+def test_all_bricks_registered_in_block_builders():
     expected = {
         "mistral4_mla", "dsv4_attention",
         "bailing_linear", "bailing_mla", "bailing_moe",
+        "gemma4_drafter", "nemotron_h_mtp",
     }
     assert expected.issubset(set(BLOCK_BUILDERS.keys()))
 
@@ -145,6 +149,8 @@ def test_bailing_moe_forward_shape():
                           v_head_dim=64)),
     ("bailing_moe", dict(num_experts=4, num_experts_per_tok=2, num_shared_experts=1,
                           moe_intermediate_size=128, n_group=1, topk_group=1)),
+    ("nemotron_h_mtp", dict(num_attention_heads=4, num_key_value_heads=2, head_dim=64,
+                              block_type="*")),
 ])
 def test_unified_superblock_builder_round_trip(kind, extra):
     block = BLOCK_BUILDERS[kind](hidden_size=_H, params=extra)
@@ -154,3 +160,69 @@ def test_unified_superblock_builder_round_trip(kind, extra):
     mx.eval(y)
     assert y.shape == _X.shape, f"{kind}: {y.shape} != {_X.shape}"
     assert not bool(mx.any(mx.isnan(y)).item()), f"{kind}: NaN in output"
+
+
+# ----- TurboQuantKVCache (PR #1202) — cross-cutting cache utility -----
+
+
+def test_turbo_quant_kv_cache_imports_from_mlx_lm():
+    from mlx_lm.models.turbo_cache import TurboQuantKVCache as _Upstream
+    cache = make_turbo_quant_kv_cache(bits=3)
+    assert isinstance(cache, _Upstream)
+
+
+@pytest.mark.parametrize("bits", [3, 4])
+def test_turbo_quant_kv_cache_factory_builds(bits):
+    cache = make_turbo_quant_kv_cache(bits=bits)
+    assert hasattr(cache, "bits")
+    assert cache.bits == bits
+
+
+# ----- Gemma 4 MTP-drafter layer (PR #1276) -----
+
+
+def test_gemma4_drafter_imports_from_mlx_lm():
+    from mlx_lm.models.gemma4_assistant import AssistantDecoderLayer as _Upstream
+    cfg = Gemma4DrafterLayerConfig(hidden_size=_H, num_attention_heads=4,
+                                     num_key_value_heads=2, head_dim=64,
+                                     intermediate_size=512)
+    block = Gemma4DrafterLayerBlock(cfg)
+    assert isinstance(block.inner, _Upstream)
+
+
+def test_gemma4_drafter_forward_cross_attention():
+    """Drafter is a cross-attn layer; takes (x, keys, values) not (x, mask, cache)."""
+    cfg = Gemma4DrafterLayerConfig(hidden_size=_H, num_attention_heads=4,
+                                     num_key_value_heads=2, head_dim=64,
+                                     intermediate_size=512)
+    block = Gemma4DrafterLayerBlock(cfg)
+    # Backbone-side K/V shaped [B, num_kv_heads, T, head_dim]
+    keys = mx.random.normal((1, 2, 8, 64))
+    values = mx.random.normal((1, 2, 8, 64))
+    y = block(_X, keys, values)
+    mx.eval(y)
+    assert y.shape == _X.shape
+
+
+# ----- Nemotron-H MTP block (PR #1161) -----
+
+
+def test_nemotron_h_mtp_imports_from_mlx_lm():
+    from mlx_lm.models.nemotron_h import NemotronHMTPBlock as _Upstream
+    cfg = NemotronHMTPConfig(hidden_size=_H, num_attention_heads=4,
+                              num_key_value_heads=2, head_dim=64, block_type="*")
+    block = NemotronHMTPBlockWrapper(cfg)
+    assert isinstance(block.inner, _Upstream)
+
+
+@pytest.mark.parametrize("block_type", ["*", "-"])  # attention, MLP
+def test_nemotron_h_mtp_forward(block_type):
+    cfg = NemotronHMTPConfig(hidden_size=_H, num_attention_heads=4,
+                              num_key_value_heads=2, head_dim=64,
+                              block_type=block_type)
+    block = NemotronHMTPBlockWrapper(cfg)
+    y = block(_X)
+    if isinstance(y, tuple):
+        y = y[0]
+    mx.eval(y)
+    assert y.shape == _X.shape
