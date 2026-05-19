@@ -9,6 +9,13 @@ Stage A surface (this commit):
 
 from __future__ import annotations
 
+from cppmega_v4.spec.adapters import (
+    ADAPTER_RULES,
+    AdapterRule,
+    AdapterSuggestion,
+    insert_adapter_chain,
+    suggest_adapter_chain,
+)
 from cppmega_v4.spec.resolver import (
     DiagnosticSeverity,
     ResolvedBrickGraph,
@@ -26,6 +33,9 @@ from cppmega_v4.spec.shape_contract import (
 )
 
 __all__ = [
+    "ADAPTER_RULES",
+    "AdapterRule",
+    "AdapterSuggestion",
     "BrickShapeContract",
     "DiagnosticSeverity",
     "ResolveError",
@@ -34,7 +44,9 @@ __all__ = [
     "ShapeDiagnostic",
     "ShapeExpr",
     "contract_for",
+    "insert_adapter_chain",
     "register_contract",
     "registered_kinds",
     "resolve_shapes",
+    "suggest_adapter_chain",
 ]
