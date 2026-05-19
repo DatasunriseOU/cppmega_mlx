@@ -1301,10 +1301,35 @@ def test_fp8_path_c_dsa_attention_route_metadata_is_configured(
     assert route["path_c_fusion"]["compiler"] == "tilelang.engine.fusion"
     assert route["path_c_fusion"]["requires_msl_post_fusion"] is False
     assert route["path_c_fusion"]["large_tensor_staging_allowed"] is False
+    assert route["path_c_fusion"]["fullgraph_required"] is True
+    assert route["path_c_fusion"]["graph_break_policy"] == "fail_closed"
+    assert [blocker["kind"] for blocker in route["path_c_fusion"]["schedule_blockers"]] == [
+        "missing_single_entry_train_block_schedule",
+        "fp8_prepare_tilelang_prim_func_missing",
+    ]
+    assert route["path_c_fusion"]["autograd_plan"]["status"] == (
+        "requires_aot_autograd_codegen"
+    )
+    assert route["path_c_fusion"]["autograd_plan"]["missing_backward_nodes"] == [
+        "mamba3_scan_bwd",
+        "m2rnn_packed_post_bwd",
+    ]
+    assert route["path_c_fusion"]["autograd_plan"]["backward_nodes"] == [
+        "m2rnn_packed_post_bwd",
+        "mamba3_scan_bwd",
+    ]
+    assert route["path_c_fusion"]["autograd_plan"]["backward_edges"] == [
+        [
+            "m2rnn_packed_post_bwd",
+            "mamba3_scan_bwd",
+            "scan_y_grad",
+        ]
+    ]
     assert route["path_c_fusion"]["node_names"] == [
         "mamba3_scan",
         "m2rnn_packed_post",
-        "sparse_mla_fp8_prepared",
+        "fp8_prepare",
+        "sparse_mla_fp8_apply",
     ]
     assert route["path_c_fusion"]["z3_sync"] == {
         "enabled": True,
@@ -1313,12 +1338,33 @@ def test_fp8_path_c_dsa_attention_route_metadata_is_configured(
         "proof_required": True,
     }
     assert route["path_c_fusion"]["acceptance_gate"]["ignores_bad_path_b"] is True
+    assert route["path_c_fusion"]["acceptance_gate"]["requires_ready_fusion_plan"] is True
+    assert route["path_c_fusion"]["acceptance_gate"]["current_plan_default_eligible"] is False
     assert route["path_c_fusion"]["cache_audit_required"] is True
     assert producer_gate["required"] is True
     assert producer_gate["ok"] is True
     assert producer_gate["status"] == m04_train_step.FP8_PATH_C_NATIVE_PRODUCER_STATUS
     assert producer_gate["fail_closed"] is False
     assert producer_gate["producer"] == producer
+
+
+def test_path_c_fusion_force_mode_fails_closed_until_real_schedule_exists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CPPMEGA_PATH_C_FUSION", "force")
+
+    payload = m04_train_step.path_c_fusion_payload()
+
+    assert payload["mode"] == "force"
+    assert payload["status"] == "force_blocked_schedule_missing"
+    assert payload["single_kernel_fused"] is False
+    assert payload["fullgraph_required"] is True
+    assert payload["graph_break_policy"] == "fail_closed"
+    assert payload["autograd_plan"]["status"] == "requires_aot_autograd_codegen"
+    assert payload["schedule_status"] == "missing_real_fused_schedule_template"
+    assert payload["schedule_blockers"][1]["kind"] == "fp8_prepare_tilelang_prim_func_missing"
+    assert payload["default_allowed"] is False
+    assert "real fused train-block schedule" in payload["reason"]
 
 
 def test_fp8_path_c_local_gb10_profile_uses_model_factory_dsa_producer() -> None:

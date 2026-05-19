@@ -887,7 +887,7 @@ def _bwd_scan_plan_for(
 
 
 @lru_cache(maxsize=128)
-def _fwd_kernel_for(
+def _make_fwd_prim_func(
     BATCH: int,
     SEQ: int,
     HEADS: int,
@@ -903,10 +903,8 @@ def _fwd_kernel_for(
     h0_dtype: str = "float32",
     y_dtype: str = "float32",
     h_last_dtype: str = "float32",
-    *,
-    return_msl: bool = False,
-) -> tuple[Any, _msl_transform.TileLangMSLLowering]:
-    """Build & cache the Path C TileLang fwd kernel for a given (B, T, H, P, N)."""
+) -> Any:
+    """Build the raw Path C Mamba3 forward PrimFunc before lowering."""
 
     import tilelang.language as T
 
@@ -942,7 +940,7 @@ def _fwd_kernel_for(
         y: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), y_dtype),
         h_last: T.Tensor((BATCH, HEADS, HEADDIM, STATE), h_last_dtype),
     ):
-        with T.Kernel(T.ceildiv(LANES, THREADS), threads=THREADS) as bx:
+        with T.Kernel(T.ceildiv(LANES, THREADS), threads=THREADS) as _bx:
             # Metal already exposes the absolute 1-D lane id. Use it directly
             # so the lowered hot loop matches Path B and does not repeatedly
             # carry blockIdx * THREADS + threadIdx address arithmetic.
@@ -981,6 +979,50 @@ def _fwd_kernel_for(
                 for n in T.serial(STATE):
                     h_last[b, h, p, n] = T.cast(h_state[n], h_last_dtype)
 
+    return fwd
+
+
+@lru_cache(maxsize=128)
+def _fwd_kernel_for(
+    BATCH: int,
+    SEQ: int,
+    HEADS: int,
+    HEADDIM: int,
+    STATE: int,
+    x_dtype: str = "float32",
+    B_dtype: str = "float32",
+    C_dtype: str = "float32",
+    z_dtype: str = "float32",
+    A_dtype: str = "float32",
+    dt_dtype: str = "float32",
+    D_dtype: str = "float32",
+    h0_dtype: str = "float32",
+    y_dtype: str = "float32",
+    h_last_dtype: str = "float32",
+    *,
+    return_msl: bool = False,
+) -> tuple[Any, _msl_transform.TileLangMSLLowering]:
+    """Build & cache the Path C TileLang fwd kernel for a given (B, T, H, P, N)."""
+
+    del return_msl
+    fwd = _make_fwd_prim_func(
+        BATCH,
+        SEQ,
+        HEADS,
+        HEADDIM,
+        STATE,
+        x_dtype,
+        B_dtype,
+        C_dtype,
+        z_dtype,
+        A_dtype,
+        dt_dtype,
+        D_dtype,
+        h0_dtype,
+        y_dtype,
+        h_last_dtype,
+    )
+
     artifact = dispatch_lower(fwd, target="metal", return_msl=True)
     if hasattr(artifact, "_tilelang_engine_target"):
         raise MSLDispatchUnsupported("Mamba3 Path C requires TileLang MSL extraction metadata")
@@ -1005,7 +1047,7 @@ def _fwd_kernel_for(
 
 
 @lru_cache(maxsize=128)
-def _fwd_with_snapshots_kernel_for(
+def _make_fwd_with_snapshots_prim_func(
     BATCH: int,
     SEQ: int,
     HEADS: int,
@@ -1022,8 +1064,8 @@ def _fwd_with_snapshots_kernel_for(
     y_dtype: str = "float32",
     h_last_dtype: str = "float32",
     h_snap_dtype: str = "float32",
-) -> tuple[Any, _msl_transform.TileLangMSLLowering]:
-    """Build Path C fwd that also materializes per-step states for training."""
+) -> Any:
+    """Build the raw Path C Mamba3 training PrimFunc before lowering."""
 
     import tilelang.language as T
 
@@ -1101,6 +1143,49 @@ def _fwd_with_snapshots_kernel_for(
                 for n in T.serial(STATE):
                     h_last[b, h, p, n] = T.cast(h_state[n], h_last_dtype)
 
+    return fwd_with_snapshots
+
+
+@lru_cache(maxsize=128)
+def _fwd_with_snapshots_kernel_for(
+    BATCH: int,
+    SEQ: int,
+    HEADS: int,
+    HEADDIM: int,
+    STATE: int,
+    x_dtype: str = "float32",
+    B_dtype: str = "float32",
+    C_dtype: str = "float32",
+    z_dtype: str = "float32",
+    A_dtype: str = "float32",
+    dt_dtype: str = "float32",
+    D_dtype: str = "float32",
+    h0_dtype: str = "float32",
+    y_dtype: str = "float32",
+    h_last_dtype: str = "float32",
+    h_snap_dtype: str = "float32",
+) -> tuple[Any, _msl_transform.TileLangMSLLowering]:
+    """Build Path C fwd that also materializes per-step states for training."""
+
+    fwd_with_snapshots = _make_fwd_with_snapshots_prim_func(
+        BATCH,
+        SEQ,
+        HEADS,
+        HEADDIM,
+        STATE,
+        x_dtype,
+        B_dtype,
+        C_dtype,
+        z_dtype,
+        A_dtype,
+        dt_dtype,
+        D_dtype,
+        h0_dtype,
+        y_dtype,
+        h_last_dtype,
+        h_snap_dtype,
+    )
+
     artifact = dispatch_lower(fwd_with_snapshots, target="metal", return_msl=True)
     if hasattr(artifact, "_tilelang_engine_target"):
         raise MSLDispatchUnsupported("Mamba3 Path C requires TileLang MSL extraction metadata")
@@ -1176,7 +1261,6 @@ def _bwd_state_snapshots_kernel_for(
         with T.Kernel(T.ceildiv(LANES, THREADS), threads=THREADS) as _bx:
             global_lane = T.call_intrin("int32", "tir.metal.thread_position_in_grid_x")
             h_state = T.alloc_local((STATE,), accum_dtype)
-            dh = T.alloc_local((STATE,), accum_dtype)
             if LANES % THREADS == 0 or global_lane < LANES:
                 p = global_lane % HEADDIM
                 if BATCH == 1:
@@ -1258,6 +1342,7 @@ def _bwd_simd_reduce_kernel_for(
     A_dtype: str = "float32",
     dt_dtype: str = "float32",
     D_dtype: str = "float32",
+    h0_dtype: str = "float32",
     dx_dtype: str = "float32",
     dz_dtype: str = "float32",
     dB_dtype: str = "float32",
@@ -1322,6 +1407,7 @@ def _bwd_simd_reduce_kernel_for(
             tid = T.get_thread_binding(0)
             global_lane = T.call_intrin("int32", "tir.metal.thread_position_in_grid_x")
             h_state = T.alloc_local((STATE,), accum_dtype)
+            dh = T.alloc_local((STATE,), accum_dtype)
             if LANES % THREADS == 0 or global_lane < LANES:
                 p = global_lane % HEADDIM
                 reduce_lane = tid % HEADDIM

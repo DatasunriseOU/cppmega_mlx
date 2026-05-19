@@ -1571,7 +1571,7 @@ def _mapped_packed_fwd_kernel_for(
 
 
 @lru_cache(maxsize=128)
-def _mapped_packed_post_fwd_k_parallel_kernel_for(
+def _make_mapped_packed_post_fwd_k_parallel_prim_func(
     batch: int,
     seq: int,
     total_heads: int,
@@ -1585,12 +1585,11 @@ def _mapped_packed_post_fwd_k_parallel_kernel_for(
     v_dim: int,
     projected_dim: int,
     carrier_dtype: str,
-    *,
-    return_msl: bool = False,
-) -> tuple[Any, _msl_transform.TileLangMSLLowering]:
+) -> Any:
+    """Build the raw mapped packed-post k-parallel PrimFunc before lowering."""
+
     import tilelang.language as T
 
-    del return_msl
     conv_dim = _mapped_conv_dim(q_heads, k_heads, v_heads, k_dim, v_dim)
     k_offset = q_heads * k_dim
     v_offset = k_offset + k_heads * k_dim
@@ -1703,9 +1702,45 @@ def _mapped_packed_post_fwd_k_parallel_kernel_for(
                 for vv in T.serial(v_dim):
                     h_last[b, h, tid, vv] = T.cast(h_row[vv], carrier_dtype)
 
-    fwd = _with_global_symbol(
+    return _with_global_symbol(
         fwd,
         "m2rnn_mapped_packed_post_fwd_kp",
+        batch,
+        seq,
+        total_heads,
+        q_heads,
+        k_heads,
+        v_heads,
+        g_heads,
+        w_heads,
+        f_heads,
+        k_dim,
+        v_dim,
+        projected_dim,
+        carrier_dtype,
+    )
+
+
+@lru_cache(maxsize=128)
+def _mapped_packed_post_fwd_k_parallel_kernel_for(
+    batch: int,
+    seq: int,
+    total_heads: int,
+    q_heads: int,
+    k_heads: int,
+    v_heads: int,
+    g_heads: int,
+    w_heads: int,
+    f_heads: int,
+    k_dim: int,
+    v_dim: int,
+    projected_dim: int,
+    carrier_dtype: str,
+    *,
+    return_msl: bool = False,
+) -> tuple[Any, _msl_transform.TileLangMSLLowering]:
+    del return_msl
+    fwd = _make_mapped_packed_post_fwd_k_parallel_prim_func(
         batch,
         seq,
         total_heads,
@@ -1738,7 +1773,7 @@ def _mapped_packed_post_fwd_k_parallel_kernel_for(
 
 
 @lru_cache(maxsize=128)
-def _mapped_packed_post_fwd_kernel_for(
+def _make_mapped_packed_post_fwd_prim_func(
     batch: int,
     seq: int,
     total_heads: int,
@@ -1752,30 +1787,11 @@ def _mapped_packed_post_fwd_kernel_for(
     v_dim: int,
     projected_dim: int,
     carrier_dtype: str,
-    *,
-    return_msl: bool = False,
-) -> tuple[Any, _msl_transform.TileLangMSLLowering]:
-    if k_dim >= _MAPPED_PACKED_FWD_K_PARALLEL_MIN_K and max(k_dim, v_dim) <= 256:
-        return _mapped_packed_post_fwd_k_parallel_kernel_for(
-            batch,
-            seq,
-            total_heads,
-            q_heads,
-            k_heads,
-            v_heads,
-            g_heads,
-            w_heads,
-            f_heads,
-            k_dim,
-            v_dim,
-            projected_dim,
-            carrier_dtype,
-            return_msl=return_msl,
-        )
+) -> Any:
+    """Build the raw mapped packed-post PrimFunc before lowering."""
 
     import tilelang.language as T
 
-    del return_msl
     conv_dim = _mapped_conv_dim(q_heads, k_heads, v_heads, k_dim, v_dim)
     k_offset = q_heads * k_dim
     v_offset = k_offset + k_heads * k_dim
@@ -1891,9 +1907,63 @@ def _mapped_packed_post_fwd_kernel_for(
                                 carrier_dtype,
                             )
 
-    fwd = _with_global_symbol(
+    return _with_global_symbol(
         fwd,
         "m2rnn_mapped_packed_post_fwd",
+        batch,
+        seq,
+        total_heads,
+        q_heads,
+        k_heads,
+        v_heads,
+        g_heads,
+        w_heads,
+        f_heads,
+        k_dim,
+        v_dim,
+        projected_dim,
+        carrier_dtype,
+    )
+
+
+@lru_cache(maxsize=128)
+def _mapped_packed_post_fwd_kernel_for(
+    batch: int,
+    seq: int,
+    total_heads: int,
+    q_heads: int,
+    k_heads: int,
+    v_heads: int,
+    g_heads: int,
+    w_heads: int,
+    f_heads: int,
+    k_dim: int,
+    v_dim: int,
+    projected_dim: int,
+    carrier_dtype: str,
+    *,
+    return_msl: bool = False,
+) -> tuple[Any, _msl_transform.TileLangMSLLowering]:
+    if k_dim >= _MAPPED_PACKED_FWD_K_PARALLEL_MIN_K and max(k_dim, v_dim) <= 256:
+        return _mapped_packed_post_fwd_k_parallel_kernel_for(
+            batch,
+            seq,
+            total_heads,
+            q_heads,
+            k_heads,
+            v_heads,
+            g_heads,
+            w_heads,
+            f_heads,
+            k_dim,
+            v_dim,
+            projected_dim,
+            carrier_dtype,
+            return_msl=return_msl,
+        )
+
+    del return_msl
+    fwd = _make_mapped_packed_post_fwd_prim_func(
         batch,
         seq,
         total_heads,

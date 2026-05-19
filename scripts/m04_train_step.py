@@ -1156,17 +1156,63 @@ def path_c_fusion_payload() -> dict[str, Any]:
     plan = compile_path_c_region(region)
     if not isinstance(plan, FusionCompilePlan):
         raise TypeError("compile_path_c_region unexpectedly returned an artifact")
+    real_schedule_missing = not plan.single_kernel_fused
+    force_blocked = mode is PathCFusionMode.FORCE and real_schedule_missing
+    status = (
+        "off"
+        if mode is PathCFusionMode.OFF
+        else "force_blocked_schedule_missing"
+        if force_blocked
+        else "plan_ready_not_default"
+    )
+    reason = (
+        "real fused train-block schedule is not available yet; graph capture "
+        "must not be defaulted as single-kernel fusion"
+        if real_schedule_missing
+        else None
+    )
     return {
         "mode": mode.value,
-        "status": (
-            "off"
-            if mode is PathCFusionMode.OFF
-            else "plan_ready_not_default"
-        ),
+        "status": status,
+        "reason": reason,
         "region_name": plan.region_name,
         "lowering_boundary": plan.lowering_boundary,
         "backend": plan.backend,
         "compiler": plan.compiler,
+        "fusion_kind": plan.fusion_kind,
+        "schedule_status": plan.schedule_status,
+        "schedule_blockers": [
+            {
+                "kind": "missing_single_entry_train_block_schedule",
+                "reason": (
+                    "no real TileLang/TIR schedule template currently lowers "
+                    "mamba3_scan + m2rnn_packed_post + fp8_prepare/apply into "
+                    "one entry PrimFunc"
+                ),
+            },
+            {
+                "kind": "fp8_prepare_tilelang_prim_func_missing",
+                "reason": (
+                    "the fusion IR now models fp8_prepare as the producer, but "
+                    "there is not yet a real TileLang PrimFunc/schedule that "
+                    "projects post_y and emits q_fp8/q_scale/kv_fp8/kv_scale "
+                    "inside the fused train block"
+                ),
+            },
+        ],
+        "single_kernel_fused": plan.single_kernel_fused,
+        "fullgraph_required": True,
+        "graph_break_policy": "fail_closed",
+        "autograd_plan": {
+            "mode": plan.autograd_mode,
+            "status": plan.autograd_status,
+            "backward_nodes": list(plan.autograd_backward_nodes),
+            "backward_edges": [
+                list(edge) for edge in plan.autograd_backward_edges
+            ],
+            "missing_backward_nodes": list(plan.autograd_missing_backward_nodes),
+        },
+        "default_allowed": False,
         "node_names": list(region.node_names),
         "fusion_groups": [
             {
@@ -1188,6 +1234,8 @@ def path_c_fusion_payload() -> dict[str, Any]:
         "acceptance_gate": {
             "ignores_bad_path_b": True,
             "requires_clean_path_b_baseline": True,
+            "requires_ready_fusion_plan": True,
+            "current_plan_default_eligible": False,
             "requires_real_c_over_b_win": True,
             "requires_peak_memory_non_regression": True,
         },
