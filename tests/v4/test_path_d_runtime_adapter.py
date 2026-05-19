@@ -265,6 +265,85 @@ def test_kda_compact_topology_invariants_are_not_exact_arrays():
     assert invariants.max_chunk_id == 2
 
 
+def test_kda_topology_fingerprint_covers_specialization_contract():
+    from cppmega_v4._tilelang.path_d_runtime_adapter import (
+        _kda_varlen_topology_descriptor,
+        _kda_varlen_topology_fingerprint,
+    )
+
+    descriptor = _kda_varlen_topology_descriptor(
+        cu_values=(0, 16, 64),
+        chunk_offsets=(0, 1, 3),
+        total_tokens=64,
+        h_heads=1,
+        hv_heads=2,
+        k_dim=64,
+        v_dim=32,
+        chunk_size=32,
+        scale=0.125,
+        use_initial_state=True,
+        output_final_state=False,
+    )
+    fingerprint = _kda_varlen_topology_fingerprint(descriptor)
+    changed = {
+        **descriptor,
+        "chunk_size": 16,
+    }
+
+    assert descriptor["total_tokens"] == 64
+    assert descriptor["num_sequences"] == 2
+    assert descriptor["h_heads"] == 1
+    assert descriptor["hv_heads"] == 2
+    assert descriptor["k_dim"] == 64
+    assert descriptor["v_dim"] == 32
+    assert descriptor["chunk_size"] == 32
+    assert descriptor["lengths"] == (16, 48)
+    assert descriptor["chunk_offsets"] == (0, 1, 3)
+    assert descriptor["use_initial_state"] is True
+    assert descriptor["output_final_state"] is False
+    assert descriptor["scale"] == 0.125
+    assert len(fingerprint) == 64
+    assert _kda_varlen_topology_fingerprint(changed) != fingerprint
+
+
+def test_kda_topology_disk_manifest_round_trips(tmp_path, monkeypatch):
+    from cppmega_v4._tilelang.path_d_runtime_adapter import (
+        KDA_TOPOLOGY_CACHE_DIR_ENV,
+        _read_kda_topology_manifest,
+        _write_kda_topology_manifest,
+    )
+
+    monkeypatch.setenv(KDA_TOPOLOGY_CACHE_DIR_ENV, str(tmp_path))
+    descriptor = {
+        "total_tokens": 64,
+        "num_sequences": 2,
+        "k_dim": 64,
+        "v_dim": 32,
+        "h_heads": 1,
+        "hv_heads": 1,
+        "chunk_size": 32,
+        "lengths": (16, 48),
+        "chunk_offsets": (0, 1, 3),
+        "use_initial_state": True,
+        "output_final_state": True,
+        "scale": 0.125,
+    }
+
+    _write_kda_topology_manifest(
+        "a" * 64,
+        descriptor=descriptor,
+        status="compiled",
+        stages=("token", "inter"),
+    )
+    payload = _read_kda_topology_manifest("a" * 64)
+
+    assert payload is not None
+    assert payload["fingerprint"] == "a" * 64
+    assert payload["status"] == "compiled"
+    assert payload["descriptor"]["lengths"] == [16, 48]
+    assert payload["stages"] == ["token", "inter"]
+
+
 def test_runtime_adapter_specializes_topology_metadata_loads():
     pytest.importorskip("tvm")
     from tvm import tir
@@ -273,13 +352,12 @@ def test_runtime_adapter_specializes_topology_metadata_loads():
         specialize_primfunc_for_topology_metadata,
     )
 
-    cu_data = tir.Var("cu_seqlens", "handle")
-    cu_buffer = tir.decl_buffer((3,), "int64", name="cu_seqlens", data=cu_data)
+    cu_buffer = tir.decl_buffer((3,), "int64", name="cu_seqlens")
     idx = tir.Var("idx", "int64")
     func = tir.PrimFunc(
-        [cu_data, idx],
+        [cu_buffer.data, idx],
         tir.Evaluate(tir.BufferLoad(cu_buffer, [idx])),
-        buffer_map={cu_data: cu_buffer},
+        buffer_map={cu_buffer.data: cu_buffer},
     )
 
     specialized = specialize_primfunc_for_topology_metadata(

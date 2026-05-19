@@ -8,6 +8,8 @@ multi-kernel plan needed to turn FLA chunks into ``(y, h_last)``.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import os
 from dataclasses import dataclass
@@ -22,6 +24,8 @@ KDA_TOPOLOGY_SPECIALIZATION_THRESHOLD_ENV = (
 KDA_TOPOLOGY_SPECIALIZATION_MAX_ENTRIES_ENV = (
     "CPPMEGA_V4_KDA_TOPOLOGY_SPECIALIZATION_MAX_ENTRIES"
 )
+KDA_TOPOLOGY_CACHE_DIR_ENV = "CPPMEGA_V4_KDA_TOPOLOGY_CACHE_DIR"
+KDA_TOPOLOGY_MANIFEST_VERSION = 1
 RCP_LN2 = 1.4426950408889634
 GDN_FIXED_T = 64
 GDN_FIXED_H = 1
@@ -215,6 +219,255 @@ def _env_flag(name: str) -> bool:
     }
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return int(default)
+    try:
+        return int(raw)
+    except ValueError:
+        return int(default)
+
+
+def _reset_kda_topology_cache_for_tests() -> None:
+    _KDA_TOPOLOGY_HITS.clear()
+    _KDA_TOPOLOGY_DISABLED.clear()
+
+
+def _kda_compact_topology_invariants(
+    *,
+    cu_values: tuple[int, ...] | list[int],
+    chunk_offsets: tuple[int, ...] | list[int],
+    total_tokens: int,
+    chunk_size: int,
+) -> KDATopologyInvariants:
+    cu = tuple(int(x) for x in cu_values)
+    offsets = tuple(int(x) for x in chunk_offsets)
+    total = int(total_tokens)
+    num_sequences = max(len(cu) - 1, 0)
+    lengths = [right - left for left, right in zip(cu, cu[1:])]
+    num_chunks = int(offsets[-1]) if offsets else 0
+    bounds_valid = (
+        len(cu) >= 2
+        and cu[0] == 0
+        and cu[-1] == total
+        and all(0 <= value <= total for value in cu)
+        and all(length >= 0 for length in lengths)
+    )
+    cu_monotonic = all(left <= right for left, right in zip(cu, cu[1:]))
+    chunk_offsets_monotonic = (
+        len(offsets) == len(cu)
+        and bool(offsets)
+        and offsets[0] == 0
+        and all(left <= right for left, right in zip(offsets, offsets[1:]))
+    )
+    return KDATopologyInvariants(
+        total_tokens=total,
+        num_sequences=num_sequences,
+        num_chunks=num_chunks,
+        max_sequence_tokens=max(lengths, default=0),
+        max_chunk_id=num_chunks - 1 if num_chunks else -1,
+        bounds_valid=bounds_valid,
+        cu_monotonic=cu_monotonic,
+        chunk_offsets_monotonic=chunk_offsets_monotonic,
+    )
+
+
+def _json_ready(value: Any) -> Any:
+    if isinstance(value, tuple):
+        return [_json_ready(item) for item in value]
+    if isinstance(value, list):
+        return [_json_ready(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _json_ready(item) for key, item in sorted(value.items())}
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _kda_varlen_topology_descriptor(
+    *,
+    cu_values: tuple[int, ...] | list[int],
+    chunk_offsets: tuple[int, ...] | list[int],
+    total_tokens: int,
+    h_heads: int,
+    hv_heads: int,
+    k_dim: int,
+    v_dim: int,
+    chunk_size: int,
+    scale: Any,
+    use_initial_state: bool,
+    output_final_state: bool,
+) -> dict[str, Any]:
+    cu = tuple(int(x) for x in cu_values)
+    offsets = tuple(int(x) for x in chunk_offsets)
+    lengths = tuple(int(right - left) for left, right in zip(cu, cu[1:]))
+    return {
+        "version": KDA_TOPOLOGY_MANIFEST_VERSION,
+        "total_tokens": int(total_tokens),
+        "num_sequences": len(lengths),
+        "h_heads": int(h_heads),
+        "hv_heads": int(hv_heads),
+        "k_dim": int(k_dim),
+        "v_dim": int(v_dim),
+        "chunk_size": int(chunk_size),
+        "lengths": lengths,
+        "chunk_offsets": offsets,
+        "use_initial_state": bool(use_initial_state),
+        "output_final_state": bool(output_final_state),
+        "scale": None if scale is None else float(scale),
+    }
+
+
+def _kda_varlen_topology_fingerprint(descriptor: dict[str, Any]) -> str:
+    payload = json.dumps(
+        _json_ready(descriptor),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _kda_topology_cache_dir() -> str:
+    override = os.environ.get(KDA_TOPOLOGY_CACHE_DIR_ENV)
+    if override:
+        return os.path.abspath(os.path.expanduser(override))
+    tilelang_cache = os.environ.get("TILELANG_CACHE_DIR")
+    if tilelang_cache:
+        root = os.path.abspath(os.path.expanduser(tilelang_cache))
+    else:
+        root = os.path.expanduser("~/.tilelang/cache")
+    return os.path.join(root, "cppmega_kda_topologies")
+
+
+def _kda_topology_manifest_path(fingerprint: str) -> str:
+    return os.path.join(_kda_topology_cache_dir(), f"{fingerprint}.json")
+
+
+def _write_kda_topology_manifest(
+    fingerprint: str,
+    *,
+    descriptor: dict[str, Any],
+    status: str,
+    stages: tuple[str, ...],
+) -> None:
+    cache_dir = _kda_topology_cache_dir()
+    os.makedirs(cache_dir, exist_ok=True)
+    path = _kda_topology_manifest_path(fingerprint)
+    payload = {
+        "version": KDA_TOPOLOGY_MANIFEST_VERSION,
+        "fingerprint": str(fingerprint),
+        "descriptor": _json_ready(descriptor),
+        "status": str(status),
+        "stages": list(stages),
+        "tilelang_cache_dir": os.path.abspath(
+            os.path.expanduser(
+                os.environ.get("TILELANG_CACHE_DIR", "~/.tilelang/cache")
+            )
+        ),
+    }
+    temp_path = f"{path}.{os.getpid()}.tmp"
+    with open(temp_path, "w", encoding="utf-8") as file:
+        json.dump(payload, file, sort_keys=True, separators=(",", ":"))
+    os.replace(temp_path, path)
+
+
+def _read_kda_topology_manifest(fingerprint: str) -> Optional[dict[str, Any]]:
+    path = _kda_topology_manifest_path(fingerprint)
+    try:
+        with open(path, "r", encoding="utf-8") as file:
+            payload = json.load(file)
+    except FileNotFoundError:
+        return None
+    if payload.get("version") != KDA_TOPOLOGY_MANIFEST_VERSION:
+        return None
+    if payload.get("fingerprint") != fingerprint:
+        return None
+    return payload
+
+
+def _kda_varlen_topology_key(
+    *,
+    cu_values: tuple[int, ...] | list[int],
+    chunk_indices: tuple[int, ...] | list[int],
+    chunk_offsets: tuple[int, ...] | list[int],
+    total_tokens: int,
+    h_heads: int,
+    hv_heads: int,
+    k_dim: int,
+    v_dim: int,
+    scale: Any,
+    use_initial_state: bool,
+    output_final_state: bool,
+    chunk_size: int = KDA_FIXED_BT,
+) -> tuple[Any, ...]:
+    cu = tuple(int(x) for x in cu_values)
+    offsets = tuple(int(x) for x in chunk_offsets)
+    descriptor = _kda_varlen_topology_descriptor(
+        cu_values=cu,
+        chunk_offsets=offsets,
+        total_tokens=total_tokens,
+        h_heads=h_heads,
+        hv_heads=hv_heads,
+        k_dim=k_dim,
+        v_dim=v_dim,
+        chunk_size=chunk_size,
+        scale=scale,
+        use_initial_state=use_initial_state,
+        output_final_state=output_final_state,
+    )
+    fingerprint = _kda_varlen_topology_fingerprint(descriptor)
+    del chunk_indices
+    return (
+        "kda_varlen_topology_v2",
+        fingerprint,
+    )
+
+
+def _record_kda_topology_hit(key: tuple[Any, ...]) -> KDATopologyDecision:
+    threshold = max(
+        _env_int(KDA_TOPOLOGY_SPECIALIZATION_THRESHOLD_ENV, 3),
+        0,
+    )
+    if threshold <= 0:
+        return KDATopologyDecision(
+            key=key,
+            hits=0,
+            use_specialized=False,
+            reason="topology specialization disabled",
+        )
+    if key in _KDA_TOPOLOGY_DISABLED:
+        hits = _KDA_TOPOLOGY_HITS.get(key, 0)
+        return KDATopologyDecision(
+            key=key,
+            hits=hits,
+            use_specialized=False,
+            reason="topology specialization disabled after compile fallback",
+        )
+
+    max_entries = max(
+        _env_int(KDA_TOPOLOGY_SPECIALIZATION_MAX_ENTRIES_ENV, 64),
+        1,
+    )
+    if key not in _KDA_TOPOLOGY_HITS and len(_KDA_TOPOLOGY_HITS) >= max_entries:
+        oldest = next(iter(_KDA_TOPOLOGY_HITS))
+        _KDA_TOPOLOGY_HITS.pop(oldest, None)
+        _KDA_TOPOLOGY_DISABLED.discard(oldest)
+    hits = _KDA_TOPOLOGY_HITS.get(key, 0) + 1
+    _KDA_TOPOLOGY_HITS[key] = hits
+    use_specialized = hits >= threshold
+    return KDATopologyDecision(
+        key=key,
+        hits=hits,
+        use_specialized=use_specialized,
+        reason=(
+            "hot topology promoted"
+            if use_specialized
+            else "dynamic topology below specialization threshold"
+        ),
+    )
+
+
 def primfunc_has_degraded_markers(prim_func: Any) -> bool:
     """Return True when frontend emitted visible degraded breadcrumbs."""
 
@@ -285,6 +538,106 @@ def specialize_primfunc_for_scalars(
     return prim_func.specialize(mapping)
 
 
+def _freeze_topology_constants(
+    topology_constants: Optional[dict[str, tuple[int, ...] | list[int]]],
+) -> tuple[tuple[str, tuple[int, ...]], ...]:
+    if not topology_constants:
+        return ()
+    return tuple(
+        sorted(
+            (str(name), tuple(int(x) for x in values))
+            for name, values in topology_constants.items()
+        )
+    )
+
+
+def _thaw_topology_constants(
+    topology_constants_key: tuple[tuple[str, tuple[int, ...]], ...],
+) -> dict[str, tuple[int, ...]]:
+    return {name: tuple(values) for name, values in topology_constants_key}
+
+
+def _metadata_constants_for_buffer(
+    buffer_name: str,
+    topology_constants: dict[str, tuple[int, ...]],
+) -> Optional[tuple[int, ...]]:
+    if buffer_name in topology_constants:
+        return topology_constants[buffer_name]
+    for name, values in topology_constants.items():
+        if buffer_name.startswith(f"{name}_"):
+            return values
+    return None
+
+
+def specialize_primfunc_for_topology_metadata(
+    prim_func: Any,
+    topology_constants: dict[str, tuple[int, ...] | list[int]],
+) -> Any:
+    """Constant-fold hot varlen topology metadata loads inside a PrimFunc.
+
+    The public launch ABI remains unchanged: cppmega still passes cu_seqlens,
+    chunk_indices, and chunk_offsets. Hot topologies simply compile a variant
+    whose internal loads from those small metadata arrays are replaced by
+    constants/selects, which keeps the dynamic path generic and avoids asking
+    the analyzer/Z3 to reason about exact runtime arrays.
+    """
+
+    constants = {
+        str(name): tuple(int(x) for x in values)
+        for name, values in topology_constants.items()
+        if values is not None
+    }
+    if not constants:
+        return prim_func
+
+    from tvm import tir
+    from tvm.tir import stmt_functor
+
+    def const_expr(dtype: str, value: int) -> Any:
+        return tir.IntImm(dtype, int(value))
+
+    def index_dtype(index: Any) -> str:
+        dtype = str(getattr(index, "dtype", "int64"))
+        return dtype if dtype.startswith(("int", "uint")) else "int64"
+
+    def const_lookup(index: Any, values: tuple[int, ...], dtype: str) -> Any:
+        if not values:
+            return None
+        immediate = getattr(index, "value", None)
+        if immediate is not None:
+            pos = int(immediate)
+            if 0 <= pos < len(values):
+                return const_expr(dtype, values[pos])
+        idx_dtype = index_dtype(index)
+        expr = const_expr(dtype, values[-1])
+        for pos in range(len(values) - 2, -1, -1):
+            expr = tir.Select(
+                index == tir.IntImm(idx_dtype, pos),
+                const_expr(dtype, values[pos]),
+                expr,
+            )
+        return expr
+
+    def post(node: Any) -> Any:
+        buffer = getattr(node, "buffer", None)
+        indices = getattr(node, "indices", None)
+        if buffer is None or indices is None or len(indices) != 1:
+            return node
+        values = _metadata_constants_for_buffer(str(getattr(buffer, "name", "")), constants)
+        if values is None:
+            return node
+        replacement = const_lookup(indices[0], values, str(getattr(node, "dtype", "int64")))
+        return node if replacement is None else replacement
+
+    body = stmt_functor.ir_transform(
+        prim_func.body,
+        None,
+        post,
+        ["tirx.BufferLoad"],
+    )
+    return prim_func.with_body(body)
+
+
 def _default_compile_fn(
     prim_func: Any,
     *,
@@ -311,6 +664,7 @@ def compile_tilelang_primfunc(
     plan: PathDKernelPlan,
     *,
     compile_fn: Optional[Callable[..., Any]] = None,
+    topology_constants: Optional[dict[str, tuple[int, ...] | list[int]]] = None,
 ) -> PathDCompileResult:
     """Specialize, validate, compile, and wrap one PrimFunc.
 
@@ -331,6 +685,10 @@ def compile_tilelang_primfunc(
         specialized = specialize_primfunc_for_scalars(
             specialized,
             plan.scalar_specializations,
+        )
+        specialized = specialize_primfunc_for_topology_metadata(
+            specialized,
+            topology_constants or {},
         )
     except Exception as exc:  # noqa: BLE001
         return PathDCompileResult(
@@ -399,6 +757,7 @@ def _compile_gdn_chunk_h_cached(
     constexprs_key: tuple[tuple[str, Any], ...],
     grid: tuple[int, ...],
     scalar_specializations: tuple[Any, ...],
+    topology_constants_key: tuple[tuple[str, tuple[int, ...]], ...],
     allow_degraded_primfunc: bool,
 ) -> PathDCompileResult:
     from cppmega_v4._tilelang.linear_attention_path_d_real import lower_fla_chunk_h
@@ -411,6 +770,7 @@ def _compile_gdn_chunk_h_cached(
         grid=grid,
         allow_degraded_primfunc=allow_degraded_primfunc,
         scalar_specializations=scalar_specializations,
+        topology_constants=_thaw_topology_constants(topology_constants_key),
     )
 
 
@@ -421,6 +781,7 @@ def _compile_lowered_kernel_result(
     grid: tuple[int, ...],
     allow_degraded_primfunc: bool,
     scalar_specializations: Optional[tuple[Any, ...]] = None,
+    topology_constants: Optional[dict[str, tuple[int, ...]]] = None,
 ) -> PathDCompileResult:
     if lowered.status != "LOWERED_FULL" or lowered.prim_func is None:
         return PathDCompileResult(
@@ -446,7 +807,11 @@ def _compile_lowered_kernel_result(
         execution_backend=base_plan.execution_backend,
         allow_degraded_primfunc=allow_degraded_primfunc,
     )
-    return compile_tilelang_primfunc(lowered.prim_func, plan)
+    return compile_tilelang_primfunc(
+        lowered.prim_func,
+        plan,
+        topology_constants=topology_constants,
+    )
 
 
 @lru_cache(maxsize=16)
@@ -510,6 +875,7 @@ def _compile_kda_intra_token_cached(
     constexprs_key: tuple[tuple[str, Any], ...],
     grid: tuple[int, ...],
     scalar_specializations: tuple[Any, ...],
+    topology_constants_key: tuple[tuple[str, tuple[int, ...]], ...],
     allow_degraded_primfunc: bool,
 ) -> PathDCompileResult:
     from cppmega_v4._tilelang.linear_attention_path_d_real import (
@@ -523,6 +889,7 @@ def _compile_kda_intra_token_cached(
         grid=grid,
         allow_degraded_primfunc=allow_degraded_primfunc,
         scalar_specializations=scalar_specializations,
+        topology_constants=_thaw_topology_constants(topology_constants_key),
     )
 
 
@@ -531,6 +898,7 @@ def _compile_kda_inter_solve_cached(
     constexprs_key: tuple[tuple[str, Any], ...],
     grid: tuple[int, ...],
     scalar_specializations: tuple[Any, ...],
+    topology_constants_key: tuple[tuple[str, tuple[int, ...]], ...],
     allow_degraded_primfunc: bool,
 ) -> PathDCompileResult:
     from cppmega_v4._tilelang.linear_attention_path_d_real import (
@@ -544,6 +912,7 @@ def _compile_kda_inter_solve_cached(
         grid=grid,
         allow_degraded_primfunc=allow_degraded_primfunc,
         scalar_specializations=scalar_specializations,
+        topology_constants=_thaw_topology_constants(topology_constants_key),
     )
 
 
@@ -551,6 +920,7 @@ def _compile_kda_inter_solve_cached(
 def _compile_kda_recompute_w_u_cached(
     constexprs_key: tuple[tuple[str, Any], ...],
     grid: tuple[int, ...],
+    topology_constants_key: tuple[tuple[str, tuple[int, ...]], ...],
     allow_degraded_primfunc: bool,
 ) -> PathDCompileResult:
     from cppmega_v4._tilelang.linear_attention_path_d_real import (
@@ -563,6 +933,7 @@ def _compile_kda_recompute_w_u_cached(
         base_plan=KDA_RECOMPUTE_W_U_PLAN,
         grid=grid,
         allow_degraded_primfunc=allow_degraded_primfunc,
+        topology_constants=_thaw_topology_constants(topology_constants_key),
     )
 
 
@@ -571,6 +942,7 @@ def _compile_kda_chunk_o_cached(
     constexprs_key: tuple[tuple[str, Any], ...],
     grid: tuple[int, ...],
     scalar_specializations: tuple[Any, ...],
+    topology_constants_key: tuple[tuple[str, tuple[int, ...]], ...],
     allow_degraded_primfunc: bool,
 ) -> PathDCompileResult:
     from cppmega_v4._tilelang.linear_attention_path_d_real import (
@@ -584,6 +956,7 @@ def _compile_kda_chunk_o_cached(
         grid=grid,
         allow_degraded_primfunc=allow_degraded_primfunc,
         scalar_specializations=scalar_specializations,
+        topology_constants=_thaw_topology_constants(topology_constants_key),
     )
 
 
@@ -637,6 +1010,7 @@ def compile_gdn_chunk_h_artifact(
     constexprs: Optional[dict[str, Any]] = None,
     grid: tuple[int, ...] = (1, 1),
     scalar_specializations: Optional[tuple[Any, ...]] = None,
+    topology_constants: Optional[dict[str, tuple[int, ...] | list[int]]] = None,
     allow_degraded_primfunc: bool = False,
 ) -> PathDCompileResult:
     """Compile/cache the currently lowerable GDN Path D chunk-h artifact."""
@@ -652,6 +1026,7 @@ def compile_gdn_chunk_h_artifact(
         GDN_CHUNK_H_PLAN.scalar_specializations
         if scalar_specializations is None
         else scalar_specializations,
+        _freeze_topology_constants(topology_constants),
         bool(allow_degraded_primfunc),
     )
 
@@ -702,6 +1077,7 @@ def compile_kda_intra_token_artifact(
     scale: Any = None,
     constexprs: Optional[dict[str, Any]] = None,
     grid: Optional[tuple[int, ...]] = None,
+    topology_constants: Optional[dict[str, tuple[int, ...] | list[int]]] = None,
     allow_degraded_primfunc: bool = False,
 ) -> PathDCompileResult:
     """Compile/cache KDA's token-parallel diagonal block kernel."""
@@ -739,6 +1115,7 @@ def compile_kda_intra_token_artifact(
         _freeze_items(cfg),
         tuple(int(x) for x in grid),
         scalar_specializations,
+        _freeze_topology_constants(topology_constants),
         bool(allow_degraded_primfunc),
     )
 
@@ -757,6 +1134,7 @@ def compile_kda_inter_solve_artifact(
     scale: Any = None,
     constexprs: Optional[dict[str, Any]] = None,
     grid: Optional[tuple[int, ...]] = None,
+    topology_constants: Optional[dict[str, tuple[int, ...] | list[int]]] = None,
     allow_degraded_primfunc: bool = False,
 ) -> PathDCompileResult:
     """Compile/cache KDA's fused inter-subchunk solve kernel."""
@@ -792,6 +1170,7 @@ def compile_kda_inter_solve_artifact(
         _freeze_items(cfg),
         tuple(int(x) for x in grid),
         scalar_specializations,
+        _freeze_topology_constants(topology_constants),
         bool(allow_degraded_primfunc),
     )
 
@@ -808,6 +1187,7 @@ def compile_kda_recompute_w_u_artifact(
     is_varlen: bool = False,
     constexprs: Optional[dict[str, Any]] = None,
     grid: Optional[tuple[int, ...]] = None,
+    topology_constants: Optional[dict[str, tuple[int, ...] | list[int]]] = None,
     allow_degraded_primfunc: bool = False,
 ) -> PathDCompileResult:
     """Compile/cache KDA's WY recompute kernel."""
@@ -838,6 +1218,7 @@ def compile_kda_recompute_w_u_artifact(
     return _compile_kda_recompute_w_u_cached(
         _freeze_items(cfg),
         tuple(int(x) for x in grid),
+        _freeze_topology_constants(topology_constants),
         bool(allow_degraded_primfunc),
     )
 
@@ -856,6 +1237,7 @@ def compile_kda_chunk_o_artifact(
     scale: Any = None,
     constexprs: Optional[dict[str, Any]] = None,
     grid: Optional[tuple[int, ...]] = None,
+    topology_constants: Optional[dict[str, tuple[int, ...] | list[int]]] = None,
     allow_degraded_primfunc: bool = False,
 ) -> PathDCompileResult:
     """Compile/cache the GLA output kernel variant used by KDA."""
@@ -891,6 +1273,7 @@ def compile_kda_chunk_o_artifact(
         _freeze_items(cfg),
         tuple(int(x) for x in grid),
         scalar_specializations,
+        _freeze_topology_constants(topology_constants),
         bool(allow_degraded_primfunc),
     )
 
@@ -1151,6 +1534,7 @@ def _compile_kda_runtime_stages(
     scale: Any,
     use_initial_state: bool,
     output_final_state: bool,
+    topology_constants: Optional[dict[str, tuple[int, ...] | list[int]]] = None,
 ) -> tuple[
     PathDCompileResult,
     PathDCompileResult,
@@ -1206,6 +1590,7 @@ def _compile_kda_runtime_stages(
             is_varlen=is_varlen,
             scale=scale,
             constexprs=runtime_private,
+            topology_constants=topology_constants,
         ),
         compile_kda_inter_solve_artifact(
             batch=batch,
@@ -1219,6 +1604,7 @@ def _compile_kda_runtime_stages(
             scale=scale,
             constexprs=runtime_private,
             grid=stage_grid,
+            topology_constants=topology_constants,
         ),
         compile_kda_recompute_w_u_artifact(
             batch=batch,
@@ -1231,11 +1617,13 @@ def _compile_kda_runtime_stages(
             is_varlen=is_varlen,
             constexprs=runtime_private,
             grid=stage_grid,
+            topology_constants=topology_constants,
         ),
         compile_gdn_chunk_h_artifact(
             constexprs=chunk_h_constexprs,
             grid=chunk_v_grid,
             scalar_specializations=(int(total_tokens),),
+            topology_constants=topology_constants,
         ),
         compile_kda_chunk_o_artifact(
             batch=batch,
@@ -1250,6 +1638,7 @@ def _compile_kda_runtime_stages(
             scale=scale,
             constexprs=runtime_private,
             grid=chunk_o_grid,
+            topology_constants=topology_constants,
         ),
     )
 
@@ -1578,6 +1967,40 @@ def kda_fwd_runtime_call(
             adapter_name="KDA",
         )
 
+    topology_key: Optional[tuple[Any, ...]] = None
+    topology_descriptor: Optional[dict[str, Any]] = None
+    topology_fingerprint: Optional[str] = None
+    topology_constants: Optional[dict[str, tuple[int, ...]]] = None
+    if is_varlen:
+        chunk_indices_values = tuple(
+            _as_int_list(chunk_indices_arg, name="chunk_indices")
+        )
+        chunk_offsets_values = tuple(
+            _as_int_list(chunk_offsets_arg, name="chunk_offsets")
+        )
+        topology_descriptor = _kda_varlen_topology_descriptor(
+            cu_values=tuple(cu_values),
+            chunk_offsets=chunk_offsets_values,
+            total_tokens=total_tokens,
+            h_heads=h_heads,
+            hv_heads=hv_heads,
+            k_dim=k_dim,
+            v_dim=v_dim,
+            chunk_size=KDA_FIXED_BT,
+            scale=scale,
+            use_initial_state=initial_state is not None,
+            output_final_state=bool(output_final_state),
+        )
+        topology_fingerprint = _kda_varlen_topology_fingerprint(topology_descriptor)
+        topology_key = ("kda_varlen_topology_v2", topology_fingerprint)
+        topology_decision = _record_kda_topology_hit(topology_key)
+        if topology_decision.use_specialized:
+            topology_constants = {
+                "cu_seqlens": tuple(cu_values),
+                "chunk_indices": chunk_indices_values,
+                "chunk_offsets": chunk_offsets_values,
+            }
+
     token, inter, recompute, chunk_h, chunk_o = _compile_kda_runtime_stages(
         batch=b,
         total_tokens=total_tokens,
@@ -1591,7 +2014,54 @@ def kda_fwd_runtime_call(
         scale=scale,
         use_initial_state=initial_state is not None,
         output_final_state=bool(output_final_state),
+        topology_constants=topology_constants,
     )
+    if topology_constants is not None and any(
+        not stage.available for stage in (token, inter, recompute, chunk_h, chunk_o)
+    ):
+        if topology_key is not None:
+            _KDA_TOPOLOGY_DISABLED.add(topology_key)
+        if topology_fingerprint is not None and topology_descriptor is not None:
+            try:
+                _write_kda_topology_manifest(
+                    topology_fingerprint,
+                    descriptor=topology_descriptor,
+                    status="disabled",
+                    stages=tuple(
+                        stage.plan.name if stage.plan is not None else "unknown"
+                        for stage in (token, inter, recompute, chunk_h, chunk_o)
+                    ),
+                )
+            except OSError:
+                pass
+        token, inter, recompute, chunk_h, chunk_o = _compile_kda_runtime_stages(
+            batch=b,
+            total_tokens=total_tokens,
+            num_sequences=num_sequences,
+            num_chunks=num_chunks,
+            h_heads=h_heads,
+            hv_heads=hv_heads,
+            k_dim=k_dim,
+            v_dim=v_dim,
+            is_varlen=is_varlen,
+            scale=scale,
+            use_initial_state=initial_state is not None,
+            output_final_state=bool(output_final_state),
+        )
+    elif topology_constants is not None and topology_fingerprint is not None:
+        if topology_descriptor is not None:
+            try:
+                _write_kda_topology_manifest(
+                    topology_fingerprint,
+                    descriptor=topology_descriptor,
+                    status="compiled",
+                    stages=tuple(
+                        stage.plan.name if stage.plan is not None else "unknown"
+                        for stage in (token, inter, recompute, chunk_h, chunk_o)
+                    ),
+                )
+            except OSError:
+                pass
     for stage in (token, inter, recompute, chunk_h, chunk_o):
         if not stage.available:
             detail = f"; {coverage_reason}" if coverage_reason else ""
@@ -1723,7 +2193,12 @@ def kda_fwd_runtime_call(
 __all__ = [
     "ALLOW_DEGRADED_ENV",
     "GDN_RECURRENT_PLAN",
+    "KDA_TOPOLOGY_CACHE_DIR_ENV",
+    "KDA_TOPOLOGY_SPECIALIZATION_MAX_ENTRIES_ENV",
+    "KDA_TOPOLOGY_SPECIALIZATION_THRESHOLD_ENV",
     "KDA_RECURRENT_PLAN",
+    "KDATopologyDecision",
+    "KDATopologyInvariants",
     "PathDCompileResult",
     "PathDKernelPlan",
     "PathDRecurrentPlan",
@@ -1744,4 +2219,5 @@ __all__ = [
     "primfunc_has_degraded_markers",
     "specialize_primfunc_for_grid",
     "specialize_primfunc_for_scalars",
+    "specialize_primfunc_for_topology_metadata",
 ]
