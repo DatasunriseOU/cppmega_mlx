@@ -1,7 +1,12 @@
-"""KDA multi-path dispatch (Paths B/C/D + auto-mode).
+"""KDA multi-path dispatch (Paths B/C/D/E + auto-mode).
 
-Same shape as ``linear_attention_paths.py`` but for the KDA backend. KDA
-has no mlx-lm equivalent op (no Path E).
+Same shape as ``linear_attention_paths.py`` but for the KDA backend. Path E
+reuses the SAME mlx-lm gated_delta Metal kernel as GDN — the kernel
+auto-selects the vectorised-gate variant when ``g.ndim == 4``
+(``mlx_lm/models/gated_delta.py::gated_delta_kernel``), which is exactly
+KDA's per-K log-decay shape. Mirrors how
+``mlx_lm/models/kimi_linear.py::KimiDeltaAttention`` drives the same
+upstream kernel from KDA-shaped inputs.
 
 Backend status (May 2026):
     - Path A: pure-MLX naive recurrent KDA (golden) — always available.
@@ -16,6 +21,10 @@ Backend status (May 2026):
     - Path D: ``poc.triton_frontend.from_triton_kernel`` over FLA KDA
       chunk kernels. cppmega owns the runtime adapter for FLA's forward
       multi-kernel launch, including packed varlen metadata.
+    - Path E: vendored mlx-lm gated_delta vectorised-gate Metal kernel
+      (the same kernel that powers GDN Path E; KDA just hits the
+      ``g.ndim == 4`` branch). Requires Dk % 32 == 0 and Dv % 4 == 0;
+      smaller dims drop to the pure-ops reference path.
 
 Env override: ``CPPMEGA_V4_KERNEL_PATH__KDA``.
 """
@@ -137,6 +146,43 @@ def _path_d_call(*args, **kwargs):
         return _path_a_call(*args, **kwargs)
 
 
+# ----- Path E (vendored mlx-lm gated_delta vectorised-gate kernel) -----
+
+
+def _path_e_status() -> PathStatus:
+    try:
+        importlib.import_module(
+            "cppmega_v4.nn._external.mlx_lm_kda_update"
+        )
+    except Exception as exc:
+        return PathStatus(
+            path="path_e", available=False,
+            reason=(
+                "mlx-lm gated_delta vectorised-gate adapter not importable: "
+                f"{exc}"
+            ),
+        )
+    return PathStatus(
+        path="path_e", available=True,
+        reason=(
+            "vendored mlx-lm gated_delta vectorised-gate Metal kernel "
+            "(Dk%32==0 & Dv%4==0; smaller dims fall back to the pure-ops "
+            "reference). The same kernel as GDN Path E — KDA hits the "
+            "g.ndim==4 branch in gated_delta_kernel."
+        ),
+    )
+
+
+def _path_e_call(*args, **kwargs):
+    if not _path_e_status().available:
+        return _path_a_call(*args, **kwargs)
+    try:
+        from cppmega_v4.nn._external.mlx_lm_kda_update import kda_update
+        return kda_update(*args, **kwargs)
+    except Exception:
+        return _path_a_call(*args, **kwargs)
+
+
 # ----- Public dispatch -----
 
 
@@ -146,20 +192,17 @@ def kda_path_statuses() -> dict[PathName, PathStatus]:
         "path_b": _path_b_status(),
         "path_c": _path_c_status(),
         "path_d": _path_d_status(),
+        "path_e": _path_e_status(),
     }
 
 
 def kda_auto_mode_for_inputs(*, env_var: str = ENV_VAR) -> PathName:
     forced = env_override(env_var)
     if forced is not None:
-        if forced == "path_e":
-            raise ValueError(
-                "KDA has no Path E; use path_a, path_b, path_c, path_d, or auto"
-            )
         return forced  # type: ignore[return-value]
     return auto_pick(
         kda_path_statuses(),
-        preference=("path_c", "path_b", "path_d", "path_a"),
+        preference=("path_c", "path_b", "path_e", "path_d", "path_a"),
     )
 
 
@@ -171,6 +214,7 @@ def kda_recurrent_dispatch(*args, **kwargs):
         "path_b": _path_b_call,
         "path_c": _path_c_call,
         "path_d": _path_d_call,
+        "path_e": _path_e_call,
     }[path]
     return fn(*args, **kwargs)
 

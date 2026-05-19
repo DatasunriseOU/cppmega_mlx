@@ -326,5 +326,63 @@ def test_kda_path_d_try_lower_returns_seam_message():
 # ----- Dispatch sanity -----
 
 
+# ----- Path E (vendored mlx-lm gated_delta vec-gate kernel) -----
+
+
+def test_kda_path_e_status_available():
+    from cppmega_v4._tilelang.kda_paths import _path_e_status
+    st = _path_e_status()
+    assert st.available, st.reason
+    assert "gated_delta" in st.reason
+
+
+def test_kda_path_e_parity_with_path_a_kernel_path():
+    """Dk%32==0 + Dv%4==0 hits the Metal kernel — must match Path A."""
+    from cppmega_v4.nn._external.mlx_lm_kda_update import kda_update
+    B, T, H, HV, K, V = 1, 4, 2, 4, 32, 32
+    rng = np.random.default_rng(123)
+    q = mx.array(rng.standard_normal((B, T, H, K)).astype(np.float32))
+    k = mx.array(rng.standard_normal((B, T, H, K)).astype(np.float32))
+    v = mx.array(rng.standard_normal((B, T, HV, V)).astype(np.float32))
+    g = mx.array(-rng.uniform(0.01, 0.2, (B, T, HV, K)).astype(np.float32))
+    beta = mx.array(rng.uniform(0.1, 0.9, (B, T, HV)).astype(np.float32))
+    o_e, sf_e = kda_update(q, k, v, g, beta, output_final_state=True)
+    o_a, sf_a = naive_recurrent_kda(q, k, v, g, beta, output_final_state=True)
+    mx.eval(o_e, o_a, sf_e, sf_a)
+    np.testing.assert_allclose(np.array(o_e), np.array(o_a), atol=1e-4, rtol=1e-4)
+    np.testing.assert_allclose(np.array(sf_e), np.array(sf_a), atol=1e-4, rtol=1e-4)
+
+
+def test_kda_path_e_parity_ops_fallback():
+    """Small dims (Dk%32!=0) fall through to the pure-ops reference."""
+    from cppmega_v4.nn._external.mlx_lm_kda_update import kda_update
+    B, T, H, HV, K, V = 1, 3, 2, 4, 8, 8
+    rng = np.random.default_rng(131)
+    q = mx.array(rng.standard_normal((B, T, H, K)).astype(np.float32))
+    k = mx.array(rng.standard_normal((B, T, H, K)).astype(np.float32))
+    v = mx.array(rng.standard_normal((B, T, HV, V)).astype(np.float32))
+    g = mx.array(-rng.uniform(0.01, 0.2, (B, T, HV, K)).astype(np.float32))
+    beta = mx.array(rng.uniform(0.1, 0.9, (B, T, HV)).astype(np.float32))
+    o_e, _ = kda_update(q, k, v, g, beta)
+    o_a, _ = naive_recurrent_kda(q, k, v, g, beta)
+    np.testing.assert_allclose(np.array(o_e), np.array(o_a), atol=1e-4, rtol=1e-4)
+
+
+def test_kda_path_e_forced_via_env(monkeypatch):
+    monkeypatch.setenv(KDA_ENV, "path_e")
+    B, T, H, HV, K, V = 1, 4, 2, 4, 32, 32
+    rng = np.random.default_rng(141)
+    q = mx.array(rng.standard_normal((B, T, H, K)).astype(np.float32))
+    k = mx.array(rng.standard_normal((B, T, H, K)).astype(np.float32))
+    v = mx.array(rng.standard_normal((B, T, HV, V)).astype(np.float32))
+    g = mx.array(-rng.uniform(0.01, 0.2, (B, T, HV, K)).astype(np.float32))
+    beta = mx.array(rng.uniform(0.1, 0.9, (B, T, HV)).astype(np.float32))
+    o, _ = kda_recurrent_dispatch(q, k, v, g, beta)
+    assert o.shape == (B, T, HV, V)
+    assert not bool(mx.any(mx.isnan(o)).item())
+
+
 def test_kda_statuses_keys_unchanged():
-    assert set(kda_path_statuses().keys()) == {"path_a", "path_b", "path_c", "path_d"}
+    assert set(kda_path_statuses().keys()) == {
+        "path_a", "path_b", "path_c", "path_d", "path_e",
+    }

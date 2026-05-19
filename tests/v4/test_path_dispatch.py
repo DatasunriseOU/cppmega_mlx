@@ -145,19 +145,19 @@ def test_gdn_dispatch_each_path_runs(monkeypatch, path):
 
 
 def test_kda_statuses_keys():
-    # KDA has no Path E.
+    # KDA now has Path E (same upstream Metal kernel as GDN; KDA hits the
+    # vectorised-gate branch via g.ndim==4).
     statuses = kda_path_statuses()
-    assert set(statuses.keys()) == {"path_a", "path_b", "path_c", "path_d"}
+    assert set(statuses.keys()) == {"path_a", "path_b", "path_c", "path_d", "path_e"}
 
 
 def test_kda_path_a_always_available():
     assert kda_path_statuses()["path_a"].available
 
 
-def test_kda_auto_mode_rejects_path_e(monkeypatch):
+def test_kda_auto_mode_accepts_path_e(monkeypatch):
     monkeypatch.setenv(KDA_ENV, "path_e")
-    with pytest.raises(ValueError, match="no Path E"):
-        kda_auto_mode_for_inputs()
+    assert kda_auto_mode_for_inputs() == "path_e"
 
 
 def test_kda_dispatch_returns_same_as_path_a(monkeypatch):

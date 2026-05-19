@@ -51,7 +51,7 @@ ENV_VAR_FOR_BLOCK: dict[Block, str] = {
 }
 
 GDN_PATHS: tuple[Path_, ...] = ("path_a", "path_b", "path_c", "path_d", "path_e")
-KDA_PATHS: tuple[Path_, ...] = ("path_a", "path_b", "path_c", "path_d")
+KDA_PATHS: tuple[Path_, ...] = ("path_a", "path_b", "path_c", "path_d", "path_e")
 
 
 @dataclass

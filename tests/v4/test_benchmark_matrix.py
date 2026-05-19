@@ -125,13 +125,13 @@ def test_run_matrix_gdn_covers_all_5_paths():
     assert receipt.promotion.env_var.endswith("LINEAR_ATTENTION")
 
 
-def test_run_matrix_kda_covers_4_paths_no_path_e():
+def test_run_matrix_kda_covers_all_5_paths():
     shape = CellShape(
         block="kda", path="path_a", batch=1, seq_len=4,
         num_heads=2, head_dim_k=4, head_dim_v=4, num_v_heads=2,
     )
     receipt = run_matrix(shape, warmup=1, iters=2)
-    assert len(receipt.cells) == 4
+    assert len(receipt.cells) == 5
     paths_seen = {c.path for c in receipt.cells}
     assert paths_seen == set(KDA_PATHS)
     assert receipt.promotion.env_var.endswith("KDA")
