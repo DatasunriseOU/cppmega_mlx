@@ -1245,7 +1245,9 @@ def test_fp8_path_c_training_dtype_route_blocks_missing_sparse_mla_producer(
 
 def test_fp8_path_c_dsa_attention_route_metadata_is_configured(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("CPPMEGA_PATH_C_FUSION", "auto")
     args = m04_train_step.build_parser().parse_args(
         [
             "--synthetic",
@@ -1293,6 +1295,25 @@ def test_fp8_path_c_dsa_attention_route_metadata_is_configured(
     assert route["full_end_to_end_training_available"] is True
     assert route["direct_mx_array_artifact_call_status"] == "m04_uses_model_graph_route"
     assert route["selected_action"] == "run_path_c_training_route"
+    assert route["path_c_fusion"]["mode"] == "auto"
+    assert route["path_c_fusion"]["status"] == "plan_ready_not_default"
+    assert route["path_c_fusion"]["lowering_boundary"] == "tilelang_tvm_ir"
+    assert route["path_c_fusion"]["compiler"] == "tilelang.engine.fusion"
+    assert route["path_c_fusion"]["requires_msl_post_fusion"] is False
+    assert route["path_c_fusion"]["large_tensor_staging_allowed"] is False
+    assert route["path_c_fusion"]["node_names"] == [
+        "mamba3_scan",
+        "m2rnn_packed_post",
+        "sparse_mla_fp8_prepared",
+    ]
+    assert route["path_c_fusion"]["z3_sync"] == {
+        "enabled": True,
+        "objective": "minimize_sync_async",
+        "candidates": ["sync", "async"],
+        "proof_required": True,
+    }
+    assert route["path_c_fusion"]["acceptance_gate"]["ignores_bad_path_b"] is True
+    assert route["path_c_fusion"]["cache_audit_required"] is True
     assert producer_gate["required"] is True
     assert producer_gate["ok"] is True
     assert producer_gate["status"] == m04_train_step.FP8_PATH_C_NATIVE_PRODUCER_STATUS

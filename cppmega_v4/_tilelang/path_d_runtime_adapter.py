@@ -453,7 +453,7 @@ def _record_kda_topology_hit(key: tuple[Any, ...]) -> KDATopologyDecision:
         oldest = next(iter(_KDA_TOPOLOGY_HITS))
         _KDA_TOPOLOGY_HITS.pop(oldest, None)
         _KDA_TOPOLOGY_DISABLED.discard(oldest)
-    hits = _KDA_TOPOLOGY_HITS.get(key, 0) + 1
+    hits = _KDA_TOPOLOGY_HITS.pop(key, 0) + 1
     _KDA_TOPOLOGY_HITS[key] = hits
     use_specialized = hits >= threshold
     return KDATopologyDecision(
@@ -2001,67 +2001,58 @@ def kda_fwd_runtime_call(
                 "chunk_offsets": chunk_offsets_values,
             }
 
-    token, inter, recompute, chunk_h, chunk_o = _compile_kda_runtime_stages(
-        batch=b,
-        total_tokens=total_tokens,
-        num_sequences=num_sequences,
-        num_chunks=num_chunks,
-        h_heads=h_heads,
-        hv_heads=hv_heads,
-        k_dim=k_dim,
-        v_dim=v_dim,
-        is_varlen=is_varlen,
-        scale=scale,
-        use_initial_state=initial_state is not None,
-        output_final_state=bool(output_final_state),
-        topology_constants=topology_constants,
-    )
-    if topology_constants is not None and any(
-        not stage.available for stage in (token, inter, recompute, chunk_h, chunk_o)
-    ):
-        if topology_key is not None:
-            _KDA_TOPOLOGY_DISABLED.add(topology_key)
-        if topology_fingerprint is not None and topology_descriptor is not None:
-            try:
-                _write_kda_topology_manifest(
-                    topology_fingerprint,
-                    descriptor=topology_descriptor,
-                    status="disabled",
-                    stages=tuple(
-                        stage.plan.name if stage.plan is not None else "unknown"
-                        for stage in (token, inter, recompute, chunk_h, chunk_o)
-                    ),
-                )
-            except OSError:
-                pass
-        token, inter, recompute, chunk_h, chunk_o = _compile_kda_runtime_stages(
-            batch=b,
-            total_tokens=total_tokens,
-            num_sequences=num_sequences,
-            num_chunks=num_chunks,
-            h_heads=h_heads,
-            hv_heads=hv_heads,
-            k_dim=k_dim,
-            v_dim=v_dim,
-            is_varlen=is_varlen,
-            scale=scale,
-            use_initial_state=initial_state is not None,
-            output_final_state=bool(output_final_state),
+    stage_kwargs = {
+        "batch": b,
+        "total_tokens": total_tokens,
+        "num_sequences": num_sequences,
+        "num_chunks": num_chunks,
+        "h_heads": h_heads,
+        "hv_heads": hv_heads,
+        "k_dim": k_dim,
+        "v_dim": v_dim,
+        "is_varlen": is_varlen,
+        "scale": scale,
+        "use_initial_state": initial_state is not None,
+        "output_final_state": bool(output_final_state),
+    }
+    stages = _compile_kda_runtime_stages(**stage_kwargs)
+    if topology_constants is not None and all(stage.available for stage in stages):
+        specialized_stages = _compile_kda_runtime_stages(
+            **stage_kwargs,
+            topology_constants=topology_constants,
         )
-    elif topology_constants is not None and topology_fingerprint is not None:
-        if topology_descriptor is not None:
-            try:
-                _write_kda_topology_manifest(
-                    topology_fingerprint,
-                    descriptor=topology_descriptor,
-                    status="compiled",
-                    stages=tuple(
-                        stage.plan.name if stage.plan is not None else "unknown"
-                        for stage in (token, inter, recompute, chunk_h, chunk_o)
-                    ),
-                )
-            except OSError:
-                pass
+        if all(stage.available for stage in specialized_stages):
+            stages = specialized_stages
+            if topology_fingerprint is not None and topology_descriptor is not None:
+                try:
+                    _write_kda_topology_manifest(
+                        topology_fingerprint,
+                        descriptor=topology_descriptor,
+                        status="compiled",
+                        stages=tuple(
+                            stage.plan.name if stage.plan is not None else "unknown"
+                            for stage in stages
+                        ),
+                    )
+                except OSError:
+                    pass
+        else:
+            if topology_key is not None:
+                _KDA_TOPOLOGY_DISABLED.add(topology_key)
+            if topology_fingerprint is not None and topology_descriptor is not None:
+                try:
+                    _write_kda_topology_manifest(
+                        topology_fingerprint,
+                        descriptor=topology_descriptor,
+                        status="disabled",
+                        stages=tuple(
+                            stage.plan.name if stage.plan is not None else "unknown"
+                            for stage in specialized_stages
+                        ),
+                    )
+                except OSError:
+                    pass
+    token, inter, recompute, chunk_h, chunk_o = stages
     for stage in (token, inter, recompute, chunk_h, chunk_o):
         if not stage.available:
             detail = f"; {coverage_reason}" if coverage_reason else ""

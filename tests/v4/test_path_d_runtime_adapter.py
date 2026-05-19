@@ -243,6 +243,47 @@ def test_kda_topology_policy_promotes_only_repeated_varlen_layout(monkeypatch):
     assert other.use_specialized is False
 
 
+def test_kda_topology_hit_cache_eviction_is_lru(monkeypatch):
+    from cppmega_v4._tilelang.path_d_runtime_adapter import (
+        KDA_TOPOLOGY_SPECIALIZATION_MAX_ENTRIES_ENV,
+        KDA_TOPOLOGY_SPECIALIZATION_THRESHOLD_ENV,
+        _kda_varlen_topology_key,
+        _record_kda_topology_hit,
+        _reset_kda_topology_cache_for_tests,
+    )
+
+    monkeypatch.setenv(KDA_TOPOLOGY_SPECIALIZATION_MAX_ENTRIES_ENV, "2")
+    monkeypatch.setenv(KDA_TOPOLOGY_SPECIALIZATION_THRESHOLD_ENV, "10")
+    _reset_kda_topology_cache_for_tests()
+
+    def make_key(cu_values, chunk_offsets):
+        return _kda_varlen_topology_key(
+            cu_values=cu_values,
+            chunk_indices=(),
+            chunk_offsets=chunk_offsets,
+            total_tokens=64,
+            h_heads=1,
+            hv_heads=1,
+            k_dim=64,
+            v_dim=32,
+            scale=None,
+            use_initial_state=False,
+            output_final_state=False,
+        )
+
+    key_a = make_key((0, 16, 64), (0, 1, 3))
+    key_b = make_key((0, 32, 64), (0, 1, 2))
+    key_c = make_key((0, 8, 64), (0, 1, 3))
+
+    _record_kda_topology_hit(key_a)
+    _record_kda_topology_hit(key_b)
+    _record_kda_topology_hit(key_a)
+    _record_kda_topology_hit(key_c)
+    b_after_eviction = _record_kda_topology_hit(key_b)
+
+    assert b_after_eviction.hits == 1
+
+
 def test_kda_compact_topology_invariants_are_not_exact_arrays():
     from cppmega_v4._tilelang.path_d_runtime_adapter import (
         _kda_compact_topology_invariants,
@@ -342,6 +383,66 @@ def test_kda_topology_disk_manifest_round_trips(tmp_path, monkeypatch):
     assert payload["status"] == "compiled"
     assert payload["descriptor"]["lengths"] == [16, 48]
     assert payload["stages"] == ["token", "inter"]
+
+
+def test_kda_runtime_writes_manifest_for_promoted_topology(tmp_path, monkeypatch):
+    import mlx.core as mx
+
+    from cppmega_v4._tilelang import path_d_runtime_adapter as adapter
+
+    monkeypatch.setenv(adapter.KDA_TOPOLOGY_SPECIALIZATION_THRESHOLD_ENV, "1")
+    monkeypatch.setenv(adapter.KDA_TOPOLOGY_CACHE_DIR_ENV, str(tmp_path))
+    adapter._reset_kda_topology_cache_for_tests()
+    compile_topology_constants = []
+
+    def fake_compile_stages(**kwargs):
+        compile_topology_constants.append(kwargs.get("topology_constants"))
+        names = (
+            "kda.intra_token_parallel",
+            "kda.inter_solve",
+            "kda.recompute_w_u",
+            "gdn.chunk_delta_h",
+            "kda.chunk_o_gk",
+        )
+        return tuple(
+            adapter.PathDCompileResult(
+                available=True,
+                reason="fake",
+                artifact=object(),
+                plan=adapter.PathDKernelPlan(name=name, out_idx=(), grid=(1,)),
+            )
+            for name in names
+        )
+
+    monkeypatch.setattr(adapter, "_compile_kda_runtime_stages", fake_compile_stages)
+    monkeypatch.setattr(adapter, "_launch_stage", lambda _stage, *args: None)
+
+    q = mx.zeros((1, 32, 1, 8), dtype=mx.float16)
+    k = mx.zeros((1, 32, 1, 8), dtype=mx.float16)
+    v = mx.zeros((1, 32, 1, 8), dtype=mx.float16)
+    g = mx.zeros((1, 32, 1, 8), dtype=mx.float32)
+    beta = mx.zeros((1, 32, 1), dtype=mx.float32)
+    cu_seqlens = mx.array([0, 16, 32], dtype=mx.int64)
+    initial_state = mx.zeros((2, 1, 8, 8), dtype=mx.float32)
+
+    y, final_state = adapter.kda_fwd_runtime_call(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        cu_seqlens=cu_seqlens,
+        initial_state=initial_state,
+        output_final_state=True,
+    )
+    manifests = list(tmp_path.glob("*.json"))
+
+    assert y.shape == (1, 32, 1, 8)
+    assert final_state is not None
+    assert final_state.shape == (2, 1, 8, 8)
+    assert compile_topology_constants[0] is None
+    assert compile_topology_constants[1] is not None
+    assert len(manifests) == 1
 
 
 def test_runtime_adapter_specializes_topology_metadata_loads():

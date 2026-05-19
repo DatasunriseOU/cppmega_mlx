@@ -41,6 +41,13 @@ from cppmega_mlx.runtime.memory import (  # noqa: E402
     maybe_clear_cache_after_step,
     memory_limit_api_status,
 )
+from cppmega_mlx.runtime.path_c_fusion import (  # noqa: E402
+    FusionCompilePlan,
+    PathCFusionMode,
+    build_mamba3_fp8_train_region,
+    compile_path_c_region,
+    selected_path_c_fusion_mode,
+)
 from cppmega_mlx.recipes.model_factory import (  # noqa: E402
     local_gb10_quarter,
     local_gb10_quarter_profile,
@@ -1137,6 +1144,54 @@ def fp8_path_c_training_route_payload(
             if requested
             else None
         ),
+        "path_c_fusion": path_c_fusion_payload(),
+    }
+
+
+def path_c_fusion_payload() -> dict[str, Any]:
+    """Return receipt metadata for the high-level Path C fusion planner."""
+
+    mode = selected_path_c_fusion_mode()
+    region = build_mamba3_fp8_train_region()
+    plan = compile_path_c_region(region)
+    if not isinstance(plan, FusionCompilePlan):
+        raise TypeError("compile_path_c_region unexpectedly returned an artifact")
+    return {
+        "mode": mode.value,
+        "status": (
+            "off"
+            if mode is PathCFusionMode.OFF
+            else "plan_ready_not_default"
+        ),
+        "region_name": plan.region_name,
+        "lowering_boundary": plan.lowering_boundary,
+        "backend": plan.backend,
+        "compiler": plan.compiler,
+        "node_names": list(region.node_names),
+        "fusion_groups": [
+            {
+                "node_names": list(group.node_names),
+                "schedule_template": group.schedule_template,
+            }
+            for group in plan.fusion_groups
+        ],
+        "backward_graph": plan.backward_graph,
+        "requires_msl_post_fusion": plan.requires_msl_post_fusion,
+        "large_tensor_staging_allowed": plan.large_tensor_staging_allowed,
+        "cache_key_parts": list(plan.cache_key_parts),
+        "z3_sync": {
+            "enabled": plan.z3_sync.enabled,
+            "objective": plan.z3_sync.objective,
+            "candidates": list(plan.z3_sync.candidates),
+            "proof_required": plan.z3_sync.proof_required,
+        },
+        "acceptance_gate": {
+            "ignores_bad_path_b": True,
+            "requires_clean_path_b_baseline": True,
+            "requires_real_c_over_b_win": True,
+            "requires_peak_memory_non_regression": True,
+        },
+        "cache_audit_required": True,
     }
 
 

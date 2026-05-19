@@ -56,7 +56,8 @@ def test_region_builder_creates_fx_like_ir_without_msl_post_fusion() -> None:
 
     assert isinstance(region, PathCFusionRegion)
     assert region.node_names == ("mamba3_scan", "packed_post", "fp8_prepared")
-    assert plan.lowering_boundary == "tilelang_tvm_region"
+    assert plan.lowering_boundary == "tilelang_tvm_ir"
+    assert plan.compiler == "tilelang.engine.fusion"
     assert plan.requires_msl_post_fusion is False
     assert plan.fusion_groups[0].node_names == region.node_names
     assert plan.backward_graph == "aot_autograd"
@@ -87,9 +88,16 @@ def test_mamba3_fp8_template_has_expected_train_block_pattern() -> None:
     ]
     assert plan.cache_key_parts == (
         "region:mamba3_fp8_train_block",
+        "entry:mamba3_fp8_train_block",
         "nodes:mamba3_scan,m2rnn_packed_post,sparse_mla_fp8_prepared",
+        (
+            "edges:"
+            "mamba3_scan->m2rnn_packed_post:scan_y:internal,"
+            "m2rnn_packed_post->sparse_mla_fp8_prepared:post_y:internal"
+        ),
         "backend:tilelang_tvm_ffi",
-        "z3:minimize_sync_async",
+        "boundary:tilelang_tvm_ir",
+        "z3:sync_async",
     )
 
 
