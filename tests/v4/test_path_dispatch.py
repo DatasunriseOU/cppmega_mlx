@@ -82,15 +82,16 @@ def test_gdn_path_a_always_available():
     assert statuses["path_a"].available
 
 
-def test_gdn_path_d_still_deferred_without_triton():
-    """Path D needs triton — unavailable on Apple Silicon. Path C is now
-    real-or-fallback depending on whether tilelang is importable."""
+def test_gdn_path_d_and_c_reasons_are_coherent():
+    """Path D / Path C status reasons must be coherent regardless of whether
+    the backend is currently available (depends on triton + tilelang)."""
     statuses = linear_attention_path_statuses()
     st_d = statuses["path_d"]
-    assert not st_d.available
+    # Reason must name the lowering pipeline so the next contributor knows
+    # what's going on whether available is True or False.
+    assert "triton" in st_d.reason.lower() or "tilelang" in st_d.reason.lower()
     assert len(st_d.reason) > 20
-    # Path C reason must always name the lowering pipeline, regardless of
-    # whether tilelang is reachable.
+    # Path C reason must always name the lowering pipeline.
     st_c = statuses["path_c"]
     assert "tvm_ffi" in st_c.reason and "metal" in st_c.reason.lower()
 
