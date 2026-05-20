@@ -13,6 +13,11 @@ Stage A surface (this commit):
 
 from __future__ import annotations
 
+from cppmega_v4.parallelism.distributed_memory import (
+    DistributedMemoryReport,
+    PerRankMemory,
+    estimate_distributed_memory,
+)
 from cppmega_v4.parallelism.sharding_spec import (
     AxisAssignment,
     ParallelismKind,
@@ -42,11 +47,14 @@ __all__ = [
     "DeviceKind",
     "DeviceSpec",
     "DeviceTopology",
+    "DistributedMemoryReport",
     "ParallelismKind",
+    "PerRankMemory",
     "ShardingSpec",
     "TOPOLOGY_BUILTINS",
     "a100_8x",
     "b100_8x",
+    "estimate_distributed_memory",
     "fsdp2_only",
     "fsdp2_plus_tp",
     "gb10_quarter",
