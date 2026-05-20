@@ -154,6 +154,8 @@ class PathCModelBrick:
     name: str
     kind: str
     route_symbol: str | None = None
+    attention_qkv_has_bias: bool | None = None
+    attention_out_proj_has_bias: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -161,6 +163,8 @@ class _ResolvedPathCModelBrick:
     name: str
     kind: str
     route_symbol: str
+    attention_qkv_has_bias: bool = True
+    attention_out_proj_has_bias: bool = True
 
 
 @dataclass(frozen=True)
@@ -998,27 +1002,59 @@ def _resolved_path_c_model_brick(
         name = f"brick_{index}_{route_symbol.lower()}"
     if kind is None:
         kind = route_symbol
+    attention_qkv_has_bias = _brick_bool_attr(
+        brick,
+        "attention_qkv_has_bias",
+        default=True,
+    )
+    attention_out_proj_has_bias = _brick_bool_attr(
+        brick,
+        "attention_out_proj_has_bias",
+        default=attention_qkv_has_bias,
+    )
     return _ResolvedPathCModelBrick(
         name=_require_identifier(name, label="brick.name"),
         kind=str(kind),
         route_symbol=route_symbol,
+        attention_qkv_has_bias=attention_qkv_has_bias,
+        attention_out_proj_has_bias=attention_out_proj_has_bias,
     )
 
 
 def _path_c_brick_metadata(
     brick: _ResolvedPathCModelBrick,
 ) -> dict[str, str]:
-    return {
+    metadata = {
         "name": brick.name,
         "kind": brick.kind,
         "route_symbol": brick.route_symbol,
     }
+    if brick.route_symbol == "A" and not brick.attention_qkv_has_bias:
+        metadata["attention_qkv_has_bias"] = "false"
+    if brick.route_symbol == "A" and not brick.attention_out_proj_has_bias:
+        metadata["attention_out_proj_has_bias"] = "false"
+    return metadata
 
 
 def _brick_attr(brick: Any, name: str) -> Any | None:
     if isinstance(brick, Mapping):
         return brick.get(name)
     return getattr(brick, name, None)
+
+
+def _brick_bool_attr(brick: Any, name: str, *, default: bool) -> bool:
+    raw = _brick_attr(brick, name)
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        normalized = raw.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    raise ValueError(f"{name} must be a boolean flag, got {raw!r}")
 
 
 def _route_symbols_from_model(model: Any) -> tuple[str, ...]:
@@ -1494,7 +1530,7 @@ def _emit_attention_model_brick_surfaces(
                 context.route_hidden,
                 *_prefixed_abi_inputs(
                     projection_name,
-                    _ATTENTION_QKV_REAL_ABI_INPUTS,
+                    _attention_qkv_real_abi_inputs_for_brick(brick),
                 ),
             ),
             outputs=(q_fp8, q_scale, kv_fp8, kv_scale, indices),
@@ -1515,7 +1551,7 @@ def _emit_attention_model_brick_surfaces(
                     apply_name,
                     (
                         *_SPARSE_MLA_REAL_ABI_INPUTS,
-                        *_ATTENTION_OUT_PROJ_REAL_ABI_INPUTS,
+                        *_attention_out_proj_real_abi_inputs_for_brick(brick),
                     ),
                 ),
             ),
@@ -1524,6 +1560,34 @@ def _emit_attention_model_brick_surfaces(
         )
     )
     return _PathCBrickSurfaceLoweringResult(delta_output=delta)
+
+
+def _attention_qkv_real_abi_inputs_for_brick(
+    brick: _ResolvedPathCModelBrick,
+) -> tuple[str, ...]:
+    if brick.attention_qkv_has_bias:
+        return _ATTENTION_QKV_REAL_ABI_INPUTS
+    return tuple(
+        name
+        for name in _ATTENTION_QKV_REAL_ABI_INPUTS
+        if name
+        not in {
+            "attention_q_proj_bias",
+            "attention_sparse_kv_proj_bias",
+        }
+    )
+
+
+def _attention_out_proj_real_abi_inputs_for_brick(
+    brick: _ResolvedPathCModelBrick,
+) -> tuple[str, ...]:
+    if brick.attention_out_proj_has_bias:
+        return _ATTENTION_OUT_PROJ_REAL_ABI_INPUTS
+    return tuple(
+        name
+        for name in _ATTENTION_OUT_PROJ_REAL_ABI_INPUTS
+        if name != "attention_out_proj_bias"
+    )
 
 
 def _append_path_c_inter_brick_residual_norm(

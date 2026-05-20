@@ -57,6 +57,8 @@ __all__ = [
     "PathCBrickScheduleFragment",
     "PathCBrickScheduleDescriptorRegistry",
     "PathCFusionScheduleAcceptanceProfile",
+    "PathCFusionScheduleChainPlan",
+    "PathCFusionScheduleChainSegment",
     "PathCFusionScheduleOptimizer",
     "PathCFusionScheduleOptimizerPlan",
     "PathCFusionScheduleRegistry",
@@ -73,6 +75,8 @@ __all__ = [
     "make_path_c_descriptor_schedule_template",
     "path_c_fusion_schedule_spec",
     "path_c_fusion_schedule_template",
+    "plan_path_c_direct_fusion_chain_for_region",
+    "plan_path_c_direct_fusion_chains_for_model",
     "plan_path_c_fusion_schedule_for_region",
     "plan_path_c_fusion_schedules_for_model",
     "plan_mamba3_fp8_train_fusion_schedule",
@@ -263,6 +267,33 @@ class PathCFusionScheduleOptimizerPlan:
     region: PathCFusionRegion
     plan: FusionCompilePlan
     schedule_target: PathCFusionScheduleTarget | None
+
+
+@dataclass(frozen=True)
+class PathCFusionScheduleChainSegment:
+    """One contiguous fused segment in a generic Path C schedule chain."""
+
+    index: int
+    node_start: int
+    node_end: int
+    region: PathCFusionRegion
+    plan: FusionCompilePlan | None
+    schedule_target: PathCFusionScheduleTarget | None
+    kernel_parameter_count: int | None
+    physical_abi_policy: str
+    status: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class PathCFusionScheduleChainPlan:
+    """Generic direct-buffer chain plan for a Path C region."""
+
+    source_region: PathCFusionRegion
+    max_kernel_buffers: int
+    segments: tuple[PathCFusionScheduleChainSegment, ...]
+    status: str
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -1337,17 +1368,25 @@ def _direct_physical_abi_plan(
     shape_env: PathCModelShapeEnv | None,
     indent: str,
 ) -> _PhysicalAbiPlan:
-    access_by_buffer = {
-        buffer_name: _loop_indexed_buffer_ref(
+    direct_shape_by_buffer = {
+        buffer_name: _direct_logical_buffer_shape(
             buffer_name,
             shape_by_buffer[buffer_name],
+            shape_env,
+        )
+        for buffer_name in external_buffers
+    }
+    access_by_buffer = {
+        buffer_name: _direct_loop_indexed_buffer_ref(
+            buffer_name,
+            direct_shape_by_buffer[buffer_name],
             loop_extent,
             shape_env,
         )
         for buffer_name in external_buffers
     }
     physical_shapes = {
-        buffer_name: shape_by_buffer[buffer_name]
+        buffer_name: direct_shape_by_buffer[buffer_name]
         for buffer_name in external_buffers
     }
     logical_to_physical = {
@@ -1355,13 +1394,13 @@ def _direct_physical_abi_plan(
             "bank": buffer_name,
             "dtype": dtype_by_buffer[buffer_name],
             "offset": 0,
-            "shape": shape_by_buffer[buffer_name],
-            "size": _flattened_extent(shape_by_buffer[buffer_name]),
+            "shape": direct_shape_by_buffer[buffer_name],
+            "size": _flattened_extent(direct_shape_by_buffer[buffer_name]),
         }
         for buffer_name in external_buffers
     }
     param_lines = tuple(
-        f"{indent}{name}: T.Buffer({_shape_literal(shape_by_buffer[name])}, "
+        f"{indent}{name}: T.Buffer({_shape_literal(direct_shape_by_buffer[name])}, "
         f"\"{dtype_by_buffer[name]}\"),"
         for name in external_buffers
     )
@@ -1371,6 +1410,114 @@ def _direct_physical_abi_plan(
         physical_buffer_shapes=physical_shapes,
         logical_to_physical=logical_to_physical,
     )
+
+
+def _direct_logical_buffer_shape(
+    buffer_name: str,
+    flat_shape: tuple[int, ...],
+    shape_env: PathCModelShapeEnv | None,
+) -> tuple[int, ...]:
+    if shape_env is None:
+        return flat_shape
+    hidden = shape_env.hidden_size
+    q_dim = shape_env.attention_num_q_heads * shape_env.attention_head_dim
+    kv_dim = shape_env.attention_num_kv_heads * shape_env.attention_head_dim
+    canonical_name = _canonical_buffer_name(buffer_name)
+    if canonical_name == "mamba3_in_proj_weight":
+        return (shape_env.mamba_in_proj_dim, hidden)
+    if canonical_name == "mamba3_out_proj_weight":
+        return (hidden, shape_env.mamba_inner_dim)
+    if canonical_name == "mamba3_conv_weight":
+        return (shape_env.mamba_conv_channels, shape_env.mamba_conv_kernel, 1)
+    if canonical_name in {
+        "mamba3_B_norm_weight",
+        "mamba3_B_bias",
+        "mamba3_C_norm_weight",
+        "mamba3_C_bias",
+    }:
+        return (
+            shape_env.mamba_effective_mimo_rank,
+            shape_env.mamba_groups,
+            shape_env.mamba_state_dim,
+        )
+    if canonical_name == "m2rnn_in_proj_weight":
+        return (shape_env.m2rnn_in_proj_dim, hidden)
+    if canonical_name == "m2rnn_conv_weight":
+        return (shape_env.m2rnn_conv_dim, shape_env.m2rnn_conv_kernel, 1)
+    if canonical_name == "m2rnn_state_weight":
+        return (
+            shape_env.m2rnn_num_weight_heads,
+            shape_env.m2rnn_k_head_dim,
+            shape_env.m2rnn_v_head_dim,
+        )
+    if canonical_name == "m2rnn_D":
+        return (shape_env.m2rnn_num_heads, shape_env.m2rnn_v_head_dim)
+    if canonical_name == "m2rnn_out_proj_weight":
+        return (
+            hidden,
+            shape_env.m2rnn_num_heads * shape_env.m2rnn_v_head_dim,
+        )
+    if canonical_name == "attention_q_proj_weight":
+        return (q_dim, hidden)
+    if canonical_name == "attention_sparse_kv_proj_weight":
+        return (kv_dim, hidden)
+    if canonical_name == "attention_out_proj_weight":
+        return (hidden, q_dim)
+    sequence_hidden_names = {
+        "hidden",
+        "mamba3_delta",
+        "m2rnn_hidden",
+        "m2rnn_delta",
+        "attention_hidden",
+        "hidden_after_mamba3",
+        "hidden_after_m2rnn",
+        "attention_out",
+    }
+    ungrad_name = (
+        str(buffer_name)[: -len("_grad")]
+        if str(buffer_name).endswith("_grad")
+        else str(buffer_name)
+    )
+    if (
+        canonical_name in sequence_hidden_names
+        or ungrad_name.endswith("_hidden")
+        or ungrad_name.endswith("_hidden_after")
+        or ungrad_name.endswith("_delta")
+        or ungrad_name.endswith("_out")
+    ):
+        return (1, shape_env.sequence_length, hidden)
+    return flat_shape
+
+
+def _direct_loop_indexed_buffer_ref(
+    buffer_name: str,
+    shape: Sequence[int],
+    loop_extent: int,
+    shape_env: PathCModelShapeEnv | None,
+) -> str:
+    if len(tuple(shape)) > 1:
+        return _row_major_buffer_ref(_safe_identifier(buffer_name), shape)
+    return _loop_indexed_buffer_ref(buffer_name, shape, loop_extent, shape_env)
+
+
+def _row_major_buffer_ref(name: str, shape: Sequence[int]) -> str:
+    dims = tuple(int(dim) for dim in shape)
+    flat_extent = _flattened_extent(dims)
+    if len(dims) == 2:
+        return (
+            f"{name}[(i % {flat_extent}) // {dims[1]}, "
+            f"(i % {flat_extent}) % {dims[1]}]"
+        )
+    if len(dims) == 3:
+        if dims[0] == 1:
+            return f"{name}[0, i // {dims[2]}, i % {dims[2]}]"
+        inner = dims[1] * dims[2]
+        return (
+            f"{name}[(i % {flat_extent}) // {inner}, "
+            f"((i % {flat_extent}) // {dims[2]}) % {dims[1]}, "
+            f"(i % {flat_extent}) % {dims[2]}]"
+        )
+    return f"{name}[i % {flat_extent}]"
 
 
 def _physical_abi_bank_name(dtype: str) -> str:
@@ -1598,81 +1745,82 @@ def _append_row_phased_hidden_body(
             f"{indent * 2}{_scratch_name(node, 'row_total_grad')} = "
             "T.alloc_local((1,), \"float32\")"
         )
-    body.append(f"{indent * 2}for row in T.serial(0, {sequence_length}):")
-    for node, descriptor, fragment in fwd_items:
-        if _is_row_phased_mamba3(node, descriptor, shape_env):
-            _append_row_phased_mamba3_body(
+    if fwd_items:
+        body.append(f"{indent * 2}for row in T.serial(0, {sequence_length}):")
+        for node, descriptor, fragment in fwd_items:
+            if _is_row_phased_mamba3(node, descriptor, shape_env):
+                _append_row_phased_mamba3_body(
+                    body,
+                    node=node,
+                    descriptor=descriptor,
+                    dtype_by_buffer=dtype_by_buffer,
+                    access_by_buffer=access_by_buffer,
+                    shape_env=shape_env,
+                    thread_count=thread_count,
+                    indent=indent,
+                )
+                continue
+            if node.op_name == "residual_rmsnorm":
+                _append_row_phased_residual_rmsnorm_body(
+                    body,
+                    node=node,
+                    descriptor=descriptor,
+                    dtype_by_buffer=dtype_by_buffer,
+                    access_by_buffer=access_by_buffer,
+                    hidden_size=hidden_size,
+                    thread_count=thread_count,
+                    indent=indent,
+                )
+                continue
+            if _is_row_phased_attention_qkv_projection(node, shape_env):
+                _append_row_phased_attention_qkv_projection_body(
+                    body,
+                    node=node,
+                    descriptor=descriptor,
+                    dtype_by_buffer=dtype_by_buffer,
+                    access_by_buffer=access_by_buffer,
+                    shape_env=shape_env,
+                    thread_count=thread_count,
+                    indent=indent,
+                )
+                continue
+            if _is_row_phased_m2rnn(node, descriptor, shape_env):
+                _append_row_phased_m2rnn_body(
+                    body,
+                    node=node,
+                    descriptor=descriptor,
+                    dtype_by_buffer=dtype_by_buffer,
+                    access_by_buffer=access_by_buffer,
+                    shape_env=shape_env,
+                    thread_count=thread_count,
+                    indent=indent,
+                )
+                continue
+            if _is_row_phased_sparse_mla_fp8_apply(node, shape_env):
+                _append_row_phased_sparse_mla_fp8_apply_body(
+                    body,
+                    node=node,
+                    descriptor=descriptor,
+                    dtype_by_buffer=dtype_by_buffer,
+                    access_by_buffer=access_by_buffer,
+                    shape_env=shape_env,
+                    thread_count=thread_count,
+                    indent=indent,
+                )
+                continue
+            body.append(
+                f"{indent * 3}for i in T.serial(row * {hidden_size} + lane, "
+                f"(row + 1) * {hidden_size}, step={thread_count}):"
+            )
+            _append_descriptor_node_comments(
                 body,
                 node=node,
                 descriptor=descriptor,
-                dtype_by_buffer=dtype_by_buffer,
-                access_by_buffer=access_by_buffer,
-                shape_env=shape_env,
-                thread_count=thread_count,
-                indent=indent,
+                indent=indent * 4,
             )
-            continue
-        if node.op_name == "residual_rmsnorm":
-            _append_row_phased_residual_rmsnorm_body(
-                body,
-                node=node,
-                descriptor=descriptor,
-                dtype_by_buffer=dtype_by_buffer,
-                access_by_buffer=access_by_buffer,
-                hidden_size=hidden_size,
-                thread_count=thread_count,
-                indent=indent,
-            )
-            continue
-        if _is_row_phased_attention_qkv_projection(node, shape_env):
-            _append_row_phased_attention_qkv_projection_body(
-                body,
-                node=node,
-                descriptor=descriptor,
-                dtype_by_buffer=dtype_by_buffer,
-                access_by_buffer=access_by_buffer,
-                shape_env=shape_env,
-                thread_count=thread_count,
-                indent=indent,
-            )
-            continue
-        if _is_row_phased_m2rnn(node, descriptor, shape_env):
-            _append_row_phased_m2rnn_body(
-                body,
-                node=node,
-                descriptor=descriptor,
-                dtype_by_buffer=dtype_by_buffer,
-                access_by_buffer=access_by_buffer,
-                shape_env=shape_env,
-                thread_count=thread_count,
-                indent=indent,
-            )
-            continue
-        if _is_row_phased_sparse_mla_fp8_apply(node, shape_env):
-            _append_row_phased_sparse_mla_fp8_apply_body(
-                body,
-                node=node,
-                descriptor=descriptor,
-                dtype_by_buffer=dtype_by_buffer,
-                access_by_buffer=access_by_buffer,
-                shape_env=shape_env,
-                thread_count=thread_count,
-                indent=indent,
-            )
-            continue
-        body.append(
-            f"{indent * 3}for i in T.serial(row * {hidden_size} + lane, "
-            f"(row + 1) * {hidden_size}, step={thread_count}):"
-        )
-        _append_descriptor_node_comments(
-            body,
-            node=node,
-            descriptor=descriptor,
-            indent=indent * 4,
-        )
-        for statement in fragment.statements:
-            body.append(f"{indent * 4}{statement}")
-        body.append(f"{indent * 3}T.sync_threads()")
+            for statement in fragment.statements:
+                body.append(f"{indent * 4}{statement}")
+            body.append(f"{indent * 3}T.sync_threads()")
     if not bwd_items:
         return
     row_phased_bwd_items = tuple(
@@ -7375,6 +7523,169 @@ def plan_path_c_fusion_schedule_for_region(
     )
 
 
+def plan_path_c_direct_fusion_chain_for_region(
+    region: PathCFusionRegion,
+    *,
+    include_backward: bool = True,
+    max_kernel_buffers: int = DESCRIPTOR_PORTABLE_KERNEL_BUFFER_LIMIT,
+    registry: PathCFusionScheduleRegistry | None = None,
+) -> PathCFusionScheduleChainPlan:
+    """Greedily split a Path C region into direct-buffer fused segments.
+
+    This is the generic escape hatch when a single direct-buffer train-block
+    would exceed Metal's portable buffer slot limit.  It never falls back to
+    dtype-bank packing; segments that cannot be expressed with direct buffers
+    under ``max_kernel_buffers`` are reported as blocked.
+    """
+
+    if not isinstance(region, PathCFusionRegion):
+        raise TypeError("region must be PathCFusionRegion")
+    if max_kernel_buffers <= 0:
+        raise ValueError("max_kernel_buffers must be positive")
+    working_region = (
+        build_path_c_aot_autograd_region(region)
+        if include_backward
+        and not any(node.op_name.endswith("_bwd") for node in region.nodes)
+        else region
+    )
+    nodes = tuple(working_region.nodes)
+    segments: list[PathCFusionScheduleChainSegment] = []
+    start = 0
+    selector = registry or default_path_c_fusion_schedule_registry()
+    while start < len(nodes):
+        best: PathCFusionScheduleChainSegment | None = None
+        first_failure: str | None = None
+        for end in range(start + 1, len(nodes) + 1):
+            candidate_region = _subregion_from_nodes(
+                working_region,
+                start=start,
+                end=end,
+                name=f"{working_region.name}_chain_{start}_{end}",
+            )
+            target = selector.select(candidate_region)
+            if target is None:
+                first_failure = (
+                    f"no descriptor target for op signature "
+                    f"{tuple(node.op_name for node in candidate_region.nodes)!r}"
+                )
+                break
+            direct_target = _target_with_physical_abi_policy(
+                target,
+                candidate_region,
+                DESCRIPTOR_PHYSICAL_ABI_POLICY_DIRECT,
+            )
+            try:
+                parameter_count = _kernel_parameter_count_for_target(
+                    candidate_region,
+                    direct_target,
+                )
+            except Exception as exc:
+                first_failure = str(exc)
+                if best is None:
+                    break
+                continue
+            if parameter_count > max_kernel_buffers:
+                first_failure = (
+                    f"direct-buffer segment needs {parameter_count} kernel "
+                    f"buffers, above limit {max_kernel_buffers}"
+                )
+                break
+            plan = compile_path_c_region(
+                candidate_region,
+                schedule_template=_attested_schedule_template_for_target(
+                    direct_target,
+                    candidate_region,
+                ),
+                schedule_name=direct_target.schedule_name,
+                schedule_status=direct_target.schedule_status,
+            )
+            if not isinstance(plan, FusionCompilePlan):
+                raise TypeError("compile_path_c_region unexpectedly returned an artifact")
+            best = PathCFusionScheduleChainSegment(
+                index=len(segments),
+                node_start=start,
+                node_end=end,
+                region=candidate_region,
+                plan=plan,
+                schedule_target=direct_target,
+                kernel_parameter_count=parameter_count,
+                physical_abi_policy=DESCRIPTOR_PHYSICAL_ABI_POLICY_DIRECT,
+                status="ok",
+                reason="direct-buffer segment fits the portable Metal buffer limit",
+            )
+        if best is not None:
+            segments.append(best)
+            start = best.node_end
+            continue
+        blocked_region = _subregion_from_nodes(
+            working_region,
+            start=start,
+            end=start + 1,
+            name=f"{working_region.name}_chain_{start}_{start + 1}",
+        )
+        segments.append(
+            PathCFusionScheduleChainSegment(
+                index=len(segments),
+                node_start=start,
+                node_end=start + 1,
+                region=blocked_region,
+                plan=None,
+                schedule_target=None,
+                kernel_parameter_count=None,
+                physical_abi_policy=DESCRIPTOR_PHYSICAL_ABI_POLICY_DIRECT,
+                status="blocked",
+                reason=first_failure or "direct-buffer segment planning failed",
+            )
+        )
+        start += 1
+    blocked = tuple(segment for segment in segments if segment.status != "ok")
+    return PathCFusionScheduleChainPlan(
+        source_region=working_region,
+        max_kernel_buffers=max_kernel_buffers,
+        segments=tuple(segments),
+        status="ready" if not blocked else "blocked",
+        reason=(
+            "all chain segments fit direct-buffer portable Metal limits"
+            if not blocked
+            else "at least one chain segment cannot be expressed as direct buffers"
+        ),
+    )
+
+
+def plan_path_c_direct_fusion_chains_for_model(
+    model: Any,
+    *,
+    region_prefix: str | None = None,
+    include_backward: bool = True,
+    min_route_bricks: int = 2,
+    max_kernel_buffers: int = DESCRIPTOR_PORTABLE_KERNEL_BUFFER_LIMIT,
+    registry: PathCFusionScheduleRegistry | None = None,
+) -> tuple[PathCFusionScheduleChainPlan, ...]:
+    """Plan direct-buffer fused schedule chains for every supported model region.
+
+    This is the direct-buffer sibling of
+    ``plan_path_c_fusion_schedules_for_model``: discover regions from the
+    model's brick graph first, then split each discovered region into generic
+    direct-buffer segments.  It does not consult named acceptance fixtures.
+    """
+
+    regions = build_path_c_model_regions_from_model(
+        model,
+        region_prefix=region_prefix,
+        include_backward=False,
+        min_route_bricks=min_route_bricks,
+    )
+    return tuple(
+        plan_path_c_direct_fusion_chain_for_region(
+            region,
+            include_backward=include_backward,
+            max_kernel_buffers=max_kernel_buffers,
+            registry=registry,
+        )
+        for region in regions
+    )
+
+
 def plan_path_c_fusion_schedules_for_model(
     model: Any,
     *,
@@ -7404,6 +7715,72 @@ def plan_path_c_fusion_schedules_for_model(
         )
         for region in regions
     )
+
+
+def _subregion_from_nodes(
+    region: PathCFusionRegion,
+    *,
+    start: int,
+    end: int,
+    name: str,
+) -> PathCFusionRegion:
+    selected_nodes = tuple(region.nodes[start:end])
+    if not selected_nodes:
+        raise ValueError("subregion node slice must not be empty")
+    metadata = {
+        **dict(region.metadata),
+        "path_c_chain_source_region": region.name,
+        "path_c_chain_node_start": start,
+        "path_c_chain_node_end": end,
+    }
+    return build_path_c_fusion_region(
+        region_name=name,
+        surfaces=tuple(
+            FusionKernelSurface.path_c(
+                name=node.name,
+                op_name=node.op_name,
+                inputs=node.inputs,
+                outputs=node.outputs,
+                backward=node.backward,
+                backend=node.backend,
+            )
+            for node in selected_nodes
+        ),
+        z3_sync=region.z3_sync,
+        metadata=metadata,
+    )
+
+
+def _target_with_physical_abi_policy(
+    target: PathCFusionScheduleTarget,
+    region: PathCFusionRegion,
+    physical_abi_policy: str,
+) -> PathCFusionScheduleTarget:
+    validated_policy = _validated_physical_abi_policy(physical_abi_policy)
+    if target.physical_abi_policy == validated_policy:
+        return target
+    shape_env = _shape_env_for_region(region)
+    return replace(
+        target,
+        schedule_template=make_path_c_descriptor_schedule_template(
+            target.brick_descriptors,
+            entry_symbol=getattr(region, "entry_symbol", None)
+            or getattr(region, "name", None),
+            buffer_extent=target.buffer_extent,
+            shape_env=shape_env,
+            internal_buffer_policy=target.internal_buffer_policy,
+            loop_policy=target.loop_policy,
+            physical_abi_policy=validated_policy,
+        ),
+        physical_abi_policy=validated_policy,
+    )
+
+
+def _kernel_parameter_count_for_target(
+    region: PathCFusionRegion,
+    target: PathCFusionScheduleTarget,
+) -> int:
+    return len(tuple(target.schedule_template(region).params))
 
 
 def _attested_schedule_template_for_target(

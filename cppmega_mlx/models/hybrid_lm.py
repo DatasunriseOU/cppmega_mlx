@@ -8,10 +8,20 @@ implementation and does not claim production kernel performance.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import TYPE_CHECKING, Literal, TypedDict, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Literal,
+    Mapping,
+    Sequence,
+    TypedDict,
+    cast,
+)
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.utils import tree_flatten
 
 from cppmega_mlx.data.packing import mlx_document_boundary_mask
 from cppmega_mlx.inference.engine import ContiguousKVCache, kv_cache_position
@@ -29,6 +39,7 @@ from cppmega_mlx.nn.moe import ActivationName, MoEConfig, ReferenceMoE
 from cppmega_mlx.nn.ngram_hash import NgramHashEmbedding
 from cppmega_mlx.nn.structure_embedding import CppMegaStructureEmbedding
 from cppmega_mlx.recipes.pattern import ExpandedNamPattern, NamLayer, expand_nam_pattern
+from cppmega_mlx.runtime.path_c_physical_abi import PathCLogicalBufferOwner
 from cppmega_mlx.runtime.kernel_policy import KernelPath, selected_path
 from cppmega_mlx.training.mtp import MinimalMTPHead, MTPLossConfig
 
@@ -44,6 +55,7 @@ HybridBlockModule = (
     | EngramBranch
     | ConceptBlock
 )
+PathCActivationProbe = Callable[[Mapping[str, Any]], None]
 
 _ROUTE_SYMBOL_BACKENDS: dict[str, HybridBackend] = {
     "A": "attention",
@@ -66,6 +78,41 @@ class StructureEmbeddingConfigKwargs(TypedDict):
     num_node_types: int
     active_components: str
     bottleneck_dim: int
+
+
+class PathCActivationBufferCapture:
+    """Opt-in Path C activation owner that stores references, not copies."""
+
+    def __init__(
+        self,
+        aliases: Mapping[str, str | Sequence[str]] | None = None,
+        *,
+        owner_name: str = "HybridTinyLM.path_c_activation_capture",
+    ) -> None:
+        self.owner_name = owner_name
+        self.aliases = {
+            str(source): (str(target),)
+            if isinstance(target, str)
+            else tuple(str(item) for item in target)
+            for source, target in (aliases or {}).items()
+        }
+        self.buffers: dict[str, mx.array] = {}
+        self.events: list[Mapping[str, Any]] = []
+
+    def __call__(self, event: Mapping[str, Any]) -> None:
+        tensor = event.get("tensor")
+        if not isinstance(tensor, mx.array):
+            return
+        logical_names = tuple(str(name) for name in event.get("logical_names", ()))
+        for name in logical_names:
+            self.buffers[name] = tensor
+            for alias in self.aliases.get(name, ()):
+                self.buffers[alias] = tensor
+        self.events.append(event)
+
+    def clear(self) -> None:
+        self.buffers.clear()
+        self.events.clear()
 
 
 @dataclass(frozen=True)
@@ -408,6 +455,8 @@ class HybridTinyBlock(nn.Module):
     def __init__(self, layer: NamLayer, config: HybridTinyConfig):
         super().__init__()
         self.layer = layer
+        self.path_c_layer_index = layer.number - 1
+        self.path_c_brick_name = f"layer_{self.path_c_layer_index}_{layer.symbol.lower()}"
         self.norm = nn.RMSNorm(config.hidden_size)
         mhc_config = config.mhc_config()
         self.mhc: ManifoldBranchMixer | None = (
@@ -441,6 +490,40 @@ class HybridTinyBlock(nn.Module):
             self.block = ConceptBlock(config.concept_config())
         else:  # pragma: no cover - expand_nam_pattern rejects this first.
             raise ValueError(f"unsupported hybrid layer symbol {layer.symbol!r}")
+
+    def _path_c_activation_probe(self) -> PathCActivationProbe | None:
+        probe = getattr(self, "_path_c_activation_probe_callback", None)
+        return probe if callable(probe) else None
+
+    def _path_c_activation_logical_names(self, name: str) -> tuple[str, ...]:
+        brick_name = str(getattr(self, "path_c_profile_brick_name", self.path_c_brick_name))
+        if name == "hidden":
+            return (f"{brick_name}_hidden",)
+        if name == "normed":
+            return (f"{brick_name}_residual_norm_hidden",)
+        if name == "delta":
+            return (f"{brick_name}_delta",)
+        if name == "hidden_after":
+            return (f"{brick_name}_hidden_after",)
+        return (f"{brick_name}_{name}",)
+
+    def _emit_path_c_activation(self, name: str, tensor: mx.array) -> None:
+        probe = self._path_c_activation_probe()
+        if probe is None:
+            return
+        probe(
+            {
+                "name": name,
+                "logical_names": self._path_c_activation_logical_names(name),
+                "tensor": tensor,
+                "layer_number": self.layer.number,
+                "layer_index": self.path_c_layer_index,
+                "route_symbol": self.layer.symbol,
+                "backend": self.backend,
+                "brick_name": self.path_c_brick_name,
+                "profile_brick_name": getattr(self, "path_c_profile_brick_name", None),
+            }
+        )
 
     @property
     def attention_block(self) -> CausalSelfAttention | None:
@@ -477,6 +560,7 @@ class HybridTinyBlock(nn.Module):
     ) -> mx.array:
         self.validate_backend()
         residual = hidden_states
+        self._emit_path_c_activation("hidden", residual)
         delta = self.route_delta(
             hidden_states,
             mask,
@@ -484,7 +568,9 @@ class HybridTinyBlock(nn.Module):
             attention_layer_idx=attention_layer_idx,
             doc_ids=doc_ids,
         )
+        self._emit_path_c_activation("delta", delta)
         updated = residual + delta
+        self._emit_path_c_activation("hidden_after", updated)
         if self.mhc is not None:
             return self.mhc([updated, residual])
         return updated
@@ -542,6 +628,7 @@ class HybridTinyBlock(nn.Module):
         if kv_cache is not None and self.backend != "attention":
             raise ValueError("kv_cache may only be passed to attention route blocks")
         x = self.norm(hidden_states)
+        self._emit_path_c_activation("normed", x)
         if self.backend == "attention":
             delta = cast(CausalSelfAttention, self.block)(
                 x,
@@ -625,11 +712,189 @@ class HybridTinyLM(nn.Module):
     def path_c_bricks(self) -> tuple[dict[str, str], ...]:
         return tuple(
             {
-                "name": f"layer_{index}_{block.layer.symbol.lower()}",
+                "name": str(
+                    getattr(
+                        block,
+                        "path_c_profile_brick_name",
+                        f"layer_{index}_{block.layer.symbol.lower()}",
+                    )
+                ),
                 "kind": block.backend,
                 "route_symbol": block.layer.symbol,
+                **(
+                    {
+                        "attention_qkv_has_bias": str(
+                            bool(block.attention_block.config.bias)
+                        ).lower(),
+                        "attention_out_proj_has_bias": str(
+                            bool(block.attention_block.config.bias)
+                        ).lower(),
+                    }
+                    if block.attention_block is not None
+                    else {}
+                ),
             }
             for index, block in enumerate(self.layers)
+        )
+
+    def attach_path_c_activation_probe(self, probe: PathCActivationProbe) -> int:
+        """Install an explicit zero-copy activation probe on route blocks."""
+
+        if not callable(probe):
+            raise TypeError("probe must be callable")
+        for block in self.layers:
+            block._path_c_activation_probe_callback = probe  # type: ignore[attr-defined]
+        return len(self.layers)
+
+    def detach_path_c_activation_probe(self) -> None:
+        """Remove the explicit Path C activation probe from all route blocks."""
+
+        for block in self.layers:
+            if hasattr(block, "_path_c_activation_probe_callback"):
+                delattr(block, "_path_c_activation_probe_callback")
+
+    def path_c_parameter_logical_aliases(self) -> dict[str, tuple[str, ...]]:
+        """Map MLX parameter tree names to Path C logical input names."""
+
+        parameter_names = {
+            name
+            for name, value in tree_flatten(self.trainable_parameters())
+            if isinstance(value, mx.array)
+        }
+        aliases: dict[str, tuple[str, ...]] = {}
+
+        def add(
+            layer_index: int,
+            parameter_suffix: str,
+            logical_suffix: str,
+            *,
+            block: HybridTinyBlock,
+        ) -> None:
+            parameter_name = f"layers.{layer_index}.{parameter_suffix}"
+            if parameter_name not in parameter_names:
+                return
+            logical_prefixes = [block.path_c_brick_name]
+            profile_name = getattr(block, "path_c_profile_brick_name", None)
+            if profile_name is not None and profile_name not in logical_prefixes:
+                logical_prefixes.append(str(profile_name))
+            aliases[parameter_name] = tuple(
+                f"{prefix}_{logical_suffix}" for prefix in logical_prefixes
+            )
+
+        for index, block in enumerate(self.layers):
+            add(
+                index,
+                "norm.weight",
+                "residual_norm_weight",
+                block=block,
+            )
+            if block.backend == "mamba3":
+                for parameter_suffix, logical_suffix in (
+                    ("block.in_proj.weight", "mamba3_in_proj_weight"),
+                    ("block.out_proj.weight", "mamba3_out_proj_weight"),
+                    ("block.conv_weight", "mamba3_conv_weight"),
+                    ("block.conv_bias", "mamba3_conv_bias"),
+                    ("block.dt_bias", "mamba3_dt_bias"),
+                    ("block.B_norm_weight", "mamba3_B_norm_weight"),
+                    ("block.C_norm_weight", "mamba3_C_norm_weight"),
+                    ("block.B_bias", "mamba3_B_bias"),
+                    ("block.C_bias", "mamba3_C_bias"),
+                    ("block.D", "mamba3_D"),
+                ):
+                    add(index, parameter_suffix, logical_suffix, block=block)
+            elif block.backend == "m2rnn":
+                for parameter_suffix, logical_suffix in (
+                    ("block.in_proj.weight", "m2rnn_in_proj_weight"),
+                    ("block.out_proj.weight", "m2rnn_out_proj_weight"),
+                    ("block.conv_weight", "m2rnn_conv_weight"),
+                    ("block.conv_bias", "m2rnn_conv_bias"),
+                    ("block.g_norm.weight", "m2rnn_g_norm_weight"),
+                    ("block.state_weight", "m2rnn_state_weight"),
+                    ("block.A_log", "m2rnn_A_log"),
+                    ("block.dt_bias", "m2rnn_dt_bias"),
+                    ("block.D", "m2rnn_D"),
+                ):
+                    add(index, parameter_suffix, logical_suffix, block=block)
+            elif block.backend == "attention":
+                for parameter_suffix, logical_suffix in (
+                    (
+                        "block.q_proj.weight",
+                        "qkv_projection_attention_q_proj_weight",
+                    ),
+                    (
+                        "block.q_proj.bias",
+                        "qkv_projection_attention_q_proj_bias",
+                    ),
+                    (
+                        "block.sparse_kv_proj.weight",
+                        "qkv_projection_attention_sparse_kv_proj_weight",
+                    ),
+                    (
+                        "block.sparse_kv_proj.bias",
+                        "qkv_projection_attention_sparse_kv_proj_bias",
+                    ),
+                    (
+                        "block.rope_inv_freq",
+                        "qkv_projection_attention_rope_inv_freq",
+                    ),
+                    (
+                        "block.out_proj.weight",
+                        "sparse_mla_fp8_apply_attention_out_proj_weight",
+                    ),
+                    (
+                        "block.out_proj.bias",
+                        "sparse_mla_fp8_apply_attention_out_proj_bias",
+                    ),
+                ):
+                    add(index, parameter_suffix, logical_suffix, block=block)
+
+        return aliases
+
+    def path_c_parameter_gradient_aliases(self) -> dict[str, tuple[str, ...]]:
+        """Map MLX parameter-grad tree names to Path C logical grad names."""
+
+        return {
+            f"{parameter_name}_grad": tuple(
+                f"{logical_name}_grad" for logical_name in logical_names
+            )
+            for parameter_name, logical_names in (
+                self.path_c_parameter_logical_aliases()
+            ).items()
+        }
+
+    def make_path_c_direct_fusion_chain_logical_buffer_owner(
+        self,
+        *,
+        owner_name: str | None = None,
+    ) -> PathCLogicalBufferOwner:
+        """Expose model parameter tensors to direct Path C chain binding.
+
+        The owner only records existing MLX array references. It deliberately
+        does not flatten, cast, or synthesize missing constants/state buffers.
+        """
+
+        parameters = {
+            name: value
+            for name, value in tree_flatten(self.trainable_parameters())
+            if isinstance(value, mx.array)
+        }
+        buffers: dict[str, mx.array] = {}
+        for parameter_name, logical_names in (
+            self.path_c_parameter_logical_aliases()
+        ).items():
+            tensor = parameters.get(parameter_name)
+            if tensor is None:
+                continue
+            for logical_name in logical_names:
+                buffers[logical_name] = tensor
+
+        profile_name = str(
+            getattr(self, "path_c_profile_name", "HybridTinyLM")
+        )
+        return PathCLogicalBufferOwner(
+            owner_name=owner_name
+            or f"{profile_name}.path_c_model_parameter_buffers",
+            buffers=buffers,
         )
 
     def path_c_fusion_regions(
@@ -646,7 +911,9 @@ class HybridTinyLM(nn.Module):
 
         return build_path_c_model_regions_from_model(
             self,
-            region_prefix="hybrid_tiny_lm_path_c",
+            region_prefix=str(
+                getattr(self, "path_c_region_prefix", "hybrid_tiny_lm_path_c")
+            ),
             include_backward=include_backward,
             min_route_bricks=min_route_bricks,
         )
@@ -852,6 +1119,8 @@ __all__ = [
     "HybridAttentionMode",
     "HybridBackend",
     "HybridBlockModule",
+    "PathCActivationBufferCapture",
+    "PathCActivationProbe",
     "HybridTinyBlock",
     "HybridTinyConfig",
     "HybridTinyLM",

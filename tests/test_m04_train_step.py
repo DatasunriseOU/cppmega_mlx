@@ -6,7 +6,6 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import mlx.core as mx
@@ -15,8 +14,12 @@ import mlx.optimizers as optim
 import pytest
 
 import scripts.m04_train_step as m04_train_step
+from cppmega_mlx.models.hybrid_lm import PathCActivationBufferCapture
 from cppmega_mlx.recipes.model_factory import build_local_gb10_quarter_tiny_smoke_model
-from cppmega_mlx.runtime.path_c_physical_abi import make_physical_abi_bank_owner
+from cppmega_mlx.runtime.path_c_physical_abi import (
+    PathCLogicalBufferOwner,
+    make_physical_abi_bank_owner,
+)
 from cppmega_mlx.runtime.path_c_fusion_schedules import (
     PATH_C_DESCRIPTOR_SCHEDULE_GENERATOR,
 )
@@ -1627,9 +1630,12 @@ def test_fp8_path_c_dsa_attention_route_metadata_is_configured(
         "local_gb10_quarter_brick_10_M_delta_grad",
     ]:
         assert expected_internal in required_internal_buffers
+    assert route["path_c_fusion"]["production_compile_receipt"]["status"] == (
+        "verified"
+    )
+    assert route["path_c_fusion"]["production_compile_receipt"]["verified"] is True
     assert [blocker["kind"] for blocker in route["path_c_fusion"]["schedule_blockers"]] == [
         "selected_model_schedule_not_default",
-        "production_schedule_not_compile_verified",
         "fused_train_block_runtime_not_bound",
         "production_1b_matrix_profile_missing",
     ]
@@ -1772,12 +1778,62 @@ def _model_route_physical_bank_owner(model: Any | None = None):
     )
     assert scheduled.schedule_target is not None
     prim_func = scheduled.schedule_target.schedule_template(scheduled.region)
+    owner_prefix = (
+        str(getattr(model, "path_c_profile_name"))
+        if model is not None and getattr(model, "path_c_profile_name", None)
+        else "local_gb10_quarter"
+    )
     return make_physical_abi_bank_owner(
-        "HybridTinyLM.path_c_physical_abi_banks",
+        f"{owner_prefix}.path_c_physical_abi_banks",
         getattr(prim_func, "_cppmega_path_c_physical_buffer_abi_map"),
         getattr(prim_func, "_cppmega_path_c_physical_buffer_abi_shapes"),
         _model_route_physical_bank_buffers(model),
     )
+
+
+def _model_route_direct_chain(model: Any | None = None):
+    regions = _model_route_regions(model)
+    selected_region = m04_train_step._select_path_c_model_route_region(regions)
+    assert selected_region is not None
+    scheduled = m04_train_step.plan_path_c_fusion_schedule_for_region(
+        selected_region,
+        include_backward=True,
+    )
+    return m04_train_step.plan_path_c_direct_fusion_chain_for_region(
+        scheduled.region,
+        include_backward=True,
+    )
+
+
+def _model_route_direct_chain_logical_buffers(
+    model: Any | None = None,
+) -> dict[str, _PathCBankLike]:
+    buffers: dict[str, _PathCBankLike] = {}
+    chain = _model_route_direct_chain(model)
+    assert chain.status == "ready"
+    for segment in chain.segments:
+        target = segment.schedule_target
+        assert target is not None
+        prim_func = target.schedule_template(segment.region)
+        abi_map = getattr(prim_func, "_cppmega_path_c_physical_buffer_abi_map")
+        abi_shapes = getattr(prim_func, "_cppmega_path_c_physical_buffer_abi_shapes")
+        bridge = m04_train_step.plan_physical_abi_runtime_bridge(abi_map, abi_shapes)
+        assert bridge["status"] == "direct_logical_tensor_binding_supported"
+        for name in bridge["required_bank_buffers"]:
+            candidate = _PathCBankLike(
+                tuple(abi_shapes[name]),
+                bridge["bank_dtypes"][name],
+            )
+            existing = buffers.setdefault(name, candidate)
+            assert existing.shape == candidate.shape
+            assert existing.dtype == candidate.dtype
+    return buffers
+
+
+def _model_route_direct_chain_artifacts(
+    model: Any | None = None,
+) -> tuple[Any, ...]:
+    return tuple(lambda *args: None for _ in _model_route_direct_chain(model).segments)
 
 
 def test_path_c_fusion_runtime_binding_accepts_model_owned_physical_banks(
@@ -1798,11 +1854,14 @@ def test_path_c_fusion_runtime_binding_accepts_model_owned_physical_banks(
         region=scheduled.region,
         schedule_target=scheduled.schedule_target,
         bank_buffers=bank_buffers,
-        bank_buffer_owner="HybridTinyLM.path_c_physical_abi_banks",
+        bank_buffer_owner="local_gb10_quarter.path_c_physical_abi_banks",
+        fused_artifact=lambda *args: None,
     )
 
     assert payload["status"] == "ok"
     assert payload["binding_status"] == "ok"
+    assert payload["physical_abi_binding_ready"] is True
+    assert payload["fused_artifact_bound"] is True
     assert payload["runtime_uses_fused_train_block"] is True
     assert payload["missing_bank_buffers"] == []
     assert payload["provided_bank_buffers"] == [
@@ -1810,7 +1869,7 @@ def test_path_c_fusion_runtime_binding_accepts_model_owned_physical_banks(
         "path_c_uint8_abi_bank",
         "path_c_int32_abi_bank",
     ]
-    assert payload["bank_buffer_owner"] == "HybridTinyLM.path_c_physical_abi_banks"
+    assert payload["bank_buffer_owner"] == "local_gb10_quarter.path_c_physical_abi_banks"
     assert payload["hidden_packing_performed"] is False
 
 
@@ -1831,16 +1890,63 @@ def test_path_c_fusion_runtime_binding_accepts_bank_owner_object(
         region=scheduled.region,
         schedule_target=scheduled.schedule_target,
         bank_owner=_model_route_physical_bank_owner(),
+        fused_artifact=lambda *args: None,
     )
 
     assert payload["status"] == "ok"
+    assert payload["physical_abi_binding_ready"] is True
+    assert payload["fused_artifact_bound"] is True
     assert payload["runtime_uses_fused_train_block"] is True
-    assert payload["bank_buffer_owner"] == "HybridTinyLM.path_c_physical_abi_banks"
+    assert payload["bank_buffer_owner"] == "local_gb10_quarter.path_c_physical_abi_banks"
     assert payload["provided_bank_buffers"] == [
         "path_c_float32_abi_bank",
         "path_c_uint8_abi_bank",
         "path_c_int32_abi_bank",
     ]
+
+
+def test_fp8_path_c_training_route_selects_direct_chain_when_segments_are_bound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CPPMEGA_PATH_C_FUSION", "auto")
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--synthetic",
+            "--dtype",
+            "fp8_path_c",
+            "--pattern",
+            "A",
+            "--depth",
+            "1",
+            "--dsa-a-layer-ranks",
+            "0",
+            "--output",
+            str(tmp_path / "receipt.json"),
+        ]
+    )
+    config = m04_train_step.config_from_args(args, data_path=tmp_path / "tokens.npz")
+
+    route = m04_train_step.fp8_path_c_training_route_payload(
+        config,
+        direct_chain_artifacts=_model_route_direct_chain_artifacts(),
+        direct_chain_logical_buffers=_model_route_direct_chain_logical_buffers(),
+        direct_chain_logical_buffer_owner="local_gb10_quarter.path_c_direct_buffers",
+    )
+
+    direct_chain = route["path_c_fusion"]["direct_chained_fusion"]
+    assert direct_chain["runtime_binding"]["status"] == "ok"
+    assert direct_chain["runtime_binding"]["runtime_uses_direct_fusion_chain"] is True
+    assert direct_chain["runtime_binding"]["segment_count"] == 4
+    assert route["status"] == m04_train_step.FP8_PATH_C_E2E_TRAINING_STATUS
+    assert route["end_to_end_training_status"] == (
+        m04_train_step.FP8_PATH_C_E2E_TRAINING_STATUS
+    )
+    assert route["full_end_to_end_training_available"] is True
+    assert route["selected_action"] == "run_path_c_direct_fusion_chain_route"
+    assert route["direct_mx_array_artifact_call_status"] == (
+        "m04_uses_direct_fusion_chain_route"
+    )
 
 
 def test_fp8_path_c_training_route_keeps_split_until_fused_artifact_is_bound(
@@ -1868,18 +1974,57 @@ def test_fp8_path_c_training_route_keeps_split_until_fused_artifact_is_bound(
     route = m04_train_step.fp8_path_c_training_route_payload(
         config,
         bank_buffers=_model_route_physical_bank_buffers(),
-        bank_buffer_owner="HybridTinyLM.path_c_physical_abi_banks",
+        bank_buffer_owner="local_gb10_quarter.path_c_physical_abi_banks",
     )
 
     binding = route["path_c_fusion"]["runtime_training_binding"]
     assert binding["physical_abi_binding_ready"] is True
     assert binding["fused_artifact_bound"] is False
     assert binding["runtime_uses_fused_train_block"] is False
+    direct_chain = route["path_c_fusion"]["direct_chained_fusion"]
+    assert direct_chain["status"] == "ready"
+    assert direct_chain["covers_full_region"] is True
+    audit = direct_chain["model_binding_audit"]
+    assert audit["status"] == "runtime_activation_owner_missing"
+    assert audit["requires_runtime_activation_owner"] is True
+    assert audit["runtime_activation_or_grad_count"] > 0
+    assert "hidden" in audit["runtime_activation_or_grad_examples"]
+    assert direct_chain["runtime_binding"]["status"] == (
+        m04_train_step.FP8_PATH_C_DIRECT_CHAIN_LOGICAL_BUFFERS_MISSING_STATUS
+    )
+    assert (
+        direct_chain["runtime_binding"]["runtime_uses_direct_fusion_chain"]
+        is False
+    )
     assert route["fused_train_block_runtime_available"] is False
     assert route["fused_train_block_blocker_type"] == (
         "fused_train_block_artifact_missing"
     )
     assert route["selected_action"] == "run_path_c_split_training_route"
+
+
+def test_path_c_fusion_payload_keeps_compile_blocker_without_matching_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CPPMEGA_PATH_C_FUSION", "auto")
+    monkeypatch.setenv(
+        "CPPMEGA_PATH_C_FUSION_COMPILE_RECEIPT",
+        str(tmp_path / "missing_receipt.json"),
+    )
+
+    payload = m04_train_step.path_c_fusion_payload(
+        model=build_local_gb10_quarter_tiny_smoke_model(),
+    )
+
+    assert payload["production_compile_receipt"]["status"] == "missing"
+    compile_blockers = [
+        blocker
+        for blocker in payload["schedule_blockers"]
+        if blocker["kind"] == "production_schedule_not_compile_verified"
+    ]
+    assert len(compile_blockers) == 1
+    assert compile_blockers[0]["compile_receipt_status"] == "missing"
 
 
 def test_fp8_path_c_training_route_selects_fused_action_when_banks_are_bound(
@@ -1907,10 +2052,12 @@ def test_fp8_path_c_training_route_selects_fused_action_when_banks_are_bound(
     route = m04_train_step.fp8_path_c_training_route_payload(
         config,
         bank_buffers=_model_route_physical_bank_buffers(),
-        bank_buffer_owner="HybridTinyLM.path_c_physical_abi_banks",
+        bank_buffer_owner="local_gb10_quarter.path_c_physical_abi_banks",
+        fused_artifact=lambda *args: None,
     )
 
     assert route["full_end_to_end_training_available"] is True
+    assert route["status"] == m04_train_step.FP8_PATH_C_E2E_TRAINING_STATUS
     assert route["fused_train_block_runtime_available"] is True
     assert route["fused_train_block_blocker_type"] is None
     assert route["direct_mx_array_artifact_call_status"] == (
@@ -1946,6 +2093,7 @@ def test_fp8_path_c_training_route_for_model_reads_bank_owner(
     config = m04_train_step.config_from_args(args, data_path=tmp_path / "tokens.npz")
     model = build_local_gb10_quarter_tiny_smoke_model()
     model.path_c_physical_abi_bank_owner = _model_route_physical_bank_owner(model)
+    model.path_c_fused_train_block_artifact = lambda *args: None
 
     route = m04_train_step.fp8_path_c_training_route_payload_for_model(
         config,
@@ -1954,7 +2102,7 @@ def test_fp8_path_c_training_route_for_model_reads_bank_owner(
 
     assert route["selected_action"] == "run_path_c_fused_train_block_route"
     assert route["path_c_fusion"]["runtime_training_binding"]["bank_buffer_owner"] == (
-        "HybridTinyLM.path_c_physical_abi_banks"
+        "local_gb10_quarter.path_c_physical_abi_banks"
     )
 
 
@@ -1987,15 +2135,153 @@ def test_fp8_path_c_training_route_for_model_uses_model_derived_regions(
     )
 
     graph = route["path_c_fusion"]["graph_construction"]
-    assert graph["input_model"] == "HybridTinyLM.path_c_bricks"
-    assert graph["selected_model_region"] == "hybrid_tiny_lm_path_c_10_12"
+    assert graph["input_model"] == "local_gb10_quarter.path_c_bricks"
+    assert graph["selected_model_region"] == "local_gb10_quarter_path_c_10_12"
     assert route["path_c_fusion"]["model_route_candidates"]["profile"] == (
-        "HybridTinyLM"
+        "local_gb10_quarter"
     )
     candidate = route["path_c_fusion"]["model_route_candidates"][
         "selected_candidate"
     ]
-    assert candidate["brick_names"] == ["layer_10_m", "layer_11_r", "layer_12_a"]
+    assert candidate["brick_names"] == [
+        "local_gb10_quarter_brick_10_M",
+        "local_gb10_quarter_brick_11_R",
+        "local_gb10_quarter_brick_12_A",
+    ]
+    audit = route["path_c_fusion"]["direct_chained_fusion"]["model_binding_audit"]
+    assert audit["status"] == "runtime_backward_or_state_owner_missing"
+    assert audit["required_logical_buffer_count"] == 81
+    assert audit["model_parameter_or_constant_count"] == 28
+    assert audit["runtime_activation_or_grad_count"] == 48
+    assert audit["backward_gradient_count"] == 37
+    assert audit["forward_activation_probe_surface_available"] is True
+    assert audit["parameter_gradient_probe_surface_available"] is True
+    assert audit["model_parameter_logical_owner_available"] is True
+    assert audit["model_parameter_logical_owner"] == (
+        "local_gb10_quarter.path_c_model_parameter_buffers"
+    )
+    assert audit["model_parameter_logical_owner_buffer_count"] > 0
+    assert audit["backward_gradient_parameter_alias_coverage_count"] == 24
+    assert audit["backward_gradient_uncovered_count"] == 13
+    assert audit["profile_brick_names_attached"] is True
+    assert audit["forward_activation_or_prepared_count"] > 0
+    assert audit["backward_gradient_count"] > 0
+    runtime_binding = route["path_c_fusion"]["direct_chained_fusion"][
+        "runtime_binding"
+    ]
+    assert runtime_binding["logical_buffer_owner"] == (
+        "local_gb10_quarter.path_c_model_parameter_buffers"
+    )
+    assert runtime_binding["provided_logical_buffer_count"] == 25
+    assert runtime_binding["shape_mismatch_count"] == 0
+    assert runtime_binding["shape_mismatch_buffers"] == []
+    assert runtime_binding["missing_logical_buffer_count"] == 56
+    assert (
+        "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_sm_scale"
+        in runtime_binding["missing_logical_buffers"]
+    )
+    assert runtime_binding["hidden_packing_performed"] is False
+
+
+def test_fp8_path_c_training_route_composes_model_and_runtime_logical_owners(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CPPMEGA_PATH_C_FUSION", "auto")
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--synthetic",
+            "--dtype",
+            "fp8_path_c",
+            "--pattern",
+            "A",
+            "--depth",
+            "1",
+            "--dsa-a-layer-ranks",
+            "0",
+            "--output",
+            str(tmp_path / "receipt.json"),
+        ]
+    )
+    config = m04_train_step.config_from_args(args, data_path=tmp_path / "tokens.npz")
+    model = build_local_gb10_quarter_tiny_smoke_model()
+    extra_owner = PathCLogicalBufferOwner(
+        "local_gb10_quarter.path_c_runtime_activation_buffers",
+        {
+            "hidden": _PathCBankLike((1, 512, 16), "float32"),
+            "hidden_grad": _PathCBankLike((1, 512, 16), "float32"),
+        },
+    )
+    model.path_c_direct_fusion_chain_logical_buffer_owners = (extra_owner,)
+
+    route = m04_train_step.fp8_path_c_training_route_payload_for_model(
+        config,
+        model,
+    )
+
+    runtime_binding = route["path_c_fusion"]["direct_chained_fusion"][
+        "runtime_binding"
+    ]
+    assert runtime_binding["logical_buffer_owner"] == (
+        "local_gb10_quarter.path_c_direct_fusion_chain_buffers"
+    )
+    assert runtime_binding["hidden_packing_performed"] is False
+    assert runtime_binding["provided_logical_buffer_count"] == 27
+    assert runtime_binding["missing_logical_buffer_count"] == 54
+    assert "hidden" not in runtime_binding["missing_logical_buffers"]
+    assert "hidden_grad" not in runtime_binding["missing_logical_buffers"]
+
+
+def test_fp8_path_c_training_route_accepts_real_activation_capture_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CPPMEGA_PATH_C_FUSION", "auto")
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--synthetic",
+            "--dtype",
+            "fp8_path_c",
+            "--pattern",
+            "A",
+            "--depth",
+            "1",
+            "--dsa-a-layer-ranks",
+            "0",
+            "--output",
+            str(tmp_path / "receipt.json"),
+        ]
+    )
+    config = m04_train_step.config_from_args(args, data_path=tmp_path / "tokens.npz")
+    model = build_local_gb10_quarter_tiny_smoke_model()
+    capture = PathCActivationBufferCapture(
+        aliases={"local_gb10_quarter_brick_10_M_hidden": "hidden"},
+        owner_name="local_gb10_quarter.path_c_forward_activation_capture",
+    )
+    model.attach_path_c_activation_probe(capture)
+    hidden = model.decoder_hidden_states(mx.zeros((1, 512), dtype=mx.int32))
+    mx.eval(hidden)
+    model.path_c_direct_fusion_chain_logical_buffer_owners = (capture,)
+
+    route = m04_train_step.fp8_path_c_training_route_payload_for_model(
+        config,
+        model,
+    )
+
+    runtime_binding = route["path_c_fusion"]["direct_chained_fusion"][
+        "runtime_binding"
+    ]
+    assert runtime_binding["logical_buffer_owner"] == (
+        "local_gb10_quarter.path_c_direct_fusion_chain_buffers"
+    )
+    assert runtime_binding["shape_mismatch_count"] == 0
+    assert "hidden" not in runtime_binding["missing_logical_buffers"]
+    assert "local_gb10_quarter_brick_10_M_delta" not in (
+        runtime_binding["missing_logical_buffers"]
+    )
+    assert capture.buffers["hidden"] is capture.buffers[
+        "local_gb10_quarter_brick_10_M_hidden"
+    ]
 
 
 def test_receipt_preserves_bound_fp8_path_c_route_from_train_payload(
@@ -2022,6 +2308,7 @@ def test_receipt_preserves_bound_fp8_path_c_route_from_train_payload(
     route = m04_train_step.fp8_path_c_training_route_payload(
         config,
         bank_owner=_model_route_physical_bank_owner(),
+        fused_artifact=lambda *args: None,
     )
 
     receipt = m04_train_step.receipt_from_train_payload(
@@ -2069,7 +2356,7 @@ def test_receipt_preserves_bound_fp8_path_c_route_from_train_payload(
     ] is True
 
 
-def test_path_c_fusion_force_mode_fails_closed_until_real_schedule_is_verified(
+def test_path_c_fusion_force_mode_fails_closed_until_runtime_is_bound(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("CPPMEGA_PATH_C_FUSION", "force")
@@ -2077,7 +2364,7 @@ def test_path_c_fusion_force_mode_fails_closed_until_real_schedule_is_verified(
     payload = m04_train_step.path_c_fusion_payload()
 
     assert payload["mode"] == "force"
-    assert payload["status"] == "force_blocked_schedule_unverified"
+    assert payload["status"] == "force_blocked_runtime_not_bound"
     assert payload["single_kernel_fused"] is False
     assert payload["fullgraph_required"] is True
     assert payload["graph_break_policy"] == "fail_closed"
@@ -2120,6 +2407,14 @@ def test_path_c_fusion_force_mode_fails_closed_until_real_schedule_is_verified(
     assert "production_1b_matrix_profile_missing" in {
         blocker["kind"] for blocker in payload["schedule_blockers"]
     }
+    assert "production_schedule_not_compile_verified" not in {
+        blocker["kind"] for blocker in payload["schedule_blockers"]
+    }
+    assert payload["production_compile_receipt"]["status"] == "verified"
+    assert payload["production_compile_receipt"]["native_compile_ok"] is True
+    assert payload["production_compile_receipt"]["cache_key_recompile_status"] == (
+        "key_stable"
+    )
     assert "production_schedule_uses_descriptor_loop_fragments" not in {
         blocker["kind"] for blocker in payload["schedule_blockers"]
     }
@@ -2129,8 +2424,8 @@ def test_path_c_fusion_force_mode_fails_closed_until_real_schedule_is_verified(
     assert payload["semantic_blockers"] == []
     assert "diagnostic_raw_abi_region" not in payload
     assert payload["default_allowed"] is False
-    assert "real fused train-block schedule is registered" in payload["reason"]
-    assert "not yet trusted" in payload["reason"]
+    assert "matching native compile receipt" in payload["reason"]
+    assert "runtime still has no bound fused artifact" in payload["reason"]
 
 
 def test_fp8_path_c_local_gb10_profile_uses_model_factory_dsa_producer() -> None:

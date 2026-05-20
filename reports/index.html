@@ -242,17 +242,50 @@
                                 href="path_c_fusion_compile_receipt.json">Compile Receipt
                                 JSON</a></strong>
                         <p>Dynamic model-derived fused schedule compiles natively to a TileLang
-                            <code>JITKernel</code>; schedule contract is <code>verified</code>. The runtime hook now
-                            accepts an explicit caller/model-owned physical ABI bank owner, but the live m04 training
-                            route still reports <code>runtime_uses_fused_train_block=false</code> until the model owns
-                            and passes those banks.</p>
+                            <code>JITKernel</code>; schedule contract is <code>verified</code> and the live m04 route now
+                            validates this production receipt by schedule id, verified contract, native compile, and
+                            stable cache-key recompile audit before removing the compile blocker. Factory-built models now
+                            identify the route as <code>local_gb10_quarter.path_c_bricks</code> /
+                            <code>local_gb10_quarter_path_c_10_12</code>. The runtime hooks accept either an explicit
+                            caller/model-owned physical ABI bank owner for the single fused artifact, or caller-owned
+                            direct logical buffers for the 4-segment chain. Live m04 still keeps
+                            <code>runtime_uses_fused_train_block=false</code> until one of those executable owner/artifact
+                            sets is attached to the training route. The direct no-pack ABI alternative
+                            is also recorded and blocked explicitly: <code>direct_buffers</code> would need 73 Metal
+                            kernel buffers against the 31-buffer portable limit. The generic direct-chain planner is
+                            now concrete and model-driven: <code>plan_path_c_direct_fusion_chains_for_model(model)</code>
+                            discovers regions from <code>path_c_bricks</code>, and
+                            <code>direct_chained_fusion_plan.status=ready</code> has 4 contiguous fused
+                            segments covering the full fwd+bwd region and each segment at or below 31 buffers; all
+                            4 segments also native-compile to TileLang <code>JITKernel</code>, and the route can select
+                            <code>run_path_c_direct_fusion_chain_route</code> when the segment artifacts and direct buffers
+                            are explicitly bound. The current model-binding audit still blocks live execution because
+                            the chain needs 81 logical buffers: 28 model parameters/constants, 11 forward
+                            activation/prepared buffers, 37 backward gradients, and 5 runtime states. Bias-less
+                            attention blocks no longer declare nonexistent q/sparse_kv/out_proj bias buffers or
+                            bias-gradient outputs in the model-derived ABI. The
+                            model now exposes an opt-in zero-copy forward activation probe, a model-owned direct
+                            logical owner for existing parameter tensors, and a direct/profile alias map from MLX
+                            parameter-gradient tree names to Path C logical gradient names. The
+                            eager training step exposes an opt-in zero-copy parameter-gradient probe. The generated
+                            direct ABI now declares model-owned weight tensors and batch-one activations in their natural MLX shapes, so the
+                            model-owner binding audit reports <code>shape_mismatch_count=0</code> for the 25 provided
+                            parameter buffers, and a real captured <code>hidden</code> activation binds without a
+                            reshape/copy. The route can also compose the model owner with additional
+                            runtime logical owners via <code>compose_path_c_logical_buffer_owner()</code> without tensor
+                            packing/casting; the focused regression binds <code>hidden</code> and <code>hidden_grad</code>
+                            through an extra owner and drops the missing logical-buffer count from 56 to 54. Current
+                            audit covers 24 of 37 backward logical gradients from model
+                            parameter grads; the remaining 13 are activation/state/prepared-FP8/placeholder gradients.
+                            The chain still cannot run because activation-gradient, prepared FP8, sparse constants,
+                            runtime-state owners, and callable runtime segment artifacts are not completely bound.</p>
                         <p><a href="path_c_fusion_compile_source.py">Generated TileLang source</a></p>
                     </div>
                     <div class="metric"><span>Path C fused train-block goal audit</span><strong><a
                                 href="path_c_fusion_goal_audit_20260520.html">Goal Audit
                                 HTML</a></strong>
                         <p>Prompt-to-artifact checklist for MaskAnalysis, fused schedule body, real ABI, compile
-                            receipt, cache-key audit, default gate, and the remaining runtime ABI-bank blocker.</p>
+                            receipt, cache-key audit, default gate, and the remaining runtime owner/artifact blocker.</p>
                     </div>
                     <div class="metric"><span>Fresh 2026-05-18 matrix</span><strong><a
                                 href="v4/cppmega_1b_path_matrix_safe_mamba_bwd_20260518.html">Safe Matrix
@@ -378,7 +411,7 @@
             <div class="body">
                 <div class="grid">
                     <div class="metric"><span>2026-05-20 full-C cells</span><strong>42/42 passed</strong></div>
-                    <div class="metric"><span>Fused compile receipt</span><strong>native ok, runtime off</strong></div>
+                    <div class="metric"><span>Fused compile receipt</span><strong>native ok, route validated, runtime off</strong></div>
                     <div class="metric"><span>BF16 adam8bit Path B baseline</span><strong>1010.34 tok/s</strong></div>
                     <div class="metric"><span>FP8 lion8bit Path B baseline</span><strong>1001.57 tok/s</strong></div>
                 </div>

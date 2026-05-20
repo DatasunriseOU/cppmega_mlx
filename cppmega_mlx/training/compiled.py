@@ -11,13 +11,13 @@ from __future__ import annotations
 import time
 from dataclasses import asdict, dataclass
 from functools import partial
-from typing import Any, Callable, Literal, Mapping, TypeVar, cast
+from typing import Any, Callable, Literal, Mapping, Sequence, TypeVar, cast
 
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.utils import average_gradients
 import mlx.optimizers as optim
-from mlx.utils import tree_map
+from mlx.utils import tree_flatten, tree_map
 
 from cppmega_mlx.data.batch import LMTokenBatch, ensure_lm_batch
 from cppmega_mlx.training.loss import next_token_cross_entropy
@@ -35,6 +35,7 @@ CompileTarget = Literal[
     "moe_router",
 ]
 F = TypeVar("F", bound=Callable[..., Any])
+PathCGradientProbe = Callable[[Mapping[str, Any]], None]
 
 REGIONAL_COMPILE_TARGETS: Mapping[CompileTarget, bool] = {
     "mamba3_pre": True,
@@ -56,6 +57,41 @@ STABLE_BATCH_KEYS = (
 
 CompiledBatch = dict[str, mx.array | None]
 CompiledBatchSignature = tuple[tuple[str, tuple[int, ...] | None, str | None], ...]
+
+
+class PathCGradientBufferCapture:
+    """Opt-in Path C gradient owner that stores references, not copies."""
+
+    def __init__(
+        self,
+        aliases: Mapping[str, str | Sequence[str]] | None = None,
+        *,
+        owner_name: str = "CompiledPretrainingStep.path_c_gradient_capture",
+    ) -> None:
+        self.owner_name = owner_name
+        self.aliases = {
+            str(source): (str(target),)
+            if isinstance(target, str)
+            else tuple(str(item) for item in target)
+            for source, target in (aliases or {}).items()
+        }
+        self.buffers: dict[str, mx.array] = {}
+        self.events: list[Mapping[str, Any]] = []
+
+    def __call__(self, event: Mapping[str, Any]) -> None:
+        tensor = event.get("tensor")
+        if not isinstance(tensor, mx.array):
+            return
+        logical_names = tuple(str(name) for name in event.get("logical_names", ()))
+        for name in logical_names:
+            self.buffers[name] = tensor
+            for alias in self.aliases.get(name, ()):
+                self.buffers[alias] = tensor
+        self.events.append(event)
+
+    def clear(self) -> None:
+        self.buffers.clear()
+        self.events.clear()
 
 
 def should_compile_region(target: CompileTarget) -> bool:
@@ -172,6 +208,7 @@ class CompiledPretrainingStep:
         compile: bool = True,
         grad_accum_steps: int = 1,
         split_grad_update_eval: bool = False,
+        path_c_gradient_probe: PathCGradientProbe | None = None,
     ):
         if not isinstance(compile, bool):
             raise TypeError("compile must be a boolean")
@@ -197,6 +234,9 @@ class CompiledPretrainingStep:
         self._grad_accum: Any = None
         self._pending_microbatches = 0
         self._loss_and_grad = nn.value_and_grad(self.model, self.loss_fn)
+        self._path_c_gradient_probe: PathCGradientProbe | None = None
+        if path_c_gradient_probe is not None:
+            self.attach_path_c_gradient_probe(path_c_gradient_probe)
 
     def __call__(
         self,
@@ -253,6 +293,20 @@ class CompiledPretrainingStep:
         """Gradient accumulator tree needed for exact mid-accumulation resume."""
 
         return self._grad_accum
+
+    def attach_path_c_gradient_probe(self, probe: PathCGradientProbe) -> None:
+        """Install an explicit zero-copy gradient probe for eager train steps."""
+
+        if self.compile:
+            raise ValueError("Path C gradient probe requires compile=False")
+        if not callable(probe):
+            raise TypeError("probe must be callable")
+        self._path_c_gradient_probe = probe
+
+    def detach_path_c_gradient_probe(self) -> None:
+        """Remove the explicit Path C gradient probe."""
+
+        self._path_c_gradient_probe = None
 
     def state_dict(self) -> dict[str, Any]:
         """Return all Python-side state needed to resume this train-step wrapper."""
@@ -350,6 +404,23 @@ class CompiledPretrainingStep:
 
         return grads
 
+    def _emit_path_c_gradients(self, grads: Any) -> None:
+        probe = self._path_c_gradient_probe
+        if probe is None:
+            return
+        for parameter_name, tensor in tree_flatten(grads):
+            if not isinstance(tensor, mx.array):
+                continue
+            probe(
+                {
+                    "name": "gradient",
+                    "parameter_name": parameter_name,
+                    "logical_names": (f"{parameter_name}_grad",),
+                    "tensor": tensor,
+                    "phase": "value_and_grad",
+                }
+            )
+
     def _eager_step(
         self,
         batch: CompiledBatch,
@@ -358,6 +429,7 @@ class CompiledPretrainingStep:
     ) -> tuple[mx.array, mx.array, Any]:
         loss_batch = cast(Mapping[str, mx.array], batch)
         (loss, ntokens), grads = self._loss_and_grad(self.model, loss_batch)
+        self._emit_path_c_gradients(grads)
         if self.split_grad_update_eval:
             mx.eval(loss, ntokens, grads)
         grads = self._accumulate_or_update(grads, prev_grad, do_update)
@@ -414,6 +486,8 @@ def _require_bool(value: Any, *, name: str) -> bool:
 __all__ = [
     "CompileTarget",
     "CompiledPretrainingStep",
+    "PathCGradientBufferCapture",
+    "PathCGradientProbe",
     "REGIONAL_COMPILE_TARGETS",
     "maybe_compile_region",
     "normalize_compiled_batch",

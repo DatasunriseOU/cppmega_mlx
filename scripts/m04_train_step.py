@@ -9,6 +9,7 @@ grad-checkpoint target-parquet gate is captured.
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import asdict
 import io
@@ -24,7 +25,7 @@ import tempfile
 import time
 import traceback
 from types import SimpleNamespace
-from typing import Any, Mapping
+from typing import Any
 
 import numpy as np
 
@@ -48,12 +49,14 @@ from cppmega_mlx.runtime.path_c_fusion import (  # noqa: E402
     selected_path_c_fusion_mode,
 )
 from cppmega_mlx.runtime.path_c_physical_abi import (  # noqa: E402
+    compose_path_c_logical_buffer_owner,
     plan_physical_abi_runtime_bridge,
     validate_physical_abi_runtime_bindings,
 )
 from cppmega_mlx.runtime.path_c_fusion_schedules import (  # noqa: E402
     PATH_C_DESCRIPTOR_SCHEDULE_GENERATOR,
     path_c_fusion_schedule_spec,
+    plan_path_c_direct_fusion_chain_for_region,
     plan_path_c_fusion_schedule_for_region,
 )
 from cppmega_mlx.recipes.model_factory import (  # noqa: E402
@@ -153,6 +156,16 @@ FP8_PATH_C_FUSED_TRAIN_BLOCK_BANKS_MISSING_STATUS = (
 )
 FP8_PATH_C_FUSED_TRAIN_BLOCK_ARTIFACT_MISSING_STATUS = (
     "fused_train_block_artifact_missing"
+)
+FP8_PATH_C_DIRECT_CHAIN_LOGICAL_BUFFERS_MISSING_STATUS = (
+    "direct_fusion_chain_logical_buffers_missing"
+)
+FP8_PATH_C_DIRECT_CHAIN_ARTIFACTS_MISSING_STATUS = (
+    "direct_fusion_chain_artifacts_missing"
+)
+PATH_C_FUSION_COMPILE_RECEIPT_ENV = "CPPMEGA_PATH_C_FUSION_COMPILE_RECEIPT"
+PATH_C_FUSION_COMPILE_RECEIPT_PATH = (
+    ROOT / "reports" / "path_c_fusion_compile_receipt.json"
 )
 FP8_PATH_C_BRIDGE_TARGET = "native_mlx_tvm_ffi_graph_bridge"
 FP8_PATH_C_BRIDGE_STATUS = "m04_wired_for_native_tvm_ffi_graph_outputs"
@@ -1005,6 +1018,10 @@ def fp8_path_c_training_route_payload(
     bank_buffer_owner: str | None = None,
     bank_owner: Any | None = None,
     fused_artifact: Any | None = None,
+    direct_chain_artifacts: Any | None = None,
+    direct_chain_logical_buffers: Mapping[str, Any] | None = None,
+    direct_chain_logical_buffer_owner: str | None = None,
+    direct_chain_logical_owner: Any | None = None,
 ) -> dict[str, Any]:
     requested = fp8_path_c_route_requested(args)
     producer = sparse_mla_fp8_producer_payload(args)
@@ -1015,18 +1032,36 @@ def fp8_path_c_training_route_payload(
         bank_buffer_owner=bank_buffer_owner,
         bank_owner=bank_owner,
         fused_artifact=fused_artifact,
+        direct_chain_artifacts=direct_chain_artifacts,
+        direct_chain_logical_buffers=direct_chain_logical_buffers,
+        direct_chain_logical_buffer_owner=direct_chain_logical_buffer_owner,
+        direct_chain_logical_owner=direct_chain_logical_owner,
     )
     runtime_training_binding = path_c_fusion.get("runtime_training_binding", {})
-    fused_train_block_runtime_available = bool(
+    single_fused_train_block_runtime_available = bool(
         isinstance(runtime_training_binding, dict)
         and runtime_training_binding.get("runtime_uses_fused_train_block")
+    )
+    direct_chain_binding = {}
+    direct_chained_fusion = path_c_fusion.get("direct_chained_fusion", {})
+    if isinstance(direct_chained_fusion, dict):
+        direct_chain_binding = direct_chained_fusion.get("runtime_binding", {})
+    direct_fusion_chain_runtime_available = bool(
+        isinstance(direct_chain_binding, dict)
+        and direct_chain_binding.get("runtime_uses_direct_fusion_chain")
+    )
+    fused_train_block_runtime_available = bool(
+        single_fused_train_block_runtime_available
+        or direct_fusion_chain_runtime_available
     )
     split_training_available = bool(requested and producer_configured)
     full_training_available = bool(
         split_training_available and fused_train_block_runtime_available
     )
     route_status = (
-        FP8_PATH_C_SPLIT_TRAINING_STATUS
+        FP8_PATH_C_E2E_TRAINING_STATUS
+        if full_training_available
+        else FP8_PATH_C_SPLIT_TRAINING_STATUS
         if requested and producer_configured
         else producer["status"]
         if requested
@@ -1043,7 +1078,9 @@ def fp8_path_c_training_route_payload(
     )
     direct_call_status = (
         "m04_uses_fused_train_block_route"
-        if full_training_available
+        if full_training_available and single_fused_train_block_runtime_available
+        else "m04_uses_direct_fusion_chain_route"
+        if full_training_available and direct_fusion_chain_runtime_available
         else "m04_uses_split_model_graph_route_not_fused_train_block"
         if split_training_available
         else str(producer["status"])
@@ -1052,7 +1089,9 @@ def fp8_path_c_training_route_payload(
     )
     selected_action = (
         "run_path_c_fused_train_block_route"
-        if full_training_available
+        if full_training_available and single_fused_train_block_runtime_available
+        else "run_path_c_direct_fusion_chain_route"
+        if full_training_available and direct_fusion_chain_runtime_available
         else "run_path_c_split_training_route"
         if split_training_available
         else f"fail_closed_{producer['status']}"
@@ -1079,6 +1118,12 @@ def fp8_path_c_training_route_payload(
         "full_end_to_end_training_available": full_training_available,
         "fused_train_block_runtime_available": (
             fused_train_block_runtime_available
+        ),
+        "single_fused_train_block_runtime_available": (
+            single_fused_train_block_runtime_available
+        ),
+        "direct_fusion_chain_runtime_available": (
+            direct_fusion_chain_runtime_available
         ),
         "fused_train_block_blocker_type": fused_train_block_blocker_type,
         "end_to_end_training_status": route_status,
@@ -1205,17 +1250,80 @@ def fp8_path_c_training_route_payload(
     }
 
 
+def _as_path_c_logical_owner_tuple(raw_owners: Any) -> tuple[Any, ...]:
+    if raw_owners is None:
+        return ()
+    if isinstance(raw_owners, Mapping) or hasattr(raw_owners, "buffers"):
+        return (raw_owners,)
+    return tuple(raw_owners)
+
+
+def _path_c_direct_chain_logical_owner_for_model(model: Any) -> Any | None:
+    owners: list[Any] = []
+    base_owner = getattr(
+        model,
+        "path_c_direct_fusion_chain_logical_buffer_owner",
+        None,
+    )
+    if base_owner is None:
+        make_logical_owner = getattr(
+            model,
+            "make_path_c_direct_fusion_chain_logical_buffer_owner",
+            None,
+        )
+        if callable(make_logical_owner):
+            base_owner = make_logical_owner()
+    if base_owner is not None:
+        owners.append(base_owner)
+    owners.extend(
+        _as_path_c_logical_owner_tuple(
+            getattr(
+                model,
+                "path_c_direct_fusion_chain_logical_buffer_owners",
+                None,
+            )
+        )
+    )
+    if not owners:
+        return None
+    if len(owners) == 1:
+        return owners[0]
+    profile_name = str(getattr(model, "path_c_profile_name", "HybridTinyLM"))
+    return compose_path_c_logical_buffer_owner(
+        f"{profile_name}.path_c_direct_fusion_chain_buffers",
+        *owners,
+    )
+
+
 def fp8_path_c_training_route_payload_for_model(
     args: argparse.Namespace | TrainHybridTinyConfig,
     model: Any,
 ) -> dict[str, Any]:
     """Return Path C training route metadata using model-owned ABI banks."""
 
+    direct_chain_logical_owner = _path_c_direct_chain_logical_owner_for_model(model)
+
     return fp8_path_c_training_route_payload(
         args,
         model=model,
         bank_owner=getattr(model, "path_c_physical_abi_bank_owner", None),
         fused_artifact=getattr(model, "path_c_fused_train_block_artifact", None),
+        direct_chain_artifacts=getattr(
+            model,
+            "path_c_direct_fusion_chain_artifacts",
+            None,
+        ),
+        direct_chain_logical_buffers=getattr(
+            model,
+            "path_c_direct_fusion_chain_logical_buffers",
+            None,
+        ),
+        direct_chain_logical_buffer_owner=getattr(
+            model,
+            "path_c_direct_fusion_chain_logical_buffer_owner_name",
+            None,
+        ),
+        direct_chain_logical_owner=direct_chain_logical_owner,
     )
 
 
@@ -1339,6 +1447,625 @@ def path_c_fusion_runtime_training_binding_payload(
         }
 
 
+def _path_c_direct_chain_plan_payload(chain: Any) -> dict[str, Any]:
+    segments = []
+    for segment in getattr(chain, "segments", ()):
+        target = getattr(segment, "schedule_target", None)
+        plan = getattr(segment, "plan", None)
+        contract = getattr(plan, "schedule_contract", None)
+        segments.append(
+            {
+                "index": int(segment.index),
+                "node_start": int(segment.node_start),
+                "node_end": int(segment.node_end),
+                "region_name": getattr(segment.region, "name", ""),
+                "node_names": list(getattr(segment.region, "node_names", ())),
+                "op_signature": [
+                    str(node.op_name)
+                    for node in getattr(segment.region, "nodes", ())
+                ],
+                "status": str(segment.status),
+                "reason": str(segment.reason),
+                "physical_abi_policy": str(segment.physical_abi_policy),
+                "kernel_parameter_count": segment.kernel_parameter_count,
+                "schedule_id": getattr(target, "schedule_id", None),
+                "schedule_name": getattr(target, "schedule_name", None),
+                "schedule_contract_status": getattr(contract, "status", None),
+            }
+        )
+    source_nodes = list(getattr(chain.source_region, "node_names", ()))
+    covers_full_region = bool(segments) and (
+        segments[0]["node_start"] == 0
+        and segments[-1]["node_end"] == len(source_nodes)
+        and all(
+            left["node_end"] == right["node_start"]
+            for left, right in zip(segments[:-1], segments[1:], strict=True)
+        )
+    )
+    return {
+        "status": str(chain.status),
+        "reason": str(chain.reason),
+        "max_kernel_buffers": int(chain.max_kernel_buffers),
+        "segment_count": len(segments),
+        "covers_full_region": covers_full_region,
+        "source_region_name": getattr(chain.source_region, "name", ""),
+        "source_node_count": len(source_nodes),
+        "segments": segments,
+    }
+
+
+def _path_c_direct_chain_artifact_for_segment(
+    artifacts: Any | None,
+    segment: Any,
+) -> Any | None:
+    if artifacts is None:
+        return None
+    if isinstance(artifacts, Mapping):
+        target = getattr(segment, "schedule_target", None)
+        keys = (
+            segment.index,
+            str(segment.index),
+            getattr(segment.region, "name", None),
+            getattr(target, "schedule_id", None),
+            getattr(target, "schedule_name", None),
+        )
+        for key in keys:
+            if key is not None and key in artifacts:
+                return artifacts[key]
+        return None
+    if isinstance(artifacts, (list, tuple)):
+        try:
+            return artifacts[int(segment.index)]
+        except IndexError:
+            return None
+    return None
+
+
+def _path_c_direct_chain_buffer_category(name: str) -> str:
+    if name in {"hidden", "hidden_grad"}:
+        return "runtime_activation_or_grad"
+    if name.endswith("_grad"):
+        return "runtime_activation_or_grad"
+    if any(
+        name.endswith(suffix)
+        for suffix in (
+            "_weight",
+            "_bias",
+            "_D",
+            "_A_log",
+            "_dt_bias",
+            "_sm_scale",
+            "_sinks",
+            "_has_sinks",
+            "_rope_inv_freq",
+        )
+    ):
+        return "model_parameter_or_constant"
+    if any(
+        name.endswith(suffix)
+        for suffix in (
+            "_h0",
+            "_state",
+            "_state_in",
+            "_conv_state",
+        )
+    ):
+        return "runtime_state"
+    return "runtime_activation_or_grad"
+
+
+def path_c_direct_fusion_chain_model_binding_audit(
+    *,
+    chain: Any,
+    model: Any | None = None,
+) -> dict[str, Any]:
+    """Classify direct-chain buffers by the owner needed at live runtime."""
+
+    required_buffers: dict[str, dict[str, Any]] = {}
+    for segment in getattr(chain, "segments", ()):
+        target = getattr(segment, "schedule_target", None)
+        if target is None or str(segment.status) != "ok":
+            continue
+        prim_func = target.schedule_template(segment.region)
+        physical_abi_map = dict(
+            getattr(prim_func, "_cppmega_path_c_physical_buffer_abi_map", {})
+            or {}
+        )
+        physical_abi_shapes = dict(
+            getattr(
+                prim_func,
+                "_cppmega_path_c_physical_buffer_abi_shapes",
+                {},
+            )
+            or {}
+        )
+        bridge = plan_physical_abi_runtime_bridge(
+            physical_abi_map,
+            physical_abi_shapes,
+        )
+        bank_dtypes = dict(bridge.get("bank_dtypes", {}))
+        for name in bridge.get("required_bank_buffers", ()):
+            name = str(name)
+            required_buffers.setdefault(
+                name,
+                {
+                    "name": name,
+                    "shape": tuple(physical_abi_shapes.get(name, ())),
+                    "dtype": bank_dtypes.get(name),
+                    "category": _path_c_direct_chain_buffer_category(name),
+                    "segments": [],
+                },
+            )["segments"].append(int(segment.index))
+    by_category: dict[str, list[str]] = {}
+    for item in required_buffers.values():
+        by_category.setdefault(str(item["category"]), []).append(str(item["name"]))
+    for names in by_category.values():
+        names.sort()
+    runtime_activation_or_grad = by_category.get("runtime_activation_or_grad", [])
+    backward_grad_names = sorted(
+        name for name in runtime_activation_or_grad if name.endswith("_grad")
+    )
+    forward_activation_names = sorted(
+        name for name in runtime_activation_or_grad if not name.endswith("_grad")
+    )
+    runtime_state_names = by_category.get("runtime_state", [])
+    runtime_names = sorted([*runtime_activation_or_grad, *runtime_state_names])
+    requires_runtime_owner = bool(runtime_names)
+    forward_probe_available = bool(
+        model is not None
+        and callable(getattr(model, "attach_path_c_activation_probe", None))
+    )
+    profile_bricks_attached = bool(
+        model is not None
+        and all(
+            hasattr(layer, "path_c_profile_brick_name")
+            for layer in getattr(model, "layers", ())
+        )
+    )
+    parameter_gradient_probe_available = callable(
+        getattr(CompiledPretrainingStep, "attach_path_c_gradient_probe", None)
+    )
+    parameter_gradient_aliases: Mapping[str, Any] = {}
+    if model is not None and callable(
+        getattr(model, "path_c_parameter_gradient_aliases", None)
+    ):
+        parameter_gradient_aliases = model.path_c_parameter_gradient_aliases()
+    model_logical_owner = None
+    make_logical_owner = (
+        getattr(model, "make_path_c_direct_fusion_chain_logical_buffer_owner", None)
+        if model is not None
+        else None
+    )
+    if callable(make_logical_owner):
+        model_logical_owner = make_logical_owner()
+    model_logical_owner_buffers = getattr(model_logical_owner, "buffers", {}) or {}
+    parameter_gradient_alias_targets = sorted(
+        {
+            str(target)
+            for targets in parameter_gradient_aliases.values()
+            for target in (
+                (targets,) if isinstance(targets, str) else tuple(targets)
+            )
+        }
+    )
+    covered_parameter_gradient_names = sorted(
+        set(backward_grad_names).intersection(parameter_gradient_alias_targets)
+    )
+    uncovered_backward_grad_names = sorted(
+        set(backward_grad_names).difference(covered_parameter_gradient_names)
+    )
+    status = (
+        "runtime_backward_or_state_owner_missing"
+        if requires_runtime_owner and forward_probe_available
+        else "runtime_activation_owner_missing"
+        if requires_runtime_owner
+        else "model_parameter_owner_sufficient"
+    )
+    return {
+        "status": status,
+        "required_logical_buffer_count": len(required_buffers),
+        "model_parameter_or_constant_count": len(
+            by_category.get("model_parameter_or_constant", [])
+        ),
+        "runtime_activation_or_grad_count": len(
+            by_category.get("runtime_activation_or_grad", [])
+        ),
+        "forward_activation_or_prepared_count": len(forward_activation_names),
+        "backward_gradient_count": len(backward_grad_names),
+        "runtime_state_count": len(by_category.get("runtime_state", [])),
+        "requires_runtime_activation_owner": requires_runtime_owner,
+        "forward_activation_probe_surface_available": forward_probe_available,
+        "parameter_gradient_probe_surface_available": (
+            parameter_gradient_probe_available
+        ),
+        "parameter_gradient_alias_count": len(parameter_gradient_aliases),
+        "model_parameter_logical_owner_available": model_logical_owner is not None,
+        "model_parameter_logical_owner": None
+        if model_logical_owner is None
+        else str(getattr(model_logical_owner, "owner_name", "")),
+        "model_parameter_logical_owner_buffer_count": len(
+            model_logical_owner_buffers
+        ),
+        "backward_gradient_parameter_alias_coverage_count": len(
+            covered_parameter_gradient_names
+        ),
+        "backward_gradient_uncovered_count": len(uncovered_backward_grad_names),
+        "profile_brick_names_attached": profile_bricks_attached,
+        "forward_activation_or_prepared_examples": forward_activation_names[:12],
+        "backward_gradient_examples": backward_grad_names[:12],
+        "backward_gradient_parameter_alias_coverage_examples": (
+            covered_parameter_gradient_names[:12]
+        ),
+        "backward_gradient_uncovered_examples": uncovered_backward_grad_names[:12],
+        "runtime_activation_or_grad_examples": runtime_names[:12],
+        "categories": {category: len(names) for category, names in by_category.items()},
+        "reason": (
+            "model exposes an explicit zero-copy forward activation probe, but "
+            "direct-chain runtime still needs the remaining gradient/state/"
+            "prepared-buffer owners produced inside the train step before it "
+            "can execute"
+            if requires_runtime_owner and forward_probe_available
+            else "direct-chain runtime needs activations, prepared FP8 buffers, states, "
+            "and gradients produced inside the train step; model parameters alone "
+            "cannot satisfy this ABI without hidden staging"
+            if requires_runtime_owner
+            else "direct-chain runtime can be satisfied by model-owned parameters"
+        ),
+    }
+
+
+def path_c_direct_fusion_chain_runtime_binding_payload(
+    *,
+    chain: Any,
+    logical_buffers: Mapping[str, Any] | None = None,
+    logical_buffer_owner: str | None = None,
+    logical_owner: Any | None = None,
+    artifacts: Any | None = None,
+) -> dict[str, Any]:
+    """Return executable-runtime binding status for a direct-buffer chain."""
+
+    try:
+        resolved_buffers = logical_buffers
+        resolved_owner = logical_buffer_owner
+        hidden_packing_performed = False
+        no_hidden_allocation_policy = True
+        if logical_owner is not None:
+            if logical_buffers is not None:
+                raise ValueError(
+                    "logical_owner and logical_buffers are mutually exclusive"
+                )
+            resolved_buffers = getattr(logical_owner, "buffers", None)
+            resolved_owner = str(
+                getattr(logical_owner, "owner_name", resolved_owner)
+            )
+            hidden_packing_performed = bool(
+                getattr(logical_owner, "hidden_packing_performed", False)
+            )
+            no_hidden_allocation_policy = bool(
+                getattr(logical_owner, "no_hidden_allocation_policy", True)
+            )
+        provided_names = set(str(name) for name in (resolved_buffers or {}))
+        segment_payloads = []
+        all_segments_ready = str(getattr(chain, "status", "")) == "ready"
+        all_direct_logical = True
+        all_bindings_ready = True
+        all_artifacts_bound = True
+        required_logical_buffer_names: set[str] = set()
+        missing_logical_buffers: set[str] = set()
+        shape_mismatch_buffers: set[str] = set()
+        dtype_mismatch_buffers: set[str] = set()
+        binding_errors: set[str] = set()
+        missing_artifact_segments: list[int] = []
+        for segment in getattr(chain, "segments", ()):
+            target = getattr(segment, "schedule_target", None)
+            if target is None or str(segment.status) != "ok":
+                all_segments_ready = False
+                all_direct_logical = False
+                all_bindings_ready = False
+                all_artifacts_bound = False
+                missing_artifact_segments.append(int(segment.index))
+                segment_payloads.append(
+                    {
+                        "index": int(segment.index),
+                        "status": "blocked",
+                        "reason": str(segment.reason),
+                        "runtime_ready": False,
+                        "artifact_bound": False,
+                        "logical_tensor_binding_ready": False,
+                        "required_logical_buffers": [],
+                        "missing_logical_buffers": [],
+                        "provided_logical_buffers": [],
+                    }
+                )
+                continue
+            prim_func = target.schedule_template(segment.region)
+            physical_abi_map = dict(
+                getattr(prim_func, "_cppmega_path_c_physical_buffer_abi_map", {})
+                or {}
+            )
+            physical_abi_shapes = dict(
+                getattr(
+                    prim_func,
+                    "_cppmega_path_c_physical_buffer_abi_shapes",
+                    {},
+                )
+                or {}
+            )
+            physical_abi_policy = str(
+                getattr(prim_func, "_cppmega_path_c_physical_abi_policy", "unknown")
+            )
+            bridge = plan_physical_abi_runtime_bridge(
+                physical_abi_map,
+                physical_abi_shapes,
+            )
+            binding = validate_physical_abi_runtime_bindings(
+                physical_abi_map,
+                physical_abi_shapes,
+                resolved_buffers,
+            )
+            required_logical_buffers = list(bridge.get("required_bank_buffers", ()))
+            required_logical_buffer_names.update(
+                str(name) for name in required_logical_buffers
+            )
+            segment_missing = list(binding.get("missing_bank_buffers", ()))
+            ordered_kernel_buffers = list(binding.get("ordered_kernel_buffers", ()))
+            provided_logical_buffers = [
+                name for name in ordered_kernel_buffers if name in provided_names
+            ]
+            logical_binding_ready = (
+                binding.get("status") == "ok" and not segment_missing
+            )
+            direct_logical_supported = bool(
+                bridge.get("logical_tensor_binding_supported")
+            )
+            artifact = _path_c_direct_chain_artifact_for_segment(
+                artifacts,
+                segment,
+            )
+            artifact_bound = callable(artifact)
+            runtime_ready = bool(
+                physical_abi_policy == "direct_buffers"
+                and direct_logical_supported
+                and logical_binding_ready
+                and artifact_bound
+            )
+            if not direct_logical_supported or physical_abi_policy != "direct_buffers":
+                all_direct_logical = False
+            shape_mismatch_buffers.update(
+                str(name) for name in binding.get("shape_mismatch_buffers", ())
+            )
+            dtype_mismatch_buffers.update(
+                str(name) for name in binding.get("dtype_mismatch_buffers", ())
+            )
+            binding_errors.update(str(error) for error in binding.get("errors", ()))
+            if not logical_binding_ready:
+                all_bindings_ready = False
+                missing_logical_buffers.update(str(name) for name in segment_missing)
+            if not artifact_bound:
+                all_artifacts_bound = False
+                missing_artifact_segments.append(int(segment.index))
+            segment_payloads.append(
+                {
+                    "index": int(segment.index),
+                    "status": "ok" if runtime_ready else "not_bound",
+                    "reason": (
+                        "segment has callable artifact and caller-owned direct "
+                        "logical buffers"
+                        if runtime_ready
+                        else "segment requires callable artifact and caller-owned "
+                        "direct logical buffers"
+                    ),
+                    "runtime_ready": runtime_ready,
+                    "artifact_bound": artifact_bound,
+                    "logical_tensor_binding_supported": direct_logical_supported,
+                    "logical_tensor_binding_ready": logical_binding_ready,
+                    "bridge_status": bridge.get("status"),
+                    "binding_status": binding.get("status"),
+                    "physical_abi_policy": physical_abi_policy,
+                    "required_logical_buffers": required_logical_buffers,
+                    "missing_logical_buffers": segment_missing,
+                    "unexpected_logical_buffers": list(
+                        binding.get("unexpected_buffers", ())
+                    ),
+                    "shape_mismatch_buffers": list(
+                        binding.get("shape_mismatch_buffers", ())
+                    ),
+                    "dtype_mismatch_buffers": list(
+                        binding.get("dtype_mismatch_buffers", ())
+                    ),
+                    "binding_errors": list(binding.get("errors", ())),
+                    "provided_logical_buffers": provided_logical_buffers,
+                    "schedule_id": target.schedule_id,
+                    "region_name": segment.region.name,
+                }
+            )
+        runtime_uses_direct_chain = bool(
+            all_segments_ready
+            and all_direct_logical
+            and all_bindings_ready
+            and all_artifacts_bound
+            and segment_payloads
+        )
+        status = (
+            "ok"
+            if runtime_uses_direct_chain
+            else "direct_fusion_chain_plan_blocked"
+            if not all_segments_ready or not all_direct_logical
+            else FP8_PATH_C_DIRECT_CHAIN_LOGICAL_BUFFERS_MISSING_STATUS
+            if not all_bindings_ready
+            else FP8_PATH_C_DIRECT_CHAIN_ARTIFACTS_MISSING_STATUS
+        )
+        return {
+            "status": status,
+            "chain_status": str(getattr(chain, "status", "unknown")),
+            "runtime_uses_direct_fusion_chain": runtime_uses_direct_chain,
+            "runtime_uses_fused_train_block": runtime_uses_direct_chain,
+            "logical_tensor_binding_ready": all_bindings_ready,
+            "direct_logical_tensor_binding_supported": all_direct_logical,
+            "direct_chain_artifacts_bound": all_artifacts_bound,
+            "logical_buffer_owner": resolved_owner,
+            "segment_count": len(segment_payloads),
+            "missing_artifact_segments": missing_artifact_segments,
+            "missing_logical_buffers": sorted(missing_logical_buffers),
+            "missing_logical_buffer_count": len(missing_logical_buffers),
+            "provided_logical_buffer_count": len(
+                set(provided_names).intersection(
+                    {
+                        str(name)
+                        for payload in segment_payloads
+                        for name in payload.get("required_logical_buffers", ())
+                    }
+                )
+            ),
+            "unexpected_logical_buffers": sorted(
+                provided_names.difference(required_logical_buffer_names)
+            ),
+            "unexpected_logical_buffer_count": len(
+                provided_names.difference(required_logical_buffer_names)
+            ),
+            "shape_mismatch_buffers": sorted(shape_mismatch_buffers),
+            "shape_mismatch_count": len(shape_mismatch_buffers),
+            "dtype_mismatch_buffers": sorted(dtype_mismatch_buffers),
+            "dtype_mismatch_count": len(dtype_mismatch_buffers),
+            "binding_errors": sorted(binding_errors),
+            "hidden_packing_performed": hidden_packing_performed,
+            "no_hidden_allocation_policy": no_hidden_allocation_policy,
+            "segments": segment_payloads,
+            "reason": (
+                "all direct-chain segments have callable artifacts and caller-owned "
+                "logical buffers in generated kernel argument order"
+                if runtime_uses_direct_chain
+                else "direct-chain runtime requires caller/model-owned logical "
+                "buffers and callable segment artifacts; hidden packing or copying "
+                "is forbidden"
+            ),
+        }
+    except Exception as exc:  # pragma: no cover - defensive receipt metadata
+        return {
+            "status": "direct_fusion_chain_runtime_binding_unavailable",
+            "chain_status": "unknown",
+            "runtime_uses_direct_fusion_chain": False,
+            "runtime_uses_fused_train_block": False,
+            "logical_tensor_binding_ready": False,
+            "direct_logical_tensor_binding_supported": False,
+            "direct_chain_artifacts_bound": False,
+            "logical_buffer_owner": logical_buffer_owner
+            if logical_owner is None
+            else str(getattr(logical_owner, "owner_name", logical_buffer_owner)),
+            "segment_count": 0,
+            "missing_artifact_segments": [],
+            "missing_logical_buffers": [],
+            "missing_logical_buffer_count": 0,
+            "provided_logical_buffer_count": 0,
+            "unexpected_logical_buffers": [],
+            "unexpected_logical_buffer_count": 0,
+            "shape_mismatch_buffers": [],
+            "shape_mismatch_count": 0,
+            "dtype_mismatch_buffers": [],
+            "dtype_mismatch_count": 0,
+            "binding_errors": [],
+            "hidden_packing_performed": False,
+            "no_hidden_allocation_policy": True,
+            "segments": [],
+            "reason": str(exc),
+        }
+
+
+def _path_c_fusion_compile_receipt_path() -> Path:
+    override = os.environ.get(PATH_C_FUSION_COMPILE_RECEIPT_ENV)
+    if override:
+        return Path(override).expanduser()
+    return PATH_C_FUSION_COMPILE_RECEIPT_PATH
+
+
+def _path_c_fusion_compile_receipt_payload(
+    *,
+    schedule_spec: Any,
+    plan: Any,
+) -> dict[str, Any]:
+    """Validate the production fused-schedule compile receipt for this route."""
+
+    receipt_path = _path_c_fusion_compile_receipt_path()
+    base: dict[str, Any] = {
+        "path": str(receipt_path),
+        "status": "missing",
+        "verified": False,
+        "schedule_id": None,
+        "schedule_name": None,
+        "native_compile_ok": False,
+        "cache_key_recompile_status": None,
+        "reason": "production fused schedule compile receipt is missing",
+    }
+    if not receipt_path.exists():
+        return base
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {
+            **base,
+            "status": "unreadable",
+            "reason": f"{type(exc).__name__}: {exc}",
+        }
+
+    receipt_schedule = receipt.get("schedule_spec", {})
+    receipt_plan = receipt.get("compile_plan", {})
+    receipt_contract = receipt_plan.get("schedule_contract", {}) or {}
+    receipt_cache_audit = receipt.get("cache_key_recompile_audit", {}) or {}
+    schedule_id = str(receipt_schedule.get("schedule_id", ""))
+    schedule_name = str(receipt_plan.get("schedule_name", ""))
+    cache_key_recompile_status = receipt_cache_audit.get("status")
+
+    expected_schedule_id = str(schedule_spec.schedule_id)
+    expected_schedule_name = str(schedule_spec.schedule_name)
+    checks = {
+        "receipt_status_ok": receipt.get("status") == "ok",
+        "native_compile_ok": receipt.get("native_compile_requested") is True
+        and receipt.get("native_compile_ok") is True,
+        "schedule_id_matches": schedule_id == expected_schedule_id,
+        "schedule_name_matches": schedule_name == expected_schedule_name,
+        "plan_region_matches": receipt_plan.get("region_name") == plan.region_name,
+        "single_kernel_fused": receipt_plan.get("single_kernel_fused") is True,
+        "compile_plan_ready": receipt_plan.get("schedule_status") == "ready",
+        "schedule_contract_verified": receipt_contract.get("status") == "verified",
+        "declared_schedule_id_matches": (
+            receipt_contract.get("declared_schedule_id") == expected_schedule_id
+        ),
+        "real_abi_complete": (
+            receipt_schedule.get("real_abi_contract_complete") is True
+            and receipt_schedule.get("missing_real_abi_inputs") == []
+            and receipt_contract.get("missing_real_abi_inputs") == []
+        ),
+        "real_abi_input_shapes_match": (
+            tuple(receipt_schedule.get("required_real_abi_input_shapes", ()))
+            == tuple(schedule_spec.required_real_abi_input_shapes)
+        ),
+        "production_fragments_complete": (
+            receipt_schedule.get("production_fragments_complete") is True
+        ),
+        "cache_key_recompile_stable": cache_key_recompile_status == "key_stable",
+    }
+    failed_checks = [name for name, ok in checks.items() if not ok]
+    verified = not failed_checks
+    return {
+        **base,
+        "status": "verified" if verified else "mismatch",
+        "verified": verified,
+        "schedule_id": schedule_id or None,
+        "schedule_name": schedule_name or None,
+        "native_compile_ok": bool(receipt.get("native_compile_ok")),
+        "cache_key_recompile_status": cache_key_recompile_status,
+        "checks": checks,
+        "failed_checks": failed_checks,
+        "reason": (
+            "production fused schedule compile receipt matches the selected "
+            "schedule, verified contract, native lowerer, and stable cache-key "
+            "recompile audit"
+            if verified
+            else "production fused schedule compile receipt does not match this route"
+        ),
+    }
+
+
 def path_c_fusion_payload(
     *,
     model: Any | None = None,
@@ -1346,6 +2073,10 @@ def path_c_fusion_payload(
     bank_buffer_owner: str | None = None,
     bank_owner: Any | None = None,
     fused_artifact: Any | None = None,
+    direct_chain_artifacts: Any | None = None,
+    direct_chain_logical_buffers: Mapping[str, Any] | None = None,
+    direct_chain_logical_buffer_owner: str | None = None,
+    direct_chain_logical_owner: Any | None = None,
 ) -> dict[str, Any]:
     """Return receipt metadata for the high-level Path C fusion planner."""
 
@@ -1380,6 +2111,11 @@ def path_c_fusion_payload(
         contract=plan.schedule_contract,
         target=scheduled.schedule_target,
     )
+    compile_receipt = _path_c_fusion_compile_receipt_payload(
+        schedule_spec=schedule_spec,
+        plan=plan,
+    )
+    production_compile_verified = bool(compile_receipt.get("verified"))
     runtime_training_binding = path_c_fusion_runtime_training_binding_payload(
         region=region,
         schedule_target=scheduled.schedule_target,
@@ -1388,14 +2124,36 @@ def path_c_fusion_payload(
         bank_owner=bank_owner,
         fused_artifact=fused_artifact,
     )
-    real_schedule_unverified = not plan.single_kernel_fused
+    direct_chain = plan_path_c_direct_fusion_chain_for_region(
+        region,
+        include_backward=True,
+    )
+    direct_chain_runtime_binding = (
+        path_c_direct_fusion_chain_runtime_binding_payload(
+            chain=direct_chain,
+            logical_buffers=direct_chain_logical_buffers,
+            logical_buffer_owner=direct_chain_logical_buffer_owner,
+            logical_owner=direct_chain_logical_owner,
+            artifacts=direct_chain_artifacts,
+        )
+    )
+    runtime_fused_route_bound = bool(
+        runtime_training_binding.get("runtime_uses_fused_train_block")
+        or direct_chain_runtime_binding.get("runtime_uses_direct_fusion_chain")
+    )
+    real_schedule_unverified = (
+        not production_compile_verified and not plan.single_kernel_fused
+    )
     force_blocked = mode is PathCFusionMode.FORCE and real_schedule_unverified
+    force_runtime_blocked = mode is PathCFusionMode.FORCE and not runtime_fused_route_bound
     scaffold_blocked = not schedule_spec.production_fragments_complete
     status = (
         "off"
         if mode is PathCFusionMode.OFF
         else "force_blocked_schedule_unverified"
         if force_blocked
+        else "force_blocked_runtime_not_bound"
+        if force_runtime_blocked
         else "plan_scaffold_not_default"
         if scaffold_blocked
         else "plan_ready_not_default"
@@ -1406,13 +2164,23 @@ def path_c_fusion_payload(
             "scaffold, but the production body is not complete because at least "
             "one brick fragment is not production-inlined"
         )
-    elif real_schedule_unverified:
+    elif not production_compile_verified:
         reason = (
             "real fused train-block schedule is registered but is not yet trusted, "
             "compile-verified, benchmarked, and memory-profiled for default use"
         )
+    elif not runtime_fused_route_bound:
+        reason = (
+            "real fused train-block schedule has a matching native compile "
+            "receipt and stable cache-key audit, but the training runtime still "
+            "has no bound fused artifact/banks or direct-chain logical buffers"
+        )
     else:
-        reason = None
+        reason = (
+            "real fused train-block schedule is compile-verified and runtime-bound, "
+            "but the full 1B benchmark, profiling, and memory receipts are still "
+            "required before default use"
+        )
     return {
         "mode": mode.value,
         "status": status,
@@ -1549,6 +2317,17 @@ def path_c_fusion_payload(
             else None
         ),
         "runtime_training_binding": runtime_training_binding,
+        "production_compile_receipt": compile_receipt,
+        "direct_chained_fusion": {
+            **_path_c_direct_chain_plan_payload(direct_chain),
+            "model_binding_audit": (
+                path_c_direct_fusion_chain_model_binding_audit(
+                    chain=direct_chain,
+                    model=model,
+                )
+            ),
+            "runtime_binding": direct_chain_runtime_binding,
+        },
         "schedule_blockers": [
             {
                 "kind": (
@@ -1605,18 +2384,31 @@ def path_c_fusion_payload(
                 if not schedule_spec.production_fragments_complete
                 else []
             ),
-            {
-                "kind": "production_schedule_not_compile_verified",
-                "schedule_id": schedule_spec.schedule_id,
-                "schedule_name": schedule_spec.schedule_name,
-                "schedule_contract_status": plan.schedule_contract.status
-                if plan.schedule_contract is not None
-                else "missing",
-                "reason": (
-                    "the planner has not produced a trusted lowered production "
-                    "compile receipt with schedule_contract.status=verified"
-                ),
-            },
+            *(
+                [
+                    {
+                        "kind": "production_schedule_not_compile_verified",
+                        "schedule_id": schedule_spec.schedule_id,
+                        "schedule_name": schedule_spec.schedule_name,
+                        "schedule_contract_status": plan.schedule_contract.status
+                        if plan.schedule_contract is not None
+                        else "missing",
+                        "compile_receipt_status": compile_receipt.get("status"),
+                        "compile_receipt_path": compile_receipt.get("path"),
+                        "failed_checks": list(
+                            compile_receipt.get("failed_checks", ())
+                        ),
+                        "reason": (
+                            "the planner has not produced a matching lowered "
+                            "production compile receipt with native_compile_ok, "
+                            "schedule_contract.status=verified, and a stable "
+                            "cache-key recompile audit"
+                        ),
+                    }
+                ]
+                if not production_compile_verified
+                else []
+            ),
             *(
                 [
                     {
@@ -1641,9 +2433,7 @@ def path_c_fusion_payload(
                         "reason": runtime_training_binding.get("reason"),
                     }
                 ]
-                if not runtime_training_binding.get(
-                    "runtime_uses_fused_train_block"
-                )
+                if not runtime_fused_route_bound
                 else []
             ),
             {
@@ -1733,6 +2523,7 @@ def path_c_fusion_payload(
             "requires_clean_path_b_baseline": True,
             "requires_ready_fusion_plan": True,
             "requires_compile_verified_single_kernel": True,
+            "current_compile_receipt_verified": production_compile_verified,
             "requires_verified_schedule_contract": True,
             "requires_complete_real_abi_contract": True,
             "current_plan_default_eligible": False,

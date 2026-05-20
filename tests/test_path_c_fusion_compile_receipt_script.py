@@ -133,6 +133,28 @@ def test_compile_receipt_plans_model_derived_fused_schedule(tmp_path: Path) -> N
         "path_c_uint8_abi_bank",
         "path_c_int32_abi_bank",
     ]
+    direct_alternative = payload["direct_logical_abi_alternative"]
+    assert direct_alternative["physical_abi_policy"] == "direct_buffers"
+    assert direct_alternative["status"] == "blocked_metal_buffer_limit"
+    assert direct_alternative["logical_tensor_binding_supported"] is True
+    assert direct_alternative["no_hidden_allocation_policy"] is True
+    assert direct_alternative["kernel_parameter_count"] > (
+        direct_alternative["metal_buffer_limit"]
+    )
+    assert direct_alternative["metal_buffer_limit_exceeded"] is True
+    chain_plan = direct_alternative["direct_chained_fusion_plan"]
+    assert chain_plan["status"] == "ready"
+    assert chain_plan["covers_full_region"] is True
+    assert chain_plan["segment_count"] >= 2
+    assert all(
+        segment["physical_abi_policy"] == "direct_buffers"
+        and segment["kernel_parameter_count"] <= chain_plan["max_kernel_buffers"]
+        for segment in chain_plan["segments"]
+    )
+    assert direct_alternative["direct_chained_fusion_native_compile"] == {
+        "status": "not_requested",
+        "native_compile_requested": False,
+    }
     assert payload["generated_source"]["spilled_shared_scratch_shapes"]
     assert payload["generated_source"]["shared_scratch_abi_bytes"] > 0
     assert "local_gb10_quarter_brick_10_M_delta" in (
@@ -165,8 +187,11 @@ def test_compile_receipt_plans_model_derived_fused_schedule(tmp_path: Path) -> N
 
 def test_compile_receipt_records_native_lowerer_artifact(tmp_path: Path) -> None:
     captured: dict[str, object] = {}
+    call_count = 0
 
     def fake_lowerer(func_or_mod: object, **kwargs: object) -> object:
+        nonlocal call_count
+        call_count += 1
         captured["func_or_mod"] = func_or_mod
         captured["kwargs"] = kwargs
         return SimpleNamespace(name="fake-jit-kernel")
@@ -199,6 +224,17 @@ def test_compile_receipt_records_native_lowerer_artifact(tmp_path: Path) -> None
     assert payload["generated_source"]["compile_pass_configs"] == {
         "tirx.disable_cse_tir": True,
     }
+    chain_compile = payload["direct_logical_abi_alternative"][
+        "direct_chained_fusion_native_compile"
+    ]
+    assert chain_compile["status"] == "ok"
+    assert chain_compile["segment_count"] >= 2
+    assert all(
+        segment["native_compile_ok"]
+        and segment["artifact_type"] == "SimpleNamespace"
+        for segment in chain_compile["segments"]
+    )
+    assert call_count >= 1 + chain_compile["segment_count"]
     assert captured["kwargs"]["target"] == "metal"
 
 

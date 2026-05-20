@@ -77,6 +77,80 @@ class PathCPhysicalAbiBankOwner:
         return tuple(spec.name for spec in self.bank_specs)
 
 
+@dataclass(frozen=True)
+class PathCLogicalBufferOwner:
+    """Caller/model-owned logical buffers for direct Path C chain execution.
+
+    This wrapper records references to existing logical tensors. It never
+    reshapes, packs, casts, or allocates buffers to satisfy a generated ABI.
+    """
+
+    owner_name: str
+    buffers: Mapping[str, Any]
+    hidden_packing_performed: bool = False
+    no_hidden_allocation_policy: bool = True
+
+
+def compose_path_c_logical_buffer_owner(
+    owner_name: str,
+    *owners: PathCLogicalBufferOwner | Mapping[str, Any] | None,
+) -> PathCLogicalBufferOwner:
+    """Combine existing logical-buffer owners without touching tensor storage."""
+
+    sentinel = object()
+    buffers: dict[str, Any] = {}
+    buffer_sources: dict[str, str] = {}
+    hidden_packing_performed = False
+    no_hidden_allocation_policy = True
+
+    for index, owner in enumerate(owners):
+        if owner is None:
+            continue
+        if isinstance(owner, Mapping):
+            owner_buffers = owner
+            source_name = f"mapping_{index}"
+            owner_hidden_packing = False
+            owner_no_hidden_allocation = True
+        else:
+            owner_buffers = getattr(owner, "buffers", None)
+            source_name = str(getattr(owner, "owner_name", f"owner_{index}"))
+            owner_hidden_packing = bool(
+                getattr(owner, "hidden_packing_performed", False)
+            )
+            owner_no_hidden_allocation = bool(
+                getattr(owner, "no_hidden_allocation_policy", True)
+            )
+        if owner_buffers is None:
+            raise TypeError(
+                "Path C logical owner entries must be PathCLogicalBufferOwner "
+                "instances or mappings"
+            )
+        hidden_packing_performed = (
+            hidden_packing_performed or owner_hidden_packing
+        )
+        no_hidden_allocation_policy = (
+            no_hidden_allocation_policy and owner_no_hidden_allocation
+        )
+        for raw_name, value in owner_buffers.items():
+            name = str(raw_name)
+            existing = buffers.get(name, sentinel)
+            if existing is not sentinel and existing is not value:
+                raise ValueError(
+                    f"conflicting logical buffer {name!r}: "
+                    f"{buffer_sources[name]} and {source_name} provide "
+                    "different objects"
+                )
+            buffers[name] = value
+            buffer_sources.setdefault(name, source_name)
+
+    return PathCLogicalBufferOwner(
+        owner_name=owner_name,
+        buffers=buffers,
+        hidden_packing_performed=hidden_packing_performed,
+        no_hidden_allocation_policy=no_hidden_allocation_policy,
+    )
+
+
 def normalize_physical_abi_map(
     mapping: Mapping[str, Any],
 ) -> tuple[PathCPhysicalAbiBinding, ...]:
@@ -357,6 +431,8 @@ def validate_physical_abi_runtime_bindings(
             "ordered_kernel_buffers": required_banks,
             "missing_bank_buffers": required_banks,
             "unexpected_buffers": [],
+            "shape_mismatch_buffers": [],
+            "dtype_mismatch_buffers": [],
             "bridge_plan": bridge_plan,
         }
 
@@ -367,6 +443,8 @@ def validate_physical_abi_runtime_bindings(
         f"{bank}: missing caller-owned bank buffer"
         for bank in missing
     ]
+    shape_mismatches: list[str] = []
+    dtype_mismatches: list[str] = []
 
     for bank in required_banks:
         if bank not in provided:
@@ -374,12 +452,14 @@ def validate_physical_abi_runtime_bindings(
         expected_shape = tuple(int(dim) for dim in tuple(bank_shapes[bank]))
         actual_shape = _shape_of(provided[bank])
         if actual_shape != expected_shape:
+            shape_mismatches.append(bank)
             errors.append(
                 f"{bank}: shape {actual_shape} does not match expected {expected_shape}"
             )
         expected_dtype = bank_dtypes.get(bank)
         actual_dtype = _dtype_of(provided[bank])
         if actual_dtype != expected_dtype:
+            dtype_mismatches.append(bank)
             errors.append(
                 f"{bank}: dtype {actual_dtype!r} does not match expected {expected_dtype!r}"
             )
@@ -395,6 +475,8 @@ def validate_physical_abi_runtime_bindings(
         "ordered_kernel_buffers": required_banks,
         "missing_bank_buffers": missing,
         "unexpected_buffers": unexpected,
+        "shape_mismatch_buffers": shape_mismatches,
+        "dtype_mismatch_buffers": dtype_mismatches,
         "bridge_plan": bridge_plan,
     }
 
@@ -480,6 +562,8 @@ __all__ = [
     "PathCPhysicalAbiBinding",
     "PathCPhysicalAbiBankOwner",
     "PathCPhysicalAbiBankSpec",
+    "PathCLogicalBufferOwner",
+    "compose_path_c_logical_buffer_owner",
     "make_physical_abi_bank_owner",
     "normalize_physical_abi_map",
     "physical_abi_bank_specs",

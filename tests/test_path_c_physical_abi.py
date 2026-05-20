@@ -3,6 +3,8 @@ from __future__ import annotations
 import pytest
 
 from cppmega_mlx.runtime.path_c_physical_abi import (
+    PathCLogicalBufferOwner,
+    compose_path_c_logical_buffer_owner,
     make_physical_abi_bank_owner,
     physical_abi_bank_specs,
     physical_abi_full_runtime_kernel_args,
@@ -168,6 +170,41 @@ class _ArrayLike:
     def __init__(self, shape: tuple[int, ...], dtype: str) -> None:
         self.shape = shape
         self.dtype = dtype
+
+
+def test_compose_path_c_logical_buffer_owner_preserves_existing_refs() -> None:
+    hidden = _ArrayLike((2, 4), "float32")
+    hidden_grad = _ArrayLike((2, 4), "float32")
+
+    owner = compose_path_c_logical_buffer_owner(
+        "local_gb10_quarter.path_c_direct_fusion_chain_buffers",
+        PathCLogicalBufferOwner(
+            "local_gb10_quarter.path_c_model_parameter_buffers",
+            {"hidden": hidden},
+        ),
+        PathCLogicalBufferOwner(
+            "local_gb10_quarter.path_c_runtime_activation_buffers",
+            {"hidden_grad": hidden_grad},
+        ),
+    )
+
+    assert owner.owner_name == "local_gb10_quarter.path_c_direct_fusion_chain_buffers"
+    assert owner.buffers["hidden"] is hidden
+    assert owner.buffers["hidden_grad"] is hidden_grad
+    assert owner.hidden_packing_performed is False
+    assert owner.no_hidden_allocation_policy is True
+
+
+def test_compose_path_c_logical_buffer_owner_rejects_conflicting_refs() -> None:
+    left = _ArrayLike((2,), "float32")
+    right = _ArrayLike((2,), "float32")
+
+    with pytest.raises(ValueError, match="conflicting logical buffer"):
+        compose_path_c_logical_buffer_owner(
+            "local_gb10_quarter.path_c_direct_fusion_chain_buffers",
+            PathCLogicalBufferOwner("left", {"hidden": left}),
+            PathCLogicalBufferOwner("right", {"hidden": right}),
+        )
 
 
 def test_runtime_binding_accepts_existing_prepacked_bank_buffers() -> None:

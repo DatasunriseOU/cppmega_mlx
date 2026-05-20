@@ -258,11 +258,24 @@ class ModelFactoryProfile:
     def path_c_bricks(self) -> tuple[dict[str, str], ...]:
         """Return allocation-free brick descriptors for Path C auto-discovery."""
 
+        config = self.hybrid_config()
         return tuple(
             {
                 "name": f"{self.name}_brick_{index}_{layer.symbol}",
                 "kind": layer.role,
                 "route_symbol": layer.symbol,
+                **(
+                    {
+                        "attention_qkv_has_bias": str(
+                            bool(config.attention_config(layer.attention_route).bias)
+                        ).lower(),
+                        "attention_out_proj_has_bias": str(
+                            bool(config.attention_config(layer.attention_route).bias)
+                        ).lower(),
+                    }
+                    if layer.symbol == "A"
+                    else {}
+                ),
             }
             for index, layer in enumerate(self.expanded_pattern.layers)
         )
@@ -276,9 +289,12 @@ class ModelFactoryProfile:
         """Allocate the profile's MLX model via the existing HybridTinyLM builder."""
 
         self.tokenizer_contract.require_resolved()
-        return HybridTinyLM(
-            self.hybrid_config(**hybrid_config_overrides),
-            dtype=dtype,
+        return _attach_path_c_profile_metadata(
+            HybridTinyLM(
+                self.hybrid_config(**hybrid_config_overrides),
+                dtype=dtype,
+            ),
+            self,
         )
 
     def build_tiny_smoke_model(
@@ -289,9 +305,12 @@ class ModelFactoryProfile:
     ) -> HybridTinyLM:
         """Allocate a tiny model that preserves route metadata for smoke tests."""
 
-        return HybridTinyLM(
-            self.tiny_smoke_config(**hybrid_config_overrides),
-            dtype=dtype,
+        return _attach_path_c_profile_metadata(
+            HybridTinyLM(
+                self.tiny_smoke_config(**hybrid_config_overrides),
+                dtype=dtype,
+            ),
+            self,
         )
 
 
@@ -345,6 +364,19 @@ def get_model_profile(name: str) -> ModelFactoryProfile:
         f"unknown model factory profile {name!r}; supported: "
         f"{LOCAL_GB10_QUARTER_PROFILE}, {NAM56R_FULL_PROFILE}"
     )
+
+
+def _attach_path_c_profile_metadata(
+    model: HybridTinyLM,
+    profile: ModelFactoryProfile,
+) -> HybridTinyLM:
+    model.path_c_profile_name = profile.name
+    model.path_c_input_model_name = f"{profile.name}.path_c_bricks"
+    model.path_c_region_prefix = f"{profile.name}_path_c"
+    for index, (layer, brick) in enumerate(zip(model.layers, profile.path_c_bricks)):
+        layer.path_c_layer_index = index
+        layer.path_c_profile_brick_name = brick["name"]
+    return model
 
 
 def local_gb10_quarter(

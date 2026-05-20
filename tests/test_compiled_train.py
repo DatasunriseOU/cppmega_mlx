@@ -15,6 +15,7 @@ from cppmega_mlx.models.hybrid_lm import HybridTinyConfig, HybridTinyLM
 from cppmega_mlx.models.tiny_lm import TinyLM, TinyLMConfig
 from cppmega_mlx.training.compiled import (
     CompiledPretrainingStep,
+    PathCGradientBufferCapture,
     PretrainingMetrics,
     PretrainingState,
     REGIONAL_COMPILE_TARGETS,
@@ -403,6 +404,68 @@ def test_compiled_pretraining_step_rejects_non_boolean_compile_flag() -> None:
 
     with pytest.raises(TypeError, match="compile must be a boolean"):
         CompiledPretrainingStep(model, optimizer, compile=bad_compile)
+
+
+def test_path_c_gradient_probe_is_eager_only_and_stores_references() -> None:
+    config = _hybrid_config(pattern="M", depth=1)
+    model = HybridTinyLM(config)
+    optimizer = optim.AdamW(learning_rate=1e-3, weight_decay=0.0)
+    batch = synthetic_token_batch(
+        batch_size=1,
+        seq_length=8,
+        vocab_size=config.vocab_size,
+        seed=71,
+        include_structure=True,
+    )
+    capture = PathCGradientBufferCapture(
+        aliases={
+            "layers.0.block.in_proj.weight_grad": (
+                "layer_0_m_mamba3_in_proj_weight_grad"
+            )
+        },
+        owner_name="hybrid_tiny_m.path_c_gradient_capture",
+    )
+    step = CompiledPretrainingStep(
+        model,
+        optimizer,
+        compile=False,
+        path_c_gradient_probe=capture,
+    )
+
+    metrics = step(batch)
+
+    assert metrics.compiled is False
+    assert capture.owner_name == "hybrid_tiny_m.path_c_gradient_capture"
+    assert "layers.0.block.in_proj.weight_grad" in capture.buffers
+    assert "layer_0_m_mamba3_in_proj_weight_grad" in capture.buffers
+    assert (
+        capture.buffers["layer_0_m_mamba3_in_proj_weight_grad"]
+        is capture.buffers["layers.0.block.in_proj.weight_grad"]
+    )
+    events_by_name = {
+        str(event["parameter_name"]): event for event in capture.events
+    }
+    event = events_by_name["layers.0.block.in_proj.weight"]
+    assert capture.buffers["layers.0.block.in_proj.weight_grad"] is event["tensor"]
+    assert event["logical_names"] == ("layers.0.block.in_proj.weight_grad",)
+    assert event["phase"] == "value_and_grad"
+
+
+def test_path_c_gradient_probe_rejects_compiled_step_fail_closed() -> None:
+    model = TinyLM(_tiny_config())
+    optimizer = optim.AdamW(learning_rate=1e-2, weight_decay=0.0)
+
+    with pytest.raises(ValueError, match="compile=False"):
+        CompiledPretrainingStep(
+            model,
+            optimizer,
+            compile=True,
+            path_c_gradient_probe=lambda _event: None,
+        )
+
+    step = CompiledPretrainingStep(model, optimizer, compile=True)
+    with pytest.raises(ValueError, match="compile=False"):
+        step.attach_path_c_gradient_probe(lambda _event: None)
 
 
 @pytest.mark.parametrize("grad_accum_steps", [True, "1", 0])

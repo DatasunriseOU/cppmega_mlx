@@ -64,6 +64,8 @@ from cppmega_mlx.runtime.path_c_fusion_schedules import (
     mamba3_fp8_train_prototype_schedule_template,
     path_c_fusion_schedule_spec,
     path_c_fusion_schedule_template,
+    plan_path_c_direct_fusion_chain_for_region,
+    plan_path_c_direct_fusion_chains_for_model,
     plan_path_c_fusion_schedule_for_region,
     plan_path_c_fusion_schedules_for_model,
     plan_mamba3_fp8_train_fusion_schedule,
@@ -666,6 +668,105 @@ def test_plan_path_c_fusion_schedules_for_model_uses_dynamic_brick_chain() -> No
     assert "mamba3_in_proj_weight" not in (
         scheduled.schedule_target.required_real_abi_inputs
     )
+
+
+def test_plan_path_c_direct_fusion_chains_for_model_uses_dynamic_brick_chain() -> None:
+    model = SimpleNamespace(
+        name="dynamic_model",
+        route_symbols=("M",),
+        path_c_bricks=(
+            {"name": "scan", "kind": "mamba3"},
+            {"name": "m2", "kind": "m2rnn"},
+            {"name": "attn", "kind": "sparse_mla_fp8"},
+        ),
+        config=local_gb10_quarter_profile().hybrid_config(),
+    )
+
+    chains = plan_path_c_direct_fusion_chains_for_model(
+        model,
+        region_prefix="dynamic_model_path_c",
+    )
+
+    assert len(chains) == 1
+    chain = chains[0]
+    assert chain.status == "ready"
+    assert chain.source_region.name == "dynamic_model_path_c_0_2"
+    assert any(
+        node.op_name.endswith("_bwd") for node in chain.source_region.nodes
+    )
+    assert chain.source_region.metadata.get("path_c_acceptance_fixture_abi") is not True
+    assert chain.segments[0].node_start == 0
+    assert chain.segments[-1].node_end == len(chain.source_region.nodes)
+    assert all(segment.physical_abi_policy == "direct_buffers" for segment in chain.segments)
+    assert all(
+        "mamba3_in_proj_weight" not in getattr(
+            segment.schedule_target,
+            "required_real_abi_inputs",
+            (),
+        )
+        for segment in chain.segments
+        if segment.schedule_target is not None
+    )
+
+
+def test_model_derived_biasless_attention_omits_qkv_bias_abi() -> None:
+    profile = local_gb10_quarter_profile()
+    model = SimpleNamespace(
+        name=profile.name,
+        path_c_bricks=profile.path_c_bricks,
+        config=profile.hybrid_config(),
+    )
+    fwd_region = build_path_c_model_regions_from_model(
+        model,
+        region_prefix=f"{profile.name}_path_c",
+    )[0]
+    region = build_path_c_aot_autograd_region(fwd_region)
+    qkv_node = next(
+        node for node in region.nodes if node.op_name == "attention_qkv_projection"
+    )
+    qkv_bwd_node = next(
+        node
+        for node in region.nodes
+        if node.op_name == "attention_qkv_projection_bwd"
+    )
+    apply_node = next(
+        node for node in region.nodes if node.op_name == "sparse_mla_fp8_apply"
+    )
+    target = select_path_c_fusion_schedule_target(region)
+
+    assert target is not None
+    assert "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_bias" not in (
+        qkv_node.inputs
+    )
+    assert (
+        "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_bias"
+        not in qkv_node.inputs
+    )
+    assert (
+        "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_bias_grad"
+        not in qkv_bwd_node.outputs
+    )
+    assert (
+        "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_bias_grad"
+        not in qkv_bwd_node.outputs
+    )
+    assert (
+        "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_attention_out_proj_bias"
+        not in apply_node.inputs
+    )
+
+    prim_func = target.schedule_template(region)
+    abi_map = prim_func._cppmega_path_c_physical_buffer_abi_map
+    generated_source = prim_func._cppmega_path_c_generated_source
+
+    assert all(
+        "q_proj_bias" not in name and "sparse_kv_proj_bias" not in name
+        for name in abi_map
+    )
+    assert all("attention_out_proj_bias" not in name for name in abi_map)
+    assert "q_proj_bias" not in generated_source
+    assert "sparse_kv_proj_bias" not in generated_source
+    assert "attention_out_proj_bias" not in generated_source
 
 
 def test_compile_plan_cache_key_is_stable_for_equivalent_surface_ordering() -> None:
@@ -2910,6 +3011,116 @@ def test_model_derived_aot_backward_schedule_uses_dynamic_edge_names() -> None:
     )
 
 
+def test_row_phased_bwd_only_descriptor_template_skips_empty_forward_loop() -> None:
+    profile = local_gb10_quarter_profile()
+    model = SimpleNamespace(
+        name=profile.name,
+        path_c_bricks=profile.path_c_bricks,
+        config=profile.hybrid_config(),
+    )
+    fwd_region = build_path_c_model_regions_from_model(
+        model,
+        region_prefix=f"{profile.name}_path_c",
+    )[0]
+    region = build_path_c_aot_autograd_region(fwd_region)
+    bwd_region = build_path_c_fusion_region(
+        region_name=f"{profile.name}_path_c_bwd_only",
+        surfaces=tuple(
+            FusionKernelSurface.path_c(
+                name=node.name,
+                op_name=node.op_name,
+                inputs=node.inputs,
+                outputs=node.outputs,
+                backward=node.backward,
+                backend=node.backend,
+            )
+            for node in region.nodes
+            if node.op_name.endswith("_bwd")
+        ),
+        z3_sync=region.z3_sync,
+        metadata=region.metadata,
+    )
+    target = select_path_c_fusion_schedule_target(bwd_region)
+
+    assert target is not None
+    prim_func = target.schedule_template(bwd_region)
+    generated_source = prim_func._cppmega_path_c_generated_source
+
+    assert "# backward_policy: row_phased_hidden_recompute" in generated_source
+    assert "for row in T.serial(0, 4096):\n        # backward_policy" not in (
+        generated_source
+    )
+
+
+def test_direct_fusion_chain_splits_model_route_under_metal_buffer_limit() -> None:
+    profile = local_gb10_quarter_profile()
+    model = SimpleNamespace(
+        name=profile.name,
+        path_c_bricks=profile.path_c_bricks,
+        config=profile.hybrid_config(),
+    )
+    fwd_region = build_path_c_model_regions_from_model(
+        model,
+        region_prefix=f"{profile.name}_path_c",
+    )[0]
+    region = build_path_c_aot_autograd_region(fwd_region)
+
+    chain = plan_path_c_direct_fusion_chain_for_region(
+        region,
+        include_backward=False,
+    )
+
+    assert chain.status == "ready"
+    assert len(chain.segments) >= 2
+    assert tuple(
+        (segment.node_start, segment.node_end)
+        for segment in chain.segments
+    )[0][0] == 0
+    assert chain.segments[-1].node_end == len(region.nodes)
+    for previous, current in zip(chain.segments[:-1], chain.segments[1:], strict=True):
+        assert previous.node_end == current.node_start
+    for segment in chain.segments:
+        assert segment.status == "ok"
+        assert segment.physical_abi_policy == "direct_buffers"
+        assert segment.kernel_parameter_count is not None
+        assert segment.kernel_parameter_count <= chain.max_kernel_buffers
+        assert segment.schedule_target is not None
+        assert segment.plan is not None
+    shape_env = fwd_region.metadata["path_c_model_shape_env"]
+    abi_shapes = {}
+    for segment in chain.segments:
+        assert segment.schedule_target is not None
+        prim_func = segment.schedule_target.schedule_template(segment.region)
+        for buffer_name, shape in (
+            prim_func._cppmega_path_c_physical_buffer_abi_shapes.items()
+        ):
+            previous_shape = abi_shapes.setdefault(buffer_name, shape)
+            assert previous_shape == shape
+    assert abi_shapes["hidden"] == (
+        1,
+        shape_env.sequence_length,
+        shape_env.hidden_size,
+    )
+    assert abi_shapes["local_gb10_quarter_brick_10_M_delta"] == (
+        1,
+        shape_env.sequence_length,
+        shape_env.hidden_size,
+    )
+    assert abi_shapes[
+        "local_gb10_quarter_brick_10_M_mamba3_in_proj_weight"
+    ] == (shape_env.mamba_in_proj_dim, shape_env.hidden_size)
+    assert abi_shapes[
+        "local_gb10_quarter_brick_10_M_mamba3_conv_weight"
+    ] == (
+        shape_env.mamba_conv_channels,
+        shape_env.mamba_conv_kernel,
+        1,
+    )
+    assert abi_shapes[
+        "local_gb10_quarter_brick_10_M_residual_norm_weight"
+    ] == (shape_env.hidden_size,)
+
+
 @pytest.mark.skipif(
     os.environ.get("CPPMEGA_RUN_NATIVE_TILELANG_COMPILE_SMOKE") != "1",
     reason=(
@@ -3129,7 +3340,11 @@ def test_model_region_shape_env_controls_dynamic_descriptor_extent() -> None:
     )
     prim_func = target.schedule_template(region)
     generated_source = prim_func._cppmega_path_c_generated_source
-    assert "hidden: T.Buffer((4096,), \"float32\")" in generated_source
+    abi_shapes = prim_func._cppmega_path_c_physical_buffer_abi_shapes
+    assert abi_shapes["hidden"] == (1, 128, 32)
+    assert "hidden: T.Buffer((1, 128, 32), \"float32\")" in generated_source
+    assert "hidden[0, i // 32, i % 32]" in generated_source
+    assert "hidden[0, (i % 4096) // 32, (i % 4096) % 32]" not in generated_source
     assert prim_func._cppmega_path_c_buffer_extent == 128
     assert prim_func._cppmega_path_c_loop_extent == 4096
     assert target.internal_buffer_policy == DESCRIPTOR_INTERNAL_BUFFER_POLICY_ROW_LOCAL_HIDDEN

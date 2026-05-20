@@ -117,7 +117,7 @@
         <div class="grid">
           <div class="metric"><span>Fused schedule body</span><strong><span class="status pass">compiled</span></strong><p><code>single_kernel_fused=true</code></p></div>
           <div class="metric"><span>Real ABI contract</span><strong><span class="status pass">complete</span></strong><p><code>missing_real_abi_inputs=[]</code></p></div>
-          <div class="metric"><span>Training runtime route</span><strong><span class="status partial">owner hook ready</span></strong><p>Explicit bank-owner binding works; live model banks still missing.</p></div>
+          <div class="metric"><span>Training runtime route</span><strong><span class="status partial">artifact gates ready</span></strong><p>Model-derived route is dynamic; live model banks/direct buffers and callable artifacts are still missing.</p></div>
           <div class="metric"><span>Path C default</span><strong><span class="status block">disabled</span></strong><p>Default gate remains fail-closed.</p></div>
         </div>
       </div>
@@ -148,26 +148,26 @@
             <tr>
               <td>Production fused schedule body exists for the selected local GB10 Path C train-block region.</td>
               <td><span class="status pass">compiled</span></td>
-              <td><code>reports/path_c_fusion_compile_receipt.json</code>: <code>compile_plan.single_kernel_fused=true</code>, <code>compile_plan.schedule_status=ready</code>, <code>runtime_execution_contract.single_entry_tilelang_ir=true</code>.</td>
-              <td>Runtime training route still does not call this fused artifact.</td>
+              <td><code>reports/path_c_fusion_compile_receipt.json</code>: <code>compile_plan.single_kernel_fused=true</code>, <code>compile_plan.schedule_status=ready</code>, <code>runtime_execution_contract.single_entry_tilelang_ir=true</code>. Native smoke <code>test_model_derived_descriptor_template_compiles_with_tilelang_lowerer</code> passes.</td>
+              <td>Live training still does not attach or execute the compiled fused artifact.</td>
             </tr>
             <tr>
               <td>Real ABI is carried into the fused region.</td>
               <td><span class="status pass">complete</span></td>
-              <td><code>reports/path_c_fusion_compile_receipt.json</code>: <code>compile_plan.schedule_contract.status=verified</code>, <code>missing_real_abi_inputs=[]</code>, <code>real_abi_contract_complete=true</code>.</td>
-              <td>Physical bank ownership must be wired into the model/training runtime. The generic explicit-bank binding hook is now covered.</td>
+              <td><code>reports/path_c_fusion_compile_receipt.json</code>: <code>compile_plan.schedule_contract.status=verified</code>, <code>schedule_spec.missing_real_abi_inputs=[]</code>, <code>schedule_spec.real_abi_contract_complete=true</code>. Live m04 now validates the receipt against the selected route before dropping the compile blocker: schedule id/name, region, native compile, verified contract, complete ABI, real ABI input shapes, production fragments, and <code>cache_key_recompile_audit.status=key_stable</code>. Factory-built models now carry <code>path_c_profile_name</code>, <code>path_c_input_model_name</code>, and <code>path_c_region_prefix</code>, so live route metadata is <code>local_gb10_quarter.*</code> instead of generic <code>HybridTinyLM.*</code>. Bias-less attention metadata is propagated into the model-derived region, so nonexistent q/sparse_kv projection bias buffers and bias-gradient outputs are not part of the real ABI. The receipt also records the no-pack alternative as <code>direct_logical_abi_alternative.status=blocked_metal_buffer_limit</code>: direct logical tensor binding is supported, but this selected train block would require 73 Metal kernel buffers versus the 31-buffer portable limit. The generic direct-chain fallback is now planned as <code>direct_chained_fusion_plan.status=ready</code> with 4 contiguous direct-buffer segments, and <code>direct_chained_fusion_native_compile.status=ok</code> verifies all 4 segments lower to TileLang <code>JITKernel</code>. The model-level direct-chain entrypoint is dynamic: <code>plan_path_c_direct_fusion_chains_for_model(model)</code> discovers regions from <code>path_c_bricks</code> and never consults the named acceptance fixture. The m04 route now exposes <code>direct_chained_fusion.runtime_binding</code> and can select <code>run_path_c_direct_fusion_chain_route</code> when caller-owned logical buffers plus callable segment artifacts are supplied.</td>
+              <td>Live training still needs a real model owner that exposes those logical buffers/artifacts without hidden packing or copies.</td>
             </tr>
             <tr>
               <td>Native TileLang compile crash should not abort Python on the known MaskAnalysis unsupported cmpi.</td>
               <td><span class="status pass">covered</span></td>
-              <td><code>poc/triton_frontend/tests/test_ptr_analysis.py</code> covers the unsupported unit-mask cmpi in a subprocess. Current run: <code>13 passed</code>.</td>
+              <td><code>poc/triton_frontend/tests/test_ptr_analysis.py</code> covers the unsupported unit-mask cmpi in a subprocess. Current focused run: <code>test_ptr_analysis_unsupported_unit_mask_cmp_fails_recoverably</code> passed.</td>
               <td>Keep minimizing any new abort signatures separately if they appear.</td>
             </tr>
             <tr>
               <td>Full 1B matrix/profiling run proves fused Path C train-block performance.</td>
               <td><span class="status block">blocked</span></td>
-              <td>Current matrix artifacts measure split/generated Path C runtime surfaces. Compile receipt says <code>reporting_contract.runtime_uses_fused_train_block=false</code>. The route payload can now select fused mode when explicit caller-owned banks are supplied, but the live model does not own them yet.</td>
-              <td>Run the full matrix only after the training loop passes real model-owned ABI banks into the fused train-block artifact.</td>
+              <td>Current matrix artifacts measure split/generated Path C runtime surfaces. Compile receipt says <code>reporting_contract.runtime_uses_fused_train_block=false</code>. The production-profile live payload now has <code>production_compile_receipt.status=verified</code>, so the remaining live blockers are runtime binding and 1B profiling, not compile verification. It still reports <code>selected_action=run_path_c_split_training_route</code> and <code>direct_chained_fusion.runtime_binding.status=direct_fusion_chain_logical_buffers_missing</code>. A tiny factory-built model audit reports <code>direct_chained_fusion.model_binding_audit.status=runtime_backward_or_state_owner_missing</code>: the zero-copy forward activation probe exists, a real captured <code>hidden</code> activation in natural MLX shape <code>(1, S, H)</code> now passes the direct ABI shape audit, the model can map MLX parameter-gradient tree names to Path C logical gradient names, and the eager train step now exposes a zero-copy parameter-gradient probe. The audit covers 24 of 37 backward logical gradients from model parameter grads; activation-gradient, prepared FP8, placeholder, and runtime-state owners are still incomplete.</td>
+              <td>Run the full matrix only after the training loop binds either real model-owned physical ABI banks plus the fused artifact, or real direct logical buffers plus all direct-chain segment artifacts.</td>
             </tr>
             <tr>
               <td>Path C can become default only after clean speed, memory, compile, ABI, and cache gates.</td>
@@ -178,7 +178,7 @@
             <tr>
               <td>Cache-key/recompile audit must be closed on production compile receipt.</td>
               <td><span class="status pass">stable</span></td>
-              <td><code>cache_key_recompile_audit.status=key_stable</code>; equivalent native compile attempts produced identical cache material and lowered module digests.</td>
+              <td><code>cache_key_recompile_audit.status=key_stable</code>; equivalent native compile attempts produced identical cache material and lowered module digests. Live m04 validates this field before treating the production compile receipt as verified.</td>
               <td>Repeat after runtime train-block binding changes, because the final runtime route may alter cache-key material.</td>
             </tr>
           </tbody>
@@ -189,17 +189,23 @@
     <section>
       <div class="head">
         <h2>Hard Runtime Blocker</h2>
-        <p>The fused artifact compiles and smoke-runs with synthetic buffers, and the generic route hook accepts explicit physical banks. The real training model still is not bank-owned.</p>
+        <p>The fused artifact compiles and smoke-runs with synthetic buffers. The generic route hook now accepts both explicit physical banks for the single artifact and direct logical buffers for the 4-segment chain. The real training model still does not attach either executable owner/artifact set.</p>
       </div>
       <div class="body">
         <ul>
-          <li><code>runtime_execution_contract.status=compile_only_not_runtime_ready</code></li>
+          <li><code>runtime_execution_contract.status=compile_only_not_runtime_ready</code>; live route <code>production_compile_receipt.status=verified</code> removes the old <code>production_schedule_not_compile_verified</code> blocker only when the receipt matches the selected schedule and stable cache-key audit.</li>
           <li><code>physical_abi_runtime_bridge_status=prepacked_bank_buffers_required</code></li>
           <li><code>physical_abi_runtime_binding_status=not_bound</code></li>
           <li>Missing required banks: <code>path_c_float32_abi_bank</code>, <code>path_c_uint8_abi_bank</code>, <code>path_c_int32_abi_bank</code></li>
-          <li>New runtime hook: <code>path_c_fusion_runtime_training_binding_payload(..., bank_owner=...)</code> marks fused executable only when caller-owned banks satisfy shape and dtype.</li>
+          <li><code>direct_logical_abi_alternative.status=blocked_metal_buffer_limit</code>: the no-pack direct ABI is a real checked alternative, but it needs 73 kernel buffers against the 31-buffer Metal limit.</li>
+          <li><code>direct_chained_fusion_plan.status=ready</code>: the generic planner covers the full fwd+bwd region with 4 direct-buffer fused segments: 31, 28, 31, and 27 kernel buffers.</li>
+          <li><code>direct_chained_fusion_native_compile.status=ok</code>: all 4 direct-chain segments native-compile as verified TileLang <code>JITKernel</code> artifacts.</li>
+          <li><code>direct_chained_fusion.model_binding_audit.status=runtime_backward_or_state_owner_missing</code> for factory-built models: the 4 full-train direct-chain segments require 81 unique logical buffers: 28 model parameters/constants, 11 forward activation/prepared buffers, 37 backward gradients, and 5 runtime states. Bias-less attention no longer contributes fake q/sparse_kv/out_proj bias buffers or bias-gradient outputs. Forward activation and parameter-gradient zero-copy probes now exist, and <code>backward_gradient_parameter_alias_coverage_count=24</code> leaves <code>backward_gradient_uncovered_count=13</code>, but this is still not enough to bind the full runtime ABI.</li>
+          <li>Factory-created <code>HybridTinyLM</code> instances now carry profile-specific Path C names, so the selected model route is <code>local_gb10_quarter_path_c_10_12</code> and the graph input is <code>local_gb10_quarter.path_c_bricks</code>. The model also exposes <code>attach_path_c_activation_probe()</code>, <code>PathCActivationBufferCapture</code>, <code>make_path_c_direct_fusion_chain_logical_buffer_owner()</code>, and <code>path_c_parameter_gradient_aliases()</code>; all store or map references to existing tensors without copying. The generated direct ABI now declares model weights and batch-one activations in their natural MLX shapes, so the auto model-owned logical owner reaches the runtime-binding audit with <code>provided_logical_buffer_count=25</code> and <code>shape_mismatch_count=0</code>, and the real activation capture owner binds <code>hidden</code> without a reshape/copy. The route can now compose the model parameter owner with additional <code>path_c_direct_fusion_chain_logical_buffer_owners</code> via <code>compose_path_c_logical_buffer_owner()</code> without tensor packing/casting; a focused regression binds <code>hidden</code> and <code>hidden_grad</code> through an extra owner and reduces missing buffers from 56 to 54. The remaining block is missing prepared-FP8/sparse-constant/runtime-state/backward-gradient owners and callable direct-chain artifacts, not parameter-shape staging.</li>
+          <li>Runtime hook: <code>path_c_fusion_runtime_training_binding_payload(..., bank_owner=..., fused_artifact=...)</code> marks the single fused artifact executable only when caller-owned banks satisfy shape/dtype and the callable fused artifact is attached.</li>
+          <li>Direct-chain runtime hook: <code>path_c_direct_fusion_chain_runtime_binding_payload(..., logical_buffers=..., artifacts=...)</code> marks the 4-segment chain executable only when every segment has caller-owned direct logical buffers and a callable artifact. Focused test <code>test_fp8_path_c_training_route_selects_direct_chain_when_segments_are_bound</code> passed.</li>
           <li>Receipt seam is wired to preserve a bound <code>fp8_path_c_training_route</code> from <code>train_payload</code> instead of recomputing it without the model owner.</li>
-          <li>Required next code change: make the model/training runtime own and pass those physical ABI banks without hidden packing or copies.</li>
+          <li>Required next code change: wire runtime execution to one of the valid ABI routes: caller-owned physical banks for the single artifact, or the new direct-buffer chain segment sequence.</li>
         </ul>
       </div>
     </section>
@@ -223,20 +229,64 @@
               <td><span class="status pass">exit 0</span> <code>ninja: no work to do</code></td>
             </tr>
             <tr>
-              <td><code>PYTHONPATH=. /Volumes/external/sources/nanochat/.venv/bin/python -m pytest poc/triton_frontend/tests/test_ptr_analysis.py -q --tb=short</code></td>
-              <td><span class="status pass">13 passed</span></td>
+              <td><code>PYTHONPATH=. /Volumes/external/sources/nanochat/.venv/bin/python -m pytest poc/triton_frontend/tests/test_ptr_analysis.py::test_ptr_analysis_unsupported_unit_mask_cmp_fails_recoverably -q --tb=short</code></td>
+              <td><span class="status pass">1 passed</span></td>
             </tr>
             <tr>
-              <td><code>PYTHONPATH=. /Volumes/external/sources/nanochat/.venv/bin/python -m ruff check ...</code> for Path C/m04/matrix files</td>
+              <td><code>CPPMEGA_RUN_NATIVE_TILELANG_COMPILE_SMOKE=1 PYTHONPATH=. /Volumes/external/sources/nanochat/.venv/bin/python -m pytest tests/test_path_c_fusion_ir.py::test_model_derived_descriptor_template_compiles_with_tilelang_lowerer -q --tb=short</code></td>
+              <td><span class="status pass">1 passed</span></td>
+            </tr>
+            <tr>
+              <td><code>PYTHONPATH=. /Volumes/external/sources/nanochat/.venv/bin/ruff check cppmega_mlx/runtime/path_c_fusion_schedules.py cppmega_mlx/runtime/path_c_physical_abi.py scripts/m04_train_step.py tests/test_path_c_fusion_ir.py tests/test_m04_train_step.py tests/test_path_c_physical_abi.py</code></td>
               <td><span class="status pass">All checks passed</span></td>
             </tr>
             <tr>
-              <td><code>PYTHONPATH=. /Volumes/external/sources/nanochat/.venv/bin/python -m pytest tests/test_path_c_physical_abi.py tests/test_m04_train_step.py::test_fp8_path_c_dsa_attention_route_metadata_is_configured tests/test_m04_train_step.py::test_path_c_fusion_runtime_binding_accepts_model_owned_physical_banks tests/test_m04_train_step.py::test_path_c_fusion_runtime_binding_accepts_bank_owner_object tests/test_m04_train_step.py::test_fp8_path_c_training_route_selects_fused_action_when_banks_are_bound tests/test_m04_train_step.py::test_fp8_path_c_training_route_for_model_reads_bank_owner tests/test_m04_train_step.py::test_receipt_preserves_bound_fp8_path_c_route_from_train_payload tests/test_bench_1b_training_matrix.py::test_bench_1b_matrix_extracts_m04_receipt_metrics -q --tb=short</code></td>
-              <td><span class="status pass">17 passed</span></td>
+              <td><code>PYTHONPATH=. /Volumes/external/sources/nanochat/.venv/bin/python -m pytest tests/test_path_c_fusion_ir.py::test_plan_path_c_fusion_schedules_for_model_uses_dynamic_brick_chain tests/test_path_c_fusion_ir.py::test_plan_path_c_direct_fusion_chains_for_model_uses_dynamic_brick_chain tests/test_path_c_fusion_ir.py::test_direct_fusion_chain_splits_model_route_under_metal_buffer_limit -q --tb=short</code></td>
+              <td><span class="status pass">3 passed</span>, covering dynamic schedule planning, dynamic direct-chain planning, and the full local GB10 direct-chain split.</td>
             </tr>
             <tr>
-              <td><code>PYTHONPATH=. /Volumes/external/sources/nanochat/.venv/bin/python -m pytest tests/test_path_c_physical_abi.py tests/test_path_c_fusion_compile_receipt_script.py tests/test_render_1b_training_matrix_html.py tests/test_path_c_fusion_ir.py tests/test_m04_train_step.py tests/test_bench_1b_training_matrix.py -q --tb=short</code></td>
-              <td><span class="status pass">187 passed, 5 skipped</span></td>
+              <td><code>PYTHONPATH=. /Volumes/external/sources/nanochat/.venv/bin/python -m pytest tests/test_m04_train_step.py::test_fp8_path_c_training_route_accepts_real_activation_capture_owner tests/test_m04_train_step.py::test_fp8_path_c_training_route_composes_model_and_runtime_logical_owners -q --tb=short</code></td>
+              <td><span class="status pass">2 passed</span>, including natural-shape real activation capture and zero-copy composed logical owners.</td>
+            </tr>
+            <tr>
+              <td><code>PYTHONPATH=. /Volumes/external/sources/nanochat/.venv/bin/ruff check scripts/path_c_fusion_compile_receipt.py tests/test_path_c_fusion_compile_receipt_script.py tests/test_bench_1b_training_matrix.py tests/test_compiled_train.py</code></td>
+              <td><span class="status pass">All checks passed</span></td>
+            </tr>
+            <tr>
+              <td><code>PYTHONPATH=. /Volumes/external/sources/nanochat/.venv/bin/python -m pytest tests/test_model_factory.py tests/test_hybrid_lm_extensions.py -q --tb=short</code></td>
+              <td><span class="status pass">30 passed</span>, including bias-less Path C brick metadata, direct/profile Path C parameter-gradient alias mapping, and model-owned direct logical buffer owner references.</td>
+            </tr>
+            <tr>
+              <td><code>PYTHONPATH=. /Volumes/external/sources/nanochat/.venv/bin/python -m pytest tests/test_m04_train_step.py -q --tb=short</code></td>
+              <td><span class="status pass">97 tests covered in the combined run below</span>, including full-train direct-chain audit counts, compile-receipt validation, force-mode runtime fail-closed status, natural-shape activation capture, and dynamic composition of model/runtime logical owners.</td>
+            </tr>
+            <tr>
+              <td><code>PYTHONPATH=. /Volumes/external/sources/nanochat/.venv/bin/python -m pytest tests/test_path_c_physical_abi.py tests/test_m04_train_step.py -q --tb=short</code></td>
+              <td><span class="status pass">111 passed</span>, including zero-copy logical-owner composition, duplicate-buffer conflict rejection, natural-shape activation capture, and the m04 composed-owner route regression.</td>
+            </tr>
+            <tr>
+              <td><code>PYTHONPATH=. /Volumes/external/sources/nanochat/.venv/bin/python -m pytest tests/test_path_c_fusion_ir.py -q --tb=short</code></td>
+              <td><span class="status pass">75 passed, 5 skipped</span>, including dynamic direct-chain planning from model bricks, model-derived no-bias attention ABI, and natural-rank direct activation ABI regressions.</td>
+            </tr>
+            <tr>
+              <td><code>PYTHONPATH=. /Volumes/external/sources/nanochat/.venv/bin/python -m pytest tests/test_path_c_fusion_compile_receipt_script.py tests/test_bench_1b_training_matrix.py -q --tb=short</code></td>
+              <td><span class="status pass">10 passed</span>, including compile receipt and matrix extractor checks.</td>
+            </tr>
+            <tr>
+              <td><code>PYTHONPATH=. /Volumes/external/sources/nanochat/.venv/bin/python -m pytest tests/test_compiled_train.py -q --tb=short</code></td>
+              <td><span class="status pass">32 passed</span>, including the zero-copy Path C parameter-gradient probe and compile=True fail-closed guard.</td>
+            </tr>
+            <tr>
+              <td><code>HTMLParser().feed(...)</code> for <code>reports/index.html</code> and <code>reports/path_c_fusion_goal_audit_20260520.html</code></td>
+              <td><span class="status pass">html ok</span></td>
+            </tr>
+            <tr>
+              <td><code>PYTHONPATH=. /Volumes/external/sources/nanochat/.venv/bin/python scripts/path_c_fusion_compile_receipt.py --out reports/path_c_fusion_compile_receipt.json --source-out reports/path_c_fusion_compile_source.py --runtime-smoke tiny</code></td>
+              <td><span class="status pass">exit 0</span>, regenerated receipt with <code>direct_logical_abi_alternative.status=blocked_metal_buffer_limit</code>, <code>direct_chained_fusion_plan.status=ready</code>, and <code>direct_chained_fusion_native_compile.status=ok</code>.</td>
+            </tr>
+            <tr>
+              <td><code>cmake --build poc/triton_frontend/_cxx/build --parallel 16</code> in <code>/Volumes/external/sources/tilelang</code>; <code>python3.13 -m pytest poc/triton_frontend/tests/test_ptr_analysis.py::test_ptr_analysis_unsupported_unit_mask_cmp_fails_recoverably poc/triton_frontend/tests/test_ptr_analysis.py::test_ptr_analysis_rewrites_addptr poc/triton_frontend/tests/test_structured_to_memref.py::test_structured_to_memref_eliminates_tts_ops -q --tb=short</code>; <code>CPPMEGA_RUN_NATIVE_TILELANG_COMPILE_SMOKE=1 PYTHONPATH=/Volumes/external/sources/tilelang/poc/triton_frontend/_cxx/build:/Volumes/external/sources/tilelang:. /Volumes/external/sources/nanochat/.venv/bin/python -m pytest tests/test_path_c_fusion_ir.py::test_row_phased_descriptor_template_compiles_with_tilelang_lowerer -q --tb=short</code></td>
+              <td><span class="status pass">rebuilt and smoke-tested</span>: vendored <code>MaskAnalysis::parseCmp</code> lower-bound fallthrough now returns <code>failure()</code> instead of aborting on the targeted unsupported unit-mask cmp fixture; the opt-in Path C native TileLang compile smoke also passed against the rebuilt <code>_triton_frontend_cxx.cpython-313-darwin.so</code>.</td>
             </tr>
           </tbody>
         </table>

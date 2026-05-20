@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from cppmega_v4.build import (
+from cppmega_v4.buildspec import (
     LOSS_BUILTINS,
     LossKind,
     LossSpec,

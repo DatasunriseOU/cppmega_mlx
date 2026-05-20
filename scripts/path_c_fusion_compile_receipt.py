@@ -39,7 +39,10 @@ from cppmega_mlx.runtime.path_c_fusion import (  # noqa: E402
     tilelang_single_entry_lowerer,
 )
 from cppmega_mlx.runtime.path_c_fusion_schedules import (  # noqa: E402
+    DESCRIPTOR_PHYSICAL_ABI_POLICY_DIRECT,
+    make_path_c_descriptor_schedule_template,
     path_c_fusion_schedule_spec,
+    plan_path_c_direct_fusion_chain_for_region,
     select_path_c_fusion_schedule_target,
 )
 from cppmega_mlx.runtime.path_c_physical_abi import (  # noqa: E402
@@ -561,6 +564,257 @@ def _runtime_execution_contract(
     }
 
 
+def _direct_logical_abi_alternative_payload(
+    *,
+    region: Any,
+    target: Any,
+    target_name: str,
+    shape_env: Any,
+) -> dict[str, Any]:
+    """Describe the no-pack direct logical-buffer ABI alternative."""
+
+    try:
+        if not getattr(target, "brick_descriptors", ()):
+            return {
+                "status": "unsupported_target",
+                "physical_abi_policy": DESCRIPTOR_PHYSICAL_ABI_POLICY_DIRECT,
+                "reason": "selected schedule target does not expose brick descriptors",
+            }
+        direct_template = make_path_c_descriptor_schedule_template(
+            target.brick_descriptors,
+            entry_symbol=getattr(region, "entry_symbol", None)
+            or getattr(region, "name", None),
+            buffer_extent=target.buffer_extent,
+            shape_env=shape_env,
+            internal_buffer_policy=target.internal_buffer_policy,
+            loop_policy=target.loop_policy,
+            physical_abi_policy=DESCRIPTOR_PHYSICAL_ABI_POLICY_DIRECT,
+        )
+        direct_prim_func = direct_template(region)
+        physical_abi_map = dict(
+            getattr(direct_prim_func, "_cppmega_path_c_physical_buffer_abi_map", {})
+            or {}
+        )
+        physical_abi_shapes = dict(
+            getattr(
+                direct_prim_func,
+                "_cppmega_path_c_physical_buffer_abi_shapes",
+                {},
+            )
+            or {}
+        )
+        bridge = plan_physical_abi_runtime_bridge(
+            physical_abi_map,
+            physical_abi_shapes,
+        )
+        kernel_parameter_count = _kernel_parameter_count(direct_prim_func)
+        metal_buffer_limit_exceeded = (
+            target_name == "metal"
+            and kernel_parameter_count > METAL_KERNEL_BUFFER_LIMIT
+        )
+        chained_plan = plan_path_c_direct_fusion_chain_for_region(
+            region,
+            include_backward=False,
+            max_kernel_buffers=METAL_KERNEL_BUFFER_LIMIT,
+        )
+        status = (
+            "blocked_metal_buffer_limit"
+            if metal_buffer_limit_exceeded
+            else "direct_logical_binding_candidate"
+        )
+        return {
+            "status": status,
+            "physical_abi_policy": DESCRIPTOR_PHYSICAL_ABI_POLICY_DIRECT,
+            "reason": (
+                "direct logical-buffer ABI would avoid hidden bank packing, but "
+                "the selected train-block exceeds the Metal kernel buffer limit"
+                if metal_buffer_limit_exceeded
+                else
+                "direct logical-buffer ABI can bind caller-owned tensors without "
+                "prepacked dtype banks"
+            ),
+            "kernel_parameter_count": kernel_parameter_count,
+            "logical_parameter_count": len(physical_abi_map),
+            "metal_buffer_limit": METAL_KERNEL_BUFFER_LIMIT,
+            "metal_buffer_limit_exceeded": metal_buffer_limit_exceeded,
+            "logical_tensor_binding_supported": bool(
+                bridge.get("logical_tensor_binding_supported")
+            ),
+            "prepacked_bank_binding_supported": bool(
+                bridge.get("prepacked_bank_binding_supported")
+            ),
+            "required_kernel_buffers": list(bridge.get("required_bank_buffers", ())),
+            "no_hidden_allocation_policy": bool(
+                bridge.get("no_hidden_allocation_policy", True)
+            ),
+            "direct_chained_fusion_plan": _direct_chained_fusion_plan_payload(
+                chained_plan
+            ),
+            "next_codegen_steps": [
+                "route runtime through direct-buffer chained fused segments to stay under Metal limits without dtype-bank packing",
+                "compile and call each chained segment with caller-owned logical tensor buffers",
+            ]
+            if (
+                metal_buffer_limit_exceeded
+                and chained_plan.status == "ready"
+            )
+            else [
+                "keep production ABI under Metal buffer limits without runtime packing",
+                "use model/training-owned physical banks or a generic chained fusion planner",
+            ]
+            if metal_buffer_limit_exceeded
+            else [],
+        }
+    except Exception as exc:  # pragma: no cover - defensive receipt metadata
+        return {
+            "status": "unavailable",
+            "physical_abi_policy": DESCRIPTOR_PHYSICAL_ABI_POLICY_DIRECT,
+            "reason": str(exc),
+        }
+
+
+def _direct_chained_fusion_plan_payload(chain: Any) -> dict[str, Any]:
+    segments = []
+    for segment in getattr(chain, "segments", ()):
+        plan = getattr(segment, "plan", None)
+        target = getattr(segment, "schedule_target", None)
+        contract = getattr(plan, "schedule_contract", None)
+        segments.append(
+            {
+                "index": int(segment.index),
+                "node_start": int(segment.node_start),
+                "node_end": int(segment.node_end),
+                "region_name": getattr(segment.region, "name", ""),
+                "node_names": list(getattr(segment.region, "node_names", ())),
+                "op_signature": [
+                    str(node.op_name)
+                    for node in getattr(segment.region, "nodes", ())
+                ],
+                "status": str(segment.status),
+                "reason": str(segment.reason),
+                "physical_abi_policy": str(segment.physical_abi_policy),
+                "kernel_parameter_count": segment.kernel_parameter_count,
+                "schedule_id": getattr(target, "schedule_id", None),
+                "schedule_name": getattr(target, "schedule_name", None),
+                "schedule_contract_status": getattr(contract, "status", None),
+            }
+        )
+    source_nodes = list(getattr(chain.source_region, "node_names", ()))
+    covers_full_region = bool(segments) and (
+        segments[0]["node_start"] == 0
+        and segments[-1]["node_end"] == len(source_nodes)
+        and all(
+            left["node_end"] == right["node_start"]
+            for left, right in zip(segments[:-1], segments[1:], strict=True)
+        )
+    )
+    return {
+        "status": str(chain.status),
+        "reason": str(chain.reason),
+        "max_kernel_buffers": int(chain.max_kernel_buffers),
+        "segment_count": len(segments),
+        "covers_full_region": covers_full_region,
+        "source_region_name": getattr(chain.source_region, "name", ""),
+        "source_node_count": len(source_nodes),
+        "segments": segments,
+    }
+
+
+def _native_compile_direct_chain_payload(
+    *,
+    region: Any,
+    native_compile: bool,
+    native_lowerer: Callable[..., Any] | None,
+    target_name: str,
+) -> dict[str, Any]:
+    if not native_compile:
+        return {
+            "status": "not_requested",
+            "native_compile_requested": False,
+        }
+    if native_lowerer is None:
+        return {
+            "status": "unavailable",
+            "native_compile_requested": True,
+            "reason": "no native lowerer was configured",
+        }
+
+    chain = plan_path_c_direct_fusion_chain_for_region(
+        region,
+        include_backward=False,
+        max_kernel_buffers=METAL_KERNEL_BUFFER_LIMIT,
+    )
+    segment_payloads: list[dict[str, Any]] = []
+    for segment in chain.segments:
+        target = segment.schedule_target
+        if target is None:
+            segment_payloads.append(
+                {
+                    "index": segment.index,
+                    "status": "blocked",
+                    "native_compile_ok": False,
+                    "reason": segment.reason,
+                }
+            )
+            continue
+        schedule_template = mark_path_c_schedule_template_for_region(
+            target.schedule_template,
+            segment.region,
+            implementation_kind=target.implementation_kind,
+            production_schedule_id=target.schedule_id
+            if target.implementation_kind == "production"
+            else "",
+            required_real_abi_inputs=target.required_real_abi_inputs,
+        )
+        compiled, stdout, stderr, error, elapsed_s = (
+            _compile_path_c_region_with_native_capture(
+                region=segment.region,
+                schedule_template=schedule_template,
+                schedule_name=target.schedule_name,
+                schedule_status=target.schedule_status,
+                native_lowerer=native_lowerer,
+                target_name=target_name,
+            )
+        )
+        artifact = compiled.artifact if isinstance(compiled, CompiledPathCRegion) else None
+        plan = compiled.plan if isinstance(compiled, CompiledPathCRegion) else compiled
+        contract = getattr(plan, "schedule_contract", None)
+        native_compile_ok = bool(error is None and artifact is not None)
+        segment_payloads.append(
+            {
+                "index": segment.index,
+                "node_start": segment.node_start,
+                "node_end": segment.node_end,
+                "region_name": segment.region.name,
+                "op_signature": [node.op_name for node in segment.region.nodes],
+                "kernel_parameter_count": segment.kernel_parameter_count,
+                "schedule_id": target.schedule_id,
+                "schedule_contract_status": getattr(contract, "status", None),
+                "native_compile_ok": native_compile_ok,
+                "artifact_type": type(artifact).__name__ if artifact is not None else None,
+                "elapsed_s": elapsed_s,
+                "error": error,
+                "stdout_tail": stdout[-2000:],
+                "stderr_tail": stderr[-2000:],
+            }
+        )
+    all_ok = bool(segment_payloads) and all(
+        bool(segment.get("native_compile_ok"))
+        for segment in segment_payloads
+    )
+    return {
+        "status": "ok" if chain.status == "ready" and all_ok else "failed",
+        "native_compile_requested": True,
+        "target": target_name,
+        "chain_status": chain.status,
+        "segment_count": len(segment_payloads),
+        "covers_full_region": _direct_chained_fusion_plan_payload(chain)[
+            "covers_full_region"
+        ],
+        "segments": segment_payloads,
+    }
+
+
 def _selected_region_and_target() -> tuple[Any, Any, Any, Any]:
     profile = local_gb10_quarter_profile()
     model = SimpleNamespace(
@@ -962,6 +1216,12 @@ def build_compile_receipt(
         physical_buffer_abi_shapes,
         None,
     )
+    direct_logical_abi_alternative = _direct_logical_abi_alternative_payload(
+        region=region,
+        target=target,
+        target_name=target_name,
+        shape_env=getattr(prim_func, "_cppmega_path_c_shape_env", None),
+    )
     internal_scratch_abi_buffers = tuple(
         getattr(prim_func, "_cppmega_path_c_internal_scratch_abi_buffers", ())
         or ()
@@ -1002,6 +1262,15 @@ def build_compile_receipt(
                 execution_backend=execution_backend,
                 **kwargs,
             )
+
+    direct_logical_abi_alternative["direct_chained_fusion_native_compile"] = (
+        _native_compile_direct_chain_payload(
+            region=region,
+            native_compile=native_compile,
+            native_lowerer=native_lowerer,
+            target_name=target_name,
+        )
+    )
 
     if native_compile:
         compiled, compile_stdout, compile_stderr, compile_error, _compile_elapsed_s = (
@@ -1105,6 +1374,7 @@ def build_compile_receipt(
             physical_abi_runtime_bridge=physical_abi_runtime_bridge,
             physical_abi_runtime_binding=physical_abi_runtime_binding,
         ),
+        "direct_logical_abi_alternative": direct_logical_abi_alternative,
         "runtime_smoke": _runtime_smoke_payload(
             mode=runtime_smoke,
             target_name=target_name,

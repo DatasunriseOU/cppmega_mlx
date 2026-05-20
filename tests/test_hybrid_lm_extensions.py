@@ -6,16 +6,19 @@ from __future__ import annotations
 import math
 
 import mlx.core as mx
+from mlx.utils import tree_flatten
 import pytest
 
 from cppmega_mlx.models.hybrid_lm import (
     HybridTinyBlock,
     HybridTinyConfig,
     HybridTinyLM,
+    PathCActivationBufferCapture,
 )
 from cppmega_mlx.nn.attention import AttentionConfig, CausalSelfAttention
 from cppmega_mlx.nn.concept import ConceptBlock, ConceptBlockConfig
 from cppmega_mlx.nn.engram import EngramBranch
+from cppmega_mlx.recipes.model_factory import build_local_gb10_quarter_tiny_smoke_model
 from cppmega_mlx.recipes.pattern import expand_nam_pattern, parse_nam_pattern
 from cppmega_mlx.training.mtp import MinimalMTPHead
 
@@ -144,6 +147,111 @@ def test_hybrid_lm_with_engram_and_concept_forward_runs():
     input_ids = mx.array([[0, 1, 2, 3]])
     logits = model(input_ids)
     assert logits.shape == (1, 4, 16)
+
+
+def test_path_c_activation_probe_is_opt_in_and_stores_references():
+    cfg = _tiny_mtp_cfg(pattern="MR", depth=2, max_seq_length=4)
+    model = HybridTinyLM(cfg)
+    capture = PathCActivationBufferCapture()
+    input_ids = mx.array([[0, 1, 2, 3]])
+
+    model.decoder_hidden_states(input_ids)
+
+    assert capture.events == []
+    assert all(
+        not hasattr(layer, "_path_c_activation_probe_callback")
+        for layer in model.layers
+    )
+
+    assert model.attach_path_c_activation_probe(capture) == 2
+    model.decoder_hidden_states(input_ids)
+
+    expected = {
+        "layer_0_m_hidden",
+        "layer_0_m_residual_norm_hidden",
+        "layer_0_m_delta",
+        "layer_0_m_hidden_after",
+        "layer_1_r_hidden",
+        "layer_1_r_residual_norm_hidden",
+        "layer_1_r_delta",
+        "layer_1_r_hidden_after",
+    }
+    assert expected.issubset(capture.buffers)
+    for event in capture.events:
+        tensor = event["tensor"]
+        for name in event["logical_names"]:
+            assert capture.buffers[name] is tensor
+
+    model.detach_path_c_activation_probe()
+    assert all(
+        not hasattr(layer, "_path_c_activation_probe_callback")
+        for layer in model.layers
+    )
+
+
+def test_path_c_activation_capture_uses_profile_brick_aliases_without_copy():
+    model = build_local_gb10_quarter_tiny_smoke_model()
+    block = model.layers[10]
+    hidden = mx.random.normal((1, 4, model.config.hidden_size))
+    capture = PathCActivationBufferCapture(
+        aliases={"local_gb10_quarter_brick_10_M_hidden": "hidden"},
+        owner_name="local_gb10_quarter.forward_activation_capture",
+    )
+
+    assert capture.owner_name == "local_gb10_quarter.forward_activation_capture"
+    assert block.path_c_profile_brick_name == "local_gb10_quarter_brick_10_M"
+    model.attach_path_c_activation_probe(capture)
+    block(hidden, mask=None)
+
+    assert capture.buffers["local_gb10_quarter_brick_10_M_hidden"] is hidden
+    assert capture.buffers["hidden"] is hidden
+
+
+def test_path_c_parameter_gradient_aliases_use_direct_and_profile_names():
+    model = build_local_gb10_quarter_tiny_smoke_model()
+
+    aliases = model.path_c_parameter_gradient_aliases()
+
+    assert aliases["layers.10.block.in_proj.weight_grad"] == (
+        "layer_10_m_mamba3_in_proj_weight_grad",
+        "local_gb10_quarter_brick_10_M_mamba3_in_proj_weight_grad",
+    )
+    assert aliases["layers.10.norm.weight_grad"] == (
+        "layer_10_m_residual_norm_weight_grad",
+        "local_gb10_quarter_brick_10_M_residual_norm_weight_grad",
+    )
+    assert aliases["layers.11.block.state_weight_grad"] == (
+        "layer_11_r_m2rnn_state_weight_grad",
+        "local_gb10_quarter_brick_11_R_m2rnn_state_weight_grad",
+    )
+    assert aliases["layers.12.block.sparse_kv_proj.weight_grad"] == (
+        "layer_12_a_qkv_projection_attention_sparse_kv_proj_weight_grad",
+        "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_weight_grad",
+    )
+    assert "layers.12.block.q_proj.bias_grad" not in aliases
+    assert "layers.12.block.sparse_kv_proj.bias_grad" not in aliases
+
+
+def test_path_c_direct_logical_owner_uses_model_parameter_references_only():
+    model = build_local_gb10_quarter_tiny_smoke_model()
+    params = dict(tree_flatten(model.trainable_parameters()))
+
+    owner = model.make_path_c_direct_fusion_chain_logical_buffer_owner()
+
+    assert owner.owner_name == "local_gb10_quarter.path_c_model_parameter_buffers"
+    assert owner.hidden_packing_performed is False
+    assert owner.no_hidden_allocation_policy is True
+    assert owner.buffers[
+        "local_gb10_quarter_brick_10_M_mamba3_in_proj_weight"
+    ] is params["layers.10.block.in_proj.weight"]
+    assert owner.buffers[
+        "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_attention_out_proj_weight"
+    ] is params["layers.12.block.out_proj.weight"]
+    assert all("attention_out_proj_bias" not in name for name in owner.buffers)
+    assert all(
+        "sparse_mla_fp8_apply_sparse_mla_sm_scale" not in name
+        for name in owner.buffers
+    )
 
 
 # ---------------------------------------------------------------------------

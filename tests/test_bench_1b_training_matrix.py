@@ -253,6 +253,50 @@ def test_bench_1b_matrix_extracts_m04_receipt_metrics(
     ]
 
 
+def test_path_c_fusion_summary_preserves_direct_chain_runtime_route() -> None:
+    receipt = {
+        "training": {
+            "fp8_path_c_training_route": {
+                "fused_train_block_runtime_available": True,
+                "path_c_fusion": {
+                    "mode": "auto",
+                    "status": "plan_ready_not_default",
+                    "runtime_training_binding": {
+                        "status": "model_owned_physical_abi_banks_missing",
+                        "runtime_uses_fused_train_block": False,
+                    },
+                    "direct_chained_fusion": {
+                        "status": "ready",
+                        "segment_count": 4,
+                        "runtime_binding": {
+                            "status": "ok",
+                            "runtime_uses_direct_fusion_chain": True,
+                        },
+                    },
+                    "schedule_blockers": [],
+                    "production_schedule": {
+                        "schedule_id": "path_c_descriptor_chain_abc",
+                        "implementation_kind": "production",
+                        "production_fragments_complete": True,
+                        "real_abi_contract_complete": True,
+                        "missing_real_abi_inputs": [],
+                    },
+                    "schedule_contract": {"status": "verified"},
+                },
+            },
+        },
+    }
+
+    summary = matrix.path_c_fusion_summary_from_receipt(receipt)
+    proof = matrix.proof_result_from_receipt(receipt, path="path_c_warm")
+
+    assert summary["runtime_uses_fused_train_block"] is True
+    assert summary["runtime_uses_direct_fusion_chain"] is True
+    assert summary["runtime_binding_status"] == "ok"
+    assert summary["direct_chain_runtime_binding_status"] == "ok"
+    assert proof["runtime_uses_fused_train_block"] is True
+
+
 def test_bench_1b_matrix_reuses_existing_ok_receipt(
     tmp_path: Path,
     monkeypatch,  # type: ignore[no-untyped-def]

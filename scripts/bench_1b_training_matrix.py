@@ -598,6 +598,21 @@ def path_c_fusion_summary_from_receipt(receipt: dict[str, Any]) -> dict[str, Any
     runtime_binding = fusion.get("runtime_training_binding")
     if not isinstance(runtime_binding, dict):
         runtime_binding = {}
+    direct_chained = fusion.get("direct_chained_fusion")
+    if not isinstance(direct_chained, dict):
+        direct_chained = {}
+    direct_chain_binding = direct_chained.get("runtime_binding")
+    if not isinstance(direct_chain_binding, dict):
+        direct_chain_binding = {}
+    runtime_uses_fused_train_block = bool(
+        runtime_binding.get("runtime_uses_fused_train_block")
+        or direct_chain_binding.get("runtime_uses_direct_fusion_chain")
+    )
+    runtime_binding_status = (
+        "ok"
+        if direct_chain_binding.get("runtime_uses_direct_fusion_chain")
+        else runtime_binding.get("status")
+    )
     return {
         "mode": fusion.get("mode"),
         "status": fusion.get("status"),
@@ -620,10 +635,14 @@ def path_c_fusion_summary_from_receipt(receipt: dict[str, Any]) -> dict[str, Any
         ),
         "missing_real_abi_inputs": production.get("missing_real_abi_inputs"),
         "schedule_contract_status": contract.get("status"),
-        "runtime_binding_status": runtime_binding.get("status"),
-        "runtime_uses_fused_train_block": runtime_binding.get(
-            "runtime_uses_fused_train_block"
+        "runtime_binding_status": runtime_binding_status,
+        "runtime_uses_fused_train_block": runtime_uses_fused_train_block,
+        "runtime_uses_direct_fusion_chain": direct_chain_binding.get(
+            "runtime_uses_direct_fusion_chain"
         ),
+        "direct_chain_status": direct_chained.get("status"),
+        "direct_chain_segment_count": direct_chained.get("segment_count"),
+        "direct_chain_runtime_binding_status": direct_chain_binding.get("status"),
         "required_bank_buffers": runtime_binding.get("required_bank_buffers"),
         "missing_bank_buffers": runtime_binding.get("missing_bank_buffers"),
     }

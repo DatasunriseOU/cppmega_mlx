@@ -61,6 +61,16 @@ def test_local_gb10_quarter_profile_matches_m0_2_contract_without_allocation() -
     assert "".join(profile.expanded_pattern.symbols) == "AEMEAEMEAEMRA"
     assert profile.expanded_pattern.dsa_layer_numbers == (5, 9, 13)
     assert profile.expanded_pattern.mla_layer_numbers == (1,)
+    attention_bricks = [
+        brick for brick in profile.path_c_bricks if brick["route_symbol"] == "A"
+    ]
+    assert attention_bricks
+    assert all(
+        brick["attention_qkv_has_bias"] == "false" for brick in attention_bricks
+    )
+    assert all(
+        brick["attention_out_proj_has_bias"] == "false" for brick in attention_bricks
+    )
 
 
 def test_local_gb10_quarter_builds_valid_existing_configs_without_model_allocation() -> None:
@@ -216,9 +226,20 @@ def test_tiny_smoke_model_preserves_profile_route_and_has_finite_t512_forward() 
     mx.eval(logits)
 
     assert model.config.depth == 13
+    assert model.path_c_profile_name == "local_gb10_quarter"
+    assert model.path_c_input_model_name == "local_gb10_quarter.path_c_bricks"
+    assert model.path_c_region_prefix == "local_gb10_quarter_path_c"
     assert "".join(model.route_symbols) == "AEMEAEMEAEMRA"
     assert model.pattern.dsa_layer_numbers == (5, 9, 13)
     assert model.pattern.mla_layer_numbers == (1,)
+    assert model.layers[12].attention_block is not None
+    assert model.layers[12].attention_block.config.bias is False
+    assert model.path_c_bricks[12]["attention_qkv_has_bias"] == "false"
+    assert model.path_c_bricks[12]["attention_out_proj_has_bias"] == "false"
+    assert all(
+        region.name.startswith("local_gb10_quarter_path_c_")
+        for region in model.path_c_fusion_regions()
+    )
     assert logits.shape == (1, 512, model.config.vocab_size)
     assert bool(mx.all(mx.isfinite(logits)).item())
     assert math.isfinite(float(mx.mean(logits).item()))

@@ -1,6 +1,6 @@
 {
   "artifact": {
-    "repr": "<tilelang.jit.kernel.JITKernel object at 0x1292e42f0>",
+    "repr": "<tilelang.jit.kernel.JITKernel object at 0x125642b10>",
     "type": "JITKernel"
   },
   "cache_key_recompile_audit": {
@@ -19,7 +19,7 @@
         "shape_env:08baafa0943991557fc67448ed4f1a587ffa1c3417fe248470ff0786047db79b"
       ],
       "cache_key_material_sha256": "437919fdf081617403a5da20dd505fe50221c5481a034ad292adcba825f11507",
-      "lowered_module_digest": "069d1241d924dc15df56afd8d1a1659fb6a4c115aabafc362ae5651e8ba59bd3",
+      "lowered_module_digest": "51131836001de2198376cc53ba3cad73221a39cf6d20e1c80a0aafabffe8d2fe",
       "reason": "digest covers compile plan cache-key material and the lowered single-entry TileLang IRModule",
       "status": "lowered_module_digest_recorded"
     },
@@ -37,14 +37,14 @@
         "shape_env:08baafa0943991557fc67448ed4f1a587ffa1c3417fe248470ff0786047db79b"
       ],
       "cache_key_material_sha256": "437919fdf081617403a5da20dd505fe50221c5481a034ad292adcba825f11507",
-      "elapsed_s": 0.020852832996752113,
-      "lowered_module_digest": "069d1241d924dc15df56afd8d1a1659fb6a4c115aabafc362ae5651e8ba59bd3",
+      "elapsed_s": 0.01719154097372666,
+      "lowered_module_digest": "51131836001de2198376cc53ba3cad73221a39cf6d20e1c80a0aafabffe8d2fe",
       "native_compile_error": null,
       "native_compile_ok": true,
       "reason": "digest covers compile plan cache-key material and the lowered single-entry TileLang IRModule",
       "status": "lowered_module_digest_recorded",
       "stderr_tail": "",
-      "stdout_tail": "2026-05-20 11:50:10  [TileLang:tilelang.cache.kernel_cache:WARNING] (kernel_cache.py:333): Found kernel 'local_gb10_quarter_path_c_10_12' in memory cache. For better performance, consider using `@tilelang.jit` instead of direct kernel caching.\n"
+      "stdout_tail": "2026-05-20 16:21:14  [TileLang:tilelang.cache.kernel_cache:WARNING] (kernel_cache.py:333): Found kernel 'local_gb10_quarter_path_c_10_12' in memory cache. For better performance, consider using `@tilelang.jit` instead of direct kernel caching.\n"
     },
     "status": "key_stable"
   },
@@ -70,7 +70,7 @@
     "region_name": "local_gb10_quarter_path_c_10_12",
     "schedule_contract": {
       "declared_implementation_kind": "production",
-      "declared_key": "b687b88ecdef62c7258a2cef3609c45d88d64a4608a1a3445a068274d4ddf390",
+      "declared_key": "bdb694af5cabeda9f821bd2ef0fb69596ceb75eaa6ec6136115ef30e9a89fed9",
       "declared_required_real_abi_inputs": [
         "local_gb10_quarter_brick_10_M_mamba3_in_proj_weight",
         "local_gb10_quarter_brick_10_M_mamba3_out_proj_weight",
@@ -97,19 +97,14 @@
         "local_gb10_quarter_brick_11_R_m2rnn_conv_state",
         "local_gb10_quarter_brick_11_R_residual_norm_weight",
         "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_weight",
-        "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_bias",
         "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_weight",
-        "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_bias",
         "local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_inv_freq",
         "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_sm_scale",
         "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_sinks",
         "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_has_sinks",
         "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_attention_out_proj_weight",
-        "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_attention_out_proj_bias",
         "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_weight_grad",
-        "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_bias_grad",
         "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_weight_grad",
-        "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_bias_grad",
         "local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_inv_freq_grad",
         "local_gb10_quarter_brick_11_R_residual_norm_weight_grad",
         "local_gb10_quarter_brick_11_R_m2rnn_in_proj_weight_grad",
@@ -136,7 +131,7 @@
         "local_gb10_quarter_brick_10_M_mamba3_h0_grad"
       ],
       "declared_schedule_id": "path_c_descriptor_chain_c44eddb18abd",
-      "key": "b687b88ecdef62c7258a2cef3609c45d88d64a4608a1a3445a068274d4ddf390",
+      "key": "bdb694af5cabeda9f821bd2ef0fb69596ceb75eaa6ec6136115ef30e9a89fed9",
       "missing_real_abi_inputs": [],
       "name": "local_gb10_quarter_path_c_10_12:single_entry_contract",
       "op_signature": [
@@ -183,9 +178,7 @@
         "local_gb10_quarter_brick_11_R_residual_norm_weight",
         "local_gb10_quarter_brick_11_R_hidden_after",
         "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_weight",
-        "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_bias",
         "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_weight",
-        "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_bias",
         "local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_inv_freq",
         "local_gb10_quarter_brick_12_A_qkv_projection_kv_fp8",
         "local_gb10_quarter_brick_12_A_qkv_projection_kv_scale",
@@ -193,7 +186,6 @@
         "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_sinks",
         "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_has_sinks",
         "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_attention_out_proj_weight",
-        "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_attention_out_proj_bias",
         "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_out",
         "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_lse",
         "local_gb10_quarter_brick_12_A_qkv_projection_q_fp8_grad",
@@ -202,9 +194,7 @@
         "local_gb10_quarter_brick_12_A_qkv_projection_kv_scale_grad",
         "local_gb10_quarter_brick_12_A_qkv_projection_indices_grad",
         "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_weight_grad",
-        "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_bias_grad",
         "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_weight_grad",
-        "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_bias_grad",
         "local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_inv_freq_grad",
         "local_gb10_quarter_brick_11_R_hidden_after_grad",
         "local_gb10_quarter_brick_11_R_residual_norm_weight_grad",
@@ -257,7 +247,288 @@
     "single_kernel_fused": true
   },
   "default_eligible": false,
-  "elapsed_s": 5.473144333052915,
+  "direct_logical_abi_alternative": {
+    "direct_chained_fusion_native_compile": {
+      "chain_status": "ready",
+      "covers_full_region": true,
+      "native_compile_requested": true,
+      "segment_count": 4,
+      "segments": [
+        {
+          "artifact_type": "JITKernel",
+          "elapsed_s": 2.6931509589776397,
+          "error": null,
+          "index": 0,
+          "kernel_parameter_count": 31,
+          "native_compile_ok": true,
+          "node_end": 4,
+          "node_start": 0,
+          "op_signature": [
+            "mamba3_mimo",
+            "residual_rmsnorm",
+            "m2rnn",
+            "residual_rmsnorm"
+          ],
+          "region_name": "local_gb10_quarter_path_c_10_12_chain_0_4",
+          "schedule_contract_status": "verified",
+          "schedule_id": "path_c_descriptor_chain_c6fb5eedfe52",
+          "stderr_tail": "",
+          "stdout_tail": "2026-05-20 16:21:05  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:133): TileLang begins to compile kernel `local_gb10_quarter_path_c_10_12_chain_0_4` with `out_idx=None`\n2026-05-20 16:21:07  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:141): TileLang completes to compile kernel `local_gb10_quarter_path_c_10_12_chain_0_4`\n"
+        },
+        {
+          "artifact_type": "JITKernel",
+          "elapsed_s": 2.8390331249684095,
+          "error": null,
+          "index": 1,
+          "kernel_parameter_count": 28,
+          "native_compile_ok": true,
+          "node_end": 8,
+          "node_start": 4,
+          "op_signature": [
+            "attention_qkv_projection",
+            "sparse_mla_fp8_apply",
+            "attention_qkv_projection_bwd",
+            "residual_rmsnorm_bwd"
+          ],
+          "region_name": "local_gb10_quarter_path_c_10_12_chain_4_8",
+          "schedule_contract_status": "verified",
+          "schedule_id": "path_c_descriptor_chain_d23e7a6b6f78",
+          "stderr_tail": "",
+          "stdout_tail": "2026-05-20 16:21:08  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:133): TileLang begins to compile kernel `local_gb10_quarter_path_c_10_12_chain_4_8` with `out_idx=None`\n2026-05-20 16:21:10  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:141): TileLang completes to compile kernel `local_gb10_quarter_path_c_10_12_chain_4_8`\n"
+        },
+        {
+          "artifact_type": "JITKernel",
+          "elapsed_s": 1.8342547499923967,
+          "error": null,
+          "index": 2,
+          "kernel_parameter_count": 31,
+          "native_compile_ok": true,
+          "node_end": 10,
+          "node_start": 8,
+          "op_signature": [
+            "m2rnn_bwd",
+            "residual_rmsnorm_bwd"
+          ],
+          "region_name": "local_gb10_quarter_path_c_10_12_chain_8_10",
+          "schedule_contract_status": "verified",
+          "schedule_id": "path_c_descriptor_chain_f48235161fcc",
+          "stderr_tail": "",
+          "stdout_tail": "2026-05-20 16:21:11  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:133): TileLang begins to compile kernel `local_gb10_quarter_path_c_10_12_chain_8_10` with `out_idx=None`\n2026-05-20 16:21:12  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:141): TileLang completes to compile kernel `local_gb10_quarter_path_c_10_12_chain_8_10`\n"
+        },
+        {
+          "artifact_type": "JITKernel",
+          "elapsed_s": 1.8631334999809042,
+          "error": null,
+          "index": 3,
+          "kernel_parameter_count": 27,
+          "native_compile_ok": true,
+          "node_end": 11,
+          "node_start": 10,
+          "op_signature": [
+            "mamba3_mimo_bwd"
+          ],
+          "region_name": "local_gb10_quarter_path_c_10_12_chain_10_11",
+          "schedule_contract_status": "verified",
+          "schedule_id": "path_c_descriptor_chain_8f0590224f64",
+          "stderr_tail": "",
+          "stdout_tail": "2026-05-20 16:21:12  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:133): TileLang begins to compile kernel `local_gb10_quarter_path_c_10_12_chain_10_11` with `out_idx=None`\n2026-05-20 16:21:13  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:141): TileLang completes to compile kernel `local_gb10_quarter_path_c_10_12_chain_10_11`\n"
+        }
+      ],
+      "status": "ok",
+      "target": "metal"
+    },
+    "direct_chained_fusion_plan": {
+      "covers_full_region": true,
+      "max_kernel_buffers": 31,
+      "reason": "all chain segments fit direct-buffer portable Metal limits",
+      "segment_count": 4,
+      "segments": [
+        {
+          "index": 0,
+          "kernel_parameter_count": 31,
+          "node_end": 4,
+          "node_names": [
+            "local_gb10_quarter_brick_10_M",
+            "local_gb10_quarter_brick_10_M_residual_norm",
+            "local_gb10_quarter_brick_11_R",
+            "local_gb10_quarter_brick_11_R_residual_norm"
+          ],
+          "node_start": 0,
+          "op_signature": [
+            "mamba3_mimo",
+            "residual_rmsnorm",
+            "m2rnn",
+            "residual_rmsnorm"
+          ],
+          "physical_abi_policy": "direct_buffers",
+          "reason": "direct-buffer segment fits the portable Metal buffer limit",
+          "region_name": "local_gb10_quarter_path_c_10_12_chain_0_4",
+          "schedule_contract_status": "registered_not_lowered",
+          "schedule_id": "path_c_descriptor_chain_c6fb5eedfe52",
+          "schedule_name": "local_gb10_quarter_path_c_10_12_chain_0_4:descriptor_generated_fwd_bwd",
+          "status": "ok"
+        },
+        {
+          "index": 1,
+          "kernel_parameter_count": 28,
+          "node_end": 8,
+          "node_names": [
+            "local_gb10_quarter_brick_12_A_qkv_projection",
+            "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply",
+            "local_gb10_quarter_brick_12_A_qkv_projection_bwd",
+            "local_gb10_quarter_brick_11_R_residual_norm_bwd"
+          ],
+          "node_start": 4,
+          "op_signature": [
+            "attention_qkv_projection",
+            "sparse_mla_fp8_apply",
+            "attention_qkv_projection_bwd",
+            "residual_rmsnorm_bwd"
+          ],
+          "physical_abi_policy": "direct_buffers",
+          "reason": "direct-buffer segment fits the portable Metal buffer limit",
+          "region_name": "local_gb10_quarter_path_c_10_12_chain_4_8",
+          "schedule_contract_status": "registered_not_lowered",
+          "schedule_id": "path_c_descriptor_chain_d23e7a6b6f78",
+          "schedule_name": "local_gb10_quarter_path_c_10_12_chain_4_8:descriptor_generated_fwd_bwd",
+          "status": "ok"
+        },
+        {
+          "index": 2,
+          "kernel_parameter_count": 31,
+          "node_end": 10,
+          "node_names": [
+            "local_gb10_quarter_brick_11_R_bwd",
+            "local_gb10_quarter_brick_10_M_residual_norm_bwd"
+          ],
+          "node_start": 8,
+          "op_signature": [
+            "m2rnn_bwd",
+            "residual_rmsnorm_bwd"
+          ],
+          "physical_abi_policy": "direct_buffers",
+          "reason": "direct-buffer segment fits the portable Metal buffer limit",
+          "region_name": "local_gb10_quarter_path_c_10_12_chain_8_10",
+          "schedule_contract_status": "registered_not_lowered",
+          "schedule_id": "path_c_descriptor_chain_f48235161fcc",
+          "schedule_name": "local_gb10_quarter_path_c_10_12_chain_8_10:descriptor_generated_fwd_bwd",
+          "status": "ok"
+        },
+        {
+          "index": 3,
+          "kernel_parameter_count": 27,
+          "node_end": 11,
+          "node_names": [
+            "local_gb10_quarter_brick_10_M_bwd"
+          ],
+          "node_start": 10,
+          "op_signature": [
+            "mamba3_mimo_bwd"
+          ],
+          "physical_abi_policy": "direct_buffers",
+          "reason": "direct-buffer segment fits the portable Metal buffer limit",
+          "region_name": "local_gb10_quarter_path_c_10_12_chain_10_11",
+          "schedule_contract_status": "registered_not_lowered",
+          "schedule_id": "path_c_descriptor_chain_8f0590224f64",
+          "schedule_name": "local_gb10_quarter_path_c_10_12_chain_10_11:descriptor_generated_fwd_bwd",
+          "status": "ok"
+        }
+      ],
+      "source_node_count": 11,
+      "source_region_name": "local_gb10_quarter_path_c_10_12",
+      "status": "ready"
+    },
+    "kernel_parameter_count": 73,
+    "logical_parameter_count": 73,
+    "logical_tensor_binding_supported": true,
+    "metal_buffer_limit": 31,
+    "metal_buffer_limit_exceeded": true,
+    "next_codegen_steps": [
+      "route runtime through direct-buffer chained fused segments to stay under Metal limits without dtype-bank packing",
+      "compile and call each chained segment with caller-owned logical tensor buffers"
+    ],
+    "no_hidden_allocation_policy": true,
+    "physical_abi_policy": "direct_buffers",
+    "prepacked_bank_binding_supported": true,
+    "reason": "direct logical-buffer ABI would avoid hidden bank packing, but the selected train-block exceeds the Metal kernel buffer limit",
+    "required_kernel_buffers": [
+      "hidden",
+      "local_gb10_quarter_brick_10_M_state_in",
+      "local_gb10_quarter_brick_10_M_mamba3_in_proj_weight",
+      "local_gb10_quarter_brick_10_M_mamba3_out_proj_weight",
+      "local_gb10_quarter_brick_10_M_mamba3_conv_weight",
+      "local_gb10_quarter_brick_10_M_mamba3_conv_bias",
+      "local_gb10_quarter_brick_10_M_mamba3_dt_bias",
+      "local_gb10_quarter_brick_10_M_mamba3_B_norm_weight",
+      "local_gb10_quarter_brick_10_M_mamba3_B_bias",
+      "local_gb10_quarter_brick_10_M_mamba3_C_norm_weight",
+      "local_gb10_quarter_brick_10_M_mamba3_C_bias",
+      "local_gb10_quarter_brick_10_M_mamba3_D",
+      "local_gb10_quarter_brick_10_M_mamba3_h0",
+      "local_gb10_quarter_brick_10_M_state",
+      "local_gb10_quarter_brick_10_M_residual_norm_weight",
+      "local_gb10_quarter_brick_11_R_m2rnn_in_proj_weight",
+      "local_gb10_quarter_brick_11_R_m2rnn_conv_weight",
+      "local_gb10_quarter_brick_11_R_m2rnn_conv_bias",
+      "local_gb10_quarter_brick_11_R_m2rnn_state_weight",
+      "local_gb10_quarter_brick_11_R_m2rnn_A_log",
+      "local_gb10_quarter_brick_11_R_m2rnn_dt_bias",
+      "local_gb10_quarter_brick_11_R_m2rnn_D",
+      "local_gb10_quarter_brick_11_R_m2rnn_g_norm_weight",
+      "local_gb10_quarter_brick_11_R_m2rnn_out_proj_weight",
+      "local_gb10_quarter_brick_11_R_m2rnn_h0",
+      "local_gb10_quarter_brick_11_R_m2rnn_conv_state",
+      "local_gb10_quarter_brick_11_R_residual_norm_weight",
+      "local_gb10_quarter_brick_11_R_hidden_after",
+      "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_weight",
+      "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_weight",
+      "local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_inv_freq",
+      "local_gb10_quarter_brick_12_A_qkv_projection_kv_fp8",
+      "local_gb10_quarter_brick_12_A_qkv_projection_kv_scale",
+      "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_sm_scale",
+      "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_sinks",
+      "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_has_sinks",
+      "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_attention_out_proj_weight",
+      "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_out",
+      "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_lse",
+      "local_gb10_quarter_brick_12_A_qkv_projection_q_fp8_grad",
+      "local_gb10_quarter_brick_12_A_qkv_projection_q_scale_grad",
+      "local_gb10_quarter_brick_12_A_qkv_projection_kv_fp8_grad",
+      "local_gb10_quarter_brick_12_A_qkv_projection_kv_scale_grad",
+      "local_gb10_quarter_brick_12_A_qkv_projection_indices_grad",
+      "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_weight_grad",
+      "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_weight_grad",
+      "local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_inv_freq_grad",
+      "local_gb10_quarter_brick_11_R_hidden_after_grad",
+      "local_gb10_quarter_brick_11_R_residual_norm_weight_grad",
+      "local_gb10_quarter_brick_11_R_m2rnn_in_proj_weight_grad",
+      "local_gb10_quarter_brick_11_R_m2rnn_conv_weight_grad",
+      "local_gb10_quarter_brick_11_R_m2rnn_conv_bias_grad",
+      "local_gb10_quarter_brick_11_R_m2rnn_state_weight_grad",
+      "local_gb10_quarter_brick_11_R_m2rnn_A_log_grad",
+      "local_gb10_quarter_brick_11_R_m2rnn_dt_bias_grad",
+      "local_gb10_quarter_brick_11_R_m2rnn_D_grad",
+      "local_gb10_quarter_brick_11_R_m2rnn_g_norm_weight_grad",
+      "local_gb10_quarter_brick_11_R_m2rnn_out_proj_weight_grad",
+      "local_gb10_quarter_brick_11_R_m2rnn_h0_grad",
+      "hidden_grad",
+      "local_gb10_quarter_brick_10_M_residual_norm_weight_grad",
+      "local_gb10_quarter_brick_10_M_state_in_grad",
+      "local_gb10_quarter_brick_10_M_mamba3_in_proj_weight_grad",
+      "local_gb10_quarter_brick_10_M_mamba3_out_proj_weight_grad",
+      "local_gb10_quarter_brick_10_M_mamba3_conv_weight_grad",
+      "local_gb10_quarter_brick_10_M_mamba3_conv_bias_grad",
+      "local_gb10_quarter_brick_10_M_mamba3_dt_bias_grad",
+      "local_gb10_quarter_brick_10_M_mamba3_B_norm_weight_grad",
+      "local_gb10_quarter_brick_10_M_mamba3_B_bias_grad",
+      "local_gb10_quarter_brick_10_M_mamba3_C_norm_weight_grad",
+      "local_gb10_quarter_brick_10_M_mamba3_C_bias_grad",
+      "local_gb10_quarter_brick_10_M_mamba3_D_grad",
+      "local_gb10_quarter_brick_10_M_mamba3_h0_grad"
+    ],
+    "status": "blocked_metal_buffer_limit"
+  },
+  "elapsed_s": 17.388052916969173,
   "execution_backend": "tvm_ffi",
   "fusion_cache_key": {
     "cache_key_material": [
@@ -272,12 +543,12 @@
       "shape_env:08baafa0943991557fc67448ed4f1a587ffa1c3417fe248470ff0786047db79b"
     ],
     "cache_key_material_sha256": "437919fdf081617403a5da20dd505fe50221c5481a034ad292adcba825f11507",
-    "lowered_module_digest": "069d1241d924dc15df56afd8d1a1659fb6a4c115aabafc362ae5651e8ba59bd3",
+    "lowered_module_digest": "51131836001de2198376cc53ba3cad73221a39cf6d20e1c80a0aafabffe8d2fe",
     "reason": "digest covers compile plan cache-key material and the lowered single-entry TileLang IRModule",
     "status": "lowered_module_digest_recorded"
   },
   "generated_source": {
-    "bytes": 113761,
+    "bytes": 112269,
     "compile_pass_configs": {
       "tirx.disable_cse_tir": true
     },
@@ -294,8 +565,8 @@
       "local_gb10_quarter_brick_10_M_delta_grad"
     ],
     "internal_scratch_abi_count": 10,
-    "logical_buffer_abi_map_count": 78,
-    "logical_parameter_count": 78,
+    "logical_buffer_abi_map_count": 73,
+    "logical_parameter_count": 73,
     "path": "reports/path_c_fusion_compile_source.py",
     "physical_abi_policy": "banked_by_dtype",
     "physical_abi_runtime_binding": {
@@ -361,21 +632,16 @@
             "local_gb10_quarter_brick_11_R_m2rnn_state_weight_grad",
             "local_gb10_quarter_brick_11_R_residual_norm_weight",
             "local_gb10_quarter_brick_11_R_residual_norm_weight_grad",
-            "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_bias",
-            "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_bias_grad",
             "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_weight",
             "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_weight_grad",
             "local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_inv_freq",
             "local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_inv_freq_grad",
-            "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_bias",
-            "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_bias_grad",
             "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_weight",
             "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_weight_grad",
             "local_gb10_quarter_brick_12_A_qkv_projection_indices_grad",
             "local_gb10_quarter_brick_12_A_qkv_projection_kv_scale",
             "local_gb10_quarter_brick_12_A_qkv_projection_kv_scale_grad",
             "local_gb10_quarter_brick_12_A_qkv_projection_q_scale_grad",
-            "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_attention_out_proj_bias",
             "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_attention_out_proj_weight",
             "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_lse",
             "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_out",
@@ -402,6 +668,7 @@
         ],
         "status": "prepacked_bank_buffers_required"
       },
+      "dtype_mismatch_buffers": [],
       "errors": [],
       "missing_bank_buffers": [
         "path_c_float32_abi_bank",
@@ -414,6 +681,7 @@
         "path_c_int32_abi_bank"
       ],
       "reason": "no caller-owned physical bank buffers were supplied",
+      "shape_mismatch_buffers": [],
       "status": "not_bound",
       "unexpected_buffers": []
     },
@@ -479,21 +747,16 @@
           "local_gb10_quarter_brick_11_R_m2rnn_state_weight_grad",
           "local_gb10_quarter_brick_11_R_residual_norm_weight",
           "local_gb10_quarter_brick_11_R_residual_norm_weight_grad",
-          "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_bias",
-          "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_bias_grad",
           "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_weight",
           "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_weight_grad",
           "local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_inv_freq",
           "local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_inv_freq_grad",
-          "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_bias",
-          "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_bias_grad",
           "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_weight",
           "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_weight_grad",
           "local_gb10_quarter_brick_12_A_qkv_projection_indices_grad",
           "local_gb10_quarter_brick_12_A_qkv_projection_kv_scale",
           "local_gb10_quarter_brick_12_A_qkv_projection_kv_scale_grad",
           "local_gb10_quarter_brick_12_A_qkv_projection_q_scale_grad",
-          "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_attention_out_proj_bias",
           "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_attention_out_proj_weight",
           "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_lse",
           "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_out",
@@ -522,23 +785,23 @@
     },
     "physical_abi_validation": {
       "bank_capacity_elements": {
-        "path_c_float32_abi_bank": 330011533,
+        "path_c_float32_abi_bank": 329993613,
         "path_c_int32_abi_bank": 1,
         "path_c_uint8_abi_bank": 44040192
       },
       "bank_count": 3,
       "bank_used_bytes": {
-        "path_c_float32_abi_bank": 1320046132,
+        "path_c_float32_abi_bank": 1319974452,
         "path_c_int32_abi_bank": 4,
         "path_c_uint8_abi_bank": 44040192
       },
       "bank_used_elements": {
-        "path_c_float32_abi_bank": 330011533,
+        "path_c_float32_abi_bank": 329993613,
         "path_c_int32_abi_bank": 1,
         "path_c_uint8_abi_bank": 44040192
       },
       "errors": [],
-      "logical_buffer_count": 78,
+      "logical_buffer_count": 73,
       "status": "ok"
     },
     "physical_buffer_abi_map": {
@@ -554,7 +817,7 @@
       "hidden_grad": {
         "bank": "path_c_float32_abi_bank",
         "dtype": "float32",
-        "offset": 221799597,
+        "offset": 221781677,
         "shape": [
           14680064
         ],
@@ -572,7 +835,7 @@
       "local_gb10_quarter_brick_10_M_mamba3_B_bias_grad": {
         "bank": "path_c_float32_abi_bank",
         "dtype": "float32",
-        "offset": 329546525,
+        "offset": 329528605,
         "shape": [
           2048
         ],
@@ -590,7 +853,7 @@
       "local_gb10_quarter_brick_10_M_mamba3_B_norm_weight_grad": {
         "bank": "path_c_float32_abi_bank",
         "dtype": "float32",
-        "offset": 329544477,
+        "offset": 329526557,
         "shape": [
           2048
         ],
@@ -608,7 +871,7 @@
       "local_gb10_quarter_brick_10_M_mamba3_C_bias_grad": {
         "bank": "path_c_float32_abi_bank",
         "dtype": "float32",
-        "offset": 329550621,
+        "offset": 329532701,
         "shape": [
           2048
         ],
@@ -626,7 +889,7 @@
       "local_gb10_quarter_brick_10_M_mamba3_C_norm_weight_grad": {
         "bank": "path_c_float32_abi_bank",
         "dtype": "float32",
-        "offset": 329548573,
+        "offset": 329530653,
         "shape": [
           2048
         ],
@@ -644,7 +907,7 @@
       "local_gb10_quarter_brick_10_M_mamba3_D_grad": {
         "bank": "path_c_float32_abi_bank",
         "dtype": "float32",
-        "offset": 329552669,
+        "offset": 329534749,
         "shape": [
           112
         ],
@@ -662,7 +925,7 @@
       "local_gb10_quarter_brick_10_M_mamba3_conv_bias_grad": {
         "bank": "path_c_float32_abi_bank",
         "dtype": "float32",
-        "offset": 329533101,
+        "offset": 329515181,
         "shape": [
           11264
         ],
@@ -680,7 +943,7 @@
       "local_gb10_quarter_brick_10_M_mamba3_conv_weight_grad": {
         "bank": "path_c_float32_abi_bank",
         "dtype": "float32",
-        "offset": 329499309,
+        "offset": 329481389,
         "shape": [
           33792
         ],
@@ -698,7 +961,7 @@
       "local_gb10_quarter_brick_10_M_mamba3_dt_bias_grad": {
         "bank": "path_c_float32_abi_bank",
         "dtype": "float32",
-        "offset": 329544365,
+        "offset": 329526445,
         "shape": [
           112
         ],
@@ -716,7 +979,7 @@
       "local_gb10_quarter_brick_10_M_mamba3_h0_grad": {
         "bank": "path_c_float32_abi_bank",
         "dtype": "float32",
-        "offset": 329552781,
+        "offset": 329534861,
         "shape": [
           458752
         ],
@@ -734,7 +997,7 @@
       "local_gb10_quarter_brick_10_M_mamba3_in_proj_weight_grad": {
         "bank": "path_c_float32_abi_bank",
         "dtype": "float32",
-        "offset": 236487341,
+        "offset": 236469421,
         "shape": [
           67321856
         ],
@@ -752,7 +1015,7 @@
       "local_gb10_quarter_brick_10_M_mamba3_out_proj_weight_grad": {
         "bank": "path_c_float32_abi_bank",
         "dtype": "float32",
-        "offset": 303809197,
+        "offset": 303791277,
         "shape": [
           25690112
         ],
@@ -770,7 +1033,7 @@
       "local_gb10_quarter_brick_10_M_residual_norm_weight_grad": {
         "bank": "path_c_float32_abi_bank",
         "dtype": "float32",
-        "offset": 236479661,
+        "offset": 236461741,
         "shape": [
           3584
         ],
@@ -797,7 +1060,7 @@
       "local_gb10_quarter_brick_10_M_state_in_grad": {
         "bank": "path_c_float32_abi_bank",
         "dtype": "float32",
-        "offset": 236483245,
+        "offset": 236465325,
         "shape": [
           4096
         ],
@@ -815,7 +1078,7 @@
       "local_gb10_quarter_brick_11_R_hidden_after_grad": {
         "bank": "path_c_float32_abi_bank",
         "dtype": "float32",
-        "offset": 206071301,
+        "offset": 206053381,
         "shape": [
           14680064
         ],
@@ -833,7 +1096,7 @@
       "local_gb10_quarter_brick_11_R_m2rnn_A_log_grad": {
         "bank": "path_c_float32_abi_bank",
         "dtype": "float32",
-        "offset": 221565989,
+        "offset": 221548069,
         "shape": [
           4
         ],
@@ -851,7 +1114,7 @@
       "local_gb10_quarter_brick_11_R_m2rnn_D_grad": {
         "bank": "path_c_float32_abi_bank",
         "dtype": "float32",
-        "offset": 221565997,
+        "offset": 221548077,
         "shape": [
           64
         ],
@@ -869,7 +1132,7 @@
       "local_gb10_quarter_brick_11_R_m2rnn_conv_bias_grad": {
         "bank": "path_c_float32_abi_bank",
         "dtype": "float32",
-        "offset": 221565573,
+        "offset": 221547653,
         "shape": [
           160
         ],
@@ -896,7 +1159,7 @@
       "local_gb10_quarter_brick_11_R_m2rnn_conv_weight_grad": {
         "bank": "path_c_float32_abi_bank",
         "dtype": "float32",
-        "offset": 221564933,
+        "offset": 221547013,
         "shape": [
           640
         ],
@@ -914,7 +1177,7 @@
       "local_gb10_quarter_brick_11_R_m2rnn_dt_bias_grad": {
         "bank": "path_c_float32_abi_bank",
         "dtype": "float32",
-        "offset": 221565993,
+        "offset": 221548073,
         "shape": [
           4
         ],
@@ -932,7 +1195,7 @@
       "local_gb10_quarter_brick_11_R_m2rnn_g_norm_weight_grad": {
         "bank": "path_c_float32_abi_bank",
         "dtype": "float32",
-        "offset": 221566061,
+        "offset": 221548141,
         "shape": [
           64
         ],
@@ -950,7 +1213,7 @@
       "local_gb10_quarter_brick_11_R_m2rnn_h0_grad": {
         "bank": "path_c_float32_abi_bank",
         "dtype": "float32",
-        "offset": 221795501,
+        "offset": 221777581,
         "shape": [
           4096
         ],
@@ -968,7 +1231,7 @@
       "local_gb10_quarter_brick_11_R_m2rnn_in_proj_weight_grad": {
         "bank": "path_c_float32_abi_bank",
         "dtype": "float32",
-        "offset": 220754949,
+        "offset": 220737029,
         "shape": [
           809984
         ],
@@ -986,7 +1249,7 @@
       "local_gb10_quarter_brick_11_R_m2rnn_out_proj_weight_grad": {
         "bank": "path_c_float32_abi_bank",
         "dtype": "float32",
-        "offset": 221566125,
+        "offset": 221548205,
         "shape": [
           229376
         ],
@@ -1004,7 +1267,7 @@
       "local_gb10_quarter_brick_11_R_m2rnn_state_weight_grad": {
         "bank": "path_c_float32_abi_bank",
         "dtype": "float32",
-        "offset": 221565733,
+        "offset": 221547813,
         "shape": [
           256
         ],
@@ -1022,25 +1285,7 @@
       "local_gb10_quarter_brick_11_R_residual_norm_weight_grad": {
         "bank": "path_c_float32_abi_bank",
         "dtype": "float32",
-        "offset": 220751365,
-        "shape": [
-          3584
-        ],
-        "size": 3584
-      },
-      "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_bias": {
-        "bank": "path_c_float32_abi_bank",
-        "dtype": "float32",
-        "offset": 137699176,
-        "shape": [
-          3584
-        ],
-        "size": 3584
-      },
-      "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_bias_grad": {
-        "bank": "path_c_float32_abi_bank",
-        "dtype": "float32",
-        "offset": 193219013,
+        "offset": 220733445,
         "shape": [
           3584
         ],
@@ -1058,7 +1303,7 @@
       "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_weight_grad": {
         "bank": "path_c_float32_abi_bank",
         "dtype": "float32",
-        "offset": 180373957,
+        "offset": 180363205,
         "shape": [
           12845056
         ],
@@ -1067,7 +1312,7 @@
       "local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_inv_freq": {
         "bank": "path_c_float32_abi_bank",
         "dtype": "float32",
-        "offset": 150551400,
+        "offset": 150544232,
         "shape": [
           64
         ],
@@ -1076,34 +1321,16 @@
       "local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_inv_freq_grad": {
         "bank": "path_c_float32_abi_bank",
         "dtype": "float32",
-        "offset": 206071237,
+        "offset": 206053317,
         "shape": [
           64
         ],
         "size": 64
       },
-      "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_bias": {
-        "bank": "path_c_float32_abi_bank",
-        "dtype": "float32",
-        "offset": 150547816,
-        "shape": [
-          3584
-        ],
-        "size": 3584
-      },
-      "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_bias_grad": {
-        "bank": "path_c_float32_abi_bank",
-        "dtype": "float32",
-        "offset": 206067653,
-        "shape": [
-          3584
-        ],
-        "size": 3584
-      },
       "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_weight": {
         "bank": "path_c_float32_abi_bank",
         "dtype": "float32",
-        "offset": 137702760,
+        "offset": 137699176,
         "shape": [
           12845056
         ],
@@ -1112,7 +1339,7 @@
       "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_weight_grad": {
         "bank": "path_c_float32_abi_bank",
         "dtype": "float32",
-        "offset": 193222597,
+        "offset": 193208261,
         "shape": [
           12845056
         ],
@@ -1121,7 +1348,7 @@
       "local_gb10_quarter_brick_12_A_qkv_projection_indices_grad": {
         "bank": "path_c_float32_abi_bank",
         "dtype": "float32",
-        "offset": 178538949,
+        "offset": 178528197,
         "shape": [
           1835008
         ],
@@ -1148,7 +1375,7 @@
       "local_gb10_quarter_brick_12_A_qkv_projection_kv_scale": {
         "bank": "path_c_float32_abi_bank",
         "dtype": "float32",
-        "offset": 150551464,
+        "offset": 150544296,
         "shape": [
           114688
         ],
@@ -1157,7 +1384,7 @@
       "local_gb10_quarter_brick_12_A_qkv_projection_kv_scale_grad": {
         "bank": "path_c_float32_abi_bank",
         "dtype": "float32",
-        "offset": 178424261,
+        "offset": 178413509,
         "shape": [
           114688
         ],
@@ -1175,25 +1402,16 @@
       "local_gb10_quarter_brick_12_A_qkv_projection_q_scale_grad": {
         "bank": "path_c_float32_abi_bank",
         "dtype": "float32",
-        "offset": 178309573,
+        "offset": 178298821,
         "shape": [
           114688
         ],
         "size": 114688
       },
-      "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_attention_out_proj_bias": {
-        "bank": "path_c_float32_abi_bank",
-        "dtype": "float32",
-        "offset": 163511237,
-        "shape": [
-          3584
-        ],
-        "size": 3584
-      },
       "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_attention_out_proj_weight": {
         "bank": "path_c_float32_abi_bank",
         "dtype": "float32",
-        "offset": 150666181,
+        "offset": 150659013,
         "shape": [
           12845056
         ],
@@ -1202,7 +1420,7 @@
       "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_lse": {
         "bank": "path_c_float32_abi_bank",
         "dtype": "float32",
-        "offset": 178194885,
+        "offset": 178184133,
         "shape": [
           114688
         ],
@@ -1211,7 +1429,7 @@
       "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_out": {
         "bank": "path_c_float32_abi_bank",
         "dtype": "float32",
-        "offset": 163514821,
+        "offset": 163504069,
         "shape": [
           14680064
         ],
@@ -1229,7 +1447,7 @@
       "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_sinks": {
         "bank": "path_c_float32_abi_bank",
         "dtype": "float32",
-        "offset": 150666153,
+        "offset": 150658985,
         "shape": [
           28
         ],
@@ -1238,7 +1456,7 @@
       "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_sm_scale": {
         "bank": "path_c_float32_abi_bank",
         "dtype": "float32",
-        "offset": 150666152,
+        "offset": 150658984,
         "shape": [
           1
         ],
@@ -1247,7 +1465,7 @@
     },
     "physical_buffer_abi_shapes": {
       "path_c_float32_abi_bank": [
-        330011533
+        329993613
       ],
       "path_c_int32_abi_bank": [
         1
@@ -1257,7 +1475,7 @@
       ]
     },
     "physical_parameter_count": 21,
-    "sha256": "7a79b6a48c72e2050aa42633f4c0615dee5cd0b1998c02013a84755c73091fce",
+    "sha256": "479d361c3e2816baa24930fa772ea1d8996884e1930a7e894fa9d6995b57d81e",
     "shared_scratch_abi_bytes": 436608,
     "spilled_shared_scratch_count": 18,
     "spilled_shared_scratch_shapes": {
@@ -1504,21 +1722,21 @@
     "artifact_type": "JITKernel",
     "buffer_abi": [
       {
-        "bytes": 1320046132,
+        "bytes": 57252,
         "dtype": "float32",
-        "elements": 330011533,
+        "elements": 14313,
         "name": "path_c_float32_abi_bank",
         "shape": [
-          330011533
+          14313
         ]
       },
       {
-        "bytes": 44040192,
+        "bytes": 1024,
         "dtype": "uint8",
-        "elements": 44040192,
+        "elements": 1024,
         "name": "path_c_uint8_abi_bank",
         "shape": [
-          44040192
+          1024
         ]
       },
       {
@@ -1529,205 +1747,32 @@
         "shape": [
           1
         ]
-      },
-      {
-        "bytes": 90112,
-        "dtype": "float32",
-        "elements": 22528,
-        "name": "local_gb10_quarter_brick_10_M_mamba3_conv_history",
-        "shape": [
-          2,
-          11264
-        ]
-      },
-      {
-        "bytes": 75136,
-        "dtype": "float32",
-        "elements": 18784,
-        "name": "local_gb10_quarter_brick_10_M_mamba3_projected_vec",
-        "shape": [
-          18784
-        ]
-      },
-      {
-        "bytes": 45056,
-        "dtype": "float32",
-        "elements": 11264,
-        "name": "local_gb10_quarter_brick_10_M_mamba3_conv_vec",
-        "shape": [
-          11264
-        ]
-      },
-      {
-        "bytes": 28672,
-        "dtype": "float32",
-        "elements": 7168,
-        "name": "local_gb10_quarter_brick_10_M_mamba3_out_inner",
-        "shape": [
-          7168
-        ]
-      },
-      {
-        "bytes": 16384,
-        "dtype": "float32",
-        "elements": 4096,
-        "name": "local_gb10_quarter_brick_11_R_m2rnn_h_state",
-        "shape": [
-          4,
-          64,
-          16
-        ]
-      },
-      {
-        "bytes": 16384,
-        "dtype": "float32",
-        "elements": 4096,
-        "name": "local_gb10_quarter_brick_11_R_m2rnn_h_next",
-        "shape": [
-          4,
-          64,
-          16
-        ]
-      },
-      {
-        "bytes": 14336,
-        "dtype": "float32",
-        "elements": 3584,
-        "name": "local_gb10_quarter_brick_10_M_delta",
-        "shape": [
-          3584
-        ]
-      },
-      {
-        "bytes": 14336,
-        "dtype": "float32",
-        "elements": 3584,
-        "name": "local_gb10_quarter_brick_10_M_hidden_after",
-        "shape": [
-          3584
-        ]
-      },
-      {
-        "bytes": 14336,
-        "dtype": "float32",
-        "elements": 3584,
-        "name": "local_gb10_quarter_brick_10_M_residual_norm_hidden",
-        "shape": [
-          3584
-        ]
-      },
-      {
-        "bytes": 14336,
-        "dtype": "float32",
-        "elements": 3584,
-        "name": "local_gb10_quarter_brick_11_R_delta",
-        "shape": [
-          3584
-        ]
-      },
-      {
-        "bytes": 14336,
-        "dtype": "float32",
-        "elements": 3584,
-        "name": "local_gb10_quarter_brick_11_R_residual_norm_hidden",
-        "shape": [
-          3584
-        ]
-      },
-      {
-        "bytes": 14336,
-        "dtype": "float32",
-        "elements": 3584,
-        "name": "local_gb10_quarter_brick_11_R_residual_norm_hidden_grad",
-        "shape": [
-          3584
-        ]
-      },
-      {
-        "bytes": 14336,
-        "dtype": "float32",
-        "elements": 3584,
-        "name": "local_gb10_quarter_brick_10_M_hidden_after_grad",
-        "shape": [
-          3584
-        ]
-      },
-      {
-        "bytes": 14336,
-        "dtype": "float32",
-        "elements": 3584,
-        "name": "local_gb10_quarter_brick_11_R_delta_grad",
-        "shape": [
-          3584
-        ]
-      },
-      {
-        "bytes": 14336,
-        "dtype": "float32",
-        "elements": 3584,
-        "name": "local_gb10_quarter_brick_10_M_residual_norm_hidden_grad",
-        "shape": [
-          3584
-        ]
-      },
-      {
-        "bytes": 14336,
-        "dtype": "float32",
-        "elements": 3584,
-        "name": "local_gb10_quarter_brick_10_M_delta_grad",
-        "shape": [
-          3584
-        ]
-      },
-      {
-        "bytes": 14336,
-        "dtype": "float32",
-        "elements": 3584,
-        "name": "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_context_values",
-        "shape": [
-          3584
-        ]
-      },
-      {
-        "bytes": 7168,
-        "dtype": "float32",
-        "elements": 1792,
-        "name": "local_gb10_quarter_brick_10_M_mamba3_angle_cumsum",
-        "shape": [
-          112,
-          16
-        ]
       }
     ],
-    "compile_elapsed_s": 0.01620141603052616,
-    "elapsed_s": 0.3078053329954855,
-    "execute_elapsed_s": 0.002720958029385656,
+    "compile_elapsed_s": 0.02406141598476097,
+    "elapsed_s": 0.17316379200201482,
+    "execute_elapsed_s": 0.01065366598777473,
     "execution_backend": "tvm_ffi",
     "implementation_kind": "production",
-    "kernel_parameter_count": 21,
+    "kernel_parameter_count": 3,
     "kernel_source": {
-      "for_loop_count": 154,
-      "if_count": 215,
-      "kernel_source_bytes": 232506,
-      "kernel_source_lines": 2110,
-      "threadgroup_barrier_count": 99,
-      "threadgroup_dynamic_shared_bytes": 21696
+      "for_loop_count": 89,
+      "if_count": 170,
+      "kernel_source_bytes": 151214,
+      "kernel_source_lines": 1564,
+      "threadgroup_barrier_count": 80,
+      "threadgroup_dynamic_shared_bytes": 8096
     },
-    "logical_parameter_count": 78,
-    "max_buffer_bytes": 2000000000,
-    "mode": "production_1b",
+    "logical_parameter_count": 42,
+    "max_buffer_bytes": 268435456,
+    "mode": "tiny_mra",
     "node_names": [
-      "local_gb10_quarter_brick_10_M",
-      "local_gb10_quarter_brick_10_M_residual_norm",
-      "local_gb10_quarter_brick_11_R",
-      "local_gb10_quarter_brick_11_R_residual_norm",
-      "local_gb10_quarter_brick_12_A_qkv_projection",
-      "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply",
-      "local_gb10_quarter_brick_12_A_qkv_projection_bwd",
-      "local_gb10_quarter_brick_11_R_residual_norm_bwd",
-      "local_gb10_quarter_brick_11_R_bwd",
-      "local_gb10_quarter_brick_10_M_residual_norm_bwd",
-      "local_gb10_quarter_brick_10_M_bwd"
+      "route_0_M",
+      "route_0_M_residual_norm",
+      "route_1_R",
+      "route_1_R_residual_norm",
+      "route_2_A_qkv_projection",
+      "route_2_A_sparse_mla_fp8_apply"
     ],
     "physical_abi_policy": "banked_by_dtype",
     "physical_abi_runtime_binding": {
@@ -1740,87 +1785,51 @@
         "logical_buffers_by_bank": {
           "path_c_float32_abi_bank": [
             "hidden",
-            "hidden_grad",
-            "local_gb10_quarter_brick_10_M_mamba3_B_bias",
-            "local_gb10_quarter_brick_10_M_mamba3_B_bias_grad",
-            "local_gb10_quarter_brick_10_M_mamba3_B_norm_weight",
-            "local_gb10_quarter_brick_10_M_mamba3_B_norm_weight_grad",
-            "local_gb10_quarter_brick_10_M_mamba3_C_bias",
-            "local_gb10_quarter_brick_10_M_mamba3_C_bias_grad",
-            "local_gb10_quarter_brick_10_M_mamba3_C_norm_weight",
-            "local_gb10_quarter_brick_10_M_mamba3_C_norm_weight_grad",
-            "local_gb10_quarter_brick_10_M_mamba3_D",
-            "local_gb10_quarter_brick_10_M_mamba3_D_grad",
-            "local_gb10_quarter_brick_10_M_mamba3_conv_bias",
-            "local_gb10_quarter_brick_10_M_mamba3_conv_bias_grad",
-            "local_gb10_quarter_brick_10_M_mamba3_conv_weight",
-            "local_gb10_quarter_brick_10_M_mamba3_conv_weight_grad",
-            "local_gb10_quarter_brick_10_M_mamba3_dt_bias",
-            "local_gb10_quarter_brick_10_M_mamba3_dt_bias_grad",
-            "local_gb10_quarter_brick_10_M_mamba3_h0",
-            "local_gb10_quarter_brick_10_M_mamba3_h0_grad",
-            "local_gb10_quarter_brick_10_M_mamba3_in_proj_weight",
-            "local_gb10_quarter_brick_10_M_mamba3_in_proj_weight_grad",
-            "local_gb10_quarter_brick_10_M_mamba3_out_proj_weight",
-            "local_gb10_quarter_brick_10_M_mamba3_out_proj_weight_grad",
-            "local_gb10_quarter_brick_10_M_residual_norm_weight",
-            "local_gb10_quarter_brick_10_M_residual_norm_weight_grad",
-            "local_gb10_quarter_brick_10_M_state",
-            "local_gb10_quarter_brick_10_M_state_in",
-            "local_gb10_quarter_brick_10_M_state_in_grad",
-            "local_gb10_quarter_brick_11_R_hidden_after",
-            "local_gb10_quarter_brick_11_R_hidden_after_grad",
-            "local_gb10_quarter_brick_11_R_m2rnn_A_log",
-            "local_gb10_quarter_brick_11_R_m2rnn_A_log_grad",
-            "local_gb10_quarter_brick_11_R_m2rnn_D",
-            "local_gb10_quarter_brick_11_R_m2rnn_D_grad",
-            "local_gb10_quarter_brick_11_R_m2rnn_conv_bias",
-            "local_gb10_quarter_brick_11_R_m2rnn_conv_bias_grad",
-            "local_gb10_quarter_brick_11_R_m2rnn_conv_state",
-            "local_gb10_quarter_brick_11_R_m2rnn_conv_weight",
-            "local_gb10_quarter_brick_11_R_m2rnn_conv_weight_grad",
-            "local_gb10_quarter_brick_11_R_m2rnn_dt_bias",
-            "local_gb10_quarter_brick_11_R_m2rnn_dt_bias_grad",
-            "local_gb10_quarter_brick_11_R_m2rnn_g_norm_weight",
-            "local_gb10_quarter_brick_11_R_m2rnn_g_norm_weight_grad",
-            "local_gb10_quarter_brick_11_R_m2rnn_h0",
-            "local_gb10_quarter_brick_11_R_m2rnn_h0_grad",
-            "local_gb10_quarter_brick_11_R_m2rnn_in_proj_weight",
-            "local_gb10_quarter_brick_11_R_m2rnn_in_proj_weight_grad",
-            "local_gb10_quarter_brick_11_R_m2rnn_out_proj_weight",
-            "local_gb10_quarter_brick_11_R_m2rnn_out_proj_weight_grad",
-            "local_gb10_quarter_brick_11_R_m2rnn_state_weight",
-            "local_gb10_quarter_brick_11_R_m2rnn_state_weight_grad",
-            "local_gb10_quarter_brick_11_R_residual_norm_weight",
-            "local_gb10_quarter_brick_11_R_residual_norm_weight_grad",
-            "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_bias",
-            "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_bias_grad",
-            "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_weight",
-            "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_weight_grad",
-            "local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_inv_freq",
-            "local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_inv_freq_grad",
-            "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_bias",
-            "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_bias_grad",
-            "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_weight",
-            "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_weight_grad",
-            "local_gb10_quarter_brick_12_A_qkv_projection_indices_grad",
-            "local_gb10_quarter_brick_12_A_qkv_projection_kv_scale",
-            "local_gb10_quarter_brick_12_A_qkv_projection_kv_scale_grad",
-            "local_gb10_quarter_brick_12_A_qkv_projection_q_scale_grad",
-            "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_attention_out_proj_bias",
-            "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_attention_out_proj_weight",
-            "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_lse",
-            "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_out",
-            "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_sinks",
-            "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_sm_scale"
+            "route_0_M_mamba3_B_bias",
+            "route_0_M_mamba3_B_norm_weight",
+            "route_0_M_mamba3_C_bias",
+            "route_0_M_mamba3_C_norm_weight",
+            "route_0_M_mamba3_D",
+            "route_0_M_mamba3_conv_bias",
+            "route_0_M_mamba3_conv_weight",
+            "route_0_M_mamba3_dt_bias",
+            "route_0_M_mamba3_h0",
+            "route_0_M_mamba3_in_proj_weight",
+            "route_0_M_mamba3_out_proj_weight",
+            "route_0_M_residual_norm_weight",
+            "route_0_M_state",
+            "route_0_M_state_in",
+            "route_1_R_hidden_after",
+            "route_1_R_m2rnn_A_log",
+            "route_1_R_m2rnn_D",
+            "route_1_R_m2rnn_conv_bias",
+            "route_1_R_m2rnn_conv_state",
+            "route_1_R_m2rnn_conv_weight",
+            "route_1_R_m2rnn_dt_bias",
+            "route_1_R_m2rnn_g_norm_weight",
+            "route_1_R_m2rnn_h0",
+            "route_1_R_m2rnn_in_proj_weight",
+            "route_1_R_m2rnn_out_proj_weight",
+            "route_1_R_m2rnn_state_weight",
+            "route_1_R_residual_norm_weight",
+            "route_2_A_qkv_projection_attention_q_proj_bias",
+            "route_2_A_qkv_projection_attention_q_proj_weight",
+            "route_2_A_qkv_projection_attention_rope_inv_freq",
+            "route_2_A_qkv_projection_attention_sparse_kv_proj_bias",
+            "route_2_A_qkv_projection_attention_sparse_kv_proj_weight",
+            "route_2_A_qkv_projection_kv_scale",
+            "route_2_A_sparse_mla_fp8_apply_attention_out_proj_bias",
+            "route_2_A_sparse_mla_fp8_apply_attention_out_proj_weight",
+            "route_2_A_sparse_mla_fp8_apply_lse",
+            "route_2_A_sparse_mla_fp8_apply_out",
+            "route_2_A_sparse_mla_fp8_apply_sparse_mla_sinks",
+            "route_2_A_sparse_mla_fp8_apply_sparse_mla_sm_scale"
           ],
           "path_c_int32_abi_bank": [
-            "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_has_sinks"
+            "route_2_A_sparse_mla_fp8_apply_sparse_mla_has_sinks"
           ],
           "path_c_uint8_abi_bank": [
-            "local_gb10_quarter_brick_12_A_qkv_projection_kv_fp8",
-            "local_gb10_quarter_brick_12_A_qkv_projection_kv_fp8_grad",
-            "local_gb10_quarter_brick_12_A_qkv_projection_q_fp8_grad"
+            "route_2_A_qkv_projection_kv_fp8"
           ]
         },
         "logical_tensor_binding_supported": false,
@@ -1834,6 +1843,7 @@
         ],
         "status": "prepacked_bank_buffers_required"
       },
+      "dtype_mismatch_buffers": [],
       "errors": [],
       "missing_bank_buffers": [],
       "ordered_kernel_buffers": [
@@ -1842,41 +1852,24 @@
         "path_c_int32_abi_bank"
       ],
       "reason": "caller supplied the physical bank buffers in kernel argument order",
+      "shape_mismatch_buffers": [],
       "status": "ok",
       "unexpected_buffers": []
     },
-    "region_name": "local_gb10_quarter_path_c_10_12",
+    "region_name": "runtime_smoke_0_2",
     "result_repr": "[]",
     "result_type": "list",
     "runtime_kernel_buffers": [
       "path_c_float32_abi_bank",
       "path_c_uint8_abi_bank",
-      "path_c_int32_abi_bank",
-      "local_gb10_quarter_brick_10_M_mamba3_conv_history",
-      "local_gb10_quarter_brick_10_M_mamba3_projected_vec",
-      "local_gb10_quarter_brick_10_M_mamba3_conv_vec",
-      "local_gb10_quarter_brick_10_M_mamba3_out_inner",
-      "local_gb10_quarter_brick_11_R_m2rnn_h_state",
-      "local_gb10_quarter_brick_11_R_m2rnn_h_next",
-      "local_gb10_quarter_brick_10_M_delta",
-      "local_gb10_quarter_brick_10_M_hidden_after",
-      "local_gb10_quarter_brick_10_M_residual_norm_hidden",
-      "local_gb10_quarter_brick_11_R_delta",
-      "local_gb10_quarter_brick_11_R_residual_norm_hidden",
-      "local_gb10_quarter_brick_11_R_residual_norm_hidden_grad",
-      "local_gb10_quarter_brick_10_M_hidden_after_grad",
-      "local_gb10_quarter_brick_11_R_delta_grad",
-      "local_gb10_quarter_brick_10_M_residual_norm_hidden_grad",
-      "local_gb10_quarter_brick_10_M_delta_grad",
-      "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_context_values",
-      "local_gb10_quarter_brick_10_M_mamba3_angle_cumsum"
+      "path_c_int32_abi_bank"
     ],
-    "schedule_id": "path_c_descriptor_chain_c44eddb18abd",
+    "schedule_id": "path_c_descriptor_chain_9241ad8b8790",
     "status": "ok",
     "stderr_tail": "",
-    "stdout_tail": "2026-05-20 11:50:11  [TileLang:tilelang.cache.kernel_cache:WARNING] (kernel_cache.py:333): Found kernel 'local_gb10_quarter_path_c_10_12' in memory cache. For better performance, consider using `@tilelang.jit` instead of direct kernel caching.\n",
+    "stdout_tail": "",
     "target": "metal",
-    "total_buffer_bytes": 1364522936
+    "total_buffer_bytes": 58280
   },
   "schedule_spec": {
     "brick_production_fragment_statuses": [
@@ -1926,19 +1919,14 @@
       "local_gb10_quarter_brick_11_R_m2rnn_conv_state:(480,)",
       "local_gb10_quarter_brick_11_R_residual_norm_weight:(3584,)",
       "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_weight:(12845056,)",
-      "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_bias:(3584,)",
       "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_weight:(12845056,)",
-      "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_bias:(3584,)",
       "local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_inv_freq:(64,)",
       "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_sm_scale:(1,)",
       "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_sinks:(28,)",
       "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_has_sinks:(1,)",
       "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_attention_out_proj_weight:(12845056,)",
-      "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_attention_out_proj_bias:(3584,)",
       "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_weight_grad:(12845056,)",
-      "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_bias_grad:(3584,)",
       "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_weight_grad:(12845056,)",
-      "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_bias_grad:(3584,)",
       "local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_inv_freq_grad:(64,)",
       "local_gb10_quarter_brick_11_R_residual_norm_weight_grad:(3584,)",
       "local_gb10_quarter_brick_11_R_m2rnn_in_proj_weight_grad:(809984,)",
@@ -2008,19 +1996,14 @@
       "local_gb10_quarter_brick_11_R_m2rnn_conv_state",
       "local_gb10_quarter_brick_11_R_residual_norm_weight",
       "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_weight",
-      "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_bias",
       "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_weight",
-      "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_bias",
       "local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_inv_freq",
       "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_sm_scale",
       "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_sinks",
       "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_has_sinks",
       "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_attention_out_proj_weight",
-      "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_attention_out_proj_bias",
       "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_weight_grad",
-      "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_bias_grad",
       "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_weight_grad",
-      "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_bias_grad",
       "local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_inv_freq_grad",
       "local_gb10_quarter_brick_11_R_residual_norm_weight_grad",
       "local_gb10_quarter_brick_11_R_m2rnn_in_proj_weight_grad",
@@ -2101,11 +2084,11 @@
     ]
   },
   "software": {
-    "cppmega_sha": "f222b75",
+    "cppmega_sha": "34e3e7a",
     "platform": "macOS-26.4.1-arm64-arm-64bit-Mach-O",
     "python": "3.13.12",
     "tilelang_root": "/Volumes/external/sources/tilelang",
-    "tilelang_sha": "7f0e39f6"
+    "tilelang_sha": "c6f2a65d"
   },
   "status": "ok",
   "target": "metal"
