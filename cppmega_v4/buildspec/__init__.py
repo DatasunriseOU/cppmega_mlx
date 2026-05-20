@@ -37,7 +37,11 @@ from cppmega_v4.buildspec.model_build_spec import (
 )
 from cppmega_v4.buildspec.rewriters import (
     HeadDetectionError,
+    IFIMCompositionError,
+    IFIMRewriter,
     LossRewriteError,
+    MHCCompositionError,
+    MHCRewriter,
     MTPRewriter,
 )
 from cppmega_v4.buildspec.optim_spec import (
@@ -56,8 +60,12 @@ __all__ = [
     "BuildDiagnosticSeverity",
     "BuildDiagnostics",
     "HeadDetectionError",
+    "IFIMCompositionError",
+    "IFIMRewriter",
     "LOSS_BUILTINS",
     "LossRewriteError",
+    "MHCCompositionError",
+    "MHCRewriter",
     "MTPRewriter",
     "LossKind",
     "LossSpec",

@@ -1,6 +1,7 @@
 """Concrete graph rewriters.
 
-Stage C scope (this commit): :class:`MTPRewriter`.
+Stage C + D scope (this commit family): :class:`MTPRewriter`,
+:class:`IFIMRewriter`, :class:`MHCRewriter`.
 
 A rewriter is a callable ``(ModelBuildSpec) -> ModelBuildSpec`` that
 matches the :class:`cppmega_v4.buildspec.Rewriter` Protocol. It:
@@ -39,6 +40,8 @@ from typing import Final
 from cppmega_v4.buildspec.loss_spec import (
     LossKind,
     LossSpec,
+    ifim_shaped_loss,
+    mhc_attn_bias_loss,
     mtp_weighted_loss,
 )
 from cppmega_v4.buildspec.model_build_spec import (
@@ -269,8 +272,240 @@ class LossRewriteError(RuntimeError):
     """Raised by MTPRewriter when the input loss can't be safely converted."""
 
 
+# ---------------------------------------------------------------------------
+# IFIMRewriter
+# ---------------------------------------------------------------------------
+
+
+_ATTENTION_KINDS: Final[frozenset[str]] = frozenset({
+    "attention", "gated_attention", "gqa_sliding", "cca_attention",
+    "mla", "mla_absorb", "mistral4_mla", "bailing_mla",
+    "dsv4_attention", "nsa", "csa_hca",
+})
+
+
+@dataclass(frozen=True)
+class IFIMRewriter:
+    """Inverse Fisher Information Matrix shaping rewriter.
+
+    Adds a virtual ``ifim_aux`` brick downstream of the (post-MTP if
+    present) head and rewrites the loss to :func:`ifim_shaped_loss`
+    with ``lambda_fim`` weighting.
+
+    Pre-condition: ``"single_head"`` OR ``"mtp_k_heads"`` (works either
+    way — when MTP rewrote first, IFIM attaches to every head clone via
+    the loss aggregator; the graph stays simple and only one aux node
+    appears).
+
+    Post-condition: adds ``"ifim_added"`` to the state-token set.
+    """
+
+    lambda_fim: float = 0.1
+    aux_node_name: str = "ifim_aux"
+
+    # Rewriter protocol
+    name: str = field(init=False)
+    required_preconditions: frozenset[str] = field(init=False)
+    provided_postconditions: frozenset[str] = field(init=False)
+
+    def __post_init__(self) -> None:
+        if self.lambda_fim < 0:
+            raise ValueError(
+                f"IFIMRewriter.lambda_fim must be ≥ 0, got {self.lambda_fim}"
+            )
+        if not self.aux_node_name.strip():
+            raise ValueError("IFIMRewriter.aux_node_name must be non-empty")
+        object.__setattr__(
+            self, "name", f"IFIMRewriter(λ={self.lambda_fim})",
+        )
+        # Accept either single-head CE base or post-MTP K-head — runtime
+        # picks the right loss aggregator.
+        object.__setattr__(
+            self, "required_preconditions", frozenset(),
+        )
+        object.__setattr__(
+            self, "provided_postconditions", frozenset({"ifim_added"}),
+        )
+
+    def __call__(self, spec: ModelBuildSpec) -> ModelBuildSpec:
+        if "ifim_added" in spec.state_tokens:
+            raise IFIMCompositionError(
+                "IFIMRewriter already applied to this spec; double-apply "
+                "would compound the lambda_fim weight unsafely"
+            )
+
+        # Don't touch the underlying graph topology — IFIM is a
+        # loss-side rewrite. We add the aux node so downstream consumers
+        # (memory_report, GUI) can see it in the brick list. Edges
+        # connect it as a leaf consumer of the existing head(s).
+        existing_names = {n.name for n in spec.graph.nodes}
+        aux_name = self.aux_node_name
+        suffix = 0
+        while aux_name in existing_names:
+            suffix += 1
+            aux_name = f"{self.aux_node_name}_{suffix}"
+
+        # Pick the head(s) to feed: prefer the loss spec's declared
+        # head_outputs; fall back to the last node when none match.
+        head_names = [
+            n.name for n in spec.graph.nodes
+            if n.name in spec.loss.head_outputs
+        ]
+        if not head_names:
+            head_names = [spec.graph.nodes[-1].name] if spec.graph.nodes else []
+
+        aux_node = BrickNode(
+            kind="mlp",  # safe stand-in shape contract; real impl is loss-side
+            name=aux_name,
+            params={"is_ifim_aux": True, "lambda_fim": self.lambda_fim},
+            module=None,
+        )
+        new_nodes = (*spec.graph.nodes, aux_node)
+        new_edges = (
+            *spec.graph.edges,
+            *[(h, aux_name) for h in head_names],
+        )
+        new_graph = BrickGraph(nodes=new_nodes, edges=new_edges)
+
+        # Rewrite loss: preserve original head_outputs; switch to IFIM kind.
+        new_loss = ifim_shaped_loss(
+            lambda_fim=self.lambda_fim,
+            head_output_name=spec.loss.head_outputs[0],
+        )
+        # If the input was MTP-weighted, keep the multi-head structure:
+        # promote IFIM into a "MTP-with-IFIM" combined spec by reusing
+        # the MTP head_outputs as the IFIM heads.
+        if spec.loss.kind is LossKind.MTP_WEIGHTED:
+            new_loss = LossSpec(
+                kind=LossKind.IFIM_SHAPED,
+                params={"lambda_fim": float(self.lambda_fim)},
+                head_outputs=spec.loss.head_outputs,
+                label_source="next_token",
+            )
+
+        return spec.replace(graph=new_graph, loss=new_loss)
+
+
+class IFIMCompositionError(RuntimeError):
+    """Raised by :class:`IFIMRewriter` when applied twice to the same spec."""
+
+
+# ---------------------------------------------------------------------------
+# MHCRewriter
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class MHCRewriter:
+    """Multi-Head-Copy attention bias rewriter.
+
+    For every attention brick in the graph, materialises ``num_copies-1``
+    additional weight-shared copies and adds an auxiliary
+    :func:`mhc_attn_bias_loss` term with ``lambda_mhc`` weighting.
+
+    The copies are NAMED ``<orig>_mhc_<i>`` and reuse the original
+    module reference (weight sharing happens at build time — Stage E
+    wires them into one nn.Linear with cached forward).
+
+    Post-condition: adds ``"mhc_copies_added"``.
+    """
+
+    num_copies: int = 2
+    lambda_mhc: float = 0.05
+
+    # Rewriter protocol
+    name: str = field(init=False)
+    required_preconditions: frozenset[str] = field(init=False)
+    provided_postconditions: frozenset[str] = field(init=False)
+
+    def __post_init__(self) -> None:
+        if self.num_copies < 1:
+            raise ValueError(
+                f"MHCRewriter.num_copies must be ≥ 1, got {self.num_copies}"
+            )
+        if self.lambda_mhc < 0:
+            raise ValueError(
+                f"MHCRewriter.lambda_mhc must be ≥ 0, got {self.lambda_mhc}"
+            )
+        object.__setattr__(
+            self, "name",
+            f"MHCRewriter(copies={self.num_copies}, λ={self.lambda_mhc})",
+        )
+        object.__setattr__(
+            self, "required_preconditions", frozenset(),
+        )
+        object.__setattr__(
+            self, "provided_postconditions",
+            frozenset() if self.num_copies == 1
+            else frozenset({"mhc_copies_added"}),
+        )
+
+    def __call__(self, spec: ModelBuildSpec) -> ModelBuildSpec:
+        if self.num_copies == 1:
+            return spec
+        if "mhc_copies_added" in spec.state_tokens:
+            raise MHCCompositionError(
+                "MHCRewriter already applied to this spec; double-apply "
+                "would multiply attention copies geometrically"
+            )
+
+        new_nodes: list[BrickNode] = list(spec.graph.nodes)
+        new_edges: list[tuple[str, str]] = list(spec.graph.edges)
+        existing_names = {n.name for n in spec.graph.nodes}
+
+        attention_nodes = [
+            n for n in spec.graph.nodes if n.kind in _ATTENTION_KINDS
+        ]
+        if not attention_nodes:
+            # No-op: graph has no attention bricks; advertise the
+            # postcondition anyway so chained rewriters can rely on it.
+            return spec.replace(graph=spec.graph)
+
+        for attn in attention_nodes:
+            for i in range(1, self.num_copies):
+                clone_name = f"{attn.name}_mhc_{i}"
+                suffix = 0
+                while clone_name in existing_names:
+                    suffix += 1
+                    clone_name = f"{attn.name}_mhc_{i}_{suffix}"
+                existing_names.add(clone_name)
+                clone = BrickNode(
+                    kind=attn.kind,
+                    name=clone_name,
+                    params={**attn.params, "is_mhc_copy": True,
+                            "mhc_source": attn.name},
+                    module=attn.module,   # weight-shared at build time
+                )
+                new_nodes.append(clone)
+                # Wire identically: every producer of attn also feeds
+                # the copy (so it sees the same input). The output of
+                # the copy is consumed by the auxiliary loss only.
+                for p, c in spec.graph.edges:
+                    if c == attn.name:
+                        new_edges.append((p, clone_name))
+
+        new_graph = BrickGraph(nodes=tuple(new_nodes), edges=tuple(new_edges))
+
+        # Switch loss to MHC_ATTN_BIAS (keep head_outputs from previous loss).
+        new_loss = LossSpec(
+            kind=LossKind.MHC_ATTN_BIAS,
+            params={"lambda_mhc": float(self.lambda_mhc)},
+            head_outputs=spec.loss.head_outputs,
+            label_source=spec.loss.label_source,
+        )
+        return spec.replace(graph=new_graph, loss=new_loss)
+
+
+class MHCCompositionError(RuntimeError):
+    """Raised by :class:`MHCRewriter` when applied twice to the same spec."""
+
+
 __all__ = [
     "HeadDetectionError",
+    "IFIMCompositionError",
+    "IFIMRewriter",
     "LossRewriteError",
+    "MHCCompositionError",
+    "MHCRewriter",
     "MTPRewriter",
 ]
