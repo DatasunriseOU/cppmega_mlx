@@ -148,6 +148,7 @@ _MAMBA3_FP8_TRAIN_FWD_BWD_OP_SIGNATURE = (
     "residual_rmsnorm",
     "attention_qkv_projection",
     "sparse_mla_fp8_apply",
+    "sparse_mla_fp8_apply_bwd",
     "attention_qkv_projection_bwd",
     "residual_rmsnorm_bwd",
     "m2rnn_bwd",
@@ -737,6 +738,44 @@ def default_path_c_brick_schedule_descriptor_registry() -> (
                     "softmax stats without full activation staging"
                 ),
                 fragment_emitter=_emit_sparse_mla_fp8_apply_source,
+            ),
+            PathCBrickScheduleDescriptor(
+                op_name="sparse_mla_fp8_apply_bwd",
+                implementation_status="descriptor_codegen_ready",
+                required_codegen_steps=(
+                    "sparse_mla_fp8_apply_bwd_descriptor",
+                    "sparse_mla_fp8_apply_bwd_prepared_grad_owner_outputs",
+                    "sparse_mla_fp8_apply_bwd_out_proj_grad_owner_outputs",
+                ),
+                supports_backward=False,
+                description="Sparse MLA FP8 apply backward descriptor",
+                production_source=(
+                    "cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c:"
+                    "sparse_mla_fp8_path_c_apply VJP"
+                ),
+                production_fragment_status="region_fragment_inlined_unoptimized",
+                production_fragment_reason=(
+                    "Sparse-MLA FP8 apply backward now has an explicit "
+                    "descriptor and emits prepared q/kv FP8, scale, and "
+                    "attention out-projection owner gradients inside the "
+                    "train-block graph, but it is still scalar descriptor code "
+                    "rather than the production softmax/out-projection VJP"
+                ),
+                preferred_internal_buffer_policy=(
+                    DESCRIPTOR_INTERNAL_BUFFER_POLICY_ROW_LOCAL_HIDDEN
+                ),
+                preferred_loop_policy=DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN,
+                production_fragment_policy=DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN,
+                production_fragment_codegen_step=(
+                    "sparse_mla_fp8_apply_bwd_row_phased_prepared_grad"
+                ),
+                production_fragment_inlined_reason=(
+                    "row-phased descriptor codegen emits Sparse-MLA apply "
+                    "backward owner outputs for prepared q/kv FP8 values, "
+                    "prepared scales, and attention out-projection gradients "
+                    "without exposing q/kv prepared gradients as external ABI"
+                ),
+                fragment_emitter=_emit_sparse_mla_fp8_apply_bwd_source,
             ),
         )
     )
@@ -1845,7 +1884,7 @@ def _append_row_phased_hidden_body(
             )
             for statement in fragment.statements:
                 body.append(f"{indent * 3}{statement}")
-            body.append(f"{indent * 2}T.sync_threads()")
+            body.append(f"{indent * 3}T.sync_threads()")
         return
     for node, _descriptor, _fragment in bwd_items:
         if _is_row_phased_residual_rmsnorm_bwd(node, _descriptor):
@@ -5715,6 +5754,101 @@ def _emit_sparse_mla_fp8_apply_source(
     )
 
 
+def _emit_sparse_mla_fp8_apply_bwd_source(
+    node: _ScheduleNodeView,
+    dtype_by_buffer: dict[str, str],
+    access_by_buffer: dict[str, str],
+) -> _ScheduleNodeFragment:
+    apply_grad = _scratch_name(node, "apply_grad")
+    q_value = _scratch_name(node, "q_value")
+    kv_value = _scratch_name(node, "kv_value")
+    index = "i"
+    out_grad = _node_indexed_canonical_or_positional_input_expr(
+        node,
+        ("attention_out", "out"),
+        0,
+        dtype_by_buffer,
+        access_by_buffer,
+        index,
+    )
+    q_fp8 = _node_indexed_canonical_input_expr(
+        node,
+        "q_fp8",
+        dtype_by_buffer,
+        access_by_buffer,
+        index,
+    )
+    q_scale = _node_indexed_canonical_input_expr(
+        node,
+        "q_scale",
+        dtype_by_buffer,
+        access_by_buffer,
+        index,
+        default="1.0",
+    )
+    kv_fp8 = _node_indexed_canonical_input_expr(
+        node,
+        "kv_fp8",
+        dtype_by_buffer,
+        access_by_buffer,
+        index,
+    )
+    kv_scale = _node_indexed_canonical_input_expr(
+        node,
+        "kv_scale",
+        dtype_by_buffer,
+        access_by_buffer,
+        index,
+        default="1.0",
+    )
+    sm_scale = _node_indexed_canonical_input_expr(
+        node,
+        "sparse_mla_sm_scale",
+        dtype_by_buffer,
+        access_by_buffer,
+        index,
+        default="1.0",
+    )
+    out_proj_weight = _node_indexed_canonical_input_expr(
+        node,
+        "attention_out_proj_weight",
+        dtype_by_buffer,
+        access_by_buffer,
+        index,
+        default="1.0",
+    )
+    inner = [
+        f"{q_value}[0] = {q_fp8} * {q_scale}",
+        f"{kv_value}[0] = {kv_fp8} * {kv_scale}",
+        f"{apply_grad}[0] = {out_grad} * {out_proj_weight} * {sm_scale}",
+    ]
+    for output_name in node.outputs:
+        canonical_name = _canonical_buffer_name(output_name)
+        output_ref = _buffer_ref(output_name, access_by_buffer, index)
+        if canonical_name == "q_fp8":
+            inner.append(f"{output_ref} = {apply_grad}[0] * {q_scale}")
+        elif canonical_name == "q_scale":
+            inner.append(f"{output_ref} = {apply_grad}[0] * {q_fp8}")
+        elif canonical_name == "kv_fp8":
+            inner.append(f"{output_ref} = {apply_grad}[0] * {kv_scale}")
+        elif canonical_name == "kv_scale":
+            inner.append(f"{output_ref} = {apply_grad}[0] * {kv_fp8}")
+        elif canonical_name == "attention_out_proj_weight":
+            inner.append(f"{output_ref} = {out_grad} * ({q_value}[0] + {kv_value}[0])")
+        elif canonical_name == "attention_out_proj_bias":
+            inner.append(f"{output_ref} = {out_grad}")
+        else:
+            inner.append(f"{output_ref} = {apply_grad}[0]")
+    return _ScheduleNodeFragment(
+        allocations=(
+            f"{apply_grad} = T.alloc_local((1,), \"float32\")",
+            f"{q_value} = T.alloc_local((1,), \"float32\")",
+            f"{kv_value} = T.alloc_local((1,), \"float32\")",
+        ),
+        statements=tuple(inner),
+    )
+
+
 def _emit_attention_qkv_projection_bwd_source(
     node: _ScheduleNodeView,
     dtype_by_buffer: dict[str, str],
@@ -6481,10 +6615,12 @@ def _is_attention_kv_history_workspace_output(
 ) -> bool:
     if producer.op_name != "attention_qkv_projection":
         return False
+    if str(output_name).endswith("_grad"):
+        return False
     if _canonical_buffer_name(output_name) not in {"kv_fp8", "kv_scale"}:
         return False
     return any(
-        consumer.op_name == "sparse_mla_fp8_apply"
+        consumer.op_name in {"sparse_mla_fp8_apply", "sparse_mla_fp8_apply_bwd"}
         and output_name in consumer.inputs
         for consumer in nodes
     )
@@ -6497,6 +6633,8 @@ def _uses_external_kv_history_workspace(
     internal_buffer_policy: str,
     loop_policy: str,
 ) -> bool:
+    if str(buffer_name).endswith("_grad"):
+        return False
     if shape_env is None:
         return False
     if internal_buffer_policy != DESCRIPTOR_INTERNAL_BUFFER_POLICY_ROW_LOCAL_HIDDEN:
@@ -6523,6 +6661,8 @@ def _external_buffers_for_nodes(
 
 
 def _buffer_dtype(buffer_name: str) -> str:
+    if str(buffer_name).endswith("_grad"):
+        return "float32"
     if _canonical_buffer_name(buffer_name) in {"q_fp8", "kv_fp8"}:
         return "uint8"
     if buffer_name == "indices" or buffer_name.endswith("_indices"):
@@ -6584,6 +6724,8 @@ def _is_mamba3_state_like_buffer(buffer_name: str, canonical_name: str) -> bool:
     if canonical_name == "m2rnn_conv_state":
         return False
     name = str(buffer_name)
+    if name.endswith("_grad"):
+        name = name[: -len("_grad")]
     return (
         (name.endswith("_state") or name.endswith("_state_in") or name.endswith("_state_out"))
         and "m2rnn" not in name

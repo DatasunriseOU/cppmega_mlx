@@ -329,6 +329,9 @@ def path_c_default_block_reason(payload: dict[str, Any]) -> str | None:
     if reporting.get("path_c_default_allowed") is not False:
         return None
     runtime_fused = reporting.get("runtime_uses_fused_train_block")
+    production_smoke_fused = reporting.get(
+        "production_runtime_smoke_uses_fused_train_block"
+    )
     plan = receipt.get("compile_plan", {})
     contract = plan.get("schedule_contract", {}) if isinstance(plan, dict) else {}
     contract_status = (
@@ -336,7 +339,8 @@ def path_c_default_block_reason(payload: dict[str, Any]) -> str | None:
     ) or "unknown"
     return (
         "compile receipt blocks default promotion: "
-        f"runtime fused train block is {runtime_fused}; "
+        f"train-step runtime fused train block is {runtime_fused}; "
+        f"production smoke fused block is {production_smoke_fused}; "
         f"schedule contract is {contract_status}."
     )
 

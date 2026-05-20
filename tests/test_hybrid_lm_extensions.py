@@ -6,6 +6,7 @@ from __future__ import annotations
 import math
 
 import mlx.core as mx
+import mlx.nn as nn
 from mlx.utils import tree_flatten
 import pytest
 
@@ -152,7 +153,7 @@ def test_hybrid_lm_with_engram_and_concept_forward_runs():
 def test_path_c_activation_probe_is_opt_in_and_stores_references():
     cfg = _tiny_mtp_cfg(pattern="MR", depth=2, max_seq_length=4)
     model = HybridTinyLM(cfg)
-    capture = PathCActivationBufferCapture()
+    capture = PathCActivationBufferCapture(aliases={"layer_0_m_hidden": "hidden"})
     input_ids = mx.array([[0, 1, 2, 3]])
 
     model.decoder_hidden_states(input_ids)
@@ -169,10 +170,15 @@ def test_path_c_activation_probe_is_opt_in_and_stores_references():
     expected = {
         "layer_0_m_hidden",
         "layer_0_m_residual_norm_hidden",
+        "layer_0_m_mamba3_h0",
+        "layer_0_m_state_in",
+        "layer_0_m_state",
         "layer_0_m_delta",
         "layer_0_m_hidden_after",
         "layer_1_r_hidden",
         "layer_1_r_residual_norm_hidden",
+        "layer_1_r_m2rnn_h0",
+        "layer_1_r_m2rnn_conv_state",
         "layer_1_r_delta",
         "layer_1_r_hidden_after",
     }
@@ -187,6 +193,54 @@ def test_path_c_activation_probe_is_opt_in_and_stores_references():
         not hasattr(layer, "_path_c_activation_probe_callback")
         for layer in model.layers
     )
+
+
+def test_path_c_activation_probe_captures_vjp_cotangents_without_copy():
+    cfg = _tiny_mtp_cfg(pattern="MR", depth=2, max_seq_length=4)
+    model = HybridTinyLM(cfg)
+    capture = PathCActivationBufferCapture(aliases={"layer_0_m_hidden": "hidden"})
+    input_ids = mx.array([[0, 1, 2, 3]], dtype=mx.int32)
+
+    model.attach_path_c_activation_probe(capture)
+
+    def loss_fn(model_arg: HybridTinyLM, tokens: mx.array):
+        hidden = model_arg.decoder_hidden_states(tokens)
+        return mx.sum(hidden), mx.array(hidden.size, dtype=mx.int32)
+
+    (loss, ntokens), grads = nn.value_and_grad(model, loss_fn)(model, input_ids)
+    mx.eval(loss, ntokens, grads)
+
+    expected = {
+        "layer_0_m_hidden_grad",
+        "layer_0_m_residual_norm_hidden_grad",
+        "layer_0_m_delta_grad",
+        "layer_0_m_hidden_after_grad",
+        "layer_1_r_hidden_grad",
+        "layer_1_r_residual_norm_hidden_grad",
+        "layer_1_r_delta_grad",
+        "layer_1_r_hidden_after_grad",
+    }
+    assert expected.issubset(capture.buffers)
+    for name in expected:
+        grad = capture.buffers[name]
+        assert grad.shape == (1, 4, cfg.hidden_size)
+        assert grad.dtype == mx.float32
+
+    gradient_events = [
+        event
+        for event in capture.events
+        if event.get("phase") == "value_and_grad"
+    ]
+    assert {event["logical_names"][0] for event in gradient_events}.issuperset(
+        expected
+    )
+    for event in gradient_events:
+        tensor = event["tensor"]
+        for name in event["logical_names"]:
+            assert capture.buffers[name] is tensor
+    assert capture.buffers["hidden_grad"] is capture.buffers[
+        "layer_0_m_hidden_grad"
+    ]
 
 
 def test_path_c_activation_capture_uses_profile_brick_aliases_without_copy():
@@ -205,6 +259,84 @@ def test_path_c_activation_capture_uses_profile_brick_aliases_without_copy():
 
     assert capture.buffers["local_gb10_quarter_brick_10_M_hidden"] is hidden
     assert capture.buffers["hidden"] is hidden
+
+
+def test_path_c_activation_probe_captures_sparse_mla_prepared_buffers():
+    model = build_local_gb10_quarter_tiny_smoke_model()
+    block = model.layers[12]
+    capture = PathCActivationBufferCapture(
+        owner_name="local_gb10_quarter.path_c_forward_activation_capture",
+    )
+    model.attach_path_c_activation_probe(capture)
+
+    assert block.attention_block is not None
+    prepared = block.attention_block.prepare_sparse_mla_fp8(
+        mx.zeros((1, 4, model.config.hidden_size), dtype=mx.float32),
+        mask="causal",
+    )
+    mx.eval(prepared.q_fp8, prepared.q_scale, prepared.kv_fp8, prepared.kv_scale)
+
+    assert (
+        capture.buffers["local_gb10_quarter_brick_12_A_qkv_projection_q_fp8"]
+        is prepared.q_fp8
+    )
+    assert (
+        capture.buffers["local_gb10_quarter_brick_12_A_qkv_projection_q_scale"]
+        is prepared.q_scale
+    )
+    assert (
+        capture.buffers["local_gb10_quarter_brick_12_A_qkv_projection_kv_fp8"]
+        is prepared.kv_fp8
+    )
+    assert (
+        capture.buffers["local_gb10_quarter_brick_12_A_qkv_projection_kv_scale"]
+        is prepared.kv_scale
+    )
+    assert (
+        capture.buffers["local_gb10_quarter_brick_12_A_qkv_projection_indices"]
+        is prepared.indices
+    )
+
+    model.detach_path_c_activation_probe()
+    prepared_after_detach = block.attention_block.prepare_sparse_mla_fp8(
+        mx.zeros((1, 4, model.config.hidden_size), dtype=mx.float32),
+        mask="causal",
+    )
+    mx.eval(prepared_after_detach.q_fp8)
+    assert capture.buffers[
+        "local_gb10_quarter_brick_12_A_qkv_projection_q_fp8"
+    ] is prepared.q_fp8
+
+
+def test_path_c_activation_probe_maps_sparse_mla_apply_runtime_buffers():
+    model = build_local_gb10_quarter_tiny_smoke_model()
+    block = model.layers[12]
+    capture = PathCActivationBufferCapture(
+        owner_name="local_gb10_quarter.path_c_forward_activation_capture",
+    )
+    model.attach_path_c_activation_probe(capture)
+
+    assert block.attention_block is not None
+    probe = block.attention_block._path_c_sparse_mla_apply_probe()
+    assert callable(probe)
+    buffers = {
+        "sparse_mla_sm_scale": mx.array([0.5], dtype=mx.float32),
+        "sparse_mla_sinks": mx.zeros((4,), dtype=mx.float32),
+        "sparse_mla_has_sinks": mx.array([0], dtype=mx.int32),
+        "lse": mx.zeros((16,), dtype=mx.float32),
+        "out": mx.zeros((1, 4, model.config.hidden_size), dtype=mx.float32),
+    }
+
+    for name, tensor in buffers.items():
+        probe({"name": name, "tensor": tensor})
+
+    for name, tensor in buffers.items():
+        assert (
+            capture.buffers[
+                f"local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_{name}"
+            ]
+            is tensor
+        )
 
 
 def test_path_c_parameter_gradient_aliases_use_direct_and_profile_names():

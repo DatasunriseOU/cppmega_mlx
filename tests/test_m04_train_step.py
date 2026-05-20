@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 import json
 import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
+from mlx.utils import tree_flatten
 import pytest
 
 import scripts.m04_train_step as m04_train_step
@@ -48,6 +52,10 @@ from scripts.m04_train_step import (
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "m04_train_step.py"
 PYTHON = ROOT / ".venv" / "bin" / "python"
+DEFAULT_FUSION_COMPILE_RECEIPT = ROOT / "reports" / "path_c_fusion_compile_receipt.json"
+PRODUCTION_FUSION_COMPILE_RECEIPT = (
+    ROOT / "reports" / "path_c_fusion_production_smoke_receipt.json"
+)
 LOCAL_MLX_PYTHON = Path("/Volumes/external/sources/mlx/python")
 LOCAL_MLX_LIB = LOCAL_MLX_PYTHON / "mlx" / "lib"
 BASELINE_RECEIPT = ROOT / "bench" / "baselines" / "m04_train_step.json"
@@ -69,6 +77,36 @@ REAL_PARQUET_COLUMNS = (
     "token_sibling_index",
     "token_ast_node_type",
 )
+
+
+@contextmanager
+def temporary_env(updates: Mapping[str, str | None]) -> Iterator[None]:
+    previous = {key: os.environ.get(key) for key in updates}
+    try:
+        for key, value in updates.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+@pytest.fixture
+def path_c_fusion_auto_env() -> Iterator[None]:
+    with temporary_env({"CPPMEGA_PATH_C_FUSION": "auto"}):
+        yield
+
+
+@pytest.fixture
+def path_c_fusion_force_env() -> Iterator[None]:
+    with temporary_env({"CPPMEGA_PATH_C_FUSION": "force"}):
+        yield
 
 
 def strip_known_tvm_stderr_noise(stderr: str) -> str:
@@ -105,56 +143,126 @@ def canonical_allocation_probe(**overrides: Any) -> dict[str, Any]:
     return probe
 
 
-def test_fp8_path_policies_set_explicit_runtime_routes(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    monkeypatch.setattr(m04_train_step, "ensure_tilelang_dev_env_for_path_c", lambda: None)
-    for key in (
-        "CPPMEGA_KERNEL_PATH__SPARSE_MLA",
-        "CPPMEGA_SPARSE_MLA_FP8_ROUTE",
-        "CPPMEGA_MAMBA3_PATH_C_BWD",
-    ):
-        monkeypatch.delenv(key, raising=False)
+class _ValueAndGradPathCDirectFusionChainTrainingRuntime(
+    m04_train_step.PathCDirectFusionChainTrainingRuntime
+):
+    def value_and_grad(
+        self,
+        model: nn.Module,
+        batch: Mapping[str, mx.array],
+        loss_and_grad: Any,
+    ) -> tuple[tuple[mx.array, mx.array], Any]:
+        return loss_and_grad(model, batch)
 
+
+class _ContractedValueAndGradPathCDirectFusionChainTrainingRuntime(
+    _ValueAndGradPathCDirectFusionChainTrainingRuntime
+):
+    def value_and_grad_contract(self) -> dict[str, Any]:
+        return {
+            "contract": m04_train_step.PATH_C_DIRECT_FUSION_VALUE_AND_GRAD_CONTRACT,
+            "owner": "CompiledPretrainingStep",
+            "uses_direct_chain_runtime": True,
+            "uses_forward_hook": True,
+            "uses_backward_or_vjp_hook": True,
+            "returns_model_grads": True,
+            "loss_cotangent_bridge_ready": True,
+            "model_gradient_tree_ready": True,
+            "delegates_to_eager_loss_and_grad": False,
+            "hidden_packing_performed": False,
+        }
+
+
+class _ContractedLossCotangentBridge:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, tuple[str, ...]]] = []
+
+    def loss_cotangent_bridge_contract(self) -> dict[str, Any]:
+        return {
+            "contract": m04_train_step.PATH_C_LOSS_COTANGENT_BRIDGE_CONTRACT,
+            "returns_required_loss_cotangents": True,
+            "delegates_to_eager_loss_and_grad": False,
+            "hidden_packing_performed": False,
+        }
+
+    def __call__(
+        self,
+        *,
+        model: nn.Module,
+        batch: Mapping[str, mx.array],
+        logical_buffers: Mapping[str, mx.array],
+        required_loss_cotangent_buffers: Sequence[str],
+        chain: Any,
+    ) -> dict[str, Any]:
+        del model, batch, chain
+        self.calls.append(
+            (
+                "loss_cotangent_bridge",
+                tuple(required_loss_cotangent_buffers),
+            )
+        )
+        return {
+            "loss": mx.array(1.25, dtype=mx.float32),
+            "ntokens": mx.array(7, dtype=mx.uint32),
+            "cotangents": {
+                name: logical_buffers[name]
+                for name in required_loss_cotangent_buffers
+            },
+        }
+
+
+def test_fp8_path_policies_set_explicit_runtime_routes(tmp_path: Path) -> None:
     path_c_args = m04_train_step.build_parser().parse_args(
         ["--synthetic", "--dtype", "fp8_path_c", "--output", str(tmp_path / "c.json")]
     )
-    with m04_train_step.fp8_path_c_kernel_policy(path_c_args):
-        assert os.environ["CPPMEGA_KERNEL_PATH__SPARSE_MLA"] == "path_c"
-        assert os.environ["CPPMEGA_SPARSE_MLA_FP8_ROUTE"] == "path_c"
-        assert os.environ["CPPMEGA_MAMBA3_PATH_C_BWD"] == "path_b"
-    assert "CPPMEGA_SPARSE_MLA_FP8_ROUTE" not in os.environ
-    assert "CPPMEGA_MAMBA3_PATH_C_BWD" not in os.environ
-
     path_b_args = m04_train_step.build_parser().parse_args(
         ["--synthetic", "--dtype", "fp8_path_b", "--output", str(tmp_path / "b.json")]
     )
-    with m04_train_step.fp8_path_b_kernel_policy(path_b_args):
-        assert os.environ["CPPMEGA_KERNEL_PATH__SPARSE_MLA"] == "path_b"
-        assert os.environ["CPPMEGA_SPARSE_MLA_FP8_ROUTE"] == "path_b"
+    with temporary_env(
+        {
+            "CPPMEGA_KERNEL_PATH__SPARSE_MLA": None,
+            "CPPMEGA_SPARSE_MLA_FP8_ROUTE": None,
+            "CPPMEGA_MAMBA3_PATH_C_BWD": None,
+        }
+    ):
+        with m04_train_step.fp8_path_c_kernel_policy(
+            path_c_args,
+            ensure_dev_env=lambda: None,
+        ):
+            assert os.environ["CPPMEGA_KERNEL_PATH__SPARSE_MLA"] == "path_c"
+            assert os.environ["CPPMEGA_SPARSE_MLA_FP8_ROUTE"] == "path_c"
+            assert os.environ["CPPMEGA_MAMBA3_PATH_C_BWD"] == "path_b"
+        assert "CPPMEGA_SPARSE_MLA_FP8_ROUTE" not in os.environ
         assert "CPPMEGA_MAMBA3_PATH_C_BWD" not in os.environ
 
+        with m04_train_step.fp8_path_b_kernel_policy(path_b_args):
+            assert os.environ["CPPMEGA_KERNEL_PATH__SPARSE_MLA"] == "path_b"
+            assert os.environ["CPPMEGA_SPARSE_MLA_FP8_ROUTE"] == "path_b"
+            assert "CPPMEGA_MAMBA3_PATH_C_BWD" not in os.environ
 
-def test_tilelang_dev_env_points_to_build_root_and_runtime_libs(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
+
+def test_tilelang_dev_env_points_to_build_root_and_runtime_libs(tmp_path: Path) -> None:
     source_root = tmp_path / "tl_apache_tvm_swap"
     build_root = source_root / "build"
     (source_root / "tilelang").mkdir(parents=True)
     (source_root / "3rdparty" / "tvm" / "python").mkdir(parents=True)
     (build_root / "lib").mkdir(parents=True)
     (build_root / "tvm").mkdir(parents=True)
-    monkeypatch.setenv("TILELANG_DEV_BUILD_ROOT", str(source_root))
-    monkeypatch.delenv("TVM_LIBRARY_PATH", raising=False)
-    monkeypatch.delenv("DYLD_LIBRARY_PATH", raising=False)
 
-    m04_train_step.ensure_tilelang_dev_env_for_path_c()
+    with temporary_env(
+        {
+            "TILELANG_DEV_BUILD_ROOT": str(source_root),
+            "TVM_LIBRARY_PATH": None,
+            "DYLD_LIBRARY_PATH": None,
+        }
+    ):
+        m04_train_step.ensure_tilelang_dev_env_for_path_c()
 
-    assert os.environ["TILELANG_DEV_BUILD_ROOT"] == str(build_root)
-    assert os.environ["TVM_LIBRARY_PATH"] == str(build_root / "lib")
-    assert str(build_root / "lib") in os.environ["DYLD_LIBRARY_PATH"].split(os.pathsep)
+        assert os.environ["TILELANG_DEV_BUILD_ROOT"] == str(build_root)
+        assert os.environ["TVM_LIBRARY_PATH"] == str(build_root / "lib")
+        assert str(build_root / "lib") in os.environ["DYLD_LIBRARY_PATH"].split(
+            os.pathsep
+        )
 
 
 def test_m04_import_preserves_recipes_package_exports() -> None:
@@ -183,11 +291,7 @@ class _FakeCacheLimitMLX:
         return 987654321
 
 
-def test_path_c_local_gb10_defaults_cache_limit_to_zero(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    monkeypatch.setenv("CPPMEGA_KERNEL_PATH", "path_c")
+def test_path_c_local_gb10_defaults_cache_limit_to_zero(tmp_path: Path) -> None:
     args = m04_train_step.build_parser().parse_args(
         [
             "--model-profile",
@@ -198,7 +302,8 @@ def test_path_c_local_gb10_defaults_cache_limit_to_zero(
     )
     fake = _FakeCacheLimitMLX()
 
-    payload = m04_train_step.apply_cache_limit_payload(args, mx_module=fake)
+    with temporary_env({"CPPMEGA_KERNEL_PATH": "path_c"}):
+        payload = m04_train_step.apply_cache_limit_payload(args, mx_module=fake)
 
     assert fake.calls == [0]
     assert payload == {
@@ -211,12 +316,7 @@ def test_path_c_local_gb10_defaults_cache_limit_to_zero(
     }
 
 
-def test_non_path_c_keeps_mlx_cache_default(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    monkeypatch.delenv("CPPMEGA_KERNEL_PATH", raising=False)
-    monkeypatch.delenv("CPPMEGA_MLX_CACHE_LIMIT_BYTES", raising=False)
+def test_non_path_c_keeps_mlx_cache_default(tmp_path: Path) -> None:
     args = m04_train_step.build_parser().parse_args(
         [
             "--model-profile",
@@ -227,7 +327,13 @@ def test_non_path_c_keeps_mlx_cache_default(
     )
     fake = _FakeCacheLimitMLX()
 
-    payload = m04_train_step.apply_cache_limit_payload(args, mx_module=fake)
+    with temporary_env(
+        {
+            "CPPMEGA_KERNEL_PATH": None,
+            "CPPMEGA_MLX_CACHE_LIMIT_BYTES": None,
+        }
+    ):
+        payload = m04_train_step.apply_cache_limit_payload(args, mx_module=fake)
 
     assert fake.calls == []
     assert payload["configured"] is False
@@ -1254,9 +1360,9 @@ def test_fp8_path_c_training_dtype_route_blocks_missing_sparse_mla_producer(
 
 def test_fp8_path_c_dsa_attention_route_metadata_is_configured(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    path_c_fusion_auto_env: None,
 ) -> None:
-    monkeypatch.setenv("CPPMEGA_PATH_C_FUSION", "auto")
+    del path_c_fusion_auto_env
     args = m04_train_step.build_parser().parse_args(
         [
             "--synthetic",
@@ -1276,7 +1382,10 @@ def test_fp8_path_c_dsa_attention_route_metadata_is_configured(
 
     producer = m04_train_step.sparse_mla_fp8_producer_payload(config)
     producer_gate = m04_train_step.fp8_path_c_producer_gate_payload(config)
-    route = m04_train_step.fp8_path_c_training_route_payload(config)
+    route = m04_train_step.fp8_path_c_training_route_payload(
+        config,
+        compile_receipt_path=PRODUCTION_FUSION_COMPILE_RECEIPT,
+    )
 
     assert config.dsa_a_layer_ranks == (0,)
     assert producer["configured"] is True
@@ -1359,7 +1468,7 @@ def test_fp8_path_c_dsa_attention_route_metadata_is_configured(
             "attention_qkv_projection",
             "sparse_mla_fp8_apply",
         ],
-        "selected_model_region_schedule_id": "path_c_descriptor_chain_c44eddb18abd",
+        "selected_model_region_schedule_id": "path_c_descriptor_chain_5785a4a0210e",
         "preset_only": False,
     }
     model_route_candidates = route["path_c_fusion"]["model_route_candidates"]
@@ -1432,7 +1541,7 @@ def test_fp8_path_c_dsa_attention_route_metadata_is_configured(
     assert route["path_c_fusion"]["schedule_registry"] == {
         "selector": "PathCFusionScheduleRegistry",
         "match_policy": "op_signature_or_descriptor_chain",
-        "selected_schedule_id": "path_c_descriptor_chain_c44eddb18abd",
+        "selected_schedule_id": "path_c_descriptor_chain_5785a4a0210e",
         "selected_schedule_name": (
             "local_gb10_quarter_path_c_10_12:descriptor_generated_fwd_bwd"
         ),
@@ -1446,14 +1555,14 @@ def test_fp8_path_c_dsa_attention_route_metadata_is_configured(
     ] == "production"
     assert route["path_c_fusion"]["schedule_contract"][
         "declared_schedule_id"
-    ] == "path_c_descriptor_chain_c44eddb18abd"
+    ] == "path_c_descriptor_chain_5785a4a0210e"
     assert "local_gb10_quarter_brick_10_M_mamba3_in_proj_weight" in (
         route["path_c_fusion"]["schedule_contract"][
             "declared_required_real_abi_inputs"
         ]
     )
     assert route["path_c_fusion"]["production_schedule"]["schedule_id"] == (
-        "path_c_descriptor_chain_c44eddb18abd"
+        "path_c_descriptor_chain_5785a4a0210e"
     )
     assert route["path_c_fusion"]["production_schedule"]["schedule_name"] == (
         "local_gb10_quarter_path_c_10_12:descriptor_generated_fwd_bwd"
@@ -1634,13 +1743,29 @@ def test_fp8_path_c_dsa_attention_route_metadata_is_configured(
         "verified"
     )
     assert route["path_c_fusion"]["production_compile_receipt"]["verified"] is True
+    assert (
+        route["path_c_fusion"]["production_compile_receipt"][
+            "runtime_execution_status"
+        ]
+        == "runtime_ready"
+    )
+    assert (
+        route["path_c_fusion"]["production_compile_receipt"]["runtime_smoke_mode"]
+        == "production_1b"
+    )
+    assert (
+        route["path_c_fusion"]["production_compile_receipt"][
+            "production_runtime_smoke_uses_fused_train_block"
+        ]
+        is True
+    )
     assert [blocker["kind"] for blocker in route["path_c_fusion"]["schedule_blockers"]] == [
         "selected_model_schedule_not_default",
         "fused_train_block_runtime_not_bound",
         "production_1b_matrix_profile_missing",
     ]
     assert route["path_c_fusion"]["schedule_blockers"][0]["schedule_id"] == (
-        "path_c_descriptor_chain_c44eddb18abd"
+        "path_c_descriptor_chain_5785a4a0210e"
     )
     assert route["path_c_fusion"]["schedule_blockers"][0]["schedule_generator"] == (
         PATH_C_DESCRIPTOR_SCHEDULE_GENERATOR
@@ -1650,6 +1775,7 @@ def test_fp8_path_c_dsa_attention_route_metadata_is_configured(
     assert route["path_c_fusion"]["autograd_plan"]["status"] == "ready"
     assert route["path_c_fusion"]["autograd_plan"]["missing_backward_nodes"] == []
     assert route["path_c_fusion"]["autograd_plan"]["backward_nodes"] == [
+        "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_bwd",
         "local_gb10_quarter_brick_12_A_qkv_projection_bwd",
         "local_gb10_quarter_brick_11_R_residual_norm_bwd",
         "local_gb10_quarter_brick_11_R_bwd",
@@ -1657,6 +1783,26 @@ def test_fp8_path_c_dsa_attention_route_metadata_is_configured(
         "local_gb10_quarter_brick_10_M_bwd",
     ]
     assert route["path_c_fusion"]["autograd_plan"]["backward_edges"] == [
+        [
+            "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_bwd",
+            "local_gb10_quarter_brick_12_A_qkv_projection_bwd",
+            "local_gb10_quarter_brick_12_A_qkv_projection_kv_scale_grad",
+        ],
+        [
+            "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_bwd",
+            "local_gb10_quarter_brick_12_A_qkv_projection_bwd",
+            "local_gb10_quarter_brick_12_A_qkv_projection_kv_fp8_grad",
+        ],
+        [
+            "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_bwd",
+            "local_gb10_quarter_brick_12_A_qkv_projection_bwd",
+            "local_gb10_quarter_brick_12_A_qkv_projection_q_scale_grad",
+        ],
+        [
+            "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_bwd",
+            "local_gb10_quarter_brick_12_A_qkv_projection_bwd",
+            "local_gb10_quarter_brick_12_A_qkv_projection_q_fp8_grad",
+        ],
         [
             "local_gb10_quarter_brick_12_A_qkv_projection_bwd",
             "local_gb10_quarter_brick_11_R_residual_norm_bwd",
@@ -1681,7 +1827,7 @@ def test_fp8_path_c_dsa_attention_route_metadata_is_configured(
             "local_gb10_quarter_brick_10_M_residual_norm_bwd",
             "local_gb10_quarter_brick_10_M_bwd",
             "local_gb10_quarter_brick_10_M_delta_grad",
-        ]
+        ],
     ]
     assert route["path_c_fusion"]["node_names"] == [
         "local_gb10_quarter_brick_10_M",
@@ -1690,6 +1836,7 @@ def test_fp8_path_c_dsa_attention_route_metadata_is_configured(
         "local_gb10_quarter_brick_11_R_residual_norm",
         "local_gb10_quarter_brick_12_A_qkv_projection",
         "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply",
+        "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_bwd",
         "local_gb10_quarter_brick_12_A_qkv_projection_bwd",
         "local_gb10_quarter_brick_11_R_residual_norm_bwd",
         "local_gb10_quarter_brick_11_R_bwd",
@@ -1830,6 +1977,16 @@ def _model_route_direct_chain_logical_buffers(
     return buffers
 
 
+def _model_route_direct_chain_mx_buffers(
+    model: Any | None = None,
+) -> dict[str, mx.array]:
+    buffers: dict[str, mx.array] = {}
+    for name, spec in _model_route_direct_chain_logical_buffers(model).items():
+        dtype = getattr(mx, str(spec.dtype))
+        buffers[name] = mx.zeros(tuple(spec.shape), dtype=dtype)
+    return buffers
+
+
 def _model_route_direct_chain_artifacts(
     model: Any | None = None,
 ) -> tuple[Any, ...]:
@@ -1837,9 +1994,9 @@ def _model_route_direct_chain_artifacts(
 
 
 def test_path_c_fusion_runtime_binding_accepts_model_owned_physical_banks(
-    monkeypatch: pytest.MonkeyPatch,
+    path_c_fusion_auto_env: None,
 ) -> None:
-    monkeypatch.setenv("CPPMEGA_PATH_C_FUSION", "auto")
+    del path_c_fusion_auto_env
     _, _, regions = m04_train_step._local_gb10_path_c_model_regions()
     selected_region = m04_train_step._select_path_c_model_route_region(regions)
     assert selected_region is not None
@@ -1874,9 +2031,9 @@ def test_path_c_fusion_runtime_binding_accepts_model_owned_physical_banks(
 
 
 def test_path_c_fusion_runtime_binding_accepts_bank_owner_object(
-    monkeypatch: pytest.MonkeyPatch,
+    path_c_fusion_auto_env: None,
 ) -> None:
-    monkeypatch.setenv("CPPMEGA_PATH_C_FUSION", "auto")
+    del path_c_fusion_auto_env
     _, _, regions = m04_train_step._local_gb10_path_c_model_regions()
     selected_region = m04_train_step._select_path_c_model_route_region(regions)
     assert selected_region is not None
@@ -1905,11 +2062,11 @@ def test_path_c_fusion_runtime_binding_accepts_bank_owner_object(
     ]
 
 
-def test_fp8_path_c_training_route_selects_direct_chain_when_segments_are_bound(
+def test_fp8_path_c_training_route_keeps_split_when_direct_chain_is_standalone(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    path_c_fusion_auto_env: None,
 ) -> None:
-    monkeypatch.setenv("CPPMEGA_PATH_C_FUSION", "auto")
+    del path_c_fusion_auto_env
     args = m04_train_step.build_parser().parse_args(
         [
             "--synthetic",
@@ -1937,23 +2094,832 @@ def test_fp8_path_c_training_route_selects_direct_chain_when_segments_are_bound(
     direct_chain = route["path_c_fusion"]["direct_chained_fusion"]
     assert direct_chain["runtime_binding"]["status"] == "ok"
     assert direct_chain["runtime_binding"]["runtime_uses_direct_fusion_chain"] is True
+    assert direct_chain["standalone_dispatch_available"] is True
+    assert direct_chain["training_critical_path"] is False
+    assert direct_chain["training_runtime_available"] is False
     assert direct_chain["runtime_binding"]["segment_count"] == 4
-    assert route["status"] == m04_train_step.FP8_PATH_C_E2E_TRAINING_STATUS
+    assert route["status"] == m04_train_step.FP8_PATH_C_SPLIT_TRAINING_STATUS
     assert route["end_to_end_training_status"] == (
-        m04_train_step.FP8_PATH_C_E2E_TRAINING_STATUS
+        m04_train_step.FP8_PATH_C_SPLIT_TRAINING_STATUS
     )
+    assert route["full_end_to_end_training_available"] is False
+    assert route["direct_fusion_chain_runtime_available"] is True
+    assert route["direct_fusion_chain_standalone_dispatch_available"] is True
+    assert route["direct_fusion_chain_training_critical_path"] is False
+    assert route["direct_fusion_chain_training_runtime_available"] is False
+    assert route["direct_fusion_chain_training_runtime_contract"]["status"] == (
+        m04_train_step.FP8_PATH_C_DIRECT_CHAIN_TRAINING_RUNTIME_MISSING_STATUS
+    )
+    assert route["fused_train_block_runtime_available"] is False
+    assert route["fused_train_block_blocker_type"] == (
+        m04_train_step.FP8_PATH_C_DIRECT_CHAIN_TRAINING_RUNTIME_MISSING_STATUS
+    )
+    assert route["selected_action"] == "run_path_c_split_training_route"
+    assert route["direct_mx_array_artifact_call_status"] == (
+        "m04_direct_fusion_chain_standalone_only_not_training_route"
+    )
+
+
+def test_path_c_direct_chain_value_and_grad_bridge_plan_reports_loss_and_tree_gaps(
+    tmp_path: Path,
+    path_c_fusion_auto_env: None,
+) -> None:
+    del path_c_fusion_auto_env
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--synthetic",
+            "--dtype",
+            "fp8_path_c",
+            "--pattern",
+            "A",
+            "--depth",
+            "1",
+            "--dsa-a-layer-ranks",
+            "0",
+            "--output",
+            str(tmp_path / "receipt.json"),
+        ]
+    )
+    config = m04_train_step.config_from_args(args, data_path=tmp_path / "tokens.npz")
+    model = build_local_gb10_quarter_tiny_smoke_model()
+
+    route = m04_train_step.fp8_path_c_training_route_payload_for_model(
+        config,
+        model,
+    )
+
+    bridge = route["path_c_fusion"]["direct_chained_fusion"][
+        "value_and_grad_bridge_plan"
+    ]
+    assert bridge["status"] == "blocked"
+    assert bridge["contract"] == m04_train_step.PATH_C_DIRECT_FUSION_VALUE_AND_GRAD_CONTRACT
+    assert bridge["loss_cotangent_bridge_ready"] is False
+    assert bridge["model_gradient_tree_ready"] is False
+    assert bridge["delegates_to_eager_loss_and_grad"] is False
+    assert bridge["required_gradient_buffer_count"] == 34
+    assert bridge["covered_parameter_gradient_buffer_count"] == 25
+    assert bridge["parameter_gradient_tree_name_count"] == 25
+    assert bridge["bridge_only_gradient_buffer_count"] == 9
+    assert bridge["required_loss_cotangent_buffers"] == [
+        "local_gb10_quarter_brick_11_R_hidden_after_grad",
+        "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_out_grad",
+    ]
+    assert "hidden_grad" not in bridge["required_loss_cotangent_buffers"]
+    assert "hidden_grad" in bridge["bridge_only_gradient_buffers"]
+    assert "hidden_grad" in bridge["required_runtime_bridge_gradients"]
+    assert "local_gb10_quarter_brick_10_M_mamba3_h0_grad" in bridge[
+        "required_runtime_bridge_gradients"
+    ]
+    assert "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_weight_grad" in (
+        bridge["covered_parameter_gradient_buffers"]
+    )
+    assert "layers.12.block.q_proj.weight_grad" in bridge[
+        "parameter_gradient_tree_names"
+    ]
+    assert {blocker["kind"] for blocker in bridge["blockers"]} == {
+        "loss_cotangent_bridge_missing",
+        "model_gradient_tree_extraction_missing",
+        "runtime_bridge_gradient_outputs_required",
+    }
+    assert route["selected_action"] == "run_path_c_split_training_route"
+
+
+def test_path_c_model_gradient_tree_from_direct_buffers_maps_parameter_aliases(
+    tmp_path: Path,
+) -> None:
+    del tmp_path
+    model = build_local_gb10_quarter_tiny_smoke_model()
+    buffers = _model_route_direct_chain_mx_buffers(model)
+    chain = _model_route_direct_chain(model)
+    bridge = m04_train_step.path_c_direct_fusion_chain_value_and_grad_bridge_plan(
+        chain=chain,
+        model=model,
+    )
+
+    payload = m04_train_step.path_c_model_gradient_tree_extraction_payload(
+        model=model,
+        logical_buffers=buffers,
+        parameter_gradient_names=bridge["parameter_gradient_tree_names"],
+    )
+    gradient_tree = m04_train_step.path_c_model_gradient_tree_from_direct_buffers(
+        model=model,
+        logical_buffers=buffers,
+        parameter_gradient_names=bridge["parameter_gradient_tree_names"],
+    )
+    flat = dict(tree_flatten(gradient_tree))
+
+    assert payload["status"] == "ok"
+    assert payload["gradient_tree_ready"] is True
+    assert payload["mapped_parameter_gradient_count"] == 25
+    assert payload["parameter_gradient_alias_count"] == 25
+    assert payload["missing_parameter_gradient_names"] == []
+    assert payload["missing_logical_gradient_buffers"] == []
+    assert "layers.12.block.q_proj.weight_grad" in flat
+    logical_name = (
+        "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_weight_grad"
+    )
+    assert flat["layers.12.block.q_proj.weight_grad"] is buffers[logical_name]
+
+
+def test_path_c_direct_chain_bridge_plan_accepts_gradient_tree_buffers(
+    tmp_path: Path,
+) -> None:
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--synthetic",
+            "--dtype",
+            "fp8_path_c",
+            "--pattern",
+            "A",
+            "--depth",
+            "1",
+            "--dsa-a-layer-ranks",
+            "0",
+            "--output",
+            str(tmp_path / "receipt.json"),
+        ]
+    )
+    config = m04_train_step.config_from_args(args, data_path=tmp_path / "tokens.npz")
+    model = build_local_gb10_quarter_tiny_smoke_model()
+    buffers = _model_route_direct_chain_mx_buffers(model)
+
+    route = m04_train_step.fp8_path_c_training_route_payload(
+        config,
+        model=model,
+        direct_chain_logical_buffers=buffers,
+        direct_chain_logical_buffer_owner="unit.path_c_direct_buffers",
+    )
+    bridge = route["path_c_fusion"]["direct_chained_fusion"][
+        "value_and_grad_bridge_plan"
+    ]
+
+    assert bridge["status"] == "blocked"
+    assert bridge["loss_cotangent_bridge_ready"] is False
+    assert bridge["model_gradient_tree_ready"] is True
+    assert bridge["runtime_bridge_gradient_outputs_ready"] is True
+    assert bridge["model_gradient_tree_extraction"]["status"] == "ok"
+    assert bridge["model_gradient_tree_extraction"][
+        "mapped_parameter_gradient_count"
+    ] == 25
+    assert {blocker["kind"] for blocker in bridge["blockers"]} == {
+        "loss_cotangent_bridge_missing"
+    }
+    assert route["selected_action"] == "run_path_c_split_training_route"
+
+
+def test_path_c_direct_chain_runtime_value_and_grad_uses_loss_cotangent_bridge(
+    tmp_path: Path,
+) -> None:
+    del tmp_path
+    model = build_local_gb10_quarter_tiny_smoke_model()
+    chain = _model_route_direct_chain(model)
+    buffers = _model_route_direct_chain_mx_buffers(model)
+    bridge = _ContractedLossCotangentBridge()
+    runtime = m04_train_step.PathCDirectFusionChainTrainingRuntime(
+        chain=chain,
+        artifacts=_model_route_direct_chain_artifacts(model),
+        logical_buffers=buffers,
+        owner_name="unit.path_c_direct_training_runtime",
+        training_critical_path=True,
+        loss_cotangent_bridge=bridge,
+    )
+    runtime.bind_training_graph(
+        owner="CompiledPretrainingStep",
+        uses_direct_chain_runtime=True,
+        uses_forward_hook=True,
+        uses_backward_or_vjp_hook=True,
+    )
+
+    contract = m04_train_step._direct_chain_value_and_grad_contract_payload(runtime)
+    assert contract["status"] == "ok"
+    assert contract["loss_cotangent_bridge_ready"] is True
+    assert contract["model_gradient_tree_ready"] is True
+
+    def forbidden_loss_and_grad(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("Path C direct runtime must not delegate to eager")
+
+    (loss, ntokens), grads = runtime.value_and_grad(
+        model,
+        {},
+        forbidden_loss_and_grad,
+    )
+    flat = dict(tree_flatten(grads))
+
+    assert float(loss.item()) == pytest.approx(1.25)
+    assert int(ntokens.item()) == 7
+    assert bridge.calls == [
+        (
+            "loss_cotangent_bridge",
+            (
+                "local_gb10_quarter_brick_11_R_hidden_after_grad",
+                "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_out_grad",
+            ),
+        )
+    ]
+    logical_name = (
+        "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_weight_grad"
+    )
+    assert flat["layers.12.block.q_proj.weight_grad"] is buffers[logical_name]
+
+
+def test_fp8_path_c_training_route_rejects_legacy_direct_chain_bool(
+    tmp_path: Path,
+) -> None:
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--synthetic",
+            "--dtype",
+            "fp8_path_c",
+            "--pattern",
+            "A",
+            "--depth",
+            "1",
+            "--dsa-a-layer-ranks",
+            "0",
+            "--output",
+            str(tmp_path / "receipt.json"),
+        ]
+    )
+    config = m04_train_step.config_from_args(args, data_path=tmp_path / "tokens.npz")
+    model = build_local_gb10_quarter_tiny_smoke_model()
+    model.path_c_direct_fusion_chain_training_critical_path = True
+
+    route = m04_train_step.fp8_path_c_training_route_payload(
+        config,
+        model=model,
+        direct_chain_artifacts=_model_route_direct_chain_artifacts(model),
+        direct_chain_logical_buffers=_model_route_direct_chain_logical_buffers(model),
+        direct_chain_logical_buffer_owner="local_gb10_quarter.path_c_direct_buffers",
+    )
+
+    contract = route["direct_fusion_chain_training_runtime_contract"]
+    assert contract["status"] == (
+        m04_train_step.FP8_PATH_C_DIRECT_CHAIN_TRAINING_RUNTIME_MISSING_STATUS
+    )
+    assert contract["runtime_installed"] is False
+    assert route["direct_fusion_chain_training_critical_path"] is False
+    assert route["direct_fusion_chain_training_runtime_available"] is False
+    assert route["selected_action"] == "run_path_c_split_training_route"
+
+
+def test_fp8_path_c_training_route_rejects_partial_direct_chain_runtime(
+    tmp_path: Path,
+) -> None:
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--synthetic",
+            "--dtype",
+            "fp8_path_c",
+            "--pattern",
+            "A",
+            "--depth",
+            "1",
+            "--dsa-a-layer-ranks",
+            "0",
+            "--output",
+            str(tmp_path / "receipt.json"),
+        ]
+    )
+    config = m04_train_step.config_from_args(args, data_path=tmp_path / "tokens.npz")
+    model = build_local_gb10_quarter_tiny_smoke_model()
+    runtime = SimpleNamespace(
+        contract=m04_train_step.PATH_C_DIRECT_FUSION_TRAINING_RUNTIME_CONTRACT,
+        owner_name="unit.path_c_direct_training_runtime",
+        training_critical_path=True,
+        forward=lambda *args: None,
+        no_hidden_allocation_policy=True,
+        hidden_packing_performed=False,
+    )
+
+    route = m04_train_step.fp8_path_c_training_route_payload(
+        config,
+        model=model,
+        direct_chain_artifacts=_model_route_direct_chain_artifacts(model),
+        direct_chain_logical_buffers=_model_route_direct_chain_logical_buffers(model),
+        direct_chain_logical_buffer_owner="local_gb10_quarter.path_c_direct_buffers",
+        direct_chain_training_runtime=runtime,
+    )
+
+    contract = route["direct_fusion_chain_training_runtime_contract"]
+    assert contract["status"] == (
+        m04_train_step.FP8_PATH_C_DIRECT_CHAIN_TRAINING_RUNTIME_INCOMPLETE_STATUS
+    )
+    assert contract["forward_callable"] is True
+    assert contract["backward_callable"] is False
+    assert contract["vjp_callable"] is False
+    assert route["direct_fusion_chain_training_runtime_available"] is False
+    assert route["fused_train_block_runtime_available"] is False
+    assert route["selected_action"] == "run_path_c_split_training_route"
+
+
+def test_fp8_path_c_training_route_rejects_direct_chain_runtime_without_graph_binding(
+    tmp_path: Path,
+) -> None:
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--synthetic",
+            "--dtype",
+            "fp8_path_c",
+            "--pattern",
+            "A",
+            "--depth",
+            "1",
+            "--dsa-a-layer-ranks",
+            "0",
+            "--output",
+            str(tmp_path / "receipt.json"),
+        ]
+    )
+    config = m04_train_step.config_from_args(args, data_path=tmp_path / "tokens.npz")
+    model = build_local_gb10_quarter_tiny_smoke_model()
+    runtime = _ContractedValueAndGradPathCDirectFusionChainTrainingRuntime(
+        chain=_model_route_direct_chain(model),
+        artifacts=_model_route_direct_chain_artifacts(model),
+        logical_buffers=_model_route_direct_chain_mx_buffers(model),
+        owner_name="unit.path_c_direct_training_runtime",
+        training_critical_path=True,
+    )
+    runtime_payload = runtime.forward()
+    assert runtime_payload["status"] == "ok"
+    assert runtime_payload["runtime_uses_direct_fusion_chain"] is True
+
+    route = m04_train_step.fp8_path_c_training_route_payload(
+        config,
+        model=model,
+        direct_chain_artifacts=_model_route_direct_chain_artifacts(model),
+        direct_chain_logical_buffers=_model_route_direct_chain_logical_buffers(model),
+        direct_chain_logical_buffer_owner="local_gb10_quarter.path_c_direct_buffers",
+        direct_chain_training_runtime=runtime,
+    )
+
+    direct_chain = route["path_c_fusion"]["direct_chained_fusion"]
+    contract = route["direct_fusion_chain_training_runtime_contract"]
+    assert contract["status"] == (
+        m04_train_step.FP8_PATH_C_DIRECT_CHAIN_TRAINING_RUNTIME_NOT_CRITICAL_STATUS
+    )
+    assert contract["contract_matches"] is True
+    assert (
+        contract["runtime_class"]
+        == "_ContractedValueAndGradPathCDirectFusionChainTrainingRuntime"
+    )
+    assert contract["value_and_grad_contract"]["status"] == "ok"
+    assert contract["runtime_owner"] == "unit.path_c_direct_training_runtime"
+    assert contract["training_critical_path_declared"] is True
+    assert contract["value_and_grad_callable"] is True
+    assert contract["value_and_grad_contract_ok"] is True
+    assert contract["training_graph_bound"] is False
+    assert contract["training_graph_binding"]["status"] == "missing"
+    assert contract["training_critical_path_verified"] is False
+    assert direct_chain["training_runtime_contract"]["status"] == (
+        m04_train_step.FP8_PATH_C_DIRECT_CHAIN_TRAINING_RUNTIME_NOT_CRITICAL_STATUS
+    )
+    assert direct_chain["training_critical_path"] is False
+    assert direct_chain["training_runtime_available"] is False
+    assert route["direct_fusion_chain_training_runtime_available"] is False
+    assert route["fused_train_block_runtime_available"] is False
+    assert route["selected_action"] == "run_path_c_split_training_route"
+
+
+def test_fp8_path_c_training_route_rejects_graph_bound_runtime_without_loss_bridge(
+    tmp_path: Path,
+) -> None:
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--synthetic",
+            "--dtype",
+            "fp8_path_c",
+            "--pattern",
+            "A",
+            "--depth",
+            "1",
+            "--dsa-a-layer-ranks",
+            "0",
+            "--output",
+            str(tmp_path / "receipt.json"),
+        ]
+    )
+    config = m04_train_step.config_from_args(args, data_path=tmp_path / "tokens.npz")
+    model = build_local_gb10_quarter_tiny_smoke_model()
+    runtime = m04_train_step.PathCDirectFusionChainTrainingRuntime(
+        chain=_model_route_direct_chain(model),
+        artifacts=_model_route_direct_chain_artifacts(model),
+        logical_buffers=_model_route_direct_chain_mx_buffers(model),
+        owner_name="unit.path_c_direct_training_runtime",
+        training_critical_path=True,
+    )
+    runtime.bind_training_graph(
+        owner="CompiledPretrainingStep",
+        uses_direct_chain_runtime=True,
+        uses_forward_hook=True,
+        uses_backward_or_vjp_hook=True,
+    )
+
+    route = m04_train_step.fp8_path_c_training_route_payload(
+        config,
+        model=model,
+        direct_chain_artifacts=_model_route_direct_chain_artifacts(model),
+        direct_chain_logical_buffers=_model_route_direct_chain_logical_buffers(model),
+        direct_chain_logical_buffer_owner="local_gb10_quarter.path_c_direct_buffers",
+        direct_chain_training_runtime=runtime,
+    )
+
+    contract = route["direct_fusion_chain_training_runtime_contract"]
+    assert contract["status"] == (
+        m04_train_step.FP8_PATH_C_DIRECT_CHAIN_TRAINING_RUNTIME_INCOMPLETE_STATUS
+    )
+    assert contract["forward_callable"] is True
+    assert contract["backward_callable"] is True
+    assert contract["value_and_grad_callable"] is True
+    assert contract["value_and_grad_contract"]["status"] == "incomplete"
+    assert (
+        contract["value_and_grad_contract"]["loss_cotangent_bridge_contract"][
+            "status"
+        ]
+        == "missing"
+    )
+    assert contract["training_graph_bound"] is True
+    assert contract["training_critical_path_verified"] is False
+    assert route["direct_fusion_chain_training_runtime_available"] is False
+    assert route["fused_train_block_runtime_available"] is False
+    assert route["selected_action"] == "run_path_c_split_training_route"
+
+
+def test_fp8_path_c_training_route_rejects_graph_bound_value_and_grad_without_direct_contract(
+    tmp_path: Path,
+) -> None:
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--synthetic",
+            "--dtype",
+            "fp8_path_c",
+            "--pattern",
+            "A",
+            "--depth",
+            "1",
+            "--dsa-a-layer-ranks",
+            "0",
+            "--output",
+            str(tmp_path / "receipt.json"),
+        ]
+    )
+    config = m04_train_step.config_from_args(args, data_path=tmp_path / "tokens.npz")
+    model = build_local_gb10_quarter_tiny_smoke_model()
+    runtime = _ValueAndGradPathCDirectFusionChainTrainingRuntime(
+        chain=_model_route_direct_chain(model),
+        artifacts=_model_route_direct_chain_artifacts(model),
+        logical_buffers=_model_route_direct_chain_mx_buffers(model),
+        owner_name="unit.path_c_direct_training_runtime",
+        training_critical_path=True,
+    )
+    runtime.bind_training_graph(
+        owner="CompiledPretrainingStep",
+        uses_direct_chain_runtime=True,
+        uses_forward_hook=True,
+        uses_backward_or_vjp_hook=True,
+    )
+
+    route = m04_train_step.fp8_path_c_training_route_payload(
+        config,
+        model=model,
+        direct_chain_artifacts=_model_route_direct_chain_artifacts(model),
+        direct_chain_logical_buffers=_model_route_direct_chain_logical_buffers(model),
+        direct_chain_logical_buffer_owner="local_gb10_quarter.path_c_direct_buffers",
+        direct_chain_training_runtime=runtime,
+    )
+
+    contract = route["direct_fusion_chain_training_runtime_contract"]
+    assert contract["status"] == (
+        m04_train_step.FP8_PATH_C_DIRECT_CHAIN_TRAINING_RUNTIME_INCOMPLETE_STATUS
+    )
+    assert contract["value_and_grad_callable"] is True
+    assert contract["value_and_grad_contract"]["status"] == "incomplete"
+    assert (
+        contract["value_and_grad_contract"]["loss_cotangent_bridge_ready"]
+        is False
+    )
+    assert contract["value_and_grad_contract"]["model_gradient_tree_ready"] is False
+    assert "contracted loss-to-region cotangent bridge" in str(
+        contract["value_and_grad_contract"]["reason"]
+    )
+    assert (
+        contract["value_and_grad_contract"]["loss_cotangent_bridge_contract"][
+            "status"
+        ]
+        == "missing"
+    )
+    assert contract["value_and_grad_contract_ok"] is False
+    assert contract["training_graph_bound"] is True
+    assert contract["training_critical_path_verified"] is False
+    assert route["direct_fusion_chain_training_runtime_available"] is False
+    assert route["fused_train_block_runtime_available"] is False
+    assert route["full_end_to_end_training_available"] is False
+    assert route["status"] == m04_train_step.FP8_PATH_C_SPLIT_TRAINING_STATUS
+    assert route["selected_action"] == "run_path_c_split_training_route"
+
+
+def test_path_c_direct_chain_native_artifacts_bind_with_direct_buffers(
+    tmp_path: Path,
+) -> None:
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--synthetic",
+            "--dtype",
+            "fp8_path_c",
+            "--pattern",
+            "A",
+            "--depth",
+            "1",
+            "--dsa-a-layer-ranks",
+            "0",
+            "--output",
+            str(tmp_path / "receipt.json"),
+        ]
+    )
+    config = m04_train_step.config_from_args(args, data_path=tmp_path / "tokens.npz")
+    model = build_local_gb10_quarter_tiny_smoke_model()
+    chain = _model_route_direct_chain(model)
+
+    artifacts = m04_train_step.compile_path_c_direct_fusion_chain_artifacts(chain)
+
+    assert len(artifacts) == len(chain.segments)
+    assert all(callable(artifact) for artifact in artifacts)
+    assert {type(artifact).__name__ for artifact in artifacts} == {"JITKernel"}
+
+    route = m04_train_step.fp8_path_c_training_route_payload(
+        config,
+        model=model,
+        direct_chain_artifacts=artifacts,
+        direct_chain_logical_buffers=_model_route_direct_chain_logical_buffers(model),
+        direct_chain_logical_buffer_owner="local_gb10_quarter.path_c_direct_buffers",
+    )
+    runtime_binding = route["path_c_fusion"]["direct_chained_fusion"][
+        "runtime_binding"
+    ]
+
+    assert runtime_binding["status"] == "ok"
+    assert runtime_binding["direct_chain_artifacts_bound"] is True
+    assert runtime_binding["runtime_uses_direct_fusion_chain"] is True
+    assert runtime_binding["missing_artifact_segments"] == []
+    assert route["path_c_fusion"]["direct_chained_fusion"][
+        "standalone_dispatch_available"
+    ] is True
+    assert route["path_c_fusion"]["direct_chained_fusion"][
+        "training_runtime_available"
+    ] is False
+    assert route["path_c_fusion"]["direct_chained_fusion"][
+        "training_runtime_contract"
+    ]["status"] == (
+        m04_train_step.FP8_PATH_C_DIRECT_CHAIN_TRAINING_RUNTIME_MISSING_STATUS
+    )
+    assert route["selected_action"] == "run_path_c_split_training_route"
+
+
+def test_path_c_direct_chain_runtime_executor_runs_native_segments(
+    tmp_path: Path,
+) -> None:
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--synthetic",
+            "--dtype",
+            "fp8_path_c",
+            "--pattern",
+            "A",
+            "--depth",
+            "1",
+            "--dsa-a-layer-ranks",
+            "0",
+            "--output",
+            str(tmp_path / "receipt.json"),
+        ]
+    )
+    config = m04_train_step.config_from_args(args, data_path=tmp_path / "tokens.npz")
+    model = build_local_gb10_quarter_tiny_smoke_model()
+    chain = _model_route_direct_chain(model)
+    buffers = _model_route_direct_chain_mx_buffers(model)
+    artifacts = m04_train_step.compile_path_c_direct_fusion_chain_artifacts(chain)
+    route = m04_train_step.fp8_path_c_training_route_payload(
+        config,
+        model=model,
+        direct_chain_artifacts=artifacts,
+        direct_chain_logical_buffers=buffers,
+        direct_chain_logical_buffer_owner="local_gb10_quarter.path_c_direct_buffers",
+    )
+
+    assert route["selected_action"] == "run_path_c_split_training_route"
+    assert route["direct_mx_array_artifact_call_status"] == (
+        "m04_direct_fusion_chain_standalone_only_not_training_route"
+    )
+
+    payload = m04_train_step.run_path_c_direct_fusion_chain_route(
+        chain=chain,
+        logical_buffers=buffers,
+        artifacts=artifacts,
+    )
+
+    assert payload["status"] == "ok"
+    assert payload["runtime_uses_direct_fusion_chain"] is True
+    assert payload["segment_count"] == 4
+    assert [segment["status"] for segment in payload["segments"]] == [
+        "ok",
+        "ok",
+        "ok",
+        "ok",
+    ]
+    assert [segment["kernel_arg_count"] for segment in payload["segments"]] == [
+        len(segment["required_logical_buffers"])
+        for segment in route["path_c_fusion"]["direct_chained_fusion"][
+            "runtime_binding"
+        ]["segments"]
+    ]
+
+
+def test_path_c_direct_chain_runtime_installer_keeps_probe_off_critical_path(
+    tmp_path: Path,
+) -> None:
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--synthetic",
+            "--dtype",
+            "fp8_path_c",
+            "--pattern",
+            "A",
+            "--depth",
+            "1",
+            "--dsa-a-layer-ranks",
+            "0",
+            "--output",
+            str(tmp_path / "receipt.json"),
+        ]
+    )
+    config = m04_train_step.config_from_args(args, data_path=tmp_path / "tokens.npz")
+    model = build_local_gb10_quarter_tiny_smoke_model()
+    chain = _model_route_direct_chain(model)
+    logical_owner = PathCLogicalBufferOwner(
+        owner_name="unit.path_c_direct_fusion_chain_buffers",
+        buffers=_model_route_direct_chain_mx_buffers(model),
+    )
+
+    install_payload = (
+        m04_train_step.install_path_c_direct_chain_training_runtime_for_model(
+            model=model,
+            chain=chain,
+            artifacts=_model_route_direct_chain_artifacts(model),
+            logical_owner=logical_owner,
+            owner_name="unit.path_c_direct_training_runtime",
+            training_critical_path=False,
+            run_probe=True,
+        )
+    )
+    route = m04_train_step.fp8_path_c_training_route_payload_for_model(
+        config,
+        model,
+    )
+    contract = route["direct_fusion_chain_training_runtime_contract"]
+
+    assert install_payload["status"] == "ok"
+    assert install_payload["runtime_uses_direct_fusion_chain"] is True
+    assert install_payload["execution"]["status"] == "ok"
+    assert install_payload["training_critical_path"] is False
+    assert contract["runtime_class"] == "PathCDirectFusionChainTrainingRuntime"
+    assert contract["status"] == (
+        m04_train_step.FP8_PATH_C_DIRECT_CHAIN_TRAINING_RUNTIME_INCOMPLETE_STATUS
+    )
+    assert contract["value_and_grad_callable"] is True
+    assert contract["value_and_grad_contract"]["status"] == "incomplete"
+    assert "contracted loss-to-region cotangent bridge" in str(
+        contract["value_and_grad_contract"]["reason"]
+    )
+    assert (
+        contract["value_and_grad_contract"]["loss_cotangent_bridge_contract"][
+            "status"
+        ]
+        == "missing"
+    )
+    assert route["direct_fusion_chain_runtime_available"] is True
+    assert route["direct_fusion_chain_training_runtime_available"] is False
+    assert route["selected_action"] == "run_path_c_split_training_route"
+
+
+def test_path_c_direct_chain_runtime_installer_blocks_incomplete_critical_path(
+    tmp_path: Path,
+) -> None:
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--synthetic",
+            "--dtype",
+            "fp8_path_c",
+            "--pattern",
+            "A",
+            "--depth",
+            "1",
+            "--dsa-a-layer-ranks",
+            "0",
+            "--output",
+            str(tmp_path / "receipt.json"),
+        ]
+    )
+    config = m04_train_step.config_from_args(args, data_path=tmp_path / "tokens.npz")
+    model = build_local_gb10_quarter_tiny_smoke_model()
+    chain = _model_route_direct_chain(model)
+    logical_owner = PathCLogicalBufferOwner(
+        owner_name="unit.path_c_direct_fusion_chain_buffers",
+        buffers=_model_route_direct_chain_mx_buffers(model),
+    )
+
+    install_payload = (
+        m04_train_step.install_path_c_direct_chain_training_runtime_for_model(
+            model=model,
+            chain=chain,
+            artifacts=_model_route_direct_chain_artifacts(model),
+            logical_owner=logical_owner,
+            owner_name="unit.path_c_direct_training_runtime",
+            training_critical_path=True,
+            run_probe=False,
+        )
+    )
+    route = m04_train_step.fp8_path_c_training_route_payload_for_model(
+        config,
+        model,
+    )
+
+    assert install_payload["status"] == "blocked"
+    assert install_payload["training_critical_path"] is False
+    assert install_payload["reason"] == "direct-chain value_and_grad runtime incomplete"
+    assert install_payload["value_and_grad_contract"]["status"] == "incomplete"
+    assert (
+        install_payload["value_and_grad_contract"]["loss_cotangent_bridge_ready"]
+        is False
+    )
+    assert (
+        install_payload["value_and_grad_contract"]["model_gradient_tree_ready"]
+        is False
+    )
+    assert not hasattr(model, "path_c_direct_fusion_chain_training_runtime")
+    assert route["selected_action"] == "run_path_c_split_training_route"
+    assert route["direct_fusion_chain_training_runtime_available"] is False
+
+
+def test_path_c_direct_chain_runtime_installer_accepts_contracted_loss_bridge(
+    tmp_path: Path,
+) -> None:
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--synthetic",
+            "--dtype",
+            "fp8_path_c",
+            "--pattern",
+            "A",
+            "--depth",
+            "1",
+            "--dsa-a-layer-ranks",
+            "0",
+            "--output",
+            str(tmp_path / "receipt.json"),
+        ]
+    )
+    config = m04_train_step.config_from_args(args, data_path=tmp_path / "tokens.npz")
+    model = build_local_gb10_quarter_tiny_smoke_model()
+    chain = _model_route_direct_chain(model)
+    logical_owner = PathCLogicalBufferOwner(
+        owner_name="unit.path_c_direct_fusion_chain_buffers",
+        buffers=_model_route_direct_chain_mx_buffers(model),
+    )
+
+    install_payload = (
+        m04_train_step.install_path_c_direct_chain_training_runtime_for_model(
+            model=model,
+            chain=chain,
+            artifacts=_model_route_direct_chain_artifacts(model),
+            logical_owner=logical_owner,
+            owner_name="unit.path_c_direct_training_runtime",
+            training_critical_path=True,
+            run_probe=False,
+            loss_cotangent_bridge=_ContractedLossCotangentBridge(),
+        )
+    )
+    route = m04_train_step.fp8_path_c_training_route_payload_for_model(
+        config,
+        model,
+    )
+    contract = route["direct_fusion_chain_training_runtime_contract"]
+
+    assert install_payload["status"] == "ok"
+    assert install_payload["training_critical_path"] is True
+    assert install_payload["value_and_grad_contract"]["status"] == "ok"
+    assert contract["status"] == "ok"
+    assert contract["training_runtime_available"] is True
+    assert contract["training_graph_bound"] is True
+    assert contract["value_and_grad_contract_ok"] is True
+    assert route["direct_fusion_chain_training_runtime_available"] is True
     assert route["full_end_to_end_training_available"] is True
     assert route["selected_action"] == "run_path_c_direct_fusion_chain_route"
-    assert route["direct_mx_array_artifact_call_status"] == (
-        "m04_uses_direct_fusion_chain_route"
-    )
 
 
 def test_fp8_path_c_training_route_keeps_split_until_fused_artifact_is_bound(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    path_c_fusion_auto_env: None,
 ) -> None:
-    monkeypatch.setenv("CPPMEGA_PATH_C_FUSION", "auto")
+    del path_c_fusion_auto_env
     args = m04_train_step.build_parser().parse_args(
         [
             "--synthetic",
@@ -2005,16 +2971,13 @@ def test_fp8_path_c_training_route_keeps_split_until_fused_artifact_is_bound(
 
 def test_path_c_fusion_payload_keeps_compile_blocker_without_matching_receipt(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    path_c_fusion_auto_env: None,
 ) -> None:
-    monkeypatch.setenv("CPPMEGA_PATH_C_FUSION", "auto")
-    monkeypatch.setenv(
-        "CPPMEGA_PATH_C_FUSION_COMPILE_RECEIPT",
-        str(tmp_path / "missing_receipt.json"),
-    )
+    del path_c_fusion_auto_env
 
     payload = m04_train_step.path_c_fusion_payload(
         model=build_local_gb10_quarter_tiny_smoke_model(),
+        compile_receipt_path=tmp_path / "missing_receipt.json",
     )
 
     assert payload["production_compile_receipt"]["status"] == "missing"
@@ -2027,11 +2990,49 @@ def test_path_c_fusion_payload_keeps_compile_blocker_without_matching_receipt(
     assert compile_blockers[0]["compile_receipt_status"] == "missing"
 
 
+def test_path_c_fusion_payload_rejects_tiny_smoke_compile_receipt(
+    path_c_fusion_auto_env: None,
+) -> None:
+    del path_c_fusion_auto_env
+
+    payload = m04_train_step.path_c_fusion_payload(
+        model=build_local_gb10_quarter_tiny_smoke_model(),
+        compile_receipt_path=DEFAULT_FUSION_COMPILE_RECEIPT,
+    )
+
+    receipt = payload["production_compile_receipt"]
+    assert receipt["status"] == "mismatch"
+    assert receipt["runtime_execution_status"] == "compile_only_not_runtime_ready"
+    assert receipt["runtime_route_uses_fused_region"] is False
+    assert receipt["runtime_smoke_status"] == "ok"
+    assert receipt["runtime_smoke_mode"] == "tiny_mra"
+    assert receipt["runtime_smoke_actually_executed"] is True
+    assert receipt["production_runtime_smoke_uses_fused_train_block"] is False
+    assert {
+        "runtime_execution_ready",
+        "production_runtime_smoke_ok",
+        "production_smoke_uses_fused_train_block",
+    }.issubset(set(receipt["failed_checks"]))
+
+    compile_blockers = [
+        blocker
+        for blocker in payload["schedule_blockers"]
+        if blocker["kind"] == "production_schedule_not_compile_verified"
+    ]
+    assert len(compile_blockers) == 1
+    assert compile_blockers[0]["compile_receipt_status"] == "mismatch"
+    assert {
+        "runtime_execution_ready",
+        "production_runtime_smoke_ok",
+        "production_smoke_uses_fused_train_block",
+    }.issubset(set(compile_blockers[0]["failed_checks"]))
+
+
 def test_fp8_path_c_training_route_selects_fused_action_when_banks_are_bound(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    path_c_fusion_auto_env: None,
 ) -> None:
-    monkeypatch.setenv("CPPMEGA_PATH_C_FUSION", "auto")
+    del path_c_fusion_auto_env
     args = m04_train_step.build_parser().parse_args(
         [
             "--synthetic",
@@ -2072,9 +3073,9 @@ def test_fp8_path_c_training_route_selects_fused_action_when_banks_are_bound(
 
 def test_fp8_path_c_training_route_for_model_reads_bank_owner(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    path_c_fusion_auto_env: None,
 ) -> None:
-    monkeypatch.setenv("CPPMEGA_PATH_C_FUSION", "auto")
+    del path_c_fusion_auto_env
     args = m04_train_step.build_parser().parse_args(
         [
             "--synthetic",
@@ -2108,9 +3109,9 @@ def test_fp8_path_c_training_route_for_model_reads_bank_owner(
 
 def test_fp8_path_c_training_route_for_model_uses_model_derived_regions(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    path_c_fusion_auto_env: None,
 ) -> None:
-    monkeypatch.setenv("CPPMEGA_PATH_C_FUSION", "auto")
+    del path_c_fusion_auto_env
     args = m04_train_step.build_parser().parse_args(
         [
             "--synthetic",
@@ -2150,10 +3151,10 @@ def test_fp8_path_c_training_route_for_model_uses_model_derived_regions(
     ]
     audit = route["path_c_fusion"]["direct_chained_fusion"]["model_binding_audit"]
     assert audit["status"] == "runtime_backward_or_state_owner_missing"
-    assert audit["required_logical_buffer_count"] == 81
+    assert audit["required_logical_buffer_count"] == 78
     assert audit["model_parameter_or_constant_count"] == 28
-    assert audit["runtime_activation_or_grad_count"] == 48
-    assert audit["backward_gradient_count"] == 37
+    assert audit["runtime_activation_or_grad_count"] == 45
+    assert audit["backward_gradient_count"] == 34
     assert audit["forward_activation_probe_surface_available"] is True
     assert audit["parameter_gradient_probe_surface_available"] is True
     assert audit["model_parameter_logical_owner_available"] is True
@@ -2161,8 +3162,8 @@ def test_fp8_path_c_training_route_for_model_uses_model_derived_regions(
         "local_gb10_quarter.path_c_model_parameter_buffers"
     )
     assert audit["model_parameter_logical_owner_buffer_count"] > 0
-    assert audit["backward_gradient_parameter_alias_coverage_count"] == 24
-    assert audit["backward_gradient_uncovered_count"] == 13
+    assert audit["backward_gradient_parameter_alias_coverage_count"] == 25
+    assert audit["backward_gradient_uncovered_count"] == 9
     assert audit["profile_brick_names_attached"] is True
     assert audit["forward_activation_or_prepared_count"] > 0
     assert audit["backward_gradient_count"] > 0
@@ -2173,9 +3174,8 @@ def test_fp8_path_c_training_route_for_model_uses_model_derived_regions(
         "local_gb10_quarter.path_c_model_parameter_buffers"
     )
     assert runtime_binding["provided_logical_buffer_count"] == 25
-    assert runtime_binding["shape_mismatch_count"] == 0
     assert runtime_binding["shape_mismatch_buffers"] == []
-    assert runtime_binding["missing_logical_buffer_count"] == 56
+    assert runtime_binding["missing_logical_buffer_count"] == 53
     assert (
         "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_sm_scale"
         in runtime_binding["missing_logical_buffers"]
@@ -2183,11 +3183,242 @@ def test_fp8_path_c_training_route_for_model_uses_model_derived_regions(
     assert runtime_binding["hidden_packing_performed"] is False
 
 
+def test_path_c_fusion_payload_reports_model_level_direct_chain_planner() -> None:
+    model = build_local_gb10_quarter_tiny_smoke_model()
+
+    payload = m04_train_step.path_c_fusion_payload(model=model)
+
+    direct_chain = payload["direct_chained_fusion"]
+    assert direct_chain["source_region_name"] == "local_gb10_quarter_path_c_10_12"
+    assert direct_chain["construction"]["planner"] == (
+        "plan_path_c_direct_fusion_chains_for_model"
+    )
+    assert direct_chain["construction"]["region_prefix"] == (
+        "local_gb10_quarter_path_c"
+    )
+    assert direct_chain["construction"]["candidate_chain_count"] == 1
+    assert payload["graph_construction"]["static_acceptance_fixture_used_for_selection"] is False
+
+
+def test_path_c_direct_chain_runtime_capture_owners_reduce_binding_gap() -> None:
+    model = build_local_gb10_quarter_tiny_smoke_model()
+    activation_capture, gradient_capture = (
+        m04_train_step._path_c_direct_chain_runtime_capture_owners_for_model(model)
+    )
+    fake_buffers = _model_route_direct_chain_logical_buffers(model)
+
+    def tensor_for(name: str) -> mx.array:
+        spec = fake_buffers[name]
+        dtype = getattr(mx, str(spec.dtype))
+        return mx.zeros(tuple(spec.shape), dtype=dtype)
+
+    assert activation_capture.aliases == {
+        "local_gb10_quarter_brick_10_M_hidden": ("hidden",),
+    }
+    activation_capture(
+        {
+            "logical_names": ("local_gb10_quarter_brick_10_M_hidden",),
+            "tensor": tensor_for("hidden"),
+        }
+    )
+    for name, tensor in fake_buffers.items():
+        if (
+            name.endswith(
+                (
+                    "_mamba3_h0",
+                    "_state",
+                    "_state_in",
+                    "_m2rnn_h0",
+                    "_m2rnn_conv_state",
+                )
+            )
+            or any(
+                token in name
+                for token in (
+                    "_hidden",
+                    "_residual_norm_hidden",
+                    "_delta",
+                    "_hidden_after",
+                    "_qkv_projection_q_fp8",
+                    "_qkv_projection_q_scale",
+                    "_qkv_projection_kv_fp8",
+                    "_qkv_projection_kv_scale",
+                    "_qkv_projection_indices",
+                    "_sparse_mla_fp8_apply_lse",
+                    "_sparse_mla_fp8_apply_out",
+                    "_sparse_mla_fp8_apply_sparse_mla_has_sinks",
+                    "_sparse_mla_fp8_apply_sparse_mla_sinks",
+                    "_sparse_mla_fp8_apply_sparse_mla_sm_scale",
+                )
+            )
+        ) and not name.endswith("_grad"):
+            activation_capture({"logical_names": (name,), "tensor": tensor_for(name)})
+    for source, targets in gradient_capture.aliases.items():
+        for target in targets:
+            if target in fake_buffers:
+                gradient_capture(
+                    {"logical_names": (source,), "tensor": tensor_for(target)}
+                )
+                break
+    model.path_c_direct_fusion_chain_logical_buffer_owners = (
+        activation_capture,
+        gradient_capture,
+    )
+
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--synthetic",
+            "--dtype",
+            "fp8_path_c",
+            "--pattern",
+            "A",
+            "--depth",
+            "1",
+            "--dsa-a-layer-ranks",
+            "0",
+            "--output",
+            "/tmp/path-c-runtime-capture-owner-receipt.json",
+        ]
+    )
+    config = m04_train_step.config_from_args(
+        args,
+        data_path=Path("/tmp/path-c-runtime-capture-owner-tokens.npz"),
+    )
+    route = m04_train_step.fp8_path_c_training_route_payload_for_model(
+        config,
+        model,
+    )
+    runtime_binding = route["path_c_fusion"]["direct_chained_fusion"][
+        "runtime_binding"
+    ]
+
+    assert runtime_binding["logical_buffer_owner"] == (
+        "local_gb10_quarter.path_c_direct_fusion_chain_buffers"
+    )
+    assert runtime_binding["provided_logical_buffer_count"] == 69
+    assert runtime_binding["missing_logical_buffer_count"] == 9
+    assert runtime_binding["shape_mismatch_count"] == 0
+    assert runtime_binding["dtype_mismatch_count"] == 0
+    assert "hidden" not in runtime_binding["missing_logical_buffers"]
+    assert (
+        "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_sm_scale"
+        not in runtime_binding["missing_logical_buffers"]
+    )
+    assert (
+        "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_out"
+        not in runtime_binding["missing_logical_buffers"]
+    )
+    assert (
+        "local_gb10_quarter_brick_12_A_qkv_projection_q_fp8_grad"
+        not in runtime_binding["missing_logical_buffers"]
+    )
+    assert (
+        "local_gb10_quarter_brick_12_A_qkv_projection_kv_fp8_grad"
+        not in runtime_binding["missing_logical_buffers"]
+    )
+    assert (
+        "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_out_grad"
+        in runtime_binding["missing_logical_buffers"]
+    )
+    assert runtime_binding["hidden_packing_performed"] is False
+
+    vjp_activation_grad_sources = {
+        "local_gb10_quarter_brick_10_M_hidden_grad": "hidden_grad",
+        "local_gb10_quarter_brick_10_M_delta_grad": (
+            "local_gb10_quarter_brick_10_M_delta_grad"
+        ),
+        "local_gb10_quarter_brick_10_M_hidden_after_grad": (
+            "local_gb10_quarter_brick_10_M_hidden_after_grad"
+        ),
+        "local_gb10_quarter_brick_11_R_delta_grad": (
+            "local_gb10_quarter_brick_11_R_delta_grad"
+        ),
+        "local_gb10_quarter_brick_11_R_hidden_after_grad": (
+            "local_gb10_quarter_brick_11_R_hidden_after_grad"
+        ),
+        "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_out_grad": (
+            "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_out_grad"
+        ),
+    }
+    for logical_name, buffer_name in vjp_activation_grad_sources.items():
+        activation_capture(
+            {
+                "logical_names": (logical_name,),
+                "tensor": tensor_for(buffer_name),
+                "phase": "value_and_grad",
+            }
+        )
+    route = m04_train_step.fp8_path_c_training_route_payload_for_model(
+        config,
+        model,
+    )
+    runtime_binding = route["path_c_fusion"]["direct_chained_fusion"][
+        "runtime_binding"
+    ]
+
+    assert runtime_binding["provided_logical_buffer_count"] == 75
+    assert runtime_binding["missing_logical_buffer_count"] == 3
+    assert runtime_binding["shape_mismatch_count"] == 0
+    assert "hidden_grad" not in runtime_binding["missing_logical_buffers"]
+    assert (
+        "local_gb10_quarter_brick_10_M_delta_grad"
+        not in runtime_binding["missing_logical_buffers"]
+    )
+    assert (
+        "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_out_grad"
+        not in runtime_binding["missing_logical_buffers"]
+    )
+    assert runtime_binding["missing_logical_buffers"] == [
+        "local_gb10_quarter_brick_10_M_mamba3_h0_grad",
+        "local_gb10_quarter_brick_10_M_state_in_grad",
+        "local_gb10_quarter_brick_11_R_m2rnn_h0_grad",
+    ]
+
+    workspace_owner = (
+        m04_train_step.make_path_c_direct_fusion_chain_workspace_owner(
+            chain=_model_route_direct_chain(model),
+            logical_buffer_names=runtime_binding["missing_logical_buffers"],
+            owner_name="local_gb10_quarter.path_c_direct_fusion_chain_workspace",
+        )
+    )
+    assert set(workspace_owner.buffers) == set(
+        runtime_binding["missing_logical_buffers"]
+    )
+    assert workspace_owner.buffers[
+        "local_gb10_quarter_brick_10_M_state_in_grad"
+    ].shape == workspace_owner.buffers[
+        "local_gb10_quarter_brick_10_M_mamba3_h0_grad"
+    ].shape
+    model.path_c_direct_fusion_chain_logical_buffer_owners = (
+        activation_capture,
+        gradient_capture,
+        workspace_owner,
+    )
+
+    route = m04_train_step.fp8_path_c_training_route_payload_for_model(
+        config,
+        model,
+    )
+    runtime_binding = route["path_c_fusion"]["direct_chained_fusion"][
+        "runtime_binding"
+    ]
+
+    assert runtime_binding["provided_logical_buffer_count"] == 78
+    assert runtime_binding["missing_logical_buffer_count"] == 0
+    assert runtime_binding["logical_tensor_binding_ready"] is True
+    assert runtime_binding["direct_chain_artifacts_bound"] is False
+    assert runtime_binding["status"] == (
+        m04_train_step.FP8_PATH_C_DIRECT_CHAIN_ARTIFACTS_MISSING_STATUS
+    )
+    assert runtime_binding["missing_artifact_segments"] == [0, 1, 2, 3]
+    assert runtime_binding["hidden_packing_performed"] is False
+
+
 def test_fp8_path_c_training_route_composes_model_and_runtime_logical_owners(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    path_c_fusion_auto_env: None,
 ) -> None:
-    monkeypatch.setenv("CPPMEGA_PATH_C_FUSION", "auto")
+    del path_c_fusion_auto_env
     args = m04_train_step.build_parser().parse_args(
         [
             "--synthetic",
@@ -2227,16 +3458,16 @@ def test_fp8_path_c_training_route_composes_model_and_runtime_logical_owners(
     )
     assert runtime_binding["hidden_packing_performed"] is False
     assert runtime_binding["provided_logical_buffer_count"] == 27
-    assert runtime_binding["missing_logical_buffer_count"] == 54
+    assert runtime_binding["missing_logical_buffer_count"] == 51
     assert "hidden" not in runtime_binding["missing_logical_buffers"]
     assert "hidden_grad" not in runtime_binding["missing_logical_buffers"]
 
 
 def test_fp8_path_c_training_route_accepts_real_activation_capture_owner(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    path_c_fusion_auto_env: None,
 ) -> None:
-    monkeypatch.setenv("CPPMEGA_PATH_C_FUSION", "auto")
+    del path_c_fusion_auto_env
     args = m04_train_step.build_parser().parse_args(
         [
             "--synthetic",
@@ -2274,7 +3505,13 @@ def test_fp8_path_c_training_route_accepts_real_activation_capture_owner(
     assert runtime_binding["logical_buffer_owner"] == (
         "local_gb10_quarter.path_c_direct_fusion_chain_buffers"
     )
-    assert runtime_binding["shape_mismatch_count"] == 0
+    assert runtime_binding["shape_mismatch_buffers"] == [
+        "local_gb10_quarter_brick_10_M_mamba3_h0",
+        "local_gb10_quarter_brick_10_M_state",
+        "local_gb10_quarter_brick_10_M_state_in",
+        "local_gb10_quarter_brick_11_R_m2rnn_conv_state",
+        "local_gb10_quarter_brick_11_R_m2rnn_h0",
+    ]
     assert "hidden" not in runtime_binding["missing_logical_buffers"]
     assert "local_gb10_quarter_brick_10_M_delta" not in (
         runtime_binding["missing_logical_buffers"]
@@ -2286,9 +3523,9 @@ def test_fp8_path_c_training_route_accepts_real_activation_capture_owner(
 
 def test_receipt_preserves_bound_fp8_path_c_route_from_train_payload(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    path_c_fusion_auto_env: None,
 ) -> None:
-    monkeypatch.setenv("CPPMEGA_PATH_C_FUSION", "auto")
+    del path_c_fusion_auto_env
     args = m04_train_step.build_parser().parse_args(
         [
             "--synthetic",
@@ -2357,11 +3594,13 @@ def test_receipt_preserves_bound_fp8_path_c_route_from_train_payload(
 
 
 def test_path_c_fusion_force_mode_fails_closed_until_runtime_is_bound(
-    monkeypatch: pytest.MonkeyPatch,
+    path_c_fusion_force_env: None,
 ) -> None:
-    monkeypatch.setenv("CPPMEGA_PATH_C_FUSION", "force")
+    del path_c_fusion_force_env
 
-    payload = m04_train_step.path_c_fusion_payload()
+    payload = m04_train_step.path_c_fusion_payload(
+        compile_receipt_path=PRODUCTION_FUSION_COMPILE_RECEIPT,
+    )
 
     assert payload["mode"] == "force"
     assert payload["status"] == "force_blocked_runtime_not_bound"
@@ -2376,10 +3615,10 @@ def test_path_c_fusion_force_mode_fails_closed_until_runtime_is_bound(
     assert payload["schedule_contract"]["status"] == "registered_not_lowered"
     assert payload["schedule_contract"]["declared_implementation_kind"] == "production"
     assert payload["schedule_contract"]["declared_schedule_id"] == (
-        "path_c_descriptor_chain_c44eddb18abd"
+        "path_c_descriptor_chain_5785a4a0210e"
     )
     assert payload["production_schedule"]["schedule_id"] == (
-        "path_c_descriptor_chain_c44eddb18abd"
+        "path_c_descriptor_chain_5785a4a0210e"
     )
     assert payload["production_schedule"]["implementation_status"] == (
         "ready"
@@ -2414,6 +3653,21 @@ def test_path_c_fusion_force_mode_fails_closed_until_runtime_is_bound(
     assert payload["production_compile_receipt"]["native_compile_ok"] is True
     assert payload["production_compile_receipt"]["cache_key_recompile_status"] == (
         "key_stable"
+    )
+    assert payload["production_compile_receipt"]["runtime_execution_status"] == (
+        "runtime_ready"
+    )
+    assert payload["production_compile_receipt"]["runtime_route_uses_fused_region"] is True
+    assert payload["production_compile_receipt"]["runtime_smoke_status"] == "ok"
+    assert payload["production_compile_receipt"]["runtime_smoke_mode"] == "production_1b"
+    assert (
+        payload["production_compile_receipt"]["runtime_smoke_actually_executed"] is True
+    )
+    assert (
+        payload["production_compile_receipt"][
+            "production_runtime_smoke_uses_fused_train_block"
+        ]
+        is True
     )
     assert "production_schedule_uses_descriptor_loop_fragments" not in {
         blocker["kind"] for blocker in payload["schedule_blockers"]
@@ -2520,7 +3774,6 @@ def assert_local_gb10_metadata_dry_run_contract(payload: dict[str, Any]) -> None
 
 
 def test_local_gb10_quarter_dry_run_is_metadata_only_preflight(
-    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     def fail_route(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
@@ -2529,9 +3782,6 @@ def test_local_gb10_quarter_dry_run_is_metadata_only_preflight(
     def fail_allocation_probe(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
         raise AssertionError("full local_gb10_quarter allocation must be opt-in")
 
-    monkeypatch.setattr(m04_train_step, "dry_run_payload", fail_route)
-    monkeypatch.setattr(m04_train_step, "train_hybrid_tiny", fail_route)
-    monkeypatch.setattr(m04_train_step, "local_gb10_quarter", fail_allocation_probe)
     args = m04_train_step.build_parser().parse_args(
         [
             "--synthetic",
@@ -2543,7 +3793,12 @@ def test_local_gb10_quarter_dry_run_is_metadata_only_preflight(
         ]
     )
 
-    payload, exit_code = m04_train_step.run_receipt(args)
+    payload, exit_code = m04_train_step.run_receipt(
+        args,
+        dry_run_payload_fn=fail_route,
+        train_hybrid_tiny_fn=fail_route,
+        allocation_probe_fn=fail_allocation_probe,
+    )
 
     assert exit_code == 0
     assert_local_gb10_metadata_dry_run_contract(payload)
@@ -2558,14 +3813,11 @@ def test_local_gb10_quarter_dry_run_is_metadata_only_preflight(
 
 
 def test_local_gb10_quarter_dry_run_require_loss_decrease_fails_closed(
-    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     def fail_route(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
         raise AssertionError("training and dry-run routes must not be called")
 
-    monkeypatch.setattr(m04_train_step, "dry_run_payload", fail_route)
-    monkeypatch.setattr(m04_train_step, "train_hybrid_tiny", fail_route)
     args = m04_train_step.build_parser().parse_args(
         [
             "--synthetic",
@@ -2578,7 +3830,11 @@ def test_local_gb10_quarter_dry_run_require_loss_decrease_fails_closed(
         ]
     )
 
-    payload, exit_code = m04_train_step.run_receipt(args)
+    payload, exit_code = m04_train_step.run_receipt(
+        args,
+        dry_run_payload_fn=fail_route,
+        train_hybrid_tiny_fn=fail_route,
+    )
 
     assert exit_code == 2
     assert_local_gb10_metadata_dry_run_contract(payload)
@@ -2678,8 +3934,7 @@ def test_non_default_optimizer_is_blocked_outside_local_gb10_route(
     assert payload["training"]["optimizer"]["name"] == "Lion"
 
 
-def test_local_gb10_quarter_training_routes_to_monkeypatchable_seam(
-    monkeypatch: pytest.MonkeyPatch,
+def test_local_gb10_quarter_training_routes_to_injected_seam(
     tmp_path: Path,
 ) -> None:
     route_calls: list[tuple[m04_train_step.TrainHybridTinyConfig, Path]] = []
@@ -2703,12 +3958,6 @@ def test_local_gb10_quarter_training_routes_to_monkeypatchable_seam(
             2,
         )
 
-    monkeypatch.setattr(m04_train_step, "train_hybrid_tiny", fail_train)
-    monkeypatch.setattr(
-        m04_train_step,
-        "run_local_gb10_quarter_training",
-        fake_local_gb10_route,
-    )
     args = m04_train_step.build_parser().parse_args(
         [
             "--synthetic",
@@ -2719,7 +3968,11 @@ def test_local_gb10_quarter_training_routes_to_monkeypatchable_seam(
         ]
     )
 
-    payload, exit_code = m04_train_step.run_receipt(args)
+    payload, exit_code = m04_train_step.run_receipt(
+        args,
+        train_hybrid_tiny_fn=fail_train,
+        local_gb10_route_fn=fake_local_gb10_route,
+    )
 
     assert len(route_calls) == 1
     config, data_path = route_calls[0]
@@ -2741,8 +3994,7 @@ def test_local_gb10_quarter_training_routes_to_monkeypatchable_seam(
     assert payload["acceptance_gate"]["model_identity_ok"] is False
 
 
-def test_local_gb10_quarter_grad_checkpoint_routes_to_monkeypatchable_seam(
-    monkeypatch: pytest.MonkeyPatch,
+def test_local_gb10_quarter_grad_checkpoint_routes_to_injected_seam(
     tmp_path: Path,
 ) -> None:
     route_calls: list[tuple[m04_train_step.TrainHybridTinyConfig, Path]] = []
@@ -2766,12 +4018,6 @@ def test_local_gb10_quarter_grad_checkpoint_routes_to_monkeypatchable_seam(
             2,
         )
 
-    monkeypatch.setattr(m04_train_step, "train_hybrid_tiny", fail_train)
-    monkeypatch.setattr(
-        m04_train_step,
-        "run_local_gb10_quarter_training",
-        fake_local_gb10_route,
-    )
     args = m04_train_step.build_parser().parse_args(
         [
             "--synthetic",
@@ -2783,7 +4029,11 @@ def test_local_gb10_quarter_grad_checkpoint_routes_to_monkeypatchable_seam(
         ]
     )
 
-    payload, exit_code = m04_train_step.run_receipt(args)
+    payload, exit_code = m04_train_step.run_receipt(
+        args,
+        train_hybrid_tiny_fn=fail_train,
+        local_gb10_route_fn=fake_local_gb10_route,
+    )
 
     assert len(route_calls) == 1
     config, data_path = route_calls[0]
@@ -2807,7 +4057,6 @@ def test_local_gb10_quarter_grad_checkpoint_routes_to_monkeypatchable_seam(
 
 
 def test_local_gb10_quarter_dry_run_with_allocation_probe_is_preflight_only(
-    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     probe_called = False
@@ -2820,11 +4069,6 @@ def test_local_gb10_quarter_dry_run_with_allocation_probe_is_preflight_only(
     def fail_route(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
         raise AssertionError("training and dry-run routes must not be called")
 
-    monkeypatch.setattr(
-        m04_train_step, "probe_local_gb10_quarter_allocation", fake_probe
-    )
-    monkeypatch.setattr(m04_train_step, "dry_run_payload", fail_route)
-    monkeypatch.setattr(m04_train_step, "train_hybrid_tiny", fail_route)
     args = m04_train_step.build_parser().parse_args(
         [
             "--synthetic",
@@ -2837,7 +4081,12 @@ def test_local_gb10_quarter_dry_run_with_allocation_probe_is_preflight_only(
         ]
     )
 
-    payload, exit_code = m04_train_step.run_receipt(args)
+    payload, exit_code = m04_train_step.run_receipt(
+        args,
+        dry_run_payload_fn=fail_route,
+        train_hybrid_tiny_fn=fail_route,
+        allocation_probe_fn=fake_probe,
+    )
 
     assert probe_called is True
     assert exit_code == 0
@@ -2857,15 +4106,11 @@ def test_local_gb10_quarter_dry_run_with_allocation_probe_is_preflight_only(
 
 
 def test_local_gb10_allocation_probe_success_is_preflight_only(
-    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     def fake_probe() -> dict[str, Any]:
         return canonical_allocation_probe()
 
-    monkeypatch.setattr(
-        m04_train_step, "probe_local_gb10_quarter_allocation", fake_probe
-    )
     args = m04_train_step.build_parser().parse_args(
         [
             "--probe-local-gb10-quarter-allocation",
@@ -2874,7 +4119,10 @@ def test_local_gb10_allocation_probe_success_is_preflight_only(
         ]
     )
 
-    preflight = m04_train_step.local_gb10_quarter_preflight_from_args(args)
+    preflight = m04_train_step.local_gb10_quarter_preflight_from_args(
+        args,
+        allocation_probe_fn=fake_probe,
+    )
     gate = local_gb10_gate(
         model_name="HybridTinyLM",
         grad_checkpoint=grad_checkpoint_identity(enabled=False),
@@ -2897,7 +4145,6 @@ def test_local_gb10_allocation_probe_success_is_preflight_only(
 
 
 def test_local_gb10_allocation_probe_failure_fails_closed(
-    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     def fake_probe() -> dict[str, Any]:
@@ -2909,9 +4156,6 @@ def test_local_gb10_allocation_probe_failure_fails_closed(
             error="synthetic allocation failure",
         )
 
-    monkeypatch.setattr(
-        m04_train_step, "probe_local_gb10_quarter_allocation", fake_probe
-    )
     args = m04_train_step.build_parser().parse_args(
         [
             "--probe-local-gb10-quarter-allocation",
@@ -2920,7 +4164,10 @@ def test_local_gb10_allocation_probe_failure_fails_closed(
         ]
     )
 
-    preflight = m04_train_step.local_gb10_quarter_preflight_from_args(args)
+    preflight = m04_train_step.local_gb10_quarter_preflight_from_args(
+        args,
+        allocation_probe_fn=fake_probe,
+    )
     gate = local_gb10_gate(local_gb10_quarter_preflight=preflight)
 
     assert preflight["allocation_attempted"] is True

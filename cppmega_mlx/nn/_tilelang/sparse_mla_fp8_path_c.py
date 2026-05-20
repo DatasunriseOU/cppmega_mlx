@@ -29,6 +29,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
+from collections.abc import Callable, Mapping
 from typing import Any, cast
 
 import mlx.core as mx
@@ -99,6 +100,7 @@ _SMFP8_IQKR_RT = _SMFP8_QKR_DEFAULT_REDUCE_THREADS
 _SMFP8_IQKR_VEC = _SMFP8_QKR_DEFAULT_VEC
 _SMFP8_IQKR_BLOCK_K = _SMFP8_IQKR_RT * _SMFP8_IQKR_VEC
 _SMFP8_IQKR_K_WORDS = _SMFP8_IQKR_K // 4
+_SMFP8_IQKR_INDEX_DTYPE = "int32"
 
 _SMFP8_APPLY_B = 1
 _SMFP8_APPLY_S = 1
@@ -123,6 +125,8 @@ _SMFP8_APPLY_IDX_SIZE = (
 )
 _SMFP8_APPLY_OUT_SIZE = _SMFP8_APPLY_LANES * _SMFP8_APPLY_DV
 _SMFP8_APPLY_LSE_SIZE = _SMFP8_APPLY_LANES
+_SMFP8_APPLY_OUT_DTYPE = "float32"
+_SMFP8_APPLY_INDEX_DTYPE = "int32"
 
 _SMFP8_BWD_B = 1
 _SMFP8_BWD_S = 1
@@ -143,9 +147,17 @@ _SMFP8_BWD_KV_SCALE_SIZE = _SMFP8_BWD_B * _SMFP8_BWD_SKV * _SMFP8_BWD_G
 _SMFP8_BWD_IDX_SIZE = _SMFP8_BWD_B * _SMFP8_BWD_S * _SMFP8_BWD_G * _SMFP8_BWD_TOPK
 _SMFP8_BWD_DOUT_SIZE = _SMFP8_BWD_LANES * _SMFP8_BWD_DV
 _SMFP8_BWD_DOUT_DTYPE = "float32"
+_SMFP8_BWD_INDEX_DTYPE = "int32"
+_SMFP8_BWD_CLEAR_BATCH = _SMFP8_BWD_B
+_SMFP8_BWD_CLEAR_SEQ_LEN_KV = _SMFP8_BWD_SKV
+_SMFP8_BWD_CLEAR_KV_GROUP = _SMFP8_BWD_G
+_SMFP8_BWD_CLEAR_K = _SMFP8_BWD_K
 _SMFP8_BWD_CLEAR_TOTAL = _SMFP8_BWD_B * _SMFP8_BWD_SKV * _SMFP8_BWD_G * _SMFP8_BWD_K
 _SMFP8_BWD_CLEAR_THREADS = 256
 _SMFP8_PER_TOKEN_QUANT_THREADS = 256
+_SMFP8_PTQ_ROWS = 1
+_SMFP8_PTQ_K = 64
+_SMFP8_PTQ_INPUT_DTYPE = "float32"
 _SMFP8_PREPARE_Q_ROWS = 1
 _SMFP8_PREPARE_KV_ROWS = 1
 _SMFP8_PREPARE_ROWS = _SMFP8_PREPARE_Q_ROWS + _SMFP8_PREPARE_KV_ROWS
@@ -206,6 +218,24 @@ class SparseMLAFp8IndexedQKReducePathCStatus:
 
 class SparseMLAFp8PathCDirectError(RuntimeError):
     """Raised when a prepared-buffer tvm-ffi owner-output path cannot run."""
+
+
+def _emit_fp8_apply_runtime_buffer(
+    probe: Callable[[Mapping[str, Any]], None] | None,
+    *,
+    name: str,
+    tensor: mx.array,
+) -> None:
+    if probe is None:
+        return
+    probe(
+        {
+            "name": name,
+            "tensor": tensor,
+            "producer_owner": "sparse_mla_fp8_path_c_apply",
+            "producer_stage": "sparse_mla_fp8_apply",
+        }
+    )
 
 
 def _index_dtype_name(indices: mx.array, *, op_name: str) -> str:
@@ -1848,9 +1878,6 @@ def _make_fp8_sparse_mla_apply_kernel(
             inv_sum = T.alloc_local((1,), "float32")
             stride = T.alloc_local((1,), "int32")
             gather_idx = T.alloc_local((1,), "int32")
-            kv_row_base_local = T.alloc_local((1,), "int32")
-            kv_scale_idx_local = T.alloc_local((1,), "int32")
-            dkv_idx_local = T.alloc_local((1,), "int32")
 
             h = bx % _SMFP8_APPLY_H
             b = bx // (_SMFP8_APPLY_H * _SMFP8_APPLY_S)
@@ -2984,6 +3011,7 @@ def sparse_mla_fp8_path_c_apply(
     out: mx.array | None = None,
     lse: mx.array | None = None,
     output_dtype: mx.Dtype | None = None,
+    runtime_buffer_probe: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> mx.array | tuple[mx.array, mx.array] | None:
     """Run fused FP8 Sparse-MLA Path C over prepared GPU buffers.
 
@@ -3071,6 +3099,21 @@ def sparse_mla_fp8_path_c_apply(
                 raise ValueError("sinks must be float32")
             sinks_buf = sinks
             has_sinks_buf = mx.array([1], dtype=mx.int32)
+        _emit_fp8_apply_runtime_buffer(
+            runtime_buffer_probe,
+            name="sparse_mla_sm_scale",
+            tensor=sm_scale_buf,
+        )
+        _emit_fp8_apply_runtime_buffer(
+            runtime_buffer_probe,
+            name="sparse_mla_sinks",
+            tensor=sinks_buf,
+        )
+        _emit_fp8_apply_runtime_buffer(
+            runtime_buffer_probe,
+            name="sparse_mla_has_sinks",
+            tensor=has_sinks_buf,
+        )
         returned = kernel(
             _flat_1d_view(q_fp8),
             _flat_1d_view(q_scale),
@@ -3093,8 +3136,13 @@ def sparse_mla_fp8_path_c_apply(
             raise RuntimeError(
                 "sparse_mla_fp8_path_c_apply: native TileLang tvm-ffi "
                 "graph-output dispatch did not return out/lse"
-            )
+        )
         return None
+    _emit_fp8_apply_runtime_buffer(
+        runtime_buffer_probe,
+        name="lse",
+        tensor=cast(mx.array, returned[1]),
+    )
     direct_out = cast(mx.array, returned[0]).reshape(
         (batch, seq_len, heads, d_v_resolved)
     )
@@ -3250,6 +3298,7 @@ def sparse_mla_fp8_path_c_apply_prepared_float(
     force_path_c: bool = False,
     causal: bool = False,
     output_dtype: mx.Dtype | None = None,
+    runtime_buffer_probe: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> mx.array:
     """Differentiable owner wrapper for prepared-buffer FP8 Path C apply.
 
@@ -3275,6 +3324,7 @@ def sparse_mla_fp8_path_c_apply_prepared_float(
             sinks=sinks,
             force_path_c=force_path_c,
             output_dtype=_mx_float_dtype(output_dtype, default=q_in.dtype),
+            runtime_buffer_probe=runtime_buffer_probe,
         )
         if out is None:
             if force_path_c:

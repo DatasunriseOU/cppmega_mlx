@@ -1825,8 +1825,17 @@ def test_fp8_path_c_prepared_float_wrapper_does_not_quantize(
         return_lse: bool = False,
         force_path_c: bool = False,
         output_dtype: mx.Dtype | None = None,
+        runtime_buffer_probe: object | None = None,
     ) -> mx.array:
-        del q_scale_in, kv_scale_in, indices_in, sm_scale, sinks, return_lse
+        del (
+            q_scale_in,
+            kv_scale_in,
+            indices_in,
+            sm_scale,
+            sinks,
+            return_lse,
+            runtime_buffer_probe,
+        )
         assert force_path_c is True
         assert output_dtype == q.dtype
         calls.append((tuple(q_fp8_in.shape), tuple(kv_fp8_in.shape)))

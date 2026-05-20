@@ -98,6 +98,76 @@ def _assert_params_allclose(
         np.testing.assert_allclose(actual_params[name], expected_value, rtol=0, atol=atol)
 
 
+class _RecordingPathCTrainingRuntime:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, tuple[str, ...]]] = []
+        self.binding: dict[str, Any] | None = None
+
+    def bind_training_graph(self, **binding: Any) -> None:
+        self.binding = {"status": "ok", **binding}
+
+    def unbind_training_graph(self, *, owner: str) -> None:
+        assert self.binding is not None
+        assert self.binding["owner"] == owner
+        self.binding = None
+
+    def training_graph_binding(self) -> dict[str, Any] | None:
+        return self.binding
+
+    def value_and_grad(
+        self,
+        model: nn.Module,
+        batch: dict[str, mx.array],
+        loss_and_grad: Any,
+    ) -> tuple[tuple[mx.array, mx.array], Any]:
+        self.calls.append((type(model).__name__, tuple(batch)))
+        return loss_and_grad(model, batch)
+
+
+class _ContractedRecordingPathCTrainingRuntime(_RecordingPathCTrainingRuntime):
+    def value_and_grad_contract(self) -> dict[str, Any]:
+        return {
+            "contract": "path_c_direct_fusion_value_and_grad_v1",
+            "owner": "CompiledPretrainingStep",
+            "uses_direct_chain_runtime": True,
+            "uses_forward_hook": True,
+            "uses_backward_or_vjp_hook": True,
+            "returns_model_grads": True,
+            "loss_cotangent_bridge_ready": True,
+            "model_gradient_tree_ready": True,
+            "delegates_to_eager_loss_and_grad": False,
+            "hidden_packing_performed": False,
+        }
+
+
+class _NoLossBridgePathCTrainingRuntime(_ContractedRecordingPathCTrainingRuntime):
+    def value_and_grad_contract(self) -> dict[str, Any]:
+        payload = dict(super().value_and_grad_contract())
+        payload["loss_cotangent_bridge_ready"] = False
+        return payload
+
+
+class _BindingAwarePathCTrainingRuntime(_RecordingPathCTrainingRuntime):
+    def value_and_grad_contract(self) -> dict[str, Any]:
+        binding = self.training_graph_binding() or {}
+        return {
+            "contract": "path_c_direct_fusion_value_and_grad_v1",
+            "owner": binding.get("owner"),
+            "uses_direct_chain_runtime": bool(
+                binding.get("uses_direct_chain_runtime")
+            ),
+            "uses_forward_hook": bool(binding.get("uses_forward_hook")),
+            "uses_backward_or_vjp_hook": bool(
+                binding.get("uses_backward_or_vjp_hook")
+            ),
+            "returns_model_grads": True,
+            "loss_cotangent_bridge_ready": True,
+            "model_gradient_tree_ready": True,
+            "delegates_to_eager_loss_and_grad": False,
+            "hidden_packing_performed": False,
+        }
+
+
 def test_regional_compile_policy_matches_cppmega_receipt() -> None:
     assert REGIONAL_COMPILE_TARGETS == {
         "mamba3_pre": True,
@@ -122,41 +192,18 @@ def test_regional_compile_rejects_unknown_targets_fail_closed() -> None:
         regional_compile(bad_target, lambda x: x)
 
 
-def test_regional_compile_allowed_target_calls_mx_compile(monkeypatch: Any) -> None:
-    calls: list[dict[str, Any]] = []
-
-    def fake_compile(fn: Any, **kwargs: Any) -> Any:
-        calls.append({"fn": fn, "kwargs": kwargs})
-
-        def wrapper(x: mx.array) -> mx.array:
-            return fn(x) + 1
-
-        return wrapper
-
-    monkeypatch.setattr("cppmega_mlx.training.compiled.mx.compile", fake_compile)
-
-    @regional_compile("data_dep_a", shapeless=True)
+def test_regional_compile_allowed_target_returns_compiled_callable() -> None:
     def add_two(x: mx.array) -> mx.array:
         return x + 2
 
-    result = add_two(mx.array(3))
+    compiled = maybe_compile_region("data_dep_a", add_two, shapeless=True)
+    result = compiled(mx.array(3))
 
-    assert len(calls) == 1
-    assert calls[0]["kwargs"] == {"shapeless": True}
-    assert int(result.item()) == 6
+    assert compiled is not add_two
+    assert int(result.item()) == 5
 
 
-def test_regional_compile_denied_target_returns_original_function(
-    monkeypatch: Any,
-) -> None:
-    calls: list[Any] = []
-
-    def fake_compile(fn: Any, **kwargs: Any) -> Any:
-        calls.append((fn, kwargs))
-        return fn
-
-    monkeypatch.setattr("cppmega_mlx.training.compiled.mx.compile", fake_compile)
-
+def test_regional_compile_denied_target_returns_original_function() -> None:
     def rmsnorm_like(x: mx.array) -> mx.array:
         return x * 2
 
@@ -164,7 +211,6 @@ def test_regional_compile_denied_target_returns_original_function(
     result = maybe_compiled(mx.array(3))
 
     assert maybe_compiled is rmsnorm_like
-    assert calls == []
     assert int(result.item()) == 6
 
 
@@ -466,6 +512,132 @@ def test_path_c_gradient_probe_rejects_compiled_step_fail_closed() -> None:
     step = CompiledPretrainingStep(model, optimizer, compile=True)
     with pytest.raises(ValueError, match="compile=False"):
         step.attach_path_c_gradient_probe(lambda _event: None)
+
+
+def test_path_c_training_runtime_binds_graph_and_runs_contracted_value_and_grad() -> None:
+    model = TinyLM(_tiny_config())
+    optimizer = optim.AdamW(learning_rate=1e-2, weight_decay=0.0)
+    runtime = _ContractedRecordingPathCTrainingRuntime()
+    step = CompiledPretrainingStep(
+        model,
+        optimizer,
+        compile=False,
+        path_c_training_runtime=runtime,
+    )
+    batch = synthetic_token_batch(
+        batch_size=2,
+        seq_length=8,
+        vocab_size=model.config.vocab_size,
+        seed=82,
+        include_structure=True,
+    )
+    before = _flat_params(model)
+
+    metrics = step(batch)
+    after = _flat_params(model)
+
+    assert metrics.compiled is False
+    assert metrics.updated is True
+    assert metrics.ntokens == 14
+    assert runtime.calls == [("TinyLM", STABLE_BATCH_KEYS)]
+    assert runtime.training_graph_binding() == {
+        "status": "ok",
+        "owner": "CompiledPretrainingStep",
+        "uses_direct_chain_runtime": True,
+        "uses_forward_hook": True,
+        "uses_backward_or_vjp_hook": True,
+    }
+    assert step.state_dict()["path_c_training_runtime_installed"] is True
+    assert (
+        step.state_dict()["path_c_training_runtime_class"]
+        == "_ContractedRecordingPathCTrainingRuntime"
+    )
+    assert _has_parameter_delta(before, after)
+
+    step.detach_path_c_training_runtime()
+
+    assert runtime.training_graph_binding() is None
+    assert step.state_dict()["path_c_training_runtime_installed"] is False
+    assert step.state_dict()["path_c_training_runtime_class"] is None
+
+
+def test_path_c_training_runtime_checks_contract_after_graph_binding() -> None:
+    model = TinyLM(_tiny_config())
+    optimizer = optim.AdamW(learning_rate=1e-2, weight_decay=0.0)
+    runtime = _BindingAwarePathCTrainingRuntime()
+
+    step = CompiledPretrainingStep(
+        model,
+        optimizer,
+        compile=False,
+        path_c_training_runtime=runtime,
+    )
+
+    assert step.state_dict()["path_c_training_runtime_installed"] is True
+    assert runtime.training_graph_binding() == {
+        "status": "ok",
+        "owner": "CompiledPretrainingStep",
+        "uses_direct_chain_runtime": True,
+        "uses_forward_hook": True,
+        "uses_backward_or_vjp_hook": True,
+    }
+
+
+def test_path_c_training_runtime_rejects_compiled_step_fail_closed() -> None:
+    model = TinyLM(_tiny_config())
+    optimizer = optim.AdamW(learning_rate=1e-2, weight_decay=0.0)
+    runtime = _RecordingPathCTrainingRuntime()
+
+    with pytest.raises(ValueError, match="Path C training runtime requires compile=False"):
+        CompiledPretrainingStep(
+            model,
+            optimizer,
+            compile=True,
+            path_c_training_runtime=runtime,
+        )
+
+    step = CompiledPretrainingStep(model, optimizer, compile=True)
+    with pytest.raises(ValueError, match="Path C training runtime requires compile=False"):
+        step.attach_path_c_training_runtime(runtime)
+
+
+def test_path_c_training_runtime_rejects_missing_value_and_grad() -> None:
+    model = TinyLM(_tiny_config())
+    optimizer = optim.AdamW(learning_rate=1e-2, weight_decay=0.0)
+
+    with pytest.raises(TypeError, match="must define value_and_grad"):
+        CompiledPretrainingStep(
+            model,
+            optimizer,
+            compile=False,
+            path_c_training_runtime=object(),
+        )
+
+
+def test_path_c_training_runtime_rejects_missing_direct_value_and_grad_contract() -> None:
+    model = TinyLM(_tiny_config())
+    optimizer = optim.AdamW(learning_rate=1e-2, weight_decay=0.0)
+
+    with pytest.raises(ValueError, match="value_and_grad_contract"):
+        CompiledPretrainingStep(
+            model,
+            optimizer,
+            compile=False,
+            path_c_training_runtime=_RecordingPathCTrainingRuntime(),
+        )
+
+
+def test_path_c_training_runtime_rejects_contract_without_loss_bridge() -> None:
+    model = TinyLM(_tiny_config())
+    optimizer = optim.AdamW(learning_rate=1e-2, weight_decay=0.0)
+
+    with pytest.raises(ValueError, match="value_and_grad_contract"):
+        CompiledPretrainingStep(
+            model,
+            optimizer,
+            compile=False,
+            path_c_training_runtime=_NoLossBridgePathCTrainingRuntime(),
+        )
 
 
 @pytest.mark.parametrize("grad_accum_steps", [True, "1", 0])

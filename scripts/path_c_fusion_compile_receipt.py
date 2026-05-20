@@ -43,6 +43,7 @@ from cppmega_mlx.runtime.path_c_fusion_schedules import (  # noqa: E402
     make_path_c_descriptor_schedule_template,
     path_c_fusion_schedule_spec,
     plan_path_c_direct_fusion_chain_for_region,
+    plan_path_c_direct_fusion_chains_for_model,
     select_path_c_fusion_schedule_target,
 )
 from cppmega_mlx.runtime.path_c_physical_abi import (  # noqa: E402
@@ -532,10 +533,11 @@ def _runtime_execution_contract(
         )
 
     status = "runtime_ready" if not blockers else "compile_only_not_runtime_ready"
+    runtime_route_uses_fused_region = status == "runtime_ready"
     return {
         "status": status,
         "single_entry_tilelang_ir": bool(generated_source.strip()),
-        "runtime_route_uses_fused_region": False,
+        "runtime_route_uses_fused_region": runtime_route_uses_fused_region,
         "kernel_parameter_count": kernel_parameter_count,
         "metal_buffer_limit": METAL_KERNEL_BUFFER_LIMIT,
         "metal_buffer_limit_exceeded": metal_buffer_limit_exceeded,
@@ -564,12 +566,35 @@ def _runtime_execution_contract(
     }
 
 
+def _production_runtime_smoke_binding(
+    *,
+    runtime_smoke_payload: Mapping[str, Any],
+    region_name: str,
+) -> Mapping[str, Any] | None:
+    """Return production smoke binding evidence for the selected fused region."""
+
+    if runtime_smoke_payload.get("status") != "ok":
+        return None
+    if runtime_smoke_payload.get("mode") != "production_1b":
+        return None
+    if runtime_smoke_payload.get("region_name") != region_name:
+        return None
+    binding = runtime_smoke_payload.get("physical_abi_runtime_binding")
+    if not isinstance(binding, Mapping):
+        return None
+    if binding.get("status") != "ok":
+        return None
+    return binding
+
+
 def _direct_logical_abi_alternative_payload(
     *,
     region: Any,
     target: Any,
     target_name: str,
     shape_env: Any,
+    model: Any | None = None,
+    selected_forward_region: Any | None = None,
 ) -> dict[str, Any]:
     """Describe the no-pack direct logical-buffer ABI alternative."""
 
@@ -612,10 +637,10 @@ def _direct_logical_abi_alternative_payload(
             target_name == "metal"
             and kernel_parameter_count > METAL_KERNEL_BUFFER_LIMIT
         )
-        chained_plan = plan_path_c_direct_fusion_chain_for_region(
-            region,
-            include_backward=False,
-            max_kernel_buffers=METAL_KERNEL_BUFFER_LIMIT,
+        chained_plan, chained_construction = _direct_chain_for_selected_region(
+            model=model,
+            selected_region=selected_forward_region or region,
+            already_has_backward=selected_forward_region is None,
         )
         status = (
             "blocked_metal_buffer_limit"
@@ -650,6 +675,7 @@ def _direct_logical_abi_alternative_payload(
             "direct_chained_fusion_plan": _direct_chained_fusion_plan_payload(
                 chained_plan
             ),
+            "direct_chained_fusion_construction": chained_construction,
             "next_codegen_steps": [
                 "route runtime through direct-buffer chained fused segments to stay under Metal limits without dtype-bank packing",
                 "compile and call each chained segment with caller-owned logical tensor buffers",
@@ -720,9 +746,79 @@ def _direct_chained_fusion_plan_payload(chain: Any) -> dict[str, Any]:
     }
 
 
+def _select_path_c_direct_chain_for_region(
+    chains: tuple[Any, ...],
+    selected_region: Any,
+) -> Any | None:
+    if not chains:
+        return None
+    selected_name = str(getattr(selected_region, "name", ""))
+    for chain in chains:
+        source_region = getattr(chain, "source_region", None)
+        if str(getattr(source_region, "name", "")) == selected_name:
+            return chain
+    return max(
+        chains,
+        key=lambda chain: (
+            len(getattr(getattr(chain, "source_region", None), "nodes", ())),
+            len(getattr(getattr(chain, "source_region", None), "edges", ())),
+            str(getattr(getattr(chain, "source_region", None), "name", "")),
+        ),
+    )
+
+
+def _direct_chain_for_selected_region(
+    *,
+    model: Any | None,
+    selected_region: Any,
+    already_has_backward: bool,
+) -> tuple[Any, dict[str, Any]]:
+    if model is not None:
+        region_prefix = str(
+            getattr(model, "path_c_region_prefix", None)
+            or f"{getattr(model, 'name', 'model')}_path_c"
+        )
+        chains = plan_path_c_direct_fusion_chains_for_model(
+            model,
+            region_prefix=region_prefix,
+            include_backward=True,
+            max_kernel_buffers=METAL_KERNEL_BUFFER_LIMIT,
+        )
+        chain = _select_path_c_direct_chain_for_region(chains, selected_region)
+        if chain is None:
+            raise RuntimeError("selected model did not produce any direct Path C chain")
+        return chain, {
+            "planner": "plan_path_c_direct_fusion_chains_for_model",
+            "region_prefix": region_prefix,
+            "candidate_chain_count": len(chains),
+            "selected_source_region": getattr(
+                getattr(chain, "source_region", None),
+                "name",
+                None,
+            ),
+        }
+    chain = plan_path_c_direct_fusion_chain_for_region(
+        selected_region,
+        include_backward=not already_has_backward,
+        max_kernel_buffers=METAL_KERNEL_BUFFER_LIMIT,
+    )
+    return chain, {
+        "planner": "plan_path_c_direct_fusion_chain_for_region",
+        "region_prefix": None,
+        "candidate_chain_count": 1,
+        "selected_source_region": getattr(
+            getattr(chain, "source_region", None),
+            "name",
+            None,
+        ),
+    }
+
+
 def _native_compile_direct_chain_payload(
     *,
-    region: Any,
+    model: Any | None,
+    selected_region: Any,
+    already_has_backward: bool,
     native_compile: bool,
     native_lowerer: Callable[..., Any] | None,
     target_name: str,
@@ -739,10 +835,10 @@ def _native_compile_direct_chain_payload(
             "reason": "no native lowerer was configured",
         }
 
-    chain = plan_path_c_direct_fusion_chain_for_region(
-        region,
-        include_backward=False,
-        max_kernel_buffers=METAL_KERNEL_BUFFER_LIMIT,
+    chain, construction = _direct_chain_for_selected_region(
+        model=model,
+        selected_region=selected_region,
+        already_has_backward=already_has_backward,
     )
     segment_payloads: list[dict[str, Any]] = []
     for segment in chain.segments:
@@ -807,6 +903,7 @@ def _native_compile_direct_chain_payload(
         "native_compile_requested": True,
         "target": target_name,
         "chain_status": chain.status,
+        "construction": construction,
         "segment_count": len(segment_payloads),
         "covers_full_region": _direct_chained_fusion_plan_payload(chain)[
             "covers_full_region"
@@ -815,16 +912,24 @@ def _native_compile_direct_chain_payload(
     }
 
 
-def _selected_region_and_target() -> tuple[Any, Any, Any, Any]:
+def _local_gb10_model_descriptor() -> tuple[Any, Any]:
     profile = local_gb10_quarter_profile()
     model = SimpleNamespace(
         name=profile.name,
+        path_c_profile_name=profile.name,
+        path_c_input_model_name=f"{profile.name}.path_c_bricks",
+        path_c_region_prefix=f"{profile.name}_path_c",
         path_c_bricks=profile.path_c_bricks,
         config=profile.hybrid_config(),
     )
+    return profile, model
+
+
+def _selected_region_and_target() -> tuple[Any, Any, Any, Any, Any]:
+    profile, model = _local_gb10_model_descriptor()
     regions = build_path_c_model_regions_from_model(
         model,
-        region_prefix=f"{profile.name}_path_c",
+        region_prefix=model.path_c_region_prefix,
         include_backward=False,
     )
     if not regions:
@@ -839,7 +944,7 @@ def _selected_region_and_target() -> tuple[Any, Any, Any, Any]:
         raise RuntimeError(
             "selected Path C fusion region did not resolve to a schedule target"
         )
-    return profile, fwd_region, region, target
+    return profile, model, fwd_region, region, target
 
 
 def _kernel_parameter_count(prim_func: Any) -> int:
@@ -925,7 +1030,9 @@ def _tiny_runtime_smoke_region_and_target() -> tuple[Any, Any]:
 
 def _runtime_smoke_region_and_target(mode: str) -> tuple[Any, Any]:
     if mode == "production":
-        _profile, _fwd_region, region, target = _selected_region_and_target()
+        _profile, _model, _fwd_region, region, target = (
+            _selected_region_and_target()
+        )
         return region, target
     return _tiny_runtime_smoke_region_and_target()
 
@@ -1180,12 +1287,13 @@ def build_compile_receipt(
     target_name: str = "metal",
     execution_backend: str = "tvm_ffi",
     lowerer: Callable[..., Any] | None = None,
+    tilelang_entry_lowerer: Callable[..., Any] | None = None,
     runtime_smoke: str = "none",
     runtime_smoke_max_bytes: int = 256 * 1024 * 1024,
     runtime_smoke_lowerer: Callable[..., Any] | None = None,
 ) -> tuple[int, dict[str, Any]]:
     started = time.perf_counter()
-    profile, fwd_region, region, target = _selected_region_and_target()
+    profile, model, fwd_region, region, target = _selected_region_and_target()
     prim_func = target.schedule_template(region)
     generated_source = str(
         getattr(prim_func, "_cppmega_path_c_generated_source", "")
@@ -1221,6 +1329,8 @@ def build_compile_receipt(
         target=target,
         target_name=target_name,
         shape_env=getattr(prim_func, "_cppmega_path_c_shape_env", None),
+        model=model,
+        selected_forward_region=fwd_region,
     )
     internal_scratch_abi_buffers = tuple(
         getattr(prim_func, "_cppmega_path_c_internal_scratch_abi_buffers", ())
@@ -1254,9 +1364,10 @@ def build_compile_receipt(
     compiled: FusionCompilePlan | CompiledPathCRegion
     native_lowerer = lowerer
     if native_compile and native_lowerer is None:
+        entry_lowerer = tilelang_entry_lowerer or tilelang_single_entry_lowerer
 
         def native_lowerer(func_or_mod: Any, *, target: str, **kwargs: Any) -> Any:
-            return tilelang_single_entry_lowerer(
+            return entry_lowerer(
                 func_or_mod,
                 target=target,
                 execution_backend=execution_backend,
@@ -1265,7 +1376,9 @@ def build_compile_receipt(
 
     direct_logical_abi_alternative["direct_chained_fusion_native_compile"] = (
         _native_compile_direct_chain_payload(
-            region=region,
+            model=model,
+            selected_region=fwd_region,
+            already_has_backward=False,
             native_compile=native_compile,
             native_lowerer=native_lowerer,
             target_name=target_name,
@@ -1299,6 +1412,25 @@ def build_compile_receipt(
     status = "ok" if (not native_compile or native_compile_ok) else "failed"
     elapsed_s = time.perf_counter() - started
     tilelang_root = _tilelang_root()
+    runtime_smoke_payload = _runtime_smoke_payload(
+        mode=runtime_smoke,
+        target_name=target_name,
+        execution_backend=execution_backend,
+        max_bytes=runtime_smoke_max_bytes,
+        lowerer=runtime_smoke_lowerer,
+    )
+    production_runtime_smoke_binding = _production_runtime_smoke_binding(
+        runtime_smoke_payload=runtime_smoke_payload,
+        region_name=region.name,
+    )
+    runtime_contract_binding = (
+        production_runtime_smoke_binding
+        if production_runtime_smoke_binding is not None
+        else physical_abi_runtime_binding
+    )
+    production_runtime_smoke_uses_fused_train_block = (
+        production_runtime_smoke_binding is not None
+    )
     payload = {
         "kind": "cppmega_path_c_fusion_compile_receipt",
         "schema_version": RECEIPT_SCHEMA_VERSION,
@@ -1372,16 +1504,10 @@ def build_compile_receipt(
             kernel_parameter_count=_kernel_parameter_count(prim_func),
             target_name=target_name,
             physical_abi_runtime_bridge=physical_abi_runtime_bridge,
-            physical_abi_runtime_binding=physical_abi_runtime_binding,
+            physical_abi_runtime_binding=runtime_contract_binding,
         ),
         "direct_logical_abi_alternative": direct_logical_abi_alternative,
-        "runtime_smoke": _runtime_smoke_payload(
-            mode=runtime_smoke,
-            target_name=target_name,
-            execution_backend=execution_backend,
-            max_bytes=runtime_smoke_max_bytes,
-            lowerer=runtime_smoke_lowerer,
-        ),
+        "runtime_smoke": runtime_smoke_payload,
         "default_eligible": bool(
             plan.single_kernel_fused
             and contract is not None
@@ -1440,6 +1566,9 @@ def build_compile_receipt(
             "matrix_measures_current_runtime_route": True,
             "compile_receipt_measures_fused_schedule_compile": True,
             "runtime_uses_fused_train_block": False,
+            "production_runtime_smoke_uses_fused_train_block": (
+                production_runtime_smoke_uses_fused_train_block
+            ),
             "path_c_default_allowed": False,
         },
     }

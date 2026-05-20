@@ -36,6 +36,8 @@ CompileTarget = Literal[
 ]
 F = TypeVar("F", bound=Callable[..., Any])
 PathCGradientProbe = Callable[[Mapping[str, Any]], None]
+PathCTrainingRuntime = Any
+PATH_C_TRAINING_VALUE_AND_GRAD_CONTRACT = "path_c_direct_fusion_value_and_grad_v1"
 
 REGIONAL_COMPILE_TARGETS: Mapping[CompileTarget, bool] = {
     "mamba3_pre": True,
@@ -209,6 +211,7 @@ class CompiledPretrainingStep:
         grad_accum_steps: int = 1,
         split_grad_update_eval: bool = False,
         path_c_gradient_probe: PathCGradientProbe | None = None,
+        path_c_training_runtime: PathCTrainingRuntime | None = None,
     ):
         if not isinstance(compile, bool):
             raise TypeError("compile must be a boolean")
@@ -237,6 +240,9 @@ class CompiledPretrainingStep:
         self._path_c_gradient_probe: PathCGradientProbe | None = None
         if path_c_gradient_probe is not None:
             self.attach_path_c_gradient_probe(path_c_gradient_probe)
+        self._path_c_training_runtime: PathCTrainingRuntime | None = None
+        if path_c_training_runtime is not None:
+            self.attach_path_c_training_runtime(path_c_training_runtime)
 
     def __call__(
         self,
@@ -308,6 +314,50 @@ class CompiledPretrainingStep:
 
         self._path_c_gradient_probe = None
 
+    def attach_path_c_training_runtime(self, runtime: PathCTrainingRuntime) -> None:
+        """Install an explicit runtime that owns eager value-and-grad execution."""
+
+        if self.compile:
+            raise ValueError("Path C training runtime requires compile=False")
+        value_and_grad = getattr(runtime, "value_and_grad", None)
+        if not callable(value_and_grad):
+            raise TypeError("Path C training runtime must define value_and_grad")
+        bind = getattr(runtime, "bind_training_graph", None)
+        bound = False
+        if callable(bind):
+            bind(
+                owner="CompiledPretrainingStep",
+                uses_direct_chain_runtime=True,
+                uses_forward_hook=True,
+                uses_backward_or_vjp_hook=True,
+            )
+            bound = True
+        try:
+            value_and_grad_contract = _path_c_training_runtime_value_and_grad_contract(
+                runtime
+            )
+            if value_and_grad_contract.get("status") != "ok":
+                raise ValueError(
+                    "Path C training runtime value_and_grad_contract is incomplete: "
+                    f"{value_and_grad_contract.get('status')}"
+                )
+        except Exception:
+            if bound:
+                unbind = getattr(runtime, "unbind_training_graph", None)
+                if callable(unbind):
+                    unbind(owner="CompiledPretrainingStep")
+            raise
+        self._path_c_training_runtime = runtime
+
+    def detach_path_c_training_runtime(self) -> None:
+        """Remove the explicit Path C training runtime."""
+
+        runtime = self._path_c_training_runtime
+        unbind = getattr(runtime, "unbind_training_graph", None)
+        if callable(unbind):
+            unbind(owner="CompiledPretrainingStep")
+        self._path_c_training_runtime = None
+
     def state_dict(self) -> dict[str, Any]:
         """Return all Python-side state needed to resume this train-step wrapper."""
 
@@ -317,6 +367,14 @@ class CompiledPretrainingStep:
             "pending_microbatches": self._pending_microbatches,
             "gradient_accumulator_present": self._grad_accum is not None,
             "compiled": self.compile,
+            "path_c_training_runtime_installed": (
+                self._path_c_training_runtime is not None
+            ),
+            "path_c_training_runtime_class": type(
+                self._path_c_training_runtime
+            ).__name__
+            if self._path_c_training_runtime is not None
+            else None,
         }
 
     def load_state_dict(
@@ -428,7 +486,15 @@ class CompiledPretrainingStep:
         do_update: bool,
     ) -> tuple[mx.array, mx.array, Any]:
         loss_batch = cast(Mapping[str, mx.array], batch)
-        (loss, ntokens), grads = self._loss_and_grad(self.model, loss_batch)
+        runtime = self._path_c_training_runtime
+        if runtime is None:
+            (loss, ntokens), grads = self._loss_and_grad(self.model, loss_batch)
+        else:
+            (loss, ntokens), grads = runtime.value_and_grad(
+                self.model,
+                loss_batch,
+                self._loss_and_grad,
+            )
         self._emit_path_c_gradients(grads)
         if self.split_grad_update_eval:
             mx.eval(loss, ntokens, grads)
@@ -483,11 +549,65 @@ def _require_bool(value: Any, *, name: str) -> bool:
     return value
 
 
+def _path_c_training_runtime_value_and_grad_contract(
+    runtime: PathCTrainingRuntime,
+) -> dict[str, Any]:
+    raw_contract = getattr(runtime, "value_and_grad_contract", None)
+    if callable(raw_contract):
+        raw_contract = raw_contract()
+    if not isinstance(raw_contract, Mapping):
+        return {
+            "status": "missing",
+            "contract": PATH_C_TRAINING_VALUE_AND_GRAD_CONTRACT,
+        }
+    payload = dict(raw_contract)
+    contract = str(payload.get("contract", ""))
+    owner = str(payload.get("owner", ""))
+    uses_runtime = bool(payload.get("uses_direct_chain_runtime"))
+    uses_forward = bool(payload.get("uses_forward_hook"))
+    uses_reverse = bool(payload.get("uses_backward_or_vjp_hook"))
+    returns_model_grads = bool(payload.get("returns_model_grads"))
+    loss_cotangent_bridge_ready = bool(payload.get("loss_cotangent_bridge_ready"))
+    model_gradient_tree_ready = bool(payload.get("model_gradient_tree_ready"))
+    delegates_to_eager = bool(payload.get("delegates_to_eager_loss_and_grad", True))
+    hidden_packing = bool(payload.get("hidden_packing_performed", False))
+    status = (
+        "ok"
+        if contract == PATH_C_TRAINING_VALUE_AND_GRAD_CONTRACT
+        and owner == "CompiledPretrainingStep"
+        and uses_runtime
+        and uses_forward
+        and uses_reverse
+        and returns_model_grads
+        and loss_cotangent_bridge_ready
+        and model_gradient_tree_ready
+        and not delegates_to_eager
+        and not hidden_packing
+        else "incomplete"
+    )
+    return {
+        **payload,
+        "status": status,
+        "contract": contract or PATH_C_TRAINING_VALUE_AND_GRAD_CONTRACT,
+        "owner": owner or None,
+        "uses_direct_chain_runtime": uses_runtime,
+        "uses_forward_hook": uses_forward,
+        "uses_backward_or_vjp_hook": uses_reverse,
+        "returns_model_grads": returns_model_grads,
+        "loss_cotangent_bridge_ready": loss_cotangent_bridge_ready,
+        "model_gradient_tree_ready": model_gradient_tree_ready,
+        "delegates_to_eager_loss_and_grad": delegates_to_eager,
+        "hidden_packing_performed": hidden_packing,
+    }
+
+
 __all__ = [
     "CompileTarget",
     "CompiledPretrainingStep",
+    "PATH_C_TRAINING_VALUE_AND_GRAD_CONTRACT",
     "PathCGradientBufferCapture",
     "PathCGradientProbe",
+    "PathCTrainingRuntime",
     "REGIONAL_COMPILE_TARGETS",
     "maybe_compile_region",
     "normalize_compiled_batch",

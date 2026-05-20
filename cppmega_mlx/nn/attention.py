@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import os
 from dataclasses import dataclass
-from typing import Literal, cast
+from typing import Any, Callable, Literal, Mapping, cast
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -13,10 +13,12 @@ import mlx.nn as nn
 from cppmega_mlx._mlx_lm_imports import scaled_dot_product_attention
 from cppmega_mlx.inference.engine import ContiguousKVCache
 from cppmega_mlx.runtime.kernel_policy import KernelPath, record_dispatch, selected_path
+from cppmega_mlx.runtime.path_c_taps import emit_and_tap_path_c_tensor
 
 AttentionMode = Literal["mla", "dsa", "full", "gqa"]
 _DENSE_MODES: frozenset[str] = frozenset({"mla", "full", "gqa"})
 RopeType = Literal["standard", "llama3", "yarn"]
+PathCPreparedProbe = Callable[[Mapping[str, Any]], None]
 SPARSE_MLA_FP8_PRODUCER_OWNER = (
     "cppmega_mlx.nn.attention.CausalSelfAttention.prepare_sparse_mla_fp8"
 )
@@ -566,6 +568,83 @@ class CausalSelfAttention(nn.Module):
             else 1.0
         )
         self.route_info = AttentionRouteInfo(mode=config.mode, backend="mlx.fast.sdpa")
+        self._path_c_prepared_probe_callback: PathCPreparedProbe | None = None
+        self._path_c_prepared_probe_prefix: str | None = None
+
+    def attach_path_c_prepared_probe(
+        self,
+        probe: PathCPreparedProbe,
+        *,
+        logical_prefix: str,
+    ) -> None:
+        """Install an explicit zero-copy prepared-buffer probe."""
+
+        if not callable(probe):
+            raise TypeError("probe must be callable")
+        self._path_c_prepared_probe_callback = probe
+        self._path_c_prepared_probe_prefix = str(logical_prefix)
+
+    def detach_path_c_prepared_probe(self) -> None:
+        """Remove the optional Path C prepared-buffer probe."""
+
+        self._path_c_prepared_probe_callback = None
+        self._path_c_prepared_probe_prefix = None
+
+    def _emit_path_c_prepared_buffer(self, name: str, tensor: mx.array) -> None:
+        probe = self._path_c_prepared_probe_callback
+        prefix = self._path_c_prepared_probe_prefix
+        if probe is None or prefix is None:
+            return
+        probe(
+            {
+                "name": name,
+                "logical_names": (f"{prefix}_qkv_projection_{name}",),
+                "tensor": tensor,
+                "producer_owner": SPARSE_MLA_FP8_PRODUCER_OWNER,
+                "producer_stage": SPARSE_MLA_FP8_PRODUCER_STAGE,
+            }
+        )
+
+    def _emit_path_c_sparse_mla_apply_buffer(
+        self,
+        name: str,
+        tensor: mx.array,
+    ) -> mx.array:
+        probe = self._path_c_prepared_probe_callback
+        prefix = self._path_c_prepared_probe_prefix
+        if probe is None or prefix is None:
+            return tensor
+        return emit_and_tap_path_c_tensor(
+            tensor,
+            probe=probe,
+            event={
+                "name": name,
+                "logical_names": (f"{prefix}_sparse_mla_fp8_apply_{name}",),
+                "producer_owner": SPARSE_MLA_FP8_PRODUCER_OWNER,
+                "producer_stage": "sparse_mla_fp8_apply",
+            },
+            capture_gradient=name == "out",
+        )
+
+    def _path_c_sparse_mla_apply_probe(
+        self,
+    ) -> Callable[[Mapping[str, Any]], None] | None:
+        if (
+            self._path_c_prepared_probe_callback is None
+            or self._path_c_prepared_probe_prefix is None
+        ):
+            return None
+
+        def probe(event: Mapping[str, Any]) -> None:
+            tensor = event.get("tensor")
+            if not isinstance(tensor, mx.array):
+                return
+            self._emit_path_c_sparse_mla_apply_buffer(
+                str(event.get("name", "")),
+                tensor,
+            )
+
+        return probe
 
     def _rotary_tables(self, seq_len: int, offset: int) -> tuple[mx.array, mx.array]:
         if self.rope_inv_freq is None:
@@ -702,6 +781,11 @@ class CausalSelfAttention(nn.Module):
             and rope_offset == 0
             and (key_length is None or key_length == seq)
         )
+        self._emit_path_c_prepared_buffer("q_fp8", q_fp8)
+        self._emit_path_c_prepared_buffer("q_scale", q_scale)
+        self._emit_path_c_prepared_buffer("kv_fp8", kv_fp8)
+        self._emit_path_c_prepared_buffer("kv_scale", kv_scale)
+        self._emit_path_c_prepared_buffer("indices", indices)
         return SparseMLAFp8Prepared(
             q_fp8=q_fp8,
             q_scale=q_scale,
@@ -748,6 +832,7 @@ class CausalSelfAttention(nn.Module):
                 force_path_c=True,
                 causal=prepared.causal,
                 output_dtype=prepared.q.dtype,
+                runtime_buffer_probe=self._path_c_sparse_mla_apply_probe(),
             )
         else:
             out = sparse_mla_fp8_path_c_apply(
@@ -760,6 +845,7 @@ class CausalSelfAttention(nn.Module):
                 d_v=prepared.d_v,
                 sinks=sinks,
                 force_path_c=True,
+                runtime_buffer_probe=self._path_c_sparse_mla_apply_probe(),
             )
         if out is None:
             raise RuntimeError(
@@ -771,6 +857,7 @@ class CausalSelfAttention(nn.Module):
         # out_proj consumes the Path C output directly; do not stage a
         # full-tensor dtype cast at this boundary.
         out = out.reshape(output_shape)
+        out = self._emit_path_c_sparse_mla_apply_buffer("out", out)
         return self.out_proj(out)
 
     def _prepare_sparse_mla_float_baseline(

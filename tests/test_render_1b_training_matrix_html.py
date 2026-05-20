@@ -409,6 +409,7 @@ def test_compile_receipt_blocks_speed_only_rows_from_default_label(
         },
         "reporting_contract": {
             "runtime_uses_fused_train_block": False,
+            "production_runtime_smoke_uses_fused_train_block": True,
             "path_c_default_allowed": False,
         },
     }
@@ -435,5 +436,6 @@ def test_compile_receipt_blocks_speed_only_rows_from_default_label(
     text = out.read_text(encoding="utf-8")
     assert "Path C speed candidate" in text
     assert "Path C default candidate" not in text
-    assert "runtime fused train block is False" in text
+    assert "train-step runtime fused train block is False" in text
+    assert "production smoke fused block is True" in text
     assert "--mamba3-bwd path_c" in text

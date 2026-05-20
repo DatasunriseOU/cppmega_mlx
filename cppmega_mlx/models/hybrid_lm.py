@@ -39,8 +39,9 @@ from cppmega_mlx.nn.moe import ActivationName, MoEConfig, ReferenceMoE
 from cppmega_mlx.nn.ngram_hash import NgramHashEmbedding
 from cppmega_mlx.nn.structure_embedding import CppMegaStructureEmbedding
 from cppmega_mlx.recipes.pattern import ExpandedNamPattern, NamLayer, expand_nam_pattern
-from cppmega_mlx.runtime.path_c_physical_abi import PathCLogicalBufferOwner
 from cppmega_mlx.runtime.kernel_policy import KernelPath, selected_path
+from cppmega_mlx.runtime.path_c_physical_abi import PathCLogicalBufferOwner
+from cppmega_mlx.runtime.path_c_taps import emit_and_tap_path_c_tensor
 from cppmega_mlx.training.mtp import MinimalMTPHead, MTPLossConfig
 
 if TYPE_CHECKING:
@@ -88,8 +89,10 @@ class PathCActivationBufferCapture:
         aliases: Mapping[str, str | Sequence[str]] | None = None,
         *,
         owner_name: str = "HybridTinyLM.path_c_activation_capture",
+        capture_gradients: bool = True,
     ) -> None:
         self.owner_name = owner_name
+        self.capture_gradients = capture_gradients
         self.aliases = {
             str(source): (str(target),)
             if isinstance(target, str)
@@ -106,7 +109,13 @@ class PathCActivationBufferCapture:
         logical_names = tuple(str(name) for name in event.get("logical_names", ()))
         for name in logical_names:
             self.buffers[name] = tensor
-            for alias in self.aliases.get(name, ()):
+            aliases = list(self.aliases.get(name, ()))
+            if name.endswith("_grad"):
+                aliases.extend(
+                    f"{alias}_grad"
+                    for alias in self.aliases.get(name[: -len("_grad")], ())
+                )
+            for alias in aliases:
                 self.buffers[alias] = tensor
         self.events.append(event)
 
@@ -507,22 +516,23 @@ class HybridTinyBlock(nn.Module):
             return (f"{brick_name}_hidden_after",)
         return (f"{brick_name}_{name}",)
 
-    def _emit_path_c_activation(self, name: str, tensor: mx.array) -> None:
+    def _emit_path_c_activation(self, name: str, tensor: mx.array) -> mx.array:
         probe = self._path_c_activation_probe()
         if probe is None:
-            return
-        probe(
-            {
+            return tensor
+        return emit_and_tap_path_c_tensor(
+            tensor,
+            probe=probe,
+            event={
                 "name": name,
                 "logical_names": self._path_c_activation_logical_names(name),
-                "tensor": tensor,
                 "layer_number": self.layer.number,
                 "layer_index": self.path_c_layer_index,
                 "route_symbol": self.layer.symbol,
                 "backend": self.backend,
                 "brick_name": self.path_c_brick_name,
                 "profile_brick_name": getattr(self, "path_c_profile_brick_name", None),
-            }
+            },
         )
 
     @property
@@ -560,7 +570,7 @@ class HybridTinyBlock(nn.Module):
     ) -> mx.array:
         self.validate_backend()
         residual = hidden_states
-        self._emit_path_c_activation("hidden", residual)
+        residual = self._emit_path_c_activation("hidden", residual)
         delta = self.route_delta(
             hidden_states,
             mask,
@@ -568,9 +578,9 @@ class HybridTinyBlock(nn.Module):
             attention_layer_idx=attention_layer_idx,
             doc_ids=doc_ids,
         )
-        self._emit_path_c_activation("delta", delta)
+        delta = self._emit_path_c_activation("delta", delta)
         updated = residual + delta
-        self._emit_path_c_activation("hidden_after", updated)
+        updated = self._emit_path_c_activation("hidden_after", updated)
         if self.mhc is not None:
             return self.mhc([updated, residual])
         return updated
@@ -628,7 +638,7 @@ class HybridTinyBlock(nn.Module):
         if kv_cache is not None and self.backend != "attention":
             raise ValueError("kv_cache may only be passed to attention route blocks")
         x = self.norm(hidden_states)
-        self._emit_path_c_activation("normed", x)
+        x = self._emit_path_c_activation("normed", x)
         if self.backend == "attention":
             delta = cast(CausalSelfAttention, self.block)(
                 x,
@@ -637,16 +647,33 @@ class HybridTinyBlock(nn.Module):
                 layer_idx=attention_layer_idx,
             )
         elif self.backend == "mamba3":
-            delta, _ = cast(Mamba3ReferenceBlock, self.block)(x)
+            mamba3 = cast(Mamba3ReferenceBlock, self.block)
+            probe = self._path_c_activation_probe()
+            if probe is not None:
+                h0 = mamba3.initial_h0(x.shape[0], x.dtype)
+                h0 = self._emit_path_c_activation("mamba3_h0", h0)
+                h0 = self._emit_path_c_activation("state_in", h0)
+                delta, state = mamba3(x, h0=h0)
+                self._emit_path_c_activation("state", state)
+            else:
+                delta, _ = mamba3(x)
         elif self.backend == "moe":
             delta = cast(ReferenceMoE, self.block)(x).output
         elif self.backend == "m2rnn":
             m2rnn = cast(M2RNNMixer, self.block)
-            if selected_path("m2rnn") is KernelPath.PATH_C:
-                delta, _ = m2rnn(
+            use_explicit_state = (
+                selected_path("m2rnn") is KernelPath.PATH_C
+                or self._path_c_activation_probe() is not None
+            )
+            if use_explicit_state:
+                h0 = m2rnn.initial_h0(x.shape[0], x.dtype)
+                h0 = self._emit_path_c_activation("m2rnn_h0", h0)
+                delta, state = m2rnn(
                     x,
-                    h0=m2rnn.initial_h0(x.shape[0], x.dtype),
+                    h0=h0,
+                    return_state=True,
                 )
+                self._emit_path_c_activation("m2rnn_conv_state", state.conv_state)
             else:
                 delta, _ = m2rnn(x)
         elif self.backend == "engram":
@@ -744,6 +771,20 @@ class HybridTinyLM(nn.Module):
             raise TypeError("probe must be callable")
         for block in self.layers:
             block._path_c_activation_probe_callback = probe  # type: ignore[attr-defined]
+            attention = block.attention_block
+            if attention is not None and callable(
+                getattr(attention, "attach_path_c_prepared_probe", None)
+            ):
+                attention.attach_path_c_prepared_probe(
+                    probe,
+                    logical_prefix=str(
+                        getattr(
+                            block,
+                            "path_c_profile_brick_name",
+                            block.path_c_brick_name,
+                        )
+                    ),
+                )
         return len(self.layers)
 
     def detach_path_c_activation_probe(self) -> None:
@@ -752,6 +793,11 @@ class HybridTinyLM(nn.Module):
         for block in self.layers:
             if hasattr(block, "_path_c_activation_probe_callback"):
                 delattr(block, "_path_c_activation_probe_callback")
+            attention = block.attention_block
+            if attention is not None and callable(
+                getattr(attention, "detach_path_c_prepared_probe", None)
+            ):
+                attention.detach_path_c_prepared_probe()
 
     def path_c_parameter_logical_aliases(self) -> dict[str, tuple[str, ...]]:
         """Map MLX parameter tree names to Path C logical input names."""

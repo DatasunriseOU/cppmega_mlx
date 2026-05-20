@@ -238,30 +238,39 @@
                             <a href="cppmega_1b_path_matrix_20260520_full_path_c_bwd.csv">CSV</a> ·
                             <a href="cppmega_1b_path_matrix_20260520_full_path_c_bwd.md">Markdown</a></p>
                     </div>
-                    <div class="metric"><span>Current fused schedule compile receipt</span><strong><a
+                    <div class="metric"><span>Default fused schedule compile receipt</span><strong><a
                                 href="path_c_fusion_compile_receipt.json">Compile Receipt
                                 JSON</a></strong>
                         <p>Dynamic model-derived fused schedule compiles natively to a TileLang
-                            <code>JITKernel</code>; schedule contract is <code>verified</code> and the live m04 route now
-                            validates this production receipt by schedule id, verified contract, native compile, and
-                            stable cache-key recompile audit before removing the compile blocker. Factory-built models now
+                            <code>JITKernel</code>; schedule contract is <code>verified</code>, but the default compile
+                            receipt is still a <code>tiny_mra</code> smoke receipt with
+                            <code>runtime_execution_contract.status=compile_only_not_runtime_ready</code>. The live m04
+                            route now rejects that receipt for default promotion and only treats
+                            <a href="path_c_fusion_production_smoke_receipt.json">the separate production-smoke
+                                receipt</a> as compile-verified when schedule id, verified contract, native compile,
+                            <code>runtime_execution_contract.status=runtime_ready</code>,
+                            <code>runtime_smoke.mode=production_1b</code>, and stable cache-key recompile audit all
+                            pass. Factory-built models now
                             identify the route as <code>local_gb10_quarter.path_c_bricks</code> /
                             <code>local_gb10_quarter_path_c_10_12</code>. The runtime hooks accept either an explicit
                             caller/model-owned physical ABI bank owner for the single fused artifact, or caller-owned
                             direct logical buffers for the 4-segment chain. Live m04 still keeps
-                            <code>runtime_uses_fused_train_block=false</code> until one of those executable owner/artifact
-                            sets is attached to the training route. The direct no-pack ABI alternative
+                            <code>runtime_uses_fused_train_block=false</code> until either the single fused artifact is
+                            attached to the training route or the direct-chain sequence replaces the split/eager
+                            train-step critical path. The direct no-pack ABI alternative
                             is also recorded and blocked explicitly: <code>direct_buffers</code> would need 73 Metal
                             kernel buffers against the 31-buffer portable limit. The generic direct-chain planner is
                             now concrete and model-driven: <code>plan_path_c_direct_fusion_chains_for_model(model)</code>
                             discovers regions from <code>path_c_bricks</code>, and
                             <code>direct_chained_fusion_plan.status=ready</code> has 4 contiguous fused
                             segments covering the full fwd+bwd region and each segment at or below 31 buffers; all
-                            4 segments also native-compile to TileLang <code>JITKernel</code>, and the route can select
-                            <code>run_path_c_direct_fusion_chain_route</code> when the segment artifacts and direct buffers
-                            are explicitly bound. The current model-binding audit still blocks live execution because
-                            the chain needs 81 logical buffers: 28 model parameters/constants, 11 forward
-                            activation/prepared buffers, 37 backward gradients, and 5 runtime states. Bias-less
+                            4 segments also native-compile to TileLang <code>JITKernel</code>. Binding the segment
+                            artifacts and direct buffers now proves standalone dispatch only: the training route stays
+                            on <code>run_path_c_split_training_route</code> until an explicit
+                            <code>path_c_direct_fusion_training_runtime_v1</code> object provides callable forward,
+                            backward/vjp, and <code>value_and_grad</code> hooks on the m04 critical path. The current model-binding audit still blocks live execution because
+                            the chain needs 78 logical buffers: 28 model parameters/constants, 11 forward
+                            activation/prepared buffers, 34 backward gradients, and 5 runtime states. Bias-less
                             attention blocks no longer declare nonexistent q/sparse_kv/out_proj bias buffers or
                             bias-gradient outputs in the model-derived ABI. The
                             model now exposes an opt-in zero-copy forward activation probe, a model-owned direct
@@ -270,16 +279,47 @@
                             eager training step exposes an opt-in zero-copy parameter-gradient probe. The generated
                             direct ABI now declares model-owned weight tensors and batch-one activations in their natural MLX shapes, so the
                             model-owner binding audit reports <code>shape_mismatch_count=0</code> for the 25 provided
-                            parameter buffers, and a real captured <code>hidden</code> activation binds without a
-                            reshape/copy. The route can also compose the model owner with additional
-                            runtime logical owners via <code>compose_path_c_logical_buffer_owner()</code> without tensor
-                            packing/casting; the focused regression binds <code>hidden</code> and <code>hidden_grad</code>
-                            through an extra owner and drops the missing logical-buffer count from 56 to 54. Current
-                            audit covers 24 of 37 backward logical gradients from model
-                            parameter grads; the remaining 13 are activation/state/prepared-FP8/placeholder gradients.
-                            The chain still cannot run because activation-gradient, prepared FP8, sparse constants,
-                            runtime-state owners, and callable runtime segment artifacts are not completely bound.</p>
-                        <p><a href="path_c_fusion_compile_source.py">Generated TileLang source</a></p>
+                            parameter buffers. The m04 eager route now installs post-step activation/gradient capture
+                            owners, aliases the captured root <code>hidden</code> tensor into the direct ABI, captures
+                            Sparse-MLA prepared FP8 q/kv buffers plus scales from <code>prepare_sparse_mla_fp8()</code>,
+                            surfaces Sparse-MLA apply runtime scalars, sinks, <code>lse</code>, and reshaped <code>out</code>,
+                            keeps Sparse-MLA apply backward in the dynamic graph, internalizes the q/kv prepared-gradient outputs,
+                            surfaces Mamba3/M2RNN h0 and state tensors through the same zero-copy capture path,
+                            and still avoids reshape/copy. The route can also compose the model owner with additional runtime
+                            logical owners via <code>compose_path_c_logical_buffer_owner()</code> without tensor packing/casting;
+                            the initial capture audit reaches <code>provided_logical_buffer_count=69</code> and drops the missing
+                            logical-buffer count from the model-owner baseline <code>53</code> to <code>9</code>. MLX VJP identity taps now capture
+                            real activation/apply cotangents without copies, including root <code>hidden_grad</code>, M/R
+                            <code>delta_grad</code>/<code>hidden_after_grad</code>, and Sparse-MLA apply <code>out_grad</code>, so the focused ABI
+                            audit reaches <code>provided_logical_buffer_count=75</code> and leaves only 3 h0/state bridge gradients missing.
+                            Those 3 are now bound by an explicit direct-chain workspace owner that allocates only generated-ABI <code>*_grad</code>
+                            output buffers; the generator now keeps <code>state_in_grad</code> on the same state extent as
+                            <code>state_in</code>/<code>mamba3_h0_grad</code> instead of falling back to sequence extent. The focused
+                            logical binding reaches <code>provided_logical_buffer_count=78</code>
+                            and <code>missing_logical_buffer_count=0</code>. A native helper now compiles all 4 direct-chain segments
+                            to callable TileLang <code>JITKernel</code> artifacts, and the focused route binding reaches
+                            <code>runtime_binding.status=ok</code> with those artifacts and direct buffers. Route metadata now exposes
+                            <code>direct_fusion_chain_training_runtime_contract</code> and rejects the old boolean
+                            <code>path_c_direct_fusion_chain_training_critical_path</code> as insufficient evidence. A concrete
+                            <code>PathCDirectFusionChainTrainingRuntime</code> wrapper now validates executable
+                            direct-chain binding and invokes the segment sequence, but route selection still rejects it as
+                            <code>direct_fusion_chain_training_runtime_incomplete</code> until it also owns a real
+                            <code>value_and_grad</code> implementation and a direct-chain value/grad contract that has
+                            both <code>loss_cotangent_bridge_ready=true</code> and
+                            <code>model_gradient_tree_ready=true</code>, without delegating to eager loss/grad. The
+                            runtime now reports that explicit blocker through
+                            <code>value_and_grad_contract.status=incomplete</code> instead of hiding it as a missing
+                            contract. A value-and-grad-capable runtime still needs
+                            <code>CompiledPretrainingStep.attach_path_c_training_runtime()</code> graph binding before it can
+                            count as critical path.
+                            <code>install_path_c_direct_chain_training_runtime_for_model()</code> now attaches that runtime plus its logical
+                            owner/artifacts for explicit post-step profiling probes, and <code>--profile-path-c-direct-chain-runtime</code>
+                            executes the direct-chain sequence after the eager step without marking it as critical path. The chain still is not
+                            used for reported training speed because m04 training executes the split/eager route instead of
+                            dispatching the direct-chain segment sequence.</p>
+                        <p><a href="path_c_fusion_compile_source.py">Generated TileLang source</a> ·
+                            <a href="path_c_fusion_production_smoke_receipt.json">Production smoke receipt</a> ·
+                            <a href="path_c_fusion_production_smoke_source.py">Production smoke source</a></p>
                     </div>
                     <div class="metric"><span>Path C fused train-block goal audit</span><strong><a
                                 href="path_c_fusion_goal_audit_20260520.html">Goal Audit

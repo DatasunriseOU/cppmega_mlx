@@ -622,6 +622,16 @@ class Mamba3ReferenceBlock(nn.Module):
         v_shape = (cfg.nheads, cfg.headdim)
         return (angle_shape, ssm_shape, k_shape, v_shape)
 
+    def initial_h0(self, batch: int, dtype: mx.Dtype) -> mx.array:
+        """Return the zero scan state used when no caller h0 is supplied."""
+
+        _require_positive_int("batch", batch)
+        cfg = self.config
+        return mx.zeros(
+            (batch, cfg.nheads, cfg.headdim, cfg.d_state),
+            dtype=dtype,
+        )
+
     def zero_cache_state(
         self,
         batch: int,
@@ -760,7 +770,7 @@ class Mamba3ReferenceBlock(nn.Module):
         if cache is not None:
             h = cache.ssm
         elif h0 is None:
-            h = mx.zeros((batch, cfg.nheads, cfg.headdim, cfg.d_state), dtype=hidden_states.dtype)
+            h = self.initial_h0(batch, hidden_states.dtype)
         else:
             expected = (batch, cfg.nheads, cfg.headdim, cfg.d_state)
             if h0.shape != expected:

@@ -5,6 +5,12 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+from cppmega_mlx.runtime.path_c_fusion import (
+    FusionCompilePlan,
+    FusionScheduleContractStatus,
+    Z3SyncSpec,
+)
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "path_c_fusion_compile_receipt.py"
@@ -36,6 +42,7 @@ def test_compile_receipt_plans_model_derived_fused_schedule(tmp_path: Path) -> N
         "matrix_measures_current_runtime_route": True,
         "compile_receipt_measures_fused_schedule_compile": True,
         "runtime_uses_fused_train_block": False,
+        "production_runtime_smoke_uses_fused_train_block": False,
         "path_c_default_allowed": False,
     }
     assert payload["schedule_target"]["implementation_kind"] == "production"
@@ -143,6 +150,13 @@ def test_compile_receipt_plans_model_derived_fused_schedule(tmp_path: Path) -> N
     )
     assert direct_alternative["metal_buffer_limit_exceeded"] is True
     chain_plan = direct_alternative["direct_chained_fusion_plan"]
+    chain_construction = direct_alternative["direct_chained_fusion_construction"]
+    assert chain_construction == {
+        "planner": "plan_path_c_direct_fusion_chains_for_model",
+        "region_prefix": "local_gb10_quarter_path_c",
+        "candidate_chain_count": 1,
+        "selected_source_region": "local_gb10_quarter_path_c_10_12",
+    }
     assert chain_plan["status"] == "ready"
     assert chain_plan["covers_full_region"] is True
     assert chain_plan["segment_count"] >= 2
@@ -228,6 +242,12 @@ def test_compile_receipt_records_native_lowerer_artifact(tmp_path: Path) -> None
         "direct_chained_fusion_native_compile"
     ]
     assert chain_compile["status"] == "ok"
+    assert chain_compile["construction"] == {
+        "planner": "plan_path_c_direct_fusion_chains_for_model",
+        "region_prefix": "local_gb10_quarter_path_c",
+        "candidate_chain_count": 1,
+        "selected_source_region": "local_gb10_quarter_path_c_10_12",
+    }
     assert chain_compile["segment_count"] >= 2
     assert all(
         segment["native_compile_ok"]
@@ -240,11 +260,10 @@ def test_compile_receipt_records_native_lowerer_artifact(tmp_path: Path) -> None
 
 def test_compile_receipt_default_lowerer_uses_requested_execution_backend(
     tmp_path: Path,
-    monkeypatch,
 ) -> None:
     captured: dict[str, object] = {}
 
-    def fake_tilelang_lowerer(
+    def fake_tilelang_entry_lowerer(
         func_or_mod: object,
         *,
         target: str,
@@ -257,16 +276,11 @@ def test_compile_receipt_default_lowerer_uses_requested_execution_backend(
         captured["kwargs"] = kwargs
         return SimpleNamespace(name="fake-default-jit-kernel")
 
-    monkeypatch.setattr(
-        path_c_fusion_compile_receipt,
-        "tilelang_single_entry_lowerer",
-        fake_tilelang_lowerer,
-    )
-
     exit_code, payload = path_c_fusion_compile_receipt.build_compile_receipt(
         native_compile=True,
         source_out=tmp_path / "generated.py",
         execution_backend="tvm",
+        tilelang_entry_lowerer=fake_tilelang_entry_lowerer,
     )
 
     assert exit_code == 0
@@ -274,6 +288,58 @@ def test_compile_receipt_default_lowerer_uses_requested_execution_backend(
     assert payload["execution_backend"] == "tvm"
     assert captured["target"] == "metal"
     assert captured["execution_backend"] == "tvm"
+
+
+def test_runtime_execution_contract_accepts_production_smoke_binding() -> None:
+    plan = FusionCompilePlan(
+        region_name="local_gb10_quarter_path_c_10_12",
+        lowering_boundary="tilelang_region",
+        backend="metal",
+        compiler="tilelang",
+        fusion_groups=(),
+        backward_graph="aot",
+        z3_sync=Z3SyncSpec.disabled(),
+        cache_key_parts=("local_gb10_quarter_path_c_10_12",),
+        schedule_name="path_c_descriptor_chain_row_phased",
+        schedule_status="ready",
+        single_kernel_fused=True,
+        schedule_contract=FusionScheduleContractStatus(
+            name="local_gb10_quarter_path_c_10_12",
+            key="local_gb10_quarter_path_c_10_12",
+            status="verified",
+            reason="schedule lowered",
+            op_signature=(),
+            required_internal_buffers=(),
+            required_external_buffers=(),
+            declared_implementation_kind="production",
+            declared_schedule_id="path_c_descriptor_chain_row_phased",
+        ),
+    )
+    contract = path_c_fusion_compile_receipt._runtime_execution_contract(
+        generated_source=(
+            "with T.Kernel(1, threads=256):\n"
+            "    lane = T.get_thread_binding(0)\n"
+            "    for i in T.serial(lane, 16, step=256):\n"
+            "        pass\n"
+        ),
+        schedule_spec=SimpleNamespace(loop_policy="row_phased"),
+        plan=plan,
+        kernel_parameter_count=3,
+        target_name="metal",
+        physical_abi_runtime_bridge={
+            "status": "prepacked_bank_buffers_required",
+        },
+        physical_abi_runtime_binding={
+            "status": "ok",
+            "missing_bank_buffers": [],
+        },
+    )
+
+    assert contract["status"] == "runtime_ready"
+    assert contract["runtime_route_uses_fused_region"] is True
+    assert contract["physical_abi_runtime_binding_status"] == "ok"
+    assert contract["physical_abi_missing_bank_buffers"] == []
+    assert contract["blockers"] == []
 
 
 def test_compile_receipt_can_execute_tiny_banked_abi_runtime_smoke(

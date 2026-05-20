@@ -655,7 +655,7 @@ def _legacy_mamba3_fp8_train_diagnostic_surfaces() -> tuple[FusionKernelSurface,
             op_name="sparse_mla_fp8_apply",
             inputs=("q_fp8", "q_scale", "kv_fp8", "kv_scale", "indices"),
             outputs=("attention_out", "lse"),
-            backward="owner_output",
+            backward="aot_autograd",
         ),
     )
 
@@ -1401,7 +1401,7 @@ def _path_c_acceptance_fixture_surfaces_from_route_symbols(
                 outputs=("attention_out", "lse")
                 if shared_acceptance_abi and attention_count == 1
                 else (f"{apply_name}_out", f"{apply_name}_lse"),
-                backward="owner_output",
+                backward="aot_autograd",
             )
         )
     return tuple(surfaces)
@@ -1556,7 +1556,7 @@ def _emit_attention_model_brick_surfaces(
                 ),
             ),
             outputs=(delta, f"{apply_name}_lse"),
-            backward="owner_output",
+            backward="aot_autograd",
         )
     )
     return _PathCBrickSurfaceLoweringResult(delta_output=delta)
@@ -1661,14 +1661,35 @@ def build_path_c_fusion_region(
     )
 
 
-_NON_DIFFERENTIABLE_FUSION_BUFFERS = frozenset({"indices", "lse", "scan_state"})
+_NON_DIFFERENTIABLE_FUSION_BUFFER_SUFFIXES = frozenset(
+    {
+        "indices",
+        "lse",
+        "scan_state",
+        "sparse_mla_sm_scale",
+        "sparse_mla_sinks",
+        "sparse_mla_has_sinks",
+    }
+)
+
+
+def _is_non_differentiable_fusion_buffer(name: str) -> bool:
+    normalized = str(name)
+    if normalized.endswith("_grad"):
+        normalized = normalized[: -len("_grad")]
+    if normalized.endswith("_state"):
+        return True
+    return any(
+        normalized == suffix or normalized.endswith(f"_{suffix}")
+        for suffix in _NON_DIFFERENTIABLE_FUSION_BUFFER_SUFFIXES
+    )
 
 
 def _differentiable_buffer_names(names: Sequence[str]) -> tuple[str, ...]:
     return tuple(
         name
         for name in names
-        if name not in _NON_DIFFERENTIABLE_FUSION_BUFFERS and not name.endswith("_state")
+        if not _is_non_differentiable_fusion_buffer(name)
     )
 
 
@@ -2387,6 +2408,7 @@ def _tilelang_optimizer_for(
                 node_by_name=node_by_name,
                 workspace_edge_buffers=workspace_edge_buffers,
             ),
+            differentiable=not _is_non_differentiable_fusion_buffer(edge.input),
         )
     return optimizer
 
@@ -2424,7 +2446,7 @@ def _tilelang_edge_lifetime_for(
     consumer = node_by_name[edge.consumer]
     if (
         producer.op_name == "attention_qkv_projection"
-        and consumer.op_name == "sparse_mla_fp8_apply"
+        and consumer.op_name in {"sparse_mla_fp8_apply", "sparse_mla_fp8_apply_bwd"}
         and _canonical_path_c_edge_buffer_name(edge.input)
         in set(workspace_edge_buffers)
     ):
@@ -2562,7 +2584,8 @@ def _region_has_attention_kv_workspace_edges(region: PathCFusionRegion) -> bool:
     node_by_name = {node.name: node for node in region.nodes}
     return any(
         node_by_name[edge.producer].op_name == "attention_qkv_projection"
-        and node_by_name[edge.consumer].op_name == "sparse_mla_fp8_apply"
+        and node_by_name[edge.consumer].op_name
+        in {"sparse_mla_fp8_apply", "sparse_mla_fp8_apply_bwd"}
         and _canonical_path_c_edge_buffer_name(edge.input) in {"kv_fp8", "kv_scale"}
         for edge in region.edges
     )
@@ -3068,7 +3091,8 @@ def _inferred_edge_lifetime(
 ) -> str:
     if (
         producer_node.op_name == "attention_qkv_projection"
-        and consumer_node.op_name == "sparse_mla_fp8_apply"
+        and consumer_node.op_name
+        in {"sparse_mla_fp8_apply", "sparse_mla_fp8_apply_bwd"}
         and _canonical_path_c_edge_buffer_name(buffer_name) in {"kv_fp8", "kv_scale"}
     ):
         return "workspace"

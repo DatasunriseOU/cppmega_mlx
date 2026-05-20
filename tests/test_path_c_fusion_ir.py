@@ -648,6 +648,7 @@ def test_plan_path_c_fusion_schedules_for_model_uses_dynamic_brick_chain() -> No
         "residual_rmsnorm",
         "attention_qkv_projection",
         "sparse_mla_fp8_apply",
+        "sparse_mla_fp8_apply_bwd",
         "attention_qkv_projection_bwd",
         "residual_rmsnorm_bwd",
         "m2rnn_bwd",
@@ -908,6 +909,7 @@ def test_mamba3_fp8_template_has_expected_train_block_pattern() -> None:
         "route_1_R_bwd",
         "route_1_R_residual_norm_bwd",
         "route_2_A_qkv_projection_bwd",
+        "route_2_A_sparse_mla_fp8_apply_bwd",
     )
     assert plan.semantic_blockers == ()
     assert plan.schedule_contract is not None
@@ -1009,6 +1011,7 @@ def test_mamba3_fp8_acceptance_fixture_region_includes_residual_norm_and_attenti
         "m2rnn_packed_post_bwd",
         "m2rnn_residual_to_attention_norm_bwd",
         "attention_qkv_projection_bwd",
+        "sparse_mla_fp8_apply_bwd",
     )
 
 
@@ -1016,7 +1019,8 @@ def test_mamba3_fp8_acceptance_fixture_region_can_include_symbolic_aot_backward_
     region = build_mamba3_fp8_train_acceptance_fixture_region(include_backward=True)
     plan = compile_path_c_region(region)
 
-    assert region.node_names[-5:] == (
+    assert region.node_names[-6:] == (
+        "sparse_mla_fp8_apply_bwd",
         "attention_qkv_projection_bwd",
         "m2rnn_residual_to_attention_norm_bwd",
         "m2rnn_packed_post_bwd",
@@ -1026,6 +1030,7 @@ def test_mamba3_fp8_acceptance_fixture_region_can_include_symbolic_aot_backward_
     assert plan.autograd_status == "ready"
     assert plan.autograd_missing_backward_nodes == ()
     assert plan.autograd_backward_nodes == (
+        "sparse_mla_fp8_apply_bwd",
         "attention_qkv_projection_bwd",
         "m2rnn_residual_to_attention_norm_bwd",
         "m2rnn_packed_post_bwd",
@@ -1033,6 +1038,26 @@ def test_mamba3_fp8_acceptance_fixture_region_can_include_symbolic_aot_backward_
         "mamba3_scan_bwd",
     )
     assert plan.autograd_backward_edges == (
+        (
+            "sparse_mla_fp8_apply_bwd",
+            "attention_qkv_projection_bwd",
+            "kv_scale_grad",
+        ),
+        (
+            "sparse_mla_fp8_apply_bwd",
+            "attention_qkv_projection_bwd",
+            "kv_fp8_grad",
+        ),
+        (
+            "sparse_mla_fp8_apply_bwd",
+            "attention_qkv_projection_bwd",
+            "q_scale_grad",
+        ),
+        (
+            "sparse_mla_fp8_apply_bwd",
+            "attention_qkv_projection_bwd",
+            "q_fp8_grad",
+        ),
         (
             "attention_qkv_projection_bwd",
             "m2rnn_residual_to_attention_norm_bwd",
@@ -1065,6 +1090,27 @@ def test_mamba3_fp8_train_backward_surfaces_receive_forward_real_abi_inputs() ->
     region = build_mamba3_fp8_train_acceptance_fixture_region(include_backward=True)
     node_by_name = {node.name: node for node in region.nodes}
 
+    assert node_by_name["sparse_mla_fp8_apply_bwd"].inputs == (
+        "attention_out_grad",
+        "q_fp8",
+        "q_scale",
+        "kv_fp8",
+        "kv_scale",
+        "indices",
+        "sparse_mla_sm_scale",
+        "sparse_mla_sinks",
+        "sparse_mla_has_sinks",
+        "attention_out_proj_weight",
+        "attention_out_proj_bias",
+    )
+    assert node_by_name["sparse_mla_fp8_apply_bwd"].outputs == (
+        "q_fp8_grad",
+        "q_scale_grad",
+        "kv_fp8_grad",
+        "kv_scale_grad",
+        "attention_out_proj_weight_grad",
+        "attention_out_proj_bias_grad",
+    )
     assert node_by_name["attention_qkv_projection_bwd"].inputs == (
         "q_fp8_grad",
         "q_scale_grad",
@@ -1835,7 +1881,7 @@ def test_mamba3_fp8_train_descriptor_schedule_uses_row_local_internal_arrays_wit
     assert "kv_scale = T.alloc_local" not in generated_source
     assert prim_func._cppmega_path_c_physical_abi_policy == "banked_by_dtype"
     assert (
-        'path_c_uint8_abi_bank: T.Buffer((44040192,), "uint8"),'
+        f'path_c_uint8_abi_bank: T.Buffer(({kv_history_extent},), "uint8"),'
         in generated_source
     )
     assert (
@@ -3116,9 +3162,45 @@ def test_direct_fusion_chain_splits_model_route_under_metal_buffer_limit() -> No
         shape_env.mamba_conv_kernel,
         1,
     )
+    mamba3_state_shape = (
+        shape_env.mamba_num_heads
+        * shape_env.mamba_head_dim
+        * shape_env.mamba_state_dim,
+    )
+    assert abi_shapes["local_gb10_quarter_brick_10_M_state_in"] == (
+        mamba3_state_shape
+    )
+    assert abi_shapes["local_gb10_quarter_brick_10_M_state_in_grad"] == (
+        mamba3_state_shape
+    )
+    assert abi_shapes["local_gb10_quarter_brick_10_M_mamba3_h0_grad"] == (
+        mamba3_state_shape
+    )
     assert abi_shapes[
         "local_gb10_quarter_brick_10_M_residual_norm_weight"
     ] == (shape_env.hidden_size,)
+
+
+def test_row_phased_acceptance_fwd_bwd_template_generates_valid_source() -> None:
+    region = build_mamba3_fp8_train_acceptance_fixture_region(include_backward=True)
+    descriptors = (
+        default_path_c_brick_schedule_descriptor_registry()
+        .descriptors_for_signature(tuple(node.op_name for node in region.nodes))
+    )
+
+    assert descriptors is not None
+
+    prim_func = build_path_c_descriptor_prim_func(
+        region,
+        descriptors,
+        entry_symbol="mamba3_acceptance_row_phased_source_regression",
+        internal_buffer_policy=DESCRIPTOR_INTERNAL_BUFFER_POLICY_ROW_LOCAL_HIDDEN,
+        loop_policy=DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN,
+    )
+
+    generated_source = prim_func._cppmega_path_c_generated_source
+    assert "# backward_policy: flat_after_row_phased_forward" in generated_source
+    assert "attention_qkv_projection_bwd_attention_q_grad" in generated_source
 
 
 @pytest.mark.skipif(
