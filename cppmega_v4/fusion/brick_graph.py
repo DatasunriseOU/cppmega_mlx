@@ -116,36 +116,79 @@ def from_block_specs(
 ) -> BrickGraph:
     """Build a BrickGraph from a list of block specs.
 
-    Each spec:
-        {"kind": "<BLOCK_BUILDERS key>", "name": "<unique>", "params": {...}}
+    Each spec is either:
+      - **leaf**: ``{"kind": "<BLOCK_BUILDERS key>", "name": "...", "params": {...}}``
+      - **parallel-block** (GalCov-C): ``{"parallel": [leaf_spec, ...]}`` —
+        all branches receive an edge from the preceding spec AND an edge
+        to the following spec. Use for Tiny Aya-style ``GQA‖MLP`` patterns
+        that BrickGraph DAG already supports but the linear DSL didn't expose.
 
-    Edges are inferred as a linear chain (specs[i] → specs[i+1]).
+    Edges:
+      - leaf → leaf: linear chain (specs[i] → specs[i+1]).
+      - leaf → parallel-block: leaf → every branch's first leaf.
+      - parallel-block → leaf: every branch's last leaf → leaf.
+      - parallel-block → parallel-block: each prev-block branch tail →
+        each next-block branch head (full cross product; conservative
+        but rarely used and easy to override later via explicit edges).
 
     Args:
-        specs: ordered list of brick specs.
+        specs: ordered list of brick specs (leaf or parallel).
         hidden_size: passed to each ``BLOCK_BUILDERS[kind](hidden_size, params)``.
         instantiate: when True, construct each module via BLOCK_BUILDERS.
-            When False, BrickNode.module is None (cheap path for planners
-            that only need kind/params).
     """
     nodes: list[BrickNode] = []
     used_names: set[str] = set()
-    for i, spec in enumerate(specs):
-        kind = spec["kind"]
-        name = spec.get("name") or f"{kind}_{i}"
+    # Per-spec entry: tuple (head_names, tail_names) — used to wire edges
+    # between adjacent specs (parallel-block heads/tails may be multi-valued).
+    spec_endpoints: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
+    spec_counter = 0
+
+    def _emit_leaf(leaf_spec: dict) -> BrickNode:
+        nonlocal spec_counter
+        kind = leaf_spec["kind"]
+        name = leaf_spec.get("name") or f"{kind}_{spec_counter}"
+        spec_counter += 1
         if name in used_names:
-            raise ValueError(f"duplicate name {name!r} in specs[{i}]")
+            raise ValueError(f"duplicate name {name!r} in specs")
         used_names.add(name)
-        params = dict(spec.get("params") or {})
+        params = dict(leaf_spec.get("params") or {})
         module = (
             BLOCK_BUILDERS[kind](hidden_size, params) if instantiate else None
         )
-        nodes.append(BrickNode(kind=kind, name=name, params=params, module=module))
+        node = BrickNode(kind=kind, name=name, params=params, module=module)
+        nodes.append(node)
+        return node
 
-    edges = tuple(
-        (nodes[i].name, nodes[i + 1].name) for i in range(len(nodes) - 1)
-    )
-    return BrickGraph(nodes=tuple(nodes), edges=edges)
+    for spec in specs:
+        if "parallel" in spec:
+            branches = spec["parallel"]
+            if not branches:
+                raise ValueError("parallel-block spec must have ≥1 branch")
+            heads: list[str] = []
+            tails: list[str] = []
+            for branch in branches:
+                if not isinstance(branch, dict) or "kind" not in branch:
+                    raise ValueError(
+                        "parallel-block branches must be leaf-specs "
+                        "{'kind': ..., 'name': ..., 'params': ...}"
+                    )
+                node = _emit_leaf(branch)
+                heads.append(node.name)
+                tails.append(node.name)
+            spec_endpoints.append((tuple(heads), tuple(tails)))
+        else:
+            node = _emit_leaf(spec)
+            spec_endpoints.append(((node.name,), (node.name,)))
+
+    edges: list[tuple[str, str]] = []
+    for i in range(len(spec_endpoints) - 1):
+        _, prev_tails = spec_endpoints[i]
+        next_heads, _ = spec_endpoints[i + 1]
+        for t in prev_tails:
+            for h in next_heads:
+                edges.append((t, h))
+
+    return BrickGraph(nodes=tuple(nodes), edges=tuple(edges))
 
 
 # ---------------------------------------------------------------------------

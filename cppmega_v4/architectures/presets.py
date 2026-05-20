@@ -384,6 +384,32 @@ PRESETS: dict[str, Callable[[int], list[dict[str, Any]]]] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# GalCov-C — parallel-block showcase specs (not in PRESETS to keep all
+# parametrized tests linear-only; consumed directly via from_block_specs).
+# ---------------------------------------------------------------------------
+
+
+def tiny_aya_parallel_specs(hidden_size: int) -> list[dict[str, Any]]:
+    """Tiny Aya-style parallel GQA + MLP between pre and post bricks.
+
+    Demonstrates the GalCov-C parallel-block DSL. See gallery entry #44.
+    """
+    return [
+        {"kind": "attention", "name": "tap_pre",
+         "params": _attn_params(hidden_size)},
+        {"parallel": [
+            {"kind": "gated_attention", "name": "tap_gqa",
+             "params": {"num_attention_heads": max(8, hidden_size // 64),
+                        "num_key_value_heads": max(2, hidden_size // 64 // 8),
+                        "head_dim": 64}},
+            {"kind": "mlp", "name": "tap_mlp"},
+        ]},
+        {"kind": "moe", "name": "tap_moe",
+         "params": {"num_experts": 4, "top_k": 2}},
+    ]
+
+
 def available_presets() -> list[str]:
     return sorted(PRESETS.keys())
 
