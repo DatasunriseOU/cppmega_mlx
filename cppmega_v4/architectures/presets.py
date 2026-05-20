@@ -190,11 +190,130 @@ def _arcee_trinity(hidden_size: int) -> list[dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# Gallery coverage additions — composition-only, no new bricks
+# ---------------------------------------------------------------------------
+
+
+def _attn_params(hidden_size: int) -> dict[str, Any]:
+    """Generic dense GQA attention params keyed off hidden_size."""
+    return {"num_heads": max(2, hidden_size // 32), "head_dim": 64}
+
+
+def _llama_like(name_prefix: str, depth: int = 1) -> Callable[[int], list[dict[str, Any]]]:
+    """LLaMA-style dense decoder repeat-unit (attention + mlp).
+
+    Used for llama3 family, mistral_small_3_1, nanbeige_4_1, phi4,
+    granite_4_1, qwen3 dense, gemma3 dense, smollm3, olmo family.
+    """
+    def _factory(hidden_size: int) -> list[dict[str, Any]]:
+        units: list[dict[str, Any]] = []
+        for i in range(depth):
+            suffix = f"_{i}" if depth > 1 else ""
+            units.append({"kind": "attention", "name": f"{name_prefix}_attn{suffix}",
+                          "params": _attn_params(hidden_size)})
+            units.append({"kind": "mlp", "name": f"{name_prefix}_mlp{suffix}"})
+        return units
+    return _factory
+
+
+def _mixtral_like(name_prefix: str, num_experts: int = 8, top_k: int = 2
+                  ) -> Callable[[int], list[dict[str, Any]]]:
+    """Mixtral-style attention + MoE (Llama4 Maverick, Qwen3 235B/30B-A3B,
+    Grok 2.5, MiMo, Tencent Hy3, etc.)."""
+    def _factory(hidden_size: int) -> list[dict[str, Any]]:
+        return [
+            {"kind": "attention", "name": f"{name_prefix}_attn",
+             "params": _attn_params(hidden_size)},
+            {"kind": "moe", "name": f"{name_prefix}_moe",
+             "params": {"num_experts": num_experts, "top_k": top_k}},
+        ]
+    return _factory
+
+
+def _glm_like(name_prefix: str, num_experts: int = 8, top_k: int = 2
+              ) -> Callable[[int], list[dict[str, Any]]]:
+    """GLM-style attention + MoE + shared MLP (acts as shared expert).
+
+    We model the shared expert as an extra mlp brick after the MoE.
+    GLM-4.5 / GLM-4.7 / Sarvam-30B / GLM-4.5-Air / INTELLECT-3.
+    """
+    def _factory(hidden_size: int) -> list[dict[str, Any]]:
+        return [
+            {"kind": "attention", "name": f"{name_prefix}_attn",
+             "params": _attn_params(hidden_size)},
+            {"kind": "moe", "name": f"{name_prefix}_moe",
+             "params": {"num_experts": num_experts, "top_k": top_k}},
+            {"kind": "mlp", "name": f"{name_prefix}_shared"},
+        ]
+    return _factory
+
+
+def _mla_moe_like(name_prefix: str, num_experts: int = 8, top_k: int = 2
+                  ) -> Callable[[int], list[dict[str, Any]]]:
+    """DeepSeek-style MLA + MoE (GLM-5 / GLM-5.1 / Sarvam-105B)."""
+    def _factory(hidden_size: int) -> list[dict[str, Any]]:
+        return [
+            {"kind": "mla", "name": f"{name_prefix}_mla",
+             "params": _mla_params(hidden_size)},
+            {"kind": "moe", "name": f"{name_prefix}_moe",
+             "params": {"num_experts": num_experts, "top_k": top_k}},
+        ]
+    return _factory
+
+
+def _sliding_global_moe(name_prefix: str, sliding_count: int = 5,
+                        num_experts: int = 8, top_k: int = 2
+                        ) -> Callable[[int], list[dict[str, Any]]]:
+    """Sliding+global+MoE pattern (GPT-OSS / MiniMax M2 / MiMo-V2-Flash /
+    Step-3.5 Flash / Tiny Aya / Ling-2.5 / Laguna XS.2)."""
+    def _factory(hidden_size: int) -> list[dict[str, Any]]:
+        nh = max(8, hidden_size // 64)
+        nkv = max(2, nh // 8)
+        sliding = {"num_attention_heads": nh, "num_key_value_heads": nkv,
+                   "head_dim": 64, "sliding_window_size": 1024}
+        glob = {"num_attention_heads": nh, "num_key_value_heads": nkv,
+                "head_dim": 64}
+        units = [
+            {"kind": "gqa_sliding", "name": f"{name_prefix}_sw_{i}",
+             "params": dict(sliding)} for i in range(sliding_count)
+        ]
+        units.append({"kind": "gated_attention", "name": f"{name_prefix}_glob",
+                      "params": dict(glob)})
+        units.append({"kind": "moe", "name": f"{name_prefix}_moe",
+                      "params": {"num_experts": num_experts, "top_k": top_k}})
+        return units
+    return _factory
+
+
+def _gemma3_dense(name_prefix: str, sliding_count: int = 5
+                  ) -> Callable[[int], list[dict[str, Any]]]:
+    """Gemma 3 / Gemma 4 dense — 5:1 sliding/global GQA + QK-norm + dense
+    MLP. We approximate with gqa_sliding + gated_attention + mlp."""
+    def _factory(hidden_size: int) -> list[dict[str, Any]]:
+        nh = max(8, hidden_size // 64)
+        nkv = max(2, nh // 8)
+        sliding = {"num_attention_heads": nh, "num_key_value_heads": nkv,
+                   "head_dim": 64, "sliding_window_size": 1024}
+        glob = {"num_attention_heads": nh, "num_key_value_heads": nkv,
+                "head_dim": 64}
+        units = [
+            {"kind": "gqa_sliding", "name": f"{name_prefix}_sw_{i}",
+             "params": dict(sliding)} for i in range(sliding_count)
+        ]
+        units.append({"kind": "gated_attention", "name": f"{name_prefix}_glob",
+                      "params": dict(glob)})
+        units.append({"kind": "mlp", "name": f"{name_prefix}_mlp"})
+        return units
+    return _factory
+
+
+# ---------------------------------------------------------------------------
 # Public registry
 # ---------------------------------------------------------------------------
 
 
 PRESETS: dict[str, Callable[[int], list[dict[str, Any]]]] = {
+    # original 12 (shipped earlier)
     "qwen3_next": _qwen3_next,
     "kimi_linear": _kimi_linear,
     "kimi_k2": _kimi_k2,
@@ -207,6 +326,61 @@ PRESETS: dict[str, Callable[[int], list[dict[str, Any]]]] = {
     "nemotron3": _nemotron3,
     "zaya1": _zaya1,
     "arcee_trinity": _arcee_trinity,
+    # ---- LLaMA family (#2, #3, #38) ----
+    "llama3_8b":          _llama_like("llama3_8b"),
+    "llama3_2_1b":        _llama_like("llama3_2_1b"),
+    "llama3_2_3b":        _llama_like("llama3_2_3b"),
+    # ---- OLMo family (#4, #26, #27) — QK-norm semantically; brick params identical ----
+    "olmo2_7b":           _llama_like("olmo2_7b"),
+    "olmo3_7b":           _gemma3_dense("olmo3_7b", sliding_count=3),
+    "olmo3_32b":          _gemma3_dense("olmo3_32b", sliding_count=3),
+    # ---- Mistral / Phi / Granite / Nanbeige dense (#8, #42, #49, #71) ----
+    "mistral_small_3_1":  _llama_like("mistral_small_3_1"),
+    "nanbeige_4_1":       _llama_like("nanbeige_4_1"),
+    "phi4":               _llama_like("phi4"),
+    "granite_4_1":        _llama_like("granite_4_1"),
+    # ---- Qwen3 dense family (#10, #13, #14, #15, #66) ----
+    "qwen3_dense_0_6b":   _llama_like("qwen3_0_6b"),
+    "qwen3_dense_4b":     _llama_like("qwen3_4b"),
+    "qwen3_dense_8b":     _llama_like("qwen3_8b"),
+    "qwen3_dense_32b":    _llama_like("qwen3_32b"),
+    "qwen3_6_27b":        _llama_like("qwen3_6_27b"),
+    # ---- SmolLM3 (#16) — periodic NoPE is a per-layer toggle; modelled as plain attn ----
+    "smollm3":            _llama_like("smollm3"),
+    # ---- Mixtral-style attention + MoE (#9, #11, #12, #22, #39, #43, #56, #67, #68, #70) ----
+    "llama4_maverick":    _mixtral_like("llama4_maverick", num_experts=8, top_k=2),
+    "qwen3_235b_a22b":    _mixtral_like("qwen3_235b", num_experts=8, top_k=2),
+    "qwen3_30b_a3b":      _mixtral_like("qwen3_30b", num_experts=4, top_k=2),
+    "grok25":             _mixtral_like("grok25", num_experts=8, top_k=2),
+    "qwen3_coder_flash":  _mixtral_like("qwen3_coder_flash", num_experts=4, top_k=2),
+    "minimax_m2_5":       _mixtral_like("minimax_m2_5", num_experts=8, top_k=2),
+    "minimax_m2_7":       _mixtral_like("minimax_m2_7", num_experts=8, top_k=2),
+    "mimo_v2_5":          _mixtral_like("mimo_v2_5", num_experts=8, top_k=2),
+    "mimo_v2_5_pro":      _mixtral_like("mimo_v2_5_pro", num_experts=8, top_k=2),
+    "tencent_hy3":        _mixtral_like("tencent_hy3", num_experts=8, top_k=2),
+    # ---- GLM-style (+ shared expert) (#18, #32, #47, #51, #52) ----
+    "glm_45":             _glm_like("glm_45", num_experts=8, top_k=2),
+    "glm_47":             _glm_like("glm_47", num_experts=8, top_k=2),
+    "glm_45_air":         _glm_like("glm_45_air", num_experts=8, top_k=2),
+    "intellect_3":        _glm_like("intellect_3", num_experts=8, top_k=2),
+    "sarvam_30b":         _glm_like("sarvam_30b", num_experts=8, top_k=2),
+    # ---- MLA + MoE DeepSeek-style (#34, #48, #63) ----
+    "glm_5":              _mla_moe_like("glm_5", num_experts=8, top_k=2),
+    "glm_51":             _mla_moe_like("glm_51", num_experts=8, top_k=2),
+    "sarvam_105b":        _mla_moe_like("sarvam_105b", num_experts=8, top_k=2),
+    # ---- Sliding+global+MoE (#19, #20, #24, #31, #41, #44, #45, #61) ----
+    "gpt_oss_120b":       _sliding_global_moe("gpt_oss_120b", sliding_count=3, num_experts=8, top_k=2),
+    "gpt_oss_20b":        _sliding_global_moe("gpt_oss_20b", sliding_count=3, num_experts=8, top_k=2),
+    "minimax_m2":         _sliding_global_moe("minimax_m2", sliding_count=3, num_experts=8, top_k=2),
+    "mimo_v2_flash":      _sliding_global_moe("mimo_v2_flash", sliding_count=5, num_experts=8, top_k=2),
+    "step3_5_flash":      _sliding_global_moe("step3_5_flash", sliding_count=3, num_experts=8, top_k=2),
+    "tiny_aya":           _sliding_global_moe("tiny_aya", sliding_count=3, num_experts=4, top_k=2),
+    "ling25":             _sliding_global_moe("ling25", sliding_count=3, num_experts=8, top_k=2),
+    "laguna_xs2":         _sliding_global_moe("laguna_xs2", sliding_count=3, num_experts=8, top_k=2),
+    # ---- Gemma 3 dense (#7, #21, #36) ----
+    "gemma3_27b":         _gemma3_dense("gemma3_27b", sliding_count=5),
+    "gemma3_270m":        _gemma3_dense("gemma3_270m", sliding_count=5),
+    "gemma4_31b":         _gemma3_dense("gemma4_31b", sliding_count=5),
 }
 
 

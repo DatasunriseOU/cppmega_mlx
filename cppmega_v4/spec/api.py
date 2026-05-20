@@ -94,12 +94,35 @@ def suggest_dim_env(preset_name: str | None = None) -> dict[str, int]:
     """
     if preset_name is None:
         return dict(_PROD_BASE)
-    if preset_name not in _PRESET_DIM_ENVS:
+    if preset_name in _PRESET_DIM_ENVS:
+        return dict(_PRESET_DIM_ENVS[preset_name])
+    # GalCov-A: dynamically derive env from the preset's spec kinds so
+    # that newly-added preset factories don't need a manual table entry.
+    try:
+        from cppmega_v4.architectures import PRESETS, build_preset_specs
+    except ImportError:
         raise KeyError(
             f"unknown preset {preset_name!r}; "
             f"available: {sorted(_PRESET_DIM_ENVS)}"
+        ) from None
+    if preset_name not in PRESETS:
+        raise KeyError(
+            f"unknown preset {preset_name!r}; "
+            f"available: {sorted(set(_PRESET_DIM_ENVS) | set(PRESETS))}"
         )
-    return dict(_PRESET_DIM_ENVS[preset_name])
+    specs = build_preset_specs(preset_name, hidden_size=_PROD_BASE["H"])
+    kinds = {s["kind"] for s in specs}
+    env = dict(_PROD_BASE)
+    # Pull in extras based on which brick categories appear.
+    if kinds & {"mla", "mla_absorb", "mistral4_mla", "bailing_mla"}:
+        env.update(_PROD_MLA_EXTRAS)
+    if "gqa_sliding" in kinds:
+        env.update(_PROD_GEMMA_EXTRAS)
+    if "mamba3" in kinds:
+        env.update(_PROD_NEMOTRON_EXTRAS)
+    if "cca_attention" in kinds:
+        env.update(_PROD_ZAYA_EXTRAS)
+    return env
 
 
 # ---------------------------------------------------------------------------

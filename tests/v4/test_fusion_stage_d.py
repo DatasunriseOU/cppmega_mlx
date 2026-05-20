@@ -114,9 +114,11 @@ def test_stage_d_builders_instantiate_at_small_hidden_size():
 # ---------------------------------------------------------------------------
 
 
-def test_available_presets_returns_twelve_names():
+def test_available_presets_returns_at_least_twelve_names():
     names = available_presets()
-    assert len(names) == 12
+    # Stage A shipped 12; Gallery Coverage (GalCov-A) expanded to >40 to
+    # cover Sebastian Raschka's LLM gallery. Lock the floor, allow growth.
+    assert len(names) >= 12
     assert set(names) == set(PRESETS.keys())
 
 
