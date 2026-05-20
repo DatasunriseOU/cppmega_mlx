@@ -24,7 +24,7 @@ import tempfile
 import time
 import traceback
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
 
@@ -46,6 +46,10 @@ from cppmega_mlx.runtime.path_c_fusion import (  # noqa: E402
     PathCFusionMode,
     build_path_c_model_regions_from_model,
     selected_path_c_fusion_mode,
+)
+from cppmega_mlx.runtime.path_c_physical_abi import (  # noqa: E402
+    plan_physical_abi_runtime_bridge,
+    validate_physical_abi_runtime_bindings,
 )
 from cppmega_mlx.runtime.path_c_fusion_schedules import (  # noqa: E402
     PATH_C_DESCRIPTOR_SCHEDULE_GENERATOR,
@@ -143,6 +147,13 @@ FP8_PATH_B_E2E_TRAINING_STATUS = "m04_path_b_fp8_reference_baseline_available"
 FP8_PATH_C_ROUTE_BLOCKER_TYPE = "fp8_path_c_training_route_unavailable"
 FP8_PATH_C_KERNEL_SURFACE_STATUS = "prepared_buffer_path_c_available"
 FP8_PATH_C_E2E_TRAINING_STATUS = "m04_path_c_training_route_available"
+FP8_PATH_C_SPLIT_TRAINING_STATUS = "m04_path_c_split_training_route_available"
+FP8_PATH_C_FUSED_TRAIN_BLOCK_BANKS_MISSING_STATUS = (
+    "model_owned_physical_abi_banks_missing"
+)
+FP8_PATH_C_FUSED_TRAIN_BLOCK_ARTIFACT_MISSING_STATUS = (
+    "fused_train_block_artifact_missing"
+)
 FP8_PATH_C_BRIDGE_TARGET = "native_mlx_tvm_ffi_graph_bridge"
 FP8_PATH_C_BRIDGE_STATUS = "m04_wired_for_native_tvm_ffi_graph_outputs"
 FP8_PATH_C_CARRIER_DTYPE = "bfloat16"
@@ -988,16 +999,65 @@ def precision_route_payload(
 
 def fp8_path_c_training_route_payload(
     args: argparse.Namespace | TrainHybridTinyConfig,
+    *,
+    model: Any | None = None,
+    bank_buffers: Mapping[str, Any] | None = None,
+    bank_buffer_owner: str | None = None,
+    bank_owner: Any | None = None,
+    fused_artifact: Any | None = None,
 ) -> dict[str, Any]:
     requested = fp8_path_c_route_requested(args)
     producer = sparse_mla_fp8_producer_payload(args)
     producer_configured = bool(producer["configured"])
+    path_c_fusion = path_c_fusion_payload(
+        model=model,
+        bank_buffers=bank_buffers,
+        bank_buffer_owner=bank_buffer_owner,
+        bank_owner=bank_owner,
+        fused_artifact=fused_artifact,
+    )
+    runtime_training_binding = path_c_fusion.get("runtime_training_binding", {})
+    fused_train_block_runtime_available = bool(
+        isinstance(runtime_training_binding, dict)
+        and runtime_training_binding.get("runtime_uses_fused_train_block")
+    )
+    split_training_available = bool(requested and producer_configured)
+    full_training_available = bool(
+        split_training_available and fused_train_block_runtime_available
+    )
     route_status = (
-        FP8_PATH_C_E2E_TRAINING_STATUS
+        FP8_PATH_C_SPLIT_TRAINING_STATUS
         if requested and producer_configured
         else producer["status"]
         if requested
         else "not_requested"
+    )
+    fused_train_block_blocker_type = (
+        None
+        if not requested
+        else None
+        if full_training_available
+        else str(runtime_training_binding.get("status"))
+        if producer_configured
+        else str(producer["status"])
+    )
+    direct_call_status = (
+        "m04_uses_fused_train_block_route"
+        if full_training_available
+        else "m04_uses_split_model_graph_route_not_fused_train_block"
+        if split_training_available
+        else str(producer["status"])
+        if requested
+        else "not_requested"
+    )
+    selected_action = (
+        "run_path_c_fused_train_block_route"
+        if full_training_available
+        else "run_path_c_split_training_route"
+        if split_training_available
+        else f"fail_closed_{producer['status']}"
+        if requested
+        else None
     )
     return {
         "requested": requested,
@@ -1015,15 +1075,14 @@ def fp8_path_c_training_route_payload(
         "producer_quantization": producer["producer_quantization"],
         "kernel_surface_status": FP8_PATH_C_KERNEL_SURFACE_STATUS,
         "kernel_surface_available": True,
-        "full_end_to_end_training_available": bool(requested and producer_configured),
-        "end_to_end_training_status": route_status,
-        "direct_mx_array_artifact_call_status": (
-            "m04_uses_model_graph_route"
-            if requested and producer_configured
-            else str(producer["status"])
-            if requested
-            else "not_requested"
+        "split_end_to_end_training_available": split_training_available,
+        "full_end_to_end_training_available": full_training_available,
+        "fused_train_block_runtime_available": (
+            fused_train_block_runtime_available
         ),
+        "fused_train_block_blocker_type": fused_train_block_blocker_type,
+        "end_to_end_training_status": route_status,
+        "direct_mx_array_artifact_call_status": direct_call_status,
         "bridge_target": FP8_PATH_C_BRIDGE_TARGET,
         "bridge_status": FP8_PATH_C_BRIDGE_STATUS,
         "bridge_evidence": {
@@ -1141,30 +1200,169 @@ def fp8_path_c_training_route_payload(
             ),
         },
         "kernel_policy_env": dict(FP8_PATH_C_KERNEL_POLICY_ENV),
-        "selected_action": (
-            "run_path_c_training_route"
-            if requested and producer_configured
-            else f"fail_closed_{producer['status']}"
-            if requested
-            else None
-        ),
-        "path_c_fusion": path_c_fusion_payload(),
+        "selected_action": selected_action,
+        "path_c_fusion": path_c_fusion,
     }
 
 
-def path_c_fusion_payload() -> dict[str, Any]:
+def fp8_path_c_training_route_payload_for_model(
+    args: argparse.Namespace | TrainHybridTinyConfig,
+    model: Any,
+) -> dict[str, Any]:
+    """Return Path C training route metadata using model-owned ABI banks."""
+
+    return fp8_path_c_training_route_payload(
+        args,
+        model=model,
+        bank_owner=getattr(model, "path_c_physical_abi_bank_owner", None),
+        fused_artifact=getattr(model, "path_c_fused_train_block_artifact", None),
+    )
+
+
+def path_c_fusion_runtime_training_binding_payload(
+    *,
+    region: Any,
+    schedule_target: Any,
+    bank_buffers: Mapping[str, Any] | None = None,
+    bank_buffer_owner: str | None = None,
+    bank_owner: Any | None = None,
+    fused_artifact: Any | None = None,
+) -> dict[str, Any]:
+    """Return executable-runtime binding status for the fused train-block."""
+
+    try:
+        resolved_bank_buffers = bank_buffers
+        resolved_bank_owner = bank_buffer_owner
+        if bank_owner is not None:
+            if bank_buffers is not None:
+                raise ValueError(
+                    "bank_owner and bank_buffers are mutually exclusive"
+                )
+            resolved_bank_buffers = getattr(bank_owner, "buffers", None)
+            resolved_bank_owner = str(
+                getattr(bank_owner, "owner_name", resolved_bank_owner)
+            )
+        prim_func = schedule_target.schedule_template(region)
+        physical_abi_map = dict(
+            getattr(prim_func, "_cppmega_path_c_physical_buffer_abi_map", {})
+            or {}
+        )
+        physical_abi_shapes = dict(
+            getattr(
+                prim_func,
+                "_cppmega_path_c_physical_buffer_abi_shapes",
+                {},
+            )
+            or {}
+        )
+        physical_abi_policy = str(
+            getattr(prim_func, "_cppmega_path_c_physical_abi_policy", "unknown")
+        )
+        bridge = plan_physical_abi_runtime_bridge(
+            physical_abi_map,
+            physical_abi_shapes,
+        )
+        binding = validate_physical_abi_runtime_bindings(
+            physical_abi_map,
+            physical_abi_shapes,
+            resolved_bank_buffers,
+        )
+        required_bank_buffers = list(bridge.get("required_bank_buffers", ()))
+        missing_bank_buffers = list(binding.get("missing_bank_buffers", ()))
+        ordered_kernel_buffers = list(binding.get("ordered_kernel_buffers", ()))
+        provided_names = set(str(name) for name in (resolved_bank_buffers or {}))
+        provided_bank_buffers = [
+            name for name in ordered_kernel_buffers if name in provided_names
+        ]
+        physical_abi_binding_ready = (
+            binding.get("status") == "ok" and not missing_bank_buffers
+        )
+        fused_artifact_bound = callable(fused_artifact)
+        runtime_uses_fused_train_block = (
+            physical_abi_binding_ready and fused_artifact_bound
+        )
+        status = (
+            "ok"
+            if runtime_uses_fused_train_block
+            else FP8_PATH_C_FUSED_TRAIN_BLOCK_ARTIFACT_MISSING_STATUS
+            if physical_abi_binding_ready
+            else FP8_PATH_C_FUSED_TRAIN_BLOCK_BANKS_MISSING_STATUS
+        )
+        return {
+            "status": status,
+            "binding_status": binding.get("status"),
+            "bridge_status": bridge.get("status"),
+            "physical_abi_binding_ready": physical_abi_binding_ready,
+            "fused_artifact_bound": fused_artifact_bound,
+            "runtime_uses_fused_train_block": runtime_uses_fused_train_block,
+            "physical_abi_policy": physical_abi_policy,
+            "required_bank_buffers": required_bank_buffers,
+            "missing_bank_buffers": missing_bank_buffers,
+            "provided_bank_buffers": provided_bank_buffers,
+            "bank_buffer_owner": resolved_bank_owner,
+            "hidden_packing_performed": False,
+            "no_hidden_allocation_policy": bool(
+                bridge.get("no_hidden_allocation_policy", True)
+            ),
+            "reason": (
+                "caller/model-owned physical ABI banks and callable fused "
+                "train-block artifact are bound in generated kernel argument order"
+                if runtime_uses_fused_train_block
+                else
+                "caller/model-owned physical ABI banks are bound, but no callable "
+                "fused train-block artifact is attached to the training runtime"
+                if physical_abi_binding_ready
+                else
+                "fused train-block runtime requires caller/model-owned physical "
+                "ABI banks; the current m04/HybridTinyLM route still owns "
+                "separate tensors, and hidden packing or copying is forbidden"
+            ),
+        }
+    except Exception as exc:  # pragma: no cover - defensive receipt metadata
+        return {
+            "status": "fused_train_block_runtime_binding_unavailable",
+            "binding_status": "unavailable",
+            "bridge_status": "unavailable",
+            "physical_abi_binding_ready": False,
+            "fused_artifact_bound": False,
+            "runtime_uses_fused_train_block": False,
+            "physical_abi_policy": "unknown",
+            "required_bank_buffers": [],
+            "missing_bank_buffers": [],
+            "provided_bank_buffers": [],
+            "bank_buffer_owner": bank_buffer_owner
+            if bank_owner is None
+            else str(getattr(bank_owner, "owner_name", bank_buffer_owner)),
+            "hidden_packing_performed": False,
+            "no_hidden_allocation_policy": True,
+            "reason": str(exc),
+        }
+
+
+def path_c_fusion_payload(
+    *,
+    model: Any | None = None,
+    bank_buffers: Mapping[str, Any] | None = None,
+    bank_buffer_owner: str | None = None,
+    bank_owner: Any | None = None,
+    fused_artifact: Any | None = None,
+) -> dict[str, Any]:
     """Return receipt metadata for the high-level Path C fusion planner."""
 
     mode = selected_path_c_fusion_mode()
-    profile, route_symbols, model_regions = _local_gb10_path_c_model_regions()
+    route_context = _path_c_model_route_context(model)
+    profile_name = route_context.profile_name
+    route_symbols = route_context.route_symbols
+    model_regions = route_context.regions
     selected_region = _select_path_c_model_route_region(model_regions)
     if selected_region is None:
-        raise RuntimeError("local_gb10_quarter did not expose any Path C model region")
+        raise RuntimeError(f"{profile_name} did not expose any Path C model region")
     model_route_candidates = _path_c_model_route_candidates_payload(
-        profile_name=profile.name,
+        profile_name=profile_name,
         route_symbols=route_symbols,
         regions=model_regions,
         selected_region=selected_region,
+        region_source=route_context.region_source,
     )
     selected_model_region = model_route_candidates["selected_candidate"]
     scheduled = plan_path_c_fusion_schedule_for_region(
@@ -1181,6 +1379,14 @@ def path_c_fusion_payload() -> dict[str, Any]:
         region,
         contract=plan.schedule_contract,
         target=scheduled.schedule_target,
+    )
+    runtime_training_binding = path_c_fusion_runtime_training_binding_payload(
+        region=region,
+        schedule_target=scheduled.schedule_target,
+        bank_buffers=bank_buffers,
+        bank_buffer_owner=bank_buffer_owner,
+        bank_owner=bank_owner,
+        fused_artifact=fused_artifact,
     )
     real_schedule_unverified = not plan.single_kernel_fused
     force_blocked = mode is PathCFusionMode.FORCE and real_schedule_unverified
@@ -1218,7 +1424,7 @@ def path_c_fusion_payload() -> dict[str, Any]:
         "fusion_kind": plan.fusion_kind,
         "graph_construction": {
             "builder": "PathCFusionScheduleOptimizer",
-            "input_model": f"{profile.name}_profile_path_c_bricks",
+            "input_model": route_context.input_model,
             "route_symbols": model_route_candidates["route_symbols"],
             "region_source": model_route_candidates["region_source"],
             "edge_policy": "infer_from_outputs_to_inputs",
@@ -1342,6 +1548,7 @@ def path_c_fusion_payload() -> dict[str, Any]:
             if plan.schedule_contract is not None
             else None
         ),
+        "runtime_training_binding": runtime_training_binding,
         "schedule_blockers": [
             {
                 "kind": (
@@ -1363,37 +1570,41 @@ def path_c_fusion_payload() -> dict[str, Any]:
                 ),
                 "schedule_generator": PATH_C_DESCRIPTOR_SCHEDULE_GENERATOR,
             },
-            {
-                "kind": "production_schedule_uses_descriptor_loop_fragments",
-                "schedule_id": schedule_spec.schedule_id,
-                "schedule_name": schedule_spec.schedule_name,
-                "schedule_generator": schedule_spec.schedule_generator,
-                "schedule_generator_status": (
-                    schedule_spec.schedule_generator_status
-                ),
-                "brick_schedule_families": list(
-                    schedule_spec.brick_schedule_families
-                ),
-                "brick_production_fragment_statuses": list(
-                    schedule_spec.brick_production_fragment_statuses
-                ),
-                "brick_production_fragment_reasons": list(
-                    schedule_spec.brick_production_fragment_reasons
-                ),
-                "brick_production_fragment_blockers": list(
-                    schedule_spec.brick_production_fragment_blockers
-                ),
-                "production_fragments_complete": (
-                    schedule_spec.production_fragments_complete
-                ),
-                "reason": (
-                    "the selected schedule is dynamically assembled from Path C "
-                    "brick descriptors and emits per-brick TileLang loop fragments, "
-                    "but those fragments are still generic descriptor bodies rather "
-                    "than the performance-tuned schedules from the production Path C "
-                    "kernels"
-                ),
-            },
+            *(
+                [
+                    {
+                        "kind": "production_schedule_uses_descriptor_loop_fragments",
+                        "schedule_id": schedule_spec.schedule_id,
+                        "schedule_name": schedule_spec.schedule_name,
+                        "schedule_generator": schedule_spec.schedule_generator,
+                        "schedule_generator_status": (
+                            schedule_spec.schedule_generator_status
+                        ),
+                        "brick_schedule_families": list(
+                            schedule_spec.brick_schedule_families
+                        ),
+                        "brick_production_fragment_statuses": list(
+                            schedule_spec.brick_production_fragment_statuses
+                        ),
+                        "brick_production_fragment_reasons": list(
+                            schedule_spec.brick_production_fragment_reasons
+                        ),
+                        "brick_production_fragment_blockers": list(
+                            schedule_spec.brick_production_fragment_blockers
+                        ),
+                        "production_fragments_complete": (
+                            schedule_spec.production_fragments_complete
+                        ),
+                        "reason": (
+                            "the selected schedule is dynamically assembled from "
+                            "Path C brick descriptors, but at least one brick "
+                            "fragment is not production-inlined"
+                        ),
+                    }
+                ]
+                if not schedule_spec.production_fragments_complete
+                else []
+            ),
             {
                 "kind": "production_schedule_not_compile_verified",
                 "schedule_id": schedule_spec.schedule_id,
@@ -1406,6 +1617,35 @@ def path_c_fusion_payload() -> dict[str, Any]:
                     "compile receipt with schedule_contract.status=verified"
                 ),
             },
+            *(
+                [
+                    {
+                        "kind": "fused_train_block_runtime_not_bound",
+                        "schedule_id": schedule_spec.schedule_id,
+                        "schedule_name": schedule_spec.schedule_name,
+                        "runtime_binding_status": (
+                            runtime_training_binding.get("status")
+                        ),
+                        "required_bank_buffers": list(
+                            runtime_training_binding.get(
+                                "required_bank_buffers",
+                                (),
+                            )
+                        ),
+                        "missing_bank_buffers": list(
+                            runtime_training_binding.get(
+                                "missing_bank_buffers",
+                                (),
+                            )
+                        ),
+                        "reason": runtime_training_binding.get("reason"),
+                    }
+                ]
+                if not runtime_training_binding.get(
+                    "runtime_uses_fused_train_block"
+                )
+                else []
+            ),
             {
                 "kind": "production_1b_matrix_profile_missing",
                 "schedule_id": schedule_spec.schedule_id,
@@ -1512,12 +1752,74 @@ def path_c_model_route_candidates_payload() -> dict[str, Any]:
         route_symbols=route_symbols,
         regions=regions,
         selected_region=_select_path_c_model_route_region(regions),
+        region_source="build_path_c_model_regions_from_model",
     )
+
+
+def _path_c_model_route_context(model: Any | None = None) -> SimpleNamespace:
+    if model is None:
+        profile, route_symbols, regions = _local_gb10_path_c_model_regions()
+        return SimpleNamespace(
+            profile_name=profile.name,
+            input_model=f"{profile.name}_profile_path_c_bricks",
+            route_symbols=route_symbols,
+            regions=regions,
+            region_source="build_path_c_model_regions_from_model",
+        )
+
+    profile_name = str(
+        getattr(model, "path_c_profile_name", None)
+        or getattr(type(model), "__name__", "model")
+    )
+    input_model = str(
+        getattr(model, "path_c_input_model_name", None)
+        or f"{profile_name}.path_c_bricks"
+    )
+    route_symbols = tuple(str(symbol) for symbol in getattr(model, "route_symbols", ()))
+    region_builder = getattr(model, "path_c_fusion_regions", None)
+    if callable(region_builder):
+        regions = tuple(
+            region_builder(
+                include_backward=False,
+                min_route_bricks=2,
+            )
+        )
+        region_source = f"{profile_name}.path_c_fusion_regions"
+    else:
+        regions = build_path_c_model_regions_from_model(
+            model,
+            region_prefix=f"{profile_name}_path_c",
+        )
+        region_source = "build_path_c_model_regions_from_model"
+
+    if not route_symbols:
+        route_symbols = _route_symbols_from_regions(regions)
+    return SimpleNamespace(
+        profile_name=profile_name,
+        input_model=input_model,
+        route_symbols=route_symbols,
+        regions=regions,
+        region_source=region_source,
+    )
+
+
+def _route_symbols_from_regions(regions: tuple[Any, ...]) -> tuple[str, ...]:
+    for region in regions:
+        metadata = getattr(region, "metadata", {})
+        bricks = metadata.get("path_c_bricks", ()) if isinstance(metadata, dict) else ()
+        symbols = tuple(
+            str(brick.get("route_symbol"))
+            for brick in bricks
+            if isinstance(brick, dict) and brick.get("route_symbol")
+        )
+        if symbols:
+            return symbols
+    return ()
 
 
 def _local_gb10_path_c_model_regions() -> tuple[Any, tuple[str, ...], tuple[Any, ...]]:
     profile = local_gb10_quarter_profile()
-    route_symbols = tuple(profile.pattern)
+    route_symbols = tuple(profile.expanded_pattern.symbols)
     model_descriptor = SimpleNamespace(
         name=profile.name,
         path_c_bricks=profile.path_c_bricks,
@@ -1536,6 +1838,7 @@ def _path_c_model_route_candidates_payload(
     route_symbols: tuple[str, ...],
     regions: tuple[Any, ...],
     selected_region: Any | None,
+    region_source: str,
 ) -> dict[str, Any]:
     candidate_regions = [
         _path_c_model_route_candidate_payload(region)
@@ -1553,7 +1856,7 @@ def _path_c_model_route_candidates_payload(
     return {
         "profile": profile_name,
         "route_symbols": list(route_symbols),
-        "region_source": "build_path_c_model_regions_from_model",
+        "region_source": region_source,
         "selection_policy": "largest_supported_contiguous_route_segment",
         "selected_candidate": selected_candidate,
         "candidate_regions": candidate_regions,
@@ -2542,6 +2845,10 @@ def run_local_gb10_quarter_training(
             grad_checkpoint=config.grad_checkpoint,
         )
         route_backend = route_backend_payload(model)
+        fp8_path_c_training_route = fp8_path_c_training_route_payload_for_model(
+            config,
+            model,
+        )
         mx.eval(model.parameters())
         mx.synchronize()
         memory_after_parameters = metal_memory_payload()
@@ -2625,6 +2932,7 @@ def run_local_gb10_quarter_training(
             "route_symbols": route_backend["route_symbols"],
             "route_roles": route_backend["route_roles"],
             "backend_plan": route_backend,
+            "fp8_path_c_training_route": fp8_path_c_training_route,
             "parameter_count": parameter_count(model),
             "tokens_per_step": final["ntokens"],
             "trained_tokens": final["trained_tokens"],
@@ -3143,6 +3451,9 @@ def receipt_from_train_payload(
         tokens_per_second=timing_tokens_per_second,
         status=status,
     )
+    fp8_path_c_route = train_payload.get("fp8_path_c_training_route")
+    if not isinstance(fp8_path_c_route, dict):
+        fp8_path_c_route = fp8_path_c_training_route_payload(config)
 
     receipt = {
         "receipt_schema_version": RECEIPT_SCHEMA_VERSION,
@@ -3168,7 +3479,7 @@ def receipt_from_train_payload(
             "synthetic": bool(args.synthetic),
             "dtype": config.dtype,
             "precision_route": precision_route_payload(config),
-            "fp8_path_c_training_route": fp8_path_c_training_route_payload(config),
+            "fp8_path_c_training_route": fp8_path_c_route,
             "steps_requested": config.steps,
             "batch_size": config.batch_size,
             "seq_len": config.seq_len,
@@ -3195,7 +3506,7 @@ def receipt_from_train_payload(
             "optimizer": optimizer,
             "grad_checkpoint": grad_checkpoint,
             "precision_route": precision_route_payload(config),
-            "fp8_path_c_training_route": fp8_path_c_training_route_payload(config),
+            "fp8_path_c_training_route": fp8_path_c_route,
             "all_finite": all_finite,
             "losses": losses,
             "initial_loss": losses[0] if losses else None,

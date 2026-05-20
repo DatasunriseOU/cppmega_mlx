@@ -34,3 +34,8 @@ markers = [
     "distributed: distributed-training boundary checks and fail-closed parity guards",
     "slow: tests that spawn subprocesses or run extended training loops; opt-in via -m slow",
 ]
+filterwarnings = [
+    "ignore:builtin type SwigPyPacked has no __module__ attribute:DeprecationWarning",
+    "ignore:builtin type SwigPyObject has no __module__ attribute:DeprecationWarning",
+    "ignore:builtin type swigvarlink has no __module__ attribute:DeprecationWarning",
+]

@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Path C Fused Train Block Goal Audit - 2026-05-20</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f8fb;
+      --panel: #ffffff;
+      --text: #17202a;
+      --muted: #667085;
+      --line: #d8dee8;
+      --good: #0f7a4f;
+      --bad: #b42318;
+      --warn: #93640f;
+      --info: #0b5cad;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.45;
+    }
+    header {
+      background: var(--panel);
+      border-bottom: 1px solid var(--line);
+      padding: 28px max(24px, calc((100vw - 1180px) / 2)) 22px;
+    }
+    main { max-width: 1180px; margin: 0 auto; padding: 24px; }
+    h1 { margin: 0 0 8px; font-size: 34px; line-height: 1.12; letter-spacing: 0; }
+    h2 { margin: 0; font-size: 19px; letter-spacing: 0; }
+    p { margin: 0; color: var(--muted); }
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      background: #f2f4f7;
+      border: 1px solid #e4e7ec;
+      border-radius: 4px;
+      padding: 1px 4px;
+    }
+    a { color: var(--info); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    section {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      margin: 0 0 18px;
+      overflow: hidden;
+    }
+    .head {
+      display: flex;
+      gap: 16px;
+      align-items: baseline;
+      justify-content: space-between;
+      border-bottom: 1px solid var(--line);
+      padding: 16px 18px;
+    }
+    .body { padding: 18px; }
+    .grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+    .metric {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      background: #fbfcfe;
+      min-height: 96px;
+    }
+    .metric span { display: block; color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+    .metric strong { display: block; font-size: 18px; line-height: 1.15; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { border-bottom: 1px solid var(--line); padding: 10px; text-align: left; vertical-align: top; }
+    th { color: #344054; background: #f8fafc; font-weight: 650; }
+    tr:last-child td { border-bottom: 0; }
+    .status {
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      border-radius: 999px;
+      padding: 2px 9px;
+      font-size: 12px;
+      font-weight: 650;
+      white-space: nowrap;
+    }
+    .pass { color: var(--good); background: #e8f5ef; }
+    .block { color: var(--bad); background: #fee4e2; }
+    .partial { color: var(--warn); background: #fff4d6; }
+    .info { color: var(--info); background: #e8f1fc; }
+    ul { margin: 0; padding-left: 18px; color: var(--muted); }
+    li + li { margin-top: 6px; }
+    @media (max-width: 860px) {
+      .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .head { display: block; }
+      .head p { margin-top: 6px; }
+    }
+    @media (max-width: 560px) {
+      main { padding: 14px; }
+      .grid { grid-template-columns: 1fr; }
+      table { font-size: 12px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Path C Fused Train Block Goal Audit</h1>
+    <p>Snapshot date: 2026-05-20. This audit separates completed compile/codegen work from the remaining runtime training blocker.</p>
+  </header>
+  <main>
+    <section>
+      <div class="head">
+        <h2>Current Verdict</h2>
+        <p>Based on current source, compile receipt, and regression tests.</p>
+      </div>
+      <div class="body">
+        <div class="grid">
+          <div class="metric"><span>Fused schedule body</span><strong><span class="status pass">compiled</span></strong><p><code>single_kernel_fused=true</code></p></div>
+          <div class="metric"><span>Real ABI contract</span><strong><span class="status pass">complete</span></strong><p><code>missing_real_abi_inputs=[]</code></p></div>
+          <div class="metric"><span>Training runtime route</span><strong><span class="status partial">owner hook ready</span></strong><p>Explicit bank-owner binding works; live model banks still missing.</p></div>
+          <div class="metric"><span>Path C default</span><strong><span class="status block">disabled</span></strong><p>Default gate remains fail-closed.</p></div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="head">
+        <h2>Prompt-To-Artifact Checklist</h2>
+        <p>Every explicit blocker mapped to current evidence.</p>
+      </div>
+      <div class="body">
+        <table>
+          <thead>
+            <tr>
+              <th>Requirement</th>
+              <th>Status</th>
+              <th>Evidence</th>
+              <th>Remaining Work</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Replace vendored <code>MaskAnalysis.cpp</code> assert in <code>parseCmp</code> with recoverable <code>failure()</code>.</td>
+              <td><span class="status pass">done</span></td>
+              <td><code>/Volumes/external/sources/tilelang/poc/triton_frontend/vendored/triton_shared/lib/Analysis/MaskAnalysis.cpp:549-558</code> now emits a debug remark and returns <code>failure()</code>. Regression test <code>test_ptr_analysis_unsupported_unit_mask_cmp_fails_recoverably</code> runs the crash case in a subprocess.</td>
+              <td>None for this assert replacement. Broader Triton frontend crash classes are separate future work.</td>
+            </tr>
+            <tr>
+              <td>Production fused schedule body exists for the selected local GB10 Path C train-block region.</td>
+              <td><span class="status pass">compiled</span></td>
+              <td><code>reports/path_c_fusion_compile_receipt.json</code>: <code>compile_plan.single_kernel_fused=true</code>, <code>compile_plan.schedule_status=ready</code>, <code>runtime_execution_contract.single_entry_tilelang_ir=true</code>.</td>
+              <td>Runtime training route still does not call this fused artifact.</td>
+            </tr>
+            <tr>
+              <td>Real ABI is carried into the fused region.</td>
+              <td><span class="status pass">complete</span></td>
+              <td><code>reports/path_c_fusion_compile_receipt.json</code>: <code>compile_plan.schedule_contract.status=verified</code>, <code>missing_real_abi_inputs=[]</code>, <code>real_abi_contract_complete=true</code>.</td>
+              <td>Physical bank ownership must be wired into the model/training runtime. The generic explicit-bank binding hook is now covered.</td>
+            </tr>
+            <tr>
+              <td>Native TileLang compile crash should not abort Python on the known MaskAnalysis unsupported cmpi.</td>
+              <td><span class="status pass">covered</span></td>
+              <td><code>poc/triton_frontend/tests/test_ptr_analysis.py</code> covers the unsupported unit-mask cmpi in a subprocess. Current run: <code>13 passed</code>.</td>
+              <td>Keep minimizing any new abort signatures separately if they appear.</td>
+            </tr>
+            <tr>
+              <td>Full 1B matrix/profiling run proves fused Path C train-block performance.</td>
+              <td><span class="status block">blocked</span></td>
+              <td>Current matrix artifacts measure split/generated Path C runtime surfaces. Compile receipt says <code>reporting_contract.runtime_uses_fused_train_block=false</code>. The route payload can now select fused mode when explicit caller-owned banks are supplied, but the live model does not own them yet.</td>
+              <td>Run the full matrix only after the training loop passes real model-owned ABI banks into the fused train-block artifact.</td>
+            </tr>
+            <tr>
+              <td>Path C can become default only after clean speed, memory, compile, ABI, and cache gates.</td>
+              <td><span class="status block">disabled</span></td>
+              <td><code>reports/path_c_fusion_compile_receipt.json</code>: <code>reporting_contract.path_c_default_allowed=false</code> and <code>runtime_execution_contract.status=compile_only_not_runtime_ready</code>.</td>
+              <td>Need fused runtime train receipt, C/B win, memory non-regression, and profiling evidence.</td>
+            </tr>
+            <tr>
+              <td>Cache-key/recompile audit must be closed on production compile receipt.</td>
+              <td><span class="status pass">stable</span></td>
+              <td><code>cache_key_recompile_audit.status=key_stable</code>; equivalent native compile attempts produced identical cache material and lowered module digests.</td>
+              <td>Repeat after runtime train-block binding changes, because the final runtime route may alter cache-key material.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <div class="head">
+        <h2>Hard Runtime Blocker</h2>
+        <p>The fused artifact compiles and smoke-runs with synthetic buffers, and the generic route hook accepts explicit physical banks. The real training model still is not bank-owned.</p>
+      </div>
+      <div class="body">
+        <ul>
+          <li><code>runtime_execution_contract.status=compile_only_not_runtime_ready</code></li>
+          <li><code>physical_abi_runtime_bridge_status=prepacked_bank_buffers_required</code></li>
+          <li><code>physical_abi_runtime_binding_status=not_bound</code></li>
+          <li>Missing required banks: <code>path_c_float32_abi_bank</code>, <code>path_c_uint8_abi_bank</code>, <code>path_c_int32_abi_bank</code></li>
+          <li>New runtime hook: <code>path_c_fusion_runtime_training_binding_payload(..., bank_owner=...)</code> marks fused executable only when caller-owned banks satisfy shape and dtype.</li>
+          <li>Receipt seam is wired to preserve a bound <code>fp8_path_c_training_route</code> from <code>train_payload</code> instead of recomputing it without the model owner.</li>
+          <li>Required next code change: make the model/training runtime own and pass those physical ABI banks without hidden packing or copies.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section>
+      <div class="head">
+        <h2>Verification Commands</h2>
+        <p>Fresh checks run during this audit pass.</p>
+      </div>
+      <div class="body">
+        <table>
+          <thead>
+            <tr>
+              <th>Command</th>
+              <th>Result</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>cmake --build build -j 12</code> in <code>/Volumes/external/sources/tilelang</code></td>
+              <td><span class="status pass">exit 0</span> <code>ninja: no work to do</code></td>
+            </tr>
+            <tr>
+              <td><code>PYTHONPATH=. /Volumes/external/sources/nanochat/.venv/bin/python -m pytest poc/triton_frontend/tests/test_ptr_analysis.py -q --tb=short</code></td>
+              <td><span class="status pass">13 passed</span></td>
+            </tr>
+            <tr>
+              <td><code>PYTHONPATH=. /Volumes/external/sources/nanochat/.venv/bin/python -m ruff check ...</code> for Path C/m04/matrix files</td>
+              <td><span class="status pass">All checks passed</span></td>
+            </tr>
+            <tr>
+              <td><code>PYTHONPATH=. /Volumes/external/sources/nanochat/.venv/bin/python -m pytest tests/test_path_c_physical_abi.py tests/test_m04_train_step.py::test_fp8_path_c_dsa_attention_route_metadata_is_configured tests/test_m04_train_step.py::test_path_c_fusion_runtime_binding_accepts_model_owned_physical_banks tests/test_m04_train_step.py::test_path_c_fusion_runtime_binding_accepts_bank_owner_object tests/test_m04_train_step.py::test_fp8_path_c_training_route_selects_fused_action_when_banks_are_bound tests/test_m04_train_step.py::test_fp8_path_c_training_route_for_model_reads_bank_owner tests/test_m04_train_step.py::test_receipt_preserves_bound_fp8_path_c_route_from_train_payload tests/test_bench_1b_training_matrix.py::test_bench_1b_matrix_extracts_m04_receipt_metrics -q --tb=short</code></td>
+              <td><span class="status pass">17 passed</span></td>
+            </tr>
+            <tr>
+              <td><code>PYTHONPATH=. /Volumes/external/sources/nanochat/.venv/bin/python -m pytest tests/test_path_c_physical_abi.py tests/test_path_c_fusion_compile_receipt_script.py tests/test_render_1b_training_matrix_html.py tests/test_path_c_fusion_ir.py tests/test_m04_train_step.py tests/test_bench_1b_training_matrix.py -q --tb=short</code></td>
+              <td><span class="status pass">187 passed, 5 skipped</span></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

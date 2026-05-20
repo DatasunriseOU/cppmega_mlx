@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import os
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -73,6 +74,47 @@ from cppmega_mlx.recipes.model_factory import (
     LOCAL_GB10_QUARTER_MAX_SEQ_LENGTH,
     local_gb10_quarter_profile,
 )
+
+
+def _physical_bank_fragment(prim_func: object, logical_name: str) -> str:
+    mapping = getattr(prim_func, "_cppmega_path_c_physical_buffer_abi_map", {})
+    info = mapping[logical_name]
+    if info["offset"] == 0:
+        return f"{info['bank']}["
+    return f"{info['bank']}[{info['offset']}"
+
+
+def _line_uses_logical_buffer(
+    prim_func: object,
+    line: str,
+    logical_name: str,
+) -> bool:
+    if logical_name in line:
+        return True
+    mapping = getattr(prim_func, "_cppmega_path_c_physical_buffer_abi_map", {})
+    info = mapping.get(logical_name)
+    if info is None:
+        return False
+    if info["offset"] == 0:
+        return f"{info['bank']}[" in line
+    return f"{info['bank']}[{info['offset']}" in line
+
+
+def _shared_alloc_bytes(source: str) -> int:
+    dtype_bytes = {"float32": 4, "uint8": 1, "int32": 4}
+    total = 0
+    for match in re.finditer(
+        r"= T\.alloc_shared\(\(([^)]*)\), \"([^\"]+)\"\)", source
+    ):
+        shape_text, dtype = match.groups()
+        elements = 1
+        for dim_text in shape_text.split(","):
+            dim_text = dim_text.strip()
+            if not dim_text:
+                continue
+            elements *= int(dim_text)
+        total += elements * dtype_bytes[dtype]
+    return total
 
 
 @T.prim_func
@@ -148,6 +190,8 @@ def _toy_path_c_model_train_block(
     sparse_mla_sm_scale: T.Buffer((4,), "float32"),
     sparse_mla_sinks: T.Buffer((4,), "float32"),
     sparse_mla_has_sinks: T.Buffer((4,), "int32"),
+    kv_fp8: T.Buffer((4,), "uint8"),
+    kv_scale: T.Buffer((4,), "float32"),
     attention_out: T.Buffer((4,), "float32"),
     lse: T.Buffer((4,), "float32"),
 ):
@@ -159,8 +203,6 @@ def _toy_path_c_model_train_block(
         attention_hidden = T.alloc_local((4,), "float32")
         q_fp8 = T.alloc_local((4,), "float32")
         q_scale = T.alloc_local((4,), "float32")
-        kv_fp8 = T.alloc_local((4,), "float32")
-        kv_scale = T.alloc_local((4,), "float32")
         indices = T.alloc_local((4,), "int32")
         mamba3_delta[0] = (
             hidden[0]
@@ -187,12 +229,12 @@ def _toy_path_c_model_train_block(
         )
         q_fp8[0] = attention_hidden[0]
         q_scale[0] = 1.0
-        kv_fp8[0] = attention_hidden[0]
+        kv_fp8[0] = T.cast(attention_hidden[0], "uint8")
         kv_scale[0] = 1.0
         indices[0] = 0
         attention_out[0] = (
             q_fp8[0]
-            + kv_fp8[0]
+            + T.cast(kv_fp8[0], "float32")
             + q_scale[0]
             + kv_scale[0]
             + T.cast(indices[0], "float32")
@@ -350,12 +392,12 @@ def test_build_path_c_model_region_from_route_symbols_uses_dynamic_default_targe
     )
 
     assert region.node_names == (
-        "mamba3_scan_1",
-        "mamba3_scan_1_residual_norm",
-        "m2rnn_packed_post_1",
-        "m2rnn_packed_post_1_residual_norm",
-        "attention_qkv_projection_1",
-        "sparse_mla_fp8_apply_1",
+        "route_0_M",
+        "route_0_M_residual_norm",
+        "route_1_R",
+        "route_1_R_residual_norm",
+        "route_2_A_qkv_projection",
+        "route_2_A_sparse_mla_fp8_apply",
     )
     assert tuple(node.op_name for node in region.nodes) == (
         "mamba3_mimo",
@@ -368,6 +410,11 @@ def test_build_path_c_model_region_from_route_symbols_uses_dynamic_default_targe
     assert region.z3_sync.enabled is True
     assert region.metadata["path_c_acceptance_tags"] == ()
     assert region.metadata["path_c_acceptance_fixture_abi"] is False
+    assert region.metadata["path_c_bricks"] == (
+        {"name": "route_0_M", "kind": "M", "route_symbol": "M"},
+        {"name": "route_1_R", "kind": "R", "route_symbol": "R"},
+        {"name": "route_2_A", "kind": "A", "route_symbol": "A"},
+    )
     assert region.metadata["path_c_model_shape_env"].sequence_length == (
         LOCAL_GB10_QUARTER_MAX_SEQ_LENGTH
     )
@@ -382,7 +429,7 @@ def test_build_path_c_model_region_from_route_symbols_uses_dynamic_default_targe
     assert target.schedule_name == (
         "generic_mra_path_c:descriptor_generated_fwd_bwd"
     )
-    assert target.implementation_kind == "prototype"
+    assert target.implementation_kind == "production"
     prim_func = path_c_fusion_schedule_template(build_path_c_aot_autograd_region(region))
     assert "def generic_mra_path_c(" in prim_func._cppmega_path_c_generated_source
     assert plan.schedule_contract is not None
@@ -699,29 +746,51 @@ def test_mamba3_fp8_template_has_expected_train_block_pattern() -> None:
     plan = compile_path_c_region(region)
 
     assert region.node_names == (
-        "mamba3_scan",
-        "m2rnn_packed_post",
-        "fp8_prepare",
-        "sparse_mla_fp8_apply",
+        "route_0_M",
+        "route_0_M_residual_norm",
+        "route_1_R",
+        "route_1_R_residual_norm",
+        "route_2_A_qkv_projection",
+        "route_2_A_sparse_mla_fp8_apply",
     )
     assert [node.op_name for node in region.nodes] == [
         "mamba3_mimo",
+        "residual_rmsnorm",
         "m2rnn",
-        "sparse_mla_fp8_prepare",
+        "residual_rmsnorm",
+        "attention_qkv_projection",
         "sparse_mla_fp8_apply",
     ]
     assert plan.cache_key_parts[:7] == (
         "region:mamba3_fp8_train_block",
         "entry:mamba3_fp8_train_block",
-        "nodes:mamba3_scan,m2rnn_packed_post,fp8_prepare,sparse_mla_fp8_apply",
+        (
+            "nodes:route_0_M,route_0_M_residual_norm,"
+            "route_1_R,route_1_R_residual_norm,"
+            "route_2_A_qkv_projection,route_2_A_sparse_mla_fp8_apply"
+        ),
         (
             "edges:"
-            "mamba3_scan->m2rnn_packed_post:scan_y:internal,"
-            "m2rnn_packed_post->fp8_prepare:post_y:internal,"
-            "fp8_prepare->sparse_mla_fp8_apply:q_fp8:internal,"
-            "fp8_prepare->sparse_mla_fp8_apply:q_scale:internal,"
-            "fp8_prepare->sparse_mla_fp8_apply:kv_fp8:internal,"
-            "fp8_prepare->sparse_mla_fp8_apply:kv_scale:internal"
+            "route_0_M->route_0_M_residual_norm:"
+            "route_0_M_delta:internal,"
+            "route_0_M_residual_norm->route_1_R:"
+            "route_0_M_residual_norm_hidden:internal,"
+            "route_0_M_residual_norm->route_1_R_residual_norm:"
+            "route_0_M_hidden_after:internal,"
+            "route_1_R->route_1_R_residual_norm:"
+            "route_1_R_delta:internal,"
+            "route_1_R_residual_norm->route_2_A_qkv_projection:"
+            "route_1_R_residual_norm_hidden:internal,"
+            "route_2_A_qkv_projection->route_2_A_sparse_mla_fp8_apply:"
+            "route_2_A_qkv_projection_q_fp8:internal,"
+            "route_2_A_qkv_projection->route_2_A_sparse_mla_fp8_apply:"
+            "route_2_A_qkv_projection_q_scale:internal,"
+            "route_2_A_qkv_projection->route_2_A_sparse_mla_fp8_apply:"
+            "route_2_A_qkv_projection_kv_fp8:workspace,"
+            "route_2_A_qkv_projection->route_2_A_sparse_mla_fp8_apply:"
+            "route_2_A_qkv_projection_kv_scale:workspace,"
+            "route_2_A_qkv_projection->route_2_A_sparse_mla_fp8_apply:"
+            "route_2_A_qkv_projection_indices:internal"
         ),
         "backend:tilelang_tvm_ffi",
         "boundary:tilelang_tvm_ir",
@@ -733,17 +802,35 @@ def test_mamba3_fp8_template_has_expected_train_block_pattern() -> None:
     assert plan.single_kernel_fused is False
     assert plan.autograd_status == "requires_aot_autograd_codegen"
     assert plan.autograd_missing_backward_nodes == (
-        "mamba3_scan_bwd",
-        "m2rnn_packed_post_bwd",
+        "route_0_M_bwd",
+        "route_0_M_residual_norm_bwd",
+        "route_1_R_bwd",
+        "route_1_R_residual_norm_bwd",
+        "route_2_A_qkv_projection_bwd",
     )
-    assert [blocker.kind for blocker in plan.semantic_blockers] == [
-        "residual_norm_bridge_missing",
-        "attention_qkv_projection_missing",
-    ]
-    assert plan.semantic_blockers[0].required_node == "mamba3_residual_to_m2rnn_norm"
-    assert plan.semantic_blockers[1].required_node == "attention_qkv_projection"
+    assert plan.semantic_blockers == ()
     assert plan.schedule_contract is not None
-    assert plan.schedule_contract.status == "blocked_semantic_contract"
+    assert plan.schedule_contract.status == "missing_schedule_template"
+
+
+def test_mamba3_fp8_train_region_is_route_driven_not_static_mra() -> None:
+    region = build_mamba3_fp8_train_region(route_symbols=("M", "R"))
+
+    assert region.metadata["path_c_route_symbols"] == ("M", "R")
+    assert region.metadata["path_c_bricks"] == (
+        {"name": "route_0_M", "kind": "M", "route_symbol": "M"},
+        {"name": "route_1_R", "kind": "R", "route_symbol": "R"},
+    )
+    assert region.node_names == (
+        "route_0_M",
+        "route_0_M_residual_norm",
+        "route_1_R",
+    )
+    assert tuple(node.op_name for node in region.nodes) == (
+        "mamba3_mimo",
+        "residual_rmsnorm",
+        "m2rnn",
+    )
 
 
 def test_mamba3_fp8_acceptance_fixture_region_includes_residual_norm_and_attention_projection() -> None:
@@ -778,6 +865,17 @@ def test_mamba3_fp8_acceptance_fixture_region_includes_residual_norm_and_attenti
         ("attention_qkv_projection", "sparse_mla_fp8_apply", "kv_scale"),
         ("attention_qkv_projection", "sparse_mla_fp8_apply", "indices"),
     ]
+    assert {
+        edge.input: edge.lifetime
+        for edge in region.edges
+        if edge.producer == "attention_qkv_projection"
+    } == {
+        "q_fp8": "internal",
+        "q_scale": "internal",
+        "kv_fp8": "workspace",
+        "kv_scale": "workspace",
+        "indices": "internal",
+    }
     assert plan.semantic_blockers == ()
     assert plan.schedule_status == "missing_real_fused_schedule_template"
     assert plan.schedule_contract is not None
@@ -790,8 +888,6 @@ def test_mamba3_fp8_acceptance_fixture_region_includes_residual_norm_and_attenti
         "attention_hidden",
         "q_fp8",
         "q_scale",
-        "kv_fp8",
-        "kv_scale",
         "indices",
     )
     external_buffers = plan.schedule_contract.required_external_buffers
@@ -800,6 +896,8 @@ def test_mamba3_fp8_acceptance_fixture_region_includes_residual_norm_and_attenti
     assert "hidden_after_m2rnn" in external_buffers
     assert "attention_out" in external_buffers
     assert "lse" in external_buffers
+    assert "kv_fp8" in external_buffers
+    assert "kv_scale" in external_buffers
     assert set(MAMBA3_FP8_TRAIN_REQUIRED_REAL_ABI_INPUTS).issubset(
         external_buffers
     )
@@ -862,6 +960,55 @@ def test_mamba3_fp8_acceptance_fixture_region_can_include_symbolic_aot_backward_
     )
 
 
+def test_mamba3_fp8_train_backward_surfaces_receive_forward_real_abi_inputs() -> None:
+    region = build_mamba3_fp8_train_acceptance_fixture_region(include_backward=True)
+    node_by_name = {node.name: node for node in region.nodes}
+
+    assert node_by_name["attention_qkv_projection_bwd"].inputs == (
+        "q_fp8_grad",
+        "q_scale_grad",
+        "kv_fp8_grad",
+        "kv_scale_grad",
+        "attention_hidden",
+        "attention_q_proj_weight",
+        "attention_q_proj_bias",
+        "attention_sparse_kv_proj_weight",
+        "attention_sparse_kv_proj_bias",
+        "attention_rope_inv_freq",
+    )
+    assert node_by_name["m2rnn_packed_post_bwd"].inputs == (
+        "m2rnn_delta_grad",
+        "m2rnn_hidden",
+        "m2rnn_in_proj_weight",
+        "m2rnn_conv_weight",
+        "m2rnn_conv_bias",
+        "m2rnn_state_weight",
+        "m2rnn_A_log",
+        "m2rnn_dt_bias",
+        "m2rnn_D",
+        "m2rnn_g_norm_weight",
+        "m2rnn_out_proj_weight",
+        "m2rnn_h0",
+        "m2rnn_conv_state",
+    )
+    assert node_by_name["mamba3_scan_bwd"].inputs == (
+        "mamba3_delta_grad",
+        "hidden",
+        "mamba_state",
+        "mamba3_in_proj_weight",
+        "mamba3_out_proj_weight",
+        "mamba3_conv_weight",
+        "mamba3_conv_bias",
+        "mamba3_dt_bias",
+        "mamba3_B_norm_weight",
+        "mamba3_B_bias",
+        "mamba3_C_norm_weight",
+        "mamba3_C_bias",
+        "mamba3_D",
+        "mamba3_h0",
+    )
+
+
 def test_mamba3_fp8_train_production_schedule_spec_is_explicit_and_abi_complete() -> None:
     region = build_mamba3_fp8_train_acceptance_fixture_region(include_backward=True)
     plan = compile_path_c_region(region)
@@ -877,7 +1024,7 @@ def test_mamba3_fp8_train_production_schedule_spec_is_explicit_and_abi_complete(
     assert spec.schedule_id == MAMBA3_FP8_TRAIN_FUSION_SCHEDULE_ID
     assert spec.schedule_name == MAMBA3_FP8_TRAIN_FUSION_SCHEDULE_NAME
     assert spec.region_name == "mamba3_m2rnn_attention_fp8_train_block"
-    assert spec.implementation_kind == "scaffold"
+    assert spec.implementation_kind == "production"
     assert spec.implementation_status == MAMBA3_FP8_TRAIN_FUSION_SCHEDULE_STATUS
     assert spec.trusted_by_default is False
     assert spec.schedule_id not in trusted_path_c_production_schedule_ids()
@@ -897,13 +1044,25 @@ def test_mamba3_fp8_train_production_schedule_spec_is_explicit_and_abi_complete(
     assert "real_model_parameter_abi_contract" in spec.required_codegen_steps
     assert "z3_sync_async_schedule_points" in spec.required_codegen_steps
     assert spec.schedule_generator == PATH_C_DESCRIPTOR_SCHEDULE_GENERATOR
-    assert (
-        spec.schedule_generator_status
-        == "loop_per_brick_descriptor_fragments"
-    )
+    assert spec.schedule_generator_status == "production_region_fragments"
     assert spec.internal_buffer_policy == DESCRIPTOR_INTERNAL_BUFFER_POLICY_ROW_LOCAL_HIDDEN
     assert spec.loop_policy == DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN
     assert "residual_rmsnorm_row_phased_production_fragment" in (
+        spec.required_codegen_steps
+    )
+    assert "attention_qkv_projection_row_phased_rope_fp8_fragment" in (
+        spec.required_codegen_steps
+    )
+    assert "sparse_mla_fp8_apply_softmax_lse_out_proj" in (
+        spec.required_codegen_steps
+    )
+    assert "sparse_mla_fp8_apply_lse_reuses_softmax_stats" in (
+        spec.required_codegen_steps
+    )
+    assert "sparse_mla_fp8_apply_row_topk_indices_cache" in (
+        spec.required_codegen_steps
+    )
+    assert "sparse_mla_fp8_apply_invalid_index_sentinel" in (
         spec.required_codegen_steps
     )
     assert spec.buffer_extent == LOCAL_GB10_QUARTER_MAX_SEQ_LENGTH
@@ -924,73 +1083,103 @@ def test_mamba3_fp8_train_production_schedule_spec_is_explicit_and_abi_complete(
     assert "residual_rmsnorm_bwd:descriptor_codegen_ready" in (
         spec.brick_descriptor_statuses
     )
-    assert spec.production_fragments_complete is False
-    assert len(spec.brick_production_fragment_blockers) == 9
+    assert spec.production_fragments_complete is True
+    assert spec.brick_production_fragment_blockers == ()
     assert any(
-        status.startswith("mamba3_mimo:region_fragment_inlined_unoptimized:")
+        status.startswith("mamba3_mimo:production_region_inlined:")
         for status in spec.brick_production_fragment_statuses
     )
     assert any(
-        "mamba3_mimo:region_fragment_inlined_unoptimized:" in reason
-        and "Path C scan kernel expects pre-projected x/B/C/z/A/dt" in reason
-        and "block-level in_proj/conv/norm parameters" in reason
+        reason.startswith("mamba3_mimo:production_region_inlined:")
+        and "row-phased descriptor codegen fuses Mamba3 dense input projection"
+        in reason
+        and "without full activation staging" in reason
         for reason in spec.brick_production_fragment_reasons
+    )
+    assert not any(
+        blocker.startswith("mamba3_mimo:")
+        for blocker in spec.brick_production_fragment_blockers
     )
     assert any(
         status.startswith("residual_rmsnorm:production_region_inlined:")
         for status in spec.brick_production_fragment_statuses
     )
     assert any(
-        status.startswith("residual_rmsnorm_bwd:region_fragment_inlined_unoptimized:")
+        status.startswith("residual_rmsnorm_bwd:production_region_inlined:")
         for status in spec.brick_production_fragment_statuses
     )
     assert any(
         reason.startswith(
-            "residual_rmsnorm_bwd:region_fragment_inlined_unoptimized:"
-            "residual/RMSNorm backward has an explicit descriptor"
+            "residual_rmsnorm_bwd:production_region_inlined:"
+            "row-phased descriptor codegen recomputes residual/RMSNorm"
         )
-        and "native TileLang lowerer timed out" in reason
-        and "occurrence gate was removed" in reason
         for reason in spec.brick_production_fragment_reasons
     )
-    assert any(
-        blocker.startswith(
-            "residual_rmsnorm_bwd:region_fragment_inlined_unoptimized:"
-            "residual/RMSNorm backward has an explicit descriptor"
-        )
+    assert not any(
+        blocker.startswith("residual_rmsnorm_bwd:")
         for blocker in spec.brick_production_fragment_blockers
     )
     assert any(
         status.startswith(
-            "attention_qkv_projection:region_fragment_inlined_unoptimized:"
+            "attention_qkv_projection:production_region_inlined:"
         )
         for status in spec.brick_production_fragment_statuses
     )
     assert any(
         reason.startswith(
-            "attention_qkv_projection_bwd:region_fragment_inlined_unoptimized:"
-            "attention Q/KV projection backward now has an explicit descriptor"
+            "attention_qkv_projection:production_region_inlined:"
+            "row-phased descriptor codegen emits real q/sparse-kv dot-products"
+        )
+        for reason in spec.brick_production_fragment_reasons
+    )
+    assert not any(
+        blocker.startswith("attention_qkv_projection:")
+        for blocker in spec.brick_production_fragment_blockers
+    )
+    assert any(
+        status.startswith("sparse_mla_fp8_apply:production_region_inlined:")
+        for status in spec.brick_production_fragment_statuses
+    )
+    assert any(
+        reason.startswith(
+            "sparse_mla_fp8_apply:production_region_inlined:"
+            "row-phased descriptor codegen emits prepared-FP8 sparse attention apply"
+        )
+        for reason in spec.brick_production_fragment_reasons
+    )
+    assert not any(
+        blocker.startswith("sparse_mla_fp8_apply:")
+        for blocker in spec.brick_production_fragment_blockers
+    )
+    assert any(
+        reason.startswith(
+            "attention_qkv_projection_bwd:production_region_inlined:"
+            "row-phased descriptor codegen emits attention Q/KV projection backward"
         )
         for reason in spec.brick_production_fragment_reasons
     )
     assert any(
         reason.startswith(
-            "m2rnn_bwd:region_fragment_inlined_unoptimized:"
-            "M2RNN backward now has an explicit descriptor"
+            "m2rnn_bwd:production_region_inlined:"
+            "row-phased descriptor codegen recomputes M2RNN backward owner outputs"
         )
         for reason in spec.brick_production_fragment_reasons
     )
     assert any(
-        "m2rnn:region_fragment_inlined_unoptimized:" in reason
-        and "mapped-packed Path C kernels expect projected conv_input/xf/projected"
-        in reason
-        and "block-level projection/conv/state parameters" in reason
+        reason.startswith(
+            "m2rnn:production_region_inlined:"
+            "row-phased descriptor codegen fuses M2RNN dense input projection"
+        )
         for reason in spec.brick_production_fragment_reasons
+    )
+    assert not any(
+        blocker.startswith("m2rnn:")
+        for blocker in spec.brick_production_fragment_blockers
     )
     assert any(
         reason.startswith(
-            "mamba3_mimo_bwd:region_fragment_inlined_unoptimized:"
-            "Mamba3 backward now has an explicit descriptor"
+            "mamba3_mimo_bwd:production_region_inlined:"
+            "row-phased descriptor codegen recomputes Mamba3 backward owner outputs"
         )
         for reason in spec.brick_production_fragment_reasons
     )
@@ -1047,7 +1236,12 @@ def test_mamba3_fp8_train_descriptor_schedule_uses_per_brick_emitters() -> None:
     assert "attention_qkv_projection_attention_kv_projected" in generated_source
     assert "attention_qkv_projection_attention_rope_phase" in generated_source
     assert "sparse_mla_fp8_apply_sink_enabled" in generated_source
-    assert "mamba3_scan_bwd_grad_accum" in generated_source
+    assert "mamba3_scan_bwd_mamba3_project_grad" in generated_source
+    assert "mamba3_scan_bwd_mamba3_conv_grad" in generated_source
+    assert "mamba3_scan_bwd_mamba3_dt_grad" in generated_source
+    assert "mamba3_scan_bwd_mamba3_state_grad" in generated_source
+    assert "mamba3_scan_bwd_mamba3_out_grad" in generated_source
+    assert "mamba3_scan_bwd_grad_accum" not in generated_source
 
 
 def test_descriptor_schedule_uses_descriptor_owned_fragment_emitter() -> None:
@@ -1179,28 +1373,58 @@ def test_mamba3_fp8_train_descriptor_schedule_labels_nonproduction_fragments() -
     )
     generated_source = prim_func._cppmega_path_c_generated_source
 
-    assert (
-        "# mamba3_scan production_fragment_status: "
-        "region_fragment_inlined_unoptimized"
-    ) in generated_source
+    assert "# mamba3_scan production_fragment_status: production_region_inlined" in (
+        generated_source
+    )
     assert (
         "# attention_qkv_projection production_fragment_status: "
-        "region_fragment_inlined_unoptimized"
+        "production_region_inlined"
     ) in generated_source
     assert (
         "# mamba3_residual_to_m2rnn_norm production_fragment_status: "
         "production_region_inlined"
     ) in generated_source
     assert (
-        "# attention_qkv_projection_bwd production_fragment_status: "
-        "region_fragment_inlined_unoptimized"
+        "# attention_qkv_projection_bwd production_fragment_status: production_region_inlined"
     ) in generated_source
-    assert "production shape-specialized scan schedule" in generated_source
-    assert "Path C scan kernel expects pre-projected x/B/C/z/A/dt" in generated_source
+    assert "# m2rnn_packed_post_bwd production_fragment_status: production_region_inlined" in (
+        generated_source
+    )
+    assert "# mamba3_scan_bwd production_fragment_status: production_region_inlined" in (
+        generated_source
+    )
+    assert "mamba3_projection_policy: dense_row_local" in generated_source
+    assert "mamba3_conv_policy: causal_depthwise_ring_history" in generated_source
+    assert "mamba3_dt_policy: softplus_A_trapezoid" in generated_source
+    assert "mamba3_scan_policy: external_state_recurrence" in generated_source
+    assert "mamba3_output_policy: dense_out_projection" in generated_source
+    assert "row-phased descriptor codegen emits real q/sparse-kv dot-products" in (
+        generated_source
+    )
     assert (
-        "mapped-packed Path C kernels expect projected conv_input/xf/projected"
+        "row-phased descriptor codegen fuses M2RNN dense input projection"
         in generated_source
     )
+    assert (
+        "m2rnn_conv_policy: lane_strided_causal_depthwise_ring_history"
+        in generated_source
+    )
+    assert "m2rnn_recurrence_policy: lane_strided_mapped_state_update" in (
+        generated_source
+    )
+    assert "m2rnn_post_policy: lane_strided_residual_gate_norm_out_proj" in (
+        generated_source
+    )
+    assert (
+        "attention_qkv_projection_bwd_policy: lane_strided_weight_bias_rope_hidden"
+        in generated_source
+    )
+    assert "m2rnn_bwd_policy: lane_strided_weight_state_recompute" in generated_source
+    assert "mamba3_mimo_bwd_policy: lane_strided_weight_state_recompute" in (
+        generated_source
+    )
+    assert "# backward_policy: row_phased_hidden_recompute" in generated_source
+    assert "# backward_policy: flat_after_row_phased_forward" not in generated_source
 
 
 def test_default_registry_uses_explicit_train_block_backward_descriptors() -> None:
@@ -1220,13 +1444,14 @@ def test_default_registry_uses_explicit_train_block_backward_descriptors() -> No
         assert descriptor.implementation_status == "descriptor_codegen_ready"
         assert expected_step in descriptor.required_codegen_steps
         assert descriptor.supports_backward is False
-        assert descriptor.production_fragment_status == (
-            "region_fragment_inlined_unoptimized"
+        assert descriptor.production_fragment_policy == (
+            DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN
         )
-        assert "explicit descriptor" in descriptor.production_fragment_reason
+        assert descriptor.production_fragment_codegen_step
+        assert descriptor.production_fragment_inlined_reason
 
 
-def test_incomplete_production_fragments_are_attested_as_scaffold() -> None:
+def test_complete_production_fragments_stay_non_default_until_compile_and_gates() -> None:
     region = build_mamba3_fp8_train_acceptance_fixture_region(include_backward=True)
     acceptance_registry = PathCFusionScheduleRegistry(
         acceptance_profiles=(
@@ -1236,7 +1461,7 @@ def test_incomplete_production_fragments_are_attested_as_scaffold() -> None:
                 schedule_name=MAMBA3_FP8_TRAIN_FUSION_SCHEDULE_NAME,
                 schedule_status=MAMBA3_FP8_TRAIN_FUSION_SCHEDULE_STATUS,
                 implementation_kind="production",
-                missing_reason="acceptance fixture for scaffold attestation",
+                missing_reason="acceptance fixture for untrusted production attestation",
                 required_codegen_steps=("single_entry_tilelang_region",),
                 entry_symbol="mamba3_m2rnn_attention_fp8_train_block",
                 required_real_abi_inputs=MAMBA3_FP8_TRAIN_REQUIRED_REAL_ABI_INPUTS,
@@ -1248,7 +1473,7 @@ def test_incomplete_production_fragments_are_attested_as_scaffold() -> None:
 
     assert target is not None
     assert target.schedule_id == MAMBA3_FP8_TRAIN_FUSION_SCHEDULE_ID
-    assert target.implementation_kind == "scaffold"
+    assert target.implementation_kind == "production"
 
     planned = plan_path_c_fusion_schedule_for_region(
         region,
@@ -1256,14 +1481,18 @@ def test_incomplete_production_fragments_are_attested_as_scaffold() -> None:
         registry=acceptance_registry,
     )
     assert planned.schedule_target is not None
-    assert planned.schedule_target.implementation_kind == "scaffold"
+    assert planned.schedule_target.implementation_kind == "production"
     assert planned.plan.schedule_contract is not None
     assert (
         planned.plan.schedule_contract.status
-        == "attested_non_production_schedule"
+        == "registered_not_lowered"
     )
-    assert planned.plan.schedule_contract.declared_implementation_kind == "scaffold"
-    assert planned.plan.schedule_contract.declared_schedule_id == ""
+    assert planned.plan.schedule_contract.declared_implementation_kind == "production"
+    assert (
+        planned.plan.schedule_contract.declared_schedule_id
+        == MAMBA3_FP8_TRAIN_FUSION_SCHEDULE_ID
+    )
+    assert planned.plan.single_kernel_fused is False
 
 
 def test_complete_production_fragments_keep_dynamic_target_production(
@@ -1391,21 +1620,72 @@ def test_mamba3_fp8_train_descriptor_schedule_uses_loop_fragments() -> None:
 
     assert "# loop_policy: row_phased_hidden" in generated_source
     assert "# internal_buffer_policy: row_local_hidden" in generated_source
+    assert "with T.Kernel(1, threads=256):" in generated_source
+    assert "lane = T.get_thread_binding(0)" in generated_source
+    assert "if lane == 0:" in generated_source
+    assert "T.sync_threads()" in generated_source
     assert f"for row in T.serial(0, {cfg.max_seq_length}):" in generated_source
     assert (
-        f"for i in T.serial(row * {cfg.hidden_size}, "
-        f"(row + 1) * {cfg.hidden_size}):"
+        f"for i in T.serial(row * {cfg.hidden_size} + lane, "
+        f"(row + 1) * {cfg.hidden_size}, step=256):"
     ) in generated_source
-    assert "# backward_policy: flat_after_row_phased_forward" in generated_source
-    assert generated_source.count(f"for row in T.serial(0, {cfg.max_seq_length}):") == 1
-    assert f"for i in T.serial(0, {activation_extent}):" in generated_source
-    assert 'mamba3_scan_mamba3_proj = T.alloc_local((1,), "float32")' in (
+    assert "# backward_policy: row_phased_hidden_recompute" in generated_source
+    assert generated_source.count(f"for row in T.serial(0, {cfg.max_seq_length}):") == 2
+    assert f"for i in T.serial(0, {activation_extent}):" not in generated_source
+    assert 'mamba3_scan_mamba3_projected_vec: T.Buffer((18784,), "float32"),' in (
         generated_source
     )
-    assert "mamba3_scan_mamba3_proj[0]" in generated_source
-    assert f"q_fp8[i % {cfg.hidden_size}]" in generated_source
-    assert "attention_out[i]" in generated_source
-    assert "mamba3_scan_bwd_grad_accum[0]" in generated_source
+    assert "mamba3_scan_mamba3_projected_vec[mamba3_scan_proj_dim]" in (
+        generated_source
+    )
+    assert "mamba3_scan_mamba3_next_dt[0]" in generated_source
+    assert "mamba3_scan_mamba3_next_trap[0]" in generated_source
+    assert "q_fp8[attention_qkv_projection_q_head * 128 + attention_qkv_projection_d]" in generated_source
+    assert any(
+        _physical_bank_fragment(prim_func, "attention_out") in line
+        and "sparse_mla_fp8_apply_context_values[" in line
+        for line in generated_source.splitlines()
+    )
+    assert "mamba3_scan_bwd_mamba3_stage_grad[0]" in generated_source
+    assert _physical_bank_fragment(prim_func, "mamba3_out_proj_weight_grad") in (
+        generated_source
+    )
+    assert "mamba3_scan_bwd_grad_accum[0]" not in generated_source
+
+
+def test_mamba3_fp8_train_descriptor_spills_large_shared_scratch_to_abi() -> None:
+    prim_func = mamba3_fp8_train_fusion_schedule_template(
+        build_mamba3_fp8_train_acceptance_fixture_region(include_backward=True)
+    )
+    generated_source = prim_func._cppmega_path_c_generated_source
+    spilled = prim_func._cppmega_path_c_spilled_shared_scratch_shapes
+
+    assert (
+        'mamba3_scan_mamba3_projected_vec: T.Buffer((18784,), "float32"),'
+        in generated_source
+    )
+    assert (
+        'mamba3_scan_mamba3_projected_vec = T.alloc_shared((18784,), "float32")'
+        not in generated_source
+    )
+    assert spilled["mamba3_scan_mamba3_projected_vec"]["dtype"] == "float32"
+    assert spilled["mamba3_scan_mamba3_projected_vec"]["shape"] == (18784,)
+    assert spilled["mamba3_scan_mamba3_projected_vec"]["bytes"] == 75136
+    assert (
+        spilled["mamba3_scan_mamba3_projected_vec"]["param_name"]
+        == "mamba3_scan_mamba3_projected_vec"
+    )
+    assert spilled["mamba3_scan_mamba3_conv_history"]["dtype"] == "float32"
+    assert spilled["mamba3_scan_mamba3_conv_history"]["shape"] == (2, 11264)
+    assert spilled["mamba3_scan_mamba3_conv_history"]["bytes"] == 90112
+    assert spilled["mamba3_scan_mamba3_conv_vec"]["bytes"] == 45056
+    assert spilled["mamba3_scan_mamba3_out_inner"]["bytes"] == 28672
+    assert spilled["mamba3_delta"]["internal_scratch_abi"] is True
+    assert 'mamba3_delta: T.Buffer((3584,), "float32"),' in generated_source
+    assert 'mamba3_delta = T.alloc_shared((3584,), "float32")' not in generated_source
+    assert "mamba3_delta" in prim_func._cppmega_path_c_internal_scratch_abi_buffers
+    assert _shared_alloc_bytes(generated_source) <= 32 * 1024
+    assert len(tuple(prim_func.params)) <= 31
 
 
 def test_mamba3_fp8_train_descriptor_schedule_uses_row_local_internal_arrays_without_full_staging() -> None:
@@ -1415,13 +1695,16 @@ def test_mamba3_fp8_train_descriptor_schedule_uses_row_local_internal_arrays_wit
     generated_source = prim_func._cppmega_path_c_generated_source
     cfg = local_gb10_quarter_profile().hybrid_config()
     activation_extent = cfg.max_seq_length * cfg.hidden_size
+    attention = cfg.attention_config("dsa")
+    kv_history_extent = cfg.max_seq_length * attention.kv_heads * attention.q_head_dim
+    kv_scale_extent = cfg.max_seq_length * attention.kv_heads
 
-    assert generated_source.count(f"for row in T.serial(0, {cfg.max_seq_length}):") == 1
+    assert generated_source.count(f"for row in T.serial(0, {cfg.max_seq_length}):") == 2
     assert (
         generated_source.count(
             f"for i in T.serial(0, {activation_extent}):"
         )
-        == 1
+        == 0
     )
     assert (
         f'mamba3_delta = T.alloc_local(({activation_extent},), "float32")'
@@ -1432,16 +1715,111 @@ def test_mamba3_fp8_train_descriptor_schedule_uses_row_local_internal_arrays_wit
         not in generated_source
     )
     assert (
-        f'mamba3_delta = T.alloc_local(({cfg.hidden_size},), "float32")'
+        f'mamba3_delta: T.Buffer(({cfg.hidden_size},), "float32"),'
         in generated_source
     )
     assert (
-        f'q_fp8 = T.alloc_local(({cfg.hidden_size},), "float32")'
+        f'mamba3_delta = T.alloc_shared(({cfg.hidden_size},), "float32")'
+        not in generated_source
+    )
+    assert (
+        f'q_fp8 = T.alloc_shared(({cfg.hidden_size},), "uint8")'
+        in generated_source
+    )
+    assert (
+        f'kv_fp8 = T.alloc_local(({attention.kv_heads * attention.q_head_dim},), "uint8")'
+        not in generated_source
+    )
+    assert "kv_fp8 = T.alloc_local" not in generated_source
+    assert "kv_scale = T.alloc_local" not in generated_source
+    assert prim_func._cppmega_path_c_physical_abi_policy == "banked_by_dtype"
+    assert (
+        'path_c_uint8_abi_bank: T.Buffer((44040192,), "uint8"),'
+        in generated_source
+    )
+    assert (
+        prim_func._cppmega_path_c_buffer_abi_shapes["kv_fp8"]
+        == (kv_history_extent,)
+    )
+    assert (
+        prim_func._cppmega_path_c_buffer_abi_shapes["kv_scale"]
+        == (kv_scale_extent,)
+    )
+    assert (
+        prim_func._cppmega_path_c_physical_buffer_abi_map["kv_fp8"]["bank"]
+        == "path_c_uint8_abi_bank"
+    )
+    assert prim_func._cppmega_path_c_internal_buffer_shapes["q_scale"] == (
+        attention.num_q_heads,
+    )
+    assert "kv_fp8" not in prim_func._cppmega_path_c_internal_buffer_shapes
+    assert "kv_scale" not in prim_func._cppmega_path_c_internal_buffer_shapes
+    assert prim_func._cppmega_path_c_internal_buffer_shapes["indices"] == (
+        attention.kv_heads * attention.sparse_topk,
+    )
+    assert (
+        f'q_scale = T.alloc_shared(({attention.num_q_heads},), "float32")'
+        in generated_source
+    )
+    assert 'm2rnn_packed_post_m2rnn_projected_vec = T.alloc_shared((226,), "float32")' in (
+        generated_source
+    )
+    assert (
+        'm2rnn_packed_post_m2rnn_sum_sq_partial = T.alloc_shared((256,), "float32")'
+        in generated_source
+    )
+    assert "# m2rnn_projection_policy: lane_strided_dense_row_local" in generated_source
+    assert (
+        "for m2rnn_packed_post_proj_dim in T.serial(lane, 226, step=256):"
+        in generated_source
+    )
+    assert (
+        f"for m2rnn_packed_post_out_dim in T.serial(lane, {cfg.hidden_size}, step=256):"
+        in generated_source
+    )
+    assert (
+        "for mamba3_scan_state_flat_init in T.serial(lane, 458752, step=256):"
+        in generated_source
+    )
+    assert "mamba3_scan_head_init = mamba3_scan_state_flat_init // 4096" in (
+        generated_source
+    )
+    assert "# fp8_prepare_policy: lane_strided_row_head_reduction" in generated_source
+    assert (
+        "for attention_qkv_projection_q_head in "
+        f"T.serial(lane, {attention.num_q_heads}, step=256):"
+        in generated_source
+    )
+    assert (
+        "for attention_qkv_projection_kv_head in "
+        f"T.serial(lane, {attention.kv_heads}, step=256):"
+        in generated_source
+    )
+    assert (
+        "for attention_qkv_projection_indices_flat in "
+        f"T.serial(lane, {attention.kv_heads * attention.sparse_topk}, step=256):"
+        in generated_source
+    )
+    assert (
+        f"for attention_qkv_projection_d in T.serial(0, {attention.q_head_dim}):"
         in generated_source
     )
     assert f"mamba3_delta[i % {cfg.hidden_size}]" in generated_source
-    assert f"q_fp8[i % {cfg.hidden_size}]" in generated_source
-    assert "attention_out[i]" in generated_source
+    assert (
+        "q_fp8[attention_qkv_projection_q_head * "
+        f"{attention.q_head_dim} + attention_qkv_projection_d]"
+    ) in generated_source
+    assert any(
+        _line_uses_logical_buffer(prim_func, line, "kv_fp8")
+        and "attention_qkv_projection_kv_head" in line
+        and "attention_qkv_projection_d" in line
+        for line in generated_source.splitlines()
+    )
+    assert any(
+        _line_uses_logical_buffer(prim_func, line, "attention_out")
+        and "sparse_mla_fp8_apply_out_dim_loop" in line
+        for line in generated_source.splitlines()
+    )
 
 
 def test_descriptor_schedule_can_row_materialize_internal_buffers_without_gb_staging() -> None:
@@ -1484,7 +1862,7 @@ def test_descriptor_schedule_can_row_materialize_internal_buffers_without_gb_sta
         "route_0_M_delta"
     ] == (32,)
     assert "# internal_buffer_policy: row_local_hidden" in generated_source
-    assert 'route_0_M_delta = T.alloc_local((32,), "float32")' in generated_source
+    assert 'route_0_M_delta = T.alloc_shared((32,), "float32")' in generated_source
     assert 'route_0_M_delta = T.alloc_local((4096,), "float32")' not in (
         generated_source
     )
@@ -1553,13 +1931,26 @@ def test_descriptor_schedule_row_phased_loop_orders_rmsnorm_after_full_row() -> 
         == DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN
     )
     assert "# loop_policy: row_phased_hidden" in generated_source
+    assert "with T.Kernel(1, threads=256):" in generated_source
+    assert "lane = T.get_thread_binding(0)" in generated_source
+    assert "if lane == 0:" in generated_source
+    assert "T.sync_threads()" in generated_source
     assert "for i in T.serial(0, 4096):" not in generated_source
     assert "for row in T.serial(0, 128):" in generated_source
-    assert "for i in T.serial(row * 32, (row + 1) * 32):" in generated_source
+    assert (
+        "for i in T.serial(row * 32 + lane, "
+        "(row + 1) * 32, step=256):"
+    ) in generated_source
     assert "route_0_M_residual_norm_inv_rms = T.alloc_local" not in generated_source
+    assert (
+        "route_0_M_residual_norm_row_sum_sq_partial[lane] = "
+        "route_0_M_residual_norm_row_sum_sq_partial[lane] + "
+    ) in generated_source
+    assert "for partial_lane in T.serial(0, 256):" in generated_source
     assert (
         "route_0_M_residual_norm_row_sum_sq[0] = "
         "route_0_M_residual_norm_row_sum_sq[0] + "
+        "route_0_M_residual_norm_row_sum_sq_partial[partial_lane]"
     ) in generated_source
     assert (
         "route_0_M_residual_norm_row_inv_rms[0] = "
@@ -1606,10 +1997,28 @@ def test_descriptor_schedule_row_phased_recomputes_residual_rmsnorm_backward() -
         "# route_0_M_residual_norm_bwd production_fragment_status: "
         "production_region_inlined"
     ) in generated_source
+    assert any(
+        _physical_bank_fragment(prim_func, "route_0_M_residual_norm_weight_grad")
+        in line
+        and " = " in line
+        and " + " in line
+        for line in generated_source.splitlines()
+    )
+    assert "for h in T.serial(lane, 32, step=256):" in generated_source
+    bwd_start = generated_source.index(
+        "# route_0_M_residual_norm_bwd: residual_rmsnorm_bwd"
+    )
+    bwd_end = generated_source.index("# route_0_M_bwd: mamba3_mimo_bwd", bwd_start)
+    bwd_segment = generated_source[bwd_start:bwd_end]
     assert (
-        "route_0_M_residual_norm_weight_grad[i % 32] = "
-        "route_0_M_residual_norm_weight_grad[i % 32] + "
-    ) in generated_source
+        bwd_segment.count(
+            "for i in T.serial(row * 32 + lane, (row + 1) * 32, step=256):"
+        )
+        == 2
+    )
+    assert "route_0_M_residual_norm_bwd_row_sum_sq_partial[lane]" in bwd_segment
+    assert "route_0_M_residual_norm_bwd_row_dot_partial[lane]" in bwd_segment
+    assert "for partial_lane in T.serial(0, 256):" in bwd_segment
     assert generated_source.index("# route_1_R: m2rnn") < (
         generated_source.index("# backward_policy: row_phased_hidden_recompute")
     )
@@ -1632,26 +2041,28 @@ def test_mamba3_fp8_train_descriptor_schedule_uses_model_derived_shape_env() -> 
     attention_weight_extent = cfg.hidden_size * cfg.hidden_size
     sinks_extent = cfg.num_attention_heads
 
-    assert f"hidden: T.Buffer(({hidden_extent},), \"float32\")" in generated_source
-    assert (
-        "attention_q_proj_weight: "
-        f"T.Buffer(({attention_weight_extent},), \"float32\")"
-    ) in generated_source
-    assert f"sparse_mla_sinks: T.Buffer(({sinks_extent},), \"float32\")" in (
-        generated_source
-    )
+    assert prim_func._cppmega_path_c_physical_abi_policy == "banked_by_dtype"
+    assert 'path_c_float32_abi_bank: T.Buffer(' in generated_source
     assert prim_func._cppmega_path_c_buffer_extent == sequence_extent
     assert prim_func._cppmega_path_c_loop_extent == hidden_extent
-    assert f"for i in T.serial(0, {hidden_extent}):" in generated_source
+    assert f"for i in T.serial(0, {hidden_extent}):" not in generated_source
+    assert f"for row in T.serial(0, {sequence_extent}):" in generated_source
     assert prim_func._cppmega_path_c_buffer_abi_shapes["hidden"] == (hidden_extent,)
     assert prim_func._cppmega_path_c_buffer_abi_shapes[
         "attention_q_proj_weight"
     ] == (
         attention_weight_extent,
     )
+    assert prim_func._cppmega_path_c_buffer_abi_shapes["sparse_mla_sinks"] == (
+        sinks_extent,
+    )
+    assert (
+        prim_func._cppmega_path_c_physical_buffer_abi_map["hidden"]["bank"]
+        == "path_c_float32_abi_bank"
+    )
 
 
-def test_mamba3_fp8_train_descriptor_loop_covers_flat_activation_extent() -> None:
+def test_mamba3_fp8_train_descriptor_loop_covers_activation_extent_by_rows() -> None:
     prim_func = mamba3_fp8_train_fusion_schedule_template(
         build_mamba3_fp8_train_acceptance_fixture_region(include_backward=True)
     )
@@ -1662,11 +2073,25 @@ def test_mamba3_fp8_train_descriptor_loop_covers_flat_activation_extent() -> Non
 
     assert prim_func._cppmega_path_c_buffer_extent == sequence_extent
     assert prim_func._cppmega_path_c_loop_extent == activation_extent
-    assert f"for i in T.serial(0, {activation_extent}):" in generated_source
+    assert f"for i in T.serial(0, {activation_extent}):" not in generated_source
+    assert generated_source.count(f"for row in T.serial(0, {sequence_extent}):") == 2
+    assert (
+        f"for i in T.serial(row * {cfg.hidden_size} + lane, "
+        f"(row + 1) * {cfg.hidden_size}, step=256):"
+    ) in generated_source
     assert f"for i in T.serial(0, {sequence_extent}):" not in generated_source
-    assert "hidden[i]" in generated_source
-    assert "attention_out[i]" in generated_source
-    assert "mamba3_residual_to_m2rnn_norm_weight[i % 3584]" in generated_source
+    assert prim_func._cppmega_path_c_buffer_abi_shapes["hidden"] == (
+        activation_extent,
+    )
+    assert any(
+        _physical_bank_fragment(prim_func, "attention_out") in line
+        and "sparse_mla_fp8_apply_context_values[" in line
+        for line in generated_source.splitlines()
+    )
+    assert _physical_bank_fragment(
+        prim_func,
+        "mamba3_residual_to_m2rnn_norm_weight",
+    ) in generated_source
 
 
 def test_mamba3_fp8_train_descriptor_projection_inputs_are_not_duplicated() -> None:
@@ -1678,74 +2103,201 @@ def test_mamba3_fp8_train_descriptor_projection_inputs_are_not_duplicated() -> N
     mamba3_project_line = next(
         line
         for line in generated_source.splitlines()
-        if "mamba3_scan_mamba3_proj[0] =" in line
+        if "mamba3_scan_mamba3_projected_vec[mamba3_scan_proj_dim] = "
+        in line
+        and _line_uses_logical_buffer(prim_func, line, "mamba3_in_proj_weight")
     )
-    mamba3_conv_line = next(
+    mamba3_conv_bias_line = next(
         line
         for line in generated_source.splitlines()
-        if "mamba3_scan_mamba3_conv[0] =" in line
+        if "mamba3_scan_mamba3_conv_vec[mamba3_scan_conv_ch] = "
+        in line
+        and _line_uses_logical_buffer(prim_func, line, "mamba3_conv_bias")
+    )
+    mamba3_conv_history_line = next(
+        line
+        for line in generated_source.splitlines()
+        if "mamba3_scan_mamba3_conv_history" in line
+        and _line_uses_logical_buffer(prim_func, line, "mamba3_conv_weight")
+    )
+    mamba3_conv_current_line = next(
+        line
+        for line in generated_source.splitlines()
+        if "mamba3_scan_mamba3_projected_vec[7168 + mamba3_scan_conv_ch]"
+        in line
+        and _line_uses_logical_buffer(prim_func, line, "mamba3_conv_weight")
     )
     mamba3_dt_line = next(
         line
         for line in generated_source.splitlines()
-        if "mamba3_scan_mamba3_dt[0] =" in line
+        if "mamba3_scan_mamba3_dt_vec[mamba3_scan_head] = T.log" in line
+    )
+    mamba3_next_dt_line = next(
+        line
+        for line in generated_source.splitlines()
+        if "mamba3_scan_mamba3_next_dt[0] = "
+        "mamba3_scan_mamba3_next_dt[0] +" in line
+    )
+    mamba3_next_trap_line = next(
+        line
+        for line in generated_source.splitlines()
+        if "mamba3_scan_mamba3_next_trap[0] = "
+        "mamba3_scan_mamba3_next_trap[0] +" in line
+    )
+    mamba3_trap_line = next(
+        line
+        for line in generated_source.splitlines()
+        if "mamba3_scan_mamba3_trap_group[mamba3_scan_trap_group_loop] = "
+        "mamba3_scan_mamba3_trap_group[mamba3_scan_trap_group_loop] +" in line
+    )
+    mamba3_b_norm_line = next(
+        line
+        for line in generated_source.splitlines()
+        if "mamba3_scan_mamba3_b_raw[" in line
+        and _line_uses_logical_buffer(prim_func, line, "mamba3_B_norm_weight")
+    )
+    mamba3_c_norm_line = next(
+        line
+        for line in generated_source.splitlines()
+        if "mamba3_scan_mamba3_c_raw[" in line
+        and _line_uses_logical_buffer(prim_func, line, "mamba3_C_norm_weight")
     )
     mamba3_state_line = next(
         line
         for line in generated_source.splitlines()
-        if "mamba3_scan_mamba3_state[0] =" in line
+        if "mamba3_scan_mamba3_state_value[0] =" in line
+        and _line_uses_logical_buffer(prim_func, line, "scan_state")
     )
     mamba3_out_line = next(
         line
         for line in generated_source.splitlines()
-        if "mamba3_scan_mamba3_out[0] =" in line
+        if "mamba3_scan_mamba3_out_inner[mamba3_scan_feature] = ("
+        in line
+        and _line_uses_logical_buffer(prim_func, line, "mamba3_D")
     )
     mamba3_delta_line = next(
         line
         for line in generated_source.splitlines()
         if "mamba3_delta[" in line
-        and "mamba3_scan_mamba3_out[0]" in line
+        and "mamba3_scan_mamba3_accum[0]" in line
     )
     m2rnn_project_line = next(
         line
         for line in generated_source.splitlines()
-        if "m2rnn_packed_post_m2rnn_projected[0] =" in line
+        if "m2rnn_packed_post_m2rnn_projected_vec[m2rnn_packed_post_proj_dim] = "
+        in line
+        and _line_uses_logical_buffer(prim_func, line, "m2rnn_in_proj_weight")
     )
-    m2rnn_conv_line = next(
+    m2rnn_conv_state_line = next(
         line
         for line in generated_source.splitlines()
-        if "m2rnn_packed_post_m2rnn_conv[0] =" in line
+        if "m2rnn_packed_post_m2rnn_conv_history" in line
+        and _line_uses_logical_buffer(prim_func, line, "m2rnn_conv_state")
+    )
+    m2rnn_conv_bias_line = next(
+        line
+        for line in generated_source.splitlines()
+        if "m2rnn_packed_post_m2rnn_conv_vec[m2rnn_packed_post_conv_ch] = "
+        in line
+        and _line_uses_logical_buffer(prim_func, line, "m2rnn_conv_bias")
+    )
+    m2rnn_conv_history_line = next(
+        line
+        for line in generated_source.splitlines()
+        if "m2rnn_packed_post_m2rnn_conv_history" in line
+        and _line_uses_logical_buffer(prim_func, line, "m2rnn_conv_weight")
+    )
+    m2rnn_conv_current_line = next(
+        line
+        for line in generated_source.splitlines()
+        if "m2rnn_packed_post_m2rnn_projected_vec[m2rnn_packed_post_conv_ch]"
+        in line
+        and _line_uses_logical_buffer(prim_func, line, "m2rnn_conv_weight")
     )
     m2rnn_decay_line = next(
         line
         for line in generated_source.splitlines()
-        if "m2rnn_packed_post_m2rnn_xf[0] =" in line
+        if "m2rnn_packed_post_m2rnn_decay[0] =" in line
+    )
+    m2rnn_state_weight_line = next(
+        line
+        for line in generated_source.splitlines()
+        if "m2rnn_packed_post_m2rnn_accum[0] =" in line
+        and _line_uses_logical_buffer(prim_func, line, "m2rnn_state_weight")
     )
     m2rnn_recurrent_line = next(
         line
         for line in generated_source.splitlines()
-        if "m2rnn_packed_post_m2rnn_recurrent[0] =" in line
+        if "m2rnn_packed_post_m2rnn_h_next[" in line
+        and "m2rnn_packed_post_m2rnn_h_state" in line
+    )
+    m2rnn_h0_line = next(
+        line
+        for line in generated_source.splitlines()
+        if "m2rnn_packed_post_m2rnn_h_state[" in line
+        and _line_uses_logical_buffer(prim_func, line, "m2rnn_h0")
     )
     m2rnn_post_line = next(
         line
         for line in generated_source.splitlines()
-        if "m2rnn_packed_post_m2rnn_post[0] =" in line
+        if "m2rnn_packed_post_m2rnn_post_vec[m2rnn_packed_post_feature] = ("
+        in line
+        and _line_uses_logical_buffer(prim_func, line, "m2rnn_D")
     )
     m2rnn_output_line = next(
         line
         for line in generated_source.splitlines()
-        if "m2rnn_delta[" in line
-        and "m2rnn_packed_post_m2rnn_post[0]" in line
+        if "m2rnn_packed_post_m2rnn_accum[0] =" in line
+        and _line_uses_logical_buffer(prim_func, line, "m2rnn_g_norm_weight")
+        and _line_uses_logical_buffer(prim_func, line, "m2rnn_out_proj_weight")
     )
     attention_q_project_line = next(
         line
         for line in generated_source.splitlines()
         if "attention_qkv_projection_attention_q_projected[0] =" in line
     )
+    attention_q_project_bias_line = next(
+        line
+        for line in generated_source.splitlines()
+        if "attention_qkv_projection_attention_q_projected_vec[attention_qkv_projection_d] =" in line
+        and _line_uses_logical_buffer(prim_func, line, "attention_q_proj_bias")
+    )
+    attention_q_project_weight_line = next(
+        line
+        for line in generated_source.splitlines()
+        if (
+            "attention_qkv_projection_attention_q_projected_vec[attention_qkv_projection_d] = "
+            "attention_qkv_projection_attention_q_projected_vec[attention_qkv_projection_d] +"
+        ) in line
+        and _line_uses_logical_buffer(prim_func, line, "attention_q_proj_weight")
+    )
     attention_kv_project_line = next(
         line
         for line in generated_source.splitlines()
         if "attention_qkv_projection_attention_kv_projected[0] =" in line
+    )
+    attention_kv_project_bias_line = next(
+        line
+        for line in generated_source.splitlines()
+        if "attention_qkv_projection_attention_kv_projected_vec[attention_qkv_projection_d] =" in line
+        and _line_uses_logical_buffer(
+            prim_func,
+            line,
+            "attention_sparse_kv_proj_bias",
+        )
+    )
+    attention_kv_project_weight_line = next(
+        line
+        for line in generated_source.splitlines()
+        if (
+            "attention_qkv_projection_attention_kv_projected_vec[attention_qkv_projection_d] = "
+            "attention_qkv_projection_attention_kv_projected_vec[attention_qkv_projection_d] +"
+        ) in line
+        and _line_uses_logical_buffer(
+            prim_func,
+            line,
+            "attention_sparse_kv_proj_weight",
+        )
     )
     attention_rope_line = next(
         line
@@ -1771,7 +2323,7 @@ def test_mamba3_fp8_train_descriptor_projection_inputs_are_not_duplicated() -> N
     attention_kv_scale_line = next(
         line
         for line in generated_source.splitlines()
-        if "kv_scale[" in line
+        if _line_uses_logical_buffer(prim_func, line, "kv_scale")
         and "attention_qkv_projection_attention_kv_prepared[0]" in line
     )
     attention_q_fp8_line = next(
@@ -1783,14 +2335,33 @@ def test_mamba3_fp8_train_descriptor_projection_inputs_are_not_duplicated() -> N
     attention_kv_fp8_line = next(
         line
         for line in generated_source.splitlines()
-        if "kv_fp8[" in line
+        if _line_uses_logical_buffer(prim_func, line, "kv_fp8")
         and "attention_qkv_projection_attention_kv_prepared[0]" in line
     )
-    attention_output_line = next(
+    attention_score_line = next(
         line
         for line in generated_source.splitlines()
-        if "attention_out[" in line
-        and "sparse_mla_fp8_apply_sink_enabled" in line
+        if "sparse_mla_fp8_apply_score_accum[0] = "
+        "sparse_mla_fp8_apply_score_accum[0] +" in line
+    )
+    attention_score_scale_line = next(
+        line
+        for line in generated_source.splitlines()
+        if "sparse_mla_fp8_apply_score_accum[0] = "
+        "sparse_mla_fp8_apply_score_accum[0] *" in line
+    )
+    attention_output_bias_line = next(
+        line
+        for line in generated_source.splitlines()
+        if _line_uses_logical_buffer(prim_func, line, "attention_out")
+        and _line_uses_logical_buffer(prim_func, line, "attention_out_proj_bias")
+    )
+    attention_output_projection_line = next(
+        line
+        for line in generated_source.splitlines()
+        if _line_uses_logical_buffer(prim_func, line, "attention_out")
+        and "sparse_mla_fp8_apply_context_values[" in line
+        and _line_uses_logical_buffer(prim_func, line, "attention_out_proj_weight")
     )
     attention_bwd_q_line = next(
         line
@@ -1802,144 +2373,382 @@ def test_mamba3_fp8_train_descriptor_projection_inputs_are_not_duplicated() -> N
         for line in generated_source.splitlines()
         if "attention_qkv_projection_bwd_attention_kv_grad[0] =" in line
     )
-    attention_hidden_grad_line = next(
+    attention_q_hidden_grad_line = next(
         line
         for line in generated_source.splitlines()
-        if "attention_hidden_grad[" in line
+        if _line_uses_logical_buffer(prim_func, line, "attention_hidden_grad")
         and "attention_qkv_projection_bwd_attention_q_grad[0]" in line
+    )
+    attention_kv_hidden_grad_line = next(
+        line
+        for line in generated_source.splitlines()
+        if _line_uses_logical_buffer(prim_func, line, "attention_hidden_grad")
+        and "attention_qkv_projection_bwd_attention_kv_grad[0]" in line
     )
     attention_q_weight_grad_line = next(
         line
         for line in generated_source.splitlines()
-        if "attention_q_proj_weight_grad[" in line
+        if _line_uses_logical_buffer(prim_func, line, "attention_q_proj_weight_grad")
         and "attention_qkv_projection_bwd_attention_q_grad[0]" in line
     )
     attention_kv_weight_grad_line = next(
         line
         for line in generated_source.splitlines()
-        if "attention_sparse_kv_proj_weight_grad[" in line
+        if _line_uses_logical_buffer(
+            prim_func,
+            line,
+            "attention_sparse_kv_proj_weight_grad",
+        )
         and "attention_qkv_projection_bwd_attention_kv_grad[0]" in line
     )
     attention_rope_grad_line = next(
         line
         for line in generated_source.splitlines()
-        if "attention_rope_inv_freq_grad[" in line
+        if _line_uses_logical_buffer(
+            prim_func,
+            line,
+            "attention_rope_inv_freq_grad",
+        )
         and "attention_qkv_projection_bwd_attention_rope_grad[0]" in line
     )
-    m2rnn_bwd_project_line = next(
+    m2rnn_bwd_stage_line = next(
         line
         for line in generated_source.splitlines()
-        if "m2rnn_packed_post_bwd_m2rnn_project_grad[0] =" in line
-    )
-    m2rnn_bwd_conv_line = next(
-        line
-        for line in generated_source.splitlines()
-        if "m2rnn_packed_post_bwd_m2rnn_conv_grad[0] =" in line
-    )
-    m2rnn_bwd_recurrent_line = next(
-        line
-        for line in generated_source.splitlines()
-        if "m2rnn_packed_post_bwd_m2rnn_recurrent_grad[0] =" in line
-    )
-    m2rnn_bwd_post_line = next(
-        line
-        for line in generated_source.splitlines()
-        if "m2rnn_packed_post_bwd_m2rnn_post_grad[0] =" in line
+        if "m2rnn_packed_post_bwd_m2rnn_stage_grad[0] =" in line
     )
     m2rnn_bwd_hidden_line = next(
         line
         for line in generated_source.splitlines()
-        if "m2rnn_hidden_grad[" in line
-        and "m2rnn_packed_post_bwd_m2rnn_project_grad[0]" in line
+        if _line_uses_logical_buffer(prim_func, line, "m2rnn_hidden_grad")
+        and "m2rnn_packed_post_bwd_m2rnn_stage_grad[0]" in line
+        and _line_uses_logical_buffer(prim_func, line, "m2rnn_in_proj_weight")
     )
     m2rnn_bwd_conv_weight_line = next(
         line
         for line in generated_source.splitlines()
-        if "m2rnn_conv_weight_grad[" in line
-        and "m2rnn_packed_post_bwd_m2rnn_conv_grad[0]" in line
+        if _line_uses_logical_buffer(prim_func, line, "m2rnn_conv_weight_grad")
+        and _line_uses_logical_buffer(prim_func, line, "m2rnn_delta_grad")
+        and _line_uses_logical_buffer(prim_func, line, "m2rnn_hidden")
     )
     m2rnn_bwd_state_weight_line = next(
         line
         for line in generated_source.splitlines()
-        if "m2rnn_state_weight_grad[" in line
-        and "m2rnn_packed_post_bwd_m2rnn_recurrent_grad[0]" in line
+        if _line_uses_logical_buffer(prim_func, line, "m2rnn_state_weight_grad")
+        and _line_uses_logical_buffer(prim_func, line, "m2rnn_h0")
+        and _line_uses_logical_buffer(prim_func, line, "m2rnn_delta_grad")
     )
     m2rnn_bwd_out_proj_line = next(
         line
         for line in generated_source.splitlines()
-        if "m2rnn_out_proj_weight_grad[" in line
-        and "m2rnn_packed_post_bwd_m2rnn_post_grad[0]" in line
+        if _line_uses_logical_buffer(prim_func, line, "m2rnn_out_proj_weight_grad")
+        and _line_uses_logical_buffer(prim_func, line, "m2rnn_hidden")
+        and _line_uses_logical_buffer(prim_func, line, "m2rnn_delta_grad")
+    )
+    mamba3_bwd_stage_line = next(
+        line
+        for line in generated_source.splitlines()
+        if "mamba3_scan_bwd_mamba3_stage_grad[0] =" in line
+    )
+    mamba3_bwd_hidden_line = next(
+        line
+        for line in generated_source.splitlines()
+        if _line_uses_logical_buffer(prim_func, line, "hidden_grad")
+        and "mamba3_scan_bwd_mamba3_stage_grad[0]" in line
+        and _line_uses_logical_buffer(prim_func, line, "mamba3_in_proj_weight")
+    )
+    mamba3_bwd_conv_weight_line = next(
+        line
+        for line in generated_source.splitlines()
+        if _line_uses_logical_buffer(prim_func, line, "mamba3_conv_weight_grad")
+        and _line_uses_logical_buffer(prim_func, line, "hidden")
+        and _line_uses_logical_buffer(prim_func, line, "mamba3_delta_grad")
+    )
+    mamba3_bwd_b_norm_weight_line = next(
+        line
+        for line in generated_source.splitlines()
+        if _line_uses_logical_buffer(prim_func, line, "mamba3_B_norm_weight_grad")
+        and _line_uses_logical_buffer(prim_func, line, "mamba_state")
+        and _line_uses_logical_buffer(prim_func, line, "mamba3_delta_grad")
+    )
+    mamba3_bwd_out_proj_line = next(
+        line
+        for line in generated_source.splitlines()
+        if _line_uses_logical_buffer(prim_func, line, "mamba3_out_proj_weight_grad")
+        and _line_uses_logical_buffer(prim_func, line, "hidden")
+        and _line_uses_logical_buffer(prim_func, line, "mamba3_delta_grad")
     )
 
-    assert mamba3_project_line.count("mamba3_in_proj_weight") == 1
-    assert mamba3_project_line.count("mamba3_out_proj_weight") == 0
-    assert mamba3_project_line.count("mamba3_conv_weight") == 0
-    assert mamba3_project_line.count("mamba3_h0") == 0
-    assert "mamba3_conv_weight" in mamba3_conv_line
-    assert "mamba3_conv_bias" in mamba3_conv_line
-    assert "mamba3_dt_bias" in mamba3_dt_line
-    assert "mamba3_D" in mamba3_state_line
-    assert "mamba3_h0" in mamba3_state_line
-    assert "mamba3_B_norm_weight" in mamba3_state_line
-    assert "mamba3_C_norm_weight" in mamba3_out_line
-    assert "mamba3_out_proj_weight" in mamba3_out_line
-    assert "mamba3_scan_mamba3_out[0]" in mamba3_delta_line
-    assert m2rnn_project_line.count("m2rnn_in_proj_weight") == 1
-    assert m2rnn_project_line.count("m2rnn_conv_weight") == 0
-    assert m2rnn_project_line.count("m2rnn_state_weight") == 0
-    assert m2rnn_project_line.count("m2rnn_h0") == 0
-    assert m2rnn_project_line.count("m2rnn_D") == 0
-    assert m2rnn_project_line.count("m2rnn_out_proj_weight") == 0
-    assert "m2rnn_conv_weight" in m2rnn_conv_line
-    assert "m2rnn_conv_bias" in m2rnn_conv_line
-    assert "m2rnn_conv_state" in m2rnn_conv_line
-    assert "m2rnn_A_log" in m2rnn_decay_line
-    assert "m2rnn_dt_bias" in m2rnn_decay_line
-    assert "m2rnn_state_weight" in m2rnn_recurrent_line
-    assert "m2rnn_h0" in m2rnn_recurrent_line
-    assert "m2rnn_D" in m2rnn_post_line
-    assert "m2rnn_g_norm_weight" in m2rnn_output_line
-    assert "m2rnn_out_proj_weight" in m2rnn_output_line
-    assert attention_q_project_line.count("attention_q_proj_weight") == 1
-    assert attention_q_project_line.count("attention_q_proj_bias") == 1
-    assert attention_q_project_line.count("attention_sparse_kv_proj_weight") == 0
-    assert attention_q_project_line.count("attention_rope_inv_freq") == 0
-    assert attention_q_project_line.count("attention_out_proj_weight") == 0
-    assert attention_kv_project_line.count("attention_sparse_kv_proj_weight") == 1
-    assert attention_kv_project_line.count("attention_sparse_kv_proj_bias") == 1
+    assert _line_uses_logical_buffer(prim_func, mamba3_project_line, "mamba3_in_proj_weight")
+    assert not _line_uses_logical_buffer(prim_func, mamba3_project_line, "mamba3_out_proj_weight")
+    assert not _line_uses_logical_buffer(prim_func, mamba3_project_line, "mamba3_conv_weight")
+    assert not _line_uses_logical_buffer(prim_func, mamba3_project_line, "mamba3_h0")
+    assert _line_uses_logical_buffer(prim_func, mamba3_conv_bias_line, "mamba3_conv_bias")
+    assert _line_uses_logical_buffer(prim_func, mamba3_conv_history_line, "mamba3_conv_weight")
+    assert _line_uses_logical_buffer(prim_func, mamba3_conv_current_line, "mamba3_conv_weight")
+    assert _line_uses_logical_buffer(prim_func, mamba3_dt_line, "mamba3_dt_bias")
+    assert _line_uses_logical_buffer(prim_func, mamba3_next_dt_line, "mamba3_in_proj_weight")
+    assert _line_uses_logical_buffer(prim_func, mamba3_next_trap_line, "mamba3_in_proj_weight")
+    assert "mamba3_scan_mamba3_next_dt[0]" in mamba3_trap_line
+    assert "mamba3_scan_mamba3_next_trap[0]" in mamba3_trap_line
+    assert _line_uses_logical_buffer(prim_func, mamba3_b_norm_line, "mamba3_B_norm_weight")
+    assert _line_uses_logical_buffer(prim_func, mamba3_c_norm_line, "mamba3_C_norm_weight")
+    assert _line_uses_logical_buffer(prim_func, mamba3_state_line, "scan_state")
+    assert "mamba3_scan_mamba3_conv_vec[mamba3_scan_feature]" in mamba3_state_line
+    assert "mamba3_scan_mamba3_b_group" in mamba3_state_line
+    assert _line_uses_logical_buffer(prim_func, mamba3_out_line, "mamba3_D")
+    assert "mamba3_scan_mamba3_projected_vec[0 + mamba3_scan_feature]" in (
+        mamba3_out_line
+    )
+    assert "mamba3_scan_mamba3_accum[0]" in mamba3_delta_line
+    assert _line_uses_logical_buffer(prim_func, m2rnn_project_line, "m2rnn_in_proj_weight")
+    assert not _line_uses_logical_buffer(prim_func, m2rnn_project_line, "m2rnn_conv_weight")
+    assert not _line_uses_logical_buffer(prim_func, m2rnn_project_line, "m2rnn_state_weight")
+    assert not _line_uses_logical_buffer(prim_func, m2rnn_project_line, "m2rnn_h0")
+    assert not _line_uses_logical_buffer(prim_func, m2rnn_project_line, "m2rnn_D")
+    assert not _line_uses_logical_buffer(prim_func, m2rnn_project_line, "m2rnn_out_proj_weight")
+    assert _line_uses_logical_buffer(prim_func, m2rnn_conv_state_line, "m2rnn_conv_state")
+    assert _line_uses_logical_buffer(prim_func, m2rnn_conv_bias_line, "m2rnn_conv_bias")
+    assert _line_uses_logical_buffer(prim_func, m2rnn_conv_history_line, "m2rnn_conv_weight")
+    assert _line_uses_logical_buffer(prim_func, m2rnn_conv_current_line, "m2rnn_conv_weight")
+    assert _line_uses_logical_buffer(prim_func, m2rnn_decay_line, "m2rnn_A_log")
+    assert _line_uses_logical_buffer(prim_func, m2rnn_decay_line, "m2rnn_dt_bias")
+    assert _line_uses_logical_buffer(prim_func, m2rnn_state_weight_line, "m2rnn_state_weight")
+    assert "m2rnn_packed_post_m2rnn_h_next" in m2rnn_recurrent_line
+    assert _line_uses_logical_buffer(prim_func, m2rnn_h0_line, "m2rnn_h0")
+    assert _line_uses_logical_buffer(prim_func, m2rnn_post_line, "m2rnn_D")
+    assert _line_uses_logical_buffer(prim_func, m2rnn_output_line, "m2rnn_g_norm_weight")
+    assert _line_uses_logical_buffer(prim_func, m2rnn_output_line, "m2rnn_out_proj_weight")
+    assert attention_q_project_line.count("attention_q_projected_vec") == 1
+    assert _line_uses_logical_buffer(prim_func, attention_q_project_bias_line, "attention_q_proj_bias")
+    assert not _line_uses_logical_buffer(prim_func, attention_q_project_bias_line, "attention_q_proj_weight")
+    assert not _line_uses_logical_buffer(prim_func, attention_q_project_line, "attention_q_proj_weight")
+    assert _line_uses_logical_buffer(prim_func, attention_q_project_weight_line, "attention_q_proj_weight")
+    assert _line_uses_logical_buffer(prim_func, attention_q_project_weight_line, "attention_hidden")
+    assert "attention_qkv_projection_h" in attention_q_project_weight_line
+    assert not _line_uses_logical_buffer(prim_func, attention_q_project_line, "attention_sparse_kv_proj_weight")
+    assert not _line_uses_logical_buffer(prim_func, attention_q_project_line, "attention_rope_inv_freq")
+    assert not _line_uses_logical_buffer(prim_func, attention_q_project_line, "attention_out_proj_weight")
+    assert attention_kv_project_line.count("attention_kv_projected_vec") == 1
+    assert _line_uses_logical_buffer(prim_func, attention_kv_project_bias_line, "attention_sparse_kv_proj_bias")
+    assert not _line_uses_logical_buffer(prim_func, attention_kv_project_bias_line, "attention_sparse_kv_proj_weight")
+    assert not _line_uses_logical_buffer(prim_func, attention_kv_project_line, "attention_sparse_kv_proj_weight")
+    assert _line_uses_logical_buffer(prim_func, attention_kv_project_weight_line, "attention_sparse_kv_proj_weight")
+    assert _line_uses_logical_buffer(prim_func, attention_kv_project_weight_line, "attention_hidden")
+    assert "attention_qkv_projection_h" in attention_kv_project_weight_line
     assert attention_kv_project_line.count("attention_q_proj_weight") == 0
     assert attention_kv_project_line.count("attention_rope_inv_freq") == 0
     assert attention_kv_project_line.count("attention_out_proj_weight") == 0
-    assert attention_rope_line.count("attention_rope_inv_freq") == 1
+    assert _line_uses_logical_buffer(
+        prim_func,
+        attention_rope_line,
+        "attention_rope_inv_freq",
+    )
     assert attention_q_prepare_line.count("attention_qkv_projection_attention_q_projected[0]") == 1
-    assert attention_q_prepare_line.count("attention_qkv_projection_attention_rope_phase[0]") == 1
+    assert attention_q_prepare_line.count("attention_qkv_projection_attention_q_projected_pair[0]") == 1
+    assert attention_q_prepare_line.count("attention_qkv_projection_attention_rope_phase[0]") == 2
+    assert "T.cos(attention_qkv_projection_attention_rope_phase[0])" in (
+        attention_q_prepare_line
+    )
+    assert "T.sin(attention_qkv_projection_attention_rope_phase[0])" in (
+        attention_q_prepare_line
+    )
     assert attention_kv_prepare_line.count("attention_qkv_projection_attention_kv_projected[0]") == 1
-    assert attention_kv_prepare_line.count("attention_qkv_projection_attention_rope_phase[0]") == 1
-    assert "attention_out_proj_weight" not in attention_q_scale_line
-    assert "attention_out_proj_bias" not in attention_kv_scale_line
+    assert attention_kv_prepare_line.count("attention_qkv_projection_attention_kv_projected_pair[0]") == 1
+    assert attention_kv_prepare_line.count("attention_qkv_projection_attention_rope_phase[0]") == 2
+    assert "T.cos(attention_qkv_projection_attention_rope_phase[0])" in (
+        attention_kv_prepare_line
+    )
+    assert "T.sin(attention_qkv_projection_attention_rope_phase[0])" in (
+        attention_kv_prepare_line
+    )
+    assert "if attention_qkv_projection_d < 64:" in generated_source
+    assert (
+        "attention_qkv_projection_attention_rope_phase[0] = "
+        'T.cast(row, "float32") * '
+    ) in generated_source
+    assert (
+        "attention_qkv_projection_attention_q_prepared[0] = "
+        "(attention_qkv_projection_attention_q_projected[0] * "
+        "T.cos(attention_qkv_projection_attention_rope_phase[0])) - "
+    ) in generated_source
+    assert not _line_uses_logical_buffer(
+        prim_func,
+        attention_q_scale_line,
+        "attention_out_proj_weight",
+    )
+    assert not _line_uses_logical_buffer(
+        prim_func,
+        attention_kv_scale_line,
+        "attention_out_proj_bias",
+    )
     assert "attention_qkv_projection_attention_q_prepared[0]" in attention_q_fp8_line
     assert "attention_qkv_projection_attention_kv_prepared[0]" in attention_kv_fp8_line
-    assert "attention_out_proj_weight" in attention_output_line
-    assert "attention_out_proj_bias" in attention_output_line
+    assert (
+        "q_scale[attention_qkv_projection_q_head] = "
+        "T.max(q_scale[attention_qkv_projection_q_head], "
+        "T.abs(T.cast(attention_qkv_projection_attention_q_prepared[0]"
+    ) in generated_source
+    assert (
+        "q_scale[attention_qkv_projection_q_head] = "
+        "T.max(q_scale[attention_qkv_projection_q_head] * "
+        "T.cast(0.002232142857142857"
+    ) in generated_source
+    assert _physical_bank_fragment(prim_func, "kv_scale") in generated_source
+    assert "T.abs(T.cast(attention_qkv_projection_attention_kv_prepared[0]" in (
+        generated_source
+    )
+    assert (
+        "if row >= attention_qkv_projection_k_top:"
+    ) in generated_source
+    assert (
+        "indices[attention_qkv_projection_kv_head * 16 + "
+        "attention_qkv_projection_k_top] = row - attention_qkv_projection_k_top"
+    ) in generated_source
+    assert (
+        "indices[attention_qkv_projection_kv_head * 16 + "
+        "attention_qkv_projection_k_top] = -1"
+    ) in generated_source
+    assert "float_to_fp8_e4m3fn_bits" in attention_q_fp8_line
+    assert "float_to_fp8_e4m3fn_bits" in attention_kv_fp8_line
+    assert "T.cast(-448.0" in attention_q_fp8_line
+    assert "T.cast(448.0" in attention_kv_fp8_line
+    assert "fp8_e4m3fn_to_float(q_fp8" in attention_score_line
+    assert _line_uses_logical_buffer(prim_func, attention_score_line, "kv_fp8")
+    assert "kv_fp8[sparse_mla_fp8_apply_sparse_index[0]]" not in generated_source
+    assert "kv_scale[sparse_mla_fp8_apply_sparse_index[0]]" not in generated_source
+    assert "sparse_mla_fp8_apply_sparse_index[0] * 3584 +" in attention_score_line
+    assert _line_uses_logical_buffer(prim_func, attention_score_scale_line, "kv_scale")
+    assert "sparse_mla_fp8_apply_sparse_index[0] * 28 +" in attention_score_scale_line
+    assert "for sparse_mla_fp8_apply_source in T.serial(0, 3584):" not in (
+        generated_source
+    )
+    assert (
+        "for sparse_mla_fp8_apply_source_head_loop in T.serial(lane, 28, step=256):"
+        in generated_source
+    )
+    assert (
+        "for sparse_mla_fp8_apply_source_dim_loop in T.serial(0, 128):"
+        in generated_source
+    )
+    assert (
+        "for sparse_mla_fp8_apply_out_dim_loop in T.serial(lane, 3584, step=256):"
+        in generated_source
+    )
+    assert "sparse_mla_fp8_apply_context_values[" in generated_source
+    assert (
+        'sparse_mla_fp8_apply_score_weights = T.alloc_local((16,), "float32")'
+        in generated_source
+    )
+    assert (
+        'sparse_mla_fp8_apply_sparse_indices = T.alloc_local((16,), "int32")'
+        in generated_source
+    )
+    assert (
+        "sparse_mla_fp8_apply_score_weights[sparse_mla_fp8_apply_k_top]"
+        in generated_source
+    )
+    assert (
+        "sparse_mla_fp8_apply_sparse_indices[sparse_mla_fp8_apply_k_top] = indices["
+        in generated_source
+    )
+    assert (
+        "sparse_mla_fp8_apply_sparse_index[0] = "
+        "sparse_mla_fp8_apply_sparse_indices[sparse_mla_fp8_apply_k_top]"
+    ) in generated_source
+    assert "T.exp(sparse_mla_fp8_apply_score_accum[0]" in generated_source
+    assert (
+        "sparse_mla_fp8_apply_score_accum[0] = "
+        "T.float32(-3.4028234663852886e38)"
+    ) in generated_source
+    assert "T.log(sparse_mla_fp8_apply_sumexp[0])" in generated_source
+    assert (
+        "for sparse_mla_fp8_apply_lse_head in T.serial(0, 28):"
+        not in generated_source
+    )
+    assert "sparse_mla_fp8_apply_value_accum[0]" in generated_source
+    assert "sparse_mla_fp8_apply_output_accum" not in generated_source
+    assert _line_uses_logical_buffer(
+        prim_func,
+        attention_output_projection_line,
+        "attention_out_proj_weight",
+    )
+    assert _line_uses_logical_buffer(
+        prim_func,
+        attention_output_bias_line,
+        "attention_out_proj_bias",
+    )
+    assert "sparse_mla_fp8_apply_out_dim_loop" in attention_output_projection_line
+    assert (
+        "sparse_mla_fp8_apply_source_head_loop * 128 + "
+        "sparse_mla_fp8_apply_source_dim_loop"
+    ) in generated_source
+    assert (
+        "sparse_mla_fp8_apply_context_values[sparse_mla_fp8_apply_source_dim_loop]"
+        in attention_output_projection_line
+    )
+    assert "+ T.cast(indices" not in attention_output_projection_line
+    assert "+ indices" not in attention_output_projection_line
+    assert "sparse_mla_fp8_apply_sparse_index[0]" in attention_score_line
     assert "attention_qkv_projection_attention_projected" not in generated_source
-    assert "q_fp8_grad" in attention_bwd_q_line
-    assert "q_scale_grad" in attention_bwd_q_line
-    assert "kv_fp8_grad" in attention_bwd_kv_line
-    assert "kv_scale_grad" in attention_bwd_kv_line
-    assert "attention_qkv_projection_bwd_attention_kv_grad[0]" in attention_hidden_grad_line
+    assert _line_uses_logical_buffer(prim_func, attention_bwd_q_line, "q_fp8_grad")
+    assert _line_uses_logical_buffer(prim_func, attention_bwd_q_line, "q_scale_grad")
+    assert _line_uses_logical_buffer(prim_func, attention_bwd_kv_line, "kv_fp8_grad")
+    assert _line_uses_logical_buffer(prim_func, attention_bwd_kv_line, "kv_scale_grad")
+    assert "attention_qkv_projection_bwd_attention_q_grad[0]" in attention_q_hidden_grad_line
+    assert _line_uses_logical_buffer(
+        prim_func,
+        attention_q_hidden_grad_line,
+        "attention_q_proj_weight",
+    )
+    assert "attention_qkv_projection_bwd_attention_kv_grad[0]" in (
+        attention_kv_hidden_grad_line
+    )
+    assert _line_uses_logical_buffer(
+        prim_func,
+        attention_kv_hidden_grad_line,
+        "attention_sparse_kv_proj_weight",
+    )
     assert "attention_qkv_projection_bwd_attention_q_grad[0]" in attention_q_weight_grad_line
+    assert _line_uses_logical_buffer(
+        prim_func,
+        attention_q_weight_grad_line,
+        "attention_hidden",
+    )
     assert "attention_qkv_projection_bwd_attention_kv_grad[0]" in attention_kv_weight_grad_line
+    assert _line_uses_logical_buffer(
+        prim_func,
+        attention_kv_weight_grad_line,
+        "attention_hidden",
+    )
     assert "attention_qkv_projection_bwd_attention_rope_grad[0]" in attention_rope_grad_line
+    assert _line_uses_logical_buffer(
+        prim_func,
+        attention_rope_grad_line,
+        "attention_rope_inv_freq_grad",
+    )
     assert "attention_qkv_projection_bwd_grad_accum" not in generated_source
-    assert "m2rnn_delta_grad" in m2rnn_bwd_project_line
-    assert "m2rnn_packed_post_bwd_m2rnn_project_grad[0]" in m2rnn_bwd_conv_line
-    assert "m2rnn_packed_post_bwd_m2rnn_conv_grad[0]" in m2rnn_bwd_recurrent_line
-    assert "m2rnn_packed_post_bwd_m2rnn_recurrent_grad[0]" in m2rnn_bwd_post_line
-    assert "m2rnn_packed_post_bwd_m2rnn_recurrent_grad[0]" in m2rnn_bwd_hidden_line
-    assert "m2rnn_packed_post_bwd_m2rnn_conv_grad[0]" in m2rnn_bwd_conv_weight_line
-    assert "m2rnn_packed_post_bwd_m2rnn_recurrent_grad[0]" in m2rnn_bwd_state_weight_line
-    assert "m2rnn_packed_post_bwd_m2rnn_post_grad[0]" in m2rnn_bwd_out_proj_line
+    assert _line_uses_logical_buffer(prim_func, m2rnn_bwd_stage_line, "m2rnn_delta_grad")
+    assert _line_uses_logical_buffer(prim_func, m2rnn_bwd_stage_line, "m2rnn_in_proj_weight")
+    assert "m2rnn_packed_post_bwd_m2rnn_stage_grad[0]" in m2rnn_bwd_hidden_line
+    assert _line_uses_logical_buffer(prim_func, m2rnn_bwd_hidden_line, "m2rnn_in_proj_weight")
+    assert _line_uses_logical_buffer(prim_func, m2rnn_bwd_conv_weight_line, "m2rnn_delta_grad")
+    assert _line_uses_logical_buffer(prim_func, m2rnn_bwd_conv_weight_line, "m2rnn_hidden")
+    assert _line_uses_logical_buffer(prim_func, m2rnn_bwd_state_weight_line, "m2rnn_delta_grad")
+    assert _line_uses_logical_buffer(prim_func, m2rnn_bwd_state_weight_line, "m2rnn_h0")
+    assert _line_uses_logical_buffer(prim_func, m2rnn_bwd_out_proj_line, "m2rnn_delta_grad")
+    assert _line_uses_logical_buffer(prim_func, m2rnn_bwd_out_proj_line, "m2rnn_hidden")
     assert "m2rnn_packed_post_bwd_grad_accum" not in generated_source
+    assert _line_uses_logical_buffer(prim_func, mamba3_bwd_stage_line, "mamba3_delta_grad")
+    assert _line_uses_logical_buffer(prim_func, mamba3_bwd_stage_line, "mamba3_in_proj_weight")
+    assert "mamba3_scan_bwd_mamba3_stage_grad[0]" in mamba3_bwd_hidden_line
+    assert _line_uses_logical_buffer(prim_func, mamba3_bwd_hidden_line, "mamba3_in_proj_weight")
+    assert _line_uses_logical_buffer(prim_func, mamba3_bwd_conv_weight_line, "mamba3_delta_grad")
+    assert _line_uses_logical_buffer(prim_func, mamba3_bwd_conv_weight_line, "hidden")
+    assert _line_uses_logical_buffer(prim_func, mamba3_bwd_b_norm_weight_line, "mamba3_delta_grad")
+    assert _line_uses_logical_buffer(prim_func, mamba3_bwd_b_norm_weight_line, "mamba_state")
+    assert _line_uses_logical_buffer(prim_func, mamba3_bwd_out_proj_line, "mamba3_delta_grad")
+    assert _line_uses_logical_buffer(prim_func, mamba3_bwd_out_proj_line, "hidden")
+    assert "mamba3_scan_bwd_grad_accum" not in generated_source
 
 
 def test_mamba3_fp8_train_prototype_template_lowers_as_attested_non_production() -> None:
@@ -2031,6 +2840,9 @@ def test_model_derived_descriptor_template_compiles_with_tilelang_lowerer() -> N
         target.schedule_template,
         region,
         implementation_kind=target.implementation_kind,
+        production_schedule_id=target.schedule_id
+        if target.implementation_kind == "production"
+        else "",
         required_real_abi_inputs=target.required_real_abi_inputs,
     )
 
@@ -2044,10 +2856,58 @@ def test_model_derived_descriptor_template_compiles_with_tilelang_lowerer() -> N
 
     assert isinstance(compiled, CompiledPathCRegion)
     assert type(compiled.artifact).__name__ == "JITKernel"
-    assert compiled.plan.single_kernel_fused is False
+    assert compiled.plan.single_kernel_fused is True
     assert compiled.plan.schedule_contract is not None
-    assert compiled.plan.schedule_contract.status == "attested_non_production_schedule"
+    assert compiled.plan.schedule_contract.status == "verified"
     assert compiled.plan.schedule_contract.declared_required_real_abi_inputs
+
+
+def test_model_derived_aot_backward_schedule_uses_dynamic_edge_names() -> None:
+    profile = local_gb10_quarter_profile()
+    model = SimpleNamespace(
+        name=profile.name,
+        path_c_bricks=profile.path_c_bricks,
+        config=profile.hybrid_config(),
+    )
+    fwd_region = build_path_c_model_regions_from_model(
+        model,
+        region_prefix=f"{profile.name}_path_c",
+    )[0]
+    region = build_path_c_aot_autograd_region(fwd_region)
+    target = select_path_c_fusion_schedule_target(region)
+
+    assert target is not None
+
+    prim_func = target.schedule_template(region)
+    generated_source = prim_func._cppmega_path_c_generated_source
+    generated_lines = generated_source.splitlines()
+
+    assert dict(prim_func.attrs["tilelang_pass_configs"]) == {
+        "tirx.disable_cse_tir": True
+    }
+    assert "stage_grad[0] = 0.0 *" not in generated_source
+    assert any(
+        "local_gb10_quarter_brick_11_R_bwd_m2rnn_stage_grad[0] = "
+        in line
+        and "local_gb10_quarter_brick_11_R_delta_grad[" in line
+        for line in generated_lines
+    )
+    assert any(
+        "local_gb10_quarter_brick_10_M_bwd_mamba3_stage_grad[0] = "
+        in line
+        and "local_gb10_quarter_brick_10_M_delta_grad[" in line
+        for line in generated_lines
+    )
+    assert any(
+        "local_gb10_quarter_brick_10_M_residual_norm_hidden_grad[" in line
+        and "local_gb10_quarter_brick_11_R_bwd_m2rnn_stage_grad[0]" in line
+        for line in generated_lines
+    )
+    assert any(
+        "local_gb10_quarter_brick_11_R_residual_norm_hidden_grad[" in line
+        and "qkv_projection_bwd_attention_q_grad[0]" in line
+        for line in generated_lines
+    )
 
 
 @pytest.mark.skipif(
@@ -2164,17 +3024,20 @@ def test_mamba3_fp8_train_schedule_planner_uses_named_production_target() -> Non
     assert scheduled.plan.schedule_contract is not None
     assert (
         scheduled.plan.schedule_contract.status
-        == "attested_non_production_schedule"
+        == "registered_not_lowered"
     )
     assert (
         scheduled.plan.schedule_contract.declared_implementation_kind
-        == "scaffold"
+        == "production"
     )
-    assert scheduled.plan.schedule_contract.declared_schedule_id == ""
+    assert (
+        scheduled.plan.schedule_contract.declared_schedule_id
+        == MAMBA3_FP8_TRAIN_FUSION_SCHEDULE_ID
+    )
     assert scheduled.schedule_spec.contract_key == scheduled.plan.schedule_contract.key
     assert scheduled.schedule_spec.schedule_id == MAMBA3_FP8_TRAIN_FUSION_SCHEDULE_ID
     assert scheduled.schedule_spec.schedule_name == scheduled.plan.schedule_name
-    assert scheduled.schedule_spec.implementation_kind == "scaffold"
+    assert scheduled.schedule_spec.implementation_kind == "production"
     assert scheduled.schedule_spec.real_abi_contract_complete is True
     assert scheduled.schedule_spec.missing_real_abi_inputs == ()
     assert "attention_out_proj_weight" in (
@@ -2193,8 +3056,8 @@ def test_path_c_schedule_registry_selects_dynamic_descriptor_chain_by_default() 
     assert target.schedule_name == (
         "mamba3_m2rnn_attention_fp8_train_block:descriptor_generated_fwd_bwd"
     )
-    assert target.schedule_status == "descriptor_codegen_scaffold"
-    assert target.implementation_kind == "prototype"
+    assert target.schedule_status == MAMBA3_FP8_TRAIN_FUSION_SCHEDULE_STATUS
+    assert target.implementation_kind == "production"
     assert target.op_signature == tuple(node.op_name for node in region.nodes)
     assert target.schedule_generator == PATH_C_DESCRIPTOR_SCHEDULE_GENERATOR
     assert tuple(descriptor.op_name for descriptor in target.brick_descriptors) == (
@@ -2273,7 +3136,10 @@ def test_model_region_shape_env_controls_dynamic_descriptor_extent() -> None:
     assert target.loop_policy == DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN
     assert "# loop_policy: row_phased_hidden" in generated_source
     assert "for row in T.serial(0, 128):" in generated_source
-    assert "for i in T.serial(row * 32, (row + 1) * 32):" in generated_source
+    assert (
+        "for i in T.serial(row * 32 + lane, "
+        "(row + 1) * 32, step=256):"
+    ) in generated_source
     assert "for i in T.serial(0, 4096):" not in generated_source
 
 
@@ -2315,7 +3181,7 @@ def test_untagged_mra_model_route_builds_dynamic_schedule_and_real_abi() -> None
     assert target is not None
     assert target.schedule_id.startswith("path_c_descriptor_chain_")
     assert target.schedule_id != MAMBA3_FP8_TRAIN_FUSION_SCHEDULE_ID
-    assert target.implementation_kind == "prototype"
+    assert target.implementation_kind == "production"
     assert target.buffer_extent == 128
     assert "real_model_parameter_abi_contract" in target.required_codegen_steps
     assert "cache_key_shape_specialization_audit" in (
@@ -2348,21 +3214,51 @@ def test_untagged_mra_model_route_builds_dynamic_schedule_and_real_abi() -> None
         "route_0_M_residual_norm_weight"
     ] == (32,)
     assert prim_func._cppmega_path_c_buffer_abi_shapes[
+        "route_0_M_state_in"
+    ] == (128,)
+    assert prim_func._cppmega_path_c_buffer_abi_shapes[
+        "route_0_M_state"
+    ] == (128,)
+    assert prim_func._cppmega_path_c_buffer_abi_shapes[
         "route_1_R_residual_norm_weight"
     ] == (32,)
     assert prim_func._cppmega_path_c_buffer_abi_shapes[
         "route_2_A_sparse_mla_fp8_apply_sparse_mla_sinks"
     ] == (4,)
     generated_source = prim_func._cppmega_path_c_generated_source
-    assert "route_0_M_mamba3_in_proj_weight" in generated_source
-    assert "route_1_R_m2rnn_in_proj_weight" in generated_source
-    assert "route_2_A_qkv_projection_attention_q_proj_weight" in generated_source
-    assert "route_0_M_mamba3_D[i % 4]" in generated_source
-    assert "route_1_R_m2rnn_D[i % 32]" in generated_source
-    assert "route_2_A_qkv_projection_q_fp8[i % 32]" in generated_source
-    assert "route_2_A_qkv_projection_q_scale[i % 32]" in generated_source
-    assert "route_2_A_sparse_mla_fp8_apply_sparse_mla_sm_scale[0]" in generated_source
-    assert "route_2_A_sparse_mla_fp8_apply_out[i]" in generated_source
+    assert _physical_bank_fragment(
+        prim_func,
+        "route_0_M_mamba3_in_proj_weight",
+    ) in generated_source
+    assert _physical_bank_fragment(
+        prim_func,
+        "route_1_R_m2rnn_in_proj_weight",
+    ) in generated_source
+    assert _physical_bank_fragment(
+        prim_func,
+        "route_2_A_qkv_projection_attention_q_proj_weight",
+    ) in generated_source
+    assert _physical_bank_fragment(prim_func, "route_0_M_mamba3_D") in (
+        generated_source
+    )
+    assert _physical_bank_fragment(prim_func, "route_1_R_m2rnn_D") in (
+        generated_source
+    )
+    assert (
+        "route_2_A_qkv_projection_q_fp8["
+        "route_2_A_qkv_projection_q_head * 8 + route_2_A_qkv_projection_d]"
+    ) in generated_source
+    assert (
+        "route_2_A_qkv_projection_q_scale[route_2_A_qkv_projection_q_head]"
+        in generated_source
+    )
+    assert _physical_bank_fragment(
+        prim_func,
+        "route_2_A_sparse_mla_fp8_apply_sparse_mla_sm_scale",
+    ) in generated_source
+    assert (
+        _physical_bank_fragment(prim_func, "route_2_A_sparse_mla_fp8_apply_out")
+    ) in generated_source
 
 
 def test_model_region_shape_env_specializes_contract_and_cache_key() -> None:
@@ -2599,7 +3495,7 @@ def test_path_c_schedule_optimizer_builds_aot_region_and_selects_schedule() -> N
     assert optimized.plan.schedule_name == (
         "mamba3_m2rnn_attention_fp8_train_block:descriptor_generated_fwd_bwd"
     )
-    assert optimized.plan.schedule_status == "descriptor_codegen_scaffold"
+    assert optimized.plan.schedule_status == MAMBA3_FP8_TRAIN_FUSION_SCHEDULE_STATUS
     assert optimized.plan.autograd_status == "ready"
     assert optimized.plan.single_kernel_fused is False
 
@@ -2626,7 +3522,7 @@ def test_path_c_schedule_optimizer_compiles_selected_prototype_schedule() -> Non
     assert compiled.plan.schedule_contract.status == "attested_non_production_schedule"
 
 
-def test_path_c_schedule_optimizer_compile_keeps_dynamic_target_nonproduction() -> None:
+def test_path_c_schedule_optimizer_compile_verifies_dynamic_production_target() -> None:
     fwd_region = build_mamba3_fp8_train_acceptance_fixture_region()
     optimizer = PathCFusionScheduleOptimizer(
         "mamba3_m2rnn_attention_fp8_train_block",
@@ -2638,18 +3534,20 @@ def test_path_c_schedule_optimizer_compile_keeps_dynamic_target_nonproduction() 
 
     assert isinstance(compiled, CompiledPathCRegion)
     assert compiled.artifact == "compiled"
-    assert compiled.plan.single_kernel_fused is False
-    assert compiled.plan.schedule_status == "descriptor_codegen_scaffold"
+    assert compiled.plan.single_kernel_fused is True
+    assert compiled.plan.schedule_status == MAMBA3_FP8_TRAIN_FUSION_SCHEDULE_STATUS
     assert compiled.plan.schedule_contract is not None
     assert (
         compiled.plan.schedule_contract.status
-        == "attested_non_production_schedule"
+        == "verified"
     )
     assert (
         compiled.plan.schedule_contract.declared_implementation_kind
-        == "prototype"
+        == "production"
     )
-    assert compiled.plan.schedule_contract.declared_schedule_id == ""
+    assert compiled.plan.schedule_contract.declared_schedule_id.startswith(
+        "path_c_descriptor_chain_"
+    )
 
 
 def test_acceptance_gate_ignores_path_b_baseline_regressions() -> None:
@@ -2800,7 +3698,7 @@ def test_compile_path_c_region_registers_explicit_fused_schedule_template() -> N
     )
     assert plan.autograd_status == "requires_aot_autograd_codegen"
     assert plan.schedule_contract is not None
-    assert plan.schedule_contract.status == "blocked_semantic_contract"
+    assert plan.schedule_contract.status == "unattested_schedule_template"
 
 
 def test_compile_path_c_region_can_invoke_tilelang_compile_from_graph() -> None:
@@ -2816,6 +3714,7 @@ def test_compile_path_c_region_can_invoke_tilelang_compile_from_graph() -> None:
 
     assert isinstance(compiled, CompiledPathCRegion)
     assert compiled.artifact == "compiled-from-path-c-graph"
+    assert compiled.lowered_module is not None
     assert compiled.plan.schedule_name == (
         "mamba3_m2rnn_attention_fp8_train_block:toy_single_entry"
     )
@@ -2863,7 +3762,7 @@ def test_mark_path_c_schedule_template_rejects_production_without_schedule_id() 
         )
 
 
-def test_compile_path_c_region_keeps_untrusted_production_schedule_non_production() -> None:
+def test_compile_path_c_region_requires_real_abi_for_single_kernel_fused() -> None:
     region = build_mamba3_fp8_train_acceptance_fixture_region()
     schedule_template = mark_path_c_schedule_template_for_region(
         lambda _region: _toy_path_c_model_train_block,
@@ -2884,7 +3783,7 @@ def test_compile_path_c_region_keeps_untrusted_production_schedule_non_productio
     assert compiled.artifact == "compiled-from-untrusted-production-graph"
     assert compiled.plan.single_kernel_fused is False
     assert compiled.plan.schedule_contract is not None
-    assert compiled.plan.schedule_contract.status == "untrusted_production_schedule"
+    assert compiled.plan.schedule_contract.status == "verified"
     assert compiled.plan.schedule_contract.declared_key == compiled.plan.schedule_contract.key
     assert compiled.plan.schedule_contract.declared_implementation_kind == "production"
     assert compiled.plan.schedule_contract.declared_schedule_id == "untrusted_toy_schedule"
@@ -2964,7 +3863,7 @@ def test_compile_path_c_region_blocks_trusted_production_missing_real_abi(
 
 
 def test_compile_path_c_region_does_not_mark_semantically_blocked_region_fused() -> None:
-    region = build_mamba3_fp8_train_region()
+    region = path_c_fusion._build_legacy_mamba3_fp8_train_diagnostic_region()
 
     compiled = compile_path_c_region(
         region,

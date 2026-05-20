@@ -1,0 +1,2112 @@
+{
+  "artifact": {
+    "repr": "<tilelang.jit.kernel.JITKernel object at 0x1292e42f0>",
+    "type": "JITKernel"
+  },
+  "cache_key_recompile_audit": {
+    "cache_hit_observed": null,
+    "cache_hit_status": "not_observed_by_tilelang_api",
+    "primary": {
+      "cache_key_material": [
+        "region:local_gb10_quarter_path_c_10_12",
+        "entry:local_gb10_quarter_path_c_10_12",
+        "nodes:local_gb10_quarter_brick_10_M,local_gb10_quarter_brick_10_M_residual_norm,local_gb10_quarter_brick_11_R,local_gb10_quarter_brick_11_R_residual_norm,local_gb10_quarter_brick_12_A_qkv_projection,local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply,local_gb10_quarter_brick_12_A_qkv_projection_bwd,local_gb10_quarter_brick_11_R_residual_norm_bwd,local_gb10_quarter_brick_11_R_bwd,local_gb10_quarter_brick_10_M_residual_norm_bwd,local_gb10_quarter_brick_10_M_bwd",
+        "edges:local_gb10_quarter_brick_10_M->local_gb10_quarter_brick_10_M_residual_norm:local_gb10_quarter_brick_10_M_delta:internal,local_gb10_quarter_brick_10_M_residual_norm->local_gb10_quarter_brick_11_R:local_gb10_quarter_brick_10_M_residual_norm_hidden:internal,local_gb10_quarter_brick_10_M_residual_norm->local_gb10_quarter_brick_11_R_residual_norm:local_gb10_quarter_brick_10_M_hidden_after:internal,local_gb10_quarter_brick_11_R->local_gb10_quarter_brick_11_R_residual_norm:local_gb10_quarter_brick_11_R_delta:internal,local_gb10_quarter_brick_11_R_residual_norm->local_gb10_quarter_brick_12_A_qkv_projection:local_gb10_quarter_brick_11_R_residual_norm_hidden:internal,local_gb10_quarter_brick_12_A_qkv_projection->local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply:local_gb10_quarter_brick_12_A_qkv_projection_q_fp8:internal,local_gb10_quarter_brick_12_A_qkv_projection->local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply:local_gb10_quarter_brick_12_A_qkv_projection_q_scale:internal,local_gb10_quarter_brick_12_A_qkv_projection->local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply:local_gb10_quarter_brick_12_A_qkv_projection_kv_fp8:workspace,local_gb10_quarter_brick_12_A_qkv_projection->local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply:local_gb10_quarter_brick_12_A_qkv_projection_kv_scale:workspace,local_gb10_quarter_brick_12_A_qkv_projection->local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply:local_gb10_quarter_brick_12_A_qkv_projection_indices:internal,local_gb10_quarter_brick_11_R_residual_norm->local_gb10_quarter_brick_12_A_qkv_projection_bwd:local_gb10_quarter_brick_11_R_residual_norm_hidden:internal,local_gb10_quarter_brick_12_A_qkv_projection_bwd->local_gb10_quarter_brick_11_R_residual_norm_bwd:local_gb10_quarter_brick_11_R_residual_norm_hidden_grad:internal,local_gb10_quarter_brick_10_M_residual_norm->local_gb10_quarter_brick_11_R_residual_norm_bwd:local_gb10_quarter_brick_10_M_hidden_after:internal,local_gb10_quarter_brick_11_R->local_gb10_quarter_brick_11_R_residual_norm_bwd:local_gb10_quarter_brick_11_R_delta:internal,local_gb10_quarter_brick_11_R_residual_norm_bwd->local_gb10_quarter_brick_11_R_bwd:local_gb10_quarter_brick_11_R_delta_grad:internal,local_gb10_quarter_brick_10_M_residual_norm->local_gb10_quarter_brick_11_R_bwd:local_gb10_quarter_brick_10_M_residual_norm_hidden:internal,local_gb10_quarter_brick_11_R_residual_norm_bwd->local_gb10_quarter_brick_10_M_residual_norm_bwd:local_gb10_quarter_brick_10_M_hidden_after_grad:internal,local_gb10_quarter_brick_11_R_bwd->local_gb10_quarter_brick_10_M_residual_norm_bwd:local_gb10_quarter_brick_10_M_residual_norm_hidden_grad:internal,local_gb10_quarter_brick_10_M->local_gb10_quarter_brick_10_M_residual_norm_bwd:local_gb10_quarter_brick_10_M_delta:internal,local_gb10_quarter_brick_10_M_residual_norm_bwd->local_gb10_quarter_brick_10_M_bwd:local_gb10_quarter_brick_10_M_delta_grad:internal",
+        "backend:tilelang_tvm_ffi",
+        "boundary:tilelang_tvm_ir",
+        "z3:sync_async",
+        "schedule:local_gb10_quarter_path_c_10_12:descriptor_generated_fwd_bwd:callable:cppmega_mlx.runtime.path_c_fusion.mark_path_c_schedule_template_for_region.<locals>.attested_schedule_template:cd3df0a412ab990611fd4adb5c47d4ec461e8207067ed6249fd969b573fdfcda",
+        "shape_env:08baafa0943991557fc67448ed4f1a587ffa1c3417fe248470ff0786047db79b"
+      ],
+      "cache_key_material_sha256": "437919fdf081617403a5da20dd505fe50221c5481a034ad292adcba825f11507",
+      "lowered_module_digest": "069d1241d924dc15df56afd8d1a1659fb6a4c115aabafc362ae5651e8ba59bd3",
+      "reason": "digest covers compile plan cache-key material and the lowered single-entry TileLang IRModule",
+      "status": "lowered_module_digest_recorded"
+    },
+    "reason": "equivalent native compile attempts produced identical cache material and lowered module digests",
+    "second": {
+      "cache_key_material": [
+        "region:local_gb10_quarter_path_c_10_12",
+        "entry:local_gb10_quarter_path_c_10_12",
+        "nodes:local_gb10_quarter_brick_10_M,local_gb10_quarter_brick_10_M_residual_norm,local_gb10_quarter_brick_11_R,local_gb10_quarter_brick_11_R_residual_norm,local_gb10_quarter_brick_12_A_qkv_projection,local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply,local_gb10_quarter_brick_12_A_qkv_projection_bwd,local_gb10_quarter_brick_11_R_residual_norm_bwd,local_gb10_quarter_brick_11_R_bwd,local_gb10_quarter_brick_10_M_residual_norm_bwd,local_gb10_quarter_brick_10_M_bwd",
+        "edges:local_gb10_quarter_brick_10_M->local_gb10_quarter_brick_10_M_residual_norm:local_gb10_quarter_brick_10_M_delta:internal,local_gb10_quarter_brick_10_M_residual_norm->local_gb10_quarter_brick_11_R:local_gb10_quarter_brick_10_M_residual_norm_hidden:internal,local_gb10_quarter_brick_10_M_residual_norm->local_gb10_quarter_brick_11_R_residual_norm:local_gb10_quarter_brick_10_M_hidden_after:internal,local_gb10_quarter_brick_11_R->local_gb10_quarter_brick_11_R_residual_norm:local_gb10_quarter_brick_11_R_delta:internal,local_gb10_quarter_brick_11_R_residual_norm->local_gb10_quarter_brick_12_A_qkv_projection:local_gb10_quarter_brick_11_R_residual_norm_hidden:internal,local_gb10_quarter_brick_12_A_qkv_projection->local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply:local_gb10_quarter_brick_12_A_qkv_projection_q_fp8:internal,local_gb10_quarter_brick_12_A_qkv_projection->local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply:local_gb10_quarter_brick_12_A_qkv_projection_q_scale:internal,local_gb10_quarter_brick_12_A_qkv_projection->local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply:local_gb10_quarter_brick_12_A_qkv_projection_kv_fp8:workspace,local_gb10_quarter_brick_12_A_qkv_projection->local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply:local_gb10_quarter_brick_12_A_qkv_projection_kv_scale:workspace,local_gb10_quarter_brick_12_A_qkv_projection->local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply:local_gb10_quarter_brick_12_A_qkv_projection_indices:internal,local_gb10_quarter_brick_11_R_residual_norm->local_gb10_quarter_brick_12_A_qkv_projection_bwd:local_gb10_quarter_brick_11_R_residual_norm_hidden:internal,local_gb10_quarter_brick_12_A_qkv_projection_bwd->local_gb10_quarter_brick_11_R_residual_norm_bwd:local_gb10_quarter_brick_11_R_residual_norm_hidden_grad:internal,local_gb10_quarter_brick_10_M_residual_norm->local_gb10_quarter_brick_11_R_residual_norm_bwd:local_gb10_quarter_brick_10_M_hidden_after:internal,local_gb10_quarter_brick_11_R->local_gb10_quarter_brick_11_R_residual_norm_bwd:local_gb10_quarter_brick_11_R_delta:internal,local_gb10_quarter_brick_11_R_residual_norm_bwd->local_gb10_quarter_brick_11_R_bwd:local_gb10_quarter_brick_11_R_delta_grad:internal,local_gb10_quarter_brick_10_M_residual_norm->local_gb10_quarter_brick_11_R_bwd:local_gb10_quarter_brick_10_M_residual_norm_hidden:internal,local_gb10_quarter_brick_11_R_residual_norm_bwd->local_gb10_quarter_brick_10_M_residual_norm_bwd:local_gb10_quarter_brick_10_M_hidden_after_grad:internal,local_gb10_quarter_brick_11_R_bwd->local_gb10_quarter_brick_10_M_residual_norm_bwd:local_gb10_quarter_brick_10_M_residual_norm_hidden_grad:internal,local_gb10_quarter_brick_10_M->local_gb10_quarter_brick_10_M_residual_norm_bwd:local_gb10_quarter_brick_10_M_delta:internal,local_gb10_quarter_brick_10_M_residual_norm_bwd->local_gb10_quarter_brick_10_M_bwd:local_gb10_quarter_brick_10_M_delta_grad:internal",
+        "backend:tilelang_tvm_ffi",
+        "boundary:tilelang_tvm_ir",
+        "z3:sync_async",
+        "schedule:local_gb10_quarter_path_c_10_12:descriptor_generated_fwd_bwd:callable:cppmega_mlx.runtime.path_c_fusion.mark_path_c_schedule_template_for_region.<locals>.attested_schedule_template:cd3df0a412ab990611fd4adb5c47d4ec461e8207067ed6249fd969b573fdfcda",
+        "shape_env:08baafa0943991557fc67448ed4f1a587ffa1c3417fe248470ff0786047db79b"
+      ],
+      "cache_key_material_sha256": "437919fdf081617403a5da20dd505fe50221c5481a034ad292adcba825f11507",
+      "elapsed_s": 0.020852832996752113,
+      "lowered_module_digest": "069d1241d924dc15df56afd8d1a1659fb6a4c115aabafc362ae5651e8ba59bd3",
+      "native_compile_error": null,
+      "native_compile_ok": true,
+      "reason": "digest covers compile plan cache-key material and the lowered single-entry TileLang IRModule",
+      "status": "lowered_module_digest_recorded",
+      "stderr_tail": "",
+      "stdout_tail": "2026-05-20 11:50:10  [TileLang:tilelang.cache.kernel_cache:WARNING] (kernel_cache.py:333): Found kernel 'local_gb10_quarter_path_c_10_12' in memory cache. For better performance, consider using `@tilelang.jit` instead of direct kernel caching.\n"
+    },
+    "status": "key_stable"
+  },
+  "compile_log": {
+    "stderr_tail": "",
+    "stdout_tail": ""
+  },
+  "compile_plan": {
+    "autograd_backward_nodes": [
+      "local_gb10_quarter_brick_12_A_qkv_projection_bwd",
+      "local_gb10_quarter_brick_11_R_residual_norm_bwd",
+      "local_gb10_quarter_brick_11_R_bwd",
+      "local_gb10_quarter_brick_10_M_residual_norm_bwd",
+      "local_gb10_quarter_brick_10_M_bwd"
+    ],
+    "autograd_missing_backward_nodes": [],
+    "autograd_status": "ready",
+    "backend": "tilelang_tvm_ffi",
+    "backward_graph": "aot_autograd",
+    "compiler": "tilelang.engine.fusion",
+    "fusion_kind": "tilelang_ir_graph_region",
+    "lowering_boundary": "tilelang_tvm_ir",
+    "region_name": "local_gb10_quarter_path_c_10_12",
+    "schedule_contract": {
+      "declared_implementation_kind": "production",
+      "declared_key": "b687b88ecdef62c7258a2cef3609c45d88d64a4608a1a3445a068274d4ddf390",
+      "declared_required_real_abi_inputs": [
+        "local_gb10_quarter_brick_10_M_mamba3_in_proj_weight",
+        "local_gb10_quarter_brick_10_M_mamba3_out_proj_weight",
+        "local_gb10_quarter_brick_10_M_mamba3_conv_weight",
+        "local_gb10_quarter_brick_10_M_mamba3_conv_bias",
+        "local_gb10_quarter_brick_10_M_mamba3_dt_bias",
+        "local_gb10_quarter_brick_10_M_mamba3_B_norm_weight",
+        "local_gb10_quarter_brick_10_M_mamba3_B_bias",
+        "local_gb10_quarter_brick_10_M_mamba3_C_norm_weight",
+        "local_gb10_quarter_brick_10_M_mamba3_C_bias",
+        "local_gb10_quarter_brick_10_M_mamba3_D",
+        "local_gb10_quarter_brick_10_M_mamba3_h0",
+        "local_gb10_quarter_brick_10_M_residual_norm_weight",
+        "local_gb10_quarter_brick_11_R_m2rnn_in_proj_weight",
+        "local_gb10_quarter_brick_11_R_m2rnn_conv_weight",
+        "local_gb10_quarter_brick_11_R_m2rnn_conv_bias",
+        "local_gb10_quarter_brick_11_R_m2rnn_state_weight",
+        "local_gb10_quarter_brick_11_R_m2rnn_A_log",
+        "local_gb10_quarter_brick_11_R_m2rnn_dt_bias",
+        "local_gb10_quarter_brick_11_R_m2rnn_D",
+        "local_gb10_quarter_brick_11_R_m2rnn_g_norm_weight",
+        "local_gb10_quarter_brick_11_R_m2rnn_out_proj_weight",
+        "local_gb10_quarter_brick_11_R_m2rnn_h0",
+        "local_gb10_quarter_brick_11_R_m2rnn_conv_state",
+        "local_gb10_quarter_brick_11_R_residual_norm_weight",
+        "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_weight",
+        "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_bias",
+        "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_weight",
+        "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_bias",
+        "local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_inv_freq",
+        "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_sm_scale",
+        "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_sinks",
+        "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_has_sinks",
+        "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_attention_out_proj_weight",
+        "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_attention_out_proj_bias",
+        "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_weight_grad",
+        "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_bias_grad",
+        "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_weight_grad",
+        "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_bias_grad",
+        "local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_inv_freq_grad",
+        "local_gb10_quarter_brick_11_R_residual_norm_weight_grad",
+        "local_gb10_quarter_brick_11_R_m2rnn_in_proj_weight_grad",
+        "local_gb10_quarter_brick_11_R_m2rnn_conv_weight_grad",
+        "local_gb10_quarter_brick_11_R_m2rnn_conv_bias_grad",
+        "local_gb10_quarter_brick_11_R_m2rnn_state_weight_grad",
+        "local_gb10_quarter_brick_11_R_m2rnn_A_log_grad",
+        "local_gb10_quarter_brick_11_R_m2rnn_dt_bias_grad",
+        "local_gb10_quarter_brick_11_R_m2rnn_D_grad",
+        "local_gb10_quarter_brick_11_R_m2rnn_g_norm_weight_grad",
+        "local_gb10_quarter_brick_11_R_m2rnn_out_proj_weight_grad",
+        "local_gb10_quarter_brick_11_R_m2rnn_h0_grad",
+        "local_gb10_quarter_brick_10_M_residual_norm_weight_grad",
+        "local_gb10_quarter_brick_10_M_mamba3_in_proj_weight_grad",
+        "local_gb10_quarter_brick_10_M_mamba3_out_proj_weight_grad",
+        "local_gb10_quarter_brick_10_M_mamba3_conv_weight_grad",
+        "local_gb10_quarter_brick_10_M_mamba3_conv_bias_grad",
+        "local_gb10_quarter_brick_10_M_mamba3_dt_bias_grad",
+        "local_gb10_quarter_brick_10_M_mamba3_B_norm_weight_grad",
+        "local_gb10_quarter_brick_10_M_mamba3_B_bias_grad",
+        "local_gb10_quarter_brick_10_M_mamba3_C_norm_weight_grad",
+        "local_gb10_quarter_brick_10_M_mamba3_C_bias_grad",
+        "local_gb10_quarter_brick_10_M_mamba3_D_grad",
+        "local_gb10_quarter_brick_10_M_mamba3_h0_grad"
+      ],
+      "declared_schedule_id": "path_c_descriptor_chain_c44eddb18abd",
+      "key": "b687b88ecdef62c7258a2cef3609c45d88d64a4608a1a3445a068274d4ddf390",
+      "missing_real_abi_inputs": [],
+      "name": "local_gb10_quarter_path_c_10_12:single_entry_contract",
+      "op_signature": [
+        "mamba3_mimo",
+        "residual_rmsnorm",
+        "m2rnn",
+        "residual_rmsnorm",
+        "attention_qkv_projection",
+        "sparse_mla_fp8_apply",
+        "attention_qkv_projection_bwd",
+        "residual_rmsnorm_bwd",
+        "m2rnn_bwd",
+        "residual_rmsnorm_bwd",
+        "mamba3_mimo_bwd"
+      ],
+      "reason": "TileLang lowered a single-entry region and verified internal edge materialization",
+      "required_external_buffers": [
+        "hidden",
+        "local_gb10_quarter_brick_10_M_state_in",
+        "local_gb10_quarter_brick_10_M_mamba3_in_proj_weight",
+        "local_gb10_quarter_brick_10_M_mamba3_out_proj_weight",
+        "local_gb10_quarter_brick_10_M_mamba3_conv_weight",
+        "local_gb10_quarter_brick_10_M_mamba3_conv_bias",
+        "local_gb10_quarter_brick_10_M_mamba3_dt_bias",
+        "local_gb10_quarter_brick_10_M_mamba3_B_norm_weight",
+        "local_gb10_quarter_brick_10_M_mamba3_B_bias",
+        "local_gb10_quarter_brick_10_M_mamba3_C_norm_weight",
+        "local_gb10_quarter_brick_10_M_mamba3_C_bias",
+        "local_gb10_quarter_brick_10_M_mamba3_D",
+        "local_gb10_quarter_brick_10_M_mamba3_h0",
+        "local_gb10_quarter_brick_10_M_state",
+        "local_gb10_quarter_brick_10_M_residual_norm_weight",
+        "local_gb10_quarter_brick_11_R_m2rnn_in_proj_weight",
+        "local_gb10_quarter_brick_11_R_m2rnn_conv_weight",
+        "local_gb10_quarter_brick_11_R_m2rnn_conv_bias",
+        "local_gb10_quarter_brick_11_R_m2rnn_state_weight",
+        "local_gb10_quarter_brick_11_R_m2rnn_A_log",
+        "local_gb10_quarter_brick_11_R_m2rnn_dt_bias",
+        "local_gb10_quarter_brick_11_R_m2rnn_D",
+        "local_gb10_quarter_brick_11_R_m2rnn_g_norm_weight",
+        "local_gb10_quarter_brick_11_R_m2rnn_out_proj_weight",
+        "local_gb10_quarter_brick_11_R_m2rnn_h0",
+        "local_gb10_quarter_brick_11_R_m2rnn_conv_state",
+        "local_gb10_quarter_brick_11_R_residual_norm_weight",
+        "local_gb10_quarter_brick_11_R_hidden_after",
+        "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_weight",
+        "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_bias",
+        "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_weight",
+        "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_bias",
+        "local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_inv_freq",
+        "local_gb10_quarter_brick_12_A_qkv_projection_kv_fp8",
+        "local_gb10_quarter_brick_12_A_qkv_projection_kv_scale",
+        "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_sm_scale",
+        "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_sinks",
+        "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_has_sinks",
+        "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_attention_out_proj_weight",
+        "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_attention_out_proj_bias",
+        "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_out",
+        "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_lse",
+        "local_gb10_quarter_brick_12_A_qkv_projection_q_fp8_grad",
+        "local_gb10_quarter_brick_12_A_qkv_projection_q_scale_grad",
+        "local_gb10_quarter_brick_12_A_qkv_projection_kv_fp8_grad",
+        "local_gb10_quarter_brick_12_A_qkv_projection_kv_scale_grad",
+        "local_gb10_quarter_brick_12_A_qkv_projection_indices_grad",
+        "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_weight_grad",
+        "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_bias_grad",
+        "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_weight_grad",
+        "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_bias_grad",
+        "local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_inv_freq_grad",
+        "local_gb10_quarter_brick_11_R_hidden_after_grad",
+        "local_gb10_quarter_brick_11_R_residual_norm_weight_grad",
+        "local_gb10_quarter_brick_11_R_m2rnn_in_proj_weight_grad",
+        "local_gb10_quarter_brick_11_R_m2rnn_conv_weight_grad",
+        "local_gb10_quarter_brick_11_R_m2rnn_conv_bias_grad",
+        "local_gb10_quarter_brick_11_R_m2rnn_state_weight_grad",
+        "local_gb10_quarter_brick_11_R_m2rnn_A_log_grad",
+        "local_gb10_quarter_brick_11_R_m2rnn_dt_bias_grad",
+        "local_gb10_quarter_brick_11_R_m2rnn_D_grad",
+        "local_gb10_quarter_brick_11_R_m2rnn_g_norm_weight_grad",
+        "local_gb10_quarter_brick_11_R_m2rnn_out_proj_weight_grad",
+        "local_gb10_quarter_brick_11_R_m2rnn_h0_grad",
+        "hidden_grad",
+        "local_gb10_quarter_brick_10_M_residual_norm_weight_grad",
+        "local_gb10_quarter_brick_10_M_state_in_grad",
+        "local_gb10_quarter_brick_10_M_mamba3_in_proj_weight_grad",
+        "local_gb10_quarter_brick_10_M_mamba3_out_proj_weight_grad",
+        "local_gb10_quarter_brick_10_M_mamba3_conv_weight_grad",
+        "local_gb10_quarter_brick_10_M_mamba3_conv_bias_grad",
+        "local_gb10_quarter_brick_10_M_mamba3_dt_bias_grad",
+        "local_gb10_quarter_brick_10_M_mamba3_B_norm_weight_grad",
+        "local_gb10_quarter_brick_10_M_mamba3_B_bias_grad",
+        "local_gb10_quarter_brick_10_M_mamba3_C_norm_weight_grad",
+        "local_gb10_quarter_brick_10_M_mamba3_C_bias_grad",
+        "local_gb10_quarter_brick_10_M_mamba3_D_grad",
+        "local_gb10_quarter_brick_10_M_mamba3_h0_grad"
+      ],
+      "required_internal_buffers": [
+        "local_gb10_quarter_brick_10_M_delta",
+        "local_gb10_quarter_brick_10_M_residual_norm_hidden",
+        "local_gb10_quarter_brick_10_M_hidden_after",
+        "local_gb10_quarter_brick_11_R_delta",
+        "local_gb10_quarter_brick_11_R_residual_norm_hidden",
+        "local_gb10_quarter_brick_12_A_qkv_projection_q_fp8",
+        "local_gb10_quarter_brick_12_A_qkv_projection_q_scale",
+        "local_gb10_quarter_brick_12_A_qkv_projection_indices",
+        "local_gb10_quarter_brick_11_R_residual_norm_hidden_grad",
+        "local_gb10_quarter_brick_11_R_delta_grad",
+        "local_gb10_quarter_brick_10_M_hidden_after_grad",
+        "local_gb10_quarter_brick_10_M_residual_norm_hidden_grad",
+        "local_gb10_quarter_brick_10_M_delta_grad"
+      ],
+      "shape_env_key": "08baafa0943991557fc67448ed4f1a587ffa1c3417fe248470ff0786047db79b",
+      "status": "verified"
+    },
+    "schedule_name": "local_gb10_quarter_path_c_10_12:descriptor_generated_fwd_bwd",
+    "schedule_status": "ready",
+    "semantic_blockers": [],
+    "single_kernel_fused": true
+  },
+  "default_eligible": false,
+  "elapsed_s": 5.473144333052915,
+  "execution_backend": "tvm_ffi",
+  "fusion_cache_key": {
+    "cache_key_material": [
+      "region:local_gb10_quarter_path_c_10_12",
+      "entry:local_gb10_quarter_path_c_10_12",
+      "nodes:local_gb10_quarter_brick_10_M,local_gb10_quarter_brick_10_M_residual_norm,local_gb10_quarter_brick_11_R,local_gb10_quarter_brick_11_R_residual_norm,local_gb10_quarter_brick_12_A_qkv_projection,local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply,local_gb10_quarter_brick_12_A_qkv_projection_bwd,local_gb10_quarter_brick_11_R_residual_norm_bwd,local_gb10_quarter_brick_11_R_bwd,local_gb10_quarter_brick_10_M_residual_norm_bwd,local_gb10_quarter_brick_10_M_bwd",
+      "edges:local_gb10_quarter_brick_10_M->local_gb10_quarter_brick_10_M_residual_norm:local_gb10_quarter_brick_10_M_delta:internal,local_gb10_quarter_brick_10_M_residual_norm->local_gb10_quarter_brick_11_R:local_gb10_quarter_brick_10_M_residual_norm_hidden:internal,local_gb10_quarter_brick_10_M_residual_norm->local_gb10_quarter_brick_11_R_residual_norm:local_gb10_quarter_brick_10_M_hidden_after:internal,local_gb10_quarter_brick_11_R->local_gb10_quarter_brick_11_R_residual_norm:local_gb10_quarter_brick_11_R_delta:internal,local_gb10_quarter_brick_11_R_residual_norm->local_gb10_quarter_brick_12_A_qkv_projection:local_gb10_quarter_brick_11_R_residual_norm_hidden:internal,local_gb10_quarter_brick_12_A_qkv_projection->local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply:local_gb10_quarter_brick_12_A_qkv_projection_q_fp8:internal,local_gb10_quarter_brick_12_A_qkv_projection->local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply:local_gb10_quarter_brick_12_A_qkv_projection_q_scale:internal,local_gb10_quarter_brick_12_A_qkv_projection->local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply:local_gb10_quarter_brick_12_A_qkv_projection_kv_fp8:workspace,local_gb10_quarter_brick_12_A_qkv_projection->local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply:local_gb10_quarter_brick_12_A_qkv_projection_kv_scale:workspace,local_gb10_quarter_brick_12_A_qkv_projection->local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply:local_gb10_quarter_brick_12_A_qkv_projection_indices:internal,local_gb10_quarter_brick_11_R_residual_norm->local_gb10_quarter_brick_12_A_qkv_projection_bwd:local_gb10_quarter_brick_11_R_residual_norm_hidden:internal,local_gb10_quarter_brick_12_A_qkv_projection_bwd->local_gb10_quarter_brick_11_R_residual_norm_bwd:local_gb10_quarter_brick_11_R_residual_norm_hidden_grad:internal,local_gb10_quarter_brick_10_M_residual_norm->local_gb10_quarter_brick_11_R_residual_norm_bwd:local_gb10_quarter_brick_10_M_hidden_after:internal,local_gb10_quarter_brick_11_R->local_gb10_quarter_brick_11_R_residual_norm_bwd:local_gb10_quarter_brick_11_R_delta:internal,local_gb10_quarter_brick_11_R_residual_norm_bwd->local_gb10_quarter_brick_11_R_bwd:local_gb10_quarter_brick_11_R_delta_grad:internal,local_gb10_quarter_brick_10_M_residual_norm->local_gb10_quarter_brick_11_R_bwd:local_gb10_quarter_brick_10_M_residual_norm_hidden:internal,local_gb10_quarter_brick_11_R_residual_norm_bwd->local_gb10_quarter_brick_10_M_residual_norm_bwd:local_gb10_quarter_brick_10_M_hidden_after_grad:internal,local_gb10_quarter_brick_11_R_bwd->local_gb10_quarter_brick_10_M_residual_norm_bwd:local_gb10_quarter_brick_10_M_residual_norm_hidden_grad:internal,local_gb10_quarter_brick_10_M->local_gb10_quarter_brick_10_M_residual_norm_bwd:local_gb10_quarter_brick_10_M_delta:internal,local_gb10_quarter_brick_10_M_residual_norm_bwd->local_gb10_quarter_brick_10_M_bwd:local_gb10_quarter_brick_10_M_delta_grad:internal",
+      "backend:tilelang_tvm_ffi",
+      "boundary:tilelang_tvm_ir",
+      "z3:sync_async",
+      "schedule:local_gb10_quarter_path_c_10_12:descriptor_generated_fwd_bwd:callable:cppmega_mlx.runtime.path_c_fusion.mark_path_c_schedule_template_for_region.<locals>.attested_schedule_template:cd3df0a412ab990611fd4adb5c47d4ec461e8207067ed6249fd969b573fdfcda",
+      "shape_env:08baafa0943991557fc67448ed4f1a587ffa1c3417fe248470ff0786047db79b"
+    ],
+    "cache_key_material_sha256": "437919fdf081617403a5da20dd505fe50221c5481a034ad292adcba825f11507",
+    "lowered_module_digest": "069d1241d924dc15df56afd8d1a1659fb6a4c115aabafc362ae5651e8ba59bd3",
+    "reason": "digest covers compile plan cache-key material and the lowered single-entry TileLang IRModule",
+    "status": "lowered_module_digest_recorded"
+  },
+  "generated_source": {
+    "bytes": 113761,
+    "compile_pass_configs": {
+      "tirx.disable_cse_tir": true
+    },
+    "internal_scratch_abi_buffers": [
+      "local_gb10_quarter_brick_10_M_delta",
+      "local_gb10_quarter_brick_10_M_hidden_after",
+      "local_gb10_quarter_brick_10_M_residual_norm_hidden",
+      "local_gb10_quarter_brick_11_R_delta",
+      "local_gb10_quarter_brick_11_R_residual_norm_hidden",
+      "local_gb10_quarter_brick_11_R_residual_norm_hidden_grad",
+      "local_gb10_quarter_brick_10_M_hidden_after_grad",
+      "local_gb10_quarter_brick_11_R_delta_grad",
+      "local_gb10_quarter_brick_10_M_residual_norm_hidden_grad",
+      "local_gb10_quarter_brick_10_M_delta_grad"
+    ],
+    "internal_scratch_abi_count": 10,
+    "logical_buffer_abi_map_count": 78,
+    "logical_parameter_count": 78,
+    "path": "reports/path_c_fusion_compile_source.py",
+    "physical_abi_policy": "banked_by_dtype",
+    "physical_abi_runtime_binding": {
+      "bridge_plan": {
+        "bank_dtypes": {
+          "path_c_float32_abi_bank": "float32",
+          "path_c_int32_abi_bank": "int32",
+          "path_c_uint8_abi_bank": "uint8"
+        },
+        "logical_buffers_by_bank": {
+          "path_c_float32_abi_bank": [
+            "hidden",
+            "hidden_grad",
+            "local_gb10_quarter_brick_10_M_mamba3_B_bias",
+            "local_gb10_quarter_brick_10_M_mamba3_B_bias_grad",
+            "local_gb10_quarter_brick_10_M_mamba3_B_norm_weight",
+            "local_gb10_quarter_brick_10_M_mamba3_B_norm_weight_grad",
+            "local_gb10_quarter_brick_10_M_mamba3_C_bias",
+            "local_gb10_quarter_brick_10_M_mamba3_C_bias_grad",
+            "local_gb10_quarter_brick_10_M_mamba3_C_norm_weight",
+            "local_gb10_quarter_brick_10_M_mamba3_C_norm_weight_grad",
+            "local_gb10_quarter_brick_10_M_mamba3_D",
+            "local_gb10_quarter_brick_10_M_mamba3_D_grad",
+            "local_gb10_quarter_brick_10_M_mamba3_conv_bias",
+            "local_gb10_quarter_brick_10_M_mamba3_conv_bias_grad",
+            "local_gb10_quarter_brick_10_M_mamba3_conv_weight",
+            "local_gb10_quarter_brick_10_M_mamba3_conv_weight_grad",
+            "local_gb10_quarter_brick_10_M_mamba3_dt_bias",
+            "local_gb10_quarter_brick_10_M_mamba3_dt_bias_grad",
+            "local_gb10_quarter_brick_10_M_mamba3_h0",
+            "local_gb10_quarter_brick_10_M_mamba3_h0_grad",
+            "local_gb10_quarter_brick_10_M_mamba3_in_proj_weight",
+            "local_gb10_quarter_brick_10_M_mamba3_in_proj_weight_grad",
+            "local_gb10_quarter_brick_10_M_mamba3_out_proj_weight",
+            "local_gb10_quarter_brick_10_M_mamba3_out_proj_weight_grad",
+            "local_gb10_quarter_brick_10_M_residual_norm_weight",
+            "local_gb10_quarter_brick_10_M_residual_norm_weight_grad",
+            "local_gb10_quarter_brick_10_M_state",
+            "local_gb10_quarter_brick_10_M_state_in",
+            "local_gb10_quarter_brick_10_M_state_in_grad",
+            "local_gb10_quarter_brick_11_R_hidden_after",
+            "local_gb10_quarter_brick_11_R_hidden_after_grad",
+            "local_gb10_quarter_brick_11_R_m2rnn_A_log",
+            "local_gb10_quarter_brick_11_R_m2rnn_A_log_grad",
+            "local_gb10_quarter_brick_11_R_m2rnn_D",
+            "local_gb10_quarter_brick_11_R_m2rnn_D_grad",
+            "local_gb10_quarter_brick_11_R_m2rnn_conv_bias",
+            "local_gb10_quarter_brick_11_R_m2rnn_conv_bias_grad",
+            "local_gb10_quarter_brick_11_R_m2rnn_conv_state",
+            "local_gb10_quarter_brick_11_R_m2rnn_conv_weight",
+            "local_gb10_quarter_brick_11_R_m2rnn_conv_weight_grad",
+            "local_gb10_quarter_brick_11_R_m2rnn_dt_bias",
+            "local_gb10_quarter_brick_11_R_m2rnn_dt_bias_grad",
+            "local_gb10_quarter_brick_11_R_m2rnn_g_norm_weight",
+            "local_gb10_quarter_brick_11_R_m2rnn_g_norm_weight_grad",
+            "local_gb10_quarter_brick_11_R_m2rnn_h0",
+            "local_gb10_quarter_brick_11_R_m2rnn_h0_grad",
+            "local_gb10_quarter_brick_11_R_m2rnn_in_proj_weight",
+            "local_gb10_quarter_brick_11_R_m2rnn_in_proj_weight_grad",
+            "local_gb10_quarter_brick_11_R_m2rnn_out_proj_weight",
+            "local_gb10_quarter_brick_11_R_m2rnn_out_proj_weight_grad",
+            "local_gb10_quarter_brick_11_R_m2rnn_state_weight",
+            "local_gb10_quarter_brick_11_R_m2rnn_state_weight_grad",
+            "local_gb10_quarter_brick_11_R_residual_norm_weight",
+            "local_gb10_quarter_brick_11_R_residual_norm_weight_grad",
+            "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_bias",
+            "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_bias_grad",
+            "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_weight",
+            "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_weight_grad",
+            "local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_inv_freq",
+            "local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_inv_freq_grad",
+            "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_bias",
+            "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_bias_grad",
+            "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_weight",
+            "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_weight_grad",
+            "local_gb10_quarter_brick_12_A_qkv_projection_indices_grad",
+            "local_gb10_quarter_brick_12_A_qkv_projection_kv_scale",
+            "local_gb10_quarter_brick_12_A_qkv_projection_kv_scale_grad",
+            "local_gb10_quarter_brick_12_A_qkv_projection_q_scale_grad",
+            "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_attention_out_proj_bias",
+            "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_attention_out_proj_weight",
+            "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_lse",
+            "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_out",
+            "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_sinks",
+            "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_sm_scale"
+          ],
+          "path_c_int32_abi_bank": [
+            "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_has_sinks"
+          ],
+          "path_c_uint8_abi_bank": [
+            "local_gb10_quarter_brick_12_A_qkv_projection_kv_fp8",
+            "local_gb10_quarter_brick_12_A_qkv_projection_kv_fp8_grad",
+            "local_gb10_quarter_brick_12_A_qkv_projection_q_fp8_grad"
+          ]
+        },
+        "logical_tensor_binding_supported": false,
+        "no_hidden_allocation_policy": true,
+        "prepacked_bank_binding_supported": true,
+        "reason": "banked physical ABI groups logical buffers into dtype banks; the runtime bridge refuses to pack or copy model tensors implicitly and requires caller-owned bank buffers",
+        "required_bank_buffers": [
+          "path_c_float32_abi_bank",
+          "path_c_uint8_abi_bank",
+          "path_c_int32_abi_bank"
+        ],
+        "status": "prepacked_bank_buffers_required"
+      },
+      "errors": [],
+      "missing_bank_buffers": [
+        "path_c_float32_abi_bank",
+        "path_c_uint8_abi_bank",
+        "path_c_int32_abi_bank"
+      ],
+      "ordered_kernel_buffers": [
+        "path_c_float32_abi_bank",
+        "path_c_uint8_abi_bank",
+        "path_c_int32_abi_bank"
+      ],
+      "reason": "no caller-owned physical bank buffers were supplied",
+      "status": "not_bound",
+      "unexpected_buffers": []
+    },
+    "physical_abi_runtime_bridge": {
+      "bank_dtypes": {
+        "path_c_float32_abi_bank": "float32",
+        "path_c_int32_abi_bank": "int32",
+        "path_c_uint8_abi_bank": "uint8"
+      },
+      "logical_buffers_by_bank": {
+        "path_c_float32_abi_bank": [
+          "hidden",
+          "hidden_grad",
+          "local_gb10_quarter_brick_10_M_mamba3_B_bias",
+          "local_gb10_quarter_brick_10_M_mamba3_B_bias_grad",
+          "local_gb10_quarter_brick_10_M_mamba3_B_norm_weight",
+          "local_gb10_quarter_brick_10_M_mamba3_B_norm_weight_grad",
+          "local_gb10_quarter_brick_10_M_mamba3_C_bias",
+          "local_gb10_quarter_brick_10_M_mamba3_C_bias_grad",
+          "local_gb10_quarter_brick_10_M_mamba3_C_norm_weight",
+          "local_gb10_quarter_brick_10_M_mamba3_C_norm_weight_grad",
+          "local_gb10_quarter_brick_10_M_mamba3_D",
+          "local_gb10_quarter_brick_10_M_mamba3_D_grad",
+          "local_gb10_quarter_brick_10_M_mamba3_conv_bias",
+          "local_gb10_quarter_brick_10_M_mamba3_conv_bias_grad",
+          "local_gb10_quarter_brick_10_M_mamba3_conv_weight",
+          "local_gb10_quarter_brick_10_M_mamba3_conv_weight_grad",
+          "local_gb10_quarter_brick_10_M_mamba3_dt_bias",
+          "local_gb10_quarter_brick_10_M_mamba3_dt_bias_grad",
+          "local_gb10_quarter_brick_10_M_mamba3_h0",
+          "local_gb10_quarter_brick_10_M_mamba3_h0_grad",
+          "local_gb10_quarter_brick_10_M_mamba3_in_proj_weight",
+          "local_gb10_quarter_brick_10_M_mamba3_in_proj_weight_grad",
+          "local_gb10_quarter_brick_10_M_mamba3_out_proj_weight",
+          "local_gb10_quarter_brick_10_M_mamba3_out_proj_weight_grad",
+          "local_gb10_quarter_brick_10_M_residual_norm_weight",
+          "local_gb10_quarter_brick_10_M_residual_norm_weight_grad",
+          "local_gb10_quarter_brick_10_M_state",
+          "local_gb10_quarter_brick_10_M_state_in",
+          "local_gb10_quarter_brick_10_M_state_in_grad",
+          "local_gb10_quarter_brick_11_R_hidden_after",
+          "local_gb10_quarter_brick_11_R_hidden_after_grad",
+          "local_gb10_quarter_brick_11_R_m2rnn_A_log",
+          "local_gb10_quarter_brick_11_R_m2rnn_A_log_grad",
+          "local_gb10_quarter_brick_11_R_m2rnn_D",
+          "local_gb10_quarter_brick_11_R_m2rnn_D_grad",
+          "local_gb10_quarter_brick_11_R_m2rnn_conv_bias",
+          "local_gb10_quarter_brick_11_R_m2rnn_conv_bias_grad",
+          "local_gb10_quarter_brick_11_R_m2rnn_conv_state",
+          "local_gb10_quarter_brick_11_R_m2rnn_conv_weight",
+          "local_gb10_quarter_brick_11_R_m2rnn_conv_weight_grad",
+          "local_gb10_quarter_brick_11_R_m2rnn_dt_bias",
+          "local_gb10_quarter_brick_11_R_m2rnn_dt_bias_grad",
+          "local_gb10_quarter_brick_11_R_m2rnn_g_norm_weight",
+          "local_gb10_quarter_brick_11_R_m2rnn_g_norm_weight_grad",
+          "local_gb10_quarter_brick_11_R_m2rnn_h0",
+          "local_gb10_quarter_brick_11_R_m2rnn_h0_grad",
+          "local_gb10_quarter_brick_11_R_m2rnn_in_proj_weight",
+          "local_gb10_quarter_brick_11_R_m2rnn_in_proj_weight_grad",
+          "local_gb10_quarter_brick_11_R_m2rnn_out_proj_weight",
+          "local_gb10_quarter_brick_11_R_m2rnn_out_proj_weight_grad",
+          "local_gb10_quarter_brick_11_R_m2rnn_state_weight",
+          "local_gb10_quarter_brick_11_R_m2rnn_state_weight_grad",
+          "local_gb10_quarter_brick_11_R_residual_norm_weight",
+          "local_gb10_quarter_brick_11_R_residual_norm_weight_grad",
+          "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_bias",
+          "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_bias_grad",
+          "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_weight",
+          "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_weight_grad",
+          "local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_inv_freq",
+          "local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_inv_freq_grad",
+          "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_bias",
+          "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_bias_grad",
+          "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_weight",
+          "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_weight_grad",
+          "local_gb10_quarter_brick_12_A_qkv_projection_indices_grad",
+          "local_gb10_quarter_brick_12_A_qkv_projection_kv_scale",
+          "local_gb10_quarter_brick_12_A_qkv_projection_kv_scale_grad",
+          "local_gb10_quarter_brick_12_A_qkv_projection_q_scale_grad",
+          "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_attention_out_proj_bias",
+          "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_attention_out_proj_weight",
+          "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_lse",
+          "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_out",
+          "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_sinks",
+          "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_sm_scale"
+        ],
+        "path_c_int32_abi_bank": [
+          "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_has_sinks"
+        ],
+        "path_c_uint8_abi_bank": [
+          "local_gb10_quarter_brick_12_A_qkv_projection_kv_fp8",
+          "local_gb10_quarter_brick_12_A_qkv_projection_kv_fp8_grad",
+          "local_gb10_quarter_brick_12_A_qkv_projection_q_fp8_grad"
+        ]
+      },
+      "logical_tensor_binding_supported": false,
+      "no_hidden_allocation_policy": true,
+      "prepacked_bank_binding_supported": true,
+      "reason": "banked physical ABI groups logical buffers into dtype banks; the runtime bridge refuses to pack or copy model tensors implicitly and requires caller-owned bank buffers",
+      "required_bank_buffers": [
+        "path_c_float32_abi_bank",
+        "path_c_uint8_abi_bank",
+        "path_c_int32_abi_bank"
+      ],
+      "status": "prepacked_bank_buffers_required"
+    },
+    "physical_abi_validation": {
+      "bank_capacity_elements": {
+        "path_c_float32_abi_bank": 330011533,
+        "path_c_int32_abi_bank": 1,
+        "path_c_uint8_abi_bank": 44040192
+      },
+      "bank_count": 3,
+      "bank_used_bytes": {
+        "path_c_float32_abi_bank": 1320046132,
+        "path_c_int32_abi_bank": 4,
+        "path_c_uint8_abi_bank": 44040192
+      },
+      "bank_used_elements": {
+        "path_c_float32_abi_bank": 330011533,
+        "path_c_int32_abi_bank": 1,
+        "path_c_uint8_abi_bank": 44040192
+      },
+      "errors": [],
+      "logical_buffer_count": 78,
+      "status": "ok"
+    },
+    "physical_buffer_abi_map": {
+      "hidden": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 0,
+        "shape": [
+          14680064
+        ],
+        "size": 14680064
+      },
+      "hidden_grad": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 221799597,
+        "shape": [
+          14680064
+        ],
+        "size": 14680064
+      },
+      "local_gb10_quarter_brick_10_M_mamba3_B_bias": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 108198000,
+        "shape": [
+          2048
+        ],
+        "size": 2048
+      },
+      "local_gb10_quarter_brick_10_M_mamba3_B_bias_grad": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 329546525,
+        "shape": [
+          2048
+        ],
+        "size": 2048
+      },
+      "local_gb10_quarter_brick_10_M_mamba3_B_norm_weight": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 108195952,
+        "shape": [
+          2048
+        ],
+        "size": 2048
+      },
+      "local_gb10_quarter_brick_10_M_mamba3_B_norm_weight_grad": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 329544477,
+        "shape": [
+          2048
+        ],
+        "size": 2048
+      },
+      "local_gb10_quarter_brick_10_M_mamba3_C_bias": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 108202096,
+        "shape": [
+          2048
+        ],
+        "size": 2048
+      },
+      "local_gb10_quarter_brick_10_M_mamba3_C_bias_grad": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 329550621,
+        "shape": [
+          2048
+        ],
+        "size": 2048
+      },
+      "local_gb10_quarter_brick_10_M_mamba3_C_norm_weight": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 108200048,
+        "shape": [
+          2048
+        ],
+        "size": 2048
+      },
+      "local_gb10_quarter_brick_10_M_mamba3_C_norm_weight_grad": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 329548573,
+        "shape": [
+          2048
+        ],
+        "size": 2048
+      },
+      "local_gb10_quarter_brick_10_M_mamba3_D": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 108204144,
+        "shape": [
+          112
+        ],
+        "size": 112
+      },
+      "local_gb10_quarter_brick_10_M_mamba3_D_grad": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 329552669,
+        "shape": [
+          112
+        ],
+        "size": 112
+      },
+      "local_gb10_quarter_brick_10_M_mamba3_conv_bias": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 108184576,
+        "shape": [
+          11264
+        ],
+        "size": 11264
+      },
+      "local_gb10_quarter_brick_10_M_mamba3_conv_bias_grad": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 329533101,
+        "shape": [
+          11264
+        ],
+        "size": 11264
+      },
+      "local_gb10_quarter_brick_10_M_mamba3_conv_weight": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 108150784,
+        "shape": [
+          33792
+        ],
+        "size": 33792
+      },
+      "local_gb10_quarter_brick_10_M_mamba3_conv_weight_grad": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 329499309,
+        "shape": [
+          33792
+        ],
+        "size": 33792
+      },
+      "local_gb10_quarter_brick_10_M_mamba3_dt_bias": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 108195840,
+        "shape": [
+          112
+        ],
+        "size": 112
+      },
+      "local_gb10_quarter_brick_10_M_mamba3_dt_bias_grad": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 329544365,
+        "shape": [
+          112
+        ],
+        "size": 112
+      },
+      "local_gb10_quarter_brick_10_M_mamba3_h0": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 108204256,
+        "shape": [
+          458752
+        ],
+        "size": 458752
+      },
+      "local_gb10_quarter_brick_10_M_mamba3_h0_grad": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 329552781,
+        "shape": [
+          458752
+        ],
+        "size": 458752
+      },
+      "local_gb10_quarter_brick_10_M_mamba3_in_proj_weight": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 15138816,
+        "shape": [
+          67321856
+        ],
+        "size": 67321856
+      },
+      "local_gb10_quarter_brick_10_M_mamba3_in_proj_weight_grad": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 236487341,
+        "shape": [
+          67321856
+        ],
+        "size": 67321856
+      },
+      "local_gb10_quarter_brick_10_M_mamba3_out_proj_weight": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 82460672,
+        "shape": [
+          25690112
+        ],
+        "size": 25690112
+      },
+      "local_gb10_quarter_brick_10_M_mamba3_out_proj_weight_grad": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 303809197,
+        "shape": [
+          25690112
+        ],
+        "size": 25690112
+      },
+      "local_gb10_quarter_brick_10_M_residual_norm_weight": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 109121760,
+        "shape": [
+          3584
+        ],
+        "size": 3584
+      },
+      "local_gb10_quarter_brick_10_M_residual_norm_weight_grad": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 236479661,
+        "shape": [
+          3584
+        ],
+        "size": 3584
+      },
+      "local_gb10_quarter_brick_10_M_state": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 108663008,
+        "shape": [
+          458752
+        ],
+        "size": 458752
+      },
+      "local_gb10_quarter_brick_10_M_state_in": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 14680064,
+        "shape": [
+          458752
+        ],
+        "size": 458752
+      },
+      "local_gb10_quarter_brick_10_M_state_in_grad": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 236483245,
+        "shape": [
+          4096
+        ],
+        "size": 4096
+      },
+      "local_gb10_quarter_brick_11_R_hidden_after": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 110174056,
+        "shape": [
+          14680064
+        ],
+        "size": 14680064
+      },
+      "local_gb10_quarter_brick_11_R_hidden_after_grad": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 206071301,
+        "shape": [
+          14680064
+        ],
+        "size": 14680064
+      },
+      "local_gb10_quarter_brick_11_R_m2rnn_A_log": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 109936384,
+        "shape": [
+          4
+        ],
+        "size": 4
+      },
+      "local_gb10_quarter_brick_11_R_m2rnn_A_log_grad": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 221565989,
+        "shape": [
+          4
+        ],
+        "size": 4
+      },
+      "local_gb10_quarter_brick_11_R_m2rnn_D": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 109936392,
+        "shape": [
+          64
+        ],
+        "size": 64
+      },
+      "local_gb10_quarter_brick_11_R_m2rnn_D_grad": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 221565997,
+        "shape": [
+          64
+        ],
+        "size": 64
+      },
+      "local_gb10_quarter_brick_11_R_m2rnn_conv_bias": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 109935968,
+        "shape": [
+          160
+        ],
+        "size": 160
+      },
+      "local_gb10_quarter_brick_11_R_m2rnn_conv_bias_grad": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 221565573,
+        "shape": [
+          160
+        ],
+        "size": 160
+      },
+      "local_gb10_quarter_brick_11_R_m2rnn_conv_state": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 110169992,
+        "shape": [
+          480
+        ],
+        "size": 480
+      },
+      "local_gb10_quarter_brick_11_R_m2rnn_conv_weight": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 109935328,
+        "shape": [
+          640
+        ],
+        "size": 640
+      },
+      "local_gb10_quarter_brick_11_R_m2rnn_conv_weight_grad": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 221564933,
+        "shape": [
+          640
+        ],
+        "size": 640
+      },
+      "local_gb10_quarter_brick_11_R_m2rnn_dt_bias": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 109936388,
+        "shape": [
+          4
+        ],
+        "size": 4
+      },
+      "local_gb10_quarter_brick_11_R_m2rnn_dt_bias_grad": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 221565993,
+        "shape": [
+          4
+        ],
+        "size": 4
+      },
+      "local_gb10_quarter_brick_11_R_m2rnn_g_norm_weight": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 109936456,
+        "shape": [
+          64
+        ],
+        "size": 64
+      },
+      "local_gb10_quarter_brick_11_R_m2rnn_g_norm_weight_grad": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 221566061,
+        "shape": [
+          64
+        ],
+        "size": 64
+      },
+      "local_gb10_quarter_brick_11_R_m2rnn_h0": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 110165896,
+        "shape": [
+          4096
+        ],
+        "size": 4096
+      },
+      "local_gb10_quarter_brick_11_R_m2rnn_h0_grad": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 221795501,
+        "shape": [
+          4096
+        ],
+        "size": 4096
+      },
+      "local_gb10_quarter_brick_11_R_m2rnn_in_proj_weight": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 109125344,
+        "shape": [
+          809984
+        ],
+        "size": 809984
+      },
+      "local_gb10_quarter_brick_11_R_m2rnn_in_proj_weight_grad": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 220754949,
+        "shape": [
+          809984
+        ],
+        "size": 809984
+      },
+      "local_gb10_quarter_brick_11_R_m2rnn_out_proj_weight": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 109936520,
+        "shape": [
+          229376
+        ],
+        "size": 229376
+      },
+      "local_gb10_quarter_brick_11_R_m2rnn_out_proj_weight_grad": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 221566125,
+        "shape": [
+          229376
+        ],
+        "size": 229376
+      },
+      "local_gb10_quarter_brick_11_R_m2rnn_state_weight": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 109936128,
+        "shape": [
+          256
+        ],
+        "size": 256
+      },
+      "local_gb10_quarter_brick_11_R_m2rnn_state_weight_grad": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 221565733,
+        "shape": [
+          256
+        ],
+        "size": 256
+      },
+      "local_gb10_quarter_brick_11_R_residual_norm_weight": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 110170472,
+        "shape": [
+          3584
+        ],
+        "size": 3584
+      },
+      "local_gb10_quarter_brick_11_R_residual_norm_weight_grad": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 220751365,
+        "shape": [
+          3584
+        ],
+        "size": 3584
+      },
+      "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_bias": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 137699176,
+        "shape": [
+          3584
+        ],
+        "size": 3584
+      },
+      "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_bias_grad": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 193219013,
+        "shape": [
+          3584
+        ],
+        "size": 3584
+      },
+      "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_weight": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 124854120,
+        "shape": [
+          12845056
+        ],
+        "size": 12845056
+      },
+      "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_weight_grad": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 180373957,
+        "shape": [
+          12845056
+        ],
+        "size": 12845056
+      },
+      "local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_inv_freq": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 150551400,
+        "shape": [
+          64
+        ],
+        "size": 64
+      },
+      "local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_inv_freq_grad": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 206071237,
+        "shape": [
+          64
+        ],
+        "size": 64
+      },
+      "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_bias": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 150547816,
+        "shape": [
+          3584
+        ],
+        "size": 3584
+      },
+      "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_bias_grad": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 206067653,
+        "shape": [
+          3584
+        ],
+        "size": 3584
+      },
+      "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_weight": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 137702760,
+        "shape": [
+          12845056
+        ],
+        "size": 12845056
+      },
+      "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_weight_grad": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 193222597,
+        "shape": [
+          12845056
+        ],
+        "size": 12845056
+      },
+      "local_gb10_quarter_brick_12_A_qkv_projection_indices_grad": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 178538949,
+        "shape": [
+          1835008
+        ],
+        "size": 1835008
+      },
+      "local_gb10_quarter_brick_12_A_qkv_projection_kv_fp8": {
+        "bank": "path_c_uint8_abi_bank",
+        "dtype": "uint8",
+        "offset": 0,
+        "shape": [
+          14680064
+        ],
+        "size": 14680064
+      },
+      "local_gb10_quarter_brick_12_A_qkv_projection_kv_fp8_grad": {
+        "bank": "path_c_uint8_abi_bank",
+        "dtype": "uint8",
+        "offset": 29360128,
+        "shape": [
+          14680064
+        ],
+        "size": 14680064
+      },
+      "local_gb10_quarter_brick_12_A_qkv_projection_kv_scale": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 150551464,
+        "shape": [
+          114688
+        ],
+        "size": 114688
+      },
+      "local_gb10_quarter_brick_12_A_qkv_projection_kv_scale_grad": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 178424261,
+        "shape": [
+          114688
+        ],
+        "size": 114688
+      },
+      "local_gb10_quarter_brick_12_A_qkv_projection_q_fp8_grad": {
+        "bank": "path_c_uint8_abi_bank",
+        "dtype": "uint8",
+        "offset": 14680064,
+        "shape": [
+          14680064
+        ],
+        "size": 14680064
+      },
+      "local_gb10_quarter_brick_12_A_qkv_projection_q_scale_grad": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 178309573,
+        "shape": [
+          114688
+        ],
+        "size": 114688
+      },
+      "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_attention_out_proj_bias": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 163511237,
+        "shape": [
+          3584
+        ],
+        "size": 3584
+      },
+      "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_attention_out_proj_weight": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 150666181,
+        "shape": [
+          12845056
+        ],
+        "size": 12845056
+      },
+      "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_lse": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 178194885,
+        "shape": [
+          114688
+        ],
+        "size": 114688
+      },
+      "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_out": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 163514821,
+        "shape": [
+          14680064
+        ],
+        "size": 14680064
+      },
+      "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_has_sinks": {
+        "bank": "path_c_int32_abi_bank",
+        "dtype": "int32",
+        "offset": 0,
+        "shape": [
+          1
+        ],
+        "size": 1
+      },
+      "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_sinks": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 150666153,
+        "shape": [
+          28
+        ],
+        "size": 28
+      },
+      "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_sm_scale": {
+        "bank": "path_c_float32_abi_bank",
+        "dtype": "float32",
+        "offset": 150666152,
+        "shape": [
+          1
+        ],
+        "size": 1
+      }
+    },
+    "physical_buffer_abi_shapes": {
+      "path_c_float32_abi_bank": [
+        330011533
+      ],
+      "path_c_int32_abi_bank": [
+        1
+      ],
+      "path_c_uint8_abi_bank": [
+        44040192
+      ]
+    },
+    "physical_parameter_count": 21,
+    "sha256": "7a79b6a48c72e2050aa42633f4c0615dee5cd0b1998c02013a84755c73091fce",
+    "shared_scratch_abi_bytes": 436608,
+    "spilled_shared_scratch_count": 18,
+    "spilled_shared_scratch_shapes": {
+      "local_gb10_quarter_brick_10_M_delta": {
+        "bytes": 14336,
+        "dtype": "float32",
+        "internal_scratch_abi": true,
+        "param_name": "local_gb10_quarter_brick_10_M_delta",
+        "shape": [
+          3584
+        ]
+      },
+      "local_gb10_quarter_brick_10_M_delta_grad": {
+        "bytes": 14336,
+        "dtype": "float32",
+        "internal_scratch_abi": true,
+        "param_name": "local_gb10_quarter_brick_10_M_delta_grad",
+        "shape": [
+          3584
+        ]
+      },
+      "local_gb10_quarter_brick_10_M_hidden_after": {
+        "bytes": 14336,
+        "dtype": "float32",
+        "internal_scratch_abi": true,
+        "param_name": "local_gb10_quarter_brick_10_M_hidden_after",
+        "shape": [
+          3584
+        ]
+      },
+      "local_gb10_quarter_brick_10_M_hidden_after_grad": {
+        "bytes": 14336,
+        "dtype": "float32",
+        "internal_scratch_abi": true,
+        "param_name": "local_gb10_quarter_brick_10_M_hidden_after_grad",
+        "shape": [
+          3584
+        ]
+      },
+      "local_gb10_quarter_brick_10_M_mamba3_angle_cumsum": {
+        "bytes": 7168,
+        "dtype": "float32",
+        "internal_scratch_abi": false,
+        "param_name": "local_gb10_quarter_brick_10_M_mamba3_angle_cumsum",
+        "shape": [
+          112,
+          16
+        ]
+      },
+      "local_gb10_quarter_brick_10_M_mamba3_conv_history": {
+        "bytes": 90112,
+        "dtype": "float32",
+        "internal_scratch_abi": false,
+        "param_name": "local_gb10_quarter_brick_10_M_mamba3_conv_history",
+        "shape": [
+          2,
+          11264
+        ]
+      },
+      "local_gb10_quarter_brick_10_M_mamba3_conv_vec": {
+        "bytes": 45056,
+        "dtype": "float32",
+        "internal_scratch_abi": false,
+        "param_name": "local_gb10_quarter_brick_10_M_mamba3_conv_vec",
+        "shape": [
+          11264
+        ]
+      },
+      "local_gb10_quarter_brick_10_M_mamba3_out_inner": {
+        "bytes": 28672,
+        "dtype": "float32",
+        "internal_scratch_abi": false,
+        "param_name": "local_gb10_quarter_brick_10_M_mamba3_out_inner",
+        "shape": [
+          7168
+        ]
+      },
+      "local_gb10_quarter_brick_10_M_mamba3_projected_vec": {
+        "bytes": 75136,
+        "dtype": "float32",
+        "internal_scratch_abi": false,
+        "param_name": "local_gb10_quarter_brick_10_M_mamba3_projected_vec",
+        "shape": [
+          18784
+        ]
+      },
+      "local_gb10_quarter_brick_10_M_residual_norm_hidden": {
+        "bytes": 14336,
+        "dtype": "float32",
+        "internal_scratch_abi": true,
+        "param_name": "local_gb10_quarter_brick_10_M_residual_norm_hidden",
+        "shape": [
+          3584
+        ]
+      },
+      "local_gb10_quarter_brick_10_M_residual_norm_hidden_grad": {
+        "bytes": 14336,
+        "dtype": "float32",
+        "internal_scratch_abi": true,
+        "param_name": "local_gb10_quarter_brick_10_M_residual_norm_hidden_grad",
+        "shape": [
+          3584
+        ]
+      },
+      "local_gb10_quarter_brick_11_R_delta": {
+        "bytes": 14336,
+        "dtype": "float32",
+        "internal_scratch_abi": true,
+        "param_name": "local_gb10_quarter_brick_11_R_delta",
+        "shape": [
+          3584
+        ]
+      },
+      "local_gb10_quarter_brick_11_R_delta_grad": {
+        "bytes": 14336,
+        "dtype": "float32",
+        "internal_scratch_abi": true,
+        "param_name": "local_gb10_quarter_brick_11_R_delta_grad",
+        "shape": [
+          3584
+        ]
+      },
+      "local_gb10_quarter_brick_11_R_m2rnn_h_next": {
+        "bytes": 16384,
+        "dtype": "float32",
+        "internal_scratch_abi": false,
+        "param_name": "local_gb10_quarter_brick_11_R_m2rnn_h_next",
+        "shape": [
+          4,
+          64,
+          16
+        ]
+      },
+      "local_gb10_quarter_brick_11_R_m2rnn_h_state": {
+        "bytes": 16384,
+        "dtype": "float32",
+        "internal_scratch_abi": false,
+        "param_name": "local_gb10_quarter_brick_11_R_m2rnn_h_state",
+        "shape": [
+          4,
+          64,
+          16
+        ]
+      },
+      "local_gb10_quarter_brick_11_R_residual_norm_hidden": {
+        "bytes": 14336,
+        "dtype": "float32",
+        "internal_scratch_abi": true,
+        "param_name": "local_gb10_quarter_brick_11_R_residual_norm_hidden",
+        "shape": [
+          3584
+        ]
+      },
+      "local_gb10_quarter_brick_11_R_residual_norm_hidden_grad": {
+        "bytes": 14336,
+        "dtype": "float32",
+        "internal_scratch_abi": true,
+        "param_name": "local_gb10_quarter_brick_11_R_residual_norm_hidden_grad",
+        "shape": [
+          3584
+        ]
+      },
+      "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_context_values": {
+        "bytes": 14336,
+        "dtype": "float32",
+        "internal_scratch_abi": false,
+        "param_name": "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_context_values",
+        "shape": [
+          3584
+        ]
+      }
+    }
+  },
+  "kind": "cppmega_path_c_fusion_compile_receipt",
+  "model_profile": "local_gb10_quarter",
+  "native_compile_error": null,
+  "native_compile_ok": true,
+  "native_compile_requested": true,
+  "reporting_contract": {
+    "compile_receipt_measures_fused_schedule_compile": true,
+    "matrix_measures_current_runtime_route": true,
+    "path_c_default_allowed": false,
+    "runtime_uses_fused_train_block": false
+  },
+  "route_symbols": [
+    "A",
+    "E",
+    "M",
+    "E",
+    "A",
+    "E",
+    "M",
+    "E",
+    "A",
+    "E",
+    "M",
+    "R",
+    "A"
+  ],
+  "runtime_execution_contract": {
+    "blockers": [
+      "physical ABI runtime binding is not ready (bridge_status=prepacked_bank_buffers_required, binding_status=not_bound, missing_bank_buffers=['path_c_float32_abi_bank', 'path_c_uint8_abi_bank', 'path_c_int32_abi_bank'])"
+    ],
+    "expected_bottlenecks": [
+      "no lane-0 production fragments were detected, but scalar row reductions still use lane 0"
+    ],
+    "kernel_parameter_count": 21,
+    "lane0_fragment_markers": [
+      "residual_rmsnorm_row_reduction",
+      "lane0_scalar_reduction",
+      "residual_rmsnorm_row_reduction",
+      "residual_rmsnorm_bwd_row_reduction",
+      "residual_rmsnorm_bwd_row_reduction"
+    ],
+    "lane0_production_fragments": [],
+    "lane0_serial_fragments": true,
+    "lane_strided_row_loops": true,
+    "loop_policy": "row_phased_hidden",
+    "metal_buffer_limit": 31,
+    "metal_buffer_limit_exceeded": false,
+    "next_codegen_steps": [
+      "bind the training runtime to caller-owned physical ABI bank buffers without hidden tensor packing or copies"
+    ],
+    "physical_abi_missing_bank_buffers": [
+      "path_c_float32_abi_bank",
+      "path_c_uint8_abi_bank",
+      "path_c_int32_abi_bank"
+    ],
+    "physical_abi_runtime_binding_status": "not_bound",
+    "physical_abi_runtime_bridge_status": "prepacked_bank_buffers_required",
+    "plan_schedule_status": "ready",
+    "plan_single_kernel_fused": true,
+    "runtime_route_uses_fused_region": false,
+    "schedule_contract_declared_kind": "production",
+    "schedule_contract_declared_schedule_id": "path_c_descriptor_chain_c44eddb18abd",
+    "schedule_contract_reason": "TileLang lowered a single-entry region and verified internal edge materialization",
+    "schedule_contract_status": "verified",
+    "single_entry_tilelang_ir": true,
+    "single_thread_kernel": false,
+    "status": "compile_only_not_runtime_ready"
+  },
+  "runtime_smoke": {
+    "actually_executed": true,
+    "artifact_type": "JITKernel",
+    "buffer_abi": [
+      {
+        "bytes": 1320046132,
+        "dtype": "float32",
+        "elements": 330011533,
+        "name": "path_c_float32_abi_bank",
+        "shape": [
+          330011533
+        ]
+      },
+      {
+        "bytes": 44040192,
+        "dtype": "uint8",
+        "elements": 44040192,
+        "name": "path_c_uint8_abi_bank",
+        "shape": [
+          44040192
+        ]
+      },
+      {
+        "bytes": 4,
+        "dtype": "int32",
+        "elements": 1,
+        "name": "path_c_int32_abi_bank",
+        "shape": [
+          1
+        ]
+      },
+      {
+        "bytes": 90112,
+        "dtype": "float32",
+        "elements": 22528,
+        "name": "local_gb10_quarter_brick_10_M_mamba3_conv_history",
+        "shape": [
+          2,
+          11264
+        ]
+      },
+      {
+        "bytes": 75136,
+        "dtype": "float32",
+        "elements": 18784,
+        "name": "local_gb10_quarter_brick_10_M_mamba3_projected_vec",
+        "shape": [
+          18784
+        ]
+      },
+      {
+        "bytes": 45056,
+        "dtype": "float32",
+        "elements": 11264,
+        "name": "local_gb10_quarter_brick_10_M_mamba3_conv_vec",
+        "shape": [
+          11264
+        ]
+      },
+      {
+        "bytes": 28672,
+        "dtype": "float32",
+        "elements": 7168,
+        "name": "local_gb10_quarter_brick_10_M_mamba3_out_inner",
+        "shape": [
+          7168
+        ]
+      },
+      {
+        "bytes": 16384,
+        "dtype": "float32",
+        "elements": 4096,
+        "name": "local_gb10_quarter_brick_11_R_m2rnn_h_state",
+        "shape": [
+          4,
+          64,
+          16
+        ]
+      },
+      {
+        "bytes": 16384,
+        "dtype": "float32",
+        "elements": 4096,
+        "name": "local_gb10_quarter_brick_11_R_m2rnn_h_next",
+        "shape": [
+          4,
+          64,
+          16
+        ]
+      },
+      {
+        "bytes": 14336,
+        "dtype": "float32",
+        "elements": 3584,
+        "name": "local_gb10_quarter_brick_10_M_delta",
+        "shape": [
+          3584
+        ]
+      },
+      {
+        "bytes": 14336,
+        "dtype": "float32",
+        "elements": 3584,
+        "name": "local_gb10_quarter_brick_10_M_hidden_after",
+        "shape": [
+          3584
+        ]
+      },
+      {
+        "bytes": 14336,
+        "dtype": "float32",
+        "elements": 3584,
+        "name": "local_gb10_quarter_brick_10_M_residual_norm_hidden",
+        "shape": [
+          3584
+        ]
+      },
+      {
+        "bytes": 14336,
+        "dtype": "float32",
+        "elements": 3584,
+        "name": "local_gb10_quarter_brick_11_R_delta",
+        "shape": [
+          3584
+        ]
+      },
+      {
+        "bytes": 14336,
+        "dtype": "float32",
+        "elements": 3584,
+        "name": "local_gb10_quarter_brick_11_R_residual_norm_hidden",
+        "shape": [
+          3584
+        ]
+      },
+      {
+        "bytes": 14336,
+        "dtype": "float32",
+        "elements": 3584,
+        "name": "local_gb10_quarter_brick_11_R_residual_norm_hidden_grad",
+        "shape": [
+          3584
+        ]
+      },
+      {
+        "bytes": 14336,
+        "dtype": "float32",
+        "elements": 3584,
+        "name": "local_gb10_quarter_brick_10_M_hidden_after_grad",
+        "shape": [
+          3584
+        ]
+      },
+      {
+        "bytes": 14336,
+        "dtype": "float32",
+        "elements": 3584,
+        "name": "local_gb10_quarter_brick_11_R_delta_grad",
+        "shape": [
+          3584
+        ]
+      },
+      {
+        "bytes": 14336,
+        "dtype": "float32",
+        "elements": 3584,
+        "name": "local_gb10_quarter_brick_10_M_residual_norm_hidden_grad",
+        "shape": [
+          3584
+        ]
+      },
+      {
+        "bytes": 14336,
+        "dtype": "float32",
+        "elements": 3584,
+        "name": "local_gb10_quarter_brick_10_M_delta_grad",
+        "shape": [
+          3584
+        ]
+      },
+      {
+        "bytes": 14336,
+        "dtype": "float32",
+        "elements": 3584,
+        "name": "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_context_values",
+        "shape": [
+          3584
+        ]
+      },
+      {
+        "bytes": 7168,
+        "dtype": "float32",
+        "elements": 1792,
+        "name": "local_gb10_quarter_brick_10_M_mamba3_angle_cumsum",
+        "shape": [
+          112,
+          16
+        ]
+      }
+    ],
+    "compile_elapsed_s": 0.01620141603052616,
+    "elapsed_s": 0.3078053329954855,
+    "execute_elapsed_s": 0.002720958029385656,
+    "execution_backend": "tvm_ffi",
+    "implementation_kind": "production",
+    "kernel_parameter_count": 21,
+    "kernel_source": {
+      "for_loop_count": 154,
+      "if_count": 215,
+      "kernel_source_bytes": 232506,
+      "kernel_source_lines": 2110,
+      "threadgroup_barrier_count": 99,
+      "threadgroup_dynamic_shared_bytes": 21696
+    },
+    "logical_parameter_count": 78,
+    "max_buffer_bytes": 2000000000,
+    "mode": "production_1b",
+    "node_names": [
+      "local_gb10_quarter_brick_10_M",
+      "local_gb10_quarter_brick_10_M_residual_norm",
+      "local_gb10_quarter_brick_11_R",
+      "local_gb10_quarter_brick_11_R_residual_norm",
+      "local_gb10_quarter_brick_12_A_qkv_projection",
+      "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply",
+      "local_gb10_quarter_brick_12_A_qkv_projection_bwd",
+      "local_gb10_quarter_brick_11_R_residual_norm_bwd",
+      "local_gb10_quarter_brick_11_R_bwd",
+      "local_gb10_quarter_brick_10_M_residual_norm_bwd",
+      "local_gb10_quarter_brick_10_M_bwd"
+    ],
+    "physical_abi_policy": "banked_by_dtype",
+    "physical_abi_runtime_binding": {
+      "bridge_plan": {
+        "bank_dtypes": {
+          "path_c_float32_abi_bank": "float32",
+          "path_c_int32_abi_bank": "int32",
+          "path_c_uint8_abi_bank": "uint8"
+        },
+        "logical_buffers_by_bank": {
+          "path_c_float32_abi_bank": [
+            "hidden",
+            "hidden_grad",
+            "local_gb10_quarter_brick_10_M_mamba3_B_bias",
+            "local_gb10_quarter_brick_10_M_mamba3_B_bias_grad",
+            "local_gb10_quarter_brick_10_M_mamba3_B_norm_weight",
+            "local_gb10_quarter_brick_10_M_mamba3_B_norm_weight_grad",
+            "local_gb10_quarter_brick_10_M_mamba3_C_bias",
+            "local_gb10_quarter_brick_10_M_mamba3_C_bias_grad",
+            "local_gb10_quarter_brick_10_M_mamba3_C_norm_weight",
+            "local_gb10_quarter_brick_10_M_mamba3_C_norm_weight_grad",
+            "local_gb10_quarter_brick_10_M_mamba3_D",
+            "local_gb10_quarter_brick_10_M_mamba3_D_grad",
+            "local_gb10_quarter_brick_10_M_mamba3_conv_bias",
+            "local_gb10_quarter_brick_10_M_mamba3_conv_bias_grad",
+            "local_gb10_quarter_brick_10_M_mamba3_conv_weight",
+            "local_gb10_quarter_brick_10_M_mamba3_conv_weight_grad",
+            "local_gb10_quarter_brick_10_M_mamba3_dt_bias",
+            "local_gb10_quarter_brick_10_M_mamba3_dt_bias_grad",
+            "local_gb10_quarter_brick_10_M_mamba3_h0",
+            "local_gb10_quarter_brick_10_M_mamba3_h0_grad",
+            "local_gb10_quarter_brick_10_M_mamba3_in_proj_weight",
+            "local_gb10_quarter_brick_10_M_mamba3_in_proj_weight_grad",
+            "local_gb10_quarter_brick_10_M_mamba3_out_proj_weight",
+            "local_gb10_quarter_brick_10_M_mamba3_out_proj_weight_grad",
+            "local_gb10_quarter_brick_10_M_residual_norm_weight",
+            "local_gb10_quarter_brick_10_M_residual_norm_weight_grad",
+            "local_gb10_quarter_brick_10_M_state",
+            "local_gb10_quarter_brick_10_M_state_in",
+            "local_gb10_quarter_brick_10_M_state_in_grad",
+            "local_gb10_quarter_brick_11_R_hidden_after",
+            "local_gb10_quarter_brick_11_R_hidden_after_grad",
+            "local_gb10_quarter_brick_11_R_m2rnn_A_log",
+            "local_gb10_quarter_brick_11_R_m2rnn_A_log_grad",
+            "local_gb10_quarter_brick_11_R_m2rnn_D",
+            "local_gb10_quarter_brick_11_R_m2rnn_D_grad",
+            "local_gb10_quarter_brick_11_R_m2rnn_conv_bias",
+            "local_gb10_quarter_brick_11_R_m2rnn_conv_bias_grad",
+            "local_gb10_quarter_brick_11_R_m2rnn_conv_state",
+            "local_gb10_quarter_brick_11_R_m2rnn_conv_weight",
+            "local_gb10_quarter_brick_11_R_m2rnn_conv_weight_grad",
+            "local_gb10_quarter_brick_11_R_m2rnn_dt_bias",
+            "local_gb10_quarter_brick_11_R_m2rnn_dt_bias_grad",
+            "local_gb10_quarter_brick_11_R_m2rnn_g_norm_weight",
+            "local_gb10_quarter_brick_11_R_m2rnn_g_norm_weight_grad",
+            "local_gb10_quarter_brick_11_R_m2rnn_h0",
+            "local_gb10_quarter_brick_11_R_m2rnn_h0_grad",
+            "local_gb10_quarter_brick_11_R_m2rnn_in_proj_weight",
+            "local_gb10_quarter_brick_11_R_m2rnn_in_proj_weight_grad",
+            "local_gb10_quarter_brick_11_R_m2rnn_out_proj_weight",
+            "local_gb10_quarter_brick_11_R_m2rnn_out_proj_weight_grad",
+            "local_gb10_quarter_brick_11_R_m2rnn_state_weight",
+            "local_gb10_quarter_brick_11_R_m2rnn_state_weight_grad",
+            "local_gb10_quarter_brick_11_R_residual_norm_weight",
+            "local_gb10_quarter_brick_11_R_residual_norm_weight_grad",
+            "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_bias",
+            "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_bias_grad",
+            "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_weight",
+            "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_weight_grad",
+            "local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_inv_freq",
+            "local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_inv_freq_grad",
+            "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_bias",
+            "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_bias_grad",
+            "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_weight",
+            "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_weight_grad",
+            "local_gb10_quarter_brick_12_A_qkv_projection_indices_grad",
+            "local_gb10_quarter_brick_12_A_qkv_projection_kv_scale",
+            "local_gb10_quarter_brick_12_A_qkv_projection_kv_scale_grad",
+            "local_gb10_quarter_brick_12_A_qkv_projection_q_scale_grad",
+            "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_attention_out_proj_bias",
+            "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_attention_out_proj_weight",
+            "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_lse",
+            "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_out",
+            "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_sinks",
+            "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_sm_scale"
+          ],
+          "path_c_int32_abi_bank": [
+            "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_has_sinks"
+          ],
+          "path_c_uint8_abi_bank": [
+            "local_gb10_quarter_brick_12_A_qkv_projection_kv_fp8",
+            "local_gb10_quarter_brick_12_A_qkv_projection_kv_fp8_grad",
+            "local_gb10_quarter_brick_12_A_qkv_projection_q_fp8_grad"
+          ]
+        },
+        "logical_tensor_binding_supported": false,
+        "no_hidden_allocation_policy": true,
+        "prepacked_bank_binding_supported": true,
+        "reason": "banked physical ABI groups logical buffers into dtype banks; the runtime bridge refuses to pack or copy model tensors implicitly and requires caller-owned bank buffers",
+        "required_bank_buffers": [
+          "path_c_float32_abi_bank",
+          "path_c_uint8_abi_bank",
+          "path_c_int32_abi_bank"
+        ],
+        "status": "prepacked_bank_buffers_required"
+      },
+      "errors": [],
+      "missing_bank_buffers": [],
+      "ordered_kernel_buffers": [
+        "path_c_float32_abi_bank",
+        "path_c_uint8_abi_bank",
+        "path_c_int32_abi_bank"
+      ],
+      "reason": "caller supplied the physical bank buffers in kernel argument order",
+      "status": "ok",
+      "unexpected_buffers": []
+    },
+    "region_name": "local_gb10_quarter_path_c_10_12",
+    "result_repr": "[]",
+    "result_type": "list",
+    "runtime_kernel_buffers": [
+      "path_c_float32_abi_bank",
+      "path_c_uint8_abi_bank",
+      "path_c_int32_abi_bank",
+      "local_gb10_quarter_brick_10_M_mamba3_conv_history",
+      "local_gb10_quarter_brick_10_M_mamba3_projected_vec",
+      "local_gb10_quarter_brick_10_M_mamba3_conv_vec",
+      "local_gb10_quarter_brick_10_M_mamba3_out_inner",
+      "local_gb10_quarter_brick_11_R_m2rnn_h_state",
+      "local_gb10_quarter_brick_11_R_m2rnn_h_next",
+      "local_gb10_quarter_brick_10_M_delta",
+      "local_gb10_quarter_brick_10_M_hidden_after",
+      "local_gb10_quarter_brick_10_M_residual_norm_hidden",
+      "local_gb10_quarter_brick_11_R_delta",
+      "local_gb10_quarter_brick_11_R_residual_norm_hidden",
+      "local_gb10_quarter_brick_11_R_residual_norm_hidden_grad",
+      "local_gb10_quarter_brick_10_M_hidden_after_grad",
+      "local_gb10_quarter_brick_11_R_delta_grad",
+      "local_gb10_quarter_brick_10_M_residual_norm_hidden_grad",
+      "local_gb10_quarter_brick_10_M_delta_grad",
+      "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_context_values",
+      "local_gb10_quarter_brick_10_M_mamba3_angle_cumsum"
+    ],
+    "schedule_id": "path_c_descriptor_chain_c44eddb18abd",
+    "status": "ok",
+    "stderr_tail": "",
+    "stdout_tail": "2026-05-20 11:50:11  [TileLang:tilelang.cache.kernel_cache:WARNING] (kernel_cache.py:333): Found kernel 'local_gb10_quarter_path_c_10_12' in memory cache. For better performance, consider using `@tilelang.jit` instead of direct kernel caching.\n",
+    "target": "metal",
+    "total_buffer_bytes": 1364522936
+  },
+  "schedule_spec": {
+    "brick_production_fragment_statuses": [
+      "mamba3_mimo:production_region_inlined:cppmega_mlx.nn._tilelang.mamba3_path_c:mamba3_mimo_fwd_path_c/mamba3_mimo_bwd_path_c",
+      "residual_rmsnorm:production_region_inlined:cppmega_mlx.runtime.path_c_fusion_schedules:_emit_residual_rmsnorm_source",
+      "m2rnn:production_region_inlined:cppmega_mlx.nn._tilelang.m2rnn_path_c:m2rnn_apply_mapped_packed_post_with_state_path_c",
+      "residual_rmsnorm:production_region_inlined:cppmega_mlx.runtime.path_c_fusion_schedules:_emit_residual_rmsnorm_source",
+      "attention_qkv_projection:production_region_inlined:cppmega_mlx.nn.attention:CausalSelfAttention.prepare_sparse_mla_fp8",
+      "sparse_mla_fp8_apply:production_region_inlined:cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c:make_fp8_sparse_mla_prepare_kernel/sparse_mla_fp8_path_c_apply",
+      "attention_qkv_projection_bwd:production_region_inlined:cppmega_mlx.nn.attention:CausalSelfAttention.prepare_sparse_mla_fp8",
+      "residual_rmsnorm_bwd:production_region_inlined:cppmega_mlx.runtime.path_c_fusion_schedules:_append_row_phased_residual_rmsnorm_bwd_body",
+      "m2rnn_bwd:production_region_inlined:cppmega_mlx.nn._tilelang.m2rnn_path_c:m2rnn_mapped_packed_bwd_path_c",
+      "residual_rmsnorm_bwd:production_region_inlined:cppmega_mlx.runtime.path_c_fusion_schedules:_append_row_phased_residual_rmsnorm_bwd_body",
+      "mamba3_mimo_bwd:production_region_inlined:cppmega_mlx.nn._tilelang.mamba3_path_c:mamba3_mimo_bwd_path_c"
+    ],
+    "implementation_kind": "production",
+    "implementation_status": "ready",
+    "internal_buffer_policy": "row_local_hidden",
+    "loop_extent": 14680064,
+    "loop_policy": "row_phased_hidden",
+    "missing_real_abi_inputs": [],
+    "production_fragments_complete": true,
+    "real_abi_contract_complete": true,
+    "required_real_abi_input_shapes": [
+      "local_gb10_quarter_brick_10_M_mamba3_in_proj_weight:(67321856,)",
+      "local_gb10_quarter_brick_10_M_mamba3_out_proj_weight:(25690112,)",
+      "local_gb10_quarter_brick_10_M_mamba3_conv_weight:(33792,)",
+      "local_gb10_quarter_brick_10_M_mamba3_conv_bias:(11264,)",
+      "local_gb10_quarter_brick_10_M_mamba3_dt_bias:(112,)",
+      "local_gb10_quarter_brick_10_M_mamba3_B_norm_weight:(2048,)",
+      "local_gb10_quarter_brick_10_M_mamba3_B_bias:(2048,)",
+      "local_gb10_quarter_brick_10_M_mamba3_C_norm_weight:(2048,)",
+      "local_gb10_quarter_brick_10_M_mamba3_C_bias:(2048,)",
+      "local_gb10_quarter_brick_10_M_mamba3_D:(112,)",
+      "local_gb10_quarter_brick_10_M_mamba3_h0:(458752,)",
+      "local_gb10_quarter_brick_10_M_residual_norm_weight:(3584,)",
+      "local_gb10_quarter_brick_11_R_m2rnn_in_proj_weight:(809984,)",
+      "local_gb10_quarter_brick_11_R_m2rnn_conv_weight:(640,)",
+      "local_gb10_quarter_brick_11_R_m2rnn_conv_bias:(160,)",
+      "local_gb10_quarter_brick_11_R_m2rnn_state_weight:(256,)",
+      "local_gb10_quarter_brick_11_R_m2rnn_A_log:(4,)",
+      "local_gb10_quarter_brick_11_R_m2rnn_dt_bias:(4,)",
+      "local_gb10_quarter_brick_11_R_m2rnn_D:(64,)",
+      "local_gb10_quarter_brick_11_R_m2rnn_g_norm_weight:(64,)",
+      "local_gb10_quarter_brick_11_R_m2rnn_out_proj_weight:(229376,)",
+      "local_gb10_quarter_brick_11_R_m2rnn_h0:(4096,)",
+      "local_gb10_quarter_brick_11_R_m2rnn_conv_state:(480,)",
+      "local_gb10_quarter_brick_11_R_residual_norm_weight:(3584,)",
+      "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_weight:(12845056,)",
+      "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_bias:(3584,)",
+      "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_weight:(12845056,)",
+      "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_bias:(3584,)",
+      "local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_inv_freq:(64,)",
+      "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_sm_scale:(1,)",
+      "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_sinks:(28,)",
+      "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_has_sinks:(1,)",
+      "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_attention_out_proj_weight:(12845056,)",
+      "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_attention_out_proj_bias:(3584,)",
+      "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_weight_grad:(12845056,)",
+      "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_bias_grad:(3584,)",
+      "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_weight_grad:(12845056,)",
+      "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_bias_grad:(3584,)",
+      "local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_inv_freq_grad:(64,)",
+      "local_gb10_quarter_brick_11_R_residual_norm_weight_grad:(3584,)",
+      "local_gb10_quarter_brick_11_R_m2rnn_in_proj_weight_grad:(809984,)",
+      "local_gb10_quarter_brick_11_R_m2rnn_conv_weight_grad:(640,)",
+      "local_gb10_quarter_brick_11_R_m2rnn_conv_bias_grad:(160,)",
+      "local_gb10_quarter_brick_11_R_m2rnn_state_weight_grad:(256,)",
+      "local_gb10_quarter_brick_11_R_m2rnn_A_log_grad:(4,)",
+      "local_gb10_quarter_brick_11_R_m2rnn_dt_bias_grad:(4,)",
+      "local_gb10_quarter_brick_11_R_m2rnn_D_grad:(64,)",
+      "local_gb10_quarter_brick_11_R_m2rnn_g_norm_weight_grad:(64,)",
+      "local_gb10_quarter_brick_11_R_m2rnn_out_proj_weight_grad:(229376,)",
+      "local_gb10_quarter_brick_11_R_m2rnn_h0_grad:(4096,)",
+      "local_gb10_quarter_brick_10_M_residual_norm_weight_grad:(3584,)",
+      "local_gb10_quarter_brick_10_M_mamba3_in_proj_weight_grad:(67321856,)",
+      "local_gb10_quarter_brick_10_M_mamba3_out_proj_weight_grad:(25690112,)",
+      "local_gb10_quarter_brick_10_M_mamba3_conv_weight_grad:(33792,)",
+      "local_gb10_quarter_brick_10_M_mamba3_conv_bias_grad:(11264,)",
+      "local_gb10_quarter_brick_10_M_mamba3_dt_bias_grad:(112,)",
+      "local_gb10_quarter_brick_10_M_mamba3_B_norm_weight_grad:(2048,)",
+      "local_gb10_quarter_brick_10_M_mamba3_B_bias_grad:(2048,)",
+      "local_gb10_quarter_brick_10_M_mamba3_C_norm_weight_grad:(2048,)",
+      "local_gb10_quarter_brick_10_M_mamba3_C_bias_grad:(2048,)",
+      "local_gb10_quarter_brick_10_M_mamba3_D_grad:(112,)",
+      "local_gb10_quarter_brick_10_M_mamba3_h0_grad:(458752,)"
+    ],
+    "schedule_id": "path_c_descriptor_chain_c44eddb18abd",
+    "trusted_by_default": false
+  },
+  "schedule_target": {
+    "brick_ops": [
+      "mamba3_mimo",
+      "residual_rmsnorm",
+      "m2rnn",
+      "residual_rmsnorm",
+      "attention_qkv_projection",
+      "sparse_mla_fp8_apply",
+      "attention_qkv_projection_bwd",
+      "residual_rmsnorm_bwd",
+      "m2rnn_bwd",
+      "residual_rmsnorm_bwd",
+      "mamba3_mimo_bwd"
+    ],
+    "implementation_kind": "production",
+    "required_real_abi_inputs": [
+      "local_gb10_quarter_brick_10_M_mamba3_in_proj_weight",
+      "local_gb10_quarter_brick_10_M_mamba3_out_proj_weight",
+      "local_gb10_quarter_brick_10_M_mamba3_conv_weight",
+      "local_gb10_quarter_brick_10_M_mamba3_conv_bias",
+      "local_gb10_quarter_brick_10_M_mamba3_dt_bias",
+      "local_gb10_quarter_brick_10_M_mamba3_B_norm_weight",
+      "local_gb10_quarter_brick_10_M_mamba3_B_bias",
+      "local_gb10_quarter_brick_10_M_mamba3_C_norm_weight",
+      "local_gb10_quarter_brick_10_M_mamba3_C_bias",
+      "local_gb10_quarter_brick_10_M_mamba3_D",
+      "local_gb10_quarter_brick_10_M_mamba3_h0",
+      "local_gb10_quarter_brick_10_M_residual_norm_weight",
+      "local_gb10_quarter_brick_11_R_m2rnn_in_proj_weight",
+      "local_gb10_quarter_brick_11_R_m2rnn_conv_weight",
+      "local_gb10_quarter_brick_11_R_m2rnn_conv_bias",
+      "local_gb10_quarter_brick_11_R_m2rnn_state_weight",
+      "local_gb10_quarter_brick_11_R_m2rnn_A_log",
+      "local_gb10_quarter_brick_11_R_m2rnn_dt_bias",
+      "local_gb10_quarter_brick_11_R_m2rnn_D",
+      "local_gb10_quarter_brick_11_R_m2rnn_g_norm_weight",
+      "local_gb10_quarter_brick_11_R_m2rnn_out_proj_weight",
+      "local_gb10_quarter_brick_11_R_m2rnn_h0",
+      "local_gb10_quarter_brick_11_R_m2rnn_conv_state",
+      "local_gb10_quarter_brick_11_R_residual_norm_weight",
+      "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_weight",
+      "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_bias",
+      "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_weight",
+      "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_bias",
+      "local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_inv_freq",
+      "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_sm_scale",
+      "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_sinks",
+      "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_has_sinks",
+      "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_attention_out_proj_weight",
+      "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_attention_out_proj_bias",
+      "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_weight_grad",
+      "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_bias_grad",
+      "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_weight_grad",
+      "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_bias_grad",
+      "local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_inv_freq_grad",
+      "local_gb10_quarter_brick_11_R_residual_norm_weight_grad",
+      "local_gb10_quarter_brick_11_R_m2rnn_in_proj_weight_grad",
+      "local_gb10_quarter_brick_11_R_m2rnn_conv_weight_grad",
+      "local_gb10_quarter_brick_11_R_m2rnn_conv_bias_grad",
+      "local_gb10_quarter_brick_11_R_m2rnn_state_weight_grad",
+      "local_gb10_quarter_brick_11_R_m2rnn_A_log_grad",
+      "local_gb10_quarter_brick_11_R_m2rnn_dt_bias_grad",
+      "local_gb10_quarter_brick_11_R_m2rnn_D_grad",
+      "local_gb10_quarter_brick_11_R_m2rnn_g_norm_weight_grad",
+      "local_gb10_quarter_brick_11_R_m2rnn_out_proj_weight_grad",
+      "local_gb10_quarter_brick_11_R_m2rnn_h0_grad",
+      "local_gb10_quarter_brick_10_M_residual_norm_weight_grad",
+      "local_gb10_quarter_brick_10_M_mamba3_in_proj_weight_grad",
+      "local_gb10_quarter_brick_10_M_mamba3_out_proj_weight_grad",
+      "local_gb10_quarter_brick_10_M_mamba3_conv_weight_grad",
+      "local_gb10_quarter_brick_10_M_mamba3_conv_bias_grad",
+      "local_gb10_quarter_brick_10_M_mamba3_dt_bias_grad",
+      "local_gb10_quarter_brick_10_M_mamba3_B_norm_weight_grad",
+      "local_gb10_quarter_brick_10_M_mamba3_B_bias_grad",
+      "local_gb10_quarter_brick_10_M_mamba3_C_norm_weight_grad",
+      "local_gb10_quarter_brick_10_M_mamba3_C_bias_grad",
+      "local_gb10_quarter_brick_10_M_mamba3_D_grad",
+      "local_gb10_quarter_brick_10_M_mamba3_h0_grad"
+    ],
+    "schedule_generator": "dynamic_brick_descriptor_generator",
+    "schedule_id": "path_c_descriptor_chain_c44eddb18abd",
+    "schedule_name": "local_gb10_quarter_path_c_10_12:descriptor_generated_fwd_bwd",
+    "schedule_status": "ready"
+  },
+  "schema_version": 1,
+  "selected_aot_region": {
+    "name": "local_gb10_quarter_path_c_10_12",
+    "node_names": [
+      "local_gb10_quarter_brick_10_M",
+      "local_gb10_quarter_brick_10_M_residual_norm",
+      "local_gb10_quarter_brick_11_R",
+      "local_gb10_quarter_brick_11_R_residual_norm",
+      "local_gb10_quarter_brick_12_A_qkv_projection",
+      "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply",
+      "local_gb10_quarter_brick_12_A_qkv_projection_bwd",
+      "local_gb10_quarter_brick_11_R_residual_norm_bwd",
+      "local_gb10_quarter_brick_11_R_bwd",
+      "local_gb10_quarter_brick_10_M_residual_norm_bwd",
+      "local_gb10_quarter_brick_10_M_bwd"
+    ],
+    "op_signature": [
+      "mamba3_mimo",
+      "residual_rmsnorm",
+      "m2rnn",
+      "residual_rmsnorm",
+      "attention_qkv_projection",
+      "sparse_mla_fp8_apply",
+      "attention_qkv_projection_bwd",
+      "residual_rmsnorm_bwd",
+      "m2rnn_bwd",
+      "residual_rmsnorm_bwd",
+      "mamba3_mimo_bwd"
+    ]
+  },
+  "selected_forward_region": {
+    "name": "local_gb10_quarter_path_c_10_12",
+    "node_names": [
+      "local_gb10_quarter_brick_10_M",
+      "local_gb10_quarter_brick_10_M_residual_norm",
+      "local_gb10_quarter_brick_11_R",
+      "local_gb10_quarter_brick_11_R_residual_norm",
+      "local_gb10_quarter_brick_12_A_qkv_projection",
+      "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply"
+    ],
+    "op_signature": [
+      "mamba3_mimo",
+      "residual_rmsnorm",
+      "m2rnn",
+      "residual_rmsnorm",
+      "attention_qkv_projection",
+      "sparse_mla_fp8_apply"
+    ]
+  },
+  "software": {
+    "cppmega_sha": "f222b75",
+    "platform": "macOS-26.4.1-arm64-arm-64bit-Mach-O",
+    "python": "3.13.12",
+    "tilelang_root": "/Volumes/external/sources/tilelang",
+    "tilelang_sha": "7f0e39f6"
+  },
+  "status": "ok",
+  "target": "metal"
+}

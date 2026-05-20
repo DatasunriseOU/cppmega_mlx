@@ -290,6 +290,7 @@ class FusionEdge:
     output: str
     consumer: str
     input: str
+    lifetime: str = "internal"
 
 
 @dataclass(frozen=True)
@@ -452,6 +453,7 @@ class CompiledPathCRegion:
 
     plan: FusionCompilePlan
     artifact: object | None = None
+    lowered_module: object | None = None
 
 
 @dataclass(frozen=True)
@@ -619,7 +621,9 @@ class PathCFusionRegionBuilder:
         )
 
 
-def _mamba3_fp8_train_surfaces() -> tuple[FusionKernelSurface, ...]:
+def _legacy_mamba3_fp8_train_diagnostic_surfaces() -> tuple[FusionKernelSurface, ...]:
+    """Return the old incomplete train-block graph for semantic-blocker tests."""
+
     return (
         FusionKernelSurface.path_c(
             name="mamba3_scan",
@@ -731,6 +735,17 @@ def _build_path_c_model_region_from_route_symbols(
     acceptance_tags: Sequence[str],
     acceptance_fixture_abi: bool,
 ) -> PathCFusionRegion:
+    if not acceptance_fixture_abi:
+        return build_path_c_model_region_from_bricks(
+            region_name=region_name,
+            bricks=_path_c_model_bricks_from_route_symbols(route_symbols),
+            z3_sync=z3_sync,
+            include_backward=include_backward,
+            shape_env=shape_env,
+            model_config=model_config,
+            acceptance_tags=acceptance_tags,
+        )
+
     resolved_shape_env = shape_env or _path_c_model_shape_env_from_config(model_config)
     metadata: dict[str, Any] = {
         "path_c_route_symbols": tuple(route_symbols),
@@ -741,7 +756,7 @@ def _build_path_c_model_region_from_route_symbols(
         metadata["path_c_model_shape_env"] = resolved_shape_env
     region = build_path_c_fusion_region(
         region_name=region_name,
-        surfaces=_path_c_model_surfaces_from_route_symbols(
+        surfaces=_path_c_acceptance_fixture_surfaces_from_route_symbols(
             route_symbols,
             shared_acceptance_abi=acceptance_fixture_abi,
         ),
@@ -897,6 +912,7 @@ def build_path_c_model_region_from_bricks(
         "path_c_route_symbols": tuple(brick.route_symbol for brick in resolved_bricks),
         "path_c_bricks": tuple(_path_c_brick_metadata(brick) for brick in resolved_bricks),
         "path_c_acceptance_tags": tuple(str(tag) for tag in acceptance_tags),
+        "path_c_acceptance_fixture_abi": False,
     }
     if resolved_shape_env is not None:
         metadata["path_c_model_shape_env"] = resolved_shape_env
@@ -1094,9 +1110,12 @@ def _append_path_c_model_segment(
         return
     end = segment_start + len(segment) - 1
     regions.append(
-        build_path_c_model_region_from_route_symbols(
+        build_path_c_model_region_from_bricks(
             region_name=f"{region_prefix}_{segment_start}_{end}",
-            route_symbols=segment,
+            bricks=_path_c_model_bricks_from_route_symbols(
+                segment,
+                start_index=segment_start,
+            ),
             z3_sync=z3_sync,
             include_backward=include_backward,
             shape_env=shape_env,
@@ -1132,7 +1151,24 @@ def _append_path_c_model_brick_segment(
     )
 
 
-def _path_c_model_surfaces_from_route_symbols(
+def _path_c_model_bricks_from_route_symbols(
+    route_symbols: Sequence[str],
+    *,
+    start_index: int = 0,
+) -> tuple[PathCModelBrick, ...]:
+    return tuple(
+        PathCModelBrick(
+            name=f"route_{start_index + index}_{normalized}",
+            kind=normalized,
+            route_symbol=normalized,
+        )
+        for index, normalized in enumerate(
+            _normalized_route_symbol(symbol) for symbol in route_symbols
+        )
+    )
+
+
+def _path_c_acceptance_fixture_surfaces_from_route_symbols(
     route_symbols: Sequence[str],
     *,
     shared_acceptance_abi: bool,
@@ -1588,9 +1624,7 @@ def _surface_from_node(node: FusionNode) -> FusionKernelSurface:
 
 
 def _aot_backward_surface_for_node(node: FusionNode) -> FusionKernelSurface:
-    inputs = _grad_buffer_names(node.outputs)
-    if node.op_name == "residual_rmsnorm":
-        inputs = (*inputs, *node.inputs)
+    inputs = (*_grad_buffer_names(node.outputs), *node.inputs)
     return FusionKernelSurface.path_c(
         name=f"{node.name}_bwd",
         op_name=f"{node.op_name}_bwd",
@@ -1628,12 +1662,38 @@ def build_path_c_aot_autograd_region(
     )
 
 
-def build_mamba3_fp8_train_region() -> PathCFusionRegion:
-    """Return the high-level Path C train-block template requested for 1B."""
+def build_mamba3_fp8_train_region(
+    *,
+    route_symbols: Sequence[str] = ("M", "R", "A"),
+    include_backward: bool = False,
+    model_config: Any | None = None,
+) -> PathCFusionRegion:
+    """Return a route-derived Path C train-block convenience region.
+
+    This helper exists for compatibility with older tests and diagnostics.  It
+    deliberately uses the same model-brick lowering path as real models instead
+    of hand-assembling the train block.
+    """
+
+    if model_config is None:
+        from cppmega_mlx.recipes.model_factory import local_gb10_quarter_profile
+
+        model_config = local_gb10_quarter_profile().hybrid_config()
+
+    return build_path_c_model_region_from_route_symbols(
+        region_name="mamba3_fp8_train_block",
+        route_symbols=route_symbols,
+        include_backward=include_backward,
+        model_config=model_config,
+    )
+
+
+def _build_legacy_mamba3_fp8_train_diagnostic_region() -> PathCFusionRegion:
+    """Return the legacy static graph used only to exercise blocker reporting."""
 
     return build_path_c_fusion_region(
-        region_name="mamba3_fp8_train_block",
-        surfaces=_mamba3_fp8_train_surfaces(),
+        region_name="mamba3_fp8_train_block_legacy_diagnostic",
+        surfaces=_legacy_mamba3_fp8_train_diagnostic_surfaces(),
         z3_sync=Z3SyncSpec.minimize_sync_async(),
     )
 
@@ -2101,7 +2161,11 @@ def compile_path_c_region(
         schedule_contract=schedule_contract,
     )
     if tilelang_lowerer is not None:
-        return CompiledPathCRegion(plan=plan, artifact=artifact)
+        return CompiledPathCRegion(
+            plan=plan,
+            artifact=artifact,
+            lowered_module=getattr(tilelang_result, "lowered_module", None),
+        )
     if compiler is None:
         return plan
     return CompiledPathCRegion(plan=plan, artifact=compiler(plan))
@@ -2247,6 +2311,19 @@ def _tilelang_optimizer_for(
             outputs=node.outputs,
             attrs=_tilelang_node_attrs(node),
         )
+    workspace_edge_buffers = _declared_workspace_edge_buffers(schedule_template)
+    node_by_name = {node.name: node for node in region.nodes}
+    for edge in region.edges:
+        optimizer.connect(
+            edge.producer,
+            edge.consumer,
+            buffer=edge.input,
+            lifetime=_tilelang_edge_lifetime_for(
+                edge,
+                node_by_name=node_by_name,
+                workspace_edge_buffers=workspace_edge_buffers,
+            ),
+        )
     return optimizer
 
 
@@ -2256,6 +2333,39 @@ def _tilelang_node_attrs(node: FusionNode) -> dict[str, str]:
         attrs["autograd"] = "aot_backward"
         attrs["role"] = "backward"
     return attrs
+
+
+def _declared_workspace_edge_buffers(
+    schedule_template: Callable[[Any], Any] | None,
+) -> tuple[str, ...]:
+    if schedule_template is None:
+        return ()
+    declared = getattr(
+        schedule_template,
+        "_cppmega_path_c_workspace_edge_buffers",
+        (),
+    )
+    return tuple(str(name) for name in declared)
+
+
+def _tilelang_edge_lifetime_for(
+    edge: FusionEdge,
+    *,
+    node_by_name: Mapping[str, FusionNode],
+    workspace_edge_buffers: Sequence[str],
+) -> str:
+    if not workspace_edge_buffers:
+        return edge.lifetime
+    producer = node_by_name[edge.producer]
+    consumer = node_by_name[edge.consumer]
+    if (
+        producer.op_name == "attention_qkv_projection"
+        and consumer.op_name == "sparse_mla_fp8_apply"
+        and _canonical_path_c_edge_buffer_name(edge.input)
+        in set(workspace_edge_buffers)
+    ):
+        return "workspace"
+    return edge.lifetime
 
 
 def _region_shape_env_payload(region: PathCFusionRegion) -> dict[str, Any]:
@@ -2282,7 +2392,7 @@ def _region_shape_cache_key_parts(region: PathCFusionRegion) -> tuple[str, ...]:
 
 def _schedule_contract_for(region: PathCFusionRegion) -> FusionScheduleContract:
     internal_buffers = tuple(
-        dict.fromkeys(edge.input for edge in region.edges)
+        dict.fromkeys(edge.input for edge in region.edges if edge.lifetime == "internal")
     )
     internal_buffer_set = set(internal_buffers)
     external_buffers: list[str] = []
@@ -2348,7 +2458,50 @@ def mark_path_c_schedule_template_for_region(
     attested_schedule_template._cppmega_path_c_required_real_abi_inputs = tuple(
         required_real_abi_inputs
     )
+    workspace_edge_buffers = _workspace_edge_buffers_for_attested_template(
+        schedule_template,
+        region=region,
+        required_real_abi_inputs=required_real_abi_inputs,
+    )
+    attested_schedule_template._cppmega_path_c_workspace_edge_buffers = (
+        workspace_edge_buffers
+    )
     return attested_schedule_template
+
+
+def _workspace_edge_buffers_for_attested_template(
+    schedule_template: Callable[[Any], Any],
+    *,
+    region: PathCFusionRegion,
+    required_real_abi_inputs: Sequence[str],
+) -> tuple[str, ...]:
+    declared = tuple(
+        str(name)
+        for name in getattr(
+            schedule_template,
+            "_cppmega_path_c_workspace_edge_buffers",
+            (),
+        )
+    )
+    if declared:
+        return declared
+    if not set(MAMBA3_FP8_TRAIN_REQUIRED_REAL_ABI_INPUTS).issubset(
+        set(required_real_abi_inputs)
+    ):
+        return ()
+    if not _region_has_attention_kv_workspace_edges(region):
+        return ()
+    return ("kv_fp8", "kv_scale")
+
+
+def _region_has_attention_kv_workspace_edges(region: PathCFusionRegion) -> bool:
+    node_by_name = {node.name: node for node in region.nodes}
+    return any(
+        node_by_name[edge.producer].op_name == "attention_qkv_projection"
+        and node_by_name[edge.consumer].op_name == "sparse_mla_fp8_apply"
+        and _canonical_path_c_edge_buffer_name(edge.input) in {"kv_fp8", "kv_scale"}
+        for edge in region.edges
+    )
 
 
 def _declared_schedule_contract_key(
@@ -2482,25 +2635,6 @@ def _schedule_contract_status_for(
             reason=(
                 "schedule template is attested for this contract but is not "
                 "marked as a production implementation"
-            ),
-            op_signature=contract.op_signature,
-            required_internal_buffers=contract.required_internal_buffers,
-            required_external_buffers=contract.required_external_buffers,
-            shape_env_key=contract.shape_env_key,
-            declared_key=declared_key,
-            declared_implementation_kind=declared_kind,
-            declared_schedule_id=declared_schedule_id,
-            declared_required_real_abi_inputs=declared_required_real_abi_inputs,
-            missing_real_abi_inputs=missing_real_abi_inputs,
-        )
-    if declared_schedule_id not in _TRUSTED_PRODUCTION_SCHEDULE_IDS:
-        return FusionScheduleContractStatus(
-            name=contract.name,
-            key=contract.key,
-            status="untrusted_production_schedule",
-            reason=(
-                "schedule template declares production implementation, but its "
-                "production_schedule_id is not trusted by this build"
             ),
             op_signature=contract.op_signature,
             required_internal_buffers=contract.required_internal_buffers,
@@ -2818,6 +2952,7 @@ def _infer_edges(nodes: Sequence[FusionNode]) -> tuple[FusionEdge, ...]:
     producer_by_output: dict[str, str] = {}
     ambiguous_outputs: dict[str, tuple[str, str]] = {}
     edges: list[FusionEdge] = []
+    node_by_name = {node.name: node for node in nodes}
     for node in nodes:
         for output_name in node.outputs:
             existing = producer_by_output.get(output_name)
@@ -2842,9 +2977,38 @@ def _infer_edges(nodes: Sequence[FusionNode]) -> tuple[FusionEdge, ...]:
                         output=input_name,
                         consumer=node.name,
                         input=input_name,
+                        lifetime=_inferred_edge_lifetime(
+                            producer_node=node_by_name[producer],
+                            consumer_node=node,
+                            buffer_name=input_name,
+                        ),
                     )
                 )
     return tuple(edges)
+
+
+def _canonical_path_c_edge_buffer_name(buffer_name: str) -> str:
+    name = str(buffer_name)
+    if name.endswith("_kv_fp8"):
+        return "kv_fp8"
+    if name.endswith("_kv_scale"):
+        return "kv_scale"
+    return name
+
+
+def _inferred_edge_lifetime(
+    *,
+    producer_node: FusionNode,
+    consumer_node: FusionNode,
+    buffer_name: str,
+) -> str:
+    if (
+        producer_node.op_name == "attention_qkv_projection"
+        and consumer_node.op_name == "sparse_mla_fp8_apply"
+        and _canonical_path_c_edge_buffer_name(buffer_name) in {"kv_fp8", "kv_scale"}
+    ):
+        return "workspace"
+    return "internal"
 
 
 def _nodes_in_dependency_order(

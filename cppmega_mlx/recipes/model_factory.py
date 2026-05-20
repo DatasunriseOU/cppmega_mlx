@@ -260,11 +260,11 @@ class ModelFactoryProfile:
 
         return tuple(
             {
-                "name": f"{self.name}_brick_{index}_{symbol}",
-                "kind": symbol,
-                "route_symbol": symbol,
+                "name": f"{self.name}_brick_{index}_{layer.symbol}",
+                "kind": layer.role,
+                "route_symbol": layer.symbol,
             }
-            for index, symbol in enumerate(self.pattern)
+            for index, layer in enumerate(self.expanded_pattern.layers)
         )
 
     def build_model(

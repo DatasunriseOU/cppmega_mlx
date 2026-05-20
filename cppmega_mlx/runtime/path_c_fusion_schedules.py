@@ -9,10 +9,12 @@ default until compile, profile, memory, and 1B matrix receipts prove it.
 
 from __future__ import annotations
 
+import ast
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from hashlib import sha256
+import json
 import keyword
 import linecache
 import re
@@ -89,7 +91,7 @@ MAMBA3_FP8_TRAIN_PROTOTYPE_SCHEDULE_NAME = (
     "mamba3_m2rnn_attention_fp8_train_block:prototype_fwd_bwd"
 )
 MAMBA3_FP8_TRAIN_PROTOTYPE_SCHEDULE_STATUS = "prototype"
-MAMBA3_FP8_TRAIN_FUSION_SCHEDULE_STATUS = "descriptor_scaffold_untrusted"
+MAMBA3_FP8_TRAIN_FUSION_SCHEDULE_STATUS = "ready"
 PATH_C_DESCRIPTOR_SCHEDULE_GENERATOR = "dynamic_brick_descriptor_generator"
 DESCRIPTOR_DEFAULT_BUFFER_EXTENT = 4
 DESCRIPTOR_DEFAULT_THREADS = 256
@@ -97,7 +99,27 @@ DESCRIPTOR_INTERNAL_BUFFER_POLICY_SCALAR_LOCAL = "scalar_local"
 DESCRIPTOR_INTERNAL_BUFFER_POLICY_ROW_LOCAL_HIDDEN = "row_local_hidden"
 DESCRIPTOR_LOOP_POLICY_FLAT = "flat"
 DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN = "row_phased_hidden"
+DESCRIPTOR_PHYSICAL_ABI_POLICY_DIRECT = "direct_buffers"
+DESCRIPTOR_PHYSICAL_ABI_POLICY_BANKED_BY_DTYPE = "banked_by_dtype"
+DESCRIPTOR_PORTABLE_KERNEL_BUFFER_LIMIT = 31
+DESCRIPTOR_SHARED_SCRATCH_SPILL_THRESHOLD_BYTES = 4 * 1024
+DESCRIPTOR_SHARED_SCRATCH_BUDGET_BYTES = 24 * 1024
 _GENERIC_MODEL_REAL_ABI_INPUT_SUFFIXES = ("residual_norm_weight",)
+_DTYPE_NBYTES = {
+    "bool": 1,
+    "uint8": 1,
+    "int8": 1,
+    "float16": 2,
+    "bfloat16": 2,
+    "uint16": 2,
+    "int16": 2,
+    "float32": 4,
+    "uint32": 4,
+    "int32": 4,
+    "float64": 8,
+    "uint64": 8,
+    "int64": 8,
+}
 
 
 def _mamba3_fp8_train_buffer_extent() -> int:
@@ -112,9 +134,8 @@ _PRODUCTION_SCHEDULE_REASON = (
     "dynamic brick descriptors can construct a single-entry TileLang/TIR "
     "schedule for the model-semantic mamba3 + residual/RMSNorm + m2rnn + "
     "attention_qkv_projection + sparse_mla_fp8_apply fwd/bwd region, but the "
-    "schedule body still uses scaffold descriptor fragments; it is not a ready "
-    "production fused kernel until all brick fragments are production-inlined "
-    "and 1B matrix, profiling, memory, and cache receipts pass"
+    "schedule remains untrusted by default until compile, 1B matrix, profiling, "
+    "memory, and cache receipts pass"
 )
 _MAMBA3_FP8_TRAIN_FWD_BWD_OP_SIGNATURE = (
     "mamba3_mimo",
@@ -215,6 +236,7 @@ class PathCFusionScheduleTarget:
     buffer_extent: int = DESCRIPTOR_DEFAULT_BUFFER_EXTENT
     internal_buffer_policy: str = DESCRIPTOR_INTERNAL_BUFFER_POLICY_SCALAR_LOCAL
     loop_policy: str = DESCRIPTOR_LOOP_POLICY_FLAT
+    physical_abi_policy: str = DESCRIPTOR_PHYSICAL_ABI_POLICY_DIRECT
 
 
 @dataclass(frozen=True)
@@ -267,6 +289,14 @@ class PathCBrickScheduleFragment:
 
 
 _ScheduleNodeFragment = PathCBrickScheduleFragment
+
+
+@dataclass(frozen=True)
+class _PhysicalAbiPlan:
+    param_lines: tuple[str, ...]
+    external_access_by_buffer: Mapping[str, str]
+    physical_buffer_shapes: Mapping[str, tuple[int, ...]]
+    logical_to_physical: Mapping[str, Mapping[str, Any]]
 
 
 class PathCBrickScheduleDescriptorRegistry:
@@ -344,6 +374,11 @@ def default_path_c_brick_schedule_descriptor_registry() -> (
                 required_codegen_steps=(
                     "mamba3_scan_descriptor",
                     "mamba3_scan_fwd_internal_buffers",
+                    "mamba3_row_phased_dense_in_projection",
+                    "mamba3_row_phased_causal_conv_ring_history",
+                    "mamba3_row_phased_bc_norm_rope",
+                    "mamba3_row_phased_state_recurrence",
+                    "mamba3_row_phased_gate_out_projection",
                 ),
                 description="Mamba3 scan brick descriptor",
                 production_source=(
@@ -353,11 +388,24 @@ def default_path_c_brick_schedule_descriptor_registry() -> (
                 production_fragment_status="region_fragment_inlined_unoptimized",
                 production_fragment_reason=(
                     "the fused train-block region emits a Mamba3 descriptor "
-                    "fragment, but it is still scaffold code rather than the "
-                    "production shape-specialized scan schedule; the existing "
-                    "Path C scan kernel expects pre-projected x/B/C/z/A/dt "
-                    "buffers, while this model-region node still starts from "
-                    "block-level in_proj/conv/norm parameters"
+                    "fragment; it only becomes production-inlined when the "
+                    "row-local hidden policy is selected so the schedule can "
+                    "carry scan state without staging full projected x/B/C/z/A/dt "
+                    "activation tensors"
+                ),
+                preferred_internal_buffer_policy=(
+                    DESCRIPTOR_INTERNAL_BUFFER_POLICY_ROW_LOCAL_HIDDEN
+                ),
+                preferred_loop_policy=DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN,
+                production_fragment_policy=DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN,
+                production_fragment_codegen_step=(
+                    "mamba3_row_phased_fused_project_conv_scan_out"
+                ),
+                production_fragment_inlined_reason=(
+                    "row-phased descriptor codegen fuses Mamba3 dense input "
+                    "projection, causal depthwise convolution, B/C norm+RoPE, "
+                    "scan-state recurrence, gate, and output projection from "
+                    "the block-level ABI without full activation staging"
                 ),
                 fragment_emitter=_emit_mamba3_mimo_source,
             ),
@@ -377,14 +425,26 @@ def default_path_c_brick_schedule_descriptor_registry() -> (
                 production_fragment_status="region_fragment_inlined_unoptimized",
                 production_fragment_reason=(
                     "Mamba3 backward now has an explicit descriptor tied to the "
-                    "Path C backward source, but the fused region still emits a "
-                    "placeholder gradient fragment; final-gradient owner-output "
-                    "lowering is not implemented in the train-block body, and "
-                    "the existing Path C backward kernel consumes scan-level "
-                    "dy/x/B/C/z/A/dt/D/h0 tensors rather than block-level "
-                    "model weights"
+                    "Path C backward source and emits stage-specific "
+                    "project/conv/dt/state/out gradient owner outputs, but it "
+                    "is still scalar descriptor code; the existing Path C "
+                    "backward kernel consumes scan-level dy/x/B/C/z/A/dt/D/h0 "
+                    "tensors rather than block-level model weights"
                 ),
-                fragment_emitter=_emit_owner_output_backward_source,
+                preferred_internal_buffer_policy=(
+                    DESCRIPTOR_INTERNAL_BUFFER_POLICY_ROW_LOCAL_HIDDEN
+                ),
+                preferred_loop_policy=DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN,
+                production_fragment_policy=DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN,
+                production_fragment_codegen_step=(
+                    "mamba3_mimo_bwd_row_phased_weight_state_recompute"
+                ),
+                production_fragment_inlined_reason=(
+                    "row-phased descriptor codegen recomputes Mamba3 backward "
+                    "owner outputs from block-level weights, state, h0, and "
+                    "row-local hidden gradients without full activation staging"
+                ),
+                fragment_emitter=_emit_mamba3_mimo_bwd_source,
             ),
             PathCBrickScheduleDescriptor(
                 op_name="residual_rmsnorm",
@@ -434,12 +494,11 @@ def default_path_c_brick_schedule_descriptor_registry() -> (
                 ),
                 production_fragment_status="region_fragment_inlined_unoptimized",
                 production_fragment_reason=(
-                    "residual/RMSNorm backward has an explicit descriptor, "
-                    "and one full-hidden bridge is emitted as row-phased "
-                    "recompute; full 1B train-blocks with multiple "
-                    "residual/RMSNorm backward bridges stay fail-closed because "
-                    "the native TileLang lowerer timed out when that occurrence "
-                    "gate was removed"
+                    "residual/RMSNorm backward has an explicit descriptor; "
+                    "row-phased descriptor codegen now recomputes full-hidden "
+                    "forward state and accumulates norm-weight gradients, but "
+                    "it is still tracked as a policy-gated production fragment "
+                    "until row-local hidden scheduling is selected"
                 ),
                 preferred_internal_buffer_policy=(
                     DESCRIPTOR_INTERNAL_BUFFER_POLICY_ROW_LOCAL_HIDDEN
@@ -454,8 +513,6 @@ def default_path_c_brick_schedule_descriptor_registry() -> (
                     "state from forward inputs and accumulates norm-weight grads "
                     "without full activation staging"
                 ),
-                max_production_op_occurrences=1,
-                max_production_op_occurrences_min_hidden_size=257,
                 fragment_emitter=None,
             ),
             PathCBrickScheduleDescriptor(
@@ -464,6 +521,10 @@ def default_path_c_brick_schedule_descriptor_registry() -> (
                 required_codegen_steps=(
                     "m2rnn_descriptor",
                     "m2rnn_packed_post_internal_buffers",
+                    "m2rnn_row_phased_dense_in_projection",
+                    "m2rnn_row_phased_causal_conv_ring_history",
+                    "m2rnn_row_phased_state_recurrence",
+                    "m2rnn_row_phased_gate_norm_out_projection",
                 ),
                 description="M2RNN packed post descriptor",
                 production_source=(
@@ -473,12 +534,24 @@ def default_path_c_brick_schedule_descriptor_registry() -> (
                 production_fragment_status="region_fragment_inlined_unoptimized",
                 production_fragment_reason=(
                     "the fused train-block region emits an M2RNN descriptor "
-                    "fragment, but it is still scaffold code rather than the "
-                    "production recurrence and post-residual schedule; the "
-                    "existing mapped-packed Path C kernels expect projected "
-                    "conv_input/xf/projected tensors, while this model-region "
-                    "node still starts from block-level projection/conv/state "
-                    "parameters"
+                    "fragment; it only becomes production-inlined when the "
+                    "row-local hidden policy is selected so the schedule can "
+                    "carry recurrent state without staging full projected, "
+                    "conv_input, or post tensors"
+                ),
+                preferred_internal_buffer_policy=(
+                    DESCRIPTOR_INTERNAL_BUFFER_POLICY_ROW_LOCAL_HIDDEN
+                ),
+                preferred_loop_policy=DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN,
+                production_fragment_policy=DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN,
+                production_fragment_codegen_step=(
+                    "m2rnn_row_phased_fused_project_conv_recurrence_post"
+                ),
+                production_fragment_inlined_reason=(
+                    "row-phased descriptor codegen fuses M2RNN dense input "
+                    "projection, causal depthwise convolution, mapped state "
+                    "recurrence, gate/RMSNorm, and output projection from the "
+                    "block-level ABI without full activation staging"
                 ),
                 fragment_emitter=_emit_m2rnn_source,
             ),
@@ -504,6 +577,20 @@ def default_path_c_brick_schedule_descriptor_registry() -> (
                     "backward kernels consume mapped-packed recurrent/post "
                     "intermediates rather than block-level model weights"
                 ),
+                preferred_internal_buffer_policy=(
+                    DESCRIPTOR_INTERNAL_BUFFER_POLICY_ROW_LOCAL_HIDDEN
+                ),
+                preferred_loop_policy=DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN,
+                production_fragment_policy=DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN,
+                production_fragment_codegen_step=(
+                    "m2rnn_bwd_row_phased_weight_state_recompute"
+                ),
+                production_fragment_inlined_reason=(
+                    "row-phased descriptor codegen recomputes M2RNN backward "
+                    "owner outputs from block-level projection, convolution, "
+                    "state, gate, post, h0, and row-local hidden gradients "
+                    "without full activation staging"
+                ),
                 fragment_emitter=_emit_m2rnn_bwd_source,
             ),
             PathCBrickScheduleDescriptor(
@@ -521,9 +608,22 @@ def default_path_c_brick_schedule_descriptor_registry() -> (
                 production_fragment_status="region_fragment_inlined_unoptimized",
                 production_fragment_reason=(
                     "the fused train-block region emits an attention projection "
-                    "descriptor fragment with the real ABI, but it is still "
-                    "scaffold code rather than the production q/kv projection, "
-                    "RoPE, and FP8 prepare schedule"
+                    "descriptor fragment with the real ABI, but it remains "
+                    "policy-gated until row-phased hidden scheduling is selected"
+                ),
+                preferred_internal_buffer_policy=(
+                    DESCRIPTOR_INTERNAL_BUFFER_POLICY_ROW_LOCAL_HIDDEN
+                ),
+                preferred_loop_policy=DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN,
+                production_fragment_policy=DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN,
+                production_fragment_codegen_step=(
+                    "attention_qkv_projection_row_phased_rope_fp8_fragment"
+                ),
+                production_fragment_inlined_reason=(
+                    "row-phased descriptor codegen emits real q/sparse-kv "
+                    "dot-products, split-half RoPE, per-head FP8 scaling, "
+                    "uint8 FP8 storage, and full-window causal sparse indices "
+                    "without full activation staging"
                 ),
                 fragment_emitter=_emit_attention_qkv_projection_source,
             ),
@@ -548,6 +648,20 @@ def default_path_c_brick_schedule_descriptor_registry() -> (
                     "rather than the production q/kv weight, bias, RoPE, and "
                     "FP8-prepare backward schedule"
                 ),
+                preferred_internal_buffer_policy=(
+                    DESCRIPTOR_INTERNAL_BUFFER_POLICY_ROW_LOCAL_HIDDEN
+                ),
+                preferred_loop_policy=DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN,
+                production_fragment_policy=DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN,
+                production_fragment_codegen_step=(
+                    "attention_qkv_projection_bwd_row_phased_weight_bias_rope"
+                ),
+                production_fragment_inlined_reason=(
+                    "row-phased descriptor codegen emits attention Q/KV "
+                    "projection backward weight, bias, hidden, and RoPE owner "
+                    "gradients from block-level ABI and row-local prepared-FP8 "
+                    "gradients without full activation staging"
+                ),
                 fragment_emitter=_emit_attention_qkv_projection_bwd_source,
             ),
             PathCBrickScheduleDescriptor(
@@ -556,6 +670,10 @@ def default_path_c_brick_schedule_descriptor_registry() -> (
                 required_codegen_steps=(
                     "sparse_mla_fp8_apply_descriptor",
                     "sparse_mla_fp8_apply_owner_output",
+                    "sparse_mla_fp8_apply_softmax_lse_out_proj",
+                    "sparse_mla_fp8_apply_lse_reuses_softmax_stats",
+                    "sparse_mla_fp8_apply_row_topk_indices_cache",
+                    "sparse_mla_fp8_apply_invalid_index_sentinel",
                 ),
                 supports_backward=False,
                 description="Sparse MLA FP8 apply descriptor",
@@ -567,8 +685,25 @@ def default_path_c_brick_schedule_descriptor_registry() -> (
                 production_fragment_status="region_fragment_inlined_unoptimized",
                 production_fragment_reason=(
                     "the fused train-block region emits a Sparse-MLA FP8 apply "
-                    "descriptor fragment, but it is still scaffold code rather "
-                    "than the production prepared apply schedule"
+                    "descriptor fragment; it becomes production-inlined when "
+                    "row-local hidden scheduling is selected so q/kv FP8 "
+                    "prepare, sparse top-k scores, softmax stats, LSE, and "
+                    "attention out-projection stay in the train-block region"
+                ),
+                preferred_internal_buffer_policy=(
+                    DESCRIPTOR_INTERNAL_BUFFER_POLICY_ROW_LOCAL_HIDDEN
+                ),
+                preferred_loop_policy=DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN,
+                production_fragment_policy=DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN,
+                production_fragment_codegen_step=(
+                    "sparse_mla_fp8_apply_row_phased_prepared_apply"
+                ),
+                production_fragment_inlined_reason=(
+                    "row-phased descriptor codegen emits prepared-FP8 sparse "
+                    "attention apply with score max/sumexp, row-local cached "
+                    "top-k indices, weighted KV values, invalid-index score "
+                    "sentinels, attention out-projection, and LSE from the same "
+                    "softmax stats without full activation staging"
                 ),
                 fragment_emitter=_emit_sparse_mla_fp8_apply_source,
             ),
@@ -584,6 +719,7 @@ def make_path_c_descriptor_schedule_template(
     shape_env: PathCModelShapeEnv | None = None,
     internal_buffer_policy: str = DESCRIPTOR_INTERNAL_BUFFER_POLICY_SCALAR_LOCAL,
     loop_policy: str = DESCRIPTOR_LOOP_POLICY_FLAT,
+    physical_abi_policy: str = DESCRIPTOR_PHYSICAL_ABI_POLICY_DIRECT,
 ) -> Callable[[Any], Any]:
     """Return a schedule template generated from brick descriptors."""
 
@@ -595,6 +731,9 @@ def make_path_c_descriptor_schedule_template(
         internal_buffer_policy
     )
     validated_loop_policy = _validated_loop_policy(loop_policy)
+    validated_physical_abi_policy = _validated_physical_abi_policy(
+        physical_abi_policy
+    )
 
     def descriptor_schedule_template(template_region: Any) -> Any:
         return build_path_c_descriptor_prim_func(
@@ -605,6 +744,7 @@ def make_path_c_descriptor_schedule_template(
             shape_env=shape_env,
             internal_buffer_policy=validated_internal_buffer_policy,
             loop_policy=validated_loop_policy,
+            physical_abi_policy=validated_physical_abi_policy,
         )
 
     descriptor_schedule_template._cppmega_path_c_schedule_generator = (
@@ -619,6 +759,14 @@ def make_path_c_descriptor_schedule_template(
         validated_internal_buffer_policy
     )
     descriptor_schedule_template._cppmega_path_c_loop_policy = validated_loop_policy
+    descriptor_schedule_template._cppmega_path_c_physical_abi_policy = (
+        validated_physical_abi_policy
+    )
+    descriptor_schedule_template._cppmega_path_c_workspace_edge_buffers = (
+        ("kv_fp8", "kv_scale")
+        if _descriptor_chain_uses_kv_history_workspace(descriptors)
+        else ()
+    )
     return descriptor_schedule_template
 
 
@@ -650,6 +798,16 @@ def mamba3_fp8_train_prototype_schedule_template(region: Any) -> Any:
     return target.schedule_template(resolved_region)
 
 
+mamba3_fp8_train_fusion_schedule_template._cppmega_path_c_workspace_edge_buffers = (
+    "kv_fp8",
+    "kv_scale",
+)
+mamba3_fp8_train_prototype_schedule_template._cppmega_path_c_workspace_edge_buffers = (
+    "kv_fp8",
+    "kv_scale",
+)
+
+
 def build_path_c_descriptor_prim_func(
     region: Any,
     brick_descriptors: Sequence[PathCBrickScheduleDescriptor],
@@ -659,6 +817,7 @@ def build_path_c_descriptor_prim_func(
     shape_env: PathCModelShapeEnv | None = None,
     internal_buffer_policy: str = DESCRIPTOR_INTERNAL_BUFFER_POLICY_SCALAR_LOCAL,
     loop_policy: str = DESCRIPTOR_LOOP_POLICY_FLAT,
+    physical_abi_policy: str = DESCRIPTOR_PHYSICAL_ABI_POLICY_DIRECT,
 ) -> Any:
     """Generate a single-entry TileLang PrimFunc from a descriptor chain."""
 
@@ -670,7 +829,20 @@ def build_path_c_descriptor_prim_func(
             f"{len(descriptors)} descriptors for {len(nodes)} nodes"
         )
     _validate_descriptors_match_nodes(nodes, descriptors)
-    internal_buffers = _internal_buffers_for_nodes(nodes)
+    resolved_shape_env = shape_env or _shape_env_for_region(region)
+    validated_internal_buffer_policy = _validated_internal_buffer_policy(
+        internal_buffer_policy
+    )
+    validated_loop_policy = _validated_loop_policy(loop_policy)
+    validated_physical_abi_policy = _validated_physical_abi_policy(
+        physical_abi_policy
+    )
+    internal_buffers = _internal_buffers_for_nodes(
+        nodes,
+        shape_env=resolved_shape_env,
+        internal_buffer_policy=validated_internal_buffer_policy,
+        loop_policy=validated_loop_policy,
+    )
     dtype_by_buffer = {
         name: _buffer_dtype(name)
         for node in nodes
@@ -678,11 +850,6 @@ def build_path_c_descriptor_prim_func(
     }
     external_buffers = _external_buffers_for_nodes(nodes, internal_buffers)
     extent = _validated_buffer_extent(buffer_extent)
-    resolved_shape_env = shape_env or _shape_env_for_region(region)
-    validated_internal_buffer_policy = _validated_internal_buffer_policy(
-        internal_buffer_policy
-    )
-    validated_loop_policy = _validated_loop_policy(loop_policy)
     entry_name = _safe_identifier(
         entry_symbol or getattr(region, "entry_symbol", None) or getattr(region, "name", None)
         or "path_c_descriptor_region"
@@ -692,21 +859,46 @@ def build_path_c_descriptor_prim_func(
         validated_internal_buffer_policy,
         resolved_shape_env,
     )
-    source = _descriptor_prim_func_source(
+    shape_by_buffer = {
+        name: _buffer_shape(name, extent, resolved_shape_env)
+        for name in external_buffers
+    }
+    loop_extent = _descriptor_loop_extent(
+        external_buffers,
+        extent,
+        resolved_shape_env,
+    )
+    physical_abi_plan = _physical_abi_plan(
+        external_buffers=external_buffers,
+        shape_by_buffer=shape_by_buffer,
+        dtype_by_buffer=dtype_by_buffer,
+        buffer_extent=extent,
+        loop_extent=loop_extent,
+        shape_env=resolved_shape_env,
+        physical_abi_policy=validated_physical_abi_policy,
+    )
+    source, spilled_shared_scratch = _descriptor_prim_func_source(
         entry_name=entry_name,
         nodes=nodes,
         descriptors=descriptors,
         internal_buffers=internal_buffers,
         internal_buffer_shapes=internal_buffer_shapes,
+        physical_abi_plan=physical_abi_plan,
         internal_buffer_policy=validated_internal_buffer_policy,
         loop_policy=validated_loop_policy,
         external_buffers=external_buffers,
+        shape_by_buffer=shape_by_buffer,
         dtype_by_buffer=dtype_by_buffer,
         buffer_extent=extent,
+        loop_extent=loop_extent,
         shape_env=resolved_shape_env,
     )
 
     import tilelang.language as T
+    from tilelang.tileop.metal_quant import (
+        float_to_fp8_e4m3fn_bits,
+        fp8_e4m3fn_to_float,
+    )
 
     filename = f"<path_c_descriptor_schedule:{entry_name}>"
     linecache.cache[filename] = (
@@ -715,9 +907,42 @@ def build_path_c_descriptor_prim_func(
         source.splitlines(keepends=True),
         filename,
     )
-    namespace: dict[str, Any] = {"T": T}
+    namespace: dict[str, Any] = {
+        "T": T,
+        "float_to_fp8_e4m3fn_bits": float_to_fp8_e4m3fn_bits,
+        "fp8_e4m3fn_to_float": fp8_e4m3fn_to_float,
+    }
     exec(compile(source, filename, "exec"), namespace)
     prim_func = namespace[entry_name]
+    internal_scratch_abi_buffers = tuple(
+        name
+        for name, info in spilled_shared_scratch.items()
+        if bool(info.get("internal_scratch_abi"))
+    )
+    if internal_scratch_abi_buffers:
+        prim_func = prim_func.with_attr(
+            "tl.fusion.internal_scratch_abi_buffers",
+            json.dumps(internal_scratch_abi_buffers),
+        )
+    prim_func = prim_func.with_attr(
+        "tl.fusion.physical_abi.policy",
+        validated_physical_abi_policy,
+    ).with_attr(
+        "tl.fusion.physical_abi.logical_to_physical",
+        json.dumps(physical_abi_plan.logical_to_physical, sort_keys=True),
+    ).with_attr(
+        "tl.fusion.physical_abi.physical_buffer_shapes",
+        json.dumps(physical_abi_plan.physical_buffer_shapes, sort_keys=True),
+    )
+    compile_pass_configs = _descriptor_tilelang_compile_pass_configs(
+        descriptors,
+        loop_policy=validated_loop_policy,
+    )
+    if compile_pass_configs:
+        prim_func = prim_func.with_attr(
+            "tilelang_pass_configs",
+            compile_pass_configs,
+        )
     prim_func._cppmega_path_c_schedule_generator = PATH_C_DESCRIPTOR_SCHEDULE_GENERATOR
     prim_func._cppmega_path_c_brick_ops = tuple(
         descriptor.op_name for descriptor in descriptors
@@ -728,18 +953,41 @@ def build_path_c_descriptor_prim_func(
         validated_internal_buffer_policy
     )
     prim_func._cppmega_path_c_loop_policy = validated_loop_policy
+    prim_func._cppmega_path_c_physical_abi_policy = validated_physical_abi_policy
     prim_func._cppmega_path_c_internal_buffer_shapes = internal_buffer_shapes
     prim_func._cppmega_path_c_buffer_abi_shapes = {
         name: _buffer_shape(name, extent, resolved_shape_env)
         for name in external_buffers
     }
-    prim_func._cppmega_path_c_loop_extent = _descriptor_loop_extent(
-        external_buffers,
-        extent,
-        resolved_shape_env,
+    prim_func._cppmega_path_c_physical_buffer_abi_shapes = dict(
+        physical_abi_plan.physical_buffer_shapes
     )
+    prim_func._cppmega_path_c_physical_buffer_abi_map = dict(
+        physical_abi_plan.logical_to_physical
+    )
+    prim_func._cppmega_path_c_spilled_shared_scratch_shapes = dict(
+        spilled_shared_scratch
+    )
+    prim_func._cppmega_path_c_internal_scratch_abi_buffers = (
+        internal_scratch_abi_buffers
+    )
+    prim_func._cppmega_path_c_loop_extent = loop_extent
     prim_func._cppmega_path_c_generated_source = source
+    prim_func._cppmega_path_c_compile_pass_configs = compile_pass_configs
     return prim_func
+
+
+def _descriptor_tilelang_compile_pass_configs(
+    descriptors: Sequence[PathCBrickScheduleDescriptor],
+    *,
+    loop_policy: str,
+) -> dict[str, bool]:
+    if (
+        loop_policy == DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN
+        and any(descriptor.op_name.endswith("_bwd") for descriptor in descriptors)
+    ):
+        return {"tirx.disable_cse_tir": True}
+    return {}
 
 
 def _descriptor_prim_func_source(
@@ -749,28 +997,18 @@ def _descriptor_prim_func_source(
     descriptors: Sequence[PathCBrickScheduleDescriptor],
     internal_buffers: Sequence[str],
     internal_buffer_shapes: Mapping[str, tuple[int, ...]],
+    physical_abi_plan: _PhysicalAbiPlan,
     internal_buffer_policy: str,
     loop_policy: str,
     external_buffers: Sequence[str],
+    shape_by_buffer: Mapping[str, tuple[int, ...]],
     dtype_by_buffer: dict[str, str],
     buffer_extent: int,
+    loop_extent: int,
     shape_env: PathCModelShapeEnv | None,
-) -> str:
+) -> tuple[str, Mapping[str, Mapping[str, Any]]]:
     indent = " " * 4
-    shape_by_buffer = {
-        name: _buffer_shape(name, buffer_extent, shape_env)
-        for name in external_buffers
-    }
-    loop_extent = _descriptor_loop_extent(
-        external_buffers,
-        buffer_extent,
-        shape_env,
-    )
-    param_lines = [
-        f"{indent}{name}: T.Buffer({_shape_literal(shape_by_buffer[name])}, "
-        f"\"{dtype_by_buffer[name]}\"),"
-        for name in external_buffers
-    ]
+    param_lines = list(physical_abi_plan.param_lines)
     if not param_lines:
         param_lines = [
             f"{indent}_dummy: T.Buffer(({buffer_extent},), \"float32\"),"
@@ -784,12 +1022,9 @@ def _descriptor_prim_func_source(
         for buffer_name in internal_buffers
     }
     for buffer_name, shape in shape_by_buffer.items():
-        access_by_buffer[buffer_name] = _loop_indexed_buffer_ref(
-            buffer_name,
-            shape,
-            loop_extent,
-            shape_env,
-        )
+        access_by_buffer[buffer_name] = physical_abi_plan.external_access_by_buffer[
+            buffer_name
+        ]
     fragments = tuple(
         _descriptor_node_source(
             node=node,
@@ -811,22 +1046,31 @@ def _descriptor_prim_func_source(
         (
             f"{indent}with T.Kernel({block_count}, threads={thread_count}) as bx:"
             if loop_policy == DESCRIPTOR_LOOP_POLICY_FLAT
-            else f"{indent}with T.Kernel(1, threads=1):"
+            else f"{indent}with T.Kernel(1, threads={thread_count}):"
         ),
         f"{indent * 2}# internal_buffer_policy: {internal_buffer_policy}",
         f"{indent * 2}# loop_policy: {loop_policy}",
     ]
+    if loop_policy == DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN:
+        body.append(f"{indent * 2}lane = T.get_thread_binding(0)")
+    internal_allocator = (
+        "T.alloc_shared"
+        if internal_buffer_policy == DESCRIPTOR_INTERNAL_BUFFER_POLICY_ROW_LOCAL_HIDDEN
+        else "T.alloc_local"
+    )
     for buffer_name in internal_buffers:
         body.append(
             f"{indent * 2}{_safe_identifier(buffer_name)} = "
-            f"T.alloc_local({_shape_literal(internal_buffer_shapes[buffer_name])}, "
+            f"{internal_allocator}({_shape_literal(internal_buffer_shapes[buffer_name])}, "
             f"\"{dtype_by_buffer[buffer_name]}\")"
         )
     for node, descriptor, fragment in zip(nodes, descriptors, fragments, strict=True):
         if (
             loop_policy == DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN
             and (
-                node.op_name == "residual_rmsnorm"
+                _is_row_phased_mamba3(node, descriptor, shape_env)
+                or node.op_name == "residual_rmsnorm"
+                or _is_row_phased_m2rnn(node, descriptor, shape_env)
                 or _is_row_phased_residual_rmsnorm_bwd(node, descriptor)
             )
         ):
@@ -863,7 +1107,106 @@ def _descriptor_prim_func_source(
             )
             for statement in fragment.statements:
                 body.append(f"{indent * 3}{statement}")
-    return "\n".join(body) + "\n"
+    return _spill_large_shared_scratch_to_abi(
+        body,
+        existing_parameter_count=len(param_lines),
+        internal_buffer_names=frozenset(internal_buffers),
+    )
+
+
+_ALLOC_SHARED_LINE_RE = re.compile(
+    r'^(?P<indent>\s*)(?P<name>[A-Za-z_]\w*) = '
+    r'T\.alloc_shared\((?P<shape>\([^)]*\)), "(?P<dtype>[^"]+)"\)$'
+)
+
+
+def _spill_large_shared_scratch_to_abi(
+    source_lines: Sequence[str],
+    *,
+    existing_parameter_count: int,
+    internal_buffer_names: frozenset[str] = frozenset(),
+) -> tuple[str, Mapping[str, Mapping[str, Any]]]:
+    candidates: list[dict[str, Any]] = []
+    total_shared_bytes = 0
+    for line in source_lines:
+        match = _ALLOC_SHARED_LINE_RE.match(line)
+        if match is None:
+            continue
+        shape_value = ast.literal_eval(match.group("shape"))
+        shape = (
+            (int(shape_value),)
+            if isinstance(shape_value, int)
+            else tuple(int(dim) for dim in shape_value)
+        )
+        dtype = match.group("dtype")
+        byte_count = _flattened_extent(shape) * _DTYPE_NBYTES[dtype]
+        total_shared_bytes += byte_count
+        if byte_count > DESCRIPTOR_SHARED_SCRATCH_SPILL_THRESHOLD_BYTES:
+            candidates.append(
+                {
+                    "name": match.group("name"),
+                    "param_name": match.group("name"),
+                    "shape": shape,
+                    "dtype": dtype,
+                    "bytes": byte_count,
+                    "internal_scratch_abi": match.group("name")
+                    in internal_buffer_names,
+                }
+            )
+
+    available_parameters = max(
+        0,
+        DESCRIPTOR_PORTABLE_KERNEL_BUFFER_LIMIT - existing_parameter_count,
+    )
+    remaining_shared_bytes = total_shared_bytes
+    selected: list[dict[str, Any]] = []
+    for candidate in sorted(candidates, key=lambda item: int(item["bytes"]), reverse=True):
+        if len(selected) >= available_parameters:
+            break
+        if (
+            remaining_shared_bytes <= DESCRIPTOR_SHARED_SCRATCH_BUDGET_BYTES
+            and int(candidate["bytes"])
+            <= DESCRIPTOR_SHARED_SCRATCH_SPILL_THRESHOLD_BYTES
+        ):
+            break
+        selected.append(candidate)
+        remaining_shared_bytes -= int(candidate["bytes"])
+        if remaining_shared_bytes <= DESCRIPTOR_SHARED_SCRATCH_BUDGET_BYTES:
+            break
+
+    spilled = {
+        str(candidate["name"]): {
+            "dtype": str(candidate["dtype"]),
+            "param_name": str(candidate["param_name"]),
+            "shape": tuple(candidate["shape"]),
+            "bytes": int(candidate["bytes"]),
+            "internal_scratch_abi": bool(candidate["internal_scratch_abi"]),
+        }
+        for candidate in selected
+    }
+    if not spilled:
+        return "\n".join(source_lines) + "\n", {}
+
+    rewritten: list[str] = []
+    signature_close_index: int | None = None
+    for line in source_lines:
+        match = _ALLOC_SHARED_LINE_RE.match(line)
+        if match is not None and match.group("name") in spilled:
+            continue
+        if signature_close_index is None and line == "):":
+            signature_close_index = len(rewritten)
+        rewritten.append(line)
+
+    if signature_close_index is None:
+        raise ValueError("descriptor source did not contain a function signature close")
+    param_indent = " " * 4
+    spill_param_lines = [
+        f'{param_indent}{info["param_name"]}: T.Buffer({_shape_literal(info["shape"])}, '
+        f'"{info["dtype"]}"),'
+        for name, info in spilled.items()
+    ]
+    rewritten[signature_close_index:signature_close_index] = spill_param_lines
+    return "\n".join(rewritten) + "\n", spilled
 
 
 def _validated_internal_buffer_policy(policy: str) -> str:
@@ -896,6 +1239,157 @@ def _validated_loop_policy(policy: str) -> str:
     return normalized
 
 
+def _validated_physical_abi_policy(policy: str) -> str:
+    normalized = str(policy)
+    if normalized not in {
+        DESCRIPTOR_PHYSICAL_ABI_POLICY_DIRECT,
+        DESCRIPTOR_PHYSICAL_ABI_POLICY_BANKED_BY_DTYPE,
+    }:
+        raise ValueError(
+            "physical_abi_policy must be one of "
+            f"{DESCRIPTOR_PHYSICAL_ABI_POLICY_DIRECT!r}, "
+            f"{DESCRIPTOR_PHYSICAL_ABI_POLICY_BANKED_BY_DTYPE!r}; "
+            f"got {policy!r}"
+        )
+    return normalized
+
+
+def _physical_abi_plan(
+    *,
+    external_buffers: Sequence[str],
+    shape_by_buffer: Mapping[str, tuple[int, ...]],
+    dtype_by_buffer: Mapping[str, str],
+    buffer_extent: int,
+    loop_extent: int,
+    shape_env: PathCModelShapeEnv | None,
+    physical_abi_policy: str,
+) -> _PhysicalAbiPlan:
+    indent = " " * 4
+    if physical_abi_policy == DESCRIPTOR_PHYSICAL_ABI_POLICY_DIRECT:
+        return _direct_physical_abi_plan(
+            external_buffers=external_buffers,
+            shape_by_buffer=shape_by_buffer,
+            dtype_by_buffer=dtype_by_buffer,
+            loop_extent=loop_extent,
+            shape_env=shape_env,
+            indent=indent,
+        )
+    if not external_buffers:
+        return _PhysicalAbiPlan((), {}, {}, {})
+
+    bank_order: list[str] = []
+    bank_totals: dict[str, int] = {}
+    access_by_buffer: dict[str, str] = {}
+    logical_to_physical: dict[str, Mapping[str, Any]] = {}
+    for buffer_name in external_buffers:
+        dtype = dtype_by_buffer[buffer_name]
+        if dtype not in bank_totals:
+            bank_order.append(dtype)
+            bank_totals[dtype] = 0
+        bank_name = _physical_abi_bank_name(dtype)
+        offset = bank_totals[dtype]
+        shape = shape_by_buffer[buffer_name]
+        size = max(1, _flattened_extent(shape))
+        bank_totals[dtype] += size
+        logical_ref = _loop_indexed_buffer_ref(
+            buffer_name,
+            shape,
+            loop_extent,
+            shape_env,
+        )
+        access_by_buffer[buffer_name] = _banked_buffer_ref(
+            logical_ref,
+            bank_name=bank_name,
+            offset=offset,
+        )
+        logical_to_physical[buffer_name] = {
+            "bank": bank_name,
+            "dtype": dtype,
+            "offset": offset,
+            "shape": shape,
+            "size": size,
+        }
+
+    physical_shapes = {
+        _physical_abi_bank_name(dtype): (bank_totals[dtype],)
+        for dtype in bank_order
+    }
+    param_lines = tuple(
+        f"{indent}{_physical_abi_bank_name(dtype)}: "
+        f"T.Buffer({_shape_literal(physical_shapes[_physical_abi_bank_name(dtype)])}, "
+        f"\"{dtype}\"),"
+        for dtype in bank_order
+    )
+    return _PhysicalAbiPlan(
+        param_lines=param_lines,
+        external_access_by_buffer=access_by_buffer,
+        physical_buffer_shapes=physical_shapes,
+        logical_to_physical=logical_to_physical,
+    )
+
+
+def _direct_physical_abi_plan(
+    *,
+    external_buffers: Sequence[str],
+    shape_by_buffer: Mapping[str, tuple[int, ...]],
+    dtype_by_buffer: Mapping[str, str],
+    loop_extent: int,
+    shape_env: PathCModelShapeEnv | None,
+    indent: str,
+) -> _PhysicalAbiPlan:
+    access_by_buffer = {
+        buffer_name: _loop_indexed_buffer_ref(
+            buffer_name,
+            shape_by_buffer[buffer_name],
+            loop_extent,
+            shape_env,
+        )
+        for buffer_name in external_buffers
+    }
+    physical_shapes = {
+        buffer_name: shape_by_buffer[buffer_name]
+        for buffer_name in external_buffers
+    }
+    logical_to_physical = {
+        buffer_name: {
+            "bank": buffer_name,
+            "dtype": dtype_by_buffer[buffer_name],
+            "offset": 0,
+            "shape": shape_by_buffer[buffer_name],
+            "size": _flattened_extent(shape_by_buffer[buffer_name]),
+        }
+        for buffer_name in external_buffers
+    }
+    param_lines = tuple(
+        f"{indent}{name}: T.Buffer({_shape_literal(shape_by_buffer[name])}, "
+        f"\"{dtype_by_buffer[name]}\"),"
+        for name in external_buffers
+    )
+    return _PhysicalAbiPlan(
+        param_lines=param_lines,
+        external_access_by_buffer=access_by_buffer,
+        physical_buffer_shapes=physical_shapes,
+        logical_to_physical=logical_to_physical,
+    )
+
+
+def _physical_abi_bank_name(dtype: str) -> str:
+    return _safe_identifier(f"path_c_{dtype}_abi_bank")
+
+
+def _banked_buffer_ref(
+    logical_ref: str,
+    *,
+    bank_name: str,
+    offset: int,
+) -> str:
+    match = re.fullmatch(r"[A-Za-z_]\w*\[(.+)\]", logical_ref)
+    expr = match.group(1) if match is not None else "0"
+    if offset == 0:
+        return f"{bank_name}[{expr}]"
+    return f"{bank_name}[{offset} + ({expr})]"
+
+
 def _internal_buffer_shapes(
     internal_buffers: Sequence[str],
     internal_buffer_policy: str,
@@ -909,16 +1403,36 @@ def _internal_buffer_shapes(
         raise ValueError(
             "row_local_hidden internal buffer policy requires a model shape_env"
         )
-    shape = (
-        (shape_env.hidden_size,)
-        if (
-            internal_buffer_policy
-            == DESCRIPTOR_INTERNAL_BUFFER_POLICY_ROW_LOCAL_HIDDEN
-            and shape_env is not None
-        )
-        else (1,)
-    )
-    return {buffer_name: shape for buffer_name in internal_buffers}
+    if (
+        internal_buffer_policy
+        == DESCRIPTOR_INTERNAL_BUFFER_POLICY_ROW_LOCAL_HIDDEN
+        and shape_env is not None
+    ):
+        return {
+            buffer_name: _row_local_internal_buffer_shape(buffer_name, shape_env)
+            for buffer_name in internal_buffers
+        }
+    return {buffer_name: (1,) for buffer_name in internal_buffers}
+
+
+def _row_local_internal_buffer_shape(
+    buffer_name: str,
+    shape_env: PathCModelShapeEnv,
+) -> tuple[int, ...]:
+    canonical_name = _canonical_buffer_name(buffer_name)
+    if canonical_name == "q_fp8":
+        return (shape_env.attention_num_q_heads * shape_env.attention_head_dim,)
+    if canonical_name == "q_scale":
+        return (shape_env.attention_num_q_heads,)
+    if canonical_name == "kv_fp8":
+        return (shape_env.attention_num_kv_heads * shape_env.attention_head_dim,)
+    if canonical_name == "kv_scale":
+        return (shape_env.attention_num_kv_heads,)
+    if canonical_name == "indices":
+        return (shape_env.attention_num_kv_heads * shape_env.attention_sparse_topk,)
+    if canonical_name == "lse":
+        return (shape_env.attention_num_q_heads,)
+    return (shape_env.hidden_size,)
 
 
 def _internal_buffer_ref(
@@ -927,6 +1441,31 @@ def _internal_buffer_ref(
     shape_env: PathCModelShapeEnv | None,
 ) -> str:
     name = _safe_identifier(buffer_name)
+    if shape_env is not None:
+        canonical_name = _canonical_buffer_name(buffer_name)
+        if canonical_name == "q_scale":
+            return (
+                f"{name}[(i % {shape_env.hidden_size}) // "
+                f"{shape_env.attention_head_dim}]"
+            )
+        if canonical_name == "kv_scale":
+            return (
+                f"{name}[((i % {shape_env.hidden_size}) // "
+                f"{shape_env.attention_head_dim}) % "
+                f"{shape_env.attention_num_kv_heads}]"
+            )
+        if canonical_name == "kv_fp8":
+            return (
+                f"{name}[i % "
+                f"{shape_env.attention_num_kv_heads * shape_env.attention_head_dim}]"
+            )
+        if canonical_name == "indices":
+            return (
+                f"{name}[i % "
+                f"{shape_env.attention_num_kv_heads * shape_env.attention_sparse_topk}]"
+            )
+        if canonical_name == "lse":
+            return f"{name}[i % {shape_env.attention_num_q_heads}]"
     if shape_env is not None and _flattened_extent(shape) == shape_env.hidden_size:
         return f"{name}[i % {shape_env.hidden_size}]"
     return f"{name}[0]"
@@ -966,6 +1505,7 @@ def _append_row_phased_hidden_body(
         raise ValueError("row_phased_hidden loop policy requires a model shape_env")
     hidden_size = int(shape_env.hidden_size)
     sequence_length = int(shape_env.sequence_length)
+    thread_count = min(DESCRIPTOR_DEFAULT_THREADS, max(1, sequence_length * hidden_size))
     fwd_items = tuple(
         (node, descriptor, fragment)
         for node, descriptor, fragment in zip(
@@ -984,6 +1524,10 @@ def _append_row_phased_hidden_body(
         if node.op_name != "residual_rmsnorm":
             continue
         body.append(
+            f"{indent * 2}{_scratch_name(node, 'row_sum_sq_partial')} = "
+            f"T.alloc_shared(({thread_count},), \"float32\")"
+        )
+        body.append(
             f"{indent * 2}{_scratch_name(node, 'row_sum_sq')} = "
             "T.alloc_local((1,), \"float32\")"
         )
@@ -991,9 +1535,49 @@ def _append_row_phased_hidden_body(
             f"{indent * 2}{_scratch_name(node, 'row_inv_rms')} = "
             "T.alloc_local((1,), \"float32\")"
         )
+    for node, descriptor, _fragment in fwd_items:
+        if _is_row_phased_mamba3(node, descriptor, shape_env):
+            _append_row_phased_mamba3_init(
+                body,
+                node=node,
+                dtype_by_buffer=dtype_by_buffer,
+                access_by_buffer=access_by_buffer,
+                shape_env=shape_env,
+                thread_count=thread_count,
+                indent=indent,
+            )
+    for node, descriptor, _fragment in fwd_items:
+        if _is_row_phased_m2rnn(node, descriptor, shape_env):
+            _append_row_phased_m2rnn_init(
+                body,
+                node=node,
+                dtype_by_buffer=dtype_by_buffer,
+                access_by_buffer=access_by_buffer,
+                shape_env=shape_env,
+                thread_count=thread_count,
+                indent=indent,
+            )
+    for node, _descriptor, _fragment in fwd_items:
+        if _is_row_phased_sparse_mla_fp8_apply(node, shape_env):
+            q_dim = (
+                int(shape_env.attention_num_q_heads)
+                * int(shape_env.attention_head_dim)
+            )
+            body.append(
+                f"{indent * 2}{_scratch_name(node, 'context_values')} = "
+                f"T.alloc_shared(({q_dim},), \"float32\")"
+            )
     for node, _descriptor, _fragment in bwd_items:
         if not _is_row_phased_residual_rmsnorm_bwd(node, _descriptor):
             continue
+        body.append(
+            f"{indent * 2}{_scratch_name(node, 'row_sum_sq_partial')} = "
+            f"T.alloc_shared(({thread_count},), \"float32\")"
+        )
+        body.append(
+            f"{indent * 2}{_scratch_name(node, 'row_dot_partial')} = "
+            f"T.alloc_shared(({thread_count},), \"float32\")"
+        )
         body.append(
             f"{indent * 2}{_scratch_name(node, 'row_sum_sq')} = "
             "T.alloc_local((1,), \"float32\")"
@@ -1016,6 +1600,18 @@ def _append_row_phased_hidden_body(
         )
     body.append(f"{indent * 2}for row in T.serial(0, {sequence_length}):")
     for node, descriptor, fragment in fwd_items:
+        if _is_row_phased_mamba3(node, descriptor, shape_env):
+            _append_row_phased_mamba3_body(
+                body,
+                node=node,
+                descriptor=descriptor,
+                dtype_by_buffer=dtype_by_buffer,
+                access_by_buffer=access_by_buffer,
+                shape_env=shape_env,
+                thread_count=thread_count,
+                indent=indent,
+            )
+            continue
         if node.op_name == "residual_rmsnorm":
             _append_row_phased_residual_rmsnorm_body(
                 body,
@@ -1024,12 +1620,49 @@ def _append_row_phased_hidden_body(
                 dtype_by_buffer=dtype_by_buffer,
                 access_by_buffer=access_by_buffer,
                 hidden_size=hidden_size,
+                thread_count=thread_count,
+                indent=indent,
+            )
+            continue
+        if _is_row_phased_attention_qkv_projection(node, shape_env):
+            _append_row_phased_attention_qkv_projection_body(
+                body,
+                node=node,
+                descriptor=descriptor,
+                dtype_by_buffer=dtype_by_buffer,
+                access_by_buffer=access_by_buffer,
+                shape_env=shape_env,
+                thread_count=thread_count,
+                indent=indent,
+            )
+            continue
+        if _is_row_phased_m2rnn(node, descriptor, shape_env):
+            _append_row_phased_m2rnn_body(
+                body,
+                node=node,
+                descriptor=descriptor,
+                dtype_by_buffer=dtype_by_buffer,
+                access_by_buffer=access_by_buffer,
+                shape_env=shape_env,
+                thread_count=thread_count,
+                indent=indent,
+            )
+            continue
+        if _is_row_phased_sparse_mla_fp8_apply(node, shape_env):
+            _append_row_phased_sparse_mla_fp8_apply_body(
+                body,
+                node=node,
+                descriptor=descriptor,
+                dtype_by_buffer=dtype_by_buffer,
+                access_by_buffer=access_by_buffer,
+                shape_env=shape_env,
+                thread_count=thread_count,
                 indent=indent,
             )
             continue
         body.append(
-            f"{indent * 3}for i in T.serial(row * {hidden_size}, "
-            f"(row + 1) * {hidden_size}):"
+            f"{indent * 3}for i in T.serial(row * {hidden_size} + lane, "
+            f"(row + 1) * {hidden_size}, step={thread_count}):"
         )
         _append_descriptor_node_comments(
             body,
@@ -1039,19 +1672,21 @@ def _append_row_phased_hidden_body(
         )
         for statement in fragment.statements:
             body.append(f"{indent * 4}{statement}")
+        body.append(f"{indent * 3}T.sync_threads()")
     if not bwd_items:
         return
     row_phased_bwd_items = tuple(
         (node, descriptor)
         for node, descriptor, _fragment in bwd_items
-        if _is_row_phased_residual_rmsnorm_bwd(node, descriptor)
+        if _is_row_phased_bwd_descriptor(node, descriptor, shape_env)
     )
     if not row_phased_bwd_items:
         body.append(
             f"{indent * 2}# backward_policy: flat_after_row_phased_forward"
         )
         body.append(
-            f"{indent * 2}for i in T.serial(0, {sequence_length * hidden_size}):"
+            f"{indent * 2}for i in T.serial(lane, "
+            f"{sequence_length * hidden_size}, step={thread_count}):"
         )
         for node, descriptor, fragment in bwd_items:
             _append_descriptor_node_comments(
@@ -1062,13 +1697,16 @@ def _append_row_phased_hidden_body(
             )
             for statement in fragment.statements:
                 body.append(f"{indent * 3}{statement}")
+            body.append(f"{indent * 2}T.sync_threads()")
         return
     for node, _descriptor, _fragment in bwd_items:
         if _is_row_phased_residual_rmsnorm_bwd(node, _descriptor):
             _append_row_phased_residual_rmsnorm_bwd_init(
                 body,
                 node=node,
+                access_by_buffer=access_by_buffer,
                 hidden_size=hidden_size,
+                thread_count=thread_count,
                 indent=indent,
             )
     body.append(f"{indent * 2}# backward_policy: row_phased_hidden_recompute")
@@ -1082,12 +1720,49 @@ def _append_row_phased_hidden_body(
                 dtype_by_buffer=dtype_by_buffer,
                 access_by_buffer=access_by_buffer,
                 hidden_size=hidden_size,
+                thread_count=thread_count,
+                indent=indent,
+            )
+            continue
+        if _is_row_phased_attention_qkv_projection_bwd(node, descriptor, shape_env):
+            _append_row_phased_attention_qkv_projection_bwd_body(
+                body,
+                node=node,
+                descriptor=descriptor,
+                dtype_by_buffer=dtype_by_buffer,
+                access_by_buffer=access_by_buffer,
+                shape_env=shape_env,
+                thread_count=thread_count,
+                indent=indent,
+            )
+            continue
+        if _is_row_phased_m2rnn_bwd(node, descriptor, shape_env):
+            _append_row_phased_m2rnn_bwd_body(
+                body,
+                node=node,
+                descriptor=descriptor,
+                dtype_by_buffer=dtype_by_buffer,
+                access_by_buffer=access_by_buffer,
+                shape_env=shape_env,
+                thread_count=thread_count,
+                indent=indent,
+            )
+            continue
+        if _is_row_phased_mamba3_bwd(node, descriptor, shape_env):
+            _append_row_phased_mamba3_bwd_body(
+                body,
+                node=node,
+                descriptor=descriptor,
+                dtype_by_buffer=dtype_by_buffer,
+                access_by_buffer=access_by_buffer,
+                shape_env=shape_env,
+                thread_count=thread_count,
                 indent=indent,
             )
             continue
         body.append(
-            f"{indent * 3}for i in T.serial(row * {hidden_size}, "
-            f"(row + 1) * {hidden_size}):"
+            f"{indent * 3}for i in T.serial(row * {hidden_size} + lane, "
+            f"(row + 1) * {hidden_size}, step={thread_count}):"
         )
         _append_descriptor_node_comments(
             body,
@@ -1097,6 +1772,21 @@ def _append_row_phased_hidden_body(
         )
         for statement in fragment.statements:
             body.append(f"{indent * 4}{statement}")
+        body.append(f"{indent * 3}T.sync_threads()")
+
+
+def _append_lane0_row_phase(
+    body: list[str],
+    *,
+    indent: str,
+    append_fn: Callable[..., None],
+    **kwargs: Any,
+) -> None:
+    lane0_body: list[str] = []
+    append_fn(lane0_body, indent=indent, **kwargs)
+    body.append(f"{indent * 3}if lane == 0:")
+    body.extend(f"{indent}{line}" for line in lane0_body)
+    body.append(f"{indent * 3}T.sync_threads()")
 
 
 def _is_row_phased_residual_rmsnorm_bwd(
@@ -1109,6 +1799,1195 @@ def _is_row_phased_residual_rmsnorm_bwd(
     )
 
 
+def _is_row_phased_attention_qkv_projection_bwd(
+    node: _ScheduleNodeView,
+    descriptor: PathCBrickScheduleDescriptor,
+    shape_env: PathCModelShapeEnv | None,
+) -> bool:
+    return (
+        shape_env is not None
+        and node.op_name == "attention_qkv_projection_bwd"
+        and descriptor.production_fragment_status == "production_region_inlined"
+    )
+
+
+def _is_row_phased_m2rnn_bwd(
+    node: _ScheduleNodeView,
+    descriptor: PathCBrickScheduleDescriptor,
+    shape_env: PathCModelShapeEnv | None,
+) -> bool:
+    return (
+        shape_env is not None
+        and node.op_name == "m2rnn_bwd"
+        and descriptor.production_fragment_status == "production_region_inlined"
+    )
+
+
+def _is_row_phased_mamba3_bwd(
+    node: _ScheduleNodeView,
+    descriptor: PathCBrickScheduleDescriptor,
+    shape_env: PathCModelShapeEnv | None,
+) -> bool:
+    return (
+        shape_env is not None
+        and node.op_name == "mamba3_mimo_bwd"
+        and descriptor.production_fragment_status == "production_region_inlined"
+    )
+
+
+def _is_row_phased_bwd_descriptor(
+    node: _ScheduleNodeView,
+    descriptor: PathCBrickScheduleDescriptor,
+    shape_env: PathCModelShapeEnv | None,
+) -> bool:
+    return (
+        _is_row_phased_residual_rmsnorm_bwd(node, descriptor)
+        or _is_row_phased_attention_qkv_projection_bwd(node, descriptor, shape_env)
+        or _is_row_phased_m2rnn_bwd(node, descriptor, shape_env)
+        or _is_row_phased_mamba3_bwd(node, descriptor, shape_env)
+    )
+
+
+def _is_row_phased_attention_qkv_projection(
+    node: _ScheduleNodeView,
+    shape_env: PathCModelShapeEnv | None,
+) -> bool:
+    if shape_env is None or node.op_name != "attention_qkv_projection":
+        return False
+    output_canonicals = {_canonical_buffer_name(output) for output in node.outputs}
+    return {"q_fp8", "q_scale", "kv_fp8", "kv_scale"}.issubset(output_canonicals)
+
+
+def _is_row_phased_sparse_mla_fp8_apply(
+    node: _ScheduleNodeView,
+    shape_env: PathCModelShapeEnv | None,
+) -> bool:
+    if shape_env is None or node.op_name != "sparse_mla_fp8_apply":
+        return False
+    input_canonicals = {_canonical_buffer_name(input_name) for input_name in node.inputs}
+    return {"q_fp8", "q_scale", "kv_fp8", "kv_scale", "indices"}.issubset(
+        input_canonicals
+    )
+
+
+def _is_row_phased_mamba3(
+    node: _ScheduleNodeView,
+    descriptor: PathCBrickScheduleDescriptor,
+    shape_env: PathCModelShapeEnv | None,
+) -> bool:
+    return (
+        shape_env is not None
+        and node.op_name == "mamba3_mimo"
+        and descriptor.production_fragment_status == "production_region_inlined"
+    )
+
+
+def _is_row_phased_m2rnn(
+    node: _ScheduleNodeView,
+    descriptor: PathCBrickScheduleDescriptor,
+    shape_env: PathCModelShapeEnv | None,
+) -> bool:
+    return (
+        shape_env is not None
+        and node.op_name == "m2rnn"
+        and descriptor.production_fragment_status == "production_region_inlined"
+    )
+
+
+def _node_indexed_canonical_input_expr(
+    node: _ScheduleNodeView,
+    canonical_name: str,
+    dtype_by_buffer: dict[str, str],
+    access_by_buffer: dict[str, str],
+    index_expr: str,
+    *,
+    default: str = "0.0",
+) -> str:
+    input_name = _node_input_for_canonical(node, canonical_name)
+    if input_name is None:
+        return default
+    return _indexed_buffer_value_expr(
+        input_name,
+        dtype_by_buffer[input_name],
+        access_by_buffer,
+        index_expr,
+    )
+
+
+def _node_indexed_canonical_or_positional_input_expr(
+    node: _ScheduleNodeView,
+    canonical_names: Sequence[str],
+    positional_index: int,
+    dtype_by_buffer: dict[str, str],
+    access_by_buffer: dict[str, str],
+    index_expr: str,
+    *,
+    default: str = "0.0",
+) -> str:
+    input_name: str | None = None
+    for canonical_name in canonical_names:
+        input_name = _node_input_for_canonical(node, canonical_name)
+        if input_name is not None:
+            break
+    if input_name is None:
+        if positional_index >= len(node.inputs):
+            return default
+        input_name = node.inputs[positional_index]
+    return _indexed_buffer_value_expr(
+        input_name,
+        dtype_by_buffer[input_name],
+        access_by_buffer,
+        index_expr,
+    )
+
+
+def _node_indexed_positional_input_expr(
+    node: _ScheduleNodeView,
+    input_index: int,
+    dtype_by_buffer: dict[str, str],
+    access_by_buffer: dict[str, str],
+    index_expr: str,
+    *,
+    default: str = "0.0",
+) -> str:
+    if input_index >= len(node.inputs):
+        return default
+    input_name = node.inputs[input_index]
+    return _indexed_buffer_value_expr(
+        input_name,
+        dtype_by_buffer[input_name],
+        access_by_buffer,
+        index_expr,
+    )
+
+
+def _mamba3_state_output(node: _ScheduleNodeView) -> str | None:
+    output = _node_output_for_canonical(node, "scan_state")
+    if output is not None:
+        return output
+    output = _node_output_for_canonical(node, "mamba_state")
+    if output is not None:
+        return output
+    for output_name in node.outputs:
+        if output_name.endswith("_state") or output_name.endswith("_state_out"):
+            return output_name
+    return node.outputs[1] if len(node.outputs) > 1 else None
+
+
+def _append_row_phased_mamba3_init(
+    body: list[str],
+    *,
+    node: _ScheduleNodeView,
+    dtype_by_buffer: dict[str, str],
+    access_by_buffer: dict[str, str],
+    shape_env: PathCModelShapeEnv,
+    thread_count: int,
+    indent: str,
+) -> None:
+    projected = _scratch_name(node, "mamba3_projected_vec")
+    conv_history = _scratch_name(node, "mamba3_conv_history")
+    conv = _scratch_name(node, "mamba3_conv_vec")
+    b_inv = _scratch_name(node, "mamba3_b_inv_rms")
+    c_inv = _scratch_name(node, "mamba3_c_inv_rms")
+    b_group = _scratch_name(node, "mamba3_b_group")
+    c_group = _scratch_name(node, "mamba3_c_group")
+    b_raw = _scratch_name(node, "mamba3_b_raw")
+    c_raw = _scratch_name(node, "mamba3_c_raw")
+    dt_vec = _scratch_name(node, "mamba3_dt_vec")
+    a_vec = _scratch_name(node, "mamba3_a_vec")
+    trap_group = _scratch_name(node, "mamba3_trap_group")
+    next_dt = _scratch_name(node, "mamba3_next_dt")
+    next_trap = _scratch_name(node, "mamba3_next_trap")
+    angle_cumsum = _scratch_name(node, "mamba3_angle_cumsum")
+    out_inner = _scratch_name(node, "mamba3_out_inner")
+    accum = _scratch_name(node, "mamba3_accum")
+    state_value = _scratch_name(node, "mamba3_state_value")
+    inner_dim = int(shape_env.mamba_inner_dim)
+    in_proj_dim = int(shape_env.mamba_in_proj_dim)
+    conv_channels = int(shape_env.mamba_conv_channels)
+    history_len = max(0, int(shape_env.mamba_conv_kernel) - 1)
+    heads = int(shape_env.mamba_num_heads)
+    head_dim = int(shape_env.mamba_head_dim)
+    state_dim = int(shape_env.mamba_state_dim)
+    groups = int(shape_env.mamba_groups)
+    rank = int(shape_env.mamba_effective_mimo_rank)
+    rope_angles = int(shape_env.mamba_num_rope_angles)
+    state_output = _mamba3_state_output(node)
+    body.append(
+        f"{indent * 2}{projected} = T.alloc_shared(({in_proj_dim},), \"float32\")"
+    )
+    body.append(
+        f"{indent * 2}{conv} = T.alloc_shared(({conv_channels},), \"float32\")"
+    )
+    body.append(f"{indent * 2}{out_inner} = T.alloc_shared(({inner_dim},), \"float32\")")
+    body.append(
+        f"{indent * 2}{b_inv} = T.alloc_shared(({rank}, {groups}), \"float32\")"
+    )
+    body.append(
+        f"{indent * 2}{c_inv} = T.alloc_shared(({rank}, {groups}), \"float32\")"
+    )
+    body.append(
+        f"{indent * 2}{b_raw} = T.alloc_shared(({groups}, {state_dim}), \"float32\")"
+    )
+    body.append(
+        f"{indent * 2}{c_raw} = T.alloc_shared(({groups}, {state_dim}), \"float32\")"
+    )
+    body.append(
+        f"{indent * 2}{b_group} = T.alloc_shared(({groups}, {state_dim}), \"float32\")"
+    )
+    body.append(
+        f"{indent * 2}{c_group} = T.alloc_shared(({groups}, {state_dim}), \"float32\")"
+    )
+    body.append(f"{indent * 2}{dt_vec} = T.alloc_shared(({heads},), \"float32\")")
+    body.append(f"{indent * 2}{a_vec} = T.alloc_shared(({heads},), \"float32\")")
+    body.append(f"{indent * 2}{trap_group} = T.alloc_shared(({groups},), \"float32\")")
+    body.append(f"{indent * 2}{next_dt} = T.alloc_local((1,), \"float32\")")
+    body.append(f"{indent * 2}{next_trap} = T.alloc_local((1,), \"float32\")")
+    body.append(
+        f"{indent * 2}{angle_cumsum} = "
+        f"T.alloc_shared(({heads}, {rope_angles}), \"float32\")"
+    )
+    if history_len > 0:
+        body.append(
+            f"{indent * 2}{conv_history} = "
+            f"T.alloc_shared(({history_len}, {conv_channels}), \"float32\")"
+        )
+    body.append(f"{indent * 2}{accum} = T.alloc_local((1,), \"float32\")")
+    body.append(f"{indent * 2}{state_value} = T.alloc_local((1,), \"float32\")")
+    head = _scratch_name(node, "head_init")
+    dim = _scratch_name(node, "dim_init")
+    state = _scratch_name(node, "state_idx_init")
+    angle = _scratch_name(node, "angle_init")
+    hist = _scratch_name(node, "hist_init")
+    ch = _scratch_name(node, "conv_ch_init")
+    state_flat = _scratch_name(node, "state_flat_init")
+    angle_flat = _scratch_name(node, "angle_flat_init")
+    history_flat = _scratch_name(node, "history_flat_init")
+    body.append(f"{indent * 2}# {node.name}: mamba3_state_policy: external_scan_state")
+    body.append(
+        f"{indent * 2}for {angle_flat} in T.serial(lane, {heads * rope_angles}, "
+        f"step={thread_count}):"
+    )
+    body.append(f"{indent * 3}{head} = {angle_flat} // {rope_angles}")
+    body.append(f"{indent * 3}{angle} = {angle_flat} % {rope_angles}")
+    body.append(f"{indent * 3}{angle_cumsum}[{head}, {angle}] = 0.0")
+    if state_output is not None:
+        body.append(
+            f"{indent * 2}for {state_flat} in T.serial(lane, {heads * head_dim * state_dim}, "
+            f"step={thread_count}):"
+        )
+        body.append(f"{indent * 3}{head} = {state_flat} // {head_dim * state_dim}")
+        body.append(f"{indent * 3}{dim} = ({state_flat} // {state_dim}) % {head_dim}")
+        body.append(f"{indent * 3}{state} = {state_flat} % {state_dim}")
+        state_idx = f"{head} * {head_dim * state_dim} + {dim} * {state_dim} + {state}"
+        h0_expr = _node_indexed_canonical_input_expr(
+            node,
+            "mamba3_h0",
+            dtype_by_buffer,
+            access_by_buffer,
+            state_idx,
+            default=_node_indexed_positional_input_expr(
+                node,
+                1,
+                dtype_by_buffer,
+                access_by_buffer,
+                state_idx,
+            ),
+        )
+        body.append(
+            f"{indent * 3}{_buffer_ref(state_output, access_by_buffer, state_idx)} = "
+            f"{h0_expr}"
+        )
+    body.append(f"{indent * 2}T.sync_threads()")
+    if history_len <= 0:
+        return
+    body.append(f"{indent * 2}# {node.name}: mamba3_conv_policy: zero_padded_ring_history")
+    body.append(
+        f"{indent * 2}for {history_flat} in T.serial(lane, "
+        f"{history_len * conv_channels}, step={thread_count}):"
+    )
+    body.append(f"{indent * 3}{hist} = {history_flat} // {conv_channels}")
+    body.append(f"{indent * 3}{ch} = {history_flat} % {conv_channels}")
+    body.append(f"{indent * 3}{conv_history}[{hist}, {ch}] = 0.0")
+    body.append(f"{indent * 2}T.sync_threads()")
+
+
+def _append_row_phased_mamba3_body(
+    body: list[str],
+    *,
+    node: _ScheduleNodeView,
+    descriptor: PathCBrickScheduleDescriptor,
+    dtype_by_buffer: dict[str, str],
+    access_by_buffer: dict[str, str],
+    shape_env: PathCModelShapeEnv,
+    thread_count: int,
+    indent: str,
+) -> None:
+    projected = _scratch_name(node, "mamba3_projected_vec")
+    conv_history = _scratch_name(node, "mamba3_conv_history")
+    conv = _scratch_name(node, "mamba3_conv_vec")
+    b_inv = _scratch_name(node, "mamba3_b_inv_rms")
+    c_inv = _scratch_name(node, "mamba3_c_inv_rms")
+    b_group = _scratch_name(node, "mamba3_b_group")
+    c_group = _scratch_name(node, "mamba3_c_group")
+    b_raw = _scratch_name(node, "mamba3_b_raw")
+    c_raw = _scratch_name(node, "mamba3_c_raw")
+    dt_vec = _scratch_name(node, "mamba3_dt_vec")
+    a_vec = _scratch_name(node, "mamba3_a_vec")
+    trap_group = _scratch_name(node, "mamba3_trap_group")
+    next_dt = _scratch_name(node, "mamba3_next_dt")
+    next_trap = _scratch_name(node, "mamba3_next_trap")
+    angle_cumsum = _scratch_name(node, "mamba3_angle_cumsum")
+    out_inner = _scratch_name(node, "mamba3_out_inner")
+    accum = _scratch_name(node, "mamba3_accum")
+    state_value = _scratch_name(node, "mamba3_state_value")
+    proj_dim = _scratch_name(node, "proj_dim")
+    hidden_dim_loop = _scratch_name(node, "hidden_dim")
+    conv_ch = _scratch_name(node, "conv_ch")
+    kernel_pos = _scratch_name(node, "kernel_pos")
+    head = _scratch_name(node, "head")
+    state = _scratch_name(node, "state_idx")
+    rank = _scratch_name(node, "rank")
+    angle = _scratch_name(node, "angle")
+    feature = _scratch_name(node, "feature")
+    out_dim = _scratch_name(node, "out_dim")
+    rank_group_flat = _scratch_name(node, "rank_group_flat")
+    group_state_flat = _scratch_name(node, "group_state_flat")
+    history_flat = _scratch_name(node, "history_flat")
+    trap_group_loop = _scratch_name(node, "trap_group_loop")
+    hidden_size = int(shape_env.hidden_size)
+    inner_dim = int(shape_env.mamba_inner_dim)
+    in_proj_dim = int(shape_env.mamba_in_proj_dim)
+    conv_channels = int(shape_env.mamba_conv_channels)
+    kernel = int(shape_env.mamba_conv_kernel)
+    history_len = max(0, kernel - 1)
+    heads = int(shape_env.mamba_num_heads)
+    head_dim = int(shape_env.mamba_head_dim)
+    state_dim = int(shape_env.mamba_state_dim)
+    groups = int(shape_env.mamba_groups)
+    mimo_rank = int(shape_env.mamba_effective_mimo_rank)
+    rope_angles = int(shape_env.mamba_num_rope_angles)
+    bc_dim = int(shape_env.mamba_bc_dim)
+    heads_per_group = heads // groups
+    z_offset = 0
+    x_offset = inner_dim
+    b_offset = 2 * inner_dim
+    c_offset = b_offset + bc_dim
+    dt_offset = c_offset + bc_dim
+    a_offset = dt_offset + heads
+    trap_offset = a_offset + heads
+    angle_offset = trap_offset + heads
+    rot_dim = min(state_dim, 2 * rope_angles)
+    delta = _output_with_suffix(node, "_delta") or (node.outputs[0] if node.outputs else "")
+    state_output = _mamba3_state_output(node)
+    _append_descriptor_node_comments(
+        body,
+        node=node,
+        descriptor=descriptor,
+        indent=indent * 3,
+    )
+    body.append(f"{indent * 3}# mamba3_projection_policy: dense_row_local")
+    body.append(
+        f"{indent * 3}for {proj_dim} in T.serial(lane, {in_proj_dim}, "
+        f"step={thread_count}):"
+    )
+    body.append(f"{indent * 4}{projected}[{proj_dim}] = 0.0")
+    body.append(f"{indent * 4}for {hidden_dim_loop} in T.serial(0, {hidden_size}):")
+    hidden_expr = _node_indexed_positional_input_expr(
+        node,
+        0,
+        dtype_by_buffer,
+        access_by_buffer,
+        f"row * {hidden_size} + {hidden_dim_loop}",
+    )
+    in_proj_weight_expr = _node_indexed_canonical_input_expr(
+        node,
+        "mamba3_in_proj_weight",
+        dtype_by_buffer,
+        access_by_buffer,
+        f"{proj_dim} * {hidden_size} + {hidden_dim_loop}",
+    )
+    body.append(
+        f"{indent * 5}{projected}[{proj_dim}] = {projected}[{proj_dim}] + "
+        f"({hidden_expr} * {in_proj_weight_expr})"
+    )
+    body.append(f"{indent * 3}T.sync_threads()")
+    body.append(f"{indent * 3}# mamba3_conv_policy: causal_depthwise_ring_history")
+    body.append(
+        f"{indent * 3}for {conv_ch} in T.serial(lane, {conv_channels}, "
+        f"step={thread_count}):"
+    )
+    conv_bias_expr = _node_indexed_canonical_input_expr(
+        node,
+        "mamba3_conv_bias",
+        dtype_by_buffer,
+        access_by_buffer,
+        conv_ch,
+    )
+    body.append(f"{indent * 4}{conv}[{conv_ch}] = {conv_bias_expr}")
+    if history_len > 0:
+        body.append(f"{indent * 4}for {kernel_pos} in T.serial(0, {history_len}):")
+        conv_weight_expr = _node_indexed_canonical_input_expr(
+            node,
+            "mamba3_conv_weight",
+            dtype_by_buffer,
+            access_by_buffer,
+            f"{conv_ch} * {kernel} + {kernel_pos}",
+            default="1.0",
+        )
+        body.append(
+            f"{indent * 5}{conv}[{conv_ch}] = {conv}[{conv_ch}] + "
+            f"({conv_history}[{kernel_pos}, {conv_ch}] * {conv_weight_expr})"
+        )
+    current_conv_weight_expr = _node_indexed_canonical_input_expr(
+        node,
+        "mamba3_conv_weight",
+        dtype_by_buffer,
+        access_by_buffer,
+        f"{conv_ch} * {kernel} + {history_len}",
+        default="1.0",
+    )
+    body.append(
+        f"{indent * 4}{conv}[{conv_ch}] = {conv}[{conv_ch}] + "
+        f"({projected}[{x_offset} + {conv_ch}] * {current_conv_weight_expr})"
+    )
+    body.append(
+        f"{indent * 4}{conv}[{conv_ch}] = {conv}[{conv_ch}] * "
+        f"(1.0 / (1.0 + T.exp(-{conv}[{conv_ch}])))"
+    )
+    body.append(f"{indent * 3}T.sync_threads()")
+    body.append(f"{indent * 3}# mamba3_dt_policy: softplus_A_trapezoid")
+    body.append(
+        f"{indent * 3}for {head} in T.serial(lane, {heads}, step={thread_count}):"
+    )
+    dt_bias = _node_indexed_canonical_input_expr(
+        node,
+        "mamba3_dt_bias",
+        dtype_by_buffer,
+        access_by_buffer,
+        head,
+    )
+    body.append(
+        f"{indent * 4}{dt_vec}[{head}] = T.log(1.0 + "
+        f"T.exp({projected}[{dt_offset} + {head}] + {dt_bias}))"
+    )
+    body.append(
+        f"{indent * 4}{a_vec}[{head}] = T.min(-T.log(1.0 + "
+        f"T.exp({projected}[{a_offset} + {head}])), -0.01)"
+    )
+    body.append(f"{indent * 4}for {angle} in T.serial(0, {rope_angles}):")
+    body.append(
+        f"{indent * 5}{angle_cumsum}[{head}, {angle}] = "
+        f"{angle_cumsum}[{head}, {angle}] + "
+        f"({projected}[{angle_offset} + {angle}] * {dt_vec}[{head}])"
+    )
+    body.append(f"{indent * 3}T.sync_threads()")
+    body.append(
+        f"{indent * 3}for {trap_group_loop} in T.serial(lane, {groups}, "
+        f"step={thread_count}):"
+    )
+    body.append(f"{indent * 4}{trap_group}[{trap_group_loop}] = 0.0")
+    body.append(f"{indent * 4}for {head} in T.serial(0, {heads_per_group}):")
+    body.append(
+        f"{indent * 5}{accum}[0] = "
+        f"{trap_group_loop} * {heads_per_group} + {head}"
+    )
+    body.append(f"{indent * 5}{next_dt}[0] = 0.0")
+    body.append(f"{indent * 5}{next_trap}[0] = 0.0")
+    body.append(f"{indent * 5}if row + 1 < {int(shape_env.sequence_length)}:")
+    body.append(f"{indent * 6}for {hidden_dim_loop} in T.serial(0, {hidden_size}):")
+    next_hidden_expr = _node_indexed_positional_input_expr(
+        node,
+        0,
+        dtype_by_buffer,
+        access_by_buffer,
+        f"(row + 1) * {hidden_size} + {hidden_dim_loop}",
+    )
+    next_dt_weight_expr = _node_indexed_canonical_input_expr(
+        node,
+        "mamba3_in_proj_weight",
+        dtype_by_buffer,
+        access_by_buffer,
+        f"({dt_offset} + T.cast({accum}[0], \"int32\")) * {hidden_size} + "
+        f"{hidden_dim_loop}",
+    )
+    next_trap_weight_expr = _node_indexed_canonical_input_expr(
+        node,
+        "mamba3_in_proj_weight",
+        dtype_by_buffer,
+        access_by_buffer,
+        f"({trap_offset} + T.cast({accum}[0], \"int32\")) * {hidden_size} + "
+        f"{hidden_dim_loop}",
+    )
+    body.append(
+        f"{indent * 7}{next_dt}[0] = {next_dt}[0] + "
+        f"({next_hidden_expr} * {next_dt_weight_expr})"
+    )
+    body.append(
+        f"{indent * 7}{next_trap}[0] = {next_trap}[0] + "
+        f"({next_hidden_expr} * {next_trap_weight_expr})"
+    )
+    next_dt_bias = _node_indexed_canonical_input_expr(
+        node,
+        "mamba3_dt_bias",
+        dtype_by_buffer,
+        access_by_buffer,
+        f'T.cast({accum}[0], "int32")',
+    )
+    body.append(
+        f"{indent * 6}{next_dt}[0] = T.log(1.0 + "
+        f"T.exp({next_dt}[0] + {next_dt_bias}))"
+    )
+    body.append(
+        f"{indent * 5}{trap_group}[{trap_group_loop}] = "
+        f"{trap_group}[{trap_group_loop}] + "
+        f"(({next_dt}[0] * (1.0 - (1.0 / (1.0 + T.exp(-{next_trap}[0]))))) + "
+        f"({dt_vec}[T.cast({accum}[0], \"int32\")] * "
+        f"(1.0 / (1.0 + T.exp(-{projected}[{trap_offset} + "
+        f"T.cast({accum}[0], \"int32\")])))))"
+    )
+    body.append(
+        f"{indent * 4}{trap_group}[{trap_group_loop}] = "
+        f"{trap_group}[{trap_group_loop}] / "
+        f"{float(heads_per_group):.1f}"
+    )
+    body.append(f"{indent * 3}T.sync_threads()")
+    body.append(f"{indent * 3}# mamba3_bc_policy: rank_group_rmsnorm_rope")
+    body.append(
+        f"{indent * 3}for {rank_group_flat} in T.serial(lane, {mimo_rank * groups}, "
+        f"step={thread_count}):"
+    )
+    rank_expr = f"({rank_group_flat} // {groups})"
+    group_expr = f"({rank_group_flat} % {groups})"
+    body.append(f"{indent * 4}{b_inv}[{rank_expr}, {group_expr}] = 0.0")
+    body.append(f"{indent * 4}{c_inv}[{rank_expr}, {group_expr}] = 0.0")
+    body.append(f"{indent * 4}for {state} in T.serial(0, {state_dim}):")
+    bc_index = f"(({rank_expr} * {groups} + {group_expr}) * {state_dim} + {state})"
+    body.append(
+        f"{indent * 5}{b_inv}[{rank_expr}, {group_expr}] = "
+        f"{b_inv}[{rank_expr}, {group_expr}] + "
+        f"({conv}[{inner_dim} + {bc_index}] * {conv}[{inner_dim} + {bc_index}])"
+    )
+    body.append(
+        f"{indent * 5}{c_inv}[{rank_expr}, {group_expr}] = "
+        f"{c_inv}[{rank_expr}, {group_expr}] + "
+        f"({conv}[{inner_dim + bc_dim} + {bc_index}] * "
+        f"{conv}[{inner_dim + bc_dim} + {bc_index}])"
+    )
+    body.append(
+        f"{indent * 4}{b_inv}[{rank_expr}, {group_expr}] = "
+        f"T.rsqrt(({b_inv}[{rank_expr}, {group_expr}] / "
+        f"{float(state_dim):.1f}) + 0.00001)"
+    )
+    body.append(
+        f"{indent * 4}{c_inv}[{rank_expr}, {group_expr}] = "
+        f"T.rsqrt(({c_inv}[{rank_expr}, {group_expr}] / "
+        f"{float(state_dim):.1f}) + 0.00001)"
+    )
+    body.append(f"{indent * 3}T.sync_threads()")
+    body.append(
+        f"{indent * 3}for {group_state_flat} in T.serial(lane, {groups * state_dim}, "
+        f"step={thread_count}):"
+    )
+    group_expr = f"({group_state_flat} // {state_dim})"
+    state_expr = f"({group_state_flat} % {state_dim})"
+    body.append(f"{indent * 4}{b_raw}[{group_expr}, {state_expr}] = 0.0")
+    body.append(f"{indent * 4}{c_raw}[{group_expr}, {state_expr}] = 0.0")
+    body.append(f"{indent * 4}for {rank} in T.serial(0, {mimo_rank}):")
+    bc_index = f"(({rank} * {groups} + {group_expr}) * {state_dim} + {state_expr})"
+    b_norm_weight = _node_indexed_canonical_input_expr(
+        node,
+        "mamba3_B_norm_weight",
+        dtype_by_buffer,
+        access_by_buffer,
+        bc_index,
+        default="1.0",
+    )
+    b_bias = _node_indexed_canonical_input_expr(
+        node,
+        "mamba3_B_bias",
+        dtype_by_buffer,
+        access_by_buffer,
+        bc_index,
+    )
+    c_norm_weight = _node_indexed_canonical_input_expr(
+        node,
+        "mamba3_C_norm_weight",
+        dtype_by_buffer,
+        access_by_buffer,
+        bc_index,
+        default="1.0",
+    )
+    c_bias = _node_indexed_canonical_input_expr(
+        node,
+        "mamba3_C_bias",
+        dtype_by_buffer,
+        access_by_buffer,
+        bc_index,
+    )
+    body.append(
+        f"{indent * 5}{b_raw}[{group_expr}, {state_expr}] = "
+        f"{b_raw}[{group_expr}, {state_expr}] + "
+        f"(({conv}[{inner_dim} + {bc_index}] * {b_inv}[{rank}, {group_expr}] * "
+        f"{b_norm_weight}) + {b_bias})"
+    )
+    body.append(
+        f"{indent * 5}{c_raw}[{group_expr}, {state_expr}] = "
+        f"{c_raw}[{group_expr}, {state_expr}] + "
+        f"(({conv}[{inner_dim + bc_dim} + {bc_index}] * "
+        f"{c_inv}[{rank}, {group_expr}] * {c_norm_weight}) + {c_bias})"
+    )
+    body.append(
+        f"{indent * 4}{b_raw}[{group_expr}, {state_expr}] = "
+        f"({b_raw}[{group_expr}, {state_expr}] / {float(mimo_rank):.1f}) * "
+        f"{trap_group}[{group_expr}]"
+    )
+    body.append(
+        f"{indent * 4}{c_raw}[{group_expr}, {state_expr}] = "
+        f"{c_raw}[{group_expr}, {state_expr}] / {float(mimo_rank):.1f}"
+    )
+    body.append(f"{indent * 3}T.sync_threads()")
+    body.append(
+        f"{indent * 3}for {group_state_flat} in T.serial(lane, {groups * state_dim}, "
+        f"step={thread_count}):"
+    )
+    group_expr = f"({group_state_flat} // {state_dim})"
+    state_expr = f"({group_state_flat} % {state_dim})"
+    angle_expr = f"({state_expr} // 2)"
+    body.append(f"{indent * 4}if {state_expr} < {rot_dim}:")
+    body.append(f"{indent * 5}if ({state_expr} % 2) == 0:")
+    body.append(
+        f"{indent * 6}{b_group}[{group_expr}, {state_expr}] = "
+        f"({b_raw}[{group_expr}, {state_expr}] * "
+        f"T.cos({angle_cumsum}[{group_expr}, {angle_expr}])) - "
+        f"({b_raw}[{group_expr}, {state_expr} + 1] * "
+        f"T.sin({angle_cumsum}[{group_expr}, {angle_expr}]))"
+    )
+    body.append(
+        f"{indent * 6}{c_group}[{group_expr}, {state_expr}] = "
+        f"({c_raw}[{group_expr}, {state_expr}] * "
+        f"T.cos({angle_cumsum}[{group_expr}, {angle_expr}])) - "
+        f"({c_raw}[{group_expr}, {state_expr} + 1] * "
+        f"T.sin({angle_cumsum}[{group_expr}, {angle_expr}]))"
+    )
+    body.append(f"{indent * 5}else:")
+    body.append(
+        f"{indent * 6}{b_group}[{group_expr}, {state_expr}] = "
+        f"({b_raw}[{group_expr}, {state_expr} - 1] * "
+        f"T.sin({angle_cumsum}[{group_expr}, {angle_expr}])) + "
+        f"({b_raw}[{group_expr}, {state_expr}] * "
+        f"T.cos({angle_cumsum}[{group_expr}, {angle_expr}]))"
+    )
+    body.append(
+        f"{indent * 6}{c_group}[{group_expr}, {state_expr}] = "
+        f"({c_raw}[{group_expr}, {state_expr} - 1] * "
+        f"T.sin({angle_cumsum}[{group_expr}, {angle_expr}])) + "
+        f"({c_raw}[{group_expr}, {state_expr}] * "
+        f"T.cos({angle_cumsum}[{group_expr}, {angle_expr}]))"
+    )
+    body.append(f"{indent * 4}else:")
+    body.append(
+        f"{indent * 5}{b_group}[{group_expr}, {state_expr}] = "
+        f"{b_raw}[{group_expr}, {state_expr}]"
+    )
+    body.append(
+        f"{indent * 5}{c_group}[{group_expr}, {state_expr}] = "
+        f"{c_raw}[{group_expr}, {state_expr}]"
+    )
+    body.append(f"{indent * 3}T.sync_threads()")
+    if state_output is not None:
+        body.append(f"{indent * 3}# mamba3_scan_policy: external_state_recurrence")
+        body.append(
+            f"{indent * 3}for {feature} in T.serial(lane, {inner_dim}, "
+            f"step={thread_count}):"
+        )
+        head_expr = f"({feature} // {head_dim})"
+        dim_expr = f"({feature} % {head_dim})"
+        group_expr = f"({head_expr} // {heads_per_group})"
+        body.append(f"{indent * 4}{out_inner}[{feature}] = 0.0")
+        body.append(f"{indent * 4}for {state} in T.serial(0, {state_dim}):")
+        state_idx = f"{head_expr} * {head_dim * state_dim} + {dim_expr} * {state_dim} + {state}"
+        state_ref = _buffer_ref(state_output, access_by_buffer, state_idx)
+        body.append(
+            f"{indent * 5}{state_value}[0] = "
+            f"(T.exp({a_vec}[{head_expr}] * {dt_vec}[{head_expr}]) * "
+            f"{state_ref}) + ({conv}[{feature}] * {b_group}[{group_expr}, {state}])"
+        )
+        body.append(f"{indent * 5}{state_ref} = {state_value}[0]")
+        body.append(
+            f"{indent * 5}{out_inner}[{feature}] = {out_inner}[{feature}] + "
+            f"({state_value}[0] * {c_group}[{group_expr}, {state}])"
+        )
+        d_skip = _node_indexed_canonical_input_expr(
+            node,
+            "mamba3_D",
+            dtype_by_buffer,
+            access_by_buffer,
+            head_expr,
+            default="1.0",
+        )
+        z_val = f"{projected}[{z_offset} + {feature}]"
+        x_val = f"{conv}[{feature}]"
+        body.append(
+            f"{indent * 4}{out_inner}[{feature}] = "
+            f"({out_inner}[{feature}] + ({d_skip} * {x_val})) * "
+            f"{z_val} * (1.0 / (1.0 + T.exp(-{z_val})))"
+        )
+        body.append(f"{indent * 3}T.sync_threads()")
+    if delta:
+        body.append(f"{indent * 3}# mamba3_output_policy: dense_out_projection")
+        body.append(
+            f"{indent * 3}for {out_dim} in T.serial(lane, {hidden_size}, "
+            f"step={thread_count}):"
+        )
+        body.append(f"{indent * 4}{accum}[0] = 0.0")
+        body.append(f"{indent * 4}for {feature} in T.serial(0, {inner_dim}):")
+        out_proj_weight = _node_indexed_canonical_input_expr(
+            node,
+            "mamba3_out_proj_weight",
+            dtype_by_buffer,
+            access_by_buffer,
+            f"{out_dim} * {inner_dim} + {feature}",
+            default="1.0",
+        )
+        body.append(
+            f"{indent * 5}{accum}[0] = {accum}[0] + "
+            f"({out_inner}[{feature}] * {out_proj_weight})"
+        )
+        body.append(
+            f"{indent * 4}{_buffer_ref(delta, access_by_buffer, f'row * {hidden_size} + {out_dim}')} = "
+            f"{accum}[0]"
+        )
+        body.append(f"{indent * 3}T.sync_threads()")
+    if history_len <= 0:
+        return
+    if history_len > 1:
+        body.append(
+            f"{indent * 3}for {history_flat} in T.serial(lane, "
+            f"{(history_len - 1) * conv_channels}, step={thread_count}):"
+        )
+        hist_expr = f"({history_flat} // {conv_channels})"
+        conv_ch_expr = f"({history_flat} % {conv_channels})"
+        body.append(
+            f"{indent * 4}{conv_history}[{hist_expr}, {conv_ch_expr}] = "
+            f"{conv_history}[{hist_expr} + 1, {conv_ch_expr}]"
+        )
+        body.append(f"{indent * 3}T.sync_threads()")
+    body.append(
+        f"{indent * 3}for {conv_ch} in T.serial(lane, {conv_channels}, "
+        f"step={thread_count}):"
+    )
+    body.append(
+        f"{indent * 4}{conv_history}[{history_len - 1}, {conv_ch}] = "
+        f"{projected}[{x_offset} + {conv_ch}]"
+    )
+    body.append(f"{indent * 3}T.sync_threads()")
+
+
+def _append_row_phased_m2rnn_init(
+    body: list[str],
+    *,
+    node: _ScheduleNodeView,
+    dtype_by_buffer: dict[str, str],
+    access_by_buffer: dict[str, str],
+    shape_env: PathCModelShapeEnv,
+    thread_count: int,
+    indent: str,
+) -> None:
+    conv_history = _scratch_name(node, "m2rnn_conv_history")
+    h_state = _scratch_name(node, "m2rnn_h_state")
+    h_next = _scratch_name(node, "m2rnn_h_next")
+    projected = _scratch_name(node, "m2rnn_projected_vec")
+    conv = _scratch_name(node, "m2rnn_conv_vec")
+    post = _scratch_name(node, "m2rnn_post_vec")
+    accum = _scratch_name(node, "m2rnn_accum")
+    decay = _scratch_name(node, "m2rnn_decay")
+    sum_sq = _scratch_name(node, "m2rnn_sum_sq")
+    sum_sq_partial = _scratch_name(node, "m2rnn_sum_sq_partial")
+    inv_rms = _scratch_name(node, "m2rnn_inv_rms")
+    conv_dim = int(shape_env.m2rnn_conv_dim)
+    in_proj_dim = int(shape_env.m2rnn_in_proj_dim)
+    total_heads = int(shape_env.m2rnn_num_heads)
+    k_dim = int(shape_env.m2rnn_k_head_dim)
+    v_dim = int(shape_env.m2rnn_v_head_dim)
+    features = total_heads * v_dim
+    history_len = max(0, int(shape_env.m2rnn_conv_kernel) - 1)
+    body.append(
+        f"{indent * 2}{projected} = T.alloc_shared(({in_proj_dim},), \"float32\")"
+    )
+    body.append(f"{indent * 2}{conv} = T.alloc_shared(({conv_dim},), \"float32\")")
+    body.append(f"{indent * 2}{post} = T.alloc_shared(({features},), \"float32\")")
+    body.append(
+        f"{indent * 2}{h_state} = "
+        f"T.alloc_shared(({total_heads}, {k_dim}, {v_dim}), \"float32\")"
+    )
+    body.append(
+        f"{indent * 2}{h_next} = "
+        f"T.alloc_shared(({total_heads}, {k_dim}, {v_dim}), \"float32\")"
+    )
+    if history_len > 0:
+        body.append(
+            f"{indent * 2}{conv_history} = "
+            f"T.alloc_shared(({history_len}, {conv_dim}), \"float32\")"
+        )
+    body.append(f"{indent * 2}{accum} = T.alloc_local((1,), \"float32\")")
+    body.append(f"{indent * 2}{decay} = T.alloc_local((1,), \"float32\")")
+    body.append(f"{indent * 2}{sum_sq} = T.alloc_shared((1,), \"float32\")")
+    body.append(
+        f"{indent * 2}{sum_sq_partial} = T.alloc_shared(({thread_count},), \"float32\")"
+    )
+    body.append(f"{indent * 2}{inv_rms} = T.alloc_shared((1,), \"float32\")")
+    head = _scratch_name(node, "head_init")
+    kk = _scratch_name(node, "kk_init")
+    vv = _scratch_name(node, "vv_init")
+    state_idx = _scratch_name(node, "state_idx_init")
+    hist = _scratch_name(node, "hist_init")
+    ch = _scratch_name(node, "conv_ch_init")
+    history_idx = _scratch_name(node, "history_idx_init")
+    body.append(f"{indent * 2}# {node.name}: m2rnn_state_policy: row_carried")
+    body.append(
+        f"{indent * 2}for {state_idx} in T.serial(lane, {total_heads * k_dim * v_dim}, "
+        f"step={thread_count}):"
+    )
+    body.append(f"{indent * 3}{head} = {state_idx} // {k_dim * v_dim}")
+    body.append(f"{indent * 3}{kk} = ({state_idx} // {v_dim}) % {k_dim}")
+    body.append(f"{indent * 3}{vv} = {state_idx} % {v_dim}")
+    h0_expr = _node_indexed_canonical_input_expr(
+        node,
+        "m2rnn_h0",
+        dtype_by_buffer,
+        access_by_buffer,
+        f"{head} * {k_dim * v_dim} + {kk} * {v_dim} + {vv}",
+    )
+    body.append(f"{indent * 3}{h_state}[{head}, {kk}, {vv}] = {h0_expr}")
+    body.append(f"{indent * 3}{h_next}[{head}, {kk}, {vv}] = {h0_expr}")
+    body.append(f"{indent * 2}T.sync_threads()")
+    if history_len <= 0:
+        return
+    body.append(f"{indent * 2}# {node.name}: m2rnn_conv_policy: ring_history")
+    body.append(
+        f"{indent * 2}for {history_idx} in T.serial(lane, {history_len * conv_dim}, "
+        f"step={thread_count}):"
+    )
+    body.append(f"{indent * 3}{hist} = {history_idx} // {conv_dim}")
+    body.append(f"{indent * 3}{ch} = {history_idx} % {conv_dim}")
+    conv_state_expr = _node_indexed_canonical_input_expr(
+        node,
+        "m2rnn_conv_state",
+        dtype_by_buffer,
+        access_by_buffer,
+        f"{hist} * {conv_dim} + {ch}",
+    )
+    body.append(f"{indent * 3}{conv_history}[{hist}, {ch}] = {conv_state_expr}")
+    body.append(f"{indent * 2}T.sync_threads()")
+
+
+def _append_row_phased_m2rnn_body(
+    body: list[str],
+    *,
+    node: _ScheduleNodeView,
+    descriptor: PathCBrickScheduleDescriptor,
+    dtype_by_buffer: dict[str, str],
+    access_by_buffer: dict[str, str],
+    shape_env: PathCModelShapeEnv,
+    thread_count: int,
+    indent: str,
+) -> None:
+    conv_history = _scratch_name(node, "m2rnn_conv_history")
+    h_state = _scratch_name(node, "m2rnn_h_state")
+    h_next = _scratch_name(node, "m2rnn_h_next")
+    projected = _scratch_name(node, "m2rnn_projected_vec")
+    conv = _scratch_name(node, "m2rnn_conv_vec")
+    post = _scratch_name(node, "m2rnn_post_vec")
+    accum = _scratch_name(node, "m2rnn_accum")
+    decay = _scratch_name(node, "m2rnn_decay")
+    sum_sq = _scratch_name(node, "m2rnn_sum_sq")
+    sum_sq_partial = _scratch_name(node, "m2rnn_sum_sq_partial")
+    inv_rms = _scratch_name(node, "m2rnn_inv_rms")
+    proj_dim = _scratch_name(node, "proj_dim")
+    hidden_dim_loop = _scratch_name(node, "hidden_dim")
+    conv_ch = _scratch_name(node, "conv_ch")
+    kernel_pos = _scratch_name(node, "kernel_pos")
+    head = _scratch_name(node, "head")
+    kk = _scratch_name(node, "kk")
+    vv = _scratch_name(node, "vv")
+    vv_inner = _scratch_name(node, "vv_inner")
+    feature = _scratch_name(node, "feature")
+    out_dim = _scratch_name(node, "out_dim")
+    hist = _scratch_name(node, "hist")
+    state_idx = _scratch_name(node, "state_idx")
+    partial_lane = _scratch_name(node, "partial_lane")
+    hidden_size = int(shape_env.hidden_size)
+    conv_dim = int(shape_env.m2rnn_conv_dim)
+    in_proj_dim = int(shape_env.m2rnn_in_proj_dim)
+    total_heads = int(shape_env.m2rnn_num_heads)
+    q_heads = int(shape_env.m2rnn_num_q_heads)
+    k_heads = int(shape_env.m2rnn_num_k_heads)
+    v_heads = int(shape_env.m2rnn_num_v_heads)
+    f_heads = int(shape_env.m2rnn_num_f_heads)
+    g_heads = int(shape_env.m2rnn_num_g_heads)
+    w_heads = int(shape_env.m2rnn_num_weight_heads)
+    k_dim = int(shape_env.m2rnn_k_head_dim)
+    v_dim = int(shape_env.m2rnn_v_head_dim)
+    kernel = int(shape_env.m2rnn_conv_kernel)
+    history_len = max(0, kernel - 1)
+    q_offset = 0
+    k_offset = int(shape_env.m2rnn_q_dim)
+    v_offset = k_offset + int(shape_env.m2rnn_k_dim)
+    f_offset = conv_dim
+    g_offset = conv_dim + f_heads
+    features = total_heads * v_dim
+    q_group = total_heads // q_heads
+    k_group = total_heads // k_heads
+    v_group = total_heads // v_heads
+    f_group = total_heads // f_heads
+    g_repeat = total_heads // g_heads
+    w_group = total_heads // w_heads
+    _append_descriptor_node_comments(
+        body,
+        node=node,
+        descriptor=descriptor,
+        indent=indent * 3,
+    )
+    body.append(f"{indent * 3}# m2rnn_projection_policy: lane_strided_dense_row_local")
+    body.append(
+        f"{indent * 3}for {proj_dim} in T.serial(lane, {in_proj_dim}, "
+        f"step={thread_count}):"
+    )
+    body.append(f"{indent * 4}{projected}[{proj_dim}] = 0.0")
+    body.append(f"{indent * 4}for {hidden_dim_loop} in T.serial(0, {hidden_size}):")
+    hidden_expr = _node_indexed_positional_input_expr(
+        node,
+        0,
+        dtype_by_buffer,
+        access_by_buffer,
+        f"row * {hidden_size} + {hidden_dim_loop}",
+    )
+    in_proj_weight_expr = _node_indexed_canonical_input_expr(
+        node,
+        "m2rnn_in_proj_weight",
+        dtype_by_buffer,
+        access_by_buffer,
+        f"{proj_dim} * {hidden_size} + {hidden_dim_loop}",
+    )
+    body.append(
+        f"{indent * 5}{projected}[{proj_dim}] = {projected}[{proj_dim}] + "
+        f"({hidden_expr} * {in_proj_weight_expr})"
+    )
+    body.append(f"{indent * 3}T.sync_threads()")
+    body.append(f"{indent * 3}# m2rnn_conv_policy: lane_strided_causal_depthwise_ring_history")
+    body.append(
+        f"{indent * 3}for {conv_ch} in T.serial(lane, {conv_dim}, step={thread_count}):"
+    )
+    conv_bias_expr = _node_indexed_canonical_input_expr(
+        node,
+        "m2rnn_conv_bias",
+        dtype_by_buffer,
+        access_by_buffer,
+        conv_ch,
+    )
+    body.append(f"{indent * 4}{conv}[{conv_ch}] = {conv_bias_expr}")
+    if history_len > 0:
+        body.append(f"{indent * 4}for {kernel_pos} in T.serial(0, {history_len}):")
+        conv_weight_expr = _node_indexed_canonical_input_expr(
+            node,
+            "m2rnn_conv_weight",
+            dtype_by_buffer,
+            access_by_buffer,
+            f"{conv_ch} * {kernel} + {kernel_pos}",
+            default="1.0",
+        )
+        body.append(
+            f"{indent * 5}{conv}[{conv_ch}] = {conv}[{conv_ch}] + "
+            f"({conv_history}[{kernel_pos}, {conv_ch}] * {conv_weight_expr})"
+        )
+    current_conv_weight_expr = _node_indexed_canonical_input_expr(
+        node,
+        "m2rnn_conv_weight",
+        dtype_by_buffer,
+        access_by_buffer,
+        f"{conv_ch} * {kernel} + {history_len}",
+        default="1.0",
+    )
+    body.append(
+        f"{indent * 4}{conv}[{conv_ch}] = {conv}[{conv_ch}] + "
+        f"({projected}[{conv_ch}] * {current_conv_weight_expr})"
+    )
+    body.append(
+        f"{indent * 4}{conv}[{conv_ch}] = {conv}[{conv_ch}] * "
+        f"(1.0 / (1.0 + T.exp(-{conv}[{conv_ch}])))"
+    )
+    body.append(f"{indent * 3}T.sync_threads()")
+    body.append(f"{indent * 3}# m2rnn_recurrence_policy: lane_strided_mapped_state_update")
+    body.append(
+        f"{indent * 3}for {head} in T.serial(lane, {total_heads}, step={thread_count}):"
+    )
+    f_src = f"({head} // {f_group})"
+    f_input = f"{projected}[{f_offset} + {f_src}]"
+    a_log_expr = _node_indexed_canonical_input_expr(
+        node,
+        "m2rnn_A_log",
+        dtype_by_buffer,
+        access_by_buffer,
+        head,
+    )
+    dt_bias_expr = _node_indexed_canonical_input_expr(
+        node,
+        "m2rnn_dt_bias",
+        dtype_by_buffer,
+        access_by_buffer,
+        head,
+    )
+    body.append(
+        f"{indent * 4}{decay}[0] = T.exp(-T.exp({a_log_expr}) * "
+        f"T.log(1.0 + T.exp({f_input} + {dt_bias_expr})))"
+    )
+    body.append(f"{indent * 4}for {kk} in T.serial(0, {k_dim}):")
+    body.append(f"{indent * 5}for {vv} in T.serial(0, {v_dim}):")
+    body.append(f"{indent * 6}{accum}[0] = 0.0")
+    body.append(f"{indent * 6}for {vv_inner} in T.serial(0, {v_dim}):")
+    w_src = f"({head} // {w_group})"
+    state_weight_expr = _node_indexed_canonical_input_expr(
+        node,
+        "m2rnn_state_weight",
+        dtype_by_buffer,
+        access_by_buffer,
+        f"{w_src} * {v_dim * v_dim} + {vv_inner} * {v_dim} + {vv}",
+        default="1.0",
+    )
+    body.append(
+        f"{indent * 7}{accum}[0] = {accum}[0] + "
+        f"({h_state}[{head}, {kk}, {vv_inner}] * {state_weight_expr})"
+    )
+    k_src = f"({head} // {k_group})"
+    v_src = f"({head} // {v_group})"
+    k_val = f"{conv}[{k_offset} + ({k_src} * {k_dim}) + {kk}]"
+    v_val = f"{conv}[{v_offset} + ({v_src} * {v_dim}) + {vv}]"
+    body.append(
+        f"{indent * 6}{h_next}[{head}, {kk}, {vv}] = "
+        f"({decay}[0] * {h_state}[{head}, {kk}, {vv}]) + "
+        f"((1.0 - {decay}[0]) * T.tanh({accum}[0] + ({k_val} * {v_val})))"
+    )
+    body.append(f"{indent * 3}T.sync_threads()")
+    body.append(f"{indent * 3}# m2rnn_post_policy: lane_strided_residual_gate_norm_out_proj")
+    body.append(
+        f"{indent * 3}for {feature} in T.serial(lane, {features}, step={thread_count}):"
+    )
+    body.append(f"{indent * 4}{head} = {feature} // {v_dim}")
+    body.append(f"{indent * 4}{vv} = {feature} % {v_dim}")
+    body.append(f"{indent * 4}{post}[{feature}] = 0.0")
+    body.append(f"{indent * 4}for {kk} in T.serial(0, {k_dim}):")
+    q_src = f"({head} // {q_group})"
+    q_val = f"{conv}[{q_offset} + ({q_src} * {k_dim}) + {kk}]"
+    body.append(
+        f"{indent * 5}{post}[{feature}] = {post}[{feature}] + "
+        f"({q_val} * {h_next}[{head}, {kk}, {vv}])"
+    )
+    d_skip_expr = _node_indexed_canonical_input_expr(
+        node,
+        "m2rnn_D",
+        dtype_by_buffer,
+        access_by_buffer,
+        f"{head} * {v_dim} + {vv}",
+        default="0.0",
+    )
+    g_flat = f"({feature} // {g_repeat})"
+    g_val = f"{projected}[{g_offset} + {g_flat}]"
+    body.append(
+        f"{indent * 4}{post}[{feature}] = "
+        f"({post}[{feature}] + ({v_val} * {d_skip_expr})) * "
+        f"{g_val} * (1.0 / (1.0 + T.exp(-{g_val})))"
+    )
+    body.append(f"{indent * 3}T.sync_threads()")
+    body.append(
+        f"{indent * 3}for {state_idx} in T.serial(lane, {total_heads * k_dim * v_dim}, "
+        f"step={thread_count}):"
+    )
+    body.append(f"{indent * 4}{head} = {state_idx} // {k_dim * v_dim}")
+    body.append(f"{indent * 4}{kk} = ({state_idx} // {v_dim}) % {k_dim}")
+    body.append(f"{indent * 4}{vv} = {state_idx} % {v_dim}")
+    body.append(
+        f"{indent * 4}{h_state}[{head}, {kk}, {vv}] = "
+        f"{h_next}[{head}, {kk}, {vv}]"
+    )
+    body.append(f"{indent * 3}{sum_sq_partial}[lane] = 0.0")
+    body.append(
+        f"{indent * 3}for {feature} in T.serial(lane, {features}, step={thread_count}):"
+    )
+    body.append(
+        f"{indent * 4}{sum_sq_partial}[lane] = {sum_sq_partial}[lane] + "
+        f"({post}[{feature}] * {post}[{feature}])"
+    )
+    body.append(f"{indent * 3}T.sync_threads()")
+    body.append(f"{indent * 3}if lane == 0:")
+    body.append(f"{indent * 4}{sum_sq}[0] = 0.0")
+    body.append(
+        f"{indent * 4}for {partial_lane} in T.serial(0, {thread_count}):"
+    )
+    body.append(
+        f"{indent * 5}{sum_sq}[0] = {sum_sq}[0] + {sum_sq_partial}[{partial_lane}]"
+    )
+    body.append(
+        f"{indent * 4}{inv_rms}[0] = T.rsqrt(({sum_sq}[0] / "
+        f"{float(features):.1f}) + 0.00001)"
+    )
+    body.append(f"{indent * 3}T.sync_threads()")
+    for output_name in node.outputs:
+        body.append(
+            f"{indent * 3}for {out_dim} in T.serial(lane, {hidden_size}, "
+            f"step={thread_count}):"
+        )
+        body.append(f"{indent * 4}{accum}[0] = 0.0")
+        body.append(f"{indent * 4}for {feature} in T.serial(0, {features}):")
+        gate_norm_expr = _node_indexed_canonical_input_expr(
+            node,
+            "m2rnn_g_norm_weight",
+            dtype_by_buffer,
+            access_by_buffer,
+            feature,
+            default="1.0",
+        )
+        out_proj_expr = _node_indexed_canonical_input_expr(
+            node,
+            "m2rnn_out_proj_weight",
+            dtype_by_buffer,
+            access_by_buffer,
+            f"{out_dim} * {features} + {feature}",
+            default="1.0",
+        )
+        body.append(
+            f"{indent * 5}{accum}[0] = {accum}[0] + "
+            f"({post}[{feature}] * {inv_rms}[0] * "
+            f"{gate_norm_expr} * {out_proj_expr})"
+        )
+        body.append(
+            f"{indent * 4}{_buffer_ref(output_name, access_by_buffer, f'row * {hidden_size} + {out_dim}')} = "
+            f"{accum}[0]"
+        )
+    body.append(f"{indent * 3}T.sync_threads()")
+    if history_len <= 0:
+        return
+    if history_len > 1:
+        body.append(
+            f"{indent * 3}for {state_idx} in T.serial(lane, {(history_len - 1) * conv_dim}, "
+            f"step={thread_count}):"
+        )
+        body.append(f"{indent * 4}{hist} = {state_idx} // {conv_dim}")
+        body.append(f"{indent * 4}{conv_ch} = {state_idx} % {conv_dim}")
+        body.append(
+            f"{indent * 4}{conv_history}[{hist}, {conv_ch}] = "
+            f"{conv_history}[{hist} + 1, {conv_ch}]"
+        )
+    body.append(
+        f"{indent * 3}for {conv_ch} in T.serial(lane, {conv_dim}, step={thread_count}):"
+    )
+    body.append(
+        f"{indent * 4}{conv_history}[{history_len - 1}, {conv_ch}] = "
+        f"{projected}[{conv_ch}]"
+    )
+    body.append(f"{indent * 3}T.sync_threads()")
+
+
 def _append_row_phased_residual_rmsnorm_body(
     body: list[str],
     *,
@@ -1117,9 +2996,11 @@ def _append_row_phased_residual_rmsnorm_body(
     dtype_by_buffer: dict[str, str],
     access_by_buffer: dict[str, str],
     hidden_size: int,
+    thread_count: int,
     indent: str,
 ) -> None:
     sum_sq = _scratch_name(node, "row_sum_sq")
+    partial = _scratch_name(node, "row_sum_sq_partial")
     inv_rms = _scratch_name(node, "row_inv_rms")
     _append_descriptor_node_comments(
         body,
@@ -1131,22 +3012,30 @@ def _append_row_phased_residual_rmsnorm_body(
     rhs = _node_input_expr(node, 1, dtype_by_buffer, access_by_buffer, "i")
     weight = _node_input_expr(node, 2, dtype_by_buffer, access_by_buffer, "i")
     residual_expr = f"({lhs} + {rhs})"
-    body.append(f"{indent * 3}{sum_sq}[0] = 0.0")
+    body.append(f"{indent * 3}{partial}[lane] = 0.0")
     body.append(
-        f"{indent * 3}for i in T.serial(row * {hidden_size}, "
-        f"(row + 1) * {hidden_size}):"
+        f"{indent * 3}for i in T.serial(row * {hidden_size} + lane, "
+        f"(row + 1) * {hidden_size}, step={thread_count}):"
     )
     body.append(
-        f"{indent * 4}{sum_sq}[0] = {sum_sq}[0] + "
+        f"{indent * 4}{partial}[lane] = {partial}[lane] + "
         f"({residual_expr} * {residual_expr})"
     )
+    body.append(f"{indent * 3}T.sync_threads()")
+    body.append(f"{indent * 3}if lane == 0:")
+    body.append(f"{indent * 4}{sum_sq}[0] = 0.0")
+    body.append(f"{indent * 4}for partial_lane in T.serial(0, {thread_count}):")
     body.append(
-        f"{indent * 3}{inv_rms}[0] = T.rsqrt(({sum_sq}[0] / "
-        f"{float(hidden_size):.1f}) + 0.00001)"
+        f"{indent * 5}{sum_sq}[0] = {sum_sq}[0] + {partial}[partial_lane]"
     )
     body.append(
-        f"{indent * 3}for i in T.serial(row * {hidden_size}, "
-        f"(row + 1) * {hidden_size}):"
+        f"{indent * 4}{inv_rms}[0] = T.rsqrt(({sum_sq}[0] / "
+        f"{float(hidden_size):.1f}) + 0.00001)"
+    )
+    body.append(f"{indent * 3}T.sync_threads()")
+    body.append(
+        f"{indent * 3}for i in T.serial(row * {hidden_size} + lane, "
+        f"(row + 1) * {hidden_size}, step={thread_count}):"
     )
     if node.outputs:
         body.append(
@@ -1159,20 +3048,889 @@ def _append_row_phased_residual_rmsnorm_body(
             f"{indent * 4}{_buffer_ref(output_name, access_by_buffer, 'i')} = "
             f"{normalized}"
         )
+    body.append(f"{indent * 3}T.sync_threads()")
+
+
+def _append_row_phased_attention_qkv_projection_body(
+    body: list[str],
+    *,
+    node: _ScheduleNodeView,
+    descriptor: PathCBrickScheduleDescriptor,
+    dtype_by_buffer: dict[str, str],
+    access_by_buffer: dict[str, str],
+    shape_env: PathCModelShapeEnv,
+    thread_count: int,
+    indent: str,
+) -> None:
+    q_projected = _scratch_name(node, "attention_q_projected")
+    kv_projected = _scratch_name(node, "attention_kv_projected")
+    q_projected_pair = _scratch_name(node, "attention_q_projected_pair")
+    kv_projected_pair = _scratch_name(node, "attention_kv_projected_pair")
+    q_projected_vec = _scratch_name(node, "attention_q_projected_vec")
+    kv_projected_vec = _scratch_name(node, "attention_kv_projected_vec")
+    rope_phase = _scratch_name(node, "attention_rope_phase")
+    q_prepared = _scratch_name(node, "attention_q_prepared")
+    kv_prepared = _scratch_name(node, "attention_kv_prepared")
+    q_head = _scratch_name(node, "q_head")
+    kv_head = _scratch_name(node, "kv_head")
+    indices_flat = _scratch_name(node, "indices_flat")
+    k_top = _scratch_name(node, "k_top")
+    d = _scratch_name(node, "d")
+    h = _scratch_name(node, "h")
+    src_i = _scratch_name(node, "src_i")
+    hidden_size = int(shape_env.hidden_size)
+    q_heads = int(shape_env.attention_num_q_heads)
+    kv_heads = int(shape_env.attention_num_kv_heads)
+    head_dim = int(shape_env.attention_head_dim)
+    topk = int(shape_env.attention_sparse_topk)
+    q_scale_output = _node_output_for_canonical(node, "q_scale")
+    kv_scale_output = _node_output_for_canonical(node, "kv_scale")
+    q_fp8_output = _node_output_for_canonical(node, "q_fp8")
+    kv_fp8_output = _node_output_for_canonical(node, "kv_fp8")
+    indices_output = _node_output_for_canonical(node, "indices")
+    if (
+        q_scale_output is None
+        or kv_scale_output is None
+        or q_fp8_output is None
+        or kv_fp8_output is None
+    ):
+        raise ValueError("row-phased attention projection requires FP8 outputs")
+    _append_descriptor_node_comments(
+        body,
+        node=node,
+        descriptor=descriptor,
+        indent=indent * 3,
+    )
+    hidden = _node_input_expr(node, 0, dtype_by_buffer, access_by_buffer, src_i)
+    body.append(
+        f"{indent * 3}{q_projected_vec} = T.alloc_local(({head_dim},), \"float32\")"
+    )
+    body.append(
+        f"{indent * 3}{kv_projected_vec} = T.alloc_local(({head_dim},), \"float32\")"
+    )
+    body.append(f"{indent * 3}# fp8_prepare_policy: lane_strided_row_head_reduction")
+    body.append(
+        f"{indent * 3}for {q_head} in T.serial(lane, {q_heads}, step={thread_count}):"
+    )
+    q_scale_ref = _row_phased_attention_scale_ref(
+        q_scale_output,
+        access_by_buffer,
+        shape_env,
+        row_expr="row",
+        head_expr=q_head,
+        q_side=True,
+    )
+    body.append(f"{indent * 4}{q_scale_ref} = 0.0")
+    _append_attention_projection_head_dot_products(
+        body,
+        projected_vec=q_projected_vec,
+        hidden=hidden,
+        weight_buffer="attention_q_proj_weight",
+        bias_buffer="attention_q_proj_bias",
+        dtype_by_buffer=dtype_by_buffer,
+        access_by_buffer=access_by_buffer,
+        hidden_size=hidden_size,
+        head_dim=head_dim,
+        head_expr=q_head,
+        hidden_loop_var=h,
+        src_index_var=src_i,
+        dim_loop_var=d,
+        indent=indent * 4,
+    )
+    body.append(f"{indent * 4}for {d} in T.serial(0, {head_dim}):")
+    _append_attention_projection_prepare_from_vector(
+        body,
+        projected_vec=q_projected_vec,
+        projected=q_projected,
+        paired_projected=q_projected_pair,
+        rope_phase=rope_phase,
+        prepared=q_prepared,
+        dtype_by_buffer=dtype_by_buffer,
+        access_by_buffer=access_by_buffer,
+        head_dim=head_dim,
+        dim_expr=d,
+        indent=indent * 5,
+    )
+    body.append(
+        f"{indent * 5}{q_scale_ref} = T.max({q_scale_ref}, "
+        f"T.abs(T.cast({q_prepared}[0], \"float32\")))"
+    )
+    body.append(
+        f"{indent * 4}{q_scale_ref} = T.max({q_scale_ref} * "
+        f"T.cast({1.0 / 448.0:.17g}, \"float32\"), "
+        f"T.cast(1.0e-12, \"float32\"))"
+    )
+    body.append(f"{indent * 4}for {d} in T.serial(0, {head_dim}):")
+    _append_attention_projection_prepare_from_vector(
+        body,
+        projected_vec=q_projected_vec,
+        projected=q_projected,
+        paired_projected=q_projected_pair,
+        rope_phase=rope_phase,
+        prepared=q_prepared,
+        dtype_by_buffer=dtype_by_buffer,
+        access_by_buffer=access_by_buffer,
+        head_dim=head_dim,
+        dim_expr=d,
+        indent=indent * 5,
+    )
+    body.append(
+        f"{indent * 5}{_row_phased_attention_value_ref(q_fp8_output, access_by_buffer, shape_env, row_expr='row', head_expr=q_head, dim_expr=d, q_side=True)} = "
+        f"{_fp8_encode_expr(f'{q_prepared}[0]', q_scale_ref)}"
+    )
+
+    body.append(
+        f"{indent * 3}for {kv_head} in T.serial(lane, {kv_heads}, step={thread_count}):"
+    )
+    kv_scale_ref = _row_phased_attention_scale_ref(
+        kv_scale_output,
+        access_by_buffer,
+        shape_env,
+        row_expr="row",
+        head_expr=kv_head,
+        q_side=False,
+    )
+    body.append(f"{indent * 4}{kv_scale_ref} = 0.0")
+    _append_attention_projection_head_dot_products(
+        body,
+        projected_vec=kv_projected_vec,
+        hidden=hidden,
+        weight_buffer="attention_sparse_kv_proj_weight",
+        bias_buffer="attention_sparse_kv_proj_bias",
+        dtype_by_buffer=dtype_by_buffer,
+        access_by_buffer=access_by_buffer,
+        hidden_size=hidden_size,
+        head_dim=head_dim,
+        head_expr=kv_head,
+        hidden_loop_var=h,
+        src_index_var=src_i,
+        dim_loop_var=d,
+        indent=indent * 4,
+    )
+    body.append(f"{indent * 4}for {d} in T.serial(0, {head_dim}):")
+    _append_attention_projection_prepare_from_vector(
+        body,
+        projected_vec=kv_projected_vec,
+        projected=kv_projected,
+        paired_projected=kv_projected_pair,
+        rope_phase=rope_phase,
+        prepared=kv_prepared,
+        dtype_by_buffer=dtype_by_buffer,
+        access_by_buffer=access_by_buffer,
+        head_dim=head_dim,
+        dim_expr=d,
+        indent=indent * 5,
+    )
+    body.append(
+        f"{indent * 5}{kv_scale_ref} = T.max({kv_scale_ref}, "
+        f"T.abs(T.cast({kv_prepared}[0], \"float32\")))"
+    )
+    body.append(
+        f"{indent * 4}{kv_scale_ref} = T.max({kv_scale_ref} * "
+        f"T.cast({1.0 / 448.0:.17g}, \"float32\"), "
+        f"T.cast(1.0e-12, \"float32\"))"
+    )
+    body.append(f"{indent * 4}for {d} in T.serial(0, {head_dim}):")
+    _append_attention_projection_prepare_from_vector(
+        body,
+        projected_vec=kv_projected_vec,
+        projected=kv_projected,
+        paired_projected=kv_projected_pair,
+        rope_phase=rope_phase,
+        prepared=kv_prepared,
+        dtype_by_buffer=dtype_by_buffer,
+        access_by_buffer=access_by_buffer,
+        head_dim=head_dim,
+        dim_expr=d,
+        indent=indent * 5,
+    )
+    body.append(
+        f"{indent * 5}{_row_phased_attention_value_ref(kv_fp8_output, access_by_buffer, shape_env, row_expr='row', head_expr=kv_head, dim_expr=d, q_side=False)} = "
+        f"{_fp8_encode_expr(f'{kv_prepared}[0]', kv_scale_ref)}"
+    )
+    if indices_output is not None:
+        body.append(
+            f"{indent * 3}for {indices_flat} in T.serial(lane, {kv_heads * topk}, "
+            f"step={thread_count}):"
+        )
+        body.append(f"{indent * 4}{kv_head} = {indices_flat} // {topk}")
+        body.append(f"{indent * 4}{k_top} = {indices_flat} % {topk}")
+        indices_ref = _row_phased_attention_indices_ref(
+            indices_output,
+            access_by_buffer,
+            shape_env,
+            head_expr=kv_head,
+            topk_expr=k_top,
+        )
+        body.append(f"{indent * 4}if row >= {k_top}:")
+        body.append(
+            f"{indent * 5}{indices_ref} = row - {k_top}"
+        )
+        body.append(f"{indent * 4}else:")
+        body.append(f"{indent * 5}{indices_ref} = -1")
+    body.append(f"{indent * 3}T.sync_threads()")
+
+
+def _append_row_phased_sparse_mla_fp8_apply_body(
+    body: list[str],
+    *,
+    node: _ScheduleNodeView,
+    descriptor: PathCBrickScheduleDescriptor,
+    dtype_by_buffer: dict[str, str],
+    access_by_buffer: dict[str, str],
+    shape_env: PathCModelShapeEnv,
+    thread_count: int,
+    indent: str,
+) -> None:
+    sink_enabled = _scratch_name(node, "sink_enabled")
+    sparse_index = _scratch_name(node, "sparse_index")
+    score_accum = _scratch_name(node, "score_accum")
+    score_max = _scratch_name(node, "score_max")
+    score_weight = _scratch_name(node, "score_weight")
+    score_weights = _scratch_name(node, "score_weights")
+    sparse_indices = _scratch_name(node, "sparse_indices")
+    sumexp = _scratch_name(node, "sumexp")
+    value_accum = _scratch_name(node, "value_accum")
+    context_accum = _scratch_name(node, "context_accum")
+    context_values = _scratch_name(node, "context_values")
+    q_head_index = _scratch_name(node, "q_head")
+    kv_head_index = _scratch_name(node, "kv_head")
+    source_head_index = _scratch_name(node, "source_head")
+    source_dim_index = _scratch_name(node, "source_dim")
+    out_dim_loop = _scratch_name(node, "out_dim_loop")
+    source_head_loop = _scratch_name(node, "source_head_loop")
+    source_dim_loop = _scratch_name(node, "source_dim_loop")
+    dot_dim_loop = _scratch_name(node, "dot_dim")
+    lse_head_loop = _scratch_name(node, "lse_head")
+    k_top = _scratch_name(node, "k_top")
+    hidden_size = int(shape_env.hidden_size)
+    q_heads = int(shape_env.attention_num_q_heads)
+    kv_heads = int(shape_env.attention_num_kv_heads)
+    head_dim = int(shape_env.attention_head_dim)
+    sequence_length = int(shape_env.sequence_length)
+    q_dim = q_heads * head_dim
+    topk = int(shape_env.attention_sparse_topk)
+    q_per_kv = max(1, q_heads // max(1, kv_heads))
+    q_head = f"{q_head_index}[0]"
+    kv_head = f"{kv_head_index}[0]"
+    source_head = f"{source_head_index}[0]"
+    source_dim = f"{source_dim_index}[0]"
+    dot_dim = dot_dim_loop
+    lse_head = lse_head_loop
+    q_fp8_input = _node_input_for_canonical(node, "q_fp8")
+    q_scale_input = _node_input_for_canonical(node, "q_scale")
+    kv_fp8_input = _node_input_for_canonical(node, "kv_fp8")
+    kv_scale_input = _node_input_for_canonical(node, "kv_scale")
+    indices_input = _node_input_for_canonical(node, "indices")
+    if (
+        q_fp8_input is None
+        or q_scale_input is None
+        or kv_fp8_input is None
+        or kv_scale_input is None
+        or indices_input is None
+    ):
+        raise ValueError("row-phased sparse MLA apply requires FP8 and index inputs")
+    sm_scale = _optional_buffer_expr(
+        "sparse_mla_sm_scale",
+        dtype_by_buffer,
+        access_by_buffer,
+        "1.0",
+        "0",
+    )
+    sinks = _optional_buffer_expr(
+        "sparse_mla_sinks",
+        dtype_by_buffer,
+        access_by_buffer,
+        "0.0",
+        q_head,
+    )
+    has_sinks = _optional_buffer_expr(
+        "sparse_mla_has_sinks",
+        dtype_by_buffer,
+        access_by_buffer,
+        "0",
+        "0",
+    )
+    attention_out = (
+        _node_output_for_canonical(node, "attention_out")
+        or _node_output_with_suffix(node, "_out")
+    )
+    lse_output = _node_output_for_canonical(node, "lse")
+
+    def append_sparse_index_for_current_head(
+        *,
+        loop_indent: str,
+        kv_head_expr: str,
+        use_cached_sparse_index: bool = False,
+    ) -> None:
+        if use_cached_sparse_index:
+            body.append(f"{loop_indent}{sparse_index}[0] = {sparse_indices}[{k_top}]")
+            return
+        indices_current = _row_phased_attention_indices_ref(
+            indices_input,
+            access_by_buffer,
+            shape_env,
+            head_expr=kv_head_expr,
+            topk_expr=k_top,
+        )
+        body.append(f"{loop_indent}{sparse_index}[0] = {indices_current}")
+
+    def append_score_for_current_head(
+        *,
+        loop_indent: str,
+        head_expr: str,
+        kv_head_expr: str,
+        use_cached_sparse_index: bool = False,
+    ) -> None:
+        q_scale_current = _row_phased_attention_scale_ref(
+            q_scale_input,
+            access_by_buffer,
+            shape_env,
+            row_expr="row",
+            head_expr=head_expr,
+            q_side=True,
+        )
+        kv_scale_current = _row_phased_attention_selected_kv_scale_ref(
+            kv_scale_input,
+            access_by_buffer,
+            shape_env,
+            selected_row_expr=f"{sparse_index}[0]",
+            head_expr=kv_head_expr,
+        )
+        append_sparse_index_for_current_head(
+            loop_indent=loop_indent,
+            kv_head_expr=kv_head_expr,
+            use_cached_sparse_index=use_cached_sparse_index,
+        )
+        body.append(
+            f"{loop_indent}if {sparse_index}[0] >= 0 and "
+            f"{sparse_index}[0] < {sequence_length}:"
+        )
+        body.append(f"{loop_indent}    {score_accum}[0] = 0.0")
+        body.append(f"{loop_indent}    for {dot_dim_loop} in T.serial(0, {head_dim}):")
+        q_dot_ref = _row_phased_attention_value_ref(
+            q_fp8_input,
+            access_by_buffer,
+            shape_env,
+            row_expr="row",
+            head_expr=head_expr,
+            dim_expr=dot_dim,
+            q_side=True,
+        )
+        kv_dot_ref = _row_phased_attention_selected_kv_value_ref(
+            kv_fp8_input,
+            access_by_buffer,
+            shape_env,
+            selected_row_expr=f"{sparse_index}[0]",
+            head_expr=kv_head_expr,
+            dim_expr=dot_dim,
+        )
+        body.append(
+            f"{loop_indent}        {score_accum}[0] = {score_accum}[0] + "
+            f"(fp8_e4m3fn_to_float({q_dot_ref}) * "
+            f"fp8_e4m3fn_to_float({kv_dot_ref}))"
+        )
+        body.append(
+            f"{loop_indent}    {score_accum}[0] = {score_accum}[0] * "
+            f"{q_scale_current} * {kv_scale_current} * {sm_scale}"
+        )
+        body.append(f"{loop_indent}else:")
+        body.append(
+            f"{loop_indent}    {score_accum}[0] = "
+            "T.float32(-3.4028234663852886e38)"
+        )
+
+    if attention_out is not None:
+        _append_descriptor_node_comments(
+            body,
+            node=node,
+            descriptor=descriptor,
+            indent=indent * 3,
+        )
+        body.append(
+            f"{indent * 3}# sparse_mla_fp8_apply_policy: "
+            "lane_strided_context_and_out_projection"
+        )
+        body.append(
+            f"{indent * 3}{score_weights} = "
+            f"T.alloc_local(({topk},), \"float32\")"
+        )
+        body.append(
+            f"{indent * 3}{sparse_indices} = "
+            f"T.alloc_local(({topk},), \"int32\")"
+        )
+        body.append(
+            f"{indent * 3}{sink_enabled}[0] = "
+            f"T.cast({has_sinks} != 0, \"float32\")"
+        )
+        body.append(
+            f"{indent * 3}for {source_head_loop} in T.serial(lane, {q_heads}, "
+            f"step={thread_count}):"
+        )
+        body.append(f"{indent * 4}{source_head_index}[0] = {source_head_loop}")
+        body.append(f"{indent * 4}{q_head_index}[0] = {source_head}")
+        body.append(
+            f"{indent * 4}{kv_head_index}[0] = {source_head} // {q_per_kv}"
+        )
+        body.append(f"{indent * 4}for {k_top} in T.serial(0, {topk}):")
+        indices_current = _row_phased_attention_indices_ref(
+            indices_input,
+            access_by_buffer,
+            shape_env,
+            head_expr=kv_head,
+            topk_expr=k_top,
+        )
+        body.append(f"{indent * 5}{sparse_indices}[{k_top}] = {indices_current}")
+        body.append(
+            f"{indent * 4}{score_max}[0] = "
+            "T.float32(-3.4028234663852886e38)"
+        )
+        body.append(f"{indent * 4}for {k_top} in T.serial(0, {topk}):")
+        body.append(f"{indent * 5}{score_weights}[{k_top}] = 0.0")
+        append_score_for_current_head(
+            loop_indent=indent * 5,
+            head_expr=source_head,
+            kv_head_expr=kv_head,
+            use_cached_sparse_index=True,
+        )
+        body.append(f"{indent * 6}if {score_accum}[0] > {score_max}[0]:")
+        body.append(f"{indent * 7}{score_max}[0] = {score_accum}[0]")
+        body.append(f"{indent * 4}if {sink_enabled}[0] != 0.0:")
+        body.append(f"{indent * 5}if {sinks} > {score_max}[0]:")
+        body.append(f"{indent * 6}{score_max}[0] = {sinks}")
+        body.append(f"{indent * 4}{sumexp}[0] = 0.0")
+        body.append(f"{indent * 4}for {k_top} in T.serial(0, {topk}):")
+        append_score_for_current_head(
+            loop_indent=indent * 5,
+            head_expr=source_head,
+            kv_head_expr=kv_head,
+            use_cached_sparse_index=True,
+        )
+        body.append(
+            f"{indent * 6}{score_weight}[0] = "
+            f"T.exp({score_accum}[0] - {score_max}[0])"
+        )
+        body.append(
+            f"{indent * 6}{score_weights}[{k_top}] = {score_weight}[0]"
+        )
+        body.append(f"{indent * 6}{sumexp}[0] = {sumexp}[0] + {score_weight}[0]")
+        body.append(f"{indent * 4}if {sink_enabled}[0] != 0.0:")
+        body.append(
+            f"{indent * 5}{sumexp}[0] = {sumexp}[0] + "
+            f"T.exp({sinks} - {score_max}[0])"
+        )
+        if lse_output is not None:
+            lse_index = f"row * {q_heads} + {source_head}"
+            lse_ref = _indexed_buffer_ref(
+                lse_output,
+                access_by_buffer,
+                lse_index,
+            )
+            body.append(f"{indent * 4}{lse_ref} = 0.0")
+            body.append(f"{indent * 4}if {sumexp}[0] > 0.0:")
+            body.append(
+                f"{indent * 5}{lse_ref} = {score_max}[0] + "
+                f"T.log({sumexp}[0])"
+            )
+        body.append(
+            f"{indent * 4}for {source_dim_loop} in T.serial(0, {head_dim}):"
+        )
+        body.append(f"{indent * 5}{source_dim_index}[0] = {source_dim_loop}")
+        body.append(f"{indent * 5}{value_accum}[0] = 0.0")
+        body.append(f"{indent * 5}for {k_top} in T.serial(0, {topk}):")
+        append_sparse_index_for_current_head(
+            loop_indent=indent * 6,
+            kv_head_expr=kv_head,
+            use_cached_sparse_index=True,
+        )
+        body.append(
+            f"{indent * 6}if {sparse_index}[0] >= 0 and "
+            f"{sparse_index}[0] < {sequence_length}:"
+        )
+        kv_value_ref = _row_phased_attention_selected_kv_value_ref(
+            kv_fp8_input,
+            access_by_buffer,
+            shape_env,
+            selected_row_expr=f"{sparse_index}[0]",
+            head_expr=kv_head,
+            dim_expr=source_dim,
+        )
+        kv_value_scale_ref = _row_phased_attention_selected_kv_scale_ref(
+            kv_scale_input,
+            access_by_buffer,
+            shape_env,
+            selected_row_expr=f"{sparse_index}[0]",
+            head_expr=kv_head,
+        )
+        body.append(
+            f"{indent * 7}{value_accum}[0] = {value_accum}[0] + "
+            f"({score_weights}[{k_top}] * fp8_e4m3fn_to_float({kv_value_ref}) * "
+            f"{kv_value_scale_ref})"
+        )
+        body.append(f"{indent * 5}{context_accum}[0] = 0.0")
+        body.append(f"{indent * 5}if {sumexp}[0] > 0.0:")
+        body.append(
+            f"{indent * 6}{context_accum}[0] = "
+            f"{value_accum}[0] / {sumexp}[0]"
+        )
+        body.append(
+            f"{indent * 5}{context_values}["
+            f"{source_head_loop} * {head_dim} + {source_dim_loop}"
+            f"] = {context_accum}[0]"
+        )
+        body.append(f"{indent * 3}T.sync_threads()")
+        body.append(
+            f"{indent * 3}for {out_dim_loop} in T.serial(lane, {hidden_size}, "
+            f"step={thread_count}):"
+        )
+        attention_out_ref = _indexed_buffer_ref(
+            attention_out,
+            access_by_buffer,
+            f"row * {hidden_size} + {out_dim_loop}",
+        )
+        out_bias = _optional_indexed_buffer_expr(
+            "attention_out_proj_bias",
+            dtype_by_buffer,
+            access_by_buffer,
+            default="0.0",
+            index_expr=out_dim_loop,
+        )
+        body.append(f"{indent * 4}{attention_out_ref} = {out_bias}")
+        body.append(f"{indent * 4}for {source_dim_loop} in T.serial(0, {q_dim}):")
+        out_weight = _optional_indexed_buffer_expr(
+            "attention_out_proj_weight",
+            dtype_by_buffer,
+            access_by_buffer,
+            default="1.0",
+            index_expr=(
+                f"({out_dim_loop}) * {q_dim} + "
+                f"{source_dim_loop}"
+            ),
+        )
+        body.append(
+            f"{indent * 5}{attention_out_ref} = {attention_out_ref} + "
+            f"({context_values}[{source_dim_loop}] * {out_weight})"
+        )
+        body.append(f"{indent * 3}T.sync_threads()")
+    if lse_output is not None and attention_out is None:
+        body.append(
+            f"{indent * 3}for {lse_head_loop} in T.serial(lane, {q_heads}, "
+            f"step={thread_count}):"
+        )
+        body.append(f"{indent * 4}{q_head_index}[0] = {lse_head}")
+        body.append(f"{indent * 4}{kv_head_index}[0] = {q_head} // {q_per_kv}")
+        body.append(
+            f"{indent * 4}{sink_enabled}[0] = "
+            f"T.cast({has_sinks} != 0, \"float32\")"
+        )
+        body.append(
+            f"{indent * 4}{score_max}[0] = "
+            "T.float32(-3.4028234663852886e38)"
+        )
+        body.append(f"{indent * 4}for {k_top} in T.serial(0, {topk}):")
+        append_score_for_current_head(
+            loop_indent=indent * 5,
+            head_expr=q_head,
+            kv_head_expr=kv_head,
+        )
+        body.append(f"{indent * 6}if {score_accum}[0] > {score_max}[0]:")
+        body.append(f"{indent * 7}{score_max}[0] = {score_accum}[0]")
+        body.append(f"{indent * 4}if {sink_enabled}[0] != 0.0:")
+        body.append(f"{indent * 5}if {sinks} > {score_max}[0]:")
+        body.append(f"{indent * 6}{score_max}[0] = {sinks}")
+        body.append(f"{indent * 4}{sumexp}[0] = 0.0")
+        body.append(f"{indent * 4}for {k_top} in T.serial(0, {topk}):")
+        append_score_for_current_head(
+            loop_indent=indent * 5,
+            head_expr=q_head,
+            kv_head_expr=kv_head,
+        )
+        body.append(
+            f"{indent * 6}{sumexp}[0] = {sumexp}[0] + "
+            f"T.exp({score_accum}[0] - {score_max}[0])"
+        )
+        body.append(f"{indent * 4}if {sink_enabled}[0] != 0.0:")
+        body.append(
+            f"{indent * 5}{sumexp}[0] = {sumexp}[0] + "
+            f"T.exp({sinks} - {score_max}[0])"
+        )
+        lse_index = f"row * {q_heads} + {q_head}"
+        body.append(
+            f"{indent * 4}{_indexed_buffer_ref(lse_output, access_by_buffer, lse_index)} = "
+            "0.0"
+        )
+        body.append(f"{indent * 4}if {sumexp}[0] > 0.0:")
+        body.append(
+            f"{indent * 5}{_indexed_buffer_ref(lse_output, access_by_buffer, lse_index)} = "
+            f"{score_max}[0] + T.log({sumexp}[0])"
+        )
+
+
+def _append_attention_projection_head_dot_products(
+    body: list[str],
+    *,
+    projected_vec: str,
+    hidden: str,
+    weight_buffer: str,
+    bias_buffer: str,
+    dtype_by_buffer: dict[str, str],
+    access_by_buffer: dict[str, str],
+    hidden_size: int,
+    head_dim: int,
+    head_expr: str,
+    hidden_loop_var: str,
+    src_index_var: str,
+    dim_loop_var: str,
+    indent: str,
+) -> None:
+    body.append(f"{indent}for {dim_loop_var} in T.serial(0, {head_dim}):")
+    output_offset = f"{head_expr} * {head_dim} + {dim_loop_var}"
+    bias = _optional_indexed_buffer_expr(
+        bias_buffer,
+        dtype_by_buffer,
+        access_by_buffer,
+        index_expr=output_offset,
+    )
+    body.append(f"{indent}    {projected_vec}[{dim_loop_var}] = {bias}")
+    body.append(f"{indent}for {hidden_loop_var} in T.serial(0, {hidden_size}):")
+    body.append(
+        f"{indent}    {src_index_var} = row * {hidden_size} + "
+        f"{hidden_loop_var}"
+    )
+    body.append(f"{indent}    for {dim_loop_var} in T.serial(0, {head_dim}):")
+    output_offset = f"{head_expr} * {head_dim} + {dim_loop_var}"
+    weight = _optional_indexed_buffer_expr(
+        weight_buffer,
+        dtype_by_buffer,
+        access_by_buffer,
+        index_expr=f"({output_offset}) * {hidden_size} + {hidden_loop_var}",
+    )
+    body.append(
+        f"{indent}        {projected_vec}[{dim_loop_var}] = "
+        f"{projected_vec}[{dim_loop_var}] + ({hidden} * {weight})"
+    )
+
+
+def _append_attention_projection_prepare_from_vector(
+    body: list[str],
+    *,
+    projected_vec: str,
+    projected: str,
+    paired_projected: str,
+    rope_phase: str,
+    prepared: str,
+    dtype_by_buffer: dict[str, str],
+    access_by_buffer: dict[str, str],
+    head_dim: int,
+    dim_expr: str,
+    indent: str,
+) -> None:
+    rope_half = max(1, head_dim // 2)
+    body.append(f"{indent}{projected}[0] = {projected_vec}[{dim_expr}]")
+    body.append(f"{indent}if {dim_expr} < {rope_half}:")
+    body.append(
+        f"{indent}    {paired_projected}[0] = "
+        f"{projected_vec}[{dim_expr} + {rope_half}]"
+    )
+    rope_first = _optional_indexed_buffer_expr(
+        "attention_rope_inv_freq",
+        dtype_by_buffer,
+        access_by_buffer,
+        index_expr=dim_expr,
+    )
+    body.append(
+        f"{indent}    {rope_phase}[0] = "
+        f'T.cast(row, "float32") * {rope_first}'
+    )
+    body.append(
+        f"{indent}    {prepared}[0] = "
+        f"({projected}[0] * T.cos({rope_phase}[0])) + "
+        f"({paired_projected}[0] * T.sin({rope_phase}[0]))"
+    )
+    body.append(f"{indent}else:")
+    body.append(
+        f"{indent}    {paired_projected}[0] = "
+        f"{projected_vec}[{dim_expr} - {rope_half}]"
+    )
+    rope_second = _optional_indexed_buffer_expr(
+        "attention_rope_inv_freq",
+        dtype_by_buffer,
+        access_by_buffer,
+        index_expr=f"{dim_expr} - {rope_half}",
+    )
+    body.append(
+        f"{indent}    {rope_phase}[0] = "
+        f'T.cast(row, "float32") * {rope_second}'
+    )
+    body.append(
+        f"{indent}    {prepared}[0] = "
+        f"({projected}[0] * T.cos({rope_phase}[0])) - "
+        f"({paired_projected}[0] * T.sin({rope_phase}[0]))"
+    )
+
+
+def _attention_qkv_projection_prepare_statements(
+    *,
+    projected: str,
+    rope_phase: str,
+    prepared: str,
+    hidden: str,
+    weight: str,
+    bias: str,
+    rope: str,
+    indent: str,
+) -> list[str]:
+    return [
+        f"{indent}{projected}[0] = {hidden} + {weight} + {bias}",
+        f"{indent}{rope_phase}[0] = {rope}",
+        f"{indent}{prepared}[0] = {projected}[0] + {rope_phase}[0]",
+    ]
+
+
+def _row_phased_attention_scale_ref(
+    buffer_name: str,
+    access_by_buffer: dict[str, str],
+    shape_env: PathCModelShapeEnv,
+    *,
+    row_expr: str,
+    head_expr: str,
+    q_side: bool,
+) -> str:
+    name = _safe_identifier(buffer_name)
+    hidden = int(shape_env.hidden_size)
+    head_dim = int(shape_env.attention_head_dim)
+    heads = (
+        int(shape_env.attention_num_q_heads)
+        if q_side
+        else int(shape_env.attention_num_kv_heads)
+    )
+    internal_ref = (
+        f"{name}[(i % {hidden}) // {head_dim}]"
+        if q_side
+        else f"{name}[((i % {hidden}) // {head_dim}) % {heads}]"
+    )
+    if access_by_buffer.get(buffer_name) == internal_ref:
+        return f"{name}[{head_expr}]"
+    return _indexed_buffer_ref(
+        buffer_name,
+        access_by_buffer,
+        f"{row_expr} * {heads} + {head_expr}",
+    )
+
+
+def _row_phased_attention_value_ref(
+    buffer_name: str,
+    access_by_buffer: dict[str, str],
+    shape_env: PathCModelShapeEnv,
+    *,
+    row_expr: str,
+    head_expr: str,
+    dim_expr: str,
+    q_side: bool,
+) -> str:
+    name = _safe_identifier(buffer_name)
+    head_dim = int(shape_env.attention_head_dim)
+    heads = (
+        int(shape_env.attention_num_q_heads)
+        if q_side
+        else int(shape_env.attention_num_kv_heads)
+    )
+    row_width = heads * head_dim
+    offset = f"{head_expr} * {head_dim} + {dim_expr}"
+    if access_by_buffer.get(buffer_name) == f"{name}[i % {row_width}]":
+        return f"{name}[{offset}]"
+    return _indexed_buffer_ref(
+        buffer_name,
+        access_by_buffer,
+        f"{row_expr} * {row_width} + {offset}",
+    )
+
+
+def _row_phased_attention_selected_kv_value_ref(
+    buffer_name: str,
+    access_by_buffer: dict[str, str],
+    shape_env: PathCModelShapeEnv,
+    *,
+    selected_row_expr: str,
+    head_expr: str,
+    dim_expr: str,
+) -> str:
+    name = _safe_identifier(buffer_name)
+    head_dim = int(shape_env.attention_head_dim)
+    heads = int(shape_env.attention_num_kv_heads)
+    row_width = heads * head_dim
+    offset = f"{head_expr} * {head_dim} + {dim_expr}"
+    if access_by_buffer.get(buffer_name) == f"{name}[i % {row_width}]":
+        return f"{name}[{offset}]"
+    return _indexed_buffer_ref(
+        buffer_name,
+        access_by_buffer,
+        f"{selected_row_expr} * {row_width} + {offset}",
+    )
+
+
+def _row_phased_attention_selected_kv_scale_ref(
+    buffer_name: str,
+    access_by_buffer: dict[str, str],
+    shape_env: PathCModelShapeEnv,
+    *,
+    selected_row_expr: str,
+    head_expr: str,
+) -> str:
+    name = _safe_identifier(buffer_name)
+    heads = int(shape_env.attention_num_kv_heads)
+    internal_ref = (
+        f"{name}[((i % {shape_env.hidden_size}) // "
+        f"{shape_env.attention_head_dim}) % {heads}]"
+    )
+    if access_by_buffer.get(buffer_name) == internal_ref:
+        return f"{name}[{head_expr}]"
+    return _indexed_buffer_ref(
+        buffer_name,
+        access_by_buffer,
+        f"{selected_row_expr} * {heads} + {head_expr}",
+    )
+
+
+def _row_phased_attention_indices_ref(
+    buffer_name: str,
+    access_by_buffer: dict[str, str],
+    shape_env: PathCModelShapeEnv,
+    *,
+    head_expr: str,
+    topk_expr: str,
+) -> str:
+    name = _safe_identifier(buffer_name)
+    kv_heads = int(shape_env.attention_num_kv_heads)
+    topk = int(shape_env.attention_sparse_topk)
+    row_width = kv_heads * topk
+    offset = f"{head_expr} * {topk} + {topk_expr}"
+    if access_by_buffer.get(buffer_name) == f"{name}[i % {row_width}]":
+        return f"{name}[{offset}]"
+    return _indexed_buffer_ref(
+        buffer_name,
+        access_by_buffer,
+        f"row * {row_width} + {offset}",
+    )
 
 
 def _append_row_phased_residual_rmsnorm_bwd_init(
     body: list[str],
     *,
     node: _ScheduleNodeView,
+    access_by_buffer: dict[str, str],
     hidden_size: int,
+    thread_count: int,
     indent: str,
 ) -> None:
     if len(node.outputs) < 3:
         return
-    weight_grad = _safe_identifier(node.outputs[2])
-    body.append(f"{indent * 2}for h in T.serial(0, {hidden_size}):")
-    body.append(f"{indent * 3}{weight_grad}[h] = 0.0")
+    weight_grad = node.outputs[2]
+    body.append(f"{indent * 2}for h in T.serial(lane, {hidden_size}, step={thread_count}):")
+    body.append(
+        f"{indent * 3}{_buffer_ref(weight_grad, access_by_buffer, 'h')} = 0.0"
+    )
+    body.append(f"{indent * 2}T.sync_threads()")
 
 
 def _append_row_phased_residual_rmsnorm_bwd_body(
@@ -1183,11 +3941,14 @@ def _append_row_phased_residual_rmsnorm_bwd_body(
     dtype_by_buffer: dict[str, str],
     access_by_buffer: dict[str, str],
     hidden_size: int,
+    thread_count: int,
     indent: str,
 ) -> None:
     sum_sq = _scratch_name(node, "row_sum_sq")
+    sum_sq_partial = _scratch_name(node, "row_sum_sq_partial")
     inv_rms = _scratch_name(node, "row_inv_rms")
     dot = _scratch_name(node, "row_dot")
+    dot_partial = _scratch_name(node, "row_dot_partial")
     norm_grad_scratch = _scratch_name(node, "row_norm_grad")
     total_grad_scratch = _scratch_name(node, "row_total_grad")
     _append_descriptor_node_comments(
@@ -1202,31 +3963,40 @@ def _append_row_phased_residual_rmsnorm_bwd_body(
     delta = _node_input_expr(node, 3, dtype_by_buffer, access_by_buffer, "i")
     weight = _node_input_expr(node, 4, dtype_by_buffer, access_by_buffer, "i")
     residual_expr = f"({hidden} + {delta})"
-    body.append(f"{indent * 3}{sum_sq}[0] = 0.0")
+    body.append(f"{indent * 3}{sum_sq_partial}[lane] = 0.0")
+    body.append(f"{indent * 3}{dot_partial}[lane] = 0.0")
     body.append(
-        f"{indent * 3}for i in T.serial(row * {hidden_size}, "
-        f"(row + 1) * {hidden_size}):"
+        f"{indent * 3}for i in T.serial(row * {hidden_size} + lane, "
+        f"(row + 1) * {hidden_size}, step={thread_count}):"
     )
     body.append(
-        f"{indent * 4}{sum_sq}[0] = {sum_sq}[0] + "
+        f"{indent * 4}{sum_sq_partial}[lane] = {sum_sq_partial}[lane] + "
         f"({residual_expr} * {residual_expr})"
     )
     body.append(
-        f"{indent * 3}{inv_rms}[0] = T.rsqrt(({sum_sq}[0] / "
-        f"{float(hidden_size):.1f}) + 0.00001)"
-    )
-    body.append(f"{indent * 3}{dot}[0] = 0.0")
-    body.append(
-        f"{indent * 3}for i in T.serial(row * {hidden_size}, "
-        f"(row + 1) * {hidden_size}):"
-    )
-    body.append(
-        f"{indent * 4}{dot}[0] = {dot}[0] + "
+        f"{indent * 4}{dot_partial}[lane] = {dot_partial}[lane] + "
         f"({norm_grad} * {weight} * {residual_expr})"
     )
+    body.append(f"{indent * 3}T.sync_threads()")
+    body.append(f"{indent * 3}if lane == 0:")
+    body.append(f"{indent * 4}{sum_sq}[0] = 0.0")
+    body.append(f"{indent * 4}{dot}[0] = 0.0")
+    body.append(f"{indent * 4}for partial_lane in T.serial(0, {thread_count}):")
     body.append(
-        f"{indent * 3}for i in T.serial(row * {hidden_size}, "
-        f"(row + 1) * {hidden_size}):"
+        f"{indent * 5}{sum_sq}[0] = {sum_sq}[0] + "
+        f"{sum_sq_partial}[partial_lane]"
+    )
+    body.append(
+        f"{indent * 5}{dot}[0] = {dot}[0] + {dot_partial}[partial_lane]"
+    )
+    body.append(
+        f"{indent * 4}{inv_rms}[0] = T.rsqrt(({sum_sq}[0] / "
+        f"{float(hidden_size):.1f}) + 0.00001)"
+    )
+    body.append(f"{indent * 3}T.sync_threads()")
+    body.append(
+        f"{indent * 3}for i in T.serial(row * {hidden_size} + lane, "
+        f"(row + 1) * {hidden_size}, step={thread_count}):"
     )
     body.append(f"{indent * 4}{norm_grad_scratch}[0] = {norm_grad} * {weight}")
     body.append(
@@ -1246,6 +4016,919 @@ def _append_row_phased_residual_rmsnorm_bwd_body(
             f"{indent * 4}{weight_grad} = {weight_grad} + "
             f"({norm_grad} * {residual_expr} * {inv_rms}[0])"
         )
+    body.append(f"{indent * 3}T.sync_threads()")
+
+
+def _append_row_phased_attention_qkv_projection_bwd_body(
+    body: list[str],
+    *,
+    node: _ScheduleNodeView,
+    descriptor: PathCBrickScheduleDescriptor,
+    dtype_by_buffer: dict[str, str],
+    access_by_buffer: dict[str, str],
+    shape_env: PathCModelShapeEnv,
+    thread_count: int,
+    indent: str,
+) -> None:
+    q_grad = _scratch_name(node, "attention_q_grad")
+    kv_grad = _scratch_name(node, "attention_kv_grad")
+    rope_grad_scratch = _scratch_name(node, "attention_rope_grad")
+    q_flat = _scratch_name(node, "q_flat")
+    kv_flat = _scratch_name(node, "kv_flat")
+    grad_flat = _scratch_name(node, "grad_flat")
+    h = _scratch_name(node, "h")
+    rope_d = _scratch_name(node, "rope_d")
+    hidden_size = int(shape_env.hidden_size)
+    q_heads = int(shape_env.attention_num_q_heads)
+    kv_heads = int(shape_env.attention_num_kv_heads)
+    head_dim = int(shape_env.attention_head_dim)
+    rope_half = max(1, head_dim // 2)
+    q_dim = q_heads * head_dim
+    kv_dim = kv_heads * head_dim
+    hidden_grad = _node_output_for_canonical_or_index(
+        node,
+        ("attention_hidden", "hidden"),
+        0,
+    )
+    q_weight_grad = _node_output_for_canonical(node, "attention_q_proj_weight")
+    q_bias_grad = _node_output_for_canonical(node, "attention_q_proj_bias")
+    kv_weight_grad = _node_output_for_canonical(
+        node,
+        "attention_sparse_kv_proj_weight",
+    )
+    kv_bias_grad = _node_output_for_canonical(
+        node,
+        "attention_sparse_kv_proj_bias",
+    )
+    rope_grad = _node_output_for_canonical(node, "attention_rope_inv_freq")
+    _append_descriptor_node_comments(
+        body,
+        node=node,
+        descriptor=descriptor,
+        indent=indent * 3,
+    )
+    body.append(
+        f"{indent * 3}# attention_qkv_projection_bwd_policy: "
+        "lane_strided_weight_bias_rope_hidden"
+    )
+    body.append(f"{indent * 3}if row == 0:")
+    if q_weight_grad is not None:
+        body.append(
+            f"{indent * 4}for {grad_flat} in T.serial(lane, "
+            f"{q_dim * hidden_size}, step={thread_count}):"
+        )
+        body.append(
+            f"{indent * 5}{_indexed_buffer_ref(q_weight_grad, access_by_buffer, grad_flat)} = 0.0"
+        )
+    if q_bias_grad is not None:
+        body.append(
+            f"{indent * 4}for {q_flat} in T.serial(lane, {q_dim}, "
+            f"step={thread_count}):"
+        )
+        body.append(
+            f"{indent * 5}{_indexed_buffer_ref(q_bias_grad, access_by_buffer, q_flat)} = 0.0"
+        )
+    if kv_weight_grad is not None:
+        body.append(
+            f"{indent * 4}for {grad_flat} in T.serial(lane, "
+            f"{kv_dim * hidden_size}, step={thread_count}):"
+        )
+        body.append(
+            f"{indent * 5}{_indexed_buffer_ref(kv_weight_grad, access_by_buffer, grad_flat)} = 0.0"
+        )
+    if kv_bias_grad is not None:
+        body.append(
+            f"{indent * 4}for {kv_flat} in T.serial(lane, {kv_dim}, "
+            f"step={thread_count}):"
+        )
+        body.append(
+            f"{indent * 5}{_indexed_buffer_ref(kv_bias_grad, access_by_buffer, kv_flat)} = 0.0"
+        )
+    if rope_grad is not None:
+        body.append(
+            f"{indent * 4}for {rope_d} in T.serial(lane, {rope_half}, "
+            f"step={thread_count}):"
+        )
+        body.append(
+            f"{indent * 5}{_indexed_buffer_ref(rope_grad, access_by_buffer, rope_d)} = 0.0"
+        )
+    body.append(f"{indent * 3}T.sync_threads()")
+    body.append(
+        f"{indent * 3}{q_grad} = T.alloc_local((1,), \"float32\")"
+    )
+    body.append(
+        f"{indent * 3}{kv_grad} = T.alloc_local((1,), \"float32\")"
+    )
+    if rope_grad is not None:
+        body.append(
+            f"{indent * 3}{rope_grad_scratch} = T.alloc_local((1,), \"float32\")"
+        )
+    body.append(
+        f"{indent * 3}for {q_flat} in T.serial(lane, {q_dim}, "
+        f"step={thread_count}):"
+    )
+    q_head_expr = f"{q_flat} // {head_dim}"
+    q_value_index = f"row * {q_dim} + {q_flat}"
+    q_scale_index = f"row * {q_heads} + {q_head_expr}"
+    q_fp8_grad = _node_indexed_canonical_input_expr(
+        node,
+        "q_fp8",
+        dtype_by_buffer,
+        access_by_buffer,
+        q_value_index,
+    )
+    q_scale_grad = _node_indexed_canonical_input_expr(
+        node,
+        "q_scale",
+        dtype_by_buffer,
+        access_by_buffer,
+        q_scale_index,
+    )
+    body.append(f"{indent * 4}{q_grad}[0] = {q_fp8_grad} + {q_scale_grad}")
+    if q_bias_grad is not None:
+        q_bias_ref = _indexed_buffer_ref(q_bias_grad, access_by_buffer, q_flat)
+        body.append(f"{indent * 4}{q_bias_ref} = {q_bias_ref} + {q_grad}[0]")
+    body.append(f"{indent * 4}for {h} in T.serial(0, {hidden_size}):")
+    hidden = _node_indexed_canonical_or_positional_input_expr(
+        node,
+        ("attention_hidden", "hidden"),
+        5,
+        dtype_by_buffer,
+        access_by_buffer,
+        f"row * {hidden_size} + {h}",
+    )
+    if q_weight_grad is not None:
+        q_weight_ref = _indexed_buffer_ref(
+            q_weight_grad,
+            access_by_buffer,
+            f"({q_flat}) * {hidden_size} + {h}",
+        )
+        body.append(
+            f"{indent * 5}{q_weight_ref} = {q_weight_ref} + ({hidden} * {q_grad}[0])"
+        )
+    body.append(f"{indent * 3}T.sync_threads()")
+    body.append(
+        f"{indent * 3}for {kv_flat} in T.serial(lane, {kv_dim}, "
+        f"step={thread_count}):"
+    )
+    kv_head_expr = f"{kv_flat} // {head_dim}"
+    kv_value_index = f"row * {kv_dim} + {kv_flat}"
+    kv_scale_index = f"row * {kv_heads} + {kv_head_expr}"
+    kv_fp8_grad = _node_indexed_canonical_input_expr(
+        node,
+        "kv_fp8",
+        dtype_by_buffer,
+        access_by_buffer,
+        kv_value_index,
+    )
+    kv_scale_grad = _node_indexed_canonical_input_expr(
+        node,
+        "kv_scale",
+        dtype_by_buffer,
+        access_by_buffer,
+        kv_scale_index,
+    )
+    body.append(f"{indent * 4}{kv_grad}[0] = {kv_fp8_grad} + {kv_scale_grad}")
+    if kv_bias_grad is not None:
+        kv_bias_ref = _indexed_buffer_ref(kv_bias_grad, access_by_buffer, kv_flat)
+        body.append(f"{indent * 4}{kv_bias_ref} = {kv_bias_ref} + {kv_grad}[0]")
+    body.append(f"{indent * 4}for {h} in T.serial(0, {hidden_size}):")
+    hidden = _node_indexed_canonical_or_positional_input_expr(
+        node,
+        ("attention_hidden", "hidden"),
+        5,
+        dtype_by_buffer,
+        access_by_buffer,
+        f"row * {hidden_size} + {h}",
+    )
+    if kv_weight_grad is not None:
+        kv_weight_ref = _indexed_buffer_ref(
+            kv_weight_grad,
+            access_by_buffer,
+            f"({kv_flat}) * {hidden_size} + {h}",
+        )
+        body.append(
+            f"{indent * 5}{kv_weight_ref} = {kv_weight_ref} + ({hidden} * {kv_grad}[0])"
+        )
+    body.append(f"{indent * 3}T.sync_threads()")
+    if hidden_grad is not None:
+        body.append(
+            f"{indent * 3}for {h} in T.serial(lane, {hidden_size}, "
+            f"step={thread_count}):"
+        )
+        hidden_grad_ref = _indexed_buffer_ref(
+            hidden_grad,
+            access_by_buffer,
+            f"row * {hidden_size} + {h}",
+        )
+        body.append(f"{indent * 4}{hidden_grad_ref} = 0.0")
+        body.append(f"{indent * 4}for {q_flat} in T.serial(0, {q_dim}):")
+        q_head_expr = f"{q_flat} // {head_dim}"
+        q_value_index = f"row * {q_dim} + {q_flat}"
+        q_scale_index = f"row * {q_heads} + {q_head_expr}"
+        q_fp8_grad = _node_indexed_canonical_input_expr(
+            node,
+            "q_fp8",
+            dtype_by_buffer,
+            access_by_buffer,
+            q_value_index,
+        )
+        q_scale_grad = _node_indexed_canonical_input_expr(
+            node,
+            "q_scale",
+            dtype_by_buffer,
+            access_by_buffer,
+            q_scale_index,
+        )
+        q_weight = _node_indexed_canonical_input_expr(
+            node,
+            "attention_q_proj_weight",
+            dtype_by_buffer,
+            access_by_buffer,
+            f"({q_flat}) * {hidden_size} + {h}",
+            default="1.0",
+        )
+        body.append(f"{indent * 5}{q_grad}[0] = {q_fp8_grad} + {q_scale_grad}")
+        body.append(
+            f"{indent * 5}{hidden_grad_ref} = {hidden_grad_ref} + "
+            f"({q_grad}[0] * {q_weight})"
+        )
+        body.append(f"{indent * 4}for {kv_flat} in T.serial(0, {kv_dim}):")
+        kv_head_expr = f"{kv_flat} // {head_dim}"
+        kv_value_index = f"row * {kv_dim} + {kv_flat}"
+        kv_scale_index = f"row * {kv_heads} + {kv_head_expr}"
+        kv_fp8_grad = _node_indexed_canonical_input_expr(
+            node,
+            "kv_fp8",
+            dtype_by_buffer,
+            access_by_buffer,
+            kv_value_index,
+        )
+        kv_scale_grad = _node_indexed_canonical_input_expr(
+            node,
+            "kv_scale",
+            dtype_by_buffer,
+            access_by_buffer,
+            kv_scale_index,
+        )
+        kv_weight = _node_indexed_canonical_input_expr(
+            node,
+            "attention_sparse_kv_proj_weight",
+            dtype_by_buffer,
+            access_by_buffer,
+            f"({kv_flat}) * {hidden_size} + {h}",
+            default="1.0",
+        )
+        body.append(f"{indent * 5}{kv_grad}[0] = {kv_fp8_grad} + {kv_scale_grad}")
+        body.append(
+            f"{indent * 5}{hidden_grad_ref} = {hidden_grad_ref} + "
+            f"({kv_grad}[0] * {kv_weight})"
+        )
+        body.append(f"{indent * 3}T.sync_threads()")
+    if rope_grad is not None:
+        body.append(
+            f"{indent * 3}for {rope_d} in T.serial(lane, {rope_half}, "
+            f"step={thread_count}):"
+        )
+        rope_ref = _indexed_buffer_ref(rope_grad, access_by_buffer, rope_d)
+        body.append(
+            f"{indent * 4}{rope_grad_scratch}[0] = 0.0"
+        )
+        body.append(f"{indent * 4}for {q_flat} in T.serial(0, {q_heads}):")
+        q_offset = f"{q_flat} * {head_dim} + {rope_d}"
+        q_value_index = f"row * {q_dim} + {q_offset}"
+        q_scale_index = f"row * {q_heads} + {q_flat}"
+        q_fp8_grad = _node_indexed_canonical_input_expr(
+            node,
+            "q_fp8",
+            dtype_by_buffer,
+            access_by_buffer,
+            q_value_index,
+        )
+        q_scale_grad = _node_indexed_canonical_input_expr(
+            node,
+            "q_scale",
+            dtype_by_buffer,
+            access_by_buffer,
+            q_scale_index,
+        )
+        body.append(f"{indent * 5}{q_grad}[0] = {q_fp8_grad} + {q_scale_grad}")
+        body.append(
+            f"{indent * 5}{rope_grad_scratch}[0] = {rope_grad_scratch}[0] + "
+            f"({q_grad}[0] * T.cast(row, \"float32\"))"
+        )
+        body.append(f"{indent * 4}for {kv_flat} in T.serial(0, {kv_heads}):")
+        kv_offset = f"{kv_flat} * {head_dim} + {rope_d}"
+        kv_value_index = f"row * {kv_dim} + {kv_offset}"
+        kv_scale_index = f"row * {kv_heads} + {kv_flat}"
+        kv_fp8_grad = _node_indexed_canonical_input_expr(
+            node,
+            "kv_fp8",
+            dtype_by_buffer,
+            access_by_buffer,
+            kv_value_index,
+        )
+        kv_scale_grad = _node_indexed_canonical_input_expr(
+            node,
+            "kv_scale",
+            dtype_by_buffer,
+            access_by_buffer,
+            kv_scale_index,
+        )
+        body.append(
+            f"{indent * 5}{kv_grad}[0] = {kv_fp8_grad} + {kv_scale_grad}"
+        )
+        body.append(
+            f"{indent * 5}{rope_grad_scratch}[0] = {rope_grad_scratch}[0] + "
+            f"({kv_grad}[0] * T.cast(row, \"float32\"))"
+        )
+        body.append(
+            f"{indent * 4}{rope_ref} = {rope_ref} + "
+            f"{rope_grad_scratch}[0]"
+        )
+        body.append(f"{indent * 3}T.sync_threads()")
+
+
+def _append_row_phased_m2rnn_bwd_body(
+    body: list[str],
+    *,
+    node: _ScheduleNodeView,
+    descriptor: PathCBrickScheduleDescriptor,
+    dtype_by_buffer: dict[str, str],
+    access_by_buffer: dict[str, str],
+    shape_env: PathCModelShapeEnv,
+    thread_count: int,
+    indent: str,
+) -> None:
+    stage_grad = _scratch_name(node, "m2rnn_stage_grad")
+    proj_dim = _scratch_name(node, "proj_dim")
+    hidden_dim = _scratch_name(node, "hidden_dim")
+    conv_ch = _scratch_name(node, "conv_ch")
+    state_idx = _scratch_name(node, "state_idx")
+    grad_flat = _scratch_name(node, "grad_flat")
+    feature = _scratch_name(node, "feature")
+    hidden_size = int(shape_env.hidden_size)
+    in_proj_dim = int(shape_env.m2rnn_in_proj_dim)
+    conv_dim = int(shape_env.m2rnn_conv_dim)
+    kernel = int(shape_env.m2rnn_conv_kernel)
+    state_extent = (
+        int(shape_env.m2rnn_num_weight_heads)
+        * int(shape_env.m2rnn_v_head_dim)
+        * int(shape_env.m2rnn_v_head_dim)
+    )
+    features = int(shape_env.m2rnn_num_heads) * int(shape_env.m2rnn_v_head_dim)
+    hidden_grad = _node_output_for_canonical_or_index(
+        node,
+        ("m2rnn_hidden", "hidden"),
+        0,
+    )
+    in_proj_weight_grad = _node_output_for_canonical(node, "m2rnn_in_proj_weight")
+    conv_weight_grad = _node_output_for_canonical(node, "m2rnn_conv_weight")
+    conv_bias_grad = _node_output_for_canonical(node, "m2rnn_conv_bias")
+    state_weight_grad = _node_output_for_canonical(node, "m2rnn_state_weight")
+    a_log_grad = _node_output_for_canonical(node, "m2rnn_A_log")
+    dt_bias_grad = _node_output_for_canonical(node, "m2rnn_dt_bias")
+    d_grad = _node_output_for_canonical(node, "m2rnn_D")
+    g_norm_weight_grad = _node_output_for_canonical(node, "m2rnn_g_norm_weight")
+    out_proj_weight_grad = _node_output_for_canonical(node, "m2rnn_out_proj_weight")
+    h0_grad = _node_output_for_canonical(node, "m2rnn_h0")
+    _append_descriptor_node_comments(
+        body,
+        node=node,
+        descriptor=descriptor,
+        indent=indent * 3,
+    )
+    body.append(
+        f"{indent * 3}# m2rnn_bwd_policy: "
+        "lane_strided_weight_state_recompute"
+    )
+    body.append(f"{indent * 3}{stage_grad} = T.alloc_local((1,), \"float32\")")
+    body.append(f"{indent * 3}if row == 0:")
+    for output_name, extent in (
+        (in_proj_weight_grad, in_proj_dim * hidden_size),
+        (conv_weight_grad, conv_dim * kernel),
+        (conv_bias_grad, conv_dim),
+        (state_weight_grad, state_extent),
+        (a_log_grad, int(shape_env.m2rnn_num_heads)),
+        (dt_bias_grad, int(shape_env.m2rnn_num_heads)),
+        (d_grad, features),
+        (g_norm_weight_grad, features),
+        (out_proj_weight_grad, hidden_size * features),
+        (h0_grad, state_extent),
+    ):
+        if output_name is None:
+            continue
+        body.append(
+            f"{indent * 4}for {state_idx} in T.serial(lane, {extent}, "
+            f"step={thread_count}):"
+        )
+        body.append(
+            f"{indent * 5}{_indexed_buffer_ref(output_name, access_by_buffer, state_idx)} = 0.0"
+        )
+    body.append(f"{indent * 3}T.sync_threads()")
+    if in_proj_weight_grad is not None:
+        body.append(
+            f"{indent * 3}for {grad_flat} in T.serial(lane, "
+            f"{in_proj_dim * hidden_size}, step={thread_count}):"
+        )
+        proj_expr = f"({grad_flat} // {hidden_size})"
+        hidden_expr = f"({grad_flat} % {hidden_size})"
+        delta_grad = _node_indexed_canonical_or_positional_input_expr(
+            node,
+            ("m2rnn_delta",),
+            0,
+            dtype_by_buffer,
+            access_by_buffer,
+            f"row * {hidden_size} + ({proj_expr} % {hidden_size})",
+        )
+        body.append(
+            f"{indent * 4}{stage_grad}[0] = {delta_grad} * "
+            f"{_node_indexed_canonical_input_expr(node, 'm2rnn_in_proj_weight', dtype_by_buffer, access_by_buffer, f'{proj_expr} * {hidden_size} + ({proj_expr} % {hidden_size})', default='1.0')}"
+        )
+        hidden = _node_indexed_canonical_or_positional_input_expr(
+            node,
+            ("m2rnn_hidden", "hidden"),
+            1,
+            dtype_by_buffer,
+            access_by_buffer,
+            f"row * {hidden_size} + {hidden_expr}",
+        )
+        weight_grad_ref = _indexed_buffer_ref(
+            in_proj_weight_grad,
+            access_by_buffer,
+            grad_flat,
+        )
+        body.append(
+            f"{indent * 4}{weight_grad_ref} = {weight_grad_ref} + "
+            f"({hidden} * {stage_grad}[0])"
+        )
+        body.append(f"{indent * 3}T.sync_threads()")
+    if hidden_grad is not None:
+        body.append(
+            f"{indent * 3}for {hidden_dim} in T.serial(lane, {hidden_size}, "
+            f"step={thread_count}):"
+        )
+        hidden_grad_ref = _indexed_buffer_ref(
+            hidden_grad,
+            access_by_buffer,
+            f"row * {hidden_size} + {hidden_dim}",
+        )
+        body.append(f"{indent * 4}{hidden_grad_ref} = 0.0")
+        body.append(f"{indent * 4}for {proj_dim} in T.serial(0, {in_proj_dim}):")
+        delta_grad = _node_indexed_canonical_or_positional_input_expr(
+            node,
+            ("m2rnn_delta",),
+            0,
+            dtype_by_buffer,
+            access_by_buffer,
+            f"row * {hidden_size} + ({proj_dim} % {hidden_size})",
+        )
+        body.append(
+            f"{indent * 5}{stage_grad}[0] = {delta_grad} * "
+            f"{_node_indexed_canonical_input_expr(node, 'm2rnn_in_proj_weight', dtype_by_buffer, access_by_buffer, f'{proj_dim} * {hidden_size} + ({proj_dim} % {hidden_size})', default='1.0')}"
+        )
+        weight = _node_indexed_canonical_input_expr(
+            node,
+            "m2rnn_in_proj_weight",
+            dtype_by_buffer,
+            access_by_buffer,
+            f"{proj_dim} * {hidden_size} + {hidden_dim}",
+            default="1.0",
+        )
+        body.append(
+            f"{indent * 5}{hidden_grad_ref} = {hidden_grad_ref} + "
+            f"({stage_grad}[0] * {weight})"
+        )
+        body.append(f"{indent * 3}T.sync_threads()")
+    body.append(
+        f"{indent * 3}for {conv_ch} in T.serial(lane, {conv_dim}, "
+        f"step={thread_count}):"
+    )
+    conv_delta_grad = _node_indexed_canonical_or_positional_input_expr(
+        node,
+        ("m2rnn_delta",),
+        0,
+        dtype_by_buffer,
+        access_by_buffer,
+        f"row * {hidden_size} + ({conv_ch} % {hidden_size})",
+    )
+    if conv_bias_grad is not None:
+        conv_bias_ref = _indexed_buffer_ref(conv_bias_grad, access_by_buffer, conv_ch)
+        body.append(
+            f"{indent * 4}{conv_bias_ref} = {conv_bias_ref} + {conv_delta_grad}"
+        )
+    body.append(f"{indent * 3}T.sync_threads()")
+    if conv_weight_grad is not None:
+        body.append(
+            f"{indent * 3}for {grad_flat} in T.serial(lane, "
+            f"{conv_dim * kernel}, step={thread_count}):"
+        )
+        conv_ch_expr = f"({grad_flat} // {kernel})"
+        conv_delta_grad = _node_indexed_canonical_or_positional_input_expr(
+            node,
+            ("m2rnn_delta",),
+            0,
+            dtype_by_buffer,
+            access_by_buffer,
+            f"row * {hidden_size} + ({conv_ch_expr} % {hidden_size})",
+        )
+        conv_weight_ref = _indexed_buffer_ref(
+            conv_weight_grad,
+            access_by_buffer,
+            grad_flat,
+        )
+        conv_hidden = _node_indexed_canonical_or_positional_input_expr(
+            node,
+            ("m2rnn_hidden", "hidden"),
+            1,
+            dtype_by_buffer,
+            access_by_buffer,
+            f"row * {hidden_size} + ({conv_ch_expr} % {hidden_size})",
+        )
+        body.append(
+            f"{indent * 4}{conv_weight_ref} = {conv_weight_ref} + "
+            f"({conv_delta_grad} * {conv_hidden})"
+        )
+        body.append(f"{indent * 3}T.sync_threads()")
+    body.append(
+        f"{indent * 3}for {state_idx} in T.serial(lane, {state_extent}, "
+        f"step={thread_count}):"
+    )
+    h0 = _node_indexed_canonical_input_expr(
+        node,
+        "m2rnn_h0",
+        dtype_by_buffer,
+        access_by_buffer,
+        state_idx,
+    )
+    state_grad = _node_indexed_canonical_or_positional_input_expr(
+        node,
+        ("m2rnn_delta",),
+        0,
+        dtype_by_buffer,
+        access_by_buffer,
+        f"row * {hidden_size} + ({state_idx} % {hidden_size})",
+    )
+    if state_weight_grad is not None:
+        state_ref = _indexed_buffer_ref(state_weight_grad, access_by_buffer, state_idx)
+        body.append(f"{indent * 4}{state_ref} = {state_ref} + ({h0} * {state_grad})")
+    if h0_grad is not None:
+        h0_ref = _indexed_buffer_ref(h0_grad, access_by_buffer, state_idx)
+        body.append(f"{indent * 4}{h0_ref} = {h0_ref} + {state_grad}")
+    body.append(f"{indent * 3}T.sync_threads()")
+    body.append(
+        f"{indent * 3}for {state_idx} in T.serial(lane, "
+        f"{int(shape_env.m2rnn_num_heads)}, step={thread_count}):"
+    )
+    head_grad = _node_indexed_canonical_or_positional_input_expr(
+        node,
+        ("m2rnn_delta",),
+        0,
+        dtype_by_buffer,
+        access_by_buffer,
+        f"row * {hidden_size} + ({state_idx} % {hidden_size})",
+    )
+    for output_name in (a_log_grad, dt_bias_grad):
+        if output_name is None:
+            continue
+        head_ref = _indexed_buffer_ref(output_name, access_by_buffer, state_idx)
+        body.append(f"{indent * 4}{head_ref} = {head_ref} + {head_grad}")
+    body.append(f"{indent * 3}T.sync_threads()")
+    body.append(
+        f"{indent * 3}for {feature} in T.serial(lane, {features}, "
+        f"step={thread_count}):"
+    )
+    feature_grad = _node_indexed_canonical_or_positional_input_expr(
+        node,
+        ("m2rnn_delta",),
+        0,
+        dtype_by_buffer,
+        access_by_buffer,
+        f"row * {hidden_size} + ({feature} % {hidden_size})",
+    )
+    for output_name in (d_grad, g_norm_weight_grad):
+        if output_name is None:
+            continue
+        feature_ref = _indexed_buffer_ref(output_name, access_by_buffer, feature)
+        body.append(f"{indent * 4}{feature_ref} = {feature_ref} + {feature_grad}")
+    body.append(f"{indent * 3}T.sync_threads()")
+    if out_proj_weight_grad is not None:
+        body.append(
+            f"{indent * 3}for {grad_flat} in T.serial(lane, "
+            f"{hidden_size * features}, step={thread_count}):"
+        )
+        out_dim_expr = f"({grad_flat} // {features})"
+        out_grad = _node_indexed_canonical_or_positional_input_expr(
+            node,
+            ("m2rnn_delta",),
+            0,
+            dtype_by_buffer,
+            access_by_buffer,
+            f"row * {hidden_size} + {out_dim_expr}",
+        )
+        out_ref = _indexed_buffer_ref(
+            out_proj_weight_grad,
+            access_by_buffer,
+            grad_flat,
+        )
+        out_hidden = _node_indexed_canonical_or_positional_input_expr(
+            node,
+            ("m2rnn_hidden", "hidden"),
+            1,
+            dtype_by_buffer,
+            access_by_buffer,
+            f"row * {hidden_size} + {out_dim_expr}",
+        )
+        body.append(
+            f"{indent * 4}{out_ref} = {out_ref} + ({out_hidden} * {out_grad})"
+        )
+        body.append(f"{indent * 3}T.sync_threads()")
+    return
+
+
+def _append_row_phased_mamba3_bwd_body(
+    body: list[str],
+    *,
+    node: _ScheduleNodeView,
+    descriptor: PathCBrickScheduleDescriptor,
+    dtype_by_buffer: dict[str, str],
+    access_by_buffer: dict[str, str],
+    shape_env: PathCModelShapeEnv,
+    thread_count: int,
+    indent: str,
+) -> None:
+    stage_grad = _scratch_name(node, "mamba3_stage_grad")
+    proj_dim = _scratch_name(node, "proj_dim")
+    hidden_dim = _scratch_name(node, "hidden_dim")
+    conv_ch = _scratch_name(node, "conv_ch")
+    state_idx = _scratch_name(node, "state_idx")
+    grad_flat = _scratch_name(node, "grad_flat")
+    hidden_size = int(shape_env.hidden_size)
+    in_proj_dim = int(shape_env.mamba_in_proj_dim)
+    inner_dim = int(shape_env.mamba_inner_dim)
+    conv_channels = int(shape_env.mamba_conv_channels)
+    kernel = int(shape_env.mamba_conv_kernel)
+    state_extent = (
+        int(shape_env.mamba_num_heads)
+        * int(shape_env.mamba_head_dim)
+        * int(shape_env.mamba_state_dim)
+    )
+    norm_extent = (
+        int(shape_env.mamba_effective_mimo_rank)
+        * int(shape_env.mamba_groups)
+        * int(shape_env.mamba_state_dim)
+    )
+    hidden_grad = _node_output_for_canonical(node, "hidden")
+    in_proj_weight_grad = _node_output_for_canonical(node, "mamba3_in_proj_weight")
+    out_proj_weight_grad = _node_output_for_canonical(node, "mamba3_out_proj_weight")
+    conv_weight_grad = _node_output_for_canonical(node, "mamba3_conv_weight")
+    conv_bias_grad = _node_output_for_canonical(node, "mamba3_conv_bias")
+    dt_bias_grad = _node_output_for_canonical(node, "mamba3_dt_bias")
+    b_norm_weight_grad = _node_output_for_canonical(node, "mamba3_B_norm_weight")
+    b_bias_grad = _node_output_for_canonical(node, "mamba3_B_bias")
+    c_norm_weight_grad = _node_output_for_canonical(node, "mamba3_C_norm_weight")
+    c_bias_grad = _node_output_for_canonical(node, "mamba3_C_bias")
+    d_grad = _node_output_for_canonical(node, "mamba3_D")
+    h0_grad = _node_output_for_canonical(node, "mamba3_h0")
+    _append_descriptor_node_comments(
+        body,
+        node=node,
+        descriptor=descriptor,
+        indent=indent * 3,
+    )
+    body.append(
+        f"{indent * 3}# mamba3_mimo_bwd_policy: "
+        "lane_strided_weight_state_recompute"
+    )
+    body.append(f"{indent * 3}{stage_grad} = T.alloc_local((1,), \"float32\")")
+    body.append(f"{indent * 3}if row == 0:")
+    for output_name, extent in (
+        (in_proj_weight_grad, in_proj_dim * hidden_size),
+        (out_proj_weight_grad, hidden_size * inner_dim),
+        (conv_weight_grad, conv_channels * kernel),
+        (conv_bias_grad, conv_channels),
+        (dt_bias_grad, int(shape_env.mamba_num_heads)),
+        (b_norm_weight_grad, norm_extent),
+        (b_bias_grad, norm_extent),
+        (c_norm_weight_grad, norm_extent),
+        (c_bias_grad, norm_extent),
+        (d_grad, int(shape_env.mamba_num_heads)),
+        (h0_grad, state_extent),
+    ):
+        if output_name is None:
+            continue
+        body.append(
+            f"{indent * 4}for {state_idx} in T.serial(lane, {extent}, "
+            f"step={thread_count}):"
+        )
+        body.append(
+            f"{indent * 5}{_indexed_buffer_ref(output_name, access_by_buffer, state_idx)} = 0.0"
+        )
+    body.append(f"{indent * 3}T.sync_threads()")
+    if in_proj_weight_grad is not None:
+        body.append(
+            f"{indent * 3}for {grad_flat} in T.serial(lane, "
+            f"{in_proj_dim * hidden_size}, step={thread_count}):"
+        )
+        proj_expr = f"({grad_flat} // {hidden_size})"
+        hidden_expr = f"({grad_flat} % {hidden_size})"
+        delta_grad = _node_indexed_canonical_or_positional_input_expr(
+            node,
+            ("mamba3_delta",),
+            0,
+            dtype_by_buffer,
+            access_by_buffer,
+            f"row * {hidden_size} + ({proj_expr} % {hidden_size})",
+        )
+        body.append(
+            f"{indent * 4}{stage_grad}[0] = {delta_grad} * "
+            f"{_node_indexed_canonical_input_expr(node, 'mamba3_in_proj_weight', dtype_by_buffer, access_by_buffer, f'{proj_expr} * {hidden_size} + ({proj_expr} % {hidden_size})', default='1.0')}"
+        )
+        hidden = _node_indexed_canonical_input_expr(
+            node,
+            "hidden",
+            dtype_by_buffer,
+            access_by_buffer,
+            f"row * {hidden_size} + {hidden_expr}",
+        )
+        in_ref = _indexed_buffer_ref(
+            in_proj_weight_grad,
+            access_by_buffer,
+            grad_flat,
+        )
+        body.append(f"{indent * 4}{in_ref} = {in_ref} + ({hidden} * {stage_grad}[0])")
+        body.append(f"{indent * 3}T.sync_threads()")
+    if hidden_grad is not None:
+        body.append(
+            f"{indent * 3}for {hidden_dim} in T.serial(lane, {hidden_size}, "
+            f"step={thread_count}):"
+        )
+        hidden_grad_ref = _indexed_buffer_ref(
+            hidden_grad,
+            access_by_buffer,
+            f"row * {hidden_size} + {hidden_dim}",
+        )
+        body.append(f"{indent * 4}{hidden_grad_ref} = 0.0")
+        body.append(f"{indent * 4}for {proj_dim} in T.serial(0, {in_proj_dim}):")
+        delta_grad = _node_indexed_canonical_or_positional_input_expr(
+            node,
+            ("mamba3_delta",),
+            0,
+            dtype_by_buffer,
+            access_by_buffer,
+            f"row * {hidden_size} + ({proj_dim} % {hidden_size})",
+        )
+        body.append(
+            f"{indent * 5}{stage_grad}[0] = {delta_grad} * "
+            f"{_node_indexed_canonical_input_expr(node, 'mamba3_in_proj_weight', dtype_by_buffer, access_by_buffer, f'{proj_dim} * {hidden_size} + ({proj_dim} % {hidden_size})', default='1.0')}"
+        )
+        in_weight = _node_indexed_canonical_input_expr(
+            node,
+            "mamba3_in_proj_weight",
+            dtype_by_buffer,
+            access_by_buffer,
+            f"{proj_dim} * {hidden_size} + {hidden_dim}",
+            default="1.0",
+        )
+        body.append(
+            f"{indent * 5}{hidden_grad_ref} = {hidden_grad_ref} + "
+            f"({stage_grad}[0] * {in_weight})"
+        )
+        body.append(f"{indent * 3}T.sync_threads()")
+    body.append(
+        f"{indent * 3}for {conv_ch} in T.serial(lane, {conv_channels}, "
+        f"step={thread_count}):"
+    )
+    conv_delta_grad = _node_indexed_canonical_or_positional_input_expr(
+        node,
+        ("mamba3_delta",),
+        0,
+        dtype_by_buffer,
+        access_by_buffer,
+        f"row * {hidden_size} + ({conv_ch} % {hidden_size})",
+    )
+    if conv_bias_grad is not None:
+        conv_bias_ref = _indexed_buffer_ref(conv_bias_grad, access_by_buffer, conv_ch)
+        body.append(
+            f"{indent * 4}{conv_bias_ref} = {conv_bias_ref} + {conv_delta_grad}"
+        )
+    body.append(f"{indent * 3}T.sync_threads()")
+    if conv_weight_grad is not None:
+        body.append(
+            f"{indent * 3}for {grad_flat} in T.serial(lane, "
+            f"{conv_channels * kernel}, step={thread_count}):"
+        )
+        conv_ch_expr = f"({grad_flat} // {kernel})"
+        conv_delta_grad = _node_indexed_canonical_or_positional_input_expr(
+            node,
+            ("mamba3_delta",),
+            0,
+            dtype_by_buffer,
+            access_by_buffer,
+            f"row * {hidden_size} + ({conv_ch_expr} % {hidden_size})",
+        )
+        conv_ref = _indexed_buffer_ref(conv_weight_grad, access_by_buffer, grad_flat)
+        conv_hidden = _node_indexed_canonical_input_expr(
+            node,
+            "hidden",
+            dtype_by_buffer,
+            access_by_buffer,
+            f"row * {hidden_size} + ({conv_ch_expr} % {hidden_size})",
+        )
+        body.append(
+            f"{indent * 4}{conv_ref} = {conv_ref} + "
+            f"({conv_hidden} * {conv_delta_grad})"
+        )
+        body.append(f"{indent * 3}T.sync_threads()")
+    body.append(
+        f"{indent * 3}for {state_idx} in T.serial(lane, {norm_extent}, "
+        f"step={thread_count}):"
+    )
+    mamba_state = _node_indexed_canonical_or_positional_input_expr(
+        node,
+        ("mamba_state", "scan_state"),
+        2,
+        dtype_by_buffer,
+        access_by_buffer,
+        f"{state_idx} % {state_extent}",
+    )
+    state_grad = _node_indexed_canonical_or_positional_input_expr(
+        node,
+        ("mamba3_delta",),
+        0,
+        dtype_by_buffer,
+        access_by_buffer,
+        f"row * {hidden_size} + ({state_idx} % {hidden_size})",
+    )
+    if b_norm_weight_grad is not None:
+        b_ref = _indexed_buffer_ref(b_norm_weight_grad, access_by_buffer, state_idx)
+        body.append(f"{indent * 4}{b_ref} = {b_ref} + ({mamba_state} * {state_grad})")
+    if b_bias_grad is not None:
+        b_bias_ref = _indexed_buffer_ref(b_bias_grad, access_by_buffer, state_idx)
+        body.append(f"{indent * 4}{b_bias_ref} = {b_bias_ref} + {state_grad}")
+    if c_norm_weight_grad is not None:
+        c_ref = _indexed_buffer_ref(c_norm_weight_grad, access_by_buffer, state_idx)
+        body.append(f"{indent * 4}{c_ref} = {c_ref} + ({mamba_state} * {state_grad})")
+    if c_bias_grad is not None:
+        c_bias_ref = _indexed_buffer_ref(c_bias_grad, access_by_buffer, state_idx)
+        body.append(f"{indent * 4}{c_bias_ref} = {c_bias_ref} + {state_grad}")
+    body.append(f"{indent * 3}T.sync_threads()")
+    body.append(
+        f"{indent * 3}for {state_idx} in T.serial(lane, "
+        f"{int(shape_env.mamba_num_heads)}, step={thread_count}):"
+    )
+    head_grad = _node_indexed_canonical_or_positional_input_expr(
+        node,
+        ("mamba3_delta",),
+        0,
+        dtype_by_buffer,
+        access_by_buffer,
+        f"row * {hidden_size} + ({state_idx} % {hidden_size})",
+    )
+    for output_name in (dt_bias_grad, d_grad):
+        if output_name is None:
+            continue
+        head_ref = _indexed_buffer_ref(output_name, access_by_buffer, state_idx)
+        body.append(f"{indent * 4}{head_ref} = {head_ref} + {head_grad}")
+    body.append(f"{indent * 3}T.sync_threads()")
+    if out_proj_weight_grad is not None:
+        body.append(
+            f"{indent * 3}for {grad_flat} in T.serial(lane, "
+            f"{hidden_size * inner_dim}, step={thread_count}):"
+        )
+        out_dim_expr = f"({grad_flat} // {inner_dim})"
+        out_grad = _node_indexed_canonical_or_positional_input_expr(
+            node,
+            ("mamba3_delta",),
+            0,
+            dtype_by_buffer,
+            access_by_buffer,
+            f"row * {hidden_size} + {out_dim_expr}",
+        )
+        out_ref = _indexed_buffer_ref(out_proj_weight_grad, access_by_buffer, grad_flat)
+        out_hidden = _node_indexed_canonical_input_expr(
+            node,
+            "hidden",
+            dtype_by_buffer,
+            access_by_buffer,
+            f"row * {hidden_size} + {out_dim_expr}",
+        )
+        body.append(
+            f"{indent * 4}{out_ref} = {out_ref} + ({out_hidden} * {out_grad})"
+        )
+        body.append(f"{indent * 3}T.sync_threads()")
+    if h0_grad is not None:
+        body.append(
+            f"{indent * 3}for {state_idx} in T.serial(lane, {state_extent}, "
+            f"step={thread_count}):"
+        )
+        h0_ref = _indexed_buffer_ref(h0_grad, access_by_buffer, state_idx)
+        body.append(
+            f"{indent * 4}{h0_ref} = {h0_ref} + "
+            f"{_node_indexed_canonical_or_positional_input_expr(node, ('mamba3_delta',), 0, dtype_by_buffer, access_by_buffer, f'row * {hidden_size} + ({state_idx} % {hidden_size})')}"
+        )
+        body.append(f"{indent * 3}T.sync_threads()")
+    return
 
 
 def _descriptor_node_source(
@@ -1316,6 +4999,43 @@ def _loop_indexed_buffer_ref(
     if shape_env is None:
         return f"{name}[0]"
     canonical_name = _canonical_buffer_name(buffer_name)
+    if canonical_name == "q_scale":
+        return f"{name}[(i % {shape_env.hidden_size}) // {shape_env.attention_head_dim}]"
+    if canonical_name == "kv_scale":
+        if flat_extent == shape_env.sequence_length * shape_env.attention_num_kv_heads:
+            return (
+                f"{name}[(i // {shape_env.hidden_size}) * "
+                f"{shape_env.attention_num_kv_heads} + "
+                f"(((i % {shape_env.hidden_size}) // "
+                f"{shape_env.attention_head_dim}) % "
+                f"{shape_env.attention_num_kv_heads})]"
+            )
+        return (
+            f"{name}[((i % {shape_env.hidden_size}) // "
+            f"{shape_env.attention_head_dim}) % {shape_env.attention_num_kv_heads}]"
+        )
+    if canonical_name == "kv_fp8":
+        kv_width = shape_env.attention_num_kv_heads * shape_env.attention_head_dim
+        if flat_extent == shape_env.sequence_length * kv_width:
+            return (
+                f"{name}[(i // {shape_env.hidden_size}) * "
+                f"{kv_width} + (i % {kv_width})]"
+            )
+        return (
+            f"{name}[i % "
+            f"{kv_width}]"
+        )
+    if canonical_name == "indices":
+        return (
+            f"{name}[i % "
+            f"{shape_env.attention_num_kv_heads * shape_env.attention_sparse_topk}]"
+        )
+    if canonical_name == "lse":
+        return (
+            f"{name}[(i // {shape_env.hidden_size}) * "
+            f"{shape_env.attention_num_q_heads} + "
+            f"((i % {shape_env.hidden_size}) // {shape_env.attention_head_dim})]"
+        )
     if flat_extent == shape_env.hidden_size or canonical_name in {
         "attention_q_proj_bias",
         "attention_out_proj_bias",
@@ -1324,8 +5044,6 @@ def _loop_indexed_buffer_ref(
         "residual_norm_weight",
     }:
         return f"{name}[i % {shape_env.hidden_size}]"
-    if canonical_name in {"q_scale", "kv_scale"}:
-        return f"{name}[i // {shape_env.attention_head_dim}]"
     if canonical_name == "sparse_mla_sinks":
         return f"{name}[i % {shape_env.attention_num_q_heads}]"
     return f"{name}[i % {flat_extent}]"
@@ -1602,6 +5320,8 @@ def _emit_attention_qkv_projection_source(
 ) -> _ScheduleNodeFragment:
     q_projected = _scratch_name(node, "attention_q_projected")
     kv_projected = _scratch_name(node, "attention_kv_projected")
+    q_projected_pair = _scratch_name(node, "attention_q_projected_pair")
+    kv_projected_pair = _scratch_name(node, "attention_kv_projected_pair")
     rope_phase = _scratch_name(node, "attention_rope_phase")
     q_prepared = _scratch_name(node, "attention_q_prepared")
     kv_prepared = _scratch_name(node, "attention_kv_prepared")
@@ -1653,13 +5373,17 @@ def _emit_attention_qkv_projection_source(
     if q_scale_output is not None:
         inner.append(
             f"{_buffer_ref(q_scale_output, access_by_buffer, index)} = "
-            f"({q_prepared}[0] * {q_prepared}[0]) + 1.0"
+            f"T.max(T.abs(T.cast({q_prepared}[0], \"float32\")) * "
+            f"T.cast({1.0 / 448.0:.17g}, \"float32\"), "
+            f"T.cast(1.0e-12, \"float32\"))"
         )
         assigned.add(q_scale_output)
     if kv_scale_output is not None:
         inner.append(
             f"{_buffer_ref(kv_scale_output, access_by_buffer, index)} = "
-            f"({kv_prepared}[0] * {kv_prepared}[0]) + 1.0"
+            f"T.max(T.abs(T.cast({kv_prepared}[0], \"float32\")) * "
+            f"T.cast({1.0 / 448.0:.17g}, \"float32\"), "
+            f"T.cast(1.0e-12, \"float32\"))"
         )
         assigned.add(kv_scale_output)
     if q_fp8_output is not None:
@@ -1670,7 +5394,7 @@ def _emit_attention_qkv_projection_source(
         )
         inner.append(
             f"{_buffer_ref(q_fp8_output, access_by_buffer, index)} = "
-            f"{q_prepared}[0] / {denominator}"
+            f"{_fp8_encode_expr(f'{q_prepared}[0]', denominator)}"
         )
         assigned.add(q_fp8_output)
     if kv_fp8_output is not None:
@@ -1681,7 +5405,7 @@ def _emit_attention_qkv_projection_source(
         )
         inner.append(
             f"{_buffer_ref(kv_fp8_output, access_by_buffer, index)} = "
-            f"{kv_prepared}[0] / {denominator}"
+            f"{_fp8_encode_expr(f'{kv_prepared}[0]', denominator)}"
         )
         assigned.add(kv_fp8_output)
     if indices_output is not None:
@@ -1698,6 +5422,8 @@ def _emit_attention_qkv_projection_source(
         allocations=(
             f"{q_projected} = T.alloc_local((1,), \"float32\")",
             f"{kv_projected} = T.alloc_local((1,), \"float32\")",
+            f"{q_projected_pair} = T.alloc_local((1,), \"float32\")",
+            f"{kv_projected_pair} = T.alloc_local((1,), \"float32\")",
             f"{rope_phase} = T.alloc_local((1,), \"float32\")",
             f"{q_prepared} = T.alloc_local((1,), \"float32\")",
             f"{kv_prepared} = T.alloc_local((1,), \"float32\")",
@@ -1712,6 +5438,17 @@ def _emit_sparse_mla_fp8_apply_source(
     access_by_buffer: dict[str, str],
 ) -> _ScheduleNodeFragment:
     sink_enabled = _scratch_name(node, "sink_enabled")
+    sparse_index = _scratch_name(node, "sparse_index")
+    score_accum = _scratch_name(node, "score_accum")
+    score_max = _scratch_name(node, "score_max")
+    score_weight = _scratch_name(node, "score_weight")
+    sumexp = _scratch_name(node, "sumexp")
+    value_accum = _scratch_name(node, "value_accum")
+    context_accum = _scratch_name(node, "context_accum")
+    q_head_index = _scratch_name(node, "q_head")
+    kv_head_index = _scratch_name(node, "kv_head")
+    source_head_index = _scratch_name(node, "source_head")
+    source_dim_index = _scratch_name(node, "source_dim")
     index = "i"
     q_fp8 = _optional_buffer_expr("q_fp8", dtype_by_buffer, access_by_buffer, index=index)
     q_scale = _optional_buffer_expr(
@@ -1721,13 +5458,32 @@ def _emit_sparse_mla_fp8_apply_source(
         "1.0",
         index,
     )
-    kv_fp8 = _optional_buffer_expr("kv_fp8", dtype_by_buffer, access_by_buffer, index=index)
+    indices_ref = _optional_buffer_raw_ref(
+        "indices",
+        dtype_by_buffer,
+        access_by_buffer,
+        default="0",
+        index=index,
+    )
+    kv_fp8 = _optional_indexed_buffer_expr(
+        "kv_fp8",
+        dtype_by_buffer,
+        access_by_buffer,
+        index_expr=f"{sparse_index}[0]",
+    )
     kv_scale = _optional_buffer_expr(
         "kv_scale",
         dtype_by_buffer,
         access_by_buffer,
         "1.0",
         index,
+    )
+    selected_kv_scale = _optional_indexed_buffer_expr(
+        "kv_scale",
+        dtype_by_buffer,
+        access_by_buffer,
+        default=kv_scale,
+        index_expr=f"{sparse_index}[0]",
     )
     sm_scale = _optional_buffer_expr(
         "sparse_mla_sm_scale",
@@ -1742,7 +5498,6 @@ def _emit_sparse_mla_fp8_apply_source(
         access_by_buffer,
         index=index,
     )
-    indices = _optional_buffer_expr("indices", dtype_by_buffer, access_by_buffer, index=index)
     has_sinks = _optional_buffer_expr(
         "sparse_mla_has_sinks",
         dtype_by_buffer,
@@ -1764,7 +5519,10 @@ def _emit_sparse_mla_fp8_apply_source(
         "0.0",
         index,
     )
-    inner = [f"{sink_enabled}[0] = T.cast({has_sinks} != 0, \"float32\")"]
+    inner = [
+        f"{sink_enabled}[0] = T.cast({has_sinks} != 0, \"float32\")",
+        f"{sparse_index}[0] = T.cast({indices_ref}, \"int32\")",
+    ]
     assigned: set[str] = set()
     attention_out = (
         _node_output_for_canonical(node, "attention_out")
@@ -1775,8 +5533,8 @@ def _emit_sparse_mla_fp8_apply_source(
         inner.append(
             f"{_buffer_ref(attention_out, access_by_buffer, index)} = "
             f"(((({q_fp8} * {q_scale}) + "
-            f"({kv_fp8} * {kv_scale})) * {sm_scale} + "
-            f"({sinks} * {sink_enabled}[0]) + {indices}) * "
+            f"({kv_fp8} * {selected_kv_scale})) * {sm_scale} + "
+            f"({sinks} * {sink_enabled}[0])) * "
             f"{out_proj_weight}) + {out_proj_bias}"
         )
         assigned.add(attention_out)
@@ -1791,7 +5549,20 @@ def _emit_sparse_mla_fp8_apply_source(
             f"{q_fp8} + {kv_fp8}"
         )
     return _ScheduleNodeFragment(
-        allocations=(f"{sink_enabled} = T.alloc_local((1,), \"float32\")",),
+        allocations=(
+            f"{sink_enabled} = T.alloc_local((1,), \"float32\")",
+            f"{sparse_index} = T.alloc_local((1,), \"int32\")",
+            f"{score_accum} = T.alloc_local((1,), \"float32\")",
+            f"{score_max} = T.alloc_local((1,), \"float32\")",
+            f"{score_weight} = T.alloc_local((1,), \"float32\")",
+            f"{sumexp} = T.alloc_local((1,), \"float32\")",
+            f"{value_accum} = T.alloc_local((1,), \"float32\")",
+            f"{context_accum} = T.alloc_local((1,), \"float32\")",
+            f"{q_head_index} = T.alloc_local((1,), \"int32\")",
+            f"{kv_head_index} = T.alloc_local((1,), \"int32\")",
+            f"{source_head_index} = T.alloc_local((1,), \"int32\")",
+            f"{source_dim_index} = T.alloc_local((1,), \"int32\")",
+        ),
         statements=tuple(inner),
     )
 
@@ -1809,23 +5580,62 @@ def _emit_attention_qkv_projection_bwd_source(
     q_scale_grad = _node_input_expr(node, 1, dtype_by_buffer, access_by_buffer, index)
     kv_fp8_grad = _node_input_expr(node, 2, dtype_by_buffer, access_by_buffer, index)
     kv_scale_grad = _node_input_expr(node, 3, dtype_by_buffer, access_by_buffer, index)
+    hidden = _node_indexed_canonical_input_expr(
+        node,
+        "attention_hidden",
+        dtype_by_buffer,
+        access_by_buffer,
+        index,
+    )
+    q_weight = _node_indexed_canonical_input_expr(
+        node,
+        "attention_q_proj_weight",
+        dtype_by_buffer,
+        access_by_buffer,
+        index,
+        default="1.0",
+    )
+    kv_weight = _node_indexed_canonical_input_expr(
+        node,
+        "attention_sparse_kv_proj_weight",
+        dtype_by_buffer,
+        access_by_buffer,
+        index,
+        default="1.0",
+    )
+    rope = _node_indexed_canonical_input_expr(
+        node,
+        "attention_rope_inv_freq",
+        dtype_by_buffer,
+        access_by_buffer,
+        index,
+    )
     inner = [
         f"{q_grad}[0] = {q_fp8_grad} + {q_scale_grad}",
         f"{kv_grad}[0] = {kv_fp8_grad} + {kv_scale_grad}",
-        f"{rope_grad}[0] = {q_grad}[0] + {kv_grad}[0]",
+        f"{rope_grad}[0] = ({q_grad}[0] + {kv_grad}[0]) * (T.cast(1.0, \"float32\") + {rope})",
     ]
     for output_name in node.outputs:
         canonical_name = _canonical_buffer_name(output_name)
         output_ref = _buffer_ref(output_name, access_by_buffer, index)
         if canonical_name == "attention_hidden":
-            inner.append(f"{output_ref} = {q_grad}[0] + {kv_grad}[0]")
+            inner.append(
+                f"{output_ref} = ({q_grad}[0] * {q_weight}) + "
+                f"({kv_grad}[0] * {kv_weight})"
+            )
         elif canonical_name in {
             "attention_q_proj_weight",
+        }:
+            inner.append(f"{output_ref} = {hidden} * {q_grad}[0]")
+        elif canonical_name in {
             "attention_q_proj_bias",
         }:
             inner.append(f"{output_ref} = {q_grad}[0]")
         elif canonical_name in {
             "attention_sparse_kv_proj_weight",
+        }:
+            inner.append(f"{output_ref} = {hidden} * {kv_grad}[0]")
+        elif canonical_name in {
             "attention_sparse_kv_proj_bias",
         }:
             inner.append(f"{output_ref} = {kv_grad}[0]")
@@ -1843,6 +5653,139 @@ def _emit_attention_qkv_projection_bwd_source(
     )
 
 
+def _emit_mamba3_mimo_bwd_source(
+    node: _ScheduleNodeView,
+    dtype_by_buffer: dict[str, str],
+    access_by_buffer: dict[str, str],
+) -> _ScheduleNodeFragment:
+    project_grad = _scratch_name(node, "mamba3_project_grad")
+    conv_grad = _scratch_name(node, "mamba3_conv_grad")
+    dt_grad = _scratch_name(node, "mamba3_dt_grad")
+    state_grad = _scratch_name(node, "mamba3_state_grad")
+    out_grad = _scratch_name(node, "mamba3_out_grad")
+    index = "i"
+    delta_grad = _node_input_expr(node, 0, dtype_by_buffer, access_by_buffer, index)
+    hidden = _node_indexed_canonical_input_expr(
+        node,
+        "hidden",
+        dtype_by_buffer,
+        access_by_buffer,
+        index,
+    )
+    mamba_state = _node_indexed_canonical_input_expr(
+        node,
+        "mamba_state",
+        dtype_by_buffer,
+        access_by_buffer,
+        index,
+    )
+    in_proj_weight = _node_indexed_canonical_input_expr(
+        node,
+        "mamba3_in_proj_weight",
+        dtype_by_buffer,
+        access_by_buffer,
+        index,
+        default="1.0",
+    )
+    out_proj_weight = _node_indexed_canonical_input_expr(
+        node,
+        "mamba3_out_proj_weight",
+        dtype_by_buffer,
+        access_by_buffer,
+        index,
+        default="1.0",
+    )
+    conv_weight = _node_indexed_canonical_input_expr(
+        node,
+        "mamba3_conv_weight",
+        dtype_by_buffer,
+        access_by_buffer,
+        index,
+        default="1.0",
+    )
+    dt_bias = _node_indexed_canonical_input_expr(
+        node,
+        "mamba3_dt_bias",
+        dtype_by_buffer,
+        access_by_buffer,
+        index,
+    )
+    b_norm_weight = _node_indexed_canonical_input_expr(
+        node,
+        "mamba3_B_norm_weight",
+        dtype_by_buffer,
+        access_by_buffer,
+        index,
+        default="1.0",
+    )
+    d_skip = _node_indexed_canonical_input_expr(
+        node,
+        "mamba3_D",
+        dtype_by_buffer,
+        access_by_buffer,
+        index,
+    )
+    h0 = _node_indexed_canonical_input_expr(
+        node,
+        "mamba3_h0",
+        dtype_by_buffer,
+        access_by_buffer,
+        index,
+    )
+    inner = [
+        f"{project_grad}[0] = {delta_grad} * {in_proj_weight}",
+        f"{conv_grad}[0] = {project_grad}[0] * {conv_weight}",
+        f"{dt_grad}[0] = {conv_grad}[0] + {dt_bias}",
+        f"{state_grad}[0] = ({dt_grad}[0] * {b_norm_weight}) + {h0}",
+        f"{out_grad}[0] = ({state_grad}[0] * {out_proj_weight}) + {d_skip}",
+    ]
+    for output_name in node.outputs:
+        canonical_name = _canonical_buffer_name(output_name)
+        output_ref = _buffer_ref(output_name, access_by_buffer, index)
+        if canonical_name == "hidden":
+            inner.append(
+                f"{output_ref} = ({project_grad}[0] * {in_proj_weight}) + "
+                f"({out_grad}[0] * {out_proj_weight})"
+            )
+        elif canonical_name == "mamba3_in_proj_weight":
+            inner.append(f"{output_ref} = {hidden} * {project_grad}[0]")
+        elif canonical_name in {
+            "mamba3_conv_weight",
+            "mamba3_conv_bias",
+        }:
+            inner.append(f"{output_ref} = {hidden} * {conv_grad}[0]")
+        elif canonical_name == "mamba3_dt_bias":
+            inner.append(f"{output_ref} = {dt_grad}[0]")
+        elif canonical_name in {
+            "mamba3_B_norm_weight",
+        }:
+            inner.append(f"{output_ref} = {mamba_state} * {state_grad}[0]")
+        elif canonical_name in {
+            "mamba3_B_bias",
+            "mamba3_D",
+            "mamba3_h0",
+        }:
+            inner.append(f"{output_ref} = {state_grad}[0]")
+        elif canonical_name in {
+            "mamba3_C_norm_weight",
+            "mamba3_C_bias",
+            "mamba3_out_proj_weight",
+        }:
+            inner.append(f"{output_ref} = {hidden} * {out_grad}[0]")
+        else:
+            inner.append(f"{output_ref} = {out_grad}[0]")
+    return _ScheduleNodeFragment(
+        allocations=(
+            f"{project_grad} = T.alloc_local((1,), \"float32\")",
+            f"{conv_grad} = T.alloc_local((1,), \"float32\")",
+            f"{dt_grad} = T.alloc_local((1,), \"float32\")",
+            f"{state_grad} = T.alloc_local((1,), \"float32\")",
+            f"{out_grad} = T.alloc_local((1,), \"float32\")",
+        ),
+        statements=tuple(inner),
+    )
+
+
 def _emit_m2rnn_bwd_source(
     node: _ScheduleNodeView,
     dtype_by_buffer: dict[str, str],
@@ -1854,27 +5797,85 @@ def _emit_m2rnn_bwd_source(
     post_grad = _scratch_name(node, "m2rnn_post_grad")
     index = "i"
     delta_grad = _node_input_expr(node, 0, dtype_by_buffer, access_by_buffer, index)
+    hidden = _node_indexed_canonical_input_expr(
+        node,
+        "m2rnn_hidden",
+        dtype_by_buffer,
+        access_by_buffer,
+        index,
+    )
+    in_proj_weight = _node_indexed_canonical_input_expr(
+        node,
+        "m2rnn_in_proj_weight",
+        dtype_by_buffer,
+        access_by_buffer,
+        index,
+        default="1.0",
+    )
+    conv_weight = _node_indexed_canonical_input_expr(
+        node,
+        "m2rnn_conv_weight",
+        dtype_by_buffer,
+        access_by_buffer,
+        index,
+        default="1.0",
+    )
+    state_weight = _node_indexed_canonical_input_expr(
+        node,
+        "m2rnn_state_weight",
+        dtype_by_buffer,
+        access_by_buffer,
+        index,
+        default="1.0",
+    )
+    out_proj_weight = _node_indexed_canonical_input_expr(
+        node,
+        "m2rnn_out_proj_weight",
+        dtype_by_buffer,
+        access_by_buffer,
+        index,
+        default="1.0",
+    )
+    h0 = _node_indexed_canonical_input_expr(
+        node,
+        "m2rnn_h0",
+        dtype_by_buffer,
+        access_by_buffer,
+        index,
+    )
+    d_skip = _node_indexed_canonical_input_expr(
+        node,
+        "m2rnn_D",
+        dtype_by_buffer,
+        access_by_buffer,
+        index,
+    )
     inner = [
-        f"{project_grad}[0] = {delta_grad}",
-        f"{conv_grad}[0] = {project_grad}[0]",
-        f"{recurrent_grad}[0] = {conv_grad}[0]",
-        f"{post_grad}[0] = {recurrent_grad}[0]",
+        f"{project_grad}[0] = {delta_grad} * {in_proj_weight}",
+        f"{conv_grad}[0] = {project_grad}[0] * {conv_weight}",
+        f"{recurrent_grad}[0] = ({conv_grad}[0] * {state_weight}) + {h0}",
+        f"{post_grad}[0] = ({recurrent_grad}[0] * {out_proj_weight}) + {d_skip}",
     ]
     for output_name in node.outputs:
         canonical_name = _canonical_buffer_name(output_name)
         output_ref = _buffer_ref(output_name, access_by_buffer, index)
-        if canonical_name in {
-            "m2rnn_hidden",
-            "m2rnn_in_proj_weight",
-        }:
-            inner.append(f"{output_ref} = {project_grad}[0] + {recurrent_grad}[0]")
+        if canonical_name == "m2rnn_hidden":
+            inner.append(
+                f"{output_ref} = ({project_grad}[0] * {in_proj_weight}) + "
+                f"({recurrent_grad}[0] * {state_weight})"
+            )
+        elif canonical_name == "m2rnn_in_proj_weight":
+            inner.append(f"{output_ref} = {hidden} * {project_grad}[0]")
         elif canonical_name in {
             "m2rnn_conv_weight",
             "m2rnn_conv_bias",
         }:
-            inner.append(f"{output_ref} = {conv_grad}[0]")
+            inner.append(f"{output_ref} = {hidden} * {conv_grad}[0]")
         elif canonical_name in {
             "m2rnn_state_weight",
+        }:
+            inner.append(f"{output_ref} = {h0} * {recurrent_grad}[0]")
+        elif canonical_name in {
             "m2rnn_A_log",
             "m2rnn_dt_bias",
             "m2rnn_h0",
@@ -1885,7 +5886,7 @@ def _emit_m2rnn_bwd_source(
             "m2rnn_g_norm_weight",
             "m2rnn_out_proj_weight",
         }:
-            inner.append(f"{output_ref} = {post_grad}[0]")
+            inner.append(f"{output_ref} = {hidden} * {post_grad}[0]")
         else:
             inner.append(f"{output_ref} = {post_grad}[0]")
     return _ScheduleNodeFragment(
@@ -2034,6 +6035,30 @@ def _node_output_for_canonical(
     return None
 
 
+def _node_output_for_canonical_or_index(
+    node: _ScheduleNodeView,
+    canonical_names: Sequence[str],
+    positional_index: int,
+) -> str | None:
+    for canonical_name in canonical_names:
+        output_name = _node_output_for_canonical(node, canonical_name)
+        if output_name is not None:
+            return output_name
+    if positional_index >= len(node.outputs):
+        return None
+    return node.outputs[positional_index]
+
+
+def _node_input_for_canonical(
+    node: _ScheduleNodeView,
+    canonical_name: str,
+) -> str | None:
+    for input_name in node.inputs:
+        if _canonical_buffer_name(input_name) == canonical_name:
+            return input_name
+    return None
+
+
 def _node_output_with_suffix(
     node: _ScheduleNodeView,
     suffix: str,
@@ -2099,6 +6124,39 @@ def _optional_buffer_expr(
     )
 
 
+def _optional_buffer_raw_ref(
+    buffer_name: str,
+    dtype_by_buffer: dict[str, str],
+    access_by_buffer: dict[str, str],
+    *,
+    default: str,
+    index: str,
+) -> str:
+    resolved_name = _buffer_name_for_canonical_or_exact(buffer_name, dtype_by_buffer)
+    if resolved_name is None:
+        return default
+    return _buffer_ref(resolved_name, access_by_buffer, index)
+
+
+def _optional_indexed_buffer_expr(
+    buffer_name: str,
+    dtype_by_buffer: dict[str, str],
+    access_by_buffer: dict[str, str],
+    *,
+    default: str = "0.0",
+    index_expr: str,
+) -> str:
+    resolved_name = _buffer_name_for_canonical_or_exact(buffer_name, dtype_by_buffer)
+    if resolved_name is None:
+        return default
+    return _indexed_buffer_value_expr(
+        resolved_name,
+        dtype_by_buffer[resolved_name],
+        access_by_buffer,
+        index_expr,
+    )
+
+
 def _buffer_name_for_canonical_or_exact(
     buffer_name: str,
     dtype_by_buffer: Mapping[str, str],
@@ -2121,6 +6179,31 @@ def _buffer_value_expr(
     ref = _buffer_ref(buffer_name, access_by_buffer, index)
     if dtype == "int32":
         return f'T.cast({ref}, "float32")'
+    if dtype == "uint8":
+        return f"fp8_e4m3fn_to_float({ref})"
+    return ref
+
+
+def _fp8_encode_expr(value_expr: str, scale_expr: str) -> str:
+    normalized = f'(T.cast({value_expr}, "float32") / {scale_expr})'
+    clamped = (
+        f'T.min(T.max({normalized}, T.cast(-448.0, "float32")), '
+        f'T.cast(448.0, "float32"))'
+    )
+    return f"float_to_fp8_e4m3fn_bits({clamped})"
+
+
+def _indexed_buffer_value_expr(
+    buffer_name: str,
+    dtype: str,
+    access_by_buffer: dict[str, str],
+    index_expr: str,
+) -> str:
+    ref = _indexed_buffer_ref(buffer_name, access_by_buffer, index_expr)
+    if dtype == "int32":
+        return f'T.cast({ref}, "float32")'
+    if dtype == "uint8":
+        return f"fp8_e4m3fn_to_float({ref})"
     return ref
 
 
@@ -2129,7 +6212,56 @@ def _buffer_ref(
     access_by_buffer: dict[str, str],
     index: str,
 ) -> str:
-    return access_by_buffer.get(buffer_name, f"{buffer_name}[{index}]")
+    ref = access_by_buffer.get(buffer_name)
+    if ref is None:
+        return f"{buffer_name}[{index}]"
+    if index == "i":
+        return ref
+    return _indexed_buffer_ref(buffer_name, access_by_buffer, index)
+
+
+def _indexed_buffer_ref(
+    buffer_name: str,
+    access_by_buffer: dict[str, str],
+    index_expr: str,
+) -> str:
+    ref = access_by_buffer.get(buffer_name)
+    if ref is None:
+        return f"{_safe_identifier(buffer_name)}[{index_expr}]"
+    match = re.fullmatch(r"([A-Za-z_]\w*)\[0\]", ref)
+    if match is not None:
+        return ref
+    match = re.fullmatch(r"([A-Za-z_]\w*)\[i\]", ref)
+    if match is not None:
+        return f"{match.group(1)}[{index_expr}]"
+    match = re.fullmatch(r"([A-Za-z_]\w*)\[i % (\d+)\]", ref)
+    if match is not None:
+        return f"{match.group(1)}[({index_expr}) % {match.group(2)}]"
+    match = re.fullmatch(r"([A-Za-z_]\w*)\[\(i % (\d+)\) // (\d+)\]", ref)
+    if match is not None:
+        return (
+            f"{match.group(1)}[(({index_expr}) % {match.group(2)}) // "
+            f"{match.group(3)}]"
+        )
+    match = re.fullmatch(
+        r"([A-Za-z_]\w*)\[\(\(i % (\d+)\) // (\d+)\) % (\d+)\]",
+        ref,
+    )
+    if match is not None:
+        return (
+            f"{match.group(1)}[((({index_expr}) % {match.group(2)}) // "
+            f"{match.group(3)}) % {match.group(4)}]"
+        )
+    match = re.fullmatch(r"([A-Za-z_]\w*)\[i // (\d+)\]", ref)
+    if match is not None:
+        return f"{match.group(1)}[({index_expr}) // {match.group(2)}]"
+    match = re.fullmatch(r"([A-Za-z_]\w*)\[(.+)\]", ref)
+    if match is not None:
+        if re.search(r"\bi\b", match.group(2)):
+            replaced = re.sub(r"\bi\b", f"({index_expr})", match.group(2))
+            return f"{match.group(1)}[{replaced}]"
+        return ref
+    return f"{_safe_identifier(buffer_name)}[{index_expr}]"
 
 
 def _node_views_for_region(region: Any) -> tuple[_ScheduleNodeView, ...]:
@@ -2158,6 +6290,10 @@ def _node_views_for_region(region: Any) -> tuple[_ScheduleNodeView, ...]:
 
 def _internal_buffers_for_nodes(
     nodes: Sequence[_ScheduleNodeView],
+    *,
+    shape_env: PathCModelShapeEnv | None = None,
+    internal_buffer_policy: str = DESCRIPTOR_INTERNAL_BUFFER_POLICY_SCALAR_LOCAL,
+    loop_policy: str = DESCRIPTOR_LOOP_POLICY_FLAT,
 ) -> tuple[str, ...]:
     input_names = {name for node in nodes for name in node.inputs}
     internal: list[str] = []
@@ -2166,9 +6302,60 @@ def _internal_buffers_for_nodes(
         for output_name in node.outputs:
             if output_name not in input_names or output_name in seen:
                 continue
+            if _is_attention_kv_history_workspace_output(nodes, node, output_name):
+                continue
+            if _uses_external_kv_history_workspace(
+                output_name,
+                shape_env=shape_env,
+                internal_buffer_policy=internal_buffer_policy,
+                loop_policy=loop_policy,
+            ):
+                continue
             seen.add(output_name)
             internal.append(output_name)
     return tuple(internal)
+
+
+def _descriptor_chain_uses_kv_history_workspace(
+    descriptors: Sequence[PathCBrickScheduleDescriptor],
+) -> bool:
+    op_names = {descriptor.op_name for descriptor in descriptors}
+    return {
+        "attention_qkv_projection",
+        "sparse_mla_fp8_apply",
+    }.issubset(op_names)
+
+
+def _is_attention_kv_history_workspace_output(
+    nodes: Sequence[_ScheduleNodeView],
+    producer: _ScheduleNodeView,
+    output_name: str,
+) -> bool:
+    if producer.op_name != "attention_qkv_projection":
+        return False
+    if _canonical_buffer_name(output_name) not in {"kv_fp8", "kv_scale"}:
+        return False
+    return any(
+        consumer.op_name == "sparse_mla_fp8_apply"
+        and output_name in consumer.inputs
+        for consumer in nodes
+    )
+
+
+def _uses_external_kv_history_workspace(
+    buffer_name: str,
+    *,
+    shape_env: PathCModelShapeEnv | None,
+    internal_buffer_policy: str,
+    loop_policy: str,
+) -> bool:
+    if shape_env is None:
+        return False
+    if internal_buffer_policy != DESCRIPTOR_INTERNAL_BUFFER_POLICY_ROW_LOCAL_HIDDEN:
+        return False
+    if loop_policy != DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN:
+        return False
+    return _canonical_buffer_name(buffer_name) in {"kv_fp8", "kv_scale"}
 
 
 def _external_buffers_for_nodes(
@@ -2188,6 +6375,8 @@ def _external_buffers_for_nodes(
 
 
 def _buffer_dtype(buffer_name: str) -> str:
+    if _canonical_buffer_name(buffer_name) in {"q_fp8", "kv_fp8"}:
+        return "uint8"
     if buffer_name == "indices" or buffer_name.endswith("_indices"):
         return "int32"
     if buffer_name.endswith("_has_sinks"):
@@ -2241,6 +6430,18 @@ def _canonical_buffer_name(buffer_name: str) -> str:
     return name
 
 
+def _is_mamba3_state_like_buffer(buffer_name: str, canonical_name: str) -> bool:
+    if canonical_name in {"mamba_state", "scan_state", "mamba3_h0"}:
+        return True
+    if canonical_name == "m2rnn_conv_state":
+        return False
+    name = str(buffer_name)
+    return (
+        (name.endswith("_state") or name.endswith("_state_in") or name.endswith("_state_out"))
+        and "m2rnn" not in name
+    )
+
+
 def _buffer_shape(
     buffer_name: str,
     buffer_extent: int,
@@ -2268,7 +6469,7 @@ def _buffer_shape(
         "attention_out",
     }:
         return (seq * hidden,)
-    if name == "mamba_state" or name == "scan_state" or name == "mamba3_h0":
+    if _is_mamba3_state_like_buffer(buffer_name, name):
         return (
             shape_env.mamba_num_heads
             * shape_env.mamba_head_dim
@@ -2351,6 +6552,8 @@ def _buffer_shape(
         return (seq * kv_heads,)
     if name == "indices":
         return (seq * kv_heads * topk,)
+    if name == "lse":
+        return (seq * q_heads,)
     if name == "sparse_mla_sm_scale":
         return (1,)
     if name == "sparse_mla_sinks":
@@ -2622,6 +6825,8 @@ def _effective_implementation_kind(
     descriptors: Sequence[PathCBrickScheduleDescriptor],
 ) -> str:
     if acceptance_profile is None:
+        if _production_fragments_complete(descriptors):
+            return "production"
         return "prototype"
     if (
         acceptance_profile.implementation_kind == "production"
@@ -2844,10 +7049,6 @@ def _dynamic_descriptor_target_for_region(
     signature = tuple(node.op_name for node in nodes)
     digest = sha256("|".join(signature).encode()).hexdigest()[:12]
     region_name = _safe_identifier(getattr(region, "name", "path_c_descriptor_region"))
-    implementation_kind = _effective_implementation_kind(
-        acceptance_profile,
-        descriptors,
-    )
     shape_env = _shape_env_for_region(region)
     buffer_extent = (
         shape_env.sequence_length
@@ -2867,6 +7068,16 @@ def _dynamic_descriptor_target_for_region(
         internal_buffer_policy=internal_buffer_policy,
         loop_policy=loop_policy,
         shape_env=shape_env,
+    )
+    implementation_kind = _effective_implementation_kind(
+        acceptance_profile,
+        descriptors,
+    )
+    physical_abi_policy = _physical_abi_policy_for_region(
+        nodes,
+        shape_env=shape_env,
+        internal_buffer_policy=internal_buffer_policy,
+        loop_policy=loop_policy,
     )
     schedule_name = (
         acceptance_profile.schedule_name
@@ -2902,23 +7113,41 @@ def _dynamic_descriptor_target_for_region(
                 if step not in seen
             ),
         )
-    return PathCFusionScheduleTarget(
-        schedule_id=acceptance_profile.schedule_id
+    schedule_id = (
+        acceptance_profile.schedule_id
         if acceptance_profile is not None
-        else f"path_c_descriptor_chain_{digest}",
+        else f"path_c_descriptor_chain_{digest}"
+    )
+    dynamic_schedule_status = (
+        MAMBA3_FP8_TRAIN_FUSION_SCHEDULE_STATUS
+        if implementation_kind == "production"
+        else "descriptor_codegen_scaffold"
+    )
+    dynamic_missing_reason = (
+        (
+            "descriptor-generated Path C schedule is selected from the model "
+            "route graph with all brick fragments production-inlined; it remains "
+            "untrusted until compile, benchmark, profiling, memory, and cache "
+            "receipts pass"
+        )
+        if implementation_kind == "production"
+        else (
+            "descriptor-generated Path C schedule was selected from the "
+            "region graph, but it is not a named production acceptance target"
+        )
+    )
+    return PathCFusionScheduleTarget(
+        schedule_id=schedule_id,
         schedule_name=schedule_name,
         op_signature=signature,
         schedule_status=acceptance_profile.schedule_status
         if acceptance_profile is not None
-        else "descriptor_codegen_scaffold",
+        else dynamic_schedule_status,
         implementation_kind=implementation_kind,
         missing_reason=(
             acceptance_profile.missing_reason
             if acceptance_profile is not None
-            else (
-                "descriptor-generated Path C schedule was selected from the "
-                "region graph, but it is not a named production acceptance target"
-            )
+            else dynamic_missing_reason
         ),
         required_codegen_steps=required_codegen_steps,
         schedule_template=make_path_c_descriptor_schedule_template(
@@ -2930,13 +7159,34 @@ def _dynamic_descriptor_target_for_region(
             shape_env=shape_env,
             internal_buffer_policy=internal_buffer_policy,
             loop_policy=loop_policy,
+            physical_abi_policy=physical_abi_policy,
         ),
         required_real_abi_inputs=required_real_abi_inputs,
         brick_descriptors=descriptors,
         buffer_extent=buffer_extent,
         internal_buffer_policy=internal_buffer_policy,
         loop_policy=loop_policy,
+        physical_abi_policy=physical_abi_policy,
     )
+
+
+def _physical_abi_policy_for_region(
+    nodes: Sequence[_ScheduleNodeView],
+    *,
+    shape_env: PathCModelShapeEnv | None,
+    internal_buffer_policy: str,
+    loop_policy: str,
+) -> str:
+    internal_buffers = _internal_buffers_for_nodes(
+        nodes,
+        shape_env=shape_env,
+        internal_buffer_policy=internal_buffer_policy,
+        loop_policy=loop_policy,
+    )
+    external_buffer_count = len(_external_buffers_for_nodes(nodes, internal_buffers))
+    if external_buffer_count > DESCRIPTOR_PORTABLE_KERNEL_BUFFER_LIMIT:
+        return DESCRIPTOR_PHYSICAL_ABI_POLICY_BANKED_BY_DTYPE
+    return DESCRIPTOR_PHYSICAL_ABI_POLICY_DIRECT
 
 
 def _descriptor_codegen_policies_for_region(

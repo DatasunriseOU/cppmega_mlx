@@ -570,6 +570,62 @@ def selected_schedule_from_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
         "kernel_counts": dict(sorted(kernel_counts.items())),
         "path_counts": dict(sorted(path_counts.items())),
         "op_kernel": dict(sorted(op_kernel.items())),
+        "path_c_fusion": path_c_fusion_summary_from_receipt(receipt),
+    }
+
+
+def path_c_fusion_payload_from_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
+    for section_name in ("training", "workload"):
+        section = receipt.get(section_name)
+        if not isinstance(section, dict):
+            continue
+        route = section.get("fp8_path_c_training_route")
+        if isinstance(route, dict) and isinstance(route.get("path_c_fusion"), dict):
+            return route["path_c_fusion"]
+    return {}
+
+
+def path_c_fusion_summary_from_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
+    fusion = path_c_fusion_payload_from_receipt(receipt)
+    if not fusion:
+        return {}
+    production = fusion.get("production_schedule")
+    if not isinstance(production, dict):
+        production = {}
+    contract = fusion.get("schedule_contract")
+    if not isinstance(contract, dict):
+        contract = {}
+    runtime_binding = fusion.get("runtime_training_binding")
+    if not isinstance(runtime_binding, dict):
+        runtime_binding = {}
+    return {
+        "mode": fusion.get("mode"),
+        "status": fusion.get("status"),
+        "schedule_name": fusion.get("schedule_name"),
+        "schedule_status": fusion.get("schedule_status"),
+        "single_kernel_fused": fusion.get("single_kernel_fused"),
+        "default_allowed": fusion.get("default_allowed"),
+        "schedule_blockers": [
+            item.get("kind")
+            for item in fusion.get("schedule_blockers", [])
+            if isinstance(item, dict)
+        ],
+        "production_schedule_id": production.get("schedule_id"),
+        "implementation_kind": production.get("implementation_kind"),
+        "production_fragments_complete": production.get(
+            "production_fragments_complete"
+        ),
+        "real_abi_contract_complete": production.get(
+            "real_abi_contract_complete"
+        ),
+        "missing_real_abi_inputs": production.get("missing_real_abi_inputs"),
+        "schedule_contract_status": contract.get("status"),
+        "runtime_binding_status": runtime_binding.get("status"),
+        "runtime_uses_fused_train_block": runtime_binding.get(
+            "runtime_uses_fused_train_block"
+        ),
+        "required_bank_buffers": runtime_binding.get("required_bank_buffers"),
+        "missing_bank_buffers": runtime_binding.get("missing_bank_buffers"),
     }
 
 
@@ -578,13 +634,27 @@ def proof_result_from_receipt(receipt: dict[str, Any], *, path: str) -> dict[str
     route = {}
     if isinstance(training, dict):
         route = training.get("fp8_path_c_training_route") or {}
+    fusion_summary = path_c_fusion_summary_from_receipt(receipt)
+    fused_train_block_runtime_available = bool(
+        isinstance(route, dict)
+        and route.get("fused_train_block_runtime_available")
+        or fusion_summary.get("runtime_uses_fused_train_block")
+    )
     return {
         "path": path,
-        "proof_source": "per-kernel TileLang route receipts plus runtime dispatch log",
+        "proof_source": (
+            "per-kernel runtime dispatch log plus Path C fusion planner metadata; "
+            "fused schedule native compile is a separate compile receipt"
+        ),
         "path_c_requested": path.startswith("path_c"),
         "fp8_path_c_route_status": route.get("status") if isinstance(route, dict) else None,
         "kernel_surface_available": (
             route.get("kernel_surface_available") if isinstance(route, dict) else None
+        ),
+        "path_c_fusion": fusion_summary,
+        "runtime_uses_fused_train_block": fused_train_block_runtime_available,
+        "fused_train_block_runtime_available": (
+            fused_train_block_runtime_available
         ),
     }
 

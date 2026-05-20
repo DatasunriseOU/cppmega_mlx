@@ -169,8 +169,43 @@ def test_bench_1b_matrix_extracts_m04_receipt_metrics(
                         }
                     ],
                     "fp8_path_c_training_route": {
-                        "status": "m04_path_c_training_route_available",
+                        "status": "m04_path_c_split_training_route_available",
                         "kernel_surface_available": True,
+                        "path_c_fusion": {
+                            "mode": "auto",
+                            "status": "plan_ready_not_default",
+                            "schedule_name": "fused:descriptor",
+                            "schedule_status": "ready",
+                            "single_kernel_fused": False,
+                            "default_allowed": False,
+                            "runtime_training_binding": {
+                                "status": "model_owned_physical_abi_banks_missing",
+                                "runtime_uses_fused_train_block": False,
+                                "required_bank_buffers": [
+                                    "path_c_float32_abi_bank",
+                                    "path_c_uint8_abi_bank",
+                                    "path_c_int32_abi_bank",
+                                ],
+                                "missing_bank_buffers": [
+                                    "path_c_float32_abi_bank",
+                                    "path_c_uint8_abi_bank",
+                                    "path_c_int32_abi_bank",
+                                ],
+                            },
+                            "schedule_blockers": [
+                                {"kind": "fused_train_block_runtime_not_bound"}
+                            ],
+                            "production_schedule": {
+                                "schedule_id": "path_c_descriptor_chain_abc",
+                                "implementation_kind": "production",
+                                "production_fragments_complete": True,
+                                "real_abi_contract_complete": True,
+                                "missing_real_abi_inputs": [],
+                            },
+                            "schedule_contract": {
+                                "status": "registered_not_lowered"
+                            },
+                        },
                     },
                 },
             }
@@ -204,7 +239,18 @@ def test_bench_1b_matrix_extracts_m04_receipt_metrics(
     assert result.active_memory_gb == 0.5
     assert result.cache_memory_gb == 0.75
     assert result.selected_schedule["kernel_counts"] == {"path_c_tilelang_dsl": 1}
+    assert result.selected_schedule["path_c_fusion"]["production_schedule_id"] == (
+        "path_c_descriptor_chain_abc"
+    )
     assert result.proof_result["path_c_requested"] is True
+    assert result.proof_result["runtime_uses_fused_train_block"] is False
+    assert result.proof_result["fused_train_block_runtime_available"] is False
+    assert result.proof_result["path_c_fusion"]["runtime_binding_status"] == (
+        "model_owned_physical_abi_banks_missing"
+    )
+    assert result.proof_result["path_c_fusion"]["schedule_blockers"] == [
+        "fused_train_block_runtime_not_bound"
+    ]
 
 
 def test_bench_1b_matrix_reuses_existing_ok_receipt(

@@ -54,6 +54,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--out", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument(
+        "--compile-receipt",
+        type=Path,
+        default=None,
+        help=(
+            "Optional scripts/path_c_fusion_compile_receipt.py JSON. This is "
+            "rendered separately because the matrix measures the runtime route."
+        ),
+    )
+    parser.add_argument(
         "--dtypes",
         default=",".join(DEFAULT_DTYPES),
         help="Comma-separated dtype sections to render.",
@@ -289,11 +298,55 @@ def memory_delta(
     return candidate_value - baseline_value
 
 
+def memory_interpretation(
+    *,
+    peak_delta: float | None,
+    active_delta: float | None,
+    cache_delta: float | None,
+) -> str:
+    """Classify allocator deltas so peak high-water is not read as live memory."""
+
+    if peak_delta is None:
+        return "-"
+    if active_delta is not None and active_delta > 0.25:
+        return "live active growth"
+    if cache_delta is not None and cache_delta > 0.25:
+        return "allocator cache growth"
+    if peak_delta >= 1.0:
+        return "transient peak/high-water; active is flat"
+    if peak_delta > 0:
+        return "small peak-only delta"
+    return "no peak regression"
+
+
+def path_c_default_block_reason(payload: dict[str, Any]) -> str | None:
+    receipt = payload.get("path_c_fusion_compile_receipt")
+    if not isinstance(receipt, dict):
+        return None
+    reporting = receipt.get("reporting_contract", {})
+    if not isinstance(reporting, dict):
+        return None
+    if reporting.get("path_c_default_allowed") is not False:
+        return None
+    runtime_fused = reporting.get("runtime_uses_fused_train_block")
+    plan = receipt.get("compile_plan", {})
+    contract = plan.get("schedule_contract", {}) if isinstance(plan, dict) else {}
+    contract_status = (
+        contract.get("status") if isinstance(contract, dict) else None
+    ) or "unknown"
+    return (
+        "compile receipt blocks default promotion: "
+        f"runtime fused train block is {runtime_fused}; "
+        f"schedule contract is {contract_status}."
+    )
+
+
 def decision_for(
     *,
     warm: Row | None,
     baseline: Row | None,
     tolerance: float,
+    default_block_reason: str | None = None,
 ) -> tuple[str, str, str]:
     if baseline and baseline.status == "not_applicable":
         if warm and warm.status == "ok":
@@ -311,8 +364,20 @@ def decision_for(
     if ratio is None:
         return ("Keep Path B", "decision-bad", "Missing tok/s for Path B or warm Path C.")
     if ratio >= 1.0:
+        if default_block_reason:
+            return (
+                "Path C speed candidate",
+                "decision-warn",
+                f"Warm Path C is faster than Path B, but {default_block_reason}",
+            )
         return ("Path C default candidate", "decision-good", "Warm Path C is faster than Path B.")
     if ratio >= 1.0 - tolerance:
+        if default_block_reason:
+            return (
+                "Path C speed candidate",
+                "decision-warn",
+                f"Warm Path C is within {tolerance:.0%} of Path B, but {default_block_reason}",
+            )
         return (
             "Path C default candidate",
             "decision-good",
@@ -325,7 +390,12 @@ def decision_for(
     )
 
 
-def render_summary_cards(rows: list[Row], dtypes: tuple[str, ...], tolerance: float) -> str:
+def render_summary_cards(
+    rows: list[Row],
+    dtypes: tuple[str, ...],
+    tolerance: float,
+    default_block_reason: str | None = None,
+) -> str:
     keyed = rows_by_key(rows)
     cards: list[str] = []
     for dtype in dtypes:
@@ -342,8 +412,9 @@ def render_summary_cards(rows: list[Row], dtypes: tuple[str, ...], tolerance: fl
                 warm=warm,
                 baseline=baseline,
                 tolerance=tolerance,
+                default_block_reason=default_block_reason,
             )
-            if class_name == "decision-good":
+            if decision in {"Path C default candidate", "Path C speed candidate"}:
                 candidates += 1
             elif decision == "Path C only":
                 na += 1
@@ -354,12 +425,15 @@ def render_summary_cards(rows: list[Row], dtypes: tuple[str, ...], tolerance: fl
             <section class="summary-card">
               <div class="card-kicker">{dtype}</div>
               <div class="card-title">{ok_count} runnable cells</div>
-              <div class="card-meta">Path C candidates: {candidates} / Keep Path B: {keep_b} / No baseline: {na}</div>
+              <div class="card-meta">{candidate_label}: {candidates} / Keep Path B: {keep_b} / No baseline: {na}</div>
               <div class="card-foot">Fastest: {fastest}</div>
             </section>
             """.format(
                 dtype=h(dtype.upper()),
                 ok_count=len(ok_rows),
+                candidate_label="Path C speed candidates"
+                if default_block_reason
+                else "Path C candidates",
                 candidates=candidates,
                 keep_b=keep_b,
                 na=na,
@@ -373,7 +447,12 @@ def render_summary_cards(rows: list[Row], dtypes: tuple[str, ...], tolerance: fl
     return "\n".join(cards)
 
 
-def render_comparison_table(rows: list[Row], dtype: str, tolerance: float) -> str:
+def render_comparison_table(
+    rows: list[Row],
+    dtype: str,
+    tolerance: float,
+    default_block_reason: str | None = None,
+) -> str:
     keyed = rows_by_key(rows)
     body: list[str] = []
     for optimizer in optimizer_order(rows, dtype):
@@ -389,6 +468,7 @@ def render_comparison_table(rows: list[Row], dtype: str, tolerance: float) -> st
             warm=warm,
             baseline=baseline,
             tolerance=tolerance,
+            default_block_reason=default_block_reason,
         )
         body.append(
             """
@@ -404,6 +484,7 @@ def render_comparison_table(rows: list[Row], dtype: str, tolerance: float) -> st
               <td class="{peak_class}">{peak_delta}</td>
               <td class="{active_class}">{active_delta}</td>
               <td class="{cache_class}">{cache_delta}</td>
+              <td>{memory_interpretation}</td>
               <td><span class="decision {class_name}">{decision}</span><div class="muted">{reason}</div></td>
             </tr>
             """.format(
@@ -421,6 +502,13 @@ def render_comparison_table(rows: list[Row], dtype: str, tolerance: float) -> st
                 peak_delta=fmt_signed(peak_delta, " GiB"),
                 active_delta=fmt_signed(active_delta, " GiB"),
                 cache_delta=fmt_signed(cache_delta, " GiB"),
+                memory_interpretation=h(
+                    memory_interpretation(
+                        peak_delta=peak_delta,
+                        active_delta=active_delta,
+                        cache_delta=cache_delta,
+                    )
+                ),
                 peak_class="bad-number" if peak_delta is not None and peak_delta > 0 else "",
                 active_class="bad-number" if active_delta is not None and active_delta > 0.25 else "",
                 cache_class="bad-number" if cache_delta is not None and cache_delta > 0 else "",
@@ -450,6 +538,7 @@ def render_comparison_table(rows: list[Row], dtype: str, tolerance: float) -> st
                 <th>Peak allocator delta</th>
                 <th>Active delta</th>
                 <th>Cache delta</th>
+                <th>Memory read</th>
                 <th>Default decision</th>
               </tr>
             </thead>
@@ -536,7 +625,23 @@ def render_methodology(payload: dict[str, Any], tolerance: float) -> str:
     )
 
 
-def render_route_legend() -> str:
+def render_route_legend(payload: dict[str, Any]) -> str:
+    config = payload.get("config", {}) if isinstance(payload.get("config"), dict) else {}
+    mamba3_bwd = str(config.get("mamba3_bwd") or "path_b")
+    if mamba3_bwd == "path_c":
+        bf16_path_c_detail = (
+            "This rendered matrix is the explicit full-Path-C experiment: "
+            "Mamba3 forward and backward both run through Path C via "
+            "<code>--mamba3-bwd path_c</code>. This is not the default "
+            "promotion rule by itself."
+        )
+    else:
+        bf16_path_c_detail = (
+            "The default-safe matrix keeps Mamba3 on Path C forward plus Path B "
+            "backward via <code>--mamba3-bwd path_b</code>; pass "
+            "<code>--mamba3-bwd path_c</code> only for an explicit full-Path-C "
+            "experiment."
+        )
     return """
       <section class="panel narrative">
         <div class="section-head">
@@ -550,7 +655,7 @@ def render_route_legend() -> str:
           </div>
           <div class="route-card">
             <h3>BF16 Path C</h3>
-            <p>Runs <code>--dtype bfloat16</code> with <code>CPPMEGA_KERNEL_PATH=path_c</code>. The default matrix keeps Mamba3 on Path C forward plus Path B backward via <code>--mamba3-bwd path_b</code>; pass <code>--mamba3-bwd path_c</code> only for an explicit full-Path-C experiment.</p>
+            <p>Runs <code>--dtype bfloat16</code> with <code>CPPMEGA_KERNEL_PATH=path_c</code>. {bf16_path_c_detail}</p>
           </div>
           <div class="route-card">
             <h3>FP8 Path B</h3>
@@ -562,10 +667,501 @@ def render_route_legend() -> str:
           </div>
         </div>
       </section>
+    """.format(bf16_path_c_detail=bf16_path_c_detail)
+
+
+def render_compile_receipt(payload: dict[str, Any]) -> str:
+    receipt = payload.get("path_c_fusion_compile_receipt")
+    if not isinstance(receipt, dict):
+        return """
+      <section class="panel narrative">
+        <div class="section-head">
+          <h2>Fused Schedule Compile Receipt</h2>
+          <p>No compile receipt was attached to this render.</p>
+        </div>
+        <div class="callout">
+          The tables below still measure the current runtime route. They do not
+          prove that the generated fused train-block was compiled or executed.
+        </div>
+      </section>
     """
+    target = receipt.get("schedule_target", {})
+    spec = receipt.get("schedule_spec", {})
+    plan = receipt.get("compile_plan", {})
+    contract = plan.get("schedule_contract", {}) if isinstance(plan, dict) else {}
+    artifact = receipt.get("artifact", {})
+    source = receipt.get("generated_source", {})
+    reporting = receipt.get("reporting_contract", {})
+    cache_key = receipt.get("fusion_cache_key", {})
+    recompile_audit = receipt.get("cache_key_recompile_audit", {})
+    runtime_contract = receipt.get("runtime_execution_contract", {})
+    runtime_smoke = receipt.get("runtime_smoke", {})
+    runtime_smoke_kernel_source = (
+        runtime_smoke.get("kernel_source", {})
+        if isinstance(runtime_smoke, dict)
+        else {}
+    )
+    physical_shapes = (
+        source.get("physical_buffer_abi_shapes", {})
+        if isinstance(source, dict)
+        else {}
+    )
+    spilled_scratch = (
+        source.get("spilled_shared_scratch_shapes", {})
+        if isinstance(source, dict)
+        else {}
+    )
+    if isinstance(spilled_scratch, dict):
+        spill_rows = []
+        for name, info in sorted(
+            spilled_scratch.items(),
+            key=lambda item: (
+                int(item[1].get("bytes", 0))
+                if isinstance(item[1], dict)
+                else 0
+            ),
+            reverse=True,
+        )[:8]:
+            if isinstance(info, dict):
+                shape = tuple(info.get("shape", ()))
+                dtype = info.get("dtype", "?")
+                byte_count = info.get("bytes", "?")
+                internal = " internal" if info.get("internal_scratch_abi") else ""
+                spill_rows.append(
+                    f"{name}{shape}:{dtype}:{byte_count}B{internal}"
+                )
+            else:
+                spill_rows.append(str(name))
+        spilled_scratch_text = ", ".join(spill_rows)
+    else:
+        spilled_scratch_text = ""
+    internal_scratch_buffers = (
+        source.get("internal_scratch_abi_buffers", [])
+        if isinstance(source, dict)
+        else []
+    )
+    physical_abi_validation = (
+        source.get("physical_abi_validation", {})
+        if isinstance(source, dict)
+        else {}
+    )
+    physical_abi_runtime_bridge = (
+        source.get("physical_abi_runtime_bridge", {})
+        if isinstance(source, dict)
+        else {}
+    )
+    physical_abi_runtime_binding = (
+        source.get("physical_abi_runtime_binding", {})
+        if isinstance(source, dict)
+        else {}
+    )
+    internal_scratch_text = (
+        ", ".join(str(name) for name in internal_scratch_buffers)
+        if isinstance(internal_scratch_buffers, list)
+        else ""
+    )
+    if isinstance(physical_shapes, dict):
+        physical_shapes_text = ", ".join(
+            f"{name}{tuple(shape) if isinstance(shape, list) else shape}"
+            for name, shape in sorted(physical_shapes.items())
+        )
+    else:
+        physical_shapes_text = ""
+    return """
+      <section class="panel narrative">
+        <div class="section-head">
+          <h2>Fused Schedule Compile Receipt</h2>
+          <p>Separate evidence for the generated single-entry TileLang schedule.</p>
+        </div>
+        <div class="narrative-grid">
+          <div>
+            <h3>Compile Status</h3>
+            <ul>
+              <li>Status: <code>{status}</code></li>
+              <li>Native compile requested: <code>{native_requested}</code></li>
+              <li>Native compile ok: <code>{native_ok}</code></li>
+              <li>Artifact: <code>{artifact_type}</code></li>
+              <li>Elapsed: <code>{elapsed}</code> s</li>
+            </ul>
+          </div>
+          <div>
+            <h3>Selected Schedule</h3>
+            <ul>
+              <li>Schedule id: <code>{schedule_id}</code></li>
+              <li>Implementation: <code>{implementation_kind}</code></li>
+              <li>Schedule status: <code>{schedule_status}</code></li>
+              <li>Contract status: <code>{contract_status}</code></li>
+              <li>Production fragments complete: <code>{fragments_complete}</code></li>
+              <li>Real ABI complete: <code>{real_abi_complete}</code></li>
+            </ul>
+          </div>
+          <div>
+            <h3>Physical ABI</h3>
+            <ul>
+              <li>Policy: <code>{physical_abi_policy}</code></li>
+              <li>Logical buffers: <code>{logical_parameter_count}</code></li>
+              <li>Physical kernel buffers: <code>{physical_parameter_count}</code></li>
+              <li>Logical ABI map entries: <code>{logical_buffer_abi_map_count}</code></li>
+              <li>Physical ABI validation: <code>{physical_abi_validation_status}</code></li>
+              <li>Runtime ABI bridge: <code>{runtime_abi_bridge_status}</code></li>
+              <li>Runtime ABI binding: <code>{runtime_abi_binding_status}</code></li>
+              <li>Runtime ABI required banks: <code>{runtime_abi_required_banks}</code></li>
+              <li>Runtime ABI missing banks: <code>{runtime_abi_missing_banks}</code></li>
+              <li>Runtime kernel buffers: <code>{kernel_parameter_count}</code></li>
+              <li>Metal buffer limit: <code>{metal_buffer_limit}</code></li>
+              <li>Limit exceeded: <code>{metal_limit_exceeded}</code></li>
+              <li>Bank shapes: <code>{physical_shapes}</code></li>
+              <li>Shared scratch ABI buffers: <code>{spilled_shared_scratch_count}</code></li>
+              <li>Shared scratch ABI bytes: <code>{shared_scratch_abi_bytes}</code></li>
+              <li>Internal scratch ABI buffers: <code>{internal_scratch_abi_count}</code></li>
+              <li>Internal scratch names: <code>{internal_scratch_names}</code></li>
+              <li>Top scratch spills: <code>{spilled_scratch}</code></li>
+            </ul>
+          </div>
+          <div>
+            <h3>Reporting Boundary</h3>
+            <ul>
+              <li>Matrix measures current runtime route: <code>{matrix_runtime}</code></li>
+              <li>Runtime uses fused train block: <code>{runtime_fused}</code></li>
+              <li>Path C default allowed: <code>{default_allowed}</code></li>
+              <li>Runtime execution status: <code>{runtime_execution_status}</code></li>
+              <li>Plan single-kernel fused: <code>{plan_single_kernel_fused}</code></li>
+              <li>Plan schedule status: <code>{plan_schedule_status}</code></li>
+              <li>Contract runtime status: <code>{runtime_contract_status}</code></li>
+              <li>Contract reason: <code>{runtime_contract_reason}</code></li>
+              <li>Declared schedule id: <code>{runtime_contract_schedule_id}</code></li>
+              <li>Single-thread generated kernel: <code>{single_thread_kernel}</code></li>
+              <li>Lane-0 serialized fragments: <code>{lane0_serial_fragments}</code></li>
+              <li>Lane-0 production fragments: <code>{lane0_production_fragments}</code></li>
+              <li>Lane-strided row loops: <code>{lane_strided_row_loops}</code></li>
+              <li>Fusion cache-key status: <code>{cache_key_status}</code></li>
+              <li>Recompile audit status: <code>{recompile_status}</code></li>
+              <li>Recompile cache-hit bit: <code>{recompile_cache_hit_status}</code></li>
+              <li>Lowered module digest: <code>{lowered_digest}</code></li>
+              <li>Generated source: <code>{source_path}</code></li>
+              <li>Source SHA256: <code>{source_sha}</code></li>
+            </ul>
+          </div>
+          <div>
+            <h3>Runtime Smoke</h3>
+            <ul>
+              <li>Mode: <code>{runtime_smoke_mode}</code></li>
+              <li>Status: <code>{runtime_smoke_status}</code></li>
+              <li>Executed: <code>{runtime_smoke_executed}</code></li>
+              <li>Smoke schedule id: <code>{runtime_smoke_schedule_id}</code></li>
+              <li>Smoke buffers: <code>{runtime_smoke_buffers}</code></li>
+              <li>Smoke ABI bytes: <code>{runtime_smoke_bytes}</code></li>
+              <li>Smoke MSL bytes: <code>{runtime_smoke_msl_bytes}</code></li>
+              <li>Smoke threadgroup bytes: <code>{runtime_smoke_threadgroup_bytes}</code></li>
+              <li>Smoke compile: <code>{runtime_smoke_compile_elapsed}</code> s</li>
+              <li>Smoke execute: <code>{runtime_smoke_execute_elapsed}</code> s</li>
+              <li>Smoke error: <code>{runtime_smoke_error}</code></li>
+            </ul>
+          </div>
+        </div>
+        <details class="command-details">
+          <summary>Missing or untrusted contract detail</summary>
+          <pre>{missing}</pre>
+        </details>
+      </section>
+    """.format(
+        status=h(receipt.get("status")),
+        native_requested=h(receipt.get("native_compile_requested")),
+        native_ok=h(receipt.get("native_compile_ok")),
+        artifact_type=h(artifact.get("type") if isinstance(artifact, dict) else None),
+        elapsed=fmt_num(_number(receipt.get("elapsed_s")), 3),
+        schedule_id=h(target.get("schedule_id") if isinstance(target, dict) else None),
+        implementation_kind=h(
+            spec.get("implementation_kind") if isinstance(spec, dict) else None
+        ),
+        schedule_status=h(
+            target.get("schedule_status") if isinstance(target, dict) else None
+        ),
+        contract_status=h(
+            contract.get("status") if isinstance(contract, dict) else None
+        ),
+        fragments_complete=h(
+            spec.get("production_fragments_complete")
+            if isinstance(spec, dict)
+            else None
+        ),
+        real_abi_complete=h(
+            spec.get("real_abi_contract_complete") if isinstance(spec, dict) else None
+        ),
+        physical_abi_policy=h(
+            source.get("physical_abi_policy") if isinstance(source, dict) else None
+        ),
+        logical_parameter_count=h(
+            source.get("logical_parameter_count") if isinstance(source, dict) else None
+        ),
+        physical_parameter_count=h(
+            source.get("physical_parameter_count") if isinstance(source, dict) else None
+        ),
+        logical_buffer_abi_map_count=h(
+            source.get("logical_buffer_abi_map_count")
+            if isinstance(source, dict)
+            else None
+        ),
+        physical_abi_validation_status=h(
+            physical_abi_validation.get("status")
+            if isinstance(physical_abi_validation, dict)
+            else None
+        ),
+        runtime_abi_bridge_status=h(
+            physical_abi_runtime_bridge.get("status")
+            if isinstance(physical_abi_runtime_bridge, dict)
+            else None
+        ),
+        runtime_abi_binding_status=h(
+            physical_abi_runtime_binding.get("status")
+            if isinstance(physical_abi_runtime_binding, dict)
+            else None
+        ),
+        runtime_abi_required_banks=h(
+            ", ".join(
+                str(name)
+                for name in physical_abi_runtime_bridge.get("required_bank_buffers", [])
+            )
+            if isinstance(physical_abi_runtime_bridge, dict)
+            else None
+        ),
+        runtime_abi_missing_banks=h(
+            ", ".join(
+                str(name)
+                for name in physical_abi_runtime_binding.get("missing_bank_buffers", [])
+            )
+            if isinstance(physical_abi_runtime_binding, dict)
+            else None
+        ),
+        kernel_parameter_count=h(
+            runtime_contract.get("kernel_parameter_count")
+            if isinstance(runtime_contract, dict)
+            else None
+        ),
+        metal_buffer_limit=h(
+            runtime_contract.get("metal_buffer_limit")
+            if isinstance(runtime_contract, dict)
+            else None
+        ),
+        metal_limit_exceeded=h(
+            runtime_contract.get("metal_buffer_limit_exceeded")
+            if isinstance(runtime_contract, dict)
+            else None
+        ),
+        physical_shapes=h(physical_shapes_text),
+        spilled_shared_scratch_count=h(
+            source.get("spilled_shared_scratch_count")
+            if isinstance(source, dict)
+            else None
+        ),
+        shared_scratch_abi_bytes=h(
+            source.get("shared_scratch_abi_bytes") if isinstance(source, dict) else None
+        ),
+        internal_scratch_abi_count=h(
+            source.get("internal_scratch_abi_count")
+            if isinstance(source, dict)
+            else None
+        ),
+        internal_scratch_names=h(internal_scratch_text),
+        spilled_scratch=h(spilled_scratch_text),
+        matrix_runtime=h(
+            reporting.get("matrix_measures_current_runtime_route")
+            if isinstance(reporting, dict)
+            else None
+        ),
+        runtime_fused=h(
+            reporting.get("runtime_uses_fused_train_block")
+            if isinstance(reporting, dict)
+            else None
+        ),
+        default_allowed=h(
+            reporting.get("path_c_default_allowed")
+            if isinstance(reporting, dict)
+            else None
+        ),
+        runtime_execution_status=h(
+            runtime_contract.get("status")
+            if isinstance(runtime_contract, dict)
+            else None
+        ),
+        plan_single_kernel_fused=h(
+            runtime_contract.get("plan_single_kernel_fused")
+            if isinstance(runtime_contract, dict)
+            else None
+        ),
+        plan_schedule_status=h(
+            runtime_contract.get("plan_schedule_status")
+            if isinstance(runtime_contract, dict)
+            else None
+        ),
+        runtime_contract_status=h(
+            runtime_contract.get("schedule_contract_status")
+            if isinstance(runtime_contract, dict)
+            else None
+        ),
+        runtime_contract_reason=h(
+            runtime_contract.get("schedule_contract_reason")
+            if isinstance(runtime_contract, dict)
+            else None
+        ),
+        runtime_contract_schedule_id=h(
+            runtime_contract.get("schedule_contract_declared_schedule_id")
+            if isinstance(runtime_contract, dict)
+            else None
+        ),
+        single_thread_kernel=h(
+            runtime_contract.get("single_thread_kernel")
+            if isinstance(runtime_contract, dict)
+            else None
+        ),
+        lane0_serial_fragments=h(
+            runtime_contract.get("lane0_serial_fragments")
+            if isinstance(runtime_contract, dict)
+            else None
+        ),
+        lane0_production_fragments=h(
+            ", ".join(runtime_contract.get("lane0_production_fragments") or [])
+            if isinstance(runtime_contract, dict)
+            else None
+        ),
+        lane_strided_row_loops=h(
+            runtime_contract.get("lane_strided_row_loops")
+            if isinstance(runtime_contract, dict)
+            else None
+        ),
+        cache_key_status=h(
+            cache_key.get("status") if isinstance(cache_key, dict) else None
+        ),
+        recompile_status=h(
+            recompile_audit.get("status")
+            if isinstance(recompile_audit, dict)
+            else None
+        ),
+        recompile_cache_hit_status=h(
+            recompile_audit.get("cache_hit_status")
+            if isinstance(recompile_audit, dict)
+            else None
+        ),
+        lowered_digest=h(
+            cache_key.get("lowered_module_digest")
+            if isinstance(cache_key, dict)
+            else None
+        ),
+        source_path=h(source.get("path") if isinstance(source, dict) else None),
+        source_sha=h(source.get("sha256") if isinstance(source, dict) else None),
+        runtime_smoke_mode=h(
+            runtime_smoke.get("mode") if isinstance(runtime_smoke, dict) else None
+        ),
+        runtime_smoke_status=h(
+            runtime_smoke.get("status") if isinstance(runtime_smoke, dict) else None
+        ),
+        runtime_smoke_executed=h(
+            runtime_smoke.get("actually_executed")
+            if isinstance(runtime_smoke, dict)
+            else None
+        ),
+        runtime_smoke_schedule_id=h(
+            runtime_smoke.get("schedule_id")
+            if isinstance(runtime_smoke, dict)
+            else None
+        ),
+        runtime_smoke_buffers=h(
+            runtime_smoke.get("kernel_parameter_count")
+            if isinstance(runtime_smoke, dict)
+            else None
+        ),
+        runtime_smoke_bytes=h(
+            runtime_smoke.get("total_buffer_bytes")
+            if isinstance(runtime_smoke, dict)
+            else None
+        ),
+        runtime_smoke_msl_bytes=h(
+            runtime_smoke_kernel_source.get("kernel_source_bytes")
+            if isinstance(runtime_smoke_kernel_source, dict)
+            else None
+        ),
+        runtime_smoke_threadgroup_bytes=h(
+            runtime_smoke_kernel_source.get("threadgroup_dynamic_shared_bytes")
+            if isinstance(runtime_smoke_kernel_source, dict)
+            else None
+        ),
+        runtime_smoke_compile_elapsed=fmt_num(
+            _number(runtime_smoke.get("compile_elapsed_s"))
+            if isinstance(runtime_smoke, dict)
+            else None,
+            3,
+        ),
+        runtime_smoke_execute_elapsed=fmt_num(
+            _number(runtime_smoke.get("execute_elapsed_s"))
+            if isinstance(runtime_smoke, dict)
+            else None,
+            3,
+        ),
+        runtime_smoke_error=h(
+            runtime_smoke.get("error") if isinstance(runtime_smoke, dict) else None
+        ),
+        missing=h(
+            json.dumps(
+                {
+                    "missing_real_abi_inputs": spec.get("missing_real_abi_inputs")
+                    if isinstance(spec, dict)
+                    else None,
+                    "contract": contract,
+                    "cache_key_recompile_audit": recompile_audit,
+                    "runtime_execution_contract": runtime_contract,
+                    "runtime_smoke": runtime_smoke,
+                    "generated_source": {
+                        "logical_buffer_abi_map_count": source.get(
+                            "logical_buffer_abi_map_count"
+                        )
+                        if isinstance(source, dict)
+                        else None,
+                        "physical_abi_validation": source.get(
+                            "physical_abi_validation"
+                        )
+                        if isinstance(source, dict)
+                        else None,
+                        "physical_abi_runtime_bridge": source.get(
+                            "physical_abi_runtime_bridge"
+                        )
+                        if isinstance(source, dict)
+                        else None,
+                        "physical_abi_runtime_binding": source.get(
+                            "physical_abi_runtime_binding"
+                        )
+                        if isinstance(source, dict)
+                        else None,
+                        "spilled_shared_scratch_count": source.get(
+                            "spilled_shared_scratch_count"
+                        )
+                        if isinstance(source, dict)
+                        else None,
+                        "shared_scratch_abi_bytes": source.get(
+                            "shared_scratch_abi_bytes"
+                        )
+                        if isinstance(source, dict)
+                        else None,
+                        "internal_scratch_abi_buffers": source.get(
+                            "internal_scratch_abi_buffers"
+                        )
+                        if isinstance(source, dict)
+                        else None,
+                    },
+                    "native_compile_error": receipt.get("native_compile_error"),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        ),
+    )
 
 
-def render_current_findings(rows: list[Row], dtypes: tuple[str, ...], tolerance: float) -> str:
+def render_current_findings(
+    rows: list[Row],
+    dtypes: tuple[str, ...],
+    tolerance: float,
+    default_block_reason: str | None = None,
+) -> str:
     keyed = rows_by_key(rows)
     lines: list[str] = []
     for dtype in dtypes:
@@ -582,6 +1178,7 @@ def render_current_findings(rows: list[Row], dtypes: tuple[str, ...], tolerance:
                 warm=warm,
                 baseline=baseline,
                 tolerance=tolerance,
+                default_block_reason=default_block_reason,
             )
             lines.append(
                 """
@@ -608,14 +1205,21 @@ def render_current_findings(rows: list[Row], dtypes: tuple[str, ...], tolerance:
                 warm=warm,
                 baseline=baseline,
                 tolerance=tolerance,
+                default_block_reason=default_block_reason,
             )
-            if class_name == "decision-good":
+            if decision in {"Path C default candidate", "Path C speed candidate"}:
                 good_rows.append((dtype, optimizer, decision))
     if good_rows:
-        headline = (
-            f"{len(good_rows)} row(s) qualify for Path C under the "
-            f"{tolerance:.0%} same-speed rule; see details below."
-        )
+        if default_block_reason:
+            headline = (
+                f"{len(good_rows)} row(s) pass the Path C speed rule, but no row "
+                f"is a default promotion because {default_block_reason}"
+            )
+        else:
+            headline = (
+                f"{len(good_rows)} row(s) qualify for Path C under the "
+                f"{tolerance:.0%} same-speed rule; see details below."
+            )
     else:
         headline = (
             "No rendered dtype/optimizer row qualifies for Path C as the default "
@@ -827,13 +1431,15 @@ def render_commands(rows: list[Row], dtypes: tuple[str, ...]) -> str:
 def render_html(payload: dict[str, Any], rows: list[Row], dtypes: tuple[str, ...], tolerance: float) -> str:
     config = payload.get("config", {}) if isinstance(payload.get("config"), dict) else {}
     software = payload.get("software", {}) if isinstance(payload.get("software"), dict) else {}
+    default_block_reason = path_c_default_block_reason(payload)
     sections: list[str] = [
         render_methodology(payload, tolerance),
-        render_route_legend(),
-        render_current_findings(rows, dtypes, tolerance),
+        render_route_legend(payload),
+        render_compile_receipt(payload),
+        render_current_findings(rows, dtypes, tolerance, default_block_reason),
     ]
     sections.extend(
-        render_comparison_table(rows, dtype, tolerance)
+        render_comparison_table(rows, dtype, tolerance, default_block_reason)
         for dtype in dtypes
         if any(row.dtype == dtype for row in rows)
     )
@@ -1118,7 +1724,7 @@ def render_html(payload: dict[str, Any], rows: list[Row], dtypes: tuple[str, ...
         tilelang_sha=h(software.get("tilelang_sha", "-")),
         mlx_version=h(software.get("mlx_version", "-")),
         tolerance=tolerance,
-        cards=render_summary_cards(rows, dtypes, tolerance),
+        cards=render_summary_cards(rows, dtypes, tolerance, default_block_reason),
         sections="\n".join(sections),
     )
 
@@ -1128,6 +1734,11 @@ def main(argv: list[str] | None = None) -> int:
     payload = json.loads(args.input.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         raise SystemExit("matrix JSON root must be an object")
+    if args.compile_receipt is not None:
+        compile_receipt = json.loads(args.compile_receipt.read_text(encoding="utf-8"))
+        if not isinstance(compile_receipt, dict):
+            raise SystemExit("compile receipt JSON root must be an object")
+        payload["path_c_fusion_compile_receipt"] = compile_receipt
     dtypes = parse_dtypes(args.dtypes)
     rows = parse_rows(payload)
     html_text = render_html(payload, rows, dtypes, args.same_speed_tolerance)

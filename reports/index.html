@@ -218,7 +218,7 @@
 <body>
     <header>
         <h1>cppmega Reports</h1>
-        <p>Training matrix and profiling artifacts generated from the 2026-05-17/18 Path B/C investigation.</p>
+        <p>Training matrix and profiling artifacts generated from the 2026-05-17 through 2026-05-20 Path B/C investigation.</p>
     </header>
     <main>
         <section>
@@ -228,6 +228,32 @@
             </div>
             <div class="body">
                 <div class="grid">
+                    <div class="metric"><span>Current 2026-05-20 full Path C backward matrix</span><strong><a
+                                href="cppmega_1b_path_matrix_20260520_full_path_c_bwd.html">Full-C 2026-05-20
+                                HTML</a></strong>
+                        <p>Fresh 42/42 1B cells: bf16/fp8 x 7 optimizers x Path B/Path C cold/Path C warm with
+                            <code>--mamba3-bwd path_c</code>. This report separates speed-only Path C rows from
+                            default promotion because the fused train block is not yet used by runtime.</p>
+                        <p><a href="cppmega_1b_path_matrix_20260520_full_path_c_bwd.json">JSON</a> ·
+                            <a href="cppmega_1b_path_matrix_20260520_full_path_c_bwd.csv">CSV</a> ·
+                            <a href="cppmega_1b_path_matrix_20260520_full_path_c_bwd.md">Markdown</a></p>
+                    </div>
+                    <div class="metric"><span>Current fused schedule compile receipt</span><strong><a
+                                href="path_c_fusion_compile_receipt.json">Compile Receipt
+                                JSON</a></strong>
+                        <p>Dynamic model-derived fused schedule compiles natively to a TileLang
+                            <code>JITKernel</code>; schedule contract is <code>verified</code>. The runtime hook now
+                            accepts an explicit caller/model-owned physical ABI bank owner, but the live m04 training
+                            route still reports <code>runtime_uses_fused_train_block=false</code> until the model owns
+                            and passes those banks.</p>
+                        <p><a href="path_c_fusion_compile_source.py">Generated TileLang source</a></p>
+                    </div>
+                    <div class="metric"><span>Path C fused train-block goal audit</span><strong><a
+                                href="path_c_fusion_goal_audit_20260520.html">Goal Audit
+                                HTML</a></strong>
+                        <p>Prompt-to-artifact checklist for MaskAnalysis, fused schedule body, real ABI, compile
+                            receipt, cache-key audit, default gate, and the remaining runtime ABI-bank blocker.</p>
+                    </div>
                     <div class="metric"><span>Fresh 2026-05-18 matrix</span><strong><a
                                 href="v4/cppmega_1b_path_matrix_safe_mamba_bwd_20260518.html">Safe Matrix
                                 HTML</a></strong>
@@ -351,10 +377,10 @@
             </div>
             <div class="body">
                 <div class="grid">
-                    <div class="metric"><span>Fresh matrix cells</span><strong>42/42 passed</strong></div>
-                    <div class="metric"><span>Fast optimizer Path C ratio</span><strong>0.665x C/B</strong></div>
-                    <div class="metric"><span>FP8 Path C average peak delta</span><strong>+30.49 GiB</strong></div>
-                    <div class="metric"><span>Corrected BF16 Lion C/B</span><strong>0.677x</strong></div>
+                    <div class="metric"><span>2026-05-20 full-C cells</span><strong>42/42 passed</strong></div>
+                    <div class="metric"><span>Fused compile receipt</span><strong>native ok, runtime off</strong></div>
+                    <div class="metric"><span>BF16 adam8bit Path B baseline</span><strong>1010.34 tok/s</strong></div>
+                    <div class="metric"><span>FP8 lion8bit Path B baseline</span><strong>1001.57 tok/s</strong></div>
                 </div>
             </div>
         </section>
