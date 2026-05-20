@@ -14,7 +14,13 @@ Exa neural + content / Perplexity reasoning Gemini 3.1; Tavily вылетел
 0. TL;DR
 
 Стек: **anywidget + React Flow 12 + Rust/WASM core + ELK.js layout + Python
-JSON-RPC backend**. Шипается двумя путями из одного codebase:
+JSON-RPC backend + `cppmega-run` CLI**. GUI **никогда не генерит .py
+codegen** — эмитит canonical `model_spec.json` + `pipeline.yaml`,
+которые consume generic runner. Single source of truth, diffable в git,
+A/B compareable, CI-friendly. Researcher copies `spec.json` из GUI
+session → ML engineer запускает identical pipeline на H100 cluster.
+
+Шипается двумя путями из одного codebase:
 
   (a) Jupyter widget — anywidget traitlets, backend = реальный
       cppmega_v4.* в notebook'е (instantiate=True, MLX runtime).
@@ -250,8 +256,18 @@ engram; etc.).
        - green если total < device_hbm * 0.7
        - yellow если 0.7..0.9
        - red если >0.9 (включая duplication, kernel_boundary)
-  7. **Build & Step** button (primary): запускает `build_model(spec)` +
-     один forward+loss+optimizer.update.
+  7. **Run pipeline** split-button dropdown (primary):
+     - "**Smoke**" (default) — parse → verify_build_spec → apply_rewrites
+       → resolve_shapes → estimate_memory → check_gotchas → build_model
+       → dry_forward (1, 8, H synthetic). <1s. Returns shape parity report.
+     - "**Full validate**" — adds input_parity_check (load N rows from
+       parquet, run tokenizer, verify shape match at every brick boundary)
+       + loss_smoke + optimizer_smoke. <30s.
+     - "**Train**" — full pipeline + actual training loop. Only enabled
+       in Jupyter widget mode (real MLX runtime).
+     Each click POSTs the spec JSON + pipeline.yaml to the runner. The
+     runner is `cppmega-run spec.json --pipeline pipeline.yaml --stages
+     <selected>` — see §5.3 below.
 
 ### 4.3 Right sidebar (320px)
 
@@ -317,13 +333,22 @@ Tabbed: **Loss** / **Optim** / **Rewriters** / **Sharding** / **Gotchas**.
   - **DeviceTopology builder**: text inputs for device kind / hbm / count
     / interconnect / bandwidth + mesh-axis table (axis name + degree) +
     validation hint when product != device count.
-  - **Build & Step results**: после нажатия Build & Step — modal с loss
-    scalar (finite/NaN), shape of head output, optimizer state-bytes
-    delta, error stack trace если что-то упало.
-  - **Save / Load**: graph + loss/optim/rewrites/sharding → JSON file.
-  - **Export**: код на Python (MLX) — generates a complete
-    `cppmega_v4.buildspec.build_model(spec, ...)` invocation как .py
-    file. (TorchStack-style Graph2Code.)
+  - **Pipeline run results**: после клика "Run pipeline" — modal с
+    per-stage status (✓/✗), per-stage elapsed_ms, и для каждой failed
+    stage — конкретный diagnostic (shape mismatch на ребре X, loss=NaN
+    на step Y, OOM на rank Z, etc.). Можно download полный JSON report.
+  - **Save / Load**: graph + loss/optim/rewrites/sharding → JSON file
+    (canonical ModelBuildSpec serialisation — diffable в git).
+  - **Export**:
+    - "**Export JSON spec**" — текущая спека как `model_spec.json` (то
+      что `cppmega-run` consume). Это и есть единственный source of truth.
+    - "**Export Pipeline YAML**" — `pipeline.yaml` с выбранными stages
+      (smoke / full validate / train). Reviewer может скопировать и
+      запустить `cppmega-run spec.json --pipeline pipeline.yaml`.
+    - "**Export shareable URL**" (только JupyterLite mode) — base64-encoded
+      spec в query string, шарится одной ссылкой.
+    Никакого `.py` codegen — generic runner consume JSON напрямую,
+    меньше surface area для дрейфа.
 
 ### 4.6 Empty state
 
@@ -366,7 +391,7 @@ Tabbed: **Loss** / **Optim** / **Rewriters** / **Sharding** / **Gotchas**.
 | `sharding.update`  | ShardingSpec change           | 0ms      | <100ms         | Yes      |
 | `verify.request`   | follows graph/param/etc       | 150ms coalesced | <100ms  | Yes      |
 | `sharding.request` | explicit "Suggest sharding"   | n/a      | <2s            | Yes      |
-| `build.request`    | "Build & Step" button         | n/a      | <5s            | Yes      |
+| `pipeline.run`     | "Run pipeline" button         | n/a      | smoke <1s / full <30s / train: open | Yes (runner) |
 | `backend.status`   | heartbeat 1Hz                 | —        | —              | Server-push |
 
 Ключ кеша: `sha256(canonical_json(spec))`, исключая позиции узлов.
@@ -480,21 +505,119 @@ Frontend держит LRU(50). Backend держит per-step LRU.
 }
 ```
 
-**`build.request` response:**
+**`pipeline.run` request (JSON spec + pipeline.yaml):**
 ```json
 {
-  "result": {
-    "built": true,
-    "spec_applied": { "graph": {/*post-rewrite*/}, "loss": {/*post-rewrite*/} },
-    "forward_step": {
-      "loss_scalar": 10.42, "finite": true,
-      "output_shape": [1, 4096, 32000],
-      "optim_state_delta_bytes": 4096
-    },
-    "elapsed_ms": 1234
+  "jsonrpc": "2.0", "id": "p_99", "method": "pipeline.run",
+  "params": {
+    "spec": { /* full ModelBuildSpec serialised, see verify.request */ },
+    "pipeline": {
+      "stages": ["parse", "verify_build_spec", "apply_rewrites",
+                 "resolve_shapes", "estimate_memory", "check_gotchas",
+                 "build_model", "dry_forward"],
+      "stage_options": {
+        "dry_forward": {"B": 1, "S": 8},
+        "input_parity_check": {
+          "parquet_path": "/data/sample.parquet",
+          "num_rows": 32, "tokenizer": "tiktoken-cl100k"
+        }
+      }
+    }
   }
 }
 ```
+
+**`pipeline.run` response (per-stage results):**
+```json
+{
+  "result": {
+    "stages": [
+      {"name": "parse",              "status": "ok", "elapsed_ms": 0.4},
+      {"name": "verify_build_spec",  "status": "ok", "elapsed_ms": 1.2,
+       "warnings": 0, "errors": 0},
+      {"name": "apply_rewrites",     "status": "ok", "elapsed_ms": 0.8,
+       "rewrites_applied": ["MTPRewriter(k=2)"]},
+      {"name": "resolve_shapes",     "status": "ok", "elapsed_ms": 2.1},
+      {"name": "estimate_memory",    "status": "ok", "elapsed_ms": 1.5,
+       "worst_rank_bytes": 2233445566, "fits": true},
+      {"name": "check_gotchas",      "status": "ok", "elapsed_ms": 0.3,
+       "fired": 1, "errors": 0},
+      {"name": "build_model",        "status": "ok", "elapsed_ms": 234},
+      {"name": "dry_forward",        "status": "fail", "elapsed_ms": 12,
+       "error": {
+         "type": "ShapeMismatch",
+         "detail": "brick 'attn' expected (1,8,4096), got (1,8,2048) from producer 'g0'",
+         "node_id": "g0", "edge": ["g0","attn"]
+       }}
+    ],
+    "overall_status": "fail",
+    "total_elapsed_ms": 252.3
+  }
+}
+```
+
+### 5.3 Generic runner contract
+
+GUI **никогда не генерит .py файл**. Вместо этого она эмитит:
+
+  1. **`model_spec.json`** — canonical serialisation `ModelBuildSpec`
+     (graph + loss + optim + rewrites + dim_env + sharding). Diffable
+     в git, версионируется, A/B сравнивается trivially.
+
+  2. **`pipeline.yaml`** — какие stages в каком порядке запускать +
+     per-stage options. Built-in stages (определены в
+     `cppmega_v4.runner`):
+
+     | Stage                   | Что делает                                          | Bytes / latency |
+     |-------------------------|-----------------------------------------------------|-----------------|
+     | `parse`                 | JSON → ModelBuildSpec (Pydantic validation)         | <1 KB / <1ms    |
+     | `verify_build_spec`     | head_outputs/optim matchers/rewrite chain coherence | 0 / <5ms        |
+     | `apply_rewrites`        | MTPRewriter / IFIMRewriter / MHCRewriter            | 0 / <10ms       |
+     | `resolve_shapes`        | strict=True, every edge resolves under dim_env      | 0 / <20ms       |
+     | `estimate_memory`       | single-device + distributed reports                 | 0 / <10ms       |
+     | `check_gotchas`         | 15 footguns                                         | 0 / <5ms        |
+     | `build_model`           | instantiate nn.Module                               | full params / 100-500ms |
+     | `dry_forward`           | synthetic input (1, 8, H), assert shape propagates  | tiny / <100ms   |
+     | `input_parity_check`    | parquet sample → tokenizer → shape match per brick  | small / <2s     |
+     | `loss_smoke`            | compute loss on dry-forward, assert finite          | tiny / <50ms    |
+     | `optimizer_smoke`       | one optim.update, assert no NaN, state delta > 0    | tiny / <100ms   |
+     | `train`                 | actual training loop (`num_steps`, `dataset`)       | depends         |
+
+     Каждая stage configurable as `skip` / `run` / `strict`. Failed
+     stage stops pipeline unless `continue_on_failure=true`.
+
+  3. **CLI runner**: `cppmega-run`
+
+     ```bash
+     # smoke (default) — для быстрой итерации
+     cppmega-run spec.json
+     # → 8 stages parse..dry_forward, ~1s, exit 0/1
+
+     # full validation — для CI
+     cppmega-run spec.json --pipeline pipeline.yaml --stages all
+     # → 11 stages, parquet check, ~30s
+
+     # custom stages — пропустить build_model если только sizing-test
+     cppmega-run spec.json --stages parse,verify,resolve,estimate
+
+     # full train — для реального запуска
+     cppmega-run spec.json --pipeline train.yaml --stages train
+
+     # JSON output для CI integration
+     cppmega-run spec.json --json > report.json
+     ```
+
+     Runner живёт в `cppmega_v4.runner` (новый модуль). Wraps уже
+     существующих `cppmega_v4.buildspec.build_model`, `verify_build_spec`,
+     `verify_distributed_plan` — добавляет только pipeline orchestrator
+     + parquet input check + CLI shim. ~250 строк.
+
+  4. **Single source of truth**: GUI shows what `cppmega-run` would do.
+     CI runs `cppmega-run spec.json --stages parse,verify,resolve,estimate,check_gotchas`
+     on every PR с changed spec. Researcher copies spec.json + pipeline.yaml
+     out of GUI session, commits to git, hands off to ML engineer who
+     re-runs identical pipeline on H100 cluster — **same JSON, same
+     stages, same diagnostics, different backend**.
 
 ### 5.3 Error envelope
 
@@ -548,8 +671,12 @@ UI poсредник: ошибки кода маппит на in-place toast + no
 | master_weights toggle | `sharding.update` → `verify`| `ShardingSpec.master_weights_fp32`         |
 | activation_checkpointing | `sharding.update` → `verify` | `ShardingSpec.activation_checkpointing` |
 | Auto-fix gotcha     | `sharding.update`             | `ShardingSpec.compile_mode='regional'`     |
-| Build & Step button | `build.request`               | `build_model(spec)` → `BuiltModel`         |
-| Export button       | (local download)              | `python_codegen(spec)` → .py file          |
+| Run pipeline (Smoke)| `pipeline.run` (8 stages)    | `cppmega-run spec.json --stages parse,..,dry_forward` |
+| Run pipeline (Full) | `pipeline.run` (11 stages)   | `cppmega-run spec.json --pipeline pipeline.yaml --stages all` |
+| Run pipeline (Train)| `pipeline.run` (train stage) | `cppmega-run spec.json --pipeline train.yaml --stages train` |
+| Export JSON spec    | (local download)              | canonical `model_spec.json` serialisation  |
+| Export Pipeline YAML| (local download)              | `pipeline.yaml` with selected stages       |
+| Export shareable URL| (clipboard, JupyterLite only) | base64-encoded spec в URL query string     |
 
 ---
 
@@ -559,10 +686,29 @@ UI poсредник: ошибки кода маппит на in-place toast + no
 
 **Этап F-A — JSON-RPC contract + Python jsonrpc server (1 неделя)**
   - Зафиксировать JSON schema (TypeScript + Pydantic в shared package)
+  - Canonical ModelBuildSpec ↔ JSON serialisation (round-trip identity test)
   - FastAPI standalone server обёртка над `verify_distributed_plan`,
-    `suggest_sharding`, `build_model`, `verify_and_estimate`
+    `suggest_sharding`, `verify_and_estimate`, `pipeline.run`
   - Test suite: golden round-trip JSON для каждого endpoint
   - Cache layer с LRU(50)
+
+**Этап F-A.2 — CLI runner `cppmega-run` + pipeline.yaml stages (1 неделя)**
+  - Новый модуль `cppmega_v4.runner` (~250 строк):
+    * `Pipeline` dataclass: ordered list of `Stage`s, per-stage options
+    * 11 built-in stages: parse / verify_build_spec / apply_rewrites /
+      resolve_shapes / estimate_memory / check_gotchas / build_model /
+      dry_forward / input_parity_check / loss_smoke / optimizer_smoke /
+      train
+    * `StageResult` dataclass: name + status + elapsed_ms + diagnostics
+    * `PipelineRunner.run(spec, pipeline)` orchestrator с continue-on-failure flag
+  - CLI shim `cppmega-run` (entry point via setup.py):
+    * `--pipeline pipeline.yaml` (default = built-in "smoke" pipeline)
+    * `--stages a,b,c` (override)
+    * `--json` (machine-readable output для CI)
+    * Exit code 0 = all green, 1 = any failed
+  - Built-in pipeline configs shipped: `smoke.yaml`, `full.yaml`, `train.yaml`
+  - Tests: per-stage unit + system "every preset passes smoke pipeline"
+    perf gate < 1s per preset (12 presets)
 
 **Этап F-B — React Flow canvas + 22 brick custom nodes (2 недели)**
   - Vite + React 18 + xyflow scaffolding
@@ -640,10 +786,55 @@ UI poсредник: ошибки кода маппит на in-place toast + no
 
 ---
 
-10. Бюджет + риски
+10. Покрытие Раschka LLM Architecture Gallery (71 модель)
 
-Бюджет: 7 недель (F-A..F-E) для v1 production-ready Jupyter widget +
-static demo. Phase 2 опционально через 3-6 месяцев.
+Прогнал список галереи против наших 22 bricks + 12 presets.
+
+**12 наших пресетов прямо покрывают ~22 entries (31%)**:
+  qwen3_next ← Qwen3 Next/3.5/3.6 (35B); kimi_linear ← Kimi Linear;
+  kimi_k2 ← K2/K2.5/K2.6; deepseek_v3 ← V3/R1/V3.2/Mistral Large 3;
+  deepseek_v4_flash ← V4-Flash/V4-Pro; gemma4 ← 26B-A4B; mistral4 ←
+  Small 4; ling26 ← 2.6; longcat ← Flash-Lite; nemotron3 ← Nano/Super/Nano 4B;
+  zaya1 ← 8B; arcee_trinity ← Large.
+
+**~45 entries trivially addable** через новые preset factories — НОЛЬ
+новых бриков, только композиции существующих:
+  - LLaMA-style (`attention` + `mlp`): #2, #3, #38, #49 (Phi-4),
+    #42, #71 (Granite 4.1)
+  - OLMo-style (`attention` QK-norm + `mlp`): #4, #26, #27
+  - Qwen3 dense: #10, #13, #14, #15, #66
+  - Mixtral-style (`attention` + `moe`): #9 Llama 4 Maverick, #11/#12 Qwen3,
+    #22 Grok 2.5, #39, #43, #56, #67, #68, #70
+  - GLM-style (+ shared expert): #18, #32, #47, #51, #52
+  - DeepSeek-style (`mla` + `moe`): #34, #48, #63
+  - Sliding+global+MoE: #19/#20 GPT-OSS, #24, #31, #41, #44, #45, #61
+  - Gemma 3 dense: #7, #21, #36
+  - SmolLM3 (#16) — нужен per-layer NoPE toggle
+
+**~5 entries требуют новых бриков или архитектурных расширений** (true gaps):
+  - **#50 xLSTM 7B** — `mlstm` brick (matrix-memory LSTM, no self-attention)
+  - **#1 GPT-2 XL** — `abs_pos_embed` brick (learned absolute positions)
+  - **#57/#58 Gemma 4 E2B/E4B** — `per_layer_embed` brick
+  - **#44 Tiny Aya** — parallel-block topology (GQA‖MLP параллельно,
+    sum results); BrickGraph DAG поддерживает, но preset DSL exposes
+    только linear chains — нужен parallel composer
+  - **Mamba-2 explicit brick** — debatable (mamba3 brick покрывает похожую
+    топологию); можно alias `mamba2 → mamba3` или добавить explicit
+
+**План доведения до 100% покрытия — отдельный bd-эпик `cppmega-mlx-cov1`**
+(заведён параллельно с этим планом). 4 стадии: missing presets, new
+bricks, parallel-block topology, gallery coverage tests.
+
+---
+
+11. Бюджет + риски
+
+Бюджет: 8 недель (F-A + F-A.2 + F-B..F-E) для v1 production-ready
+Jupyter widget + static demo + CLI runner. Phase 2 опционально через
+3-6 месяцев.
+
+**Нумерация секций после правок**: §1-9 как раньше, §10 (gallery
+coverage), §11 (бюджет+риски, был §10).
 
 **Главный риск**: React Flow DOM ceiling ~1000 nodes. Mitigation:
 collapse repeated-layer stacks в один "×N" node (UI-side abstraction);
