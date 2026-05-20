@@ -13,6 +13,10 @@ Stage A surface (this commit):
 
 from __future__ import annotations
 
+from cppmega_v4.parallelism.auto_shard import (
+    ShardingProposal,
+    suggest_sharding,
+)
 from cppmega_v4.parallelism.distributed_memory import (
     DistributedMemoryReport,
     PerRankMemory,
@@ -59,12 +63,14 @@ __all__ = [
     "GotchaSeverity",
     "ParallelismKind",
     "PerRankMemory",
+    "ShardingProposal",
     "ShardingSpec",
     "TOPOLOGY_BUILTINS",
     "a100_8x",
     "b100_8x",
     "check_gotchas",
     "estimate_distributed_memory",
+    "suggest_sharding",
     "fsdp2_only",
     "fsdp2_plus_tp",
     "gb10_quarter",
