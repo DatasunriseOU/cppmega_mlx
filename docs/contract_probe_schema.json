@@ -1,0 +1,309 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cppmega.mlx/schemas/contract_probe_report.json",
+  "title": "ContractProbeReport",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "tokenizer",
+    "parquet",
+    "findings",
+    "elapsed_ms",
+    "probe_hidden_size",
+    "dry_forward_verdict",
+    "is_clean"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0.0"
+    },
+    "tokenizer": {
+      "$ref": "#/$defs/TokenizerCapabilities"
+    },
+    "parquet": {
+      "$ref": "#/$defs/ParquetCapabilities"
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ProbeFinding"
+      }
+    },
+    "elapsed_ms": {
+      "type": "number",
+      "minimum": 0
+    },
+    "probe_hidden_size": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "dry_forward_verdict": {
+      "enum": [
+        "ok",
+        "shape_mismatch",
+        "exception",
+        "skipped"
+      ]
+    },
+    "dry_forward_detail": {
+      "type": "string"
+    },
+    "is_clean": {
+      "type": "boolean"
+    }
+  },
+  "$defs": {
+    "TokenizerCapabilities": {
+      "type": "object",
+      "required": [
+        "vocab_size",
+        "special_ids",
+        "has_fim",
+        "has_space_nl",
+        "has_code_start",
+        "has_instruction",
+        "byte_roundtrip",
+        "decoder_kind",
+        "source"
+      ],
+      "properties": {
+        "vocab_size": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "special_ids": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer"
+          }
+        },
+        "has_fim": {
+          "type": "boolean"
+        },
+        "has_space_nl": {
+          "type": "boolean"
+        },
+        "has_code_start": {
+          "type": "boolean"
+        },
+        "has_instruction": {
+          "type": "boolean"
+        },
+        "byte_roundtrip": {
+          "enum": [
+            "exact",
+            "approx",
+            "none"
+          ]
+        },
+        "decoder_kind": {
+          "enum": [
+            "custom",
+            "hf",
+            "none"
+          ]
+        },
+        "source": {
+          "type": "string"
+        }
+      }
+    },
+    "ParquetCapabilities": {
+      "type": "object",
+      "required": [
+        "schema_columns",
+        "row_count",
+        "total_bytes",
+        "has_token_ids",
+        "has_doc_ids",
+        "has_chunk_spans",
+        "has_call_edges",
+        "has_type_edges",
+        "has_provenance",
+        "side_channels",
+        "sample_seq_lens",
+        "source"
+      ],
+      "properties": {
+        "schema_columns": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ColumnSpec"
+          }
+        },
+        "row_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "total_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "has_token_ids": {
+          "type": "boolean"
+        },
+        "has_doc_ids": {
+          "type": "boolean"
+        },
+        "has_chunk_spans": {
+          "type": "boolean"
+        },
+        "has_call_edges": {
+          "type": "boolean"
+        },
+        "has_type_edges": {
+          "type": "boolean"
+        },
+        "has_provenance": {
+          "type": "boolean"
+        },
+        "side_channels": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "sample_seq_lens": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "source": {
+          "type": "string"
+        }
+      }
+    },
+    "ColumnSpec": {
+      "type": "object",
+      "required": [
+        "name",
+        "arrow_dtype",
+        "nullable",
+        "non_null_ratio"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "arrow_dtype": {
+          "type": "string"
+        },
+        "nullable": {
+          "type": "boolean"
+        },
+        "non_null_ratio": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        }
+      }
+    },
+    "DataRequirement": {
+      "type": "object",
+      "required": [
+        "key",
+        "origin",
+        "required",
+        "reason",
+        "satisfied_by"
+      ],
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "origin": {
+          "enum": [
+            "tokenizer",
+            "parquet",
+            "derived"
+          ]
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "satisfied_by": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "Alternative": {
+      "type": "object",
+      "required": [
+        "action",
+        "target",
+        "diff",
+        "cost",
+        "reason"
+      ],
+      "properties": {
+        "action": {
+          "enum": [
+            "swap_loss",
+            "swap_tokenizer",
+            "add_column",
+            "drop_brick",
+            "relax_requirement"
+          ]
+        },
+        "target": {
+          "type": "string"
+        },
+        "diff": {
+          "type": "object"
+        },
+        "cost": {
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ]
+        },
+        "reason": {
+          "type": "string"
+        }
+      }
+    },
+    "ProbeFinding": {
+      "type": "object",
+      "required": [
+        "kind",
+        "component",
+        "requirement",
+        "message",
+        "alternatives"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "satisfied",
+            "unsatisfied",
+            "warning"
+          ]
+        },
+        "component": {
+          "type": "string"
+        },
+        "requirement": {
+          "$ref": "#/$defs/DataRequirement"
+        },
+        "message": {
+          "type": "string"
+        },
+        "alternatives": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Alternative"
+          }
+        }
+      }
+    }
+  }
+}

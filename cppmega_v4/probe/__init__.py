@@ -28,6 +28,12 @@ from cppmega_v4.probe.requirements import (
     LOSS_REQUIREMENTS,
     DataRequirement,
 )
+from cppmega_v4.probe.serialize import (
+    SCHEMA_VERSION,
+    from_dict,
+    json_schema,
+    to_dict,
+)
 
 __all__ = [
     "Alternative",
@@ -39,10 +45,14 @@ __all__ = [
     "LOSS_REQUIREMENTS",
     "ParquetCapabilities",
     "ProbeFinding",
+    "SCHEMA_VERSION",
     "TokenizerCapabilities",
     "contract_probe",
     "dry_forward",
+    "from_dict",
     "generate_alternatives",
     "introspect_parquet",
     "introspect_tokenizer",
+    "json_schema",
+    "to_dict",
 ]
