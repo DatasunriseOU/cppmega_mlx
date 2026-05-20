@@ -13,6 +13,10 @@ Stage A surface (this commit):
 
 from __future__ import annotations
 
+from cppmega_v4.parallelism.api import (
+    DistributedVerificationResult,
+    verify_distributed_plan,
+)
 from cppmega_v4.parallelism.auto_shard import (
     ShardingProposal,
     suggest_sharding,
@@ -58,6 +62,7 @@ __all__ = [
     "DeviceSpec",
     "DeviceTopology",
     "DistributedMemoryReport",
+    "DistributedVerificationResult",
     "GOTCHAS",
     "Gotcha",
     "GotchaSeverity",
@@ -79,6 +84,7 @@ __all__ = [
     "m3_ultra_solo",
     "megatron_ep_only",
     "single_device",
+    "verify_distributed_plan",
     "tpu_v5p_4",
     "tpu_v6e_8",
 ]
