@@ -14,6 +14,12 @@ Stage A+B surface:
 
 from __future__ import annotations
 
+from cppmega_v4.buildspec.api import (
+    BuildError,
+    BuiltModel,
+    BuiltSequentialModel,
+    build_model,
+)
 from cppmega_v4.buildspec.diagnostics import (
     BuildDiagnostic,
     BuildDiagnosticSeverity,
@@ -59,6 +65,9 @@ __all__ = [
     "BuildDiagnostic",
     "BuildDiagnosticSeverity",
     "BuildDiagnostics",
+    "BuildError",
+    "BuiltModel",
+    "BuiltSequentialModel",
     "HeadDetectionError",
     "IFIMCompositionError",
     "IFIMRewriter",
@@ -77,6 +86,7 @@ __all__ = [
     "RewriteOrderError",
     "Rewriter",
     "adamw",
+    "build_model",
     "cross_entropy_loss",
     "custom_loss",
     "ifim_shaped_loss",
