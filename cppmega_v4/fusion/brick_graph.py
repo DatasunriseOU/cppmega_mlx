@@ -177,6 +177,10 @@ def _brick_kind_of(module: nn.Module) -> str | None:
         "GQAWithSlidingWindowBlock": "gqa_sliding",
         "CCAAttentionBlock": "cca_attention",
         "Mamba3ReferenceBlock": "mamba3",
+        # GalCov-B additions
+        "MLSTMBlock": "mlstm",
+        "AbsPosEmbedBlock": "abs_pos_embed",
+        "PerLayerEmbedBlock": "per_layer_embed",
         # gdn / kda / nsa / csa_hca / moe / mlp / engram / attention /
         # lightning_indexer are local closures in unified_superblock_v4.py
         # so their _SelfAttn / _MLP class names aren't unique. Callers

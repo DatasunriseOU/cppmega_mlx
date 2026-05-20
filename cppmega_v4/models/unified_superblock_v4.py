@@ -289,6 +289,38 @@ def _build_cca_attention(hidden_size: int, params: dict) -> nn.Module:
     return CCAAttentionBlock(cfg)
 
 
+def _build_mlstm(hidden_size: int, params: dict) -> nn.Module:
+    """xLSTM matrix-LSTM block (GalCov-B). Gallery entry #50 xLSTM 7B."""
+    from cppmega_v4.nn.mlstm import MLSTMBlock, MLSTMConfig
+    cfg = MLSTMConfig(
+        hidden_size=hidden_size,
+        head_dim=params.get("head_dim", 64),
+        rms_norm_eps=params.get("rms_norm_eps", 1e-6),
+    )
+    return MLSTMBlock(cfg)
+
+
+def _build_abs_pos_embed(hidden_size: int, params: dict) -> nn.Module:
+    """Learned absolute positional embedding (GalCov-B). Gallery #1 GPT-2 XL."""
+    from cppmega_v4.nn.abs_pos_embed import AbsPosEmbedBlock, AbsPosEmbedConfig
+    cfg = AbsPosEmbedConfig(
+        hidden_size=hidden_size,
+        max_position_embeddings=params.get("max_position_embeddings", 4096),
+    )
+    return AbsPosEmbedBlock(cfg)
+
+
+def _build_per_layer_embed(hidden_size: int, params: dict) -> nn.Module:
+    """Per-layer scaled embedding (GalCov-B). Gallery #57 Gemma 4 E2B, #58 E4B."""
+    from cppmega_v4.nn.per_layer_embed import PerLayerEmbedBlock, PerLayerEmbedConfig
+    cfg = PerLayerEmbedConfig(
+        hidden_size=hidden_size,
+        layer_index=params.get("layer_index", 0),
+        num_layers=params.get("num_layers", 32),
+    )
+    return PerLayerEmbedBlock(cfg)
+
+
 def _build_mamba3(hidden_size: int, params: dict) -> nn.Module:
     """Mamba-3 SSM reference block (from ``cppmega_mlx.nn.mamba3``).
 
@@ -462,6 +494,9 @@ BLOCK_BUILDERS: dict[str, Callable[[int, dict], nn.Module]] = {
     "gqa_sliding": _build_gqa_sliding,
     "cca_attention": _build_cca_attention,
     "mamba3": _build_mamba3,
+    "mlstm": _build_mlstm,
+    "abs_pos_embed": _build_abs_pos_embed,
+    "per_layer_embed": _build_per_layer_embed,
 }
 
 

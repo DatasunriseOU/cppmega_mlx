@@ -57,6 +57,10 @@ _CATEGORY_BY_KIND: dict[str, str] = {
     # Stage D — new SDPA-backed bricks (sliding GQA, coarse causal attn)
     "gqa_sliding": "sdpa_attention",
     "cca_attention": "sdpa_attention",
+    # GalCov-B — gallery coverage bricks
+    "mlstm": "nonlinear_rnn",
+    "abs_pos_embed": "norm_or_proj",
+    "per_layer_embed": "norm_or_proj",
     # cross attention drafter
     "gemma4_drafter": "cross_attn",
     # MTP block — opaque, treat like attention for fusion purposes

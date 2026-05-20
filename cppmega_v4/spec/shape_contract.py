@@ -489,6 +489,31 @@ _CONTRACTS: dict[str, BrickShapeContract] = {
     # cross-attn / MTP
     "gemma4_drafter": _GEMMA4_DRAFTER_CONTRACT,
     "nemotron_h_mtp": _NEMOTRON_MTP_CONTRACT,
+    # GalCov-B bricks
+    "mlstm": BrickShapeContract(
+        inputs={"x": _bsh()},
+        outputs={"y": _bsh()},
+        params_elems=ShapeExpr(("7 * H * head_dim",)),
+        activations_elems=ShapeExpr(("B * S * H + B * head_dim * head_dim",)),
+        kv_cache_elems=_zero(),
+        description="xLSTM matrix-LSTM block (no self-attention)",
+    ),
+    "abs_pos_embed": BrickShapeContract(
+        inputs={"x": _bsh()},
+        outputs={"y": _bsh()},
+        params_elems=ShapeExpr(("4096 * H",)),
+        activations_elems=ShapeExpr(("B * S * H",)),
+        kv_cache_elems=_zero(),
+        description="GPT-2-style learned absolute positional embedding",
+    ),
+    "per_layer_embed": BrickShapeContract(
+        inputs={"x": _bsh()},
+        outputs={"y": _bsh()},
+        params_elems=ShapeExpr(("2 * H",)),
+        activations_elems=ShapeExpr(("B * S * H",)),
+        kv_cache_elems=_zero(),
+        description="Per-layer scaled embedding (Gemma 4 E2B/E4B)",
+    ),
 }
 
 
