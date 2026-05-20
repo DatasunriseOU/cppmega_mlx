@@ -732,6 +732,28 @@ UI poсредник: ошибки кода маппит на in-place toast + no
   - Example notebook
   - JupyterLab + JupyterLite compatibility test
 
+**Этап F-G — Tokenizer Visualizer screen (1-1.5 недели)**
+  - Новый React route/tab `/tokenizer` в Visual Builder
+  - Runtime: `@huggingface/tokenizers` (8.3 kB gzip!) принимает наш
+    `tokenizer.json` напрямую
+  - Fork `huggingface/transformers.js-examples/the-tokenizer-playground`
+    `Token.jsx` component (~30 LoC) как scaffold
+  - Greenfield слои: round-trip diff с whitespace-sentinel awareness,
+    special-token registry (6+ hue families: FIM/CODE/CONVERSATION/
+    DOC_SEP/MTP/Engram), doc_ids overlay (CodeMirror 6 Decoration.mark),
+    train/eval mask overlay (nanochat conversation render), lossy-
+    whitespace highlight с tooltip оригинала
+  - Hover-link pattern из `dqbd/tiktokenizer` (MIT) — hover token →
+    highlight все occurrences + byte tooltip
+  - Новый JSON-RPC endpoint `tokenizer.encode_visualize` (добавляется
+    в F-A schema, реализуется как Python wrapper над `CppTokenizer`)
+  - Тесты: unit (каждый special class рендерит distinct hue), system
+    (paste typical training text, verify все `<SPACE>/<NL>` visible с
+    lossy-warn badges; pack 3 docs, verify boundaries shown)
+  - Можно делать ПАРАЛЛЕЛЬНО с F-C/F-D (после F-A schema lock + F-B
+    React shell)
+  - Cм. cppmega-mlx-o0k.7
+
 **Этап F-E — JupyterLite/Pyodide static bundle + GH Pages deploy (1 неделя)**
   - Pyodide preload `cppmega_v4` (отделить от MLX runtime)
   - GitHub Pages auto-deploy on main commit
@@ -786,6 +808,126 @@ UI poсредник: ошибки кода маппит на in-place toast + no
 
 ---
 
+9.5 Tokenizer Visualizer screen (F-G)
+
+Отдельная вкладка/route в Visual Builder для визуализации **нашего
+нестандартного BPE-токенизатора**. Что нестандартного (см.
+`cpp_tokenizer.py:33-100`):
+
+  1. **`<SPACE>` (46) + `<NL>` (47) сентинели** — `[ \t]+` и `[\r\n]+`
+     collapse до BPE → round-trip **lossy** для whitespace runs > 1
+  2. **FIM tokens** — `<FIM_PREFIX>` (4), `<FIM_MIDDLE>` (5),
+     `<FIM_SUFFIX>` (6), `<FIM_INSTRUCTION>` (45)
+  3. **CODE_START** (7) для code-block delineation
+  4. **Custom regex split** — `\p{N}{1,2}` вместо GPT-4 `{1,3}`
+  5. **65,536 fixed vocab** с fail-closed contract validation
+  6. **(nanochat only)** conversation tokens, train/eval mask, AST/symbol-ID
+     per-token attributes (enriched parquet)
+  7. **doc_ids per-token** assigned during packing (data layer, не tokenizer)
+
+Стек (из 4-агентного research):
+
+  - **Runtime**: `@huggingface/tokenizers` (tokenizers.js) — **8.3 kB
+    gzip!**, Apache-2.0, принимает наш `tokenizer.json` 1:1, exposes
+    `encoding.offsets` нативно. **No WASM нужен**, JupyterLite-friendly.
+    Fallback: `tiktoken/lite` WASM (~300-700 KB) если custom BPE ranks.
+  - **React scaffold**: fork
+    `huggingface/transformers.js-examples/the-tokenizer-playground`
+    (Apache-2.0, `Token.jsx` ~30 LoC) — готовый Web Worker pattern +
+    per-token color chips.
+  - **Hover-link pattern**: steal из `dqbd/tiktokenizer` (MIT) — hover
+    token → highlight все occurrences того же ID + byte-string tooltip.
+  - **Doc-packing rendering**: CodeMirror 6 `Decoration.mark` (handles
+    100k+ decorations smooth) — нужно для multi-document packed views.
+
+Greenfield слои (~600 строк новых, не существует ни у одного из 20+
+surveyed tools):
+
+  1. **Round-trip diff** с whitespace-sentinel awareness — стрелка
+     "input → encode → decode → result" с inline diff подсвечивающим
+     где `\n\n\n` collapsed в `<NL>` (lossy warn badge).
+  2. **Special-token registry** с distinct hue families per class
+     (FIM red-family / CODE blue-family / CONVERSATION violet-family /
+     DOC_SEP green-family / MTP amber-family / Engram cyan-family).
+  3. **doc_ids overlay** — packed sequence с bracketed regions per doc;
+     hover doc boundary показывает doc_id + length.
+  4. **Train/eval mask overlay** (nanochat conversation render — GREEN
+     supervised, RED non-supervised).
+  5. **Lossy-whitespace highlight** — token с sentinel показывает
+     оригинальный raw run через hover tooltip.
+  6. **Per-token AST depth / symbol-ID badges** (nanochat enriched
+     parquet, опционально).
+
+API endpoint (новый в F-A JSON schema):
+
+```json
+{
+  "method": "tokenizer.encode_visualize",
+  "params": {
+    "text": "def foo():\n\n\n    return 1\n",
+    "tokenizer_path": "cppmega_mlx/tokenizer/tokenizer.json",
+    "show": ["offsets", "specials", "doc_ids", "round_trip", "mask"]
+  }
+}
+```
+
+```json
+{
+  "result": {
+    "token_ids": [4, 1234, 567, 47, 7, 89, ...],
+    "offsets":   [[0,0], [0,3], [4,7], [11,14], [14,14], [15,21], ...],
+    "special_classes": [
+      {"id": 4, "name": "<FIM_PREFIX>", "class": "fim"},
+      {"id": 47, "name": "<NL>", "class": "whitespace_sentinel",
+       "original_run": "\n\n\n", "lossy": true},
+      {"id": 7, "name": "<CODE_START>", "class": "code"}
+    ],
+    "doc_ids": [0, 0, 0, 0, 0, 1, 1, 1, ...],
+    "round_trip": "def foo():\n    return 1\n",
+    "round_trip_diff": {
+      "equal": false,
+      "diffs": [{"input_span": [11,14], "result_span": [11,12],
+                 "reason": "<NL>(47) sentinel collapsed \\n\\n\\n → \\n"}]
+    },
+    "mask": [1, 1, 1, 0, 0, 1, 1, 1, ...]
+  }
+}
+```
+
+UI layout вкладки:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ Tab: Architecture / Loss / Optim / [Tokenizer] / Sharding / Gotchas │
+├─────────────────────────────────────────────────────────────────────┤
+│ ┌─ Input ─────────────────────┐ ┌─ Tokenizer ──────────────────┐    │
+│ │ <textarea editable>         │ │ tokenizer.json: [   ▼  load] │    │
+│ │ def foo():                  │ │ Vocab: 65,536                │    │
+│ │                             │ │ Special class filters:       │    │
+│ │     return 1                │ │  [✓ FIM] [✓ CODE] [✓ NL/SPACE]    │
+│ │                             │ │  [✓ DOC] [✓ MTP] [✓ Engram]  │    │
+│ └─────────────────────────────┘ └──────────────────────────────┘    │
+│ ┌─ Tokens (147) ────────────────────────────────────────────────┐   │
+│ │ ░░░def░░░ ░░░ foo░░ ▒(▒ ▒)▒ ▒:▒ █<NL>█ █<NL>█ ░░░return░░░  │   │
+│ │ ░░░ 1░░░ ▒<EOS>▒                                              │   │
+│ │ (hover any token → tooltip: id=1234, bytes=" foo", class=word)│   │
+│ └───────────────────────────────────────────────────────────────┘   │
+│ ┌─ Round-trip ──────────────────────────────────────────────────┐   │
+│ │ Input:  "def foo():\n\n\n    return 1\n"          [147 chars] │   │
+│ │ Output: "def foo():\n    return 1\n"              [145 chars] │   │
+│ │ ⚠ LOSSY: 1 collapse event at char 11               [view diff]│   │
+│ └───────────────────────────────────────────────────────────────┘   │
+│ ┌─ Doc packing ─────────────────────────────────────────────────┐   │
+│ │ [doc_0──────────][doc_1──────────────][doc_2──────] (3 docs)  │   │
+│ │ CodeMirror with vertical brackets per doc boundary            │   │
+│ └───────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+См. F-G ticket (`cppmega-mlx-o0k.7`).
+
+---
+
 10. Покрытие Раschka LLM Architecture Gallery (71 модель)
 
 Прогнал список галереи против наших 22 bricks + 12 presets.
@@ -829,9 +971,10 @@ bricks, parallel-block topology, gallery coverage tests.
 
 11. Бюджет + риски
 
-Бюджет: 8 недель (F-A + F-A.2 + F-B..F-E) для v1 production-ready
-Jupyter widget + static demo + CLI runner. Phase 2 опционально через
-3-6 месяцев.
+Бюджет: 9-9.5 недель (F-A + F-A.2 + F-B..F-E + F-G) для v1 production-ready
+Jupyter widget + static demo + CLI runner + tokenizer visualizer.
+F-G можно делать параллельно с F-C/F-D, поэтому wall-clock остаётся
+~8 недель. Phase 2 опционально через 3-6 месяцев.
 
 **Нумерация секций после правок**: §1-9 как раньше, §10 (gallery
 coverage), §11 (бюджет+риски, был §10).
