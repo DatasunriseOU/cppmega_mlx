@@ -765,6 +765,34 @@ UI poсредник: ошибки кода маппит на in-place toast + no
     React shell)
   - См. cppmega-mlx-o0k.7
 
+**Этап F-H — Training Data Inspector (2 недели)**
+  - Новый React route/tab `/data` для preview enriched parquet
+  - Runtime: `hyparquet` (pure JS, zero WASM, ~50 kB!) default
+    streams from URL; lazy DuckDB-WASM (4-6 MB) для SQL filter
+  - Virtualized grid через `hyparam/hightable` (1M+ packs smooth)
+  - Greenfield слои (~900 LoC, не существует ни у кого): per-token
+    ribbon timeline (1 ribbon per channel — int=palette, bool=binary,
+    float=gradient), FIM tri-pane mode, pack pagination, forward-
+    signature sidecar (статический mapping parquet column → forward
+    kwarg + consumers), channel inspector hover tooltip, symbol-ID/
+    call-graph mini-graph, multi-source Sankey, optional SQL filter
+  - Reuse F-G Universal Tokenizer Playground component для tokenize/
+    detokenize preview pane
+  - Новый Python module `cppmega_v4.data.preview` — RuntimeParquet
+    adapter поверх pyarrow.parquet (Jupyter mode); raw rows для
+    JupyterLite browser-side decode
+  - JSON-RPC endpoint `data.preview_parquet` (в F-A schema):
+    source + pack_offset/limit + channels[] + tokenizer + optional
+    filter_sql; response per pack с channels dict + detokenized_text
+    + forward_signature mapping
+  - Тесты: unit (каждый channel renderer, FIM detection, forward-
+    signature mapping для 22 bricks), system (load nanochat enriched
+    parquet, paginate через 100 packs, verify все 18 channels render;
+    load cppmega.mlx packed parquet с subset), perf (<200ms на pack
+    load + ribbon render; pagination <50ms per page)
+  - Можно делать ПАРАЛЛЕЛЬНО с F-C/F-D после F-A schema + F-G runtime
+  - См. cppmega-mlx-o0k.8
+
 **Этап F-E — JupyterLite/Pyodide static bundle + GH Pages deploy (1 неделя)**
   - Pyodide preload `cppmega_v4` (отделить от MLX runtime)
   - GitHub Pages auto-deploy on main commit
@@ -1000,6 +1028,165 @@ Cм. F-G ticket (`cppmega-mlx-o0k.7`).
 
 ---
 
+9.6 Training Data Inspector — parquet preview + per-token metadata (F-H)
+
+Отдельная вкладка `/data` в Visual Builder. У нас не просто token
+streams — у нас **enriched parquet** с per-token metadata. nanochat
+schema (`tokenized_enriched_schema.py:64-176`) шире всех:
+
+  - **Universal**: `input_ids`, `target_ids`, `loss_mask`, `doc_ids`,
+    `pack_id`, `valid_token_count`, `num_docs`
+  - **Platform**: `platform_ids` (113-ID vocab: OS/arch/compiler/GPU)
+  - **AST**: `token_ast_depth`, `token_sibling_index`, `token_ast_node_type`
+  - **Structure**: `token_structure_ids`, `token_dep_levels`
+  - **Semantic**: `token_symbol_ids`, `token_call_targets`,
+    `token_type_refs`, `token_def_use`
+  - **Code scopes**: `token_chunk_starts/ends/kinds/dep_levels`
+  - **Graph edges**: `token_call_edges`, `token_type_edges`
+  - **Temporal/diff**: `token_change_mask_pre/post`, `hunk_id_per_token`,
+    `edit_op_per_token`
+
+cppmega.mlx mirrors subset (`parquet_dataset.py:34-41` aliases:
+`token_structure_ids`, `token_dep_levels`, `ast_depth_ids`,
+`sibling_index_ids`, `node_type_ids`). `LMTokenBatch` dataclass
+шифрует это в model.forward().
+
+### 9.6.1 Browser parquet stack (WASM-preferred)
+
+| Pick | Bundle | When |
+|---|---|---|
+| **`hyparquet`** (pure JS) | ~50 kB, **zero WASM** | default — streams from URL, JupyterLite-friendly |
+| `hyparam/hightable` | small | virtualized grid render (1M+ packs smooth) |
+| `apache-arrow` JS | small | columnar manipulation в browser |
+| `DuckDB-WASM` 1.33 | ~4-6 MB | lazy-load когда юзеру нужен SQL filter |
+| `parquet-wasm` 0.7.1 | 456 KB brotli | optional, для wide-schema decode speed |
+
+Reference: `XiangpengHao/parquet-viewer` (Rust+Dioxus WASM build).
+
+### 9.6.2 UI layout
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│ Tab: [Architecture/Loss/Optim/Tokenizer/Data/Sharding/Gotchas]    │
+├────────────────────────────────────────────────────────────────────┤
+│ ┌─ Source ──────────┐ ┌─ Channel toggles ────────────────────┐    │
+│ │ [browse...    ▼]  │ │ [✓doc_id] [✓loss_mask] [✓platform]   │    │
+│ │ packed_v3_001.pq  │ │ [✓ast_depth] [□call_edges] [□type]   │    │
+│ │ 4096 packs        │ │ [✓change_mask] [□hunk_id]            │    │
+│ └───────────────────┘ └──────────────────────────────────────┘    │
+│ ┌─ Pack browser ─────────────────────────────────────────────┐    │
+│ │ pack_id: 0  num_docs: 3  valid: 4090  [< prev] [next >]    │    │
+│ │ Token strip:  ░def░ ░fib░ ░on░ ░acci░ ░<NL>░ ...           │    │
+│ │ Ribbon: doc_id   [─doc_0──][doc_1──][doc_2──]              │    │
+│ │ Ribbon: loss_mask[████████░░░░████░░]                       │    │
+│ │ Ribbon: ast_depth[▁▂▃▄▅▄▃▂▁▁▂▃▄▅▄▃▂▁]                      │    │
+│ │ Ribbon: platform [▓gb10▓▓▓▓ ▒linux/x86▒▒]                  │    │
+│ │ Ribbon: change   [    ▰▰▰ pre-edit ▰▰▰    ]                │    │
+│ └────────────────────────────────────────────────────────────┘    │
+│ ┌─ Forward signature sidecar ────────────────────────────────┐    │
+│ │ В model.forward() для этого pack:                          │    │
+│ │  input_ids:     tensor[2048] int32                         │    │
+│ │  target_ids:    tensor[2048] int32  ← target_ids col       │    │
+│ │  loss_mask:     tensor[2048] bool   ← loss_mask col        │    │
+│ │  doc_ids:       tensor[2048] int32  ← cumsum from EOS      │    │
+│ │  platform_ids:  tensor[2048] int32  consumer: platform_emb │    │
+│ │  ast_depth_ids: tensor[2048] int32  consumer: structure    │    │
+│ │  (gdn needs doc_ids, engram needs chunk_starts+kinds,      │    │
+│ │   mhc needs symbol_ids)                                    │    │
+│ └────────────────────────────────────────────────────────────┘    │
+│ ┌─ Tokenize/Detokenize preview (reuses F-G) ────────────────┐    │
+│ │ raw text → tokens → decode round-trip diff                 │    │
+│ └────────────────────────────────────────────────────────────┘    │
+│ ┌─ Multi-source mix (Sankey, optional) ──────────────────────┐    │
+│ │ [web 30%]─┐                                                │    │
+│ │           ├─→[mixed_pack_001..1000]                        │    │
+│ │ [code 70%]┘                                                │    │
+│ └────────────────────────────────────────────────────────────┘    │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+### 9.6.3 Greenfield слои (~900 LoC)
+
+Никто из 9+ обследованных tools не делает per-token overlay внутри
+packed sequence. Что строим:
+
+  1. Per-token **ribbon timeline** под token strip (1 ribbon per
+     channel; цвет mapping per type: int=palette, bool=binary,
+     float=gradient)
+  2. **FIM tri-pane mode** когда detected `<fim_*>` markers в pack
+  3. **Pack pagination** с virtualized rendering (1M+ packs)
+  4. **Forward-signature sidecar** — статический mapping parquet
+     column → `model.forward()` kwarg + consumers ('gdn needs
+     doc_ids', 'engram needs chunk_starts+kinds', 'mhc needs
+     symbol_ids', 'platform_emb needs platform_ids')
+  5. **Channel inspector**: hover ribbon segment → tooltip с raw value
+     + decoded interpretation (`platform_id=42 → macOS arm64 clang metal`)
+  6. **Symbol-ID/call-graph mini-graph**: click chunk boundary →
+     small graph showing call edges
+  7. **Reuse F-G Tokenizer Playground** для tokenize/detokenize preview
+  8. **Multi-source mix Sankey** (optional, читает '0.3 web 0.7 code')
+  9. **SQL filter mode** (DuckDB-WASM lazy-load) — `WHERE doc_count>5
+     AND any(loss_mask==0)`
+
+### 9.6.4 Production-frequency channels (research)
+
+Top 5 metadata channels in production (frequency-ranked, по 4-agent scan):
+
+  1. `document_ids` / position-reset — Llama-3, DeepSeek-V3, Jamba,
+     Nemotron (universal)
+  2. `loss_mask` (ignore_index=-100) — universal SFT
+  3. FIM `<fim_prefix/middle/suffix>` — StarCoder/2, SantaCoder,
+     DeepSeek-Coder, Code-Llama (arxiv:2207.14255)
+  4. Per-file headers `<repo_name>`, `<file_name>`, `<lang>` —
+     StarCoder family (arxiv:2305.06161, 2402.19173)
+  5. Per-document quality score (FineWeb-Edu classifier,
+     RedPajama-V2 signals) — все web mixes
+
+Related prior art: CTRL (arxiv:1909.05858), BigScience metadata
+schema, MeCo (arxiv:2501.01956), Source-Aware Training (arxiv:2404.01019).
+
+### 9.6.5 API endpoint (новый в F-A schema)
+
+```json
+{
+  "method": "data.preview_parquet",
+  "params": {
+    "source": { "type": "local_file|url|hf_dataset", "spec": "..." },
+    "pack_offset": 0, "pack_limit": 10,
+    "channels": ["doc_ids", "loss_mask", "platform_ids", "ast_depth_ids"],
+    "tokenizer": { "source": "preset", "spec": "cppmega_v3" },
+    "filter_sql": null
+  }
+}
+```
+
+Response per pack:
+```json
+{
+  "pack_id": 0, "num_docs": 3, "valid_token_count": 4090,
+  "channels": {
+    "doc_ids":   [0,0,0,0,0,1,1,1, ...],
+    "loss_mask": [1,1,1,0,0,1,1,1, ...],
+    "platform_ids": [42,42,42, ...]
+  },
+  "detokenized_text": "...",
+  "forward_signature": [
+    {"kwarg": "input_ids", "dtype": "int32", "shape": [2048],
+     "source_column": "input_ids", "consumed_by": ["all"]},
+    {"kwarg": "doc_ids", "dtype": "int32", "shape": [2048],
+     "source_column": "doc_ids", "consumed_by": ["gdn", "kda", "engram"]}
+  ]
+}
+```
+
+Backend: новый `cppmega_v4.data.preview` Python module с
+`RuntimeParquet` adapter поверх pyarrow.parquet (Jupyter mode); raw
+rows для browser-side decode (JupyterLite через hyparquet).
+
+См. F-H ticket (`cppmega-mlx-o0k.8`).
+
+---
+
 10. Покрытие Раschka LLM Architecture Gallery (71 модель)
 
 Прогнал список галереи против наших 22 bricks + 12 presets.
@@ -1043,10 +1230,12 @@ bricks, parallel-block topology, gallery coverage tests.
 
 11. Бюджет + риски
 
-Бюджет: 10 недель effort (F-A + F-A.2 + F-B..F-E + F-G universal playground
-2 нед) для v1 production-ready Jupyter widget + static demo + CLI runner +
-universal tokenizer playground. F-G параллелится с F-C/F-D, поэтому
-wall-clock остаётся ~8 недель. Phase 2 опционально через 3-6 месяцев.
+Бюджет: 12 недель effort (F-A + F-A.2 + F-B..F-E + F-G universal
+tokenizer playground 2 нед + F-H training data inspector 2 нед) для v1
+production-ready Jupyter widget + static demo + CLI runner + tokenizer
+playground + data inspector. F-G и F-H параллелятся с F-C/F-D после
+F-A schema lock; F-H также зависит от F-G runtime для tokenizer reuse.
+Wall-clock остаётся ~8-9 недель. Phase 2 опционально через 3-6 месяцев.
 
 **Нумерация секций после правок**: §1-9 как раньше, §10 (gallery
 coverage), §11 (бюджет+риски, был §10).
