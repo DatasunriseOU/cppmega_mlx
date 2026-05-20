@@ -1642,9 +1642,7 @@ def test_complete_production_fragments_stay_non_default_until_compile_and_gates(
     assert planned.plan.single_kernel_fused is False
 
 
-def test_complete_production_fragments_keep_dynamic_target_production(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_complete_production_fragments_keep_dynamic_target_production() -> None:
     region = build_path_c_model_region_from_route_symbols(
         region_name="dynamic_complete_production_region",
         route_symbols=("M", "R"),
@@ -1676,12 +1674,6 @@ def test_complete_production_fragments_keep_dynamic_target_production(
             ),
         ),
     )
-    monkeypatch.setattr(
-        path_c_fusion,
-        "_TRUSTED_PRODUCTION_SCHEDULE_IDS",
-        frozenset({"dynamic_complete_production_schedule"}),
-    )
-
     planned = plan_path_c_fusion_schedule_for_region(
         region,
         include_backward=False,
@@ -3181,6 +3173,66 @@ def test_direct_fusion_chain_splits_model_route_under_metal_buffer_limit() -> No
     ] == (shape_env.hidden_size,)
 
 
+def test_direct_fusion_chain_keeps_loss_bridge_forward_boundary_separate() -> None:
+    profile = local_gb10_quarter_profile()
+    model = SimpleNamespace(
+        name=profile.name,
+        path_c_bricks=profile.path_c_bricks,
+        config=profile.hybrid_config(),
+    )
+    fwd_region = build_path_c_model_regions_from_model(
+        model,
+        region_prefix=f"{profile.name}_path_c",
+    )[0]
+    region = build_path_c_aot_autograd_region(fwd_region)
+
+    chain = plan_path_c_direct_fusion_chain_for_region(
+        region,
+        include_backward=False,
+    )
+
+    assert chain.status == "ready"
+    assert [
+        (
+            segment.node_start,
+            segment.node_end,
+            getattr(segment, "execution_phase", None),
+            tuple(node.op_name for node in segment.region.nodes),
+        )
+        for segment in chain.segments
+    ] == [
+        (
+            0,
+            4,
+            "forward",
+            ("mamba3_mimo", "residual_rmsnorm", "m2rnn", "residual_rmsnorm"),
+        ),
+        (
+            4,
+            6,
+            "forward",
+            ("attention_qkv_projection", "sparse_mla_fp8_apply"),
+        ),
+        (
+            6,
+            9,
+            "backward",
+            (
+                "sparse_mla_fp8_apply_bwd",
+                "attention_qkv_projection_bwd",
+                "residual_rmsnorm_bwd",
+            ),
+        ),
+        (9, 11, "backward", ("m2rnn_bwd", "residual_rmsnorm_bwd")),
+        (11, 12, "backward", ("mamba3_mimo_bwd",)),
+    ]
+    for segment in chain.segments:
+        assert {
+            str(getattr(node, "backward", ""))
+            for node in segment.region.nodes
+        } != {"aot_autograd", "owner_output"}
+
+
 def test_row_phased_acceptance_fwd_bwd_template_generates_valid_source() -> None:
     region = build_mamba3_fp8_train_acceptance_fixture_region(include_backward=True)
     descriptors = (
@@ -4086,15 +4138,8 @@ def test_compile_path_c_region_requires_real_abi_for_single_kernel_fused() -> No
     assert compiled.plan.schedule_contract.declared_schedule_id == "untrusted_toy_schedule"
 
 
-def test_compile_path_c_region_marks_trusted_production_schedule_contract_verified(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_compile_path_c_region_marks_trusted_production_schedule_contract_verified() -> None:
     region = build_mamba3_fp8_train_acceptance_fixture_region()
-    monkeypatch.setattr(
-        path_c_fusion,
-        "_TRUSTED_PRODUCTION_SCHEDULE_IDS",
-        frozenset({"trusted_test_schedule"}),
-    )
     schedule_template = mark_path_c_schedule_template_for_region(
         lambda _region: _toy_path_c_model_train_block,
         region,
@@ -4122,15 +4167,8 @@ def test_compile_path_c_region_marks_trusted_production_schedule_contract_verifi
     assert compiled.plan.schedule_contract.missing_real_abi_inputs == ()
 
 
-def test_compile_path_c_region_blocks_trusted_production_missing_real_abi(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_compile_path_c_region_blocks_trusted_production_missing_real_abi() -> None:
     region = build_mamba3_fp8_train_acceptance_fixture_region()
-    monkeypatch.setattr(
-        path_c_fusion,
-        "_TRUSTED_PRODUCTION_SCHEDULE_IDS",
-        frozenset({"trusted_missing_abi_test_schedule"}),
-    )
     schedule_template = mark_path_c_schedule_template_for_region(
         lambda _region: _toy_path_c_model_train_block,
         region,
@@ -4182,9 +4220,7 @@ def test_compile_path_c_region_does_not_mark_semantically_blocked_region_fused()
     ]
 
 
-def test_compile_path_c_region_can_use_standard_tilelang_single_entry_lowerer(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_compile_path_c_region_can_use_standard_tilelang_single_entry_lowerer() -> None:
     region = build_mamba3_fp8_train_acceptance_fixture_region()
     captured: dict[str, object] = {}
 
@@ -4193,13 +4229,6 @@ def test_compile_path_c_region_can_use_standard_tilelang_single_entry_lowerer(
         captured["target"] = target
         captured["execution_backend"] = execution_backend
         return "compiled-single-entry-primfunc"
-
-    monkeypatch.setattr(path_c_fusion, "_compile_tilelang_prim_func", fake_compile)
-    monkeypatch.setattr(
-        path_c_fusion,
-        "_TRUSTED_PRODUCTION_SCHEDULE_IDS",
-        frozenset({"trusted_real_lowerer_test_schedule"}),
-    )
 
     schedule_template = mark_path_c_schedule_template_for_region(
         lambda _region: _toy_path_c_model_train_block,
@@ -4213,7 +4242,11 @@ def test_compile_path_c_region_can_use_standard_tilelang_single_entry_lowerer(
         schedule_template=schedule_template,
         schedule_name="mamba3_m2rnn_attention_fp8_train_block:toy_single_entry_real_lowerer",
         schedule_status="ready",
-        tilelang_lowerer=tilelang_single_entry_lowerer,
+        tilelang_lowerer=lambda func_or_mod, **kwargs: tilelang_single_entry_lowerer(
+            func_or_mod,
+            compile_prim_func=fake_compile,
+            **kwargs,
+        ),
     )
 
     assert isinstance(compiled, CompiledPathCRegion)
@@ -4298,9 +4331,7 @@ def test_compile_path_c_region_marks_registered_aot_backward_nodes_ready() -> No
     assert fused_path_c_plan_default_eligible(plan, clean_win) is False
 
 
-def test_compile_plan_propagates_ready_single_kernel_tilelang_plan(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_compile_plan_propagates_ready_single_kernel_tilelang_plan() -> None:
     region = build_mamba3_fp8_train_region()
     fake_autograd_plan = SimpleNamespace(
         mode="aot_autograd",
@@ -4319,13 +4350,10 @@ def test_compile_plan_propagates_ready_single_kernel_tilelang_plan(
         autograd_plan=fake_autograd_plan,
     )
 
-    monkeypatch.setattr(
-        path_c_fusion,
-        "_tilelang_compile_plan_for",
-        lambda _region, **_kwargs: fake_tilelang_plan,
+    plan = compile_path_c_region(
+        region,
+        tilelang_plan_factory=lambda _region, **_kwargs: fake_tilelang_plan,
     )
-
-    plan = compile_path_c_region(region)
 
     assert plan.schedule_name == "ready_train_block"
     assert plan.schedule_status == "ready"

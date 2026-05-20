@@ -7,6 +7,9 @@ from dataclasses import asdict, dataclass
 import mlx.core as mx
 import mlx.nn as nn
 
+from cppmega_mlx.data.platform_context import MAX_PLATFORM_IDS, PLATFORM_VOCAB_SIZE
+from cppmega_mlx.nn.platform_embedding import CppMegaPlatformEmbedding
+
 
 @dataclass(frozen=True)
 class TinyLMConfig:
@@ -17,6 +20,8 @@ class TinyLMConfig:
     ffn_hidden_size: int = 64
     max_seq_length: int = 64
     structure_vocab_size: int = 32
+    platform_vocab_size: int = PLATFORM_VOCAB_SIZE
+    platform_max_ids: int = MAX_PLATFORM_IDS
 
     def __post_init__(self) -> None:
         if self.vocab_size < 2:
@@ -27,6 +32,10 @@ class TinyLMConfig:
             raise ValueError("num_layers must be positive")
         if self.max_seq_length < 2:
             raise ValueError("max_seq_length must be at least 2")
+        if self.platform_vocab_size <= 1:
+            raise ValueError("platform_vocab_size must be greater than one")
+        if self.platform_max_ids <= 0:
+            raise ValueError("platform_max_ids must be positive")
 
     def to_dict(self) -> dict[str, int]:
         return asdict(self)
@@ -60,6 +69,11 @@ class TinyLM(nn.Module):
         self.structure_embedding = nn.Embedding(
             cfg.structure_vocab_size, cfg.hidden_size
         )
+        self.platform_embedding = CppMegaPlatformEmbedding(
+            hidden_size=cfg.hidden_size,
+            vocab_size=cfg.platform_vocab_size,
+            max_ids=cfg.platform_max_ids,
+        )
         self.layers = [TinyDecoderBlock(cfg) for _ in range(cfg.num_layers)]
         self.norm = nn.RMSNorm(cfg.hidden_size)
         self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
@@ -90,6 +104,7 @@ class TinyLM(nn.Module):
         ast_depth_ids: mx.array | None = None,
         sibling_index_ids: mx.array | None = None,
         node_type_ids: mx.array | None = None,
+        platform_ids: mx.array | None = None,
     ) -> mx.array:
         if input_ids.ndim != 2:
             raise ValueError(f"input_ids must be shaped (B, S), got {input_ids.shape}")
@@ -107,6 +122,21 @@ class TinyLM(nn.Module):
         structure_core = self._structure_core(structure_ids, dep_levels, seq_length)
         if structure_core is not None:
             hidden_states = hidden_states + self.structure_embedding(structure_core)
+
+        if platform_ids is not None:
+            if platform_ids.ndim != 2:
+                raise ValueError(
+                    f"platform_ids must be shaped (B, K), got {platform_ids.shape}"
+                )
+            if platform_ids.shape[0] != input_ids.shape[0]:
+                raise ValueError(
+                    "platform_ids batch dimension must match input batch "
+                    f"{input_ids.shape[0]}, got {platform_ids.shape[0]}"
+                )
+            hidden_states = hidden_states + self.platform_embedding(
+                platform_ids,
+                target_dtype=hidden_states.dtype,
+            )
 
         for optional_ids in (ast_depth_ids, sibling_index_ids, node_type_ids):
             if optional_ids is not None:

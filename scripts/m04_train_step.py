@@ -35,8 +35,14 @@ if str(ROOT) not in sys.path:
 
 import mlx.core as mx  # noqa: E402
 import mlx.nn as nn  # noqa: E402
-from mlx.utils import tree_unflatten  # noqa: E402
+from mlx.utils import tree_flatten, tree_unflatten  # noqa: E402
 
+from cppmega_mlx.data.batch import ensure_lm_batch  # noqa: E402
+from cppmega_mlx.data.packing import mlx_document_boundary_mask  # noqa: E402
+from cppmega_mlx.nn.attention import (  # noqa: E402
+    CausalSelfAttention,
+    sparse_mla_fp8_route_enabled,
+)
 from cppmega_mlx.data.parquet_dataset import TokenParquetDataset  # noqa: E402
 from cppmega_mlx.runtime.memory import (  # noqa: E402
     DEFAULT_METAL_RATIO,
@@ -44,6 +50,7 @@ from cppmega_mlx.runtime.memory import (  # noqa: E402
     maybe_clear_cache_after_step,
     memory_limit_api_status,
 )
+from cppmega_mlx.runtime.kernel_policy import KernelPath, selected_path  # noqa: E402
 from cppmega_mlx.runtime.path_c_fusion import (  # noqa: E402
     CompiledPathCRegion,
     PathCFusionMode,
@@ -75,6 +82,10 @@ from cppmega_mlx.recipes.pattern import expand_nam_pattern  # noqa: E402
 from cppmega_mlx.training.compiled import (  # noqa: E402
     CompiledPretrainingStep,
     PathCGradientBufferCapture,
+)
+from cppmega_mlx.training.cut_cross_entropy import (  # noqa: E402
+    DEFAULT_CHUNK_ROWS,
+    linear_cross_entropy,
 )
 from cppmega_mlx.training.loss import next_token_cut_cross_entropy  # noqa: E402
 from cppmega_mlx.training.optimizers import (  # noqa: E402
@@ -1100,11 +1111,15 @@ def path_c_direct_fusion_chain_training_runtime_contract_payload(
     value_and_grad_contract_ok = bool(
         value_and_grad_contract.get("status") == "ok"
     )
+    returns_full_model_grads = bool(
+        value_and_grad_contract.get("returns_full_model_grads", False)
+    )
     training_critical_path = bool(
         declared_training_critical_path
         and graph_binding_ok
         and value_and_grad_callable
         and value_and_grad_contract_ok
+        and returns_full_model_grads
     )
     if not runtime_installed:
         status = FP8_PATH_C_DIRECT_CHAIN_TRAINING_RUNTIME_MISSING_STATUS
@@ -1121,6 +1136,7 @@ def path_c_direct_fusion_chain_training_runtime_contract_payload(
         or not reverse_callable
         or not value_and_grad_callable
         or not value_and_grad_contract_ok
+        or not returns_full_model_grads
     ):
         status = FP8_PATH_C_DIRECT_CHAIN_TRAINING_RUNTIME_INCOMPLETE_STATUS
     elif hidden_packing_performed or not no_hidden_allocation_policy:
@@ -1147,6 +1163,7 @@ def path_c_direct_fusion_chain_training_runtime_contract_payload(
         "value_and_grad_callable": value_and_grad_callable,
         "value_and_grad_contract": value_and_grad_contract,
         "value_and_grad_contract_ok": value_and_grad_contract_ok,
+        "returns_full_model_grads": returns_full_model_grads,
         "training_critical_path_declared": declared_training_critical_path,
         "training_graph_bound": graph_binding_ok,
         "training_graph_binding": graph_binding,
@@ -1163,7 +1180,8 @@ def path_c_direct_fusion_chain_training_runtime_contract_payload(
             else "direct-chain artifacts or standalone dispatch are not enough; "
             "Path C needs explicit training-graph forward, backward/vjp, and "
             "value_and_grad hooks with caller-owned buffers, no hidden packing, "
-            "and no delegation to eager loss_and_grad"
+            "and no delegation to eager loss_and_grad; m04 critical path also "
+            "requires full-model gradients, not only selected-region gradients"
         ),
     }
 
@@ -1225,6 +1243,7 @@ def _direct_chain_value_and_grad_contract_payload(
             "uses_forward_hook": False,
             "uses_backward_or_vjp_hook": False,
             "returns_model_grads": False,
+            "returns_full_model_grads": False,
             "loss_cotangent_bridge_ready": False,
             "model_gradient_tree_ready": False,
             "delegates_to_eager_loss_and_grad": True,
@@ -1242,6 +1261,7 @@ def _direct_chain_value_and_grad_contract_payload(
             "uses_forward_hook": False,
             "uses_backward_or_vjp_hook": False,
             "returns_model_grads": False,
+            "returns_full_model_grads": False,
             "loss_cotangent_bridge_ready": False,
             "model_gradient_tree_ready": False,
             "delegates_to_eager_loss_and_grad": True,
@@ -1254,6 +1274,7 @@ def _direct_chain_value_and_grad_contract_payload(
     uses_forward = bool(payload.get("uses_forward_hook"))
     uses_reverse = bool(payload.get("uses_backward_or_vjp_hook"))
     returns_model_grads = bool(payload.get("returns_model_grads"))
+    returns_full_model_grads = bool(payload.get("returns_full_model_grads", False))
     loss_cotangent_bridge_ready = bool(payload.get("loss_cotangent_bridge_ready"))
     model_gradient_tree_ready = bool(payload.get("model_gradient_tree_ready"))
     delegates_to_eager = bool(payload.get("delegates_to_eager_loss_and_grad", True))
@@ -1281,6 +1302,7 @@ def _direct_chain_value_and_grad_contract_payload(
         "uses_forward_hook": uses_forward,
         "uses_backward_or_vjp_hook": uses_reverse,
         "returns_model_grads": returns_model_grads,
+        "returns_full_model_grads": returns_full_model_grads,
         "loss_cotangent_bridge_ready": loss_cotangent_bridge_ready,
         "model_gradient_tree_ready": model_gradient_tree_ready,
         "delegates_to_eager_loss_and_grad": delegates_to_eager,
@@ -1330,6 +1352,638 @@ def _path_c_loss_cotangent_bridge_contract_payload(
         "returns_required_loss_cotangents": returns_cotangents,
         "delegates_to_eager_loss_and_grad": delegates_to_eager,
         "hidden_packing_performed": hidden_packing,
+    }
+
+
+class PathCResidualSumSuffixLossCotangentBridge:
+    """Compute suffix loss cotangents for direct-chain residual output buffers."""
+
+    def __init__(self, *, chunk_rows: int = DEFAULT_CHUNK_ROWS) -> None:
+        self.chunk_rows = max(1, int(chunk_rows))
+
+    def loss_cotangent_bridge_contract(self) -> dict[str, Any]:
+        return {
+            "contract": PATH_C_LOSS_COTANGENT_BRIDGE_CONTRACT,
+            "returns_required_loss_cotangents": True,
+            "delegates_to_eager_loss_and_grad": False,
+            "hidden_packing_performed": False,
+            "suffix": "residual_sum_norm_lm_head_cut_cross_entropy",
+            "parameter_gradient_names": ("norm.weight_grad", "lm_head.weight_grad"),
+            "chunk_rows": self.chunk_rows,
+        }
+
+    def __call__(
+        self,
+        *,
+        model: nn.Module,
+        batch: Mapping[str, mx.array] | mx.array,
+        logical_buffers: Mapping[str, mx.array],
+        required_loss_cotangent_buffers: Sequence[str],
+        chain: Any,
+    ) -> dict[str, Any]:
+        required_names = tuple(str(name) for name in required_loss_cotangent_buffers)
+        if not required_names:
+            raise ValueError("loss cotangent bridge requires at least one grad buffer")
+        chain_required = tuple(
+            str(name) for name in _path_c_direct_chain_loss_cotangent_seed_buffers(chain)
+        )
+        if chain_required and set(required_names) != set(chain_required):
+            raise ValueError(
+                "loss cotangent bridge required buffers do not match direct-chain "
+                f"seed buffers: required={required_names!r}, chain={chain_required!r}"
+            )
+        source_names: list[str] = []
+        for name in required_names:
+            if not name.endswith("_grad"):
+                raise ValueError(
+                    f"loss cotangent seed buffer must end with '_grad': {name!r}"
+                )
+            source_names.append(name.removesuffix("_grad"))
+        sources: list[mx.array] = []
+        for name in source_names:
+            value = logical_buffers.get(name)
+            if not isinstance(value, mx.array):
+                raise ValueError(
+                    f"loss cotangent bridge missing source buffer {name!r}"
+                )
+            sources.append(value)
+        first_shape = tuple(sources[0].shape)
+        for name, value in zip(source_names[1:], sources[1:], strict=True):
+            if tuple(value.shape) != first_shape:
+                raise ValueError(
+                    "loss cotangent bridge source shapes must match; "
+                    f"{source_names[0]!r} has {first_shape}, {name!r} has "
+                    f"{tuple(value.shape)}"
+                )
+
+        lm_batch = ensure_lm_batch(batch)
+        targets = lm_batch.targets
+        if tuple(sources[0].shape[:2]) != tuple(targets.shape):
+            raise ValueError(
+                "loss cotangent bridge suffix input prefix shape "
+                f"{tuple(sources[0].shape[:2])} must match targets "
+                f"{tuple(targets.shape)}"
+            )
+        mask = lm_batch.target_mask
+        norm = getattr(model, "norm", None)
+        lm_head = getattr(model, "lm_head", None)
+        norm_weight = getattr(norm, "weight", None)
+        head_weight = getattr(lm_head, "weight", None)
+        if not isinstance(norm_weight, mx.array):
+            raise TypeError(
+                "loss cotangent bridge requires model.norm.weight as an mx.array"
+            )
+        if not isinstance(head_weight, mx.array):
+            raise TypeError(
+                "loss cotangent bridge requires model.lm_head.weight as an mx.array"
+            )
+        norm_eps = float(getattr(norm, "eps", 1e-5))
+
+        def suffix_loss(*suffix_args: mx.array) -> tuple[mx.array, mx.array]:
+            boundary_arrays = suffix_args[: len(sources)]
+            norm_weight_arg = suffix_args[-2]
+            head_weight_arg = suffix_args[-1]
+            hidden = boundary_arrays[0]
+            for boundary in boundary_arrays[1:]:
+                hidden = hidden + boundary
+            inv_rms = mx.rsqrt(
+                mx.mean(hidden * hidden, axis=-1, keepdims=True)
+                + mx.array(norm_eps, dtype=hidden.dtype)
+            )
+            normed = hidden * inv_rms * norm_weight_arg
+            token_losses = linear_cross_entropy(
+                normed,
+                head_weight_arg,
+                targets,
+                reduction="none",
+                chunk_rows=self.chunk_rows,
+                eval_chunks=False,
+            )
+            ntokens = mask.sum()
+            denom = mx.maximum(ntokens, mx.array(1.0, dtype=mx.float32))
+            loss = (token_losses * mask).astype(mx.float32).sum() / denom
+            return loss, ntokens
+
+        suffix_args = (*sources, norm_weight, head_weight)
+        argnums = tuple(range(len(suffix_args)))
+        (loss, ntokens), raw_grads = mx.value_and_grad(
+            suffix_loss,
+            argnums=argnums,
+        )(*suffix_args)
+        grads = raw_grads if isinstance(raw_grads, tuple) else (raw_grads,)
+        if len(grads) != len(suffix_args):
+            raise RuntimeError(
+                "loss cotangent bridge gradient arity mismatch: "
+                f"got {len(grads)}, expected {len(suffix_args)}"
+            )
+        cotangent_grads = grads[: len(required_names)]
+        norm_grad = grads[-2]
+        head_grad = grads[-1]
+        return {
+            "loss": loss,
+            "ntokens": ntokens,
+            "cotangents": dict(zip(required_names, cotangent_grads, strict=True)),
+            "parameter_grads": {
+                "norm.weight_grad": norm_grad,
+                "lm_head.weight_grad": head_grad,
+            },
+            "source_buffers": tuple(source_names),
+            "required_loss_cotangent_buffers": required_names,
+            "delegates_to_eager_loss_and_grad": False,
+            "hidden_packing_performed": False,
+        }
+
+
+_DOCUMENT_ID_ALIASES = ("document_ids", "doc_ids", "packing_document_ids")
+
+
+def _path_c_extract_document_ids(
+    batch: Mapping[str, Any] | mx.array,
+    *,
+    tokens: mx.array,
+) -> mx.array | None:
+    if not isinstance(batch, Mapping):
+        return None
+    present = [name for name in _DOCUMENT_ID_ALIASES if name in batch]
+    if len(present) > 1:
+        raise ValueError(
+            "batch mapping must provide only one document-id alias; got "
+            f"{present}"
+        )
+    if not present:
+        return None
+    value = batch[present[0]]
+    if not isinstance(value, mx.array):
+        raise TypeError(f"{present[0]} must be an mx.array")
+    if value.shape != tokens.shape:
+        raise ValueError(
+            f"{present[0]} must match tokens shape {tokens.shape}, got "
+            f"{value.shape}"
+        )
+    has_negative = mx.any(value.astype(mx.int32) < 0)
+    mx.eval(has_negative)
+    if bool(has_negative.item()):
+        raise ValueError(f"{present[0]} must be non-negative")
+    return value.astype(mx.int32)
+
+
+def _path_c_direct_chain_first_brick_name(chain: Any) -> str | None:
+    source_region = getattr(chain, "source_region", None)
+    metadata = getattr(source_region, "metadata", {}) or {}
+    raw_bricks = metadata.get("path_c_bricks", ())
+    try:
+        bricks = tuple(raw_bricks)
+    except TypeError:
+        bricks = ()
+    if bricks:
+        first = bricks[0]
+        if isinstance(first, Mapping) and first.get("name") is not None:
+            return str(first["name"])
+    nodes = getattr(source_region, "nodes", ()) or ()
+    if nodes:
+        return str(getattr(nodes[0], "name", ""))
+    return None
+
+
+def _path_c_direct_chain_start_layer_index(model: Any, chain: Any) -> int | None:
+    first_brick = _path_c_direct_chain_first_brick_name(chain)
+    if not first_brick:
+        return None
+    for index, layer in enumerate(getattr(model, "layers", ())):
+        names = {
+            str(getattr(layer, "path_c_brick_name", "")),
+            str(getattr(layer, "path_c_profile_brick_name", "")),
+        }
+        if first_brick in names:
+            return index
+    return None
+
+
+def _path_c_direct_chain_selected_layer_indices(
+    model: Any,
+    chain: Any,
+) -> tuple[int, ...]:
+    source_region = getattr(chain, "source_region", None)
+    metadata = getattr(source_region, "metadata", {}) or {}
+    raw_bricks = metadata.get("path_c_bricks", ())
+    try:
+        bricks = tuple(raw_bricks)
+    except TypeError:
+        bricks = ()
+    if not bricks:
+        start = _path_c_direct_chain_start_layer_index(model, chain)
+        return () if start is None else (start,)
+
+    name_to_index: dict[str, int] = {}
+    for index, layer in enumerate(getattr(model, "layers", ())):
+        for raw_name in (
+            getattr(layer, "path_c_brick_name", None),
+            getattr(layer, "path_c_profile_brick_name", None),
+        ):
+            if raw_name is not None:
+                name_to_index[str(raw_name)] = index
+
+    indices: list[int] = []
+    for brick in bricks:
+        brick_name = None
+        if isinstance(brick, Mapping):
+            brick_name = brick.get("name")
+        else:
+            brick_name = getattr(brick, "name", None)
+        if brick_name is None:
+            continue
+        index = name_to_index.get(str(brick_name))
+        if index is not None:
+            indices.append(index)
+    return tuple(dict.fromkeys(indices))
+
+
+def _path_c_model_trainable_parameter_names(model: Any) -> frozenset[str]:
+    return frozenset(
+        str(name)
+        for name, value in tree_flatten(model.trainable_parameters())
+        if isinstance(value, mx.array)
+    )
+
+
+def _path_c_model_prefix_parameter_names(
+    model: Any,
+    *,
+    end_layer_index: int,
+    include_boundary_norm: bool = False,
+) -> frozenset[str]:
+    names: set[str] = set()
+    for raw_name, value in tree_flatten(model.trainable_parameters()):
+        if not isinstance(value, mx.array):
+            continue
+        name = str(raw_name)
+        if name.startswith("layers."):
+            parts = name.split(".", 2)
+            if len(parts) >= 3 and parts[1].isdigit() and int(parts[1]) < end_layer_index:
+                names.add(name)
+            continue
+        if name.startswith(("norm.", "lm_head.", "mtp_head.")):
+            continue
+        names.add(name)
+    if include_boundary_norm:
+        boundary_norm_name = f"layers.{end_layer_index}.norm.weight"
+        trainable_names = _path_c_model_trainable_parameter_names(model)
+        if boundary_norm_name in trainable_names:
+            names.add(boundary_norm_name)
+    return frozenset(names)
+
+
+def _path_c_strip_gradient_suffix(name: str) -> str:
+    return name[: -len("_grad")] if name.endswith("_grad") else name
+
+
+def _path_c_gradient_tree_subset(grads: Any, names: frozenset[str]) -> Any:
+    pairs = [
+        (str(name), value)
+        for name, value in tree_flatten(grads)
+        if str(name) in names and isinstance(value, mx.array)
+    ]
+    present = {name for name, _ in pairs}
+    missing = sorted(names.difference(present))
+    if missing:
+        raise ValueError(
+            "prefix VJP did not return gradients for required parameters: "
+            f"{missing[:8]}"
+        )
+    return tree_unflatten(pairs)
+
+
+def _path_c_model_gradient_tree_strip_grad_suffixes(grads: Any) -> Any:
+    pairs: list[tuple[str, mx.array]] = []
+    seen: set[str] = set()
+    for raw_name, value in tree_flatten(grads):
+        if not isinstance(value, mx.array):
+            continue
+        name = _path_c_strip_gradient_suffix(str(raw_name))
+        if name in seen:
+            raise ValueError(f"duplicate model gradient name after suffix strip: {name}")
+        seen.add(name)
+        pairs.append((name, value))
+    return tree_unflatten(pairs)
+
+
+def _path_c_model_gradient_tree_from_parameter_grads(
+    parameter_grads: Mapping[str, Any],
+) -> Any:
+    pairs: list[tuple[str, mx.array]] = []
+    seen: set[str] = set()
+    for raw_name, value in sorted(parameter_grads.items()):
+        name = _path_c_strip_gradient_suffix(str(raw_name))
+        if name in seen:
+            raise ValueError(f"duplicate bridge parameter gradient {name!r}")
+        if not isinstance(value, mx.array):
+            raise TypeError(
+                f"loss cotangent bridge parameter grad {raw_name!r} must be an mx.array"
+            )
+        seen.add(name)
+        pairs.append((name, value))
+    return tree_unflatten(pairs)
+
+
+def _path_c_merge_model_gradient_trees(*trees: Any) -> Any:
+    merged: list[tuple[str, mx.array]] = []
+    seen: set[str] = set()
+    for tree in trees:
+        for raw_name, value in tree_flatten(tree):
+            if not isinstance(value, mx.array):
+                continue
+            name = str(raw_name)
+            if name in seen:
+                raise ValueError(f"duplicate model gradient {name!r}")
+            seen.add(name)
+            merged.append((name, value))
+    return tree_unflatten(sorted(merged, key=lambda item: item[0]))
+
+
+def _path_c_inactive_sparse_dsa_dense_parameter_names(
+    model: Any,
+    chain: Any,
+) -> frozenset[str]:
+    trainable_names = _path_c_model_trainable_parameter_names(model)
+    inactive: set[str] = set()
+    for index in _path_c_direct_chain_selected_layer_indices(model, chain):
+        try:
+            layer = tuple(getattr(model, "layers", ()))[index]
+        except IndexError:
+            continue
+        attention = getattr(layer, "attention_block", None)
+        if not isinstance(attention, CausalSelfAttention):
+            continue
+        if attention.config.mode != "dsa" or attention.sparse_kv_proj is None:
+            continue
+        for suffix in (
+            "block.k_proj.weight",
+            "block.k_proj.bias",
+            "block.v_proj.weight",
+            "block.v_proj.bias",
+        ):
+            name = f"layers.{index}.{suffix}"
+            if name in trainable_names:
+                inactive.add(name)
+    return frozenset(inactive)
+
+
+def _path_c_zero_gradient_tree_for_parameters(
+    model: Any,
+    names: frozenset[str],
+) -> Any:
+    if not names:
+        return tree_unflatten([])
+    parameters = {
+        str(name): value
+        for name, value in tree_flatten(model.trainable_parameters())
+        if isinstance(value, mx.array)
+    }
+    pairs: list[tuple[str, mx.array]] = []
+    missing = sorted(names.difference(parameters))
+    if missing:
+        raise ValueError(
+            "cannot build zero gradients for unknown parameters: "
+            f"{missing[:8]}"
+        )
+    for name in sorted(names):
+        pairs.append((name, mx.zeros_like(parameters[name])))
+    return tree_unflatten(pairs)
+
+
+def path_c_model_prefix_hidden_states(
+    model: nn.Module,
+    batch: Mapping[str, mx.array] | mx.array,
+    *,
+    end_layer_index: int,
+) -> mx.array:
+    """Return decoder hidden states immediately before a Path C route region."""
+
+    lm_batch = ensure_lm_batch(batch)
+    input_ids = lm_batch.inputs
+    layers = tuple(getattr(model, "layers", ()))
+    if end_layer_index < 0 or end_layer_index > len(layers):
+        raise ValueError(
+            f"end_layer_index must be within [0, {len(layers)}], got "
+            f"{end_layer_index}"
+        )
+    if input_ids.ndim != 2:
+        raise ValueError(f"input_ids must be shaped (B, S), got {input_ids.shape}")
+
+    seq_length = input_ids.shape[1]
+    config = getattr(model, "config", None)
+    max_seq_length = int(getattr(config, "max_seq_length", seq_length))
+    if seq_length > max_seq_length:
+        raise ValueError(
+            f"sequence length {seq_length} exceeds max_seq_length {max_seq_length}"
+        )
+
+    positions = mx.arange(seq_length)[None, :]
+    hidden_states = model.token_embedding(input_ids) + model.position_embedding(
+        positions
+    )
+    ngram_hash_embedding = getattr(model, "ngram_hash_embedding", None)
+    if ngram_hash_embedding is not None:
+        hidden_states = hidden_states + ngram_hash_embedding(input_ids)
+
+    structure_embedding = getattr(model, "structure_embedding", None)
+    if structure_embedding is not None:
+        structure_embeddings = structure_embedding(
+            structure_ids=lm_batch.structure_ids[:, :-1]
+            if lm_batch.structure_ids is not None
+            else None,
+            dep_levels=lm_batch.dep_levels[:, :-1]
+            if lm_batch.dep_levels is not None
+            else None,
+            ast_depth_ids=lm_batch.ast_depth_ids[:, :-1]
+            if lm_batch.ast_depth_ids is not None
+            else None,
+            sibling_index_ids=lm_batch.sibling_index_ids[:, :-1]
+            if lm_batch.sibling_index_ids is not None
+            else None,
+            node_type_ids=lm_batch.node_type_ids[:, :-1]
+            if lm_batch.node_type_ids is not None
+            else None,
+            target_dtype=hidden_states.dtype,
+        )
+        if structure_embeddings.ndim == hidden_states.ndim:
+            hidden_states = hidden_states + structure_embeddings
+
+    document_ids = _path_c_extract_document_ids(batch, tokens=lm_batch.tokens)
+    document_ids = document_ids[:, :-1] if document_ids is not None else None
+    prefix_layers = layers[:end_layer_index]
+    mask: mx.array | str | None = None
+    if any(getattr(layer, "backend", None) == "attention" for layer in prefix_layers):
+        if document_ids is None:
+            dsa_path_c = (
+                selected_path("sparse_mla") is KernelPath.PATH_C
+                and sparse_mla_fp8_route_enabled(KernelPath.PATH_C)
+                and any(
+                    getattr(layer, "backend", None) == "attention"
+                    and isinstance(getattr(layer, "block", None), CausalSelfAttention)
+                    and layer.block.config.mode == "dsa"
+                    for layer in prefix_layers
+                )
+            )
+            mask = (
+                "causal"
+                if dsa_path_c
+                else nn.MultiHeadAttention.create_additive_causal_mask(
+                    seq_length,
+                    dtype=hidden_states.dtype,
+                )
+            )
+        else:
+            mask = mlx_document_boundary_mask(
+                document_ids,
+                causal=True,
+                expand_heads=True,
+            )
+
+    if bool(getattr(config, "grad_checkpoint", False)):
+        for layer in prefix_layers:
+            if getattr(layer, "backend", None) == "engram" and document_ids is not None:
+                hidden_states = mx.checkpoint(layer)(
+                    hidden_states,
+                    mask,
+                    doc_ids=document_ids,
+                )
+            else:
+                hidden_states = mx.checkpoint(layer)(hidden_states, mask)
+        return hidden_states
+
+    attention_layer_idx = 0
+    for layer in prefix_layers:
+        if getattr(layer, "backend", None) == "attention":
+            hidden_states = layer(
+                hidden_states,
+                mask,
+                attention_layer_idx=None,
+            )
+            attention_layer_idx += 1
+        elif getattr(layer, "backend", None) == "engram":
+            hidden_states = layer(hidden_states, mask, doc_ids=document_ids)
+        else:
+            hidden_states = layer(hidden_states, mask)
+    return hidden_states
+
+
+def path_c_prefix_gradient_tree_from_hidden_cotangent(
+    *,
+    model: nn.Module,
+    batch: Mapping[str, mx.array] | mx.array,
+    hidden_cotangent: mx.array,
+    normed_hidden_cotangent: mx.array | None = None,
+    chain: Any,
+) -> Any:
+    start_layer_index = _path_c_direct_chain_start_layer_index(model, chain)
+    if start_layer_index is None:
+        raise ValueError("cannot resolve Path C direct-chain start layer")
+    prefix_parameter_names = _path_c_model_prefix_parameter_names(
+        model,
+        end_layer_index=start_layer_index,
+        include_boundary_norm=normed_hidden_cotangent is not None,
+    )
+
+    def prefix_vjp_loss(
+        prefix_model: nn.Module,
+        prefix_batch: Mapping[str, mx.array] | mx.array,
+    ) -> mx.array:
+        hidden = path_c_model_prefix_hidden_states(
+            prefix_model,
+            prefix_batch,
+            end_layer_index=start_layer_index,
+        )
+        if tuple(hidden.shape) != tuple(hidden_cotangent.shape):
+            raise ValueError(
+                "prefix hidden shape must match direct-chain hidden_grad shape: "
+                f"{tuple(hidden.shape)} vs {tuple(hidden_cotangent.shape)}"
+            )
+        loss = (
+            hidden.astype(mx.float32) * hidden_cotangent.astype(mx.float32)
+        ).sum()
+        if normed_hidden_cotangent is not None:
+            layers = tuple(getattr(prefix_model, "layers", ()))
+            boundary_layer = layers[start_layer_index]
+            normed_hidden = boundary_layer.norm(hidden)
+            if tuple(normed_hidden.shape) != tuple(normed_hidden_cotangent.shape):
+                raise ValueError(
+                    "prefix normed hidden shape must match direct-chain "
+                    "residual_norm_hidden_grad shape: "
+                    f"{tuple(normed_hidden.shape)} vs "
+                    f"{tuple(normed_hidden_cotangent.shape)}"
+                )
+            loss = loss + (
+                normed_hidden.astype(mx.float32)
+                * normed_hidden_cotangent.astype(mx.float32)
+            ).sum()
+        return loss
+
+    _value, grads = nn.value_and_grad(model, prefix_vjp_loss)(model, batch)
+    return _path_c_gradient_tree_subset(grads, prefix_parameter_names)
+
+
+def _path_c_direct_chain_full_gradient_coverage_payload(
+    *,
+    model: Any | None,
+    chain: Any,
+    bridge_contract: Mapping[str, Any],
+) -> dict[str, Any]:
+    if model is None:
+        return {
+            "full_model_gradient_tree_ready": False,
+            "reason": "runtime was not constructed with a model",
+            "covered_parameter_count": 0,
+            "trainable_parameter_count": 0,
+            "missing_parameter_names": [],
+        }
+    start_layer_index = _path_c_direct_chain_start_layer_index(model, chain)
+    if start_layer_index is None:
+        return {
+            "full_model_gradient_tree_ready": False,
+            "reason": "cannot resolve direct-chain start layer",
+            "covered_parameter_count": 0,
+            "trainable_parameter_count": len(_path_c_model_trainable_parameter_names(model)),
+            "missing_parameter_names": [],
+        }
+    bridge_plan = path_c_direct_fusion_chain_value_and_grad_bridge_plan(
+        chain=chain,
+        model=model,
+    )
+    direct_names = {
+        _path_c_strip_gradient_suffix(name)
+        for name in bridge_plan.get("parameter_gradient_tree_names", ())
+    }
+    prefix_names = _path_c_model_prefix_parameter_names(
+        model,
+        end_layer_index=start_layer_index,
+        include_boundary_norm=True,
+    )
+    suffix_names = {
+        _path_c_strip_gradient_suffix(str(name))
+        for name in bridge_contract.get("parameter_gradient_names", ())
+    }
+    inactive_zero_names = _path_c_inactive_sparse_dsa_dense_parameter_names(
+        model,
+        chain,
+    )
+    trainable_names = _path_c_model_trainable_parameter_names(model)
+    covered = direct_names | prefix_names | suffix_names | inactive_zero_names
+    missing = sorted(trainable_names.difference(covered))
+    return {
+        "full_model_gradient_tree_ready": not missing,
+        "reason": "prefix, selected direct-chain, suffix, and inactive zero gradients cover all trainable parameters"
+        if not missing
+        else "prefix, selected direct-chain, suffix, and inactive zero gradients do not cover all trainable parameters",
+        "start_layer_index": start_layer_index,
+        "covered_parameter_count": len(covered.intersection(trainable_names)),
+        "trainable_parameter_count": len(trainable_names),
+        "missing_parameter_names": missing,
+        "prefix_parameter_count": len(prefix_names),
+        "direct_chain_parameter_count": len(direct_names),
+        "suffix_parameter_count": len(suffix_names),
+        "inactive_zero_gradient_parameter_count": len(inactive_zero_names),
+        "inactive_zero_gradient_parameter_names": sorted(inactive_zero_names),
     }
 
 
@@ -1877,6 +2531,9 @@ def _path_c_direct_chain_plan_payload(chain: Any) -> dict[str, Any]:
                     str(node.op_name)
                     for node in getattr(segment.region, "nodes", ())
                 ],
+                "execution_phase": str(
+                    getattr(segment, "execution_phase", "unknown")
+                ),
                 "status": str(segment.status),
                 "reason": str(segment.reason),
                 "physical_abi_policy": str(segment.physical_abi_policy),
@@ -2029,6 +2686,7 @@ def run_path_c_direct_fusion_chain_route(
     logical_owner: Any | None = None,
     artifacts: Any,
     mx_module: Any = mx,
+    execution_phases: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Execute callable direct-chain segment artifacts with caller-owned buffers."""
 
@@ -2051,9 +2709,15 @@ def run_path_c_direct_fusion_chain_route(
     if resolved_buffers is None:
         raise ValueError("direct-chain route requires logical buffers")
     buffers = {str(name): value for name, value in resolved_buffers.items()}
+    selected_phases = (
+        None if execution_phases is None else {str(phase) for phase in execution_phases}
+    )
     segment_results: list[dict[str, Any]] = []
     started = time.perf_counter()
     for segment in getattr(chain, "segments", ()):
+        execution_phase = str(getattr(segment, "execution_phase", "unknown"))
+        if selected_phases is not None and execution_phase not in selected_phases:
+            continue
         artifact = _path_c_direct_chain_artifact_for_segment(artifacts, segment)
         target = getattr(segment, "schedule_target", None)
         if target is None or not callable(artifact):
@@ -2095,6 +2759,7 @@ def run_path_c_direct_fusion_chain_route(
                 "index": int(segment.index),
                 "status": "ok",
                 "region_name": segment.region.name,
+                "execution_phase": execution_phase,
                 "schedule_id": target.schedule_id,
                 "kernel_arg_count": len(arrays),
                 "kernel_args": list(ordered_names),
@@ -2107,6 +2772,9 @@ def run_path_c_direct_fusion_chain_route(
         "runtime_uses_direct_fusion_chain": True,
         "segment_count": len(segment_results),
         "elapsed_s": time.perf_counter() - started,
+        "execution_phases": None
+        if selected_phases is None
+        else sorted(selected_phases),
         "binding": binding,
         "segments": segment_results,
     }
@@ -2129,6 +2797,7 @@ class PathCDirectFusionChainTrainingRuntime:
         owner_name: str,
         training_critical_path: bool = False,
         loss_cotangent_bridge: Any | None = None,
+        model: Any | None = None,
     ) -> None:
         if logical_buffers is not None and logical_owner is not None:
             raise ValueError("logical_buffers and logical_owner are mutually exclusive")
@@ -2139,6 +2808,7 @@ class PathCDirectFusionChainTrainingRuntime:
         self.owner_name = str(owner_name)
         self.training_critical_path = bool(training_critical_path)
         self.loss_cotangent_bridge = loss_cotangent_bridge
+        self.model = model
         self._training_graph_binding: dict[str, Any] | None = None
         self.binding = path_c_direct_fusion_chain_runtime_binding_payload(
             chain=chain,
@@ -2183,6 +2853,13 @@ class PathCDirectFusionChainTrainingRuntime:
                 "direct-chain loss cotangent bridge is incomplete: "
                 f"{bridge_contract.get('status')}"
             )
+        run_path_c_direct_fusion_chain_route(
+            chain=self.chain,
+            logical_buffers=self.logical_buffers,
+            logical_owner=self.logical_owner,
+            artifacts=self.artifacts,
+            execution_phases=("forward",),
+        )
         buffers, _ = _path_c_direct_chain_resolved_logical_buffers(
             logical_buffers=self.logical_buffers,
             logical_owner=self.logical_owner,
@@ -2219,17 +2896,123 @@ class PathCDirectFusionChainTrainingRuntime:
             chain=self.chain,
             logical_buffers=buffers,
             artifacts=self.artifacts,
+            execution_phases=("backward",),
         )
         bridge_plan = path_c_direct_fusion_chain_value_and_grad_bridge_plan(
             chain=self.chain,
             model=model,
             logical_buffers=buffers,
         )
-        grads = path_c_model_gradient_tree_from_direct_buffers(
+        direct_grads = path_c_model_gradient_tree_from_direct_buffers(
             model=model,
             logical_buffers=buffers,
             parameter_gradient_names=bridge_plan["parameter_gradient_tree_names"],
         )
+        parameter_grads = bridge_payload.get("parameter_grads", {})
+        if parameter_grads is None:
+            parameter_grads = {}
+        if not isinstance(parameter_grads, Mapping):
+            raise TypeError("loss cotangent bridge parameter_grads must be a Mapping")
+        coverage = _path_c_direct_chain_full_gradient_coverage_payload(
+            model=model,
+            chain=self.chain,
+            bridge_contract=bridge_contract,
+        )
+        if coverage.get("full_model_gradient_tree_ready"):
+            required_bridge_parameter_names = {
+                str(name)
+                for name in bridge_contract.get("parameter_gradient_names", ())
+            }
+            missing_bridge_parameters = sorted(
+                required_bridge_parameter_names.difference(
+                    str(name) for name in parameter_grads
+                )
+            )
+            if missing_bridge_parameters:
+                raise ValueError(
+                    "loss cotangent bridge did not return required parameter "
+                    f"grads: {missing_bridge_parameters}"
+                )
+            first_brick_name = _path_c_direct_chain_first_brick_name(self.chain)
+            hidden_cotangent = (
+                buffers.get(f"{first_brick_name}_hidden_grad")
+                if first_brick_name is not None
+                else None
+            )
+            if not isinstance(hidden_cotangent, mx.array):
+                hidden_cotangent = buffers.get("hidden_grad")
+            if not isinstance(hidden_cotangent, mx.array):
+                raise ValueError(
+                    "full-model Path C gradients require direct-chain hidden_grad"
+                )
+            normed_hidden_cotangent = (
+                buffers.get(f"{first_brick_name}_residual_norm_hidden_grad")
+                if first_brick_name is not None
+                else None
+            )
+            if (
+                normed_hidden_cotangent is not None
+                and not isinstance(normed_hidden_cotangent, mx.array)
+            ):
+                raise ValueError(
+                    "direct-chain residual_norm_hidden_grad must be an mx.array"
+                )
+            prefix_grads = path_c_prefix_gradient_tree_from_hidden_cotangent(
+                model=model,
+                batch=batch,
+                hidden_cotangent=hidden_cotangent,
+                normed_hidden_cotangent=normed_hidden_cotangent,
+                chain=self.chain,
+            )
+            grads = _path_c_merge_model_gradient_trees(
+                prefix_grads,
+                _path_c_model_gradient_tree_strip_grad_suffixes(direct_grads),
+                _path_c_model_gradient_tree_from_parameter_grads(parameter_grads),
+                _path_c_zero_gradient_tree_for_parameters(
+                    model,
+                    frozenset(
+                        str(name)
+                        for name in coverage.get(
+                            "inactive_zero_gradient_parameter_names",
+                            (),
+                        )
+                    ),
+                ),
+            )
+            returned_names = {
+                str(name)
+                for name, value in tree_flatten(grads)
+                if isinstance(value, mx.array)
+            }
+            missing_names = sorted(
+                _path_c_model_trainable_parameter_names(model).difference(
+                    returned_names
+                )
+            )
+            if missing_names:
+                raise RuntimeError(
+                    "Path C full-model gradient merge missed trainable "
+                    f"parameters: {missing_names[:8]}"
+                )
+            return (loss, ntokens), grads
+
+        grads = direct_grads
+        if parameter_grads:
+            grad_pairs = list(tree_flatten(grads))
+            existing = {name for name, _ in grad_pairs}
+            for raw_name, value in sorted(parameter_grads.items()):
+                name = str(raw_name)
+                if name in existing:
+                    raise ValueError(
+                        f"loss cotangent bridge duplicate parameter grad {name!r}"
+                    )
+                if not isinstance(value, mx.array):
+                    raise TypeError(
+                        f"loss cotangent bridge parameter grad {name!r} "
+                        "must be an mx.array"
+                    )
+                grad_pairs.append((name, value))
+            grads = tree_unflatten(grad_pairs)
         return (loss, ntokens), grads
 
     def value_and_grad_contract(self) -> Mapping[str, Any]:
@@ -2245,6 +3028,16 @@ class PathCDirectFusionChainTrainingRuntime:
             "status"
         ) == "ok"
         loss_cotangent_bridge_ready = bridge_contract.get("status") == "ok"
+        coverage = _path_c_direct_chain_full_gradient_coverage_payload(
+            model=self.model,
+            chain=self.chain,
+            bridge_contract=bridge_contract,
+        )
+        returns_full_model_grads = bool(
+            model_gradient_tree_ready
+            and loss_cotangent_bridge_ready
+            and coverage.get("full_model_gradient_tree_ready")
+        )
         return {
             "contract": PATH_C_DIRECT_FUSION_VALUE_AND_GRAD_CONTRACT,
             "owner": binding.get("owner"),
@@ -2256,12 +3049,24 @@ class PathCDirectFusionChainTrainingRuntime:
                 binding.get("uses_backward_or_vjp_hook")
             ),
             "returns_model_grads": model_gradient_tree_ready,
+            "returns_full_model_grads": returns_full_model_grads,
+            "gradient_scope": "full_model"
+            if returns_full_model_grads
+            else "selected_region",
             "loss_cotangent_bridge_ready": loss_cotangent_bridge_ready,
             "model_gradient_tree_ready": model_gradient_tree_ready,
+            "selected_region_gradient_tree_ready": model_gradient_tree_ready,
+            "full_model_gradient_tree_ready": returns_full_model_grads,
+            "full_model_gradient_coverage": coverage,
             "delegates_to_eager_loss_and_grad": False,
             "hidden_packing_performed": False,
             "loss_cotangent_bridge_contract": bridge_contract,
             "reason": (
+                "PathCDirectFusionChainTrainingRuntime returns a full MLX "
+                "model-gradient tree from prefix VJP, caller-owned direct-chain "
+                "buffers, and a contracted suffix loss bridge"
+                if returns_full_model_grads
+                else
                 "PathCDirectFusionChainTrainingRuntime owns a contracted "
                 "loss-cotangent bridge and returns an MLX model-gradient tree "
                 "from caller-owned direct-chain buffers"
@@ -2383,6 +3188,7 @@ def install_path_c_direct_chain_training_runtime_for_model(
         owner_name=resolved_owner_name,
         training_critical_path=training_critical_path,
         loss_cotangent_bridge=loss_cotangent_bridge,
+        model=model,
     )
     if training_critical_path:
         runtime.bind_training_graph(
@@ -2392,11 +3198,24 @@ def install_path_c_direct_chain_training_runtime_for_model(
             uses_backward_or_vjp_hook=True,
         )
         value_and_grad_contract = _direct_chain_value_and_grad_contract_payload(runtime)
+        training_runtime_contract = (
+            path_c_direct_fusion_chain_training_runtime_contract_payload(
+                training_runtime=runtime,
+                runtime_binding=runtime.binding,
+            )
+        )
+        contract_block_reason = None
         if value_and_grad_contract.get("status") != "ok":
+            contract_block_reason = "direct-chain value_and_grad runtime incomplete"
+        elif not bool(value_and_grad_contract.get("returns_full_model_grads", False)):
+            contract_block_reason = "direct-chain full-model gradients incomplete"
+        elif training_runtime_contract.get("status") != "ok":
+            contract_block_reason = "direct-chain training runtime incomplete"
+        if contract_block_reason is not None:
             runtime.unbind_training_graph(owner="CompiledPretrainingStep")
             return {
                 "status": "blocked",
-                "reason": "direct-chain value_and_grad runtime incomplete",
+                "reason": contract_block_reason,
                 "runtime_owner": resolved_owner_name,
                 "runtime_class": type(runtime).__name__,
                 "training_critical_path": False,
@@ -2413,6 +3232,7 @@ def install_path_c_direct_chain_training_runtime_for_model(
                     runtime.binding.get("runtime_uses_direct_fusion_chain")
                 ),
                 "value_and_grad_contract": value_and_grad_contract,
+                "training_runtime_contract": training_runtime_contract,
                 "execution": None,
             }
     model.path_c_direct_fusion_chain_logical_buffer_owner = resolved_owner
@@ -3120,6 +3940,9 @@ def path_c_direct_fusion_chain_runtime_binding_payload(
                         "index": int(segment.index),
                         "status": "blocked",
                         "reason": str(segment.reason),
+                        "execution_phase": str(
+                            getattr(segment, "execution_phase", "unknown")
+                        ),
                         "runtime_ready": False,
                         "artifact_bound": False,
                         "logical_tensor_binding_ready": False,
@@ -3213,6 +4036,9 @@ def path_c_direct_fusion_chain_runtime_binding_payload(
                     "bridge_status": bridge.get("status"),
                     "binding_status": binding.get("status"),
                     "physical_abi_policy": physical_abi_policy,
+                    "execution_phase": str(
+                        getattr(segment, "execution_phase", "unknown")
+                    ),
                     "required_logical_buffers": required_logical_buffers,
                     "missing_logical_buffers": segment_missing,
                     "unexpected_logical_buffers": list(

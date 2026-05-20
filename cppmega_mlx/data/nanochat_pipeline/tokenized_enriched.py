@@ -1,0 +1,391 @@
+"""Helpers for offline token-level enriched parquet materialization."""
+
+from __future__ import annotations
+
+import bisect
+import inspect
+import json
+from typing import Any, cast
+
+from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
+    PLATFORM_IDS_COLUMN,
+    TOKEN_AST_DEPTH_COLUMN,
+    TOKEN_AST_NODE_TYPE_COLUMN,
+    TOKEN_CALL_EDGES_COLUMN,
+    TOKEN_CALL_TARGETS_COLUMN,
+    TOKEN_CHUNK_DEP_LEVELS_COLUMN,
+    TOKEN_CHUNK_ENDS_COLUMN,
+    TOKEN_CHUNK_KINDS_COLUMN,
+    TOKEN_CHUNK_STARTS_COLUMN,
+    TOKEN_DEF_USE_COLUMN,
+    TOKEN_DEP_LEVELS_COLUMN,
+    TOKEN_IDS_COLUMN,
+    TOKEN_SIBLING_INDEX_COLUMN,
+    TOKEN_STRUCTURE_IDS_COLUMN,
+    TOKEN_SYMBOL_IDS_COLUMN,
+    TOKEN_TYPE_EDGES_COLUMN,
+    TOKEN_TYPE_REFS_COLUMN,
+)
+
+_KIND_STR_TO_INT = {
+    "other": 0,
+    "preamble": 1,
+    "func_signature": 2,
+    "func_body": 3,
+    "class_decl": 4,
+    "class_member": 5,
+    "comment": 6,
+    "typedef": 7,
+    "namespace": 8,
+}
+
+
+def _kind_to_int(kind: Any) -> int:
+    if isinstance(kind, int):
+        return kind
+    text = str(kind)
+    if text.isdigit():
+        return int(text)
+    return _KIND_STR_TO_INT.get(text.lower(), 0)
+
+
+def _normalize_graph_edge_pairs(raw_edges: Any) -> list[tuple[int, int]]:
+    pairs: list[tuple[int, int]] = []
+    for edge in raw_edges or []:
+        if isinstance(edge, dict) and "from" in edge and "to" in edge:
+            pairs.append((int(edge["from"]), int(edge["to"])))
+        elif isinstance(edge, (list, tuple)) and len(edge) >= 2:
+            pairs.append((int(edge[0]), int(edge[1])))
+    return pairs
+
+
+def _encode_batch_with_optional_char_spans(
+    tokenizer,
+    texts: list[str],
+    *,
+    prepend=None,
+    append=None,
+    num_threads: int = 8,
+) -> tuple[list[list[int]], list[list[tuple[int, int]]] | None]:
+    def _call_tokenizer_encode(payload):
+        kwargs = {}
+        try:
+            params = inspect.signature(tokenizer.encode).parameters
+        except (TypeError, ValueError):
+            params = {}
+        accepts_var_kwargs = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+        )
+        if accepts_var_kwargs or "prepend" in params:
+            kwargs["prepend"] = prepend
+        if accepts_var_kwargs or "append" in params:
+            kwargs["append"] = append
+        if accepts_var_kwargs or "num_threads" in params:
+            kwargs["num_threads"] = num_threads
+        return tokenizer.encode(payload, **kwargs)
+
+    hf_tok = getattr(tokenizer, "_tokenizer", None) or getattr(
+        tokenizer, "tokenizer", None
+    )
+    if hf_tok is None or not hasattr(hf_tok, "encode_batch"):
+        return _call_tokenizer_encode(texts), None
+
+    def _resolve_special_id(value: str | int | None) -> int | None:
+        if value is None or isinstance(value, int):
+            return value
+        if hasattr(tokenizer, "encode_special"):
+            return int(tokenizer.encode_special(value))
+        raise ValueError(f"Tokenizer cannot resolve special token {value!r}")
+
+    prepend_id = _resolve_special_id(prepend)
+    append_id = _resolve_special_id(append)
+
+    try:
+        encodings = hf_tok.encode_batch(texts, add_special_tokens=False)
+    except TypeError:
+        encodings = hf_tok.encode_batch(texts)
+
+    token_lists: list[list[int]] = []
+    token_spans: list[list[tuple[int, int]]] = []
+    for text, enc in zip(texts, encodings):
+        ids = list(enc.ids)
+        spans = [(int(start), int(end)) for start, end in enc.offsets]
+        if prepend is not None:
+            assert prepend_id is not None
+            ids.insert(0, int(prepend_id))
+            spans.insert(0, (0, 0))
+        if append is not None:
+            assert append_id is not None
+            ids.append(int(append_id))
+            text_len = len(text)
+            spans.append((text_len, text_len))
+        token_lists.append(ids)
+        token_spans.append(spans)
+    return token_lists, token_spans
+
+
+def _extract_token_char_starts_and_valid(
+    token_positions: list[int] | list[tuple[int, int]],
+) -> tuple[list[int], list[bool]]:
+    if not token_positions:
+        return [], []
+    first = token_positions[0]
+    if isinstance(first, tuple) and len(first) == 2:
+        spans = cast(list[tuple[int, int]], token_positions)
+        span_starts = [int(start) for start, _ in spans]
+        span_valid = [int(end) > int(start) for start, end in spans]
+        return span_starts, span_valid
+
+    lengths = cast(list[int], token_positions)
+    starts: list[int] = []
+    valid: list[bool] = []
+    running = 0
+    for length in lengths:
+        n = max(int(length), 0)
+        starts.append(running)
+        valid.append(n > 0)
+        running += n
+    return starts, valid
+
+
+def _chars_to_tokens_structure_ids(
+    char_structure_ids: list[int],
+    text: str,
+    token_lengths: list[int] | list[tuple[int, int]],
+) -> list[int]:
+    del text
+    if not char_structure_ids:
+        return [0] * len(token_lengths)
+    starts, valid = _extract_token_char_starts_and_valid(token_lengths)
+    n_struct = len(char_structure_ids)
+    out: list[int] = []
+    for start, is_valid in zip(starts, valid):
+        if is_valid and start < n_struct:
+            out.append(int(char_structure_ids[start]))
+        else:
+            out.append(0)
+    return out
+
+
+def _chunk_boundaries_to_token_offsets(
+    chunk_boundaries: list[dict[str, Any]],
+    text: str,
+    token_lengths: list[int] | list[tuple[int, int]],
+) -> list[dict[str, Any]]:
+    del text
+    if not chunk_boundaries or not token_lengths:
+        return []
+    starts, _valid = _extract_token_char_starts_and_valid(token_lengths)
+    if not starts:
+        return []
+
+    result: list[dict[str, Any]] = []
+    for cb in chunk_boundaries:
+        char_start = int(cb.get("start", 0))
+        tok_idx = bisect.bisect_right(starts, char_start) - 1
+        if tok_idx < 0:
+            tok_idx = 0
+        elif tok_idx >= len(starts):
+            tok_idx = len(starts) - 1
+        result.append(
+            {
+                "token_offset": int(tok_idx),
+                "end_char": cb.get("end", cb.get("start", 0)),
+                "kind": cb.get("kind", 0),
+                "name": cb.get("name", ""),
+                "dep_level": cb.get("dep_level", 0),
+            }
+        )
+    return result
+
+
+def _compute_token_dep_levels(
+    tok_struct_ids: list[int],
+    tok_chunks: list[dict[str, Any]],
+    num_tokens: int,
+) -> list[int]:
+    del tok_struct_ids
+    if not tok_chunks:
+        return [0] * num_tokens
+
+    sorted_chunks = sorted(tok_chunks, key=lambda c: int(c["token_offset"]))
+    out = [0] * num_tokens
+    chunk_idx = 0
+    current_dep = 0
+    for token_idx in range(num_tokens):
+        while chunk_idx < len(sorted_chunks) and int(sorted_chunks[chunk_idx]["token_offset"]) <= token_idx:
+            current_dep = int(sorted_chunks[chunk_idx].get("dep_level", 0))
+            chunk_idx += 1
+        out[token_idx] = current_dep
+    return out
+
+
+def _remap_token_edges(
+    raw_edges: list[tuple[int, int]],
+    index_map: dict[int, int],
+) -> list[dict[str, int]]:
+    remapped = []
+    for src, dst in raw_edges:
+        if src in index_map and dst in index_map:
+            remapped.append({"from": int(index_map[src]), "to": int(index_map[dst])})
+    return remapped
+
+
+def _build_token_chunk_layout(
+    doc: dict[str, Any],
+    tok_chunks: list[dict[str, Any]],
+    token_count: int,
+) -> dict[str, list[int] | list[dict[str, int]]]:
+    if not tok_chunks:
+        return {
+            TOKEN_CHUNK_STARTS_COLUMN: [],
+            TOKEN_CHUNK_ENDS_COLUMN: [],
+            TOKEN_CHUNK_KINDS_COLUMN: [],
+            TOKEN_CHUNK_DEP_LEVELS_COLUMN: [],
+            TOKEN_CALL_EDGES_COLUMN: [],
+            TOKEN_TYPE_EDGES_COLUMN: [],
+        }
+
+    chunk_entries = list(enumerate(tok_chunks))
+    chunk_entries.sort(key=lambda item: int(item[1].get("token_offset", 0)))
+    index_map = {orig_idx: new_idx for new_idx, (orig_idx, _) in enumerate(chunk_entries)}
+
+    starts = [int(chunk.get("token_offset", 0)) for _, chunk in chunk_entries]
+    ends = [
+        starts[i + 1] if i + 1 < len(starts) else int(token_count)
+        for i in range(len(starts))
+    ]
+    kinds = [_kind_to_int(chunk.get("kind", 0)) for _, chunk in chunk_entries]
+    dep_levels = [int(chunk.get("dep_level", 0)) for _, chunk in chunk_entries]
+
+    call_edges = _remap_token_edges(
+        _normalize_graph_edge_pairs(doc.get("call_edges", [])),
+        index_map,
+    )
+    type_edges = _remap_token_edges(
+        _normalize_graph_edge_pairs(doc.get("type_edges", [])),
+        index_map,
+    )
+
+    return {
+        TOKEN_CHUNK_STARTS_COLUMN: starts,
+        TOKEN_CHUNK_ENDS_COLUMN: ends,
+        TOKEN_CHUNK_KINDS_COLUMN: kinds,
+        TOKEN_CHUNK_DEP_LEVELS_COLUMN: dep_levels,
+        TOKEN_CALL_EDGES_COLUMN: call_edges,
+        TOKEN_TYPE_EDGES_COLUMN: type_edges,
+    }
+
+
+def _platform_ids_from_doc(doc: dict[str, Any]) -> list[int]:
+    platform_info = doc.get("platform_info")
+    if not platform_info:
+        return []
+    if isinstance(platform_info, str):
+        try:
+            platform_info = json.loads(platform_info)
+        except json.JSONDecodeError:
+            return []
+    if not isinstance(platform_info, dict):
+        return []
+
+    from cppmega_mlx.data.nanochat_pipeline.platform_vocab import platform_info_to_ids
+
+    return platform_info_to_ids(platform_info)
+
+
+def materialize_tokenized_enriched_batch(
+    docs: list[dict[str, Any]],
+    tokenizer,
+    *,
+    num_threads: int = 8,
+) -> list[dict[str, Any]]:
+    """Convert enriched char-level docs into token-level parquet-ready metadata.
+
+    The returned token arrays align to `token_ids`, which already include the BOS
+    token at position 0.
+    """
+    if not docs:
+        return []
+
+    texts = [str(doc.get("text", "")) for doc in docs]
+    if hasattr(tokenizer, "get_bos_token_id"):
+        bos_token = tokenizer.get_bos_token_id()
+    else:
+        bos_token = tokenizer.bos_token_id
+    token_lists, token_spans_batch = _encode_batch_with_optional_char_spans(
+        tokenizer,
+        texts,
+        prepend=bos_token,
+        num_threads=num_threads,
+    )
+    if token_spans_batch is None:
+        raise ValueError(
+            "Tokenizer did not expose per-token character spans; "
+            "cannot materialize token-level enriched metadata offline."
+        )
+
+    out = []
+    for doc, token_ids, token_spans in zip(docs, token_lists, token_spans_batch):
+        token_ids = [int(tok) for tok in token_ids]
+        token_structure_ids = _chars_to_tokens_structure_ids(
+            doc.get("structure_ids", []),
+            "",
+            token_spans,
+        )
+        tok_chunks = _chunk_boundaries_to_token_offsets(
+            doc.get("chunk_boundaries", []),
+            "",
+            token_spans,
+        )
+        token_dep_levels = _compute_token_dep_levels(
+            token_structure_ids,
+            tok_chunks,
+            len(token_ids),
+        )
+
+        row = {
+            TOKEN_IDS_COLUMN: token_ids,
+            PLATFORM_IDS_COLUMN: _platform_ids_from_doc(doc),
+            TOKEN_STRUCTURE_IDS_COLUMN: token_structure_ids,
+            TOKEN_DEP_LEVELS_COLUMN: token_dep_levels,
+            TOKEN_AST_DEPTH_COLUMN: _chars_to_tokens_structure_ids(
+                doc.get("ast_depth", []),
+                "",
+                token_spans,
+            ),
+            TOKEN_SIBLING_INDEX_COLUMN: _chars_to_tokens_structure_ids(
+                doc.get("sibling_index", []),
+                "",
+                token_spans,
+            ),
+            TOKEN_AST_NODE_TYPE_COLUMN: _chars_to_tokens_structure_ids(
+                doc.get("ast_node_type", []),
+                "",
+                token_spans,
+            ),
+            TOKEN_SYMBOL_IDS_COLUMN: _chars_to_tokens_structure_ids(
+                doc.get("symbol_ids", []),
+                "",
+                token_spans,
+            ),
+            TOKEN_CALL_TARGETS_COLUMN: _chars_to_tokens_structure_ids(
+                doc.get("call_targets", []),
+                "",
+                token_spans,
+            ),
+            TOKEN_TYPE_REFS_COLUMN: _chars_to_tokens_structure_ids(
+                doc.get("type_refs", []),
+                "",
+                token_spans,
+            ),
+            TOKEN_DEF_USE_COLUMN: _chars_to_tokens_structure_ids(
+                doc.get("def_use", []),
+                "",
+                token_spans,
+            ),
+        }
+        row.update(cast(dict[str, list[int]], _build_token_chunk_layout(doc, tok_chunks, len(token_ids))))
+        out.append(row)
+
+    return out

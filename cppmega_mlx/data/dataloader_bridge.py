@@ -24,8 +24,15 @@ _BATCH_KEYS = (
     "ast_depth_ids",
     "sibling_index_ids",
     "node_type_ids",
+    "platform_ids",
+    "metadata",
 )
-_STRUCTURE_KEYS = tuple(key for key in _BATCH_KEYS if key not in {"tokens", "attention_mask"})
+_TENSOR_BATCH_KEYS = tuple(key for key in _BATCH_KEYS if key != "metadata")
+_STRUCTURE_KEYS = tuple(
+    key
+    for key in _TENSOR_BATCH_KEYS
+    if key not in {"tokens", "attention_mask", "platform_ids"}
+)
 
 
 class TorchDataLoaderBridgeError(RuntimeError):
@@ -59,7 +66,7 @@ class LocalTokenBatchDataset:
     def __len__(self) -> int:
         return len(self._batches)
 
-    def __getitem__(self, index: int) -> Mapping[str, np.ndarray]:
+    def __getitem__(self, index: int) -> Mapping[str, Any]:
         return self._batches[index]
 
 
@@ -193,7 +200,7 @@ def _load_torch_dataloader() -> Any:
             "PyTorch DataLoader bridge requires optional dependency 'torch'. "
             "Install torch explicitly or keep using native MLX iterators."
         )
-    from torch.utils.data import DataLoader
+    from torch.utils.data import DataLoader  # type: ignore[import-not-found]
 
     return DataLoader
 
@@ -202,9 +209,9 @@ def _identity_collate(sample: Mapping[str, np.ndarray]) -> Mapping[str, np.ndarr
     return sample
 
 
-def _numpy_batch(batch: LMTokenBatch | Mapping[str, Any] | mx.array) -> Mapping[str, np.ndarray]:
+def _numpy_batch(batch: LMTokenBatch | Mapping[str, Any] | mx.array) -> Mapping[str, Any]:
     if isinstance(batch, LMTokenBatch):
-        return _numpy_mapping(batch.as_dict())
+        return _numpy_mapping(batch.as_dict(include_metadata=True))
     if isinstance(batch, mx.array):
         return _numpy_mapping({"tokens": batch})
     if isinstance(batch, Mapping):
@@ -212,7 +219,7 @@ def _numpy_batch(batch: LMTokenBatch | Mapping[str, Any] | mx.array) -> Mapping[
     raise TypeError(f"unsupported token batch type: {type(batch)!r}")
 
 
-def _numpy_mapping(batch: Mapping[str, Any]) -> Mapping[str, np.ndarray]:
+def _numpy_mapping(batch: Mapping[str, Any]) -> Mapping[str, Any]:
     keys = set(batch)
     unknown = sorted(keys - set(_BATCH_KEYS))
     if unknown:
@@ -221,18 +228,33 @@ def _numpy_mapping(batch: Mapping[str, Any]) -> Mapping[str, np.ndarray]:
     if "tokens" not in batch:
         raise ValueError("DataLoader bridge batches must include 'tokens'")
 
-    arrays = {
+    arrays: dict[str, Any] = {
         key: _as_numpy_array(key, batch[key])
-        for key in _BATCH_KEYS
+        for key in _TENSOR_BATCH_KEYS
         if key in batch and batch[key] is not None
     }
+    if "metadata" in batch and batch["metadata"] is not None:
+        if not isinstance(batch["metadata"], Mapping):
+            raise ValueError("metadata must be a mapping when provided")
+        arrays["metadata"] = batch["metadata"]
     tokens = arrays["tokens"]
     if tokens.ndim != 2:
         raise ValueError(f"tokens must be shaped (B, S), got {tokens.shape}")
     if tokens.shape[1] < 2:
         raise ValueError("tokens sequence length must be at least 2")
-    for key in _BATCH_KEYS:
+    for key in _TENSOR_BATCH_KEYS:
         if key == "tokens" or key not in arrays:
+            continue
+        if key == "platform_ids":
+            if arrays[key].ndim != 2:
+                raise ValueError(
+                    f"platform_ids must be shaped (B, K), got {arrays[key].shape}"
+                )
+            if arrays[key].shape[0] != tokens.shape[0]:
+                raise ValueError(
+                    "platform_ids batch dimension must match tokens batch "
+                    f"{tokens.shape[0]}, got {arrays[key].shape[0]}"
+                )
             continue
         if arrays[key].shape != tokens.shape:
             raise ValueError(
@@ -252,6 +274,8 @@ def _as_numpy_array(key: str, value: Any) -> np.ndarray:
         raise ValueError(f"{key} IDs exceed int32 range")
     if key == "tokens":
         return array.astype(np.int32, copy=False)
+    if key == "platform_ids":
+        return array.astype(np.int32, copy=False)
     if key in _STRUCTURE_KEYS:
         return array.astype(np.int32, copy=False)
     raise ValueError(f"unsupported DataLoader bridge batch key: {key}")
@@ -266,10 +290,14 @@ def _mlx_batch(batch: Mapping[str, Any]) -> LMTokenBatch:
     arrays = _numpy_mapping(batch)
     kwargs = {
         key: mx.array(arrays[key])
-        for key in _BATCH_KEYS
+        for key in _TENSOR_BATCH_KEYS
         if key != "tokens" and key in arrays
     }
-    return LMTokenBatch(tokens=mx.array(arrays["tokens"]), **kwargs)
+    return LMTokenBatch(
+        tokens=mx.array(arrays["tokens"]),
+        metadata=arrays.get("metadata"),
+        **kwargs,
+    )
 
 
 __all__ = [

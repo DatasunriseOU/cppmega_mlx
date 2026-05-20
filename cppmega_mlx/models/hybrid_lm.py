@@ -23,6 +23,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten
 
+from cppmega_mlx.data.platform_context import MAX_PLATFORM_IDS, PLATFORM_VOCAB_SIZE
 from cppmega_mlx.data.packing import mlx_document_boundary_mask
 from cppmega_mlx.inference.engine import ContiguousKVCache, kv_cache_position
 from cppmega_mlx.nn.attention import (
@@ -37,6 +38,7 @@ from cppmega_mlx.nn.mamba3 import Mamba3Config, Mamba3ReferenceBlock
 from cppmega_mlx.nn.mhc import ManifoldBranchMixer, ManifoldBranchMixerConfig
 from cppmega_mlx.nn.moe import ActivationName, MoEConfig, ReferenceMoE
 from cppmega_mlx.nn.ngram_hash import NgramHashEmbedding
+from cppmega_mlx.nn.platform_embedding import CppMegaPlatformEmbedding
 from cppmega_mlx.nn.structure_embedding import CppMegaStructureEmbedding
 from cppmega_mlx.recipes.pattern import ExpandedNamPattern, NamLayer, expand_nam_pattern
 from cppmega_mlx.runtime.kernel_policy import KernelPath, selected_path
@@ -150,6 +152,8 @@ class HybridTinyConfig:
     structure_max_ast_depth: int = 64
     structure_max_sibling_index: int = 64
     structure_num_node_types: int = 256
+    platform_vocab_size: int = PLATFORM_VOCAB_SIZE
+    platform_max_ids: int = MAX_PLATFORM_IDS
     moe_num_experts: int = 4
     moe_top_k: int = 2
     moe_expert_hidden_size: int = 32
@@ -251,6 +255,7 @@ class HybridTinyConfig:
         self.m2rnn_config()
         self.moe_config()
         self.structure_embedding_config()
+        self.platform_embedding_config()
         self.ngram_hash_config()
         self.mhc_config()
         self.engram_config()
@@ -342,6 +347,17 @@ class HybridTinyConfig:
             "num_node_types": self.structure_num_node_types,
             "active_components": self.structure_components,
             "bottleneck_dim": self.structure_bottleneck_dim,
+        }
+
+    def platform_embedding_config(self) -> dict[str, int]:
+        if self.platform_vocab_size <= 1:
+            raise ValueError("platform_vocab_size must be greater than one")
+        if self.platform_max_ids <= 0:
+            raise ValueError("platform_max_ids must be positive")
+        return {
+            "hidden_size": self.hidden_size,
+            "vocab_size": self.platform_vocab_size,
+            "max_ids": self.platform_max_ids,
         }
 
     def ngram_hash_config(self) -> dict[str, object] | None:
@@ -502,7 +518,7 @@ class HybridTinyBlock(nn.Module):
 
     def _path_c_activation_probe(self) -> PathCActivationProbe | None:
         probe = getattr(self, "_path_c_activation_probe_callback", None)
-        return probe if callable(probe) else None
+        return cast(PathCActivationProbe, probe) if callable(probe) else None
 
     def _path_c_activation_logical_names(self, name: str) -> tuple[str, ...]:
         brick_name = str(getattr(self, "path_c_profile_brick_name", self.path_c_brick_name))
@@ -702,6 +718,7 @@ class HybridTinyLM(nn.Module):
         self.token_embedding = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
         self.position_embedding = nn.Embedding(cfg.max_seq_length, cfg.hidden_size)
         self.structure_embedding = CppMegaStructureEmbedding(**cfg.structure_embedding_config())
+        self.platform_embedding = CppMegaPlatformEmbedding(**cfg.platform_embedding_config())
         self.ngram_hash_embedding = None
         if cfg.ngram_hash_enabled:
             self.ngram_hash_embedding = NgramHashEmbedding(
@@ -973,6 +990,7 @@ class HybridTinyLM(nn.Module):
         ast_depth_ids: mx.array | None = None,
         sibling_index_ids: mx.array | None = None,
         node_type_ids: mx.array | None = None,
+        platform_ids: mx.array | None = None,
         document_ids: mx.array | None = None,
         kv_cache: ContiguousKVCache | None = None,
     ) -> mx.array:
@@ -984,6 +1002,7 @@ class HybridTinyLM(nn.Module):
                 ast_depth_ids=ast_depth_ids,
                 sibling_index_ids=sibling_index_ids,
                 node_type_ids=node_type_ids,
+                platform_ids=platform_ids,
                 document_ids=document_ids,
                 kv_cache=kv_cache,
             )
@@ -998,6 +1017,7 @@ class HybridTinyLM(nn.Module):
         ast_depth_ids: mx.array | None = None,
         sibling_index_ids: mx.array | None = None,
         node_type_ids: mx.array | None = None,
+        platform_ids: mx.array | None = None,
         document_ids: mx.array | None = None,
         kv_cache: ContiguousKVCache | None = None,
     ) -> mx.array:
@@ -1053,6 +1073,13 @@ class HybridTinyLM(nn.Module):
         )
         if structure_embeddings.ndim == hidden_states.ndim:
             hidden_states = hidden_states + structure_embeddings
+
+        platform_ids = _validate_platform_ids(platform_ids, batch_size=batch_size)
+        if platform_ids is not None:
+            hidden_states = hidden_states + self.platform_embedding(
+                platform_ids,
+                target_dtype=hidden_states.dtype,
+            )
 
         document_ids = _validate_document_ids(
             document_ids,
@@ -1132,6 +1159,23 @@ def _validate_side_channel_shape(
         raise ValueError(
             f"{name} shape {tensor.shape} must exactly match input_ids shape "
             f"({batch_size}, {seq_length})"
+        )
+    return tensor
+
+
+def _validate_platform_ids(
+    tensor: mx.array | None,
+    *,
+    batch_size: int,
+) -> mx.array | None:
+    if tensor is None:
+        return None
+    if tensor.ndim != 2:
+        raise ValueError(f"platform_ids must be shaped (B, K), got {tensor.shape}")
+    if tensor.shape[0] != batch_size:
+        raise ValueError(
+            "platform_ids batch dimension must match input batch "
+            f"{batch_size}, got {tensor.shape[0]}"
         )
     return tensor
 

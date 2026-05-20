@@ -133,6 +133,8 @@ class _ContractedRecordingPathCTrainingRuntime(_RecordingPathCTrainingRuntime):
             "uses_forward_hook": True,
             "uses_backward_or_vjp_hook": True,
             "returns_model_grads": True,
+            "returns_full_model_grads": True,
+            "gradient_scope": "full_model",
             "loss_cotangent_bridge_ready": True,
             "model_gradient_tree_ready": True,
             "delegates_to_eager_loss_and_grad": False,
@@ -144,6 +146,14 @@ class _NoLossBridgePathCTrainingRuntime(_ContractedRecordingPathCTrainingRuntime
     def value_and_grad_contract(self) -> dict[str, Any]:
         payload = dict(super().value_and_grad_contract())
         payload["loss_cotangent_bridge_ready"] = False
+        return payload
+
+
+class _SelectedRegionOnlyPathCTrainingRuntime(_ContractedRecordingPathCTrainingRuntime):
+    def value_and_grad_contract(self) -> dict[str, Any]:
+        payload = dict(super().value_and_grad_contract())
+        payload["returns_full_model_grads"] = False
+        payload["gradient_scope"] = "selected_region"
         return payload
 
 
@@ -161,6 +171,8 @@ class _BindingAwarePathCTrainingRuntime(_RecordingPathCTrainingRuntime):
                 binding.get("uses_backward_or_vjp_hook")
             ),
             "returns_model_grads": True,
+            "returns_full_model_grads": True,
+            "gradient_scope": "full_model",
             "loss_cotangent_bridge_ready": True,
             "model_gradient_tree_ready": True,
             "delegates_to_eager_loss_and_grad": False,
@@ -638,6 +650,21 @@ def test_path_c_training_runtime_rejects_contract_without_loss_bridge() -> None:
             compile=False,
             path_c_training_runtime=_NoLossBridgePathCTrainingRuntime(),
         )
+
+
+def test_path_c_training_runtime_rejects_selected_region_only_grads() -> None:
+    model = TinyLM(_tiny_config())
+    optimizer = optim.AdamW(learning_rate=1e-2, weight_decay=0.0)
+    runtime = _SelectedRegionOnlyPathCTrainingRuntime()
+
+    with pytest.raises(ValueError, match="value_and_grad_contract"):
+        CompiledPretrainingStep(
+            model,
+            optimizer,
+            compile=False,
+            path_c_training_runtime=runtime,
+        )
+    assert runtime.training_graph_binding() is None
 
 
 @pytest.mark.parametrize("grad_accum_steps", [True, "1", 0])

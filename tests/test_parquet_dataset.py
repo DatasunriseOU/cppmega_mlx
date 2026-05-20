@@ -175,6 +175,207 @@ def test_cppmega_token_side_channel_aliases_are_normalized(monkeypatch) -> None:
     }
 
 
+def test_batch_metadata_windows_keep_chunk_edges_out_of_model_kwargs() -> None:
+    columns = parquet_dataset.ParquetColumns(
+        {
+            "token_ids": [[0, 1, 2, 3, 4, 5, 6, 7]],
+            "token_structure_ids": [[1, 1, 1, 1, 2, 2, 2, 2]],
+            "token_dep_levels": [[0, 0, 0, 0, 1, 1, 1, 1]],
+            "token_chunk_starts": [[0, 4]],
+            "token_chunk_ends": [[4, 8]],
+            "token_chunk_kinds": [[2, 3]],
+            "token_chunk_dep_levels": [[0, 1]],
+            "token_call_edges": [[{"from": 0, "to": 1}]],
+            "token_type_edges": [[{"from": 1, "to": 0}]],
+            "language_info": ['{"language": "cpp"}'],
+            "build_profile": ["gb10-clang"],
+            "constituent_provenance_json": ['{"repo": "llvm"}'],
+        },
+        all_column_names=(
+            "token_ids",
+            "token_structure_ids",
+            "token_dep_levels",
+            "token_chunk_starts",
+            "token_chunk_ends",
+            "token_chunk_kinds",
+            "token_chunk_dep_levels",
+            "token_call_edges",
+            "token_type_edges",
+            "language_info",
+            "build_profile",
+            "constituent_provenance_json",
+        ),
+    )
+    token_rows = parquet_dataset._token_rows_from_columns(
+        columns,
+        token_key="token_ids",
+        text_key=None,
+        tokenizer=None,
+        eos_token_id=None,
+    )
+
+    metadata_windows = parquet_dataset._batch_metadata_windows(
+        columns,
+        token_rows,
+        seq_len=4,
+        metadata_columns=(
+            "token_chunk_starts",
+            "token_chunk_ends",
+            "token_chunk_kinds",
+            "token_chunk_dep_levels",
+            "token_call_edges",
+            "token_type_edges",
+            "language_info",
+            "build_profile",
+            "constituent_provenance_json",
+        ),
+    )
+
+    assert metadata_windows == (
+        {
+            "row_index": 0,
+            "token_start": 0,
+            "token_end": 4,
+            "token_chunk_starts": [0],
+            "token_chunk_ends": [4],
+            "token_chunk_kinds": [2],
+            "token_chunk_dep_levels": [0],
+            "token_call_edges": [],
+            "token_type_edges": [],
+            "language_info": '{"language": "cpp"}',
+            "build_profile": "gb10-clang",
+            "constituent_provenance_json": '{"repo": "llvm"}',
+        },
+        {
+            "row_index": 0,
+            "token_start": 4,
+            "token_end": 8,
+            "token_chunk_starts": [0],
+            "token_chunk_ends": [4],
+            "token_chunk_kinds": [3],
+            "token_chunk_dep_levels": [1],
+            "token_call_edges": [],
+            "token_type_edges": [],
+            "language_info": '{"language": "cpp"}',
+            "build_profile": "gb10-clang",
+            "constituent_provenance_json": '{"repo": "llvm"}',
+        },
+    )
+
+
+def test_candidate_columns_keep_batch_metadata_opt_in() -> None:
+    default_columns = parquet_dataset._candidate_parquet_columns(
+        token_key="token_ids",
+        text_key=None,
+        metadata_columns=(),
+    )
+    metadata_columns = parquet_dataset._candidate_parquet_columns(
+        token_key="token_ids",
+        text_key=None,
+        metadata_columns=("token_chunk_starts", "token_call_edges"),
+    )
+
+    assert default_columns is not None
+    assert metadata_columns is not None
+    assert "token_chunk_starts" not in default_columns
+    assert "token_call_edges" not in default_columns
+    assert "token_chunk_starts" in metadata_columns
+    assert "token_call_edges" in metadata_columns
+
+
+def test_all_metadata_excludes_token_content_and_slices_token_level_fields() -> None:
+    columns = parquet_dataset.ParquetColumns(
+        {
+            "text": ["int main() {}"],
+            "token_ids": [[0, 1, 2, 3, 4, 5, 6, 7]],
+            "token_symbol_ids": [[10, 11, 12, 13, 14, 15, 16, 17]],
+            "doc_ids": [[0, 0, 0, 0, 1, 1, 1, 1]],
+            "platform_ids": [[4, 9]],
+            "repo": ["llvm"],
+        },
+        all_column_names=(
+            "text",
+            "token_ids",
+            "token_symbol_ids",
+            "doc_ids",
+            "platform_ids",
+            "repo",
+        ),
+    )
+    token_rows = parquet_dataset._token_rows_from_columns(
+        columns,
+        token_key="token_ids",
+        text_key=None,
+        tokenizer=None,
+        eos_token_id=None,
+    )
+
+    metadata_columns = parquet_dataset._resolve_batch_metadata_columns(
+        columns,
+        token_key="token_ids",
+        text_key=None,
+        metadata_columns="all",
+    )
+    metadata_windows = parquet_dataset._batch_metadata_windows(
+        columns,
+        token_rows,
+        seq_len=4,
+        metadata_columns=metadata_columns,
+    )
+
+    assert "text" not in metadata_columns
+    assert "token_ids" not in metadata_columns
+    assert metadata_windows[0]["token_symbol_ids"] == [10, 11, 12, 13]
+    assert metadata_windows[1]["token_symbol_ids"] == [14, 15, 16, 17]
+    assert metadata_windows[0]["doc_ids"] == [0, 0, 0, 0]
+    assert metadata_windows[1]["doc_ids"] == [1, 1, 1, 1]
+    assert metadata_windows[0]["platform_ids"] == [4, 9]
+    assert metadata_windows[1]["repo"] == "llvm"
+
+
+def test_platform_ids_parquet_column_threads_to_model_kwargs(tmp_path) -> None:
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    path = tmp_path / "platform_ids.parquet"
+    table = pa.table(
+        {
+            "token_ids": pa.array(
+                [[[0, 1, 2, 3, 4, 5, 6, 7]]][0],
+                type=pa.large_list(pa.int32()),
+            ),
+            "platform_ids": pa.array(
+                [[[2, 64, 94]]][0],
+                type=pa.large_list(pa.int32()),
+            ),
+            "repo": pa.array(["llvm"]),
+        }
+    )
+    pq.write_table(table, path)
+
+    dataset = TokenParquetDataset(
+        path,
+        seq_len=4,
+        batch_size=2,
+        token_key="token_ids",
+        metadata_columns="all",
+    )
+    batch = next(dataset.iter_batches())
+
+    assert batch.platform_ids is not None
+    np.testing.assert_array_equal(
+        np.array(batch.platform_ids),
+        np.array([[2, 64, 94], [2, 64, 94]], dtype=np.int32),
+    )
+    assert "platform_ids" in batch.model_kwargs()
+    assert "platform_ids" not in batch.training_metadata()["parquet"]["columns"]
+    assert dataset.parquet_receipt["model_metadata_sources"] == {
+        "platform_ids": {
+            "column": "platform_ids",
+            "type": "large_list<element: int32>",
+        }
+    }
+
+
 def test_source_level_structure_ids_are_ignored_when_not_token_aligned(
     monkeypatch,
 ) -> None:

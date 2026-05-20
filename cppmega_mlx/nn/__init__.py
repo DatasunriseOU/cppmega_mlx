@@ -56,6 +56,10 @@ from cppmega_mlx.nn.ngram_hash import (
     NgramHashEmbedding,
     pick_primes,
 )
+from cppmega_mlx.nn.platform_embedding import (
+    CppMegaPlatformEmbedding,
+    PlatformEmbedding,
+)
 from cppmega_mlx.nn.sparse_mla import (
     SparseMLAShapes,
     sparse_mla_attention,
@@ -80,6 +84,7 @@ __all__ = [
     "CppMegaEngramBranch",
     "CppMegaManifoldBranchMixer",
     "CppMegaNgramHashEmbedding",
+    "CppMegaPlatformEmbedding",
     "CppMegaStructureEmbedding",
     "CausalSelfAttention",
     "DEFAULT_CHUNK_SIZE",
@@ -98,6 +103,7 @@ __all__ = [
     "MoEConfig",
     "MoEOutput",
     "NgramHashEmbedding",
+    "PlatformEmbedding",
     "ReferenceMoE",
     "RouterOutput",
     "SparseMLAShapes",

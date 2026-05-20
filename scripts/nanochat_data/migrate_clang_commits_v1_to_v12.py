@@ -1,0 +1,459 @@
+#!/usr/bin/env python3
+# ruff: noqa: E402
+"""Migrate clang_commits_4k_v1 parquet files to v12 schema.
+
+Reads existing v1 parquet shards, adds missing v12 columns with appropriate
+null/empty defaults, and writes upgraded v12 parquet files.
+
+The v12 schema is defined in ``scripts/data/clang_enriched_to_4k_parquet.py``
+and corresponds to the unified clang semantic family that covers both static
+code and temporal commit data.
+
+This script is idempotent: re-running it on already-migrated v12 files is a
+no-op (existing columns are preserved, missing columns are added with defaults).
+
+Usage:
+    # Migrate local directory
+    python -m scripts.data.migrate_clang_commits_v1_to_v12 \
+        --input_dir /path/to/clang_commits_4k_v1 \
+        --output_dir /path/to/clang_commits_4k_v12
+
+    # In-place migration (output_dir == input_dir)
+    python -m scripts.data.migrate_clang_commits_v1_to_v12 \
+        --input_dir /path/to/clang_commits_4k_v1 \
+        --output_dir /path/to/clang_commits_4k_v1
+
+    # Dry run (report missing columns without writing)
+    python -m scripts.data.migrate_clang_commits_v1_to_v12 \
+        --input_dir /path/to/clang_commits_4k_v1 \
+        --output_dir /path/to/clang_commits_4k_v12 \
+        --dry_run
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+import time
+from pathlib import Path
+
+import pyarrow as pa  # type: ignore[import-not-found]
+import pyarrow.parquet as pq  # type: ignore[import-not-found]
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
+    AUTHOR_TIMESTAMP_COLUMN,
+    CHANGED_CHUNK_IDS_COLUMN,
+    CHANGED_CHUNK_SPANS_COLUMN,
+    COMMIT_HASH_COLUMN,
+    COMMIT_TIMESTAMP_COLUMN,
+    EDIT_OP_PER_TOKEN_COLUMN,
+    FILEPATH_COLUMN,
+    FILEPATH_STABLE_ID_COLUMN,
+    FILE_LOCAL_COMMIT_INDEX_COLUMN,
+    HAS_AMBIGUOUS_RECONSTRUCTION_COLUMN,
+    HAS_RENAME_AMBIGUITY_COLUMN,
+    HUNK_ID_PER_TOKEN_COLUMN,
+    IS_MERGE_COMMIT_COLUMN,
+    PARENT_COUNT_COLUMN,
+    PARENT_HASHES_COLUMN,
+    PLATFORM_IDS_COLUMN,
+    REPO_COLUMN,
+    REPO_STABLE_ID_COLUMN,
+    TIMESTAMP_COLUMN,
+    TOKEN_AST_DEPTH_COLUMN,
+    TOKEN_AST_NODE_TYPE_COLUMN,
+    TOKEN_CALL_EDGES_COLUMN,
+    TOKEN_CHANGE_MASK_POST_COLUMN,
+    TOKEN_CHANGE_MASK_PRE_COLUMN,
+    TOKEN_CHUNK_DEP_LEVELS_COLUMN,
+    TOKEN_CHUNK_ENDS_COLUMN,
+    TOKEN_CHUNK_KINDS_COLUMN,
+    TOKEN_CHUNK_STARTS_COLUMN,
+    TOKEN_DEP_LEVELS_COLUMN,
+    TOKEN_IDS_COLUMN,
+    TOKEN_SIBLING_INDEX_COLUMN,
+    TOKEN_STRUCTURE_IDS_COLUMN,
+    TOKEN_SYMBOL_IDS_COLUMN,
+    TOKEN_CALL_TARGETS_COLUMN,
+    TOKEN_TYPE_REFS_COLUMN,
+    TOKEN_DEF_USE_COLUMN,
+    TOKEN_TYPE_EDGES_COLUMN,
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("migrate_clang_commits_v1_to_v12")
+
+# ---------------------------------------------------------------------------
+# Target v12 schema — matches clang_enriched_to_4k_parquet._SCHEMA plus
+# the four semantic token columns from the v12 contract.
+# ---------------------------------------------------------------------------
+
+V12_SCHEMA = pa.schema([
+    pa.field("text", pa.string()),
+    pa.field("actual_token_count", pa.int32()),
+    pa.field("structure_ids", pa.list_(pa.int8())),
+    pa.field("chunk_boundaries", pa.list_(pa.struct([
+        pa.field("start", pa.int32()),
+        pa.field("end", pa.int32()),
+        pa.field("kind", pa.int8()),
+        pa.field("dep_level", pa.int32()),
+        pa.field("name", pa.string()),
+    ]))),
+    pa.field("call_edges", pa.list_(pa.struct([
+        pa.field("from", pa.int32()),
+        pa.field("to", pa.int32()),
+    ]))),
+    pa.field("type_edges", pa.list_(pa.struct([
+        pa.field("from", pa.int32()),
+        pa.field("to", pa.int32()),
+    ]))),
+    pa.field("platform_info", pa.string()),
+    pa.field("language_info", pa.string()),
+    pa.field("build_info", pa.string()),
+    pa.field("constituent_provenance", pa.list_(pa.struct([
+        pa.field("filepath", pa.string()),
+        pa.field("language_info", pa.string()),
+        pa.field("build_info", pa.string()),
+    ]))),
+    pa.field("constituent_provenance_json", pa.string()),
+    # Chronology
+    pa.field(REPO_COLUMN, pa.string()),
+    pa.field(FILEPATH_COLUMN, pa.string()),
+    pa.field(COMMIT_HASH_COLUMN, pa.string()),
+    pa.field(TIMESTAMP_COLUMN, pa.string()),
+    pa.field(PARENT_HASHES_COLUMN, pa.list_(pa.string())),
+    pa.field(PARENT_COUNT_COLUMN, pa.int32()),
+    pa.field(IS_MERGE_COMMIT_COLUMN, pa.bool_()),
+    pa.field(AUTHOR_TIMESTAMP_COLUMN, pa.string()),
+    pa.field(COMMIT_TIMESTAMP_COLUMN, pa.string()),
+    pa.field(REPO_STABLE_ID_COLUMN, pa.string()),
+    pa.field(FILEPATH_STABLE_ID_COLUMN, pa.string()),
+    pa.field(FILE_LOCAL_COMMIT_INDEX_COLUMN, pa.int32()),
+    pa.field(HAS_AMBIGUOUS_RECONSTRUCTION_COLUMN, pa.bool_()),
+    pa.field(HAS_RENAME_AMBIGUITY_COLUMN, pa.bool_()),
+    # Token-aligned arrays
+    pa.field(TOKEN_IDS_COLUMN, pa.list_(pa.uint32())),
+    pa.field(PLATFORM_IDS_COLUMN, pa.list_(pa.uint16())),
+    pa.field(TOKEN_STRUCTURE_IDS_COLUMN, pa.list_(pa.uint8())),
+    pa.field(TOKEN_DEP_LEVELS_COLUMN, pa.list_(pa.uint16())),
+    pa.field(TOKEN_AST_DEPTH_COLUMN, pa.list_(pa.uint16())),
+    pa.field(TOKEN_SIBLING_INDEX_COLUMN, pa.list_(pa.uint16())),
+    pa.field(TOKEN_AST_NODE_TYPE_COLUMN, pa.list_(pa.uint16())),
+    # Semantic token columns (v12 additions)
+    pa.field(TOKEN_SYMBOL_IDS_COLUMN, pa.list_(pa.uint32())),
+    pa.field(TOKEN_CALL_TARGETS_COLUMN, pa.list_(pa.uint32())),
+    pa.field(TOKEN_TYPE_REFS_COLUMN, pa.list_(pa.uint32())),
+    pa.field(TOKEN_DEF_USE_COLUMN, pa.list_(pa.uint8())),
+    # Temporal token columns
+    pa.field(TOKEN_CHANGE_MASK_PRE_COLUMN, pa.list_(pa.uint8())),
+    pa.field(TOKEN_CHANGE_MASK_POST_COLUMN, pa.list_(pa.uint8())),
+    pa.field(HUNK_ID_PER_TOKEN_COLUMN, pa.list_(pa.int32())),
+    pa.field(EDIT_OP_PER_TOKEN_COLUMN, pa.list_(pa.uint8())),
+    # Chunk metadata
+    pa.field(TOKEN_CHUNK_STARTS_COLUMN, pa.list_(pa.uint32())),
+    pa.field(TOKEN_CHUNK_ENDS_COLUMN, pa.list_(pa.uint32())),
+    pa.field(TOKEN_CHUNK_KINDS_COLUMN, pa.list_(pa.uint8())),
+    pa.field(TOKEN_CHUNK_DEP_LEVELS_COLUMN, pa.list_(pa.uint16())),
+    pa.field(CHANGED_CHUNK_IDS_COLUMN, pa.list_(pa.uint32())),
+    pa.field(
+        CHANGED_CHUNK_SPANS_COLUMN,
+        pa.list_(
+            pa.struct([
+                pa.field("start", pa.uint32()),
+                pa.field("end", pa.uint32()),
+            ])
+        ),
+    ),
+    pa.field(TOKEN_CALL_EDGES_COLUMN, pa.list_(pa.struct([
+        pa.field("from", pa.uint16()),
+        pa.field("to", pa.uint16()),
+    ]))),
+    pa.field(TOKEN_TYPE_EDGES_COLUMN, pa.list_(pa.struct([
+        pa.field("from", pa.uint16()),
+        pa.field("to", pa.uint16()),
+    ]))),
+])
+
+# Map of column name -> default value factory for missing columns.
+# Lists get empty-list defaults; scalars get null/zero/False.
+_EMPTY_LIST_COLUMNS: dict[str, pa.DataType] = {}
+_SCALAR_DEFAULTS: dict[str, tuple[pa.DataType, object]] = {}
+
+for field in V12_SCHEMA:
+    if pa.types.is_list(field.type):
+        _EMPTY_LIST_COLUMNS[field.name] = field.type
+    elif pa.types.is_string(field.type):
+        _SCALAR_DEFAULTS[field.name] = (field.type, None)
+    elif pa.types.is_boolean(field.type):
+        _SCALAR_DEFAULTS[field.name] = (field.type, False)
+    elif pa.types.is_integer(field.type):
+        _SCALAR_DEFAULTS[field.name] = (field.type, None)
+
+
+def _make_null_column(
+    name: str, pa_type: pa.DataType, num_rows: int
+) -> pa.Array:
+    """Create a column of nulls or empty lists for the given type."""
+    if pa.types.is_list(pa_type):
+        # Empty list for each row
+        return pa.array([[] for _ in range(num_rows)], type=pa_type)
+    if pa.types.is_boolean(pa_type):
+        return pa.array([False] * num_rows, type=pa_type)
+    # Null for string/int scalars
+    return pa.array([None] * num_rows, type=pa_type)
+
+
+def migrate_table(table: pa.Table) -> pa.Table:
+    """Add missing v12 columns to a table, preserving existing data.
+
+    Returns a new table with the full v12 schema. Existing columns are
+    kept unchanged; missing columns are filled with appropriate defaults.
+    Extra columns not in v12 schema are preserved at the end.
+    """
+    existing_names = set(table.column_names)
+    num_rows = table.num_rows
+
+    # Build output columns in v12 schema order
+    columns: dict[str, pa.Array] = {}
+    added_columns: list[str] = []
+
+    for field in V12_SCHEMA:
+        if field.name in existing_names:
+            # Keep existing column, cast if needed
+            col = table.column(field.name)
+            try:
+                if col.type != field.type:
+                    col = col.cast(field.type, safe=False)
+            except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
+                # If cast fails, keep the original type
+                pass
+            columns[field.name] = col
+        else:
+            # Add missing column with defaults
+            columns[field.name] = _make_null_column(
+                field.name, field.type, num_rows
+            )
+            added_columns.append(field.name)
+
+    # Preserve extra columns that exist in source but not in v12 schema
+    # (e.g., changed_symbol_ids, ripple_candidates from v1 raw output)
+    extra_columns: dict[str, pa.Array] = {}
+    for name in table.column_names:
+        if name not in {f.name for f in V12_SCHEMA}:
+            extra_columns[name] = table.column(name)
+
+    if added_columns:
+        log.info("  Added %d missing columns: %s", len(added_columns), added_columns)
+
+    if extra_columns:
+        log.info(
+            "  Preserved %d extra v1 columns: %s",
+            len(extra_columns),
+            list(extra_columns.keys()),
+        )
+
+    # Build the output table: v12 columns first, then extras
+    all_names = list(columns.keys()) + list(extra_columns.keys())
+    all_arrays = list(columns.values()) + list(extra_columns.values())
+    return pa.table(dict(zip(all_names, all_arrays)))
+
+
+def migrate_shard(
+    input_path: Path,
+    output_path: Path,
+    *,
+    dry_run: bool = False,
+    row_group_size: int = 1024,
+) -> dict:
+    """Migrate a single parquet shard from v1 to v12.
+
+    Returns a summary dict with stats about the migration.
+    """
+    pf = pq.ParquetFile(str(input_path))
+    table = pf.read()
+    existing_columns = set(table.column_names)
+    v12_columns = {f.name for f in V12_SCHEMA}
+    missing = sorted(v12_columns - existing_columns)
+    extra = sorted(existing_columns - v12_columns)
+
+    stats = {
+        "input_path": str(input_path),
+        "output_path": str(output_path),
+        "num_rows": table.num_rows,
+        "num_row_groups": pf.num_row_groups,
+        "existing_columns": len(existing_columns),
+        "v12_columns": len(v12_columns),
+        "missing_columns": missing,
+        "extra_columns": extra,
+        "dry_run": dry_run,
+    }
+
+    if dry_run:
+        log.info(
+            "  [DRY RUN] %s: %d rows, %d missing columns, %d extra columns",
+            input_path.name,
+            table.num_rows,
+            len(missing),
+            len(extra),
+        )
+        return stats
+
+    if not missing:
+        log.info("  %s: already v12, no migration needed", input_path.name)
+        if input_path != output_path:
+            # Copy as-is with extras preserved
+            migrated = migrate_table(table)
+            pq.write_table(migrated, str(output_path), row_group_size=row_group_size)
+        stats["action"] = "copied" if input_path != output_path else "skipped"
+        return stats
+
+    migrated = migrate_table(table)
+
+    # Write to output (may be same path for in-place migration)
+    pq.write_table(migrated, str(output_path), row_group_size=row_group_size)
+
+    # Validate written file
+    check = pq.ParquetFile(str(output_path))
+    assert check.num_row_groups > 0, f"Empty parquet: {output_path}"
+    check.read_row_group(0)
+
+    log.info(
+        "  %s: migrated %d rows, added %d columns",
+        input_path.name,
+        table.num_rows,
+        len(missing),
+    )
+    stats["action"] = "migrated"
+    return stats
+
+
+def migrate_directory(
+    input_dir: Path,
+    output_dir: Path,
+    *,
+    dry_run: bool = False,
+    row_group_size: int = 1024,
+) -> list[dict]:
+    """Migrate all parquet shards in a directory from v1 to v12.
+
+    Returns a list of per-shard stats dicts.
+    """
+    input_dir = Path(input_dir)
+    output_dir = Path(output_dir)
+
+    if not input_dir.is_dir():
+        raise FileNotFoundError(f"Input directory not found: {input_dir}")
+
+    # Collect parquet files (train shards + val shard)
+    parquet_files = sorted(input_dir.glob("*.parquet"))
+    if not parquet_files:
+        raise FileNotFoundError(f"No .parquet files found in {input_dir}")
+
+    log.info(
+        "Found %d parquet files in %s", len(parquet_files), input_dir
+    )
+
+    if not dry_run:
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    all_stats = []
+    total_rows = 0
+    total_missing = 0
+
+    for pf_path in parquet_files:
+        out_path = output_dir / pf_path.name
+        stats = migrate_shard(
+            pf_path,
+            out_path,
+            dry_run=dry_run,
+            row_group_size=row_group_size,
+        )
+        all_stats.append(stats)
+        total_rows += stats["num_rows"]
+        total_missing += len(stats["missing_columns"])
+
+    # Copy non-parquet files (e.g., _COMPLETE sentinel)
+    if not dry_run:
+        for item in input_dir.iterdir():
+            if item.is_file() and not item.name.endswith(".parquet"):
+                dest = output_dir / item.name
+                if item != dest:
+                    dest.write_bytes(item.read_bytes())
+
+        # Write _COMPLETE sentinel for the output directory
+        sentinel = output_dir / "_COMPLETE"
+        sentinel.write_text(
+            f"Migrated from {input_dir.name} to v12 schema.\n"
+            f"{len(parquet_files)} shards, {total_rows} total rows.\n"
+        )
+
+    log.info(
+        "Migration %s: %d shards, %d total rows",
+        "preview" if dry_run else "complete",
+        len(parquet_files),
+        total_rows,
+    )
+
+    return all_stats
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Migrate clang_commits_4k_v1 parquet to v12 schema"
+    )
+    parser.add_argument(
+        "--input_dir",
+        required=True,
+        help="Path to v1 parquet directory (e.g., clang_commits_4k_v1)",
+    )
+    parser.add_argument(
+        "--output_dir",
+        required=True,
+        help="Path to output v12 directory (may equal input_dir for in-place)",
+    )
+    parser.add_argument(
+        "--dry_run",
+        action="store_true",
+        help="Report missing columns without writing",
+    )
+    parser.add_argument(
+        "--row_group_size",
+        type=int,
+        default=1024,
+        help="Row group size for output parquet (default: 1024)",
+    )
+    args = parser.parse_args()
+
+    t0 = time.time()
+    stats = migrate_directory(
+        Path(args.input_dir),
+        Path(args.output_dir),
+        dry_run=args.dry_run,
+        row_group_size=args.row_group_size,
+    )
+    elapsed = time.time() - t0
+
+    # Print summary
+    all_missing = set()
+    all_extra = set()
+    for s in stats:
+        all_missing.update(s["missing_columns"])
+        all_extra.update(s["extra_columns"])
+
+    if all_missing:
+        log.info("Columns added across all shards: %s", sorted(all_missing))
+    if all_extra:
+        log.info("Extra v1 columns preserved: %s", sorted(all_extra))
+    log.info("Elapsed: %.1f seconds", elapsed)
+
+
+if __name__ == "__main__":
+    main()

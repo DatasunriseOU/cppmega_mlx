@@ -4,6 +4,7 @@ import argparse
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 import json
+import math
 import os
 import subprocess
 import sys
@@ -166,6 +167,8 @@ class _ContractedValueAndGradPathCDirectFusionChainTrainingRuntime(
             "uses_forward_hook": True,
             "uses_backward_or_vjp_hook": True,
             "returns_model_grads": True,
+            "returns_full_model_grads": True,
+            "gradient_scope": "full_model",
             "loss_cotangent_bridge_ready": True,
             "model_gradient_tree_ready": True,
             "delegates_to_eager_loss_and_grad": False,
@@ -2097,7 +2100,11 @@ def test_fp8_path_c_training_route_keeps_split_when_direct_chain_is_standalone(
     assert direct_chain["standalone_dispatch_available"] is True
     assert direct_chain["training_critical_path"] is False
     assert direct_chain["training_runtime_available"] is False
-    assert direct_chain["runtime_binding"]["segment_count"] == 4
+    assert direct_chain["runtime_binding"]["segment_count"] == 5
+    assert [
+        segment["execution_phase"]
+        for segment in direct_chain["runtime_binding"]["segments"]
+    ] == ["forward", "forward", "backward", "backward", "backward"]
     assert route["status"] == m04_train_step.FP8_PATH_C_SPLIT_TRAINING_STATUS
     assert route["end_to_end_training_status"] == (
         m04_train_step.FP8_PATH_C_SPLIT_TRAINING_STATUS
@@ -2320,6 +2327,228 @@ def test_path_c_direct_chain_runtime_value_and_grad_uses_loss_cotangent_bridge(
         "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_weight_grad"
     )
     assert flat["layers.12.block.q_proj.weight_grad"] is buffers[logical_name]
+
+
+def test_path_c_direct_chain_runtime_value_and_grad_bridges_after_forward_segments(
+    tmp_path: Path,
+) -> None:
+    del tmp_path
+    model = build_local_gb10_quarter_tiny_smoke_model()
+    chain = _model_route_direct_chain(model)
+    buffers = _model_route_direct_chain_mx_buffers(model)
+    events: list[str] = []
+
+    def _artifact_for_segment(segment: Any) -> Any:
+        def _artifact(*_args: Any) -> None:
+            events.append(
+                f"segment:{segment.index}:{segment.execution_phase}"
+            )
+
+        return _artifact
+
+    artifacts = tuple(_artifact_for_segment(segment) for segment in chain.segments)
+
+    class _ForwardBoundaryBridge(_ContractedLossCotangentBridge):
+        def __call__(
+            self,
+            *,
+            model: nn.Module,
+            batch: Mapping[str, mx.array],
+            logical_buffers: Mapping[str, mx.array],
+            required_loss_cotangent_buffers: Sequence[str],
+            chain: Any,
+        ) -> dict[str, Any]:
+            assert events == ["segment:0:forward", "segment:1:forward"]
+            events.append("loss_cotangent_bridge")
+            return super().__call__(
+                model=model,
+                batch=batch,
+                logical_buffers=logical_buffers,
+                required_loss_cotangent_buffers=required_loss_cotangent_buffers,
+                chain=chain,
+            )
+
+    runtime = m04_train_step.PathCDirectFusionChainTrainingRuntime(
+        chain=chain,
+        artifacts=artifacts,
+        logical_buffers=buffers,
+        owner_name="unit.path_c_direct_training_runtime",
+        training_critical_path=True,
+        loss_cotangent_bridge=_ForwardBoundaryBridge(),
+    )
+    runtime.bind_training_graph(
+        owner="CompiledPretrainingStep",
+        uses_direct_chain_runtime=True,
+        uses_forward_hook=True,
+        uses_backward_or_vjp_hook=True,
+    )
+
+    def forbidden_loss_and_grad(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("Path C direct runtime must not delegate to eager")
+
+    runtime.value_and_grad(model, {}, forbidden_loss_and_grad)
+
+    assert events == [
+        "segment:0:forward",
+        "segment:1:forward",
+        "loss_cotangent_bridge",
+        "segment:2:backward",
+        "segment:3:backward",
+        "segment:4:backward",
+    ]
+
+
+def test_path_c_local_gb10_suffix_bridge_returns_real_boundary_cotangents() -> None:
+    model = build_local_gb10_quarter_tiny_smoke_model()
+    chain = _model_route_direct_chain(model)
+    buffers = _model_route_direct_chain_mx_buffers(model)
+    residual_name = "local_gb10_quarter_brick_11_R_hidden_after"
+    attention_name = "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_out"
+    residual_grad_name = f"{residual_name}_grad"
+    attention_grad_name = f"{attention_name}_grad"
+    residual = mx.ones_like(buffers[residual_name]) * mx.array(0.125)
+    attention = mx.ones_like(buffers[attention_name]) * mx.array(-0.0625)
+    buffers[residual_name] = residual
+    buffers[attention_name] = attention
+    tokens = mx.arange(residual.shape[1] + 1, dtype=mx.int32)[None, :]
+    tokens = tokens % mx.array(model.config.vocab_size, dtype=mx.int32)
+    bridge = m04_train_step.PathCResidualSumSuffixLossCotangentBridge(chunk_rows=128)
+
+    contract = bridge.loss_cotangent_bridge_contract()
+    assert contract["contract"] == m04_train_step.PATH_C_LOSS_COTANGENT_BRIDGE_CONTRACT
+    assert contract["returns_required_loss_cotangents"] is True
+    assert contract["delegates_to_eager_loss_and_grad"] is False
+    assert contract["hidden_packing_performed"] is False
+
+    payload = bridge(
+        model=model,
+        batch={"tokens": tokens},
+        logical_buffers=buffers,
+        required_loss_cotangent_buffers=(residual_grad_name, attention_grad_name),
+        chain=chain,
+    )
+
+    def expected_suffix_loss(
+        residual_hidden: mx.array,
+        attention_out: mx.array,
+        norm_weight: mx.array,
+        head_weight: mx.array,
+    ) -> tuple[mx.array, mx.array]:
+        targets = tokens[:, 1:]
+        hidden = residual_hidden + attention_out
+        inv_rms = mx.rsqrt(
+            mx.mean(hidden * hidden, axis=-1, keepdims=True)
+            + mx.array(model.norm.eps, dtype=hidden.dtype)
+        )
+        normed = hidden * inv_rms * norm_weight
+        logits = normed @ head_weight.T
+        token_losses = nn.losses.cross_entropy(
+            logits.astype(mx.float32),
+            targets,
+            reduction="none",
+        )
+        mask = mx.ones(targets.shape, dtype=mx.float32)
+        ntokens = mask.sum()
+        denom = mx.maximum(ntokens, mx.array(1.0, dtype=mx.float32))
+        return (token_losses * mask).astype(mx.float32).sum() / denom, ntokens
+
+    (expected_loss, expected_ntokens), expected_grads = mx.value_and_grad(
+        expected_suffix_loss,
+        argnums=(0, 1, 2, 3),
+    )(residual, attention, model.norm.weight, model.lm_head.weight)
+    mx.eval(
+        payload["loss"],
+        payload["ntokens"],
+        payload["cotangents"][residual_grad_name],
+        payload["cotangents"][attention_grad_name],
+        payload["parameter_grads"]["norm.weight_grad"],
+        payload["parameter_grads"]["lm_head.weight_grad"],
+        expected_loss,
+        expected_ntokens,
+        expected_grads[0],
+        expected_grads[1],
+        expected_grads[2],
+        expected_grads[3],
+    )
+
+    assert float(payload["loss"].item()) == pytest.approx(
+        float(expected_loss.item()),
+        rel=1e-5,
+        abs=1e-6,
+    )
+    assert int(payload["ntokens"].item()) == int(expected_ntokens.item())
+    assert set(payload["cotangents"]) == {residual_grad_name, attention_grad_name}
+    residual_delta = mx.max(
+        mx.abs(payload["cotangents"][residual_grad_name] - expected_grads[0])
+    )
+    attention_delta = mx.max(
+        mx.abs(payload["cotangents"][attention_grad_name] - expected_grads[1])
+    )
+    norm_delta = mx.max(
+        mx.abs(payload["parameter_grads"]["norm.weight_grad"] - expected_grads[2])
+    )
+    head_delta = mx.max(
+        mx.abs(payload["parameter_grads"]["lm_head.weight_grad"] - expected_grads[3])
+    )
+    mx.eval(residual_delta, attention_delta, norm_delta, head_delta)
+    assert float(residual_delta.item()) < 1e-5
+    assert float(attention_delta.item()) < 1e-5
+    assert float(norm_delta.item()) < 1e-5
+    assert float(head_delta.item()) < 1e-5
+
+
+def test_path_c_prefix_hidden_and_vjp_cover_pre_region_parameters() -> None:
+    model = build_local_gb10_quarter_tiny_smoke_model()
+    chain = _model_route_direct_chain(model)
+    start_layer = m04_train_step._path_c_direct_chain_start_layer_index(
+        model,
+        chain,
+    )
+    assert start_layer == 10
+
+    seq_len = 512
+    tokens = mx.arange(seq_len + 1, dtype=mx.int32)[None, :]
+    tokens = tokens % mx.array(model.config.vocab_size, dtype=mx.int32)
+    capture = PathCActivationBufferCapture(
+        aliases={
+            "local_gb10_quarter_brick_10_M_hidden": "hidden",
+            "local_gb10_quarter_brick_10_M_residual_norm_hidden": "normed_hidden",
+        },
+        owner_name="unit.path_c_prefix_boundary_capture",
+    )
+    model.attach_path_c_activation_probe(capture)
+    captured_suffix_hidden = model.decoder_hidden_states(tokens[:, :-1])
+    prefix_hidden = m04_train_step.path_c_model_prefix_hidden_states(
+        model,
+        {"tokens": tokens},
+        end_layer_index=start_layer,
+    )
+    boundary_delta = mx.max(mx.abs(prefix_hidden - capture.buffers["hidden"]))
+    mx.eval(captured_suffix_hidden, prefix_hidden, boundary_delta)
+
+    assert float(boundary_delta.item()) < 1e-6
+
+    hidden_grad = mx.ones_like(prefix_hidden) * mx.array(0.001, dtype=mx.float32)
+    normed_hidden_grad = (
+        mx.ones_like(capture.buffers["normed_hidden"]) * mx.array(0.002, dtype=mx.float32)
+    )
+    prefix_grads = m04_train_step.path_c_prefix_gradient_tree_from_hidden_cotangent(
+        model=model,
+        batch={"tokens": tokens},
+        hidden_cotangent=hidden_grad,
+        normed_hidden_cotangent=normed_hidden_grad,
+        chain=chain,
+    )
+    flat = dict(tree_flatten(prefix_grads))
+    mx.eval(prefix_grads)
+
+    assert "token_embedding.weight" in flat
+    assert "position_embedding.weight" in flat
+    assert "layers.8.block.out_proj.weight" in flat
+    assert "layers.10.norm.weight" in flat
+    assert "layers.10.block.in_proj.weight" not in flat
+    assert "norm.weight" not in flat
+    assert "lm_head.weight" not in flat
 
 
 def test_fp8_path_c_training_route_rejects_legacy_direct_chain_bool(
@@ -2718,8 +2947,16 @@ def test_path_c_direct_chain_runtime_executor_runs_native_segments(
 
     assert payload["status"] == "ok"
     assert payload["runtime_uses_direct_fusion_chain"] is True
-    assert payload["segment_count"] == 4
+    assert payload["segment_count"] == 5
+    assert [segment["execution_phase"] for segment in payload["segments"]] == [
+        "forward",
+        "forward",
+        "backward",
+        "backward",
+        "backward",
+    ]
     assert [segment["status"] for segment in payload["segments"]] == [
+        "ok",
         "ok",
         "ok",
         "ok",
@@ -2754,9 +2991,10 @@ def test_path_c_direct_chain_runtime_installer_keeps_probe_off_critical_path(
     config = m04_train_step.config_from_args(args, data_path=tmp_path / "tokens.npz")
     model = build_local_gb10_quarter_tiny_smoke_model()
     chain = _model_route_direct_chain(model)
+    logical_buffers = _model_route_direct_chain_mx_buffers(model)
     logical_owner = PathCLogicalBufferOwner(
         owner_name="unit.path_c_direct_fusion_chain_buffers",
-        buffers=_model_route_direct_chain_mx_buffers(model),
+        buffers=logical_buffers,
     )
 
     install_payload = (
@@ -2821,9 +3059,10 @@ def test_path_c_direct_chain_runtime_installer_blocks_incomplete_critical_path(
     config = m04_train_step.config_from_args(args, data_path=tmp_path / "tokens.npz")
     model = build_local_gb10_quarter_tiny_smoke_model()
     chain = _model_route_direct_chain(model)
+    logical_buffers = _model_route_direct_chain_mx_buffers(model)
     logical_owner = PathCLogicalBufferOwner(
         owner_name="unit.path_c_direct_fusion_chain_buffers",
-        buffers=_model_route_direct_chain_mx_buffers(model),
+        buffers=logical_buffers,
     )
 
     install_payload = (
@@ -2859,7 +3098,111 @@ def test_path_c_direct_chain_runtime_installer_blocks_incomplete_critical_path(
     assert route["direct_fusion_chain_training_runtime_available"] is False
 
 
-def test_path_c_direct_chain_runtime_installer_accepts_contracted_loss_bridge(
+def test_path_c_direct_chain_runtime_installer_accepts_suffix_bridge_off_critical_path(
+    tmp_path: Path,
+) -> None:
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--synthetic",
+            "--dtype",
+            "fp8_path_c",
+            "--pattern",
+            "A",
+            "--depth",
+            "1",
+            "--dsa-a-layer-ranks",
+            "0",
+            "--output",
+            str(tmp_path / "receipt.json"),
+        ]
+    )
+    config = m04_train_step.config_from_args(args, data_path=tmp_path / "tokens.npz")
+    model = build_local_gb10_quarter_tiny_smoke_model()
+    chain = _model_route_direct_chain(model)
+    logical_buffers = _model_route_direct_chain_mx_buffers(model)
+    logical_owner = PathCLogicalBufferOwner(
+        owner_name="unit.path_c_direct_fusion_chain_buffers",
+        buffers=logical_buffers,
+    )
+
+    install_payload = (
+        m04_train_step.install_path_c_direct_chain_training_runtime_for_model(
+            model=model,
+            chain=chain,
+            artifacts=_model_route_direct_chain_artifacts(model),
+            logical_owner=logical_owner,
+            owner_name="unit.path_c_direct_training_runtime",
+            training_critical_path=False,
+            run_probe=False,
+            loss_cotangent_bridge=m04_train_step.PathCResidualSumSuffixLossCotangentBridge(
+                chunk_rows=128,
+            ),
+        )
+    )
+    route = m04_train_step.fp8_path_c_training_route_payload_for_model(
+        config,
+        model,
+    )
+    contract = route["direct_fusion_chain_training_runtime_contract"]
+
+    assert install_payload["status"] == "ok"
+    assert install_payload["training_critical_path"] is False
+    assert install_payload["value_and_grad_contract"]["loss_cotangent_bridge_ready"]
+    assert install_payload["value_and_grad_contract"]["returns_model_grads"] is True
+    assert (
+        install_payload["value_and_grad_contract"]["returns_full_model_grads"]
+        is True
+    )
+    assert (
+        install_payload["value_and_grad_contract"][
+            "full_model_gradient_coverage"
+        ]["missing_parameter_names"]
+        == []
+    )
+    assert install_payload["value_and_grad_contract"][
+        "full_model_gradient_coverage"
+    ]["inactive_zero_gradient_parameter_names"] == [
+        "layers.12.block.k_proj.weight",
+        "layers.12.block.v_proj.weight",
+    ]
+    assert contract["status"] == (
+        m04_train_step.FP8_PATH_C_DIRECT_CHAIN_TRAINING_RUNTIME_INCOMPLETE_STATUS
+    )
+    assert contract["training_runtime_available"] is False
+    runtime = model.path_c_direct_fusion_chain_training_runtime
+    seq_len = logical_buffers[
+        "local_gb10_quarter_brick_11_R_hidden_after"
+    ].shape[1]
+    tokens = mx.arange(seq_len + 1, dtype=mx.int32)[None, :]
+    tokens = tokens % mx.array(model.config.vocab_size, dtype=mx.int32)
+
+    def forbidden_loss_and_grad(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("Path C production bridge must not delegate to eager")
+
+    (loss, ntokens), grads = runtime.value_and_grad(
+        model,
+        {"tokens": tokens},
+        forbidden_loss_and_grad,
+    )
+    flat = dict(tree_flatten(grads))
+
+    mx.eval(loss, ntokens)
+    assert math.isfinite(float(loss.item()))
+    assert int(ntokens.item()) == seq_len
+    assert "layers.10.norm.weight" in flat
+    assert "layers.12.block.q_proj.weight" in flat
+    assert "layers.12.block.k_proj.weight" in flat
+    assert "layers.12.block.v_proj.weight" in flat
+    assert "norm.weight" in flat
+    assert "lm_head.weight" in flat
+    assert contract["training_graph_bound"] is False
+    assert contract["value_and_grad_contract_ok"] is False
+    assert route["direct_fusion_chain_training_runtime_available"] is False
+    assert route["full_end_to_end_training_available"] is False
+    assert route["selected_action"] == "run_path_c_split_training_route"
+
+
+def test_path_c_direct_chain_runtime_blocks_incomplete_production_bridge(
     tmp_path: Path,
 ) -> None:
     args = m04_train_step.build_parser().parse_args(
@@ -2894,24 +3237,34 @@ def test_path_c_direct_chain_runtime_installer_accepts_contracted_loss_bridge(
             owner_name="unit.path_c_direct_training_runtime",
             training_critical_path=True,
             run_probe=False,
-            loss_cotangent_bridge=_ContractedLossCotangentBridge(),
+            loss_cotangent_bridge=m04_train_step.PathCResidualSumSuffixLossCotangentBridge(
+                chunk_rows=128,
+            ),
         )
     )
     route = m04_train_step.fp8_path_c_training_route_payload_for_model(
         config,
         model,
     )
-    contract = route["direct_fusion_chain_training_runtime_contract"]
 
     assert install_payload["status"] == "ok"
     assert install_payload["training_critical_path"] is True
     assert install_payload["value_and_grad_contract"]["status"] == "ok"
-    assert contract["status"] == "ok"
-    assert contract["training_runtime_available"] is True
-    assert contract["training_graph_bound"] is True
-    assert contract["value_and_grad_contract_ok"] is True
+    assert install_payload["value_and_grad_contract"]["returns_model_grads"] is True
+    assert (
+        install_payload["value_and_grad_contract"]["returns_full_model_grads"]
+        is True
+    )
+    coverage = install_payload["value_and_grad_contract"][
+        "full_model_gradient_coverage"
+    ]
+    assert coverage["missing_parameter_names"] == []
+    assert coverage["inactive_zero_gradient_parameter_names"] == [
+        "layers.12.block.k_proj.weight",
+        "layers.12.block.v_proj.weight",
+    ]
+    assert hasattr(model, "path_c_direct_fusion_chain_training_runtime")
     assert route["direct_fusion_chain_training_runtime_available"] is True
-    assert route["full_end_to_end_training_available"] is True
     assert route["selected_action"] == "run_path_c_direct_fusion_chain_route"
 
 
@@ -3151,9 +3504,9 @@ def test_fp8_path_c_training_route_for_model_uses_model_derived_regions(
     ]
     audit = route["path_c_fusion"]["direct_chained_fusion"]["model_binding_audit"]
     assert audit["status"] == "runtime_backward_or_state_owner_missing"
-    assert audit["required_logical_buffer_count"] == 78
+    assert audit["required_logical_buffer_count"] == 81
     assert audit["model_parameter_or_constant_count"] == 28
-    assert audit["runtime_activation_or_grad_count"] == 45
+    assert audit["runtime_activation_or_grad_count"] == 48
     assert audit["backward_gradient_count"] == 34
     assert audit["forward_activation_probe_surface_available"] is True
     assert audit["parameter_gradient_probe_surface_available"] is True
@@ -3175,7 +3528,7 @@ def test_fp8_path_c_training_route_for_model_uses_model_derived_regions(
     )
     assert runtime_binding["provided_logical_buffer_count"] == 25
     assert runtime_binding["shape_mismatch_buffers"] == []
-    assert runtime_binding["missing_logical_buffer_count"] == 53
+    assert runtime_binding["missing_logical_buffer_count"] == 56
     assert (
         "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_sm_scale"
         in runtime_binding["missing_logical_buffers"]
@@ -3295,7 +3648,7 @@ def test_path_c_direct_chain_runtime_capture_owners_reduce_binding_gap() -> None
     assert runtime_binding["logical_buffer_owner"] == (
         "local_gb10_quarter.path_c_direct_fusion_chain_buffers"
     )
-    assert runtime_binding["provided_logical_buffer_count"] == 69
+    assert runtime_binding["provided_logical_buffer_count"] == 72
     assert runtime_binding["missing_logical_buffer_count"] == 9
     assert runtime_binding["shape_mismatch_count"] == 0
     assert runtime_binding["dtype_mismatch_count"] == 0
@@ -3356,7 +3709,7 @@ def test_path_c_direct_chain_runtime_capture_owners_reduce_binding_gap() -> None
         "runtime_binding"
     ]
 
-    assert runtime_binding["provided_logical_buffer_count"] == 75
+    assert runtime_binding["provided_logical_buffer_count"] == 78
     assert runtime_binding["missing_logical_buffer_count"] == 3
     assert runtime_binding["shape_mismatch_count"] == 0
     assert "hidden_grad" not in runtime_binding["missing_logical_buffers"]
@@ -3403,14 +3756,14 @@ def test_path_c_direct_chain_runtime_capture_owners_reduce_binding_gap() -> None
         "runtime_binding"
     ]
 
-    assert runtime_binding["provided_logical_buffer_count"] == 78
+    assert runtime_binding["provided_logical_buffer_count"] == 81
     assert runtime_binding["missing_logical_buffer_count"] == 0
     assert runtime_binding["logical_tensor_binding_ready"] is True
     assert runtime_binding["direct_chain_artifacts_bound"] is False
     assert runtime_binding["status"] == (
         m04_train_step.FP8_PATH_C_DIRECT_CHAIN_ARTIFACTS_MISSING_STATUS
     )
-    assert runtime_binding["missing_artifact_segments"] == [0, 1, 2, 3]
+    assert runtime_binding["missing_artifact_segments"] == [0, 1, 2, 3, 4]
     assert runtime_binding["hidden_packing_performed"] is False
 
 
@@ -3458,9 +3811,18 @@ def test_fp8_path_c_training_route_composes_model_and_runtime_logical_owners(
     )
     assert runtime_binding["hidden_packing_performed"] is False
     assert runtime_binding["provided_logical_buffer_count"] == 27
-    assert runtime_binding["missing_logical_buffer_count"] == 51
+    assert runtime_binding["missing_logical_buffer_count"] == 54
+    assert [
+        segment["execution_phase"] for segment in runtime_binding["segments"]
+    ] == ["forward", "forward", "backward", "backward", "backward"]
     assert "hidden" not in runtime_binding["missing_logical_buffers"]
     assert "hidden_grad" not in runtime_binding["missing_logical_buffers"]
+    assert "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_out" in (
+        runtime_binding["missing_logical_buffers"]
+    )
+    assert "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_lse" in (
+        runtime_binding["missing_logical_buffers"]
+    )
 
 
 def test_fp8_path_c_training_route_accepts_real_activation_capture_owner(

@@ -8,7 +8,7 @@ emits fixed-shape :class:LMTokenBatch objects directly for MLX.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, NotRequired, Protocol, TypedDict, cast
@@ -40,6 +40,7 @@ class TokenParquetDatasetOptions(TokenNpzDatasetOptions, total=False):
     text_key: str | None
     tokenizer: NotRequired[Any | None]
     eos_token_id: int | None
+    metadata_columns: str | Sequence[str] | None
 
 
 class TokenBatchDataset(Protocol):

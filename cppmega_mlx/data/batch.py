@@ -20,6 +20,8 @@ class LMTokenBatch:
     ast_depth_ids: mx.array | None = None
     sibling_index_ids: mx.array | None = None
     node_type_ids: mx.array | None = None
+    platform_ids: mx.array | None = None
+    metadata: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.tokens.ndim != 2:
@@ -38,6 +40,22 @@ class LMTokenBatch:
                 "attention_mask must match tokens shape "
                 f"{self.tokens.shape}, got {self.attention_mask.shape}"
             )
+        if self.platform_ids is not None:
+            if self.platform_ids.ndim != 2:
+                raise ValueError(
+                    f"platform_ids must be shaped (B, K), got {self.platform_ids.shape}"
+                )
+            if self.platform_ids.shape[0] != self.tokens.shape[0]:
+                raise ValueError(
+                    "platform_ids batch dimension must match tokens batch "
+                    f"{self.tokens.shape[0]}, got {self.platform_ids.shape[0]}"
+                )
+            has_negative = mx.any(self.platform_ids.astype(mx.int32) < 0)
+            mx.eval(has_negative)
+            if bool(has_negative.item()):
+                raise ValueError("platform_ids must be non-negative")
+        if self.metadata is not None and not isinstance(self.metadata, Mapping):
+            raise ValueError("metadata must be a mapping when provided")
 
     @property
     def inputs(self) -> mx.array:
@@ -63,17 +81,29 @@ class LMTokenBatch:
         }
 
     def model_kwargs(self) -> dict[str, mx.array]:
-        return {
+        kwargs = {
             name: value[:, :-1]
             for name, value in self.structure_fields().items()
             if value is not None
         }
+        if self.platform_ids is not None:
+            kwargs["platform_ids"] = self.platform_ids
+        return kwargs
 
-    def as_dict(self) -> dict[str, mx.array]:
-        data: dict[str, mx.array] = {"tokens": self.tokens}
+    def training_metadata(self) -> dict[str, Any]:
+        """Return optional non-logit training metadata as a plain mapping."""
+
+        return {} if self.metadata is None else dict(self.metadata)
+
+    def as_dict(self, *, include_metadata: bool = False) -> dict[str, Any]:
+        data: dict[str, Any] = {"tokens": self.tokens}
         if self.attention_mask is not None:
             data["attention_mask"] = self.attention_mask
         data.update({k: v for k, v in self.structure_fields().items() if v is not None})
+        if self.platform_ids is not None:
+            data["platform_ids"] = self.platform_ids
+        if include_metadata and self.metadata is not None:
+            data["metadata"] = self.metadata
         return data
 
 
@@ -95,6 +125,8 @@ def ensure_lm_batch(batch: LMTokenBatch | Mapping[str, Any] | mx.array) -> LMTok
             ast_depth_ids=batch.get("ast_depth_ids"),
             sibling_index_ids=batch.get("sibling_index_ids"),
             node_type_ids=batch.get("node_type_ids"),
+            platform_ids=batch.get("platform_ids"),
+            metadata=batch.get("metadata"),
         )
     raise TypeError(f"unsupported batch type: {type(batch)!r}")
 

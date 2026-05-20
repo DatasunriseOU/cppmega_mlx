@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 from cppmega_mlx.data.batch import synthetic_token_batch
+from cppmega_mlx.data.platform_context import platform_ids_array, parse_platform_context
 from cppmega_mlx.inference.engine import make_contiguous_kv_cache
 from cppmega_mlx.models.hybrid_lm import HybridTinyConfig, HybridTinyLM
 from cppmega_mlx.nn.structure_embedding import CppMegaStructureEmbedding
@@ -95,6 +96,40 @@ def test_single_route_lms_preserve_route_specific_loss_contract() -> None:
         assert int(ntokens.item()) == 10
         assert math.isfinite(float(loss.item()))
         assert float(loss.item()) > 0
+
+
+def test_hybrid_lm_platform_ids_are_zero_init_optional_conditioning() -> None:
+    model = HybridTinyLM(_small_single_route_config("M"))
+    input_ids = mx.array([[1, 2, 3, 4]], dtype=mx.int32)
+    platform_ids = mx.array(
+        platform_ids_array(
+            [parse_platform_context({"os": "macos", "arch": "arm64", "compiler": "clang"})]
+        )
+    )
+
+    base = model.decoder_hidden_states(input_ids)
+    with_zero_platform = model.decoder_hidden_states(
+        input_ids,
+        platform_ids=platform_ids,
+    )
+    mx.eval(base, with_zero_platform)
+    np.testing.assert_allclose(np.array(base), np.array(with_zero_platform), atol=0.0)
+
+    model.platform_embedding.embedding.weight = mx.ones_like(
+        model.platform_embedding.embedding.weight
+    )
+    with_platform = model.decoder_hidden_states(input_ids, platform_ids=platform_ids)
+    mx.eval(with_platform)
+
+    assert not np.allclose(np.array(base), np.array(with_platform))
+
+
+def test_hybrid_lm_platform_ids_fail_closed_on_bad_shape() -> None:
+    model = HybridTinyLM(_small_single_route_config("M"))
+    input_ids = mx.array([[1, 2, 3, 4]], dtype=mx.int32)
+
+    with pytest.raises(ValueError, match="platform_ids must be shaped"):
+        model(input_ids, platform_ids=mx.array([1, 2, 3], dtype=mx.int32))
 
 
 def test_single_route_blocks_emit_finite_distinguishable_route_deltas() -> None:

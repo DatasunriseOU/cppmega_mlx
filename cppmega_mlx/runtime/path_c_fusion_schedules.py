@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import ast
 from collections import Counter
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from hashlib import sha256
 import json
@@ -284,6 +284,7 @@ class PathCFusionScheduleChainSegment:
     physical_abi_policy: str
     status: str
     reason: str
+    execution_phase: str
 
 
 @dataclass(frozen=True)
@@ -312,6 +313,23 @@ class _ScheduleNodeView:
     op_name: str
     inputs: tuple[str, ...]
     outputs: tuple[str, ...]
+
+
+def _path_c_schedule_node_execution_phase(node: Any) -> str:
+    backward = str(getattr(node, "backward", ""))
+    op_name = str(getattr(node, "op_name", ""))
+    if backward == "owner_output" or op_name.endswith("_bwd"):
+        return "backward"
+    return "forward"
+
+
+def _path_c_schedule_segment_execution_phase(nodes: Iterable[Any]) -> str:
+    phases = {_path_c_schedule_node_execution_phase(node) for node in nodes}
+    if not phases:
+        return "empty"
+    if len(phases) == 1:
+        return next(iter(phases))
+    return "mixed"
 
 
 @dataclass(frozen=True)
@@ -7704,6 +7722,15 @@ def plan_path_c_direct_fusion_chain_for_region(
                 end=end,
                 name=f"{working_region.name}_chain_{start}_{end}",
             )
+            execution_phase = _path_c_schedule_segment_execution_phase(
+                candidate_region.nodes
+            )
+            if execution_phase == "mixed":
+                first_failure = (
+                    "direct-chain segment would cross the forward/backward "
+                    "execution boundary required by the loss cotangent bridge"
+                )
+                break
             target = selector.select(candidate_region)
             if target is None:
                 first_failure = (
@@ -7754,6 +7781,7 @@ def plan_path_c_direct_fusion_chain_for_region(
                 physical_abi_policy=DESCRIPTOR_PHYSICAL_ABI_POLICY_DIRECT,
                 status="ok",
                 reason="direct-buffer segment fits the portable Metal buffer limit",
+                execution_phase=execution_phase,
             )
         if best is not None:
             segments.append(best)
@@ -7777,6 +7805,9 @@ def plan_path_c_direct_fusion_chain_for_region(
                 physical_abi_policy=DESCRIPTOR_PHYSICAL_ABI_POLICY_DIRECT,
                 status="blocked",
                 reason=first_failure or "direct-buffer segment planning failed",
+                execution_phase=_path_c_schedule_segment_execution_phase(
+                    blocked_region.nodes
+                ),
             )
         )
         start += 1

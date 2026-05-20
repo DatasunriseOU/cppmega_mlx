@@ -66,6 +66,36 @@ def test_bridge_accepts_mapping_and_mlx_array_batches() -> None:
     )
 
 
+def test_bridge_preserves_optional_training_metadata_without_model_kwargs() -> None:
+    metadata = {
+        "parquet": {
+            "windows": (
+                {
+                    "row_index": 0,
+                    "token_start": 0,
+                    "token_end": 4,
+                },
+            ),
+            "columns": {
+                "token_chunk_starts": ([0],),
+                "token_chunk_ends": ([4],),
+                "language_info": ('{"language": "cpp"}',),
+            },
+        }
+    }
+    source = LMTokenBatch(
+        tokens=mx.array(np.arange(4, dtype=np.int32).reshape(1, 4)),
+        metadata=metadata,
+    )
+
+    sample = LocalTokenBatchDataset([source])[0]
+    [round_trip] = list(iter_mlx_batches([sample]))
+
+    assert sample["metadata"] == metadata
+    assert round_trip.metadata == metadata
+    assert round_trip.model_kwargs() == {}
+
+
 def test_bridge_fails_closed_on_bad_batch_schema() -> None:
     with pytest.raises(ValueError, match="must include 'tokens'"):
         LocalTokenBatchDataset([{"attention_mask": np.ones((2, 4), dtype=np.float32)}])

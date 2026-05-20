@@ -1413,7 +1413,11 @@ def _path_c_model_surfaces_from_bricks(
     if not bricks:
         raise ValueError("bricks must contain at least one route")
 
-    context = _PathCBrickSurfaceLoweringContext()
+    first_brick = bricks[0]
+    context = _PathCBrickSurfaceLoweringContext(
+        residual_hidden=f"{first_brick.name}_hidden",
+        route_hidden=f"{first_brick.name}_residual_norm_hidden",
+    )
     for index, brick in enumerate(bricks):
         lowerer = _path_c_model_brick_surface_lowerer_for(brick.route_symbol)
         if lowerer is None:
@@ -1427,7 +1431,8 @@ def _path_c_model_surfaces_from_bricks(
         if index + 1 < len(bricks):
             _append_path_c_inter_brick_residual_norm(
                 context,
-                brick=brick,
+                producer_brick=brick,
+                norm_brick=bricks[index + 1],
                 delta=result.delta_output,
             )
     return tuple(context.surfaces)
@@ -1593,11 +1598,12 @@ def _attention_out_proj_real_abi_inputs_for_brick(
 def _append_path_c_inter_brick_residual_norm(
     context: _PathCBrickSurfaceLoweringContext,
     *,
-    brick: _ResolvedPathCModelBrick,
+    producer_brick: _ResolvedPathCModelBrick,
+    norm_brick: _ResolvedPathCModelBrick,
     delta: str,
 ) -> None:
-    norm_name = f"{brick.name}_residual_norm"
-    hidden_after = f"{brick.name}_hidden_after"
+    norm_name = f"{norm_brick.name}_residual_norm"
+    hidden_after = f"{producer_brick.name}_hidden_after"
     next_hidden = f"{norm_name}_hidden"
     context.surfaces.append(
         _residual_norm_surface(
@@ -2163,6 +2169,7 @@ def compile_path_c_region(
     schedule_name: str | None = None,
     schedule_status: str = "ready",
     tilelang_lowerer: Callable[..., Any] | None = None,
+    tilelang_plan_factory: Callable[..., Any] | None = None,
     target: str = "metal",
     compiler: Callable[[FusionCompilePlan], object] | None = None,
 ) -> FusionCompilePlan | CompiledPathCRegion:
@@ -2180,12 +2187,23 @@ def compile_path_c_region(
     )
     if tilelang_lowerer is not None and compiler is not None:
         raise ValueError("compiler and tilelang_lowerer are mutually exclusive")
+    if tilelang_lowerer is not None and tilelang_plan_factory is not None:
+        raise ValueError("tilelang_lowerer and tilelang_plan_factory are mutually exclusive")
     if tilelang_lowerer is None:
-        tilelang_plan = _tilelang_compile_plan_for(
-            region,
-            schedule_template=schedule_template,
-            schedule_name=schedule_name,
-            schedule_status=schedule_status,
+        tilelang_plan = (
+            _tilelang_compile_plan_for(
+                region,
+                schedule_template=schedule_template,
+                schedule_name=schedule_name,
+                schedule_status=schedule_status,
+            )
+            if tilelang_plan_factory is None
+            else tilelang_plan_factory(
+                region,
+                schedule_template=schedule_template,
+                schedule_name=schedule_name,
+                schedule_status=schedule_status,
+            )
         )
         artifact = None
     else:
@@ -2261,12 +2279,14 @@ def tilelang_single_entry_lowerer(
     *,
     target: str = "metal",
     execution_backend: str = "tvm_ffi",
+    compile_prim_func: Callable[..., Any] | None = None,
     **_kwargs: Any,
 ) -> Any:
     """Lower a single-entry fusion IRModule through ``tilelang.compile``."""
 
     prim_func = _single_entry_prim_func(func_or_mod)
-    return _compile_tilelang_prim_func(
+    compiler = compile_prim_func or _compile_tilelang_prim_func
+    return compiler(
         prim_func,
         target=target,
         execution_backend=execution_backend,

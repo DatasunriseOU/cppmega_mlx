@@ -567,6 +567,7 @@ def _path_c_training_runtime_value_and_grad_contract(
     uses_forward = bool(payload.get("uses_forward_hook"))
     uses_reverse = bool(payload.get("uses_backward_or_vjp_hook"))
     returns_model_grads = bool(payload.get("returns_model_grads"))
+    returns_full_model_grads = bool(payload.get("returns_full_model_grads", False))
     loss_cotangent_bridge_ready = bool(payload.get("loss_cotangent_bridge_ready"))
     model_gradient_tree_ready = bool(payload.get("model_gradient_tree_ready"))
     delegates_to_eager = bool(payload.get("delegates_to_eager_loss_and_grad", True))
@@ -579,6 +580,7 @@ def _path_c_training_runtime_value_and_grad_contract(
         and uses_forward
         and uses_reverse
         and returns_model_grads
+        and returns_full_model_grads
         and loss_cotangent_bridge_ready
         and model_gradient_tree_ready
         and not delegates_to_eager
@@ -594,6 +596,7 @@ def _path_c_training_runtime_value_and_grad_contract(
         "uses_forward_hook": uses_forward,
         "uses_backward_or_vjp_hook": uses_reverse,
         "returns_model_grads": returns_model_grads,
+        "returns_full_model_grads": returns_full_model_grads,
         "loss_cotangent_bridge_ready": loss_cotangent_bridge_ready,
         "model_gradient_tree_ready": model_gradient_tree_ready,
         "delegates_to_eager_loss_and_grad": delegates_to_eager,

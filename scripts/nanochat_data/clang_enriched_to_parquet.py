@@ -1,0 +1,1158 @@
+#!/usr/bin/env python3
+"""Convert Clang-enriched clang-indexer JSONL to hard-budgeted parquet.
+
+Reads gs://nanochat-training-data-2026/v5_enriched/*.jsonl.gz, applies:
+  1. Dead-platform filter (removes __SYMBIAN32__, _MSDOS, __VXWORKS__ blocks)
+  2. Platform header prepend (x86_64-linux-gnu / g++ / c++17 default)
+  3. tokenizer-aware hard-budget handling using chunk boundaries
+
+Writes parquet shards to:
+  gs://nanochat-training-data-2026/data/parquet/clang_enriched_<size>/
+
+Usage:
+    python scripts/data/clang_enriched_to_4k_parquet.py --size 4k [--dry-run] [--shard-size 10000]
+    python scripts/data/clang_enriched_to_4k_parquet.py --input-file repo.jsonl --output-file repo.parquet --overflow-policy drop
+    python scripts/data/clang_enriched_to_4k_parquet.py --help
+"""
+
+import argparse
+import gzip
+import json
+import logging
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+import pyarrow as pa  # type: ignore[import-not-found]
+import pyarrow.parquet as pq  # type: ignore[import-not-found]
+
+from cppmega_mlx.data.nanochat_pipeline.language_info import language_info_to_prefix
+from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched import (
+    PLATFORM_IDS_COLUMN,
+    TOKEN_AST_DEPTH_COLUMN,
+    TOKEN_AST_NODE_TYPE_COLUMN,
+    TOKEN_CALL_EDGES_COLUMN,
+    TOKEN_CALL_TARGETS_COLUMN,
+    TOKEN_CHUNK_DEP_LEVELS_COLUMN,
+    TOKEN_CHUNK_ENDS_COLUMN,
+    TOKEN_CHUNK_KINDS_COLUMN,
+    TOKEN_CHUNK_STARTS_COLUMN,
+    TOKEN_DEF_USE_COLUMN,
+    TOKEN_DEP_LEVELS_COLUMN,
+    TOKEN_IDS_COLUMN,
+    TOKEN_SIBLING_INDEX_COLUMN,
+    TOKEN_STRUCTURE_IDS_COLUMN,
+    TOKEN_SYMBOL_IDS_COLUMN,
+    TOKEN_TYPE_EDGES_COLUMN,
+    TOKEN_TYPE_REFS_COLUMN,
+    materialize_tokenized_enriched_batch,
+)
+from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
+    AUTHOR_TIMESTAMP_COLUMN,
+    CHANGED_CHUNK_IDS_COLUMN,
+    CHANGED_CHUNK_SPANS_COLUMN,
+    COMMIT_HASH_COLUMN,
+    COMMIT_TIMESTAMP_COLUMN,
+    EDIT_OP_PER_TOKEN_COLUMN,
+    FILEPATH_COLUMN,
+    FILEPATH_STABLE_ID_COLUMN,
+    FILE_LOCAL_COMMIT_INDEX_COLUMN,
+    HAS_AMBIGUOUS_RECONSTRUCTION_COLUMN,
+    HAS_RENAME_AMBIGUITY_COLUMN,
+    HUNK_ID_PER_TOKEN_COLUMN,
+    IS_MERGE_COMMIT_COLUMN,
+    PARENT_COUNT_COLUMN,
+    PARENT_HASHES_COLUMN,
+    REPO_COLUMN,
+    REPO_STABLE_ID_COLUMN,
+    TIMESTAMP_COLUMN,
+    TOKEN_CHANGE_MASK_POST_COLUMN,
+    TOKEN_CHANGE_MASK_PRE_COLUMN,
+)
+from scripts.nanochat_data.token_budget import (
+    chunk_enriched_document,
+    count_tokens,
+    load_tokenizer,
+    size_label_to_tokens,
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("clang_enriched_to_4k")
+
+GCS_BUCKET = "nanochat-training-data-2026"
+GCS_INPUT_PREFIX = "v5_enriched"
+GCS_OUTPUT_PREFIX_TEMPLATE = "data/parquet/clang_enriched_{size}"
+_TOKENIZED_ENRICHED_TOKENIZER = None
+_OVERFLOW_POLICIES = ("split", "drop")
+
+# ---------------------------------------------------------------------------
+# Platform header (default — enriched docs are already processed, no repo_dir)
+# ---------------------------------------------------------------------------
+
+_DEFAULT_PLATFORM_INFO = {
+    "platform": "x86_64-linux-gnu",
+    "compiler": "g++",
+    "standard": "c++17",
+    "arch": "x86_64",
+    "mode": "user",
+}
+
+
+def build_platform_header(platform_info: dict) -> str:
+    """Build a platform context comment header."""
+    platform = platform_info.get("platform", "x86_64-linux-gnu")
+    compiler = platform_info.get("compiler", "g++")
+    standard = platform_info.get("standard", "c++17")
+    arch = platform_info.get("arch", "x86_64")
+    mode = platform_info.get("mode", "user")
+    lines = [
+        "// <BOS>",
+        f"// platform: {platform}",
+        f"// compiler: {compiler}",
+        f"// standard: {standard}",
+        f"// arch: {arch}",
+        f"// mode: {mode}",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Dead-platform filter
+# ---------------------------------------------------------------------------
+
+_DEAD_PLATFORM_MARKERS = [
+    "__SYMBIAN32__",
+    "_MSDOS",
+    "__VXWORKS__",
+]
+
+
+def filter_dead_platforms(text: str) -> str:
+    """Remove dead-platform #ifdef blocks from C++ source text.
+
+    Handles nested #ifdef/#endif correctly by tracking depth.
+    """
+    if not any(marker in text for marker in _DEAD_PLATFORM_MARKERS):
+        return text
+
+    lines = text.split("\n")
+    result_lines = []
+    skip_depth = 0
+    overall_depth = 0
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+
+        if skip_depth == 0:
+            is_dead = False
+            for marker in _DEAD_PLATFORM_MARKERS:
+                if re.match(r'^\s*#\s*ifdef\s+' + re.escape(marker) + r'\b', line):
+                    is_dead = True
+                    break
+                if re.match(r'^\s*#\s*if\s+defined\s*\(\s*' + re.escape(marker) + r'\s*\)', line):
+                    is_dead = True
+                    break
+
+            if is_dead:
+                skip_depth = 1
+                overall_depth += 1
+                i += 1
+                continue
+
+            if re.match(r'^\s*#\s*(?:ifdef|ifndef|if)\b', stripped):
+                overall_depth += 1
+            elif re.match(r'^\s*#\s*endif\b', stripped):
+                overall_depth = max(0, overall_depth - 1)
+
+            result_lines.append(line)
+        else:
+            if re.match(r'^\s*#\s*(?:ifdef|ifndef|if)\b', stripped):
+                skip_depth += 1
+            elif re.match(r'^\s*#\s*endif\b', stripped):
+                skip_depth -= 1
+                if skip_depth == 0:
+                    i += 1
+                    continue
+
+        i += 1
+
+    return "\n".join(result_lines)
+
+
+# ---------------------------------------------------------------------------
+# Token-budgeted chunker
+# ---------------------------------------------------------------------------
+
+PREAMBLE_KIND = 1
+
+
+def chunk_document_exact(doc: dict, tokenizer, max_tokens: int) -> list:
+    """Chunk an enriched document into exact-token-budgeted sub-documents."""
+    def sort_key(cb):
+        is_preamble = (
+            cb.get("dep_level", 0) == 0 and cb.get("kind", 0) == PREAMBLE_KIND
+        )
+        return (0 if is_preamble else 1, cb.get("dep_level", 0), cb.get("start", 0))
+
+    return chunk_enriched_document(
+        doc,
+        max_tokens,
+        tokenizer,
+        boundary_sort_key=lambda item: sort_key(item[1]),
+    )
+
+
+def maybe_keep_document_exact(doc: dict, tokenizer, max_tokens: int) -> list[dict]:
+    """Emit the whole document only when it already fits the exact budget."""
+    exact_total = count_tokens(doc.get("text", ""), tokenizer)
+    if exact_total > max_tokens:
+        return []
+    out = dict(doc)
+    out["actual_token_count"] = exact_total
+    return [out]
+
+
+# ---------------------------------------------------------------------------
+# Parquet schema
+# ---------------------------------------------------------------------------
+
+_SCHEMA = pa.schema([
+    pa.field("text", pa.string()),
+    pa.field("actual_token_count", pa.int32()),
+    pa.field("structure_ids", pa.list_(pa.int8())),
+    pa.field("chunk_boundaries", pa.list_(pa.struct([
+        pa.field("start", pa.int32()),
+        pa.field("end", pa.int32()),
+        pa.field("kind", pa.int8()),
+        pa.field("dep_level", pa.int32()),
+        pa.field("name", pa.string()),
+    ]))),
+    pa.field("call_edges", pa.list_(pa.struct([
+        pa.field("from", pa.int32()),
+        pa.field("to", pa.int32()),
+    ]))),
+    pa.field("type_edges", pa.list_(pa.struct([
+        pa.field("from", pa.int32()),
+        pa.field("to", pa.int32()),
+    ]))),
+    pa.field("ast_depth", pa.list_(pa.uint16())),
+    pa.field("sibling_index", pa.list_(pa.uint16())),
+    pa.field("ast_node_type", pa.list_(pa.uint16())),
+    pa.field("symbol_ids", pa.list_(pa.uint32())),
+    pa.field("call_targets", pa.list_(pa.uint32())),
+    pa.field("type_refs", pa.list_(pa.uint32())),
+    pa.field("def_use", pa.list_(pa.uint8())),
+    pa.field("platform_info", pa.string()),
+    pa.field("language_info", pa.string()),
+    pa.field("build_info", pa.string()),
+    pa.field("constituent_provenance", pa.list_(pa.struct([
+        pa.field("filepath", pa.string()),
+        pa.field("language_info", pa.string()),
+        pa.field("build_info", pa.string()),
+    ]))),
+    pa.field("constituent_provenance_json", pa.string()),
+    pa.field(REPO_COLUMN, pa.string()),
+    pa.field(FILEPATH_COLUMN, pa.string()),
+    pa.field(COMMIT_HASH_COLUMN, pa.string()),
+    pa.field(TIMESTAMP_COLUMN, pa.string()),
+    pa.field(PARENT_HASHES_COLUMN, pa.list_(pa.string())),
+    pa.field(PARENT_COUNT_COLUMN, pa.int32()),
+    pa.field(IS_MERGE_COMMIT_COLUMN, pa.bool_()),
+    pa.field(AUTHOR_TIMESTAMP_COLUMN, pa.string()),
+    pa.field(COMMIT_TIMESTAMP_COLUMN, pa.string()),
+    pa.field(REPO_STABLE_ID_COLUMN, pa.string()),
+    pa.field(FILEPATH_STABLE_ID_COLUMN, pa.string()),
+    pa.field(FILE_LOCAL_COMMIT_INDEX_COLUMN, pa.int32()),
+    pa.field(HAS_AMBIGUOUS_RECONSTRUCTION_COLUMN, pa.bool_()),
+    pa.field(HAS_RENAME_AMBIGUITY_COLUMN, pa.bool_()),
+    pa.field(TOKEN_IDS_COLUMN, pa.list_(pa.uint32())),
+    pa.field(PLATFORM_IDS_COLUMN, pa.list_(pa.uint16())),
+    pa.field(TOKEN_STRUCTURE_IDS_COLUMN, pa.list_(pa.uint8())),
+    pa.field(TOKEN_DEP_LEVELS_COLUMN, pa.list_(pa.uint16())),
+    pa.field(TOKEN_AST_DEPTH_COLUMN, pa.list_(pa.uint16())),
+    pa.field(TOKEN_SIBLING_INDEX_COLUMN, pa.list_(pa.uint16())),
+    pa.field(TOKEN_AST_NODE_TYPE_COLUMN, pa.list_(pa.uint16())),
+    pa.field(TOKEN_SYMBOL_IDS_COLUMN, pa.list_(pa.uint32())),
+    pa.field(TOKEN_CALL_TARGETS_COLUMN, pa.list_(pa.uint32())),
+    pa.field(TOKEN_TYPE_REFS_COLUMN, pa.list_(pa.uint32())),
+    pa.field(TOKEN_DEF_USE_COLUMN, pa.list_(pa.uint8())),
+    pa.field(TOKEN_CHANGE_MASK_PRE_COLUMN, pa.list_(pa.uint8())),
+    pa.field(TOKEN_CHANGE_MASK_POST_COLUMN, pa.list_(pa.uint8())),
+    pa.field(HUNK_ID_PER_TOKEN_COLUMN, pa.list_(pa.int32())),
+    pa.field(EDIT_OP_PER_TOKEN_COLUMN, pa.list_(pa.uint8())),
+    pa.field(TOKEN_CHUNK_STARTS_COLUMN, pa.list_(pa.uint32())),
+    pa.field(TOKEN_CHUNK_ENDS_COLUMN, pa.list_(pa.uint32())),
+    pa.field(TOKEN_CHUNK_KINDS_COLUMN, pa.list_(pa.uint8())),
+    pa.field(TOKEN_CHUNK_DEP_LEVELS_COLUMN, pa.list_(pa.uint16())),
+    pa.field(CHANGED_CHUNK_IDS_COLUMN, pa.list_(pa.uint32())),
+    pa.field(
+        CHANGED_CHUNK_SPANS_COLUMN,
+        pa.list_(
+            pa.struct(
+                [
+                    pa.field("start", pa.uint32()),
+                    pa.field("end", pa.uint32()),
+                ]
+            )
+        ),
+    ),
+    pa.field(TOKEN_CALL_EDGES_COLUMN, pa.list_(pa.struct([
+        pa.field("from", pa.uint16()),
+        pa.field("to", pa.uint16()),
+    ]))),
+    pa.field(TOKEN_TYPE_EDGES_COLUMN, pa.list_(pa.struct([
+        pa.field("from", pa.uint16()),
+        pa.field("to", pa.uint16()),
+    ]))),
+])
+
+
+def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa.Table:
+    """Convert a list of doc dicts to a PyArrow table."""
+    tokenized_rows = tokenized_rows or [{} for _ in rows]
+    texts = []
+    token_counts = []
+    structure_ids_col = []
+    chunk_boundaries_col = []
+    call_edges_col = []
+    type_edges_col = []
+    ast_depth_col = []
+    sibling_index_col = []
+    ast_node_type_col = []
+    symbol_ids_col = []
+    call_targets_col = []
+    type_refs_col = []
+    def_use_col = []
+    platform_info_col = []
+    language_info_col = []
+    build_info_col = []
+    constituent_provenance_col = []
+    constituent_provenance_json_col = []
+    repos = []
+    filepaths = []
+    commits = []
+    timestamps = []
+    parent_hashes = []
+    parent_counts = []
+    is_merge_commits = []
+    author_timestamps = []
+    commit_timestamps = []
+    repo_stable_ids = []
+    filepath_stable_ids = []
+    file_local_commit_indices = []
+    ambiguous_reconstruction = []
+    rename_ambiguity = []
+    token_ids_col = []
+    platform_ids_col = []
+    token_structure_ids_col = []
+    token_dep_levels_col = []
+    token_ast_depth_col = []
+    token_sibling_index_col = []
+    token_ast_node_type_col = []
+    token_symbol_ids_col = []
+    token_call_targets_col = []
+    token_type_refs_col = []
+    token_def_use_col = []
+    token_change_mask_pre_col = []
+    token_change_mask_post_col = []
+    hunk_id_per_token_col = []
+    edit_op_per_token_col = []
+    token_chunk_starts_col = []
+    token_chunk_ends_col = []
+    token_chunk_kinds_col = []
+    token_chunk_dep_levels_col = []
+    changed_chunk_ids_col = []
+    changed_chunk_spans_col = []
+    token_call_edges_col = []
+    token_type_edges_col = []
+
+    for row, tokenized in zip(rows, tokenized_rows):
+        texts.append(row.get("text", ""))
+        token_counts.append(int(row.get("actual_token_count", 0)))
+        structure_ids_col.append(row.get("structure_ids", []))
+        # Normalize chunk boundaries
+        cbs = row.get("chunk_boundaries", [])
+        chunk_boundaries_col.append([
+            {
+                "start": int(cb.get("start", 0)),
+                "end": int(cb.get("end", 0)),
+                "kind": int(cb.get("kind", 0)),
+                "dep_level": int(cb.get("dep_level", 0)),
+                "name": str(cb.get("name", "")),
+            }
+            for cb in cbs
+        ])
+        call_edges_col.append([
+            {"from": int(e.get("from", 0)), "to": int(e.get("to", 0))}
+            for e in row.get("call_edges", [])
+        ])
+        type_edges_col.append([
+            {"from": int(e.get("from", 0)), "to": int(e.get("to", 0))}
+            for e in row.get("type_edges", [])
+        ])
+        ast_depth_col.append(row.get("ast_depth", []))
+        sibling_index_col.append(row.get("sibling_index", []))
+        ast_node_type_col.append(row.get("ast_node_type", []))
+        symbol_ids_col.append(row.get("symbol_ids", []))
+        call_targets_col.append(row.get("call_targets", []))
+        type_refs_col.append(row.get("type_refs", []))
+        def_use_col.append(row.get("def_use", []))
+        pi = row.get("platform_info")
+        platform_info_col.append(json.dumps(pi) if pi else None)
+        li = row.get("language_info")
+        language_info_col.append(json.dumps(li) if li else None)
+        bi = row.get("build_info")
+        build_info_col.append(json.dumps(bi) if bi else None)
+        raw_constituents = row.get("constituent_provenance")
+        if raw_constituents is None and row.get("constituent_provenance_json"):
+            try:
+                raw_constituents = json.loads(row["constituent_provenance_json"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                raw_constituents = None
+        normalized_constituents = []
+        if isinstance(raw_constituents, list):
+            for item in raw_constituents:
+                if not isinstance(item, dict):
+                    continue
+                normalized_constituents.append(
+                    {
+                        "filepath": item.get("filepath"),
+                        "language_info": (
+                            json.dumps(item["language_info"])
+                            if item.get("language_info") is not None
+                            else None
+                        ),
+                        "build_info": (
+                            json.dumps(item["build_info"])
+                            if item.get("build_info") is not None
+                            else None
+                        ),
+                    }
+                )
+        constituent_provenance_col.append(normalized_constituents)
+        constituent_provenance_json_col.append(row.get("constituent_provenance_json"))
+        repos.append(row.get(REPO_COLUMN, ""))
+        filepaths.append(row.get(FILEPATH_COLUMN, ""))
+        commits.append(row.get(COMMIT_HASH_COLUMN, row.get("commit", "")))
+        timestamps.append(row.get(TIMESTAMP_COLUMN, ""))
+        parent_hashes.append(row.get(PARENT_HASHES_COLUMN, []))
+        parent_counts.append(row.get(PARENT_COUNT_COLUMN))
+        is_merge_commits.append(row.get(IS_MERGE_COMMIT_COLUMN))
+        author_timestamps.append(row.get(AUTHOR_TIMESTAMP_COLUMN))
+        commit_timestamps.append(row.get(COMMIT_TIMESTAMP_COLUMN))
+        repo_stable_ids.append(row.get(REPO_STABLE_ID_COLUMN))
+        filepath_stable_ids.append(row.get(FILEPATH_STABLE_ID_COLUMN))
+        file_local_commit_indices.append(row.get(FILE_LOCAL_COMMIT_INDEX_COLUMN))
+        ambiguous_reconstruction.append(
+            row.get(HAS_AMBIGUOUS_RECONSTRUCTION_COLUMN, False)
+        )
+        rename_ambiguity.append(row.get(HAS_RENAME_AMBIGUITY_COLUMN, False))
+        token_ids_col.append(tokenized.get(TOKEN_IDS_COLUMN, []))
+        platform_ids_col.append(tokenized.get(PLATFORM_IDS_COLUMN, []))
+        token_structure_ids_col.append(tokenized.get(TOKEN_STRUCTURE_IDS_COLUMN, []))
+        token_dep_levels_col.append(tokenized.get(TOKEN_DEP_LEVELS_COLUMN, []))
+        token_ast_depth_col.append(tokenized.get(TOKEN_AST_DEPTH_COLUMN, []))
+        token_sibling_index_col.append(tokenized.get(TOKEN_SIBLING_INDEX_COLUMN, []))
+        token_ast_node_type_col.append(tokenized.get(TOKEN_AST_NODE_TYPE_COLUMN, []))
+        token_symbol_ids_col.append(tokenized.get(TOKEN_SYMBOL_IDS_COLUMN, []))
+        token_call_targets_col.append(tokenized.get(TOKEN_CALL_TARGETS_COLUMN, []))
+        token_type_refs_col.append(tokenized.get(TOKEN_TYPE_REFS_COLUMN, []))
+        token_def_use_col.append(tokenized.get(TOKEN_DEF_USE_COLUMN, []))
+        token_change_mask_pre_col.append(
+            tokenized.get(TOKEN_CHANGE_MASK_PRE_COLUMN, row.get(TOKEN_CHANGE_MASK_PRE_COLUMN, []))
+        )
+        token_change_mask_post_col.append(
+            tokenized.get(TOKEN_CHANGE_MASK_POST_COLUMN, row.get(TOKEN_CHANGE_MASK_POST_COLUMN, []))
+        )
+        hunk_id_per_token_col.append(
+            tokenized.get(HUNK_ID_PER_TOKEN_COLUMN, row.get(HUNK_ID_PER_TOKEN_COLUMN, []))
+        )
+        edit_op_per_token_col.append(
+            tokenized.get(EDIT_OP_PER_TOKEN_COLUMN, row.get(EDIT_OP_PER_TOKEN_COLUMN, []))
+        )
+        token_chunk_starts_col.append(tokenized.get(TOKEN_CHUNK_STARTS_COLUMN, []))
+        token_chunk_ends_col.append(tokenized.get(TOKEN_CHUNK_ENDS_COLUMN, []))
+        token_chunk_kinds_col.append(tokenized.get(TOKEN_CHUNK_KINDS_COLUMN, []))
+        token_chunk_dep_levels_col.append(
+            tokenized.get(TOKEN_CHUNK_DEP_LEVELS_COLUMN, [])
+        )
+        changed_chunk_ids_col.append(
+            tokenized.get(CHANGED_CHUNK_IDS_COLUMN, row.get(CHANGED_CHUNK_IDS_COLUMN, []))
+        )
+        changed_chunk_spans_col.append(
+            tokenized.get(CHANGED_CHUNK_SPANS_COLUMN, row.get(CHANGED_CHUNK_SPANS_COLUMN, []))
+        )
+        token_call_edges_col.append(tokenized.get(TOKEN_CALL_EDGES_COLUMN, []))
+        token_type_edges_col.append(tokenized.get(TOKEN_TYPE_EDGES_COLUMN, []))
+
+    return pa.table(
+        {
+            "text": pa.array(texts, type=_SCHEMA.field("text").type),
+            "actual_token_count": pa.array(
+                token_counts, type=_SCHEMA.field("actual_token_count").type
+            ),
+            "structure_ids": pa.array(
+                structure_ids_col, type=_SCHEMA.field("structure_ids").type
+            ),
+            "chunk_boundaries": pa.array(
+                chunk_boundaries_col, type=_SCHEMA.field("chunk_boundaries").type
+            ),
+            "call_edges": pa.array(
+                call_edges_col, type=_SCHEMA.field("call_edges").type
+            ),
+            "type_edges": pa.array(
+                type_edges_col, type=_SCHEMA.field("type_edges").type
+            ),
+            "ast_depth": pa.array(
+                ast_depth_col, type=_SCHEMA.field("ast_depth").type
+            ),
+            "sibling_index": pa.array(
+                sibling_index_col, type=_SCHEMA.field("sibling_index").type
+            ),
+            "ast_node_type": pa.array(
+                ast_node_type_col, type=_SCHEMA.field("ast_node_type").type
+            ),
+            "symbol_ids": pa.array(
+                symbol_ids_col, type=_SCHEMA.field("symbol_ids").type
+            ),
+            "call_targets": pa.array(
+                call_targets_col, type=_SCHEMA.field("call_targets").type
+            ),
+            "type_refs": pa.array(
+                type_refs_col, type=_SCHEMA.field("type_refs").type
+            ),
+            "def_use": pa.array(def_use_col, type=_SCHEMA.field("def_use").type),
+            "platform_info": pa.array(
+                platform_info_col, type=_SCHEMA.field("platform_info").type
+            ),
+            "language_info": pa.array(
+                language_info_col, type=_SCHEMA.field("language_info").type
+            ),
+            "build_info": pa.array(
+                build_info_col, type=_SCHEMA.field("build_info").type
+            ),
+            "constituent_provenance": pa.array(
+                constituent_provenance_col,
+                type=_SCHEMA.field("constituent_provenance").type,
+            ),
+            "constituent_provenance_json": pa.array(
+                constituent_provenance_json_col,
+                type=_SCHEMA.field("constituent_provenance_json").type,
+            ),
+            REPO_COLUMN: pa.array(repos, type=_SCHEMA.field(REPO_COLUMN).type),
+            FILEPATH_COLUMN: pa.array(filepaths, type=_SCHEMA.field(FILEPATH_COLUMN).type),
+            COMMIT_HASH_COLUMN: pa.array(commits, type=_SCHEMA.field(COMMIT_HASH_COLUMN).type),
+            TIMESTAMP_COLUMN: pa.array(timestamps, type=_SCHEMA.field(TIMESTAMP_COLUMN).type),
+            PARENT_HASHES_COLUMN: pa.array(parent_hashes, type=_SCHEMA.field(PARENT_HASHES_COLUMN).type),
+            PARENT_COUNT_COLUMN: pa.array(parent_counts, type=_SCHEMA.field(PARENT_COUNT_COLUMN).type),
+            IS_MERGE_COMMIT_COLUMN: pa.array(is_merge_commits, type=_SCHEMA.field(IS_MERGE_COMMIT_COLUMN).type),
+            AUTHOR_TIMESTAMP_COLUMN: pa.array(author_timestamps, type=_SCHEMA.field(AUTHOR_TIMESTAMP_COLUMN).type),
+            COMMIT_TIMESTAMP_COLUMN: pa.array(commit_timestamps, type=_SCHEMA.field(COMMIT_TIMESTAMP_COLUMN).type),
+            REPO_STABLE_ID_COLUMN: pa.array(repo_stable_ids, type=_SCHEMA.field(REPO_STABLE_ID_COLUMN).type),
+            FILEPATH_STABLE_ID_COLUMN: pa.array(filepath_stable_ids, type=_SCHEMA.field(FILEPATH_STABLE_ID_COLUMN).type),
+            FILE_LOCAL_COMMIT_INDEX_COLUMN: pa.array(
+                file_local_commit_indices,
+                type=_SCHEMA.field(FILE_LOCAL_COMMIT_INDEX_COLUMN).type,
+            ),
+            HAS_AMBIGUOUS_RECONSTRUCTION_COLUMN: pa.array(
+                ambiguous_reconstruction,
+                type=_SCHEMA.field(HAS_AMBIGUOUS_RECONSTRUCTION_COLUMN).type,
+            ),
+            HAS_RENAME_AMBIGUITY_COLUMN: pa.array(
+                rename_ambiguity,
+                type=_SCHEMA.field(HAS_RENAME_AMBIGUITY_COLUMN).type,
+            ),
+            TOKEN_IDS_COLUMN: pa.array(
+                token_ids_col, type=_SCHEMA.field(TOKEN_IDS_COLUMN).type
+            ),
+            PLATFORM_IDS_COLUMN: pa.array(
+                platform_ids_col, type=_SCHEMA.field(PLATFORM_IDS_COLUMN).type
+            ),
+            TOKEN_STRUCTURE_IDS_COLUMN: pa.array(
+                token_structure_ids_col,
+                type=_SCHEMA.field(TOKEN_STRUCTURE_IDS_COLUMN).type,
+            ),
+            TOKEN_DEP_LEVELS_COLUMN: pa.array(
+                token_dep_levels_col, type=_SCHEMA.field(TOKEN_DEP_LEVELS_COLUMN).type
+            ),
+            TOKEN_AST_DEPTH_COLUMN: pa.array(
+                token_ast_depth_col, type=_SCHEMA.field(TOKEN_AST_DEPTH_COLUMN).type
+            ),
+            TOKEN_SIBLING_INDEX_COLUMN: pa.array(
+                token_sibling_index_col,
+                type=_SCHEMA.field(TOKEN_SIBLING_INDEX_COLUMN).type,
+            ),
+            TOKEN_AST_NODE_TYPE_COLUMN: pa.array(
+                token_ast_node_type_col,
+                type=_SCHEMA.field(TOKEN_AST_NODE_TYPE_COLUMN).type,
+            ),
+            TOKEN_SYMBOL_IDS_COLUMN: pa.array(
+                token_symbol_ids_col,
+                type=_SCHEMA.field(TOKEN_SYMBOL_IDS_COLUMN).type,
+            ),
+            TOKEN_CALL_TARGETS_COLUMN: pa.array(
+                token_call_targets_col,
+                type=_SCHEMA.field(TOKEN_CALL_TARGETS_COLUMN).type,
+            ),
+            TOKEN_TYPE_REFS_COLUMN: pa.array(
+                token_type_refs_col,
+                type=_SCHEMA.field(TOKEN_TYPE_REFS_COLUMN).type,
+            ),
+            TOKEN_DEF_USE_COLUMN: pa.array(
+                token_def_use_col,
+                type=_SCHEMA.field(TOKEN_DEF_USE_COLUMN).type,
+            ),
+            TOKEN_CHANGE_MASK_PRE_COLUMN: pa.array(
+                token_change_mask_pre_col,
+                type=_SCHEMA.field(TOKEN_CHANGE_MASK_PRE_COLUMN).type,
+            ),
+            TOKEN_CHANGE_MASK_POST_COLUMN: pa.array(
+                token_change_mask_post_col,
+                type=_SCHEMA.field(TOKEN_CHANGE_MASK_POST_COLUMN).type,
+            ),
+            HUNK_ID_PER_TOKEN_COLUMN: pa.array(
+                hunk_id_per_token_col,
+                type=_SCHEMA.field(HUNK_ID_PER_TOKEN_COLUMN).type,
+            ),
+            EDIT_OP_PER_TOKEN_COLUMN: pa.array(
+                edit_op_per_token_col,
+                type=_SCHEMA.field(EDIT_OP_PER_TOKEN_COLUMN).type,
+            ),
+            TOKEN_CHUNK_STARTS_COLUMN: pa.array(
+                token_chunk_starts_col,
+                type=_SCHEMA.field(TOKEN_CHUNK_STARTS_COLUMN).type,
+            ),
+            TOKEN_CHUNK_ENDS_COLUMN: pa.array(
+                token_chunk_ends_col, type=_SCHEMA.field(TOKEN_CHUNK_ENDS_COLUMN).type
+            ),
+            TOKEN_CHUNK_KINDS_COLUMN: pa.array(
+                token_chunk_kinds_col, type=_SCHEMA.field(TOKEN_CHUNK_KINDS_COLUMN).type
+            ),
+            TOKEN_CHUNK_DEP_LEVELS_COLUMN: pa.array(
+                token_chunk_dep_levels_col,
+                type=_SCHEMA.field(TOKEN_CHUNK_DEP_LEVELS_COLUMN).type,
+            ),
+            CHANGED_CHUNK_IDS_COLUMN: pa.array(
+                changed_chunk_ids_col,
+                type=_SCHEMA.field(CHANGED_CHUNK_IDS_COLUMN).type,
+            ),
+            CHANGED_CHUNK_SPANS_COLUMN: pa.array(
+                changed_chunk_spans_col,
+                type=_SCHEMA.field(CHANGED_CHUNK_SPANS_COLUMN).type,
+            ),
+            TOKEN_CALL_EDGES_COLUMN: pa.array(
+                token_call_edges_col, type=_SCHEMA.field(TOKEN_CALL_EDGES_COLUMN).type
+            ),
+            TOKEN_TYPE_EDGES_COLUMN: pa.array(
+                token_type_edges_col, type=_SCHEMA.field(TOKEN_TYPE_EDGES_COLUMN).type
+            ),
+        },
+        schema=_SCHEMA,
+    )
+
+
+# ---------------------------------------------------------------------------
+# GCS helpers
+# ---------------------------------------------------------------------------
+
+def gcs_list_files(prefix: str) -> list:
+    """List GCS files under a prefix using gcloud storage."""
+    uri = f"gs://{GCS_BUCKET}/{prefix}/"
+    result = subprocess.run(
+        ["gcloud", "storage", "ls", uri],
+        capture_output=True, text=True, timeout=60,
+    )
+    if result.returncode != 0:
+        log.error("gcloud storage ls failed: %s", result.stderr)
+        return []
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def gcs_download(gcs_uri: str, local_path: str):
+    """Download a GCS file to local path."""
+    subprocess.run(
+        ["gcloud", "storage", "cp", gcs_uri, local_path],
+        check=True, timeout=600,
+    )
+
+
+def gcs_upload(local_path: str, gcs_uri: str):
+    """Upload a local file to GCS."""
+    subprocess.run(
+        ["gcloud", "storage", "cp", local_path, gcs_uri],
+        check=True, timeout=600,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Main pipeline
+# ---------------------------------------------------------------------------
+
+_PLATFORM_HEADER = build_platform_header(_DEFAULT_PLATFORM_INFO)
+_HEADER_LEN = len(_PLATFORM_HEADER)
+
+
+def _align_structure_ids(values: list, text_len: int) -> list[int]:
+    """Return per-char structure IDs aligned to the emitted text length."""
+    if not values:
+        return [0] * text_len
+    aligned = [int(v) for v in values[:text_len]]
+    if len(aligned) < text_len:
+        aligned.extend([0] * (text_len - len(aligned)))
+    return aligned
+
+
+def process_record(record: dict, tokenizer, max_tokens: int) -> list:
+    """Apply full processing pipeline to one enriched JSONL record."""
+    return process_record_with_policy(
+        record,
+        tokenizer,
+        max_tokens,
+        overflow_policy="split",
+    )
+
+
+def process_record_with_policy(
+    record: dict,
+    tokenizer,
+    max_tokens: int,
+    *,
+    overflow_policy: str = "split",
+) -> list[dict]:
+    """Apply full processing pipeline with explicit handling for oversized docs."""
+    if overflow_policy not in _OVERFLOW_POLICIES:
+        raise ValueError(
+            f"Unsupported overflow_policy={overflow_policy!r}; "
+            f"expected one of {_OVERFLOW_POLICIES}"
+        )
+
+    text = record.get("text", "")
+    structure_ids = record.get("structure_ids", [])
+    chunk_boundaries = record.get("chunk_boundaries", [])
+
+    # 1. Dead-platform filter
+    filtered_text = filter_dead_platforms(text)
+    metadata_stale = filtered_text != text
+
+    # 2. Prepend metadata headers; adjust structure_ids + chunk offsets
+    language_prefix = language_info_to_prefix(record.get("language_info"))
+    header_prefix = language_prefix + _PLATFORM_HEADER
+    header_len = len(header_prefix)
+    full_text = header_prefix + filtered_text
+    if metadata_stale:
+        filtered_structure_ids = [0] * len(filtered_text)
+        filtered_chunk_boundaries = []
+        filtered_call_edges = []
+        filtered_type_edges = []
+    else:
+        filtered_structure_ids = _align_structure_ids(structure_ids, len(filtered_text))
+        filtered_chunk_boundaries = chunk_boundaries
+        filtered_call_edges = record.get("call_edges", [])
+        filtered_type_edges = record.get("type_edges", [])
+
+    full_sids = [0] * header_len + filtered_structure_ids
+
+    adjusted_chunks = [
+        {
+            "start": cb.get("start", 0) + header_len,
+            "end": cb.get("end", 0) + header_len,
+            "kind": cb.get("kind", 0),
+            "dep_level": cb.get("dep_level", 0),
+            "name": cb.get("name", ""),
+        }
+        for cb in filtered_chunk_boundaries
+    ]
+
+    combined = {
+        **{k: v for k, v in record.items()
+           if k not in ("text", "structure_ids", "chunk_boundaries",
+                        "call_edges", "type_edges", "actual_token_count")},
+        "text": full_text,
+        "structure_ids": full_sids,
+        "chunk_boundaries": adjusted_chunks,
+        "call_edges": filtered_call_edges,
+        "type_edges": filtered_type_edges,
+    }
+
+    if overflow_policy == "drop":
+        docs = maybe_keep_document_exact(combined, tokenizer, max_tokens=max_tokens)
+        if not docs:
+            log.info(
+                "drop overflow record repo=%s filepath=%s actual_token_count>%d",
+                record.get("repo", ""),
+                record.get("filepath", ""),
+                max_tokens,
+            )
+        return docs
+
+    return chunk_document_exact(combined, tokenizer, max_tokens=max_tokens)
+
+
+def _open_jsonl(path: str | os.PathLike[str]):
+    target = Path(path)
+    if target.suffix == ".gz":
+        return gzip.open(target, "rt", encoding="utf-8", errors="replace")
+    return open(target, "r", encoding="utf-8", errors="replace")
+
+
+def convert_local_jsonl_to_parquet(
+    input_path: str | os.PathLike[str],
+    output_path: str | os.PathLike[str],
+    *,
+    tokenizer,
+    max_tokens: int,
+    overflow_policy: str = "split",
+    dry_run: bool = False,
+    materialize_tokenized_enriched: bool = False,
+) -> dict[str, int]:
+    """Convert a local clang JSONL/JSONL.GZ file into one parquet file."""
+    if overflow_policy not in _OVERFLOW_POLICIES:
+        raise ValueError(
+            f"Unsupported overflow_policy={overflow_policy!r}; "
+            f"expected one of {_OVERFLOW_POLICIES}"
+        )
+
+    source = Path(input_path)
+    target = Path(output_path)
+    docs_in = 0
+    docs_out = 0
+    rows: list[dict] = []
+
+    with _open_jsonl(source) as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            docs_in += 1
+            sub_docs = process_record_with_policy(
+                record,
+                tokenizer,
+                max_tokens,
+                overflow_policy=overflow_policy,
+            )
+            rows.extend(sub_docs)
+            docs_out += len(sub_docs)
+
+    if dry_run:
+        log.info(
+            "[DRY RUN] local convert %s -> %s docs_in=%d docs_out=%d policy=%s",
+            source,
+            target,
+            docs_in,
+            docs_out,
+            overflow_policy,
+        )
+        return {"docs_in": docs_in, "docs_out": docs_out}
+
+    if not rows:
+        target.unlink(missing_ok=True)
+        log.info("empty parquet")
+        return {"docs_in": docs_in, "docs_out": docs_out}
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tokenized_rows = None
+    if materialize_tokenized_enriched:
+        tokenized_rows = materialize_tokenized_enriched_batch(rows, tokenizer)
+    table = rows_to_table(rows, tokenized_rows=tokenized_rows)
+    pq.write_table(table, target, compression="snappy")
+    log.info(
+        "wrote local parquet %s docs_in=%d docs_out=%d policy=%s",
+        target,
+        docs_in,
+        docs_out,
+        overflow_policy,
+    )
+    return {"docs_in": docs_in, "docs_out": docs_out}
+
+
+def process_input_file(gcs_uri: str, tmpdir: str,
+                       dry_run: bool, shard_size: int,
+                       shard_counter: list, output_rows: list,
+                       output_prefix_local: str,
+                       output_prefix_gcs: str,
+                       tokenizer,
+                       max_tokens: int,
+                       overflow_policy: str = "split") -> tuple:
+    """Download, decompress, and process one .jsonl.gz file.
+
+    Returns (docs_in, docs_out) counts.
+    """
+    fname = gcs_uri.split("/")[-1]
+    local_gz = os.path.join(tmpdir, fname)
+
+    log.info("Downloading %s ...", gcs_uri)
+    if not dry_run:
+        gcs_download(gcs_uri, local_gz)
+    else:
+        log.info("[DRY RUN] Would download %s", gcs_uri)
+        return 0, 0
+
+    docs_in = 0
+    docs_out = 0
+
+    with gzip.open(local_gz, "rt", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as e:
+                log.warning("JSON decode error in %s: %s", fname, e)
+                continue
+
+            docs_in += 1
+            if overflow_policy == "split":
+                sub_docs = process_record(record, tokenizer, max_tokens)
+            else:
+                sub_docs = process_record_with_policy(
+                    record,
+                    tokenizer,
+                    max_tokens,
+                    overflow_policy=overflow_policy,
+                )
+            output_rows.extend(sub_docs)
+            docs_out += len(sub_docs)
+
+            # Flush shard when we hit shard_size
+            while len(output_rows) >= shard_size:
+                shard_rows = output_rows[:shard_size]
+                output_rows[:] = output_rows[shard_size:]
+                _flush_shard(
+                    shard_rows,
+                    shard_counter,
+                    dry_run,
+                    output_prefix_local,
+                    output_prefix_gcs,
+                )
+
+    os.unlink(local_gz)
+    return docs_in, docs_out
+
+
+def _flush_shard(
+    rows: list,
+    counter: list,
+    dry_run: bool,
+    output_prefix_local: str,
+    output_prefix_gcs: str,
+):
+    """Write rows to a parquet file and upload to GCS."""
+    shard_idx = counter[0]
+    counter[0] += 1
+    fname = f"train_{shard_idx:05d}.parquet"
+    local_path = os.path.join(output_prefix_local, fname)
+    gcs_uri = f"gs://{GCS_BUCKET}/{output_prefix_gcs}/{fname}"
+
+    log.info("Writing shard %d (%d rows) -> %s", shard_idx, len(rows), gcs_uri)
+    if dry_run:
+        log.info("[DRY RUN] Would write %d rows to %s", len(rows), gcs_uri)
+        return
+
+    table = rows_to_table(
+        rows,
+        tokenized_rows=(
+            materialize_tokenized_enriched_batch(rows, _TOKENIZED_ENRICHED_TOKENIZER)
+            if _TOKENIZED_ENRICHED_TOKENIZER is not None
+            else None
+        ),
+    )
+    pq.write_table(table, local_path, compression="snappy")
+    gcs_upload(local_path, gcs_uri)
+    os.unlink(local_path)
+    log.info("Uploaded shard %d (%d rows, %.1f MB)",
+             shard_idx, len(rows),
+             os.path.getsize(local_path) / 1e6 if os.path.exists(local_path) else 0)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Convert Clang-enriched v5 JSONL.GZ files to hard-budgeted parquet shards.\n\n"
+            "Reads from: gs://nanochat-training-data-2026/v5_enriched/*.jsonl.gz\n"
+            "Writes to:  gs://nanochat-training-data-2026/data/parquet/clang_enriched_<size>/"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--size",
+        type=str,
+        default="4k",
+        help="Hard token budget label, e.g. 4k or 8k (default: 4k).",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Download and process files but do not write or upload parquet.",
+    )
+    parser.add_argument(
+        "--shard-size", type=int, default=10000,
+        help="Number of chunked sub-documents per parquet shard (default: 10000).",
+    )
+    parser.add_argument(
+        "--input-prefix", default=GCS_INPUT_PREFIX,
+        help=f"GCS prefix to read JSONL.GZ from (default: {GCS_INPUT_PREFIX}).",
+    )
+    parser.add_argument(
+        "--input-file",
+        default="",
+        help="Local JSONL or JSONL.GZ input for single-file conversion mode.",
+    )
+    parser.add_argument(
+        "--output-prefix", default="",
+        help="GCS prefix to write parquet shards to. "
+        "Defaults to data/parquet/clang_enriched_<size>.",
+    )
+    parser.add_argument(
+        "--output-file",
+        default="",
+        help="Local parquet output path for single-file conversion mode.",
+    )
+    parser.add_argument(
+        "--max-files", type=int, default=0,
+        help="Maximum number of input files to process (0 = all).",
+    )
+    parser.add_argument(
+        "--tokenizer-path",
+        type=str,
+        default=None,
+        help="Path to tokenizer.json used for exact token budgeting.",
+    )
+    parser.add_argument(
+        "--materialize-tokenized-enriched",
+        action="store_true",
+        help="Also emit token_ids and token-level enriched metadata columns.",
+    )
+    parser.add_argument(
+        "--overflow-policy",
+        choices=_OVERFLOW_POLICIES,
+        default="split",
+        help="How to handle docs that exceed the exact budget after metadata prefixes "
+        "are applied. 'split' preserves legacy behavior; 'drop' is strict no-crop.",
+    )
+    args = parser.parse_args()
+
+    size_label = args.size.lower()
+    max_tokens = size_label_to_tokens(size_label)
+    tokenizer = load_tokenizer(args.tokenizer_path)
+    global _TOKENIZED_ENRICHED_TOKENIZER
+    _TOKENIZED_ENRICHED_TOKENIZER = (
+        tokenizer if args.materialize_tokenized_enriched else None
+    )
+    default_output_prefix = GCS_OUTPUT_PREFIX_TEMPLATE.format(size=size_label)
+    local_mode = bool(args.input_file or args.output_file)
+    if local_mode and not (args.input_file and args.output_file):
+        parser.error("--input-file and --output-file must be provided together")
+    if local_mode and args.max_files:
+        parser.error("--max-files is only supported in GCS mode")
+    if local_mode and args.input_prefix != GCS_INPUT_PREFIX:
+        parser.error("--input-prefix is only supported in GCS mode")
+    if local_mode and args.output_prefix:
+        parser.error("--output-prefix is only supported in GCS mode")
+    if not local_mode and not args.output_prefix:
+        args.output_prefix = default_output_prefix
+
+    if local_mode:
+        summary = convert_local_jsonl_to_parquet(
+            args.input_file,
+            args.output_file,
+            tokenizer=tokenizer,
+            max_tokens=max_tokens,
+            overflow_policy=args.overflow_policy,
+            dry_run=args.dry_run,
+            materialize_tokenized_enriched=args.materialize_tokenized_enriched,
+        )
+        log.info(
+            "Done. Local convert: %d docs in -> %d docs out.",
+            summary["docs_in"],
+            summary["docs_out"],
+        )
+        return
+
+    log.info("Listing input files at gs://%s/%s/", GCS_BUCKET, args.input_prefix)
+    input_files = gcs_list_files(args.input_prefix)
+    gz_files = [f for f in input_files if f.endswith(".jsonl.gz")]
+
+    if not gz_files:
+        log.error("No .jsonl.gz files found at gs://%s/%s/",
+                  GCS_BUCKET, args.input_prefix)
+        sys.exit(1)
+
+    if args.max_files > 0:
+        gz_files = gz_files[:args.max_files]
+
+    log.info(
+        "Found %d input files. Processing with hard_budget=%d tokens, shard_size=%d, dry_run=%s",
+        len(gz_files),
+        max_tokens,
+        args.shard_size,
+        args.dry_run,
+    )
+
+    total_in = 0
+    total_out = 0
+    shard_counter = [0]  # mutable counter shared across calls
+    output_rows = []
+
+    with tempfile.TemporaryDirectory(prefix=f"clang_{size_label}_") as tmpdir:
+        # Local dir for shard staging
+        output_prefix_local = os.path.join(tmpdir, "shards")
+        os.makedirs(output_prefix_local, exist_ok=True)
+
+        for gcs_uri in gz_files:
+            try:
+                docs_in, docs_out = process_input_file(
+                    gcs_uri, tmpdir, args.dry_run,
+                    args.shard_size, shard_counter, output_rows,
+                    output_prefix_local,
+                    args.output_prefix,
+                    tokenizer,
+                    max_tokens,
+                    args.overflow_policy,
+                )
+                total_in += docs_in
+                total_out += docs_out
+                log.info("  %s: %d in -> %d out (cumulative: %d in, %d out, %d shards)",
+                         gcs_uri.split("/")[-1], docs_in, docs_out,
+                         total_in, total_out, shard_counter[0])
+            except Exception as e:
+                log.error("Failed to process %s: %s", gcs_uri, e)
+                continue
+
+        # Flush remaining rows
+        if output_rows:
+            _flush_shard(
+                output_rows,
+                shard_counter,
+                args.dry_run,
+                output_prefix_local,
+                args.output_prefix,
+            )
+            output_rows.clear()
+
+    log.info("Done. Total: %d docs in -> %d chunks out, %d shards written.",
+             total_in, total_out, shard_counter[0])
+
+    if not args.dry_run:
+        # Write _COMPLETE sentinel
+        sentinel_uri = (
+            f"gs://{GCS_BUCKET}/{args.output_prefix}/_COMPLETE"
+        )
+        subprocess.run(
+            ["gcloud", "storage", "cp", "/dev/null", sentinel_uri],
+            check=False,
+        )
+        log.info("Wrote sentinel: %s", sentinel_uri)
+
+
+if __name__ == "__main__":
+    main()
