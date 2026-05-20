@@ -18,6 +18,12 @@ from cppmega_v4.parallelism.distributed_memory import (
     PerRankMemory,
     estimate_distributed_memory,
 )
+from cppmega_v4.parallelism.gotcha_checker import (
+    GOTCHAS,
+    Gotcha,
+    GotchaSeverity,
+    check_gotchas,
+)
 from cppmega_v4.parallelism.sharding_spec import (
     AxisAssignment,
     ParallelismKind,
@@ -48,12 +54,16 @@ __all__ = [
     "DeviceSpec",
     "DeviceTopology",
     "DistributedMemoryReport",
+    "GOTCHAS",
+    "Gotcha",
+    "GotchaSeverity",
     "ParallelismKind",
     "PerRankMemory",
     "ShardingSpec",
     "TOPOLOGY_BUILTINS",
     "a100_8x",
     "b100_8x",
+    "check_gotchas",
     "estimate_distributed_memory",
     "fsdp2_only",
     "fsdp2_plus_tp",
