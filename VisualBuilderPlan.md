@@ -732,27 +732,38 @@ UI poсредник: ошибки кода маппит на in-place toast + no
   - Example notebook
   - JupyterLab + JupyterLite compatibility test
 
-**Этап F-G — Tokenizer Visualizer screen (1-1.5 недели)**
+**Этап F-G — Universal Tokenizer Playground (2 недели)**
   - Новый React route/tab `/tokenizer` в Visual Builder
-  - Runtime: `@huggingface/tokenizers` (8.3 kB gzip!) принимает наш
-    `tokenizer.json` напрямую
+  - **Не только наш токенизатор** — ANY tokenizer с side-loading:
+    5 источников (preset library / HF Hub URL / local file / paste JSON /
+    custom tiktoken encoding) + multi-format runtime (HF JSON 8.3 kB
+    default, tiktoken/lite WASM lazy 300-700 KB, SentencePiece WASM
+    lazy ~600 KB, multi-provider opt-in ~3 MB)
+  - Side-by-side A/B/C compare (до 3 tokenizers): per-row chips,
+    cross-panel highlight bus (exBERT pattern), diff metrics dashboard
+    (count delta / specials Venn / bytes-per-token / cost)
+  - Greenfield слои (~800 LoC): tokenizer loader UI + IndexedDB cache,
+    multi-format runtime adapter (frontend + Python backend), cross-panel
+    highlight bus, round-trip diff с per-tokenizer normalization-awareness,
+    tokenizer-agnostic special-token classifier + per-tokenizer overrides
+    (FIM/CODE/CONVERSATION/DOC_SEP/MTP/Engram/whitespace-sentinel/generic),
+    diff metrics dashboard, doc_ids overlay + train/eval mask
+    (CodeMirror 6 Decoration.mark)
   - Fork `huggingface/transformers.js-examples/the-tokenizer-playground`
-    `Token.jsx` component (~30 LoC) как scaffold
-  - Greenfield слои: round-trip diff с whitespace-sentinel awareness,
-    special-token registry (6+ hue families: FIM/CODE/CONVERSATION/
-    DOC_SEP/MTP/Engram), doc_ids overlay (CodeMirror 6 Decoration.mark),
-    train/eval mask overlay (nanochat conversation render), lossy-
-    whitespace highlight с tooltip оригинала
-  - Hover-link pattern из `dqbd/tiktokenizer` (MIT) — hover token →
-    highlight все occurrences + byte tooltip
-  - Новый JSON-RPC endpoint `tokenizer.encode_visualize` (добавляется
-    в F-A schema, реализуется как Python wrapper над `CppTokenizer`)
-  - Тесты: unit (каждый special class рендерит distinct hue), system
-    (paste typical training text, verify все `<SPACE>/<NL>` visible с
-    lossy-warn badges; pack 3 docs, verify boundaries shown)
+    `Token.jsx` (~30 LoC) как scaffold; steal hover-link pattern из
+    `dqbd/tiktokenizer` (MIT)
+  - Новый Python module `cppmega_v4.tokenizer.registry` —
+    `RuntimeTokenizer.encode_visualize(text, show)` API uniform across
+    HF / tiktoken / sentencepiece / CppTokenizer backends
+  - JSON-RPC endpoint `tokenizer.encode_visualize` (в F-A schema):
+    primary + compare_with array + diff_metrics в response
+  - Тесты: unit (каждый source type load, каждый backend adapter API),
+    system (load 3 presets, side-by-side compare на test snippet, verify
+    cross-panel highlight + metrics correct), perf (<200ms на 4096-char
+    text для primary + 2 comparisons)
   - Можно делать ПАРАЛЛЕЛЬНО с F-C/F-D (после F-A schema lock + F-B
     React shell)
-  - Cм. cppmega-mlx-o0k.7
+  - См. cppmega-mlx-o0k.7
 
 **Этап F-E — JupyterLite/Pyodide static bundle + GH Pages deploy (1 неделя)**
   - Pyodide preload `cppmega_v4` (отделить от MLX runtime)
@@ -808,123 +819,184 @@ UI poсредник: ошибки кода маппит на in-place toast + no
 
 ---
 
-9.5 Tokenizer Visualizer screen (F-G)
+9.5 Universal Tokenizer Playground (F-G)
 
-Отдельная вкладка/route в Visual Builder для визуализации **нашего
-нестандартного BPE-токенизатора**. Что нестандартного (см.
-`cpp_tokenizer.py:33-100`):
+Отдельная вкладка/route в Visual Builder — **универсальный playground
+для ЛЮБОГО токенизатора**, не только нашего. Researcher загружает
+свой кастом + сравнивает side-by-side против GPT-4 / Llama-3 / Mistral /
+Claude в одном экране, видит "мы тратим X токенов на этот сниппет,
+GPT-4 тратит Y, наш round-trip lossy на whitespace а Llama bytes-perfect".
 
-  1. **`<SPACE>` (46) + `<NL>` (47) сентинели** — `[ \t]+` и `[\r\n]+`
-     collapse до BPE → round-trip **lossy** для whitespace runs > 1
-  2. **FIM tokens** — `<FIM_PREFIX>` (4), `<FIM_MIDDLE>` (5),
-     `<FIM_SUFFIX>` (6), `<FIM_INSTRUCTION>` (45)
-  3. **CODE_START** (7) для code-block delineation
-  4. **Custom regex split** — `\p{N}{1,2}` вместо GPT-4 `{1,3}`
-  5. **65,536 fixed vocab** с fail-closed contract validation
-  6. **(nanochat only)** conversation tokens, train/eval mask, AST/symbol-ID
-     per-token attributes (enriched parquet)
-  7. **doc_ids per-token** assigned during packing (data layer, не tokenizer)
+### 9.5.1 Tokenizer loader — 5 источников
 
-Стек (из 4-агентного research):
+  1. **Preset library** (built-in dropdown): GPT-4 (o200k), GPT-3.5
+     (cl100k), GPT-2 (p50k), Claude, Llama-3, Mistral, Gemma, Qwen,
+     DeepSeek-V3, Phi-3, `cppmega_v3` (наш), `nanochat_v3`. Расширяемо
+     через config file.
+  2. **HuggingFace Hub URL** — резолвится через
+     `https://huggingface.co/{repo}/resolve/main/tokenizer.json` (CDN
+     proxy если CORS бьёт).
+  3. **Local file upload** — `.json` (HF format) / `.tiktoken` (raw BPE
+     ranks) / `.model` (SentencePiece).
+  4. **Paste JSON** — прямо в textarea для quick experiments.
+  5. **Custom tiktoken encoding** — paste BPE ranks dict + special tokens
+     map + regex split pattern (то что `Tiktoken(...)` constructor
+     принимает напрямую).
 
-  - **Runtime**: `@huggingface/tokenizers` (tokenizers.js) — **8.3 kB
-    gzip!**, Apache-2.0, принимает наш `tokenizer.json` 1:1, exposes
-    `encoding.offsets` нативно. **No WASM нужен**, JupyterLite-friendly.
-    Fallback: `tiktoken/lite` WASM (~300-700 KB) если custom BPE ranks.
-  - **React scaffold**: fork
-    `huggingface/transformers.js-examples/the-tokenizer-playground`
-    (Apache-2.0, `Token.jsx` ~30 LoC) — готовый Web Worker pattern +
-    per-token color chips.
-  - **Hover-link pattern**: steal из `dqbd/tiktokenizer` (MIT) — hover
-    token → highlight все occurrences того же ID + byte-string tooltip.
-  - **Doc-packing rendering**: CodeMirror 6 `Decoration.mark` (handles
-    100k+ decorations smooth) — нужно для multi-document packed views.
+### 9.5.2 Multi-format runtime registry (lazy-load)
 
-Greenfield слои (~600 строк новых, не существует ни у одного из 20+
-surveyed tools):
+JupyterLite-friendly: total payload < 1 MB пока юзер не trigger'ит
+WASM-heavy preset.
 
-  1. **Round-trip diff** с whitespace-sentinel awareness — стрелка
-     "input → encode → decode → result" с inline diff подсвечивающим
-     где `\n\n\n` collapsed в `<NL>` (lossy warn badge).
-  2. **Special-token registry** с distinct hue families per class
-     (FIM red-family / CODE blue-family / CONVERSATION violet-family /
-     DOC_SEP green-family / MTP amber-family / Engram cyan-family).
-  3. **doc_ids overlay** — packed sequence с bracketed regions per doc;
-     hover doc boundary показывает doc_id + length.
-  4. **Train/eval mask overlay** (nanochat conversation render — GREEN
-     supervised, RED non-supervised).
-  5. **Lossy-whitespace highlight** — token с sentinel показывает
-     оригинальный raw run через hover tooltip.
-  6. **Per-token AST depth / symbol-ID badges** (nanochat enriched
-     parquet, опционально).
+| Формат                | Runtime                            | Bundle      | Lazy-load trigger              |
+|-----------------------|------------------------------------|-------------|--------------------------------|
+| HF `tokenizer.json`   | `@huggingface/tokenizers`          | 8.3 kB gzip | default, всегда loaded         |
+| tiktoken encoding     | `tiktoken/lite` WASM               | 300-700 KB  | первый GPT preset              |
+| SentencePiece `.model`| `@sctg/sentencepiece-js` WASM      | ~600 KB     | первый Gemma / Llama-2 preset  |
+| Multi-provider        | `@goliapkg/tiktoken-wasm`          | ~3 MB gzip  | optional, opt-in для Llama-3+Qwen+DeepSeek в одном binary |
 
-API endpoint (новый в F-A JSON schema):
+Backend side (Python, для Jupyter widget mode): `cppmega_v4.tokenizer.registry`
+с одинаковым `RuntimeTokenizer.encode_visualize(text, show)` API
+независимо от backend (HF / tiktoken / sentencepiece / custom CppTokenizer).
+
+### 9.5.3 Side-by-side A/B/C compare (до 3 токенизаторов)
+
+  - Same input, N tokenizers, per-row color chips + token counts.
+  - **Cross-panel highlight bus** (pattern из exBERT, не существует
+    в стоковых tokenizer playgrounds): hover token в одном panel →
+    highlights char span в input + показывает coverage в всех остальных
+    panels. Кликабельно.
+  - Diff metrics dashboard:
+    - **Token count delta** (ours vs each comparator)
+    - **Vocab sizes** chart
+    - **Special-tokens Venn** (overlap matrix)
+    - **Round-trip parity** status (✓ / ⚠ lossy с причиной per tokenizer)
+    - **Bytes-per-token efficiency** (avg / p95 / max)
+    - **Cost estimate** (опционально — если pricing data present:
+      $0.005/1K vs $0.0001/1K и т.д.)
+
+### 9.5.4 Tokenizer-aware special-token registry
+
+Hue families применяются к любому tokenizer, не только нашему:
+
+  - **FIM family** (red): `<fim_prefix>`, `<fim_middle>`, `<fim_suffix>`,
+    `<fim_instruction>`, `<|fim_*|>` aliases
+  - **CODE family** (blue): `<code_start>`, `<code_end>`,
+    `<|python_start|>`, `<|python_end|>`, `<|im_*|>` для chat-ML
+  - **CONVERSATION family** (violet): `<user_*>`, `<assistant_*>`,
+    `<|im_start|>system`, ChatML markers
+  - **DOC_SEP family** (green): `<|endoftext|>`, `<eos>`, `<|doc|>`,
+    `<|sep|>`, document boundary markers
+  - **MTP family** (amber): `<mtp_head_0>`, `<|mtp_*|>`
+  - **Engram family** (cyan): `<engram_open>`, `<engram_close>`,
+    n-gram boundary markers
+  - **Whitespace-sentinel** (yellow with lossy badge): `<NL>`,
+    `<SPACE>`, `<TAB>` если tokenizer их использует (наши + некоторые
+    code tokenizers)
+  - **Generic special** (grey, fallback): любой `<...>` / `<|...|>`
+    token не подошедший под классы выше
+
+Per-tokenizer overrides через config (для наших `cppmega_v3` /
+`nanochat_v3` — точные регистрационные правила).
+
+### 9.5.5 Greenfield слои (~800 LoC)
+
+  1. **Tokenizer loader UI** с 5 source types + IndexedDB cache (раз
+     скачали Llama-3 — больше не качаем)
+  2. **Multi-format runtime adapter** (frontend + Python backend)
+  3. **Cross-panel highlight bus** (exBERT pattern)
+  4. **Round-trip diff** с per-tokenizer normalization-awareness
+     (whitespace sentinels у нас, NFC у Llama, ByteLevel у GPT-4)
+  5. **Tokenizer-agnostic special-token classifier** + per-tokenizer
+     overrides
+  6. **Diff metrics dashboard** (count / Venn / bytes-per-token / cost)
+  7. **doc_ids overlay + train/eval mask** (для наших, optional для других)
+
+### 9.5.6 API endpoint (новый в F-A schema)
 
 ```json
 {
   "method": "tokenizer.encode_visualize",
   "params": {
     "text": "def foo():\n\n\n    return 1\n",
-    "tokenizer_path": "cppmega_mlx/tokenizer/tokenizer.json",
-    "show": ["offsets", "specials", "doc_ids", "round_trip", "mask"]
+    "tokenizer": {
+      "source": "preset",
+      "spec": "cppmega_v3"
+    },
+    "compare_with": [
+      { "source": "preset", "spec": "gpt-4" },
+      { "source": "preset", "spec": "llama-3" }
+    ],
+    "show": ["offsets", "specials", "doc_ids", "round_trip", "mask", "bpe_merges"]
   }
 }
 ```
+
+Response (one entry per tokenizer):
 
 ```json
 {
   "result": {
-    "token_ids": [4, 1234, 567, 47, 7, 89, ...],
-    "offsets":   [[0,0], [0,3], [4,7], [11,14], [14,14], [15,21], ...],
-    "special_classes": [
-      {"id": 4, "name": "<FIM_PREFIX>", "class": "fim"},
-      {"id": 47, "name": "<NL>", "class": "whitespace_sentinel",
-       "original_run": "\n\n\n", "lossy": true},
-      {"id": 7, "name": "<CODE_START>", "class": "code"}
-    ],
-    "doc_ids": [0, 0, 0, 0, 0, 1, 1, 1, ...],
-    "round_trip": "def foo():\n    return 1\n",
-    "round_trip_diff": {
-      "equal": false,
-      "diffs": [{"input_span": [11,14], "result_span": [11,12],
-                 "reason": "<NL>(47) sentinel collapsed \\n\\n\\n → \\n"}]
+    "primary": {
+      "tokenizer_id": "cppmega_v3", "vocab_size": 65536,
+      "token_ids": [4, 1234, 567, 47, 7, 89, ...],
+      "offsets":   [[0,0], [0,3], [4,7], [11,14], [14,14], [15,21], ...],
+      "special_classes": [
+        {"id": 4,  "name": "<FIM_PREFIX>", "class": "fim"},
+        {"id": 47, "name": "<NL>", "class": "whitespace_sentinel",
+         "original_run": "\n\n\n", "lossy": true}
+      ],
+      "doc_ids": [0,0,0,0,0,1,1,1,...],
+      "round_trip": "def foo():\n    return 1\n",
+      "round_trip_diff": {"equal": false, "diffs": [...]},
+      "mask": [1,1,1,0,0,1,1,1,...],
+      "bytes_per_token": {"avg": 4.2, "p95": 9.0, "max": 16}
     },
-    "mask": [1, 1, 1, 0, 0, 1, 1, 1, ...]
+    "comparisons": [
+      {"tokenizer_id": "gpt-4", "token_ids": [...], "round_trip": "...",
+       "round_trip_diff": {"equal": true, "diffs": []},
+       "bytes_per_token": {"avg": 3.9, "p95": 8.5, "max": 14}},
+      {"tokenizer_id": "llama-3", "token_ids": [...], ...}
+    ],
+    "diff_metrics": {
+      "count_delta_vs_primary": {"gpt-4": -5, "llama-3": -2},
+      "specials_overlap_pct":   {"gpt-4": 12.5, "llama-3": 25.0},
+      "round_trip_parity":      {"cppmega_v3": "lossy", "gpt-4": "ok", "llama-3": "ok"}
+    }
   }
 }
 ```
 
-UI layout вкладки:
+### 9.5.7 UI layout
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│ Tab: Architecture / Loss / Optim / [Tokenizer] / Sharding / Gotchas │
-├─────────────────────────────────────────────────────────────────────┤
-│ ┌─ Input ─────────────────────┐ ┌─ Tokenizer ──────────────────┐    │
-│ │ <textarea editable>         │ │ tokenizer.json: [   ▼  load] │    │
-│ │ def foo():                  │ │ Vocab: 65,536                │    │
-│ │                             │ │ Special class filters:       │    │
-│ │     return 1                │ │  [✓ FIM] [✓ CODE] [✓ NL/SPACE]    │
-│ │                             │ │  [✓ DOC] [✓ MTP] [✓ Engram]  │    │
-│ └─────────────────────────────┘ └──────────────────────────────┘    │
-│ ┌─ Tokens (147) ────────────────────────────────────────────────┐   │
-│ │ ░░░def░░░ ░░░ foo░░ ▒(▒ ▒)▒ ▒:▒ █<NL>█ █<NL>█ ░░░return░░░  │   │
-│ │ ░░░ 1░░░ ▒<EOS>▒                                              │   │
-│ │ (hover any token → tooltip: id=1234, bytes=" foo", class=word)│   │
-│ └───────────────────────────────────────────────────────────────┘   │
-│ ┌─ Round-trip ──────────────────────────────────────────────────┐   │
-│ │ Input:  "def foo():\n\n\n    return 1\n"          [147 chars] │   │
-│ │ Output: "def foo():\n    return 1\n"              [145 chars] │   │
-│ │ ⚠ LOSSY: 1 collapse event at char 11               [view diff]│   │
-│ └───────────────────────────────────────────────────────────────┘   │
-│ ┌─ Doc packing ─────────────────────────────────────────────────┐   │
-│ │ [doc_0──────────][doc_1──────────────][doc_2──────] (3 docs)  │   │
-│ │ CodeMirror with vertical brackets per doc boundary            │   │
-│ └───────────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────┐
+│ Tab: Architecture / Loss / Optim / [Tokenizer] / Sharding / Gotchas    │
+├────────────────────────────────────────────────────────────────────────┤
+│ ┌─ Input ─────────────────────┐ ┌─ Tokenizer pickers (A/B/C) ──────┐   │
+│ │ <textarea editable>         │ │ A: [cppmega_v3        ▼] [edit]   │   │
+│ │ def fibonacci(n):           │ │ B: [GPT-4 (o200k)     ▼] [add C]  │   │
+│ │     if n < 2: return n      │ │ C: [Llama-3           ▼] [remove] │   │
+│ │     ...                     │ │ Filters: [✓FIM][✓CODE][✓DOC] ... │   │
+│ └─────────────────────────────┘ └──────────────────────────────────┘   │
+│ ┌─ A: cppmega_v3 (47 toks) ─┐ ┌─ B: GPT-4 (52) ─┐ ┌─ C: Llama-3 (49) ┐│
+│ │ ░def░ ░fib░ ░on░ ░acci░  │ │ ░def░ ░fibon░ . │ │ ░def░ ░fib░ ░on░ ││
+│ │ ▒(▒ n▒ ▒):▒ █<NL>█ ...    │ │ ░acci░ ░(n)░ .. │ │ ░acci░ (n) ...   ││
+│ │ Round-trip: ⚠ LOSSY       │ │ ✓ exact         │ │ ✓ exact          ││
+│ │ Bytes/tok: 4.2 avg, 16 max│ │ 3.9 / 14        │ │ 4.0 / 15         ││
+│ └───────────────────────────┘ └─────────────────┘ └──────────────────┘│
+│ ┌─ Diff metrics ──────────────────────────────────────────────────┐   │
+│ │ Count delta:    A→B: −5    A→C: −2                              │   │
+│ │ Specials Venn:  A∩B 12.5%  A∩C 25%   B∩C 88%                    │   │
+│ │ Round-trip:     A lossy (1 NL collapse)  B ✓  C ✓               │   │
+│ └─────────────────────────────────────────────────────────────────┘   │
+│ ┌─ Doc packing (A only) ──────────────────────────────────────────┐   │
+│ │ [doc_0──────────][doc_1──────────────][doc_2──────] (3 docs)    │   │
+│ └─────────────────────────────────────────────────────────────────┘   │
+└────────────────────────────────────────────────────────────────────────┘
 ```
 
-См. F-G ticket (`cppmega-mlx-o0k.7`).
+Cм. F-G ticket (`cppmega-mlx-o0k.7`).
 
 ---
 
@@ -971,10 +1043,10 @@ bricks, parallel-block topology, gallery coverage tests.
 
 11. Бюджет + риски
 
-Бюджет: 9-9.5 недель (F-A + F-A.2 + F-B..F-E + F-G) для v1 production-ready
-Jupyter widget + static demo + CLI runner + tokenizer visualizer.
-F-G можно делать параллельно с F-C/F-D, поэтому wall-clock остаётся
-~8 недель. Phase 2 опционально через 3-6 месяцев.
+Бюджет: 10 недель effort (F-A + F-A.2 + F-B..F-E + F-G universal playground
+2 нед) для v1 production-ready Jupyter widget + static demo + CLI runner +
+universal tokenizer playground. F-G параллелится с F-C/F-D, поэтому
+wall-clock остаётся ~8 недель. Phase 2 опционально через 3-6 месяцев.
 
 **Нумерация секций после правок**: §1-9 как раньше, §10 (gallery
 coverage), §11 (бюджет+риски, был §10).
