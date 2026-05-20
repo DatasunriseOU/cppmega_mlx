@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from cppmega_v4.buildspec.loss_spec import LossSpec
 from cppmega_v4.buildspec.optim_spec import OptimSpec
@@ -25,6 +25,7 @@ if TYPE_CHECKING:  # pragma: no cover
     pass
 
 
+@runtime_checkable
 class Rewriter(Protocol):
     """A pure :class:`ModelBuildSpec` transformation.
 

@@ -35,6 +35,11 @@ from cppmega_v4.buildspec.model_build_spec import (
     RewriteOrderError,
     Rewriter,
 )
+from cppmega_v4.buildspec.rewriters import (
+    HeadDetectionError,
+    LossRewriteError,
+    MTPRewriter,
+)
 from cppmega_v4.buildspec.optim_spec import (
     OPTIM_BUILTINS,
     OptimKind,
@@ -50,7 +55,10 @@ __all__ = [
     "BuildDiagnostic",
     "BuildDiagnosticSeverity",
     "BuildDiagnostics",
+    "HeadDetectionError",
     "LOSS_BUILTINS",
+    "LossRewriteError",
+    "MTPRewriter",
     "LossKind",
     "LossSpec",
     "ModelBuildSpec",
