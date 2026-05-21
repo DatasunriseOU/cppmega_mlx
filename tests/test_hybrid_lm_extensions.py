@@ -184,9 +184,11 @@ def test_path_c_activation_probe_is_opt_in_and_stores_references():
     }
     assert expected.issubset(capture.buffers)
     for event in capture.events:
-        tensor = event["tensor"]
+        assert "tensor" not in event
+        assert event["tensor_dtype"] is not None
+        assert isinstance(event["tensor_shape"], tuple)
         for name in event["logical_names"]:
-            assert capture.buffers[name] is tensor
+            assert isinstance(capture.buffers[name], mx.array)
 
     model.detach_path_c_activation_probe()
     assert all(
@@ -235,9 +237,12 @@ def test_path_c_activation_probe_captures_vjp_cotangents_without_copy():
         expected
     )
     for event in gradient_events:
-        tensor = event["tensor"]
+        assert "tensor" not in event
+        assert str(event["tensor_dtype"]).endswith("float32")
         for name in event["logical_names"]:
-            assert capture.buffers[name] is tensor
+            assert tuple(int(dim) for dim in capture.buffers[name].shape) == event[
+                "tensor_shape"
+            ]
     assert capture.buffers["hidden_grad"] is capture.buffers[
         "layer_0_m_hidden_grad"
     ]

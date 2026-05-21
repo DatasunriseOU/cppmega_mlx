@@ -17,6 +17,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -196,6 +197,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tilelang-cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
     parser.add_argument("--max-cells", type=int, default=None)
     parser.add_argument(
+        "--m04-memory-cap-gib",
+        type=float,
+        default=None,
+        help=(
+            "Forward an explicit MLX memory-limit plan to each m04 cell. "
+            "The cap is applied as 0.99 * GiB for both wired and Metal limits "
+            "so benchmarked cells stay below the requested ceiling."
+        ),
+    )
+    parser.add_argument(
+        "--use-path-c-direct-chain-runtime",
+        action="store_true",
+        help=(
+            "Forward --use-path-c-direct-chain-runtime to Path C m04 cells so "
+            "the matrix measures the opt-in direct-chain critical-path route "
+            "instead of the split/generated Path C fallback."
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Write planned Markdown/CSV/JSON receipts without executing cells.",
@@ -206,6 +226,16 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Reuse existing per-cell m04 JSON receipts whose status is ok; "
             "missing or failed cells still execute."
+        ),
+    )
+    parser.add_argument(
+        "--completed-receipt-exit-grace-s",
+        type=float,
+        default=0.0,
+        help=(
+            "If a cell has already written a valid status=ok JSON receipt but "
+            "the subprocess does not exit, wait this many seconds and then "
+            "terminate it. Disabled by default."
         ),
     )
     return parser
@@ -348,6 +378,20 @@ def build_cell(
         str(output_json),
         "--json",
     )
+    if path.startswith("path_c") and bool(args.use_path_c_direct_chain_runtime):
+        command += ("--use-path-c-direct-chain-runtime",)
+    if args.m04_memory_cap_gib is not None:
+        if args.m04_memory_cap_gib <= 0:
+            raise SystemExit("--m04-memory-cap-gib must be positive")
+        command += (
+            "--memory-limit-total-bytes",
+            str(int(float(args.m04_memory_cap_gib) * (1024**3))),
+            "--memory-limit-wired-ratio",
+            "0.99",
+            "--memory-limit-metal-ratio",
+            "0.99",
+            "--apply-memory-limit-plan",
+        )
     return MatrixCell(
         dtype=dtype,
         optimizer=optimizer,
@@ -604,12 +648,21 @@ def path_c_fusion_summary_from_receipt(receipt: dict[str, Any]) -> dict[str, Any
     direct_chain_binding = direct_chained.get("runtime_binding")
     if not isinstance(direct_chain_binding, dict):
         direct_chain_binding = {}
+    direct_chain_training_contract = direct_chained.get("training_runtime_contract")
+    if not isinstance(direct_chain_training_contract, dict):
+        direct_chain_training_contract = {}
+    direct_chain_training_ready = bool(
+        direct_chain_training_contract.get("training_runtime_available")
+        or direct_chain_training_contract.get("critical_path_ready")
+    )
     runtime_uses_fused_train_block = bool(
         runtime_binding.get("runtime_uses_fused_train_block")
-        or direct_chain_binding.get("runtime_uses_direct_fusion_chain")
+        or direct_chain_training_ready
     )
     runtime_binding_status = (
         "ok"
+        if direct_chain_training_ready
+        else direct_chain_training_contract.get("status")
         if direct_chain_binding.get("runtime_uses_direct_fusion_chain")
         else runtime_binding.get("status")
     )
@@ -643,6 +696,12 @@ def path_c_fusion_summary_from_receipt(receipt: dict[str, Any]) -> dict[str, Any
         "direct_chain_status": direct_chained.get("status"),
         "direct_chain_segment_count": direct_chained.get("segment_count"),
         "direct_chain_runtime_binding_status": direct_chain_binding.get("status"),
+        "direct_chain_training_runtime_status": (
+            direct_chain_training_contract.get("status")
+        ),
+        "direct_chain_training_runtime_available": (
+            direct_chain_training_contract.get("training_runtime_available")
+        ),
         "required_bank_buffers": runtime_binding.get("required_bank_buffers"),
         "missing_bank_buffers": runtime_binding.get("missing_bank_buffers"),
     }
@@ -654,10 +713,12 @@ def proof_result_from_receipt(receipt: dict[str, Any], *, path: str) -> dict[str
     if isinstance(training, dict):
         route = training.get("fp8_path_c_training_route") or {}
     fusion_summary = path_c_fusion_summary_from_receipt(receipt)
+    route_reports_fused = bool(
+        isinstance(route, dict) and route.get("fused_train_block_runtime_available")
+    )
+    fusion_reports_fused = bool(fusion_summary.get("runtime_uses_fused_train_block"))
     fused_train_block_runtime_available = bool(
-        isinstance(route, dict)
-        and route.get("fused_train_block_runtime_available")
-        or fusion_summary.get("runtime_uses_fused_train_block")
+        route_reports_fused and fusion_reports_fused
     )
     return {
         "path": path,
@@ -846,15 +907,19 @@ def run_cell(cell: MatrixCell, *, args: argparse.Namespace, identity: dict[str, 
         env.pop("TILELANG_DISABLE_CACHE", None)
     cell.output_json.parent.mkdir(parents=True, exist_ok=True)
     start = time.perf_counter()
-    process = subprocess.run(
+    process, completed_after_ok_receipt = run_cell_process(
         list(cell.command),
         cwd=ROOT,
         env=env,
-        text=True,
-        capture_output=True,
-        check=False,
+        output_json=cell.output_json,
+        completed_receipt_exit_grace_s=float(args.completed_receipt_exit_grace_s),
     )
     duration = time.perf_counter() - start
+    if completed_after_ok_receipt:
+        cache_state["terminated_after_ok_receipt"] = True
+        cache_state["completed_receipt_exit_grace_s"] = float(
+            args.completed_receipt_exit_grace_s
+        )
     return extract_result(
         cell=cell,
         identity=identity,
@@ -862,6 +927,70 @@ def run_cell(cell: MatrixCell, *, args: argparse.Namespace, identity: dict[str, 
         process=process,
         duration_s=duration,
     )
+
+
+def run_cell_process(
+    command: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    output_json: Path,
+    completed_receipt_exit_grace_s: float = 0.0,
+) -> tuple[subprocess.CompletedProcess[str], bool]:
+    with tempfile.TemporaryFile("w+", encoding="utf-8") as stdout_file, tempfile.TemporaryFile(
+        "w+",
+        encoding="utf-8",
+    ) as stderr_file:
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            env=env,
+            text=True,
+            stdout=stdout_file,
+            stderr=stderr_file,
+        )
+        grace_started: float | None = None
+        terminated_after_ok_receipt = False
+        forced_returncode: int | None = None
+        while True:
+            returncode = process.poll()
+            if returncode is not None:
+                break
+            if completed_receipt_exit_grace_s > 0 and existing_receipt_is_ok(output_json):
+                now = time.perf_counter()
+                if grace_started is None:
+                    grace_started = now
+                elif now - grace_started >= completed_receipt_exit_grace_s:
+                    terminated_after_ok_receipt = True
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5.0)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                    forced_returncode = 0
+                    break
+            else:
+                grace_started = None
+            time.sleep(1.0)
+        stdout_file.seek(0)
+        stderr_file.seek(0)
+        stdout = stdout_file.read()
+        stderr = stderr_file.read()
+        if terminated_after_ok_receipt:
+            stderr += (
+                "\nbench harness terminated subprocess after status=ok receipt "
+                f"remained alive for {completed_receipt_exit_grace_s:.1f}s"
+            )
+        return (
+            subprocess.CompletedProcess(
+                command,
+                forced_returncode if forced_returncode is not None else process.returncode,
+                stdout or "",
+                stderr or "",
+            ),
+            terminated_after_ok_receipt,
+        )
 
 
 def write_csv(path: Path, results: list[CellResult]) -> None:

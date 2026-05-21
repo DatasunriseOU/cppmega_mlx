@@ -2,8 +2,8 @@
 # ruff: noqa: E402
 """Process git commit diffs into enriched training documents using libclang.
 
-Mirrors the Rust cpp-chunker --commit-mode pipeline but uses libclang for
-semantic parsing (qualified names, resolved call references, cross-file deps).
+Uses libclang for syntax tree metadata, qualified names, resolved call
+references, and file-local dependency ordering.
 
 Pipeline:
   1. Read JSONL records: {old_content, new_content, diff, subject, body, filepath, repo}
@@ -50,18 +50,22 @@ if str(_REPO_ROOT) not in sys.path:
 # Reuse infrastructure from index_project.py
 from tools.clang_indexer.index_project import (
     _configure_libclang,
+    _adapt_args_for_file,
+    _sanitize_compile_args_for_clang,
     FunctionDef,
     PartInfo,
     ProjectIndex,
-    get_function_text,
     extract_callees,
     get_qualified_name,
-    extract_preamble,
     FUNCTION_KINDS,
     CONTAINER_KINDS,
-    extract_ast_metadata,
+    _byte_to_char_mapper,
+    _cursor_text_and_metadata,
+    extract_clang_ast_metadata,
     extract_semantic_metadata_from_parts,
 )
+from cppmega_mlx.data.nanochat_pipeline.build_context import detect_build_context
+from scripts.nanochat_data.memory_guard import check_memory_limit, start_memory_guard
 
 if TYPE_CHECKING:
     from clang.cindex import CursorKind, Index, TranslationUnit  # pyright: ignore[reportMissingImports]
@@ -106,6 +110,9 @@ class ClassDef:
     text: str
     start_line: int
     end_line: int
+    ast_depth: list[int] = field(default_factory=list)
+    sibling_index: list[int] = field(default_factory=list)
+    ast_node_type: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -114,6 +121,11 @@ class FileAnalysis:
     preamble: str
     functions: list[FunctionDef] = field(default_factory=list)
     classes: list[ClassDef] = field(default_factory=list)
+    preamble_ast_depth: list[int] = field(default_factory=list)
+    preamble_sibling_index: list[int] = field(default_factory=list)
+    preamble_ast_node_type: list[int] = field(default_factory=list)
+    compile_args: list[str] = field(default_factory=list)
+    build_info: dict[str, object] = field(default_factory=dict)
 
     def build_local_index(self) -> ProjectIndex:
         """Build a ProjectIndex from this file's functions for dep computation."""
@@ -342,36 +354,185 @@ _SIMPLE_FALLBACK_ARGS_CPP = ['-fsyntax-only', '-Wno-everything', '-std=c++17']
 _SIMPLE_FALLBACK_ARGS_C = ['-x', 'c', '-fsyntax-only', '-Wno-everything', '-std=c11']
 
 
+def _same_clang_path(left: str | None, right: str) -> bool:
+    if not left:
+        return False
+    return os.path.normcase(os.path.normpath(left)) == os.path.normcase(os.path.normpath(right))
+
+
+def _add_unique_include(args: list[str], include_dir: str) -> None:
+    if not include_dir:
+        return
+    include_arg = f"-I{os.path.normpath(include_dir)}"
+    if include_arg not in args:
+        args.append(include_arg)
+
+
+def _analysis_compile_args(
+    filepath: str,
+    compile_args: list[str] | None,
+    repo_root: str | None,
+) -> list[str]:
+    ext = Path(filepath).suffix.lower() or '.cpp'
+    if compile_args:
+        args = _sanitize_compile_args_for_clang(list(compile_args))
+    elif ext in _C_EXTENSIONS:
+        args = list(_SIMPLE_FALLBACK_ARGS_C)
+    else:
+        args = list(_SIMPLE_FALLBACK_ARGS_CPP)
+
+    if repo_root:
+        _add_unique_include(args, repo_root)
+        _add_unique_include(args, os.path.dirname(os.path.join(repo_root, filepath)))
+    return _adapt_args_for_file(args, filepath)
+
+
+def _extract_preamble_from_source(
+    tu: TranslationUnit,
+    filename: str,
+    source: str,
+    byte_to_char: Callable[[int], int],
+    ast_depth: list[int],
+    sibling_index: list[int],
+    ast_node_type: list[int],
+) -> tuple[str, list[int], list[int], list[int]]:
+    texts: list[str] = []
+    depth_parts: list[int] = []
+    sibling_parts: list[int] = []
+    node_type_parts: list[int] = []
+    for cursor in tu.cursor.get_children():
+        cursor_file = cursor.location.file.name if cursor.location.file else None
+        if not _same_clang_path(cursor_file, filename):
+            continue
+        if cursor.kind in (
+            CursorKind.INCLUSION_DIRECTIVE,
+            CursorKind.USING_DIRECTIVE,
+            CursorKind.USING_DECLARATION,
+            CursorKind.TYPEDEF_DECL,
+            CursorKind.TYPE_ALIAS_DECL,
+            CursorKind.NAMESPACE_ALIAS,
+        ):
+            text, depth, sibling, node_type, _offsets = _cursor_text_and_metadata(
+                cursor,
+                source,
+                filename,
+                byte_to_char,
+                ast_depth,
+                sibling_index,
+                ast_node_type,
+            )
+            if not text:
+                continue
+            if texts:
+                depth_parts.append(0)
+                sibling_parts.append(0)
+                node_type_parts.append(0)
+            texts.append(text)
+            depth_parts.extend(depth)
+            sibling_parts.extend(sibling)
+            node_type_parts.extend(node_type)
+    return "\n".join(texts), depth_parts, sibling_parts, node_type_parts
+
+
+class BuildContextResolver:
+    """Resolve per-record compile context without reloading build files per row."""
+
+    def __init__(self, repo_root: str | None = None, repo_dir: str | None = None) -> None:
+        self.repo_root = os.path.abspath(repo_root) if repo_root else None
+        self.repo_dir = os.path.abspath(repo_dir) if repo_dir else None
+        self._cache: dict[str, tuple[dict, list[str], object | None]] = {}
+
+    def _record_repo_root(self, record: dict) -> str | None:
+        explicit = record.get("repo_path")
+        if isinstance(explicit, str) and explicit:
+            return os.path.abspath(explicit)
+        if self.repo_root:
+            return self.repo_root
+        repo_name = record.get("repo")
+        if self.repo_dir and isinstance(repo_name, str) and repo_name:
+            candidate = os.path.join(self.repo_dir, repo_name)
+            if os.path.isdir(candidate):
+                return os.path.abspath(candidate)
+        return None
+
+    def _load(self, repo_root: str) -> tuple[dict, list[str], object | None]:
+        cached = self._cache.get(repo_root)
+        if cached is not None:
+            return cached
+        context = detect_build_context(repo_root)
+        self._cache[repo_root] = context
+        return context
+
+    def resolve(self, record: dict) -> tuple[str | None, list[str] | None, dict[str, object]]:
+        compile_args = record.get("compile_args")
+        build_info = record.get("build_info")
+        args = [str(arg) for arg in compile_args] if isinstance(compile_args, list) else None
+        info = dict(build_info) if isinstance(build_info, dict) else {}
+
+        repo_root = self._record_repo_root(record)
+        if repo_root is None or not os.path.isdir(repo_root):
+            return None, args, info
+
+        platform_info, default_args, compile_index = self._load(repo_root)
+        if not info:
+            info = {
+                key: value
+                for key, value in platform_info.items()
+                if key in {"build_system", "source", "compiler", "standard"} and value is not None
+            }
+        filepath = str(record.get("filepath") or "")
+        if compile_index is not None and filepath:
+            lookup_path = filepath if os.path.isabs(filepath) else os.path.join(repo_root, filepath)
+            lookup = getattr(compile_index, "lookup", None)
+            if callable(lookup):
+                file_args, file_info = lookup(lookup_path)
+                if file_args:
+                    args = list(file_args)
+                if file_info:
+                    info = {**info, **dict(file_info)}
+        if args is None:
+            args = list(default_args)
+        return repo_root, args, info
+
+
 def analyze_file_clang(
     content: str,
     filepath: str,
     clang_index: Index,
     tmpdir: str,
+    *,
+    compile_args: list[str] | None = None,
+    repo_root: str | None = None,
+    build_info: dict[str, object] | None = None,
 ) -> FileAnalysis:
     """Parse a single file's content with libclang and extract functions/classes.
 
-    Writes content to a temp file (clang needs files on disk), parses with
-    PARSE_INCOMPLETE to tolerate errors, then extracts function definitions
-    with qualified names and call references.
+    Prefer the original repository path plus libclang unsaved_files so quoted
+    includes and compile_commands flags describe the real translation unit.
+    Fall back to a temp source only when no repository root is available.
     """
     if not content or len(content) < 20:
         return FileAnalysis(preamble='')
 
     ext = Path(filepath).suffix.lower() or '.cpp'
-    tmp_path = os.path.join(tmpdir, f"source{ext}")
-
-    with open(tmp_path, 'w', errors='replace') as f:
-        f.write(content)
-
-    if ext in _C_EXTENSIONS:
-        compile_args = list(_SIMPLE_FALLBACK_ARGS_C)
+    os.makedirs(tmpdir, exist_ok=True)
+    if repo_root:
+        source_path = filepath if os.path.isabs(filepath) else os.path.join(repo_root, filepath)
+        source_path = os.path.normpath(source_path)
+        unsaved_files = [(source_path, content)]
     else:
-        compile_args = list(_SIMPLE_FALLBACK_ARGS_CPP)
+        source_path = os.path.join(tmpdir, f"source{ext}")
+        unsaved_files = None
+        with open(source_path, 'w', errors='replace') as f:
+            f.write(content)
+
+    args = _analysis_compile_args(source_path, compile_args, repo_root)
 
     try:
         tu = clang_index.parse(
-            tmp_path,
-            args=compile_args,
+            source_path,
+            args=args,
+            unsaved_files=unsaved_files,
             options=(
                 TranslationUnit.PARSE_INCOMPLETE
                 | TranslationUnit.PARSE_PRECOMPILED_PREAMBLE
@@ -380,8 +541,28 @@ def analyze_file_clang(
     except Exception:
         return FileAnalysis(preamble='')
 
+    ast_depth, sibling_index, ast_node_type = extract_clang_ast_metadata(
+        content,
+        tu,
+        source_path,
+    )
+    byte_to_char = _byte_to_char_mapper(content)
+
     # Extract preamble
-    preamble = extract_preamble(tu, tmp_path)
+    (
+        preamble,
+        preamble_ast_depth,
+        preamble_sibling_index,
+        preamble_ast_node_type,
+    ) = _extract_preamble_from_source(
+        tu,
+        source_path,
+        content,
+        byte_to_char,
+        ast_depth,
+        sibling_index,
+        ast_node_type,
+    )
 
     # Extract functions and classes
     functions: list[FunctionDef] = []
@@ -390,11 +571,21 @@ def analyze_file_clang(
     def visit(cursor):
         if not cursor.location.file:
             return
-        if cursor.location.file.name != tmp_path:
+        if not _same_clang_path(cursor.location.file.name, source_path):
             return
 
         if cursor.kind in FUNCTION_KINDS and cursor.is_definition():
-            text = get_function_text(cursor, tu)
+            text, func_ast_depth, func_sibling_index, func_ast_node_type, _offsets = (
+                _cursor_text_and_metadata(
+                    cursor,
+                    content,
+                    source_path,
+                    byte_to_char,
+                    ast_depth,
+                    sibling_index,
+                    ast_node_type,
+                )
+            )
             if text and len(text) >= 20:
                 callees = extract_callees(cursor)
                 qname = get_qualified_name(cursor)
@@ -409,12 +600,25 @@ def analyze_file_clang(
                     callees=callees,
                     is_definition=True,
                     end_line=end_line,
+                    ast_depth=func_ast_depth,
+                    sibling_index=func_sibling_index,
+                    ast_node_type=func_ast_node_type,
                 ))
 
         elif cursor.kind in (CursorKind.CLASS_DECL, CursorKind.STRUCT_DECL,
                               CursorKind.CLASS_TEMPLATE):
             if cursor.is_definition():
-                text = get_function_text(cursor, tu)
+                text, cls_ast_depth, cls_sibling_index, cls_ast_node_type, _offsets = (
+                    _cursor_text_and_metadata(
+                        cursor,
+                        content,
+                        source_path,
+                        byte_to_char,
+                        ast_depth,
+                        sibling_index,
+                        ast_node_type,
+                    )
+                )
                 if text and len(text) >= 20:
                     qname = get_qualified_name(cursor)
                     classes.append(ClassDef(
@@ -423,6 +627,9 @@ def analyze_file_clang(
                         text=text,
                         start_line=cursor.extent.start.line,
                         end_line=cursor.extent.end.line,
+                        ast_depth=cls_ast_depth,
+                        sibling_index=cls_sibling_index,
+                        ast_node_type=cls_ast_node_type,
                     ))
                 # Recurse into class children to extract inline methods,
                 # constructors, and destructors defined inside the class body.
@@ -436,7 +643,16 @@ def analyze_file_clang(
     for cursor in tu.cursor.get_children():
         visit(cursor)
 
-    return FileAnalysis(preamble=preamble, functions=functions, classes=classes)
+    return FileAnalysis(
+        preamble=preamble,
+        functions=functions,
+        classes=classes,
+        preamble_ast_depth=preamble_ast_depth,
+        preamble_sibling_index=preamble_sibling_index,
+        preamble_ast_node_type=preamble_ast_node_type,
+        compile_args=args,
+        build_info=dict(build_info or {}),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -788,7 +1004,7 @@ def format_chain_document(
         short_preamble = '\n'.join(old_analysis.preamble.splitlines()[:20])
         if short_preamble:
             parts_info.append((short_preamble, 1, 0, '', None))
-            section_kinds.append('c')
+            section_kinds.append('o')
         for ci in old_changed_classes:
             cls = old_analysis.classes[ci]
             parts_info.append((cls.text, 4, 0, cls.name, cls.qualified_name))
@@ -805,7 +1021,7 @@ def format_chain_document(
         short_preamble = '\n'.join(new_analysis.preamble.splitlines()[:20])
         if short_preamble:
             parts_info.append((short_preamble, 1, 0, '', None))
-            section_kinds.append('c')
+            section_kinds.append('n')
         for ci in new_changed_classes:
             cls = new_analysis.classes[ci]
             parts_info.append((cls.text, 4, 0, cls.name, cls.qualified_name))
@@ -861,7 +1077,7 @@ def format_diff_document(
     short_preamble = '\n'.join(old_analysis.preamble.splitlines()[:20])
     if short_preamble:
         parts_info.append((short_preamble, 1, 0, '', None))
-        section_kinds.append('c')
+        section_kinds.append('o')
     for ci in old_changed_classes:
         cls = old_analysis.classes[ci]
         parts_info.append((cls.text, 4, 0, cls.name, cls.qualified_name))
@@ -892,6 +1108,51 @@ def format_diff_document(
     )
 
 
+def _analysis_ast_maps(
+    analysis: FileAnalysis | None,
+) -> dict[str, tuple[list[int], list[int], list[int]]]:
+    if analysis is None:
+        return {}
+    result: dict[str, tuple[list[int], list[int], list[int]]] = {}
+    for func in analysis.functions:
+        result[func.qualified_name] = (
+            func.ast_depth,
+            func.sibling_index,
+            func.ast_node_type,
+        )
+    for cls in analysis.classes:
+        result[cls.qualified_name] = (
+            cls.ast_depth,
+            cls.sibling_index,
+            cls.ast_node_type,
+        )
+    return result
+
+
+def _copy_clang_ast_part(
+    ast_depth: list[int],
+    sibling_index: list[int],
+    ast_node_type: list[int],
+    *,
+    offset: int,
+    part_len: int,
+    source: tuple[list[int], list[int], list[int]] | None,
+) -> None:
+    if source is None:
+        return
+    src_depth, src_sibling, src_node_type = source
+    if (
+        len(src_depth) != part_len
+        or len(src_sibling) != part_len
+        or len(src_node_type) != part_len
+    ):
+        return
+    end = offset + part_len
+    ast_depth[offset:end] = src_depth
+    sibling_index[offset:end] = src_sibling
+    ast_node_type[offset:end] = src_node_type
+
+
 def _build_enriched_from_parts(
     parts_info: list[PartInfo],
     old_analysis: FileAnalysis,
@@ -917,6 +1178,9 @@ def _build_enriched_from_parts(
     text_len = len(full_text)
 
     structure_ids = [0] * text_len
+    ast_depth = [0] * text_len
+    sibling_index = [0] * text_len
+    ast_node_type = [0] * text_len
     chunk_boundaries = []
     offset = 0
 
@@ -931,6 +1195,8 @@ def _build_enriched_from_parts(
     if new_analysis:
         for func in new_analysis.functions:
             all_funcs[func.qualified_name] = func
+    old_ast = _analysis_ast_maps(old_analysis)
+    new_ast = _analysis_ast_maps(new_analysis)
 
     for i, (part_text, kind, dep_level, name, qname) in enumerate(parts_info):
         part_len = len(part_text)
@@ -939,6 +1205,29 @@ def _build_enriched_from_parts(
 
         for j in range(offset, offset + part_len):
             structure_ids[j] = kind
+        source_kind = section_kinds[i] if section_kinds and i < len(section_kinds) else 'c'
+        part_ast: tuple[list[int], list[int], list[int]] | None = None
+        if qname:
+            if source_kind == 'n':
+                part_ast = new_ast.get(qname) or old_ast.get(qname)
+            else:
+                part_ast = old_ast.get(qname) or new_ast.get(qname)
+        elif kind == 1:
+            analysis = new_analysis if source_kind == 'n' and new_analysis else old_analysis
+            if analysis and len(analysis.preamble_ast_depth) >= part_len:
+                part_ast = (
+                    analysis.preamble_ast_depth[:part_len],
+                    analysis.preamble_sibling_index[:part_len],
+                    analysis.preamble_ast_node_type[:part_len],
+                )
+        _copy_clang_ast_part(
+            ast_depth,
+            sibling_index,
+            ast_node_type,
+            offset=offset,
+            part_len=part_len,
+            source=part_ast,
+        )
 
         chunk_boundaries.append({
             'start': offset,
@@ -966,9 +1255,6 @@ def _build_enriched_from_parts(
                     call_edges.append({'from': ci, 'to': cj})
 
     type_edges: list[dict[str, object]] = []
-
-    # AST metadata via tree-sitter
-    ast_depth, sibling_index, ast_node_type = extract_ast_metadata(full_text)
 
     semantic_index = ProjectIndex()
     for func in all_funcs.values():
@@ -1022,12 +1308,22 @@ def _build_enriched_from_parts(
         platform_info = None
     if platform_info:
         result['platform_info'] = platform_info
+    compile_args = record.get("compile_args")
+    build_info = record.get("build_info")
+    if isinstance(build_info, dict) and build_info:
+        result["build_info"] = build_info
 
     # Language info detection
     filepath = record.get('filepath', '')
     if detect_language_info is not None:
         try:
-            lang_info = detect_language_info(full_text, filepath, platform_info)
+            lang_info = detect_language_info(
+                full_text,
+                filepath,
+                platform_info,
+                compile_args=compile_args if isinstance(compile_args, list) else None,
+                build_info=build_info if isinstance(build_info, dict) else None,
+            )
         except TypeError:
             lang_info = detect_language_info(full_text, filepath)
         if lang_info:
@@ -1076,6 +1372,7 @@ def process_record(
     max_file_bytes: int,
     doc_format: str,
     max_dep_depth: int,
+    build_context: BuildContextResolver | None = None,
 ) -> list[dict]:
     """Process a single commit record into enriched documents."""
     old_content = record.get('old_content', '')
@@ -1092,6 +1389,15 @@ def process_record(
         return []
 
     filepath = record.get('filepath', 'source.cpp')
+    repo_root: str | None = None
+    compile_args: list[str] | None = None
+    build_info: dict[str, object] = {}
+    if build_context is not None:
+        repo_root, compile_args, build_info = build_context.resolve(record)
+        if compile_args:
+            record.setdefault("compile_args", compile_args)
+        if build_info:
+            record.setdefault("build_info", build_info)
 
     # Parse old and new with clang (use separate temp subdirs to avoid conflicts)
     old_dir = os.path.join(tmpdir, 'old')
@@ -1099,8 +1405,24 @@ def process_record(
     os.makedirs(old_dir, exist_ok=True)
     os.makedirs(new_dir, exist_ok=True)
 
-    old_analysis = analyze_file_clang(old_content, filepath, clang_index, old_dir)
-    new_analysis = analyze_file_clang(new_content, filepath, clang_index, new_dir)
+    old_analysis = analyze_file_clang(
+        old_content,
+        filepath,
+        clang_index,
+        old_dir,
+        compile_args=compile_args,
+        repo_root=repo_root,
+        build_info=build_info,
+    )
+    new_analysis = analyze_file_clang(
+        new_content,
+        filepath,
+        clang_index,
+        new_dir,
+        compile_args=compile_args,
+        repo_root=repo_root,
+        build_info=build_info,
+    )
 
     documents: list[dict[str, object]] = []
 
@@ -1132,6 +1454,8 @@ def process_jsonl_file(
     max_file_bytes: int,
     doc_format: str,
     max_dep_depth: int,
+    memory_limit_gb: float,
+    build_context: BuildContextResolver | None = None,
 ) -> dict:
     """Process a JSONL input file, writing enriched docs to output."""
     stats = {
@@ -1161,6 +1485,7 @@ def process_jsonl_file(
                 docs = process_record(
                     record, clang_index, tmpdir,
                     max_tokens, max_file_bytes, doc_format, max_dep_depth,
+                    build_context=build_context,
                 )
             except Exception as e:
                 stats['parse_errors'] += 1
@@ -1182,6 +1507,7 @@ def process_jsonl_file(
                 stats['documents_written'] += 1
 
             if stats['records_read'] % 1000 == 0:
+                check_memory_limit(memory_limit_gb, label="process_commits")
                 print(
                     f"  [{input_path}] {stats['records_read']} records, "
                     f"{stats['documents_written']} docs written",
@@ -1228,13 +1554,31 @@ def main() -> int:
         '--libclang-path', default=None,
         help='Explicit path to libclang.so',
     )
+    parser.add_argument(
+        '--repo-root', default=None,
+        help='Single source repo root to use for compile_commands/include resolution',
+    )
+    parser.add_argument(
+        '--repo-dir', default=None,
+        help='Parent directory containing repos named by each record["repo"]',
+    )
+    parser.add_argument(
+        '--memory-limit-gb', type=float, default=10.0,
+        help='Abort if this Python wrapper exceeds this max RSS in GiB (default: 10).',
+    )
     args = parser.parse_args()
+    start_memory_guard(args.memory_limit_gb, label="process_commits")
 
     print("Clang commit processor starting", file=sys.stderr)
     print(f"  inputs: {args.inputs}", file=sys.stderr)
     print(f"  output: {args.output}", file=sys.stderr)
     print(f"  max_tokens: {args.max_tokens}", file=sys.stderr)
     print(f"  format: {args.doc_format}", file=sys.stderr)
+    print(f"  memory_limit_gb: {args.memory_limit_gb}", file=sys.stderr)
+    if args.repo_root:
+        print(f"  repo_root: {args.repo_root}", file=sys.stderr)
+    if args.repo_dir:
+        print(f"  repo_dir: {args.repo_dir}", file=sys.stderr)
 
     # Configure libclang
     try:
@@ -1252,6 +1596,7 @@ def main() -> int:
         print("  tokenizer: estimate (~4 bytes/token)", file=sys.stderr)
 
     clang_index = Index.create()
+    build_context = BuildContextResolver(repo_root=args.repo_root, repo_dir=args.repo_dir)
 
     t0 = time.time()
     total_stats = {
@@ -1283,6 +1628,8 @@ def main() -> int:
                         input_path, out_f, clang_index, actual_tmpdir,
                         args.max_tokens, args.max_file_bytes,
                         args.doc_format, args.max_dep_depth,
+                        args.memory_limit_gb,
+                        build_context=build_context,
                     )
 
                     for k in total_stats:

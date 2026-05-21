@@ -504,7 +504,13 @@ def test_path_c_gradient_probe_is_eager_only_and_stores_references() -> None:
         str(event["parameter_name"]): event for event in capture.events
     }
     event = events_by_name["layers.0.block.in_proj.weight"]
-    assert capture.buffers["layers.0.block.in_proj.weight_grad"] is event["tensor"]
+    assert "tensor" not in event
+    assert event["tensor_shape"] == tuple(
+        int(dim) for dim in capture.buffers["layers.0.block.in_proj.weight_grad"].shape
+    )
+    assert event["tensor_dtype"] == str(
+        capture.buffers["layers.0.block.in_proj.weight_grad"].dtype
+    )
     assert event["logical_names"] == ("layers.0.block.in_proj.weight_grad",)
     assert event["phase"] == "value_and_grad"
 

@@ -82,6 +82,7 @@ from scripts.nanochat_data.token_budget import (
     load_tokenizer,
     size_label_to_tokens,
 )
+from scripts.nanochat_data.memory_guard import check_memory_limit, start_memory_guard
 
 logging.basicConfig(
     level=logging.INFO,
@@ -93,6 +94,7 @@ GCS_BUCKET = "nanochat-training-data-2026"
 GCS_INPUT_PREFIX = "v5_enriched"
 GCS_OUTPUT_PREFIX_TEMPLATE = "data/parquet/clang_enriched_{size}"
 _TOKENIZED_ENRICHED_TOKENIZER = None
+_MEMORY_LIMIT_GB = 10.0
 _OVERFLOW_POLICIES = ("split", "drop")
 _CHAR_LEVEL_METADATA_FIELDS = (
     "ast_depth",
@@ -854,6 +856,8 @@ def convert_local_jsonl_to_parquet(
     overflow_policy: str = "split",
     dry_run: bool = False,
     materialize_tokenized_enriched: bool = False,
+    local_batch_size: int = 512,
+    memory_limit_gb: float = 10.0,
 ) -> dict[str, int]:
     """Convert a local clang JSONL/JSONL.GZ file into one parquet file."""
     if overflow_policy not in _OVERFLOW_POLICIES:
@@ -867,22 +871,54 @@ def convert_local_jsonl_to_parquet(
     docs_in = 0
     docs_out = 0
     rows: list[dict] = []
+    wrote_rows = False
 
-    with _open_jsonl(source) as handle:
-        for line in handle:
-            line = line.strip()
-            if not line:
-                continue
-            record = json.loads(line)
-            docs_in += 1
-            sub_docs = process_record_with_policy(
-                record,
-                tokenizer,
-                max_tokens,
-                overflow_policy=overflow_policy,
-            )
-            rows.extend(sub_docs)
-            docs_out += len(sub_docs)
+    def flush_rows() -> None:
+        nonlocal rows, wrote_rows, writer
+        if not rows:
+            return
+        if dry_run:
+            rows = []
+            return
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tokenized_rows = (
+            materialize_tokenized_enriched_batch(rows, tokenizer)
+            if materialize_tokenized_enriched
+            else None
+        )
+        table = rows_to_table(rows, tokenized_rows=tokenized_rows)
+        if writer is None:
+            writer = pq.ParquetWriter(target, _SCHEMA, compression="snappy")
+        writer.write_table(table)
+        wrote_rows = True
+        rows = []
+        check_memory_limit(memory_limit_gb, label="clang_enriched_to_parquet")
+
+    writer = None
+    try:
+        with _open_jsonl(source) as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                record = json.loads(line)
+                docs_in += 1
+                sub_docs = process_record_with_policy(
+                    record,
+                    tokenizer,
+                    max_tokens,
+                    overflow_policy=overflow_policy,
+                )
+                rows.extend(sub_docs)
+                docs_out += len(sub_docs)
+                if len(rows) >= local_batch_size:
+                    flush_rows()
+                if docs_in % 1000 == 0:
+                    check_memory_limit(memory_limit_gb, label="clang_enriched_to_parquet")
+        flush_rows()
+    finally:
+        if writer is not None:
+            writer.close()
 
     if dry_run:
         log.info(
@@ -895,17 +931,10 @@ def convert_local_jsonl_to_parquet(
         )
         return {"docs_in": docs_in, "docs_out": docs_out}
 
-    if not rows:
+    if not wrote_rows:
         target.unlink(missing_ok=True)
         log.info("empty parquet")
         return {"docs_in": docs_in, "docs_out": docs_out}
-
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tokenized_rows = None
-    if materialize_tokenized_enriched:
-        tokenized_rows = materialize_tokenized_enriched_batch(rows, tokenizer)
-    table = rows_to_table(rows, tokenized_rows=tokenized_rows)
-    pq.write_table(table, target, compression="snappy")
     log.info(
         "wrote local parquet %s docs_in=%d docs_out=%d policy=%s",
         target,
@@ -964,6 +993,8 @@ def process_input_file(gcs_uri: str, tmpdir: str,
                 )
             output_rows.extend(sub_docs)
             docs_out += len(sub_docs)
+            if docs_in % 1000 == 0:
+                check_memory_limit(_MEMORY_LIMIT_GB, label="clang_enriched_to_parquet")
 
             # Flush shard when we hit shard_size
             while len(output_rows) >= shard_size:
@@ -1008,7 +1039,9 @@ def _flush_shard(
             else None
         ),
     )
+    check_memory_limit(_MEMORY_LIMIT_GB, label="clang_enriched_to_parquet")
     pq.write_table(table, local_path, compression="snappy")
+    check_memory_limit(_MEMORY_LIMIT_GB, label="clang_enriched_to_parquet")
     gcs_upload(local_path, gcs_uri)
     os.unlink(local_path)
     log.info("Uploaded shard %d (%d rows, %.1f MB)",
@@ -1038,6 +1071,12 @@ def main():
     parser.add_argument(
         "--shard-size", type=int, default=10000,
         help="Number of chunked sub-documents per parquet shard (default: 10000).",
+    )
+    parser.add_argument(
+        "--local-batch-size",
+        type=int,
+        default=512,
+        help="Rows per local parquet row-group write in --input-file mode (default: 512).",
     )
     parser.add_argument(
         "--input-prefix", default=GCS_INPUT_PREFIX,
@@ -1078,17 +1117,26 @@ def main():
         choices=_OVERFLOW_POLICIES,
         default="split",
         help="How to handle docs that exceed the exact budget after metadata prefixes "
-        "are applied. 'split' preserves legacy behavior; 'drop' is strict no-crop.",
+            "are applied. 'split' preserves legacy behavior; 'drop' is strict no-crop.",
+    )
+    parser.add_argument(
+        "--memory-limit-gb",
+        type=float,
+        default=10.0,
+        help="Abort if this Python wrapper exceeds this max RSS in GiB (default: 10).",
     )
     args = parser.parse_args()
+    start_memory_guard(args.memory_limit_gb, label="clang_enriched_to_parquet")
 
     size_label = args.size.lower()
     max_tokens = size_label_to_tokens(size_label)
     tokenizer = load_tokenizer(args.tokenizer_path)
     global _TOKENIZED_ENRICHED_TOKENIZER
+    global _MEMORY_LIMIT_GB
     _TOKENIZED_ENRICHED_TOKENIZER = (
         tokenizer if args.materialize_tokenized_enriched else None
     )
+    _MEMORY_LIMIT_GB = args.memory_limit_gb
     default_output_prefix = GCS_OUTPUT_PREFIX_TEMPLATE.format(size=size_label)
     local_mode = bool(args.input_file or args.output_file)
     if local_mode and not (args.input_file and args.output_file):
@@ -1099,6 +1147,8 @@ def main():
         parser.error("--input-prefix is only supported in GCS mode")
     if local_mode and args.output_prefix:
         parser.error("--output-prefix is only supported in GCS mode")
+    if args.local_batch_size <= 0:
+        parser.error("--local-batch-size must be positive")
     if not local_mode and not args.output_prefix:
         args.output_prefix = default_output_prefix
 
@@ -1111,6 +1161,8 @@ def main():
             overflow_policy=args.overflow_policy,
             dry_run=args.dry_run,
             materialize_tokenized_enriched=args.materialize_tokenized_enriched,
+            local_batch_size=args.local_batch_size,
+            memory_limit_gb=args.memory_limit_gb,
         )
         log.info(
             "Done. Local convert: %d docs in -> %d docs out.",

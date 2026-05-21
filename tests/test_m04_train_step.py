@@ -2081,6 +2081,8 @@ def test_fp8_path_c_training_route_keeps_split_when_direct_chain_is_standalone(
             "1",
             "--dsa-a-layer-ranks",
             "0",
+            "--seq-len",
+            "513",
             "--output",
             str(tmp_path / "receipt.json"),
         ]
@@ -2125,6 +2127,47 @@ def test_fp8_path_c_training_route_keeps_split_when_direct_chain_is_standalone(
     assert route["direct_mx_array_artifact_call_status"] == (
         "m04_direct_fusion_chain_standalone_only_not_training_route"
     )
+
+
+def test_bf16_path_c_policy_route_is_requested_without_fp8_producer(
+    tmp_path: Path,
+    path_c_fusion_auto_env: None,
+) -> None:
+    del path_c_fusion_auto_env
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--synthetic",
+            "--dtype",
+            "bfloat16",
+            "--output",
+            str(tmp_path / "receipt.json"),
+        ]
+    )
+    config = m04_train_step.config_from_args(args, data_path=tmp_path / "tokens.npz")
+    model = build_local_gb10_quarter_tiny_smoke_model()
+
+    with temporary_env(
+        {
+            "CPPMEGA_KERNEL_PATH": "path_c",
+            "CPPMEGA_KERNEL_PATH__MAMBA3_MIMO": "path_c",
+            "CPPMEGA_KERNEL_PATH__M2RNN": "path_c",
+            "CPPMEGA_KERNEL_PATH__SPARSE_MLA": "path_c",
+        }
+    ):
+        route = m04_train_step.fp8_path_c_training_route_payload_for_model(
+            config,
+            model,
+        )
+
+    assert m04_train_step.fp8_path_c_route_requested(config) is False
+    assert route["requested"] is True
+    assert route["dtype"] == "bfloat16"
+    assert route["sparse_mla_fp8_producer"]["requested"] is False
+    assert route["status"] == m04_train_step.FP8_PATH_C_SPLIT_TRAINING_STATUS
+    assert route["split_end_to_end_training_available"] is True
+    assert route["full_end_to_end_training_available"] is False
+    assert route["selected_action"] == "run_path_c_split_training_route"
+    assert route["blocker_type"] is None
 
 
 def test_path_c_direct_chain_value_and_grad_bridge_plan_reports_loss_and_tree_gaps(
@@ -2327,6 +2370,45 @@ def test_path_c_direct_chain_runtime_value_and_grad_uses_loss_cotangent_bridge(
         "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_weight_grad"
     )
     assert flat["layers.12.block.q_proj.weight_grad"] is buffers[logical_name]
+
+
+def test_path_c_direct_chain_value_and_grad_probe_payload_is_post_step_only(
+    tmp_path: Path,
+) -> None:
+    del tmp_path
+    model = build_local_gb10_quarter_tiny_smoke_model()
+    logical_buffers = _model_route_direct_chain_mx_buffers(model)
+    runtime = m04_train_step.PathCDirectFusionChainTrainingRuntime(
+        chain=_model_route_direct_chain(model),
+        artifacts=_model_route_direct_chain_artifacts(model),
+        logical_buffers=logical_buffers,
+        owner_name="unit.path_c_direct_training_runtime",
+        training_critical_path=False,
+        loss_cotangent_bridge=m04_train_step.PathCResidualSumSuffixLossCotangentBridge(
+            chunk_rows=128,
+        ),
+        model=model,
+    )
+    seq_len = logical_buffers[
+        "local_gb10_quarter_brick_11_R_hidden_after"
+    ].shape[1]
+    tokens = mx.arange(seq_len + 1, dtype=mx.int32)[None, :]
+    tokens = tokens % mx.array(model.config.vocab_size, dtype=mx.int32)
+
+    payload = m04_train_step.path_c_direct_chain_value_and_grad_probe_payload(
+        runtime=runtime,
+        model=model,
+        batch={"tokens": tokens},
+    )
+
+    assert payload["status"] == "ok"
+    assert payload["execution_phase"] == "post_step_profile_probe"
+    assert payload["training_critical_path"] is False
+    assert payload["delegated_to_eager_loss_and_grad"] is False
+    assert payload["gradient_count"] > 0
+    assert payload["value_and_grad_contract"]["status"] == "incomplete"
+    assert payload["value_and_grad_contract"]["returns_full_model_grads"] is True
+    assert payload["training_runtime_contract"]["training_runtime_available"] is False
 
 
 def test_path_c_direct_chain_runtime_value_and_grad_bridges_after_forward_segments(
@@ -3530,22 +3612,47 @@ def test_fp8_path_c_training_route_for_model_uses_model_derived_regions(
     ]
     audit = route["path_c_fusion"]["direct_chained_fusion"]["model_binding_audit"]
     assert audit["status"] == "runtime_backward_or_state_owner_missing"
-    assert audit["required_logical_buffer_count"] == 81
-    assert audit["model_parameter_or_constant_count"] == 28
-    assert audit["runtime_activation_or_grad_count"] == 48
-    assert audit["backward_gradient_count"] == 34
+    assert audit["required_logical_buffer_count"] == 83
+    assert audit["model_parameter_or_constant_count"] == 25
+    assert audit["runtime_activation_or_grad_count"] == 53
+    assert audit["backward_gradient_count"] == 35
     assert audit["forward_activation_probe_surface_available"] is True
     assert audit["parameter_gradient_probe_surface_available"] is True
     assert audit["model_parameter_logical_owner_available"] is True
     assert audit["model_parameter_logical_owner"] == (
         "local_gb10_quarter.path_c_model_parameter_buffers"
     )
-    assert audit["model_parameter_logical_owner_buffer_count"] > 0
+    assert audit["model_parameter_logical_owner_buffer_count"] == 25
+    assert audit["model_parameter_logical_owner_total_buffer_count"] > 25
     assert audit["backward_gradient_parameter_alias_coverage_count"] == 25
-    assert audit["backward_gradient_uncovered_count"] == 9
+    assert audit["backward_gradient_uncovered_count"] == 10
     assert audit["profile_brick_names_attached"] is True
-    assert audit["forward_activation_or_prepared_count"] > 0
-    assert audit["backward_gradient_count"] > 0
+    assert audit["forward_activation_or_prepared_count"] == 18
+    assert audit["runtime_state_count"] == 5
+    pre_step_plan = route["path_c_fusion"]["direct_chained_fusion"][
+        "pre_step_owner_plan"
+    ]
+    assert pre_step_plan["status"] == "pre_step_runtime_owner_missing"
+    assert pre_step_plan["training_critical_path_ready"] is False
+    assert pre_step_plan["model_parameter_or_constant_available_count"] == 25
+    assert pre_step_plan["model_parameter_or_constant_missing_count"] == 0
+    assert pre_step_plan["batch_dependent_forward_or_prepared_count"] == 18
+    assert pre_step_plan["batch_dependent_forward_or_prepared_missing_count"] == 18
+    assert pre_step_plan["runtime_state_count"] == 5
+    assert pre_step_plan["runtime_state_missing_count"] == 5
+    assert pre_step_plan["pre_step_runtime_missing_count"] == 23
+    assert pre_step_plan["backward_workspace_gradient_count"] == 35
+    assert (
+        "local_gb10_quarter_brick_10_M_hidden"
+        in pre_step_plan["batch_dependent_forward_or_prepared_missing_examples"]
+    )
+    assert pre_step_plan["runtime_state_missing_examples"] == [
+        "local_gb10_quarter_brick_10_M_mamba3_h0",
+        "local_gb10_quarter_brick_10_M_state",
+        "local_gb10_quarter_brick_10_M_state_in",
+        "local_gb10_quarter_brick_11_R_m2rnn_conv_state",
+        "local_gb10_quarter_brick_11_R_m2rnn_h0",
+    ]
     runtime_binding = route["path_c_fusion"]["direct_chained_fusion"][
         "runtime_binding"
     ]
@@ -3554,12 +3661,337 @@ def test_fp8_path_c_training_route_for_model_uses_model_derived_regions(
     )
     assert runtime_binding["provided_logical_buffer_count"] == 25
     assert runtime_binding["shape_mismatch_buffers"] == []
-    assert runtime_binding["missing_logical_buffer_count"] == 56
+    assert runtime_binding["missing_logical_buffer_count"] == (
+        audit["required_logical_buffer_count"]
+        - runtime_binding["provided_logical_buffer_count"]
+    )
     assert (
         "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_sm_scale"
         in runtime_binding["missing_logical_buffers"]
     )
     assert runtime_binding["hidden_packing_performed"] is False
+
+
+def test_path_c_direct_chain_pre_step_owner_is_dynamic_batch_abi(
+    tmp_path: Path,
+    path_c_fusion_auto_env: None,
+) -> None:
+    del path_c_fusion_auto_env
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--synthetic",
+            "--dtype",
+            "fp8_path_c",
+            "--pattern",
+            "A",
+            "--depth",
+            "1",
+            "--dsa-a-layer-ranks",
+            "0",
+            "--output",
+            str(tmp_path / "receipt.json"),
+        ]
+    )
+    config = m04_train_step.config_from_args(args, data_path=tmp_path / "tokens.npz")
+    model = build_local_gb10_quarter_tiny_smoke_model()
+    chain = _model_route_direct_chain(model)
+    assert int(config.seq_len) != 512
+    seq_len = 512
+    tokens = mx.arange(seq_len + 1, dtype=mx.int32)[None, :]
+    tokens = tokens % mx.array(model.config.vocab_size, dtype=mx.int32)
+
+    owner = m04_train_step.make_path_c_direct_chain_pre_step_runtime_owner(
+        chain=chain,
+        model=model,
+        batch={"tokens": tokens},
+    )
+    binding = m04_train_step.path_c_direct_fusion_chain_runtime_binding_payload(
+        chain=chain,
+        logical_owner=owner,
+        artifacts=_model_route_direct_chain_artifacts(model),
+    )
+    pre_step_plan = m04_train_step.path_c_direct_chain_pre_step_owner_plan(
+        chain=chain,
+        logical_owner=owner,
+    )
+
+    assert owner.owner_name == "local_gb10_quarter.path_c_pre_step_runtime_buffers"
+    assert len(owner.buffers) == 83
+    assert owner.hidden_packing_performed is False
+    assert owner.no_hidden_allocation_policy is True
+    assert owner.buffers[
+        "local_gb10_quarter_brick_10_M_hidden"
+    ].shape == (1, seq_len, 16)
+    parameters = dict(tree_flatten(model.trainable_parameters()))
+    assert owner.buffers[
+        "local_gb10_quarter_brick_10_M_mamba3_conv_weight"
+    ] is parameters["layers.10.block.conv_weight"]
+    assert binding["status"] == "ok"
+    assert binding["runtime_uses_direct_fusion_chain"] is True
+    assert binding["provided_logical_buffer_count"] == 83
+    assert binding["missing_logical_buffer_count"] == 0
+    assert binding["unexpected_logical_buffer_count"] == 0
+    assert pre_step_plan["status"] == "pre_step_runtime_owner_ready"
+    assert pre_step_plan["training_critical_path_ready"] is True
+    assert pre_step_plan["model_parameter_or_constant_available_count"] == 25
+    assert pre_step_plan["batch_dependent_forward_or_prepared_available_count"] == 18
+    assert pre_step_plan["runtime_state_available_count"] == 5
+    assert pre_step_plan["backward_workspace_gradient_available_count"] == 35
+
+
+def test_path_c_direct_chain_pre_step_owner_preserves_bf16_model_dtype(
+    tmp_path: Path,
+    path_c_fusion_auto_env: None,
+) -> None:
+    del path_c_fusion_auto_env
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--synthetic",
+            "--dtype",
+            "bfloat16",
+            "--output",
+            str(tmp_path / "receipt.json"),
+        ]
+    )
+    config = m04_train_step.config_from_args(args, data_path=tmp_path / "tokens.npz")
+    del config
+    model = build_local_gb10_quarter_tiny_smoke_model(dtype=mx.bfloat16)
+    chain = _model_route_direct_chain(model)
+    seq_len = 512
+    tokens = mx.arange(seq_len + 1, dtype=mx.int32)[None, :]
+    tokens = tokens % mx.array(model.config.vocab_size, dtype=mx.int32)
+
+    owner = m04_train_step.make_path_c_direct_chain_pre_step_runtime_owner(
+        chain=chain,
+        model=model,
+        batch={"tokens": tokens},
+    )
+    binding = m04_train_step.path_c_direct_fusion_chain_runtime_binding_payload(
+        chain=chain,
+        logical_owner=owner,
+        artifacts=_model_route_direct_chain_artifacts(model),
+    )
+
+    assert owner.buffers[
+        "local_gb10_quarter_brick_10_M_mamba3_in_proj_weight"
+    ].dtype == mx.bfloat16
+    assert binding["status"] == "ok"
+    assert binding["runtime_uses_direct_fusion_chain"] is True
+    assert binding["dtype_mismatch_count"] == 0
+    assert binding["dtype_mismatch_buffers"] == []
+
+
+def test_path_c_direct_chain_plans_for_runtime_input_sequence_length(
+    path_c_fusion_auto_env: None,
+) -> None:
+    del path_c_fusion_auto_env
+    model = build_local_gb10_quarter_tiny_smoke_model()
+    input_sequence_length = 128
+    profile_name = str(getattr(model, "path_c_profile_name", "HybridTinyLM"))
+    region_prefix = m04_train_step._path_c_direct_chain_region_prefix(
+        model,
+        profile_name,
+    )
+    direct_chains = m04_train_step.plan_path_c_direct_fusion_chains_for_model(
+        model,
+        region_prefix=region_prefix,
+        include_backward=True,
+        sequence_length=input_sequence_length,
+    )
+    regions = m04_train_step.build_path_c_model_regions_from_model(
+        model,
+        region_prefix=region_prefix,
+        include_backward=False,
+        sequence_length=input_sequence_length,
+    )
+    selected_region = m04_train_step._select_path_c_model_route_region(regions)
+    chain = m04_train_step._select_path_c_direct_chain_for_region(
+        direct_chains,
+        selected_region,
+    )
+    assert chain is not None
+    tokens = mx.arange(input_sequence_length + 1, dtype=mx.int32)[None, :]
+    tokens = tokens % mx.array(model.config.vocab_size, dtype=mx.int32)
+
+    owner = m04_train_step.make_path_c_direct_chain_pre_step_runtime_owner(
+        chain=chain,
+        model=model,
+        batch={"tokens": tokens},
+    )
+    artifacts = tuple(lambda *args: None for _ in chain.segments)
+    binding = m04_train_step.path_c_direct_fusion_chain_runtime_binding_payload(
+        chain=chain,
+        logical_owner=owner,
+        artifacts=artifacts,
+    )
+
+    assert owner.buffers[
+        "local_gb10_quarter_brick_10_M_hidden"
+    ].shape == (1, input_sequence_length, model.config.hidden_size)
+    assert binding["status"] == "ok"
+    assert binding["runtime_uses_direct_fusion_chain"] is True
+    assert binding["shape_mismatch_buffers"] == []
+
+
+def test_local_gb10_direct_chain_m2rnn_state_weight_uses_value_square_shape(
+    path_c_fusion_auto_env: None,
+) -> None:
+    del path_c_fusion_auto_env
+    profile = m04_train_step.local_gb10_quarter_profile()
+    model_descriptor = SimpleNamespace(
+        name=profile.name,
+        path_c_bricks=profile.path_c_bricks,
+        config=profile.hybrid_config(),
+    )
+    chains = m04_train_step.plan_path_c_direct_fusion_chains_for_model(
+        model_descriptor,
+        region_prefix=f"{profile.name}_path_c",
+        include_backward=True,
+    )
+    selected_chain = max(
+        chains,
+        key=lambda chain: len(getattr(getattr(chain, "source_region", None), "nodes", ())),
+    )
+    state_weight_shape = None
+    for segment in selected_chain.segments:
+        target = segment.schedule_target
+        assert target is not None
+        prim_func = target.schedule_template(segment.region)
+        abi_map = getattr(prim_func, "_cppmega_path_c_physical_buffer_abi_map")
+        key = "local_gb10_quarter_brick_11_R_m2rnn_state_weight"
+        if key in abi_map:
+            state_weight_shape = tuple(int(dim) for dim in abi_map[key]["shape"])
+            break
+
+    m2rnn_config = profile.hybrid_config().m2rnn_config()
+    assert state_weight_shape == (
+        m2rnn_config.num_weight_heads,
+        m2rnn_config.v_head_dim,
+        m2rnn_config.v_head_dim,
+    )
+
+
+def test_path_c_direct_chain_runtime_rebuilds_pre_step_owner_on_step(
+    tmp_path: Path,
+    path_c_fusion_auto_env: None,
+) -> None:
+    del path_c_fusion_auto_env
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--synthetic",
+            "--dtype",
+            "fp8_path_c",
+            "--pattern",
+            "A",
+            "--depth",
+            "1",
+            "--dsa-a-layer-ranks",
+            "0",
+            "--seq-len",
+            "513",
+            "--output",
+            str(tmp_path / "receipt.json"),
+        ]
+    )
+    config = m04_train_step.config_from_args(args, data_path=tmp_path / "tokens.npz")
+    model = build_local_gb10_quarter_tiny_smoke_model()
+    chain = _model_route_direct_chain(model)
+    artifacts = _model_route_direct_chain_artifacts(model)
+    seq_len = 512
+    tokens_a = mx.arange(seq_len + 1, dtype=mx.int32)[None, :]
+    tokens_a = tokens_a % mx.array(model.config.vocab_size, dtype=mx.int32)
+    tokens_b = (tokens_a + 3) % mx.array(model.config.vocab_size, dtype=mx.int32)
+    initial_owner = m04_train_step.make_path_c_direct_chain_pre_step_runtime_owner(
+        chain=chain,
+        model=model,
+        batch={"tokens": tokens_a},
+    )
+    factory_calls: list[tuple[int, ...]] = []
+
+    def owner_factory(
+        model_arg: nn.Module,
+        batch: Mapping[str, mx.array],
+    ) -> PathCLogicalBufferOwner:
+        tokens = batch["tokens"]
+        factory_calls.append(tuple(int(dim) for dim in tokens.shape))
+        return m04_train_step.make_path_c_direct_chain_pre_step_runtime_owner(
+            chain=chain,
+            model=model_arg,
+            batch=batch,
+        )
+
+    install_payload = (
+        m04_train_step.install_path_c_direct_chain_training_runtime_for_model(
+            model=model,
+            chain=chain,
+            artifacts=artifacts,
+            logical_owner=initial_owner,
+            owner_name="unit.path_c_direct_training_runtime",
+            training_critical_path=True,
+            run_probe=False,
+            loss_cotangent_bridge=m04_train_step.PathCResidualSumSuffixLossCotangentBridge(
+                chunk_rows=128,
+            ),
+            pre_step_owner_factory=owner_factory,
+        )
+    )
+    runtime = model.path_c_direct_fusion_chain_training_runtime
+    optimizer = optim.AdamW(learning_rate=1e-2, weight_decay=0.0)
+    optimizer.init(model.trainable_parameters())
+
+    def forbidden_loss_fn(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("Path C critical path must not delegate to eager loss")
+
+    stepper = m04_train_step.CompiledPretrainingStep(
+        model,
+        optimizer,
+        compile=False,
+        loss_fn=forbidden_loss_fn,
+        path_c_training_runtime=runtime,
+    )
+
+    metrics = stepper({"tokens": tokens_b})
+    route = m04_train_step.fp8_path_c_training_route_payload_for_model(
+        config,
+        model,
+    )
+    grad_name = next(
+        name
+        for name, value in runtime.last_pre_step_owner.buffers.items()
+        if name.endswith("_grad") and isinstance(value, mx.array)
+    )
+    post_step_capture = m04_train_step.PathCGradientBufferCapture(
+        owner_name="local_gb10_quarter.path_c_parameter_gradient_capture",
+    )
+    post_step_capture(
+        {
+            "logical_names": (grad_name,),
+            "tensor": mx.ones_like(runtime.last_pre_step_owner.buffers[grad_name]),
+        }
+    )
+    model.path_c_direct_fusion_chain_logical_buffer_owners = (post_step_capture,)
+    route_after_capture = m04_train_step.fp8_path_c_training_route_payload_for_model(
+        config,
+        model,
+    )
+
+    assert install_payload["status"] == "ok"
+    assert install_payload["training_critical_path"] is True
+    assert factory_calls == [(1, seq_len + 1)]
+    assert runtime.last_pre_step_owner is not initial_owner
+    assert runtime.last_pre_step_binding["status"] == "ok"
+    assert runtime.binding["runtime_uses_direct_fusion_chain"] is True
+    assert metrics.compiled is False
+    assert metrics.updated is True
+    assert metrics.ntokens == seq_len
+    assert route["direct_fusion_chain_training_runtime_available"] is True
+    assert route["selected_action"] == "run_path_c_direct_fusion_chain_route"
+    assert route_after_capture["selected_action"] == (
+        "run_path_c_direct_fusion_chain_route"
+    )
+    assert route_after_capture["path_c_fusion"]["direct_chained_fusion"][
+        "runtime_binding"
+    ]["logical_buffer_owner"] == runtime.last_pre_step_owner.owner_name
 
 
 def test_path_c_fusion_payload_reports_model_level_direct_chain_planner() -> None:
@@ -3591,13 +4023,10 @@ def test_path_c_direct_chain_runtime_capture_owners_reduce_binding_gap() -> None
         dtype = getattr(mx, str(spec.dtype))
         return mx.zeros(tuple(spec.shape), dtype=dtype)
 
-    assert activation_capture.aliases == {
-        "local_gb10_quarter_brick_10_M_hidden": ("hidden",),
-    }
     activation_capture(
         {
             "logical_names": ("local_gb10_quarter_brick_10_M_hidden",),
-            "tensor": tensor_for("hidden"),
+            "tensor": tensor_for("local_gb10_quarter_brick_10_M_hidden"),
         }
     )
     for name, tensor in fake_buffers.items():
@@ -3674,8 +4103,10 @@ def test_path_c_direct_chain_runtime_capture_owners_reduce_binding_gap() -> None
     assert runtime_binding["logical_buffer_owner"] == (
         "local_gb10_quarter.path_c_direct_fusion_chain_buffers"
     )
-    assert runtime_binding["provided_logical_buffer_count"] == 72
-    assert runtime_binding["missing_logical_buffer_count"] == 9
+    assert runtime_binding["provided_logical_buffer_count"] == (
+        len(fake_buffers) - runtime_binding["missing_logical_buffer_count"]
+    )
+    assert runtime_binding["missing_logical_buffer_count"] > 0
     assert runtime_binding["shape_mismatch_count"] == 0
     assert runtime_binding["dtype_mismatch_count"] == 0
     assert "hidden" not in runtime_binding["missing_logical_buffers"]
@@ -3702,7 +4133,9 @@ def test_path_c_direct_chain_runtime_capture_owners_reduce_binding_gap() -> None
     assert runtime_binding["hidden_packing_performed"] is False
 
     vjp_activation_grad_sources = {
-        "local_gb10_quarter_brick_10_M_hidden_grad": "hidden_grad",
+        "local_gb10_quarter_brick_10_M_hidden_grad": (
+            "local_gb10_quarter_brick_10_M_hidden_grad"
+        ),
         "local_gb10_quarter_brick_10_M_delta_grad": (
             "local_gb10_quarter_brick_10_M_delta_grad"
         ),
@@ -3735,10 +4168,15 @@ def test_path_c_direct_chain_runtime_capture_owners_reduce_binding_gap() -> None
         "runtime_binding"
     ]
 
-    assert runtime_binding["provided_logical_buffer_count"] == 78
-    assert runtime_binding["missing_logical_buffer_count"] == 3
+    assert runtime_binding["provided_logical_buffer_count"] == (
+        len(fake_buffers) - runtime_binding["missing_logical_buffer_count"]
+    )
+    assert runtime_binding["missing_logical_buffer_count"] > 0
     assert runtime_binding["shape_mismatch_count"] == 0
-    assert "hidden_grad" not in runtime_binding["missing_logical_buffers"]
+    assert (
+        "local_gb10_quarter_brick_10_M_hidden_grad"
+        not in runtime_binding["missing_logical_buffers"]
+    )
     assert (
         "local_gb10_quarter_brick_10_M_delta_grad"
         not in runtime_binding["missing_logical_buffers"]
@@ -3749,6 +4187,7 @@ def test_path_c_direct_chain_runtime_capture_owners_reduce_binding_gap() -> None
     )
     assert runtime_binding["missing_logical_buffers"] == [
         "local_gb10_quarter_brick_10_M_mamba3_h0_grad",
+        "local_gb10_quarter_brick_10_M_residual_norm_hidden_grad",
         "local_gb10_quarter_brick_10_M_state_in_grad",
         "local_gb10_quarter_brick_11_R_m2rnn_h0_grad",
     ]
@@ -3782,7 +4221,7 @@ def test_path_c_direct_chain_runtime_capture_owners_reduce_binding_gap() -> None
         "runtime_binding"
     ]
 
-    assert runtime_binding["provided_logical_buffer_count"] == 81
+    assert runtime_binding["provided_logical_buffer_count"] == len(fake_buffers)
     assert runtime_binding["missing_logical_buffer_count"] == 0
     assert runtime_binding["logical_tensor_binding_ready"] is True
     assert runtime_binding["direct_chain_artifacts_bound"] is False

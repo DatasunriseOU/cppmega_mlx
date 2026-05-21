@@ -64,6 +64,48 @@ _SCONS_BUILD_NAMES = ("SConstruct", "SConscript")
 _XMAKE_BUILD_NAMES = ("xmake.lua",)
 _FLAG_PREFIXES = ("-I", "-D", "-U", "-std=", "--std=", "/std:", "-cl-std=", "--target=", "-march=", "-mcpu=")
 _VERBATIM_FLAGS = {"-m32", "-m64", "--hip-link"}
+_PATH_VALUE_FLAGS = {
+    "-I",
+    "-isystem",
+    "-iquote",
+    "-idirafter",
+    "-F",
+    "-iframework",
+    "-include",
+    "-imacros",
+    "-isysroot",
+    "--sysroot",
+    "-resource-dir",
+}
+_PATH_JOINED_PREFIXES = (
+    "-I",
+    "-isystem",
+    "-iquote",
+    "-idirafter",
+    "-F",
+    "-iframework",
+)
+_PATH_EQ_PREFIXES = ("--sysroot=", "-isysroot=", "-resource-dir=")
+_COMPILE_COMMANDS_COMMON_DIRS = (
+    "build",
+    "build-debug",
+    "build-release",
+    "cmake-build-debug",
+    "cmake-build-release",
+    "out",
+    "out/build",
+)
+_COMPILE_COMMANDS_SKIP_DIRS = {
+    ".git",
+    ".hg",
+    ".svn",
+    "node_modules",
+    "third_party",
+    "3rdparty",
+    "vendor",
+    "external",
+    "deps",
+}
 
 
 def is_cpp_path(path: str | None) -> bool:
@@ -134,7 +176,55 @@ def _path_candidates(path: str, directory: str | None = None) -> set[str]:
     return candidates
 
 
-def _sanitize_compile_args(argv: list[str], filepath: str) -> tuple[list[str], str | None]:
+def _make_absolute_if_relative(path_text: str, directory: str | None) -> str:
+    if not path_text or directory is None or os.path.isabs(path_text):
+        return path_text
+    return os.path.normpath(os.path.join(directory, path_text))
+
+
+def _absolutize_compile_arg_paths(flags: list[str], directory: str | None) -> list[str]:
+    if directory is None:
+        return flags
+    normalized_dir = os.path.normpath(directory)
+    result: list[str] = []
+    i = 0
+    while i < len(flags):
+        arg = flags[i]
+        if arg in _PATH_VALUE_FLAGS and i + 1 < len(flags):
+            result.append(arg)
+            result.append(_make_absolute_if_relative(flags[i + 1], normalized_dir))
+            i += 2
+            continue
+        eq_prefix = next((prefix for prefix in _PATH_EQ_PREFIXES if arg.startswith(prefix)), None)
+        if eq_prefix is not None:
+            result.append(eq_prefix + _make_absolute_if_relative(arg[len(eq_prefix) :], normalized_dir))
+            i += 1
+            continue
+        joined_prefix = next(
+            (
+                prefix
+                for prefix in _PATH_JOINED_PREFIXES
+                if arg.startswith(prefix) and arg != prefix and arg[len(prefix) :]
+            ),
+            None,
+        )
+        if joined_prefix is not None:
+            result.append(
+                joined_prefix
+                + _make_absolute_if_relative(arg[len(joined_prefix) :], normalized_dir)
+            )
+            i += 1
+            continue
+        result.append(arg)
+        i += 1
+    return result
+
+
+def _sanitize_compile_args(
+    argv: list[str],
+    filepath: str,
+    directory: str | None = None,
+) -> tuple[list[str], str | None]:
     compiler = argv[0] if argv else None
     normalized_file = os.path.normpath(filepath)
     flags: list[str] = []
@@ -154,7 +244,7 @@ def _sanitize_compile_args(argv: list[str], filepath: str) -> tuple[list[str], s
         if arg.endswith((".o", ".obj", ".pcm")):
             continue
         flags.append(arg)
-    return flags, compiler
+    return _absolutize_compile_arg_paths(flags, directory), compiler
 
 
 def parse_compile_commands_entries(entries: list[dict]) -> CompileCommandsIndex:
@@ -173,7 +263,7 @@ def parse_compile_commands_entries(entries: list[dict]) -> CompileCommandsIndex:
             continue
         candidates = _path_candidates(filepath, directory)
         preferred = os.path.normpath(os.path.join(directory, filepath)) if directory and not os.path.isabs(filepath) else os.path.normpath(filepath)
-        compile_args, compiler = _sanitize_compile_args(argv, preferred)
+        compile_args, compiler = _sanitize_compile_args(argv, preferred, directory)
         entry = CompileCommandEntry(
             filepath=preferred,
             compile_args=compile_args,
@@ -209,6 +299,78 @@ def load_compile_commands_file(path: str) -> CompileCommandsIndex | None:
         return None
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         return load_compile_commands_text(f.read())
+
+
+def _score_compile_commands_file(path: str) -> int:
+    index = load_compile_commands_file(path)
+    return len(index.entries) if index is not None else 0
+
+
+def find_compile_commands_file(
+    repo_dir: str,
+    explicit_path: str | None = None,
+) -> str | None:
+    """Find the best compile_commands.json for a repo checkout.
+
+    CMake usually writes the compilation database under a build directory, not
+    the source root.  Prefer explicit/root files, then common build dirs, then a
+    shallow repo scan.  The chosen file must parse and contain at least one
+    entry.
+    """
+    candidates: list[str] = []
+    if explicit_path:
+        candidates.append(explicit_path)
+    env_path = os.environ.get("NANOCHAT_COMPILE_COMMANDS") or os.environ.get(
+        "CPPMEGA_COMPILE_COMMANDS"
+    )
+    if env_path:
+        candidates.append(env_path)
+
+    root = os.path.abspath(repo_dir)
+    candidates.append(os.path.join(root, "compile_commands.json"))
+    for dirname in _COMPILE_COMMANDS_COMMON_DIRS:
+        candidates.append(os.path.join(root, dirname, "compile_commands.json"))
+    for child in os.listdir(root) if os.path.isdir(root) else []:
+        if child.startswith(("build", "cmake-build", "out")):
+            candidates.append(os.path.join(root, child, "compile_commands.json"))
+
+    seen: set[str] = set()
+    valid: list[tuple[int, str]] = []
+    for raw in candidates:
+        path = os.path.abspath(raw)
+        if path in seen or not os.path.exists(path):
+            continue
+        seen.add(path)
+        score = _score_compile_commands_file(path)
+        if score > 0:
+            if path == os.path.join(root, "compile_commands.json") or raw == explicit_path:
+                return path
+            valid.append((score, path))
+
+    if valid:
+        valid.sort(key=lambda item: item[0], reverse=True)
+        return valid[0][1]
+
+    best_score = 0
+    best_path: str | None = None
+    for current_root, dirs, files in os.walk(root):
+        rel = os.path.relpath(current_root, root)
+        depth = 0 if rel == "." else rel.count(os.sep) + 1
+        if depth >= 4:
+            dirs.clear()
+        else:
+            dirs[:] = [d for d in dirs if d not in _COMPILE_COMMANDS_SKIP_DIRS]
+        if "compile_commands.json" not in files:
+            continue
+        path = os.path.join(current_root, "compile_commands.json")
+        if path in seen:
+            continue
+        seen.add(path)
+        score = _score_compile_commands_file(path)
+        if score > best_score:
+            best_score = score
+            best_path = path
+    return best_path
 
 
 def _extract_string_literals(text: str) -> list[str]:
@@ -703,8 +865,13 @@ def detect_build_context_from_loader(read_text: Callable[[str], str | None]) -> 
 
 
 def detect_build_context(repo_dir: str) -> tuple[dict, list[str], CompileCommandsIndex | None]:
+    compile_commands_path = find_compile_commands_file(repo_dir)
+
     def read_text(name: str) -> str | None:
-        path = os.path.join(repo_dir, name)
+        if name == "compile_commands.json" and compile_commands_path:
+            path = compile_commands_path
+        else:
+            path = os.path.join(repo_dir, name)
         if not os.path.exists(path):
             return None
         with open(path, "r", encoding="utf-8", errors="replace") as f:

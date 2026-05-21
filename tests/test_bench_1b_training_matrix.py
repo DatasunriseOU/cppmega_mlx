@@ -65,6 +65,9 @@ def test_bench_1b_matrix_plan_covers_dtype_optimizer_path_cells(
     assert by_case["fp8_adamw_path_b"].env["CPPMEGA_KERNEL_PATH"] == "path_b"
     assert by_case["fp8_adamw_path_b"].env["CPPMEGA_KERNEL_PATH__SPARSE_MLA"] == "path_b"
     assert by_case["fp8_adamw_path_c_warm"].env["CPPMEGA_SPARSE_MLA_FP8_ROUTE"] == "path_c"
+    assert "--use-path-c-direct-chain-runtime" not in by_case[
+        "bf16_adamw_path_c_warm"
+    ].command
 
 
 def test_bench_1b_matrix_can_explicitly_force_full_mamba3_path_c_bwd(
@@ -85,6 +88,30 @@ def test_bench_1b_matrix_can_explicitly_force_full_mamba3_path_c_bwd(
 
     assert cell.env["CPPMEGA_KERNEL_PATH__MAMBA3_MIMO"] == "path_c"
     assert cell.env["CPPMEGA_MAMBA3_PATH_C_BWD"] == "path_c"
+
+
+def test_bench_1b_matrix_can_forward_direct_chain_runtime_flag(
+    tmp_path: Path,
+) -> None:
+    args = _args(
+        tmp_path,
+        "--dtypes",
+        "bf16",
+        "--optimizers",
+        "adamw",
+        "--paths",
+        "path_b,path_c_warm",
+        "--use-path-c-direct-chain-runtime",
+    )
+    cells = matrix.build_cells(args)
+    by_case = {cell.case_id: cell for cell in cells}
+
+    assert "--use-path-c-direct-chain-runtime" not in by_case[
+        "bf16_adamw_path_b"
+    ].command
+    assert "--use-path-c-direct-chain-runtime" in by_case[
+        "bf16_adamw_path_c_warm"
+    ].command
 
 
 def test_bench_1b_matrix_dry_run_writes_markdown_csv_and_json(
@@ -272,6 +299,11 @@ def test_path_c_fusion_summary_preserves_direct_chain_runtime_route() -> None:
                             "status": "ok",
                             "runtime_uses_direct_fusion_chain": True,
                         },
+                        "training_runtime_contract": {
+                            "status": "ok",
+                            "training_runtime_available": True,
+                            "critical_path_ready": True,
+                        },
                     },
                     "schedule_blockers": [],
                     "production_schedule": {
@@ -294,7 +326,57 @@ def test_path_c_fusion_summary_preserves_direct_chain_runtime_route() -> None:
     assert summary["runtime_uses_direct_fusion_chain"] is True
     assert summary["runtime_binding_status"] == "ok"
     assert summary["direct_chain_runtime_binding_status"] == "ok"
+    assert summary["direct_chain_training_runtime_status"] == "ok"
+    assert summary["direct_chain_training_runtime_available"] is True
     assert proof["runtime_uses_fused_train_block"] is True
+
+
+def test_path_c_fusion_summary_does_not_promote_standalone_direct_chain() -> None:
+    receipt = {
+        "training": {
+            "fp8_path_c_training_route": {
+                "fused_train_block_runtime_available": False,
+                "path_c_fusion": {
+                    "runtime_training_binding": {
+                        "status": "model_owned_physical_abi_banks_missing",
+                        "runtime_uses_fused_train_block": False,
+                    },
+                    "direct_chained_fusion": {
+                        "status": "ready",
+                        "segment_count": 4,
+                        "runtime_binding": {
+                            "status": "ok",
+                            "runtime_uses_direct_fusion_chain": True,
+                        },
+                        "training_runtime_contract": {
+                            "status": "direct_fusion_chain_training_runtime_incomplete",
+                            "training_runtime_available": False,
+                            "critical_path_ready": False,
+                        },
+                    },
+                    "production_schedule": {
+                        "schedule_id": "path_c_descriptor_chain_abc",
+                        "implementation_kind": "production",
+                        "production_fragments_complete": True,
+                        "real_abi_contract_complete": True,
+                        "missing_real_abi_inputs": [],
+                    },
+                    "schedule_contract": {"status": "verified"},
+                },
+            },
+        },
+    }
+
+    summary = matrix.path_c_fusion_summary_from_receipt(receipt)
+    proof = matrix.proof_result_from_receipt(receipt, path="path_c_warm")
+
+    assert summary["runtime_uses_direct_fusion_chain"] is True
+    assert summary["runtime_uses_fused_train_block"] is False
+    assert summary["runtime_binding_status"] == (
+        "direct_fusion_chain_training_runtime_incomplete"
+    )
+    assert summary["direct_chain_training_runtime_available"] is False
+    assert proof["runtime_uses_fused_train_block"] is False
 
 
 def test_bench_1b_matrix_reuses_existing_ok_receipt(

@@ -20,10 +20,16 @@ import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from scripts.nanochat_data.memory_guard import start_memory_guard
+
 
 def extract_repo(args_tuple):
     """Extract commits from a single repo (runs as subprocess)."""
-    repo_path, output_file, script_path = args_tuple
+    repo_path, output_file, script_path, memory_limit_gb = args_tuple
     repo_name = Path(repo_path).name
 
     # Check if output already exists and has content
@@ -54,6 +60,8 @@ def extract_repo(args_tuple):
                 repo_path,
                 "--output",
                 output_file,
+                "--memory-limit-gb",
+                str(memory_limit_gb),
             ],
             capture_output=True,
             text=True,
@@ -134,7 +142,14 @@ def main():
         default=[],
         help="Skip these repos (by name)",
     )
+    parser.add_argument(
+        "--memory-limit-gb",
+        type=float,
+        default=10.0,
+        help="Abort each Python wrapper process above this max RSS in GiB (default: 10).",
+    )
     args = parser.parse_args()
+    start_memory_guard(args.memory_limit_gb, label="extract_all_commits")
 
     script_path = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "extract_git_history.py"
@@ -168,6 +183,7 @@ def main():
     print(f"Found {len(repos)} repositories in {args.repo_dir}")
     print(f"Output directory: {args.output_dir}")
     print(f"Workers: {args.workers}")
+    print(f"Memory limit per process: {args.memory_limit_gb} GiB")
     print()
 
     # Build task list
@@ -175,7 +191,7 @@ def main():
     for repo_path in repos:
         repo_name = Path(repo_path).name
         output_file = os.path.join(args.output_dir, f"{repo_name}_commits.jsonl")
-        tasks.append((repo_path, output_file, script_path))
+        tasks.append((repo_path, output_file, script_path, args.memory_limit_gb))
 
     # Run in parallel
     total_records = 0

@@ -9,7 +9,7 @@ lowered Metal kernels.
 from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
 from hashlib import sha256
 import io
@@ -339,6 +339,7 @@ class PathCModelShapeEnv:
     m2rnn_num_g_heads: int
     m2rnn_num_weight_heads: int
     m2rnn_conv_kernel: int
+    model_value_dtype: str = "float32"
 
     @property
     def mamba_inner_dim(self) -> int:
@@ -938,11 +939,15 @@ def build_path_c_model_regions_from_model(
     z3_sync: Z3SyncSpec | None = None,
     include_backward: bool = False,
     min_route_bricks: int = 2,
+    sequence_length: int | None = None,
 ) -> tuple[PathCFusionRegion, ...]:
     """Return Path C fusion regions discovered from a model's brick graph."""
 
     bricks = _path_c_bricks_from_model(model)
-    shape_env = _path_c_model_shape_env_from_model(model)
+    shape_env = _path_c_model_shape_env_from_model(
+        model,
+        sequence_length=sequence_length,
+    )
     return build_path_c_model_regions_from_bricks(
         bricks,
         region_prefix=region_prefix or _path_c_region_prefix_for_model(model),
@@ -1083,13 +1088,60 @@ def _path_c_region_prefix_for_model(model: Any) -> str:
     return f"{safe or 'model'}_path_c"
 
 
-def _path_c_model_shape_env_from_model(model: Any) -> PathCModelShapeEnv | None:
+def _path_c_model_shape_env_from_model(
+    model: Any,
+    *,
+    sequence_length: int | None = None,
+) -> PathCModelShapeEnv | None:
     config = (
         getattr(model, "config", None)
         or getattr(model, "cfg", None)
         or getattr(model, "model_config", None)
     )
-    return _path_c_model_shape_env_from_config(config)
+    shape_env = _path_c_model_shape_env_from_config(config)
+    if shape_env is None:
+        return None
+    model_dtype = _path_c_model_value_dtype(model)
+    updates: dict[str, Any] = {}
+    if model_dtype is not None:
+        updates["model_value_dtype"] = model_dtype
+    if sequence_length is not None:
+        resolved_sequence_length = int(sequence_length)
+        if resolved_sequence_length <= 0:
+            raise ValueError("Path C sequence_length must be positive")
+        updates["sequence_length"] = resolved_sequence_length
+    if not updates:
+        return shape_env
+    return replace(shape_env, **updates)
+
+
+def _path_c_model_value_dtype(model: Any) -> str | None:
+    parameters = getattr(model, "parameters", None)
+    if not callable(parameters):
+        return None
+    try:
+        return _first_tensor_dtype_name(parameters())
+    except Exception:
+        return None
+
+
+def _first_tensor_dtype_name(value: Any) -> str | None:
+    dtype = getattr(value, "dtype", None)
+    shape = getattr(value, "shape", None)
+    if dtype is not None and shape is not None:
+        name = str(dtype).rsplit(".", 1)[-1]
+        return name if name else None
+    if isinstance(value, Mapping):
+        for item in value.values():
+            found = _first_tensor_dtype_name(item)
+            if found is not None:
+                return found
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            found = _first_tensor_dtype_name(item)
+            if found is not None:
+                return found
+    return None
 
 
 def _path_c_model_shape_env_from_config(config: Any | None) -> PathCModelShapeEnv | None:

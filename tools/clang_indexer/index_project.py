@@ -48,8 +48,10 @@ if str(_REPO_ROOT) not in sys.path:
 from cppmega_mlx.data.nanochat_pipeline.language_info import detect_language_info
 from cppmega_mlx.data.nanochat_pipeline.build_context import (
     detect_build_context,
+    find_compile_commands_file,
     load_compile_commands_file,
 )
+from scripts.nanochat_data.memory_guard import check_memory_limit, start_memory_guard
 
 if TYPE_CHECKING:
     import clang.cindex as clang_cindex  # pyright: ignore[reportMissingImports]
@@ -247,18 +249,6 @@ def _configure_libclang(libclang_path: str | None = None) -> str | None:
         raise RuntimeError(f"{message} Last error: {last_error}") from last_error
     raise RuntimeError(message)
 
-# tree-sitter for AST metadata extraction (ast_depth, sibling_index, ast_node_type)
-_HAS_TREE_SITTER = False
-_TS_LANG = None
-try:
-    _ts = importlib.import_module("tree_sitter")
-    _ts_cpp = importlib.import_module("tree_sitter_cpp")
-    _TS_LANG = _ts.Language(_ts_cpp.language())
-    _HAS_TREE_SITTER = True
-except ImportError:
-    pass
-
-
 PartInfo: TypeAlias = tuple[str, int, int, str, str | None]
 
 
@@ -279,11 +269,14 @@ SYSTEM_PREFIXES = (
 class FunctionDef:
     """A function definition with its source location and call references."""
     __slots__ = ['name', 'qualified_name', 'file', 'line', 'end_line', 'text',
-                 'callees', 'dep_level', 'is_definition']
+                 'callees', 'dep_level', 'is_definition', 'ast_depth',
+                 'sibling_index', 'ast_node_type']
 
     def __init__(self, name: str, qualified_name: str, file: str, line: int,
                  text: str, callees: list, is_definition: bool = True,
-                 end_line: int = 0):
+                 end_line: int = 0, ast_depth: list[int] | None = None,
+                 sibling_index: list[int] | None = None,
+                 ast_node_type: list[int] | None = None):
         self.name = name
         self.qualified_name = qualified_name
         self.file = file
@@ -293,6 +286,9 @@ class FunctionDef:
         self.callees = callees  # list of qualified names called
         self.dep_level = 0
         self.is_definition = is_definition
+        self.ast_depth = list(ast_depth or [])
+        self.sibling_index = list(sibling_index or [])
+        self.ast_node_type = list(ast_node_type or [])
 
     def to_dict(self) -> dict:
         """Serialize for multiprocessing IPC."""
@@ -300,6 +296,10 @@ class FunctionDef:
             'name': self.name, 'qualified_name': self.qualified_name,
             'file': self.file, 'line': self.line, 'text': self.text,
             'callees': self.callees, 'is_definition': self.is_definition,
+            'end_line': self.end_line,
+            'ast_depth': self.ast_depth,
+            'sibling_index': self.sibling_index,
+            'ast_node_type': self.ast_node_type,
         }
 
     @classmethod
@@ -459,6 +459,210 @@ def get_function_text(cursor: Cursor, tu: TranslationUnit) -> str:
     return ""
 
 
+def _byte_to_char_mapper(source: str) -> Callable[[int], int]:
+    source_bytes = source.encode("utf-8", errors="replace")
+    byte_len = len(source_bytes)
+    if byte_len == len(source):
+        return lambda byte_offset: max(0, min(byte_offset, len(source)))
+
+    byte_to_char = [0] * (byte_len + 1)
+    byte_offset = 0
+    for char_idx, ch in enumerate(source):
+        ch_len = len(ch.encode("utf-8", errors="replace"))
+        for inner in range(ch_len):
+            if byte_offset + inner < byte_len:
+                byte_to_char[byte_offset + inner] = char_idx
+        byte_offset += ch_len
+    byte_to_char[byte_len] = len(source)
+
+    def _map(byte_offset: int) -> int:
+        if byte_offset <= 0:
+            return 0
+        if byte_offset >= byte_len:
+            return len(source)
+        return byte_to_char[byte_offset]
+
+    return _map
+
+
+def _cursor_extent_offsets(
+    cursor: Cursor,
+    filename: str,
+    byte_to_char: Callable[[int], int],
+) -> tuple[int, int] | None:
+    extent = cursor.extent
+    start = extent.start
+    end = extent.end
+    start_file = start.file.name if start.file else None
+    end_file = end.file.name if end.file else None
+    normalized_filename = os.path.normcase(os.path.normpath(filename))
+    if (
+        start_file is None
+        or end_file is None
+        or os.path.normcase(os.path.normpath(start_file)) != normalized_filename
+        or os.path.normcase(os.path.normpath(end_file)) != normalized_filename
+    ):
+        return None
+    char_start = byte_to_char(int(start.offset))
+    char_end = byte_to_char(int(end.offset))
+    if char_start >= char_end:
+        return None
+    return char_start, char_end
+
+
+_CLANG_CURSOR_BUCKETS = {
+    # 1-9: declarations
+    "FUNCTION_DECL": 1,
+    "CXX_METHOD": 1,
+    "CONSTRUCTOR": 1,
+    "DESTRUCTOR": 1,
+    "CONVERSION_FUNCTION": 1,
+    "FUNCTION_TEMPLATE": 1,
+    "CLASS_DECL": 2,
+    "CLASS_TEMPLATE": 2,
+    "CLASS_TEMPLATE_PARTIAL_SPECIALIZATION": 2,
+    "STRUCT_DECL": 3,
+    "UNION_DECL": 3,
+    "ENUM_DECL": 4,
+    "NAMESPACE": 5,
+    "VAR_DECL": 6,
+    "PARM_DECL": 6,
+    "FIELD_DECL": 7,
+    "TYPEDEF_DECL": 9,
+    "TYPE_ALIAS_DECL": 9,
+    "USING_DECLARATION": 9,
+    "USING_DIRECTIVE": 9,
+    # 10-19: statements
+    "COMPOUND_STMT": 10,
+    "IF_STMT": 11,
+    "FOR_STMT": 12,
+    "WHILE_STMT": 13,
+    "DO_STMT": 13,
+    "RETURN_STMT": 14,
+    "SWITCH_STMT": 15,
+    "CASE_STMT": 15,
+    "DEFAULT_STMT": 15,
+    "TRY_STMT": 17,
+    "CXX_CATCH_STMT": 17,
+    "CXX_THROW_EXPR": 17,
+    "BREAK_STMT": 18,
+    "CONTINUE_STMT": 18,
+    "GOTO_STMT": 18,
+    "LABEL_STMT": 19,
+    # 20-29: expressions
+    "CALL_EXPR": 20,
+    "BINARY_OPERATOR": 21,
+    "COMPOUND_ASSIGNMENT_OPERATOR": 23,
+    "UNARY_OPERATOR": 22,
+    "CONDITIONAL_OPERATOR": 24,
+    "MEMBER_REF_EXPR": 25,
+    "ARRAY_SUBSCRIPT_EXPR": 26,
+    "CSTYLE_CAST_EXPR": 27,
+    "CXX_STATIC_CAST_EXPR": 27,
+    "CXX_DYNAMIC_CAST_EXPR": 27,
+    "CXX_REINTERPRET_CAST_EXPR": 27,
+    "CXX_CONST_CAST_EXPR": 27,
+    "CXX_NEW_EXPR": 28,
+    "CXX_DELETE_EXPR": 28,
+    "LAMBDA_EXPR": 29,
+    "PAREN_EXPR": 29,
+    # 30-39: type and reference nodes
+    "TYPE_REF": 30,
+    "TEMPLATE_REF": 32,
+    "NAMESPACE_REF": 33,
+    "DECL_REF_EXPR": 83,
+    "OVERLOADED_DECL_REF": 83,
+    "MEMBER_REF": 83,
+    # 40-49: literals
+    "INTEGER_LITERAL": 40,
+    "FLOATING_LITERAL": 40,
+    "IMAGINARY_LITERAL": 40,
+    "STRING_LITERAL": 41,
+    "CHARACTER_LITERAL": 42,
+    "CXX_BOOL_LITERAL_EXPR": 43,
+    "CXX_NULL_PTR_LITERAL_EXPR": 44,
+    # 80-89: misc/preprocessor
+    "INCLUSION_DIRECTIVE": 81,
+    "MACRO_DEFINITION": 81,
+    "MACRO_INSTANTIATION": 81,
+    "TRANSLATION_UNIT": 82,
+}
+
+
+def _bucket_clang_cursor_kind(kind) -> int:
+    name = getattr(kind, "name", str(kind))
+    if "." in name:
+        name = name.rsplit(".", 1)[-1]
+    return _CLANG_CURSOR_BUCKETS.get(name, 255)
+
+
+def extract_clang_ast_metadata(
+    source: str,
+    tu: TranslationUnit,
+    filename: str,
+) -> tuple[list[int], list[int], list[int]]:
+    """Extract per-character AST metadata from clang cursor extents."""
+    text_len = len(source)
+    ast_depth = [0] * text_len
+    sibling_index = [0] * text_len
+    ast_node_type = [0] * text_len
+    if text_len == 0 or tu is None:
+        return ast_depth, sibling_index, ast_node_type
+
+    byte_to_char = _byte_to_char_mapper(source)
+    stack: list[tuple[Cursor, int, int]] = [(tu.cursor, 0, 0)]
+    while stack:
+        cursor, depth, sib_idx = stack.pop()
+        offsets = _cursor_extent_offsets(cursor, filename, byte_to_char)
+        if offsets is not None:
+            start, end = offsets
+            end = min(end, text_len)
+            bucket = _bucket_clang_cursor_kind(cursor.kind)
+            clamped_depth = min(depth, 65535)
+            clamped_sib = min(sib_idx, 65535)
+            for char_idx in range(start, end):
+                ast_depth[char_idx] = clamped_depth
+                sibling_index[char_idx] = clamped_sib
+                ast_node_type[char_idx] = bucket
+
+        children = list(cursor.get_children())
+        child_depth = depth + 1
+        for child_sib in range(len(children) - 1, -1, -1):
+            stack.append((children[child_sib], child_depth, child_sib))
+
+    return ast_depth, sibling_index, ast_node_type
+
+
+def _slice_metadata(values: list[int], start: int, end: int) -> list[int]:
+    if not values:
+        return []
+    return list(values[start:end])
+
+
+def _cursor_text_and_metadata(
+    cursor: Cursor,
+    source: str,
+    filename: str,
+    byte_to_char: Callable[[int], int],
+    ast_depth: list[int],
+    sibling_index: list[int],
+    ast_node_type: list[int],
+) -> tuple[str, list[int], list[int], list[int], tuple[int, int] | None]:
+    offsets = _cursor_extent_offsets(cursor, filename, byte_to_char)
+    if offsets is None:
+        return "", [], [], [], None
+    start, end = offsets
+    if start < 0 or end > len(source) or start >= end:
+        return "", [], [], [], None
+    return (
+        source[start:end],
+        _slice_metadata(ast_depth, start, end),
+        _slice_metadata(sibling_index, start, end),
+        _slice_metadata(ast_node_type, start, end),
+        offsets,
+    )
+
+
 def extract_callees(cursor: Cursor) -> list[str]:
     """Extract all function call references from a cursor's children."""
     callees = set()
@@ -534,6 +738,11 @@ def parse_translation_unit(
 ) -> list[FunctionDef]:
     """Parse a single C++ file and extract function definitions with callees."""
     functions: list[FunctionDef] = []
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="replace") as source_file:
+            source = source_file.read()
+    except OSError:
+        return functions
 
     try:
         tu = index.parse(
@@ -549,6 +758,12 @@ def parse_translation_unit(
         return functions
 
     rel_path = os.path.relpath(filepath, project_dir)
+    ast_depth, sibling_index, ast_node_type = extract_clang_ast_metadata(
+        source,
+        tu,
+        filepath,
+    )
+    byte_to_char = _byte_to_char_mapper(source)
 
     def visit(cursor):
         """Recursively visit cursors, descending into namespaces and classes."""
@@ -558,7 +773,17 @@ def parse_translation_unit(
             return
 
         if cursor.kind in FUNCTION_KINDS and cursor.is_definition():
-            text = get_function_text(cursor, tu)
+            text, func_ast_depth, func_sibling_index, func_ast_node_type, _offsets = (
+                _cursor_text_and_metadata(
+                    cursor,
+                    source,
+                    filepath,
+                    byte_to_char,
+                    ast_depth,
+                    sibling_index,
+                    ast_node_type,
+                )
+            )
             if text and len(text) >= 20:
                 callees = extract_callees(cursor)
                 qname = get_qualified_name(cursor)
@@ -570,6 +795,10 @@ def parse_translation_unit(
                     text=text,
                     callees=callees,
                     is_definition=True,
+                    end_line=cursor.extent.end.line,
+                    ast_depth=func_ast_depth,
+                    sibling_index=func_sibling_index,
+                    ast_node_type=func_ast_node_type,
                 ))
 
         elif cursor.kind in CONTAINER_KINDS:
@@ -587,7 +816,7 @@ _DEFAULT_SKIP_DIRS = frozenset({
     '.git', 'build', 'cmake-build', '__pycache__', 'node_modules',
     '.vs', '.vscode', 'third_party', 'external', 'deps', 'vendor',
     'test', 'tests', 'unittests', 'benchmarks',
-    # Align with Rust cpp-chunker skip list
+        # Keep generated/noisy corpus paths out of clang indexing.
     'testing', 'examples', 'example', 'samples', 'sample', 'docs', 'doc',
     # Additional noise dirs for large repos
     'fuzzers', 'fuzzing', 'regression', 'fixtures',
@@ -622,7 +851,9 @@ def find_cpp_files(
 
 def load_compile_commands(project_dir: str) -> Optional[dict]:
     """Load compile_commands.json if available."""
-    cc_path = os.path.join(project_dir, 'compile_commands.json')
+    cc_path = find_compile_commands_file(project_dir)
+    if cc_path is None:
+        return None
     compile_index = load_compile_commands_file(cc_path)
     if compile_index is None:
         return None
@@ -752,185 +983,60 @@ def collect_transitive_deps(
     return deps
 
 
-def bucket_node_type(kind: str) -> int:
-    """Map a tree-sitter node type string to a bucket in 0-255.
+_CLANG_PART_NODE_BUCKETS = {
+    0: 0,   # other
+    1: 81,  # preamble / preprocessor context
+    2: 35,  # function signature/declarator
+    3: 1,   # function body/definition
+    4: 2,   # class or struct declaration
+    5: 7,   # class member
+    6: 80,  # comment/docstring
+    7: 9,   # typedef/using
+    8: 5,   # namespace
+}
 
-    Matches the Rust ``bucket_node_type`` in cpp_chunker/enriched.rs and
-    v4_context_graph/enriched.rs so that the Python clang_indexer produces
-    identical node-type buckets.
 
-    Buckets:
-      0: unknown/unnamed
-      1-9: declarations
-      10-19: statements
-      20-29: expressions
-      30-39: types
-      40-49: literals
-      50-59: operators and punctuation
-      60-69: parameters and arguments
-      70-79: access and scope
-      80-89: miscellaneous
-      255: catch-all for unrecognised named nodes
+def extract_ast_metadata_from_parts(
+    full_text: str,
+    parts_info: list[PartInfo],
+    index: ProjectIndex | None = None,
+) -> tuple[list[int], list[int], list[int]]:
+    """Emit clang AST metadata for assembled documents.
+
+    The clang indexer builds documents from clang-extracted parts rather than
+    reparsing the assembled training text. For function parts this copies the
+    exact clang cursor metadata captured while parsing the original translation
+    unit. Non-code scaffolding such as section comments and separators stays
+    zero because it is not part of the clang AST.
     """
-    _MAP: dict[str, int] = {
-        # 0: unknown
-        "": 0,
-        # 1-9: declarations
-        "function_definition": 1,
-        "class_specifier": 2,
-        "struct_specifier": 3,
-        "enum_specifier": 4,
-        "namespace_definition": 5,
-        "declaration": 6,
-        "field_declaration": 7,
-        "template_declaration": 8,
-        "alias_declaration": 9, "type_definition": 9, "using_declaration": 9,
-        # 10-19: statements
-        "compound_statement": 10,
-        "if_statement": 11,
-        "for_statement": 12, "for_range_loop": 12,
-        "while_statement": 13, "do_statement": 13,
-        "return_statement": 14,
-        "switch_statement": 15, "case_statement": 15,
-        "expression_statement": 16,
-        "try_statement": 17, "catch_clause": 17, "throw_statement": 17,
-        "break_statement": 18, "continue_statement": 18, "goto_statement": 18,
-        "labeled_statement": 19,
-        # 20-29: expressions
-        "call_expression": 20,
-        "binary_expression": 21,
-        "unary_expression": 22,
-        "assignment_expression": 23, "augmented_assignment_expression": 23,
-        "conditional_expression": 24,
-        "field_expression": 25,
-        "subscript_expression": 26,
-        "cast_expression": 27, "static_cast_expression": 27,
-        "dynamic_cast_expression": 27, "reinterpret_cast_expression": 27,
-        "const_cast_expression": 27,
-        "new_expression": 28, "delete_expression": 28,
-        "lambda_expression": 29, "parenthesized_expression": 29,
-        # 30-39: types
-        "type_identifier": 30,
-        "primitive_type": 31, "sized_type_specifier": 31,
-        "template_type": 32, "template_argument_list": 32,
-        "qualified_identifier": 33, "scoped_identifier": 33,
-        "scoped_type_identifier": 33,
-        "pointer_declarator": 34, "reference_declarator": 34,
-        "abstract_pointer_declarator": 34, "abstract_reference_declarator": 34,
-        "function_declarator": 35, "abstract_function_declarator": 35,
-        "array_declarator": 36, "abstract_array_declarator": 36,
-        "auto": 37, "decltype": 37,
-        # 40-49: literals
-        "number_literal": 40,
-        "string_literal": 41, "raw_string_literal": 41, "string_content": 41,
-        "char_literal": 42,
-        "true": 43, "false": 43,
-        "null": 44, "nullptr": 44,
-        "user_defined_literal": 45,
-        "concatenated_string": 46,
-        # 50-59: operators and punctuation
-        ",": 50, ";": 50, ":": 50, "::": 50,
-        "{": 51, "}": 51,
-        "(": 52, ")": 52,
-        "[": 53, "]": 53,
-        "<": 54, ">": 54, "<=": 54, ">=": 54, "==": 54, "!=": 54,
-        "+": 55, "-": 55, "*": 55, "/": 55, "%": 55,
-        "&": 56, "|": 56, "^": 56, "~": 56, "!": 56,
-        "=": 57, "+=": 57, "-=": 57, "*=": 57, "/=": 57,
-        "%=": 57, "&=": 57, "|=": 57, "^=": 57, "<<=": 57, ">>=": 57,
-        "&&": 58, "||": 58,
-        "->": 59, ".": 59, "->*": 59, ".*": 59,
-        # 60-69: parameters and arguments
-        "parameter_declaration": 60, "optional_parameter_declaration": 60,
-        "variadic_parameter_declaration": 60,
-        "parameter_list": 61,
-        "argument_list": 62, "initializer_list": 62,
-        "init_declarator": 63,
-        # 70-79: access and scope
-        "access_specifier": 70,
-        "base_class_clause": 71,
-        "field_initializer_list": 72, "field_initializer": 72,
-        "namespace_identifier": 73,
-        # 80-89: miscellaneous
-        "comment": 80,
-        "preproc_include": 81, "preproc_def": 81, "preproc_ifdef": 81,
-        "preproc_ifndef": 81, "preproc_if": 81, "preproc_else": 81,
-        "preproc_elif": 81, "preproc_call": 81, "preproc_function_def": 81,
-        "translation_unit": 82,
-        "identifier": 83,
-        "ERROR": 84,
-    }
-    return _MAP.get(kind, 255)
+    text_len = len(full_text)
+    ast_depth = [0] * text_len
+    sibling_index = [0] * text_len
+    ast_node_type = [0] * text_len
+    offset = 0
 
+    for part_index, (part_text, kind, dep_level, _name, _qname) in enumerate(parts_info):
+        part_len = len(part_text)
+        if part_len <= 0:
+            continue
+        end = min(offset + part_len, text_len)
+        if offset >= text_len or offset >= end:
+            break
+        func = index.functions.get(_qname) if index is not None and _qname else None
+        if (
+            func is not None
+            and len(func.ast_depth) == part_len
+            and len(func.sibling_index) == part_len
+            and len(func.ast_node_type) == part_len
+        ):
+            ast_depth[offset:end] = func.ast_depth[: end - offset]
+            sibling_index[offset:end] = func.sibling_index[: end - offset]
+            ast_node_type[offset:end] = func.ast_node_type[: end - offset]
+        offset += part_len
+        if part_index < len(parts_info) - 1:
+            offset += 2
 
-def extract_ast_metadata(source: str) -> tuple[list[int], list[int], list[int]]:
-    """Extract per-character AST metadata using tree-sitter.
-
-    Returns ``(ast_depth, sibling_index, ast_node_type)`` each of length
-    ``len(source)``.  Values match the Rust ``extract_ast_metadata`` in the
-    cpp_chunker and v4_context_graph tools.
-
-    If tree-sitter is not available, returns zero-filled arrays (graceful
-    degradation).
-    """
-    text_len = len(source)
-    if text_len == 0 or not _HAS_TREE_SITTER:
-        return ([0] * text_len, [0] * text_len, [0] * text_len)
-
-    source_bytes = source.encode("utf-8")
-    byte_len = len(source_bytes)
-
-    # Byte-indexed arrays
-    b_depth = [0] * byte_len
-    b_sib = [0] * byte_len
-    b_ntype = [0] * byte_len
-
-    parser = _ts.Parser(_TS_LANG)
-    tree = parser.parse(source_bytes)
-    if tree is None:
-        return ([0] * text_len, [0] * text_len, [0] * text_len)
-
-    # Iterative DFS (pre-order) — parents paint first, children overwrite.
-    # Stack entries: (node, depth, sibling_idx)
-    root = tree.root_node
-    stack: list[tuple] = [(root, 0, 0)]
-
-    while stack:
-        node, depth, sib_idx = stack.pop()
-        start = node.start_byte
-        end = min(node.end_byte, byte_len)
-
-        if start < end:
-            bucket = bucket_node_type(node.type)
-            for bi in range(start, end):
-                b_depth[bi] = depth
-                b_sib[bi] = sib_idx
-                b_ntype[bi] = bucket
-
-        # Push children in reverse order so first child pops first
-        child_depth = min(depth + 1, 63)
-        children = node.children
-        for i in range(len(children) - 1, -1, -1):
-            child_sib = min(i, 63)
-            stack.append((children[i], child_depth, child_sib))
-
-    # Convert byte-indexed to char-indexed.
-    # For pure ASCII (typical C++ code), byte len == char len.
-    if byte_len == text_len:
-        return (b_depth, b_sib, b_ntype)
-
-    # Non-ASCII: map byte positions to char positions
-    c_depth = [0] * text_len
-    c_sib = [0] * text_len
-    c_ntype = [0] * text_len
-    byte_offset = 0
-    for char_idx, ch in enumerate(source):
-        if byte_offset < byte_len:
-            c_depth[char_idx] = b_depth[byte_offset]
-            c_sib[char_idx] = b_sib[byte_offset]
-            c_ntype[char_idx] = b_ntype[byte_offset]
-        byte_offset += len(ch.encode("utf-8"))
-    return (c_depth, c_sib, c_ntype)
+    return ast_depth, sibling_index, ast_node_type
 
 
 # -------------------------------------------------------------------------
@@ -1282,8 +1388,11 @@ def build_enriched_doc(
     # type_edges: empty for now (clang_indexer focuses on functions, not types)
     type_edges: list[dict[str, object]] = []
 
-    # Extract per-character AST metadata via tree-sitter
-    ast_depth, sibling_index, ast_node_type = extract_ast_metadata(full_text)
+    ast_depth, sibling_index, ast_node_type = extract_ast_metadata_from_parts(
+        full_text,
+        parts_info,
+        index,
+    )
 
     # v4 enrichment: per-file platform detection
     import sys as _sys
@@ -1525,6 +1634,7 @@ def process_project(
     parse_workers: int = 1,
     enriched: bool = False,
     extra_exclude_dirs: set[str] | None = None,
+    memory_limit_gb: float = 10.0,
 ) -> list:
     """Process a single project: parse all files, build index, generate docs."""
     project_dir = os.path.abspath(project_dir)
@@ -1574,6 +1684,7 @@ def process_project(
                         index_obj.add_function(FunctionDef.from_dict(d))
                     total_parsed += parsed_count
                     total_errors += error_count
+                    check_memory_limit(memory_limit_gb, label="index_project")
                     print(f"  Parsed {total_parsed}/{len(cpp_files)} files, "
                           f"{len(index_obj.functions)} functions", file=sys.stderr)
 
@@ -1610,6 +1721,7 @@ def process_project(
                 if errors <= 5:
                     print(f"  ERROR parsing {filepath}: {e}", file=sys.stderr)
             if parsed % 500 == 0 and parsed > 0:
+                check_memory_limit(memory_limit_gb, label="index_project")
                 print(f"  Parsed {parsed}/{len(cpp_files)} files, "
                       f"{len(index_obj.functions)} functions", file=sys.stderr)
         print(f"  Parsed {parsed} files ({errors} errors), "
@@ -1626,6 +1738,7 @@ def process_project(
         default_args=default_args,
         default_build_info=default_build_info,
     )
+    check_memory_limit(memory_limit_gb, label="index_project")
     print(f"  Generated {len(documents)} training documents", file=sys.stderr)
 
     stats = index_obj.stats()
@@ -1662,8 +1775,11 @@ def main() -> int:
                              'call_edges, type_edges alongside text')
     parser.add_argument('--exclude-dirs', type=str, default=None,
                         help='Comma-separated extra directory names to exclude from file discovery')
+    parser.add_argument('--memory-limit-gb', type=float, default=10.0,
+                        help='Abort if this Python wrapper exceeds this max RSS in GiB (default: 10)')
 
     args = parser.parse_args()
+    start_memory_guard(args.memory_limit_gb, label="index_project")
 
     try:
         _configure_libclang(args.libclang_path)
@@ -1689,6 +1805,7 @@ def main() -> int:
     print(f"Processing {len(project_dirs)} project(s)", file=sys.stderr)
     print(f"Output: {args.output}", file=sys.stderr)
     print(f"Max tokens: {args.max_tokens}", file=sys.stderr)
+    print(f"Memory limit: {args.memory_limit_gb} GiB", file=sys.stderr)
 
     extra_exclude = set(args.exclude_dirs.split(',')) if args.exclude_dirs else None
 
@@ -1704,7 +1821,8 @@ def main() -> int:
                 futures = {
                     executor.submit(
                         process_project, pd, args.max_tokens, args.max_dep_depth,
-                        args.parse_workers, enriched, extra_exclude
+                        args.parse_workers, enriched, extra_exclude,
+                        args.memory_limit_gb,
                     ): pd
                     for pd in project_dirs
                 }
@@ -1734,7 +1852,8 @@ def main() -> int:
             for pd in project_dirs:
                 try:
                     docs = process_project(pd, args.max_tokens, args.max_dep_depth,
-                                           args.parse_workers, enriched, extra_exclude)
+                                           args.parse_workers, enriched, extra_exclude,
+                                           args.memory_limit_gb)
                     for doc in docs:
                         if enriched:
                             doc_text = doc['text']

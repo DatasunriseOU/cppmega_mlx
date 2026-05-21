@@ -1,10 +1,10 @@
-"""Extract git commit history as raw JSONL for the Rust cpp-chunker commit mode.
+"""Extract git commit history as raw JSONL for clang commit enrichment.
 
 Extracts per-file commit diffs from git repos and outputs JSONL with:
   {old_content, new_content, diff, subject, body, filepath, repo}
 
-The Rust cpp-chunker --commit-mode then processes these with tree-sitter to
-extract function/class chains and produce training documents.
+The clang commit processor consumes these records, parses old/new source with
+libclang, and produces enriched training documents.
 
 Usage:
     # Extract raw commit data
@@ -13,9 +13,10 @@ Usage:
         --output /mnt/nvme/nanochat_data/opencv_commits.jsonl \
         --max_commits 50000
 
-    # Process with Rust tool
-    ./cpp-chunker --commit-mode --inputs opencv_commits.jsonl \
-        --output opencv_training.jsonl --max-tokens 16384
+    # Process with clang wrapper
+    python3 tools/clang_indexer/process_commits.py \
+        --inputs opencv_commits.jsonl \
+        --output opencv_training.jsonl --max-tokens 4096 --format both
 """
 
 import argparse
@@ -23,9 +24,16 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Optional, TypedDict
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from scripts.nanochat_data.memory_guard import check_memory_limit, start_memory_guard
 
 class _ExtractionStats(TypedDict):
     repo: str
@@ -231,6 +239,7 @@ def process_repo(
     output_file,
     max_commits: int = 0,
     repo_name: str = "",
+    memory_limit_gb: float = 10.0,
 ) -> _ExtractionStats:
     if not repo_name:
         repo_name = Path(repo_path).name
@@ -261,6 +270,7 @@ def process_repo(
 
     for i, commit_hash in enumerate(commits):
         if i > 0 and i % 1000 == 0:
+            check_memory_limit(memory_limit_gb, label="extract_git_history")
             print(
                 f"  [{repo_name}] Processed {i:,}/{len(commits):,} commits, "
                 f"{stats['records_written']:,} records"
@@ -301,6 +311,7 @@ def process_repo(
                 "body": commit_info["body"],
                 "filepath": fd["filepath"],
                 "repo": repo_name,
+                "repo_path": os.path.abspath(repo_path),
                 "commit_hash": commit_info["hash"],
                 "timestamp": commit_info["timestamp"],
                 "parent_hashes": list(commit_info["parent_hashes"]),
@@ -324,7 +335,7 @@ def process_repo(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Extract raw git commit data as JSONL for cpp-chunker --commit-mode"
+        description="Extract raw git commit data as JSONL for clang commit enrichment"
     )
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--repo", help="Path to a single git repository")
@@ -333,7 +344,14 @@ def main():
     parser.add_argument(
         "--max_commits", type=int, default=0, help="Max commits per repo (0 = all)"
     )
+    parser.add_argument(
+        "--memory-limit-gb",
+        type=float,
+        default=10.0,
+        help="Abort if this Python wrapper exceeds this max RSS in GiB (default: 10).",
+    )
     args = parser.parse_args()
+    start_memory_guard(args.memory_limit_gb, label="extract_git_history")
 
     repos = []
     if args.repo:
@@ -346,6 +364,7 @@ def main():
 
     print(f"Found {len(repos)} repositories")
     print(f"Max commits per repo: {args.max_commits or 'all'}")
+    print(f"Memory limit: {args.memory_limit_gb} GiB")
     print(f"Output: {args.output}")
     print()
 
@@ -360,7 +379,13 @@ def main():
             print(f"[{i + 1}/{len(repos)}] {repo_name}...")
 
             try:
-                stats = process_repo(repo_path, f, args.max_commits, repo_name)
+                stats = process_repo(
+                    repo_path,
+                    f,
+                    args.max_commits,
+                    repo_name,
+                    args.memory_limit_gb,
+                )
                 total_records += stats["records_written"]
                 print(f"  [{repo_name}] {stats['records_written']:,} records")
             except Exception as e:

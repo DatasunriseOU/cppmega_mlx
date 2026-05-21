@@ -218,7 +218,7 @@
 <body>
     <header>
         <h1>cppmega Reports</h1>
-        <p>Training matrix and profiling artifacts generated from the 2026-05-17 through 2026-05-20 Path B/C investigation.</p>
+        <p>Training matrix and profiling artifacts generated from the 2026-05-17 through 2026-05-21 Path B/C investigation.</p>
     </header>
     <main>
         <section>
@@ -228,15 +228,17 @@
             </div>
             <div class="body">
                 <div class="grid">
-                    <div class="metric"><span>Current 2026-05-20 full Path C backward matrix</span><strong><a
-                                href="cppmega_1b_path_matrix_20260520_full_path_c_bwd.html">Full-C 2026-05-20
+                    <div class="metric"><span>Current 2026-05-21 full Path C backward matrix</span><strong><a
+                                href="cppmega_1b_path_matrix_20260521_full_path_c_bwd.html">Full-C 2026-05-21
                                 HTML</a></strong>
                         <p>Fresh 42/42 1B cells: bf16/fp8 x 7 optimizers x Path B/Path C cold/Path C warm with
-                            <code>--mamba3-bwd path_c</code>. This report separates speed-only Path C rows from
-                            default promotion because the fused train block is not yet used by runtime.</p>
-                        <p><a href="cppmega_1b_path_matrix_20260520_full_path_c_bwd.json">JSON</a> ·
-                            <a href="cppmega_1b_path_matrix_20260520_full_path_c_bwd.csv">CSV</a> ·
-                            <a href="cppmega_1b_path_matrix_20260520_full_path_c_bwd.md">Markdown</a></p>
+                            <code>--mamba3-bwd path_c</code>, after fixing Path C capture retention and rerunning the
+                            FP8 Path C cells with an explicit 65 GiB MLX cap. All rows pass; no MLX peak exceeds
+                            65 GiB. This report separates speed-only Path C rows from default promotion because the
+                            fused train block is not yet used by runtime.</p>
+                        <p><a href="cppmega_1b_path_matrix_20260521_full_path_c_bwd.json">JSON</a> ·
+                            <a href="cppmega_1b_path_matrix_20260521_full_path_c_bwd.csv">CSV</a> ·
+                            <a href="cppmega_1b_path_matrix_20260521_full_path_c_bwd.md">Markdown</a></p>
                     </div>
                     <div class="metric"><span>Default fused schedule compile receipt</span><strong><a
                                 href="path_c_fusion_compile_receipt.json">Compile Receipt
@@ -266,11 +268,12 @@
                             segments covering the full fwd+bwd region and each segment at or below 31 buffers; all
                             4 segments also native-compile to TileLang <code>JITKernel</code>. Binding the segment
                             artifacts and direct buffers now proves standalone dispatch only: the training route stays
-                            on <code>run_path_c_split_training_route</code> until an explicit
-                            <code>path_c_direct_fusion_training_runtime_v1</code> object provides callable forward,
-                            backward/vjp, and <code>value_and_grad</code> hooks on the m04 critical path. The current model-binding audit still blocks live execution because
-                            the chain needs 78 logical buffers: 28 model parameters/constants, 11 forward
-                            activation/prepared buffers, 34 backward gradients, and 5 runtime states. Bias-less
+                            on <code>run_path_c_split_training_route</code> unless the new opt-in
+                            <code>--use-path-c-direct-chain-runtime</code> path installs a
+                            <code>path_c_direct_fusion_training_runtime_v1</code> object with callable forward,
+                            backward/vjp, and <code>value_and_grad</code> hooks on the m04 critical path. The current model-binding audit requires
+                            83 logical buffers: 25 model parameters/constants, 18 forward
+                            activation/prepared buffers, 35 backward gradients, and 5 runtime states. Bias-less
                             attention blocks no longer declare nonexistent q/sparse_kv/out_proj bias buffers or
                             bias-gradient outputs in the model-derived ABI. The
                             model now exposes an opt-in zero-copy forward activation probe, a model-owned direct
@@ -307,19 +310,25 @@
                             <code>value_and_grad</code> implementation and a direct-chain value/grad contract that has
                             both <code>loss_cotangent_bridge_ready=true</code> and
                             <code>model_gradient_tree_ready=true</code>, without delegating to eager loss/grad. The
-                            runtime now reports that explicit blocker through
-                            <code>value_and_grad_contract.status=incomplete</code> instead of hiding it as a missing
-                            contract. A value-and-grad-capable runtime still needs
-                            <code>CompiledPretrainingStep.attach_path_c_training_runtime()</code> graph binding before it can
-                            count as critical path.
+                            runtime now rebuilds a batch-derived pre-step owner inside
+                            <code>value_and_grad</code>, and <code>CompiledPretrainingStep.attach_path_c_training_runtime()</code>
+                            can bind it as opt-in critical path evidence.
                             <code>install_path_c_direct_chain_training_runtime_for_model()</code> now attaches that runtime plus its logical
-                            owner/artifacts for explicit post-step profiling probes, and <code>--profile-path-c-direct-chain-runtime</code>
-                            executes the direct-chain sequence after the eager step without marking it as critical path. The chain still is not
-                            used for reported training speed because m04 training executes the split/eager route instead of
-                            dispatching the direct-chain segment sequence.</p>
+                            owner/artifacts for explicit post-step profiling probes, <code>--profile-path-c-direct-chain-runtime</code>
+                            executes the direct-chain sequence after the eager step without marking it as critical path, and
+                            <code>--use-path-c-direct-chain-runtime</code> installs the per-batch owner factory before the train loop.
+                            The existing 1B matrix predates that opt-in critical-path path, so it must be rerun before using this as
+                            reported training speed.</p>
                         <p><a href="path_c_fusion_compile_source.py">Generated TileLang source</a> ·
                             <a href="path_c_fusion_production_smoke_receipt.json">Production smoke receipt</a> ·
                             <a href="path_c_fusion_production_smoke_source.py">Production smoke source</a></p>
+                    </div>
+                    <div class="metric"><span>Path C fused train-block completion audit</span><strong><a
+                                href="path_c_fused_train_block_completion_audit_20260521.html">Completion Audit
+                                HTML</a></strong>
+                        <p>Prompt-to-artifact checklist for MaskAnalysis, production schedule body, real ABI,
+                            native compile, full 1B matrix, default gate, cache-key audit, and the remaining
+                            critical-path runtime blocker.</p>
                     </div>
                     <div class="metric"><span>Path C fused train-block goal audit</span><strong><a
                                 href="path_c_fusion_goal_audit_20260520.html">Goal Audit
@@ -450,10 +459,10 @@
             </div>
             <div class="body">
                 <div class="grid">
-                    <div class="metric"><span>2026-05-20 full-C cells</span><strong>42/42 passed</strong></div>
+                    <div class="metric"><span>2026-05-21 full-C cells</span><strong>42/42 passed</strong></div>
                     <div class="metric"><span>Fused compile receipt</span><strong>native ok, route validated, runtime off</strong></div>
-                    <div class="metric"><span>BF16 adam8bit Path B baseline</span><strong>1010.34 tok/s</strong></div>
-                    <div class="metric"><span>FP8 lion8bit Path B baseline</span><strong>1001.57 tok/s</strong></div>
+                    <div class="metric"><span>BF16 adam8bit Path B baseline</span><strong>1005.53 tok/s</strong></div>
+                    <div class="metric"><span>FP8 adamw Path C warm</span><strong>538.39 tok/s, 63.44 GiB peak</strong></div>
                 </div>
             </div>
         </section>

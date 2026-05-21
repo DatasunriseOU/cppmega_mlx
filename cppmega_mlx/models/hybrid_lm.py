@@ -119,11 +119,22 @@ class PathCActivationBufferCapture:
                 )
             for alias in aliases:
                 self.buffers[alias] = tensor
-        self.events.append(event)
+        self.events.append(_path_c_capture_event_metadata(event))
 
     def clear(self) -> None:
         self.buffers.clear()
         self.events.clear()
+
+
+def _path_c_capture_event_metadata(event: Mapping[str, Any]) -> Mapping[str, Any]:
+    metadata: dict[str, Any] = {}
+    for key, value in event.items():
+        if isinstance(value, mx.array):
+            metadata[f"{key}_shape"] = tuple(int(dim) for dim in value.shape)
+            metadata[f"{key}_dtype"] = str(value.dtype)
+        else:
+            metadata[key] = value
+    return metadata
 
 
 @dataclass(frozen=True)
@@ -965,6 +976,7 @@ class HybridTinyLM(nn.Module):
         *,
         include_backward: bool = False,
         min_route_bricks: int = 2,
+        sequence_length: int | None = None,
     ) -> tuple[PathCFusionRegion, ...]:
         """Return Path C fusion candidate regions derived from this model."""
 
@@ -979,6 +991,7 @@ class HybridTinyLM(nn.Module):
             ),
             include_backward=include_backward,
             min_route_bricks=min_route_bricks,
+            sequence_length=sequence_length,
         )
 
     def __call__(

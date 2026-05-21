@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Path C Fused Train-Block Completion Audit - 2026-05-21</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f8fb;
+      --panel: #fff;
+      --text: #17202a;
+      --muted: #667085;
+      --line: #d8dee8;
+      --good: #0f7a4f;
+      --bad: #b42318;
+      --warn: #93640f;
+      --info: #0b5cad;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.45;
+    }
+    header {
+      background: var(--panel);
+      border-bottom: 1px solid var(--line);
+      padding: 28px max(24px, calc((100vw - 1180px) / 2)) 22px;
+    }
+    main {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+    h1 { margin: 0 0 8px; font-size: 34px; line-height: 1.1; letter-spacing: 0; }
+    h2 { margin: 0; font-size: 19px; letter-spacing: 0; }
+    p { margin: 0; color: var(--muted); }
+    a { color: var(--info); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+    }
+    section {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      margin: 18px 0;
+      overflow: hidden;
+    }
+    .head {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: baseline;
+      padding: 16px 18px;
+      border-bottom: 1px solid var(--line);
+    }
+    .body { padding: 18px; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+      gap: 12px;
+    }
+    .metric {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fbfcfe;
+      padding: 14px;
+    }
+    .metric span { display: block; color: var(--muted); font-size: 12px; }
+    .metric strong { display: block; font-size: 20px; margin-top: 4px; }
+    .table-wrap { overflow-x: auto; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 980px;
+    }
+    th, td {
+      border-bottom: 1px solid var(--line);
+      padding: 10px 11px;
+      text-align: left;
+      vertical-align: top;
+      font-size: 13px;
+    }
+    thead th {
+      background: #f1f4f8;
+      color: #475467;
+      font-size: 12px;
+      text-transform: uppercase;
+    }
+    .status {
+      display: inline-block;
+      border-radius: 999px;
+      padding: 3px 8px;
+      font-size: 12px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+    .done { background: #e7f5ee; color: var(--good); }
+    .blocked { background: #fde8e5; color: var(--bad); }
+    .partial { background: #fff8e8; color: var(--warn); }
+    .note {
+      border-left: 4px solid var(--warn);
+      background: #fff8e8;
+      border-radius: 8px;
+      padding: 13px 14px;
+      color: #344054;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Path C Fused Train-Block Completion Audit</h1>
+    <p>Audit date: 2026-05-21. Scope: production fused Path C train-block readiness, not split/generated Path C surfaces.</p>
+  </header>
+  <main>
+    <section>
+      <div class="head">
+        <h2>Verdict</h2>
+        <p>Prompt-to-artifact check</p>
+      </div>
+      <div class="body">
+        <div class="grid">
+          <div class="metric"><span>Production compile receipt</span><strong>ok, runtime_ready</strong></div>
+          <div class="metric"><span>1B matrix rows</span><strong>42/42 ok</strong></div>
+          <div class="metric"><span>Matrix fused critical path</span><strong>not active</strong></div>
+          <div class="metric"><span>Pre-step direct-chain owner</span><strong>opt-in critical path wired</strong></div>
+          <div class="metric"><span>Default Path C</span><strong>blocked</strong></div>
+        </div>
+        <p class="note" style="margin-top:14px">
+          Current evidence proves a descriptor-generated production schedule can compile and smoke as a single-entry
+          TileLang IR artifact. A separate opt-in post-step probe can execute the direct-chain non-eager
+          <code>value_and_grad</code> bridge and return full-model gradients, but that remains separate profiling evidence.
+          A generic batch-derived pre-step owner now binds the 83-buffer direct-chain ABI and an opt-in
+          <code>--use-path-c-direct-chain-runtime</code> route installs a per-batch owner factory into
+          <code>CompiledPretrainingStep.value_and_grad</code>. The 2026-05-21 matrix predates that opt-in critical-path wiring and still reports
+          <code>runtime_uses_fused_train_block=false</code> for all rows.
+        </p>
+      </div>
+    </section>
+
+    <section>
+      <div class="head">
+        <h2>Checklist</h2>
+        <p>Every old blocker mapped to current evidence</p>
+      </div>
+      <div class="body table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Requirement</th>
+              <th>Status</th>
+              <th>Evidence</th>
+              <th>Remaining blocker</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Replace the vendored Triton <code>MaskAnalysis.cpp</code> assert with recoverable failure.</td>
+              <td><span class="status done">done</span></td>
+              <td><code>MaskState::parseCmp</code> now emits the unsupported unit-mask remark and returns <code>failure()</code>. Narrow test <code>test_ptr_analysis_unsupported_unit_mask_cmp_fails_recoverably</code> passes.</td>
+              <td>None for this failure mode.</td>
+            </tr>
+            <tr>
+              <td>Production fused schedule body for the model train block.</td>
+              <td><span class="status partial">compile-ready</span></td>
+              <td><code>mamba3_fp8_train_fusion_schedule_template()</code> delegates to a descriptor-generated target rather than raising <code>NotImplementedError</code>. <a href="path_c_fusion_compile_receipt.json">Compile receipt</a> reports <code>status=ok</code>, <code>single_kernel_fused=true</code>, <code>runtime_execution_contract.status=runtime_ready</code>.</td>
+              <td>The compiled artifact is not bound into the m04 train-step critical path.</td>
+            </tr>
+            <tr>
+              <td>Real ABI carried into the selected fused region.</td>
+              <td><span class="status done">done</span></td>
+              <td><a href="path_c_fusion_compile_receipt.json">Compile receipt</a> reports <code>schedule_contract.status=verified</code> and <code>missing_real_abi_inputs=[]</code>. The 2026-05-21 matrix also reports <code>real_abi_contract_complete=true</code>.</td>
+              <td>Runtime still lacks model-owned physical ABI banks for the single fused artifact.</td>
+            </tr>
+            <tr>
+              <td>Native TileLang/Triton compile crash from <code>MaskState::parseCmp</code>.</td>
+              <td><span class="status done">done for known repro</span></td>
+              <td>Recoverable test passes in the TileLang repo. Production compile receipt is <code>ok</code> and cache-key audit is <code>key_stable</code>.</td>
+              <td>Keep future distinct pointer-analysis aborts as separate minimal repros.</td>
+            </tr>
+            <tr>
+              <td>Full 1B matrix/profiling run.</td>
+              <td><span class="status partial">split-path matrix done</span></td>
+              <td><a href="cppmega_1b_path_matrix_20260521_full_path_c_bwd.html">2026-05-21 matrix</a> has <code>42/42 ok</code>, raw receipts for all cells, and no MLX peak above 65 GiB.</td>
+              <td>This matrix measures current split/generated Path C surfaces. It is not a fused train-block critical-path proof.</td>
+            </tr>
+            <tr>
+              <td>Path C may become default.</td>
+              <td><span class="status blocked">blocked</span></td>
+              <td>Matrix proof fields still show <code>runtime_uses_fused_train_block=false</code>. Current blockers include <code>selected_model_schedule_not_default</code>, <code>fused_train_block_runtime_not_bound</code>, and <code>production_1b_matrix_profile_missing</code>.</td>
+              <td>Run the new opt-in critical-path route on the 1B matrix/profiling gate, then compare against the clean Path B baseline before changing defaults.</td>
+            </tr>
+            <tr>
+              <td>Direct-chain training runtime can run before eager Path C.</td>
+              <td><span class="status partial">opt-in wired</span></td>
+              <td><code>make_path_c_direct_chain_pre_step_runtime_owner</code> builds the 83 required buffers from the dynamic chain ABI, including 25 model-owned parameters, 18 forward/prepared buffers, 5 runtime-state buffers, and 35 backward workspace buffers. <code>PathCDirectFusionChainTrainingRuntime.value_and_grad</code> now rebuilds that owner for each batch and the unit gate runs through <code>CompiledPretrainingStep</code> with <code>training_runtime_available=true</code>.</td>
+              <td>This is still opt-in and not default. The remaining proof is a fresh 1B matrix/profile using <code>--use-path-c-direct-chain-runtime</code>, not the older post-step probe.</td>
+            </tr>
+            <tr>
+              <td>Cache-key/recompile audit closed on production receipt.</td>
+              <td><span class="status done">done</span></td>
+              <td><a href="path_c_fusion_compile_receipt.json">Compile receipt</a> and <a href="path_c_fusion_production_smoke_receipt.json">production smoke receipt</a> report <code>cache_key_recompile_audit.status=key_stable</code>.</td>
+              <td>Default remains blocked by runtime binding, not cache-key instability.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <div class="head">
+        <h2>Next Required Work</h2>
+        <p>Critical path only</p>
+      </div>
+      <div class="body">
+        <p>
+          The next implementation target is measurement and default gating: run the opt-in direct-chain critical-path
+          route on the full 1B matrix/profile, verify clean Path B baselines, and only then decide whether the
+          direct-chain route is fast and stable enough to replace the split/generated Path C surfaces. The single
+          train-block fused artifact remains a separate schedule-body target.
+        </p>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

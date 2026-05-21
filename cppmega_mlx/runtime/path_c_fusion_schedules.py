@@ -932,7 +932,7 @@ def build_path_c_descriptor_prim_func(
         loop_policy=validated_loop_policy,
     )
     dtype_by_buffer = {
-        name: _buffer_dtype(name)
+        name: _buffer_dtype(name, shape_env=resolved_shape_env)
         for node in nodes
         for name in (*node.inputs, *node.outputs)
     }
@@ -1504,7 +1504,7 @@ def _direct_logical_buffer_shape(
     if canonical_name == "m2rnn_state_weight":
         return (
             shape_env.m2rnn_num_weight_heads,
-            shape_env.m2rnn_k_head_dim,
+            shape_env.m2rnn_v_head_dim,
             shape_env.m2rnn_v_head_dim,
         )
     if canonical_name == "m2rnn_D":
@@ -6477,7 +6477,7 @@ def _buffer_value_expr(
     index: str,
 ) -> str:
     ref = _buffer_ref(buffer_name, access_by_buffer, index)
-    if dtype == "int32":
+    if dtype in {"bfloat16", "float16", "int32"}:
         return f'T.cast({ref}, "float32")'
     if dtype == "uint8":
         return f"fp8_e4m3fn_to_float({ref})"
@@ -6500,7 +6500,7 @@ def _indexed_buffer_value_expr(
     index_expr: str,
 ) -> str:
     ref = _indexed_buffer_ref(buffer_name, access_by_buffer, index_expr)
-    if dtype == "int32":
+    if dtype in {"bfloat16", "float16", "int32"}:
         return f'T.cast({ref}, "float32")'
     if dtype == "uint8":
         return f"fp8_e4m3fn_to_float({ref})"
@@ -6678,16 +6678,29 @@ def _external_buffers_for_nodes(
     return tuple(external)
 
 
-def _buffer_dtype(buffer_name: str) -> str:
+def _buffer_dtype(
+    buffer_name: str,
+    *,
+    shape_env: PathCModelShapeEnv | None = None,
+) -> str:
     if str(buffer_name).endswith("_grad"):
         return "float32"
-    if _canonical_buffer_name(buffer_name) in {"q_fp8", "kv_fp8"}:
+    canonical = _canonical_buffer_name(buffer_name)
+    if canonical in {"q_fp8", "kv_fp8"}:
         return "uint8"
     if buffer_name == "indices" or buffer_name.endswith("_indices"):
         return "int32"
     if buffer_name.endswith("_has_sinks"):
         return "int32"
-    return "float32"
+    if canonical in {"q_scale", "kv_scale", "lse"} or buffer_name.endswith(
+        ("_scale", "_sm_scale", "_lse")
+    ):
+        return "float32"
+    return (
+        str(shape_env.model_value_dtype)
+        if shape_env is not None and str(shape_env.model_value_dtype)
+        else "float32"
+    )
 
 
 def _shape_env_for_region(region: Any) -> PathCModelShapeEnv | None:
@@ -7688,6 +7701,7 @@ def plan_path_c_direct_fusion_chain_for_region(
     *,
     include_backward: bool = True,
     max_kernel_buffers: int = DESCRIPTOR_PORTABLE_KERNEL_BUFFER_LIMIT,
+    max_segment_nodes: int | None = None,
     registry: PathCFusionScheduleRegistry | None = None,
 ) -> PathCFusionScheduleChainPlan:
     """Greedily split a Path C region into direct-buffer fused segments.
@@ -7702,6 +7716,8 @@ def plan_path_c_direct_fusion_chain_for_region(
         raise TypeError("region must be PathCFusionRegion")
     if max_kernel_buffers <= 0:
         raise ValueError("max_kernel_buffers must be positive")
+    if max_segment_nodes is not None and max_segment_nodes <= 0:
+        raise ValueError("max_segment_nodes must be positive when provided")
     working_region = (
         build_path_c_aot_autograd_region(region)
         if include_backward
@@ -7716,6 +7732,15 @@ def plan_path_c_direct_fusion_chain_for_region(
         best: PathCFusionScheduleChainSegment | None = None
         first_failure: str | None = None
         for end in range(start + 1, len(nodes) + 1):
+            if (
+                max_segment_nodes is not None
+                and end - start > max_segment_nodes
+            ):
+                first_failure = (
+                    f"direct-buffer segment reached max_segment_nodes="
+                    f"{max_segment_nodes}"
+                )
+                break
             candidate_region = _subregion_from_nodes(
                 working_region,
                 start=start,
@@ -7832,7 +7857,9 @@ def plan_path_c_direct_fusion_chains_for_model(
     include_backward: bool = True,
     min_route_bricks: int = 2,
     max_kernel_buffers: int = DESCRIPTOR_PORTABLE_KERNEL_BUFFER_LIMIT,
+    max_segment_nodes: int | None = None,
     registry: PathCFusionScheduleRegistry | None = None,
+    sequence_length: int | None = None,
 ) -> tuple[PathCFusionScheduleChainPlan, ...]:
     """Plan direct-buffer fused schedule chains for every supported model region.
 
@@ -7847,12 +7874,14 @@ def plan_path_c_direct_fusion_chains_for_model(
         region_prefix=region_prefix,
         include_backward=False,
         min_route_bricks=min_route_bricks,
+        sequence_length=sequence_length,
     )
     return tuple(
         plan_path_c_direct_fusion_chain_for_region(
             region,
             include_backward=include_backward,
             max_kernel_buffers=max_kernel_buffers,
+            max_segment_nodes=max_segment_nodes,
             registry=registry,
         )
         for region in regions
@@ -7866,6 +7895,7 @@ def plan_path_c_fusion_schedules_for_model(
     include_backward: bool = True,
     min_route_bricks: int = 2,
     registry: PathCFusionScheduleRegistry | None = None,
+    sequence_length: int | None = None,
 ) -> tuple[PathCFusionScheduleOptimizerPlan, ...]:
     """Plan Path C fused schedules for every supported region in ``model``.
 
@@ -7879,6 +7909,7 @@ def plan_path_c_fusion_schedules_for_model(
         region_prefix=region_prefix,
         include_backward=False,
         min_route_bricks=min_route_bricks,
+        sequence_length=sequence_length,
     )
     return tuple(
         plan_path_c_fusion_schedule_for_region(

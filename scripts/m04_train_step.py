@@ -523,9 +523,20 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "After an eager fp8_path_c local_gb10_quarter step captures the "
-            "direct-chain logical buffers, compile and execute the direct-chain "
-            "runtime as a profiling probe. This is post-step evidence only and "
-            "does not mark Path C as the training critical path."
+            "direct-chain logical buffers, compile the direct-chain runtime and "
+            "execute its non-eager value_and_grad bridge as a profiling probe. "
+            "This is post-step evidence only and does not mark Path C as the "
+            "training critical path."
+        ),
+    )
+    parser.add_argument(
+        "--use-path-c-direct-chain-runtime",
+        action="store_true",
+        help=(
+            "Opt in to the dynamic pre-step direct-chain value_and_grad runtime "
+            "for fp8_path_c local_gb10_quarter training. This installs the "
+            "runtime on the actual m04 train-step critical path, requires "
+            "compile=False, and remains off by default."
         ),
     )
     return parser
@@ -613,6 +624,12 @@ def fp8_training_route_requested(
     return fp8_path_b_route_requested(args) or fp8_path_c_route_requested(args)
 
 
+def path_c_training_route_requested(
+    args: argparse.Namespace | TrainHybridTinyConfig,
+) -> bool:
+    return fp8_path_c_route_requested(args) or path_c_kernel_policy_requested()
+
+
 def path_c_kernel_policy_requested() -> bool:
     path_c_values = {"path_c", "c"}
     for env_name in (
@@ -624,6 +641,29 @@ def path_c_kernel_policy_requested() -> bool:
         if os.environ.get(env_name, "").strip().lower() in path_c_values:
             return True
     return False
+
+
+def path_c_training_sequence_length(
+    args: argparse.Namespace | TrainHybridTinyConfig,
+) -> int | None:
+    """Return the decoder input length used by the training loss graph."""
+
+    seq_len = int(getattr(args, "seq_len", 0) or 0)
+    if seq_len <= 1:
+        return None
+    return seq_len - 1
+
+
+def path_c_batch_sequence_length(
+    batch: Mapping[str, mx.array] | mx.array | None,
+) -> int | None:
+    if batch is None:
+        return None
+    lm_batch = ensure_lm_batch(batch)
+    inputs = lm_batch.inputs
+    if not isinstance(inputs, mx.array) or inputs.ndim != 2:
+        return None
+    return int(inputs.shape[1])
 
 
 def _validate_cache_limit_bytes(limit: int, *, source: str) -> int:
@@ -1476,7 +1516,10 @@ class PathCResidualSumSuffixLossCotangentBridge:
                 "loss cotangent bridge gradient arity mismatch: "
                 f"got {len(grads)}, expected {len(suffix_args)}"
             )
-        cotangent_grads = grads[: len(required_names)]
+        cotangent_grads = tuple(
+            grad.astype(mx.float32) if isinstance(grad, mx.array) else grad
+            for grad in grads[: len(required_names)]
+        )
         norm_grad = grads[-2]
         head_grad = grads[-1]
         return {
@@ -2002,9 +2045,14 @@ def fp8_path_c_training_route_payload(
     direct_chain_logical_owner: Any | None = None,
     direct_chain_training_runtime: Any | None = None,
 ) -> dict[str, Any]:
-    requested = fp8_path_c_route_requested(args)
+    requested = path_c_training_route_requested(args)
+    fp8_producer_required = fp8_path_c_route_requested(args)
     producer = sparse_mla_fp8_producer_payload(args)
-    producer_configured = bool(producer["configured"])
+    fp8_producer_configured = bool(producer["configured"])
+    producer_configured = bool(
+        fp8_producer_configured or not fp8_producer_required
+    )
+    sequence_length = path_c_training_sequence_length(args)
     path_c_fusion = path_c_fusion_payload(
         model=model,
         compile_receipt_path=compile_receipt_path,
@@ -2017,6 +2065,7 @@ def fp8_path_c_training_route_payload(
         direct_chain_logical_buffer_owner=direct_chain_logical_buffer_owner,
         direct_chain_logical_owner=direct_chain_logical_owner,
         direct_chain_training_runtime=direct_chain_training_runtime,
+        sequence_length=sequence_length,
     )
     runtime_training_binding = path_c_fusion.get("runtime_training_binding", {})
     single_fused_train_block_runtime_available = bool(
@@ -2056,6 +2105,8 @@ def fp8_path_c_training_route_payload(
         else FP8_PATH_C_SPLIT_TRAINING_STATUS
         if requested and producer_configured
         else producer["status"]
+        if requested and fp8_producer_required
+        else FP8_PATH_C_SPLIT_TRAINING_STATUS
         if requested
         else "not_requested"
     )
@@ -2069,6 +2120,8 @@ def fp8_path_c_training_route_payload(
         else str(runtime_training_binding.get("status"))
         if producer_configured
         else str(producer["status"])
+        if fp8_producer_required
+        else str(runtime_training_binding.get("status"))
     )
     direct_call_status = (
         "m04_uses_fused_train_block_route"
@@ -2083,6 +2136,8 @@ def fp8_path_c_training_route_payload(
         else "m04_uses_split_model_graph_route_not_fused_train_block"
         if split_training_available
         else str(producer["status"])
+        if requested and fp8_producer_required
+        else "m04_uses_split_model_graph_route_not_fused_train_block"
         if requested
         else "not_requested"
     )
@@ -2097,17 +2152,21 @@ def fp8_path_c_training_route_payload(
         else "run_path_c_split_training_route"
         if split_training_available
         else f"fail_closed_{producer['status']}"
+        if requested and fp8_producer_required
+        else "run_path_c_split_training_route"
         if requested
         else None
     )
     return {
         "requested": requested,
-        "dtype": FP8_PATH_C_DTYPE,
+        "dtype": str(getattr(args, "dtype", "")),
         "status": route_status,
         "blocker_type": None
         if (not requested or producer_configured)
         else str(producer["status"]),
-        "reason": producer["reason"] if requested and not producer_configured else None,
+        "reason": producer["reason"]
+        if requested and fp8_producer_required and not producer_configured
+        else None,
         "carrier_dtype": FP8_PATH_C_CARRIER_DTYPE,
         "native_fp8_producer_status": producer["status"],
         "sparse_mla_fp8_producer": producer,
@@ -2175,7 +2234,7 @@ def fp8_path_c_training_route_payload(
                 "name": "sparse_mla_fp8_path_c_apply",
                 "module": "cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c",
                 "shape_surface": "prepared q_fp8/q_scale/kv_fp8/kv_scale sparse-MLA buffers",
-                "training_surface": producer_configured,
+                "training_surface": fp8_producer_configured,
                 "producer_required": True,
                 "producer_status": producer["status"],
                 "backward_surface": "native_tvm_ffi_graph_output_scatter",
@@ -2243,7 +2302,7 @@ def fp8_path_c_training_route_payload(
             "current_m04_route_owner": (
                 "scripts.m04_train_step -> HybridTinyLM -> "
                 "CausalSelfAttention.prepare_sparse_mla_fp8"
-                if producer_configured
+                if fp8_producer_configured
                 else (
                     "scripts.m04_train_step -> scripts.train_hybrid_tiny -> "
                     "HybridTinyLM without DSA Sparse-MLA producer"
@@ -2272,7 +2331,23 @@ def _as_path_c_logical_owner_tuple(raw_owners: Any) -> tuple[Any, ...]:
     return tuple(raw_owners)
 
 
+def _path_c_direct_chain_runtime_logical_owner_for_model(model: Any) -> Any | None:
+    runtime = getattr(model, "path_c_direct_fusion_chain_training_runtime", None)
+    if runtime is None:
+        return None
+    for attr_name in ("last_pre_step_owner", "logical_owner"):
+        owner = getattr(runtime, attr_name, None)
+        owner_buffers = getattr(owner, "buffers", None)
+        if isinstance(owner_buffers, Mapping):
+            return owner
+    return None
+
+
 def _path_c_direct_chain_logical_owner_for_model(model: Any) -> Any | None:
+    runtime_owner = _path_c_direct_chain_runtime_logical_owner_for_model(model)
+    if runtime_owner is not None:
+        return runtime_owner
+
     owners: list[Any] = []
     base_owner = getattr(
         model,
@@ -2697,9 +2772,18 @@ def run_path_c_direct_fusion_chain_route(
         artifacts=artifacts,
     )
     if not binding.get("runtime_uses_direct_fusion_chain"):
+        detail_parts = [
+            *(str(error) for error in binding.get("binding_errors", ())[:8]),
+            *(
+                f"missing={name}"
+                for name in binding.get("missing_logical_buffers", ())[:8]
+            ),
+        ]
+        detail = "; ".join(detail_parts)
         raise ValueError(
             "direct-chain route is not executable: "
             + str(binding.get("reason", binding.get("status")))
+            + (f": {detail}" if detail else "")
         )
     resolved_buffers = (
         getattr(logical_owner, "buffers", None)
@@ -2746,8 +2830,31 @@ def run_path_c_direct_fusion_chain_route(
                 f"direct-chain segment {segment.index} buffers are invalid"
                 + (f": {detail}" if detail else "")
             )
+        scratch_specs = _path_c_internal_scratch_abi_specs(prim_func)
+        scratch_binding = _path_c_validate_internal_scratch_abi_buffers(
+            scratch_specs,
+            buffers,
+        )
+        if scratch_binding.get("status") != "ok":
+            detail = "; ".join(
+                str(error) for error in scratch_binding.get("errors", ())
+            )
+            raise ValueError(
+                f"direct-chain segment {segment.index} scratch buffers are invalid"
+                + (f": {detail}" if detail else "")
+            )
         ordered_names = tuple(
             str(name) for name in segment_binding.get("ordered_kernel_buffers", ())
+        )
+        ordered_names = (
+            *ordered_names,
+            *(
+                str(name)
+                for name in scratch_binding.get(
+                    "required_internal_scratch_buffers",
+                    (),
+                )
+            ),
         )
         arrays = tuple(buffers[name] for name in ordered_names)
         mx_module.eval(*arrays)
@@ -2798,6 +2905,8 @@ class PathCDirectFusionChainTrainingRuntime:
         training_critical_path: bool = False,
         loss_cotangent_bridge: Any | None = None,
         model: Any | None = None,
+        pre_step_owner_factory: Callable[[nn.Module, Mapping[str, mx.array]], Any]
+        | None = None,
     ) -> None:
         if logical_buffers is not None and logical_owner is not None:
             raise ValueError("logical_buffers and logical_owner are mutually exclusive")
@@ -2809,6 +2918,9 @@ class PathCDirectFusionChainTrainingRuntime:
         self.training_critical_path = bool(training_critical_path)
         self.loss_cotangent_bridge = loss_cotangent_bridge
         self.model = model
+        self.pre_step_owner_factory = pre_step_owner_factory
+        self.last_pre_step_owner: Any | None = None
+        self.last_pre_step_binding: Mapping[str, Any] | None = None
         self._training_graph_binding: dict[str, Any] | None = None
         self.binding = path_c_direct_fusion_chain_runtime_binding_payload(
             chain=chain,
@@ -2821,6 +2933,33 @@ class PathCDirectFusionChainTrainingRuntime:
                 "direct-chain training runtime requires executable direct-chain "
                 f"binding; got {self.binding.get('status')}"
             )
+
+    def _value_and_grad_logical_owner(
+        self,
+        model: nn.Module,
+        batch: Mapping[str, mx.array],
+    ) -> tuple[Mapping[str, Any] | None, Any | None]:
+        factory = self.pre_step_owner_factory
+        if factory is None:
+            return self.logical_buffers, self.logical_owner
+        owner = factory(model, batch)
+        owner_buffers = getattr(owner, "buffers", None)
+        if not isinstance(owner_buffers, Mapping):
+            raise TypeError("pre-step owner factory must return a buffers owner")
+        binding = path_c_direct_fusion_chain_runtime_binding_payload(
+            chain=self.chain,
+            logical_owner=owner,
+            artifacts=self.artifacts,
+        )
+        if not bool(binding.get("runtime_uses_direct_fusion_chain")):
+            raise ValueError(
+                "pre-step direct-chain owner is not executable: "
+                f"{binding.get('status')}"
+            )
+        self.last_pre_step_owner = owner
+        self.last_pre_step_binding = binding
+        self.binding = binding
+        return None, owner
 
     def forward(self) -> dict[str, Any]:
         return run_path_c_direct_fusion_chain_route(
@@ -2853,16 +2992,20 @@ class PathCDirectFusionChainTrainingRuntime:
                 "direct-chain loss cotangent bridge is incomplete: "
                 f"{bridge_contract.get('status')}"
             )
+        logical_buffers, logical_owner = self._value_and_grad_logical_owner(
+            model,
+            batch,
+        )
         run_path_c_direct_fusion_chain_route(
             chain=self.chain,
-            logical_buffers=self.logical_buffers,
-            logical_owner=self.logical_owner,
+            logical_buffers=logical_buffers,
+            logical_owner=logical_owner,
             artifacts=self.artifacts,
             execution_phases=("forward",),
         )
         buffers, _ = _path_c_direct_chain_resolved_logical_buffers(
-            logical_buffers=self.logical_buffers,
-            logical_owner=self.logical_owner,
+            logical_buffers=logical_buffers,
+            logical_owner=logical_owner,
         )
         required_loss_cotangent_buffers = (
             _path_c_direct_chain_loss_cotangent_seed_buffers(self.chain)
@@ -2885,12 +3028,18 @@ class PathCDirectFusionChainTrainingRuntime:
             cotangents = {}
         if not isinstance(cotangents, Mapping):
             raise TypeError("loss cotangent bridge cotangents must be a Mapping")
+        required_specs = _path_c_direct_chain_required_logical_buffer_specs(self.chain)
         for name in required_loss_cotangent_buffers:
             value = cotangents.get(name, buffers.get(name))
             if not isinstance(value, mx.array):
                 raise ValueError(
                     f"loss cotangent bridge did not provide {name!r}"
                 )
+            expected_dtype = required_specs.get(str(name), {}).get("dtype")
+            if expected_dtype is not None:
+                target_dtype = _mx_dtype_from_path_c_abi(str(expected_dtype))
+                if value.dtype != target_dtype:
+                    value = value.astype(target_dtype)
             buffers[name] = value
         run_path_c_direct_fusion_chain_route(
             chain=self.chain,
@@ -3024,9 +3173,10 @@ class PathCDirectFusionChainTrainingRuntime:
             logical_buffers=self.logical_buffers,
             logical_owner=self.logical_owner,
         )
-        model_gradient_tree_ready = bool(resolved_buffers) and bridge_contract.get(
-            "status"
-        ) == "ok"
+        pre_step_owner_factory_available = callable(self.pre_step_owner_factory)
+        model_gradient_tree_ready = (
+            bool(resolved_buffers) or pre_step_owner_factory_available
+        ) and bridge_contract.get("status") == "ok"
         loss_cotangent_bridge_ready = bridge_contract.get("status") == "ok"
         coverage = _path_c_direct_chain_full_gradient_coverage_payload(
             model=self.model,
@@ -3055,6 +3205,10 @@ class PathCDirectFusionChainTrainingRuntime:
             else "selected_region",
             "loss_cotangent_bridge_ready": loss_cotangent_bridge_ready,
             "model_gradient_tree_ready": model_gradient_tree_ready,
+            "pre_step_owner_factory_available": pre_step_owner_factory_available,
+            "last_pre_step_binding_status": None
+            if self.last_pre_step_binding is None
+            else self.last_pre_step_binding.get("status"),
             "selected_region_gradient_tree_ready": model_gradient_tree_ready,
             "full_model_gradient_tree_ready": returns_full_model_grads,
             "full_model_gradient_coverage": coverage,
@@ -3112,9 +3266,12 @@ def install_path_c_direct_chain_training_runtime_for_model(
     logical_owner: Any | None = None,
     artifact_compiler: Callable[[Any], Any] = compile_path_c_direct_fusion_chain_artifacts,
     owner_name: str | None = None,
+    sequence_length: int | None = None,
     training_critical_path: bool = False,
     run_probe: bool = False,
     loss_cotangent_bridge: Any | None = None,
+    pre_step_owner_factory: Callable[[nn.Module, Mapping[str, mx.array]], Any]
+    | None = None,
 ) -> dict[str, Any]:
     """Attach an explicit direct-chain runtime when binding is executable.
 
@@ -3133,11 +3290,13 @@ def install_path_c_direct_chain_training_runtime_for_model(
             model,
             region_prefix=direct_chain_region_prefix,
             include_backward=True,
+            sequence_length=sequence_length,
         )
         regions = build_path_c_model_regions_from_model(
             model,
             region_prefix=direct_chain_region_prefix,
             include_backward=False,
+            sequence_length=sequence_length,
         )
         selected_region = _select_path_c_model_route_region(regions)
         if selected_region is None:
@@ -3181,6 +3340,30 @@ def install_path_c_direct_chain_training_runtime_for_model(
     resolved_owner_name = owner_name or (
         f"{profile_name}.path_c_direct_fusion_chain_training_runtime"
     )
+    runtime_binding = path_c_direct_fusion_chain_runtime_binding_payload(
+        chain=selected_chain,
+        logical_owner=resolved_owner,
+        artifacts=compiled_artifacts,
+    )
+    if not bool(runtime_binding.get("runtime_uses_direct_fusion_chain")):
+        return {
+            "status": "blocked",
+            "reason": "direct-chain runtime requires executable direct-chain binding",
+            "runtime_owner": resolved_owner_name,
+            "training_critical_path": False,
+            "chain_status": str(getattr(selected_chain, "status", "")),
+            "segment_count": len(tuple(getattr(selected_chain, "segments", ()))),
+            "logical_buffer_owner": str(
+                getattr(resolved_owner, "owner_name", "direct_chain_logical_owner")
+            ),
+            "artifact_count": len(tuple(compiled_artifacts))
+            if isinstance(compiled_artifacts, (list, tuple))
+            else None,
+            "binding_status": runtime_binding.get("status"),
+            "runtime_uses_direct_fusion_chain": False,
+            "runtime_binding": runtime_binding,
+            "execution": None,
+        }
     runtime = PathCDirectFusionChainTrainingRuntime(
         chain=selected_chain,
         artifacts=compiled_artifacts,
@@ -3189,6 +3372,7 @@ def install_path_c_direct_chain_training_runtime_for_model(
         training_critical_path=training_critical_path,
         loss_cotangent_bridge=loss_cotangent_bridge,
         model=model,
+        pre_step_owner_factory=pre_step_owner_factory,
     )
     if training_critical_path:
         runtime.bind_training_graph(
@@ -3231,6 +3415,7 @@ def install_path_c_direct_chain_training_runtime_for_model(
                 "runtime_uses_direct_fusion_chain": bool(
                     runtime.binding.get("runtime_uses_direct_fusion_chain")
                 ),
+                "runtime_binding": runtime.binding,
                 "value_and_grad_contract": value_and_grad_contract,
                 "training_runtime_contract": training_runtime_contract,
                 "execution": None,
@@ -3259,6 +3444,7 @@ def install_path_c_direct_chain_training_runtime_for_model(
         "runtime_uses_direct_fusion_chain": bool(
             runtime.binding.get("runtime_uses_direct_fusion_chain")
         ),
+        "runtime_binding": runtime.binding,
         "value_and_grad_contract": _direct_chain_value_and_grad_contract_payload(
             runtime
         ),
@@ -3267,6 +3453,49 @@ def install_path_c_direct_chain_training_runtime_for_model(
             "direct-chain runtime was attached for explicit profiling/binding "
             "evidence; critical-path readiness is reported separately"
         ),
+    }
+
+
+def path_c_direct_chain_value_and_grad_probe_payload(
+    *,
+    runtime: Any,
+    model: nn.Module,
+    batch: Mapping[str, mx.array] | mx.array,
+) -> dict[str, Any]:
+    """Execute the direct-chain value-and-grad bridge as post-step evidence."""
+
+    def _forbidden_loss_and_grad(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("Path C direct-chain probe must not delegate to eager")
+
+    started = time.perf_counter()
+    (loss, ntokens), grads = runtime.value_and_grad(
+        model,
+        batch,
+        _forbidden_loss_and_grad,
+    )
+    flat_grads = [
+        (str(name), value)
+        for name, value in tree_flatten(grads)
+        if isinstance(value, mx.array)
+    ]
+    mx.eval(loss, ntokens, *(value for _, value in flat_grads))
+    value_and_grad_contract = _direct_chain_value_and_grad_contract_payload(runtime)
+    training_runtime_contract = path_c_direct_fusion_chain_training_runtime_contract_payload(
+        training_runtime=runtime,
+        runtime_binding=getattr(runtime, "binding", {}),
+    )
+    return {
+        "status": "ok",
+        "execution_phase": "post_step_profile_probe",
+        "training_critical_path": False,
+        "delegated_to_eager_loss_and_grad": False,
+        "elapsed_s": time.perf_counter() - started,
+        "loss": float(loss.item()),
+        "ntokens": int(ntokens.item()),
+        "gradient_count": len(flat_grads),
+        "gradient_name_examples": [name for name, _ in flat_grads[:8]],
+        "value_and_grad_contract": value_and_grad_contract,
+        "training_runtime_contract": training_runtime_contract,
     }
 
 
@@ -3313,7 +3542,89 @@ def _path_c_direct_chain_required_logical_buffer_specs(
             if tuple(existing["shape"]) != shape or str(existing["dtype"]) != dtype:
                 raise ValueError(f"conflicting direct-chain logical buffer spec {name!r}")
             existing["segments"].append(int(segment.index))
+        for name, scratch_spec in _path_c_internal_scratch_abi_specs(
+            prim_func
+        ).items():
+            existing = specs.setdefault(
+                name,
+                {
+                    "name": name,
+                    "shape": tuple(scratch_spec["shape"]),
+                    "dtype": str(scratch_spec["dtype"]),
+                    "category": "runtime_scratch",
+                    "segments": [],
+                },
+            )
+            if (
+                tuple(existing["shape"]) != tuple(scratch_spec["shape"])
+                or str(existing["dtype"]) != str(scratch_spec["dtype"])
+            ):
+                raise ValueError(f"conflicting direct-chain scratch buffer spec {name!r}")
+            existing["segments"].append(int(segment.index))
     return specs
+
+
+def _path_c_internal_scratch_abi_specs(prim_func: Any) -> dict[str, dict[str, Any]]:
+    scratch_shapes = dict(
+        getattr(prim_func, "_cppmega_path_c_spilled_shared_scratch_shapes", {})
+        or {}
+    )
+    specs: dict[str, dict[str, Any]] = {}
+    for raw_name, raw in scratch_shapes.items():
+        if not isinstance(raw, Mapping):
+            continue
+        name = str(raw.get("param_name", raw_name))
+        specs[name] = {
+            "shape": tuple(int(dim) for dim in tuple(raw.get("shape", ()))),
+            "dtype": str(raw.get("dtype", "float32")),
+        }
+    return specs
+
+
+def _path_c_tensor_dtype_name(value: Any) -> str | None:
+    dtype = getattr(value, "dtype", None)
+    if dtype is None:
+        return None
+    return str(dtype).rsplit(".", 1)[-1]
+
+
+def _path_c_validate_internal_scratch_abi_buffers(
+    scratch_specs: Mapping[str, Mapping[str, Any]],
+    buffers: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    provided = {str(name): value for name, value in (buffers or {}).items()}
+    missing: list[str] = []
+    shape_mismatches: list[str] = []
+    dtype_mismatches: list[str] = []
+    errors: list[str] = []
+    for name, spec in scratch_specs.items():
+        if name not in provided:
+            missing.append(name)
+            errors.append(f"{name}: missing caller-owned internal scratch buffer")
+            continue
+        expected_shape = tuple(int(dim) for dim in tuple(spec.get("shape", ())))
+        actual_shape = getattr(provided[name], "shape", None)
+        actual_shape = None if actual_shape is None else tuple(int(dim) for dim in actual_shape)
+        if actual_shape != expected_shape:
+            shape_mismatches.append(name)
+            errors.append(
+                f"{name}: shape {actual_shape} does not match expected {expected_shape}"
+            )
+        expected_dtype = str(spec.get("dtype", "float32"))
+        actual_dtype = _path_c_tensor_dtype_name(provided[name])
+        if actual_dtype != expected_dtype:
+            dtype_mismatches.append(name)
+            errors.append(
+                f"{name}: dtype {actual_dtype!r} does not match expected {expected_dtype!r}"
+            )
+    return {
+        "status": "ok" if not errors else "failed",
+        "required_internal_scratch_buffers": list(scratch_specs),
+        "missing_internal_scratch_buffers": missing,
+        "shape_mismatch_internal_scratch_buffers": shape_mismatches,
+        "dtype_mismatch_internal_scratch_buffers": dtype_mismatches,
+        "errors": errors,
+    }
 
 
 def _path_c_direct_chain_loss_cotangent_seed_buffers(chain: Any) -> list[str]:
@@ -3545,10 +3856,98 @@ def make_path_c_direct_fusion_chain_workspace_owner(
     )
 
 
+def make_path_c_direct_chain_pre_step_runtime_owner(
+    *,
+    chain: Any,
+    model: nn.Module,
+    batch: Mapping[str, mx.array] | mx.array,
+    owner_name: str | None = None,
+) -> PathCLogicalBufferOwner:
+    """Build per-step direct-chain buffers from model params and the batch.
+
+    This owner is derived from the dynamic chain ABI.  It does not depend on
+    post-step captures and does not use named acceptance fixtures.
+    """
+
+    start_layer_index = _path_c_direct_chain_start_layer_index(model, chain)
+    if start_layer_index is None:
+        raise ValueError("cannot resolve Path C direct-chain start layer")
+    first_brick_name = _path_c_direct_chain_first_brick_name(chain)
+    if not first_brick_name:
+        raise ValueError("cannot resolve Path C direct-chain first brick")
+
+    required_specs = _path_c_direct_chain_required_logical_buffer_specs(chain)
+    by_category = _path_c_direct_chain_names_by_category(required_specs)
+    make_model_owner = getattr(
+        model,
+        "make_path_c_direct_fusion_chain_logical_buffer_owner",
+        None,
+    )
+    if not callable(make_model_owner):
+        raise TypeError(
+            "model must expose make_path_c_direct_fusion_chain_logical_buffer_owner"
+        )
+    model_owner = make_model_owner()
+    model_buffers = getattr(model_owner, "buffers", None)
+    if not isinstance(model_buffers, Mapping):
+        raise TypeError("model direct-chain owner must expose Mapping buffers")
+
+    prefix_hidden = path_c_model_prefix_hidden_states(
+        model,
+        batch,
+        end_layer_index=start_layer_index,
+    )
+    hidden_seed_names = {
+        "hidden",
+        f"{first_brick_name}_hidden",
+    }
+    buffers: dict[str, mx.array] = {}
+    missing_model_buffers: list[str] = []
+    model_parameter_names = set(by_category.get("model_parameter_or_constant", ()))
+    for name in sorted(required_specs):
+        spec = required_specs[name]
+        if name in model_parameter_names:
+            value = model_buffers.get(name)
+            if isinstance(value, mx.array):
+                buffers[name] = value
+            else:
+                missing_model_buffers.append(name)
+            continue
+        if name in hidden_seed_names:
+            buffers[name] = prefix_hidden
+            continue
+        buffers[name] = mx.zeros(
+            tuple(spec["shape"]),
+            dtype=_mx_dtype_from_path_c_abi(str(spec["dtype"])),
+        )
+    if missing_model_buffers:
+        raise ValueError(
+            "model direct-chain owner is missing required parameter buffers: "
+            f"{missing_model_buffers[:8]}"
+        )
+
+    profile_name = str(getattr(model, "path_c_profile_name", "HybridTinyLM"))
+    return PathCLogicalBufferOwner(
+        owner_name=owner_name or f"{profile_name}.path_c_pre_step_runtime_buffers",
+        buffers=buffers,
+        hidden_packing_performed=False,
+        no_hidden_allocation_policy=True,
+    )
+
+
 def _path_c_direct_chain_buffer_category(name: str) -> str:
     if name in {"hidden", "hidden_grad"}:
         return "runtime_activation_or_grad"
     if name.endswith("_grad"):
+        return "runtime_activation_or_grad"
+    if any(
+        name.endswith(suffix)
+        for suffix in (
+            "_sparse_mla_sm_scale",
+            "_sparse_mla_sinks",
+            "_sparse_mla_has_sinks",
+        )
+    ):
         return "runtime_activation_or_grad"
     if any(
         name.endswith(suffix)
@@ -3558,9 +3957,6 @@ def _path_c_direct_chain_buffer_category(name: str) -> str:
             "_D",
             "_A_log",
             "_dt_bias",
-            "_sm_scale",
-            "_sinks",
-            "_has_sinks",
             "_rope_inv_freq",
         )
     ):
@@ -3576,6 +3972,131 @@ def _path_c_direct_chain_buffer_category(name: str) -> str:
     ):
         return "runtime_state"
     return "runtime_activation_or_grad"
+
+
+def _path_c_direct_chain_names_by_category(
+    required_specs: Mapping[str, Mapping[str, Any]],
+) -> dict[str, list[str]]:
+    by_category: dict[str, list[str]] = {}
+    for name, spec in required_specs.items():
+        by_category.setdefault(str(spec.get("category")), []).append(str(name))
+    for names in by_category.values():
+        names.sort()
+    return by_category
+
+
+def path_c_direct_chain_pre_step_owner_plan(
+    *,
+    chain: Any,
+    model: Any | None = None,
+    logical_buffers: Mapping[str, Any] | None = None,
+    logical_owner: Any | None = None,
+) -> dict[str, Any]:
+    """Classify which direct-chain buffers can exist before the train step."""
+
+    if logical_buffers is None and logical_owner is None and model is not None:
+        make_logical_owner = getattr(
+            model,
+            "make_path_c_direct_fusion_chain_logical_buffer_owner",
+            None,
+        )
+        if callable(make_logical_owner):
+            logical_owner = make_logical_owner()
+
+    resolved_buffers, owner_name = _path_c_direct_chain_resolved_logical_buffers(
+        logical_buffers=logical_buffers,
+        logical_owner=logical_owner,
+    )
+    required_specs = _path_c_direct_chain_required_logical_buffer_specs(chain)
+    by_category = _path_c_direct_chain_names_by_category(required_specs)
+    runtime_activation_or_grad = by_category.get("runtime_activation_or_grad", [])
+    model_parameter_names = by_category.get("model_parameter_or_constant", [])
+    runtime_state_names = by_category.get("runtime_state", [])
+    runtime_scratch_names = by_category.get("runtime_scratch", [])
+    forward_or_prepared_names = sorted(
+        name for name in runtime_activation_or_grad if not name.endswith("_grad")
+    )
+    backward_gradient_names = sorted(
+        name for name in runtime_activation_or_grad if name.endswith("_grad")
+    )
+
+    def available(names: Sequence[str]) -> list[str]:
+        return sorted(
+            name for name in names if isinstance(resolved_buffers.get(name), mx.array)
+        )
+
+    model_parameter_available = available(model_parameter_names)
+    forward_or_prepared_available = available(forward_or_prepared_names)
+    runtime_state_available = available(runtime_state_names)
+    runtime_scratch_available = available(runtime_scratch_names)
+    backward_gradient_available = available(backward_gradient_names)
+    forward_or_prepared_missing = sorted(
+        set(forward_or_prepared_names).difference(forward_or_prepared_available)
+    )
+    runtime_state_missing = sorted(
+        set(runtime_state_names).difference(runtime_state_available)
+    )
+    runtime_scratch_missing = sorted(
+        set(runtime_scratch_names).difference(runtime_scratch_available)
+    )
+    pre_step_runtime_missing = [
+        *forward_or_prepared_missing,
+        *runtime_state_missing,
+        *runtime_scratch_missing,
+    ]
+    status = (
+        "pre_step_runtime_owner_missing"
+        if pre_step_runtime_missing
+        else "pre_step_runtime_owner_ready"
+    )
+    return {
+        "status": status,
+        "training_critical_path_ready": status == "pre_step_runtime_owner_ready",
+        "logical_buffer_owner": owner_name,
+        "required_logical_buffer_count": len(required_specs),
+        "model_parameter_or_constant_count": len(model_parameter_names),
+        "model_parameter_or_constant_available_count": len(model_parameter_available),
+        "model_parameter_or_constant_missing_count": (
+            len(model_parameter_names) - len(model_parameter_available)
+        ),
+        "batch_dependent_forward_or_prepared_count": len(forward_or_prepared_names),
+        "batch_dependent_forward_or_prepared_available_count": len(
+            forward_or_prepared_available
+        ),
+        "batch_dependent_forward_or_prepared_missing_count": len(
+            forward_or_prepared_missing
+        ),
+        "runtime_state_count": len(runtime_state_names),
+        "runtime_state_available_count": len(runtime_state_available),
+        "runtime_state_missing_count": len(runtime_state_missing),
+        "runtime_scratch_count": len(runtime_scratch_names),
+        "runtime_scratch_available_count": len(runtime_scratch_available),
+        "runtime_scratch_missing_count": len(runtime_scratch_missing),
+        "pre_step_runtime_missing_count": len(pre_step_runtime_missing),
+        "backward_workspace_gradient_count": len(backward_gradient_names),
+        "backward_workspace_gradient_available_count": len(
+            backward_gradient_available
+        ),
+        "backward_workspace_gradient_missing_count": (
+            len(backward_gradient_names) - len(backward_gradient_available)
+        ),
+        "batch_dependent_forward_or_prepared_missing_examples": (
+            forward_or_prepared_missing[:12]
+        ),
+        "runtime_state_missing_examples": runtime_state_missing[:12],
+        "runtime_scratch_missing_examples": runtime_scratch_missing[:12],
+        "backward_workspace_gradient_examples": backward_gradient_names[:12],
+        "reason": (
+            "direct-chain training cannot be bound before the step until a "
+            "runtime owner produces the batch-dependent forward/prepared "
+            "buffers and recurrent state buffers without relying on a prior "
+            "eager Path C step"
+            if pre_step_runtime_missing
+            else "all batch-dependent direct-chain inputs have an explicit "
+            "pre-step owner; remaining gradient buffers can be allocated as "
+            "workspace for the VJP"
+        ),
+    }
 
 
 def path_c_direct_fusion_chain_model_binding_audit(
@@ -3620,11 +4141,20 @@ def path_c_direct_fusion_chain_model_binding_audit(
                     "segments": [],
                 },
             )["segments"].append(int(segment.index))
-    by_category: dict[str, list[str]] = {}
-    for item in required_buffers.values():
-        by_category.setdefault(str(item["category"]), []).append(str(item["name"]))
-    for names in by_category.values():
-        names.sort()
+        for name, scratch_spec in _path_c_internal_scratch_abi_specs(
+            prim_func
+        ).items():
+            required_buffers.setdefault(
+                name,
+                {
+                    "name": name,
+                    "shape": tuple(scratch_spec["shape"]),
+                    "dtype": str(scratch_spec["dtype"]),
+                    "category": "runtime_scratch",
+                    "segments": [],
+                },
+            )["segments"].append(int(segment.index))
+    by_category = _path_c_direct_chain_names_by_category(required_buffers)
     runtime_activation_or_grad = by_category.get("runtime_activation_or_grad", [])
     backward_grad_names = sorted(
         name for name in runtime_activation_or_grad if name.endswith("_grad")
@@ -3633,7 +4163,10 @@ def path_c_direct_fusion_chain_model_binding_audit(
         name for name in runtime_activation_or_grad if not name.endswith("_grad")
     )
     runtime_state_names = by_category.get("runtime_state", [])
-    runtime_names = sorted([*runtime_activation_or_grad, *runtime_state_names])
+    runtime_scratch_names = by_category.get("runtime_scratch", [])
+    runtime_names = sorted(
+        [*runtime_activation_or_grad, *runtime_state_names, *runtime_scratch_names]
+    )
     requires_runtime_owner = bool(runtime_names)
     forward_probe_available = bool(
         model is not None
@@ -3663,6 +4196,10 @@ def path_c_direct_fusion_chain_model_binding_audit(
     if callable(make_logical_owner):
         model_logical_owner = make_logical_owner()
     model_logical_owner_buffers = getattr(model_logical_owner, "buffers", {}) or {}
+    model_parameter_names = by_category.get("model_parameter_or_constant", [])
+    model_logical_owner_required_buffers = sorted(
+        name for name in model_parameter_names if name in model_logical_owner_buffers
+    )
     parameter_gradient_alias_targets = sorted(
         {
             str(target)
@@ -3708,7 +4245,13 @@ def path_c_direct_fusion_chain_model_binding_audit(
         if model_logical_owner is None
         else str(getattr(model_logical_owner, "owner_name", "")),
         "model_parameter_logical_owner_buffer_count": len(
+            model_logical_owner_required_buffers
+        ),
+        "model_parameter_logical_owner_total_buffer_count": len(
             model_logical_owner_buffers
+        ),
+        "model_parameter_logical_owner_buffer_examples": (
+            model_logical_owner_required_buffers[:12]
         ),
         "backward_gradient_parameter_alias_coverage_count": len(
             covered_parameter_gradient_names
@@ -3977,17 +4520,32 @@ def path_c_direct_fusion_chain_runtime_binding_payload(
                 physical_abi_shapes,
                 resolved_buffers,
             )
+            scratch_specs = _path_c_internal_scratch_abi_specs(prim_func)
+            scratch_binding = _path_c_validate_internal_scratch_abi_buffers(
+                scratch_specs,
+                resolved_buffers,
+            )
             required_logical_buffers = list(bridge.get("required_bank_buffers", ()))
+            required_internal_scratch_buffers = list(
+                scratch_binding.get("required_internal_scratch_buffers", ())
+            )
+            required_logical_buffers.extend(required_internal_scratch_buffers)
             required_logical_buffer_names.update(
                 str(name) for name in required_logical_buffers
             )
             segment_missing = list(binding.get("missing_bank_buffers", ()))
+            segment_missing.extend(
+                str(name)
+                for name in scratch_binding.get("missing_internal_scratch_buffers", ())
+            )
             ordered_kernel_buffers = list(binding.get("ordered_kernel_buffers", ()))
+            ordered_kernel_buffers.extend(required_internal_scratch_buffers)
             provided_logical_buffers = [
                 name for name in ordered_kernel_buffers if name in provided_names
             ]
             logical_binding_ready = (
                 binding.get("status") == "ok" and not segment_missing
+                and scratch_binding.get("status") == "ok"
             )
             direct_logical_supported = bool(
                 bridge.get("logical_tensor_binding_supported")
@@ -4008,10 +4566,27 @@ def path_c_direct_fusion_chain_runtime_binding_payload(
             shape_mismatch_buffers.update(
                 str(name) for name in binding.get("shape_mismatch_buffers", ())
             )
+            shape_mismatch_buffers.update(
+                str(name)
+                for name in scratch_binding.get(
+                    "shape_mismatch_internal_scratch_buffers",
+                    (),
+                )
+            )
             dtype_mismatch_buffers.update(
                 str(name) for name in binding.get("dtype_mismatch_buffers", ())
             )
+            dtype_mismatch_buffers.update(
+                str(name)
+                for name in scratch_binding.get(
+                    "dtype_mismatch_internal_scratch_buffers",
+                    (),
+                )
+            )
             binding_errors.update(str(error) for error in binding.get("errors", ()))
+            binding_errors.update(
+                str(error) for error in scratch_binding.get("errors", ())
+            )
             if not logical_binding_ready:
                 all_bindings_ready = False
                 missing_logical_buffers.update(str(name) for name in segment_missing)
@@ -4035,22 +4610,44 @@ def path_c_direct_fusion_chain_runtime_binding_payload(
                     "logical_tensor_binding_ready": logical_binding_ready,
                     "bridge_status": bridge.get("status"),
                     "binding_status": binding.get("status"),
+                    "internal_scratch_binding_status": scratch_binding.get("status"),
                     "physical_abi_policy": physical_abi_policy,
                     "execution_phase": str(
                         getattr(segment, "execution_phase", "unknown")
                     ),
                     "required_logical_buffers": required_logical_buffers,
                     "missing_logical_buffers": segment_missing,
+                    "required_internal_scratch_buffers": (
+                        required_internal_scratch_buffers
+                    ),
+                    "missing_internal_scratch_buffers": list(
+                        scratch_binding.get("missing_internal_scratch_buffers", ())
+                    ),
                     "unexpected_logical_buffers": list(
                         binding.get("unexpected_buffers", ())
                     ),
                     "shape_mismatch_buffers": list(
-                        binding.get("shape_mismatch_buffers", ())
+                        [
+                            *binding.get("shape_mismatch_buffers", ()),
+                            *scratch_binding.get(
+                                "shape_mismatch_internal_scratch_buffers",
+                                (),
+                            ),
+                        ]
                     ),
                     "dtype_mismatch_buffers": list(
-                        binding.get("dtype_mismatch_buffers", ())
+                        [
+                            *binding.get("dtype_mismatch_buffers", ()),
+                            *scratch_binding.get(
+                                "dtype_mismatch_internal_scratch_buffers",
+                                (),
+                            ),
+                        ]
                     ),
-                    "binding_errors": list(binding.get("errors", ())),
+                    "binding_errors": [
+                        *binding.get("errors", ()),
+                        *scratch_binding.get("errors", ()),
+                    ],
                     "provided_logical_buffers": provided_logical_buffers,
                     "schedule_id": target.schedule_id,
                     "region_name": segment.region.name,
@@ -4294,11 +4891,15 @@ def path_c_fusion_payload(
     direct_chain_logical_buffer_owner: str | None = None,
     direct_chain_logical_owner: Any | None = None,
     direct_chain_training_runtime: Any | None = None,
+    sequence_length: int | None = None,
 ) -> dict[str, Any]:
     """Return receipt metadata for the high-level Path C fusion planner."""
 
     mode = selected_path_c_fusion_mode()
-    route_context = _path_c_model_route_context(model)
+    route_context = _path_c_model_route_context(
+        model,
+        sequence_length=sequence_length,
+    )
     profile_name = route_context.profile_name
     route_symbols = route_context.route_symbols
     model_regions = route_context.regions
@@ -4347,23 +4948,34 @@ def path_c_fusion_payload(
             model,
             profile_name,
         )
-        direct_chains = plan_path_c_direct_fusion_chains_for_model(
-            model,
-            region_prefix=direct_chain_region_prefix,
-            include_backward=True,
-        )
-        direct_chain = _select_path_c_direct_chain_for_region(
-            direct_chains,
-            selected_region,
-        )
+        runtime_chain = getattr(direct_chain_training_runtime, "chain", None)
+        direct_chains = ()
+        direct_chain = runtime_chain
+        if direct_chain is None:
+            direct_chains = plan_path_c_direct_fusion_chains_for_model(
+                model,
+                region_prefix=direct_chain_region_prefix,
+                include_backward=True,
+                sequence_length=sequence_length,
+            )
+            direct_chain = _select_path_c_direct_chain_for_region(
+                direct_chains,
+                selected_region,
+            )
         if direct_chain is None:
             raise RuntimeError(
                 f"{profile_name} did not produce any direct Path C chain"
             )
         direct_chain_construction = {
-            "planner": "plan_path_c_direct_fusion_chains_for_model",
+            "planner": (
+                "training_runtime.chain"
+                if runtime_chain is not None
+                else "plan_path_c_direct_fusion_chains_for_model"
+            ),
             "region_prefix": direct_chain_region_prefix,
-            "candidate_chain_count": len(direct_chains),
+            "candidate_chain_count": len(direct_chains)
+            if direct_chains
+            else 1,
             "selected_source_region": getattr(
                 getattr(direct_chain, "source_region", None),
                 "name",
@@ -4601,6 +5213,14 @@ def path_c_fusion_payload(
                     model=model,
                 )
             ),
+            "pre_step_owner_plan": (
+                path_c_direct_chain_pre_step_owner_plan(
+                    chain=direct_chain,
+                    model=model,
+                    logical_buffers=direct_chain_logical_buffers,
+                    logical_owner=direct_chain_logical_owner,
+                )
+            ),
             "value_and_grad_bridge_plan": (
                 path_c_direct_fusion_chain_value_and_grad_bridge_plan(
                     chain=direct_chain,
@@ -4830,7 +5450,11 @@ def path_c_model_route_candidates_payload() -> dict[str, Any]:
     )
 
 
-def _path_c_model_route_context(model: Any | None = None) -> SimpleNamespace:
+def _path_c_model_route_context(
+    model: Any | None = None,
+    *,
+    sequence_length: int | None = None,
+) -> SimpleNamespace:
     if model is None:
         profile, route_symbols, regions = _local_gb10_path_c_model_regions()
         return SimpleNamespace(
@@ -4856,6 +5480,7 @@ def _path_c_model_route_context(model: Any | None = None) -> SimpleNamespace:
             region_builder(
                 include_backward=False,
                 min_route_bricks=2,
+                sequence_length=sequence_length,
             )
         )
         region_source = f"{profile_name}.path_c_fusion_regions"
@@ -4863,6 +5488,7 @@ def _path_c_model_route_context(model: Any | None = None) -> SimpleNamespace:
         regions = build_path_c_model_regions_from_model(
             model,
             region_prefix=f"{profile_name}_path_c",
+            sequence_length=sequence_length,
         )
         region_source = "build_path_c_model_regions_from_model"
 
@@ -5265,7 +5891,7 @@ def m04_20step_matrix_payload() -> dict[str, Any]:
 def _path_c_policy_ops(
     args: argparse.Namespace | TrainHybridTinyConfig,
 ) -> list[str]:
-    if not fp8_path_c_route_requested(args):
+    if not path_c_training_route_requested(args):
         return []
     return sorted(
         key.split("__", 1)[-1].lower()
@@ -5531,7 +6157,7 @@ def kernel_dispatch_report(
         "fallback_reason": fallback_reason,
         "kernel_policy_env": (
             dict(FP8_PATH_C_KERNEL_POLICY_ENV)
-            if fp8_path_c_route_requested(args)
+            if path_c_training_route_requested(args)
             else {}
         ),
     }
@@ -5990,6 +6616,127 @@ def run_local_gb10_quarter_training(
                 eval_chunks=loss_eval_chunks,
             )
 
+        batches = dataset.iter_batches(loop=True)
+        first_batch: Any | None = next(batches) if config.steps > 0 else None
+        fp8_path_c_direct_chain_critical_path_install = None
+        path_c_training_runtime = None
+        if bool(getattr(args, "use_path_c_direct_chain_runtime", False)):
+            try:
+                if not path_c_training_route_requested(config):
+                    fp8_path_c_direct_chain_critical_path_install = {
+                        "status": "blocked",
+                        "reason": (
+                            "direct-chain critical path requires Path C kernel "
+                            "policy or dtype=fp8_path_c"
+                        ),
+                        "training_critical_path": False,
+                    }
+                elif bool(compile_plan["enabled"]):
+                    fp8_path_c_direct_chain_critical_path_install = {
+                        "status": "blocked",
+                        "reason": "direct-chain critical path requires compile=False",
+                        "training_critical_path": False,
+                    }
+                elif first_batch is None:
+                    fp8_path_c_direct_chain_critical_path_install = {
+                        "status": "blocked",
+                        "reason": "direct-chain critical path requires at least one batch",
+                        "training_critical_path": False,
+                    }
+                else:
+                    path_c_runtime_sequence_length = (
+                        path_c_batch_sequence_length(first_batch)
+                        or path_c_training_sequence_length(config)
+                    )
+                    profile_name = str(
+                        getattr(model, "path_c_profile_name", "HybridTinyLM")
+                    )
+                    direct_chain_region_prefix = _path_c_direct_chain_region_prefix(
+                        model,
+                        profile_name,
+                    )
+                    direct_chains = plan_path_c_direct_fusion_chains_for_model(
+                        model,
+                        region_prefix=direct_chain_region_prefix,
+                        include_backward=True,
+                        max_segment_nodes=1,
+                        sequence_length=path_c_runtime_sequence_length,
+                    )
+                    regions = build_path_c_model_regions_from_model(
+                        model,
+                        region_prefix=direct_chain_region_prefix,
+                        include_backward=False,
+                        sequence_length=path_c_runtime_sequence_length,
+                    )
+                    selected_region = _select_path_c_model_route_region(regions)
+                    selected_chain = (
+                        None
+                        if selected_region is None
+                        else _select_path_c_direct_chain_for_region(
+                            direct_chains,
+                            selected_region,
+                        )
+                    )
+                    if selected_chain is None:
+                        fp8_path_c_direct_chain_critical_path_install = {
+                            "status": "blocked",
+                            "reason": "model did not expose a direct Path C chain",
+                            "training_critical_path": False,
+                        }
+                    else:
+                        initial_owner = (
+                            make_path_c_direct_chain_pre_step_runtime_owner(
+                                chain=selected_chain,
+                                model=model,
+                                batch=first_batch,
+                            )
+                        )
+
+                        def pre_step_owner_factory(
+                            model_arg: nn.Module,
+                            batch_arg: Mapping[str, mx.array],
+                            *,
+                            chain: Any = selected_chain,
+                        ) -> PathCLogicalBufferOwner:
+                            return make_path_c_direct_chain_pre_step_runtime_owner(
+                                chain=chain,
+                                model=model_arg,
+                                batch=batch_arg,
+                            )
+
+                        fp8_path_c_direct_chain_critical_path_install = (
+                            install_path_c_direct_chain_training_runtime_for_model(
+                                model=model,
+                                chain=selected_chain,
+                                logical_owner=initial_owner,
+                                sequence_length=path_c_runtime_sequence_length,
+                                training_critical_path=True,
+                                run_probe=False,
+                                loss_cotangent_bridge=PathCResidualSumSuffixLossCotangentBridge(
+                                    chunk_rows=config.cce_chunk_rows,
+                                ),
+                                pre_step_owner_factory=pre_step_owner_factory,
+                            )
+                        )
+                        if (
+                            fp8_path_c_direct_chain_critical_path_install.get(
+                                "status"
+                            )
+                            == "ok"
+                        ):
+                            path_c_training_runtime = getattr(
+                                model,
+                                "path_c_direct_fusion_chain_training_runtime",
+                                None,
+                            )
+            except Exception as exc:
+                fp8_path_c_direct_chain_critical_path_install = {
+                    "status": "blocked",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "training_critical_path": False,
+                }
+
         stepper = CompiledPretrainingStep(
             model,
             optimizer,
@@ -5998,12 +6745,18 @@ def run_local_gb10_quarter_training(
             compile=bool(compile_plan["enabled"]),
             split_grad_update_eval=fp8_path_c_route_requested(config),
             path_c_gradient_probe=direct_chain_gradient_capture,
+            path_c_training_runtime=path_c_training_runtime,
         )
         clear_cache_events: list[dict[str, Any]] = []
         step_metrics: list[dict[str, Any]] = []
-        batches = dataset.iter_batches(loop=True)
-        for _ in range(config.steps):
-            metrics = stepper(next(batches))
+        last_batch: Any | None = None
+        for step_index in range(config.steps):
+            if direct_chain_activation_capture is not None:
+                direct_chain_activation_capture.clear()
+            if direct_chain_gradient_capture is not None:
+                direct_chain_gradient_capture.clear()
+            last_batch = first_batch if step_index == 0 else next(batches)
+            metrics = stepper(last_batch)
             step_metrics.append(asdict(metrics))
             clear_cache_event = maybe_clear_cache_after_step(
                 metrics.step,
@@ -6074,6 +6827,7 @@ def run_local_gb10_quarter_training(
                     model,
                     region_prefix=direct_chain_region_prefix,
                     include_backward=True,
+                    sequence_length=path_c_training_sequence_length(config),
                 )
                 direct_chain = _select_path_c_direct_chain_for_region(
                     direct_chains,
@@ -6109,9 +6863,29 @@ def run_local_gb10_quarter_training(
                         install_path_c_direct_chain_training_runtime_for_model(
                             model=model,
                             training_critical_path=False,
-                            run_probe=True,
+                            run_probe=False,
+                            loss_cotangent_bridge=PathCResidualSumSuffixLossCotangentBridge(
+                                chunk_rows=config.cce_chunk_rows,
+                            ),
                         )
                     )
+                    runtime = getattr(
+                        model,
+                        "path_c_direct_fusion_chain_training_runtime",
+                        None,
+                    )
+                    if (
+                        fp8_path_c_direct_chain_runtime_probe.get("status") == "ok"
+                        and runtime is not None
+                        and last_batch is not None
+                    ):
+                        fp8_path_c_direct_chain_runtime_probe[
+                            "value_and_grad_probe"
+                        ] = path_c_direct_chain_value_and_grad_probe_payload(
+                            runtime=runtime,
+                            model=model,
+                            batch=last_batch,
+                        )
                     fp8_path_c_post_step_runtime_capture = (
                         fp8_path_c_training_route_payload_for_model(config, model)
                     )
@@ -6122,6 +6896,11 @@ def run_local_gb10_quarter_training(
                         "error": str(exc),
                         "training_critical_path": False,
                     }
+        if fp8_path_c_direct_chain_critical_path_install is not None:
+            fp8_path_c_training_route = fp8_path_c_training_route_payload_for_model(
+                config,
+                model,
+            )
         optimizer_evidence = optimizer_identity_for_selected_optimizer(
             args,
             config,
@@ -6145,6 +6924,9 @@ def run_local_gb10_quarter_training(
             ),
             "fp8_path_c_direct_chain_runtime_probe": (
                 fp8_path_c_direct_chain_runtime_probe
+            ),
+            "fp8_path_c_direct_chain_critical_path_install": (
+                fp8_path_c_direct_chain_critical_path_install
             ),
             "parameter_count": parameter_count(model),
             "tokens_per_step": final["ntokens"],
@@ -6672,6 +7454,16 @@ def receipt_from_train_payload(
     )
     if not isinstance(fp8_path_c_post_step_runtime_capture, dict):
         fp8_path_c_post_step_runtime_capture = None
+    fp8_path_c_direct_chain_runtime_probe = train_payload.get(
+        "fp8_path_c_direct_chain_runtime_probe"
+    )
+    if not isinstance(fp8_path_c_direct_chain_runtime_probe, dict):
+        fp8_path_c_direct_chain_runtime_probe = None
+    fp8_path_c_direct_chain_critical_path_install = train_payload.get(
+        "fp8_path_c_direct_chain_critical_path_install"
+    )
+    if not isinstance(fp8_path_c_direct_chain_critical_path_install, dict):
+        fp8_path_c_direct_chain_critical_path_install = None
 
     receipt = {
         "receipt_schema_version": RECEIPT_SCHEMA_VERSION,
@@ -6700,6 +7492,12 @@ def receipt_from_train_payload(
             "fp8_path_c_training_route": fp8_path_c_route,
             "fp8_path_c_post_step_runtime_capture": (
                 fp8_path_c_post_step_runtime_capture
+            ),
+            "fp8_path_c_direct_chain_runtime_probe": (
+                fp8_path_c_direct_chain_runtime_probe
+            ),
+            "fp8_path_c_direct_chain_critical_path_install": (
+                fp8_path_c_direct_chain_critical_path_install
             ),
             "steps_requested": config.steps,
             "batch_size": config.batch_size,
@@ -6730,6 +7528,12 @@ def receipt_from_train_payload(
             "fp8_path_c_training_route": fp8_path_c_route,
             "fp8_path_c_post_step_runtime_capture": (
                 fp8_path_c_post_step_runtime_capture
+            ),
+            "fp8_path_c_direct_chain_runtime_probe": (
+                fp8_path_c_direct_chain_runtime_probe
+            ),
+            "fp8_path_c_direct_chain_critical_path_install": (
+                fp8_path_c_direct_chain_critical_path_install
             ),
             "all_finite": all_finite,
             "losses": losses,

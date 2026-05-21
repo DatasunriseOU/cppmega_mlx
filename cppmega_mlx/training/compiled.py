@@ -89,11 +89,22 @@ class PathCGradientBufferCapture:
             self.buffers[name] = tensor
             for alias in self.aliases.get(name, ()):
                 self.buffers[alias] = tensor
-        self.events.append(event)
+        self.events.append(_path_c_capture_event_metadata(event))
 
     def clear(self) -> None:
         self.buffers.clear()
         self.events.clear()
+
+
+def _path_c_capture_event_metadata(event: Mapping[str, Any]) -> Mapping[str, Any]:
+    metadata: dict[str, Any] = {}
+    for key, value in event.items():
+        if isinstance(value, mx.array):
+            metadata[f"{key}_shape"] = tuple(int(dim) for dim in value.shape)
+            metadata[f"{key}_dtype"] = str(value.dtype)
+        else:
+            metadata[key] = value
+    return metadata
 
 
 def should_compile_region(target: CompileTarget) -> bool:

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 from types import ModuleType
 
+import pyarrow.parquet as pq  # type: ignore[import-not-found]
 import pytest
 
 from cppmega_mlx.data.nanochat_pipeline import platform_vocab
@@ -13,6 +15,7 @@ from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched import (
 )
 from scripts.nanochat_data import clang_enriched_to_parquet
 from scripts.nanochat_data.token_budget import chunk_enriched_document, load_tokenizer
+from tools.clang_indexer import index_project
 from tools.clang_indexer.index_project import FunctionDef, PartInfo
 from tools.clang_indexer.process_commits import FileAnalysis, _build_enriched_from_parts
 
@@ -162,6 +165,50 @@ def test_converter_header_alignment_preserves_char_metadata_coordinates() -> Non
         assert doc[key] == [0] * header_len + record[key]
 
 
+def test_local_parquet_conversion_streams_row_groups(tmp_path: Path) -> None:
+    input_path = tmp_path / "input.jsonl"
+    output_path = tmp_path / "out.parquet"
+    records = [
+        {
+            "text": "int one() { return 1; }",
+            "structure_ids": [3] * len("int one() { return 1; }"),
+            "chunk_boundaries": [
+                {"start": 0, "end": len("int one() { return 1; }"), "kind": 3, "dep_level": 0}
+            ],
+            "call_edges": [],
+            "type_edges": [],
+        },
+        {
+            "text": "int two() { return 2; }",
+            "structure_ids": [3] * len("int two() { return 2; }"),
+            "chunk_boundaries": [
+                {"start": 0, "end": len("int two() { return 2; }"), "kind": 3, "dep_level": 0}
+            ],
+            "call_edges": [],
+            "type_edges": [],
+        },
+    ]
+    input_path.write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n",
+        encoding="utf-8",
+    )
+
+    summary = clang_enriched_to_parquet.convert_local_jsonl_to_parquet(
+        input_path,
+        output_path,
+        tokenizer=load_tokenizer(),
+        max_tokens=4096,
+        overflow_policy="drop",
+        materialize_tokenized_enriched=True,
+        local_batch_size=1,
+    )
+
+    parquet_file = pq.ParquetFile(output_path)
+    assert summary == {"docs_in": 2, "docs_out": 2}
+    assert parquet_file.metadata.num_rows == 2
+    assert parquet_file.metadata.num_row_groups == 2
+
+
 def test_token_budget_slices_semantic_char_metadata() -> None:
     doc = {
         "text": "abcdef",
@@ -187,6 +234,31 @@ def test_token_budget_slices_semantic_char_metadata() -> None:
     assert pieces[1]["def_use"] == [0, 1, 2]
 
 
+def test_clang_indexer_ast_metadata_comes_from_clang(tmp_path: Path) -> None:
+    source = tmp_path / "demo.cc"
+    source.write_text(
+        "int helper() { return 1; }\n"
+        "int main() { return helper(); }\n",
+        encoding="utf-8",
+    )
+
+    index_project._configure_libclang(None)
+    clang_index = index_project.Index.create()
+    funcs = index_project.parse_translation_unit(
+        str(source),
+        clang_index,
+        ["-std=c++17", "-fsyntax-only", "-Wno-everything"],
+        str(tmp_path),
+    )
+
+    main = next(func for func in funcs if func.name == "main")
+    assert len(main.ast_depth) == len(main.text)
+    assert len(main.sibling_index) == len(main.text)
+    assert len(main.ast_node_type) == len(main.text)
+    assert any(main.ast_depth)
+    assert 20 in main.ast_node_type  # clang CALL_EXPR bucket
+
+
 def test_commit_enriched_builder_emits_semantic_columns_without_libclang_runtime() -> None:
     helper_text = "int helper() { return 1; }"
     main_text = "int main() { return helper(); }"
@@ -197,6 +269,9 @@ def test_commit_enriched_builder_emits_semantic_columns_without_libclang_runtime
         1,
         helper_text,
         [],
+        ast_depth=[1] * len(helper_text),
+        sibling_index=[0] * len(helper_text),
+        ast_node_type=[1] * len(helper_text),
     )
     main = FunctionDef(
         "main",
@@ -205,6 +280,9 @@ def test_commit_enriched_builder_emits_semantic_columns_without_libclang_runtime
         3,
         main_text,
         ["helper"],
+        ast_depth=[2] * len(main_text),
+        sibling_index=[1] * len(main_text),
+        ast_node_type=[20] * len(main_text),
     )
     analysis = FileAnalysis("", functions=[helper, main])
     parts: list[PartInfo] = [
@@ -222,6 +300,8 @@ def test_commit_enriched_builder_emits_semantic_columns_without_libclang_runtime
     text_len = len(doc["text"])
     for key in ("symbol_ids", "call_targets", "type_refs", "def_use"):
         assert len(doc[key]) == text_len
+    assert len(doc["ast_depth"]) == text_len
+    assert 20 in doc["ast_node_type"]
     assert any(doc["symbol_ids"])
     assert any(doc["call_targets"])
     assert any(value == 1 for value in doc["def_use"])
