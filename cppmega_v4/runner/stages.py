@@ -561,6 +561,19 @@ def stage_train(ctx: StageContext) -> StageResult:
                     pass
         all_modules = nn.Sequential(*modules, *lm_heads)
         opt, optimizer_kind = _build_optimizer(spec_optim, lr)
+        # G10: optional optimizer state warm-start across sequential
+        # Train runs. opts.continue_from_run_id refers to a prior
+        # run cached in _RUN_CACHE. If hit, restore opt.state so the
+        # second Train's losses[0] picks up where the first left off.
+        opt_state_carried = False
+        run_id = str(opts.get("run_id") or id(opt))
+        continue_from = opts.get("continue_from_run_id")
+        if continue_from and continue_from in _RUN_CACHE:
+            try:
+                opt.state = _RUN_CACHE[continue_from]
+                opt_state_carried = True
+            except Exception:
+                pass
         # V4-9: when hybrid, count params routed to each bucket so e2e can
         # prove the split predicate actually saw 2D vs 1D/3D parameters.
         muon_group_size: int | None = None
@@ -725,6 +738,14 @@ def stage_train(ctx: StageContext) -> StageResult:
         except Exception:
             pass
 
+        # G10: cache opt.state for future warm-start lookups (capped LRU)
+        try:
+            _RUN_CACHE[run_id] = opt.state
+            if len(_RUN_CACHE) > 8:
+                _RUN_CACHE.pop(next(iter(_RUN_CACHE)))
+        except Exception:
+            pass
+
         after_flat = dict(nn.utils.tree_flatten(all_modules.parameters()))
         delta = 0.0
         if probe_key is not None and probe_before is not None:
@@ -814,6 +835,8 @@ def stage_train(ctx: StageContext) -> StageResult:
                 "train_dtype": train_dtype,
                 "master_dtype": master_dtype,
                 "fp8_active": fp8_active,
+                "opt_state_carried": opt_state_carried,
+                "run_id": run_id,
                 "mtp": _compute_mtp_extras(
                     all_modules, mtp_k, mtp_betas, vocab_size,
                     batch, seq, hidden, targets,
@@ -875,6 +898,11 @@ def _tokenize_parquet_text(
         return out, Path(tokenizer_path).name
     except Exception:
         return [], None
+
+
+# G10: in-process LRU cache of opt.state by run_id. Used for warm-start
+# across sequential Train clicks in the same backend session.
+_RUN_CACHE: dict[str, Any] = {}
 
 
 _REWRITER_FACTORIES: dict[str, Callable[..., Any]] = {}
