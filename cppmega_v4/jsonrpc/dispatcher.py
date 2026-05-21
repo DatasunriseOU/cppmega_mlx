@@ -39,6 +39,9 @@ from cppmega_v4.jsonrpc.suggest_groups_method import suggest_optim_groups
 from cppmega_v4.jsonrpc.roundtrip_method import (
     RoundtripCheckParams, roundtrip_check,
 )
+from cppmega_v4.jsonrpc.ablation_method import (
+    AblationRunParams, ablation_run,
+)
 from cppmega_v4.jsonrpc.schema import (
     BuildPresetSpecsParams,
     CatalogExplainParams,
@@ -110,6 +113,10 @@ _ROUTES: Mapping[str, tuple[type[BaseModel], _Handler]] = {
     "data.roundtrip_check": (
         RoundtripCheckParams,
         lambda p, c: roundtrip_check(p, cache=c),
+    ),
+    "ablation.run": (
+        AblationRunParams,
+        lambda p, c: ablation_run(p, cache=c),
     ),
 }
 

@@ -704,6 +704,7 @@ METHOD_REGISTRY: frozenset[str] = frozenset({
     "architectures.list_presets",
     "suggest_optim_groups",
     "data.roundtrip_check",
+    "ablation.run",
 })
 
 
