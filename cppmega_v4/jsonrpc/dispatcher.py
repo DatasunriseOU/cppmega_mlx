@@ -22,6 +22,11 @@ from cppmega_v4.jsonrpc.methods import (
     suggest_sharding,
     verify,
 )
+from cppmega_v4.jsonrpc.tokenizer_methods import (
+    EncodeVisualizeParams,
+    encode_visualize,
+    list_presets as tokenizer_list_presets,
+)
 from cppmega_v4.jsonrpc.schema import (
     BuildPresetSpecsParams,
     ErrorCode,
@@ -66,6 +71,10 @@ _ROUTES: Mapping[str, tuple[type[BaseModel], _Handler]] = {
     "pipeline.run": (
         PipelineRunParams,
         lambda p, c: _pipeline_run(p),
+    ),
+    "tokenizer.encode_visualize": (
+        EncodeVisualizeParams,
+        lambda p, c: encode_visualize(p, cache=c),
     ),
 }
 
@@ -114,6 +123,12 @@ def dispatch(
 
     if request.method == "backend.status":
         return JsonRpcResponse(id=request.id, result={"status": "ok"})
+
+    if request.method == "tokenizer.list_presets":
+        return JsonRpcResponse(
+            id=request.id,
+            result=tokenizer_list_presets().model_dump(mode="json"),
+        )
 
     route = _ROUTES.get(request.method)
     if route is None:

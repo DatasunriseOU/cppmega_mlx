@@ -532,4 +532,6 @@ METHOD_REGISTRY: frozenset[str] = frozenset({
     "probe.run",
     "pipeline.run",
     "backend.status",
+    "tokenizer.encode_visualize",
+    "tokenizer.list_presets",
 })
