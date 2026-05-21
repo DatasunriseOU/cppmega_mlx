@@ -389,8 +389,39 @@ def stage_train(ctx: StageContext) -> StageResult:
         if not all(modules):
             raise RuntimeError("graph has un-instantiated nodes")
 
-        # Synthetic LM head: tied to the last brick's output.
-        lm_head = nn.Linear(hidden, vocab_size, bias=False)
+        # G01: detect MTP_WEIGHTED loss kind from spec; build K extra LM
+        # heads + per-head shifted-label loss. Falls back to single-head
+        # CE for all other LossKind values (effective math = CE today;
+        # IFIM/MHC math wiring is G02/G03 follow-up). Reads k + betas
+        # from spec.loss.params; _make_loss already broadcast-fills
+        # beta_0..beta_{k-1} from UI's flat `beta` field.
+        spec_loss = getattr(ctx.spec, "loss", None)
+        spec_loss_kind = (getattr(spec_loss, "kind", "cross_entropy")
+                          if spec_loss is not None else "cross_entropy")
+        spec_loss_params = (dict(getattr(spec_loss, "params", {}))
+                            if spec_loss is not None else {})
+        mtp_k = 1
+        mtp_betas: list[float] = [1.0]
+        if spec_loss_kind == "mtp_weighted":
+            try:
+                mtp_k = max(1, int(spec_loss_params.get("k", 2)))
+            except (TypeError, ValueError):
+                mtp_k = 2
+            mtp_betas = []
+            for i in range(mtp_k):
+                key = f"beta_{i}"
+                if key in spec_loss_params:
+                    mtp_betas.append(float(spec_loss_params[key]))
+                elif "beta" in spec_loss_params:
+                    mtp_betas.append(float(spec_loss_params["beta"]))
+                else:
+                    mtp_betas.append(0.5)
+
+        # Synthetic LM head — for MTP we create K of them. lm_head is the
+        # first one (used by single-head paths and the inference probe).
+        lm_heads = [nn.Linear(hidden, vocab_size, bias=False)
+                    for _ in range(mtp_k)]
+        lm_head = lm_heads[0]
 
         def forward_layers(layer_iter, input_embeds: mx.array) -> mx.array:
             x = input_embeds
@@ -404,16 +435,40 @@ def stage_train(ctx: StageContext) -> StageResult:
                 x = out
             return x
 
-        def loss_fn(model: nn.Module, emb: mx.array, tgt: mx.array) -> mx.array:
-            layers = list(getattr(model, "layers", model))
-            features = forward_layers(layers[:-1], emb)
-            if getattr(features, "shape", None) == emb.shape:
-                features = features + emb
-            logits = layers[-1](features)
+        def _ce(logits: mx.array, tgt: mx.array) -> mx.array:
             return nn.losses.cross_entropy(
                 logits.reshape(-1, vocab_size), tgt.reshape(-1),
                 reduction="mean",
             )
+
+        def _shift_labels_local(labels: mx.array, k_offset: int) -> mx.array:
+            if k_offset == 0:
+                return labels
+            B, S = labels.shape
+            if k_offset >= S:
+                return mx.zeros_like(labels)
+            return mx.concatenate(
+                [labels[:, k_offset:],
+                 mx.broadcast_to(labels[:, -1:], (B, k_offset))],
+                axis=1,
+            )
+
+        def loss_fn(model: nn.Module, emb: mx.array, tgt: mx.array) -> mx.array:
+            layers = list(getattr(model, "layers", model))
+            # Last mtp_k layers are LM heads; preceding layers are bricks.
+            head_count = mtp_k
+            brick_layers = layers[:-head_count] if head_count > 0 else layers
+            features = forward_layers(brick_layers, emb)
+            if getattr(features, "shape", None) == emb.shape:
+                features = features + emb
+            if head_count <= 1:
+                return _ce(layers[-1](features), tgt)
+            total = mx.zeros(())
+            for i in range(head_count):
+                shifted = _shift_labels_local(tgt, i)
+                total = total + mtp_betas[i] * _ce(
+                    layers[-head_count + i](features), shifted)
+            return total
 
         # V3-2: prefer real tokens from a parquet shard when opts
         # supplies parquet_path. Falls back to synthetic random targets
@@ -465,7 +520,7 @@ def stage_train(ctx: StageContext) -> StageResult:
                         token_count = len(tokens)
                 except Exception:
                     pass
-        all_modules = nn.Sequential(*modules, lm_head)
+        all_modules = nn.Sequential(*modules, *lm_heads)
         opt, optimizer_kind = _build_optimizer(spec_optim, lr)
         # V4-9: when hybrid, count params routed to each bucket so e2e can
         # prove the split predicate actually saw 2D vs 1D/3D parameters.
@@ -489,15 +544,18 @@ def stage_train(ctx: StageContext) -> StageResult:
         # V4-11: inference probe — forward over a fixed-seed input both
         # before training and after; report l2 and cosine drift. Proves
         # the optimizer's update actually changed observable model output,
-        # not just internal optimizer state.
+        # not just internal optimizer state. G01: skip the K-1 extra LM
+        # heads — probe only the primary head so output shape stays sane
+        # for mtp_k > 1.
         probe_input = mx.random.normal(
             shape=(1, seq, hidden), key=mx.random.key(42))
         probe_layers_before = list(getattr(all_modules, "layers", all_modules))
+        _probe_brick_layers = probe_layers_before[:-mtp_k]
         probe_features_before = forward_layers(
-            probe_layers_before[:-1], probe_input)
+            _probe_brick_layers, probe_input)
         if getattr(probe_features_before, "shape", None) == probe_input.shape:
             probe_features_before = probe_features_before + probe_input
-        probe_output_before = probe_layers_before[-1](
+        probe_output_before = probe_layers_before[-mtp_k](
             probe_features_before).reshape(-1)
         mx.eval(probe_output_before)
         probe_output_before = mx.array(probe_output_before)
@@ -549,10 +607,10 @@ def stage_train(ctx: StageContext) -> StageResult:
         # V4-11: re-run forward on the same fixed-seed input post-training.
         probe_layers_after = list(getattr(all_modules, "layers", all_modules))
         probe_features_after = forward_layers(
-            probe_layers_after[:-1], probe_input)
+            probe_layers_after[:-mtp_k], probe_input)
         if getattr(probe_features_after, "shape", None) == probe_input.shape:
             probe_features_after = probe_features_after + probe_input
-        probe_output_after = probe_layers_after[-1](
+        probe_output_after = probe_layers_after[-mtp_k](
             probe_features_after).reshape(-1)
         mx.eval(probe_output_after)
         diff_vec = probe_output_after - probe_output_before
@@ -619,6 +677,11 @@ def stage_train(ctx: StageContext) -> StageResult:
                     "cos_sim": round(cos_sim, 6),
                 },
                 "side_channels_observed": side_channels_observed,
+                "mtp": _compute_mtp_extras(
+                    all_modules, mtp_k, mtp_betas, vocab_size,
+                    batch, seq, hidden, targets,
+                    forward_layers, _ce, _shift_labels_local)
+                    if spec_loss_kind == "mtp_weighted" else None,
                 "model_summary": _summarize_model(
                     ctx.spec, optimizer_kind, schedule_kind_label),
             },
@@ -667,6 +730,38 @@ def _tokenize_parquet_text(
         return out, Path(tokenizer_path).name
     except Exception:
         return [], None
+
+
+def _compute_mtp_extras(
+    all_modules: Any, k: int, betas: list[float], vocab_size: int,
+    batch: int, seq: int, hidden: int, targets: Any,
+    forward_layers: Any, ce: Any, shift_labels: Any,
+) -> dict[str, Any]:
+    """G01: produce extras.mtp with per-head CE losses for the same
+    targets after training. Single extra forward pass — light compared
+    to N training steps. Reports the final per-head loss so e2e can
+    assert mtp.k matches selection AND that distinct heads have
+    distinct losses (proves K heads were actually wired)."""
+    import mlx.core as mx_local
+    layers = list(getattr(all_modules, "layers", all_modules))
+    brick_layers = layers[:-k]
+    head_layers = layers[-k:]
+    probe_emb = mx_local.random.normal(
+        shape=(batch, seq, hidden), key=mx_local.random.key(7))
+    features = forward_layers(brick_layers, probe_emb)
+    if getattr(features, "shape", None) == probe_emb.shape:
+        features = features + probe_emb
+    per_head_losses: list[float] = []
+    for i in range(k):
+        shifted = shift_labels(targets, i)
+        loss_i = ce(head_layers[i](features), shifted)
+        mx_local.eval(loss_i)
+        per_head_losses.append(round(float(loss_i.item()), 4))
+    return {
+        "k": k,
+        "betas": [round(b, 4) for b in betas],
+        "per_head_losses": per_head_losses,
+    }
 
 
 def _read_first_n_tokens(parquet_path: str, n: int) -> list[int]:

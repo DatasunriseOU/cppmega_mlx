@@ -86,6 +86,10 @@ function ExtrasEntry({
     );
   }
   if (v !== null && typeof v === "object") {
+    // G01: recurse so nested arrays/objects (e.g. extras.mtp.betas) get
+    // their own per-index testids instead of being JSON-stringified into
+    // a single dd. The recursion uses the same `${base}-${sk}` testid
+    // prefix the test framework already expects.
     return (
       <div style={{ display: "flex", gap: 8 }}>
         <dt style={{ color: "#6b7280", minWidth: 140 }}>{k}</dt>
@@ -93,15 +97,7 @@ function ExtrasEntry({
           <dl data-testid={base}
               style={{ margin: 0, paddingLeft: 8 }}>
             {Object.entries(v as Record<string, unknown>).map(([sk, sv]) => (
-              <div key={sk} style={{ display: "flex", gap: 6 }}>
-                <dt style={{ color: "#9ca3af", minWidth: 120 }}>{sk}</dt>
-                <dd data-testid={`${base}-${sk}`}
-                    style={{ margin: 0 }}>
-                  {typeof sv === "object" && sv !== null
-                    ? JSON.stringify(sv)
-                    : String(sv)}
-                </dd>
-              </div>
+              <ExtrasEntry key={sk} stage={stage} k={`${k}-${sk}`} v={sv} />
             ))}
           </dl>
         </dd>
