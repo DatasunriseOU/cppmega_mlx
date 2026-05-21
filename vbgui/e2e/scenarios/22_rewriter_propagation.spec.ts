@@ -27,10 +27,6 @@ for (const rw of REWRITERS) {
       await modal.waitFor({ timeout: 60_000 });
       const extras = await readTrainExtras(page);
 
-      // Top-level extras has the list (array DOM testid pattern)
-      const rwListRoot = page.locator(
-        "[data-testid^='run-result-extras-train-model_summary-rewriters_applied']");
-      const count = await rwListRoot.count();
       // model_summary.rewriters_applied renders as nested object → dl entry
       // OR as array → ol. Either way the chosen rewriter name must appear.
       // Easier: assert top-level extras renders the array via the recursive
