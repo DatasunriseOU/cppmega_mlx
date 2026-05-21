@@ -552,7 +552,18 @@ METHOD_REGISTRY: frozenset[str] = frozenset({
     "data.preview_parquet",
     "catalog.explain",
     "catalog.list_options",
+    "architectures.list_presets",
 })
+
+
+class ArchitecturesListPresetsResult(BaseModel):
+    """architectures.list_presets — sorted preset names from
+    cppmega_v4.architectures.PRESETS. UI calls this once on mount to
+    populate the preset launcher dropdown dynamically."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    presets: list[str] = Field(default_factory=list)
 
 
 class CatalogExplainParams(BaseModel):

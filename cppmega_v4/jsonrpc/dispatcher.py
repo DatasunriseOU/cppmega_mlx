@@ -152,6 +152,16 @@ def dispatch(
             result=tokenizer_list_presets().model_dump(mode="json"),
         )
 
+    if request.method == "architectures.list_presets":
+        from cppmega_v4.architectures import available_presets
+        from cppmega_v4.jsonrpc.schema import ArchitecturesListPresetsResult
+        return JsonRpcResponse(
+            id=request.id,
+            result=ArchitecturesListPresetsResult(
+                presets=list(available_presets()),
+            ).model_dump(mode="json"),
+        )
+
     route = _ROUTES.get(request.method)
     if route is None:
         return _error_response(
