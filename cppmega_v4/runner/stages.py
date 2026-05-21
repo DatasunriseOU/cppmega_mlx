@@ -339,12 +339,124 @@ def stage_optimizer_smoke(ctx: StageContext) -> StageResult:
 
 
 def stage_train(ctx: StageContext) -> StageResult:
-    """Placeholder for the full training stage (out of F-A.2 scope)."""
+    """Run a mini-training loop: real forward → CE loss → backward →
+    AdamW.update() × N steps. Used by the E2E train matrix (E-4) and by
+    anyone hitting the Train button in the GUI top bar.
+
+    Asserts loss is finite, weights actually moved, and loss does not
+    blow up across steps (loss_step_k / loss_step_0 < 5×). N steps and
+    learning rate come from ``stage_options.train``; defaults: 2 steps,
+    lr=1e-3.
+    """
     t0 = time.perf_counter()
-    return StageResult(
-        name="train", status="skipped",
-        elapsed_ms=(time.perf_counter() - t0) * 1000.0,
-    )
+    try:
+        import mlx.nn as nn
+        import mlx.optimizers as optim
+        from cppmega_v4.fusion import from_block_specs
+
+        opts = ctx.opts("train")
+        n_steps = int(opts.get("num_steps", 2))
+        lr = float(opts.get("lr", 1e-3))
+        vocab_size = int(opts.get("vocab_size", 256))
+        seq = int(opts.get("S", 8))
+        batch = int(opts.get("B", 1))
+        hidden = ctx.spec.dim_env.get("H", 64)
+
+        # Re-materialise the graph with instantiate=True so backward works.
+        specs = _graph_to_specs(ctx.spec.graph)
+        graph = from_block_specs(specs, hidden_size=hidden, instantiate=True)
+        modules = [n.module for n in graph.nodes]
+        if not all(modules):
+            raise RuntimeError("graph has un-instantiated nodes")
+
+        # Synthetic LM head: tied to the last brick's output.
+        lm_head = nn.Linear(hidden, vocab_size, bias=False)
+
+        def forward(input_embeds: mx.array) -> mx.array:
+            x = input_embeds
+            for mod in modules:
+                out = mod(x)
+                # Coerce tuple/dict returns to first array.
+                if isinstance(out, (tuple, list)):
+                    out = next(o for o in out if hasattr(o, "shape"))
+                elif isinstance(out, dict):
+                    out = next(v for v in out.values() if hasattr(v, "shape"))
+                x = out
+            return lm_head(x)
+
+        # Build inputs once: synthetic Gaussian embeddings (no real
+        # tokenizer dependence — train matrix isolates the gradient path).
+        rng_key = mx.random.key(0)
+        targets = mx.random.randint(0, vocab_size, shape=(batch, seq))
+
+        def loss_fn(emb: mx.array, tgt: mx.array) -> mx.array:
+            logits = forward(emb)
+            return nn.losses.cross_entropy(
+                logits.reshape(-1, vocab_size), tgt.reshape(-1),
+                reduction="mean",
+            )
+
+        all_modules = nn.Sequential(*modules, lm_head)
+        opt = optim.AdamW(learning_rate=lr)
+        loss_and_grad = nn.value_and_grad(all_modules, lambda m, emb, tgt:
+            loss_fn(emb, tgt))
+
+        losses: list[float] = []
+        # Snapshot first trainable param for delta check
+        flat_params = dict(nn.utils.tree_flatten(all_modules.parameters()))
+        first_key = next(iter(flat_params))
+        before = mx.array(flat_params[first_key])  # deep copy
+
+        for step in range(n_steps):
+            emb = mx.random.normal(shape=(batch, seq, hidden), key=rng_key)
+            rng_key, _ = mx.random.split(rng_key)
+            loss, grads = loss_and_grad(all_modules, emb, targets)
+            mx.eval(loss, grads)
+            opt.update(all_modules, grads)
+            mx.eval(all_modules.parameters(), opt.state)
+            losses.append(float(loss.item()))
+
+        # Param delta on the snapshotted leaf
+        after_flat = dict(nn.utils.tree_flatten(all_modules.parameters()))
+        delta = float(mx.linalg.norm(after_flat[first_key] - before).item())
+
+        finite = all(l == l and -1e10 < l < 1e10 for l in losses)
+        if not finite:
+            return StageResult(
+                name="train", status="fail",
+                elapsed_ms=(time.perf_counter() - t0) * 1000.0,
+                errors=1,
+                error={"type": "NonFiniteLoss",
+                       "detail": f"losses={losses}"},
+            )
+        if delta <= 1e-6:
+            return StageResult(
+                name="train", status="fail",
+                elapsed_ms=(time.perf_counter() - t0) * 1000.0,
+                errors=1,
+                error={"type": "WeightsUnchanged",
+                       "detail": f"delta {delta:.2e} <= 1e-6"},
+            )
+        if len(losses) >= 2 and losses[0] > 0 and losses[-1] / losses[0] > 5:
+            return StageResult(
+                name="train", status="fail",
+                elapsed_ms=(time.perf_counter() - t0) * 1000.0,
+                errors=1,
+                error={"type": "LossBlowUp",
+                       "detail": f"losses={losses}, ratio="
+                                 f"{losses[-1] / losses[0]:.2f}"},
+            )
+        return StageResult(
+            name="train", status="ok",
+            elapsed_ms=(time.perf_counter() - t0) * 1000.0,
+            extras={
+                "losses": [round(l, 4) for l in losses],
+                "weight_delta_norm": round(delta, 6),
+                "num_steps": n_steps,
+            },
+        )
+    except Exception as exc:
+        return _fail("train", t0, exc)
 
 
 # ---------------------------------------------------------------------------
