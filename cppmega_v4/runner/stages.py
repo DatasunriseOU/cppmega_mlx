@@ -457,6 +457,23 @@ def stage_train(ctx: StageContext) -> StageResult:
                     pass
         all_modules = nn.Sequential(*modules, lm_head)
         opt, optimizer_kind = _build_optimizer(spec_optim, lr)
+        # V4-9: when hybrid, count params routed to each bucket so e2e can
+        # prove the split predicate actually saw 2D vs 1D/3D parameters.
+        muon_group_size: int | None = None
+        adamw_group_size: int | None = None
+        if optimizer_kind == "muon_adamw_hybrid":
+            try:
+                from cppmega_mlx.training.optimizers import split_param_groups
+                muon_t, adamw_t = split_param_groups(
+                    all_modules.parameters())
+                def _count(tree: Any) -> int:
+                    flat = dict(nn.utils.tree_flatten(tree))
+                    return sum(int(v.size) for v in flat.values()
+                               if hasattr(v, "size"))
+                muon_group_size = _count(muon_t)
+                adamw_group_size = _count(adamw_t)
+            except Exception:
+                pass
         loss_and_grad = nn.value_and_grad(all_modules, loss_fn)
 
         losses: list[float] = []
@@ -552,6 +569,8 @@ def stage_train(ctx: StageContext) -> StageResult:
                     if getattr(ctx.spec, "loss", None) is not None
                     else "cross_entropy"
                 ),
+                "muon_group_size": muon_group_size,
+                "adamw_group_size": adamw_group_size,
                 "model_summary": _summarize_model(
                     ctx.spec, optimizer_kind, schedule_kind_label),
             },
