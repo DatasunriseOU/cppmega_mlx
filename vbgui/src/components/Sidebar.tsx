@@ -4,11 +4,14 @@ import { OptimTab } from "./sidebar/OptimTab";
 import { RewritersTab } from "./sidebar/RewritersTab";
 import { ShardingTab, type ShardingProposalView } from "./sidebar/ShardingTab";
 import { GotchasTab } from "./sidebar/GotchasTab";
+import { DimensionsTab,
+         type InferenceEntryClient } from "./sidebar/DimensionsTab";
 import type {
   GotchaState, LossState, OptimState, RewriterState, ShardingState,
 } from "@/state/spec";
 
-export type SidebarTab = "loss" | "optim" | "rewriters" | "sharding" | "gotchas";
+export type SidebarTab = "loss" | "optim" | "rewriters" | "sharding"
+                       | "gotchas" | "dimensions";
 
 export interface SidebarProps {
   loss: LossState;
@@ -32,14 +35,18 @@ export interface SidebarProps {
   /** Optional canvas state — required for OptimTab Auto-group button. */
   graphNodes?: import("@xyflow/react").Node[];
   graphEdges?: import("@xyflow/react").Edge[];
+  /** E7-2: inferred dimensions populated from verify response. */
+  inferenceLog?: InferenceEntryClient[];
+  onHighlightBrick?: (brick: string) => void;
 }
 
 const TAB_LABELS: { key: SidebarTab; label: string }[] = [
-  { key: "loss",      label: "Loss" },
-  { key: "optim",     label: "Optim" },
-  { key: "rewriters", label: "Rewriters" },
-  { key: "sharding",  label: "Sharding" },
-  { key: "gotchas",   label: "Gotchas" },
+  { key: "loss",       label: "Loss" },
+  { key: "optim",      label: "Optim" },
+  { key: "rewriters",  label: "Rewriters" },
+  { key: "sharding",   label: "Sharding" },
+  { key: "gotchas",    label: "Gotchas" },
+  { key: "dimensions", label: "Dimensions" },
 ];
 
 export function Sidebar(p: SidebarProps): JSX.Element {
@@ -90,6 +97,10 @@ export function Sidebar(p: SidebarProps): JSX.Element {
         )}
         {active === "gotchas"   && (
           <GotchasTab gotchas={p.gotchas} onAutoFix={p.onGotchaAutoFix} />
+        )}
+        {active === "dimensions" && (
+          <DimensionsTab log={p.inferenceLog ?? []}
+                          onHighlight={p.onHighlightBrick} />
         )}
       </div>
     </aside>

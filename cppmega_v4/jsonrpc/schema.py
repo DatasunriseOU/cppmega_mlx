@@ -15,7 +15,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 
-SCHEMA_VERSION: str = "1.0.0"
+SCHEMA_VERSION: str = "1.1.0"
 
 JsonRpcVersion = Literal["2.0"]
 
@@ -196,6 +196,137 @@ class RewriterPayload(BaseModel):
     params: dict[str, Any] = Field(default_factory=dict)
 
 
+SideChannelModePayload = Literal["off", "auto", "require", "if_available"]
+SideChannelEmbeddingPayload = Literal[
+    "categorical", "numeric_bucket", "span", "edge_bias", "none"
+]
+SideChannelFallbackPayload = Literal[
+    "zeros", "unknown_id", "drop_family", "error"
+]
+InferenceEnrichmentSourcePayload = Literal[
+    "none", "prompt_only", "parse_if_possible", "project_index", "auto"
+]
+InferenceFailPolicyPayload = Literal["drop_family", "text_only", "error"]
+PackingPolicyPayload = Literal["sequential", "best_fit"]
+
+
+class FamilySpecPayload(BaseModel):
+    """Wire form of one side-channel family policy."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: SideChannelModePayload = "if_available"
+    columns: list[str] = Field(default_factory=list)
+    embedding: SideChannelEmbeddingPayload = "categorical"
+    dropout: float = Field(default=0.0, ge=0.0, le=1.0)
+    residual_scale: float = Field(default=1.0, ge=0.0)
+    fallback: SideChannelFallbackPayload = "drop_family"
+    language_scope: list[str] = Field(default_factory=lambda: ["any"])
+
+
+class InferenceEnrichmentSpecPayload(BaseModel):
+    """Wire form of inference-time side-channel enrichment policy."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: InferenceEnrichmentSourcePayload = "auto"
+    fail_policy: InferenceFailPolicyPayload = "drop_family"
+    timeout_ms: int = Field(default=500, ge=0)
+    cache_enabled: bool = True
+
+
+def _default_side_channel_family_payloads() -> dict[str, FamilySpecPayload]:
+    return {
+        "platform": FamilySpecPayload(
+            mode="auto",
+            columns=["platform_ids", "source_platform_ids"],
+            embedding="categorical",
+            dropout=0.10,
+        ),
+        "syntax": FamilySpecPayload(
+            mode="if_available",
+            columns=[
+                "token_ast_depth",
+                "token_sibling_index",
+                "token_ast_node_type",
+            ],
+            embedding="categorical",
+            dropout=0.25,
+        ),
+        "structure": FamilySpecPayload(
+            mode="if_available",
+            columns=[
+                "token_structure_ids",
+                "token_dep_levels",
+                "token_chunk_starts",
+                "token_chunk_ends",
+                "token_chunk_kinds",
+                "token_chunk_dep_levels",
+            ],
+            embedding="categorical",
+            dropout=0.25,
+        ),
+        "semantic_graph": FamilySpecPayload(
+            mode="if_available",
+            columns=[
+                "token_symbol_ids",
+                "token_call_targets",
+                "token_type_refs",
+                "token_def_use",
+                "token_call_edges",
+                "token_type_edges",
+            ],
+            embedding="edge_bias",
+            dropout=0.50,
+        ),
+        "temporal_diff": FamilySpecPayload(
+            mode="off",
+            columns=[
+                "token_change_mask_pre",
+                "token_change_mask_post",
+                "hunk_id_per_token",
+                "edit_op_per_token",
+            ],
+            embedding="categorical",
+            dropout=0.0,
+        ),
+    }
+
+
+class SideChannelSpecPayload(BaseModel):
+    """Wire form of the generic side-channel conditioning policy."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: SideChannelModePayload = "auto"
+    families: dict[str, FamilySpecPayload] = Field(
+        default_factory=_default_side_channel_family_payloads
+    )
+    inference: InferenceEnrichmentSpecPayload = Field(
+        default_factory=InferenceEnrichmentSpecPayload
+    )
+
+
+class DataMaterializationSpecPayload(BaseModel):
+    """Wire form of packed-row parquet materialization policy."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    packing_policy: PackingPolicyPayload = "best_fit"
+    max_seq_len: int = Field(default=4096, gt=0)
+    pad_to_max: bool = True
+    include_provenance: bool = True
+    required_token_fields: list[str] = Field(default_factory=lambda: [
+        "input_ids",
+        "target_ids",
+        "loss_mask",
+        "doc_ids",
+        "pack_id",
+        "valid_token_count",
+        "num_docs",
+    ])
+
+
 # ---------------------------------------------------------------------------
 # `verify` — primary endpoint, full validation pass.
 # ---------------------------------------------------------------------------
@@ -213,6 +344,9 @@ class VerifyParams(BaseModel):
     rewriters: list[RewriterPayload] = Field(default_factory=list)
     sharding: ShardingSpecPayload | None = None
     training: bool = True
+    side_channels: SideChannelSpecPayload = Field(
+        default_factory=SideChannelSpecPayload
+    )
     available_side_channels: list[str] = Field(default_factory=lambda: ["doc_ids", "token_ids"])
 
 
@@ -312,6 +446,20 @@ class FusionRegionPayload(BaseModel):
     estimated_savings_us: float = 0.0
 
 
+class InferenceEntryPayload(BaseModel):
+    """One dimension-inference entry (E7-2). Surfaces in the
+    Dimensions sidebar tab so users see why num_heads=2 came out as it
+    did (e.g. H=128/head_dim=64 → 2)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    brick: str
+    param: str
+    value: Any
+    source: Literal["user", "auto"]
+    reason: str
+
+
 class VerifyResult(BaseModel):
     """Wire form of one ``verify`` response."""
 
@@ -322,6 +470,7 @@ class VerifyResult(BaseModel):
     memory_distributed: DistributedMemoryPayload | None = None
     gotchas: list[GotchaPayload] = Field(default_factory=list)
     fusion_plan: list[FusionRegionPayload] = Field(default_factory=list)
+    inference_log: list[InferenceEntryPayload] = Field(default_factory=list)
     elapsed_ms: float
 
 

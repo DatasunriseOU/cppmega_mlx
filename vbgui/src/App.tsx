@@ -34,7 +34,6 @@ const TOPOLOGIES: readonly TopologyFactory[] = [
 
 // Mini-spec used for preset expansion in the GUI. Matches E2EMatrix.md §3.1.
 const MINI_HIDDEN = 128;
-const MINI_DEPTH = 2;
 const MINI_DIM_ENV = {
   B: 1, S: 64, H: MINI_HIDDEN,
   nh: 2, nkv: 1, head_dim: 64,
@@ -94,6 +93,10 @@ export function App(): JSX.Element {
   const [runReport, setRunReport] = useState<RunReport | null>(null);
   const [runError, setRunError] = useState<string | null>(null);
   const [selectedBrickId, setSelectedBrickId] = useState<string | null>(null);
+  const [inferenceLog, setInferenceLog] = useState<
+    { brick: string; param: string; value: unknown;
+      source: "user" | "auto"; reason: string }[]
+  >([]);
 
   const rpc = useRpc({
     baseUrl: (import.meta.env.VITE_BACKEND_URL as string | undefined)
@@ -130,6 +133,8 @@ export function App(): JSX.Element {
         resolved?: { edges?: { src: string; dst: string;
                                matched: boolean;
                                severity: "info" | "warning" | "error" }[] };
+        inference_log?: { brick: string; param: string; value: unknown;
+                          source: "user" | "auto"; reason: string }[];
       }>("verify", params);
 
       // Aggregate per-brick to a worst-rank-bytes proxy when no sharding.
@@ -144,6 +149,9 @@ export function App(): JSX.Element {
       }
       if (r.resolved?.edges) {
         setEdges((prev) => recolorEdges(prev, r.resolved!.edges!));
+      }
+      if (r.inference_log) {
+        setInferenceLog(r.inference_log);
       }
     } catch {
       // Backend down or invalid spec; leave state and let user retry.
@@ -345,6 +353,8 @@ export function App(): JSX.Element {
                 rpc={rpc}
                 graphNodes={nodes}
                 graphEdges={edges}
+                inferenceLog={inferenceLog}
+                onHighlightBrick={setSelectedBrickId}
                 onLossApply={(l) => dispatch({ type: "loss.set", loss: l })}
                 onOptimApply={(o) => dispatch({ type: "optim.set", optim: o })}
                 onRewriterAdd={(r) =>

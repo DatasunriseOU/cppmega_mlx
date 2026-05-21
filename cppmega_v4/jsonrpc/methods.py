@@ -306,6 +306,24 @@ def verify(params: VerifyParams, *, cache: LRUCache | None = None) -> VerifyResu
         for fp in fusion_plan
     ]
 
+    # E7-2: build inference log so the UI Dimensions tab can show why
+    # each per-brick parameter has the value it does (user-set vs
+    # auto-derived from dim_env).
+    from cppmega_v4.spec.inference_log import build_inference_log
+    from cppmega_v4.jsonrpc.schema import InferenceEntryPayload
+    inference_log_raw = build_inference_log(
+        {"nodes": [{"id": n.id, "kind": n.kind, "params": dict(n.params)}
+                   for n in params.graph.nodes]},
+        dict(params.dim_env),
+    )
+    inference_log_payload = [
+        InferenceEntryPayload(
+            brick=e.brick, param=e.param, value=e.value,
+            source=e.source, reason=e.reason,
+        )
+        for e in inference_log_raw
+    ]
+
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
     out = VerifyResult(
         resolved=ResolvedGraph(
@@ -317,6 +335,7 @@ def verify(params: VerifyParams, *, cache: LRUCache | None = None) -> VerifyResu
         memory_distributed=distributed_payload,
         gotchas=gotcha_payloads,
         fusion_plan=fusion_payloads,
+        inference_log=inference_log_payload,
         elapsed_ms=elapsed_ms,
     )
     _cache_store(cache, key, out)
