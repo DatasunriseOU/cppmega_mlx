@@ -57,7 +57,8 @@ describe("TopBar", () => {
     expect(onRunPipeline).toHaveBeenCalledWith("full");
     fireEvent.click(screen.getByTestId("run-pipeline-toggle"));
     fireEvent.click(screen.getByTestId("run-pipeline-train"));
-    expect(onRunPipeline).toHaveBeenCalledWith("train");
+    expect(onRunPipeline).toHaveBeenCalledWith("train",
+      expect.objectContaining({ num_steps: expect.any(Number) }));
   });
 
   it("topology selector emits onTopologyChange", () => {

@@ -261,7 +261,9 @@ export function App(): JSX.Element {
     void requestSuggestSharding();
   }, [requestSuggestSharding, spec.sharding.topology, nodes.length]);
 
-  const handleRunPipeline = useCallback(async (mode: RunMode) => {
+  const handleRunPipeline = useCallback(async (
+    mode: RunMode, opts?: { num_steps?: number },
+  ) => {
     const snap = wireSpecRef.current;
     if (snap.nodes.length === 0) {
       setRunError("canvas is empty — drop bricks or pick a preset first");
@@ -272,10 +274,15 @@ export function App(): JSX.Element {
     setRunReport(null);
     const stages = mode === "smoke" ? SMOKE_STAGES
                  : mode === "full"  ? FULL_STAGES : TRAIN_STAGES;
+    // V3-6: TopBar exposes train_num_steps; thread it via stage_options.
+    const stage_options: Record<string, Record<string, unknown>> = {};
+    if (mode === "train" && typeof opts?.num_steps === "number") {
+      stage_options.train = { num_steps: opts.num_steps };
+    }
     try {
       const r = await rpc.call<RunReport>("pipeline.run", {
         spec: buildVerifyParams(snap.nodes, snap.edges, snap.spec),
-        pipeline: { stages, stage_options: {} },
+        pipeline: { stages, stage_options },
       });
       setRunReport(r);
     } catch (e) {

@@ -13,11 +13,12 @@ export interface TopBarProps {
   onPresetDrop: (name: string) => void;
   onTopologyChange: (t: TopologyFactory) => void;
   onCompileModeChange: (m: SpecState["sharding"]["compile_mode"]) => void;
-  onRunPipeline: (mode: RunMode) => void;
+  onRunPipeline: (mode: RunMode, opts?: { num_steps?: number }) => void;
 }
 
 export function TopBar(p: TopBarProps): JSX.Element {
   const [open, setOpen] = useState(false);
+  const [trainNumSteps, setTrainNumSteps] = useState<number>(2);
   return (
     <header data-testid="top-bar"
             style={{ height: 56, display: "flex", alignItems: "center",
@@ -71,8 +72,22 @@ export function TopBar(p: TopBarProps): JSX.Element {
             <button data-testid="run-pipeline-full"
                     onClick={() => { setOpen(false); p.onRunPipeline("full"); }}
                     style={menuItem}>Full validate</button>
+            <div style={{ padding: "6px 12px", display: "flex",
+                          alignItems: "center", gap: 6 }}>
+              <span style={{ fontSize: 11, color: "#6b7280" }}>
+                train steps:</span>
+              <input data-testid="train-num-steps"
+                     type="number" min={1} max={64}
+                     value={trainNumSteps}
+                     onChange={(e) =>
+                       setTrainNumSteps(Math.max(1, parseInt(
+                         e.target.value || "1", 10)))}
+                     style={{ width: 50 }} />
+            </div>
             <button data-testid="run-pipeline-train"
-                    onClick={() => { setOpen(false); p.onRunPipeline("train"); }}
+                    onClick={() => { setOpen(false);
+                                     p.onRunPipeline("train",
+                                       { num_steps: trainNumSteps }); }}
                     style={menuItem}>Train</button>
           </div>
         )}
