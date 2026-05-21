@@ -9,8 +9,9 @@ Goal (per task brief):
 
 Important reality check
 -----------------------
-TileLang's bridge emits CuTeDSL Python from TileLang IR; it does NOT import
-hand-written ``@cute.kernel`` modules (see
+TileLang's upstream bridge emits CuTeDSL Python from TileLang IR; cppmega's
+wrapper adds only a narrow reverse importer for the smallest
+``SingleGemmWGMMA`` smoke kernel (see
 :mod:`cppmega_mlx.nn._cute_bridge` docstring and ``CUTE_BRIDGE_KNOWN_GAPS``).
 So this test:
 
@@ -156,8 +157,8 @@ def test_cppmega_cute_kernel_module_is_loadable() -> None:
     )
 
 
-def test_external_cute_kernel_is_explicitly_unsupported() -> None:
-    """Loud-failure contract for the *unsupported* import direction.
+def test_unrecognized_external_cute_kernel_is_explicitly_unsupported() -> None:
+    """Loud-failure contract for unsupported external CuTe import inputs.
 
     ``cute_dsl_to_tilelang_prim`` must raise ``CuteBridgeUnsupported`` with
     a reason mentioning PR #1421 — callers should never get a silent

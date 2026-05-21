@@ -246,14 +246,20 @@ def _numpy_mapping(batch: Mapping[str, Any]) -> Mapping[str, Any]:
         if key == "tokens" or key not in arrays:
             continue
         if key == "platform_ids":
-            if arrays[key].ndim != 2:
+            if arrays[key].ndim not in (2, 3):
                 raise ValueError(
-                    f"platform_ids must be shaped (B, K), got {arrays[key].shape}"
+                    "platform_ids must be shaped (B, K) or (B, S, K), "
+                    f"got {arrays[key].shape}"
                 )
             if arrays[key].shape[0] != tokens.shape[0]:
                 raise ValueError(
                     "platform_ids batch dimension must match tokens batch "
                     f"{tokens.shape[0]}, got {arrays[key].shape[0]}"
+                )
+            if arrays[key].ndim == 3 and arrays[key].shape[1] != tokens.shape[1]:
+                raise ValueError(
+                    "token-local platform_ids sequence dimension must match tokens "
+                    f"{tokens.shape[1]}, got {arrays[key].shape[1]}"
                 )
             continue
         if arrays[key].shape != tokens.shape:

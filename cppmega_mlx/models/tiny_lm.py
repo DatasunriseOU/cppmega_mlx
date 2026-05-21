@@ -124,14 +124,20 @@ class TinyLM(nn.Module):
             hidden_states = hidden_states + self.structure_embedding(structure_core)
 
         if platform_ids is not None:
-            if platform_ids.ndim != 2:
+            if platform_ids.ndim not in (2, 3):
                 raise ValueError(
-                    f"platform_ids must be shaped (B, K), got {platform_ids.shape}"
+                    "platform_ids must be shaped (B, K) or (B, S, K), "
+                    f"got {platform_ids.shape}"
                 )
             if platform_ids.shape[0] != input_ids.shape[0]:
                 raise ValueError(
                     "platform_ids batch dimension must match input batch "
                     f"{input_ids.shape[0]}, got {platform_ids.shape[0]}"
+                )
+            if platform_ids.ndim == 3 and platform_ids.shape[1] != seq_length:
+                raise ValueError(
+                    "token-local platform_ids sequence dimension must match input "
+                    f"sequence {seq_length}, got {platform_ids.shape[1]}"
                 )
             hidden_states = hidden_states + self.platform_embedding(
                 platform_ids,

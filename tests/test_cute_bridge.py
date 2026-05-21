@@ -1,10 +1,14 @@
 # pyright: reportInvalidTypeForm=false, reportMissingImports=false
 """Forward-direction emit test for the TileLang -> CuTeDSL bridge.
 
-Per PR apache/tilelang#1421 the bridge is one-way: TileLang ``T.prim_func``
-IR -> CuTeDSL Python source via ``tilelang.compile(prim, target='cutedsl')``.
-The reverse direction (importing hand-written ``@cute.kernel`` Python as
-TileLang IR) is unsupported and must raise :class:`CuteBridgeUnsupported`.
+Per PR apache/tilelang#1421 the upstream bridge is one-way: TileLang
+``T.prim_func`` IR -> CuTeDSL Python source via
+``tilelang.compile(prim, target='cutedsl')``.  cppmega adds a narrow
+reverse importer for the smallest external ``SingleGemmWGMMA`` and
+``MaskedLKQApplyWGMMA`` kernels plus the one-chunk
+``StateApplyConsumersWGMMA`` tile and fixed-nchunk multi-chunk variant; other
+hand-written ``@cute.kernel`` objects remain unsupported and must raise
+:class:`CuteBridgeUnsupported`.
 
 The bigger smoke at ``tests/test_cute_to_tilelang_bridge.py`` exercises a
 full end-to-end compile + run of a CuTeDSL artifact. This file is narrower:
@@ -27,6 +31,7 @@ import importlib
 import importlib.util
 import os
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -150,9 +155,9 @@ def test_compile_prim_to_cutedsl_signature_and_unsupported_reverse() -> None:
 
     * ``compile_prim_to_cutedsl`` exists, is callable, and is annotated as
       taking a single positional arg.
-    * The reverse direction (``cute_dsl_to_tilelang_prim``) raises
+    * Unrecognized reverse-direction inputs raise
       :class:`CuteBridgeUnsupported` cleanly with a message that mentions
-      PR #1421 and the supported alternative — callers must never get a
+      PR #1421 and the supported alternatives — callers must never get a
       silent ``None`` from the unsupported path.
 
     Runs on every host (no CUDA / cutlass dependency) — pure API surface.
@@ -170,7 +175,7 @@ def test_compile_prim_to_cutedsl_signature_and_unsupported_reverse() -> None:
     assert len(params) == 1, f"expected 1 positional arg, got {sig}"
     assert params[0].name == "prim_func"
 
-    # Reverse-direction guard.
+    # Unrecognized reverse-direction guard.
     with pytest.raises(bridge_mod.CuteBridgeUnsupported) as excinfo:
         bridge_mod.cute_dsl_to_tilelang_prim(object())
     msg = str(excinfo.value)
@@ -178,6 +183,233 @@ def test_compile_prim_to_cutedsl_signature_and_unsupported_reverse() -> None:
     assert (
         "compile_prim_to_cutedsl" in msg or "dispatch_lower" in msg
     ), msg
+
+
+def test_single_gemm_wgmma_imports_to_tilelang_primfunc() -> None:
+    """The smallest cppmega external CuTe kernel imports as TileLang IR.
+
+    This pins the first supported reverse-direction case:
+    ``SingleGemmWGMMA`` maps to a single-CTA TileLang ``T.gemm`` PrimFunc
+    for ``C[M, N] = A[M, K] @ B[N, K].T``.  More complex external
+    ``@cute.kernel`` objects should continue to fail loudly until they have
+    a dedicated importer.
+    """
+
+    bridge_mod = _load_bridge_module()
+
+    class SingleGemmWGMMA:
+        M = 64
+        N = 64
+        K = 64
+        dtype = "bfloat16"
+
+    prim = bridge_mod.cute_dsl_to_tilelang_prim(SingleGemmWGMMA())
+
+    text = str(prim)
+    assert "gemm" in text
+    assert "A" in text
+    assert "B" in text
+    assert "C" in text
+
+
+def test_single_gemm_wgmma_source_imports_without_cutlass_import() -> None:
+    """Import the real external CuTe source file without importing cutlass.
+
+    The source-level importer must statically recover the ``SingleGemmWGMMA``
+    contract from cppmega's ``single_gemm_test.py``.  This is stronger than
+    importing a live Python object because this Mac test host does not have
+    ``cutlass`` / ``quack`` installed, but the actual source file still has
+    enough information to build the TileLang ``T.gemm`` PrimFunc.
+    """
+
+    bridge_mod = _load_bridge_module()
+    source = Path(
+        "/Volumes/external/sources/cppmega/cppmega/megatron/"
+        "cute_dsl_mimo/single_gemm_test.py"
+    )
+    if not source.exists():
+        pytest.skip(f"cppmega CuTe source file not present: {source}")
+
+    prim = bridge_mod.cute_dsl_source_to_tilelang_prim(source)
+
+    text = str(prim)
+    assert "gemm" in text
+    assert "A" in text
+    assert "B" in text
+    assert "C" in text
+
+
+def test_masked_lkq_apply_source_imports_two_gemm_masked_tile() -> None:
+    """Import the next external CuTe tile as TileLang IR.
+
+    ``masked_lkq_apply.py`` fuses ``future_mask(K @ Q.T) @ dPhi``.  The
+    importer must recover this as two TileLang GEMMs with an in-IR masked
+    spill, not as a launch-boundary placeholder.
+    """
+
+    bridge_mod = _load_bridge_module()
+    source = Path(
+        "/Volumes/external/sources/cppmega/cppmega/megatron/"
+        "cute_dsl_mimo/masked_lkq_apply.py"
+    )
+    if not source.exists():
+        pytest.skip(f"cppmega CuTe source file not present: {source}")
+
+    prim = bridge_mod.cute_dsl_source_to_tilelang_prim(source)
+
+    text = str(prim)
+    assert text.count("gemm") >= 2
+    assert "if_then_else" in text
+    assert "K" in text
+    assert "Q" in text
+    assert "DPhT" in text
+    assert "Apply" in text
+
+
+def test_state_apply_consumers_source_imports_three_gemm_consumers() -> None:
+    """Import the one-chunk state/apply/consumer CuTe tile as TileLang IR.
+
+    ``state_apply_consumers.py`` fuses ``K @ DStates``,
+    ``future_mask(K @ Q.T) @ dPhi``, and the scalar DV / DMIMO_V consumers.
+    The importer must keep those products and consumers in one TileLang region
+    instead of treating the CuTe file as an opaque launch boundary.
+    """
+
+    bridge_mod = _load_bridge_module()
+    source = Path(
+        "/Volumes/external/sources/cppmega/cppmega/megatron/"
+        "cute_dsl_mimo/state_apply_consumers.py"
+    )
+    if not source.exists():
+        pytest.skip(f"cppmega CuTe source file not present: {source}")
+
+    prim = bridge_mod.cute_dsl_source_to_tilelang_prim(
+        source,
+        class_name="StateApplyConsumersWGMMA",
+    )
+
+    text = str(prim)
+    assert text.count("gemm") >= 3
+    assert "if_then_else" in text
+    assert "K" in text
+    assert "Q" in text
+    assert "DstT" in text
+    assert "DPhT" in text
+    assert "V" in text
+    assert "MimoV" in text
+    assert "DV" in text
+    assert "DMimoV" in text
+
+
+def test_multi_chunk_state_apply_consumers_source_imports_reverse_scan() -> None:
+    """Import the multi-chunk reverse-scan CuTe tile as TileLang IR.
+
+    The multi-chunk class carries ``DStates.T`` across chunks, computes scaled
+    future-masked LKQ/apply products, writes per-chunk DV, and accumulates
+    DMIMO_V.  The source importer must require the chunk-count specialization
+    explicitly and keep the reverse-scan owner in one TileLang region.
+    """
+
+    bridge_mod = _load_bridge_module()
+    source = Path(
+        "/Volumes/external/sources/cppmega/cppmega/megatron/"
+        "cute_dsl_mimo/state_apply_consumers.py"
+    )
+    if not source.exists():
+        pytest.skip(f"cppmega CuTe source file not present: {source}")
+
+    prim = bridge_mod.cute_dsl_source_to_tilelang_prim(
+        source,
+        class_name="MultiChunkStateApplyConsumersWGMMA",
+        nchunks=2,
+    )
+
+    text = str(prim)
+    assert text.count("gemm") >= 4
+    assert "chunk_rev" in text
+    assert "if_then_else" in text
+    assert "exp" in text
+    assert "K" in text
+    assert "QT" in text
+    assert "DACS" in text
+    assert "DACSRev" in text
+    assert "Segsum" in text
+    assert "QKDot" in text
+    assert "Gamma" in text
+    assert "DMimoV" in text
+
+
+def test_fa4_v2_source_imports_three_gemm_chain_without_lkq_output() -> None:
+    """Import FA4 v2's fused 3-GEMM chain as one TileLang region.
+
+    ``fa4_bwd_adapter_v2.py`` computes ``DPs = K @ DstT + (K @ Q) @ DPhT``
+    and deliberately removes the intermediate LKQ global output.  The importer
+    must recover that as TileLang T-ops rather than treating the FA4 source as
+    an opaque launch boundary.
+    """
+
+    bridge_mod = _load_bridge_module()
+    source = Path(
+        "/Volumes/external/sources/cppmega/cppmega/megatron/"
+        "cute_dsl_mimo/fa4_bwd_adapter_v2.py"
+    )
+    if not source.exists():
+        pytest.skip(f"cppmega CuTe source file not present: {source}")
+
+    prim = bridge_mod.cute_dsl_source_to_tilelang_prim(
+        source,
+        class_name="FA4PatternFused3GemmV2",
+    )
+
+    text = str(prim)
+    assert text.count("gemm") >= 3
+    assert "K" in text
+    assert "Q" in text
+    assert "DstT" in text
+    assert "DPhT" in text
+    assert "DPs" in text
+    assert "LKQ" in text
+
+
+def test_fa4_v1_source_imports_three_gemm_chain_with_lkq_output() -> None:
+    """Import FA4 v1's fused 3-GEMM chain and preserve the LKQ output.
+
+    ``fa4_bwd_adapter.py`` computes the same ``DPs`` chain as v2, but also
+    writes the intermediate ``LKQ = K @ Q`` tile to global memory for
+    verification / downstream consumers.  The source importer must keep that
+    public output in the TileLang contract instead of falling back to an opaque
+    launch boundary.
+    """
+
+    bridge_mod = _load_bridge_module()
+    source = Path(
+        "/Volumes/external/sources/cppmega/cppmega/megatron/"
+        "cute_dsl_mimo/fa4_bwd_adapter.py"
+    )
+    if not source.exists():
+        pytest.skip(f"cppmega CuTe source file not present: {source}")
+
+    prim = bridge_mod.cute_dsl_source_to_tilelang_prim(
+        source,
+        class_name="FA4PatternFused3Gemm",
+    )
+
+    text = str(prim)
+    assert text.count("gemm") >= 3
+    assert "K" in text
+    assert "Q" in text
+    assert "DstT" in text
+    assert "DPhT" in text
+    assert "DPs" in text
+    assert "LKQ" in text
+    assert {buffer.name for buffer in prim.buffer_map.values()} >= {
+        "K",
+        "Q",
+        "DstT",
+        "DPhT",
+        "DPs",
+        "LKQ",
+    }
 
 
 def test_emit_matmul_to_cute_dsl_produces_valid_python() -> None:

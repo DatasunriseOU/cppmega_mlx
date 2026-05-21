@@ -28,20 +28,17 @@ from cppmega_mlx.training.stp_loss import (
     next_token_and_stp_loss,
 )
 
-_DOCUMENT_ID_ALIASES = ("document_ids", "doc_ids", "packing_document_ids")
-
-
 def next_token_cross_entropy(
     model: nn.Module,
     batch: LMTokenBatch | Mapping[str, mx.array] | mx.array,
 ) -> tuple[mx.array, mx.array]:
     """Return masked next-token CE loss and the number of contributing tokens."""
 
-    document_ids = _extract_document_ids(batch)
     lm_batch = ensure_lm_batch(batch)
+    document_ids = lm_batch.input_document_ids
     model_kwargs = lm_batch.model_kwargs()
     if document_ids is not None:
-        model_kwargs["document_ids"] = document_ids[:, :-1]
+        model_kwargs["document_ids"] = document_ids
     logits = model(lm_batch.inputs, **model_kwargs)
     targets = lm_batch.targets
 
@@ -75,12 +72,12 @@ def next_token_cut_cross_entropy(
     integration path, not a full manual chunked-backward memory receipt.
     """
 
-    document_ids = _extract_document_ids(batch)
     lm_batch = ensure_lm_batch(batch)
+    document_ids = lm_batch.input_document_ids
     hidden_states = _decoder_hidden_states_for_mtp(
         model,
         lm_batch,
-        document_ids=document_ids[:, :-1] if document_ids is not None else None,
+        document_ids=document_ids,
     )
     targets = lm_batch.targets
     if hidden_states.shape[:2] != targets.shape:
@@ -124,8 +121,9 @@ def next_token_cross_entropy_with_mtp(
     persistent head parameters.
     """
 
-    document_ids = _extract_document_ids(batch)
     lm_batch = ensure_lm_batch(batch)
+    document_ids = lm_batch.input_document_ids
+    target_document_ids = lm_batch.target_document_ids
     next_token_loss, ntokens = next_token_cross_entropy(model, batch)
     cfg = config or MTPLossConfig()
 
@@ -154,12 +152,12 @@ def next_token_cross_entropy_with_mtp(
     hidden_states = _decoder_hidden_states_for_mtp(
         model,
         lm_batch,
-        document_ids=document_ids[:, :-1] if document_ids is not None else None,
+        document_ids=document_ids,
     )
     mtp_loss, per_depth_losses, depth_weights = head.loss(
         hidden_states,
         lm_batch.targets,
-        document_ids=document_ids[:, 1:] if document_ids is not None else None,
+        document_ids=target_document_ids,
     )
     total_loss = next_token_and_mtp_loss(
         next_token_loss,
@@ -192,14 +190,14 @@ def next_token_cross_entropy_with_stp(
     path remains unchanged until a recipe explicitly enables STP.
     """
 
-    document_ids = _extract_document_ids(batch)
     lm_batch = ensure_lm_batch(batch)
+    document_ids = lm_batch.input_document_ids
     next_token_loss, ntokens = next_token_cross_entropy(model, batch)
     cfg = config or STPLossConfig()
     hidden_states = _decoder_hidden_states_for_mtp(
         model,
         lm_batch,
-        document_ids=document_ids[:, :-1] if document_ids is not None else None,
+        document_ids=document_ids,
     )
     stp_loss = compute_stp_loss(hidden_states, n_spans=cfg.n_spans)
     total_loss = next_token_and_stp_loss(
@@ -326,19 +324,19 @@ def _structure_hidden_state_delta(
 
     if isinstance(structure_embedding, StructureEmbedding):
         structure_embeddings = structure_embedding(
-            structure_ids=batch.structure_ids[:, :-1]
+            structure_ids=batch._input_aligned(batch.structure_ids)
             if batch.structure_ids is not None
             else None,
-            dep_levels=batch.dep_levels[:, :-1]
+            dep_levels=batch._input_aligned(batch.dep_levels)
             if batch.dep_levels is not None
             else None,
-            ast_depth_ids=batch.ast_depth_ids[:, :-1]
+            ast_depth_ids=batch._input_aligned(batch.ast_depth_ids)
             if batch.ast_depth_ids is not None
             else None,
-            sibling_index_ids=batch.sibling_index_ids[:, :-1]
+            sibling_index_ids=batch._input_aligned(batch.sibling_index_ids)
             if batch.sibling_index_ids is not None
             else None,
-            node_type_ids=batch.node_type_ids[:, :-1]
+            node_type_ids=batch._input_aligned(batch.node_type_ids)
             if batch.node_type_ids is not None
             else None,
             target_dtype=hidden_dtype,
@@ -356,8 +354,12 @@ def _structure_hidden_state_delta(
     structure_core_fn = getattr(model, "_structure_core", None)
     if callable(structure_core_fn):
         structure_core = structure_core_fn(
-            batch.structure_ids[:, :-1] if batch.structure_ids is not None else None,
-            batch.dep_levels[:, :-1] if batch.dep_levels is not None else None,
+            batch._input_aligned(batch.structure_ids)
+            if batch.structure_ids is not None
+            else None,
+            batch._input_aligned(batch.dep_levels)
+            if batch.dep_levels is not None
+            else None,
             seq_length,
         )
         if structure_core is not None:
@@ -373,51 +375,11 @@ def _structure_hidden_state_delta(
         batch.node_type_ids,
     ):
         if optional_ids is not None:
-            channel_ids = optional_ids[:, :-1]
+            channel_ids = batch._input_aligned(optional_ids)
             delta = delta + structure_embedding(
                 channel_ids % int(structure_embedding.weight.shape[0])
             )
     return delta
-
-
-def _extract_document_ids(
-    batch: LMTokenBatch | Mapping[str, mx.array] | mx.array,
-) -> mx.array | None:
-    if not isinstance(batch, Mapping):
-        return None
-
-    present = [name for name in _DOCUMENT_ID_ALIASES if name in batch]
-    if not present:
-        return None
-    if len(present) > 1:
-        raise ValueError(
-            "batch mapping must provide only one document-id alias; got "
-            f"{tuple(present)!r}"
-        )
-
-    tokens = batch.get("tokens")
-    if not isinstance(tokens, mx.array):
-        raise ValueError("batch mapping must contain a 'tokens' array")
-    document_ids = batch[present[0]]
-    if not isinstance(document_ids, mx.array):
-        raise TypeError(f"{present[0]} must be an mx.array")
-    _validate_document_id_batch(document_ids, tokens=tokens, alias=present[0])
-    return document_ids.astype(mx.int32)
-
-
-def _validate_document_id_batch(
-    document_ids: mx.array,
-    *,
-    tokens: mx.array,
-    alias: str,
-) -> None:
-    if document_ids.ndim != 2:
-        raise ValueError(f"{alias} must be shaped (B, S), got {document_ids.shape}")
-    if document_ids.shape != tokens.shape:
-        raise ValueError(
-            f"{alias} must match tokens shape {tokens.shape}, got {document_ids.shape}"
-        )
-    _raise_if_negative_document_ids(document_ids, alias=alias)
 
 
 def _raise_if_negative_document_ids(

@@ -59,16 +59,41 @@ def _build_csa_hca(hidden_size: int, params: dict) -> CSAHCAHybridV4:
 
 
 def _build_mlp(hidden_size: int, params: dict) -> nn.Module:
+    """MLP / Gated-MLP block.
+
+    The ``activation`` param (E7-5) routes between gated and dense paths:
+      - 'glu' (default, backwards-compat): sigmoid(gate) * up
+      - 'swiglu'/'geglu'/'reglu': gated activation via apply_activation
+      - 'gelu'/'silu'/'relu'/'relu2'/'sqrelu': dense — gate projection
+        kept allocated for state-dict parity but unused; up→act→down.
+
+    Validation lives in verify_build_spec, not here, so a misuse here
+    raises ValueError from apply_activation.
+    """
+    from cppmega_mlx.nn.activations import IS_GATED, apply_activation
+
     intermediate = params.get("intermediate_size", 4 * hidden_size)
-    class _GatedMLP(nn.Module):
+    activation = params.get("activation", "glu")
+
+    class _MLP(nn.Module):
         def __init__(self):
             super().__init__()
             self.gate = nn.Linear(hidden_size, intermediate, bias=False)
             self.up = nn.Linear(hidden_size, intermediate, bias=False)
             self.down = nn.Linear(intermediate, hidden_size, bias=False)
+
         def __call__(self, x):
-            return self.down(mx.sigmoid(self.gate(x)) * self.up(x))
-    return _GatedMLP()
+            up = self.up(x)
+            if activation == "glu":
+                return self.down(mx.sigmoid(self.gate(x)) * up)
+            if activation in IS_GATED and IS_GATED[activation]:
+                return self.down(apply_activation(activation, up,
+                                                  gate=self.gate(x)))
+            if activation in IS_GATED:
+                return self.down(apply_activation(activation, up))
+            # Unknown name — fall back to GLU to keep training alive.
+            return self.down(mx.sigmoid(self.gate(x)) * up)
+    return _MLP()
 
 
 def _build_pass_through_unsupported(kind: str):

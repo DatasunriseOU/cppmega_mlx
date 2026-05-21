@@ -239,7 +239,13 @@ def _sanitize_compile_args(
         if arg in {"-c", "-S"}:
             continue
         normalized_arg = os.path.normpath(arg)
-        if normalized_arg == normalized_file or normalized_arg.endswith(normalized_file):
+        arg_candidates = {normalized_arg}
+        if directory and not os.path.isabs(arg):
+            arg_candidates.add(os.path.normpath(os.path.join(directory, arg)))
+        if (
+            normalized_file in arg_candidates
+            or normalized_file.endswith(os.sep + normalized_arg)
+        ):
             continue
         if arg.endswith((".o", ".obj", ".pcm")):
             continue

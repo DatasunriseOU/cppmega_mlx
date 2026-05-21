@@ -68,10 +68,12 @@ _TOKEN_TEMPORAL_METADATA_COLUMNS = (
     "hunk_id_per_token",
     "edit_op_per_token",
 )
+_SOURCE_PLATFORM_IDS_COLUMN = "source_platform_ids"
+_VALID_TOKEN_COUNT_COLUMN = "valid_token_count"
 _ROW_METADATA_COLUMNS = (
     "actual_token_count",
     "pack_id",
-    "valid_token_count",
+    _VALID_TOKEN_COUNT_COLUMN,
     "num_docs",
     "platform_ids",
     "platform_info",
@@ -117,9 +119,15 @@ _MODEL_INPUT_PARQUET_COLUMNS = frozenset(
 _MODEL_METADATA_COLUMN_ALIASES: Mapping[str, tuple[str, ...]] = {
     "platform_ids": ("platform_ids",),
 }
+_LOSS_MASK_COLUMN_ALIASES = ("loss_mask", "token_loss_mask")
+_DOCUMENT_ID_COLUMN_ALIASES = ("doc_ids", "document_ids", "packing_document_ids")
+_TRAINING_INPUT_PARQUET_COLUMNS = frozenset(
+    ("target_ids", *_LOSS_MASK_COLUMN_ALIASES, *_DOCUMENT_ID_COLUMN_ALIASES)
+)
 _MODEL_INPUT_PARQUET_COLUMNS = frozenset(
     (
         *_MODEL_INPUT_PARQUET_COLUMNS,
+        _SOURCE_PLATFORM_IDS_COLUMN,
         *(
             alias
             for aliases in _MODEL_METADATA_COLUMN_ALIASES.values()
@@ -138,6 +146,7 @@ _TOKEN_LEVEL_METADATA_COLUMNS = frozenset(
         "document_ids",
         "packing_document_ids",
         "loss_mask",
+        "token_loss_mask",
     )
 )
 BatchMetadataColumnSelection = Sequence[str] | Literal["all"] | None
@@ -233,20 +242,56 @@ class TokenParquetDataset:
                 metadata_columns=metadata_columns,
             ),
         )
+        resolved_token_key = _resolve_token_key(columns, token_key=token_key, text_key=text_key)
+        self.token_key = resolved_token_key
         token_rows = _token_rows_from_columns(
             columns,
-            token_key=token_key,
+            token_key=resolved_token_key,
             text_key=text_key,
             tokenizer=tokenizer,
             eos_token_id=eos_token_id,
         )
         token_windows = _fixed_windows_from_rows(token_rows, seq_len)
+        specs = _fixed_window_specs_from_rows(token_rows, seq_len)
+        target_rows, target_source = _optional_token_aligned_rows_with_source(
+            columns,
+            token_rows,
+            aliases=("target_ids",),
+            label="target_ids",
+        )
+        target_windows = (
+            _windows_from_specs(target_rows, specs, seq_len, dtype=np.int64)
+            if target_rows is not None
+            else None
+        )
+        loss_mask_rows, loss_mask_source = _optional_numeric_token_aligned_rows(
+            columns,
+            token_rows,
+            aliases=_LOSS_MASK_COLUMN_ALIASES,
+            label="loss_mask",
+        )
+        loss_mask_windows = (
+            _windows_from_specs(loss_mask_rows, specs, seq_len, dtype=np.float32)
+            if loss_mask_rows is not None
+            else None
+        )
+        document_id_rows, document_id_source = _optional_token_aligned_rows_with_source(
+            columns,
+            token_rows,
+            aliases=_DOCUMENT_ID_COLUMN_ALIASES,
+            label="document_ids",
+        )
+        document_id_windows = (
+            _windows_from_specs(document_id_rows, specs, seq_len, dtype=np.int64)
+            if document_id_rows is not None
+            else None
+        )
         side_channel_columns = _side_channel_windows(columns, token_rows, seq_len)
         side_channels = side_channel_columns.channels
         model_metadata_columns = _model_metadata_windows(columns, token_rows, seq_len)
         batch_metadata_columns = _resolve_batch_metadata_columns(
             columns,
-            token_key=token_key,
+            token_key=resolved_token_key,
             text_key=text_key,
             metadata_columns=metadata_columns,
         )
@@ -267,6 +312,15 @@ class TokenParquetDataset:
                 )
 
         self._tokens = _to_int32_token_ids(token_windows)
+        self._target_tokens = (
+            _to_int32_token_ids(target_windows) if target_windows is not None else None
+        )
+        self._loss_mask = loss_mask_windows.astype(np.float32, copy=False) if loss_mask_windows is not None else None
+        self._document_ids = (
+            document_id_windows.astype(np.int32, copy=False)
+            if document_id_windows is not None
+            else None
+        )
         self._side_channels = {
             key: _to_side_channel_values(key, value)
             for key, value in side_channels.items()
@@ -280,8 +334,12 @@ class TokenParquetDataset:
         self.metadata = metadata or TokenDatasetMetadata(source_format="parquet")
         self.parquet_receipt = _parquet_receipt(
             columns,
-            token_key=token_key,
+            token_key=resolved_token_key,
             text_key=text_key,
+            resolved_token_key=resolved_token_key,
+            target_source=target_source,
+            loss_mask_source=loss_mask_source,
+            document_id_source=document_id_source,
             side_channel_sources=side_channel_columns.sources,
             skipped_side_channels=side_channel_columns.skipped,
             model_metadata_sources=model_metadata_columns.sources,
@@ -385,6 +443,15 @@ class TokenParquetDataset:
         )
         return LMTokenBatch(
             tokens=mx.array(self._tokens[sample_idx]),
+            target_tokens=None
+            if self._target_tokens is None
+            else mx.array(self._target_tokens[sample_idx]),
+            loss_mask=None
+            if self._loss_mask is None
+            else mx.array(self._loss_mask[sample_idx]),
+            document_ids=None
+            if self._document_ids is None
+            else mx.array(self._document_ids[sample_idx]),
             metadata=self._make_batch_metadata(sample_idx),
             **kwargs,
         )
@@ -424,9 +491,13 @@ def _candidate_parquet_columns(
     if metadata_columns == "all":
         return None
 
-    candidates = [token_key]
+    candidates = [token_key, "tokens", "token_ids", "input_ids", "target_ids"]
     if text_key is not None:
         candidates.append(text_key)
+    candidates.extend(_LOSS_MASK_COLUMN_ALIASES)
+    candidates.extend(_DOCUMENT_ID_COLUMN_ALIASES)
+    candidates.append(_SOURCE_PLATFORM_IDS_COLUMN)
+    candidates.append(_VALID_TOKEN_COUNT_COLUMN)
     for aliases in _SIDE_CHANNEL_COLUMN_ALIASES.values():
         candidates.extend(aliases)
     for aliases in _MODEL_METADATA_COLUMN_ALIASES.values():
@@ -503,6 +574,26 @@ def _schema_type_labels(
     return {name: str(schema.field(name).type) for name in names}
 
 
+def _resolve_token_key(
+    columns: ParquetColumns,
+    *,
+    token_key: str,
+    text_key: str | None,
+) -> str:
+    if token_key in columns.values:
+        return token_key
+    for candidate in ("tokens", "token_ids", "input_ids"):
+        if candidate in columns.values:
+            return candidate
+    if text_key is not None:
+        return token_key
+    available = ", ".join(sorted(columns.values))
+    raise ValueError(
+        f"parquet column {token_key!r} not found and no token_ids/input_ids fallback "
+        f"was present; available: {available}"
+    )
+
+
 def _token_rows_from_columns(
     columns: ParquetColumns,
     *,
@@ -529,6 +620,51 @@ def _token_rows_from_columns(
             tokens.append(eos_token_id)
         rows.append([int(token) for token in tokens])
     return rows
+
+
+def _optional_token_aligned_rows_with_source(
+    columns: ParquetColumns,
+    token_rows: list[list[int]],
+    *,
+    aliases: Sequence[str],
+    label: str,
+) -> tuple[list[list[int]] | None, str | None]:
+    matched = [column_key for column_key in aliases if column_key in columns.values]
+    if len(matched) > 1:
+        raise ValueError(f"{label} declared more than once via columns: {', '.join(matched)}")
+    if not matched:
+        return None, None
+    column_key = matched[0]
+    _reject_non_integer_parquet_type(columns, column_key, label)
+    rows = [
+        _coerce_token_row(value, label=f"{column_key} {label}")
+        for value in columns.require(column_key)
+    ]
+    if not _rows_are_token_aligned(rows, token_rows):
+        raise ValueError(f"{column_key} rows must be token-aligned with token IDs")
+    return rows, column_key
+
+
+def _optional_numeric_token_aligned_rows(
+    columns: ParquetColumns,
+    token_rows: list[list[int]],
+    *,
+    aliases: Sequence[str],
+    label: str,
+) -> tuple[list[list[int | float]] | None, str | None]:
+    matched = [column_key for column_key in aliases if column_key in columns.values]
+    if len(matched) > 1:
+        raise ValueError(f"{label} declared more than once via columns: {', '.join(matched)}")
+    if not matched:
+        return None, None
+    column_key = matched[0]
+    rows = [
+        _coerce_numeric_row(value, label=f"{column_key} {label}")
+        for value in columns.require(column_key)
+    ]
+    if not _rows_are_token_aligned(rows, token_rows):
+        raise ValueError(f"{column_key} rows must be token-aligned with token IDs")
+    return rows, column_key
 
 
 def _side_channel_windows(
@@ -593,7 +729,19 @@ def _model_metadata_windows(
     channels: dict[str, np.ndarray] = {}
     sources: dict[str, dict[str, str | None]] = {}
     specs = _fixed_window_specs_from_rows(token_rows, seq_len)
+    doc_local_platform = _doc_local_platform_id_windows(
+        columns,
+        token_rows,
+        specs=specs,
+        seq_len=seq_len,
+    )
+    if doc_local_platform is not None:
+        windows, source = doc_local_platform
+        channels["platform_ids"] = windows
+        sources["platform_ids"] = source
     for key, aliases in _MODEL_METADATA_COLUMN_ALIASES.items():
+        if key in channels:
+            continue
         matched = [column_key for column_key in aliases if column_key in columns.values]
         if len(matched) > 1:
             joined = ", ".join(matched)
@@ -626,6 +774,72 @@ def _model_metadata_windows(
     return _ModelMetadataColumns(channels=channels, sources=sources)
 
 
+def _doc_local_platform_id_windows(
+    columns: ParquetColumns,
+    token_rows: list[list[int]],
+    *,
+    specs: Sequence[_WindowSpec],
+    seq_len: int,
+) -> tuple[np.ndarray, dict[str, str | None]] | None:
+    if _SOURCE_PLATFORM_IDS_COLUMN not in columns.values or not specs:
+        return None
+
+    doc_column = next(
+        (column for column in _DOCUMENT_ID_COLUMN_ALIASES if column in columns.values),
+        None,
+    )
+    if doc_column is None:
+        raise ValueError(
+            f"{_SOURCE_PLATFORM_IDS_COLUMN} requires token-aligned doc_ids"
+        )
+
+    doc_rows = [
+        _coerce_token_row(value, label=f"{doc_column} document IDs")
+        for value in columns.require(doc_column)
+    ]
+    if not _rows_are_token_aligned(doc_rows, token_rows):
+        raise ValueError(f"{doc_column} rows must be token-aligned with token IDs")
+
+    platform_rows = [
+        _coerce_platform_id_groups(value, row_index=row_index)
+        for row_index, value in enumerate(columns.require(_SOURCE_PLATFORM_IDS_COLUMN))
+    ]
+    valid_token_counts = _valid_token_counts_from_columns(columns, token_rows)
+
+    windows = np.zeros((len(specs), seq_len, MAX_PLATFORM_IDS), dtype=np.int32)
+    has_any_platform = False
+    for out_index, spec in enumerate(specs):
+        if spec.row_index is None:
+            continue
+        row_platforms = platform_rows[spec.row_index]
+        row_doc_ids = doc_rows[spec.row_index]
+        valid_token_count = valid_token_counts[spec.row_index]
+        for local_pos, token_pos in enumerate(range(spec.token_start, spec.token_end)):
+            if token_pos >= valid_token_count:
+                continue
+            doc_id = int(row_doc_ids[token_pos])
+            source_doc_index = doc_id - 1
+            if source_doc_index < 0 or source_doc_index >= len(row_platforms):
+                continue
+            platform_ids = row_platforms[source_doc_index]
+            if not platform_ids:
+                continue
+            has_any_platform = True
+            windows[out_index, local_pos, : len(platform_ids)] = np.asarray(
+                platform_ids,
+                dtype=np.int32,
+            )
+
+    if not has_any_platform:
+        return None
+    return windows, {
+        "column": _SOURCE_PLATFORM_IDS_COLUMN,
+        "type": columns.type_label(_SOURCE_PLATFORM_IDS_COLUMN),
+        "document_column": doc_column,
+        "document_type": columns.type_label(doc_column),
+    }
+
+
 def _resolve_batch_metadata_columns(
     columns: ParquetColumns,
     *,
@@ -641,6 +855,7 @@ def _resolve_batch_metadata_columns(
         excluded = {
             token_key,
             *_TOKEN_CONTENT_PARQUET_COLUMNS,
+            *_TRAINING_INPUT_PARQUET_COLUMNS.intersection(loaded),
             *(_MODEL_INPUT_PARQUET_COLUMNS & loaded),
         }
         if text_key is not None:
@@ -728,6 +943,32 @@ def _fixed_window_specs_from_rows(
                 )
             )
     return tuple(specs)
+
+
+def _windows_from_specs(
+    rows: Sequence[Sequence[int | float]],
+    specs: Sequence[_WindowSpec],
+    seq_len: int,
+    *,
+    dtype: np.dtype | type,
+) -> np.ndarray:
+    windows: list[np.ndarray] = []
+    if all(len(row) == 1 for row in rows):
+        flat = np.asarray([row[0] for row in rows], dtype=dtype)
+        for spec in specs:
+            windows.append(flat[spec.token_start : spec.token_end])
+    else:
+        for spec in specs:
+            if spec.row_index is None:
+                continue
+            row = np.asarray(rows[spec.row_index], dtype=dtype)
+            windows.append(row[spec.token_start : spec.token_end])
+    if not windows:
+        return np.empty((0, seq_len), dtype=dtype)
+    result = np.stack(windows, axis=0)
+    if result.shape[1] != seq_len:
+        raise ValueError(f"training column windows must have seq_len={seq_len}, got {result.shape}")
+    return result
 
 
 def _add_chunk_metadata_window(
@@ -890,17 +1131,21 @@ def _parquet_receipt(
     *,
     token_key: str,
     text_key: str | None,
+    resolved_token_key: str,
+    target_source: str | None,
+    loss_mask_source: str | None,
+    document_id_source: str | None,
     side_channel_sources: Mapping[str, Mapping[str, str | None]],
     skipped_side_channels: Sequence[Mapping[str, str | None]],
     model_metadata_sources: Mapping[str, Mapping[str, str | None]],
     batch_metadata_columns: Sequence[str],
 ) -> dict[str, Any]:
     token_source: dict[str, str | None]
-    if token_key in columns.values:
+    if resolved_token_key in columns.values:
         token_source = {
             "mode": "token_column",
-            "column": token_key,
-            "type": columns.type_label(token_key),
+            "column": resolved_token_key,
+            "type": columns.type_label(resolved_token_key),
         }
     else:
         token_source = {
@@ -928,6 +1173,18 @@ def _parquet_receipt(
         receipt["model_metadata_sources"] = {
             key: dict(value) for key, value in sorted(model_metadata_sources.items())
         }
+    training_sources = {
+        "target_tokens": target_source,
+        "loss_mask": loss_mask_source,
+        "document_ids": document_id_source,
+    }
+    present_training_sources = {
+        key: {"column": source, "type": columns.type_label(source)}
+        for key, source in training_sources.items()
+        if source is not None
+    }
+    if present_training_sources:
+        receipt["training_column_sources"] = present_training_sources
     if batch_metadata_columns:
         receipt["batch_metadata_sources"] = {
             column: {
@@ -964,6 +1221,59 @@ def _fixed_windows_from_rows(
     if not windows:
         return np.empty((0, seq_len), dtype=np.int32)
     return np.concatenate(windows, axis=0)
+
+
+def _valid_token_counts_from_columns(
+    columns: ParquetColumns,
+    token_rows: Sequence[Sequence[int]],
+) -> list[int]:
+    if _VALID_TOKEN_COUNT_COLUMN not in columns.values:
+        return [len(row) for row in token_rows]
+    counts: list[int] = []
+    for row_index, value in enumerate(columns.require(_VALID_TOKEN_COUNT_COLUMN)):
+        count = _coerce_integral_value(
+            value,
+            label=f"{_VALID_TOKEN_COUNT_COLUMN} row {row_index}",
+        )
+        row_length = len(token_rows[row_index])
+        if not 0 <= count <= row_length:
+            raise ValueError(
+                f"{_VALID_TOKEN_COUNT_COLUMN} row {row_index} must be in "
+                f"[0, {row_length}], got {count}"
+            )
+        counts.append(count)
+    return counts
+
+
+def _coerce_platform_id_groups(value: Any, *, row_index: int) -> list[list[int]]:
+    decoded = _decode_json_like(value)
+    if decoded is None:
+        return []
+    if isinstance(decoded, np.ndarray):
+        decoded = decoded.tolist()
+    if not isinstance(decoded, (list, tuple)):
+        raise ValueError(
+            f"{_SOURCE_PLATFORM_IDS_COLUMN} row {row_index} must be a list of lists"
+        )
+
+    groups: list[list[int]] = []
+    for group_index, group in enumerate(decoded):
+        ids = _coerce_token_row(
+            group,
+            label=f"{_SOURCE_PLATFORM_IDS_COLUMN} row {row_index} doc {group_index}",
+        )
+        if len(ids) > MAX_PLATFORM_IDS:
+            raise ValueError(
+                f"{_SOURCE_PLATFORM_IDS_COLUMN} row {row_index} doc {group_index} "
+                f"exceeds MAX_PLATFORM_IDS={MAX_PLATFORM_IDS}"
+            )
+        if any(platform_id < 0 for platform_id in ids):
+            raise ValueError(
+                f"{_SOURCE_PLATFORM_IDS_COLUMN} row {row_index} doc {group_index} "
+                "must contain non-negative IDs"
+            )
+        groups.append(ids)
+    return groups
 
 
 def _coerce_token_row(value: Any, *, label: str = "token IDs") -> list[int]:

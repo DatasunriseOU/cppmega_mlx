@@ -9,7 +9,8 @@ Public API
 ----------
 * :func:`detect_cuda_arch` -> ``"sm_89" / "sm_90a" / "sm_100" / "sm_120" / "sm_121" / "cpu"``
 * :func:`dispatch_kernel_bridge` -- ``kind in {"triton", "cute_dsl", "mxfp8", "mxfp8_grouped"}``;
-  kwargs forwarded to the chosen sub-bridge.
+  kwargs forwarded to the chosen sub-bridge. Pass ``arch=...`` to route for a
+  target CUDA arch when importing/lowering IR on a non-CUDA host.
 * :data:`ARCH_BRIDGE_TABLE` -- mapping ``arch -> frozenset[bridge_kind]`` documenting
   the support matrix exhaustively.
 * :class:`CUDABridgeUnsupported` -- raised for any arch/kind combo that has no
@@ -31,10 +32,15 @@ sm_121 (GB10)       yes      no        yes      yes
 cpu / no CUDA       no       no        no       no
 ==================  =======  ========  =======  =============
 
-* sm_90 CuTe-DSL is *partial*: only the supported direction
-  (``_cute_bridge.compile_prim_to_cutedsl``) routes here; the reverse
-  direction (external ``@cute.kernel`` -> TileLang IR import) is loud-fail
-  via ``CuteBridgeUnsupported`` from ``_cute_bridge`` itself.
+* sm_90 CuTe-DSL is *partial*: TileLang-IR -> CuTeDSL
+  (``_cute_bridge.compile_prim_to_cutedsl``) routes here, and
+  ``_cute_bridge.cute_dsl_to_tilelang_prim`` /
+  ``_cute_bridge.cute_dsl_source_to_tilelang_prim`` can recover cppmega's
+  smallest ``SingleGemmWGMMA``, ``MaskedLKQApplyWGMMA``, one-chunk
+  ``StateApplyConsumersWGMMA``, and fixed-nchunk
+  ``MultiChunkStateApplyConsumersWGMMA`` external kernels as TileLang ``T``
+  ops. More complex external ``@cute.kernel`` objects still loud-fail via
+  ``CuteBridgeUnsupported`` until they have dedicated importers.
 * Unknown SM (e.g. future ``sm_130``) emits a ``RuntimeWarning`` and
   *falls back to sm_120 dispatch*. This keeps newer client GPUs usable for
   Triton/MXFP8 paths until we cut a release with explicit support.
@@ -161,17 +167,26 @@ def _unsupported_combo_error(arch: str, kind: str) -> CUDABridgeUnsupported:
     )
 
 
-def dispatch_kernel_bridge(kind: str, /, **kwargs: Any) -> Any:
+def dispatch_kernel_bridge(
+    kind: str,
+    /,
+    *,
+    arch: str | None = None,
+    **kwargs: Any,
+) -> Any:
     """Dispatch ``kind`` to the appropriate per-arch CUDA bridge.
 
-    ``kind`` must be one of :data:`SUPPORTED_KINDS`. ``kwargs`` are
-    forwarded verbatim to the selected sub-bridge entry point:
+    ``kind`` must be one of :data:`SUPPORTED_KINDS`. ``arch`` optionally
+    selects a target CUDA arch (for example ``"sm_90a"``) instead of using
+    local CUDA detection. ``kwargs`` are forwarded verbatim to the selected
+    sub-bridge entry point:
 
     * ``"triton"`` -> :func:`cppmega_mlx.nn._triton_bridge.triton_to_tilelang_prim`
     * ``"cute_dsl"`` -> :func:`cppmega_mlx.nn._cute_bridge.compile_prim_to_cutedsl`
-      (only the *supported* direction; reverse direction must be obtained
-      by calling ``_cute_bridge.cute_dsl_to_tilelang_prim`` directly, which
-      raises :class:`~cppmega_mlx.nn._cute_bridge.CuteBridgeUnsupported`).
+      for TileLang-IR -> CuTeDSL, or
+      :func:`cppmega_mlx.nn._cute_bridge.cute_dsl_source_to_tilelang_prim` /
+      :func:`cppmega_mlx.nn._cute_bridge.cute_dsl_to_tilelang_prim` when
+      ``source_path`` / ``cute_kernel`` is provided for external CuTe import.
     * ``"mxfp8"`` -> ``_mxfp8_bridge.mxfp8_to_tilelang_extern`` (lazy import;
       file may not exist on every checkout -- raised as
       :class:`CUDABridgeUnsupported` with a precise reason if missing).
@@ -191,7 +206,7 @@ def dispatch_kernel_bridge(kind: str, /, **kwargs: Any) -> Any:
             f"{sorted(SUPPORTED_KINDS)!r}"
         )
 
-    raw_arch = detect_cuda_arch()
+    raw_arch = arch or detect_cuda_arch()
     if raw_arch == "cpu":
         raise _no_cuda_error(kind)
 
@@ -208,8 +223,23 @@ def dispatch_kernel_bridge(kind: str, /, **kwargs: Any) -> Any:
         return triton_to_tilelang_prim(**kwargs)
 
     if kind == "cute_dsl":
-        from cppmega_mlx.nn._cute_bridge import compile_prim_to_cutedsl
+        from cppmega_mlx.nn._cute_bridge import (
+            compile_prim_to_cutedsl,
+            cute_dsl_source_to_tilelang_prim,
+            cute_dsl_to_tilelang_prim,
+        )
 
+        source_path = kwargs.pop("source_path", None)
+        if source_path is not None:
+            return cute_dsl_source_to_tilelang_prim(source_path, **kwargs)
+        cute_kernel = kwargs.pop("cute_kernel", None)
+        if cute_kernel is not None:
+            if kwargs:
+                raise CUDABridgeUnsupported(
+                    "cute_dsl external kernel import accepts only cute_kernel; "
+                    f"unexpected kwargs {sorted(kwargs)!r}."
+                )
+            return cute_dsl_to_tilelang_prim(cute_kernel)
         return compile_prim_to_cutedsl(**kwargs)
 
     # MXFP8 paths -- lazy import because the bridge module may be authored

@@ -10,6 +10,10 @@ import pytest
 
 from cppmega_mlx.data.nanochat_pipeline import platform_vocab
 from cppmega_mlx.data.nanochat_pipeline import tokenized_enriched_schema as schema
+from cppmega_mlx.data.nanochat_pipeline.build_context import (
+    detect_build_context,
+    find_compile_commands_file,
+)
 from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched import (
     materialize_tokenized_enriched_batch,
 )
@@ -17,7 +21,12 @@ from scripts.nanochat_data import clang_enriched_to_parquet
 from scripts.nanochat_data.token_budget import chunk_enriched_document, load_tokenizer
 from tools.clang_indexer import index_project
 from tools.clang_indexer.index_project import FunctionDef, PartInfo
-from tools.clang_indexer.process_commits import FileAnalysis, _build_enriched_from_parts
+from tools.clang_indexer.process_commits import (
+    BuildContextResolver,
+    FileAnalysis,
+    _build_enriched_from_parts,
+    analyze_file_clang,
+)
 
 
 class _CharTokenizer:
@@ -257,6 +266,92 @@ def test_clang_indexer_ast_metadata_comes_from_clang(tmp_path: Path) -> None:
     assert len(main.ast_node_type) == len(main.text)
     assert any(main.ast_depth)
     assert 20 in main.ast_node_type  # clang CALL_EXPR bucket
+
+
+def test_build_context_discovers_nested_compile_commands_and_absolutizes_includes(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "build").mkdir()
+    (tmp_path / "include").mkdir()
+    (tmp_path / "src").mkdir()
+    compile_commands = [
+        {
+            "directory": str(tmp_path),
+            "command": "clang++ -Iinclude -std=c++20 -c src/main.cc -o main.o",
+            "file": "src/main.cc",
+        }
+    ]
+    (tmp_path / "build" / "compile_commands.json").write_text(
+        json.dumps(compile_commands),
+        encoding="utf-8",
+    )
+
+    discovered = find_compile_commands_file(str(tmp_path))
+    context, _default_args, compile_index = detect_build_context(str(tmp_path))
+
+    assert discovered == str(tmp_path / "build" / "compile_commands.json")
+    assert context["build_system"] == "compile_commands"
+    assert compile_index is not None
+    file_args, build_info = compile_index.lookup(str(tmp_path / "src" / "main.cc"))
+    assert file_args is not None
+    assert f"-I{tmp_path / 'include'}" in file_args
+    assert "src/main.cc" not in file_args
+    assert build_info == {
+        "build_system": "compile_commands",
+        "source": "compile_commands",
+        "compiler": "clang++",
+    }
+
+
+def test_commit_clang_analysis_uses_repo_build_context_for_virtual_source(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "build").mkdir()
+    (tmp_path / "include").mkdir()
+    (tmp_path / "src").mkdir()
+    (tmp_path / "include" / "dep.hpp").write_text(
+        "inline int dep() { return 7; }\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "build" / "compile_commands.json").write_text(
+        json.dumps(
+            [
+                {
+                    "directory": str(tmp_path),
+                    "command": "clang++ -Iinclude -std=c++17 -c src/main.cc -o main.o",
+                    "file": "src/main.cc",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    source = '#include "dep.hpp"\nint main() { return dep(); }\n'
+
+    index_project._configure_libclang(None)
+    clang_index = index_project.Index.create()
+    fallback = analyze_file_clang(
+        source,
+        "src/main.cc",
+        clang_index,
+        str(tmp_path / "fallback"),
+    )
+    repo_root, compile_args, build_info = BuildContextResolver(
+        repo_root=str(tmp_path)
+    ).resolve({"filepath": "src/main.cc"})
+    build_aware = analyze_file_clang(
+        source,
+        "src/main.cc",
+        clang_index,
+        str(tmp_path / "build-aware"),
+        compile_args=compile_args,
+        repo_root=repo_root,
+        build_info=build_info,
+    )
+
+    assert next(func for func in fallback.functions if func.name == "main").callees == []
+    main = next(func for func in build_aware.functions if func.name == "main")
+    assert main.callees == ["dep"]
+    assert build_aware.build_info["build_system"] == "compile_commands"
 
 
 def test_commit_enriched_builder_emits_semantic_columns_without_libclang_runtime() -> None:

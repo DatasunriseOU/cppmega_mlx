@@ -40,20 +40,24 @@ class PlatformEmbedding(nn.Module):
         dtype = target_dtype or self.embedding.weight.dtype
         if platform_ids is None:
             return mx.array(0.0, dtype=dtype)
-        if platform_ids.ndim != 2:
+        if platform_ids.ndim not in (2, 3):
             raise ValueError(
-                f"platform_ids must be shaped (B, K), got {platform_ids.shape}"
+                "platform_ids must be shaped (B, K) or (B, S, K), "
+                f"got {platform_ids.shape}"
             )
-        if platform_ids.shape[1] > self.max_ids:
+        if platform_ids.shape[-1] > self.max_ids:
             raise ValueError(
-                f"platform_ids width {platform_ids.shape[1]} exceeds max_ids={self.max_ids}"
+                f"platform_ids width {platform_ids.shape[-1]} exceeds max_ids={self.max_ids}"
             )
 
         ids = platform_ids.astype(mx.int64)
         self._validate_range(ids)
         embeddings = self.embedding(ids)
         mask = (ids != 0)[..., None].astype(embeddings.dtype)
-        out = mx.sum(embeddings * mask, axis=1)[:, None, :]
+        if ids.ndim == 2:
+            out = mx.sum(embeddings * mask, axis=1)[:, None, :]
+        else:
+            out = mx.sum(embeddings * mask, axis=2)
         if out.dtype != dtype:
             out = out.astype(dtype)
         return out

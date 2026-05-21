@@ -1087,7 +1087,11 @@ class HybridTinyLM(nn.Module):
         if structure_embeddings.ndim == hidden_states.ndim:
             hidden_states = hidden_states + structure_embeddings
 
-        platform_ids = _validate_platform_ids(platform_ids, batch_size=batch_size)
+        platform_ids = _validate_platform_ids(
+            platform_ids,
+            batch_size=batch_size,
+            seq_length=seq_length,
+        )
         if platform_ids is not None:
             hidden_states = hidden_states + self.platform_embedding(
                 platform_ids,
@@ -1180,15 +1184,23 @@ def _validate_platform_ids(
     tensor: mx.array | None,
     *,
     batch_size: int,
+    seq_length: int,
 ) -> mx.array | None:
     if tensor is None:
         return None
-    if tensor.ndim != 2:
-        raise ValueError(f"platform_ids must be shaped (B, K), got {tensor.shape}")
+    if tensor.ndim not in (2, 3):
+        raise ValueError(
+            f"platform_ids must be shaped (B, K) or (B, S, K), got {tensor.shape}"
+        )
     if tensor.shape[0] != batch_size:
         raise ValueError(
             "platform_ids batch dimension must match input batch "
             f"{batch_size}, got {tensor.shape[0]}"
+        )
+    if tensor.ndim == 3 and tensor.shape[1] != seq_length:
+        raise ValueError(
+            "token-local platform_ids sequence dimension must match input sequence "
+            f"{seq_length}, got {tensor.shape[1]}"
         )
     return tensor
 

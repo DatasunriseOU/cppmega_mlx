@@ -4,9 +4,11 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import mlx.nn as nn
 
 from cppmega_mlx.data.parquet_dataset import TokenParquetDataset
 import cppmega_mlx.data.parquet_dataset as parquet_dataset
+from cppmega_mlx.training.loss import next_token_cross_entropy
 
 
 class _FakeColumn:
@@ -327,8 +329,7 @@ def test_all_metadata_excludes_token_content_and_slices_token_level_fields() -> 
     assert "token_ids" not in metadata_columns
     assert metadata_windows[0]["token_symbol_ids"] == [10, 11, 12, 13]
     assert metadata_windows[1]["token_symbol_ids"] == [14, 15, 16, 17]
-    assert metadata_windows[0]["doc_ids"] == [0, 0, 0, 0]
-    assert metadata_windows[1]["doc_ids"] == [1, 1, 1, 1]
+    assert "doc_ids" not in metadata_columns
     assert "platform_ids" not in metadata_columns
     assert metadata_windows[1]["repo"] == "llvm"
 
@@ -374,6 +375,67 @@ def test_platform_ids_parquet_column_threads_to_model_kwargs(tmp_path) -> None:
             "type": "large_list<element: int32>",
         }
     }
+
+
+def test_nanochat_input_target_loss_docids_parquet_drive_training_batch(tmp_path) -> None:
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    path = tmp_path / "packed.parquet"
+    table = pa.table(
+        {
+            "input_ids": pa.array([[10, 11, 12, 13]], type=pa.large_list(pa.int32())),
+            "target_ids": pa.array([[11, 12, 13, 14]], type=pa.large_list(pa.int32())),
+            "loss_mask": pa.array([[1, 1, 0, 0]], type=pa.large_list(pa.int8())),
+            "doc_ids": pa.array([[0, 0, 1, 1]], type=pa.large_list(pa.int32())),
+            "token_structure_ids": pa.array(
+                [[2, 2, 3, 3]], type=pa.large_list(pa.int16())
+            ),
+            "token_symbol_ids": pa.array(
+                [[100, 101, 102, 103]], type=pa.large_list(pa.int64())
+            ),
+        }
+    )
+    pq.write_table(table, path)
+
+    dataset = TokenParquetDataset(
+        path,
+        seq_len=4,
+        batch_size=1,
+        metadata_columns="all",
+    )
+    batch = next(dataset.iter_batches())
+
+    np.testing.assert_array_equal(np.array(batch.inputs), [[10, 11, 12, 13]])
+    np.testing.assert_array_equal(np.array(batch.targets), [[11, 12, 13, 14]])
+    np.testing.assert_array_equal(np.array(batch.target_mask), [[1, 1, 0, 0]])
+    np.testing.assert_array_equal(np.array(batch.input_document_ids), [[0, 0, 1, 1]])
+    np.testing.assert_array_equal(
+        np.array(batch.model_kwargs()["structure_ids"]),
+        [[2, 2, 3, 3]],
+    )
+    metadata_columns = batch.training_metadata()["parquet"]["columns"]
+    assert "token_symbol_ids" in metadata_columns
+    assert "target_ids" not in metadata_columns
+    assert "loss_mask" not in metadata_columns
+    assert "doc_ids" not in metadata_columns
+    assert dataset.parquet_receipt["token_source"]["column"] == "input_ids"
+    assert dataset.parquet_receipt["training_column_sources"] == {
+        "target_tokens": {"column": "target_ids", "type": "large_list<element: int32>"},
+        "loss_mask": {"column": "loss_mask", "type": "large_list<element: int8>"},
+        "document_ids": {"column": "doc_ids", "type": "large_list<element: int32>"},
+    }
+
+    class UniformLogitModel(nn.Module):
+        def __call__(self, input_ids, **kwargs):
+            assert tuple(input_ids.shape) == (1, 4)
+            assert "document_ids" in kwargs
+            return parquet_dataset.mx.zeros((1, 4, 32), dtype=parquet_dataset.mx.float32)
+
+    loss, ntokens = next_token_cross_entropy(UniformLogitModel(), batch)
+    parquet_dataset.mx.eval(loss, ntokens)
+
+    assert int(ntokens.item()) == 2
+    assert float(loss.item()) > 0
 
 
 def test_source_level_structure_ids_are_ignored_when_not_token_aligned(

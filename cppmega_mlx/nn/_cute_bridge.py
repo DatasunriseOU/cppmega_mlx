@@ -39,23 +39,32 @@ There are two supportable paths:
    it works as-is for ``"cutedsl"`` once the cppmega-mlx environment has
    ``CPPMEGA_MLX_TILELANG_ENGINE=engine`` (auto mode also works on Linux+CUDA).
 
-2. **External-CuTeDSL → TileLang import** (NOT supported by the upstream
-   bridge). PR #1421 does not implement IR import from ``@cute.kernel``
-   functions — it only emits CuTeDSL from TileLang IR. Wiring cppmega's
-   ``SingleGemmWGMMA`` etc. as TileLang prim functions would require either:
+2. **External-CuTeDSL → TileLang import** (pattern-recognized subset).
+   PR #1421 does not implement general IR import from ``@cute.kernel``
+   functions — it only emits CuTeDSL from TileLang IR.  For cppmega's
+   smallest smoke kernels, ``SingleGemmWGMMA``, ``MaskedLKQApplyWGMMA``,
+   one-chunk ``StateApplyConsumersWGMMA``, fixed-nchunk
+   ``MultiChunkStateApplyConsumersWGMMA``, and FA4's
+   ``FA4PatternFused3Gemm`` / ``FA4PatternFused3GemmV2`` chains, we can
+   recover the tile contract and
+   re-express it as TileLang ``T`` ops.  More complex kernels still require
+   either:
 
        (a) re-expressing the kernel in TileLang ``T`` ops, or
-       (b) extending TileLang with a CuTeDSL frontend (out of scope here).
+       (b) extending TileLang with a CuTeDSL frontend.
 
-This module exposes :func:`cute_dsl_to_tilelang_prim` as a thin shim that
-documents the gap loudly. It also exposes :func:`compile_prim_to_cutedsl` for
-the supported direction — the test harness exercises that path.
+This module exposes :func:`cute_dsl_to_tilelang_prim` for that narrow import
+case and fails loudly for everything else. It also exposes
+:func:`compile_prim_to_cutedsl` for the supported emit direction — the test
+harness exercises both paths.
 
 See ``tests/test_cute_to_tilelang_bridge.py`` for an end-to-end smoke.
 """
 
 from __future__ import annotations
 
+import ast
+from pathlib import Path
 from typing import Any
 
 __all__ = [
@@ -63,6 +72,7 @@ __all__ = [
     "TILELANG_CUTEDSL_ENTRY",
     "CuteBridgeUnsupported",
     "compile_prim_to_cutedsl",
+    "cute_dsl_source_to_tilelang_prim",
     "cute_dsl_to_tilelang_prim",
     "tilelang_cutedsl_available",
 ]
@@ -81,11 +91,15 @@ TILELANG_CUTEDSL_ENTRY = {
 CUTE_BRIDGE_KNOWN_GAPS = (
     # Direction mismatch — the most important one.
     "TileLang's CuTeDSL bridge emits CuTeDSL Python from a TileLang T.prim_func; "
-    "it does not consume hand-written @cute.kernel modules. cppmega's "
-    "cute_dsl_mimo/* kernels (SingleGemmWGMMA, FA4 backward, fused 10-GEMM "
-    "bwd_bwd_sm90_p4) are external CuTeDSL — they cannot be 'imported' as "
-    "TileLang IR without re-expressing them in T-ops or building a new "
-    "CuTeDSL frontend for TileLang.",
+    "it does not generally consume hand-written @cute.kernel modules. cppmega's "
+    "SingleGemmWGMMA, MaskedLKQApplyWGMMA, one-chunk "
+    "StateApplyConsumersWGMMA, and fixed-nchunk "
+    "MultiChunkStateApplyConsumersWGMMA plus FA4PatternFused3Gemm and "
+    "FA4PatternFused3GemmV2 can be "
+    "pattern-imported by re-expressing the recovered contracts in TileLang "
+    "T-ops; complex cute_dsl_mimo kernels (full FA4 backward, fused 10-GEMM "
+    "bwd_bwd_sm90_p4) still need dedicated TileLang rewrites or a real "
+    "CuTeDSL frontend.",
     # Hopper-specific feature gaps — even for the supported direction.
     "TileLang's CuTeDSL emitter (sm_90 path) does not expose all WGMMA / TMA "
     "knobs that cppmega's hand-written kernels rely on (e.g. quack.sm90_utils, "
@@ -100,10 +114,7 @@ CUTE_BRIDGE_KNOWN_GAPS = (
 
 
 class CuteBridgeUnsupported(RuntimeError):
-    """Raised when an external CuTeDSL kernel is asked to be 'imported' as
-    a TileLang prim_func — the upstream bridge does not support that
-    direction. See :data:`CUTE_BRIDGE_KNOWN_GAPS`.
-    """
+    """Raised when an external CuTeDSL kernel has no TileLang importer."""
 
 
 def tilelang_cutedsl_available() -> tuple[bool, str]:
@@ -128,28 +139,878 @@ def tilelang_cutedsl_available() -> tuple[bool, str]:
     return True, ""
 
 
-def cute_dsl_to_tilelang_prim(cute_kernel: Any) -> Any:  # noqa: ARG001
-    """Stub for the *unsupported* direction (external CuTeDSL → TileLang IR).
+def cute_dsl_to_tilelang_prim(cute_kernel: Any) -> Any:
+    """Import a recognized external CuTeDSL kernel as TileLang IR.
 
-    Raises :class:`CuteBridgeUnsupported` with a precise reason. This exists
-    so callers can ``try: cute_dsl_to_tilelang_prim(k); except
-    CuteBridgeUnsupported: <fall back to direct cute.compile>`` rather than
-    silently relying on a non-existent bridge.
+    The supported reverse-direction subset is intentionally small.  cppmega's
+    ``SingleGemmWGMMA`` is re-expressed as a single-CTA TileLang ``T.gemm``
+    PrimFunc with the same public contract, ``MaskedLKQApplyWGMMA`` is
+    re-expressed as two TileLang GEMMs plus an in-IR future-mask spill, and
+    one-chunk ``StateApplyConsumersWGMMA`` is re-expressed as three GEMMs plus
+    the DV/DMIMO_V consumers. The fixed-nchunk multi-chunk state/apply importer
+    and FA4 3-GEMM chains are source-only because their useful contracts are
+    easier to recover from source without importing ``cutlass`` / ``quack``.
+    Unsupported kernels still raise
+    :class:`CuteBridgeUnsupported` with a precise reason rather than returning
+    ``None`` or silently falling back to a launch boundary.
 
-    To dispatch a TileLang ``T.prim_func`` through the CuTeDSL backend (the
-    direction PR #1421 *does* support), call
+    To dispatch an existing TileLang ``T.prim_func`` through the CuTeDSL
+    backend (the direction PR #1421 natively supports), call
     :func:`compile_prim_to_cutedsl` or ``dispatch_lower(prim, target='cutedsl')``
     from ``cppmega_mlx.nn._tilelang._engine_dispatch``.
     """
 
+    name = _cute_kernel_class_name(cute_kernel)
+    if name == "SingleGemmWGMMA":
+        m = _positive_int_attr(cute_kernel, "M")
+        n = _positive_int_attr(cute_kernel, "N")
+        k = _positive_int_attr(cute_kernel, "K")
+        dtype = _normalize_cute_dtype(getattr(cute_kernel, "dtype", "bfloat16"))
+        return _build_single_gemm_wgmma_tilelang_prim(m, n, k, dtype)
+    if name == "MaskedLKQApplyWGMMA":
+        dim = _positive_int_attr(cute_kernel, "dim")
+        rank = _positive_int_attr(cute_kernel, "rank")
+        dtype = _normalize_cute_dtype(getattr(cute_kernel, "dtype", "bfloat16"))
+        return _build_masked_lkq_apply_tilelang_prim(dim, rank, dtype)
+    if name == "StateApplyConsumersWGMMA":
+        dim = _positive_int_attr(cute_kernel, "dim")
+        rank = _positive_int_attr(cute_kernel, "rank")
+        chunk_size = _positive_int_attr(cute_kernel, "chunk_size")
+        dtype = _normalize_cute_dtype(getattr(cute_kernel, "dtype", "bfloat16"))
+        return _build_state_apply_consumers_tilelang_prim(
+            dim,
+            rank,
+            chunk_size,
+            dtype,
+        )
+
     raise CuteBridgeUnsupported(
-        "TileLang's CuTeDSL bridge (PR #1421) emits CuTeDSL from TileLang IR; "
-        "it does not import @cute.kernel Python. To use cppmega's "
-        "cute_dsl_mimo/* kernels, call them directly via cute.compile(...). "
-        "To route a TileLang prim_func through the CuTeDSL backend instead, "
+        "TileLang's CuTeDSL bridge (PR #1421) emits CuTeDSL from TileLang IR "
+        "and cppmega_mlx currently imports only the external SingleGemmWGMMA, "
+        "MaskedLKQApplyWGMMA, one-chunk StateApplyConsumersWGMMA, and "
+        "source-level fixed-nchunk MultiChunkStateApplyConsumersWGMMA / "
+        "FA4PatternFused3Gemm / FA4PatternFused3GemmV2 patterns as TileLang "
+        "T-ops. Unsupported "
+        f"@cute.kernel object {name or type(cute_kernel).__name__!r} needs a "
+        "dedicated TileLang T-op rewrite or a real CuTeDSL frontend. To route "
+        "an existing TileLang prim_func through the CuTeDSL backend instead, "
         "use cppmega_mlx.nn._cute_bridge.compile_prim_to_cutedsl(prim) or "
         "dispatch_lower(prim, target='cutedsl')."
     )
+
+
+def cute_dsl_source_to_tilelang_prim(
+    source_path: str | Path,
+    *,
+    class_name: str | None = None,
+    nchunks: int | None = None,
+) -> Any:
+    """Statically import a recognized external CuTeDSL source file.
+
+    This path intentionally avoids importing the external Python module, so it
+    works on Mac/MLX hosts where ``cutlass`` and ``quack`` are not installed.
+    Supported source patterns are cppmega's ``SingleGemmWGMMA``,
+    ``MaskedLKQApplyWGMMA``, one-chunk ``StateApplyConsumersWGMMA``,
+    fixed-nchunk ``MultiChunkStateApplyConsumersWGMMA``, and
+    ``FA4PatternFused3Gemm`` / ``FA4PatternFused3GemmV2`` classes with
+    ``@cute.kernel`` methods and
+    literal constructor defaults for their tile-contract dimensions.
+    """
+
+    path = Path(source_path)
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    except OSError as exc:
+        raise CuteBridgeUnsupported(
+            f"cannot read CuTeDSL source file {path}: {exc}"
+        ) from exc
+    except SyntaxError as exc:
+        raise CuteBridgeUnsupported(
+            f"cannot parse CuTeDSL source file {path}: {exc}"
+        ) from exc
+
+    cls = _find_cute_kernel_class(tree, class_name=class_name)
+    if cls.name == "SingleGemmWGMMA":
+        m, n, k, dtype = _single_gemm_defaults_from_class(cls)
+        return _build_single_gemm_wgmma_tilelang_prim(m, n, k, dtype)
+    if cls.name == "MaskedLKQApplyWGMMA":
+        dim, rank, dtype = _masked_lkq_defaults_from_class(cls)
+        return _build_masked_lkq_apply_tilelang_prim(dim, rank, dtype)
+    if cls.name == "StateApplyConsumersWGMMA":
+        dim, rank, chunk_size, dtype = _state_apply_consumers_defaults_from_class(cls)
+        return _build_state_apply_consumers_tilelang_prim(
+            dim,
+            rank,
+            chunk_size,
+            dtype,
+        )
+    if cls.name == "MultiChunkStateApplyConsumersWGMMA":
+        if nchunks is None:
+            raise CuteBridgeUnsupported(
+                "MultiChunkStateApplyConsumersWGMMA source import requires "
+                "explicit nchunks because the CuTe kernel specializes it from "
+                "the runtime tensor shape."
+            )
+        nchunks_value = _positive_int_value(nchunks, "nchunks")
+        if nchunks_value not in (2, 4, 8):
+            raise CuteBridgeUnsupported(
+                "MultiChunkStateApplyConsumersWGMMA source import supports "
+                f"nchunks in (2, 4, 8); got {nchunks_value}."
+            )
+        base_cls = _find_class_by_name(tree, "StateApplyConsumersWGMMA")
+        dim, rank, chunk_size, dtype = _state_apply_consumers_defaults_from_class(
+            base_cls
+        )
+        return _build_multi_chunk_state_apply_consumers_tilelang_prim(
+            dim,
+            rank,
+            chunk_size,
+            dtype,
+            nchunks_value,
+        )
+    if cls.name == "FA4PatternFused3Gemm":
+        dim, dtype = _fa4_fused3_gemm_defaults_from_class(cls)
+        return _build_fa4_v1_fused3_gemm_tilelang_prim(dim, dtype)
+    if cls.name == "FA4PatternFused3GemmV2":
+        dim, dtype = _fa4_fused3_gemm_defaults_from_class(cls)
+        return _build_fa4_v2_fused3_gemm_tilelang_prim(dim, dtype)
+    raise CuteBridgeUnsupported(
+        "source-level CuTeDSL import currently supports only SingleGemmWGMMA, "
+        "MaskedLKQApplyWGMMA, one-chunk StateApplyConsumersWGMMA, and "
+        "fixed-nchunk MultiChunkStateApplyConsumersWGMMA plus "
+        "FA4PatternFused3Gemm / FA4PatternFused3GemmV2; "
+        f"got {cls.name!r} from {path}."
+    )
+
+
+def _cute_kernel_class_name(cute_kernel: Any) -> str:
+    """Return the stable class/function name for a CuTeDSL kernel object."""
+
+    direct = getattr(cute_kernel, "__name__", None)
+    if isinstance(direct, str) and direct:
+        return direct
+    cls = getattr(cute_kernel, "__class__", None)
+    name = getattr(cls, "__name__", "")
+    return name if isinstance(name, str) else ""
+
+
+def _find_cute_kernel_class(
+    tree: ast.Module,
+    *,
+    class_name: str | None,
+) -> ast.ClassDef:
+    """Find the requested or sole ``@cute.kernel`` class in a source AST."""
+
+    classes = [node for node in tree.body if isinstance(node, ast.ClassDef)]
+    if class_name is not None:
+        matches = [node for node in classes if node.name == class_name]
+        if not matches:
+            raise CuteBridgeUnsupported(
+                f"CuTeDSL source does not define class {class_name!r}."
+            )
+        candidate = matches[0]
+        if not _class_has_cute_kernel(candidate):
+            raise CuteBridgeUnsupported(
+                f"CuTeDSL source class {class_name!r} has no @cute.kernel method."
+            )
+        return candidate
+
+    named = [node for node in classes if node.name == "SingleGemmWGMMA"]
+    if named and _class_has_cute_kernel(named[0]):
+        return named[0]
+
+    cute_classes = [node for node in classes if _class_has_cute_kernel(node)]
+    if len(cute_classes) == 1:
+        return cute_classes[0]
+    if not cute_classes:
+        raise CuteBridgeUnsupported(
+            "CuTeDSL source does not define a class with a @cute.kernel method."
+        )
+    raise CuteBridgeUnsupported(
+        "CuTeDSL source defines multiple @cute.kernel classes; pass class_name."
+    )
+
+
+def _find_class_by_name(tree: ast.Module, class_name: str) -> ast.ClassDef:
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and node.name == class_name:
+            return node
+    raise CuteBridgeUnsupported(f"CuTeDSL source does not define class {class_name!r}.")
+
+
+def _class_has_cute_kernel(cls: ast.ClassDef) -> bool:
+    for item in cls.body:
+        if not isinstance(item, ast.FunctionDef):
+            continue
+        if any(
+            _is_cute_decorator(decorator, "kernel")
+            for decorator in item.decorator_list
+        ):
+            return True
+    return False
+
+
+def _is_cute_decorator(node: ast.expr, attr: str) -> bool:
+    target = node.func if isinstance(node, ast.Call) else node
+    return (
+        isinstance(target, ast.Attribute)
+        and isinstance(target.value, ast.Name)
+        and target.value.id == "cute"
+        and target.attr == attr
+    )
+
+
+def _single_gemm_defaults_from_class(cls: ast.ClassDef) -> tuple[int, int, int, str]:
+    init = next(
+        (
+            item
+            for item in cls.body
+            if isinstance(item, ast.FunctionDef) and item.name == "__init__"
+        ),
+        None,
+    )
+    if init is None:
+        raise CuteBridgeUnsupported("SingleGemmWGMMA source has no __init__ method.")
+
+    defaults_by_name = _function_defaults_by_name(init)
+    try:
+        m = _literal_positive_int(defaults_by_name["M"], "M")
+        n = _literal_positive_int(defaults_by_name["N"], "N")
+        k = _literal_positive_int(defaults_by_name["K"], "K")
+    except KeyError as exc:
+        raise CuteBridgeUnsupported(
+            "SingleGemmWGMMA source __init__ must default M, N, and K."
+        ) from exc
+    dtype_node = defaults_by_name.get("dtype")
+    dtype = _normalize_cute_dtype(
+        _ast_default_to_name(dtype_node or ast.Constant("bfloat16"))
+    )
+    return m, n, k, dtype
+
+
+def _masked_lkq_defaults_from_class(cls: ast.ClassDef) -> tuple[int, int, str]:
+    init = next(
+        (
+            item
+            for item in cls.body
+            if isinstance(item, ast.FunctionDef) and item.name == "__init__"
+        ),
+        None,
+    )
+    if init is None:
+        raise CuteBridgeUnsupported("MaskedLKQApplyWGMMA source has no __init__ method.")
+
+    defaults_by_name = _function_defaults_by_name(init)
+    try:
+        dim = _literal_positive_int(defaults_by_name["dim"], "dim")
+        rank = _literal_positive_int(defaults_by_name["rank"], "rank")
+    except KeyError as exc:
+        raise CuteBridgeUnsupported(
+            "MaskedLKQApplyWGMMA source __init__ must default dim and rank."
+        ) from exc
+    dtype_node = defaults_by_name.get("dtype")
+    dtype = _normalize_cute_dtype(
+        _ast_default_to_name(dtype_node or ast.Constant("bfloat16"))
+    )
+    return dim, rank, dtype
+
+
+def _state_apply_consumers_defaults_from_class(
+    cls: ast.ClassDef,
+) -> tuple[int, int, int, str]:
+    init = next(
+        (
+            item
+            for item in cls.body
+            if isinstance(item, ast.FunctionDef) and item.name == "__init__"
+        ),
+        None,
+    )
+    if init is None:
+        raise CuteBridgeUnsupported(
+            "StateApplyConsumersWGMMA source has no __init__ method."
+        )
+
+    defaults_by_name = _function_defaults_by_name(init)
+    try:
+        dim = _literal_positive_int(defaults_by_name["dim"], "dim")
+        rank = _literal_positive_int(defaults_by_name["rank"], "rank")
+        chunk_size = _literal_positive_int(
+            defaults_by_name["chunk_size"],
+            "chunk_size",
+        )
+    except KeyError as exc:
+        raise CuteBridgeUnsupported(
+            "StateApplyConsumersWGMMA source __init__ must default dim, "
+            "rank, and chunk_size."
+        ) from exc
+    dtype_node = defaults_by_name.get("dtype")
+    dtype = _normalize_cute_dtype(
+        _ast_default_to_name(dtype_node or ast.Constant("bfloat16"))
+    )
+    return dim, rank, chunk_size, dtype
+
+
+def _fa4_fused3_gemm_defaults_from_class(cls: ast.ClassDef) -> tuple[int, str]:
+    init = next(
+        (
+            item
+            for item in cls.body
+            if isinstance(item, ast.FunctionDef) and item.name == "__init__"
+        ),
+        None,
+    )
+    if init is None:
+        raise CuteBridgeUnsupported(
+            f"{cls.name} source has no __init__ method."
+        )
+
+    defaults_by_name = _function_defaults_by_name(init)
+    try:
+        dim = _literal_positive_int(defaults_by_name["DIM"], "DIM")
+    except KeyError as exc:
+        raise CuteBridgeUnsupported(
+            f"{cls.name} source __init__ must default DIM."
+        ) from exc
+    dtype_node = defaults_by_name.get("dtype")
+    dtype = _normalize_cute_dtype(
+        _ast_default_to_name(dtype_node or ast.Constant("bfloat16"))
+    )
+    return dim, dtype
+
+
+def _fa4_v2_defaults_from_class(cls: ast.ClassDef) -> tuple[int, str]:
+    return _fa4_fused3_gemm_defaults_from_class(cls)
+
+
+def _function_defaults_by_name(fn: ast.FunctionDef) -> dict[str, ast.expr]:
+    args = fn.args.args
+    defaults = fn.args.defaults
+    if not defaults:
+        return {}
+    defaulted_args = args[-len(defaults):]
+    return {arg.arg: default for arg, default in zip(defaulted_args, defaults)}
+
+
+def _literal_positive_int(node: ast.expr, name: str) -> int:
+    if not isinstance(node, ast.Constant) or isinstance(node.value, bool):
+        raise CuteBridgeUnsupported(
+            f"CuTeDSL source default {name!r} must be an integer literal."
+        )
+    try:
+        value = int(node.value)
+    except (TypeError, ValueError) as exc:
+        raise CuteBridgeUnsupported(
+            f"CuTeDSL source default {name!r} must be an integer literal."
+        ) from exc
+    if value <= 0:
+        raise CuteBridgeUnsupported(
+            f"CuTeDSL source default {name!r} must be positive."
+        )
+    return value
+
+
+def _ast_default_to_name(node: ast.expr) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        parts = [node.attr]
+        base = node.value
+        while isinstance(base, ast.Attribute):
+            parts.append(base.attr)
+            base = base.value
+        if isinstance(base, ast.Name):
+            parts.append(base.id)
+        return ".".join(reversed(parts))
+    if isinstance(node, ast.Constant):
+        return str(node.value)
+    raise CuteBridgeUnsupported(
+        "CuTeDSL source dtype default must be a simple name or literal."
+    )
+
+
+def _positive_int_attr(cute_kernel: Any, attr: str) -> int:
+    """Read a positive integer kernel dimension from an external kernel."""
+
+    if not hasattr(cute_kernel, attr):
+        raise CuteBridgeUnsupported(
+            f"CuTeDSL import requires integer attribute {attr!r}."
+        )
+    return _positive_int_value(getattr(cute_kernel, attr), attr)
+
+
+def _positive_int_value(value: Any, name: str) -> int:
+    if isinstance(value, bool):
+        raise CuteBridgeUnsupported(
+            f"CuTeDSL value {name!r} must be a positive integer."
+        )
+    try:
+        result = int(value)
+    except (TypeError, ValueError) as exc:
+        raise CuteBridgeUnsupported(
+            f"CuTeDSL value {name!r} must be a positive integer; "
+            f"got {value!r}."
+        ) from exc
+    if result <= 0:
+        raise CuteBridgeUnsupported(
+            f"CuTeDSL value {name!r} must be positive; got {result}."
+        )
+    return result
+
+
+def _normalize_cute_dtype(dtype: Any) -> str:
+    """Map common CuTe/CUTLASS dtype spellings to TileLang dtype strings."""
+
+    spellings = [
+        getattr(dtype, "__name__", ""),
+        getattr(dtype, "name", ""),
+        type(dtype).__name__,
+        str(dtype),
+    ]
+    joined = " ".join(str(item).lower() for item in spellings if item)
+    if "bfloat16" in joined or "bf16" in joined:
+        return "bfloat16"
+    if "float16" in joined or "f16" in joined or "half" in joined:
+        return "float16"
+    raise CuteBridgeUnsupported(
+        "CuTeDSL import supports bfloat16 and float16 inputs; "
+        f"got dtype={dtype!r}."
+    )
+
+
+def _build_single_gemm_wgmma_tilelang_prim(
+    m: int,
+    n: int,
+    k: int,
+    dtype: str,
+) -> Any:
+    """Build TileLang IR for cppmega's ``SingleGemmWGMMA`` contract."""
+
+    try:
+        import tilelang.language as T
+    except Exception as exc:  # pragma: no cover - host/environment dependent
+        raise CuteBridgeUnsupported(
+            "SingleGemmWGMMA import requires a working tilelang import; "
+            f"got {exc.__class__.__name__}: {exc}."
+        ) from exc
+
+    threads = 128
+
+    @T.prim_func
+    def single_gemm_wgmma_imported(
+        A: T.Tensor((m, k), dtype),
+        B: T.Tensor((n, k), dtype),
+        C: T.Tensor((m, n), dtype),
+    ):
+        with T.Kernel(1, 1, threads=threads) as (_bx, _by):
+            A_sh = T.alloc_shared((m, k), dtype)
+            B_sh = T.alloc_shared((n, k), dtype)
+            C_loc = T.alloc_fragment((m, n), "float32")
+            T.clear(C_loc)
+            T.copy(A[0, 0], A_sh)
+            T.copy(B[0, 0], B_sh)
+            T.gemm(A_sh, B_sh, C_loc, False, True)
+            T.copy(C_loc, C[0, 0])
+
+    return single_gemm_wgmma_imported
+
+
+def _build_masked_lkq_apply_tilelang_prim(
+    dim: int,
+    rank: int,
+    dtype: str,
+) -> Any:
+    """Build TileLang IR for cppmega's ``MaskedLKQApplyWGMMA`` contract."""
+
+    try:
+        import tilelang.language as T
+    except Exception as exc:  # pragma: no cover - host/environment dependent
+        raise CuteBridgeUnsupported(
+            "MaskedLKQApplyWGMMA import requires a working tilelang import; "
+            f"got {exc.__class__.__name__}: {exc}."
+        ) from exc
+
+    threads = 128
+
+    @T.prim_func
+    def masked_lkq_apply_wgmma_imported(
+        K: T.Tensor((dim, dim), dtype),
+        Q: T.Tensor((dim, dim), dtype),
+        DPhT: T.Tensor((dim, dim), dtype),
+        Apply: T.Tensor((dim, dim), dtype),
+    ):
+        with T.Kernel(1, 1, threads=threads) as (_bx, _by):
+            K_sh = T.alloc_shared((dim, dim), dtype)
+            Q_sh = T.alloc_shared((dim, dim), dtype)
+            DPhT_sh = T.alloc_shared((dim, dim), dtype)
+            LKQ_sh = T.alloc_shared((dim, dim), dtype)
+            LKQ_acc = T.alloc_fragment((dim, dim), "float32")
+            Apply_acc = T.alloc_fragment((dim, dim), "float32")
+            T.clear(LKQ_acc)
+            T.clear(Apply_acc)
+            T.copy(K[0, 0], K_sh)
+            T.copy(Q[0, 0], Q_sh)
+            T.copy(DPhT[0, 0], DPhT_sh)
+            T.gemm(K_sh, Q_sh, LKQ_acc, False, True)
+            for row, col in T.Parallel(dim, dim):
+                LKQ_sh[row, col] = T.if_then_else(
+                    (row // rank) < (col // rank),
+                    T.cast(LKQ_acc[row, col], dtype),
+                    T.cast(0, dtype),
+                )
+            T.gemm(LKQ_sh, DPhT_sh, Apply_acc, False, True)
+            T.copy(Apply_acc, Apply[0, 0])
+
+    return masked_lkq_apply_wgmma_imported
+
+
+def _build_state_apply_consumers_tilelang_prim(
+    dim: int,
+    rank: int,
+    chunk_size: int,
+    dtype: str,
+) -> Any:
+    """Build TileLang IR for cppmega's one-chunk state/apply consumer tile."""
+
+    try:
+        import tilelang.language as T
+    except Exception as exc:  # pragma: no cover - host/environment dependent
+        raise CuteBridgeUnsupported(
+            "StateApplyConsumersWGMMA import requires a working tilelang import; "
+            f"got {exc.__class__.__name__}: {exc}."
+        ) from exc
+
+    threads = 128
+
+    @T.prim_func
+    def state_apply_consumers_wgmma_imported(
+        K: T.Tensor((dim, dim), dtype),
+        Q: T.Tensor((dim, dim), dtype),
+        DstT: T.Tensor((dim, dim), dtype),
+        DPhT: T.Tensor((dim, dim), dtype),
+        V: T.Tensor((chunk_size, dim), dtype),
+        MimoV: T.Tensor((rank, dim), dtype),
+        DV: T.Tensor((chunk_size, dim), "float32"),
+        DMimoV: T.Tensor((rank, dim), "float32"),
+    ):
+        with T.Kernel(1, 1, threads=threads) as (_bx, _by):
+            K_sh = T.alloc_shared((dim, dim), dtype)
+            Q_sh = T.alloc_shared((dim, dim), dtype)
+            DstT_sh = T.alloc_shared((dim, dim), dtype)
+            DPhT_sh = T.alloc_shared((dim, dim), dtype)
+            State_sh = T.alloc_shared((dim, dim), dtype)
+            LKQ_sh = T.alloc_shared((dim, dim), dtype)
+            Apply_sh = T.alloc_shared((dim, dim), dtype)
+            State_acc = T.alloc_fragment((dim, dim), "float32")
+            LKQ_acc = T.alloc_fragment((dim, dim), "float32")
+            Apply_acc = T.alloc_fragment((dim, dim), "float32")
+            dv_acc = T.alloc_local((1,), "float32")
+            dmimo_acc = T.alloc_local((1,), "float32")
+
+            T.clear(State_acc)
+            T.clear(LKQ_acc)
+            T.clear(Apply_acc)
+            T.copy(K[0, 0], K_sh)
+            T.copy(Q[0, 0], Q_sh)
+            T.copy(DstT[0, 0], DstT_sh)
+            T.copy(DPhT[0, 0], DPhT_sh)
+
+            T.gemm(K_sh, DstT_sh, State_acc, False, True)
+            T.gemm(K_sh, Q_sh, LKQ_acc, False, True)
+            for row, col in T.Parallel(dim, dim):
+                State_sh[row, col] = T.cast(State_acc[row, col], dtype)
+                LKQ_sh[row, col] = T.if_then_else(
+                    (row // rank) < (col // rank),
+                    T.cast(LKQ_acc[row, col], dtype),
+                    T.cast(0, dtype),
+                )
+
+            T.gemm(LKQ_sh, DPhT_sh, Apply_acc, False, True)
+            for row, col in T.Parallel(dim, dim):
+                Apply_sh[row, col] = T.cast(Apply_acc[row, col], dtype)
+
+            for t, p in T.Parallel(chunk_size, dim):
+                dv_acc[0] = 0.0
+                for r in T.serial(rank):
+                    dv_acc[0] = dv_acc[0] + (
+                        (
+                            T.cast(State_sh[t * rank + r, p], "float32")
+                            + T.cast(Apply_sh[t * rank + r, p], "float32")
+                        )
+                        * T.cast(MimoV[r, p], "float32")
+                    )
+                DV[t, p] = dv_acc[0]
+
+            for r, p in T.Parallel(rank, dim):
+                dmimo_acc[0] = 0.0
+                for t in T.serial(chunk_size):
+                    dmimo_acc[0] = dmimo_acc[0] + (
+                        (
+                            T.cast(State_sh[t * rank + r, p], "float32")
+                            + T.cast(Apply_sh[t * rank + r, p], "float32")
+                        )
+                        * T.cast(V[t, p], "float32")
+                    )
+                DMimoV[r, p] = dmimo_acc[0]
+
+    return state_apply_consumers_wgmma_imported
+
+
+def _build_multi_chunk_state_apply_consumers_tilelang_prim(
+    dim: int,
+    rank: int,
+    chunk_size: int,
+    dtype: str,
+    nchunks: int,
+) -> Any:
+    """Build TileLang IR for cppmega's fixed-nchunk reverse-scan consumer tile."""
+
+    try:
+        import tilelang.language as T
+    except Exception as exc:  # pragma: no cover - host/environment dependent
+        raise CuteBridgeUnsupported(
+            "MultiChunkStateApplyConsumersWGMMA import requires a working "
+            f"tilelang import; got {exc.__class__.__name__}: {exc}."
+        ) from exc
+
+    threads = 128
+
+    @T.prim_func
+    def multi_chunk_state_apply_consumers_wgmma_imported(
+        K: T.Tensor((nchunks, dim, dim), dtype),
+        Q: T.Tensor((nchunks, dim, dim), dtype),
+        QT: T.Tensor((nchunks, dim, dim), dtype),
+        DPhT: T.Tensor((nchunks, dim, dim), dtype),
+        DACS: T.Tensor((nchunks, chunk_size), "float32"),
+        DACSRev: T.Tensor((nchunks, chunk_size), "float32"),
+        Segsum: T.Tensor((nchunks, chunk_size, chunk_size), "float32"),
+        QKDot: T.Tensor((nchunks, chunk_size, rank, rank), dtype),
+        Gamma: T.Tensor((nchunks, chunk_size), "float32"),
+        D: T.Tensor((1,), "float32"),
+        V: T.Tensor((nchunks, chunk_size, dim), dtype),
+        MimoV: T.Tensor((rank, dim), dtype),
+        DV: T.Tensor((nchunks, chunk_size, dim), "float32"),
+        DMimoV: T.Tensor((rank, dim), "float32"),
+    ):
+        with T.Kernel(1, 1, threads=threads) as (_bx, _by):
+            K_sh = T.alloc_shared((dim, dim), dtype)
+            Q_sh = T.alloc_shared((dim, dim), dtype)
+            QT_sh = T.alloc_shared((dim, dim), dtype)
+            DPhT_sh = T.alloc_shared((dim, dim), dtype)
+            DPhScaledT_sh = T.alloc_shared((dim, dim), dtype)
+            CarryT_sh = T.alloc_shared((dim, dim), dtype)
+            State_sh = T.alloc_shared((dim, dim), dtype)
+            LKQ_sh = T.alloc_shared((dim, dim), dtype)
+            Apply_sh = T.alloc_shared((dim, dim), dtype)
+            Carry_acc = T.alloc_fragment((dim, dim), "float32")
+            State_acc = T.alloc_fragment((dim, dim), "float32")
+            LKQ_acc = T.alloc_fragment((dim, dim), "float32")
+            Apply_acc = T.alloc_fragment((dim, dim), "float32")
+            dv_acc = T.alloc_local((1,), "float32")
+            dmimo_acc = T.alloc_local((1,), "float32")
+            dpsi = T.alloc_local((1,), "float32")
+
+            T.clear(Carry_acc)
+            for r, p in T.Parallel(rank, dim):
+                DMimoV[r, p] = 0.0
+
+            for chunk_rev in T.serial(0, nchunks):
+                chunk_idx = nchunks - 1 - chunk_rev
+                T.copy(K[chunk_idx, 0, 0], K_sh)
+                T.copy(Q[chunk_idx, 0, 0], Q_sh)
+                T.copy(QT[chunk_idx, 0, 0], QT_sh)
+                T.copy(DPhT[chunk_idx, 0, 0], DPhT_sh)
+
+                for p, f in T.Parallel(dim, dim):
+                    DPhScaledT_sh[p, f] = T.cast(
+                        T.cast(DPhT[chunk_idx, p, f], "float32")
+                        * T.exp(DACS[chunk_idx, f // rank]),
+                        dtype,
+                    )
+                    CarryT_sh[p, f] = T.cast(Carry_acc[p, f], dtype)
+
+                T.clear(State_acc)
+                T.clear(LKQ_acc)
+                T.clear(Apply_acc)
+
+                T.gemm(K_sh, CarryT_sh, State_acc, False, True)
+                for row, col in T.Parallel(dim, dim):
+                    State_acc[row, col] = (
+                        State_acc[row, col] * T.exp(DACSRev[chunk_idx, row // rank])
+                    )
+
+                T.gemm(K_sh, Q_sh, LKQ_acc, False, True)
+                for row, col in T.Parallel(dim, dim):
+                    State_sh[row, col] = T.cast(State_acc[row, col], dtype)
+                    LKQ_sh[row, col] = T.if_then_else(
+                        (row // rank) < (col // rank),
+                        T.cast(
+                            LKQ_acc[row, col]
+                            * T.exp(Segsum[chunk_idx, col // rank, row // rank]),
+                            dtype,
+                        ),
+                        T.cast(0, dtype),
+                    )
+
+                T.gemm(LKQ_sh, DPhT_sh, Apply_acc, False, True)
+                for row, col in T.Parallel(dim, dim):
+                    Apply_sh[row, col] = T.cast(Apply_acc[row, col], dtype)
+
+                for t, p in T.Parallel(chunk_size, dim):
+                    dv_acc[0] = 0.0
+                    for r in T.serial(rank):
+                        dpsi[0] = (
+                            T.cast(State_sh[t * rank + r, p], "float32")
+                            + T.cast(Apply_sh[t * rank + r, p], "float32")
+                            + D[0] * T.cast(DPhT[chunk_idx, p, t * rank + r], "float32")
+                        )
+                        for r_out in T.serial(rank):
+                            dpsi[0] = dpsi[0] + (
+                                Gamma[chunk_idx, t]
+                                * T.cast(QKDot[chunk_idx, t, r_out, r], "float32")
+                                * T.cast(
+                                    DPhT[chunk_idx, p, t * rank + r_out],
+                                    "float32",
+                                )
+                            )
+                        dpsi[0] = T.cast(T.cast(dpsi[0], dtype), "float32")
+                        dv_acc[0] = dv_acc[0] + (
+                            dpsi[0] * T.cast(MimoV[r, p], "float32")
+                        )
+                    DV[chunk_idx, t, p] = dv_acc[0]
+
+                for r, p in T.Parallel(rank, dim):
+                    dmimo_acc[0] = 0.0
+                    for t in T.serial(chunk_size):
+                        dpsi[0] = (
+                            T.cast(State_sh[t * rank + r, p], "float32")
+                            + T.cast(Apply_sh[t * rank + r, p], "float32")
+                            + D[0] * T.cast(DPhT[chunk_idx, p, t * rank + r], "float32")
+                        )
+                        for r_out in T.serial(rank):
+                            dpsi[0] = dpsi[0] + (
+                                Gamma[chunk_idx, t]
+                                * T.cast(QKDot[chunk_idx, t, r_out, r], "float32")
+                                * T.cast(
+                                    DPhT[chunk_idx, p, t * rank + r_out],
+                                    "float32",
+                                )
+                            )
+                        dpsi[0] = T.cast(T.cast(dpsi[0], dtype), "float32")
+                        dmimo_acc[0] = dmimo_acc[0] + (
+                            dpsi[0] * T.cast(V[chunk_idx, t, p], "float32")
+                        )
+                    DMimoV[r, p] = DMimoV[r, p] + dmimo_acc[0]
+
+                for row, col in T.Parallel(dim, dim):
+                    Carry_acc[row, col] = (
+                        Carry_acc[row, col] * T.exp(DACS[chunk_idx, chunk_size - 1])
+                    )
+                T.gemm(DPhScaledT_sh, QT_sh, Carry_acc, True, True)
+
+    return multi_chunk_state_apply_consumers_wgmma_imported
+
+
+def _build_fa4_v1_fused3_gemm_tilelang_prim(
+    dim: int,
+    dtype: str,
+) -> Any:
+    """Build TileLang IR for FA4 v1's 3-GEMM chain with LKQ output."""
+
+    try:
+        import tilelang.language as T
+    except Exception as exc:  # pragma: no cover - host/environment dependent
+        raise CuteBridgeUnsupported(
+            "FA4PatternFused3Gemm import requires a working tilelang import; "
+            f"got {exc.__class__.__name__}: {exc}."
+        ) from exc
+
+    threads = 128
+
+    @T.prim_func
+    def fa4_v1_fused3_gemm_imported(
+        K: T.Tensor((dim, dim), dtype),
+        Q: T.Tensor((dim, dim), dtype),
+        DstT: T.Tensor((dim, dim), dtype),
+        DPhT: T.Tensor((dim, dim), dtype),
+        DPs: T.Tensor((dim, dim), dtype),
+        LKQ: T.Tensor((dim, dim), dtype),
+    ):
+        with T.Kernel(1, 1, threads=threads) as (_bx, _by):
+            K_sh = T.alloc_shared((dim, dim), dtype)
+            Q_sh = T.alloc_shared((dim, dim), dtype)
+            DstT_sh = T.alloc_shared((dim, dim), dtype)
+            DPhT_sh = T.alloc_shared((dim, dim), dtype)
+            LKQ_sh = T.alloc_shared((dim, dim), dtype)
+            DPs_acc = T.alloc_fragment((dim, dim), "float32")
+            LKQ_acc = T.alloc_fragment((dim, dim), "float32")
+
+            T.clear(DPs_acc)
+            T.clear(LKQ_acc)
+            T.copy(K[0, 0], K_sh)
+            T.copy(Q[0, 0], Q_sh)
+            T.copy(DstT[0, 0], DstT_sh)
+            T.copy(DPhT[0, 0], DPhT_sh)
+
+            T.gemm(K_sh, DstT_sh, DPs_acc, False, True)
+            T.gemm(K_sh, Q_sh, LKQ_acc, False, True)
+            for row, col in T.Parallel(dim, dim):
+                LKQ_sh[row, col] = T.cast(LKQ_acc[row, col], dtype)
+            T.copy(LKQ_sh, LKQ[0, 0])
+            T.gemm(LKQ_sh, DPhT_sh, DPs_acc, False, True)
+            T.copy(DPs_acc, DPs[0, 0])
+
+    return fa4_v1_fused3_gemm_imported
+
+
+def _build_fa4_v2_fused3_gemm_tilelang_prim(
+    dim: int,
+    dtype: str,
+) -> Any:
+    """Build TileLang IR for FA4 v2's no-LKQ-output 3-GEMM chain."""
+
+    try:
+        import tilelang.language as T
+    except Exception as exc:  # pragma: no cover - host/environment dependent
+        raise CuteBridgeUnsupported(
+            "FA4PatternFused3GemmV2 import requires a working tilelang import; "
+            f"got {exc.__class__.__name__}: {exc}."
+        ) from exc
+
+    threads = 128
+
+    @T.prim_func
+    def fa4_v2_fused3_gemm_imported(
+        K: T.Tensor((dim, dim), dtype),
+        Q: T.Tensor((dim, dim), dtype),
+        DstT: T.Tensor((dim, dim), dtype),
+        DPhT: T.Tensor((dim, dim), dtype),
+        DPs: T.Tensor((dim, dim), dtype),
+    ):
+        with T.Kernel(1, 1, threads=threads) as (_bx, _by):
+            K_sh = T.alloc_shared((dim, dim), dtype)
+            Q_sh = T.alloc_shared((dim, dim), dtype)
+            DstT_sh = T.alloc_shared((dim, dim), dtype)
+            DPhT_sh = T.alloc_shared((dim, dim), dtype)
+            LKQ_sh = T.alloc_shared((dim, dim), dtype)
+            DPs_acc = T.alloc_fragment((dim, dim), "float32")
+            LKQ_acc = T.alloc_fragment((dim, dim), "float32")
+
+            T.clear(DPs_acc)
+            T.clear(LKQ_acc)
+            T.copy(K[0, 0], K_sh)
+            T.copy(Q[0, 0], Q_sh)
+            T.copy(DstT[0, 0], DstT_sh)
+            T.copy(DPhT[0, 0], DPhT_sh)
+
+            T.gemm(K_sh, DstT_sh, DPs_acc, False, True)
+            T.gemm(K_sh, Q_sh, LKQ_acc, False, True)
+            for row, col in T.Parallel(dim, dim):
+                LKQ_sh[row, col] = T.cast(LKQ_acc[row, col], dtype)
+            T.gemm(LKQ_sh, DPhT_sh, DPs_acc, False, True)
+            T.copy(DPs_acc, DPs[0, 0])
+
+    return fa4_v2_fused3_gemm_imported
 
 
 def compile_prim_to_cutedsl(prim_func: Any) -> Any:

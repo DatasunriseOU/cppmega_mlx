@@ -923,7 +923,14 @@ def build_path_c_model_region_from_bricks(
         metadata["path_c_model_shape_env"] = resolved_shape_env
     region = build_path_c_fusion_region(
         region_name=region_name,
-        surfaces=_path_c_model_surfaces_from_bricks(resolved_bricks),
+        surfaces=_path_c_model_surfaces_from_bricks(
+            resolved_bricks,
+            initial_hidden=(
+                f"{resolved_bricks[0].name}_hidden"
+                if resolved_shape_env is not None
+                else "hidden"
+            ),
+        ),
         z3_sync=z3_sync or Z3SyncSpec.minimize_sync_async(),
         metadata=metadata,
     )
@@ -1461,14 +1468,15 @@ def _path_c_acceptance_fixture_surfaces_from_route_symbols(
 
 def _path_c_model_surfaces_from_bricks(
     bricks: Sequence[_ResolvedPathCModelBrick],
+    *,
+    initial_hidden: str = "hidden",
 ) -> tuple[FusionKernelSurface, ...]:
     if not bricks:
         raise ValueError("bricks must contain at least one route")
 
-    first_brick = bricks[0]
     context = _PathCBrickSurfaceLoweringContext(
-        residual_hidden=f"{first_brick.name}_hidden",
-        route_hidden=f"{first_brick.name}_residual_norm_hidden",
+        residual_hidden=initial_hidden,
+        route_hidden=initial_hidden,
     )
     for index, brick in enumerate(bricks):
         lowerer = _path_c_model_brick_surface_lowerer_for(brick.route_symbol)
@@ -1654,7 +1662,7 @@ def _append_path_c_inter_brick_residual_norm(
     norm_brick: _ResolvedPathCModelBrick,
     delta: str,
 ) -> None:
-    norm_name = f"{norm_brick.name}_residual_norm"
+    norm_name = f"{producer_brick.name}_residual_norm"
     hidden_after = f"{producer_brick.name}_hidden_after"
     next_hidden = f"{norm_name}_hidden"
     context.surfaces.append(

@@ -124,6 +124,31 @@ def test_hybrid_lm_platform_ids_are_zero_init_optional_conditioning() -> None:
     assert not np.allclose(np.array(base), np.array(with_platform))
 
 
+def test_hybrid_lm_accepts_token_local_platform_ids() -> None:
+    model = HybridTinyLM(_small_single_route_config("M"))
+    input_ids = mx.array([[1, 2, 3, 4]], dtype=mx.int32)
+    platform_ids = mx.array(
+        [[[3, 64, 94], [3, 64, 94], [2, 64, 94], [2, 64, 94]]],
+        dtype=mx.int32,
+    )
+
+    base = model.decoder_hidden_states(input_ids)
+    with_zero_platform = model.decoder_hidden_states(
+        input_ids,
+        platform_ids=platform_ids,
+    )
+    mx.eval(base, with_zero_platform)
+    np.testing.assert_allclose(np.array(base), np.array(with_zero_platform), atol=0.0)
+
+    model.platform_embedding.embedding.weight = mx.ones_like(
+        model.platform_embedding.embedding.weight
+    )
+    with_platform = model.decoder_hidden_states(input_ids, platform_ids=platform_ids)
+    mx.eval(with_platform)
+
+    assert not np.allclose(np.array(base), np.array(with_platform))
+
+
 def test_hybrid_lm_platform_ids_fail_closed_on_bad_shape() -> None:
     model = HybridTinyLM(_small_single_route_config("M"))
     input_ids = mx.array([[1, 2, 3, 4]], dtype=mx.int32)

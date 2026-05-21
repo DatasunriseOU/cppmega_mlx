@@ -30,6 +30,26 @@ def test_platform_embedding_is_zero_init_and_padding_aware() -> None:
     np.testing.assert_allclose(_to_numpy(enabled)[1, 0], np.zeros((6,)))
 
 
+def test_platform_embedding_supports_token_local_platform_ids() -> None:
+    module = PlatformEmbedding(hidden_size=3, vocab_size=PLATFORM_VOCAB_SIZE)
+    platform_ids = mx.array(
+        [[[2, 64, 0], [3, 64, 94], [0, 0, 0]]],
+        dtype=mx.int32,
+    )
+
+    out = module(platform_ids, target_dtype=mx.float32)
+
+    assert out.shape == (1, 3, 3)
+    assert np.count_nonzero(_to_numpy(out)) == 0
+
+    module.embedding.weight = mx.ones_like(module.embedding.weight)
+    enabled = module(platform_ids, target_dtype=mx.float32)
+
+    np.testing.assert_allclose(_to_numpy(enabled)[0, 0], np.full((3,), 2.0))
+    np.testing.assert_allclose(_to_numpy(enabled)[0, 1], np.full((3,), 3.0))
+    np.testing.assert_allclose(_to_numpy(enabled)[0, 2], np.zeros((3,)))
+
+
 def test_platform_embedding_validates_platform_ids_shape_and_range() -> None:
     module = PlatformEmbedding(hidden_size=4, vocab_size=PLATFORM_VOCAB_SIZE)
 
