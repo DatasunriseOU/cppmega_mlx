@@ -400,6 +400,7 @@ export function App(): JSX.Element {
                   dispatch({ type: "rewriters.remove", index: i })}
                 onRewriterReorder={(f, t) =>
                   dispatch({ type: "rewriters.reorder", from: f, to: t })}
+                onRewriterApply={() => void scheduleVerify()}
                 onShardingChange={(s) =>
                   dispatch({ type: "sharding.set", sharding: s })}
                 onShardingAccept={handleShardingAccept}

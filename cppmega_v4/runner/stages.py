@@ -696,6 +696,10 @@ def _summarize_model(
     loss = getattr(spec, "loss", None)
     if loss is not None:
         loss_kind = getattr(loss, "kind", "cross_entropy")
+    # V4-8: surface which rewriters the UI chained so e2e can assert
+    # MTP/IFIM/MHC selection actually reached the backend spec.
+    rewriters = getattr(spec, "rewriters", []) or []
+    rewriters_applied = [getattr(r, "name", str(r)) for r in rewriters]
     return {
         "mlp_activation": _pget(mlp_node, "activation", "swiglu"),
         "attention_pre_norm": _pget(attn_node, "pre_norm", "none"),
@@ -705,6 +709,7 @@ def _summarize_model(
         "optimizer_kind": optimizer_kind,
         "schedule_kind": schedule_kind,
         "loss_kind": loss_kind,
+        "rewriters_applied": rewriters_applied,
         "num_brick_kinds": len({n.kind for n in nodes}),
     }
 
