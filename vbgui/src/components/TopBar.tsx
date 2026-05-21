@@ -128,7 +128,7 @@ export function TopBar(p: TopBarProps): JSX.Element {
               <span style={{ fontSize: 11, color: "#6b7280" }}>
                 train steps:</span>
               <input data-testid="train-num-steps"
-                     type="number" min={1} max={64}
+                     type="number" min={1} max={512}
                      value={trainNumSteps}
                      onChange={(e) =>
                        setTrainNumSteps(Math.max(1, parseInt(

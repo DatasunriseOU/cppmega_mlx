@@ -908,6 +908,7 @@ def stage_train(ctx: StageContext) -> StageResult:
             elapsed_ms=(time.perf_counter() - t0) * 1000.0,
             extras={
                 "losses": [round(loss_item, 4) for loss_item in losses],
+                "losses_smoothed": _ema_smooth(losses, window=10),
                 "lr_trajectory": [
                     round(lr_item, 6) for lr_item in lr_trajectory
                 ],
@@ -1091,6 +1092,17 @@ def _apply_spec_rewriters(
         "skipped": skipped,
         "_build_spec": current,
     }
+
+
+def _ema_smooth(values: list[float], window: int = 10) -> list[float]:
+    """G15: simple windowed-mean smoothing (cheaper than true EMA, same
+    job for visualising convergence)."""
+    out: list[float] = []
+    for i in range(len(values)):
+        start = max(0, i - window + 1)
+        sl = values[start:i + 1]
+        out.append(round(sum(sl) / len(sl), 4))
+    return out
 
 
 def _compute_hybrid_deltas(
