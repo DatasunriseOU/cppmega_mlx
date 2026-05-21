@@ -8,11 +8,24 @@ around in the canvas doesn't bust the cache.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 from collections import OrderedDict
 from threading import Lock
 from typing import Any, Mapping
+
+try:
+    from pydantic import BaseModel
+except ImportError:  # pragma: no cover - pydantic is part of the gui extra
+    BaseModel = None  # type: ignore[assignment]
+
+
+def _isolate(value: Any) -> Any:
+    """Return a copy of ``value`` safe for an independent consumer."""
+    if BaseModel is not None and isinstance(value, BaseModel):
+        return value.model_copy(deep=True)
+    return copy.deepcopy(value)
 
 
 DEFAULT_CAPACITY: int = 50
@@ -81,21 +94,31 @@ class LRUCache:
             return len(self._data)
 
     def get(self, key: str) -> Any | None:
+        """Return a fresh deep-copy of the cached value (or None on miss).
+
+        Hits MUST return a distinct object so that a downstream consumer
+        mutating the result cannot corrupt the next reader. Pydantic
+        models pay one model_copy(deep=True); plain dicts/lists pay one
+        copy.deepcopy.
+        """
         with self._lock:
             if key not in self._data:
                 self._misses += 1
                 return None
             self._data.move_to_end(key)
             self._hits += 1
-            return self._data[key]
+            stored = self._data[key]
+        return _isolate(stored)
 
     def set(self, key: str, value: Any) -> None:
+        """Store a deep-copy so the caller can mutate the original safely."""
+        snapshot = _isolate(value)
         with self._lock:
             if key in self._data:
                 self._data.move_to_end(key)
-                self._data[key] = value
+                self._data[key] = snapshot
                 return
-            self._data[key] = value
+            self._data[key] = snapshot
             if len(self._data) > self._capacity:
                 self._data.popitem(last=False)
 

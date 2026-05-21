@@ -87,12 +87,24 @@ class VisualBuilderWidget(anywidget.AnyWidget):
         self.on_msg(self._on_msg)
 
     def _on_msg(self, _: object, content: Any, _buffers: list[bytes]) -> None:
-        """Route a kernel-bound JSON-RPC envelope to the dispatcher."""
+        """Route a kernel-bound JSON-RPC envelope to the dispatcher.
+
+        Side effect: every successful dispatch also lands in the
+        ``last_result`` traitlet so Python notebook code can observe RPC
+        results without snooping on the wire.
+        """
         if not isinstance(content, dict):
             _log.warning("VisualBuilderWidget: dropped non-dict msg %r", content)
             return
         response = dispatch(content, cache=self._cache)
-        self.send(response.model_dump(mode="json", exclude_none=True))
+        payload = response.model_dump(mode="json", exclude_none=True)
+        self.send(payload)
+        if response.result is not None:
+            self.last_result = {
+                "method": content.get("method"),
+                "id": response.id,
+                "result": response.result,
+            }
 
     @property
     def cache_stats(self) -> dict[str, int]:

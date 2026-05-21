@@ -72,8 +72,11 @@ def preview_parquet(
     if params.offset < 0:
         raise ValueError(f"offset must be ≥ 0, got {params.offset}")
 
-    cache_key = f"preview::{params.path}::{params.offset}::{params.limit}::" \
-                f"{','.join(sorted(params.channels or []))}"
+    # Distinguish "no filter" (None → all channels) from "explicit empty
+    # filter" ([] → drop all channels) in both cache key and selection.
+    filter_tag = "ALL" if params.channels is None else \
+                 f"FILTER:{','.join(sorted(params.channels))}"
+    cache_key = f"preview::{params.path}::{params.offset}::{params.limit}::{filter_tag}"
     if cache is not None:
         hit = cache.get(cache_key)
         if hit is not None:
@@ -93,8 +96,11 @@ def preview_parquet(
     # bookkeeping. Caller may further restrict via ``params.channels``.
     caps = introspect_parquet(params.path, sample_rows=min(params.limit, 64))
     available = sorted(c for c in caps.side_channels if c != token_col)
-    selected = [c for c in available if not params.channels
-                or c in params.channels]
+    if params.channels is None:
+        selected = available
+    else:
+        wanted = set(params.channels)
+        selected = [c for c in available if c in wanted]
     cols_to_read = [token_col, *selected]
 
     table = pf.read(columns=cols_to_read)

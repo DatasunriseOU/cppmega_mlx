@@ -13,6 +13,8 @@ hover-cross-panel highlight events.
 
 from __future__ import annotations
 
+import hashlib
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -85,6 +87,7 @@ class _LoadedTokenizer:
 
 
 _TOKENIZER_CACHE: dict[str, _LoadedTokenizer] = {}
+_TOKENIZER_CACHE_LOCK = threading.Lock()
 
 
 def _load(source: str) -> _LoadedTokenizer:
@@ -94,11 +97,15 @@ def _load(source: str) -> _LoadedTokenizer:
     path = Path(source)
     if not path.is_file():
         raise FileNotFoundError(f"tokenizer source not found: {source}")
-    tok = Tokenizer.from_file(str(path))
-    caps = introspect_tokenizer(path)
-    loaded = _LoadedTokenizer(tokenizer=tok, capabilities=caps)
-    _TOKENIZER_CACHE[source] = loaded
-    return loaded
+    with _TOKENIZER_CACHE_LOCK:
+        hit = _TOKENIZER_CACHE.get(source)
+        if hit is not None:
+            return hit
+        tok = Tokenizer.from_file(str(path))
+        caps = introspect_tokenizer(path)
+        loaded = _LoadedTokenizer(tokenizer=tok, capabilities=caps)
+        _TOKENIZER_CACHE[source] = loaded
+        return loaded
 
 
 # ---------------------------------------------------------------------------
@@ -168,8 +175,11 @@ def list_presets() -> ListPresetsResult:
 
 
 def _cache_key(p: EncodeVisualizeParams) -> str:
-    # No layout fields here, so canonical JSON via sorted-keys is fine.
-    return f"tokenize::{p.tokenizer_source}::{p.add_special_tokens}::{hash(p.text)}"
+    # SHA-256 over text so the key is stable across processes — Python's
+    # built-in hash() is salted by PYTHONHASHSEED and would not survive a
+    # server restart.
+    text_digest = hashlib.sha256(p.text.encode("utf-8")).hexdigest()
+    return f"tokenize::{p.tokenizer_source}::{p.add_special_tokens}::{text_digest}"
 
 
 def _caps_to_dict(c: TokenizerCapabilities) -> dict[str, Any]:

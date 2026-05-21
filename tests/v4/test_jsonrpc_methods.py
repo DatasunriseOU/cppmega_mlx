@@ -108,7 +108,10 @@ def test_verify_cache_hit_short_circuits():
     params = _simple_verify_params()
     r1 = verify(params, cache=cache)
     r2 = verify(params, cache=cache)
-    assert r1 is r2
+    # Cache returns a defensive deep-copy on hit (C1 from review) so
+    # consumers can mutate freely — assert equality, not identity.
+    assert r1 == r2
+    assert r1 is not r2
     stats = cache.stats()
     assert stats["hits"] == 1 and stats["misses"] == 1
 

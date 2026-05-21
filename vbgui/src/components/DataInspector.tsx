@@ -55,12 +55,19 @@ export function DataInspector({
         "data.preview_parquet",
         { path, offset: nextOffset, limit: pageSize },
       );
-      setResult(r);
+      setResult((prev) => {
+        // Reset channel toggles when the underlying schema changes
+        // (different path OR different available_channels set).
+        const schemaChanged =
+          !prev ||
+          prev.token_column !== r.token_column ||
+          prev.available_channels.length !== r.available_channels.length ||
+          prev.available_channels.some((c, i) => c !== r.available_channels[i]);
+        if (schemaChanged) setEnabled(new Set(r.available_channels));
+        return r;
+      });
       setOffset(nextOffset);
       setError(null);
-      // Default all channels on
-      setEnabled((prev) => prev.size === 0
-        ? new Set(r.available_channels) : prev);
     } catch (e) {
       setError(String(e));
       setResult(null);

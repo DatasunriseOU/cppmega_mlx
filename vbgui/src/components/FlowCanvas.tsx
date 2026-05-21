@@ -39,7 +39,10 @@ export function FlowCanvas({
       e.preventDefault();
       const brick = e.dataTransfer.getData("application/x-cppmega-brick");
       if (brick && onDropBrick) {
-        const rect = (e.target as HTMLDivElement).getBoundingClientRect();
+        // currentTarget is the canvas wrapper; e.target is whatever the
+        // user dropped onto (often a child node) and would give wrong
+        // coordinates.
+        const rect = e.currentTarget.getBoundingClientRect();
         onDropBrick(brick, { x: e.clientX - rect.left, y: e.clientY - rect.top });
       }
     },
