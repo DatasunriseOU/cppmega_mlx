@@ -634,6 +634,15 @@ def stage_train(ctx: StageContext) -> StageResult:
             "num_clips": 0,
         }
 
+        # G06: memory peak instrumentation — bracket train loop with
+        # reset_peak_memory + get_peak_memory; extras.memory_peak_bytes.
+        memory_peak_bytes: int | None = None
+        try:
+            if hasattr(mx, "metal"):
+                mx.metal.reset_peak_memory()
+        except Exception:
+            pass
+
         losses: list[float] = []
         lr_trajectory: list[float] = []
         # Snapshot one leaf with a real gradient; fixed first-leaf probes can
@@ -689,6 +698,12 @@ def stage_train(ctx: StageContext) -> StageResult:
             opt.update(all_modules, grads)
             mx.eval(all_modules.parameters(), opt.state)
             losses.append(float(loss.item()))
+
+        try:
+            if hasattr(mx, "metal"):
+                memory_peak_bytes = int(mx.metal.get_peak_memory())
+        except Exception:
+            pass
 
         after_flat = dict(nn.utils.tree_flatten(all_modules.parameters()))
         delta = 0.0
@@ -775,6 +790,7 @@ def stage_train(ctx: StageContext) -> StageResult:
                 "side_channels_observed": side_channels_observed,
                 "graph_diff": graph_diff,
                 "gradient_clip": clip_extras,
+                "memory_peak_bytes": memory_peak_bytes,
                 "mtp": _compute_mtp_extras(
                     all_modules, mtp_k, mtp_betas, vocab_size,
                     batch, seq, hidden, targets,
