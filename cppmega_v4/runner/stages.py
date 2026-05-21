@@ -576,11 +576,13 @@ def _tokenize_parquet_text(
         from tokenizers import Tokenizer
         from pathlib import Path
         table = pq.read_table(parquet_path)
-        if "text" not in table.column_names:
+        text_col = next((c for c in ("text", "original_text", "raw_text")
+                         if c in table.column_names), None)
+        if text_col is None:
             return [], None
         tok = Tokenizer.from_file(str(tokenizer_path))
         out: list[int] = []
-        col = table.column("text")
+        col = table.column(text_col)
         for chunk in col.chunks:
             for cell in chunk.to_pylist():
                 if cell is None:
