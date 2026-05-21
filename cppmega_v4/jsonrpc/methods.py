@@ -27,6 +27,7 @@ from cppmega_v4.buildspec import (
     OptimSpec,
     ParamGroup,
 )
+from cppmega_v4.buildspec.schedules import ScheduleSpec
 from cppmega_v4.fusion import from_block_specs
 from cppmega_v4.parallelism import (
     AxisAssignment,
@@ -43,18 +44,6 @@ from cppmega_v4.parallelism import (
     tpu_v6e_8,
     verify_distributed_plan,
 )
-
-
-_TOPOLOGY_FACTORIES = {
-    "h100_8x": h100_8x,
-    "h200_8x": h200_8x,
-    "a100_8x": a100_8x,
-    "b100_8x": b100_8x,
-    "gb10_quarter": gb10_quarter,
-    "tpu_v5p_4": tpu_v5p_4,
-    "tpu_v6e_8": tpu_v6e_8,
-    "m3_ultra_solo": m3_ultra_solo,
-}
 from cppmega_v4.probe import contract_probe as _contract_probe
 from cppmega_v4.probe import to_dict as _probe_to_dict
 from cppmega_v4.spec import (
@@ -94,6 +83,18 @@ from cppmega_v4.jsonrpc.schema import (
 )
 
 
+_TOPOLOGY_FACTORIES = {
+    "h100_8x": h100_8x,
+    "h200_8x": h200_8x,
+    "a100_8x": a100_8x,
+    "b100_8x": b100_8x,
+    "gb10_quarter": gb10_quarter,
+    "tpu_v5p_4": tpu_v5p_4,
+    "tpu_v6e_8": tpu_v6e_8,
+    "m3_ultra_solo": m3_ultra_solo,
+}
+
+
 # ---------------------------------------------------------------------------
 # Coercion helpers: wire payload → backend dataclasses.
 # ---------------------------------------------------------------------------
@@ -123,16 +124,46 @@ def _make_loss(payload: LossSpecPayload) -> LossSpec:
 
 
 def _make_optim(payload: OptimSpecPayload) -> OptimSpec:
+    kind = OptimKind(payload.kind)
+
+    def _default_betas() -> tuple[float, float] | None:
+        if kind in (OptimKind.LION, OptimKind.LION_8BIT):
+            return (0.9, 0.99)
+        if kind is OptimKind.ADAM_8BIT:
+            return (0.9, 0.999)
+        if kind in (OptimKind.ADAMW, OptimKind.MUON_ADAMW_HYBRID):
+            return (0.9, 0.95)
+        return None
+
+    def _make_schedule(g) -> ScheduleSpec | None:
+        schedule = g.schedule
+        if schedule is None:
+            return None
+        return ScheduleSpec(
+            kind=schedule.kind,
+            warmup_steps=schedule.warmup_steps,
+            total_steps=schedule.total_steps,
+            min_lr_ratio=schedule.min_lr_ratio,
+            decay_steps=schedule.decay_steps,
+            power=schedule.power,
+        )
+
     groups = tuple(
         ParamGroup(
             matcher=g.matcher,
             lr=g.lr,
             weight_decay=g.weight_decay,
-            betas=g.betas if g.betas is not None else (0.9, 0.95),
+            betas=g.betas if g.betas is not None else _default_betas(),
+            ns_steps=(
+                g.ns_steps
+                if g.ns_steps is not None
+                else (5 if kind is OptimKind.MUON else None)
+            ),
+            schedule=_make_schedule(g),
         )
         for g in payload.groups
     )
-    return OptimSpec(kind=OptimKind(payload.kind), groups=groups)
+    return OptimSpec(kind=kind, groups=groups)
 
 
 def _make_topology(payload: TopologyPayload):

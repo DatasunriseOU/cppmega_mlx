@@ -20,8 +20,8 @@ of the post-rewrite spec for telemetry.
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from typing import Any
 
 import mlx.core as mx
@@ -35,7 +35,7 @@ from cppmega_v4.buildspec.diagnostics import (
 from cppmega_v4.buildspec.loss_spec import LossKind, LossSpec
 from cppmega_v4.buildspec.model_build_spec import ModelBuildSpec
 from cppmega_v4.buildspec.optim_spec import OptimKind, OptimSpec, ParamGroup
-from cppmega_v4.fusion.brick_graph import BrickGraph, BrickNode
+from cppmega_v4.fusion.brick_graph import BrickGraph
 from cppmega_v4.models.unified_superblock_v4 import BLOCK_BUILDERS
 
 
@@ -48,6 +48,14 @@ _SKIP_KINDS_FORWARD: frozenset[str] = frozenset({
     # adapter-prefixed bricks are pure-shape rewires; their forward is
     # a passthrough (or handled separately via a future Stage F)
 })
+_AUTOGRAD_SAFE_KERNEL_KINDS: frozenset[str] = frozenset({"gdn", "kda"})
+
+
+def _autograd_safe_params(kind: str, params: Mapping[str, Any]) -> dict[str, Any]:
+    out = dict(params)
+    if kind in _AUTOGRAD_SAFE_KERNEL_KINDS and "kernel_path" not in out:
+        out["kernel_path"] = "path_a"
+    return out
 
 
 class BuiltSequentialModel(nn.Module):
@@ -67,9 +75,12 @@ class BuiltSequentialModel(nn.Module):
         # them up as sub-modules (for parameter registration).
         self._node_attrs: dict[str, str] = {}
         for node in graph.nodes:
+            params = _autograd_safe_params(node.kind, node.params)
             module = node.module
+            if node.kind in _AUTOGRAD_SAFE_KERNEL_KINDS and "kernel_path" not in node.params:
+                module = None
             if module is None and node.kind in BLOCK_BUILDERS:
-                module = BLOCK_BUILDERS[node.kind](hidden_size, dict(node.params))
+                module = BLOCK_BUILDERS[node.kind](hidden_size, params)
             if module is None:
                 continue
             attr = f"brick_{_safe_name(node.name)}"
@@ -235,8 +246,33 @@ def _build_optimizer(spec: OptimSpec) -> object:
     nn.Module params is performed by callers (Stage F has the full
     matcher loop)."""
     if spec.kind is OptimKind.ADAMW:
+        from cppmega_mlx.training.optimizers import make_adamw
         g = spec.groups[0]
-        return optim.AdamW(
+        return make_adamw(
+            learning_rate=g.lr,
+            betas=list(g.betas) if g.betas is not None else [0.9, 0.999],
+            weight_decay=g.weight_decay,
+        )
+    if spec.kind is OptimKind.LION:
+        from cppmega_mlx.training.optimizers import make_lion
+        g = spec.groups[0]
+        return make_lion(
+            learning_rate=g.lr,
+            betas=list(g.betas) if g.betas is not None else [0.9, 0.99],
+            weight_decay=g.weight_decay,
+        )
+    if spec.kind is OptimKind.LION_8BIT:
+        from cppmega_mlx.training.optimizers_quantized import make_lion8bit
+        g = spec.groups[0]
+        return make_lion8bit(
+            learning_rate=g.lr,
+            betas=list(g.betas) if g.betas is not None else [0.9, 0.99],
+            weight_decay=g.weight_decay,
+        )
+    if spec.kind is OptimKind.ADAM_8BIT:
+        from cppmega_mlx.training.optimizers_quantized import make_adam8bit
+        g = spec.groups[0]
+        return make_adam8bit(
             learning_rate=g.lr,
             betas=list(g.betas) if g.betas is not None else [0.9, 0.999],
             weight_decay=g.weight_decay,

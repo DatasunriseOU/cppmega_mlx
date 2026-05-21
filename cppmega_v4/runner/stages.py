@@ -25,17 +25,15 @@ from cppmega_v4.buildspec import (
     ModelBuildSpec,
     OptimKind,
     OptimSpec,
-    ParamGroup,
     build_model,
     verify_build_spec,
 )
 from cppmega_v4.fusion import from_block_specs
 from cppmega_v4.fusion.auto_planner import plan_fusion_regions
-from cppmega_v4.parallelism import verify_distributed_plan
 from cppmega_v4.parallelism.gotcha_checker import check_gotchas
 from cppmega_v4.probe import contract_probe
 from cppmega_v4.probe.dry_forward import dry_forward
-from cppmega_v4.spec import estimate_memory, verify_and_estimate
+from cppmega_v4.spec import verify_and_estimate
 from cppmega_v4.spec.resolver import resolve_shapes
 from cppmega_v4.jsonrpc.methods import (
     _make_loss, _make_optim, _make_sharding, _graph_to_specs,
@@ -313,11 +311,9 @@ def stage_loss_smoke(ctx: StageContext) -> StageResult:
                 name="loss_smoke", status="skipped",
                 elapsed_ms=(time.perf_counter() - t0) * 1000.0,
             )
-        hidden = ctx.spec.dim_env.get("H", 64)
         seq = int(ctx.opts("dry_forward").get("S", 8))
         # Synthetic logits + targets — checks the loss kernel itself.
         logits = mx.random.normal((1, seq, 32))
-        targets = mx.zeros((1, seq), dtype=mx.int32)
         loss_value = mx.mean(mx.softmax(logits, axis=-1) * 0.0 + 1.0)
         finite = bool(mx.isfinite(loss_value).item())
         return StageResult(
@@ -351,7 +347,6 @@ def stage_train(ctx: StageContext) -> StageResult:
     t0 = time.perf_counter()
     try:
         import mlx.nn as nn
-        import mlx.optimizers as optim
         from cppmega_v4.fusion import from_block_specs
 
         opts = ctx.opts("train")
@@ -397,9 +392,9 @@ def stage_train(ctx: StageContext) -> StageResult:
         # Synthetic LM head: tied to the last brick's output.
         lm_head = nn.Linear(hidden, vocab_size, bias=False)
 
-        def forward(input_embeds: mx.array) -> mx.array:
+        def forward_layers(layer_iter, input_embeds: mx.array) -> mx.array:
             x = input_embeds
-            for mod in modules:
+            for mod in layer_iter:
                 out = mod(x)
                 # Coerce tuple/dict returns to first array.
                 if isinstance(out, (tuple, list)):
@@ -407,31 +402,33 @@ def stage_train(ctx: StageContext) -> StageResult:
                 elif isinstance(out, dict):
                     out = next(v for v in out.values() if hasattr(v, "shape"))
                 x = out
-            return lm_head(x)
+            return x
 
-        # Build inputs once: synthetic Gaussian embeddings (no real
-        # tokenizer dependence — train matrix isolates the gradient path).
-        rng_key = mx.random.key(0)
-        targets = mx.random.randint(0, vocab_size, shape=(batch, seq))
-
-        def loss_fn(emb: mx.array, tgt: mx.array) -> mx.array:
-            logits = forward(emb)
+        def loss_fn(model: nn.Module, emb: mx.array, tgt: mx.array) -> mx.array:
+            layers = list(getattr(model, "layers", model))
+            features = forward_layers(layers[:-1], emb)
+            if getattr(features, "shape", None) == emb.shape:
+                features = features + emb
+            logits = layers[-1](features)
             return nn.losses.cross_entropy(
                 logits.reshape(-1, vocab_size), tgt.reshape(-1),
                 reduction="mean",
             )
 
+        # Build inputs once: synthetic Gaussian embeddings (no real
+        # tokenizer dependence — train matrix isolates the gradient path).
+        rng_key = mx.random.key(0)
+        targets = mx.random.randint(0, vocab_size, shape=(batch, seq))
         all_modules = nn.Sequential(*modules, lm_head)
-        opt = optim.AdamW(learning_rate=lr)
-        loss_and_grad = nn.value_and_grad(all_modules, lambda m, emb, tgt:
-            loss_fn(emb, tgt))
+        opt, optimizer_kind = _build_optimizer(spec_optim, lr)
+        loss_and_grad = nn.value_and_grad(all_modules, loss_fn)
 
         losses: list[float] = []
         lr_trajectory: list[float] = []
-        # Snapshot first trainable param for delta check
-        flat_params = dict(nn.utils.tree_flatten(all_modules.parameters()))
-        first_key = next(iter(flat_params))
-        before = mx.array(flat_params[first_key])  # deep copy
+        # Snapshot one leaf with a real gradient; fixed first-leaf probes can
+        # falsely fail optimizers whose earliest parameter is untouched.
+        probe_key: str | None = None
+        probe_before: mx.array | None = None
 
         for step in range(n_steps):
             # If a schedule callable exists, override optimizer's
@@ -448,15 +445,32 @@ def stage_train(ctx: StageContext) -> StageResult:
             rng_key, _ = mx.random.split(rng_key)
             loss, grads = loss_and_grad(all_modules, emb, targets)
             mx.eval(loss, grads)
+            if probe_key is None:
+                flat_params = dict(nn.utils.tree_flatten(all_modules.parameters()))
+                flat_grads = dict(nn.utils.tree_flatten(grads))
+                for key, grad in flat_grads.items():
+                    if key not in flat_params:
+                        continue
+                    grad_norm = float(mx.linalg.norm(grad.astype(mx.float32)).item())
+                    if grad_norm > 0.0:
+                        probe_key = key
+                        probe_before = mx.array(flat_params[key])
+                        break
             opt.update(all_modules, grads)
             mx.eval(all_modules.parameters(), opt.state)
             losses.append(float(loss.item()))
 
-        # Param delta on the snapshotted leaf
         after_flat = dict(nn.utils.tree_flatten(all_modules.parameters()))
-        delta = float(mx.linalg.norm(after_flat[first_key] - before).item())
+        delta = 0.0
+        if probe_key is not None and probe_before is not None:
+            delta = float(
+                mx.linalg.norm(after_flat[probe_key] - probe_before).item()
+            )
 
-        finite = all(l == l and -1e10 < l < 1e10 for l in losses)
+        finite = all(
+            loss_item == loss_item and -1e10 < loss_item < 1e10
+            for loss_item in losses
+        )
         if not finite:
             return StageResult(
                 name="train", status="fail",
@@ -486,11 +500,16 @@ def stage_train(ctx: StageContext) -> StageResult:
             name="train", status="ok",
             elapsed_ms=(time.perf_counter() - t0) * 1000.0,
             extras={
-                "losses": [round(l, 4) for l in losses],
-                "lr_trajectory": [round(l, 6) for l in lr_trajectory],
+                "losses": [round(loss_item, 4) for loss_item in losses],
+                "lr_trajectory": [
+                    round(lr_item, 6) for lr_item in lr_trajectory
+                ],
                 "weight_delta_norm": round(delta, 6),
                 "num_steps": n_steps,
                 "schedule_kind": schedule_kind_label,
+                "optimizer_kind": optimizer_kind,
+                "model_summary": _summarize_model(
+                    ctx.spec, optimizer_kind, schedule_kind_label),
             },
         )
     except Exception as exc:
@@ -500,6 +519,81 @@ def stage_train(ctx: StageContext) -> StageResult:
 # ---------------------------------------------------------------------------
 # Registry.
 # ---------------------------------------------------------------------------
+
+
+def _build_optimizer(
+    spec_optim: OptimSpec | None, base_lr: float,
+) -> tuple[Any, str]:
+    """Dispatch on OptimKind from the spec to instantiate a real mlx
+    optimizer from the cppmega_mlx.training factories. Returns
+    (optimizer_instance, kind_string). Falls back to AdamW when spec is None.
+
+    Single source of truth for "what optimizer did the UI actually run"
+    — extras["optimizer_kind"] surfaces this exact string so Playwright
+    tests can assert UI selection propagated through to training math.
+    """
+    import mlx.optimizers as optim
+    from cppmega_mlx.training.optimizers import (
+        make_adamw, make_lion, make_muon,
+    )
+    from cppmega_mlx.training.optimizers_quantized import (
+        make_adam8bit, make_lion8bit,
+    )
+
+    if spec_optim is None or not spec_optim.groups:
+        return optim.AdamW(learning_rate=base_lr), "adamw"
+
+    raw_kind = spec_optim.kind
+    kind = raw_kind if isinstance(raw_kind, OptimKind) else OptimKind(raw_kind)
+    if kind is OptimKind.ADAMW:
+        return make_adamw(learning_rate=base_lr), "adamw"
+    if kind is OptimKind.LION:
+        return make_lion(learning_rate=base_lr), "lion"
+    if kind is OptimKind.LION_8BIT:
+        return make_lion8bit(learning_rate=base_lr), "lion8bit"
+    if kind is OptimKind.ADAM_8BIT:
+        return make_adam8bit(learning_rate=base_lr), "adam8bit"
+    if kind is OptimKind.MUON:
+        return make_muon(lr_muon=base_lr, lr_adamw=base_lr), "muon"
+    if kind is OptimKind.MUON_ADAMW_HYBRID:
+        return (
+            make_muon(lr_muon=base_lr, lr_adamw=base_lr * 0.1),
+            "muon_adamw_hybrid",
+        )
+    if kind is OptimKind.SGD:
+        return optim.SGD(learning_rate=base_lr), "sgd"
+    raise ValueError(f"unknown OptimKind {kind!r}")
+
+
+def _summarize_model(
+    spec: Any, optimizer_kind: str, schedule_kind: str,
+) -> dict[str, Any]:
+    """Snapshot the user-visible model dimensions that affected training.
+
+    Surfaces per-brick activation + norm choices so Playwright tests can
+    assert that a UI dropdown change actually propagated through verify
+    + train. Mirrors what the user clicked in BrickContextPanel.
+    """
+    nodes = list(getattr(spec.graph, "nodes", []))
+    mlp_node = next((n for n in nodes if n.kind == "mlp"), None)
+    attn_node = next((n for n in nodes if n.kind == "attention"), None)
+
+    def _pget(node: Any, key: str, default: Any) -> Any:
+        if node is None:
+            return None
+        params = getattr(node, "params", {}) or {}
+        return params.get(key, default)
+
+    return {
+        "mlp_activation": _pget(mlp_node, "activation", "swiglu"),
+        "attention_pre_norm": _pget(attn_node, "pre_norm", "none"),
+        "attention_post_norm": _pget(attn_node, "post_norm", "rmsnorm"),
+        "mlp_pre_norm": _pget(mlp_node, "pre_norm", "none"),
+        "mlp_post_norm": _pget(mlp_node, "post_norm", "none"),
+        "optimizer_kind": optimizer_kind,
+        "schedule_kind": schedule_kind,
+        "num_brick_kinds": len({n.kind for n in nodes}),
+    }
 
 
 _Stage = Callable[[StageContext], StageResult]
