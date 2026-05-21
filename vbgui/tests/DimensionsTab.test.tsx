@@ -57,4 +57,36 @@ describe("DimensionsTab", () => {
     render(<DimensionsTab log={[]} />);
     expect(screen.getByText(/No matching entries/)).toBeTruthy();
   });
+
+  // G19: Apply button on auto rows
+  it("G19: Apply button visible only on auto-source rows", () => {
+    const log = [
+      { brick: "attn", param: "head_dim", value: 64,
+        source: "auto" as const, reason: "inferred from H" },
+      { brick: "mlp", param: "intermediate_size", value: 256,
+        source: "user" as const, reason: "user set" },
+    ];
+    render(<DimensionsTab log={log} onApply={() => {}} />);
+    expect(screen.getByTestId("dim-row-attn-head_dim-apply")).toBeTruthy();
+    expect(screen.queryByTestId(
+      "dim-row-mlp-intermediate_size-apply")).toBeNull();
+  });
+
+  it("G19: clicking Apply fires onApply(entry)", () => {
+    const onApply = vi.fn();
+    const entry = { brick: "attn", param: "head_dim", value: 64,
+                    source: "auto" as const, reason: "inferred from H" };
+    render(<DimensionsTab log={[entry]} onApply={onApply} />);
+    fireEvent.click(screen.getByTestId("dim-row-attn-head_dim-apply"));
+    expect(onApply).toHaveBeenCalledWith(entry);
+  });
+
+  it("G19: Apply button absent when onApply prop missing", () => {
+    render(<DimensionsTab log={[
+      { brick: "attn", param: "head_dim", value: 64,
+        source: "auto", reason: "x" },
+    ]} />);
+    expect(screen.queryByTestId(
+      "dim-row-attn-head_dim-apply")).toBeNull();
+  });
 });

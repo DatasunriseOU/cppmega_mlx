@@ -15,10 +15,14 @@ export interface InferenceEntryClient {
 export interface DimensionsTabProps {
   log: InferenceEntryClient[];
   onHighlight?: (brick: string) => void;
+  /** G19: callback when user clicks Apply on an auto-inferred row.
+   *  Parent dispatches the spec mutation so subsequent verify hides
+   *  the suggestion (closing the loop). */
+  onApply?: (entry: InferenceEntryClient) => void;
 }
 
 export function DimensionsTab({
-  log, onHighlight,
+  log, onHighlight, onApply,
 }: DimensionsTabProps): JSX.Element {
   const [filterSource, setFilterSource] =
     useState<"all" | "user" | "auto">("all");
@@ -70,6 +74,7 @@ export function DimensionsTab({
             <th style={th}>Value</th>
             <th style={th}>Source</th>
             <th style={th}>Reason</th>
+            <th style={th}></th>
           </tr>
         </thead>
         <tbody>
@@ -95,6 +100,16 @@ export function DimensionsTab({
               </td>
               <td style={{ ...td, color: "#6b7280", fontSize: 11 }}>
                 {e.reason}
+              </td>
+              <td style={td}>
+                {onApply && e.source === "auto" && (
+                  <button data-testid={`dim-row-${e.brick}-${e.param}-apply`}
+                          onClick={(ev) => { ev.stopPropagation();
+                                             onApply(e); }}
+                          style={{ fontSize: 10, padding: "1px 6px" }}>
+                    Apply
+                  </button>
+                )}
               </td>
             </tr>
           ))}
