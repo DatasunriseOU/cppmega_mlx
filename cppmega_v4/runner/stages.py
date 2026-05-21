@@ -476,6 +476,22 @@ def stage_train(ctx: StageContext) -> StageResult:
                 pass
         loss_and_grad = nn.value_and_grad(all_modules, loss_fn)
 
+        # V4-11: inference probe — forward over a fixed-seed input both
+        # before training and after; report l2 and cosine drift. Proves
+        # the optimizer's update actually changed observable model output,
+        # not just internal optimizer state.
+        probe_input = mx.random.normal(
+            shape=(1, seq, hidden), key=mx.random.key(42))
+        probe_layers_before = list(getattr(all_modules, "layers", all_modules))
+        probe_features_before = forward_layers(
+            probe_layers_before[:-1], probe_input)
+        if getattr(probe_features_before, "shape", None) == probe_input.shape:
+            probe_features_before = probe_features_before + probe_input
+        probe_output_before = probe_layers_before[-1](
+            probe_features_before).reshape(-1)
+        mx.eval(probe_output_before)
+        probe_output_before = mx.array(probe_output_before)
+
         losses: list[float] = []
         lr_trajectory: list[float] = []
         # Snapshot one leaf with a real gradient; fixed first-leaf probes can
@@ -519,6 +535,23 @@ def stage_train(ctx: StageContext) -> StageResult:
             delta = float(
                 mx.linalg.norm(after_flat[probe_key] - probe_before).item()
             )
+
+        # V4-11: re-run forward on the same fixed-seed input post-training.
+        probe_layers_after = list(getattr(all_modules, "layers", all_modules))
+        probe_features_after = forward_layers(
+            probe_layers_after[:-1], probe_input)
+        if getattr(probe_features_after, "shape", None) == probe_input.shape:
+            probe_features_after = probe_features_after + probe_input
+        probe_output_after = probe_layers_after[-1](
+            probe_features_after).reshape(-1)
+        mx.eval(probe_output_after)
+        diff_vec = probe_output_after - probe_output_before
+        l2_diff = float(mx.linalg.norm(diff_vec).item())
+        before_norm = float(mx.linalg.norm(probe_output_before).item())
+        after_norm = float(mx.linalg.norm(probe_output_after).item())
+        denom = max(before_norm * after_norm, 1e-12)
+        dot = float(mx.sum(probe_output_before * probe_output_after).item())
+        cos_sim = dot / denom
 
         finite = all(
             loss_item == loss_item and -1e10 < loss_item < 1e10
@@ -571,6 +604,10 @@ def stage_train(ctx: StageContext) -> StageResult:
                 ),
                 "muon_group_size": muon_group_size,
                 "adamw_group_size": adamw_group_size,
+                "inference_probe": {
+                    "l2_diff": round(l2_diff, 6),
+                    "cos_sim": round(cos_sim, 6),
+                },
                 "model_summary": _summarize_model(
                     ctx.spec, optimizer_kind, schedule_kind_label),
             },
