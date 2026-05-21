@@ -101,21 +101,35 @@ def test_structure_embedding_returns_scalar_zero_when_no_active_inputs_are_prese
     assert float(out.item()) == 0.0
 
 
-def test_structure_embedding_gradients_reach_tables_after_projection_is_enabled():
-    module = CppMegaStructureEmbedding(hidden_size=16, active_components="core", bottleneck_dim=4)
-    module.up_proj.weight = mx.ones_like(module.up_proj.weight)
+def test_structure_embedding_zero_residual_still_backprops_to_tables():
+    module = CppMegaStructureEmbedding(
+        hidden_size=16,
+        active_components="core",
+        bottleneck_dim=4,
+    )
     structure_ids = mx.array([[1, 2, 3]], dtype=mx.int64)
     dep_levels = mx.array([[0, 1, 2]], dtype=mx.int64)
 
     def loss_fn():
-        return mx.sum(module(structure_ids=structure_ids, dep_levels=dep_levels, target_dtype=mx.float32))
+        return mx.sum(
+            module(
+                structure_ids=structure_ids,
+                dep_levels=dep_levels,
+                target_dtype=mx.float32,
+            )
+        )
 
+    out = module(
+        structure_ids=structure_ids,
+        dep_levels=dep_levels,
+        target_dtype=mx.float32,
+    )
     loss, grads = nn.value_and_grad(module, loss_fn)()
-    mx.eval(loss, grads)
+    mx.eval(out, loss, grads)
 
+    assert np.count_nonzero(to_numpy(out)) == 0
     assert "stacked_emb" in grads
     grad = grads["stacked_emb"]["weight"]
     assert grad.shape == module.stacked_emb.weight.shape
     assert bool(mx.any(mx.isfinite(grad)).item())
     assert float(mx.sum(mx.abs(grad)).item()) > 0.0
-

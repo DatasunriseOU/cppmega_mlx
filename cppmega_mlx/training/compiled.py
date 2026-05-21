@@ -55,6 +55,7 @@ STABLE_BATCH_KEYS = (
     "ast_depth_ids",
     "sibling_index_ids",
     "node_type_ids",
+    "platform_ids",
 )
 
 CompiledBatch = dict[str, mx.array | None]

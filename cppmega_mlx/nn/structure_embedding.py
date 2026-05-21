@@ -71,7 +71,12 @@ class StructureEmbedding(nn.Module):
         self.stacked_emb = nn.Embedding(total_vocab, self.bottleneck_dim)
         self.up_proj = nn.Linear(self.bottleneck_dim, self.hidden_size, bias=False)
         self.stacked_emb.weight = mx.zeros_like(self.stacked_emb.weight)
-        self.up_proj.weight = mx.zeros_like(self.up_proj.weight)
+        # Keep the residual output exactly zero at init via the zero table, but
+        # leave a small non-zero projection so CE gradients reach the table.
+        self.up_proj.weight = self.up_proj.weight * mx.array(
+            0.02,
+            dtype=self.up_proj.weight.dtype,
+        )
         self.component_scales = mx.full(
             (len(self.active_component_names),),
             1.0 / len(self.active_component_names),
@@ -180,4 +185,3 @@ class StructureEmbedding(nn.Module):
 
 
 CppMegaStructureEmbedding = StructureEmbedding
-

@@ -8,6 +8,14 @@ from typing import Any, Mapping
 import mlx.core as mx
 import numpy as np
 
+SideChannelDropoutPolicy = Mapping[str, float]
+
+_SIDE_CHANNEL_FAMILY_FIELDS: Mapping[str, tuple[str, ...]] = {
+    "platform": ("platform_ids",),
+    "syntax": ("ast_depth_ids", "sibling_index_ids", "node_type_ids"),
+    "structure": ("structure_ids", "dep_levels"),
+}
+
 
 @dataclass(frozen=True)
 class LMTokenBatch:
@@ -24,6 +32,7 @@ class LMTokenBatch:
     sibling_index_ids: mx.array | None = None
     node_type_ids: mx.array | None = None
     platform_ids: mx.array | None = None
+    side_channels: Mapping[str, Mapping[str, mx.array]] | None = None
     metadata: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
@@ -105,6 +114,8 @@ class LMTokenBatch:
             mx.eval(has_negative)
             if bool(has_negative.item()):
                 raise ValueError("platform_ids must be non-negative")
+        if self.side_channels is not None:
+            _validate_side_channel_map(self.side_channels)
         if self.metadata is not None and not isinstance(self.metadata, Mapping):
             raise ValueError("metadata must be a mapping when provided")
 
@@ -163,6 +174,62 @@ class LMTokenBatch:
             )
         return kwargs
 
+    def side_channel_map(self) -> dict[str, dict[str, mx.array]]:
+        """Return side-channel tensors grouped by family and column name."""
+
+        out: dict[str, dict[str, mx.array]] = {
+            family: {}
+            for family in _SIDE_CHANNEL_FAMILY_FIELDS
+        }
+        for family, fields in _SIDE_CHANNEL_FAMILY_FIELDS.items():
+            for field_name in fields:
+                value = getattr(self, field_name)
+                if value is not None:
+                    out[family][field_name] = value
+        if self.side_channels is not None:
+            for family, columns in self.side_channels.items():
+                out.setdefault(family, {}).update(dict(columns))
+        return {family: columns for family, columns in out.items() if columns}
+
+    def with_side_channel_dropout(
+        self,
+        policy: SideChannelDropoutPolicy | None,
+        *,
+        seed: int | None = None,
+        training: bool = True,
+    ) -> "LMTokenBatch":
+        """Apply shape-stable family dropout by zeroing selected channels."""
+
+        if not training or not policy:
+            return self
+        rates = _validate_side_channel_dropout_policy(policy)
+        if not rates:
+            return self
+        rng = np.random.default_rng(seed)
+        dropped = {
+            family
+            for family, rate in rates.items()
+            if rate >= 1.0 or (rate > 0.0 and float(rng.random()) < rate)
+        }
+        if not dropped:
+            return self
+
+        kwargs = self.as_dict(include_metadata=True, include_side_channels=True)
+        for family in dropped:
+            for field_name in _SIDE_CHANNEL_FAMILY_FIELDS.get(family, ()):
+                value = kwargs.get(field_name)
+                if value is not None:
+                    kwargs[field_name] = mx.zeros_like(value)
+        if self.side_channels is not None:
+            kwargs["side_channels"] = {
+                family: {
+                    name: mx.zeros_like(value) if family in dropped else value
+                    for name, value in columns.items()
+                }
+                for family, columns in self.side_channels.items()
+            }
+        return LMTokenBatch(**kwargs)
+
     def _target_aligned(self, value: mx.array) -> mx.array:
         if tuple(value.shape) == tuple(self.targets.shape):
             return value
@@ -206,7 +273,12 @@ class LMTokenBatch:
 
         return {} if self.metadata is None else dict(self.metadata)
 
-    def as_dict(self, *, include_metadata: bool = False) -> dict[str, Any]:
+    def as_dict(
+        self,
+        *,
+        include_metadata: bool = False,
+        include_side_channels: bool = False,
+    ) -> dict[str, Any]:
         data: dict[str, Any] = {"tokens": self.tokens}
         if self.target_tokens is not None:
             data["target_tokens"] = self.target_tokens
@@ -219,12 +291,49 @@ class LMTokenBatch:
         data.update({k: v for k, v in self.structure_fields().items() if v is not None})
         if self.platform_ids is not None:
             data["platform_ids"] = self.platform_ids
+        if include_side_channels and self.side_channels is not None:
+            data["side_channels"] = self.side_channels
         if include_metadata and self.metadata is not None:
             data["metadata"] = self.metadata
         return data
 
 
 _DOCUMENT_ID_ALIASES = ("document_ids", "doc_ids", "packing_document_ids")
+
+
+def _validate_side_channel_map(
+    side_channels: Mapping[str, Mapping[str, mx.array]],
+) -> None:
+    if not isinstance(side_channels, Mapping):
+        raise ValueError("side_channels must be a mapping when provided")
+    for family, columns in side_channels.items():
+        if not isinstance(family, str) or not family.strip():
+            raise ValueError("side channel family names must be non-empty strings")
+        if not isinstance(columns, Mapping):
+            raise ValueError(f"side channel family {family!r} must map column names")
+        for name, value in columns.items():
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError("side channel column names must be non-empty strings")
+            if not isinstance(value, mx.array):
+                raise ValueError(
+                    f"side channel {family}.{name} must be an mlx array"
+                )
+
+
+def _validate_side_channel_dropout_policy(
+    policy: SideChannelDropoutPolicy,
+) -> dict[str, float]:
+    rates: dict[str, float] = {}
+    for family, rate in policy.items():
+        if not isinstance(family, str) or not family.strip():
+            raise ValueError("side channel dropout family names must be non-empty")
+        value = float(rate)
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(
+                f"side channel dropout for {family!r} must be in [0, 1], got {rate!r}"
+            )
+        rates[family] = value
+    return rates
 
 
 def _document_ids_from_mapping(batch: Mapping[str, Any]) -> Any | None:
@@ -271,6 +380,7 @@ def ensure_lm_batch(batch: LMTokenBatch | Mapping[str, Any] | mx.array) -> LMTok
             sibling_index_ids=batch.get("sibling_index_ids"),
             node_type_ids=batch.get("node_type_ids"),
             platform_ids=batch.get("platform_ids"),
+            side_channels=batch.get("side_channels"),
             metadata=batch.get("metadata"),
         )
     raise TypeError(f"unsupported batch type: {type(batch)!r}")
@@ -331,4 +441,9 @@ def synthetic_token_batch(
     )
 
 
-__all__ = ["LMTokenBatch", "ensure_lm_batch", "synthetic_token_batch"]
+__all__ = [
+    "LMTokenBatch",
+    "SideChannelDropoutPolicy",
+    "ensure_lm_batch",
+    "synthetic_token_batch",
+]

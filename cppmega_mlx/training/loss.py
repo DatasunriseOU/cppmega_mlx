@@ -8,7 +8,11 @@ from typing import Mapping, cast
 import mlx.core as mx
 import mlx.nn as nn
 
-from cppmega_mlx.data.batch import LMTokenBatch, ensure_lm_batch
+from cppmega_mlx.data.batch import (
+    LMTokenBatch,
+    SideChannelDropoutPolicy,
+    ensure_lm_batch,
+)
 from cppmega_mlx.nn.structure_embedding import StructureEmbedding
 from cppmega_mlx.training.cut_cross_entropy import (
     DEFAULT_CHUNK_ROWS,
@@ -31,10 +35,18 @@ from cppmega_mlx.training.stp_loss import (
 def next_token_cross_entropy(
     model: nn.Module,
     batch: LMTokenBatch | Mapping[str, mx.array] | mx.array,
+    *,
+    side_channel_dropout: SideChannelDropoutPolicy | None = None,
+    side_channel_dropout_seed: int | None = None,
 ) -> tuple[mx.array, mx.array]:
     """Return masked next-token CE loss and the number of contributing tokens."""
 
     lm_batch = ensure_lm_batch(batch)
+    lm_batch = lm_batch.with_side_channel_dropout(
+        side_channel_dropout,
+        seed=side_channel_dropout_seed,
+        training=True,
+    )
     document_ids = lm_batch.input_document_ids
     model_kwargs = lm_batch.model_kwargs()
     if document_ids is not None:
@@ -63,6 +75,8 @@ def next_token_cut_cross_entropy(
     *,
     chunk_rows: int = DEFAULT_CHUNK_ROWS,
     eval_chunks: bool = True,
+    side_channel_dropout: SideChannelDropoutPolicy | None = None,
+    side_channel_dropout_seed: int | None = None,
 ) -> tuple[mx.array, mx.array]:
     """Return masked next-token CE via the MLX-native chunked linear path.
 
@@ -73,6 +87,11 @@ def next_token_cut_cross_entropy(
     """
 
     lm_batch = ensure_lm_batch(batch)
+    lm_batch = lm_batch.with_side_channel_dropout(
+        side_channel_dropout,
+        seed=side_channel_dropout_seed,
+        training=True,
+    )
     document_ids = lm_batch.input_document_ids
     hidden_states = _decoder_hidden_states_for_mtp(
         model,

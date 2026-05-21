@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from functools import partial
 import math
 
 import mlx.core as mx
@@ -15,7 +16,7 @@ from cppmega_mlx.config.model import (
     Mamba3Config,
     Nam56RModelConfig,
 )
-from cppmega_mlx.data.batch import synthetic_token_batch
+from cppmega_mlx.data.batch import LMTokenBatch, synthetic_token_batch
 from cppmega_mlx.models.hybrid_lm import HybridTinyConfig, HybridTinyLM
 from cppmega_mlx.recipes.nam56r import build_hybrid_tiny_config_from_nam56r
 from cppmega_mlx.training.compiled import CompiledPretrainingStep
@@ -23,6 +24,7 @@ from cppmega_mlx.training.loss import (
     next_token_cross_entropy,
     next_token_cross_entropy_with_mtp,
 )
+from cppmega_mlx.training.loop import one_step_train
 
 
 def _hybrid_config(**overrides) -> HybridTinyConfig:
@@ -746,7 +748,7 @@ def test_nam56r_lite_recipe_instantiates_custom_routes_and_backpropagates() -> N
     assert _max_abs(flat_grads, "layers.3.block.state_weight") > 0
 
 
-def test_hybrid_lm_structure_embedding_receives_gradients_when_projection_enabled() -> (
+def test_hybrid_lm_structure_embedding_receives_gradients_at_zero_residual_init() -> (
     None
 ):
     mx.random.seed(17)
@@ -758,9 +760,6 @@ def test_hybrid_lm_structure_embedding_receives_gradients_when_projection_enable
             structure_components="all",
             structure_num_categories=16,
         )
-    )
-    model.structure_embedding.up_proj.weight = mx.ones_like(
-        model.structure_embedding.up_proj.weight
     )
     batch = synthetic_token_batch(
         batch_size=2,
@@ -780,6 +779,133 @@ def test_hybrid_lm_structure_embedding_receives_gradients_when_projection_enable
     assert "structure_embedding.stacked_emb.weight" in flat_grads
     assert np.isfinite(flat_grads["structure_embedding.stacked_emb.weight"]).all()
     assert _max_abs(flat_grads, "structure_embedding.stacked_emb.weight") > 0
+
+
+def test_lm_batch_side_channel_family_dropout_is_shape_stable() -> None:
+    batch = synthetic_token_batch(
+        batch_size=2,
+        seq_length=6,
+        vocab_size=32,
+        seed=41,
+        include_structure=True,
+    )
+    platform_ids = mx.array(
+        [
+            [
+                [2, 64, 0],
+                [2, 64, 0],
+                [2, 64, 0],
+                [2, 64, 0],
+                [2, 64, 0],
+                [0, 0, 0],
+            ],
+            [
+                [3, 64, 0],
+                [3, 64, 0],
+                [3, 64, 0],
+                [3, 64, 0],
+                [3, 64, 0],
+                [0, 0, 0],
+            ],
+        ],
+        dtype=mx.int32,
+    )
+    batch = LMTokenBatch(
+        **batch.as_dict(),
+        platform_ids=platform_ids,
+        side_channels={
+            "semantic_graph": {
+                "token_symbol_ids": mx.ones(batch.tokens.shape, dtype=mx.int32)
+            }
+        },
+    )
+
+    dropped = batch.with_side_channel_dropout(
+        {"platform": 1.0, "structure": 1.0, "semantic_graph": 1.0},
+        seed=7,
+    )
+
+    assert dropped.platform_ids is not None
+    assert dropped.platform_ids.shape == batch.platform_ids.shape
+    assert dropped.structure_ids is not None
+    assert dropped.structure_ids.shape == batch.structure_ids.shape
+    assert dropped.side_channels is not None
+    assert (
+        dropped.side_channels["semantic_graph"]["token_symbol_ids"].shape
+        == batch.tokens.shape
+    )
+    assert float(mx.sum(mx.abs(dropped.platform_ids)).item()) == 0.0
+    assert float(mx.sum(mx.abs(dropped.structure_ids)).item()) == 0.0
+    assert (
+        float(
+            mx.sum(
+                mx.abs(dropped.side_channels["semantic_graph"]["token_symbol_ids"])
+            ).item()
+        )
+        == 0.0
+    )
+
+
+def test_hybrid_lm_train_step_smokes_no_platform_and_full_side_channels() -> None:
+    config = _single_route_config("A")
+    token_batch = synthetic_token_batch(
+        batch_size=2,
+        seq_length=6,
+        vocab_size=config.vocab_size,
+        seed=43,
+        include_structure=False,
+    )
+    platform_ids = mx.array(
+        [
+            [[2, 64, 0]] * 6,
+            [[3, 64, 0]] * 6,
+        ],
+        dtype=mx.int32,
+    )
+    platform_batch = LMTokenBatch(
+        tokens=token_batch.tokens,
+        attention_mask=token_batch.attention_mask,
+        platform_ids=platform_ids,
+    )
+    full_base = synthetic_token_batch(
+        batch_size=2,
+        seq_length=6,
+        vocab_size=config.vocab_size,
+        seed=47,
+        include_structure=True,
+    )
+    full_batch = LMTokenBatch(**full_base.as_dict(), platform_ids=platform_ids)
+
+    for index, batch in enumerate((token_batch, platform_batch, full_batch)):
+        mx.random.seed(101 + index)
+        model = HybridTinyLM(
+            _hybrid_config(
+                pattern="A",
+                depth=1,
+                dsa_a_layer_ranks=(0,),
+                max_seq_length=7,
+                structure_components="all",
+                structure_num_categories=16,
+            )
+        )
+        optimizer = optim.AdamW(learning_rate=1e-3, weight_decay=0.0)
+        result = one_step_train(
+            model,
+            optimizer,
+            batch,
+            loss_fn=partial(
+                next_token_cross_entropy,
+                side_channel_dropout={
+                    "platform": 0.0,
+                    "structure": 0.0,
+                    "syntax": 0.0,
+                },
+                side_channel_dropout_seed=13,
+            ),
+        )
+
+        assert math.isfinite(result.loss)
+        assert result.ntokens == 10
 
 
 def test_hybrid_lm_optimizer_step_updates_representative_route_params() -> None:
