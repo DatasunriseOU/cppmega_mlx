@@ -423,24 +423,38 @@ def stage_train(ctx: StageContext) -> StageResult:
         rng_key = mx.random.key(0)
         data_source = "synthetic"
         token_count = 0
+        tokenizer_used: str | None = None
         parquet_path = opts.get("parquet_path")
+        tokenizer_path = opts.get("tokenizer_path")
+        targets = mx.random.randint(0, vocab_size, shape=(batch, seq))
         if parquet_path:
-            try:
-                tokens = _read_first_n_tokens(parquet_path, n=batch * seq)
+            # V4-2: prefer tokenize(text) path when both tokenizer and a
+            # 'text' column are present; fall back to raw-int input_ids
+            # column (V3-2) when not; fall through to synthetic otherwise.
+            if tokenizer_path:
+                tokens, used = _tokenize_parquet_text(
+                    parquet_path, tokenizer_path, n_tokens=batch * seq)
                 if len(tokens) >= batch * seq:
-                    tokens = [int(t) % vocab_size for t in tokens[:batch * seq]]
+                    tokens = [int(t) % vocab_size
+                              for t in tokens[:batch * seq]]
                     targets = mx.array(tokens, dtype=mx.int32).reshape(
                         batch, seq)
-                    data_source = "parquet"
+                    data_source = "parquet_tokenized"
                     token_count = len(tokens)
-                else:
-                    targets = mx.random.randint(
-                        0, vocab_size, shape=(batch, seq))
-            except Exception:
-                targets = mx.random.randint(
-                    0, vocab_size, shape=(batch, seq))
-        else:
-            targets = mx.random.randint(0, vocab_size, shape=(batch, seq))
+                    tokenizer_used = used
+            if data_source == "synthetic":
+                try:
+                    tokens = _read_first_n_tokens(
+                        parquet_path, n=batch * seq)
+                    if len(tokens) >= batch * seq:
+                        tokens = [int(t) % vocab_size
+                                  for t in tokens[:batch * seq]]
+                        targets = mx.array(tokens, dtype=mx.int32).reshape(
+                            batch, seq)
+                        data_source = "parquet"
+                        token_count = len(tokens)
+                except Exception:
+                    pass
         all_modules = nn.Sequential(*modules, lm_head)
         opt, optimizer_kind = _build_optimizer(spec_optim, lr)
         loss_and_grad = nn.value_and_grad(all_modules, loss_fn)
@@ -532,6 +546,7 @@ def stage_train(ctx: StageContext) -> StageResult:
                 "optimizer_kind": optimizer_kind,
                 "data_source": data_source,
                 "token_count": token_count,
+                "tokenizer_used": tokenizer_used,
                 "model_summary": _summarize_model(
                     ctx.spec, optimizer_kind, schedule_kind_label),
             },
@@ -543,6 +558,41 @@ def stage_train(ctx: StageContext) -> StageResult:
 # ---------------------------------------------------------------------------
 # Registry.
 # ---------------------------------------------------------------------------
+
+
+def _tokenize_parquet_text(
+    parquet_path: str, tokenizer_path: str, n_tokens: int,
+) -> tuple[list[int], str | None]:
+    """V4-2: encode the parquet ``text`` column through a real tokenizer.
+
+    Returns (token_ids, tokenizer_basename) on success, ([], None) on any
+    failure so stage_train can fall through cleanly to the V3-2 raw-int
+    path or the synthetic fallback. We deliberately swallow all exceptions
+    here — the goal is non-fatal degradation, not surfacing tokenizer
+    bugs through the train pipeline.
+    """
+    try:
+        import pyarrow.parquet as pq
+        from tokenizers import Tokenizer
+        from pathlib import Path
+        table = pq.read_table(parquet_path)
+        if "text" not in table.column_names:
+            return [], None
+        tok = Tokenizer.from_file(str(tokenizer_path))
+        out: list[int] = []
+        col = table.column("text")
+        for chunk in col.chunks:
+            for cell in chunk.to_pylist():
+                if cell is None:
+                    continue
+                enc = tok.encode(str(cell))
+                for tid in enc.ids:
+                    out.append(int(tid))
+                    if len(out) >= n_tokens:
+                        return out, Path(tokenizer_path).name
+        return out, Path(tokenizer_path).name
+    except Exception:
+        return [], None
 
 
 def _read_first_n_tokens(parquet_path: str, n: int) -> list[int]:
