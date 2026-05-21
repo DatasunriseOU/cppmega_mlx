@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { LossKind, LossState } from "@/state/spec";
 
 export interface LossTabProps {
@@ -16,6 +16,17 @@ const KINDS: { key: LossKind; label: string }[] = [
 
 export function LossTab({ loss, onApply }: LossTabProps): JSX.Element {
   const [draft, setDraft] = useState<LossState>(loss);
+
+  // V4-7: keep draft in sync when the parent rebinds loss (e.g. preset
+  // auto-binds head_outputs to the last brick). Otherwise the draft
+  // captured at first mount sends head_outputs=['logits'] to verify and
+  // the whole pipeline fails before train.
+  useEffect(() => {
+    setDraft((prev) => ({
+      ...prev,
+      head_outputs: loss.head_outputs,
+    }));
+  }, [loss.head_outputs.join(",")]);
 
   function setKind(k: LossKind) {
     setDraft({ ...draft, kind: k, params: defaultParamsFor(k) });

@@ -547,6 +547,11 @@ def stage_train(ctx: StageContext) -> StageResult:
                 "data_source": data_source,
                 "token_count": token_count,
                 "tokenizer_used": tokenizer_used,
+                "loss_kind": (
+                    ctx.spec.loss.kind
+                    if getattr(ctx.spec, "loss", None) is not None
+                    else "cross_entropy"
+                ),
                 "model_summary": _summarize_model(
                     ctx.spec, optimizer_kind, schedule_kind_label),
             },
@@ -687,6 +692,10 @@ def _summarize_model(
         params = getattr(node, "params", {}) or {}
         return params.get(key, default)
 
+    loss_kind = "cross_entropy"
+    loss = getattr(spec, "loss", None)
+    if loss is not None:
+        loss_kind = getattr(loss, "kind", "cross_entropy")
     return {
         "mlp_activation": _pget(mlp_node, "activation", "swiglu"),
         "attention_pre_norm": _pget(attn_node, "pre_norm", "none"),
@@ -695,6 +704,7 @@ def _summarize_model(
         "mlp_post_norm": _pget(mlp_node, "post_norm", "none"),
         "optimizer_kind": optimizer_kind,
         "schedule_kind": schedule_kind,
+        "loss_kind": loss_kind,
         "num_brick_kinds": len({n.kind for n in nodes}),
     }
 

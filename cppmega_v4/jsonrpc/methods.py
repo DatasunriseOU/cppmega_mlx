@@ -116,10 +116,42 @@ def _graph_to_specs(graph: GraphSpec) -> list[dict[str, Any]]:
 
 
 def _make_loss(payload: LossSpecPayload) -> LossSpec:
+    # V4-7: UI LossTab sends a flattened MTP shape (params={"k": K, "beta": B}
+    # and a single head_outputs entry) so that the user doesn't have to spell
+    # out beta_0..beta_{K-1} or pre-clone the head. Expand here so the
+    # LossSpec __post_init__ contract is satisfied without making the UI
+    # know about per-i betas.
+    kind = LossKind(payload.kind)
+    params = dict(payload.params)
+    head_outputs = list(payload.head_outputs)
+    if kind is LossKind.MTP_WEIGHTED:
+        try:
+            k = int(params.get("k", 2))
+        except (TypeError, ValueError):
+            k = 2
+        params["k"] = k
+        # If the UI sent a single `beta`, broadcast it to beta_0..beta_{k-1}.
+        if "beta" in params and not any(f"beta_{i}" in params for i in range(k)):
+            beta_val = float(params.pop("beta"))
+            for i in range(k):
+                params[f"beta_{i}"] = beta_val
+        else:
+            for i in range(k):
+                params.setdefault(f"beta_{i}", 0.5)
+        # Auto-extend head_outputs to length k by repeating the last entry —
+        # MTPRewriter will materialise the k heads downstream; the UI only
+        # needs to know the seed head.
+        if not head_outputs:
+            head_outputs = ["mlp"]
+        while len(head_outputs) < k:
+            head_outputs.append(head_outputs[-1])
+        head_outputs = head_outputs[:k]
     return LossSpec(
-        kind=LossKind(payload.kind),
-        head_outputs=tuple(payload.head_outputs),
-        params=dict(payload.params),
+        kind=kind,
+        head_outputs=tuple(head_outputs),
+        params=params,
+        label_source="next_k_tokens" if kind is LossKind.MTP_WEIGHTED
+                                     else "next_token",
     )
 
 
