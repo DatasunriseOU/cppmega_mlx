@@ -2,10 +2,16 @@ import { useState } from "react";
 import type { OptimKind, OptimState, ParamGroupState,
               ScheduleSpecState } from "@/state/spec";
 import { ScheduleEditor } from "@/components/ScheduleEditor";
+import { Tooltip } from "@/components/Tooltip";
+import { ExplainModal } from "@/components/ExplainModal";
+import type { RpcClient } from "@/lib/rpc";
 
 export interface OptimTabProps {
   optim: OptimState;
   onApply: (next: OptimState) => void;
+  /** Optional RPC client for tooltip + Apply-recommended integration.
+   *  When omitted the tooltip surface is rendered but inert. */
+  rpc?: RpcClient | null;
 }
 
 const KINDS: OptimKind[] = [
@@ -30,10 +36,27 @@ const DEFAULT_NEW_GROUP: ParamGroupState = {
   matcher: "regex:.*", lr: 1e-4, weight_decay: 0.0,
 };
 
-export function OptimTab({ optim, onApply }: OptimTabProps): JSX.Element {
+export function OptimTab({ optim, onApply, rpc }: OptimTabProps): JSX.Element {
   const [draft, setDraft] = useState<OptimState>(optim);
   const [expandedSchedules, setExpandedSchedules] =
     useState<Set<number>>(new Set());
+  const [explainKind, setExplainKind] = useState<OptimKind | null>(null);
+
+  function applyRecommendedToKind(params: Record<string, unknown>) {
+    // The first group governs lr; we copy lr/weight_decay/betas from
+    // the recommended map when present.
+    const lr = typeof params.lr === "number" ? params.lr : draft.groups[0].lr;
+    const wd = typeof params.weight_decay === "number"
+      ? params.weight_decay : draft.groups[0].weight_decay;
+    const betas = Array.isArray(params.betas) && params.betas.length === 2
+      ? (params.betas as [number, number])
+      : draft.groups[0].betas;
+    setDraft({
+      ...draft,
+      groups: draft.groups.map((g, i) =>
+        i === 0 ? { ...g, lr, weight_decay: wd, betas } : g),
+    });
+  }
 
   function updateGroup(i: number, patch: Partial<ParamGroupState>) {
     setDraft({
@@ -60,7 +83,12 @@ export function OptimTab({ optim, onApply }: OptimTabProps): JSX.Element {
 
   return (
     <div data-testid="optim-tab" style={panel}>
-      <label>Kind
+      <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
+        <Tooltip rpc={rpc ?? null} category="optimizer" name={draft.kind}
+                 onInfoClick={() => setExplainKind(draft.kind)}
+                 testId="optim-kind-tooltip">
+          <span>Kind</span>
+        </Tooltip>
         <select
           data-testid="optim-kind"
           value={draft.kind}
@@ -70,6 +98,13 @@ export function OptimTab({ optim, onApply }: OptimTabProps): JSX.Element {
           {KINDS.map((k) => <option key={k} value={k}>{k}</option>)}
         </select>
       </label>
+
+      {explainKind && (
+        <ExplainModal rpc={rpc ?? null} category="optimizer"
+                      name={explainKind}
+                      onClose={() => setExplainKind(null)}
+                      onApplyRecommended={applyRecommendedToKind} />
+      )}
 
       <table data-testid="optim-groups"
              style={{ width: "100%", fontSize: 11, borderCollapse: "collapse" }}>

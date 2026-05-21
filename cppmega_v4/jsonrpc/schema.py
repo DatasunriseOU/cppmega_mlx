@@ -550,4 +550,63 @@ METHOD_REGISTRY: frozenset[str] = frozenset({
     "tokenizer.encode_visualize",
     "tokenizer.list_presets",
     "data.preview_parquet",
+    "catalog.explain",
+    "catalog.list_options",
 })
+
+
+class CatalogExplainParams(BaseModel):
+    """catalog.explain — fetch one ExplainEntry."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    category: str
+    name: str
+
+
+class CatalogExplainEntryPayload(BaseModel):
+    """Wire form of ExplainEntry."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    category: str
+    name: str
+    summary: str
+    when_to_use: str
+    when_to_avoid: str
+    recommended_params: dict[str, Any] = Field(default_factory=dict)
+    paper_ref: str | None = None
+    paper_url: str | None = None
+    gotchas: list[str] = Field(default_factory=list)
+
+
+class CatalogExplainResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    entry: CatalogExplainEntryPayload | None = None
+    not_found_message: str | None = None
+
+
+class CatalogListOptionsParams(BaseModel):
+    """catalog.list_options — fetch every entry in a category."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    category: str
+
+
+class CatalogOptionSummary(BaseModel):
+    """Compact summary used in dropdowns (no full entry to keep payload
+    small when listing many options)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    summary: str
+    paper_ref: str | None = None
+
+
+class CatalogListOptionsResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    options: list[CatalogOptionSummary] = Field(default_factory=list)

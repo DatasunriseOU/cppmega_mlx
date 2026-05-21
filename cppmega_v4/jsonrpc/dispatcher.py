@@ -31,8 +31,14 @@ from cppmega_v4.jsonrpc.data_methods import (
     PreviewParquetParams,
     preview_parquet,
 )
+from cppmega_v4.jsonrpc.catalog_methods import (
+    catalog_explain,
+    catalog_list_options,
+)
 from cppmega_v4.jsonrpc.schema import (
     BuildPresetSpecsParams,
+    CatalogExplainParams,
+    CatalogListOptionsParams,
     ErrorCode,
     JsonRpcError,
     JsonRpcRequest,
@@ -83,6 +89,14 @@ _ROUTES: Mapping[str, tuple[type[BaseModel], _Handler]] = {
     "data.preview_parquet": (
         PreviewParquetParams,
         lambda p, c: preview_parquet(p, cache=c),
+    ),
+    "catalog.explain": (
+        CatalogExplainParams,
+        lambda p, c: catalog_explain(p, cache=c),
+    ),
+    "catalog.list_options": (
+        CatalogListOptionsParams,
+        lambda p, c: catalog_list_options(p, cache=c),
     ),
 }
 

@@ -327,6 +327,7 @@ export function App(): JSX.Element {
                 sharding={spec.sharding}
                 gotchas={spec.gotchas}
                 proposals={proposals}
+                rpc={rpc}
                 onLossApply={(l) => dispatch({ type: "loss.set", loss: l })}
                 onOptimApply={(o) => dispatch({ type: "optim.set", optim: o })}
                 onRewriterAdd={(r) =>

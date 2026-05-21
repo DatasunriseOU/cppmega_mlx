@@ -26,6 +26,9 @@ export interface SidebarProps {
   onShardingChange: (s: ShardingState) => void;
   onShardingAccept: (idx: number) => void;
   onGotchaAutoFix?: (id: string) => void;
+  /** Optional rpc client — enables tooltip/explain integration in
+   *  OptimTab and downstream tabs. App passes useRpc() here. */
+  rpc?: import("@/lib/rpc").RpcClient | null;
 }
 
 const TAB_LABELS: { key: SidebarTab; label: string }[] = [
@@ -65,7 +68,7 @@ export function Sidebar(p: SidebarProps): JSX.Element {
       </nav>
       <div style={{ flex: 1, overflowY: "auto" }}>
         {active === "loss"      && <LossTab loss={p.loss} onApply={p.onLossApply} />}
-        {active === "optim"     && <OptimTab optim={p.optim} onApply={p.onOptimApply} />}
+        {active === "optim"     && <OptimTab optim={p.optim} onApply={p.onOptimApply} rpc={p.rpc ?? null} />}
         {active === "rewriters" && (
           <RewritersTab rewriters={p.rewriters}
                         onAdd={p.onRewriterAdd}
