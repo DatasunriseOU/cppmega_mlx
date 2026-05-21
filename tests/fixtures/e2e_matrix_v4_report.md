@@ -1,6 +1,6 @@
 # E2E Coverage Matrix v4 — Closure Report
 
-Epic: `cppmega-mlx-br1` (13 sub-tickets closed, 1 deferred). Mirrors
+Epic: `cppmega-mlx-br1` (14 sub-tickets closed). Mirrors
 the v3 closure layout. Closes the data-flow honesty gaps the v3 audit
 surfaced — UI parquet/tokenizer selection now reaches stage_train, all
 10 activations + 6 schedules + 4 loss kinds proven through UI→train,
@@ -20,7 +20,7 @@ model genuinely changed observable behaviour.
 | V4-7  | cppmega-mlx-o2n | `3aba787` | —       | —       | +4   | ✅     |
 | V4-8  | cppmega-mlx-ais | `6225f20` | —       | —       | +3   | ✅     |
 | V4-9  | cppmega-mlx-9e7 | `9efbabc` | —       | —       | +1   | ✅     |
-| V4-10 | cppmega-mlx-zfh | —         | —       | —       | —    | ❄ deferred (P2, needs net-new SideChannelsTab + forward hook) |
+| V4-10 | cppmega-mlx-zfh | `ed6a485` | —       | —       | +3   | ✅     |
 | V4-11 | cppmega-mlx-dpj | `308bae0` | —       | —       | +2   | ✅     |
 | V4-12 | cppmega-mlx-v22 | `0942caa` | —       | —       | +20  | ✅     |
 | V4-13 | cppmega-mlx-1v8 | `1a46d63` | —       | —       | +2   | ✅     |
@@ -90,10 +90,7 @@ model genuinely changed observable behaviour.
 
 ## Deferred / soft gaps (carry to v5)
 
-1. **V4-10 side_channels reach forward** — backend forward-hook
-   plumbing + net-new SideChannelsTab UI. Current INITIAL_SPEC families
-   are static; user has no surface to mutate from.
-2. **Sharding plan apply → real distributed train** — needs multi-device.
+1. **Sharding plan apply → real distributed train** — needs multi-device.
 3. **Memory peak vs estimate** — needs `mx.metal.get_peak_memory`
    instrumentation across train cycles.
 4. **WS reconnect mid-train** — lifecycle.
