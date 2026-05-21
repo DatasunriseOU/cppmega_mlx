@@ -228,6 +228,12 @@ PATH_C_FUSION_COMPILE_RECEIPT_ENV = "CPPMEGA_PATH_C_FUSION_COMPILE_RECEIPT"
 PATH_C_FUSION_COMPILE_RECEIPT_PATH = (
     ROOT / "reports" / "path_c_fusion_compile_receipt.json"
 )
+PATH_C_FUSION_MATRIX_PROFILE_RECEIPT_ENV = (
+    "CPPMEGA_PATH_C_FUSION_MATRIX_PROFILE_RECEIPT"
+)
+PATH_C_FUSION_MATRIX_PROFILE_RECEIPT_PATH = (
+    ROOT / "reports" / "path_c_fusion_matrix_profile_receipt.json"
+)
 FP8_PATH_C_BRIDGE_TARGET = "native_mlx_tvm_ffi_graph_bridge"
 FP8_PATH_C_BRIDGE_STATUS = "m04_wired_for_native_tvm_ffi_graph_outputs"
 FP8_PATH_C_CARRIER_DTYPE = "bfloat16"
@@ -5767,10 +5773,114 @@ def _path_c_fusion_compile_receipt_payload(
     }
 
 
+def _path_c_fusion_matrix_profile_receipt_path() -> Path:
+    override = os.environ.get(PATH_C_FUSION_MATRIX_PROFILE_RECEIPT_ENV)
+    if override:
+        return Path(override).expanduser()
+    return PATH_C_FUSION_MATRIX_PROFILE_RECEIPT_PATH
+
+
+def _path_c_fusion_matrix_profile_payload(
+    *,
+    schedule_spec: Any,
+    receipt_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Validate 1B matrix/profile/cache evidence for a production schedule."""
+
+    receipt_path = (
+        Path(receipt_path).expanduser()
+        if receipt_path is not None
+        else _path_c_fusion_matrix_profile_receipt_path()
+    )
+    expected_schedule_id = str(schedule_spec.schedule_id)
+    expected_schedule_name = str(schedule_spec.schedule_name)
+    base: dict[str, Any] = {
+        "path": str(receipt_path),
+        "status": "missing",
+        "verified": False,
+        "schedule_id": None,
+        "schedule_name": None,
+        "failed_checks": [],
+        "reason": "production fused schedule 1B matrix/profile receipt is missing",
+    }
+    if not receipt_path.exists():
+        return base
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {
+            **base,
+            "status": "unreadable",
+            "reason": f"{type(exc).__name__}: {exc}",
+        }
+
+    matrix_rows = receipt.get("matrix_rows", ())
+    checks = {
+        "receipt_kind_ok": (
+            receipt.get("kind")
+            == "cppmega_path_c_fusion_matrix_profile_receipt"
+        ),
+        "receipt_status_ok": receipt.get("status") == "ok",
+        "model_profile_matches": (
+            receipt.get("model_profile") == REQUIRED_MODEL_PROFILE
+        ),
+        "schedule_id_matches": (
+            str(receipt.get("schedule_id", "")) == expected_schedule_id
+        ),
+        "schedule_name_matches": (
+            str(receipt.get("schedule_name", "")) == expected_schedule_name
+        ),
+        "full_1b_matrix_captured": (
+            receipt.get("full_1b_matrix_captured") is True
+        ),
+        "profiling_traces_captured": (
+            receipt.get("profiling_traces_captured") is True
+        ),
+        "memory_non_regression_ok": (
+            receipt.get("memory_non_regression_ok") is True
+        ),
+        "cache_receipts_captured": (
+            receipt.get("cache_receipts_captured") is True
+        ),
+        "path_b_baselines_clean": (
+            receipt.get("path_b_baselines_clean") is True
+        ),
+        "path_c_default_gate_rows_passed": (
+            receipt.get("path_c_default_gate_rows_passed") is True
+        ),
+        "path_c_peak_memory_non_regression": (
+            receipt.get("path_c_peak_memory_non_regression") is True
+        ),
+        "path_c_warm_cache_hit_observed": (
+            receipt.get("path_c_warm_cache_hit_observed") is True
+        ),
+        "matrix_rows_present": isinstance(matrix_rows, list) and bool(matrix_rows),
+    }
+    failed_checks = [name for name, ok in checks.items() if not ok]
+    verified = not failed_checks
+    return {
+        **base,
+        "status": "verified" if verified else "mismatch",
+        "verified": verified,
+        "schedule_id": receipt.get("schedule_id"),
+        "schedule_name": receipt.get("schedule_name"),
+        "checks": checks,
+        "failed_checks": failed_checks,
+        "matrix_row_count": len(matrix_rows) if isinstance(matrix_rows, list) else 0,
+        "reason": (
+            "production fused schedule has matching full 1B matrix, profiling, "
+            "memory non-regression, and cache receipt evidence"
+            if verified
+            else "production fused schedule matrix/profile receipt does not match this route"
+        ),
+    }
+
+
 def path_c_fusion_payload(
     *,
     model: Any | None = None,
     compile_receipt_path: str | Path | None = None,
+    matrix_profile_receipt_path: str | Path | None = None,
     bank_buffers: Mapping[str, Any] | None = None,
     bank_buffer_owner: str | None = None,
     bank_owner: Any | None = None,
@@ -5825,6 +5935,13 @@ def path_c_fusion_payload(
         receipt_path=compile_receipt_path,
     )
     production_compile_verified = bool(compile_receipt.get("verified"))
+    matrix_profile_receipt = _path_c_fusion_matrix_profile_payload(
+        schedule_spec=schedule_spec,
+        receipt_path=matrix_profile_receipt_path,
+    )
+    production_matrix_profile_verified = bool(
+        matrix_profile_receipt.get("verified")
+    )
     expected_bank_buffer_owner = (
         bank_buffer_owner
         if bank_buffer_owner is not None
@@ -6109,6 +6226,7 @@ def path_c_fusion_payload(
             fused_train_block_training_contract
         ),
         "production_compile_receipt": compile_receipt,
+        "production_matrix_profile_receipt": matrix_profile_receipt,
         "direct_chained_fusion": {
             **_path_c_direct_chain_plan_payload(direct_chain),
             "construction": direct_chain_construction,
@@ -6264,16 +6382,31 @@ def path_c_fusion_payload(
                 if not runtime_fused_route_bound
                 else []
             ),
-            {
-                "kind": "production_1b_matrix_profile_missing",
-                "schedule_id": schedule_spec.schedule_id,
-                "schedule_name": schedule_spec.schedule_name,
-                "reason": (
-                    "the full 1B Path B/Path C matrix, profiling traces, memory "
-                    "non-regression evidence, and cache receipts have not been "
-                    "captured for this production schedule"
-                ),
-            },
+            *(
+                [
+                    {
+                        "kind": "production_1b_matrix_profile_missing",
+                        "schedule_id": schedule_spec.schedule_id,
+                        "schedule_name": schedule_spec.schedule_name,
+                        "matrix_profile_receipt_status": (
+                            matrix_profile_receipt.get("status")
+                        ),
+                        "matrix_profile_receipt_path": (
+                            matrix_profile_receipt.get("path")
+                        ),
+                        "failed_checks": list(
+                            matrix_profile_receipt.get("failed_checks", ())
+                        ),
+                        "reason": (
+                            "the full 1B Path B/Path C matrix, profiling traces, "
+                            "memory non-regression evidence, and cache receipts "
+                            "have not been captured for this production schedule"
+                        ),
+                    }
+                ]
+                if not production_matrix_profile_verified
+                else []
+            ),
             *(
                 [
                     {
@@ -6352,6 +6485,9 @@ def path_c_fusion_payload(
             "requires_ready_fusion_plan": True,
             "requires_compile_verified_single_kernel": True,
             "current_compile_receipt_verified": production_compile_verified,
+            "current_matrix_profile_verified": (
+                production_matrix_profile_verified
+            ),
             "requires_verified_schedule_contract": True,
             "requires_complete_real_abi_contract": True,
             "current_plan_default_eligible": False,

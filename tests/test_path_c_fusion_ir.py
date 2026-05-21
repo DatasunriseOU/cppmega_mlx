@@ -23,6 +23,7 @@ from cppmega_mlx.runtime.path_c_fusion import (
     Z3SyncSpec,
     build_path_c_aot_autograd_region,
     audit_fusion_cache_key,
+    audit_fused_path_c_plan_default_eligibility,
     audit_warm_cache_reuse,
     build_path_c_fusion_region,
     build_path_c_model_regions_from_bricks,
@@ -4007,10 +4008,39 @@ def test_plan_acceptance_gate_requires_real_single_kernel_and_aot_bwd() -> None:
             required_external_buffers=("hidden",),
             declared_key="test_key",
             declared_implementation_kind="production",
+            declared_schedule_id="untrusted_test_schedule",
             declared_required_real_abi_inputs=("hidden",),
         ),
     )
-    assert fused_path_c_plan_default_eligible(ready_plan, clean_win) is True
+    assert fused_path_c_plan_default_eligible(ready_plan, clean_win) is False
+    audit = audit_fused_path_c_plan_default_eligibility(ready_plan, clean_win)
+    assert audit.eligible is False
+    assert audit.status == "untrusted_schedule_id"
+    assert audit.schedule_id == "untrusted_test_schedule"
+
+    trusted_ready_plan = replace(
+        ready_plan,
+        schedule_contract=replace(
+            ready_plan.schedule_contract,
+            declared_schedule_id="trusted_test_schedule",
+        ),
+    )
+    assert (
+        fused_path_c_plan_default_eligible(
+            trusted_ready_plan,
+            clean_win,
+            trusted_schedule_ids=frozenset({"trusted_test_schedule"}),
+        )
+        is True
+    )
+    trusted_audit = audit_fused_path_c_plan_default_eligibility(
+        trusted_ready_plan,
+        clean_win,
+        trusted_schedule_ids=frozenset({"trusted_test_schedule"}),
+    )
+    assert trusted_audit.eligible is True
+    assert trusted_audit.status == "eligible"
+    assert trusted_audit.schedule_id == "trusted_test_schedule"
 
     undeclared_real_abi = replace(
         ready_plan,

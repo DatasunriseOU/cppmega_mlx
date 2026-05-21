@@ -5177,6 +5177,62 @@ def test_path_c_fusion_force_mode_fails_closed_until_runtime_is_bound(
     assert "runtime still has no bound fused artifact" in payload["reason"]
 
 
+def test_path_c_fusion_payload_accepts_matching_matrix_profile_receipt(
+    tmp_path: Path,
+    path_c_fusion_force_env: None,
+) -> None:
+    del path_c_fusion_force_env
+    baseline_payload = m04_train_step.path_c_fusion_payload(
+        compile_receipt_path=PRODUCTION_FUSION_COMPILE_RECEIPT,
+    )
+    schedule = baseline_payload["production_schedule"]
+    matrix_receipt_path = tmp_path / "path_c_fusion_matrix_profile.json"
+    matrix_receipt_path.write_text(
+        json.dumps(
+            {
+                "kind": "cppmega_path_c_fusion_matrix_profile_receipt",
+                "status": "ok",
+                "model_profile": m04_train_step.REQUIRED_MODEL_PROFILE,
+                "schedule_id": schedule["schedule_id"],
+                "schedule_name": schedule["schedule_name"],
+                "full_1b_matrix_captured": True,
+                "profiling_traces_captured": True,
+                "memory_non_regression_ok": True,
+                "cache_receipts_captured": True,
+                "path_b_baselines_clean": True,
+                "path_c_default_gate_rows_passed": True,
+                "path_c_peak_memory_non_regression": True,
+                "path_c_warm_cache_hit_observed": True,
+                "matrix_rows": [
+                    {
+                        "dtype": "fp8",
+                        "optimizer": "adamw",
+                        "path": "path_c_warm",
+                        "status": "ok",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    payload = m04_train_step.path_c_fusion_payload(
+        compile_receipt_path=PRODUCTION_FUSION_COMPILE_RECEIPT,
+        matrix_profile_receipt_path=matrix_receipt_path,
+    )
+
+    assert payload["production_matrix_profile_receipt"]["status"] == "verified"
+    assert payload["production_matrix_profile_receipt"]["verified"] is True
+    assert payload["production_matrix_profile_receipt"]["schedule_id"] == (
+        schedule["schedule_id"]
+    )
+    assert "production_1b_matrix_profile_missing" not in {
+        blocker["kind"] for blocker in payload["schedule_blockers"]
+    }
+    assert payload["acceptance_gate"]["current_matrix_profile_verified"] is True
+    assert payload["default_allowed"] is False
+
+
 def test_fp8_path_c_local_gb10_profile_uses_model_factory_dsa_producer() -> None:
     args = m04_train_step.build_parser().parse_args(
         [

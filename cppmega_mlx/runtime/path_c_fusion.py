@@ -39,10 +39,12 @@ __all__ = [
     "PathCFusionRegionBuilder",
     "PathCModelBrick",
     "PathCModelShapeEnv",
+    "PathCPlanDefaultEligibilityAudit",
     "SparseMLAFp8PrepareSpec",
     "WarmCacheAudit",
     "Z3SyncSpec",
     "audit_fusion_cache_key",
+    "audit_fused_path_c_plan_default_eligibility",
     "audit_warm_cache_reuse",
     "build_path_c_aot_autograd_region",
     "build_path_c_fusion_region",
@@ -2966,6 +2968,16 @@ class BenchmarkAcceptanceRow:
         return self.path_c_warm_tok_sec / self.path_b_tok_sec
 
 
+@dataclass(frozen=True)
+class PathCPlanDefaultEligibilityAudit:
+    """Structured result for the fused Path C default-eligibility gate."""
+
+    eligible: bool
+    status: str
+    reason: str
+    schedule_id: str = ""
+
+
 def path_b_baseline_is_clean(
     row: BenchmarkAcceptanceRow,
     *,
@@ -2995,34 +3007,149 @@ def fused_path_c_default_eligible(
     return row.path_c_peak_delta_gib <= max_peak_delta_gib
 
 
+def audit_fused_path_c_plan_default_eligibility(
+    plan: FusionCompilePlan,
+    row: BenchmarkAcceptanceRow,
+    *,
+    min_c_over_b: float = DEFAULT_MIN_C_OVER_B,
+    max_peak_delta_gib: float = DEFAULT_MAX_PEAK_DELTA_GIB,
+    trusted_schedule_ids: Sequence[str] | None = None,
+) -> PathCPlanDefaultEligibilityAudit:
+    """Explain whether a fused Path C plan can be enabled by default."""
+
+    if not plan.single_kernel_fused:
+        return PathCPlanDefaultEligibilityAudit(
+            eligible=False,
+            status="not_single_kernel_fused",
+            reason="plan did not lower to one fused kernel",
+        )
+    if plan.schedule_status != "ready":
+        return PathCPlanDefaultEligibilityAudit(
+            eligible=False,
+            status="schedule_not_ready",
+            reason=f"schedule status is {plan.schedule_status!r}, not 'ready'",
+        )
+    if plan.autograd_status != "ready" or plan.autograd_missing_backward_nodes:
+        return PathCPlanDefaultEligibilityAudit(
+            eligible=False,
+            status="autograd_not_ready",
+            reason="AOT autograd backward coverage is not complete",
+        )
+    if plan.semantic_blockers:
+        return PathCPlanDefaultEligibilityAudit(
+            eligible=False,
+            status="semantic_blockers",
+            reason="semantic fusion blockers remain",
+        )
+    if plan.schedule_contract is None:
+        return PathCPlanDefaultEligibilityAudit(
+            eligible=False,
+            status="missing_schedule_contract",
+            reason="plan has no verified schedule contract",
+        )
+    contract = plan.schedule_contract
+    if contract.status != "verified":
+        return PathCPlanDefaultEligibilityAudit(
+            eligible=False,
+            status="unverified_schedule_contract",
+            reason=contract.reason,
+            schedule_id=contract.declared_schedule_id,
+        )
+    if contract.declared_implementation_kind != "production":
+        return PathCPlanDefaultEligibilityAudit(
+            eligible=False,
+            status="non_production_schedule",
+            reason=(
+                "declared implementation kind is "
+                f"{contract.declared_implementation_kind!r}, not 'production'"
+            ),
+            schedule_id=contract.declared_schedule_id,
+        )
+    if not contract.declared_schedule_id:
+        return PathCPlanDefaultEligibilityAudit(
+            eligible=False,
+            status="missing_schedule_id",
+            reason="verified production contract did not declare a schedule ID",
+        )
+    trusted_ids = (
+        trusted_path_c_production_schedule_ids()
+        if trusted_schedule_ids is None
+        else frozenset(str(schedule_id) for schedule_id in trusted_schedule_ids)
+    )
+    if contract.declared_schedule_id not in trusted_ids:
+        return PathCPlanDefaultEligibilityAudit(
+            eligible=False,
+            status="untrusted_schedule_id",
+            reason=(
+                f"production schedule ID {contract.declared_schedule_id!r} "
+                "is not trusted by this build"
+            ),
+            schedule_id=contract.declared_schedule_id,
+        )
+    if not contract.declared_required_real_abi_inputs:
+        return PathCPlanDefaultEligibilityAudit(
+            eligible=False,
+            status="undeclared_real_abi",
+            reason="verified production contract declared no real ABI inputs",
+            schedule_id=contract.declared_schedule_id,
+        )
+    if contract.missing_real_abi_inputs:
+        missing = ", ".join(contract.missing_real_abi_inputs)
+        return PathCPlanDefaultEligibilityAudit(
+            eligible=False,
+            status="incomplete_real_abi",
+            reason=f"verified production contract is missing real ABI inputs: {missing}",
+            schedule_id=contract.declared_schedule_id,
+        )
+    if not path_b_baseline_is_clean(row):
+        return PathCPlanDefaultEligibilityAudit(
+            eligible=False,
+            status="unclean_path_b_baseline",
+            reason="Path B baseline row is not clean enough for default gating",
+            schedule_id=contract.declared_schedule_id,
+        )
+    if row.c_over_b < min_c_over_b:
+        return PathCPlanDefaultEligibilityAudit(
+            eligible=False,
+            status="insufficient_path_c_speedup",
+            reason=f"Path C/B ratio {row.c_over_b:.6g} is below {min_c_over_b:.6g}",
+            schedule_id=contract.declared_schedule_id,
+        )
+    if row.path_c_peak_delta_gib > max_peak_delta_gib:
+        return PathCPlanDefaultEligibilityAudit(
+            eligible=False,
+            status="path_c_peak_delta_too_high",
+            reason=(
+                f"Path C peak delta {row.path_c_peak_delta_gib:.6g} GiB "
+                f"exceeds {max_peak_delta_gib:.6g} GiB"
+            ),
+            schedule_id=contract.declared_schedule_id,
+        )
+    return PathCPlanDefaultEligibilityAudit(
+        eligible=True,
+        status="eligible",
+        reason="plan and benchmark row satisfy fused Path C default gating",
+        schedule_id=contract.declared_schedule_id,
+    )
+
+
 def fused_path_c_plan_default_eligible(
     plan: FusionCompilePlan,
     row: BenchmarkAcceptanceRow,
     *,
     min_c_over_b: float = DEFAULT_MIN_C_OVER_B,
     max_peak_delta_gib: float = DEFAULT_MAX_PEAK_DELTA_GIB,
+    trusted_schedule_ids: Sequence[str] | None = None,
 ) -> bool:
     """Gate default Path C fusion on both the plan and clean benchmark row."""
 
-    if not plan.single_kernel_fused:
-        return False
-    if plan.schedule_status != "ready":
-        return False
-    if plan.autograd_status != "ready" or plan.autograd_missing_backward_nodes:
-        return False
-    if plan.semantic_blockers:
-        return False
-    if plan.schedule_contract is None or plan.schedule_contract.status != "verified":
-        return False
-    if not plan.schedule_contract.declared_required_real_abi_inputs:
-        return False
-    if plan.schedule_contract.missing_real_abi_inputs:
-        return False
-    return fused_path_c_default_eligible(
+    return audit_fused_path_c_plan_default_eligibility(
+        plan,
         row,
         min_c_over_b=min_c_over_b,
         max_peak_delta_gib=max_peak_delta_gib,
-    )
+        trusted_schedule_ids=trusted_schedule_ids,
+    ).eligible
 
 
 @dataclass(frozen=True)
