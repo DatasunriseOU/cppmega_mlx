@@ -244,6 +244,8 @@ export function App(): JSX.Element {
                    matcher: g.matcher, lr: g.lr,
                    weight_decay: g.weight_decay,
                    betas: g.betas,
+                   ns_steps: g.ns_steps,
+                   schedule: g.schedule,
                  })) },
         topology: { factory: snap.spec.sharding.topology, kwargs: {} },
       });
@@ -410,6 +412,12 @@ function buildVerifyParams(nodes: Node[], edges: Edge[],
              groups: spec.optim.groups.map((g) => ({
                matcher: g.matcher, lr: g.lr,
                weight_decay: g.weight_decay, betas: g.betas,
+               // V3-5: thread schedule + ns_steps through to backend.
+               // The wire payload dropped these previously, making the
+               // OptimTab ScheduleEditor and Muon ns_steps decorative —
+               // backend always saw constant lr and default ns_steps=5.
+               ns_steps: g.ns_steps,
+               schedule: g.schedule,
              })) },
     rewriters: spec.rewriters.map((r) => ({ name: r.name, params: r.params })),
     sharding: {
