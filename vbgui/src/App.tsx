@@ -21,10 +21,25 @@ import {
 } from "@/state/spec";
 import type { ShardingProposalView } from "@/components/sidebar/ShardingTab";
 
+// Mirrors cppmega_v4.architectures.PRESETS — covers every brick
+// combination the Raschka gallery defines, exposed through the top-bar
+// preset launcher so the E2E matrix can iterate them via the GUI.
 const PRESETS: readonly string[] = [
-  "qwen3_next", "kimi_linear", "kimi_k2", "deepseek_v3",
-  "deepseek_v4_flash", "gemma4", "mistral4", "ling26",
-  "longcat", "nemotron3", "zaya1", "arcee_trinity",
+  "arcee_trinity", "deepseek_v3", "deepseek_v4_flash",
+  "gemma3_270m", "gemma3_27b", "gemma4", "gemma4_31b",
+  "glm_45", "glm_45_air", "glm_47", "glm_5", "glm_51",
+  "gpt_oss_120b", "gpt_oss_20b", "granite_4_1", "grok25",
+  "intellect_3", "kimi_k2", "kimi_linear", "laguna_xs2",
+  "ling25", "ling26", "llama3_2_1b", "llama3_2_3b", "llama3_8b",
+  "llama4_maverick", "longcat", "mimo_v2_5", "mimo_v2_5_pro",
+  "mimo_v2_flash", "minimax_m2", "minimax_m2_5", "minimax_m2_7",
+  "mistral4", "mistral_small_3_1", "nanbeige_4_1", "nemotron3",
+  "olmo2_7b", "olmo3_32b", "olmo3_7b", "phi4",
+  "qwen3_235b_a22b", "qwen3_30b_a3b", "qwen3_6_27b",
+  "qwen3_coder_flash", "qwen3_dense_0_6b", "qwen3_dense_32b",
+  "qwen3_dense_4b", "qwen3_dense_8b", "qwen3_next",
+  "sarvam_105b", "sarvam_30b", "smollm3", "step3_5_flash",
+  "tencent_hy3", "tiny_aya", "zaya1",
 ];
 
 const TOPOLOGIES: readonly TopologyFactory[] = [

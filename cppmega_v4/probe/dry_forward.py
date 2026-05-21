@@ -50,13 +50,41 @@ def dry_forward(
                 )
             modules[node.name] = builder(hidden_size, dict(node.params))
 
+        def _call(mod: object, x: mx.array) -> mx.array:
+            """Call a brick and coerce tuple/dict returns to a single array.
+
+            Some bricks (mamba3, certain ssm wrappers) emit
+            ``(activations, state)`` — take the first array-shaped element.
+            """
+            out = mod(x)  # type: ignore[operator]
+            if isinstance(out, tuple) or isinstance(out, list):
+                for item in out:
+                    if hasattr(item, "shape"):
+                        return item
+                raise TypeError(
+                    f"brick {type(mod).__name__} returned tuple with no array",
+                )
+            if isinstance(out, dict):
+                for v in out.values():
+                    if hasattr(v, "shape"):
+                        return v
+                raise TypeError(
+                    f"brick {type(mod).__name__} returned dict with no array",
+                )
+            if not hasattr(out, "shape"):
+                raise TypeError(
+                    f"brick {type(mod).__name__} returned {type(out).__name__} "
+                    f"with no .shape attribute",
+                )
+            return out
+
         x0 = mx.random.normal((batch, seq_len, hidden_size))
         # Topo: pre-compute predecessors map; if a node has multiple
         # predecessors, mean-reduce their outputs before forwarding.
         outputs: dict[str, mx.array] = {}
         roots = [n.name for n in graph.nodes if not graph.predecessors(n.name)]
         for name in roots:
-            outputs[name] = modules[name](x0)
+            outputs[name] = _call(modules[name], x0)
         # Iterate remaining nodes in declared order (graph is already a
         # topological declaration thanks to from_block_specs).
         for node in graph.nodes:
@@ -64,14 +92,14 @@ def dry_forward(
                 continue
             preds = graph.predecessors(node.name)
             if not preds:
-                outputs[node.name] = modules[node.name](x0)
+                outputs[node.name] = _call(modules[node.name], x0)
                 continue
             if len(preds) == 1:
                 inp = outputs[preds[0]]
             else:
                 stacked = mx.stack([outputs[p] for p in preds], axis=0)
                 inp = mx.mean(stacked, axis=0)
-            outputs[node.name] = modules[node.name](inp)
+            outputs[node.name] = _call(modules[node.name], inp)
 
         last = graph.nodes[-1].name
         y = outputs[last]
