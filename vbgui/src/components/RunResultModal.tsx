@@ -1,6 +1,6 @@
 // Modal that displays per-stage results from a pipeline.run response.
 
-import { useState } from "react";
+import { Fragment, useState } from "react";
 
 export interface StageResult {
   name: string;
@@ -28,6 +28,95 @@ const ICONS = { ok: "✓", fail: "✗", skipped: "·" } as const;
 const COLORS = {
   ok: "#10b981", fail: "#dc2626", skipped: "#9ca3af",
 } as const;
+
+// V3-4: keys excluded from the visible extras dl because they're
+// redundant with the row's status / error rendering.
+const EXTRAS_RESERVED = new Set<string>([
+  "name", "status", "elapsed_ms", "warnings", "errors", "error",
+]);
+
+function extrasOf(s: StageResult): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(s)) {
+    if (!EXTRAS_RESERVED.has(k)) out[k] = v;
+  }
+  return out;
+}
+
+function hasContent(s: StageResult): boolean {
+  return s.error != null || Object.keys(extrasOf(s)).length > 0;
+}
+
+function StageExtras({
+  stage, extras,
+}: { stage: string; extras: Record<string, unknown> }): JSX.Element {
+  return (
+    <dl data-testid={`run-result-extras-${stage}`}
+        style={{ margin: 0, fontSize: 11, fontFamily: "monospace" }}>
+      {Object.entries(extras).map(([k, v]) => (
+        <ExtrasEntry key={k} stage={stage} k={k} v={v} />
+      ))}
+    </dl>
+  );
+}
+
+function ExtrasEntry({
+  stage, k, v,
+}: { stage: string; k: string; v: unknown }): JSX.Element {
+  const base = `run-result-extras-${stage}-${k}`;
+  if (Array.isArray(v)) {
+    return (
+      <div style={{ display: "flex", gap: 8 }}>
+        <dt style={{ color: "#6b7280", minWidth: 140 }}>{k}</dt>
+        <dd style={{ margin: 0 }}>
+          <ol data-testid={base}
+              style={{ margin: 0, padding: "0 0 0 16px",
+                       display: "flex", gap: 6, flexWrap: "wrap",
+                       listStyle: "none" }}>
+            {v.map((item, i) => (
+              <li key={i} data-testid={`${base}-${i}`}>
+                {typeof item === "object" && item !== null
+                  ? JSON.stringify(item)
+                  : String(item)}
+              </li>
+            ))}
+          </ol>
+        </dd>
+      </div>
+    );
+  }
+  if (v !== null && typeof v === "object") {
+    return (
+      <div style={{ display: "flex", gap: 8 }}>
+        <dt style={{ color: "#6b7280", minWidth: 140 }}>{k}</dt>
+        <dd style={{ margin: 0 }}>
+          <dl data-testid={base}
+              style={{ margin: 0, paddingLeft: 8 }}>
+            {Object.entries(v as Record<string, unknown>).map(([sk, sv]) => (
+              <div key={sk} style={{ display: "flex", gap: 6 }}>
+                <dt style={{ color: "#9ca3af", minWidth: 120 }}>{sk}</dt>
+                <dd data-testid={`${base}-${sk}`}
+                    style={{ margin: 0 }}>
+                  {typeof sv === "object" && sv !== null
+                    ? JSON.stringify(sv)
+                    : String(sv)}
+                </dd>
+              </div>
+            ))}
+          </dl>
+        </dd>
+      </div>
+    );
+  }
+  return (
+    <div style={{ display: "flex", gap: 8 }}>
+      <dt style={{ color: "#6b7280", minWidth: 140 }}>{k}</dt>
+      <dd data-testid={base} style={{ margin: 0 }}>
+        {v === null || v === undefined ? "null" : String(v)}
+      </dd>
+    </div>
+  );
+}
 
 export function RunResultModal({
   report, error, onClose,
@@ -91,10 +180,11 @@ export function RunResultModal({
             <tbody>
               {report.stages.map((s) => {
                 const open = expanded.has(s.name);
+                const extras = extrasOf(s);
+                const hasExtras = Object.keys(extras).length > 0;
                 return (
-                  <>
-                    <tr key={s.name}
-                        data-testid={`run-result-stage-${s.name}`}
+                  <Fragment key={s.name}>
+                    <tr data-testid={`run-result-stage-${s.name}`}
                         style={{ borderBottom: "1px solid #f3f4f6" }}>
                       <td style={td}>
                         <span style={{ color: COLORS[s.status],
@@ -110,7 +200,7 @@ export function RunResultModal({
                         {s.elapsed_ms.toFixed(1)}
                       </td>
                       <td style={td}>
-                        {s.error && (
+                        {hasContent(s) && (
                           <button data-testid={`run-result-expand-${s.name}`}
                                   onClick={() => toggle(expanded,
                                                        setExpanded, s.name)}>
@@ -129,7 +219,15 @@ export function RunResultModal({
                         </td>
                       </tr>
                     )}
-                  </>
+                    {open && hasExtras && (
+                      <tr data-testid={`run-result-extras-row-${s.name}`}>
+                        <td colSpan={5} style={{ ...td, background: "#f9fafb",
+                                                 padding: "6px 12px" }}>
+                          <StageExtras stage={s.name} extras={extras} />
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
                 );
               })}
             </tbody>

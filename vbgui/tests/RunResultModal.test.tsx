@@ -82,4 +82,103 @@ describe("RunResultModal", () => {
     expect(screen.getByTestId("run-result-error").textContent)
       .toContain("backend down");
   });
+
+  // ---------------- V3-4: extras surfaced under each stage row -----------
+
+  const REPORT_WITH_EXTRAS: RunReport = {
+    overall_status: "ok",
+    total_elapsed_ms: 500.0,
+    stages: [
+      {
+        name: "train",
+        status: "ok",
+        elapsed_ms: 480.0,
+        losses: [3.4, 3.1, 2.9],
+        lr_trajectory: [0.001, 0.001, 0.001],
+        weight_delta_norm: 0.0123,
+        num_steps: 3,
+        schedule_kind: "constant",
+        optimizer_kind: "lion",
+        model_summary: {
+          mlp_activation: "swiglu",
+          attention_pre_norm: "layernorm",
+          attention_post_norm: "rmsnorm",
+          mlp_pre_norm: "none",
+          mlp_post_norm: "none",
+          optimizer_kind: "lion",
+          schedule_kind: "constant",
+          num_brick_kinds: 2,
+        },
+      },
+    ],
+  };
+
+  it("expand reveals extras when stage has only extras (no error)", () => {
+    render(<RunResultModal report={REPORT_WITH_EXTRAS} onClose={() => {}} />);
+    fireEvent.click(screen.getByTestId("run-result-expand-train"));
+    expect(screen.getByTestId("run-result-extras-row-train")).toBeTruthy();
+    expect(screen.getByTestId("run-result-extras-train")).toBeTruthy();
+  });
+
+  it("primitives surface with run-result-extras-{stage}-{key} testids", () => {
+    render(<RunResultModal report={REPORT_WITH_EXTRAS} onClose={() => {}} />);
+    fireEvent.click(screen.getByTestId("run-result-expand-train"));
+    expect(screen.getByTestId("run-result-extras-train-optimizer_kind")
+      .textContent).toBe("lion");
+    expect(screen.getByTestId("run-result-extras-train-schedule_kind")
+      .textContent).toBe("constant");
+    expect(screen.getByTestId("run-result-extras-train-weight_delta_norm")
+      .textContent).toBe("0.0123");
+    expect(screen.getByTestId("run-result-extras-train-num_steps")
+      .textContent).toBe("3");
+  });
+
+  it("arrays render with run-result-extras-{stage}-{key}-{i} per item", () => {
+    render(<RunResultModal report={REPORT_WITH_EXTRAS} onClose={() => {}} />);
+    fireEvent.click(screen.getByTestId("run-result-expand-train"));
+    expect(screen.getByTestId("run-result-extras-train-losses-0")
+      .textContent).toBe("3.4");
+    expect(screen.getByTestId("run-result-extras-train-losses-2")
+      .textContent).toBe("2.9");
+    expect(screen.getByTestId("run-result-extras-train-lr_trajectory-1")
+      .textContent).toBe("0.001");
+  });
+
+  it("nested objects render with run-result-extras-{stage}-{key}-{sub}", () => {
+    render(<RunResultModal report={REPORT_WITH_EXTRAS} onClose={() => {}} />);
+    fireEvent.click(screen.getByTestId("run-result-expand-train"));
+    expect(screen.getByTestId(
+      "run-result-extras-train-model_summary-mlp_activation")
+      .textContent).toBe("swiglu");
+    expect(screen.getByTestId(
+      "run-result-extras-train-model_summary-attention_pre_norm")
+      .textContent).toBe("layernorm");
+    expect(screen.getByTestId(
+      "run-result-extras-train-model_summary-optimizer_kind")
+      .textContent).toBe("lion");
+  });
+
+  it("expand button hidden when stage has no content (no error+no extras)", () => {
+    render(<RunResultModal report={REPORT_OK} onClose={() => {}} />);
+    // REPORT_OK stages have no error and no extras → no expand button.
+    expect(screen.queryByTestId("run-result-expand-parse")).toBeNull();
+    expect(screen.queryByTestId("run-result-expand-build_model")).toBeNull();
+  });
+
+  it("expand reveals BOTH error and extras when both present", () => {
+    const mixed: RunReport = {
+      overall_status: "fail", total_elapsed_ms: 1.0,
+      stages: [{
+        name: "train", status: "fail", elapsed_ms: 1.0,
+        error: { type: "Boom", detail: "kaboom" },
+        losses: [1, 2],
+      }],
+    };
+    render(<RunResultModal report={mixed} onClose={() => {}} />);
+    fireEvent.click(screen.getByTestId("run-result-expand-train"));
+    expect(screen.getByTestId("run-result-detail-train").textContent)
+      .toContain("Boom");
+    expect(screen.getByTestId("run-result-extras-train-losses-0")
+      .textContent).toBe("1");
+  });
 });
