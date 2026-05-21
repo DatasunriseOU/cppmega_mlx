@@ -692,6 +692,28 @@ def stage_train(ctx: StageContext) -> StageResult:
             "num_clips": 0,
         }
 
+        # G25: detect MoE / sparse-experts bricks in graph; surface
+        # routing config in extras.moe. Pure observation — actual
+        # routing/load-balance computation is v6+ work.
+        moe_extras: dict[str, Any] | None = None
+        try:
+            moe_kinds = {"moe", "bailing_moe", "sparse_moe"}
+            wire_nodes = getattr(ctx.spec.graph, "nodes", []) or []
+            moe_node = next((n for n in wire_nodes
+                             if getattr(n, "kind", "") in moe_kinds), None)
+            if moe_node is not None:
+                p = dict(getattr(moe_node, "params", {}) or {})
+                moe_extras = {
+                    "kind": str(getattr(moe_node, "kind", "moe")),
+                    "num_experts": int(p.get("num_experts", 1)),
+                    "top_k": int(p.get("top_k", 1)),
+                    "routing_entropy": None,        # v6: actual measurement
+                    "load_balance_loss": None,
+                    "dropped_token_ratio": None,
+                }
+        except Exception:
+            pass
+
         # G07: read precision toggles from spec (passthrough — backend
         # doesn't actually switch dtype yet, but extras report what the
         # UI asked for so e2e can assert propagation). Real mixed/fp8
@@ -921,6 +943,7 @@ def stage_train(ctx: StageContext) -> StageResult:
                 "train_dtype": train_dtype,
                 "master_dtype": master_dtype,
                 "fp8_active": fp8_active,
+                "moe": moe_extras,
                 "opt_state_carried": opt_state_carried,
                 "run_id": run_id,
                 "mtp": _compute_mtp_extras(
