@@ -28,7 +28,7 @@ test("UI activation change (glu→swiglu) propagates to train", async ({ page })
   // Click the mlp node (preset gives us attention + mlp = 2 nodes)
   const mlpNode = page.locator("[data-testid='brick-node-llama3_8b_mlp']");
   await mlpNode.click();
-  const panel = page.locator("[data-testid^='brick-context-llama3_8b_mlp']");
+  const panel = page.getByTestId("brick-context-llama3_8b_mlp");
   await expect(panel).toBeVisible({ timeout: 4_000 });
 
   // Change activation to swiglu + Apply
@@ -76,7 +76,7 @@ test("UI pre_norm switch attention rmsnorm→layernorm reaches train", async ({ 
 
   const attnNode = page.locator("[data-testid='brick-node-llama3_8b_attn']");
   await attnNode.click();
-  const panel = page.locator("[data-testid^='brick-context-llama3_8b_attn']");
+  const panel = page.getByTestId("brick-context-llama3_8b_attn");
   await expect(panel).toBeVisible();
   await page.locator(
     "[data-testid='brick-context-llama3_8b_attn-pre-norm']")
