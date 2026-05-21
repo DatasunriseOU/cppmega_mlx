@@ -703,6 +703,7 @@ METHOD_REGISTRY: frozenset[str] = frozenset({
     "catalog.list_options",
     "architectures.list_presets",
     "suggest_optim_groups",
+    "data.roundtrip_check",
 })
 
 

@@ -166,7 +166,12 @@ def _make_token_rows(tok: Tokenizer, n_rows: int, seq_len: int) -> list[list[int
 def _parquet_columns_for(schema: str, tok: Tokenizer, n_rows: int,
                          seq_len: int) -> dict[str, Any]:
     tokens = _make_token_rows(tok, n_rows, seq_len)
-    cols: dict[str, Any] = {"input_ids": tokens}
+    # E7-3: include the source text so data.roundtrip_check can compare
+    # decoded tokens back to the ground truth.
+    original_text = [SAMPLE_SENTENCES[i % len(SAMPLE_SENTENCES)]
+                     for i in range(n_rows)]
+    cols: dict[str, Any] = {"input_ids": tokens,
+                            "original_text": original_text}
     if schema in ("P2_doc", "P3_engram", "P4_full"):
         cols["doc_ids"] = [i // 4 for i in range(n_rows)]
     if schema in ("P3_engram", "P4_full"):

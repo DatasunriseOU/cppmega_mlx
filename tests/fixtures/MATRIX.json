@@ -2,7 +2,8 @@
   "parquets": {
     "T1_cppmega_v3__P1_minimal": {
       "columns": [
-        "input_ids"
+        "input_ids",
+        "original_text"
       ],
       "path": "/Volumes/external/sources/cppmega.mlx/tests/fixtures/parquet/T1_cppmega_v3__P1_minimal.parquet",
       "rows": 32,
@@ -13,6 +14,7 @@
     "T1_cppmega_v3__P2_doc": {
       "columns": [
         "input_ids",
+        "original_text",
         "doc_ids"
       ],
       "path": "/Volumes/external/sources/cppmega.mlx/tests/fixtures/parquet/T1_cppmega_v3__P2_doc.parquet",
@@ -24,6 +26,7 @@
     "T1_cppmega_v3__P3_engram": {
       "columns": [
         "input_ids",
+        "original_text",
         "doc_ids",
         "call_edges"
       ],
@@ -36,6 +39,7 @@
     "T1_cppmega_v3__P4_full": {
       "columns": [
         "input_ids",
+        "original_text",
         "doc_ids",
         "call_edges",
         "loss_mask",
@@ -51,7 +55,8 @@
     },
     "T2_gpt2_small__P1_minimal": {
       "columns": [
-        "input_ids"
+        "input_ids",
+        "original_text"
       ],
       "path": "/Volumes/external/sources/cppmega.mlx/tests/fixtures/parquet/T2_gpt2_small__P1_minimal.parquet",
       "rows": 32,
@@ -62,6 +67,7 @@
     "T2_gpt2_small__P2_doc": {
       "columns": [
         "input_ids",
+        "original_text",
         "doc_ids"
       ],
       "path": "/Volumes/external/sources/cppmega.mlx/tests/fixtures/parquet/T2_gpt2_small__P2_doc.parquet",
@@ -73,6 +79,7 @@
     "T2_gpt2_small__P3_engram": {
       "columns": [
         "input_ids",
+        "original_text",
         "doc_ids",
         "call_edges"
       ],
@@ -85,6 +92,7 @@
     "T2_gpt2_small__P4_full": {
       "columns": [
         "input_ids",
+        "original_text",
         "doc_ids",
         "call_edges",
         "loss_mask",
@@ -100,7 +108,8 @@
     },
     "T3_minimal_no_fim__P1_minimal": {
       "columns": [
-        "input_ids"
+        "input_ids",
+        "original_text"
       ],
       "path": "/Volumes/external/sources/cppmega.mlx/tests/fixtures/parquet/T3_minimal_no_fim__P1_minimal.parquet",
       "rows": 32,
@@ -111,6 +120,7 @@
     "T3_minimal_no_fim__P2_doc": {
       "columns": [
         "input_ids",
+        "original_text",
         "doc_ids"
       ],
       "path": "/Volumes/external/sources/cppmega.mlx/tests/fixtures/parquet/T3_minimal_no_fim__P2_doc.parquet",
@@ -122,6 +132,7 @@
     "T3_minimal_no_fim__P3_engram": {
       "columns": [
         "input_ids",
+        "original_text",
         "doc_ids",
         "call_edges"
       ],
@@ -134,6 +145,7 @@
     "T3_minimal_no_fim__P4_full": {
       "columns": [
         "input_ids",
+        "original_text",
         "doc_ids",
         "call_edges",
         "loss_mask",
@@ -149,7 +161,8 @@
     },
     "T4_fim_only__P1_minimal": {
       "columns": [
-        "input_ids"
+        "input_ids",
+        "original_text"
       ],
       "path": "/Volumes/external/sources/cppmega.mlx/tests/fixtures/parquet/T4_fim_only__P1_minimal.parquet",
       "rows": 32,
@@ -160,6 +173,7 @@
     "T4_fim_only__P2_doc": {
       "columns": [
         "input_ids",
+        "original_text",
         "doc_ids"
       ],
       "path": "/Volumes/external/sources/cppmega.mlx/tests/fixtures/parquet/T4_fim_only__P2_doc.parquet",
@@ -171,6 +185,7 @@
     "T4_fim_only__P3_engram": {
       "columns": [
         "input_ids",
+        "original_text",
         "doc_ids",
         "call_edges"
       ],
@@ -183,6 +198,7 @@
     "T4_fim_only__P4_full": {
       "columns": [
         "input_ids",
+        "original_text",
         "doc_ids",
         "call_edges",
         "loss_mask",
@@ -266,21 +282,21 @@
   "tokenizers": {
     "T1_cppmega_v3": {
       "digest": "34439c0fbe76d582",
-      "fresh": true,
+      "fresh": false,
       "path": "/Volumes/external/sources/cppmega.mlx/tests/fixtures/tokenizers/T1_cppmega_v3.json",
       "specials": [],
       "vocab_size": 65536
     },
     "T2_gpt2_small": {
       "digest": "11e818f948f43497",
-      "fresh": true,
+      "fresh": false,
       "path": "/Volumes/external/sources/cppmega.mlx/tests/fixtures/tokenizers/T2_gpt2_small.json",
       "specials": [],
       "vocab_size": 50257
     },
     "T3_minimal_no_fim": {
       "digest": "17a044a3c1bb0486",
-      "fresh": true,
+      "fresh": false,
       "path": "/Volumes/external/sources/cppmega.mlx/tests/fixtures/tokenizers/T3_minimal_no_fim.json",
       "specials": [
         "<PAD>",
@@ -292,7 +308,7 @@
     },
     "T4_fim_only": {
       "digest": "892f2bab670c5cd4",
-      "fresh": true,
+      "fresh": false,
       "path": "/Volumes/external/sources/cppmega.mlx/tests/fixtures/tokenizers/T4_fim_only.json",
       "specials": [
         "<PAD>",
