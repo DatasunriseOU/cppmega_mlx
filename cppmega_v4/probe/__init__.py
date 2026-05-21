@@ -13,6 +13,7 @@ from cppmega_v4.probe.alternatives import Alternative, generate_alternatives
 from cppmega_v4.probe.capabilities import (
     ColumnSpec,
     ParquetCapabilities,
+    SideChannelFamilyCoverage,
     TokenizerCapabilities,
     introspect_parquet,
     introspect_tokenizer,
@@ -46,6 +47,7 @@ __all__ = [
     "ParquetCapabilities",
     "ProbeFinding",
     "SCHEMA_VERSION",
+    "SideChannelFamilyCoverage",
     "TokenizerCapabilities",
     "contract_probe",
     "dry_forward",

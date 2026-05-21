@@ -40,6 +40,7 @@ from cppmega_v4.probe import (
     contract_probe,
     dry_forward,
     generate_alternatives,
+    introspect_parquet,
 )
 
 
@@ -55,6 +56,54 @@ def _write_full_parquet(p: Path, *, n_rows: int = 16, with_edges: bool = True):
         cols["call_edges"] = [[(0, 1)] for _ in range(n_rows)]
         cols["type_edges"] = [[(0, 2)] for _ in range(n_rows)]
     pq.write_table(pa.table(cols), p)
+
+
+def _write_token_only_parquet(p: Path):
+    pq.write_table(pa.table({
+        "token_ids": [list(range(4)), list(range(4, 8))],
+    }), p)
+
+
+def _write_partial_side_channel_parquet(p: Path):
+    pq.write_table(pa.table({
+        "token_ids": [list(range(4)), list(range(4, 8))],
+        # Source-level AST ids from current GB10 samples: useful provenance,
+        # but not token-coordinate training side channels.
+        "structure_ids": [[1, 2], [3, 4, 5]],
+        "call_edges": [[(0, 1)], [(1, 2)]],
+        "source_path": ["a.cc", "b.cc"],
+    }), p)
+
+
+def _write_enriched_side_channel_parquet(p: Path):
+    rows = 2
+    tokens = [list(range(4)), list(range(4, 8))]
+    pq.write_table(pa.table({
+        "input_ids": tokens,
+        "target_ids": [row[1:] + [0] for row in tokens],
+        "loss_mask": [[1, 1, 1, 0] for _ in range(rows)],
+        "doc_ids": [[1, 1, 2, 2], [1, 1, 1, 1]],
+        "pack_id": [0, 1],
+        "valid_token_count": [4, 4],
+        "num_docs": [2, 2],
+        "platform_ids": [[10, 99], [20, 99]],
+        "source_platform_ids": [[[10, 99], [11, 99]], [[20, 99]]],
+        "token_ast_depth": [[0, 1, 1, 2], [0, 1, 2, 2]],
+        "token_sibling_index": [[0, 0, 1, 0], [0, 0, 0, 1]],
+        "token_ast_node_type": [[1, 2, 2, 3], [1, 2, 3, 3]],
+        "token_structure_ids": [[4, 4, 5, 5], [6, 6, 7, 7]],
+        "token_dep_levels": [[0, 1, 1, 2], [0, 1, 2, 2]],
+        "token_call_edges": [[(0, 1)], [(1, 3)]],
+        "token_type_edges": [[(0, 2)], [(2, 3)]],
+        "token_change_mask_pre": [[0, 0, 1, 1], [0, 1, 1, 0]],
+        "hunk_id_per_token": [[0, 0, 1, 1], [2, 2, 2, 2]],
+        "edit_op_per_token": [[0, 0, 1, 1], [1, 1, 0, 0]],
+        "source_file_id": [101, 102],
+        "language_id": [1, 1],
+        "extractor_name": ["clang", "clang"],
+        "extractor_version": ["v10", "v10"],
+        "tokenizer_id": ["nanochat", "nanochat"],
+    }), p)
 
 
 def _minimal_tokenizer(p: Path, *, with_fim: bool = False):
@@ -120,6 +169,56 @@ def test_data_requirement_direct_match():
 def test_data_requirement_satisfied_by_alternative_key():
     r = DataRequirement("labels", "derived", True, "", satisfied_by=("input_ids",))
     assert r.is_satisfied_by(frozenset({"input_ids"}))
+
+
+# ---------------------------------------------------------------------------
+# Side-channel family capability discovery.
+# ---------------------------------------------------------------------------
+
+
+def test_parquet_capabilities_reports_token_only_family_status(tmp_path: Path):
+    pqp = tmp_path / "token_only.parquet"
+    _write_token_only_parquet(pqp)
+    caps = introspect_parquet(pqp)
+
+    assert caps.side_channel_families["universal"].status == "derived"
+    assert caps.side_channel_families["universal"].provenance == "derived"
+    assert caps.side_channel_families["platform"].status == "missing"
+    assert caps.side_channel_families["structure"].status == "missing"
+    assert caps.side_channels == frozenset()
+
+
+def test_parquet_capabilities_reports_dropped_source_level_columns(tmp_path: Path):
+    pqp = tmp_path / "partial.parquet"
+    _write_partial_side_channel_parquet(pqp)
+    caps = introspect_parquet(pqp)
+
+    structure = caps.side_channel_families["structure"]
+    graph = caps.side_channel_families["semantic_graph"]
+    assert structure.status == "dropped"
+    assert structure.token_alignment == "no"
+    assert structure.dropped_columns == ("structure_ids",)
+    assert graph.status == "dropped"
+    assert graph.graph_remapping == "no"
+    assert graph.dropped_columns == ("call_edges",)
+
+
+def test_parquet_capabilities_reports_enriched_family_coverage(tmp_path: Path):
+    pqp = tmp_path / "enriched.parquet"
+    _write_enriched_side_channel_parquet(pqp)
+    caps = introspect_parquet(pqp)
+
+    assert caps.has_provenance is True
+    assert caps.side_channel_families["universal"].status == "present"
+    assert caps.side_channel_families["platform"].status == "present"
+    assert caps.side_channel_families["platform"].token_alignment == "yes"
+    assert caps.side_channel_families["syntax"].status == "present"
+    assert caps.side_channel_families["structure"].status == "partial"
+    assert caps.side_channel_families["structure"].token_alignment == "yes"
+    assert caps.side_channel_families["semantic_graph"].status == "partial"
+    assert caps.side_channel_families["semantic_graph"].graph_remapping == "yes"
+    assert caps.side_channel_families["temporal_diff"].status == "partial"
+    assert caps.side_channel_families["temporal_diff"].provenance == "original"
 
 
 # ---------------------------------------------------------------------------

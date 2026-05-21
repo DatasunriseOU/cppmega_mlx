@@ -19,6 +19,7 @@ from cppmega_v4.probe.alternatives import Alternative
 from cppmega_v4.probe.capabilities import (
     ColumnSpec,
     ParquetCapabilities,
+    SideChannelFamilyCoverage,
     TokenizerCapabilities,
 )
 from cppmega_v4.probe.probe import ContractProbeReport, ProbeFinding
@@ -139,6 +140,12 @@ def json_schema() -> dict[str, Any]:
                         "type": "array",
                         "items": {"type": "string"},
                     },
+                    "side_channel_families": {
+                        "type": "object",
+                        "additionalProperties": {
+                            "$ref": "#/$defs/SideChannelFamilyCoverage"
+                        },
+                    },
                     "sample_seq_lens": {
                         "type": "array",
                         "items": {"type": "integer", "minimum": 0},
@@ -154,6 +161,51 @@ def json_schema() -> dict[str, Any]:
                     "arrow_dtype": {"type": "string"},
                     "nullable": {"type": "boolean"},
                     "non_null_ratio": {"type": "number", "minimum": 0, "maximum": 1},
+                },
+            },
+            "SideChannelFamilyCoverage": {
+                "type": "object",
+                "required": [
+                    "family", "status", "columns", "missing_columns",
+                    "dropped_columns", "token_alignment", "graph_remapping",
+                    "provenance", "non_null_ratio",
+                ],
+                "properties": {
+                    "family": {"type": "string"},
+                    "status": {
+                        "enum": [
+                            "present", "partial", "missing", "derived", "dropped",
+                        ],
+                    },
+                    "columns": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "missing_columns": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "dropped_columns": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "token_alignment": {
+                        "enum": ["yes", "no", "unknown", "not_applicable"],
+                    },
+                    "graph_remapping": {
+                        "enum": ["yes", "no", "missing", "not_applicable"],
+                    },
+                    "provenance": {
+                        "enum": [
+                            "original", "derived", "missing", "dropped",
+                            "mixed", "unknown",
+                        ],
+                    },
+                    "non_null_ratio": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1,
+                    },
                 },
             },
             "DataRequirement": {
@@ -249,6 +301,34 @@ def _column_from_dict(d: Mapping[str, Any]) -> ColumnSpec:
     )
 
 
+def _family_coverage_to_dict(c: SideChannelFamilyCoverage) -> dict[str, Any]:
+    return {
+        "family": c.family,
+        "status": c.status,
+        "columns": list(c.columns),
+        "missing_columns": list(c.missing_columns),
+        "dropped_columns": list(c.dropped_columns),
+        "token_alignment": c.token_alignment,
+        "graph_remapping": c.graph_remapping,
+        "provenance": c.provenance,
+        "non_null_ratio": c.non_null_ratio,
+    }
+
+
+def _family_coverage_from_dict(d: Mapping[str, Any]) -> SideChannelFamilyCoverage:
+    return SideChannelFamilyCoverage(
+        family=d["family"],
+        status=d["status"],
+        columns=tuple(d.get("columns", ())),
+        missing_columns=tuple(d.get("missing_columns", ())),
+        dropped_columns=tuple(d.get("dropped_columns", ())),
+        token_alignment=d["token_alignment"],
+        graph_remapping=d["graph_remapping"],
+        provenance=d["provenance"],
+        non_null_ratio=float(d["non_null_ratio"]),
+    )
+
+
 def _parquet_to_dict(p: ParquetCapabilities) -> dict[str, Any]:
     return {
         "schema_columns": [_column_to_dict(c) for c in p.schema_columns],
@@ -263,6 +343,10 @@ def _parquet_to_dict(p: ParquetCapabilities) -> dict[str, Any]:
         "side_channels": sorted(p.side_channels),
         "sample_seq_lens": list(p.sample_seq_lens),
         "source": p.source,
+        "side_channel_families": {
+            name: _family_coverage_to_dict(coverage)
+            for name, coverage in sorted(p.side_channel_families.items())
+        },
     }
 
 
@@ -280,6 +364,10 @@ def _parquet_from_dict(d: Mapping[str, Any]) -> ParquetCapabilities:
         side_channels=frozenset(d["side_channels"]),
         sample_seq_lens=tuple(int(x) for x in d["sample_seq_lens"]),
         source=d["source"],
+        side_channel_families={
+            name: _family_coverage_from_dict(coverage)
+            for name, coverage in d.get("side_channel_families", {}).items()
+        },
     )
 
 

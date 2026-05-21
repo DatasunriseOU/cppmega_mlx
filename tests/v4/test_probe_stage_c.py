@@ -81,6 +81,19 @@ def test_to_dict_then_from_dict_round_trip(tmp_path: Path):
     assert restored == report
 
 
+def test_from_dict_accepts_legacy_parquet_without_side_channel_families(tmp_path: Path):
+    pqp = tmp_path / "shard.parquet"
+    _write_full_parquet(pqp)
+    report = contract_probe(_make_spec(), _VENDORED_TOKENIZER, pqp)
+    payload = to_dict(report)
+    del payload["parquet"]["side_channel_families"]
+
+    restored = from_dict(payload)
+
+    assert restored.parquet.side_channel_families == {}
+    assert restored.parquet.side_channels == report.parquet.side_channels
+
+
 def test_to_dict_then_from_dict_round_trip_with_findings(tmp_path: Path):
     """IFIM on minimal tokenizer → unsatisfied findings + alternatives."""
     pqp = tmp_path / "shard.parquet"

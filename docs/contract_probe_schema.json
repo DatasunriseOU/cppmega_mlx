@@ -163,6 +163,12 @@
             "type": "string"
           }
         },
+        "side_channel_families": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/SideChannelFamilyCoverage"
+          }
+        },
         "sample_seq_lens": {
           "type": "array",
           "items": {
@@ -192,6 +198,83 @@
         },
         "nullable": {
           "type": "boolean"
+        },
+        "non_null_ratio": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        }
+      }
+    },
+    "SideChannelFamilyCoverage": {
+      "type": "object",
+      "required": [
+        "family",
+        "status",
+        "columns",
+        "missing_columns",
+        "dropped_columns",
+        "token_alignment",
+        "graph_remapping",
+        "provenance",
+        "non_null_ratio"
+      ],
+      "properties": {
+        "family": {
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "present",
+            "partial",
+            "missing",
+            "derived",
+            "dropped"
+          ]
+        },
+        "columns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "missing_columns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "dropped_columns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "token_alignment": {
+          "enum": [
+            "yes",
+            "no",
+            "unknown",
+            "not_applicable"
+          ]
+        },
+        "graph_remapping": {
+          "enum": [
+            "yes",
+            "no",
+            "missing",
+            "not_applicable"
+          ]
+        },
+        "provenance": {
+          "enum": [
+            "original",
+            "derived",
+            "missing",
+            "dropped",
+            "mixed",
+            "unknown"
+          ]
         },
         "non_null_ratio": {
           "type": "number",
