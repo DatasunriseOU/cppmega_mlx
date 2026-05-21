@@ -253,6 +253,12 @@ def stage_dry_forward(ctx: StageContext) -> StageResult:
         graph = from_block_specs(specs, hidden_size=hidden, instantiate=False)
         result = dry_forward(graph, hidden_size=hidden, seq_len=seq, batch=batch)
         ctx.dry_forward_verdict = result.verdict
+        # G21: rich extras — observable B/S/H + verdict for modal display
+        rich: dict[str, Any] = {
+            "batch": batch, "seq_len": seq, "hidden": hidden,
+            "verdict": result.verdict,
+            "num_nodes": len(graph.nodes),
+        }
         return StageResult(
             name="dry_forward",
             status="ok" if result.verdict == "ok" else "fail",
@@ -260,6 +266,7 @@ def stage_dry_forward(ctx: StageContext) -> StageResult:
             error=({"type": result.verdict, "detail": result.detail}
                    if result.verdict != "ok" else None),
             errors=0 if result.verdict == "ok" else 1,
+            extras=rich,
         )
     except Exception as exc:
         return _fail("dry_forward", t0, exc)
@@ -316,6 +323,7 @@ def stage_loss_smoke(ctx: StageContext) -> StageResult:
         logits = mx.random.normal((1, seq, 32))
         loss_value = mx.mean(mx.softmax(logits, axis=-1) * 0.0 + 1.0)
         finite = bool(mx.isfinite(loss_value).item())
+        # G21: rich extras — loss value + finite flag observable
         return StageResult(
             name="loss_smoke",
             status="ok" if finite else "fail",
@@ -323,15 +331,29 @@ def stage_loss_smoke(ctx: StageContext) -> StageResult:
             errors=0 if finite else 1,
             error=(None if finite
                    else {"type": "NonFiniteLoss", "detail": str(loss_value)}),
+            extras={
+                "loss_value": round(float(loss_value.item()), 6),
+                "loss_finite": finite,
+                "seq_len": seq,
+            },
         )
     except Exception as exc:
         return _fail("loss_smoke", t0, exc)
 
 
 def stage_optimizer_smoke(ctx: StageContext) -> StageResult:
-    """No-op for now — full optimizer.update wired in F-A.3 (training stage)."""
+    """G21: report optim kind + group counts observably."""
     t0 = time.perf_counter()
-    return _ok("optimizer_smoke", t0, note="placeholder until training stage lands")
+    spec_optim = getattr(ctx.spec, "optim", None)
+    kind = "adamw"
+    num_groups = 1
+    if spec_optim is not None:
+        kind = str(getattr(spec_optim, "kind", "adamw"))
+        groups = getattr(spec_optim, "groups", None) or []
+        num_groups = len(groups)
+    return _ok("optimizer_smoke", t0,
+               note="placeholder until training stage lands",
+               optimizer_kind=kind, num_groups=num_groups)
 
 
 def stage_train(ctx: StageContext) -> StageResult:
