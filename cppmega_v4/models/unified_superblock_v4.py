@@ -74,6 +74,9 @@ def _build_mlp(hidden_size: int, params: dict) -> nn.Module:
 
     intermediate = params.get("intermediate_size", 4 * hidden_size)
     activation = params.get("activation", "glu")
+    norm_eps = params.get("norm_eps", 1e-6)
+    pre_norm_kind = params.get("pre_norm", "none")
+    post_norm_kind = params.get("post_norm", "none")
 
     class _MLP(nn.Module):
         def __init__(self):
@@ -81,18 +84,26 @@ def _build_mlp(hidden_size: int, params: dict) -> nn.Module:
             self.gate = nn.Linear(hidden_size, intermediate, bias=False)
             self.up = nn.Linear(hidden_size, intermediate, bias=False)
             self.down = nn.Linear(intermediate, hidden_size, bias=False)
+            self.pre_norm = _make_norm(pre_norm_kind, hidden_size, norm_eps)
+            self.post_norm = _make_norm(post_norm_kind, hidden_size, norm_eps)
 
         def __call__(self, x):
+            if self.pre_norm is not None:
+                x = self.pre_norm(x)
             up = self.up(x)
             if activation == "glu":
-                return self.down(mx.sigmoid(self.gate(x)) * up)
-            if activation in IS_GATED and IS_GATED[activation]:
-                return self.down(apply_activation(activation, up,
-                                                  gate=self.gate(x)))
-            if activation in IS_GATED:
-                return self.down(apply_activation(activation, up))
-            # Unknown name — fall back to GLU to keep training alive.
-            return self.down(mx.sigmoid(self.gate(x)) * up)
+                y = self.down(mx.sigmoid(self.gate(x)) * up)
+            elif activation in IS_GATED and IS_GATED[activation]:
+                y = self.down(apply_activation(activation, up,
+                                                gate=self.gate(x)))
+            elif activation in IS_GATED:
+                y = self.down(apply_activation(activation, up))
+            else:
+                # Unknown name — fall back to GLU to keep training alive.
+                y = self.down(mx.sigmoid(self.gate(x)) * up)
+            if self.post_norm is not None:
+                y = self.post_norm(y)
+            return y
     return _MLP()
 
 
@@ -363,11 +374,30 @@ def _build_mamba3(hidden_size: int, params: dict) -> nn.Module:
     return Mamba3ReferenceBlock(Mamba3Config(**cfg_kwargs))
 
 
+def _make_norm(kind: str, dim: int, eps: float):
+    """E7-6/E7-18: return RMSNorm / LayerNorm / None per kind."""
+    if kind == "rmsnorm":
+        return nn.RMSNorm(dim, eps=eps)
+    if kind == "layernorm":
+        return nn.LayerNorm(dim, eps=eps)
+    if kind == "none":
+        return None
+    raise ValueError(f"unknown norm kind {kind!r}; "
+                     "use 'rmsnorm' / 'layernorm' / 'none'")
+
+
 def _build_attention(hidden_size: int, params: dict) -> nn.Module:
-    """Standard multi-head self-attention (causal). Used for `attention`."""
+    """Standard multi-head self-attention (causal). Used for `attention`.
+
+    Honors params.pre_norm (default 'none', matches legacy behavior)
+    and params.post_norm (default 'rmsnorm', also matches legacy).
+    See cppmega_v4/buildspec/norm_validation.py for diagnostics.
+    """
     num_heads = params.get("num_heads", max(1, hidden_size // 64))
     head_dim = params.get("head_dim", hidden_size // num_heads)
     norm_eps = params.get("norm_eps", 1e-6)
+    pre_norm_kind = params.get("pre_norm", "none")
+    post_norm_kind = params.get("post_norm", "rmsnorm")
 
     class _SelfAttn(nn.Module):
         def __init__(self):
@@ -376,11 +406,16 @@ def _build_attention(hidden_size: int, params: dict) -> nn.Module:
             self.k_proj = nn.Linear(hidden_size, num_heads * head_dim, bias=False)
             self.v_proj = nn.Linear(hidden_size, num_heads * head_dim, bias=False)
             self.o_proj = nn.Linear(num_heads * head_dim, hidden_size, bias=False)
-            self.norm = nn.RMSNorm(hidden_size, eps=norm_eps)
+            self.pre_norm = _make_norm(pre_norm_kind, hidden_size, norm_eps)
+            # 'norm' alias preserves state-dict keys from earlier
+            # checkpoints where only one (post) norm existed.
+            self.norm = _make_norm(post_norm_kind, hidden_size, norm_eps)
             # Zero-init out so the block is identity at init.
             self.o_proj.weight = mx.zeros_like(self.o_proj.weight)
 
         def __call__(self, x):
+            if self.pre_norm is not None:
+                x = self.pre_norm(x)
             B, S, _ = x.shape
             q = self.q_proj(x).reshape(B, S, num_heads, head_dim)
             k = self.k_proj(x).reshape(B, S, num_heads, head_dim)
@@ -396,7 +431,10 @@ def _build_attention(hidden_size: int, params: dict) -> nn.Module:
             w = mx.softmax(scores.astype(mx.float32), axis=-1).astype(scores.dtype)
             o = mx.matmul(w, v)
             o = mx.transpose(o, (0, 2, 1, 3)).reshape(B, S, num_heads * head_dim)
-            return self.norm(self.o_proj(o))
+            o = self.o_proj(o)
+            if self.norm is not None:
+                o = self.norm(o)
+            return o
 
     return _SelfAttn()
 
