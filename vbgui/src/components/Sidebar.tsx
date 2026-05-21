@@ -6,12 +6,13 @@ import { ShardingTab, type ShardingProposalView } from "./sidebar/ShardingTab";
 import { GotchasTab } from "./sidebar/GotchasTab";
 import { DimensionsTab,
          type InferenceEntryClient } from "./sidebar/DimensionsTab";
+import { AblationsTab } from "./sidebar/AblationsTab";
 import type {
   GotchaState, LossState, OptimState, RewriterState, ShardingState,
 } from "@/state/spec";
 
 export type SidebarTab = "loss" | "optim" | "rewriters" | "sharding"
-                       | "gotchas" | "dimensions";
+                       | "gotchas" | "dimensions" | "ablations";
 
 export interface SidebarProps {
   loss: LossState;
@@ -47,6 +48,7 @@ const TAB_LABELS: { key: SidebarTab; label: string }[] = [
   { key: "sharding",   label: "Sharding" },
   { key: "gotchas",    label: "Gotchas" },
   { key: "dimensions", label: "Dimensions" },
+  { key: "ablations",  label: "Ablations" },
 ];
 
 export function Sidebar(p: SidebarProps): JSX.Element {
@@ -101,6 +103,13 @@ export function Sidebar(p: SidebarProps): JSX.Element {
         {active === "dimensions" && (
           <DimensionsTab log={p.inferenceLog ?? []}
                           onHighlight={p.onHighlightBrick} />
+        )}
+        {active === "ablations" && (
+          <AblationsTab rpc={p.rpc ?? null}
+                         nodes={p.graphNodes ?? []}
+                         edges={p.graphEdges ?? []}
+                         optim={p.optim}
+                         loss={p.loss} />
         )}
       </div>
     </aside>
