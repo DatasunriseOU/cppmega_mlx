@@ -253,6 +253,7 @@ export function App(): JSX.Element {
         loss: { kind: snap.spec.loss.kind,
                 head_outputs: snap.spec.loss.head_outputs },
         optim: { kind: snap.spec.optim.kind,
+                 gradient_clip_norm: snap.spec.optim.grad_clip_norm,
                  groups: snap.spec.optim.groups.map((g) => ({
                    matcher: g.matcher, lr: g.lr,
                    weight_decay: g.weight_decay,
@@ -481,6 +482,7 @@ function buildVerifyParams(
     loss: { kind: spec.loss.kind, head_outputs: spec.loss.head_outputs,
             params: spec.loss.params },
     optim: { kind: spec.optim.kind,
+             gradient_clip_norm: spec.optim.grad_clip_norm,
              groups: spec.optim.groups.map((g) => ({
                matcher: g.matcher, lr: g.lr,
                weight_decay: g.weight_decay, betas: g.betas,
