@@ -13,9 +13,9 @@
     "esModuleInterop": true,
     "skipLibCheck": true,
     "resolveJsonModule": true,
-    "types": ["vitest/globals"],
+    "types": ["vitest/globals", "node", "vite/client"],
     "baseUrl": ".",
     "paths": { "@/*": ["src/*"] }
   },
-  "include": ["src", "tests"]
+  "include": ["src", "tests", "e2e"]
 }

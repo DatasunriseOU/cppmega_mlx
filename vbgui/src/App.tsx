@@ -95,6 +95,8 @@ export function App(): JSX.Element {
   const [runError, setRunError] = useState<string | null>(null);
 
   const rpc = useRpc({
+    baseUrl: (import.meta.env.VITE_BACKEND_URL as string | undefined)
+              ?? "http://127.0.0.1:8765",
     enableWs: true,
     onBackendStatus: (s) => dispatch({ type: "backend.status", status: s }),
   });
@@ -185,18 +187,31 @@ export function App(): JSX.Element {
 
   const handlePresetDrop = useCallback(async (name: string) => {
     try {
+      // num_layers omitted → one repeat unit. Each preset's unit is the
+      // smallest topologically complete subgraph (some are 6+ bricks long
+      // for sliding/global patterns), so asking for num_layers=MINI_DEPTH
+      // would truncate to zero for those. Stick with the canonical unit.
       const r = await rpc.call<{ specs: BrickSpec[]; preset_name: string }>(
         "build_preset_specs",
-        { preset_name: name, hidden_size: MINI_HIDDEN,
-          num_layers: MINI_DEPTH },
+        { preset_name: name, hidden_size: MINI_HIDDEN },
       );
       const { nodes: ns, edges: es } = presetSpecsToNodes(r.specs);
       setNodes(ns);
       setEdges(es);
+      // Rebind loss.head_outputs to the last brick so verify_build_spec
+      // accepts the freshly-loaded preset (which doesn't define a node
+      // literally named "logits"). User can change this later via the
+      // Loss tab.
+      if (ns.length > 0) {
+        dispatch({ type: "loss.set", loss: {
+          ...spec.loss,
+          head_outputs: [ns[ns.length - 1].id],
+        }});
+      }
     } catch (e) {
       setRunError(String(e));
     }
-  }, [rpc]);
+  }, [rpc, spec.loss]);
 
   const requestSuggestSharding = useCallback(async () => {
     const snap = wireSpecRef.current;

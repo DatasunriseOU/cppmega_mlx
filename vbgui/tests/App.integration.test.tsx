@@ -65,7 +65,6 @@ describe("App integration — preset launcher", () => {
     expect(presetCall.params).toMatchObject({
       preset_name: "qwen3_next",
       hidden_size: 128,
-      num_layers: 2,
     });
   });
 });

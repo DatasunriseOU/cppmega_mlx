@@ -19,6 +19,12 @@ cppmega_mlx/training/native_optim/*.dylib
 cppmega_mlx/training/native_optim/*.metallib
 cppmega_v4/widget/static/
 
+# Visual Builder E2E artefacts (per-run output).
+vbgui/e2e/test-results/
+vbgui/e2e/screenshots/
+vbgui/e2e/logs/
+vbgui/e2e/playwright-report/
+
 # Local Metal GPU traces (multi-hundred-MB Apple Xcode capture bundles).
 *.gputrace
 docs/upstream/tilelang_metal_mamba3/captures/
