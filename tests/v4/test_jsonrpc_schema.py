@@ -10,6 +10,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
+from cppmega_v4.buildspec import DataMaterializationSpec, SideChannelSpec
 from cppmega_v4.jsonrpc import (
     EVENT_TAXONOMY,
     METHOD_REGISTRY,
@@ -28,7 +29,10 @@ from cppmega_v4.jsonrpc import (
 )
 from cppmega_v4.jsonrpc.schema import (
     EdgeResolution,
+    DataMaterializationSpecPayload,
+    FamilySpecPayload,
     GraphSpec,
+    InferenceEnrichmentSpecPayload,
     LossSpecPayload,
     OptimSpecPayload,
     PerBrickMemory,
@@ -37,6 +41,7 @@ from cppmega_v4.jsonrpc.schema import (
     PipelineRunResult,
     ResolvedGraph,
     ShardingSpecPayload,
+    SideChannelSpecPayload,
     StageResult,
     TopologyPayload,
 )
@@ -141,8 +146,13 @@ def test_verify_params_round_trip():
     parsed = VerifyParams.model_validate(payload)
     assert parsed.graph.nodes[0].id == "a"
     assert parsed.training is True
+    assert parsed.side_channels.mode == "auto"
+    assert parsed.side_channels.families["platform"].columns == [
+        "platform_ids", "source_platform_ids",
+    ]
     serial = parsed.model_dump(mode="json")
     assert "graph" in serial
+    assert serial["side_channels"]["families"]["structure"]["mode"] == "if_available"
 
 
 def test_verify_params_rejects_unknown_field():
@@ -150,6 +160,42 @@ def test_verify_params_rejects_unknown_field():
     payload["mystery"] = 1
     with pytest.raises(ValidationError):
         VerifyParams.model_validate(payload)
+
+
+def test_side_channel_payload_validates_policy_values():
+    payload = SideChannelSpecPayload(
+        families={
+            "platform": FamilySpecPayload(
+                mode="require",
+                columns=["platform_ids"],
+                dropout=0.2,
+                fallback="error",
+            ),
+            "syntax": FamilySpecPayload(mode="off"),
+        },
+        inference=InferenceEnrichmentSpecPayload(
+            source="prompt_only",
+            timeout_ms=250,
+        ),
+    )
+    assert payload.families["platform"].fallback == "error"
+
+    with pytest.raises(ValidationError):
+        FamilySpecPayload(mode="sometimes")
+    with pytest.raises(ValidationError):
+        FamilySpecPayload(dropout=1.1)
+    with pytest.raises(ValidationError):
+        InferenceEnrichmentSpecPayload(source="magic")
+
+
+def test_side_channel_payload_matches_buildspec_defaults():
+    payload = SideChannelSpecPayload.model_validate(SideChannelSpec().to_dict())
+    assert payload.model_dump(mode="json") == SideChannelSpec().to_dict()
+
+    materialization = DataMaterializationSpecPayload.model_validate(
+        DataMaterializationSpec().to_dict()
+    )
+    assert materialization.model_dump(mode="json") == DataMaterializationSpec().to_dict()
 
 
 def test_loss_spec_payload_accepts_known_kinds():

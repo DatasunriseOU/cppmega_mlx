@@ -224,6 +224,31 @@ class LMTokenBatch:
         return data
 
 
+_DOCUMENT_ID_ALIASES = ("document_ids", "doc_ids", "packing_document_ids")
+
+
+def _document_ids_from_mapping(batch: Mapping[str, Any]) -> Any | None:
+    present = [
+        alias
+        for alias in _DOCUMENT_ID_ALIASES
+        if alias in batch and batch[alias] is not None
+    ]
+    if len(present) > 1:
+        raise ValueError(
+            "only one document-id alias may be provided; got "
+            f"{', '.join(present)}"
+        )
+    if not present:
+        return None
+    alias = present[0]
+    value = batch[alias]
+    has_negative_doc = mx.any(value.astype(mx.int32) < 0)
+    mx.eval(has_negative_doc)
+    if bool(has_negative_doc.item()):
+        raise ValueError(f"{alias} must be non-negative")
+    return value
+
+
 def ensure_lm_batch(batch: LMTokenBatch | Mapping[str, Any] | mx.array) -> LMTokenBatch:
     """Normalize supported tiny-trainer batch inputs into LMTokenBatch."""
 
@@ -239,10 +264,7 @@ def ensure_lm_batch(batch: LMTokenBatch | Mapping[str, Any] | mx.array) -> LMTok
             target_tokens=batch.get("target_tokens", batch.get("target_ids")),
             attention_mask=batch.get("attention_mask"),
             loss_mask=batch.get("loss_mask"),
-            document_ids=batch.get(
-                "document_ids",
-                batch.get("doc_ids", batch.get("packing_document_ids")),
-            ),
+            document_ids=_document_ids_from_mapping(batch),
             structure_ids=batch.get("structure_ids"),
             dep_levels=batch.get("dep_levels"),
             ast_depth_ids=batch.get("ast_depth_ids"),

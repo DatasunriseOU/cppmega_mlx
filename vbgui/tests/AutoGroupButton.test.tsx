@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { AutoGroupButton } from "@/components/AutoGroupButton";
 import type { Node, Edge } from "@xyflow/react";
+import type { RpcClient } from "@/lib/rpc";
 
 const NODES: Node[] = [
   { id: "attn", type: "brick", position: { x: 0, y: 0 }, data: { kind: "attention" } },
@@ -24,8 +25,8 @@ const FAKE_RESULT = {
   uncovered_params: 0,
 };
 
-function fakeRpc(payload: unknown) {
-  return { call: vi.fn(async () => payload) } as never;
+function fakeRpc(payload: unknown): RpcClient {
+  return { call: vi.fn(async () => payload) } as unknown as RpcClient;
 }
 
 describe("AutoGroupButton", () => {
@@ -63,7 +64,9 @@ describe("AutoGroupButton", () => {
   });
 
   it("shows error on RPC failure", async () => {
-    const rpc = { call: vi.fn(async () => { throw new Error("boom"); }) } as never;
+    const rpc = {
+      call: vi.fn(async () => { throw new Error("boom"); }),
+    } as unknown as RpcClient;
     render(<AutoGroupButton rpc={rpc}
                              optimKind="adamw"
                              nodes={NODES} edges={EDGES}
@@ -76,7 +79,9 @@ describe("AutoGroupButton", () => {
   });
 
   it("button label shows Analysing… during pending RPC", async () => {
-    const rpc = { call: vi.fn(() => new Promise(() => {})) } as never;
+    const rpc = {
+      call: vi.fn(() => new Promise(() => {})),
+    } as unknown as RpcClient;
     render(<AutoGroupButton rpc={rpc}
                              optimKind="adamw"
                              nodes={NODES} edges={EDGES}

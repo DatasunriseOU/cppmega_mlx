@@ -397,3 +397,37 @@ def test_compile_receipt_can_execute_tiny_banked_abi_runtime_smoke(
         tuple(entry["shape"]) for entry in smoke["buffer_abi"]
     ]
     assert captured["kwargs"]["target"] == "metal"
+
+
+def test_runtime_smoke_binds_artifact_through_m04_fused_train_block_route(
+    tmp_path: Path,
+) -> None:
+    def fake_artifact(*_args: object) -> list[object]:
+        return []
+
+    def fake_lowerer(func_or_mod: object, **kwargs: object) -> object:
+        del func_or_mod, kwargs
+        return fake_artifact
+
+    exit_code, payload = path_c_fusion_compile_receipt.build_compile_receipt(
+        native_compile=False,
+        source_out=tmp_path / "generated.py",
+        runtime_smoke="tiny",
+        runtime_smoke_lowerer=fake_lowerer,
+    )
+
+    smoke = payload["runtime_smoke"]
+    fused_route = smoke["fused_train_block_route"]
+
+    assert exit_code == 0
+    assert smoke["status"] == "ok"
+    assert fused_route["status"] == "ok"
+    assert fused_route["install"]["status"] == "ok"
+    assert fused_route["install"]["runtime_uses_fused_train_block"] is True
+    assert fused_route["install"]["hidden_packing_performed"] is False
+    assert fused_route["route"]["selected_action"] == (
+        "run_path_c_fused_train_block_route"
+    )
+    assert fused_route["route"]["path_c_fusion"]["runtime_training_binding"][
+        "runtime_uses_fused_train_block"
+    ] is True

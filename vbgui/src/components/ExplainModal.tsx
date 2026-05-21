@@ -1,7 +1,7 @@
 // ExplainModal — full ExplainEntry display with "Apply recommended"
 // button for optimizer/schedule entries.
 
-import { useCatalog, type ExplainEntryClient } from "@/hooks/useCatalog";
+import { useCatalog } from "@/hooks/useCatalog";
 import type { RpcClient } from "@/lib/rpc";
 
 export interface ExplainModalProps {

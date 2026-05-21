@@ -47,6 +47,7 @@ from cppmega_mlx.runtime.path_c_fusion_schedules import (  # noqa: E402
     select_path_c_fusion_schedule_target,
 )
 from cppmega_mlx.runtime.path_c_physical_abi import (  # noqa: E402
+    make_physical_abi_bank_owner,
     physical_abi_full_runtime_kernel_args,
     plan_physical_abi_runtime_bridge,
     validate_physical_abi_map,
@@ -998,7 +999,7 @@ def _buffer_abi_payload(prim_func: Any) -> tuple[list[dict[str, Any]], int]:
     return entries, total_bytes
 
 
-def _tiny_runtime_smoke_region_and_target() -> tuple[Any, Any]:
+def _tiny_runtime_smoke_region_target_model() -> tuple[Any, Any, Any]:
     profile = local_gb10_quarter_profile()
     cfg = profile.tiny_smoke_config(
         pattern="MRA",
@@ -1013,7 +1014,13 @@ def _tiny_runtime_smoke_region_and_target() -> tuple[Any, Any]:
         m2rnn_k_head_dim=8,
         m2rnn_v_head_dim=8,
     )
-    model = SimpleNamespace(route_symbols=("M", "R", "A"), config=cfg)
+    model = SimpleNamespace(
+        name="runtime_smoke",
+        path_c_profile_name="runtime_smoke",
+        path_c_input_model_name="runtime_smoke.path_c_bricks",
+        route_symbols=("M", "R", "A"),
+        config=cfg,
+    )
     regions = build_path_c_model_regions_from_model(
         model,
         region_prefix="runtime_smoke",
@@ -1021,20 +1028,30 @@ def _tiny_runtime_smoke_region_and_target() -> tuple[Any, Any]:
     )
     if not regions:
         raise RuntimeError("tiny MRA smoke model did not produce a Path C region")
-    region = regions[0]
+    region = build_path_c_aot_autograd_region(regions[0])
     target = select_path_c_fusion_schedule_target(region)
     if target is None:
         raise RuntimeError("tiny MRA smoke region did not resolve to a schedule target")
+    return region, target, model
+
+
+def _tiny_runtime_smoke_region_and_target() -> tuple[Any, Any]:
+    region, target, _model = _tiny_runtime_smoke_region_target_model()
     return region, target
 
 
-def _runtime_smoke_region_and_target(mode: str) -> tuple[Any, Any]:
+def _runtime_smoke_region_target_model(mode: str) -> tuple[Any, Any, Any]:
     if mode == "production":
         _profile, _model, _fwd_region, region, target = (
             _selected_region_and_target()
         )
-        return region, target
-    return _tiny_runtime_smoke_region_and_target()
+        return region, target, _model
+    return _tiny_runtime_smoke_region_target_model()
+
+
+def _runtime_smoke_region_and_target(mode: str) -> tuple[Any, Any]:
+    region, target, _model = _runtime_smoke_region_target_model(mode)
+    return region, target
 
 
 def _mlx_dtype(dtype: str) -> Any:
@@ -1076,6 +1093,101 @@ def _artifact_kernel_source_stats(artifact: Any) -> dict[str, Any]:
     return stats
 
 
+def _runtime_smoke_route_args(mode: str) -> SimpleNamespace:
+    if mode == "production":
+        profile = local_gb10_quarter_profile()
+        return SimpleNamespace(
+            dtype="fp8_path_c",
+            model_profile="local_gb10_quarter",
+            seq_len=1,
+            pattern=profile.pattern,
+            depth=profile.depth,
+            dsa_a_layer_ranks=profile.dsa_a_layer_ranks,
+        )
+    return SimpleNamespace(
+        dtype="fp8_path_c",
+        model_profile="runtime_smoke",
+        seq_len=1,
+        pattern="MRA",
+        depth=3,
+        dsa_a_layer_ranks=(0,),
+    )
+
+
+def _runtime_smoke_fused_train_block_route_payload(
+    *,
+    mode: str,
+    model: Any,
+    artifact: Any,
+    physical_buffer_abi_map: Mapping[str, Any],
+    physical_buffer_abi_shapes: Mapping[str, Any],
+    physical_bank_buffers: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Bind the smoke artifact through the m04 fused train-block route."""
+
+    try:
+        from scripts import m04_train_step  # noqa: PLC0415
+
+        profile_name = str(
+            getattr(model, "path_c_profile_name", None)
+            or getattr(model, "name", "runtime_smoke")
+        )
+        bank_owner = make_physical_abi_bank_owner(
+            f"{profile_name}.path_c_physical_abi_banks",
+            physical_buffer_abi_map,
+            physical_buffer_abi_shapes,
+            physical_bank_buffers,
+        )
+        install = m04_train_step.install_path_c_fused_train_block_runtime_for_model(
+            model=model,
+            bank_owner=bank_owner,
+            fused_artifact=artifact,
+            sequence_length=None,
+        )
+        route = m04_train_step.fp8_path_c_training_route_payload_for_model(
+            _runtime_smoke_route_args(mode),
+            model,
+        )
+        runtime_binding = dict(
+            route.get("path_c_fusion", {}).get("runtime_training_binding", {})
+        )
+        selected_action = route.get("selected_action")
+        status = (
+            "ok"
+            if install.get("status") == "ok"
+            and selected_action == "run_path_c_fused_train_block_route"
+            and runtime_binding.get("runtime_uses_fused_train_block") is True
+            else "blocked"
+        )
+        return {
+            "status": status,
+            "install": install,
+            "route": {
+                "status": route.get("status"),
+                "selected_action": selected_action,
+                "full_end_to_end_training_available": route.get(
+                    "full_end_to_end_training_available"
+                ),
+                "single_fused_train_block_runtime_available": route.get(
+                    "single_fused_train_block_runtime_available"
+                ),
+                "path_c_fusion": {
+                    "runtime_training_binding": runtime_binding,
+                },
+            },
+            "hidden_packing_performed": bool(
+                install.get("hidden_packing_performed", False)
+                or runtime_binding.get("hidden_packing_performed", False)
+            ),
+        }
+    except Exception as exc:
+        return {
+            "status": "unavailable",
+            "error": f"{type(exc).__name__}: {exc}",
+            "hidden_packing_performed": False,
+        }
+
+
 def _runtime_smoke_payload(
     *,
     mode: str,
@@ -1106,7 +1218,7 @@ def _runtime_smoke_payload(
     total_bytes: int | None = None
     smoke_mode = "production_1b" if mode == "production" else "tiny_mra"
     try:
-        region, target = _runtime_smoke_region_and_target(mode)
+        region, target, model = _runtime_smoke_region_target_model(mode)
         prim_func = target.schedule_template(region)
         buffer_abi, total_bytes = _buffer_abi_payload(prim_func)
         if total_bytes > max_bytes:
@@ -1205,6 +1317,14 @@ def _runtime_smoke_payload(
             physical_buffer_abi_shapes,
             physical_bank_buffers,
         )
+        fused_train_block_route = _runtime_smoke_fused_train_block_route_payload(
+            mode=mode,
+            model=model,
+            artifact=artifact,
+            physical_buffer_abi_map=physical_buffer_abi_map,
+            physical_buffer_abi_shapes=physical_buffer_abi_shapes,
+            physical_bank_buffers=physical_bank_buffers,
+        )
         kernel_buffer_order = tuple(str(entry["name"]) for entry in buffer_abi)
         arrays = list(
             physical_abi_full_runtime_kernel_args(
@@ -1235,6 +1355,7 @@ def _runtime_smoke_payload(
                 "unknown",
             ),
             "physical_abi_runtime_binding": physical_abi_runtime_binding,
+            "fused_train_block_route": fused_train_block_route,
             "runtime_kernel_buffers": list(kernel_buffer_order),
             "kernel_parameter_count": _kernel_parameter_count(prim_func),
             "logical_parameter_count": len(

@@ -307,9 +307,10 @@ def _dispatch_m2rnn_scan(
 ) -> tuple[mx.array, mx.array]:
     """Route the M2RNN scan according to :class:`KernelPath`.
 
-    AUTO/PATH_B use the Path B Metal kernel when available. REFERENCE always
-    uses the pure-MLX :func:`chunked_m2rnn_scan`. PATH_C is explicit and
-    fail-closed.
+    AUTO uses the retired Path B status seam only when it is available,
+    otherwise it falls back to the pure-MLX :func:`chunked_m2rnn_scan`.
+    PATH_B and PATH_C are explicit and fail-closed when their native routes
+    are unavailable.
     """
 
     from cppmega_mlx.runtime.kernel_policy import (

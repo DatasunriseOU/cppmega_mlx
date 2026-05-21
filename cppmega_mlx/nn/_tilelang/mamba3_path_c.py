@@ -142,22 +142,22 @@ _BWD_SIMD_OUTPUT_IDX = (9, 10, 11, 12, 13, 14, 15, 16)
 _BWD_PARTIAL_OUTPUT_NAMES = (
     "dx",
     "dz",
-    "dB_partial",
-    "dC_partial",
-    "dA_partial",
-    "ddt_partial",
-    "dD_partial",
+    "dB_lane_grad",
+    "dC_lane_grad",
+    "dA_lane_grad",
+    "ddt_lane_grad",
+    "dD_lane_grad",
     "dh0",
 )
 _BWD_PARTIAL_OUTPUT_IDX = (9, 10, 11, 12, 13, 14, 15, 16)
 _BWD_SCRATCH_OUTPUT_NAMES = (
     "dx",
     "dz",
-    "dB_partial",
-    "dC_partial",
-    "dA_partial",
-    "ddt_partial",
-    "dD_partial",
+    "dB_lane_grad",
+    "dC_lane_grad",
+    "dA_lane_grad",
+    "ddt_lane_grad",
+    "dD_lane_grad",
     "dh0",
 )
 _BWD_SCRATCH_OUTPUT_IDX = (9, 10, 11, 12, 13, 14, 15, 16)
@@ -689,7 +689,7 @@ def mamba3_mimo_path_c_status() -> Mamba3PathCStatus:
         return Mamba3PathCStatus(available=False, reason=reason)
     try:
         fwd_kernel, fwd_lowering = _fwd_kernel_for(1, 4, 1, 2, 4, return_msl=True)
-        bwd_kernel, bwd_lowering = _bwd_partial_kernel_for_state_snapshots(
+        bwd_kernel, bwd_lowering = _bwd_lane_grad_kernel_for_state_snapshots(
             1, 4, 1, 2, 4
         )
         del fwd_kernel, bwd_kernel
@@ -728,7 +728,7 @@ def _is_power_of_two(value: int) -> bool:
     return value > 0 and (value & (value - 1)) == 0
 
 
-def _bwd_partial_dtypes_for_input_dtypes(
+def _bwd_lane_grad_dtypes_for_input_dtypes(
     dtypes: dict[str, str],
 ) -> tuple[str, str, str, str, str]:
     if all(
@@ -1734,7 +1734,7 @@ def _bwd_simd_reduce_kernel_for_state_snapshots(
 
 
 @lru_cache(maxsize=128)
-def _bwd_partial_kernel_for_state_snapshots(
+def _bwd_lane_grad_kernel_for_state_snapshots(
     BATCH: int,
     SEQ: int,
     HEADS: int,
@@ -1781,7 +1781,7 @@ def _bwd_partial_kernel_for_state_snapshots(
     accum_dtype = "float32"
 
     @T.prim_func
-    def bwd_partial(
+    def bwd_lane_grad(
         dy: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), dy_dtype),
         x: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), x_dtype),
         B: T.Tensor((BATCH, SEQ, HEADS, STATE), B_dtype),
@@ -1793,11 +1793,11 @@ def _bwd_partial_kernel_for_state_snapshots(
         h_snap: T.Tensor((BATCH, SEQ + 1, HEADS, HEADDIM, STATE), h_snap_dtype),
         dx: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), dx_dtype),
         dz: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), dz_dtype),
-        dB_partial: T.Tensor((BATCH, SEQ, HEADS, STATE, HEADDIM), dB_dtype),
-        dC_partial: T.Tensor((BATCH, SEQ, HEADS, STATE, HEADDIM), dC_dtype),
-        dA_partial: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), dA_dtype),
-        ddt_partial: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), ddt_dtype),
-        dD_partial: T.Tensor((BATCH, HEADS, HEADDIM), dD_dtype),
+        dB_lane_grad: T.Tensor((BATCH, SEQ, HEADS, STATE, HEADDIM), dB_dtype),
+        dC_lane_grad: T.Tensor((BATCH, SEQ, HEADS, STATE, HEADDIM), dC_dtype),
+        dA_lane_grad: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), dA_dtype),
+        ddt_lane_grad: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), ddt_dtype),
+        dD_lane_grad: T.Tensor((BATCH, HEADS, HEADDIM), dD_dtype),
         dh0: T.Tensor((BATCH, HEADS, HEADDIM, STATE), dh0_dtype),
     ):
         with T.Kernel(T.ceildiv(LANES, THREADS), threads=THREADS) as _bx:
@@ -1851,11 +1851,11 @@ def _bwd_partial_kernel_for_state_snapshots(
                         B_val = T.cast(B[b, t, h, n], accum_dtype)
                         h_prev = T.cast(h_snap[b, t, h, p, n], accum_dtype)
                         dh_n = dh[n] + d_y_skipped * C_val
-                        dC_partial[b, t, h, n, p] = T.cast(
+                        dC_lane_grad[b, t, h, n, p] = T.cast(
                             d_y_skipped * h_state[n],
                             dC_dtype,
                         )
-                        dB_partial[b, t, h, n, p] = T.cast(
+                        dB_lane_grad[b, t, h, n, p] = T.cast(
                             dh_n * x_val,
                             dB_dtype,
                         )
@@ -1868,14 +1868,14 @@ def _bwd_partial_kernel_for_state_snapshots(
                     dx[b, t, h, p] = T.cast(dx_skip + dx_inp, dx_dtype)
 
                     d_logdecay = d_decay * decay
-                    dA_partial[b, t, h, p] = T.cast(d_logdecay * dt_val, dA_dtype)
-                    ddt_partial[b, t, h, p] = T.cast(d_logdecay * A_val, ddt_dtype)
+                    dA_lane_grad[b, t, h, p] = T.cast(d_logdecay * dt_val, dA_dtype)
+                    ddt_lane_grad[b, t, h, p] = T.cast(d_logdecay * A_val, ddt_dtype)
 
                 for n in T.serial(STATE):
                     dh0[b, h, p, n] = T.cast(dh[n], dh0_dtype)
-                dD_partial[b, h, p] = T.cast(dD_acc, dD_dtype)
+                dD_lane_grad[b, h, p] = T.cast(dD_acc, dD_dtype)
 
-    artifact = dispatch_lower(bwd_partial, target="metal", return_msl=True)
+    artifact = dispatch_lower(bwd_lane_grad, target="metal", return_msl=True)
     if hasattr(artifact, "_tilelang_engine_target"):
         raise MSLDispatchUnsupported("Mamba3 Path C requires TileLang MSL extraction metadata")
     lowering = cast(_msl_transform.TileLangMSLLowering, artifact)
@@ -1890,7 +1890,7 @@ def _bwd_partial_kernel_for_state_snapshots(
     import tilelang
 
     kernel = tilelang.compile(
-        bwd_partial,
+        bwd_lane_grad,
         target=_msl_transform._as_metal_target("metal"),
         execution_backend="tvm_ffi",
         out_idx=list(_BWD_PARTIAL_OUTPUT_IDX),
@@ -1945,11 +1945,11 @@ def _bwd_scratch_partial_kernel_for(
         h0: T.Tensor((BATCH, HEADS, HEADDIM, STATE), h0_dtype),
         dx: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), dx_dtype),
         dz: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), dz_dtype),
-        dB_partial: T.Tensor((BATCH, SEQ, HEADS, STATE, HEADDIM), dB_dtype),
-        dC_partial: T.Tensor((BATCH, SEQ, HEADS, STATE, HEADDIM), dC_dtype),
-        dA_partial: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), dA_dtype),
-        ddt_partial: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), ddt_dtype),
-        dD_partial: T.Tensor((BATCH, HEADS, HEADDIM), dD_dtype),
+        dB_lane_grad: T.Tensor((BATCH, SEQ, HEADS, STATE, HEADDIM), dB_dtype),
+        dC_lane_grad: T.Tensor((BATCH, SEQ, HEADS, STATE, HEADDIM), dC_dtype),
+        dA_lane_grad: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), dA_dtype),
+        ddt_lane_grad: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), ddt_dtype),
+        dD_lane_grad: T.Tensor((BATCH, HEADS, HEADDIM), dD_dtype),
         dh0: T.Tensor((BATCH, HEADS, HEADDIM, STATE), dh0_dtype),
     ):
         h_steps_scratch = T.alloc_global(
@@ -2029,11 +2029,11 @@ def _bwd_scratch_partial_kernel_for(
                             accum_dtype,
                         )
                         dh_n = dh[n] + d_y_skipped * C_val
-                        dC_partial[b, t, h, n, p] = T.cast(
+                        dC_lane_grad[b, t, h, n, p] = T.cast(
                             d_y_skipped * h_state[n],
                             dC_dtype,
                         )
-                        dB_partial[b, t, h, n, p] = T.cast(
+                        dB_lane_grad[b, t, h, n, p] = T.cast(
                             dh_n * x_val,
                             dB_dtype,
                         )
@@ -2046,12 +2046,12 @@ def _bwd_scratch_partial_kernel_for(
                     dx[b, t, h, p] = T.cast(dx_skip + dx_inp, dx_dtype)
 
                     d_logdecay = d_decay * decay
-                    dA_partial[b, t, h, p] = T.cast(d_logdecay * dt_val, dA_dtype)
-                    ddt_partial[b, t, h, p] = T.cast(d_logdecay * A_val, ddt_dtype)
+                    dA_lane_grad[b, t, h, p] = T.cast(d_logdecay * dt_val, dA_dtype)
+                    ddt_lane_grad[b, t, h, p] = T.cast(d_logdecay * A_val, ddt_dtype)
 
                 for n in T.serial(STATE):
                     dh0[b, h, p, n] = T.cast(dh[n], dh0_dtype)
-                dD_partial[b, h, p] = T.cast(dD_acc, dD_dtype)
+                dD_lane_grad[b, h, p] = T.cast(dD_acc, dD_dtype)
 
     artifact = dispatch_lower(bwd_scratch, target="metal", return_msl=True)
     if hasattr(artifact, "_tilelang_engine_target"):
@@ -2080,7 +2080,7 @@ def _bwd_scratch_partial_kernel_for(
 
 
 @lru_cache(maxsize=128)
-def _bwd_partial_reduce_kernel_for(
+def _bwd_lane_grad_reduce_kernel_for(
     BATCH: int,
     SEQ: int,
     HEADS: int,
@@ -2108,12 +2108,12 @@ def _bwd_partial_reduce_kernel_for(
     THREADS = _threads_for(LANES)
 
     @T.prim_func
-    def bwd_partial_reduce(
-        dB_partial: T.Tensor((BATCH, SEQ, HEADS, STATE, HEADDIM), dB_dtype),
-        dC_partial: T.Tensor((BATCH, SEQ, HEADS, STATE, HEADDIM), dC_dtype),
-        dA_partial: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), dA_dtype),
-        ddt_partial: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), ddt_dtype),
-        dD_partial: T.Tensor((BATCH, HEADS, HEADDIM), dD_dtype),
+    def bwd_lane_grad_reduce(
+        dB_lane_grad: T.Tensor((BATCH, SEQ, HEADS, STATE, HEADDIM), dB_dtype),
+        dC_lane_grad: T.Tensor((BATCH, SEQ, HEADS, STATE, HEADDIM), dC_dtype),
+        dA_lane_grad: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), dA_dtype),
+        ddt_lane_grad: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), ddt_dtype),
+        dD_lane_grad: T.Tensor((BATCH, HEADS, HEADDIM), dD_dtype),
         dB: T.Tensor((BATCH, SEQ, HEADS, STATE), out_dB_dtype),
         dC: T.Tensor((BATCH, SEQ, HEADS, STATE), out_dC_dtype),
         dA: T.Tensor((BATCH, SEQ, HEADS), out_dA_dtype),
@@ -2130,8 +2130,8 @@ def _bwd_partial_reduce_kernel_for(
                 dB_sum = T.alloc_var(T.float32, init=0.0)
                 dC_sum = T.alloc_var(T.float32, init=0.0)
                 for p in T.serial(HEADDIM):
-                    dB_sum += T.cast(dB_partial[b, t, h, n, p], "float32")
-                    dC_sum += T.cast(dC_partial[b, t, h, n, p], "float32")
+                    dB_sum += T.cast(dB_lane_grad[b, t, h, n, p], "float32")
+                    dC_sum += T.cast(dC_lane_grad[b, t, h, n, p], "float32")
                 dB[b, t, h, n] = T.cast(dB_sum, out_dB_dtype)
                 dC[b, t, h, n] = T.cast(dC_sum, out_dC_dtype)
 
@@ -2142,8 +2142,8 @@ def _bwd_partial_reduce_kernel_for(
                 dA_sum = T.alloc_var(T.float32, init=0.0)
                 ddt_sum = T.alloc_var(T.float32, init=0.0)
                 for p in T.serial(HEADDIM):
-                    dA_sum += T.cast(dA_partial[b, t, h, p], "float32")
-                    ddt_sum += T.cast(ddt_partial[b, t, h, p], "float32")
+                    dA_sum += T.cast(dA_lane_grad[b, t, h, p], "float32")
+                    ddt_sum += T.cast(ddt_lane_grad[b, t, h, p], "float32")
                 dA[b, t, h] = T.cast(dA_sum, out_dA_dtype)
                 ddt[b, t, h] = T.cast(ddt_sum, out_ddt_dtype)
 
@@ -2152,10 +2152,10 @@ def _bwd_partial_reduce_kernel_for(
                 dD_sum = T.alloc_var(T.float32, init=0.0)
                 for b in T.serial(BATCH):
                     for p in T.serial(HEADDIM):
-                        dD_sum += T.cast(dD_partial[b, h, p], "float32")
+                        dD_sum += T.cast(dD_lane_grad[b, h, p], "float32")
                 dD[h] = T.cast(dD_sum, out_dD_dtype)
 
-    artifact = dispatch_lower(bwd_partial_reduce, target="metal", return_msl=True)
+    artifact = dispatch_lower(bwd_lane_grad_reduce, target="metal", return_msl=True)
     if hasattr(artifact, "_tilelang_engine_target"):
         raise MSLDispatchUnsupported("Mamba3 Path C requires TileLang MSL extraction metadata")
     lowering = cast(_msl_transform.TileLangMSLLowering, artifact)
@@ -2163,11 +2163,11 @@ def _bwd_partial_reduce_kernel_for(
         name for name in lowering.buffer_param_names if name not in _BWD_REDUCE_OUTPUT_NAMES
     ]
     if set(input_names) != {
-        "dB_partial",
-        "dC_partial",
-        "dA_partial",
-        "ddt_partial",
-        "dD_partial",
+        "dB_lane_grad",
+        "dC_lane_grad",
+        "dA_lane_grad",
+        "ddt_lane_grad",
+        "dD_lane_grad",
     }:
         raise MSLDispatchUnsupported(
             "unexpected Mamba3 Path C partial reducer buffer signature: "
@@ -2176,7 +2176,7 @@ def _bwd_partial_reduce_kernel_for(
     import tilelang
 
     kernel = tilelang.compile(
-        bwd_partial_reduce,
+        bwd_lane_grad_reduce,
         target=_msl_transform._as_metal_target("metal"),
         execution_backend="tvm_ffi",
         out_idx=list(_BWD_REDUCE_OUTPUT_IDX),
@@ -2185,7 +2185,7 @@ def _bwd_partial_reduce_kernel_for(
 
 
 @lru_cache(maxsize=128)
-def _bwd_partial_reduce_threaded_kernel_for(
+def _bwd_lane_grad_reduce_threaded_kernel_for(
     BATCH: int,
     SEQ: int,
     HEADS: int,
@@ -2221,12 +2221,12 @@ def _bwd_partial_reduce_threaded_kernel_for(
     ROWS_PER_BLOCK = max(1, _REDUCE_MAX_THREADS // HEADDIM)
 
     @T.prim_func
-    def bwd_partial_reduce_threaded(
-        dB_partial: T.Tensor((BATCH, SEQ, HEADS, STATE, HEADDIM), dB_dtype),
-        dC_partial: T.Tensor((BATCH, SEQ, HEADS, STATE, HEADDIM), dC_dtype),
-        dA_partial: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), dA_dtype),
-        ddt_partial: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), ddt_dtype),
-        dD_partial: T.Tensor((BATCH, HEADS, HEADDIM), dD_dtype),
+    def bwd_lane_grad_reduce_threaded(
+        dB_lane_grad: T.Tensor((BATCH, SEQ, HEADS, STATE, HEADDIM), dB_dtype),
+        dC_lane_grad: T.Tensor((BATCH, SEQ, HEADS, STATE, HEADDIM), dC_dtype),
+        dA_lane_grad: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), dA_dtype),
+        ddt_lane_grad: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), ddt_dtype),
+        dD_lane_grad: T.Tensor((BATCH, HEADS, HEADDIM), dD_dtype),
         dB: T.Tensor((BATCH, SEQ, HEADS, STATE), out_dB_dtype),
         dC: T.Tensor((BATCH, SEQ, HEADS, STATE), out_dC_dtype),
         dA: T.Tensor((BATCH, SEQ, HEADS), out_dA_dtype),
@@ -2248,8 +2248,8 @@ def _bwd_partial_reduce_threaded_kernel_for(
                 dC_acc = T.alloc_local((1,), T.float32)
                 dB_reduced = T.alloc_local((1,), T.float32)
                 dC_reduced = T.alloc_local((1,), T.float32)
-                dB_acc[0] = T.cast(dB_partial[b, t, h, n, p], "float32")
-                dC_acc[0] = T.cast(dC_partial[b, t, h, n, p], "float32")
+                dB_acc[0] = T.cast(dB_lane_grad[b, t, h, n, p], "float32")
+                dC_acc[0] = T.cast(dC_lane_grad[b, t, h, n, p], "float32")
                 T.thread_reduce(dB_acc[0], dB_reduced[0], reduce_axis, op="sum")
                 T.thread_reduce(dC_acc[0], dC_reduced[0], reduce_axis, op="sum")
                 if p == 0:
@@ -2264,8 +2264,8 @@ def _bwd_partial_reduce_threaded_kernel_for(
                 ddt_acc = T.alloc_local((1,), T.float32)
                 dA_reduced = T.alloc_local((1,), T.float32)
                 ddt_reduced = T.alloc_local((1,), T.float32)
-                dA_acc[0] = T.cast(dA_partial[b, t, h, p], "float32")
-                ddt_acc[0] = T.cast(ddt_partial[b, t, h, p], "float32")
+                dA_acc[0] = T.cast(dA_lane_grad[b, t, h, p], "float32")
+                ddt_acc[0] = T.cast(ddt_lane_grad[b, t, h, p], "float32")
                 T.thread_reduce(dA_acc[0], dA_reduced[0], reduce_axis, op="sum")
                 T.thread_reduce(ddt_acc[0], ddt_reduced[0], reduce_axis, op="sum")
                 if p == 0:
@@ -2278,12 +2278,12 @@ def _bwd_partial_reduce_threaded_kernel_for(
                 dD_reduced = T.alloc_local((1,), T.float32)
                 dD_acc[0] = 0.0
                 for b in T.serial(BATCH):
-                    dD_acc[0] += T.cast(dD_partial[b, h, p], "float32")
+                    dD_acc[0] += T.cast(dD_lane_grad[b, h, p], "float32")
                 T.thread_reduce(dD_acc[0], dD_reduced[0], reduce_axis, op="sum")
                 if p == 0:
                     dD[h] = T.cast(dD_reduced[0], out_dD_dtype)
 
-    artifact = dispatch_lower(bwd_partial_reduce_threaded, target="metal", return_msl=True)
+    artifact = dispatch_lower(bwd_lane_grad_reduce_threaded, target="metal", return_msl=True)
     if hasattr(artifact, "_tilelang_engine_target"):
         raise MSLDispatchUnsupported("Mamba3 Path C requires TileLang MSL extraction metadata")
     lowering = cast(_msl_transform.TileLangMSLLowering, artifact)
@@ -2291,11 +2291,11 @@ def _bwd_partial_reduce_threaded_kernel_for(
         name for name in lowering.buffer_param_names if name not in _BWD_REDUCE_OUTPUT_NAMES
     ]
     if set(input_names) != {
-        "dB_partial",
-        "dC_partial",
-        "dA_partial",
-        "ddt_partial",
-        "dD_partial",
+        "dB_lane_grad",
+        "dC_lane_grad",
+        "dA_lane_grad",
+        "ddt_lane_grad",
+        "dD_lane_grad",
     }:
         raise MSLDispatchUnsupported(
             "unexpected Mamba3 Path C threaded partial reducer buffer signature: "
@@ -2304,7 +2304,7 @@ def _bwd_partial_reduce_threaded_kernel_for(
     import tilelang
 
     kernel = tilelang.compile(
-        bwd_partial_reduce_threaded,
+        bwd_lane_grad_reduce_threaded,
         target=_msl_transform._as_metal_target("metal"),
         execution_backend="tvm_ffi",
         out_idx=list(_BWD_REDUCE_OUTPUT_IDX),
@@ -2367,45 +2367,45 @@ def _astype_if_needed(array: mx.array, dtype: mx.Dtype) -> mx.array:
     return array if array.dtype == dtype else array.astype(dtype)
 
 
-def _reduce_bwd_partials_path_c_kernel(
-    dB_partial: mx.array,
-    dC_partial: mx.array,
-    dA_partial: mx.array,
-    ddt_partial: mx.array,
-    dD_partial: mx.array,
+def _reduce_bwd_lane_grads_path_c_kernel(
+    dB_lane_grad: mx.array,
+    dC_lane_grad: mx.array,
+    dA_lane_grad: mx.array,
+    ddt_lane_grad: mx.array,
+    dD_lane_grad: mx.array,
     *,
     output_dtypes: tuple[str, str, str, str, str] | None = None,
 ) -> tuple[mx.array, mx.array, mx.array, mx.array, mx.array]:
     """Reduce bwd partial gradients over P with a serial TileLang kernel."""
 
-    if len(dB_partial.shape) != 5:
+    if len(dB_lane_grad.shape) != 5:
         raise ValueError(
-            "mamba3_mimo_bwd_path_c partial reducer expects dB_partial shape "
+            "mamba3_mimo_bwd_path_c partial reducer expects dB_lane_grad shape "
             "(B, T, H, N, P)"
         )
-    batch, seq, heads, state, headdim = map(int, dB_partial.shape)
+    batch, seq, heads, state, headdim = map(int, dB_lane_grad.shape)
     expected_c = (batch, seq, heads, state, headdim)
     expected_lane = (batch, seq, heads, headdim)
     expected_d = (batch, heads, headdim)
-    if tuple(dC_partial.shape) != expected_c:
+    if tuple(dC_lane_grad.shape) != expected_c:
         raise ValueError(
-            "mamba3_mimo_bwd_path_c partial reducer expects dC_partial shape "
-            f"{expected_c}; got {tuple(dC_partial.shape)}"
+            "mamba3_mimo_bwd_path_c partial reducer expects dC_lane_grad shape "
+            f"{expected_c}; got {tuple(dC_lane_grad.shape)}"
         )
-    if tuple(dA_partial.shape) != expected_lane:
+    if tuple(dA_lane_grad.shape) != expected_lane:
         raise ValueError(
-            "mamba3_mimo_bwd_path_c partial reducer expects dA_partial shape "
-            f"{expected_lane}; got {tuple(dA_partial.shape)}"
+            "mamba3_mimo_bwd_path_c partial reducer expects dA_lane_grad shape "
+            f"{expected_lane}; got {tuple(dA_lane_grad.shape)}"
         )
-    if tuple(ddt_partial.shape) != expected_lane:
+    if tuple(ddt_lane_grad.shape) != expected_lane:
         raise ValueError(
-            "mamba3_mimo_bwd_path_c partial reducer expects ddt_partial shape "
-            f"{expected_lane}; got {tuple(ddt_partial.shape)}"
+            "mamba3_mimo_bwd_path_c partial reducer expects ddt_lane_grad shape "
+            f"{expected_lane}; got {tuple(ddt_lane_grad.shape)}"
         )
-    if tuple(dD_partial.shape) != expected_d:
+    if tuple(dD_lane_grad.shape) != expected_d:
         raise ValueError(
-            "mamba3_mimo_bwd_path_c partial reducer expects dD_partial shape "
-            f"{expected_d}; got {tuple(dD_partial.shape)}"
+            "mamba3_mimo_bwd_path_c partial reducer expects dD_lane_grad shape "
+            f"{expected_d}; got {tuple(dD_lane_grad.shape)}"
         )
     if min(batch, seq, heads, headdim, state) <= 0:
         raise RuntimeError(
@@ -2415,19 +2415,19 @@ def _reduce_bwd_partials_path_c_kernel(
 
     dtypes = _require_supported_no_hidden_casts(
         "mamba3_mimo_bwd_path_c partial reducer",
-        ("dB_partial", dB_partial),
-        ("dC_partial", dC_partial),
-        ("dA_partial", dA_partial),
-        ("ddt_partial", ddt_partial),
-        ("dD_partial", dD_partial),
+        ("dB_lane_grad", dB_lane_grad),
+        ("dC_lane_grad", dC_lane_grad),
+        ("dA_lane_grad", dA_lane_grad),
+        ("ddt_lane_grad", ddt_lane_grad),
+        ("dD_lane_grad", dD_lane_grad),
     )
     if output_dtypes is None:
         reduce_output_dtypes = (
-            dtypes["dB_partial"],
-            dtypes["dC_partial"],
-            dtypes["dA_partial"],
-            dtypes["ddt_partial"],
-            dtypes["dD_partial"],
+            dtypes["dB_lane_grad"],
+            dtypes["dC_lane_grad"],
+            dtypes["dA_lane_grad"],
+            dtypes["ddt_lane_grad"],
+            dtypes["dD_lane_grad"],
         )
     else:
         if len(output_dtypes) != len(_BWD_REDUCE_OUTPUT_NAMES):
@@ -2445,17 +2445,17 @@ def _reduce_bwd_partials_path_c_kernel(
             )
         reduce_output_dtypes = output_dtypes
     try:
-        kernel, lowering = _bwd_partial_reduce_kernel_for(
+        kernel, lowering = _bwd_lane_grad_reduce_kernel_for(
             batch,
             seq,
             heads,
             headdim,
             state,
-            dtypes["dB_partial"],
-            dtypes["dC_partial"],
-            dtypes["dA_partial"],
-            dtypes["ddt_partial"],
-            dtypes["dD_partial"],
+            dtypes["dB_lane_grad"],
+            dtypes["dC_lane_grad"],
+            dtypes["dA_lane_grad"],
+            dtypes["ddt_lane_grad"],
+            dtypes["dD_lane_grad"],
             reduce_output_dtypes[0],
             reduce_output_dtypes[1],
             reduce_output_dtypes[2],
@@ -2468,7 +2468,7 @@ def _reduce_bwd_partials_path_c_kernel(
         ) from exc
 
     try:
-        out_list = kernel(dB_partial, dC_partial, dA_partial, ddt_partial, dD_partial)
+        out_list = kernel(dB_lane_grad, dC_lane_grad, dA_lane_grad, ddt_lane_grad, dD_lane_grad)
     except Exception as exc:
         _raise_if_dlpack_boundary_failure("mamba3_mimo_bwd_path_c partial reducer", exc)
         raise RuntimeError(
@@ -2483,87 +2483,87 @@ def _reduce_bwd_partials_path_c_kernel(
     return cast(tuple[mx.array, mx.array, mx.array, mx.array, mx.array], tuple(out_list))
 
 
-def _reduce_bwd_partials_path_c_fast_kernel(
-    dB_partial: mx.array,
-    dC_partial: mx.array,
-    dA_partial: mx.array,
-    ddt_partial: mx.array,
-    dD_partial: mx.array,
+def _reduce_bwd_lane_grads_path_c_fast_kernel(
+    dB_lane_grad: mx.array,
+    dC_lane_grad: mx.array,
+    dA_lane_grad: mx.array,
+    ddt_lane_grad: mx.array,
+    dD_lane_grad: mx.array,
     *,
     output_dtypes: tuple[str, str, str, str, str] | None = None,
 ) -> tuple[mx.array, mx.array, mx.array, mx.array, mx.array]:
     """Use the fastest supported standalone TileLang P-reducer for partial grads."""
 
-    if len(dB_partial.shape) == 5:
-        headdim = int(dB_partial.shape[4])
+    if len(dB_lane_grad.shape) == 5:
+        headdim = int(dB_lane_grad.shape[4])
     else:
         headdim = 0
     # Full-shape profiling is dtype-sensitive: current Metal thread_reduce is
     # faster for FP32 partials, while the simple serial reducer wins for compact
     # BF16 dB/dC partials where conversion and reduction overhead dominate.
     if (
-        dB_partial.dtype == mx.float32
-        and dC_partial.dtype == mx.float32
+        dB_lane_grad.dtype == mx.float32
+        and dC_lane_grad.dtype == mx.float32
         and _is_power_of_two(headdim)
         and headdim <= _MAX_THREADS
     ):
-        return _reduce_bwd_partials_path_c_threaded_kernel(
-            dB_partial,
-            dC_partial,
-            dA_partial,
-            ddt_partial,
-            dD_partial,
+        return _reduce_bwd_lane_grads_path_c_threaded_kernel(
+            dB_lane_grad,
+            dC_lane_grad,
+            dA_lane_grad,
+            ddt_lane_grad,
+            dD_lane_grad,
             output_dtypes=output_dtypes,
         )
-    return _reduce_bwd_partials_path_c_kernel(
-        dB_partial,
-        dC_partial,
-        dA_partial,
-        ddt_partial,
-        dD_partial,
+    return _reduce_bwd_lane_grads_path_c_kernel(
+        dB_lane_grad,
+        dC_lane_grad,
+        dA_lane_grad,
+        ddt_lane_grad,
+        dD_lane_grad,
         output_dtypes=output_dtypes,
     )
 
 
-def _reduce_bwd_partials_path_c_threaded_kernel(
-    dB_partial: mx.array,
-    dC_partial: mx.array,
-    dA_partial: mx.array,
-    ddt_partial: mx.array,
-    dD_partial: mx.array,
+def _reduce_bwd_lane_grads_path_c_threaded_kernel(
+    dB_lane_grad: mx.array,
+    dC_lane_grad: mx.array,
+    dA_lane_grad: mx.array,
+    ddt_lane_grad: mx.array,
+    dD_lane_grad: mx.array,
     *,
     output_dtypes: tuple[str, str, str, str, str] | None = None,
 ) -> tuple[mx.array, mx.array, mx.array, mx.array, mx.array]:
     """Reduce bwd partial gradients over P with a threaded TileLang kernel."""
 
-    if len(dB_partial.shape) != 5:
+    if len(dB_lane_grad.shape) != 5:
         raise ValueError(
             "mamba3_mimo_bwd_path_c threaded partial reducer expects "
-            "dB_partial shape (B, T, H, N, P)"
+            "dB_lane_grad shape (B, T, H, N, P)"
         )
-    batch, seq, heads, state, headdim = map(int, dB_partial.shape)
+    batch, seq, heads, state, headdim = map(int, dB_lane_grad.shape)
     expected_c = (batch, seq, heads, state, headdim)
     expected_lane = (batch, seq, heads, headdim)
     expected_d = (batch, heads, headdim)
-    if tuple(dC_partial.shape) != expected_c:
+    if tuple(dC_lane_grad.shape) != expected_c:
         raise ValueError(
             "mamba3_mimo_bwd_path_c threaded partial reducer expects "
-            f"dC_partial shape {expected_c}; got {tuple(dC_partial.shape)}"
+            f"dC_lane_grad shape {expected_c}; got {tuple(dC_lane_grad.shape)}"
         )
-    if tuple(dA_partial.shape) != expected_lane:
+    if tuple(dA_lane_grad.shape) != expected_lane:
         raise ValueError(
             "mamba3_mimo_bwd_path_c threaded partial reducer expects "
-            f"dA_partial shape {expected_lane}; got {tuple(dA_partial.shape)}"
+            f"dA_lane_grad shape {expected_lane}; got {tuple(dA_lane_grad.shape)}"
         )
-    if tuple(ddt_partial.shape) != expected_lane:
+    if tuple(ddt_lane_grad.shape) != expected_lane:
         raise ValueError(
             "mamba3_mimo_bwd_path_c threaded partial reducer expects "
-            f"ddt_partial shape {expected_lane}; got {tuple(ddt_partial.shape)}"
+            f"ddt_lane_grad shape {expected_lane}; got {tuple(ddt_lane_grad.shape)}"
         )
-    if tuple(dD_partial.shape) != expected_d:
+    if tuple(dD_lane_grad.shape) != expected_d:
         raise ValueError(
             "mamba3_mimo_bwd_path_c threaded partial reducer expects "
-            f"dD_partial shape {expected_d}; got {tuple(dD_partial.shape)}"
+            f"dD_lane_grad shape {expected_d}; got {tuple(dD_lane_grad.shape)}"
         )
     if min(batch, seq, heads, headdim, state) <= 0:
         raise RuntimeError(
@@ -2573,19 +2573,19 @@ def _reduce_bwd_partials_path_c_threaded_kernel(
 
     dtypes = _require_supported_no_hidden_casts(
         "mamba3_mimo_bwd_path_c threaded partial reducer",
-        ("dB_partial", dB_partial),
-        ("dC_partial", dC_partial),
-        ("dA_partial", dA_partial),
-        ("ddt_partial", ddt_partial),
-        ("dD_partial", dD_partial),
+        ("dB_lane_grad", dB_lane_grad),
+        ("dC_lane_grad", dC_lane_grad),
+        ("dA_lane_grad", dA_lane_grad),
+        ("ddt_lane_grad", ddt_lane_grad),
+        ("dD_lane_grad", dD_lane_grad),
     )
     if output_dtypes is None:
         reduce_output_dtypes = (
-            dtypes["dB_partial"],
-            dtypes["dC_partial"],
-            dtypes["dA_partial"],
-            dtypes["ddt_partial"],
-            dtypes["dD_partial"],
+            dtypes["dB_lane_grad"],
+            dtypes["dC_lane_grad"],
+            dtypes["dA_lane_grad"],
+            dtypes["ddt_lane_grad"],
+            dtypes["dD_lane_grad"],
         )
     else:
         if len(output_dtypes) != len(_BWD_REDUCE_OUTPUT_NAMES):
@@ -2603,17 +2603,17 @@ def _reduce_bwd_partials_path_c_threaded_kernel(
             )
         reduce_output_dtypes = output_dtypes
     try:
-        kernel, lowering = _bwd_partial_reduce_threaded_kernel_for(
+        kernel, lowering = _bwd_lane_grad_reduce_threaded_kernel_for(
             batch,
             seq,
             heads,
             headdim,
             state,
-            dtypes["dB_partial"],
-            dtypes["dC_partial"],
-            dtypes["dA_partial"],
-            dtypes["ddt_partial"],
-            dtypes["dD_partial"],
+            dtypes["dB_lane_grad"],
+            dtypes["dC_lane_grad"],
+            dtypes["dA_lane_grad"],
+            dtypes["ddt_lane_grad"],
+            dtypes["dD_lane_grad"],
             reduce_output_dtypes[0],
             reduce_output_dtypes[1],
             reduce_output_dtypes[2],
@@ -2626,7 +2626,7 @@ def _reduce_bwd_partials_path_c_threaded_kernel(
         ) from exc
 
     try:
-        out_list = kernel(dB_partial, dC_partial, dA_partial, ddt_partial, dD_partial)
+        out_list = kernel(dB_lane_grad, dC_lane_grad, dA_lane_grad, ddt_lane_grad, dD_lane_grad)
     except Exception as exc:
         _raise_if_dlpack_boundary_failure(
             "mamba3_mimo_bwd_path_c threaded partial reducer",
@@ -3082,7 +3082,7 @@ def _mamba3_mimo_bwd_path_c_partial_outputs_from_snapshots(
             f"{expected_h_snap}; got {tuple(h_snap.shape)}"
         )
     if partial_dtypes is None:
-        partial_dtypes = _bwd_partial_dtypes_for_input_dtypes(dtypes)
+        partial_dtypes = _bwd_lane_grad_dtypes_for_input_dtypes(dtypes)
     if len(partial_dtypes) != len(_BWD_REDUCE_OUTPUT_NAMES):
         raise ValueError(
             "mamba3_mimo_bwd_path_c partial_dtypes must have "
@@ -3098,7 +3098,7 @@ def _mamba3_mimo_bwd_path_c_partial_outputs_from_snapshots(
         )
 
     try:
-        kernel, lowering = _bwd_partial_kernel_for_state_snapshots(
+        kernel, lowering = _bwd_lane_grad_kernel_for_state_snapshots(
             batch,
             seq,
             heads,
@@ -3138,16 +3138,16 @@ def _mamba3_mimo_bwd_path_c_partial_outputs_from_snapshots(
 
     if not isinstance(out_list, (list, tuple)) or len(out_list) != len(_BWD_PARTIAL_OUTPUT_NAMES):
         raise RuntimeError("Mamba3 Path C partial bwd tvm-ffi returned an invalid output tuple")
-    dx_pc, dz_pc, dB_partial, dC_partial, dA_partial, ddt_partial, dD_partial, dh0_pc = out_list
+    dx_pc, dz_pc, dB_lane_grad, dC_lane_grad, dA_lane_grad, ddt_lane_grad, dD_lane_grad, dh0_pc = out_list
     del lowering
     return (
         dx_pc,
         dz_pc,
-        dB_partial,
-        dC_partial,
-        dA_partial,
-        ddt_partial,
-        dD_partial,
+        dB_lane_grad,
+        dC_lane_grad,
+        dA_lane_grad,
+        ddt_lane_grad,
+        dD_lane_grad,
         dh0_pc,
     )
 
@@ -3172,11 +3172,11 @@ def _mamba3_mimo_bwd_path_c_from_snapshots_kernel(
     (
         dx_pc,
         dz_pc,
-        dB_partial,
-        dC_partial,
-        dA_partial,
-        ddt_partial,
-        dD_partial,
+        dB_lane_grad,
+        dC_lane_grad,
+        dA_lane_grad,
+        ddt_lane_grad,
+        dD_lane_grad,
         dh0_pc,
     ) = _mamba3_mimo_bwd_path_c_partial_outputs_from_snapshots(
         dy,
@@ -3190,12 +3190,12 @@ def _mamba3_mimo_bwd_path_c_from_snapshots_kernel(
         h0,
         h_snap,
     )
-    dB_pc, dC_pc, dA_pc, ddt_pc, dD_pc = _reduce_bwd_partials_path_c_fast_kernel(
-        dB_partial,
-        dC_partial,
-        dA_partial,
-        ddt_partial,
-        dD_partial,
+    dB_pc, dC_pc, dA_pc, ddt_pc, dD_pc = _reduce_bwd_lane_grads_path_c_fast_kernel(
+        dB_lane_grad,
+        dC_lane_grad,
+        dA_lane_grad,
+        ddt_lane_grad,
+        dD_lane_grad,
         output_dtypes=(
             ("bfloat16", "bfloat16", "bfloat16", "bfloat16", "bfloat16")
             if bf16_route
@@ -3319,11 +3319,11 @@ def _mamba3_mimo_bwd_path_c_partial_kernel(
     (
         dx_pc,
         dz_pc,
-        dB_partial,
-        dC_partial,
-        dA_partial,
-        ddt_partial,
-        dD_partial,
+        dB_lane_grad,
+        dC_lane_grad,
+        dA_lane_grad,
+        ddt_lane_grad,
+        dD_lane_grad,
         dh0_pc,
     ) = _mamba3_mimo_bwd_path_c_partial_outputs(
         dy,
@@ -3337,12 +3337,12 @@ def _mamba3_mimo_bwd_path_c_partial_kernel(
         h0,
         snapshot_dtype=snapshot_dtype,
     )
-    dB_pc, dC_pc, dA_pc, ddt_pc, dD_pc = _reduce_bwd_partials_path_c_fast_kernel(
-        dB_partial,
-        dC_partial,
-        dA_partial,
-        ddt_partial,
-        dD_partial,
+    dB_pc, dC_pc, dA_pc, ddt_pc, dD_pc = _reduce_bwd_lane_grads_path_c_fast_kernel(
+        dB_lane_grad,
+        dC_lane_grad,
+        dA_lane_grad,
+        ddt_lane_grad,
+        dD_lane_grad,
         output_dtypes=(
             ("bfloat16", "bfloat16", "bfloat16", "bfloat16", "bfloat16")
             if bf16_route
@@ -3381,11 +3381,11 @@ def _mamba3_mimo_bwd_path_c_partial_tl_reduce_kernel(
     (
         dx_pc,
         dz_pc,
-        dB_partial,
-        dC_partial,
-        dA_partial,
-        ddt_partial,
-        dD_partial,
+        dB_lane_grad,
+        dC_lane_grad,
+        dA_lane_grad,
+        ddt_lane_grad,
+        dD_lane_grad,
         dh0_pc,
     ) = _mamba3_mimo_bwd_path_c_partial_outputs(
         dy,
@@ -3399,12 +3399,12 @@ def _mamba3_mimo_bwd_path_c_partial_tl_reduce_kernel(
         h0,
         snapshot_dtype=snapshot_dtype,
     )
-    dB_pc, dC_pc, dA_pc, ddt_pc, dD_pc = _reduce_bwd_partials_path_c_fast_kernel(
-        dB_partial,
-        dC_partial,
-        dA_partial,
-        ddt_partial,
-        dD_partial,
+    dB_pc, dC_pc, dA_pc, ddt_pc, dD_pc = _reduce_bwd_lane_grads_path_c_fast_kernel(
+        dB_lane_grad,
+        dC_lane_grad,
+        dA_lane_grad,
+        ddt_lane_grad,
+        dD_lane_grad,
         output_dtypes=(
             ("bfloat16", "bfloat16", "bfloat16", "bfloat16", "bfloat16")
             if bf16_route
@@ -3443,11 +3443,11 @@ def _mamba3_mimo_bwd_path_c_partial_threaded_reduce_kernel(
     (
         dx_pc,
         dz_pc,
-        dB_partial,
-        dC_partial,
-        dA_partial,
-        ddt_partial,
-        dD_partial,
+        dB_lane_grad,
+        dC_lane_grad,
+        dA_lane_grad,
+        ddt_lane_grad,
+        dD_lane_grad,
         dh0_pc,
     ) = _mamba3_mimo_bwd_path_c_partial_outputs(
         dy,
@@ -3461,12 +3461,12 @@ def _mamba3_mimo_bwd_path_c_partial_threaded_reduce_kernel(
         h0,
         snapshot_dtype=snapshot_dtype,
     )
-    dB_pc, dC_pc, dA_pc, ddt_pc, dD_pc = _reduce_bwd_partials_path_c_threaded_kernel(
-        dB_partial,
-        dC_partial,
-        dA_partial,
-        ddt_partial,
-        dD_partial,
+    dB_pc, dC_pc, dA_pc, ddt_pc, dD_pc = _reduce_bwd_lane_grads_path_c_threaded_kernel(
+        dB_lane_grad,
+        dC_lane_grad,
+        dA_lane_grad,
+        ddt_lane_grad,
+        dD_lane_grad,
         output_dtypes=(
             ("bfloat16", "bfloat16", "bfloat16", "bfloat16", "bfloat16")
             if bf16_route
@@ -3507,11 +3507,11 @@ def _mamba3_mimo_bwd_path_c_bf16_snapshot_kernel(
     (
         dx_pc,
         dz_pc,
-        dB_partial,
-        dC_partial,
-        dA_partial,
-        ddt_partial,
-        dD_partial,
+        dB_lane_grad,
+        dC_lane_grad,
+        dA_lane_grad,
+        ddt_lane_grad,
+        dD_lane_grad,
         dh0_pc,
     ) = _mamba3_mimo_bwd_path_c_partial_outputs(
         dy,
@@ -3525,11 +3525,11 @@ def _mamba3_mimo_bwd_path_c_bf16_snapshot_kernel(
         h0,
         snapshot_dtype="bfloat16",
     )
-    dB_pc = mx.sum(dB_partial, axis=4)
-    dC_pc = mx.sum(dC_partial, axis=4)
-    dA_pc = mx.sum(dA_partial, axis=3)
-    ddt_pc = mx.sum(ddt_partial, axis=3)
-    dD_pc = mx.sum(dD_partial, axis=(0, 2))
+    dB_pc = mx.sum(dB_lane_grad, axis=4)
+    dC_pc = mx.sum(dC_lane_grad, axis=4)
+    dA_pc = mx.sum(dA_lane_grad, axis=3)
+    ddt_pc = mx.sum(ddt_lane_grad, axis=3)
+    dD_pc = mx.sum(dD_lane_grad, axis=(0, 2))
     return (
         _astype_if_needed(dx_pc, x.dtype),
         _astype_if_needed(dB_pc, B.dtype),
@@ -3581,7 +3581,7 @@ def _mamba3_mimo_bwd_path_c_scratch_partial_outputs(
     bf16_route = all(
         array.dtype == mx.bfloat16 for array in (dy, x, B, C, z, A, dt, D, h0)
     )
-    partial_dtypes = _bwd_partial_dtypes_for_input_dtypes(dtypes)
+    partial_dtypes = _bwd_lane_grad_dtypes_for_input_dtypes(dtypes)
     try:
         kernel, lowering = _bwd_scratch_partial_kernel_for(
             batch,
@@ -3645,19 +3645,19 @@ def _mamba3_mimo_bwd_path_c_scratch_kernel(
     (
         dx_pc,
         dz_pc,
-        dB_partial,
-        dC_partial,
-        dA_partial,
-        ddt_partial,
-        dD_partial,
+        dB_lane_grad,
+        dC_lane_grad,
+        dA_lane_grad,
+        ddt_lane_grad,
+        dD_lane_grad,
         dh0_pc,
     ) = _mamba3_mimo_bwd_path_c_scratch_partial_outputs(dy, x, B, C, z, A, dt, D, h0)
-    dB_pc, dC_pc, dA_pc, ddt_pc, dD_pc = _reduce_bwd_partials_path_c_fast_kernel(
-        dB_partial,
-        dC_partial,
-        dA_partial,
-        ddt_partial,
-        dD_partial,
+    dB_pc, dC_pc, dA_pc, ddt_pc, dD_pc = _reduce_bwd_lane_grads_path_c_fast_kernel(
+        dB_lane_grad,
+        dC_lane_grad,
+        dA_lane_grad,
+        ddt_lane_grad,
+        dD_lane_grad,
         output_dtypes=(
             ("bfloat16", "bfloat16", "bfloat16", "bfloat16", "bfloat16")
             if bf16_route
@@ -3692,18 +3692,18 @@ def _mamba3_mimo_bwd_path_c_scratch_mlx_reduce_kernel(
     (
         dx_pc,
         dz_pc,
-        dB_partial,
-        dC_partial,
-        dA_partial,
-        ddt_partial,
-        dD_partial,
+        dB_lane_grad,
+        dC_lane_grad,
+        dA_lane_grad,
+        ddt_lane_grad,
+        dD_lane_grad,
         dh0_pc,
     ) = _mamba3_mimo_bwd_path_c_scratch_partial_outputs(dy, x, B, C, z, A, dt, D, h0)
-    dB_pc = mx.sum(dB_partial, axis=4)
-    dC_pc = mx.sum(dC_partial, axis=4)
-    dA_pc = mx.sum(dA_partial, axis=3)
-    ddt_pc = mx.sum(ddt_partial, axis=3)
-    dD_pc = mx.sum(dD_partial, axis=(0, 2))
+    dB_pc = mx.sum(dB_lane_grad, axis=4)
+    dC_pc = mx.sum(dC_lane_grad, axis=4)
+    dA_pc = mx.sum(dA_lane_grad, axis=3)
+    ddt_pc = mx.sum(ddt_lane_grad, axis=3)
+    dD_pc = mx.sum(dD_lane_grad, axis=(0, 2))
     return (
         _astype_if_needed(dx_pc, x.dtype),
         _astype_if_needed(dB_pc, B.dtype),
@@ -4061,7 +4061,7 @@ def dump_lowered_bwd_msl(
     """Return the raw lowered MSL for the production Path C backward kernel."""
 
     snapshot_dtype = "bfloat16" if dtype == "bfloat16" else "float32"
-    partial_dtypes = _bwd_partial_dtypes_for_input_dtypes(
+    partial_dtypes = _bwd_lane_grad_dtypes_for_input_dtypes(
         {
             "dy": dtype,
             "x": dtype,
@@ -4074,7 +4074,7 @@ def dump_lowered_bwd_msl(
             "h0": dtype,
         }
     )
-    kernel, lowering = _bwd_partial_kernel_for_state_snapshots(
+    kernel, lowering = _bwd_lane_grad_kernel_for_state_snapshots(
         batch,
         seq,
         heads,
@@ -4112,9 +4112,9 @@ def _clear_mamba3_path_c_caches() -> None:
         _bwd_state_snapshots_kernel_for,
         _bwd_simd_reduce_kernel_for,
         _bwd_simd_reduce_kernel_for_state_snapshots,
-        _bwd_partial_kernel_for_state_snapshots,
+        _bwd_lane_grad_kernel_for_state_snapshots,
         _bwd_scratch_partial_kernel_for,
-        _bwd_partial_reduce_kernel_for,
+        _bwd_lane_grad_reduce_kernel_for,
     ):
         cached_fn.cache_clear()
 

@@ -1,14 +1,15 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { renderHook, waitFor } from "@testing-library/react";
 import { usePresets, _clearPresetsCache } from "@/hooks/usePresets";
+import type { RpcClient } from "@/lib/rpc";
 
-function fakeRpc(payload: { presets: string[] } | Error) {
+function fakeRpc(payload: { presets: string[] } | Error): RpcClient {
   return {
     call: vi.fn(async () => {
       if (payload instanceof Error) throw payload;
       return payload;
     }),
-  } as never;
+  } as unknown as RpcClient;
 }
 
 beforeEach(() => _clearPresetsCache());

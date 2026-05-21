@@ -55,12 +55,12 @@ from cppmega_mlx.nn._tilelang.mamba3_path_c import (
 )
 
 
-_BWD_PARTIAL_OUTPUT_TOKENS = (
-    "dA" + "_partial",
-    "dB" + "_partial",
-    "dC" + "_partial",
-    "dD" + "_partial",
-    "ddt" + "_partial",
+_BWD_LANE_GRAD_OUTPUT_TOKENS = (
+    "dA_lane_grad",
+    "dB_lane_grad",
+    "dC_lane_grad",
+    "dD_lane_grad",
+    "ddt_lane_grad",
 )
 
 
@@ -202,13 +202,13 @@ def _require_mamba3_path_c() -> None:
         pytest.skip(f"mamba3 Path C unavailable on this host: {status.reason}")
 
 
-def _assert_no_bwd_partial_outputs(msl: str) -> None:
-    for name in _BWD_PARTIAL_OUTPUT_TOKENS:
+def _assert_no_bwd_lane_grad_outputs(msl: str) -> None:
+    for name in _BWD_LANE_GRAD_OUTPUT_TOKENS:
         assert name not in msl
 
 
-def _assert_bwd_partial_outputs(msl: str) -> None:
-    for name in _BWD_PARTIAL_OUTPUT_TOKENS:
+def _assert_bwd_lane_grad_outputs(msl: str) -> None:
+    for name in _BWD_LANE_GRAD_OUTPUT_TOKENS:
         assert name in msl
 
 
@@ -248,7 +248,7 @@ def test_lowered_bwd_msl_contains_kernel_void() -> None:
     for name in ("A", "B", "C", "D", "dt", "dy", "h_snap", "x", "z"):
         assert name in msl, f"input buffer {name!r} missing from lowered MSL"
     assert "h_steps" not in msl
-    _assert_bwd_partial_outputs(msl)
+    _assert_bwd_lane_grad_outputs(msl)
     for name in ("dh0", "dx", "dz"):
         assert name in msl, f"output buffer {name!r} missing from lowered MSL"
 
@@ -264,7 +264,7 @@ def test_bwd_scratch_route_lowering_owns_scratch_without_h_snap_input() -> None:
     assert "h_snap" not in lowering.buffer_param_names
     assert "device float* h_steps_scratch" in lowering.msl_text
     assert "device float* h_snap" not in lowering.msl_text
-    _assert_bwd_partial_outputs(lowering.msl_text)
+    _assert_bwd_lane_grad_outputs(lowering.msl_text)
 
 
 def test_bwd_scratch_route_lowering_compacts_bf16_partials() -> None:
@@ -282,11 +282,11 @@ def test_bwd_scratch_route_lowering_compacts_bf16_partials() -> None:
         "bfloat16",  # h0
         "bfloat16",  # dx
         "bfloat16",  # dz
-        "bfloat16",  # dB_partial
-        "bfloat16",  # dC_partial
-        "float32",  # dA_partial
-        "float32",  # ddt_partial
-        "float32",  # dD_partial
+        "bfloat16",  # dB_lane_grad
+        "bfloat16",  # dC_lane_grad
+        "float32",  # dA_lane_grad
+        "float32",  # ddt_lane_grad
+        "float32",  # dD_lane_grad
         "bfloat16",  # dh0
         "bfloat16",  # h_steps_scratch
     )
@@ -295,11 +295,11 @@ def test_bwd_scratch_route_lowering_compacts_bf16_partials() -> None:
     )
 
     assert "device tvm_bfloat16* h_steps_scratch" in lowering.msl_text
-    assert "device tvm_bfloat16* dB_partial" in lowering.msl_text
-    assert "device tvm_bfloat16* dC_partial" in lowering.msl_text
-    assert "device float* dA_partial" in lowering.msl_text
-    assert "device float* ddt_partial" in lowering.msl_text
-    assert "device float* dD_partial" in lowering.msl_text
+    assert "device tvm_bfloat16* dB_lane_grad" in lowering.msl_text
+    assert "device tvm_bfloat16* dC_lane_grad" in lowering.msl_text
+    assert "device float* dA_lane_grad" in lowering.msl_text
+    assert "device float* ddt_lane_grad" in lowering.msl_text
+    assert "device float* dD_lane_grad" in lowering.msl_text
 
 
 def test_dump_lowered_bwd_msl_matches_bf16_partial_dtype_policy() -> None:
@@ -314,39 +314,39 @@ def test_dump_lowered_bwd_msl_matches_bf16_partial_dtype_policy() -> None:
         dtype="bfloat16",
     )
 
-    assert "device tvm_bfloat16* dB_partial" in msl
-    assert "device tvm_bfloat16* dC_partial" in msl
-    assert "device float* dA_partial" in msl
-    assert "device float* ddt_partial" in msl
-    assert "device float* dD_partial" in msl
+    assert "device tvm_bfloat16* dB_lane_grad" in msl
+    assert "device tvm_bfloat16* dC_lane_grad" in msl
+    assert "device float* dA_lane_grad" in msl
+    assert "device float* ddt_lane_grad" in msl
+    assert "device float* dD_lane_grad" in msl
 
 
-def test_bwd_partial_reduce_kernel_matches_mlx_sum_small_shape() -> None:
+def test_bwd_lane_grad_reduce_kernel_matches_mlx_sum_small_shape() -> None:
     """Standalone TileLang P-reducer matches the MLX reductions it may replace."""
 
     _require_mamba3_path_c()
     batch, seq, heads, headdim, state = 1, 3, 2, 4, 5
     mx.random.seed(71)
-    dB_partial = mx.random.normal((batch, seq, heads, state, headdim)).astype(mx.float32)
-    dC_partial = mx.random.normal((batch, seq, heads, state, headdim)).astype(mx.float32)
-    dA_partial = mx.random.normal((batch, seq, heads, headdim)).astype(mx.float32)
-    ddt_partial = mx.random.normal((batch, seq, heads, headdim)).astype(mx.float32)
-    dD_partial = mx.random.normal((batch, heads, headdim)).astype(mx.float32)
-    mx.eval(dB_partial, dC_partial, dA_partial, ddt_partial, dD_partial)
+    dB_lane_grad = mx.random.normal((batch, seq, heads, state, headdim)).astype(mx.float32)
+    dC_lane_grad = mx.random.normal((batch, seq, heads, state, headdim)).astype(mx.float32)
+    dA_lane_grad = mx.random.normal((batch, seq, heads, headdim)).astype(mx.float32)
+    ddt_lane_grad = mx.random.normal((batch, seq, heads, headdim)).astype(mx.float32)
+    dD_lane_grad = mx.random.normal((batch, heads, headdim)).astype(mx.float32)
+    mx.eval(dB_lane_grad, dC_lane_grad, dA_lane_grad, ddt_lane_grad, dD_lane_grad)
 
-    reduced = mamba3_path_c._reduce_bwd_partials_path_c_kernel(
-        dB_partial,
-        dC_partial,
-        dA_partial,
-        ddt_partial,
-        dD_partial,
+    reduced = mamba3_path_c._reduce_bwd_lane_grads_path_c_kernel(
+        dB_lane_grad,
+        dC_lane_grad,
+        dA_lane_grad,
+        ddt_lane_grad,
+        dD_lane_grad,
     )
     expected = (
-        mx.sum(dB_partial, axis=4),
-        mx.sum(dC_partial, axis=4),
-        mx.sum(dA_partial, axis=3),
-        mx.sum(ddt_partial, axis=3),
-        mx.sum(dD_partial, axis=(0, 2)),
+        mx.sum(dB_lane_grad, axis=4),
+        mx.sum(dC_lane_grad, axis=4),
+        mx.sum(dA_lane_grad, axis=3),
+        mx.sum(ddt_lane_grad, axis=3),
+        mx.sum(dD_lane_grad, axis=(0, 2)),
     )
     mx.eval(*reduced, *expected)
     for name, got, want in zip(("dB", "dC", "dA", "ddt", "dD"), reduced, expected, strict=True):
@@ -359,33 +359,33 @@ def test_bwd_partial_reduce_kernel_matches_mlx_sum_small_shape() -> None:
         )
 
 
-def test_bwd_partial_reduce_kernel_can_write_bf16_outputs() -> None:
+def test_bwd_lane_grad_reduce_kernel_can_write_bf16_outputs() -> None:
     """Diagnostic reducer can write final BF16 grads without hidden MLX casts."""
 
     _require_mamba3_path_c()
     batch, seq, heads, headdim, state = 1, 3, 2, 4, 5
     mx.random.seed(74)
-    dB_partial = mx.random.normal((batch, seq, heads, state, headdim)).astype(mx.float32)
-    dC_partial = mx.random.normal((batch, seq, heads, state, headdim)).astype(mx.float32)
-    dA_partial = mx.random.normal((batch, seq, heads, headdim)).astype(mx.float32)
-    ddt_partial = mx.random.normal((batch, seq, heads, headdim)).astype(mx.float32)
-    dD_partial = mx.random.normal((batch, heads, headdim)).astype(mx.float32)
-    mx.eval(dB_partial, dC_partial, dA_partial, ddt_partial, dD_partial)
+    dB_lane_grad = mx.random.normal((batch, seq, heads, state, headdim)).astype(mx.float32)
+    dC_lane_grad = mx.random.normal((batch, seq, heads, state, headdim)).astype(mx.float32)
+    dA_lane_grad = mx.random.normal((batch, seq, heads, headdim)).astype(mx.float32)
+    ddt_lane_grad = mx.random.normal((batch, seq, heads, headdim)).astype(mx.float32)
+    dD_lane_grad = mx.random.normal((batch, heads, headdim)).astype(mx.float32)
+    mx.eval(dB_lane_grad, dC_lane_grad, dA_lane_grad, ddt_lane_grad, dD_lane_grad)
 
-    reduced = mamba3_path_c._reduce_bwd_partials_path_c_kernel(
-        dB_partial,
-        dC_partial,
-        dA_partial,
-        ddt_partial,
-        dD_partial,
+    reduced = mamba3_path_c._reduce_bwd_lane_grads_path_c_kernel(
+        dB_lane_grad,
+        dC_lane_grad,
+        dA_lane_grad,
+        ddt_lane_grad,
+        dD_lane_grad,
         output_dtypes=("bfloat16", "bfloat16", "bfloat16", "bfloat16", "bfloat16"),
     )
     expected = (
-        mx.sum(dB_partial, axis=4).astype(mx.bfloat16),
-        mx.sum(dC_partial, axis=4).astype(mx.bfloat16),
-        mx.sum(dA_partial, axis=3).astype(mx.bfloat16),
-        mx.sum(ddt_partial, axis=3).astype(mx.bfloat16),
-        mx.sum(dD_partial, axis=(0, 2)).astype(mx.bfloat16),
+        mx.sum(dB_lane_grad, axis=4).astype(mx.bfloat16),
+        mx.sum(dC_lane_grad, axis=4).astype(mx.bfloat16),
+        mx.sum(dA_lane_grad, axis=3).astype(mx.bfloat16),
+        mx.sum(ddt_lane_grad, axis=3).astype(mx.bfloat16),
+        mx.sum(dD_lane_grad, axis=(0, 2)).astype(mx.bfloat16),
     )
     mx.eval(*reduced, *expected)
 
@@ -407,26 +407,26 @@ def test_bwd_threaded_partial_reduce_kernel_matches_mlx_sum_small_shape() -> Non
     _require_mamba3_path_c()
     batch, seq, heads, headdim, state = 1, 3, 2, 4, 5
     mx.random.seed(75)
-    dB_partial = mx.random.normal((batch, seq, heads, state, headdim)).astype(mx.float32)
-    dC_partial = mx.random.normal((batch, seq, heads, state, headdim)).astype(mx.float32)
-    dA_partial = mx.random.normal((batch, seq, heads, headdim)).astype(mx.float32)
-    ddt_partial = mx.random.normal((batch, seq, heads, headdim)).astype(mx.float32)
-    dD_partial = mx.random.normal((batch, heads, headdim)).astype(mx.float32)
-    mx.eval(dB_partial, dC_partial, dA_partial, ddt_partial, dD_partial)
+    dB_lane_grad = mx.random.normal((batch, seq, heads, state, headdim)).astype(mx.float32)
+    dC_lane_grad = mx.random.normal((batch, seq, heads, state, headdim)).astype(mx.float32)
+    dA_lane_grad = mx.random.normal((batch, seq, heads, headdim)).astype(mx.float32)
+    ddt_lane_grad = mx.random.normal((batch, seq, heads, headdim)).astype(mx.float32)
+    dD_lane_grad = mx.random.normal((batch, heads, headdim)).astype(mx.float32)
+    mx.eval(dB_lane_grad, dC_lane_grad, dA_lane_grad, ddt_lane_grad, dD_lane_grad)
 
-    reduced = mamba3_path_c._reduce_bwd_partials_path_c_threaded_kernel(
-        dB_partial,
-        dC_partial,
-        dA_partial,
-        ddt_partial,
-        dD_partial,
+    reduced = mamba3_path_c._reduce_bwd_lane_grads_path_c_threaded_kernel(
+        dB_lane_grad,
+        dC_lane_grad,
+        dA_lane_grad,
+        ddt_lane_grad,
+        dD_lane_grad,
     )
     expected = (
-        mx.sum(dB_partial, axis=4),
-        mx.sum(dC_partial, axis=4),
-        mx.sum(dA_partial, axis=3),
-        mx.sum(ddt_partial, axis=3),
-        mx.sum(dD_partial, axis=(0, 2)),
+        mx.sum(dB_lane_grad, axis=4),
+        mx.sum(dC_lane_grad, axis=4),
+        mx.sum(dA_lane_grad, axis=3),
+        mx.sum(ddt_lane_grad, axis=3),
+        mx.sum(dD_lane_grad, axis=(0, 2)),
     )
     mx.eval(*reduced, *expected)
     for name, got, want in zip(("dB", "dC", "dA", "ddt", "dD"), reduced, expected, strict=True):
@@ -442,7 +442,7 @@ def test_bwd_threaded_partial_reduce_kernel_matches_mlx_sum_small_shape() -> Non
 def test_bwd_threaded_partial_reduce_kernel_lowers_thread_reduce() -> None:
     _require_mamba3_path_c()
 
-    _kernel, lowering = mamba3_path_c._bwd_partial_reduce_threaded_kernel_for(
+    _kernel, lowering = mamba3_path_c._bwd_lane_grad_reduce_threaded_kernel_for(
         1, 3, 2, 4, 5
     )
 
@@ -451,7 +451,7 @@ def test_bwd_threaded_partial_reduce_kernel_lowers_thread_reduce() -> None:
     assert "simd_sum" in lowering.msl_text
 
 
-def test_bwd_partial_outputs_compact_large_reduction_partials_for_bf16() -> None:
+def test_bwd_lane_grad_outputs_compact_large_reduction_partials_for_bf16() -> None:
     """BF16 bwd stores bandwidth-dominant dB/dC partials as BF16."""
 
     _require_mamba3_path_c()
@@ -464,28 +464,28 @@ def test_bwd_partial_outputs_compact_large_reduction_partials_for_bf16() -> None
     (
         dx_pc,
         dz_pc,
-        dB_partial,
-        dC_partial,
-        dA_partial,
-        ddt_partial,
-        dD_partial,
+        dB_lane_grad,
+        dC_lane_grad,
+        dA_lane_grad,
+        ddt_lane_grad,
+        dD_lane_grad,
         dh0_pc,
     ) = mamba3_path_c._mamba3_mimo_bwd_path_c_partial_outputs(
         dy, x, B, C, z, A, dt, D, h0
     )
-    mx.eval(dx_pc, dz_pc, dB_partial, dC_partial, dA_partial, ddt_partial, dD_partial, dh0_pc)
+    mx.eval(dx_pc, dz_pc, dB_lane_grad, dC_lane_grad, dA_lane_grad, ddt_lane_grad, dD_lane_grad, dh0_pc)
 
     assert dx_pc.dtype == mx.bfloat16
     assert dz_pc.dtype == mx.bfloat16
     assert dh0_pc.dtype == mx.bfloat16
-    assert dB_partial.dtype == mx.bfloat16
-    assert dC_partial.dtype == mx.bfloat16
-    assert dA_partial.dtype == mx.float32
-    assert ddt_partial.dtype == mx.float32
-    assert dD_partial.dtype == mx.float32
+    assert dB_lane_grad.dtype == mx.bfloat16
+    assert dC_lane_grad.dtype == mx.bfloat16
+    assert dA_lane_grad.dtype == mx.float32
+    assert ddt_lane_grad.dtype == mx.float32
+    assert dD_lane_grad.dtype == mx.float32
 
 
-def test_bwd_partial_outputs_store_bc_reduction_axis_innermost() -> None:
+def test_bwd_lane_grad_outputs_store_bc_reduction_axis_innermost() -> None:
     """dB/dC partials should make the P reduction contiguous for post-reduce."""
 
     _require_mamba3_path_c()
@@ -506,22 +506,22 @@ def test_bwd_partial_outputs_store_bc_reduction_axis_innermost() -> None:
     (
         _dx_pc,
         _dz_pc,
-        dB_partial,
-        dC_partial,
-        dA_partial,
-        ddt_partial,
-        dD_partial,
+        dB_lane_grad,
+        dC_lane_grad,
+        dA_lane_grad,
+        ddt_lane_grad,
+        dD_lane_grad,
         _dh0_pc,
     ) = mamba3_path_c._mamba3_mimo_bwd_path_c_partial_outputs(
         dy, x, B, C, z, A, dt, D, h0
     )
-    mx.eval(dB_partial, dC_partial, dA_partial, ddt_partial, dD_partial)
+    mx.eval(dB_lane_grad, dC_lane_grad, dA_lane_grad, ddt_lane_grad, dD_lane_grad)
 
-    assert tuple(dB_partial.shape) == (batch, seq, heads, state, headdim)
-    assert tuple(dC_partial.shape) == (batch, seq, heads, state, headdim)
-    assert tuple(dA_partial.shape) == (batch, seq, heads, headdim)
-    assert tuple(ddt_partial.shape) == (batch, seq, heads, headdim)
-    assert tuple(dD_partial.shape) == (batch, heads, headdim)
+    assert tuple(dB_lane_grad.shape) == (batch, seq, heads, state, headdim)
+    assert tuple(dC_lane_grad.shape) == (batch, seq, heads, state, headdim)
+    assert tuple(dA_lane_grad.shape) == (batch, seq, heads, headdim)
+    assert tuple(ddt_lane_grad.shape) == (batch, seq, heads, headdim)
+    assert tuple(dD_lane_grad.shape) == (batch, heads, headdim)
 
 
 def test_lowered_bwd_bench_shape_uses_partial_outputs_not_hot_allreduce() -> None:
@@ -532,8 +532,8 @@ def test_lowered_bwd_bench_shape_uses_partial_outputs_not_hot_allreduce() -> Non
     assert "simd_shuffle_down" not in body
     assert "threadgroup_barrier(" not in body
     assert "red_buf_staging" not in body
-    _assert_bwd_partial_outputs(msl)
-    assert "dD_partial" in msl
+    _assert_bwd_lane_grad_outputs(msl)
+    assert "dD_lane_grad" in msl
 
 
 @pytest.mark.parametrize("headdim", [64, 96, 128, 256, 512, 1024])
@@ -546,8 +546,8 @@ def test_lowered_bwd_aligned_headdims_avoid_split_thread_allreduce(
     assert "simd_sum(" not in body
     assert "threadgroup_barrier(" not in body
     assert "red_buf_staging" not in body
-    _assert_bwd_partial_outputs(msl)
-    assert "dD_partial" in msl
+    _assert_bwd_lane_grad_outputs(msl)
+    assert "dD_lane_grad" in msl
 
 
 @pytest.mark.parametrize(
@@ -706,7 +706,7 @@ def test_runtime_bwd_msl_reuses_decay_scalar_without_dump_postprocess() -> None:
     """The tvm-ffi bwd runtime source must not rely on report-only MSL cleanup."""
 
     _require_mamba3_path_c()
-    _bwd_kernel, bwd_lowering = mamba3_path_c._bwd_partial_kernel_for_state_snapshots(
+    _bwd_kernel, bwd_lowering = mamba3_path_c._bwd_lane_grad_kernel_for_state_snapshots(
         1, 4, 1, 2, 4
     )
 
@@ -720,7 +720,7 @@ def test_runtime_bwd_msl_specializes_batch_one_index_base_for_full_lane_shape() 
 
     _require_mamba3_path_c()
     dtype_args = ("bfloat16",) * 18
-    _bwd_kernel, bwd_lowering = mamba3_path_c._bwd_partial_kernel_for_state_snapshots(
+    _bwd_kernel, bwd_lowering = mamba3_path_c._bwd_lane_grad_kernel_for_state_snapshots(
         1,
         2048,
         112,
@@ -743,7 +743,7 @@ def test_runtime_bwd_msl_elides_full_lane_guard_for_aligned_model_shape() -> Non
     _snap_kernel, snap_lowering = mamba3_path_c._bwd_state_snapshots_kernel_for(
         1, 2048, 112, 64, 64
     )
-    _partial_kernel, partial_lowering = mamba3_path_c._bwd_partial_kernel_for_state_snapshots(
+    _partial_kernel, partial_lowering = mamba3_path_c._bwd_lane_grad_kernel_for_state_snapshots(
         1, 2048, 112, 64, 64
     )
     _scratch_kernel, scratch_lowering = mamba3_path_c._bwd_scratch_partial_kernel_for(
@@ -763,7 +763,7 @@ def test_runtime_bwd_msl_keeps_lane_guard_for_unaligned_shape() -> None:
     """The exact-lane cleanup must not remove OOB protection on ragged grids."""
 
     _require_mamba3_path_c()
-    _partial_kernel, partial_lowering = mamba3_path_c._bwd_partial_kernel_for_state_snapshots(
+    _partial_kernel, partial_lowering = mamba3_path_c._bwd_lane_grad_kernel_for_state_snapshots(
         1, 4, 5, 65, 4
     )
     body = partial_lowering.msl_text.split("kernel void", 1)[1]
@@ -1361,7 +1361,7 @@ def test_bwd_scratch_route_uses_tilelang_post_reduce(monkeypatch) -> None:
 
     _require_mamba3_path_c()
     calls: list[tuple[str, ...] | None] = []
-    original_reduce = mamba3_path_c._reduce_bwd_partials_path_c_threaded_kernel
+    original_reduce = mamba3_path_c._reduce_bwd_lane_grads_path_c_threaded_kernel
 
     def wrapped_reduce(*args, **kwargs):
         output_dtypes = kwargs.get("output_dtypes")
@@ -1370,7 +1370,7 @@ def test_bwd_scratch_route_uses_tilelang_post_reduce(monkeypatch) -> None:
 
     monkeypatch.setattr(
         mamba3_path_c,
-        "_reduce_bwd_partials_path_c_threaded_kernel",
+        "_reduce_bwd_lane_grads_path_c_threaded_kernel",
         wrapped_reduce,
     )
 
@@ -1428,7 +1428,7 @@ def test_bwd_scratch_bf16_uses_serial_tilelang_post_reduce(monkeypatch) -> None:
     _require_mamba3_path_c()
     serial_calls: list[tuple[str, ...] | None] = []
     threaded_calls = 0
-    original_serial = mamba3_path_c._reduce_bwd_partials_path_c_kernel
+    original_serial = mamba3_path_c._reduce_bwd_lane_grads_path_c_kernel
 
     def wrapped_serial(*args, **kwargs):
         output_dtypes = kwargs.get("output_dtypes")
@@ -1442,12 +1442,12 @@ def test_bwd_scratch_bf16_uses_serial_tilelang_post_reduce(monkeypatch) -> None:
 
     monkeypatch.setattr(
         mamba3_path_c,
-        "_reduce_bwd_partials_path_c_kernel",
+        "_reduce_bwd_lane_grads_path_c_kernel",
         wrapped_serial,
     )
     monkeypatch.setattr(
         mamba3_path_c,
-        "_reduce_bwd_partials_path_c_threaded_kernel",
+        "_reduce_bwd_lane_grads_path_c_threaded_kernel",
         fail_threaded,
     )
 
@@ -1626,7 +1626,7 @@ def test_bwd_path_c_fp32_production_uses_tilelang_post_reduce(monkeypatch) -> No
 
     _require_mamba3_path_c()
     calls: list[tuple[str, ...] | None] = []
-    original_reduce = mamba3_path_c._reduce_bwd_partials_path_c_threaded_kernel
+    original_reduce = mamba3_path_c._reduce_bwd_lane_grads_path_c_threaded_kernel
 
     def wrapped_reduce(*args, **kwargs):
         output_dtypes = kwargs.get("output_dtypes")
@@ -1635,7 +1635,7 @@ def test_bwd_path_c_fp32_production_uses_tilelang_post_reduce(monkeypatch) -> No
 
     monkeypatch.setattr(
         mamba3_path_c,
-        "_reduce_bwd_partials_path_c_threaded_kernel",
+        "_reduce_bwd_lane_grads_path_c_threaded_kernel",
         wrapped_reduce,
     )
 

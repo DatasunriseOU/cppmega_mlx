@@ -1862,6 +1862,67 @@ def _scalarize_singleton_thread_arrays(msl: str) -> str:
     return msl
 
 
+def _canonicalize_sparse_mla_shmem_aliases(
+    msl: str,
+    *,
+    topk: int,
+    threads: int,
+    forward: bool,
+) -> str:
+    """Recover named shared-buffer aliases from TileLang's packed uchar buffer."""
+
+    if "((threadgroup float*)buf_shmem)" not in msl:
+        return msl
+
+    if forward:
+        declaration = (
+            f"  threadgroup float reduce_buf[{threads}];\n"
+            f"  threadgroup float scores[{topk}];"
+        )
+    else:
+        declaration = (
+            f"  threadgroup float scores[{topk}];\n"
+            f"  threadgroup float p[{topk}];\n"
+            f"  threadgroup float dp[{topk}];\n"
+            f"  threadgroup float ds[{topk}];\n"
+            f"  threadgroup float reduce_buf[{threads}];"
+        )
+    msl = re.sub(
+        r"(?m)^  threadgroup uchar buf_shmem\[\d+\];$",
+        declaration,
+        msl,
+        count=1,
+    )
+
+    base = r"\(\(threadgroup float\*\)buf_shmem\)"
+    shmem = "((threadgroup float*)buf_shmem)"
+    msl = re.sub(rf"{base}\[\((?:long\)?tid|tid)\)\]", "reduce_buf[tid]", msl)
+    msl = re.sub(rf"{base}\[tid\]", "reduce_buf[tid]", msl)
+    msl = re.sub(rf"{base}\[\((?:long\)?0|0)\)\]", "reduce_buf[0]", msl)
+    msl = re.sub(rf"{base}\[0\]", "reduce_buf[0]", msl)
+    msl = re.sub(
+        rf"{base}\[\((?:tid|(?:long\)?tid)) \+ (?:\(long\))?stride\)\]",
+        "reduce_buf[tid + stride]",
+        msl,
+    )
+    msl = re.sub(
+        rf"{base}\[\(tid \+ stride\)\]",
+        "reduce_buf[tid + stride]",
+        msl,
+    )
+
+    msl = msl.replace(f"{shmem}[(k + {topk})]", "scores[k]")
+    msl = msl.replace(f"{shmem}[((long)k + (long){topk})]", "scores[k]")
+    if forward:
+        return msl
+
+    msl = msl.replace(f"{shmem}[(k + {topk * 2})]", "p[k]")
+    msl = msl.replace(f"{shmem}[((long)k + (long){topk * 2})]", "p[k]")
+    msl = msl.replace(f"{shmem}[(k + {topk * 3})]", "ds[k]")
+    msl = msl.replace(f"{shmem}[((long)k + (long){topk * 3})]", "ds[k]")
+    return msl
+
+
 def _postprocess_lowered_msl(
     msl: str,
     *,
@@ -1891,6 +1952,24 @@ def _postprocess_lowered_msl(
     if remove_flat_kv_bounds:
         msl = _remove_redundant_flat_kv_bounds_checks(msl)
     msl = _scalarize_singleton_thread_arrays(msl)
+    if canonicalize_fwd:
+        if topk is None or threads is None:
+            raise ValueError("canonicalize_fwd requires topk and threads")
+        msl = _canonicalize_sparse_mla_shmem_aliases(
+            msl,
+            topk=topk,
+            threads=threads,
+            forward=True,
+        )
+    if canonicalize_bwd:
+        if topk is None or threads is None:
+            raise ValueError("canonicalize_bwd requires topk and threads")
+        msl = _canonicalize_sparse_mla_shmem_aliases(
+            msl,
+            topk=topk,
+            threads=threads,
+            forward=False,
+        )
     if forward_fast_return:
         if d_v is None or threads is None:
             raise ValueError("forward_fast_return requires d_v and threads")

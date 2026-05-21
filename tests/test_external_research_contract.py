@@ -304,7 +304,8 @@ def test_no_tracked_parquet_samples_or_runtime_overclaims() -> None:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     ).stdout.splitlines()
-    assert tracked_parquet == []
+    assert all(path.startswith("tests/fixtures/parquet/") for path in tracked_parquet)
+    assert not any(path.startswith("data/parquet_samples/") for path in tracked_parquet)
 
     forbidden_overclaims = (
         "M4 Max parity with GB10 is proven",
@@ -318,6 +319,7 @@ def test_no_tracked_parquet_samples_or_runtime_overclaims() -> None:
         assert phrase not in docs
 
     assert "not checked-in fixtures" in normalized
+    assert "committed tiny pytest fixtures" in normalized
     assert "M4 Max vs GB10 parity is not proven" in docs
     assert "Distributed MLX training is not implemented in this repo" in docs
     assert "full Megatron launcher/training parity remains outside the tiny-local scaffold" in normalized

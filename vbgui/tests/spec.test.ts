@@ -67,6 +67,45 @@ describe("specReducer", () => {
       { type: "backend.status", status: "connected" });
     expect(s.backend_status).toBe("connected");
   });
+
+  it("side_channels.set replaces generic side-channel policy", () => {
+    const s = specReducer(INITIAL_SPEC, {
+      type: "side_channels.set",
+      side_channels: {
+        ...INITIAL_SPEC.side_channels,
+        families: {
+          ...INITIAL_SPEC.side_channels.families,
+          platform: {
+            ...INITIAL_SPEC.side_channels.families.platform,
+            mode: "require",
+            dropout: 0.2,
+            fallback: "error",
+          },
+        },
+      },
+    });
+    expect(s.side_channels.families.platform.mode).toBe("require");
+    expect(s.side_channels.families.platform.dropout).toBe(0.2);
+    expect(s.side_channels.families.platform.fallback).toBe("error");
+  });
+});
+
+describe("side-channel defaults", () => {
+  it("INITIAL_SPEC exposes language-neutral side-channel families", () => {
+    expect(INITIAL_SPEC.side_channels.mode).toBe("auto");
+    expect(Object.keys(INITIAL_SPEC.side_channels.families)).toEqual([
+      "platform",
+      "syntax",
+      "structure",
+      "semantic_graph",
+      "temporal_diff",
+    ]);
+    expect(INITIAL_SPEC.side_channels.families.platform.columns).toEqual([
+      "platform_ids",
+      "source_platform_ids",
+    ]);
+    expect(INITIAL_SPEC.side_channels.inference.fail_policy).toBe("drop_family");
+  });
 });
 
 describe("memory helpers", () => {

@@ -50,6 +50,39 @@ export interface RewriterState {
   params: Record<string, number | string>;
 }
 
+export type SideChannelMode = "off" | "auto" | "require" | "if_available";
+export type SideChannelEmbedding = "categorical" | "numeric_bucket" | "span"
+                                 | "edge_bias" | "none";
+export type SideChannelFallback = "zeros" | "unknown_id" | "drop_family"
+                                | "error";
+export type InferenceEnrichmentSource = "none" | "prompt_only"
+                                      | "parse_if_possible" | "project_index"
+                                      | "auto";
+export type InferenceFailPolicy = "drop_family" | "text_only" | "error";
+
+export interface SideChannelFamilyState {
+  mode: SideChannelMode;
+  columns: string[];
+  embedding: SideChannelEmbedding;
+  dropout: number;
+  residual_scale: number;
+  fallback: SideChannelFallback;
+  language_scope: string[];
+}
+
+export interface InferenceEnrichmentState {
+  source: InferenceEnrichmentSource;
+  fail_policy: InferenceFailPolicy;
+  timeout_ms: number;
+  cache_enabled: boolean;
+}
+
+export interface SideChannelState {
+  mode: SideChannelMode;
+  families: Record<string, SideChannelFamilyState>;
+  inference: InferenceEnrichmentState;
+}
+
 export type TopologyFactory =
   | "h100_8x" | "h200_8x" | "a100_8x" | "b100_8x"
   | "gb10_quarter" | "tpu_v6e_8" | "tpu_v5p_4" | "m3_ultra_solo";
@@ -80,6 +113,7 @@ export interface SpecState {
   loss: LossState;
   optim: OptimState;
   rewriters: RewriterState[];
+  side_channels: SideChannelState;
   sharding: ShardingState;
   gotchas: GotchaState[];
   worst_rank_bytes: number;
@@ -99,6 +133,85 @@ export const INITIAL_SPEC: SpecState = {
     mixed_precision: true,
   },
   rewriters: [],
+  side_channels: {
+    mode: "auto",
+    families: {
+      platform: {
+        mode: "auto",
+        columns: ["platform_ids", "source_platform_ids"],
+        embedding: "categorical",
+        dropout: 0.10,
+        residual_scale: 1.0,
+        fallback: "drop_family",
+        language_scope: ["any"],
+      },
+      syntax: {
+        mode: "if_available",
+        columns: [
+          "token_ast_depth",
+          "token_sibling_index",
+          "token_ast_node_type",
+        ],
+        embedding: "categorical",
+        dropout: 0.25,
+        residual_scale: 1.0,
+        fallback: "drop_family",
+        language_scope: ["any"],
+      },
+      structure: {
+        mode: "if_available",
+        columns: [
+          "token_structure_ids",
+          "token_dep_levels",
+          "token_chunk_starts",
+          "token_chunk_ends",
+          "token_chunk_kinds",
+          "token_chunk_dep_levels",
+        ],
+        embedding: "categorical",
+        dropout: 0.25,
+        residual_scale: 1.0,
+        fallback: "drop_family",
+        language_scope: ["any"],
+      },
+      semantic_graph: {
+        mode: "if_available",
+        columns: [
+          "token_symbol_ids",
+          "token_call_targets",
+          "token_type_refs",
+          "token_def_use",
+          "token_call_edges",
+          "token_type_edges",
+        ],
+        embedding: "edge_bias",
+        dropout: 0.50,
+        residual_scale: 1.0,
+        fallback: "drop_family",
+        language_scope: ["any"],
+      },
+      temporal_diff: {
+        mode: "off",
+        columns: [
+          "token_change_mask_pre",
+          "token_change_mask_post",
+          "hunk_id_per_token",
+          "edit_op_per_token",
+        ],
+        embedding: "categorical",
+        dropout: 0.0,
+        residual_scale: 1.0,
+        fallback: "drop_family",
+        language_scope: ["any"],
+      },
+    },
+    inference: {
+      source: "auto",
+      fail_policy: "drop_family",
+      timeout_ms: 500,
+      cache_enabled: true,
+    },
+  },
   sharding: {
     topology: "h100_8x",
     axis_assignments: [{ axis_name: "dp", kind: "fsdp2", degree: 8 }],
@@ -127,6 +240,7 @@ export type SpecAction =
   | { type: "rewriters.add"; rewriter: RewriterState }
   | { type: "rewriters.remove"; index: number }
   | { type: "rewriters.reorder"; from: number; to: number }
+  | { type: "side_channels.set"; side_channels: SideChannelState }
   | { type: "sharding.set"; sharding: ShardingState }
   | { type: "gotchas.set"; gotchas: GotchaState[] }
   | { type: "memory.set"; worst_rank_bytes: number; device_hbm_bytes?: number }
@@ -154,6 +268,7 @@ export function specReducer(s: SpecState, a: SpecAction): SpecState {
       out.splice(a.to, 0, moved);
       return { ...s, rewriters: out };
     }
+    case "side_channels.set": return { ...s, side_channels: a.side_channels };
     case "sharding.set": return { ...s, sharding: a.sharding };
     case "gotchas.set":  return { ...s, gotchas: a.gotchas };
     case "memory.set":   return {

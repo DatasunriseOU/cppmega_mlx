@@ -102,6 +102,8 @@ _TRAINING_STATE_FIELDS = {
     "gradient_accumulator",
     "gradient_accumulator_present",
     "pending_microbatches",
+    "path_c_training_runtime_class",
+    "path_c_training_runtime_installed",
     "state",
 }
 _CHECKPOINT_MECHANIC_METADATA_ROOTS = {
@@ -795,6 +797,26 @@ def _validate_checkpoint_metadata(payload: dict[str, Any], metadata_path: Path) 
             raise ValueError(
                 f"checkpoint metadata {metadata_path}: "
                 "training_state.compiled must be a boolean"
+            )
+        runtime_installed = training_state.get("path_c_training_runtime_installed")
+        if runtime_installed is not None and not isinstance(runtime_installed, bool):
+            raise ValueError(
+                f"checkpoint metadata {metadata_path}: "
+                "training_state.path_c_training_runtime_installed must be a boolean"
+            )
+        runtime_class = training_state.get("path_c_training_runtime_class")
+        if runtime_class is not None and (
+            not isinstance(runtime_class, str) or not runtime_class.strip()
+        ):
+            raise ValueError(
+                f"checkpoint metadata {metadata_path}: "
+                "training_state.path_c_training_runtime_class must be a string"
+            )
+        if runtime_installed is False and runtime_class is not None:
+            raise ValueError(
+                f"checkpoint metadata {metadata_path}: "
+                "training_state.path_c_training_runtime_class must be null when "
+                "path_c_training_runtime_installed is false"
             )
         if pending_microbatches > 0 and not accumulator_present:
             raise ValueError(

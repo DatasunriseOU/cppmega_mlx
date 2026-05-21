@@ -166,6 +166,7 @@ The current collected test files are:
 
 - tests/test_archive_bench_baseline_script.py
 - tests/test_attention.py
+- tests/test_bench_1b_training_matrix.py
 - tests/test_bench_baselines.py
 - tests/test_bench_matrix.py
 - tests/test_bench_script.py
@@ -186,6 +187,7 @@ The current collected test files are:
 - tests/test_distributed_zero1.py
 - tests/test_distributed_zero1_loopback.py
 - tests/test_engram.py
+- tests/test_engram_doc_ids.py
 - tests/test_env_runtime.py
 - tests/test_eval.py
 - tests/test_external_research_contract.py
@@ -195,6 +197,7 @@ The current collected test files are:
 - tests/test_grad_buffer_no_aliasing.py
 - tests/test_grad_dtype_contract.py
 - tests/test_hybrid_lm.py
+- tests/test_hybrid_lm_extensions.py
 - tests/test_hybrid_lm_gradients.py
 - tests/test_inference_engine.py
 - tests/test_inference_generation.py
@@ -228,18 +231,27 @@ The current collected test files are:
 - tests/test_muon_ns_carrier_bench.py
 - tests/test_mxfp8_bridge.py
 - tests/test_nam56r_pattern.py
+- tests/test_nanochat_generators.py
 - tests/test_ngram_hash.py
 - tests/test_optimizer_no_master_contract.py
 - tests/test_optimizers_quantized.py
+- tests/test_pack_enriched_rows.py
 - tests/test_package_exports.py
 - tests/test_parity_manifest.py
 - tests/test_parquet_dataset.py
+- tests/test_path_c_fusion_compile_receipt_script.py
+- tests/test_path_c_fusion_ir.py
+- tests/test_path_c_fusion_templates.py
+- tests/test_path_c_physical_abi.py
 - tests/test_plasticity.py
+- tests/test_platform_context.py
+- tests/test_platform_embedding.py
 - tests/test_profile.py
 - tests/test_profile_capture_script.py
 - tests/test_pytest_markers.py
 - tests/test_quantized_muon_momentum.py
 - tests/test_real_parquet_samples.py
+- tests/test_render_1b_training_matrix_html.py
 - tests/test_runtime_exports.py
 - tests/test_seed_runtime.py
 - tests/test_sequence_packing.py
@@ -247,6 +259,7 @@ The current collected test files are:
 - tests/test_stp_loss.py
 - tests/test_structure_embedding.py
 - tests/test_system_requirements_doc.py
+- tests/test_tilelang_async_barrier_plan.py
 - tests/test_tilelang_bench_harness.py
 - tests/test_tilelang_experimental_imports.py
 - tests/test_tilelang_fp8_matmul_path_c_bench.py
@@ -257,6 +270,8 @@ The current collected test files are:
 - tests/test_tilelang_mamba3_helpers.py
 - tests/test_tilelang_mamba3_path_c.py
 - tests/test_tilelang_msl_transform.py
+- tests/test_tilelang_native_boundary.py
+- tests/test_tilelang_native_bridge_cmake_status.py
 - tests/test_tilelang_path_c_vs_b_parity.py
 - tests/test_tilelang_sparse_mla.py
 - tests/test_tilelang_sparse_mla_blockscaled.py
@@ -264,6 +279,7 @@ The current collected test files are:
 - tests/test_tilelang_sparse_mla_fp8.py
 - tests/test_tilelang_topk.py
 - tests/test_tiny_train.py
+- tests/test_token_coordinate_parquet.py
 - tests/test_token_dataset.py
 - tests/test_tokenizer_contract.py
 - tests/test_tokenizer_loader.py

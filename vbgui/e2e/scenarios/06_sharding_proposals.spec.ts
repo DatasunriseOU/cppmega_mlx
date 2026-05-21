@@ -4,7 +4,7 @@
 
 import { test, expect } from "@playwright/test";
 import {
-  gotoApp, selectPreset, clickTab,
+  gotoApp, selectPreset,
 } from "../fixtures";
 import { snapshot } from "../utils/screenshot";
 

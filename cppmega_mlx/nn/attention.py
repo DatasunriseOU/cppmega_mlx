@@ -391,6 +391,8 @@ def sparse_mla_fp8_route_enabled(path: KernelPath) -> bool:
     """Return whether the active dtype route explicitly enables FP8 Sparse-MLA."""
 
     value = os.environ.get(SPARSE_MLA_FP8_ROUTE_ENV, "").strip().lower()
+    if not value:
+        return False
     if path is KernelPath.PATH_C:
         return value in {"path_c", "c", "fp8_path_c"}
     if path is KernelPath.PATH_B:

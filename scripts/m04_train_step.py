@@ -63,6 +63,7 @@ from cppmega_mlx.runtime.path_c_fusion import (  # noqa: E402
 from cppmega_mlx.runtime.path_c_physical_abi import (  # noqa: E402
     PathCLogicalBufferOwner,
     compose_path_c_logical_buffer_owner,
+    make_physical_abi_bank_owner,
     plan_physical_abi_runtime_bridge,
     validate_physical_abi_runtime_bindings,
 )
@@ -2434,12 +2435,37 @@ def fp8_path_c_training_route_payload_for_model(
     model: Any,
     *,
     compile_receipt_path: str | Path | None = None,
+    auto_install_fused_train_block: bool = True,
+    fused_train_block_artifact_lowerer: Callable[..., Any] | None = None,
+    fused_train_block_artifact_target_name: str = "metal",
+    fused_train_block_artifact_execution_backend: str = "tvm_ffi",
 ) -> dict[str, Any]:
     """Return Path C training route metadata using model-owned ABI banks."""
 
+    sequence_length = path_c_training_sequence_length(args)
+    auto_install_report: dict[str, Any] | None = None
+    model_bank_owner = getattr(model, "path_c_physical_abi_bank_owner", None)
+    model_fused_artifact = getattr(model, "path_c_fused_train_block_artifact", None)
+    if (
+        auto_install_fused_train_block
+        and model_bank_owner is not None
+        and not callable(model_fused_artifact)
+    ):
+        auto_install_report = install_path_c_fused_train_block_runtime_for_model(
+            model=model,
+            bank_owner=model_bank_owner,
+            compile_artifact=True,
+            artifact_lowerer=fused_train_block_artifact_lowerer,
+            artifact_target_name=fused_train_block_artifact_target_name,
+            artifact_execution_backend=(
+                fused_train_block_artifact_execution_backend
+            ),
+            sequence_length=sequence_length,
+        )
+
     direct_chain_logical_owner = _path_c_direct_chain_logical_owner_for_model(model)
 
-    return fp8_path_c_training_route_payload(
+    route = fp8_path_c_training_route_payload(
         args,
         model=model,
         compile_receipt_path=compile_receipt_path,
@@ -2467,6 +2493,11 @@ def fp8_path_c_training_route_payload_for_model(
             None,
         ),
     )
+    if auto_install_report is not None:
+        path_c_fusion = route.get("path_c_fusion")
+        if isinstance(path_c_fusion, dict):
+            path_c_fusion["fused_train_block_auto_install"] = auto_install_report
+    return route
 
 
 def path_c_fusion_runtime_training_binding_payload(
@@ -2587,6 +2618,407 @@ def path_c_fusion_runtime_training_binding_payload(
             "no_hidden_allocation_policy": True,
             "reason": str(exc),
         }
+
+
+def _path_c_fused_train_block_plan_payload(plan: Any) -> dict[str, Any]:
+    contract = getattr(plan, "schedule_contract", None)
+    return {
+        "region_name": getattr(plan, "region_name", None),
+        "schedule_name": getattr(plan, "schedule_name", None),
+        "schedule_status": getattr(plan, "schedule_status", None),
+        "single_kernel_fused": bool(getattr(plan, "single_kernel_fused", False)),
+        "backward_graph": getattr(plan, "backward_graph", None),
+        "autograd_status": getattr(plan, "autograd_status", None),
+        "schedule_contract_status": getattr(contract, "status", None),
+        "declared_required_real_abi_inputs": list(
+            getattr(contract, "declared_required_real_abi_inputs", ()) or ()
+        ),
+        "missing_real_abi_inputs": list(
+            getattr(contract, "missing_real_abi_inputs", ()) or ()
+        ),
+    }
+
+
+def _path_c_fused_train_block_artifact_compile_report(
+    payload: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    if payload is None:
+        return None
+    report = dict(payload)
+    artifact = report.pop("artifact", None)
+    report["artifact_bound"] = callable(artifact)
+    report["artifact_type"] = (
+        type(artifact).__name__ if artifact is not None else None
+    )
+    return report
+
+
+def compile_path_c_fused_train_block_artifact_for_model(
+    *,
+    model: Any,
+    sequence_length: int | None = None,
+    target_name: str = "metal",
+    execution_backend: str = "tvm_ffi",
+    lowerer: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+    """Compile the selected model Path C train block as one callable artifact.
+
+    This compiles only the generated fused TileLang/TVM schedule. It does not
+    allocate physical ABI banks or attach the artifact to the model; callers
+    must still bind caller/model-owned banks before using the train-block route.
+    """
+
+    profile_name = str(getattr(model, "path_c_profile_name", "HybridTinyLM"))
+    runtime_owner = f"{profile_name}.path_c_fused_train_block_runtime"
+    route_context = _path_c_model_route_context(
+        model,
+        sequence_length=sequence_length,
+    )
+    selected_region = _select_path_c_model_route_region(route_context.regions)
+    if selected_region is None:
+        return {
+            "status": "blocked",
+            "reason": "model did not expose a Path C route region",
+            "runtime_owner": runtime_owner,
+            "route_region": None,
+            "native_compile_ok": False,
+            "hidden_packing_performed": False,
+            "artifact": None,
+        }
+
+    scheduled = plan_path_c_fusion_schedule_for_region(
+        selected_region,
+        include_backward=True,
+    )
+    schedule_target = getattr(scheduled, "schedule_target", None)
+    if schedule_target is None:
+        return {
+            "status": "blocked",
+            "reason": str(getattr(scheduled, "reason", "Path C schedule unavailable")),
+            "runtime_owner": runtime_owner,
+            "route_region": getattr(selected_region, "name", None),
+            "native_compile_ok": False,
+            "hidden_packing_performed": False,
+            "artifact": None,
+        }
+
+    native_lowerer = lowerer
+    if native_lowerer is None:
+
+        def native_lowerer(func_or_mod: Any, *, target: str, **kwargs: Any) -> Any:
+            return tilelang_single_entry_lowerer(
+                func_or_mod,
+                target=target,
+                execution_backend=execution_backend,
+                **kwargs,
+            )
+
+    schedule_template = mark_path_c_schedule_template_for_region(
+        schedule_target.schedule_template,
+        scheduled.region,
+        implementation_kind=schedule_target.implementation_kind,
+        production_schedule_id=schedule_target.schedule_id
+        if schedule_target.implementation_kind == "production"
+        else "",
+        required_real_abi_inputs=schedule_target.required_real_abi_inputs,
+    )
+    try:
+        compiled = compile_path_c_region(
+            scheduled.region,
+            schedule_template=schedule_template,
+            schedule_name=schedule_target.schedule_name,
+            schedule_status=schedule_target.schedule_status,
+            tilelang_lowerer=native_lowerer,
+            target=target_name,
+        )
+    except Exception as exc:
+        return {
+            "status": "blocked",
+            "reason": str(exc),
+            "error_type": type(exc).__name__,
+            "runtime_owner": runtime_owner,
+            "route_region": getattr(scheduled.region, "name", None),
+            "schedule_id": getattr(schedule_target, "schedule_id", None),
+            "schedule_name": getattr(schedule_target, "schedule_name", None),
+            "implementation_kind": getattr(
+                schedule_target,
+                "implementation_kind",
+                None,
+            ),
+            "native_compile_ok": False,
+            "hidden_packing_performed": False,
+            "artifact": None,
+        }
+
+    artifact = compiled.artifact if isinstance(compiled, CompiledPathCRegion) else None
+    plan = compiled.plan if isinstance(compiled, CompiledPathCRegion) else compiled
+    plan_payload = _path_c_fused_train_block_plan_payload(plan)
+    if artifact is None or not callable(artifact):
+        return {
+            "status": "blocked",
+            "reason": "fused train-block native compile did not produce a callable artifact",
+            "runtime_owner": runtime_owner,
+            "route_region": getattr(scheduled.region, "name", None),
+            "schedule_id": getattr(schedule_target, "schedule_id", None),
+            "schedule_name": getattr(schedule_target, "schedule_name", None),
+            "implementation_kind": getattr(
+                schedule_target,
+                "implementation_kind",
+                None,
+            ),
+            "native_compile_ok": False,
+            "hidden_packing_performed": False,
+            "plan": plan_payload,
+            "artifact": None,
+        }
+    if not bool(plan_payload["single_kernel_fused"]):
+        return {
+            "status": "blocked",
+            "reason": "compiled train-block plan is not a verified single fused kernel",
+            "runtime_owner": runtime_owner,
+            "route_region": getattr(scheduled.region, "name", None),
+            "schedule_id": getattr(schedule_target, "schedule_id", None),
+            "schedule_name": getattr(schedule_target, "schedule_name", None),
+            "implementation_kind": getattr(
+                schedule_target,
+                "implementation_kind",
+                None,
+            ),
+            "native_compile_ok": False,
+            "hidden_packing_performed": False,
+            "plan": plan_payload,
+            "artifact": None,
+        }
+    return {
+        "status": "ok",
+        "reason": (
+            "selected Path C model train block compiled to one callable "
+            "generated TileLang/TVM artifact"
+        ),
+        "runtime_owner": runtime_owner,
+        "route_region": getattr(scheduled.region, "name", None),
+        "schedule_id": getattr(schedule_target, "schedule_id", None),
+        "schedule_name": getattr(schedule_target, "schedule_name", None),
+        "implementation_kind": getattr(schedule_target, "implementation_kind", None),
+        "native_compile_ok": True,
+        "hidden_packing_performed": False,
+        "plan": plan_payload,
+        "artifact": artifact,
+    }
+
+
+def install_path_c_fused_train_block_runtime_for_model(
+    *,
+    model: Any,
+    bank_owner: Any | None = None,
+    bank_buffers: Mapping[str, Any] | None = None,
+    bank_buffer_owner: str | None = None,
+    fused_artifact: Any | None = None,
+    compile_artifact: bool = False,
+    artifact_lowerer: Callable[..., Any] | None = None,
+    artifact_target_name: str = "metal",
+    artifact_execution_backend: str = "tvm_ffi",
+    sequence_length: int | None = None,
+) -> dict[str, Any]:
+    """Attach a single fused train-block runtime when ABI binding is executable.
+
+    The fused route requires caller/model-owned physical ABI banks plus a
+    callable compiled artifact. This installer validates those objects against
+    the generated schedule ABI and never allocates, packs, reshapes, or casts
+    tensors to satisfy the binding.
+    """
+
+    profile_name = str(getattr(model, "path_c_profile_name", "HybridTinyLM"))
+    if bank_owner is not None and bank_buffers is not None:
+        return {
+            "status": "blocked",
+            "reason": "bank_owner and bank_buffers are mutually exclusive",
+            "runtime_owner": f"{profile_name}.path_c_fused_train_block_runtime",
+            "runtime_uses_fused_train_block": False,
+            "hidden_packing_performed": False,
+            "artifact_compile": None,
+            "execution": None,
+        }
+
+    route_context = _path_c_model_route_context(
+        model,
+        sequence_length=sequence_length,
+    )
+    selected_region = _select_path_c_model_route_region(route_context.regions)
+    if selected_region is None:
+        return {
+            "status": "blocked",
+            "reason": "model did not expose a Path C route region",
+            "runtime_owner": f"{profile_name}.path_c_fused_train_block_runtime",
+            "runtime_uses_fused_train_block": False,
+            "hidden_packing_performed": False,
+            "artifact_compile": None,
+            "execution": None,
+        }
+
+    scheduled = plan_path_c_fusion_schedule_for_region(
+        selected_region,
+        include_backward=True,
+    )
+    schedule_target = getattr(scheduled, "schedule_target", None)
+    if schedule_target is None:
+        return {
+            "status": "blocked",
+            "reason": str(getattr(scheduled, "reason", "Path C schedule unavailable")),
+            "runtime_owner": f"{profile_name}.path_c_fused_train_block_runtime",
+            "route_region": getattr(selected_region, "name", None),
+            "runtime_uses_fused_train_block": False,
+            "hidden_packing_performed": False,
+            "artifact_compile": None,
+            "execution": None,
+        }
+
+    resolved_artifact = (
+        fused_artifact
+        if fused_artifact is not None
+        else getattr(model, "path_c_fused_train_block_artifact", None)
+    )
+    resolved_bank_owner = (
+        bank_owner
+        if bank_owner is not None
+        else getattr(model, "path_c_physical_abi_bank_owner", None)
+    )
+    resolved_bank_buffers = bank_buffers
+    resolved_bank_buffer_owner = bank_buffer_owner
+    if resolved_bank_owner is None and bank_buffers is not None:
+        try:
+            prim_func = schedule_target.schedule_template(scheduled.region)
+            physical_abi_map = dict(
+                getattr(prim_func, "_cppmega_path_c_physical_buffer_abi_map", {})
+                or {}
+            )
+            physical_abi_shapes = dict(
+                getattr(
+                    prim_func,
+                    "_cppmega_path_c_physical_buffer_abi_shapes",
+                    {},
+                )
+                or {}
+            )
+            resolved_bank_owner = make_physical_abi_bank_owner(
+                bank_buffer_owner
+                or f"{profile_name}.path_c_physical_abi_banks",
+                physical_abi_map,
+                physical_abi_shapes,
+                bank_buffers,
+            )
+            resolved_bank_buffers = None
+            resolved_bank_buffer_owner = None
+        except Exception as exc:
+            return {
+                "status": "blocked",
+                "reason": f"physical ABI bank owner validation failed: {exc}",
+                "runtime_owner": f"{profile_name}.path_c_fused_train_block_runtime",
+                "route_region": getattr(selected_region, "name", None),
+                "runtime_uses_fused_train_block": False,
+                "hidden_packing_performed": False,
+                "artifact_compile": None,
+                "execution": None,
+            }
+
+    artifact_compile_payload: dict[str, Any] | None = None
+    if resolved_artifact is None and compile_artifact:
+        if resolved_bank_owner is None:
+            artifact_compile_payload = {
+                "status": "skipped_physical_abi_banks_missing",
+                "reason": (
+                    "fused train-block artifact compilation is deferred until "
+                    "caller/model-owned physical ABI banks are available; the "
+                    "installer will not allocate or pack banks implicitly"
+                ),
+                "native_compile_ok": False,
+                "hidden_packing_performed": False,
+                "artifact": None,
+            }
+        else:
+            artifact_compile_payload = (
+                compile_path_c_fused_train_block_artifact_for_model(
+                    model=model,
+                    sequence_length=sequence_length,
+                    target_name=artifact_target_name,
+                    execution_backend=artifact_execution_backend,
+                    lowerer=artifact_lowerer,
+                )
+            )
+            if artifact_compile_payload.get("status") != "ok":
+                return {
+                    "status": "blocked",
+                    "reason": artifact_compile_payload.get("reason"),
+                    "runtime_owner": f"{profile_name}.path_c_fused_train_block_runtime",
+                    "route_region": getattr(selected_region, "name", None),
+                    "runtime_uses_fused_train_block": False,
+                    "hidden_packing_performed": bool(
+                        artifact_compile_payload.get(
+                            "hidden_packing_performed",
+                            False,
+                        )
+                    ),
+                    "artifact_compile": (
+                        _path_c_fused_train_block_artifact_compile_report(
+                            artifact_compile_payload
+                        )
+                    ),
+                    "execution": None,
+                }
+            resolved_artifact = artifact_compile_payload.get("artifact")
+
+    runtime_binding = path_c_fusion_runtime_training_binding_payload(
+        region=scheduled.region,
+        schedule_target=schedule_target,
+        bank_buffers=resolved_bank_buffers,
+        bank_buffer_owner=resolved_bank_buffer_owner,
+        bank_owner=resolved_bank_owner,
+        fused_artifact=resolved_artifact,
+    )
+    runtime_owner = f"{profile_name}.path_c_fused_train_block_runtime"
+    if not bool(runtime_binding.get("runtime_uses_fused_train_block")):
+        return {
+            "status": "blocked",
+            "reason": runtime_binding.get("reason"),
+            "runtime_owner": runtime_owner,
+            "route_region": getattr(selected_region, "name", None),
+            "binding_status": runtime_binding.get("status"),
+            "runtime_uses_fused_train_block": False,
+            "runtime_binding": runtime_binding,
+            "hidden_packing_performed": bool(
+                runtime_binding.get("hidden_packing_performed", False)
+            ),
+            "artifact_compile": _path_c_fused_train_block_artifact_compile_report(
+                artifact_compile_payload
+            ),
+            "execution": None,
+        }
+
+    model.path_c_physical_abi_bank_owner = resolved_bank_owner
+    model.path_c_fused_train_block_artifact = resolved_artifact
+    return {
+        "status": "ok",
+        "runtime_owner": runtime_owner,
+        "route_region": getattr(selected_region, "name", None),
+        "binding_status": runtime_binding.get("status"),
+        "runtime_uses_fused_train_block": True,
+        "runtime_binding": runtime_binding,
+        "bank_buffer_owner": runtime_binding.get("bank_buffer_owner"),
+        "hidden_packing_performed": bool(
+            runtime_binding.get("hidden_packing_performed", False)
+        ),
+        "no_hidden_allocation_policy": bool(
+            runtime_binding.get("no_hidden_allocation_policy", True)
+        ),
+        "artifact_compile": _path_c_fused_train_block_artifact_compile_report(
+            artifact_compile_payload
+        ),
+        "execution": None,
+        "reason": (
+            "single fused train-block runtime is attached from model/caller-owned "
+            "physical ABI banks and a callable generated artifact"
+        ),
+    }
 
 
 def _path_c_direct_chain_plan_payload(chain: Any) -> dict[str, Any]:
@@ -3094,23 +3526,12 @@ class PathCDirectFusionChainTrainingRuntime:
                 raise ValueError(
                     "full-model Path C gradients require direct-chain hidden_grad"
                 )
-            normed_hidden_cotangent = (
-                buffers.get(f"{first_brick_name}_residual_norm_hidden_grad")
-                if first_brick_name is not None
-                else None
-            )
-            if (
-                normed_hidden_cotangent is not None
-                and not isinstance(normed_hidden_cotangent, mx.array)
-            ):
-                raise ValueError(
-                    "direct-chain residual_norm_hidden_grad must be an mx.array"
-                )
+            raw_hidden_cotangent = mx.zeros_like(hidden_cotangent)
             prefix_grads = path_c_prefix_gradient_tree_from_hidden_cotangent(
                 model=model,
                 batch=batch,
-                hidden_cotangent=hidden_cotangent,
-                normed_hidden_cotangent=normed_hidden_cotangent,
+                hidden_cotangent=raw_hidden_cotangent,
+                normed_hidden_cotangent=hidden_cotangent,
                 chain=self.chain,
             )
             grads = _path_c_merge_model_gradient_trees(
@@ -3897,6 +4318,10 @@ def make_path_c_direct_chain_pre_step_runtime_owner(
         batch,
         end_layer_index=start_layer_index,
     )
+    layers = tuple(getattr(model, "layers", ()))
+    boundary_hidden = prefix_hidden
+    if start_layer_index < len(layers):
+        boundary_hidden = layers[start_layer_index].norm(prefix_hidden)
     hidden_seed_names = {
         "hidden",
         f"{first_brick_name}_hidden",
@@ -3914,7 +4339,7 @@ def make_path_c_direct_chain_pre_step_runtime_owner(
                 missing_model_buffers.append(name)
             continue
         if name in hidden_seed_names:
-            buffers[name] = prefix_hidden
+            buffers[name] = boundary_hidden
             continue
         buffers[name] = mx.zeros(
             tuple(spec["shape"]),

@@ -837,14 +837,12 @@ class HybridTinyLM(nn.Module):
         }
         aliases: dict[str, tuple[str, ...]] = {}
 
-        def add(
-            layer_index: int,
-            parameter_suffix: str,
+        def add_parameter(
+            parameter_name: str,
             logical_suffix: str,
             *,
             block: HybridTinyBlock,
         ) -> None:
-            parameter_name = f"layers.{layer_index}.{parameter_suffix}"
             if parameter_name not in parameter_names:
                 return
             logical_prefixes = [block.path_c_brick_name]
@@ -855,13 +853,27 @@ class HybridTinyLM(nn.Module):
                 f"{prefix}_{logical_suffix}" for prefix in logical_prefixes
             )
 
-        for index, block in enumerate(self.layers):
-            add(
-                index,
-                "norm.weight",
+        def add(
+            layer_index: int,
+            parameter_suffix: str,
+            logical_suffix: str,
+            *,
+            block: HybridTinyBlock,
+        ) -> None:
+            add_parameter(
+                f"layers.{layer_index}.{parameter_suffix}",
+                logical_suffix,
+                block=block,
+            )
+
+        for index, block in enumerate(self.layers[:-1]):
+            add_parameter(
+                f"layers.{index + 1}.norm.weight",
                 "residual_norm_weight",
                 block=block,
             )
+
+        for index, block in enumerate(self.layers):
             if block.backend == "mamba3":
                 for parameter_suffix, logical_suffix in (
                     ("block.in_proj.weight", "mamba3_in_proj_weight"),

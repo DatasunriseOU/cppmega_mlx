@@ -2,11 +2,12 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
 import { Tooltip } from "@/components/Tooltip";
 import { _clearCatalogMemo } from "@/hooks/useCatalog";
+import type { RpcClient } from "@/lib/rpc";
 
-function fakeRpc(payload: unknown) {
+function fakeRpc(payload: unknown): RpcClient {
   return {
     call: vi.fn(async (_method: string, _params: unknown) => payload),
-  } as never;
+  } as unknown as RpcClient;
 }
 
 const LION_PAYLOAD = {

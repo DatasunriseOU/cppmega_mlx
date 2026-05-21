@@ -1,5 +1,5 @@
 // Wire-format types matching cppmega_v4.jsonrpc.schema (Pydantic side).
-// Keep in sync with SCHEMA_VERSION 1.0.0. When the backend bumps the
+// Keep in sync with SCHEMA_VERSION 1.1.0. When the backend bumps the
 // version, regen this file (codegen lands in F-D).
 
 export type JsonRpcVersion = "2.0";
@@ -24,7 +24,7 @@ export interface JsonRpcResponse<R = unknown> {
   error?: JsonRpcError;
 }
 
-export const SCHEMA_VERSION = "1.0.0";
+export const SCHEMA_VERSION = "1.1.0";
 
 // ---------------------------------------------------------------------------
 // Domain payloads
@@ -47,6 +47,39 @@ export interface GraphSpec {
 }
 
 export type Severity = "info" | "warning" | "error";
+
+export type SideChannelMode = "off" | "auto" | "require" | "if_available";
+export type SideChannelEmbedding = "categorical" | "numeric_bucket" | "span"
+                                 | "edge_bias" | "none";
+export type SideChannelFallback = "zeros" | "unknown_id" | "drop_family"
+                                | "error";
+export type InferenceEnrichmentSource = "none" | "prompt_only"
+                                      | "parse_if_possible" | "project_index"
+                                      | "auto";
+export type InferenceFailPolicy = "drop_family" | "text_only" | "error";
+
+export interface FamilySpecPayload {
+  mode: SideChannelMode;
+  columns: string[];
+  embedding: SideChannelEmbedding;
+  dropout: number;
+  residual_scale: number;
+  fallback: SideChannelFallback;
+  language_scope: string[];
+}
+
+export interface InferenceEnrichmentSpecPayload {
+  source: InferenceEnrichmentSource;
+  fail_policy: InferenceFailPolicy;
+  timeout_ms: number;
+  cache_enabled: boolean;
+}
+
+export interface SideChannelSpecPayload {
+  mode: SideChannelMode;
+  families: Record<string, FamilySpecPayload>;
+  inference: InferenceEnrichmentSpecPayload;
+}
 
 export interface EdgeResolution {
   src: string;

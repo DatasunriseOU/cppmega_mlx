@@ -353,9 +353,13 @@ def test_path_c_parameter_gradient_aliases_use_direct_and_profile_names():
         "layer_10_m_mamba3_in_proj_weight_grad",
         "local_gb10_quarter_brick_10_M_mamba3_in_proj_weight_grad",
     )
-    assert aliases["layers.10.norm.weight_grad"] == (
+    assert aliases["layers.11.norm.weight_grad"] == (
         "layer_10_m_residual_norm_weight_grad",
         "local_gb10_quarter_brick_10_M_residual_norm_weight_grad",
+    )
+    assert aliases["layers.12.norm.weight_grad"] == (
+        "layer_11_r_residual_norm_weight_grad",
+        "local_gb10_quarter_brick_11_R_residual_norm_weight_grad",
     )
     assert aliases["layers.11.block.state_weight_grad"] == (
         "layer_11_r_m2rnn_state_weight_grad",
@@ -381,6 +385,12 @@ def test_path_c_direct_logical_owner_uses_model_parameter_references_only():
     assert owner.buffers[
         "local_gb10_quarter_brick_10_M_mamba3_in_proj_weight"
     ] is params["layers.10.block.in_proj.weight"]
+    assert owner.buffers[
+        "local_gb10_quarter_brick_10_M_residual_norm_weight"
+    ] is params["layers.11.norm.weight"]
+    assert owner.buffers[
+        "local_gb10_quarter_brick_11_R_residual_norm_weight"
+    ] is params["layers.12.norm.weight"]
     assert owner.buffers[
         "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_attention_out_proj_weight"
     ] is params["layers.12.block.out_proj.weight"]

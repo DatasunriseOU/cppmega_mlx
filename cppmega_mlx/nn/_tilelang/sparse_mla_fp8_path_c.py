@@ -3313,18 +3313,22 @@ def sparse_mla_fp8_path_c_apply_prepared_float(
         q_in: mx.array,
         kv_in: mx.array,
     ) -> mx.array:
+        apply_kwargs: dict[str, Any] = {
+            "sm_scale": sm_scale,
+            "d_v": d_v,
+            "sinks": sinks,
+            "force_path_c": force_path_c,
+            "output_dtype": _mx_float_dtype(output_dtype, default=q_in.dtype),
+        }
+        if runtime_buffer_probe is not None:
+            apply_kwargs["runtime_buffer_probe"] = runtime_buffer_probe
         out = sparse_mla_fp8_path_c_apply(
             q_fp8,
             q_scale,
             kv_fp8,
             kv_scale,
             indices,
-            sm_scale=sm_scale,
-            d_v=d_v,
-            sinks=sinks,
-            force_path_c=force_path_c,
-            output_dtype=_mx_float_dtype(output_dtype, default=q_in.dtype),
-            runtime_buffer_probe=runtime_buffer_probe,
+            **apply_kwargs,
         )
         if out is None:
             if force_path_c:

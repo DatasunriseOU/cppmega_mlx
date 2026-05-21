@@ -65,7 +65,8 @@ Repo hygiene:
 - Keep .venv, __pycache__, pytest caches, .beads, agent logs, and
   data/parquet_samples/ out of commits. The Parquet samples are useful for
   local real-data smoke tests, but they are large local artifacts, not repo
-  fixtures.
+  fixtures and remain not checked-in fixtures. The only parquet files allowed
+  in git are committed tiny pytest fixtures under tests/fixtures/parquet/.
 
 Non-goals and limits:
 
