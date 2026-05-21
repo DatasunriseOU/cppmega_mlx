@@ -415,10 +415,32 @@ def stage_train(ctx: StageContext) -> StageResult:
                 reduction="mean",
             )
 
-        # Build inputs once: synthetic Gaussian embeddings (no real
-        # tokenizer dependence — train matrix isolates the gradient path).
+        # V3-2: prefer real tokens from a parquet shard when opts
+        # supplies parquet_path. Falls back to synthetic random targets
+        # when absent (preserves E-4 matrix behaviour). data_source +
+        # token_count surface in extras so deep e2e can prove the real-
+        # data path actually executed instead of silently degrading.
         rng_key = mx.random.key(0)
-        targets = mx.random.randint(0, vocab_size, shape=(batch, seq))
+        data_source = "synthetic"
+        token_count = 0
+        parquet_path = opts.get("parquet_path")
+        if parquet_path:
+            try:
+                tokens = _read_first_n_tokens(parquet_path, n=batch * seq)
+                if len(tokens) >= batch * seq:
+                    tokens = [int(t) % vocab_size for t in tokens[:batch * seq]]
+                    targets = mx.array(tokens, dtype=mx.int32).reshape(
+                        batch, seq)
+                    data_source = "parquet"
+                    token_count = len(tokens)
+                else:
+                    targets = mx.random.randint(
+                        0, vocab_size, shape=(batch, seq))
+            except Exception:
+                targets = mx.random.randint(
+                    0, vocab_size, shape=(batch, seq))
+        else:
+            targets = mx.random.randint(0, vocab_size, shape=(batch, seq))
         all_modules = nn.Sequential(*modules, lm_head)
         opt, optimizer_kind = _build_optimizer(spec_optim, lr)
         loss_and_grad = nn.value_and_grad(all_modules, loss_fn)
@@ -508,6 +530,8 @@ def stage_train(ctx: StageContext) -> StageResult:
                 "num_steps": n_steps,
                 "schedule_kind": schedule_kind_label,
                 "optimizer_kind": optimizer_kind,
+                "data_source": data_source,
+                "token_count": token_count,
                 "model_summary": _summarize_model(
                     ctx.spec, optimizer_kind, schedule_kind_label),
             },
@@ -519,6 +543,33 @@ def stage_train(ctx: StageContext) -> StageResult:
 # ---------------------------------------------------------------------------
 # Registry.
 # ---------------------------------------------------------------------------
+
+
+def _read_first_n_tokens(parquet_path: str, n: int) -> list[int]:
+    """V3-2: read the first ``n`` token ids from a parquet shard so
+    stage_train can train against real corpus tokens instead of a
+    random target tensor. Reuses the column-detection convention from
+    cppmega_v4.jsonrpc.data_methods (input_ids / token_ids / tokens)."""
+    import pyarrow.parquet as pq
+    table = pq.read_table(parquet_path)
+    primary = None
+    for c in ("input_ids", "token_ids", "tokens"):
+        if c in table.column_names:
+            primary = c
+            break
+    if primary is None:
+        return []
+    column = table.column(primary)
+    out: list[int] = []
+    for chunk in column.chunks:
+        for cell in chunk.to_pylist():
+            if cell is None:
+                continue
+            for tok in cell:
+                out.append(int(tok))
+                if len(out) >= n:
+                    return out
+    return out
 
 
 def _build_optimizer(
