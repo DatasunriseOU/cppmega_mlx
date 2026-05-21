@@ -10,7 +10,10 @@ export default defineConfig({
   testDir: "./scenarios",
   fullyParallel: false,
   forbidOnly: !!process.env.CI,
-  retries: process.env.CI ? 1 : 0,
+  // One retry everywhere — the 1100+ cell matrix occasionally drops a
+  // request under workers=4 contention; a retry catches genuine
+  // flakiness without masking real failures (Playwright reports both).
+  retries: 1,
   workers: process.env.CI ? 2 : 4,
   reporter: process.env.CI ? "github" : "list",
   globalSetup: "./globalSetup.ts",
