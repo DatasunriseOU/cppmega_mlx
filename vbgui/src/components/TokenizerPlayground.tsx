@@ -35,6 +35,13 @@ export interface TokenizerPlaygroundProps {
   rpc: RpcClient;
   initialSources?: string[];      // up to 3
   maxPanels?: number;             // default 3
+  /** V4-3: callback when user picks this tokenizer for training.
+   *  App stores in trainTokenizerPath; handleRunPipeline forwards via
+   *  stage_options.train.tokenizer_path so backend V4-2 path can
+   *  tokenize parquet text. */
+  onUseForTrain?: (tokenizerSource: string) => void;
+  /** V4-3: current path App is using for training (drives ✓ label). */
+  trainTokenizerPath?: string | null;
 }
 
 const COLORS = ["#fde68a", "#bfdbfe", "#bbf7d0", "#fecaca", "#ddd6fe",
@@ -47,6 +54,7 @@ function colorForId(id: number, isSpecial: boolean): string {
 
 export function TokenizerPlayground({
   rpc, initialSources = [], maxPanels = 3,
+  onUseForTrain, trainTokenizerPath,
 }: TokenizerPlaygroundProps): JSX.Element {
   const [text, setText] = useState("Hello, world!\ndef foo():\n  return 42");
   const [hoverSpan, setHoverSpan] = useState<{ start: number; end: number } | null>(null);
@@ -113,7 +121,9 @@ export function TokenizerPlayground({
                           onSourceChange={(s) => setSource(i, s)}
                           onEncode={() => runEncode(i)}
                           onRemove={() => removePanel(i)}
-                          onHover={setHoverSpan} />
+                          onHover={setHoverSpan}
+                          onUseForTrain={onUseForTrain}
+                          trainTokenizerPath={trainTokenizerPath} />
         ))}
       </div>
     </div>
@@ -129,10 +139,13 @@ interface TokenizerPanelProps {
   onEncode: () => void;
   onRemove: () => void;
   onHover: (span: { start: number; end: number } | null) => void;
+  onUseForTrain?: (tokenizerSource: string) => void;
+  trainTokenizerPath?: string | null;
 }
 
 function TokenizerPanel({
   index, state, hoverSpan, onSourceChange, onEncode, onRemove, onHover,
+  onUseForTrain, trainTokenizerPath,
 }: TokenizerPanelProps): JSX.Element {
   return (
     <section data-testid={`tokenizer-panel-${index}`}
@@ -148,6 +161,22 @@ function TokenizerPanel({
         <button data-testid={`tokenizer-encode-${index}`} onClick={onEncode}>
           Encode
         </button>
+        {onUseForTrain && (
+          <button data-testid={`tokenizer-use-for-train-${index}`}
+                  disabled={!state.source}
+                  title={trainTokenizerPath === state.source
+                    ? "Currently used for training"
+                    : "Send this tokenizer to stage_train"}
+                  onClick={() => onUseForTrain(state.source)}
+                  style={{
+                    background: trainTokenizerPath === state.source
+                      ? "#dcfce7" : undefined,
+                    color: trainTokenizerPath === state.source
+                      ? "#166534" : undefined,
+                  }}>
+            {trainTokenizerPath === state.source ? "✓ Train" : "→ Train"}
+          </button>
+        )}
         <button data-testid={`tokenizer-remove-${index}`} onClick={onRemove}>×</button>
       </div>
 

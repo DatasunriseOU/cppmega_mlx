@@ -71,6 +71,42 @@ describe("TokenizerPlayground", () => {
     expect(screen.getByTestId("tokenizer-panel-0")).toBeTruthy();
   });
 
+  // V4-3: Use-for-train button
+  it("tokenizer-use-for-train-{i} hidden when onUseForTrain absent", () => {
+    render(<TokenizerPlayground rpc={mockClient(SAMPLE_RESULT)}
+                                initialSources={["/x.json"]} />);
+    expect(screen.queryByTestId("tokenizer-use-for-train-0")).toBeNull();
+  });
+
+  it("tokenizer-use-for-train-{i} disabled until source is set", () => {
+    const onUseForTrain = vi.fn();
+    render(<TokenizerPlayground rpc={mockClient(SAMPLE_RESULT)}
+                                initialSources={[""]}
+                                onUseForTrain={onUseForTrain} />);
+    expect(screen.getByTestId("tokenizer-use-for-train-0")
+      .hasAttribute("disabled")).toBe(true);
+  });
+
+  it("tokenizer-use-for-train-{i} fires onUseForTrain(source)", () => {
+    const onUseForTrain = vi.fn();
+    render(<TokenizerPlayground rpc={mockClient(SAMPLE_RESULT)}
+                                initialSources={["/my/tok.json"]}
+                                onUseForTrain={onUseForTrain} />);
+    fireEvent.click(screen.getByTestId("tokenizer-use-for-train-0"));
+    expect(onUseForTrain).toHaveBeenCalledWith("/my/tok.json");
+  });
+
+  it("active panel shows ✓ Train when trainTokenizerPath matches", () => {
+    render(<TokenizerPlayground rpc={mockClient(SAMPLE_RESULT)}
+                                initialSources={["/active.json", "/other.json"]}
+                                onUseForTrain={() => {}}
+                                trainTokenizerPath="/active.json" />);
+    expect(screen.getByTestId("tokenizer-use-for-train-0").textContent)
+      .toContain("✓ Train");
+    expect(screen.getByTestId("tokenizer-use-for-train-1").textContent)
+      .not.toContain("✓ Train");
+  });
+
   it("Renders error envelope when backend fails", async () => {
     const failing = new RpcClient({
       baseUrl: "http://x",

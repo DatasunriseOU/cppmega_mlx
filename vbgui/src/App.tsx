@@ -407,7 +407,9 @@ export function App(): JSX.Element {
             </>
           )}
           {activeTab === "tokenizer" && (
-            <TokenizerPlayground rpc={rpc} />
+            <TokenizerPlayground rpc={rpc}
+              onUseForTrain={(t) => setTrainTokenizerPath(t)}
+              trainTokenizerPath={trainTokenizerPath} />
           )}
           {activeTab === "data" && (
             <DataInspector rpc={rpc}
