@@ -34,6 +34,35 @@ describe("TopBar", () => {
     expect(screen.getByTestId("run-pipeline")).toBeTruthy();
   });
 
+  // V4-1: train-data-source indicator
+  it("train-data-source reads 'synthetic' when no parquet selected", () => {
+    render(<TopBar {...defaultTopProps()} />);
+    expect(screen.getByTestId("train-data-source").textContent)
+      .toBe("synthetic");
+  });
+
+  it("train-data-source shows parquet basename when trainParquetPath set",
+    () => {
+      render(<TopBar {...defaultTopProps({
+        trainParquetPath: "/tmp/fixtures/T2_gpt2_small__P1.parquet",
+      })} />);
+      const indicator = screen.getByTestId("train-data-source").textContent!;
+      expect(indicator).toContain("parquet:");
+      expect(indicator).toContain("T2_gpt2_small__P1.parquet");
+      expect(indicator).not.toContain("/tmp/");
+    });
+
+  it("train-data-source appends tokenizer basename when both set", () => {
+    render(<TopBar {...defaultTopProps({
+      trainParquetPath: "/a/b/foo.parquet",
+      trainTokenizerPath: "/x/y/cppmega_tokenizer.json",
+    })} />);
+    const t = screen.getByTestId("train-data-source").textContent!;
+    expect(t).toContain("foo.parquet");
+    expect(t).toContain("tok:");
+    expect(t).toContain("cppmega_tokenizer.json");
+  });
+
   it("preset launcher fires onPresetDrop when chosen", () => {
     const onPresetDrop = vi.fn();
     render(<TopBar {...defaultTopProps({ onPresetDrop })} />);

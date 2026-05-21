@@ -22,6 +22,11 @@ export interface DataInspectorProps {
   rpc: RpcClient;
   initialPath?: string;
   pageSize?: number;
+  /** V4-1: callback when user picks the loaded parquet for training.
+   *  App stores the path and forwards via stage_options.train.parquet_path. */
+  onUseForTrain?: (parquetPath: string, tokenizerPath: string | null) => void;
+  /** V4-1: current path App is using for training (drives button label). */
+  trainParquetPath?: string | null;
 }
 
 const CHANNEL_COLORS = ["#fde68a", "#bfdbfe", "#bbf7d0", "#fecaca",
@@ -56,6 +61,7 @@ interface RoundtripCheckResult {
 
 export function DataInspector({
   rpc, initialPath = "", pageSize = 16,
+  onUseForTrain, trainParquetPath,
 }: DataInspectorProps): JSX.Element {
   const [path, setPath] = useState(initialPath);
   const [offset, setOffset] = useState(0);
@@ -117,6 +123,21 @@ export function DataInspector({
                style={{ flex: 1, fontFamily: "monospace", fontSize: 11 }} />
         <button data-testid="data-load" onClick={() => load(0)}>
           Load
+        </button>
+        <button data-testid="data-use-for-train"
+                disabled={!result || !onUseForTrain}
+                title={trainParquetPath === path
+                  ? "Currently used for training"
+                  : "Send this parquet (and tokenizer if set) to stage_train"}
+                onClick={() => onUseForTrain?.(path,
+                  tokenizerSource || null)}
+                style={{
+                  background: trainParquetPath === path
+                    ? "#dcfce7" : undefined,
+                  color: trainParquetPath === path
+                    ? "#166534" : undefined,
+                }}>
+          {trainParquetPath === path ? "✓ Training" : "Use for training"}
         </button>
       </header>
       <header style={{ display: "flex", gap: 8, alignItems: "center" }}>

@@ -97,6 +97,12 @@ export function App(): JSX.Element {
     { brick: string; param: string; value: unknown;
       source: "user" | "auto"; reason: string }[]
   >([]);
+  // V4-1: data source for stage_train. When set, handleRunPipeline
+  // forwards via stage_options.train.parquet_path; UI shows indicator.
+  const [trainParquetPath, setTrainParquetPath] =
+    useState<string | null>(null);
+  const [trainTokenizerPath, setTrainTokenizerPath] =
+    useState<string | null>(null);
 
   const rpc = useRpc({
     baseUrl: (import.meta.env.VITE_BACKEND_URL as string | undefined)
@@ -275,9 +281,16 @@ export function App(): JSX.Element {
     const stages = mode === "smoke" ? SMOKE_STAGES
                  : mode === "full"  ? FULL_STAGES : TRAIN_STAGES;
     // V3-6: TopBar exposes train_num_steps; thread it via stage_options.
+    // V4-1: forward parquet_path + tokenizer_path picked in Data/Tokenizer tabs.
     const stage_options: Record<string, Record<string, unknown>> = {};
-    if (mode === "train" && typeof opts?.num_steps === "number") {
-      stage_options.train = { num_steps: opts.num_steps };
+    if (mode === "train") {
+      const trainOpts: Record<string, unknown> = {};
+      if (typeof opts?.num_steps === "number") {
+        trainOpts.num_steps = opts.num_steps;
+      }
+      if (trainParquetPath) trainOpts.parquet_path = trainParquetPath;
+      if (trainTokenizerPath) trainOpts.tokenizer_path = trainTokenizerPath;
+      if (Object.keys(trainOpts).length > 0) stage_options.train = trainOpts;
     }
     try {
       const r = await rpc.call<RunReport>("pipeline.run", {
@@ -288,7 +301,7 @@ export function App(): JSX.Element {
     } catch (e) {
       setRunError(String(e));
     }
-  }, [rpc]);
+  }, [rpc, trainParquetPath, trainTokenizerPath]);
 
   const handleShardingAccept = useCallback((idx: number) => {
     const chosen = proposals[idx];
@@ -317,6 +330,8 @@ export function App(): JSX.Element {
           onCompileModeChange={(m) => dispatch({ type: "sharding.set",
             sharding: { ...spec.sharding, compile_mode: m } })}
           onRunPipeline={handleRunPipeline}
+          trainParquetPath={trainParquetPath}
+          trainTokenizerPath={trainTokenizerPath}
           trainDisabled={
             (() => {
               // V3-8/V3-9: gate Train on gotcha severity. The verify RPC
@@ -395,7 +410,12 @@ export function App(): JSX.Element {
             <TokenizerPlayground rpc={rpc} />
           )}
           {activeTab === "data" && (
-            <DataInspector rpc={rpc} />
+            <DataInspector rpc={rpc}
+              onUseForTrain={(p, t) => {
+                setTrainParquetPath(p);
+                if (t !== null) setTrainTokenizerPath(t);
+              }}
+              trainParquetPath={trainParquetPath} />
           )}
         </div>
         <BottomStrip state={spec} fusedRegionCount={0} />

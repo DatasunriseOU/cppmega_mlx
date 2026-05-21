@@ -17,6 +17,12 @@ export interface TopBarProps {
   /** V3-8/V3-9: when present, Train button is rendered disabled with
    *  reason exposed via data-testid='top-bar-train-disabled-reason'. */
   trainDisabled?: { reason: string } | null;
+  /** V4-1: parquet + tokenizer paths picked in Data/Tokenizer tabs.
+   *  Drives the data-testid='train-data-source' indicator next to
+   *  Train so the user can tell whether training will use real tokens
+   *  or fall back to synthetic. */
+  trainParquetPath?: string | null;
+  trainTokenizerPath?: string | null;
 }
 
 export function TopBar(p: TopBarProps): JSX.Element {
@@ -58,6 +64,17 @@ export function TopBar(p: TopBarProps): JSX.Element {
       </select>
 
       <MemoryBar state={p.state} />
+
+      <span data-testid="train-data-source"
+            style={{ fontSize: 10,
+                     color: p.trainParquetPath ? "#16a34a" : "#9ca3af",
+                     fontFamily: "monospace" }}>
+        {p.trainParquetPath
+          ? `parquet: ${basename(p.trainParquetPath)}` +
+            (p.trainTokenizerPath
+              ? ` · tok: ${basename(p.trainTokenizerPath)}` : "")
+          : "synthetic"}
+      </span>
 
       <div style={{ position: "relative" }}>
         <button data-testid="run-pipeline"
@@ -111,6 +128,11 @@ export function TopBar(p: TopBarProps): JSX.Element {
       </div>
     </header>
   );
+}
+
+function basename(p: string): string {
+  const slash = p.lastIndexOf("/");
+  return slash >= 0 ? p.slice(slash + 1) : p;
 }
 
 const menuItem: React.CSSProperties = {

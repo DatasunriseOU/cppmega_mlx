@@ -91,6 +91,54 @@ describe("DataInspector", () => {
     });
   });
 
+  // V4-1: Use-for-train button
+  it("data-use-for-train disabled until parquet loaded", () => {
+    render(<DataInspector rpc={mockClient(SAMPLE)} initialPath="/x"
+                          onUseForTrain={() => {}} />);
+    expect(screen.getByTestId("data-use-for-train")
+      .hasAttribute("disabled")).toBe(true);
+  });
+
+  it("data-use-for-train fires onUseForTrain(path, null) after load",
+    async () => {
+      const onUseForTrain = vi.fn();
+      render(<DataInspector rpc={mockClient(SAMPLE)}
+                            initialPath="/tmp/sh.parquet"
+                            onUseForTrain={onUseForTrain} />);
+      fireEvent.click(screen.getByTestId("data-load"));
+      await waitFor(() => {
+        expect(screen.getByTestId("data-metrics")).toBeTruthy();
+      });
+      fireEvent.click(screen.getByTestId("data-use-for-train"));
+      expect(onUseForTrain).toHaveBeenCalledWith("/tmp/sh.parquet", null);
+    });
+
+  it("data-use-for-train fires onUseForTrain(path, tokenizer) when both set",
+    async () => {
+      const onUseForTrain = vi.fn();
+      render(<DataInspector rpc={mockClient(SAMPLE)}
+                            initialPath="/p.parquet"
+                            onUseForTrain={onUseForTrain} />);
+      fireEvent.click(screen.getByTestId("data-load"));
+      await waitFor(() =>
+        expect(screen.getByTestId("data-metrics")).toBeTruthy());
+      fireEvent.change(screen.getByTestId("data-tokenizer-path"),
+        { target: { value: "/t.json" } });
+      fireEvent.click(screen.getByTestId("data-use-for-train"));
+      expect(onUseForTrain).toHaveBeenCalledWith("/p.parquet", "/t.json");
+    });
+
+  it("data-use-for-train shows ✓ Training when this path is active", async () => {
+    render(<DataInspector rpc={mockClient(SAMPLE)} initialPath="/p"
+                          trainParquetPath="/p"
+                          onUseForTrain={() => {}} />);
+    fireEvent.click(screen.getByTestId("data-load"));
+    await waitFor(() =>
+      expect(screen.getByTestId("data-metrics")).toBeTruthy());
+    expect(screen.getByTestId("data-use-for-train").textContent)
+      .toContain("Training");
+  });
+
   it("renders error envelope when backend fails", async () => {
     const failing = new RpcClient({
       baseUrl: "http://x",
