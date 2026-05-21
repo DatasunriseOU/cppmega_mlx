@@ -317,6 +317,8 @@ export function App(): JSX.Element {
                 gotchas={spec.gotchas}
                 proposals={proposals}
                 rpc={rpc}
+                graphNodes={nodes}
+                graphEdges={edges}
                 onLossApply={(l) => dispatch({ type: "loss.set", loss: l })}
                 onOptimApply={(o) => dispatch({ type: "optim.set", optim: o })}
                 onRewriterAdd={(r) =>

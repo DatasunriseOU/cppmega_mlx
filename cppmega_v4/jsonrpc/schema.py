@@ -553,6 +553,7 @@ METHOD_REGISTRY: frozenset[str] = frozenset({
     "catalog.explain",
     "catalog.list_options",
     "architectures.list_presets",
+    "suggest_optim_groups",
 })
 
 
@@ -564,6 +565,40 @@ class ArchitecturesListPresetsResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     presets: list[str] = Field(default_factory=list)
+
+
+class SuggestOptimGroupsParams(BaseModel):
+    """suggest_optim_groups — auto-classify graph parameters into
+    matcher-based optimizer groups (E7-4)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    graph: GraphSpec
+    optim_kind: str = "muon_adamw_hybrid"
+    hidden_size: int = 128
+
+
+class ProposedGroupPayload(BaseModel):
+    """Wire form of group_inference.ProposedGroup."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    matcher: str
+    optim_kind: str
+    lr: float
+    weight_decay: float
+    betas: tuple[float, float] | None = None
+    ns_steps: int | None = None
+    param_count: int
+    rationale: str
+
+
+class SuggestOptimGroupsResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    proposals: list[ProposedGroupPayload] = Field(default_factory=list)
+    total_params: int = 0
+    uncovered_params: int = 0
 
 
 class CatalogExplainParams(BaseModel):

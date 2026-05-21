@@ -35,6 +35,7 @@ from cppmega_v4.jsonrpc.catalog_methods import (
     catalog_explain,
     catalog_list_options,
 )
+from cppmega_v4.jsonrpc.suggest_groups_method import suggest_optim_groups
 from cppmega_v4.jsonrpc.schema import (
     BuildPresetSpecsParams,
     CatalogExplainParams,
@@ -47,6 +48,7 @@ from cppmega_v4.jsonrpc.schema import (
     PipelineRunResult,
     ProbeRunParams,
     SuggestAdaptersParams,
+    SuggestOptimGroupsParams,
     SuggestShardingParams,
     VerifyParams,
 )
@@ -97,6 +99,10 @@ _ROUTES: Mapping[str, tuple[type[BaseModel], _Handler]] = {
     "catalog.list_options": (
         CatalogListOptionsParams,
         lambda p, c: catalog_list_options(p, cache=c),
+    ),
+    "suggest_optim_groups": (
+        SuggestOptimGroupsParams,
+        lambda p, c: suggest_optim_groups(p, cache=c),
     ),
 }
 

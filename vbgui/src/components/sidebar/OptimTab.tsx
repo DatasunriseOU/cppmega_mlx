@@ -4,7 +4,9 @@ import type { OptimKind, OptimState, ParamGroupState,
 import { ScheduleEditor } from "@/components/ScheduleEditor";
 import { Tooltip } from "@/components/Tooltip";
 import { ExplainModal } from "@/components/ExplainModal";
+import { AutoGroupButton } from "@/components/AutoGroupButton";
 import type { RpcClient } from "@/lib/rpc";
+import type { Node, Edge } from "@xyflow/react";
 
 export interface OptimTabProps {
   optim: OptimState;
@@ -12,6 +14,10 @@ export interface OptimTabProps {
   /** Optional RPC client for tooltip + Apply-recommended integration.
    *  When omitted the tooltip surface is rendered but inert. */
   rpc?: RpcClient | null;
+  /** Canvas state for the Auto-group button. When omitted the button
+   *  is rendered but disabled. */
+  graphNodes?: Node[];
+  graphEdges?: Edge[];
 }
 
 const KINDS: OptimKind[] = [
@@ -36,11 +42,14 @@ const DEFAULT_NEW_GROUP: ParamGroupState = {
   matcher: "regex:.*", lr: 1e-4, weight_decay: 0.0,
 };
 
-export function OptimTab({ optim, onApply, rpc }: OptimTabProps): JSX.Element {
+export function OptimTab({
+  optim, onApply, rpc, graphNodes, graphEdges,
+}: OptimTabProps): JSX.Element {
   const [draft, setDraft] = useState<OptimState>(optim);
   const [expandedSchedules, setExpandedSchedules] =
     useState<Set<number>>(new Set());
   const [explainKind, setExplainKind] = useState<OptimKind | null>(null);
+  const [autoGroupBanner, setAutoGroupBanner] = useState<string | null>(null);
 
   function applyRecommendedToKind(params: Record<string, unknown>) {
     // The first group governs lr; we copy lr/weight_decay/betas from
@@ -157,7 +166,29 @@ export function OptimTab({ optim, onApply, rpc }: OptimTabProps): JSX.Element {
         )
       ))}
 
-      <button data-testid="optim-add-group" onClick={addGroup}>+ Add group</button>
+      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+        <button data-testid="optim-add-group" onClick={addGroup}>
+          + Add group
+        </button>
+        <AutoGroupButton
+          rpc={rpc ?? null}
+          optimKind={draft.kind}
+          nodes={graphNodes ?? []}
+          edges={graphEdges ?? []}
+          onApply={(groups, banner) => {
+            setDraft({ ...draft, groups });
+            setAutoGroupBanner(banner);
+          }}
+        />
+      </div>
+      {autoGroupBanner && (
+        <pre data-testid="optim-auto-group-banner"
+             style={{ background: "#eff6ff", color: "#1e40af",
+                      padding: 6, borderRadius: 4, fontSize: 11,
+                      whiteSpace: "pre-wrap", marginTop: 4 }}>
+          {autoGroupBanner}
+        </pre>
+      )}
 
       <label>grad_clip_norm
         <input data-testid="optim-clip" type="number" step={0.1}

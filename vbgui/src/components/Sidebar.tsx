@@ -29,6 +29,9 @@ export interface SidebarProps {
   /** Optional rpc client — enables tooltip/explain integration in
    *  OptimTab and downstream tabs. App passes useRpc() here. */
   rpc?: import("@/lib/rpc").RpcClient | null;
+  /** Optional canvas state — required for OptimTab Auto-group button. */
+  graphNodes?: import("@xyflow/react").Node[];
+  graphEdges?: import("@xyflow/react").Edge[];
 }
 
 const TAB_LABELS: { key: SidebarTab; label: string }[] = [
@@ -68,7 +71,11 @@ export function Sidebar(p: SidebarProps): JSX.Element {
       </nav>
       <div style={{ flex: 1, overflowY: "auto" }}>
         {active === "loss"      && <LossTab loss={p.loss} onApply={p.onLossApply} />}
-        {active === "optim"     && <OptimTab optim={p.optim} onApply={p.onOptimApply} rpc={p.rpc ?? null} />}
+        {active === "optim"     && <OptimTab optim={p.optim}
+                                              onApply={p.onOptimApply}
+                                              rpc={p.rpc ?? null}
+                                              graphNodes={p.graphNodes}
+                                              graphEdges={p.graphEdges} />}
         {active === "rewriters" && (
           <RewritersTab rewriters={p.rewriters}
                         onAdd={p.onRewriterAdd}
