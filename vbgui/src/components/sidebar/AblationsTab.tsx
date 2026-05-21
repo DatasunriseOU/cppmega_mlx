@@ -216,7 +216,8 @@ export function AblationsTab({
                     )}
                     <code>{r.variant}</code>
                   </td>
-                  <td style={td}>{final?.toFixed(4) ?? "—"}</td>
+                  <td data-testid={`ablation-final-${r.variant}`}
+                      style={td}>{final?.toFixed(4) ?? "—"}</td>
                   <td style={{ ...td,
                                 color: delta == null ? "#9ca3af"
                                        : delta > 0 ? "#dc2626" : "#16a34a" }}>
