@@ -707,10 +707,33 @@ def stage_train(ctx: StageContext) -> StageResult:
         fp8_active = False
         # Wire fp8_enabled from spec.sharding (payload pydantic model)
         ws_sharding = getattr(ctx.spec, "sharding", None)
+        sharding_applied: dict[str, Any] | None = None
         if ws_sharding is not None:
             fp8_active = bool(getattr(ws_sharding, "fp8_enabled", False))
             if fp8_active:
                 train_dtype = "fp8"
+            # G05: surface axis_assignments so e2e can prove UI sharding
+            # selection reaches stage_train (math is single-device for
+            # stage_train; real distributed train is v6).
+            axes = getattr(ws_sharding, "axis_assignments", None) or []
+            if axes:
+                shard_dim = 1
+                axis_list = []
+                for a in axes:
+                    deg = int(getattr(a, "degree", 1))
+                    shard_dim *= deg
+                    axis_list.append({
+                        "axis_name": str(getattr(a, "axis_name", "")),
+                        "kind": str(getattr(a, "kind", "")),
+                        "degree": deg,
+                    })
+                sharding_applied = {
+                    "axis_assignments": axis_list,
+                    "shard_dim": shard_dim,
+                    "microbatch_size": max(1, batch // shard_dim),
+                    "compile_mode": str(getattr(
+                        ws_sharding, "compile_mode", "off")),
+                }
 
         # G06: memory peak instrumentation — bracket train loop with
         # reset_peak_memory + get_peak_memory; extras.memory_peak_bytes.
@@ -894,6 +917,7 @@ def stage_train(ctx: StageContext) -> StageResult:
                 "graph_diff": graph_diff,
                 "gradient_clip": clip_extras,
                 "memory_peak_bytes": memory_peak_bytes,
+                "sharding_applied": sharding_applied,
                 "train_dtype": train_dtype,
                 "master_dtype": master_dtype,
                 "fp8_active": fp8_active,
