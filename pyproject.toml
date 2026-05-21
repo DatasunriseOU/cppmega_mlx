@@ -27,8 +27,11 @@ gui = [
     "jsonschema>=4.20",
 ]
 
+[project.scripts]
+cppmega-run = "cppmega_v4.runner.cli:main"
+
 [tool.setuptools.packages.find]
-include = ["cppmega_mlx*"]
+include = ["cppmega_mlx*", "cppmega_v4*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

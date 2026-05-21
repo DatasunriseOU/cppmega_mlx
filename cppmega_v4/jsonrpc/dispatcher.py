@@ -28,6 +28,8 @@ from cppmega_v4.jsonrpc.schema import (
     JsonRpcError,
     JsonRpcRequest,
     JsonRpcResponse,
+    PipelineRunParams,
+    PipelineRunResult,
     ProbeRunParams,
     SuggestAdaptersParams,
     SuggestShardingParams,
@@ -61,7 +63,24 @@ _ROUTES: Mapping[str, tuple[type[BaseModel], _Handler]] = {
         ProbeRunParams,
         lambda p, c: probe_run(p, cache=c),
     ),
+    "pipeline.run": (
+        PipelineRunParams,
+        lambda p, c: _pipeline_run(p),
+    ),
 }
+
+
+def _pipeline_run(params: PipelineRunParams) -> PipelineRunResult:
+    # Lazy import — runner package depends on jsonrpc.schema for VerifyParams;
+    # binding the symbols here breaks the import cycle.
+    from cppmega_v4.runner import Pipeline, run_pipeline
+    pipeline = Pipeline.from_dict({
+        "stages": params.pipeline.stages,
+        "stage_options": params.pipeline.stage_options,
+        "continue_on_failure": params.pipeline.continue_on_failure,
+    })
+    report = run_pipeline(params.spec, pipeline)
+    return PipelineRunResult.model_validate(report.to_dict())
 
 
 def dispatch(

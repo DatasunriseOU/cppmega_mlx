@@ -90,3 +90,18 @@ def test_dispatch_preserves_request_id_on_error():
     resp = dispatch({"jsonrpc": "2.0", "id": 42, "method": "no_such"})
     assert resp.id == 42
     assert resp.error.code == ErrorCode.METHOD_NOT_FOUND
+
+
+def test_dispatch_pipeline_run_round_trip():
+    envelope = {
+        "jsonrpc": "2.0", "id": "pp", "method": "pipeline.run",
+        "params": {
+            "spec": {"graph": _GRAPH, "dim_env": _DIM_ENV,
+                     "loss": _LOSS, "optim": _OPTIM},
+            "pipeline": {"stages": ["parse", "verify_build_spec"]},
+        },
+    }
+    resp = dispatch(envelope)
+    assert resp.error is None
+    assert resp.result["overall_status"] == "ok"
+    assert len(resp.result["stages"]) == 2
