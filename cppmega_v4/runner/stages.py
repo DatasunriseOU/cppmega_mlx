@@ -565,6 +565,13 @@ def stage_train(ctx: StageContext) -> StageResult:
         # prove the split predicate actually saw 2D vs 1D/3D parameters.
         muon_group_size: int | None = None
         adamw_group_size: int | None = None
+        # G22: snapshot pre-train per-bucket param norms so post-train we
+        # can compute the per-bucket update delta. Muon and AdamW produce
+        # different update math; bucket-specific deltas must diverge.
+        hybrid_muon_keys: list[str] = []
+        hybrid_adamw_keys: list[str] = []
+        hybrid_muon_before: dict[str, Any] = {}
+        hybrid_adamw_before: dict[str, Any] = {}
         if optimizer_kind == "muon_adamw_hybrid":
             try:
                 from cppmega_mlx.training.optimizers import split_param_groups
@@ -576,6 +583,19 @@ def stage_train(ctx: StageContext) -> StageResult:
                                if hasattr(v, "size"))
                 muon_group_size = _count(muon_t)
                 adamw_group_size = _count(adamw_t)
+                # G22: per-bucket snapshot
+                hybrid_muon_keys = list(dict(
+                    nn.utils.tree_flatten(muon_t)).keys())
+                hybrid_adamw_keys = list(dict(
+                    nn.utils.tree_flatten(adamw_t)).keys())
+                flat_all = dict(nn.utils.tree_flatten(
+                    all_modules.parameters()))
+                for k in hybrid_muon_keys:
+                    if k in flat_all:
+                        hybrid_muon_before[k] = mx.array(flat_all[k])
+                for k in hybrid_adamw_keys:
+                    if k in flat_all:
+                        hybrid_adamw_before[k] = mx.array(flat_all[k])
             except Exception:
                 pass
         loss_and_grad = nn.value_and_grad(all_modules, loss_fn)
@@ -745,6 +765,9 @@ def stage_train(ctx: StageContext) -> StageResult:
                 ),
                 "muon_group_size": muon_group_size,
                 "adamw_group_size": adamw_group_size,
+                "hybrid_deltas": _compute_hybrid_deltas(
+                    after_flat, hybrid_muon_before, hybrid_adamw_before)
+                    if optimizer_kind == "muon_adamw_hybrid" else None,
                 "inference_probe": {
                     "l2_diff": round(l2_diff, 6),
                     "cos_sim": round(cos_sim, 6),
@@ -891,6 +914,34 @@ def _apply_spec_rewriters(
         "renamed": [],  # MTPRewriter renames head_0; tracked via added set
         "skipped": skipped,
         "_build_spec": current,
+    }
+
+
+def _compute_hybrid_deltas(
+    after_flat: dict[str, Any],
+    muon_before: dict[str, Any], adamw_before: dict[str, Any],
+) -> dict[str, Any]:
+    """G22: per-bucket L2 update delta. Muon (sign-of-grad NS-ortho on
+    2-D matmul weights) and AdamW (adaptive 2nd moment on 1-D / 3-D+
+    tensors) MUST produce different update magnitudes for the same
+    training run, otherwise the hybrid split predicate is decorative."""
+    import mlx.core as mx_local
+
+    def _bucket_norm(before: dict[str, Any]) -> float:
+        total = 0.0
+        for k, v in before.items():
+            if k in after_flat:
+                diff = after_flat[k] - v
+                total += float(mx_local.sum(diff * diff).item())
+        return total ** 0.5
+
+    muon_norm = _bucket_norm(muon_before)
+    adamw_norm = _bucket_norm(adamw_before)
+    ratio = (muon_norm / adamw_norm) if adamw_norm > 1e-12 else 0.0
+    return {
+        "muon_norm": round(muon_norm, 6),
+        "adamw_norm": round(adamw_norm, 6),
+        "ratio": round(ratio, 6),
     }
 
 
