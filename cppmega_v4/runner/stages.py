@@ -599,6 +599,21 @@ def stage_train(ctx: StageContext) -> StageResult:
         mx.eval(probe_output_before)
         probe_output_before = mx.array(probe_output_before)
 
+        # G23: gradient_clip_norm activation. Read from spec_optim
+        # (buildspec OptimSpec) or rewritten_build_spec (post-rewriters);
+        # threshold None disables clipping (passthrough behaviour pre-G23).
+        clip_threshold: float | None = None
+        _opt_for_clip = (rewritten_build_spec.optim
+                         if rewritten_build_spec is not None
+                         else spec_optim)
+        if _opt_for_clip is not None:
+            clip_threshold = getattr(_opt_for_clip, "gradient_clip_norm", None)
+        clip_extras: dict[str, Any] = {
+            "threshold": clip_threshold,
+            "max_grad_norm_seen": 0.0,
+            "num_clips": 0,
+        }
+
         losses: list[float] = []
         lr_trajectory: list[float] = []
         # Snapshot one leaf with a real gradient; fixed first-leaf probes can
@@ -632,6 +647,25 @@ def stage_train(ctx: StageContext) -> StageResult:
                         probe_key = key
                         probe_before = mx.array(flat_params[key])
                         break
+            # G23: global L2 grad-norm clip when spec.optim.gradient_clip_norm
+            # set. Compute total norm across the flat grad tree; if it
+            # exceeds threshold, rescale all grads by threshold/total_norm.
+            if clip_threshold is not None and clip_threshold > 0:
+                flat_g = dict(nn.utils.tree_flatten(grads))
+                sq_sum = mx.zeros(())
+                for g in flat_g.values():
+                    if hasattr(g, "shape"):
+                        sq_sum = sq_sum + mx.sum(
+                            g.astype(mx.float32) * g.astype(mx.float32))
+                total_norm = float(mx.sqrt(sq_sum).item())
+                if total_norm > clip_extras["max_grad_norm_seen"]:
+                    clip_extras["max_grad_norm_seen"] = round(total_norm, 6)
+                if total_norm > clip_threshold:
+                    scale = clip_threshold / total_norm
+                    grads = nn.utils.tree_map(
+                        lambda g: g * scale if hasattr(g, "shape") else g,
+                        grads)
+                    clip_extras["num_clips"] += 1
             opt.update(all_modules, grads)
             mx.eval(all_modules.parameters(), opt.state)
             losses.append(float(loss.item()))
@@ -717,6 +751,7 @@ def stage_train(ctx: StageContext) -> StageResult:
                 },
                 "side_channels_observed": side_channels_observed,
                 "graph_diff": graph_diff,
+                "gradient_clip": clip_extras,
                 "mtp": _compute_mtp_extras(
                     all_modules, mtp_k, mtp_betas, vocab_size,
                     batch, seq, hidden, targets,

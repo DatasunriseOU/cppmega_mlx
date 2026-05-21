@@ -10,8 +10,12 @@ import pytest
 import cppmega_mlx.inference as inference
 from cppmega_mlx.inference import (
     AdapterCapabilities,
+    CodeMetadataAdapter,
     InferenceSideChannelBuilder,
     TokenMetadata,
+    builtin_code_metadata_adapters,
+    get_builtin_code_metadata_adapter,
+    normalize_code_language,
 )
 from cppmega_mlx.models.hybrid_lm import HybridTinyConfig, HybridTinyLM
 
@@ -73,7 +77,7 @@ def _tiny_model() -> HybridTinyLM:
             depth=1,
             dsa_a_layer_ranks=(0,),
             num_attention_heads=4,
-            max_seq_length=16,
+            max_seq_length=64,
             structure_components="all",
             structure_num_categories=16,
         )
@@ -188,3 +192,72 @@ def test_inference_root_exports_side_channel_builder() -> None:
     assert inference.InferenceSideChannelBuilder is InferenceSideChannelBuilder
     assert "InferenceSideChannelBuilder" in inference.__all__
     assert "InferenceFailPolicy" in inference.__all__
+    assert "get_builtin_code_metadata_adapter" in inference.__all__
+
+
+def test_builtin_language_adapter_registry_is_generic() -> None:
+    registry = builtin_code_metadata_adapters()
+
+    assert set(registry) == {"cpp", "rust", "go", "python"}
+    assert normalize_code_language("c++") == "cpp"
+    assert normalize_code_language("py") == "python"
+    for language, adapter in registry.items():
+        assert isinstance(adapter, CodeMetadataAdapter)
+        caps = adapter.probe({})
+        assert caps.language == language
+        assert caps.version
+        assert caps.families
+        assert isinstance(caps.available, bool)
+
+
+def test_builtin_unavailable_language_adapters_fail_explicitly() -> None:
+    builder = InferenceSideChannelBuilder(TinyTokenizer())
+
+    for language in ("rust", "go", "python"):
+        adapter = get_builtin_code_metadata_adapter(language)
+        caps = adapter.probe({})
+        assert caps.available is False
+        assert caps.reason == "adapter_not_implemented"
+
+        dropped = builder.build("fn main() {}", language=language)
+        assert dropped.model_kwargs == {}
+        assert dropped.side_channels == {}
+        assert dropped.provenance["adapter"].startswith("dropped:adapter_unavailable")
+
+        with pytest.raises(RuntimeError, match="adapter_unavailable"):
+            InferenceSideChannelBuilder(
+                TinyTokenizer(),
+                fail_policy="error",
+            ).build("fn main() {}", language=language)
+
+
+def test_builtin_cpp_adapter_conforms_or_reports_unavailable() -> None:
+    adapter = get_builtin_code_metadata_adapter("cpp")
+    caps = adapter.probe({})
+
+    assert caps.language == "cpp"
+    assert caps.families == ("syntax", "structure")
+    if not caps.available:
+        result = InferenceSideChannelBuilder(TinyTokenizer()).build(
+            "int main() { return 0; }\n",
+            language="cpp",
+        )
+        assert result.provenance["adapter"].startswith("dropped:adapter_unavailable")
+        return
+
+    result = InferenceSideChannelBuilder(TinyTokenizer()).build(
+        "int add(int x) { return x + 1; }\n",
+        language="cpp",
+    )
+    logits = _tiny_model()(result.prompt_ids, **result.model_kwargs)
+    mx.eval(logits)
+
+    assert result.cache_components.adapter_language == "cpp"
+    assert result.cache_components.adapter_version == "clang-ast-v1"
+    assert result.model_kwargs["structure_ids"].shape == result.prompt_ids.shape
+    assert result.model_kwargs["ast_depth_ids"].shape == result.prompt_ids.shape
+    assert result.model_kwargs["sibling_index_ids"].shape == result.prompt_ids.shape
+    assert result.model_kwargs["node_type_ids"].shape == result.prompt_ids.shape
+    assert "structure" in result.side_channels
+    assert "syntax" in result.side_channels
+    assert result.provenance["adapter"] == "cpp:clang-ast-v1"

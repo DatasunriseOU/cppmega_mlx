@@ -6,6 +6,9 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from hashlib import sha256
 import json
+import os
+from pathlib import Path
+import tempfile
 from typing import Any, Literal, Protocol, runtime_checkable
 
 import mlx.core as mx
@@ -28,6 +31,8 @@ class AdapterCapabilities:
     language: str
     version: str
     families: tuple[str, ...] = ()
+    available: bool = True
+    reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -62,6 +67,234 @@ class CodeMetadataAdapter(Protocol):
         tokens: Sequence[int],
         tokenizer: Any,
     ) -> TokenMetadata: ...
+
+
+class AdapterUnavailableError(RuntimeError):
+    """Raised when an adapter exists but cannot run in this environment."""
+
+
+@dataclass(frozen=True)
+class _SourceMetadata:
+    language: str
+    source: str
+    ast_depth: tuple[int, ...]
+    sibling_index: tuple[int, ...]
+    node_type: tuple[int, ...]
+    provenance: Mapping[str, str]
+
+
+class UnavailableCodeMetadataAdapter:
+    """Explicit placeholder for languages whose extractor is not wired yet."""
+
+    version = "unavailable-v1"
+
+    def __init__(
+        self,
+        language: str,
+        *,
+        families: Sequence[str] = (),
+        reason: str = "adapter_not_implemented",
+    ) -> None:
+        self.language = normalize_code_language(language)
+        self.families = tuple(families)
+        self.reason = reason
+
+    def probe(self, context: Mapping[str, Any]) -> AdapterCapabilities:
+        del context
+        return AdapterCapabilities(
+            language=self.language,
+            version=self.version,
+            families=self.families,
+            available=False,
+            reason=self.reason,
+        )
+
+    def extract(self, source_or_project: str, options: Mapping[str, Any]) -> Any:
+        del source_or_project, options
+        raise AdapterUnavailableError(self.reason)
+
+    def map_to_tokens(
+        self,
+        metadata: Any,
+        tokens: Sequence[int],
+        tokenizer: Any,
+    ) -> TokenMetadata:
+        del metadata, tokens, tokenizer
+        raise AdapterUnavailableError(self.reason)
+
+
+class ClangCodeMetadataAdapter:
+    """Clang-backed C/C++ metadata adapter for inference enrichment.
+
+    The adapter parses a source snippet or unsaved file through libclang and
+    maps source-coordinate AST signals into the canonical token metadata shape.
+    More expensive project-index semantics stay behind the same protocol.
+    """
+
+    language = "cpp"
+    version = "clang-ast-v1"
+    families = ("syntax", "structure")
+
+    def probe(self, context: Mapping[str, Any]) -> AdapterCapabilities:
+        try:
+            _clang_runtime(context.get("libclang_path"))
+        except Exception as exc:
+            return AdapterCapabilities(
+                language=self.language,
+                version=self.version,
+                families=self.families,
+                available=False,
+                reason=str(exc),
+            )
+        return AdapterCapabilities(
+            language=self.language,
+            version=self.version,
+            families=self.families,
+            available=True,
+        )
+
+    def extract(
+        self,
+        source_or_project: str,
+        options: Mapping[str, Any],
+    ) -> _SourceMetadata:
+        if not isinstance(source_or_project, str) or not source_or_project:
+            raise AdapterUnavailableError("source must be a non-empty string")
+        clang = _clang_runtime(options.get("libclang_path"))
+        from tools.clang_indexer.index_project import (
+            _sanitize_compile_args_for_clang,
+            extract_clang_ast_metadata,
+        )
+
+        language = normalize_code_language(str(options.get("language") or self.language))
+        repo_root = options.get("repo_root")
+        filepath = str(options.get("filepath") or _default_source_path(language))
+        compile_args = options.get("compile_args")
+        args = (
+            _sanitize_compile_args_for_clang(list(compile_args))
+            if isinstance(compile_args, Sequence) and not isinstance(compile_args, str)
+            else _default_clang_args(language)
+        )
+        with tempfile.TemporaryDirectory(prefix="cppmega_infer_clang_") as tmpdir:
+            if repo_root:
+                source_path = filepath if os.path.isabs(filepath) else os.path.join(
+                    str(repo_root), filepath
+                )
+                source_path = os.path.normpath(source_path)
+                unsaved_files = [(source_path, source_or_project)]
+            else:
+                source_path = os.path.join(tmpdir, Path(filepath).name)
+                with open(source_path, "w", encoding="utf-8", errors="replace") as handle:
+                    handle.write(source_or_project)
+                unsaved_files = None
+
+            index = clang.Index.create()
+            try:
+                tu = index.parse(
+                    source_path,
+                    args=args,
+                    unsaved_files=unsaved_files,
+                    options=(
+                        clang.TranslationUnit.PARSE_INCOMPLETE
+                        | clang.TranslationUnit.PARSE_PRECOMPILED_PREAMBLE
+                    ),
+                )
+            except Exception as exc:
+                raise AdapterUnavailableError(f"clang_parse_failed:{exc}") from exc
+
+            ast_depth, sibling_index, node_type = extract_clang_ast_metadata(
+                source_or_project,
+                tu,
+                source_path,
+            )
+        return _SourceMetadata(
+            language=language,
+            source=source_or_project,
+            ast_depth=tuple(ast_depth),
+            sibling_index=tuple(sibling_index),
+            node_type=tuple(node_type),
+            provenance={
+                "adapter": f"{self.language}:{self.version}",
+                "syntax": "clang_ast",
+                "structure": "clang_ast",
+            },
+        )
+
+    def map_to_tokens(
+        self,
+        metadata: Any,
+        tokens: Sequence[int],
+        tokenizer: Any,
+    ) -> TokenMetadata:
+        if not isinstance(metadata, _SourceMetadata):
+            raise TypeError("metadata must be _SourceMetadata")
+        source_indices = _token_source_indices(metadata.source, tokens, tokenizer)
+        ast_depth = _source_values_at_indices(metadata.ast_depth, source_indices)
+        sibling_index = _source_values_at_indices(metadata.sibling_index, source_indices)
+        node_type = _source_values_at_indices(metadata.node_type, source_indices)
+        structure_ids = [value if value > 0 else 0 for value in node_type]
+        return TokenMetadata(
+            structure_ids=structure_ids,
+            dep_levels=ast_depth,
+            ast_depth_ids=ast_depth,
+            sibling_index_ids=sibling_index,
+            node_type_ids=node_type,
+            provenance=metadata.provenance,
+        )
+
+
+_LANGUAGE_ALIASES = {
+    "c++": "cpp",
+    "cxx": "cpp",
+    "cc": "cpp",
+    "py": "python",
+    "rs": "rust",
+    "golang": "go",
+}
+
+_UNAVAILABLE_ADAPTER_FAMILIES = {
+    "rust": ("syntax", "structure", "semantic_graph"),
+    "go": ("syntax", "structure", "semantic_graph"),
+    "python": ("syntax", "structure"),
+}
+
+
+def normalize_code_language(language: str) -> str:
+    normalized = str(language).strip().lower().replace("_", "-")
+    return _LANGUAGE_ALIASES.get(normalized, normalized)
+
+
+def get_builtin_code_metadata_adapter(language: str) -> CodeMetadataAdapter:
+    normalized = normalize_code_language(language)
+    if normalized in {"cpp", "c", "cuda", "hip"}:
+        return ClangCodeMetadataAdapter()
+    if normalized in _UNAVAILABLE_ADAPTER_FAMILIES:
+        return UnavailableCodeMetadataAdapter(
+            normalized,
+            families=_UNAVAILABLE_ADAPTER_FAMILIES[normalized],
+        )
+    return UnavailableCodeMetadataAdapter(
+        normalized,
+        reason="adapter_unknown_language",
+    )
+
+
+def builtin_code_metadata_adapters() -> Mapping[str, CodeMetadataAdapter]:
+    return {
+        "cpp": ClangCodeMetadataAdapter(),
+        "rust": UnavailableCodeMetadataAdapter(
+            "rust",
+            families=_UNAVAILABLE_ADAPTER_FAMILIES["rust"],
+        ),
+        "go": UnavailableCodeMetadataAdapter(
+            "go",
+            families=_UNAVAILABLE_ADAPTER_FAMILIES["go"],
+        ),
+        "python": UnavailableCodeMetadataAdapter(
+            "python",
+            families=_UNAVAILABLE_ADAPTER_FAMILIES["python"],
+        ),
+    }
 
 
 @dataclass(frozen=True)
@@ -146,6 +379,8 @@ class InferenceSideChannelBuilder:
         ctx = parse_platform_context(platform_context)
         rendered_context = render_platform_context(ctx)
         active_adapter = adapter or self.adapter
+        if active_adapter is None and language is not None:
+            active_adapter = get_builtin_code_metadata_adapter(language)
         cache_components = _cache_components(
             text=text,
             tokenizer_id=self.tokenizer_id,
@@ -174,14 +409,48 @@ class InferenceSideChannelBuilder:
             provenance["platform"] = "platform_context"
 
         if active_adapter is None:
-            if language is not None:
-                _handle_adapter_failure(
-                    policy,
-                    "adapter_missing",
-                    provenance=provenance,
-                    model_kwargs=model_kwargs,
-                    side_channels=side_channels,
-                )
+            return InferenceSideChannelResult(
+                prompt_ids=prompt_ids,
+                model_kwargs=model_kwargs,
+                side_channels=side_channels,
+                provenance=provenance,
+                platform_context=ctx,
+                rendered_platform_context=rendered_context,
+                cache_components=cache_components,
+            )
+
+        adapter_context = {
+            "language": language or active_adapter.language,
+            "platform_context": ctx,
+            "tokenizer_id": self.tokenizer_id,
+        }
+        try:
+            capabilities = active_adapter.probe(adapter_context)
+        except Exception as exc:
+            _handle_adapter_failure(
+                policy,
+                f"adapter_error:{type(exc).__name__}",
+                provenance=provenance,
+                model_kwargs=model_kwargs,
+                side_channels=side_channels,
+            )
+            return InferenceSideChannelResult(
+                prompt_ids=prompt_ids,
+                model_kwargs=model_kwargs,
+                side_channels=side_channels,
+                provenance=provenance,
+                platform_context=ctx,
+                rendered_platform_context=rendered_context,
+                cache_components=cache_components,
+            )
+        if not capabilities.available:
+            _handle_adapter_failure(
+                policy,
+                f"adapter_unavailable:{capabilities.reason or 'unknown'}",
+                provenance=provenance,
+                model_kwargs=model_kwargs,
+                side_channels=side_channels,
+            )
             return InferenceSideChannelResult(
                 prompt_ids=prompt_ids,
                 model_kwargs=model_kwargs,
@@ -195,11 +464,7 @@ class InferenceSideChannelBuilder:
         try:
             metadata = active_adapter.extract(
                 text,
-                {
-                    "language": language or active_adapter.language,
-                    "platform_context": ctx,
-                    "tokenizer_id": self.tokenizer_id,
-                },
+                adapter_context,
             )
             token_metadata = active_adapter.map_to_tokens(
                 metadata,
@@ -260,6 +525,98 @@ def _infer_tokenizer_id(tokenizer: Any) -> str:
         if value:
             return str(value)
     return f"{tokenizer.__class__.__module__}.{tokenizer.__class__.__qualname__}"
+
+
+def _clang_runtime(libclang_path: Any) -> Any:
+    from tools.clang_indexer.index_project import _configure_libclang
+
+    _configure_libclang(str(libclang_path) if libclang_path else None)
+    import clang.cindex as clang_cindex  # type: ignore[import-not-found]
+
+    return clang_cindex
+
+
+def _default_source_path(language: str) -> str:
+    if language == "c":
+        return "snippet.c"
+    if language == "cuda":
+        return "snippet.cu"
+    if language == "hip":
+        return "snippet.hip"
+    return "snippet.cpp"
+
+
+def _default_clang_args(language: str) -> list[str]:
+    if language == "c":
+        return ["-x", "c", "-std=c11", "-fsyntax-only", "-Wno-everything"]
+    return ["-x", "c++", "-std=c++20", "-fsyntax-only", "-Wno-everything"]
+
+
+def _source_values_at_indices(
+    values: Sequence[int],
+    indices: Sequence[int],
+) -> list[int]:
+    if not indices:
+        return []
+    if not values:
+        return [0] * len(indices)
+    value_count = len(values)
+    return [int(values[min(value_count - 1, max(0, index))]) for index in indices]
+
+
+def _token_source_indices(
+    source: str,
+    tokens: Sequence[int],
+    tokenizer: Any,
+) -> list[int]:
+    token_count = len(tokens)
+    if token_count <= 0:
+        return []
+    offsets = _token_offsets(source, tokens, tokenizer)
+    if offsets is not None:
+        source_len = len(source)
+        return [
+            min(
+                source_len - 1,
+                max(0, start if end <= start else (start + end - 1) // 2),
+            )
+            if source_len > 0 else 0
+            for start, end in offsets
+        ]
+    source_len = len(source)
+    if source_len <= 0:
+        return [0] * token_count
+    return [
+        min(source_len - 1, (index * source_len) // token_count)
+        for index in range(token_count)
+    ]
+
+
+def _token_offsets(
+    source: str,
+    tokens: Sequence[int],
+    tokenizer: Any,
+) -> list[tuple[int, int]] | None:
+    encode = getattr(tokenizer, "encode", None)
+    if encode is None:
+        return None
+    try:
+        encoded = encode(source)
+    except Exception:
+        return None
+    offsets = getattr(encoded, "offsets", None)
+    ids = getattr(encoded, "ids", None)
+    if offsets is None or ids is None:
+        return None
+    if list(ids) != list(tokens) or len(offsets) != len(tokens):
+        return None
+    out: list[tuple[int, int]] = []
+    for item in offsets:
+        if not isinstance(item, Sequence) or len(item) != 2:
+            return None
+        start, end = int(item[0]), int(item[1])
+        out.append((start, end))
+    return out
 
 
 def _cache_components(
@@ -349,11 +706,17 @@ def _handle_adapter_failure(
 
 
 __all__ = [
+    "AdapterUnavailableError",
     "AdapterCapabilities",
+    "ClangCodeMetadataAdapter",
     "CodeMetadataAdapter",
     "InferenceFailPolicy",
     "InferenceSideChannelBuilder",
     "InferenceSideChannelCacheComponents",
     "InferenceSideChannelResult",
     "TokenMetadata",
+    "UnavailableCodeMetadataAdapter",
+    "builtin_code_metadata_adapters",
+    "get_builtin_code_metadata_adapter",
+    "normalize_code_language",
 ]
