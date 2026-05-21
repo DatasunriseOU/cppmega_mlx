@@ -17,6 +17,7 @@ build/
 cppmega_mlx/training/native_optim/*.so
 cppmega_mlx/training/native_optim/*.dylib
 cppmega_mlx/training/native_optim/*.metallib
+cppmega_v4/widget/static/
 
 # Local Metal GPU traces (multi-hundred-MB Apple Xcode capture bundles).
 *.gputrace
