@@ -24,6 +24,9 @@ export interface TopBarProps {
    *  or fall back to synthetic. */
   trainParquetPath?: string | null;
   trainTokenizerPath?: string | null;
+  /** G11: save/load callbacks. */
+  onSaveSpec?: () => void;
+  onLoadSpec?: (file: File) => void;
 }
 
 export function TopBar(p: TopBarProps): JSX.Element {
@@ -70,6 +73,28 @@ export function TopBar(p: TopBarProps): JSX.Element {
       </select>
 
       <MemoryBar state={p.state} />
+
+      {p.onSaveSpec && (
+        <button data-testid="spec-save" onClick={p.onSaveSpec}>Save</button>
+      )}
+      {p.onLoadSpec && (
+        <>
+          <input data-testid="spec-load-input"
+                 type="file" accept=".json"
+                 style={{ display: "none" }}
+                 onChange={(e) => {
+                   const f = e.target.files?.[0];
+                   if (f && p.onLoadSpec) p.onLoadSpec(f);
+                   e.currentTarget.value = "";
+                 }} />
+          <button data-testid="spec-load"
+                  onClick={() => {
+                    const el = document.querySelector<HTMLInputElement>(
+                      "[data-testid='spec-load-input']");
+                    el?.click();
+                  }}>Load</button>
+        </>
+      )}
 
       <span data-testid="train-data-source"
             style={{ fontSize: 10,

@@ -63,6 +63,30 @@ describe("TopBar", () => {
     expect(t).toContain("cppmega_tokenizer.json");
   });
 
+  // G11: Save/Load buttons
+  it("G11: spec-save + spec-load hidden when callbacks not provided", () => {
+    render(<TopBar {...defaultTopProps()} />);
+    expect(screen.queryByTestId("spec-save")).toBeNull();
+    expect(screen.queryByTestId("spec-load")).toBeNull();
+  });
+
+  it("G11: spec-save fires onSaveSpec callback", () => {
+    const onSaveSpec = vi.fn();
+    render(<TopBar {...defaultTopProps({ onSaveSpec })} />);
+    fireEvent.click(screen.getByTestId("spec-save"));
+    expect(onSaveSpec).toHaveBeenCalledTimes(1);
+  });
+
+  it("G11: spec-load-input fires onLoadSpec with file", () => {
+    const onLoadSpec = vi.fn();
+    render(<TopBar {...defaultTopProps({ onLoadSpec })} />);
+    const file = new File(['{"spec":{}}'], "test.spec.json",
+      { type: "application/json" });
+    fireEvent.change(screen.getByTestId("spec-load-input"),
+      { target: { files: [file] } });
+    expect(onLoadSpec).toHaveBeenCalledWith(file);
+  });
+
   it("preset launcher fires onPresetDrop when chosen", () => {
     const onPresetDrop = vi.fn();
     render(<TopBar {...defaultTopProps({ onPresetDrop })} />);

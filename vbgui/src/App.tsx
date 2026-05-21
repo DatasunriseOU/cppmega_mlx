@@ -353,6 +353,33 @@ export function App(): JSX.Element {
           onRunPipeline={handleRunPipeline}
           trainParquetPath={trainParquetPath}
           trainTokenizerPath={trainTokenizerPath}
+          onSaveSpec={() => {
+            // G11: serialise full SpecState + canvas (nodes/edges) to JSON
+            const blob = new Blob([JSON.stringify({
+              projectName, spec, nodes, edges,
+            }, null, 2)], { type: "application/json" });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = `${projectName}.spec.json`;
+            a.click();
+            URL.revokeObjectURL(url);
+          }}
+          onLoadSpec={(file: File) => {
+            const reader = new FileReader();
+            reader.onload = () => {
+              try {
+                const obj = JSON.parse(String(reader.result));
+                if (obj.projectName) setProjectName(String(obj.projectName));
+                if (obj.spec) dispatch({ type: "spec.replace", spec: obj.spec });
+                if (obj.nodes) setNodes(obj.nodes);
+                if (obj.edges) setEdges(obj.edges);
+              } catch (e) {
+                setRunError(`Load failed: ${String(e)}`);
+              }
+            };
+            reader.readAsText(file);
+          }}
           trainDisabled={
             (() => {
               // V3-8/V3-9: gate Train on gotcha severity. The verify RPC

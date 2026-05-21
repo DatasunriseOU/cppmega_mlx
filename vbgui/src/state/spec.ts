@@ -246,7 +246,8 @@ export type SpecAction =
   | { type: "gotchas.set"; gotchas: GotchaState[] }
   | { type: "memory.set"; worst_rank_bytes: number; device_hbm_bytes?: number }
   | { type: "verify.complete"; elapsed_ms: number; brick_count: number }
-  | { type: "backend.status"; status: SpecState["backend_status"] };
+  | { type: "backend.status"; status: SpecState["backend_status"] }
+  | { type: "spec.replace"; spec: SpecState };
 
 export function specReducer(s: SpecState, a: SpecAction): SpecState {
   switch (a.type) {
@@ -270,6 +271,7 @@ export function specReducer(s: SpecState, a: SpecAction): SpecState {
       return { ...s, rewriters: out };
     }
     case "side_channels.set": return { ...s, side_channels: a.side_channels };
+    case "spec.replace": return a.spec;
     case "sharding.set": return { ...s, sharding: a.sharding };
     case "gotchas.set":  return { ...s, gotchas: a.gotchas };
     case "memory.set":   return {
