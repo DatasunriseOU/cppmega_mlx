@@ -39,6 +39,21 @@ function isArrayRibbon(v: unknown): v is unknown[] {
   return Array.isArray(v);
 }
 
+interface RoundtripRowResult {
+  row_idx: number;
+  matches: boolean;
+  byte_diff: number;
+  decoded_preview: string;
+  original_bytes: number;
+  decoded_bytes: number;
+}
+interface RoundtripCheckResult {
+  rows: RoundtripRowResult[];
+  pass_rate: number;
+  tokenizer_capability: string;
+  has_original_text: boolean;
+}
+
 export function DataInspector({
   rpc, initialPath = "", pageSize = 16,
 }: DataInspectorProps): JSX.Element {
@@ -47,6 +62,9 @@ export function DataInspector({
   const [result, setResult] = useState<PreviewParquetResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [enabled, setEnabled] = useState<Set<string>>(new Set());
+  const [tokenizerSource, setTokenizerSource] = useState("");
+  const [roundtrip, setRoundtrip] =
+    useState<Map<number, RoundtripRowResult>>(new Map());
 
   const load = useCallback(async (nextOffset: number) => {
     if (!path) return;
@@ -101,6 +119,29 @@ export function DataInspector({
           Load
         </button>
       </header>
+      <header style={{ display: "flex", gap: 8, alignItems: "center" }}>
+        <span style={{ fontSize: 11, color: "#6b7280" }}>Tokenizer:</span>
+        <input data-testid="data-tokenizer-path"
+               type="text" placeholder="/path/to/tokenizer.json (optional)"
+               value={tokenizerSource}
+               onChange={(e) => setTokenizerSource(e.target.value)}
+               style={{ flex: 1, fontFamily: "monospace", fontSize: 11 }} />
+        <button data-testid="data-roundtrip"
+                disabled={!path || !tokenizerSource}
+                onClick={async () => {
+                  try {
+                    const r = await rpc.call<RoundtripCheckResult>(
+                      "data.roundtrip_check",
+                      { parquet_path: path, tokenizer_source: tokenizerSource,
+                        max_rows: pageSize });
+                    const m = new Map<number, RoundtripRowResult>();
+                    for (const row of r.rows) m.set(row.row_idx, row);
+                    setRoundtrip(m);
+                  } catch (e) { setError(String(e)); }
+                }}>
+          Check roundtrip
+        </button>
+      </header>
 
       {error && (
         <div data-testid="data-error"
@@ -147,7 +188,23 @@ export function DataInspector({
                    data-testid={`data-row-${row.row_index}`}
                    style={{ padding: 6, borderBottom: "1px solid #f3f4f6",
                             fontFamily: "monospace", fontSize: 11 }}>
-                <div style={{ color: "#6b7280" }}>row #{row.row_index}</div>
+                <div style={{ color: "#6b7280",
+                              display: "flex", gap: 6, alignItems: "center" }}>
+                  <span>row #{row.row_index}</span>
+                  {roundtrip.has(row.row_index) && (() => {
+                    const rt = roundtrip.get(row.row_index)!;
+                    return (
+                      <span data-testid={`data-roundtrip-${row.row_index}`}
+                            title={`byte_diff=${rt.byte_diff} · decoded="${rt.decoded_preview}"`}
+                            style={{ padding: "1px 6px", borderRadius: 3,
+                                     fontSize: 10, fontWeight: 600,
+                                     background: rt.matches ? "#dcfce7" : "#fee2e2",
+                                     color: rt.matches ? "#166534" : "#991b1b" }}>
+                        Roundtrip {rt.matches ? "OK" : "FAIL"}
+                      </span>
+                    );
+                  })()}
+                </div>
                 <div style={{ display: "flex", flexWrap: "wrap", gap: 2,
                               padding: "2px 0" }}>
                   {row.tokens.map((tok, i) => (
