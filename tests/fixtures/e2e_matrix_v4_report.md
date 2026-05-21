@@ -91,7 +91,7 @@ model genuinely changed observable behaviour.
 ## Deferred / soft gaps (carry to v5)
 
 1. **Sharding plan apply → real distributed train** — needs multi-device.
-3. **Memory peak vs estimate** — needs `mx.metal.get_peak_memory`
+2. **Memory peak vs estimate** — needs `mx.metal.get_peak_memory`
    instrumentation across train cycles.
 4. **WS reconnect mid-train** — lifecycle.
 5. **Concurrent / abortable Train** — needs cancel UI + train cancel handle.
