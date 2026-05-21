@@ -14,6 +14,9 @@ export interface TopBarProps {
   onTopologyChange: (t: TopologyFactory) => void;
   onCompileModeChange: (m: SpecState["sharding"]["compile_mode"]) => void;
   onRunPipeline: (mode: RunMode, opts?: { num_steps?: number }) => void;
+  /** V3-8/V3-9: when present, Train button is rendered disabled with
+   *  reason exposed via data-testid='top-bar-train-disabled-reason'. */
+  trainDisabled?: { reason: string } | null;
 }
 
 export function TopBar(p: TopBarProps): JSX.Element {
@@ -88,7 +91,21 @@ export function TopBar(p: TopBarProps): JSX.Element {
                     onClick={() => { setOpen(false);
                                      p.onRunPipeline("train",
                                        { num_steps: trainNumSteps }); }}
-                    style={menuItem}>Train</button>
+                    disabled={!!p.trainDisabled}
+                    title={p.trainDisabled?.reason ?? ""}
+                    style={{ ...menuItem,
+                             opacity: p.trainDisabled ? 0.5 : 1,
+                             cursor: p.trainDisabled ? "not-allowed"
+                                                     : "pointer" }}>
+              Train
+              {p.trainDisabled && (
+                <span data-testid="top-bar-train-disabled-reason"
+                      style={{ display: "block", fontSize: 10,
+                               color: "#dc2626" }}>
+                  {p.trainDisabled.reason}
+                </span>
+              )}
+            </button>
           </div>
         )}
       </div>

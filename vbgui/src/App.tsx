@@ -317,6 +317,19 @@ export function App(): JSX.Element {
           onCompileModeChange={(m) => dispatch({ type: "sharding.set",
             sharding: { ...spec.sharding, compile_mode: m } })}
           onRunPipeline={handleRunPipeline}
+          trainDisabled={
+            (() => {
+              // V3-8/V3-9: gate Train on gotcha severity. The verify RPC
+              // returns gotchas with severity "error" for both validator
+              // failures (verify=error, V3-9) and check_gotchas critical
+              // findings (V3-8). Surfacing them via the disabled-reason
+              // attribute lets Playwright assert on the exact gating cause.
+              const errs = spec.gotchas.filter(g => g.severity === "error");
+              if (errs.length === 0) return null;
+              return { reason: `${errs.length} critical issue${
+                errs.length > 1 ? "s" : ""}: ${errs[0].message}` };
+            })()
+          }
         />
         <AppTabs active={activeTab} onChange={setActiveTab} />
         <div style={{ flex: 1, display: "flex", minHeight: 0 }}>
