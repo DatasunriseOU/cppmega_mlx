@@ -773,7 +773,25 @@ def stage_train(ctx: StageContext) -> StageResult:
         probe_key: str | None = None
         probe_before: mx.array | None = None
 
+        # G09: check abort flag set via opts.abort or _ABORT_TOKENS set
+        abort_token = opts.get("abort_token")
         for step in range(n_steps):
+            if abort_token is not None and abort_token in _ABORT_TOKENS:
+                # Stop early; return partial extras with cancellation flag.
+                return StageResult(
+                    name="train", status="ok",
+                    elapsed_ms=(time.perf_counter() - t0) * 1000.0,
+                    extras={
+                        "losses": [round(l, 4) for l in losses],
+                        "lr_trajectory": [round(l, 6) for l in lr_trajectory],
+                        "weight_delta_norm": 0.0,
+                        "num_steps": step,
+                        "schedule_kind": schedule_kind_label,
+                        "optimizer_kind": optimizer_kind,
+                        "aborted": True,
+                        "abort_token": abort_token,
+                    },
+                )
             # If a schedule callable exists, override optimizer's
             # learning_rate per step. MLX optimizers accept a fresh
             # scalar via the public learning_rate attribute.
@@ -1013,6 +1031,20 @@ def _tokenize_parquet_text(
 # G10: in-process LRU cache of opt.state by run_id. Used for warm-start
 # across sequential Train clicks in the same backend session.
 _RUN_CACHE: dict[str, Any] = {}
+
+# G09: in-process set of abort tokens. Caller sets opts.abort_token to
+# some unique string; another caller (e.g. WS handler) inserts the same
+# token into this set to signal cancellation between train steps.
+_ABORT_TOKENS: set[str] = set()
+
+
+def request_abort(token: str) -> None:
+    """G09: signal stage_train to abort the run identified by token."""
+    _ABORT_TOKENS.add(token)
+
+
+def clear_abort(token: str) -> None:
+    _ABORT_TOKENS.discard(token)
 
 
 _REWRITER_FACTORIES: dict[str, Callable[..., Any]] = {}
