@@ -15,6 +15,8 @@ from cppmega_mlx.models.hybrid_lm import HybridTinyConfig, HybridTinyLM
 from cppmega_mlx.models.tiny_lm import TinyLM, TinyLMConfig
 from cppmega_mlx.training.compiled import (
     CompiledPretrainingStep,
+    PATH_C_FUSED_TRAIN_BLOCK_TRAINING_RUNTIME_CONTRACT,
+    PATH_C_FUSED_TRAIN_BLOCK_VALUE_AND_GRAD_CONTRACT,
     PathCGradientBufferCapture,
     PretrainingMetrics,
     PretrainingState,
@@ -165,6 +167,33 @@ class _BindingAwarePathCTrainingRuntime(_RecordingPathCTrainingRuntime):
             "owner": binding.get("owner"),
             "uses_direct_chain_runtime": bool(
                 binding.get("uses_direct_chain_runtime")
+            ),
+            "uses_forward_hook": bool(binding.get("uses_forward_hook")),
+            "uses_backward_or_vjp_hook": bool(
+                binding.get("uses_backward_or_vjp_hook")
+            ),
+            "returns_model_grads": True,
+            "returns_full_model_grads": True,
+            "gradient_scope": "full_model",
+            "loss_cotangent_bridge_ready": True,
+            "model_gradient_tree_ready": True,
+            "delegates_to_eager_loss_and_grad": False,
+            "hidden_packing_performed": False,
+        }
+
+
+class _BindingAwareFusedTrainBlockPathCTrainingRuntime(
+    _RecordingPathCTrainingRuntime
+):
+    contract = PATH_C_FUSED_TRAIN_BLOCK_TRAINING_RUNTIME_CONTRACT
+
+    def value_and_grad_contract(self) -> dict[str, Any]:
+        binding = self.training_graph_binding() or {}
+        return {
+            "contract": PATH_C_FUSED_TRAIN_BLOCK_VALUE_AND_GRAD_CONTRACT,
+            "owner": binding.get("owner"),
+            "uses_fused_train_block_runtime": bool(
+                binding.get("uses_fused_train_block_runtime")
             ),
             "uses_forward_hook": bool(binding.get("uses_forward_hook")),
             "uses_backward_or_vjp_hook": bool(
@@ -596,6 +625,28 @@ def test_path_c_training_runtime_checks_contract_after_graph_binding() -> None:
         "status": "ok",
         "owner": "CompiledPretrainingStep",
         "uses_direct_chain_runtime": True,
+        "uses_forward_hook": True,
+        "uses_backward_or_vjp_hook": True,
+    }
+
+
+def test_path_c_training_runtime_accepts_fused_train_block_contract() -> None:
+    model = TinyLM(_tiny_config())
+    optimizer = optim.AdamW(learning_rate=1e-2, weight_decay=0.0)
+    runtime = _BindingAwareFusedTrainBlockPathCTrainingRuntime()
+
+    step = CompiledPretrainingStep(
+        model,
+        optimizer,
+        compile=False,
+        path_c_training_runtime=runtime,
+    )
+
+    assert step.state_dict()["path_c_training_runtime_installed"] is True
+    assert runtime.training_graph_binding() == {
+        "status": "ok",
+        "owner": "CompiledPretrainingStep",
+        "uses_fused_train_block_runtime": True,
         "uses_forward_hook": True,
         "uses_backward_or_vjp_hook": True,
     }

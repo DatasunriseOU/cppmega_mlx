@@ -254,6 +254,34 @@ def _cache_store(cache: LRUCache | None, key: str | None, value: Any):
         cache.set(key, value)
 
 
+def _side_channel_policy_gotchas(
+    side_channels: Any,
+    available: frozenset[str],
+) -> list[GotchaPayload]:
+    """Report GUI-visible contract errors for required side-channel families."""
+    out: list[GotchaPayload] = []
+    global_requires = side_channels.mode == "require"
+    for family, policy in sorted(side_channels.families.items()):
+        if policy.mode == "off":
+            continue
+        required = policy.mode == "require" or global_requires
+        if not required:
+            continue
+        missing = [col for col in policy.columns if col not in available]
+        if not missing:
+            continue
+        out.append(GotchaPayload(
+            id=f"side_channel_required_{family}",
+            severity="error",
+            message=(
+                f"required side-channel family {family!r} is missing "
+                f"{', '.join(missing)}"
+            ),
+            reference="docs/side_channel_conditioning_plan.md#configuration-contract",
+        ))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # verify
 # ---------------------------------------------------------------------------
@@ -339,6 +367,9 @@ def verify(params: VerifyParams, *, cache: LRUCache | None = None) -> VerifyResu
             )
             for g in dverify.gotchas
         ]
+    gotcha_payloads.extend(
+        _side_channel_policy_gotchas(params.side_channels, available)
+    )
 
     edge_payloads: list[EdgeResolution] = []
     for re in resolved.edges:

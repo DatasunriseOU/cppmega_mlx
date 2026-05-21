@@ -1,0 +1,291 @@
+import { useEffect, useMemo, useState, type CSSProperties } from "react";
+import type {
+  GotchaState,
+  InferenceEnrichmentSource,
+  InferenceFailPolicy,
+  SideChannelFallback,
+  SideChannelMode,
+  SideChannelState,
+} from "@/state/spec";
+
+export interface SideChannelsTabProps {
+  sideChannels: SideChannelState;
+  availableChannels: string[];
+  gotchas: GotchaState[];
+  onApply: (next: SideChannelState) => void;
+}
+
+const MODES: SideChannelMode[] = ["off", "auto", "require", "if_available"];
+const FALLBACKS: SideChannelFallback[] = [
+  "zeros", "unknown_id", "drop_family", "error",
+];
+const SOURCES: InferenceEnrichmentSource[] = [
+  "none", "prompt_only", "parse_if_possible", "project_index", "auto",
+];
+const FAIL_POLICIES: InferenceFailPolicy[] = [
+  "drop_family", "text_only", "error",
+];
+const ADAPTERS = ["none", "cpp", "rust", "go", "python"] as const;
+
+export function SideChannelsTab({
+  sideChannels, availableChannels, gotchas, onApply,
+}: SideChannelsTabProps): JSX.Element {
+  const [draft, setDraft] = useState<SideChannelState>(sideChannels);
+  const [platform, setPlatform] = useState({
+    os: "macos",
+    arch: "arm64",
+    compiler: "clang",
+    accelerator: "metal",
+    standard: "c++20",
+  });
+  const [prompt, setPrompt] = useState("int add(int a, int b) { return a + b; }");
+  const [adapter, setAdapter] = useState<typeof ADAPTERS[number]>("cpp");
+
+  useEffect(() => setDraft(sideChannels), [sideChannels]);
+
+  const available = useMemo(() => new Set(availableChannels), [availableChannels]);
+  const requiredErrors = gotchas.filter((g) =>
+    g.id.startsWith("side_channel_required_"));
+  const platformPreview = renderPlatform(platform);
+  const enabledFamilies = Object.entries(draft.families)
+    .filter(([, f]) => f.mode !== "off")
+    .map(([name]) => name);
+
+  return (
+    <div data-testid="side-channels-tab" style={panel}>
+      <section style={section}>
+        <label style={label}>Mode
+          <select data-testid="side-channels-mode"
+                  value={draft.mode}
+                  onChange={(e) =>
+                    setDraft({ ...draft,
+                      mode: e.target.value as SideChannelMode })}>
+            {MODES.map((m) => <option key={m} value={m}>{m}</option>)}
+          </select>
+        </label>
+        <div data-testid="side-channels-available" style={muted}>
+          available: {availableChannels.length === 0
+            ? "none" : availableChannels.join(", ")}
+        </div>
+      </section>
+
+      <section style={section}>
+        {Object.entries(draft.families).map(([name, family]) => {
+          const present = family.columns.filter((c) => available.has(c));
+          const missing = family.columns.filter((c) => !available.has(c));
+          return (
+            <div key={name} data-testid={`side-channel-family-${name}`}
+                 style={familyRow}>
+              <div style={{ display: "flex", justifyContent: "space-between",
+                            gap: 6 }}>
+                <strong>{name}</strong>
+                <span data-testid={`side-channel-family-${name}-coverage`}
+                      style={{ color: missing.length === 0 ? "#166534" : "#92400e" }}>
+                  {present.length}/{family.columns.length}
+                </span>
+              </div>
+              <label style={label}>Mode
+                <select data-testid={`side-channel-family-${name}-mode`}
+                        value={family.mode}
+                        onChange={(e) => setFamily(name, {
+                          mode: e.target.value as SideChannelMode,
+                        })}>
+                  {MODES.map((m) => <option key={m} value={m}>{m}</option>)}
+                </select>
+              </label>
+              <label style={label}>Dropout
+                <input data-testid={`side-channel-family-${name}-dropout`}
+                       type="number" min={0} max={1} step={0.05}
+                       value={family.dropout}
+                       onChange={(e) => setFamily(name, {
+                         dropout: Number(e.target.value),
+                       })} />
+              </label>
+              <label style={label}>Fallback
+                <select data-testid={`side-channel-family-${name}-fallback`}
+                        value={family.fallback}
+                        onChange={(e) => setFamily(name, {
+                          fallback: e.target.value as SideChannelFallback,
+                        })}>
+                  {FALLBACKS.map((f) => <option key={f} value={f}>{f}</option>)}
+                </select>
+              </label>
+              <label style={label}>Residual
+                <input data-testid={`side-channel-family-${name}-residual`}
+                       type="number" min={0} step={0.1}
+                       value={family.residual_scale}
+                       onChange={(e) => setFamily(name, {
+                         residual_scale: Number(e.target.value),
+                       })} />
+              </label>
+              {missing.length > 0 && (
+                <div data-testid={`side-channel-family-${name}-missing`}
+                     style={muted}>
+                  missing: {missing.join(", ")}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </section>
+
+      <section style={section}>
+        <h4 style={heading}>Inference</h4>
+        <label style={label}>Source
+          <select data-testid="side-channel-inference-source"
+                  value={draft.inference.source}
+                  onChange={(e) => setDraft({
+                    ...draft,
+                    inference: {
+                      ...draft.inference,
+                      source: e.target.value as InferenceEnrichmentSource,
+                    },
+                  })}>
+            {SOURCES.map((s) => <option key={s} value={s}>{s}</option>)}
+          </select>
+        </label>
+        <label style={label}>Fail policy
+          <select data-testid="side-channel-inference-fail-policy"
+                  value={draft.inference.fail_policy}
+                  onChange={(e) => setDraft({
+                    ...draft,
+                    inference: {
+                      ...draft.inference,
+                      fail_policy: e.target.value as InferenceFailPolicy,
+                    },
+                  })}>
+            {FAIL_POLICIES.map((p) => <option key={p} value={p}>{p}</option>)}
+          </select>
+        </label>
+        <label style={label}>Timeout ms
+          <input data-testid="side-channel-inference-timeout"
+                 type="number" min={0}
+                 value={draft.inference.timeout_ms}
+                 onChange={(e) => setDraft({
+                   ...draft,
+                   inference: {
+                     ...draft.inference,
+                     timeout_ms: Number(e.target.value),
+                   },
+                 })} />
+        </label>
+        <label style={{ ...label, flexDirection: "row", alignItems: "center" }}>
+          <input data-testid="side-channel-inference-cache"
+                 type="checkbox"
+                 checked={draft.inference.cache_enabled}
+                 onChange={(e) => setDraft({
+                   ...draft,
+                   inference: {
+                     ...draft.inference,
+                     cache_enabled: e.target.checked,
+                   },
+                 })} />
+          Cache
+        </label>
+        <label style={label}>Adapter
+          <select data-testid="side-channel-adapter"
+                  value={adapter}
+                  onChange={(e) =>
+                    setAdapter(e.target.value as typeof ADAPTERS[number])}>
+            {ADAPTERS.map((a) => <option key={a} value={a}>{a}</option>)}
+          </select>
+        </label>
+      </section>
+
+      <section style={section}>
+        <h4 style={heading}>Platform</h4>
+        {(["os", "arch", "compiler", "accelerator", "standard"] as const)
+          .map((key) => (
+            <label key={key} style={label}>{key}
+              <input data-testid={`side-channel-platform-${key}`}
+                     value={platform[key]}
+                     onChange={(e) =>
+                       setPlatform({ ...platform, [key]: e.target.value })} />
+            </label>
+          ))}
+        <pre data-testid="side-channel-platform-preview" style={preview}>
+          {platformPreview || "unspecified"}
+        </pre>
+      </section>
+
+      <section style={section}>
+        <h4 style={heading}>Preview</h4>
+        <textarea data-testid="side-channel-preview-prompt"
+                  value={prompt}
+                  onChange={(e) => setPrompt(e.target.value)}
+                  style={{ width: "100%", minHeight: 54,
+                           fontFamily: "monospace", fontSize: 11 }} />
+        <pre data-testid="side-channel-preview" style={preview}>
+{`tokens=${prompt.length}
+source=${draft.inference.source}
+fail_policy=${draft.inference.fail_policy}
+adapter=${adapter}
+platform=${platformPreview || "unspecified"}
+families=${enabledFamilies.join(",") || "none"}`}
+        </pre>
+      </section>
+
+      <section data-testid="side-channel-probe" style={section}>
+        <h4 style={heading}>Contract Probe</h4>
+        {requiredErrors.length === 0 ? (
+          <div data-testid="side-channel-probe-clean" style={muted}>
+            0 required-family errors
+          </div>
+        ) : requiredErrors.map((g) => (
+          <div key={g.id} data-testid={`side-channel-probe-error-${g.id}`}
+               style={{ color: "#b91c1c", fontSize: 11 }}>
+            {g.message}
+          </div>
+        ))}
+      </section>
+
+      <button data-testid="side-channels-apply"
+              onClick={() => onApply(draft)}>
+        Apply
+      </button>
+    </div>
+  );
+
+  function setFamily(
+    name: string,
+    patch: Partial<SideChannelState["families"][string]>,
+  ) {
+    setDraft({
+      ...draft,
+      families: {
+        ...draft.families,
+        [name]: { ...draft.families[name], ...patch },
+      },
+    });
+  }
+}
+
+function renderPlatform(platform: Record<string, string>): string {
+  return Object.entries(platform)
+    .filter(([, value]) => value.trim().length > 0)
+    .map(([key, value]) => `${key}=${value.trim()}`)
+    .join("; ");
+}
+
+const panel: CSSProperties = {
+  display: "flex", flexDirection: "column", gap: 10, padding: 12,
+  fontFamily: "system-ui, sans-serif", fontSize: 12,
+};
+const section: CSSProperties = {
+  display: "flex", flexDirection: "column", gap: 6,
+  borderBottom: "1px solid #e5e7eb", paddingBottom: 8,
+};
+const familyRow: CSSProperties = {
+  display: "flex", flexDirection: "column", gap: 4,
+  padding: 6, border: "1px solid #e5e7eb", borderRadius: 4,
+};
+const label: CSSProperties = {
+  display: "flex", flexDirection: "column", gap: 2,
+  color: "#374151", fontSize: 11,
+};
+const heading: CSSProperties = { margin: 0, fontSize: 13 };
+const muted: CSSProperties = { color: "#6b7280", fontSize: 11 };
+const preview: CSSProperties = {
+  margin: 0, padding: 6, border: "1px solid #e5e7eb", borderRadius: 3,
+  background: "#f9fafb", whiteSpace: "pre-wrap", fontSize: 11,
+};

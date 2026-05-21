@@ -424,6 +424,16 @@ def stage_train(ctx: StageContext) -> StageResult:
         data_source = "synthetic"
         token_count = 0
         tokenizer_used: str | None = None
+        # V4-10: record which side-channels the caller supplied. Pure
+        # observation for now — actual per-channel forward routing is
+        # v5+ work. Surfacing via extras lets e2e prove UI toggles
+        # reached the backend opts surface.
+        side_channels_in = opts.get("side_channels") or {}
+        side_channels_observed: list[str] = []
+        if isinstance(side_channels_in, dict):
+            for name, data in side_channels_in.items():
+                if isinstance(data, (list, tuple)) and len(data) > 0:
+                    side_channels_observed.append(str(name))
         parquet_path = opts.get("parquet_path")
         tokenizer_path = opts.get("tokenizer_path")
         targets = mx.random.randint(0, vocab_size, shape=(batch, seq))
@@ -608,6 +618,7 @@ def stage_train(ctx: StageContext) -> StageResult:
                     "l2_diff": round(l2_diff, 6),
                     "cos_sim": round(cos_sim, 6),
                 },
+                "side_channels_observed": side_channels_observed,
                 "model_summary": _summarize_model(
                     ctx.spec, optimizer_kind, schedule_kind_label),
             },

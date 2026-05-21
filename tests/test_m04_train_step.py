@@ -176,6 +176,65 @@ class _ContractedValueAndGradPathCDirectFusionChainTrainingRuntime(
         }
 
 
+class _ReadyFusedTrainBlockTrainingRuntime:
+    contract = m04_train_step.PATH_C_FUSED_TRAIN_BLOCK_TRAINING_RUNTIME_CONTRACT
+    training_critical_path = True
+    hidden_packing_performed = False
+    no_hidden_allocation_policy = True
+    owner_name = "local_gb10_quarter.path_c_fused_train_block_runtime"
+
+    def __init__(self) -> None:
+        self._binding: dict[str, Any] | None = {
+            "owner": "CompiledPretrainingStep",
+            "uses_fused_train_block_runtime": True,
+            "uses_forward_hook": True,
+            "uses_backward_or_vjp_hook": True,
+        }
+
+    def forward(self, *args: Any, **kwargs: Any) -> None:
+        raise AssertionError("unit tests only inspect the fused train-block contract")
+
+    def backward(self, *args: Any, **kwargs: Any) -> None:
+        raise AssertionError("unit tests only inspect the fused train-block contract")
+
+    def value_and_grad(self, *args: Any, **kwargs: Any) -> None:
+        raise AssertionError("unit tests only inspect the fused train-block contract")
+
+    def bind_training_graph(self, **binding: Any) -> None:
+        self._binding = dict(binding)
+
+    def unbind_training_graph(self, *, owner: str) -> None:
+        if self._binding is not None and self._binding.get("owner") == owner:
+            self._binding = None
+
+    def training_graph_binding(self) -> dict[str, Any]:
+        return dict(self._binding or {})
+
+    def value_and_grad_contract(self) -> dict[str, Any]:
+        return {
+            "contract": m04_train_step.PATH_C_FUSED_TRAIN_BLOCK_VALUE_AND_GRAD_CONTRACT,
+            "owner": "CompiledPretrainingStep",
+            "uses_fused_train_block_runtime": True,
+            "uses_forward_hook": True,
+            "uses_backward_or_vjp_hook": True,
+            "returns_model_grads": True,
+            "returns_full_model_grads": True,
+            "gradient_scope": "full_model",
+            "loss_cotangent_bridge_ready": True,
+            "model_gradient_tree_ready": True,
+            "delegates_to_eager_loss_and_grad": False,
+            "hidden_packing_performed": False,
+        }
+
+
+class _UnboundReadyFusedTrainBlockTrainingRuntime(
+    _ReadyFusedTrainBlockTrainingRuntime
+):
+    def __init__(self) -> None:
+        super().__init__()
+        self.unbind_training_graph(owner="CompiledPretrainingStep")
+
+
 class _ContractedLossCotangentBridge:
     def __init__(self) -> None:
         self.calls: list[tuple[str, tuple[str, ...]]] = []
@@ -3552,6 +3611,107 @@ def test_fp8_path_c_training_route_keeps_split_until_fused_artifact_is_bound(
     assert route["selected_action"] == "run_path_c_split_training_route"
 
 
+def test_fp8_path_c_training_route_keeps_split_until_fused_training_runtime_is_bound(
+    tmp_path: Path,
+    path_c_fusion_auto_env: None,
+) -> None:
+    del path_c_fusion_auto_env
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--synthetic",
+            "--dtype",
+            "fp8_path_c",
+            "--pattern",
+            "A",
+            "--depth",
+            "1",
+            "--dsa-a-layer-ranks",
+            "0",
+            "--output",
+            str(tmp_path / "receipt.json"),
+        ]
+    )
+    config = m04_train_step.config_from_args(args, data_path=tmp_path / "tokens.npz")
+
+    route = m04_train_step.fp8_path_c_training_route_payload(
+        config,
+        bank_owner=_model_route_physical_bank_owner(),
+        fused_artifact=lambda *args: None,
+    )
+
+    binding = route["path_c_fusion"]["runtime_training_binding"]
+    assert binding["runtime_uses_fused_train_block"] is True
+    assert route["single_fused_train_block_standalone_dispatch_available"] is True
+    assert route["single_fused_train_block_runtime_available"] is False
+    assert route["fused_train_block_training_runtime_available"] is False
+    assert route["fused_train_block_training_runtime_contract"]["status"] == (
+        m04_train_step.FP8_PATH_C_FUSED_TRAIN_BLOCK_TRAINING_RUNTIME_MISSING_STATUS
+    )
+    assert route["fused_train_block_runtime_available"] is False
+    assert route["fused_train_block_blocker_type"] == (
+        m04_train_step.FP8_PATH_C_FUSED_TRAIN_BLOCK_TRAINING_RUNTIME_MISSING_STATUS
+    )
+    assert route["selected_action"] == "run_path_c_split_training_route"
+
+
+def test_fp8_path_c_training_route_reports_model_owned_physical_bank_plan(
+    tmp_path: Path,
+    path_c_fusion_auto_env: None,
+) -> None:
+    del path_c_fusion_auto_env
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--synthetic",
+            "--dtype",
+            "fp8_path_c",
+            "--pattern",
+            "A",
+            "--depth",
+            "1",
+            "--dsa-a-layer-ranks",
+            "0",
+            "--output",
+            str(tmp_path / "receipt.json"),
+        ]
+    )
+    config = m04_train_step.config_from_args(args, data_path=tmp_path / "tokens.npz")
+    model = build_local_gb10_quarter_tiny_smoke_model()
+
+    route = m04_train_step.fp8_path_c_training_route_payload_for_model(
+        config,
+        model,
+    )
+
+    binding = route["path_c_fusion"]["runtime_training_binding"]
+    assert binding["status"] == (
+        m04_train_step.FP8_PATH_C_FUSED_TRAIN_BLOCK_BANKS_MISSING_STATUS
+    )
+    bank_plan = binding["model_owned_physical_abi_bank_plan"]
+    assert bank_plan["status"] == "model_owned_physical_abi_banks_required"
+    assert bank_plan["owner_attribute"] == "path_c_physical_abi_bank_owner"
+    assert bank_plan["owner_name"] == "local_gb10_quarter.path_c_physical_abi_banks"
+    assert bank_plan["allocation_required_before_binding"] is True
+    assert bank_plan["hidden_packing_performed"] is False
+    assert bank_plan["no_hidden_allocation_policy"] is True
+    assert bank_plan["required_bank_buffers"] == binding["required_bank_buffers"]
+    assert [spec["name"] for spec in bank_plan["bank_specs"]] == (
+        binding["required_bank_buffers"]
+    )
+    assert {spec["dtype"] for spec in bank_plan["bank_specs"]} == {
+        "float32",
+        "uint8",
+        "int32",
+    }
+    assert bank_plan["total_nbytes"] == sum(
+        spec["nbytes"] for spec in bank_plan["bank_specs"]
+    )
+    assert bank_plan["total_nbytes"] > 0
+    assert all(
+        spec["logical_buffer_count"] == len(spec["logical_buffers"])
+        for spec in bank_plan["bank_specs"]
+    )
+
+
 def test_path_c_fusion_payload_keeps_compile_blocker_without_matching_receipt(
     tmp_path: Path,
     path_c_fusion_auto_env: None,
@@ -3664,11 +3824,16 @@ def test_fp8_path_c_training_route_selects_fused_action_when_banks_are_bound(
         bank_buffers=_model_route_physical_bank_buffers(),
         bank_buffer_owner="local_gb10_quarter.path_c_physical_abi_banks",
         fused_artifact=lambda *args: None,
+        fused_train_block_training_runtime=_ReadyFusedTrainBlockTrainingRuntime(),
     )
 
     assert route["full_end_to_end_training_available"] is True
     assert route["status"] == m04_train_step.FP8_PATH_C_E2E_TRAINING_STATUS
     assert route["fused_train_block_runtime_available"] is True
+    assert route["single_fused_train_block_standalone_dispatch_available"] is True
+    assert route["single_fused_train_block_runtime_available"] is True
+    assert route["fused_train_block_training_runtime_available"] is True
+    assert route["fused_train_block_training_runtime_contract"]["status"] == "ok"
     assert route["fused_train_block_blocker_type"] is None
     assert route["direct_mx_array_artifact_call_status"] == (
         "m04_uses_fused_train_block_route"
@@ -3714,7 +3879,12 @@ def test_fp8_path_c_training_route_for_model_reads_bank_owner(
         model,
     )
 
-    assert route["selected_action"] == "run_path_c_fused_train_block_route"
+    assert route["selected_action"] == "run_path_c_split_training_route"
+    assert route["single_fused_train_block_standalone_dispatch_available"] is True
+    assert route["fused_train_block_training_runtime_available"] is False
+    assert route["fused_train_block_training_runtime_contract"]["status"] == (
+        m04_train_step.FP8_PATH_C_FUSED_TRAIN_BLOCK_TRAINING_RUNTIME_MISSING_STATUS
+    )
     assert route["path_c_fusion"]["runtime_training_binding"]["bank_buffer_owner"] == (
         "local_gb10_quarter.path_c_physical_abi_banks"
     )
@@ -3765,10 +3935,71 @@ def test_fp8_path_c_training_route_for_model_auto_compiles_fused_artifact_when_b
     assert auto_install["artifact_compile"]["status"] == "ok"
     assert auto_install["artifact_compile"]["artifact_bound"] is True
     assert auto_install["hidden_packing_performed"] is False
-    assert route["selected_action"] == "run_path_c_fused_train_block_route"
+    assert route["selected_action"] == "run_path_c_split_training_route"
+    assert route["single_fused_train_block_standalone_dispatch_available"] is True
+    assert route["fused_train_block_training_runtime_available"] is False
     assert route["path_c_fusion"]["runtime_training_binding"][
         "runtime_uses_fused_train_block"
     ] is True
+    assert callable(model.path_c_fused_train_block_artifact)
+    assert lowerer_calls[0]["target"] == "metal"
+
+
+def test_fp8_path_c_training_route_for_model_auto_binds_model_training_runtime(
+    tmp_path: Path,
+    path_c_fusion_auto_env: None,
+) -> None:
+    del path_c_fusion_auto_env
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--synthetic",
+            "--dtype",
+            "fp8_path_c",
+            "--pattern",
+            "A",
+            "--depth",
+            "1",
+            "--dsa-a-layer-ranks",
+            "0",
+            "--output",
+            str(tmp_path / "receipt.json"),
+        ]
+    )
+    config = m04_train_step.config_from_args(args, data_path=tmp_path / "tokens.npz")
+    model = build_local_gb10_quarter_tiny_smoke_model()
+    sequence_length = m04_train_step.path_c_training_sequence_length(config)
+    model.path_c_physical_abi_bank_owner = _model_route_physical_bank_owner(
+        model,
+        sequence_length=sequence_length,
+    )
+    runtime = _UnboundReadyFusedTrainBlockTrainingRuntime()
+    model.path_c_fused_train_block_training_runtime = runtime
+    lowerer_calls: list[dict[str, Any]] = []
+
+    def fake_lowerer(func_or_mod: Any, *, target: str, **kwargs: Any) -> Any:
+        del func_or_mod
+        lowerer_calls.append({"target": target, "kwargs": dict(kwargs)})
+        return lambda *args: None
+
+    route = m04_train_step.fp8_path_c_training_route_payload_for_model(
+        config,
+        model,
+        fused_train_block_artifact_lowerer=fake_lowerer,
+    )
+
+    auto_install = route["path_c_fusion"]["fused_train_block_auto_install"]
+    assert auto_install["status"] == "ok"
+    assert auto_install["training_runtime_available"] is True
+    assert auto_install["training_runtime_contract"]["status"] == "ok"
+    assert runtime.training_graph_binding() == {
+        "owner": "CompiledPretrainingStep",
+        "uses_fused_train_block_runtime": True,
+        "uses_forward_hook": True,
+        "uses_backward_or_vjp_hook": True,
+    }
+    assert route["selected_action"] == "run_path_c_fused_train_block_route"
+    assert route["fused_train_block_training_runtime_available"] is True
+    assert route["single_fused_train_block_runtime_available"] is True
     assert callable(model.path_c_fused_train_block_artifact)
     assert lowerer_calls[0]["target"] == "metal"
 
@@ -3821,10 +4052,60 @@ def test_path_c_fused_train_block_runtime_installer_binds_model_owned_banks(
         model,
     )
 
-    assert route["selected_action"] == "run_path_c_fused_train_block_route"
+    assert route["selected_action"] == "run_path_c_split_training_route"
+    assert route["single_fused_train_block_standalone_dispatch_available"] is True
+    assert route["fused_train_block_training_runtime_available"] is False
     assert route["path_c_fusion"]["runtime_training_binding"]["bank_buffer_owner"] == (
         "local_gb10_quarter.path_c_physical_abi_banks"
     )
+
+
+def test_path_c_fused_train_block_runtime_installer_attaches_training_runtime_contract(
+    tmp_path: Path,
+    path_c_fusion_auto_env: None,
+) -> None:
+    del path_c_fusion_auto_env
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--synthetic",
+            "--dtype",
+            "fp8_path_c",
+            "--pattern",
+            "A",
+            "--depth",
+            "1",
+            "--dsa-a-layer-ranks",
+            "0",
+            "--output",
+            str(tmp_path / "receipt.json"),
+        ]
+    )
+    config = m04_train_step.config_from_args(args, data_path=tmp_path / "tokens.npz")
+    model = build_local_gb10_quarter_tiny_smoke_model()
+    sequence_length = m04_train_step.path_c_training_sequence_length(config)
+    runtime = _ReadyFusedTrainBlockTrainingRuntime()
+
+    install = m04_train_step.install_path_c_fused_train_block_runtime_for_model(
+        model=model,
+        bank_owner=_model_route_physical_bank_owner(
+            model,
+            sequence_length=sequence_length,
+        ),
+        fused_artifact=lambda *args: None,
+        training_runtime=runtime,
+        sequence_length=sequence_length,
+    )
+    route = m04_train_step.fp8_path_c_training_route_payload_for_model(
+        config,
+        model,
+    )
+
+    assert install["status"] == "ok"
+    assert install["training_runtime_available"] is True
+    assert install["training_runtime_contract"]["status"] == "ok"
+    assert model.path_c_fused_train_block_training_runtime is runtime
+    assert route["fused_train_block_training_runtime_available"] is True
+    assert route["selected_action"] == "run_path_c_fused_train_block_route"
 
 
 def test_compile_path_c_fused_train_block_artifact_for_model_lowers_selected_aot_region(
@@ -3936,7 +4217,9 @@ def test_path_c_fused_train_block_runtime_installer_compiles_artifact_when_banks
         model,
     )
 
-    assert route["selected_action"] == "run_path_c_fused_train_block_route"
+    assert route["selected_action"] == "run_path_c_split_training_route"
+    assert route["single_fused_train_block_standalone_dispatch_available"] is True
+    assert route["fused_train_block_training_runtime_available"] is False
     assert route["path_c_fusion"]["runtime_training_binding"][
         "runtime_uses_fused_train_block"
     ] is True
@@ -4757,6 +5040,7 @@ def test_receipt_preserves_bound_fp8_path_c_route_from_train_payload(
         config,
         bank_owner=_model_route_physical_bank_owner(),
         fused_artifact=lambda *args: None,
+        fused_train_block_training_runtime=_ReadyFusedTrainBlockTrainingRuntime(),
     )
 
     receipt = m04_train_step.receipt_from_train_payload(

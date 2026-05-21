@@ -2658,7 +2658,11 @@ def _post_residual_gate_bwd_kernel_for(
                 skipped = y_val + v_val * d_val
                 dskipped = dpost_val * silu_g
 
-                dy_recurrent[b, t, h, vv] = T.cast(dskipped, grad_dtype)
+                T.atomic_add(
+                    dy_recurrent[b, t, h, vv],
+                    dskipped,
+                    memory_order="relaxed",
+                )
                 T.atomic_add(
                     dconv_input[b, t, v_index],
                     dskipped * d_val,
@@ -2806,7 +2810,11 @@ def _post_residual_gate_bwd_from_recurrence_kernel_for(
                     skipped = y_acc[0] + v_val * d_val
                     dskipped = dpost_val * silu_g
 
-                    dy_recurrent[b, t, h, vv] = T.cast(dskipped, grad_dtype)
+                    T.atomic_add(
+                        dy_recurrent[b, t, h, vv],
+                        dskipped,
+                        memory_order="relaxed",
+                    )
                     T.atomic_add(
                         dconv_input[b, t, v_index],
                         dskipped * d_val,
@@ -5384,6 +5392,14 @@ def _post_residual_gate_apply_for_layout(
             v_heads=v_heads,
             g_heads=g_heads,
         )
+        # MLX can otherwise drop the first TileLang owner-output from the
+        # custom-VJP return graph under pytest capture. A scalar readback keeps
+        # the dy buffer live at the autograd boundary without staging or
+        # copying the tensor.
+        try:
+            _ = grads[0][0, 0, 0, 0].item()
+        except IndexError:
+            pass
         return _match_primal_gradient_dtypes(grads, primals)
 
     return _apply

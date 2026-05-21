@@ -1152,11 +1152,20 @@ def _runtime_smoke_fused_train_block_route_payload(
             route.get("path_c_fusion", {}).get("runtime_training_binding", {})
         )
         selected_action = route.get("selected_action")
+        standalone_bound = bool(
+            install.get("status") == "ok"
+            and runtime_binding.get("runtime_uses_fused_train_block") is True
+        )
+        training_route_bound = bool(
+            standalone_bound
+            and selected_action == "run_path_c_fused_train_block_route"
+            and route.get("single_fused_train_block_runtime_available") is True
+        )
         status = (
             "ok"
-            if install.get("status") == "ok"
-            and selected_action == "run_path_c_fused_train_block_route"
-            and runtime_binding.get("runtime_uses_fused_train_block") is True
+            if training_route_bound
+            else "standalone_only_not_training_route"
+            if standalone_bound
             else "blocked"
         )
         return {
@@ -1168,8 +1177,19 @@ def _runtime_smoke_fused_train_block_route_payload(
                 "full_end_to_end_training_available": route.get(
                     "full_end_to_end_training_available"
                 ),
+                "single_fused_train_block_standalone_dispatch_available": (
+                    route.get(
+                        "single_fused_train_block_standalone_dispatch_available"
+                    )
+                ),
                 "single_fused_train_block_runtime_available": route.get(
                     "single_fused_train_block_runtime_available"
+                ),
+                "fused_train_block_training_runtime_available": route.get(
+                    "fused_train_block_training_runtime_available"
+                ),
+                "fused_train_block_training_runtime_contract": route.get(
+                    "fused_train_block_training_runtime_contract"
                 ),
                 "path_c_fusion": {
                     "runtime_training_binding": runtime_binding,

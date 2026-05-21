@@ -64,6 +64,7 @@ from cppmega_mlx.runtime.path_c_physical_abi import (  # noqa: E402
     PathCLogicalBufferOwner,
     compose_path_c_logical_buffer_owner,
     make_physical_abi_bank_owner,
+    physical_abi_bank_specs,
     plan_physical_abi_runtime_bridge,
     validate_physical_abi_runtime_bindings,
 )
@@ -180,6 +181,18 @@ FP8_PATH_C_FUSED_TRAIN_BLOCK_BANKS_MISSING_STATUS = (
 FP8_PATH_C_FUSED_TRAIN_BLOCK_ARTIFACT_MISSING_STATUS = (
     "fused_train_block_artifact_missing"
 )
+FP8_PATH_C_FUSED_TRAIN_BLOCK_TRAINING_RUNTIME_MISSING_STATUS = (
+    "fused_train_block_training_runtime_missing"
+)
+FP8_PATH_C_FUSED_TRAIN_BLOCK_TRAINING_RUNTIME_INCOMPLETE_STATUS = (
+    "fused_train_block_training_runtime_incomplete"
+)
+FP8_PATH_C_FUSED_TRAIN_BLOCK_TRAINING_RUNTIME_NOT_CRITICAL_STATUS = (
+    "fused_train_block_training_runtime_not_on_critical_path"
+)
+FP8_PATH_C_FUSED_TRAIN_BLOCK_TRAINING_RUNTIME_HIDDEN_ALLOCATION_STATUS = (
+    "fused_train_block_training_runtime_hidden_allocation"
+)
 FP8_PATH_C_DIRECT_CHAIN_LOGICAL_BUFFERS_MISSING_STATUS = (
     "direct_fusion_chain_logical_buffers_missing"
 )
@@ -203,6 +216,12 @@ PATH_C_DIRECT_FUSION_TRAINING_RUNTIME_CONTRACT = (
 )
 PATH_C_DIRECT_FUSION_VALUE_AND_GRAD_CONTRACT = (
     "path_c_direct_fusion_value_and_grad_v1"
+)
+PATH_C_FUSED_TRAIN_BLOCK_TRAINING_RUNTIME_CONTRACT = (
+    "path_c_fused_train_block_training_runtime_v1"
+)
+PATH_C_FUSED_TRAIN_BLOCK_VALUE_AND_GRAD_CONTRACT = (
+    "path_c_fused_train_block_value_and_grad_v1"
 )
 PATH_C_LOSS_COTANGENT_BRIDGE_CONTRACT = "path_c_loss_cotangent_bridge_v1"
 PATH_C_FUSION_COMPILE_RECEIPT_ENV = "CPPMEGA_PATH_C_FUSION_COMPILE_RECEIPT"
@@ -1227,6 +1246,128 @@ def path_c_direct_fusion_chain_training_runtime_contract_payload(
     }
 
 
+def path_c_fused_train_block_training_runtime_contract_payload(
+    *,
+    training_runtime: Any | None,
+    runtime_binding: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Validate that a single fused train-block runtime owns training execution."""
+
+    runtime_binding = runtime_binding or {}
+    runtime_installed = training_runtime is not None
+    forward = getattr(training_runtime, "forward", None)
+    backward = getattr(training_runtime, "backward", None)
+    vjp = getattr(training_runtime, "vjp", None)
+    value_and_grad = getattr(training_runtime, "value_and_grad", None)
+    forward_callable = callable(forward)
+    backward_callable = callable(backward)
+    vjp_callable = callable(vjp)
+    value_and_grad_callable = callable(value_and_grad)
+    reverse_callable = backward_callable or vjp_callable
+    declared_contract = str(getattr(training_runtime, "contract", ""))
+    contract_matches = (
+        declared_contract == PATH_C_FUSED_TRAIN_BLOCK_TRAINING_RUNTIME_CONTRACT
+    )
+    declared_training_critical_path = bool(
+        getattr(
+            training_runtime,
+            "training_critical_path",
+            getattr(training_runtime, "critical_path", False),
+        )
+    )
+    hidden_packing_performed = bool(
+        getattr(training_runtime, "hidden_packing_performed", False)
+    )
+    no_hidden_allocation_policy = bool(
+        getattr(training_runtime, "no_hidden_allocation_policy", True)
+    )
+    runtime_uses_fused_train_block = bool(
+        runtime_binding.get("runtime_uses_fused_train_block")
+    )
+    graph_binding = _fused_train_block_training_graph_binding_payload(
+        training_runtime
+    )
+    graph_binding_ok = bool(graph_binding.get("status") == "ok")
+    value_and_grad_contract = _fused_train_block_value_and_grad_contract_payload(
+        training_runtime
+    )
+    value_and_grad_contract_ok = bool(
+        value_and_grad_contract.get("status") == "ok"
+    )
+    returns_full_model_grads = bool(
+        value_and_grad_contract.get("returns_full_model_grads", False)
+    )
+    training_critical_path = bool(
+        declared_training_critical_path
+        and graph_binding_ok
+        and value_and_grad_callable
+        and value_and_grad_contract_ok
+        and returns_full_model_grads
+    )
+    if not runtime_installed:
+        status = FP8_PATH_C_FUSED_TRAIN_BLOCK_TRAINING_RUNTIME_MISSING_STATUS
+    elif not runtime_uses_fused_train_block:
+        status = str(
+            runtime_binding.get(
+                "status",
+                FP8_PATH_C_FUSED_TRAIN_BLOCK_BANKS_MISSING_STATUS,
+            )
+        )
+    elif (
+        not contract_matches
+        or not forward_callable
+        or not reverse_callable
+        or not value_and_grad_callable
+        or not value_and_grad_contract_ok
+        or not returns_full_model_grads
+    ):
+        status = FP8_PATH_C_FUSED_TRAIN_BLOCK_TRAINING_RUNTIME_INCOMPLETE_STATUS
+    elif hidden_packing_performed or not no_hidden_allocation_policy:
+        status = FP8_PATH_C_FUSED_TRAIN_BLOCK_TRAINING_RUNTIME_HIDDEN_ALLOCATION_STATUS
+    elif not training_critical_path:
+        status = FP8_PATH_C_FUSED_TRAIN_BLOCK_TRAINING_RUNTIME_NOT_CRITICAL_STATUS
+    else:
+        status = "ok"
+    training_runtime_available = status == "ok"
+    return {
+        "contract": PATH_C_FUSED_TRAIN_BLOCK_TRAINING_RUNTIME_CONTRACT,
+        "status": status,
+        "training_runtime_available": training_runtime_available,
+        "runtime_installed": runtime_installed,
+        "declared_contract": declared_contract if runtime_installed else None,
+        "contract_matches": contract_matches,
+        "runtime_class": type(training_runtime).__name__ if runtime_installed else None,
+        "runtime_owner": getattr(training_runtime, "owner_name", None)
+        if runtime_installed
+        else None,
+        "forward_callable": forward_callable,
+        "backward_callable": backward_callable,
+        "vjp_callable": vjp_callable,
+        "value_and_grad_callable": value_and_grad_callable,
+        "value_and_grad_contract": value_and_grad_contract,
+        "value_and_grad_contract_ok": value_and_grad_contract_ok,
+        "returns_full_model_grads": returns_full_model_grads,
+        "training_critical_path_declared": declared_training_critical_path,
+        "training_graph_bound": graph_binding_ok,
+        "training_graph_binding": graph_binding,
+        "training_critical_path_verified": training_critical_path,
+        "critical_path_ready": training_runtime_available,
+        "runtime_uses_fused_train_block": runtime_uses_fused_train_block,
+        "hidden_packing_performed": hidden_packing_performed,
+        "no_hidden_allocation_policy": no_hidden_allocation_policy,
+        "reason": (
+            "single fused train-block value_and_grad is installed in the "
+            "training graph and backed by callable generated artifact plus "
+            "model-owned physical ABI banks"
+            if training_runtime_available
+            else "fused train-block bank/artifact binding is not enough; m04 "
+            "needs an explicit training-graph value_and_grad runtime with "
+            "full-model gradients, no hidden packing, and no delegation to "
+            "eager loss_and_grad"
+        ),
+    }
+
+
 def _direct_chain_training_graph_binding_payload(
     training_runtime: Any | None,
 ) -> dict[str, Any]:
@@ -1340,6 +1481,130 @@ def _direct_chain_value_and_grad_contract_payload(
         "contract": contract or PATH_C_DIRECT_FUSION_VALUE_AND_GRAD_CONTRACT,
         "owner": owner or None,
         "uses_direct_chain_runtime": uses_runtime,
+        "uses_forward_hook": uses_forward,
+        "uses_backward_or_vjp_hook": uses_reverse,
+        "returns_model_grads": returns_model_grads,
+        "returns_full_model_grads": returns_full_model_grads,
+        "loss_cotangent_bridge_ready": loss_cotangent_bridge_ready,
+        "model_gradient_tree_ready": model_gradient_tree_ready,
+        "delegates_to_eager_loss_and_grad": delegates_to_eager,
+        "hidden_packing_performed": hidden_packing,
+    }
+
+
+def _fused_train_block_training_graph_binding_payload(
+    training_runtime: Any | None,
+) -> dict[str, Any]:
+    if training_runtime is None:
+        return {
+            "status": "missing",
+            "owner": None,
+            "uses_fused_train_block_runtime": False,
+            "uses_forward_hook": False,
+            "uses_backward_or_vjp_hook": False,
+        }
+    raw_binding = getattr(training_runtime, "training_graph_binding", None)
+    if callable(raw_binding):
+        raw_binding = raw_binding()
+    if not isinstance(raw_binding, Mapping):
+        return {
+            "status": "missing",
+            "owner": None,
+            "uses_fused_train_block_runtime": False,
+            "uses_forward_hook": False,
+            "uses_backward_or_vjp_hook": False,
+        }
+    payload = dict(raw_binding)
+    owner = str(payload.get("owner", ""))
+    uses_runtime = bool(payload.get("uses_fused_train_block_runtime"))
+    uses_forward = bool(payload.get("uses_forward_hook"))
+    uses_reverse = bool(payload.get("uses_backward_or_vjp_hook"))
+    status = (
+        "ok"
+        if owner == "CompiledPretrainingStep"
+        and uses_runtime
+        and uses_forward
+        and uses_reverse
+        else "incomplete"
+    )
+    return {
+        **payload,
+        "status": status,
+        "owner": owner or None,
+        "uses_fused_train_block_runtime": uses_runtime,
+        "uses_forward_hook": uses_forward,
+        "uses_backward_or_vjp_hook": uses_reverse,
+    }
+
+
+def _fused_train_block_value_and_grad_contract_payload(
+    training_runtime: Any | None,
+) -> dict[str, Any]:
+    if training_runtime is None:
+        return {
+            "status": "missing",
+            "contract": PATH_C_FUSED_TRAIN_BLOCK_VALUE_AND_GRAD_CONTRACT,
+            "owner": None,
+            "uses_fused_train_block_runtime": False,
+            "uses_forward_hook": False,
+            "uses_backward_or_vjp_hook": False,
+            "returns_model_grads": False,
+            "returns_full_model_grads": False,
+            "loss_cotangent_bridge_ready": False,
+            "model_gradient_tree_ready": False,
+            "delegates_to_eager_loss_and_grad": True,
+            "hidden_packing_performed": False,
+        }
+    raw_contract = getattr(training_runtime, "value_and_grad_contract", None)
+    if callable(raw_contract):
+        raw_contract = raw_contract()
+    if not isinstance(raw_contract, Mapping):
+        return {
+            "status": "missing",
+            "contract": PATH_C_FUSED_TRAIN_BLOCK_VALUE_AND_GRAD_CONTRACT,
+            "owner": None,
+            "uses_fused_train_block_runtime": False,
+            "uses_forward_hook": False,
+            "uses_backward_or_vjp_hook": False,
+            "returns_model_grads": False,
+            "returns_full_model_grads": False,
+            "loss_cotangent_bridge_ready": False,
+            "model_gradient_tree_ready": False,
+            "delegates_to_eager_loss_and_grad": True,
+            "hidden_packing_performed": False,
+        }
+    payload = dict(raw_contract)
+    owner = str(payload.get("owner", ""))
+    contract = str(payload.get("contract", ""))
+    uses_runtime = bool(payload.get("uses_fused_train_block_runtime"))
+    uses_forward = bool(payload.get("uses_forward_hook"))
+    uses_reverse = bool(payload.get("uses_backward_or_vjp_hook"))
+    returns_model_grads = bool(payload.get("returns_model_grads"))
+    returns_full_model_grads = bool(payload.get("returns_full_model_grads", False))
+    loss_cotangent_bridge_ready = bool(payload.get("loss_cotangent_bridge_ready"))
+    model_gradient_tree_ready = bool(payload.get("model_gradient_tree_ready"))
+    delegates_to_eager = bool(payload.get("delegates_to_eager_loss_and_grad", True))
+    hidden_packing = bool(payload.get("hidden_packing_performed", False))
+    status = (
+        "ok"
+        if contract == PATH_C_FUSED_TRAIN_BLOCK_VALUE_AND_GRAD_CONTRACT
+        and owner == "CompiledPretrainingStep"
+        and uses_runtime
+        and uses_forward
+        and uses_reverse
+        and returns_model_grads
+        and loss_cotangent_bridge_ready
+        and model_gradient_tree_ready
+        and not delegates_to_eager
+        and not hidden_packing
+        else "incomplete"
+    )
+    return {
+        **payload,
+        "status": status,
+        "contract": contract or PATH_C_FUSED_TRAIN_BLOCK_VALUE_AND_GRAD_CONTRACT,
+        "owner": owner or None,
+        "uses_fused_train_block_runtime": uses_runtime,
         "uses_forward_hook": uses_forward,
         "uses_backward_or_vjp_hook": uses_reverse,
         "returns_model_grads": returns_model_grads,
@@ -2045,6 +2310,7 @@ def fp8_path_c_training_route_payload(
     direct_chain_logical_buffer_owner: str | None = None,
     direct_chain_logical_owner: Any | None = None,
     direct_chain_training_runtime: Any | None = None,
+    fused_train_block_training_runtime: Any | None = None,
 ) -> dict[str, Any]:
     requested = path_c_training_route_requested(args)
     fp8_producer_required = fp8_path_c_route_requested(args)
@@ -2066,12 +2332,30 @@ def fp8_path_c_training_route_payload(
         direct_chain_logical_buffer_owner=direct_chain_logical_buffer_owner,
         direct_chain_logical_owner=direct_chain_logical_owner,
         direct_chain_training_runtime=direct_chain_training_runtime,
+        fused_train_block_training_runtime=fused_train_block_training_runtime,
         sequence_length=sequence_length,
     )
     runtime_training_binding = path_c_fusion.get("runtime_training_binding", {})
-    single_fused_train_block_runtime_available = bool(
+    single_fused_train_block_standalone_dispatch_available = bool(
         isinstance(runtime_training_binding, dict)
         and runtime_training_binding.get("runtime_uses_fused_train_block")
+    )
+    fused_train_block_training_contract: Mapping[str, Any] = {}
+    candidate_fused_contract = path_c_fusion.get(
+        "fused_train_block_training_runtime_contract",
+        {},
+    )
+    if isinstance(candidate_fused_contract, Mapping):
+        fused_train_block_training_contract = candidate_fused_contract
+    fused_train_block_training_critical_path = bool(
+        fused_train_block_training_contract.get("critical_path_ready")
+    )
+    fused_train_block_training_runtime_available = bool(
+        single_fused_train_block_standalone_dispatch_available
+        and fused_train_block_training_contract.get("training_runtime_available")
+    )
+    single_fused_train_block_runtime_available = (
+        fused_train_block_training_runtime_available
     )
     direct_chain_binding = {}
     direct_chain_training_contract: Mapping[str, Any] = {}
@@ -2116,6 +2400,8 @@ def fp8_path_c_training_route_payload(
         if not requested
         else None
         if full_training_available
+        else str(fused_train_block_training_contract.get("status"))
+        if single_fused_train_block_standalone_dispatch_available
         else str(direct_chain_training_contract.get("status"))
         if direct_fusion_chain_runtime_available
         else str(runtime_training_binding.get("status"))
@@ -2132,6 +2418,8 @@ def fp8_path_c_training_route_payload(
             full_training_available
             and direct_fusion_chain_training_runtime_available
         )
+        else "m04_fused_train_block_standalone_only_not_training_route"
+        if single_fused_train_block_standalone_dispatch_available
         else "m04_direct_fusion_chain_standalone_only_not_training_route"
         if direct_fusion_chain_runtime_available
         else "m04_uses_split_model_graph_route_not_fused_train_block"
@@ -2183,6 +2471,18 @@ def fp8_path_c_training_route_payload(
         ),
         "single_fused_train_block_runtime_available": (
             single_fused_train_block_runtime_available
+        ),
+        "single_fused_train_block_standalone_dispatch_available": (
+            single_fused_train_block_standalone_dispatch_available
+        ),
+        "fused_train_block_training_critical_path": (
+            fused_train_block_training_critical_path
+        ),
+        "fused_train_block_training_runtime_available": (
+            fused_train_block_training_runtime_available
+        ),
+        "fused_train_block_training_runtime_contract": dict(
+            fused_train_block_training_contract
         ),
         "direct_fusion_chain_runtime_available": (
             direct_fusion_chain_runtime_available
@@ -2446,6 +2746,11 @@ def fp8_path_c_training_route_payload_for_model(
     auto_install_report: dict[str, Any] | None = None
     model_bank_owner = getattr(model, "path_c_physical_abi_bank_owner", None)
     model_fused_artifact = getattr(model, "path_c_fused_train_block_artifact", None)
+    model_fused_training_runtime = getattr(
+        model,
+        "path_c_fused_train_block_training_runtime",
+        None,
+    )
     if (
         auto_install_fused_train_block
         and model_bank_owner is not None
@@ -2454,6 +2759,7 @@ def fp8_path_c_training_route_payload_for_model(
         auto_install_report = install_path_c_fused_train_block_runtime_for_model(
             model=model,
             bank_owner=model_bank_owner,
+            training_runtime=model_fused_training_runtime,
             compile_artifact=True,
             artifact_lowerer=fused_train_block_artifact_lowerer,
             artifact_target_name=fused_train_block_artifact_target_name,
@@ -2492,12 +2798,83 @@ def fp8_path_c_training_route_payload_for_model(
             "path_c_direct_fusion_chain_training_runtime",
             None,
         ),
+        fused_train_block_training_runtime=getattr(
+            model,
+            "path_c_fused_train_block_training_runtime",
+            None,
+        ),
     )
     if auto_install_report is not None:
         path_c_fusion = route.get("path_c_fusion")
         if isinstance(path_c_fusion, dict):
             path_c_fusion["fused_train_block_auto_install"] = auto_install_report
     return route
+
+
+def _path_c_physical_abi_bank_plan_payload(
+    *,
+    physical_abi_map: Mapping[str, Any],
+    physical_abi_shapes: Mapping[str, Any],
+    owner_name: str | None,
+) -> dict[str, Any]:
+    """Describe required caller/model-owned physical ABI banks without allocation."""
+
+    try:
+        specs = physical_abi_bank_specs(physical_abi_map, physical_abi_shapes)
+    except Exception as exc:
+        return {
+            "status": "unavailable",
+            "reason": str(exc),
+            "owner_attribute": "path_c_physical_abi_bank_owner",
+            "owner_name": owner_name,
+            "allocation_required_before_binding": False,
+            "required_bank_buffers": [],
+            "bank_count": 0,
+            "bank_specs": [],
+            "total_elements": 0,
+            "total_nbytes": 0,
+            "hidden_packing_performed": False,
+            "no_hidden_allocation_policy": True,
+        }
+
+    bank_specs: list[dict[str, Any]] = []
+    for spec in specs:
+        logical_buffers = [str(name) for name in spec.logical_buffers]
+        bank_specs.append(
+            {
+                "name": spec.name,
+                "shape": list(spec.shape),
+                "dtype": spec.dtype,
+                "elements": spec.elements,
+                "nbytes": spec.nbytes,
+                "logical_buffer_count": len(logical_buffers),
+                "logical_buffers": logical_buffers,
+            }
+        )
+    total_elements = sum(int(spec["elements"]) for spec in bank_specs)
+    total_nbytes = sum(int(spec["nbytes"]) for spec in bank_specs)
+    return {
+        "status": "model_owned_physical_abi_banks_required"
+        if bank_specs
+        else "no_physical_abi_banks_required",
+        "reason": (
+            "generated fused train-block ABI requires the model or caller to "
+            "own these physical bank buffers before runtime binding; hidden "
+            "packing and implicit allocation remain forbidden"
+            if bank_specs
+            else "generated fused train-block ABI did not require physical banks"
+        ),
+        "owner_attribute": "path_c_physical_abi_bank_owner",
+        "owner_name": owner_name,
+        "allocation_required_before_binding": bool(bank_specs),
+        "required_bank_buffers": [str(spec["name"]) for spec in bank_specs],
+        "bank_count": len(bank_specs),
+        "bank_specs": bank_specs,
+        "total_elements": total_elements,
+        "total_nbytes": total_nbytes,
+        "hidden_packing_performed": False,
+        "no_hidden_allocation_policy": True,
+    }
 
 
 def path_c_fusion_runtime_training_binding_payload(
@@ -2543,6 +2920,11 @@ def path_c_fusion_runtime_training_binding_payload(
             physical_abi_map,
             physical_abi_shapes,
         )
+        bank_plan = _path_c_physical_abi_bank_plan_payload(
+            physical_abi_map=physical_abi_map,
+            physical_abi_shapes=physical_abi_shapes,
+            owner_name=resolved_bank_owner,
+        )
         binding = validate_physical_abi_runtime_bindings(
             physical_abi_map,
             physical_abi_shapes,
@@ -2581,6 +2963,7 @@ def path_c_fusion_runtime_training_binding_payload(
             "missing_bank_buffers": missing_bank_buffers,
             "provided_bank_buffers": provided_bank_buffers,
             "bank_buffer_owner": resolved_bank_owner,
+            "model_owned_physical_abi_bank_plan": bank_plan,
             "hidden_packing_performed": False,
             "no_hidden_allocation_policy": bool(
                 bridge.get("no_hidden_allocation_policy", True)
@@ -2614,6 +2997,22 @@ def path_c_fusion_runtime_training_binding_payload(
             "bank_buffer_owner": bank_buffer_owner
             if bank_owner is None
             else str(getattr(bank_owner, "owner_name", bank_buffer_owner)),
+            "model_owned_physical_abi_bank_plan": {
+                "status": "unavailable",
+                "reason": str(exc),
+                "owner_attribute": "path_c_physical_abi_bank_owner",
+                "owner_name": bank_buffer_owner
+                if bank_owner is None
+                else str(getattr(bank_owner, "owner_name", bank_buffer_owner)),
+                "allocation_required_before_binding": False,
+                "required_bank_buffers": [],
+                "bank_count": 0,
+                "bank_specs": [],
+                "total_elements": 0,
+                "total_nbytes": 0,
+                "hidden_packing_performed": False,
+                "no_hidden_allocation_policy": True,
+            },
             "hidden_packing_performed": False,
             "no_hidden_allocation_policy": True,
             "reason": str(exc),
@@ -2814,6 +3213,7 @@ def install_path_c_fused_train_block_runtime_for_model(
     bank_buffers: Mapping[str, Any] | None = None,
     bank_buffer_owner: str | None = None,
     fused_artifact: Any | None = None,
+    training_runtime: Any | None = None,
     compile_artifact: bool = False,
     artifact_lowerer: Callable[..., Any] | None = None,
     artifact_target_name: str = "metal",
@@ -2994,8 +3394,67 @@ def install_path_c_fused_train_block_runtime_for_model(
             "execution": None,
         }
 
+    training_runtime_contract = (
+        path_c_fused_train_block_training_runtime_contract_payload(
+            training_runtime=training_runtime,
+            runtime_binding=runtime_binding,
+        )
+    )
+    training_runtime_bound = False
+    if training_runtime is not None:
+        bind_training_graph = getattr(training_runtime, "bind_training_graph", None)
+        if callable(bind_training_graph):
+            bind_training_graph(
+                owner="CompiledPretrainingStep",
+                uses_fused_train_block_runtime=True,
+                uses_forward_hook=True,
+                uses_backward_or_vjp_hook=True,
+            )
+            training_runtime_bound = True
+            training_runtime_contract = (
+                path_c_fused_train_block_training_runtime_contract_payload(
+                    training_runtime=training_runtime,
+                    runtime_binding=runtime_binding,
+                )
+            )
+        if training_runtime_contract.get("status") != "ok":
+            if training_runtime_bound:
+                unbind_training_graph = getattr(
+                    training_runtime,
+                    "unbind_training_graph",
+                    None,
+                )
+                if callable(unbind_training_graph):
+                    unbind_training_graph(owner="CompiledPretrainingStep")
+            return {
+                "status": "blocked",
+                "reason": training_runtime_contract.get("reason"),
+                "runtime_owner": runtime_owner,
+                "route_region": getattr(selected_region, "name", None),
+                "binding_status": runtime_binding.get("status"),
+                "runtime_uses_fused_train_block": True,
+                "runtime_binding": runtime_binding,
+                "training_runtime_available": False,
+                "training_runtime_contract": training_runtime_contract,
+                "hidden_packing_performed": bool(
+                    runtime_binding.get("hidden_packing_performed", False)
+                    or training_runtime_contract.get(
+                        "hidden_packing_performed",
+                        False,
+                    )
+                ),
+                "artifact_compile": (
+                    _path_c_fused_train_block_artifact_compile_report(
+                        artifact_compile_payload
+                    )
+                ),
+                "execution": None,
+            }
+
     model.path_c_physical_abi_bank_owner = resolved_bank_owner
     model.path_c_fused_train_block_artifact = resolved_artifact
+    if training_runtime is not None:
+        model.path_c_fused_train_block_training_runtime = training_runtime
     return {
         "status": "ok",
         "runtime_owner": runtime_owner,
@@ -3003,9 +3462,14 @@ def install_path_c_fused_train_block_runtime_for_model(
         "binding_status": runtime_binding.get("status"),
         "runtime_uses_fused_train_block": True,
         "runtime_binding": runtime_binding,
+        "training_runtime_available": bool(
+            training_runtime_contract.get("training_runtime_available")
+        ),
+        "training_runtime_contract": training_runtime_contract,
         "bank_buffer_owner": runtime_binding.get("bank_buffer_owner"),
         "hidden_packing_performed": bool(
             runtime_binding.get("hidden_packing_performed", False)
+            or training_runtime_contract.get("hidden_packing_performed", False)
         ),
         "no_hidden_allocation_policy": bool(
             runtime_binding.get("no_hidden_allocation_policy", True)
@@ -5316,6 +5780,7 @@ def path_c_fusion_payload(
     direct_chain_logical_buffer_owner: str | None = None,
     direct_chain_logical_owner: Any | None = None,
     direct_chain_training_runtime: Any | None = None,
+    fused_train_block_training_runtime: Any | None = None,
     sequence_length: int | None = None,
 ) -> dict[str, Any]:
     """Return receipt metadata for the high-level Path C fusion planner."""
@@ -5360,13 +5825,27 @@ def path_c_fusion_payload(
         receipt_path=compile_receipt_path,
     )
     production_compile_verified = bool(compile_receipt.get("verified"))
+    expected_bank_buffer_owner = (
+        bank_buffer_owner
+        if bank_buffer_owner is not None
+        else f"{profile_name}.path_c_physical_abi_banks"
+    )
     runtime_training_binding = path_c_fusion_runtime_training_binding_payload(
         region=region,
         schedule_target=scheduled.schedule_target,
         bank_buffers=bank_buffers,
-        bank_buffer_owner=bank_buffer_owner,
+        bank_buffer_owner=expected_bank_buffer_owner,
         bank_owner=bank_owner,
         fused_artifact=fused_artifact,
+    )
+    fused_train_block_training_contract = (
+        path_c_fused_train_block_training_runtime_contract_payload(
+            training_runtime=fused_train_block_training_runtime,
+            runtime_binding=runtime_training_binding,
+        )
+    )
+    fused_train_block_training_critical_path = bool(
+        fused_train_block_training_contract.get("critical_path_ready")
     )
     if model is not None:
         direct_chain_region_prefix = _path_c_direct_chain_region_prefix(
@@ -5441,7 +5920,7 @@ def path_c_fusion_payload(
         direct_chain_training_contract.get("critical_path_ready")
     )
     runtime_fused_route_bound = bool(
-        runtime_training_binding.get("runtime_uses_fused_train_block")
+        fused_train_block_training_contract.get("training_runtime_available")
         or direct_chain_training_contract.get("training_runtime_available")
     )
     real_schedule_unverified = (
@@ -5620,6 +6099,15 @@ def path_c_fusion_payload(
             else None
         ),
         "runtime_training_binding": runtime_training_binding,
+        "fused_train_block_training_critical_path": bool(
+            fused_train_block_training_critical_path
+        ),
+        "fused_train_block_training_runtime_available": bool(
+            fused_train_block_training_contract.get("training_runtime_available")
+        ),
+        "fused_train_block_training_runtime_contract": (
+            fused_train_block_training_contract
+        ),
         "production_compile_receipt": compile_receipt,
         "direct_chained_fusion": {
             **_path_c_direct_chain_plan_payload(direct_chain),
@@ -5758,7 +6246,19 @@ def path_c_fusion_payload(
                                 (),
                             )
                         ),
-                        "reason": runtime_training_binding.get("reason"),
+                        "training_runtime_contract_status": (
+                            fused_train_block_training_contract.get("status")
+                        ),
+                        "training_runtime_available": bool(
+                            fused_train_block_training_contract.get(
+                                "training_runtime_available"
+                            )
+                        ),
+                        "reason": (
+                            fused_train_block_training_contract.get("reason")
+                            if runtime_training_binding.get("status") == "ok"
+                            else runtime_training_binding.get("reason")
+                        ),
                     }
                 ]
                 if not runtime_fused_route_bound

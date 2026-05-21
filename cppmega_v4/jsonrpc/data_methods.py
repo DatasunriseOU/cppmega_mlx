@@ -44,11 +44,27 @@ class PreviewRow(BaseModel):
     channels: dict[str, Any] = Field(default_factory=dict)
 
 
+class SideChannelFamilyPreview(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    family: str
+    status: str
+    columns: list[str] = Field(default_factory=list)
+    missing_columns: list[str] = Field(default_factory=list)
+    dropped_columns: list[str] = Field(default_factory=list)
+    token_alignment: str
+    graph_remapping: str
+    provenance: str
+    non_null_ratio: float
+
+
 class PreviewParquetResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
     rows: list[PreviewRow]
     token_column: str
     available_channels: list[str]
+    side_channel_families: dict[str, SideChannelFamilyPreview] = Field(
+        default_factory=dict
+    )
     bytes_per_token_avg: float
     bytes_per_token_p95: float
     bytes_per_token_max: int
@@ -132,6 +148,20 @@ def preview_parquet(
         rows=rows,
         token_column=token_col,
         available_channels=available,
+        side_channel_families={
+            name: SideChannelFamilyPreview(
+                family=coverage.family,
+                status=coverage.status,
+                columns=list(coverage.columns),
+                missing_columns=list(coverage.missing_columns),
+                dropped_columns=list(coverage.dropped_columns),
+                token_alignment=coverage.token_alignment,
+                graph_remapping=coverage.graph_remapping,
+                provenance=coverage.provenance,
+                non_null_ratio=coverage.non_null_ratio,
+            )
+            for name, coverage in sorted(caps.side_channel_families.items())
+        },
         bytes_per_token_avg=round(bpt_avg, 3),
         bytes_per_token_p95=round(bpt_p95, 3),
         bytes_per_token_max=int(bpt_max),

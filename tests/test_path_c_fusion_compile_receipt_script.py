@@ -399,7 +399,7 @@ def test_compile_receipt_can_execute_tiny_banked_abi_runtime_smoke(
     assert captured["kwargs"]["target"] == "metal"
 
 
-def test_runtime_smoke_binds_artifact_through_m04_fused_train_block_route(
+def test_runtime_smoke_reports_standalone_fused_artifact_not_training_route(
     tmp_path: Path,
 ) -> None:
     def fake_artifact(*_args: object) -> list[object]:
@@ -421,12 +421,27 @@ def test_runtime_smoke_binds_artifact_through_m04_fused_train_block_route(
 
     assert exit_code == 0
     assert smoke["status"] == "ok"
-    assert fused_route["status"] == "ok"
+    assert fused_route["status"] == "standalone_only_not_training_route"
     assert fused_route["install"]["status"] == "ok"
     assert fused_route["install"]["runtime_uses_fused_train_block"] is True
+    assert fused_route["install"]["training_runtime_available"] is False
+    assert fused_route["install"]["training_runtime_contract"]["status"] == (
+        "fused_train_block_training_runtime_missing"
+    )
     assert fused_route["install"]["hidden_packing_performed"] is False
     assert fused_route["route"]["selected_action"] == (
-        "run_path_c_fused_train_block_route"
+        "run_path_c_split_training_route"
+    )
+    assert (
+        fused_route["route"]["single_fused_train_block_standalone_dispatch_available"]
+        is True
+    )
+    assert fused_route["route"]["single_fused_train_block_runtime_available"] is False
+    assert fused_route["route"]["fused_train_block_training_runtime_available"] is False
+    assert fused_route["route"]["fused_train_block_training_runtime_contract"][
+        "status"
+    ] == (
+        "fused_train_block_training_runtime_missing"
     )
     assert fused_route["route"]["path_c_fusion"]["runtime_training_binding"][
         "runtime_uses_fused_train_block"

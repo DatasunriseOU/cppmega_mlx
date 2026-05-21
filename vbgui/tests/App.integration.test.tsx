@@ -168,3 +168,75 @@ describe("App integration — tab switching", () => {
     expect(screen.getByTestId("data-inspector")).toBeTruthy();
   });
 });
+
+describe("App integration — side-channel data wiring", () => {
+  it("threads DataInspector side-channel coverage into pipeline spec", async () => {
+    const { fetchFn, calls } = recorder({
+      build_preset_specs: {
+        specs: [
+          { kind: "attention", name: "a0", params: {} },
+          { kind: "mlp",       name: "a1", params: {} },
+        ],
+        preset_name: "llama3_8b",
+      },
+      verify: { memory_per_brick: {}, gotchas: [], elapsed_ms: 0,
+                resolved: { edges: [] } },
+      suggest_sharding: { proposals: [] },
+      "data.preview_parquet": {
+        rows: [{ row_index: 0, tokens: [1, 2],
+                 channels: { platform_ids: [1, 2] } }],
+        token_column: "input_ids",
+        available_channels: ["platform_ids", "token_structure_ids"],
+        side_channel_families: {
+          platform: {
+            family: "platform", status: "present",
+            columns: ["platform_ids"], missing_columns: [],
+            dropped_columns: [], token_alignment: "yes",
+            graph_remapping: "not_applicable",
+            provenance: "original", non_null_ratio: 1.0,
+          },
+        },
+        bytes_per_token_avg: 1.0,
+        bytes_per_token_p95: 1.0,
+        bytes_per_token_max: 1,
+        total_rows: 1,
+        elapsed_ms: 0.1,
+      },
+      "pipeline.run": {
+        stages: [{ name: "train", status: "ok", elapsed_ms: 1 }],
+        overall_status: "ok",
+        total_elapsed_ms: 1,
+      },
+    });
+    (globalThis as unknown as { fetch: typeof fetch }).fetch = fetchFn as never;
+
+    render(<App />);
+    fireEvent.change(screen.getByTestId("preset-launcher"),
+      { target: { value: "llama3_8b" } });
+    await waitFor(() => {
+      expect(calls.some((c) => c.method === "build_preset_specs")).toBe(true);
+    });
+
+    fireEvent.click(screen.getByTestId("app-tab-data"));
+    fireEvent.change(screen.getByTestId("data-path"),
+      { target: { value: "/tmp/enriched.parquet" } });
+    fireEvent.click(screen.getByTestId("data-load"));
+    await waitFor(() => {
+      expect(screen.getByTestId("data-family-platform-status").textContent)
+        .toContain("present");
+    });
+
+    fireEvent.click(screen.getByTestId("run-pipeline-toggle"));
+    fireEvent.click(screen.getByTestId("run-pipeline-train"));
+    await waitFor(() => {
+      expect(calls.some((c) => c.method === "pipeline.run")).toBe(true);
+    });
+    const pipelineCall = calls.find((c) => c.method === "pipeline.run")!;
+    const params = pipelineCall.params as {
+      spec: { available_side_channels: string[] };
+    };
+    expect(params.spec.available_side_channels).toEqual([
+      "platform_ids", "token_structure_ids",
+    ]);
+  });
+});

@@ -19,7 +19,7 @@ import { useVerifyAfter } from "@/hooks/useVerifyAfter";
 import { usePresets } from "@/hooks/usePresets";
 
 import {
-  INITIAL_SPEC, specReducer, type TopologyFactory,
+  INITIAL_SPEC, specReducer, type SpecState, type TopologyFactory,
 } from "@/state/spec";
 import type { ShardingProposalView } from "@/components/sidebar/ShardingTab";
 
@@ -103,6 +103,8 @@ export function App(): JSX.Element {
     useState<string | null>(null);
   const [trainTokenizerPath, setTrainTokenizerPath] =
     useState<string | null>(null);
+  const [availableSideChannels, setAvailableSideChannels] =
+    useState<string[]>(["doc_ids", "token_ids"]);
 
   const rpc = useRpc({
     baseUrl: (import.meta.env.VITE_BACKEND_URL as string | undefined)
@@ -117,15 +119,17 @@ export function App(): JSX.Element {
   const PRESETS = usePresets(rpc);
 
   // Keep one stable spec snapshot for the verify debouncer to read.
-  const wireSpecRef = useRef({ nodes, edges, spec });
+  const wireSpecRef = useRef({ nodes, edges, spec, availableSideChannels });
   useEffect(() => {
-    wireSpecRef.current = { nodes, edges, spec };
-  }, [nodes, edges, spec]);
+    wireSpecRef.current = { nodes, edges, spec, availableSideChannels };
+  }, [nodes, edges, spec, availableSideChannels]);
 
   const runVerify = useCallback(async () => {
     const snap = wireSpecRef.current;
     if (snap.nodes.length === 0) return;
-    const params = buildVerifyParams(snap.nodes, snap.edges, snap.spec);
+    const params = buildVerifyParams(
+      snap.nodes, snap.edges, snap.spec, snap.availableSideChannels,
+    );
     try {
       const r = await rpc.call<{
         memory_distributed?: { worst_rank?: { total_bytes?: number };
@@ -181,9 +185,12 @@ export function App(): JSX.Element {
     `::${spec.sharding.axis_assignments.length}` +
     `::${spec.sharding.fp8_enabled ? 1 : 0}`;
   const rewriterKey = spec.rewriters.map((r) => r.name).join(",");
+  const sideChannelKey = JSON.stringify(spec.side_channels);
+  const availableSideChannelKey = availableSideChannels.join(",");
   useEffect(() => { scheduleVerify(); },
            [nodesKey, edgesKey, lossKey, optimKey, shardingKey,
-            rewriterKey, scheduleVerify]);
+            rewriterKey, sideChannelKey, availableSideChannelKey,
+            scheduleVerify]);
 
   // ----- Handlers ----------------------------------------------------------
 
@@ -268,7 +275,8 @@ export function App(): JSX.Element {
   }, [requestSuggestSharding, spec.sharding.topology, nodes.length]);
 
   const handleRunPipeline = useCallback(async (
-    mode: RunMode, opts?: { num_steps?: number },
+    mode: RunMode,
+    opts?: { num_steps?: number; side_channels?: string[] },
   ) => {
     const snap = wireSpecRef.current;
     if (snap.nodes.length === 0) {
@@ -290,11 +298,23 @@ export function App(): JSX.Element {
       }
       if (trainParquetPath) trainOpts.parquet_path = trainParquetPath;
       if (trainTokenizerPath) trainOpts.tokenizer_path = trainTokenizerPath;
+      // V4-10: forward side-channel selection as synthetic int lists so
+      // stage_train can record observation (the actual forward hook is
+      // a smoke probe — full per-channel ingestion is v5+ work).
+      if (opts?.side_channels && opts.side_channels.length > 0) {
+        const sc: Record<string, number[]> = {};
+        for (const name of opts.side_channels) {
+          sc[name] = [0, 1, 2, 3, 4, 5, 6, 7];  // synthetic 8-token sample
+        }
+        trainOpts.side_channels = sc;
+      }
       if (Object.keys(trainOpts).length > 0) stage_options.train = trainOpts;
     }
     try {
       const r = await rpc.call<RunReport>("pipeline.run", {
-        spec: buildVerifyParams(snap.nodes, snap.edges, snap.spec),
+        spec: buildVerifyParams(
+          snap.nodes, snap.edges, snap.spec, snap.availableSideChannels,
+        ),
         pipeline: { stages, stage_options },
       });
       setRunReport(r);
@@ -384,6 +404,8 @@ export function App(): JSX.Element {
                 loss={spec.loss}
                 optim={spec.optim}
                 rewriters={spec.rewriters}
+                sideChannels={spec.side_channels}
+                availableSideChannels={availableSideChannels}
                 sharding={spec.sharding}
                 gotchas={spec.gotchas}
                 proposals={proposals}
@@ -401,6 +423,8 @@ export function App(): JSX.Element {
                 onRewriterReorder={(f, t) =>
                   dispatch({ type: "rewriters.reorder", from: f, to: t })}
                 onRewriterApply={() => void scheduleVerify()}
+                onSideChannelsApply={(s) =>
+                  dispatch({ type: "side_channels.set", side_channels: s })}
                 onShardingChange={(s) =>
                   dispatch({ type: "sharding.set", sharding: s })}
                 onShardingAccept={handleShardingAccept}
@@ -418,6 +442,7 @@ export function App(): JSX.Element {
                 setTrainParquetPath(p);
                 if (t !== null) setTrainTokenizerPath(t);
               }}
+              onAvailableChannelsChange={setAvailableSideChannels}
               trainParquetPath={trainParquetPath} />
           )}
         </div>
@@ -444,8 +469,12 @@ function nodesToGraph(nodes: Node[], edges: Edge[]) {
   };
 }
 
-function buildVerifyParams(nodes: Node[], edges: Edge[],
-                           spec: ReturnType<typeof specReducer>) {
+function buildVerifyParams(
+  nodes: Node[],
+  edges: Edge[],
+  spec: SpecState,
+  availableSideChannels: string[] = ["doc_ids", "token_ids"],
+) {
   return {
     graph: nodesToGraph(nodes, edges),
     dim_env: MINI_DIM_ENV,
@@ -471,7 +500,7 @@ function buildVerifyParams(nodes: Node[], edges: Edge[],
     },
     training: true,
     side_channels: spec.side_channels,
-    available_side_channels: ["doc_ids", "token_ids"],
+    available_side_channels: availableSideChannels,
   };
 }
 

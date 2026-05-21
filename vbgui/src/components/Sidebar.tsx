@@ -7,17 +7,22 @@ import { GotchasTab } from "./sidebar/GotchasTab";
 import { DimensionsTab,
          type InferenceEntryClient } from "./sidebar/DimensionsTab";
 import { AblationsTab } from "./sidebar/AblationsTab";
+import { SideChannelsTab } from "./sidebar/SideChannelsTab";
 import type {
   GotchaState, LossState, OptimState, RewriterState, ShardingState,
+  SideChannelState,
 } from "@/state/spec";
 
 export type SidebarTab = "loss" | "optim" | "rewriters" | "sharding"
-                       | "gotchas" | "dimensions" | "ablations";
+                       | "gotchas" | "dimensions" | "ablations"
+                       | "side_channels";
 
 export interface SidebarProps {
   loss: LossState;
   optim: OptimState;
   rewriters: RewriterState[];
+  sideChannels: SideChannelState;
+  availableSideChannels: string[];
   sharding: ShardingState;
   gotchas: GotchaState[];
   proposals: ShardingProposalView[];
@@ -27,6 +32,7 @@ export interface SidebarProps {
   onRewriterRemove: (i: number) => void;
   onRewriterReorder: (from: number, to: number) => void;
   onRewriterApply?: () => void;
+  onSideChannelsApply: (s: SideChannelState) => void;
   onShardingChange: (s: ShardingState) => void;
   onShardingAccept: (idx: number) => void;
   onGotchaAutoFix?: (id: string) => void;
@@ -45,6 +51,7 @@ const TAB_LABELS: { key: SidebarTab; label: string }[] = [
   { key: "loss",       label: "Loss" },
   { key: "optim",      label: "Optim" },
   { key: "rewriters",  label: "Rewriters" },
+  { key: "side_channels", label: "Side Ch." },
   { key: "sharding",   label: "Sharding" },
   { key: "gotchas",    label: "Gotchas" },
   { key: "dimensions", label: "Dimensions" },
@@ -60,7 +67,8 @@ export function Sidebar(p: SidebarProps): JSX.Element {
                     display: "flex", flexDirection: "column",
                     fontFamily: "system-ui, sans-serif" }}>
       <nav role="tablist" data-testid="sidebar-tabs"
-           style={{ display: "flex", borderBottom: "1px solid #e5e7eb" }}>
+           style={{ display: "flex", flexWrap: "wrap",
+                    borderBottom: "1px solid #e5e7eb" }}>
         {TAB_LABELS.map((t) => (
           <button key={t.key}
                   role="tab"
@@ -68,7 +76,7 @@ export function Sidebar(p: SidebarProps): JSX.Element {
                   data-testid={`sidebar-tab-${t.key}`}
                   onClick={() => setActive(t.key)}
                   style={{
-                    flex: 1, padding: "8px 4px", border: "none",
+                    flex: "1 0 33%", padding: "8px 4px", border: "none",
                     background: active === t.key ? "#f3f4f6" : "transparent",
                     cursor: "pointer", fontSize: 12,
                     borderBottom: active === t.key
@@ -91,6 +99,12 @@ export function Sidebar(p: SidebarProps): JSX.Element {
                         onRemove={p.onRewriterRemove}
                         onReorder={p.onRewriterReorder}
                         onApply={p.onRewriterApply} />
+        )}
+        {active === "side_channels" && (
+          <SideChannelsTab sideChannels={p.sideChannels}
+                           availableChannels={p.availableSideChannels}
+                           gotchas={p.gotchas}
+                           onApply={p.onSideChannelsApply} />
         )}
         {active === "sharding"  && (
           <ShardingTab sharding={p.sharding} proposals={p.proposals}

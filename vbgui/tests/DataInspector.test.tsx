@@ -21,6 +21,30 @@ const SAMPLE: PreviewParquetResult = {
   ],
   token_column: "input_ids",
   available_channels: ["doc_ids", "loss_mask"],
+  side_channel_families: {
+    universal: {
+      family: "universal",
+      status: "derived",
+      columns: ["input_ids", "doc_ids"],
+      missing_columns: ["target_ids"],
+      dropped_columns: [],
+      token_alignment: "yes",
+      graph_remapping: "not_applicable",
+      provenance: "derived",
+      non_null_ratio: 1.0,
+    },
+    structure: {
+      family: "structure",
+      status: "missing",
+      columns: [],
+      missing_columns: ["token_structure_ids"],
+      dropped_columns: [],
+      token_alignment: "unknown",
+      graph_remapping: "not_applicable",
+      provenance: "missing",
+      non_null_ratio: 0.0,
+    },
+  },
   bytes_per_token_avg: 1.4,
   bytes_per_token_p95: 2.0,
   bytes_per_token_max: 2,
@@ -69,6 +93,28 @@ describe("DataInspector", () => {
     const ribbon = screen.getByTestId("data-ribbon-0-loss_mask");
     expect(ribbon.textContent).toContain("1");
     expect(ribbon.textContent).toContain("0");
+  });
+
+  it("renders side-channel family coverage diagnostics", async () => {
+    render(<DataInspector rpc={mockClient(SAMPLE)} initialPath="/x" />);
+    fireEvent.click(screen.getByTestId("data-load"));
+    await waitFor(() =>
+      expect(screen.getByTestId("data-family-coverage")).toBeTruthy());
+    expect(screen.getByTestId("data-family-universal-status").textContent)
+      .toContain("derived");
+    expect(screen.getByTestId("data-family-structure-missing").textContent)
+      .toContain("token_structure_ids");
+  });
+
+  it("notifies parent when loaded channels change", async () => {
+    const onAvailableChannelsChange = vi.fn();
+    render(<DataInspector rpc={mockClient(SAMPLE)} initialPath="/x"
+                          onAvailableChannelsChange={onAvailableChannelsChange} />);
+    fireEvent.click(screen.getByTestId("data-load"));
+    await waitFor(() =>
+      expect(onAvailableChannelsChange).toHaveBeenCalledWith([
+        "doc_ids", "loss_mask",
+      ]));
   });
 
   it("pagination Prev/Next call backend with new offsets", async () => {

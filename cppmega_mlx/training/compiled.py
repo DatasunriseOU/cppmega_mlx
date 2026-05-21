@@ -37,7 +37,18 @@ CompileTarget = Literal[
 F = TypeVar("F", bound=Callable[..., Any])
 PathCGradientProbe = Callable[[Mapping[str, Any]], None]
 PathCTrainingRuntime = Any
-PATH_C_TRAINING_VALUE_AND_GRAD_CONTRACT = "path_c_direct_fusion_value_and_grad_v1"
+PATH_C_DIRECT_FUSION_VALUE_AND_GRAD_CONTRACT = (
+    "path_c_direct_fusion_value_and_grad_v1"
+)
+PATH_C_TRAINING_VALUE_AND_GRAD_CONTRACT = (
+    PATH_C_DIRECT_FUSION_VALUE_AND_GRAD_CONTRACT
+)
+PATH_C_FUSED_TRAIN_BLOCK_TRAINING_RUNTIME_CONTRACT = (
+    "path_c_fused_train_block_training_runtime_v1"
+)
+PATH_C_FUSED_TRAIN_BLOCK_VALUE_AND_GRAD_CONTRACT = (
+    "path_c_fused_train_block_value_and_grad_v1"
+)
 
 REGIONAL_COMPILE_TARGETS: Mapping[CompileTarget, bool] = {
     "mamba3_pre": True,
@@ -337,12 +348,16 @@ class CompiledPretrainingStep:
         bind = getattr(runtime, "bind_training_graph", None)
         bound = False
         if callable(bind):
-            bind(
-                owner="CompiledPretrainingStep",
-                uses_direct_chain_runtime=True,
-                uses_forward_hook=True,
-                uses_backward_or_vjp_hook=True,
-            )
+            binding = {
+                "owner": "CompiledPretrainingStep",
+                "uses_forward_hook": True,
+                "uses_backward_or_vjp_hook": True,
+            }
+            if _path_c_training_runtime_uses_fused_train_block(runtime):
+                binding["uses_fused_train_block_runtime"] = True
+            else:
+                binding["uses_direct_chain_runtime"] = True
+            bind(**binding)
             bound = True
         try:
             value_and_grad_contract = _path_c_training_runtime_value_and_grad_contract(
@@ -575,7 +590,16 @@ def _path_c_training_runtime_value_and_grad_contract(
     payload = dict(raw_contract)
     contract = str(payload.get("contract", ""))
     owner = str(payload.get("owner", ""))
-    uses_runtime = bool(payload.get("uses_direct_chain_runtime"))
+    uses_direct_chain_runtime = bool(payload.get("uses_direct_chain_runtime"))
+    uses_fused_train_block_runtime = bool(
+        payload.get("uses_fused_train_block_runtime")
+    )
+    direct_contract = contract == PATH_C_DIRECT_FUSION_VALUE_AND_GRAD_CONTRACT
+    fused_contract = contract == PATH_C_FUSED_TRAIN_BLOCK_VALUE_AND_GRAD_CONTRACT
+    uses_runtime = bool(
+        (direct_contract and uses_direct_chain_runtime)
+        or (fused_contract and uses_fused_train_block_runtime)
+    )
     uses_forward = bool(payload.get("uses_forward_hook"))
     uses_reverse = bool(payload.get("uses_backward_or_vjp_hook"))
     returns_model_grads = bool(payload.get("returns_model_grads"))
@@ -586,7 +610,7 @@ def _path_c_training_runtime_value_and_grad_contract(
     hidden_packing = bool(payload.get("hidden_packing_performed", False))
     status = (
         "ok"
-        if contract == PATH_C_TRAINING_VALUE_AND_GRAD_CONTRACT
+        if (direct_contract or fused_contract)
         and owner == "CompiledPretrainingStep"
         and uses_runtime
         and uses_forward
@@ -604,7 +628,8 @@ def _path_c_training_runtime_value_and_grad_contract(
         "status": status,
         "contract": contract or PATH_C_TRAINING_VALUE_AND_GRAD_CONTRACT,
         "owner": owner or None,
-        "uses_direct_chain_runtime": uses_runtime,
+        "uses_direct_chain_runtime": uses_direct_chain_runtime,
+        "uses_fused_train_block_runtime": uses_fused_train_block_runtime,
         "uses_forward_hook": uses_forward,
         "uses_backward_or_vjp_hook": uses_reverse,
         "returns_model_grads": returns_model_grads,
@@ -616,9 +641,22 @@ def _path_c_training_runtime_value_and_grad_contract(
     }
 
 
+def _path_c_training_runtime_uses_fused_train_block(
+    runtime: PathCTrainingRuntime,
+) -> bool:
+    return bool(
+        getattr(runtime, "uses_fused_train_block_runtime", False)
+        or str(getattr(runtime, "contract", ""))
+        == PATH_C_FUSED_TRAIN_BLOCK_TRAINING_RUNTIME_CONTRACT
+    )
+
+
 __all__ = [
     "CompileTarget",
     "CompiledPretrainingStep",
+    "PATH_C_DIRECT_FUSION_VALUE_AND_GRAD_CONTRACT",
+    "PATH_C_FUSED_TRAIN_BLOCK_TRAINING_RUNTIME_CONTRACT",
+    "PATH_C_FUSED_TRAIN_BLOCK_VALUE_AND_GRAD_CONTRACT",
     "PATH_C_TRAINING_VALUE_AND_GRAD_CONTRACT",
     "PathCGradientBufferCapture",
     "PathCGradientProbe",

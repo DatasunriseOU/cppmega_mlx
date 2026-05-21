@@ -5,6 +5,7 @@ import { OptimTab } from "@/components/sidebar/OptimTab";
 import { RewritersTab } from "@/components/sidebar/RewritersTab";
 import { ShardingTab } from "@/components/sidebar/ShardingTab";
 import { GotchasTab } from "@/components/sidebar/GotchasTab";
+import { SideChannelsTab } from "@/components/sidebar/SideChannelsTab";
 import { Sidebar } from "@/components/Sidebar";
 import { INITIAL_SPEC } from "@/state/spec";
 
@@ -204,20 +205,76 @@ describe("GotchasTab", () => {
   });
 });
 
+describe("SideChannelsTab", () => {
+  it("updates family policy and applies the draft", () => {
+    const onApply = vi.fn();
+    render(<SideChannelsTab sideChannels={INITIAL_SPEC.side_channels}
+                            availableChannels={["doc_ids", "token_ids"]}
+                            gotchas={[]}
+                            onApply={onApply} />);
+    fireEvent.change(screen.getByTestId("side-channel-family-platform-mode"),
+      { target: { value: "require" } });
+    fireEvent.change(screen.getByTestId("side-channel-family-platform-dropout"),
+      { target: { value: "0.2" } });
+    fireEvent.change(screen.getByTestId("side-channel-family-platform-fallback"),
+      { target: { value: "error" } });
+    fireEvent.click(screen.getByTestId("side-channels-apply"));
+    const next = onApply.mock.calls[0][0];
+    expect(next.families.platform.mode).toBe("require");
+    expect(next.families.platform.dropout).toBe(0.2);
+    expect(next.families.platform.fallback).toBe("error");
+  });
+
+  it("renders inference and platform preview controls", () => {
+    render(<SideChannelsTab sideChannels={INITIAL_SPEC.side_channels}
+                            availableChannels={["platform_ids"]}
+                            gotchas={[]}
+                            onApply={() => {}} />);
+    fireEvent.change(screen.getByTestId("side-channel-inference-source"),
+      { target: { value: "parse_if_possible" } });
+    fireEvent.change(screen.getByTestId("side-channel-platform-os"),
+      { target: { value: "linux" } });
+    expect(screen.getByTestId("side-channel-platform-preview").textContent)
+      .toContain("os=linux");
+    expect(screen.getByTestId("side-channel-preview").textContent)
+      .toContain("source=parse_if_possible");
+  });
+
+  it("surfaces required-family contract probe errors", () => {
+    render(<SideChannelsTab sideChannels={INITIAL_SPEC.side_channels}
+                            availableChannels={[]}
+                            gotchas={[{
+                              id: "side_channel_required_platform",
+                              severity: "error",
+                              message: "required side-channel family 'platform'",
+                            }]}
+                            onApply={() => {}} />);
+    expect(screen.getByTestId(
+      "side-channel-probe-error-side_channel_required_platform",
+    ).textContent).toContain("platform");
+  });
+});
+
 describe("Sidebar", () => {
   const stubs = {
     loss: INITIAL_SPEC.loss, optim: INITIAL_SPEC.optim,
-    rewriters: INITIAL_SPEC.rewriters, sharding: INITIAL_SPEC.sharding,
+    rewriters: INITIAL_SPEC.rewriters,
+    sideChannels: INITIAL_SPEC.side_channels,
+    availableSideChannels: ["doc_ids", "token_ids"],
+    sharding: INITIAL_SPEC.sharding,
     gotchas: INITIAL_SPEC.gotchas, proposals: [],
     onLossApply: () => {}, onOptimApply: () => {},
     onRewriterAdd: () => {}, onRewriterRemove: () => {},
     onRewriterReorder: () => {},
+    onSideChannelsApply: () => {},
     onShardingChange: () => {}, onShardingAccept: () => {},
   };
 
-  it("renders all 5 tab buttons", () => {
+  it("renders side-channel tab button with existing tabs", () => {
     render(<Sidebar {...stubs} />);
-    for (const k of ["loss", "optim", "rewriters", "sharding", "gotchas"]) {
+    for (const k of [
+      "loss", "optim", "rewriters", "side_channels", "sharding", "gotchas",
+    ]) {
       expect(screen.getByTestId(`sidebar-tab-${k}`)).toBeTruthy();
     }
   });
@@ -226,6 +283,8 @@ describe("Sidebar", () => {
     render(<Sidebar {...stubs} />);
     fireEvent.click(screen.getByTestId("sidebar-tab-optim"));
     expect(screen.getByTestId("optim-tab")).toBeTruthy();
+    fireEvent.click(screen.getByTestId("sidebar-tab-side_channels"));
+    expect(screen.getByTestId("side-channels-tab")).toBeTruthy();
     fireEvent.click(screen.getByTestId("sidebar-tab-gotchas"));
     expect(screen.getByTestId("gotchas-tab")).toBeTruthy();
   });

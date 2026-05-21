@@ -11,11 +11,24 @@ export interface PreviewParquetResult {
   rows: PreviewRow[];
   token_column: string;
   available_channels: string[];
+  side_channel_families?: Record<string, SideChannelFamilyCoverage>;
   bytes_per_token_avg: number;
   bytes_per_token_p95: number;
   bytes_per_token_max: number;
   total_rows: number;
   elapsed_ms: number;
+}
+
+export interface SideChannelFamilyCoverage {
+  family: string;
+  status: string;
+  columns: string[];
+  missing_columns: string[];
+  dropped_columns: string[];
+  token_alignment: string;
+  graph_remapping: string;
+  provenance: string;
+  non_null_ratio: number;
 }
 
 export interface DataInspectorProps {
@@ -27,6 +40,7 @@ export interface DataInspectorProps {
   onUseForTrain?: (parquetPath: string, tokenizerPath: string | null) => void;
   /** V4-1: current path App is using for training (drives button label). */
   trainParquetPath?: string | null;
+  onAvailableChannelsChange?: (channels: string[]) => void;
 }
 
 const CHANNEL_COLORS = ["#fde68a", "#bfdbfe", "#bbf7d0", "#fecaca",
@@ -34,6 +48,12 @@ const CHANNEL_COLORS = ["#fde68a", "#bfdbfe", "#bbf7d0", "#fecaca",
 
 function colorForChannel(idx: number): string {
   return CHANNEL_COLORS[idx % CHANNEL_COLORS.length];
+}
+
+function familyColor(status: string): string {
+  if (status === "present" || status === "derived") return "#166534";
+  if (status === "partial" || status === "dropped") return "#92400e";
+  return "#991b1b";
 }
 
 function isScalarRibbon(v: unknown): v is number {
@@ -61,7 +81,7 @@ interface RoundtripCheckResult {
 
 export function DataInspector({
   rpc, initialPath = "", pageSize = 16,
-  onUseForTrain, trainParquetPath,
+  onUseForTrain, trainParquetPath, onAvailableChannelsChange,
 }: DataInspectorProps): JSX.Element {
   const [path, setPath] = useState(initialPath);
   const [offset, setOffset] = useState(0);
@@ -79,6 +99,7 @@ export function DataInspector({
         "data.preview_parquet",
         { path, offset: nextOffset, limit: pageSize },
       );
+      onAvailableChannelsChange?.(r.available_channels);
       setResult((prev) => {
         // Reset channel toggles when the underlying schema changes
         // (different path OR different available_channels set).
@@ -199,6 +220,43 @@ export function DataInspector({
               </label>
             ))}
           </div>
+
+          {result.side_channel_families &&
+            Object.keys(result.side_channel_families).length > 0 && (
+            <div data-testid="data-family-coverage"
+                 style={{ display: "grid",
+                          gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))",
+                          gap: 6 }}>
+              {Object.entries(result.side_channel_families).map(([name, fam]) => (
+                <div key={name} data-testid={`data-family-${name}`}
+                     style={{ border: "1px solid #e5e7eb", borderRadius: 4,
+                              padding: 6, fontSize: 11 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between",
+                                gap: 6 }}>
+                    <strong>{name}</strong>
+                    <span data-testid={`data-family-${name}-status`}
+                          style={{ color: familyColor(fam.status) }}>
+                      {fam.status}
+                    </span>
+                  </div>
+                  <div data-testid={`data-family-${name}-alignment`}
+                       style={{ color: "#6b7280" }}>
+                    align={fam.token_alignment} · graph={fam.graph_remapping}
+                  </div>
+                  <div data-testid={`data-family-${name}-provenance`}
+                       style={{ color: "#6b7280" }}>
+                    provenance={fam.provenance} · non-null {fam.non_null_ratio.toFixed(2)}
+                  </div>
+                  {fam.missing_columns.length > 0 && (
+                    <div data-testid={`data-family-${name}-missing`}
+                         style={{ color: "#92400e" }}>
+                      missing: {fam.missing_columns.join(", ")}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
 
           <div data-testid="data-rows"
                style={{ flex: 1, overflowY: "auto",

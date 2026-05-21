@@ -39,6 +39,12 @@ def test_preview_returns_first_page(tmp_path: Path):
     assert r.token_column == "input_ids"
     assert "doc_ids" in r.available_channels
     assert "call_edges" in r.available_channels
+    assert r.side_channel_families["semantic_graph"].status == "dropped"
+    assert set(r.side_channel_families["semantic_graph"].dropped_columns) == {
+        "call_edges",
+        "type_edges",
+    }
+    assert r.side_channel_families["semantic_graph"].graph_remapping == "no"
 
 
 def test_preview_carries_channel_payload_per_row(tmp_path: Path):
@@ -124,6 +130,8 @@ def test_dispatch_data_preview_parquet_round_trip(tmp_path: Path):
     assert resp.error is None
     assert len(resp.result["rows"]) == 2
     assert resp.result["token_column"] == "input_ids"
+    assert "side_channel_families" in resp.result
+    assert "universal" in resp.result["side_channel_families"]
 
 
 def test_method_registry_includes_data_preview():

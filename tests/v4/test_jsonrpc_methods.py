@@ -70,6 +70,37 @@ def test_verify_includes_fusion_plan():
     assert region.brick_names == ["a", "b"]
 
 
+def test_verify_reports_required_side_channel_family_errors():
+    params = _simple_verify_params(
+        side_channels={
+            "mode": "auto",
+            "families": {
+                "platform": {
+                    "mode": "require",
+                    "columns": ["platform_ids"],
+                    "embedding": "categorical",
+                    "dropout": 0.0,
+                    "residual_scale": 1.0,
+                    "fallback": "error",
+                    "language_scope": ["any"],
+                },
+            },
+            "inference": {
+                "source": "auto",
+                "fail_policy": "drop_family",
+                "timeout_ms": 500,
+                "cache_enabled": True,
+            },
+        },
+        available_side_channels=["doc_ids", "token_ids"],
+    )
+    r = verify(params)
+    gotcha = next(g for g in r.gotchas
+                  if g.id == "side_channel_required_platform")
+    assert gotcha.severity == "error"
+    assert "platform_ids" in gotcha.message
+
+
 def test_verify_emits_distributed_memory_with_sharding():
     p = _simple_verify_params(sharding={
         "topology": {"factory": "h100_8x", "kwargs": {}},
