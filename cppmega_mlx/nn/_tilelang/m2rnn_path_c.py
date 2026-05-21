@@ -5018,6 +5018,20 @@ def _materialize_atomic_add_owner_outputs(*outputs: mx.array) -> None:
         mx.synchronize()
 
 
+def _sync_owner_output_scalars(*items: tuple[mx.array, tuple[int, ...]]) -> None:
+    # Keep MLX owner-output buffers live across custom-VJP boundaries without
+    # staging, copying, or host-readback of the tensor.
+    scalars = []
+    for output, index in items:
+        try:
+            scalars.append(output[index])
+        except IndexError:
+            pass
+    if scalars:
+        mx.eval(*scalars)
+        mx.synchronize()
+
+
 @mx.custom_function
 def m2rnn_apply_packed_with_state_path_c(
     conv_input: mx.array,
@@ -5282,6 +5296,12 @@ def _mapped_packed_post_apply_for_layout(
             )
             return _match_primal_gradient_dtypes(grads, primals)
         dy_recurrent, dconv_post, dD, dprojected = post_grads
+        _sync_owner_output_scalars(
+            (dy_recurrent, (0, 0, 0, 0)),
+            (dconv_post, (0, 0, 0)),
+            (dD, (0, 0)),
+            (dprojected, (0, 0, 0)),
+        )
         dconv_recurrent, dW, dxf, dh0 = _m2rnn_mapped_packed_bwd_path_b_reduced(
             dy_recurrent,
             conv_input,
@@ -5392,14 +5412,7 @@ def _post_residual_gate_apply_for_layout(
             v_heads=v_heads,
             g_heads=g_heads,
         )
-        # MLX can otherwise drop the first TileLang owner-output from the
-        # custom-VJP return graph under pytest capture. A scalar readback keeps
-        # the dy buffer live at the autograd boundary without staging or
-        # copying the tensor.
-        try:
-            _ = grads[0][0, 0, 0, 0].item()
-        except IndexError:
-            pass
+        _sync_owner_output_scalars((grads[0], (0, 0, 0, 0)))
         return _match_primal_gradient_dtypes(grads, primals)
 
     return _apply
