@@ -197,7 +197,11 @@ class ShardingSpecPayload(BaseModel):
 
     topology: TopologyPayload
     axis_assignments: list[AxisAssignmentPayload]
-    compile_mode: Literal["regional", "global", "off"] = "regional"
+    # V4-13: 'whole_model' is canonical for both UI TopBar + gotcha_checker
+    # conditions. Schema previously rejected it as not in {regional, global,
+    # off}, blocking UI from ever triggering the fsdp2_whole_compile /
+    # megatron_tp_whole_compile error gotchas. 'global' kept as back-compat.
+    compile_mode: Literal["regional", "global", "off", "whole_model"] = "regional"
     fp8_enabled: bool = False
 
 
