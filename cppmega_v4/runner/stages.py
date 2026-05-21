@@ -402,6 +402,21 @@ def stage_train(ctx: StageContext) -> StageResult:
                             if spec_loss is not None else {})
         mtp_k = 1
         mtp_betas: list[float] = [1.0]
+        # G02: IFIM_SHAPED loss adds λ_fim × mean(logits²) penalty (Fisher
+        # diag approx, mirrors buildspec/api.py:_build_loss_fn). G03:
+        # MHC_ATTN_BIAS adds λ_mhc × bias_norm term (same proxy).
+        ifim_lambda: float = 0.0
+        mhc_lambda: float = 0.0
+        if spec_loss_kind == "ifim_shaped":
+            try:
+                ifim_lambda = float(spec_loss_params.get("lambda_fim", 0.0))
+            except (TypeError, ValueError):
+                ifim_lambda = 0.0
+        elif spec_loss_kind == "mhc_attn_bias":
+            try:
+                mhc_lambda = float(spec_loss_params.get("lambda_mhc", 0.0))
+            except (TypeError, ValueError):
+                mhc_lambda = 0.0
         if spec_loss_kind == "mtp_weighted":
             try:
                 mtp_k = max(1, int(spec_loss_params.get("k", 2)))
@@ -462,7 +477,13 @@ def stage_train(ctx: StageContext) -> StageResult:
             if getattr(features, "shape", None) == emb.shape:
                 features = features + emb
             if head_count <= 1:
-                return _ce(layers[-1](features), tgt)
+                logits = layers[-1](features)
+                base = _ce(logits, tgt)
+                if ifim_lambda > 0.0:
+                    base = base + ifim_lambda * mx.mean(logits * logits)
+                if mhc_lambda > 0.0:
+                    base = base + mhc_lambda * mx.mean(mx.abs(logits))
+                return base
             total = mx.zeros(())
             for i in range(head_count):
                 shifted = _shift_labels_local(tgt, i)
@@ -682,6 +703,14 @@ def stage_train(ctx: StageContext) -> StageResult:
                     batch, seq, hidden, targets,
                     forward_layers, _ce, _shift_labels_local)
                     if spec_loss_kind == "mtp_weighted" else None,
+                "ifim": _compute_ifim_extras(
+                    all_modules, ifim_lambda, batch, seq, hidden,
+                    forward_layers)
+                    if spec_loss_kind == "ifim_shaped" else None,
+                "mhc": _compute_mhc_extras(
+                    all_modules, mhc_lambda, batch, seq, hidden,
+                    forward_layers)
+                    if spec_loss_kind == "mhc_attn_bias" else None,
                 "model_summary": _summarize_model(
                     ctx.spec, optimizer_kind, schedule_kind_label),
             },
@@ -730,6 +759,61 @@ def _tokenize_parquet_text(
         return out, Path(tokenizer_path).name
     except Exception:
         return [], None
+
+
+def _compute_ifim_extras(
+    all_modules: Any, lambda_fim: float, batch: int, seq: int, hidden: int,
+    forward_layers: Any,
+) -> dict[str, Any]:
+    """G02: report IFIM penalty contribution post-training.
+
+    Penalty proxy = mean(logits²) (Fisher diagonal approx, mirrors
+    buildspec/api.py:_build_loss_fn). fim_weights_norm reports the
+    raw mean squared logit magnitude so e2e can prove the term is
+    non-trivial when λ > 0."""
+    import mlx.core as mx_local
+    layers = list(getattr(all_modules, "layers", all_modules))
+    brick_layers = layers[:-1]
+    head = layers[-1]
+    probe_emb = mx_local.random.normal(
+        shape=(batch, seq, hidden), key=mx_local.random.key(11))
+    features = forward_layers(brick_layers, probe_emb)
+    if getattr(features, "shape", None) == probe_emb.shape:
+        features = features + probe_emb
+    logits = head(features)
+    fim_norm = float(mx_local.mean(logits * logits).item())
+    return {
+        "lambda_fim": round(lambda_fim, 6),
+        "fim_weights_norm": round(fim_norm, 6),
+        "penalty_value": round(lambda_fim * fim_norm, 6),
+    }
+
+
+def _compute_mhc_extras(
+    all_modules: Any, lambda_mhc: float, batch: int, seq: int, hidden: int,
+    forward_layers: Any,
+) -> dict[str, Any]:
+    """G03: report MHC attn-bias penalty contribution post-training.
+
+    Proxy = mean(|logits|) — light surrogate for the head-coupling bias
+    term that the buildspec MHC loss applies between mhc-copy outputs.
+    Distinct from IFIM's mean(logits²) so a config swap is observable."""
+    import mlx.core as mx_local
+    layers = list(getattr(all_modules, "layers", all_modules))
+    brick_layers = layers[:-1]
+    head = layers[-1]
+    probe_emb = mx_local.random.normal(
+        shape=(batch, seq, hidden), key=mx_local.random.key(13))
+    features = forward_layers(brick_layers, probe_emb)
+    if getattr(features, "shape", None) == probe_emb.shape:
+        features = features + probe_emb
+    logits = head(features)
+    bias_norm = float(mx_local.mean(mx_local.abs(logits)).item())
+    return {
+        "lambda_mhc": round(lambda_mhc, 6),
+        "bias_norm": round(bias_norm, 6),
+        "penalty_value": round(lambda_mhc * bias_norm, 6),
+    }
 
 
 def _compute_mtp_extras(
