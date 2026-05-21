@@ -1,0 +1,193 @@
+name: E2E Coverage Matrix
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "cppmega_v4/**"
+      - "cppmega_mlx/**"
+      - "vbgui/**"
+      - "tests/fixtures/build_e2e_matrix.py"
+      - "tests/fixtures/tokenizers/**"
+      - "tests/fixtures/parquet/**"
+      - ".github/workflows/e2e-matrix.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "cppmega_v4/**"
+      - "vbgui/**"
+      - "tests/fixtures/build_e2e_matrix.py"
+  schedule:
+    # Nightly full run — includes the mini-train matrix on macOS.
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: e2e-matrix-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # On every push/PR: smoke matrix (912 cells, ubuntu, no real MLX
+  # training — backend just verifies). Quick gate, ~10 min.
+  preset-matrix:
+    name: Preset matrix (smoke, ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: vbgui/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[gui,parquet,widget]"
+          pip install jsonschema pyarrow tokenizers anywidget
+      - name: Generate fixtures
+        run: python tests/fixtures/build_e2e_matrix.py
+      - name: Vbgui install + typecheck
+        working-directory: vbgui
+        env:
+          NODE_ENV: development
+        run: |
+          npm ci
+          npm run typecheck
+      - name: Playwright browsers
+        working-directory: vbgui
+        run: npx playwright install --with-deps chromium
+      - name: Run preset matrix shard ${{ matrix.shard }}/4
+        working-directory: vbgui
+        env:
+          NODE_ENV: development
+          CI: "1"
+        run: |
+          npx playwright test --config=e2e/playwright.config.ts \
+            e2e/scenarios/02_preset_matrix.spec.ts \
+            --shard=${{ matrix.shard }}/4
+      - name: Upload artefacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: preset-matrix-shard-${{ matrix.shard }}
+          path: |
+            vbgui/e2e/test-results/
+            vbgui/e2e/screenshots/
+            vbgui/e2e/logs/
+          retention-days: 3
+
+  # Specialised + canvas smoke scenarios — run on every push (lightweight).
+  specialised:
+    name: Specialised + canvas smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "22", cache: "npm",
+                cache-dependency-path: vbgui/package-lock.json }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13" }
+      - run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[gui,parquet,widget]"
+          pip install jsonschema pyarrow tokenizers anywidget
+      - run: python tests/fixtures/build_e2e_matrix.py
+      - working-directory: vbgui
+        env: { NODE_ENV: development }
+        run: |
+          npm ci
+          npm run typecheck
+      - working-directory: vbgui
+        run: npx playwright install --with-deps chromium
+      - working-directory: vbgui
+        env: { NODE_ENV: development, CI: "1" }
+        run: |
+          npx playwright test --config=e2e/playwright.config.ts \
+            e2e/scenarios/01_canvas_smoke.spec.ts \
+            e2e/scenarios/04_tokenizer_playground.spec.ts \
+            e2e/scenarios/05_data_inspector.spec.ts \
+            e2e/scenarios/06_sharding_proposals.spec.ts \
+            e2e/scenarios/07_gotchas.spec.ts
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: specialised-results
+          path: |
+            vbgui/e2e/test-results/
+            vbgui/e2e/screenshots/
+            vbgui/e2e/logs/
+          retention-days: 3
+
+  # Mini-train matrix (192 cells, real mlx) — macOS only, nightly.
+  mini-train-matrix:
+    name: Mini-train matrix (macOS, nightly)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "22", cache: "npm",
+                cache-dependency-path: vbgui/package-lock.json }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13" }
+      - run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[gui,parquet,widget]"
+          pip install jsonschema pyarrow tokenizers anywidget mlx mlx-lm
+      - run: python tests/fixtures/build_e2e_matrix.py
+      - working-directory: vbgui
+        env: { NODE_ENV: development }
+        run: |
+          npm ci
+          npm run typecheck
+      - working-directory: vbgui
+        run: npx playwright install --with-deps chromium
+      - working-directory: vbgui
+        env: { NODE_ENV: development, CI: "1" }
+        run: |
+          npx playwright test --config=e2e/playwright.config.ts \
+            e2e/scenarios/03_train_matrix.spec.ts
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mini-train-results
+          path: |
+            vbgui/e2e/test-results/
+            vbgui/e2e/screenshots/
+            vbgui/e2e/logs/
+          retention-days: 7
+
+  # Matrix report — aggregates shard artefacts into one Markdown
+  # summary, posted as a build summary + uploaded as standalone artefact.
+  matrix-report:
+    name: Matrix report
+    needs: [preset-matrix, specialised]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { path: artifacts }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13" }
+      - name: Build matrix report
+        run: |
+          python tools/build_e2e_matrix_report.py \
+            --artifacts artifacts \
+            --output e2e_matrix_report.md
+          cat e2e_matrix_report.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: e2e_matrix_report
+          path: e2e_matrix_report.md
+          retention-days: 14
