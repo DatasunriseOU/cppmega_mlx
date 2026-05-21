@@ -46,12 +46,17 @@ test("V4-3: Tokenizer Playground tokenizer reaches stage_train tokenizer_path",
     await modal.waitFor({ timeout: 60_000 });
     await page.getByTestId("run-result-expand-train").click();
 
-    // The T2 parquet has only input_ids (no 'text' column), so V4-2
-    // tokenizer path falls through to V3-2 raw-int path. Either way
-    // data_source must NOT be 'synthetic'.
+    // G13: tighten V4-3 — matrix parquet fixtures have an
+    // 'original_text' column (V4-2 helper recognises it as text), so
+    // the tokenizer path MUST activate. data_source must be exactly
+    // 'parquet_tokenized', not just non-synthetic.
     const dataSource = await page.getByTestId(
       "run-result-extras-train-data_source").textContent();
-    expect(["parquet", "parquet_tokenized"]).toContain(dataSource?.trim());
+    expect(dataSource?.trim()).toBe("parquet_tokenized");
+    // tokenizer_used must contain the picked tokenizer's basename.
+    const tokenizerUsed = await page.getByTestId(
+      "run-result-extras-train-tokenizer_used").textContent();
+    expect(tokenizerUsed?.trim()).toContain(".json");
 
     await closeModal(page);
   });
