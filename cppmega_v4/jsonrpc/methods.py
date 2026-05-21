@@ -32,10 +32,29 @@ from cppmega_v4.parallelism import (
     AxisAssignment,
     ParallelismKind,
     ShardingSpec,
-    TOPOLOGY_BUILTINS,
+    a100_8x,
+    b100_8x,
+    gb10_quarter,
+    h100_8x,
+    h200_8x,
+    m3_ultra_solo,
     suggest_sharding as _suggest_sharding,
+    tpu_v5p_4,
+    tpu_v6e_8,
     verify_distributed_plan,
 )
+
+
+_TOPOLOGY_FACTORIES = {
+    "h100_8x": h100_8x,
+    "h200_8x": h200_8x,
+    "a100_8x": a100_8x,
+    "b100_8x": b100_8x,
+    "gb10_quarter": gb10_quarter,
+    "tpu_v5p_4": tpu_v5p_4,
+    "tpu_v6e_8": tpu_v6e_8,
+    "m3_ultra_solo": m3_ultra_solo,
+}
 from cppmega_v4.probe import contract_probe as _contract_probe
 from cppmega_v4.probe import to_dict as _probe_to_dict
 from cppmega_v4.spec import (
@@ -117,11 +136,11 @@ def _make_optim(payload: OptimSpecPayload) -> OptimSpec:
 
 
 def _make_topology(payload: TopologyPayload):
-    factory = TOPOLOGY_BUILTINS.get(payload.factory)
+    factory = _TOPOLOGY_FACTORIES.get(payload.factory)
     if factory is None:
         raise ValueError(
             f"unknown topology factory {payload.factory!r}; "
-            f"available: {sorted(TOPOLOGY_BUILTINS)}"
+            f"available: {sorted(_TOPOLOGY_FACTORIES)}"
         )
     return factory(**payload.kwargs)
 
@@ -249,9 +268,11 @@ def verify(params: VerifyParams, *, cache: LRUCache | None = None) -> VerifyResu
         )
         gotcha_payloads = [
             GotchaPayload(
-                id=g.id, severity=g.severity.value if hasattr(g.severity, "value")
-                                                  else str(g.severity),
-                message=g.message, reference=getattr(g, "reference", None),
+                id=g.gotcha_id,
+                severity=g.severity.value if hasattr(g.severity, "value")
+                                          else str(g.severity),
+                message=g.message,
+                reference=getattr(g, "reference", None),
             )
             for g in dverify.gotchas
         ]
