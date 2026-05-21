@@ -149,3 +149,27 @@ def test_cute_dsl_source_import_routes_by_explicit_target_arch() -> None:
     assert "A" in text
     assert "B" in text
     assert "C" in text
+
+
+def test_cute_dsl_phase4_source_import_routes_by_explicit_target_arch() -> None:
+    """Dispatcher reaches the largest static CuTe source importer on Mac."""
+
+    source = Path(
+        "/Volumes/external/sources/cppmega/cppmega/megatron/"
+        "cute_dsl_mimo/fused_bwd_bwd_sm90_p4.py"
+    )
+    if not source.exists():
+        pytest.skip(f"cppmega CuTe source file not present: {source}")
+
+    prim = ckb.dispatch_kernel_bridge(
+        "cute_dsl",
+        arch="sm_90a",
+        source_path=source,
+        class_name="FusedBwdBwdP4",
+        nchunks=2,
+    )
+
+    text = str(prim)
+    assert text.count("gemm") >= 10
+    assert "chunk_rev" in text
+    assert "DstatesOut" in text

@@ -35,6 +35,7 @@ from cppmega_mlx.runtime.path_c_fusion import (
     build_mamba3_fp8_train_acceptance_fixture_region,
     compile_path_c_region,
     mark_path_c_schedule_template_for_region,
+    tilelang_single_entry_lowerer,
     trusted_path_c_production_schedule_ids,
 )
 
@@ -46,6 +47,7 @@ __all__ = [
     "MAMBA3_FP8_TRAIN_BUFFER_EXTENT",
     "MAMBA3_FP8_TRAIN_PROTOTYPE_SCHEDULE_NAME",
     "MAMBA3_FP8_TRAIN_PROTOTYPE_SCHEDULE_STATUS",
+    "CompiledMamba3Fp8TrainFusionSchedule",
     "Mamba3Fp8TrainFusionSchedulePlan",
     "Mamba3Fp8TrainFusionScheduleSpec",
     "DESCRIPTOR_INTERNAL_BUFFER_POLICY_ROW_LOCAL_HIDDEN",
@@ -75,6 +77,7 @@ __all__ = [
     "make_path_c_descriptor_schedule_template",
     "path_c_fusion_schedule_spec",
     "path_c_fusion_schedule_template",
+    "compile_mamba3_fp8_train_fusion_schedule",
     "plan_path_c_direct_fusion_chain_for_region",
     "plan_path_c_direct_fusion_chains_for_model",
     "plan_path_c_fusion_schedule_for_region",
@@ -304,6 +307,15 @@ class Mamba3Fp8TrainFusionSchedulePlan:
 
     region: PathCFusionRegion
     plan: FusionCompilePlan
+    schedule_spec: Mamba3Fp8TrainFusionScheduleSpec
+
+
+@dataclass(frozen=True)
+class CompiledMamba3Fp8TrainFusionSchedule:
+    """Lowered named Mamba3 FP8 train-block schedule with its contract."""
+
+    region: PathCFusionRegion
+    compiled: CompiledPathCRegion
     schedule_spec: Mamba3Fp8TrainFusionScheduleSpec
 
 
@@ -8170,6 +8182,62 @@ def plan_mamba3_fp8_train_fusion_schedule(
         schedule_spec=mamba3_fp8_train_fusion_schedule_spec(
             optimized.region,
             contract=optimized.plan.schedule_contract,
+            target=target,
+        ),
+    )
+
+
+def compile_mamba3_fp8_train_fusion_schedule(
+    *,
+    tilelang_lowerer: Callable[..., Any] | None = None,
+    target_name: str = "metal",
+    include_backward: bool = True,
+) -> CompiledMamba3Fp8TrainFusionSchedule:
+    """Lower the named Mamba3 FP8 train-block acceptance schedule.
+
+    This is the compiled counterpart of
+    :func:`plan_mamba3_fp8_train_fusion_schedule`: it selects the named
+    acceptance profile from the region graph, attests the generated descriptor
+    schedule for that exact contract, and invokes the supplied TileLang lowerer.
+    The schedule is still not trusted-by-default; callers must inspect the
+    returned contract and external receipts before enabling it as a default.
+    """
+
+    fwd_region = _mamba3_fp8_train_acceptance_region(include_backward=False)
+    acceptance_registry = PathCFusionScheduleRegistry(
+        acceptance_profiles=(_mamba3_fp8_train_acceptance_profile(),),
+    )
+    optimizer = PathCFusionScheduleOptimizer(
+        fwd_region.name,
+        registry=acceptance_registry,
+        metadata=fwd_region.metadata,
+        enable_aot_autograd=include_backward,
+    ).add_kernels(_surfaces_from_region(fwd_region))
+    region = optimizer.build_region()
+    target = optimizer.select_schedule_target(region)
+    if target is None:
+        raise RuntimeError(
+            f"no Path C fusion schedule target registered for op signature "
+            f"{tuple(node.op_name for node in region.nodes)!r}"
+        )
+    lowerer = tilelang_lowerer or tilelang_single_entry_lowerer
+    schedule_template = _attested_schedule_template_for_target(target, region)
+    compiled = compile_path_c_region(
+        region,
+        schedule_template=schedule_template,
+        schedule_name=target.schedule_name,
+        schedule_status=target.schedule_status,
+        tilelang_lowerer=lowerer,
+        target=target_name,
+    )
+    if not isinstance(compiled, CompiledPathCRegion):
+        raise TypeError("compile_path_c_region unexpectedly returned a plan")
+    return CompiledMamba3Fp8TrainFusionSchedule(
+        region=region,
+        compiled=compiled,
+        schedule_spec=mamba3_fp8_train_fusion_schedule_spec(
+            region,
+            contract=compiled.plan.schedule_contract,
             target=target,
         ),
     )

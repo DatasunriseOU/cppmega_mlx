@@ -17,7 +17,6 @@ from cppmega_v4.buildspec import (
     LossKind,
     MTPRewriter,
     ModelBuildSpec,
-    OptimKind,
     adamw,
     build_model,
     cross_entropy_loss,
@@ -77,6 +76,13 @@ def test_build_model_attaches_brick_modules_as_submodules():
     params = built.module.trainable_parameters()
     assert "brick_backbone" in params
     assert "brick_logits" in params
+
+
+def test_build_model_defaults_linear_attention_to_autograd_safe_path_a():
+    spec = _minimal_spec()
+    built = build_model(spec)
+    backbone = getattr(built.module, "brick_backbone")
+    assert backbone.config.kernel_path == "path_a"
 
 
 def test_build_model_strict_raises_on_verify_errors():

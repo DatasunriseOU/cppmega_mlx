@@ -305,6 +305,7 @@ def test_hybrid_lm_dsa_path_c_uses_sparse_causal_sentinel(
         )
 
     monkeypatch.setenv("CPPMEGA_KERNEL_PATH__SPARSE_MLA", "path_c")
+    monkeypatch.setenv("CPPMEGA_SPARSE_MLA_FP8_ROUTE", "path_c")
     monkeypatch.setattr(
         nn.MultiHeadAttention,
         "create_additive_causal_mask",
@@ -363,6 +364,7 @@ def test_hybrid_lm_dsa_path_c_threads_document_mask_to_sparse_indices(
         )
 
     monkeypatch.setenv("CPPMEGA_KERNEL_PATH__SPARSE_MLA", "path_c")
+    monkeypatch.setenv("CPPMEGA_SPARSE_MLA_FP8_ROUTE", "path_c")
     monkeypatch.setattr(fp8_path_c, "sparse_mla_fp8_path_c_apply", fake_apply)
 
     model = HybridTinyLM(

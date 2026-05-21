@@ -66,6 +66,7 @@ export function AutoGroupButton({
         lr: p.lr,
         weight_decay: p.weight_decay,
         betas: p.betas ?? undefined,
+        ns_steps: p.ns_steps,
       }));
       const banner =
         `Auto-grouped ${result.proposals.length} group${

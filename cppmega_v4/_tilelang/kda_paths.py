@@ -32,11 +32,15 @@ Env override: ``CPPMEGA_V4_KERNEL_PATH__KDA``.
 from __future__ import annotations
 
 import importlib
+from collections.abc import Mapping
 
 from cppmega_v4._tilelang._dispatch import PathName, PathStatus, auto_pick, env_override
 from cppmega_v4.nn._external.fla_naive_kda import naive_recurrent_kda
 
 ENV_VAR = "CPPMEGA_V4_KERNEL_PATH__KDA"
+_VALID_PATHS: tuple[PathName, ...] = (
+    "path_a", "path_b", "path_c", "path_d", "path_e",
+)
 
 
 # ----- Path A -----
@@ -77,9 +81,35 @@ def _path_b_status() -> PathStatus:
         )
 
 
-def _path_b_call(*args, **kwargs):
-    if not _path_b_status().available:
+def _fallback_or_raise(
+    path: PathName,
+    reason: str,
+    allow_fallback: bool,
+    *args,
+    **kwargs,
+):
+    if allow_fallback:
         return _path_a_call(*args, **kwargs)
+    raise RuntimeError(f"KDA {path} unavailable and fallback disabled: {reason}")
+
+
+def _dispatch_failure_or_fallback(
+    path: PathName,
+    exc: Exception,
+    allow_fallback: bool,
+    *args,
+    **kwargs,
+):
+    if allow_fallback:
+        return _path_a_call(*args, **kwargs)
+    raise RuntimeError(f"KDA {path} dispatch failed and fallback disabled: {exc}") from exc
+
+
+def _path_b_call(*args, allow_fallback: bool = True, **kwargs):
+    if not _path_b_status().available:
+        return _fallback_or_raise(
+            "path_b", _path_b_status().reason, allow_fallback, *args, **kwargs,
+        )
     mod = importlib.import_module("cppmega_v4._tilelang.kda_path_b")
     return mod.kda_forward_path_b(*args, **kwargs)
 
@@ -105,14 +135,18 @@ def _path_c_status() -> PathStatus:
     )
 
 
-def _path_c_call(*args, **kwargs):
+def _path_c_call(*args, allow_fallback: bool = True, **kwargs):
     if not _path_c_status().available:
-        return _path_a_call(*args, **kwargs)
+        return _fallback_or_raise(
+            "path_c", _path_c_status().reason, allow_fallback, *args, **kwargs,
+        )
     try:
         from cppmega_v4._tilelang.kda_path_c import _kda_fwd_path_c_call
         return _kda_fwd_path_c_call(*args, **kwargs)
-    except Exception:
-        return _path_a_call(*args, **kwargs)
+    except Exception as exc:
+        return _dispatch_failure_or_fallback(
+            "path_c", exc, allow_fallback, *args, **kwargs,
+        )
 
 
 # ----- Path D (Triton frontend) -----
@@ -136,14 +170,18 @@ def _path_d_status() -> PathStatus:
     )
 
 
-def _path_d_call(*args, **kwargs):
+def _path_d_call(*args, allow_fallback: bool = True, **kwargs):
     if not _path_d_status().available:
-        return _path_a_call(*args, **kwargs)
+        return _fallback_or_raise(
+            "path_d", _path_d_status().reason, allow_fallback, *args, **kwargs,
+        )
     try:
         from cppmega_v4._tilelang.kda_path_d import _kda_fwd_path_d_call
         return _kda_fwd_path_d_call(*args, **kwargs)
-    except Exception:
-        return _path_a_call(*args, **kwargs)
+    except Exception as exc:
+        return _dispatch_failure_or_fallback(
+            "path_d", exc, allow_fallback, *args, **kwargs,
+        )
 
 
 # ----- Path E (vendored mlx-lm gated_delta vectorised-gate kernel) -----
@@ -173,42 +211,78 @@ def _path_e_status() -> PathStatus:
     )
 
 
-def _path_e_call(*args, **kwargs):
+def _path_e_call(*args, allow_fallback: bool = True, **kwargs):
     if not _path_e_status().available:
-        return _path_a_call(*args, **kwargs)
+        return _fallback_or_raise(
+            "path_e", _path_e_status().reason, allow_fallback, *args, **kwargs,
+        )
     try:
         from cppmega_v4.nn._external.mlx_lm_kda_update import kda_update
         return kda_update(*args, **kwargs)
-    except Exception:
-        return _path_a_call(*args, **kwargs)
+    except Exception as exc:
+        return _dispatch_failure_or_fallback(
+            "path_e", exc, allow_fallback, *args, **kwargs,
+        )
 
 
 # ----- Public dispatch -----
 
 
-def kda_path_statuses() -> dict[PathName, PathStatus]:
-    return {
+def kda_path_statuses(
+    status_overrides: Mapping[PathName, PathStatus] | None = None,
+) -> dict[PathName, PathStatus]:
+    statuses = {
         "path_a": _path_a_status(),
         "path_b": _path_b_status(),
         "path_c": _path_c_status(),
         "path_d": _path_d_status(),
         "path_e": _path_e_status(),
     }
+    if status_overrides:
+        for path, status in status_overrides.items():
+            if path not in _VALID_PATHS:
+                raise ValueError(f"unsupported KDA path override: {path!r}")
+            if status.path != path:
+                raise ValueError(
+                    f"KDA status override key {path!r} does not match "
+                    f"status.path {status.path!r}"
+                )
+            statuses[path] = status
+    return statuses
 
 
-def kda_auto_mode_for_inputs(*, env_var: str = ENV_VAR) -> PathName:
+def kda_auto_mode_for_inputs(
+    *,
+    env_var: str = ENV_VAR,
+    status_overrides: Mapping[PathName, PathStatus] | None = None,
+) -> PathName:
     forced = env_override(env_var)
     if forced is not None:
         return forced  # type: ignore[return-value]
     return auto_pick(
-        kda_path_statuses(),
+        kda_path_statuses(status_overrides=status_overrides),
         preference=("path_c", "path_b", "path_e", "path_d", "path_a"),
     )
 
 
-def kda_recurrent_dispatch(*args, **kwargs):
+def kda_recurrent_dispatch(
+    *args,
+    path: PathName | None = None,
+    allow_fallback: bool = True,
+    status_overrides: Mapping[PathName, PathStatus] | None = None,
+    **kwargs,
+):
     """Call the auto-selected KDA backend, falling back to Path A."""
-    path = kda_auto_mode_for_inputs()
+    statuses = kda_path_statuses(status_overrides=status_overrides)
+    if path is None:
+        path = kda_auto_mode_for_inputs(status_overrides=status_overrides)
+    if path not in _VALID_PATHS:
+        raise ValueError(f"unsupported KDA path {path!r}")
+    status = statuses[path]
+    if path != "path_a" and not status.available:
+        return _fallback_or_raise(
+            path, status.reason, allow_fallback, *args, **kwargs,
+        )
     fn = {
         "path_a": _path_a_call,
         "path_b": _path_b_call,
@@ -216,7 +290,9 @@ def kda_recurrent_dispatch(*args, **kwargs):
         "path_d": _path_d_call,
         "path_e": _path_e_call,
     }[path]
-    return fn(*args, **kwargs)
+    if path == "path_a":
+        return fn(*args, **kwargs)
+    return fn(*args, allow_fallback=allow_fallback, **kwargs)
 
 
 __all__ = [

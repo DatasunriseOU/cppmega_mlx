@@ -167,7 +167,7 @@ def test_block_forward_shape():
     cfg = _tiny_cfg()
     block = LinearAttentionBlock(cfg)
     x = mx.random.normal((1, 4, cfg.hidden_size))
-    out = block(x)
+    out = block(x, kernel_path="path_a")
     assert out.shape == x.shape
 
 
@@ -184,7 +184,7 @@ def test_block_is_identity_at_init():
     cfg = _tiny_cfg()
     block = LinearAttentionBlock(cfg)
     x = mx.random.normal((1, 4, cfg.hidden_size))
-    out = block(x)
+    out = block(x, kernel_path="path_a")
     np.testing.assert_allclose(np.array(out), np.zeros_like(np.array(x)), atol=1e-5)
 
 
@@ -192,7 +192,7 @@ def test_block_short_conv_runs():
     cfg = _tiny_cfg(use_short_conv=True, conv_size=3)
     block = LinearAttentionBlock(cfg)
     x = mx.random.normal((1, 4, cfg.hidden_size))
-    out = block(x)
+    out = block(x, kernel_path="path_a")
     assert out.shape == x.shape
 
 
@@ -202,8 +202,12 @@ def test_block_doc_ids_changes_output():
     # Give o_proj a small non-zero weight so we see a diff.
     block.o_proj.weight = mx.random.normal(block.o_proj.weight.shape) * 0.1
     x = mx.random.normal((1, 6, cfg.hidden_size))
-    out_no_doc = block(x)
-    out_with_doc = block(x, doc_ids=mx.array([[0, 0, 0, 1, 1, 1]], dtype=mx.int32))
+    out_no_doc = block(x, kernel_path="path_a")
+    out_with_doc = block(
+        x,
+        doc_ids=mx.array([[0, 0, 0, 1, 1, 1]], dtype=mx.int32),
+        kernel_path="path_a",
+    )
     # First doc: matches.
     np.testing.assert_allclose(
         np.array(out_no_doc[:, :3, :]), np.array(out_with_doc[:, :3, :]), atol=1e-5
@@ -229,7 +233,7 @@ def test_block_gradient_flows():
 
     def loss_fn(params):
         block.update(params)
-        return mx.mean(mx.square(block(x)))
+        return mx.mean(mx.square(block(x, kernel_path="path_a")))
 
     grads = mx.grad(loss_fn)(block.trainable_parameters())
     for name in ("q_proj", "k_proj", "v_proj", "a_proj", "b_proj", "o_proj"):

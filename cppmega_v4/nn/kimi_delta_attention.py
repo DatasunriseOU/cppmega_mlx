@@ -26,6 +26,7 @@ from dataclasses import dataclass
 import mlx.core as mx
 import mlx.nn as nn
 
+from cppmega_v4._tilelang._dispatch import PathName
 from cppmega_v4.nn._external.fla_naive_kda import naive_recurrent_kda
 from cppmega_v4.nn.linear_attention import _causal_short_conv
 
@@ -43,6 +44,7 @@ class KimiDeltaAttentionConfig:
     conv_size: int = 4
     use_gate: bool = False
     norm_eps: float = 1e-6
+    kernel_path: PathName | None = None
 
     def __post_init__(self) -> None:
         if self.hidden_size <= 0:
@@ -122,7 +124,13 @@ class KimiDeltaAttentionBlock(nn.Module):
             w_np[c][center][0] = 1.0
         return mx.array(w_np, dtype=mx.float32)
 
-    def __call__(self, x: mx.array, *, doc_ids: mx.array | None = None) -> mx.array:
+    def __call__(
+        self,
+        x: mx.array,
+        *,
+        doc_ids: mx.array | None = None,
+        kernel_path: PathName | None = None,
+    ) -> mx.array:
         if x.ndim != 3:
             raise ValueError(f"x must be shaped (B, S, D), got {x.shape}")
         if x.shape[-1] != self.config.hidden_size:
@@ -130,6 +138,7 @@ class KimiDeltaAttentionBlock(nn.Module):
                 f"x last dim must be {self.config.hidden_size}, got {x.shape[-1]}"
             )
         cfg = self.config
+        selected_kernel_path = cfg.kernel_path if kernel_path is None else kernel_path
         batch, seq_len, _ = x.shape
 
         q = self.q_proj(x)
@@ -151,16 +160,28 @@ class KimiDeltaAttentionBlock(nn.Module):
 
         if doc_ids is None:
             from cppmega_v4._tilelang.kda_paths import kda_recurrent_dispatch
-            o, _ = kda_recurrent_dispatch(q, k, v, g, beta)
+            o, _ = kda_recurrent_dispatch(
+                q, k, v, g, beta, path=selected_kernel_path,
+            )
         else:
-            o = self._recurrent_with_doc_reset(q, k, v, g, beta, doc_ids)
+            o = self._recurrent_with_doc_reset(
+                q, k, v, g, beta, doc_ids, kernel_path=selected_kernel_path,
+            )
 
         o = o.reshape(batch, seq_len, cfg.value_dim)
         o = self.o_proj(o)
         return self.o_norm(o)
 
     @staticmethod
-    def _recurrent_with_doc_reset(q, k, v, g, beta, doc_ids: mx.array) -> mx.array:
+    def _recurrent_with_doc_reset(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        doc_ids: mx.array,
+        kernel_path: PathName | None = None,
+    ) -> mx.array:
         if doc_ids.ndim != 2:
             raise ValueError(f"doc_ids must be 2D (B, T), got {doc_ids.shape}")
         batch, seq_len = doc_ids.shape
@@ -186,6 +207,7 @@ class KimiDeltaAttentionBlock(nn.Module):
                     v[b:b + 1, s:e],
                     g[b:b + 1, s:e],
                     beta[b:b + 1, s:e],
+                    path=kernel_path,
                 )
                 outs.append(ob)
             per_batch.append(mx.concatenate(outs, axis=1))

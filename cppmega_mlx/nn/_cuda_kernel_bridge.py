@@ -38,9 +38,11 @@ cpu / no CUDA       no       no        no       no
   ``_cute_bridge.cute_dsl_source_to_tilelang_prim`` can recover cppmega's
   smallest ``SingleGemmWGMMA``, ``MaskedLKQApplyWGMMA``, one-chunk
   ``StateApplyConsumersWGMMA``, and fixed-nchunk
-  ``MultiChunkStateApplyConsumersWGMMA`` external kernels as TileLang ``T``
-  ops. More complex external ``@cute.kernel`` objects still loud-fail via
-  ``CuteBridgeUnsupported`` until they have dedicated importers.
+  ``MultiChunkStateApplyConsumersWGMMA``, Phase-4 ``FusedBwdBwdP4``, and
+  FA4 ``FA4PatternFused3Gemm`` / ``FA4PatternFused3GemmV2`` external
+  kernels as TileLang ``T`` ops. Other external ``@cute.kernel`` objects
+  still loud-fail via ``CuteBridgeUnsupported`` until they have dedicated
+  importers.
 * Unknown SM (e.g. future ``sm_130``) emits a ``RuntimeWarning`` and
   *falls back to sm_120 dispatch*. This keeps newer client GPUs usable for
   Triton/MXFP8 paths until we cut a release with explicit support.
@@ -107,10 +109,8 @@ def detect_cuda_arch() -> str:
 
     Returns one of :data:`KNOWN_ARCHES` -- including ``"cpu"`` when no
     CUDA device is visible. The result is cached for the lifetime of the
-    process via ``functools.lru_cache``; tests that monkeypatch the
-    detection should patch the *symbol* (e.g.
-    ``monkeypatch.setattr(_cuda_kernel_bridge, 'detect_cuda_arch',
-    lambda: 'sm_130')``) rather than relying on the cache being cleared.
+    process via ``functools.lru_cache``; callers that need a specific
+    target should pass ``arch=...`` to :func:`dispatch_kernel_bridge`.
 
     Hopper sub-variant note: ``torch.cuda.get_device_capability()`` cannot
     distinguish sm_90 from sm_90a (the latter being the arch-flag form

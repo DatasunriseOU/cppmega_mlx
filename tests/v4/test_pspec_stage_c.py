@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from cppmega_v4.architectures import build_preset_specs
 from cppmega_v4.buildspec import (
     ModelBuildSpec,
@@ -24,7 +22,6 @@ from cppmega_v4.parallelism import (
     fsdp2_only,
     fsdp2_plus_tp,
     h100_8x,
-    h200_8x,
     megatron_ep_only,
     single_device,
     tpu_v6e_8,
@@ -333,7 +330,7 @@ def test_severity_distribution_is_balanced():
 # ---------------------------------------------------------------------------
 
 
-def test_check_gotchas_swallows_predicate_exceptions(monkeypatch):
+def test_check_gotchas_swallows_predicate_exceptions():
     """If a trigger predicate raises (e.g. missing dim_env key), the
     overall check should NOT propagate — that gotcha is treated as
     not-fired."""
@@ -342,16 +339,15 @@ def test_check_gotchas_swallows_predicate_exceptions(monkeypatch):
     def boom(s, b):
         raise KeyError("missing 'B' from dim_env")
 
-    monkeypatch.setattr(
-        gc, "GOTCHAS",
-        (Gotcha(
+    gotchas = (
+        Gotcha(
             gotcha_id="boom",
             severity=GotchaSeverity.ERROR,
             condition=boom,
             message="should never be visible",
             reference="test",
-        ),),
+        ),
     )
     spec = _qwen_spec()
-    fired = gc.check_gotchas(fsdp2_only(h100_8x()), spec)
+    fired = gc.check_gotchas(fsdp2_only(h100_8x()), spec, gotchas=gotchas)
     assert fired == ()

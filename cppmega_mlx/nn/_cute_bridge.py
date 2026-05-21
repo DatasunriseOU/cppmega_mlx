@@ -44,7 +44,8 @@ There are two supportable paths:
    functions — it only emits CuTeDSL from TileLang IR.  For cppmega's
    smallest smoke kernels, ``SingleGemmWGMMA``, ``MaskedLKQApplyWGMMA``,
    one-chunk ``StateApplyConsumersWGMMA``, fixed-nchunk
-   ``MultiChunkStateApplyConsumersWGMMA``, and FA4's
+   ``MultiChunkStateApplyConsumersWGMMA``, Phase-4 ``FusedBwdBwdP4``,
+   and FA4's
    ``FA4PatternFused3Gemm`` / ``FA4PatternFused3GemmV2`` chains, we can
    recover the tile contract and
    re-express it as TileLang ``T`` ops.  More complex kernels still require
@@ -93,19 +94,19 @@ CUTE_BRIDGE_KNOWN_GAPS = (
     "TileLang's CuTeDSL bridge emits CuTeDSL Python from a TileLang T.prim_func; "
     "it does not generally consume hand-written @cute.kernel modules. cppmega's "
     "SingleGemmWGMMA, MaskedLKQApplyWGMMA, one-chunk "
-    "StateApplyConsumersWGMMA, and fixed-nchunk "
-    "MultiChunkStateApplyConsumersWGMMA plus FA4PatternFused3Gemm and "
-    "FA4PatternFused3GemmV2 can be "
+    "StateApplyConsumersWGMMA, fixed-nchunk "
+    "MultiChunkStateApplyConsumersWGMMA, Phase-4 FusedBwdBwdP4, and "
+    "FA4PatternFused3Gemm / FA4PatternFused3GemmV2 can be "
     "pattern-imported by re-expressing the recovered contracts in TileLang "
-    "T-ops; complex cute_dsl_mimo kernels (full FA4 backward, fused 10-GEMM "
-    "bwd_bwd_sm90_p4) still need dedicated TileLang rewrites or a real "
-    "CuTeDSL frontend.",
+    "T-ops; complex cute_dsl_mimo kernels outside this recovered contract "
+    "set still need dedicated TileLang rewrites or a real CuTeDSL frontend.",
     # Hopper-specific feature gaps — even for the supported direction.
     "TileLang's CuTeDSL emitter (sm_90 path) does not expose all WGMMA / TMA "
     "knobs that cppmega's hand-written kernels rely on (e.g. quack.sm90_utils, "
     "warpgroup.OperandSource selection, custom SmemAllocator layouts, "
-    "StMatrix epilogues). Re-expressing fused_bwd_bwd_sm90_p4 in TileLang IR "
-    "would lose those optimizations.",
+    "StMatrix epilogues). The FusedBwdBwdP4 importer preserves the public "
+    "10-GEMM dataflow contract, but not those Hopper-specific scheduling "
+    "optimizations.",
     # Environment gating.
     "tilelang.compile(target='cutedsl') requires nvidia-cutlass-dsl>=4.3.1 "
     "(excluding 4.3.4) AND a CUDA host. Mac/MLX hosts cannot exercise this "
@@ -211,7 +212,8 @@ def cute_dsl_source_to_tilelang_prim(
     works on Mac/MLX hosts where ``cutlass`` and ``quack`` are not installed.
     Supported source patterns are cppmega's ``SingleGemmWGMMA``,
     ``MaskedLKQApplyWGMMA``, one-chunk ``StateApplyConsumersWGMMA``,
-    fixed-nchunk ``MultiChunkStateApplyConsumersWGMMA``, and
+    fixed-nchunk ``MultiChunkStateApplyConsumersWGMMA``, Phase-4
+    ``FusedBwdBwdP4``, and
     ``FA4PatternFused3Gemm`` / ``FA4PatternFused3GemmV2`` classes with
     ``@cute.kernel`` methods and
     literal constructor defaults for their tile-contract dimensions.
@@ -268,6 +270,28 @@ def cute_dsl_source_to_tilelang_prim(
             dtype,
             nchunks_value,
         )
+    if cls.name == "FusedBwdBwdP4":
+        if nchunks is None:
+            raise CuteBridgeUnsupported(
+                "FusedBwdBwdP4 source import requires explicit nchunks "
+                "because the CuTe kernel specializes it from the runtime "
+                "tensor shape."
+            )
+        nchunks_value = _positive_int_value(nchunks, "nchunks")
+        if nchunks_value not in (2, 4, 8):
+            raise CuteBridgeUnsupported(
+                "FusedBwdBwdP4 source import supports nchunks in (2, 4, 8); "
+                f"got {nchunks_value}."
+            )
+        n, p, r, chunk_size, dtype = _fused_bwd_bwd_p4_defaults_from_class(cls)
+        return _build_fused_bwd_bwd_p4_tilelang_prim(
+            n,
+            p,
+            r,
+            chunk_size,
+            dtype,
+            nchunks_value,
+        )
     if cls.name == "FA4PatternFused3Gemm":
         dim, dtype = _fa4_fused3_gemm_defaults_from_class(cls)
         return _build_fa4_v1_fused3_gemm_tilelang_prim(dim, dtype)
@@ -278,7 +302,7 @@ def cute_dsl_source_to_tilelang_prim(
         "source-level CuTeDSL import currently supports only SingleGemmWGMMA, "
         "MaskedLKQApplyWGMMA, one-chunk StateApplyConsumersWGMMA, and "
         "fixed-nchunk MultiChunkStateApplyConsumersWGMMA plus "
-        "FA4PatternFused3Gemm / FA4PatternFused3GemmV2; "
+        "FusedBwdBwdP4 and FA4PatternFused3Gemm / FA4PatternFused3GemmV2; "
         f"got {cls.name!r} from {path}."
     )
 
@@ -299,7 +323,7 @@ def _find_cute_kernel_class(
     *,
     class_name: str | None,
 ) -> ast.ClassDef:
-    """Find the requested or sole ``@cute.kernel`` class in a source AST."""
+    """Find the requested or sole CuTeDSL class in a source AST."""
 
     classes = [node for node in tree.body if isinstance(node, ast.ClassDef)]
     if class_name is not None:
@@ -309,25 +333,25 @@ def _find_cute_kernel_class(
                 f"CuTeDSL source does not define class {class_name!r}."
             )
         candidate = matches[0]
-        if not _class_has_cute_kernel(candidate):
+        if not _class_has_cute_entrypoint(candidate):
             raise CuteBridgeUnsupported(
-                f"CuTeDSL source class {class_name!r} has no @cute.kernel method."
+                f"CuTeDSL source class {class_name!r} has no @cute.kernel or @cute.jit method."
             )
         return candidate
 
     named = [node for node in classes if node.name == "SingleGemmWGMMA"]
-    if named and _class_has_cute_kernel(named[0]):
+    if named and _class_has_cute_entrypoint(named[0]):
         return named[0]
 
-    cute_classes = [node for node in classes if _class_has_cute_kernel(node)]
+    cute_classes = [node for node in classes if _class_has_cute_entrypoint(node)]
     if len(cute_classes) == 1:
         return cute_classes[0]
     if not cute_classes:
         raise CuteBridgeUnsupported(
-            "CuTeDSL source does not define a class with a @cute.kernel method."
+            "CuTeDSL source does not define a class with a @cute.kernel or @cute.jit method."
         )
     raise CuteBridgeUnsupported(
-        "CuTeDSL source defines multiple @cute.kernel classes; pass class_name."
+        "CuTeDSL source defines multiple @cute.kernel/@cute.jit classes; pass class_name."
     )
 
 
@@ -338,12 +362,13 @@ def _find_class_by_name(tree: ast.Module, class_name: str) -> ast.ClassDef:
     raise CuteBridgeUnsupported(f"CuTeDSL source does not define class {class_name!r}.")
 
 
-def _class_has_cute_kernel(cls: ast.ClassDef) -> bool:
+def _class_has_cute_entrypoint(cls: ast.ClassDef) -> bool:
     for item in cls.body:
         if not isinstance(item, ast.FunctionDef):
             continue
         if any(
             _is_cute_decorator(decorator, "kernel")
+            or _is_cute_decorator(decorator, "jit")
             for decorator in item.decorator_list
         ):
             return True
@@ -477,6 +502,41 @@ def _fa4_fused3_gemm_defaults_from_class(cls: ast.ClassDef) -> tuple[int, str]:
         _ast_default_to_name(dtype_node or ast.Constant("bfloat16"))
     )
     return dim, dtype
+
+
+def _fused_bwd_bwd_p4_defaults_from_class(
+    cls: ast.ClassDef,
+) -> tuple[int, int, int, int, str]:
+    init = next(
+        (
+            item
+            for item in cls.body
+            if isinstance(item, ast.FunctionDef) and item.name == "__init__"
+        ),
+        None,
+    )
+    if init is None:
+        raise CuteBridgeUnsupported("FusedBwdBwdP4 source has no __init__ method.")
+
+    defaults_by_name = _function_defaults_by_name(init)
+    try:
+        n = _literal_positive_int(defaults_by_name["N"], "N")
+        p = _literal_positive_int(defaults_by_name["P"], "P")
+        r = _literal_positive_int(defaults_by_name["R"], "R")
+        chunk_size = _literal_positive_int(
+            defaults_by_name["chunk_size"],
+            "chunk_size",
+        )
+    except KeyError as exc:
+        raise CuteBridgeUnsupported(
+            "FusedBwdBwdP4 source __init__ must default N, P, R, "
+            "and chunk_size."
+        ) from exc
+    dtype_node = defaults_by_name.get("dtype")
+    dtype = _normalize_cute_dtype(
+        _ast_default_to_name(dtype_node or ast.Constant("bfloat16"))
+    )
+    return n, p, r, chunk_size, dtype
 
 
 def _fa4_v2_defaults_from_class(cls: ast.ClassDef) -> tuple[int, str]:
@@ -909,6 +969,134 @@ def _build_multi_chunk_state_apply_consumers_tilelang_prim(
                 T.gemm(DPhScaledT_sh, QT_sh, Carry_acc, True, True)
 
     return multi_chunk_state_apply_consumers_wgmma_imported
+
+
+def _build_fused_bwd_bwd_p4_tilelang_prim(
+    n: int,
+    p: int,
+    r: int,
+    chunk_size: int,
+    dtype: str,
+    nchunks: int,
+) -> Any:
+    """Build TileLang IR for cppmega's Phase-4 10-GEMM CuTe tile contract."""
+
+    try:
+        import tilelang.language as T
+    except Exception as exc:  # pragma: no cover - host/environment dependent
+        raise CuteBridgeUnsupported(
+            "FusedBwdBwdP4 import requires a working tilelang import; "
+            f"got {exc.__class__.__name__}: {exc}."
+        ) from exc
+
+    fcs = chunk_size * r
+    if not (n == p == fcs):
+        raise CuteBridgeUnsupported(
+            "FusedBwdBwdP4 source import currently supports the source's "
+            "single tiled_mma contract N == P == chunk_size * R; got "
+            f"N={n}, P={p}, chunk_size={chunk_size}, R={r}."
+        )
+
+    threads = 128
+
+    @T.prim_func
+    def fused_bwd_bwd_p4_imported(
+        K: T.Tensor((nchunks, fcs, n), dtype),
+        K_T: T.Tensor((nchunks, n, fcs), dtype),
+        Q: T.Tensor((nchunks, fcs, n), dtype),
+        Q_T: T.Tensor((nchunks, n, fcs), dtype),
+        Dst: T.Tensor((nchunks, n, p), dtype),
+        DPh: T.Tensor((nchunks, fcs, p), dtype),
+        DPh_T: T.Tensor((nchunks, p, fcs), dtype),
+        Psi: T.Tensor((nchunks, fcs, p), dtype),
+        Sts: T.Tensor((nchunks, n, p), dtype),
+        DPsiV: T.Tensor((nchunks, fcs, p), dtype),
+        DK: T.Tensor((nchunks, fcs, n), dtype),
+        DQ: T.Tensor((nchunks, fcs, n), dtype),
+        Dqkd: T.Tensor((nchunks, fcs, fcs), dtype),
+        DstatesOut: T.Tensor((n, p), dtype),
+    ):
+        with T.Kernel(1, 1, threads=threads) as (_bx, _by):
+            K_sh = T.alloc_shared((fcs, n), dtype)
+            K_T_sh = T.alloc_shared((n, fcs), dtype)
+            Q_sh = T.alloc_shared((fcs, n), dtype)
+            Q_T_sh = T.alloc_shared((n, fcs), dtype)
+            Dst_sh = T.alloc_shared((n, p), dtype)
+            DPh_sh = T.alloc_shared((fcs, p), dtype)
+            DPh_T_sh = T.alloc_shared((p, fcs), dtype)
+            Psi_sh = T.alloc_shared((fcs, p), dtype)
+            Sts_sh = T.alloc_shared((n, p), dtype)
+            LKQ_sh = T.alloc_shared((fcs, fcs), dtype)
+            DKI_sh = T.alloc_shared((fcs, fcs), dtype)
+            DKI_T_sh = T.alloc_shared((fcs, fcs), dtype)
+
+            acc_dstates = T.alloc_fragment((n, p), "float32")
+            acc_dPsiV = T.alloc_fragment((fcs, p), "float32")
+            acc_lkq = T.alloc_fragment((fcs, fcs), "float32")
+            acc_dqkd = T.alloc_fragment((fcs, fcs), "float32")
+            acc_dk = T.alloc_fragment((fcs, n), "float32")
+            acc_dki = T.alloc_fragment((fcs, fcs), "float32")
+            acc_dki_T = T.alloc_fragment((fcs, fcs), "float32")
+            acc_dq = T.alloc_fragment((fcs, n), "float32")
+
+            T.clear(acc_dstates)
+            for chunk_rev in T.serial(0, nchunks):
+                chunk_idx = nchunks - 1 - chunk_rev
+                T.copy(K[chunk_idx, 0, 0], K_sh)
+                T.copy(K_T[chunk_idx, 0, 0], K_T_sh)
+                T.copy(Q[chunk_idx, 0, 0], Q_sh)
+                T.copy(Q_T[chunk_idx, 0, 0], Q_T_sh)
+                T.copy(Dst[chunk_idx, 0, 0], Dst_sh)
+                T.copy(DPh[chunk_idx, 0, 0], DPh_sh)
+                T.copy(DPh_T[chunk_idx, 0, 0], DPh_T_sh)
+                T.copy(Psi[chunk_idx, 0, 0], Psi_sh)
+                T.copy(Sts[chunk_idx, 0, 0], Sts_sh)
+
+                T.clear(acc_dPsiV)
+                T.clear(acc_lkq)
+                T.clear(acc_dqkd)
+                T.clear(acc_dk)
+                T.clear(acc_dki)
+                T.clear(acc_dki_T)
+                T.clear(acc_dq)
+
+                # GEMM1: dPsiV = K @ Dst.T
+                T.gemm(K_sh, Dst_sh, acc_dPsiV, False, True)
+                # GEMM2: lkq = K @ Q.T
+                T.gemm(K_sh, Q_sh, acc_lkq, False, True)
+                # GEMM4: dqkd = DPh @ Psi.T
+                T.gemm(DPh_sh, Psi_sh, acc_dqkd, False, True)
+                # GEMM5: dk = Psi @ Dst.T
+                T.gemm(Psi_sh, Dst_sh, acc_dk, False, True)
+                # GEMM6: dki = Psi @ DPh.T
+                T.gemm(Psi_sh, DPh_sh, acc_dki, False, True)
+                # GEMM6': dki_T = DPh @ Psi.T
+                T.gemm(DPh_sh, Psi_sh, acc_dki_T, False, True)
+                # GEMM8: dq = DPh @ Sts.T
+                T.gemm(DPh_sh, Sts_sh, acc_dq, False, True)
+                # GEMM10: loop-carried dstates += Q.T @ DPh
+                T.gemm(Q_T_sh, DPh_T_sh, acc_dstates, False, True)
+
+                for i, j in T.Parallel(fcs, fcs):
+                    LKQ_sh[i, j] = T.cast(acc_lkq[i, j], dtype)
+                    DKI_sh[i, j] = T.cast(acc_dki[i, j], dtype)
+                    DKI_T_sh[i, j] = T.cast(acc_dki_T[i, j], dtype)
+
+                # GEMM3: dPsiV += lkq @ DPh.T
+                T.gemm(LKQ_sh, DPh_sh, acc_dPsiV, False, True)
+                # GEMM7: dk += dki @ Q
+                T.gemm(DKI_sh, Q_T_sh, acc_dk, False, True)
+                # GEMM9: dq += dki.T @ K
+                T.gemm(DKI_T_sh, K_T_sh, acc_dq, False, True)
+
+                T.copy(acc_dPsiV, DPsiV[chunk_idx, 0, 0])
+                T.copy(acc_dk, DK[chunk_idx, 0, 0])
+                T.copy(acc_dq, DQ[chunk_idx, 0, 0])
+                T.copy(acc_dqkd, Dqkd[chunk_idx, 0, 0])
+
+            T.copy(acc_dstates, DstatesOut[0, 0])
+
+    return fused_bwd_bwd_p4_imported
 
 
 def _build_fa4_v1_fused3_gemm_tilelang_prim(

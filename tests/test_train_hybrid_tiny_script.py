@@ -516,6 +516,8 @@ def _assert_update_boundary_training_state(
             "tensors": [],
         },
         "gradient_accumulator_present": False,
+        "path_c_training_runtime_class": None,
+        "path_c_training_runtime_installed": False,
         "pending_microbatches": 0,
         "state": {
             "step": step,

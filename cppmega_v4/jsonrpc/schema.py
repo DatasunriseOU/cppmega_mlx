@@ -157,6 +157,20 @@ class OptimSpecPayload(BaseModel):
     groups: list[ParamGroupPayload]
 
 
+def _default_optim_payload() -> OptimSpecPayload:
+    return OptimSpecPayload(
+        kind="adamw",
+        groups=[
+            ParamGroupPayload(
+                matcher="all",
+                lr=1e-3,
+                weight_decay=0.01,
+                betas=(0.9, 0.95),
+            ),
+        ],
+    )
+
+
 class TopologyPayload(BaseModel):
     """How to instantiate a DeviceTopology — factory + kwargs."""
 
@@ -340,7 +354,7 @@ class VerifyParams(BaseModel):
     graph: GraphSpec
     dim_env: dict[str, int]
     loss: LossSpecPayload
-    optim: OptimSpecPayload
+    optim: OptimSpecPayload = Field(default_factory=_default_optim_payload)
     rewriters: list[RewriterPayload] = Field(default_factory=list)
     sharding: ShardingSpecPayload | None = None
     training: bool = True

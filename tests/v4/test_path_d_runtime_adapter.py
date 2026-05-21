@@ -193,15 +193,13 @@ def test_runtime_adapter_specializes_scale_and_static_t():
     assert prim.specialized == {"scale": 0.125, "T": 64}
 
 
-def test_kda_topology_policy_promotes_only_repeated_varlen_layout(monkeypatch):
+def test_kda_topology_policy_promotes_only_repeated_varlen_layout():
     from cppmega_v4._tilelang.path_d_runtime_adapter import (
-        KDA_TOPOLOGY_SPECIALIZATION_THRESHOLD_ENV,
         _kda_varlen_topology_key,
         _record_kda_topology_hit,
         _reset_kda_topology_cache_for_tests,
     )
 
-    monkeypatch.setenv(KDA_TOPOLOGY_SPECIALIZATION_THRESHOLD_ENV, "2")
     _reset_kda_topology_cache_for_tests()
     key = _kda_varlen_topology_key(
         cu_values=(0, 16, 64),
@@ -217,8 +215,8 @@ def test_kda_topology_policy_promotes_only_repeated_varlen_layout(monkeypatch):
         output_final_state=True,
     )
 
-    first = _record_kda_topology_hit(key)
-    second = _record_kda_topology_hit(key)
+    first = _record_kda_topology_hit(key, threshold=2)
+    second = _record_kda_topology_hit(key, threshold=2)
     other = _record_kda_topology_hit(
         _kda_varlen_topology_key(
             cu_values=(0, 32, 64),
@@ -232,7 +230,8 @@ def test_kda_topology_policy_promotes_only_repeated_varlen_layout(monkeypatch):
             scale=0.125,
             use_initial_state=True,
             output_final_state=True,
-        )
+        ),
+        threshold=2,
     )
 
     assert first.hits == 1
@@ -243,17 +242,13 @@ def test_kda_topology_policy_promotes_only_repeated_varlen_layout(monkeypatch):
     assert other.use_specialized is False
 
 
-def test_kda_topology_hit_cache_eviction_is_lru(monkeypatch):
+def test_kda_topology_hit_cache_eviction_is_lru():
     from cppmega_v4._tilelang.path_d_runtime_adapter import (
-        KDA_TOPOLOGY_SPECIALIZATION_MAX_ENTRIES_ENV,
-        KDA_TOPOLOGY_SPECIALIZATION_THRESHOLD_ENV,
         _kda_varlen_topology_key,
         _record_kda_topology_hit,
         _reset_kda_topology_cache_for_tests,
     )
 
-    monkeypatch.setenv(KDA_TOPOLOGY_SPECIALIZATION_MAX_ENTRIES_ENV, "2")
-    monkeypatch.setenv(KDA_TOPOLOGY_SPECIALIZATION_THRESHOLD_ENV, "10")
     _reset_kda_topology_cache_for_tests()
 
     def make_key(cu_values, chunk_offsets):
@@ -275,11 +270,13 @@ def test_kda_topology_hit_cache_eviction_is_lru(monkeypatch):
     key_b = make_key((0, 32, 64), (0, 1, 2))
     key_c = make_key((0, 8, 64), (0, 1, 3))
 
-    _record_kda_topology_hit(key_a)
-    _record_kda_topology_hit(key_b)
-    _record_kda_topology_hit(key_a)
-    _record_kda_topology_hit(key_c)
-    b_after_eviction = _record_kda_topology_hit(key_b)
+    _record_kda_topology_hit(key_a, threshold=10, max_entries=2)
+    _record_kda_topology_hit(key_b, threshold=10, max_entries=2)
+    _record_kda_topology_hit(key_a, threshold=10, max_entries=2)
+    _record_kda_topology_hit(key_c, threshold=10, max_entries=2)
+    b_after_eviction = _record_kda_topology_hit(
+        key_b, threshold=10, max_entries=2,
+    )
 
     assert b_after_eviction.hits == 1
 
@@ -347,14 +344,12 @@ def test_kda_topology_fingerprint_covers_specialization_contract():
     assert _kda_varlen_topology_fingerprint(changed) != fingerprint
 
 
-def test_kda_topology_disk_manifest_round_trips(tmp_path, monkeypatch):
+def test_kda_topology_disk_manifest_round_trips(tmp_path):
     from cppmega_v4._tilelang.path_d_runtime_adapter import (
-        KDA_TOPOLOGY_CACHE_DIR_ENV,
         _read_kda_topology_manifest,
         _write_kda_topology_manifest,
     )
 
-    monkeypatch.setenv(KDA_TOPOLOGY_CACHE_DIR_ENV, str(tmp_path))
     descriptor = {
         "total_tokens": 64,
         "num_sequences": 2,
@@ -375,8 +370,9 @@ def test_kda_topology_disk_manifest_round_trips(tmp_path, monkeypatch):
         descriptor=descriptor,
         status="compiled",
         stages=("token", "inter"),
+        cache_dir=str(tmp_path),
     )
-    payload = _read_kda_topology_manifest("a" * 64)
+    payload = _read_kda_topology_manifest("a" * 64, cache_dir=str(tmp_path))
 
     assert payload is not None
     assert payload["fingerprint"] == "a" * 64
@@ -385,13 +381,11 @@ def test_kda_topology_disk_manifest_round_trips(tmp_path, monkeypatch):
     assert payload["stages"] == ["token", "inter"]
 
 
-def test_kda_runtime_writes_manifest_for_promoted_topology(tmp_path, monkeypatch):
+def test_kda_runtime_writes_manifest_for_promoted_topology(tmp_path):
     import mlx.core as mx
 
     from cppmega_v4._tilelang import path_d_runtime_adapter as adapter
 
-    monkeypatch.setenv(adapter.KDA_TOPOLOGY_SPECIALIZATION_THRESHOLD_ENV, "1")
-    monkeypatch.setenv(adapter.KDA_TOPOLOGY_CACHE_DIR_ENV, str(tmp_path))
     adapter._reset_kda_topology_cache_for_tests()
     compile_topology_constants = []
 
@@ -414,9 +408,6 @@ def test_kda_runtime_writes_manifest_for_promoted_topology(tmp_path, monkeypatch
             for name in names
         )
 
-    monkeypatch.setattr(adapter, "_compile_kda_runtime_stages", fake_compile_stages)
-    monkeypatch.setattr(adapter, "_launch_stage", lambda _stage, *args: None)
-
     q = mx.zeros((1, 32, 1, 8), dtype=mx.float16)
     k = mx.zeros((1, 32, 1, 8), dtype=mx.float16)
     v = mx.zeros((1, 32, 1, 8), dtype=mx.float16)
@@ -434,6 +425,10 @@ def test_kda_runtime_writes_manifest_for_promoted_topology(tmp_path, monkeypatch
         cu_seqlens=cu_seqlens,
         initial_state=initial_state,
         output_final_state=True,
+        topology_specialization_threshold=1,
+        topology_cache_dir=str(tmp_path),
+        compile_stages_fn=fake_compile_stages,
+        launch_stage_fn=lambda _stage, *args: None,
     )
     manifests = list(tmp_path.glob("*.json"))
 

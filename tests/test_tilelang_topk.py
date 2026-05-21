@@ -296,7 +296,7 @@ def test_path_c_lowering_uses_single_merge_active_branch() -> None:
     threads = _path_c_threads_for(8)
     _, lowering = _path_c_kernel_for(1, 64, 8, threads, "float32")
     assert lowering.body.count("threadgroup_barrier") == 2
-    assert lowering.body.count("stride * 2") == 1
+    assert lowering.body.count("% (pos * 2)") == 1
 
 
 def test_path_c_debug_lowering_uses_dispatch_returned_msl_without_fast_kernel(

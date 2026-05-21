@@ -33,6 +33,7 @@ export interface ParamGroupState {
   lr: number;
   weight_decay: number;
   betas?: [number, number];
+  ns_steps?: number | null;
   schedule?: ScheduleSpecState;
 }
 

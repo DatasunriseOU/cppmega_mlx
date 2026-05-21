@@ -26,9 +26,9 @@ class PathStatus:
         return self.available
 
 
-def env_override(env_var: str) -> str | None:
-    """Read an env override (e.g., 'path_a', 'path_b', ...). None = auto."""
-    value = os.environ.get(env_var, "").strip().lower()
+def parse_path_override(value: str | None, *, env_var: str) -> PathName | None:
+    """Parse a path override value (e.g., 'path_a', 'path_b', ...). None = auto."""
+    value = (value or "").strip().lower()
     if not value or value == "auto":
         return None
     if value not in ("path_a", "path_b", "path_c", "path_d", "path_e"):
@@ -36,7 +36,12 @@ def env_override(env_var: str) -> str | None:
             f"unsupported {env_var}={value!r}; "
             "expected one of: path_a, path_b, path_c, path_d, path_e, auto"
         )
-    return value
+    return value  # type: ignore[return-value]
+
+
+def env_override(env_var: str) -> PathName | None:
+    """Read an env override. None means auto mode."""
+    return parse_path_override(os.environ.get(env_var), env_var=env_var)
 
 
 def auto_pick(

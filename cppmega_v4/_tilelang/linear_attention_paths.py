@@ -37,7 +37,7 @@ preference order (C > B > E > D > A).
 from __future__ import annotations
 
 import importlib
-import os
+from collections.abc import Mapping
 from typing import Callable
 
 import mlx.core as mx
@@ -49,6 +49,9 @@ from cppmega_v4.nn._external.fla_naive_gated_delta_rule import (
 
 ENV_VAR = "CPPMEGA_V4_KERNEL_PATH__LINEAR_ATTENTION"
 PathFn = Callable[..., tuple[mx.array, mx.array | None]]
+_VALID_PATHS: tuple[PathName, ...] = (
+    "path_a", "path_b", "path_c", "path_d", "path_e",
+)
 
 
 # --- Path A (always available) --------------------------------------------
@@ -90,9 +93,36 @@ def _path_b_status() -> PathStatus:
         )
 
 
-def _path_b_call(*args, **kwargs):
-    if not _path_b_status().available:
+def _fallback_or_raise(
+    path: PathName,
+    reason: str,
+    allow_fallback: bool,
+    *args,
+    **kwargs,
+):
+    if allow_fallback:
         return _path_a_call(*args, **kwargs)
+    raise RuntimeError(f"GDN {path} unavailable and fallback disabled: {reason}")
+
+
+def _dispatch_failure_or_fallback(
+    path: PathName,
+    exc: Exception,
+    allow_fallback: bool,
+    *args,
+    **kwargs,
+):
+    if allow_fallback:
+        return _path_a_call(*args, **kwargs)
+    raise RuntimeError(f"GDN {path} dispatch failed and fallback disabled: {exc}") from exc
+
+
+def _path_b_call(*args, allow_fallback: bool = True, **kwargs):
+    status = _path_b_status()
+    if not status.available:
+        return _fallback_or_raise(
+            "path_b", status.reason, allow_fallback, *args, **kwargs,
+        )
     mod = importlib.import_module("cppmega_v4._tilelang.linear_attention_path_b")
     return mod.gdn_forward_path_b(*args, **kwargs)
 
@@ -120,17 +150,22 @@ def _path_c_status() -> PathStatus:
     )
 
 
-def _path_c_call(*args, **kwargs):
+def _path_c_call(*args, allow_fallback: bool = True, **kwargs):
     """Try Path C; fall back to Path A on any error (compile, runtime, missing infra)."""
-    if not _path_c_status().available:
-        return _path_a_call(*args, **kwargs)
+    status = _path_c_status()
+    if not status.available:
+        return _fallback_or_raise(
+            "path_c", status.reason, allow_fallback, *args, **kwargs,
+        )
     try:
         from cppmega_v4._tilelang.linear_attention_path_c import (
             _gdn_fwd_path_c_call,
         )
         return _gdn_fwd_path_c_call(*args, **kwargs)
-    except Exception:
-        return _path_a_call(*args, **kwargs)
+    except Exception as exc:
+        return _dispatch_failure_or_fallback(
+            "path_c", exc, allow_fallback, *args, **kwargs,
+        )
 
 
 # --- Path D (Triton frontend) ---------------------------------------------
@@ -156,16 +191,21 @@ def _path_d_status() -> PathStatus:
     )
 
 
-def _path_d_call(*args, **kwargs):
-    if not _path_d_status().available:
-        return _path_a_call(*args, **kwargs)
+def _path_d_call(*args, allow_fallback: bool = True, **kwargs):
+    status = _path_d_status()
+    if not status.available:
+        return _fallback_or_raise(
+            "path_d", status.reason, allow_fallback, *args, **kwargs,
+        )
     try:
         from cppmega_v4._tilelang.linear_attention_path_d import (
             _gdn_fwd_path_d_call,
         )
         return _gdn_fwd_path_d_call(*args, **kwargs)
-    except Exception:
-        return _path_a_call(*args, **kwargs)
+    except Exception as exc:
+        return _dispatch_failure_or_fallback(
+            "path_d", exc, allow_fallback, *args, **kwargs,
+        )
 
 
 # --- Path E (vendored mlx-lm PR #1217) ------------------------------------
@@ -195,39 +235,81 @@ def _path_e_status() -> PathStatus:
         )
 
 
-def _path_e_call(*args, **kwargs):
-    if not _path_e_status().available:
-        return _path_a_call(*args, **kwargs)
-    op = importlib.import_module("cppmega_v4.nn._external.mlx_lm_gated_delta_update")
-    return op.gated_delta_update(*args, **kwargs)
+def _path_e_call(*args, allow_fallback: bool = True, **kwargs):
+    status = _path_e_status()
+    if not status.available:
+        return _fallback_or_raise(
+            "path_e", status.reason, allow_fallback, *args, **kwargs,
+        )
+    try:
+        op = importlib.import_module(
+            "cppmega_v4.nn._external.mlx_lm_gated_delta_update"
+        )
+        return op.gated_delta_update(*args, **kwargs)
+    except Exception as exc:
+        return _dispatch_failure_or_fallback(
+            "path_e", exc, allow_fallback, *args, **kwargs,
+        )
 
 
 # --- Public dispatch ------------------------------------------------------
 
 
-def linear_attention_path_statuses() -> dict[PathName, PathStatus]:
-    return {
+def linear_attention_path_statuses(
+    status_overrides: Mapping[PathName, PathStatus] | None = None,
+) -> dict[PathName, PathStatus]:
+    statuses = {
         "path_a": _path_a_status(),
         "path_b": _path_b_status(),
         "path_c": _path_c_status(),
         "path_d": _path_d_status(),
         "path_e": _path_e_status(),
     }
+    if status_overrides:
+        for path, status in status_overrides.items():
+            if path not in _VALID_PATHS:
+                raise ValueError(f"unsupported GDN path override: {path!r}")
+            if status.path != path:
+                raise ValueError(
+                    f"GDN status override key {path!r} does not match "
+                    f"status.path {status.path!r}"
+                )
+            statuses[path] = status
+    return statuses
 
 
-def linear_attention_auto_mode_for_inputs(*, env_var: str = ENV_VAR) -> PathName:
+def linear_attention_auto_mode_for_inputs(
+    *,
+    env_var: str = ENV_VAR,
+    status_overrides: Mapping[PathName, PathStatus] | None = None,
+) -> PathName:
     forced = env_override(env_var)
     if forced is not None:
-        return forced  # type: ignore[return-value]
-    return auto_pick(linear_attention_path_statuses())
+        return forced
+    return auto_pick(linear_attention_path_statuses(status_overrides=status_overrides))
 
 
-def gated_delta_recurrent_dispatch(*args, **kwargs):
+def gated_delta_recurrent_dispatch(
+    *args,
+    path: PathName | None = None,
+    allow_fallback: bool = True,
+    status_overrides: Mapping[PathName, PathStatus] | None = None,
+    **kwargs,
+):
     """Call the auto-selected GDN backend, falling back to Path A.
 
     Same callable signature as ``naive_recurrent_gated_delta_rule``.
     """
-    path = linear_attention_auto_mode_for_inputs()
+    statuses = linear_attention_path_statuses(status_overrides=status_overrides)
+    if path is None:
+        path = linear_attention_auto_mode_for_inputs(status_overrides=status_overrides)
+    if path not in _VALID_PATHS:
+        raise ValueError(f"unsupported GDN path {path!r}")
+    status = statuses[path]
+    if path != "path_a" and not status.available:
+        return _fallback_or_raise(
+            path, status.reason, allow_fallback, *args, **kwargs,
+        )
     fn: PathFn = {
         "path_a": _path_a_call,
         "path_b": _path_b_call,
@@ -235,7 +317,9 @@ def gated_delta_recurrent_dispatch(*args, **kwargs):
         "path_d": _path_d_call,
         "path_e": _path_e_call,
     }[path]
-    return fn(*args, **kwargs)
+    if path == "path_a":
+        return fn(*args, **kwargs)
+    return fn(*args, allow_fallback=allow_fallback, **kwargs)
 
 
 __all__ = [

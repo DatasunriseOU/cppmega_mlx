@@ -24,8 +24,8 @@ from cppmega_v4._tilelang.linear_attention_path_c import (
     _path_c_runtime_status,
     _tilelang_importable,
 )
+from cppmega_v4._tilelang._dispatch import PathStatus
 from cppmega_v4._tilelang.linear_attention_paths import (
-    ENV_VAR as GDN_ENV,
     _path_c_status,
     gated_delta_recurrent_dispatch,
 )
@@ -56,33 +56,25 @@ def test_path_c_runtime_status_matches_dispatch_status():
     assert reason in st.reason
 
 
-def test_path_c_forced_via_env_returns_valid_output(monkeypatch):
+def test_path_c_forced_returns_valid_output():
     """Forcing path_c must always produce a valid output (real or fallback)."""
-    monkeypatch.setenv(GDN_ENV, "path_c")
     B, T, H, K, V = 1, 4, 2, 32, 32
     q = mx.random.normal((B, T, H, K))
     k = mx.random.normal((B, T, H, K))
     v = mx.random.normal((B, T, H, V))
     beta = mx.sigmoid(mx.random.normal((B, T, H)))
     g = -mx.abs(mx.random.normal((B, T, H)) * 0.1)
-    o, _ = gated_delta_recurrent_dispatch(q, k, v, beta, g)
+    o, _ = gated_delta_recurrent_dispatch(q, k, v, beta, g, path="path_c")
     assert o.shape == (B, T, H, V)
     assert not bool(mx.any(mx.isnan(o)).item())
 
 
-def test_path_c_fallback_matches_path_a_when_unavailable(monkeypatch):
+def test_path_c_fallback_matches_path_a_when_unavailable():
     """When the real kernel isn't available, dispatch must equal Path A bit-for-bit.
 
-    Runs unconditionally: if tilelang is reachable, we force the runtime status
-    to ``unavailable`` so the dispatcher exercises the Path A fallback either way.
+    Runs unconditionally: if tilelang is reachable, explicit status overrides
+    force the dispatcher through the Path A fallback without runtime patching.
     """
-    monkeypatch.setenv(GDN_ENV, "path_c")
-    from cppmega_v4._tilelang import linear_attention_path_c as path_c_mod
-    monkeypatch.setattr(
-        path_c_mod,
-        "_path_c_runtime_status",
-        lambda: (False, "forced unavailable for fallback parity test"),
-    )
     B, T, H, K, V = 1, 5, 2, 8, 8
     rng = np.random.default_rng(7)
     q = mx.array(rng.standard_normal((B, T, H, K)).astype(np.float32))
@@ -90,7 +82,19 @@ def test_path_c_fallback_matches_path_a_when_unavailable(monkeypatch):
     v = mx.array(rng.standard_normal((B, T, H, V)).astype(np.float32))
     beta = mx.array(rng.uniform(0.1, 0.9, (B, T, H)).astype(np.float32))
     g = mx.array(-rng.uniform(0.01, 0.5, (B, T, H)).astype(np.float32))
-    o_disp, _ = gated_delta_recurrent_dispatch(q, k, v, beta, g)
+    o_disp, _ = gated_delta_recurrent_dispatch(
+        q,
+        k,
+        v,
+        beta,
+        g,
+        path="path_c",
+        status_overrides={
+            "path_c": PathStatus(
+                "path_c", False, "forced unavailable for fallback parity test"
+            )
+        },
+    )
     o_ref, _ = naive_recurrent_gated_delta_rule(q, k, v, beta, g)
     np.testing.assert_array_equal(np.array(o_disp), np.array(o_ref))
 

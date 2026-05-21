@@ -46,6 +46,7 @@ def test_kind_is_no_longer_passthrough(kind):
 def test_gdn_block_builds_and_runs():
     sb = _mk([BlockSpec(kind="gdn", repeat=1, params={
         "num_heads": 4, "head_dim": 16, "use_short_conv": False,
+        "kernel_path": "path_a",
     })])
     tok, h = _inputs()
     out = sb(tok, h)
@@ -58,6 +59,7 @@ def test_gdn_block_threads_doc_ids():
     o_proj (zero-init at construction) so the doc-reset effect is observable."""
     sb = _mk([BlockSpec(kind="gdn", repeat=1, params={
         "num_heads": 4, "head_dim": 16, "use_short_conv": False,
+        "kernel_path": "path_a",
     })])
     # Perturb o_proj so block contributes a non-zero delta (default is identity).
     gdn = sb.blocks[0].module
@@ -84,6 +86,7 @@ def test_gdn_block_threads_doc_ids():
 def test_kda_block_builds_and_runs():
     sb = _mk([BlockSpec(kind="kda", repeat=1, params={
         "num_heads": 4, "head_dim": 16, "use_short_conv": False,
+        "kernel_path": "path_a",
     })])
     tok, h = _inputs()
     out = sb(tok, h)
@@ -168,9 +171,11 @@ def test_full_v4_stack_runs_end_to_end():
             }),
             BlockSpec(kind="gdn", repeat=1, params={
                 "num_heads": 4, "head_dim": 32, "use_short_conv": False,
+                "kernel_path": "path_a",
             }),
             BlockSpec(kind="kda", repeat=1, params={
                 "num_heads": 4, "head_dim": 32, "use_short_conv": False,
+                "kernel_path": "path_a",
             }),
             BlockSpec(kind="attention", repeat=1, params={
                 "num_heads": 4, "head_dim": 32,
@@ -214,6 +219,7 @@ def test_full_v4_stack_grads_propagate():
         blocks=[
             BlockSpec(kind="gdn", repeat=1, params={
                 "num_heads": 4, "head_dim": 16, "use_short_conv": False,
+                "kernel_path": "path_a",
             }),
             BlockSpec(kind="attention", repeat=1, params={
                 "num_heads": 4, "head_dim": 16,

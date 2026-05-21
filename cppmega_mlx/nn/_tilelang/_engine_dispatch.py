@@ -95,11 +95,19 @@ def _engine_compile(
         compile_target = _as_metal_target(target)
 
     pass_context = _with_pass_context(pass_configs)
-    if pass_context is None:
-        artifact = tilelang.compile(prim_func, target=compile_target, out_idx=None)
-    else:
-        with pass_context:
+    try:
+        if pass_context is None:
             artifact = tilelang.compile(prim_func, target=compile_target, out_idx=None)
+        else:
+            with pass_context:
+                artifact = tilelang.compile(prim_func, target=compile_target, out_idx=None)
+    except ValueError as exc:
+        message = str(exc)
+        if "Cannot find global function target.build.tilelang_" in message:
+            raise RuntimeError(
+                f"TileLang backend for target {target!r} is unavailable: {message}"
+            ) from exc
+        raise
     try:
         setattr(artifact, "_tilelang_engine_target", target)
     except (AttributeError, TypeError):

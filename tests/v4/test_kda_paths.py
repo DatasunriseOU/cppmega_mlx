@@ -9,7 +9,6 @@ import pytest
 from cppmega_v4._tilelang.kda_path_b import kda_forward_path_b
 from cppmega_v4._tilelang.kda_path_c import (
     _path_c_runtime_status as kda_path_c_runtime,
-    _tilelang_importable as kda_tilelang_importable,
 )
 from cppmega_v4._tilelang.kda_path_d import (
     _fla_kda_chunk_importable,
@@ -17,8 +16,8 @@ from cppmega_v4._tilelang.kda_path_d import (
     _triton_frontend_importable,
     _try_lower_fla_kda_kernel,
 )
+from cppmega_v4._tilelang._dispatch import PathStatus
 from cppmega_v4._tilelang.kda_paths import (
-    ENV_VAR as KDA_ENV,
     _path_b_status,
     _path_c_status,
     _path_d_status,
@@ -124,15 +123,14 @@ def test_kda_path_b_custom_scale_parity():
     np.testing.assert_allclose(np.array(o_b), np.array(o_a), atol=1e-4, rtol=1e-4)
 
 
-def test_kda_path_b_dispatch(monkeypatch):
-    monkeypatch.setenv(KDA_ENV, "path_b")
+def test_kda_path_b_dispatch():
     B, T, H, HV, K, V = 1, 4, 2, 4, 8, 8
     q = mx.random.normal((B, T, H, K))
     k = mx.random.normal((B, T, H, K))
     v = mx.random.normal((B, T, HV, V))
     g = -mx.abs(mx.random.normal((B, T, HV, K)) * 0.1)
     beta = mx.sigmoid(mx.random.normal((B, T, HV)))
-    o, _ = kda_recurrent_dispatch(q, k, v, g, beta)
+    o, _ = kda_recurrent_dispatch(q, k, v, g, beta, path="path_b")
     assert o.shape == (B, T, HV, V)
     assert not bool(mx.any(mx.isnan(o)).item())
 
@@ -158,29 +156,20 @@ def test_kda_path_c_runtime_matches_dispatch_status():
     assert reason in st.reason
 
 
-def test_kda_path_c_forced_via_env_returns_valid_output(monkeypatch):
-    monkeypatch.setenv(KDA_ENV, "path_c")
+def test_kda_path_c_forced_returns_valid_output():
     B, T, H, HV, K, V = 1, 4, 2, 4, 8, 8
     q = mx.random.normal((B, T, H, K))
     k = mx.random.normal((B, T, H, K))
     v = mx.random.normal((B, T, HV, V))
     g = -mx.abs(mx.random.normal((B, T, HV, K)) * 0.1)
     beta = mx.sigmoid(mx.random.normal((B, T, HV)))
-    o, _ = kda_recurrent_dispatch(q, k, v, g, beta)
+    o, _ = kda_recurrent_dispatch(q, k, v, g, beta, path="path_c")
     assert o.shape == (B, T, HV, V)
     assert not bool(mx.any(mx.isnan(o)).item())
 
 
-def test_kda_path_c_fallback_matches_path_a(monkeypatch):
-    """Path C fallback parity. Always runs: if tilelang is reachable, we force
-    the runtime status to ``unavailable`` so the dispatcher exercises Path A."""
-    monkeypatch.setenv(KDA_ENV, "path_c")
-    from cppmega_v4._tilelang import kda_path_c as kda_path_c_mod
-    monkeypatch.setattr(
-        kda_path_c_mod,
-        "_path_c_runtime_status",
-        lambda: (False, "forced unavailable for fallback parity test"),
-    )
+def test_kda_path_c_fallback_matches_path_a():
+    """Path C fallback parity uses an explicit status seam, not patching."""
     B, T, H, HV, K, V = 1, 4, 2, 4, 6, 6
     rng = np.random.default_rng(41)
     q = mx.array(rng.standard_normal((B, T, H, K)).astype(np.float32))
@@ -188,7 +177,21 @@ def test_kda_path_c_fallback_matches_path_a(monkeypatch):
     v = mx.array(rng.standard_normal((B, T, HV, V)).astype(np.float32))
     g = mx.array(-rng.uniform(0.01, 0.2, (B, T, HV, K)).astype(np.float32))
     beta = mx.array(rng.uniform(0.1, 0.9, (B, T, HV)).astype(np.float32))
-    o_disp, _ = kda_recurrent_dispatch(q, k, v, g, beta)
+    o_disp, _ = kda_recurrent_dispatch(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        path="path_c",
+        status_overrides={
+            "path_c": PathStatus(
+                path="path_c",
+                available=False,
+                reason="forced unavailable for fallback parity test",
+            )
+        },
+    )
     o_ref, _ = naive_recurrent_kda(q, k, v, g, beta)
     np.testing.assert_array_equal(np.array(o_disp), np.array(o_ref))
 
@@ -220,33 +223,25 @@ def test_kda_path_d_probes_return_tuples():
     assert isinstance(ok_src, bool) and r_src
 
 
-def test_kda_path_d_forced_falls_back_cleanly(monkeypatch):
-    monkeypatch.setenv(KDA_ENV, "path_d")
+def test_kda_path_d_forced_falls_back_cleanly():
     B, T, H, HV, K, V = 1, 4, 2, 4, 8, 8
     q = mx.random.normal((B, T, H, K))
     k = mx.random.normal((B, T, H, K))
     v = mx.random.normal((B, T, HV, V))
     g = -mx.abs(mx.random.normal((B, T, HV, K)) * 0.1)
     beta = mx.sigmoid(mx.random.normal((B, T, HV)))
-    o, _ = kda_recurrent_dispatch(q, k, v, g, beta)
+    o, _ = kda_recurrent_dispatch(q, k, v, g, beta, path="path_d")
     assert o.shape == (B, T, HV, V)
     assert not bool(mx.any(mx.isnan(o)).item())
 
 
-def test_kda_path_d_forced_fixed_prefill_uses_runtime_adapter(monkeypatch):
+def test_kda_path_d_forced_fixed_prefill_uses_runtime_adapter():
     pytest.importorskip("tilelang")
     ok, reason = kda_path_d_runtime()
     if not ok:
         pytest.skip(reason)
 
     from cppmega_v4._tilelang import kda_paths as kda_paths_mod
-
-    monkeypatch.setenv(KDA_ENV, "path_d")
-
-    def fail_path_a(*args, **kwargs):
-        raise AssertionError("Path D fixed prefill unexpectedly fell back to Path A")
-
-    monkeypatch.setattr(kda_paths_mod, "_path_a_call", fail_path_a)
 
     q = mx.zeros((1, 64, 1, 64), dtype=mx.float16)
     k = mx.zeros((1, 64, 1, 64), dtype=mx.float16)
@@ -260,6 +255,8 @@ def test_kda_path_d_forced_fixed_prefill_uses_runtime_adapter(monkeypatch):
         v,
         g,
         beta,
+        path="path_d",
+        allow_fallback=False,
         output_final_state=True,
     )
     mx.eval(y, final_state)
@@ -270,20 +267,13 @@ def test_kda_path_d_forced_fixed_prefill_uses_runtime_adapter(monkeypatch):
     assert final_state.shape == (1, 1, 64, 32)
 
 
-def test_kda_path_d_forced_varlen_uses_runtime_adapter(monkeypatch):
+def test_kda_path_d_forced_varlen_uses_runtime_adapter():
     pytest.importorskip("tilelang")
     ok, reason = kda_path_d_runtime()
     if not ok:
         pytest.skip(reason)
 
     from cppmega_v4._tilelang import kda_paths as kda_paths_mod
-
-    monkeypatch.setenv(KDA_ENV, "path_d")
-
-    def fail_path_a(*args, **kwargs):
-        raise AssertionError("Path D varlen unexpectedly fell back to Path A")
-
-    monkeypatch.setattr(kda_paths_mod, "_path_a_call", fail_path_a)
 
     q = mx.zeros((1, 64, 1, 64), dtype=mx.float16)
     k = mx.zeros((1, 64, 1, 64), dtype=mx.float16)
@@ -299,6 +289,8 @@ def test_kda_path_d_forced_varlen_uses_runtime_adapter(monkeypatch):
         v,
         g,
         beta,
+        path="path_d",
+        allow_fallback=False,
         cu_seqlens=cu_seqlens,
         initial_state=h0,
         output_final_state=True,
@@ -368,8 +360,7 @@ def test_kda_path_e_parity_ops_fallback():
     np.testing.assert_allclose(np.array(o_e), np.array(o_a), atol=1e-4, rtol=1e-4)
 
 
-def test_kda_path_e_forced_via_env(monkeypatch):
-    monkeypatch.setenv(KDA_ENV, "path_e")
+def test_kda_path_e_forced():
     B, T, H, HV, K, V = 1, 4, 2, 4, 32, 32
     rng = np.random.default_rng(141)
     q = mx.array(rng.standard_normal((B, T, H, K)).astype(np.float32))
@@ -377,7 +368,7 @@ def test_kda_path_e_forced_via_env(monkeypatch):
     v = mx.array(rng.standard_normal((B, T, HV, V)).astype(np.float32))
     g = mx.array(-rng.uniform(0.01, 0.2, (B, T, HV, K)).astype(np.float32))
     beta = mx.array(rng.uniform(0.1, 0.9, (B, T, HV)).astype(np.float32))
-    o, _ = kda_recurrent_dispatch(q, k, v, g, beta)
+    o, _ = kda_recurrent_dispatch(q, k, v, g, beta, path="path_e")
     assert o.shape == (B, T, HV, V)
     assert not bool(mx.any(mx.isnan(o)).item())
 

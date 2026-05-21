@@ -27,6 +27,9 @@ Test policy
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+import subprocess
 import sys
 import textwrap
 import types
@@ -42,6 +45,7 @@ triton = pytest.importorskip("triton")
 import triton.language as tl  # noqa: E402  - depends on importorskip above
 
 from cppmega_mlx.nn._triton_bridge import (  # noqa: E402
+    TRITON_FRONTEND_PATH_ENV,
     TritonBridgeError,
     frontend_available,
     triton_to_tilelang_prim,
@@ -129,6 +133,64 @@ def test_bridge_module_imports():
     assert hasattr(bridge, "triton_to_tilelang_compile")
     assert hasattr(bridge, "TritonBridgeError")
     assert hasattr(bridge, "frontend_available")
+
+
+def test_bridge_passes_triton_jit_function_to_frontend(tmp_path):
+    """Bridge must preserve Triton's JITFunction wrapper for TTIR capture."""
+
+    fake_frontend = tmp_path / "poc" / "triton_frontend"
+    fake_frontend.mkdir(parents=True)
+    (tmp_path / "poc" / "__init__.py").write_text("")
+    (fake_frontend / "__init__.py").write_text(
+        textwrap.dedent(
+            """
+            class _FakePrim:
+                body = object()
+
+                def with_attr(self, *args, **kwargs):
+                    return self
+
+            def from_triton_kernel(fn, **kwargs):
+                if not hasattr(fn, "fn"):
+                    raise AssertionError(
+                        f"expected Triton JITFunction wrapper, got {type(fn).__name__}"
+                    )
+                return _FakePrim()
+            """
+        )
+    )
+
+    script = textwrap.dedent(
+        """
+        import triton
+        import triton.language as tl
+        from cppmega_mlx.nn._triton_bridge import triton_to_tilelang_prim
+
+        @triton.jit
+        def _identity_kernel(x_ptr, BLOCK: tl.constexpr):
+            return
+
+        prim = triton_to_tilelang_prim(
+            _identity_kernel,
+            constexprs={"BLOCK": 1},
+        )
+        assert hasattr(prim, "body")
+        """
+    )
+    env = {
+        **os.environ,
+        TRITON_FRONTEND_PATH_ENV: str(tmp_path),
+    }
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr + result.stdout
 
 
 def test_bridge_lowering_smoke():

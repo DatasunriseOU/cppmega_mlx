@@ -1923,6 +1923,188 @@ def _canonicalize_sparse_mla_shmem_aliases(
     return msl
 
 
+def _drop_dead_stride_declaration(msl: str) -> str:
+    """Remove scalar stride temps once reductions own stride in the loop header."""
+
+    if re.search(r"(?m)^[ \t]*stride = ", msl) is not None:
+        return msl
+    msl = re.sub(r"(?m)^[ \t]*(?:int|uint) stride;\n", "", msl)
+    return msl
+
+
+def _canonicalize_fwd_named_shared_hot_loops(msl: str, *, qk_dim: int) -> str:
+    """Canonicalize forward hot loops after packed shared memory is renamed."""
+
+    msl = re.sub(
+        rf"(?P<indent>    )if \(gather_idx < 0\) \{{\n"
+        r"(?P=indent)  scores\[k\] = -INFINITY;\n"
+        r"(?P=indent)\} else \{\n"
+        r"(?P=indent)  acc = 0\.000000e\+00f;\n"
+        r"(?P<body>.*?"
+        rf"for \(uint d = 0; d < {qk_dim}; \+\+d\) \{{.*?\n"
+        r"(?P=indent)  \}\n"
+        r"(?P=indent)  scores\[k\] = \(acc \* sm_scale\);\n)"
+        r"(?P=indent)\}",
+        (
+            r"\g<indent>if (gather_idx < 0) {\n"
+            r"\g<indent>  scores[k] = -INFINITY;\n"
+            r"\g<indent>  continue;\n"
+            r"\g<indent>}\n"
+            r"\g<indent>acc = 0.000000e+00f;\n"
+            r"\g<body>"
+        ),
+        msl,
+        count=1,
+        flags=re.DOTALL,
+    )
+    return msl.replace("scores[k] = (acc * sm_scale);", "scores[k] = acc * sm_scale;")
+
+
+def _canonicalize_bwd_named_shared_hot_loops(
+    msl: str,
+    *,
+    topk: int,
+    qk_dim: int,
+    d_v: int,
+) -> str:
+    """Canonicalize backward hot loops after packed shared memory is renamed."""
+
+    msl = re.sub(
+        rf"(?P<indent>    )if \(gather_idx < 0\) \{{\n"
+        r"(?P=indent)  scores\[k\] = 0\.000000e\+00f;\n"
+        r"(?P=indent)\} else \{\n"
+        r"(?P=indent)  acc = 0\.000000e\+00f;\n"
+        r"(?P=indent)  uint kv_row_base = (?P<base>[^\n]+);\n"
+        rf"(?P=indent)  for \(uint d_1 = 0; d_1 < {d_v}; \+\+d_1\) \{{\n"
+        r"(?P=indent)    acc = \(acc \+ \(\(\(float\)kv\[kv_row_base \+ d_1\]\) \* "
+        r"\(\(float\)d_out\[d_out_row \+ d_1\]\)\)\);\n"
+        r"(?P=indent)  \}\n"
+        r"(?P=indent)  scores\[k\] = acc;\n"
+        r"(?P=indent)\}",
+        (
+            r"\g<indent>if (gather_idx < 0) {\n"
+            r"\g<indent>  dp[k] = 0.000000e+00f;\n"
+            r"\g<indent>  continue;\n"
+            r"\g<indent>}\n"
+            r"\g<indent>uint kv_row_base = \g<base>;\n"
+            r"\g<indent>float acc = 0.0f;\n"
+            f"\\g<indent>for (uint d = 0; d < {d_v}; ++d) {{\n"
+            r"\g<indent>  float v = float(kv[kv_row_base + d]);\n"
+            r"\g<indent>  float dod = float(d_out[d_out_row + d]);\n"
+            r"\g<indent>  acc += v * dod;\n"
+            r"\g<indent>}\n"
+            r"\g<indent>dp[k] = acc;"
+        ),
+        msl,
+        count=1,
+    )
+    msl = msl.replace(
+        "  local = -INFINITY;\n"
+        f"  for (uint k = tid; k < {topk}; k += threads) {{\n"
+        "    if (local < scores[k]) {\n"
+        "      local = scores[k];\n"
+        "    }\n"
+        "  }\n"
+        "  reduce_buf[tid] = local;",
+        "  float local_max = -INFINITY;\n"
+        f"  for (uint k = tid; k < {topk}; k += threads) {{\n"
+        "    float v = scores[k];\n"
+        "    if (v > local_max) local_max = v;\n"
+        "  }\n"
+        "  reduce_buf[tid] = local_max;",
+        1,
+    )
+    msl = msl.replace(
+        "  local = 0.000000e+00f;\n"
+        f"  for (uint k = tid; k < {topk}; k += threads) {{\n"
+        "    local = (local + p[k]);\n"
+        "  }\n"
+        "  reduce_buf[tid] = local;",
+        "  float local_sum = 0.0f;\n"
+        f"  for (uint k = tid; k < {topk}; k += threads) {{\n"
+        "    local_sum += p[k];\n"
+        "  }\n"
+        "  reduce_buf[tid] = local_sum;",
+        1,
+    )
+    msl = msl.replace(
+        "  local = 0.000000e+00f;\n"
+        f"  for (uint k = tid; k < {topk}; k += threads) {{\n"
+        "    local = (local + (p[k] * scores[k]));\n"
+        "  }\n"
+        "  reduce_buf[tid] = local;",
+        "  float local_rs = 0.0f;\n"
+        f"  for (uint k = tid; k < {topk}; k += threads) {{\n"
+        "    local_rs += p[k] * dp[k];\n"
+        "  }\n"
+        "  reduce_buf[tid] = local_rs;",
+        1,
+    )
+    msl = msl.replace(
+        "ds[k] = (p[k] * (scores[k] - rowsum));",
+        "ds[k] = p[k] * (dp[k] - rowsum);",
+    )
+    msl = re.sub(
+        rf"acc = \(\(sm_scale \* \(\(threadgroup float\*\)buf_shmem\)\[\(cse_v\d+ \+ {topk * 3}\)\]\) \* "
+        r"\(\(float\)q\[\(\(cse_v\d+ \+ cse_v\d+\) \+ tid\)\]\)\);",
+        "acc = sm_scale * ds[k] * float(q[q_row_base + d]);",
+        msl,
+        count=1,
+    )
+    msl = re.sub(
+        rf"acc = \(acc \+ \(\(\(threadgroup float\*\)buf_shmem\)\[\(cse_v\d+ \+ {topk * 2}\)\] \* "
+        r"\(\(float\)d_out\[\(\(cse_v\d+ \+ cse_v\d+\) \+ tid\)\]\)\)\);",
+        "acc += p[k] * float(d_out[d_out_row + d]);",
+        msl,
+        count=1,
+    )
+    msl = re.sub(
+        r"tl::AtomicAdd\(\(&\(dkv\[[^\n]+\]\)\), acc, 0\);",
+        "tl::AtomicAdd((&(dkv[kv_row_base + d])), acc, 0);",
+        msl,
+        count=1,
+    )
+    msl = re.sub(
+        rf"for \(uint kd = tid; kd < {topk * qk_dim}; kd \+= threads\) \{{\n"
+        rf"    int gather_idx = indices\[\(idx_base \+ \(kd / {qk_dim}\)\)\];",
+        (
+            rf"for (uint kd = tid; kd < {topk * qk_dim}; kd += threads) {{\n"
+            f"    uint k = kd / {qk_dim};\n"
+            f"    uint d = kd % {qk_dim};\n"
+            "    int gather_idx = indices[idx_base + k];"
+        ),
+        msl,
+        count=1,
+    )
+    msl = msl.replace(
+        f"((threadgroup float*)buf_shmem)[((kd / {qk_dim}) + {topk * 3})]",
+        "ds[k]",
+    )
+    msl = msl.replace(
+        f"((threadgroup float*)buf_shmem)[((kd / {qk_dim}) + {topk * 2})]",
+        "p[k]",
+    )
+    msl = msl.replace("q[q_row_base + tid]", "q[q_row_base + d]")
+    msl = msl.replace("d_out[d_out_row + tid]", "d_out[d_out_row + d]")
+    msl = msl.replace(
+        "acc = sm_scale * ds[k] * float(q[q_row_base + d]);",
+        "float qv = float(q[q_row_base + d]);\n      acc = sm_scale * ds[k] * qv;",
+    )
+    msl = msl.replace(
+        "acc = ((sm_scale * ds[k]) * ((float)q[q_row_base + d]));",
+        "float qv = float(q[q_row_base + d]);\n      acc = sm_scale * ds[k] * qv;",
+    )
+    msl = msl.replace(
+        "acc += p[k] * float(d_out[d_out_row + d]);",
+        "float dod = float(d_out[d_out_row + d]);\n      acc += p[k] * dod;",
+    )
+    msl = msl.replace(
+        "acc = (acc + (p[k] * ((float)d_out[d_out_row + d])));",
+        "float dod = float(d_out[d_out_row + d]);\n      acc += p[k] * dod;",
+    )
+    return msl
+
+
 def _postprocess_lowered_msl(
     msl: str,
     *,
@@ -2011,6 +2193,16 @@ def _postprocess_lowered_msl(
         )
         msl = _canonicalize_fwd_qk_negative_continue(msl)
         msl = _drop_unused_fwd_scalar_declarations(msl)
+        msl = _canonicalize_sparse_mla_shmem_aliases(
+            msl,
+            topk=topk,
+            threads=threads,
+            forward=True,
+        )
+        msl = _canonicalize_fwd_named_shared_hot_loops(msl, qk_dim=qk_dim)
+        msl = _canonicalize_fwd_reductions(msl, threads=threads)
+        msl = _canonicalize_fwd_unsigned_msl(msl)
+        msl = _drop_dead_stride_declaration(msl)
     if canonicalize_bwd:
         if topk is None or qk_dim is None or d_v is None or threads is None:
             raise ValueError("canonicalize_bwd requires topk, qk_dim, d_v, and threads")
@@ -2056,6 +2248,22 @@ def _postprocess_lowered_msl(
         msl = _canonicalize_bwd_path_b_hot_loops(msl, qk_dim=qk_dim, d_v=d_v, topk=topk)
         msl = _drop_unused_bwd_scalar_declarations(msl)
         msl = _canonicalize_bwd_path_b_layout(msl)
+        msl = _canonicalize_sparse_mla_shmem_aliases(
+            msl,
+            topk=topk,
+            threads=threads,
+            forward=False,
+        )
+        msl = _canonicalize_bwd_named_shared_hot_loops(
+            msl,
+            topk=topk,
+            qk_dim=qk_dim,
+            d_v=d_v,
+        )
+        msl = _canonicalize_bwd_reductions(msl, threads=threads)
+        msl = _canonicalize_bwd_unsigned_msl(msl)
+        msl = _drop_unused_bwd_scalar_declarations(msl)
+        msl = _drop_dead_stride_declaration(msl)
     return msl
 
 

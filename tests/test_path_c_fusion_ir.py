@@ -3391,6 +3391,47 @@ def test_mamba3_fp8_train_schedule_planner_uses_named_production_target() -> Non
     assert scheduled.plan.single_kernel_fused is False
 
 
+def test_mamba3_fp8_train_schedule_compile_helper_verifies_named_target() -> None:
+    from cppmega_mlx.runtime import path_c_fusion_schedules as schedules
+
+    compiled = schedules.compile_mamba3_fp8_train_fusion_schedule(
+        tilelang_lowerer=lambda *args, **kwargs: "compiled-named-mamba3"
+    )
+
+    assert isinstance(compiled.compiled, CompiledPathCRegion)
+    assert compiled.compiled.artifact == "compiled-named-mamba3"
+    assert compiled.region.name == "mamba3_m2rnn_attention_fp8_train_block"
+    assert compiled.schedule_spec.schedule_id == MAMBA3_FP8_TRAIN_FUSION_SCHEDULE_ID
+    assert compiled.schedule_spec.schedule_name == MAMBA3_FP8_TRAIN_FUSION_SCHEDULE_NAME
+    assert compiled.schedule_spec.real_abi_contract_complete is True
+    assert compiled.compiled.plan.single_kernel_fused is True
+    assert compiled.compiled.plan.schedule_contract is not None
+    assert compiled.compiled.plan.schedule_contract.status == "verified"
+    assert (
+        compiled.compiled.plan.schedule_contract.declared_schedule_id
+        == MAMBA3_FP8_TRAIN_FUSION_SCHEDULE_ID
+    )
+
+
+@pytest.mark.skipif(
+    os.environ.get("CPPMEGA_RUN_NATIVE_TILELANG_COMPILE_SMOKE") != "1",
+    reason=(
+        "native tilelang.compile smoke is opt-in because it loads the native "
+        "Triton frontend and should run only when explicitly requested"
+    ),
+)
+def test_mamba3_fp8_train_schedule_compile_helper_defaults_to_tilelang_lowerer() -> None:
+    from cppmega_mlx.runtime import path_c_fusion_schedules as schedules
+
+    compiled = schedules.compile_mamba3_fp8_train_fusion_schedule()
+
+    assert isinstance(compiled.compiled, CompiledPathCRegion)
+    assert type(compiled.compiled.artifact).__name__ == "JITKernel"
+    assert compiled.compiled.plan.single_kernel_fused is True
+    assert compiled.compiled.plan.schedule_contract is not None
+    assert compiled.compiled.plan.schedule_contract.status == "verified"
+
+
 def test_path_c_schedule_registry_selects_dynamic_descriptor_chain_by_default() -> None:
     region = build_mamba3_fp8_train_acceptance_fixture_region(include_backward=True)
     target = select_path_c_fusion_schedule_target(region)

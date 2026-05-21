@@ -682,6 +682,7 @@ def test_dsa_path_c_kv_cache_keeps_fp8_buffers_in_mlx_kv_cache(
     import cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c as fp8_path_c
 
     monkeypatch.setenv("CPPMEGA_KERNEL_PATH__SPARSE_MLA", "path_c")
+    monkeypatch.setenv("CPPMEGA_SPARSE_MLA_FP8_ROUTE", "path_c")
     cfg = AttentionConfig(
         d_model=16,
         num_q_heads=4,

@@ -34,6 +34,7 @@ GDN_FIXED_K = 64
 GDN_FIXED_V = 32
 GDN_FIXED_BT = 64
 GDN_FIXED_BV = 32
+GDN_METAL_SAFE_CHUNK_O_BT = 32
 GDN_FIXED_CHUNK_O_BV = 16
 KDA_FIXED_T = 64
 KDA_FIXED_H = 1
@@ -328,7 +329,9 @@ def _kda_varlen_topology_fingerprint(descriptor: dict[str, Any]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _kda_topology_cache_dir() -> str:
+def _kda_topology_cache_dir(cache_dir: Optional[str] = None) -> str:
+    if cache_dir:
+        return os.path.abspath(os.path.expanduser(cache_dir))
     override = os.environ.get(KDA_TOPOLOGY_CACHE_DIR_ENV)
     if override:
         return os.path.abspath(os.path.expanduser(override))
@@ -340,8 +343,11 @@ def _kda_topology_cache_dir() -> str:
     return os.path.join(root, "cppmega_kda_topologies")
 
 
-def _kda_topology_manifest_path(fingerprint: str) -> str:
-    return os.path.join(_kda_topology_cache_dir(), f"{fingerprint}.json")
+def _kda_topology_manifest_path(
+    fingerprint: str,
+    cache_dir: Optional[str] = None,
+) -> str:
+    return os.path.join(_kda_topology_cache_dir(cache_dir), f"{fingerprint}.json")
 
 
 def _write_kda_topology_manifest(
@@ -350,10 +356,11 @@ def _write_kda_topology_manifest(
     descriptor: dict[str, Any],
     status: str,
     stages: tuple[str, ...],
+    cache_dir: Optional[str] = None,
 ) -> None:
-    cache_dir = _kda_topology_cache_dir()
-    os.makedirs(cache_dir, exist_ok=True)
-    path = _kda_topology_manifest_path(fingerprint)
+    manifest_dir = _kda_topology_cache_dir(cache_dir)
+    os.makedirs(manifest_dir, exist_ok=True)
+    path = _kda_topology_manifest_path(fingerprint, cache_dir=manifest_dir)
     payload = {
         "version": KDA_TOPOLOGY_MANIFEST_VERSION,
         "fingerprint": str(fingerprint),
@@ -372,8 +379,11 @@ def _write_kda_topology_manifest(
     os.replace(temp_path, path)
 
 
-def _read_kda_topology_manifest(fingerprint: str) -> Optional[dict[str, Any]]:
-    path = _kda_topology_manifest_path(fingerprint)
+def _read_kda_topology_manifest(
+    fingerprint: str,
+    cache_dir: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    path = _kda_topology_manifest_path(fingerprint, cache_dir=cache_dir)
     try:
         with open(path, "r", encoding="utf-8") as file:
             payload = json.load(file)
@@ -424,11 +434,15 @@ def _kda_varlen_topology_key(
     )
 
 
-def _record_kda_topology_hit(key: tuple[Any, ...]) -> KDATopologyDecision:
-    threshold = max(
-        _env_int(KDA_TOPOLOGY_SPECIALIZATION_THRESHOLD_ENV, 3),
-        0,
-    )
+def _record_kda_topology_hit(
+    key: tuple[Any, ...],
+    *,
+    threshold: Optional[int] = None,
+    max_entries: Optional[int] = None,
+) -> KDATopologyDecision:
+    if threshold is None:
+        threshold = _env_int(KDA_TOPOLOGY_SPECIALIZATION_THRESHOLD_ENV, 3)
+    threshold = max(int(threshold), 0)
     if threshold <= 0:
         return KDATopologyDecision(
             key=key,
@@ -445,10 +459,9 @@ def _record_kda_topology_hit(key: tuple[Any, ...]) -> KDATopologyDecision:
             reason="topology specialization disabled after compile fallback",
         )
 
-    max_entries = max(
-        _env_int(KDA_TOPOLOGY_SPECIALIZATION_MAX_ENTRIES_ENV, 64),
-        1,
-    )
+    if max_entries is None:
+        max_entries = _env_int(KDA_TOPOLOGY_SPECIALIZATION_MAX_ENTRIES_ENV, 64)
+    max_entries = max(int(max_entries), 1)
     if key not in _KDA_TOPOLOGY_HITS and len(_KDA_TOPOLOGY_HITS) >= max_entries:
         oldest = next(iter(_KDA_TOPOLOGY_HITS))
         _KDA_TOPOLOGY_HITS.pop(oldest, None)
@@ -1044,16 +1057,23 @@ def compile_gdn_chunk_o_artifact(
     )
 
     cfg = dict(DEFAULT_CHUNK_O_CONSTEXPRS)
+    # The original FLA BT=64 chunk_o lowering needs 60 KiB of Metal
+    # threadgroup memory on Apple. Keep the standalone compile artifact on
+    # the smaller topology while the full GDN runtime remains explicitly
+    # pinned to the legacy BT=64 multi-stage contract below.
+    cfg["BT"] = GDN_METAL_SAFE_CHUNK_O_BT
     cfg["BV"] = GDN_FIXED_CHUNK_O_BV
     if constexprs:
         cfg.update(constexprs)
     if grid is None:
+        t = int(cfg.get("_RUNTIME_T", GDN_FIXED_T))
+        bt = int(cfg.get("BT", GDN_METAL_SAFE_CHUNK_O_BT))
         grid = (
             math.ceil(
                 int(cfg.get("V", GDN_FIXED_V))
                 / int(cfg.get("BV", GDN_FIXED_CHUNK_O_BV))
             ),
-            1,
+            math.ceil(t / bt),
             1,
         )
     return _compile_gdn_chunk_o_cached(
@@ -1514,7 +1534,7 @@ def _compile_gdn_runtime_stages(
             grid=chunk_v_grid,
         ),
         compile_gdn_chunk_o_artifact(
-            constexprs={"BV": GDN_FIXED_CHUNK_O_BV},
+            constexprs={"BT": GDN_FIXED_BT, "BV": GDN_FIXED_CHUNK_O_BV},
             grid=chunk_o_grid,
         ),
     )
@@ -1874,6 +1894,11 @@ def kda_fwd_runtime_call(
     chunk_indices: Any = None,
     chunk_offsets: Any = None,
     coverage_reason: str = "",
+    topology_specialization_threshold: Optional[int] = None,
+    topology_specialization_max_entries: Optional[int] = None,
+    topology_cache_dir: Optional[str] = None,
+    compile_stages_fn: Optional[Callable[..., Any]] = None,
+    launch_stage_fn: Optional[Callable[..., Any]] = None,
     **kwargs: Any,
 ) -> Any:
     """Launch the KDA Path D FLA multi-kernel pipeline."""
@@ -1885,6 +1910,13 @@ def kda_fwd_runtime_call(
         )
 
     import mlx.core as mx
+
+    compile_stages = (
+        _compile_kda_runtime_stages
+        if compile_stages_fn is None
+        else compile_stages_fn
+    )
+    launch_stage = _launch_stage if launch_stage_fn is None else launch_stage_fn
 
     q_shape = tuple(int(x) for x in getattr(q, "shape", ()))
     if len(q_shape) != 4:
@@ -1993,7 +2025,11 @@ def kda_fwd_runtime_call(
         )
         topology_fingerprint = _kda_varlen_topology_fingerprint(topology_descriptor)
         topology_key = ("kda_varlen_topology_v2", topology_fingerprint)
-        topology_decision = _record_kda_topology_hit(topology_key)
+        topology_decision = _record_kda_topology_hit(
+            topology_key,
+            threshold=topology_specialization_threshold,
+            max_entries=topology_specialization_max_entries,
+        )
         if topology_decision.use_specialized:
             topology_constants = {
                 "cu_seqlens": tuple(cu_values),
@@ -2015,9 +2051,9 @@ def kda_fwd_runtime_call(
         "use_initial_state": initial_state is not None,
         "output_final_state": bool(output_final_state),
     }
-    stages = _compile_kda_runtime_stages(**stage_kwargs)
+    stages = compile_stages(**stage_kwargs)
     if topology_constants is not None and all(stage.available for stage in stages):
-        specialized_stages = _compile_kda_runtime_stages(
+        specialized_stages = compile_stages(
             **stage_kwargs,
             topology_constants=topology_constants,
         )
@@ -2033,6 +2069,7 @@ def kda_fwd_runtime_call(
                             stage.plan.name if stage.plan is not None else "unknown"
                             for stage in stages
                         ),
+                        cache_dir=topology_cache_dir,
                     )
                 except OSError:
                     pass
@@ -2049,6 +2086,7 @@ def kda_fwd_runtime_call(
                             stage.plan.name if stage.plan is not None else "unknown"
                             for stage in specialized_stages
                         ),
+                        cache_dir=topology_cache_dir,
                     )
                 except OSError:
                     pass
@@ -2091,7 +2129,7 @@ def kda_fwd_runtime_call(
 
     aqk, akkd = _bind_returned_outputs(
         "kda.intra_token_parallel",
-        _launch_stage(
+        launch_stage(
             token,
             q_flat,
             k_flat,
@@ -2105,7 +2143,7 @@ def kda_fwd_runtime_call(
     )
     aqk, akk = _bind_returned_outputs(
         "kda.inter_solve",
-        _launch_stage(
+        launch_stage(
             inter,
             q_flat,
             k_flat,
@@ -2121,7 +2159,7 @@ def kda_fwd_runtime_call(
     )
     qg, kg, w, u = _bind_returned_outputs(
         "kda.recompute_w_u",
-        _launch_stage(
+        launch_stage(
             recompute,
             q_flat,
             k_flat,
@@ -2140,7 +2178,7 @@ def kda_fwd_runtime_call(
     )
     v_new, h = _bind_returned_outputs(
         "kda.chunk_delta_h",
-        _launch_stage(
+        launch_stage(
             chunk_h,
             kg,
             u,
@@ -2158,7 +2196,7 @@ def kda_fwd_runtime_call(
     )
     (o,) = _bind_returned_outputs(
         "kda.chunk_o_gk",
-        _launch_stage(
+        launch_stage(
             chunk_o,
             q_flat,
             v_new,

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Literal, Mapping
 
@@ -77,6 +78,18 @@ def introspect_tokenizer(source: str | Path) -> TokenizerCapabilities:
     path = Path(source)
     if not path.exists():
         raise FileNotFoundError(f"tokenizer source not found: {path}")
+    stat = path.stat()
+    return _introspect_tokenizer_cached(str(path), stat.st_mtime_ns, stat.st_size)
+
+
+@lru_cache(maxsize=16)
+def _introspect_tokenizer_cached(
+    path_str: str,
+    mtime_ns: int,
+    size_bytes: int,
+) -> TokenizerCapabilities:
+    del mtime_ns, size_bytes
+    path = Path(path_str)
     raw = json.loads(path.read_text())
 
     vocab = raw.get("model", {}).get("vocab", {}) or {}
@@ -113,7 +126,7 @@ def introspect_tokenizer(source: str | Path) -> TokenizerCapabilities:
         has_instruction="FIM_INSTRUCTION" in found,
         byte_roundtrip=byte_roundtrip,
         decoder_kind=decoder_kind,
-        source=str(path),
+        source=path_str,
     )
 
 

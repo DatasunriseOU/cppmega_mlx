@@ -70,8 +70,8 @@ __all__ = [
 #: Env var override: point at a different ``tl_poc_review`` checkout.
 TRITON_FRONTEND_PATH_ENV = "CPPMEGA_MLX_TRITON_FRONTEND_PATH"
 
-#: Default location of the POC frontend on dev hosts. Mirrors the path used
-#: in :mod:`cppmega_mlx.nn._tilelang._engine_dispatch`.
+#: Historical location of the POC frontend on dev hosts. Newer checkouts keep
+#: TileLang as a sibling of ``cppmega.mlx``.
 _DEFAULT_FRONTEND_ROOT = Path("/private/tmp/tl_poc_review")
 
 
@@ -90,13 +90,21 @@ def _frontend_root() -> Path:
     """Return the directory that contains the ``poc/triton_frontend`` package.
 
     Override via ``$CPPMEGA_MLX_TRITON_FRONTEND_PATH``. Falls back to the
-    standard dev path. We do NOT raise if it doesn't exist — callers go
-    through :func:`frontend_available` first.
+    standard dev path, then to a sibling ``../tilelang`` checkout. We do NOT
+    raise if no candidate exists — callers go through :func:`frontend_available`
+    first.
     """
 
     raw = os.environ.get(TRITON_FRONTEND_PATH_ENV)
     if raw:
         return Path(raw)
+    candidates = (
+        _DEFAULT_FRONTEND_ROOT,
+        Path(__file__).resolve().parents[3] / "tilelang",
+    )
+    for candidate in candidates:
+        if (candidate / "poc" / "triton_frontend" / "__init__.py").exists():
+            return candidate
     return _DEFAULT_FRONTEND_ROOT
 
 
@@ -190,20 +198,21 @@ def triton_to_tilelang_prim(
     tf = _require_frontend()
 
     # Triton's ``@triton.jit`` wraps the function in ``JITFunction`` whose
-    # underlying callable lives at ``.fn``. The POC frontend accepts both,
-    # but we normalise here so the frontend's introspection always sees a
-    # plain function with the original ``__name__``.
-    target_fn = getattr(fn, "fn", fn)
-    if not callable(target_fn):
+    # underlying callable lives at ``.fn``. Keep the wrapper for the frontend:
+    # Triton's 3.6+ TTIR capture path needs ``JITFunction.params`` and other
+    # compile metadata, while the underlying callable is only used here for
+    # validation and name inference.
+    underlying_fn = getattr(fn, "fn", fn)
+    if not callable(underlying_fn):
         raise TritonBridgeError(
             f"triton_to_tilelang_prim: expected a callable, got {type(fn)!r}"
         )
 
-    inferred_name = name or getattr(target_fn, "__name__", None) or "triton_kernel"
+    inferred_name = name or getattr(underlying_fn, "__name__", None) or "triton_kernel"
 
     try:
         prim = tf.from_triton_kernel(
-            target_fn,
+            fn,
             grid=grid,
             constexprs=constexprs,
             target=target,

@@ -286,6 +286,7 @@ The current collected test files are:
 - tests/test_train_hybrid_tiny_script.py
 - tests/test_train_tiny_npz_script.py
 - tests/test_training_exports.py
+- tests/test_triton_bridge_frontend_discovery.py
 - tests/test_triton_to_cute_dsl.py
 - tests/test_triton_to_tilelang_bridge.py
 

@@ -239,6 +239,41 @@ def test_single_gemm_wgmma_source_imports_without_cutlass_import() -> None:
     assert "C" in text
 
 
+def test_single_gemm_wgmma_cute_jit_source_imports_without_cutlass_import(
+    tmp_path: Path,
+) -> None:
+    """Static source import accepts @cute.jit as well as @cute.kernel."""
+
+    bridge_mod = _load_bridge_module()
+    source = tmp_path / "single_gemm_jit.py"
+    source.write_text(
+        """
+import cutlass.cute as cute
+
+
+class SingleGemmWGMMA:
+    def __init__(self, M=16, N=32, K=8, dtype="float16"):
+        self.M = M
+        self.N = N
+        self.K = K
+        self.dtype = dtype
+
+    @cute.jit
+    def __call__(self, A, B, C):
+        pass
+""",
+        encoding="utf-8",
+    )
+
+    prim = bridge_mod.cute_dsl_source_to_tilelang_prim(source)
+
+    text = str(prim)
+    assert "gemm" in text
+    assert "A" in text
+    assert "B" in text
+    assert "C" in text
+
+
 def test_masked_lkq_apply_source_imports_two_gemm_masked_tile() -> None:
     """Import the next external CuTe tile as TileLang IR.
 
@@ -412,6 +447,58 @@ def test_fa4_v1_source_imports_three_gemm_chain_with_lkq_output() -> None:
     }
 
 
+def test_fused_bwd_bwd_p4_source_imports_ten_gemm_reverse_scan() -> None:
+    """Import the Phase-4 10-GEMM external CuTe tile as one TileLang region.
+
+    ``fused_bwd_bwd_sm90_p4.py`` is the largest hand-written CuTe source in
+    the cppmega import surface.  The source importer should recover its fixed
+    tile contract for a specialized chunk count instead of leaving it as an
+    opaque CuTe launch boundary.
+    """
+
+    bridge_mod = _load_bridge_module()
+    source = Path(
+        "/Volumes/external/sources/cppmega/cppmega/megatron/"
+        "cute_dsl_mimo/fused_bwd_bwd_sm90_p4.py"
+    )
+    if not source.exists():
+        pytest.skip(f"cppmega CuTe source file not present: {source}")
+
+    prim = bridge_mod.cute_dsl_source_to_tilelang_prim(
+        source,
+        class_name="FusedBwdBwdP4",
+        nchunks=2,
+    )
+
+    text = str(prim)
+    assert text.count("gemm") >= 10
+    assert "chunk_rev" in text
+    assert "K_T" in text
+    assert "Q_T" in text
+    assert "DPh_T" in text
+    assert "DPsiV" in text
+    assert "DK" in text
+    assert "DQ" in text
+    assert "Dqkd" in text
+    assert "DstatesOut" in text
+    assert {buffer.name for buffer in prim.buffer_map.values()} >= {
+        "K",
+        "K_T",
+        "Q",
+        "Q_T",
+        "Dst",
+        "DPh",
+        "DPh_T",
+        "Psi",
+        "Sts",
+        "DPsiV",
+        "DK",
+        "DQ",
+        "Dqkd",
+        "DstatesOut",
+    }
+
+
 def test_emit_matmul_to_cute_dsl_produces_valid_python() -> None:
     """Forward emit path produces non-empty, parseable CuTeDSL source.
 
@@ -428,71 +515,61 @@ def test_emit_matmul_to_cute_dsl_produces_valid_python() -> None:
     bridge_mod = _load_bridge_module()
     _skip_if_cutedsl_unreachable(bridge_mod)
 
-    # Force engine path so dispatch_lower doesn't silently fall back to
-    # the metal MSL shim (which is not applicable for target='cutedsl').
-    prev = os.environ.get("CPPMEGA_MLX_TILELANG_ENGINE")
-    os.environ["CPPMEGA_MLX_TILELANG_ENGINE"] = "engine"
-    try:
-        prim = _build_smallest_emittable_prim()
-        artifact = bridge_mod.compile_prim_to_cutedsl(prim)
+    prim = _build_smallest_emittable_prim()
+    artifact = bridge_mod.compile_prim_to_cutedsl(prim)
 
-        # (4) Adapter type — must be the cutedsl one.
-        from tilelang.jit.adapter.cutedsl import CuTeDSLKernelAdapter
+    # (4) Adapter type — must be the cutedsl one.
+    from tilelang.jit.adapter.cutedsl import CuTeDSLKernelAdapter
 
-        assert isinstance(artifact, CuTeDSLKernelAdapter), (
-            f"expected CuTeDSLKernelAdapter, got {type(artifact).__name__} "
-            "— target='cutedsl' did not route through the CuTeDSL backend"
+    assert isinstance(artifact, CuTeDSLKernelAdapter), (
+        f"expected CuTeDSLKernelAdapter, got {type(artifact).__name__} "
+        "— target='cutedsl' did not route through the CuTeDSL backend"
+    )
+
+    # The adapter exposes the emitted source via get_kernel_source().
+    src = artifact.get_kernel_source(kernel_only=True)
+
+    # (1) Non-empty.
+    assert isinstance(src, str)
+    assert len(src) > 0, "emitted CuTeDSL source is empty"
+
+    # (2) Carries a cute.* decorator on the kernel entrypoint. PR #1421
+    # emits @cute.jit / @cute.kernel; accept either since the exact
+    # decorator name has shifted across cutlass-dsl minor versions.
+    assert (
+        "@cute.kernel" in src or "@cute.jit" in src
+    ), f"emitted source has no cute.kernel/cute.jit decorator:\n{src[:400]}"
+
+    # (3) Parses as Python and the AST contains at least one function
+    # definition decorated with cute.{kernel,jit}.
+    tree = ast.parse(src)
+
+    def _is_cute_decorator(node: ast.expr) -> bool:
+        """Match @cute.kernel, @cute.jit, @cute.kernel(...), etc."""
+
+        target = node.func if isinstance(node, ast.Call) else node
+        if not isinstance(target, ast.Attribute):
+            return False
+        return (
+            isinstance(target.value, ast.Name)
+            and target.value.id == "cute"
+            and target.attr in {"kernel", "jit"}
         )
 
-        # The adapter exposes the emitted source via get_kernel_source().
-        src = artifact.get_kernel_source(kernel_only=True)
+    decorated = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef)
+        and any(_is_cute_decorator(d) for d in n.decorator_list)
+    ]
+    assert decorated, (
+        "emitted CuTeDSL source has no @cute.kernel / @cute.jit "
+        f"decorated function:\n{src[:600]}"
+    )
 
-        # (1) Non-empty.
-        assert isinstance(src, str)
-        assert len(src) > 0, "emitted CuTeDSL source is empty"
-
-        # (2) Carries a cute.* decorator on the kernel entrypoint. PR #1421
-        # emits @cute.jit / @cute.kernel; accept either since the exact
-        # decorator name has shifted across cutlass-dsl minor versions.
-        assert (
-            "@cute.kernel" in src or "@cute.jit" in src
-        ), f"emitted source has no cute.kernel/cute.jit decorator:\n{src[:400]}"
-
-        # (3) Parses as Python and the AST contains at least one function
-        # definition decorated with cute.{kernel,jit}.
-        tree = ast.parse(src)
-
-        def _is_cute_decorator(node: ast.expr) -> bool:
-            """Match @cute.kernel, @cute.jit, @cute.kernel(...), etc."""
-
-            target = node.func if isinstance(node, ast.Call) else node
-            if not isinstance(target, ast.Attribute):
-                return False
-            return (
-                isinstance(target.value, ast.Name)
-                and target.value.id == "cute"
-                and target.attr in {"kernel", "jit"}
-            )
-
-        decorated = [
-            n
-            for n in ast.walk(tree)
-            if isinstance(n, ast.FunctionDef)
-            and any(_is_cute_decorator(d) for d in n.decorator_list)
-        ]
-        assert decorated, (
-            "emitted CuTeDSL source has no @cute.kernel / @cute.jit "
-            f"decorated function:\n{src[:600]}"
-        )
-
-        # Diagnostic: surface the source length and the first decorated
-        # function name so failures elsewhere have context.
-        sys.stderr.write(
-            f"\n[emit] cutedsl source length={len(src)} entrypoint="
-            f"{decorated[0].name!r}\n"
-        )
-    finally:
-        if prev is None:
-            os.environ.pop("CPPMEGA_MLX_TILELANG_ENGINE", None)
-        else:
-            os.environ["CPPMEGA_MLX_TILELANG_ENGINE"] = prev
+    # Diagnostic: surface the source length and the first decorated
+    # function name so failures elsewhere have context.
+    sys.stderr.write(
+        f"\n[emit] cutedsl source length={len(src)} entrypoint="
+        f"{decorated[0].name!r}\n"
+    )

@@ -8,10 +8,8 @@ from __future__ import annotations
 
 import mlx.core as mx
 import numpy as np
-import pytest
 
 from cppmega_v4._tilelang.linear_attention_paths import (
-    ENV_VAR as GDN_ENV,
     _path_e_status,
     gated_delta_recurrent_dispatch,
 )
@@ -59,15 +57,14 @@ def test_path_e_parity_with_path_a():
     np.testing.assert_allclose(np.array(o_e), np.array(o_a), atol=1e-3, rtol=1e-2)
 
 
-def test_path_e_dispatch_via_env(monkeypatch):
-    monkeypatch.setenv(GDN_ENV, "path_e")
+def test_path_e_dispatch_forced():
     B, T, H, K, V = 1, 4, 2, 32, 32
     q = mx.random.normal((B, T, H, K))
     k = mx.random.normal((B, T, H, K))
     v = mx.random.normal((B, T, H, V))
     beta = mx.sigmoid(mx.random.normal((B, T, H)))
     g = -mx.abs(mx.random.normal((B, T, H)) * 0.1)  # log-decay ≤ 0
-    o, _ = gated_delta_recurrent_dispatch(q, k, v, beta, g)
+    o, _ = gated_delta_recurrent_dispatch(q, k, v, beta, g, path="path_e")
     assert o.shape == (B, T, H, V)
     assert not bool(mx.any(mx.isnan(o)).item())
 

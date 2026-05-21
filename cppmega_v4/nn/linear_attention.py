@@ -23,6 +23,7 @@ from dataclasses import dataclass
 import mlx.core as mx
 import mlx.nn as nn
 
+from cppmega_v4._tilelang._dispatch import PathName
 from cppmega_v4.nn._external.fla_naive_gated_delta_rule import (
     naive_recurrent_gated_delta_rule,
 )
@@ -47,6 +48,7 @@ class LinearAttentionConfig:
     conv_size: int = 4
     use_gate: bool = False
     norm_eps: float = 1e-6
+    kernel_path: PathName | None = None
 
     def __post_init__(self) -> None:
         if self.hidden_size <= 0:
@@ -150,7 +152,13 @@ class LinearAttentionBlock(nn.Module):
             w_np[c][center][0] = 1.0
         return mx.array(w_np, dtype=mx.float32)
 
-    def __call__(self, x: mx.array, *, doc_ids: mx.array | None = None) -> mx.array:
+    def __call__(
+        self,
+        x: mx.array,
+        *,
+        doc_ids: mx.array | None = None,
+        kernel_path: PathName | None = None,
+    ) -> mx.array:
         if x.ndim != 3:
             raise ValueError(f"x must be shaped (B, S, D), got {x.shape}")
         if x.shape[-1] != self.config.hidden_size:
@@ -158,6 +166,7 @@ class LinearAttentionBlock(nn.Module):
                 f"x last dim must be {self.config.hidden_size}, got {x.shape[-1]}"
             )
         cfg = self.config
+        selected_kernel_path = cfg.kernel_path if kernel_path is None else kernel_path
         batch, seq_len, _ = x.shape
 
         q = self.q_proj(x)
@@ -188,11 +197,15 @@ class LinearAttentionBlock(nn.Module):
             from cppmega_v4._tilelang.linear_attention_paths import (
                 gated_delta_recurrent_dispatch,
             )
-            o, _ = gated_delta_recurrent_dispatch(q, k, v, beta, g)
+            o, _ = gated_delta_recurrent_dispatch(
+                q, k, v, beta, g, path=selected_kernel_path,
+            )
         else:
             # Document-boundary state reset: split into runs of contiguous
             # doc_id, dispatch each run through the path system, concat.
-            o = self._recurrent_with_doc_reset(q, k, v, beta, g, doc_ids)
+            o = self._recurrent_with_doc_reset(
+                q, k, v, beta, g, doc_ids, kernel_path=selected_kernel_path,
+            )
 
         # o has shape [B, T, H_v, V_dim]; flatten head axis for o_proj.
         o = o.reshape(batch, seq_len, cfg.value_dim)
@@ -207,6 +220,7 @@ class LinearAttentionBlock(nn.Module):
         beta: mx.array,
         g: mx.array,
         doc_ids: mx.array,
+        kernel_path: PathName | None = None,
     ) -> mx.array:
         """Apply naive recurrent kernel per document segment.
 
@@ -242,7 +256,9 @@ class LinearAttentionBlock(nn.Module):
                 from cppmega_v4._tilelang.linear_attention_paths import (
                     gated_delta_recurrent_dispatch,
                 )
-                ob, _ = gated_delta_recurrent_dispatch(qb, kb, vb, bb, gb)
+                ob, _ = gated_delta_recurrent_dispatch(
+                    qb, kb, vb, bb, gb, path=kernel_path,
+                )
                 run_outputs.append(ob)
             per_batch_outputs.append(mx.concatenate(run_outputs, axis=1))
         return mx.concatenate(per_batch_outputs, axis=0)

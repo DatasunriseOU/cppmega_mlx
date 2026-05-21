@@ -305,14 +305,17 @@ GOTCHAS: tuple[Gotcha, ...] = (
 def check_gotchas(
     sharding: ShardingSpec,
     build_spec: ModelBuildSpec,
+    *,
+    gotchas: tuple[Gotcha, ...] | None = None,
 ) -> tuple[Gotcha, ...]:
     """Run every gotcha trigger; return all that fire.
 
     Pure function — no runtime, suitable for the GUI inner loop on every
     sharding-spec / model-spec mutation.
     """
+    gotcha_table = GOTCHAS if gotchas is None else gotchas
     fired: list[Gotcha] = []
-    for g in GOTCHAS:
+    for g in gotcha_table:
         try:
             if g.condition(sharding, build_spec):
                 fired.append(g)

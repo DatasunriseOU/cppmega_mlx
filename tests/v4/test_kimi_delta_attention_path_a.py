@@ -155,7 +155,7 @@ def test_block_forward_shape():
     cfg = _tiny_cfg()
     block = KimiDeltaAttentionBlock(cfg)
     x = mx.random.normal((1, 4, cfg.hidden_size))
-    out = block(x)
+    out = block(x, kernel_path="path_a")
     assert out.shape == x.shape
 
 
@@ -171,7 +171,7 @@ def test_block_is_identity_at_init():
     cfg = _tiny_cfg()
     block = KimiDeltaAttentionBlock(cfg)
     x = mx.random.normal((1, 4, cfg.hidden_size))
-    out = block(x)
+    out = block(x, kernel_path="path_a")
     np.testing.assert_allclose(np.array(out), np.zeros_like(np.array(x)), atol=1e-5)
 
 
@@ -179,7 +179,7 @@ def test_block_with_short_conv():
     cfg = _tiny_cfg(use_short_conv=True, conv_size=3)
     block = KimiDeltaAttentionBlock(cfg)
     x = mx.random.normal((1, 4, cfg.hidden_size))
-    out = block(x)
+    out = block(x, kernel_path="path_a")
     assert out.shape == x.shape
 
 
@@ -187,7 +187,7 @@ def test_block_with_gqa():
     cfg = _tiny_cfg(num_heads=2, num_v_heads=4)
     block = KimiDeltaAttentionBlock(cfg)
     x = mx.random.normal((1, 4, cfg.hidden_size))
-    out = block(x)
+    out = block(x, kernel_path="path_a")
     assert out.shape == x.shape
 
 
@@ -196,8 +196,12 @@ def test_block_doc_ids_changes_output():
     block = KimiDeltaAttentionBlock(cfg)
     block.o_proj.weight = mx.random.normal(block.o_proj.weight.shape) * 0.1
     x = mx.random.normal((1, 6, cfg.hidden_size))
-    out_no = block(x)
-    out_yes = block(x, doc_ids=mx.array([[0, 0, 0, 1, 1, 1]], dtype=mx.int32))
+    out_no = block(x, kernel_path="path_a")
+    out_yes = block(
+        x,
+        doc_ids=mx.array([[0, 0, 0, 1, 1, 1]], dtype=mx.int32),
+        kernel_path="path_a",
+    )
     np.testing.assert_allclose(
         np.array(out_no[:, :3, :]), np.array(out_yes[:, :3, :]), atol=1e-5
     )
@@ -212,7 +216,7 @@ def test_block_gradient_flows():
 
     def loss_fn(params):
         block.update(params)
-        return mx.mean(mx.square(block(x)))
+        return mx.mean(mx.square(block(x, kernel_path="path_a")))
 
     grads = mx.grad(loss_fn)(block.trainable_parameters())
     for name in ("q_proj", "k_proj", "v_proj", "b_proj", "f_proj_1", "f_proj_2", "o_proj"):
