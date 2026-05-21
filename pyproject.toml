@@ -19,6 +19,13 @@ dependencies = [
 parquet = [
     "pyarrow>=21",
 ]
+gui = [
+    "pydantic>=2.10",
+    "fastapi>=0.110",
+    "uvicorn>=0.30",
+    "httpx>=0.27",
+    "jsonschema>=4.20",
+]
 
 [tool.setuptools.packages.find]
 include = ["cppmega_mlx*"]

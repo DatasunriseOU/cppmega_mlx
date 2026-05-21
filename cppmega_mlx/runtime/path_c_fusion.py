@@ -2380,6 +2380,8 @@ def _tilelang_optimizer_for(
     capture = io.StringIO()
     with redirect_stdout(capture), redirect_stderr(capture):
         from tilelang.engine.fusion import (
+            FusionBlockDescriptor,
+            FusionBlockRegistry,
             FusionOptimizer,
             FusionScheduleRegistry,
         )
@@ -2408,14 +2410,25 @@ def _tilelang_optimizer_for(
         require_single_kernel=True,
         enable_z3_sync_async=region.z3_sync.enabled,
     )
-    for node in region.nodes:
-        optimizer.add_node(
-            node.name,
-            op=node.op_name,
-            inputs=node.inputs,
-            outputs=node.outputs,
-            attrs=_tilelang_node_attrs(node),
+    block_registry = FusionBlockRegistry(
+        tuple(
+            FusionBlockDescriptor(
+                op=node.op_name,
+                inputs=node.inputs,
+                outputs=node.outputs,
+                attrs=_tilelang_node_attrs(node),
+                aliases=(f"{node.name}:{node.op_name}",),
+            )
+            for node in region.nodes
         )
+    )
+    optimizer.add_blocks(
+        tuple(
+            {"name": node.name, "kind": f"{node.name}:{node.op_name}"}
+            for node in region.nodes
+        ),
+        block_registry=block_registry,
+    )
     workspace_edge_buffers = _declared_workspace_edge_buffers(schedule_template)
     node_by_name = {node.name: node for node in region.nodes}
     for edge in region.edges:

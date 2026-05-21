@@ -60,6 +60,7 @@ from tools.clang_indexer.index_project import (
     FUNCTION_KINDS,
     CONTAINER_KINDS,
     extract_ast_metadata,
+    extract_semantic_metadata_from_parts,
 )
 
 if TYPE_CHECKING:
@@ -70,22 +71,24 @@ else:
     TranslationUnit = object
 
 
-DetectLanguageInfoFn = Callable[[str, str | None], dict[str, object] | None]
-
-
 class _ClangRuntimeSurface(Protocol):
     Index: type[object]
     TranslationUnit: type[object]
     CursorKind: object
 
 
-clang_runtime = cast(_ClangRuntimeSurface, importlib.import_module("clang.cindex"))
-if not TYPE_CHECKING:
-    Index = cast(type[object], clang_runtime.Index)  # type: ignore[assignment]
-    TranslationUnit = cast(type[object], clang_runtime.TranslationUnit)  # type: ignore[assignment]
-    CursorKind = clang_runtime.CursorKind  # type: ignore[assignment]
+clang_runtime: _ClangRuntimeSurface | None
+try:
+    clang_runtime = cast(_ClangRuntimeSurface, importlib.import_module("clang.cindex"))
+except ImportError:
+    clang_runtime = None
+else:
+    if not TYPE_CHECKING:
+        Index = cast(type[object], clang_runtime.Index)  # type: ignore[assignment]
+        TranslationUnit = cast(type[object], clang_runtime.TranslationUnit)  # type: ignore[assignment]
+        CursorKind = clang_runtime.CursorKind  # type: ignore[assignment]
 
-detect_language_info: Callable[[str, str | None], dict[str, object] | None] | None
+detect_language_info: Callable[..., dict[str, object] | None] | None
 try:
     from cppmega_mlx.data.nanochat_pipeline.language_info import detect_language_info
 except ImportError:
@@ -136,6 +139,11 @@ class HunkRange:
 
 _HUNK_RE = re.compile(r'@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@')
 
+EDIT_OP_UNCHANGED = 0
+EDIT_OP_INSERTED = 1
+EDIT_OP_MODIFIED = 2
+EDIT_OP_CONTEXT = 3
+
 
 def parse_hunk_ranges(diff: str) -> list[HunkRange]:
     """Parse unified diff @@ lines into hunk ranges."""
@@ -158,6 +166,171 @@ def changed_lines(hunks: list[HunkRange], use_old: bool) -> set[int]:
         count = max(h.old_count if use_old else h.new_count, 1)
         lines.update(range(start, start + count))
     return lines
+
+
+def compute_new_line_edit_ops(diff: str) -> dict[int, int]:
+    """Map 1-based new-file lines to edit operation IDs from a unified diff."""
+    ops: dict[int, int] = {}
+    current_new_line: int | None = None
+    pending_removes = 0
+    for line in diff.splitlines():
+        match = _HUNK_RE.match(line)
+        if match:
+            current_new_line = int(match.group(3))
+            pending_removes = 0
+            continue
+        if current_new_line is None:
+            continue
+        if line.startswith('-') and not line.startswith('---'):
+            pending_removes += 1
+            continue
+        if line.startswith('+') and not line.startswith('+++'):
+            if pending_removes > 0:
+                ops[current_new_line] = EDIT_OP_MODIFIED
+                pending_removes -= 1
+            else:
+                ops[current_new_line] = EDIT_OP_INSERTED
+            current_new_line += 1
+            continue
+        pending_removes = 0
+        current_new_line += 1
+    return ops
+
+
+def _line_ranges_by_number(text: str) -> dict[int, tuple[int, int]]:
+    ranges: dict[int, tuple[int, int]] = {}
+    offset = 0
+    for line_no, line in enumerate(text.splitlines(keepends=True), start=1):
+        end = offset + len(line)
+        ranges[line_no] = (offset, end)
+        offset = end
+    if text and (not text.endswith(('\n', '\r'))):
+        ranges.setdefault(len(ranges) + 1, (offset, len(text)))
+    return ranges
+
+
+def _line_ranges_for_changed_functions(
+    analysis: FileAnalysis,
+    changed_line_numbers: set[int],
+) -> list[tuple[int, int]]:
+    if not analysis.functions and not analysis.classes:
+        return []
+    ranges: list[tuple[int, int]] = []
+    for func in analysis.functions:
+        if any(line in changed_line_numbers for line in range(func.line, func.end_line + 1)):
+            ranges.append((func.line, func.end_line))
+    for cls in analysis.classes:
+        if any(line in changed_line_numbers for line in range(cls.start_line, cls.end_line + 1)):
+            ranges.append((cls.start_line, cls.end_line))
+    return ranges
+
+
+def _build_commit_temporal_metadata(
+    full_text: str,
+    part_texts: list[str],
+    section_kinds: list[str],
+    *,
+    record: dict,
+    old_analysis: FileAnalysis,
+    new_analysis: Optional[FileAnalysis],
+) -> dict[str, list[int]]:
+    text_len = len(full_text)
+    change_mask_pre = [0] * text_len
+    change_mask_post = [0] * text_len
+    hunk_id_per_char = [0] * text_len
+    edit_op_per_char = [EDIT_OP_CONTEXT] * text_len
+
+    diff = str(record.get('diff', '') or '')
+    hunks = parse_hunk_ranges(diff)
+    if not hunks:
+        return {
+            'change_mask_pre': [],
+            'change_mask_post': [],
+            'hunk_id_per_char': [],
+            'edit_op_per_char': [],
+        }
+
+    old_changed_lines = changed_lines(hunks, use_old=True)
+    new_line_ops = compute_new_line_edit_ops(diff)
+    old_changed_ranges = _line_ranges_for_changed_functions(old_analysis, old_changed_lines)
+    old_content = str(record.get('old_content', '') or '')
+    new_content = str(record.get('new_content', '') or '')
+    old_line_ranges = _line_ranges_by_number(str(record.get('old_content', '') or ''))
+    new_line_ranges = _line_ranges_by_number(str(record.get('new_content', '') or ''))
+    new_line_ops_by_text: dict[str, int] = {}
+    for line_no, (start, end) in new_line_ranges.items():
+        stripped = new_content[start:end].strip()
+        if not stripped:
+            continue
+        op = new_line_ops.get(line_no, EDIT_OP_UNCHANGED)
+        previous = new_line_ops_by_text.get(stripped)
+        if previous is None or (previous == EDIT_OP_UNCHANGED and op != EDIT_OP_UNCHANGED):
+            new_line_ops_by_text[stripped] = op
+
+    def old_part_changed(part: str) -> bool:
+        if not part.strip() or not old_changed_ranges:
+            return False
+        for start_line, end_line in old_changed_ranges:
+            start_end = old_line_ranges.get(start_line)
+            end_end = old_line_ranges.get(end_line)
+            if not start_end or not end_end:
+                continue
+            changed_text = old_content[start_end[0]:end_end[1]].strip()
+            if changed_text and (part.strip() in changed_text or changed_text in part.strip()):
+                return True
+        return False
+
+    def new_line_op(part_line: str) -> int:
+        stripped = part_line.strip()
+        if not stripped:
+            return EDIT_OP_CONTEXT
+        return new_line_ops_by_text.get(stripped, EDIT_OP_UNCHANGED)
+
+    offset = 0
+    for idx, part in enumerate(part_texts):
+        source_kind = section_kinds[idx] if idx < len(section_kinds) else 'c'
+        part_len = len(part)
+        if part_len <= 0:
+            continue
+        part_end = min(offset + part_len, text_len)
+        if source_kind == 'n':
+            pos = offset
+            for line in part.splitlines(keepends=True):
+                line_len = len(line)
+                op = new_line_op(line)
+                changed = int(op in (EDIT_OP_INSERTED, EDIT_OP_MODIFIED))
+                end = min(pos + line_len, text_len)
+                for char_idx in range(pos, end):
+                    change_mask_post[char_idx] = changed
+                    hunk_id_per_char[char_idx] = 1 if changed else 0
+                    edit_op_per_char[char_idx] = op
+                pos = end
+        elif source_kind == 'o':
+            changed = int(old_part_changed(part))
+            for char_idx in range(offset, part_end):
+                change_mask_pre[char_idx] = changed
+                hunk_id_per_char[char_idx] = 1 if changed else 0
+                edit_op_per_char[char_idx] = EDIT_OP_CONTEXT
+        else:
+            for char_idx in range(offset, part_end):
+                edit_op_per_char[char_idx] = EDIT_OP_CONTEXT
+        offset += part_len
+        if idx < len(part_texts) - 1:
+            offset += 2
+
+    if not any(change_mask_pre) and not any(change_mask_post):
+        return {
+            'change_mask_pre': [],
+            'change_mask_post': [],
+            'hunk_id_per_char': [],
+            'edit_op_per_char': [],
+        }
+    return {
+        'change_mask_pre': change_mask_pre,
+        'change_mask_post': change_mask_post,
+        'hunk_id_per_char': hunk_id_per_char,
+        'edit_op_per_char': edit_op_per_char,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -601,35 +774,45 @@ def format_chain_document(
 
     # Build parts_info: (text, kind, dep_level, name, qname)
     parts_info: list[PartInfo] = []
+    section_kinds: list[str] = []
 
     # Docstring (kind=6: comment)
     docstring = build_docstring(record)
     parts_info.append((docstring, 6, 0, '', None))
+    section_kinds.append('c')
 
     # PRE-COMMIT section
     if old_chain or old_changed_classes:
         parts_info.append(('// === PRE-COMMIT ===', 0, 0, '', None))
+        section_kinds.append('c')
         short_preamble = '\n'.join(old_analysis.preamble.splitlines()[:20])
         if short_preamble:
             parts_info.append((short_preamble, 1, 0, '', None))
+            section_kinds.append('c')
         for ci in old_changed_classes:
             cls = old_analysis.classes[ci]
             parts_info.append((cls.text, 4, 0, cls.name, cls.qualified_name))
+            section_kinds.append('o')
         for func in old_chain:
             parts_info.append((func.text, 3, func.dep_level, func.name, func.qualified_name))
+            section_kinds.append('o')
 
     # POST-COMMIT section
     subject = record.get('subject', '').strip()
     if new_chain or new_changed_classes:
         parts_info.append((f'// === POST-COMMIT: {subject} ===', 0, 0, '', None))
+        section_kinds.append('c')
         short_preamble = '\n'.join(new_analysis.preamble.splitlines()[:20])
         if short_preamble:
             parts_info.append((short_preamble, 1, 0, '', None))
+            section_kinds.append('c')
         for ci in new_changed_classes:
             cls = new_analysis.classes[ci]
             parts_info.append((cls.text, 4, 0, cls.name, cls.qualified_name))
+            section_kinds.append('n')
         for func in new_chain:
             parts_info.append((func.text, 3, func.dep_level, func.name, func.qualified_name))
+            section_kinds.append('n')
 
     if len(parts_info) <= 1:
         return None
@@ -644,6 +827,7 @@ def format_chain_document(
     return _build_enriched_from_parts(
         parts_info, old_analysis, new_analysis, record,
         changed_symbol_ids=csids, ripple_candidates=ripple,
+        section_kinds=section_kinds,
     )
 
 
@@ -664,27 +848,35 @@ def format_diff_document(
     old_chain = extract_function_chain(old_analysis, old_changed_funcs, max_dep_depth)
 
     parts_info: list[PartInfo] = []
+    section_kinds: list[str] = []
 
     # Docstring
     docstring = build_docstring(record)
     parts_info.append((docstring, 6, 0, '', None))
+    section_kinds.append('c')
 
     # Context: old code chain
     parts_info.append(('// === CONTEXT ===', 0, 0, '', None))
+    section_kinds.append('c')
     short_preamble = '\n'.join(old_analysis.preamble.splitlines()[:20])
     if short_preamble:
         parts_info.append((short_preamble, 1, 0, '', None))
+        section_kinds.append('c')
     for ci in old_changed_classes:
         cls = old_analysis.classes[ci]
         parts_info.append((cls.text, 4, 0, cls.name, cls.qualified_name))
+        section_kinds.append('o')
     for func in old_chain:
         parts_info.append((func.text, 3, func.dep_level, func.name, func.qualified_name))
+        section_kinds.append('o')
 
     # Raw diff
     diff_text = record.get('diff', '')
     if diff_text:
         parts_info.append(('// === DIFF ===', 0, 0, '', None))
+        section_kinds.append('c')
         parts_info.append((diff_text, 0, 0, '', None))
+        section_kinds.append('c')
 
     if len(parts_info) <= 2:
         return None
@@ -696,6 +888,7 @@ def format_diff_document(
     return _build_enriched_from_parts(
         parts_info, old_analysis, None, record,
         changed_symbol_ids=csids, ripple_candidates=ripple,
+        section_kinds=section_kinds,
     )
 
 
@@ -706,12 +899,14 @@ def _build_enriched_from_parts(
     record: dict,
     changed_symbol_ids: Optional[list[int]] = None,
     ripple_candidates: Optional[list[dict]] = None,
+    section_kinds: Optional[list[str]] = None,
 ) -> dict:
     """Build enriched document dict from parts_info list.
 
     Produces the same schema as build_enriched_doc() in index_project.py:
     text, structure_ids, chunk_boundaries, call_edges, type_edges,
-    ast_depth, sibling_index, ast_node_type.
+    ast_depth, sibling_index, ast_node_type, symbol_ids, call_targets,
+    type_refs, def_use.
 
     Additionally emits:
     - changed_symbol_ids: list of int — IDs of symbols modified in this commit
@@ -775,6 +970,15 @@ def _build_enriched_from_parts(
     # AST metadata via tree-sitter
     ast_depth, sibling_index, ast_node_type = extract_ast_metadata(full_text)
 
+    semantic_index = ProjectIndex()
+    for func in all_funcs.values():
+        semantic_index.add_function(func)
+    semantic_meta = extract_semantic_metadata_from_parts(
+        full_text,
+        parts_info,
+        semantic_index,
+    )
+
     result: dict = {
         'text': full_text,
         'structure_ids': structure_ids,
@@ -784,14 +988,48 @@ def _build_enriched_from_parts(
         'ast_depth': ast_depth,
         'sibling_index': sibling_index,
         'ast_node_type': ast_node_type,
+        'symbol_ids': semantic_meta['symbol_ids'],
+        'call_targets': semantic_meta['call_targets'],
+        'type_refs': semantic_meta['type_refs'],
+        'def_use': semantic_meta['def_use'],
         'changed_symbol_ids': changed_symbol_ids or [],
         'ripple_candidates': ripple_candidates or [],
     }
+    temporal_meta = _build_commit_temporal_metadata(
+        full_text,
+        texts,
+        section_kinds or ['c'] * len(texts),
+        record=record,
+        old_analysis=old_analysis,
+        new_analysis=new_analysis,
+    )
+    result.update(temporal_meta)
+
+    # Platform info detection mirrors the source-indexer path.
+    _parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    _v5_dir = os.path.join(_parent, 'v5_gke_orchestrator')
+    if _v5_dir not in sys.path:
+        sys.path.insert(0, _v5_dir)
+    platform_info: dict[str, object] | None
+    try:
+        _platform_detect = importlib.import_module("platform_detect")
+        _detect_plat = cast(
+            Callable[[str], dict[str, object] | None],
+            getattr(_platform_detect, "detect_platforms"),
+        )
+        platform_info = _detect_plat(full_text)
+    except ImportError:
+        platform_info = None
+    if platform_info:
+        result['platform_info'] = platform_info
 
     # Language info detection
     filepath = record.get('filepath', '')
     if detect_language_info is not None:
-        lang_info = detect_language_info(full_text, filepath)
+        try:
+            lang_info = detect_language_info(full_text, filepath, platform_info)
+        except TypeError:
+            lang_info = detect_language_info(full_text, filepath)
         if lang_info:
             result['language_info'] = lang_info
 
@@ -811,7 +1049,7 @@ def _load_tokenizer(path: Optional[str]):
         return
     if path and os.path.exists(path):
         try:
-            from tokenizers import Tokenizer
+            from tokenizers import Tokenizer  # type: ignore[reportMissingImports]
             _tokenizer = Tokenizer.from_file(path)
             return
         except Exception:
@@ -953,7 +1191,7 @@ def process_jsonl_file(
     return stats
 
 
-def main():
+def main() -> int:
     parser = argparse.ArgumentParser(
         description='Process git commit diffs into enriched training documents using libclang',
     )
@@ -999,7 +1237,11 @@ def main():
     print(f"  format: {args.doc_format}", file=sys.stderr)
 
     # Configure libclang
-    libclang_path = _configure_libclang(args.libclang_path)
+    try:
+        libclang_path = _configure_libclang(args.libclang_path)
+    except ImportError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
     print(f"  libclang: {libclang_path or 'system default'}", file=sys.stderr)
 
     # Load tokenizer
@@ -1058,7 +1300,8 @@ def main():
     if total_stats['records_read'] > 0:
         rate = total_stats['records_read'] / elapsed
         print(f"Rate: {rate:.1f} records/sec", file=sys.stderr)
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())

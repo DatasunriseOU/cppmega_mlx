@@ -3134,7 +3134,7 @@ def test_direct_fusion_chain_splits_model_route_under_metal_buffer_limit() -> No
         ):
             previous_shape = abi_shapes.setdefault(buffer_name, shape)
             assert previous_shape == shape
-    assert abi_shapes["hidden"] == (
+    assert abi_shapes["local_gb10_quarter_brick_10_M_hidden"] == (
         1,
         shape_env.sequence_length,
         shape_env.hidden_size,
@@ -3169,7 +3169,7 @@ def test_direct_fusion_chain_splits_model_route_under_metal_buffer_limit() -> No
         mamba3_state_shape
     )
     assert abi_shapes[
-        "local_gb10_quarter_brick_10_M_residual_norm_weight"
+        "local_gb10_quarter_brick_11_R_residual_norm_weight"
     ] == (shape_env.hidden_size,)
 
 
@@ -3475,10 +3475,10 @@ def test_model_region_shape_env_controls_dynamic_descriptor_extent() -> None:
     prim_func = target.schedule_template(region)
     generated_source = prim_func._cppmega_path_c_generated_source
     abi_shapes = prim_func._cppmega_path_c_physical_buffer_abi_shapes
-    assert abi_shapes["hidden"] == (1, 128, 32)
-    assert "hidden: T.Buffer((1, 128, 32), \"float32\")" in generated_source
-    assert "hidden[0, i // 32, i % 32]" in generated_source
-    assert "hidden[0, (i % 4096) // 32, (i % 4096) % 32]" not in generated_source
+    assert abi_shapes["route_0_M_hidden"] == (1, 128, 32)
+    assert "route_0_M_hidden: T.Buffer((1, 128, 32), \"float32\")" in generated_source
+    assert "route_0_M_hidden[0, i // 32, i % 32]" in generated_source
+    assert "route_0_M_hidden[0, (i % 4096) // 32, (i % 4096) % 32]" not in generated_source
     assert prim_func._cppmega_path_c_buffer_extent == 128
     assert prim_func._cppmega_path_c_loop_extent == 4096
     assert target.internal_buffer_policy == DESCRIPTOR_INTERNAL_BUFFER_POLICY_ROW_LOCAL_HIDDEN

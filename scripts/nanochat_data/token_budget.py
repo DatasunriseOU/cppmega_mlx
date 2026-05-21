@@ -98,6 +98,17 @@ def _best_split_char_index(
     return best
 
 
+_CHAR_LEVEL_METADATA_FIELDS = (
+    "ast_depth",
+    "sibling_index",
+    "ast_node_type",
+    "symbol_ids",
+    "call_targets",
+    "type_refs",
+    "def_use",
+)
+
+
 def _slice_doc_char_range(
     doc: dict[str, Any],
     start_char: int,
@@ -118,6 +129,7 @@ def _slice_doc_char_range(
             "call_edges",
             "type_edges",
             "actual_token_count",
+            *_CHAR_LEVEL_METADATA_FIELDS,
         }
     }
     sliced["text"] = text[start_char:end_char]
@@ -128,11 +140,12 @@ def _slice_doc_char_range(
     else:
         sliced["structure_ids"] = []
 
-    ast_like_fields = ("ast_depth", "sibling_index", "ast_node_type")
-    for key in ast_like_fields:
+    for key in _CHAR_LEVEL_METADATA_FIELDS:
         values = doc.get(key, [])
         if values:
             sliced[key] = list(values[start_char:end_char])
+        else:
+            sliced[key] = []
 
     if selected_boundaries is None:
         raw_boundaries = list(enumerate(doc.get("chunk_boundaries", [])))

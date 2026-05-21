@@ -9,6 +9,10 @@ from typing import Any, cast
 
 from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     PLATFORM_IDS_COLUMN,
+    CHANGED_CHUNK_IDS_COLUMN,
+    CHANGED_CHUNK_SPANS_COLUMN,
+    EDIT_OP_PER_TOKEN_COLUMN,
+    HUNK_ID_PER_TOKEN_COLUMN,
     TOKEN_AST_DEPTH_COLUMN,
     TOKEN_AST_NODE_TYPE_COLUMN,
     TOKEN_CALL_EDGES_COLUMN,
@@ -25,6 +29,8 @@ from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     TOKEN_SYMBOL_IDS_COLUMN,
     TOKEN_TYPE_EDGES_COLUMN,
     TOKEN_TYPE_REFS_COLUMN,
+    TOKEN_CHANGE_MASK_POST_COLUMN,
+    TOKEN_CHANGE_MASK_PRE_COLUMN,
 )
 
 _KIND_STR_TO_INT = {
@@ -277,6 +283,44 @@ def _build_token_chunk_layout(
     }
 
 
+def _tokenize_optional_char_field(
+    doc: dict[str, Any],
+    keys: tuple[str, ...],
+    token_spans: list[tuple[int, int]],
+) -> list[int]:
+    for key in keys:
+        values = doc.get(key, [])
+        if values:
+            return _chars_to_tokens_structure_ids(values, "", token_spans)
+    return []
+
+
+def _changed_chunk_metadata(
+    token_chunk_starts: list[int],
+    token_chunk_ends: list[int],
+    change_masks: tuple[list[int], ...],
+) -> tuple[list[int], list[dict[str, int]]]:
+    if not token_chunk_starts or not token_chunk_ends:
+        return [], []
+    changed_ids: list[int] = []
+    changed_spans: list[dict[str, int]] = []
+    for chunk_idx, (start, end) in enumerate(zip(token_chunk_starts, token_chunk_ends)):
+        start_i = max(int(start), 0)
+        end_i = max(int(end), start_i)
+        changed = False
+        for mask in change_masks:
+            if not mask:
+                continue
+            bounded_end = min(end_i, len(mask))
+            if start_i < bounded_end and any(int(value) != 0 for value in mask[start_i:bounded_end]):
+                changed = True
+                break
+        if changed:
+            changed_ids.append(chunk_idx)
+            changed_spans.append({"start": start_i, "end": end_i})
+    return changed_ids, changed_spans
+
+
 def _platform_ids_from_doc(doc: dict[str, Any]) -> list[int]:
     platform_info = doc.get("platform_info")
     if not platform_info:
@@ -344,7 +388,28 @@ def materialize_tokenized_enriched_batch(
             len(token_ids),
         )
 
-        row = {
+        token_change_mask_pre = _tokenize_optional_char_field(
+            doc,
+            ("change_mask_pre", TOKEN_CHANGE_MASK_PRE_COLUMN),
+            token_spans,
+        )
+        token_change_mask_post = _tokenize_optional_char_field(
+            doc,
+            ("change_mask_post", "token_change_mask", TOKEN_CHANGE_MASK_POST_COLUMN),
+            token_spans,
+        )
+        hunk_id_per_token = _tokenize_optional_char_field(
+            doc,
+            ("hunk_id_per_char", HUNK_ID_PER_TOKEN_COLUMN),
+            token_spans,
+        )
+        edit_op_per_token = _tokenize_optional_char_field(
+            doc,
+            ("edit_op_per_char", "token_edit_op", EDIT_OP_PER_TOKEN_COLUMN),
+            token_spans,
+        )
+
+        row: dict[str, Any] = {
             TOKEN_IDS_COLUMN: token_ids,
             PLATFORM_IDS_COLUMN: _platform_ids_from_doc(doc),
             TOKEN_STRUCTURE_IDS_COLUMN: token_structure_ids,
@@ -384,8 +449,19 @@ def materialize_tokenized_enriched_batch(
                 "",
                 token_spans,
             ),
+            TOKEN_CHANGE_MASK_PRE_COLUMN: token_change_mask_pre,
+            TOKEN_CHANGE_MASK_POST_COLUMN: token_change_mask_post,
+            HUNK_ID_PER_TOKEN_COLUMN: hunk_id_per_token,
+            EDIT_OP_PER_TOKEN_COLUMN: edit_op_per_token,
         }
         row.update(cast(dict[str, list[int]], _build_token_chunk_layout(doc, tok_chunks, len(token_ids))))
+        changed_chunk_ids, changed_chunk_spans = _changed_chunk_metadata(
+            cast(list[int], row[TOKEN_CHUNK_STARTS_COLUMN]),
+            cast(list[int], row[TOKEN_CHUNK_ENDS_COLUMN]),
+            (token_change_mask_pre, token_change_mask_post),
+        )
+        row[CHANGED_CHUNK_IDS_COLUMN] = changed_chunk_ids
+        row[CHANGED_CHUNK_SPANS_COLUMN] = changed_chunk_spans
         out.append(row)
 
     return out

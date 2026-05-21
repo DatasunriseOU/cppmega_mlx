@@ -64,6 +64,19 @@ else:
     TranslationUnit = object
 
 
+class _MissingCursorKind:
+    def __getattr__(self, name: str) -> str:
+        return f"<missing-clang-cursorkind:{name}>"
+
+
+class _MissingIndex:
+    @staticmethod
+    def create():
+        raise ImportError(
+            "libclang Python bindings not found. Install with: pip install libclang"
+        )
+
+
 class _ClangCIndexModule(Protocol):
     __file__: str
 
@@ -88,9 +101,10 @@ DetectLanguageInfoFn = Callable[
 ]
 
 
-clang_cindex_module: _ClangCIndexModule
+clang_cindex_module: _ClangCIndexModule | None
 clang_config_cls: _ClangConfig
 index_cls: _IndexFactory
+_CLANG_IMPORT_ERROR: ImportError | None = None
 
 try:
     clang_cindex_runtime = importlib.import_module("clang.cindex")
@@ -105,18 +119,13 @@ try:
         Index = getattr(clang_cindex_runtime, "Index")  # type: ignore[assignment]
         TranslationUnit = getattr(clang_cindex_runtime, "TranslationUnit")  # type: ignore[assignment]
 except ImportError as _clang_import_err:
-    # Re-raise as ImportError so callers/tests can catch it cleanly
-    # instead of crashing the entire process with sys.exit
-    if __name__ == "__main__":
-        print("ERROR: libclang Python bindings not found.", file=sys.stderr)
-        print("Install with: pip install libclang", file=sys.stderr)
-        print("Or: sudo apt install python3-clang", file=sys.stderr)
-        sys.exit(1)
-    else:
-        raise ImportError(
-            "libclang Python bindings not found. "
-            "Install with: pip install libclang"
-        ) from _clang_import_err
+    _CLANG_IMPORT_ERROR = _clang_import_err
+    clang_cindex_module = None
+    clang_config_cls = cast(_ClangConfig, object)
+    index_cls = cast(_IndexFactory, _MissingIndex)
+    if not TYPE_CHECKING:
+        CursorKind = _MissingCursorKind()  # type: ignore[assignment]
+        Index = _MissingIndex  # type: ignore[assignment]
 
 
 _LIBCLANG_CONFIGURED = False
@@ -139,6 +148,8 @@ _COMMON_LIBCLANG_CANDIDATES = [
 
 
 def _iter_bundled_libclang_candidates() -> Iterator[str]:
+    if clang_cindex_module is None:
+        return
     module_path = getattr(clang_cindex_module, "__file__", "")
     if not module_path:
         return
@@ -203,6 +214,10 @@ def _configure_libclang(libclang_path: str | None = None) -> str | None:
     global _LIBCLANG_CONFIGURED
     if _LIBCLANG_CONFIGURED:
         return os.environ.get("NANOCHAT_LIBCLANG_PATH") or libclang_path
+    if _CLANG_IMPORT_ERROR is not None:
+        raise ImportError(
+            "libclang Python bindings not found. Install with: pip install libclang"
+        ) from _CLANG_IMPORT_ERROR
 
     last_error: Exception | None = None
     for candidate in _iter_libclang_candidates(libclang_path):
@@ -1650,7 +1665,11 @@ def main() -> int:
 
     args = parser.parse_args()
 
-    _configure_libclang(args.libclang_path)
+    try:
+        _configure_libclang(args.libclang_path)
+    except ImportError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
 
     # Collect project directories
     project_dirs = []

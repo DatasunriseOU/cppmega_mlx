@@ -329,7 +329,7 @@ def test_all_metadata_excludes_token_content_and_slices_token_level_fields() -> 
     assert metadata_windows[1]["token_symbol_ids"] == [14, 15, 16, 17]
     assert metadata_windows[0]["doc_ids"] == [0, 0, 0, 0]
     assert metadata_windows[1]["doc_ids"] == [1, 1, 1, 1]
-    assert metadata_windows[0]["platform_ids"] == [4, 9]
+    assert "platform_ids" not in metadata_columns
     assert metadata_windows[1]["repo"] == "llvm"
 
 

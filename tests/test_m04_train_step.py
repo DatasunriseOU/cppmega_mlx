@@ -3344,13 +3344,39 @@ def test_path_c_fusion_payload_keeps_compile_blocker_without_matching_receipt(
 
 
 def test_path_c_fusion_payload_rejects_tiny_smoke_compile_receipt(
+    tmp_path: Path,
     path_c_fusion_auto_env: None,
 ) -> None:
     del path_c_fusion_auto_env
+    receipt_payload = json.loads(
+        PRODUCTION_FUSION_COMPILE_RECEIPT.read_text(encoding="utf-8")
+    )
+    receipt_payload["runtime_execution_contract"] = {
+        **receipt_payload["runtime_execution_contract"],
+        "status": "compile_only_not_runtime_ready",
+        "runtime_route_uses_fused_region": False,
+        "physical_abi_runtime_binding_status": "not_bound",
+        "physical_abi_missing_bank_buffers": [
+            "path_c_float32_abi_bank",
+            "path_c_uint8_abi_bank",
+            "path_c_int32_abi_bank",
+        ],
+    }
+    receipt_payload["runtime_smoke"] = {
+        "status": "ok",
+        "mode": "tiny_mra",
+        "actually_executed": True,
+    }
+    receipt_payload["reporting_contract"] = {
+        **receipt_payload.get("reporting_contract", {}),
+        "production_runtime_smoke_uses_fused_train_block": False,
+    }
+    tiny_receipt_path = tmp_path / "tiny_smoke_compile_receipt.json"
+    tiny_receipt_path.write_text(json.dumps(receipt_payload), encoding="utf-8")
 
     payload = m04_train_step.path_c_fusion_payload(
         model=build_local_gb10_quarter_tiny_smoke_model(),
-        compile_receipt_path=DEFAULT_FUSION_COMPILE_RECEIPT,
+        compile_receipt_path=tiny_receipt_path,
     )
 
     receipt = payload["production_compile_receipt"]

@@ -358,10 +358,17 @@ def test_gb10_real_parquet_sample_receipt_names_available_samples() -> None:
     if not found:
         pytest.skip(f"GB10 parquet samples are not present under {GB10_SAMPLE_ROOT}")
 
-    assert found == [
+    expected = [
         "data/parquet_samples/gb10/clang_commits_4k_v1/val_00000.parquet",
         "data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet",
     ]
+    token_coords = (
+        "data/parquet_samples/gb10/clang_semantic_4k_v10_tokencoords/"
+        "val_00000.parquet"
+    )
+    if token_coords in found:
+        expected.append(token_coords)
+    assert found == expected
 
 
 def _pyarrow_modules() -> tuple[Any, Any]:

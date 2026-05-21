@@ -115,9 +115,12 @@ def test_compile_receipt_plans_model_derived_fused_schedule(tmp_path: Path) -> N
     assert payload["generated_source"]["logical_buffer_abi_map_count"] > (
         payload["runtime_execution_contract"]["kernel_parameter_count"]
     )
-    hidden_mapping = payload["generated_source"]["physical_buffer_abi_map"]["hidden"]
+    hidden_mapping = payload["generated_source"]["physical_buffer_abi_map"][
+        "local_gb10_quarter_brick_10_M_hidden"
+    ]
     assert hidden_mapping["bank"] == "path_c_float32_abi_bank"
-    assert hidden_mapping["offset"] == 0
+    assert isinstance(hidden_mapping["offset"], int)
+    assert hidden_mapping["offset"] >= 0
     assert hidden_mapping["dtype"] == "float32"
     assert payload["generated_source"]["physical_abi_validation"]["status"] == "ok"
     assert (

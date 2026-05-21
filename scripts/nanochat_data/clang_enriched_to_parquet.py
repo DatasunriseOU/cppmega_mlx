@@ -26,6 +26,10 @@ import sys
 import tempfile
 from pathlib import Path
 
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 import pyarrow as pa  # type: ignore[import-not-found]
 import pyarrow.parquet as pq  # type: ignore[import-not-found]
 
@@ -90,12 +94,30 @@ GCS_INPUT_PREFIX = "v5_enriched"
 GCS_OUTPUT_PREFIX_TEMPLATE = "data/parquet/clang_enriched_{size}"
 _TOKENIZED_ENRICHED_TOKENIZER = None
 _OVERFLOW_POLICIES = ("split", "drop")
+_CHAR_LEVEL_METADATA_FIELDS = (
+    "ast_depth",
+    "sibling_index",
+    "ast_node_type",
+    "symbol_ids",
+    "call_targets",
+    "type_refs",
+    "def_use",
+)
 
 # ---------------------------------------------------------------------------
 # Platform header (default — enriched docs are already processed, no repo_dir)
 # ---------------------------------------------------------------------------
 
 _DEFAULT_PLATFORM_INFO = {
+    "os": ["linux"],
+    "rtos": [],
+    "gpu": [],
+    "arch": ["x64"],
+    "compiler": ["gcc"],
+    "cpp_std": "c++17",
+}
+
+_DEFAULT_PLATFORM_HEADER_INFO = {
     "platform": "x86_64-linux-gnu",
     "compiler": "g++",
     "standard": "c++17",
@@ -697,7 +719,7 @@ def gcs_upload(local_path: str, gcs_uri: str):
 # Main pipeline
 # ---------------------------------------------------------------------------
 
-_PLATFORM_HEADER = build_platform_header(_DEFAULT_PLATFORM_INFO)
+_PLATFORM_HEADER = build_platform_header(_DEFAULT_PLATFORM_HEADER_INFO)
 _HEADER_LEN = len(_PLATFORM_HEADER)
 
 
@@ -709,6 +731,13 @@ def _align_structure_ids(values: list, text_len: int) -> list[int]:
     if len(aligned) < text_len:
         aligned.extend([0] * (text_len - len(aligned)))
     return aligned
+
+
+def _align_optional_char_metadata(values: list, text_len: int) -> list[int]:
+    """Return per-char metadata aligned to `text_len`, preserving absence."""
+    if not values:
+        return []
+    return _align_structure_ids(values, text_len)
 
 
 def process_record(record: dict, tokenizer, max_tokens: int) -> list:
@@ -760,6 +789,14 @@ def process_record_with_policy(
         filtered_type_edges = record.get("type_edges", [])
 
     full_sids = [0] * header_len + filtered_structure_ids
+    char_metadata: dict[str, list[int]] = {}
+    for key in _CHAR_LEVEL_METADATA_FIELDS:
+        values = record.get(key, [])
+        if metadata_stale:
+            char_metadata[key] = [0] * len(full_text) if values else []
+        else:
+            aligned = _align_optional_char_metadata(values, len(filtered_text))
+            char_metadata[key] = [0] * header_len + aligned if aligned else []
 
     adjusted_chunks = [
         {
@@ -775,13 +812,17 @@ def process_record_with_policy(
     combined = {
         **{k: v for k, v in record.items()
            if k not in ("text", "structure_ids", "chunk_boundaries",
-                        "call_edges", "type_edges", "actual_token_count")},
+                        "call_edges", "type_edges", "actual_token_count",
+                        *_CHAR_LEVEL_METADATA_FIELDS)},
         "text": full_text,
         "structure_ids": full_sids,
         "chunk_boundaries": adjusted_chunks,
         "call_edges": filtered_call_edges,
         "type_edges": filtered_type_edges,
+        **char_metadata,
     }
+    if not combined.get("platform_info"):
+        combined["platform_info"] = dict(_DEFAULT_PLATFORM_INFO)
 
     if overflow_policy == "drop":
         docs = maybe_keep_document_exact(combined, tokenizer, max_tokens=max_tokens)

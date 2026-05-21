@@ -1,6 +1,6 @@
 @T.prim_func
 def local_gb10_quarter_path_c_10_12(
-    path_c_float32_abi_bank: T.Buffer((355909005,), "float32"),
+    path_c_float32_abi_bank: T.Buffer((385269133,), "float32"),
     path_c_uint8_abi_bank: T.Buffer((14680064,), "uint8"),
     path_c_int32_abi_bank: T.Buffer((1,), "int32"),
     local_gb10_quarter_brick_10_M_mamba3_conv_history: T.Buffer((2, 11264), "float32"),
@@ -11,15 +11,15 @@ def local_gb10_quarter_path_c_10_12(
     local_gb10_quarter_brick_11_R_m2rnn_h_next: T.Buffer((4, 64, 16), "float32"),
     local_gb10_quarter_brick_10_M_delta: T.Buffer((3584,), "float32"),
     local_gb10_quarter_brick_10_M_hidden_after: T.Buffer((3584,), "float32"),
-    local_gb10_quarter_brick_10_M_residual_norm_hidden: T.Buffer((3584,), "float32"),
-    local_gb10_quarter_brick_11_R_delta: T.Buffer((3584,), "float32"),
     local_gb10_quarter_brick_11_R_residual_norm_hidden: T.Buffer((3584,), "float32"),
+    local_gb10_quarter_brick_11_R_delta: T.Buffer((3584,), "float32"),
+    local_gb10_quarter_brick_12_A_residual_norm_hidden: T.Buffer((3584,), "float32"),
     local_gb10_quarter_brick_12_A_qkv_projection_q_fp8_grad: T.Buffer((3584,), "float32"),
     local_gb10_quarter_brick_12_A_qkv_projection_kv_fp8_grad: T.Buffer((3584,), "float32"),
-    local_gb10_quarter_brick_11_R_residual_norm_hidden_grad: T.Buffer((3584,), "float32"),
+    local_gb10_quarter_brick_12_A_residual_norm_hidden_grad: T.Buffer((3584,), "float32"),
     local_gb10_quarter_brick_10_M_hidden_after_grad: T.Buffer((3584,), "float32"),
     local_gb10_quarter_brick_11_R_delta_grad: T.Buffer((3584,), "float32"),
-    local_gb10_quarter_brick_10_M_residual_norm_hidden_grad: T.Buffer((3584,), "float32"),
+    local_gb10_quarter_brick_11_R_residual_norm_hidden_grad: T.Buffer((3584,), "float32"),
     local_gb10_quarter_brick_10_M_delta_grad: T.Buffer((3584,), "float32"),
     local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_context_values: T.Buffer((3584,), "float32"),
     local_gb10_quarter_brick_10_M_mamba3_angle_cumsum: T.Buffer((112, 16), "float32"),
@@ -67,12 +67,12 @@ def local_gb10_quarter_path_c_10_12(
         local_gb10_quarter_brick_10_M_bwd_mamba3_dt_grad = T.alloc_local((1,), "float32")
         local_gb10_quarter_brick_10_M_bwd_mamba3_state_grad = T.alloc_local((1,), "float32")
         local_gb10_quarter_brick_10_M_bwd_mamba3_out_grad = T.alloc_local((1,), "float32")
-        local_gb10_quarter_brick_10_M_residual_norm_row_sum_sq_partial = T.alloc_shared((256,), "float32")
-        local_gb10_quarter_brick_10_M_residual_norm_row_sum_sq = T.alloc_local((1,), "float32")
-        local_gb10_quarter_brick_10_M_residual_norm_row_inv_rms = T.alloc_local((1,), "float32")
         local_gb10_quarter_brick_11_R_residual_norm_row_sum_sq_partial = T.alloc_shared((256,), "float32")
         local_gb10_quarter_brick_11_R_residual_norm_row_sum_sq = T.alloc_local((1,), "float32")
         local_gb10_quarter_brick_11_R_residual_norm_row_inv_rms = T.alloc_local((1,), "float32")
+        local_gb10_quarter_brick_12_A_residual_norm_row_sum_sq_partial = T.alloc_shared((256,), "float32")
+        local_gb10_quarter_brick_12_A_residual_norm_row_sum_sq = T.alloc_local((1,), "float32")
+        local_gb10_quarter_brick_12_A_residual_norm_row_inv_rms = T.alloc_local((1,), "float32")
         local_gb10_quarter_brick_10_M_mamba3_b_inv_rms = T.alloc_shared((4, 8), "float32")
         local_gb10_quarter_brick_10_M_mamba3_c_inv_rms = T.alloc_shared((4, 8), "float32")
         local_gb10_quarter_brick_10_M_mamba3_b_raw = T.alloc_shared((8, 64), "float32")
@@ -117,15 +117,22 @@ def local_gb10_quarter_path_c_10_12(
             local_gb10_quarter_brick_11_R_head_init = local_gb10_quarter_brick_11_R_state_idx_init // 1024
             local_gb10_quarter_brick_11_R_kk_init = (local_gb10_quarter_brick_11_R_state_idx_init // 16) % 64
             local_gb10_quarter_brick_11_R_vv_init = local_gb10_quarter_brick_11_R_state_idx_init % 16
-            local_gb10_quarter_brick_11_R_m2rnn_h_state[local_gb10_quarter_brick_11_R_head_init, local_gb10_quarter_brick_11_R_kk_init, local_gb10_quarter_brick_11_R_vv_init] = path_c_float32_abi_bank[110165896 + ((local_gb10_quarter_brick_11_R_head_init * 1024 + local_gb10_quarter_brick_11_R_kk_init * 16 + local_gb10_quarter_brick_11_R_vv_init) % 4096)]
-            local_gb10_quarter_brick_11_R_m2rnn_h_next[local_gb10_quarter_brick_11_R_head_init, local_gb10_quarter_brick_11_R_kk_init, local_gb10_quarter_brick_11_R_vv_init] = path_c_float32_abi_bank[110165896 + ((local_gb10_quarter_brick_11_R_head_init * 1024 + local_gb10_quarter_brick_11_R_kk_init * 16 + local_gb10_quarter_brick_11_R_vv_init) % 4096)]
+            local_gb10_quarter_brick_11_R_m2rnn_h_state[local_gb10_quarter_brick_11_R_head_init, local_gb10_quarter_brick_11_R_kk_init, local_gb10_quarter_brick_11_R_vv_init] = path_c_float32_abi_bank[124845960 + ((local_gb10_quarter_brick_11_R_head_init * 1024 + local_gb10_quarter_brick_11_R_kk_init * 16 + local_gb10_quarter_brick_11_R_vv_init) % 4096)]
+            local_gb10_quarter_brick_11_R_m2rnn_h_next[local_gb10_quarter_brick_11_R_head_init, local_gb10_quarter_brick_11_R_kk_init, local_gb10_quarter_brick_11_R_vv_init] = path_c_float32_abi_bank[124845960 + ((local_gb10_quarter_brick_11_R_head_init * 1024 + local_gb10_quarter_brick_11_R_kk_init * 16 + local_gb10_quarter_brick_11_R_vv_init) % 4096)]
         T.sync_threads()
         # local_gb10_quarter_brick_11_R: m2rnn_conv_policy: ring_history
         for local_gb10_quarter_brick_11_R_history_idx_init in T.serial(lane, 480, step=256):
             local_gb10_quarter_brick_11_R_hist_init = local_gb10_quarter_brick_11_R_history_idx_init // 160
             local_gb10_quarter_brick_11_R_conv_ch_init = local_gb10_quarter_brick_11_R_history_idx_init % 160
-            local_gb10_quarter_brick_11_R_m2rnn_conv_history[local_gb10_quarter_brick_11_R_hist_init, local_gb10_quarter_brick_11_R_conv_ch_init] = path_c_float32_abi_bank[110169992 + ((local_gb10_quarter_brick_11_R_hist_init * 160 + local_gb10_quarter_brick_11_R_conv_ch_init) % 480)]
+            local_gb10_quarter_brick_11_R_m2rnn_conv_history[local_gb10_quarter_brick_11_R_hist_init, local_gb10_quarter_brick_11_R_conv_ch_init] = path_c_float32_abi_bank[124850056 + ((local_gb10_quarter_brick_11_R_hist_init * 160 + local_gb10_quarter_brick_11_R_conv_ch_init) % 480)]
         T.sync_threads()
+        local_gb10_quarter_brick_12_A_residual_norm_bwd_row_sum_sq_partial = T.alloc_shared((256,), "float32")
+        local_gb10_quarter_brick_12_A_residual_norm_bwd_row_dot_partial = T.alloc_shared((256,), "float32")
+        local_gb10_quarter_brick_12_A_residual_norm_bwd_row_sum_sq = T.alloc_local((1,), "float32")
+        local_gb10_quarter_brick_12_A_residual_norm_bwd_row_inv_rms = T.alloc_local((1,), "float32")
+        local_gb10_quarter_brick_12_A_residual_norm_bwd_row_dot = T.alloc_local((1,), "float32")
+        local_gb10_quarter_brick_12_A_residual_norm_bwd_row_norm_grad = T.alloc_local((1,), "float32")
+        local_gb10_quarter_brick_12_A_residual_norm_bwd_row_total_grad = T.alloc_local((1,), "float32")
         local_gb10_quarter_brick_11_R_residual_norm_bwd_row_sum_sq_partial = T.alloc_shared((256,), "float32")
         local_gb10_quarter_brick_11_R_residual_norm_bwd_row_dot_partial = T.alloc_shared((256,), "float32")
         local_gb10_quarter_brick_11_R_residual_norm_bwd_row_sum_sq = T.alloc_local((1,), "float32")
@@ -133,13 +140,6 @@ def local_gb10_quarter_path_c_10_12(
         local_gb10_quarter_brick_11_R_residual_norm_bwd_row_dot = T.alloc_local((1,), "float32")
         local_gb10_quarter_brick_11_R_residual_norm_bwd_row_norm_grad = T.alloc_local((1,), "float32")
         local_gb10_quarter_brick_11_R_residual_norm_bwd_row_total_grad = T.alloc_local((1,), "float32")
-        local_gb10_quarter_brick_10_M_residual_norm_bwd_row_sum_sq_partial = T.alloc_shared((256,), "float32")
-        local_gb10_quarter_brick_10_M_residual_norm_bwd_row_dot_partial = T.alloc_shared((256,), "float32")
-        local_gb10_quarter_brick_10_M_residual_norm_bwd_row_sum_sq = T.alloc_local((1,), "float32")
-        local_gb10_quarter_brick_10_M_residual_norm_bwd_row_inv_rms = T.alloc_local((1,), "float32")
-        local_gb10_quarter_brick_10_M_residual_norm_bwd_row_dot = T.alloc_local((1,), "float32")
-        local_gb10_quarter_brick_10_M_residual_norm_bwd_row_norm_grad = T.alloc_local((1,), "float32")
-        local_gb10_quarter_brick_10_M_residual_norm_bwd_row_total_grad = T.alloc_local((1,), "float32")
         for row in T.serial(0, 4096):
             # local_gb10_quarter_brick_10_M: mamba3_mimo
             # local_gb10_quarter_brick_10_M production_fragment_status: production_region_inlined
@@ -232,22 +232,22 @@ def local_gb10_quarter_path_c_10_12(
             for local_gb10_quarter_brick_10_M_conv_ch in T.serial(lane, 11264, step=256):
                 local_gb10_quarter_brick_10_M_mamba3_conv_history[1, local_gb10_quarter_brick_10_M_conv_ch] = local_gb10_quarter_brick_10_M_mamba3_projected_vec[7168 + local_gb10_quarter_brick_10_M_conv_ch]
             T.sync_threads()
-            # local_gb10_quarter_brick_10_M_residual_norm: residual_rmsnorm
-            # local_gb10_quarter_brick_10_M_residual_norm production_fragment_status: production_region_inlined
-            # local_gb10_quarter_brick_10_M_residual_norm production_fragment_reason: row-phased descriptor codegen emits the residual bridge, full-row sum-of-squares reduction, inverse RMS, and weighted normalized output without full activation staging
-            local_gb10_quarter_brick_10_M_residual_norm_row_sum_sq_partial[lane] = 0.0
+            # local_gb10_quarter_brick_11_R_residual_norm: residual_rmsnorm
+            # local_gb10_quarter_brick_11_R_residual_norm production_fragment_status: production_region_inlined
+            # local_gb10_quarter_brick_11_R_residual_norm production_fragment_reason: row-phased descriptor codegen emits the residual bridge, full-row sum-of-squares reduction, inverse RMS, and weighted normalized output without full activation staging
+            local_gb10_quarter_brick_11_R_residual_norm_row_sum_sq_partial[lane] = 0.0
             for i in T.serial(row * 3584 + lane, (row + 1) * 3584, step=256):
-                local_gb10_quarter_brick_10_M_residual_norm_row_sum_sq_partial[lane] = local_gb10_quarter_brick_10_M_residual_norm_row_sum_sq_partial[lane] + ((path_c_float32_abi_bank[i] + local_gb10_quarter_brick_10_M_delta[i % 3584]) * (path_c_float32_abi_bank[i] + local_gb10_quarter_brick_10_M_delta[i % 3584]))
+                local_gb10_quarter_brick_11_R_residual_norm_row_sum_sq_partial[lane] = local_gb10_quarter_brick_11_R_residual_norm_row_sum_sq_partial[lane] + ((path_c_float32_abi_bank[109121760 + (i)] + local_gb10_quarter_brick_10_M_delta[i % 3584]) * (path_c_float32_abi_bank[109121760 + (i)] + local_gb10_quarter_brick_10_M_delta[i % 3584]))
             T.sync_threads()
             if lane == 0:
-                local_gb10_quarter_brick_10_M_residual_norm_row_sum_sq[0] = 0.0
+                local_gb10_quarter_brick_11_R_residual_norm_row_sum_sq[0] = 0.0
                 for partial_lane in T.serial(0, 256):
-                    local_gb10_quarter_brick_10_M_residual_norm_row_sum_sq[0] = local_gb10_quarter_brick_10_M_residual_norm_row_sum_sq[0] + local_gb10_quarter_brick_10_M_residual_norm_row_sum_sq_partial[partial_lane]
-                local_gb10_quarter_brick_10_M_residual_norm_row_inv_rms[0] = T.rsqrt((local_gb10_quarter_brick_10_M_residual_norm_row_sum_sq[0] / 3584.0) + 0.00001)
+                    local_gb10_quarter_brick_11_R_residual_norm_row_sum_sq[0] = local_gb10_quarter_brick_11_R_residual_norm_row_sum_sq[0] + local_gb10_quarter_brick_11_R_residual_norm_row_sum_sq_partial[partial_lane]
+                local_gb10_quarter_brick_11_R_residual_norm_row_inv_rms[0] = T.rsqrt((local_gb10_quarter_brick_11_R_residual_norm_row_sum_sq[0] / 3584.0) + 0.00001)
             T.sync_threads()
             for i in T.serial(row * 3584 + lane, (row + 1) * 3584, step=256):
-                local_gb10_quarter_brick_10_M_hidden_after[i % 3584] = (path_c_float32_abi_bank[i] + local_gb10_quarter_brick_10_M_delta[i % 3584])
-                local_gb10_quarter_brick_10_M_residual_norm_hidden[i % 3584] = (path_c_float32_abi_bank[i] + local_gb10_quarter_brick_10_M_delta[i % 3584]) * local_gb10_quarter_brick_10_M_residual_norm_row_inv_rms[0] * path_c_float32_abi_bank[109121760 + (i % 3584)]
+                local_gb10_quarter_brick_10_M_hidden_after[i % 3584] = (path_c_float32_abi_bank[109121760 + (i)] + local_gb10_quarter_brick_10_M_delta[i % 3584])
+                local_gb10_quarter_brick_11_R_residual_norm_hidden[i % 3584] = (path_c_float32_abi_bank[109121760 + (i)] + local_gb10_quarter_brick_10_M_delta[i % 3584]) * local_gb10_quarter_brick_11_R_residual_norm_row_inv_rms[0] * path_c_float32_abi_bank[123801824 + (i % 3584)]
             T.sync_threads()
             # local_gb10_quarter_brick_11_R: m2rnn
             # local_gb10_quarter_brick_11_R production_fragment_status: production_region_inlined
@@ -256,24 +256,24 @@ def local_gb10_quarter_path_c_10_12(
             for local_gb10_quarter_brick_11_R_proj_dim in T.serial(lane, 226, step=256):
                 local_gb10_quarter_brick_11_R_m2rnn_projected_vec[local_gb10_quarter_brick_11_R_proj_dim] = 0.0
                 for local_gb10_quarter_brick_11_R_hidden_dim in T.serial(0, 3584):
-                    local_gb10_quarter_brick_11_R_m2rnn_projected_vec[local_gb10_quarter_brick_11_R_proj_dim] = local_gb10_quarter_brick_11_R_m2rnn_projected_vec[local_gb10_quarter_brick_11_R_proj_dim] + (local_gb10_quarter_brick_10_M_residual_norm_hidden[(row * 3584 + local_gb10_quarter_brick_11_R_hidden_dim) % 3584] * path_c_float32_abi_bank[109125344 + ((local_gb10_quarter_brick_11_R_proj_dim * 3584 + local_gb10_quarter_brick_11_R_hidden_dim) % 809984)])
+                    local_gb10_quarter_brick_11_R_m2rnn_projected_vec[local_gb10_quarter_brick_11_R_proj_dim] = local_gb10_quarter_brick_11_R_m2rnn_projected_vec[local_gb10_quarter_brick_11_R_proj_dim] + (local_gb10_quarter_brick_11_R_residual_norm_hidden[(row * 3584 + local_gb10_quarter_brick_11_R_hidden_dim) % 3584] * path_c_float32_abi_bank[123805408 + ((local_gb10_quarter_brick_11_R_proj_dim * 3584 + local_gb10_quarter_brick_11_R_hidden_dim) % 809984)])
             T.sync_threads()
             # m2rnn_conv_policy: lane_strided_causal_depthwise_ring_history
             for local_gb10_quarter_brick_11_R_conv_ch in T.serial(lane, 160, step=256):
-                local_gb10_quarter_brick_11_R_m2rnn_conv_vec[local_gb10_quarter_brick_11_R_conv_ch] = path_c_float32_abi_bank[109935968 + ((local_gb10_quarter_brick_11_R_conv_ch) % 160)]
+                local_gb10_quarter_brick_11_R_m2rnn_conv_vec[local_gb10_quarter_brick_11_R_conv_ch] = path_c_float32_abi_bank[124616032 + ((local_gb10_quarter_brick_11_R_conv_ch) % 160)]
                 for local_gb10_quarter_brick_11_R_kernel_pos in T.serial(0, 3):
-                    local_gb10_quarter_brick_11_R_m2rnn_conv_vec[local_gb10_quarter_brick_11_R_conv_ch] = local_gb10_quarter_brick_11_R_m2rnn_conv_vec[local_gb10_quarter_brick_11_R_conv_ch] + (local_gb10_quarter_brick_11_R_m2rnn_conv_history[local_gb10_quarter_brick_11_R_kernel_pos, local_gb10_quarter_brick_11_R_conv_ch] * path_c_float32_abi_bank[109935328 + ((local_gb10_quarter_brick_11_R_conv_ch * 4 + local_gb10_quarter_brick_11_R_kernel_pos) % 640)])
-                local_gb10_quarter_brick_11_R_m2rnn_conv_vec[local_gb10_quarter_brick_11_R_conv_ch] = local_gb10_quarter_brick_11_R_m2rnn_conv_vec[local_gb10_quarter_brick_11_R_conv_ch] + (local_gb10_quarter_brick_11_R_m2rnn_projected_vec[local_gb10_quarter_brick_11_R_conv_ch] * path_c_float32_abi_bank[109935328 + ((local_gb10_quarter_brick_11_R_conv_ch * 4 + 3) % 640)])
+                    local_gb10_quarter_brick_11_R_m2rnn_conv_vec[local_gb10_quarter_brick_11_R_conv_ch] = local_gb10_quarter_brick_11_R_m2rnn_conv_vec[local_gb10_quarter_brick_11_R_conv_ch] + (local_gb10_quarter_brick_11_R_m2rnn_conv_history[local_gb10_quarter_brick_11_R_kernel_pos, local_gb10_quarter_brick_11_R_conv_ch] * path_c_float32_abi_bank[124615392 + ((local_gb10_quarter_brick_11_R_conv_ch * 4 + local_gb10_quarter_brick_11_R_kernel_pos) % 640)])
+                local_gb10_quarter_brick_11_R_m2rnn_conv_vec[local_gb10_quarter_brick_11_R_conv_ch] = local_gb10_quarter_brick_11_R_m2rnn_conv_vec[local_gb10_quarter_brick_11_R_conv_ch] + (local_gb10_quarter_brick_11_R_m2rnn_projected_vec[local_gb10_quarter_brick_11_R_conv_ch] * path_c_float32_abi_bank[124615392 + ((local_gb10_quarter_brick_11_R_conv_ch * 4 + 3) % 640)])
                 local_gb10_quarter_brick_11_R_m2rnn_conv_vec[local_gb10_quarter_brick_11_R_conv_ch] = local_gb10_quarter_brick_11_R_m2rnn_conv_vec[local_gb10_quarter_brick_11_R_conv_ch] * (1.0 / (1.0 + T.exp(-local_gb10_quarter_brick_11_R_m2rnn_conv_vec[local_gb10_quarter_brick_11_R_conv_ch])))
             T.sync_threads()
             # m2rnn_recurrence_policy: lane_strided_mapped_state_update
             for local_gb10_quarter_brick_11_R_head in T.serial(lane, 4, step=256):
-                local_gb10_quarter_brick_11_R_m2rnn_decay[0] = T.exp(-T.exp(path_c_float32_abi_bank[109936384 + ((local_gb10_quarter_brick_11_R_head) % 4)]) * T.log(1.0 + T.exp(local_gb10_quarter_brick_11_R_m2rnn_projected_vec[160 + (local_gb10_quarter_brick_11_R_head // 2)] + path_c_float32_abi_bank[109936388 + ((local_gb10_quarter_brick_11_R_head) % 4)])))
+                local_gb10_quarter_brick_11_R_m2rnn_decay[0] = T.exp(-T.exp(path_c_float32_abi_bank[124616448 + ((local_gb10_quarter_brick_11_R_head) % 4)]) * T.log(1.0 + T.exp(local_gb10_quarter_brick_11_R_m2rnn_projected_vec[160 + (local_gb10_quarter_brick_11_R_head // 2)] + path_c_float32_abi_bank[124616452 + ((local_gb10_quarter_brick_11_R_head) % 4)])))
                 for local_gb10_quarter_brick_11_R_kk in T.serial(0, 64):
                     for local_gb10_quarter_brick_11_R_vv in T.serial(0, 16):
                         local_gb10_quarter_brick_11_R_m2rnn_accum[0] = 0.0
                         for local_gb10_quarter_brick_11_R_vv_inner in T.serial(0, 16):
-                            local_gb10_quarter_brick_11_R_m2rnn_accum[0] = local_gb10_quarter_brick_11_R_m2rnn_accum[0] + (local_gb10_quarter_brick_11_R_m2rnn_h_state[local_gb10_quarter_brick_11_R_head, local_gb10_quarter_brick_11_R_kk, local_gb10_quarter_brick_11_R_vv_inner] * path_c_float32_abi_bank[109936128 + (((local_gb10_quarter_brick_11_R_head // 4) * 256 + local_gb10_quarter_brick_11_R_vv_inner * 16 + local_gb10_quarter_brick_11_R_vv) % 256)])
+                            local_gb10_quarter_brick_11_R_m2rnn_accum[0] = local_gb10_quarter_brick_11_R_m2rnn_accum[0] + (local_gb10_quarter_brick_11_R_m2rnn_h_state[local_gb10_quarter_brick_11_R_head, local_gb10_quarter_brick_11_R_kk, local_gb10_quarter_brick_11_R_vv_inner] * path_c_float32_abi_bank[124616192 + (((local_gb10_quarter_brick_11_R_head // 4) * 256 + local_gb10_quarter_brick_11_R_vv_inner * 16 + local_gb10_quarter_brick_11_R_vv) % 256)])
                         local_gb10_quarter_brick_11_R_m2rnn_h_next[local_gb10_quarter_brick_11_R_head, local_gb10_quarter_brick_11_R_kk, local_gb10_quarter_brick_11_R_vv] = (local_gb10_quarter_brick_11_R_m2rnn_decay[0] * local_gb10_quarter_brick_11_R_m2rnn_h_state[local_gb10_quarter_brick_11_R_head, local_gb10_quarter_brick_11_R_kk, local_gb10_quarter_brick_11_R_vv]) + ((1.0 - local_gb10_quarter_brick_11_R_m2rnn_decay[0]) * T.tanh(local_gb10_quarter_brick_11_R_m2rnn_accum[0] + (local_gb10_quarter_brick_11_R_m2rnn_conv_vec[64 + ((local_gb10_quarter_brick_11_R_head // 4) * 64) + local_gb10_quarter_brick_11_R_kk] * local_gb10_quarter_brick_11_R_m2rnn_conv_vec[128 + ((local_gb10_quarter_brick_11_R_head // 2) * 16) + local_gb10_quarter_brick_11_R_vv])))
             T.sync_threads()
             # m2rnn_post_policy: lane_strided_residual_gate_norm_out_proj
@@ -283,7 +283,7 @@ def local_gb10_quarter_path_c_10_12(
                 local_gb10_quarter_brick_11_R_m2rnn_post_vec[local_gb10_quarter_brick_11_R_feature] = 0.0
                 for local_gb10_quarter_brick_11_R_kk in T.serial(0, 64):
                     local_gb10_quarter_brick_11_R_m2rnn_post_vec[local_gb10_quarter_brick_11_R_feature] = local_gb10_quarter_brick_11_R_m2rnn_post_vec[local_gb10_quarter_brick_11_R_feature] + (local_gb10_quarter_brick_11_R_m2rnn_conv_vec[0 + ((local_gb10_quarter_brick_11_R_head // 4) * 64) + local_gb10_quarter_brick_11_R_kk] * local_gb10_quarter_brick_11_R_m2rnn_h_next[local_gb10_quarter_brick_11_R_head, local_gb10_quarter_brick_11_R_kk, local_gb10_quarter_brick_11_R_vv])
-                local_gb10_quarter_brick_11_R_m2rnn_post_vec[local_gb10_quarter_brick_11_R_feature] = (local_gb10_quarter_brick_11_R_m2rnn_post_vec[local_gb10_quarter_brick_11_R_feature] + (local_gb10_quarter_brick_11_R_m2rnn_conv_vec[128 + ((local_gb10_quarter_brick_11_R_head // 2) * 16) + local_gb10_quarter_brick_11_R_vv] * path_c_float32_abi_bank[109936392 + ((local_gb10_quarter_brick_11_R_head * 16 + local_gb10_quarter_brick_11_R_vv) % 64)])) * local_gb10_quarter_brick_11_R_m2rnn_projected_vec[162 + (local_gb10_quarter_brick_11_R_feature // 1)] * (1.0 / (1.0 + T.exp(-local_gb10_quarter_brick_11_R_m2rnn_projected_vec[162 + (local_gb10_quarter_brick_11_R_feature // 1)])))
+                local_gb10_quarter_brick_11_R_m2rnn_post_vec[local_gb10_quarter_brick_11_R_feature] = (local_gb10_quarter_brick_11_R_m2rnn_post_vec[local_gb10_quarter_brick_11_R_feature] + (local_gb10_quarter_brick_11_R_m2rnn_conv_vec[128 + ((local_gb10_quarter_brick_11_R_head // 2) * 16) + local_gb10_quarter_brick_11_R_vv] * path_c_float32_abi_bank[124616456 + ((local_gb10_quarter_brick_11_R_head * 16 + local_gb10_quarter_brick_11_R_vv) % 64)])) * local_gb10_quarter_brick_11_R_m2rnn_projected_vec[162 + (local_gb10_quarter_brick_11_R_feature // 1)] * (1.0 / (1.0 + T.exp(-local_gb10_quarter_brick_11_R_m2rnn_projected_vec[162 + (local_gb10_quarter_brick_11_R_feature // 1)])))
             T.sync_threads()
             for local_gb10_quarter_brick_11_R_state_idx in T.serial(lane, 4096, step=256):
                 local_gb10_quarter_brick_11_R_head = local_gb10_quarter_brick_11_R_state_idx // 1024
@@ -303,7 +303,7 @@ def local_gb10_quarter_path_c_10_12(
             for local_gb10_quarter_brick_11_R_out_dim in T.serial(lane, 3584, step=256):
                 local_gb10_quarter_brick_11_R_m2rnn_accum[0] = 0.0
                 for local_gb10_quarter_brick_11_R_feature in T.serial(0, 64):
-                    local_gb10_quarter_brick_11_R_m2rnn_accum[0] = local_gb10_quarter_brick_11_R_m2rnn_accum[0] + (local_gb10_quarter_brick_11_R_m2rnn_post_vec[local_gb10_quarter_brick_11_R_feature] * local_gb10_quarter_brick_11_R_m2rnn_inv_rms[0] * path_c_float32_abi_bank[109936456 + ((local_gb10_quarter_brick_11_R_feature) % 64)] * path_c_float32_abi_bank[109936520 + ((local_gb10_quarter_brick_11_R_out_dim * 64 + local_gb10_quarter_brick_11_R_feature) % 229376)])
+                    local_gb10_quarter_brick_11_R_m2rnn_accum[0] = local_gb10_quarter_brick_11_R_m2rnn_accum[0] + (local_gb10_quarter_brick_11_R_m2rnn_post_vec[local_gb10_quarter_brick_11_R_feature] * local_gb10_quarter_brick_11_R_m2rnn_inv_rms[0] * path_c_float32_abi_bank[124616520 + ((local_gb10_quarter_brick_11_R_feature) % 64)] * path_c_float32_abi_bank[124616584 + ((local_gb10_quarter_brick_11_R_out_dim * 64 + local_gb10_quarter_brick_11_R_feature) % 229376)])
                 local_gb10_quarter_brick_11_R_delta[(row * 3584 + local_gb10_quarter_brick_11_R_out_dim) % 3584] = local_gb10_quarter_brick_11_R_m2rnn_accum[0]
             T.sync_threads()
             for local_gb10_quarter_brick_11_R_state_idx in T.serial(lane, 320, step=256):
@@ -313,22 +313,22 @@ def local_gb10_quarter_path_c_10_12(
             for local_gb10_quarter_brick_11_R_conv_ch in T.serial(lane, 160, step=256):
                 local_gb10_quarter_brick_11_R_m2rnn_conv_history[2, local_gb10_quarter_brick_11_R_conv_ch] = local_gb10_quarter_brick_11_R_m2rnn_projected_vec[local_gb10_quarter_brick_11_R_conv_ch]
             T.sync_threads()
-            # local_gb10_quarter_brick_11_R_residual_norm: residual_rmsnorm
-            # local_gb10_quarter_brick_11_R_residual_norm production_fragment_status: production_region_inlined
-            # local_gb10_quarter_brick_11_R_residual_norm production_fragment_reason: row-phased descriptor codegen emits the residual bridge, full-row sum-of-squares reduction, inverse RMS, and weighted normalized output without full activation staging
-            local_gb10_quarter_brick_11_R_residual_norm_row_sum_sq_partial[lane] = 0.0
+            # local_gb10_quarter_brick_12_A_residual_norm: residual_rmsnorm
+            # local_gb10_quarter_brick_12_A_residual_norm production_fragment_status: production_region_inlined
+            # local_gb10_quarter_brick_12_A_residual_norm production_fragment_reason: row-phased descriptor codegen emits the residual bridge, full-row sum-of-squares reduction, inverse RMS, and weighted normalized output without full activation staging
+            local_gb10_quarter_brick_12_A_residual_norm_row_sum_sq_partial[lane] = 0.0
             for i in T.serial(row * 3584 + lane, (row + 1) * 3584, step=256):
-                local_gb10_quarter_brick_11_R_residual_norm_row_sum_sq_partial[lane] = local_gb10_quarter_brick_11_R_residual_norm_row_sum_sq_partial[lane] + ((local_gb10_quarter_brick_10_M_hidden_after[i % 3584] + local_gb10_quarter_brick_11_R_delta[i % 3584]) * (local_gb10_quarter_brick_10_M_hidden_after[i % 3584] + local_gb10_quarter_brick_11_R_delta[i % 3584]))
+                local_gb10_quarter_brick_12_A_residual_norm_row_sum_sq_partial[lane] = local_gb10_quarter_brick_12_A_residual_norm_row_sum_sq_partial[lane] + ((local_gb10_quarter_brick_10_M_hidden_after[i % 3584] + local_gb10_quarter_brick_11_R_delta[i % 3584]) * (local_gb10_quarter_brick_10_M_hidden_after[i % 3584] + local_gb10_quarter_brick_11_R_delta[i % 3584]))
             T.sync_threads()
             if lane == 0:
-                local_gb10_quarter_brick_11_R_residual_norm_row_sum_sq[0] = 0.0
+                local_gb10_quarter_brick_12_A_residual_norm_row_sum_sq[0] = 0.0
                 for partial_lane in T.serial(0, 256):
-                    local_gb10_quarter_brick_11_R_residual_norm_row_sum_sq[0] = local_gb10_quarter_brick_11_R_residual_norm_row_sum_sq[0] + local_gb10_quarter_brick_11_R_residual_norm_row_sum_sq_partial[partial_lane]
-                local_gb10_quarter_brick_11_R_residual_norm_row_inv_rms[0] = T.rsqrt((local_gb10_quarter_brick_11_R_residual_norm_row_sum_sq[0] / 3584.0) + 0.00001)
+                    local_gb10_quarter_brick_12_A_residual_norm_row_sum_sq[0] = local_gb10_quarter_brick_12_A_residual_norm_row_sum_sq[0] + local_gb10_quarter_brick_12_A_residual_norm_row_sum_sq_partial[partial_lane]
+                local_gb10_quarter_brick_12_A_residual_norm_row_inv_rms[0] = T.rsqrt((local_gb10_quarter_brick_12_A_residual_norm_row_sum_sq[0] / 3584.0) + 0.00001)
             T.sync_threads()
             for i in T.serial(row * 3584 + lane, (row + 1) * 3584, step=256):
-                path_c_float32_abi_bank[110174056 + (i)] = (local_gb10_quarter_brick_10_M_hidden_after[i % 3584] + local_gb10_quarter_brick_11_R_delta[i % 3584])
-                local_gb10_quarter_brick_11_R_residual_norm_hidden[i % 3584] = (local_gb10_quarter_brick_10_M_hidden_after[i % 3584] + local_gb10_quarter_brick_11_R_delta[i % 3584]) * local_gb10_quarter_brick_11_R_residual_norm_row_inv_rms[0] * path_c_float32_abi_bank[110170472 + (i % 3584)]
+                path_c_float32_abi_bank[124854120 + (i)] = (local_gb10_quarter_brick_10_M_hidden_after[i % 3584] + local_gb10_quarter_brick_11_R_delta[i % 3584])
+                local_gb10_quarter_brick_12_A_residual_norm_hidden[i % 3584] = (local_gb10_quarter_brick_10_M_hidden_after[i % 3584] + local_gb10_quarter_brick_11_R_delta[i % 3584]) * local_gb10_quarter_brick_12_A_residual_norm_row_inv_rms[0] * path_c_float32_abi_bank[124850536 + (i % 3584)]
             T.sync_threads()
             # local_gb10_quarter_brick_12_A_qkv_projection: attention_qkv_projection
             # local_gb10_quarter_brick_12_A_qkv_projection production_fragment_status: production_region_inlined
@@ -343,16 +343,16 @@ def local_gb10_quarter_path_c_10_12(
                 for local_gb10_quarter_brick_12_A_qkv_projection_h in T.serial(0, 3584):
                     local_gb10_quarter_brick_12_A_qkv_projection_src_i = row * 3584 + local_gb10_quarter_brick_12_A_qkv_projection_h
                     for local_gb10_quarter_brick_12_A_qkv_projection_d in T.serial(0, 128):
-                        local_gb10_quarter_brick_12_A_qkv_projection_attention_q_projected_vec[local_gb10_quarter_brick_12_A_qkv_projection_d] = local_gb10_quarter_brick_12_A_qkv_projection_attention_q_projected_vec[local_gb10_quarter_brick_12_A_qkv_projection_d] + (local_gb10_quarter_brick_11_R_residual_norm_hidden[(local_gb10_quarter_brick_12_A_qkv_projection_src_i) % 3584] * path_c_float32_abi_bank[124854120 + (((local_gb10_quarter_brick_12_A_qkv_projection_q_head * 128 + local_gb10_quarter_brick_12_A_qkv_projection_d) * 3584 + local_gb10_quarter_brick_12_A_qkv_projection_h) % 12845056)])
+                        local_gb10_quarter_brick_12_A_qkv_projection_attention_q_projected_vec[local_gb10_quarter_brick_12_A_qkv_projection_d] = local_gb10_quarter_brick_12_A_qkv_projection_attention_q_projected_vec[local_gb10_quarter_brick_12_A_qkv_projection_d] + (local_gb10_quarter_brick_12_A_residual_norm_hidden[(local_gb10_quarter_brick_12_A_qkv_projection_src_i) % 3584] * path_c_float32_abi_bank[139534184 + (((local_gb10_quarter_brick_12_A_qkv_projection_q_head * 128 + local_gb10_quarter_brick_12_A_qkv_projection_d) * 3584 + local_gb10_quarter_brick_12_A_qkv_projection_h) % 12845056)])
                 for local_gb10_quarter_brick_12_A_qkv_projection_d in T.serial(0, 128):
                     local_gb10_quarter_brick_12_A_qkv_projection_attention_q_projected[0] = local_gb10_quarter_brick_12_A_qkv_projection_attention_q_projected_vec[local_gb10_quarter_brick_12_A_qkv_projection_d]
                     if local_gb10_quarter_brick_12_A_qkv_projection_d < 64:
                         local_gb10_quarter_brick_12_A_qkv_projection_attention_q_projected_pair[0] = local_gb10_quarter_brick_12_A_qkv_projection_attention_q_projected_vec[local_gb10_quarter_brick_12_A_qkv_projection_d + 64]
-                        local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_phase[0] = T.cast(row, "float32") * path_c_float32_abi_bank[150544232 + ((local_gb10_quarter_brick_12_A_qkv_projection_d) % 64)]
+                        local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_phase[0] = T.cast(row, "float32") * path_c_float32_abi_bank[165224296 + ((local_gb10_quarter_brick_12_A_qkv_projection_d) % 64)]
                         local_gb10_quarter_brick_12_A_qkv_projection_attention_q_prepared[0] = (local_gb10_quarter_brick_12_A_qkv_projection_attention_q_projected[0] * T.cos(local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_phase[0])) + (local_gb10_quarter_brick_12_A_qkv_projection_attention_q_projected_pair[0] * T.sin(local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_phase[0]))
                     else:
                         local_gb10_quarter_brick_12_A_qkv_projection_attention_q_projected_pair[0] = local_gb10_quarter_brick_12_A_qkv_projection_attention_q_projected_vec[local_gb10_quarter_brick_12_A_qkv_projection_d - 64]
-                        local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_phase[0] = T.cast(row, "float32") * path_c_float32_abi_bank[150544232 + ((local_gb10_quarter_brick_12_A_qkv_projection_d - 64) % 64)]
+                        local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_phase[0] = T.cast(row, "float32") * path_c_float32_abi_bank[165224296 + ((local_gb10_quarter_brick_12_A_qkv_projection_d - 64) % 64)]
                         local_gb10_quarter_brick_12_A_qkv_projection_attention_q_prepared[0] = (local_gb10_quarter_brick_12_A_qkv_projection_attention_q_projected[0] * T.cos(local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_phase[0])) - (local_gb10_quarter_brick_12_A_qkv_projection_attention_q_projected_pair[0] * T.sin(local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_phase[0]))
                     local_gb10_quarter_brick_12_A_qkv_projection_q_scale[local_gb10_quarter_brick_12_A_qkv_projection_q_head] = T.max(local_gb10_quarter_brick_12_A_qkv_projection_q_scale[local_gb10_quarter_brick_12_A_qkv_projection_q_head], T.abs(T.cast(local_gb10_quarter_brick_12_A_qkv_projection_attention_q_prepared[0], "float32")))
                 local_gb10_quarter_brick_12_A_qkv_projection_q_scale[local_gb10_quarter_brick_12_A_qkv_projection_q_head] = T.max(local_gb10_quarter_brick_12_A_qkv_projection_q_scale[local_gb10_quarter_brick_12_A_qkv_projection_q_head] * T.cast(0.002232142857142857, "float32"), T.cast(1.0e-12, "float32"))
@@ -360,44 +360,44 @@ def local_gb10_quarter_path_c_10_12(
                     local_gb10_quarter_brick_12_A_qkv_projection_attention_q_projected[0] = local_gb10_quarter_brick_12_A_qkv_projection_attention_q_projected_vec[local_gb10_quarter_brick_12_A_qkv_projection_d]
                     if local_gb10_quarter_brick_12_A_qkv_projection_d < 64:
                         local_gb10_quarter_brick_12_A_qkv_projection_attention_q_projected_pair[0] = local_gb10_quarter_brick_12_A_qkv_projection_attention_q_projected_vec[local_gb10_quarter_brick_12_A_qkv_projection_d + 64]
-                        local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_phase[0] = T.cast(row, "float32") * path_c_float32_abi_bank[150544232 + ((local_gb10_quarter_brick_12_A_qkv_projection_d) % 64)]
+                        local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_phase[0] = T.cast(row, "float32") * path_c_float32_abi_bank[165224296 + ((local_gb10_quarter_brick_12_A_qkv_projection_d) % 64)]
                         local_gb10_quarter_brick_12_A_qkv_projection_attention_q_prepared[0] = (local_gb10_quarter_brick_12_A_qkv_projection_attention_q_projected[0] * T.cos(local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_phase[0])) + (local_gb10_quarter_brick_12_A_qkv_projection_attention_q_projected_pair[0] * T.sin(local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_phase[0]))
                     else:
                         local_gb10_quarter_brick_12_A_qkv_projection_attention_q_projected_pair[0] = local_gb10_quarter_brick_12_A_qkv_projection_attention_q_projected_vec[local_gb10_quarter_brick_12_A_qkv_projection_d - 64]
-                        local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_phase[0] = T.cast(row, "float32") * path_c_float32_abi_bank[150544232 + ((local_gb10_quarter_brick_12_A_qkv_projection_d - 64) % 64)]
+                        local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_phase[0] = T.cast(row, "float32") * path_c_float32_abi_bank[165224296 + ((local_gb10_quarter_brick_12_A_qkv_projection_d - 64) % 64)]
                         local_gb10_quarter_brick_12_A_qkv_projection_attention_q_prepared[0] = (local_gb10_quarter_brick_12_A_qkv_projection_attention_q_projected[0] * T.cos(local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_phase[0])) - (local_gb10_quarter_brick_12_A_qkv_projection_attention_q_projected_pair[0] * T.sin(local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_phase[0]))
                     local_gb10_quarter_brick_12_A_qkv_projection_q_fp8[local_gb10_quarter_brick_12_A_qkv_projection_q_head * 128 + local_gb10_quarter_brick_12_A_qkv_projection_d] = float_to_fp8_e4m3fn_bits(T.min(T.max((T.cast(local_gb10_quarter_brick_12_A_qkv_projection_attention_q_prepared[0], "float32") / local_gb10_quarter_brick_12_A_qkv_projection_q_scale[local_gb10_quarter_brick_12_A_qkv_projection_q_head]), T.cast(-448.0, "float32")), T.cast(448.0, "float32")))
             for local_gb10_quarter_brick_12_A_qkv_projection_kv_head in T.serial(lane, 28, step=256):
-                path_c_float32_abi_bank[150544296 + (((row * 28 + local_gb10_quarter_brick_12_A_qkv_projection_kv_head) // 3584) * 28 + ((((row * 28 + local_gb10_quarter_brick_12_A_qkv_projection_kv_head) % 3584) // 128) % 28))] = 0.0
+                path_c_float32_abi_bank[165224360 + (((row * 28 + local_gb10_quarter_brick_12_A_qkv_projection_kv_head) // 3584) * 28 + ((((row * 28 + local_gb10_quarter_brick_12_A_qkv_projection_kv_head) % 3584) // 128) % 28))] = 0.0
                 for local_gb10_quarter_brick_12_A_qkv_projection_d in T.serial(0, 128):
                     local_gb10_quarter_brick_12_A_qkv_projection_attention_kv_projected_vec[local_gb10_quarter_brick_12_A_qkv_projection_d] = 0.0
                 for local_gb10_quarter_brick_12_A_qkv_projection_h in T.serial(0, 3584):
                     local_gb10_quarter_brick_12_A_qkv_projection_src_i = row * 3584 + local_gb10_quarter_brick_12_A_qkv_projection_h
                     for local_gb10_quarter_brick_12_A_qkv_projection_d in T.serial(0, 128):
-                        local_gb10_quarter_brick_12_A_qkv_projection_attention_kv_projected_vec[local_gb10_quarter_brick_12_A_qkv_projection_d] = local_gb10_quarter_brick_12_A_qkv_projection_attention_kv_projected_vec[local_gb10_quarter_brick_12_A_qkv_projection_d] + (local_gb10_quarter_brick_11_R_residual_norm_hidden[(local_gb10_quarter_brick_12_A_qkv_projection_src_i) % 3584] * path_c_float32_abi_bank[137699176 + (((local_gb10_quarter_brick_12_A_qkv_projection_kv_head * 128 + local_gb10_quarter_brick_12_A_qkv_projection_d) * 3584 + local_gb10_quarter_brick_12_A_qkv_projection_h) % 12845056)])
+                        local_gb10_quarter_brick_12_A_qkv_projection_attention_kv_projected_vec[local_gb10_quarter_brick_12_A_qkv_projection_d] = local_gb10_quarter_brick_12_A_qkv_projection_attention_kv_projected_vec[local_gb10_quarter_brick_12_A_qkv_projection_d] + (local_gb10_quarter_brick_12_A_residual_norm_hidden[(local_gb10_quarter_brick_12_A_qkv_projection_src_i) % 3584] * path_c_float32_abi_bank[152379240 + (((local_gb10_quarter_brick_12_A_qkv_projection_kv_head * 128 + local_gb10_quarter_brick_12_A_qkv_projection_d) * 3584 + local_gb10_quarter_brick_12_A_qkv_projection_h) % 12845056)])
                 for local_gb10_quarter_brick_12_A_qkv_projection_d in T.serial(0, 128):
                     local_gb10_quarter_brick_12_A_qkv_projection_attention_kv_projected[0] = local_gb10_quarter_brick_12_A_qkv_projection_attention_kv_projected_vec[local_gb10_quarter_brick_12_A_qkv_projection_d]
                     if local_gb10_quarter_brick_12_A_qkv_projection_d < 64:
                         local_gb10_quarter_brick_12_A_qkv_projection_attention_kv_projected_pair[0] = local_gb10_quarter_brick_12_A_qkv_projection_attention_kv_projected_vec[local_gb10_quarter_brick_12_A_qkv_projection_d + 64]
-                        local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_phase[0] = T.cast(row, "float32") * path_c_float32_abi_bank[150544232 + ((local_gb10_quarter_brick_12_A_qkv_projection_d) % 64)]
+                        local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_phase[0] = T.cast(row, "float32") * path_c_float32_abi_bank[165224296 + ((local_gb10_quarter_brick_12_A_qkv_projection_d) % 64)]
                         local_gb10_quarter_brick_12_A_qkv_projection_attention_kv_prepared[0] = (local_gb10_quarter_brick_12_A_qkv_projection_attention_kv_projected[0] * T.cos(local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_phase[0])) + (local_gb10_quarter_brick_12_A_qkv_projection_attention_kv_projected_pair[0] * T.sin(local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_phase[0]))
                     else:
                         local_gb10_quarter_brick_12_A_qkv_projection_attention_kv_projected_pair[0] = local_gb10_quarter_brick_12_A_qkv_projection_attention_kv_projected_vec[local_gb10_quarter_brick_12_A_qkv_projection_d - 64]
-                        local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_phase[0] = T.cast(row, "float32") * path_c_float32_abi_bank[150544232 + ((local_gb10_quarter_brick_12_A_qkv_projection_d - 64) % 64)]
+                        local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_phase[0] = T.cast(row, "float32") * path_c_float32_abi_bank[165224296 + ((local_gb10_quarter_brick_12_A_qkv_projection_d - 64) % 64)]
                         local_gb10_quarter_brick_12_A_qkv_projection_attention_kv_prepared[0] = (local_gb10_quarter_brick_12_A_qkv_projection_attention_kv_projected[0] * T.cos(local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_phase[0])) - (local_gb10_quarter_brick_12_A_qkv_projection_attention_kv_projected_pair[0] * T.sin(local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_phase[0]))
-                    path_c_float32_abi_bank[150544296 + (((row * 28 + local_gb10_quarter_brick_12_A_qkv_projection_kv_head) // 3584) * 28 + ((((row * 28 + local_gb10_quarter_brick_12_A_qkv_projection_kv_head) % 3584) // 128) % 28))] = T.max(path_c_float32_abi_bank[150544296 + (((row * 28 + local_gb10_quarter_brick_12_A_qkv_projection_kv_head) // 3584) * 28 + ((((row * 28 + local_gb10_quarter_brick_12_A_qkv_projection_kv_head) % 3584) // 128) % 28))], T.abs(T.cast(local_gb10_quarter_brick_12_A_qkv_projection_attention_kv_prepared[0], "float32")))
-                path_c_float32_abi_bank[150544296 + (((row * 28 + local_gb10_quarter_brick_12_A_qkv_projection_kv_head) // 3584) * 28 + ((((row * 28 + local_gb10_quarter_brick_12_A_qkv_projection_kv_head) % 3584) // 128) % 28))] = T.max(path_c_float32_abi_bank[150544296 + (((row * 28 + local_gb10_quarter_brick_12_A_qkv_projection_kv_head) // 3584) * 28 + ((((row * 28 + local_gb10_quarter_brick_12_A_qkv_projection_kv_head) % 3584) // 128) % 28))] * T.cast(0.002232142857142857, "float32"), T.cast(1.0e-12, "float32"))
+                    path_c_float32_abi_bank[165224360 + (((row * 28 + local_gb10_quarter_brick_12_A_qkv_projection_kv_head) // 3584) * 28 + ((((row * 28 + local_gb10_quarter_brick_12_A_qkv_projection_kv_head) % 3584) // 128) % 28))] = T.max(path_c_float32_abi_bank[165224360 + (((row * 28 + local_gb10_quarter_brick_12_A_qkv_projection_kv_head) // 3584) * 28 + ((((row * 28 + local_gb10_quarter_brick_12_A_qkv_projection_kv_head) % 3584) // 128) % 28))], T.abs(T.cast(local_gb10_quarter_brick_12_A_qkv_projection_attention_kv_prepared[0], "float32")))
+                path_c_float32_abi_bank[165224360 + (((row * 28 + local_gb10_quarter_brick_12_A_qkv_projection_kv_head) // 3584) * 28 + ((((row * 28 + local_gb10_quarter_brick_12_A_qkv_projection_kv_head) % 3584) // 128) % 28))] = T.max(path_c_float32_abi_bank[165224360 + (((row * 28 + local_gb10_quarter_brick_12_A_qkv_projection_kv_head) // 3584) * 28 + ((((row * 28 + local_gb10_quarter_brick_12_A_qkv_projection_kv_head) % 3584) // 128) % 28))] * T.cast(0.002232142857142857, "float32"), T.cast(1.0e-12, "float32"))
                 for local_gb10_quarter_brick_12_A_qkv_projection_d in T.serial(0, 128):
                     local_gb10_quarter_brick_12_A_qkv_projection_attention_kv_projected[0] = local_gb10_quarter_brick_12_A_qkv_projection_attention_kv_projected_vec[local_gb10_quarter_brick_12_A_qkv_projection_d]
                     if local_gb10_quarter_brick_12_A_qkv_projection_d < 64:
                         local_gb10_quarter_brick_12_A_qkv_projection_attention_kv_projected_pair[0] = local_gb10_quarter_brick_12_A_qkv_projection_attention_kv_projected_vec[local_gb10_quarter_brick_12_A_qkv_projection_d + 64]
-                        local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_phase[0] = T.cast(row, "float32") * path_c_float32_abi_bank[150544232 + ((local_gb10_quarter_brick_12_A_qkv_projection_d) % 64)]
+                        local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_phase[0] = T.cast(row, "float32") * path_c_float32_abi_bank[165224296 + ((local_gb10_quarter_brick_12_A_qkv_projection_d) % 64)]
                         local_gb10_quarter_brick_12_A_qkv_projection_attention_kv_prepared[0] = (local_gb10_quarter_brick_12_A_qkv_projection_attention_kv_projected[0] * T.cos(local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_phase[0])) + (local_gb10_quarter_brick_12_A_qkv_projection_attention_kv_projected_pair[0] * T.sin(local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_phase[0]))
                     else:
                         local_gb10_quarter_brick_12_A_qkv_projection_attention_kv_projected_pair[0] = local_gb10_quarter_brick_12_A_qkv_projection_attention_kv_projected_vec[local_gb10_quarter_brick_12_A_qkv_projection_d - 64]
-                        local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_phase[0] = T.cast(row, "float32") * path_c_float32_abi_bank[150544232 + ((local_gb10_quarter_brick_12_A_qkv_projection_d - 64) % 64)]
+                        local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_phase[0] = T.cast(row, "float32") * path_c_float32_abi_bank[165224296 + ((local_gb10_quarter_brick_12_A_qkv_projection_d - 64) % 64)]
                         local_gb10_quarter_brick_12_A_qkv_projection_attention_kv_prepared[0] = (local_gb10_quarter_brick_12_A_qkv_projection_attention_kv_projected[0] * T.cos(local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_phase[0])) - (local_gb10_quarter_brick_12_A_qkv_projection_attention_kv_projected_pair[0] * T.sin(local_gb10_quarter_brick_12_A_qkv_projection_attention_rope_phase[0]))
-                    path_c_uint8_abi_bank[row * 3584 + local_gb10_quarter_brick_12_A_qkv_projection_kv_head * 128 + local_gb10_quarter_brick_12_A_qkv_projection_d] = float_to_fp8_e4m3fn_bits(T.min(T.max((T.cast(local_gb10_quarter_brick_12_A_qkv_projection_attention_kv_prepared[0], "float32") / path_c_float32_abi_bank[150544296 + (((row * 28 + local_gb10_quarter_brick_12_A_qkv_projection_kv_head) // 3584) * 28 + ((((row * 28 + local_gb10_quarter_brick_12_A_qkv_projection_kv_head) % 3584) // 128) % 28))]), T.cast(-448.0, "float32")), T.cast(448.0, "float32")))
+                    path_c_uint8_abi_bank[row * 3584 + local_gb10_quarter_brick_12_A_qkv_projection_kv_head * 128 + local_gb10_quarter_brick_12_A_qkv_projection_d] = float_to_fp8_e4m3fn_bits(T.min(T.max((T.cast(local_gb10_quarter_brick_12_A_qkv_projection_attention_kv_prepared[0], "float32") / path_c_float32_abi_bank[165224360 + (((row * 28 + local_gb10_quarter_brick_12_A_qkv_projection_kv_head) // 3584) * 28 + ((((row * 28 + local_gb10_quarter_brick_12_A_qkv_projection_kv_head) % 3584) // 128) % 28))]), T.cast(-448.0, "float32")), T.cast(448.0, "float32")))
             for local_gb10_quarter_brick_12_A_qkv_projection_indices_flat in T.serial(lane, 448, step=256):
                 local_gb10_quarter_brick_12_A_qkv_projection_kv_head = local_gb10_quarter_brick_12_A_qkv_projection_indices_flat // 16
                 local_gb10_quarter_brick_12_A_qkv_projection_k_top = local_gb10_quarter_brick_12_A_qkv_projection_indices_flat % 16
@@ -427,14 +427,14 @@ def local_gb10_quarter_path_c_10_12(
                         local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_score_accum[0] = 0.0
                         for local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_dot_dim in T.serial(0, 128):
                             local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_score_accum[0] = local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_score_accum[0] + (fp8_e4m3fn_to_float(local_gb10_quarter_brick_12_A_qkv_projection_q_fp8[local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_source_head[0] * 128 + local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_dot_dim]) * fp8_e4m3fn_to_float(path_c_uint8_abi_bank[local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_index[0] * 3584 + local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_kv_head[0] * 128 + local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_dot_dim]))
-                        local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_score_accum[0] = local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_score_accum[0] * local_gb10_quarter_brick_12_A_qkv_projection_q_scale[local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_source_head[0]] * path_c_float32_abi_bank[150544296 + (((local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_index[0] * 28 + local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_kv_head[0]) // 3584) * 28 + ((((local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_index[0] * 28 + local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_kv_head[0]) % 3584) // 128) % 28))] * path_c_float32_abi_bank[150658984 + (0)]
+                        local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_score_accum[0] = local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_score_accum[0] * local_gb10_quarter_brick_12_A_qkv_projection_q_scale[local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_source_head[0]] * path_c_float32_abi_bank[165224360 + (((local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_index[0] * 28 + local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_kv_head[0]) // 3584) * 28 + ((((local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_index[0] * 28 + local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_kv_head[0]) % 3584) // 128) % 28))] * path_c_float32_abi_bank[165339048 + (0)]
                     else:
                         local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_score_accum[0] = T.float32(-3.4028234663852886e38)
                         if local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_score_accum[0] > local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_score_max[0]:
                             local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_score_max[0] = local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_score_accum[0]
                 if local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sink_enabled[0] != 0.0:
-                    if path_c_float32_abi_bank[150658985 + ((local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_q_head[0]) % 28)] > local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_score_max[0]:
-                        local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_score_max[0] = path_c_float32_abi_bank[150658985 + ((local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_q_head[0]) % 28)]
+                    if path_c_float32_abi_bank[165339049 + ((local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_q_head[0]) % 28)] > local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_score_max[0]:
+                        local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_score_max[0] = path_c_float32_abi_bank[165339049 + ((local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_q_head[0]) % 28)]
                 local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sumexp[0] = 0.0
                 for local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_k_top in T.serial(0, 16):
                     local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_index[0] = local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_indices[local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_k_top]
@@ -442,39 +442,39 @@ def local_gb10_quarter_path_c_10_12(
                         local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_score_accum[0] = 0.0
                         for local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_dot_dim in T.serial(0, 128):
                             local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_score_accum[0] = local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_score_accum[0] + (fp8_e4m3fn_to_float(local_gb10_quarter_brick_12_A_qkv_projection_q_fp8[local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_source_head[0] * 128 + local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_dot_dim]) * fp8_e4m3fn_to_float(path_c_uint8_abi_bank[local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_index[0] * 3584 + local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_kv_head[0] * 128 + local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_dot_dim]))
-                        local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_score_accum[0] = local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_score_accum[0] * local_gb10_quarter_brick_12_A_qkv_projection_q_scale[local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_source_head[0]] * path_c_float32_abi_bank[150544296 + (((local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_index[0] * 28 + local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_kv_head[0]) // 3584) * 28 + ((((local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_index[0] * 28 + local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_kv_head[0]) % 3584) // 128) % 28))] * path_c_float32_abi_bank[150658984 + (0)]
+                        local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_score_accum[0] = local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_score_accum[0] * local_gb10_quarter_brick_12_A_qkv_projection_q_scale[local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_source_head[0]] * path_c_float32_abi_bank[165224360 + (((local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_index[0] * 28 + local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_kv_head[0]) // 3584) * 28 + ((((local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_index[0] * 28 + local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_kv_head[0]) % 3584) // 128) % 28))] * path_c_float32_abi_bank[165339048 + (0)]
                     else:
                         local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_score_accum[0] = T.float32(-3.4028234663852886e38)
                         local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_score_weight[0] = T.exp(local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_score_accum[0] - local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_score_max[0])
                         local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_score_weights[local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_k_top] = local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_score_weight[0]
                         local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sumexp[0] = local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sumexp[0] + local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_score_weight[0]
                 if local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sink_enabled[0] != 0.0:
-                    local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sumexp[0] = local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sumexp[0] + T.exp(path_c_float32_abi_bank[150658985 + ((local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_q_head[0]) % 28)] - local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_score_max[0])
-                path_c_float32_abi_bank[178184133 + (((row * 28 + local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_source_head[0]) // 3584) * 28 + (((row * 28 + local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_source_head[0]) % 3584) // 128))] = 0.0
+                    local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sumexp[0] = local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sumexp[0] + T.exp(path_c_float32_abi_bank[165339049 + ((local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_q_head[0]) % 28)] - local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_score_max[0])
+                path_c_float32_abi_bank[192864197 + (((row * 28 + local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_source_head[0]) // 3584) * 28 + (((row * 28 + local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_source_head[0]) % 3584) // 128))] = 0.0
                 if local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sumexp[0] > 0.0:
-                    path_c_float32_abi_bank[178184133 + (((row * 28 + local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_source_head[0]) // 3584) * 28 + (((row * 28 + local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_source_head[0]) % 3584) // 128))] = local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_score_max[0] + T.log(local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sumexp[0])
+                    path_c_float32_abi_bank[192864197 + (((row * 28 + local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_source_head[0]) // 3584) * 28 + (((row * 28 + local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_source_head[0]) % 3584) // 128))] = local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_score_max[0] + T.log(local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sumexp[0])
                 for local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_source_dim_loop in T.serial(0, 128):
                     local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_source_dim[0] = local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_source_dim_loop
                     local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_value_accum[0] = 0.0
                     for local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_k_top in T.serial(0, 16):
                         local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_index[0] = local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_indices[local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_k_top]
                         if local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_index[0] >= 0 and local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_index[0] < 4096:
-                            local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_value_accum[0] = local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_value_accum[0] + (local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_score_weights[local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_k_top] * fp8_e4m3fn_to_float(path_c_uint8_abi_bank[local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_index[0] * 3584 + local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_kv_head[0] * 128 + local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_source_dim[0]]) * path_c_float32_abi_bank[150544296 + (((local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_index[0] * 28 + local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_kv_head[0]) // 3584) * 28 + ((((local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_index[0] * 28 + local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_kv_head[0]) % 3584) // 128) % 28))])
+                            local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_value_accum[0] = local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_value_accum[0] + (local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_score_weights[local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_k_top] * fp8_e4m3fn_to_float(path_c_uint8_abi_bank[local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_index[0] * 3584 + local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_kv_head[0] * 128 + local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_source_dim[0]]) * path_c_float32_abi_bank[165224360 + (((local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_index[0] * 28 + local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_kv_head[0]) // 3584) * 28 + ((((local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_index[0] * 28 + local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_kv_head[0]) % 3584) // 128) % 28))])
                     local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_context_accum[0] = 0.0
                     if local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sumexp[0] > 0.0:
                         local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_context_accum[0] = local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_value_accum[0] / local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sumexp[0]
                     local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_context_values[local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_source_head_loop * 128 + local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_source_dim_loop] = local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_context_accum[0]
             T.sync_threads()
             for local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_out_dim_loop in T.serial(lane, 3584, step=256):
-                path_c_float32_abi_bank[163504069 + ((row * 3584 + local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_out_dim_loop))] = 0.0
+                path_c_float32_abi_bank[178184133 + ((row * 3584 + local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_out_dim_loop))] = 0.0
                 for local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_source_dim_loop in T.serial(0, 3584):
-                    path_c_float32_abi_bank[163504069 + ((row * 3584 + local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_out_dim_loop))] = path_c_float32_abi_bank[163504069 + ((row * 3584 + local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_out_dim_loop))] + (local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_context_values[local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_source_dim_loop] * path_c_float32_abi_bank[150659013 + (((local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_out_dim_loop) * 3584 + local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_source_dim_loop) % 12845056)])
+                    path_c_float32_abi_bank[178184133 + ((row * 3584 + local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_out_dim_loop))] = path_c_float32_abi_bank[178184133 + ((row * 3584 + local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_out_dim_loop))] + (local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_context_values[local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_source_dim_loop] * path_c_float32_abi_bank[165339077 + (((local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_out_dim_loop) * 3584 + local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_source_dim_loop) % 12845056)])
             T.sync_threads()
         for h in T.serial(lane, 3584, step=256):
-            path_c_float32_abi_bank[246194181 + ((h) % 3584)] = 0.0
+            path_c_float32_abi_bank[260874245 + ((h) % 3584)] = 0.0
         T.sync_threads()
         for h in T.serial(lane, 3584, step=256):
-            path_c_float32_abi_bank[261922477 + ((h) % 3584)] = 0.0
+            path_c_float32_abi_bank[276602541 + ((h) % 3584)] = 0.0
         T.sync_threads()
         # backward_policy: row_phased_hidden_recompute
         for row in T.serial(0, 4096):
@@ -483,13 +483,13 @@ def local_gb10_quarter_path_c_10_12(
                 # local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_bwd production_fragment_status: production_region_inlined
                 # local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_bwd production_fragment_reason: row-phased descriptor codegen emits Sparse-MLA apply backward owner outputs for prepared q/kv FP8 values, prepared scales, and attention out-projection gradients without exposing q/kv prepared gradients as external ABI
                 local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_bwd_q_value[0] = fp8_e4m3fn_to_float(local_gb10_quarter_brick_12_A_qkv_projection_q_fp8[(i) % 3584]) * local_gb10_quarter_brick_12_A_qkv_projection_q_scale[((i) % 3584) // 128]
-                local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_bwd_kv_value[0] = fp8_e4m3fn_to_float(path_c_uint8_abi_bank[i]) * path_c_float32_abi_bank[150544296 + (((i) // 3584) * 28 + ((((i) % 3584) // 128) % 28))]
-                local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_bwd_apply_grad[0] = path_c_float32_abi_bank[178298821 + ((i))] * path_c_float32_abi_bank[150659013 + ((i) % 12845056)] * path_c_float32_abi_bank[150658984 + (0)]
+                local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_bwd_kv_value[0] = fp8_e4m3fn_to_float(path_c_uint8_abi_bank[i]) * path_c_float32_abi_bank[165224360 + (((i) // 3584) * 28 + ((((i) % 3584) // 128) % 28))]
+                local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_bwd_apply_grad[0] = path_c_float32_abi_bank[192978885 + ((i))] * path_c_float32_abi_bank[165339077 + ((i) % 12845056)] * path_c_float32_abi_bank[165339048 + (0)]
                 local_gb10_quarter_brick_12_A_qkv_projection_q_fp8_grad[i % 3584] = local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_bwd_apply_grad[0] * local_gb10_quarter_brick_12_A_qkv_projection_q_scale[((i) % 3584) // 128]
                 local_gb10_quarter_brick_12_A_qkv_projection_q_scale_grad[(i % 3584) // 128] = local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_bwd_apply_grad[0] * fp8_e4m3fn_to_float(local_gb10_quarter_brick_12_A_qkv_projection_q_fp8[(i) % 3584])
-                local_gb10_quarter_brick_12_A_qkv_projection_kv_fp8_grad[i % 3584] = local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_bwd_apply_grad[0] * path_c_float32_abi_bank[150544296 + (((i) // 3584) * 28 + ((((i) % 3584) // 128) % 28))]
+                local_gb10_quarter_brick_12_A_qkv_projection_kv_fp8_grad[i % 3584] = local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_bwd_apply_grad[0] * path_c_float32_abi_bank[165224360 + (((i) // 3584) * 28 + ((((i) % 3584) // 128) % 28))]
                 local_gb10_quarter_brick_12_A_qkv_projection_kv_scale_grad[((i % 3584) // 128) % 28] = local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_bwd_apply_grad[0] * fp8_e4m3fn_to_float(path_c_uint8_abi_bank[i])
-                path_c_float32_abi_bank[192978885 + (i % 12845056)] = path_c_float32_abi_bank[178298821 + ((i))] * (local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_bwd_q_value[0] + local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_bwd_kv_value[0])
+                path_c_float32_abi_bank[207658949 + (i % 12845056)] = path_c_float32_abi_bank[192978885 + ((i))] * (local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_bwd_q_value[0] + local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_bwd_kv_value[0])
             T.sync_threads()
             # local_gb10_quarter_brick_12_A_qkv_projection_bwd: attention_qkv_projection_bwd
             # local_gb10_quarter_brick_12_A_qkv_projection_bwd production_fragment_status: production_region_inlined
@@ -497,11 +497,11 @@ def local_gb10_quarter_path_c_10_12(
             # attention_qkv_projection_bwd_policy: lane_strided_weight_bias_rope_hidden
             if row == 0:
                 for local_gb10_quarter_brick_12_A_qkv_projection_bwd_grad_flat in T.serial(lane, 12845056, step=256):
-                    path_c_float32_abi_bank[205823941 + ((local_gb10_quarter_brick_12_A_qkv_projection_bwd_grad_flat) % 12845056)] = 0.0
+                    path_c_float32_abi_bank[220504005 + ((local_gb10_quarter_brick_12_A_qkv_projection_bwd_grad_flat) % 12845056)] = 0.0
                 for local_gb10_quarter_brick_12_A_qkv_projection_bwd_grad_flat in T.serial(lane, 12845056, step=256):
-                    path_c_float32_abi_bank[218668997 + ((local_gb10_quarter_brick_12_A_qkv_projection_bwd_grad_flat) % 12845056)] = 0.0
+                    path_c_float32_abi_bank[233349061 + ((local_gb10_quarter_brick_12_A_qkv_projection_bwd_grad_flat) % 12845056)] = 0.0
                 for local_gb10_quarter_brick_12_A_qkv_projection_bwd_rope_d in T.serial(lane, 64, step=256):
-                    path_c_float32_abi_bank[231514053 + ((local_gb10_quarter_brick_12_A_qkv_projection_bwd_rope_d) % 64)] = 0.0
+                    path_c_float32_abi_bank[246194117 + ((local_gb10_quarter_brick_12_A_qkv_projection_bwd_rope_d) % 64)] = 0.0
             T.sync_threads()
             local_gb10_quarter_brick_12_A_qkv_projection_bwd_attention_q_grad = T.alloc_local((1,), "float32")
             local_gb10_quarter_brick_12_A_qkv_projection_bwd_attention_kv_grad = T.alloc_local((1,), "float32")
@@ -509,21 +509,21 @@ def local_gb10_quarter_path_c_10_12(
             for local_gb10_quarter_brick_12_A_qkv_projection_bwd_q_flat in T.serial(lane, 3584, step=256):
                 local_gb10_quarter_brick_12_A_qkv_projection_bwd_attention_q_grad[0] = local_gb10_quarter_brick_12_A_qkv_projection_q_fp8_grad[(row * 3584 + local_gb10_quarter_brick_12_A_qkv_projection_bwd_q_flat) % 3584] + local_gb10_quarter_brick_12_A_qkv_projection_q_scale_grad[((row * 28 + local_gb10_quarter_brick_12_A_qkv_projection_bwd_q_flat // 128) % 3584) // 128]
                 for local_gb10_quarter_brick_12_A_qkv_projection_bwd_h in T.serial(0, 3584):
-                    path_c_float32_abi_bank[205823941 + (((local_gb10_quarter_brick_12_A_qkv_projection_bwd_q_flat) * 3584 + local_gb10_quarter_brick_12_A_qkv_projection_bwd_h) % 12845056)] = path_c_float32_abi_bank[205823941 + (((local_gb10_quarter_brick_12_A_qkv_projection_bwd_q_flat) * 3584 + local_gb10_quarter_brick_12_A_qkv_projection_bwd_h) % 12845056)] + (local_gb10_quarter_brick_11_R_residual_norm_hidden[(row * 3584 + local_gb10_quarter_brick_12_A_qkv_projection_bwd_h) % 3584] * local_gb10_quarter_brick_12_A_qkv_projection_bwd_attention_q_grad[0])
+                    path_c_float32_abi_bank[220504005 + (((local_gb10_quarter_brick_12_A_qkv_projection_bwd_q_flat) * 3584 + local_gb10_quarter_brick_12_A_qkv_projection_bwd_h) % 12845056)] = path_c_float32_abi_bank[220504005 + (((local_gb10_quarter_brick_12_A_qkv_projection_bwd_q_flat) * 3584 + local_gb10_quarter_brick_12_A_qkv_projection_bwd_h) % 12845056)] + (local_gb10_quarter_brick_12_A_residual_norm_hidden[(row * 3584 + local_gb10_quarter_brick_12_A_qkv_projection_bwd_h) % 3584] * local_gb10_quarter_brick_12_A_qkv_projection_bwd_attention_q_grad[0])
             T.sync_threads()
             for local_gb10_quarter_brick_12_A_qkv_projection_bwd_kv_flat in T.serial(lane, 3584, step=256):
                 local_gb10_quarter_brick_12_A_qkv_projection_bwd_attention_kv_grad[0] = local_gb10_quarter_brick_12_A_qkv_projection_kv_fp8_grad[(row * 3584 + local_gb10_quarter_brick_12_A_qkv_projection_bwd_kv_flat) % 3584] + local_gb10_quarter_brick_12_A_qkv_projection_kv_scale_grad[(((row * 28 + local_gb10_quarter_brick_12_A_qkv_projection_bwd_kv_flat // 128) % 3584) // 128) % 28]
                 for local_gb10_quarter_brick_12_A_qkv_projection_bwd_h in T.serial(0, 3584):
-                    path_c_float32_abi_bank[218668997 + (((local_gb10_quarter_brick_12_A_qkv_projection_bwd_kv_flat) * 3584 + local_gb10_quarter_brick_12_A_qkv_projection_bwd_h) % 12845056)] = path_c_float32_abi_bank[218668997 + (((local_gb10_quarter_brick_12_A_qkv_projection_bwd_kv_flat) * 3584 + local_gb10_quarter_brick_12_A_qkv_projection_bwd_h) % 12845056)] + (local_gb10_quarter_brick_11_R_residual_norm_hidden[(row * 3584 + local_gb10_quarter_brick_12_A_qkv_projection_bwd_h) % 3584] * local_gb10_quarter_brick_12_A_qkv_projection_bwd_attention_kv_grad[0])
+                    path_c_float32_abi_bank[233349061 + (((local_gb10_quarter_brick_12_A_qkv_projection_bwd_kv_flat) * 3584 + local_gb10_quarter_brick_12_A_qkv_projection_bwd_h) % 12845056)] = path_c_float32_abi_bank[233349061 + (((local_gb10_quarter_brick_12_A_qkv_projection_bwd_kv_flat) * 3584 + local_gb10_quarter_brick_12_A_qkv_projection_bwd_h) % 12845056)] + (local_gb10_quarter_brick_12_A_residual_norm_hidden[(row * 3584 + local_gb10_quarter_brick_12_A_qkv_projection_bwd_h) % 3584] * local_gb10_quarter_brick_12_A_qkv_projection_bwd_attention_kv_grad[0])
             T.sync_threads()
             for local_gb10_quarter_brick_12_A_qkv_projection_bwd_h in T.serial(lane, 3584, step=256):
-                local_gb10_quarter_brick_11_R_residual_norm_hidden_grad[(row * 3584 + local_gb10_quarter_brick_12_A_qkv_projection_bwd_h) % 3584] = 0.0
+                local_gb10_quarter_brick_12_A_residual_norm_hidden_grad[(row * 3584 + local_gb10_quarter_brick_12_A_qkv_projection_bwd_h) % 3584] = 0.0
                 for local_gb10_quarter_brick_12_A_qkv_projection_bwd_q_flat in T.serial(0, 3584):
                     local_gb10_quarter_brick_12_A_qkv_projection_bwd_attention_q_grad[0] = local_gb10_quarter_brick_12_A_qkv_projection_q_fp8_grad[(row * 3584 + local_gb10_quarter_brick_12_A_qkv_projection_bwd_q_flat) % 3584] + local_gb10_quarter_brick_12_A_qkv_projection_q_scale_grad[((row * 28 + local_gb10_quarter_brick_12_A_qkv_projection_bwd_q_flat // 128) % 3584) // 128]
-                    local_gb10_quarter_brick_11_R_residual_norm_hidden_grad[(row * 3584 + local_gb10_quarter_brick_12_A_qkv_projection_bwd_h) % 3584] = local_gb10_quarter_brick_11_R_residual_norm_hidden_grad[(row * 3584 + local_gb10_quarter_brick_12_A_qkv_projection_bwd_h) % 3584] + (local_gb10_quarter_brick_12_A_qkv_projection_bwd_attention_q_grad[0] * path_c_float32_abi_bank[124854120 + (((local_gb10_quarter_brick_12_A_qkv_projection_bwd_q_flat) * 3584 + local_gb10_quarter_brick_12_A_qkv_projection_bwd_h) % 12845056)])
+                    local_gb10_quarter_brick_12_A_residual_norm_hidden_grad[(row * 3584 + local_gb10_quarter_brick_12_A_qkv_projection_bwd_h) % 3584] = local_gb10_quarter_brick_12_A_residual_norm_hidden_grad[(row * 3584 + local_gb10_quarter_brick_12_A_qkv_projection_bwd_h) % 3584] + (local_gb10_quarter_brick_12_A_qkv_projection_bwd_attention_q_grad[0] * path_c_float32_abi_bank[139534184 + (((local_gb10_quarter_brick_12_A_qkv_projection_bwd_q_flat) * 3584 + local_gb10_quarter_brick_12_A_qkv_projection_bwd_h) % 12845056)])
                 for local_gb10_quarter_brick_12_A_qkv_projection_bwd_kv_flat in T.serial(0, 3584):
                     local_gb10_quarter_brick_12_A_qkv_projection_bwd_attention_kv_grad[0] = local_gb10_quarter_brick_12_A_qkv_projection_kv_fp8_grad[(row * 3584 + local_gb10_quarter_brick_12_A_qkv_projection_bwd_kv_flat) % 3584] + local_gb10_quarter_brick_12_A_qkv_projection_kv_scale_grad[(((row * 28 + local_gb10_quarter_brick_12_A_qkv_projection_bwd_kv_flat // 128) % 3584) // 128) % 28]
-                    local_gb10_quarter_brick_11_R_residual_norm_hidden_grad[(row * 3584 + local_gb10_quarter_brick_12_A_qkv_projection_bwd_h) % 3584] = local_gb10_quarter_brick_11_R_residual_norm_hidden_grad[(row * 3584 + local_gb10_quarter_brick_12_A_qkv_projection_bwd_h) % 3584] + (local_gb10_quarter_brick_12_A_qkv_projection_bwd_attention_kv_grad[0] * path_c_float32_abi_bank[137699176 + (((local_gb10_quarter_brick_12_A_qkv_projection_bwd_kv_flat) * 3584 + local_gb10_quarter_brick_12_A_qkv_projection_bwd_h) % 12845056)])
+                    local_gb10_quarter_brick_12_A_residual_norm_hidden_grad[(row * 3584 + local_gb10_quarter_brick_12_A_qkv_projection_bwd_h) % 3584] = local_gb10_quarter_brick_12_A_residual_norm_hidden_grad[(row * 3584 + local_gb10_quarter_brick_12_A_qkv_projection_bwd_h) % 3584] + (local_gb10_quarter_brick_12_A_qkv_projection_bwd_attention_kv_grad[0] * path_c_float32_abi_bank[152379240 + (((local_gb10_quarter_brick_12_A_qkv_projection_bwd_kv_flat) * 3584 + local_gb10_quarter_brick_12_A_qkv_projection_bwd_h) % 12845056)])
             T.sync_threads()
             for local_gb10_quarter_brick_12_A_qkv_projection_bwd_rope_d in T.serial(lane, 64, step=256):
                 local_gb10_quarter_brick_12_A_qkv_projection_bwd_attention_rope_grad[0] = 0.0
@@ -533,7 +533,89 @@ def local_gb10_quarter_path_c_10_12(
                 for local_gb10_quarter_brick_12_A_qkv_projection_bwd_kv_flat in T.serial(0, 28):
                     local_gb10_quarter_brick_12_A_qkv_projection_bwd_attention_kv_grad[0] = local_gb10_quarter_brick_12_A_qkv_projection_kv_fp8_grad[(row * 3584 + local_gb10_quarter_brick_12_A_qkv_projection_bwd_kv_flat * 128 + local_gb10_quarter_brick_12_A_qkv_projection_bwd_rope_d) % 3584] + local_gb10_quarter_brick_12_A_qkv_projection_kv_scale_grad[(((row * 28 + local_gb10_quarter_brick_12_A_qkv_projection_bwd_kv_flat) % 3584) // 128) % 28]
                     local_gb10_quarter_brick_12_A_qkv_projection_bwd_attention_rope_grad[0] = local_gb10_quarter_brick_12_A_qkv_projection_bwd_attention_rope_grad[0] + (local_gb10_quarter_brick_12_A_qkv_projection_bwd_attention_kv_grad[0] * T.cast(row, "float32"))
-                path_c_float32_abi_bank[231514053 + ((local_gb10_quarter_brick_12_A_qkv_projection_bwd_rope_d) % 64)] = path_c_float32_abi_bank[231514053 + ((local_gb10_quarter_brick_12_A_qkv_projection_bwd_rope_d) % 64)] + local_gb10_quarter_brick_12_A_qkv_projection_bwd_attention_rope_grad[0]
+                path_c_float32_abi_bank[246194117 + ((local_gb10_quarter_brick_12_A_qkv_projection_bwd_rope_d) % 64)] = path_c_float32_abi_bank[246194117 + ((local_gb10_quarter_brick_12_A_qkv_projection_bwd_rope_d) % 64)] + local_gb10_quarter_brick_12_A_qkv_projection_bwd_attention_rope_grad[0]
+            T.sync_threads()
+            # local_gb10_quarter_brick_12_A_residual_norm_bwd: residual_rmsnorm_bwd
+            # local_gb10_quarter_brick_12_A_residual_norm_bwd production_fragment_status: production_region_inlined
+            # local_gb10_quarter_brick_12_A_residual_norm_bwd production_fragment_reason: row-phased descriptor codegen recomputes residual/RMSNorm state from forward inputs and accumulates norm-weight grads without full activation staging
+            local_gb10_quarter_brick_12_A_residual_norm_bwd_row_sum_sq_partial[lane] = 0.0
+            local_gb10_quarter_brick_12_A_residual_norm_bwd_row_dot_partial[lane] = 0.0
+            for i in T.serial(row * 3584 + lane, (row + 1) * 3584, step=256):
+                local_gb10_quarter_brick_12_A_residual_norm_bwd_row_sum_sq_partial[lane] = local_gb10_quarter_brick_12_A_residual_norm_bwd_row_sum_sq_partial[lane] + ((local_gb10_quarter_brick_10_M_hidden_after[i % 3584] + local_gb10_quarter_brick_11_R_delta[i % 3584]) * (local_gb10_quarter_brick_10_M_hidden_after[i % 3584] + local_gb10_quarter_brick_11_R_delta[i % 3584]))
+                local_gb10_quarter_brick_12_A_residual_norm_bwd_row_dot_partial[lane] = local_gb10_quarter_brick_12_A_residual_norm_bwd_row_dot_partial[lane] + (local_gb10_quarter_brick_12_A_residual_norm_hidden_grad[i % 3584] * path_c_float32_abi_bank[124850536 + (i % 3584)] * (local_gb10_quarter_brick_10_M_hidden_after[i % 3584] + local_gb10_quarter_brick_11_R_delta[i % 3584]))
+            T.sync_threads()
+            if lane == 0:
+                local_gb10_quarter_brick_12_A_residual_norm_bwd_row_sum_sq[0] = 0.0
+                local_gb10_quarter_brick_12_A_residual_norm_bwd_row_dot[0] = 0.0
+                for partial_lane in T.serial(0, 256):
+                    local_gb10_quarter_brick_12_A_residual_norm_bwd_row_sum_sq[0] = local_gb10_quarter_brick_12_A_residual_norm_bwd_row_sum_sq[0] + local_gb10_quarter_brick_12_A_residual_norm_bwd_row_sum_sq_partial[partial_lane]
+                    local_gb10_quarter_brick_12_A_residual_norm_bwd_row_dot[0] = local_gb10_quarter_brick_12_A_residual_norm_bwd_row_dot[0] + local_gb10_quarter_brick_12_A_residual_norm_bwd_row_dot_partial[partial_lane]
+                local_gb10_quarter_brick_12_A_residual_norm_bwd_row_inv_rms[0] = T.rsqrt((local_gb10_quarter_brick_12_A_residual_norm_bwd_row_sum_sq[0] / 3584.0) + 0.00001)
+            T.sync_threads()
+            for i in T.serial(row * 3584 + lane, (row + 1) * 3584, step=256):
+                local_gb10_quarter_brick_12_A_residual_norm_bwd_row_norm_grad[0] = local_gb10_quarter_brick_12_A_residual_norm_hidden_grad[i % 3584] * path_c_float32_abi_bank[124850536 + (i % 3584)]
+                local_gb10_quarter_brick_12_A_residual_norm_bwd_row_total_grad[0] = path_c_float32_abi_bank[246194181 + (i)] + (local_gb10_quarter_brick_12_A_residual_norm_bwd_row_inv_rms[0] * (local_gb10_quarter_brick_12_A_residual_norm_bwd_row_norm_grad[0] - ((local_gb10_quarter_brick_10_M_hidden_after[i % 3584] + local_gb10_quarter_brick_11_R_delta[i % 3584]) * local_gb10_quarter_brick_12_A_residual_norm_bwd_row_dot[0] * local_gb10_quarter_brick_12_A_residual_norm_bwd_row_inv_rms[0] * local_gb10_quarter_brick_12_A_residual_norm_bwd_row_inv_rms[0] / 3584.0)))
+                local_gb10_quarter_brick_10_M_hidden_after_grad[i % 3584] = local_gb10_quarter_brick_12_A_residual_norm_bwd_row_total_grad[0]
+                local_gb10_quarter_brick_11_R_delta_grad[i % 3584] = local_gb10_quarter_brick_12_A_residual_norm_bwd_row_total_grad[0]
+                path_c_float32_abi_bank[260874245 + (i % 3584)] = path_c_float32_abi_bank[260874245 + (i % 3584)] + (local_gb10_quarter_brick_12_A_residual_norm_hidden_grad[i % 3584] * (local_gb10_quarter_brick_10_M_hidden_after[i % 3584] + local_gb10_quarter_brick_11_R_delta[i % 3584]) * local_gb10_quarter_brick_12_A_residual_norm_bwd_row_inv_rms[0])
+            T.sync_threads()
+            # local_gb10_quarter_brick_11_R_bwd: m2rnn_bwd
+            # local_gb10_quarter_brick_11_R_bwd production_fragment_status: production_region_inlined
+            # local_gb10_quarter_brick_11_R_bwd production_fragment_reason: row-phased descriptor codegen recomputes M2RNN backward owner outputs from block-level projection, convolution, state, gate, post, h0, and row-local hidden gradients without full activation staging
+            # m2rnn_bwd_policy: lane_strided_weight_state_recompute
+            local_gb10_quarter_brick_11_R_bwd_m2rnn_stage_grad = T.alloc_local((1,), "float32")
+            if row == 0:
+                for local_gb10_quarter_brick_11_R_bwd_state_idx in T.serial(lane, 809984, step=256):
+                    path_c_float32_abi_bank[260877829 + ((local_gb10_quarter_brick_11_R_bwd_state_idx) % 809984)] = 0.0
+                for local_gb10_quarter_brick_11_R_bwd_state_idx in T.serial(lane, 640, step=256):
+                    path_c_float32_abi_bank[261687813 + ((local_gb10_quarter_brick_11_R_bwd_state_idx) % 640)] = 0.0
+                for local_gb10_quarter_brick_11_R_bwd_state_idx in T.serial(lane, 160, step=256):
+                    path_c_float32_abi_bank[261688453 + ((local_gb10_quarter_brick_11_R_bwd_state_idx) % 160)] = 0.0
+                for local_gb10_quarter_brick_11_R_bwd_state_idx in T.serial(lane, 256, step=256):
+                    path_c_float32_abi_bank[261688613 + ((local_gb10_quarter_brick_11_R_bwd_state_idx) % 256)] = 0.0
+                for local_gb10_quarter_brick_11_R_bwd_state_idx in T.serial(lane, 4, step=256):
+                    path_c_float32_abi_bank[261688869 + ((local_gb10_quarter_brick_11_R_bwd_state_idx) % 4)] = 0.0
+                for local_gb10_quarter_brick_11_R_bwd_state_idx in T.serial(lane, 4, step=256):
+                    path_c_float32_abi_bank[261688873 + ((local_gb10_quarter_brick_11_R_bwd_state_idx) % 4)] = 0.0
+                for local_gb10_quarter_brick_11_R_bwd_state_idx in T.serial(lane, 64, step=256):
+                    path_c_float32_abi_bank[261688877 + ((local_gb10_quarter_brick_11_R_bwd_state_idx) % 64)] = 0.0
+                for local_gb10_quarter_brick_11_R_bwd_state_idx in T.serial(lane, 64, step=256):
+                    path_c_float32_abi_bank[261688941 + ((local_gb10_quarter_brick_11_R_bwd_state_idx) % 64)] = 0.0
+                for local_gb10_quarter_brick_11_R_bwd_state_idx in T.serial(lane, 229376, step=256):
+                    path_c_float32_abi_bank[261689005 + ((local_gb10_quarter_brick_11_R_bwd_state_idx) % 229376)] = 0.0
+                for local_gb10_quarter_brick_11_R_bwd_state_idx in T.serial(lane, 256, step=256):
+                    path_c_float32_abi_bank[261918381 + ((local_gb10_quarter_brick_11_R_bwd_state_idx) % 4096)] = 0.0
+            T.sync_threads()
+            for local_gb10_quarter_brick_11_R_bwd_grad_flat in T.serial(lane, 809984, step=256):
+                local_gb10_quarter_brick_11_R_bwd_m2rnn_stage_grad[0] = local_gb10_quarter_brick_11_R_delta_grad[(row * 3584 + ((local_gb10_quarter_brick_11_R_bwd_grad_flat // 3584) % 3584)) % 3584] * path_c_float32_abi_bank[123805408 + (((local_gb10_quarter_brick_11_R_bwd_grad_flat // 3584) * 3584 + ((local_gb10_quarter_brick_11_R_bwd_grad_flat // 3584) % 3584)) % 809984)]
+                path_c_float32_abi_bank[260877829 + ((local_gb10_quarter_brick_11_R_bwd_grad_flat) % 809984)] = path_c_float32_abi_bank[260877829 + ((local_gb10_quarter_brick_11_R_bwd_grad_flat) % 809984)] + (local_gb10_quarter_brick_11_R_residual_norm_hidden[(row * 3584 + (local_gb10_quarter_brick_11_R_bwd_grad_flat % 3584)) % 3584] * local_gb10_quarter_brick_11_R_bwd_m2rnn_stage_grad[0])
+            T.sync_threads()
+            for local_gb10_quarter_brick_11_R_bwd_hidden_dim in T.serial(lane, 3584, step=256):
+                local_gb10_quarter_brick_11_R_residual_norm_hidden_grad[(row * 3584 + local_gb10_quarter_brick_11_R_bwd_hidden_dim) % 3584] = 0.0
+                for local_gb10_quarter_brick_11_R_bwd_proj_dim in T.serial(0, 226):
+                    local_gb10_quarter_brick_11_R_bwd_m2rnn_stage_grad[0] = local_gb10_quarter_brick_11_R_delta_grad[(row * 3584 + (local_gb10_quarter_brick_11_R_bwd_proj_dim % 3584)) % 3584] * path_c_float32_abi_bank[123805408 + ((local_gb10_quarter_brick_11_R_bwd_proj_dim * 3584 + (local_gb10_quarter_brick_11_R_bwd_proj_dim % 3584)) % 809984)]
+                    local_gb10_quarter_brick_11_R_residual_norm_hidden_grad[(row * 3584 + local_gb10_quarter_brick_11_R_bwd_hidden_dim) % 3584] = local_gb10_quarter_brick_11_R_residual_norm_hidden_grad[(row * 3584 + local_gb10_quarter_brick_11_R_bwd_hidden_dim) % 3584] + (local_gb10_quarter_brick_11_R_bwd_m2rnn_stage_grad[0] * path_c_float32_abi_bank[123805408 + ((local_gb10_quarter_brick_11_R_bwd_proj_dim * 3584 + local_gb10_quarter_brick_11_R_bwd_hidden_dim) % 809984)])
+            T.sync_threads()
+            for local_gb10_quarter_brick_11_R_bwd_conv_ch in T.serial(lane, 160, step=256):
+                path_c_float32_abi_bank[261688453 + ((local_gb10_quarter_brick_11_R_bwd_conv_ch) % 160)] = path_c_float32_abi_bank[261688453 + ((local_gb10_quarter_brick_11_R_bwd_conv_ch) % 160)] + local_gb10_quarter_brick_11_R_delta_grad[(row * 3584 + (local_gb10_quarter_brick_11_R_bwd_conv_ch % 3584)) % 3584]
+            T.sync_threads()
+            for local_gb10_quarter_brick_11_R_bwd_grad_flat in T.serial(lane, 640, step=256):
+                path_c_float32_abi_bank[261687813 + ((local_gb10_quarter_brick_11_R_bwd_grad_flat) % 640)] = path_c_float32_abi_bank[261687813 + ((local_gb10_quarter_brick_11_R_bwd_grad_flat) % 640)] + (local_gb10_quarter_brick_11_R_delta_grad[(row * 3584 + ((local_gb10_quarter_brick_11_R_bwd_grad_flat // 4) % 3584)) % 3584] * local_gb10_quarter_brick_11_R_residual_norm_hidden[(row * 3584 + ((local_gb10_quarter_brick_11_R_bwd_grad_flat // 4) % 3584)) % 3584])
+            T.sync_threads()
+            for local_gb10_quarter_brick_11_R_bwd_state_idx in T.serial(lane, 256, step=256):
+                path_c_float32_abi_bank[261688613 + ((local_gb10_quarter_brick_11_R_bwd_state_idx) % 256)] = path_c_float32_abi_bank[261688613 + ((local_gb10_quarter_brick_11_R_bwd_state_idx) % 256)] + (path_c_float32_abi_bank[124845960 + ((local_gb10_quarter_brick_11_R_bwd_state_idx) % 4096)] * local_gb10_quarter_brick_11_R_delta_grad[(row * 3584 + (local_gb10_quarter_brick_11_R_bwd_state_idx % 3584)) % 3584])
+                path_c_float32_abi_bank[261918381 + ((local_gb10_quarter_brick_11_R_bwd_state_idx) % 4096)] = path_c_float32_abi_bank[261918381 + ((local_gb10_quarter_brick_11_R_bwd_state_idx) % 4096)] + local_gb10_quarter_brick_11_R_delta_grad[(row * 3584 + (local_gb10_quarter_brick_11_R_bwd_state_idx % 3584)) % 3584]
+            T.sync_threads()
+            for local_gb10_quarter_brick_11_R_bwd_state_idx in T.serial(lane, 4, step=256):
+                path_c_float32_abi_bank[261688869 + ((local_gb10_quarter_brick_11_R_bwd_state_idx) % 4)] = path_c_float32_abi_bank[261688869 + ((local_gb10_quarter_brick_11_R_bwd_state_idx) % 4)] + local_gb10_quarter_brick_11_R_delta_grad[(row * 3584 + (local_gb10_quarter_brick_11_R_bwd_state_idx % 3584)) % 3584]
+                path_c_float32_abi_bank[261688873 + ((local_gb10_quarter_brick_11_R_bwd_state_idx) % 4)] = path_c_float32_abi_bank[261688873 + ((local_gb10_quarter_brick_11_R_bwd_state_idx) % 4)] + local_gb10_quarter_brick_11_R_delta_grad[(row * 3584 + (local_gb10_quarter_brick_11_R_bwd_state_idx % 3584)) % 3584]
+            T.sync_threads()
+            for local_gb10_quarter_brick_11_R_bwd_feature in T.serial(lane, 64, step=256):
+                path_c_float32_abi_bank[261688877 + ((local_gb10_quarter_brick_11_R_bwd_feature) % 64)] = path_c_float32_abi_bank[261688877 + ((local_gb10_quarter_brick_11_R_bwd_feature) % 64)] + local_gb10_quarter_brick_11_R_delta_grad[(row * 3584 + (local_gb10_quarter_brick_11_R_bwd_feature % 3584)) % 3584]
+                path_c_float32_abi_bank[261688941 + ((local_gb10_quarter_brick_11_R_bwd_feature) % 64)] = path_c_float32_abi_bank[261688941 + ((local_gb10_quarter_brick_11_R_bwd_feature) % 64)] + local_gb10_quarter_brick_11_R_delta_grad[(row * 3584 + (local_gb10_quarter_brick_11_R_bwd_feature % 3584)) % 3584]
+            T.sync_threads()
+            for local_gb10_quarter_brick_11_R_bwd_grad_flat in T.serial(lane, 229376, step=256):
+                path_c_float32_abi_bank[261689005 + ((local_gb10_quarter_brick_11_R_bwd_grad_flat) % 229376)] = path_c_float32_abi_bank[261689005 + ((local_gb10_quarter_brick_11_R_bwd_grad_flat) % 229376)] + (local_gb10_quarter_brick_11_R_residual_norm_hidden[(row * 3584 + (local_gb10_quarter_brick_11_R_bwd_grad_flat // 64)) % 3584] * local_gb10_quarter_brick_11_R_delta_grad[(row * 3584 + (local_gb10_quarter_brick_11_R_bwd_grad_flat // 64)) % 3584])
             T.sync_threads()
             # local_gb10_quarter_brick_11_R_residual_norm_bwd: residual_rmsnorm_bwd
             # local_gb10_quarter_brick_11_R_residual_norm_bwd production_fragment_status: production_region_inlined
@@ -541,8 +623,8 @@ def local_gb10_quarter_path_c_10_12(
             local_gb10_quarter_brick_11_R_residual_norm_bwd_row_sum_sq_partial[lane] = 0.0
             local_gb10_quarter_brick_11_R_residual_norm_bwd_row_dot_partial[lane] = 0.0
             for i in T.serial(row * 3584 + lane, (row + 1) * 3584, step=256):
-                local_gb10_quarter_brick_11_R_residual_norm_bwd_row_sum_sq_partial[lane] = local_gb10_quarter_brick_11_R_residual_norm_bwd_row_sum_sq_partial[lane] + ((local_gb10_quarter_brick_10_M_hidden_after[i % 3584] + local_gb10_quarter_brick_11_R_delta[i % 3584]) * (local_gb10_quarter_brick_10_M_hidden_after[i % 3584] + local_gb10_quarter_brick_11_R_delta[i % 3584]))
-                local_gb10_quarter_brick_11_R_residual_norm_bwd_row_dot_partial[lane] = local_gb10_quarter_brick_11_R_residual_norm_bwd_row_dot_partial[lane] + (local_gb10_quarter_brick_11_R_residual_norm_hidden_grad[i % 3584] * path_c_float32_abi_bank[110170472 + (i % 3584)] * (local_gb10_quarter_brick_10_M_hidden_after[i % 3584] + local_gb10_quarter_brick_11_R_delta[i % 3584]))
+                local_gb10_quarter_brick_11_R_residual_norm_bwd_row_sum_sq_partial[lane] = local_gb10_quarter_brick_11_R_residual_norm_bwd_row_sum_sq_partial[lane] + ((path_c_float32_abi_bank[109121760 + (i)] + local_gb10_quarter_brick_10_M_delta[i % 3584]) * (path_c_float32_abi_bank[109121760 + (i)] + local_gb10_quarter_brick_10_M_delta[i % 3584]))
+                local_gb10_quarter_brick_11_R_residual_norm_bwd_row_dot_partial[lane] = local_gb10_quarter_brick_11_R_residual_norm_bwd_row_dot_partial[lane] + (local_gb10_quarter_brick_11_R_residual_norm_hidden_grad[i % 3584] * path_c_float32_abi_bank[123801824 + (i % 3584)] * (path_c_float32_abi_bank[109121760 + (i)] + local_gb10_quarter_brick_10_M_delta[i % 3584]))
             T.sync_threads()
             if lane == 0:
                 local_gb10_quarter_brick_11_R_residual_norm_bwd_row_sum_sq[0] = 0.0
@@ -553,93 +635,11 @@ def local_gb10_quarter_path_c_10_12(
                 local_gb10_quarter_brick_11_R_residual_norm_bwd_row_inv_rms[0] = T.rsqrt((local_gb10_quarter_brick_11_R_residual_norm_bwd_row_sum_sq[0] / 3584.0) + 0.00001)
             T.sync_threads()
             for i in T.serial(row * 3584 + lane, (row + 1) * 3584, step=256):
-                local_gb10_quarter_brick_11_R_residual_norm_bwd_row_norm_grad[0] = local_gb10_quarter_brick_11_R_residual_norm_hidden_grad[i % 3584] * path_c_float32_abi_bank[110170472 + (i % 3584)]
-                local_gb10_quarter_brick_11_R_residual_norm_bwd_row_total_grad[0] = path_c_float32_abi_bank[231514117 + (i)] + (local_gb10_quarter_brick_11_R_residual_norm_bwd_row_inv_rms[0] * (local_gb10_quarter_brick_11_R_residual_norm_bwd_row_norm_grad[0] - ((local_gb10_quarter_brick_10_M_hidden_after[i % 3584] + local_gb10_quarter_brick_11_R_delta[i % 3584]) * local_gb10_quarter_brick_11_R_residual_norm_bwd_row_dot[0] * local_gb10_quarter_brick_11_R_residual_norm_bwd_row_inv_rms[0] * local_gb10_quarter_brick_11_R_residual_norm_bwd_row_inv_rms[0] / 3584.0)))
-                local_gb10_quarter_brick_10_M_hidden_after_grad[i % 3584] = local_gb10_quarter_brick_11_R_residual_norm_bwd_row_total_grad[0]
-                local_gb10_quarter_brick_11_R_delta_grad[i % 3584] = local_gb10_quarter_brick_11_R_residual_norm_bwd_row_total_grad[0]
-                path_c_float32_abi_bank[246194181 + (i % 3584)] = path_c_float32_abi_bank[246194181 + (i % 3584)] + (local_gb10_quarter_brick_11_R_residual_norm_hidden_grad[i % 3584] * (local_gb10_quarter_brick_10_M_hidden_after[i % 3584] + local_gb10_quarter_brick_11_R_delta[i % 3584]) * local_gb10_quarter_brick_11_R_residual_norm_bwd_row_inv_rms[0])
-            T.sync_threads()
-            # local_gb10_quarter_brick_11_R_bwd: m2rnn_bwd
-            # local_gb10_quarter_brick_11_R_bwd production_fragment_status: production_region_inlined
-            # local_gb10_quarter_brick_11_R_bwd production_fragment_reason: row-phased descriptor codegen recomputes M2RNN backward owner outputs from block-level projection, convolution, state, gate, post, h0, and row-local hidden gradients without full activation staging
-            # m2rnn_bwd_policy: lane_strided_weight_state_recompute
-            local_gb10_quarter_brick_11_R_bwd_m2rnn_stage_grad = T.alloc_local((1,), "float32")
-            if row == 0:
-                for local_gb10_quarter_brick_11_R_bwd_state_idx in T.serial(lane, 809984, step=256):
-                    path_c_float32_abi_bank[246197765 + ((local_gb10_quarter_brick_11_R_bwd_state_idx) % 809984)] = 0.0
-                for local_gb10_quarter_brick_11_R_bwd_state_idx in T.serial(lane, 640, step=256):
-                    path_c_float32_abi_bank[247007749 + ((local_gb10_quarter_brick_11_R_bwd_state_idx) % 640)] = 0.0
-                for local_gb10_quarter_brick_11_R_bwd_state_idx in T.serial(lane, 160, step=256):
-                    path_c_float32_abi_bank[247008389 + ((local_gb10_quarter_brick_11_R_bwd_state_idx) % 160)] = 0.0
-                for local_gb10_quarter_brick_11_R_bwd_state_idx in T.serial(lane, 256, step=256):
-                    path_c_float32_abi_bank[247008549 + ((local_gb10_quarter_brick_11_R_bwd_state_idx) % 256)] = 0.0
-                for local_gb10_quarter_brick_11_R_bwd_state_idx in T.serial(lane, 4, step=256):
-                    path_c_float32_abi_bank[247008805 + ((local_gb10_quarter_brick_11_R_bwd_state_idx) % 4)] = 0.0
-                for local_gb10_quarter_brick_11_R_bwd_state_idx in T.serial(lane, 4, step=256):
-                    path_c_float32_abi_bank[247008809 + ((local_gb10_quarter_brick_11_R_bwd_state_idx) % 4)] = 0.0
-                for local_gb10_quarter_brick_11_R_bwd_state_idx in T.serial(lane, 64, step=256):
-                    path_c_float32_abi_bank[247008813 + ((local_gb10_quarter_brick_11_R_bwd_state_idx) % 64)] = 0.0
-                for local_gb10_quarter_brick_11_R_bwd_state_idx in T.serial(lane, 64, step=256):
-                    path_c_float32_abi_bank[247008877 + ((local_gb10_quarter_brick_11_R_bwd_state_idx) % 64)] = 0.0
-                for local_gb10_quarter_brick_11_R_bwd_state_idx in T.serial(lane, 229376, step=256):
-                    path_c_float32_abi_bank[247008941 + ((local_gb10_quarter_brick_11_R_bwd_state_idx) % 229376)] = 0.0
-                for local_gb10_quarter_brick_11_R_bwd_state_idx in T.serial(lane, 256, step=256):
-                    path_c_float32_abi_bank[247238317 + ((local_gb10_quarter_brick_11_R_bwd_state_idx) % 4096)] = 0.0
-            T.sync_threads()
-            for local_gb10_quarter_brick_11_R_bwd_grad_flat in T.serial(lane, 809984, step=256):
-                local_gb10_quarter_brick_11_R_bwd_m2rnn_stage_grad[0] = local_gb10_quarter_brick_11_R_delta_grad[(row * 3584 + ((local_gb10_quarter_brick_11_R_bwd_grad_flat // 3584) % 3584)) % 3584] * path_c_float32_abi_bank[109125344 + (((local_gb10_quarter_brick_11_R_bwd_grad_flat // 3584) * 3584 + ((local_gb10_quarter_brick_11_R_bwd_grad_flat // 3584) % 3584)) % 809984)]
-                path_c_float32_abi_bank[246197765 + ((local_gb10_quarter_brick_11_R_bwd_grad_flat) % 809984)] = path_c_float32_abi_bank[246197765 + ((local_gb10_quarter_brick_11_R_bwd_grad_flat) % 809984)] + (local_gb10_quarter_brick_10_M_residual_norm_hidden[(row * 3584 + (local_gb10_quarter_brick_11_R_bwd_grad_flat % 3584)) % 3584] * local_gb10_quarter_brick_11_R_bwd_m2rnn_stage_grad[0])
-            T.sync_threads()
-            for local_gb10_quarter_brick_11_R_bwd_hidden_dim in T.serial(lane, 3584, step=256):
-                local_gb10_quarter_brick_10_M_residual_norm_hidden_grad[(row * 3584 + local_gb10_quarter_brick_11_R_bwd_hidden_dim) % 3584] = 0.0
-                for local_gb10_quarter_brick_11_R_bwd_proj_dim in T.serial(0, 226):
-                    local_gb10_quarter_brick_11_R_bwd_m2rnn_stage_grad[0] = local_gb10_quarter_brick_11_R_delta_grad[(row * 3584 + (local_gb10_quarter_brick_11_R_bwd_proj_dim % 3584)) % 3584] * path_c_float32_abi_bank[109125344 + ((local_gb10_quarter_brick_11_R_bwd_proj_dim * 3584 + (local_gb10_quarter_brick_11_R_bwd_proj_dim % 3584)) % 809984)]
-                    local_gb10_quarter_brick_10_M_residual_norm_hidden_grad[(row * 3584 + local_gb10_quarter_brick_11_R_bwd_hidden_dim) % 3584] = local_gb10_quarter_brick_10_M_residual_norm_hidden_grad[(row * 3584 + local_gb10_quarter_brick_11_R_bwd_hidden_dim) % 3584] + (local_gb10_quarter_brick_11_R_bwd_m2rnn_stage_grad[0] * path_c_float32_abi_bank[109125344 + ((local_gb10_quarter_brick_11_R_bwd_proj_dim * 3584 + local_gb10_quarter_brick_11_R_bwd_hidden_dim) % 809984)])
-            T.sync_threads()
-            for local_gb10_quarter_brick_11_R_bwd_conv_ch in T.serial(lane, 160, step=256):
-                path_c_float32_abi_bank[247008389 + ((local_gb10_quarter_brick_11_R_bwd_conv_ch) % 160)] = path_c_float32_abi_bank[247008389 + ((local_gb10_quarter_brick_11_R_bwd_conv_ch) % 160)] + local_gb10_quarter_brick_11_R_delta_grad[(row * 3584 + (local_gb10_quarter_brick_11_R_bwd_conv_ch % 3584)) % 3584]
-            T.sync_threads()
-            for local_gb10_quarter_brick_11_R_bwd_grad_flat in T.serial(lane, 640, step=256):
-                path_c_float32_abi_bank[247007749 + ((local_gb10_quarter_brick_11_R_bwd_grad_flat) % 640)] = path_c_float32_abi_bank[247007749 + ((local_gb10_quarter_brick_11_R_bwd_grad_flat) % 640)] + (local_gb10_quarter_brick_11_R_delta_grad[(row * 3584 + ((local_gb10_quarter_brick_11_R_bwd_grad_flat // 4) % 3584)) % 3584] * local_gb10_quarter_brick_10_M_residual_norm_hidden[(row * 3584 + ((local_gb10_quarter_brick_11_R_bwd_grad_flat // 4) % 3584)) % 3584])
-            T.sync_threads()
-            for local_gb10_quarter_brick_11_R_bwd_state_idx in T.serial(lane, 256, step=256):
-                path_c_float32_abi_bank[247008549 + ((local_gb10_quarter_brick_11_R_bwd_state_idx) % 256)] = path_c_float32_abi_bank[247008549 + ((local_gb10_quarter_brick_11_R_bwd_state_idx) % 256)] + (path_c_float32_abi_bank[110165896 + ((local_gb10_quarter_brick_11_R_bwd_state_idx) % 4096)] * local_gb10_quarter_brick_11_R_delta_grad[(row * 3584 + (local_gb10_quarter_brick_11_R_bwd_state_idx % 3584)) % 3584])
-                path_c_float32_abi_bank[247238317 + ((local_gb10_quarter_brick_11_R_bwd_state_idx) % 4096)] = path_c_float32_abi_bank[247238317 + ((local_gb10_quarter_brick_11_R_bwd_state_idx) % 4096)] + local_gb10_quarter_brick_11_R_delta_grad[(row * 3584 + (local_gb10_quarter_brick_11_R_bwd_state_idx % 3584)) % 3584]
-            T.sync_threads()
-            for local_gb10_quarter_brick_11_R_bwd_state_idx in T.serial(lane, 4, step=256):
-                path_c_float32_abi_bank[247008805 + ((local_gb10_quarter_brick_11_R_bwd_state_idx) % 4)] = path_c_float32_abi_bank[247008805 + ((local_gb10_quarter_brick_11_R_bwd_state_idx) % 4)] + local_gb10_quarter_brick_11_R_delta_grad[(row * 3584 + (local_gb10_quarter_brick_11_R_bwd_state_idx % 3584)) % 3584]
-                path_c_float32_abi_bank[247008809 + ((local_gb10_quarter_brick_11_R_bwd_state_idx) % 4)] = path_c_float32_abi_bank[247008809 + ((local_gb10_quarter_brick_11_R_bwd_state_idx) % 4)] + local_gb10_quarter_brick_11_R_delta_grad[(row * 3584 + (local_gb10_quarter_brick_11_R_bwd_state_idx % 3584)) % 3584]
-            T.sync_threads()
-            for local_gb10_quarter_brick_11_R_bwd_feature in T.serial(lane, 64, step=256):
-                path_c_float32_abi_bank[247008813 + ((local_gb10_quarter_brick_11_R_bwd_feature) % 64)] = path_c_float32_abi_bank[247008813 + ((local_gb10_quarter_brick_11_R_bwd_feature) % 64)] + local_gb10_quarter_brick_11_R_delta_grad[(row * 3584 + (local_gb10_quarter_brick_11_R_bwd_feature % 3584)) % 3584]
-                path_c_float32_abi_bank[247008877 + ((local_gb10_quarter_brick_11_R_bwd_feature) % 64)] = path_c_float32_abi_bank[247008877 + ((local_gb10_quarter_brick_11_R_bwd_feature) % 64)] + local_gb10_quarter_brick_11_R_delta_grad[(row * 3584 + (local_gb10_quarter_brick_11_R_bwd_feature % 3584)) % 3584]
-            T.sync_threads()
-            for local_gb10_quarter_brick_11_R_bwd_grad_flat in T.serial(lane, 229376, step=256):
-                path_c_float32_abi_bank[247008941 + ((local_gb10_quarter_brick_11_R_bwd_grad_flat) % 229376)] = path_c_float32_abi_bank[247008941 + ((local_gb10_quarter_brick_11_R_bwd_grad_flat) % 229376)] + (local_gb10_quarter_brick_10_M_residual_norm_hidden[(row * 3584 + (local_gb10_quarter_brick_11_R_bwd_grad_flat // 64)) % 3584] * local_gb10_quarter_brick_11_R_delta_grad[(row * 3584 + (local_gb10_quarter_brick_11_R_bwd_grad_flat // 64)) % 3584])
-            T.sync_threads()
-            # local_gb10_quarter_brick_10_M_residual_norm_bwd: residual_rmsnorm_bwd
-            # local_gb10_quarter_brick_10_M_residual_norm_bwd production_fragment_status: production_region_inlined
-            # local_gb10_quarter_brick_10_M_residual_norm_bwd production_fragment_reason: row-phased descriptor codegen recomputes residual/RMSNorm state from forward inputs and accumulates norm-weight grads without full activation staging
-            local_gb10_quarter_brick_10_M_residual_norm_bwd_row_sum_sq_partial[lane] = 0.0
-            local_gb10_quarter_brick_10_M_residual_norm_bwd_row_dot_partial[lane] = 0.0
-            for i in T.serial(row * 3584 + lane, (row + 1) * 3584, step=256):
-                local_gb10_quarter_brick_10_M_residual_norm_bwd_row_sum_sq_partial[lane] = local_gb10_quarter_brick_10_M_residual_norm_bwd_row_sum_sq_partial[lane] + ((path_c_float32_abi_bank[i] + local_gb10_quarter_brick_10_M_delta[i % 3584]) * (path_c_float32_abi_bank[i] + local_gb10_quarter_brick_10_M_delta[i % 3584]))
-                local_gb10_quarter_brick_10_M_residual_norm_bwd_row_dot_partial[lane] = local_gb10_quarter_brick_10_M_residual_norm_bwd_row_dot_partial[lane] + (local_gb10_quarter_brick_10_M_residual_norm_hidden_grad[i % 3584] * path_c_float32_abi_bank[109121760 + (i % 3584)] * (path_c_float32_abi_bank[i] + local_gb10_quarter_brick_10_M_delta[i % 3584]))
-            T.sync_threads()
-            if lane == 0:
-                local_gb10_quarter_brick_10_M_residual_norm_bwd_row_sum_sq[0] = 0.0
-                local_gb10_quarter_brick_10_M_residual_norm_bwd_row_dot[0] = 0.0
-                for partial_lane in T.serial(0, 256):
-                    local_gb10_quarter_brick_10_M_residual_norm_bwd_row_sum_sq[0] = local_gb10_quarter_brick_10_M_residual_norm_bwd_row_sum_sq[0] + local_gb10_quarter_brick_10_M_residual_norm_bwd_row_sum_sq_partial[partial_lane]
-                    local_gb10_quarter_brick_10_M_residual_norm_bwd_row_dot[0] = local_gb10_quarter_brick_10_M_residual_norm_bwd_row_dot[0] + local_gb10_quarter_brick_10_M_residual_norm_bwd_row_dot_partial[partial_lane]
-                local_gb10_quarter_brick_10_M_residual_norm_bwd_row_inv_rms[0] = T.rsqrt((local_gb10_quarter_brick_10_M_residual_norm_bwd_row_sum_sq[0] / 3584.0) + 0.00001)
-            T.sync_threads()
-            for i in T.serial(row * 3584 + lane, (row + 1) * 3584, step=256):
-                local_gb10_quarter_brick_10_M_residual_norm_bwd_row_norm_grad[0] = local_gb10_quarter_brick_10_M_residual_norm_hidden_grad[i % 3584] * path_c_float32_abi_bank[109121760 + (i % 3584)]
-                local_gb10_quarter_brick_10_M_residual_norm_bwd_row_total_grad[0] = local_gb10_quarter_brick_10_M_hidden_after_grad[i % 3584] + (local_gb10_quarter_brick_10_M_residual_norm_bwd_row_inv_rms[0] * (local_gb10_quarter_brick_10_M_residual_norm_bwd_row_norm_grad[0] - ((path_c_float32_abi_bank[i] + local_gb10_quarter_brick_10_M_delta[i % 3584]) * local_gb10_quarter_brick_10_M_residual_norm_bwd_row_dot[0] * local_gb10_quarter_brick_10_M_residual_norm_bwd_row_inv_rms[0] * local_gb10_quarter_brick_10_M_residual_norm_bwd_row_inv_rms[0] / 3584.0)))
-                path_c_float32_abi_bank[247242413 + (i)] = local_gb10_quarter_brick_10_M_residual_norm_bwd_row_total_grad[0]
-                local_gb10_quarter_brick_10_M_delta_grad[i % 3584] = local_gb10_quarter_brick_10_M_residual_norm_bwd_row_total_grad[0]
-                path_c_float32_abi_bank[261922477 + (i % 3584)] = path_c_float32_abi_bank[261922477 + (i % 3584)] + (local_gb10_quarter_brick_10_M_residual_norm_hidden_grad[i % 3584] * (path_c_float32_abi_bank[i] + local_gb10_quarter_brick_10_M_delta[i % 3584]) * local_gb10_quarter_brick_10_M_residual_norm_bwd_row_inv_rms[0])
+                local_gb10_quarter_brick_11_R_residual_norm_bwd_row_norm_grad[0] = local_gb10_quarter_brick_11_R_residual_norm_hidden_grad[i % 3584] * path_c_float32_abi_bank[123801824 + (i % 3584)]
+                local_gb10_quarter_brick_11_R_residual_norm_bwd_row_total_grad[0] = local_gb10_quarter_brick_10_M_hidden_after_grad[i % 3584] + (local_gb10_quarter_brick_11_R_residual_norm_bwd_row_inv_rms[0] * (local_gb10_quarter_brick_11_R_residual_norm_bwd_row_norm_grad[0] - ((path_c_float32_abi_bank[109121760 + (i)] + local_gb10_quarter_brick_10_M_delta[i % 3584]) * local_gb10_quarter_brick_11_R_residual_norm_bwd_row_dot[0] * local_gb10_quarter_brick_11_R_residual_norm_bwd_row_inv_rms[0] * local_gb10_quarter_brick_11_R_residual_norm_bwd_row_inv_rms[0] / 3584.0)))
+                path_c_float32_abi_bank[261922477 + (i)] = local_gb10_quarter_brick_11_R_residual_norm_bwd_row_total_grad[0]
+                local_gb10_quarter_brick_10_M_delta_grad[i % 3584] = local_gb10_quarter_brick_11_R_residual_norm_bwd_row_total_grad[0]
+                path_c_float32_abi_bank[276602541 + (i % 3584)] = path_c_float32_abi_bank[276602541 + (i % 3584)] + (local_gb10_quarter_brick_11_R_residual_norm_hidden_grad[i % 3584] * (path_c_float32_abi_bank[109121760 + (i)] + local_gb10_quarter_brick_10_M_delta[i % 3584]) * local_gb10_quarter_brick_11_R_residual_norm_bwd_row_inv_rms[0])
             T.sync_threads()
             # local_gb10_quarter_brick_10_M_bwd: mamba3_mimo_bwd
             # local_gb10_quarter_brick_10_M_bwd production_fragment_status: production_region_inlined
@@ -648,57 +648,57 @@ def local_gb10_quarter_path_c_10_12(
             local_gb10_quarter_brick_10_M_bwd_mamba3_stage_grad = T.alloc_local((1,), "float32")
             if row == 0:
                 for local_gb10_quarter_brick_10_M_bwd_state_idx in T.serial(lane, 67321856, step=256):
-                    path_c_float32_abi_bank[262384813 + ((local_gb10_quarter_brick_10_M_bwd_state_idx))] = 0.0
+                    path_c_float32_abi_bank[291744941 + ((local_gb10_quarter_brick_10_M_bwd_state_idx))] = 0.0
                 for local_gb10_quarter_brick_10_M_bwd_state_idx in T.serial(lane, 25690112, step=256):
-                    path_c_float32_abi_bank[329706669 + ((local_gb10_quarter_brick_10_M_bwd_state_idx))] = 0.0
+                    path_c_float32_abi_bank[359066797 + ((local_gb10_quarter_brick_10_M_bwd_state_idx))] = 0.0
                 for local_gb10_quarter_brick_10_M_bwd_state_idx in T.serial(lane, 33792, step=256):
-                    path_c_float32_abi_bank[355396781 + ((local_gb10_quarter_brick_10_M_bwd_state_idx) % 33792)] = 0.0
+                    path_c_float32_abi_bank[384756909 + ((local_gb10_quarter_brick_10_M_bwd_state_idx) % 33792)] = 0.0
                 for local_gb10_quarter_brick_10_M_bwd_state_idx in T.serial(lane, 11264, step=256):
-                    path_c_float32_abi_bank[355430573 + ((local_gb10_quarter_brick_10_M_bwd_state_idx) % 11264)] = 0.0
+                    path_c_float32_abi_bank[384790701 + ((local_gb10_quarter_brick_10_M_bwd_state_idx) % 11264)] = 0.0
                 for local_gb10_quarter_brick_10_M_bwd_state_idx in T.serial(lane, 112, step=256):
-                    path_c_float32_abi_bank[355441837 + ((local_gb10_quarter_brick_10_M_bwd_state_idx) % 112)] = 0.0
+                    path_c_float32_abi_bank[384801965 + ((local_gb10_quarter_brick_10_M_bwd_state_idx) % 112)] = 0.0
                 for local_gb10_quarter_brick_10_M_bwd_state_idx in T.serial(lane, 2048, step=256):
-                    path_c_float32_abi_bank[355441949 + ((local_gb10_quarter_brick_10_M_bwd_state_idx) % 2048)] = 0.0
+                    path_c_float32_abi_bank[384802077 + ((local_gb10_quarter_brick_10_M_bwd_state_idx) % 2048)] = 0.0
                 for local_gb10_quarter_brick_10_M_bwd_state_idx in T.serial(lane, 2048, step=256):
-                    path_c_float32_abi_bank[355443997 + ((local_gb10_quarter_brick_10_M_bwd_state_idx) % 2048)] = 0.0
+                    path_c_float32_abi_bank[384804125 + ((local_gb10_quarter_brick_10_M_bwd_state_idx) % 2048)] = 0.0
                 for local_gb10_quarter_brick_10_M_bwd_state_idx in T.serial(lane, 2048, step=256):
-                    path_c_float32_abi_bank[355446045 + ((local_gb10_quarter_brick_10_M_bwd_state_idx) % 2048)] = 0.0
+                    path_c_float32_abi_bank[384806173 + ((local_gb10_quarter_brick_10_M_bwd_state_idx) % 2048)] = 0.0
                 for local_gb10_quarter_brick_10_M_bwd_state_idx in T.serial(lane, 2048, step=256):
-                    path_c_float32_abi_bank[355448093 + ((local_gb10_quarter_brick_10_M_bwd_state_idx) % 2048)] = 0.0
+                    path_c_float32_abi_bank[384808221 + ((local_gb10_quarter_brick_10_M_bwd_state_idx) % 2048)] = 0.0
                 for local_gb10_quarter_brick_10_M_bwd_state_idx in T.serial(lane, 112, step=256):
-                    path_c_float32_abi_bank[355450141 + ((local_gb10_quarter_brick_10_M_bwd_state_idx) % 112)] = 0.0
+                    path_c_float32_abi_bank[384810269 + ((local_gb10_quarter_brick_10_M_bwd_state_idx) % 112)] = 0.0
                 for local_gb10_quarter_brick_10_M_bwd_state_idx in T.serial(lane, 458752, step=256):
-                    path_c_float32_abi_bank[355450253 + ((local_gb10_quarter_brick_10_M_bwd_state_idx) % 458752)] = 0.0
+                    path_c_float32_abi_bank[384810381 + ((local_gb10_quarter_brick_10_M_bwd_state_idx) % 458752)] = 0.0
             T.sync_threads()
             for local_gb10_quarter_brick_10_M_bwd_grad_flat in T.serial(lane, 67321856, step=256):
                 local_gb10_quarter_brick_10_M_bwd_mamba3_stage_grad[0] = local_gb10_quarter_brick_10_M_delta_grad[(row * 3584 + ((local_gb10_quarter_brick_10_M_bwd_grad_flat // 3584) % 3584)) % 3584] * path_c_float32_abi_bank[15138816 + (((local_gb10_quarter_brick_10_M_bwd_grad_flat // 3584) * 3584 + ((local_gb10_quarter_brick_10_M_bwd_grad_flat // 3584) % 3584)))]
-                path_c_float32_abi_bank[262384813 + ((local_gb10_quarter_brick_10_M_bwd_grad_flat))] = path_c_float32_abi_bank[262384813 + ((local_gb10_quarter_brick_10_M_bwd_grad_flat))] + (path_c_float32_abi_bank[row * 3584 + (local_gb10_quarter_brick_10_M_bwd_grad_flat % 3584)] * local_gb10_quarter_brick_10_M_bwd_mamba3_stage_grad[0])
+                path_c_float32_abi_bank[291744941 + ((local_gb10_quarter_brick_10_M_bwd_grad_flat))] = path_c_float32_abi_bank[291744941 + ((local_gb10_quarter_brick_10_M_bwd_grad_flat))] + (path_c_float32_abi_bank[row * 3584 + (local_gb10_quarter_brick_10_M_bwd_grad_flat % 3584)] * local_gb10_quarter_brick_10_M_bwd_mamba3_stage_grad[0])
             T.sync_threads()
             for local_gb10_quarter_brick_10_M_bwd_hidden_dim in T.serial(lane, 3584, step=256):
-                path_c_float32_abi_bank[247242413 + ((row * 3584 + local_gb10_quarter_brick_10_M_bwd_hidden_dim))] = 0.0
+                path_c_float32_abi_bank[276606125 + ((row * 3584 + local_gb10_quarter_brick_10_M_bwd_hidden_dim))] = 0.0
                 for local_gb10_quarter_brick_10_M_bwd_proj_dim in T.serial(0, 18784):
                     local_gb10_quarter_brick_10_M_bwd_mamba3_stage_grad[0] = local_gb10_quarter_brick_10_M_delta_grad[(row * 3584 + (local_gb10_quarter_brick_10_M_bwd_proj_dim % 3584)) % 3584] * path_c_float32_abi_bank[15138816 + ((local_gb10_quarter_brick_10_M_bwd_proj_dim * 3584 + (local_gb10_quarter_brick_10_M_bwd_proj_dim % 3584)))]
-                    path_c_float32_abi_bank[247242413 + ((row * 3584 + local_gb10_quarter_brick_10_M_bwd_hidden_dim))] = path_c_float32_abi_bank[247242413 + ((row * 3584 + local_gb10_quarter_brick_10_M_bwd_hidden_dim))] + (local_gb10_quarter_brick_10_M_bwd_mamba3_stage_grad[0] * path_c_float32_abi_bank[15138816 + ((local_gb10_quarter_brick_10_M_bwd_proj_dim * 3584 + local_gb10_quarter_brick_10_M_bwd_hidden_dim))])
+                    path_c_float32_abi_bank[276606125 + ((row * 3584 + local_gb10_quarter_brick_10_M_bwd_hidden_dim))] = path_c_float32_abi_bank[276606125 + ((row * 3584 + local_gb10_quarter_brick_10_M_bwd_hidden_dim))] + (local_gb10_quarter_brick_10_M_bwd_mamba3_stage_grad[0] * path_c_float32_abi_bank[15138816 + ((local_gb10_quarter_brick_10_M_bwd_proj_dim * 3584 + local_gb10_quarter_brick_10_M_bwd_hidden_dim))])
             T.sync_threads()
             for local_gb10_quarter_brick_10_M_bwd_conv_ch in T.serial(lane, 11264, step=256):
-                path_c_float32_abi_bank[355430573 + ((local_gb10_quarter_brick_10_M_bwd_conv_ch) % 11264)] = path_c_float32_abi_bank[355430573 + ((local_gb10_quarter_brick_10_M_bwd_conv_ch) % 11264)] + local_gb10_quarter_brick_10_M_delta_grad[(row * 3584 + (local_gb10_quarter_brick_10_M_bwd_conv_ch % 3584)) % 3584]
+                path_c_float32_abi_bank[384790701 + ((local_gb10_quarter_brick_10_M_bwd_conv_ch) % 11264)] = path_c_float32_abi_bank[384790701 + ((local_gb10_quarter_brick_10_M_bwd_conv_ch) % 11264)] + local_gb10_quarter_brick_10_M_delta_grad[(row * 3584 + (local_gb10_quarter_brick_10_M_bwd_conv_ch % 3584)) % 3584]
             T.sync_threads()
             for local_gb10_quarter_brick_10_M_bwd_grad_flat in T.serial(lane, 33792, step=256):
-                path_c_float32_abi_bank[355396781 + ((local_gb10_quarter_brick_10_M_bwd_grad_flat) % 33792)] = path_c_float32_abi_bank[355396781 + ((local_gb10_quarter_brick_10_M_bwd_grad_flat) % 33792)] + (path_c_float32_abi_bank[row * 3584 + ((local_gb10_quarter_brick_10_M_bwd_grad_flat // 3) % 3584)] * local_gb10_quarter_brick_10_M_delta_grad[(row * 3584 + ((local_gb10_quarter_brick_10_M_bwd_grad_flat // 3) % 3584)) % 3584])
+                path_c_float32_abi_bank[384756909 + ((local_gb10_quarter_brick_10_M_bwd_grad_flat) % 33792)] = path_c_float32_abi_bank[384756909 + ((local_gb10_quarter_brick_10_M_bwd_grad_flat) % 33792)] + (path_c_float32_abi_bank[row * 3584 + ((local_gb10_quarter_brick_10_M_bwd_grad_flat // 3) % 3584)] * local_gb10_quarter_brick_10_M_delta_grad[(row * 3584 + ((local_gb10_quarter_brick_10_M_bwd_grad_flat // 3) % 3584)) % 3584])
             T.sync_threads()
             for local_gb10_quarter_brick_10_M_bwd_state_idx in T.serial(lane, 2048, step=256):
-                path_c_float32_abi_bank[355441949 + ((local_gb10_quarter_brick_10_M_bwd_state_idx) % 2048)] = path_c_float32_abi_bank[355441949 + ((local_gb10_quarter_brick_10_M_bwd_state_idx) % 2048)] + (path_c_float32_abi_bank[14680064 + ((local_gb10_quarter_brick_10_M_bwd_state_idx % 458752) % 458752)] * local_gb10_quarter_brick_10_M_delta_grad[(row * 3584 + (local_gb10_quarter_brick_10_M_bwd_state_idx % 3584)) % 3584])
-                path_c_float32_abi_bank[355443997 + ((local_gb10_quarter_brick_10_M_bwd_state_idx) % 2048)] = path_c_float32_abi_bank[355443997 + ((local_gb10_quarter_brick_10_M_bwd_state_idx) % 2048)] + local_gb10_quarter_brick_10_M_delta_grad[(row * 3584 + (local_gb10_quarter_brick_10_M_bwd_state_idx % 3584)) % 3584]
-                path_c_float32_abi_bank[355446045 + ((local_gb10_quarter_brick_10_M_bwd_state_idx) % 2048)] = path_c_float32_abi_bank[355446045 + ((local_gb10_quarter_brick_10_M_bwd_state_idx) % 2048)] + (path_c_float32_abi_bank[14680064 + ((local_gb10_quarter_brick_10_M_bwd_state_idx % 458752) % 458752)] * local_gb10_quarter_brick_10_M_delta_grad[(row * 3584 + (local_gb10_quarter_brick_10_M_bwd_state_idx % 3584)) % 3584])
-                path_c_float32_abi_bank[355448093 + ((local_gb10_quarter_brick_10_M_bwd_state_idx) % 2048)] = path_c_float32_abi_bank[355448093 + ((local_gb10_quarter_brick_10_M_bwd_state_idx) % 2048)] + local_gb10_quarter_brick_10_M_delta_grad[(row * 3584 + (local_gb10_quarter_brick_10_M_bwd_state_idx % 3584)) % 3584]
+                path_c_float32_abi_bank[384802077 + ((local_gb10_quarter_brick_10_M_bwd_state_idx) % 2048)] = path_c_float32_abi_bank[384802077 + ((local_gb10_quarter_brick_10_M_bwd_state_idx) % 2048)] + (path_c_float32_abi_bank[14680064 + ((local_gb10_quarter_brick_10_M_bwd_state_idx % 458752) % 458752)] * local_gb10_quarter_brick_10_M_delta_grad[(row * 3584 + (local_gb10_quarter_brick_10_M_bwd_state_idx % 3584)) % 3584])
+                path_c_float32_abi_bank[384804125 + ((local_gb10_quarter_brick_10_M_bwd_state_idx) % 2048)] = path_c_float32_abi_bank[384804125 + ((local_gb10_quarter_brick_10_M_bwd_state_idx) % 2048)] + local_gb10_quarter_brick_10_M_delta_grad[(row * 3584 + (local_gb10_quarter_brick_10_M_bwd_state_idx % 3584)) % 3584]
+                path_c_float32_abi_bank[384806173 + ((local_gb10_quarter_brick_10_M_bwd_state_idx) % 2048)] = path_c_float32_abi_bank[384806173 + ((local_gb10_quarter_brick_10_M_bwd_state_idx) % 2048)] + (path_c_float32_abi_bank[14680064 + ((local_gb10_quarter_brick_10_M_bwd_state_idx % 458752) % 458752)] * local_gb10_quarter_brick_10_M_delta_grad[(row * 3584 + (local_gb10_quarter_brick_10_M_bwd_state_idx % 3584)) % 3584])
+                path_c_float32_abi_bank[384808221 + ((local_gb10_quarter_brick_10_M_bwd_state_idx) % 2048)] = path_c_float32_abi_bank[384808221 + ((local_gb10_quarter_brick_10_M_bwd_state_idx) % 2048)] + local_gb10_quarter_brick_10_M_delta_grad[(row * 3584 + (local_gb10_quarter_brick_10_M_bwd_state_idx % 3584)) % 3584]
             T.sync_threads()
             for local_gb10_quarter_brick_10_M_bwd_state_idx in T.serial(lane, 112, step=256):
-                path_c_float32_abi_bank[355441837 + ((local_gb10_quarter_brick_10_M_bwd_state_idx) % 112)] = path_c_float32_abi_bank[355441837 + ((local_gb10_quarter_brick_10_M_bwd_state_idx) % 112)] + local_gb10_quarter_brick_10_M_delta_grad[(row * 3584 + (local_gb10_quarter_brick_10_M_bwd_state_idx % 3584)) % 3584]
-                path_c_float32_abi_bank[355450141 + ((local_gb10_quarter_brick_10_M_bwd_state_idx) % 112)] = path_c_float32_abi_bank[355450141 + ((local_gb10_quarter_brick_10_M_bwd_state_idx) % 112)] + local_gb10_quarter_brick_10_M_delta_grad[(row * 3584 + (local_gb10_quarter_brick_10_M_bwd_state_idx % 3584)) % 3584]
+                path_c_float32_abi_bank[384801965 + ((local_gb10_quarter_brick_10_M_bwd_state_idx) % 112)] = path_c_float32_abi_bank[384801965 + ((local_gb10_quarter_brick_10_M_bwd_state_idx) % 112)] + local_gb10_quarter_brick_10_M_delta_grad[(row * 3584 + (local_gb10_quarter_brick_10_M_bwd_state_idx % 3584)) % 3584]
+                path_c_float32_abi_bank[384810269 + ((local_gb10_quarter_brick_10_M_bwd_state_idx) % 112)] = path_c_float32_abi_bank[384810269 + ((local_gb10_quarter_brick_10_M_bwd_state_idx) % 112)] + local_gb10_quarter_brick_10_M_delta_grad[(row * 3584 + (local_gb10_quarter_brick_10_M_bwd_state_idx % 3584)) % 3584]
             T.sync_threads()
             for local_gb10_quarter_brick_10_M_bwd_grad_flat in T.serial(lane, 25690112, step=256):
-                path_c_float32_abi_bank[329706669 + ((local_gb10_quarter_brick_10_M_bwd_grad_flat))] = path_c_float32_abi_bank[329706669 + ((local_gb10_quarter_brick_10_M_bwd_grad_flat))] + (path_c_float32_abi_bank[row * 3584 + (local_gb10_quarter_brick_10_M_bwd_grad_flat // 7168)] * local_gb10_quarter_brick_10_M_delta_grad[(row * 3584 + (local_gb10_quarter_brick_10_M_bwd_grad_flat // 7168)) % 3584])
+                path_c_float32_abi_bank[359066797 + ((local_gb10_quarter_brick_10_M_bwd_grad_flat))] = path_c_float32_abi_bank[359066797 + ((local_gb10_quarter_brick_10_M_bwd_grad_flat))] + (path_c_float32_abi_bank[row * 3584 + (local_gb10_quarter_brick_10_M_bwd_grad_flat // 7168)] * local_gb10_quarter_brick_10_M_delta_grad[(row * 3584 + (local_gb10_quarter_brick_10_M_bwd_grad_flat // 7168)) % 3584])
             T.sync_threads()
             for local_gb10_quarter_brick_10_M_bwd_state_idx in T.serial(lane, 458752, step=256):
-                path_c_float32_abi_bank[355450253 + ((local_gb10_quarter_brick_10_M_bwd_state_idx) % 458752)] = path_c_float32_abi_bank[355450253 + ((local_gb10_quarter_brick_10_M_bwd_state_idx) % 458752)] + local_gb10_quarter_brick_10_M_delta_grad[(row * 3584 + (local_gb10_quarter_brick_10_M_bwd_state_idx % 3584)) % 3584]
+                path_c_float32_abi_bank[384810381 + ((local_gb10_quarter_brick_10_M_bwd_state_idx) % 458752)] = path_c_float32_abi_bank[384810381 + ((local_gb10_quarter_brick_10_M_bwd_state_idx) % 458752)] + local_gb10_quarter_brick_10_M_delta_grad[(row * 3584 + (local_gb10_quarter_brick_10_M_bwd_state_idx % 3584)) % 3584]
             T.sync_threads()
