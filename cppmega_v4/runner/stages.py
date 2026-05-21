@@ -389,15 +389,33 @@ def stage_train(ctx: StageContext) -> StageResult:
         if not all(modules):
             raise RuntimeError("graph has un-instantiated nodes")
 
-        # G01: detect MTP_WEIGHTED loss kind from spec; build K extra LM
-        # heads + per-head shifted-label loss. Falls back to single-head
-        # CE for all other LossKind values (effective math = CE today;
-        # IFIM/MHC math wiring is G02/G03 follow-up). Reads k + betas
-        # from spec.loss.params; _make_loss already broadcast-fills
-        # beta_0..beta_{k-1} from UI's flat `beta` field.
-        spec_loss = getattr(ctx.spec, "loss", None)
+        # G04: apply rewriters to ctx.build_spec (if available) so MTP /
+        # IFIM / MHC rewriters can actually mutate the spec before the
+        # loss kernel + K-head branch fires. Captures graph_diff for
+        # extras so e2e can prove the rewrite happened.
+        graph_diff: dict[str, Any] = {
+            "added": [], "removed": [], "renamed": [], "skipped": [],
+        }
+        rewritten_build_spec = getattr(ctx, "build_spec", None)
+        spec_rewriters = getattr(ctx.spec, "rewriters", []) or []
+        if rewritten_build_spec is not None and spec_rewriters:
+            graph_diff = _apply_spec_rewriters(
+                rewritten_build_spec, spec_rewriters)
+            # Adopt rewritten spec so loss-kind detection picks up the
+            # MTPRewriter's CE→MTP_WEIGHTED upgrade.
+            rewritten_build_spec = graph_diff.pop("_build_spec")
+
+        # G01: detect MTP_WEIGHTED loss kind (possibly after rewrite);
+        # build K extra LM heads + per-head shifted-label loss.
+        spec_loss = (rewritten_build_spec.loss
+                     if rewritten_build_spec is not None
+                     else getattr(ctx.spec, "loss", None))
         spec_loss_kind = (getattr(spec_loss, "kind", "cross_entropy")
                           if spec_loss is not None else "cross_entropy")
+        # LossKind from buildspec is an enum; coerce to its .value for
+        # the string comparisons below.
+        if hasattr(spec_loss_kind, "value"):
+            spec_loss_kind = spec_loss_kind.value
         spec_loss_params = (dict(getattr(spec_loss, "params", {}))
                             if spec_loss is not None else {})
         mtp_k = 1
@@ -698,6 +716,7 @@ def stage_train(ctx: StageContext) -> StageResult:
                     "cos_sim": round(cos_sim, 6),
                 },
                 "side_channels_observed": side_channels_observed,
+                "graph_diff": graph_diff,
                 "mtp": _compute_mtp_extras(
                     all_modules, mtp_k, mtp_betas, vocab_size,
                     batch, seq, hidden, targets,
@@ -759,6 +778,85 @@ def _tokenize_parquet_text(
         return out, Path(tokenizer_path).name
     except Exception:
         return [], None
+
+
+_REWRITER_FACTORIES: dict[str, Callable[..., Any]] = {}
+
+
+def _get_rewriter_factories() -> dict[str, Callable[..., Any]]:
+    """Lazy-import rewriter classes; populated on first call."""
+    global _REWRITER_FACTORIES
+    if not _REWRITER_FACTORIES:
+        from cppmega_v4.buildspec.rewriters import (
+            MTPRewriter, IFIMRewriter, MHCRewriter,
+        )
+        _REWRITER_FACTORIES = {
+            "MTPRewriter": MTPRewriter,
+            "IFIMRewriter": IFIMRewriter,
+            "MHCRewriter": MHCRewriter,
+        }
+    return _REWRITER_FACTORIES
+
+
+def _apply_spec_rewriters(
+    build_spec: Any, wire_rewriters: list[Any],
+) -> dict[str, Any]:
+    """G04: instantiate rewriters from UI payloads and apply them to
+    build_spec sequentially. Returns {added, removed, renamed, skipped,
+    _build_spec}. Precondition failures are recorded in 'skipped'
+    rather than fatal — so the user's chain doesn't kill train when one
+    rewriter doesn't fit the current spec."""
+    factories = _get_rewriter_factories()
+    before_names: set[str] = {n.name for n in build_spec.graph.nodes}
+    skipped: list[dict[str, str]] = []
+    current = build_spec
+    for r in wire_rewriters:
+        if isinstance(r, dict):
+            name = r.get("name")
+            params = r.get("params") or {}
+        else:
+            name = getattr(r, "name", None)
+            params = getattr(r, "params", None) or {}
+        if name not in factories:
+            skipped.append({"name": str(name), "reason": "unknown_rewriter"})
+            continue
+        try:
+            # MTPRewriter accepts k + beta; IFIM accepts lambda_fim;
+            # MHC accepts N + lambda_mhc. Pass through whatever the UI
+            # sent — extra keys ignored by dataclass via filtering.
+            ctor = factories[name]
+            valid_keys = {
+                "MTPRewriter": {"k", "beta", "share_backbone",
+                                "add_head_param_group"},
+                "IFIMRewriter": {"lambda_fim", "fim_source",
+                                 "aux_node_name"},
+                "MHCRewriter": {"N", "lambda_mhc", "copy_prefix"},
+            }.get(name, set())
+            filtered = {k: v for k, v in (params or {}).items()
+                        if k in valid_keys}
+            # UI RewritersTab defaults `beta: 0.6` (scalar) but
+            # MTPRewriter expects a tuple of length k. Drop scalar beta
+            # so the rewriter uses its geometric-decay default. Also
+            # coerce list→tuple for hashability.
+            if name == "MTPRewriter" and "beta" in filtered:
+                b = filtered["beta"]
+                if isinstance(b, (list, tuple)):
+                    filtered["beta"] = tuple(b)
+                else:
+                    del filtered["beta"]
+            instance = ctor(**filtered)
+            current = instance(current)
+        except Exception as exc:
+            skipped.append({"name": str(name),
+                            "reason": f"{type(exc).__name__}: {exc!s}"[:120]})
+    after_names: set[str] = {n.name for n in current.graph.nodes}
+    return {
+        "added": sorted(after_names - before_names),
+        "removed": sorted(before_names - after_names),
+        "renamed": [],  # MTPRewriter renames head_0; tracked via added set
+        "skipped": skipped,
+        "_build_spec": current,
+    }
 
 
 def _compute_ifim_extras(
