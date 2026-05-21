@@ -93,6 +93,9 @@ model genuinely changed observable behaviour.
 1. **Sharding plan apply → real distributed train** — needs multi-device.
 2. **Memory peak vs estimate** — needs `mx.metal.get_peak_memory`
    instrumentation across train cycles.
+3. **Side-channel forward routing** — V4-10 shipped observation probe;
+   actual per-channel ingestion into forward pass (doc_ids / token_ids
+   modulating attention bias, conditioning, etc) is v5+ work.
 4. **WS reconnect mid-train** — lifecycle.
 5. **Concurrent / abortable Train** — needs cancel UI + train cancel handle.
 6. **Spec save/load roundtrip** — still deferred from v3 (V3-12).
