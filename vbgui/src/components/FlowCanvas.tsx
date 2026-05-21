@@ -19,6 +19,9 @@ export interface FlowCanvasProps {
   onConnect?: (params: { source: string; target: string }) => void;
   isValidConnection?: IsValidConnection;
   onDropBrick?: (kind: string, position: { x: number; y: number }) => void;
+  /** Fires when the user clicks a brick node — opens BrickContextPanel
+   *  (E7-5/E7-6). */
+  onNodeClick?: (nodeId: string) => void;
 }
 
 const NODE_TYPES: NodeTypes = {
@@ -27,7 +30,7 @@ const NODE_TYPES: NodeTypes = {
 };
 
 export function FlowCanvas({
-  nodes, edges, onConnect, isValidConnection, onDropBrick,
+  nodes, edges, onConnect, isValidConnection, onDropBrick, onNodeClick,
 }: FlowCanvasProps): JSX.Element {
   const handleConnect = useCallback(
     (p: { source: string; target: string }) => onConnect?.(p),
@@ -71,6 +74,7 @@ export function FlowCanvas({
         edges={styledEdges}
         nodeTypes={NODE_TYPES}
         onConnect={handleConnect as never}
+        onNodeClick={(_e, node) => onNodeClick?.(node.id)}
         isValidConnection={isValidConnection}
         fitView
       >

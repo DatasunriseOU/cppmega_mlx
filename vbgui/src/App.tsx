@@ -12,6 +12,7 @@ import { AppTabs, type AppTab } from "@/components/AppTabs";
 import { RunResultModal, type RunReport } from "@/components/RunResultModal";
 import { TokenizerPlayground } from "@/components/TokenizerPlayground";
 import { DataInspector } from "@/components/DataInspector";
+import { BrickContextPanel } from "@/components/BrickContextPanel";
 
 import { useRpc } from "@/hooks/useRpc";
 import { useVerifyAfter } from "@/hooks/useVerifyAfter";
@@ -92,6 +93,7 @@ export function App(): JSX.Element {
   const [activeTab, setActiveTab] = useState<AppTab>("canvas");
   const [runReport, setRunReport] = useState<RunReport | null>(null);
   const [runError, setRunError] = useState<string | null>(null);
+  const [selectedBrickId, setSelectedBrickId] = useState<string | null>(null);
 
   const rpc = useRpc({
     baseUrl: (import.meta.env.VITE_BACKEND_URL as string | undefined)
@@ -308,7 +310,31 @@ export function App(): JSX.Element {
                 nodes={nodes} edges={edges}
                 onConnect={handleConnect}
                 onDropBrick={handleDropBrick}
+                onNodeClick={setSelectedBrickId}
               />
+              {selectedBrickId && (() => {
+                const selected = nodes.find((n) => n.id === selectedBrickId);
+                if (!selected) return null;
+                const data = selected.data as {
+                  kind?: string; params?: Record<string, unknown>;
+                };
+                return (
+                  <BrickContextPanel
+                    rpc={rpc}
+                    brickId={selectedBrickId}
+                    brickKind={data.kind ?? "mlp"}
+                    params={data.params ?? {}}
+                    onApply={(newParams) => {
+                      setNodes((prev) => prev.map((n) =>
+                        n.id === selectedBrickId
+                          ? { ...n, data: { ...(n.data as object),
+                                            params: newParams } as never }
+                          : n));
+                    }}
+                    onClose={() => setSelectedBrickId(null)}
+                  />
+                );
+              })()}
               <Sidebar
                 loss={spec.loss}
                 optim={spec.optim}
@@ -383,6 +409,7 @@ function buildVerifyParams(nodes: Node[], edges: Edge[],
       fp8_enabled: spec.sharding.fp8_enabled,
     },
     training: true,
+    side_channels: spec.side_channels,
     available_side_channels: ["doc_ids", "token_ids"],
   };
 }
