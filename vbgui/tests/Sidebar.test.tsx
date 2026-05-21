@@ -67,6 +67,51 @@ describe("OptimTab", () => {
     fireEvent.click(screen.getByTestId("optim-apply"));
     expect(onApply).toHaveBeenCalled();
   });
+
+  it("kind dropdown exposes all 7 OptimKind options (E7-12)", () => {
+    render(<OptimTab optim={INITIAL_SPEC.optim} onApply={() => {}} />);
+    const select = screen.getByTestId("optim-kind") as HTMLSelectElement;
+    const options = Array.from(select.options).map((o) => o.value);
+    expect(options).toEqual([
+      "adamw", "muon", "muon_adamw_hybrid",
+      "lion", "lion8bit", "adam8bit", "sgd",
+    ]);
+  });
+
+  it("can select Lion from the kind dropdown (E7-12)", () => {
+    const onApply = vi.fn();
+    render(<OptimTab optim={INITIAL_SPEC.optim} onApply={onApply} />);
+    fireEvent.change(screen.getByTestId("optim-kind"),
+                     { target: { value: "lion" } });
+    fireEvent.click(screen.getByTestId("optim-apply"));
+    const arg = onApply.mock.calls[0][0];
+    expect(arg.kind).toBe("lion");
+  });
+
+  it("can select Lion8bit and Adam8bit from the dropdown (E7-12)", () => {
+    const onApply = vi.fn();
+    render(<OptimTab optim={INITIAL_SPEC.optim} onApply={onApply} />);
+    for (const kind of ["lion8bit", "adam8bit"]) {
+      fireEvent.change(screen.getByTestId("optim-kind"),
+                       { target: { value: kind } });
+      fireEvent.click(screen.getByTestId("optim-apply"));
+    }
+    const kinds = onApply.mock.calls.map((c) => c[0].kind);
+    expect(kinds).toContain("lion8bit");
+    expect(kinds).toContain("adam8bit");
+  });
+});
+
+describe("OptimTab — RECOMMENDED_LR (E7-12)", () => {
+  it("exposes recommended lr per kind including Lion=1e-4", async () => {
+    const mod = await import("@/components/sidebar/OptimTab");
+    expect(mod.RECOMMENDED_LR.lion).toBe(1e-4);
+    expect(mod.RECOMMENDED_LR.lion8bit).toBe(1e-4);
+    expect(mod.RECOMMENDED_LR.adam8bit).toBe(3e-4);
+    expect(mod.RECOMMENDED_LR.adamw).toBe(3e-4);
+    expect(mod.RECOMMENDED_LR.muon).toBe(1e-2);
+    expect(mod.RECOMMENDED_LR.sgd).toBe(1e-2);
+  });
 });
 
 describe("RewritersTab", () => {

@@ -13,7 +13,8 @@ export interface LossState {
   params: Record<string, number | string>;
 }
 
-export type OptimKind = "adamw" | "muon" | "muon_adamw_hybrid" | "sgd";
+export type OptimKind = "adamw" | "muon" | "muon_adamw_hybrid"
+                       | "lion" | "lion8bit" | "adam8bit" | "sgd";
 
 export interface ParamGroupState {
   matcher: string;

@@ -13,6 +13,7 @@ at :func:`build_model` time (Stage E).
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Final
@@ -24,7 +25,16 @@ class OptimKind(str, Enum):
     ADAMW              = "adamw"
     MUON               = "muon"
     MUON_ADAMW_HYBRID  = "muon_adamw_hybrid"
+    LION               = "lion"
+    LION_8BIT          = "lion8bit"
+    ADAM_8BIT          = "adam8bit"
     SGD                = "sgd"
+
+
+# Sign-based Lion updates scale ONLY by the sign of momentum, so a large
+# learning rate quickly blows up to NaN. Chen et al. 2023 recommend
+# 3-10x smaller LR than AdamW; we issue a UserWarning above this ceiling.
+LION_LR_WARN_CEILING: Final[float] = 5e-4
 
 
 _VALID_MATCHER_PREFIXES: Final[frozenset[str]] = frozenset({"regex:"})
@@ -135,6 +145,29 @@ class OptimSpec:
                         f"MUON group must declare ns_steps; group {g.matcher!r} "
                         "is missing it"
                     )
+        elif self.kind in (OptimKind.LION, OptimKind.LION_8BIT):
+            for g in self.groups:
+                if g.betas is None:
+                    raise ValueError(
+                        f"{self.kind.value.upper()} group must declare betas; "
+                        f"group {g.matcher!r} is missing them"
+                    )
+                if g.lr > LION_LR_WARN_CEILING:
+                    warnings.warn(
+                        f"{self.kind.value} group {g.matcher!r} lr={g.lr:.2e} "
+                        f"exceeds recommended ceiling {LION_LR_WARN_CEILING:.0e}; "
+                        "sign-based updates ignore gradient magnitude and "
+                        "diverge to NaN at high LR (Chen et al. 2023).",
+                        UserWarning,
+                        stacklevel=3,
+                    )
+        elif self.kind is OptimKind.ADAM_8BIT:
+            for g in self.groups:
+                if g.betas is None:
+                    raise ValueError(
+                        f"ADAM_8BIT group must declare betas; group "
+                        f"{g.matcher!r} is missing them"
+                    )
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +263,75 @@ def sgd(
     )
 
 
+def lion(
+    lr: float = 1e-4,
+    weight_decay: float = 0.0,
+    betas: tuple[float, float] = (0.9, 0.99),
+    *,
+    gradient_clip_norm: float | None = 1.0,
+) -> OptimSpec:
+    """Single-group Lion spec (Chen et al. 2023).
+
+    Defaults match the paper: lr=1e-4 (3-10x smaller than AdamW because
+    sign-based updates ignore gradient magnitude), betas=(0.9, 0.99).
+    Memory footprint is half of AdamW: a single fp32 momentum buffer.
+
+    Raises UserWarning if lr > 5e-4 (typically NaN territory).
+    """
+    return OptimSpec(
+        kind=OptimKind.LION,
+        groups=(
+            ParamGroup(matcher="all", lr=lr, weight_decay=weight_decay,
+                       betas=betas),
+        ),
+        gradient_clip_norm=gradient_clip_norm,
+    )
+
+
+def lion8bit(
+    lr: float = 1e-4,
+    weight_decay: float = 0.0,
+    betas: tuple[float, float] = (0.9, 0.99),
+    *,
+    gradient_clip_norm: float | None = 1.0,
+) -> OptimSpec:
+    """Single-group 8-bit Lion (quantized momentum) — same defaults as
+    :func:`lion` but with int8 momentum + per-block fp32 absmax (block
+    size 256). Use when memory-constrained beyond Lion's already-halved
+    state. Runtime selects :class:`Lion8bit` over :class:`LionFP32Moments`
+    via the ``kind`` field."""
+    return OptimSpec(
+        kind=OptimKind.LION_8BIT,
+        groups=(
+            ParamGroup(matcher="all", lr=lr, weight_decay=weight_decay,
+                       betas=betas),
+        ),
+        gradient_clip_norm=gradient_clip_norm,
+    )
+
+
+def adam8bit(
+    lr: float = 3e-4,
+    weight_decay: float = 0.01,
+    betas: tuple[float, float] = (0.9, 0.999),
+    *,
+    gradient_clip_norm: float | None = 1.0,
+) -> OptimSpec:
+    """Single-group 8-bit AdamW (quantized first+second moments).
+
+    Defaults track standard AdamW (lr=3e-4) because the quantization
+    preserves the update direction; only the moment buffers shrink.
+    Use when memory budget cannot accommodate full fp32 moments."""
+    return OptimSpec(
+        kind=OptimKind.ADAM_8BIT,
+        groups=(
+            ParamGroup(matcher="all", lr=lr, weight_decay=weight_decay,
+                       betas=betas),
+        ),
+        gradient_clip_norm=gradient_clip_norm,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Registry — used by Stage E / GUI dropdown
 # ---------------------------------------------------------------------------
@@ -239,16 +341,23 @@ OPTIM_BUILTINS: dict[str, str] = {
     "adamw":              "cppmega_v4.buildspec.optim_spec:adamw",
     "muon":               "cppmega_v4.buildspec.optim_spec:muon",
     "muon_adamw_hybrid":  "cppmega_v4.buildspec.optim_spec:muon_adamw_hybrid",
+    "lion":               "cppmega_v4.buildspec.optim_spec:lion",
+    "lion8bit":           "cppmega_v4.buildspec.optim_spec:lion8bit",
+    "adam8bit":           "cppmega_v4.buildspec.optim_spec:adam8bit",
     "sgd":                "cppmega_v4.buildspec.optim_spec:sgd",
 }
 
 
 __all__ = [
+    "LION_LR_WARN_CEILING",
     "OPTIM_BUILTINS",
     "OptimKind",
     "OptimSpec",
     "ParamGroup",
+    "adam8bit",
     "adamw",
+    "lion",
+    "lion8bit",
     "muon",
     "muon_adamw_hybrid",
     "sgd",

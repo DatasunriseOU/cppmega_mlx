@@ -6,7 +6,23 @@ export interface OptimTabProps {
   onApply: (next: OptimState) => void;
 }
 
-const KINDS: OptimKind[] = ["adamw", "muon", "muon_adamw_hybrid", "sgd"];
+const KINDS: OptimKind[] = [
+  "adamw", "muon", "muon_adamw_hybrid",
+  "lion", "lion8bit", "adam8bit",
+  "sgd",
+];
+
+// Recommended lr per kind — surfaces in tooltip + can auto-populate
+// the first group's lr when the kind changes (E7-10 will wire this).
+export const RECOMMENDED_LR: Record<OptimKind, number> = {
+  adamw:             3e-4,
+  muon:              1e-2,
+  muon_adamw_hybrid: 1e-2,
+  lion:              1e-4,
+  lion8bit:          1e-4,
+  adam8bit:          3e-4,
+  sgd:               1e-2,
+};
 
 const DEFAULT_NEW_GROUP: ParamGroupState = {
   matcher: "regex:.*", lr: 1e-4, weight_decay: 0.0,
