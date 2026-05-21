@@ -534,4 +534,5 @@ METHOD_REGISTRY: frozenset[str] = frozenset({
     "backend.status",
     "tokenizer.encode_visualize",
     "tokenizer.list_presets",
+    "data.preview_parquet",
 })

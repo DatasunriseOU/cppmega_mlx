@@ -27,6 +27,10 @@ from cppmega_v4.jsonrpc.tokenizer_methods import (
     encode_visualize,
     list_presets as tokenizer_list_presets,
 )
+from cppmega_v4.jsonrpc.data_methods import (
+    PreviewParquetParams,
+    preview_parquet,
+)
 from cppmega_v4.jsonrpc.schema import (
     BuildPresetSpecsParams,
     ErrorCode,
@@ -75,6 +79,10 @@ _ROUTES: Mapping[str, tuple[type[BaseModel], _Handler]] = {
     "tokenizer.encode_visualize": (
         EncodeVisualizeParams,
         lambda p, c: encode_visualize(p, cache=c),
+    ),
+    "data.preview_parquet": (
+        PreviewParquetParams,
+        lambda p, c: preview_parquet(p, cache=c),
     ),
 }
 
