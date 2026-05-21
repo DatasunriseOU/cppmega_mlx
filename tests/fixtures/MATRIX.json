@@ -1,0 +1,309 @@
+{
+  "parquets": {
+    "T1_cppmega_v3__P1_minimal": {
+      "columns": [
+        "input_ids"
+      ],
+      "path": "/Volumes/external/sources/cppmega.mlx/tests/fixtures/parquet/T1_cppmega_v3__P1_minimal.parquet",
+      "rows": 32,
+      "schema": "P1_minimal",
+      "seq_len": 64,
+      "tokenizer": "T1_cppmega_v3"
+    },
+    "T1_cppmega_v3__P2_doc": {
+      "columns": [
+        "input_ids",
+        "doc_ids"
+      ],
+      "path": "/Volumes/external/sources/cppmega.mlx/tests/fixtures/parquet/T1_cppmega_v3__P2_doc.parquet",
+      "rows": 32,
+      "schema": "P2_doc",
+      "seq_len": 64,
+      "tokenizer": "T1_cppmega_v3"
+    },
+    "T1_cppmega_v3__P3_engram": {
+      "columns": [
+        "input_ids",
+        "doc_ids",
+        "call_edges"
+      ],
+      "path": "/Volumes/external/sources/cppmega.mlx/tests/fixtures/parquet/T1_cppmega_v3__P3_engram.parquet",
+      "rows": 32,
+      "schema": "P3_engram",
+      "seq_len": 64,
+      "tokenizer": "T1_cppmega_v3"
+    },
+    "T1_cppmega_v3__P4_full": {
+      "columns": [
+        "input_ids",
+        "doc_ids",
+        "call_edges",
+        "loss_mask",
+        "chunk_boundaries",
+        "type_edges",
+        "constituent_provenance_offsets"
+      ],
+      "path": "/Volumes/external/sources/cppmega.mlx/tests/fixtures/parquet/T1_cppmega_v3__P4_full.parquet",
+      "rows": 32,
+      "schema": "P4_full",
+      "seq_len": 64,
+      "tokenizer": "T1_cppmega_v3"
+    },
+    "T2_gpt2_small__P1_minimal": {
+      "columns": [
+        "input_ids"
+      ],
+      "path": "/Volumes/external/sources/cppmega.mlx/tests/fixtures/parquet/T2_gpt2_small__P1_minimal.parquet",
+      "rows": 32,
+      "schema": "P1_minimal",
+      "seq_len": 64,
+      "tokenizer": "T2_gpt2_small"
+    },
+    "T2_gpt2_small__P2_doc": {
+      "columns": [
+        "input_ids",
+        "doc_ids"
+      ],
+      "path": "/Volumes/external/sources/cppmega.mlx/tests/fixtures/parquet/T2_gpt2_small__P2_doc.parquet",
+      "rows": 32,
+      "schema": "P2_doc",
+      "seq_len": 64,
+      "tokenizer": "T2_gpt2_small"
+    },
+    "T2_gpt2_small__P3_engram": {
+      "columns": [
+        "input_ids",
+        "doc_ids",
+        "call_edges"
+      ],
+      "path": "/Volumes/external/sources/cppmega.mlx/tests/fixtures/parquet/T2_gpt2_small__P3_engram.parquet",
+      "rows": 32,
+      "schema": "P3_engram",
+      "seq_len": 64,
+      "tokenizer": "T2_gpt2_small"
+    },
+    "T2_gpt2_small__P4_full": {
+      "columns": [
+        "input_ids",
+        "doc_ids",
+        "call_edges",
+        "loss_mask",
+        "chunk_boundaries",
+        "type_edges",
+        "constituent_provenance_offsets"
+      ],
+      "path": "/Volumes/external/sources/cppmega.mlx/tests/fixtures/parquet/T2_gpt2_small__P4_full.parquet",
+      "rows": 32,
+      "schema": "P4_full",
+      "seq_len": 64,
+      "tokenizer": "T2_gpt2_small"
+    },
+    "T3_minimal_no_fim__P1_minimal": {
+      "columns": [
+        "input_ids"
+      ],
+      "path": "/Volumes/external/sources/cppmega.mlx/tests/fixtures/parquet/T3_minimal_no_fim__P1_minimal.parquet",
+      "rows": 32,
+      "schema": "P1_minimal",
+      "seq_len": 64,
+      "tokenizer": "T3_minimal_no_fim"
+    },
+    "T3_minimal_no_fim__P2_doc": {
+      "columns": [
+        "input_ids",
+        "doc_ids"
+      ],
+      "path": "/Volumes/external/sources/cppmega.mlx/tests/fixtures/parquet/T3_minimal_no_fim__P2_doc.parquet",
+      "rows": 32,
+      "schema": "P2_doc",
+      "seq_len": 64,
+      "tokenizer": "T3_minimal_no_fim"
+    },
+    "T3_minimal_no_fim__P3_engram": {
+      "columns": [
+        "input_ids",
+        "doc_ids",
+        "call_edges"
+      ],
+      "path": "/Volumes/external/sources/cppmega.mlx/tests/fixtures/parquet/T3_minimal_no_fim__P3_engram.parquet",
+      "rows": 32,
+      "schema": "P3_engram",
+      "seq_len": 64,
+      "tokenizer": "T3_minimal_no_fim"
+    },
+    "T3_minimal_no_fim__P4_full": {
+      "columns": [
+        "input_ids",
+        "doc_ids",
+        "call_edges",
+        "loss_mask",
+        "chunk_boundaries",
+        "type_edges",
+        "constituent_provenance_offsets"
+      ],
+      "path": "/Volumes/external/sources/cppmega.mlx/tests/fixtures/parquet/T3_minimal_no_fim__P4_full.parquet",
+      "rows": 32,
+      "schema": "P4_full",
+      "seq_len": 64,
+      "tokenizer": "T3_minimal_no_fim"
+    },
+    "T4_fim_only__P1_minimal": {
+      "columns": [
+        "input_ids"
+      ],
+      "path": "/Volumes/external/sources/cppmega.mlx/tests/fixtures/parquet/T4_fim_only__P1_minimal.parquet",
+      "rows": 32,
+      "schema": "P1_minimal",
+      "seq_len": 64,
+      "tokenizer": "T4_fim_only"
+    },
+    "T4_fim_only__P2_doc": {
+      "columns": [
+        "input_ids",
+        "doc_ids"
+      ],
+      "path": "/Volumes/external/sources/cppmega.mlx/tests/fixtures/parquet/T4_fim_only__P2_doc.parquet",
+      "rows": 32,
+      "schema": "P2_doc",
+      "seq_len": 64,
+      "tokenizer": "T4_fim_only"
+    },
+    "T4_fim_only__P3_engram": {
+      "columns": [
+        "input_ids",
+        "doc_ids",
+        "call_edges"
+      ],
+      "path": "/Volumes/external/sources/cppmega.mlx/tests/fixtures/parquet/T4_fim_only__P3_engram.parquet",
+      "rows": 32,
+      "schema": "P3_engram",
+      "seq_len": 64,
+      "tokenizer": "T4_fim_only"
+    },
+    "T4_fim_only__P4_full": {
+      "columns": [
+        "input_ids",
+        "doc_ids",
+        "call_edges",
+        "loss_mask",
+        "chunk_boundaries",
+        "type_edges",
+        "constituent_provenance_offsets"
+      ],
+      "path": "/Volumes/external/sources/cppmega.mlx/tests/fixtures/parquet/T4_fim_only__P4_full.parquet",
+      "rows": 32,
+      "schema": "P4_full",
+      "seq_len": 64,
+      "tokenizer": "T4_fim_only"
+    }
+  },
+  "round_trip": {
+    "T1_cppmega_v3__P1_minimal": {
+      "first_decoded": "add a b a b",
+      "non_empty": "True"
+    },
+    "T1_cppmega_v3__P2_doc": {
+      "first_decoded": "add a b a b",
+      "non_empty": "True"
+    },
+    "T1_cppmega_v3__P3_engram": {
+      "first_decoded": "add a b a b",
+      "non_empty": "True"
+    },
+    "T1_cppmega_v3__P4_full": {
+      "first_decoded": "add a b a b",
+      "non_empty": "True"
+    },
+    "T2_gpt2_small__P1_minimal": {
+      "first_decoded": "def add(a, b): return a + b\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!",
+      "non_empty": "True"
+    },
+    "T2_gpt2_small__P2_doc": {
+      "first_decoded": "def add(a, b): return a + b\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!",
+      "non_empty": "True"
+    },
+    "T2_gpt2_small__P3_engram": {
+      "first_decoded": "def add(a, b): return a + b\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!",
+      "non_empty": "True"
+    },
+    "T2_gpt2_small__P4_full": {
+      "first_decoded": "def add(a, b): return a + b\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!",
+      "non_empty": "True"
+    },
+    "T3_minimal_no_fim__P1_minimal": {
+      "first_decoded": "def add(a, b): return a + b\n",
+      "non_empty": "True"
+    },
+    "T3_minimal_no_fim__P2_doc": {
+      "first_decoded": "def add(a, b): return a + b\n",
+      "non_empty": "True"
+    },
+    "T3_minimal_no_fim__P3_engram": {
+      "first_decoded": "def add(a, b): return a + b\n",
+      "non_empty": "True"
+    },
+    "T3_minimal_no_fim__P4_full": {
+      "first_decoded": "def add(a, b): return a + b\n",
+      "non_empty": "True"
+    },
+    "T4_fim_only__P1_minimal": {
+      "first_decoded": "def add(a, b): return a + b\n",
+      "non_empty": "True"
+    },
+    "T4_fim_only__P2_doc": {
+      "first_decoded": "def add(a, b): return a + b\n",
+      "non_empty": "True"
+    },
+    "T4_fim_only__P3_engram": {
+      "first_decoded": "def add(a, b): return a + b\n",
+      "non_empty": "True"
+    },
+    "T4_fim_only__P4_full": {
+      "first_decoded": "def add(a, b): return a + b\n",
+      "non_empty": "True"
+    }
+  },
+  "tokenizers": {
+    "T1_cppmega_v3": {
+      "digest": "34439c0fbe76d582",
+      "fresh": true,
+      "path": "/Volumes/external/sources/cppmega.mlx/tests/fixtures/tokenizers/T1_cppmega_v3.json",
+      "specials": [],
+      "vocab_size": 65536
+    },
+    "T2_gpt2_small": {
+      "digest": "11e818f948f43497",
+      "fresh": true,
+      "path": "/Volumes/external/sources/cppmega.mlx/tests/fixtures/tokenizers/T2_gpt2_small.json",
+      "specials": [],
+      "vocab_size": 50257
+    },
+    "T3_minimal_no_fim": {
+      "digest": "17a044a3c1bb0486",
+      "fresh": true,
+      "path": "/Volumes/external/sources/cppmega.mlx/tests/fixtures/tokenizers/T3_minimal_no_fim.json",
+      "specials": [
+        "<PAD>",
+        "<UNK>",
+        "<BOS>",
+        "<EOS>"
+      ],
+      "vocab_size": 260
+    },
+    "T4_fim_only": {
+      "digest": "892f2bab670c5cd4",
+      "fresh": true,
+      "path": "/Volumes/external/sources/cppmega.mlx/tests/fixtures/tokenizers/T4_fim_only.json",
+      "specials": [
+        "<PAD>",
+        "<UNK>",
+        "<BOS>",
+        "<EOS>",
+        "<FIM_PREFIX>",
+        "<FIM_MIDDLE>",
+        "<FIM_SUFFIX>"
+      ],
+      "vocab_size": 440
+    }
+  }
+}
