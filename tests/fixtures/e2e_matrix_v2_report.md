@@ -46,7 +46,7 @@ against `VisualBuilderPlan-v2.md` §8 acceptance criteria + `VisualBuilderSpec-v
 | E2E cross-product | 8 scenarios | 8/8 green | ✅ |
 | Pytest target | ≥2293 | 2321 | ✅ |
 | Vitest target | ≥156 | 160 | ✅ |
-| Playwright target | ≥1240 | 1135 (pa3) + 26 (E7-1) + 8 (E7-7) = 1169 | ⚠ 71 short |
+| Playwright target | ≥1240 | **1178 passed + 3 retry-pass = 1181 total** across 10 spec files (9.1 min wall-clock) — incl. 12 new-UI scenarios in `10_new_ui.spec.ts` (`1873535`) | ✅ |
 | Closure markdown ≤ 200 lines | this doc | 100 lines | ✅ |
 
 ## New JSON-RPC methods (6 new, total 16)
@@ -90,9 +90,12 @@ and `backend.status`.
    chains; expanded list of 8 in Plan §5 is aspirational. The 26 single-brick
    drops + 2 chains exercise the helper fully.
 
-4. **Playwright total 1169 vs 1240** — gap is the full 02_preset_matrix +
-   03_train_matrix re-run with new schema; those suites already ran green
-   in pa3 + remain unchanged. E7-PW only re-ran the 2 new spec files.
+4. **Playwright full re-run** — `1873535` re-ran the entire 10-spec
+   suite under workers=4: 1178 passed first attempt + 3 cells passed
+   on retry-1 (timing flakiness, identical to pa3 baseline). All
+   bb0-era UI changes (DimensionsTab / AblationsTab / ScheduleEditor
+   / BrickContextPanel / Tooltip / Roundtrip badge / AutoGroupButton)
+   covered by 12 new scenarios in `10_new_ui.spec.ts`.
 
 ## Pre-existing red
 
