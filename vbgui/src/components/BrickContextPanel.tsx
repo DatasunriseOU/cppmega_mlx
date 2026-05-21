@@ -10,7 +10,8 @@ import { Tooltip } from "@/components/Tooltip";
 import { ExplainModal } from "@/components/ExplainModal";
 
 const ACTIVATION_OPTIONS = [
-  "glu", "gelu", "relu", "relu2", "sqrelu", "silu", "swiglu",
+  "glu", "gelu", "relu", "relu2", "sqrelu", "silu", "mish",
+  "swiglu", "geglu", "reglu", "xielu",
 ];
 const NORM_OPTIONS = ["rmsnorm", "layernorm", "none"];
 

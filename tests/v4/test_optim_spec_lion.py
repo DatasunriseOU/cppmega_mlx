@@ -160,21 +160,24 @@ def test_existing_factories_unchanged(factory):
 # ---------------------------------------------------------------------------
 
 
-def test_activation_names_contains_six_entries():
+def test_activation_names_contains_ten_entries():
+    # E7-13 extended the set from 6 → 10 (added mish + geglu/reglu/xielu).
     assert set(ACTIVATION_NAMES) == {
-        "gelu", "relu", "relu2", "sqrelu", "silu", "swiglu",
+        "gelu", "relu", "relu2", "sqrelu", "silu", "mish",
+        "swiglu", "geglu", "reglu", "xielu",
     }
 
 
-def test_is_gated_only_swiglu_is_gated():
-    assert is_gated("swiglu") is True
-    for name in ("gelu", "relu", "relu2", "sqrelu", "silu"):
+def test_is_gated_four_gated_six_dense():
+    for name in ("swiglu", "geglu", "reglu", "xielu"):
+        assert is_gated(name) is True
+    for name in ("gelu", "relu", "relu2", "sqrelu", "silu", "mish"):
         assert is_gated(name) is False
 
 
 def test_is_gated_rejects_unknown_name():
-    with pytest.raises(ValueError, match="unknown activation 'mish'"):
-        is_gated("mish")
+    with pytest.raises(ValueError, match="unknown activation 'banana'"):
+        is_gated("banana")
 
 
 @pytest.mark.parametrize("name", ["gelu", "relu", "relu2", "sqrelu", "silu"])

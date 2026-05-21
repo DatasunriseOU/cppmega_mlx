@@ -265,6 +265,55 @@ _ACTIVATION_ENTRIES = [
                  "projection; verify will block the mismatch",
                  "Convention: intermediate_size = 8/3*H rounded to 256"),
     ),
+    ExplainEntry(
+        category="activation", name="mish",
+        summary="Mish — `x * tanh(softplus(x))` (Misra 2019). Smooth, "
+                "self-regularizing.",
+        when_to_use="Vision tasks; some LLM ablations show +0.5-1% "
+                    "accuracy vs ReLU/GELU.",
+        when_to_avoid="LLM pretraining at scale — SwiGLU dominates.",
+        recommended_params={},
+        paper_ref="Misra, 2019",
+        paper_url="https://arxiv.org/abs/1908.08681",
+        gotchas=("More compute than GELU; not significantly better on "
+                 "LLM downstream metrics",),
+    ),
+    ExplainEntry(
+        category="activation", name="geglu",
+        summary="Gated GELU — `gelu(gate) * up` (Shazeer 2020).",
+        when_to_use="GLM / Falcon-family pretraining; fine-tuning from "
+                    "GELU-pretrained checkpoints with gating.",
+        when_to_avoid="Same as SwiGLU memory caveat; pick SwiGLU if "
+                      "you're starting fresh in 2025.",
+        recommended_params={},
+        paper_ref="Shazeer, 2020",
+        paper_url="https://arxiv.org/abs/2002.05202",
+        gotchas=("Requires gated_mlp brick",),
+    ),
+    ExplainEntry(
+        category="activation", name="reglu",
+        summary="Gated ReLU — `relu(gate) * up` (Shazeer 2020).",
+        when_to_use="Hardware-constrained inference where ReLU is "
+                    "cheaper than GELU/SiLU on the target accelerator.",
+        when_to_avoid="Modern LLM pretraining — quality lags SwiGLU.",
+        recommended_params={},
+        paper_ref="Shazeer, 2020",
+        paper_url="https://arxiv.org/abs/2002.05202",
+        gotchas=("Dead-gate problem: some gate units may emit 0 "
+                 "indefinitely",),
+    ),
+    ExplainEntry(
+        category="activation", name="xielu",
+        summary="Extended xGLU — `gelu(gate) * silu(up)`. Niche, "
+                "appears in Megatron ablations.",
+        when_to_use="Research / ablation runs; not a default choice.",
+        when_to_avoid="Production pretraining — under-studied.",
+        recommended_params={},
+        paper_ref=None,
+        paper_url=None,
+        gotchas=("Combined gating + activation cost > SwiGLU; quality "
+                 "rarely better",),
+    ),
 ]
 
 

@@ -23,12 +23,15 @@ import mlx.nn as nn
 
 
 ActivationName = Literal[
-    "gelu", "relu", "relu2", "sqrelu", "silu", "swiglu",
+    "gelu", "relu", "relu2", "sqrelu", "silu", "mish",
+    "swiglu", "geglu", "reglu", "xielu",
 ]
-"""Recognised activation names — E7-12 set (6 entries).
+"""Recognised activation names — E7-12 + E7-13 set (10 entries).
 
-Gated entries (require a ``gate`` companion projection): swiglu.
-Dense entries (single projection input): gelu, relu, relu2, sqrelu, silu.
+Gated entries (require a ``gate`` companion projection):
+  swiglu, geglu, reglu, xielu.
+Dense entries (single projection input):
+  gelu, relu, relu2, sqrelu, silu, mish.
 """
 
 
@@ -38,7 +41,11 @@ IS_GATED: Final[dict[str, bool]] = {
     "relu2":  False,
     "sqrelu": False,
     "silu":   False,
+    "mish":   False,
     "swiglu": True,
+    "geglu":  True,
+    "reglu":  True,
+    "xielu":  True,
 }
 
 
@@ -93,9 +100,24 @@ def apply_activation(
         return mx.square(mx.maximum(x, 0))
     if name == "silu":
         return nn.silu(x)
+    if name == "mish":
+        # x * tanh(softplus(x)); softplus(z) = log(1 + exp(z))
+        # Use log1p for numerical stability.
+        return x * mx.tanh(mx.log1p(mx.exp(x)))
     if name == "swiglu":
-        assert gate is not None  # narrowed for type-checkers
+        assert gate is not None
         return nn.silu(gate) * x
+    if name == "geglu":
+        assert gate is not None
+        return nn.gelu_approx(gate) * x
+    if name == "reglu":
+        assert gate is not None
+        return mx.maximum(gate, 0) * x
+    if name == "xielu":
+        # Extended xGLU variant: gelu(gate) * silu(x); not a single
+        # published paper but appears in some Megatron-style ablations.
+        assert gate is not None
+        return nn.gelu_approx(gate) * nn.silu(x)
 
     raise AssertionError(f"unreachable: {name!r}")
 
