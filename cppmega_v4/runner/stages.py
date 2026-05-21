@@ -636,13 +636,36 @@ def stage_train(ctx: StageContext) -> StageResult:
         loss_and_grad = nn.value_and_grad(all_modules, loss_fn)
 
         # V4-11: inference probe — forward over a fixed-seed input both
-        # before training and after; report l2 and cosine drift. Proves
-        # the optimizer's update actually changed observable model output,
-        # not just internal optimizer state. G01: skip the K-1 extra LM
-        # heads — probe only the primary head so output shape stays sane
-        # for mtp_k > 1.
-        probe_input = mx.random.normal(
-            shape=(1, seq, hidden), key=mx.random.key(42))
+        # before training and after; report l2 and cosine drift.
+        # G20: when opts.inference_probe_text + tokenizer_path supplied,
+        # encode real text via the tokenizer and use its embedding as
+        # probe input (instead of random Gaussian). Reports
+        # extras.inference_probe.{real_tokens, text_len, top1_token_drift}.
+        probe_text = opts.get("inference_probe_text")
+        probe_real_tokens = False
+        probe_text_len = 0
+        if probe_text and tokenizer_path:
+            try:
+                from tokenizers import Tokenizer as _Tok
+                _tok = _Tok.from_file(str(tokenizer_path))
+                enc_ids = _tok.encode(str(probe_text)).ids[:seq]
+                if len(enc_ids) > 0:
+                    # Pad to seq via repeating last token
+                    while len(enc_ids) < seq:
+                        enc_ids.append(enc_ids[-1])
+                    ids_arr = mx.array(
+                        [int(t) % vocab_size for t in enc_ids],
+                        dtype=mx.int32).reshape(1, seq)
+                    # Use a lightweight Embedding to project ids → hidden
+                    _emb = nn.Embedding(vocab_size, hidden)
+                    probe_input = _emb(ids_arr)
+                    probe_real_tokens = True
+                    probe_text_len = len(enc_ids)
+            except Exception:
+                pass
+        if not probe_real_tokens:
+            probe_input = mx.random.normal(
+                shape=(1, seq, hidden), key=mx.random.key(42))
         probe_layers_before = list(getattr(all_modules, "layers", all_modules))
         _probe_brick_layers = probe_layers_before[:-mtp_k]
         probe_features_before = forward_layers(
@@ -792,6 +815,20 @@ def stage_train(ctx: StageContext) -> StageResult:
         dot = float(mx.sum(probe_output_before * probe_output_after).item())
         cos_sim = dot / denom
 
+        # G20: top-1 token drift count when probing with real tokens.
+        # Reshape flat outputs back to (B*S, V) for argmax comparison.
+        top1_token_drift = 0
+        if probe_real_tokens:
+            try:
+                vbefore = probe_output_before.reshape(-1, vocab_size)
+                vafter = probe_output_after.reshape(-1, vocab_size)
+                top1_before = vbefore.argmax(axis=-1)
+                top1_after = vafter.argmax(axis=-1)
+                top1_token_drift = int(mx.sum(
+                    top1_before != top1_after).item())
+            except Exception:
+                pass
+
         finite = all(
             loss_item == loss_item and -1e10 < loss_item < 1e10
             for loss_item in losses
@@ -849,6 +886,9 @@ def stage_train(ctx: StageContext) -> StageResult:
                 "inference_probe": {
                     "l2_diff": round(l2_diff, 6),
                     "cos_sim": round(cos_sim, 6),
+                    "real_tokens": probe_real_tokens,
+                    "text_len": probe_text_len,
+                    "top1_token_drift": top1_token_drift,
                 },
                 "side_channels_observed": side_channels_observed,
                 "graph_diff": graph_diff,
