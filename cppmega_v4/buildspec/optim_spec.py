@@ -18,6 +18,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Final
 
+from cppmega_v4.buildspec.schedules import ScheduleSpec
+
 
 class OptimKind(str, Enum):
     """Recognised optimizer families."""
@@ -63,6 +65,7 @@ class ParamGroup:
     weight_decay: float = 0.01
     betas: tuple[float, float] | None = None
     ns_steps: int | None = None
+    schedule: ScheduleSpec | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.matcher, str) or not self.matcher.strip():
@@ -93,6 +96,20 @@ class ParamGroup:
             raise ValueError(
                 f"ParamGroup.ns_steps must be ≥ 1, got {self.ns_steps!r}"
             )
+        if self.schedule is not None and not isinstance(self.schedule,
+                                                       ScheduleSpec):
+            raise TypeError(
+                f"ParamGroup.schedule must be ScheduleSpec | None, got "
+                f"{type(self.schedule).__name__}"
+            )
+
+    def effective_lr_callable(self):
+        """Return ``step → lr`` callable. If no schedule, returns the
+        constant ``lr`` for every step (matching MLX optimizer API)."""
+        if self.schedule is None:
+            base = float(self.lr)
+            return lambda _step, _b=base: _b
+        return self.schedule.build(self.lr)
 
 
 @dataclass(frozen=True)
@@ -354,6 +371,7 @@ __all__ = [
     "OptimKind",
     "OptimSpec",
     "ParamGroup",
+    "ScheduleSpec",
     "adam8bit",
     "adamw",
     "lion",

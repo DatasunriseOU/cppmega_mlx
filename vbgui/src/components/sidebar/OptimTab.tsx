@@ -1,5 +1,7 @@
 import { useState } from "react";
-import type { OptimKind, OptimState, ParamGroupState } from "@/state/spec";
+import type { OptimKind, OptimState, ParamGroupState,
+              ScheduleSpecState } from "@/state/spec";
+import { ScheduleEditor } from "@/components/ScheduleEditor";
 
 export interface OptimTabProps {
   optim: OptimState;
@@ -30,11 +32,23 @@ const DEFAULT_NEW_GROUP: ParamGroupState = {
 
 export function OptimTab({ optim, onApply }: OptimTabProps): JSX.Element {
   const [draft, setDraft] = useState<OptimState>(optim);
+  const [expandedSchedules, setExpandedSchedules] =
+    useState<Set<number>>(new Set());
 
   function updateGroup(i: number, patch: Partial<ParamGroupState>) {
     setDraft({
       ...draft,
       groups: draft.groups.map((g, idx) => (idx === i ? { ...g, ...patch } : g)),
+    });
+  }
+  function setSchedule(i: number, schedule: ScheduleSpecState | undefined) {
+    updateGroup(i, { schedule });
+  }
+  function toggleSchedule(i: number) {
+    setExpandedSchedules((prev) => {
+      const next = new Set(prev);
+      next.has(i) ? next.delete(i) : next.add(i);
+      return next;
     });
   }
   function addGroup() {
@@ -85,6 +99,11 @@ export function OptimTab({ optim, onApply }: OptimTabProps): JSX.Element {
                        })} />
               </td>
               <td>
+                <button data-testid={`optim-group-${i}-schedule-toggle`}
+                        onClick={() => toggleSchedule(i)}
+                        title="Edit LR schedule">
+                  {expandedSchedules.has(i) || g.schedule ? "⏲▾" : "⏲"}
+                </button>
                 <button data-testid={`optim-group-${i}-remove`}
                         onClick={() => removeGroup(i)}>×</button>
               </td>
@@ -92,6 +111,16 @@ export function OptimTab({ optim, onApply }: OptimTabProps): JSX.Element {
           ))}
         </tbody>
       </table>
+
+      {draft.groups.map((g, i) => (
+        (expandedSchedules.has(i) || g.schedule) && (
+          <ScheduleEditor key={`sched-${i}`}
+                          index={i}
+                          baseLr={g.lr}
+                          value={g.schedule}
+                          onChange={(s) => setSchedule(i, s)} />
+        )
+      ))}
 
       <button data-testid="optim-add-group" onClick={addGroup}>+ Add group</button>
 

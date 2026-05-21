@@ -122,6 +122,19 @@ class LossSpecPayload(BaseModel):
     params: dict[str, Any] = Field(default_factory=dict)
 
 
+class ScheduleSpecPayload(BaseModel):
+    """Wire form of ScheduleSpec (cppmega_v4.buildspec.schedules)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: str = "constant"
+    warmup_steps: int = 0
+    total_steps: int | None = None
+    min_lr_ratio: float = 0.1
+    decay_steps: int | None = None
+    power: float = 2.0
+
+
 class ParamGroupPayload(BaseModel):
     """One optimizer param group with matcher + hyperparams."""
 
@@ -131,6 +144,8 @@ class ParamGroupPayload(BaseModel):
     lr: float
     weight_decay: float = 0.0
     betas: tuple[float, float] | None = None
+    ns_steps: int | None = None
+    schedule: ScheduleSpecPayload | None = None
 
 
 class OptimSpecPayload(BaseModel):

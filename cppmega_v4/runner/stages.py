@@ -362,6 +362,31 @@ def stage_train(ctx: StageContext) -> StageResult:
         batch = int(opts.get("B", 1))
         hidden = ctx.spec.dim_env.get("H", 64)
 
+        # E7-9: honour the first ParamGroup's schedule (if any). The
+        # group's lr overrides the legacy stage_options lr default, and
+        # if a ScheduleSpec is attached we build a step→lr callable.
+        # Multi-group schedules (per-matcher LR curves) await E7-9
+        # follow-up — for now the first group governs.
+        lr_callable = None
+        schedule_kind_label = "constant"
+        spec_optim = getattr(ctx.spec, "optim", None)
+        if spec_optim is not None and getattr(spec_optim, "groups", None):
+            first_group = spec_optim.groups[0]
+            lr = float(first_group.lr)
+            sched_payload = getattr(first_group, "schedule", None)
+            if sched_payload is not None:
+                from cppmega_v4.buildspec.schedules import ScheduleSpec
+                schedule = ScheduleSpec(
+                    kind=sched_payload.kind,
+                    warmup_steps=sched_payload.warmup_steps,
+                    total_steps=sched_payload.total_steps,
+                    min_lr_ratio=sched_payload.min_lr_ratio,
+                    decay_steps=sched_payload.decay_steps,
+                    power=sched_payload.power,
+                )
+                lr_callable = schedule.build(lr)
+                schedule_kind_label = schedule.kind
+
         # Re-materialise the graph with instantiate=True so backward works.
         specs = _graph_to_specs(ctx.spec.graph)
         graph = from_block_specs(specs, hidden_size=hidden, instantiate=True)
@@ -402,12 +427,23 @@ def stage_train(ctx: StageContext) -> StageResult:
             loss_fn(emb, tgt))
 
         losses: list[float] = []
+        lr_trajectory: list[float] = []
         # Snapshot first trainable param for delta check
         flat_params = dict(nn.utils.tree_flatten(all_modules.parameters()))
         first_key = next(iter(flat_params))
         before = mx.array(flat_params[first_key])  # deep copy
 
         for step in range(n_steps):
+            # If a schedule callable exists, override optimizer's
+            # learning_rate per step. MLX optimizers accept a fresh
+            # scalar via the public learning_rate attribute.
+            if lr_callable is not None:
+                step_lr = float(lr_callable(step))
+                opt.learning_rate = step_lr
+                lr_trajectory.append(step_lr)
+            else:
+                lr_trajectory.append(lr)
+
             emb = mx.random.normal(shape=(batch, seq, hidden), key=rng_key)
             rng_key, _ = mx.random.split(rng_key)
             loss, grads = loss_and_grad(all_modules, emb, targets)
@@ -451,8 +487,10 @@ def stage_train(ctx: StageContext) -> StageResult:
             elapsed_ms=(time.perf_counter() - t0) * 1000.0,
             extras={
                 "losses": [round(l, 4) for l in losses],
+                "lr_trajectory": [round(l, 6) for l in lr_trajectory],
                 "weight_delta_norm": round(delta, 6),
                 "num_steps": n_steps,
+                "schedule_kind": schedule_kind_label,
             },
         )
     except Exception as exc:

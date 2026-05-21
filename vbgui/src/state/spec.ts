@@ -16,11 +16,24 @@ export interface LossState {
 export type OptimKind = "adamw" | "muon" | "muon_adamw_hybrid"
                        | "lion" | "lion8bit" | "adam8bit" | "sgd";
 
+export type ScheduleKind = "constant" | "linear_warmup" | "cosine"
+                          | "wsd" | "inv_sqrt" | "polynomial";
+
+export interface ScheduleSpecState {
+  kind: ScheduleKind;
+  warmup_steps?: number;
+  total_steps?: number;
+  min_lr_ratio?: number;
+  decay_steps?: number;
+  power?: number;
+}
+
 export interface ParamGroupState {
   matcher: string;
   lr: number;
   weight_decay: number;
   betas?: [number, number];
+  schedule?: ScheduleSpecState;
 }
 
 export interface OptimState {
