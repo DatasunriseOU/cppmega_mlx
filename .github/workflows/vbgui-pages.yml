@@ -1,0 +1,84 @@
+name: Deploy Visual Builder static demo to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "vbgui/**"
+      - "cppmega_v4/widget/**"
+      - "cppmega_v4/spec/**"
+      - "cppmega_v4/buildspec/**"
+      - "cppmega_v4/parallelism/**"
+      - "cppmega_v4/fusion/**"
+      - "cppmega_v4/probe/**"
+      - "cppmega_v4/jsonrpc/**"
+      - "cppmega_v4/runner/**"
+      - ".github/workflows/vbgui-pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: vbgui/package-lock.json
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install JupyterLite + Pyodide kernel
+        run: |
+          python -m pip install --upgrade pip
+          pip install jupyterlite-core jupyterlite-pyodide-kernel jupyter-server
+
+      - name: Build standalone Vite bundle
+        working-directory: vbgui
+        env:
+          NODE_ENV: development
+        run: |
+          npm ci
+          npm run typecheck
+          npm test
+          npm run build
+          npm run build:widget
+
+      - name: Build JupyterLite static site
+        working-directory: vbgui/jupyterlite
+        run: jupyter lite build --output-dir ../site/jupyterlite
+
+      - name: Stage Pages payload
+        run: |
+          mkdir -p vbgui/site
+          cp -r vbgui/dist/* vbgui/site/
+          test -d vbgui/site/jupyterlite
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: vbgui/site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
