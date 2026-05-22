@@ -1208,7 +1208,7 @@ def dataset_receipt_payload(
     if index_metadata is not None:
         payload["index_metadata"] = _json_ready(index_metadata)
         payload["megatron_indexed_receipt"] = {
-            "ingress": "MegatronIndexedDataset",
+            "ingress": dataset.__class__.__name__,
             "path_accepts_suffixless_prefix": True,
             "sidecar_schema": "explicit_token_aligned_binary_side_channel_paths",
             "local_only": True,

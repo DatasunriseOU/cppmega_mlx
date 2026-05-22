@@ -28,6 +28,8 @@ from cppmega_mlx.data.fim import (
 from cppmega_mlx.data.megatron_indexed import (
     MegatronIndexedDataset,
     MegatronIndexedMetadata,
+    MegatronIndexedMultiShardDataset,
+    MegatronIndexedMultiShardMetadata,
     megatron_indexed_side_channel_schema,
     open_megatron_indexed_dataset,
 )
@@ -82,6 +84,8 @@ __all__ = [
     "MAX_PLATFORM_IDS",
     "MegatronIndexedDataset",
     "MegatronIndexedMetadata",
+    "MegatronIndexedMultiShardDataset",
+    "MegatronIndexedMultiShardMetadata",
     "OversizedSamplePolicy",
     "PLATFORM_VOCAB",
     "PLATFORM_VOCAB_SIZE",

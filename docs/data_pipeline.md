@@ -17,9 +17,10 @@ cppmega_mlx.data accepts token IDs from three local ingress paths:
   threading after the SPACE/NL retokenize: source-level structure_ids is
   recorded as not_token_aligned and skipped, while future regenerated
   token_* aliases remain supported when their rows match token_ids.
-- Megatron Indexed `.bin/.idx` datasets through open_megatron_indexed_dataset,
-  using the standalone reader seam without importing Megatron runtime code into
-  the Mac path.
+- Megatron Indexed `.bin/.idx` datasets through open_megatron_indexed_dataset:
+  either a single suffixless prefix or a directory of `.idx`/`.bin` shard
+  pairs, using the standalone reader seam without importing Megatron runtime
+  code into the Mac path.
 
 All paths are tokenizer-agnostic at this layer. Callers are responsible for
 using a tokenizer contract that supplies the EOS token ID and any FIM/chat
@@ -111,8 +112,10 @@ LMTokenBatch document_ids but does not satisfy the 100M-token stress gate.
   path does not import torch unless the bridge is requested.
 - Mapping-batch and LMTokenBatch training can carry explicit packed document
   IDs through next-token and MTP loss paths into model attention.
-- NPZ, Parquet, and Megatron indexed loaders preserve persisted token-aligned
-  document IDs.
-- Full Stream D is still not closeable: multi-shard/scale validation, packed
-  multi-shard side-channel schema ownership, and the 100M-token stress gate
-  remain open.
+- NPZ, Parquet, and single- or multi-shard Megatron indexed loaders preserve
+  persisted token-aligned document IDs.
+- Multi-shard Megatron indexed directories batch across shard boundaries only
+  when token dtype, side-channel keys/dtypes, document-id presence/dtype, and
+  tokenizer metadata match across shards; schema drift fails closed.
+- Full Stream D is still not closeable: scale validation and the 100M-token
+  stress gate remain open.

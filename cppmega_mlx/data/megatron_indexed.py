@@ -98,6 +98,20 @@ class MegatronIndexedMetadata:
     source_format: str = "megatron"
 
 
+@dataclass(frozen=True)
+class MegatronIndexedMultiShardMetadata:
+    """Aggregated metadata for a directory of Megatron indexed token shards."""
+
+    root_path: Path
+    shard_count: int
+    dtype: str
+    sequence_count: int
+    document_count: int
+    token_count: int
+    shards: tuple[MegatronIndexedMetadata, ...]
+    source_format: str = "megatron-multishard"
+
+
 class MegatronIndexedDataset:
     """Read fixed token windows from Megatron .bin/.idx shards.
 
@@ -309,6 +323,9 @@ class MegatronIndexedDataset:
         return token_min, token_max
 
     def _make_batch(self, sample_idx: np.ndarray) -> LMTokenBatch:
+        return _lm_batch_from_numpy(self._make_numpy_batch(sample_idx))
+
+    def _make_numpy_batch(self, sample_idx: np.ndarray) -> dict[str, np.ndarray]:
         tokens = np.empty((sample_idx.shape[0], self.seq_len), dtype=np.int32)
         side_channels = {
             key: np.empty(
@@ -348,12 +365,205 @@ class MegatronIndexedDataset:
                 )
                 document_ids[row] = _to_document_id_values(doc_view)
 
-        kwargs = {key: mx.array(value) for key, value in side_channels.items()}
-        return LMTokenBatch(
-            tokens=mx.array(tokens),
-            document_ids=None if document_ids is None else mx.array(document_ids),
-            **kwargs,
+        batch: dict[str, np.ndarray] = {"tokens": tokens}
+        for key in _SIDE_CHANNEL_KEYS:
+            if key in side_channels:
+                batch[key] = side_channels[key]
+        if document_ids is not None:
+            batch["document_ids"] = document_ids
+        return batch
+
+
+class MegatronIndexedMultiShardDataset:
+    """Read a directory of fixed-shape Megatron indexed shards as one dataset."""
+
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        seq_len: int,
+        batch_size: int,
+        dtype: str | np.dtype | None = None,
+        metadata_path: str | Path | None = None,
+        token_key: str = "tokens",
+        shuffle: bool = False,
+        seed: int = 0,
+        loop: bool = False,
+        resume_batch: int = 0,
+        metadata: TokenDatasetMetadata | None = None,
+    ) -> None:
+        if metadata_path is not None:
+            raise ValueError(
+                "multi-shard Megatron directories use per-shard sidecars; "
+                "metadata_path is not supported"
+            )
+        if resume_batch < 0:
+            raise ValueError("resume_batch must be non-negative")
+
+        self.path = Path(path)
+        self.seq_len = seq_len
+        self.batch_size = batch_size
+        self.token_key = token_key
+        self.shuffle = shuffle
+        self.seed = seed
+        self.loop = loop
+        self.resume_batch = resume_batch
+
+        prefixes = _find_multishard_prefixes(self.path)
+        self._shards = tuple(
+            MegatronIndexedDataset(
+                prefix,
+                seq_len=seq_len,
+                batch_size=batch_size,
+                dtype=dtype,
+                token_key=token_key,
+            )
+            for prefix in prefixes
         )
+        schema = _validate_multishard_schema(self._shards)
+        self._side_channel_keys = schema.side_channel_keys
+        self._document_ids_present = schema.document_ids_present
+        self._batch_keys = (
+            "tokens",
+            *self._side_channel_keys,
+            *(("document_ids",) if self._document_ids_present else ()),
+        )
+        self._side_channels = {key: None for key in self._side_channel_keys}
+        sample_counts = np.asarray(
+            [shard.num_samples for shard in self._shards], dtype=np.int64
+        )
+        self._sample_offsets = np.concatenate(
+            [np.array([0], dtype=np.int64), np.cumsum(sample_counts, dtype=np.int64)]
+        )
+        self.index_metadata = MegatronIndexedMultiShardMetadata(
+            root_path=self.path,
+            shard_count=len(self._shards),
+            dtype=schema.token_dtype,
+            sequence_count=sum(
+                shard.index_metadata.sequence_count for shard in self._shards
+            ),
+            document_count=sum(
+                shard.index_metadata.document_count for shard in self._shards
+            ),
+            token_count=sum(shard.index_metadata.token_count for shard in self._shards),
+            shards=tuple(shard.index_metadata for shard in self._shards),
+        )
+        self.metadata = (
+            metadata
+            if metadata is not None
+            else _multi_shard_token_metadata(self._shards)
+        )
+
+    def __len__(self) -> int:
+        return self.num_batches
+
+    @property
+    def num_samples(self) -> int:
+        return int(self._sample_offsets[-1])
+
+    @property
+    def num_batches(self) -> int:
+        return self.num_samples // self.batch_size
+
+    @property
+    def dropped_samples(self) -> int:
+        return self.num_samples - self.num_batches * self.batch_size
+
+    def sample_order(self, *, epoch: int = 0) -> np.ndarray:
+        order = np.arange(self.num_samples, dtype=np.int64)
+        if self.shuffle:
+            rng = np.random.default_rng(self.seed + epoch)
+            rng.shuffle(order)
+        return order
+
+    def iter_batches(
+        self,
+        *,
+        resume_batch: int | None = None,
+        epoch: int = 0,
+        loop: bool | None = None,
+    ) -> Iterator[LMTokenBatch]:
+        effective_loop = self.loop if loop is None else loop
+        start_batch = self.resume_batch if resume_batch is None else resume_batch
+        if start_batch < 0:
+            raise ValueError("resume_batch must be non-negative")
+
+        current_epoch = epoch
+        batch_offset = start_batch
+        while True:
+            if self.num_batches == 0:
+                return
+            if batch_offset >= self.num_batches:
+                if not effective_loop:
+                    return
+                current_epoch += batch_offset // self.num_batches
+                batch_offset = batch_offset % self.num_batches
+
+            order = self.sample_order(epoch=current_epoch)
+            for local_batch in range(batch_offset, self.num_batches):
+                sample_idx = order[
+                    local_batch * self.batch_size : (local_batch + 1) * self.batch_size
+                ]
+                yield self._make_batch(sample_idx)
+
+            if not effective_loop:
+                return
+            current_epoch += 1
+            batch_offset = 0
+
+    def cursor_after(self, consumed_batches: int, *, epoch: int = 0) -> BatchCursor:
+        if consumed_batches < 0:
+            raise ValueError("consumed_batches must be non-negative")
+        total_batches = self.resume_batch + consumed_batches
+        if self.num_batches == 0:
+            return BatchCursor(
+                epoch=epoch,
+                batch_offset=0,
+                global_batch_offset=total_batches,
+            )
+        return BatchCursor(
+            epoch=epoch + total_batches // self.num_batches,
+            batch_offset=total_batches % self.num_batches,
+            global_batch_offset=total_batches,
+        )
+
+    def token_id_range(self) -> tuple[int, int]:
+        ranges = [shard.token_id_range() for shard in self._shards]
+        return min(low for low, _ in ranges), max(high for _, high in ranges)
+
+    def _make_batch(self, sample_idx: np.ndarray) -> LMTokenBatch:
+        return _lm_batch_from_numpy(self._make_numpy_batch(sample_idx))
+
+    def _make_numpy_batch(self, sample_idx: np.ndarray) -> dict[str, np.ndarray]:
+        shard_indices = np.searchsorted(
+            self._sample_offsets[1:],
+            sample_idx,
+            side="right",
+        )
+        arrays: dict[str, np.ndarray] | None = None
+        for shard_index in np.unique(shard_indices):
+            row_positions = np.flatnonzero(shard_indices == shard_index)
+            local_sample_idx = (
+                sample_idx[row_positions] - self._sample_offsets[int(shard_index)]
+            )
+            shard_arrays = self._shards[int(shard_index)]._make_numpy_batch(
+                local_sample_idx.astype(np.int64, copy=False)
+            )
+            if tuple(shard_arrays) != self._batch_keys:
+                raise ValueError("Megatron multi-shard batch schema changed during read")
+            if arrays is None:
+                arrays = {
+                    key: np.empty(
+                        (sample_idx.shape[0], self.seq_len),
+                        dtype=value.dtype,
+                    )
+                    for key, value in shard_arrays.items()
+                }
+            for key, value in shard_arrays.items():
+                arrays[key][row_positions] = value
+        if arrays is None:
+            raise ValueError("cannot build an empty Megatron multi-shard batch")
+        return arrays
 
 
 def open_megatron_indexed_dataset(
@@ -369,8 +579,8 @@ def open_megatron_indexed_dataset(
     loop: bool = False,
     resume_batch: int = 0,
     metadata: TokenDatasetMetadata | None = None,
-) -> MegatronIndexedDataset:
-    """Open a standalone local Megatron-indexed shard for CLI/training code.
+) -> MegatronIndexedDataset | MegatronIndexedMultiShardDataset:
+    """Open standalone local Megatron-indexed shards for CLI/training code.
 
     This is the explicit fail-closed ingress for macOS/MLX paths that already
     have Megatron .bin/.idx token shards.  It intentionally depends only on
@@ -378,6 +588,21 @@ def open_megatron_indexed_dataset(
     runtime modules.
     """
 
+    path = Path(path)
+    if path.is_dir():
+        return MegatronIndexedMultiShardDataset(
+            path,
+            seq_len=seq_len,
+            batch_size=batch_size,
+            dtype=dtype,
+            metadata_path=metadata_path,
+            token_key=token_key,
+            shuffle=shuffle,
+            seed=seed,
+            loop=loop,
+            resume_batch=resume_batch,
+            metadata=metadata,
+        )
     return MegatronIndexedDataset(
         path,
         seq_len=seq_len,
@@ -413,6 +638,20 @@ def megatron_indexed_side_channel_schema() -> dict[str, dict[str, object]]:
     }
 
 
+def _lm_batch_from_numpy(arrays: dict[str, np.ndarray]) -> LMTokenBatch:
+    kwargs = {
+        key: mx.array(arrays[key])
+        for key in _SIDE_CHANNEL_KEYS
+        if key in arrays
+    }
+    document_ids = arrays.get("document_ids")
+    return LMTokenBatch(
+        tokens=mx.array(arrays["tokens"]),
+        document_ids=None if document_ids is None else mx.array(document_ids),
+        **kwargs,
+    )
+
+
 @dataclass(frozen=True)
 class _ResolvedPaths:
     prefix: Path
@@ -435,6 +674,90 @@ class _SideChannelStorage:
     dtype: np.dtype
     windows: np.ndarray
     mmap: np.memmap
+
+
+@dataclass(frozen=True)
+class _MultiShardSchema:
+    token_dtype: str
+    side_channel_keys: tuple[str, ...]
+    side_channel_dtypes: tuple[tuple[str, str], ...]
+    document_ids_present: bool
+    document_ids_dtype: str | None
+
+
+def _find_multishard_prefixes(path: Path) -> tuple[Path, ...]:
+    if not path.is_dir():
+        raise ValueError(f"Megatron multi-shard path must be a directory: {path}")
+    idx_paths = sorted(
+        candidate
+        for candidate in path.iterdir()
+        if candidate.is_file() and candidate.suffix == ".idx"
+    )
+    if not idx_paths:
+        raise ValueError(
+            f"Megatron multi-shard directory must contain .idx shards: {path}"
+        )
+    return tuple(idx_path.with_suffix("") for idx_path in idx_paths)
+
+
+def _validate_multishard_schema(
+    shards: tuple[MegatronIndexedDataset, ...],
+) -> _MultiShardSchema:
+    if not shards:
+        raise ValueError("Megatron multi-shard dataset requires at least one shard")
+    reference = _single_shard_schema(shards[0])
+    for shard in shards[1:]:
+        schema = _single_shard_schema(shard)
+        if schema != reference:
+            raise ValueError(
+                "Megatron multi-shard schema mismatch: token dtype, side-channel "
+                "keys/dtypes, and document-id sidecars must match across shards"
+            )
+    return reference
+
+
+def _single_shard_schema(shard: MegatronIndexedDataset) -> _MultiShardSchema:
+    side_channel_keys = tuple(
+        key for key in _SIDE_CHANNEL_KEYS if key in shard._side_channels
+    )
+    side_channel_dtypes = tuple(
+        (key, shard._side_channels[key].dtype.name) for key in side_channel_keys
+    )
+    return _MultiShardSchema(
+        token_dtype=shard.index_metadata.dtype,
+        side_channel_keys=side_channel_keys,
+        side_channel_dtypes=side_channel_dtypes,
+        document_ids_present=shard._document_ids is not None,
+        document_ids_dtype=(
+            None if shard._document_ids is None else shard._document_ids.dtype.name
+        ),
+    )
+
+
+def _multi_shard_token_metadata(
+    shards: tuple[MegatronIndexedDataset, ...],
+) -> TokenDatasetMetadata:
+    first = shards[0].metadata
+    for shard in shards[1:]:
+        current = shard.metadata
+        if (
+            current.vocab_size != first.vocab_size
+            or current.tokenizer_contract != first.tokenizer_contract
+            or current.local_profile_vocab_size != first.local_profile_vocab_size
+            or current.megacpp_tokenizer_vocab_size
+            != first.megacpp_tokenizer_vocab_size
+        ):
+            raise ValueError(
+                "Megatron multi-shard tokenizer metadata mismatch: vocab and "
+                "tokenizer contract must match across shards"
+            )
+    return TokenDatasetMetadata(
+        vocab_size=first.vocab_size,
+        tokenizer_contract=first.tokenizer_contract,
+        local_profile_vocab_size=first.local_profile_vocab_size,
+        megacpp_tokenizer_vocab_size=first.megacpp_tokenizer_vocab_size,
+        source_format="megatron-multishard",
+    )
 
 
 def _resolve_paths(
@@ -931,6 +1254,8 @@ def _token_metadata(
 __all__ = [
     "MegatronIndexedDataset",
     "MegatronIndexedMetadata",
+    "MegatronIndexedMultiShardDataset",
+    "MegatronIndexedMultiShardMetadata",
     "megatron_indexed_side_channel_schema",
     "open_megatron_indexed_dataset",
 ]

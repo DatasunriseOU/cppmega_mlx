@@ -13,6 +13,7 @@ from numpy.typing import DTypeLike
 
 from cppmega_mlx.data.megatron_indexed import (
     MegatronIndexedDataset,
+    MegatronIndexedMultiShardDataset,
     megatron_indexed_side_channel_schema,
     open_megatron_indexed_dataset,
 )
@@ -124,6 +125,61 @@ def _write_indexed_train_smoke_fixture(prefix: Path) -> None:
         ),
         encoding="utf-8",
     )
+
+
+def _write_structured_multishard_fixture(
+    root: Path,
+    *,
+    shard_docs: list[list[np.ndarray]],
+    with_structure: bool = True,
+    with_document_ids: bool = True,
+) -> list[Path]:
+    prefixes: list[Path] = []
+    next_doc_id = 0
+    for shard_index, docs in enumerate(shard_docs):
+        prefix = root / f"shard_{shard_index:05d}"
+        prefixes.append(prefix)
+        _write_mmididx(prefix, docs, dtype=np.int32)
+        flat = np.concatenate(docs)
+        side_channel_paths: dict[str, object] = {}
+        if with_structure:
+            structure_path = prefix.with_name(f"{prefix.name}_structure_ids.bin")
+            dep_path = prefix.with_name(f"{prefix.name}_dep_levels.bin")
+            (flat % 7).astype(np.int16).tofile(structure_path)
+            (flat % 3).astype(np.uint8).tofile(dep_path)
+            side_channel_paths = {
+                "structure_ids": {
+                    "path": structure_path.name,
+                    "dtype": "int16",
+                },
+                "dep_levels": {
+                    "path": dep_path.name,
+                    "dtype": "uint8",
+                },
+            }
+        sidecar: dict[str, object] = {
+            "vocab_size": 256,
+            "tokenizer_contract": "local_profile",
+            "source_format": "megatron-indexed-test",
+        }
+        if side_channel_paths:
+            sidecar["side_channel_paths"] = side_channel_paths
+        if with_document_ids:
+            doc_path = prefix.with_name(f"{prefix.name}_doc_ids.bin")
+            doc_ids = []
+            for doc in docs:
+                doc_ids.extend([next_doc_id] * len(doc))
+                next_doc_id += 1
+            np.asarray(doc_ids, dtype=np.int16).tofile(doc_path)
+            sidecar["doc_ids"] = {
+                "path": doc_path.name,
+                "dtype": "int16",
+            }
+        prefix.with_suffix(".idx.json").write_text(
+            json.dumps(sidecar),
+            encoding="utf-8",
+        )
+    return prefixes
 
 
 def _run_train_hybrid_tiny(*args: str) -> subprocess.CompletedProcess[str]:
@@ -458,6 +514,190 @@ def test_open_token_dataset_infers_megatron_from_suffixless_prefix(tmp_path) -> 
         _batch_tokens(dataset),
         np.array([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=np.int32),
     )
+
+
+def test_open_token_dataset_accepts_multishard_directory_and_spans_shards(
+    tmp_path,
+) -> None:
+    _write_structured_multishard_fixture(
+        tmp_path,
+        shard_docs=[
+            [np.arange(8, dtype=np.int32)],
+            [np.arange(100, 108, dtype=np.int32)],
+        ],
+    )
+
+    dataset = open_token_dataset(tmp_path, seq_len=4, batch_size=3)
+    batch = next(dataset.iter_batches())
+
+    assert isinstance(dataset, MegatronIndexedMultiShardDataset)
+    assert dataset.path == tmp_path
+    assert dataset.metadata.source_format == "megatron-multishard"
+    assert dataset.index_metadata.source_format == "megatron-multishard"
+    assert dataset.index_metadata.shard_count == 2
+    assert len(dataset.index_metadata.shards) == 2
+    assert dataset.num_samples == 4
+    assert dataset.num_batches == 1
+    assert dataset.dropped_samples == 1
+    assert dataset.token_id_range() == (0, 107)
+    np.testing.assert_array_equal(
+        np.array(batch.tokens),
+        np.array(
+            [
+                [0, 1, 2, 3],
+                [4, 5, 6, 7],
+                [100, 101, 102, 103],
+            ],
+            dtype=np.int32,
+        ),
+    )
+    np.testing.assert_array_equal(
+        np.array(batch.document_ids),
+        np.array(
+            [
+                [0, 0, 0, 0],
+                [0, 0, 0, 0],
+                [1, 1, 1, 1],
+            ],
+            dtype=np.int32,
+        ),
+    )
+    np.testing.assert_array_equal(
+        np.array(batch.structure_ids),
+        np.array(batch.tokens) % 7,
+    )
+    np.testing.assert_array_equal(
+        np.array(batch.dep_levels),
+        np.array(batch.tokens) % 3,
+    )
+    assert tuple(batch.model_kwargs()) == ("structure_ids", "dep_levels")
+    np.testing.assert_array_equal(
+        np.array(batch.model_kwargs()["structure_ids"]),
+        np.array(batch.tokens[:, :-1]) % 7,
+    )
+
+
+def test_megatron_multishard_shuffle_resume_and_cursor_are_global(
+    tmp_path,
+) -> None:
+    _write_structured_multishard_fixture(
+        tmp_path,
+        shard_docs=[
+            [np.arange(12, dtype=np.int32)],
+            [np.arange(100, 112, dtype=np.int32)],
+        ],
+        with_structure=False,
+        with_document_ids=False,
+    )
+
+    left = open_megatron_indexed_dataset(
+        tmp_path,
+        seq_len=4,
+        batch_size=2,
+        shuffle=True,
+        seed=123,
+    )
+    right = open_megatron_indexed_dataset(
+        tmp_path,
+        seq_len=4,
+        batch_size=2,
+        shuffle=True,
+        seed=123,
+    )
+    other_seed = open_megatron_indexed_dataset(
+        tmp_path,
+        seq_len=4,
+        batch_size=2,
+        shuffle=True,
+        seed=124,
+    )
+
+    assert isinstance(left, MegatronIndexedMultiShardDataset)
+    left_batches = list(left.iter_batches())
+    right_batches = list(right.iter_batches())
+    assert [np.array(batch.tokens).tolist() for batch in left_batches] == [
+        np.array(batch.tokens).tolist() for batch in right_batches
+    ]
+    assert left.sample_order(epoch=0).tolist() != other_seed.sample_order(
+        epoch=0
+    ).tolist()
+    resumed = next(left.iter_batches(resume_batch=1))
+    np.testing.assert_array_equal(
+        np.array(resumed.tokens),
+        np.array(left_batches[1].tokens),
+    )
+    cursor = left.cursor_after(3)
+    assert cursor.epoch == 1
+    assert cursor.batch_offset == 0
+    assert cursor.global_batch_offset == 3
+
+
+def test_megatron_multishard_schema_mismatch_fails_closed(tmp_path) -> None:
+    _write_structured_multishard_fixture(
+        tmp_path,
+        shard_docs=[
+            [np.arange(8, dtype=np.int32)],
+            [np.arange(100, 108, dtype=np.int32)],
+        ],
+    )
+    second_sidecar = tmp_path / "shard_00001.idx.json"
+    payload = json.loads(second_sidecar.read_text(encoding="utf-8"))
+    payload.pop("side_channel_paths")
+    second_sidecar.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="multi-shard schema mismatch"):
+        open_megatron_indexed_dataset(tmp_path, seq_len=4, batch_size=2)
+
+
+def test_train_script_accepts_multishard_megatron_directory(tmp_path) -> None:
+    _write_structured_multishard_fixture(
+        tmp_path,
+        shard_docs=[
+            [np.arange(8, dtype=np.int32)],
+            [np.arange(100, 108, dtype=np.int32)],
+        ],
+    )
+
+    result = _run_train_hybrid_tiny(
+        str(tmp_path),
+        "--dry-run-json",
+        "--data-format",
+        "megatron",
+        "--batch-size",
+        "2",
+        "--seq-len",
+        "4",
+        "--steps",
+        "1",
+        "--hidden-size",
+        "8",
+        "--num-attention-heads",
+        "1",
+        "--pattern",
+        "A",
+        "--depth",
+        "1",
+    )
+    payload = _load_script_json(result)
+
+    assert payload["status"] == "dry_run"
+    assert payload["dataset"]["path"] == str(tmp_path)
+    assert payload["dataset"]["metadata"]["source_format"] == "megatron-multishard"
+    receipt = payload["dataset"]["dataset_receipt"]
+    assert receipt["source_format"] == "megatron-multishard"
+    assert receipt["index_metadata"]["source_format"] == "megatron-multishard"
+    assert receipt["index_metadata"]["shard_count"] == 2
+    assert receipt["megatron_indexed_receipt"]["ingress"] == (
+        "MegatronIndexedMultiShardDataset"
+    )
+    assert receipt["megatron_indexed_receipt"]["megatron_runtime_imported"] is False
+
+
+def test_open_megatron_indexed_dataset_rejects_empty_multishard_directory(
+    tmp_path,
+) -> None:
+    with pytest.raises(ValueError, match="must contain .idx shards"):
+        open_megatron_indexed_dataset(tmp_path, seq_len=4, batch_size=2)
 
 
 def test_mmididx_int64_converts_safe_token_ids_to_int32(tmp_path) -> None:

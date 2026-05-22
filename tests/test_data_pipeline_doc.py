@@ -21,10 +21,11 @@ def test_data_pipeline_doc_states_ingress_packing_and_guardrails() -> None:
         "fixed-length packed rows",
         "document-boundary mask",
         "Mapping-batch and LMTokenBatch training can carry explicit packed document IDs",
-        "NPZ, Parquet, and Megatron indexed loaders preserve persisted token-aligned document IDs",
+        "NPZ, Parquet, and single- or multi-shard Megatron indexed loaders preserve persisted token-aligned document IDs",
+        "Multi-shard Megatron indexed directories batch across shard boundaries",
         "PyTorch DataLoader integration is explicit and optional",
         "M0.1 tokenizer parity is already closed",
-        "packed multi-shard side-channel schema ownership",
+        "schema drift fails closed",
         "100M-token stress gate",
     ]
     for phrase in required_phrases:

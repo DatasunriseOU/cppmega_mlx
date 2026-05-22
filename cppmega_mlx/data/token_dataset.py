@@ -358,9 +358,9 @@ def open_token_dataset(
             **cast(TokenParquetDatasetOptions, kwargs),
         )
     if inferred in {"megatron", "bin", "idx"}:
-        from cppmega_mlx.data.megatron_indexed import MegatronIndexedDataset
+        from cppmega_mlx.data.megatron_indexed import open_megatron_indexed_dataset
 
-        return MegatronIndexedDataset(
+        return open_megatron_indexed_dataset(
             path,
             seq_len=seq_len,
             batch_size=batch_size,
@@ -370,6 +370,8 @@ def open_token_dataset(
 
 
 def _infer_format_from_path(path: Path) -> str:
+    if path.is_dir() and any(candidate.suffix == ".idx" for candidate in path.iterdir()):
+        return "megatron"
     suffix = path.suffix.lstrip(".").lower()
     if suffix:
         return suffix
