@@ -1669,6 +1669,16 @@ def stage_train(ctx: StageContext) -> StageResult:
                               if fim_loss_value is not None else None),
                 "val_every": val_every,
                 "val_losses": [round(v, 6) for v in val_losses],
+                "perplexity": (
+                    round(float(__import__("math").exp(
+                        sum(losses[-min(50, len(losses)):])
+                        / max(1, min(50, len(losses))))), 6)
+                    if losses else None),
+                "bits_per_byte": (
+                    round((sum(losses[-min(50, len(losses)):])
+                           / max(1, min(50, len(losses))))
+                          / 0.6931471805599453, 6)
+                    if losses else None),
                 "train_dtype": train_dtype,
                 "master_dtype": master_dtype,
                 "fp8_active": fp8_active,
