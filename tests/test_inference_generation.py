@@ -14,6 +14,7 @@ from cppmega_mlx.inference import (
     PromptCacheEntry,
     build_prompt_cache,
     generate_tokens,
+    generate_tokens_speculative,
     generate_tokens_with_kv_cache,
     generate_tokens_with_prompt_cache,
     next_token_logits,
@@ -57,6 +58,41 @@ class _ScriptedLogitsModel:
         )
         for row, token_id in enumerate(next_ids):
             logits[row, -1, token_id] = 1000.0
+        return mx.array(logits)
+
+
+class _PerPositionLogitsModel:
+    def __init__(
+        self,
+        next_ids_by_position: Sequence[int],
+        *,
+        vocab_size: int = 16,
+        max_seq_length: int | None = None,
+    ) -> None:
+        self.next_ids_by_position = next_ids_by_position
+        self.vocab_size = vocab_size
+        self.calls = 0
+        self.seen_tokens: list[np.ndarray] = []
+        self.seen_model_kwargs: list[dict[str, np.ndarray]] = []
+        if max_seq_length is not None:
+            self.config = SimpleNamespace(max_seq_length=max_seq_length)
+
+    def __call__(self, tokens: mx.array, **model_kwargs: mx.array) -> mx.array:
+        batch_size, sequence_length = tokens.shape
+        assert batch_size == 1
+        self.calls += 1
+        self.seen_tokens.append(_as_numpy(tokens))
+        self.seen_model_kwargs.append(
+            {key: np.array(value) for key, value in sorted(model_kwargs.items())}
+        )
+        logits = np.full(
+            (batch_size, sequence_length, self.vocab_size),
+            -1000.0,
+            dtype=np.float32,
+        )
+        for position in range(sequence_length):
+            table_pos = min(position, len(self.next_ids_by_position) - 1)
+            logits[0, position, self.next_ids_by_position[table_pos]] = 1000.0
         return mx.array(logits)
 
 
@@ -483,6 +519,172 @@ def test_generate_tokens_seeded_sampling_is_deterministic() -> None:
     )
 
     np.testing.assert_array_equal(_as_numpy(left), _as_numpy(right))
+
+
+def test_generate_tokens_speculative_accepts_draft_window_and_target_tail() -> None:
+    draft_model = _ScriptedLogitsModel([[4], [5]], vocab_size=16)
+    target_model = _PerPositionLogitsModel([0, 4, 5, 6], vocab_size=16)
+    prompt = mx.array([[1, 2]], dtype=mx.int32)
+
+    tokens = generate_tokens_speculative(
+        target_model,
+        draft_model,
+        prompt,
+        max_new_tokens=3,
+        draft_window=2,
+        temperature=0.0,
+        rng_key=mx.random.key(7),
+    )
+
+    np.testing.assert_array_equal(
+        _as_numpy(tokens),
+        np.array([[1, 2, 4, 5, 6]], dtype=np.int32),
+    )
+    assert draft_model.seen_shapes == [(1, 2), (1, 3)]
+    assert target_model.calls == 1
+    np.testing.assert_array_equal(
+        target_model.seen_tokens[0],
+        np.array([[1, 2, 4, 5]], dtype=np.int32),
+    )
+
+
+def test_generate_tokens_speculative_rejects_bad_draft_with_target_residual() -> None:
+    draft_model = _ScriptedLogitsModel([[4]], vocab_size=16)
+    target_model = _PerPositionLogitsModel([0, 7, 8], vocab_size=16)
+    prompt = mx.array([[1, 2]], dtype=mx.int32)
+
+    tokens = generate_tokens_speculative(
+        target_model,
+        draft_model,
+        prompt,
+        max_new_tokens=1,
+        draft_window=1,
+        temperature=0.0,
+        rng_key=mx.random.key(11),
+    )
+
+    np.testing.assert_array_equal(
+        _as_numpy(tokens),
+        np.array([[1, 2, 7]], dtype=np.int32),
+    )
+
+
+def test_generate_tokens_speculative_trims_accepted_window_at_eos() -> None:
+    eos = 2
+    draft_model = _ScriptedLogitsModel([[4], [eos]], vocab_size=16)
+    target_model = _PerPositionLogitsModel([0, 4, eos, 6], vocab_size=16)
+    prompt = mx.array([[1, 3]], dtype=mx.int32)
+
+    tokens = generate_tokens_speculative(
+        target_model,
+        draft_model,
+        prompt,
+        max_new_tokens=4,
+        draft_window=2,
+        eos_token_id=eos,
+        temperature=0.0,
+        rng_key=mx.random.key(13),
+    )
+
+    np.testing.assert_array_equal(
+        _as_numpy(tokens),
+        np.array([[1, 3, 4, eos]], dtype=np.int32),
+    )
+    assert target_model.calls == 1
+
+
+def test_generate_tokens_speculative_threads_side_channel_model_kwargs() -> None:
+    draft_model = _KwargRecordingScriptedLogitsModel([[4], [5]], vocab_size=16)
+    target_model = _PerPositionLogitsModel([0, 4, 5, 6], vocab_size=16)
+    prompt = mx.array([[1, 2]], dtype=mx.int32)
+
+    tokens = generate_tokens_speculative(
+        target_model,
+        draft_model,
+        prompt,
+        max_new_tokens=3,
+        draft_window=2,
+        temperature=0.0,
+        rng_key=mx.random.key(17),
+        model_kwargs={
+            "structure_ids": mx.array([[7, 8]], dtype=mx.int32),
+            "platform_ids": mx.array([[[1, 2, 3], [4, 5, 6]]], dtype=mx.int32),
+        },
+    )
+
+    np.testing.assert_array_equal(
+        _as_numpy(tokens),
+        np.array([[1, 2, 4, 5, 6]], dtype=np.int32),
+    )
+    assert [kwargs["structure_ids"].shape for kwargs in draft_model.seen_model_kwargs] == [
+        (1, 2),
+        (1, 3),
+    ]
+    np.testing.assert_array_equal(
+        draft_model.seen_model_kwargs[1]["structure_ids"],
+        np.array([[7, 8, 0]], dtype=np.int32),
+    )
+    assert target_model.seen_model_kwargs[0]["structure_ids"].shape == (1, 4)
+    np.testing.assert_array_equal(
+        target_model.seen_model_kwargs[0]["structure_ids"],
+        np.array([[7, 8, 0, 0]], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(
+        target_model.seen_model_kwargs[0]["platform_ids"],
+        np.array([[[1, 2, 3], [4, 5, 6], [4, 5, 6], [4, 5, 6]]], dtype=np.int32),
+    )
+
+
+def test_generate_tokens_speculative_caps_draft_window_to_target_capacity() -> None:
+    draft_model = _ScriptedLogitsModel([[4], [5], [6], [7]], vocab_size=16)
+    target_model = _PerPositionLogitsModel([0, 4, 5, 6], vocab_size=16, max_seq_length=4)
+    prompt = mx.array([[1, 2]], dtype=mx.int32)
+
+    tokens = generate_tokens_speculative(
+        target_model,
+        draft_model,
+        prompt,
+        max_new_tokens=2,
+        draft_window=4,
+        temperature=0.0,
+        rng_key=mx.random.key(19),
+    )
+
+    np.testing.assert_array_equal(
+        _as_numpy(tokens),
+        np.array([[1, 2, 4, 5]], dtype=np.int32),
+    )
+    assert draft_model.seen_shapes == [(1, 2), (1, 3)]
+    np.testing.assert_array_equal(
+        target_model.seen_tokens[0],
+        np.array([[1, 2, 4, 5]], dtype=np.int32),
+    )
+
+
+def test_generate_tokens_speculative_rejects_batch_and_invalid_window() -> None:
+    draft_model = _ScriptedLogitsModel([[4]], vocab_size=16)
+    target_model = _PerPositionLogitsModel([0, 4], vocab_size=16)
+
+    with pytest.raises(ValueError, match="batch=1"):
+        generate_tokens_speculative(
+            target_model,
+            draft_model,
+            mx.array([[1], [2]], dtype=mx.int32),
+            max_new_tokens=1,
+        )
+
+    with pytest.raises(ValueError, match="draft_window"):
+        generate_tokens_speculative(
+            target_model,
+            draft_model,
+            mx.array([[1]], dtype=mx.int32),
+            max_new_tokens=1,
+            draft_window=0,
+        )
+
+
+def test_generate_tokens_speculative_is_exported_from_package() -> None:
+    assert inference.generate_tokens_speculative is generate_tokens_speculative
 
 
 def test_generate_tokens_with_kv_cache_prefills_then_decodes_one_token_steps() -> None:

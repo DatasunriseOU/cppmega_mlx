@@ -17,6 +17,7 @@ from cppmega_mlx.inference.engine import (
     make_contiguous_kv_cache,
 )
 from cppmega_mlx.inference.sampling import sample_next_token
+from cppmega_mlx.inference.speculative_decode import speculative_acceptance
 
 GenerationFinishReason = Literal["eos", "length"]
 
@@ -78,21 +79,7 @@ def next_token_logits(model_output: Any, tokens: mx.array) -> mx.array:
     MTP/draft tensors are rejected until the speculative/self-spec paths land.
     """
 
-    if isinstance(model_output, tuple | list):
-        raise ValueError(
-            "MTP/draft tuple outputs are not supported by standard next-token "
-            "inference"
-        )
-    if isinstance(model_output, dict):
-        raise ValueError(
-            "structured model outputs are not supported by standard next-token "
-            "inference; pass plain logits"
-        )
-    if not isinstance(model_output, mx.array):
-        raise TypeError("model output must be an mlx.core.array of logits")
-
-    _validate_logits_shape(model_output, tokens)
-    return model_output[:, -1, :]
+    return _standard_generation_logits(model_output, tokens)[:, -1, :]
 
 
 def generate_tokens(
@@ -153,6 +140,109 @@ def generate_tokens(
             eos_matches = cast(mx.array, next_token[:, 0] == eos_token_id)
             if bool(mx.all(eos_matches)):
                 break
+
+    return tokens
+
+
+def generate_tokens_speculative(
+    target_model: Any,
+    draft_model: Any,
+    prompt_ids: mx.array,
+    *,
+    max_new_tokens: int,
+    draft_window: int = 4,
+    model_kwargs: Mapping[str, mx.array] | None = None,
+    draft_model_kwargs: Mapping[str, mx.array] | None = None,
+    eos_token_id: int | None = None,
+    temperature: float = 1.0,
+    rng_key: Any | None = None,
+) -> mx.array:
+    """Generate with vanilla speculative decoding on the eager MLX path.
+
+    The draft model proposes up to ``draft_window`` tokens, then the target
+    model verifies those tokens with one full-prefix forward and the existing
+    Leviathan-style acceptance-rejection helper. This scoped Stream I slice is
+    deliberately batch=1 and no-KV; paged attention, EAGLE, and MTP
+    self-speculation remain separate rows.
+    """
+
+    if len(prompt_ids.shape) != 2:
+        raise ValueError("prompt_ids must have shape (batch, sequence)")
+    if int(prompt_ids.shape[0]) != 1:
+        raise ValueError("speculative generation currently supports batch=1")
+    if int(prompt_ids.shape[1]) <= 0:
+        raise ValueError("prompt_ids must contain at least one token")
+    if max_new_tokens < 0:
+        raise ValueError("max_new_tokens must be non-negative")
+    if draft_window <= 0:
+        raise ValueError("draft_window must be positive")
+    if max_new_tokens == 0:
+        return prompt_ids
+
+    target_max_seq_length = _model_max_seq_length(target_model)
+    draft_max_seq_length = _model_max_seq_length(draft_model)
+    _validate_prefix_fits_max_length(prompt_ids, target_max_seq_length)
+    _validate_prefix_fits_max_length(prompt_ids, draft_max_seq_length)
+
+    tokens = prompt_ids
+    generated = 0
+    key = rng_key
+    resolved_draft_model_kwargs = draft_model_kwargs
+    if resolved_draft_model_kwargs is None:
+        resolved_draft_model_kwargs = model_kwargs
+
+    while generated < max_new_tokens:
+        remaining = max_new_tokens - generated
+        append_limit = remaining
+        window = min(draft_window, remaining)
+        target_slots = _available_generation_slots(tokens, target_max_seq_length)
+        if target_slots is not None:
+            window = min(window, target_slots)
+            append_limit = min(append_limit, target_slots)
+        draft_slots = _available_generation_slots(tokens, draft_max_seq_length)
+        if draft_slots is not None:
+            window = min(window, draft_slots)
+        draft_tokens, draft_logits, key = _propose_speculative_draft_window(
+            draft_model,
+            tokens,
+            draft_window=window,
+            model_kwargs=resolved_draft_model_kwargs,
+            eos_token_id=eos_token_id,
+            temperature=temperature,
+            rng_key=key,
+            max_seq_length=draft_max_seq_length,
+        )
+        candidate = mx.concatenate([tokens, draft_tokens[None, :].astype(tokens.dtype)], axis=1)
+        _validate_prefix_fits_max_length(candidate, target_max_seq_length)
+
+        target_logits = _standard_generation_logits(
+            target_model(
+                candidate,
+                **_model_kwargs_for_prefix(model_kwargs, candidate),
+            ),
+            candidate,
+        )
+        start = int(tokens.shape[1]) - 1
+        verifier_logits = target_logits[0, start : start + int(draft_tokens.shape[0]) + 1, :]
+
+        key, acceptance_key = _split_generation_key(key)
+        accepted, _n_accepted, next_token = speculative_acceptance(
+            draft_logits,
+            verifier_logits,
+            draft_tokens,
+            temperature=temperature,
+            rng_key=acceptance_key,
+        )
+        append_tokens, found_eos = _speculative_append_tokens(
+            accepted,
+            next_token,
+            remaining=append_limit,
+            eos_token_id=eos_token_id,
+        )
+        tokens = mx.concatenate([tokens, append_tokens[None, :].astype(tokens.dtype)], axis=1)
+        generated += int(append_tokens.shape[0])
+        if found_eos:
+            break
 
     return tokens
 
@@ -557,6 +647,24 @@ def _resolve_kv_cache(
     )
 
 
+def _standard_generation_logits(model_output: Any, tokens: mx.array) -> mx.array:
+    if isinstance(model_output, tuple | list):
+        raise ValueError(
+            "MTP/draft tuple outputs are not supported by standard next-token "
+            "inference"
+        )
+    if isinstance(model_output, dict):
+        raise ValueError(
+            "structured model outputs are not supported by standard next-token "
+            "inference; pass plain logits"
+        )
+    if not isinstance(model_output, mx.array):
+        raise TypeError("model output must be an mlx.core.array of logits")
+
+    _validate_logits_shape(model_output, tokens)
+    return model_output
+
+
 def _model_kwargs_for_prefix(
     model_kwargs: Mapping[str, mx.array] | None,
     tokens: mx.array,
@@ -702,6 +810,82 @@ def _validate_prompt_cache_prefix(
     prefix_matches = cast(mx.array, prompt_ids[:, :prefix_length] == prompt_cache.prompt_ids)
     if not bool(mx.all(prefix_matches)):
         raise ValueError("prompt_ids must start with prompt_cache.prompt_ids")
+
+
+def _propose_speculative_draft_window(
+    draft_model: Any,
+    tokens: mx.array,
+    *,
+    draft_window: int,
+    model_kwargs: Mapping[str, mx.array] | None,
+    eos_token_id: int | None,
+    temperature: float,
+    rng_key: Any | None,
+    max_seq_length: int | None,
+) -> tuple[mx.array, mx.array, Any | None]:
+    draft_tokens: list[mx.array] = []
+    draft_logits: list[mx.array] = []
+    draft_prefix = tokens
+    key = rng_key
+
+    for _ in range(draft_window):
+        if max_seq_length is not None and draft_prefix.shape[1] >= max_seq_length:
+            raise ValueError("draft generation would exceed model.config.max_seq_length")
+        step_logits = next_token_logits(
+            draft_model(
+                draft_prefix,
+                **_model_kwargs_for_prefix(model_kwargs, draft_prefix),
+            ),
+            draft_prefix,
+        )
+        key, step_key = _split_generation_key(key)
+        next_token = sample_next_token(
+            step_logits,
+            temperature=temperature,
+            rng_key=step_key,
+        ).astype(tokens.dtype)
+        draft_logits.append(step_logits[0])
+        draft_tokens.append(next_token[:, 0])
+        draft_prefix = mx.concatenate([draft_prefix, next_token], axis=1)
+        if eos_token_id is not None and _all_rows_match_token(next_token, eos_token_id):
+            break
+
+    return (
+        mx.concatenate(draft_tokens, axis=0).astype(tokens.dtype),
+        mx.stack(draft_logits, axis=0),
+        key,
+    )
+
+
+def _speculative_append_tokens(
+    accepted: mx.array,
+    next_token: mx.array,
+    *,
+    remaining: int,
+    eos_token_id: int | None,
+) -> tuple[mx.array, bool]:
+    proposed = mx.concatenate([accepted, next_token], axis=0)[:remaining]
+    if eos_token_id is None:
+        return proposed, False
+
+    for idx in range(int(proposed.shape[0])):
+        if int(proposed[idx].item()) == eos_token_id:
+            return proposed[: idx + 1], True
+    return proposed, False
+
+
+def _validate_prefix_fits_max_length(tokens: mx.array, max_seq_length: int | None) -> None:
+    if max_seq_length is not None and tokens.shape[1] > max_seq_length:
+        raise ValueError("tokens exceed model.config.max_seq_length")
+
+
+def _available_generation_slots(tokens: mx.array, max_seq_length: int | None) -> int | None:
+    if max_seq_length is None:
+        return None
+    slots = max_seq_length - int(tokens.shape[1])
+    if slots <= 0:
+        raise ValueError("generation would exceed model.config.max_seq_length")
+    return slots
 
 
 def _stream_generate_tokens_with_kv_cache(
