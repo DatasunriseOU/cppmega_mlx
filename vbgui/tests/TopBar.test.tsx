@@ -131,6 +131,13 @@ describe("TopBar", () => {
       expect.objectContaining({ num_steps: expect.any(Number) }));
   });
 
+  it("does not render legacy train side-channel checkboxes", () => {
+    render(<TopBar {...defaultTopProps()} />);
+    fireEvent.click(screen.getByTestId("run-pipeline-toggle"));
+    expect(screen.queryByTestId("train-side-channel-doc_ids")).toBeNull();
+    expect(screen.queryByTestId("train-side-channel-token_ids")).toBeNull();
+  });
+
   it("topology selector emits onTopologyChange", () => {
     const onTopologyChange = vi.fn();
     render(<TopBar {...defaultTopProps({ onTopologyChange })} />);

@@ -14,7 +14,7 @@ export interface TopBarProps {
   onTopologyChange: (t: TopologyFactory) => void;
   onCompileModeChange: (m: SpecState["sharding"]["compile_mode"]) => void;
   onRunPipeline: (mode: RunMode,
-    opts?: { num_steps?: number; side_channels?: string[] }) => void;
+    opts?: { num_steps?: number }) => void;
   /** H02: toggle callbacks. */
   onMixedPrecisionChange?: (enabled: boolean) => void;
   onFp8EnabledChange?: (enabled: boolean) => void;
@@ -39,11 +39,6 @@ export interface TopBarProps {
 export function TopBar(p: TopBarProps): JSX.Element {
   const [open, setOpen] = useState(false);
   const [trainNumSteps, setTrainNumSteps] = useState<number>(2);
-  // V4-10: side-channel toggles for the train run. Off by default;
-  // when on, App.handleRunPipeline forwards a synthetic int list to
-  // backend opts.side_channels so stage_train can record observation.
-  const [scDocIds, setScDocIds] = useState<boolean>(false);
-  const [scTokenIds, setScTokenIds] = useState<boolean>(false);
   return (
     <header data-testid="top-bar"
             style={{ height: 56, display: "flex", alignItems: "center",
@@ -170,30 +165,10 @@ export function TopBar(p: TopBarProps): JSX.Element {
                          e.target.value || "1", 10)))}
                      style={{ width: 50 }} />
             </div>
-            <div style={{ padding: "0 12px 6px", display: "flex",
-                          alignItems: "center", gap: 10, fontSize: 11 }}>
-              <span style={{ color: "#6b7280" }}>side-channels:</span>
-              <label style={{ display: "flex", gap: 3, alignItems: "center" }}>
-                <input data-testid="train-side-channel-doc_ids"
-                       type="checkbox" checked={scDocIds}
-                       onChange={(e) => setScDocIds(e.target.checked)} />
-                doc_ids
-              </label>
-              <label style={{ display: "flex", gap: 3, alignItems: "center" }}>
-                <input data-testid="train-side-channel-token_ids"
-                       type="checkbox" checked={scTokenIds}
-                       onChange={(e) => setScTokenIds(e.target.checked)} />
-                token_ids
-              </label>
-            </div>
             <button data-testid="run-pipeline-train"
                     onClick={() => { setOpen(false);
-                                     const sc: string[] = [];
-                                     if (scDocIds) sc.push("doc_ids");
-                                     if (scTokenIds) sc.push("token_ids");
                                      p.onRunPipeline("train",
-                                       { num_steps: trainNumSteps,
-                                         side_channels: sc }); }}
+                                       { num_steps: trainNumSteps }); }}
                     disabled={!!p.trainDisabled}
                     title={p.trainDisabled?.reason ?? ""}
                     style={{ ...menuItem,

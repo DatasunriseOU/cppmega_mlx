@@ -11,8 +11,10 @@ import type {
 export interface SideChannelsTabProps {
   sideChannels: SideChannelState;
   availableChannels: string[];
+  selectedTrainChannels: string[];
   gotchas: GotchaState[];
   onApply: (next: SideChannelState) => void;
+  onTrainChannelsChange: (next: string[]) => void;
 }
 
 const MODES: SideChannelMode[] = ["off", "auto", "require", "if_available"];
@@ -28,7 +30,8 @@ const FAIL_POLICIES: InferenceFailPolicy[] = [
 const ADAPTERS = ["none", "cpp", "rust", "go", "python"] as const;
 
 export function SideChannelsTab({
-  sideChannels, availableChannels, gotchas, onApply,
+  sideChannels, availableChannels, selectedTrainChannels, gotchas, onApply,
+  onTrainChannelsChange,
 }: SideChannelsTabProps): JSX.Element {
   const [draft, setDraft] = useState<SideChannelState>(sideChannels);
   const [platform, setPlatform] = useState({
@@ -44,6 +47,10 @@ export function SideChannelsTab({
   useEffect(() => setDraft(sideChannels), [sideChannels]);
 
   const available = useMemo(() => new Set(availableChannels), [availableChannels]);
+  const selectedTrain = useMemo(
+    () => new Set(selectedTrainChannels),
+    [selectedTrainChannels],
+  );
   const requiredErrors = gotchas.filter((g) =>
     g.id.startsWith("side_channel_required_"));
   const platformPreview = renderPlatform(platform);
@@ -67,6 +74,29 @@ export function SideChannelsTab({
           available: {availableChannels.length === 0
             ? "none" : availableChannels.join(", ")}
         </div>
+      </section>
+
+      <section data-testid="side-channel-train-selection" style={section}>
+        <h4 style={heading}>Train Inputs</h4>
+        {availableChannels.length === 0 ? (
+          <div data-testid="side-channel-train-empty" style={muted}>
+            no available token channels
+          </div>
+        ) : (
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+            {availableChannels.map((name) => (
+              <label key={name}
+                     style={{ display: "flex", gap: 4, alignItems: "center" }}>
+                <input data-testid={`side-channel-train-${name}`}
+                       type="checkbox"
+                       checked={selectedTrain.has(name)}
+                       onChange={(e) =>
+                         setTrainChannel(name, e.target.checked)} />
+                {name}
+              </label>
+            ))}
+          </div>
+        )}
       </section>
 
       <section style={section}>
@@ -257,6 +287,21 @@ families=${enabledFamilies.join(",") || "none"}`}
         [name]: { ...draft.families[name], ...patch },
       },
     });
+  }
+
+  function setTrainChannel(name: string, checked: boolean) {
+    const selected = new Set(selectedTrainChannels);
+    if (checked) {
+      selected.add(name);
+    } else {
+      selected.delete(name);
+    }
+    const ordered = [
+      ...availableChannels.filter((c) => selected.has(c)),
+      ...selectedTrainChannels.filter((c) =>
+        selected.has(c) && !available.has(c)),
+    ];
+    onTrainChannelsChange(ordered);
   }
 }
 

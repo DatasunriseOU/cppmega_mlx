@@ -23,6 +23,7 @@ export interface SidebarProps {
   rewriters: RewriterState[];
   sideChannels: SideChannelState;
   availableSideChannels: string[];
+  selectedTrainSideChannels: string[];
   sharding: ShardingState;
   gotchas: GotchaState[];
   proposals: ShardingProposalView[];
@@ -33,6 +34,7 @@ export interface SidebarProps {
   onRewriterReorder: (from: number, to: number) => void;
   onRewriterApply?: () => void;
   onSideChannelsApply: (s: SideChannelState) => void;
+  onTrainSideChannelsChange: (channels: string[]) => void;
   onShardingChange: (s: ShardingState) => void;
   onShardingAccept: (idx: number) => void;
   onGotchaAutoFix?: (id: string) => void;
@@ -103,8 +105,11 @@ export function Sidebar(p: SidebarProps): JSX.Element {
         {active === "side_channels" && (
           <SideChannelsTab sideChannels={p.sideChannels}
                            availableChannels={p.availableSideChannels}
+                           selectedTrainChannels={p.selectedTrainSideChannels}
                            gotchas={p.gotchas}
-                           onApply={p.onSideChannelsApply} />
+                           onApply={p.onSideChannelsApply}
+                           onTrainChannelsChange={
+                             p.onTrainSideChannelsChange} />
         )}
         {active === "sharding"  && (
           <ShardingTab sharding={p.sharding} proposals={p.proposals}

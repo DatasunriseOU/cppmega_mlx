@@ -107,6 +107,7 @@ export function App(): JSX.Element {
     useState<string | null>(null);
   const [availableSideChannels, setAvailableSideChannels] =
     useState<string[]>(["doc_ids", "token_ids"]);
+  const [trainSideChannels, setTrainSideChannels] = useState<string[]>([]);
 
   const rpc = useRpc({
     baseUrl: (import.meta.env.VITE_BACKEND_URL as string | undefined)
@@ -125,6 +126,11 @@ export function App(): JSX.Element {
   useEffect(() => {
     wireSpecRef.current = { nodes, edges, spec, availableSideChannels };
   }, [nodes, edges, spec, availableSideChannels]);
+
+  useEffect(() => {
+    const available = new Set(availableSideChannels);
+    setTrainSideChannels((prev) => prev.filter((name) => available.has(name)));
+  }, [availableSideChannels]);
 
   const runVerify = useCallback(async () => {
     const snap = wireSpecRef.current;
@@ -283,7 +289,7 @@ export function App(): JSX.Element {
 
   const handleRunPipeline = useCallback(async (
     mode: RunMode,
-    opts?: { num_steps?: number; side_channels?: string[] },
+    opts?: { num_steps?: number },
   ) => {
     const snap = wireSpecRef.current;
     if (snap.nodes.length === 0) {
@@ -309,11 +315,11 @@ export function App(): JSX.Element {
       }
       if (trainParquetPath) trainOpts.parquet_path = trainParquetPath;
       if (trainTokenizerPath) trainOpts.tokenizer_path = trainTokenizerPath;
-      // Forward side-channel selection as synthetic int lists for the
+      // Forward SideChannelsTab train selection as synthetic int lists for the
       // stage_train G17 math-effect smoke path.
-      if (opts?.side_channels && opts.side_channels.length > 0) {
+      if (trainSideChannels.length > 0) {
         const sc: Record<string, number[]> = {};
-        for (const name of opts.side_channels) {
+        for (const name of trainSideChannels) {
           sc[name] = [0, 1, 2, 3, 4, 5, 6, 7];  // synthetic 8-token sample
         }
         trainOpts.side_channels = sc;
@@ -338,7 +344,7 @@ export function App(): JSX.Element {
         setTrainRunId(null);
       }
     }
-  }, [rpc, trainParquetPath, trainTokenizerPath]);
+  }, [rpc, trainParquetPath, trainSideChannels, trainTokenizerPath]);
 
   const handleCancelTrain = useCallback(async () => {
     const runId = trainRunId;
@@ -474,6 +480,7 @@ export function App(): JSX.Element {
                 rewriters={spec.rewriters}
                 sideChannels={spec.side_channels}
                 availableSideChannels={availableSideChannels}
+                selectedTrainSideChannels={trainSideChannels}
                 sharding={spec.sharding}
                 gotchas={spec.gotchas}
                 proposals={proposals}
@@ -493,6 +500,7 @@ export function App(): JSX.Element {
                 onRewriterApply={() => void scheduleVerify()}
                 onSideChannelsApply={(s) =>
                   dispatch({ type: "side_channels.set", side_channels: s })}
+                onTrainSideChannelsChange={setTrainSideChannels}
                 onShardingChange={(s) =>
                   dispatch({ type: "sharding.set", sharding: s })}
                 onShardingAccept={handleShardingAccept}

@@ -210,8 +210,10 @@ describe("SideChannelsTab", () => {
     const onApply = vi.fn();
     render(<SideChannelsTab sideChannels={INITIAL_SPEC.side_channels}
                             availableChannels={["doc_ids", "token_ids"]}
+                            selectedTrainChannels={[]}
                             gotchas={[]}
-                            onApply={onApply} />);
+                            onApply={onApply}
+                            onTrainChannelsChange={() => {}} />);
     fireEvent.change(screen.getByTestId("side-channel-family-platform-mode"),
       { target: { value: "require" } });
     fireEvent.change(screen.getByTestId("side-channel-family-platform-dropout"),
@@ -228,8 +230,10 @@ describe("SideChannelsTab", () => {
   it("renders inference and platform preview controls", () => {
     render(<SideChannelsTab sideChannels={INITIAL_SPEC.side_channels}
                             availableChannels={["platform_ids"]}
+                            selectedTrainChannels={[]}
                             gotchas={[]}
-                            onApply={() => {}} />);
+                            onApply={() => {}}
+                            onTrainChannelsChange={() => {}} />);
     fireEvent.change(screen.getByTestId("side-channel-inference-source"),
       { target: { value: "parse_if_possible" } });
     fireEvent.change(screen.getByTestId("side-channel-platform-os"),
@@ -243,15 +247,33 @@ describe("SideChannelsTab", () => {
   it("surfaces required-family contract probe errors", () => {
     render(<SideChannelsTab sideChannels={INITIAL_SPEC.side_channels}
                             availableChannels={[]}
+                            selectedTrainChannels={[]}
                             gotchas={[{
                               id: "side_channel_required_platform",
                               severity: "error",
                               message: "required side-channel family 'platform'",
                             }]}
-                            onApply={() => {}} />);
+                            onApply={() => {}}
+                            onTrainChannelsChange={() => {}} />);
     expect(screen.getByTestId(
       "side-channel-probe-error-side_channel_required_platform",
     ).textContent).toContain("platform");
+  });
+
+  it("selects train side-channel inputs inside the side-channel tab", () => {
+    const onTrainChannelsChange = vi.fn();
+    render(<SideChannelsTab sideChannels={INITIAL_SPEC.side_channels}
+                            availableChannels={["doc_ids", "token_ids"]}
+                            selectedTrainChannels={["doc_ids"]}
+                            gotchas={[]}
+                            onApply={() => {}}
+                            onTrainChannelsChange={onTrainChannelsChange} />);
+    expect(screen.getByTestId("side-channel-train-doc_ids"))
+      .toHaveProperty("checked", true);
+    fireEvent.click(screen.getByTestId("side-channel-train-token_ids"));
+    expect(onTrainChannelsChange).toHaveBeenCalledWith([
+      "doc_ids", "token_ids",
+    ]);
   });
 });
 
@@ -261,12 +283,14 @@ describe("Sidebar", () => {
     rewriters: INITIAL_SPEC.rewriters,
     sideChannels: INITIAL_SPEC.side_channels,
     availableSideChannels: ["doc_ids", "token_ids"],
+    selectedTrainSideChannels: [],
     sharding: INITIAL_SPEC.sharding,
     gotchas: INITIAL_SPEC.gotchas, proposals: [],
     onLossApply: () => {}, onOptimApply: () => {},
     onRewriterAdd: () => {}, onRewriterRemove: () => {},
     onRewriterReorder: () => {},
     onSideChannelsApply: () => {},
+    onTrainSideChannelsChange: () => {},
     onShardingChange: () => {}, onShardingAccept: () => {},
   };
 

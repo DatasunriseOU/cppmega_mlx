@@ -1,4 +1,4 @@
-// V4-10/H17: side_channels toggle in train dropdown reaches stage_train
+// V4-10/H10/H17: SideChannelsTab train selection reaches stage_train
 // and doc_ids has a real forward effect through the attention mask.
 
 import { test, expect } from "@playwright/test";
@@ -10,8 +10,12 @@ test("V4-10: doc_ids toggle reaches stage_train side_channels_observed",
     await gotoApp(page);
     await selectPreset(page, "llama3_8b");
 
+    await page.getByTestId("sidebar-tab-side_channels").click();
+    await page.getByTestId("side-channel-train-doc_ids").check();
+    await expect(page.getByTestId("train-side-channel-doc_ids"))
+      .toHaveCount(0);
+
     await page.getByTestId("run-pipeline-toggle").click();
-    await page.getByTestId("train-side-channel-doc_ids").check();
     await page.getByTestId("run-pipeline-train").click();
 
     const modal = page.getByTestId("run-result-modal");
@@ -39,9 +43,10 @@ test("V4-10: both toggles enabled → both observed", async ({ page }) => {
   await gotoApp(page);
   await selectPreset(page, "llama3_8b");
 
+  await page.getByTestId("sidebar-tab-side_channels").click();
+  await page.getByTestId("side-channel-train-doc_ids").check();
+  await page.getByTestId("side-channel-train-token_ids").check();
   await page.getByTestId("run-pipeline-toggle").click();
-  await page.getByTestId("train-side-channel-doc_ids").check();
-  await page.getByTestId("train-side-channel-token_ids").check();
   await page.getByTestId("run-pipeline-train").click();
 
   const modal = page.getByTestId("run-result-modal");
