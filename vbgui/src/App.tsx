@@ -303,7 +303,7 @@ export function App(): JSX.Element {
       checkpoint_save_path?: string;
       checkpoint_load_path?: string;
       inference_probe_text?: string;
-      master_dtype?: "fp32" | "bf16" | "fp16";
+      master_dtype?: "fp32" | "bf16" | "fp16" | "auto";
     },
   ) => {
     const snap = wireSpecRef.current;
@@ -346,8 +346,9 @@ export function App(): JSX.Element {
       if (opts?.inference_probe_text) {
         trainOpts.inference_probe_text = opts.inference_probe_text;
       }
-      // H23: master_dtype override (fp32/bf16/fp16).
-      if (opts?.master_dtype) {
+      // H23: master_dtype override (fp32/bf16/fp16). "auto" defers to
+      // spec.optim.mixed_precision (H02) — don't override the wire.
+      if (opts?.master_dtype && opts.master_dtype !== "auto") {
         trainOpts.master_dtype = opts.master_dtype;
       }
       // H20: when the spec carries sharding axes, derive fake_ranks

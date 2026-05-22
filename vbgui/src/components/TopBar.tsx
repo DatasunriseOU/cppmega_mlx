@@ -18,7 +18,7 @@ export interface TopBarProps {
       checkpoint_save_path?: string;
       checkpoint_load_path?: string;
       inference_probe_text?: string;
-      master_dtype?: "fp32" | "bf16" | "fp16";
+      master_dtype?: "fp32" | "bf16" | "fp16" | "auto";
     }) => void;
   /** H02: toggle callbacks. */
   onMixedPrecisionChange?: (enabled: boolean) => void;
@@ -48,8 +48,10 @@ export function TopBar(p: TopBarProps): JSX.Element {
   const [ckptSavePath, setCkptSavePath] = useState<string>("");
   const [ckptLoadPath, setCkptLoadPath] = useState<string>("");
   const [probeText, setProbeText] = useState<string>("");
+  // "auto" defers to spec.optim.mixed_precision (H02) — the explicit
+  // fp32/bf16/fp16 options override that for H23.
   const [masterDtype, setMasterDtype] =
-    useState<"fp32" | "bf16" | "fp16">("fp32");
+    useState<"fp32" | "bf16" | "fp16" | "auto">("auto");
   return (
     <header data-testid="top-bar"
             style={{ height: 56, display: "flex", alignItems: "center",
@@ -220,7 +222,8 @@ export function TopBar(p: TopBarProps): JSX.Element {
                       value={masterDtype}
                       onChange={(e) =>
                         setMasterDtype(e.target.value as
-                          "fp32" | "bf16" | "fp16")}>
+                          "fp32" | "bf16" | "fp16" | "auto")}>
+                <option value="auto">auto (mixed_precision)</option>
                 <option value="fp32">fp32</option>
                 <option value="bf16">bf16</option>
                 <option value="fp16">fp16</option>
