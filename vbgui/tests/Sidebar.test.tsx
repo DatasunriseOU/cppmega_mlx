@@ -244,6 +244,26 @@ describe("SideChannelsTab", () => {
       .toContain("source=parse_if_possible");
   });
 
+  it("runs enriched preview and renders generated tensor summaries", () => {
+    render(<SideChannelsTab sideChannels={INITIAL_SPEC.side_channels}
+                            availableChannels={["platform_ids"]}
+                            selectedTrainChannels={[]}
+                            gotchas={[]}
+                            onApply={() => {}}
+                            onTrainChannelsChange={() => {}} />);
+    fireEvent.change(screen.getByTestId("side-channel-inference-source"),
+      { target: { value: "parse_if_possible" } });
+    fireEvent.change(screen.getByTestId("side-channel-preview-prompt"),
+      { target: { value: "int x;" } });
+    fireEvent.click(screen.getByTestId("side-channel-preview-run"));
+
+    const tensors = screen.getByTestId("side-channel-preview-tensors");
+    expect(tensors.textContent).toContain("prompt_ids shape=(1,6)");
+    expect(tensors.textContent).toContain("platform_ids shape=(1,5)");
+    expect(tensors.textContent).toContain("structure_ids shape=(1,6)");
+    expect(tensors.textContent).toContain("ast_depth_ids shape=(1,6)");
+  });
+
   it("surfaces required-family contract probe errors", () => {
     render(<SideChannelsTab sideChannels={INITIAL_SPEC.side_channels}
                             availableChannels={[]}

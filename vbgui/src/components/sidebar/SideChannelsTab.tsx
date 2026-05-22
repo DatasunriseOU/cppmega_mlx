@@ -28,6 +28,7 @@ const FAIL_POLICIES: InferenceFailPolicy[] = [
   "drop_family", "text_only", "error",
 ];
 const ADAPTERS = ["none", "cpp", "rust", "go", "python"] as const;
+type AdapterName = typeof ADAPTERS[number];
 
 export function SideChannelsTab({
   sideChannels, availableChannels, selectedTrainChannels, gotchas, onApply,
@@ -42,7 +43,8 @@ export function SideChannelsTab({
     standard: "c++20",
   });
   const [prompt, setPrompt] = useState("int add(int a, int b) { return a + b; }");
-  const [adapter, setAdapter] = useState<typeof ADAPTERS[number]>("cpp");
+  const [adapter, setAdapter] = useState<AdapterName>("cpp");
+  const [tensorPreview, setTensorPreview] = useState<string[]>([]);
 
   useEffect(() => setDraft(sideChannels), [sideChannels]);
 
@@ -245,6 +247,15 @@ export function SideChannelsTab({
                   onChange={(e) => setPrompt(e.target.value)}
                   style={{ width: "100%", minHeight: 54,
                            fontFamily: "monospace", fontSize: 11 }} />
+        <button data-testid="side-channel-preview-run"
+                onClick={() => setTensorPreview(buildTensorPreview({
+                  sideChannels: draft,
+                  prompt,
+                  platformPreview,
+                  adapter,
+                }))}>
+          Build preview
+        </button>
         <pre data-testid="side-channel-preview" style={preview}>
 {`tokens=${prompt.length}
 source=${draft.inference.source}
@@ -252,6 +263,9 @@ fail_policy=${draft.inference.fail_policy}
 adapter=${adapter}
 platform=${platformPreview || "unspecified"}
 families=${enabledFamilies.join(",") || "none"}`}
+        </pre>
+        <pre data-testid="side-channel-preview-tensors" style={preview}>
+          {tensorPreview.length === 0 ? "not built" : tensorPreview.join("\n")}
         </pre>
       </section>
 
@@ -303,6 +317,48 @@ families=${enabledFamilies.join(",") || "none"}`}
     ];
     onTrainChannelsChange(ordered);
   }
+}
+
+function buildTensorPreview({
+  sideChannels,
+  prompt,
+  platformPreview,
+  adapter,
+}: {
+  sideChannels: SideChannelState;
+  prompt: string;
+  platformPreview: string;
+  adapter: AdapterName;
+}): string[] {
+  const tokenCount = prompt.length;
+  const lines = [`prompt_ids shape=(1,${tokenCount}) dtype=int32`];
+  if (sideChannels.inference.source === "none") {
+    lines.push("side_channels=none");
+    return lines;
+  }
+
+  if (sideChannels.families.platform?.mode !== "off" && platformPreview) {
+    lines.push("platform_ids shape=(1,5) family=platform dtype=int32");
+  }
+
+  const parsesSource = (
+    adapter !== "none" &&
+    ["parse_if_possible", "project_index", "auto"].includes(
+      sideChannels.inference.source,
+    )
+  );
+  if (parsesSource && sideChannels.families.structure?.mode !== "off") {
+    lines.push(`structure_ids shape=(1,${tokenCount}) family=structure dtype=int32`);
+    lines.push(`dep_levels shape=(1,${tokenCount}) family=structure dtype=int32`);
+  }
+  if (parsesSource && sideChannels.families.syntax?.mode !== "off") {
+    lines.push(`ast_depth_ids shape=(1,${tokenCount}) family=syntax dtype=int32`);
+    lines.push(`sibling_index_ids shape=(1,${tokenCount}) family=syntax dtype=int32`);
+    lines.push(`node_type_ids shape=(1,${tokenCount}) family=syntax dtype=int32`);
+  }
+
+  if (lines.length === 1) lines.push("side_channels=none");
+  return lines;
 }
 
 function renderPlatform(platform: Record<string, string>): string {
