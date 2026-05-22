@@ -58,6 +58,43 @@ def write_parquet(path: Path) -> None:
     pq.write_table(table, path)
 
 
+def write_parquet_with_family_side_channels(path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    table = pa.table(
+        {
+            "token_ids": pa.array(
+                [
+                    [1, 2, 3, 4],
+                    [5, 6, 7, 8],
+                    [9, 10, 11, 12],
+                    [13, 14, 15, 16],
+                ],
+                type=pa.large_list(pa.uint32()),
+            ),
+            "token_symbol_ids": pa.array(
+                [
+                    [10, 11, 12, 13],
+                    [14, 15, 16, 17],
+                    [18, 19, 20, 21],
+                    [22, 23, 24, 25],
+                ],
+                type=pa.large_list(pa.int32()),
+            ),
+            "edit_op_per_token": pa.array(
+                [
+                    [0, 0, 2, 2],
+                    [0, 3, 0, 3],
+                    [1, 1, 0, 0],
+                    [4, 0, 4, 0],
+                ],
+                type=pa.large_list(pa.int32()),
+            ),
+        }
+    )
+    pq.write_table(table, path)
+
+
 def run_script(*args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, str(SCRIPT), *args],
@@ -209,6 +246,8 @@ def test_parquet_smoke_reports_local_ingress_contract(tmp_path: Path) -> None:
         }
     ]
     assert payload["side_channels"] == []
+    assert payload["family_side_channels"] == []
+    assert payload["family_side_channel_presence"] == {}
     assert payload["structure_side_channels"] == []
     assert payload["structure_side_channels_present"] is False
     assert payload["local_only"] is True
@@ -216,6 +255,46 @@ def test_parquet_smoke_reports_local_ingress_contract(tmp_path: Path) -> None:
     assert payload["m4_vs_gb10_parity_claim"] is False
     assert payload["distributed_megatron_parity_claim"] is False
     assert payload["training_wired"] is False
+
+
+def test_parquet_smoke_reports_generic_family_side_channels(tmp_path: Path) -> None:
+    dataset_path = tmp_path / "family_side_channels.parquet"
+    write_parquet_with_family_side_channels(dataset_path)
+
+    result = run_script(
+        str(dataset_path),
+        "--token-key",
+        "token_ids",
+        "--batch-size",
+        "2",
+        "--seq-len",
+        "4",
+        "--forward-smoke",
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = load_json(result)
+    assert payload["side_channels"] == []
+    assert payload["family_side_channels"] == ["semantic_graph", "temporal_diff"]
+    assert payload["family_side_channel_presence"] == {
+        "semantic_graph": {"token_symbol_ids": True},
+        "temporal_diff": {"edit_op_per_token": True},
+    }
+    assert payload["dataset"]["parquet_receipt"]["family_side_channel_sources"] == {
+        "semantic_graph": {
+            "token_symbol_ids": {
+                "column": "token_symbol_ids",
+                "type": "large_list<element: int32>",
+            }
+        },
+        "temporal_diff": {
+            "edit_op_per_token": {
+                "column": "edit_op_per_token",
+                "type": "large_list<element: int32>",
+            }
+        },
+    }
+    assert payload["forward"]["side_channel_model_kwargs"] == []
 
 
 def test_megatron_multishard_smoke_reports_side_channels(tmp_path: Path) -> None:

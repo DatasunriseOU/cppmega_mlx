@@ -188,6 +188,7 @@ def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
     batches = _read_batches(dataset, max_batches=int(args.batches))
     first_batch = batches[0]
     side_channels = _side_channel_presence(first_batch)
+    family_side_channels = _family_side_channel_presence(first_batch)
     structure_channels = [
         key for key in STRUCTURE_SIDE_CHANNELS if side_channels.get(key, False)
     ]
@@ -211,6 +212,10 @@ def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
         "seq_len": batch_shape[1],
         "side_channel_presence": side_channels,
         "side_channels": [key for key, present in side_channels.items() if present],
+        "family_side_channel_presence": family_side_channels,
+        "family_side_channels": [
+            family for family, columns in family_side_channels.items() if columns
+        ],
         "structure_side_channel_presence": {
             key: side_channels[key] for key in STRUCTURE_SIDE_CHANNELS
         },
@@ -297,6 +302,18 @@ def _side_channel_presence(batch: LMTokenBatch) -> dict[str, bool]:
         **{key: value is not None for key, value in batch.structure_fields().items()},
     }
     return dict(sorted(presence.items()))
+
+
+def _family_side_channel_presence(batch: LMTokenBatch) -> dict[str, dict[str, bool]]:
+    if not batch.side_channels:
+        return {}
+    return {
+        family: {
+            column: value is not None
+            for column, value in sorted(columns.items())
+        }
+        for family, columns in sorted(batch.side_channels.items())
+    }
 
 
 def _dataset_receipt(dataset: TokenBatchDataset) -> dict[str, Any]:
