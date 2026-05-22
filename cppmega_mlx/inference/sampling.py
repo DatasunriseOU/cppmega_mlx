@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any, cast
 
 import mlx.core as mx
+
+from cppmega_mlx.inference.constraints import LogitsProcessor
 
 
 def sample_next_token(
@@ -14,6 +17,8 @@ def sample_next_token(
     top_k: int | None = None,
     top_p: float | None = 1.0,
     rng_key: Any | None = None,
+    tokens: mx.array | None = None,
+    logits_processors: Sequence[LogitsProcessor] | None = None,
 ) -> mx.array:
     """Sample one next token from ``(batch, vocab)`` logits and return ``(batch, 1)``.
 
@@ -29,6 +34,12 @@ def sample_next_token(
         top_p = 1.0
     if not 0.0 < top_p <= 1.0:
         raise ValueError("top_p must be in (0, 1]")
+
+    if logits_processors:
+        if tokens is None:
+            raise ValueError("tokens are required when logits_processors are provided")
+        for processor in logits_processors:
+            logits = processor(logits, tokens)
 
     if temperature == 0.0:
         return mx.argmax(logits, axis=-1, keepdims=True)

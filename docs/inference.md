@@ -15,6 +15,7 @@ GB10/CUDA parity are separate tasks.
 | Prompt cache reuse | `generate_tokens_with_prompt_cache(` | Reuses an attention-only contiguous prompt prefix via `PromptCacheEntry` | `build_prompt_cache`, suffix decode, sampling knobs | No SSM/recurrent/ngram prompt-state reuse |
 | Vanilla speculative decode | `generate_tokens_speculative(` | Eager batch=1 draft-window verifier with Leviathan-style acceptance/rejection | target model, draft model, `draft_window`, sampling knobs | No KV/paged speculative serving |
 | MTP self-speculative decode | `generate_tokens_mtp_self_speculative(` | Eager batch=1 path using attached `mtp_head` as draft source | `draft_window`, trained MTP depth, sampling knobs | No EAGLE-2/token-recycling claim |
+| JSON-mode constrained decode | `JsonConstrainedLogitsProcessor` | Token-id JSON prefix mask for sampler, eager, contiguous-KV, prompt-cache, and streaming generation | `JsonTokenIds`, `start_position`, `logits_processors` | not JSON Schema, not raw text/tokenizer parsing |
 | Local token-id API serving | `create_local_generation_app(` | Optional FastAPI app exposing `/health` and `/generate` over token IDs | caller-owned model, generation options, `model_kwargs_builder`, optional decoder | not an OpenAI-compatible API |
 | Inference quantization manifest | `scripts/quantize_for_inference.py` | Local q4 helper manifest over repo-local inference quantization primitives | preset, q4 bits/group size, KV-q4 bits/group size, forward check | not a full checkpoint converter |
 | q4 quality smoke | `scripts/bench_inference_quality.py` | Built-in ARC/MMLU/HumanEval-style token-id smoke harness over q4 linears | `--tasks-jsonl`, suites, q4 bits/group size | not a real ARC/MMLU/HumanEval leaderboard run |
@@ -67,6 +68,19 @@ server-side paths.
 
 EAGLE-2, token recycling, Medusa, Hydra, and paged speculative serving remain
 pattern or future work until measured against these simpler local baselines.
+
+## JSON-Mode Constraints
+
+`JsonConstrainedLogitsProcessor` is a token-id logits processor. Callers supply
+`JsonTokenIds`, mapping tokenizer-specific IDs to JSON structural tokens,
+scalar placeholder categories, whitespace, and optional EOS. The processor
+parses only the constrained suffix starting at `start_position`, then masks
+invalid next-token logits before greedy/top-k/top-p sampling.
+
+This path is wired through `sample_next_token`, `generate_tokens`,
+`generate_tokens_with_kv_cache`, `generate_tokens_with_prompt_cache`, and
+`stream_generate_tokens`. It is intentionally a JSON-mode prefix guard, not a
+JSON Schema engine, raw text parser, tokenizer decoder, or semantic validator.
 
 ## Serving
 
@@ -130,3 +144,4 @@ being silently fabricated.
 - This is not a full checkpoint converter.
 - This is not a GB10 parity claim.
 - This is not mixed bf16-to-q4 quantized_kv_start > 0 transition coverage.
+- JSON-mode constrained decoding is not JSON Schema or raw text parsing.

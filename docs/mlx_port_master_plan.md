@@ -894,7 +894,14 @@ Excluded as Hopper-only dead-end on Metal: cppmega/megatron/cute_dsl_mimo/ (sm_9
 176. **SCOPED DONE (KV-q4 long-context smoke harness)**: add `scripts/bench_inference_long_context.py` for local token-id NIAH and RULER-style long-context checks on the repo-local contiguous `QuantizedKVCache` path. The default run is allocation-safe, uses built-in smoke tasks, supports external JSONL token-id rows, records actual context length, q4 KV bits/group/start, prefill+decode timing, exact-token-match metrics, memory-safety metadata, and explicit local-only/no-leaderboard/no-GB10/no-full-model claims. This is not a real NIAH/RULER leaderboard run, not a full-model long-context receipt, and not mixed bf16-to-q4 `quantized_kv_start > 0` transition coverage.
 177. **SCOPED DONE**: add `docs/inference.md` documenting the current local MLX inference modes: eager full-prefix generation, contiguous KV generation/streaming, prompt-cache reuse and safety guards, vanilla and MTP self-speculative loops, local token-id FastAPI serving, q4 quality smoke, KV-q4 long-context smoke, side-channel `model_kwargs`/`model_kwargs_builder` boundaries, and explicit non-claims for OpenAI-compatible API, model-integrated paged attention, real benchmark leaderboards, GB10 parity, and mixed `quantized_kv_start > 0` transition coverage.
 178. **SCOPED DONE**: add `scripts/quantize_for_inference.py`, an inference-only CLI wrapper over the repo-local q4 quantization helpers. The script builds a small `HybridTinyLM` preset, applies `quantize_module_for_inference`, validates q4 KV-cache configuration, optionally runs a finite forward-diff check, and writes a manifest with quantized/remaining Linear counts, skipped embedding/output-head policy, memory-safety metadata, and explicit local-only/no-training/no-full-checkpoint-converter/no-GB10 claims. This is not a production checkpoint loader/saver or training quantization path.
-179. Add JSON-mode constrained decoding (logits processor).
+179. **SCOPED DONE**: add `JsonConstrainedLogitsProcessor` and `JsonTokenIds`
+    in `cppmega_mlx/inference/constraints.py`, exported from
+    `cppmega_mlx.inference`. The processor masks invalid token IDs before
+    greedy/top-k/top-p sampling and is wired through eager full-prefix,
+    contiguous-KV, prompt-cache, and streaming generation via
+    `logits_processors`. This is token-id JSON prefix guarding only; it is not
+    JSON Schema support, raw text/tokenizer parsing, OpenAI structured outputs,
+    or speculative/paged constrained serving.
 180. Add tool-use template support (chat-template special tokens already reserved).
 
 ### Stream J — Benchmarking, Profiling & Validation (181–200)

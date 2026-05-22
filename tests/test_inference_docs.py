@@ -27,6 +27,9 @@ def test_inference_modes_doc_pins_supported_local_surfaces() -> None:
         "scripts/bench_inference_quality.py",
         "scripts/bench_inference_long_context.py",
         "scripts/quantize_for_inference.py",
+        "JsonConstrainedLogitsProcessor",
+        "JsonTokenIds",
+        "logits_processors",
         "QuantizedKVCache",
         "model_kwargs_builder",
     ):
@@ -44,5 +47,6 @@ def test_inference_modes_doc_keeps_non_claims_explicit() -> None:
         "not a GB10 parity claim",
         "not a full checkpoint converter",
         "not mixed bf16-to-q4 quantized_kv_start > 0 transition coverage",
+        "not JSON Schema or raw text parsing",
     ):
         assert phrase in text

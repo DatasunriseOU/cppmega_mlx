@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, cast
 
@@ -16,6 +16,7 @@ from cppmega_mlx.inference.engine import (
     kv_cache_position,
     make_contiguous_kv_cache,
 )
+from cppmega_mlx.inference.constraints import LogitsProcessor
 from cppmega_mlx.inference.sampling import sample_next_token
 from cppmega_mlx.inference.speculative_decode import speculative_acceptance
 
@@ -94,6 +95,7 @@ def generate_tokens(
     top_k: int | None = None,
     top_p: float | None = 1.0,
     rng_key: Any | None = None,
+    logits_processors: Sequence[LogitsProcessor] | None = None,
 ) -> mx.array:
     """Generate tokens by recomputing ``model(tokens)`` on the full prefix.
 
@@ -134,6 +136,8 @@ def generate_tokens(
             top_k=top_k,
             top_p=top_p,
             rng_key=step_key,
+            tokens=tokens,
+            logits_processors=logits_processors,
         ).astype(tokens.dtype)
         tokens = mx.concatenate([tokens, next_token], axis=1)
 
@@ -367,6 +371,7 @@ def generate_tokens_with_kv_cache(
     top_k: int | None = None,
     top_p: float | None = 1.0,
     rng_key: Any | None = None,
+    logits_processors: Sequence[LogitsProcessor] | None = None,
 ) -> mx.array:
     """Generate with one prompt prefill and one-token KV-cache decode steps.
 
@@ -424,6 +429,8 @@ def generate_tokens_with_kv_cache(
             top_k=top_k,
             top_p=top_p,
             rng_key=step_key,
+            tokens=tokens,
+            logits_processors=logits_processors,
         ).astype(tokens.dtype)
         tokens = mx.concatenate([tokens, next_token], axis=1)
 
@@ -520,6 +527,7 @@ def generate_tokens_with_prompt_cache(
     top_k: int | None = None,
     top_p: float | None = 1.0,
     rng_key: Any | None = None,
+    logits_processors: Sequence[LogitsProcessor] | None = None,
 ) -> mx.array:
     """Generate by cloning a reusable contiguous-KV prefix cache.
 
@@ -574,6 +582,8 @@ def generate_tokens_with_prompt_cache(
             top_k=top_k,
             top_p=top_p,
             rng_key=step_key,
+            tokens=tokens,
+            logits_processors=logits_processors,
         ).astype(tokens.dtype)
         tokens = mx.concatenate([tokens, next_token], axis=1)
 
@@ -622,6 +632,7 @@ def stream_generate_tokens(
     kv_bits: int = 4,
     kv_group_size: int = 64,
     decode_token: Callable[[int], str] | None = None,
+    logits_processors: Sequence[LogitsProcessor] | None = None,
 ) -> Iterator[GenerationChunk]:
     """Yield generated tokens one step at a time.
 
@@ -663,6 +674,7 @@ def stream_generate_tokens(
             kv_bits=kv_bits,
             kv_group_size=kv_group_size,
             decode_token=decode_token,
+            logits_processors=logits_processors,
             max_seq_length=max_seq_length,
         )
         return
@@ -691,6 +703,8 @@ def stream_generate_tokens(
             top_k=top_k,
             top_p=top_p,
             rng_key=step_key,
+            tokens=tokens,
+            logits_processors=logits_processors,
         ).astype(tokens.dtype)
         tokens = mx.concatenate([tokens, next_token], axis=1)
         yield _make_generation_chunk(
@@ -1166,6 +1180,7 @@ def _stream_generate_tokens_with_kv_cache(
     kv_bits: int,
     kv_group_size: int,
     decode_token: Callable[[int], str] | None,
+    logits_processors: Sequence[LogitsProcessor] | None,
     max_seq_length: int | None,
 ) -> Iterator[GenerationChunk]:
     tokens = prompt_ids
@@ -1203,6 +1218,8 @@ def _stream_generate_tokens_with_kv_cache(
             top_k=top_k,
             top_p=top_p,
             rng_key=step_key,
+            tokens=tokens,
+            logits_processors=logits_processors,
         ).astype(tokens.dtype)
         tokens = mx.concatenate([tokens, next_token], axis=1)
         yield _make_generation_chunk(

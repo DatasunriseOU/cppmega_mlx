@@ -11,6 +11,11 @@ from cppmega_mlx.inference.engine import (
     rollback_contiguous_kv_cache,
     trim_contiguous_kv_cache,
 )
+from cppmega_mlx.inference.constraints import (
+    JsonConstrainedLogitsProcessor,
+    JsonTokenIds,
+    LogitsProcessor,
+)
 from cppmega_mlx.inference.infilling import build_fim_prompt_ids
 from cppmega_mlx.inference.generation import (
     GenerationChunk,
@@ -82,6 +87,9 @@ __all__ = [
     "InferenceSideChannelBuilder",
     "InferenceSideChannelCacheComponents",
     "InferenceSideChannelResult",
+    "JsonConstrainedLogitsProcessor",
+    "JsonTokenIds",
+    "LogitsProcessor",
     "GoCodeMetadataAdapter",
     "PAGED_ATTENTION_NOT_INTEGRATED_MESSAGE",
     "PagedKVBlockManager",

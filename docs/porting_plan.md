@@ -213,6 +213,7 @@ The current collected test files are:
 - tests/test_inference_engine.py
 - tests/test_inference_generation.py
 - tests/test_inference_infilling.py
+- tests/test_inference_json_constraints.py
 - tests/test_inference_quantization.py
 - tests/test_inference_sampling.py
 - tests/test_inference_serve.py
