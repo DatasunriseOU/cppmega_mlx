@@ -11,7 +11,10 @@ import cppmega_mlx.inference as inference
 from cppmega_mlx.inference import (
     AdapterCapabilities,
     CodeMetadataAdapter,
+    GoCodeMetadataAdapter,
     InferenceSideChannelBuilder,
+    PythonCodeMetadataAdapter,
+    RustCodeMetadataAdapter,
     TokenMetadata,
     builtin_code_metadata_adapters,
     get_builtin_code_metadata_adapter,
@@ -193,6 +196,9 @@ def test_inference_root_exports_side_channel_builder() -> None:
     assert "InferenceSideChannelBuilder" in inference.__all__
     assert "InferenceFailPolicy" in inference.__all__
     assert "get_builtin_code_metadata_adapter" in inference.__all__
+    assert "PythonCodeMetadataAdapter" in inference.__all__
+    assert "RustCodeMetadataAdapter" in inference.__all__
+    assert "GoCodeMetadataAdapter" in inference.__all__
 
 
 def test_builtin_language_adapter_registry_is_generic() -> None:
@@ -201,6 +207,9 @@ def test_builtin_language_adapter_registry_is_generic() -> None:
     assert set(registry) == {"cpp", "rust", "go", "python"}
     assert normalize_code_language("c++") == "cpp"
     assert normalize_code_language("py") == "python"
+    assert isinstance(registry["python"], PythonCodeMetadataAdapter)
+    assert isinstance(registry["rust"], RustCodeMetadataAdapter)
+    assert isinstance(registry["go"], GoCodeMetadataAdapter)
     for language, adapter in registry.items():
         assert isinstance(adapter, CodeMetadataAdapter)
         caps = adapter.probe({})
@@ -210,25 +219,93 @@ def test_builtin_language_adapter_registry_is_generic() -> None:
         assert isinstance(caps.available, bool)
 
 
-def test_builtin_unavailable_language_adapters_fail_explicitly() -> None:
+def test_unknown_language_adapter_fails_explicitly() -> None:
     builder = InferenceSideChannelBuilder(TinyTokenizer())
 
-    for language in ("rust", "go", "python"):
-        adapter = get_builtin_code_metadata_adapter(language)
-        caps = adapter.probe({})
-        assert caps.available is False
-        assert caps.reason == "adapter_not_implemented"
+    adapter = get_builtin_code_metadata_adapter("zig")
+    caps = adapter.probe({})
+    assert caps.available is False
+    assert caps.reason == "adapter_unknown_language"
 
-        dropped = builder.build("fn main() {}", language=language)
-        assert dropped.model_kwargs == {}
-        assert dropped.side_channels == {}
-        assert dropped.provenance["adapter"].startswith("dropped:adapter_unavailable")
+    dropped = builder.build("const x = 1;", language="zig")
+    assert dropped.model_kwargs == {}
+    assert dropped.side_channels == {}
+    assert dropped.provenance["adapter"].startswith("dropped:adapter_unavailable")
 
-        with pytest.raises(RuntimeError, match="adapter_unavailable"):
-            InferenceSideChannelBuilder(
-                TinyTokenizer(),
-                fail_policy="error",
-            ).build("fn main() {}", language=language)
+    with pytest.raises(RuntimeError, match="adapter_unavailable"):
+        InferenceSideChannelBuilder(
+            TinyTokenizer(),
+            fail_policy="error",
+        ).build("const x = 1;", language="zig")
+
+
+def _assert_builtin_language_adapter_conforms(
+    language: str,
+    source: str,
+    expected_version: str,
+) -> None:
+    adapter = get_builtin_code_metadata_adapter(language)
+    caps = adapter.probe({})
+
+    assert caps.language == language
+    assert caps.families == ("syntax", "structure")
+    if not caps.available:
+        result = InferenceSideChannelBuilder(TinyTokenizer()).build(
+            source,
+            language=language,
+        )
+        assert result.provenance["adapter"].startswith("dropped:adapter_unavailable")
+        return
+
+    result = InferenceSideChannelBuilder(TinyTokenizer()).build(
+        source,
+        language=language,
+    )
+    logits = _tiny_model()(result.prompt_ids, **result.model_kwargs)
+    mx.eval(logits)
+
+    assert result.cache_components.adapter_language == language
+    assert result.cache_components.adapter_version == expected_version
+    assert result.model_kwargs["structure_ids"].shape == result.prompt_ids.shape
+    assert result.model_kwargs["dep_levels"].shape == result.prompt_ids.shape
+    assert result.model_kwargs["ast_depth_ids"].shape == result.prompt_ids.shape
+    assert result.model_kwargs["sibling_index_ids"].shape == result.prompt_ids.shape
+    assert result.model_kwargs["node_type_ids"].shape == result.prompt_ids.shape
+    assert "structure" in result.side_channels
+    assert "syntax" in result.side_channels
+    assert result.provenance["adapter"] == f"{language}:{expected_version}"
+
+
+def test_builtin_python_adapter_produces_token_metadata() -> None:
+    _assert_builtin_language_adapter_conforms(
+        "python",
+        "def add(x: int) -> int:\n    return x + 1\n",
+        "python-ast-v1",
+    )
+
+
+def test_builtin_python_adapter_maps_utf8_ast_offsets_to_char_positions() -> None:
+    source = "éé = 1\nx = 2\n"
+    metadata = PythonCodeMetadataAdapter().extract(source, {})
+
+    assert metadata.node_type[0] != 0
+    assert metadata.node_type[source.index("\n")] == 0
+
+
+def test_builtin_rust_adapter_conforms_or_reports_unavailable() -> None:
+    _assert_builtin_language_adapter_conforms(
+        "rust",
+        "pub fn add(x: i32) -> i32 { x + 1 }\n",
+        "rust-syntax-v1",
+    )
+
+
+def test_builtin_go_adapter_conforms_or_reports_unavailable() -> None:
+    _assert_builtin_language_adapter_conforms(
+        "go",
+        "package main\nfunc add(x int) int { return x + 1 }\n",
+        "go-syntax-v1",
+    )
 
 
 def test_builtin_cpp_adapter_conforms_or_reports_unavailable() -> None:

@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import ast
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from hashlib import sha256
 import json
 import os
 from pathlib import Path
+import re
+import shutil
+import subprocess
 import tempfile
 from typing import Any, Literal, Protocol, runtime_checkable
 
@@ -228,19 +232,175 @@ class ClangCodeMetadataAdapter:
     ) -> TokenMetadata:
         if not isinstance(metadata, _SourceMetadata):
             raise TypeError("metadata must be _SourceMetadata")
-        source_indices = _token_source_indices(metadata.source, tokens, tokenizer)
-        ast_depth = _source_values_at_indices(metadata.ast_depth, source_indices)
-        sibling_index = _source_values_at_indices(metadata.sibling_index, source_indices)
-        node_type = _source_values_at_indices(metadata.node_type, source_indices)
-        structure_ids = [value if value > 0 else 0 for value in node_type]
-        return TokenMetadata(
-            structure_ids=structure_ids,
-            dep_levels=ast_depth,
-            ast_depth_ids=ast_depth,
-            sibling_index_ids=sibling_index,
-            node_type_ids=node_type,
-            provenance=metadata.provenance,
+        return _source_metadata_to_token_metadata(metadata, tokens, tokenizer)
+
+
+class PythonCodeMetadataAdapter:
+    """Python stdlib AST adapter for inference enrichment."""
+
+    language = "python"
+    version = "python-ast-v1"
+    families = ("syntax", "structure")
+
+    def probe(self, context: Mapping[str, Any]) -> AdapterCapabilities:
+        del context
+        return AdapterCapabilities(
+            language=self.language,
+            version=self.version,
+            families=self.families,
+            available=True,
         )
+
+    def extract(
+        self,
+        source_or_project: str,
+        options: Mapping[str, Any],
+    ) -> _SourceMetadata:
+        del options
+        if not isinstance(source_or_project, str) or not source_or_project:
+            raise AdapterUnavailableError("source must be a non-empty string")
+        try:
+            ast_depth, sibling_index, node_type = _python_ast_metadata(
+                source_or_project
+            )
+        except SyntaxError as exc:
+            raise AdapterUnavailableError(
+                f"python_parse_failed:{exc.msg}"
+            ) from exc
+        return _SourceMetadata(
+            language=self.language,
+            source=source_or_project,
+            ast_depth=tuple(ast_depth),
+            sibling_index=tuple(sibling_index),
+            node_type=tuple(node_type),
+            provenance={
+                "adapter": f"{self.language}:{self.version}",
+                "syntax": "python_ast",
+                "structure": "python_ast",
+            },
+        )
+
+    def map_to_tokens(
+        self,
+        metadata: Any,
+        tokens: Sequence[int],
+        tokenizer: Any,
+    ) -> TokenMetadata:
+        if not isinstance(metadata, _SourceMetadata):
+            raise TypeError("metadata must be _SourceMetadata")
+        return _source_metadata_to_token_metadata(metadata, tokens, tokenizer)
+
+
+class RustCodeMetadataAdapter:
+    """Rust syntax adapter using the local rustc parser when available."""
+
+    language = "rust"
+    version = "rust-syntax-v1"
+    families = ("syntax", "structure")
+
+    def probe(self, context: Mapping[str, Any]) -> AdapterCapabilities:
+        rustc = _tool_path(context.get("rustc_path"), "rustc")
+        return AdapterCapabilities(
+            language=self.language,
+            version=self.version,
+            families=self.families,
+            available=rustc is not None,
+            reason=None if rustc is not None else "rustc_not_found",
+        )
+
+    def extract(
+        self,
+        source_or_project: str,
+        options: Mapping[str, Any],
+    ) -> _SourceMetadata:
+        if not isinstance(source_or_project, str) or not source_or_project:
+            raise AdapterUnavailableError("source must be a non-empty string")
+        rustc = _tool_path(options.get("rustc_path"), "rustc")
+        if rustc is None:
+            raise AdapterUnavailableError("rustc_not_found")
+        _check_rust_syntax(source_or_project, rustc=rustc)
+        ast_depth, sibling_index, node_type = _lexical_source_metadata(
+            "rust",
+            source_or_project,
+        )
+        return _SourceMetadata(
+            language=self.language,
+            source=source_or_project,
+            ast_depth=tuple(ast_depth),
+            sibling_index=tuple(sibling_index),
+            node_type=tuple(node_type),
+            provenance={
+                "adapter": f"{self.language}:{self.version}",
+                "syntax": "rustc_syntax_check",
+                "structure": "lexical_nesting",
+            },
+        )
+
+    def map_to_tokens(
+        self,
+        metadata: Any,
+        tokens: Sequence[int],
+        tokenizer: Any,
+    ) -> TokenMetadata:
+        if not isinstance(metadata, _SourceMetadata):
+            raise TypeError("metadata must be _SourceMetadata")
+        return _source_metadata_to_token_metadata(metadata, tokens, tokenizer)
+
+
+class GoCodeMetadataAdapter:
+    """Go syntax adapter using gofmt's parser when available."""
+
+    language = "go"
+    version = "go-syntax-v1"
+    families = ("syntax", "structure")
+
+    def probe(self, context: Mapping[str, Any]) -> AdapterCapabilities:
+        gofmt = _gofmt_path(context.get("gofmt_path"))
+        return AdapterCapabilities(
+            language=self.language,
+            version=self.version,
+            families=self.families,
+            available=gofmt is not None,
+            reason=None if gofmt is not None else "gofmt_not_found",
+        )
+
+    def extract(
+        self,
+        source_or_project: str,
+        options: Mapping[str, Any],
+    ) -> _SourceMetadata:
+        if not isinstance(source_or_project, str) or not source_or_project:
+            raise AdapterUnavailableError("source must be a non-empty string")
+        gofmt = _gofmt_path(options.get("gofmt_path"))
+        if gofmt is None:
+            raise AdapterUnavailableError("gofmt_not_found")
+        _check_go_syntax(source_or_project, gofmt=gofmt)
+        ast_depth, sibling_index, node_type = _lexical_source_metadata(
+            "go",
+            source_or_project,
+        )
+        return _SourceMetadata(
+            language=self.language,
+            source=source_or_project,
+            ast_depth=tuple(ast_depth),
+            sibling_index=tuple(sibling_index),
+            node_type=tuple(node_type),
+            provenance={
+                "adapter": f"{self.language}:{self.version}",
+                "syntax": "gofmt_syntax_check",
+                "structure": "lexical_nesting",
+            },
+        )
+
+    def map_to_tokens(
+        self,
+        metadata: Any,
+        tokens: Sequence[int],
+        tokenizer: Any,
+    ) -> TokenMetadata:
+        if not isinstance(metadata, _SourceMetadata):
+            raise TypeError("metadata must be _SourceMetadata")
+        return _source_metadata_to_token_metadata(metadata, tokens, tokenizer)
 
 
 _LANGUAGE_ALIASES = {
@@ -252,13 +412,6 @@ _LANGUAGE_ALIASES = {
     "golang": "go",
 }
 
-_UNAVAILABLE_ADAPTER_FAMILIES = {
-    "rust": ("syntax", "structure", "semantic_graph"),
-    "go": ("syntax", "structure", "semantic_graph"),
-    "python": ("syntax", "structure"),
-}
-
-
 def normalize_code_language(language: str) -> str:
     normalized = str(language).strip().lower().replace("_", "-")
     return _LANGUAGE_ALIASES.get(normalized, normalized)
@@ -268,11 +421,12 @@ def get_builtin_code_metadata_adapter(language: str) -> CodeMetadataAdapter:
     normalized = normalize_code_language(language)
     if normalized in {"cpp", "c", "cuda", "hip"}:
         return ClangCodeMetadataAdapter()
-    if normalized in _UNAVAILABLE_ADAPTER_FAMILIES:
-        return UnavailableCodeMetadataAdapter(
-            normalized,
-            families=_UNAVAILABLE_ADAPTER_FAMILIES[normalized],
-        )
+    if normalized == "python":
+        return PythonCodeMetadataAdapter()
+    if normalized == "rust":
+        return RustCodeMetadataAdapter()
+    if normalized == "go":
+        return GoCodeMetadataAdapter()
     return UnavailableCodeMetadataAdapter(
         normalized,
         reason="adapter_unknown_language",
@@ -282,18 +436,9 @@ def get_builtin_code_metadata_adapter(language: str) -> CodeMetadataAdapter:
 def builtin_code_metadata_adapters() -> Mapping[str, CodeMetadataAdapter]:
     return {
         "cpp": ClangCodeMetadataAdapter(),
-        "rust": UnavailableCodeMetadataAdapter(
-            "rust",
-            families=_UNAVAILABLE_ADAPTER_FAMILIES["rust"],
-        ),
-        "go": UnavailableCodeMetadataAdapter(
-            "go",
-            families=_UNAVAILABLE_ADAPTER_FAMILIES["go"],
-        ),
-        "python": UnavailableCodeMetadataAdapter(
-            "python",
-            families=_UNAVAILABLE_ADAPTER_FAMILIES["python"],
-        ),
+        "rust": RustCodeMetadataAdapter(),
+        "go": GoCodeMetadataAdapter(),
+        "python": PythonCodeMetadataAdapter(),
     }
 
 
@@ -357,7 +502,7 @@ class InferenceSideChannelBuilder:
         self.tokenizer = tokenizer
         self.tokenizer_id = tokenizer_id or _infer_tokenizer_id(tokenizer)
         self.adapter = adapter
-        self.fail_policy = fail_policy
+        self.fail_policy: InferenceFailPolicy = fail_policy
 
     def build(
         self,
@@ -370,7 +515,7 @@ class InferenceSideChannelBuilder:
     ) -> InferenceSideChannelResult:
         if not isinstance(text, str):
             raise TypeError("text must be a string")
-        policy = fail_policy or self.fail_policy
+        policy: InferenceFailPolicy = fail_policy or self.fail_policy
         if policy not in {"drop_family", "text_only", "error"}:
             raise ValueError("fail_policy must be drop_family, text_only, or error")
 
@@ -552,6 +697,236 @@ def _default_clang_args(language: str) -> list[str]:
     return ["-x", "c++", "-std=c++20", "-fsyntax-only", "-Wno-everything"]
 
 
+def _source_metadata_to_token_metadata(
+    metadata: _SourceMetadata,
+    tokens: Sequence[int],
+    tokenizer: Any,
+) -> TokenMetadata:
+    source_indices = _token_source_indices(metadata.source, tokens, tokenizer)
+    ast_depth = _source_values_at_indices(metadata.ast_depth, source_indices)
+    sibling_index = _source_values_at_indices(metadata.sibling_index, source_indices)
+    node_type = _source_values_at_indices(metadata.node_type, source_indices)
+    structure_ids = [value if value > 0 else 0 for value in node_type]
+    return TokenMetadata(
+        structure_ids=structure_ids,
+        dep_levels=ast_depth,
+        ast_depth_ids=ast_depth,
+        sibling_index_ids=sibling_index,
+        node_type_ids=node_type,
+        provenance=metadata.provenance,
+    )
+
+
+def _python_ast_metadata(source: str) -> tuple[list[int], list[int], list[int]]:
+    tree = ast.parse(source)
+    ast_depth = [0] * len(source)
+    sibling_index = [0] * len(source)
+    node_type = [0] * len(source)
+    line_starts, byte_to_char = _line_offset_maps(source)
+
+    def offset(line_no: int | None, byte_col: int | None) -> int | None:
+        if line_no is None or byte_col is None:
+            return None
+        if line_no <= 0 or line_no > len(line_starts):
+            return None
+        line_map = byte_to_char[line_no - 1]
+        bounded_col = min(len(line_map) - 1, max(0, int(byte_col)))
+        return min(len(source), line_starts[line_no - 1] + line_map[bounded_col])
+
+    def visit(node: ast.AST, depth: int, index: int) -> None:
+        start = offset(getattr(node, "lineno", None), getattr(node, "col_offset", None))
+        end = offset(
+            getattr(node, "end_lineno", None),
+            getattr(node, "end_col_offset", None),
+        )
+        if start is not None and end is not None and end > start:
+            node_id = _stable_node_type_id(type(node).__name__)
+            for pos in range(max(0, start), min(len(source), end)):
+                if depth >= ast_depth[pos]:
+                    ast_depth[pos] = depth
+                    sibling_index[pos] = index
+                    node_type[pos] = node_id
+        for child_index, child in enumerate(ast.iter_child_nodes(node)):
+            visit(child, depth + 1, child_index)
+
+    visit(tree, 0, 0)
+    return ast_depth, sibling_index, node_type
+
+
+def _line_offset_maps(source: str) -> tuple[list[int], list[list[int]]]:
+    lines = source.splitlines(keepends=True)
+    if not lines:
+        lines = [""]
+    starts: list[int] = []
+    byte_to_char: list[list[int]] = []
+    cursor = 0
+    for line in lines:
+        starts.append(cursor)
+        cursor += len(line)
+        byte_len = len(line.encode("utf-8"))
+        mapping = [0] * (byte_len + 1)
+        byte_cursor = 0
+        for char_index, char in enumerate(line):
+            char_width = len(char.encode("utf-8"))
+            for byte_index in range(char_width):
+                mapping[byte_cursor + byte_index] = char_index
+            byte_cursor += char_width
+        mapping[byte_cursor] = len(line)
+        byte_to_char.append(mapping)
+    return starts, byte_to_char
+
+
+_LEXICAL_KEYWORDS = {
+    "rust": frozenset({
+        "as", "async", "await", "break", "const", "continue", "crate",
+        "dyn", "else", "enum", "extern", "false", "fn", "for", "if",
+        "impl", "in", "let", "loop", "match", "mod", "move", "mut",
+        "pub", "ref", "return", "self", "Self", "static", "struct",
+        "super", "trait", "true", "type", "unsafe", "use", "where",
+        "while",
+    }),
+    "go": frozenset({
+        "break", "case", "chan", "const", "continue", "default", "defer",
+        "else", "fallthrough", "for", "func", "go", "goto", "if",
+        "import", "interface", "map", "package", "range", "return",
+        "select", "struct", "switch", "type", "var",
+    }),
+}
+
+
+def _lexical_source_metadata(
+    language: str,
+    source: str,
+) -> tuple[list[int], list[int], list[int]]:
+    ast_depth = [0] * len(source)
+    sibling_index = [0] * len(source)
+    node_type = [0] * len(source)
+    sibling_counters: dict[int, int] = {}
+    keywords = _LEXICAL_KEYWORDS.get(language, frozenset())
+    depth = 0
+    index = 0
+    while index < len(source):
+        char = source[index]
+        if char in ")]}":
+            depth = max(0, depth - 1)
+        token_end = index + 1
+        token_kind = "whitespace"
+        if char.isalpha() or char == "_":
+            token_end = index + 1
+            while (
+                token_end < len(source)
+                and (source[token_end].isalnum() or source[token_end] == "_")
+            ):
+                token_end += 1
+            text = source[index:token_end]
+            token_kind = "keyword" if text in keywords else "identifier"
+        elif char.isdigit():
+            token_end = index + 1
+            while token_end < len(source) and (
+                source[token_end].isalnum() or source[token_end] in "._"
+            ):
+                token_end += 1
+            token_kind = "literal"
+        elif char in "{}[]().,;:+-*/%&|^!<>=?":
+            token_kind = "punctuation"
+
+        local_sibling = sibling_counters.get(depth, 0)
+        if token_kind != "whitespace":
+            sibling_counters[depth] = local_sibling + 1
+        node_id = _stable_node_type_id(f"{language}:{token_kind}")
+        for pos in range(index, token_end):
+            ast_depth[pos] = depth
+            sibling_index[pos] = local_sibling
+            node_type[pos] = node_id if token_kind != "whitespace" else 0
+        if char in "([{":
+            depth += 1
+        index = token_end
+    return ast_depth, sibling_index, node_type
+
+
+def _stable_node_type_id(name: str) -> int:
+    return int(sha256(name.encode("utf-8")).hexdigest()[:6], 16) % 255 + 1
+
+
+def _tool_path(configured: Any, executable: str) -> str | None:
+    if configured:
+        path = str(configured)
+        return path if os.path.exists(path) else None
+    return shutil.which(executable)
+
+
+def _gofmt_path(configured: Any) -> str | None:
+    path = _tool_path(configured, "gofmt")
+    if path is not None:
+        return path
+    go = shutil.which("go")
+    if not go:
+        return None
+    candidate = os.path.join(os.path.dirname(go), "gofmt")
+    return candidate if os.path.exists(candidate) else None
+
+
+def _check_rust_syntax(source: str, *, rustc: str) -> None:
+    errors: list[str] = []
+    for wrapped in (False, True):
+        with tempfile.TemporaryDirectory(prefix="cppmega_infer_rust_") as tmpdir:
+            src = source if not wrapped else f"mod cppmega_infer {{\n{source}\n}}\n"
+            path = os.path.join(tmpdir, "snippet.rs")
+            out = os.path.join(tmpdir, "snippet.rmeta")
+            with open(path, "w", encoding="utf-8", errors="replace") as handle:
+                handle.write(src)
+            result = _run_syntax_tool(
+                [
+                    rustc,
+                    "--edition=2021",
+                    "--crate-type",
+                    "lib",
+                    "--emit=metadata",
+                    "-o",
+                    out,
+                    path,
+                ]
+            )
+            if result.returncode == 0:
+                return
+            errors.append(result.stderr.decode("utf-8", errors="replace")[:400])
+    raise AdapterUnavailableError(
+        "rust_parse_failed:" + (errors[-1].strip() if errors else "unknown")
+    )
+
+
+def _check_go_syntax(source: str, *, gofmt: str) -> None:
+    has_package = re.search(r"^\s*package\s+\w+", source, flags=re.MULTILINE)
+    src = source if has_package else f"package main\n{source}\n"
+    with tempfile.TemporaryDirectory(prefix="cppmega_infer_go_") as tmpdir:
+        path = os.path.join(tmpdir, "snippet.go")
+        with open(path, "w", encoding="utf-8", errors="replace") as handle:
+            handle.write(src)
+        result = _run_syntax_tool([gofmt, path])
+    if result.returncode != 0:
+        error = result.stderr.decode("utf-8", errors="replace")[:400].strip()
+        raise AdapterUnavailableError(f"go_parse_failed:{error}")
+
+
+def _run_syntax_tool(argv: Sequence[str]) -> subprocess.CompletedProcess[bytes]:
+    try:
+        return subprocess.run(
+            list(argv),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=2.0,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise AdapterUnavailableError(
+            f"syntax_tool_timeout:{os.path.basename(str(argv[0]))}"
+        ) from exc
+    except OSError as exc:
+        raise AdapterUnavailableError(
+            f"syntax_tool_failed:{os.path.basename(str(argv[0]))}:{exc.__class__.__name__}"
+        ) from exc
+
+
 def _source_values_at_indices(
     values: Sequence[int],
     indices: Sequence[int],
@@ -710,10 +1085,13 @@ __all__ = [
     "AdapterCapabilities",
     "ClangCodeMetadataAdapter",
     "CodeMetadataAdapter",
+    "GoCodeMetadataAdapter",
     "InferenceFailPolicy",
     "InferenceSideChannelBuilder",
     "InferenceSideChannelCacheComponents",
     "InferenceSideChannelResult",
+    "PythonCodeMetadataAdapter",
+    "RustCodeMetadataAdapter",
     "TokenMetadata",
     "UnavailableCodeMetadataAdapter",
     "builtin_code_metadata_adapters",
