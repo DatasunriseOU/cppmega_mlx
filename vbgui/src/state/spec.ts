@@ -119,6 +119,10 @@ export interface SpecState {
   gotchas: GotchaState[];
   worst_rank_bytes: number;
   device_hbm_bytes: number;
+  /** H11: actual Metal peak from extras.memory_peak_bytes (last Train).
+   *  Renders the "actual" half of the dual MemoryBar — left unset
+   *  until a Train run completes. */
+  actual_peak_bytes?: number;
   last_verify_ms: number;
   brick_count: number;
   backend_status: "connected" | "reconnecting" | "disconnected";
@@ -245,6 +249,7 @@ export type SpecAction =
   | { type: "sharding.set"; sharding: ShardingState }
   | { type: "gotchas.set"; gotchas: GotchaState[] }
   | { type: "memory.set"; worst_rank_bytes: number; device_hbm_bytes?: number }
+  | { type: "memory.actual_set"; actual_peak_bytes: number | undefined }
   | { type: "verify.complete"; elapsed_ms: number; brick_count: number }
   | { type: "backend.status"; status: SpecState["backend_status"] }
   | { type: "spec.replace"; spec: SpecState };
@@ -278,6 +283,9 @@ export function specReducer(s: SpecState, a: SpecAction): SpecState {
       ...s,
       worst_rank_bytes: a.worst_rank_bytes,
       device_hbm_bytes: a.device_hbm_bytes ?? s.device_hbm_bytes,
+    };
+    case "memory.actual_set": return {
+      ...s, actual_peak_bytes: a.actual_peak_bytes,
     };
     case "verify.complete": return {
       ...s, last_verify_ms: a.elapsed_ms, brick_count: a.brick_count,

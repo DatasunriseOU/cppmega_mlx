@@ -374,6 +374,13 @@ export function App(): JSX.Element {
         const trainStage = r.stages?.find((s) => s.name === "train");
         if (trainStage?.status === "ok") {
           setLastTrainRunId(activeTrainRunId);
+          // H11: surface the Metal peak alongside the verify estimate.
+          const peak = (trainStage as unknown as
+            { memory_peak_bytes?: number }).memory_peak_bytes;
+          if (typeof peak === "number" && peak > 0) {
+            dispatch({ type: "memory.actual_set",
+                       actual_peak_bytes: peak });
+          }
         }
       }
     } catch (e) {

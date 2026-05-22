@@ -245,4 +245,27 @@ describe("MemoryBar", () => {
     const fill = screen.getByTestId("memory-bar-fill");
     expect(fill.getAttribute("style")).toContain("width: 50%");
   });
+
+  it("H11: estimate testid always present, actual hidden until set",
+    () => {
+      const s = { ...INITIAL_SPEC,
+                  worst_rank_bytes: 10 * 1024 ** 3,
+                  device_hbm_bytes: 80 * 1024 ** 3 };
+      render(<MemoryBar state={s} />);
+      expect(screen.getByTestId("memory-bar-estimate").textContent)
+        .toContain("est");
+      expect(screen.queryByTestId("memory-bar-actual")).toBeNull();
+    });
+
+  it("H11: actual testid appears once actual_peak_bytes is set", () => {
+    const s = { ...INITIAL_SPEC,
+                worst_rank_bytes: 10 * 1024 ** 3,
+                device_hbm_bytes: 80 * 1024 ** 3,
+                actual_peak_bytes: 12 * 1024 ** 3 };
+    render(<MemoryBar state={s} />);
+    expect(screen.getByTestId("memory-bar-estimate").textContent)
+      .toContain("10.00 GB");
+    expect(screen.getByTestId("memory-bar-actual").textContent)
+      .toContain("12.00 GB");
+  });
 });
