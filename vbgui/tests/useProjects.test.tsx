@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { renderHook, act } from "@testing-library/react";
+import { renderHook, act, waitFor } from "@testing-library/react";
 import { useProjects } from "@/hooks/useProjects";
 
 describe("V7-H02 useProjects", () => {
@@ -76,10 +76,14 @@ describe("V7-H02 useProjects", () => {
     expect(aa?.payload).toEqual({ v: 1 });
   });
 
-  it.skip("hydrates from localStorage on next mount (jsdom stub does not persist across renderHook)", () => {
+  it("hydrates from localStorage on next mount", async () => {
     const { result, unmount } = renderHook(
       () => useProjects<{ v: number }>());
     act(() => { result.current.create("alpha", { v: 1 }); });
+    await waitFor(() => {
+      expect(window.localStorage.getItem("vbgui_projects_v1"))
+        .not.toBeNull();
+    });
     unmount();
     // Fresh mount — should see the persisted project.
     const { result: r2 } = renderHook(
