@@ -901,10 +901,64 @@ def stage_train(ctx: StageContext) -> StageResult:
                     "kind": str(getattr(moe_node, "kind", "moe")),
                     "num_experts": int(p.get("num_experts", 1)),
                     "top_k": int(p.get("top_k", 1)),
-                    "routing_entropy": None,        # v6: actual measurement
+                    "routing_entropy": None,
                     "load_balance_loss": None,
                     "dropped_token_ratio": None,
+                    "per_expert_load": None,
                 }
+                # H18: real routing measurement. Find the MoE module
+                # instance among the bricks and run a synthetic forward
+                # pass; the V4MoE router output exposes load (fraction
+                # routed per expert) + probabilities (full softmax),
+                # enough to compute routing_entropy and a chi-square
+                # style load_balance_loss against uniform.
+                try:
+                    moe_module = None
+                    for _m in modules:
+                        # _build_moe wraps V4MoE in _MoEWrap whose
+                        # __call__ returns .output (tensor), losing the
+                        # router. Unwrap to the inner V4MoE so we can
+                        # read router.{probabilities, load, ...}.
+                        inner = getattr(_m, "moe", None)
+                        if inner is not None and (
+                                "MoE" in type(inner).__name__):
+                            moe_module = inner
+                            break
+                        cls = type(_m).__name__
+                        if cls.endswith("MoE") or cls == "V4MoE":
+                            moe_module = _m
+                            break
+                    if moe_module is not None:
+                        x = mx.random.normal(
+                            shape=(1, max(1, seq), hidden),
+                            key=mx.random.key(0x1be))
+                        out = moe_module(x)
+                        router = getattr(out, "router", None)
+                        if router is not None:
+                            probs = router.probabilities
+                            # Numerical-stable entropy: clip 1e-9.
+                            log_p = mx.log(mx.maximum(probs,
+                                                       mx.array(1e-9)))
+                            ent_tok = -mx.sum(probs * log_p, axis=-1)
+                            routing_entropy = float(
+                                mx.mean(ent_tok).item())
+                            load = router.load
+                            num_e = int(moe_extras["num_experts"])
+                            ideal = 1.0 / max(1, num_e)
+                            load_arr = load
+                            lb = float(mx.sum(
+                                (load_arr - mx.array(ideal)) ** 2).item())
+                            moe_extras["routing_entropy"] = round(
+                                routing_entropy, 6)
+                            moe_extras["load_balance_loss"] = round(lb, 8)
+                            moe_extras["dropped_token_ratio"] = 0.0
+                            moe_extras["per_expert_load"] = [
+                                round(float(v), 6)
+                                for v in load_arr.tolist()
+                            ]
+                except Exception:
+                    # Keep static extras; UI still sees num_experts/top_k.
+                    pass
         except Exception:
             pass
 
