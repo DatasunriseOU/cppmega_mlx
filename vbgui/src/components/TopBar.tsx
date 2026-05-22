@@ -23,6 +23,12 @@ export interface TopBarProps {
   /** H02: toggle callbacks. */
   onMixedPrecisionChange?: (enabled: boolean) => void;
   onFp8EnabledChange?: (enabled: boolean) => void;
+  /** V7-H03 undo/redo controls. Buttons render only when callbacks
+   *  provided so unit tests for default TopBar are unaffected. */
+  onUndo?: () => void;
+  onRedo?: () => void;
+  canUndo?: boolean;
+  canRedo?: boolean;
   /** H03: cancel the currently in-flight Train run. */
   trainInFlight?: boolean;
   trainRunId?: string | null;
@@ -110,6 +116,18 @@ export function TopBar(p: TopBarProps): JSX.Element {
         </label>
       )}
 
+      {p.onUndo && (
+        <button data-testid="top-bar-undo"
+                onClick={p.onUndo}
+                disabled={!p.canUndo}
+                title="Undo (Cmd/Ctrl+Z)">↶</button>
+      )}
+      {p.onRedo && (
+        <button data-testid="top-bar-redo"
+                onClick={p.onRedo}
+                disabled={!p.canRedo}
+                title="Redo (Shift+Cmd/Ctrl+Z)">↷</button>
+      )}
       {p.onSaveSpec && (
         <button data-testid="spec-save" onClick={p.onSaveSpec}>Save</button>
       )}

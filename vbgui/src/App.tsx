@@ -22,6 +22,7 @@ import {
   INITIAL_SPEC, specReducer, type SpecState, type TopologyFactory,
 } from "@/state/spec";
 import { migrate } from "@/state/migrations";
+import { useHistory } from "@/hooks/useHistory";
 import type { ShardingProposalView } from "@/components/sidebar/ShardingTab";
 
 // PRESETS list is now fetched dynamically from the backend via
@@ -90,6 +91,18 @@ export function App(): JSX.Element {
   const [projectName, setProjectName] = useState("untitled");
   const [proposals, setProposals] = useState<ShardingProposalView[]>([]);
   const [spec, dispatch] = useReducer(specReducer, INITIAL_SPEC);
+  // V7-H03: bounded undo/redo. Snapshot is the (nodes, edges, spec)
+  // triple captured on every Verify cycle (cheap proxy for any
+  // user-meaningful mutation that landed). Undo/redo restore the
+  // snapshot triple in one shot.
+  const history = useHistory<{ nodes: Node[]; edges: Edge[];
+                                spec: SpecState }>(50);
+  const lastHistoryKeyRef = useRef<string>("");
+  // V7-H03: when undo/redo applies a snapshot back, the resulting
+  // state-change effect would otherwise push that snapshot AGAIN
+  // and clear the redo stack. This ref lets the apply-path skip
+  // the next push.
+  const suppressNextHistoryPushRef = useRef<boolean>(false);
   const [activeTab, setActiveTab] = useState<AppTab>("canvas");
   const [runReport, setRunReport] = useState<RunReport | null>(null);
   const [runError, setRunError] = useState<string | null>(null);
@@ -210,6 +223,57 @@ export function App(): JSX.Element {
            [nodesKey, edgesKey, lossKey, optimKey, shardingKey,
             rewriterKey, sideChannelKey, availableSideChannelKey,
             scheduleVerify]);
+
+  // V7-H03: snapshot the (nodes, edges, spec) triple every time a
+  // structural key changes — that's the same set of user-meaningful
+  // mutations the verify debouncer reacts to.
+  useEffect(() => {
+    const key = `${nodesKey}|${edgesKey}|${lossKey}|${optimKey}|`
+      + `${shardingKey}|${rewriterKey}|${sideChannelKey}`;
+    if (key === lastHistoryKeyRef.current) return;
+    lastHistoryKeyRef.current = key;
+    if (suppressNextHistoryPushRef.current) {
+      suppressNextHistoryPushRef.current = false;
+      return;
+    }
+    history.push({ nodes, edges, spec });
+  }, [nodesKey, edgesKey, lossKey, optimKey, shardingKey,
+      rewriterKey, sideChannelKey, history, nodes, edges, spec]);
+
+  const handleUndo = useCallback(() => {
+    const prev = history.undo();
+    if (prev) {
+      suppressNextHistoryPushRef.current = true;
+      setNodes(prev.nodes);
+      setEdges(prev.edges);
+      dispatch({ type: "spec.replace", spec: prev.spec });
+    }
+  }, [history]);
+  const handleRedo = useCallback(() => {
+    const nxt = history.redo();
+    if (nxt) {
+      suppressNextHistoryPushRef.current = true;
+      setNodes(nxt.nodes);
+      setEdges(nxt.edges);
+      dispatch({ type: "spec.replace", spec: nxt.spec });
+    }
+  }, [history]);
+
+  // V7-H03: Cmd/Ctrl+Z = undo, Shift+Cmd/Ctrl+Z = redo.
+  useEffect(() => {
+    function onKey(ev: KeyboardEvent) {
+      const meta = ev.metaKey || ev.ctrlKey;
+      if (!meta || ev.key.toLowerCase() !== "z") return;
+      // Don't intercept inside text inputs.
+      const tag = (ev.target as HTMLElement | null)?.tagName ?? "";
+      if (tag === "INPUT" || tag === "TEXTAREA") return;
+      ev.preventDefault();
+      if (ev.shiftKey) handleRedo();
+      else handleUndo();
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [handleUndo, handleRedo]);
 
   // ----- Handlers ----------------------------------------------------------
 
@@ -459,6 +523,10 @@ export function App(): JSX.Element {
           trainInFlight={trainInFlight}
           trainRunId={trainRunId}
           onCancelTrain={handleCancelTrain}
+          onUndo={handleUndo}
+          onRedo={handleRedo}
+          canUndo={history.canUndo}
+          canRedo={history.canRedo}
           onMixedPrecisionChange={(enabled) => dispatch({ type: "optim.set",
             optim: { ...spec.optim, mixed_precision: enabled } })}
           onFp8EnabledChange={(enabled) => dispatch({ type: "sharding.set",
