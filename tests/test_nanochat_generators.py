@@ -14,6 +14,7 @@ from cppmega_mlx.data.parquet_dataset import (
     MultiShardTokenParquetDataset,
     TokenParquetDataset,
 )
+from cppmega_mlx.data.packing import document_boundary_mask
 from cppmega_mlx.data.nanochat_pipeline import platform_vocab
 from cppmega_mlx.data.nanochat_pipeline import tokenized_enriched_schema as schema
 from cppmega_mlx.data.nanochat_pipeline.build_context import (
@@ -23,7 +24,17 @@ from cppmega_mlx.data.nanochat_pipeline.build_context import (
 from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched import (
     materialize_tokenized_enriched_batch,
 )
+from cppmega_v4.data.doc_id_assignment import (
+    assign_sharded_doc_ids,
+    write_doc_id_manifest,
+)
 from scripts.nanochat_data import clang_enriched_to_parquet
+from scripts.nanochat_data.pack_enriched_rows import (
+    DOC_IDS_COLUMN,
+    INPUT_IDS_COLUMN,
+    read_tokenized_documents,
+    pack_documents,
+)
 from scripts.nanochat_data.token_budget import chunk_enriched_document, load_tokenizer
 from tools.clang_indexer import index_project
 from tools.clang_indexer.index_project import FunctionDef, PartInfo
@@ -101,6 +112,7 @@ def test_clang_enriched_docs_to_table_carries_token_semantic_columns() -> None:
     rows = [
         {
             "text": "int main() { return f(); }",
+            "source_doc_id": "demo.cc@main",
             "actual_token_count": 4,
             "structure_ids": [3, 3, 3, 3],
             "chunk_boundaries": [{"start": 0, "end": 24, "kind": 3, "dep_level": 0}],
@@ -130,6 +142,7 @@ def test_clang_enriched_docs_to_table_carries_token_semantic_columns() -> None:
         tokenized_rows=tokenized_rows,
     )
 
+    assert table.column("source_doc_id").to_pylist() == ["demo.cc@main"]
     for column in (
         "ast_depth",
         "sibling_index",
@@ -232,6 +245,10 @@ def test_local_parquet_conversion_streams_row_groups(tmp_path: Path) -> None:
     assert summary == {"docs_in": 2, "docs_out": 2}
     assert parquet_file.metadata.num_rows == 2
     assert parquet_file.metadata.num_row_groups == 2
+    assert parquet_file.read(columns=["source_doc_id"]).column("source_doc_id").to_pylist() == [
+        "input.jsonl:1",
+        "input.jsonl:2",
+    ]
 
 
 def test_multi_shard_parquet_stream_matches_one_by_one_shard_order(
@@ -259,6 +276,79 @@ def test_multi_shard_parquet_stream_matches_one_by_one_shard_order(
         batch.metadata["parquet_stream"]["shard_index"]
         for batch in streamed.iter_batches(loop=False)
     ] == [0, 0, 1]
+
+
+def test_cross_shard_doc_id_manifest_reconstructs_boundary_spanning_doc(
+    tmp_path: Path,
+) -> None:
+    shards = [
+        [{"source_doc_id": "alpha", "token_ids": [1, 2], "text": "ab"}],
+        [
+            {"source_doc_id": "alpha", "token_ids": [3, 4], "text": "cd"},
+            {"source_doc_id": "beta", "token_ids": [9], "text": "x"},
+        ],
+        [{"source_doc_id": "alpha", "token_ids": [5, 6], "text": "ef"}],
+    ]
+
+    assignment = assign_sharded_doc_ids(shards)
+    alpha_id = assignment.doc_ids_by_shard[0][0]
+
+    assert assignment.doc_ids_by_shard[1][0] == alpha_id
+    assert assignment.doc_ids_by_shard[2][0] == alpha_id
+    assert assignment.doc_ids_by_shard[1][1] != alpha_id
+    assert assignment.manifest[str(alpha_id)] == [
+        {"shard_index": 0, "start_row": 0, "end_row": 1},
+        {"shard_index": 1, "start_row": 0, "end_row": 1},
+        {"shard_index": 2, "start_row": 0, "end_row": 1},
+    ]
+    manifest_path = tmp_path / "doc_id_manifest.json"
+    write_doc_id_manifest(manifest_path, assignment)
+    sidecar = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert sidecar["schema"] == "cppmega_doc_id_manifest_v1"
+    assert sidecar["manifest"][str(alpha_id)] == assignment.manifest[str(alpha_id)]
+
+    reconstructed: list[int] = []
+    for span in assignment.manifest[str(alpha_id)]:
+        for row in shards[span["shard_index"]][span["start_row"]:span["end_row"]]:
+            reconstructed.extend(row["token_ids"])
+    assert reconstructed == [1, 2, 3, 4, 5, 6]
+
+    alpha_mask = document_boundary_mask([[alpha_id] * len(reconstructed)], causal=True)
+    assert bool(alpha_mask[0, 2, 1])
+    assert bool(alpha_mask[0, 4, 3])
+
+
+def test_pack_enriched_rows_preserves_source_doc_id_across_input_shards(
+    tmp_path: Path,
+) -> None:
+    shard0 = tmp_path / "train_00000.parquet"
+    shard1 = tmp_path / "train_00001.parquet"
+    pq.write_table(
+        pa.table({"token_ids": [[1, 2]], "source_doc_id": ["alpha"]}),
+        shard0,
+    )
+    pq.write_table(
+        pa.table(
+            {
+                "token_ids": [[3, 4], [9, 10]],
+                "source_doc_id": ["alpha", "beta"],
+            }
+        ),
+        shard1,
+    )
+
+    docs = read_tokenized_documents(tmp_path)
+    rows, overflow = pack_documents(
+        docs,
+        target_length=6,
+        pad_token_id=0,
+        strategy="sequential",
+    )
+
+    assert overflow == []
+    assert rows[0][INPUT_IDS_COLUMN] == [1, 2, 3, 4, 9, 10]
+    assert rows[0][DOC_IDS_COLUMN][0] == rows[0][DOC_IDS_COLUMN][2]
+    assert rows[0][DOC_IDS_COLUMN][3] != rows[0][DOC_IDS_COLUMN][4]
 
 
 def test_token_budget_slices_semantic_char_metadata() -> None:

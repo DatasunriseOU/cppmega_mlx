@@ -19,6 +19,7 @@ from typing import Any, SupportsInt
 import pyarrow as pa  # type: ignore[import-not-found]
 import pyarrow.parquet as pq  # type: ignore[import-not-found]
 
+from cppmega_v4.data.doc_id_assignment import stable_doc_signature
 from cppmega_mlx.data.nanochat_pipeline.packed_rows_schema import (
     CHANGED_CHUNK_IDS_COLUMN,
     CHANGED_CHUNK_SPANS_COLUMN,
@@ -85,6 +86,7 @@ SLACK_TOKENS_COLUMN = "slack_tokens"
 SOURCE_DOC_INDICES_COLUMN = SOURCE_DOC_IDS_COLUMN
 SOURCE_DOC_TOKEN_LENGTHS_COLUMN = "source_doc_token_lengths"
 SOURCE_PLATFORM_IDS_COLUMN = "source_platform_ids"
+SOURCE_DOC_ID_COLUMN = "source_doc_id"
 
 PACKED_TOKEN_METADATA_COLUMNS = PACKED_ROWS_TOKEN_METADATA_COLUMNS
 PACKED_CHUNK_METADATA_COLUMNS = PACKED_ROWS_CHUNK_METADATA_COLUMNS
@@ -169,6 +171,7 @@ class NormalizedDoc:
     """A normalized per-document row ready for offline packing."""
 
     source_doc_index: int
+    stable_doc_id: int
     token_ids: list[int]
     token_meta: dict[str, list[int]]
     chunk_starts: list[int]
@@ -189,6 +192,7 @@ class NormalizedDoc:
     def to_overflow_record(self) -> dict[str, Any]:
         record = {
             "source_doc_index": int(self.source_doc_index),
+            SOURCE_DOC_ID_COLUMN: int(self.stable_doc_id),
             "token_count": int(self.token_count),
             TOKEN_IDS_COLUMN: list(self.token_ids),
             PLATFORM_IDS_COLUMN: list(self.platform_ids),
@@ -535,6 +539,7 @@ def normalize_document_record(
     record: dict[str, Any],
     *,
     source_doc_index: int,
+    stable_doc_id: int | None = None,
 ) -> NormalizedDoc:
     """Validate and normalize one input parquet record."""
 
@@ -566,6 +571,7 @@ def normalize_document_record(
 
     return NormalizedDoc(
         source_doc_index=int(source_doc_index),
+        stable_doc_id=int(source_doc_index + 1 if stable_doc_id is None else stable_doc_id),
         token_ids=token_ids,
         token_meta=token_meta,
         chunk_starts=chunk_starts,
@@ -595,11 +601,46 @@ def _list_input_files(input_path: str | os.PathLike[str]) -> list[Path]:
     raise FileNotFoundError(f"Input path does not exist: {path}")
 
 
+def _has_stable_doc_signature(record: dict[str, Any]) -> bool:
+    explicit = (
+        SOURCE_DOC_ID_COLUMN,
+        "source_document_id",
+        "document_id",
+        "doc_id",
+    )
+    if any(record.get(column) is not None for column in explicit):
+        return True
+    provenance = (
+        REPO_STABLE_ID_COLUMN,
+        FILEPATH_STABLE_ID_COLUMN,
+        COMMIT_HASH_COLUMN,
+        FILE_LOCAL_COMMIT_INDEX_COLUMN,
+    )
+    return any(record.get(column) is not None for column in provenance)
+
+
+def _stable_doc_id_for_record(
+    record: dict[str, Any],
+    *,
+    source_doc_index: int,
+    signature_to_id: dict[str, int],
+) -> int:
+    if not _has_stable_doc_signature(record):
+        return int(source_doc_index + 1)
+    signature = stable_doc_signature(record)
+    doc_id = signature_to_id.get(signature)
+    if doc_id is None:
+        doc_id = len(signature_to_id) + 1
+        signature_to_id[signature] = doc_id
+    return int(doc_id)
+
+
 def read_tokenized_documents(input_path: str | os.PathLike[str]) -> list[NormalizedDoc]:
     """Read tokenized per-document parquet rows from a file or directory."""
 
     docs: list[NormalizedDoc] = []
     source_doc_index = 0
+    signature_to_id: dict[str, int] = {}
     for path in _list_input_files(input_path):
         parquet_file = pq.ParquetFile(path)
         available = set(parquet_file.schema_arrow.names)
@@ -610,6 +651,10 @@ def read_tokenized_documents(input_path: str | os.PathLike[str]) -> list[Normali
             column
             for column in (
                 TOKEN_IDS_COLUMN,
+                SOURCE_DOC_ID_COLUMN,
+                "source_document_id",
+                "document_id",
+                "doc_id",
                 PLATFORM_IDS_COLUMN,
                 *RAW_COMMIT_CHRONOLOGY_COLUMNS,
                 *PACKED_TOKEN_METADATA_COLUMNS,
@@ -624,6 +669,11 @@ def read_tokenized_documents(input_path: str | os.PathLike[str]) -> list[Normali
                     normalize_document_record(
                         record,
                         source_doc_index=source_doc_index,
+                        stable_doc_id=_stable_doc_id_for_record(
+                            record,
+                            source_doc_index=source_doc_index,
+                            signature_to_id=signature_to_id,
+                        ),
                     )
                 )
                 source_doc_index += 1
@@ -768,7 +818,8 @@ def _materialize_packed_row(
 
     token_offset = 0
     chunk_offset = 0
-    for doc_id, doc in enumerate(ordered_docs, start=1):
+    for doc in ordered_docs:
+        doc_id = max(0, int(doc.stable_doc_id))
         concatenated_tokens.extend(doc.token_ids)
         doc_ids.extend([doc_id] * doc.token_count)
         source_doc_indices.append(doc.source_doc_index)
@@ -824,7 +875,7 @@ def _materialize_packed_row(
         _loss_mask_for_packed_docs(doc_ids, target_length=valid_token_count)
     )
     slack_tokens = target_length - valid_token_count
-    pad_doc_id = len(ordered_docs) if ordered_docs else 0
+    pad_doc_id = max(len(ordered_docs), max(doc_ids, default=0)) if doc_ids else 0
 
     row: dict[str, Any] = {
         PACK_ID_COLUMN: int(pack_id),

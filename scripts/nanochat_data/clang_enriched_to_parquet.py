@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: E402
 """Convert Clang-enriched clang-indexer JSONL to hard-budgeted parquet.
 
 Reads gs://nanochat-training-data-2026/v5_enriched/*.jsonl.gz, applies:
@@ -251,6 +252,7 @@ def maybe_keep_document_exact(doc: dict, tokenizer, max_tokens: int) -> list[dic
 
 _SCHEMA = pa.schema([
     pa.field("text", pa.string()),
+    pa.field("source_doc_id", pa.string()),
     pa.field("actual_token_count", pa.int32()),
     pa.field("structure_ids", pa.list_(pa.int8())),
     pa.field("chunk_boundaries", pa.list_(pa.struct([
@@ -344,6 +346,7 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
     """Convert a list of doc dicts to a PyArrow table."""
     tokenized_rows = tokenized_rows or [{} for _ in rows]
     texts = []
+    source_doc_ids = []
     token_counts = []
     structure_ids_col = []
     chunk_boundaries_col = []
@@ -401,6 +404,10 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
 
     for row, tokenized in zip(rows, tokenized_rows):
         texts.append(row.get("text", ""))
+        raw_source_doc_id = row.get("source_doc_id")
+        source_doc_ids.append(
+            None if raw_source_doc_id is None else str(raw_source_doc_id)
+        )
         token_counts.append(int(row.get("actual_token_count", 0)))
         structure_ids_col.append(row.get("structure_ids", []))
         # Normalize chunk boundaries
@@ -521,6 +528,9 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
     return pa.table(
         {
             "text": pa.array(texts, type=_SCHEMA.field("text").type),
+            "source_doc_id": pa.array(
+                source_doc_ids, type=_SCHEMA.field("source_doc_id").type
+            ),
             "actual_token_count": pa.array(
                 token_counts, type=_SCHEMA.field("actual_token_count").type
             ),
@@ -909,6 +919,9 @@ def convert_local_jsonl_to_parquet(
                     max_tokens,
                     overflow_policy=overflow_policy,
                 )
+                source_doc_id = record.get("source_doc_id", f"{source.name}:{docs_in}")
+                for sub_doc in sub_docs:
+                    sub_doc.setdefault("source_doc_id", source_doc_id)
                 rows.extend(sub_docs)
                 docs_out += len(sub_docs)
                 if len(rows) >= local_batch_size:
@@ -991,6 +1004,9 @@ def process_input_file(gcs_uri: str, tmpdir: str,
                     max_tokens,
                     overflow_policy=overflow_policy,
                 )
+            source_doc_id = record.get("source_doc_id", f"{fname}:{docs_in}")
+            for sub_doc in sub_docs:
+                sub_doc.setdefault("source_doc_id", source_doc_id)
             output_rows.extend(sub_docs)
             docs_out += len(sub_docs)
             if docs_in % 1000 == 0:
