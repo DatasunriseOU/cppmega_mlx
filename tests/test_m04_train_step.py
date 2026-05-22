@@ -4133,6 +4133,51 @@ def test_fp8_path_c_training_route_for_model_auto_binds_model_training_runtime(
     assert lowerer_calls[0]["target"] == "metal"
 
 
+def test_path_c_fusion_payload_reads_model_bound_fused_train_block_runtime(
+    tmp_path: Path,
+    path_c_fusion_auto_env: None,
+) -> None:
+    del path_c_fusion_auto_env
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--synthetic",
+            "--dtype",
+            "fp8_path_c",
+            "--pattern",
+            "A",
+            "--depth",
+            "1",
+            "--dsa-a-layer-ranks",
+            "0",
+            "--output",
+            str(tmp_path / "receipt.json"),
+        ]
+    )
+    config = m04_train_step.config_from_args(args, data_path=tmp_path / "tokens.npz")
+    model = build_local_gb10_quarter_tiny_smoke_model()
+    sequence_length = m04_train_step.path_c_training_sequence_length(config)
+    model.path_c_physical_abi_bank_owner = _model_route_physical_bank_owner(
+        model,
+        sequence_length=sequence_length,
+    )
+    model.path_c_fused_train_block_artifact = lambda *args: None
+    model.path_c_fused_train_block_training_runtime = (
+        _ReadyFusedTrainBlockTrainingRuntime()
+    )
+
+    payload = m04_train_step.path_c_fusion_payload(
+        model=model,
+        sequence_length=sequence_length,
+    )
+
+    assert payload["runtime_training_binding"]["status"] == "ok"
+    assert payload["runtime_training_binding"]["runtime_uses_fused_train_block"] is True
+    assert payload["fused_train_block_training_runtime_contract"]["status"] == "ok"
+    assert "fused_train_block_runtime_not_bound" not in {
+        blocker["kind"] for blocker in payload["schedule_blockers"]
+    }
+
+
 def test_path_c_fused_train_block_runtime_installer_binds_model_owned_banks(
     tmp_path: Path,
     path_c_fusion_auto_env: None,
@@ -4980,6 +5025,55 @@ def test_path_c_direct_chain_runtime_rebuilds_pre_step_owner_on_step(
     assert route_after_capture["path_c_fusion"]["direct_chained_fusion"][
         "runtime_binding"
     ]["logical_buffer_owner"] == runtime.last_pre_step_owner.owner_name
+
+
+def test_path_c_fusion_payload_reads_model_bound_direct_chain_runtime(
+    path_c_fusion_auto_env: None,
+) -> None:
+    del path_c_fusion_auto_env
+    model = build_local_gb10_quarter_tiny_smoke_model()
+    chain = _model_route_direct_chain(model)
+    seq_len = 512
+    tokens = mx.arange(seq_len + 1, dtype=mx.int32)[None, :]
+    tokens = tokens % mx.array(model.config.vocab_size, dtype=mx.int32)
+
+    def owner_factory(
+        model_arg: nn.Module,
+        batch: Mapping[str, mx.array],
+    ) -> PathCLogicalBufferOwner:
+        return m04_train_step.make_path_c_direct_chain_pre_step_runtime_owner(
+            chain=chain,
+            model=model_arg,
+            batch=batch,
+        )
+
+    initial_owner = owner_factory(model, {"tokens": tokens})
+    install_payload = (
+        m04_train_step.install_path_c_direct_chain_training_runtime_for_model(
+            model=model,
+            chain=chain,
+            artifacts=_model_route_direct_chain_artifacts(model),
+            logical_owner=initial_owner,
+            training_critical_path=True,
+            loss_cotangent_bridge=m04_train_step.PathCResidualSumSuffixLossCotangentBridge(
+                chunk_rows=128,
+            ),
+            pre_step_owner_factory=owner_factory,
+        )
+    )
+
+    payload = m04_train_step.path_c_fusion_payload(
+        model=model,
+        sequence_length=seq_len,
+    )
+
+    assert install_payload["status"] == "ok"
+    direct_chain = payload["direct_chained_fusion"]
+    assert direct_chain["runtime_binding"]["runtime_uses_direct_fusion_chain"] is True
+    assert direct_chain["training_runtime_contract"]["status"] == "ok"
+    assert "fused_train_block_runtime_not_bound" not in {
+        blocker["kind"] for blocker in payload["schedule_blockers"]
+    }
 
 
 def test_path_c_fusion_payload_reports_model_level_direct_chain_planner() -> None:

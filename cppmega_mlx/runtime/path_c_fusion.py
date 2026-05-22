@@ -17,6 +17,7 @@ import json
 import os
 from typing import Any, Callable, Mapping, Sequence
 
+import mlx.core as mx
 
 __all__ = [
     "BenchmarkAcceptanceRow",
@@ -40,6 +41,7 @@ __all__ = [
     "PathCModelBrick",
     "PathCModelShapeEnv",
     "PathCPlanDefaultEligibilityAudit",
+    "PathCSemanticGraphSideChannelBatch",
     "SparseMLAFp8PrepareSpec",
     "WarmCacheAudit",
     "Z3SyncSpec",
@@ -62,6 +64,7 @@ __all__ = [
     "fused_path_c_plan_default_eligible",
     "mamba3_fp8_train_schedule_status_from_prim_funcs",
     "mark_path_c_schedule_template_for_region",
+    "path_c_semantic_graph_side_channel_batch",
     "path_b_baseline_is_clean",
     "selected_path_c_fusion_mode",
     "tilelang_single_entry_lowerer",
@@ -418,6 +421,104 @@ class PathCModelShapeEnv:
     @property
     def m2rnn_in_proj_dim(self) -> int:
         return self.m2rnn_conv_dim + self.m2rnn_num_f_heads + self.m2rnn_g_dim
+
+
+@dataclass(frozen=True)
+class PathCSemanticGraphSideChannelBatch:
+    """Caller-owned semantic graph edge tensors for Path C schedule ABIs."""
+
+    call_edges: mx.array | None
+    call_edge_mask: mx.array | None
+    type_edges: mx.array | None
+    type_edge_mask: mx.array | None
+    call_edge_count: int
+    type_edge_count: int
+
+    @property
+    def available(self) -> bool:
+        return self.call_edges is not None or self.type_edges is not None
+
+
+def path_c_semantic_graph_side_channel_batch(
+    batch: Any,
+) -> PathCSemanticGraphSideChannelBatch:
+    """Normalize LM semantic graph side-channel tensors for Path C runtimes."""
+
+    from cppmega_mlx.data.batch import ensure_lm_batch
+
+    lm_batch = ensure_lm_batch(batch)
+    semantic_graph = (lm_batch.side_channels or {}).get("semantic_graph", {})
+    call_edges = _optional_path_c_edge_tensor(semantic_graph, "token_call_edges")
+    call_mask = _optional_path_c_edge_mask(
+        semantic_graph,
+        "token_call_edges_mask",
+        edges=call_edges,
+    )
+    type_edges = _optional_path_c_edge_tensor(semantic_graph, "token_type_edges")
+    type_mask = _optional_path_c_edge_mask(
+        semantic_graph,
+        "token_type_edges_mask",
+        edges=type_edges,
+    )
+    return PathCSemanticGraphSideChannelBatch(
+        call_edges=call_edges,
+        call_edge_mask=call_mask,
+        type_edges=type_edges,
+        type_edge_mask=type_mask,
+        call_edge_count=_path_c_edge_count(call_mask),
+        type_edge_count=_path_c_edge_count(type_mask),
+    )
+
+
+def _optional_path_c_edge_tensor(
+    semantic_graph: Mapping[str, Any],
+    name: str,
+) -> mx.array | None:
+    value = semantic_graph.get(name)
+    if value is None:
+        return None
+    if not isinstance(value, mx.array):
+        raise ValueError(f"{name} must be an mlx array")
+    if value.ndim != 3 or int(value.shape[-1]) != 2:
+        raise ValueError(f"{name} must be shaped (B, E, 2), got {value.shape}")
+    if str(value.dtype).rsplit(".", 1)[-1] != "int32":
+        raise ValueError(f"{name} must be int32, got {value.dtype}")
+    return value
+
+
+def _optional_path_c_edge_mask(
+    semantic_graph: Mapping[str, Any],
+    name: str,
+    *,
+    edges: mx.array | None,
+) -> mx.array | None:
+    value = semantic_graph.get(name)
+    if edges is None:
+        if value is not None:
+            raise ValueError(f"{name} was provided without its edge tensor")
+        return None
+    if value is None:
+        raise ValueError(f"{name} is required when {name.removesuffix('_mask')} is set")
+    if not isinstance(value, mx.array):
+        raise ValueError(f"{name} must be an mlx array")
+    if value.ndim != 2 or tuple(int(dim) for dim in value.shape) != tuple(
+        int(dim) for dim in edges.shape[:2]
+    ):
+        raise ValueError(
+            f"{name} must match edge shape prefix {edges.shape[:2]}, got {value.shape}"
+        )
+    dtype = str(value.dtype).rsplit(".", 1)[-1]
+    if dtype not in {"bool", "int32"}:
+        raise ValueError(f"{name} must be bool or int32, got {value.dtype}")
+    return value if dtype == "int32" else value.astype(mx.int32)
+
+
+def _path_c_edge_count(mask: mx.array | None) -> int:
+    if mask is None:
+        return 0
+    total = mx.sum(mask.astype(mx.int32))
+    mx.eval(total)
+    return int(total.item())
 
 
 @dataclass(frozen=True)

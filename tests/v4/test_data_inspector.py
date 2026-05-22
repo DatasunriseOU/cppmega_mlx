@@ -25,6 +25,23 @@ def _write_full_parquet(p: Path, n_rows: int = 32):
     }), p)
 
 
+def _write_real_edge_parquet(p: Path):
+    pq.write_table(pa.table({
+        "input_ids": [
+            list(range(8)),
+            list(range(8, 16)),
+        ],
+        "call_edges": [
+            [{"from": 5, "to": 10}, {"from": 12, "to": 3}],
+            [],
+        ],
+        "type_edges": [
+            [{"from": 2, "to": 42}],
+            [{"from": 8, "to": 9}],
+        ],
+    }), p)
+
+
 # ---------------------------------------------------------------------------
 # preview_parquet
 # ---------------------------------------------------------------------------
@@ -56,6 +73,29 @@ def test_preview_carries_channel_payload_per_row(tmp_path: Path):
     assert len(first.tokens) > 0
     assert "doc_ids" in first.channels
     assert "loss_mask" in first.channels
+
+
+def test_preview_reports_real_clang_edge_distributions(tmp_path: Path):
+    p = tmp_path / "real_edges.parquet"
+    _write_real_edge_parquet(p)
+
+    r = preview_parquet(PreviewParquetParams(path=str(p), offset=0, limit=2))
+
+    call_edges = r.edge_distributions["call_edges"]
+    assert call_edges.edge_count == 2
+    assert call_edges.non_empty_rows == 1
+    assert call_edges.min_node_id == 3
+    assert call_edges.max_node_id == 12
+    assert call_edges.distinct_node_count == 4
+    assert call_edges.per_row_max == 2
+    assert call_edges.sample_edges == [{"from": 5, "to": 10}, {"from": 12, "to": 3}]
+    assert call_edges.synthetic_0_to_7_only is False
+
+    type_edges = r.edge_distributions["type_edges"]
+    assert type_edges.edge_count == 2
+    assert type_edges.non_empty_rows == 2
+    assert type_edges.max_node_id == 42
+    assert type_edges.synthetic_0_to_7_only is False
 
 
 def test_preview_pagination_offset_works(tmp_path: Path):

@@ -8,8 +8,10 @@ import math
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten
+import numpy as np
 import pytest
 
+from cppmega_mlx.data.batch import LMTokenBatch
 from cppmega_mlx.models.hybrid_lm import (
     HybridTinyBlock,
     HybridTinyConfig,
@@ -21,6 +23,12 @@ from cppmega_mlx.nn.concept import ConceptBlock, ConceptBlockConfig
 from cppmega_mlx.nn.engram import EngramBranch
 from cppmega_mlx.recipes.model_factory import build_local_gb10_quarter_tiny_smoke_model
 from cppmega_mlx.recipes.pattern import expand_nam_pattern, parse_nam_pattern
+from cppmega_mlx.runtime.path_c_fusion import (
+    path_c_semantic_graph_side_channel_batch,
+)
+from cppmega_mlx.runtime.path_c_fusion_schedules import (
+    path_c_semantic_graph_schedule_inputs,
+)
 from cppmega_mlx.training.mtp import MinimalMTPHead
 
 
@@ -246,6 +254,40 @@ def test_path_c_activation_probe_captures_vjp_cotangents_without_copy():
     assert capture.buffers["hidden_grad"] is capture.buffers[
         "layer_0_m_hidden_grad"
     ]
+
+
+def test_path_c_semantic_graph_edges_match_indexer_shape_and_dtype():
+    batch = LMTokenBatch(
+        tokens=mx.array([[1, 2, 3, 4]], dtype=mx.int32),
+        side_channels={
+            "semantic_graph": {
+                "token_call_edges": mx.array([[[5, 10], [12, 3]]], dtype=mx.int32),
+                "token_call_edges_mask": mx.array([[1, 1]], dtype=mx.int32),
+                "token_type_edges": mx.array([[[2, 42], [0, 0]]], dtype=mx.int32),
+                "token_type_edges_mask": mx.array([[1, 0]], dtype=mx.int32),
+            },
+        },
+    )
+
+    graph = path_c_semantic_graph_side_channel_batch(batch)
+
+    assert graph.call_edges.shape == (1, 2, 2)
+    assert graph.call_edges.dtype == mx.int32
+    assert graph.call_edge_mask.shape == (1, 2)
+    assert graph.call_edge_mask.dtype == mx.int32
+    assert graph.call_edge_count == 2
+    assert graph.type_edges.shape == (1, 2, 2)
+    assert graph.type_edge_count == 1
+    np_call_edges = np.array(graph.call_edges)
+    np_type_edges = np.array(graph.type_edges)
+    np.testing.assert_array_equal(np_call_edges[0, :2], [[5, 10], [12, 3]])
+    np.testing.assert_array_equal(np_type_edges[0, 0], [2, 42])
+
+    schedule_inputs = path_c_semantic_graph_schedule_inputs(graph)
+    assert schedule_inputs["path_c_semantic_call_edges"] is graph.call_edges
+    assert schedule_inputs["path_c_semantic_call_edge_mask"] is graph.call_edge_mask
+    assert schedule_inputs["path_c_semantic_type_edges"] is graph.type_edges
+    assert schedule_inputs["path_c_semantic_type_edge_mask"] is graph.type_edge_mask
 
 
 def test_path_c_activation_capture_uses_profile_brick_aliases_without_copy():

@@ -72,9 +72,17 @@ _FAMILY_TOKEN_SIDE_CHANNEL_COLUMNS: Mapping[str, tuple[str, ...]] = {
     "semantic_graph": _TOKEN_SEMANTIC_METADATA_COLUMNS,
     "temporal_diff": _TOKEN_TEMPORAL_METADATA_COLUMNS,
 }
+_FAMILY_GRAPH_SIDE_CHANNEL_COLUMNS: Mapping[str, tuple[str, ...]] = {
+    "semantic_graph": _TOKEN_GRAPH_METADATA_COLUMNS,
+}
 _FAMILY_TOKEN_SIDE_CHANNEL_COLUMNS_FLAT = tuple(
     column
     for columns in _FAMILY_TOKEN_SIDE_CHANNEL_COLUMNS.values()
+    for column in columns
+)
+_FAMILY_GRAPH_SIDE_CHANNEL_COLUMNS_FLAT = tuple(
+    column
+    for columns in _FAMILY_GRAPH_SIDE_CHANNEL_COLUMNS.values()
     for column in columns
 )
 _SOURCE_PLATFORM_IDS_COLUMN = "source_platform_ids"
@@ -303,10 +311,19 @@ class TokenParquetDataset:
         )
         side_channel_columns = _side_channel_windows(columns, token_rows, seq_len)
         side_channels = side_channel_columns.channels
-        family_side_channel_columns = _family_side_channel_windows(
+        family_token_side_channel_columns = _family_side_channel_windows(
             columns,
             token_rows,
             seq_len,
+        )
+        family_graph_side_channel_columns = _family_graph_side_channel_windows(
+            columns,
+            token_rows,
+            seq_len,
+        )
+        family_side_channel_columns = _merge_family_side_channel_columns(
+            family_token_side_channel_columns,
+            family_graph_side_channel_columns,
         )
         model_metadata_columns = _model_metadata_windows(columns, token_rows, seq_len)
         batch_metadata_columns = _resolve_batch_metadata_columns(
@@ -533,6 +550,8 @@ def _candidate_parquet_columns(
     candidates.extend(_LOSS_MASK_COLUMN_ALIASES)
     candidates.extend(_DOCUMENT_ID_COLUMN_ALIASES)
     candidates.extend(_FAMILY_TOKEN_SIDE_CHANNEL_COLUMNS_FLAT)
+    candidates.extend(_TOKEN_CHUNK_METADATA_COLUMNS)
+    candidates.extend(_FAMILY_GRAPH_SIDE_CHANNEL_COLUMNS_FLAT)
     candidates.append(_SOURCE_PLATFORM_IDS_COLUMN)
     candidates.append(_VALID_TOKEN_COUNT_COLUMN)
     for aliases in _SIDE_CHANNEL_COLUMN_ALIASES.values():
@@ -791,6 +810,116 @@ def _family_side_channel_windows(
                 "type": columns.type_label(column),
             }
     return _FamilySideChannelColumns(channels=channels, sources=sources)
+
+
+def _family_graph_side_channel_windows(
+    columns: ParquetColumns,
+    token_rows: list[list[int]],
+    seq_len: int,
+) -> _FamilySideChannelColumns:
+    channels: dict[str, dict[str, np.ndarray]] = {}
+    sources: dict[str, dict[str, dict[str, str | None]]] = {}
+    graph_columns = tuple(
+        column
+        for columns_for_family in _FAMILY_GRAPH_SIDE_CHANNEL_COLUMNS.values()
+        for column in columns_for_family
+        if column in columns.values
+    )
+    if not graph_columns:
+        return _FamilySideChannelColumns(channels=channels, sources=sources)
+    if "token_chunk_starts" not in columns.values or "token_chunk_ends" not in columns.values:
+        joined = ", ".join(graph_columns)
+        raise ValueError(
+            f"{joined} graph side-channels require token_chunk_starts and "
+            "token_chunk_ends for packed-row remapping"
+        )
+
+    for family, family_columns in _FAMILY_GRAPH_SIDE_CHANNEL_COLUMNS.items():
+        for column in family_columns:
+            if column not in columns.values:
+                continue
+            edge_values, edge_mask = _token_graph_edge_windows(
+                columns,
+                token_rows,
+                seq_len=seq_len,
+                edge_column=column,
+            )
+            if edge_values.shape[1] == 0:
+                continue
+            mask_column = f"{column}_mask"
+            family_channels = channels.setdefault(family, {})
+            family_channels[column] = edge_values
+            family_channels[mask_column] = edge_mask
+            family_sources = sources.setdefault(family, {})
+            family_sources[column] = {
+                "column": column,
+                "type": columns.type_label(column),
+            }
+            family_sources[mask_column] = {
+                "column": column,
+                "type": columns.type_label(column),
+                "derived": "edge_presence_mask",
+            }
+    return _FamilySideChannelColumns(channels=channels, sources=sources)
+
+
+def _merge_family_side_channel_columns(
+    *groups: _FamilySideChannelColumns,
+) -> _FamilySideChannelColumns:
+    channels: dict[str, dict[str, np.ndarray]] = {}
+    sources: dict[str, dict[str, dict[str, str | None]]] = {}
+    for group in groups:
+        for family, family_columns in group.channels.items():
+            target = channels.setdefault(family, {})
+            source_target = sources.setdefault(family, {})
+            for column, value in family_columns.items():
+                if column in target:
+                    raise ValueError(
+                        f"{family}.{column} side-channel declared more than once"
+                    )
+                target[column] = value
+                if column in group.sources.get(family, {}):
+                    source_target[column] = dict(group.sources[family][column])
+    return _FamilySideChannelColumns(channels=channels, sources=sources)
+
+
+def _token_graph_edge_windows(
+    columns: ParquetColumns,
+    token_rows: list[list[int]],
+    *,
+    seq_len: int,
+    edge_column: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    specs = _fixed_window_specs_from_rows(token_rows, seq_len)
+    edge_windows: list[list[tuple[int, int]]] = []
+    for spec in specs:
+        if spec.row_index is None:
+            edge_windows.append([])
+            continue
+        window: dict[str, Any] = {}
+        _add_chunk_metadata_window(
+            window,
+            columns,
+            row_index=spec.row_index,
+            token_start=spec.token_start,
+            token_end=spec.token_end,
+            metadata_columns=(
+                "token_chunk_starts",
+                "token_chunk_ends",
+                edge_column,
+            ),
+        )
+        edge_windows.append(_normalize_edge_pairs(window.get(edge_column, [])))
+
+    max_edges = max((len(edges) for edges in edge_windows), default=0)
+    edge_values = np.zeros((len(edge_windows), max_edges, 2), dtype=np.int32)
+    edge_mask = np.zeros((len(edge_windows), max_edges), dtype=np.int32)
+    for row_index, edges in enumerate(edge_windows):
+        for edge_index, (src, dst) in enumerate(edges):
+            edge_values[row_index, edge_index, 0] = int(src)
+            edge_values[row_index, edge_index, 1] = int(dst)
+            edge_mask[row_index, edge_index] = 1
+    return edge_values, edge_mask
 
 
 def _model_metadata_windows(

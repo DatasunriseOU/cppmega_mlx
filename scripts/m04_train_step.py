@@ -1838,7 +1838,11 @@ def _path_c_extract_document_ids(
 ) -> mx.array | None:
     if not isinstance(batch, Mapping):
         return None
-    present = [name for name in _DOCUMENT_ID_ALIASES if name in batch]
+    present = [
+        name
+        for name in _DOCUMENT_ID_ALIASES
+        if name in batch and batch[name] is not None
+    ]
     if len(present) > 1:
         raise ValueError(
             "batch mapping must provide only one document-id alias; got "
@@ -7053,17 +7057,77 @@ def path_c_fusion_payload(
         if bank_buffer_owner is not None
         else f"{profile_name}.path_c_physical_abi_banks"
     )
+    resolved_bank_owner = bank_owner
+    if resolved_bank_owner is None and bank_buffers is None and model is not None:
+        resolved_bank_owner = getattr(model, "path_c_physical_abi_bank_owner", None)
+    resolved_fused_artifact = fused_artifact
+    if resolved_fused_artifact is None and model is not None:
+        resolved_fused_artifact = getattr(
+            model,
+            "path_c_fused_train_block_artifact",
+            None,
+        )
+    resolved_fused_train_block_training_runtime = fused_train_block_training_runtime
+    if resolved_fused_train_block_training_runtime is None and model is not None:
+        resolved_fused_train_block_training_runtime = getattr(
+            model,
+            "path_c_fused_train_block_training_runtime",
+            None,
+        )
+    resolved_direct_chain_training_runtime = direct_chain_training_runtime
+    if resolved_direct_chain_training_runtime is None and model is not None:
+        resolved_direct_chain_training_runtime = getattr(
+            model,
+            "path_c_direct_fusion_chain_training_runtime",
+            None,
+        )
+    resolved_direct_chain_artifacts = direct_chain_artifacts
+    if resolved_direct_chain_artifacts is None:
+        resolved_direct_chain_artifacts = getattr(
+            resolved_direct_chain_training_runtime,
+            "artifacts",
+            None,
+        )
+    if resolved_direct_chain_artifacts is None and model is not None:
+        resolved_direct_chain_artifacts = getattr(
+            model,
+            "path_c_direct_fusion_chain_artifacts",
+            None,
+        )
+    resolved_direct_chain_logical_buffers = direct_chain_logical_buffers
+    if resolved_direct_chain_logical_buffers is None and model is not None:
+        resolved_direct_chain_logical_buffers = getattr(
+            model,
+            "path_c_direct_fusion_chain_logical_buffers",
+            None,
+        )
+    resolved_direct_chain_logical_buffer_owner = direct_chain_logical_buffer_owner
+    if resolved_direct_chain_logical_buffer_owner is None and model is not None:
+        resolved_direct_chain_logical_buffer_owner = getattr(
+            model,
+            "path_c_direct_fusion_chain_logical_buffer_owner_name",
+            None,
+        )
+    resolved_direct_chain_logical_owner = direct_chain_logical_owner
+    if (
+        resolved_direct_chain_logical_owner is None
+        and resolved_direct_chain_logical_buffers is None
+        and model is not None
+    ):
+        resolved_direct_chain_logical_owner = (
+            _path_c_direct_chain_logical_owner_for_model(model)
+        )
     runtime_training_binding = path_c_fusion_runtime_training_binding_payload(
         region=region,
         schedule_target=scheduled.schedule_target,
         bank_buffers=bank_buffers,
         bank_buffer_owner=expected_bank_buffer_owner,
-        bank_owner=bank_owner,
-        fused_artifact=fused_artifact,
+        bank_owner=resolved_bank_owner,
+        fused_artifact=resolved_fused_artifact,
     )
     fused_train_block_training_contract = (
         path_c_fused_train_block_training_runtime_contract_payload(
-            training_runtime=fused_train_block_training_runtime,
+            training_runtime=resolved_fused_train_block_training_runtime,
             runtime_binding=runtime_training_binding,
         )
     )
@@ -7075,7 +7139,7 @@ def path_c_fusion_payload(
             model,
             profile_name,
         )
-        runtime_chain = getattr(direct_chain_training_runtime, "chain", None)
+        runtime_chain = getattr(resolved_direct_chain_training_runtime, "chain", None)
         direct_chains = ()
         direct_chain = runtime_chain
         if direct_chain is None:
@@ -7127,15 +7191,15 @@ def path_c_fusion_payload(
     direct_chain_runtime_binding = (
         path_c_direct_fusion_chain_runtime_binding_payload(
             chain=direct_chain,
-            logical_buffers=direct_chain_logical_buffers,
-            logical_buffer_owner=direct_chain_logical_buffer_owner,
-            logical_owner=direct_chain_logical_owner,
-            artifacts=direct_chain_artifacts,
+            logical_buffers=resolved_direct_chain_logical_buffers,
+            logical_buffer_owner=resolved_direct_chain_logical_buffer_owner,
+            logical_owner=resolved_direct_chain_logical_owner,
+            artifacts=resolved_direct_chain_artifacts,
         )
     )
     direct_chain_training_contract = (
         path_c_direct_fusion_chain_training_runtime_contract_payload(
-            training_runtime=direct_chain_training_runtime,
+            training_runtime=resolved_direct_chain_training_runtime,
             runtime_binding=direct_chain_runtime_binding,
         )
     )

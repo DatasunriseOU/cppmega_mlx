@@ -708,6 +708,8 @@ def wrap_tilelang_metal_kernel(
     output_count: int,
     name: str | None = None,
     args_struct_inline: dict[str, Any] | None = None,
+    input_buffer_names: Sequence[str] | None = None,
+    output_buffer_names: Sequence[str] | None = None,
     allow_mx_fast_metal_kernel: bool = False,
 ) -> TileLangMetalAdapter:
     """Adapt a TileLang Metal artifact for ``mx.fast.metal_kernel``.
@@ -715,11 +717,16 @@ def wrap_tilelang_metal_kernel(
     ``artifact`` may be a TileLang ``CompiledArtifact``, a raw MSL
     string, or anything exposing ``.kernel_source`` / ``.rt_mod.get_source()``.
 
-    The first ``input_count`` device buffers in the kernel signature are
-    renamed to ``inp0..inp{input_count-1}``; the next ``output_count`` to
-    ``out0..out{output_count-1}``. TileLang emits buffer parameters in
-    PrimFunc declaration order with outputs *last* by convention, so the
-    caller is responsible for asserting that ordering matches their kernel.
+    By default, the first ``input_count`` device buffers in the kernel
+    signature are renamed to ``inp0..inp{input_count-1}``; the next
+    ``output_count`` to ``out0..out{output_count-1}``.
+
+    Callers that already know the PrimFunc ABI may pass
+    ``input_buffer_names`` / ``output_buffer_names``. That mode is required
+    for TileLang kernels whose Metal signature interleaves outputs with inputs
+    or omits unused input tensors after lowering. ``input_count`` remains the
+    runtime input ABI count; the adapter exposes only the subset of those
+    named inputs that are present in the emitted Metal signature.
 
     This raw MLX fast-kernel bridge is fail-closed by default because the
     production Path C boundary is tvm-ffi/owner-output. Tests and explicit
@@ -746,8 +753,27 @@ def wrap_tilelang_metal_kernel(
             f"input_count/output_count must be non-negative, got "
             f"input_count={input_count}, output_count={output_count}"
         )
-    expected_total = input_count + output_count
-    if expected_total == 0:
+    if input_buffer_names is not None:
+        input_buffer_names = tuple(str(name) for name in input_buffer_names)
+        if len(input_buffer_names) != input_count:
+            raise MLXRuntimeError(
+                f"input_buffer_names has {len(input_buffer_names)} entries, "
+                f"but input_count={input_count}"
+            )
+    if output_buffer_names is not None:
+        output_buffer_names = tuple(str(name) for name in output_buffer_names)
+        if len(output_buffer_names) != output_count:
+            raise MLXRuntimeError(
+                f"output_buffer_names has {len(output_buffer_names)} entries, "
+                f"but output_count={output_count}"
+            )
+    if (input_buffer_names is None) != (output_buffer_names is None):
+        raise MLXRuntimeError(
+            "input_buffer_names and output_buffer_names must be provided together"
+        )
+
+    declared_total = input_count + output_count
+    if declared_total == 0:
         raise MLXRuntimeError("kernel must have at least one buffer parameter")
 
     src = _extract_kernel_source(artifact)
@@ -764,30 +790,56 @@ def wrap_tilelang_metal_kernel(
     prelude, kernel_name, signature, body = _split_kernel(src)
 
     buffer_names = _parse_buffer_param_names(signature)
-    if len(buffer_names) != expected_total:
-        raise MLXRuntimeError(
-            f"buffer count mismatch: parsed {len(buffer_names)} device/constant "
-            f"buffers from kernel signature ({buffer_names!r}), but caller "
-            f"declared input_count={input_count} + output_count={output_count} "
-            f"= {expected_total}"
-        )
+    if input_buffer_names is None or output_buffer_names is None:
+        if len(buffer_names) != declared_total:
+            raise MLXRuntimeError(
+                f"buffer count mismatch: parsed {len(buffer_names)} device/constant "
+                f"buffers from kernel signature ({buffer_names!r}), but caller "
+                f"declared input_count={input_count} + output_count={output_count} "
+                f"= {declared_total}"
+            )
+        input_sources = tuple(buffer_names[:input_count])
+        output_sources = tuple(buffer_names[input_count:])
+    else:
+        parsed = set(buffer_names)
+        input_sources = tuple(name for name in input_buffer_names if name in parsed)
+        output_sources = tuple(output_buffer_names)
+        missing_outputs = tuple(name for name in output_sources if name not in parsed)
+        if missing_outputs:
+            raise MLXRuntimeError(
+                "output_buffer_names contains buffers missing from the Metal "
+                f"signature: {missing_outputs!r}; parsed={buffer_names!r}"
+            )
+        explicit_sources = input_sources + output_sources
+        if len(set(explicit_sources)) != len(explicit_sources):
+            raise MLXRuntimeError(
+                f"explicit buffer mapping contains duplicate source names: "
+                f"{explicit_sources!r}"
+            )
+        unmapped = tuple(name for name in buffer_names if name not in explicit_sources)
+        if unmapped:
+            raise MLXRuntimeError(
+                f"explicit buffer mapping does not cover emitted buffers "
+                f"{unmapped!r}; parsed={buffer_names!r}"
+            )
+        if not explicit_sources:
+            raise MLXRuntimeError(
+                "explicit buffer mapping did not match any emitted Metal buffers"
+            )
 
-    input_names = tuple(f"inp{i}" for i in range(input_count))
-    output_names = tuple(f"out{i}" for i in range(output_count))
-    rename: dict[str, str] = {}
-    for src_name, mlx_name in zip(buffer_names[:input_count], input_names):
-        rename[src_name] = mlx_name
-    for src_name, mlx_name in zip(buffer_names[input_count:], output_names):
-        rename[src_name] = mlx_name
-
-    # Sanity: each buffer name must be unique. TileLang shouldn't emit
-    # duplicates but if it ever did, the rename dict would silently lose
-    # the earlier mapping.
     if len(set(buffer_names)) != len(buffer_names):
         raise MLXRuntimeError(
             f"unsupported TileLang Metal pattern: duplicate buffer names "
             f"{buffer_names!r}"
         )
+
+    input_names = tuple(f"inp{i}" for i in range(len(input_sources)))
+    output_names = tuple(f"out{i}" for i in range(len(output_sources)))
+    rename: dict[str, str] = {}
+    for src_name, mlx_name in zip(input_sources, input_names):
+        rename[src_name] = mlx_name
+    for src_name, mlx_name in zip(output_sources, output_names):
+        rename[src_name] = mlx_name
 
     renamed_body = _rename_identifiers_in_code(body, rename)
 

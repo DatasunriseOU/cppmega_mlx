@@ -213,6 +213,44 @@ kernel void vector_add_kernel(
     assert "arg.n_elements[0]" in adapter.body
 
 
+def test_wrap_accepts_explicit_interleaved_buffer_mapping() -> None:
+    """TileLang Metal may reorder buffers and omit unused input tensors."""
+    from cppmega_mlx.nn._tilelang._mlx_runtime import wrap_tilelang_metal_kernel
+
+    src = """
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void qk_scale_kernel(
+    device const float* K [[buffer(0)]],
+    device float* P [[buffer(1)]],
+    device const float* Q [[buffer(2)]],
+    device const float* Scale [[buffer(3)]]
+) {
+    uint id = thread_position_in_grid.x;
+    P[id] = Q[id] * K[id] * Scale[0];
+}
+"""
+
+    adapter = wrap_tilelang_metal_kernel(
+        src,
+        input_count=4,
+        output_count=1,
+        input_buffer_names=("Q", "K", "Indices", "Scale"),
+        output_buffer_names=("P",),
+        allow_mx_fast_metal_kernel=True,
+    )
+
+    assert adapter.buffer_names == ("K", "P", "Q", "Scale")
+    assert adapter.input_names == ("inp0", "inp1", "inp2")
+    assert adapter.output_names == ("out0",)
+    assert "out0[id]" in adapter.body
+    assert "inp0[id]" in adapter.body
+    assert "inp1[id]" in adapter.body
+    assert "inp2[0]" in adapter.body
+    assert "Indices" not in adapter.body
+
+
 def test_rewrite_blockidx_to_thread_position_in_grid() -> None:
     """``blockIdx``/``threadIdx`` identifiers are rewritten to MLX builtins.
 

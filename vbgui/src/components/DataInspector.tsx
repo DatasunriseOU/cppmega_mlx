@@ -12,6 +12,7 @@ export interface PreviewParquetResult {
   token_column: string;
   available_channels: string[];
   side_channel_families?: Record<string, SideChannelFamilyCoverage>;
+  edge_distributions?: Record<string, EdgeDistributionPreview>;
   bytes_per_token_avg: number;
   bytes_per_token_p95: number;
   bytes_per_token_max: number;
@@ -29,6 +30,21 @@ export interface SideChannelFamilyCoverage {
   graph_remapping: string;
   provenance: string;
   non_null_ratio: number;
+}
+
+export interface EdgeDistributionPreview {
+  column: string;
+  edge_count: number;
+  row_count: number;
+  non_empty_rows: number;
+  min_node_id: number | null;
+  max_node_id: number | null;
+  distinct_node_count: number;
+  per_row_min: number;
+  per_row_avg: number;
+  per_row_max: number;
+  synthetic_0_to_7_only: boolean;
+  sample_edges: Array<{ from: number; to: number }>;
 }
 
 export interface DataInspectorProps {
@@ -253,6 +269,39 @@ export function DataInspector({
                       missing: {fam.missing_columns.join(", ")}
                     </div>
                   )}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {result.edge_distributions &&
+            Object.keys(result.edge_distributions).length > 0 && (
+            <div data-testid="data-edge-distributions"
+                 style={{ display: "grid",
+                          gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+                          gap: 6 }}>
+              {Object.entries(result.edge_distributions).map(([name, dist]) => (
+                <div key={name} data-testid={`data-edge-distribution-${name}`}
+                     style={{ border: "1px solid #e5e7eb", borderRadius: 4,
+                              padding: 6, fontSize: 11 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between",
+                                gap: 6 }}>
+                    <strong>{name}</strong>
+                    <span style={{ color: dist.synthetic_0_to_7_only
+                      ? "#92400e" : "#166534" }}>
+                      {dist.synthetic_0_to_7_only ? "synthetic 0..7" : "real"}
+                    </span>
+                  </div>
+                  <div style={{ color: "#374151" }}>
+                    edges {dist.edge_count} · rows {dist.non_empty_rows}/{dist.row_count}
+                  </div>
+                  <div style={{ color: "#6b7280" }}>
+                    ids {dist.min_node_id ?? "n/a"}..max {dist.max_node_id ?? "n/a"} ·
+                    distinct {dist.distinct_node_count}
+                  </div>
+                  <div style={{ color: "#6b7280" }}>
+                    per-row {dist.per_row_min}/{dist.per_row_avg.toFixed(2)}/{dist.per_row_max}
+                  </div>
                 </div>
               ))}
             </div>

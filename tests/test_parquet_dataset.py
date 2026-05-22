@@ -419,6 +419,80 @@ def test_parquet_token_semantic_and_temporal_metadata_reach_side_channel_map(
     )
 
 
+def test_parquet_token_graph_edges_reach_semantic_side_channel_map(tmp_path) -> None:
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    path = tmp_path / "semantic_edges.parquet"
+    edge_type = pa.large_list(
+        pa.struct([("from", pa.int32()), ("to", pa.int32())])
+    )
+    table = pa.table(
+        {
+            "token_ids": pa.array(
+                [[0, 1, 2, 3, 4, 5, 6, 7]],
+                type=pa.large_list(pa.int32()),
+            ),
+            "token_chunk_starts": pa.array(
+                [[0, 2, 4, 6]],
+                type=pa.large_list(pa.int32()),
+            ),
+            "token_chunk_ends": pa.array(
+                [[2, 4, 6, 8]],
+                type=pa.large_list(pa.int32()),
+            ),
+            "token_call_edges": pa.array(
+                [[{"from": 0, "to": 1}, {"from": 2, "to": 3}]],
+                type=edge_type,
+            ),
+            "token_type_edges": pa.array(
+                [[{"from": 1, "to": 0}, {"from": 3, "to": 2}]],
+                type=edge_type,
+            ),
+        }
+    )
+    pq.write_table(table, path)
+
+    dataset = TokenParquetDataset(path, seq_len=4, batch_size=2, token_key="token_ids")
+    batch = next(dataset.iter_batches())
+
+    assert batch.side_channels is not None
+    graph = batch.side_channels["semantic_graph"]
+    assert set(graph) == {
+        "token_call_edges",
+        "token_call_edges_mask",
+        "token_type_edges",
+        "token_type_edges_mask",
+    }
+    np.testing.assert_array_equal(
+        np.array(graph["token_call_edges"]),
+        np.array([[[0, 1]], [[0, 1]]], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(
+        np.array(graph["token_call_edges_mask"]),
+        np.array([[1], [1]], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(
+        np.array(graph["token_type_edges"]),
+        np.array([[[1, 0]], [[1, 0]]], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(
+        np.array(graph["token_type_edges_mask"]),
+        np.array([[1], [1]], dtype=np.int32),
+    )
+    assert (
+        dataset.parquet_receipt["family_side_channel_sources"]["semantic_graph"][
+            "token_call_edges"
+        ]["column"]
+        == "token_call_edges"
+    )
+    assert (
+        dataset.parquet_receipt["family_side_channel_sources"]["semantic_graph"][
+            "token_type_edges"
+        ]["column"]
+        == "token_type_edges"
+    )
+
+
 def test_parquet_token_semantic_side_channel_fails_closed_when_not_token_aligned(
     tmp_path,
 ) -> None:

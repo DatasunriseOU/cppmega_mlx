@@ -22,6 +22,16 @@ from cppmega_v4.probe import introspect_parquet
 
 
 _PRIMARY_TOKEN_COLS: tuple[str, ...] = ("input_ids", "token_ids", "tokens")
+_EDGE_CHANNELS: frozenset[str] = frozenset(
+    {
+        "clang_call_edges",
+        "clang_type_edges",
+        "call_edges",
+        "type_edges",
+        "token_call_edges",
+        "token_type_edges",
+    }
+)
 
 
 # ---------------------------------------------------------------------------
@@ -57,12 +67,31 @@ class SideChannelFamilyPreview(BaseModel):
     non_null_ratio: float
 
 
+class EdgeDistributionPreview(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    column: str
+    edge_count: int
+    row_count: int
+    non_empty_rows: int
+    min_node_id: int | None = None
+    max_node_id: int | None = None
+    distinct_node_count: int
+    per_row_min: int
+    per_row_avg: float
+    per_row_max: int
+    synthetic_0_to_7_only: bool
+    sample_edges: list[dict[str, int]] = Field(default_factory=list)
+
+
 class PreviewParquetResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
     rows: list[PreviewRow]
     token_column: str
     available_channels: list[str]
     side_channel_families: dict[str, SideChannelFamilyPreview] = Field(
+        default_factory=dict
+    )
+    edge_distributions: dict[str, EdgeDistributionPreview] = Field(
         default_factory=dict
     )
     bytes_per_token_avg: float
@@ -162,6 +191,7 @@ def preview_parquet(
             )
             for name, coverage in sorted(caps.side_channel_families.items())
         },
+        edge_distributions=_edge_distributions(rows, selected),
         bytes_per_token_avg=round(bpt_avg, 3),
         bytes_per_token_p95=round(bpt_p95, 3),
         bytes_per_token_max=int(bpt_max),
@@ -206,3 +236,54 @@ def _bytes_per_token_stats(
     p95_idx = max(0, int(len(sorted_lengths) * 0.95) - 1)
     p95 = float(sorted_lengths[p95_idx])
     return avg, p95, max(lengths)
+
+
+def _edge_distributions(
+    rows: list[PreviewRow],
+    selected_channels: list[str],
+) -> dict[str, EdgeDistributionPreview]:
+    out: dict[str, EdgeDistributionPreview] = {}
+    for channel in selected_channels:
+        if channel not in _EDGE_CHANNELS:
+            continue
+        row_counts: list[int] = []
+        node_ids: set[int] = set()
+        samples: list[dict[str, int]] = []
+        for row in rows:
+            edges = _edge_pairs(row.channels.get(channel))
+            row_counts.append(len(edges))
+            for src, dst in edges:
+                node_ids.add(src)
+                node_ids.add(dst)
+                if len(samples) < 8:
+                    samples.append({"from": src, "to": dst})
+        edge_count = sum(row_counts)
+        out[channel] = EdgeDistributionPreview(
+            column=channel,
+            edge_count=edge_count,
+            row_count=len(rows),
+            non_empty_rows=sum(1 for count in row_counts if count > 0),
+            min_node_id=min(node_ids) if node_ids else None,
+            max_node_id=max(node_ids) if node_ids else None,
+            distinct_node_count=len(node_ids),
+            per_row_min=min(row_counts) if row_counts else 0,
+            per_row_avg=round(edge_count / len(row_counts), 3) if row_counts else 0.0,
+            per_row_max=max(row_counts) if row_counts else 0,
+            synthetic_0_to_7_only=(
+                bool(node_ids) and min(node_ids) >= 0 and max(node_ids) <= 7
+            ),
+            sample_edges=samples,
+        )
+    return out
+
+
+def _edge_pairs(value: Any) -> list[tuple[int, int]]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    pairs: list[tuple[int, int]] = []
+    for item in value:
+        if isinstance(item, dict) and "from" in item and "to" in item:
+            pairs.append((int(item["from"]), int(item["to"])))
+        elif isinstance(item, (list, tuple)) and len(item) >= 2:
+            pairs.append((int(item[0]), int(item[1])))
+    return pairs

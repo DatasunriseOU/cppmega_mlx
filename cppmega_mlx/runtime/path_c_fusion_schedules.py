@@ -28,6 +28,7 @@ from cppmega_mlx.runtime.path_c_fusion import (
     MAMBA3_FP8_TRAIN_REQUIRED_REAL_ABI_INPUTS,
     PathCFusionRegion,
     PathCModelShapeEnv,
+    PathCSemanticGraphSideChannelBatch,
     Z3SyncSpec,
     build_path_c_aot_autograd_region,
     build_path_c_fusion_region,
@@ -78,6 +79,7 @@ __all__ = [
     "path_c_fusion_schedule_spec",
     "path_c_fusion_schedule_template",
     "compile_mamba3_fp8_train_fusion_schedule",
+    "path_c_semantic_graph_schedule_inputs",
     "plan_path_c_direct_fusion_chain_for_region",
     "plan_path_c_direct_fusion_chains_for_model",
     "plan_path_c_fusion_schedule_for_region",
@@ -146,6 +148,23 @@ _DTYPE_NBYTES = {
     "uint64": 8,
     "int64": 8,
 }
+
+
+def path_c_semantic_graph_schedule_inputs(
+    graph: PathCSemanticGraphSideChannelBatch,
+) -> dict[str, object]:
+    """Return caller-owned semantic graph buffers in Path C ABI names."""
+
+    inputs: dict[str, object] = {}
+    if graph.call_edges is not None:
+        inputs["path_c_semantic_call_edges"] = graph.call_edges
+    if graph.call_edge_mask is not None:
+        inputs["path_c_semantic_call_edge_mask"] = graph.call_edge_mask
+    if graph.type_edges is not None:
+        inputs["path_c_semantic_type_edges"] = graph.type_edges
+    if graph.type_edge_mask is not None:
+        inputs["path_c_semantic_type_edge_mask"] = graph.type_edge_mask
+    return inputs
 
 
 def _mamba3_fp8_train_buffer_extent() -> int:

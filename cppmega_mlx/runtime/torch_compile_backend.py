@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+import copy
 from dataclasses import dataclass
 import operator
 from threading import Lock
@@ -10,7 +11,7 @@ from typing import Any
 _BACKEND_NAME = "tilelang"
 _STRICT_BACKEND_NAME = "tilelang_strict"
 _FUSION_PATTERN_NAMES = ("gemm_softmax", "qk_reduce_sm_scale")
-_LOWERED_PATTERNS = frozenset[str]()
+_LOWERED_PATTERNS = frozenset({"gemm_softmax", "qk_reduce_sm_scale"})
 _QK_REDUCE_TARGETS = frozenset(
     {
         "fp8_sparse_mla_indexed_qk_reduce",
@@ -38,6 +39,38 @@ class TileLangLoweringAttempt:
     artifact_name: str | None = None
     error: str | None = None
     runner: Any | None = None
+
+
+@dataclass(frozen=True)
+class AutogradPreservingFallbackRunner:
+    graph_module: Any
+    lowering_attempt: TileLangLoweringAttempt
+    reason: str
+
+    def __call__(self, *args: Any) -> Any:
+        return self.graph_module.forward(*args)
+
+
+@dataclass(frozen=True)
+class AOTAutogradRunner:
+    runner: Any
+    lowering_attempt: TileLangLoweringAttempt
+    output_container: str
+
+    def __call__(self, *args: Any) -> Any:
+        result = self.runner(*args)
+        if self.output_container == "single":
+            if isinstance(result, (tuple, list)):
+                if len(result) != 1:
+                    raise RuntimeError(
+                        "tilelang AOTAutograd runner expected one output, "
+                        f"got {len(result)}"
+                    )
+                return result[0]
+            return result
+        if self.output_container == "list" and isinstance(result, tuple):
+            return list(result)
+        return result
 
 
 def _target_name(target: Any) -> str:
@@ -248,7 +281,7 @@ def _attempt_tilelang_lowering(
     try:
         _propagate_fx_shapes(graph_module, example_inputs)
         lowerer = FXToTileLang(graph_module, list(example_inputs))
-        artifact = lowerer.run()
+        artifact = lowerer.run(expose_metal=True)
         source = str(getattr(artifact, "source", "") or "")
         compiled = _artifact_compiled_without_extern_fallback(artifact)
         runner = wrap_as_custom_op(artifact, lowerer.fx_signature()) if compiled else None
@@ -274,6 +307,75 @@ def _lowering_attempt_detail(attempt: TileLangLoweringAttempt) -> str:
     return "no TileLang lowerer detail available"
 
 
+def _requires_grad_inputs(example_inputs: Sequence[Any]) -> bool:
+    return any(bool(getattr(value, "requires_grad", False)) for value in example_inputs)
+
+
+def is_autograd_preserving_fallback(compiled_callable: Any) -> bool:
+    return isinstance(compiled_callable, AutogradPreservingFallbackRunner)
+
+
+def is_aot_autograd_runner(compiled_callable: Any) -> bool:
+    return isinstance(compiled_callable, AOTAutogradRunner)
+
+
+def runtime_fallback_count(compiled_callable: Any) -> int:
+    artifact = getattr(compiled_callable, "_tilelang_artifact", None)
+    launcher = getattr(artifact, "launcher", None)
+    if launcher is not None:
+        return int(getattr(launcher, "_tilelang_runtime_fallback_count", 0) or 0)
+    return int(
+        getattr(compiled_callable, "_tilelang_runtime_fallback_count", 0) or 0
+    )
+
+
+def _aot_ready_graph_module(graph_module: Any) -> tuple[Any, str]:
+    graph_for_aot = copy.deepcopy(graph_module)
+    for node in graph_for_aot.graph.nodes:
+        if node.op != "output":
+            continue
+        output = node.args[0] if node.args else ()
+        if isinstance(output, tuple):
+            output_container = "tuple"
+        elif isinstance(output, list):
+            node.args = (tuple(output),)
+            output_container = "list"
+        else:
+            node.args = ((output,),)
+            output_container = "single"
+        break
+    else:
+        output_container = "tuple"
+    graph_for_aot.graph.lint()
+    graph_for_aot.recompile()
+    return graph_for_aot, output_container
+
+
+def _attempt_tilelang_aot_autograd(
+    graph_module: Any,
+    example_inputs: Sequence[Any],
+    lowering_attempt: TileLangLoweringAttempt,
+) -> AOTAutogradRunner:
+    try:
+        from poc.torch_dynamo.aot_autograd_glue import (
+            make_aot_backend,
+            tilelang_bw_compiler,
+            tilelang_fw_compiler,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "tilelang AOTAutograd backend is unavailable"
+        ) from exc
+    graph_for_aot, output_container = _aot_ready_graph_module(graph_module)
+    backend = make_aot_backend(tilelang_fw_compiler, tilelang_bw_compiler)
+    runner = backend(graph_for_aot, list(example_inputs))
+    return AOTAutogradRunner(
+        runner=runner,
+        lowering_attempt=lowering_attempt,
+        output_container=output_container,
+    )
+
+
 def compile_fx_graph(
     graph_module: Any,
     example_inputs: Sequence[Any],
@@ -282,11 +384,30 @@ def compile_fx_graph(
 ) -> Any:
     report = inspect_fx_graph(graph_module)
     _record_inspection(report)
-    if require_lowered_patterns and report.pending_lowerings:
+    matched_patterns = tuple(
+        name for name in _FUSION_PATTERN_NAMES if report.pattern_hits[name] > 0
+    )
+    if require_lowered_patterns and matched_patterns:
         attempt = _attempt_tilelang_lowering(graph_module, example_inputs)
         if attempt.compiled and attempt.runner is not None:
+            if _requires_grad_inputs(example_inputs):
+                try:
+                    return _attempt_tilelang_aot_autograd(
+                        graph_module,
+                        example_inputs,
+                        attempt,
+                    )
+                except Exception as exc:
+                    pending = ", ".join(report.pending_lowerings or matched_patterns)
+                    raise RuntimeError(
+                        "tilelang torch.compile backend matched pattern(s) "
+                        "and compiled the forward TileLang emitter, but "
+                        "AOTAutograd lowering failed for strict grad inputs: "
+                        f"{pending}. TileLang lowerer detail: "
+                        f"{_lowering_attempt_detail(attempt)}"
+                    ) from exc
             return attempt.runner
-        pending = ", ".join(report.pending_lowerings)
+        pending = ", ".join(report.pending_lowerings or matched_patterns)
         raise RuntimeError(
             "tilelang torch.compile backend matched pattern(s) without "
             f"compiled TileLang emitters: {pending}. "
@@ -360,14 +481,19 @@ def register_tilelang_strict_backend() -> str:
 
 
 __all__ = [
+    "AOTAutogradRunner",
+    "AutogradPreservingFallbackRunner",
     "FXGraphInspection",
     "TileLangLoweringAttempt",
     "compile_fx_graph",
     "fusion_hits",
     "inspect_fx_graph",
+    "is_aot_autograd_runner",
+    "is_autograd_preserving_fallback",
     "register_tilelang_backend",
     "register_tilelang_strict_backend",
     "reset_fusion_hits",
+    "runtime_fallback_count",
     "strict_tilelang_backend",
     "tilelang_backend",
     "torch_compile_backend_available",

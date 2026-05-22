@@ -45,6 +45,7 @@ const SAMPLE: PreviewParquetResult = {
       non_null_ratio: 0.0,
     },
   },
+  edge_distributions: {},
   bytes_per_token_avg: 1.4,
   bytes_per_token_p95: 2.0,
   bytes_per_token_max: 2,
@@ -104,6 +105,41 @@ describe("DataInspector", () => {
       .toContain("derived");
     expect(screen.getByTestId("data-family-structure-missing").textContent)
       .toContain("token_structure_ids");
+  });
+
+  it("renders real clang edge id distributions", async () => {
+    const edgeSample: PreviewParquetResult = {
+      ...SAMPLE,
+      available_channels: ["call_edges", "type_edges"],
+      rows: [
+        { row_index: 0, tokens: [1, 2, 3],
+          channels: { call_edges: [{ from: 5, to: 54 }], type_edges: [] } },
+      ],
+      edge_distributions: {
+        call_edges: {
+          column: "call_edges",
+          edge_count: 3,
+          row_count: 1,
+          non_empty_rows: 1,
+          min_node_id: 5,
+          max_node_id: 54,
+          distinct_node_count: 4,
+          per_row_min: 3,
+          per_row_avg: 3,
+          per_row_max: 3,
+          synthetic_0_to_7_only: false,
+          sample_edges: [{ from: 5, to: 54 }],
+        },
+      },
+    };
+    render(<DataInspector rpc={mockClient(edgeSample)} initialPath="/x" />);
+    fireEvent.click(screen.getByTestId("data-load"));
+    await waitFor(() =>
+      expect(screen.getByTestId("data-edge-distribution-call_edges")).toBeTruthy());
+    const panel = screen.getByTestId("data-edge-distribution-call_edges");
+    expect(panel.textContent).toContain("call_edges");
+    expect(panel.textContent).toContain("max 54");
+    expect(panel.textContent).toContain("real");
   });
 
   it("notifies parent when loaded channels change", async () => {
