@@ -195,8 +195,12 @@ def _make_optim(payload: OptimSpecPayload) -> OptimSpec:
         )
         for g in payload.groups
     )
-    return OptimSpec(kind=kind, groups=groups,
-                     gradient_clip_norm=payload.gradient_clip_norm)
+    return OptimSpec(
+        kind=kind,
+        groups=groups,
+        gradient_clip_norm=payload.gradient_clip_norm,
+        mixed_precision=payload.mixed_precision,
+    )
 
 
 def _make_topology(payload: TopologyPayload):

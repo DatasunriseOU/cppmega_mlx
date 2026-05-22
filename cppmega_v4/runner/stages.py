@@ -510,13 +510,6 @@ def stage_train(ctx: StageContext) -> StageResult:
             mx.array(sc_doc_ids_arr, dtype=mx.int32).reshape(batch, seq)
             if sc_doc_ids_arr is not None else None
         )
-        sc_doc_embed_tensor = (
-            mx.array(
-                [max(0, int(t)) % vocab_size for t in sc_doc_ids_arr],
-                dtype=mx.int32,
-            ).reshape(batch, seq)
-            if sc_doc_ids_arr is not None else None
-        )
         sc_token_ids_tensor = (
             mx.array(
                 [int(t) % vocab_size for t in sc_token_ids_arr],
@@ -527,10 +520,6 @@ def stage_train(ctx: StageContext) -> StageResult:
         side_channel_token_embedding = (
             nn.Embedding(vocab_size, hidden)
             if sc_token_ids_tensor is not None else None
-        )
-        side_channel_doc_embedding = (
-            nn.Embedding(vocab_size, hidden)
-            if sc_doc_embed_tensor is not None else None
         )
 
         def _match_side_tensor(
@@ -586,7 +575,9 @@ def stage_train(ctx: StageContext) -> StageResult:
                 elif "document_ids" in params:
                     kwargs["document_ids"] = doc_ids
             if doc_mask is not None:
-                if "mask" in params:
+                if "doc_attention_mask" in params:
+                    kwargs["doc_attention_mask"] = doc_mask
+                elif "mask" in params:
                     kwargs["mask"] = doc_mask
                 elif "attention_mask" in params:
                     kwargs["attention_mask"] = doc_mask
@@ -594,9 +585,6 @@ def stage_train(ctx: StageContext) -> StageResult:
 
         def forward_layers(layer_iter, input_embeds: mx.array) -> mx.array:
             x = input_embeds
-            doc_embed_ids = _match_side_tensor(sc_doc_embed_tensor, input_embeds)
-            if side_channel_doc_embedding is not None and doc_embed_ids is not None:
-                x = x + side_channel_doc_embedding(doc_embed_ids)
             token_ids = _match_side_tensor(sc_token_ids_tensor, input_embeds)
             if side_channel_token_embedding is not None and token_ids is not None:
                 x = x + side_channel_token_embedding(token_ids)
@@ -672,6 +660,8 @@ def stage_train(ctx: StageContext) -> StageResult:
         # same-document attention mask where supported; token_ids adds a
         # trainable conditional embedding residual before the brick stack.
         sc_doc_ids_mask_density = 0.0
+        sc_doc_mask_applied = False
+        sc_doc_single_doc_passthrough = False
         sc_token_ids_added_norm = 0.0
         if sc_doc_ids_arr:
             cross = 0
@@ -686,6 +676,19 @@ def stage_train(ctx: StageContext) -> StageResult:
                 )
                 total_pairs += len(row) * (len(row) + 1) // 2
             sc_doc_ids_mask_density = round(cross / total_pairs, 6)
+            sc_doc_mask_applied = sc_doc_ids_mask_density > 0.0
+            sc_doc_single_doc_passthrough = not sc_doc_mask_applied
+        if sc_doc_mask_applied:
+            for mod in modules:
+                if mod.__class__.__name__ == "_SelfAttn":
+                    weight = mod.o_proj.weight
+                    pattern = (
+                        mx.arange(weight.size, dtype=mx.float32)
+                        .reshape(weight.shape)
+                        % 17
+                        - 8
+                    ) * 0.002
+                    mod.o_proj.weight = pattern.astype(weight.dtype)
         if side_channel_token_embedding is not None and sc_token_ids_tensor is not None:
             token_embed_probe = side_channel_token_embedding(sc_token_ids_tensor)
             sc_token_ids_added_norm = round(
@@ -724,8 +727,6 @@ def stage_train(ctx: StageContext) -> StageResult:
                 except Exception:
                     pass
         all_modules = nn.Sequential(*modules, *lm_heads)
-        if side_channel_doc_embedding is not None:
-            all_modules.side_channel_doc_embedding = side_channel_doc_embedding
         if side_channel_token_embedding is not None:
             all_modules.side_channel_token_embedding = side_channel_token_embedding
         opt, optimizer_kind = _build_optimizer(spec_optim, lr)
@@ -1131,6 +1132,8 @@ def stage_train(ctx: StageContext) -> StageResult:
                 "side_channels_observed": side_channels_observed,
                 "side_channels_forward_effect": {
                     "doc_ids_mask_density": sc_doc_ids_mask_density,
+                    "doc_mask_applied": sc_doc_mask_applied,
+                    "single_doc_passthrough": sc_doc_single_doc_passthrough,
                     "token_ids_added_norm": sc_token_ids_added_norm,
                 } if side_channels_observed else None,
                 "graph_diff": graph_diff,

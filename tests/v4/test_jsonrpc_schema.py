@@ -16,7 +16,6 @@ from cppmega_v4.jsonrpc import (
     METHOD_REGISTRY,
     SCHEMA_VERSION,
     BuildPresetSpecsParams,
-    BuildPresetSpecsResult,
     ErrorCode,
     JsonRpcError,
     JsonRpcRequest,
@@ -25,7 +24,6 @@ from cppmega_v4.jsonrpc import (
     SuggestAdaptersParams,
     SuggestShardingParams,
     VerifyParams,
-    VerifyResult,
 )
 from cppmega_v4.jsonrpc.schema import (
     EdgeResolution,
@@ -207,8 +205,12 @@ def test_loss_spec_payload_accepts_known_kinds():
 def test_optim_spec_payload_requires_groups():
     with pytest.raises(ValidationError):
         OptimSpecPayload(kind="adamw")
-    OptimSpecPayload(kind="adamw",
-                     groups=[{"matcher": "all", "lr": 1e-4}])
+    payload = OptimSpecPayload(
+        kind="adamw",
+        groups=[{"matcher": "all", "lr": 1e-4}],
+        mixed_precision=False,
+    )
+    assert payload.mixed_precision is False
 
 
 def test_sharding_spec_payload_accepts_topology_and_axes():

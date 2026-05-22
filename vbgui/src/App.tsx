@@ -361,6 +361,10 @@ export function App(): JSX.Element {
           onCompileModeChange={(m) => dispatch({ type: "sharding.set",
             sharding: { ...spec.sharding, compile_mode: m } })}
           onRunPipeline={handleRunPipeline}
+          onMixedPrecisionChange={(enabled) => dispatch({ type: "optim.set",
+            optim: { ...spec.optim, mixed_precision: enabled } })}
+          onFp8EnabledChange={(enabled) => dispatch({ type: "sharding.set",
+            sharding: { ...spec.sharding, fp8_enabled: enabled } })}
           trainParquetPath={trainParquetPath}
           trainTokenizerPath={trainTokenizerPath}
           onSaveSpec={() => {
@@ -520,6 +524,7 @@ function buildVerifyParams(
             params: spec.loss.params },
     optim: { kind: spec.optim.kind,
              gradient_clip_norm: spec.optim.grad_clip_norm,
+             mixed_precision: spec.optim.mixed_precision,
              groups: spec.optim.groups.map((g) => ({
                matcher: g.matcher, lr: g.lr,
                weight_decay: g.weight_decay, betas: g.betas,

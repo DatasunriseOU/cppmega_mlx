@@ -6,9 +6,12 @@ masks plus doc conditioning and routes token_ids into conditional embeddings.
 
 from __future__ import annotations
 
+import inspect
+
 import mlx.core as mx
 
 from cppmega_v4.jsonrpc.schema import VerifyParams
+from cppmega_v4.models.unified_superblock_v4 import _build_attention
 from cppmega_v4.runner import Pipeline, run_pipeline
 
 
@@ -43,6 +46,34 @@ def test_no_side_channels_forward_effect_none():
     assert extras["side_channels_forward_effect"] is None
 
 
+def test_attention_accepts_doc_attention_mask_alias():
+    attn = _build_attention(32, {"num_heads": 2, "head_dim": 16})
+    params = inspect.signature(attn.__call__).parameters
+    assert "doc_attention_mask" in params
+
+
+def test_attention_doc_mask_changes_attention_when_output_active():
+    mx.random.seed(23)
+    attn = _build_attention(32, {"num_heads": 2, "head_dim": 16})
+    weight = attn.o_proj.weight
+    attn.o_proj.weight = (
+        (mx.arange(weight.size, dtype=mx.float32).reshape(weight.shape) % 17 - 8)
+        * 0.002
+    ).astype(weight.dtype)
+    x = mx.random.normal((1, 8, 32))
+    split_doc = mx.array([[0, 0, 0, 1, 1, 1, 2, 2]], dtype=mx.int32)
+    same_doc = mx.array([[7, 7, 7, 7, 7, 7, 7, 7]], dtype=mx.int32)
+    split_mask = (split_doc[:, :, None] == split_doc[:, None, :])[:, None, :, :]
+    same_mask = (same_doc[:, :, None] == same_doc[:, None, :])[:, None, :, :]
+
+    no_mask = attn(x)
+    masked = attn(x, doc_attention_mask=split_mask)
+    passthrough = attn(x, doc_attention_mask=same_mask)
+
+    assert float(mx.linalg.norm((masked - no_mask).astype(mx.float32)).item()) > 0
+    assert float(mx.linalg.norm((passthrough - no_mask).astype(mx.float32)).item()) == 0
+
+
 def test_doc_ids_populates_mask_density():
     extras = _run({"num_steps": 2,
                    "side_channels": {"doc_ids": [0, 0, 0, 1, 1, 1, 2, 2]}})
@@ -50,6 +81,8 @@ def test_doc_ids_populates_mask_density():
     assert fwd is not None
     # 3 distinct docs → significant cross-doc fraction
     assert fwd["doc_ids_mask_density"] > 0.1
+    assert fwd["doc_mask_applied"] is True
+    assert fwd["single_doc_passthrough"] is False
     assert fwd["token_ids_added_norm"] == 0.0
 
 
@@ -60,6 +93,21 @@ def test_doc_ids_change_loss_vs_disabled_same_seed():
         "losses"
     ]
     assert doc != base
+    assert max(abs(a - b) for a, b in zip(doc, base, strict=True)) > 1e-4
+
+
+def test_single_doc_ids_reduce_to_no_mask_same_seed():
+    base = _run({"num_steps": 3})["losses"]
+    extras = _run({
+        "num_steps": 3,
+        "side_channels": {"doc_ids": [7, 7, 7, 7, 7, 7, 7, 7]},
+    })
+    fwd = extras["side_channels_forward_effect"]
+    assert fwd is not None
+    assert fwd["doc_ids_mask_density"] == 0.0
+    assert fwd["doc_mask_applied"] is False
+    assert fwd["single_doc_passthrough"] is True
+    assert extras["losses"] == base
 
 
 def test_token_ids_populates_added_norm():
@@ -69,6 +117,8 @@ def test_token_ids_populates_added_norm():
     assert fwd is not None
     assert fwd["token_ids_added_norm"] > 0
     assert fwd["doc_ids_mask_density"] == 0.0
+    assert fwd["doc_mask_applied"] is False
+    assert fwd["single_doc_passthrough"] is False
 
 
 def test_token_ids_change_loss_vs_disabled_same_seed():

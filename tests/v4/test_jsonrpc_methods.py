@@ -12,6 +12,7 @@ import pytest
 
 from cppmega_v4.jsonrpc import LRUCache
 from cppmega_v4.jsonrpc.methods import (
+    _make_optim,
     build_preset_specs,
     probe_run,
     suggest_adapters,
@@ -21,6 +22,7 @@ from cppmega_v4.jsonrpc.methods import (
 from cppmega_v4.jsonrpc.schema import (
     BuildPresetSpecsParams,
     ProbeRunParams,
+    OptimSpecPayload,
     SuggestAdaptersParams,
     SuggestShardingParams,
     VerifyParams,
@@ -46,6 +48,15 @@ def _simple_verify_params(**extra) -> VerifyParams:
     }
     payload.update(extra)
     return VerifyParams.model_validate(payload)
+
+
+def test_make_optim_threads_mixed_precision_flag():
+    optim = _make_optim(OptimSpecPayload(
+        kind="adamw",
+        groups=[{"matcher": "all", "lr": 1e-4}],
+        mixed_precision=False,
+    ))
+    assert optim.mixed_precision is False
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +172,8 @@ def test_verify_cache_invariant_to_node_layout():
     # back out for the Pydantic model. The cache key uses the raw dict
     # (model_dump → strip_layout) so this still hits.
     for n in dumped["graph"]["nodes"]:
-        n.pop("x"); n.pop("y")
+        n.pop("x")
+        n.pop("y")
     again = VerifyParams.model_validate(dumped)
     verify(again, cache=cache)
     assert cache.stats()["hits"] == 1

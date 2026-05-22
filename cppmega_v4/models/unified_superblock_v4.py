@@ -413,7 +413,20 @@ def _build_attention(hidden_size: int, params: dict) -> nn.Module:
             # Zero-init out so the block is identity at init.
             self.o_proj.weight = mx.zeros_like(self.o_proj.weight)
 
-        def __call__(self, x, mask=None):
+        def __call__(
+            self,
+            x,
+            mask=None,
+            attention_mask=None,
+            doc_attention_mask=None,
+        ):
+            mask = (
+                doc_attention_mask
+                if doc_attention_mask is not None
+                else attention_mask
+                if attention_mask is not None
+                else mask
+            )
             if self.pre_norm is not None:
                 x = self.pre_norm(x)
             B, S, _ = x.shape

@@ -15,6 +15,9 @@ export interface TopBarProps {
   onCompileModeChange: (m: SpecState["sharding"]["compile_mode"]) => void;
   onRunPipeline: (mode: RunMode,
     opts?: { num_steps?: number; side_channels?: string[] }) => void;
+  /** H02: toggle callbacks. */
+  onMixedPrecisionChange?: (enabled: boolean) => void;
+  onFp8EnabledChange?: (enabled: boolean) => void;
   /** V3-8/V3-9: when present, Train button is rendered disabled with
    *  reason exposed via data-testid='top-bar-train-disabled-reason'. */
   trainDisabled?: { reason: string } | null;
@@ -73,6 +76,27 @@ export function TopBar(p: TopBarProps): JSX.Element {
       </select>
 
       <MemoryBar state={p.state} />
+
+      {p.onMixedPrecisionChange && (
+        <label style={{ fontSize: 10, display: "flex", gap: 3,
+                        alignItems: "center" }}>
+          <input data-testid="top-bar-mixed-precision" type="checkbox"
+                 checked={!!p.state.optim.mixed_precision}
+                 onChange={(e) =>
+                   p.onMixedPrecisionChange?.(e.target.checked)} />
+          mixed_precision
+        </label>
+      )}
+      {p.onFp8EnabledChange && (
+        <label style={{ fontSize: 10, display: "flex", gap: 3,
+                        alignItems: "center" }}>
+          <input data-testid="top-bar-fp8-enabled" type="checkbox"
+                 checked={!!p.state.sharding.fp8_enabled}
+                 onChange={(e) =>
+                   p.onFp8EnabledChange?.(e.target.checked)} />
+          fp8
+        </label>
+      )}
 
       {p.onSaveSpec && (
         <button data-testid="spec-save" onClick={p.onSaveSpec}>Save</button>

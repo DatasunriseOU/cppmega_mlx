@@ -158,6 +158,7 @@ class OptimSpecPayload(BaseModel):
     # V5-G23: UI gradient_clip_norm passed through to backend OptimSpec
     # so stage_train can apply L2-norm clipping. None disables.
     gradient_clip_norm: float | None = 1.0
+    mixed_precision: bool = True
 
 
 def _default_optim_payload() -> OptimSpecPayload:
