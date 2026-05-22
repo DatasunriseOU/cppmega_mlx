@@ -15,7 +15,7 @@ from hashlib import sha256
 import io
 import json
 import os
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence, cast
 
 import mlx.core as mx
 
@@ -501,9 +501,9 @@ def _optional_path_c_edge_mask(
         raise ValueError(f"{name} is required when {name.removesuffix('_mask')} is set")
     if not isinstance(value, mx.array):
         raise ValueError(f"{name} must be an mlx array")
-    if value.ndim != 2 or tuple(int(dim) for dim in value.shape) != tuple(
-        int(dim) for dim in edges.shape[:2]
-    ):
+    mask_shape = _path_c_array_shape_tuple(value)
+    edge_prefix_shape = _path_c_array_shape_tuple(edges)[:2]
+    if value.ndim != 2 or mask_shape != edge_prefix_shape:
         raise ValueError(
             f"{name} must match edge shape prefix {edges.shape[:2]}, got {value.shape}"
         )
@@ -519,6 +519,10 @@ def _path_c_edge_count(mask: mx.array | None) -> int:
     total = mx.sum(mask.astype(mx.int32))
     mx.eval(total)
     return int(total.item())
+
+
+def _path_c_array_shape_tuple(value: mx.array) -> tuple[int, ...]:
+    return tuple(int(dim) for dim in cast(Sequence[int], value.shape))
 
 
 @dataclass(frozen=True)
@@ -1074,12 +1078,12 @@ def _path_c_bricks_from_model(model: Any) -> tuple[Any, ...]:
     if callable(bricks):
         bricks = bricks()
     if bricks is not None:
-        return tuple(bricks)
+        return tuple(cast(Iterable[Any], bricks))
     kinds = getattr(model, "kinds", None)
     if callable(kinds):
         return tuple(
             PathCModelBrick(name=f"block_{index}_{kind}", kind=str(kind))
-            for index, kind in enumerate(kinds())
+            for index, kind in enumerate(cast(Iterable[Any], kinds()))
         )
     return tuple(
         PathCModelBrick(
@@ -2354,6 +2358,7 @@ def compile_path_c_region(
         raise ValueError("compiler and tilelang_lowerer are mutually exclusive")
     if tilelang_lowerer is not None and tilelang_plan_factory is not None:
         raise ValueError("tilelang_lowerer and tilelang_plan_factory are mutually exclusive")
+    tilelang_result: Any | None = None
     if tilelang_lowerer is None:
         tilelang_plan = (
             _tilelang_compile_plan_for(
@@ -2735,11 +2740,16 @@ def mark_path_c_schedule_template_for_region(
             return schedule_template(region)
         return schedule_template(template_region)
 
-    attested_schedule_template._cppmega_path_c_schedule_contract_key = contract.key
-    attested_schedule_template._cppmega_path_c_schedule_contract_name = contract.name
-    attested_schedule_template._cppmega_path_c_schedule_implementation_kind = implementation_kind
-    attested_schedule_template._cppmega_path_c_production_schedule_id = production_schedule_id
-    attested_schedule_template._cppmega_path_c_required_real_abi_inputs = tuple(
+    attested_schedule_template_any = cast(Any, attested_schedule_template)
+    attested_schedule_template_any._cppmega_path_c_schedule_contract_key = contract.key
+    attested_schedule_template_any._cppmega_path_c_schedule_contract_name = contract.name
+    attested_schedule_template_any._cppmega_path_c_schedule_implementation_kind = (
+        implementation_kind
+    )
+    attested_schedule_template_any._cppmega_path_c_production_schedule_id = (
+        production_schedule_id
+    )
+    attested_schedule_template_any._cppmega_path_c_required_real_abi_inputs = tuple(
         required_real_abi_inputs
     )
     workspace_edge_buffers = _workspace_edge_buffers_for_attested_template(
@@ -2747,7 +2757,7 @@ def mark_path_c_schedule_template_for_region(
         region=region,
         required_real_abi_inputs=required_real_abi_inputs,
     )
-    attested_schedule_template._cppmega_path_c_workspace_edge_buffers = (
+    attested_schedule_template_any._cppmega_path_c_workspace_edge_buffers = (
         workspace_edge_buffers
     )
     return attested_schedule_template

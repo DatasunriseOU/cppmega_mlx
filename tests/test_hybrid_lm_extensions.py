@@ -271,6 +271,10 @@ def test_path_c_semantic_graph_edges_match_indexer_shape_and_dtype():
 
     graph = path_c_semantic_graph_side_channel_batch(batch)
 
+    assert graph.call_edges is not None
+    assert graph.call_edge_mask is not None
+    assert graph.type_edges is not None
+    assert graph.type_edge_mask is not None
     assert graph.call_edges.shape == (1, 2, 2)
     assert graph.call_edges.dtype == mx.int32
     assert graph.call_edge_mask.shape == (1, 2)
