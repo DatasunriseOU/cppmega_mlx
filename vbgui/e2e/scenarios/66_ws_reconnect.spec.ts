@@ -26,8 +26,8 @@ test("H12: WS drop+reconnect during Train preserves modal completion",
           all.push(this as unknown as WebSocket);
         }
       }
-      // @ts-expect-error - overwriting global ctor is intentional
-      window.WebSocket = TrackedWS;
+      (window as unknown as { WebSocket: typeof WebSocket })
+        .WebSocket = TrackedWS as unknown as typeof WebSocket;
     });
 
     await gotoApp(page);

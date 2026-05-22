@@ -2,7 +2,7 @@
 // Calls ablation.run RPC; renders a results table with mini-chart
 // loss curves per variant + ranking by final loss.
 
-import { useState } from "react";
+import { Fragment, useState } from "react";
 import type { RpcClient } from "@/lib/rpc";
 import type { Node, Edge } from "@xyflow/react";
 import type { OptimState, LossState } from "@/state/spec";
@@ -26,6 +26,10 @@ interface AblationVariantResult {
   elapsed_ms: number;
   weight_delta_norm: number;
   error?: Record<string, unknown> | null;
+  /** H14: full train extras subtree per variant (losses, model_summary,
+   *  optimizer_kind, schedule_kind, data_source, etc.). Optional so
+   *  pre-H14 backend responses still parse. */
+  extras?: Record<string, unknown>;
 }
 
 interface AblationResult {
@@ -81,6 +85,15 @@ export function AblationsTab({
   const [running, setRunning] = useState(false);
   const [result, setResult] = useState<AblationResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // H14: per-variant expand state for the full extras subtree.
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  function toggleExpanded(v: string) {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(v)) next.delete(v); else next.add(v);
+      return next;
+    });
+  }
 
   function toggleVariant(v: string) {
     setVariants((prev) => {
@@ -193,6 +206,7 @@ export function AblationsTab({
                         borderCollapse: "collapse" }}>
           <thead>
             <tr style={{ background: "#f9fafb" }}>
+              <th style={th}></th>
               <th style={th}>Variant</th>
               <th style={th}>Final</th>
               <th style={th}>Δ</th>
@@ -206,38 +220,98 @@ export function AblationsTab({
               const delta = (baselineFinal != null && final != null)
                 ? ((final - baselineFinal) / Math.max(1e-9, baselineFinal)) * 100
                 : null;
+              const open = expanded.has(r.variant);
               return (
-                <tr key={r.variant}
-                    data-testid={`ablation-row-${r.variant}`}
-                    style={{ borderBottom: "1px solid #f3f4f6" }}>
-                  <td style={td}>
-                    {r.variant === baseline && (
-                      <span style={{ color: "#f59e0b", marginRight: 2 }}>★</span>
-                    )}
-                    <code>{r.variant}</code>
-                  </td>
-                  <td data-testid={`ablation-final-${r.variant}`}
-                      style={td}>{final?.toFixed(4) ?? "—"}</td>
-                  <td style={{ ...td,
-                                color: delta == null ? "#9ca3af"
-                                       : delta > 0 ? "#dc2626" : "#16a34a" }}>
-                    {delta == null ? "—"
-                      : delta === 0 ? "0%"
-                      : `${delta > 0 ? "+" : ""}${delta.toFixed(1)}%`}
-                  </td>
-                  <td style={td}><MiniChart values={r.losses} /></td>
-                  <td style={{ ...td,
-                                color: r.status === "ok"
-                                  ? "#16a34a" : "#dc2626" }}>
-                    {r.status}
-                  </td>
-                </tr>
+                <Fragment key={r.variant}>
+                  <tr data-testid={`ablation-row-${r.variant}`}
+                      style={{ borderBottom: "1px solid #f3f4f6" }}>
+                    <td style={td}>
+                      <button data-testid={
+                                `ablation-row-${r.variant}-expand`}
+                              onClick={() => toggleExpanded(r.variant)}
+                              style={{ background: "transparent",
+                                       border: "none", cursor: "pointer",
+                                       padding: 0 }}>
+                        {open ? "▾" : "▸"}
+                      </button>
+                    </td>
+                    <td style={td}>
+                      {r.variant === baseline && (
+                        <span style={{ color: "#f59e0b",
+                                       marginRight: 2 }}>★</span>
+                      )}
+                      <code>{r.variant}</code>
+                    </td>
+                    <td data-testid={`ablation-final-${r.variant}`}
+                        style={td}>{final?.toFixed(4) ?? "—"}</td>
+                    <td style={{ ...td,
+                                  color: delta == null ? "#9ca3af"
+                                         : delta > 0 ? "#dc2626"
+                                                     : "#16a34a" }}>
+                      {delta == null ? "—"
+                        : delta === 0 ? "0%"
+                        : `${delta > 0 ? "+" : ""}${delta.toFixed(1)}%`}
+                    </td>
+                    <td style={td}><MiniChart values={r.losses} /></td>
+                    <td style={{ ...td,
+                                  color: r.status === "ok"
+                                    ? "#16a34a" : "#dc2626" }}>
+                      {r.status}
+                    </td>
+                  </tr>
+                  {open && (
+                    <tr data-testid={`ablation-row-${r.variant}-extras`}>
+                      <td colSpan={6}
+                          style={{ ...td, background: "#fafafa",
+                                   padding: 8 }}>
+                        <VariantExtras variant={r.variant}
+                                       losses={r.losses}
+                                       extras={r.extras ?? {}} />
+                      </td>
+                    </tr>
+                  )}
+                </Fragment>
               );
             })}
           </tbody>
         </table>
       )}
     </div>
+  );
+}
+
+function VariantExtras({
+  variant, losses, extras,
+}: { variant: string; losses: number[];
+     extras: Record<string, unknown> }): JSX.Element {
+  // H14: render the full extras subtree per variant so the user can see
+  // exactly what diverged across ablation runs (model_summary, optimizer
+  // kind, schedule kind, data_source, etc.) — not just final loss.
+  return (
+    <dl data-testid={`ablation-row-${variant}-extras-content`}
+        style={{ margin: 0, fontSize: 11, fontFamily: "monospace",
+                 display: "grid",
+                 gridTemplateColumns: "120px 1fr",
+                 columnGap: 8, rowGap: 2 }}>
+      <dt style={{ color: "#6b7280" }}>losses</dt>
+      <dd data-testid={`ablation-row-${variant}-losses`}
+          style={{ margin: 0 }}>
+        [{losses.map((l) => l.toFixed(4)).join(", ")}]
+      </dd>
+      {Object.entries(extras).map(([k, v]) => (
+        <Fragment key={k}>
+          <dt style={{ color: "#6b7280" }}>{k}</dt>
+          <dd data-testid={`ablation-row-${variant}-extras-${k}`}
+              style={{ margin: 0, wordBreak: "break-all" }}>
+            {v === null || v === undefined
+              ? "null"
+              : typeof v === "object"
+                ? JSON.stringify(v)
+                : String(v)}
+          </dd>
+        </Fragment>
+      ))}
+    </dl>
   );
 }
 

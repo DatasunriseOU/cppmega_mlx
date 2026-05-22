@@ -41,6 +41,10 @@ class AblationVariantResult(BaseModel):
     elapsed_ms: float
     weight_delta_norm: float = 0.0
     error: dict[str, Any] | None = None
+    # H14: full train extras subtree so the UI can render a
+    # per-variant detail view (model_summary, optimizer_kind,
+    # schedule_kind, data_source, etc.) instead of just final loss.
+    extras: dict[str, Any] = Field(default_factory=dict)
 
 
 class AblationRunResult(BaseModel):
@@ -132,6 +136,9 @@ def ablation_run(
                 losses=[float(l) for l in extras.get("losses", [])],
                 elapsed_ms=(time.perf_counter() - v_start) * 1000,
                 weight_delta_norm=float(extras.get("weight_delta_norm", 0)),
+                # H14: forward the full extras subtree so the UI can
+                # render a per-variant model_summary + auxiliary fields.
+                extras=dict(extras),
             ))
         except Exception as exc:
             results.append(AblationVariantResult(
