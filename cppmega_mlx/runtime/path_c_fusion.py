@@ -342,6 +342,7 @@ class PathCModelShapeEnv:
     m2rnn_num_weight_heads: int
     m2rnn_conv_kernel: int
     model_value_dtype: str = "float32"
+    vocab_size: int = 0
 
     @property
     def mamba_inner_dim(self) -> int:
@@ -1188,6 +1189,7 @@ def _path_c_model_shape_env_from_config(config: Any | None) -> PathCModelShapeEn
         m2rnn_num_g_heads=int(m2rnn_config.num_g_heads),
         m2rnn_num_weight_heads=int(m2rnn_config.num_weight_heads),
         m2rnn_conv_kernel=int(m2rnn_config.conv_kernel),
+        vocab_size=int(getattr(config, "vocab_size", 0) or 0),
     )
 
 

@@ -4255,12 +4255,25 @@ def test_compile_path_c_fused_train_block_artifact_for_model_lowers_selected_aot
     assert compiled["plan"]["single_kernel_fused"] is True
     assert compiled["plan"]["backward_graph"] == "aot_autograd"
     training_abi_contract = compiled["training_abi_contract"]
-    assert training_abi_contract["status"] == "incomplete"
-    assert training_abi_contract["can_back_value_and_grad"] is False
+    assert training_abi_contract["status"] == "ok"
+    assert training_abi_contract["can_back_value_and_grad"] is True
     assert training_abi_contract["loss_output_available"] is True
     assert training_abi_contract["ntokens_output_available"] is True
     assert training_abi_contract["train_step_output_abi_declared"] is True
-    assert training_abi_contract["train_step_outputs_computed"] is False
+    assert training_abi_contract["train_step_suffix_loss_input_abi_declared"] is True
+    assert training_abi_contract["suffix_loss_inputs_available"] is True
+    assert training_abi_contract["missing_suffix_loss_inputs"] == []
+    assert training_abi_contract["train_step_outputs_computed"] is True
+    assert training_abi_contract["train_step_computed_outputs"] == [
+        "loss",
+        "ntokens",
+    ]
+    assert training_abi_contract["train_step_pending_outputs"] == []
+    loss_source_buffers = training_abi_contract["train_step_loss_source_buffers"]
+    assert len(loss_source_buffers) == 2
+    assert loss_source_buffers[0].endswith("_R_hidden_after")
+    assert loss_source_buffers[1].endswith("_A_sparse_mla_fp8_apply_out")
+    assert training_abi_contract["train_step_loss_cotangents_computed"] is True
     assert training_abi_contract["gradient_output_count"] > 0
     assert training_abi_contract["logical_buffer_count"] > (
         training_abi_contract["kernel_parameter_count"]
@@ -4314,14 +4327,12 @@ def test_path_c_fused_train_block_runtime_installer_compiles_artifact_when_banks
     assert install["artifact_compile"]["status"] == "ok"
     assert install["artifact_compile"]["native_compile_ok"] is True
     assert install["artifact_compile"]["artifact_bound"] is True
-    assert install["artifact_compile"]["training_abi_contract"]["status"] == (
-        "incomplete"
-    )
+    assert install["artifact_compile"]["training_abi_contract"]["status"] == "ok"
     assert (
         install["artifact_compile"]["training_abi_contract"][
             "can_back_value_and_grad"
         ]
-        is False
+        is True
     )
     assert (
         install["artifact_compile"]["training_abi_contract"][
@@ -4337,9 +4348,51 @@ def test_path_c_fused_train_block_runtime_installer_compiles_artifact_when_banks
     )
     assert (
         install["artifact_compile"]["training_abi_contract"][
+            "train_step_suffix_loss_input_abi_declared"
+        ]
+        is True
+    )
+    assert (
+        install["artifact_compile"]["training_abi_contract"][
+            "suffix_loss_inputs_available"
+        ]
+        is True
+    )
+    assert (
+        install["artifact_compile"]["training_abi_contract"][
+            "missing_suffix_loss_inputs"
+        ]
+        == []
+    )
+    assert (
+        install["artifact_compile"]["training_abi_contract"][
             "train_step_outputs_computed"
         ]
-        is False
+        is True
+    )
+    assert (
+        install["artifact_compile"]["training_abi_contract"][
+            "train_step_computed_outputs"
+        ]
+        == ["loss", "ntokens"]
+    )
+    assert (
+        install["artifact_compile"]["training_abi_contract"][
+            "train_step_pending_outputs"
+        ]
+        == []
+    )
+    install_loss_source_buffers = install["artifact_compile"][
+        "training_abi_contract"
+    ]["train_step_loss_source_buffers"]
+    assert len(install_loss_source_buffers) == 2
+    assert install_loss_source_buffers[0].endswith("_R_hidden_after")
+    assert install_loss_source_buffers[1].endswith("_A_sparse_mla_fp8_apply_out")
+    assert (
+        install["artifact_compile"]["training_abi_contract"][
+            "train_step_loss_cotangents_computed"
+        ]
+        is True
     )
     assert (
         install["artifact_compile"]["training_abi_contract"][

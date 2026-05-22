@@ -3683,11 +3683,13 @@ def test_model_derived_fwd_bwd_descriptor_declares_train_step_scalar_abi() -> No
 
     assert output_abi == {
         "declared": True,
-        "outputs_computed": False,
+        "outputs_computed": True,
+        "computed_logical_outputs": ("loss", "ntokens"),
+        "pending_logical_outputs": (),
         "logical_outputs": ("loss", "ntokens"),
         "reason": (
-            "train-step scalar ABI slots are declared, but suffix loss "
-            "codegen is not fused into the descriptor body yet"
+            "train-step scalar ABI slots are generated and populated by fused "
+            "suffix loss codegen"
         ),
     }
     assert buffer_abi_shapes["loss"] == (1,)
@@ -3698,6 +3700,228 @@ def test_model_derived_fwd_bwd_descriptor_declares_train_step_scalar_abi() -> No
     assert physical_abi_map["ntokens"]["bank"] == "path_c_float32_abi_bank"
     assert physical_abi_map["ntokens"]["shape"] == (1,)
     assert physical_abi_map["ntokens"]["dtype"] == "float32"
+
+
+def test_model_derived_fwd_bwd_descriptor_declares_suffix_loss_input_abi() -> None:
+    cfg = local_gb10_quarter_profile().tiny_smoke_config(
+        pattern="MRA",
+        depth=3,
+        dsa_a_layer_ranks=(0,),
+        max_seq_length=128,
+        hidden_size=32,
+        num_attention_heads=4,
+        mamba_head_dim=8,
+        mamba_state_dim=4,
+        mamba_groups=1,
+        m2rnn_k_head_dim=8,
+        m2rnn_v_head_dim=8,
+    )
+    model = SimpleNamespace(route_symbols=("M", "R", "A"), config=cfg)
+    fwd_region = build_path_c_model_regions_from_model(
+        model,
+        region_prefix="dynamic_mra_model",
+    )[0]
+    region = build_path_c_aot_autograd_region(fwd_region)
+    target = select_path_c_fusion_schedule_target(region)
+
+    assert target is not None
+    assert "train_step_suffix_loss_input_abi" in target.required_codegen_steps
+
+    prim_func = target.schedule_template(region)
+    suffix_abi = prim_func._cppmega_path_c_train_step_suffix_loss_input_abi
+    physical_abi_map = prim_func._cppmega_path_c_physical_buffer_abi_map
+    buffer_abi_shapes = prim_func._cppmega_path_c_buffer_abi_shapes
+
+    assert suffix_abi == {
+        "declared": True,
+        "logical_inputs": (
+            "target_ids",
+            "target_mask",
+            "final_norm_weight",
+            "lm_head_weight",
+        ),
+        "reason": (
+            "train-step suffix loss inputs are declared for fused loss codegen; "
+            "target_mask is consumed for ntokens, while full loss codegen is pending"
+        ),
+    }
+    assert buffer_abi_shapes["target_ids"] == (128,)
+    assert buffer_abi_shapes["target_mask"] == (128,)
+    assert buffer_abi_shapes["final_norm_weight"] == (32,)
+    assert buffer_abi_shapes["lm_head_weight"] == (cfg.vocab_size * 32,)
+    assert physical_abi_map["target_ids"]["dtype"] == "int32"
+    assert physical_abi_map["target_mask"]["dtype"] == "float32"
+    assert physical_abi_map["final_norm_weight"]["dtype"] == "float32"
+    assert physical_abi_map["lm_head_weight"]["dtype"] == "float32"
+    assert physical_abi_map["lm_head_weight"]["shape"] == (cfg.vocab_size * 32,)
+    assert physical_abi_map["lm_head_weight"]["logical_shape"] == (
+        cfg.vocab_size,
+        32,
+    )
+
+
+def test_model_derived_fwd_bwd_descriptor_computes_ntokens_from_target_mask() -> None:
+    cfg = local_gb10_quarter_profile().tiny_smoke_config(
+        pattern="MRA",
+        depth=3,
+        dsa_a_layer_ranks=(0,),
+        max_seq_length=128,
+        hidden_size=32,
+        num_attention_heads=4,
+        mamba_head_dim=8,
+        mamba_state_dim=4,
+        mamba_groups=1,
+        m2rnn_k_head_dim=8,
+        m2rnn_v_head_dim=8,
+    )
+    model = SimpleNamespace(route_symbols=("M", "R", "A"), config=cfg)
+    fwd_region = build_path_c_model_regions_from_model(
+        model,
+        region_prefix="dynamic_mra_model",
+    )[0]
+    region = build_path_c_aot_autograd_region(fwd_region)
+    target = select_path_c_fusion_schedule_target(region)
+
+    assert target is not None
+
+    prim_func = target.schedule_template(region)
+    output_abi = prim_func._cppmega_path_c_train_step_output_abi
+    generated_source = prim_func._cppmega_path_c_generated_source
+
+    assert output_abi["outputs_computed"] is True
+    assert output_abi["computed_logical_outputs"] == ("loss", "ntokens")
+    assert output_abi["pending_logical_outputs"] == ()
+    assert "# train_step_suffix_loss_ntokens" in generated_source
+    assert "for token_row in T.serial(0, 128):" in generated_source
+    assert _physical_bank_fragment(prim_func, "ntokens") in generated_source
+    assert _physical_bank_fragment(prim_func, "target_mask") in generated_source
+    assert "loss" in output_abi["computed_logical_outputs"]
+
+
+def test_model_derived_fwd_bwd_descriptor_computes_suffix_loss_before_backward() -> None:
+    cfg = local_gb10_quarter_profile().tiny_smoke_config(
+        pattern="MRA",
+        depth=3,
+        dsa_a_layer_ranks=(0,),
+        max_seq_length=128,
+        hidden_size=32,
+        num_attention_heads=4,
+        mamba_head_dim=8,
+        mamba_state_dim=4,
+        mamba_groups=1,
+        m2rnn_k_head_dim=8,
+        m2rnn_v_head_dim=8,
+    )
+    model = SimpleNamespace(route_symbols=("M", "R", "A"), config=cfg)
+    fwd_region = build_path_c_model_regions_from_model(
+        model,
+        region_prefix="dynamic_mra_model",
+    )[0]
+    region = build_path_c_aot_autograd_region(fwd_region)
+    target = select_path_c_fusion_schedule_target(region)
+
+    assert target is not None
+
+    prim_func = target.schedule_template(region)
+    output_abi = prim_func._cppmega_path_c_train_step_output_abi
+    generated_source = prim_func._cppmega_path_c_generated_source
+
+    assert output_abi["outputs_computed"] is True
+    assert output_abi["computed_logical_outputs"] == ("loss", "ntokens")
+    assert output_abi["pending_logical_outputs"] == ()
+    suffix_index = generated_source.index("# train_step_suffix_loss_scalar")
+    backward_index = generated_source.index("# backward_policy: row_phased_hidden_recompute")
+    assert suffix_index < backward_index
+    assert "for vocab_col in T.serial(0, 256):" in generated_source
+    assert "for suffix_hidden_col in T.serial(0, 32):" in generated_source
+    assert "T.exp(train_step_suffix_logit[0] - train_step_suffix_max_logit[0])" in (
+        generated_source
+    )
+    assert "T.log(train_step_suffix_sum_exp[0])" in generated_source
+    assert _physical_bank_fragment(prim_func, "loss") in generated_source
+    assert _physical_bank_fragment(prim_func, "target_ids") in generated_source
+    assert _physical_bank_fragment(prim_func, "target_mask") in generated_source
+    assert _physical_bank_fragment(prim_func, "final_norm_weight") in generated_source
+    assert _physical_bank_fragment(prim_func, "lm_head_weight") in generated_source
+    lm_head_info = prim_func._cppmega_path_c_physical_buffer_abi_map["lm_head_weight"]
+    assert (
+        f"{lm_head_info['bank']}[{lm_head_info['offset']} + "
+        "((vocab_col) * 32 + (suffix_hidden_col))]"
+    ) in generated_source
+    for source_name in (
+        "route_1_R_hidden_after",
+        "route_2_A_sparse_mla_fp8_apply_out",
+    ):
+        source_info = prim_func._cppmega_path_c_physical_buffer_abi_map[source_name]
+        assert source_info["logical_shape"] == (1, 128, 32)
+        assert (
+            f"{source_info['bank']}[{source_info['offset']} + "
+            "((token_row) * 32 + (suffix_hidden_col))]"
+        ) in generated_source
+    assert _physical_bank_fragment(prim_func, "route_1_R_hidden_after") in (
+        generated_source
+    )
+    assert _physical_bank_fragment(
+        prim_func,
+        "route_2_A_sparse_mla_fp8_apply_out",
+    ) in generated_source
+
+
+def test_model_derived_fwd_bwd_descriptor_seeds_suffix_loss_cotangents_before_backward() -> None:
+    cfg = local_gb10_quarter_profile().tiny_smoke_config(
+        pattern="MRA",
+        depth=3,
+        dsa_a_layer_ranks=(0,),
+        max_seq_length=128,
+        hidden_size=32,
+        num_attention_heads=4,
+        mamba_head_dim=8,
+        mamba_state_dim=4,
+        mamba_groups=1,
+        m2rnn_k_head_dim=8,
+        m2rnn_v_head_dim=8,
+    )
+    model = SimpleNamespace(route_symbols=("M", "R", "A"), config=cfg)
+    fwd_region = build_path_c_model_regions_from_model(
+        model,
+        region_prefix="dynamic_mra_model",
+    )[0]
+    region = build_path_c_aot_autograd_region(fwd_region)
+    target = select_path_c_fusion_schedule_target(region)
+
+    assert target is not None
+
+    prim_func = target.schedule_template(region)
+    generated_source = prim_func._cppmega_path_c_generated_source
+    cotangent_abi = prim_func._cppmega_path_c_train_step_loss_cotangent_abi
+
+    assert cotangent_abi["cotangents_computed"] is True
+    assert cotangent_abi["source_logical_buffers"] == (
+        "route_1_R_hidden_after",
+        "route_2_A_sparse_mla_fp8_apply_out",
+    )
+    assert cotangent_abi["logical_cotangent_buffers"] == (
+        "route_1_R_hidden_after_grad",
+        "route_2_A_sparse_mla_fp8_apply_out_grad",
+    )
+    suffix_index = generated_source.index("# train_step_suffix_loss_scalar")
+    seed_index = generated_source.index("# train_step_suffix_loss_cotangent_seeds")
+    backward_index = generated_source.index("# backward_policy: row_phased_hidden_recompute")
+    assert suffix_index < seed_index < backward_index
+    assert "train_step_suffix_seed_softmax[0]" in generated_source
+    assert "train_step_suffix_seed_class_grad[0]" in generated_source
+    assert "train_step_suffix_seed_dot[0]" in generated_source
+    assert "train_step_suffix_seed_hidden_grad[0]" in generated_source
+    assert "for seed_hidden_dot_col in T.serial(0, 32):" in generated_source
+    assert "for suffix_hidden_col in T.serial(0, 32):" in generated_source
+    assert "for vocab_col in T.serial(0, 256):" in generated_source
+    for grad_name in cotangent_abi["logical_cotangent_buffers"]:
+        grad_info = prim_func._cppmega_path_c_physical_buffer_abi_map[grad_name]
+        assert (
+            f"{grad_info['bank']}[{grad_info['offset']} + "
+            "((token_row) * 32 + (suffix_hidden_col))] = "
+            "train_step_suffix_seed_hidden_grad[0]"
+        ) in generated_source
 
 
 def test_model_region_shape_env_specializes_contract_and_cache_key() -> None:

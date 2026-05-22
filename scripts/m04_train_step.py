@@ -3094,11 +3094,24 @@ def _path_c_fused_train_block_training_abi_contract_payload(
             "returns_model_grads": False,
             "returns_full_model_grads": False,
             "train_step_output_abi_declared": False,
+            "train_step_suffix_loss_input_abi_declared": False,
             "train_step_outputs_computed": False,
+            "train_step_computed_outputs": [],
+            "train_step_pending_outputs": [],
+            "train_step_loss_source_buffers": [],
+            "train_step_loss_cotangents_computed": False,
+            "train_step_loss_cotangent_abi": {},
+            "suffix_loss_inputs_available": False,
             "logical_buffer_count": 0,
             "kernel_parameter_count": 0,
             "gradient_output_count": 0,
             "missing_value_and_grad_outputs": ["loss", "ntokens", "model_grads"],
+            "missing_suffix_loss_inputs": [
+                "target_ids",
+                "target_mask",
+                "final_norm_weight",
+                "lm_head_weight",
+            ],
             "loss_output_candidates": [],
             "ntokens_output_candidates": [],
             "sample_gradient_outputs": [],
@@ -3113,9 +3126,50 @@ def _path_c_fused_train_block_training_abi_contract_payload(
     train_step_output_abi = dict(
         getattr(prim_func, "_cppmega_path_c_train_step_output_abi", {}) or {}
     )
+    train_step_suffix_loss_input_abi = dict(
+        getattr(prim_func, "_cppmega_path_c_train_step_suffix_loss_input_abi", {})
+        or {}
+    )
     train_step_output_abi_declared = bool(train_step_output_abi.get("declared"))
+    train_step_suffix_loss_input_abi_declared = bool(
+        train_step_suffix_loss_input_abi.get("declared")
+    )
     train_step_outputs_computed = bool(
         train_step_output_abi.get("outputs_computed")
+    )
+    train_step_computed_outputs = [
+        str(name)
+        for name in train_step_output_abi.get("computed_logical_outputs", ())
+    ]
+    train_step_pending_outputs = [
+        str(name)
+        for name in train_step_output_abi.get("pending_logical_outputs", ())
+    ]
+    train_step_loss_source_buffers = [
+        str(name)
+        for name in (
+            getattr(
+                prim_func,
+                "_cppmega_path_c_train_step_suffix_loss_source_buffers",
+                (),
+            )
+            or ()
+        )
+    ]
+    train_step_loss_cotangent_abi = dict(
+        getattr(
+            prim_func,
+            "_cppmega_path_c_train_step_loss_cotangent_abi",
+            {},
+        )
+        or {}
+    )
+    train_step_loss_cotangents_computed = bool(
+        train_step_loss_cotangent_abi.get("cotangents_computed")
+    )
+    suffix_loss_inputs = tuple(
+        str(name)
+        for name in train_step_suffix_loss_input_abi.get("logical_inputs", ())
     )
     logical_names = tuple(str(name) for name in physical_abi_map)
 
@@ -3148,7 +3202,20 @@ def _path_c_fused_train_block_training_abi_contract_payload(
         missing_outputs.append("ntokens")
     if not gradient_outputs:
         missing_outputs.append("model_grads")
-    can_back_value_and_grad = not missing_outputs and train_step_outputs_computed
+    missing_suffix_loss_inputs = [
+        name for name in suffix_loss_inputs if name not in physical_abi_map
+    ]
+    suffix_loss_inputs_available = (
+        train_step_suffix_loss_input_abi_declared
+        and bool(suffix_loss_inputs)
+        and not missing_suffix_loss_inputs
+    )
+    can_back_value_and_grad = (
+        not missing_outputs
+        and suffix_loss_inputs_available
+        and train_step_outputs_computed
+        and train_step_loss_cotangents_computed
+    )
     return {
         "contract": PATH_C_FUSED_TRAIN_BLOCK_VALUE_AND_GRAD_CONTRACT,
         "status": "ok" if can_back_value_and_grad else "incomplete",
@@ -3158,12 +3225,23 @@ def _path_c_fused_train_block_training_abi_contract_payload(
         "returns_model_grads": bool(gradient_outputs),
         "returns_full_model_grads": False,
         "train_step_output_abi_declared": train_step_output_abi_declared,
+        "train_step_suffix_loss_input_abi_declared": (
+            train_step_suffix_loss_input_abi_declared
+        ),
         "train_step_outputs_computed": train_step_outputs_computed,
+        "train_step_computed_outputs": train_step_computed_outputs,
+        "train_step_pending_outputs": train_step_pending_outputs,
+        "train_step_loss_source_buffers": train_step_loss_source_buffers,
+        "train_step_loss_cotangents_computed": train_step_loss_cotangents_computed,
+        "train_step_loss_cotangent_abi": train_step_loss_cotangent_abi,
         "train_step_output_abi": train_step_output_abi,
+        "train_step_suffix_loss_input_abi": train_step_suffix_loss_input_abi,
+        "suffix_loss_inputs_available": suffix_loss_inputs_available,
         "logical_buffer_count": len(logical_names),
         "kernel_parameter_count": len(physical_abi_shapes),
         "gradient_output_count": len(gradient_outputs),
         "missing_value_and_grad_outputs": missing_outputs,
+        "missing_suffix_loss_inputs": missing_suffix_loss_inputs,
         "loss_output_candidates": loss_outputs,
         "ntokens_output_candidates": ntokens_outputs,
         "sample_gradient_outputs": gradient_outputs[:8],
@@ -3171,6 +3249,21 @@ def _path_c_fused_train_block_training_abi_contract_payload(
             "generated fused train-block ABI exposes loss, ntokens, and gradient "
             "buffers for value_and_grad"
             if can_back_value_and_grad
+            else "generated fused train-block ABI declares scalar outputs, but "
+            "is missing suffix loss inputs required to compute them"
+            if not missing_outputs and not suffix_loss_inputs_available
+            else "generated fused train-block ABI computes loss and ntokens, "
+            "but suffix loss cotangents are not generated into the backward "
+            "seed buffers yet"
+            if (
+                not missing_outputs
+                and suffix_loss_inputs_available
+                and train_step_outputs_computed
+                and not train_step_loss_cotangents_computed
+            )
+            else "generated fused train-block ABI computes ntokens from "
+            "target_mask, but loss suffix codegen has not populated loss yet"
+            if not missing_outputs and train_step_computed_outputs
             else "generated fused train-block ABI declares the train-step "
             "loss/ntokens scalar slots, but suffix loss codegen has not populated "
             "them yet"
