@@ -45,6 +45,11 @@ from cppmega_v4.jsonrpc.schema import VerifyParams
 StageStatus = Literal["ok", "skipped", "fail", "cancelled"]
 
 
+class _ArchMismatchSentinel(Exception):
+    """V7-C01 internal control-flow: skip opt-state load on strict
+    arch mismatch without surfacing as a real error."""
+
+
 @dataclass
 class StageResult:
     """One stage's execution outcome."""
@@ -1118,19 +1123,99 @@ def stage_train(ctx: StageContext) -> StageResult:
         # resumed run picks up Adam moments → strict losses[0] parity
         # with the saved run's losses[-1].
         opt_state_load = opts.get("opt_state_load_path")
+        opt_state_strict = bool(opts.get("opt_state_strict", False))
+        opt_state_arch_diff: dict[str, Any] | None = None
         if opt_state_load:
             try:
                 import safetensors.mlx as _stmlx
                 loaded_st = _stmlx.load_file(opt_state_load)
                 # V01: pull rng_key out of the opt-state bundle before
-                # tree_unflatten so it doesn't pollute opt.state. mlx
-                # rng keys are mx.uint32 arrays of shape (2,).
+                # tree_unflatten so it doesn't pollute opt.state.
                 rng_buf = loaded_st.pop("_rng_key", None)
+                # V7-C01: structural fingerprint diff. Fresh Adam
+                # optimisers initialise opt.state lazily (only after
+                # the first opt.update), so the saved opt-state is
+                # compared against the LIVE MODEL params instead.
+                # Each opt-state key for AdamW carries the same shape
+                # as its underlying param (m and v moments share the
+                # param shape). We strip suffixes that aren't actual
+                # model keys to find the base param.
+                live_flat = dict(nn.utils.tree_flatten(
+                    all_modules.parameters()))
+                def _fp(d: dict) -> dict[str, tuple]:
+                    return {k: (tuple(v.shape), str(v.dtype))
+                            for k, v in d.items() if hasattr(v, "shape")}
+                live_fp = _fp(live_flat)
+                saved_fp = _fp(loaded_st)
+                def _base(k: str) -> str | None:
+                    if k in live_fp:
+                        return k
+                    # Walk back along dot path looking for a model
+                    # param this opt-state entry corresponds to.
+                    parts = k.split(".")
+                    for cut in range(len(parts) - 1, 0, -1):
+                        cand = ".".join(parts[:cut])
+                        if cand in live_fp:
+                            return cand
+                    return None
+                # Non-param opt entries (e.g. AdamW "step",
+                # "learning_rate" scalars) are neither model-derived
+                # nor problematic — skip them.
+                NON_PARAM_SUFFIXES = {"step", "learning_rate"}
+                missing: list[str] = []   # model param with no opt-state
+                covered: set[str] = set()
+                extra: list[str] = []     # opt-state without a model param
+                shape_mismatch: list[str] = []
+                for sk, sv in saved_fp.items():
+                    if (sk in NON_PARAM_SUFFIXES
+                            or sk.endswith(".step")
+                            or sk.endswith(".learning_rate")):
+                        continue
+                    bk = _base(sk)
+                    if bk is None:
+                        extra.append(sk)
+                        continue
+                    covered.add(bk)
+                    if live_fp[bk] != sv:
+                        shape_mismatch.append(sk)
+                missing = sorted(set(live_fp) - covered)
+                extra = sorted(extra)
+                shape_mismatch = sorted(shape_mismatch)
+                if missing or extra or shape_mismatch:
+                    opt_state_arch_diff = {
+                        "missing_keys": missing[:10],
+                        "missing_keys_count": len(missing),
+                        "extra_keys": extra[:10],
+                        "extra_keys_count": len(extra),
+                        "shape_mismatch": shape_mismatch[:10],
+                        "shape_mismatch_count": len(shape_mismatch),
+                    }
+                    # Strict mode: skip on ANY diff.
+                    # Non-strict: skip only on shape_mismatch (would
+                    # crash mid-step otherwise); tolerate missing/extra.
+                    skip_load = (opt_state_strict
+                                  or len(shape_mismatch) > 0)
+                    if skip_load:
+                        mode = ("strict mode" if opt_state_strict
+                                else "shape mismatch")
+                        opt_state_warning = (
+                            f"opt_state arch mismatch ({mode}): "
+                            f"{len(missing)} missing, {len(extra)} extra, "
+                            f"{len(shape_mismatch)} shape-mismatch keys; "
+                            f"cold restart"
+                        )
+                        raise _ArchMismatchSentinel()
+                # Not strict (or no diff) → attempt load. Missing/extra
+                # keys are tolerated; shape_mismatch will still raise
+                # in tree_unflatten and surface as the generic warning.
                 opt.state = nn.utils.tree_unflatten(list(loaded_st.items()))
                 if rng_buf is not None:
                     rng_key = rng_buf
                     rng_key_loaded = True
                 opt_state_loaded_path = str(opt_state_load)
+            except _ArchMismatchSentinel:
+                # Already populated opt_state_warning above.
+                pass
             except FileNotFoundError as exc:
                 opt_state_warning = (
                     f"opt_state_load_path missing: {exc}; cold restart")
@@ -1429,6 +1514,7 @@ def stage_train(ctx: StageContext) -> StageResult:
                     "opt_state_loaded_path": opt_state_loaded_path,
                     "opt_state_warning": opt_state_warning,
                     "rng_key_loaded": rng_key_loaded,
+                    "opt_state_arch_diff": opt_state_arch_diff,
                 },
                 "mtp": _compute_mtp_extras(
                     all_modules, mtp_k, mtp_betas, vocab_size,
