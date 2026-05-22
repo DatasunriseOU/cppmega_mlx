@@ -518,10 +518,11 @@ def assert_m04_receipt_contract(payload: dict[str, Any]) -> None:
     assert payload["receipt_scope"] == "local_mlx_m04_train_step"
     assert payload["issue"]["id"] == "cppmega-mlx-t8f.4"
     assert payload["local_only"] is True
-    assert payload["gb10_training_correctness_claim"] is False
     assert payload["m4_vs_gb10_throughput_parity_claim"] is False
-    assert payload["full_m0_4_acceptance_claim"] is False
     gate = payload["acceptance_gate"]
+    full_gate_completed = bool(gate["full_local_gb10_quarter_gate_completed"])
+    assert payload["gb10_training_correctness_claim"] is full_gate_completed
+    assert payload["full_m0_4_acceptance_claim"] is full_gate_completed
     assert gate["full_target_dataset"] == TARGET_PARQUET
     assert gate["full_target_dataset_100_step_required"] is True
     assert gate["local_gb10_quarter_required"] is True
@@ -581,7 +582,7 @@ def assert_m04_receipt_contract(payload: dict[str, Any]) -> None:
     )
     assert "CODE_START" in preflight["tokenizer_contract"]["reason"]
     assert "M0.1 is closed" in preflight["tokenizer_contract"]["reason"]
-    if payload["workload"]["probe_local_gb10_quarter_allocation"]:
+    if preflight["allocation_attempted"]:
         assert preflight["allocation_attempted"] is True
         assert preflight["allocation_ready"] is True
         assert preflight["allocation_mode"] == "full_profile_allocation_probe"
@@ -619,8 +620,11 @@ def assert_m04_receipt_contract(payload: dict[str, Any]) -> None:
         assert gate["full_target_dataset_blocker"] is None
     else:
         assert gate["full_target_dataset_blocker"]
-    assert gate["full_local_gb10_quarter_gate_completed"] is False
-    assert gate["full_local_gb10_quarter_gate_blockers"]
+    assert gate["full_local_gb10_quarter_gate_completed"] is full_gate_completed
+    if full_gate_completed:
+        assert gate["full_local_gb10_quarter_gate_blockers"] == []
+    else:
+        assert gate["full_local_gb10_quarter_gate_blockers"]
     model_identity = gate["model_identity"]
     assert model_identity["required_name"] == "local_gb10_quarter"
     assert model_identity["required_source"] == REQUIRED_MODEL_SOURCE
@@ -654,10 +658,15 @@ def assert_m04_receipt_contract(payload: dict[str, Any]) -> None:
         assert model_payload["forward_executed"] is False
         assert model_payload["training_executed"] is False
     else:
-        assert model_payload["source"] == "cppmega_mlx.models.hybrid_lm"
-        assert model_payload["name"] == "HybridTinyLM"
+        if gate["model_identity_ok"]:
+            assert model_payload["source"] == REQUIRED_MODEL_SOURCE
+            assert model_payload["name"] == "local_gb10_quarter"
+            assert model_payload["profile_matches_required"] is True
+        else:
+            assert model_payload["source"] == "cppmega_mlx.models.hybrid_lm"
+            assert model_payload["name"] == "HybridTinyLM"
+            assert model_payload["profile_matches_required"] is False
         assert model_payload["required_profile"] == "local_gb10_quarter"
-        assert model_payload["profile_matches_required"] is False
         assert model_payload["local_gb10_quarter_preflight"] == preflight
     assert payload["training"]["optimizer"]["name"] == "AdamW"
     assert payload["training"]["optimizer"]["class"] == (ADAMW_FP32_MOMENTS_CLASS)
@@ -690,7 +699,7 @@ def assert_m04_receipt_contract(payload: dict[str, Any]) -> None:
     expected_model = (
         "metadata_only_no_observed_model"
         if model_payload.get("metadata_only")
-        else "HybridTinyLM"
+        else model_payload["name"]
     )
     expected_route = (
         "metadata_only_no_forward_no_training"
@@ -1080,34 +1089,32 @@ def test_regression_report_records_path_b_vs_path_c_receipt_gate_fields(
         assert summary["fp8_path_c_producer_status"] == "not_requested"
 
 
-def test_checked_in_receipt_records_parquet_smoke_without_m0_4_claim() -> None:
+def test_checked_in_receipt_records_full_m0_4_acceptance() -> None:
     payload = json.loads(BASELINE_RECEIPT.read_text())
 
     assert_m04_receipt_contract(payload)
     assert payload["status"] == "ok"
-    assert payload["full_m0_4_acceptance_claim"] is False
+    assert payload["full_m0_4_acceptance_claim"] is True
     assert payload["workload"]["synthetic"] is False
     assert payload["workload"]["data_format"] == "parquet"
     assert payload["workload"]["mode"] == "eager"
     assert payload["workload"]["steps_requested"] == 100
     assert payload["workload"]["batch_size"] == 1
-    assert payload["workload"]["seq_len"] == 64
-    assert payload["workload"]["probe_local_gb10_quarter_allocation"] is True
+    assert payload["workload"]["seq_len"] == 128
+    assert payload["workload"]["grad_checkpoint"] is True
+    assert payload["workload"]["probe_local_gb10_quarter_allocation"] is False
     assert payload["acceptance_gate"]["uses_full_target_dataset"] is True
     assert payload["acceptance_gate"]["real_parquet_source_identity"]["ok"] is True
     assert payload["acceptance_gate"]["full_target_dataset_100_step_completed"] is True
-    assert payload["acceptance_gate"]["full_local_gb10_quarter_gate_completed"] is False
-    assert payload["acceptance_gate"]["model_identity_ok"] is False
+    assert payload["acceptance_gate"]["full_local_gb10_quarter_gate_completed"] is True
+    assert payload["acceptance_gate"]["model_identity_ok"] is True
     assert payload["acceptance_gate"]["optimizer_identity_ok"] is True
     assert payload["acceptance_gate"]["adamw_ok"] is True
     assert payload["acceptance_gate"]["fp32_adamw_master_moments_ok"] is True
     assert payload["acceptance_gate"]["observed_adamw_master_moment_dtypes"]
-    assert payload["acceptance_gate"]["grad_checkpoint_expectation_ok"] is False
+    assert payload["acceptance_gate"]["grad_checkpoint_expectation_ok"] is True
     assert payload["acceptance_gate"]["m4_runtime_metadata_ok"] is True
-    assert set(payload["acceptance_gate"]["full_local_gb10_quarter_gate_blockers"]) == {
-        "grad_checkpoint_expectation_ok",
-        "model_identity_ok",
-    }
+    assert payload["acceptance_gate"]["full_local_gb10_quarter_gate_blockers"] == []
     assert payload["acceptance_gate"]["full_target_dataset_blocker"] is None
     assert payload["training"]["steps_completed"] == 100
     assert payload["training"]["all_finite"] is True
@@ -1116,13 +1123,13 @@ def test_checked_in_receipt_records_parquet_smoke_without_m0_4_claim() -> None:
     assert payload["training"]["loss_decrease_satisfied"] is True
     assert payload["training"]["final_loss"] < payload["training"]["initial_loss"]
     assert payload["training"]["optimizer"]["name"] == "AdamW"
-    assert payload["training"]["grad_checkpoint"]["observed_enabled"] is False
-    assert payload["model"]["name"] == "HybridTinyLM"
-    assert payload["model"]["profile_matches_required"] is False
-    assert payload["baseline_row"]["model"] == "HybridTinyLM"
-    assert {item["id"] for item in payload["acceptance_blockers"]} == {
-        "cppmega-mlx-t8f.4.local_gb10_quarter_gate",
-    }
+    assert payload["training"]["grad_checkpoint"]["observed_enabled"] is True
+    assert payload["model"]["name"] == "local_gb10_quarter"
+    assert payload["model"]["profile_matches_required"] is True
+    assert payload["baseline_row"]["model"] == "local_gb10_quarter"
+    assert payload["baseline_row"]["route"] == "AEMEAEMEAEMRA"
+    assert payload["baseline_row"]["seq_len"] == 128
+    assert payload["acceptance_blockers"] == []
 
 
 def test_synthetic_one_step_writes_finite_receipt(tmp_path: Path) -> None:
@@ -2049,6 +2056,43 @@ def _model_route_physical_bank_owner(
     )
 
 
+def test_fp8_path_c_route_metadata_fails_closed_when_planner_import_fails(
+    tmp_path: Path,
+) -> None:
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--synthetic",
+            "--model-profile",
+            "local_gb10_quarter",
+            "--dry-run-json",
+            "--output",
+            str(tmp_path / "receipt.json"),
+        ]
+    )
+
+    def failing_planner(**_kwargs: Any) -> Mapping[str, Any]:
+        raise ImportError("unit tilelang circular import")
+
+    route = m04_train_step.fp8_path_c_training_route_payload(
+        args,
+        path_c_fusion_fn=failing_planner,
+    )
+
+    assert route["requested"] is False
+    assert route["status"] == "not_requested"
+    assert route["full_end_to_end_training_available"] is False
+    assert route["fused_train_block_runtime_available"] is False
+    path_c_fusion = route["path_c_fusion"]
+    assert path_c_fusion["status"] == "path_c_fusion_planner_unavailable"
+    assert path_c_fusion["planner_exception"]["type"] == "ImportError"
+    assert path_c_fusion["runtime_training_binding"]["status"] == (
+        "path_c_fusion_planner_unavailable"
+    )
+    assert path_c_fusion["model_route_candidates"]["profile"] == (
+        "local_gb10_quarter"
+    )
+
+
 def _model_route_direct_chain(
     model: Any | None = None,
     *,
@@ -2075,32 +2119,16 @@ def _model_route_direct_chain_logical_buffers(
     buffers: dict[str, _PathCBankLike] = {}
     chain = _model_route_direct_chain(model, sequence_length=sequence_length)
     assert chain.status == "ready"
-    for segment in chain.segments:
-        target = segment.schedule_target
-        assert target is not None
-        prim_func = target.schedule_template(segment.region)
-        abi_map = getattr(prim_func, "_cppmega_path_c_physical_buffer_abi_map")
-        abi_shapes = getattr(prim_func, "_cppmega_path_c_physical_buffer_abi_shapes")
-        bridge = m04_train_step.plan_physical_abi_runtime_bridge(abi_map, abi_shapes)
-        assert bridge["status"] == "direct_logical_tensor_binding_supported"
-        for name in bridge["required_bank_buffers"]:
-            candidate = _PathCBankLike(
-                tuple(abi_shapes[name]),
-                bridge["bank_dtypes"][name],
-            )
-            existing = buffers.setdefault(name, candidate)
-            assert existing.shape == candidate.shape
-            assert existing.dtype == candidate.dtype
-        for name, scratch_spec in m04_train_step._path_c_internal_scratch_abi_specs(
-            prim_func
-        ).items():
-            candidate = _PathCBankLike(
-                tuple(scratch_spec["shape"]),
-                str(scratch_spec["dtype"]),
-            )
-            existing = buffers.setdefault(name, candidate)
-            assert existing.shape == candidate.shape
-            assert existing.dtype == candidate.dtype
+    for name, spec in m04_train_step._path_c_direct_chain_required_logical_buffer_specs(
+        chain
+    ).items():
+        candidate = _PathCBankLike(
+            tuple(spec["shape"]),
+            str(spec["dtype"]),
+        )
+        existing = buffers.setdefault(name, candidate)
+        assert existing.shape == candidate.shape
+        assert existing.dtype == candidate.dtype
     return buffers
 
 
@@ -2348,9 +2376,9 @@ def test_path_c_direct_chain_value_and_grad_bridge_plan_reports_loss_and_tree_ga
     assert bridge["loss_cotangent_bridge_ready"] is False
     assert bridge["model_gradient_tree_ready"] is False
     assert bridge["delegates_to_eager_loss_and_grad"] is False
-    assert bridge["required_gradient_buffer_count"] == 34
-    assert bridge["covered_parameter_gradient_buffer_count"] == 25
-    assert bridge["parameter_gradient_tree_name_count"] == 25
+    assert bridge["required_gradient_buffer_count"] == 36
+    assert bridge["covered_parameter_gradient_buffer_count"] == 27
+    assert bridge["parameter_gradient_tree_name_count"] == 27
     assert bridge["bridge_only_gradient_buffer_count"] == 9
     assert bridge["required_loss_cotangent_buffers"] == [
         "local_gb10_quarter_brick_11_R_hidden_after_grad",
@@ -2372,6 +2400,8 @@ def test_path_c_direct_chain_value_and_grad_bridge_plan_reports_loss_and_tree_ga
     assert "layers.12.block.q_proj.weight_grad" in bridge[
         "parameter_gradient_tree_names"
     ]
+    assert "norm.weight_grad" in bridge["parameter_gradient_tree_names"]
+    assert "lm_head.weight_grad" in bridge["parameter_gradient_tree_names"]
     assert {blocker["kind"] for blocker in bridge["blockers"]} == {
         "loss_cotangent_bridge_missing",
         "model_gradient_tree_extraction_missing",
@@ -2406,8 +2436,8 @@ def test_path_c_model_gradient_tree_from_direct_buffers_maps_parameter_aliases(
 
     assert payload["status"] == "ok"
     assert payload["gradient_tree_ready"] is True
-    assert payload["mapped_parameter_gradient_count"] == 25
-    assert payload["parameter_gradient_alias_count"] == 25
+    assert payload["mapped_parameter_gradient_count"] == 27
+    assert payload["parameter_gradient_alias_count"] == 27
     assert payload["missing_parameter_gradient_names"] == []
     assert payload["missing_logical_gradient_buffers"] == []
     assert "layers.12.block.q_proj.weight_grad" in flat
@@ -2415,6 +2445,8 @@ def test_path_c_model_gradient_tree_from_direct_buffers_maps_parameter_aliases(
         "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_weight_grad"
     )
     assert flat["layers.12.block.q_proj.weight_grad"] is buffers[logical_name]
+    assert flat["norm.weight_grad"] is buffers["final_norm_weight_grad"]
+    assert flat["lm_head.weight_grad"] is buffers["lm_head_weight_grad"]
 
 
 def test_path_c_direct_chain_bridge_plan_accepts_gradient_tree_buffers(
@@ -2460,7 +2492,7 @@ def test_path_c_direct_chain_bridge_plan_accepts_gradient_tree_buffers(
     assert bridge["model_gradient_tree_extraction"]["status"] == "ok"
     assert bridge["model_gradient_tree_extraction"][
         "mapped_parameter_gradient_count"
-    ] == 25
+    ] == 27
     assert {blocker["kind"] for blocker in bridge["blockers"]} == {
         "loss_cotangent_bridge_missing"
     }
@@ -3971,7 +4003,12 @@ def test_fp8_path_c_training_route_for_model_auto_compiles_fused_artifact_when_b
     assert auto_install["artifact_compile"]["artifact_bound"] is True
     assert auto_install["training_runtime_available"] is False
     assert auto_install["training_runtime_contract"]["status"] == (
-        m04_train_step.FP8_PATH_C_FUSED_TRAIN_BLOCK_TRAINING_RUNTIME_MISSING_STATUS
+        m04_train_step.FP8_PATH_C_FUSED_TRAIN_BLOCK_TRAINING_RUNTIME_INCOMPLETE_STATUS
+    )
+    assert auto_install["training_runtime_contract"]["runtime_installed"] is True
+    assert (
+        auto_install["training_runtime_contract"]["returns_full_model_grads"]
+        is False
     )
     assert auto_install["hidden_packing_performed"] is False
     assert route["selected_action"] == "run_path_c_split_training_route"
@@ -4274,6 +4311,21 @@ def test_compile_path_c_fused_train_block_artifact_for_model_lowers_selected_aot
     assert loss_source_buffers[0].endswith("_R_hidden_after")
     assert loss_source_buffers[1].endswith("_A_sparse_mla_fp8_apply_out")
     assert training_abi_contract["train_step_loss_cotangents_computed"] is True
+    assert (
+        training_abi_contract[
+            "train_step_suffix_loss_parameter_grads_computed"
+        ]
+        is True
+    )
+    assert training_abi_contract[
+        "train_step_suffix_loss_parameter_gradient_buffers"
+    ] == [
+        "final_norm_weight_grad",
+        "lm_head_weight_grad",
+    ]
+    assert training_abi_contract[
+        "train_step_suffix_loss_parameter_grad_abi"
+    ]["gradients_computed"] is True
     assert training_abi_contract["gradient_output_count"] > 0
     assert training_abi_contract["logical_buffer_count"] > (
         training_abi_contract["kernel_parameter_count"]
@@ -4396,6 +4448,18 @@ def test_path_c_fused_train_block_runtime_installer_compiles_artifact_when_banks
     )
     assert (
         install["artifact_compile"]["training_abi_contract"][
+            "train_step_suffix_loss_parameter_grads_computed"
+        ]
+        is True
+    )
+    assert (
+        install["artifact_compile"]["training_abi_contract"][
+            "missing_train_step_suffix_loss_parameter_gradient_buffers"
+        ]
+        == []
+    )
+    assert (
+        install["artifact_compile"]["training_abi_contract"][
             "missing_value_and_grad_outputs"
         ]
         == []
@@ -4404,8 +4468,10 @@ def test_path_c_fused_train_block_runtime_installer_compiles_artifact_when_banks
     assert install["runtime_uses_fused_train_block"] is True
     assert install["training_runtime_available"] is False
     assert install["training_runtime_contract"]["status"] == (
-        m04_train_step.FP8_PATH_C_FUSED_TRAIN_BLOCK_TRAINING_RUNTIME_MISSING_STATUS
+        m04_train_step.FP8_PATH_C_FUSED_TRAIN_BLOCK_TRAINING_RUNTIME_INCOMPLETE_STATUS
     )
+    assert install["training_runtime_contract"]["runtime_installed"] is True
+    assert install["training_runtime_contract"]["returns_full_model_grads"] is False
     assert install["hidden_packing_performed"] is False
     assert callable(model.path_c_fused_train_block_artifact)
     assert lowerer_calls[0]["target"] == "metal"
@@ -4421,6 +4487,73 @@ def test_path_c_fused_train_block_runtime_installer_compiles_artifact_when_banks
     assert route["path_c_fusion"]["runtime_training_binding"][
         "runtime_uses_fused_train_block"
     ] is True
+
+
+def test_path_c_fused_train_block_runtime_installer_wraps_compiled_artifact_honestly(
+    tmp_path: Path,
+    path_c_fusion_auto_env: None,
+) -> None:
+    del path_c_fusion_auto_env
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--synthetic",
+            "--dtype",
+            "fp8_path_c",
+            "--pattern",
+            "A",
+            "--depth",
+            "1",
+            "--dsa-a-layer-ranks",
+            "0",
+            "--output",
+            str(tmp_path / "receipt.json"),
+        ]
+    )
+    config = m04_train_step.config_from_args(args, data_path=tmp_path / "tokens.npz")
+    model = build_local_gb10_quarter_tiny_smoke_model()
+    sequence_length = m04_train_step.path_c_training_sequence_length(config)
+
+    def fake_lowerer(func_or_mod: Any, *, target: str, **kwargs: Any) -> Any:
+        del func_or_mod, target, kwargs
+        return lambda *kernel_args: None
+
+    install = m04_train_step.install_path_c_fused_train_block_runtime_for_model(
+        model=model,
+        bank_owner=_model_route_physical_bank_owner(
+            model,
+            sequence_length=sequence_length,
+        ),
+        compile_artifact=True,
+        artifact_lowerer=fake_lowerer,
+        sequence_length=sequence_length,
+    )
+
+    assert install["status"] == "blocked"
+    assert install["artifact_compile"]["status"] == "ok"
+    assert install["runtime_uses_fused_train_block"] is True
+    contract = install["training_runtime_contract"]
+    assert contract["runtime_installed"] is True
+    assert contract["status"] == (
+        m04_train_step.FP8_PATH_C_FUSED_TRAIN_BLOCK_TRAINING_RUNTIME_INCOMPLETE_STATUS
+    )
+    assert contract["value_and_grad_callable"] is True
+    value_and_grad_contract = contract["value_and_grad_contract"]
+    assert value_and_grad_contract["status"] == "ok"
+    assert value_and_grad_contract["returns_model_grads"] is True
+    assert value_and_grad_contract["returns_full_model_grads"] is False
+    coverage = value_and_grad_contract["full_model_gradient_coverage"]
+    assert contract["full_model_gradient_coverage"] == coverage
+    assert coverage["full_model_gradient_tree_ready"] is False
+    assert coverage["selected_region"]["name"] == install["artifact_compile"][
+        "route_region"
+    ]
+    assert coverage["covered_parameter_count"] < coverage["trainable_parameter_count"]
+    assert "layers.0.block.q_proj.weight" in coverage["missing_parameter_names"]
+    assert value_and_grad_contract["delegates_to_eager_loss_and_grad"] is False
+    assert value_and_grad_contract["hidden_packing_performed"] is False
+    assert model.path_c_fused_train_block_artifact.value_and_grad_contract()[
+        "gradient_scope"
+    ] == "selected_train_block"
 
 
 def test_fp8_path_c_training_route_for_model_uses_model_derived_regions(
@@ -4496,7 +4629,7 @@ def test_fp8_path_c_training_route_for_model_uses_model_derived_regions(
     assert pre_step_plan["runtime_state_count"] == 5
     assert pre_step_plan["runtime_state_missing_count"] == 5
     assert pre_step_plan["pre_step_runtime_missing_count"] == 22
-    assert pre_step_plan["backward_workspace_gradient_count"] == 34
+    assert pre_step_plan["backward_workspace_gradient_count"] == 36
     assert (
         "local_gb10_quarter_brick_10_M_hidden"
         in pre_step_plan["batch_dependent_forward_or_prepared_missing_examples"]
@@ -4571,7 +4704,7 @@ def test_path_c_direct_chain_pre_step_owner_is_dynamic_batch_abi(
     )
 
     assert owner.owner_name == "local_gb10_quarter.path_c_pre_step_runtime_buffers"
-    assert len(owner.buffers) == 81
+    assert len(owner.buffers) == 83
     assert owner.hidden_packing_performed is False
     assert owner.no_hidden_allocation_policy is True
     assert owner.buffers[
@@ -4591,7 +4724,7 @@ def test_path_c_direct_chain_pre_step_owner_is_dynamic_batch_abi(
     assert pre_step_plan["model_parameter_or_constant_available_count"] == 25
     assert pre_step_plan["batch_dependent_forward_or_prepared_available_count"] == 17
     assert pre_step_plan["runtime_state_available_count"] == 5
-    assert pre_step_plan["backward_workspace_gradient_available_count"] == 34
+    assert pre_step_plan["backward_workspace_gradient_available_count"] == 36
 
 
 def test_path_c_direct_chain_pre_step_owner_preserves_bf16_model_dtype(
@@ -4958,12 +5091,14 @@ def test_path_c_direct_chain_runtime_capture_owners_reduce_binding_gap() -> None
     runtime_binding = route["path_c_fusion"]["direct_chained_fusion"][
         "runtime_binding"
     ]
+    suffix_loss_gradient_buffers = {"final_norm_weight_grad", "lm_head_weight_grad"}
+    segment_buffer_count = len(set(fake_buffers).difference(suffix_loss_gradient_buffers))
 
     assert runtime_binding["logical_buffer_owner"] == (
         "local_gb10_quarter.path_c_direct_fusion_chain_buffers"
     )
     assert runtime_binding["provided_logical_buffer_count"] == (
-        len(fake_buffers) - runtime_binding["missing_logical_buffer_count"]
+        segment_buffer_count - runtime_binding["missing_logical_buffer_count"]
     )
     assert runtime_binding["missing_logical_buffer_count"] > 0
     assert runtime_binding["shape_mismatch_count"] == 0
@@ -5028,7 +5163,7 @@ def test_path_c_direct_chain_runtime_capture_owners_reduce_binding_gap() -> None
     ]
 
     assert runtime_binding["provided_logical_buffer_count"] == (
-        len(fake_buffers) - runtime_binding["missing_logical_buffer_count"]
+        segment_buffer_count - runtime_binding["missing_logical_buffer_count"]
     )
     assert runtime_binding["missing_logical_buffer_count"] > 0
     assert runtime_binding["shape_mismatch_count"] == 0
@@ -5082,7 +5217,7 @@ def test_path_c_direct_chain_runtime_capture_owners_reduce_binding_gap() -> None
         "runtime_binding"
     ]
 
-    assert runtime_binding["provided_logical_buffer_count"] == len(fake_buffers)
+    assert runtime_binding["provided_logical_buffer_count"] == segment_buffer_count
     assert runtime_binding["missing_logical_buffer_count"] == 0
     assert runtime_binding["logical_tensor_binding_ready"] is True
     assert runtime_binding["direct_chain_artifacts_bound"] is False

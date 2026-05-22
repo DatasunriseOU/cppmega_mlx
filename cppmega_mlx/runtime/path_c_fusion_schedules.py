@@ -18,7 +18,7 @@ import json
 import keyword
 import linecache
 import re
-from typing import Any
+from typing import Any, cast
 
 from cppmega_mlx.runtime.path_c_fusion import (
     CompiledPathCRegion,
@@ -122,6 +122,10 @@ _TRAIN_STEP_SUFFIX_LOSS_INPUT_ABI_NAMES = (
     "target_mask",
     "final_norm_weight",
     "lm_head_weight",
+)
+_TRAIN_STEP_SUFFIX_LOSS_PARAMETER_GRAD_ABI_NAMES = (
+    "final_norm_weight_grad",
+    "lm_head_weight_grad",
 )
 _TRAIN_STEP_SUFFIX_LOSS_INPUT_ABI_REASON = (
     "train-step suffix loss inputs are declared for fused loss codegen; "
@@ -865,27 +869,28 @@ def make_path_c_descriptor_schedule_template(
             train_step_output_abi=bool(train_step_output_abi),
         )
 
-    descriptor_schedule_template._cppmega_path_c_schedule_generator = (
+    descriptor_schedule_metadata = cast(Any, descriptor_schedule_template)
+    descriptor_schedule_metadata._cppmega_path_c_schedule_generator = (
         PATH_C_DESCRIPTOR_SCHEDULE_GENERATOR
     )
-    descriptor_schedule_template._cppmega_path_c_brick_ops = tuple(
+    descriptor_schedule_metadata._cppmega_path_c_brick_ops = tuple(
         descriptor.op_name for descriptor in descriptors
     )
-    descriptor_schedule_template._cppmega_path_c_buffer_extent = extent
-    descriptor_schedule_template._cppmega_path_c_shape_env = shape_env
-    descriptor_schedule_template._cppmega_path_c_internal_buffer_policy = (
+    descriptor_schedule_metadata._cppmega_path_c_buffer_extent = extent
+    descriptor_schedule_metadata._cppmega_path_c_shape_env = shape_env
+    descriptor_schedule_metadata._cppmega_path_c_internal_buffer_policy = (
         validated_internal_buffer_policy
     )
-    descriptor_schedule_template._cppmega_path_c_loop_policy = validated_loop_policy
-    descriptor_schedule_template._cppmega_path_c_physical_abi_policy = (
+    descriptor_schedule_metadata._cppmega_path_c_loop_policy = validated_loop_policy
+    descriptor_schedule_metadata._cppmega_path_c_physical_abi_policy = (
         validated_physical_abi_policy
     )
-    descriptor_schedule_template._cppmega_path_c_workspace_edge_buffers = (
+    descriptor_schedule_metadata._cppmega_path_c_workspace_edge_buffers = (
         ("kv_fp8", "kv_scale")
         if _descriptor_chain_uses_kv_history_workspace(descriptors)
         else ()
     )
-    descriptor_schedule_template._cppmega_path_c_train_step_output_abi_enabled = (
+    descriptor_schedule_metadata._cppmega_path_c_train_step_output_abi_enabled = (
         bool(train_step_output_abi)
     )
     return descriptor_schedule_template
@@ -919,11 +924,17 @@ def mamba3_fp8_train_prototype_schedule_template(region: Any) -> Any:
     return target.schedule_template(resolved_region)
 
 
-mamba3_fp8_train_fusion_schedule_template._cppmega_path_c_workspace_edge_buffers = (
+cast(
+    Any,
+    mamba3_fp8_train_fusion_schedule_template,
+)._cppmega_path_c_workspace_edge_buffers = (
     "kv_fp8",
     "kv_scale",
 )
-mamba3_fp8_train_prototype_schedule_template._cppmega_path_c_workspace_edge_buffers = (
+cast(
+    Any,
+    mamba3_fp8_train_prototype_schedule_template,
+)._cppmega_path_c_workspace_edge_buffers = (
     "kv_fp8",
     "kv_scale",
 )
@@ -998,11 +1009,17 @@ def build_path_c_descriptor_prim_func(
         if train_step_output_abi_payload["declared"]
         else ()
     )
+    train_step_suffix_loss_parameter_grad_buffers = (
+        _train_step_suffix_loss_parameter_grad_buffers(
+            declared=bool(train_step_output_abi),
+        )
+    )
     external_buffers_for_abi = _append_unique_names(
         external_buffers,
         (
             *train_step_suffix_loss_input_buffers,
             *train_step_output_buffers,
+            *train_step_suffix_loss_parameter_grad_buffers,
         ),
     )
     extent = _validated_buffer_extent(buffer_extent)
@@ -1026,6 +1043,9 @@ def build_path_c_descriptor_prim_func(
     for name in train_step_output_buffers:
         dtype_by_buffer[name] = "float32"
         shape_by_buffer[name] = (1,)
+    for name in train_step_suffix_loss_parameter_grad_buffers:
+        dtype_by_buffer[name] = _buffer_dtype(name, shape_env=resolved_shape_env)
+        shape_by_buffer[name] = _buffer_shape(name, extent, resolved_shape_env)
     loop_extent = _descriptor_loop_extent(
         external_buffers,
         extent,
@@ -1055,6 +1075,13 @@ def build_path_c_descriptor_prim_func(
             ),
         )
     )
+    train_step_suffix_loss_parameter_grad_abi_payload = (
+        _train_step_suffix_loss_parameter_grad_abi_payload(
+            declared=bool(train_step_output_abi),
+            logical_gradient_buffers=train_step_suffix_loss_parameter_grad_buffers,
+            physical_abi_plan=physical_abi_plan,
+        )
+    )
     source, spilled_shared_scratch = _descriptor_prim_func_source(
         entry_name=entry_name,
         nodes=nodes,
@@ -1073,6 +1100,11 @@ def build_path_c_descriptor_prim_func(
         train_step_computed_output_buffers=train_step_computed_output_buffers,
         train_step_loss_source_buffers=train_step_loss_source_buffers,
         train_step_loss_cotangent_buffers=train_step_loss_cotangent_buffers,
+        train_step_loss_parameter_grad_buffers=(
+            train_step_suffix_loss_parameter_grad_buffers
+            if train_step_suffix_loss_parameter_grad_abi_payload["gradients_computed"]
+            else ()
+        ),
     )
 
     import tilelang.language as T
@@ -1123,6 +1155,12 @@ def build_path_c_descriptor_prim_func(
     ).with_attr(
         "tl.fusion.train_step_loss_cotangent_abi",
         json.dumps(train_step_loss_cotangent_abi_payload, sort_keys=True),
+    ).with_attr(
+        "tl.fusion.train_step_suffix_loss_parameter_grad_abi",
+        json.dumps(
+            train_step_suffix_loss_parameter_grad_abi_payload,
+            sort_keys=True,
+        ),
     )
     compile_pass_configs = _descriptor_tilelang_compile_pass_configs(
         descriptors,
@@ -1175,6 +1213,9 @@ def build_path_c_descriptor_prim_func(
     )
     prim_func._cppmega_path_c_train_step_loss_cotangent_abi = dict(
         train_step_loss_cotangent_abi_payload
+    )
+    prim_func._cppmega_path_c_train_step_suffix_loss_parameter_grad_abi = dict(
+        train_step_suffix_loss_parameter_grad_abi_payload
     )
     return prim_func
 
@@ -1318,6 +1359,49 @@ def _train_step_loss_cotangent_abi_payload(
     }
 
 
+def _train_step_suffix_loss_parameter_grad_buffers(
+    *,
+    declared: bool,
+) -> tuple[str, ...]:
+    return _TRAIN_STEP_SUFFIX_LOSS_PARAMETER_GRAD_ABI_NAMES if declared else ()
+
+
+def _train_step_suffix_loss_parameter_grad_abi_payload(
+    *,
+    declared: bool,
+    logical_gradient_buffers: Sequence[str],
+    physical_abi_plan: _PhysicalAbiPlan,
+) -> dict[str, Any]:
+    parameter_buffers = ("final_norm_weight", "lm_head_weight") if declared else ()
+    gradient_buffers = tuple(str(name) for name in logical_gradient_buffers)
+    missing_gradients = tuple(
+        name
+        for name in _TRAIN_STEP_SUFFIX_LOSS_PARAMETER_GRAD_ABI_NAMES
+        if name not in physical_abi_plan.logical_to_physical
+    )
+    gradients_computed = bool(
+        declared
+        and parameter_buffers
+        and not missing_gradients
+        and all(name in physical_abi_plan.logical_to_physical for name in parameter_buffers)
+    )
+    return {
+        "declared": bool(declared),
+        "parameter_logical_buffers": parameter_buffers,
+        "logical_gradient_buffers": gradient_buffers,
+        "gradients_computed": gradients_computed,
+        "missing_logical_gradient_buffers": missing_gradients,
+        "reason": (
+            "train-step suffix loss parameter gradients are generated for "
+            "final_norm_weight and lm_head_weight"
+            if gradients_computed
+            else "train-step suffix loss parameter gradients are not required for this descriptor"
+            if not declared
+            else "train-step suffix loss parameter gradient buffers are missing from the physical ABI"
+        ),
+    }
+
+
 def _train_step_suffix_loss_input_abi_payload(
     *,
     declared: bool,
@@ -1352,6 +1436,7 @@ def _descriptor_prim_func_source(
     train_step_computed_output_buffers: Sequence[str] = (),
     train_step_loss_source_buffers: Sequence[str] = (),
     train_step_loss_cotangent_buffers: Sequence[str] = (),
+    train_step_loss_parameter_grad_buffers: Sequence[str] = (),
 ) -> tuple[str, Mapping[str, Mapping[str, Any]]]:
     indent = " " * 4
     param_lines = list(physical_abi_plan.param_lines)
@@ -1440,6 +1525,9 @@ def _descriptor_prim_func_source(
             train_step_loss_source_buffers=train_step_loss_source_buffers,
             physical_abi_plan=physical_abi_plan,
             train_step_loss_cotangent_buffers=train_step_loss_cotangent_buffers,
+            train_step_loss_parameter_grad_buffers=(
+                train_step_loss_parameter_grad_buffers
+            ),
             indent=indent,
         )
     else:
@@ -1463,6 +1551,9 @@ def _descriptor_prim_func_source(
             loss_source_buffers=train_step_loss_source_buffers,
             physical_abi_plan=physical_abi_plan,
             train_step_loss_cotangent_buffers=train_step_loss_cotangent_buffers,
+            train_step_loss_parameter_grad_buffers=(
+                train_step_loss_parameter_grad_buffers
+            ),
             loop_policy=loop_policy,
             shape_env=shape_env,
             indent=indent,
@@ -1480,6 +1571,7 @@ def _append_train_step_suffix_scalar_outputs(
     computed_outputs: Sequence[str],
     loss_source_buffers: Sequence[str],
     train_step_loss_cotangent_buffers: Sequence[str],
+    train_step_loss_parameter_grad_buffers: Sequence[str],
     physical_abi_plan: _PhysicalAbiPlan,
     loop_policy: str,
     shape_env: PathCModelShapeEnv | None,
@@ -1489,6 +1581,9 @@ def _append_train_step_suffix_scalar_outputs(
     compute_ntokens = "ntokens" in computed_output_set
     compute_loss = "loss" in computed_output_set
     compute_cotangents = bool(train_step_loss_cotangent_buffers) and compute_loss
+    compute_parameter_grads = (
+        bool(train_step_loss_parameter_grad_buffers) and compute_loss
+    )
     if not compute_ntokens and not compute_loss:
         return
     if shape_env is None:
@@ -1503,12 +1598,22 @@ def _append_train_step_suffix_scalar_outputs(
     ):
         compute_loss = False
         compute_cotangents = False
+        compute_parameter_grads = False
     if compute_cotangents and not _train_step_suffix_loss_cotangents_can_emit(
         physical_abi_plan=physical_abi_plan,
         loss_source_buffers=loss_source_buffers,
         cotangent_buffers=train_step_loss_cotangent_buffers,
     ):
         compute_cotangents = False
+    if (
+        compute_parameter_grads
+        and not _train_step_suffix_loss_parameter_grads_can_emit(
+            physical_abi_plan=physical_abi_plan,
+            loss_source_buffers=loss_source_buffers,
+            parameter_grad_buffers=train_step_loss_parameter_grad_buffers,
+        )
+    ):
+        compute_parameter_grads = False
 
     sequence_length = int(shape_env.sequence_length)
     hidden_size = int(shape_env.hidden_size)
@@ -1557,6 +1662,14 @@ def _append_train_step_suffix_scalar_outputs(
             "train_step_suffix_seed_softmax",
             "train_step_suffix_seed_class_grad",
             "train_step_suffix_seed_hidden_grad",
+        ):
+            body.append(
+                f"{indent * 2}{scratch_name} = T.alloc_local((1,), \"float32\")"
+            )
+    if compute_parameter_grads:
+        for scratch_name in (
+            "train_step_suffix_param_grad_norm",
+            "train_step_suffix_param_class_grad",
         ):
             body.append(
                 f"{indent * 2}{scratch_name} = T.alloc_local((1,), \"float32\")"
@@ -1687,6 +1800,21 @@ def _append_train_step_suffix_scalar_outputs(
             ntokens_ref=ntokens_ref,
             indent=indent,
         )
+    if compute_parameter_grads:
+        _append_train_step_suffix_loss_parameter_grads(
+            body,
+            loss_source_buffers=loss_source_buffers,
+            parameter_grad_buffers=train_step_loss_parameter_grad_buffers,
+            physical_abi_plan=physical_abi_plan,
+            sequence_length=sequence_length,
+            hidden_size=hidden_size,
+            vocab_size=vocab_size,
+            target_mask_ref=target_mask_ref,
+            target_mask_value=target_mask_value,
+            target_id_ref=target_id_ref,
+            ntokens_ref=ntokens_ref,
+            indent=indent,
+        )
     if loop_policy == DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN:
         body.append(f"{indent * 2}T.sync_threads()")
 
@@ -1721,6 +1849,26 @@ def _train_step_suffix_loss_cotangents_can_emit(
             str(name) in physical_abi_plan.logical_to_physical
             for name in (*loss_source_buffers, *cotangent_buffers)
         )
+    )
+
+
+def _train_step_suffix_loss_parameter_grads_can_emit(
+    *,
+    physical_abi_plan: _PhysicalAbiPlan,
+    loss_source_buffers: Sequence[str],
+    parameter_grad_buffers: Sequence[str],
+) -> bool:
+    required = {
+        "final_norm_weight",
+        "lm_head_weight",
+        "ntokens",
+        "target_ids",
+        "target_mask",
+        *tuple(str(name) for name in loss_source_buffers),
+        *tuple(str(name) for name in parameter_grad_buffers),
+    }
+    return bool(loss_source_buffers) and all(
+        name in physical_abi_plan.logical_to_physical for name in required
     )
 
 
@@ -1909,6 +2057,276 @@ def _append_train_step_suffix_loss_cotangent_seeds(
             f"{indent * 6}{cotangent_ref} = "
             "train_step_suffix_seed_hidden_grad[0]"
         )
+
+
+def _append_train_step_suffix_loss_parameter_grads(
+    body: list[str],
+    *,
+    loss_source_buffers: Sequence[str],
+    parameter_grad_buffers: Sequence[str],
+    physical_abi_plan: _PhysicalAbiPlan,
+    sequence_length: int,
+    hidden_size: int,
+    vocab_size: int,
+    target_mask_ref: str,
+    target_mask_value: str,
+    target_id_ref: str,
+    ntokens_ref: str,
+    indent: str,
+) -> None:
+    buffer_set = {str(name) for name in parameter_grad_buffers}
+    body.append(f"{indent * 3}# train_step_suffix_loss_parameter_grads")
+    if "final_norm_weight_grad" in buffer_set:
+        body.append(f"{indent * 3}for suffix_hidden_col in T.serial(0, {hidden_size}):")
+        final_norm_grad_ref = _physical_logical_buffer_ref(
+            physical_abi_plan,
+            "final_norm_weight_grad",
+            "suffix_hidden_col",
+        )
+        body.append(f"{indent * 4}{final_norm_grad_ref} = T.cast(0.0, \"float32\")")
+    if "lm_head_weight_grad" in buffer_set:
+        body.append(f"{indent * 3}for vocab_col in T.serial(0, {vocab_size}):")
+        body.append(f"{indent * 4}for suffix_hidden_col in T.serial(0, {hidden_size}):")
+        lm_head_grad_ref = _physical_logical_buffer_ref_2d(
+            physical_abi_plan,
+            "lm_head_weight_grad",
+            "vocab_col",
+            "suffix_hidden_col",
+        )
+        body.append(f"{indent * 5}{lm_head_grad_ref} = T.cast(0.0, \"float32\")")
+
+    body.append(f"{indent * 3}for token_row in T.serial(0, {sequence_length}):")
+    body.append(f"{indent * 4}if T.cast({target_mask_ref}, \"float32\") != 0.0:")
+    body.append(
+        f"{indent * 5}train_step_suffix_row_sum_sq[0] = "
+        'T.cast(0.0, "float32")'
+    )
+    body.append(f"{indent * 5}for suffix_hidden_col in T.serial(0, {hidden_size}):")
+    _append_suffix_hidden_value(
+        body,
+        physical_abi_plan=physical_abi_plan,
+        loss_source_buffers=loss_source_buffers,
+        row_expr="token_row",
+        hidden_expr="suffix_hidden_col",
+        target="train_step_suffix_hidden_value[0]",
+        indent=indent * 6,
+    )
+    body.append(
+        f"{indent * 6}train_step_suffix_row_sum_sq[0] = "
+        "train_step_suffix_row_sum_sq[0] + "
+        "(train_step_suffix_hidden_value[0] * "
+        "train_step_suffix_hidden_value[0])"
+    )
+    body.append(
+        f"{indent * 5}train_step_suffix_inv_rms[0] = "
+        f"T.rsqrt((train_step_suffix_row_sum_sq[0] / {float(hidden_size)}) "
+        "+ 0.00001)"
+    )
+    body.append(
+        f"{indent * 5}train_step_suffix_max_logit[0] = "
+        "T.float32(-3.4028234663852886e38)"
+    )
+    body.append(f"{indent * 5}for vocab_col in T.serial(0, {vocab_size}):")
+    _append_suffix_logit(
+        body,
+        physical_abi_plan=physical_abi_plan,
+        loss_source_buffers=loss_source_buffers,
+        hidden_size=hidden_size,
+        row_expr="token_row",
+        vocab_expr="vocab_col",
+        indent=indent * 6,
+        hidden_loop_name="suffix_param_logit_hidden_col",
+    )
+    body.append(
+        f"{indent * 6}if train_step_suffix_logit[0] > "
+        "train_step_suffix_max_logit[0]:"
+    )
+    body.append(
+        f"{indent * 7}train_step_suffix_max_logit[0] = "
+        "train_step_suffix_logit[0]"
+    )
+    body.append(
+        f"{indent * 5}train_step_suffix_sum_exp[0] = "
+        'T.cast(0.0, "float32")'
+    )
+    body.append(f"{indent * 5}for vocab_col in T.serial(0, {vocab_size}):")
+    _append_suffix_logit(
+        body,
+        physical_abi_plan=physical_abi_plan,
+        loss_source_buffers=loss_source_buffers,
+        hidden_size=hidden_size,
+        row_expr="token_row",
+        vocab_expr="vocab_col",
+        indent=indent * 6,
+        hidden_loop_name="suffix_param_logit_hidden_col",
+    )
+    body.append(
+        f"{indent * 6}train_step_suffix_sum_exp[0] = "
+        "train_step_suffix_sum_exp[0] + "
+        "T.exp(train_step_suffix_logit[0] - "
+        "train_step_suffix_max_logit[0])"
+    )
+    if "lm_head_weight_grad" in buffer_set:
+        body.append(f"{indent * 5}for vocab_col in T.serial(0, {vocab_size}):")
+        _append_train_step_suffix_param_class_grad(
+            body,
+            physical_abi_plan=physical_abi_plan,
+            loss_source_buffers=loss_source_buffers,
+            hidden_size=hidden_size,
+            row_expr="token_row",
+            vocab_expr="vocab_col",
+            target_id_ref=target_id_ref,
+            target_mask_value=target_mask_value,
+            ntokens_ref=ntokens_ref,
+            indent=indent * 6,
+        )
+        body.append(f"{indent * 6}for suffix_hidden_col in T.serial(0, {hidden_size}):")
+        _append_suffix_hidden_value(
+            body,
+            physical_abi_plan=physical_abi_plan,
+            loss_source_buffers=loss_source_buffers,
+            row_expr="token_row",
+            hidden_expr="suffix_hidden_col",
+            target="train_step_suffix_hidden_value[0]",
+            indent=indent * 7,
+        )
+        final_norm = _physical_logical_buffer_value_expr(
+            physical_abi_plan,
+            "final_norm_weight",
+            "suffix_hidden_col",
+        )
+        lm_head_grad_ref = _physical_logical_buffer_ref_2d(
+            physical_abi_plan,
+            "lm_head_weight_grad",
+            "vocab_col",
+            "suffix_hidden_col",
+        )
+        body.append(
+            f"{indent * 7}{lm_head_grad_ref} = {lm_head_grad_ref} + "
+            "(train_step_suffix_param_class_grad[0] * "
+            "train_step_suffix_hidden_value[0] * "
+            f"train_step_suffix_inv_rms[0] * {final_norm})"
+        )
+    if "final_norm_weight_grad" in buffer_set:
+        body.append(f"{indent * 5}for suffix_hidden_col in T.serial(0, {hidden_size}):")
+        _append_train_step_suffix_param_grad_norm(
+            body,
+            physical_abi_plan=physical_abi_plan,
+            loss_source_buffers=loss_source_buffers,
+            hidden_size=hidden_size,
+            vocab_size=vocab_size,
+            row_expr="token_row",
+            hidden_expr="suffix_hidden_col",
+            target_id_ref=target_id_ref,
+            target_mask_value=target_mask_value,
+            ntokens_ref=ntokens_ref,
+            indent=indent * 6,
+        )
+        _append_suffix_hidden_value(
+            body,
+            physical_abi_plan=physical_abi_plan,
+            loss_source_buffers=loss_source_buffers,
+            row_expr="token_row",
+            hidden_expr="suffix_hidden_col",
+            target="train_step_suffix_hidden_value[0]",
+            indent=indent * 6,
+        )
+        final_norm_grad_ref = _physical_logical_buffer_ref(
+            physical_abi_plan,
+            "final_norm_weight_grad",
+            "suffix_hidden_col",
+        )
+        body.append(
+            f"{indent * 6}{final_norm_grad_ref} = {final_norm_grad_ref} + "
+            "(train_step_suffix_param_grad_norm[0] * "
+            "train_step_suffix_hidden_value[0] * "
+            "train_step_suffix_inv_rms[0])"
+        )
+
+
+def _append_train_step_suffix_param_grad_norm(
+    body: list[str],
+    *,
+    physical_abi_plan: _PhysicalAbiPlan,
+    loss_source_buffers: Sequence[str],
+    hidden_size: int,
+    vocab_size: int,
+    row_expr: str,
+    hidden_expr: str,
+    target_id_ref: str,
+    target_mask_value: str,
+    ntokens_ref: str,
+    indent: str,
+) -> None:
+    body.append(
+        f"{indent}train_step_suffix_param_grad_norm[0] = "
+        'T.cast(0.0, "float32")'
+    )
+    body.append(f"{indent}for vocab_col in T.serial(0, {vocab_size}):")
+    _append_train_step_suffix_param_class_grad(
+        body,
+        physical_abi_plan=physical_abi_plan,
+        loss_source_buffers=loss_source_buffers,
+        hidden_size=hidden_size,
+        row_expr=row_expr,
+        vocab_expr="vocab_col",
+        target_id_ref=target_id_ref,
+        target_mask_value=target_mask_value,
+        ntokens_ref=ntokens_ref,
+        indent=f"{indent}    ",
+    )
+    lm_head = _physical_logical_buffer_value_expr_2d(
+        physical_abi_plan,
+        "lm_head_weight",
+        "vocab_col",
+        hidden_expr,
+    )
+    body.append(
+        f"{indent}    train_step_suffix_param_grad_norm[0] = "
+        "train_step_suffix_param_grad_norm[0] + "
+        f"(train_step_suffix_param_class_grad[0] * {lm_head})"
+    )
+
+
+def _append_train_step_suffix_param_class_grad(
+    body: list[str],
+    *,
+    physical_abi_plan: _PhysicalAbiPlan,
+    loss_source_buffers: Sequence[str],
+    hidden_size: int,
+    row_expr: str,
+    vocab_expr: str,
+    target_id_ref: str,
+    target_mask_value: str,
+    ntokens_ref: str,
+    indent: str,
+) -> None:
+    _append_suffix_logit(
+        body,
+        physical_abi_plan=physical_abi_plan,
+        loss_source_buffers=loss_source_buffers,
+        hidden_size=hidden_size,
+        row_expr=row_expr,
+        vocab_expr=vocab_expr,
+        indent=indent,
+        hidden_loop_name="suffix_param_logit_hidden_col",
+    )
+    body.append(
+        f"{indent}train_step_suffix_param_class_grad[0] = "
+        "T.exp(train_step_suffix_logit[0] - train_step_suffix_max_logit[0]) / "
+        "train_step_suffix_sum_exp[0]"
+    )
+    body.append(f"{indent}if {vocab_expr} == {target_id_ref}:")
+    body.append(
+        f"{indent}    train_step_suffix_param_class_grad[0] = "
+        "train_step_suffix_param_class_grad[0] - T.cast(1.0, \"float32\")"
+    )
+    body.append(
+        f"{indent}train_step_suffix_param_class_grad[0] = "
+        "train_step_suffix_param_class_grad[0] * "
+        f"T.cast({target_mask_value}, \"float32\") / "
+        f'T.max(T.cast({ntokens_ref}, "float32"), T.cast(1.0, "float32"))'
+    )
 
 
 def _append_train_step_suffix_seed_grad_norm(
@@ -2653,6 +3071,7 @@ def _append_row_phased_hidden_body(
     train_step_loss_source_buffers: Sequence[str],
     physical_abi_plan: _PhysicalAbiPlan,
     train_step_loss_cotangent_buffers: Sequence[str],
+    train_step_loss_parameter_grad_buffers: Sequence[str],
     indent: str,
 ) -> None:
     if shape_env is None:
@@ -2833,6 +3252,9 @@ def _append_row_phased_hidden_body(
         computed_outputs=train_step_computed_output_buffers,
         loss_source_buffers=train_step_loss_source_buffers,
         train_step_loss_cotangent_buffers=train_step_loss_cotangent_buffers,
+        train_step_loss_parameter_grad_buffers=(
+            train_step_loss_parameter_grad_buffers
+        ),
         physical_abi_plan=physical_abi_plan,
         loop_policy=DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN,
         shape_env=shape_env,

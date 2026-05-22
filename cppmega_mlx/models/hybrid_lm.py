@@ -934,6 +934,11 @@ class HybridTinyLM(nn.Module):
                 ):
                     add(index, parameter_suffix, logical_suffix, block=block)
 
+        if "norm.weight" in parameter_names:
+            aliases["norm.weight"] = ("final_norm_weight",)
+        if "lm_head.weight" in parameter_names:
+            aliases["lm_head.weight"] = ("lm_head_weight",)
+
         return aliases
 
     def path_c_parameter_gradient_aliases(self) -> dict[str, tuple[str, ...]]:

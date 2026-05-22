@@ -3924,6 +3924,82 @@ def test_model_derived_fwd_bwd_descriptor_seeds_suffix_loss_cotangents_before_ba
         ) in generated_source
 
 
+def test_model_derived_fwd_bwd_descriptor_computes_suffix_parameter_grads_before_backward() -> None:
+    cfg = local_gb10_quarter_profile().tiny_smoke_config(
+        pattern="MRA",
+        depth=3,
+        dsa_a_layer_ranks=(0,),
+        max_seq_length=128,
+        hidden_size=32,
+        num_attention_heads=4,
+        mamba_head_dim=8,
+        mamba_state_dim=4,
+        mamba_groups=1,
+        m2rnn_k_head_dim=8,
+        m2rnn_v_head_dim=8,
+    )
+    model = SimpleNamespace(route_symbols=("M", "R", "A"), config=cfg)
+    fwd_region = build_path_c_model_regions_from_model(
+        model,
+        region_prefix="dynamic_mra_model",
+    )[0]
+    region = build_path_c_aot_autograd_region(fwd_region)
+    target = select_path_c_fusion_schedule_target(region)
+
+    assert target is not None
+
+    prim_func = target.schedule_template(region)
+    generated_source = prim_func._cppmega_path_c_generated_source
+    parameter_grad_abi = (
+        prim_func._cppmega_path_c_train_step_suffix_loss_parameter_grad_abi
+    )
+    physical_abi_map = prim_func._cppmega_path_c_physical_buffer_abi_map
+
+    assert parameter_grad_abi == {
+        "declared": True,
+        "parameter_logical_buffers": ("final_norm_weight", "lm_head_weight"),
+        "logical_gradient_buffers": (
+            "final_norm_weight_grad",
+            "lm_head_weight_grad",
+        ),
+        "gradients_computed": True,
+        "missing_logical_gradient_buffers": (),
+        "reason": (
+            "train-step suffix loss parameter gradients are generated for "
+            "final_norm_weight and lm_head_weight"
+        ),
+    }
+    assert physical_abi_map["final_norm_weight_grad"]["shape"] == (32,)
+    assert physical_abi_map["final_norm_weight_grad"]["logical_shape"] == (32,)
+    assert physical_abi_map["lm_head_weight_grad"]["shape"] == (
+        cfg.vocab_size * 32,
+    )
+    assert physical_abi_map["lm_head_weight_grad"]["logical_shape"] == (
+        cfg.vocab_size,
+        32,
+    )
+    suffix_index = generated_source.index("# train_step_suffix_loss_scalar")
+    param_grad_index = generated_source.index("# train_step_suffix_loss_parameter_grads")
+    backward_index = generated_source.index("# backward_policy: row_phased_hidden_recompute")
+    assert suffix_index < param_grad_index < backward_index
+    assert "train_step_suffix_param_class_grad[0]" in generated_source
+    assert "train_step_suffix_param_grad_norm[0]" in generated_source
+    final_norm_grad_info = physical_abi_map["final_norm_weight_grad"]
+    lm_head_grad_info = physical_abi_map["lm_head_weight_grad"]
+    assert (
+        f"{final_norm_grad_info['bank']}[{final_norm_grad_info['offset']} + "
+        "(suffix_hidden_col)] = "
+        f"{final_norm_grad_info['bank']}[{final_norm_grad_info['offset']} + "
+        "(suffix_hidden_col)] + "
+    ) in generated_source
+    assert (
+        f"{lm_head_grad_info['bank']}[{lm_head_grad_info['offset']} + "
+        "((vocab_col) * 32 + (suffix_hidden_col))] = "
+        f"{lm_head_grad_info['bank']}[{lm_head_grad_info['offset']} + "
+        "((vocab_col) * 32 + (suffix_hidden_col))] + "
+    ) in generated_source
+
+
 def test_model_region_shape_env_specializes_contract_and_cache_key() -> None:
     base_profile = local_gb10_quarter_profile()
     cfg_a = base_profile.tiny_smoke_config(

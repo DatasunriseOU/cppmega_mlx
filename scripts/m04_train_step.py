@@ -84,6 +84,7 @@ from cppmega_mlx.recipes.pattern import expand_nam_pattern  # noqa: E402
 from cppmega_mlx.training.compiled import (  # noqa: E402
     CompiledPretrainingStep,
     PathCGradientBufferCapture,
+    PathCFusedTrainBlockCallableArtifact,
     PathCFusedTrainBlockTrainingRuntime,
 )
 from cppmega_mlx.training.cut_cross_entropy import (  # noqa: E402
@@ -1190,6 +1191,9 @@ def path_c_direct_fusion_chain_training_runtime_contract_payload(
     returns_full_model_grads = bool(
         value_and_grad_contract.get("returns_full_model_grads", False)
     )
+    full_model_gradient_coverage = value_and_grad_contract.get(
+        "full_model_gradient_coverage"
+    )
     training_critical_path = bool(
         declared_training_critical_path
         and graph_binding_ok
@@ -1240,6 +1244,7 @@ def path_c_direct_fusion_chain_training_runtime_contract_payload(
         "value_and_grad_contract": value_and_grad_contract,
         "value_and_grad_contract_ok": value_and_grad_contract_ok,
         "returns_full_model_grads": returns_full_model_grads,
+        "full_model_gradient_coverage": full_model_gradient_coverage,
         "training_critical_path_declared": declared_training_critical_path,
         "training_graph_bound": graph_binding_ok,
         "training_graph_binding": graph_binding,
@@ -1313,6 +1318,9 @@ def path_c_fused_train_block_training_runtime_contract_payload(
     returns_full_model_grads = bool(
         value_and_grad_contract.get("returns_full_model_grads", False)
     )
+    full_model_gradient_coverage = value_and_grad_contract.get(
+        "full_model_gradient_coverage"
+    )
     training_critical_path = bool(
         declared_training_critical_path
         and graph_binding_ok
@@ -1363,6 +1371,7 @@ def path_c_fused_train_block_training_runtime_contract_payload(
         "value_and_grad_contract": value_and_grad_contract,
         "value_and_grad_contract_ok": value_and_grad_contract_ok,
         "returns_full_model_grads": returns_full_model_grads,
+        "full_model_gradient_coverage": full_model_gradient_coverage,
         "training_critical_path_declared": declared_training_critical_path,
         "training_graph_bound": graph_binding_ok,
         "training_graph_binding": graph_binding,
@@ -2275,9 +2284,11 @@ def _path_c_direct_chain_full_gradient_coverage_payload(
         chain=chain,
         model=model,
     )
+    suffix_bridge_parameter_names = {"norm.weight_grad", "lm_head.weight_grad"}
     direct_names = {
         _path_c_strip_gradient_suffix(name)
         for name in bridge_plan.get("parameter_gradient_tree_names", ())
+        if str(name) not in suffix_bridge_parameter_names
     }
     prefix_names = _path_c_model_prefix_parameter_names(
         model,
@@ -2312,6 +2323,109 @@ def _path_c_direct_chain_full_gradient_coverage_payload(
     }
 
 
+def _path_c_fusion_planner_unavailable_payload(
+    *,
+    args: argparse.Namespace | TrainHybridTinyConfig,
+    sequence_length: int,
+    exception: Exception,
+) -> dict[str, Any]:
+    mode = selected_path_c_fusion_mode()
+    profile_name = str(getattr(args, "model_profile", "hybrid_tiny"))
+    route_symbols: tuple[str, ...] = ()
+    if profile_name == REQUIRED_MODEL_PROFILE:
+        route_symbols = tuple(local_gb10_quarter_profile().expanded_pattern.symbols)
+    exception_payload = {
+        "type": type(exception).__name__,
+        "message": str(exception),
+    }
+    status = "path_c_fusion_planner_unavailable"
+    reason = (
+        "Path C fusion route metadata failed closed because the planner could "
+        f"not be imported or executed: {exception_payload['type']}: "
+        f"{exception_payload['message']}"
+    )
+    runtime_binding = {
+        "status": status,
+        "runtime_uses_fused_train_block": False,
+        "runtime_binding_ready": False,
+        "physical_abi_binding_ready": False,
+        "provided_bank_buffers": [],
+        "required_bank_buffers": [],
+        "no_hidden_allocation_policy": True,
+        "reason": reason,
+    }
+    training_contract = {
+        "status": status,
+        "training_runtime_available": False,
+        "runtime_installed": False,
+        "critical_path_ready": False,
+        "reason": reason,
+    }
+    direct_chain_binding = {
+        "status": status,
+        "runtime_uses_direct_fusion_chain": False,
+        "logical_tensor_binding_ready": False,
+        "direct_chain_artifacts_bound": False,
+        "reason": reason,
+    }
+    return {
+        "mode": mode.value,
+        "status": status,
+        "reason": reason,
+        "region_name": None,
+        "backend": "tilelang",
+        "compiler": "tilelang.engine.fusion",
+        "fusion_kind": "model_route_path_c",
+        "sequence_length": int(sequence_length),
+        "planner_exception": exception_payload,
+        "graph_construction": {
+            "builder": "PathCFusionScheduleOptimizer",
+            "input_model": profile_name,
+            "route_symbols": list(route_symbols),
+            "region_source": "planner_unavailable",
+            "selected_model_region": None,
+            "selected_model_region_op_signature": [],
+            "selected_model_region_schedule_id": None,
+            "preset_only": False,
+        },
+        "model_route_candidates": {
+            "profile": profile_name,
+            "route_symbols": list(route_symbols),
+            "region_source": "planner_unavailable",
+            "selection_policy": "largest_supported_contiguous_route_segment",
+            "selected_candidate": None,
+            "candidate_regions": [],
+            "planner_exception": exception_payload,
+        },
+        "runtime_training_binding": runtime_binding,
+        "fused_train_block_training_runtime_contract": training_contract,
+        "direct_chained_fusion": {
+            "status": status,
+            "runtime_binding": direct_chain_binding,
+            "training_runtime_contract": training_contract,
+        },
+        "schedule_blockers": [
+            {
+                "kind": status,
+                "reason": reason,
+                "exception": exception_payload,
+            }
+        ],
+        "single_kernel_fused": False,
+        "production_compile_receipt": {
+            "status": "not_evaluated",
+            "verified": False,
+            "reason": reason,
+        },
+        "production_matrix_profile_receipt": {
+            "status": "not_evaluated",
+            "verified": False,
+            "reason": reason,
+        },
+        "zero_copy_required": True,
+    }
+
+
 def fp8_path_c_training_route_payload(
     args: argparse.Namespace | TrainHybridTinyConfig,
     *,
@@ -2327,7 +2441,10 @@ def fp8_path_c_training_route_payload(
     direct_chain_logical_owner: Any | None = None,
     direct_chain_training_runtime: Any | None = None,
     fused_train_block_training_runtime: Any | None = None,
+    path_c_fusion_fn: Callable[..., Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    if path_c_fusion_fn is None:
+        path_c_fusion_fn = path_c_fusion_payload
     requested = path_c_training_route_requested(args)
     fp8_producer_required = fp8_path_c_route_requested(args)
     producer = sparse_mla_fp8_producer_payload(args)
@@ -2336,21 +2453,30 @@ def fp8_path_c_training_route_payload(
         fp8_producer_configured or not fp8_producer_required
     )
     sequence_length = path_c_training_sequence_length(args)
-    path_c_fusion = path_c_fusion_payload(
-        model=model,
-        compile_receipt_path=compile_receipt_path,
-        bank_buffers=bank_buffers,
-        bank_buffer_owner=bank_buffer_owner,
-        bank_owner=bank_owner,
-        fused_artifact=fused_artifact,
-        direct_chain_artifacts=direct_chain_artifacts,
-        direct_chain_logical_buffers=direct_chain_logical_buffers,
-        direct_chain_logical_buffer_owner=direct_chain_logical_buffer_owner,
-        direct_chain_logical_owner=direct_chain_logical_owner,
-        direct_chain_training_runtime=direct_chain_training_runtime,
-        fused_train_block_training_runtime=fused_train_block_training_runtime,
-        sequence_length=sequence_length,
-    )
+    try:
+        path_c_fusion = dict(
+            path_c_fusion_fn(
+                model=model,
+                compile_receipt_path=compile_receipt_path,
+                bank_buffers=bank_buffers,
+                bank_buffer_owner=bank_buffer_owner,
+                bank_owner=bank_owner,
+                fused_artifact=fused_artifact,
+                direct_chain_artifacts=direct_chain_artifacts,
+                direct_chain_logical_buffers=direct_chain_logical_buffers,
+                direct_chain_logical_buffer_owner=direct_chain_logical_buffer_owner,
+                direct_chain_logical_owner=direct_chain_logical_owner,
+                direct_chain_training_runtime=direct_chain_training_runtime,
+                fused_train_block_training_runtime=fused_train_block_training_runtime,
+                sequence_length=sequence_length,
+            )
+        )
+    except Exception as exc:
+        path_c_fusion = _path_c_fusion_planner_unavailable_payload(
+            args=args,
+            sequence_length=sequence_length or 0,
+            exception=exc,
+        )
     runtime_training_binding = path_c_fusion.get("runtime_training_binding", {})
     single_fused_train_block_standalone_dispatch_available = bool(
         isinstance(runtime_training_binding, dict)
@@ -3101,6 +3227,13 @@ def _path_c_fused_train_block_training_abi_contract_payload(
             "train_step_loss_source_buffers": [],
             "train_step_loss_cotangents_computed": False,
             "train_step_loss_cotangent_abi": {},
+            "train_step_suffix_loss_parameter_grads_computed": False,
+            "train_step_suffix_loss_parameter_grad_abi": {},
+            "train_step_suffix_loss_parameter_gradient_buffers": [],
+            "missing_train_step_suffix_loss_parameter_gradient_buffers": [
+                "final_norm_weight_grad",
+                "lm_head_weight_grad",
+            ],
             "suffix_loss_inputs_available": False,
             "logical_buffer_count": 0,
             "kernel_parameter_count": 0,
@@ -3167,6 +3300,31 @@ def _path_c_fused_train_block_training_abi_contract_payload(
     train_step_loss_cotangents_computed = bool(
         train_step_loss_cotangent_abi.get("cotangents_computed")
     )
+    train_step_suffix_loss_parameter_grad_abi = dict(
+        getattr(
+            prim_func,
+            "_cppmega_path_c_train_step_suffix_loss_parameter_grad_abi",
+            {},
+        )
+        or {}
+    )
+    train_step_suffix_loss_parameter_gradient_buffers = [
+        str(name)
+        for name in train_step_suffix_loss_parameter_grad_abi.get(
+            "logical_gradient_buffers",
+            (),
+        )
+    ]
+    missing_train_step_suffix_loss_parameter_gradient_buffers = [
+        name
+        for name in train_step_suffix_loss_parameter_gradient_buffers
+        if name not in physical_abi_map
+    ]
+    train_step_suffix_loss_parameter_grads_computed = bool(
+        train_step_suffix_loss_parameter_grad_abi.get("gradients_computed")
+        and train_step_suffix_loss_parameter_gradient_buffers
+        and not missing_train_step_suffix_loss_parameter_gradient_buffers
+    )
     suffix_loss_inputs = tuple(
         str(name)
         for name in train_step_suffix_loss_input_abi.get("logical_inputs", ())
@@ -3202,6 +3360,8 @@ def _path_c_fused_train_block_training_abi_contract_payload(
         missing_outputs.append("ntokens")
     if not gradient_outputs:
         missing_outputs.append("model_grads")
+    if not train_step_suffix_loss_parameter_grads_computed:
+        missing_outputs.append("suffix_parameter_grads")
     missing_suffix_loss_inputs = [
         name for name in suffix_loss_inputs if name not in physical_abi_map
     ]
@@ -3215,6 +3375,7 @@ def _path_c_fused_train_block_training_abi_contract_payload(
         and suffix_loss_inputs_available
         and train_step_outputs_computed
         and train_step_loss_cotangents_computed
+        and train_step_suffix_loss_parameter_grads_computed
     )
     return {
         "contract": PATH_C_FUSED_TRAIN_BLOCK_VALUE_AND_GRAD_CONTRACT,
@@ -3234,6 +3395,18 @@ def _path_c_fused_train_block_training_abi_contract_payload(
         "train_step_loss_source_buffers": train_step_loss_source_buffers,
         "train_step_loss_cotangents_computed": train_step_loss_cotangents_computed,
         "train_step_loss_cotangent_abi": train_step_loss_cotangent_abi,
+        "train_step_suffix_loss_parameter_grads_computed": (
+            train_step_suffix_loss_parameter_grads_computed
+        ),
+        "train_step_suffix_loss_parameter_grad_abi": (
+            train_step_suffix_loss_parameter_grad_abi
+        ),
+        "train_step_suffix_loss_parameter_gradient_buffers": (
+            train_step_suffix_loss_parameter_gradient_buffers
+        ),
+        "missing_train_step_suffix_loss_parameter_gradient_buffers": (
+            missing_train_step_suffix_loss_parameter_gradient_buffers
+        ),
         "train_step_output_abi": train_step_output_abi,
         "train_step_suffix_loss_input_abi": train_step_suffix_loss_input_abi,
         "suffix_loss_inputs_available": suffix_loss_inputs_available,
@@ -3260,6 +3433,16 @@ def _path_c_fused_train_block_training_abi_contract_payload(
                 and suffix_loss_inputs_available
                 and train_step_outputs_computed
                 and not train_step_loss_cotangents_computed
+            )
+            else "generated fused train-block ABI computes suffix loss "
+            "cotangents, but final norm and lm-head suffix parameter gradients "
+            "are not generated into model-gradient buffers yet"
+            if (
+                not missing_outputs
+                and suffix_loss_inputs_available
+                and train_step_outputs_computed
+                and train_step_loss_cotangents_computed
+                and not train_step_suffix_loss_parameter_grads_computed
             )
             else "generated fused train-block ABI computes ntokens from "
             "target_mask, but loss suffix codegen has not populated loss yet"
@@ -3291,6 +3474,37 @@ def _path_c_fused_train_block_plan_payload(plan: Any) -> dict[str, Any]:
         "missing_real_abi_inputs": list(
             getattr(contract, "missing_real_abi_inputs", ()) or ()
         ),
+    }
+
+
+def _path_c_fused_train_block_selected_region_metadata(region: Any) -> dict[str, Any]:
+    metadata = getattr(region, "metadata", {})
+    bricks = (
+        tuple(metadata.get("path_c_bricks", ()))
+        if isinstance(metadata, Mapping)
+        else ()
+    )
+    brick_names = [
+        str(brick.get("name"))
+        for brick in bricks
+        if isinstance(brick, Mapping) and brick.get("name")
+    ]
+    brick_route_symbols = [
+        str(brick.get("route_symbol"))
+        for brick in bricks
+        if isinstance(brick, Mapping) and brick.get("route_symbol")
+    ]
+    node_names = [str(name) for name in getattr(region, "node_names", ())]
+    return {
+        "name": getattr(region, "name", None),
+        "node_count": len(getattr(region, "nodes", ()) or ()),
+        "edge_count": len(getattr(region, "edges", ()) or ()),
+        "first_node_name": node_names[0] if node_names else None,
+        "last_node_name": node_names[-1] if node_names else None,
+        "brick_names": brick_names,
+        "first_brick_name": brick_names[0] if brick_names else None,
+        "last_brick_name": brick_names[-1] if brick_names else None,
+        "brick_route_symbols": brick_route_symbols,
     }
 
 
@@ -3377,9 +3591,11 @@ def compile_path_c_fused_train_block_artifact_for_model(
         else "",
         required_real_abi_inputs=schedule_target.required_real_abi_inputs,
     )
+    training_abi_prim_func: Any | None = None
     try:
+        training_abi_prim_func = schedule_template(scheduled.region)
         training_abi_contract = _path_c_fused_train_block_training_abi_contract_payload(
-            schedule_template(scheduled.region)
+            training_abi_prim_func
         )
     except Exception as exc:
         training_abi_contract = {
@@ -3455,6 +3671,38 @@ def compile_path_c_fused_train_block_artifact_for_model(
             "training_abi_contract": training_abi_contract,
             "artifact": None,
         }
+    if (
+        artifact is not None
+        and not _path_c_fused_train_block_artifact_has_training_runtime_contract(
+            artifact
+        )
+        and training_abi_prim_func is not None
+    ):
+        parameter_gradient_aliases: Mapping[str, Any] = {}
+        if callable(getattr(model, "path_c_parameter_gradient_aliases", None)):
+            parameter_gradient_aliases = model.path_c_parameter_gradient_aliases()
+        artifact = PathCFusedTrainBlockCallableArtifact(
+            kernel=artifact,
+            physical_abi_map=getattr(
+                training_abi_prim_func,
+                "_cppmega_path_c_physical_buffer_abi_map",
+                {},
+            ),
+            physical_abi_shapes=getattr(
+                training_abi_prim_func,
+                "_cppmega_path_c_physical_buffer_abi_shapes",
+                {},
+            ),
+            training_abi_contract=training_abi_contract,
+            parameter_gradient_aliases=parameter_gradient_aliases,
+            trainable_parameter_names=tuple(
+                sorted(_path_c_model_trainable_parameter_names(model))
+            ),
+            selected_region_metadata=(
+                _path_c_fused_train_block_selected_region_metadata(scheduled.region)
+            ),
+        )
+
     return {
         "status": "ok",
         "reason": (
@@ -4227,16 +4475,22 @@ class PathCDirectFusionChainTrainingRuntime:
             model=model,
             logical_buffers=buffers,
         )
-        direct_grads = path_c_model_gradient_tree_from_direct_buffers(
-            model=model,
-            logical_buffers=buffers,
-            parameter_gradient_names=bridge_plan["parameter_gradient_tree_names"],
-        )
         parameter_grads = bridge_payload.get("parameter_grads", {})
         if parameter_grads is None:
             parameter_grads = {}
         if not isinstance(parameter_grads, Mapping):
             raise TypeError("loss cotangent bridge parameter_grads must be a Mapping")
+        bridge_parameter_gradient_names = {str(name) for name in parameter_grads}
+        direct_parameter_gradient_names = [
+            str(name)
+            for name in bridge_plan["parameter_gradient_tree_names"]
+            if str(name) not in bridge_parameter_gradient_names
+        ]
+        direct_grads = path_c_model_gradient_tree_from_direct_buffers(
+            model=model,
+            logical_buffers=buffers,
+            parameter_gradient_names=direct_parameter_gradient_names,
+        )
         coverage = _path_c_direct_chain_full_gradient_coverage_payload(
             model=model,
             chain=self.chain,
@@ -4667,11 +4921,16 @@ def _path_c_direct_chain_required_logical_buffer_specs(
     chain: Any,
 ) -> dict[str, dict[str, Any]]:
     specs: dict[str, dict[str, Any]] = {}
+    suffix_shape_env: Any | None = None
+    suffix_segment_index = -1
     for segment in getattr(chain, "segments", ()):
         target = getattr(segment, "schedule_target", None)
         if target is None or str(segment.status) != "ok":
             continue
         prim_func = target.schedule_template(segment.region)
+        suffix_segment_index = max(suffix_segment_index, int(segment.index))
+        if suffix_shape_env is None:
+            suffix_shape_env = getattr(prim_func, "_cppmega_path_c_shape_env", None)
         physical_abi_map = dict(
             getattr(prim_func, "_cppmega_path_c_physical_buffer_abi_map", {})
             or {}
@@ -4725,6 +4984,33 @@ def _path_c_direct_chain_required_logical_buffer_specs(
             ):
                 raise ValueError(f"conflicting direct-chain scratch buffer spec {name!r}")
             existing["segments"].append(int(segment.index))
+    if (
+        suffix_shape_env is not None
+        and _path_c_direct_chain_loss_cotangent_seed_buffers(chain)
+    ):
+        hidden = int(getattr(suffix_shape_env, "hidden_size", 0) or 0)
+        vocab = int(getattr(suffix_shape_env, "vocab_size", 0) or 0)
+        if hidden > 0:
+            suffix_specs = {
+                "final_norm_weight_grad": (hidden,),
+                "lm_head_weight_grad": (max(1, vocab) * hidden,),
+            }
+            for name, shape in suffix_specs.items():
+                existing = specs.setdefault(
+                    name,
+                    {
+                        "name": name,
+                        "shape": shape,
+                        "dtype": "float32",
+                        "category": "runtime_activation_or_grad",
+                        "segments": [],
+                    },
+                )
+                if tuple(existing["shape"]) != shape or str(existing["dtype"]) != "float32":
+                    raise ValueError(
+                        f"conflicting direct-chain suffix grad spec {name!r}"
+                    )
+                existing["segments"].append(suffix_segment_index)
     return specs
 
 
@@ -5837,6 +6123,13 @@ def path_c_direct_fusion_chain_runtime_binding_payload(
             if not all_bindings_ready
             else FP8_PATH_C_DIRECT_CHAIN_ARTIFACTS_MISSING_STATUS
         )
+        supplemental_train_step_buffers = {
+            "final_norm_weight_grad",
+            "lm_head_weight_grad",
+        }
+        unexpected_logical_buffers = provided_names.difference(
+            required_logical_buffer_names
+        ).difference(supplemental_train_step_buffers)
         return {
             "status": status,
             "chain_status": str(getattr(chain, "status", "unknown")),
@@ -5860,11 +6153,9 @@ def path_c_direct_fusion_chain_runtime_binding_payload(
                 )
             ),
             "unexpected_logical_buffers": sorted(
-                provided_names.difference(required_logical_buffer_names)
+                unexpected_logical_buffers
             ),
-            "unexpected_logical_buffer_count": len(
-                provided_names.difference(required_logical_buffer_names)
-            ),
+            "unexpected_logical_buffer_count": len(unexpected_logical_buffers),
             "shape_mismatch_buffers": sorted(shape_mismatch_buffers),
             "shape_mismatch_count": len(shape_mismatch_buffers),
             "dtype_mismatch_buffers": sorted(dtype_mismatch_buffers),

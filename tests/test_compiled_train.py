@@ -18,6 +18,7 @@ from cppmega_mlx.training.compiled import (
     PATH_C_FUSED_TRAIN_BLOCK_TRAINING_RUNTIME_CONTRACT,
     PATH_C_FUSED_TRAIN_BLOCK_VALUE_AND_GRAD_CONTRACT,
     PathCGradientBufferCapture,
+    PathCFusedTrainBlockCallableArtifact,
     PretrainingMetrics,
     PretrainingState,
     REGIONAL_COMPILE_TARGETS,
@@ -650,6 +651,150 @@ def test_path_c_training_runtime_accepts_fused_train_block_contract() -> None:
         "uses_forward_hook": True,
         "uses_backward_or_vjp_hook": True,
     }
+
+
+def test_fused_train_block_callable_artifact_uses_caller_owned_banks() -> None:
+    calls: list[tuple[Any, ...]] = []
+    float_bank = mx.array([2.0, 0.5, 1.5], dtype=mx.float32)
+    int_bank = mx.array([3], dtype=mx.int32)
+
+    class _BankOwner:
+        owner_name = "unit.path_c_physical_abi_banks"
+        buffers = {
+            "path_c_float32_abi_bank": float_bank,
+            "path_c_int32_abi_bank": int_bank,
+        }
+
+    artifact = PathCFusedTrainBlockCallableArtifact(
+        kernel=lambda *kernel_args: calls.append(kernel_args),
+        physical_abi_map={
+            "loss": {
+                "bank": "path_c_float32_abi_bank",
+                "dtype": "float32",
+                "offset": 0,
+                "shape": (1,),
+                "logical_shape": (1,),
+                "size": 1,
+            },
+            "linear_weight_grad": {
+                "bank": "path_c_float32_abi_bank",
+                "dtype": "float32",
+                "offset": 1,
+                "shape": (2,),
+                "logical_shape": (2,),
+                "size": 2,
+            },
+            "ntokens": {
+                "bank": "path_c_int32_abi_bank",
+                "dtype": "int32",
+                "offset": 0,
+                "shape": (1,),
+                "logical_shape": (1,),
+                "size": 1,
+            },
+        },
+        physical_abi_shapes={
+            "path_c_float32_abi_bank": (3,),
+            "path_c_int32_abi_bank": (1,),
+        },
+        training_abi_contract={
+            "loss_output_candidates": ("loss",),
+            "ntokens_output_candidates": ("ntokens",),
+            "train_step_loss_cotangents_computed": True,
+        },
+        parameter_gradient_aliases={
+            "linear.weight_grad": ("linear_weight_grad",),
+        },
+        trainable_parameter_names=("linear.weight",),
+    )
+
+    (loss, ntokens), grads = artifact.value_and_grad(
+        TinyLM(_tiny_config()),
+        {},
+        bank_owner=_BankOwner(),
+    )
+
+    assert calls == [(float_bank, int_bank)]
+    np.testing.assert_allclose(np.array(loss), np.array([2.0], dtype=np.float32))
+    np.testing.assert_array_equal(np.array(ntokens), np.array([3], dtype=np.int32))
+    grad_pairs = dict(tree_flatten(grads))
+    np.testing.assert_allclose(
+        np.array(grad_pairs["linear.weight"]),
+        np.array([0.5, 1.5], dtype=np.float32),
+    )
+    contract = artifact.value_and_grad_contract()
+    assert contract["gradient_scope"] == "full_model"
+    coverage = contract["full_model_gradient_coverage"]
+    assert coverage["full_model_gradient_tree_ready"] is True
+    assert coverage["covered_parameter_names"] == ["linear.weight"]
+    assert coverage["missing_parameter_names"] == []
+
+
+def test_fused_train_block_callable_artifact_reports_missing_full_model_grads() -> None:
+    artifact = PathCFusedTrainBlockCallableArtifact(
+        kernel=lambda *kernel_args: None,
+        physical_abi_map={
+            "loss": {
+                "bank": "path_c_float32_abi_bank",
+                "dtype": "float32",
+                "offset": 0,
+                "shape": (1,),
+                "logical_shape": (1,),
+                "size": 1,
+            },
+            "linear_weight_grad": {
+                "bank": "path_c_float32_abi_bank",
+                "dtype": "float32",
+                "offset": 1,
+                "shape": (2,),
+                "logical_shape": (2,),
+                "size": 2,
+            },
+            "ntokens": {
+                "bank": "path_c_int32_abi_bank",
+                "dtype": "int32",
+                "offset": 0,
+                "shape": (1,),
+                "logical_shape": (1,),
+                "size": 1,
+            },
+        },
+        physical_abi_shapes={
+            "path_c_float32_abi_bank": (3,),
+            "path_c_int32_abi_bank": (1,),
+        },
+        training_abi_contract={
+            "loss_output_candidates": ("loss",),
+            "ntokens_output_candidates": ("ntokens",),
+            "train_step_loss_cotangents_computed": True,
+        },
+        parameter_gradient_aliases={
+            "linear.weight_grad": ("linear_weight_grad",),
+        },
+        trainable_parameter_names=("linear.weight", "embed.weight"),
+        selected_region_metadata={
+            "name": "unit_path_c_10_12",
+            "first_brick_name": "brick_10_M",
+            "last_brick_name": "brick_12_A",
+            "brick_route_symbols": ["M", "R", "A"],
+        },
+    )
+
+    contract = artifact.value_and_grad_contract()
+    assert contract["returns_model_grads"] is True
+    assert contract["returns_full_model_grads"] is False
+    assert contract["gradient_scope"] == "selected_train_block"
+    coverage = contract["full_model_gradient_coverage"]
+    assert coverage["full_model_gradient_tree_ready"] is False
+    assert coverage["reason"] == (
+        "selected fused train-block gradients do not cover all trainable "
+        "model parameters"
+    )
+    assert coverage["covered_parameter_names"] == ["linear.weight"]
+    assert coverage["missing_parameter_names"] == ["embed.weight"]
+    assert coverage["covered_parameter_count"] == 1
+    assert coverage["trainable_parameter_count"] == 2
+    assert coverage["selected_region"]["name"] == "unit_path_c_10_12"
 
 
 def test_path_c_training_runtime_rejects_compiled_step_fail_closed() -> None:

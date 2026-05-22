@@ -369,6 +369,8 @@ def test_path_c_parameter_gradient_aliases_use_direct_and_profile_names():
         "layer_12_a_qkv_projection_attention_sparse_kv_proj_weight_grad",
         "local_gb10_quarter_brick_12_A_qkv_projection_attention_sparse_kv_proj_weight_grad",
     )
+    assert aliases["norm.weight_grad"] == ("final_norm_weight_grad",)
+    assert aliases["lm_head.weight_grad"] == ("lm_head_weight_grad",)
     assert "layers.12.block.q_proj.bias_grad" not in aliases
     assert "layers.12.block.sparse_kv_proj.bias_grad" not in aliases
 

@@ -17,9 +17,10 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.utils import average_gradients
 import mlx.optimizers as optim
-from mlx.utils import tree_flatten, tree_map
+from mlx.utils import tree_flatten, tree_map, tree_unflatten
 
 from cppmega_mlx.data.batch import LMTokenBatch, ensure_lm_batch
+from cppmega_mlx.runtime.path_c_physical_abi import physical_abi_runtime_kernel_args
 from cppmega_mlx.training.loss import next_token_cross_entropy
 
 
@@ -108,6 +109,252 @@ class PathCGradientBufferCapture:
         self.events.clear()
 
 
+class PathCFusedTrainBlockCallableArtifact:
+    """Contracted wrapper around a compiled fused train-block kernel.
+
+    The wrapper only consumes caller/model-owned physical ABI banks. It does not
+    pack logical tensors into banks and does not fall back to eager
+    ``loss_and_grad``.
+    """
+
+    hidden_packing_performed = False
+    no_hidden_allocation_policy = True
+
+    def __init__(
+        self,
+        *,
+        kernel: Callable[..., Any],
+        physical_abi_map: Mapping[str, Any],
+        physical_abi_shapes: Mapping[str, Any],
+        training_abi_contract: Mapping[str, Any],
+        parameter_gradient_aliases: Mapping[str, str | Sequence[str]] | None = None,
+        trainable_parameter_names: Sequence[str] | None = None,
+        selected_region_metadata: Mapping[str, Any] | None = None,
+    ) -> None:
+        if not callable(kernel):
+            raise TypeError("fused train-block kernel must be callable")
+        self.kernel = kernel
+        self.physical_abi_map = {
+            str(name): dict(value)
+            for name, value in physical_abi_map.items()
+            if isinstance(value, Mapping)
+        }
+        self.physical_abi_shapes = {
+            str(name): tuple(int(dim) for dim in tuple(shape))
+            for name, shape in physical_abi_shapes.items()
+        }
+        self.training_abi_contract = dict(training_abi_contract)
+        self.parameter_gradient_aliases = _normalize_gradient_aliases(
+            parameter_gradient_aliases or {}
+        )
+        self.trainable_parameter_names = frozenset(
+            str(name) for name in (trainable_parameter_names or ())
+        )
+        self.selected_region_metadata = _normalize_contract_metadata(
+            selected_region_metadata or {}
+        )
+        self._logical_gradient_names = frozenset(
+            name for name in self.physical_abi_map if name.endswith("_grad")
+        )
+        self._parameter_gradient_bindings = tuple(
+            self._iter_parameter_gradient_bindings()
+        )
+        self._loss_logical_name = self._first_logical_candidate(
+            self.training_abi_contract.get("loss_output_candidates", ()),
+            fallback="loss",
+        )
+        self._ntokens_logical_name = self._first_logical_candidate(
+            self.training_abi_contract.get("ntokens_output_candidates", ()),
+            fallback="ntokens",
+        )
+
+    def _iter_parameter_gradient_bindings(self) -> list[tuple[str, str]]:
+        bindings: list[tuple[str, str]] = []
+        for parameter_grad_name, targets in sorted(
+            self.parameter_gradient_aliases.items()
+        ):
+            for target in targets:
+                if target in self._logical_gradient_names:
+                    bindings.append((parameter_grad_name, target))
+                    break
+        return bindings
+
+    def _first_logical_candidate(
+        self,
+        candidates: Any,
+        *,
+        fallback: str,
+    ) -> str | None:
+        for candidate in candidates or ():
+            name = str(candidate)
+            if name in self.physical_abi_map:
+                return name
+        return fallback if fallback in self.physical_abi_map else None
+
+    def _bank_buffers(self, bank_owner: Any) -> Mapping[str, Any]:
+        buffers = bank_owner if isinstance(bank_owner, Mapping) else None
+        if buffers is None:
+            buffers = getattr(bank_owner, "buffers", None)
+        if not isinstance(buffers, Mapping):
+            raise TypeError("fused train-block artifact requires a bank_owner")
+        return buffers
+
+    def _kernel_args_from_bank_owner(self, bank_owner: Any) -> tuple[Any, ...]:
+        return physical_abi_runtime_kernel_args(
+            self.physical_abi_map,
+            self.physical_abi_shapes,
+            self._bank_buffers(bank_owner),
+        )
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        return self.forward(*args, **kwargs)
+
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
+        bank_owner = kwargs.pop("bank_owner", None)
+        if bank_owner is None:
+            return self.kernel(*args, **kwargs)
+        if args or kwargs:
+            raise TypeError(
+                "fused train-block artifact accepts only bank_owner-bound "
+                "kernel dispatch"
+            )
+        return self.kernel(*self._kernel_args_from_bank_owner(bank_owner))
+
+    def backward(self, *args: Any, **kwargs: Any) -> Any:
+        return self.forward(*args, **kwargs)
+
+    def vjp(self, *args: Any, **kwargs: Any) -> Any:
+        return self.backward(*args, **kwargs)
+
+    def _logical_buffer_view(self, bank_owner: Any, logical_name: str) -> mx.array:
+        info = self.physical_abi_map.get(logical_name)
+        if not isinstance(info, Mapping):
+            raise ValueError(f"logical buffer is not in physical ABI: {logical_name}")
+        buffers = self._bank_buffers(bank_owner)
+        bank_name = str(info.get("bank", ""))
+        if bank_name not in buffers:
+            raise ValueError(f"bank buffer is not bound: {bank_name}")
+        bank = buffers[bank_name]
+        if not isinstance(bank, mx.array):
+            raise TypeError(f"bank buffer {bank_name!r} must be an mx.array")
+        offset = int(info.get("offset", 0))
+        size = int(info.get("size", 1))
+        view = bank[offset : offset + size]
+        logical_shape = tuple(
+            int(dim)
+            for dim in tuple(info.get("logical_shape", info.get("shape", (size,))))
+        )
+        if logical_shape and logical_shape != tuple(view.shape):
+            view = mx.reshape(view, logical_shape)
+        return view
+
+    def value_and_grad(
+        self,
+        model: nn.Module,
+        batch: Mapping[str, mx.array],
+        *,
+        bank_owner: Any,
+    ) -> tuple[tuple[mx.array, mx.array], Any]:
+        del model, batch
+        self.forward(bank_owner=bank_owner)
+        if self._loss_logical_name is None or self._ntokens_logical_name is None:
+            raise ValueError("fused train-block ABI does not expose loss and ntokens")
+        loss = self._logical_buffer_view(bank_owner, self._loss_logical_name)
+        ntokens = self._logical_buffer_view(bank_owner, self._ntokens_logical_name)
+        pairs: list[tuple[str, mx.array]] = []
+        seen: set[str] = set()
+        for parameter_grad_name, logical_name in self._parameter_gradient_bindings:
+            parameter_name = _strip_gradient_suffix(parameter_grad_name)
+            if parameter_name in seen:
+                raise ValueError(f"duplicate fused gradient for {parameter_name!r}")
+            seen.add(parameter_name)
+            pairs.append(
+                (
+                    parameter_name,
+                    self._logical_buffer_view(bank_owner, logical_name),
+                )
+            )
+        return (loss, ntokens), tree_unflatten(pairs)
+
+    def _full_model_gradient_coverage_payload(
+        self,
+        *,
+        covered_parameter_names: frozenset[str],
+        missing_parameter_names: list[str],
+        returns_full_model_grads: bool,
+    ) -> Mapping[str, Any]:
+        if not self.trainable_parameter_names:
+            reason = "trainable model parameter names were not provided"
+        elif returns_full_model_grads:
+            reason = (
+                "selected fused train-block gradients cover all trainable "
+                "model parameters"
+            )
+        else:
+            reason = (
+                "selected fused train-block gradients do not cover all trainable "
+                "model parameters"
+            )
+        return {
+            "full_model_gradient_tree_ready": returns_full_model_grads,
+            "reason": reason,
+            "gradient_scope": "full_model"
+            if returns_full_model_grads
+            else "selected_train_block",
+            "selected_region": self.selected_region_metadata,
+            "covered_parameter_names": sorted(covered_parameter_names),
+            "missing_parameter_names": missing_parameter_names,
+            "covered_parameter_count": len(covered_parameter_names),
+            "trainable_parameter_count": len(self.trainable_parameter_names),
+            "missing_parameter_count": len(missing_parameter_names),
+            "sample_missing_parameter_names": missing_parameter_names[:8],
+        }
+
+    def value_and_grad_contract(self) -> Mapping[str, Any]:
+        covered_parameter_names = frozenset(
+            _strip_gradient_suffix(name)
+            for name, _logical_name in self._parameter_gradient_bindings
+        )
+        missing_parameter_names = sorted(
+            self.trainable_parameter_names.difference(covered_parameter_names)
+        )
+        returns_full_model_grads = bool(self.trainable_parameter_names) and not (
+            missing_parameter_names
+        )
+        coverage = self._full_model_gradient_coverage_payload(
+            covered_parameter_names=covered_parameter_names,
+            missing_parameter_names=missing_parameter_names,
+            returns_full_model_grads=returns_full_model_grads,
+        )
+        return {
+            "contract": PATH_C_FUSED_TRAIN_BLOCK_VALUE_AND_GRAD_CONTRACT,
+            "owner": "CompiledPretrainingStep",
+            "uses_fused_train_block_runtime": True,
+            "uses_forward_hook": True,
+            "uses_backward_or_vjp_hook": True,
+            "returns_model_grads": bool(self._parameter_gradient_bindings),
+            "returns_full_model_grads": returns_full_model_grads,
+            "gradient_scope": "full_model"
+            if returns_full_model_grads
+            else "selected_train_block",
+            "covered_parameter_count": len(covered_parameter_names),
+            "trainable_parameter_count": len(self.trainable_parameter_names),
+            "missing_parameter_count": len(missing_parameter_names),
+            "sample_missing_parameter_names": missing_parameter_names[:8],
+            "full_model_gradient_tree_ready": returns_full_model_grads,
+            "full_model_gradient_coverage": coverage,
+            "loss_cotangent_bridge_ready": bool(
+                self.training_abi_contract.get(
+                    "train_step_loss_cotangents_computed",
+                    False,
+                )
+            ),
+            "model_gradient_tree_ready": bool(self._parameter_gradient_bindings),
+            "delegates_to_eager_loss_and_grad": False,
+            "hidden_packing_performed": False,
+        }
+
+
 class PathCFusedTrainBlockTrainingRuntime:
     """Training runtime wrapper for a contracted fused Path C train artifact.
 
@@ -144,7 +391,7 @@ class PathCFusedTrainBlockTrainingRuntime:
             raise TypeError(
                 "fused train-block artifact must define value_and_grad_contract"
             )
-        self.artifact = artifact
+        self.artifact: Any = artifact
         self.bank_owner = bank_owner
         self.owner_name = owner_name
         self._binding: dict[str, Any] | None = None
@@ -194,6 +441,39 @@ class PathCFusedTrainBlockTrainingRuntime:
 
     def value_and_grad_contract(self) -> Mapping[str, Any]:
         return self.artifact.value_and_grad_contract()
+
+
+def _normalize_gradient_aliases(
+    aliases: Mapping[str, str | Sequence[str]],
+) -> dict[str, tuple[str, ...]]:
+    normalized: dict[str, tuple[str, ...]] = {}
+    for source, targets in aliases.items():
+        if isinstance(targets, str):
+            normalized[str(source)] = (str(targets),)
+        else:
+            normalized[str(source)] = tuple(str(target) for target in targets)
+    return normalized
+
+
+def _strip_gradient_suffix(name: str) -> str:
+    return name[: -len("_grad")] if name.endswith("_grad") else name
+
+
+def _normalize_contract_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
+    return {str(key): _contract_metadata_value(value) for key, value in metadata.items()}
+
+
+def _contract_metadata_value(value: Any) -> Any:
+    if value is None or isinstance(value, str | int | float | bool):
+        return value
+    if isinstance(value, Mapping):
+        return {
+            str(key): _contract_metadata_value(inner_value)
+            for key, inner_value in value.items()
+        }
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
+        return [_contract_metadata_value(item) for item in value]
+    return str(value)
 
 
 def _path_c_capture_event_metadata(event: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -748,6 +1028,7 @@ __all__ = [
     "PATH_C_TRAINING_VALUE_AND_GRAD_CONTRACT",
     "PathCGradientBufferCapture",
     "PathCGradientProbe",
+    "PathCFusedTrainBlockCallableArtifact",
     "PathCFusedTrainBlockTrainingRuntime",
     "PathCTrainingRuntime",
     "REGIONAL_COMPILE_TARGETS",
