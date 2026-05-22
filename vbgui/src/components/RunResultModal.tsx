@@ -1,6 +1,7 @@
 // Modal that displays per-stage results from a pipeline.run response.
 
 import { Fragment, useState } from "react";
+import { LossChart } from "@/components/LossChart";
 
 export interface StageResult {
   name: string;
@@ -219,6 +220,17 @@ export function RunResultModal({
                       <tr data-testid={`run-result-extras-row-${s.name}`}>
                         <td colSpan={5} style={{ ...td, background: "#f9fafb",
                                                  padding: "6px 12px" }}>
+                          {s.name === "train" && Array.isArray(extras.losses)
+                            && extras.losses.length > 0 && (
+                            <div data-testid="run-result-loss-chart-wrap"
+                                 style={{ marginBottom: 8 }}>
+                              <LossChart
+                                losses={(extras.losses as unknown[])
+                                  .map(Number)
+                                  .filter((n) => Number.isFinite(n))}
+                              />
+                            </div>
+                          )}
                           <StageExtras stage={s.name} extras={extras} />
                         </td>
                       </tr>
