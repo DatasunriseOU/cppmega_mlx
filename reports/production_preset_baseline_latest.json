@@ -1,0 +1,27 @@
+{
+  "date_utc": "20260522_124449",
+  "hidden": 256,
+  "num_steps": 5,
+  "rows": [
+    {
+      "preset": "llama3_8b",
+      "hidden": 256,
+      "n_layers": 2,
+      "num_steps": 5,
+      "status": "ok",
+      "ms_per_step_warm": 18.6266,
+      "peak_memory_mb": 57.7925,
+      "total_elapsed_s": 0.0931
+    },
+    {
+      "preset": "mistral_small_3_1",
+      "hidden": 256,
+      "n_layers": 2,
+      "num_steps": 5,
+      "status": "ok",
+      "ms_per_step_warm": 4.3268,
+      "peak_memory_mb": 68.2945,
+      "total_elapsed_s": 0.0216
+    }
+  ]
+}
