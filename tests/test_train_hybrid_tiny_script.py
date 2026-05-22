@@ -290,6 +290,7 @@ def _assert_training_loss(
     chunk_rows: int | None = None,
     side_channel_dropout: dict[str, float] | None = None,
     side_channel_dropout_seed: int | None = None,
+    side_channel_residual_scale: dict[str, float] | None = None,
 ) -> None:
     loss = payload["training_loss"]
     assert loss["backend"] == backend
@@ -297,6 +298,7 @@ def _assert_training_loss(
     assert loss["manual_chunked_backward"] is False
     assert loss["side_channel_dropout"] == (side_channel_dropout or {})
     assert loss["side_channel_dropout_seed"] == side_channel_dropout_seed
+    assert loss["side_channel_residual_scale"] == (side_channel_residual_scale or {})
     if backend == "cross_entropy":
         assert loss == {
             "backend": "cross_entropy",
@@ -307,6 +309,7 @@ def _assert_training_loss(
             "manual_chunked_backward": False,
             "side_channel_dropout": side_channel_dropout or {},
             "side_channel_dropout_seed": side_channel_dropout_seed,
+            "side_channel_residual_scale": side_channel_residual_scale or {},
             "source": "cppmega_mlx.training.loss.next_token_cross_entropy",
         }
     elif backend == "cce":
@@ -319,6 +322,7 @@ def _assert_training_loss(
             "manual_chunked_backward": False,
             "side_channel_dropout": side_channel_dropout or {},
             "side_channel_dropout_seed": side_channel_dropout_seed,
+            "side_channel_residual_scale": side_channel_residual_scale or {},
             "source": "cppmega_mlx.training.loss.next_token_cut_cross_entropy",
         }
     else:
@@ -622,6 +626,7 @@ def test_help_lists_hybrid_training_flags() -> None:
     assert "--cce-chunk-rows" in result.stdout
     assert "--side-channel-dropout" in result.stdout
     assert "--side-channel-dropout-seed" in result.stdout
+    assert "--side-channel-residual-scale" in result.stdout
     assert "--memory-limit-total-bytes" in result.stdout
     assert "--apply-memory-limit-plan" in result.stdout
 
@@ -717,6 +722,20 @@ def test_dry_run_json_reports_side_channel_dropout_policy() -> None:
         side_channel_dropout=expected,
         side_channel_dropout_seed=17,
     )
+
+
+def test_dry_run_json_reports_side_channel_residual_scale_policy() -> None:
+    result = run_script(
+        "--dry-run-json",
+        "--side-channel-residual-scale",
+        "platform=0,structure=0.5",
+    )
+
+    payload = _load_json_result(result)
+    expected = {"platform": 0.0, "structure": 0.5}
+    assert payload["config"]["side_channel_residual_scale"] == expected
+    assert payload["model_config"]["side_channel_residual_scale"] == expected
+    _assert_training_loss(payload, side_channel_residual_scale=expected)
 
 
 def test_dry_run_json_selects_muon_from_cli() -> None:

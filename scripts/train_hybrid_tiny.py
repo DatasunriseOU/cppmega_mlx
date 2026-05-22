@@ -31,7 +31,11 @@ if str(ROOT) not in sys.path:
 import mlx.core as mx  # noqa: E402
 
 from cppmega_mlx.data.token_dataset import TokenBatchDataset, open_token_dataset  # noqa: E402
-from cppmega_mlx.models.hybrid_lm import HybridTinyConfig, HybridTinyLM  # noqa: E402
+from cppmega_mlx.models.hybrid_lm import (  # noqa: E402
+    HYBRID_SIDE_CHANNEL_RESIDUAL_SCALE_FAMILIES,
+    HybridTinyConfig,
+    HybridTinyLM,
+)
 from cppmega_mlx.runtime.memory import (  # noqa: E402
     DEFAULT_METAL_RATIO,
     DEFAULT_WIRED_RATIO,
@@ -131,6 +135,7 @@ class TrainHybridTinyConfig:
     ngram_hash_seed: int | None = None
     side_channel_dropout: dict[str, float] = field(default_factory=dict)
     side_channel_dropout_seed: int | None = None
+    side_channel_residual_scale: dict[str, float] = field(default_factory=dict)
     include_structure: bool = True
     grad_checkpoint: bool = False
     shuffle: bool = False
@@ -361,6 +366,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=TrainHybridTinyConfig.side_channel_dropout_seed,
         help="Optional deterministic seed for side-channel family dropout.",
     )
+    parser.add_argument(
+        "--side-channel-residual-scale",
+        default="",
+        help=(
+            "Comma-separated family=scale model residual policy for consumed "
+            "families, e.g. platform=1,structure=0.5."
+        ),
+    )
     parser.add_argument("--token-key", default=TrainHybridTinyConfig.token_key)
     parser.add_argument("--seed", type=int, default=TrainHybridTinyConfig.seed)
     parser.add_argument("--shuffle", action="store_true")
@@ -496,6 +509,52 @@ def parse_side_channel_dropout(value: str | None) -> dict[str, float]:
     return policy
 
 
+def parse_side_channel_residual_scale(value: str | None) -> dict[str, float]:
+    if value is None or not value.strip():
+        return {}
+    policy: dict[str, float] = {}
+    allowed = set(HYBRID_SIDE_CHANNEL_RESIDUAL_SCALE_FAMILIES)
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise argparse.ArgumentTypeError(
+                "side_channel_residual_scale entries must be family=scale pairs"
+            )
+        family, raw_scale = item.split("=", 1)
+        family = family.strip()
+        if not family:
+            raise argparse.ArgumentTypeError(
+                "side_channel_residual_scale family names must be non-empty"
+            )
+        if family not in allowed:
+            allowed_list = ", ".join(HYBRID_SIDE_CHANNEL_RESIDUAL_SCALE_FAMILIES)
+            raise argparse.ArgumentTypeError(
+                "side_channel_residual_scale only supports model-consumed "
+                f"families: {allowed_list}; got {family!r}"
+            )
+        try:
+            scale = float(raw_scale.strip())
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(str(exc)) from exc
+        if not math.isfinite(scale) or scale < 0.0:
+            raise argparse.ArgumentTypeError(
+                f"side_channel_residual_scale for {family!r} must be finite and >= 0"
+            )
+        policy[family] = scale
+    if (
+        "structure" in policy
+        and "syntax" in policy
+        and not math.isclose(policy["structure"], policy["syntax"])
+    ):
+        raise argparse.ArgumentTypeError(
+            "structure and syntax currently share a single structure residual; "
+            "set one side_channel_residual_scale value or matching values"
+        )
+    return policy
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return build_parser().parse_args(argv)
 
@@ -560,6 +619,9 @@ def config_from_args(args: argparse.Namespace) -> TrainHybridTinyConfig:
         ngram_hash_seed=args.ngram_hash_seed,
         side_channel_dropout=parse_side_channel_dropout(args.side_channel_dropout),
         side_channel_dropout_seed=args.side_channel_dropout_seed,
+        side_channel_residual_scale=parse_side_channel_residual_scale(
+            args.side_channel_residual_scale
+        ),
         include_structure=not args.no_structure,
         grad_checkpoint=args.grad_checkpoint,
         shuffle=args.shuffle,
@@ -676,6 +738,32 @@ def validate_config(config: TrainHybridTinyConfig) -> None:
         and config.side_channel_dropout_seed < 0
     ):
         raise ValueError("side_channel_dropout_seed must be >= 0")
+    allowed_residual_families = set(HYBRID_SIDE_CHANNEL_RESIDUAL_SCALE_FAMILIES)
+    for family, scale in config.side_channel_residual_scale.items():
+        if not isinstance(family, str) or not family.strip():
+            raise ValueError("side_channel_residual_scale family names must be non-empty")
+        if family not in allowed_residual_families:
+            allowed = ", ".join(HYBRID_SIDE_CHANNEL_RESIDUAL_SCALE_FAMILIES)
+            raise ValueError(
+                "side_channel_residual_scale only supports model-consumed "
+                f"families: {allowed}; got {family!r}"
+            )
+        if not math.isfinite(float(scale)) or float(scale) < 0.0:
+            raise ValueError(
+                f"side_channel_residual_scale for {family!r} must be finite and >= 0"
+            )
+    if (
+        "structure" in config.side_channel_residual_scale
+        and "syntax" in config.side_channel_residual_scale
+        and not math.isclose(
+            config.side_channel_residual_scale["structure"],
+            config.side_channel_residual_scale["syntax"],
+        )
+    ):
+        raise ValueError(
+            "structure and syntax currently share a single structure residual; "
+            "set one side_channel_residual_scale value or matching values"
+        )
     if config.memory_limit_total_bytes is not None and config.memory_limit_total_bytes <= 0:
         raise ValueError("memory_limit_total_bytes must be positive")
     memory_limit_plan(
@@ -836,6 +924,7 @@ def hybrid_model_config(
         ngram_hash_embed_dim=config.ngram_hash_embed_dim,
         ngram_hash_dropout=config.ngram_hash_dropout,
         ngram_hash_seed=config.ngram_hash_seed,
+        side_channel_residual_scale=dict(config.side_channel_residual_scale),
         grad_checkpoint=config.grad_checkpoint,
     )
 
@@ -975,9 +1064,13 @@ def safe_training_optimizer_payload(config: TrainHybridTinyConfig) -> dict[str, 
 
 def training_loss_payload(config: TrainHybridTinyConfig) -> dict[str, Any]:
     side_channel_dropout = dict(sorted(config.side_channel_dropout.items()))
+    side_channel_residual_scale = dict(
+        sorted(config.side_channel_residual_scale.items())
+    )
     side_channel_receipt = {
         "side_channel_dropout": side_channel_dropout,
         "side_channel_dropout_seed": config.side_channel_dropout_seed,
+        "side_channel_residual_scale": side_channel_residual_scale,
     }
     if config.loss_backend == "cross_entropy":
         return {

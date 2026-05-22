@@ -7,7 +7,8 @@ implementation and does not claim production kernel performance.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+import math
+from dataclasses import asdict, dataclass, field
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -58,6 +59,8 @@ HybridBlockModule = (
     | EngramBranch
     | ConceptBlock
 )
+
+HYBRID_SIDE_CHANNEL_RESIDUAL_SCALE_FAMILIES = ("platform", "structure", "syntax")
 PathCActivationProbe = Callable[[Mapping[str, Any]], None]
 
 _ROUTE_SYMBOL_BACKENDS: dict[str, HybridBackend] = {
@@ -137,6 +140,39 @@ def _path_c_capture_event_metadata(event: Mapping[str, Any]) -> Mapping[str, Any
     return metadata
 
 
+def _normalize_side_channel_residual_scale(
+    policy: Mapping[str, float],
+) -> dict[str, float]:
+    normalized: dict[str, float] = {}
+    allowed = set(HYBRID_SIDE_CHANNEL_RESIDUAL_SCALE_FAMILIES)
+    for raw_family, raw_scale in policy.items():
+        family = str(raw_family).strip()
+        if not family:
+            raise ValueError("side_channel_residual_scale family names must be non-empty")
+        if family not in allowed:
+            allowed_list = ", ".join(HYBRID_SIDE_CHANNEL_RESIDUAL_SCALE_FAMILIES)
+            raise ValueError(
+                "side_channel_residual_scale only supports model-consumed "
+                f"families: {allowed_list}; got {family!r}"
+            )
+        scale = float(raw_scale)
+        if not math.isfinite(scale) or scale < 0.0:
+            raise ValueError(
+                f"side_channel_residual_scale for {family!r} must be finite and >= 0"
+            )
+        normalized[family] = scale
+    if (
+        "structure" in normalized
+        and "syntax" in normalized
+        and not math.isclose(normalized["structure"], normalized["syntax"])
+    ):
+        raise ValueError(
+            "structure and syntax currently share a single structure residual; "
+            "set one side_channel_residual_scale value or matching values"
+        )
+    return dict(sorted(normalized.items()))
+
+
 @dataclass(frozen=True)
 class HybridTinyConfig:
     """Tiny local hybrid-LM config.
@@ -196,6 +232,7 @@ class HybridTinyConfig:
     ngram_hash_embed_dim: int = 16
     ngram_hash_dropout: float = 0.0
     ngram_hash_seed: int | None = None
+    side_channel_residual_scale: dict[str, float] = field(default_factory=dict)
     mhc_enabled: bool = False
     grad_checkpoint: bool = False
     # Attention mode default applied to A-layers that did not get DSA routing.
@@ -257,6 +294,11 @@ class HybridTinyConfig:
                 f"attention_mode must be one of 'mla', 'dsa', 'full', 'gqa', "
                 f"got {self.attention_mode!r}"
             )
+        object.__setattr__(
+            self,
+            "side_channel_residual_scale",
+            _normalize_side_channel_residual_scale(self.side_channel_residual_scale),
+        )
         self.attention_config(self.attention_mode)
         # Always also validate the dsa mode contract because dsa_a_layer_ranks
         # may pin specific A-layers to dsa regardless of attention_mode.
@@ -370,6 +412,14 @@ class HybridTinyConfig:
             "vocab_size": self.platform_vocab_size,
             "max_ids": self.platform_max_ids,
         }
+
+    def residual_scale_for(self, family: str) -> float:
+        if family == "structure":
+            return self.side_channel_residual_scale.get(
+                "structure",
+                self.side_channel_residual_scale.get("syntax", 1.0),
+            )
+        return self.side_channel_residual_scale.get(family, 1.0)
 
     def ngram_hash_config(self) -> dict[str, object] | None:
         if not self.ngram_hash_enabled:
@@ -1083,37 +1133,56 @@ class HybridTinyLM(nn.Module):
         if self.ngram_hash_embedding is not None:
             hidden_states = hidden_states + self.ngram_hash_embedding(input_ids)
 
-        structure_embeddings = self.structure_embedding(
-            structure_ids=_validate_side_channel_shape(
+        structure_inputs = {
+            "structure_ids": _validate_side_channel_shape(
                 "structure_ids", structure_ids, batch_size, seq_length
             ),
-            dep_levels=_validate_side_channel_shape(
+            "dep_levels": _validate_side_channel_shape(
                 "dep_levels", dep_levels, batch_size, seq_length
             ),
-            ast_depth_ids=_validate_side_channel_shape(
+            "ast_depth_ids": _validate_side_channel_shape(
                 "ast_depth_ids", ast_depth_ids, batch_size, seq_length
             ),
-            sibling_index_ids=_validate_side_channel_shape(
+            "sibling_index_ids": _validate_side_channel_shape(
                 "sibling_index_ids", sibling_index_ids, batch_size, seq_length
             ),
-            node_type_ids=_validate_side_channel_shape(
+            "node_type_ids": _validate_side_channel_shape(
                 "node_type_ids", node_type_ids, batch_size, seq_length
             ),
-            target_dtype=hidden_states.dtype,
-        )
-        if structure_embeddings.ndim == hidden_states.ndim:
-            hidden_states = hidden_states + structure_embeddings
+        }
+        structure_residual_scale = self.config.residual_scale_for("structure")
+        if structure_residual_scale != 0.0:
+            structure_embeddings = self.structure_embedding(
+                **structure_inputs,
+                target_dtype=hidden_states.dtype,
+            )
+            if structure_embeddings.ndim == hidden_states.ndim:
+                if structure_residual_scale == 1.0:
+                    hidden_states = hidden_states + structure_embeddings
+                else:
+                    hidden_states = hidden_states + (
+                        structure_embeddings
+                        * mx.array(structure_residual_scale, dtype=hidden_states.dtype)
+                    )
 
         platform_ids = _validate_platform_ids(
             platform_ids,
             batch_size=batch_size,
             seq_length=seq_length,
         )
-        if platform_ids is not None:
-            hidden_states = hidden_states + self.platform_embedding(
+        platform_residual_scale = self.config.residual_scale_for("platform")
+        if platform_ids is not None and platform_residual_scale != 0.0:
+            platform_residual = self.platform_embedding(
                 platform_ids,
                 target_dtype=hidden_states.dtype,
             )
+            if platform_residual_scale == 1.0:
+                hidden_states = hidden_states + platform_residual
+            else:
+                hidden_states = hidden_states + (
+                    platform_residual
+                    * mx.array(platform_residual_scale, dtype=hidden_states.dtype)
+                )
 
         document_ids = _validate_document_ids(
             document_ids,

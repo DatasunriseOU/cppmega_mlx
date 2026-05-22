@@ -40,30 +40,32 @@ def _hybrid_config(**overrides) -> HybridTinyConfig:
     return HybridTinyConfig(**params)
 
 
-def _small_single_route_config(symbol: str) -> HybridTinyConfig:
-    return _hybrid_config(
-        hidden_size=8,
-        pattern=symbol,
-        depth=1,
-        dsa_a_layer_ranks=(0,) if symbol == "A" else (),
-        num_attention_heads=1,
-        max_seq_length=8,
-        mamba_expand=1,
-        mamba_head_dim=4,
-        mamba_state_dim=4,
-        mamba_groups=1,
-        mamba_chunk_size=4,
-        moe_num_experts=4,
-        moe_top_k=4,
-        moe_expert_hidden_size=16,
-        moe_shared_expert_hidden_size=8,
-        m2rnn_k_head_dim=2,
-        m2rnn_v_head_dim=2,
-        m2rnn_num_v_heads=1,
-        m2rnn_num_f_heads=1,
-        m2rnn_num_weight_heads=1,
-        m2rnn_chunk_size=4,
-    )
+def _small_single_route_config(symbol: str, **overrides) -> HybridTinyConfig:
+    params = {
+        "hidden_size": 8,
+        "pattern": symbol,
+        "depth": 1,
+        "dsa_a_layer_ranks": (0,) if symbol == "A" else (),
+        "num_attention_heads": 1,
+        "max_seq_length": 8,
+        "mamba_expand": 1,
+        "mamba_head_dim": 4,
+        "mamba_state_dim": 4,
+        "mamba_groups": 1,
+        "mamba_chunk_size": 4,
+        "moe_num_experts": 4,
+        "moe_top_k": 4,
+        "moe_expert_hidden_size": 16,
+        "moe_shared_expert_hidden_size": 8,
+        "m2rnn_k_head_dim": 2,
+        "m2rnn_v_head_dim": 2,
+        "m2rnn_num_v_heads": 1,
+        "m2rnn_num_f_heads": 1,
+        "m2rnn_num_weight_heads": 1,
+        "m2rnn_chunk_size": 4,
+    }
+    params.update(overrides)
+    return _hybrid_config(**params)
 
 
 def test_single_route_lms_preserve_route_specific_loss_contract() -> None:
@@ -122,6 +124,111 @@ def test_hybrid_lm_platform_ids_are_zero_init_optional_conditioning() -> None:
     mx.eval(with_platform)
 
     assert not np.allclose(np.array(base), np.array(with_platform))
+
+
+def _platform_residual_model(scale: float) -> HybridTinyLM:
+    mx.random.seed(701)
+    model = HybridTinyLM(
+        _small_single_route_config(
+            "M",
+            side_channel_residual_scale={"platform": scale},
+        )
+    )
+    model.platform_embedding.embedding.weight = mx.ones_like(
+        model.platform_embedding.embedding.weight
+    )
+    return model
+
+
+def test_hybrid_lm_platform_residual_scale_controls_conditioning() -> None:
+    input_ids = mx.array([[1, 2, 3, 4]], dtype=mx.int32)
+    platform_ids = mx.array(
+        platform_ids_array(
+            [parse_platform_context({"os": "macos", "arch": "arm64", "compiler": "clang"})]
+        )
+    )
+
+    zero_model = _platform_residual_model(0.0)
+    half_model = _platform_residual_model(0.5)
+    one_model = _platform_residual_model(1.0)
+
+    zero_base = zero_model.decoder_hidden_states(input_ids)
+    zero = zero_model.decoder_hidden_states(input_ids, platform_ids=platform_ids)
+    half_base = half_model.decoder_hidden_states(input_ids)
+    half = half_model.decoder_hidden_states(input_ids, platform_ids=platform_ids)
+    one_base = one_model.decoder_hidden_states(input_ids)
+    one = one_model.decoder_hidden_states(input_ids, platform_ids=platform_ids)
+    mx.eval(zero_base, zero, half_base, half, one_base, one)
+
+    np.testing.assert_allclose(np.array(zero), np.array(zero_base), atol=0.0)
+    assert not np.allclose(np.array(half), np.array(half_base))
+    assert not np.allclose(np.array(one), np.array(one_base))
+    assert not np.allclose(np.array(half), np.array(one))
+
+
+def _structure_residual_model(scale: float) -> HybridTinyLM:
+    mx.random.seed(702)
+    model = HybridTinyLM(
+        _small_single_route_config(
+            "M",
+            side_channel_residual_scale={"structure": scale},
+        )
+    )
+    model.structure_embedding.stacked_emb.weight = mx.ones_like(
+        model.structure_embedding.stacked_emb.weight
+    )
+    model.structure_embedding.up_proj.weight = mx.ones_like(
+        model.structure_embedding.up_proj.weight
+    )
+    return model
+
+
+def test_hybrid_lm_structure_residual_scale_controls_conditioning() -> None:
+    input_ids = mx.array([[1, 2, 3, 4]], dtype=mx.int32)
+    structure_ids = mx.array([[1, 2, 3, 4]], dtype=mx.int32)
+    dep_levels = mx.array([[0, 1, 2, 3]], dtype=mx.int32)
+
+    zero_model = _structure_residual_model(0.0)
+    half_model = _structure_residual_model(0.5)
+    one_model = _structure_residual_model(1.0)
+
+    zero_base = zero_model.decoder_hidden_states(input_ids)
+    zero = zero_model.decoder_hidden_states(
+        input_ids,
+        structure_ids=structure_ids,
+        dep_levels=dep_levels,
+    )
+    half_base = half_model.decoder_hidden_states(input_ids)
+    half = half_model.decoder_hidden_states(
+        input_ids,
+        structure_ids=structure_ids,
+        dep_levels=dep_levels,
+    )
+    one_base = one_model.decoder_hidden_states(input_ids)
+    one = one_model.decoder_hidden_states(
+        input_ids,
+        structure_ids=structure_ids,
+        dep_levels=dep_levels,
+    )
+    mx.eval(zero_base, zero, half_base, half, one_base, one)
+
+    np.testing.assert_allclose(np.array(zero), np.array(zero_base), atol=0.0)
+    assert not np.allclose(np.array(half), np.array(half_base))
+    assert not np.allclose(np.array(one), np.array(one_base))
+    assert not np.allclose(np.array(half), np.array(one))
+
+
+def test_hybrid_lm_rejects_unsupported_residual_scale_families() -> None:
+    with pytest.raises(ValueError, match="side_channel_residual_scale"):
+        _small_single_route_config(
+            "M",
+            side_channel_residual_scale={"semantic_graph": 0.5},
+        )
+    with pytest.raises(ValueError, match="single structure residual"):
+        _small_single_route_config(
+            "M",
+            side_channel_residual_scale={"structure": 1.0, "syntax": 0.5},
+        )
 
 
 def test_hybrid_lm_accepts_token_local_platform_ids() -> None:
