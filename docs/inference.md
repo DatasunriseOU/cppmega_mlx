@@ -16,6 +16,7 @@ GB10/CUDA parity are separate tasks.
 | Vanilla speculative decode | `generate_tokens_speculative(` | Eager batch=1 draft-window verifier with Leviathan-style acceptance/rejection | target model, draft model, `draft_window`, sampling knobs | No KV/paged speculative serving |
 | MTP self-speculative decode | `generate_tokens_mtp_self_speculative(` | Eager batch=1 path using attached `mtp_head` as draft source | `draft_window`, trained MTP depth, sampling knobs | No EAGLE-2/token-recycling claim |
 | Local token-id API serving | `create_local_generation_app(` | Optional FastAPI app exposing `/health` and `/generate` over token IDs | caller-owned model, generation options, `model_kwargs_builder`, optional decoder | not an OpenAI-compatible API |
+| Inference quantization manifest | `scripts/quantize_for_inference.py` | Local q4 helper manifest over repo-local inference quantization primitives | preset, q4 bits/group size, KV-q4 bits/group size, forward check | not a full checkpoint converter |
 | q4 quality smoke | `scripts/bench_inference_quality.py` | Built-in ARC/MMLU/HumanEval-style token-id smoke harness over q4 linears | `--tasks-jsonl`, suites, q4 bits/group size | not a real ARC/MMLU/HumanEval leaderboard run |
 | KV-q4 long-context smoke | `scripts/bench_inference_long_context.py` | Built-in NIAH/RULER-style token-id smoke harness over `QuantizedKVCache` | `--context-tokens`, suites, `--kv-bits`, `--kv-group-size`, `--quantized-kv-start` | not a real NIAH/RULER leaderboard run |
 
@@ -85,6 +86,13 @@ fleet endpoint, and not model-integrated paged attention.
 
 ## Benchmarks
 
+`scripts/quantize_for_inference.py` is an inference-only helper that builds a
+small local preset, applies `quantize_module_for_inference`, validates the
+KV-q4 configuration, and writes a manifest with quantized/remaining Linear
+counts, skipped embedding/output-head policy, memory-safety metadata, and
+optional forward-diff information. It is not a full checkpoint converter and
+does not claim training quantization.
+
 `scripts/bench_inference_throughput.py` measures local smoke prefill/decode
 throughput for Qwen3-4B-class and NAM56R-class route profiles without
 allocating full multi-billion-parameter models.
@@ -119,5 +127,6 @@ being silently fabricated.
 - This is not model-integrated paged attention.
 - This is not a real ARC/MMLU/HumanEval leaderboard run.
 - This is not a real NIAH/RULER leaderboard run.
+- This is not a full checkpoint converter.
 - This is not a GB10 parity claim.
 - This is not mixed bf16-to-q4 quantized_kv_start > 0 transition coverage.

@@ -266,6 +266,7 @@ The current collected test files are:
 - tests/test_profile.py
 - tests/test_profile_capture_script.py
 - tests/test_pytest_markers.py
+- tests/test_quantize_for_inference_script.py
 - tests/test_quantized_muon_momentum.py
 - tests/test_real_parquet_samples.py
 - tests/test_render_1b_training_matrix_html.py
