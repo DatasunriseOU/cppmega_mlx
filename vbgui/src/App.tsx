@@ -246,7 +246,10 @@ export function App(): JSX.Element {
     try {
       const r = await rpc.call<{
         proposals: { strategy_name: string; fits: boolean;
-                     estimated_per_rank_bytes: number; reason: string }[];
+                     estimated_per_rank_bytes: number; reason: string;
+                     sharding?: { axis_assignments: {
+                       axis_name: string; kind: string; degree: number;
+                     }[] } }[];
       }>("suggest_sharding", {
         graph: nodesToGraph(snap.nodes, snap.edges),
         dim_env: MINI_DIM_ENV,
@@ -267,6 +270,7 @@ export function App(): JSX.Element {
         strategy_name: p.strategy_name, fits: p.fits,
         estimated_per_rank_bytes: p.estimated_per_rank_bytes,
         reason: p.reason,
+        axis_assignments: p.sharding?.axis_assignments,
       })));
     } catch { /* keep prior proposals on failure */ }
   }, [rpc]);
@@ -326,13 +330,20 @@ export function App(): JSX.Element {
   const handleShardingAccept = useCallback((idx: number) => {
     const chosen = proposals[idx];
     if (!chosen) return;
-    // The proposal carries strategy + reason; backend already knows the
-    // axis-assignments. We re-run verify so the new memory bar reflects.
+    // H01: actually mutate spec.sharding.axis_assignments with the
+    // proposal's axes. Previous version only re-verified the OLD spec,
+    // so accepting a proposal had zero observable effect downstream.
+    if (chosen.axis_assignments && chosen.axis_assignments.length > 0) {
+      dispatch({ type: "sharding.set",
+                 sharding: { ...spec.sharding,
+                             axis_assignments: chosen.axis_assignments } });
+    }
     void scheduleVerify();
     setRunReport(null);
-    setRunError(`sharding proposal "${chosen.strategy_name}" applied — re-verifying`);
+    setRunError(
+      `sharding proposal "${chosen.strategy_name}" applied — re-verifying`);
     setTimeout(() => setRunError(null), 2000);
-  }, [proposals, scheduleVerify]);
+  }, [proposals, scheduleVerify, spec.sharding]);
 
   return (
     <ReactFlowProvider>

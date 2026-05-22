@@ -5,6 +5,10 @@ export interface ShardingProposalView {
   fits: boolean;
   estimated_per_rank_bytes: number;
   reason: string;
+  /** H01: backend proposals carry the full axis_assignments + topology +
+   *  compile_mode. Accept must mutate spec.sharding to use them, not
+   *  just re-verify with the old spec. */
+  axis_assignments?: ShardingAxis[];
 }
 
 export interface ShardingTabProps {
