@@ -102,6 +102,27 @@ describe("TopBar", () => {
     expect(onRunPipeline).toHaveBeenCalledWith("smoke");
   });
 
+  it("H22: trainInFlight disables Train button + shows Training… label",
+    () => {
+      render(<TopBar {...defaultTopProps({ trainInFlight: true })} />);
+      fireEvent.click(screen.getByTestId("run-pipeline-toggle"));
+      const btn = screen.getByTestId("run-pipeline-train");
+      expect(btn).toHaveProperty("disabled", true);
+      expect(btn.textContent).toContain("Training");
+    });
+
+  it("H22: top-bar-train-status shows training when trainInFlight", () => {
+    render(<TopBar {...defaultTopProps({ trainInFlight: true })} />);
+    expect(screen.getByTestId("top-bar-train-status").textContent)
+      .toBe("training");
+  });
+
+  it("H22: top-bar-train-status shows idle by default", () => {
+    render(<TopBar {...defaultTopProps()} />);
+    expect(screen.getByTestId("top-bar-train-status").textContent)
+      .toBe("idle");
+  });
+
   it("Cancel button is disabled without an in-flight train run", () => {
     render(<TopBar {...defaultTopProps()} />);
     expect(screen.getByTestId("run-pipeline-cancel"))

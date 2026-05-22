@@ -138,6 +138,12 @@ export function TopBar(p: TopBarProps): JSX.Element {
           : "synthetic"}
       </span>
 
+      <span data-testid="top-bar-train-status"
+            style={{ fontSize: 10, color: p.trainInFlight ? "#d97706"
+                                                          : "#9ca3af",
+                     fontFamily: "monospace" }}>
+        {p.trainInFlight ? "training" : "idle"}
+      </span>
       <div style={{ position: "relative" }}>
         <button data-testid="run-pipeline"
                 onClick={() => p.onRunPipeline("smoke")}>
@@ -226,13 +232,17 @@ export function TopBar(p: TopBarProps): JSX.Element {
                                            ckptLoadPath || undefined,
                                          inference_probe_text:
                                            probeText || undefined }); }}
-                    disabled={!!p.trainDisabled}
-                    title={p.trainDisabled?.reason ?? ""}
+                    // H22: disable while a Train is already running so
+                    // double-clicks don't spawn a parallel pipeline.
+                    disabled={!!p.trainDisabled || !!p.trainInFlight}
+                    title={p.trainDisabled?.reason
+                      ?? (p.trainInFlight ? "Training in progress" : "")}
                     style={{ ...menuItem,
-                             opacity: p.trainDisabled ? 0.5 : 1,
-                             cursor: p.trainDisabled ? "not-allowed"
-                                                     : "pointer" }}>
-              Train
+                             opacity: (p.trainDisabled || p.trainInFlight)
+                               ? 0.5 : 1,
+                             cursor: (p.trainDisabled || p.trainInFlight)
+                               ? "not-allowed" : "pointer" }}>
+              {p.trainInFlight ? "Training…" : "Train"}
               {p.trainDisabled && (
                 <span data-testid="top-bar-train-disabled-reason"
                       style={{ display: "block", fontSize: 10,
