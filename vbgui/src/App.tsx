@@ -293,7 +293,10 @@ export function App(): JSX.Element {
 
   const handleRunPipeline = useCallback(async (
     mode: RunMode,
-    opts?: { num_steps?: number; warm_start?: boolean },
+    opts?: { num_steps?: number; warm_start?: boolean;
+      checkpoint_save_path?: string;
+      checkpoint_load_path?: string;
+    },
   ) => {
     const snap = wireSpecRef.current;
     if (snap.nodes.length === 0) {
@@ -321,6 +324,13 @@ export function App(): JSX.Element {
       // the backend G10 LRU cache restores opt.state from prior run.
       if (opts?.warm_start && lastTrainRunId) {
         trainOpts.continue_from_run_id = lastTrainRunId;
+      }
+      // H05: forward checkpoint save/load paths to stage_train G12.
+      if (opts?.checkpoint_save_path) {
+        trainOpts.checkpoint_save_path = opts.checkpoint_save_path;
+      }
+      if (opts?.checkpoint_load_path) {
+        trainOpts.checkpoint_load_path = opts.checkpoint_load_path;
       }
       if (trainParquetPath) trainOpts.parquet_path = trainParquetPath;
       if (trainTokenizerPath) trainOpts.tokenizer_path = trainTokenizerPath;

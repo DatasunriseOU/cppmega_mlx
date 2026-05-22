@@ -14,7 +14,10 @@ export interface TopBarProps {
   onTopologyChange: (t: TopologyFactory) => void;
   onCompileModeChange: (m: SpecState["sharding"]["compile_mode"]) => void;
   onRunPipeline: (mode: RunMode,
-    opts?: { num_steps?: number; warm_start?: boolean }) => void;
+    opts?: { num_steps?: number; warm_start?: boolean;
+      checkpoint_save_path?: string;
+      checkpoint_load_path?: string;
+    }) => void;
   /** H02: toggle callbacks. */
   onMixedPrecisionChange?: (enabled: boolean) => void;
   onFp8EnabledChange?: (enabled: boolean) => void;
@@ -40,6 +43,8 @@ export function TopBar(p: TopBarProps): JSX.Element {
   const [open, setOpen] = useState(false);
   const [trainNumSteps, setTrainNumSteps] = useState<number>(2);
   const [warmStart, setWarmStart] = useState<boolean>(false);
+  const [ckptSavePath, setCkptSavePath] = useState<string>("");
+  const [ckptLoadPath, setCkptLoadPath] = useState<string>("");
   return (
     <header data-testid="top-bar"
             style={{ height: 56, display: "flex", alignItems: "center",
@@ -174,11 +179,37 @@ export function TopBar(p: TopBarProps): JSX.Element {
                      onChange={(e) => setWarmStart(e.target.checked)} />
               warm-start (continue from last run)
             </label>
+            <div style={{ padding: "6px 12px", display: "flex",
+                          flexDirection: "column", gap: 4, fontSize: 11,
+                          color: "#374151" }}>
+              <label style={{ display: "flex", alignItems: "center",
+                              gap: 6 }}>
+                <span style={{ width: 78, color: "#6b7280" }}>ckpt save:</span>
+                <input data-testid="train-checkpoint-save-path" type="text"
+                       placeholder="/tmp/ckpt.safetensors"
+                       value={ckptSavePath}
+                       onChange={(e) => setCkptSavePath(e.target.value)}
+                       style={{ width: 200 }} />
+              </label>
+              <label style={{ display: "flex", alignItems: "center",
+                              gap: 6 }}>
+                <span style={{ width: 78, color: "#6b7280" }}>ckpt load:</span>
+                <input data-testid="train-checkpoint-load-path" type="text"
+                       placeholder="/tmp/prev.safetensors"
+                       value={ckptLoadPath}
+                       onChange={(e) => setCkptLoadPath(e.target.value)}
+                       style={{ width: 200 }} />
+              </label>
+            </div>
             <button data-testid="run-pipeline-train"
                     onClick={() => { setOpen(false);
                                      p.onRunPipeline("train",
                                        { num_steps: trainNumSteps,
-                                         warm_start: warmStart }); }}
+                                         warm_start: warmStart,
+                                         checkpoint_save_path:
+                                           ckptSavePath || undefined,
+                                         checkpoint_load_path:
+                                           ckptLoadPath || undefined }); }}
                     disabled={!!p.trainDisabled}
                     title={p.trainDisabled?.reason ?? ""}
                     style={{ ...menuItem,

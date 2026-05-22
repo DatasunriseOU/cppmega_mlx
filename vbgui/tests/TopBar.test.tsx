@@ -131,6 +131,33 @@ describe("TopBar", () => {
       expect.objectContaining({ num_steps: expect.any(Number) }));
   });
 
+  it("H05: train-checkpoint-save/load-path inputs forward into opts",
+    () => {
+      const onRunPipeline = vi.fn();
+      render(<TopBar {...defaultTopProps({ onRunPipeline })} />);
+      fireEvent.click(screen.getByTestId("run-pipeline-toggle"));
+      fireEvent.change(screen.getByTestId("train-checkpoint-save-path"),
+        { target: { value: "/tmp/save.safetensors" } });
+      fireEvent.change(screen.getByTestId("train-checkpoint-load-path"),
+        { target: { value: "/tmp/load.safetensors" } });
+      fireEvent.click(screen.getByTestId("run-pipeline-train"));
+      expect(onRunPipeline).toHaveBeenLastCalledWith("train",
+        expect.objectContaining({
+          checkpoint_save_path: "/tmp/save.safetensors",
+          checkpoint_load_path: "/tmp/load.safetensors",
+        }));
+    });
+
+  it("H05: empty checkpoint inputs omit fields", () => {
+    const onRunPipeline = vi.fn();
+    render(<TopBar {...defaultTopProps({ onRunPipeline })} />);
+    fireEvent.click(screen.getByTestId("run-pipeline-toggle"));
+    fireEvent.click(screen.getByTestId("run-pipeline-train"));
+    const opts = onRunPipeline.mock.calls.at(-1)?.[1];
+    expect(opts.checkpoint_save_path).toBeUndefined();
+    expect(opts.checkpoint_load_path).toBeUndefined();
+  });
+
   it("H04: train-warm-start checkbox forwards warm_start flag", () => {
     const onRunPipeline = vi.fn();
     render(<TopBar {...defaultTopProps({ onRunPipeline })} />);
