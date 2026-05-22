@@ -1122,6 +1122,15 @@ def stage_train(ctx: StageContext) -> StageResult:
                     f"opt_state_load failed: "
                     f"{type(exc).__name__}: {exc}; cold restart")
 
+        # H20: fake multi-rank distributed train smoke. When
+        # opts.fake_ranks > 1, the forward+backward is replayed N times
+        # on the same micro-batch and gradients are mean-reduced (an
+        # all-reduce simulation). With identical inputs per replay the
+        # mean equals each rank's grad, so loss trajectories are
+        # bit-identical to fake_ranks=1; extras.gradient_reduce_ms
+        # captures the per-step reduce wall-clock.
+        fake_ranks = max(1, int(opts.get("fake_ranks", 1)))
+        gradient_reduce_ms_total = 0.0
         # G09: check abort flag set via opts.abort or _ABORT_TOKENS set
         abort_token = opts.get("abort_token")
         for step in range(n_steps):
@@ -1153,6 +1162,25 @@ def stage_train(ctx: StageContext) -> StageResult:
                 emb = train_token_embedding(targets)
             loss, grads = loss_and_grad(all_modules, emb, targets)
             mx.eval(loss, grads)
+            # H20: simulate fake_ranks-way all-reduce by replaying the
+            # backward N-1 more times on identical input and mean-
+            # reducing all gradients across the synthetic ranks.
+            if fake_ranks > 1:
+                _t_reduce = time.perf_counter()
+                accum_grads = grads
+                for _r in range(1, fake_ranks):
+                    _, g_r = loss_and_grad(all_modules, emb, targets)
+                    accum_grads = nn.utils.tree_map(
+                        lambda a, b: a + b
+                            if hasattr(a, "shape") else a,
+                        accum_grads, g_r)
+                grads = nn.utils.tree_map(
+                    lambda g: g / fake_ranks
+                        if hasattr(g, "shape") else g,
+                    accum_grads)
+                mx.eval(grads)
+                gradient_reduce_ms_total += (
+                    time.perf_counter() - _t_reduce) * 1000.0
             if probe_key is None:
                 flat_params = dict(nn.utils.tree_flatten(all_modules.parameters()))
                 flat_grads = dict(nn.utils.tree_flatten(grads))
@@ -1362,6 +1390,9 @@ def stage_train(ctx: StageContext) -> StageResult:
                 "gradient_clip": clip_extras,
                 "memory_peak_bytes": memory_peak_bytes,
                 "sharding_applied": sharding_applied,
+                "fake_ranks": fake_ranks,
+                "gradient_reduce_ms": round(
+                    gradient_reduce_ms_total, 4),
                 "train_dtype": train_dtype,
                 "master_dtype": master_dtype,
                 "fp8_active": fp8_active,

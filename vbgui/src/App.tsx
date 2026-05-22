@@ -345,6 +345,17 @@ export function App(): JSX.Element {
       if (opts?.inference_probe_text) {
         trainOpts.inference_probe_text = opts.inference_probe_text;
       }
+      // H20: when the spec carries sharding axes, derive fake_ranks
+      // from the product of their degrees so a Train run simulates a
+      // mean-reduced multi-rank backward (extras.fake_ranks +
+      // gradient_reduce_ms light up).
+      const axes = snap.spec.sharding?.axis_assignments ?? [];
+      if (axes.length > 0) {
+        const totalDegree = axes.reduce(
+          (acc, a) => acc * Math.max(1, (a as { degree?: number }).degree
+            ?? 1), 1);
+        if (totalDegree > 1) trainOpts.fake_ranks = totalDegree;
+      }
       if (trainParquetPath) trainOpts.parquet_path = trainParquetPath;
       if (trainTokenizerPath) trainOpts.tokenizer_path = trainTokenizerPath;
       // Forward SideChannelsTab train selection as synthetic int lists for the
