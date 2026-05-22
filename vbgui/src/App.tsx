@@ -302,6 +302,7 @@ export function App(): JSX.Element {
     opts?: { num_steps?: number; warm_start?: boolean;
       checkpoint_save_path?: string;
       checkpoint_load_path?: string;
+      inference_probe_text?: string;
     },
   ) => {
     const snap = wireSpecRef.current;
@@ -337,6 +338,12 @@ export function App(): JSX.Element {
       }
       if (opts?.checkpoint_load_path) {
         trainOpts.checkpoint_load_path = opts.checkpoint_load_path;
+      }
+      // H08: forward inference probe text (G20). Backend pairs it with
+      // tokenizer_path (also forwarded above) to encode real tokens for
+      // the pre-vs-post forward divergence probe.
+      if (opts?.inference_probe_text) {
+        trainOpts.inference_probe_text = opts.inference_probe_text;
       }
       if (trainParquetPath) trainOpts.parquet_path = trainParquetPath;
       if (trainTokenizerPath) trainOpts.tokenizer_path = trainTokenizerPath;

@@ -17,6 +17,7 @@ export interface TopBarProps {
     opts?: { num_steps?: number; warm_start?: boolean;
       checkpoint_save_path?: string;
       checkpoint_load_path?: string;
+      inference_probe_text?: string;
     }) => void;
   /** H02: toggle callbacks. */
   onMixedPrecisionChange?: (enabled: boolean) => void;
@@ -45,6 +46,7 @@ export function TopBar(p: TopBarProps): JSX.Element {
   const [warmStart, setWarmStart] = useState<boolean>(false);
   const [ckptSavePath, setCkptSavePath] = useState<string>("");
   const [ckptLoadPath, setCkptLoadPath] = useState<string>("");
+  const [probeText, setProbeText] = useState<string>("");
   return (
     <header data-testid="top-bar"
             style={{ height: 56, display: "flex", alignItems: "center",
@@ -201,6 +203,18 @@ export function TopBar(p: TopBarProps): JSX.Element {
                        style={{ width: 200 }} />
               </label>
             </div>
+            <label style={{ padding: "6px 12px", display: "flex",
+                            flexDirection: "column", gap: 3, fontSize: 11,
+                            color: "#374151" }}>
+              <span style={{ color: "#6b7280" }}>probe text:</span>
+              <textarea data-testid="train-probe-text"
+                        placeholder="Optional: encode this for inference probe"
+                        value={probeText}
+                        onChange={(e) => setProbeText(e.target.value)}
+                        rows={2}
+                        style={{ width: 280, fontFamily: "monospace",
+                                 fontSize: 11 }} />
+            </label>
             <button data-testid="run-pipeline-train"
                     onClick={() => { setOpen(false);
                                      p.onRunPipeline("train",
@@ -209,7 +223,9 @@ export function TopBar(p: TopBarProps): JSX.Element {
                                          checkpoint_save_path:
                                            ckptSavePath || undefined,
                                          checkpoint_load_path:
-                                           ckptLoadPath || undefined }); }}
+                                           ckptLoadPath || undefined,
+                                         inference_probe_text:
+                                           probeText || undefined }); }}
                     disabled={!!p.trainDisabled}
                     title={p.trainDisabled?.reason ?? ""}
                     style={{ ...menuItem,

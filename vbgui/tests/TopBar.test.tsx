@@ -148,6 +148,29 @@ describe("TopBar", () => {
         }));
     });
 
+  it("H08: train-probe-text textarea forwards inference_probe_text",
+    () => {
+      const onRunPipeline = vi.fn();
+      render(<TopBar {...defaultTopProps({ onRunPipeline })} />);
+      fireEvent.click(screen.getByTestId("run-pipeline-toggle"));
+      fireEvent.change(screen.getByTestId("train-probe-text"),
+        { target: { value: "hello world from probe" } });
+      fireEvent.click(screen.getByTestId("run-pipeline-train"));
+      expect(onRunPipeline).toHaveBeenLastCalledWith("train",
+        expect.objectContaining({
+          inference_probe_text: "hello world from probe",
+        }));
+    });
+
+  it("H08: empty probe text omits field", () => {
+    const onRunPipeline = vi.fn();
+    render(<TopBar {...defaultTopProps({ onRunPipeline })} />);
+    fireEvent.click(screen.getByTestId("run-pipeline-toggle"));
+    fireEvent.click(screen.getByTestId("run-pipeline-train"));
+    const opts = onRunPipeline.mock.calls.at(-1)?.[1];
+    expect(opts.inference_probe_text).toBeUndefined();
+  });
+
   it("H05: empty checkpoint inputs omit fields", () => {
     const onRunPipeline = vi.fn();
     render(<TopBar {...defaultTopProps({ onRunPipeline })} />);
