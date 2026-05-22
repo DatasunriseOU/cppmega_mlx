@@ -21,6 +21,7 @@ import { usePresets } from "@/hooks/usePresets";
 import {
   INITIAL_SPEC, specReducer, type SpecState, type TopologyFactory,
 } from "@/state/spec";
+import { migrate } from "@/state/migrations";
 import type { ShardingProposalView } from "@/components/sidebar/ShardingTab";
 
 // PRESETS list is now fetched dynamically from the backend via
@@ -480,11 +481,16 @@ export function App(): JSX.Element {
             const reader = new FileReader();
             reader.onload = () => {
               try {
-                const obj = JSON.parse(String(reader.result));
+                const raw = JSON.parse(String(reader.result));
+                // V7-H04: migrate-on-load so older saved bundles still
+                // hydrate cleanly. Future-version specs throw a
+                // FutureSchemaError that bubbles into the error modal.
+                const obj = migrate(raw);
                 if (obj.projectName) setProjectName(String(obj.projectName));
-                if (obj.spec) dispatch({ type: "spec.replace", spec: obj.spec });
-                if (obj.nodes) setNodes(obj.nodes);
-                if (obj.edges) setEdges(obj.edges);
+                if (obj.spec) dispatch({ type: "spec.replace",
+                                          spec: obj.spec as never });
+                if (obj.nodes) setNodes(obj.nodes as never[]);
+                if (obj.edges) setEdges(obj.edges as never[]);
               } catch (e) {
                 setRunError(`Load failed: ${String(e)}`);
               }
