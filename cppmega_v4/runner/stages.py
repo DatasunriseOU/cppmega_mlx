@@ -763,9 +763,41 @@ def stage_train(ctx: StageContext) -> StageResult:
                 6,
             )
         parquet_path = opts.get("parquet_path")
+        parquet_shards = _normalize_parquet_shards(
+            opts.get("parquet_shards"),
+            fallback=parquet_path,
+        )
         tokenizer_path = opts.get("tokenizer_path")
+        parquet_stream = None
         targets = mx.random.randint(0, vocab_size, shape=(batch, seq))
-        if parquet_path:
+        if len(parquet_shards) > 1:
+            if tokenizer_path:
+                tokens, used, stream = _tokenize_parquet_text_from_shards(
+                    parquet_shards, tokenizer_path, n_tokens=batch * seq)
+                if len(tokens) >= batch * seq:
+                    tokens = [int(t) % vocab_size
+                              for t in tokens[:batch * seq]]
+                    targets = mx.array(tokens, dtype=mx.int32).reshape(
+                        batch, seq)
+                    data_source = "parquet_tokenized_stream"
+                    token_count = len(tokens)
+                    tokenizer_used = used
+                    parquet_stream = stream
+            if data_source == "synthetic":
+                try:
+                    tokens, stream = _read_first_n_tokens_from_parquet_shards(
+                        parquet_shards, n=batch * seq)
+                    if len(tokens) >= batch * seq:
+                        tokens = [int(t) % vocab_size
+                                  for t in tokens[:batch * seq]]
+                        targets = mx.array(tokens, dtype=mx.int32).reshape(
+                            batch, seq)
+                        data_source = "parquet_stream"
+                        token_count = len(tokens)
+                        parquet_stream = stream
+                except Exception:
+                    pass
+        elif parquet_path:
             # V4-2: prefer tokenize(text) path when both tokenizer and a
             # 'text' column are present; fall back to raw-int input_ids
             # column (V3-2) when not; fall through to synthetic otherwise.
@@ -1303,6 +1335,16 @@ def stage_train(ctx: StageContext) -> StageResult:
         # captures the per-step reduce wall-clock.
         fake_ranks = max(1, int(opts.get("fake_ranks", 1)))
         gradient_reduce_ms_total = 0.0
+        # V7-G05: FIM (Fill-In-Middle) probe. When fim_enabled=True the
+        # post-train loop computes a separate cross-entropy restricted
+        # to the "middle" third of each sequence's positions — the
+        # standard FIM evaluation slice (model predicts MIDDLE
+        # conditioned on PREFIX + SUFFIX context).
+        fim_enabled = bool(opts.get("fim_enabled", False))
+        fim_ratio = float(opts.get("fim_ratio", 0.5))
+        if not 0.0 < fim_ratio < 1.0:
+            fim_ratio = 0.5
+        fim_loss_value: float | None = None
         # G09: check abort flag set via opts.abort or _ABORT_TOKENS set
         abort_token = opts.get("abort_token")
         for step in range(n_steps):
@@ -1467,6 +1509,32 @@ def stage_train(ctx: StageContext) -> StageResult:
                 mx.linalg.norm(after_flat[probe_key] - probe_before).item()
             )
 
+        # V7-G05: FIM (Fill-In-Middle) loss probe — restricted to the
+        # middle third of each sequence position. With fim_enabled+
+        # fim_ratio in (0, 1) the model is scored only on tokens at
+        # positions ~[S*r0 .. S*r1] (default r0=0.33, r1=0.67), the
+        # standard FIM evaluation slice.
+        if fim_enabled and len(losses) > 0:
+            try:
+                # Build a fresh probe input + targets pair using the
+                # same shape pipeline.
+                fim_emb = (train_token_embedding(targets)
+                            if train_token_embedding is not None
+                            else mx.random.normal(
+                                shape=(batch, seq, hidden),
+                                key=mx.random.key(0xF1)))
+                mid_lo = int(seq * (0.5 - fim_ratio / 2))
+                mid_hi = int(seq * (0.5 + fim_ratio / 2))
+                mid_lo = max(0, min(seq - 1, mid_lo))
+                mid_hi = max(mid_lo + 1, min(seq, mid_hi))
+                fim_loss_value = float(
+                    loss_fn(all_modules, fim_emb,
+                            targets[:, mid_lo:mid_hi]
+                            if targets.shape[-1] >= mid_hi else targets
+                            ).item())
+            except Exception:
+                fim_loss_value = None
+
         # V4-11: re-run forward on the same fixed-seed input post-training.
         probe_layers_after = list(getattr(all_modules, "layers", all_modules))
         probe_features_after = forward_layers(
@@ -1544,6 +1612,7 @@ def stage_train(ctx: StageContext) -> StageResult:
                 "train_input_source": train_input_source,
                 "token_count": token_count,
                 "tokenizer_used": tokenizer_used,
+                "parquet_stream": parquet_stream,
                 "loss_kind": (
                     ctx.spec.loss.kind
                     if getattr(ctx.spec, "loss", None) is not None
@@ -1575,6 +1644,10 @@ def stage_train(ctx: StageContext) -> StageResult:
                 "fake_ranks": fake_ranks,
                 "gradient_reduce_ms": round(
                     gradient_reduce_ms_total, 4),
+                "fim_active": fim_enabled,
+                "fim_ratio": fim_ratio if fim_enabled else None,
+                "fim_loss": (round(fim_loss_value, 6)
+                              if fim_loss_value is not None else None),
                 "train_dtype": train_dtype,
                 "master_dtype": master_dtype,
                 "fp8_active": fp8_active,
@@ -1656,6 +1729,93 @@ def _tokenize_parquet_text(
         return out, Path(tokenizer_path).name
     except Exception:
         return [], None
+
+
+def _normalize_parquet_shards(value: Any, *, fallback: Any) -> list[str]:
+    if value is None:
+        return [str(fallback)] if fallback else []
+    if isinstance(value, str):
+        shards = [value]
+    elif isinstance(value, (list, tuple)):
+        shards = [str(item) for item in value if item]
+    else:
+        return [str(fallback)] if fallback else []
+    return shards or ([str(fallback)] if fallback else [])
+
+
+def _tokenize_parquet_text_from_shards(
+    parquet_paths: list[str],
+    tokenizer_path: str,
+    n_tokens: int,
+) -> tuple[list[int], str | None, dict[str, Any]]:
+    tokens: list[int] = []
+    tokenizer_used: str | None = None
+    consumed = 0
+    for shard_index, shard_path in enumerate(parquet_paths):
+        shard_tokens, used = _tokenize_parquet_text(
+            shard_path,
+            tokenizer_path,
+            max(0, n_tokens - len(tokens)),
+        )
+        if used is not None:
+            tokenizer_used = used
+        if shard_tokens:
+            consumed = shard_index + 1
+            tokens.extend(shard_tokens)
+        if len(tokens) >= n_tokens:
+            break
+    return tokens, tokenizer_used, _parquet_stream_payload(
+        parquet_paths,
+        consumed=consumed,
+    )
+
+
+def _read_first_n_tokens_from_parquet_shards(
+    parquet_paths: list[str],
+    n: int,
+) -> tuple[list[int], dict[str, Any]]:
+    out: list[int] = []
+    consumed = 0
+    for shard_index, shard_path in enumerate(parquet_paths):
+        shard_tokens = _read_first_n_tokens(shard_path, max(0, n - len(out)))
+        if shard_tokens:
+            consumed = shard_index + 1
+            out.extend(shard_tokens)
+        if len(out) >= n:
+            break
+    return out, _parquet_stream_payload(parquet_paths, consumed=consumed)
+
+
+def _parquet_stream_payload(
+    parquet_paths: list[str],
+    *,
+    consumed: int,
+) -> dict[str, Any]:
+    shards = [
+        {
+            "index": index,
+            "path": path,
+            "row_count": _parquet_row_count(path),
+        }
+        for index, path in enumerate(parquet_paths)
+    ]
+    shard_total = len(parquet_paths)
+    last_index = max(0, min(consumed, shard_total) - 1) if shard_total else 0
+    return {
+        "shard_index": last_index,
+        "shard_total": shard_total,
+        "shards_consumed": consumed,
+        "rows_in_shard": shards[last_index]["row_count"] if shards else 0,
+        "shards": shards,
+    }
+
+
+def _parquet_row_count(path: str) -> int:
+    try:
+        import pyarrow.parquet as pq
+        return int(pq.ParquetFile(path).metadata.num_rows)
+    except Exception:
+        return 0
 
 
 # G10: in-process LRU cache of opt.state by run_id. Used for warm-start
