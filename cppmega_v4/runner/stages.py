@@ -766,6 +766,16 @@ def stage_train(ctx: StageContext) -> StageResult:
             all_modules.train_token_embedding = train_token_embedding
         if side_channel_token_embedding is not None:
             all_modules.side_channel_token_embedding = side_channel_token_embedding
+
+        # H16: real dtype switching. master_dtype/train_dtype/fp8_active
+        # are computed below from spec.optim.mixed_precision +
+        # spec.sharding.fp8_enabled. We must do the actual mx cast here
+        # (after model is built but before any forward) and record the
+        # post-cast dtype on extras.dtype_actual so the e2e gate can
+        # prove the toggle wasn't pure echo.
+        # NOTE: the master_dtype / fp8_active / train_dtype variables
+        # are computed in the block immediately below; we plumb the
+        # cast into _apply_dtype_real() right after that.
         opt, optimizer_kind = _build_optimizer(spec_optim, lr)
         # G10: optional optimizer state warm-start across sequential
         # Train runs. opts.continue_from_run_id refers to a prior
@@ -972,6 +982,42 @@ def stage_train(ctx: StageContext) -> StageResult:
                         int(per_rank_activation_bytes),
                     "total_param_bytes": int(total_param_bytes),
                 }
+
+        # H16: real dtype switching. Cast params to master_dtype and
+        # record post-cast actual dtype on extras.dtype_actual.
+        dtype_actual: dict[str, Any] = {
+            "master_dtype_requested": master_dtype,
+            "train_dtype_requested": train_dtype,
+            "fp8_attempted": fp8_active,
+            "fp8_fallback_reason": None,
+        }
+        try:
+            if master_dtype == "fp32":
+                all_modules.set_dtype(mx.float32)
+            elif master_dtype == "bf16":
+                all_modules.set_dtype(mx.bfloat16)
+            elif master_dtype == "fp16":
+                all_modules.set_dtype(mx.float16)
+            # Probe one parameter's post-cast dtype.
+            for _v in nn.utils.tree_flatten(
+                    all_modules.parameters()):
+                if hasattr(_v[1], "dtype"):
+                    dtype_actual["master_dtype_actual"] = str(_v[1].dtype)
+                    break
+        except Exception as exc:
+            dtype_actual["master_cast_error"] = (
+                f"{type(exc).__name__}: {exc}")
+        if fp8_active:
+            # mlx has no fp8 in this build — record the honest fallback
+            # reason so the UI can show why train_dtype came back bf16.
+            try:
+                _ = getattr(mx, "float8", None)
+                if _ is None:
+                    raise AttributeError("mx.float8 not in this build")
+            except (AttributeError, NotImplementedError) as fp8_exc:
+                dtype_actual["fp8_fallback_reason"] = str(fp8_exc)
+                train_dtype = "bf16"
+        dtype_actual["train_dtype_actual"] = train_dtype
 
         # G06: memory peak instrumentation — bracket train loop with
         # reset_peak_memory + get_peak_memory; extras.memory_peak_bytes.
@@ -1228,6 +1274,7 @@ def stage_train(ctx: StageContext) -> StageResult:
                 "train_dtype": train_dtype,
                 "master_dtype": master_dtype,
                 "fp8_active": fp8_active,
+                "dtype_actual": dtype_actual,
                 "moe": moe_extras,
                 "opt_state_carried": opt_state_carried,
                 "run_id": run_id,
