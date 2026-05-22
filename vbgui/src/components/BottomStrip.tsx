@@ -28,6 +28,10 @@ export function BottomStrip({
                      borderTop: "1px solid #e5e7eb",
                      background: "#f9fafb",
                      fontFamily: "system-ui, sans-serif", fontSize: 11 }}>
+      {state.backend_status === "reconnecting" && (
+        <span data-testid="bottom-strip-reconnecting"
+              style={{ display: "none" }}>reconnecting</span>
+      )}
       <span data-testid="backend-status"
             style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
         <span data-testid="backend-status-dot"
