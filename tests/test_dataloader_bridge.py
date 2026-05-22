@@ -96,19 +96,33 @@ def test_bridge_preserves_optional_training_metadata_without_model_kwargs() -> N
     assert round_trip.model_kwargs() == {}
 
 
+def test_bridge_preserves_document_ids_as_first_class_batch_field() -> None:
+    source = LMTokenBatch(
+        tokens=mx.array(np.arange(8, dtype=np.int32).reshape(2, 4)),
+        document_ids=mx.array(
+            np.array([[0, 0, 1, 1], [2, 2, 3, 3]], dtype=np.int32)
+        ),
+    )
+
+    sample = LocalTokenBatchDataset([source])[0]
+    [round_trip] = list(iter_mlx_batches([sample]))
+
+    assert set(sample) == {"tokens", "document_ids"}
+    assert sample["document_ids"].dtype == np.int32
+    assert round_trip.document_ids is not None
+    np.testing.assert_array_equal(
+        np.array(round_trip.document_ids),
+        np.array(source.document_ids),
+    )
+    np.testing.assert_array_equal(
+        np.array(round_trip.input_document_ids),
+        np.array([[0, 0, 1], [2, 2, 3]], dtype=np.int32),
+    )
+
+
 def test_bridge_fails_closed_on_bad_batch_schema() -> None:
     with pytest.raises(ValueError, match="must include 'tokens'"):
         LocalTokenBatchDataset([{"attention_mask": np.ones((2, 4), dtype=np.float32)}])
-
-    with pytest.raises(ValueError, match="unsupported DataLoader bridge batch keys"):
-        LocalTokenBatchDataset(
-            [
-                {
-                    "tokens": np.arange(8, dtype=np.int32).reshape(2, 4),
-                    "document_ids": np.zeros((2, 4), dtype=np.int32),
-                }
-            ]
-        )
 
     with pytest.raises(ValueError, match="structure_ids must match tokens shape"):
         LocalTokenBatchDataset(

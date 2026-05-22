@@ -82,6 +82,7 @@ _SIDE_CHANNEL_KEYS = (
     "sibling_index_ids",
     "node_type_ids",
 )
+_DOCUMENT_ID_KEYS = ("document_ids", "doc_ids", "packing_document_ids")
 _AMBIGUOUS_SIDECAR_KEYS = (
     "side_channels",
 )
@@ -192,6 +193,11 @@ class TokenNpzDataset:
                 for key in _SIDE_CHANNEL_KEYS
                 if key in data
             }
+            document_ids = _document_id_windows_from_npz(
+                data,
+                token_windows=token_windows,
+                seq_len=seq_len,
+            )
             loaded_metadata = TokenDatasetMetadata.from_npz(data)
 
         if not len(token_windows):
@@ -208,6 +214,11 @@ class TokenNpzDataset:
             key: _to_side_channel_values(key, value)
             for key, value in side_channels.items()
         }
+        self._document_ids = (
+            _to_document_id_values(document_ids)
+            if document_ids is not None
+            else None
+        )
         self.metadata = metadata if metadata is not None else loaded_metadata
 
     def __len__(self) -> int:
@@ -304,7 +315,13 @@ class TokenNpzDataset:
             key: mx.array(value[sample_idx])
             for key, value in self._side_channels.items()
         }
-        return LMTokenBatch(tokens=mx.array(self._tokens[sample_idx]), **kwargs)
+        return LMTokenBatch(
+            tokens=mx.array(self._tokens[sample_idx]),
+            document_ids=None
+            if self._document_ids is None
+            else mx.array(self._document_ids[sample_idx]),
+            **kwargs,
+        )
 
 
 def open_token_dataset(
@@ -390,6 +407,30 @@ def _fixed_windows(values: np.ndarray, seq_len: int) -> np.ndarray:
     raise ValueError(f"token arrays must be 1D or 2D, got shape {values.shape}")
 
 
+def _document_id_windows_from_npz(
+    data: NpzFile,
+    *,
+    token_windows: np.ndarray,
+    seq_len: int,
+) -> np.ndarray | None:
+    present = [key for key in _DOCUMENT_ID_KEYS if key in data]
+    if len(present) > 1:
+        raise ValueError(
+            "only one document-id array may be provided in NPZ; got "
+            f"{', '.join(present)}"
+        )
+    if not present:
+        return None
+    key = present[0]
+    windows = _fixed_windows(np.asarray(data[key]), seq_len)
+    if windows.shape != token_windows.shape:
+        raise ValueError(
+            f"{key} windows must match tokens shape {token_windows.shape}, "
+            f"got {windows.shape}"
+        )
+    return windows
+
+
 def _npz_scalar_int(
     data: NpzFile, key: str, default: int
 ) -> int:
@@ -433,6 +474,15 @@ def _to_side_channel_values(key: str, values: np.ndarray) -> np.ndarray:
     if np.any(values > np.iinfo(np.int32).max):
         raise ValueError(f"{key} side-channel IDs exceed int32 range")
     return values.astype(_side_channel_dtype(key), copy=False)
+
+
+def _to_document_id_values(values: np.ndarray) -> np.ndarray:
+    _require_integer_array("document_ids", values)
+    if np.any(values < 0):
+        raise ValueError("document_ids must be non-negative")
+    if np.any(values > np.iinfo(np.int32).max):
+        raise ValueError("document_ids exceed int32 range")
+    return values.astype(np.int32, copy=False)
 
 
 def _require_integer_array(label: str, values: np.ndarray) -> None:

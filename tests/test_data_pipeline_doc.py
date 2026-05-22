@@ -20,11 +20,12 @@ def test_data_pipeline_doc_states_ingress_packing_and_guardrails() -> None:
         "appends one EOS token",
         "fixed-length packed rows",
         "document-boundary mask",
-        "Mapping-batch training can carry explicit packed document IDs",
-        "loaders still need an owned schema pass",
+        "Mapping-batch and LMTokenBatch training can carry explicit packed document IDs",
+        "NPZ and Parquet loaders preserve persisted token-aligned document IDs",
         "PyTorch DataLoader integration is explicit and optional",
         "M0.1 tokenizer parity is already closed",
-        "packed document-id schema ownership",
+        "Megatron indexed sidecar document-id preservation still needs a separate schema pass",
+        "packed Megatron document-id schema ownership",
         "100M-token stress gate",
     ]
     for phrase in required_phrases:

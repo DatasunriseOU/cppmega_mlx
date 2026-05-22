@@ -69,6 +69,30 @@ def test_npz_2d_tokens_and_structure_channels_are_sliced_together(tmp_path) -> N
     assert dataset.metadata.tokenizer_contract == "local_profile"
 
 
+def test_npz_document_ids_are_sliced_and_threaded_to_lm_batch(tmp_path) -> None:
+    path = tmp_path / "packed_docs.npz"
+    tokens = np.arange(12, dtype=np.int32).reshape(1, 12)
+    doc_ids = np.array([[0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3]], dtype=np.int64)
+    _write_npz(path, tokens=tokens, doc_ids=doc_ids)
+
+    dataset = TokenNpzDataset(path, seq_len=4, batch_size=2)
+    batch = next(dataset.iter_batches())
+
+    assert batch.document_ids is not None
+    np.testing.assert_array_equal(
+        np.array(batch.document_ids),
+        np.array([[0, 0, 0, 1], [1, 1, 2, 2]], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(
+        np.array(batch.input_document_ids),
+        np.array([[0, 0, 0], [1, 1, 2]], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(
+        np.array(batch.target_document_ids),
+        np.array([[0, 0, 1], [1, 2, 2]], dtype=np.int32),
+    )
+
+
 def test_shuffle_is_deterministic_and_resume_skips_consumed_batches(tmp_path) -> None:
     path = tmp_path / "shuffle.npz"
     _write_npz(path, tokens=np.arange(60, dtype=np.int32))
@@ -218,6 +242,15 @@ def test_rejects_bad_shapes_and_incomplete_sample_sets(tmp_path) -> None:
     with pytest.raises(ValueError, match="structure_ids"):
         TokenNpzDataset(bad_side_channel, seq_len=4, batch_size=1)
 
+    bad_doc_ids = tmp_path / "bad_doc_ids.npz"
+    _write_npz(
+        bad_doc_ids,
+        tokens=np.arange(12, dtype=np.int32),
+        doc_ids=np.arange(8, dtype=np.int32),
+    )
+    with pytest.raises(ValueError, match="doc_ids windows must match tokens shape"):
+        TokenNpzDataset(bad_doc_ids, seq_len=4, batch_size=1)
+
 
 def test_npz_rejects_token_ids_outside_int32_range(tmp_path) -> None:
     too_large = tmp_path / "too_large_tokens.npz"
@@ -284,6 +317,39 @@ def test_npz_rejects_non_integer_structure_side_channels(tmp_path) -> None:
         match="structure_ids side-channel IDs must use an integer dtype",
     ):
         TokenNpzDataset(path, seq_len=4, batch_size=1)
+
+
+def test_npz_rejects_bad_document_id_aliases_and_values(tmp_path) -> None:
+    duplicate = tmp_path / "duplicate_doc_ids.npz"
+    _write_npz(
+        duplicate,
+        tokens=np.arange(4, dtype=np.int32),
+        doc_ids=np.zeros(4, dtype=np.int32),
+        document_ids=np.zeros(4, dtype=np.int32),
+    )
+    with pytest.raises(ValueError, match="only one document-id array"):
+        TokenNpzDataset(duplicate, seq_len=4, batch_size=1)
+
+    negative = tmp_path / "negative_doc_ids.npz"
+    _write_npz(
+        negative,
+        tokens=np.arange(4, dtype=np.int32),
+        packing_document_ids=np.array([0, 0, -1, 1], dtype=np.int32),
+    )
+    with pytest.raises(ValueError, match="document_ids must be non-negative"):
+        TokenNpzDataset(negative, seq_len=4, batch_size=1)
+
+    too_large = tmp_path / "large_doc_ids.npz"
+    _write_npz(
+        too_large,
+        tokens=np.arange(4, dtype=np.int32),
+        document_ids=np.array(
+            [0, np.iinfo(np.int32).max + 1, 1, 1],
+            dtype=np.int64,
+        ),
+    )
+    with pytest.raises(ValueError, match="document_ids exceed int32 range"):
+        TokenNpzDataset(too_large, seq_len=4, batch_size=1)
 
 
 def test_npz_ambiguous_side_channels_fail_closed(tmp_path) -> None:

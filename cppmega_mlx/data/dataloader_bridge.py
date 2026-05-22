@@ -19,6 +19,7 @@ from cppmega_mlx.data.batch import LMTokenBatch
 _BATCH_KEYS = (
     "tokens",
     "attention_mask",
+    "document_ids",
     "structure_ids",
     "dep_levels",
     "ast_depth_ids",
@@ -31,8 +32,9 @@ _TENSOR_BATCH_KEYS = tuple(key for key in _BATCH_KEYS if key != "metadata")
 _STRUCTURE_KEYS = tuple(
     key
     for key in _TENSOR_BATCH_KEYS
-    if key not in {"tokens", "attention_mask", "platform_ids"}
+    if key not in {"tokens", "attention_mask", "document_ids", "platform_ids"}
 )
+_TOKEN_ALIGNED_INT_KEYS = ("document_ids", *_STRUCTURE_KEYS)
 
 
 class TorchDataLoaderBridgeError(RuntimeError):
@@ -282,7 +284,7 @@ def _as_numpy_array(key: str, value: Any) -> np.ndarray:
         return array.astype(np.int32, copy=False)
     if key == "platform_ids":
         return array.astype(np.int32, copy=False)
-    if key in _STRUCTURE_KEYS:
+    if key in _TOKEN_ALIGNED_INT_KEYS:
         return array.astype(np.int32, copy=False)
     raise ValueError(f"unsupported DataLoader bridge batch key: {key}")
 

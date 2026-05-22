@@ -75,12 +75,9 @@ IDs and uses mlx_document_boundary_mask(..., causal=True, expand_heads=True)
 for attention routes. The next-token and MTP loss helpers accept exactly one of
 document_ids, doc_ids, or packing_document_ids in mapping batches, validate
 that it matches tokens, reject negative explicit IDs, slice it to model inputs,
-and fail closed on alias conflicts.
-
-Historical caveat: sequence packing is no longer simply "not wired into the
-training loop" or "not consumed by the current attention implementation" for
-mapping batches, but LMTokenBatch dataset ingress still lacks a first-class
-document-id field.
+and fail closed on alias conflicts. LMTokenBatch exposes document_ids as a
+first-class field, and NPZ plus Parquet ingress preserve token-aligned
+document IDs when the shard provides exactly one supported alias.
 
 ## Optional PyTorch DataLoader Bridge
 
@@ -95,17 +92,16 @@ The bridge is fail-closed by design:
   rejects any explicit non-spawn context.
 - persistent_workers and prefetch_factor are accepted only when workers are
   enabled.
-- Batch schemas are limited to tokens, attention_mask, and the existing
-  token-aligned structure side-channel keys. Unknown keys are rejected instead
-  of being silently dropped.
+- Batch schemas are limited to tokens, attention_mask, document_ids, and the
+  existing token-aligned structure/platform side-channel keys. Unknown keys are
+  rejected instead of being silently dropped.
 - If torch is not installed, bridge construction raises a clear optional
   dependency error; native MLX dataset iterators remain the default path.
 
 This bridge covers the narrow Stream D PyTorch DataLoader seam only. M0.1
 tokenizer parity is already closed by the vendored GB10 tokenizer contract and
-explicit <SPACE>/<NL> sentinel decode receipt; the bridge does not make
-packed document IDs first-class in LMTokenBatch, and does not satisfy the
-100M-token stress gate.
+explicit <SPACE>/<NL> sentinel decode receipt; the bridge preserves
+LMTokenBatch document_ids but does not satisfy the 100M-token stress gate.
 
 ## Current Guardrails
 
@@ -113,9 +109,11 @@ packed document IDs first-class in LMTokenBatch, and does not satisfy the
 - The current training ingress still consumes dense LMTokenBatch rows.
 - PyTorch DataLoader integration is explicit and optional; the MLX training hot
   path does not import torch unless the bridge is requested.
-- Mapping-batch training can carry explicit packed document IDs through
-  next-token and MTP loss paths into model attention.
-- LMTokenBatch itself still has no persisted document-id field, and data
-  loaders still need an owned schema pass before packed IDs are first-class.
+- Mapping-batch and LMTokenBatch training can carry explicit packed document
+  IDs through next-token and MTP loss paths into model attention.
+- NPZ and Parquet loaders preserve persisted token-aligned document IDs;
+  Megatron indexed sidecar document-id preservation still needs a separate
+  schema pass.
 - Full Stream D is still not closeable: multi-shard/scale validation, packed
-  document-id schema ownership, and the 100M-token stress gate remain open.
+  Megatron document-id schema ownership, and the 100M-token stress gate remain
+  open.
