@@ -84,6 +84,16 @@ export interface SideChannelState {
   inference: InferenceEnrichmentState;
 }
 
+export type PackingPolicy = "sequential" | "best_fit";
+
+export interface DataMaterializationState {
+  packing_policy: PackingPolicy;
+  max_seq_len: number;
+  pad_to_max: boolean;
+  include_provenance: boolean;
+  required_token_fields: string[];
+}
+
 export type TopologyFactory =
   | "h100_8x" | "h200_8x" | "a100_8x" | "b100_8x"
   | "gb10_quarter" | "tpu_v6e_8" | "tpu_v5p_4" | "m3_ultra_solo";
@@ -115,6 +125,7 @@ export interface SpecState {
   optim: OptimState;
   rewriters: RewriterState[];
   side_channels: SideChannelState;
+  data_materialization: DataMaterializationState;
   sharding: ShardingState;
   gotchas: GotchaState[];
   worst_rank_bytes: number;
@@ -216,6 +227,21 @@ export const INITIAL_SPEC: SpecState = {
       timeout_ms: 500,
       cache_enabled: true,
     },
+  },
+  data_materialization: {
+    packing_policy: "best_fit",
+    max_seq_len: 4096,
+    pad_to_max: true,
+    include_provenance: true,
+    required_token_fields: [
+      "input_ids",
+      "target_ids",
+      "loss_mask",
+      "doc_ids",
+      "pack_id",
+      "valid_token_count",
+      "num_docs",
+    ],
   },
   sharding: {
     topology: "h100_8x",

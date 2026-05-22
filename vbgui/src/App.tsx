@@ -763,6 +763,7 @@ function buildVerifyParams(
     },
     training: true,
     side_channels: spec.side_channels,
+    data_materialization: spec.data_materialization,
     available_side_channels: availableSideChannels,
   };
 }

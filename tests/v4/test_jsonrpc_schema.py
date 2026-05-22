@@ -148,12 +148,23 @@ def test_verify_params_round_trip():
     assert parsed.graph.nodes[0].id == "a"
     assert parsed.training is True
     assert parsed.side_channels.mode == "auto"
+    assert parsed.data_materialization.packing_policy == "best_fit"
+    assert parsed.data_materialization.max_seq_len == 4096
     assert parsed.side_channels.families["platform"].columns == [
         "platform_ids", "source_platform_ids",
     ]
     serial = parsed.model_dump(mode="json")
     assert "graph" in serial
     assert serial["side_channels"]["families"]["structure"]["mode"] == "if_available"
+    assert serial["data_materialization"]["required_token_fields"] == [
+        "input_ids",
+        "target_ids",
+        "loss_mask",
+        "doc_ids",
+        "pack_id",
+        "valid_token_count",
+        "num_docs",
+    ]
 
 
 def test_verify_params_rejects_unknown_field():

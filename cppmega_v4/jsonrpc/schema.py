@@ -15,7 +15,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 
-SCHEMA_VERSION: str = "1.1.0"
+SCHEMA_VERSION: str = "1.1.1"
 
 JsonRpcVersion = Literal["2.0"]
 
@@ -368,6 +368,9 @@ class VerifyParams(BaseModel):
     training: bool = True
     side_channels: SideChannelSpecPayload = Field(
         default_factory=SideChannelSpecPayload
+    )
+    data_materialization: DataMaterializationSpecPayload = Field(
+        default_factory=DataMaterializationSpecPayload
     )
     available_side_channels: list[str] = Field(default_factory=lambda: ["doc_ids", "token_ids"])
 

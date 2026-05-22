@@ -1,5 +1,5 @@
 // Wire-format types matching cppmega_v4.jsonrpc.schema (Pydantic side).
-// Keep in sync with SCHEMA_VERSION 1.1.0. When the backend bumps the
+// Keep in sync with SCHEMA_VERSION 1.1.1. When the backend bumps the
 // version, regen this file (codegen lands in F-D).
 
 export type JsonRpcVersion = "2.0";
@@ -24,7 +24,7 @@ export interface JsonRpcResponse<R = unknown> {
   error?: JsonRpcError;
 }
 
-export const SCHEMA_VERSION = "1.1.0";
+export const SCHEMA_VERSION = "1.1.1";
 
 // ---------------------------------------------------------------------------
 // Domain payloads
@@ -79,6 +79,16 @@ export interface SideChannelSpecPayload {
   mode: SideChannelMode;
   families: Record<string, FamilySpecPayload>;
   inference: InferenceEnrichmentSpecPayload;
+}
+
+export type PackingPolicy = "sequential" | "best_fit";
+
+export interface DataMaterializationSpecPayload {
+  packing_policy: PackingPolicy;
+  max_seq_len: number;
+  pad_to_max: boolean;
+  include_provenance: boolean;
+  required_token_fields: string[];
 }
 
 export interface EdgeResolution {

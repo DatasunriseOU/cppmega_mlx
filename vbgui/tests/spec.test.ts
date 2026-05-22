@@ -106,6 +106,24 @@ describe("side-channel defaults", () => {
     ]);
     expect(INITIAL_SPEC.side_channels.inference.fail_policy).toBe("drop_family");
   });
+
+  it("INITIAL_SPEC exposes packed-row materialization defaults", () => {
+    expect(INITIAL_SPEC.data_materialization).toEqual({
+      packing_policy: "best_fit",
+      max_seq_len: 4096,
+      pad_to_max: true,
+      include_provenance: true,
+      required_token_fields: [
+        "input_ids",
+        "target_ids",
+        "loss_mask",
+        "doc_ids",
+        "pack_id",
+        "valid_token_count",
+        "num_docs",
+      ],
+    });
+  });
 });
 
 describe("memory helpers", () => {

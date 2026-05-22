@@ -12,7 +12,7 @@
 // by a newer build) throw — the caller is expected to surface this as
 // a UI error rather than silently corrupting the spec.
 
-export const CURRENT_SCHEMA_VERSION = 1;
+export const CURRENT_SCHEMA_VERSION = 2;
 
 export type SchemaVersion = number;
 
@@ -37,9 +37,46 @@ function migrate_v0_to_v1(spec: VersionedSpec): VersionedSpec {
   return { ...spec, schema_version: 1 };
 }
 
+function defaultDataMaterialization(): Record<string, unknown> {
+  return {
+    packing_policy: "best_fit",
+    max_seq_len: 4096,
+    pad_to_max: true,
+    include_provenance: true,
+    required_token_fields: [
+      "input_ids",
+      "target_ids",
+      "loss_mask",
+      "doc_ids",
+      "pack_id",
+      "valid_token_count",
+      "num_docs",
+    ],
+  };
+}
+
+/** v1 → v2: add packed-row materialization defaults to saved GUI specs. */
+function migrate_v1_to_v2(spec: VersionedSpec): VersionedSpec {
+  const nested = spec.spec;
+  if (nested && typeof nested === "object" && !Array.isArray(nested)) {
+    const specPayload = nested as Record<string, unknown>;
+    return {
+      ...spec,
+      schema_version: 2,
+      spec: {
+        ...specPayload,
+        data_materialization:
+          specPayload.data_materialization ?? defaultDataMaterialization(),
+      },
+    };
+  }
+  return { ...spec, schema_version: 2 };
+}
+
 const MIGRATIONS: Record<number,
   (s: VersionedSpec) => VersionedSpec> = {
   0: migrate_v0_to_v1,
+  1: migrate_v1_to_v2,
 };
 
 export function migrate(spec: VersionedSpec): VersionedSpec {

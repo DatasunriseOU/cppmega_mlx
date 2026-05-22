@@ -110,10 +110,21 @@ describe("App integration — run pipeline", () => {
     const pipelineCall = calls.find((c) => c.method === "pipeline.run")!;
     const pipelineParams = pipelineCall.params as {
       pipeline: { stages: string[] };
+      spec: {
+        data_materialization: {
+          packing_policy: string;
+          max_seq_len: number;
+          required_token_fields: string[];
+        };
+      };
     };
     expect(pipelineParams.pipeline.stages).toContain("parse");
     expect(pipelineParams.pipeline.stages).toContain("dry_forward");
     expect(pipelineParams.pipeline.stages).not.toContain("train");
+    expect(pipelineParams.spec.data_materialization.packing_policy).toBe("best_fit");
+    expect(pipelineParams.spec.data_materialization.max_seq_len).toBe(4096);
+    expect(pipelineParams.spec.data_materialization.required_token_fields)
+      .toContain("loss_mask");
 
     await waitFor(() => {
       expect(screen.getByTestId("run-result-modal")).toBeTruthy();
