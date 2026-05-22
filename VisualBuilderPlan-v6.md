@@ -1,6 +1,37 @@
 # VisualBuilderPlan-v6 — UI Wiring + Real Math-Effect for V5 Placeholders
 
-**Status**: planned 2026-05-22 (epic id TBD)
+**Status**: planned 2026-05-22 (epic `cppmega-mlx-te6`)
+
+## bd ticket ID mapping (post-creation)
+
+| H#  | bd id           | Title                                            |
+|-----|-----------------|--------------------------------------------------|
+| H01 | cppmega-mlx-fjb | Sharding UI → train                              |
+| H02 | cppmega-mlx-8p1 | fp8/mixed_precision toggles                      |
+| H03 | cppmega-mlx-ou1 | Cancel button + WS abort                         |
+| H04 | cppmega-mlx-c4f | train-warm-start checkbox                        |
+| H05 | cppmega-mlx-fr5 | checkpoint path inputs                           |
+| H06 | cppmega-mlx-ays | UI N=100 real-corpus walk                        |
+| H07 | cppmega-mlx-75m | DimensionsTab Apply dispatch                     |
+| H08 | cppmega-mlx-cem | train-probe-text textarea                        |
+| H09 | cppmega-mlx-sq3 | Save/Load roundtrip parity                       |
+| H10 | cppmega-mlx-v5i | SideChannelsTab proper                           |
+| H11 | cppmega-mlx-i04 | memory peak parity                               |
+| H12 | cppmega-mlx-vlh | WS reconnect recovery e2e                        |
+| H13 | cppmega-mlx-65v | other-stages extras UI walk                      |
+| H14 | cppmega-mlx-ep7 | AblationsTab full extras                         |
+| H15 | cppmega-mlx-8rb | real per-rank shard simulation                   |
+| H16 | cppmega-mlx-oku | real mlx dtype switching                         |
+| H17 | cppmega-mlx-gqu | real cross-doc attention mask                    |
+| H18 | cppmega-mlx-6ls | MoE forward hook (entropy + load balance)        |
+| H19 | cppmega-mlx-56o | strict identical-loss-continuation               |
+| H20 | cppmega-mlx-4o9 | fake-rank distributed smoke                      |
+| H21 | cppmega-mlx-bqy | inference-after-resume bounded drift             |
+| H22 | cppmega-mlx-1ne | concurrent Train clicks                          |
+| H23 | cppmega-mlx-age | fp16 dtype option                                |
+| H24 | cppmega-mlx-sby | 100+ step UI walk w/ checkpoint                  |
+| H25 | cppmega-mlx-8px | honest categorisation audit                      |
+
 **Driver**: V5 closure audit found that out of 25 closed tickets, only
 ~11 are real math-effect. The remaining 14 split between:
 - **"backend ready + UI not wired"** — 10 gaps where pytest passes but
