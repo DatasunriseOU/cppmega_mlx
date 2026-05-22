@@ -76,8 +76,8 @@ for attention routes. The next-token and MTP loss helpers accept exactly one of
 document_ids, doc_ids, or packing_document_ids in mapping batches, validate
 that it matches tokens, reject negative explicit IDs, slice it to model inputs,
 and fail closed on alias conflicts. LMTokenBatch exposes document_ids as a
-first-class field, and NPZ plus Parquet ingress preserve token-aligned
-document IDs when the shard provides exactly one supported alias.
+first-class field, and NPZ, Parquet, and Megatron indexed ingress preserve
+token-aligned document IDs when the shard provides exactly one supported alias.
 
 ## Optional PyTorch DataLoader Bridge
 
@@ -111,9 +111,8 @@ LMTokenBatch document_ids but does not satisfy the 100M-token stress gate.
   path does not import torch unless the bridge is requested.
 - Mapping-batch and LMTokenBatch training can carry explicit packed document
   IDs through next-token and MTP loss paths into model attention.
-- NPZ and Parquet loaders preserve persisted token-aligned document IDs;
-  Megatron indexed sidecar document-id preservation still needs a separate
-  schema pass.
+- NPZ, Parquet, and Megatron indexed loaders preserve persisted token-aligned
+  document IDs.
 - Full Stream D is still not closeable: multi-shard/scale validation, packed
-  Megatron document-id schema ownership, and the 100M-token stress gate remain
-  open.
+  multi-shard side-channel schema ownership, and the 100M-token stress gate
+  remain open.

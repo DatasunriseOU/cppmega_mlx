@@ -661,6 +661,56 @@ def test_mmididx_side_channel_paths_are_sliced_with_token_windows(tmp_path) -> N
     np.testing.assert_array_equal(np.array(batch.target_mask), np.ones((2, 3), dtype=np.float32))
 
 
+@pytest.mark.parametrize(
+    "sidecar",
+    [
+        {
+            "doc_ids": {
+                "path": "doc_ids.bin",
+                "dtype": "int16",
+            },
+        },
+        {
+            "side_channel_paths": {
+                "packing_document_ids": {
+                    "path": "doc_ids.bin",
+                    "dtype": "int16",
+                },
+            },
+        },
+    ],
+)
+def test_mmididx_document_ids_are_sliced_to_lm_batch(tmp_path, sidecar) -> None:
+    prefix = tmp_path / "document_id_sidecar"
+    docs = [
+        np.arange(8, dtype=np.int32),
+        np.arange(100, 108, dtype=np.int32),
+    ]
+    _write_mmididx(prefix, docs, dtype=np.int32)
+    doc_ids = np.array(
+        [0, 0, 0, 0, 1, 1, 1, 1, 7, 7, 7, 7, 8, 8, 8, 8],
+        dtype=np.int16,
+    )
+    doc_ids.tofile(tmp_path / "doc_ids.bin")
+    prefix.with_suffix(".idx.json").write_text(
+        json.dumps(sidecar),
+        encoding="utf-8",
+    )
+
+    batch = next(MegatronIndexedDataset(prefix, seq_len=4, batch_size=2).iter_batches())
+
+    assert batch.document_ids is not None
+    np.testing.assert_array_equal(
+        np.array(batch.document_ids),
+        np.array([[0, 0, 0, 0], [1, 1, 1, 1]], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(
+        np.array(batch.input_document_ids),
+        np.array([[0, 0, 0], [1, 1, 1]], dtype=np.int32),
+    )
+    assert "document_ids" not in batch.model_kwargs()
+
+
 def test_mmididx_top_level_side_channel_entry_is_supported(tmp_path) -> None:
     prefix = tmp_path / "top_level_structure"
     docs = [np.arange(12, dtype=np.int32)]
@@ -899,6 +949,38 @@ def test_mmididx_side_channel_length_mismatch_fails_closed(tmp_path) -> None:
         MegatronIndexedDataset(prefix, seq_len=4, batch_size=1)
 
 
+def test_mmididx_document_ids_length_mismatch_fails_closed(tmp_path) -> None:
+    prefix = tmp_path / "short_document_ids"
+    _write_mmididx(prefix, [np.arange(12, dtype=np.int32)], dtype=np.int32)
+    np.arange(8, dtype=np.int32).tofile(tmp_path / "doc_ids.bin")
+    prefix.with_suffix(".idx.json").write_text(
+        json.dumps({"doc_ids": "doc_ids.bin"}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="document_ids token count .* token shard count"):
+        MegatronIndexedDataset(prefix, seq_len=4, batch_size=1)
+
+
+def test_mmididx_duplicate_document_id_sidecars_fail_closed(tmp_path) -> None:
+    prefix = tmp_path / "duplicate_document_ids"
+    _write_mmididx(prefix, [np.arange(8, dtype=np.int32)], dtype=np.int32)
+    np.arange(8, dtype=np.int32).tofile(tmp_path / "doc_ids.bin")
+    np.arange(8, dtype=np.int32).tofile(tmp_path / "document_ids.bin")
+    prefix.with_suffix(".idx.json").write_text(
+        json.dumps(
+            {
+                "side_channel_paths": {"doc_ids": "doc_ids.bin"},
+                "document_ids": "document_ids.bin",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="document_ids sidecar declared more than once"):
+        MegatronIndexedDataset(prefix, seq_len=4, batch_size=1)
+
+
 def test_mmididx_rejects_side_channel_values_outside_int32_range(tmp_path) -> None:
     prefix = tmp_path / "oversized_side_channel"
     _write_mmididx(prefix, [np.arange(4, dtype=np.int32)], dtype=np.int32)
@@ -923,6 +1005,22 @@ def test_mmididx_rejects_side_channel_values_outside_int32_range(tmp_path) -> No
     dataset = MegatronIndexedDataset(prefix, seq_len=4, batch_size=1)
 
     with pytest.raises(ValueError, match="structure_ids side-channel IDs exceed int32 range"):
+        next(dataset.iter_batches())
+
+
+def test_mmididx_negative_document_ids_are_rejected(tmp_path) -> None:
+    prefix = tmp_path / "negative_document_ids"
+    _write_mmididx(prefix, [np.arange(8, dtype=np.int32)], dtype=np.int32)
+    np.array([0, 0, -1, 1, 1, 1, 2, 2], dtype=np.int32).tofile(
+        tmp_path / "doc_ids.bin"
+    )
+    prefix.with_suffix(".idx.json").write_text(
+        json.dumps({"packing_document_ids": "doc_ids.bin"}),
+        encoding="utf-8",
+    )
+
+    dataset = MegatronIndexedDataset(prefix, seq_len=4, batch_size=1)
+    with pytest.raises(ValueError, match="document_ids must be non-negative"):
         next(dataset.iter_batches())
 
 

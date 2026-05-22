@@ -38,6 +38,7 @@ _SIDE_CHANNEL_KEY_ALIASES: dict[str, tuple[str, ...]] = {
     "sibling_index_ids": ("token_sibling_index",),
     "node_type_ids": ("token_ast_node_type",),
 }
+_DOCUMENT_ID_KEYS = ("document_ids", "doc_ids", "packing_document_ids")
 _SIDE_CHANNEL_ALIAS_TO_KEY = {
     alias: key
     for key, aliases in _SIDE_CHANNEL_KEY_ALIASES.items()
@@ -191,6 +192,14 @@ class MegatronIndexedDataset:
             token_count=int(sequence_lengths.sum()),
             token_windows=windows,
         )
+        self._document_ids = _load_document_ids(
+            sidecar,
+            prefix=resolved.prefix,
+            metadata_path=resolved.metadata_path,
+            token_dtype=token_dtype,
+            token_count=int(sequence_lengths.sum()),
+            token_windows=windows,
+        )
         self.index_metadata = MegatronIndexedMetadata(
             bin_path=self.bin_path,
             idx_path=self.idx_path if self.idx_path and self.idx_path.exists() else None,
@@ -308,6 +317,11 @@ class MegatronIndexedDataset:
             )
             for key in self._side_channels
         }
+        document_ids = (
+            np.empty((sample_idx.shape[0], self.seq_len), dtype=np.int32)
+            if self._document_ids is not None
+            else None
+        )
         for row, window_index in enumerate(sample_idx):
             byte_offset = int(self._windows[int(window_index)])
             token_view = np.frombuffer(
@@ -325,9 +339,21 @@ class MegatronIndexedDataset:
                     offset=int(storage.windows[int(window_index)]),
                 )
                 side_channels[key][row] = _to_side_channel_values(key, side_view)
+            if self._document_ids is not None and document_ids is not None:
+                doc_view = np.frombuffer(
+                    self._document_ids.mmap,
+                    dtype=self._document_ids.dtype,
+                    count=self.seq_len,
+                    offset=int(self._document_ids.windows[int(window_index)]),
+                )
+                document_ids[row] = _to_document_id_values(doc_view)
 
         kwargs = {key: mx.array(value) for key, value in side_channels.items()}
-        return LMTokenBatch(tokens=mx.array(tokens), **kwargs)
+        return LMTokenBatch(
+            tokens=mx.array(tokens),
+            document_ids=None if document_ids is None else mx.array(document_ids),
+            **kwargs,
+        )
 
 
 def open_megatron_indexed_dataset(
@@ -508,6 +534,58 @@ def _load_side_channels(
     return storages
 
 
+def _load_document_ids(
+    sidecar: dict[str, Any],
+    *,
+    prefix: Path,
+    metadata_path: Path | None,
+    token_dtype: np.dtype,
+    token_count: int,
+    token_windows: np.ndarray,
+) -> _SideChannelStorage | None:
+    entry = _document_id_entry(sidecar)
+    if entry is None:
+        return None
+    base_dir = metadata_path.parent if metadata_path is not None else prefix.parent
+    path, dtype = _parse_side_channel_entry("document_ids", entry, base_dir=base_dir)
+    capacity, remainder = divmod(path.stat().st_size, dtype.itemsize)
+    if remainder:
+        raise ValueError(
+            "document_ids file size is not divisible by dtype itemsize "
+            f"{dtype.itemsize}"
+        )
+    if int(capacity) != token_count:
+        raise ValueError(
+            f"document_ids token count {int(capacity)} does not match "
+            f"token shard count {token_count}"
+        )
+    token_item_offset = token_windows // token_dtype.itemsize
+    windows = token_item_offset * dtype.itemsize
+    return _SideChannelStorage(
+        path=path,
+        dtype=dtype,
+        windows=windows.astype(np.int64, copy=False),
+        mmap=np.memmap(path, mode="r", dtype=np.uint8),
+    )
+
+
+def _document_id_entry(sidecar: dict[str, Any]) -> Any | None:
+    entries: list[Any] = []
+    mapping = sidecar.get("side_channel_paths")
+    if mapping is not None:
+        if not isinstance(mapping, dict):
+            raise ValueError("side_channel_paths must be a mapping of key to path metadata")
+        for raw_key, entry in mapping.items():
+            if str(raw_key) in _DOCUMENT_ID_KEYS and _declares_side_channel(entry):
+                entries.append(entry)
+    for key in _DOCUMENT_ID_KEYS:
+        if key in sidecar and _declares_side_channel(sidecar[key]):
+            entries.append(sidecar[key])
+    if len(entries) > 1:
+        raise ValueError("document_ids sidecar declared more than once")
+    return entries[0] if entries else None
+
+
 def _reject_ambiguous_side_channel_metadata(sidecar: dict[str, Any]) -> None:
     ambiguous = [
         key
@@ -541,6 +619,8 @@ def _side_channel_entries(sidecar: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(mapping, dict):
             raise ValueError("side_channel_paths must be a mapping of key to path metadata")
         for raw_key, entry in mapping.items():
+            if str(raw_key) in _DOCUMENT_ID_KEYS:
+                continue
             key = _canonical_side_channel_key(str(raw_key))
             if key is None:
                 raise NotImplementedError(f"unsupported side-channel key {raw_key!r}")
@@ -639,6 +719,16 @@ def _to_side_channel_values(key: str, values: np.ndarray) -> np.ndarray:
         raise ValueError(f"{key} side-channel IDs must be non-negative")
     if np.any(values > np.iinfo(np.int32).max):
         raise ValueError(f"{key} side-channel IDs exceed int32 range")
+    return values.astype(np.int32, copy=False)
+
+
+def _to_document_id_values(values: np.ndarray) -> np.ndarray:
+    if values.dtype.kind not in {"i", "u"}:
+        raise ValueError("document_ids must use an integer dtype")
+    if np.any(values < 0):
+        raise ValueError("document_ids must be non-negative")
+    if np.any(values > np.iinfo(np.int32).max):
+        raise ValueError("document_ids exceed int32 range")
     return values.astype(np.int32, copy=False)
 
 
