@@ -22,6 +22,7 @@ EXPECTED_RUNTIME_EXPORTS = [
     "restore_rng_state",
     "seed_all",
     "selected_path",
+    "torch_compile_backend",
 ]
 
 

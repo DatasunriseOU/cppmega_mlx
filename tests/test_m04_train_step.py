@@ -5195,6 +5195,8 @@ def test_path_c_fusion_payload_accepts_matching_matrix_profile_receipt(
                 "model_profile": m04_train_step.REQUIRED_MODEL_PROFILE,
                 "schedule_id": schedule["schedule_id"],
                 "schedule_name": schedule["schedule_name"],
+                "single_cppmega_commit": True,
+                "cppmega_sha": "abc123",
                 "full_1b_matrix_captured": True,
                 "profiling_traces_captured": True,
                 "memory_non_regression_ok": True,
@@ -5205,11 +5207,12 @@ def test_path_c_fusion_payload_accepts_matching_matrix_profile_receipt(
                 "path_c_warm_cache_hit_observed": True,
                 "matrix_rows": [
                     {
-                        "dtype": "fp8",
-                        "optimizer": "adamw",
-                        "path": "path_c_warm",
+                        "dtype_route": dtype_route,
+                        "optimizer": optimizer,
                         "status": "ok",
                     }
+                    for dtype_route in m04_train_step.MATRIX_DTYPE_ROUTES
+                    for optimizer in m04_train_step.MATRIX_OPTIMIZERS
                 ],
             }
         ),
@@ -5231,6 +5234,324 @@ def test_path_c_fusion_payload_accepts_matching_matrix_profile_receipt(
     }
     assert payload["acceptance_gate"]["current_matrix_profile_verified"] is True
     assert payload["default_allowed"] is False
+
+
+def test_path_c_fusion_payload_rejects_incomplete_matrix_profile_receipt(
+    tmp_path: Path,
+    path_c_fusion_force_env: None,
+) -> None:
+    del path_c_fusion_force_env
+    baseline_payload = m04_train_step.path_c_fusion_payload(
+        compile_receipt_path=PRODUCTION_FUSION_COMPILE_RECEIPT,
+    )
+    schedule = baseline_payload["production_schedule"]
+    matrix_receipt_path = tmp_path / "incomplete_path_c_fusion_matrix_profile.json"
+    matrix_receipt_path.write_text(
+        json.dumps(
+            {
+                "kind": "cppmega_path_c_fusion_matrix_profile_receipt",
+                "status": "ok",
+                "model_profile": m04_train_step.REQUIRED_MODEL_PROFILE,
+                "schedule_id": schedule["schedule_id"],
+                "schedule_name": schedule["schedule_name"],
+                "single_cppmega_commit": True,
+                "cppmega_sha": "abc123",
+                "full_1b_matrix_captured": True,
+                "profiling_traces_captured": True,
+                "memory_non_regression_ok": True,
+                "cache_receipts_captured": True,
+                "path_b_baselines_clean": True,
+                "path_c_default_gate_rows_passed": True,
+                "path_c_peak_memory_non_regression": True,
+                "path_c_warm_cache_hit_observed": True,
+                "row_check_summary": {
+                    "total_rows": 1,
+                    "row_status_ok": 1,
+                    "path_b_baseline_clean": 1,
+                    "path_c_default_gate_passed": 1,
+                    "path_c_peak_memory_non_regression": 1,
+                    "path_c_warm_cache_hit_observed": 1,
+                    "path_c_cold_cache_miss_observed": 1,
+                    "profiling_trace_captured": 1,
+                },
+                "failed_rows_by_check": {},
+                "matrix_rows": [
+                    {
+                        "dtype_route": "fp8_path_c",
+                        "optimizer": "adamw",
+                        "status": "ok",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    payload = m04_train_step.path_c_fusion_payload(
+        compile_receipt_path=PRODUCTION_FUSION_COMPILE_RECEIPT,
+        matrix_profile_receipt_path=matrix_receipt_path,
+    )
+
+    receipt = payload["production_matrix_profile_receipt"]
+    assert receipt["status"] == "mismatch"
+    assert receipt["verified"] is False
+    assert "matrix_rows_cover_required_grid" in receipt["failed_checks"]
+    matrix_blockers = [
+        blocker
+        for blocker in payload["schedule_blockers"]
+        if blocker["kind"] == "production_1b_matrix_profile_missing"
+    ]
+    assert len(matrix_blockers) == 1
+    assert "matrix_rows_cover_required_grid" in matrix_blockers[0]["failed_checks"]
+    assert matrix_blockers[0]["row_check_summary"] == receipt["row_check_summary"]
+    assert matrix_blockers[0]["failed_rows_by_check"] == (
+        receipt["failed_rows_by_check"]
+    )
+    assert payload["acceptance_gate"]["current_matrix_profile_verified"] is False
+
+
+def _complete_matrix_profile_rows(
+    *,
+    cppmega_sha: str = "abc123",
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "dtype_route": dtype_route,
+            "optimizer": optimizer,
+            "status": "ok",
+            "cppmega_sha": cppmega_sha,
+            "path_b_status": "ok",
+            "path_b_tok_sec": 100.0,
+            "path_b_peak_memory_gb": 10.0,
+            "path_c_warm_status": "ok",
+            "path_c_warm_tok_sec": 125.0,
+            "path_c_peak_memory_gb": 9.5,
+            "path_c_warm_cache_hit": True,
+            "path_c_cold_cache_hit": False,
+            "profiling_trace_path": (
+                f"reports/profiling/{dtype_route}_{optimizer}_path_c.json"
+            ),
+        }
+        for dtype_route in m04_train_step.MATRIX_DTYPE_ROUTES
+        for optimizer in m04_train_step.MATRIX_OPTIMIZERS
+    ]
+
+
+def _path_matrix_profile_rows(
+    *,
+    cppmega_sha: str = "abc123",
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for dtype in ("bf16", "fp8"):
+        for optimizer in (
+            *m04_train_step.MATRIX_OPTIMIZERS,
+            "muon_int8",
+        ):
+            for path, cache_hit, tok_sec, peak_memory_gb in (
+                ("path_b", None, 100.0, 10.0),
+                ("path_c_cold", False, 110.0, 9.75),
+                ("path_c_warm", True, 125.0, 9.5),
+            ):
+                rows.append(
+                    {
+                        "dtype": dtype,
+                        "optimizer": optimizer,
+                        "path": path,
+                        "status": "ok",
+                        "pass_fail_reason": "ok",
+                        "cppmega_sha": cppmega_sha,
+                        "tok_sec": tok_sec,
+                        "peak_memory_gb": peak_memory_gb,
+                        "cache_hit": cache_hit,
+                    }
+                )
+    return rows
+
+
+def test_path_c_fusion_matrix_profile_receipt_derives_verified_grid_from_report(
+    tmp_path: Path,
+    path_c_fusion_force_env: None,
+) -> None:
+    del path_c_fusion_force_env
+    baseline_payload = m04_train_step.path_c_fusion_payload(
+        compile_receipt_path=PRODUCTION_FUSION_COMPILE_RECEIPT,
+    )
+    schedule = baseline_payload["production_schedule"]
+
+    receipt = m04_train_step.path_c_fusion_matrix_profile_receipt_from_report(
+        {
+            "software": {"cppmega_sha": "abc123"},
+            "results": _complete_matrix_profile_rows(cppmega_sha="abc123"),
+        },
+        schedule_id=schedule["schedule_id"],
+        schedule_name=schedule["schedule_name"],
+    )
+
+    assert receipt["status"] == "ok"
+    assert receipt["full_1b_matrix_captured"] is True
+    assert receipt["single_cppmega_commit"] is True
+    assert receipt["cppmega_sha"] == "abc123"
+    assert receipt["profiling_traces_captured"] is True
+    assert receipt["memory_non_regression_ok"] is True
+    assert receipt["cache_receipts_captured"] is True
+    assert receipt["path_b_baselines_clean"] is True
+    assert receipt["path_c_default_gate_rows_passed"] is True
+    assert receipt["path_c_peak_memory_non_regression"] is True
+    assert receipt["path_c_warm_cache_hit_observed"] is True
+    assert len(receipt["matrix_rows"]) == (
+        len(m04_train_step.MATRIX_DTYPE_ROUTES)
+        * len(m04_train_step.MATRIX_OPTIMIZERS)
+    )
+    row_count = len(m04_train_step.MATRIX_DTYPE_ROUTES) * len(
+        m04_train_step.MATRIX_OPTIMIZERS
+    )
+    assert receipt["row_check_summary"] == {
+        "total_rows": row_count,
+        "row_status_ok": row_count,
+        "path_b_baseline_clean": row_count,
+        "path_c_default_gate_passed": row_count,
+        "path_c_peak_memory_non_regression": row_count,
+        "path_c_warm_cache_hit_observed": row_count,
+        "path_c_cold_cache_miss_observed": row_count,
+        "profiling_trace_captured": row_count,
+    }
+    assert receipt["failed_rows_by_check"] == {}
+
+    receipt_path = tmp_path / "derived_path_c_fusion_matrix_profile.json"
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    payload = m04_train_step.path_c_fusion_payload(
+        compile_receipt_path=PRODUCTION_FUSION_COMPILE_RECEIPT,
+        matrix_profile_receipt_path=receipt_path,
+    )
+
+    assert payload["production_matrix_profile_receipt"]["status"] == "verified"
+    assert payload["production_matrix_profile_receipt"]["row_check_summary"] == (
+        receipt["row_check_summary"]
+    )
+    assert payload["production_matrix_profile_receipt"]["failed_rows_by_check"] == {}
+    assert payload["acceptance_gate"]["current_matrix_profile_verified"] is True
+
+
+def test_path_c_fusion_matrix_profile_receipt_derives_grid_from_path_matrix_report(
+    path_c_fusion_force_env: None,
+) -> None:
+    del path_c_fusion_force_env
+    baseline_payload = m04_train_step.path_c_fusion_payload(
+        compile_receipt_path=PRODUCTION_FUSION_COMPILE_RECEIPT,
+    )
+    schedule = baseline_payload["production_schedule"]
+
+    receipt = m04_train_step.path_c_fusion_matrix_profile_receipt_from_report(
+        {
+            "software": {"cppmega_sha": "abc123"},
+            "results": _path_matrix_profile_rows(cppmega_sha="abc123"),
+        },
+        schedule_id=schedule["schedule_id"],
+        schedule_name=schedule["schedule_name"],
+    )
+
+    assert receipt["status"] == "mismatch"
+    assert receipt["single_cppmega_commit"] is True
+    assert receipt["full_1b_matrix_captured"] is True
+    assert receipt["profiling_traces_captured"] is False
+    assert "profiling_traces_captured" in receipt["failed_checks"]
+    assert len(receipt["matrix_rows"]) == (
+        len(m04_train_step.MATRIX_DTYPE_ROUTES)
+        * len(m04_train_step.MATRIX_OPTIMIZERS)
+    )
+    assert receipt["missing_matrix_rows"] == []
+    row_count = len(m04_train_step.MATRIX_DTYPE_ROUTES) * len(
+        m04_train_step.MATRIX_OPTIMIZERS
+    )
+    assert receipt["row_check_summary"] == {
+        "total_rows": row_count,
+        "row_status_ok": row_count,
+        "path_b_baseline_clean": row_count,
+        "path_c_default_gate_passed": row_count,
+        "path_c_peak_memory_non_regression": row_count,
+        "path_c_warm_cache_hit_observed": row_count,
+        "path_c_cold_cache_miss_observed": row_count,
+        "profiling_trace_captured": 0,
+    }
+    assert receipt["failed_rows_by_check"] == {
+        "profiling_trace_captured": [
+            f"{dtype_route}:{optimizer}"
+            for dtype_route in m04_train_step.MATRIX_DTYPE_ROUTES
+            for optimizer in m04_train_step.MATRIX_OPTIMIZERS
+        ],
+    }
+
+
+def test_path_c_fusion_matrix_profile_receipt_counts_per_row_check_failures(
+    path_c_fusion_force_env: None,
+) -> None:
+    del path_c_fusion_force_env
+    baseline_payload = m04_train_step.path_c_fusion_payload(
+        compile_receipt_path=PRODUCTION_FUSION_COMPILE_RECEIPT,
+    )
+    schedule = baseline_payload["production_schedule"]
+    rows = _complete_matrix_profile_rows(cppmega_sha="abc123")
+    rows[0]["path_c_peak_memory_gb"] = 10.25
+    rows[1]["path_c_warm_tok_sec"] = 90.0
+    rows[2].pop("profiling_trace_path")
+
+    receipt = m04_train_step.path_c_fusion_matrix_profile_receipt_from_report(
+        {
+            "software": {"cppmega_sha": "abc123"},
+            "results": rows,
+        },
+        schedule_id=schedule["schedule_id"],
+        schedule_name=schedule["schedule_name"],
+    )
+
+    row_count = len(m04_train_step.MATRIX_DTYPE_ROUTES) * len(
+        m04_train_step.MATRIX_OPTIMIZERS
+    )
+    assert receipt["status"] == "mismatch"
+    assert receipt["row_check_summary"] == {
+        "total_rows": row_count,
+        "row_status_ok": row_count,
+        "path_b_baseline_clean": row_count,
+        "path_c_default_gate_passed": row_count - 1,
+        "path_c_peak_memory_non_regression": row_count - 1,
+        "path_c_warm_cache_hit_observed": row_count,
+        "path_c_cold_cache_miss_observed": row_count,
+        "profiling_trace_captured": row_count - 1,
+    }
+    assert receipt["failed_rows_by_check"] == {
+        "path_c_default_gate_passed": ["bf16:muon"],
+        "path_c_peak_memory_non_regression": ["bf16:adamw"],
+        "profiling_trace_captured": ["bf16:muon_adamw"],
+    }
+
+
+def test_path_c_fusion_matrix_profile_receipt_rejects_mixed_commits_and_peak_regression(
+    path_c_fusion_force_env: None,
+) -> None:
+    del path_c_fusion_force_env
+    baseline_payload = m04_train_step.path_c_fusion_payload(
+        compile_receipt_path=PRODUCTION_FUSION_COMPILE_RECEIPT,
+    )
+    schedule = baseline_payload["production_schedule"]
+    rows = _complete_matrix_profile_rows(cppmega_sha="abc123")
+    rows[0]["cppmega_sha"] = "def456"
+    rows[1]["path_c_peak_memory_gb"] = 10.25
+
+    receipt = m04_train_step.path_c_fusion_matrix_profile_receipt_from_report(
+        {
+            "software": {"cppmega_sha": "abc123"},
+            "results": rows,
+        },
+        schedule_id=schedule["schedule_id"],
+        schedule_name=schedule["schedule_name"],
+    )
+
+    assert receipt["status"] == "mismatch"
+    assert receipt["single_cppmega_commit"] is False
+    assert receipt["memory_non_regression_ok"] is False
+    assert receipt["path_c_peak_memory_non_regression"] is False
+    assert "single_cppmega_commit" in receipt["failed_checks"]
+    assert "path_c_peak_memory_non_regression" in receipt["failed_checks"]
 
 
 def test_fp8_path_c_local_gb10_profile_uses_model_factory_dsa_producer() -> None:

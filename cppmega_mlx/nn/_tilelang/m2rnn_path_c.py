@@ -2613,8 +2613,12 @@ def _post_residual_gate_bwd_kernel_for(
     g_dim = g_heads * v_dim
     g_offset = projected_dim - g_dim
     features = total_heads * v_dim
-    lanes = batch * seq * features
-    threads = _threads_for(features)
+    dy_lanes = batch * seq * features
+    dconv_lanes = batch * seq * conv_dim
+    dD_lanes = total_heads * v_dim
+    dprojected_lanes = batch * seq * projected_dim
+    lanes = dy_lanes + dconv_lanes + dD_lanes + dprojected_lanes
+    threads = _threads_for(max(features, conv_dim, projected_dim))
     accum_dtype = "float32"
 
     @T.prim_func
@@ -2633,51 +2637,106 @@ def _post_residual_gate_bwd_kernel_for(
             tid = T.get_thread_binding(0)
             lane = bx * threads + tid
             if lane < lanes:
-                feature = lane % features
-                t = (lane // features) % seq
-                b = lane // (features * seq)
-                h = feature // v_dim
-                vv = feature % v_dim
-                v_src = h // v_group
-                v_index = v_offset + v_src * v_dim + vv
-                g_flat = feature // g_repeat
-                g_index = g_offset + g_flat
-                dpost_val = T.cast(dpost[b, t, feature], accum_dtype)
-                g_val = T.cast(projected[b, t, g_index], accum_dtype)
-                sig_g = T.alloc_var(T.float32, init=0.0)
-                if g_val >= 0.0:
-                    sig_g = 1.0 / (1.0 + T.exp(-g_val))
+                if lane < dy_lanes:
+                    feature = lane % features
+                    t = (lane // features) % seq
+                    b = lane // (features * seq)
+                    h = feature // v_dim
+                    vv = feature % v_dim
+                    g_flat = feature // g_repeat
+                    g_index = g_offset + g_flat
+                    dpost_val = T.cast(dpost[b, t, feature], accum_dtype)
+                    g_val = T.cast(projected[b, t, g_index], accum_dtype)
+                    sig_g = T.alloc_var(T.float32, init=0.0)
+                    if g_val >= 0.0:
+                        sig_g = 1.0 / (1.0 + T.exp(-g_val))
+                    else:
+                        sig_g = T.exp(g_val)
+                        sig_g = sig_g / (1.0 + sig_g)
+                    dy_recurrent[b, t, h, vv] = T.cast(
+                        dpost_val * g_val * sig_g,
+                        grad_dtype,
+                    )
+                elif lane < dy_lanes + dconv_lanes:
+                    local = lane - dy_lanes
+                    c = local % conv_dim
+                    t = (local // conv_dim) % seq
+                    b = local // (conv_dim * seq)
+                    acc = T.alloc_var(T.float32, init=0.0)
+                    if c >= v_offset and c < v_offset + v_heads * v_dim:
+                        v_rel = c - v_offset
+                        v_src = v_rel // v_dim
+                        vv = v_rel % v_dim
+                        for local_h in T.serial(v_group):
+                            h = v_src * v_group + local_h
+                            feature = h * v_dim + vv
+                            g_flat = feature // g_repeat
+                            g_index = g_offset + g_flat
+                            dpost_val = T.cast(dpost[b, t, feature], accum_dtype)
+                            g_val = T.cast(projected[b, t, g_index], accum_dtype)
+                            sig_g = T.alloc_var(T.float32, init=0.0)
+                            if g_val >= 0.0:
+                                sig_g = 1.0 / (1.0 + T.exp(-g_val))
+                            else:
+                                sig_g = T.exp(g_val)
+                                sig_g = sig_g / (1.0 + sig_g)
+                            dskipped = dpost_val * g_val * sig_g
+                            d_val = T.cast(D[h, vv], accum_dtype)
+                            acc = acc + dskipped * d_val
+                    dconv_input[b, t, c] = T.cast(acc, grad_dtype)
+                elif lane < dy_lanes + dconv_lanes + dD_lanes:
+                    local = lane - dy_lanes - dconv_lanes
+                    h = local // v_dim
+                    vv = local % v_dim
+                    v_src = h // v_group
+                    v_index = v_offset + v_src * v_dim + vv
+                    acc = T.alloc_var(T.float32, init=0.0)
+                    for b in T.serial(batch):
+                        for t in T.serial(seq):
+                            feature = h * v_dim + vv
+                            g_flat = feature // g_repeat
+                            g_index = g_offset + g_flat
+                            dpost_val = T.cast(dpost[b, t, feature], accum_dtype)
+                            g_val = T.cast(projected[b, t, g_index], accum_dtype)
+                            sig_g = T.alloc_var(T.float32, init=0.0)
+                            if g_val >= 0.0:
+                                sig_g = 1.0 / (1.0 + T.exp(-g_val))
+                            else:
+                                sig_g = T.exp(g_val)
+                                sig_g = sig_g / (1.0 + sig_g)
+                            dskipped = dpost_val * g_val * sig_g
+                            v_val = T.cast(conv_input[b, t, v_index], accum_dtype)
+                            acc = acc + dskipped * v_val
+                    dD[h, vv] = T.cast(acc, grad_dtype)
                 else:
-                    sig_g = T.exp(g_val)
-                    sig_g = sig_g / (1.0 + sig_g)
-                silu_g = g_val * sig_g
-                silu_dg = sig_g * (1.0 + g_val * (1.0 - sig_g))
-                y_val = T.cast(y[b, t, h, vv], accum_dtype)
-                v_val = T.cast(conv_input[b, t, v_index], accum_dtype)
-                d_val = T.cast(D[h, vv], accum_dtype)
-                skipped = y_val + v_val * d_val
-                dskipped = dpost_val * silu_g
-
-                T.atomic_add(
-                    dy_recurrent[b, t, h, vv],
-                    dskipped,
-                    memory_order="relaxed",
-                )
-                T.atomic_add(
-                    dconv_input[b, t, v_index],
-                    dskipped * d_val,
-                    memory_order="relaxed",
-                )
-                T.atomic_add(
-                    dD[h, vv],
-                    dskipped * v_val,
-                    memory_order="relaxed",
-                )
-                T.atomic_add(
-                    dprojected[b, t, g_index],
-                    dpost_val * skipped * silu_dg,
-                    memory_order="relaxed",
-                )
+                    local = lane - dy_lanes - dconv_lanes - dD_lanes
+                    p = local % projected_dim
+                    t = (local // projected_dim) % seq
+                    b = local // (projected_dim * seq)
+                    acc = T.alloc_var(T.float32, init=0.0)
+                    if p >= g_offset and p < g_offset + g_dim:
+                        g_flat = p - g_offset
+                        g_val = T.cast(projected[b, t, p], accum_dtype)
+                        sig_g = T.alloc_var(T.float32, init=0.0)
+                        if g_val >= 0.0:
+                            sig_g = 1.0 / (1.0 + T.exp(-g_val))
+                        else:
+                            sig_g = T.exp(g_val)
+                            sig_g = sig_g / (1.0 + sig_g)
+                        silu_dg = sig_g * (1.0 + g_val * (1.0 - sig_g))
+                        for r in T.serial(g_repeat):
+                            feature = g_flat * g_repeat + r
+                            h = feature // v_dim
+                            vv = feature % v_dim
+                            v_src = h // v_group
+                            v_index = v_offset + v_src * v_dim + vv
+                            dpost_val = T.cast(dpost[b, t, feature], accum_dtype)
+                            y_val = T.cast(y[b, t, h, vv], accum_dtype)
+                            v_val = T.cast(conv_input[b, t, v_index], accum_dtype)
+                            d_val = T.cast(D[h, vv], accum_dtype)
+                            skipped = y_val + v_val * d_val
+                            acc = acc + dpost_val * skipped * silu_dg
+                    dprojected[b, t, p] = T.cast(acc, grad_dtype)
 
     bwd = _with_global_symbol(
         bwd,

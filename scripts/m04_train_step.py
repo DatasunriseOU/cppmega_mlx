@@ -323,6 +323,15 @@ OPEN_M0_BLOCKERS = (
 )
 MATRIX_DTYPE_ROUTES = ("bf16", "fp8_path_b", "fp8_path_c", "int8")
 MATRIX_OPTIMIZERS = ("adamw", "muon", "muon_adamw", "lion", "lion8bit", "adam8bit")
+MATRIX_PROFILE_ROW_CHECKS = (
+    "row_status_ok",
+    "path_b_baseline_clean",
+    "path_c_default_gate_passed",
+    "path_c_peak_memory_non_regression",
+    "path_c_warm_cache_hit_observed",
+    "path_c_cold_cache_miss_observed",
+    "profiling_trace_captured",
+)
 MATRIX_STEPS = 20
 MATRIX_ACCEPTANCE_STEPS = 100
 MATRIX_SMOKE_STEPS = 1
@@ -5780,6 +5789,507 @@ def _path_c_fusion_matrix_profile_receipt_path() -> Path:
     return PATH_C_FUSION_MATRIX_PROFILE_RECEIPT_PATH
 
 
+def _matrix_profile_string(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _matrix_profile_float(row: Mapping[str, Any], keys: Sequence[str]) -> float | None:
+    for key in keys:
+        value = row.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                continue
+            try:
+                return float(text)
+            except ValueError:
+                continue
+    return None
+
+
+def _matrix_profile_bool_is(
+    row: Mapping[str, Any],
+    keys: Sequence[str],
+    *,
+    expected: bool,
+) -> bool:
+    for key in keys:
+        if key in row:
+            return row.get(key) is expected
+    return False
+
+
+def _matrix_profile_status_ok(value: Any) -> bool:
+    if value is True:
+        return True
+    text = _matrix_profile_string(value)
+    if text is None:
+        return False
+    return text.lower() in {"ok", "pass", "passed", "success", "verified"}
+
+
+def _matrix_profile_trace_captured(row: Mapping[str, Any]) -> bool:
+    if row.get("profiling_trace_captured") is True:
+        return True
+    for key in (
+        "profiling_trace_path",
+        "profile_trace_path",
+        "trace_path",
+        "xctrace_path",
+    ):
+        if _matrix_profile_string(row.get(key)):
+            return True
+    return False
+
+
+def _matrix_profile_row_check_summary(
+    matrix_rows: Sequence[Mapping[str, Any]],
+) -> dict[str, int]:
+    summary = {"total_rows": len(matrix_rows)}
+    for check_name in MATRIX_PROFILE_ROW_CHECKS:
+        summary[check_name] = sum(
+            1
+            for row in matrix_rows
+            if isinstance(row.get("checks"), Mapping)
+            and bool(row["checks"].get(check_name))
+        )
+    return summary
+
+
+def _matrix_profile_row_key(row: Mapping[str, Any]) -> str | None:
+    dtype_route = _matrix_profile_string(row.get("dtype_route"))
+    optimizer_name = _matrix_profile_string(row.get("optimizer"))
+    if dtype_route is None or optimizer_name is None:
+        return None
+    return f"{dtype_route}:{optimizer_name}"
+
+
+def _matrix_profile_failed_rows_by_check(
+    matrix_rows: Sequence[Mapping[str, Any]],
+) -> dict[str, list[str]]:
+    failed_rows: dict[str, list[str]] = {}
+    for row in matrix_rows:
+        row_key = _matrix_profile_row_key(row)
+        checks = row.get("checks")
+        if row_key is None or not isinstance(checks, Mapping):
+            continue
+        for check_name in MATRIX_PROFILE_ROW_CHECKS:
+            if not bool(checks.get(check_name)):
+                failed_rows.setdefault(check_name, []).append(row_key)
+    return failed_rows
+
+
+def _matrix_profile_failed_rows_payload(value: Any) -> dict[str, list[str]]:
+    if not isinstance(value, Mapping):
+        return {}
+    failed_rows: dict[str, list[str]] = {}
+    for check_name, rows in value.items():
+        if not isinstance(check_name, str):
+            continue
+        if not isinstance(rows, Sequence) or isinstance(
+            rows,
+            (str, bytes, bytearray),
+        ):
+            continue
+        failed_rows[check_name] = [str(row) for row in rows]
+    return failed_rows
+
+
+def _matrix_profile_report_rows(
+    matrix_report: Mapping[str, Any],
+) -> list[Mapping[str, Any]]:
+    for key in ("matrix_rows", "results", "rows", "cells"):
+        rows = matrix_report.get(key)
+        if isinstance(rows, Sequence) and not isinstance(
+            rows, (str, bytes, bytearray)
+        ):
+            mapped_rows = [row for row in rows if isinstance(row, Mapping)]
+            if mapped_rows:
+                return mapped_rows
+    return []
+
+
+def _matrix_profile_row_commit(
+    *,
+    row: Mapping[str, Any],
+    report_software: Mapping[str, Any],
+) -> str | None:
+    row_software = row.get("software")
+    if not isinstance(row_software, Mapping):
+        row_software = {}
+    for source in (row, row_software, report_software):
+        for key in ("cppmega_sha", "git_commit"):
+            value = _matrix_profile_string(source.get(key))
+            if value:
+                return value
+    return None
+
+
+def _matrix_profile_direct_receipt_row(
+    row: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    dtype_route = _matrix_profile_string(row.get("dtype_route"))
+    optimizer_name = _matrix_profile_string(row.get("optimizer"))
+    if dtype_route is None or optimizer_name is None:
+        return None
+    dtype_route = dtype_route.lower()
+    optimizer_name = optimizer_name.lower()
+    if dtype_route not in MATRIX_DTYPE_ROUTES:
+        return None
+    if optimizer_name not in MATRIX_OPTIMIZERS:
+        return None
+
+    path_b_peak_memory_gb = _matrix_profile_float(
+        row,
+        (
+            "path_b_peak_memory_gb",
+            "baseline_peak_memory_gb",
+            "path_b_peak_gb",
+        ),
+    )
+    path_c_peak_memory_gb = _matrix_profile_float(
+        row,
+        (
+            "path_c_peak_memory_gb",
+            "path_c_warm_peak_memory_gb",
+            "path_c_peak_gb",
+        ),
+    )
+    path_b_tok_sec = _matrix_profile_float(
+        row,
+        (
+            "path_b_tok_sec",
+            "baseline_tok_sec",
+            "path_b_tokens_per_second",
+            "baseline_tokens_per_second",
+        ),
+    )
+    path_c_warm_tok_sec = _matrix_profile_float(
+        row,
+        (
+            "path_c_warm_tok_sec",
+            "path_c_tok_sec",
+            "path_c_tokens_per_second",
+            "path_c_warm_tokens_per_second",
+        ),
+    )
+    path_b_status_ok = _matrix_profile_status_ok(
+        row.get("path_b_status", row.get("baseline_status", row.get("status")))
+    )
+    path_c_warm_status_ok = _matrix_profile_status_ok(
+        row.get("path_c_warm_status", row.get("path_c_status", row.get("status")))
+    )
+    path_b_reason = _matrix_profile_string(
+        row.get("path_b_pass_fail_reason", row.get("pass_fail_reason", "ok"))
+    )
+    path_c_reason = _matrix_profile_string(
+        row.get(
+            "path_c_warm_pass_fail_reason",
+            row.get("path_c_pass_fail_reason", "ok"),
+        )
+    )
+    path_b_baseline_clean = path_b_status_ok and path_b_reason == "ok"
+    path_c_default_gate_passed = (
+        path_c_warm_status_ok
+        and path_c_reason == "ok"
+        and path_b_tok_sec is not None
+        and path_c_warm_tok_sec is not None
+        and path_c_warm_tok_sec >= path_b_tok_sec
+    )
+    path_c_peak_memory_non_regression = (
+        path_b_peak_memory_gb is not None
+        and path_c_peak_memory_gb is not None
+        and path_c_peak_memory_gb <= path_b_peak_memory_gb
+    )
+    path_c_warm_cache_hit_observed = _matrix_profile_bool_is(
+        row,
+        ("path_c_warm_cache_hit", "warm_cache_hit"),
+        expected=True,
+    )
+    path_c_cold_cache_miss_observed = _matrix_profile_bool_is(
+        row,
+        ("path_c_cold_cache_hit", "cold_cache_hit"),
+        expected=False,
+    )
+    profiling_trace_captured = _matrix_profile_trace_captured(row)
+    row_status_ok = _matrix_profile_status_ok(row.get("status"))
+    checks = {
+        "row_status_ok": row_status_ok,
+        "path_b_baseline_clean": path_b_baseline_clean,
+        "path_c_default_gate_passed": path_c_default_gate_passed,
+        "path_c_peak_memory_non_regression": path_c_peak_memory_non_regression,
+        "path_c_warm_cache_hit_observed": path_c_warm_cache_hit_observed,
+        "path_c_cold_cache_miss_observed": path_c_cold_cache_miss_observed,
+        "profiling_trace_captured": profiling_trace_captured,
+    }
+    failed_checks = [name for name, ok in checks.items() if not ok]
+    row_observed_ok = (
+        row_status_ok
+        and path_b_baseline_clean
+        and path_c_warm_status_ok
+        and path_c_reason == "ok"
+    )
+    return {
+        "dtype_route": dtype_route,
+        "optimizer": optimizer_name,
+        "status": "ok" if row_observed_ok else "mismatch",
+        "path_b_tok_sec": path_b_tok_sec,
+        "path_c_warm_tok_sec": path_c_warm_tok_sec,
+        "path_b_peak_memory_gb": path_b_peak_memory_gb,
+        "path_c_peak_memory_gb": path_c_peak_memory_gb,
+        "checks": checks,
+        "failed_checks": failed_checks,
+    }
+
+
+def _matrix_profile_path_matrix_optimizer_alias(
+    dtype_route: str,
+    optimizer_name: str,
+) -> str:
+    if dtype_route != "int8":
+        return optimizer_name
+    if optimizer_name in {"adamw", "adam8bit"}:
+        return "adam8bit"
+    if optimizer_name in {"lion", "lion8bit"}:
+        return "lion8bit"
+    if optimizer_name in {"muon", "muon_adamw"}:
+        return "muon_int8"
+    return optimizer_name
+
+
+def _matrix_profile_path_matrix_dtype(dtype_route: str) -> str:
+    if dtype_route in {"fp8_path_b", "fp8_path_c"}:
+        return "fp8"
+    return "bf16"
+
+
+def _matrix_profile_path_matrix_receipt_row(
+    *,
+    dtype_route: str,
+    optimizer_name: str,
+    baseline_row: Mapping[str, Any],
+    warm_row: Mapping[str, Any] | None,
+    cold_row: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    if dtype_route == "fp8_path_b":
+        warm_row = baseline_row
+    if warm_row is None:
+        return None
+    normalized_row: dict[str, Any] = {
+        "dtype_route": dtype_route,
+        "optimizer": optimizer_name,
+        "status": baseline_row.get("status"),
+        "path_b_status": baseline_row.get("status"),
+        "path_b_pass_fail_reason": baseline_row.get("pass_fail_reason", "ok"),
+        "path_b_tok_sec": baseline_row.get("tok_sec"),
+        "path_b_peak_memory_gb": baseline_row.get("peak_memory_gb"),
+        "path_c_warm_status": warm_row.get("status"),
+        "path_c_warm_pass_fail_reason": warm_row.get("pass_fail_reason", "ok"),
+        "path_c_warm_tok_sec": warm_row.get("tok_sec"),
+        "path_c_peak_memory_gb": warm_row.get("peak_memory_gb"),
+        "path_c_warm_cache_hit": (
+            True if dtype_route == "fp8_path_b" else warm_row.get("cache_hit")
+        ),
+        "path_c_cold_cache_hit": (
+            False
+            if dtype_route == "fp8_path_b" or cold_row is None
+            else cold_row.get("cache_hit")
+        ),
+    }
+    for key in (
+        "profiling_trace_path",
+        "profile_trace_path",
+        "trace_path",
+        "xctrace_path",
+        "profiling_trace_captured",
+    ):
+        if key in warm_row:
+            normalized_row[key] = warm_row[key]
+        elif key in baseline_row:
+            normalized_row[key] = baseline_row[key]
+    return _matrix_profile_direct_receipt_row(normalized_row)
+
+
+def _matrix_profile_path_matrix_receipt_rows(
+    report_rows: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    path_rows: dict[tuple[str, str, str], Mapping[str, Any]] = {}
+    for row in report_rows:
+        dtype = _matrix_profile_string(row.get("dtype"))
+        optimizer_name = _matrix_profile_string(row.get("optimizer"))
+        path_name = _matrix_profile_string(row.get("path"))
+        if dtype is None or optimizer_name is None or path_name is None:
+            continue
+        path_rows[(dtype.lower(), optimizer_name.lower(), path_name.lower())] = row
+
+    matrix_rows: list[dict[str, Any]] = []
+    for dtype_route in MATRIX_DTYPE_ROUTES:
+        dtype = _matrix_profile_path_matrix_dtype(dtype_route)
+        for optimizer_name in MATRIX_OPTIMIZERS:
+            optimizer_alias = _matrix_profile_path_matrix_optimizer_alias(
+                dtype_route,
+                optimizer_name,
+            )
+            baseline_row = path_rows.get((dtype, optimizer_alias, "path_b"))
+            if baseline_row is None:
+                continue
+            warm_row = path_rows.get((dtype, optimizer_alias, "path_c_warm"))
+            cold_row = path_rows.get((dtype, optimizer_alias, "path_c_cold"))
+            receipt_row = _matrix_profile_path_matrix_receipt_row(
+                dtype_route=dtype_route,
+                optimizer_name=optimizer_name,
+                baseline_row=baseline_row,
+                warm_row=warm_row,
+                cold_row=cold_row,
+            )
+            if receipt_row is not None:
+                matrix_rows.append(receipt_row)
+    return matrix_rows
+
+
+def path_c_fusion_matrix_profile_receipt_from_report(
+    matrix_report: Mapping[str, Any],
+    *,
+    schedule_id: str,
+    schedule_name: str,
+    model_profile: str = REQUIRED_MODEL_PROFILE,
+) -> dict[str, Any]:
+    """Derive a production matrix/profile receipt from benchmark row evidence."""
+
+    report_software = matrix_report.get("software")
+    if not isinstance(report_software, Mapping):
+        report_software = {}
+    report_rows = _matrix_profile_report_rows(matrix_report)
+    required_matrix_grid = {
+        (str(dtype_route), str(optimizer_name))
+        for dtype_route in MATRIX_DTYPE_ROUTES
+        for optimizer_name in MATRIX_OPTIMIZERS
+    }
+    row_by_grid: dict[tuple[str, str], dict[str, Any]] = {}
+    commits: set[str] = set()
+    missing_commit_rows = 0
+    for row in report_rows:
+        commit = _matrix_profile_row_commit(
+            row=row,
+            report_software=report_software,
+        )
+        if commit is None:
+            missing_commit_rows += 1
+        else:
+            commits.add(commit)
+        receipt_row = _matrix_profile_direct_receipt_row(row)
+        if receipt_row is None:
+            continue
+        row_by_grid[(receipt_row["dtype_route"], receipt_row["optimizer"])] = (
+            receipt_row
+        )
+    if not row_by_grid:
+        for receipt_row in _matrix_profile_path_matrix_receipt_rows(report_rows):
+            row_by_grid[(receipt_row["dtype_route"], receipt_row["optimizer"])] = (
+                receipt_row
+            )
+
+    matrix_rows = [
+        row_by_grid[(dtype_route, optimizer_name)]
+        for dtype_route in MATRIX_DTYPE_ROUTES
+        for optimizer_name in MATRIX_OPTIMIZERS
+        if (dtype_route, optimizer_name) in row_by_grid
+    ]
+    missing_matrix_grid = sorted(
+        f"{dtype_route}:{optimizer_name}"
+        for dtype_route, optimizer_name in required_matrix_grid.difference(
+            row_by_grid
+        )
+    )
+    full_1b_matrix_captured = not missing_matrix_grid and bool(matrix_rows)
+    grid_rows_ok = (
+        len(matrix_rows) == len(required_matrix_grid)
+        and all(row.get("status") == "ok" for row in matrix_rows)
+    )
+    single_cppmega_commit = len(commits) == 1 and missing_commit_rows == 0
+    checks = {
+        "single_cppmega_commit": single_cppmega_commit,
+        "full_1b_matrix_captured": full_1b_matrix_captured and grid_rows_ok,
+        "profiling_traces_captured": grid_rows_ok
+        and all(
+            bool(row.get("checks", {}).get("profiling_trace_captured"))
+            for row in matrix_rows
+        ),
+        "memory_non_regression_ok": grid_rows_ok
+        and all(
+            bool(row.get("checks", {}).get("path_c_peak_memory_non_regression"))
+            for row in matrix_rows
+        ),
+        "cache_receipts_captured": grid_rows_ok
+        and all(
+            bool(row.get("checks", {}).get("path_c_warm_cache_hit_observed"))
+            and bool(row.get("checks", {}).get("path_c_cold_cache_miss_observed"))
+            for row in matrix_rows
+        ),
+        "path_b_baselines_clean": grid_rows_ok
+        and all(
+            bool(row.get("checks", {}).get("path_b_baseline_clean"))
+            for row in matrix_rows
+        ),
+        "path_c_default_gate_rows_passed": grid_rows_ok
+        and all(
+            bool(row.get("checks", {}).get("path_c_default_gate_passed"))
+            for row in matrix_rows
+        ),
+        "path_c_peak_memory_non_regression": grid_rows_ok
+        and all(
+            bool(row.get("checks", {}).get("path_c_peak_memory_non_regression"))
+            for row in matrix_rows
+        ),
+        "path_c_warm_cache_hit_observed": grid_rows_ok
+        and all(
+            bool(row.get("checks", {}).get("path_c_warm_cache_hit_observed"))
+            for row in matrix_rows
+        ),
+    }
+    failed_checks = [name for name, ok in checks.items() if not ok]
+    row_check_summary = _matrix_profile_row_check_summary(matrix_rows)
+    failed_rows_by_check = _matrix_profile_failed_rows_by_check(matrix_rows)
+    return {
+        "kind": "cppmega_path_c_fusion_matrix_profile_receipt",
+        "status": "ok" if not failed_checks else "mismatch",
+        "model_profile": model_profile,
+        "schedule_id": schedule_id,
+        "schedule_name": schedule_name,
+        "cppmega_sha": next(iter(commits)) if len(commits) == 1 else None,
+        "cppmega_shas": sorted(commits),
+        "missing_commit_rows": missing_commit_rows,
+        "single_cppmega_commit": single_cppmega_commit,
+        "full_1b_matrix_captured": checks["full_1b_matrix_captured"],
+        "profiling_traces_captured": checks["profiling_traces_captured"],
+        "memory_non_regression_ok": checks["memory_non_regression_ok"],
+        "cache_receipts_captured": checks["cache_receipts_captured"],
+        "path_b_baselines_clean": checks["path_b_baselines_clean"],
+        "path_c_default_gate_rows_passed": checks[
+            "path_c_default_gate_rows_passed"
+        ],
+        "path_c_peak_memory_non_regression": checks[
+            "path_c_peak_memory_non_regression"
+        ],
+        "path_c_warm_cache_hit_observed": checks[
+            "path_c_warm_cache_hit_observed"
+        ],
+        "row_check_summary": row_check_summary,
+        "failed_rows_by_check": failed_rows_by_check,
+        "matrix_rows": matrix_rows,
+        "missing_matrix_rows": missing_matrix_grid,
+        "checks": checks,
+        "failed_checks": failed_checks,
+    }
+
+
 def _path_c_fusion_matrix_profile_payload(
     *,
     schedule_spec: Any,
@@ -5801,6 +6311,7 @@ def _path_c_fusion_matrix_profile_payload(
         "schedule_id": None,
         "schedule_name": None,
         "failed_checks": [],
+        "failed_rows_by_check": {},
         "reason": "production fused schedule 1B matrix/profile receipt is missing",
     }
     if not receipt_path.exists():
@@ -5814,7 +6325,37 @@ def _path_c_fusion_matrix_profile_payload(
             "reason": f"{type(exc).__name__}: {exc}",
         }
 
+    row_check_summary = receipt.get("row_check_summary")
+    if not isinstance(row_check_summary, Mapping):
+        row_check_summary = {}
+    failed_rows_by_check = _matrix_profile_failed_rows_payload(
+        receipt.get("failed_rows_by_check")
+    )
     matrix_rows = receipt.get("matrix_rows", ())
+    required_matrix_grid = {
+        (str(dtype_route), str(optimizer_name))
+        for dtype_route in MATRIX_DTYPE_ROUTES
+        for optimizer_name in MATRIX_OPTIMIZERS
+    }
+    observed_matrix_grid: set[tuple[str, str]] = set()
+    if isinstance(matrix_rows, list):
+        for row in matrix_rows:
+            if not isinstance(row, Mapping):
+                continue
+            if row.get("status") != "ok":
+                continue
+            dtype_route = str(
+                row.get("dtype_route", row.get("dtype", ""))
+            ).strip()
+            optimizer_name = str(row.get("optimizer", "")).strip()
+            if dtype_route and optimizer_name:
+                observed_matrix_grid.add((dtype_route, optimizer_name))
+    missing_matrix_grid = sorted(
+        f"{dtype_route}:{optimizer_name}"
+        for dtype_route, optimizer_name in required_matrix_grid.difference(
+            observed_matrix_grid
+        )
+    )
     checks = {
         "receipt_kind_ok": (
             receipt.get("kind")
@@ -5829,6 +6370,10 @@ def _path_c_fusion_matrix_profile_payload(
         ),
         "schedule_name_matches": (
             str(receipt.get("schedule_name", "")) == expected_schedule_name
+        ),
+        "single_cppmega_commit": (
+            receipt.get("single_cppmega_commit") is True
+            and bool(str(receipt.get("cppmega_sha", "")).strip())
         ),
         "full_1b_matrix_captured": (
             receipt.get("full_1b_matrix_captured") is True
@@ -5855,6 +6400,7 @@ def _path_c_fusion_matrix_profile_payload(
             receipt.get("path_c_warm_cache_hit_observed") is True
         ),
         "matrix_rows_present": isinstance(matrix_rows, list) and bool(matrix_rows),
+        "matrix_rows_cover_required_grid": not missing_matrix_grid,
     }
     failed_checks = [name for name, ok in checks.items() if not ok]
     verified = not failed_checks
@@ -5867,6 +6413,11 @@ def _path_c_fusion_matrix_profile_payload(
         "checks": checks,
         "failed_checks": failed_checks,
         "matrix_row_count": len(matrix_rows) if isinstance(matrix_rows, list) else 0,
+        "required_matrix_row_count": len(required_matrix_grid),
+        "covered_matrix_row_count": len(observed_matrix_grid),
+        "missing_matrix_rows": missing_matrix_grid,
+        "row_check_summary": dict(row_check_summary),
+        "failed_rows_by_check": failed_rows_by_check,
         "reason": (
             "production fused schedule has matching full 1B matrix, profiling, "
             "memory non-regression, and cache receipt evidence"
@@ -6396,6 +6947,12 @@ def path_c_fusion_payload(
                         ),
                         "failed_checks": list(
                             matrix_profile_receipt.get("failed_checks", ())
+                        ),
+                        "row_check_summary": dict(
+                            matrix_profile_receipt.get("row_check_summary", {})
+                        ),
+                        "failed_rows_by_check": dict(
+                            matrix_profile_receipt.get("failed_rows_by_check", {})
                         ),
                         "reason": (
                             "the full 1B Path B/Path C matrix, profiling traces, "

@@ -26,6 +26,7 @@ from cppmega_mlx.runtime.seed import (
     restore_rng_state,
     seed_all,
 )
+from cppmega_mlx.runtime import torch_compile_backend
 
 __all__ = [
     "AppliedMemoryLimits",
@@ -46,4 +47,5 @@ __all__ = [
     "restore_rng_state",
     "seed_all",
     "selected_path",
+    "torch_compile_backend",
 ]

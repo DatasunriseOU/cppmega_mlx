@@ -1,11 +1,12 @@
-"""G17: side_channels reach forward — extras.side_channels_forward_effect.
+"""G17: side_channels reach stage_train forward and change math.
 
-V4-10 was observation-only; G17 surfaces forward-routing contributions
-(doc_ids_mask_density + token_ids_added_norm). Full attention-bias /
-cross-doc-mask routing deferred to v6+ (requires nn.Module rewrites).
+V4-10 was observation-only. G17 routes doc_ids into same-document attention
+masks plus doc conditioning and routes token_ids into conditional embeddings.
 """
 
 from __future__ import annotations
+
+import mlx.core as mx
 
 from cppmega_v4.jsonrpc.schema import VerifyParams
 from cppmega_v4.runner import Pipeline, run_pipeline
@@ -27,6 +28,7 @@ def _spec() -> VerifyParams:
 
 
 def _run(opts: dict) -> dict:
+    mx.random.seed(17)
     report = run_pipeline(_spec(), Pipeline.from_dict({
         "stages": ["parse", "verify_build_spec", "build_model", "train"],
         "stage_options": {"train": opts},
@@ -51,6 +53,15 @@ def test_doc_ids_populates_mask_density():
     assert fwd["token_ids_added_norm"] == 0.0
 
 
+def test_doc_ids_change_loss_vs_disabled_same_seed():
+    base = _run({"num_steps": 3})["losses"]
+    doc = _run({"num_steps": 3,
+                "side_channels": {"doc_ids": [0, 0, 0, 1, 1, 1, 2, 2]}})[
+        "losses"
+    ]
+    assert doc != base
+
+
 def test_token_ids_populates_added_norm():
     extras = _run({"num_steps": 2,
                    "side_channels": {"token_ids": [1, 2, 3, 4, 5, 6, 7, 8]}})
@@ -58,6 +69,15 @@ def test_token_ids_populates_added_norm():
     assert fwd is not None
     assert fwd["token_ids_added_norm"] > 0
     assert fwd["doc_ids_mask_density"] == 0.0
+
+
+def test_token_ids_change_loss_vs_disabled_same_seed():
+    base = _run({"num_steps": 3})["losses"]
+    token = _run({"num_steps": 3,
+                  "side_channels": {"token_ids": [1, 2, 3, 4, 5, 6, 7, 8]}})[
+        "losses"
+    ]
+    assert token != base
 
 
 def test_both_channels_both_metrics_populated():

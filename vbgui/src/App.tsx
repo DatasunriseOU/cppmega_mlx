@@ -299,9 +299,8 @@ export function App(): JSX.Element {
       }
       if (trainParquetPath) trainOpts.parquet_path = trainParquetPath;
       if (trainTokenizerPath) trainOpts.tokenizer_path = trainTokenizerPath;
-      // V4-10: forward side-channel selection as synthetic int lists so
-      // stage_train can record observation (the actual forward hook is
-      // a smoke probe — full per-channel ingestion is v5+ work).
+      // Forward side-channel selection as synthetic int lists for the
+      // stage_train G17 math-effect smoke path.
       if (opts?.side_channels && opts.side_channels.length > 0) {
         const sc: Record<string, number[]> = {};
         for (const name of opts.side_channels) {

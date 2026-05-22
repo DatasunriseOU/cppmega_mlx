@@ -114,6 +114,44 @@ def test_bench_1b_matrix_can_forward_direct_chain_runtime_flag(
     ].command
 
 
+def test_bench_1b_matrix_can_plan_profile_capture_wrapped_command(
+    tmp_path: Path,
+) -> None:
+    args = _args(
+        tmp_path,
+        "--capture-profiles",
+        "--profile-capture-timeout-s",
+        "123.5",
+        "--dtypes",
+        "bf16",
+        "--optimizers",
+        "adamw",
+        "--paths",
+        "path_c_warm",
+    )
+    cell = matrix.build_cells(args)[0]
+
+    trace_path, capture_receipt_path = matrix.profile_capture_paths(cell, args)
+    command = matrix.profile_capture_command(
+        cell.command,
+        trace_path=trace_path,
+        timeout_s=args.profile_capture_timeout_s,
+    )
+
+    assert trace_path == (
+        tmp_path / "cells" / "profiles" / "bf16_adamw_path_c_warm.gputrace"
+    )
+    assert capture_receipt_path == (
+        tmp_path / "cells" / "profiles" / "bf16_adamw_path_c_warm_capture.json"
+    )
+    assert command[:2] == (sys.executable, "scripts/profile_capture.py")
+    assert "--trace-path" in command
+    assert str(trace_path) in command
+    assert "--timeout-s" in command
+    assert "123.5" in command
+    assert command[-len(cell.command) :] == cell.command
+
+
 def test_bench_1b_matrix_dry_run_writes_markdown_csv_and_json(
     tmp_path: Path,
 ) -> None:
@@ -145,15 +183,25 @@ def test_bench_1b_matrix_dry_run_writes_markdown_csv_and_json(
     assert "MLX SHA" in markdown
     assert "fp8_adamw_path_b" in markdown
     assert "--dtype fp8_path_b" in markdown
+    assert "profile trace" in markdown
     rows = list(csv.DictReader((tmp_path / "matrix.csv").open(encoding="utf-8")))
     assert len(rows) == 4
     statuses = {row["case_id"]: row["status"] for row in rows}
     assert statuses["bf16_adamw_path_b"] == "planned"
     assert statuses["fp8_adamw_path_b"] == "planned"
+    assert rows[0]["profiling_trace_captured"] == "False"
+    assert rows[0]["profiling_trace_path"] == ""
+    assert rows[0]["profiling_capture_receipt_path"] == ""
+    assert rows[0]["profiling_capture_status"] == ""
     payload = json.loads((tmp_path / "matrix.json").read_text(encoding="utf-8"))
     assert payload["scope"] == "cppmega_1b_path_matrix"
     assert payload["config"]["block_size"] == 2048
     assert payload["config"]["mamba3_bwd"] == "path_b"
+    first_result = payload["results"][0]
+    assert first_result["profiling_trace_captured"] is False
+    assert first_result["profiling_trace_path"] is None
+    assert first_result["profiling_capture_receipt_path"] is None
+    assert first_result["profiling_capture_status"] is None
 
 
 def test_bench_1b_matrix_extracts_m04_receipt_metrics(
@@ -185,6 +233,11 @@ def test_bench_1b_matrix_extracts_m04_receipt_metrics(
                         "active_memory_bytes": 512 << 20,
                         "cache_memory_bytes": 768 << 20,
                     },
+                },
+                "profiling": {
+                    "trace_path": "reports/profiling/bf16_adamw_path_c_cold.gputrace",
+                    "capture_receipt_path": "reports/profiling/bf16_adamw_path_c_cold_capture.json",
+                    "capture_status": "ok",
                 },
                 "training": {
                     "all_finite": True,
@@ -278,6 +331,86 @@ def test_bench_1b_matrix_extracts_m04_receipt_metrics(
     assert result.proof_result["path_c_fusion"]["schedule_blockers"] == [
         "fused_train_block_runtime_not_bound"
     ]
+    assert result.profiling_trace_path == (
+        "reports/profiling/bf16_adamw_path_c_cold.gputrace"
+    )
+    assert result.profiling_trace_captured is True
+    assert result.profiling_capture_receipt_path == (
+        "reports/profiling/bf16_adamw_path_c_cold_capture.json"
+    )
+    assert result.profiling_capture_status == "ok"
+    row = result.to_row()
+    assert row["profiling_trace_path"] == (
+        "reports/profiling/bf16_adamw_path_c_cold.gputrace"
+    )
+    assert row["profiling_trace_captured"] is True
+    assert row["profiling_capture_receipt_path"] == (
+        "reports/profiling/bf16_adamw_path_c_cold_capture.json"
+    )
+    assert row["profiling_capture_status"] == "ok"
+
+
+def test_bench_1b_matrix_extracts_profile_capture_receipt_when_m04_has_no_profile(
+    tmp_path: Path,
+) -> None:
+    args = _args(
+        tmp_path,
+        "--dtypes",
+        "bf16",
+        "--optimizers",
+        "adamw",
+        "--paths",
+        "path_c_warm",
+    )
+    cell = matrix.build_cells(args)[0]
+    cell.output_json.parent.mkdir(parents=True)
+    cell.output_json.write_text(
+        json.dumps(
+            {
+                "status": "ok",
+                "timing": {"step_times_s": [1.0], "tokens_per_second": 1024.0},
+                "memory": {"peak_memory_bytes": 1 << 30},
+                "training": {"all_finite": True, "kernel_dispatch": []},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    trace_path = tmp_path / "profiles" / "bf16_adamw_path_c_warm.gputrace"
+    capture_receipt_path = (
+        tmp_path / "profiles" / "bf16_adamw_path_c_warm_capture.json"
+    )
+
+    result = matrix.extract_result(
+        cell=cell,
+        identity={
+            "cppmega_sha": "cpp",
+            "tilelang_sha": "tl",
+            "mlx_sha": "mlx",
+            "mlx_version": "0.0+mlx",
+        },
+        cache_state={
+            "cache_mode": "warm",
+            "cache_dir": str(tmp_path / "cache"),
+            "cache_files_before": 1,
+        },
+        process=subprocess.CompletedProcess(cell.command, 0, "", ""),
+        duration_s=3.0,
+        profile_trace_path=trace_path,
+        profile_capture_receipt_path=capture_receipt_path,
+        profile_capture_receipt={
+            "kind": "cppmega_mlx_metal_capture_receipt",
+            "status": "ok",
+            "capture_started": True,
+            "capture_stopped": True,
+            "trace_path": str(trace_path),
+        },
+    )
+
+    assert result.profiling_trace_path == str(trace_path)
+    assert result.profiling_trace_captured is True
+    assert result.profiling_capture_receipt_path == str(capture_receipt_path)
+    assert result.profiling_capture_status == "ok"
 
 
 def test_path_c_fusion_summary_preserves_direct_chain_runtime_route() -> None:

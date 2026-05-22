@@ -107,6 +107,10 @@ class CellResult:
     peak_memory_gb: float | None = None
     active_memory_gb: float | None = None
     cache_memory_gb: float | None = None
+    profiling_trace_path: str | None = None
+    profiling_trace_captured: bool = False
+    profiling_capture_receipt_path: str | None = None
+    profiling_capture_status: str | None = None
     selected_schedule: dict[str, Any] = field(default_factory=dict)
     proof_result: dict[str, Any] = field(default_factory=dict)
     pass_fail_reason: str | None = None
@@ -138,6 +142,10 @@ class CellResult:
             "peak_memory_gb": self.peak_memory_gb,
             "active_memory_gb": self.active_memory_gb,
             "cache_memory_gb": self.cache_memory_gb,
+            "profiling_trace_path": self.profiling_trace_path,
+            "profiling_trace_captured": self.profiling_trace_captured,
+            "profiling_capture_receipt_path": self.profiling_capture_receipt_path,
+            "profiling_capture_status": self.profiling_capture_status,
             "cache_hit": self.cache_state.get("cache_hit"),
             "selected_schedule": json.dumps(self.selected_schedule, sort_keys=True),
             "proof_result": json.dumps(self.proof_result, sort_keys=True),
@@ -237,6 +245,29 @@ def build_parser() -> argparse.ArgumentParser:
             "the subprocess does not exit, wait this many seconds and then "
             "terminate it. Disabled by default."
         ),
+    )
+    parser.add_argument(
+        "--capture-profiles",
+        action="store_true",
+        help=(
+            "Run each cell under scripts/profile_capture.py and attach the "
+            "resulting MLX Metal capture receipt to the matrix row."
+        ),
+    )
+    parser.add_argument(
+        "--profile-trace-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory for per-cell .gputrace outputs. Defaults to "
+            "<work-dir>/profiles when --capture-profiles is enabled."
+        ),
+    )
+    parser.add_argument(
+        "--profile-capture-timeout-s",
+        type=float,
+        default=60.0,
+        help="Timeout forwarded to scripts/profile_capture.py for each cell.",
     )
     return parser
 
@@ -535,6 +566,78 @@ def command_string(command: tuple[str, ...]) -> str:
     return " ".join(command)
 
 
+def profile_capture_paths(
+    cell: MatrixCell,
+    args: argparse.Namespace,
+) -> tuple[Path, Path]:
+    trace_dir = args.profile_trace_dir or (args.work_dir / "profiles")
+    return (
+        trace_dir / f"{cell.case_id}.gputrace",
+        trace_dir / f"{cell.case_id}_capture.json",
+    )
+
+
+def profile_capture_command(
+    command: tuple[str, ...],
+    *,
+    trace_path: Path,
+    timeout_s: float,
+) -> tuple[str, ...]:
+    return (
+        sys.executable,
+        "scripts/profile_capture.py",
+        "--trace-path",
+        str(trace_path),
+        "--timeout-s",
+        f"{float(timeout_s):g}",
+        "--",
+        *command,
+    )
+
+
+def profile_capture_receipt_from_stdout(stdout: str) -> dict[str, Any] | None:
+    for raw_line in reversed(stdout.splitlines()):
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if (
+            isinstance(payload, dict)
+            and payload.get("kind") == "cppmega_mlx_metal_capture_receipt"
+        ):
+            return payload
+    return None
+
+
+def profile_capture_receipt_from_process(
+    process: subprocess.CompletedProcess[str],
+    *,
+    trace_path: Path,
+    capture_receipt_path: Path,
+) -> dict[str, Any]:
+    receipt = profile_capture_receipt_from_stdout(process.stdout or "")
+    if receipt is None:
+        receipt = {
+            "kind": "cppmega_mlx_metal_capture_receipt",
+            "status": "missing_capture_receipt",
+            "error": "scripts/profile_capture.py did not emit a JSON receipt",
+            "trace_path": str(trace_path),
+            "capture_started": False,
+            "capture_stopped": False,
+            "command_status": "unknown",
+            "returncode": process.returncode,
+        }
+    capture_receipt_path.parent.mkdir(parents=True, exist_ok=True)
+    capture_receipt_path.write_text(
+        json.dumps(receipt, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return receipt
+
+
 def existing_receipt_is_ok(path: Path) -> bool:
     if not path.exists():
         return False
@@ -593,6 +696,98 @@ def planned_result(cell: MatrixCell, identity: dict[str, str]) -> CellResult:
         pass_fail_reason="dry-run plan only; cell not executed",
         receipt_path=str(cell.output_json),
     )
+
+
+def _string_or_none(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _first_string(*values: Any) -> str | None:
+    for value in values:
+        text = _string_or_none(value)
+        if text is not None:
+            return text
+    return None
+
+
+def _truthy_flag(value: Any) -> bool:
+    if value is True:
+        return True
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes"}
+    if isinstance(value, int):
+        return value == 1
+    return False
+
+
+def profiling_payload_from_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
+    profiling = receipt.get("profiling") if isinstance(receipt, dict) else {}
+    if not isinstance(profiling, dict):
+        profiling = {}
+    trace_path = _first_string(
+        receipt.get("profiling_trace_path"),
+        receipt.get("profile_trace_path"),
+        receipt.get("trace_path"),
+        receipt.get("xctrace_path"),
+        profiling.get("profiling_trace_path"),
+        profiling.get("profile_trace_path"),
+        profiling.get("trace_path"),
+        profiling.get("xctrace_path"),
+    )
+    capture_receipt_path = _first_string(
+        receipt.get("profiling_capture_receipt_path"),
+        receipt.get("profile_capture_receipt_path"),
+        receipt.get("capture_receipt_path"),
+        profiling.get("profiling_capture_receipt_path"),
+        profiling.get("profile_capture_receipt_path"),
+        profiling.get("capture_receipt_path"),
+    )
+    capture_status = _first_string(
+        receipt.get("profiling_capture_status"),
+        receipt.get("profile_capture_status"),
+        receipt.get("capture_status"),
+        profiling.get("profiling_capture_status"),
+        profiling.get("profile_capture_status"),
+        profiling.get("capture_status"),
+    )
+    return {
+        "profiling_trace_path": trace_path,
+        "profiling_trace_captured": bool(
+            trace_path or _truthy_flag(receipt.get("profiling_trace_captured"))
+        ),
+        "profiling_capture_receipt_path": capture_receipt_path,
+        "profiling_capture_status": capture_status,
+    }
+
+
+def profiling_payload_from_capture_receipt(
+    receipt: dict[str, Any],
+    *,
+    requested_trace_path: Path | None,
+    capture_receipt_path: Path | None,
+) -> dict[str, Any]:
+    capture_status = _first_string(receipt.get("status"))
+    trace_path = _first_string(
+        receipt.get("trace_path"),
+        str(requested_trace_path) if requested_trace_path is not None else None,
+    )
+    captured = bool(
+        capture_status == "ok"
+        and trace_path
+        and _truthy_flag(receipt.get("capture_started"))
+        and _truthy_flag(receipt.get("capture_stopped"))
+    )
+    return {
+        "profiling_trace_path": trace_path if captured else None,
+        "profiling_trace_captured": captured,
+        "profiling_capture_receipt_path": (
+            str(capture_receipt_path) if capture_receipt_path is not None else None
+        ),
+        "profiling_capture_status": capture_status,
+    }
 
 
 def selected_schedule_from_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
@@ -746,6 +941,9 @@ def extract_result(
     cache_state: dict[str, Any],
     process: subprocess.CompletedProcess[str],
     duration_s: float,
+    profile_trace_path: Path | None = None,
+    profile_capture_receipt_path: Path | None = None,
+    profile_capture_receipt: dict[str, Any] | None = None,
 ) -> CellResult:
     cache_after = cache_file_count(cell.cache_dir)
     if cell.cache_dir is not None:
@@ -824,10 +1022,31 @@ def extract_result(
         if isinstance(training, dict) and isinstance(training.get("optimizer"), dict)
         else {}
     )
+    profiling_payload = profiling_payload_from_receipt(receipt)
+    if profile_capture_receipt is not None:
+        capture_profiling_payload = profiling_payload_from_capture_receipt(
+            profile_capture_receipt,
+            requested_trace_path=profile_trace_path,
+            capture_receipt_path=profile_capture_receipt_path,
+        )
+        if not profiling_payload["profiling_trace_captured"]:
+            profiling_payload = capture_profiling_payload
+        else:
+            profiling_payload["profiling_capture_receipt_path"] = (
+                profiling_payload["profiling_capture_receipt_path"]
+                or capture_profiling_payload["profiling_capture_receipt_path"]
+            )
+            profiling_payload["profiling_capture_status"] = (
+                profiling_payload["profiling_capture_status"]
+                or capture_profiling_payload["profiling_capture_status"]
+            )
     steps_completed = (
         int(training.get("steps_completed"))
         if isinstance(training, dict) and training.get("steps_completed") is not None
         else None
+    )
+    executed_command = (
+        tuple(str(part) for part in process.args) if process.args else cell.command
     )
     return CellResult(
         case_id=cell.case_id,
@@ -835,7 +1054,7 @@ def extract_result(
         optimizer=cell.optimizer,
         path=cell.path,
         status=status,
-        command=command_string(cell.command),
+        command=command_string(executed_command),
         cppmega_sha=identity["cppmega_sha"],
         tilelang_sha=identity["tilelang_sha"],
         mlx_sha=identity["mlx_sha"],
@@ -876,6 +1095,12 @@ def extract_result(
         cache_memory_gb=(
             cache_bytes / (1024**3) if cache_bytes is not None else None
         ),
+        profiling_trace_path=profiling_payload["profiling_trace_path"],
+        profiling_trace_captured=profiling_payload["profiling_trace_captured"],
+        profiling_capture_receipt_path=profiling_payload[
+            "profiling_capture_receipt_path"
+        ],
+        profiling_capture_status=profiling_payload["profiling_capture_status"],
         selected_schedule=selected_schedule_from_receipt(receipt),
         proof_result=proof_result_from_receipt(receipt, path=cell.path),
         pass_fail_reason=reason,
@@ -906,26 +1131,53 @@ def run_cell(cell: MatrixCell, *, args: argparse.Namespace, identity: dict[str, 
         env["TILELANG_TMP_DIR"] = str(cell.cache_dir / "tmp")
         env.pop("TILELANG_DISABLE_CACHE", None)
     cell.output_json.parent.mkdir(parents=True, exist_ok=True)
+    profile_trace_path: Path | None = None
+    profile_capture_receipt_path: Path | None = None
+    command = list(cell.command)
+    completed_receipt_exit_grace_s = float(args.completed_receipt_exit_grace_s)
+    if bool(args.capture_profiles):
+        profile_trace_path, profile_capture_receipt_path = profile_capture_paths(
+            cell,
+            args,
+        )
+        profile_trace_path.parent.mkdir(parents=True, exist_ok=True)
+        profile_capture_receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        command = list(
+            profile_capture_command(
+                cell.command,
+                trace_path=profile_trace_path,
+                timeout_s=float(args.profile_capture_timeout_s),
+            )
+        )
+        completed_receipt_exit_grace_s = 0.0
     start = time.perf_counter()
     process, completed_after_ok_receipt = run_cell_process(
-        list(cell.command),
+        command,
         cwd=ROOT,
         env=env,
         output_json=cell.output_json,
-        completed_receipt_exit_grace_s=float(args.completed_receipt_exit_grace_s),
+        completed_receipt_exit_grace_s=completed_receipt_exit_grace_s,
     )
     duration = time.perf_counter() - start
+    profile_capture_receipt: dict[str, Any] | None = None
+    if profile_trace_path is not None and profile_capture_receipt_path is not None:
+        profile_capture_receipt = profile_capture_receipt_from_process(
+            process,
+            trace_path=profile_trace_path,
+            capture_receipt_path=profile_capture_receipt_path,
+        )
     if completed_after_ok_receipt:
         cache_state["terminated_after_ok_receipt"] = True
-        cache_state["completed_receipt_exit_grace_s"] = float(
-            args.completed_receipt_exit_grace_s
-        )
+        cache_state["completed_receipt_exit_grace_s"] = completed_receipt_exit_grace_s
     return extract_result(
         cell=cell,
         identity=identity,
         cache_state=cache_state,
         process=process,
         duration_s=duration,
+        profile_trace_path=profile_trace_path,
+        profile_capture_receipt_path=profile_capture_receipt_path,
+        profile_capture_receipt=profile_capture_receipt,
     )
 
 
@@ -1028,13 +1280,13 @@ def write_markdown(path: Path, *, results: list[CellResult], identity: dict[str,
         f"- MLX SHA: `{identity['mlx_sha']}`",
         f"- MLX version: `{identity['mlx_version']}`",
         "",
-        "| dtype | optimizer | path | status | tok/s | step/s | compile s | peak GB | cache hit | reason |",
-        "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | --- | --- |",
+        "| dtype | optimizer | path | status | tok/s | step/s | compile s | peak GB | cache hit | profile trace | reason |",
+        "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | --- | --- | --- |",
     ]
     for result in results:
         step_per_second = (1.0 / result.step_sec) if result.step_sec else None
         lines.append(
-            "| {dtype} | {optimizer} | {path} | {status} | {tok} | {step} | {compile} | {peak} | {cache} | {reason} |".format(
+            "| {dtype} | {optimizer} | {path} | {status} | {tok} | {step} | {compile} | {peak} | {cache} | {trace} | {reason} |".format(
                 dtype=result.dtype,
                 optimizer=result.optimizer,
                 path=result.path,
@@ -1044,6 +1296,9 @@ def write_markdown(path: Path, *, results: list[CellResult], identity: dict[str,
                 compile=_fmt(result.compile_time_s),
                 peak=_fmt(result.peak_memory_gb),
                 cache=_fmt(result.cache_state.get("cache_hit")),
+                trace=(
+                    _short_text(result.profiling_trace_path, 500) or ""
+                ).replace("|", "/"),
                 reason=(_short_text(result.pass_fail_reason, 500) or "").replace("|", "/"),
             )
         )

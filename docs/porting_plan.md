@@ -242,6 +242,7 @@ The current collected test files are:
 - tests/test_parquet_dataset.py
 - tests/test_path_c_fusion_compile_receipt_script.py
 - tests/test_path_c_fusion_ir.py
+- tests/test_path_c_fusion_matrix_profile_receipt_script.py
 - tests/test_path_c_fusion_templates.py
 - tests/test_path_c_physical_abi.py
 - tests/test_plasticity.py
@@ -284,6 +285,7 @@ The current collected test files are:
 - tests/test_token_dataset.py
 - tests/test_tokenizer_contract.py
 - tests/test_tokenizer_loader.py
+- tests/test_torch_compile_tilelang_backend.py
 - tests/test_train_hybrid_tiny_script.py
 - tests/test_train_tiny_npz_script.py
 - tests/test_training_exports.py

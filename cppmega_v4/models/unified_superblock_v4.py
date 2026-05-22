@@ -413,7 +413,7 @@ def _build_attention(hidden_size: int, params: dict) -> nn.Module:
             # Zero-init out so the block is identity at init.
             self.o_proj.weight = mx.zeros_like(self.o_proj.weight)
 
-        def __call__(self, x):
+        def __call__(self, x, mask=None):
             if self.pre_norm is not None:
                 x = self.pre_norm(x)
             B, S, _ = x.shape
@@ -425,9 +425,36 @@ def _build_attention(hidden_size: int, params: dict) -> nn.Module:
             v = mx.transpose(v, (0, 2, 1, 3))
             scale = head_dim ** -0.5
             scores = mx.matmul(q, mx.transpose(k, (0, 1, 3, 2))) * scale
-            mask = mx.tril(mx.ones((S, S), dtype=mx.bool_))
-            scores = mx.where(mask, scores, mx.full(scores.shape, -1e9,
-                                                     dtype=scores.dtype))
+            causal_mask = mx.tril(mx.ones((S, S), dtype=mx.bool_))
+            if mask is None:
+                scores = mx.where(
+                    causal_mask,
+                    scores,
+                    mx.full(scores.shape, -1e9, dtype=scores.dtype),
+                )
+            elif mask.dtype == mx.bool_:
+                if len(mask.shape) == 2:
+                    mask = mask[None, None, :, :]
+                elif len(mask.shape) == 3:
+                    mask = mask[:, None, :, :]
+                allowed = mask & causal_mask[None, None, :, :]
+                scores = mx.where(
+                    allowed,
+                    scores,
+                    mx.full(scores.shape, -1e9, dtype=scores.dtype),
+                )
+            else:
+                causal_bias = mx.where(
+                    causal_mask,
+                    mx.zeros((S, S), dtype=scores.dtype),
+                    mx.full((S, S), -1e9, dtype=scores.dtype),
+                )
+                scores = scores + causal_bias
+                if len(mask.shape) == 2:
+                    mask = mask[None, None, :, :]
+                elif len(mask.shape) == 3:
+                    mask = mask[:, None, :, :]
+                scores = scores + mask.astype(scores.dtype)
             w = mx.softmax(scores.astype(mx.float32), axis=-1).astype(scores.dtype)
             o = mx.matmul(w, v)
             o = mx.transpose(o, (0, 2, 1, 3)).reshape(B, S, num_heads * head_dim)

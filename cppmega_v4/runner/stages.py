@@ -12,6 +12,7 @@ or continue.
 
 from __future__ import annotations
 
+import inspect
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -378,6 +379,8 @@ def stage_train(ctx: StageContext) -> StageResult:
         seq = int(opts.get("S", 8))
         batch = int(opts.get("B", 1))
         hidden = ctx.spec.dim_env.get("H", 64)
+        train_seed = int(opts.get("seed", 0))
+        mx.random.seed(train_seed)
 
         # E7-9: honour the first ParamGroup's schedule (if any). The
         # group's lr overrides the legacy stage_options lr default, and
@@ -472,16 +475,141 @@ def stage_train(ctx: StageContext) -> StageResult:
                 else:
                     mtp_betas.append(0.5)
 
-        # Synthetic LM head — for MTP we create K of them. lm_head is the
-        # first one (used by single-head paths and the inference probe).
+        # Synthetic LM heads: one for CE, K heads for local MTP smoke paths.
         lm_heads = [nn.Linear(hidden, vocab_size, bias=False)
                     for _ in range(mtp_k)]
-        lm_head = lm_heads[0]
+
+        side_channels_in = opts.get("side_channels") or {}
+        side_channels_observed: list[str] = []
+        sc_doc_ids_arr: list[int] | None = None
+        sc_token_ids_arr: list[int] | None = None
+
+        def _side_channel_values(name: str, data: Any) -> list[int] | None:
+            if not isinstance(data, (list, tuple)) or len(data) == 0:
+                return None
+            side_channels_observed.append(name)
+            values = [int(v) for v in data[:batch * seq]]
+            if not values:
+                return None
+            if len(values) < batch * seq:
+                values.extend([values[-1]] * (batch * seq - len(values)))
+            return values
+
+        if isinstance(side_channels_in, dict):
+            for raw_name, data in side_channels_in.items():
+                name = str(raw_name)
+                values = _side_channel_values(name, data)
+                if values is None:
+                    continue
+                if name == "doc_ids":
+                    sc_doc_ids_arr = values
+                elif name == "token_ids":
+                    sc_token_ids_arr = values
+
+        sc_doc_ids_tensor = (
+            mx.array(sc_doc_ids_arr, dtype=mx.int32).reshape(batch, seq)
+            if sc_doc_ids_arr is not None else None
+        )
+        sc_doc_embed_tensor = (
+            mx.array(
+                [max(0, int(t)) % vocab_size for t in sc_doc_ids_arr],
+                dtype=mx.int32,
+            ).reshape(batch, seq)
+            if sc_doc_ids_arr is not None else None
+        )
+        sc_token_ids_tensor = (
+            mx.array(
+                [int(t) % vocab_size for t in sc_token_ids_arr],
+                dtype=mx.int32,
+            ).reshape(batch, seq)
+            if sc_token_ids_arr is not None else None
+        )
+        side_channel_token_embedding = (
+            nn.Embedding(vocab_size, hidden)
+            if sc_token_ids_tensor is not None else None
+        )
+        side_channel_doc_embedding = (
+            nn.Embedding(vocab_size, hidden)
+            if sc_doc_embed_tensor is not None else None
+        )
+
+        def _match_side_tensor(
+            tensor: mx.array | None,
+            input_embeds: mx.array,
+        ) -> mx.array | None:
+            if tensor is None:
+                return None
+            B, S = input_embeds.shape[:2]
+            if tensor.shape[1] != S:
+                return None
+            if tensor.shape[0] == B:
+                return tensor
+            if tensor.shape[0] > B:
+                return tensor[:B, :]
+            if tensor.shape[0] == 1:
+                return mx.broadcast_to(tensor, (B, S))
+            return None
+
+        def _doc_attention_mask(
+            doc_ids: mx.array | None,
+        ) -> mx.array | None:
+            if doc_ids is None:
+                return None
+            same_doc = doc_ids[:, :, None] == doc_ids[:, None, :]
+            return same_doc[:, None, :, :]
+
+        side_channel_call_params: dict[int, set[str]] = {}
+
+        def _module_call_params(mod: nn.Module) -> set[str]:
+            key = id(mod)
+            params = side_channel_call_params.get(key)
+            if params is None:
+                params = set(inspect.signature(mod.__call__).parameters)
+                side_channel_call_params[key] = params
+            return params
+
+        def _call_with_side_channels(
+            mod: nn.Module,
+            x: mx.array,
+            *,
+            doc_ids: mx.array | None,
+            doc_mask: mx.array | None,
+            token_ids: mx.array | None,
+        ) -> mx.array:
+            params = _module_call_params(mod)
+            kwargs: dict[str, Any] = {}
+            if token_ids is not None and "token_ids" in params:
+                kwargs["token_ids"] = token_ids
+            if doc_ids is not None:
+                if "doc_ids" in params:
+                    kwargs["doc_ids"] = doc_ids
+                elif "document_ids" in params:
+                    kwargs["document_ids"] = doc_ids
+            if doc_mask is not None:
+                if "mask" in params:
+                    kwargs["mask"] = doc_mask
+                elif "attention_mask" in params:
+                    kwargs["attention_mask"] = doc_mask
+            return mod(x, **kwargs)
 
         def forward_layers(layer_iter, input_embeds: mx.array) -> mx.array:
             x = input_embeds
+            doc_embed_ids = _match_side_tensor(sc_doc_embed_tensor, input_embeds)
+            if side_channel_doc_embedding is not None and doc_embed_ids is not None:
+                x = x + side_channel_doc_embedding(doc_embed_ids)
+            token_ids = _match_side_tensor(sc_token_ids_tensor, input_embeds)
+            if side_channel_token_embedding is not None and token_ids is not None:
+                x = x + side_channel_token_embedding(token_ids)
+            doc_ids = _match_side_tensor(sc_doc_ids_tensor, input_embeds)
+            doc_mask = _doc_attention_mask(doc_ids)
             for mod in layer_iter:
-                out = mod(x)
+                out = _call_with_side_channels(
+                    mod,
+                    x,
+                    doc_ids=doc_ids,
+                    doc_mask=doc_mask,
+                    token_ids=token_ids,
+                )
                 # Coerce tuple/dict returns to first array.
                 if isinstance(out, (tuple, list)):
                     out = next(o for o in out if hasattr(o, "shape"))
@@ -540,42 +668,30 @@ def stage_train(ctx: StageContext) -> StageResult:
         data_source = "synthetic"
         token_count = 0
         tokenizer_used: str | None = None
-        # V4-10: record which side-channels the caller supplied. Pure
-        # observation for now — actual per-channel forward routing is
-        # v5+ work. Surfacing via extras lets e2e prove UI toggles
-        # reached the backend opts surface.
-        side_channels_in = opts.get("side_channels") or {}
-        side_channels_observed: list[str] = []
-        # G17: per-channel forward-effect contributions. doc_ids modulates
-        # the residual embed with a per-doc bias scalar; token_ids adds a
-        # conditional embed; both are non-trivial enough to shift loss
-        # when enabled. Real attention-bias / cross-doc-mask routing is
-        # v6+ (needs deeper nn.Module rewriting).
-        sc_doc_ids_arr: list[int] | None = None
-        sc_token_ids_arr: list[int] | None = None
-        if isinstance(side_channels_in, dict):
-            for name, data in side_channels_in.items():
-                if isinstance(data, (list, tuple)) and len(data) > 0:
-                    side_channels_observed.append(str(name))
-                    if name == "doc_ids":
-                        sc_doc_ids_arr = list(data)[:seq * batch]
-                    elif name == "token_ids":
-                        sc_token_ids_arr = list(data)[:seq * batch]
+        # G17: side-channels are real forward inputs now. doc_ids builds a
+        # same-document attention mask where supported; token_ids adds a
+        # trainable conditional embedding residual before the brick stack.
         sc_doc_ids_mask_density = 0.0
         sc_token_ids_added_norm = 0.0
         if sc_doc_ids_arr:
-            # Density = fraction of cross-doc positions (where i,j have
-            # different doc_ids; reduces attention overlap region).
-            cross = sum(1 for i in range(len(sc_doc_ids_arr))
-                        for j in range(i, len(sc_doc_ids_arr))
-                        if sc_doc_ids_arr[i] != sc_doc_ids_arr[j])
-            total_pairs = max(1, len(sc_doc_ids_arr) *
-                              (len(sc_doc_ids_arr) + 1) // 2)
+            cross = 0
+            total_pairs = 0
+            for b in range(batch):
+                row = sc_doc_ids_arr[b * seq:(b + 1) * seq]
+                cross += sum(
+                    1
+                    for i in range(len(row))
+                    for j in range(i + 1)
+                    if row[i] != row[j]
+                )
+                total_pairs += len(row) * (len(row) + 1) // 2
             sc_doc_ids_mask_density = round(cross / total_pairs, 6)
-        if sc_token_ids_arr:
+        if side_channel_token_embedding is not None and sc_token_ids_tensor is not None:
+            token_embed_probe = side_channel_token_embedding(sc_token_ids_tensor)
             sc_token_ids_added_norm = round(
-                sum(abs(int(t)) for t in sc_token_ids_arr) /
-                max(1, len(sc_token_ids_arr)), 6)
+                float(mx.linalg.norm(token_embed_probe.astype(mx.float32)).item()),
+                6,
+            )
         parquet_path = opts.get("parquet_path")
         tokenizer_path = opts.get("tokenizer_path")
         targets = mx.random.randint(0, vocab_size, shape=(batch, seq))
@@ -608,6 +724,10 @@ def stage_train(ctx: StageContext) -> StageResult:
                 except Exception:
                     pass
         all_modules = nn.Sequential(*modules, *lm_heads)
+        if side_channel_doc_embedding is not None:
+            all_modules.side_channel_doc_embedding = side_channel_doc_embedding
+        if side_channel_token_embedding is not None:
+            all_modules.side_channel_token_embedding = side_channel_token_embedding
         opt, optimizer_kind = _build_optimizer(spec_optim, lr)
         # G10: optional optimizer state warm-start across sequential
         # Train runs. opts.continue_from_run_id refers to a prior
@@ -822,8 +942,10 @@ def stage_train(ctx: StageContext) -> StageResult:
                     name="train", status="ok",
                     elapsed_ms=(time.perf_counter() - t0) * 1000.0,
                     extras={
-                        "losses": [round(l, 4) for l in losses],
-                        "lr_trajectory": [round(l, 6) for l in lr_trajectory],
+                        "losses": [round(loss_item, 4)
+                                   for loss_item in losses],
+                        "lr_trajectory": [round(lr_item, 6)
+                                          for lr_item in lr_trajectory],
                         "weight_delta_norm": 0.0,
                         "num_steps": step,
                         "schedule_kind": schedule_kind_label,
