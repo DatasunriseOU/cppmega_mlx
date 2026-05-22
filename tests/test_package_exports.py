@@ -113,6 +113,7 @@ def test_package_roots_expose_local_mlx_contracts() -> None:
     assert {
         "GenerationChunk",
         "generate_tokens",
+        "generate_tokens_mtp_self_speculative",
         "generate_tokens_speculative",
         "sample_next_token",
         "stream_generate_tokens",

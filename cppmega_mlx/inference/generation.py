@@ -247,6 +247,104 @@ def generate_tokens_speculative(
     return tokens
 
 
+def generate_tokens_mtp_self_speculative(
+    model: Any,
+    prompt_ids: mx.array,
+    *,
+    max_new_tokens: int,
+    draft_window: int | None = None,
+    model_kwargs: Mapping[str, mx.array] | None = None,
+    eos_token_id: int | None = None,
+    temperature: float = 1.0,
+    rng_key: Any | None = None,
+) -> mx.array:
+    """Generate with a model-owned MTP head as the speculative drafter.
+
+    This is the scoped FastMTP-aligned Stream I path: the same model computes
+    the last verified hidden state, its attached ``mtp_head`` drafts a bounded
+    token window, and the model verifies the candidate prefix with one normal
+    target forward. It is deliberately eager batch=1 and no-KV.
+    """
+
+    if len(prompt_ids.shape) != 2:
+        raise ValueError("prompt_ids must have shape (batch, sequence)")
+    if int(prompt_ids.shape[0]) != 1:
+        raise ValueError("MTP self-speculative generation currently supports batch=1")
+    if int(prompt_ids.shape[1]) <= 0:
+        raise ValueError("prompt_ids must contain at least one token")
+    if max_new_tokens < 0:
+        raise ValueError("max_new_tokens must be non-negative")
+    if max_new_tokens == 0:
+        return prompt_ids
+
+    mtp_head = _resolve_mtp_draft_head(model)
+    trained_depth = _mtp_head_trained_depth(mtp_head)
+    window_limit = trained_depth if draft_window is None else draft_window
+    if window_limit <= 0:
+        raise ValueError("draft_window must be positive")
+    if window_limit > trained_depth:
+        raise ValueError("draft_window must not exceed model.mtp_head.config.depth")
+
+    max_seq_length = _model_max_seq_length(model)
+    _validate_prefix_fits_max_length(prompt_ids, max_seq_length)
+
+    tokens = prompt_ids
+    generated = 0
+    key = rng_key
+    while generated < max_new_tokens:
+        remaining = max_new_tokens - generated
+        append_limit = remaining
+        window = min(window_limit, remaining)
+        target_slots = _available_generation_slots(tokens, max_seq_length)
+        if target_slots is not None:
+            window = min(window, target_slots)
+            append_limit = min(append_limit, target_slots)
+
+        draft_tokens, draft_logits, key = _propose_mtp_self_speculative_window(
+            model,
+            mtp_head,
+            tokens,
+            draft_window=window,
+            model_kwargs=model_kwargs,
+            eos_token_id=eos_token_id,
+            temperature=temperature,
+            rng_key=key,
+        )
+        candidate = mx.concatenate([tokens, draft_tokens[None, :].astype(tokens.dtype)], axis=1)
+        _validate_prefix_fits_max_length(candidate, max_seq_length)
+
+        target_logits = _standard_generation_logits(
+            model(
+                candidate,
+                **_model_kwargs_for_prefix(model_kwargs, candidate),
+            ),
+            candidate,
+        )
+        start = int(tokens.shape[1]) - 1
+        verifier_logits = target_logits[0, start : start + int(draft_tokens.shape[0]) + 1, :]
+
+        key, acceptance_key = _split_generation_key(key)
+        accepted, _n_accepted, next_token = speculative_acceptance(
+            draft_logits,
+            verifier_logits,
+            draft_tokens,
+            temperature=temperature,
+            rng_key=acceptance_key,
+        )
+        append_tokens, found_eos = _speculative_append_tokens(
+            accepted,
+            next_token,
+            remaining=append_limit,
+            eos_token_id=eos_token_id,
+        )
+        tokens = mx.concatenate([tokens, append_tokens[None, :].astype(tokens.dtype)], axis=1)
+        generated += int(append_tokens.shape[0])
+        if found_eos:
+            break
+
+    return tokens
+
+
 def generate_tokens_with_kv_cache(
     model: Any,
     prompt_ids: mx.array,
@@ -872,6 +970,147 @@ def _speculative_append_tokens(
         if int(proposed[idx].item()) == eos_token_id:
             return proposed[: idx + 1], True
     return proposed, False
+
+
+def _resolve_mtp_draft_head(model: Any) -> Any:
+    mtp_head = getattr(model, "mtp_head", None)
+    if mtp_head is None:
+        raise ValueError("model.mtp_head is required for MTP self-speculative generation")
+    if not callable(getattr(model, "decoder_hidden_states", None)):
+        raise TypeError("MTP self-speculative generation requires model.decoder_hidden_states")
+    return mtp_head
+
+
+def _mtp_head_trained_depth(mtp_head: Any) -> int:
+    config = getattr(mtp_head, "config", None)
+    depth = getattr(config, "depth", None)
+    if depth is None:
+        raise ValueError("model.mtp_head.config.depth is required")
+    depth_int = int(depth)
+    if depth_int <= 0:
+        raise ValueError("model.mtp_head.config.depth must be positive")
+    return depth_int
+
+
+def _propose_mtp_self_speculative_window(
+    model: Any,
+    mtp_head: Any,
+    tokens: mx.array,
+    *,
+    draft_window: int,
+    model_kwargs: Mapping[str, mx.array] | None,
+    eos_token_id: int | None,
+    temperature: float,
+    rng_key: Any | None,
+) -> tuple[mx.array, mx.array, Any | None]:
+    hidden_states = model.decoder_hidden_states(
+        tokens,
+        **_model_kwargs_for_prefix(model_kwargs, tokens),
+    )
+    if not isinstance(hidden_states, mx.array) or hidden_states.ndim != 3:
+        raise TypeError("model.decoder_hidden_states must return (batch, sequence, hidden)")
+    if hidden_states.shape[:2] != tokens.shape:
+        raise ValueError("decoder hidden states prefix shape must match tokens")
+
+    last_hidden = hidden_states[:, -1:, :]
+    last_token_ids = tokens[:, -1:]
+    draft_method = getattr(mtp_head, "draft", None)
+    if callable(draft_method):
+        draft_callable = cast(
+            Callable[..., tuple[mx.array, mx.array, Any | None]],
+            draft_method,
+        )
+        draft_rows, draft_logit_rows, key = draft_callable(
+            last_hidden,
+            last_token_ids,
+            num_draft_tokens=draft_window,
+            temperature=temperature,
+            rng_key=rng_key,
+        )
+    else:
+        draft_rows, draft_logit_rows, key = _draft_with_minimal_mtp_head(
+            mtp_head,
+            last_hidden,
+            last_token_ids,
+            num_draft_tokens=draft_window,
+            temperature=temperature,
+            rng_key=rng_key,
+        )
+    _validate_mtp_draft_rows(draft_rows, draft_logit_rows, draft_window=draft_window)
+
+    draft_tokens = draft_rows[0].astype(tokens.dtype)
+    draft_logits = draft_logit_rows[0]
+    if eos_token_id is not None:
+        for idx in range(int(draft_tokens.shape[0])):
+            if int(draft_tokens[idx].item()) == eos_token_id:
+                return draft_tokens[: idx + 1], draft_logits[: idx + 1], key
+    return draft_tokens, draft_logits, key
+
+
+def _draft_with_minimal_mtp_head(
+    mtp_head: Any,
+    last_hidden: mx.array,
+    last_token_ids: mx.array,
+    *,
+    num_draft_tokens: int,
+    temperature: float,
+    rng_key: Any | None,
+) -> tuple[mx.array, mx.array, Any | None]:
+    required = (
+        "token_embedding",
+        "hidden_norm",
+        "embedding_norm",
+        "proj",
+        "shared_block",
+        "output_norm",
+        "lm_head",
+    )
+    missing = [name for name in required if not callable(getattr(mtp_head, name, None))]
+    if missing:
+        raise TypeError(f"model.mtp_head is missing draft components: {', '.join(missing)}")
+
+    h = last_hidden
+    token_ids = last_token_ids
+    draft_tokens: list[mx.array] = []
+    draft_logits: list[mx.array] = []
+    key = rng_key
+    for _ in range(num_draft_tokens):
+        token_emb = mtp_head.token_embedding(token_ids)
+        h_mtp = mtp_head.proj(
+            mx.concatenate(
+                [mtp_head.hidden_norm(h), mtp_head.embedding_norm(token_emb)],
+                axis=-1,
+            )
+        )
+        h = mtp_head.output_norm(mtp_head.shared_block(h_mtp))
+        step_logits = mtp_head.lm_head(h)[:, -1, :]
+        key, step_key = _split_generation_key(key)
+        next_token = sample_next_token(
+            step_logits,
+            temperature=temperature,
+            rng_key=step_key,
+        ).astype(last_token_ids.dtype)
+        draft_logits.append(step_logits)
+        draft_tokens.append(next_token)
+        token_ids = next_token
+
+    return mx.concatenate(draft_tokens, axis=1), mx.stack(draft_logits, axis=1), key
+
+
+def _validate_mtp_draft_rows(
+    draft_tokens: mx.array,
+    draft_logits: mx.array,
+    *,
+    draft_window: int,
+) -> None:
+    if not isinstance(draft_tokens, mx.array):
+        raise TypeError("MTP draft tokens must be an mlx.core.array")
+    if not isinstance(draft_logits, mx.array):
+        raise TypeError("MTP draft logits must be an mlx.core.array")
+    if draft_tokens.shape != (1, draft_window):
+        raise ValueError("MTP draft tokens must have shape (1, draft_window)")
+    if len(draft_logits.shape) != 3 or draft_logits.shape[:2] != (1, draft_window):
+        raise ValueError("MTP draft logits must have shape (1, draft_window, vocab)")
 
 
 def _validate_prefix_fits_max_length(tokens: mx.array, max_seq_length: int | None) -> None:

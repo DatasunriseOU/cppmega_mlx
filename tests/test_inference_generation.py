@@ -14,6 +14,7 @@ from cppmega_mlx.inference import (
     PromptCacheEntry,
     build_prompt_cache,
     generate_tokens,
+    generate_tokens_mtp_self_speculative,
     generate_tokens_speculative,
     generate_tokens_with_kv_cache,
     generate_tokens_with_prompt_cache,
@@ -94,6 +95,65 @@ class _PerPositionLogitsModel:
             table_pos = min(position, len(self.next_ids_by_position) - 1)
             logits[0, position, self.next_ids_by_position[table_pos]] = 1000.0
         return mx.array(logits)
+
+
+class _ScriptedMTPDraftHead:
+    def __init__(
+        self,
+        draft_tokens: Sequence[int],
+        *,
+        vocab_size: int = 16,
+        depth: int = 2,
+    ) -> None:
+        self.draft_tokens = tuple(draft_tokens)
+        self.vocab_size = vocab_size
+        self.config = SimpleNamespace(depth=depth)
+        self.calls = 0
+        self.seen_last_hidden_shapes: list[tuple[int, ...]] = []
+        self.seen_last_token_ids: list[np.ndarray] = []
+
+    def draft(
+        self,
+        last_hidden: mx.array,
+        last_token_ids: mx.array,
+        *,
+        num_draft_tokens: int,
+        temperature: float,
+        rng_key: object | None = None,
+    ) -> tuple[mx.array, mx.array, object | None]:
+        del temperature
+        self.calls += 1
+        self.seen_last_hidden_shapes.append(tuple(last_hidden.shape))
+        self.seen_last_token_ids.append(_as_numpy(last_token_ids))
+        tokens = self.draft_tokens[:num_draft_tokens]
+        logits = np.full((1, len(tokens), self.vocab_size), -1000.0, dtype=np.float32)
+        for idx, token_id in enumerate(tokens):
+            logits[0, idx, token_id] = 1000.0
+        return mx.array([tokens], dtype=mx.int32), mx.array(logits), rng_key
+
+
+class _SelfSpecTargetModel(_PerPositionLogitsModel):
+    def __init__(
+        self,
+        next_ids_by_position: Sequence[int],
+        *,
+        mtp_head: object | None,
+        vocab_size: int = 16,
+        max_seq_length: int | None = None,
+    ) -> None:
+        super().__init__(
+            next_ids_by_position,
+            vocab_size=vocab_size,
+            max_seq_length=max_seq_length,
+        )
+        self.mtp_head = mtp_head
+        self.seen_decoder_tokens: list[np.ndarray] = []
+
+    def decoder_hidden_states(self, tokens: mx.array, **model_kwargs: mx.array) -> mx.array:
+        if model_kwargs:
+            raise AssertionError(f"unexpected model kwargs: {sorted(model_kwargs)}")
+        self.seen_decoder_tokens.append(_as_numpy(tokens))
+        return mx.zeros((tokens.shape[0], tokens.shape[1], 8), dtype=mx.float32)
 
 
 class _KwargRecordingScriptedLogitsModel(_ScriptedLogitsModel):
@@ -685,6 +745,122 @@ def test_generate_tokens_speculative_rejects_batch_and_invalid_window() -> None:
 
 def test_generate_tokens_speculative_is_exported_from_package() -> None:
     assert inference.generate_tokens_speculative is generate_tokens_speculative
+
+
+def test_generate_tokens_mtp_self_speculative_accepts_mtp_window_and_target_tail() -> None:
+    mtp_head = _ScriptedMTPDraftHead([4, 5], vocab_size=16, depth=2)
+    model = _SelfSpecTargetModel([0, 4, 5, 6], mtp_head=mtp_head, vocab_size=16)
+    prompt = mx.array([[1, 2]], dtype=mx.int32)
+
+    tokens = generate_tokens_mtp_self_speculative(
+        model,
+        prompt,
+        max_new_tokens=3,
+        draft_window=2,
+        temperature=0.0,
+        rng_key=mx.random.key(23),
+    )
+
+    np.testing.assert_array_equal(
+        _as_numpy(tokens),
+        np.array([[1, 2, 4, 5, 6]], dtype=np.int32),
+    )
+    assert mtp_head.calls == 1
+    assert mtp_head.seen_last_hidden_shapes == [(1, 1, 8)]
+    np.testing.assert_array_equal(
+        mtp_head.seen_last_token_ids[0],
+        np.array([[2]], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(
+        model.seen_decoder_tokens[0],
+        np.array([[1, 2]], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(
+        model.seen_tokens[0],
+        np.array([[1, 2, 4, 5]], dtype=np.int32),
+    )
+
+
+def test_generate_tokens_mtp_self_speculative_rejects_bad_mtp_draft() -> None:
+    mtp_head = _ScriptedMTPDraftHead([4], vocab_size=16, depth=2)
+    model = _SelfSpecTargetModel([0, 7, 8], mtp_head=mtp_head, vocab_size=16)
+    prompt = mx.array([[1, 2]], dtype=mx.int32)
+
+    tokens = generate_tokens_mtp_self_speculative(
+        model,
+        prompt,
+        max_new_tokens=1,
+        draft_window=1,
+        temperature=0.0,
+        rng_key=mx.random.key(29),
+    )
+
+    np.testing.assert_array_equal(
+        _as_numpy(tokens),
+        np.array([[1, 2, 7]], dtype=np.int32),
+    )
+
+
+def test_generate_tokens_mtp_self_speculative_uses_real_minimal_mtp_head() -> None:
+    model = HybridTinyLM(
+        HybridTinyConfig(
+            vocab_size=17,
+            hidden_size=8,
+            pattern="A",
+            depth=1,
+            dsa_a_layer_ranks=(),
+            num_attention_heads=1,
+            max_seq_length=8,
+            mtp_enabled=True,
+            mtp_depth=2,
+        )
+    )
+    prompt = mx.array([[1, 2, 3]], dtype=mx.int32)
+
+    tokens = generate_tokens_mtp_self_speculative(
+        model,
+        prompt,
+        max_new_tokens=1,
+        draft_window=1,
+        temperature=0.0,
+        rng_key=mx.random.key(31),
+    )
+
+    generated = _as_numpy(tokens)
+    assert generated.shape == (1, 4)
+    np.testing.assert_array_equal(generated[:, :3], _as_numpy(prompt))
+    assert 0 <= int(generated[0, 3]) < model.config.vocab_size
+
+
+def test_generate_tokens_mtp_self_speculative_fails_closed_without_mtp_head() -> None:
+    model = _SelfSpecTargetModel([0, 4], mtp_head=None, vocab_size=16)
+
+    with pytest.raises(ValueError, match="mtp_head"):
+        generate_tokens_mtp_self_speculative(
+            model,
+            mx.array([[1, 2]], dtype=mx.int32),
+            max_new_tokens=1,
+        )
+
+
+def test_generate_tokens_mtp_self_speculative_rejects_window_beyond_trained_depth() -> None:
+    mtp_head = _ScriptedMTPDraftHead([4, 5, 6], vocab_size=16, depth=2)
+    model = _SelfSpecTargetModel([0, 4, 5, 6], mtp_head=mtp_head, vocab_size=16)
+
+    with pytest.raises(ValueError, match="draft_window"):
+        generate_tokens_mtp_self_speculative(
+            model,
+            mx.array([[1, 2]], dtype=mx.int32),
+            max_new_tokens=1,
+            draft_window=3,
+        )
+
+
+def test_generate_tokens_mtp_self_speculative_is_exported_from_package() -> None:
+    assert (
+        inference.generate_tokens_mtp_self_speculative
+        is generate_tokens_mtp_self_speculative
+    )
 
 
 def test_generate_tokens_with_kv_cache_prefills_then_decodes_one_token_steps() -> None:
