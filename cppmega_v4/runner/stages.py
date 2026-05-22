@@ -1109,6 +1109,8 @@ def stage_train(ctx: StageContext) -> StageResult:
         checkpoint_loaded: str | None = None
         opt_state_loaded_path: str | None = None
         opt_state_warning: str | None = None
+        ckpt_metadata_loaded: dict | None = None
+        ckpt_metadata_warning: str | None = None
         ckpt_load = opts.get("checkpoint_load_path")
         if ckpt_load:
             try:
@@ -1117,6 +1119,46 @@ def stage_train(ctx: StageContext) -> StageResult:
                 all_modules.update(
                     nn.utils.tree_unflatten(list(loaded.items())))
                 checkpoint_loaded = str(ckpt_load)
+            except Exception:
+                pass
+            # V7-C03: read self-describing metadata and validate
+            # arch.config_hash against the live spec. Mismatch is a
+            # warning (not a hard block) unless opts.ckpt_strict.
+            try:
+                ckpt_metadata_loaded = read_ckpt_metadata(ckpt_load)
+                if ckpt_metadata_loaded is not None:
+                    live_meta = _build_ckpt_metadata(
+                        ctx=ctx, optimizer_kind=optimizer_kind,
+                        n_steps=n_steps, lr=lr,
+                    )
+                    import json as _json
+                    saved_arch = ckpt_metadata_loaded.get("arch", {})
+                    saved_hash = (saved_arch.get("config_hash")
+                                  if isinstance(saved_arch, dict)
+                                  else None)
+                    live_arch_hash = _json.loads(
+                        live_meta["arch"])["config_hash"]
+                    if saved_hash and saved_hash != live_arch_hash:
+                        ckpt_metadata_warning = (
+                            f"arch.config_hash mismatch: "
+                            f"saved={saved_hash[:12]} "
+                            f"live={live_arch_hash[:12]}"
+                        )
+                        if opts.get("ckpt_strict"):
+                            # Roll back the weight load — fresh weights.
+                            checkpoint_loaded = None
+                    saved_opt = ckpt_metadata_loaded.get("opt", {})
+                    saved_opt_kind = (saved_opt.get("kind")
+                                      if isinstance(saved_opt, dict)
+                                      else None)
+                    if (saved_opt_kind
+                            and saved_opt_kind != optimizer_kind):
+                        ckpt_metadata_warning = (
+                            (ckpt_metadata_warning + " | ")
+                            if ckpt_metadata_warning else "") + (
+                            f"opt.kind mismatch: "
+                            f"saved={saved_opt_kind} "
+                            f"live={optimizer_kind}")
             except Exception:
                 pass
         # H19: optional opt.state load alongside the checkpoint so a
@@ -1343,14 +1385,20 @@ def stage_train(ctx: StageContext) -> StageResult:
             pass
 
         # G12: optional checkpoint save after training.
+        # V7-C03: write self-describing metadata to the safetensors
+        # header so a loader can validate arch hash + opt kind.
         checkpoint_saved: str | None = None
         opt_state_saved_path: str | None = None
         ckpt_save = opts.get("checkpoint_save_path")
+        ckpt_metadata = _build_ckpt_metadata(
+            ctx=ctx, optimizer_kind=optimizer_kind,
+            n_steps=n_steps, lr=lr,
+        )
         if ckpt_save:
             try:
                 import safetensors.mlx as _stmlx
                 flat = dict(nn.utils.tree_flatten(all_modules.parameters()))
-                _stmlx.save_file(flat, ckpt_save)
+                _stmlx.save_file(flat, ckpt_save, metadata=ckpt_metadata)
                 checkpoint_saved = str(ckpt_save)
             except Exception:
                 pass
@@ -1370,7 +1418,8 @@ def stage_train(ctx: StageContext) -> StageResult:
                 }
                 if hasattr(rng_key, "shape"):
                     opt_arrays["_rng_key"] = rng_key
-                _stmlx.save_file(opt_arrays, opt_state_save)
+                _stmlx.save_file(opt_arrays, opt_state_save,
+                                  metadata=ckpt_metadata)
                 opt_state_saved_path = str(opt_state_save)
             except Exception:
                 pass
@@ -1515,6 +1564,8 @@ def stage_train(ctx: StageContext) -> StageResult:
                     "opt_state_warning": opt_state_warning,
                     "rng_key_loaded": rng_key_loaded,
                     "opt_state_arch_diff": opt_state_arch_diff,
+                    "metadata": ckpt_metadata_loaded,
+                    "metadata_warning": ckpt_metadata_warning,
                 },
                 "mtp": _compute_mtp_extras(
                     all_modules, mtp_k, mtp_betas, vocab_size,
@@ -1675,6 +1726,76 @@ def _apply_spec_rewriters(
         "skipped": skipped,
         "_build_spec": current,
     }
+
+
+CPPMEGA_CKPT_VERSION = "v7-c03"
+
+
+def _build_ckpt_metadata(*, ctx, optimizer_kind: str,
+                          n_steps: int, lr: float) -> dict[str, str]:
+    """V7-C03: produce a self-describing safetensors metadata dict.
+
+    Stored values are str (safetensors-mandated): each top-level
+    key carries a compact JSON-serialised sub-object.
+    """
+    import hashlib
+    import json as _json
+
+    nodes_summary = [
+        {"id": getattr(n, "id", ""),
+         "kind": getattr(n, "kind", ""),
+         "params": dict(getattr(n, "params", {}) or {})}
+        for n in (getattr(ctx.spec.graph, "nodes", []) or [])
+    ]
+    edges_summary = [
+        {"src": getattr(e, "src", ""),
+         "dst": getattr(e, "dst", "")}
+        for e in (getattr(ctx.spec.graph, "edges", []) or [])
+    ]
+    dim_env_obj = ctx.spec.dim_env.model_dump() if hasattr(
+        ctx.spec.dim_env, "model_dump") else dict(
+            getattr(ctx.spec, "dim_env", {}) or {})
+    arch_payload = {
+        "nodes": nodes_summary,
+        "edges": edges_summary,
+        "dim_env": dim_env_obj,
+    }
+    arch_hash = hashlib.sha256(
+        _json.dumps(arch_payload, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    return {
+        "cppmega_version": CPPMEGA_CKPT_VERSION,
+        "arch": _json.dumps({
+            "config_hash": arch_hash,
+            "config_json": arch_payload,
+        }, sort_keys=True),
+        "train": _json.dumps({
+            "global_step": int(n_steps),
+        }, sort_keys=True),
+        "opt": _json.dumps({
+            "kind": str(optimizer_kind),
+            "lr": float(lr),
+        }, sort_keys=True),
+    }
+
+
+def read_ckpt_metadata(path: str) -> dict | None:
+    """V7-C03 reader. Parses each top-level JSON sub-object back into
+    a dict. Returns None when the file has no metadata."""
+    import json as _json
+    try:
+        from safetensors import safe_open
+        with safe_open(path, framework="mlx") as f:
+            raw = f.metadata() or {}
+    except Exception:
+        return None
+    out: dict = {}
+    for k, v in raw.items():
+        try:
+            out[k] = _json.loads(v) if v and v[0] in "{[" else v
+        except Exception:
+            out[k] = v
+    return out or None
 
 
 def _ema_smooth(values: list[float], window: int = 10) -> list[float]:
