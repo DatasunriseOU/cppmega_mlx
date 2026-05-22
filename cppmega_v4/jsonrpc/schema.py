@@ -663,13 +663,30 @@ class PipelineRunParams(BaseModel):
     pipeline: PipelinePayload
 
 
+class PipelineAbortParams(BaseModel):
+    """Request cancellation of an in-flight pipeline train stage."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str = Field(min_length=1)
+
+
+class PipelineAbortResult(BaseModel):
+    """Acknowledgement that the train abort token has been set."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["abort_requested"] = "abort_requested"
+    run_id: str
+
+
 class StageResult(BaseModel):
     """One stage execution result."""
 
     model_config = ConfigDict(extra="allow")
 
     name: str
-    status: Literal["ok", "skipped", "fail"]
+    status: Literal["ok", "skipped", "fail", "cancelled"]
     elapsed_ms: float
     warnings: int = 0
     errors: int = 0
@@ -682,7 +699,7 @@ class PipelineRunResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     stages: list[StageResult]
-    overall_status: Literal["ok", "fail"]
+    overall_status: Literal["ok", "fail", "cancelled"]
     total_elapsed_ms: float
 
 
@@ -707,6 +724,7 @@ EVENT_TAXONOMY: frozenset[str] = frozenset({
     "backend.status",
     "probe.run",
     "pipeline.run",
+    "pipeline.abort",
 })
 
 
@@ -717,6 +735,7 @@ METHOD_REGISTRY: frozenset[str] = frozenset({
     "build_preset_specs",
     "probe.run",
     "pipeline.run",
+    "pipeline.abort",
     "backend.status",
     "tokenizer.encode_visualize",
     "tokenizer.list_presets",

@@ -8,6 +8,7 @@ from cppmega_v4.jsonrpc import (
     LRUCache,
     dispatch,
 )
+from cppmega_v4.runner.stages import clear_abort
 
 
 _GRAPH = {
@@ -105,3 +106,41 @@ def test_dispatch_pipeline_run_round_trip():
     assert resp.error is None
     assert resp.result["overall_status"] == "ok"
     assert len(resp.result["stages"]) == 2
+
+
+def test_dispatch_pipeline_abort_requests_stage_abort():
+    run_id = "dispatcher-abort-1"
+    clear_abort(run_id)
+    try:
+        resp = dispatch({
+            "jsonrpc": "2.0", "id": "abort", "method": "pipeline.abort",
+            "params": {"run_id": run_id},
+        })
+        assert resp.error is None
+        assert resp.result == {
+            "status": "abort_requested",
+            "run_id": run_id,
+        }
+
+        envelope = {
+            "jsonrpc": "2.0", "id": "train", "method": "pipeline.run",
+            "params": {
+                "spec": {"graph": _GRAPH, "dim_env": _DIM_ENV,
+                         "loss": _LOSS, "optim": _OPTIM},
+                "pipeline": {
+                    "stages": ["parse", "verify_build_spec", "build_model",
+                               "train"],
+                    "stage_options": {
+                        "train": {"num_steps": 8, "abort_token": run_id},
+                    },
+                },
+            },
+        }
+        run_resp = dispatch(envelope)
+        assert run_resp.error is None
+        assert run_resp.result["overall_status"] == "cancelled"
+        train = run_resp.result["stages"][-1]
+        assert train["status"] == "cancelled"
+        assert train["aborted"] is True
+    finally:
+        clear_abort(run_id)

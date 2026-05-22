@@ -50,6 +50,8 @@ from cppmega_v4.jsonrpc.schema import (
     JsonRpcError,
     JsonRpcRequest,
     JsonRpcResponse,
+    PipelineAbortParams,
+    PipelineAbortResult,
     PipelineRunParams,
     PipelineRunResult,
     ProbeRunParams,
@@ -89,6 +91,10 @@ _ROUTES: Mapping[str, tuple[type[BaseModel], _Handler]] = {
     "pipeline.run": (
         PipelineRunParams,
         lambda p, c: _pipeline_run(p),
+    ),
+    "pipeline.abort": (
+        PipelineAbortParams,
+        lambda p, c: _pipeline_abort(p),
     ),
     "tokenizer.encode_visualize": (
         EncodeVisualizeParams,
@@ -132,6 +138,12 @@ def _pipeline_run(params: PipelineRunParams) -> PipelineRunResult:
     })
     report = run_pipeline(params.spec, pipeline)
     return PipelineRunResult.model_validate(report.to_dict())
+
+
+def _pipeline_abort(params: PipelineAbortParams) -> PipelineAbortResult:
+    from cppmega_v4.runner.stages import request_abort
+    request_abort(params.run_id)
+    return PipelineAbortResult(run_id=params.run_id)
 
 
 def dispatch(

@@ -67,17 +67,16 @@ for (const preset of CONVERGENCE_PRESETS) {
     expect(extras.losses.length).toBe(16);
     expect(extras.losses.every(l => Number.isFinite(l))).toBe(true);
 
-    // G14: strictly stronger than V4-4 — adds a no-blow-up cap that
-    // V4-4 lacked. Real-corpus convergence on a 2-brick synthetic model
-    // at AdamW lr=3e-4 over 16 steps is noisy (the model is too tiny
-    // to fit real tokens well; loss can oscillate within ±30% of
-    // initial). What's REQUIRED: bounded behaviour (no NaN, no
-    // divergence to 1.5×initial). V4-4 had no upper bound — any
-    // single-step monotone-down trick passed.
+    // G14/H03 follow-up: real-token training now feeds stable token
+    // embeddings instead of fresh random embeddings every step. The
+    // tiny batch may legitimately fit hard, so the lower 0.3×initial
+    // floor would reject successful convergence. What's REQUIRED:
+    // bounded behaviour plus a real final loss drop.
     const first = extras.losses[0];
     const secondHalf = extras.losses.slice(8);
     expect(Math.max(...secondHalf)).toBeLessThan(first * 1.5);
-    expect(Math.min(...secondHalf)).toBeGreaterThan(first * 0.3);
+    expect(Math.min(...secondHalf)).toBeGreaterThanOrEqual(0);
+    expect(extras.losses[extras.losses.length - 1]).toBeLessThan(first * 0.3);
 
     // Weights moved meaningfully (V4-4 had 1e-4 — bump to 1e-3 for N=16)
     expect(extras.weight_delta_norm).toBeGreaterThan(1e-3);

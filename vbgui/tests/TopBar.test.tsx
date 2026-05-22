@@ -102,6 +102,23 @@ describe("TopBar", () => {
     expect(onRunPipeline).toHaveBeenCalledWith("smoke");
   });
 
+  it("Cancel button is disabled without an in-flight train run", () => {
+    render(<TopBar {...defaultTopProps()} />);
+    expect(screen.getByTestId("run-pipeline-cancel"))
+      .toHaveProperty("disabled", true);
+  });
+
+  it("Cancel button fires onCancelTrain for an in-flight train run", () => {
+    const onCancelTrain = vi.fn();
+    render(<TopBar {...defaultTopProps({
+      trainInFlight: true,
+      trainRunId: "train-1",
+      onCancelTrain,
+    })} />);
+    fireEvent.click(screen.getByTestId("run-pipeline-cancel"));
+    expect(onCancelTrain).toHaveBeenCalledTimes(1);
+  });
+
   it("toggle reveals Full + Train menu", () => {
     const onRunPipeline = vi.fn();
     render(<TopBar {...defaultTopProps({ onRunPipeline })} />);

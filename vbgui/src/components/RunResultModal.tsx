@@ -4,7 +4,7 @@ import { Fragment, useState } from "react";
 
 export interface StageResult {
   name: string;
-  status: "ok" | "skipped" | "fail";
+  status: "ok" | "skipped" | "fail" | "cancelled";
   elapsed_ms: number;
   warnings?: number;
   errors?: number;
@@ -14,7 +14,7 @@ export interface StageResult {
 
 export interface RunReport {
   stages: StageResult[];
-  overall_status: "ok" | "fail";
+  overall_status: "ok" | "fail" | "cancelled";
   total_elapsed_ms: number;
 }
 
@@ -24,9 +24,9 @@ export interface RunResultModalProps {
   onClose: () => void;
 }
 
-const ICONS = { ok: "✓", fail: "✗", skipped: "·" } as const;
+const ICONS = { ok: "✓", fail: "✗", skipped: "·", cancelled: "!" } as const;
 const COLORS = {
-  ok: "#10b981", fail: "#dc2626", skipped: "#9ca3af",
+  ok: "#10b981", fail: "#dc2626", skipped: "#9ca3af", cancelled: "#f59e0b",
 } as const;
 
 // V3-4: keys excluded from the visible extras dl because they're

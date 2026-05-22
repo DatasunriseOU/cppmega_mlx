@@ -90,7 +90,10 @@ def run_pipeline(spec: VerifyParams, pipeline: Pipeline) -> PipelineReport:
         stage = STAGE_REGISTRY[name]
         result = stage(ctx)
         results.append(result)
-        if result.status == "fail" and not pipeline.continue_on_failure:
+        if (
+            result.status in {"fail", "cancelled"}
+            and not pipeline.continue_on_failure
+        ):
             # Mark every subsequent stage as skipped for visibility.
             for remaining in pipeline.stages[len(results):]:
                 results.append(StageResult(
@@ -100,6 +103,8 @@ def run_pipeline(spec: VerifyParams, pipeline: Pipeline) -> PipelineReport:
     overall = "ok"
     if any(r.status == "fail" for r in results):
         overall = "fail"
+    elif any(r.status == "cancelled" for r in results):
+        overall = "cancelled"
     elapsed = (time.perf_counter() - t0) * 1000.0
     return PipelineReport(
         stages=results, overall_status=overall, total_elapsed_ms=elapsed,

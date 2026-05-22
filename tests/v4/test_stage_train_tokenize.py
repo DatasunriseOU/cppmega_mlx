@@ -100,6 +100,7 @@ def test_stage_train_tokenizes_text_column(tmp_path, trained_tokenizer):
         "tokenizer_path": trained_tokenizer,
     }})
     assert extras["data_source"] == "parquet_tokenized"
+    assert extras["train_input_source"] == "token_embedding"
     assert extras["tokenizer_used"] == "tokenizer.json"
     assert extras["token_count"] >= 8  # batch*seq = 1*8
 
@@ -119,6 +120,7 @@ def test_stage_train_falls_back_to_raw_when_no_text_column(
     }})
     # Tokenizer was supplied but text column absent → V3-2 path wins.
     assert extras["data_source"] == "parquet"
+    assert extras["train_input_source"] == "token_embedding"
     assert extras["tokenizer_used"] is None
     assert extras["token_count"] == 8
 
@@ -134,6 +136,7 @@ def test_stage_train_falls_back_to_synthetic_when_tokenizer_missing(
         "tokenizer_path": "/nonexistent/tok.json",
     }})
     assert extras["data_source"] == "synthetic"
+    assert extras["train_input_source"] == "random"
     assert extras["tokenizer_used"] is None
 
 
@@ -163,4 +166,7 @@ def test_stage_train_clips_token_ids_to_vocab(tmp_path, trained_tokenizer):
     }})
     assert extras["data_source"] == "parquet_tokenized"
     # Loss must stay finite even though tokens were clipped.
-    assert all(l == l and -1e10 < l < 1e10 for l in extras["losses"])
+    assert all(
+        loss_item == loss_item and -1e10 < loss_item < 1e10
+        for loss_item in extras["losses"]
+    )

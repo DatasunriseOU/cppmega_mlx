@@ -44,6 +44,7 @@ def test_methods_lists_documented_endpoints(client):
     methods = r.json()["methods"]
     assert "verify" in methods
     assert "probe.run" in methods
+    assert "pipeline.abort" in methods
 
 
 def test_rpc_verify_round_trip(client):

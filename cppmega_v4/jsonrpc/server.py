@@ -73,7 +73,7 @@ def create_app(*, cache_capacity: int = 50) -> FastAPI:
 
     @app.post("/rpc")
     async def rpc(payload: dict) -> dict:
-        response = dispatch(payload, cache=cache)
+        response = await _dispatch(payload, cache)
         return response.model_dump(mode="json", exclude_none=True)
 
     @app.websocket("/ws")
@@ -92,7 +92,7 @@ def create_app(*, cache_capacity: int = 50) -> FastAPI:
                                   "data": {"detail": str(exc)}},
                     })
                     continue
-                response = dispatch(payload, cache=cache)
+                response = await _dispatch(payload, cache)
                 await socket.send_json(
                     response.model_dump(mode="json", exclude_none=True)
                 )
@@ -106,6 +106,12 @@ def create_app(*, cache_capacity: int = 50) -> FastAPI:
                 pass
 
     return app
+
+
+async def _dispatch(payload: dict, cache: LRUCache):
+    if payload.get("method") == "pipeline.run":
+        return await asyncio.to_thread(dispatch, payload, cache=cache)
+    return dispatch(payload, cache=cache)
 
 
 async def _heartbeat(socket: WebSocket) -> None:

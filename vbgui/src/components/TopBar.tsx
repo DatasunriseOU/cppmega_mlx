@@ -18,6 +18,10 @@ export interface TopBarProps {
   /** H02: toggle callbacks. */
   onMixedPrecisionChange?: (enabled: boolean) => void;
   onFp8EnabledChange?: (enabled: boolean) => void;
+  /** H03: cancel the currently in-flight Train run. */
+  trainInFlight?: boolean;
+  trainRunId?: string | null;
+  onCancelTrain?: () => void;
   /** V3-8/V3-9: when present, Train button is rendered disabled with
    *  reason exposed via data-testid='top-bar-train-disabled-reason'. */
   trainDisabled?: { reason: string } | null;
@@ -135,6 +139,13 @@ export function TopBar(p: TopBarProps): JSX.Element {
         <button data-testid="run-pipeline"
                 onClick={() => p.onRunPipeline("smoke")}>
           Smoke
+        </button>
+        <button data-testid="run-pipeline-cancel"
+                onClick={() => p.onCancelTrain?.()}
+                disabled={!p.trainInFlight || !p.trainRunId}
+                title={p.trainInFlight ? "Cancel Train" : "No Train run active"}
+                style={{ marginLeft: 4 }}>
+          Cancel
         </button>
         <button data-testid="run-pipeline-toggle"
                 onClick={() => setOpen((x) => !x)}>▾</button>

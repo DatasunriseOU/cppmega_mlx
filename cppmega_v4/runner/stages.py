@@ -42,7 +42,7 @@ from cppmega_v4.jsonrpc.methods import (
 from cppmega_v4.jsonrpc.schema import VerifyParams
 
 
-StageStatus = Literal["ok", "skipped", "fail"]
+StageStatus = Literal["ok", "skipped", "fail", "cancelled"]
 
 
 @dataclass
@@ -115,6 +115,36 @@ def _fail(name: str, t0: float, exc: BaseException) -> StageResult:
             "type": type(exc).__name__,
             "detail": str(exc),
             "trace": traceback.format_exception_only(type(exc), exc)[-1].strip(),
+        },
+    )
+
+
+def _cancelled_train_result(
+    t0: float,
+    *,
+    abort_token: str,
+    step: int,
+    losses: list[float],
+    lr_trajectory: list[float],
+    schedule_kind_label: str,
+    optimizer_kind: str,
+    weight_delta_norm: float = 0.0,
+) -> StageResult:
+    clear_abort(abort_token)
+    return StageResult(
+        name="train", status="cancelled",
+        elapsed_ms=(time.perf_counter() - t0) * 1000.0,
+        extras={
+            "losses": [round(loss_item, 4) for loss_item in losses],
+            "lr_trajectory": [
+                round(lr_item, 6) for lr_item in lr_trajectory
+            ],
+            "weight_delta_norm": round(weight_delta_norm, 6),
+            "num_steps": step,
+            "schedule_kind": schedule_kind_label,
+            "optimizer_kind": optimizer_kind,
+            "aborted": True,
+            "abort_token": abort_token,
         },
     )
 
@@ -726,7 +756,14 @@ def stage_train(ctx: StageContext) -> StageResult:
                         token_count = len(tokens)
                 except Exception:
                     pass
+        train_token_embedding = None
+        train_input_source = "random"
+        if data_source != "synthetic":
+            train_token_embedding = nn.Embedding(vocab_size, hidden)
+            train_input_source = "token_embedding"
         all_modules = nn.Sequential(*modules, *lm_heads)
+        if train_token_embedding is not None:
+            all_modules.train_token_embedding = train_token_embedding
         if side_channel_token_embedding is not None:
             all_modules.side_channel_token_embedding = side_channel_token_embedding
         opt, optimizer_kind = _build_optimizer(spec_optim, lr)
@@ -939,21 +976,14 @@ def stage_train(ctx: StageContext) -> StageResult:
         for step in range(n_steps):
             if abort_token is not None and abort_token in _ABORT_TOKENS:
                 # Stop early; return partial extras with cancellation flag.
-                return StageResult(
-                    name="train", status="ok",
-                    elapsed_ms=(time.perf_counter() - t0) * 1000.0,
-                    extras={
-                        "losses": [round(loss_item, 4)
-                                   for loss_item in losses],
-                        "lr_trajectory": [round(lr_item, 6)
-                                          for lr_item in lr_trajectory],
-                        "weight_delta_norm": 0.0,
-                        "num_steps": step,
-                        "schedule_kind": schedule_kind_label,
-                        "optimizer_kind": optimizer_kind,
-                        "aborted": True,
-                        "abort_token": abort_token,
-                    },
+                return _cancelled_train_result(
+                    t0,
+                    abort_token=str(abort_token),
+                    step=step,
+                    losses=losses,
+                    lr_trajectory=lr_trajectory,
+                    schedule_kind_label=schedule_kind_label,
+                    optimizer_kind=optimizer_kind,
                 )
             # If a schedule callable exists, override optimizer's
             # learning_rate per step. MLX optimizers accept a fresh
@@ -965,8 +995,11 @@ def stage_train(ctx: StageContext) -> StageResult:
             else:
                 lr_trajectory.append(lr)
 
-            emb = mx.random.normal(shape=(batch, seq, hidden), key=rng_key)
-            rng_key, _ = mx.random.split(rng_key)
+            if train_token_embedding is None:
+                emb = mx.random.normal(shape=(batch, seq, hidden), key=rng_key)
+                rng_key, _ = mx.random.split(rng_key)
+            else:
+                emb = train_token_embedding(targets)
             loss, grads = loss_and_grad(all_modules, emb, targets)
             mx.eval(loss, grads)
             if probe_key is None:
@@ -1002,6 +1035,25 @@ def stage_train(ctx: StageContext) -> StageResult:
             opt.update(all_modules, grads)
             mx.eval(all_modules.parameters(), opt.state)
             losses.append(float(loss.item()))
+            if abort_token is not None and abort_token in _ABORT_TOKENS:
+                partial_delta = 0.0
+                if probe_key is not None and probe_before is not None:
+                    after_flat = dict(
+                        nn.utils.tree_flatten(all_modules.parameters()))
+                    partial_delta = float(
+                        mx.linalg.norm(
+                            after_flat[probe_key] - probe_before).item()
+                    )
+                return _cancelled_train_result(
+                    t0,
+                    abort_token=str(abort_token),
+                    step=step + 1,
+                    losses=losses,
+                    lr_trajectory=lr_trajectory,
+                    schedule_kind_label=schedule_kind_label,
+                    optimizer_kind=optimizer_kind,
+                    weight_delta_norm=partial_delta,
+                )
 
         try:
             if hasattr(mx, "metal"):
@@ -1110,6 +1162,7 @@ def stage_train(ctx: StageContext) -> StageResult:
                 "schedule_kind": schedule_kind_label,
                 "optimizer_kind": optimizer_kind,
                 "data_source": data_source,
+                "train_input_source": train_input_source,
                 "token_count": token_count,
                 "tokenizer_used": tokenizer_used,
                 "loss_kind": (

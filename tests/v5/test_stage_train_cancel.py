@@ -23,19 +23,25 @@ def _spec() -> VerifyParams:
 
 
 def _run(opts: dict) -> dict:
+    train = _run_stage(opts)
+    return train.extras
+
+
+def _run_stage(opts: dict):
     report = run_pipeline(_spec(), Pipeline.from_dict({
         "stages": ["parse", "verify_build_spec", "build_model", "train"],
         "stage_options": {"train": opts},
     }))
-    train = next(s for s in report.stages if s.name == "train")
-    return train.extras
+    return next(s for s in report.stages if s.name == "train")
 
 
 def test_abort_token_set_before_run_cancels_immediately():
     token = "abort-test-1"
     request_abort(token)
     try:
-        extras = _run({"num_steps": 8, "abort_token": token})
+        stage = _run_stage({"num_steps": 8, "abort_token": token})
+        extras = stage.extras
+        assert stage.status == "cancelled"
         assert extras.get("aborted") is True
         assert extras["abort_token"] == token
         # Aborted at step 0 → losses empty

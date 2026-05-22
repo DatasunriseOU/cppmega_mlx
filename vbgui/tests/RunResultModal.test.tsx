@@ -24,6 +24,15 @@ const REPORT_FAIL: RunReport = {
   ],
 };
 
+const REPORT_CANCELLED: RunReport = {
+  overall_status: "cancelled",
+  total_elapsed_ms: 20.0,
+  stages: [
+    { name: "train", status: "cancelled", elapsed_ms: 20.0,
+      aborted: true, num_steps: 3, losses: [5.5, 5.2, 5.1] },
+  ],
+};
+
 describe("RunResultModal", () => {
   it("returns null when there's nothing to show", () => {
     const { container } = render(
@@ -45,6 +54,19 @@ describe("RunResultModal", () => {
     for (const s of REPORT_OK.stages) {
       expect(screen.getByTestId(`run-result-stage-${s.name}`)).toBeTruthy();
     }
+  });
+
+  it("renders cancelled stage status and partial train extras", () => {
+    render(<RunResultModal report={REPORT_CANCELLED} onClose={() => {}} />);
+    expect(screen.getByTestId("run-result-overall").textContent)
+      .toContain("cancelled");
+    expect(screen.getByTestId("run-result-stage-train").textContent)
+      .toContain("cancelled");
+    fireEvent.click(screen.getByTestId("run-result-expand-train"));
+    expect(screen.getByTestId("run-result-extras-train-num_steps").textContent)
+      .toBe("3");
+    expect(screen.getByTestId("run-result-extras-train-aborted").textContent)
+      .toBe("true");
   });
 
   it("close button fires onClose", () => {

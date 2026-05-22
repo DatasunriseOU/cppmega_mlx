@@ -34,6 +34,8 @@ from cppmega_v4.jsonrpc.schema import (
     LossSpecPayload,
     OptimSpecPayload,
     PerBrickMemory,
+    PipelineAbortParams,
+    PipelineAbortResult,
     PipelinePayload,
     PipelineRunParams,
     PipelineRunResult,
@@ -60,7 +62,7 @@ def test_schema_version_is_semver():
 def test_method_registry_covers_all_documented_methods():
     expected = {
         "verify", "suggest_sharding", "suggest_adapters",
-        "build_preset_specs", "probe.run", "pipeline.run",
+        "build_preset_specs", "probe.run", "pipeline.run", "pipeline.abort",
         "backend.status",
     }
     assert expected <= METHOD_REGISTRY
@@ -73,6 +75,7 @@ def test_event_taxonomy_locks_documented_events():
         "rewriter.add", "rewriter.remove", "rewriter.reorder",
         "sharding.update", "verify.request", "sharding.request",
         "build.request", "backend.status", "probe.run", "pipeline.run",
+        "pipeline.abort",
     }
     assert documented <= EVENT_TAXONOMY
 
@@ -289,11 +292,20 @@ def test_pipeline_run_params_nests_spec_and_pipeline():
     assert p.pipeline.stages == ["parse"]
 
 
+def test_pipeline_abort_params_and_result():
+    params = PipelineAbortParams(run_id="train-1")
+    assert params.run_id == "train-1"
+    result = PipelineAbortResult(run_id=params.run_id)
+    assert result.status == "abort_requested"
+    assert result.run_id == "train-1"
+
+
 def test_stage_result_enum():
     StageResult(name="parse", status="ok", elapsed_ms=1.0)
     StageResult(name="parse", status="skipped", elapsed_ms=0.0)
     StageResult(name="parse", status="fail", elapsed_ms=1.0,
                 error={"type": "ShapeMismatch", "detail": "X"})
+    StageResult(name="train", status="cancelled", elapsed_ms=1.0)
     with pytest.raises(ValidationError):
         StageResult(name="parse", status="weird", elapsed_ms=1.0)
 
@@ -301,6 +313,11 @@ def test_stage_result_enum():
 def test_pipeline_run_result_overall_status_enum():
     PipelineRunResult(stages=[], overall_status="ok", total_elapsed_ms=0.0)
     PipelineRunResult(stages=[], overall_status="fail", total_elapsed_ms=0.0)
+    PipelineRunResult(
+        stages=[StageResult(name="train", status="cancelled", elapsed_ms=0.0)],
+        overall_status="cancelled",
+        total_elapsed_ms=0.0,
+    )
     with pytest.raises(ValidationError):
         PipelineRunResult(stages=[], overall_status="meh", total_elapsed_ms=0.0)
 

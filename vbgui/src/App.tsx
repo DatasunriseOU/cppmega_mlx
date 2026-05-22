@@ -92,6 +92,8 @@ export function App(): JSX.Element {
   const [activeTab, setActiveTab] = useState<AppTab>("canvas");
   const [runReport, setRunReport] = useState<RunReport | null>(null);
   const [runError, setRunError] = useState<string | null>(null);
+  const [trainInFlight, setTrainInFlight] = useState(false);
+  const [trainRunId, setTrainRunId] = useState<string | null>(null);
   const [selectedBrickId, setSelectedBrickId] = useState<string | null>(null);
   const [inferenceLog, setInferenceLog] = useState<
     { brick: string; param: string; value: unknown;
@@ -296,8 +298,12 @@ export function App(): JSX.Element {
     // V3-6: TopBar exposes train_num_steps; thread it via stage_options.
     // V4-1: forward parquet_path + tokenizer_path picked in Data/Tokenizer tabs.
     const stage_options: Record<string, Record<string, unknown>> = {};
+    let activeTrainRunId: string | null = null;
     if (mode === "train") {
       const trainOpts: Record<string, unknown> = {};
+      activeTrainRunId = makeTrainRunId();
+      trainOpts.run_id = activeTrainRunId;
+      trainOpts.abort_token = activeTrainRunId;
       if (typeof opts?.num_steps === "number") {
         trainOpts.num_steps = opts.num_steps;
       }
@@ -313,6 +319,8 @@ export function App(): JSX.Element {
         trainOpts.side_channels = sc;
       }
       if (Object.keys(trainOpts).length > 0) stage_options.train = trainOpts;
+      setTrainRunId(activeTrainRunId);
+      setTrainInFlight(true);
     }
     try {
       const r = await rpc.call<RunReport>("pipeline.run", {
@@ -324,8 +332,23 @@ export function App(): JSX.Element {
       setRunReport(r);
     } catch (e) {
       setRunError(String(e));
+    } finally {
+      if (mode === "train") {
+        setTrainInFlight(false);
+        setTrainRunId(null);
+      }
     }
   }, [rpc, trainParquetPath, trainTokenizerPath]);
+
+  const handleCancelTrain = useCallback(async () => {
+    const runId = trainRunId;
+    if (!runId) return;
+    try {
+      await rpc.call("pipeline.abort", { run_id: runId });
+    } catch (e) {
+      setRunError(String(e));
+    }
+  }, [rpc, trainRunId]);
 
   const handleShardingAccept = useCallback((idx: number) => {
     const chosen = proposals[idx];
@@ -361,6 +384,9 @@ export function App(): JSX.Element {
           onCompileModeChange={(m) => dispatch({ type: "sharding.set",
             sharding: { ...spec.sharding, compile_mode: m } })}
           onRunPipeline={handleRunPipeline}
+          trainInFlight={trainInFlight}
+          trainRunId={trainRunId}
+          onCancelTrain={handleCancelTrain}
           onMixedPrecisionChange={(enabled) => dispatch({ type: "optim.set",
             optim: { ...spec.optim, mixed_precision: enabled } })}
           onFp8EnabledChange={(enabled) => dispatch({ type: "sharding.set",
@@ -509,6 +535,13 @@ function nodesToGraph(nodes: Node[], edges: Edge[]) {
     }),
     edges: edges.map((e) => ({ src: e.source, dst: e.target })),
   };
+}
+
+function makeTrainRunId(): string {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return `train-${crypto.randomUUID()}`;
+  }
+  return `train-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
 function buildVerifyParams(
