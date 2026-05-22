@@ -14,7 +14,7 @@ export interface TopBarProps {
   onTopologyChange: (t: TopologyFactory) => void;
   onCompileModeChange: (m: SpecState["sharding"]["compile_mode"]) => void;
   onRunPipeline: (mode: RunMode,
-    opts?: { num_steps?: number }) => void;
+    opts?: { num_steps?: number; warm_start?: boolean }) => void;
   /** H02: toggle callbacks. */
   onMixedPrecisionChange?: (enabled: boolean) => void;
   onFp8EnabledChange?: (enabled: boolean) => void;
@@ -39,6 +39,7 @@ export interface TopBarProps {
 export function TopBar(p: TopBarProps): JSX.Element {
   const [open, setOpen] = useState(false);
   const [trainNumSteps, setTrainNumSteps] = useState<number>(2);
+  const [warmStart, setWarmStart] = useState<boolean>(false);
   return (
     <header data-testid="top-bar"
             style={{ height: 56, display: "flex", alignItems: "center",
@@ -165,10 +166,19 @@ export function TopBar(p: TopBarProps): JSX.Element {
                          e.target.value || "1", 10)))}
                      style={{ width: 50 }} />
             </div>
+            <label style={{ padding: "6px 12px", display: "flex",
+                            alignItems: "center", gap: 6, fontSize: 11,
+                            color: "#374151" }}>
+              <input data-testid="train-warm-start" type="checkbox"
+                     checked={warmStart}
+                     onChange={(e) => setWarmStart(e.target.checked)} />
+              warm-start (continue from last run)
+            </label>
             <button data-testid="run-pipeline-train"
                     onClick={() => { setOpen(false);
                                      p.onRunPipeline("train",
-                                       { num_steps: trainNumSteps }); }}
+                                       { num_steps: trainNumSteps,
+                                         warm_start: warmStart }); }}
                     disabled={!!p.trainDisabled}
                     title={p.trainDisabled?.reason ?? ""}
                     style={{ ...menuItem,

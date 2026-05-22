@@ -94,6 +94,10 @@ export function App(): JSX.Element {
   const [runError, setRunError] = useState<string | null>(null);
   const [trainInFlight, setTrainInFlight] = useState(false);
   const [trainRunId, setTrainRunId] = useState<string | null>(null);
+  // H04: most recent successfully-completed Train run_id, used as
+  // continue_from_run_id when the warm-start checkbox is on. Cleared
+  // when an error/cancel terminates the next run.
+  const [lastTrainRunId, setLastTrainRunId] = useState<string | null>(null);
   const [selectedBrickId, setSelectedBrickId] = useState<string | null>(null);
   const [inferenceLog, setInferenceLog] = useState<
     { brick: string; param: string; value: unknown;
@@ -289,7 +293,7 @@ export function App(): JSX.Element {
 
   const handleRunPipeline = useCallback(async (
     mode: RunMode,
-    opts?: { num_steps?: number },
+    opts?: { num_steps?: number; warm_start?: boolean },
   ) => {
     const snap = wireSpecRef.current;
     if (snap.nodes.length === 0) {
@@ -312,6 +316,11 @@ export function App(): JSX.Element {
       trainOpts.abort_token = activeTrainRunId;
       if (typeof opts?.num_steps === "number") {
         trainOpts.num_steps = opts.num_steps;
+      }
+      // H04: warm-start uses lastTrainRunId as continue_from_run_id so
+      // the backend G10 LRU cache restores opt.state from prior run.
+      if (opts?.warm_start && lastTrainRunId) {
+        trainOpts.continue_from_run_id = lastTrainRunId;
       }
       if (trainParquetPath) trainOpts.parquet_path = trainParquetPath;
       if (trainTokenizerPath) trainOpts.tokenizer_path = trainTokenizerPath;
@@ -336,6 +345,14 @@ export function App(): JSX.Element {
         pipeline: { stages, stage_options },
       });
       setRunReport(r);
+      // H04: remember run_id of a successful Train so a follow-up
+      // warm-start run can reference it.
+      if (mode === "train" && activeTrainRunId) {
+        const trainStage = r.stages?.find((s) => s.name === "train");
+        if (trainStage?.status === "ok") {
+          setLastTrainRunId(activeTrainRunId);
+        }
+      }
     } catch (e) {
       setRunError(String(e));
     } finally {
@@ -344,7 +361,8 @@ export function App(): JSX.Element {
         setTrainRunId(null);
       }
     }
-  }, [rpc, trainParquetPath, trainSideChannels, trainTokenizerPath]);
+  }, [rpc, trainParquetPath, trainSideChannels, trainTokenizerPath,
+      lastTrainRunId]);
 
   const handleCancelTrain = useCallback(async () => {
     const runId = trainRunId;

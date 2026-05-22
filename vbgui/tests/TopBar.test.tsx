@@ -131,6 +131,22 @@ describe("TopBar", () => {
       expect.objectContaining({ num_steps: expect.any(Number) }));
   });
 
+  it("H04: train-warm-start checkbox forwards warm_start flag", () => {
+    const onRunPipeline = vi.fn();
+    render(<TopBar {...defaultTopProps({ onRunPipeline })} />);
+    fireEvent.click(screen.getByTestId("run-pipeline-toggle"));
+    // Default OFF → warm_start: false
+    fireEvent.click(screen.getByTestId("run-pipeline-train"));
+    expect(onRunPipeline).toHaveBeenLastCalledWith("train",
+      expect.objectContaining({ warm_start: false }));
+    // Toggle ON → warm_start: true
+    fireEvent.click(screen.getByTestId("run-pipeline-toggle"));
+    fireEvent.click(screen.getByTestId("train-warm-start"));
+    fireEvent.click(screen.getByTestId("run-pipeline-train"));
+    expect(onRunPipeline).toHaveBeenLastCalledWith("train",
+      expect.objectContaining({ warm_start: true }));
+  });
+
   it("does not render legacy train side-channel checkboxes", () => {
     render(<TopBar {...defaultTopProps()} />);
     fireEvent.click(screen.getByTestId("run-pipeline-toggle"));
