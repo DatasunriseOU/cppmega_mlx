@@ -8,8 +8,12 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import mlx.core as mx
 import numpy as np
 import pytest
+
+from cppmega_mlx.data.batch import LMTokenBatch
+from scripts.train_hybrid_tiny import TrainHybridTinyConfig, make_training_loss_fn
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -284,11 +288,15 @@ def _assert_training_loss(
     *,
     backend: str = "cross_entropy",
     chunk_rows: int | None = None,
+    side_channel_dropout: dict[str, float] | None = None,
+    side_channel_dropout_seed: int | None = None,
 ) -> None:
     loss = payload["training_loss"]
     assert loss["backend"] == backend
     assert loss["eval_backend"] == "cross_entropy"
     assert loss["manual_chunked_backward"] is False
+    assert loss["side_channel_dropout"] == (side_channel_dropout or {})
+    assert loss["side_channel_dropout_seed"] == side_channel_dropout_seed
     if backend == "cross_entropy":
         assert loss == {
             "backend": "cross_entropy",
@@ -297,6 +305,8 @@ def _assert_training_loss(
             "eval_backend": "cross_entropy",
             "forward_memory_saving_claim": False,
             "manual_chunked_backward": False,
+            "side_channel_dropout": side_channel_dropout or {},
+            "side_channel_dropout_seed": side_channel_dropout_seed,
             "source": "cppmega_mlx.training.loss.next_token_cross_entropy",
         }
     elif backend == "cce":
@@ -307,10 +317,31 @@ def _assert_training_loss(
             "eval_backend": "cross_entropy",
             "forward_memory_saving_claim": True,
             "manual_chunked_backward": False,
+            "side_channel_dropout": side_channel_dropout or {},
+            "side_channel_dropout_seed": side_channel_dropout_seed,
             "source": "cppmega_mlx.training.loss.next_token_cut_cross_entropy",
         }
     else:
         raise AssertionError(f"unexpected loss backend under test: {backend}")
+
+
+class _StructureDropoutProbeModel:
+    def __call__(
+        self,
+        input_ids: mx.array,
+        *,
+        structure_ids: mx.array | None = None,
+        **_: mx.array,
+    ) -> mx.array:
+        vocab = 8
+        expected_targets = input_ids + 1
+        classes = mx.arange(vocab).reshape(1, 1, vocab)
+        target_logits = (classes == expected_targets[:, :, None]).astype(mx.float32)
+        if structure_ids is None:
+            scale = mx.zeros(input_ids.shape, dtype=mx.float32)
+        else:
+            scale = (structure_ids > 0).astype(mx.float32)
+        return target_logits * scale[:, :, None] * 5.0
 
 
 def _tiny_ngram_hash_args() -> list[str]:
@@ -589,6 +620,8 @@ def test_help_lists_hybrid_training_flags() -> None:
     assert "CPPMEGA_OPTIMIZER" in result.stdout
     assert "--loss-backend" in result.stdout
     assert "--cce-chunk-rows" in result.stdout
+    assert "--side-channel-dropout" in result.stdout
+    assert "--side-channel-dropout-seed" in result.stdout
     assert "--memory-limit-total-bytes" in result.stdout
     assert "--apply-memory-limit-plan" in result.stdout
 
@@ -644,6 +677,46 @@ def test_dry_run_json_reports_opt_in_cce_loss_backend() -> None:
     assert payload["config"]["loss_backend"] == "cce"
     assert payload["config"]["cce_chunk_rows"] == 4
     _assert_training_loss(payload, backend="cce", chunk_rows=4)
+
+
+def test_training_loss_fn_threads_configured_side_channel_dropout() -> None:
+    batch = LMTokenBatch(
+        tokens=mx.array([[1, 2, 3]], dtype=mx.int32),
+        structure_ids=mx.ones((1, 3), dtype=mx.int32),
+    )
+    model = _StructureDropoutProbeModel()
+    keep_config = TrainHybridTinyConfig()
+    drop_config = TrainHybridTinyConfig(
+        side_channel_dropout={"structure": 1.0},
+        side_channel_dropout_seed=17,
+    )
+
+    keep_loss, keep_tokens = make_training_loss_fn(keep_config)(model, batch)
+    drop_loss, drop_tokens = make_training_loss_fn(drop_config)(model, batch)
+    mx.eval(keep_loss, keep_tokens, drop_loss, drop_tokens)
+
+    assert int(keep_tokens.item()) == int(drop_tokens.item()) == 2
+    assert float(drop_loss.item()) > float(keep_loss.item())
+
+
+def test_dry_run_json_reports_side_channel_dropout_policy() -> None:
+    result = run_script(
+        "--dry-run-json",
+        "--side-channel-dropout",
+        "structure=1,platform=0.5",
+        "--side-channel-dropout-seed",
+        "17",
+    )
+
+    payload = _load_json_result(result)
+    expected = {"platform": 0.5, "structure": 1.0}
+    assert payload["config"]["side_channel_dropout"] == expected
+    assert payload["config"]["side_channel_dropout_seed"] == 17
+    _assert_training_loss(
+        payload,
+        side_channel_dropout=expected,
+        side_channel_dropout_seed=17,
+    )
 
 
 def test_dry_run_json_selects_muon_from_cli() -> None:

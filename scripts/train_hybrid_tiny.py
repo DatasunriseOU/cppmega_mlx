@@ -16,7 +16,7 @@ import platform
 import statistics
 import sys
 import tempfile
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, field, is_dataclass
 from functools import partial
 from importlib import metadata
 from pathlib import Path
@@ -129,6 +129,8 @@ class TrainHybridTinyConfig:
     ngram_hash_embed_dim: int = 16
     ngram_hash_dropout: float = 0.0
     ngram_hash_seed: int | None = None
+    side_channel_dropout: dict[str, float] = field(default_factory=dict)
+    side_channel_dropout_seed: int | None = None
     include_structure: bool = True
     grad_checkpoint: bool = False
     shuffle: bool = False
@@ -345,6 +347,20 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=TrainHybridTinyConfig.ngram_hash_seed,
     )
+    parser.add_argument(
+        "--side-channel-dropout",
+        default="",
+        help=(
+            "Comma-separated family=rate training dropout policy, e.g. "
+            "platform=0.1,structure=0.25."
+        ),
+    )
+    parser.add_argument(
+        "--side-channel-dropout-seed",
+        type=int,
+        default=TrainHybridTinyConfig.side_channel_dropout_seed,
+        help="Optional deterministic seed for side-channel family dropout.",
+    )
     parser.add_argument("--token-key", default=TrainHybridTinyConfig.token_key)
     parser.add_argument("--seed", type=int, default=TrainHybridTinyConfig.seed)
     parser.add_argument("--shuffle", action="store_true")
@@ -450,6 +466,36 @@ def parse_csv_ints(value: str) -> tuple[int, ...]:
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
+def parse_side_channel_dropout(value: str | None) -> dict[str, float]:
+    if value is None or not value.strip():
+        return {}
+    policy: dict[str, float] = {}
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise argparse.ArgumentTypeError(
+                "side_channel_dropout entries must be family=rate pairs"
+            )
+        family, raw_rate = item.split("=", 1)
+        family = family.strip()
+        if not family:
+            raise argparse.ArgumentTypeError(
+                "side_channel_dropout family names must be non-empty"
+            )
+        try:
+            rate = float(raw_rate.strip())
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(str(exc)) from exc
+        if not 0.0 <= rate <= 1.0:
+            raise argparse.ArgumentTypeError(
+                f"side_channel_dropout for {family!r} must be in [0, 1], got {rate}"
+            )
+        policy[family] = rate
+    return policy
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return build_parser().parse_args(argv)
 
@@ -512,6 +558,8 @@ def config_from_args(args: argparse.Namespace) -> TrainHybridTinyConfig:
         ngram_hash_embed_dim=args.ngram_hash_embed_dim,
         ngram_hash_dropout=args.ngram_hash_dropout,
         ngram_hash_seed=args.ngram_hash_seed,
+        side_channel_dropout=parse_side_channel_dropout(args.side_channel_dropout),
+        side_channel_dropout_seed=args.side_channel_dropout_seed,
         include_structure=not args.no_structure,
         grad_checkpoint=args.grad_checkpoint,
         shuffle=args.shuffle,
@@ -616,6 +664,18 @@ def validate_config(config: TrainHybridTinyConfig) -> None:
             raise ValueError("ngram_hash_embed_dim must be positive")
         if not 0.0 <= config.ngram_hash_dropout < 1.0:
             raise ValueError("ngram_hash_dropout must be in [0, 1)")
+    for family, rate in config.side_channel_dropout.items():
+        if not isinstance(family, str) or not family.strip():
+            raise ValueError("side_channel_dropout family names must be non-empty")
+        if not 0.0 <= float(rate) <= 1.0:
+            raise ValueError(
+                f"side_channel_dropout for {family!r} must be in [0, 1]"
+            )
+    if (
+        config.side_channel_dropout_seed is not None
+        and config.side_channel_dropout_seed < 0
+    ):
+        raise ValueError("side_channel_dropout_seed must be >= 0")
     if config.memory_limit_total_bytes is not None and config.memory_limit_total_bytes <= 0:
         raise ValueError("memory_limit_total_bytes must be positive")
     memory_limit_plan(
@@ -914,6 +974,11 @@ def safe_training_optimizer_payload(config: TrainHybridTinyConfig) -> dict[str, 
 
 
 def training_loss_payload(config: TrainHybridTinyConfig) -> dict[str, Any]:
+    side_channel_dropout = dict(sorted(config.side_channel_dropout.items()))
+    side_channel_receipt = {
+        "side_channel_dropout": side_channel_dropout,
+        "side_channel_dropout_seed": config.side_channel_dropout_seed,
+    }
     if config.loss_backend == "cross_entropy":
         return {
             "backend": "cross_entropy",
@@ -923,6 +988,7 @@ def training_loss_payload(config: TrainHybridTinyConfig) -> dict[str, Any]:
             "forward_memory_saving_claim": False,
             "manual_chunked_backward": False,
             "eval_backend": "cross_entropy",
+            **side_channel_receipt,
         }
     if config.loss_backend == "cce":
         return {
@@ -933,6 +999,7 @@ def training_loss_payload(config: TrainHybridTinyConfig) -> dict[str, Any]:
             "forward_memory_saving_claim": True,
             "manual_chunked_backward": False,
             "eval_backend": "cross_entropy",
+            **side_channel_receipt,
         }
     raise ValueError(
         f"unsupported loss_backend={config.loss_backend!r}; expected one of: "
@@ -952,12 +1019,21 @@ def safe_training_loss_payload(config: TrainHybridTinyConfig) -> dict[str, Any]:
 
 
 def make_training_loss_fn(config: TrainHybridTinyConfig) -> Any:
+    side_channel_kwargs: dict[str, Any] = {}
+    if config.side_channel_dropout:
+        side_channel_kwargs["side_channel_dropout"] = dict(config.side_channel_dropout)
+        side_channel_kwargs["side_channel_dropout_seed"] = (
+            config.side_channel_dropout_seed
+        )
     if config.loss_backend == "cross_entropy":
+        if side_channel_kwargs:
+            return partial(next_token_cross_entropy, **side_channel_kwargs)
         return next_token_cross_entropy
     if config.loss_backend == "cce":
         return partial(
             next_token_cut_cross_entropy,
             chunk_rows=config.cce_chunk_rows,
+            **side_channel_kwargs,
         )
     raise ValueError(
         f"unsupported loss_backend={config.loss_backend!r}; expected one of: "
