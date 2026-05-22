@@ -30,9 +30,18 @@ def test_data_pipeline_doc_states_ingress_packing_and_guardrails() -> None:
         "M0.1 tokenizer parity is already closed",
         "schema drift fails closed",
         "local 100M-token ingress gate",
+        "local Stream D data-ingress acceptance is closed",
+        "full-corpus pretraining is a post-M0 concern",
     ]
     for phrase in required_phrases:
         assert " ".join(phrase.lower().split()) in normalized_text
+
+    stale_phrases = [
+        "Full Stream D is still not closeable",
+        "Full Stream D remains open",
+    ]
+    for phrase in stale_phrases:
+        assert " ".join(phrase.lower().split()) not in normalized_text
 
 
 def test_sequence_packing_helpers_are_public_data_exports() -> None:

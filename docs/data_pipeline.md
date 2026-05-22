@@ -2,8 +2,11 @@
 
 This document describes the current local data ingress and reference packing
 contract for cppmega_mlx. It is intentionally scoped to local MLX data helpers
-and the tiny training/model path. Full Stream D remains open until the remaining
-tokenizer/full-corpus parity gates are proven.
+and the tiny training/model path. The local Stream D data-ingress acceptance is
+closed for this scope: tokenizer parity is covered by the vendored GB10
+tokenizer contract, local 100M-token Megatron indexed stress is covered by the
+stress harness, and full-corpus pretraining is a post-M0 concern rather than a
+local ingress blocker.
 
 ## Token Ingress
 
@@ -154,5 +157,8 @@ M4-vs-GB10 parity claim.
   tokenizer metadata match across shards; schema drift fails closed.
 - The Megatron indexed stress harness covers the local 100M-token ingress gate
   under an explicit peak-memory ceiling.
-- Full Stream D is still not closeable until the remaining tokenizer/full-corpus
-  parity gates are proven.
+- Local Stream D data-ingress acceptance is closed for NPZ, Parquet, Megatron
+  indexed, packing, document IDs, side-channel preservation, DataLoader bridge,
+  data_smoke forward closure, tokenizer contract, and local 100M-token stress.
+- Full-corpus pretraining remains a post-M0 concern and is not claimed by this
+  local data-ingress contract.
