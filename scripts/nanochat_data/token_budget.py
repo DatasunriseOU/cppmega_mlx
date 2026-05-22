@@ -7,6 +7,9 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from cppmega_mlx.tokenizer.cpp_tokenizer import CppMegaTokenizer, load_cppmega_tokenizer
+from cppmega_mlx.tokenizer.fingerprint import (
+    tokenizer_fingerprint as _tokenizer_fingerprint,
+)
 
 
 class TokenCounter(Protocol):
@@ -49,6 +52,12 @@ def resolve_tokenizer_path(tokenizer_path: str | None = None) -> str:
 
 def load_tokenizer(tokenizer_path: str | None = None) -> CppMegaTokenizer:
     return load_cppmega_tokenizer(resolve_tokenizer_path(tokenizer_path))
+
+
+def tokenizer_fingerprint(tokenizer_or_path: Any | None = None) -> str:
+    if tokenizer_or_path is None:
+        tokenizer_or_path = resolve_tokenizer_path(None)
+    return _tokenizer_fingerprint(tokenizer_or_path)
 
 
 def count_tokens(text: str, tokenizer: TokenCounter) -> int:

@@ -166,10 +166,16 @@ The current collected test files are:
 
 - tests/test_archive_bench_baseline_script.py
 - tests/test_attention.py
+- tests/test_audit_v3_v4_v5.py
 - tests/test_bench_1b_training_matrix.py
 - tests/test_bench_baselines.py
+- tests/test_bench_dtype_cast_cost.py
+- tests/test_bench_dtype_long_horizon.py
+- tests/test_bench_inference_latency.py
 - tests/test_bench_matrix.py
+- tests/test_bench_production_presets.py
 - tests/test_bench_script.py
+- tests/test_bench_whole_model_compile.py
 - tests/test_check_environment_script.py
 - tests/test_checkpoint.py
 - tests/test_checkpoint_subprocess_resume.py
@@ -196,6 +202,7 @@ The current collected test files are:
 - tests/test_fusion_patterns_extended.py
 - tests/test_grad_buffer_no_aliasing.py
 - tests/test_grad_dtype_contract.py
+- tests/test_h17_single_doc_passthrough.py
 - tests/test_hybrid_lm.py
 - tests/test_hybrid_lm_extensions.py
 - tests/test_hybrid_lm_gradients.py
@@ -209,6 +216,8 @@ The current collected test files are:
 - tests/test_inference_speculative_decode.py
 - tests/test_kernel_policy.py
 - tests/test_lint_mlx.py
+- tests/test_long_context_forward.py
+- tests/test_long_horizon_convergence.py
 - tests/test_m03_forward_parity_manifest_script.py
 - tests/test_m04_train_step.py
 - tests/test_m05_mtp_parity_manifest_script.py
@@ -217,6 +226,7 @@ The current collected test files are:
 - tests/test_mamba3.py
 - tests/test_mamba3_dispatch.py
 - tests/test_megatron_indexed.py
+- tests/test_megatron_ingress_stress_script.py
 - tests/test_memory_audit.py
 - tests/test_memory_runtime.py
 - tests/test_metal_ops.py
@@ -292,6 +302,7 @@ The current collected test files are:
 - tests/test_triton_bridge_frontend_discovery.py
 - tests/test_triton_to_cute_dsl.py
 - tests/test_triton_to_tilelang_bridge.py
+- tests/test_whole_model_compile_memory.py
 
 ## Wave-Next Work
 

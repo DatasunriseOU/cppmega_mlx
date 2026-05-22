@@ -40,6 +40,7 @@ from cppmega_v4.jsonrpc.methods import (
     _make_loss, _make_optim, _make_sharding, _graph_to_specs,
 )
 from cppmega_v4.jsonrpc.schema import VerifyParams
+from cppmega_mlx.tokenizer.fingerprint import tokenizer_fingerprint
 
 
 StageStatus = Literal["ok", "skipped", "fail", "cancelled"]
@@ -253,19 +254,32 @@ def stage_estimate_memory(ctx: StageContext) -> StageResult:
         master_fp32_bytes = int(params_bytes)
         # Inference probe + token embedding forward stash ~params/2.
         probe_bytes = int(params_bytes // 2)
+        # MLX peak counters include any allocator-resident buffers already
+        # active in this long-lived Python process. Account for that baseline
+        # so full-suite parity is not hostage to previous Metal tests.
+        allocator_active_bytes = _mlx_active_memory_bytes()
         estimated_peak_bytes = (params_bytes + activation_bytes
                                  + adam_moments_bytes + grad_bytes
-                                 + master_fp32_bytes + probe_bytes)
+                                 + master_fp32_bytes + probe_bytes
+                                 + allocator_active_bytes)
         return _ok(
             "estimate_memory", t0,
             total_bytes=params_bytes,
             params_bytes=params_bytes,
             activation_bytes=activation_bytes,
             adam_moments_bytes=adam_moments_bytes,
+            allocator_active_bytes=allocator_active_bytes,
             estimated_peak_bytes=estimated_peak_bytes,
         )
     except Exception as exc:
         return _fail("estimate_memory", t0, exc)
+
+
+def _mlx_active_memory_bytes() -> int:
+    try:
+        return int(mx.get_active_memory())
+    except Exception:
+        return 0
 
 
 def stage_check_gotchas(ctx: StageContext) -> StageResult:
@@ -771,6 +785,10 @@ def stage_train(ctx: StageContext) -> StageResult:
         parquet_stream = None
         targets = mx.random.randint(0, vocab_size, shape=(batch, seq))
         if len(parquet_shards) > 1:
+            _validate_parquet_stream_tokenizer_fingerprints(
+                parquet_shards,
+                expected_tokenizer=tokenizer_path,
+            )
             if tokenizer_path:
                 tokens, used, stream = _tokenize_parquet_text_from_shards(
                     parquet_shards, tokenizer_path, n_tokens=batch * seq)
@@ -798,6 +816,10 @@ def stage_train(ctx: StageContext) -> StageResult:
                 except Exception:
                     pass
         elif parquet_path:
+            _validate_parquet_stream_tokenizer_fingerprints(
+                [str(parquet_path)],
+                expected_tokenizer=tokenizer_path,
+            )
             # V4-2: prefer tokenize(text) path when both tokenizer and a
             # 'text' column are present; fall back to raw-int input_ids
             # column (V3-2) when not; fall through to synthetic otherwise.
@@ -1851,6 +1873,56 @@ def _parquet_row_count(path: str) -> int:
         return int(pq.ParquetFile(path).metadata.num_rows)
     except Exception:
         return 0
+
+
+def _parquet_tokenizer_fingerprint(path: str) -> str | None:
+    import pyarrow.parquet as pq
+    try:
+        parquet_file = pq.ParquetFile(path)
+    except Exception:
+        return None
+    if "tokenizer_fingerprint" not in parquet_file.schema_arrow.names:
+        return None
+    seen: set[str] = set()
+    for batch in parquet_file.iter_batches(
+        columns=["tokenizer_fingerprint"],
+        batch_size=1024,
+    ):
+        for value in batch.column(0).to_pylist():
+            if value is not None:
+                seen.add(str(value))
+            if len(seen) > 1:
+                raise ValueError(
+                    f"tokenizer_fingerprint mismatch within shard {path}"
+                )
+    return next(iter(seen)) if seen else None
+
+
+def _validate_parquet_stream_tokenizer_fingerprints(
+    parquet_paths: list[str],
+    *,
+    expected_tokenizer: Any | None = None,
+) -> str | None:
+    fingerprints = {
+        fingerprint
+        for path in parquet_paths
+        if (fingerprint := _parquet_tokenizer_fingerprint(path)) is not None
+    }
+    if len(fingerprints) > 1:
+        joined = ", ".join(sorted(fingerprints))
+        raise ValueError(
+            "tokenizer_fingerprint mismatch across parquet shards: "
+            f"{joined}"
+        )
+    fingerprint = next(iter(fingerprints)) if fingerprints else None
+    if fingerprint is not None and expected_tokenizer is not None:
+        expected = tokenizer_fingerprint(expected_tokenizer)
+        if fingerprint != expected:
+            raise ValueError(
+                "tokenizer_fingerprint mismatch between parquet shards "
+                f"and active tokenizer: shard={fingerprint} active={expected}"
+            )
+    return fingerprint
 
 
 # G10: in-process LRU cache of opt.state by run_id. Used for warm-start

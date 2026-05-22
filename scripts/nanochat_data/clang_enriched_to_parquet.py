@@ -82,6 +82,7 @@ from scripts.nanochat_data.token_budget import (
     count_tokens,
     load_tokenizer,
     size_label_to_tokens,
+    tokenizer_fingerprint,
 )
 from scripts.nanochat_data.memory_guard import check_memory_limit, start_memory_guard
 
@@ -253,6 +254,7 @@ def maybe_keep_document_exact(doc: dict, tokenizer, max_tokens: int) -> list[dic
 _SCHEMA = pa.schema([
     pa.field("text", pa.string()),
     pa.field("source_doc_id", pa.string()),
+    pa.field("tokenizer_fingerprint", pa.string()),
     pa.field("actual_token_count", pa.int32()),
     pa.field("structure_ids", pa.list_(pa.int8())),
     pa.field("chunk_boundaries", pa.list_(pa.struct([
@@ -347,6 +349,7 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
     tokenized_rows = tokenized_rows or [{} for _ in rows]
     texts = []
     source_doc_ids = []
+    tokenizer_fingerprints = []
     token_counts = []
     structure_ids_col = []
     chunk_boundaries_col = []
@@ -407,6 +410,12 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
         raw_source_doc_id = row.get("source_doc_id")
         source_doc_ids.append(
             None if raw_source_doc_id is None else str(raw_source_doc_id)
+        )
+        raw_tokenizer_fingerprint = row.get("tokenizer_fingerprint")
+        tokenizer_fingerprints.append(
+            None
+            if raw_tokenizer_fingerprint is None
+            else str(raw_tokenizer_fingerprint)
         )
         token_counts.append(int(row.get("actual_token_count", 0)))
         structure_ids_col.append(row.get("structure_ids", []))
@@ -530,6 +539,10 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
             "text": pa.array(texts, type=_SCHEMA.field("text").type),
             "source_doc_id": pa.array(
                 source_doc_ids, type=_SCHEMA.field("source_doc_id").type
+            ),
+            "tokenizer_fingerprint": pa.array(
+                tokenizer_fingerprints,
+                type=_SCHEMA.field("tokenizer_fingerprint").type,
             ),
             "actual_token_count": pa.array(
                 token_counts, type=_SCHEMA.field("actual_token_count").type
@@ -882,6 +895,7 @@ def convert_local_jsonl_to_parquet(
     docs_out = 0
     rows: list[dict] = []
     wrote_rows = False
+    active_tokenizer_fingerprint = tokenizer_fingerprint(tokenizer)
 
     def flush_rows() -> None:
         nonlocal rows, wrote_rows, writer
@@ -922,6 +936,10 @@ def convert_local_jsonl_to_parquet(
                 source_doc_id = record.get("source_doc_id", f"{source.name}:{docs_in}")
                 for sub_doc in sub_docs:
                     sub_doc.setdefault("source_doc_id", source_doc_id)
+                    sub_doc.setdefault(
+                        "tokenizer_fingerprint",
+                        active_tokenizer_fingerprint,
+                    )
                 rows.extend(sub_docs)
                 docs_out += len(sub_docs)
                 if len(rows) >= local_batch_size:
@@ -982,6 +1000,7 @@ def process_input_file(gcs_uri: str, tmpdir: str,
 
     docs_in = 0
     docs_out = 0
+    active_tokenizer_fingerprint = tokenizer_fingerprint(tokenizer)
 
     with gzip.open(local_gz, "rt", encoding="utf-8", errors="replace") as f:
         for line in f:
@@ -1007,6 +1026,10 @@ def process_input_file(gcs_uri: str, tmpdir: str,
             source_doc_id = record.get("source_doc_id", f"{fname}:{docs_in}")
             for sub_doc in sub_docs:
                 sub_doc.setdefault("source_doc_id", source_doc_id)
+                sub_doc.setdefault(
+                    "tokenizer_fingerprint",
+                    active_tokenizer_fingerprint,
+                )
             output_rows.extend(sub_docs)
             docs_out += len(sub_docs)
             if docs_in % 1000 == 0:

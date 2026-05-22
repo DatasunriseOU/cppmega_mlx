@@ -36,6 +36,7 @@ from scripts.nanochat_data.pack_enriched_rows import (
     pack_documents,
 )
 from scripts.nanochat_data.token_budget import chunk_enriched_document, load_tokenizer
+from scripts.nanochat_data.token_budget import tokenizer_fingerprint
 from tools.clang_indexer import index_project
 from tools.clang_indexer.index_project import FunctionDef, PartInfo
 from tools.clang_indexer.process_commits import (
@@ -51,9 +52,17 @@ class _CharTokenizer:
         return [ord(ch) for ch in text]
 
 
-def _write_token_parquet(path: Path, rows: list[list[int]]) -> Path:
+def _write_token_parquet(
+    path: Path,
+    rows: list[list[int]],
+    *,
+    tokenizer_fingerprint: str | None = None,
+) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(pa.table({"token_ids": rows}), path)
+    data = {"token_ids": rows}
+    if tokenizer_fingerprint is not None:
+        data["tokenizer_fingerprint"] = [tokenizer_fingerprint] * len(rows)
+    pq.write_table(pa.table(data), path)
     return path
 
 
@@ -249,6 +258,100 @@ def test_local_parquet_conversion_streams_row_groups(tmp_path: Path) -> None:
         "input.jsonl:1",
         "input.jsonl:2",
     ]
+    fingerprints = parquet_file.read(
+        columns=["tokenizer_fingerprint"]
+    ).column("tokenizer_fingerprint").to_pylist()
+    assert len(set(fingerprints)) == 1
+    assert fingerprints[0] == tokenizer_fingerprint(load_tokenizer())
+
+
+def test_tokenizer_fingerprint_and_ids_stable_across_independent_shards(
+    tmp_path: Path,
+) -> None:
+    texts = [f"int fn_{idx}() {{ return {idx}; }}" for idx in range(32)]
+
+    shard_token_rows = []
+    shard_fingerprints = []
+    for shard_idx in range(3):
+        tokenizer = load_tokenizer()
+        input_path = tmp_path / f"input_{shard_idx}.jsonl"
+        output_path = tmp_path / f"train_{shard_idx:05d}.parquet"
+        input_path.write_text(
+            "\n".join(
+                json.dumps(
+                    {
+                        "text": text,
+                        "structure_ids": [3] * len(text),
+                        "chunk_boundaries": [
+                            {
+                                "start": 0,
+                                "end": len(text),
+                                "kind": 3,
+                                "dep_level": 0,
+                            }
+                        ],
+                        "call_edges": [],
+                        "type_edges": [],
+                    }
+                )
+                for text in texts
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        clang_enriched_to_parquet.convert_local_jsonl_to_parquet(
+            input_path,
+            output_path,
+            tokenizer=tokenizer,
+            max_tokens=4096,
+            overflow_policy="drop",
+            materialize_tokenized_enriched=True,
+            local_batch_size=8,
+        )
+        table = pq.read_table(
+            output_path,
+            columns=["token_ids", "tokenizer_fingerprint"],
+        )
+        shard_token_rows.append(table.column("token_ids").to_pylist())
+        shard_fingerprints.append(
+            set(table.column("tokenizer_fingerprint").to_pylist())
+        )
+
+    assert shard_token_rows[0] == shard_token_rows[1] == shard_token_rows[2]
+    assert len({next(iter(fingerprints)) for fingerprints in shard_fingerprints}) == 1
+
+
+def test_multishard_parquet_rejects_tokenizer_fingerprint_mismatch(
+    tmp_path: Path,
+) -> None:
+    shard0 = tmp_path / "train_00000.parquet"
+    shard1 = tmp_path / "train_00001.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "token_ids": [[1, 2, 3, 4]],
+                "tokenizer_fingerprint": ["a" * 64],
+            }
+        ),
+        shard0,
+    )
+    pq.write_table(
+        pa.table(
+            {
+                "token_ids": [[5, 6, 7, 8]],
+                "tokenizer_fingerprint": ["b" * 64],
+            }
+        ),
+        shard1,
+    )
+
+    with pytest.raises(ValueError, match="tokenizer_fingerprint mismatch"):
+        MultiShardTokenParquetDataset(
+            [shard0, shard1],
+            seq_len=4,
+            batch_size=1,
+            token_key="token_ids",
+        )
 
 
 def test_multi_shard_parquet_stream_matches_one_by_one_shard_order(
@@ -257,10 +360,12 @@ def test_multi_shard_parquet_stream_matches_one_by_one_shard_order(
     shard0 = _write_token_parquet(
         tmp_path / "corpus" / "val_00000.parquet",
         [[1, 2, 3, 4], [5, 6, 7, 8]],
+        tokenizer_fingerprint="c" * 64,
     )
     shard1 = _write_token_parquet(
         tmp_path / "corpus" / "val_00001.parquet",
         [[9, 10, 11, 12]],
+        tokenizer_fingerprint="c" * 64,
     )
     kwargs = {"seq_len": 4, "batch_size": 1, "token_key": "token_ids"}
     streamed = MultiShardTokenParquetDataset([shard0, shard1], **kwargs)
@@ -271,6 +376,7 @@ def test_multi_shard_parquet_stream_matches_one_by_one_shard_order(
     )
 
     assert not hasattr(streamed, "_datasets")
+    assert streamed.parquet_receipt["stream"]["tokenizer_fingerprint"] == "c" * 64
     assert _dataset_token_rows(streamed) == expected
     assert [
         batch.metadata["parquet_stream"]["shard_index"]

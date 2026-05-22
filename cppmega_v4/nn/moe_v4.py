@@ -124,6 +124,12 @@ class V4MoE(nn.Module):
         super().__init__()
         self.config = config
         self.gate = nn.Linear(config.d_model, config.num_experts, bias=config.bias)
+        # Routers should start close to uniform so early expert assignment is
+        # balanced before specialization. MLX Linear's default scale can make
+        # tiny synthetic tests overconfident depending on prior RNG state.
+        self.gate.weight = self.gate.weight * 0.1
+        if config.bias:
+            self.gate.bias = mx.zeros_like(self.gate.bias)
         self.experts = [
             FeedForwardExpert(
                 config.d_model,

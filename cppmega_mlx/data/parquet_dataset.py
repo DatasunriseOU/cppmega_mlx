@@ -28,6 +28,7 @@ from cppmega_mlx.data.token_dataset import (
     _to_int32_token_ids,
     _to_side_channel_values,
 )
+from cppmega_mlx.tokenizer.fingerprint import tokenizer_fingerprint
 
 
 TextEncoder = Callable[[str], Sequence[int]]
@@ -583,6 +584,10 @@ class MultiShardTokenParquetDataset:
         self.seed = seed
         self.loop = loop
         self._metadata_columns = metadata_columns
+        self.tokenizer_fingerprint = _validate_parquet_tokenizer_fingerprints(
+            self.paths,
+            expected_tokenizer=tokenizer,
+        )
         summaries: list[_ShardDatasetSummary] = []
         side_channel_names: set[str] = set()
         self.path = self.paths[0]
@@ -616,6 +621,7 @@ class MultiShardTokenParquetDataset:
             "stream": {
                 "shard_count": len(self._shards),
                 "deterministic_order": True,
+                "tokenizer_fingerprint": self.tokenizer_fingerprint,
                 "shards": [
                     {
                         "index": index,
@@ -718,6 +724,53 @@ class MultiShardTokenParquetDataset:
 def _parquet_file_row_count(path: Path) -> int:
     pq = importlib.import_module("pyarrow.parquet")
     return int(pq.ParquetFile(path).metadata.num_rows)
+
+
+def _parquet_tokenizer_fingerprint(path: Path) -> str | None:
+    pq = importlib.import_module("pyarrow.parquet")
+    parquet_file = pq.ParquetFile(path)
+    if "tokenizer_fingerprint" not in parquet_file.schema_arrow.names:
+        return None
+    seen: set[str] = set()
+    for batch in parquet_file.iter_batches(
+        columns=["tokenizer_fingerprint"],
+        batch_size=1024,
+    ):
+        for value in batch.column(0).to_pylist():
+            if value is not None:
+                seen.add(str(value))
+            if len(seen) > 1:
+                raise ValueError(
+                    f"tokenizer_fingerprint mismatch within shard {path}"
+                )
+    return next(iter(seen)) if seen else None
+
+
+def _validate_parquet_tokenizer_fingerprints(
+    paths: Sequence[Path],
+    *,
+    expected_tokenizer: Any | None = None,
+) -> str | None:
+    fingerprints = {
+        fingerprint
+        for path in paths
+        if (fingerprint := _parquet_tokenizer_fingerprint(path)) is not None
+    }
+    if len(fingerprints) > 1:
+        joined = ", ".join(sorted(fingerprints))
+        raise ValueError(
+            "tokenizer_fingerprint mismatch across parquet shards: "
+            f"{joined}"
+        )
+    fingerprint = next(iter(fingerprints)) if fingerprints else None
+    if fingerprint is not None and expected_tokenizer is not None:
+        expected = tokenizer_fingerprint(expected_tokenizer)
+        if fingerprint != expected:
+            raise ValueError(
+                "tokenizer_fingerprint mismatch between parquet shards "
+                f"and active tokenizer: shard={fingerprint} active={expected}"
+            )
+    return fingerprint
 
 
 def _candidate_parquet_columns(

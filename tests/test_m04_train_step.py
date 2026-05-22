@@ -83,9 +83,17 @@ REAL_PARQUET_COLUMNS = (
 )
 
 
-def _write_m04_token_parquet(path: Path, rows: list[list[int]]) -> Path:
+def _write_m04_token_parquet(
+    path: Path,
+    rows: list[list[int]],
+    *,
+    tokenizer_fingerprint: str | None = None,
+) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(pa.table({"token_ids": rows}), path)
+    data = {"token_ids": rows}
+    if tokenizer_fingerprint is not None:
+        data["tokenizer_fingerprint"] = [tokenizer_fingerprint] * len(rows)
+    pq.write_table(pa.table(data), path)
     return path
 
 
@@ -198,6 +206,44 @@ def test_m04_parquet_shards_stream_in_deterministic_order(tmp_path: Path) -> Non
     stream = payload["dataset_receipt"]["parquet_receipt"]["stream"]
     assert stream["shard_count"] == 2
     assert stream["shards"][1]["row_count"] == 1
+
+
+def test_m04_rejects_mismatched_parquet_shard_tokenizers(tmp_path: Path) -> None:
+    shard0 = _write_m04_token_parquet(
+        tmp_path / "corpus" / "val_00000.parquet",
+        [[1, 2, 3, 4]],
+        tokenizer_fingerprint="a" * 64,
+    )
+    shard1 = _write_m04_token_parquet(
+        tmp_path / "corpus" / "val_00001.parquet",
+        [[5, 6, 7, 8]],
+        tokenizer_fingerprint="b" * 64,
+    )
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--data-path",
+            str(shard0),
+            "--data-format",
+            "parquet",
+            "--token-key",
+            "token_ids",
+            "--seq-len",
+            "4",
+            "--batch-size",
+            "1",
+            "--data-shard",
+            str(shard1),
+        ]
+    )
+    config = m04_train_step.config_from_args(args, data_path=shard0)
+
+    with pytest.raises(ValueError, match="tokenizer_fingerprint mismatch"):
+        m04_train_step.training_dataset_from_args(
+            args,
+            config=config,
+            data_path=shard0,
+            loop=False,
+        )
 
 
 class _ValueAndGradPathCDirectFusionChainTrainingRuntime(

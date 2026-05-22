@@ -18,7 +18,6 @@ import math
 
 import mlx.core as mx
 import mlx.nn as nn
-import pytest
 from mlx.optimizers import AdamW
 
 from cppmega_v4.nn.moe_v4 import V4MoE, V4MoEConfig

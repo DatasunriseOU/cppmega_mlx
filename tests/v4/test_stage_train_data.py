@@ -38,12 +38,16 @@ def _verify_params() -> VerifyParams:
 
 
 def _write_parquet(tmp_path: pathlib.Path, column: str = "input_ids",
-                   n_rows: int = 4, n_tokens_per_row: int = 64) -> str:
+                   n_rows: int = 4, n_tokens_per_row: int = 64,
+                   tokenizer_fingerprint: str | None = None) -> str:
     rows = []
     for r in range(n_rows):
         rows.append(list(range(r * n_tokens_per_row,
                                (r + 1) * n_tokens_per_row)))
-    table = pa.table({column: rows})
+    data = {column: rows}
+    if tokenizer_fingerprint is not None:
+        data["tokenizer_fingerprint"] = [tokenizer_fingerprint] * n_rows
+    table = pa.table(data)
     tmp_path.mkdir(parents=True, exist_ok=True)
     path = tmp_path / "fixture.parquet"
     pq.write_table(table, path)
@@ -95,6 +99,65 @@ def test_stage_train_streams_parquet_shards_sequentially(tmp_path):
     assert extras["parquet_stream"]["shard_total"] == 2
     assert extras["parquet_stream"]["shards_consumed"] == 2
     assert extras["parquet_stream"]["shard_index"] == 1
+
+
+def test_stage_train_rejects_mismatched_parquet_shard_tokenizers(tmp_path):
+    """parquet_shards with different tokenizer fingerprints fail closed."""
+    shard0 = _write_parquet(
+        tmp_path / "s0", n_rows=1, n_tokens_per_row=4,
+        tokenizer_fingerprint="a" * 64)
+    shard1 = _write_parquet(
+        tmp_path / "s1", n_rows=1, n_tokens_per_row=4,
+        tokenizer_fingerprint="b" * 64)
+
+    spec = _verify_params()
+    report = run_pipeline(spec, Pipeline.from_dict({
+        "stages": ["parse", "verify_build_spec", "build_model", "train"],
+        "stage_options": {"train": {
+            "num_steps": 2,
+            "parquet_path": shard0,
+            "parquet_shards": [shard0, shard1],
+        }},
+    }))
+
+    train = next(s for s in report.stages if s.name == "train")
+    assert report.overall_status == "fail"
+    assert train.status == "fail"
+    assert train.error is not None
+    assert train.error["type"] == "ValueError"
+    assert "tokenizer_fingerprint mismatch" in train.error["detail"]
+
+
+def test_stage_train_rejects_shard_tokenizer_mismatch_with_active_tokenizer(
+    tmp_path,
+):
+    """parquet fingerprint must match explicit tokenizer_path before streaming."""
+    shard = _write_parquet(
+        tmp_path / "s0", n_rows=1, n_tokens_per_row=8,
+        tokenizer_fingerprint="a" * 64)
+    tokenizer_path = (
+        pathlib.Path(__file__).resolve().parents[2]
+        / "cppmega_mlx"
+        / "tokenizer"
+        / "tokenizer.json"
+    )
+
+    spec = _verify_params()
+    report = run_pipeline(spec, Pipeline.from_dict({
+        "stages": ["parse", "verify_build_spec", "build_model", "train"],
+        "stage_options": {"train": {
+            "num_steps": 2,
+            "parquet_path": shard,
+            "tokenizer_path": str(tokenizer_path),
+        }},
+    }))
+
+    train = next(s for s in report.stages if s.name == "train")
+    assert report.overall_status == "fail"
+    assert train.status == "fail"
+    assert train.error is not None
+    assert train.error["type"] == "ValueError"
+    assert "active tokenizer" in train.error["detail"]
 
 
 def test_stage_train_falls_back_when_parquet_missing_token_column(tmp_path):
