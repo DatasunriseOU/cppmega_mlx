@@ -32,6 +32,7 @@ from cppmega_mlx.inference.quantization import (
     validate_kv_head_dim,
 )
 from cppmega_mlx.inference.sampling import sample_next_token
+from cppmega_mlx.inference.serve import create_local_generation_app
 from cppmega_mlx.inference.serving import (
     ContinuousBatchScheduler,
     PAGED_ATTENTION_NOT_INTEGRATED_MESSAGE,
@@ -97,6 +98,7 @@ __all__ = [
     "build_paged_block_table",
     "builtin_code_metadata_adapters",
     "clone_contiguous_kv_cache",
+    "create_local_generation_app",
     "generate_tokens",
     "generate_tokens_mtp_self_speculative",
     "generate_tokens_speculative",

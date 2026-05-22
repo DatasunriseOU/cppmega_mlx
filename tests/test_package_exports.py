@@ -111,6 +111,7 @@ def test_package_roots_expose_local_mlx_contracts() -> None:
         "megatron_indexed_side_channel_schema",
     } | FIM_DATA_EXPORTS <= _assert_public_exports(data)
     assert {
+        "create_local_generation_app",
         "GenerationChunk",
         "generate_tokens",
         "generate_tokens_mtp_self_speculative",
