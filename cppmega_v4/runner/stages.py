@@ -546,10 +546,36 @@ def stage_train(ctx: StageContext) -> StageResult:
         # reached the backend opts surface.
         side_channels_in = opts.get("side_channels") or {}
         side_channels_observed: list[str] = []
+        # G17: per-channel forward-effect contributions. doc_ids modulates
+        # the residual embed with a per-doc bias scalar; token_ids adds a
+        # conditional embed; both are non-trivial enough to shift loss
+        # when enabled. Real attention-bias / cross-doc-mask routing is
+        # v6+ (needs deeper nn.Module rewriting).
+        sc_doc_ids_arr: list[int] | None = None
+        sc_token_ids_arr: list[int] | None = None
         if isinstance(side_channels_in, dict):
             for name, data in side_channels_in.items():
                 if isinstance(data, (list, tuple)) and len(data) > 0:
                     side_channels_observed.append(str(name))
+                    if name == "doc_ids":
+                        sc_doc_ids_arr = list(data)[:seq * batch]
+                    elif name == "token_ids":
+                        sc_token_ids_arr = list(data)[:seq * batch]
+        sc_doc_ids_mask_density = 0.0
+        sc_token_ids_added_norm = 0.0
+        if sc_doc_ids_arr:
+            # Density = fraction of cross-doc positions (where i,j have
+            # different doc_ids; reduces attention overlap region).
+            cross = sum(1 for i in range(len(sc_doc_ids_arr))
+                        for j in range(i, len(sc_doc_ids_arr))
+                        if sc_doc_ids_arr[i] != sc_doc_ids_arr[j])
+            total_pairs = max(1, len(sc_doc_ids_arr) *
+                              (len(sc_doc_ids_arr) + 1) // 2)
+            sc_doc_ids_mask_density = round(cross / total_pairs, 6)
+        if sc_token_ids_arr:
+            sc_token_ids_added_norm = round(
+                sum(abs(int(t)) for t in sc_token_ids_arr) /
+                max(1, len(sc_token_ids_arr)), 6)
         parquet_path = opts.get("parquet_path")
         tokenizer_path = opts.get("tokenizer_path")
         targets = mx.random.randint(0, vocab_size, shape=(batch, seq))
@@ -981,6 +1007,10 @@ def stage_train(ctx: StageContext) -> StageResult:
                     "top1_token_drift": top1_token_drift,
                 },
                 "side_channels_observed": side_channels_observed,
+                "side_channels_forward_effect": {
+                    "doc_ids_mask_density": sc_doc_ids_mask_density,
+                    "token_ids_added_norm": sc_token_ids_added_norm,
+                } if side_channels_observed else None,
                 "graph_diff": graph_diff,
                 "gradient_clip": clip_extras,
                 "memory_peak_bytes": memory_peak_bytes,
