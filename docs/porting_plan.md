@@ -209,6 +209,7 @@ The current collected test files are:
 - tests/test_hybrid_lm.py
 - tests/test_hybrid_lm_extensions.py
 - tests/test_hybrid_lm_gradients.py
+- tests/test_inference_docs.py
 - tests/test_inference_engine.py
 - tests/test_inference_generation.py
 - tests/test_inference_infilling.py
