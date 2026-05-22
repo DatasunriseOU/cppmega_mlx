@@ -1092,6 +1092,8 @@ def stage_train(ctx: StageContext) -> StageResult:
         # G12: optional checkpoint load before training. Reads safetensors
         # weights into the model. Failure is non-fatal — log via extras.
         checkpoint_loaded: str | None = None
+        opt_state_loaded_path: str | None = None
+        opt_state_warning: str | None = None
         ckpt_load = opts.get("checkpoint_load_path")
         if ckpt_load:
             try:
@@ -1102,6 +1104,23 @@ def stage_train(ctx: StageContext) -> StageResult:
                 checkpoint_loaded = str(ckpt_load)
             except Exception:
                 pass
+        # H19: optional opt.state load alongside the checkpoint so a
+        # resumed run picks up Adam moments → strict losses[0] parity
+        # with the saved run's losses[-1].
+        opt_state_load = opts.get("opt_state_load_path")
+        if opt_state_load:
+            try:
+                import safetensors.mlx as _stmlx
+                loaded_st = _stmlx.load_file(opt_state_load)
+                opt.state = nn.utils.tree_unflatten(list(loaded_st.items()))
+                opt_state_loaded_path = str(opt_state_load)
+            except FileNotFoundError as exc:
+                opt_state_warning = (
+                    f"opt_state_load_path missing: {exc}; cold restart")
+            except Exception as exc:
+                opt_state_warning = (
+                    f"opt_state_load failed: "
+                    f"{type(exc).__name__}: {exc}; cold restart")
 
         # G09: check abort flag set via opts.abort or _ABORT_TOKENS set
         abort_token = opts.get("abort_token")
@@ -1195,6 +1214,7 @@ def stage_train(ctx: StageContext) -> StageResult:
 
         # G12: optional checkpoint save after training.
         checkpoint_saved: str | None = None
+        opt_state_saved_path: str | None = None
         ckpt_save = opts.get("checkpoint_save_path")
         if ckpt_save:
             try:
@@ -1202,6 +1222,23 @@ def stage_train(ctx: StageContext) -> StageResult:
                 flat = dict(nn.utils.tree_flatten(all_modules.parameters()))
                 _stmlx.save_file(flat, ckpt_save)
                 checkpoint_saved = str(ckpt_save)
+            except Exception:
+                pass
+        # H19: opt.state save → separate file so a follow-up Train can
+        # resume exactly where this one left off (Adam moments + step).
+        opt_state_save = opts.get("opt_state_save_path")
+        if opt_state_save:
+            try:
+                import safetensors.mlx as _stmlx
+                opt_flat = dict(nn.utils.tree_flatten(opt.state))
+                # safetensors only accepts mx.array values; strip
+                # scalars / non-array entries from opt.state.
+                opt_arrays = {
+                    k: v for k, v in opt_flat.items()
+                    if hasattr(v, "shape")
+                }
+                _stmlx.save_file(opt_arrays, opt_state_save)
+                opt_state_saved_path = str(opt_state_save)
             except Exception:
                 pass
 
@@ -1335,6 +1372,11 @@ def stage_train(ctx: StageContext) -> StageResult:
                 "checkpoint": {
                     "saved_path": checkpoint_saved,
                     "loaded_path": checkpoint_loaded,
+                    # H19: opt.state side-car so resumed training matches
+                    # the saved run's losses[-1] within 1e-5.
+                    "opt_state_saved_path": opt_state_saved_path,
+                    "opt_state_loaded_path": opt_state_loaded_path,
+                    "opt_state_warning": opt_state_warning,
                 },
                 "mtp": _compute_mtp_extras(
                     all_modules, mtp_k, mtp_betas, vocab_size,

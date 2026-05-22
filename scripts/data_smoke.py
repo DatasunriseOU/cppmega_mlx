@@ -246,6 +246,10 @@ def _resolve_dataset_format(
         return "parquet"
     if suffix in {".bin", ".idx", ".json"}:
         return "megatron"
+    if dataset_path.is_dir() and any(
+        candidate.suffix == ".idx" for candidate in dataset_path.iterdir()
+    ):
+        return "megatron"
     if dataset_path.with_suffix(".bin").exists() or dataset_path.with_suffix(
         ".idx"
     ).exists():

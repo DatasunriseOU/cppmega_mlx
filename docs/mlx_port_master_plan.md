@@ -505,8 +505,8 @@ throughput claim.
     is Mac-vs-GB10 decode parity, with byte-exact round-trip for inputs
     without multi-char whitespace runs.
 62. Add tokenizer vocab assertion at model load (refuse mismatched ID→token mapping; assert vocab_size == 65536; assert presence of all reserved special tokens by id and string form).
-63. Extend the existing standalone Megatron IndexedDataset .bin/.idx reader seam with additional golden fixtures and scale checks.
-64. Add IndexedDataset multi-shard support and side-channel schema preservation; do not import Megatron runtime into the Mac path.
+63. Extend the existing standalone Megatron IndexedDataset .bin/.idx reader seam with additional golden fixtures and scale checks. Current local status: scripts/megatron_ingress_stress.py provides a bounded local stress harness and JSON receipt.
+64. Add IndexedDataset multi-shard support and side-channel schema preservation; do not import Megatron runtime into the Mac path. Current local status: open_megatron_indexed_dataset accepts single prefixes and directories of .idx/.bin shards with fail-closed side-channel/doc-id schema checks.
 65. Implement sequence packing: concat-with-EOS, cumulative doc-id; attention mask via mx.cumsum comparison.
 66. Implement BOS-aligned best-fit packing (mirror nanochat-mlx loader).
 67. Add structure-embedding side-channels in batch: structure_ids, dep_levels, ast_depth_ids, sibling_index, node_type (already in LMTokenBatch; verify dataset emits them).
@@ -522,7 +522,7 @@ throughput claim.
 77. Add tokenizer parity test vs CUDA cppmega tokenizer (encode-decode equivalence).
 78. Add scripts/data_smoke.py for end-to-end ingress check (.bin/.idx → packed → batched → forward).
 79. Document data format in docs/data_pipeline.md (file layout, special tokens, packing algorithm, FIM rates).
-80. Add stress test: 100M-token shard, measure throughput and peak memory.
+80. Add stress test: 100M-token shard, measure throughput and peak memory. Current local status: scripts/megatron_ingress_stress.py runs this gate with an explicit peak-memory ceiling and no GB10/distributed parity claim.
 
 ### Stream E — Training Loop & Checkpointing (81–100)
 

@@ -9,6 +9,8 @@ from typing import Any
 import numpy as np
 import pytest
 
+from tests.test_megatron_indexed import _write_structured_multishard_fixture
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "data_smoke.py"
@@ -212,6 +214,39 @@ def test_parquet_smoke_reports_local_ingress_contract(tmp_path: Path) -> None:
     assert payload["m4_vs_gb10_parity_claim"] is False
     assert payload["distributed_megatron_parity_claim"] is False
     assert payload["training_wired"] is False
+
+
+def test_megatron_multishard_smoke_reports_side_channels(tmp_path: Path) -> None:
+    _write_structured_multishard_fixture(
+        tmp_path,
+        shard_docs=[
+            [np.arange(8, dtype=np.int32)],
+            [np.arange(100, 108, dtype=np.int32)],
+        ],
+    )
+
+    result = run_script(
+        str(tmp_path),
+        "--batch-size",
+        "2",
+        "--seq-len",
+        "4",
+        "--require-structure-side-channels",
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = load_json(result)
+    assert payload["status"] == "ok"
+    assert payload["dataset_format"] == "megatron"
+    assert payload["batch_shape"] == [2, 4]
+    assert payload["dataset"]["metadata"]["source_format"] == "megatron-multishard"
+    assert payload["dataset"]["index_metadata"]["source_format"] == "megatron-multishard"
+    assert payload["dataset"]["index_metadata"]["shard_count"] == 2
+    assert payload["dataset"]["token_id_range"] == [0, 107]
+    assert payload["side_channels"] == ["dep_levels", "structure_ids"]
+    assert payload["structure_side_channels"] == ["structure_ids", "dep_levels"]
+    assert payload["structure_side_channels_present"] is True
+    assert payload["distributed_megatron_parity_claim"] is False
 
 
 def test_unsupported_dataset_format_fails_closed_with_json(tmp_path: Path) -> None:

@@ -23,10 +23,12 @@ def test_data_pipeline_doc_states_ingress_packing_and_guardrails() -> None:
         "Mapping-batch and LMTokenBatch training can carry explicit packed document IDs",
         "NPZ, Parquet, and single- or multi-shard Megatron indexed loaders preserve persisted token-aligned document IDs",
         "Multi-shard Megatron indexed directories batch across shard boundaries",
+        "scripts/megatron_ingress_stress.py generates local Megatron Indexed fixtures",
+        "explicitly makes no GB10, distributed Megatron, or M4-vs-GB10 parity claim",
         "PyTorch DataLoader integration is explicit and optional",
         "M0.1 tokenizer parity is already closed",
         "schema drift fails closed",
-        "100M-token stress gate",
+        "local 100M-token ingress gate",
     ]
     for phrase in required_phrases:
         assert " ".join(phrase.lower().split()) in normalized_text
