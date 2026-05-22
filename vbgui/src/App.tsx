@@ -107,6 +107,12 @@ export function App(): JSX.Element {
   const [runReport, setRunReport] = useState<RunReport | null>(null);
   const [runError, setRunError] = useState<string | null>(null);
   const [trainInFlight, setTrainInFlight] = useState(false);
+  // V7-I03: synchronous lock. React's setTrainInFlight schedules an
+  // async commit, so two button clicks within the same microtask
+  // both read trainInFlight=false and both call rpc.call. The ref
+  // is mutated synchronously inside handleRunPipeline before any
+  // await, closing the ~10ms window.
+  const trainInFlightLockRef = useRef<boolean>(false);
   const [trainRunId, setTrainRunId] = useState<string | null>(null);
   // H04: most recent successfully-completed Train run_id, used as
   // continue_from_run_id when the warm-start checkbox is on. Cleared
@@ -371,8 +377,17 @@ export function App(): JSX.Element {
       master_dtype?: "fp32" | "bf16" | "fp16" | "auto";
     },
   ) => {
+    // V7-I03: synchronous lock check at the very top — before any
+    // await, before the canvas-empty guard. Two rapid clicks both
+    // pass through React's stale-prop trainInFlight=false but only
+    // the first acquires the ref.
+    if (mode === "train") {
+      if (trainInFlightLockRef.current) return;
+      trainInFlightLockRef.current = true;
+    }
     const snap = wireSpecRef.current;
     if (snap.nodes.length === 0) {
+      if (mode === "train") trainInFlightLockRef.current = false;
       setRunError("canvas is empty — drop bricks or pick a preset first");
       setRunReport(null);
       return;
@@ -471,6 +486,7 @@ export function App(): JSX.Element {
       if (mode === "train") {
         setTrainInFlight(false);
         setTrainRunId(null);
+        trainInFlightLockRef.current = false;
       }
     }
   }, [rpc, trainParquetPath, trainSideChannels, trainTokenizerPath,
