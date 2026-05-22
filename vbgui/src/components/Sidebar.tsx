@@ -47,6 +47,9 @@ export interface SidebarProps {
   /** E7-2: inferred dimensions populated from verify response. */
   inferenceLog?: InferenceEntryClient[];
   onHighlightBrick?: (brick: string) => void;
+  /** H07: parent dispatches the per-brick params mutation when the
+   *  user clicks Apply on an auto-inferred row in DimensionsTab. */
+  onDimensionsApply?: (entry: InferenceEntryClient) => void;
 }
 
 const TAB_LABELS: { key: SidebarTab; label: string }[] = [
@@ -121,7 +124,8 @@ export function Sidebar(p: SidebarProps): JSX.Element {
         )}
         {active === "dimensions" && (
           <DimensionsTab log={p.inferenceLog ?? []}
-                          onHighlight={p.onHighlightBrick} />
+                          onHighlight={p.onHighlightBrick}
+                          onApply={p.onDimensionsApply} />
         )}
         {active === "ablations" && (
           <AblationsTab rpc={p.rpc ?? null}

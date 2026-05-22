@@ -312,4 +312,16 @@ describe("Sidebar", () => {
     fireEvent.click(screen.getByTestId("sidebar-tab-gotchas"));
     expect(screen.getByTestId("gotchas-tab")).toBeTruthy();
   });
+
+  it("H07: Sidebar forwards onDimensionsApply to DimensionsTab", () => {
+    const onDimensionsApply = vi.fn();
+    const entry = { brick: "attn0", param: "head_dim", value: 64,
+                    source: "auto" as const, reason: "inferred from H/nh" };
+    render(<Sidebar {...stubs}
+            inferenceLog={[entry]}
+            onDimensionsApply={onDimensionsApply} />);
+    fireEvent.click(screen.getByTestId("sidebar-tab-dimensions"));
+    fireEvent.click(screen.getByTestId("dim-row-attn0-head_dim-apply"));
+    expect(onDimensionsApply).toHaveBeenCalledWith(entry);
+  });
 });

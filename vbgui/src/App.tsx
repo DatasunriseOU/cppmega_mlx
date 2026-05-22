@@ -187,8 +187,14 @@ export function App(): JSX.Element {
   // Trigger verify only on inputs that the user controls. The verify
   // response writes back into spec AND edge severity — depending on
   // either of those in the effect would loop. Use structural keys.
-  const nodesKey = nodes.map((n) => `${n.id}:${(n.data as { kind?: string })
-                                                   ?.kind ?? ""}`).join("|");
+  // H07: include params hash so the verify debouncer re-fires when the
+  // user mutates brick.data.params via DimensionsTab Apply or
+  // BrickContextPanel. Without this, the inferred-dimensions feedback
+  // loop never closed because the table reflected stale verify state.
+  const nodesKey = nodes.map((n) => {
+    const d = n.data as { kind?: string; params?: Record<string, unknown> };
+    return `${n.id}:${d.kind ?? ""}:${JSON.stringify(d.params ?? {})}`;
+  }).join("|");
   const edgesKey = edges.map((e) => `${e.source}>${e.target}`).join("|");
   const lossKey = `${spec.loss.kind}::${spec.loss.head_outputs.join(",")}`;
   const optimKey = `${spec.optim.kind}::${spec.optim.groups.length}`;
@@ -532,6 +538,23 @@ export function App(): JSX.Element {
                 onShardingChange={(s) =>
                   dispatch({ type: "sharding.set", sharding: s })}
                 onShardingAccept={handleShardingAccept}
+                onDimensionsApply={(entry) => {
+                  // H07: write the auto-suggested value into the matched
+                  // brick's params. Re-verify will then re-render the
+                  // entry as source="user" (or drop it entirely if the
+                  // inference no longer fires), closing the feedback loop.
+                  setNodes((prev) => prev.map((n) => {
+                    if (n.id !== entry.brick) return n;
+                    const d = (n.data ?? {}) as {
+                      kind?: string; params?: Record<string, unknown>;
+                    };
+                    return { ...n, data: {
+                      ...d,
+                      params: { ...(d.params ?? {}),
+                                [entry.param]: entry.value },
+                    } as never };
+                  }));
+                }}
               />
             </>
           )}
