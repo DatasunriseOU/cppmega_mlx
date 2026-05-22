@@ -112,6 +112,11 @@ DESCRIPTOR_PORTABLE_KERNEL_BUFFER_LIMIT = 31
 DESCRIPTOR_SHARED_SCRATCH_SPILL_THRESHOLD_BYTES = 4 * 1024
 DESCRIPTOR_SHARED_SCRATCH_BUDGET_BYTES = 24 * 1024
 _GENERIC_MODEL_REAL_ABI_INPUT_SUFFIXES = ("residual_norm_weight",)
+_TRAIN_STEP_SCALAR_OUTPUT_ABI_NAMES = ("loss", "ntokens")
+_TRAIN_STEP_SCALAR_OUTPUT_ABI_REASON = (
+    "train-step scalar ABI slots are declared, but suffix loss codegen is not "
+    "fused into the descriptor body yet"
+)
 _DTYPE_NBYTES = {
     "bool": 1,
     "uint8": 1,
@@ -820,6 +825,7 @@ def make_path_c_descriptor_schedule_template(
     internal_buffer_policy: str = DESCRIPTOR_INTERNAL_BUFFER_POLICY_SCALAR_LOCAL,
     loop_policy: str = DESCRIPTOR_LOOP_POLICY_FLAT,
     physical_abi_policy: str = DESCRIPTOR_PHYSICAL_ABI_POLICY_DIRECT,
+    train_step_output_abi: bool = False,
 ) -> Callable[[Any], Any]:
     """Return a schedule template generated from brick descriptors."""
 
@@ -845,6 +851,7 @@ def make_path_c_descriptor_schedule_template(
             internal_buffer_policy=validated_internal_buffer_policy,
             loop_policy=validated_loop_policy,
             physical_abi_policy=validated_physical_abi_policy,
+            train_step_output_abi=bool(train_step_output_abi),
         )
 
     descriptor_schedule_template._cppmega_path_c_schedule_generator = (
@@ -866,6 +873,9 @@ def make_path_c_descriptor_schedule_template(
         ("kv_fp8", "kv_scale")
         if _descriptor_chain_uses_kv_history_workspace(descriptors)
         else ()
+    )
+    descriptor_schedule_template._cppmega_path_c_train_step_output_abi_enabled = (
+        bool(train_step_output_abi)
     )
     return descriptor_schedule_template
 
@@ -918,6 +928,7 @@ def build_path_c_descriptor_prim_func(
     internal_buffer_policy: str = DESCRIPTOR_INTERNAL_BUFFER_POLICY_SCALAR_LOCAL,
     loop_policy: str = DESCRIPTOR_LOOP_POLICY_FLAT,
     physical_abi_policy: str = DESCRIPTOR_PHYSICAL_ABI_POLICY_DIRECT,
+    train_step_output_abi: bool = False,
 ) -> Any:
     """Generate a single-entry TileLang PrimFunc from a descriptor chain."""
 
@@ -949,6 +960,18 @@ def build_path_c_descriptor_prim_func(
         for name in (*node.inputs, *node.outputs)
     }
     external_buffers = _external_buffers_for_nodes(nodes, internal_buffers)
+    train_step_output_abi_payload = _train_step_output_abi_payload(
+        declared=bool(train_step_output_abi)
+    )
+    train_step_output_buffers = tuple(
+        train_step_output_abi_payload["logical_outputs"]
+        if train_step_output_abi_payload["declared"]
+        else ()
+    )
+    external_buffers_for_abi = _append_unique_names(
+        external_buffers,
+        train_step_output_buffers,
+    )
     extent = _validated_buffer_extent(buffer_extent)
     entry_name = _safe_identifier(
         entry_symbol or getattr(region, "entry_symbol", None) or getattr(region, "name", None)
@@ -963,13 +986,17 @@ def build_path_c_descriptor_prim_func(
         name: _buffer_shape(name, extent, resolved_shape_env)
         for name in external_buffers
     }
+    dtype_by_buffer = dict(dtype_by_buffer)
+    for name in train_step_output_buffers:
+        dtype_by_buffer[name] = "float32"
+        shape_by_buffer[name] = (1,)
     loop_extent = _descriptor_loop_extent(
         external_buffers,
         extent,
         resolved_shape_env,
     )
     physical_abi_plan = _physical_abi_plan(
-        external_buffers=external_buffers,
+        external_buffers=external_buffers_for_abi,
         shape_by_buffer=shape_by_buffer,
         dtype_by_buffer=dtype_by_buffer,
         buffer_extent=extent,
@@ -986,7 +1013,7 @@ def build_path_c_descriptor_prim_func(
         physical_abi_plan=physical_abi_plan,
         internal_buffer_policy=validated_internal_buffer_policy,
         loop_policy=validated_loop_policy,
-        external_buffers=external_buffers,
+        external_buffers=external_buffers_for_abi,
         shape_by_buffer=shape_by_buffer,
         dtype_by_buffer=dtype_by_buffer,
         buffer_extent=extent,
@@ -1033,6 +1060,9 @@ def build_path_c_descriptor_prim_func(
     ).with_attr(
         "tl.fusion.physical_abi.physical_buffer_shapes",
         json.dumps(physical_abi_plan.physical_buffer_shapes, sort_keys=True),
+    ).with_attr(
+        "tl.fusion.train_step_output_abi",
+        json.dumps(train_step_output_abi_payload, sort_keys=True),
     )
     compile_pass_configs = _descriptor_tilelang_compile_pass_configs(
         descriptors,
@@ -1056,8 +1086,8 @@ def build_path_c_descriptor_prim_func(
     prim_func._cppmega_path_c_physical_abi_policy = validated_physical_abi_policy
     prim_func._cppmega_path_c_internal_buffer_shapes = internal_buffer_shapes
     prim_func._cppmega_path_c_buffer_abi_shapes = {
-        name: _buffer_shape(name, extent, resolved_shape_env)
-        for name in external_buffers
+        name: shape_by_buffer[name]
+        for name in external_buffers_for_abi
     }
     prim_func._cppmega_path_c_physical_buffer_abi_shapes = dict(
         physical_abi_plan.physical_buffer_shapes
@@ -1074,6 +1104,9 @@ def build_path_c_descriptor_prim_func(
     prim_func._cppmega_path_c_loop_extent = loop_extent
     prim_func._cppmega_path_c_generated_source = source
     prim_func._cppmega_path_c_compile_pass_configs = compile_pass_configs
+    prim_func._cppmega_path_c_train_step_output_abi = dict(
+        train_step_output_abi_payload
+    )
     return prim_func
 
 
@@ -1088,6 +1121,43 @@ def _descriptor_tilelang_compile_pass_configs(
     ):
         return {"tirx.disable_cse_tir": True}
     return {}
+
+
+def _append_unique_names(
+    names: Sequence[str],
+    extra_names: Sequence[str],
+) -> tuple[str, ...]:
+    values = [str(name) for name in names]
+    seen = set(values)
+    for raw_name in extra_names:
+        name = str(raw_name)
+        if name in seen:
+            continue
+        values.append(name)
+        seen.add(name)
+    return tuple(values)
+
+
+def _train_step_output_abi_payload(
+    *,
+    declared: bool,
+    outputs_computed: bool = False,
+) -> dict[str, Any]:
+    return {
+        "declared": bool(declared),
+        "outputs_computed": bool(outputs_computed),
+        "logical_outputs": _TRAIN_STEP_SCALAR_OUTPUT_ABI_NAMES
+        if declared
+        else (),
+        "reason": _TRAIN_STEP_SCALAR_OUTPUT_ABI_REASON
+        if declared and not outputs_computed
+        else (
+            "train-step scalar ABI slots are generated and populated by fused "
+            "suffix loss codegen"
+            if declared
+            else "train-step scalar ABI slots are not required for this descriptor"
+        ),
+    }
 
 
 def _descriptor_prim_func_source(
@@ -7412,6 +7482,7 @@ def _dynamic_descriptor_target_for_region(
         internal_buffer_policy=internal_buffer_policy,
         loop_policy=loop_policy,
     )
+    train_step_output_abi = _region_requires_train_step_output_abi(region, nodes)
     schedule_name = (
         acceptance_profile.schedule_name
         if acceptance_profile is not None
@@ -7430,6 +7501,8 @@ def _dynamic_descriptor_target_for_region(
         extra_steps.append("z3_sync_async_schedule_points")
     if shape_env is not None:
         extra_steps.append("cache_key_shape_specialization_audit")
+    if train_step_output_abi:
+        extra_steps.append("train_step_scalar_output_abi")
     if extra_steps:
         seen = set(required_codegen_steps)
         required_codegen_steps = (
@@ -7493,6 +7566,7 @@ def _dynamic_descriptor_target_for_region(
             internal_buffer_policy=internal_buffer_policy,
             loop_policy=loop_policy,
             physical_abi_policy=physical_abi_policy,
+            train_step_output_abi=train_step_output_abi,
         ),
         required_real_abi_inputs=required_real_abi_inputs,
         brick_descriptors=descriptors,
@@ -7501,6 +7575,20 @@ def _dynamic_descriptor_target_for_region(
         loop_policy=loop_policy,
         physical_abi_policy=physical_abi_policy,
     )
+
+
+def _region_requires_train_step_output_abi(
+    region: Any,
+    nodes: Sequence[_ScheduleNodeView],
+) -> bool:
+    metadata = getattr(region, "metadata", {}) or {}
+    if bool(metadata.get("path_c_acceptance_fixture_abi", False)):
+        return False
+    if metadata.get("path_c_chain_source_region"):
+        return False
+    if not metadata.get("path_c_bricks"):
+        return False
+    return any(str(node.op_name).endswith("_bwd") for node in nodes)
 
 
 def _physical_abi_policy_for_region(

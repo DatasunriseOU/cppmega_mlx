@@ -235,6 +235,41 @@ class _UnboundReadyFusedTrainBlockTrainingRuntime(
         self.unbind_training_graph(owner="CompiledPretrainingStep")
 
 
+class _ContractedFusedTrainBlockArtifact:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, tuple[str, ...]]] = []
+
+    def __call__(self, *args: Any, **kwargs: Any) -> None:
+        self.calls.append(("call", tuple(kwargs)))
+
+    def forward(self, *args: Any, **kwargs: Any) -> None:
+        self.calls.append(("forward", tuple(kwargs)))
+
+    def backward(self, *args: Any, **kwargs: Any) -> None:
+        self.calls.append(("backward", tuple(kwargs)))
+
+    def value_and_grad(self, model: Any, batch: Mapping[str, mx.array], *, bank_owner: Any) -> tuple[Any, Any]:
+        self.calls.append(("value_and_grad", tuple(sorted(batch))))
+        del model, bank_owner
+        raise AssertionError("unit test only validates automatic runtime binding")
+
+    def value_and_grad_contract(self) -> dict[str, Any]:
+        return {
+            "contract": m04_train_step.PATH_C_FUSED_TRAIN_BLOCK_VALUE_AND_GRAD_CONTRACT,
+            "owner": "CompiledPretrainingStep",
+            "uses_fused_train_block_runtime": True,
+            "uses_forward_hook": True,
+            "uses_backward_or_vjp_hook": True,
+            "returns_model_grads": True,
+            "returns_full_model_grads": True,
+            "gradient_scope": "full_model",
+            "loss_cotangent_bridge_ready": True,
+            "model_gradient_tree_ready": True,
+            "delegates_to_eager_loss_and_grad": False,
+            "hidden_packing_performed": False,
+        }
+
+
 class _ContractedLossCotangentBridge:
     def __init__(self) -> None:
         self.calls: list[tuple[str, tuple[str, ...]]] = []
@@ -3931,9 +3966,13 @@ def test_fp8_path_c_training_route_for_model_auto_compiles_fused_artifact_when_b
     )
 
     auto_install = route["path_c_fusion"]["fused_train_block_auto_install"]
-    assert auto_install["status"] == "ok"
+    assert auto_install["status"] == "blocked"
     assert auto_install["artifact_compile"]["status"] == "ok"
     assert auto_install["artifact_compile"]["artifact_bound"] is True
+    assert auto_install["training_runtime_available"] is False
+    assert auto_install["training_runtime_contract"]["status"] == (
+        m04_train_step.FP8_PATH_C_FUSED_TRAIN_BLOCK_TRAINING_RUNTIME_MISSING_STATUS
+    )
     assert auto_install["hidden_packing_performed"] is False
     assert route["selected_action"] == "run_path_c_split_training_route"
     assert route["single_fused_train_block_standalone_dispatch_available"] is True
@@ -3943,6 +3982,59 @@ def test_fp8_path_c_training_route_for_model_auto_compiles_fused_artifact_when_b
     ] is True
     assert callable(model.path_c_fused_train_block_artifact)
     assert lowerer_calls[0]["target"] == "metal"
+
+
+def test_fp8_path_c_training_route_for_model_auto_wraps_contracted_fused_artifact(
+    tmp_path: Path,
+    path_c_fusion_auto_env: None,
+) -> None:
+    del path_c_fusion_auto_env
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--synthetic",
+            "--dtype",
+            "fp8_path_c",
+            "--pattern",
+            "A",
+            "--depth",
+            "1",
+            "--dsa-a-layer-ranks",
+            "0",
+            "--output",
+            str(tmp_path / "receipt.json"),
+        ]
+    )
+    config = m04_train_step.config_from_args(args, data_path=tmp_path / "tokens.npz")
+    model = build_local_gb10_quarter_tiny_smoke_model()
+    sequence_length = m04_train_step.path_c_training_sequence_length(config)
+    model.path_c_physical_abi_bank_owner = _model_route_physical_bank_owner(
+        model,
+        sequence_length=sequence_length,
+    )
+    artifact = _ContractedFusedTrainBlockArtifact()
+    model.path_c_fused_train_block_artifact = artifact
+
+    route = m04_train_step.fp8_path_c_training_route_payload_for_model(
+        config,
+        model,
+    )
+
+    runtime = model.path_c_fused_train_block_training_runtime
+    assert runtime.artifact is artifact
+    assert runtime.bank_owner is model.path_c_physical_abi_bank_owner
+    assert runtime.training_graph_binding() == {
+        "owner": "CompiledPretrainingStep",
+        "uses_fused_train_block_runtime": True,
+        "uses_forward_hook": True,
+        "uses_backward_or_vjp_hook": True,
+    }
+    assert route["selected_action"] == "run_path_c_fused_train_block_route"
+    assert route["fused_train_block_training_runtime_available"] is True
+    assert route["single_fused_train_block_runtime_available"] is True
+    assert route["fused_train_block_training_runtime_contract"]["status"] == "ok"
+    assert route["path_c_fusion"]["runtime_training_binding"][
+        "runtime_uses_fused_train_block"
+    ] is True
 
 
 def test_fp8_path_c_training_route_for_model_auto_binds_model_training_runtime(
@@ -4038,9 +4130,13 @@ def test_path_c_fused_train_block_runtime_installer_binds_model_owned_banks(
         sequence_length=sequence_length,
     )
 
-    assert install["status"] == "ok"
+    assert install["status"] == "blocked"
     assert install["runtime_uses_fused_train_block"] is True
     assert install["runtime_binding"]["status"] == "ok"
+    assert install["training_runtime_available"] is False
+    assert install["training_runtime_contract"]["status"] == (
+        m04_train_step.FP8_PATH_C_FUSED_TRAIN_BLOCK_TRAINING_RUNTIME_MISSING_STATUS
+    )
     assert install["hidden_packing_performed"] is False
     assert model.path_c_physical_abi_bank_owner.owner_name == (
         "local_gb10_quarter.path_c_physical_abi_banks"
@@ -4158,6 +4254,18 @@ def test_compile_path_c_fused_train_block_artifact_for_model_lowers_selected_aot
     assert compiled["implementation_kind"] == "production"
     assert compiled["plan"]["single_kernel_fused"] is True
     assert compiled["plan"]["backward_graph"] == "aot_autograd"
+    training_abi_contract = compiled["training_abi_contract"]
+    assert training_abi_contract["status"] == "incomplete"
+    assert training_abi_contract["can_back_value_and_grad"] is False
+    assert training_abi_contract["loss_output_available"] is True
+    assert training_abi_contract["ntokens_output_available"] is True
+    assert training_abi_contract["train_step_output_abi_declared"] is True
+    assert training_abi_contract["train_step_outputs_computed"] is False
+    assert training_abi_contract["gradient_output_count"] > 0
+    assert training_abi_contract["logical_buffer_count"] > (
+        training_abi_contract["kernel_parameter_count"]
+    )
+    assert training_abi_contract["missing_value_and_grad_outputs"] == []
     assert lowerer_calls[0]["target"] == "metal"
 
 
@@ -4202,12 +4310,49 @@ def test_path_c_fused_train_block_runtime_installer_compiles_artifact_when_banks
         sequence_length=sequence_length,
     )
 
-    assert install["status"] == "ok"
+    assert install["status"] == "blocked"
     assert install["artifact_compile"]["status"] == "ok"
     assert install["artifact_compile"]["native_compile_ok"] is True
     assert install["artifact_compile"]["artifact_bound"] is True
+    assert install["artifact_compile"]["training_abi_contract"]["status"] == (
+        "incomplete"
+    )
+    assert (
+        install["artifact_compile"]["training_abi_contract"][
+            "can_back_value_and_grad"
+        ]
+        is False
+    )
+    assert (
+        install["artifact_compile"]["training_abi_contract"][
+            "loss_output_available"
+        ]
+        is True
+    )
+    assert (
+        install["artifact_compile"]["training_abi_contract"][
+            "ntokens_output_available"
+        ]
+        is True
+    )
+    assert (
+        install["artifact_compile"]["training_abi_contract"][
+            "train_step_outputs_computed"
+        ]
+        is False
+    )
+    assert (
+        install["artifact_compile"]["training_abi_contract"][
+            "missing_value_and_grad_outputs"
+        ]
+        == []
+    )
     assert "artifact" not in install["artifact_compile"]
     assert install["runtime_uses_fused_train_block"] is True
+    assert install["training_runtime_available"] is False
+    assert install["training_runtime_contract"]["status"] == (
+        m04_train_step.FP8_PATH_C_FUSED_TRAIN_BLOCK_TRAINING_RUNTIME_MISSING_STATUS
+    )
     assert install["hidden_packing_performed"] is False
     assert callable(model.path_c_fused_train_block_artifact)
     assert lowerer_calls[0]["target"] == "metal"

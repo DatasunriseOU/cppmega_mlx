@@ -108,6 +108,94 @@ class PathCGradientBufferCapture:
         self.events.clear()
 
 
+class PathCFusedTrainBlockTrainingRuntime:
+    """Training runtime wrapper for a contracted fused Path C train artifact.
+
+    The wrapper binds an already-compiled fused artifact to caller/model-owned
+    physical ABI banks. It never allocates, packs, casts, or reshapes tensors;
+    artifacts that need those steps must fail closed before reaching this seam.
+    """
+
+    contract = PATH_C_FUSED_TRAIN_BLOCK_TRAINING_RUNTIME_CONTRACT
+    training_critical_path = True
+    hidden_packing_performed = False
+    no_hidden_allocation_policy = True
+    uses_fused_train_block_runtime = True
+
+    def __init__(
+        self,
+        *,
+        artifact: Any,
+        bank_owner: Any,
+        owner_name: str,
+    ) -> None:
+        if not callable(artifact):
+            raise TypeError("fused train-block artifact must be callable")
+        if not callable(getattr(artifact, "forward", None)):
+            raise TypeError("fused train-block artifact must define forward")
+        if not (
+            callable(getattr(artifact, "backward", None))
+            or callable(getattr(artifact, "vjp", None))
+        ):
+            raise TypeError("fused train-block artifact must define backward or vjp")
+        if not callable(getattr(artifact, "value_and_grad", None)):
+            raise TypeError("fused train-block artifact must define value_and_grad")
+        if not callable(getattr(artifact, "value_and_grad_contract", None)):
+            raise TypeError(
+                "fused train-block artifact must define value_and_grad_contract"
+            )
+        self.artifact = artifact
+        self.bank_owner = bank_owner
+        self.owner_name = owner_name
+        self._binding: dict[str, Any] | None = None
+
+    def _with_bank_owner(self, kwargs: Mapping[str, Any]) -> dict[str, Any]:
+        payload = dict(kwargs)
+        payload.setdefault("bank_owner", self.bank_owner)
+        return payload
+
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
+        return self.artifact.forward(*args, **self._with_bank_owner(kwargs))
+
+    def backward(self, *args: Any, **kwargs: Any) -> Any:
+        backward = getattr(self.artifact, "backward", None)
+        if callable(backward):
+            return backward(*args, **self._with_bank_owner(kwargs))
+        return self.artifact.vjp(*args, **self._with_bank_owner(kwargs))
+
+    def vjp(self, *args: Any, **kwargs: Any) -> Any:
+        vjp = getattr(self.artifact, "vjp", None)
+        if callable(vjp):
+            return vjp(*args, **self._with_bank_owner(kwargs))
+        return self.backward(*args, **kwargs)
+
+    def value_and_grad(
+        self,
+        model: nn.Module,
+        batch: Mapping[str, mx.array],
+        loss_and_grad: Any,
+    ) -> tuple[tuple[mx.array, mx.array], Any]:
+        del loss_and_grad
+        return self.artifact.value_and_grad(
+            model,
+            batch,
+            bank_owner=self.bank_owner,
+        )
+
+    def bind_training_graph(self, **binding: Any) -> None:
+        self._binding = dict(binding)
+
+    def unbind_training_graph(self, *, owner: str) -> None:
+        if self._binding is not None and self._binding.get("owner") == owner:
+            self._binding = None
+
+    def training_graph_binding(self) -> dict[str, Any]:
+        return dict(self._binding or {})
+
+    def value_and_grad_contract(self) -> Mapping[str, Any]:
+        return self.artifact.value_and_grad_contract()
+
+
 def _path_c_capture_event_metadata(event: Mapping[str, Any]) -> Mapping[str, Any]:
     metadata: dict[str, Any] = {}
     for key, value in event.items():
@@ -660,6 +748,7 @@ __all__ = [
     "PATH_C_TRAINING_VALUE_AND_GRAD_CONTRACT",
     "PathCGradientBufferCapture",
     "PathCGradientProbe",
+    "PathCFusedTrainBlockTrainingRuntime",
     "PathCTrainingRuntime",
     "REGIONAL_COMPILE_TARGETS",
     "maybe_compile_region",

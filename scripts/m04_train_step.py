@@ -84,6 +84,7 @@ from cppmega_mlx.recipes.pattern import expand_nam_pattern  # noqa: E402
 from cppmega_mlx.training.compiled import (  # noqa: E402
     CompiledPretrainingStep,
     PathCGradientBufferCapture,
+    PathCFusedTrainBlockTrainingRuntime,
 )
 from cppmega_mlx.training.cut_cross_entropy import (  # noqa: E402
     DEFAULT_CHUNK_ROWS,
@@ -2766,16 +2767,27 @@ def fp8_path_c_training_route_payload_for_model(
         "path_c_fused_train_block_training_runtime",
         None,
     )
+    artifact_can_back_training_runtime = (
+        _path_c_fused_train_block_artifact_has_training_runtime_contract(
+            model_fused_artifact
+        )
+    )
     if (
         auto_install_fused_train_block
         and model_bank_owner is not None
-        and not callable(model_fused_artifact)
+        and (
+            not callable(model_fused_artifact)
+            or (
+                model_fused_training_runtime is None
+                and artifact_can_back_training_runtime
+            )
+        )
     ):
         auto_install_report = install_path_c_fused_train_block_runtime_for_model(
             model=model,
             bank_owner=model_bank_owner,
             training_runtime=model_fused_training_runtime,
-            compile_artifact=True,
+            compile_artifact=not callable(model_fused_artifact),
             artifact_lowerer=fused_train_block_artifact_lowerer,
             artifact_target_name=fused_train_block_artifact_target_name,
             artifact_execution_backend=(
@@ -2824,6 +2836,41 @@ def fp8_path_c_training_route_payload_for_model(
         if isinstance(path_c_fusion, dict):
             path_c_fusion["fused_train_block_auto_install"] = auto_install_report
     return route
+
+
+def _path_c_fused_train_block_artifact_has_training_runtime_contract(
+    artifact: Any,
+) -> bool:
+    return bool(
+        callable(artifact)
+        and callable(getattr(artifact, "forward", None))
+        and (
+            callable(getattr(artifact, "backward", None))
+            or callable(getattr(artifact, "vjp", None))
+        )
+        and callable(getattr(artifact, "value_and_grad", None))
+        and callable(getattr(artifact, "value_and_grad_contract", None))
+    )
+
+
+def _path_c_fused_train_block_training_runtime_from_artifact(
+    *,
+    artifact: Any,
+    bank_owner: Any,
+    runtime_owner: str,
+) -> Any | None:
+    if not _path_c_fused_train_block_artifact_has_training_runtime_contract(
+        artifact
+    ):
+        return None
+    try:
+        return PathCFusedTrainBlockTrainingRuntime(
+            artifact=artifact,
+            bank_owner=bank_owner,
+            owner_name=runtime_owner,
+        )
+    except TypeError:
+        return None
 
 
 def _path_c_physical_abi_bank_plan_payload(
@@ -3034,6 +3081,107 @@ def path_c_fusion_runtime_training_binding_payload(
         }
 
 
+def _path_c_fused_train_block_training_abi_contract_payload(
+    prim_func: Any | None,
+) -> dict[str, Any]:
+    if prim_func is None:
+        return {
+            "contract": PATH_C_FUSED_TRAIN_BLOCK_VALUE_AND_GRAD_CONTRACT,
+            "status": "unavailable",
+            "can_back_value_and_grad": False,
+            "loss_output_available": False,
+            "ntokens_output_available": False,
+            "returns_model_grads": False,
+            "returns_full_model_grads": False,
+            "train_step_output_abi_declared": False,
+            "train_step_outputs_computed": False,
+            "logical_buffer_count": 0,
+            "kernel_parameter_count": 0,
+            "gradient_output_count": 0,
+            "missing_value_and_grad_outputs": ["loss", "ntokens", "model_grads"],
+            "loss_output_candidates": [],
+            "ntokens_output_candidates": [],
+            "sample_gradient_outputs": [],
+            "reason": "generated fused train-block PrimFunc was unavailable",
+        }
+    physical_abi_map = dict(
+        getattr(prim_func, "_cppmega_path_c_physical_buffer_abi_map", {}) or {}
+    )
+    physical_abi_shapes = dict(
+        getattr(prim_func, "_cppmega_path_c_physical_buffer_abi_shapes", {}) or {}
+    )
+    train_step_output_abi = dict(
+        getattr(prim_func, "_cppmega_path_c_train_step_output_abi", {}) or {}
+    )
+    train_step_output_abi_declared = bool(train_step_output_abi.get("declared"))
+    train_step_outputs_computed = bool(
+        train_step_output_abi.get("outputs_computed")
+    )
+    logical_names = tuple(str(name) for name in physical_abi_map)
+
+    def value_output_candidates(semantic_name: str) -> list[str]:
+        accepted_leaf_names = {
+            "loss": {"loss", "train_loss", "total_loss"},
+            "ntokens": {"ntokens", "num_tokens", "token_count"},
+        }[semantic_name]
+        matches: list[str] = []
+        for logical_name in logical_names:
+            leaf = logical_name.rsplit("/", 1)[-1].rsplit(".", 1)[-1]
+            if leaf not in accepted_leaf_names:
+                continue
+            entry = physical_abi_map.get(logical_name, {})
+            size = entry.get("size") if isinstance(entry, Mapping) else None
+            shape = entry.get("shape") if isinstance(entry, Mapping) else None
+            if size == 1 or tuple(shape or ()) in ((), (1,)):
+                matches.append(logical_name)
+        return sorted(matches)
+
+    gradient_outputs = sorted(
+        logical_name for logical_name in logical_names if logical_name.endswith("_grad")
+    )
+    loss_outputs = value_output_candidates("loss")
+    ntokens_outputs = value_output_candidates("ntokens")
+    missing_outputs: list[str] = []
+    if not loss_outputs:
+        missing_outputs.append("loss")
+    if not ntokens_outputs:
+        missing_outputs.append("ntokens")
+    if not gradient_outputs:
+        missing_outputs.append("model_grads")
+    can_back_value_and_grad = not missing_outputs and train_step_outputs_computed
+    return {
+        "contract": PATH_C_FUSED_TRAIN_BLOCK_VALUE_AND_GRAD_CONTRACT,
+        "status": "ok" if can_back_value_and_grad else "incomplete",
+        "can_back_value_and_grad": can_back_value_and_grad,
+        "loss_output_available": bool(loss_outputs),
+        "ntokens_output_available": bool(ntokens_outputs),
+        "returns_model_grads": bool(gradient_outputs),
+        "returns_full_model_grads": False,
+        "train_step_output_abi_declared": train_step_output_abi_declared,
+        "train_step_outputs_computed": train_step_outputs_computed,
+        "train_step_output_abi": train_step_output_abi,
+        "logical_buffer_count": len(logical_names),
+        "kernel_parameter_count": len(physical_abi_shapes),
+        "gradient_output_count": len(gradient_outputs),
+        "missing_value_and_grad_outputs": missing_outputs,
+        "loss_output_candidates": loss_outputs,
+        "ntokens_output_candidates": ntokens_outputs,
+        "sample_gradient_outputs": gradient_outputs[:8],
+        "reason": (
+            "generated fused train-block ABI exposes loss, ntokens, and gradient "
+            "buffers for value_and_grad"
+            if can_back_value_and_grad
+            else "generated fused train-block ABI declares the train-step "
+            "loss/ntokens scalar slots, but suffix loss codegen has not populated "
+            "them yet"
+            if not missing_outputs
+            else "generated fused train-block ABI exposes gradient buffers but "
+            "does not yet expose all outputs required for a single-kernel "
+            "train-step value_and_grad runtime"
+        ),
+    }
+
+
 def _path_c_fused_train_block_plan_payload(plan: Any) -> dict[str, Any]:
     contract = getattr(plan, "schedule_contract", None)
     return {
@@ -3137,6 +3285,15 @@ def compile_path_c_fused_train_block_artifact_for_model(
         required_real_abi_inputs=schedule_target.required_real_abi_inputs,
     )
     try:
+        training_abi_contract = _path_c_fused_train_block_training_abi_contract_payload(
+            schedule_template(scheduled.region)
+        )
+    except Exception as exc:
+        training_abi_contract = {
+            **_path_c_fused_train_block_training_abi_contract_payload(None),
+            "reason": str(exc),
+        }
+    try:
         compiled = compile_path_c_region(
             scheduled.region,
             schedule_template=schedule_template,
@@ -3183,6 +3340,7 @@ def compile_path_c_fused_train_block_artifact_for_model(
             "native_compile_ok": False,
             "hidden_packing_performed": False,
             "plan": plan_payload,
+            "training_abi_contract": training_abi_contract,
             "artifact": None,
         }
     if not bool(plan_payload["single_kernel_fused"]):
@@ -3201,6 +3359,7 @@ def compile_path_c_fused_train_block_artifact_for_model(
             "native_compile_ok": False,
             "hidden_packing_performed": False,
             "plan": plan_payload,
+            "training_abi_contract": training_abi_contract,
             "artifact": None,
         }
     return {
@@ -3217,6 +3376,7 @@ def compile_path_c_fused_train_block_artifact_for_model(
         "native_compile_ok": True,
         "hidden_packing_performed": False,
         "plan": plan_payload,
+        "training_abi_contract": training_abi_contract,
         "artifact": artifact,
     }
 
@@ -3409,6 +3569,15 @@ def install_path_c_fused_train_block_runtime_for_model(
             "execution": None,
         }
 
+    if training_runtime is None and resolved_bank_owner is not None:
+        training_runtime = (
+            _path_c_fused_train_block_training_runtime_from_artifact(
+                artifact=resolved_artifact,
+                bank_owner=resolved_bank_owner,
+                runtime_owner=runtime_owner,
+            )
+        )
+
     training_runtime_contract = (
         path_c_fused_train_block_training_runtime_contract_payload(
             training_runtime=training_runtime,
@@ -3432,39 +3601,41 @@ def install_path_c_fused_train_block_runtime_for_model(
                     runtime_binding=runtime_binding,
                 )
             )
-        if training_runtime_contract.get("status") != "ok":
-            if training_runtime_bound:
-                unbind_training_graph = getattr(
-                    training_runtime,
-                    "unbind_training_graph",
-                    None,
+    if training_runtime_contract.get("status") != "ok":
+        if training_runtime_bound:
+            unbind_training_graph = getattr(
+                training_runtime,
+                "unbind_training_graph",
+                None,
+            )
+            if callable(unbind_training_graph):
+                unbind_training_graph(owner="CompiledPretrainingStep")
+        model.path_c_physical_abi_bank_owner = resolved_bank_owner
+        model.path_c_fused_train_block_artifact = resolved_artifact
+        return {
+            "status": "blocked",
+            "reason": training_runtime_contract.get("reason"),
+            "runtime_owner": runtime_owner,
+            "route_region": getattr(selected_region, "name", None),
+            "binding_status": runtime_binding.get("status"),
+            "runtime_uses_fused_train_block": True,
+            "runtime_binding": runtime_binding,
+            "training_runtime_available": False,
+            "training_runtime_contract": training_runtime_contract,
+            "hidden_packing_performed": bool(
+                runtime_binding.get("hidden_packing_performed", False)
+                or training_runtime_contract.get(
+                    "hidden_packing_performed",
+                    False,
                 )
-                if callable(unbind_training_graph):
-                    unbind_training_graph(owner="CompiledPretrainingStep")
-            return {
-                "status": "blocked",
-                "reason": training_runtime_contract.get("reason"),
-                "runtime_owner": runtime_owner,
-                "route_region": getattr(selected_region, "name", None),
-                "binding_status": runtime_binding.get("status"),
-                "runtime_uses_fused_train_block": True,
-                "runtime_binding": runtime_binding,
-                "training_runtime_available": False,
-                "training_runtime_contract": training_runtime_contract,
-                "hidden_packing_performed": bool(
-                    runtime_binding.get("hidden_packing_performed", False)
-                    or training_runtime_contract.get(
-                        "hidden_packing_performed",
-                        False,
-                    )
-                ),
-                "artifact_compile": (
-                    _path_c_fused_train_block_artifact_compile_report(
-                        artifact_compile_payload
-                    )
-                ),
-                "execution": None,
-            }
+            ),
+            "artifact_compile": (
+                _path_c_fused_train_block_artifact_compile_report(
+                    artifact_compile_payload
+                )
+            ),
+            "execution": None,
+        }
 
     model.path_c_physical_abi_bank_owner = resolved_bank_owner
     model.path_c_fused_train_block_artifact = resolved_artifact

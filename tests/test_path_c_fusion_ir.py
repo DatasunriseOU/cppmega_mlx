@@ -3652,6 +3652,54 @@ def test_untagged_mra_model_route_builds_dynamic_schedule_and_real_abi() -> None
     ) in generated_source
 
 
+def test_model_derived_fwd_bwd_descriptor_declares_train_step_scalar_abi() -> None:
+    cfg = local_gb10_quarter_profile().tiny_smoke_config(
+        pattern="MRA",
+        depth=3,
+        dsa_a_layer_ranks=(0,),
+        max_seq_length=128,
+        hidden_size=32,
+        num_attention_heads=4,
+        mamba_head_dim=8,
+        mamba_state_dim=4,
+        mamba_groups=1,
+        m2rnn_k_head_dim=8,
+        m2rnn_v_head_dim=8,
+    )
+    model = SimpleNamespace(route_symbols=("M", "R", "A"), config=cfg)
+    fwd_region = build_path_c_model_regions_from_model(
+        model,
+        region_prefix="dynamic_mra_model",
+    )[0]
+    region = build_path_c_aot_autograd_region(fwd_region)
+    target = select_path_c_fusion_schedule_target(region)
+
+    assert target is not None
+
+    prim_func = target.schedule_template(region)
+    output_abi = prim_func._cppmega_path_c_train_step_output_abi
+    physical_abi_map = prim_func._cppmega_path_c_physical_buffer_abi_map
+    buffer_abi_shapes = prim_func._cppmega_path_c_buffer_abi_shapes
+
+    assert output_abi == {
+        "declared": True,
+        "outputs_computed": False,
+        "logical_outputs": ("loss", "ntokens"),
+        "reason": (
+            "train-step scalar ABI slots are declared, but suffix loss "
+            "codegen is not fused into the descriptor body yet"
+        ),
+    }
+    assert buffer_abi_shapes["loss"] == (1,)
+    assert buffer_abi_shapes["ntokens"] == (1,)
+    assert physical_abi_map["loss"]["bank"] == "path_c_float32_abi_bank"
+    assert physical_abi_map["loss"]["shape"] == (1,)
+    assert physical_abi_map["loss"]["dtype"] == "float32"
+    assert physical_abi_map["ntokens"]["bank"] == "path_c_float32_abi_bank"
+    assert physical_abi_map["ntokens"]["shape"] == (1,)
+    assert physical_abi_map["ntokens"]["dtype"] == "float32"
+
+
 def test_model_region_shape_env_specializes_contract_and_cache_key() -> None:
     base_profile = local_gb10_quarter_profile()
     cfg_a = base_profile.tiny_smoke_config(

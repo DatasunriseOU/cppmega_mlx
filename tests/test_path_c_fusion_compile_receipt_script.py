@@ -422,7 +422,7 @@ def test_runtime_smoke_reports_standalone_fused_artifact_not_training_route(
     assert exit_code == 0
     assert smoke["status"] == "ok"
     assert fused_route["status"] == "standalone_only_not_training_route"
-    assert fused_route["install"]["status"] == "ok"
+    assert fused_route["install"]["status"] == "blocked"
     assert fused_route["install"]["runtime_uses_fused_train_block"] is True
     assert fused_route["install"]["training_runtime_available"] is False
     assert fused_route["install"]["training_runtime_contract"]["status"] == (

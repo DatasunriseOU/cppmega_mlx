@@ -1153,7 +1153,7 @@ def _runtime_smoke_fused_train_block_route_payload(
         )
         selected_action = route.get("selected_action")
         standalone_bound = bool(
-            install.get("status") == "ok"
+            install.get("runtime_uses_fused_train_block") is True
             and runtime_binding.get("runtime_uses_fused_train_block") is True
         )
         training_route_bound = bool(
