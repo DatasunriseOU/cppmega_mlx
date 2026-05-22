@@ -303,6 +303,7 @@ export function App(): JSX.Element {
       checkpoint_save_path?: string;
       checkpoint_load_path?: string;
       inference_probe_text?: string;
+      master_dtype?: "fp32" | "bf16" | "fp16";
     },
   ) => {
     const snap = wireSpecRef.current;
@@ -344,6 +345,10 @@ export function App(): JSX.Element {
       // the pre-vs-post forward divergence probe.
       if (opts?.inference_probe_text) {
         trainOpts.inference_probe_text = opts.inference_probe_text;
+      }
+      // H23: master_dtype override (fp32/bf16/fp16).
+      if (opts?.master_dtype) {
+        trainOpts.master_dtype = opts.master_dtype;
       }
       // H20: when the spec carries sharding axes, derive fake_ranks
       // from the product of their degrees so a Train run simulates a

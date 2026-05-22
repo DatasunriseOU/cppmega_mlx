@@ -974,6 +974,12 @@ def stage_train(ctx: StageContext) -> StageResult:
             if precision_optim is not None else True)
         master_dtype = "fp32" if mixed_precision else "bf16"
         train_dtype = "bf16"
+        # H23: opts.master_dtype overrides — accepts "fp32", "bf16", "fp16".
+        _opt_master = opts.get("master_dtype")
+        if _opt_master in ("fp32", "bf16", "fp16"):
+            master_dtype = str(_opt_master)
+            if master_dtype == "fp16":
+                train_dtype = "fp16"
         fp8_active = False
         # Wire fp8_enabled from spec.sharding (payload pydantic model)
         ws_sharding = getattr(ctx.spec, "sharding", None)
