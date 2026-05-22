@@ -63,7 +63,7 @@ def create_app(*, cache_capacity: int = 50) -> FastAPI:
         return {"methods": sorted(METHOD_REGISTRY)}
 
     @app.get("/cache/stats")
-    def cache_stats() -> dict[str, int]:
+    def cache_stats() -> dict[str, int | float]:
         return cache.stats()
 
     @app.post("/cache/clear")

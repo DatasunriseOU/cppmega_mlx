@@ -84,6 +84,9 @@ class LRUCache:
         self._lock = Lock()
         self._hits = 0
         self._misses = 0
+        # V7-I07: count entries evicted by LRU bound (oldest popped
+        # to make room for newer set()).
+        self._evictions = 0
 
     @property
     def capacity(self) -> int:
@@ -121,18 +124,23 @@ class LRUCache:
             self._data[key] = snapshot
             if len(self._data) > self._capacity:
                 self._data.popitem(last=False)
+                self._evictions += 1
 
     def clear(self) -> None:
         with self._lock:
             self._data.clear()
             self._hits = 0
             self._misses = 0
+            self._evictions = 0
 
-    def stats(self) -> dict[str, int]:
+    def stats(self) -> dict[str, int | float]:
         with self._lock:
+            total = self._hits + self._misses
             return {
                 "size": len(self._data),
                 "capacity": self._capacity,
                 "hits": self._hits,
                 "misses": self._misses,
+                "evictions": self._evictions,
+                "hit_rate": (self._hits / total) if total > 0 else 0.0,
             }
