@@ -172,6 +172,7 @@ The current collected test files are:
 - tests/test_bench_dtype_cast_cost.py
 - tests/test_bench_dtype_long_horizon.py
 - tests/test_bench_inference_latency.py
+- tests/test_bench_inference_quality.py
 - tests/test_bench_inference_throughput.py
 - tests/test_bench_matrix.py
 - tests/test_bench_production_presets.py
