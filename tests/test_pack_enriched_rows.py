@@ -8,6 +8,8 @@ import pytest
 from cppmega_mlx.data.parquet_dataset import TokenParquetDataset
 from cppmega_mlx.data.nanochat_pipeline.platform_vocab import MAX_PLATFORM_IDS
 from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
+    CHANGED_CHUNK_IDS_COLUMN,
+    CHANGED_CHUNK_SPANS_COLUMN,
     PLATFORM_IDS_COLUMN,
     TOKEN_AST_DEPTH_COLUMN,
     TOKEN_CALL_EDGES_COLUMN,
@@ -18,6 +20,7 @@ from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     TOKEN_DEP_LEVELS_COLUMN,
     TOKEN_IDS_COLUMN,
     TOKEN_STRUCTURE_IDS_COLUMN,
+    TOKEN_TYPE_EDGES_COLUMN,
 )
 from scripts.nanochat_data.pack_enriched_rows import (
     DOC_IDS_COLUMN,
@@ -50,6 +53,9 @@ def _doc(
     token_chunk_kinds: list[int] | None = None,
     token_chunk_dep_levels: list[int] | None = None,
     token_call_edges: list[dict[str, int]] | None = None,
+    token_type_edges: list[dict[str, int]] | None = None,
+    changed_chunk_ids: list[int] | None = None,
+    changed_chunk_spans: list[dict[str, int]] | None = None,
 ) -> dict[str, object]:
     return {
         TOKEN_IDS_COLUMN: list(token_ids),
@@ -62,6 +68,9 @@ def _doc(
         TOKEN_CHUNK_KINDS_COLUMN: list(token_chunk_kinds or []),
         TOKEN_CHUNK_DEP_LEVELS_COLUMN: list(token_chunk_dep_levels or []),
         TOKEN_CALL_EDGES_COLUMN: list(token_call_edges or []),
+        TOKEN_TYPE_EDGES_COLUMN: list(token_type_edges or []),
+        CHANGED_CHUNK_IDS_COLUMN: list(changed_chunk_ids or []),
+        CHANGED_CHUNK_SPANS_COLUMN: list(changed_chunk_spans or []),
     }
 
 
@@ -147,6 +156,8 @@ def test_pack_documents_carries_token_and_chunk_metadata_with_offsets() -> None:
                 token_chunk_ends=[2],
                 token_chunk_kinds=[4],
                 token_chunk_dep_levels=[1],
+                changed_chunk_ids=[0],
+                changed_chunk_spans=[{"start": 0, "end": 2}],
             ),
             _doc(
                 [10, 11, 12],
@@ -159,6 +170,9 @@ def test_pack_documents_carries_token_and_chunk_metadata_with_offsets() -> None:
                 token_chunk_kinds=[1, 2],
                 token_chunk_dep_levels=[0, 2],
                 token_call_edges=[{"from": 1, "to": 0}],
+                token_type_edges=[{"from": 0, "to": 1}],
+                changed_chunk_ids=[1],
+                changed_chunk_spans=[{"start": 1, "end": 3}],
             ),
         ]
     )
@@ -176,6 +190,80 @@ def test_pack_documents_carries_token_and_chunk_metadata_with_offsets() -> None:
     assert row[TOKEN_CHUNK_KINDS_COLUMN] == [4, 1, 2]
     assert row[TOKEN_CHUNK_DEP_LEVELS_COLUMN] == [1, 0, 2]
     assert row[TOKEN_CALL_EDGES_COLUMN] == [{"from": 2, "to": 1}]
+    assert row[TOKEN_TYPE_EDGES_COLUMN] == [{"from": 1, "to": 2}]
+    assert row[CHANGED_CHUNK_IDS_COLUMN] == [0, 2]
+    assert row[CHANGED_CHUNK_SPANS_COLUMN] == [
+        {"start": 0, "end": 2},
+        {"start": 3, "end": 5},
+    ]
+
+
+@pytest.mark.parametrize(
+    ("edge_column", "edge"),
+    [
+        (TOKEN_CALL_EDGES_COLUMN, {"from": 0, "to": 1}),
+        (TOKEN_TYPE_EDGES_COLUMN, {"from": 1, "to": 0}),
+    ],
+)
+def test_normalize_document_record_rejects_graph_edges_without_chunk_layout(
+    edge_column: str,
+    edge: dict[str, int],
+) -> None:
+    record = _doc([1, 2, 3])
+    record[edge_column] = [edge]
+
+    with pytest.raises(ValueError, match="requires non-empty token_chunk"):
+        normalize_document_record(record, source_doc_index=0)
+
+
+@pytest.mark.parametrize(
+    ("edge_column", "edge"),
+    [
+        (TOKEN_CALL_EDGES_COLUMN, {"from": 0, "to": 2}),
+        (TOKEN_TYPE_EDGES_COLUMN, {"from": -1, "to": 0}),
+    ],
+)
+def test_normalize_document_record_rejects_graph_edges_out_of_chunk_range(
+    edge_column: str,
+    edge: dict[str, int],
+) -> None:
+    record = _doc(
+        [1, 2, 3],
+        token_chunk_starts=[0],
+        token_chunk_ends=[3],
+        token_chunk_kinds=[1],
+        token_chunk_dep_levels=[0],
+    )
+    record[edge_column] = [edge]
+
+    with pytest.raises(ValueError, match=f"{edge_column} edge out of range"):
+        normalize_document_record(record, source_doc_index=0)
+
+
+def test_normalize_document_record_rejects_changed_chunk_ids_without_chunk_layout() -> None:
+    record = _doc(
+        [1, 2, 3],
+        changed_chunk_ids=[0],
+        changed_chunk_spans=[{"start": 0, "end": 1}],
+    )
+
+    with pytest.raises(ValueError, match="requires non-empty token_chunk"):
+        normalize_document_record(record, source_doc_index=0)
+
+
+def test_normalize_document_record_rejects_changed_chunk_ids_out_of_range() -> None:
+    record = _doc(
+        [1, 2, 3],
+        token_chunk_starts=[0],
+        token_chunk_ends=[3],
+        token_chunk_kinds=[1],
+        token_chunk_dep_levels=[0],
+        changed_chunk_ids=[1],
+        changed_chunk_spans=[{"start": 0, "end": 1}],
+    )
+
+    with pytest.raises(ValueError, match=f"{CHANGED_CHUNK_IDS_COLUMN} out of range"):
+        normalize_document_record(record, source_doc_index=0)
 
 
 def test_pack_documents_merges_mixed_platform_ids_for_packed_row() -> None:

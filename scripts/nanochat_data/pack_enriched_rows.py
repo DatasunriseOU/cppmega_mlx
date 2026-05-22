@@ -364,6 +364,43 @@ def _normalize_changed_chunk_spans(value: Any) -> list[tuple[int, int]]:
     return spans
 
 
+def _validate_chunk_graph_references(
+    *,
+    source_doc_index: int,
+    chunk_count: int,
+    call_edges: list[dict[str, int]],
+    type_edges: list[dict[str, int]],
+    changed_chunk_ids: list[int],
+) -> None:
+    has_graph_metadata = bool(call_edges or type_edges or changed_chunk_ids)
+    if has_graph_metadata and chunk_count == 0:
+        raise ValueError(
+            "graph/chunk metadata requires non-empty token_chunk_* layout "
+            f"for source_doc_index={source_doc_index}"
+        )
+
+    for column, edges in (
+        (TOKEN_CALL_EDGES_COLUMN, call_edges),
+        (TOKEN_TYPE_EDGES_COLUMN, type_edges),
+    ):
+        for edge in edges:
+            src = int(edge["from"])
+            dst = int(edge["to"])
+            if not (0 <= src < chunk_count and 0 <= dst < chunk_count):
+                raise ValueError(
+                    f"{column} edge out of range for source_doc_index={source_doc_index}: "
+                    f"got ({src}, {dst}) with chunk_count={chunk_count}"
+                )
+
+    for chunk_id in changed_chunk_ids:
+        if not (0 <= int(chunk_id) < chunk_count):
+            raise ValueError(
+                f"{CHANGED_CHUNK_IDS_COLUMN} out of range for "
+                f"source_doc_index={source_doc_index}: got {chunk_id} "
+                f"with chunk_count={chunk_count}"
+            )
+
+
 def _normalize_chronology(record: dict[str, Any]) -> dict[str, Any]:
     chronology: dict[str, Any] = {
         REPO_COLUMN: record.get(REPO_COLUMN),
@@ -469,6 +506,13 @@ def _normalize_chunk_meta(
             f"for source_doc_index={source_doc_index}: expected equal lengths, got "
             f"{len(changed_chunk_ids)} and {len(changed_chunk_spans)}"
         )
+    _validate_chunk_graph_references(
+        source_doc_index=source_doc_index,
+        chunk_count=len(starts),
+        call_edges=call_edges,
+        type_edges=type_edges,
+        changed_chunk_ids=changed_chunk_ids,
+    )
     for start, end in changed_chunk_spans:
         if not (0 <= start < end <= token_count):
             raise ValueError(
