@@ -682,7 +682,11 @@ def stage_train(ctx: StageContext) -> StageResult:
         # when absent (preserves E-4 matrix behaviour). data_source +
         # token_count surface in extras so deep e2e can prove the real-
         # data path actually executed instead of silently degrading.
+        # V01: per-step random data key. Round-tripped through the
+        # opt.state safetensors side-car (key "_rng_key") so a resumed
+        # Train picks up the exact same data stream as a contiguous run.
         rng_key = mx.random.key(0)
+        rng_key_loaded = False
         data_source = "synthetic"
         token_count = 0
         tokenizer_used: str | None = None
@@ -1118,7 +1122,14 @@ def stage_train(ctx: StageContext) -> StageResult:
             try:
                 import safetensors.mlx as _stmlx
                 loaded_st = _stmlx.load_file(opt_state_load)
+                # V01: pull rng_key out of the opt-state bundle before
+                # tree_unflatten so it doesn't pollute opt.state. mlx
+                # rng keys are mx.uint32 arrays of shape (2,).
+                rng_buf = loaded_st.pop("_rng_key", None)
                 opt.state = nn.utils.tree_unflatten(list(loaded_st.items()))
+                if rng_buf is not None:
+                    rng_key = rng_buf
+                    rng_key_loaded = True
                 opt_state_loaded_path = str(opt_state_load)
             except FileNotFoundError as exc:
                 opt_state_warning = (
@@ -1260,17 +1271,20 @@ def stage_train(ctx: StageContext) -> StageResult:
                 pass
         # H19: opt.state save → separate file so a follow-up Train can
         # resume exactly where this one left off (Adam moments + step).
+        # V01: also persist rng_key under the "_rng_key" entry so the
+        # resumed run consumes the same synthetic data stream → enables
+        # strict 1e-5 loss continuation in the matched-fragment test.
         opt_state_save = opts.get("opt_state_save_path")
         if opt_state_save:
             try:
                 import safetensors.mlx as _stmlx
                 opt_flat = dict(nn.utils.tree_flatten(opt.state))
-                # safetensors only accepts mx.array values; strip
-                # scalars / non-array entries from opt.state.
                 opt_arrays = {
                     k: v for k, v in opt_flat.items()
                     if hasattr(v, "shape")
                 }
+                if hasattr(rng_key, "shape"):
+                    opt_arrays["_rng_key"] = rng_key
                 _stmlx.save_file(opt_arrays, opt_state_save)
                 opt_state_saved_path = str(opt_state_save)
             except Exception:
@@ -1414,6 +1428,7 @@ def stage_train(ctx: StageContext) -> StageResult:
                     "opt_state_saved_path": opt_state_saved_path,
                     "opt_state_loaded_path": opt_state_loaded_path,
                     "opt_state_warning": opt_state_warning,
+                    "rng_key_loaded": rng_key_loaded,
                 },
                 "mtp": _compute_mtp_extras(
                     all_modules, mtp_k, mtp_betas, vocab_size,
