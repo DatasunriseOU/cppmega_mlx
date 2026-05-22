@@ -17,6 +17,7 @@ from cppmega_mlx.inference import (
     RustCodeMetadataAdapter,
     TokenMetadata,
     builtin_code_metadata_adapters,
+    generate_tokens,
     get_builtin_code_metadata_adapter,
     normalize_code_language,
 )
@@ -145,6 +146,25 @@ def test_inference_side_channel_builder_adapter_metadata_smoke() -> None:
     assert result.cache_components.adapter_language == "cpp"
     assert result.cache_components.adapter_version == "fake-clang-v1"
     assert logits.shape[:2] == result.prompt_ids.shape
+
+
+def test_inference_side_channel_builder_result_feeds_generation_loop() -> None:
+    builder = InferenceSideChannelBuilder(
+        TinyTokenizer(),
+        adapter=FakeCppAdapter(),
+    )
+    result = builder.build("int x;", language="cpp")
+
+    generated = generate_tokens(
+        _tiny_model(),
+        result.prompt_ids,
+        max_new_tokens=1,
+        temperature=0.0,
+        model_kwargs=result.model_kwargs,
+    )
+    mx.eval(generated)
+
+    assert generated.shape == (1, result.prompt_ids.shape[1] + 1)
 
 
 def test_inference_side_channel_builder_fallback_policies_are_explicit() -> None:

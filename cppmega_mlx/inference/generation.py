@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal, cast
 
@@ -19,6 +19,20 @@ from cppmega_mlx.inference.engine import (
 from cppmega_mlx.inference.sampling import sample_next_token
 
 GenerationFinishReason = Literal["eos", "length"]
+
+_ZERO_GENERATED_MODEL_KWARGS = frozenset(
+    {
+        "structure_ids",
+        "dep_levels",
+        "ast_depth_ids",
+        "sibling_index_ids",
+        "node_type_ids",
+    }
+)
+_REPEAT_GENERATED_MODEL_KWARGS = frozenset({"document_ids", "platform_ids"})
+_SEQUENCE_ALIGNED_MODEL_KWARGS = (
+    _ZERO_GENERATED_MODEL_KWARGS | _REPEAT_GENERATED_MODEL_KWARGS
+)
 
 
 @dataclass(frozen=True)
@@ -86,6 +100,7 @@ def generate_tokens(
     prompt_ids: mx.array,
     *,
     max_new_tokens: int,
+    model_kwargs: Mapping[str, mx.array] | None = None,
     eos_token_id: int | None = None,
     temperature: float = 1.0,
     top_k: int | None = None,
@@ -116,7 +131,10 @@ def generate_tokens(
         if max_seq_length is not None and tokens.shape[1] >= max_seq_length:
             raise ValueError("generation would exceed model.config.max_seq_length")
 
-        step_logits = next_token_logits(model(tokens), tokens)
+        step_logits = next_token_logits(
+            model(tokens, **_model_kwargs_for_prefix(model_kwargs, tokens)),
+            tokens,
+        )
 
         step_key = None
         if key is not None:
@@ -144,6 +162,7 @@ def generate_tokens_with_kv_cache(
     prompt_ids: mx.array,
     *,
     max_new_tokens: int,
+    model_kwargs: Mapping[str, mx.array] | None = None,
     cache: ContiguousKVCache | None = None,
     cache_config: ContiguousKVCacheConfig | None = None,
     num_layers: int | None = None,
@@ -194,7 +213,14 @@ def generate_tokens_with_kv_cache(
     )
 
     key = rng_key
-    step_logits = next_token_logits(model(tokens, kv_cache=kv_cache), tokens)
+    step_logits = next_token_logits(
+        model(
+            tokens,
+            kv_cache=kv_cache,
+            **_model_kwargs_for_prefix(model_kwargs, tokens),
+        ),
+        tokens,
+    )
     for step in range(max_new_tokens):
         if max_seq_length is not None and tokens.shape[1] >= max_seq_length:
             raise ValueError("generation would exceed model.config.max_seq_length")
@@ -222,7 +248,14 @@ def generate_tokens_with_kv_cache(
         if max_seq_length is not None and tokens.shape[1] >= max_seq_length:
             raise ValueError("generation would exceed model.config.max_seq_length")
 
-        step_logits = next_token_logits(model(next_token, kv_cache=kv_cache), next_token)
+        step_logits = next_token_logits(
+            model(
+                next_token,
+                kv_cache=kv_cache,
+                **_model_kwargs_for_generated_step(model_kwargs, next_token),
+            ),
+            next_token,
+        )
 
     return tokens
 
@@ -231,6 +264,7 @@ def build_prompt_cache(
     model: Any,
     prompt_ids: mx.array,
     *,
+    model_kwargs: Mapping[str, mx.array] | None = None,
     cache: ContiguousKVCache | None = None,
     cache_config: ContiguousKVCacheConfig | None = None,
     num_layers: int | None = None,
@@ -269,7 +303,14 @@ def build_prompt_cache(
     if kv_cache_position(kv_cache) != 0:
         raise RuntimeError("prompt cache build requires an empty contiguous KV cache")
 
-    next_logits = next_token_logits(model(prompt_ids, kv_cache=kv_cache), prompt_ids)
+    next_logits = next_token_logits(
+        model(
+            prompt_ids,
+            kv_cache=kv_cache,
+            **_model_kwargs_for_prefix(model_kwargs, prompt_ids),
+        ),
+        prompt_ids,
+    )
     return PromptCacheEntry(
         prompt_ids=mx.array(prompt_ids),
         cache=kv_cache,
@@ -283,6 +324,7 @@ def generate_tokens_with_prompt_cache(
     *,
     prompt_cache: PromptCacheEntry,
     max_new_tokens: int,
+    model_kwargs: Mapping[str, mx.array] | None = None,
     eos_token_id: int | None = None,
     temperature: float = 1.0,
     top_k: int | None = None,
@@ -316,7 +358,18 @@ def generate_tokens_with_prompt_cache(
     if suffix.shape[1] == 0:
         step_logits = prompt_cache.next_logits
     else:
-        step_logits = next_token_logits(model(suffix, kv_cache=kv_cache), suffix)
+        step_logits = next_token_logits(
+            model(
+                suffix,
+                kv_cache=kv_cache,
+                **_model_kwargs_for_slice(
+                    model_kwargs,
+                    start=prefix_length,
+                    tokens=suffix,
+                ),
+            ),
+            suffix,
+        )
 
     key = rng_key
     for step in range(max_new_tokens):
@@ -343,7 +396,14 @@ def generate_tokens_with_prompt_cache(
         if max_seq_length is not None and tokens.shape[1] >= max_seq_length:
             raise ValueError("generation would exceed model.config.max_seq_length")
 
-        step_logits = next_token_logits(model(next_token, kv_cache=kv_cache), next_token)
+        step_logits = next_token_logits(
+            model(
+                next_token,
+                kv_cache=kv_cache,
+                **_model_kwargs_for_generated_step(model_kwargs, next_token),
+            ),
+            next_token,
+        )
 
     return tokens
 
@@ -353,6 +413,7 @@ def stream_generate_tokens(
     prompt_ids: mx.array,
     *,
     max_new_tokens: int,
+    model_kwargs: Mapping[str, mx.array] | None = None,
     eos_token_id: int | None = None,
     temperature: float = 1.0,
     top_k: int | None = None,
@@ -394,6 +455,7 @@ def stream_generate_tokens(
             model,
             prompt_ids,
             max_new_tokens=max_new_tokens,
+            model_kwargs=model_kwargs,
             eos_token_id=eos_token_id,
             temperature=temperature,
             top_k=top_k,
@@ -427,7 +489,10 @@ def stream_generate_tokens(
         if max_seq_length is not None and tokens.shape[1] >= max_seq_length:
             raise ValueError("generation would exceed model.config.max_seq_length")
 
-        step_logits = next_token_logits(model(tokens), tokens)
+        step_logits = next_token_logits(
+            model(tokens, **_model_kwargs_for_prefix(model_kwargs, tokens)),
+            tokens,
+        )
         key, step_key = _split_generation_key(key)
         next_token = sample_next_token(
             step_logits,
@@ -492,6 +557,137 @@ def _resolve_kv_cache(
     )
 
 
+def _model_kwargs_for_prefix(
+    model_kwargs: Mapping[str, mx.array] | None,
+    tokens: mx.array,
+) -> dict[str, mx.array]:
+    if not model_kwargs:
+        return {}
+    return {
+        name: _align_model_kwarg_for_prefix(name, value, tokens)
+        for name, value in model_kwargs.items()
+    }
+
+
+def _model_kwargs_for_slice(
+    model_kwargs: Mapping[str, mx.array] | None,
+    *,
+    start: int,
+    tokens: mx.array,
+) -> dict[str, mx.array]:
+    if not model_kwargs:
+        return {}
+    batch_size, sequence_length = _batch_sequence(tokens)
+    out: dict[str, mx.array] = {}
+    for name, value in model_kwargs.items():
+        _validate_model_kwarg_tensor(name, value)
+        if not _sequence_aligned_model_kwarg(name, value, batch_size):
+            out[name] = value
+            continue
+        available = max(0, int(value.shape[1]) - start)
+        if available >= sequence_length:
+            out[name] = value[:, start : start + sequence_length, ...]
+            continue
+        chunks = []
+        if available > 0:
+            chunks.append(value[:, start:, ...])
+        chunks.append(
+            _generated_model_kwarg_tail(
+                name,
+                value,
+                batch_size=batch_size,
+                sequence_length=sequence_length - available,
+            )
+        )
+        out[name] = mx.concatenate(chunks, axis=1) if len(chunks) > 1 else chunks[0]
+    return out
+
+
+def _model_kwargs_for_generated_step(
+    model_kwargs: Mapping[str, mx.array] | None,
+    tokens: mx.array,
+) -> dict[str, mx.array]:
+    if not model_kwargs:
+        return {}
+    batch_size, sequence_length = _batch_sequence(tokens)
+    out: dict[str, mx.array] = {}
+    for name, value in model_kwargs.items():
+        _validate_model_kwarg_tensor(name, value)
+        if _sequence_aligned_model_kwarg(name, value, batch_size):
+            out[name] = _generated_model_kwarg_tail(
+                name,
+                value,
+                batch_size=batch_size,
+                sequence_length=sequence_length,
+            )
+        else:
+            out[name] = value
+    return out
+
+
+def _align_model_kwarg_for_prefix(
+    name: str,
+    value: mx.array,
+    tokens: mx.array,
+) -> mx.array:
+    _validate_model_kwarg_tensor(name, value)
+    batch_size, sequence_length = _batch_sequence(tokens)
+    if not _sequence_aligned_model_kwarg(name, value, batch_size):
+        return value
+
+    current_length = int(value.shape[1])
+    if current_length == sequence_length:
+        return value
+    if current_length > sequence_length:
+        return value[:, :sequence_length, ...]
+    tail = _generated_model_kwarg_tail(
+        name,
+        value,
+        batch_size=batch_size,
+        sequence_length=sequence_length - current_length,
+    )
+    return mx.concatenate([value, tail], axis=1)
+
+
+def _validate_model_kwarg_tensor(name: str, value: mx.array) -> None:
+    if not isinstance(value, mx.array):
+        raise TypeError(f"model_kwargs[{name!r}] must be an mlx.core.array")
+
+
+def _sequence_aligned_model_kwarg(
+    name: str,
+    value: mx.array,
+    batch_size: int,
+) -> bool:
+    shape = value.shape
+    if not shape or int(shape[0]) != batch_size:
+        return False
+    if name == "platform_ids":
+        return len(shape) == 3
+    return name in _SEQUENCE_ALIGNED_MODEL_KWARGS and len(shape) >= 2
+
+
+def _generated_model_kwarg_tail(
+    name: str,
+    value: mx.array,
+    *,
+    batch_size: int,
+    sequence_length: int,
+) -> mx.array:
+    if sequence_length <= 0:
+        return value[:, :0, ...]
+    tail_shape = (batch_size, sequence_length, *tuple(value.shape[2:]))
+    if name in _REPEAT_GENERATED_MODEL_KWARGS and int(value.shape[1]) > 0:
+        return mx.broadcast_to(value[:, -1:, ...], tail_shape)
+    return mx.zeros(tail_shape, dtype=value.dtype)
+
+
+def _batch_sequence(tokens: mx.array) -> tuple[int, int]:
+    if len(tokens.shape) != 2:
+        raise ValueError("tokens must have shape (batch, sequence)")
+    return int(tokens.shape[0]), int(tokens.shape[1])
+
+
 def _validate_prompt_cache_prefix(
     prompt_ids: mx.array,
     prompt_cache: PromptCacheEntry,
@@ -513,6 +709,7 @@ def _stream_generate_tokens_with_kv_cache(
     prompt_ids: mx.array,
     *,
     max_new_tokens: int,
+    model_kwargs: Mapping[str, mx.array] | None,
     eos_token_id: int | None,
     temperature: float,
     top_k: int | None,
@@ -547,7 +744,14 @@ def _stream_generate_tokens_with_kv_cache(
     )
 
     key = rng_key
-    step_logits = next_token_logits(model(tokens, kv_cache=kv_cache), tokens)
+    step_logits = next_token_logits(
+        model(
+            tokens,
+            kv_cache=kv_cache,
+            **_model_kwargs_for_prefix(model_kwargs, tokens),
+        ),
+        tokens,
+    )
     for step in range(max_new_tokens):
         if max_seq_length is not None and tokens.shape[1] >= max_seq_length:
             raise ValueError("generation would exceed model.config.max_seq_length")
@@ -574,7 +778,14 @@ def _stream_generate_tokens_with_kv_cache(
             break
         if max_seq_length is not None and tokens.shape[1] >= max_seq_length:
             raise ValueError("generation would exceed model.config.max_seq_length")
-        step_logits = next_token_logits(model(next_token, kv_cache=kv_cache), next_token)
+        step_logits = next_token_logits(
+            model(
+                next_token,
+                kv_cache=kv_cache,
+                **_model_kwargs_for_generated_step(model_kwargs, next_token),
+            ),
+            next_token,
+        )
 
 
 def _split_generation_key(key: Any | None) -> tuple[Any | None, Any | None]:

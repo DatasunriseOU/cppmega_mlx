@@ -60,6 +60,28 @@ class _ScriptedLogitsModel:
         return mx.array(logits)
 
 
+class _KwargRecordingScriptedLogitsModel(_ScriptedLogitsModel):
+    def __init__(
+        self,
+        next_ids_by_step: Sequence[Sequence[int]],
+        *,
+        vocab_size: int = 16,
+        max_seq_length: int | None = None,
+    ) -> None:
+        super().__init__(
+            next_ids_by_step,
+            vocab_size=vocab_size,
+            max_seq_length=max_seq_length,
+        )
+        self.seen_model_kwargs: list[dict[str, np.ndarray]] = []
+
+    def __call__(self, tokens: mx.array, **model_kwargs: mx.array) -> mx.array:
+        self.seen_model_kwargs.append(
+            {key: np.array(value) for key, value in sorted(model_kwargs.items())}
+        )
+        return super().__call__(tokens)
+
+
 class _KVScriptedLogitsModel(_ScriptedLogitsModel):
     def __init__(
         self,
@@ -84,6 +106,34 @@ class _KVScriptedLogitsModel(_ScriptedLogitsModel):
         assert kv_cache is not None
         self.seen_cache_ids.append(id(kv_cache))
         return super().__call__(tokens)
+
+
+class _KVKwargRecordingScriptedLogitsModel(_KVScriptedLogitsModel):
+    def __init__(
+        self,
+        next_ids_by_step: Sequence[Sequence[int]],
+        *,
+        vocab_size: int = 16,
+        max_seq_length: int | None = None,
+    ) -> None:
+        super().__init__(
+            next_ids_by_step,
+            vocab_size=vocab_size,
+            max_seq_length=max_seq_length,
+        )
+        self.seen_model_kwargs: list[dict[str, np.ndarray]] = []
+
+    def __call__(
+        self,
+        tokens: mx.array,
+        *,
+        kv_cache: ContiguousKVCache | None = None,
+        **model_kwargs: mx.array,
+    ) -> mx.array:
+        self.seen_model_kwargs.append(
+            {key: np.array(value) for key, value in sorted(model_kwargs.items())}
+        )
+        return super().__call__(tokens, kv_cache=kv_cache)
 
 
 class _UpdatingKVScriptedLogitsModel(_KVScriptedLogitsModel):
@@ -182,6 +232,44 @@ def test_generate_tokens_preserves_prompt_prefix_exactly() -> None:
         generated,
         np.array([[1, 2, 7, 9], [3, 4, 8, 10]], dtype=np.int32),
     )
+
+
+def test_generate_tokens_threads_enriched_prompt_model_kwargs() -> None:
+    model = _KwargRecordingScriptedLogitsModel([[4], [5]])
+    prompt = mx.array([[1, 2]], dtype=mx.int32)
+
+    tokens = generate_tokens(
+        model,
+        prompt,
+        max_new_tokens=2,
+        temperature=0.0,
+        model_kwargs={
+            "structure_ids": mx.array([[7, 8]], dtype=mx.int32),
+            "platform_ids": mx.array([[2, 64, 0]], dtype=mx.int32),
+        },
+    )
+
+    np.testing.assert_array_equal(
+        _as_numpy(tokens),
+        np.array([[1, 2, 4, 5]], dtype=np.int32),
+    )
+    assert [kwargs["structure_ids"].shape for kwargs in model.seen_model_kwargs] == [
+        (1, 2),
+        (1, 3),
+    ]
+    np.testing.assert_array_equal(
+        model.seen_model_kwargs[0]["structure_ids"],
+        np.array([[7, 8]], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(
+        model.seen_model_kwargs[1]["structure_ids"],
+        np.array([[7, 8, 0]], dtype=np.int32),
+    )
+    for kwargs in model.seen_model_kwargs:
+        np.testing.assert_array_equal(
+            kwargs["platform_ids"],
+            np.array([[2, 64, 0]], dtype=np.int32),
+        )
 
 
 def test_generate_tokens_stops_on_eos_only_when_all_rows_emit_eos() -> None:
@@ -435,6 +523,47 @@ def test_generate_tokens_with_kv_cache_handles_batched_rows() -> None:
         np.array([[1, 2, 4, 6], [3, 4, 5, 7]], dtype=np.int32),
     )
     assert model.seen_shapes == [(2, 2), (2, 1)]
+
+
+def test_generate_tokens_with_kv_cache_uses_prompt_kwargs_then_generated_defaults() -> None:
+    model = _KVKwargRecordingScriptedLogitsModel([[4], [5]])
+    prompt = mx.array([[1, 2]], dtype=mx.int32)
+    cache = _make_cache()
+
+    tokens = generate_tokens_with_kv_cache(
+        model,
+        prompt,
+        max_new_tokens=2,
+        cache=cache,
+        temperature=0.0,
+        model_kwargs={
+            "structure_ids": mx.array([[7, 8]], dtype=mx.int32),
+            "platform_ids": mx.array([[2, 64, 0]], dtype=mx.int32),
+        },
+    )
+
+    np.testing.assert_array_equal(
+        _as_numpy(tokens),
+        np.array([[1, 2, 4, 5]], dtype=np.int32),
+    )
+    assert model.seen_shapes == [(1, 2), (1, 1)]
+    assert [kwargs["structure_ids"].shape for kwargs in model.seen_model_kwargs] == [
+        (1, 2),
+        (1, 1),
+    ]
+    np.testing.assert_array_equal(
+        model.seen_model_kwargs[0]["structure_ids"],
+        np.array([[7, 8]], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(
+        model.seen_model_kwargs[1]["structure_ids"],
+        np.array([[0]], dtype=np.int32),
+    )
+    for kwargs in model.seen_model_kwargs:
+        np.testing.assert_array_equal(
+            kwargs["platform_ids"],
+            np.array([[2, 64, 0]], dtype=np.int32),
+        )
 
 
 def test_generate_tokens_with_kv_cache_stops_on_eos_without_extra_decode() -> None:
