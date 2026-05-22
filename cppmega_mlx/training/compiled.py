@@ -61,7 +61,10 @@ REGIONAL_COMPILE_TARGETS: Mapping[CompileTarget, bool] = {
 
 STABLE_BATCH_KEYS = (
     "tokens",
+    "target_tokens",
     "attention_mask",
+    "loss_mask",
+    "document_ids",
     "structure_ids",
     "dep_levels",
     "ast_depth_ids",
@@ -538,8 +541,8 @@ def normalize_compiled_batch(
     mx.compile keys off the Python input structure as well as array shapes
     and dtypes.  Keep every optional side channel present in the dict and use
     None for absent fields so callers do not alternate between different
-    dict key sets when switching between plain token batches and structured
-    batches.
+    dict key sets when switching among plain token batches, packed-row
+    training batches, and structured batches.
     """
 
     batch_dict = ensure_lm_batch(batch).as_dict()

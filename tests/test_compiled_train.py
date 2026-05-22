@@ -10,7 +10,7 @@ import numpy as np
 from mlx.utils import tree_flatten
 import pytest
 
-from cppmega_mlx.data.batch import synthetic_token_batch
+from cppmega_mlx.data.batch import LMTokenBatch, synthetic_token_batch
 from cppmega_mlx.models.hybrid_lm import HybridTinyConfig, HybridTinyLM
 from cppmega_mlx.models.tiny_lm import TinyLM, TinyLMConfig
 from cppmega_mlx.training.compiled import (
@@ -355,10 +355,57 @@ def test_normalize_compiled_batch_uses_fixed_keys_for_optional_fields() -> None:
     plain_tokens = plain_dict["tokens"]
     assert plain_tokens is not None
     assert plain_tokens.shape == (2, 8)
+    assert plain_dict["target_tokens"] is None
     assert plain_dict["attention_mask"] is None
+    assert plain_dict["loss_mask"] is None
+    assert plain_dict["document_ids"] is None
     assert plain_dict["structure_ids"] is None
+    assert structured_dict["target_tokens"] is None
     assert structured_dict["attention_mask"] is not None
+    assert structured_dict["loss_mask"] is None
+    assert structured_dict["document_ids"] is None
     assert structured_dict["structure_ids"] is not None
+
+
+def test_normalize_compiled_batch_preserves_packed_row_training_fields() -> None:
+    tokens = mx.array([[1, 2, 3, 0]], dtype=mx.int32)
+    target_tokens = mx.array([[2, 3, 0, 0]], dtype=mx.int32)
+    loss_mask = mx.array([[1, 0, 0, 0]], dtype=mx.float32)
+    document_ids = mx.array([[0, 0, 1, 1]], dtype=mx.int32)
+    batch = LMTokenBatch(
+        tokens=tokens,
+        target_tokens=target_tokens,
+        loss_mask=loss_mask,
+        document_ids=document_ids,
+    )
+
+    normalized = normalize_compiled_batch(batch.as_dict())
+
+    assert tuple(normalized) == STABLE_BATCH_KEYS
+    assert normalized["tokens"] is tokens
+    assert normalized["target_tokens"] is target_tokens
+    assert normalized["loss_mask"] is loss_mask
+    assert normalized["document_ids"] is document_ids
+
+
+@pytest.mark.parametrize("compile_step", [False, True])
+def test_pretraining_step_honors_packed_row_loss_mask(compile_step: bool) -> None:
+    mx.random.seed(911)
+    model = TinyLM(_tiny_config())
+    optimizer = optim.AdamW(learning_rate=1e-3, weight_decay=0.0)
+    batch = LMTokenBatch(
+        tokens=mx.array([[1, 2, 3, 4]], dtype=mx.int32),
+        target_tokens=mx.array([[2, 3, 4, 0]], dtype=mx.int32),
+        loss_mask=mx.array([[1, 0, 0, 0]], dtype=mx.float32),
+    )
+
+    metrics = CompiledPretrainingStep(model, optimizer, compile=compile_step)(batch)
+
+    assert metrics.compiled is compile_step
+    assert metrics.ntokens == 1
+    assert metrics.trained_tokens == 1
+    assert math.isfinite(metrics.loss)
+    assert metrics.loss > 0
 
 
 def test_normalize_compiled_batch_does_not_mutate_mapping_inputs() -> None:

@@ -110,6 +110,27 @@ def _copy_real_parquet_head(
     pq.write_table(pa.Table.from_batches([batch]), sample_path)
 
 
+def _write_packed_row_parquet(path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+
+    table = pa.table(
+        {
+            "input_ids": pa.array([[1, 2, 3, 4]], type=pa.large_list(pa.int32())),
+            "target_ids": pa.array([[2, 3, 4, 0]], type=pa.large_list(pa.int32())),
+            "loss_mask": pa.array(
+                [[1.0, 0.0, 0.0, 0.0]],
+                type=pa.large_list(pa.float32()),
+            ),
+            "doc_ids": pa.array([[0, 0, 1, 1]], type=pa.large_list(pa.int32())),
+            "pack_id": pa.array([7], type=pa.int32()),
+            "valid_token_count": pa.array([4], type=pa.int32()),
+            "num_docs": pa.array([2], type=pa.int32()),
+        }
+    )
+    pq.write_table(table, path)
+
+
 def _tiny_route_args(symbol: str, *, steps: int = 1) -> list[str]:
     args = [
         "--json",
@@ -866,6 +887,75 @@ def test_real_gb10_parquet_cli_smoke_trains_token_only_after_retokenize(
     assert payload["trained_tokens"] == 63
     assert payload["final_loss"] > 0
     assert payload["step_metrics"][0]["ntokens"] == 63
+
+
+def test_packed_row_parquet_cli_smoke_honors_explicit_targets_and_loss_mask(
+    tmp_path: Path,
+) -> None:
+    parquet_path = tmp_path / "packed_rows.parquet"
+    _write_packed_row_parquet(parquet_path)
+
+    result = run_script(
+        str(parquet_path),
+        "--json",
+        "--data-format",
+        "parquet",
+        "--token-key",
+        "input_ids",
+        "--batch-size",
+        "1",
+        "--seq-len",
+        "4",
+        "--steps",
+        "1",
+        "--hidden-size",
+        "8",
+        "--num-attention-heads",
+        "1",
+        "--pattern",
+        "A",
+        "--depth",
+        "1",
+        "--vocab-size",
+        "16",
+        "--no-compile",
+    )
+
+    payload = _load_json_result(result)
+
+    assert payload["status"] == "ok"
+    assert payload["synthetic_npz"] is False
+    assert payload["dataset"]["path"] == str(parquet_path)
+    assert payload["dataset"]["metadata"]["source_format"] == "parquet"
+    assert payload["dataset"]["token_key"] == "input_ids"
+    assert payload["dataset"]["num_samples"] == 1
+    assert payload["dataset"]["num_batches"] == 1
+    assert payload["tokens_per_step"] == 1
+    assert payload["trained_tokens"] == 1
+    assert payload["step_metrics"][0]["ntokens"] == 1
+    assert payload["step_metrics"][0]["trained_tokens"] == 1
+    assert payload["final_loss"] > 0
+
+    receipt = payload["dataset"]["dataset_receipt"]["parquet_receipt"]
+    assert receipt["token_source"] == {
+        "mode": "token_column",
+        "column": "input_ids",
+        "type": "large_list<element: int32>",
+    }
+    assert receipt["training_column_sources"] == {
+        "target_tokens": {
+            "column": "target_ids",
+            "type": "large_list<element: int32>",
+        },
+        "loss_mask": {
+            "column": "loss_mask",
+            "type": "large_list<element: float>",
+        },
+        "document_ids": {
+            "column": "doc_ids",
+            "type": "large_list<element: int32>",
+        },
+    }
 
 
 def test_dry_run_json_accepts_explicit_no_compile() -> None:
