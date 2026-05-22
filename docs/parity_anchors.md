@@ -441,10 +441,13 @@ launchers.
   production cadence scheduling, sequence-parallel gather, or CUDA/Hopper/GB10
   kernel parity. Treat Hopper fused CE as source-only evidence until a separate
   hardware-gated receipt exists.
-- Fail-closed M0.5 receipt: no checked-in or locally observed fixed-seed
+- Fail-closed M0.5 receipt: the active non-blocking external-reference bd task
+  is cppmega-mlx-hjfn; the older mixed-scope blocker cppmega-mlx-t8f.5 is
+  superseded by that task, not closed as completed FastMTP parity evidence. No
+  checked-in or locally observed fixed-seed
   CUDA/GB10 artifact currently records the required FastMTP loss values plus
   grad norm for cppmega/megatron/fastmtp_layer.py and
-  cppmega/megatron/mtp_native_hopper_ce.py. M0.5 remains open until that
+  cppmega/megatron/mtp_native_hopper_ce.py. External M0.5 remains open until that
   artifact exists and a numerical MLX-vs-CUDA comparison is evaluated; the
   local tests above are contract coverage, not closure evidence.
 - Hardening receipt: the M0.5 manifest builder/validator now rejects nested

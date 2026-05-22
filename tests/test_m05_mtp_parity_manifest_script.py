@@ -26,6 +26,7 @@ from cppmega_mlx.training.parity import (
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "m05_mtp_parity_manifest.py"
 PYTHON = ROOT / ".venv" / "bin" / "python"
+EXTERNAL_M05_FASTMTP_TASK_ID = "cppmega-mlx-hjfn"
 
 
 def run_script(*args: str, timeout: int = 30) -> subprocess.CompletedProcess[str]:
@@ -85,6 +86,10 @@ def valid_cuda_artifact_payload() -> dict[str, Any]:
 
 def write_json(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+
+def test_m05_manifest_tracks_current_external_reference_task() -> None:
+    assert M05_MTP_PARITY_ISSUE_ID == EXTERNAL_M05_FASTMTP_TASK_ID
 
 
 def assert_m05_fail_closed_invariants(payload: dict[str, Any]) -> None:

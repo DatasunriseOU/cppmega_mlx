@@ -116,7 +116,7 @@
   "gb10_mtp_parity_claim": false,
   "gb10_parity_claim": false,
   "issue": {
-    "id": "cppmega-mlx-t8f.5",
+    "id": "cppmega-mlx-hjfn",
     "title": "M0.5: fail-closed FastMTP parity scaffold"
   },
   "local_only": true,
@@ -128,7 +128,7 @@
   "m4_vs_gb10_mtp_parity_claim": false,
   "m4_vs_gb10_parity_claim": false,
   "metadata": {
-    "git_commit": "2728cfe",
+    "git_commit": "7315eb6",
     "metadata_preflight_only": true,
     "scaffold_only": true,
     "script": "scripts/m05_mtp_parity_manifest.py"

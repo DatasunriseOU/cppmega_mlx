@@ -125,7 +125,7 @@ _M03_CUDA_STATUS_BY_PREFLIGHT_STATUS = {
     "valid_not_evaluated": "refused_not_evaluated",
 }
 M05_MTP_PARITY_RECEIPT_SCOPE = "local_cuda_mlx_m05_fastmtp"
-M05_MTP_PARITY_ISSUE_ID = "cppmega-mlx-t8f.5"
+M05_MTP_PARITY_ISSUE_ID = "cppmega-mlx-hjfn"
 M05_MTP_PARITY_OUTPUT = "bench/parity/m05_fastmtp.json"
 M05_MTP_PARITY_PROFILE = "local_gb10_quarter"
 M05_MTP_DEPTH = 2
