@@ -25,6 +25,7 @@ def test_data_pipeline_doc_states_ingress_packing_and_guardrails() -> None:
         "Multi-shard Megatron indexed directories batch across shard boundaries",
         "scripts/megatron_ingress_stress.py generates local Megatron Indexed fixtures",
         "explicitly makes no GB10, distributed Megatron, or M4-vs-GB10 parity claim",
+        "scripts/data_smoke.py --forward-smoke verifies local batch -> model forward closure",
         "PyTorch DataLoader integration is explicit and optional",
         "M0.1 tokenizer parity is already closed",
         "schema drift fails closed",

@@ -128,10 +128,21 @@ The intended Stream D scale gate is:
   --include-structure-ids
 ```
 
+## Local Forward Smoke
+
+scripts/data_smoke.py remains ingress-only by default, but --forward-smoke
+adds a forward-only tiny HybridTinyLM check on the first full batch. The script
+threads LMTokenBatch.model_kwargs() side channels and token-aligned
+document_ids into the model, reports finite next-token loss and logits shape,
+and keeps training_wired=false with no GB10, distributed Megatron, or
+M4-vs-GB10 parity claim.
+
 ## Current Guardrails
 
 - Packing is exported from cppmega_mlx.data for callers and tests.
 - The current training ingress still consumes dense LMTokenBatch rows.
+- scripts/data_smoke.py --forward-smoke verifies local batch -> model forward
+  closure without training, benchmarking, or parity claims.
 - PyTorch DataLoader integration is explicit and optional; the MLX training hot
   path does not import torch unless the bridge is requested.
 - Mapping-batch and LMTokenBatch training can carry explicit packed document

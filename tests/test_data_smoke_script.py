@@ -114,6 +114,8 @@ def test_npz_smoke_reports_local_ingress_contract(tmp_path: Path) -> None:
     assert payload["m4_vs_gb10_parity_claim"] is False
     assert payload["distributed_megatron_parity_claim"] is False
     assert payload["trainable_metal_kernel_adoption_claim"] is False
+    assert payload["forward_wired"] is False
+    assert payload["forward"] == {"enabled": False}
     assert payload["training_wired"] is False
 
 
@@ -246,6 +248,83 @@ def test_megatron_multishard_smoke_reports_side_channels(tmp_path: Path) -> None
     assert payload["side_channels"] == ["dep_levels", "structure_ids"]
     assert payload["structure_side_channels"] == ["structure_ids", "dep_levels"]
     assert payload["structure_side_channels_present"] is True
+    assert payload["distributed_megatron_parity_claim"] is False
+    assert payload["forward_wired"] is False
+
+
+def test_npz_smoke_can_run_forward_only_model_path(tmp_path: Path) -> None:
+    npz_path = tmp_path / "tokens.npz"
+    write_npz(npz_path, include_structure=True)
+
+    result = run_script(
+        str(npz_path),
+        "--dataset-format",
+        "npz",
+        "--batch-size",
+        "2",
+        "--seq-len",
+        "4",
+        "--forward-smoke",
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = load_json(result)
+    assert payload["status"] == "ok"
+    assert payload["forward_wired"] is True
+    assert payload["training_wired"] is False
+    assert payload["forward"]["enabled"] is True
+    assert payload["forward"]["forward_only"] is True
+    assert payload["forward"]["finite_loss"] is True
+    assert payload["forward"]["logits_shape"] == [2, 3, 32]
+    assert payload["forward"]["target_shape"] == [2, 3]
+    assert payload["forward"]["ntokens"] == 6.0
+    assert payload["forward"]["document_ids_used"] is False
+    assert payload["forward"]["side_channel_model_kwargs"] == [
+        "dep_levels",
+        "structure_ids",
+    ]
+    assert payload["forward"]["training_wired"] is False
+    assert payload["gb10_parity_claim"] is False
+
+
+def test_megatron_multishard_smoke_can_run_forward_with_document_ids(
+    tmp_path: Path,
+) -> None:
+    _write_structured_multishard_fixture(
+        tmp_path,
+        shard_docs=[
+            [np.arange(8, dtype=np.int32)],
+            [np.arange(100, 108, dtype=np.int32)],
+        ],
+    )
+
+    result = run_script(
+        str(tmp_path),
+        "--batch-size",
+        "2",
+        "--seq-len",
+        "4",
+        "--require-structure-side-channels",
+        "--forward-smoke",
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = load_json(result)
+    assert payload["status"] == "ok"
+    assert payload["dataset_format"] == "megatron"
+    assert payload["forward_wired"] is True
+    assert payload["training_wired"] is False
+    assert payload["forward"]["enabled"] is True
+    assert payload["forward"]["finite_loss"] is True
+    assert payload["forward"]["logits_shape"] == [2, 3, 256]
+    assert payload["forward"]["target_shape"] == [2, 3]
+    assert payload["forward"]["ntokens"] == 6.0
+    assert payload["forward"]["document_ids_used"] is True
+    assert payload["forward"]["side_channel_model_kwargs"] == [
+        "dep_levels",
+        "structure_ids",
+    ]
+    assert payload["forward"]["training_wired"] is False
     assert payload["distributed_megatron_parity_claim"] is False
 
 

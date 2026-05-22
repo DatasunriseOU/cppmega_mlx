@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke local token dataset ingress without wiring training."""
+"""Smoke local token dataset ingress with an optional forward-only check."""
 
 from __future__ import annotations
 
@@ -118,6 +118,32 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional dtype for raw .bin Megatron handoffs without .idx metadata.",
     )
+    parser.add_argument(
+        "--forward-smoke",
+        action="store_true",
+        help=(
+            "Run a tiny HybridTinyLM forward/loss on the first opened batch. "
+            "This is forward-only and does not wire training or parity claims."
+        ),
+    )
+    parser.add_argument(
+        "--forward-seed",
+        type=int,
+        default=0,
+        help="MLX random seed used when constructing the forward-smoke model.",
+    )
+    parser.add_argument(
+        "--forward-hidden-size",
+        type=int,
+        default=16,
+        help="Hidden size for the tiny forward-smoke HybridTinyLM.",
+    )
+    parser.add_argument(
+        "--forward-attention-heads",
+        type=int,
+        default=4,
+        help="Attention head count for the tiny forward-smoke HybridTinyLM.",
+    )
     return parser
 
 
@@ -196,6 +222,11 @@ def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
         payload["packing"] = _packing_receipt(first_batch, args)
     else:
         payload["packing"] = {"enabled": False}
+    if args.forward_smoke:
+        payload["forward"] = _forward_receipt(first_batch, dataset, args)
+        payload["forward_wired"] = True
+    else:
+        payload["forward"] = {"enabled": False}
     return payload
 
 
@@ -311,6 +342,85 @@ def _packing_receipt(batch: LMTokenBatch, args: argparse.Namespace) -> dict[str,
     }
 
 
+def _forward_receipt(
+    batch: LMTokenBatch,
+    dataset: TokenBatchDataset,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    if args.forward_hidden_size <= 0:
+        raise SmokeError("--forward-hidden-size must be positive")
+    if args.forward_attention_heads <= 0:
+        raise SmokeError("--forward-attention-heads must be positive")
+    if args.forward_hidden_size % args.forward_attention_heads != 0:
+        raise SmokeError(
+            "--forward-hidden-size must be divisible by --forward-attention-heads"
+        )
+
+    from cppmega_mlx.models.hybrid_lm import HybridTinyConfig, HybridTinyLM
+    import mlx.nn as nn
+
+    vocab_size = _forward_vocab_size(dataset)
+    input_seq_len = int(batch.inputs.shape[1])
+    mx.random.seed(int(args.forward_seed))
+    config = HybridTinyConfig(
+        vocab_size=vocab_size,
+        hidden_size=int(args.forward_hidden_size),
+        num_attention_heads=int(args.forward_attention_heads),
+        depth=1,
+        pattern="A",
+        max_seq_length=max(2, input_seq_len),
+        attention_sparse_topk=max(1, min(16, input_seq_len)),
+    )
+    model = HybridTinyLM(config)
+    model_kwargs = batch.model_kwargs()
+    document_ids = batch.input_document_ids
+    if document_ids is not None:
+        model_kwargs["document_ids"] = document_ids
+
+    logits = model(batch.inputs, **model_kwargs)
+    targets = batch.targets
+    token_losses = nn.losses.cross_entropy(
+        logits.astype(mx.float32),
+        targets,
+        reduction="none",
+    )
+    mask = batch.target_mask
+    ntokens = mask.sum()
+    denom = mx.maximum(ntokens, mx.array(1.0, dtype=mx.float32))
+    loss = (token_losses * mask).astype(mx.float32).sum() / denom
+    mx.eval(logits, loss, ntokens)
+    loss_value = float(loss.item())
+    ntokens_value = float(ntokens.item())
+    side_channel_kwargs = sorted(key for key in model_kwargs if key != "document_ids")
+    return {
+        "document_ids_used": document_ids is not None,
+        "enabled": True,
+        "finite_loss": bool(np.isfinite(loss_value)),
+        "forward_only": True,
+        "logits_shape": [int(dim) for dim in logits.shape],
+        "loss": loss_value,
+        "model": {
+            "class": "HybridTinyLM",
+            "hidden_size": int(args.forward_hidden_size),
+            "num_attention_heads": int(args.forward_attention_heads),
+            "pattern": "A",
+            "seed": int(args.forward_seed),
+            "vocab_size": vocab_size,
+        },
+        "ntokens": ntokens_value,
+        "side_channel_model_kwargs": side_channel_kwargs,
+        "target_shape": [int(dim) for dim in batch.targets.shape],
+        "training_wired": False,
+    }
+
+
+def _forward_vocab_size(dataset: TokenBatchDataset) -> int:
+    token_min, token_max = dataset.token_id_range()
+    if token_min < 0:
+        raise SmokeError("forward smoke requires non-negative token IDs")
+    return max(2, int(dataset.metadata.vocab_size), int(token_max) + 1)
+
+
 def _base_receipt(
     *,
     status: str,
@@ -326,6 +436,7 @@ def _base_receipt(
         "receipt_scope": "local_token_dataset_ingress_smoke",
         "status": status,
         "trainable_metal_kernel_adoption_claim": False,
+        "forward_wired": False,
         "training_wired": False,
     }
     if dataset_format is not None:
