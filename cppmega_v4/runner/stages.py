@@ -773,6 +773,20 @@ def stage_train(ctx: StageContext) -> StageResult:
         probe_key: str | None = None
         probe_before: mx.array | None = None
 
+        # G12: optional checkpoint load before training. Reads safetensors
+        # weights into the model. Failure is non-fatal — log via extras.
+        checkpoint_loaded: str | None = None
+        ckpt_load = opts.get("checkpoint_load_path")
+        if ckpt_load:
+            try:
+                import safetensors.mlx as _stmlx
+                loaded = _stmlx.load_file(ckpt_load)
+                all_modules.update(
+                    nn.utils.tree_unflatten(list(loaded.items())))
+                checkpoint_loaded = str(ckpt_load)
+            except Exception:
+                pass
+
         # G09: check abort flag set via opts.abort or _ABORT_TOKENS set
         abort_token = opts.get("abort_token")
         for step in range(n_steps):
@@ -845,6 +859,18 @@ def stage_train(ctx: StageContext) -> StageResult:
                 memory_peak_bytes = int(mx.metal.get_peak_memory())
         except Exception:
             pass
+
+        # G12: optional checkpoint save after training.
+        checkpoint_saved: str | None = None
+        ckpt_save = opts.get("checkpoint_save_path")
+        if ckpt_save:
+            try:
+                import safetensors.mlx as _stmlx
+                flat = dict(nn.utils.tree_flatten(all_modules.parameters()))
+                _stmlx.save_file(flat, ckpt_save)
+                checkpoint_saved = str(ckpt_save)
+            except Exception:
+                pass
 
         # G10: cache opt.state for future warm-start lookups (capped LRU)
         try:
@@ -965,6 +991,10 @@ def stage_train(ctx: StageContext) -> StageResult:
                 "moe": moe_extras,
                 "opt_state_carried": opt_state_carried,
                 "run_id": run_id,
+                "checkpoint": {
+                    "saved_path": checkpoint_saved,
+                    "loaded_path": checkpoint_loaded,
+                },
                 "mtp": _compute_mtp_extras(
                     all_modules, mtp_k, mtp_betas, vocab_size,
                     batch, seq, hidden, targets,
