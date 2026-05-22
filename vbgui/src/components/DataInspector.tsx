@@ -13,6 +13,7 @@ export interface PreviewParquetResult {
   available_channels: string[];
   side_channel_families?: Record<string, SideChannelFamilyCoverage>;
   edge_distributions?: Record<string, EdgeDistributionPreview>;
+  shards?: ShardPreview[];
   bytes_per_token_avg: number;
   bytes_per_token_p95: number;
   bytes_per_token_max: number;
@@ -47,13 +48,24 @@ export interface EdgeDistributionPreview {
   sample_edges: Array<{ from: number; to: number }>;
 }
 
+export interface ShardPreview {
+  index: number;
+  path: string;
+  byte_size: number;
+  row_count: number;
+}
+
 export interface DataInspectorProps {
   rpc: RpcClient;
   initialPath?: string;
   pageSize?: number;
   /** V4-1: callback when user picks the loaded parquet for training.
    *  App stores the path and forwards via stage_options.train.parquet_path. */
-  onUseForTrain?: (parquetPath: string, tokenizerPath: string | null) => void;
+  onUseForTrain?: (
+    parquetPath: string,
+    tokenizerPath: string | null,
+    shardPaths?: string[],
+  ) => void;
   /** V4-1: current path App is using for training (drives button label). */
   trainParquetPath?: string | null;
   onAvailableChannelsChange?: (channels: string[]) => void;
@@ -145,6 +157,18 @@ export function DataInspector({
 
   const totalPages = result ? Math.ceil(result.total_rows / pageSize) : 0;
   const currentPage = pageSize > 0 ? Math.floor(offset / pageSize) : 0;
+  const useForTrain = useCallback(() => {
+    if (!onUseForTrain) return;
+    const tokenizerPath = tokenizerSource || null;
+    const shardPaths = result?.shards && result.shards.length > 1
+      ? result.shards.map((shard) => shard.path)
+      : undefined;
+    if (shardPaths) {
+      onUseForTrain(path, tokenizerPath, shardPaths);
+    } else {
+      onUseForTrain(path, tokenizerPath);
+    }
+  }, [onUseForTrain, path, result, tokenizerSource]);
 
   return (
     <div data-testid="data-inspector"
@@ -166,8 +190,7 @@ export function DataInspector({
                 title={trainParquetPath === path
                   ? "Currently used for training"
                   : "Send this parquet (and tokenizer if set) to stage_train"}
-                onClick={() => onUseForTrain?.(path,
-                  tokenizerSource || null)}
+                onClick={useForTrain}
                 style={{
                   background: trainParquetPath === path
                     ? "#dcfce7" : undefined,
@@ -217,6 +240,33 @@ export function DataInspector({
             {" "}p95 {result.bytes_per_token_p95.toFixed(2)}
             {" "}max {result.bytes_per_token_max}
           </div>
+
+          {result.shards && result.shards.length > 0 && (
+            <div data-testid="data-shards"
+                 style={{ display: "grid",
+                          gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+                          gap: 6 }}>
+              {result.shards.map((shard) => (
+                <div key={`${shard.index}-${shard.path}`}
+                     data-testid={`data-shard-${shard.index}`}
+                     style={{ border: "1px solid #e5e7eb", borderRadius: 4,
+                              padding: 6, fontSize: 11 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between",
+                                gap: 6 }}>
+                    <strong>shard {shard.index + 1}/{result.shards?.length ?? 1}</strong>
+                    <span>{shard.row_count} rows</span>
+                  </div>
+                  <div style={{ color: "#6b7280", fontFamily: "monospace",
+                                overflowWrap: "anywhere" }}>
+                    {shard.path}
+                  </div>
+                  <div style={{ color: "#6b7280" }}>
+                    {shard.byte_size} bytes
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
 
           <div data-testid="data-channels"
                style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>

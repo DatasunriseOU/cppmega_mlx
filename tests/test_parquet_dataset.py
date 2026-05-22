@@ -266,7 +266,7 @@ def test_batch_metadata_windows_keep_chunk_edges_out_of_model_kwargs() -> None:
     )
 
 
-def test_candidate_columns_keep_batch_metadata_opt_in() -> None:
+def test_candidate_columns_keep_row_metadata_opt_in_but_load_graph_inputs() -> None:
     default_columns = parquet_dataset._candidate_parquet_columns(
         token_key="token_ids",
         text_key=None,
@@ -275,15 +275,17 @@ def test_candidate_columns_keep_batch_metadata_opt_in() -> None:
     metadata_columns = parquet_dataset._candidate_parquet_columns(
         token_key="token_ids",
         text_key=None,
-        metadata_columns=("token_chunk_starts", "token_call_edges"),
+        metadata_columns=("repo", "token_call_edges"),
     )
 
     assert default_columns is not None
     assert metadata_columns is not None
-    assert "token_chunk_starts" not in default_columns
-    assert "token_call_edges" not in default_columns
+    assert "token_chunk_starts" in default_columns
+    assert "token_call_edges" in default_columns
+    assert "repo" not in default_columns
     assert "token_chunk_starts" in metadata_columns
     assert "token_call_edges" in metadata_columns
+    assert "repo" in metadata_columns
 
 
 def test_all_metadata_excludes_token_content_and_slices_token_level_fields() -> None:

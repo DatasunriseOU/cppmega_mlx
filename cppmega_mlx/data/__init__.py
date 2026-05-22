@@ -45,7 +45,11 @@ from cppmega_mlx.data.packing import (
     pack_bos_aligned_best_fit,
     pack_documents_with_eos,
 )
-from cppmega_mlx.data.parquet_dataset import ParquetColumns, TokenParquetDataset
+from cppmega_mlx.data.parquet_dataset import (
+    MultiShardTokenParquetDataset,
+    ParquetColumns,
+    TokenParquetDataset,
+)
 from cppmega_mlx.data.platform_context import (
     MAX_PLATFORM_IDS,
     PLATFORM_VOCAB,
@@ -86,6 +90,7 @@ __all__ = [
     "MegatronIndexedMetadata",
     "MegatronIndexedMultiShardDataset",
     "MegatronIndexedMultiShardMetadata",
+    "MultiShardTokenParquetDataset",
     "OversizedSamplePolicy",
     "PLATFORM_VOCAB",
     "PLATFORM_VOCAB_SIZE",

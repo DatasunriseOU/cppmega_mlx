@@ -64,6 +64,39 @@ def test_preview_returns_first_page(tmp_path: Path):
     assert r.side_channel_families["semantic_graph"].graph_remapping == "no"
 
 
+def test_preview_reports_ordered_sibling_shards(tmp_path: Path):
+    shard_b = tmp_path / "val_00001.parquet"
+    shard_a = tmp_path / "val_00000.parquet"
+    _write_full_parquet(shard_b, n_rows=3)
+    _write_full_parquet(shard_a, n_rows=2)
+
+    r = preview_parquet(PreviewParquetParams(path=str(shard_a), offset=0, limit=1))
+
+    assert [Path(shard.path).name for shard in r.shards] == [
+        "val_00000.parquet",
+        "val_00001.parquet",
+    ]
+    assert [shard.index for shard in r.shards] == [0, 1]
+    assert [shard.row_count for shard in r.shards] == [2, 3]
+    assert all(shard.byte_size > 0 for shard in r.shards)
+
+
+def test_preview_directory_uses_first_shard_for_capabilities(tmp_path: Path):
+    shard_a = tmp_path / "val_00000.parquet"
+    shard_b = tmp_path / "val_00001.parquet"
+    _write_full_parquet(shard_a, n_rows=2)
+    _write_full_parquet(shard_b, n_rows=3)
+
+    r = preview_parquet(PreviewParquetParams(path=str(tmp_path), offset=0, limit=1))
+
+    assert r.token_column == "input_ids"
+    assert "doc_ids" in r.available_channels
+    assert [Path(shard.path).name for shard in r.shards] == [
+        "val_00000.parquet",
+        "val_00001.parquet",
+    ]
+
+
 def test_preview_carries_channel_payload_per_row(tmp_path: Path):
     p = tmp_path / "shard.parquet"
     _write_full_parquet(p, n_rows=8)

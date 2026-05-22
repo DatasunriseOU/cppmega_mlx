@@ -5,9 +5,15 @@ import json
 from pathlib import Path
 from types import ModuleType
 
+import numpy as np
+import pyarrow as pa  # type: ignore[import-not-found]
 import pyarrow.parquet as pq  # type: ignore[import-not-found]
 import pytest
 
+from cppmega_mlx.data.parquet_dataset import (
+    MultiShardTokenParquetDataset,
+    TokenParquetDataset,
+)
 from cppmega_mlx.data.nanochat_pipeline import platform_vocab
 from cppmega_mlx.data.nanochat_pipeline import tokenized_enriched_schema as schema
 from cppmega_mlx.data.nanochat_pipeline.build_context import (
@@ -32,6 +38,16 @@ from tools.clang_indexer.process_commits import (
 class _CharTokenizer:
     def encode(self, text: str) -> list[int]:
         return [ord(ch) for ch in text]
+
+
+def _write_token_parquet(path: Path, rows: list[list[int]]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(pa.table({"token_ids": rows}), path)
+    return path
+
+
+def _dataset_token_rows(dataset: TokenParquetDataset | MultiShardTokenParquetDataset):
+    return [np.array(batch.tokens).tolist() for batch in dataset.iter_batches(loop=False)]
 
 
 def _load_nanochat_module(relative_path: str) -> ModuleType:
@@ -216,6 +232,33 @@ def test_local_parquet_conversion_streams_row_groups(tmp_path: Path) -> None:
     assert summary == {"docs_in": 2, "docs_out": 2}
     assert parquet_file.metadata.num_rows == 2
     assert parquet_file.metadata.num_row_groups == 2
+
+
+def test_multi_shard_parquet_stream_matches_one_by_one_shard_order(
+    tmp_path: Path,
+) -> None:
+    shard0 = _write_token_parquet(
+        tmp_path / "corpus" / "val_00000.parquet",
+        [[1, 2, 3, 4], [5, 6, 7, 8]],
+    )
+    shard1 = _write_token_parquet(
+        tmp_path / "corpus" / "val_00001.parquet",
+        [[9, 10, 11, 12]],
+    )
+    kwargs = {"seq_len": 4, "batch_size": 1, "token_key": "token_ids"}
+    streamed = MultiShardTokenParquetDataset([shard0, shard1], **kwargs)
+
+    expected = (
+        _dataset_token_rows(TokenParquetDataset(shard0, **kwargs))
+        + _dataset_token_rows(TokenParquetDataset(shard1, **kwargs))
+    )
+
+    assert not hasattr(streamed, "_datasets")
+    assert _dataset_token_rows(streamed) == expected
+    assert [
+        batch.metadata["parquet_stream"]["shard_index"]
+        for batch in streamed.iter_batches(loop=False)
+    ] == [0, 0, 1]
 
 
 def test_token_budget_slices_semantic_char_metadata() -> None:

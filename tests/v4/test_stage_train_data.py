@@ -8,12 +8,10 @@ and token_count for assertion.
 
 from __future__ import annotations
 
-import json
 import pathlib
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-import pytest
 
 from cppmega_v4.jsonrpc.schema import VerifyParams
 from cppmega_v4.runner import Pipeline, run_pipeline
@@ -79,6 +77,24 @@ def test_stage_train_reads_real_tokens_from_parquet(tmp_path):
     }})
     assert extras["data_source"] == "parquet"
     assert extras["token_count"] == 1 * 8  # batch=1, seq=8
+
+
+def test_stage_train_streams_parquet_shards_sequentially(tmp_path):
+    """parquet_shards → stage_train consumes shard 0 then shard 1 in one run."""
+    shard0 = _write_parquet(tmp_path / "s0", n_rows=1, n_tokens_per_row=4)
+    shard1 = _write_parquet(tmp_path / "s1", n_rows=1, n_tokens_per_row=4)
+
+    extras = _run(stage_options={"train": {
+        "num_steps": 2,
+        "parquet_path": shard0,
+        "parquet_shards": [shard0, shard1],
+    }})
+
+    assert extras["data_source"] == "parquet_stream"
+    assert extras["token_count"] == 8
+    assert extras["parquet_stream"]["shard_total"] == 2
+    assert extras["parquet_stream"]["shards_consumed"] == 2
+    assert extras["parquet_stream"]["shard_index"] == 1
 
 
 def test_stage_train_falls_back_when_parquet_missing_token_column(tmp_path):

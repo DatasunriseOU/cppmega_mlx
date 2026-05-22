@@ -43,7 +43,10 @@ from cppmega_mlx.nn.attention import (  # noqa: E402
     CausalSelfAttention,
     sparse_mla_fp8_route_enabled,
 )
-from cppmega_mlx.data.parquet_dataset import TokenParquetDataset  # noqa: E402
+from cppmega_mlx.data.parquet_dataset import (  # noqa: E402
+    MultiShardTokenParquetDataset,
+    TokenParquetDataset,
+)
 from cppmega_mlx.runtime.memory import (  # noqa: E402
     DEFAULT_METAL_RATIO,
     DEFAULT_WIRED_RATIO,
@@ -384,6 +387,17 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Token dataset path. Defaults to {TARGET_PARQUET.relative_to(ROOT)}.",
     )
     parser.add_argument(
+        "--data-shard",
+        dest="data_shards",
+        action="append",
+        type=Path,
+        default=[],
+        help=(
+            "Additional parquet shard path for deterministic sequential streaming. "
+            "Repeat to pass the full corpus order."
+        ),
+    )
+    parser.add_argument(
         "--data-format",
         choices=("npz", "parquet", "megatron"),
         default="parquet",
@@ -612,6 +626,46 @@ def config_from_args(
         memory_limit_metal_ratio=args.memory_limit_metal_ratio,
         apply_memory_limit_plan=args.apply_memory_limit_plan,
         clear_cache_every_steps=args.clear_cache_every_steps,
+    )
+
+
+def parquet_shard_paths_from_args(
+    args: argparse.Namespace,
+    *,
+    data_path: Path,
+) -> tuple[Path, ...]:
+    paths = [data_path, *(Path(path) for path in getattr(args, "data_shards", ()) or ())]
+    return tuple(dict.fromkeys(paths))
+
+
+def training_dataset_from_args(
+    args: argparse.Namespace,
+    *,
+    config: TrainHybridTinyConfig,
+    data_path: Path,
+    loop: bool,
+) -> TokenParquetDataset | MultiShardTokenParquetDataset:
+    shard_paths = parquet_shard_paths_from_args(args, data_path=data_path)
+    if len(shard_paths) > 1:
+        if config.data_format != "parquet":
+            raise ValueError("multi-shard streaming requires --data-format parquet")
+        return MultiShardTokenParquetDataset(
+            shard_paths,
+            seq_len=config.seq_len,
+            batch_size=config.batch_size,
+            token_key=config.token_key,
+            shuffle=config.shuffle,
+            seed=config.seed,
+            loop=loop,
+        )
+    return TokenParquetDataset(
+        data_path,
+        seq_len=config.seq_len,
+        batch_size=config.batch_size,
+        token_key=config.token_key,
+        shuffle=config.shuffle,
+        seed=config.seed,
+        loop=loop,
     )
 
 
@@ -2831,6 +2885,21 @@ def _path_c_direct_chain_logical_owner_for_model(model: Any) -> Any | None:
     )
 
 
+def _path_c_physical_abi_bank_owner_for_model(
+    model: Any,
+    *,
+    sequence_length: int | None,
+) -> Any | None:
+    bank_owner = getattr(model, "path_c_physical_abi_bank_owner", None)
+    if bank_owner is not None:
+        return bank_owner
+
+    make_bank_owner = getattr(model, "make_path_c_physical_abi_bank_owner", None)
+    if callable(make_bank_owner):
+        return make_bank_owner(sequence_length=sequence_length)
+    return None
+
+
 def _path_c_direct_chain_runtime_capture_aliases_for_model(
     model: Any,
 ) -> dict[str, tuple[str, ...]]:
@@ -2890,7 +2959,10 @@ def fp8_path_c_training_route_payload_for_model(
 
     sequence_length = path_c_training_sequence_length(args)
     auto_install_report: dict[str, Any] | None = None
-    model_bank_owner = getattr(model, "path_c_physical_abi_bank_owner", None)
+    model_bank_owner = _path_c_physical_abi_bank_owner_for_model(
+        model,
+        sequence_length=sequence_length,
+    )
     model_fused_artifact = getattr(model, "path_c_fused_train_block_artifact", None)
     model_fused_training_runtime = getattr(
         model,
@@ -2932,7 +3004,7 @@ def fp8_path_c_training_route_payload_for_model(
         args,
         model=model,
         compile_receipt_path=compile_receipt_path,
-        bank_owner=getattr(model, "path_c_physical_abi_bank_owner", None),
+        bank_owner=model_bank_owner,
         fused_artifact=getattr(model, "path_c_fused_train_block_artifact", None),
         direct_chain_artifacts=getattr(
             model,
@@ -3801,7 +3873,10 @@ def install_path_c_fused_train_block_runtime_for_model(
     resolved_bank_owner = (
         bank_owner
         if bank_owner is not None
-        else getattr(model, "path_c_physical_abi_bank_owner", None)
+        else _path_c_physical_abi_bank_owner_for_model(
+            model,
+            sequence_length=sequence_length,
+        )
     )
     resolved_bank_buffers = bank_buffers
     resolved_bank_buffer_owner = bank_buffer_owner
@@ -8788,13 +8863,10 @@ def run_local_gb10_quarter_training(
         memory_limit = train_memory_limit_payload(config, apply=True)
         cache_limit = apply_cache_limit_payload(args, mx_module=mx)
         mx.random.seed(config.seed)
-        dataset = TokenParquetDataset(
-            data_path,
-            seq_len=config.seq_len,
-            batch_size=config.batch_size,
-            token_key=config.token_key,
-            shuffle=config.shuffle,
-            seed=config.seed,
+        dataset = training_dataset_from_args(
+            args,
+            config=config,
+            data_path=data_path,
             loop=True,
         )
         validate_side_channel_contract(config, dataset)

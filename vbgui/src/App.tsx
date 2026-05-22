@@ -127,6 +127,8 @@ export function App(): JSX.Element {
   // forwards via stage_options.train.parquet_path; UI shows indicator.
   const [trainParquetPath, setTrainParquetPath] =
     useState<string | null>(null);
+  const [trainParquetShards, setTrainParquetShards] =
+    useState<string[]>([]);
   const [trainTokenizerPath, setTrainTokenizerPath] =
     useState<string | null>(null);
   const [availableSideChannels, setAvailableSideChannels] =
@@ -443,6 +445,9 @@ export function App(): JSX.Element {
         if (totalDegree > 1) trainOpts.fake_ranks = totalDegree;
       }
       if (trainParquetPath) trainOpts.parquet_path = trainParquetPath;
+      if (trainParquetShards.length > 1) {
+        trainOpts.parquet_shards = trainParquetShards;
+      }
       if (trainTokenizerPath) trainOpts.tokenizer_path = trainTokenizerPath;
       // Forward SideChannelsTab train selection as synthetic int lists for the
       // stage_train G17 math-effect smoke path.
@@ -686,8 +691,9 @@ export function App(): JSX.Element {
           )}
           {activeTab === "data" && (
             <DataInspector rpc={rpc}
-              onUseForTrain={(p, t) => {
+              onUseForTrain={(p, t, shards) => {
                 setTrainParquetPath(p);
+                setTrainParquetShards(shards ?? []);
                 if (t !== null) setTrainTokenizerPath(t);
               }}
               onAvailableChannelsChange={setAvailableSideChannels}

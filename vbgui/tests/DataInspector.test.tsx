@@ -46,6 +46,7 @@ const SAMPLE: PreviewParquetResult = {
     },
   },
   edge_distributions: {},
+  shards: [],
   bytes_per_token_avg: 1.4,
   bytes_per_token_p95: 2.0,
   bytes_per_token_max: 2,
@@ -140,6 +141,34 @@ describe("DataInspector", () => {
     expect(panel.textContent).toContain("call_edges");
     expect(panel.textContent).toContain("max 54");
     expect(panel.textContent).toContain("real");
+  });
+
+  it("renders ordered shard list and passes all shards for training", async () => {
+    const onUseForTrain = vi.fn();
+    const shardSample: PreviewParquetResult = {
+      ...SAMPLE,
+      shards: [
+        { index: 0, path: "/corpus/val_00000.parquet", byte_size: 128, row_count: 2 },
+        { index: 1, path: "/corpus/val_00001.parquet", byte_size: 256, row_count: 3 },
+      ],
+    };
+    render(<DataInspector rpc={mockClient(shardSample)}
+                          initialPath="/corpus/val_00000.parquet"
+                          onUseForTrain={onUseForTrain} />);
+    fireEvent.click(screen.getByTestId("data-load"));
+    await waitFor(() =>
+      expect(screen.getByTestId("data-shards")).toBeTruthy());
+    expect(screen.getByTestId("data-shard-0").textContent)
+      .toContain("val_00000.parquet");
+    expect(screen.getByTestId("data-shard-1").textContent)
+      .toContain("3 rows");
+
+    fireEvent.click(screen.getByTestId("data-use-for-train"));
+    expect(onUseForTrain).toHaveBeenCalledWith(
+      "/corpus/val_00000.parquet",
+      null,
+      ["/corpus/val_00000.parquet", "/corpus/val_00001.parquet"],
+    );
   });
 
   it("notifies parent when loaded channels change", async () => {

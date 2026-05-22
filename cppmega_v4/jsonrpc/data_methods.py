@@ -11,6 +11,9 @@ to in-browser hyparquet for the same shape later (F-E follow-up).
 
 from __future__ import annotations
 
+import glob
+import json
+from pathlib import Path
 import time
 from typing import Any
 
@@ -32,6 +35,7 @@ _EDGE_CHANNELS: frozenset[str] = frozenset(
         "token_type_edges",
     }
 )
+_PARQUET_SUFFIXES: frozenset[str] = frozenset({".parquet", ".pq"})
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +87,14 @@ class EdgeDistributionPreview(BaseModel):
     sample_edges: list[dict[str, int]] = Field(default_factory=list)
 
 
+class ShardPreview(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    index: int
+    path: str
+    byte_size: int
+    row_count: int
+
+
 class PreviewParquetResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
     rows: list[PreviewRow]
@@ -94,6 +106,7 @@ class PreviewParquetResult(BaseModel):
     edge_distributions: dict[str, EdgeDistributionPreview] = Field(
         default_factory=dict
     )
+    shards: list[ShardPreview] = Field(default_factory=list)
     bytes_per_token_avg: float
     bytes_per_token_p95: float
     bytes_per_token_max: int
@@ -121,14 +134,17 @@ def preview_parquet(
     # filter" ([] → drop all channels) in both cache key and selection.
     filter_tag = "ALL" if params.channels is None else \
                  f"FILTER:{','.join(sorted(params.channels))}"
-    cache_key = f"preview::{params.path}::{params.offset}::{params.limit}::{filter_tag}"
+    preview_path, shard_paths = _preview_path_and_shards(params.path)
+    cache_key = (
+        f"preview::{preview_path}::{params.offset}::{params.limit}::{filter_tag}"
+    )
     if cache is not None:
         hit = cache.get(cache_key)
         if hit is not None:
             return hit
 
     t0 = time.perf_counter()
-    pf = pq.ParquetFile(params.path)
+    pf = pq.ParquetFile(preview_path)
     schema_names = [f.name for f in pf.schema_arrow]
     token_col = _pick_token_column(schema_names)
     if token_col is None:
@@ -139,7 +155,7 @@ def preview_parquet(
 
     # Side-channel pool: every column that isn't the token stream or
     # bookkeeping. Caller may further restrict via ``params.channels``.
-    caps = introspect_parquet(params.path, sample_rows=min(params.limit, 64))
+    caps = introspect_parquet(preview_path, sample_rows=min(params.limit, 64))
     available = sorted(c for c in caps.side_channels if c != token_col)
     if params.channels is None:
         selected = available
@@ -192,6 +208,7 @@ def preview_parquet(
             for name, coverage in sorted(caps.side_channel_families.items())
         },
         edge_distributions=_edge_distributions(rows, selected),
+        shards=_shard_previews(shard_paths),
         bytes_per_token_avg=round(bpt_avg, 3),
         bytes_per_token_p95=round(bpt_p95, 3),
         bytes_per_token_max=int(bpt_max),
@@ -213,6 +230,78 @@ def _pick_token_column(schema_names: list[str]) -> str | None:
         if name in schema_names:
             return name
     return None
+
+
+def _preview_path_and_shards(path_text: str) -> tuple[Path, tuple[Path, ...]]:
+    shards = _discover_parquet_shards(path_text)
+    if not shards:
+        return Path(path_text), (Path(path_text),)
+    requested = Path(path_text)
+    preview_path = requested if requested in shards else shards[0]
+    return preview_path, shards
+
+
+def _discover_parquet_shards(path_text: str) -> tuple[Path, ...]:
+    if any(ch in path_text for ch in "*?[]"):
+        return tuple(sorted(Path(item) for item in glob.glob(path_text)))
+
+    path = Path(path_text)
+    if path.is_dir():
+        return _sorted_parquet_files(path)
+
+    if path.suffix.lower() == ".json" and path.exists():
+        return _manifest_parquet_shards(path)
+
+    if path.suffix.lower() in _PARQUET_SUFFIXES and path.exists():
+        siblings = _sorted_parquet_files(path.parent)
+        return siblings or (path,)
+
+    return (path,)
+
+
+def _sorted_parquet_files(directory: Path) -> tuple[Path, ...]:
+    files = [
+        item
+        for suffix in sorted(_PARQUET_SUFFIXES)
+        for item in directory.glob(f"*{suffix}")
+        if item.is_file()
+    ]
+    return tuple(sorted(files, key=lambda item: item.name))
+
+
+def _manifest_parquet_shards(manifest_path: Path) -> tuple[Path, ...]:
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    entries = payload.get("shards") if isinstance(payload, dict) else payload
+    if not isinstance(entries, list):
+        return ()
+    shards: list[Path] = []
+    for entry in entries:
+        raw_path = entry.get("path") if isinstance(entry, dict) else entry
+        if not isinstance(raw_path, str):
+            continue
+        shard_path = Path(raw_path)
+        if not shard_path.is_absolute():
+            shard_path = manifest_path.parent / shard_path
+        if shard_path.suffix.lower() in _PARQUET_SUFFIXES:
+            shards.append(shard_path)
+    return tuple(sorted(shards, key=lambda item: item.name))
+
+
+def _shard_previews(shard_paths: tuple[Path, ...]) -> list[ShardPreview]:
+    previews: list[ShardPreview] = []
+    for index, path in enumerate(shard_paths):
+        row_count = 0
+        if path.exists():
+            row_count = int(pq.ParquetFile(path).metadata.num_rows)
+        previews.append(
+            ShardPreview(
+                index=index,
+                path=str(path),
+                byte_size=path.stat().st_size if path.exists() else 0,
+                row_count=row_count,
+            )
+        )
+    return previews
 
 
 def _bytes_per_token_stats(

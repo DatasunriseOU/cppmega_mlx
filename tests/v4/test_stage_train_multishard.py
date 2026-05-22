@@ -6,7 +6,6 @@ import pathlib
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-import pytest
 
 from cppmega_v4.jsonrpc.schema import VerifyParams
 from cppmega_v4.runner import Pipeline, run_pipeline
@@ -73,7 +72,7 @@ def test_v7_g01_multi_shard_stream_payload_lists_all_shards(tmp_path):
 
 
 def test_v7_g01_two_shards_actually_drained(tmp_path):
-    """Tiny shards (4 tokens each) force the demand to span both."""
+    """Tiny shards (4 tokens each) force the default B=1, S=8 demand to span both."""
     s1 = _write_int_parquet(tmp_path / "tiny_0.parquet", n_rows=1,
                              seq_len=4, start=10)
     s2 = _write_int_parquet(tmp_path / "tiny_1.parquet", n_rows=1,
@@ -82,10 +81,9 @@ def test_v7_g01_two_shards_actually_drained(tmp_path):
                     parquet_shards=[s1, s2])
     ps = extras.get("parquet_stream")
     assert ps is not None
-    # With demand = batch*seq = 64 and each shard only 4 tokens, the
-    # stream falls back to synthetic — but parquet_stream still
-    # reports both shard candidates so the UI can show 2 shards.
+    assert extras["data_source"] == "parquet_stream"
     assert ps["shard_total"] == 2
+    assert ps["shards_consumed"] == 2
 
 
 def test_v7_g01_single_shard_path_unchanged(tmp_path):

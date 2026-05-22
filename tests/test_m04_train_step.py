@@ -16,6 +16,9 @@ import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
 from mlx.utils import tree_flatten
+import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 import scripts.m04_train_step as m04_train_step
@@ -80,6 +83,12 @@ REAL_PARQUET_COLUMNS = (
 )
 
 
+def _write_m04_token_parquet(path: Path, rows: list[list[int]]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(pa.table({"token_ids": rows}), path)
+    return path
+
+
 @contextmanager
 def temporary_env(updates: Mapping[str, str | None]) -> Iterator[None]:
     previous = {key: os.environ.get(key) for key in updates}
@@ -142,6 +151,53 @@ def canonical_allocation_probe(**overrides: Any) -> dict[str, Any]:
     }
     probe.update(overrides)
     return probe
+
+
+def test_m04_parquet_shards_stream_in_deterministic_order(tmp_path: Path) -> None:
+    shard0 = _write_m04_token_parquet(
+        tmp_path / "corpus" / "val_00000.parquet",
+        [[1, 2, 3, 4]],
+    )
+    shard1 = _write_m04_token_parquet(
+        tmp_path / "corpus" / "val_00001.parquet",
+        [[5, 6, 7, 8]],
+    )
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--data-path",
+            str(shard0),
+            "--data-format",
+            "parquet",
+            "--token-key",
+            "token_ids",
+            "--seq-len",
+            "4",
+            "--batch-size",
+            "1",
+            "--data-shard",
+            str(shard1),
+        ]
+    )
+    config = m04_train_step.config_from_args(args, data_path=shard0)
+
+    dataset = m04_train_step.training_dataset_from_args(
+        args,
+        config=config,
+        data_path=shard0,
+        loop=False,
+    )
+    batches = dataset.iter_batches(loop=False)
+    first = next(batches)
+    second = next(batches)
+
+    assert np.array(first.tokens).tolist() == [[1, 2, 3, 4]]
+    assert np.array(second.tokens).tolist() == [[5, 6, 7, 8]]
+    assert first.metadata["parquet_stream"]["shard_index"] == 0
+    assert second.metadata["parquet_stream"]["shard_index"] == 1
+    payload = m04_train_step.dataset_payload(dataset, config)
+    stream = payload["dataset_receipt"]["parquet_receipt"]["stream"]
+    assert stream["shard_count"] == 2
+    assert stream["shards"][1]["row_count"] == 1
 
 
 class _ValueAndGradPathCDirectFusionChainTrainingRuntime(
@@ -268,6 +324,25 @@ class _ContractedFusedTrainBlockArtifact:
             "delegates_to_eager_loss_and_grad": False,
             "hidden_packing_performed": False,
         }
+
+
+class _PhysicalAbiBankOwnerFactoryModel:
+    def __init__(self, wrapped: Any, owner: Any) -> None:
+        self._wrapped = wrapped
+        self._owner = owner
+        self.owner_factory_sequence_lengths: list[int | None] = []
+        self.path_c_fused_train_block_artifact = _ContractedFusedTrainBlockArtifact()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._wrapped, name)
+
+    def make_path_c_physical_abi_bank_owner(
+        self,
+        *,
+        sequence_length: int | None = None,
+    ) -> Any:
+        self.owner_factory_sequence_lengths.append(sequence_length)
+        return self._owner
 
 
 class _ContractedLossCotangentBridge:
@@ -3952,6 +4027,53 @@ def test_fp8_path_c_training_route_for_model_reads_bank_owner(
     assert route["fused_train_block_training_runtime_contract"]["status"] == (
         m04_train_step.FP8_PATH_C_FUSED_TRAIN_BLOCK_TRAINING_RUNTIME_MISSING_STATUS
     )
+    assert route["path_c_fusion"]["runtime_training_binding"]["bank_buffer_owner"] == (
+        "local_gb10_quarter.path_c_physical_abi_banks"
+    )
+
+
+def test_fp8_path_c_training_route_for_model_reads_bank_owner_factory(
+    tmp_path: Path,
+    path_c_fusion_auto_env: None,
+) -> None:
+    del path_c_fusion_auto_env
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--synthetic",
+            "--dtype",
+            "fp8_path_c",
+            "--pattern",
+            "A",
+            "--depth",
+            "1",
+            "--dsa-a-layer-ranks",
+            "0",
+            "--output",
+            str(tmp_path / "receipt.json"),
+        ]
+    )
+    config = m04_train_step.config_from_args(args, data_path=tmp_path / "tokens.npz")
+    wrapped = build_local_gb10_quarter_tiny_smoke_model()
+    sequence_length = m04_train_step.path_c_training_sequence_length(config)
+    owner = _model_route_physical_bank_owner(
+        wrapped,
+        sequence_length=sequence_length,
+    )
+    model = _PhysicalAbiBankOwnerFactoryModel(wrapped, owner)
+
+    route = m04_train_step.fp8_path_c_training_route_payload_for_model(
+        config,
+        model,
+    )
+
+    assert model.owner_factory_sequence_lengths == [sequence_length]
+    assert route["selected_action"] == "run_path_c_fused_train_block_route"
+    assert route["fused_train_block_training_runtime_available"] is True
+    assert route["single_fused_train_block_runtime_available"] is True
+    assert route["fused_train_block_training_runtime_contract"]["status"] == "ok"
+    assert route["path_c_fusion"]["runtime_training_binding"][
+        "runtime_uses_fused_train_block"
+    ] is True
     assert route["path_c_fusion"]["runtime_training_binding"]["bank_buffer_owner"] == (
         "local_gb10_quarter.path_c_physical_abi_banks"
     )

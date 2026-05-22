@@ -535,6 +535,191 @@ class TokenParquetDataset:
         }
 
 
+@dataclass(frozen=True)
+class _ShardDatasetSummary:
+    path: Path
+    row_count: int
+    byte_size: int
+    num_samples: int
+    num_batches: int
+    dropped_samples: int
+    token_min: int
+    token_max: int
+
+
+class MultiShardTokenParquetDataset:
+    """Deterministic sequential stream over multiple parquet token shards.
+
+    The constructor records per-shard summaries, then releases the shard dataset.
+    Iteration reopens one shard at a time so multi-shard training does not retain
+    every shard's token/side-channel arrays concurrently.
+    """
+
+    def __init__(
+        self,
+        paths: Sequence[str | Path],
+        *,
+        seq_len: int,
+        batch_size: int,
+        token_key: str = "tokens",
+        text_key: str | None = None,
+        tokenizer: Any | None = None,
+        eos_token_id: int | None = None,
+        shuffle: bool = False,
+        seed: int = 0,
+        loop: bool = False,
+        metadata_columns: BatchMetadataColumnSelection = None,
+    ) -> None:
+        self.paths = tuple(Path(path) for path in paths)
+        if not self.paths:
+            raise ValueError("at least one parquet shard is required")
+        self.seq_len = seq_len
+        self.batch_size = batch_size
+        self._token_key = token_key
+        self._text_key = text_key
+        self._tokenizer = tokenizer
+        self._eos_token_id = eos_token_id
+        self.shuffle = shuffle
+        self.seed = seed
+        self.loop = loop
+        self._metadata_columns = metadata_columns
+        summaries: list[_ShardDatasetSummary] = []
+        side_channel_names: set[str] = set()
+        self.path = self.paths[0]
+        self.token_key = token_key
+        self.metadata = TokenDatasetMetadata(source_format="parquet")
+        for index, path in enumerate(self.paths):
+            dataset = self._open_shard_dataset(path)
+            token_min, token_max = dataset.token_id_range()
+            if index == 0:
+                self.token_key = dataset.token_key
+                self.metadata = dataset.metadata
+            side_channel_names.update(str(name) for name in dataset._side_channels)
+            summaries.append(
+                _ShardDatasetSummary(
+                    path=path,
+                    byte_size=path.stat().st_size if path.exists() else 0,
+                    row_count=_parquet_file_row_count(path),
+                    num_samples=dataset.num_samples,
+                    num_batches=dataset.num_batches,
+                    dropped_samples=dataset.dropped_samples,
+                    token_min=token_min,
+                    token_max=token_max,
+                )
+            )
+        self._shards = tuple(summaries)
+        self._side_channels = {
+            name: np.empty((0,), dtype=np.int32)
+            for name in sorted(side_channel_names)
+        }
+        self.parquet_receipt = {
+            "stream": {
+                "shard_count": len(self._shards),
+                "deterministic_order": True,
+                "shards": [
+                    {
+                        "index": index,
+                        "path": str(summary.path),
+                        "byte_size": summary.byte_size,
+                        "row_count": summary.row_count,
+                        "num_samples": summary.num_samples,
+                        "num_batches": summary.num_batches,
+                    }
+                    for index, summary in enumerate(self._shards)
+                ],
+            }
+        }
+
+    def __len__(self) -> int:
+        return self.num_batches
+
+    @property
+    def num_samples(self) -> int:
+        return sum(shard.num_samples for shard in self._shards)
+
+    @property
+    def num_batches(self) -> int:
+        return sum(shard.num_batches for shard in self._shards)
+
+    @property
+    def dropped_samples(self) -> int:
+        return sum(shard.dropped_samples for shard in self._shards)
+
+    def token_id_range(self) -> tuple[int, int]:
+        return (
+            min(shard.token_min for shard in self._shards),
+            max(shard.token_max for shard in self._shards),
+        )
+
+    def iter_batches(
+        self,
+        *,
+        resume_batch: int | None = None,
+        epoch: int = 0,
+        loop: bool | None = None,
+    ) -> Iterator[LMTokenBatch]:
+        if resume_batch not in (None, 0):
+            raise ValueError("multi-shard parquet resume_batch is not supported")
+        effective_loop = self.loop if loop is None else loop
+        current_epoch = epoch
+        while True:
+            yielded = False
+            for shard_index, shard in enumerate(self._shards):
+                dataset = self._open_shard_dataset(shard.path)
+                for batch_index, batch in enumerate(
+                    dataset.iter_batches(epoch=current_epoch, loop=False)
+                ):
+                    yielded = True
+                    yield self._with_stream_metadata(
+                        batch,
+                        shard_index=shard_index,
+                        batch_index=batch_index,
+                    )
+            if not effective_loop or not yielded:
+                return
+            current_epoch += 1
+
+    def _with_stream_metadata(
+        self,
+        batch: LMTokenBatch,
+        *,
+        shard_index: int,
+        batch_index: int,
+    ) -> LMTokenBatch:
+        kwargs = batch.as_dict(include_metadata=True, include_side_channels=True)
+        metadata = dict(batch.metadata or {})
+        shard = self.parquet_receipt["stream"]["shards"][shard_index]
+        metadata["parquet_stream"] = {
+            "shard_index": shard_index,
+            "shard_total": len(self._shards),
+            "shard_path": shard["path"],
+            "rows_in_shard": shard["row_count"],
+            "batch_index_in_shard": batch_index,
+        }
+        kwargs["metadata"] = metadata
+        return LMTokenBatch(**kwargs)
+
+    def _open_shard_dataset(self, path: Path) -> TokenParquetDataset:
+        return TokenParquetDataset(
+            path,
+            seq_len=self.seq_len,
+            batch_size=self.batch_size,
+            token_key=self._token_key,
+            text_key=self._text_key,
+            tokenizer=self._tokenizer,
+            eos_token_id=self._eos_token_id,
+            shuffle=self.shuffle,
+            seed=self.seed,
+            loop=False,
+            metadata_columns=self._metadata_columns,
+        )
+
+
+def _parquet_file_row_count(path: Path) -> int:
+    pq = importlib.import_module("pyarrow.parquet")
+    return int(pq.ParquetFile(path).metadata.num_rows)
+
+
 def _candidate_parquet_columns(
     *,
     token_key: str,

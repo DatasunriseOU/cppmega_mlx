@@ -239,4 +239,72 @@ describe("App integration — side-channel data wiring", () => {
       "platform_ids", "token_structure_ids",
     ]);
   });
+
+  it("threads DataInspector shard list into train stage options", async () => {
+    const { fetchFn, calls } = recorder({
+      build_preset_specs: {
+        specs: [
+          { kind: "attention", name: "a0", params: {} },
+          { kind: "mlp",       name: "a1", params: {} },
+        ],
+        preset_name: "llama3_8b",
+      },
+      verify: { memory_per_brick: {}, gotchas: [], elapsed_ms: 0,
+                resolved: { edges: [] } },
+      suggest_sharding: { proposals: [] },
+      "data.preview_parquet": {
+        rows: [{ row_index: 0, tokens: [1, 2], channels: {} }],
+        token_column: "input_ids",
+        available_channels: [],
+        side_channel_families: {},
+        edge_distributions: {},
+        shards: [
+          { index: 0, path: "/tmp/corpus/val_00000.parquet", byte_size: 128, row_count: 1 },
+          { index: 1, path: "/tmp/corpus/val_00001.parquet", byte_size: 256, row_count: 1 },
+        ],
+        bytes_per_token_avg: 1.0,
+        bytes_per_token_p95: 1.0,
+        bytes_per_token_max: 1,
+        total_rows: 1,
+        elapsed_ms: 0.1,
+      },
+      "pipeline.run": {
+        stages: [{ name: "train", status: "ok", elapsed_ms: 1 }],
+        overall_status: "ok",
+        total_elapsed_ms: 1,
+      },
+    });
+    (globalThis as unknown as { fetch: typeof fetch }).fetch = fetchFn as never;
+
+    render(<App />);
+    fireEvent.change(screen.getByTestId("preset-launcher"),
+      { target: { value: "llama3_8b" } });
+    await waitFor(() => {
+      expect(calls.some((c) => c.method === "build_preset_specs")).toBe(true);
+    });
+
+    fireEvent.click(screen.getByTestId("app-tab-data"));
+    fireEvent.change(screen.getByTestId("data-path"),
+      { target: { value: "/tmp/corpus/val_00000.parquet" } });
+    fireEvent.click(screen.getByTestId("data-load"));
+    await waitFor(() => {
+      expect(screen.getByTestId("data-shard-1").textContent)
+        .toContain("val_00001.parquet");
+    });
+    fireEvent.click(screen.getByTestId("data-use-for-train"));
+
+    fireEvent.click(screen.getByTestId("run-pipeline-toggle"));
+    fireEvent.click(screen.getByTestId("run-pipeline-train"));
+    await waitFor(() => {
+      expect(calls.some((c) => c.method === "pipeline.run")).toBe(true);
+    });
+    const pipelineCall = calls.find((c) => c.method === "pipeline.run")!;
+    const params = pipelineCall.params as {
+      pipeline: { stage_options: { train: { parquet_shards?: string[] } } };
+    };
+    expect(params.pipeline.stage_options.train.parquet_shards).toEqual([
+      "/tmp/corpus/val_00000.parquet",
+      "/tmp/corpus/val_00001.parquet",
+    ]);
+  });
 });

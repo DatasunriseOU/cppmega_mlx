@@ -1345,6 +1345,9 @@ def stage_train(ctx: StageContext) -> StageResult:
         if not 0.0 < fim_ratio < 1.0:
             fim_ratio = 0.5
         fim_loss_value: float | None = None
+        # V7-A04: held-out validation loss at val_every cadence.
+        val_every = int(opts.get("val_every", 0) or 0)
+        val_losses: list[float] = []
         # G09: check abort flag set via opts.abort or _ABORT_TOKENS set
         abort_token = opts.get("abort_token")
         for step in range(n_steps):
@@ -1428,6 +1431,22 @@ def stage_train(ctx: StageContext) -> StageResult:
             opt.update(all_modules, grads)
             mx.eval(all_modules.parameters(), opt.state)
             losses.append(float(loss.item()))
+            # V7-A04: validation pass at val_every cadence on a fresh
+            # random batch (held-out from the train stream). No grad,
+            # same loss kernel.
+            if val_every > 0 and (step + 1) % val_every == 0:
+                try:
+                    val_emb = mx.random.normal(
+                        shape=(batch, seq, hidden),
+                        key=mx.random.key(0xCAFE0 + step))
+                    val_targets = mx.random.randint(
+                        0, vocab_size, shape=(batch, seq),
+                        key=mx.random.key(0xCAFE1 + step))
+                    vL = float(loss_fn(all_modules, val_emb,
+                                        val_targets).item())
+                    val_losses.append(vL)
+                except Exception:
+                    pass
             if abort_token is not None and abort_token in _ABORT_TOKENS:
                 partial_delta = 0.0
                 if probe_key is not None and probe_before is not None:
@@ -1648,6 +1667,8 @@ def stage_train(ctx: StageContext) -> StageResult:
                 "fim_ratio": fim_ratio if fim_enabled else None,
                 "fim_loss": (round(fim_loss_value, 6)
                               if fim_loss_value is not None else None),
+                "val_every": val_every,
+                "val_losses": [round(v, 6) for v in val_losses],
                 "train_dtype": train_dtype,
                 "master_dtype": master_dtype,
                 "fp8_active": fp8_active,
@@ -1709,16 +1730,20 @@ def _tokenize_parquet_text(
         import pyarrow.parquet as pq
         from tokenizers import Tokenizer
         from pathlib import Path
-        table = pq.read_table(parquet_path)
+        parquet_file = pq.ParquetFile(parquet_path)
+        schema_names = list(parquet_file.schema_arrow.names)
         text_col = next((c for c in ("text", "original_text", "raw_text")
-                         if c in table.column_names), None)
+                         if c in schema_names), None)
         if text_col is None:
             return [], None
         tok = Tokenizer.from_file(str(tokenizer_path))
         out: list[int] = []
-        col = table.column(text_col)
-        for chunk in col.chunks:
-            for cell in chunk.to_pylist():
+        for batch in parquet_file.iter_batches(
+            columns=[text_col],
+            batch_size=1024,
+        ):
+            column = batch.column(0)
+            for cell in column.to_pylist():
                 if cell is None:
                     continue
                 enc = tok.encode(str(cell))
@@ -2118,18 +2143,19 @@ def _read_first_n_tokens(parquet_path: str, n: int) -> list[int]:
     random target tensor. Reuses the column-detection convention from
     cppmega_v4.jsonrpc.data_methods (input_ids / token_ids / tokens)."""
     import pyarrow.parquet as pq
-    table = pq.read_table(parquet_path)
+    parquet_file = pq.ParquetFile(parquet_path)
+    schema_names = list(parquet_file.schema_arrow.names)
     primary = None
     for c in ("input_ids", "token_ids", "tokens"):
-        if c in table.column_names:
+        if c in schema_names:
             primary = c
             break
     if primary is None:
         return []
-    column = table.column(primary)
     out: list[int] = []
-    for chunk in column.chunks:
-        for cell in chunk.to_pylist():
+    for batch in parquet_file.iter_batches(columns=[primary], batch_size=1024):
+        column = batch.column(0)
+        for cell in column.to_pylist():
             if cell is None:
                 continue
             for tok in cell:
