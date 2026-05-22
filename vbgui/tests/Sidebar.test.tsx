@@ -203,6 +203,31 @@ describe("GotchasTab", () => {
     fireEvent.click(screen.getByTestId("gotcha-fsdp2_whole_compile-autofix"));
     expect(onAutoFix).toHaveBeenCalledWith("fsdp2_whole_compile");
   });
+
+  it("V7-H01: extended auto-fix coverage (6 new gotcha ids)", () => {
+    const ids = ["missing_edge", "dim_mismatch", "unknown_brick",
+                  "bad_dtype_combo", "schedule_out_of_range",
+                  "tokenizer_mismatch"];
+    const onAutoFix = vi.fn();
+    render(<GotchasTab onAutoFix={onAutoFix}
+            gotchas={ids.map((id) => ({ id, severity: "warning" as const,
+                                          message: id }))} />);
+    for (const id of ids) {
+      expect(screen.getByTestId(`gotcha-${id}-autofix`)).toBeTruthy();
+    }
+    // Click first one fires callback with the id.
+    fireEvent.click(screen.getByTestId(
+      "gotcha-missing_edge-autofix"));
+    expect(onAutoFix).toHaveBeenCalledWith("missing_edge");
+  });
+
+  it("V7-H01: Auto-fix button text shows recovery label", () => {
+    render(<GotchasTab onAutoFix={() => {}} gotchas={[
+      { id: "bad_dtype_combo", severity: "warning", message: "x" },
+    ]} />);
+    const btn = screen.getByTestId("gotcha-bad_dtype_combo-autofix");
+    expect(btn.textContent).toContain("bf16");
+  });
 });
 
 describe("SideChannelsTab", () => {

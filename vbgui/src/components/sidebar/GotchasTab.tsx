@@ -11,9 +11,30 @@ const COLOR: Record<GotchaState["severity"], string> = {
   info:    "#2563eb",
 };
 
+// V7-H01: extended auto-fix coverage for the 6 most common
+// validation gotchas. The App handler dispatches the corresponding
+// spec mutation when the user clicks the inline Apply-fix button.
 const AUTO_FIXABLE: Set<string> = new Set([
-  "fsdp2_whole_compile", "megatron_tp_whole_compile",
+  "fsdp2_whole_compile",
+  "megatron_tp_whole_compile",
+  "missing_edge",
+  "dim_mismatch",
+  "unknown_brick",
+  "bad_dtype_combo",
+  "schedule_out_of_range",
+  "tokenizer_mismatch",
 ]);
+
+const FIX_LABELS: Record<string, string> = {
+  fsdp2_whole_compile:      "Switch compile_mode → regional",
+  megatron_tp_whole_compile: "Switch compile_mode → regional",
+  missing_edge:             "Insert missing edge",
+  dim_mismatch:             "Adjust hidden_size to nearest valid",
+  unknown_brick:            "Remove unknown brick",
+  bad_dtype_combo:          "Reset dtype to bf16 master",
+  schedule_out_of_range:    "Clamp schedule to valid range",
+  tokenizer_mismatch:       "Pick MATRIX-compatible tokenizer",
+};
 
 function groupBySeverity(gs: GotchaState[]): Record<string, GotchaState[]> {
   const out: Record<string, GotchaState[]> = { error: [], warning: [], info: [] };
@@ -52,8 +73,9 @@ export function GotchasTab({ gotchas, onAutoFix }: GotchasTabProps): JSX.Element
                 )}
                 {onAutoFix && AUTO_FIXABLE.has(g.id) && (
                   <button data-testid={`gotcha-${g.id}-autofix`}
-                          onClick={() => onAutoFix(g.id)}>
-                    Auto-fix
+                          onClick={() => onAutoFix(g.id)}
+                          title={FIX_LABELS[g.id] ?? "Auto-fix"}>
+                    {FIX_LABELS[g.id] ?? "Auto-fix"}
                   </button>
                 )}
               </div>

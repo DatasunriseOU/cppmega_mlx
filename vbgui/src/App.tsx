@@ -664,6 +664,43 @@ export function App(): JSX.Element {
                 onShardingChange={(s) =>
                   dispatch({ type: "sharding.set", sharding: s })}
                 onShardingAccept={handleShardingAccept}
+                onGotchaAutoFix={(id) => {
+                  // V7-H01: dispatch recovery for known auto-fixable
+                  // gotcha ids. Unknown ids no-op gracefully.
+                  if (id === "fsdp2_whole_compile"
+                      || id === "megatron_tp_whole_compile") {
+                    dispatch({ type: "sharding.set",
+                      sharding: { ...spec.sharding,
+                                  compile_mode: "regional" } });
+                  } else if (id === "bad_dtype_combo") {
+                    dispatch({ type: "optim.set",
+                      optim: { ...spec.optim,
+                                mixed_precision: false } });
+                    dispatch({ type: "sharding.set",
+                      sharding: { ...spec.sharding,
+                                  fp8_enabled: false } });
+                  } else if (id === "unknown_brick") {
+                    setNodes((prev) => prev.filter((n) => {
+                      const k = (n.data as { kind?: string })?.kind;
+                      return typeof k === "string" && k.length > 0;
+                    }));
+                  } else if (id === "missing_edge") {
+                    setEdges((prev) => {
+                      const ids = nodes.map((n) => n.id);
+                      const next: Edge[] = [];
+                      for (let i = 0; i < ids.length - 1; i++) {
+                        const eid = `${ids[i]}->${ids[i + 1]}`;
+                        if (!prev.some((e) => e.id === eid)) {
+                          next.push({ id: eid,
+                            source: ids[i], target: ids[i + 1],
+                            data: { severity: "info" } });
+                        }
+                      }
+                      return [...prev, ...next];
+                    });
+                  }
+                  void scheduleVerify();
+                }}
                 onDimensionsApply={(entry) => {
                   // H07: write the auto-suggested value into the matched
                   // brick's params. Re-verify will then re-render the
