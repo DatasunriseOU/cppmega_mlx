@@ -16,6 +16,17 @@ REQUIRED_SPECIAL_TOKEN_IDS: dict[str, int] = {
     "NL": 47,
 }
 
+TOOL_USE_SPECIAL_TOKEN_IDS: dict[str, int] = {
+    "BOS": 2,
+    "EOS": 3,
+    "CODE_START": 7,
+    "CODE_END": 8,
+    "THINK_START": 9,
+    "THINK_END": 10,
+    "QUERY_TOOL": 11,
+    "TOOL_RESULT": 19,
+}
+
 SpecialTokenMapping = Mapping[int, str] | Mapping[str, int]
 
 
@@ -28,15 +39,6 @@ def validate_required_special_token_ids(mapping: SpecialTokenMapping) -> None:
     """
 
     token_to_id = _normalize_special_token_mapping(mapping)
-    seen_ids: dict[int, str] = {}
-    for token, token_id in token_to_id.items():
-        existing = seen_ids.setdefault(token_id, token)
-        if existing != token:
-            raise ValueError(
-                f"special token id collision: id {token_id} maps to both "
-                f"{existing!r} and {token!r}"
-            )
-
     for token, expected_id in REQUIRED_SPECIAL_TOKEN_IDS.items():
         if token not in token_to_id:
             raise ValueError(f"missing required special token {token!r}")
@@ -44,6 +46,15 @@ def validate_required_special_token_ids(mapping: SpecialTokenMapping) -> None:
         if actual_id != expected_id:
             raise ValueError(
                 f"special token {token!r} must use id {expected_id}, got {actual_id}"
+            )
+
+    seen_ids: dict[int, str] = {}
+    for token, token_id in token_to_id.items():
+        existing = seen_ids.setdefault(token_id, token)
+        if existing != token:
+            raise ValueError(
+                f"special token id collision: id {token_id} maps to both "
+                f"{existing!r} and {token!r}"
             )
 
 
@@ -87,5 +98,6 @@ def _is_int_key(value: object) -> bool:
 __all__ = [
     "REQUIRED_SPECIAL_TOKEN_IDS",
     "SpecialTokenMapping",
+    "TOOL_USE_SPECIAL_TOKEN_IDS",
     "validate_required_special_token_ids",
 ]

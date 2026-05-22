@@ -30,6 +30,12 @@ def test_inference_modes_doc_pins_supported_local_surfaces() -> None:
         "JsonConstrainedLogitsProcessor",
         "JsonTokenIds",
         "logits_processors",
+        "render_tool_use_template(",
+        "encode_tool_use_template(",
+        "compute_tool_use_loss_mask(",
+        "ToolUseSpecialTokenIds",
+        "<QUERY_TOOL>",
+        "<TOOL_RESULT>",
         "QuantizedKVCache",
         "model_kwargs_builder",
     ):
@@ -48,5 +54,7 @@ def test_inference_modes_doc_keeps_non_claims_explicit() -> None:
         "not a full checkpoint converter",
         "not mixed bf16-to-q4 quantized_kv_start > 0 transition coverage",
         "not JSON Schema or raw text parsing",
+        "not a runtime tool executor",
+        "not an OpenAI chat template",
     ):
         assert phrase in text

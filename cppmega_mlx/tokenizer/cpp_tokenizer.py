@@ -21,6 +21,11 @@ EXPECTED_SPECIAL_TOKENS: dict[str, int] = {
     "<FIM_MIDDLE>": 5,
     "<FIM_SUFFIX>": 6,
     "<CODE_START>": 7,
+    "<CODE_END>": 8,
+    "<THINK_START>": 9,
+    "<THINK_END>": 10,
+    "<QUERY_TOOL>": 11,
+    "<TOOL_RESULT>": 19,
     "<FIM_INSTRUCTION>": 45,
     "<SPACE>": 46,
     "<NL>": 47,
@@ -76,6 +81,26 @@ class CppMegaTokenizer:
     @property
     def code_start_id(self) -> int:
         return EXPECTED_SPECIAL_TOKENS["<CODE_START>"]
+
+    @property
+    def code_end_id(self) -> int:
+        return EXPECTED_SPECIAL_TOKENS["<CODE_END>"]
+
+    @property
+    def think_start_id(self) -> int:
+        return EXPECTED_SPECIAL_TOKENS["<THINK_START>"]
+
+    @property
+    def think_end_id(self) -> int:
+        return EXPECTED_SPECIAL_TOKENS["<THINK_END>"]
+
+    @property
+    def query_tool_id(self) -> int:
+        return EXPECTED_SPECIAL_TOKENS["<QUERY_TOOL>"]
+
+    @property
+    def tool_result_id(self) -> int:
+        return EXPECTED_SPECIAL_TOKENS["<TOOL_RESULT>"]
 
     @property
     def fim_instruction_id(self) -> int:
@@ -182,7 +207,7 @@ def load_cppmega_tokenizer(path: str | Path) -> CppMegaTokenizer:
     _validate_vocab_contract(vocab, tokenizer_path)
 
     try:
-        from tokenizers import Tokenizer
+        from tokenizers import Tokenizer  # pyright: ignore[reportMissingImports]
     except ModuleNotFoundError as exc:
         raise TokenizerContractError(
             "tokenizers package is required to load cppmega tokenizer artifacts"

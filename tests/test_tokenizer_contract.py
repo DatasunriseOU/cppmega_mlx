@@ -4,6 +4,7 @@ import pytest
 
 from cppmega_mlx.data.tokenizer_contract import (
     REQUIRED_SPECIAL_TOKEN_IDS,
+    TOOL_USE_SPECIAL_TOKEN_IDS,
     validate_required_special_token_ids,
 )
 
@@ -18,6 +19,19 @@ def test_valid_id_to_token_mapping_passes() -> None:
 
 def test_valid_token_to_id_mapping_passes() -> None:
     validate_required_special_token_ids(REQUIRED_SPECIAL_TOKEN_IDS)
+
+
+def test_tool_use_token_ids_match_vendored_artifact_contract() -> None:
+    assert TOOL_USE_SPECIAL_TOKEN_IDS == {
+        "BOS": 2,
+        "EOS": 3,
+        "CODE_START": 7,
+        "CODE_END": 8,
+        "THINK_START": 9,
+        "THINK_END": 10,
+        "QUERY_TOOL": 11,
+        "TOOL_RESULT": 19,
+    }
 
 
 def test_missing_required_special_token_fails() -> None:

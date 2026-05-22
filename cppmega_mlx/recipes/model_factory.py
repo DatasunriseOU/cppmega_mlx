@@ -73,9 +73,10 @@ class TokenizerContractStatus:
     blocker_id: str = LOCAL_GB10_QUARTER_TOKENIZER_BLOCKER_ID
     reason: str = (
         "M0.1 is closed: the deployed GB10 65K tokenizer is vendored with "
-        "id 7=<CODE_START>, id 45=<FIM_INSTRUCTION>, id 46=<SPACE>, and "
-        "id 47=<NL>; MLX and upstream wrappers use explicit whitespace-sentinel "
-        "encode/decode with Mac-vs-upstream parity receipts"
+        "id 7=<CODE_START>, id 8=<CODE_END>, id 11=<QUERY_TOOL>, "
+        "id 19=<TOOL_RESULT>, id 45=<FIM_INSTRUCTION>, id 46=<SPACE>, "
+        "and id 47=<NL>; MLX and upstream wrappers use explicit "
+        "whitespace-sentinel encode/decode with Mac-vs-upstream parity receipts"
     )
 
     @property

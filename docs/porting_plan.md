@@ -220,6 +220,7 @@ The current collected test files are:
 - tests/test_inference_serving.py
 - tests/test_inference_side_channels.py
 - tests/test_inference_speculative_decode.py
+- tests/test_inference_tool_use_template.py
 - tests/test_kernel_policy.py
 - tests/test_lint_mlx.py
 - tests/test_long_context_forward.py

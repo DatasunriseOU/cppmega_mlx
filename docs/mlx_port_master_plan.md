@@ -42,7 +42,7 @@ This document is a planning synthesis from parallel research lanes (local-code a
 - **Distributed**: mx.distributed (ring / JACCL), multi-Mac ZeRO-style sharding.
 - **Sharded checkpoints** (model.safetensors.index.json).
 - **Sequence packing** (cumulative-doc-id attention mask).
-- **Tokenizer**: M0.1 is closed. The vendored GB10 BPE artifact and special-token contract exist for vocab=65536 with id7=<CODE_START>, id45=<FIM_INSTRUCTION>, id46=<SPACE>, id47=<NL>. Encode normalizes whitespace runs ([\r\n]+-><NL>, [ \t]+-><SPACE>); decode is plain token concat with sentinel substitution. Same wrapper deployed on Mac and gb10/CUDA side.
+- **Tokenizer**: M0.1 is closed. The vendored GB10 BPE artifact and special-token contract exist for vocab=65536 with id7=<CODE_START>, id8=<CODE_END>, id11=<QUERY_TOOL>, id19=<TOOL_RESULT>, id45=<FIM_INSTRUCTION>, id46=<SPACE>, id47=<NL>. Encode normalizes whitespace runs ([\r\n]+-><NL>, [ \t]+-><SPACE>); decode is plain token concat with sentinel substitution. Same wrapper deployed on Mac and gb10/CUDA side.
 - **Inference / generation**: temperature/top-k/top-p sampling, eager no-KV full-prefix generation, contiguous KV-cache generation/streaming, paged KV scheduler metadata with fail-closed model-integration guard, contiguous prompt-cache reuse, fail-closed prompt-cache safety guards for SSM/stateful routes, fail-closed standard MTP/draft-output guard, prompt-only FIM/iFIM infilling construction, eager vanilla speculative decoding, and eager MTP self-speculative decoding exist locally. Still open: model-integrated paged attention/API serving, integrated FIM decode/postprocess loop, EAGLE/token-recycling speculative paths, q4 path, and KV-q4 path.
 - **Quantization**: bf16 only; no mx.quantize integration, no q4 inference path.
 - **Structural parity anchors, not CUDA tensor parity**: existing tests/test_cppmega_parity_anchors.py checks NAM56R route/layer constants, DSA/MLA layer derivation, vocab/MoE anchors, fail-closed parity wording, and optional sibling cppmega source-anchor presence when that checkout exists. The source-file existence check is only one guard; the test is broader than file-presence coverage, but it still does not compare CUDA golden tensors or prove numerical agreement.
@@ -69,7 +69,7 @@ Full-stack research-grade LLM (40-45K LOC):
   - ifim.py (Sun et al. arXiv 2509.24637, Sep 2025: instruction-aware FIM; paper/source proposal only, not the deployed GB10 token-id contract).
   - stp.py (Huang/LeCun arXiv 2602.22617, Feb 2026: JEPA geodesic regularization, ~100 LOC).
 - Speculative decoding references: vanilla acceptance-rejection and MTP self-spec now have scoped eager MLX loops; EAGLE-2 remains pattern-only/gated until simpler paths underperform.
-- Tokenizer/FIM intent is a source reference only: live local/GB10 artifacts use the deployed M0.1 contract documented below (id7=<CODE_START>, id45=<FIM_INSTRUCTION>, id46=<SPACE>, id47=<NL>), and M0.1 decode parity is covered by the explicit <SPACE>/<NL> token redesign rather than HF reversible round-trip decode.
+- Tokenizer/FIM intent is a source reference only: live local/GB10 artifacts use the deployed M0.1 contract documented below (including id7=<CODE_START>, id8=<CODE_END>, id11=<QUERY_TOOL>, id19=<TOOL_RESULT>, id45=<FIM_INSTRUCTION>, id46=<SPACE>, id47=<NL>), and M0.1 decode parity is covered by the explicit <SPACE>/<NL> token redesign rather than HF reversible round-trip decode.
 - Training: pretrain + midtrain + SFT + RL via Muon/AdamW, FA3 (CUDA) / Pallas (TPU) / SDPA fallback.
 - Inference: contiguous KV (engine.py) + paged KV scheduler (serving.py).
 
@@ -233,7 +233,7 @@ Before fanning out across all 10 streams, prove the smallest viable path on the 
 **Goal**: load local_gb10_quarter config (depth=13, hidden=3584, FFN=18944, 28 heads, head_dim=128, vocab=65536, MTP=2, AEMEAEMEAEMR pattern); run bf16 training end-to-end on a single Mac using MLX/Metal; validate local parquet loss/memory receipts; and keep external CUDA/GB10 numerical reference closure separate from Mac-local acceptance.
 
 **Gate set** (Mac-local gates must be green before scaling effort; external reference closure is tracked fail-closed but does not block Mac-local M0.4 work):
-- M0.1 — **CLOSED**. Tokenizer: vendor the deployed GB10 tokenizer artifact with vocab=65536 and the reserved ID contract (id 2=BOS, 3=EOT/EOS, 4=FIM_PREFIX, 5=FIM_MIDDLE, 6=FIM_SUFFIX, 7=CODE_START, 45=FIM_INSTRUCTION, 46=SPACE, 47=NL). The wrapper normalizes whitespace runs at encode ([\r\n]+-><NL>, [ \t]+-><SPACE>) and decode is plain token concat with sentinel substitution; this fixes the BPE-split decode bug (e.g., sum->s,u,m->s u m) and gives byte-exact round-trip for inputs without multi-char whitespace runs. The explicit-token approach matches the CUDA-side nanochat/cpp_tokenizer.py decode behavior. Do not reopen this gate over the deployed HF decoder=null artifact's non-reversible decode(encode(text)) behavior.
+- M0.1 — **CLOSED**. Tokenizer: vendor the deployed GB10 tokenizer artifact with vocab=65536 and the reserved ID contract (id 2=BOS, 3=EOT/EOS, 4=FIM_PREFIX, 5=FIM_MIDDLE, 6=FIM_SUFFIX, 7=CODE_START, 8=CODE_END, 9=THINK_START, 10=THINK_END, 11=QUERY_TOOL, 19=TOOL_RESULT, 45=FIM_INSTRUCTION, 46=SPACE, 47=NL). The wrapper normalizes whitespace runs at encode ([\r\n]+-><NL>, [ \t]+-><SPACE>) and decode is plain token concat with sentinel substitution; this fixes the BPE-split decode bug (e.g., sum->s,u,m->s u m) and gives byte-exact round-trip for inputs without multi-char whitespace runs. The explicit-token approach matches the CUDA-side nanochat/cpp_tokenizer.py decode behavior. Do not reopen this gate over the deployed HF decoder=null artifact's non-reversible decode(encode(text)) behavior.
 - M0.2 — Model factory entry for local_gb10_quarter in cppmega_mlx/recipes/model_factory.py. With M0.1 closed, the default profile is unblocked; acceptance remains the profile contract plus build → forward closure on shape (B=1, T=512) returning finite logits with config schema validation rejecting invalid combos.
 - M0.3 — **External reference closure, not a Mac-local blocker**. Random-init seed-matched forward parity remains useful for comparing MLX against a CUDA/GB10 reference, but it does not gate local MLX/Metal M0.4 training progress. The fail-closed scaffold constructs the same local_gb10_quarter config and fixed B=1,T=512,seed=3003 input batch (tokens_sha256=c645ca4053e5206dcbe58c13aa26f4a9e56c5aa2aee90a4d4778bbc9d9c33549). No real CUDA logits artifact exists at bench/parity/cuda/m03_local_gb10_quarter_seed3003_logits.json, so scripts/m03_forward_parity_manifest.py must refuse the default missing artifact and keep m0_3_closed=false. A metadata-valid CUDA artifact only reaches artifact_preflight_status=valid_not_evaluated; it is not external reference acceptance until a separate numerical harness compares the full logits tensor (shape=[1,512,65536], numel=33554432) against MLX and records pass/fail parity. The non-blocking bd follow-up is cppmega-mlx-uwhj; the old Mac-local blocker task cppmega-mlx-t8f.3 is superseded by that external-reference task, not closed as completed parity evidence.
 - M0.4 — One training step in bf16 (loss + backward + optimizer.update). No NaNs. Loss decrease over 100 steps on the target local parquet sample. **Data source**: local ignored data/parquet_samples/gb10/clang_semantic_4k_v10/val_00000.parquet (~492 MB total of GB10 validation shards when present locally; not committed to git). Full local_gb10_quarter acceptance is captured in bench/baselines/m04_train_step.json with --grad-checkpoint on the target parquet: 100/100 steps, loss 11.2004585 -> 6.9402304, finite loss/grad path, AdamW with FP32 master moments, mean step time 10.72670 s, 16.28 target tokens/s, and peak process memory 23,917,647,383 bytes. No GB10 scp or full-corpus prep needed for M0.
@@ -902,7 +902,17 @@ Excluded as Hopper-only dead-end on Metal: cppmega/megatron/cute_dsl_mimo/ (sm_9
     `logits_processors`. This is token-id JSON prefix guarding only; it is not
     JSON Schema support, raw text/tokenizer parsing, OpenAI structured outputs,
     or speculative/paged constrained serving.
-180. Add tool-use template support (chat-template special tokens already reserved).
+180. **SCOPED DONE**: add cppmega C++ tool-use template support in
+    `cppmega_mlx/inference/tool_use.py`, exported from `cppmega_mlx.inference`.
+    The formatter renders `<THINK_START>`, `<QUERY_TOOL>`, `<TOOL_RESULT>`, and
+    `<CODE_START>` protocol blocks; the encoder delegates to a caller-owned
+    tokenizer; and `compute_tool_use_loss_mask(...)` masks instruction and
+    runtime-injected tool-result spans while training model-generated think,
+    tool-call, and code spans. The tokenizer wrapper and contract expose the
+    actual vendored tool-use IDs (`CODE_END=8`, `THINK_START=9`,
+    `THINK_END=10`, `QUERY_TOOL=11`, `TOOL_RESULT=19`). This is not runtime
+    tool execution, C++ tool-call parsing, OpenAI chat templating, or
+    OpenAI-compatible serving.
 
 ### Stream J — Benchmarking, Profiling & Validation (181–200)
 

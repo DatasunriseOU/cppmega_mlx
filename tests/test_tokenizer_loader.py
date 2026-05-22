@@ -54,9 +54,24 @@ def test_load_cppmega_tokenizer_accepts_exact_m01_contract(tmp_path: Path) -> No
     assert tokenizer.fim_middle_id == 5
     assert tokenizer.fim_suffix_id == 6
     assert tokenizer.code_start_id == 7
+    assert tokenizer.code_end_id == 8
+    assert tokenizer.think_start_id == 9
+    assert tokenizer.think_end_id == 10
+    assert tokenizer.query_tool_id == 11
+    assert tokenizer.tool_result_id == 19
     assert tokenizer.fim_instruction_id == 45
     assert tokenizer.token_for_id(7) == "<CODE_START>"
     assert tokenizer.id_for_token("<CODE_START>") == 7
+    assert tokenizer.token_for_id(8) == "<CODE_END>"
+    assert tokenizer.id_for_token("<CODE_END>") == 8
+    assert tokenizer.token_for_id(9) == "<THINK_START>"
+    assert tokenizer.id_for_token("<THINK_START>") == 9
+    assert tokenizer.token_for_id(10) == "<THINK_END>"
+    assert tokenizer.id_for_token("<THINK_END>") == 10
+    assert tokenizer.token_for_id(11) == "<QUERY_TOOL>"
+    assert tokenizer.id_for_token("<QUERY_TOOL>") == 11
+    assert tokenizer.token_for_id(19) == "<TOOL_RESULT>"
+    assert tokenizer.id_for_token("<TOOL_RESULT>") == 19
     assert tokenizer.token_for_id(45) == "<FIM_INSTRUCTION>"
     assert tokenizer.id_for_token("<FIM_INSTRUCTION>") == 45
     assert tokenizer.space_token_id == 46
@@ -124,6 +139,9 @@ def test_nanochat_v3_artifact_satisfies_special_id_contract() -> None:
 
     assert tokenizer.vocab_size == 65_536
     assert tokenizer.code_start_id == 7
+    assert tokenizer.code_end_id == 8
+    assert tokenizer.query_tool_id == 11
+    assert tokenizer.tool_result_id == 19
     assert tokenizer.fim_instruction_id == 45
     assert tokenizer.token_for_id(7) == "<CODE_START>"
     assert tokenizer.id_for_token("<CODE_START>") == 7
@@ -222,6 +240,11 @@ def test_nanochat_v3_fixed_tokens_config_matches_special_id_contract() -> None:
     assert special_tokens["<FIM_MIDDLE>"] == 5
     assert special_tokens["<FIM_SUFFIX>"] == 6
     assert special_tokens["<CODE_START>"] == 7
+    assert special_tokens["<CODE_END>"] == 8
+    assert special_tokens["<THINK_START>"] == 9
+    assert special_tokens["<THINK_END>"] == 10
+    assert special_tokens["<QUERY_TOOL>"] == 11
+    assert special_tokens["<TOOL_RESULT>"] == 19
     assert special_tokens["<FIM_INSTRUCTION>"] == 45
     assert special_tokens["<SPACE>"] == 46
     assert special_tokens["<NL>"] == 47

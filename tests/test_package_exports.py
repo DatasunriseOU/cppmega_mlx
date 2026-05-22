@@ -30,6 +30,13 @@ FIM_DATA_EXPORTS = {
     "sample_middle_span",
     "validate_required_special_token_ids",
 }
+TOOL_USE_INFERENCE_EXPORTS = {
+    "ToolUseBlock",
+    "ToolUseSpecialTokenIds",
+    "compute_tool_use_loss_mask",
+    "encode_tool_use_template",
+    "render_tool_use_template",
+}
 FOREIGN_RUNTIME_ALIASES = {
     "CudaGraphTrainer",
     "DifferentiableMetalKernel",
@@ -118,7 +125,7 @@ def test_package_roots_expose_local_mlx_contracts() -> None:
         "generate_tokens_speculative",
         "sample_next_token",
         "stream_generate_tokens",
-    } <= _assert_public_exports(inference)
+    } | TOOL_USE_INFERENCE_EXPORTS <= _assert_public_exports(inference)
     assert {
         "Mamba3CacheState",
         "Mamba3ReferenceBlock",

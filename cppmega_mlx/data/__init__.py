@@ -63,6 +63,7 @@ from cppmega_mlx.data.platform_context import (
 from cppmega_mlx.data.tokenizer_contract import (
     REQUIRED_SPECIAL_TOKEN_IDS,
     SpecialTokenMapping,
+    TOOL_USE_SPECIAL_TOKEN_IDS,
     validate_required_special_token_ids,
 )
 from cppmega_mlx.data.token_dataset import (
@@ -103,6 +104,7 @@ __all__ = [
     "TokenDatasetMetadata",
     "TorchDataLoaderBridgeConfig",
     "TorchDataLoaderBridgeError",
+    "TOOL_USE_SPECIAL_TOKEN_IDS",
     "TokenNpzDataset",
     "TokenParquetDataset",
     "apply_fim_permutation",

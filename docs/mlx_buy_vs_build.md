@@ -241,7 +241,8 @@ Verdict legend: **VENDOR** = drop in unchanged (pin SHA), **FORK** = vendor + pa
       <td>AA</td>
       <td>BPE tokenizer with FIM/iFIM tokens</td>
       <td>**CLOSED for M0.1:** deployed GB10/local artifact contract<br>
-      is vocab=65536 with id 7=<CODE_START>, id<br>
+      is vocab=65536 with id 7=<CODE_START>, id 8=<CODE_END>,<br>
+      id 11=<QUERY_TOOL>, id 19=<TOOL_RESULT>, id<br>
       45=<FIM_INSTRUCTION>, id 46=<SPACE>, and id 47=<NL>;<br>
       tokenizer.json legacy 32K is not used; MLX/CUDA wrappers use<br>
       explicit whitespace-sentinel encode/decode parity</td>

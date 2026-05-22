@@ -72,6 +72,13 @@ from cppmega_mlx.inference.speculative_decode import (
     typical_acceptance,
     typical_acceptance_batch,
 )
+from cppmega_mlx.inference.tool_use import (
+    ToolUseBlock,
+    ToolUseSpecialTokenIds,
+    compute_tool_use_loss_mask,
+    encode_tool_use_template,
+    render_tool_use_template,
+)
 
 __all__ = [
     "ContiguousKVCache",
@@ -100,13 +107,17 @@ __all__ = [
     "SchedulerOutput",
     "SequenceRequest",
     "TokenMetadata",
+    "ToolUseBlock",
+    "ToolUseSpecialTokenIds",
     "UnavailableCodeMetadataAdapter",
     "build_prompt_cache",
     "build_fim_prompt_ids",
     "build_paged_block_table",
     "builtin_code_metadata_adapters",
     "clone_contiguous_kv_cache",
+    "compute_tool_use_loss_mask",
     "create_local_generation_app",
+    "encode_tool_use_template",
     "generate_tokens",
     "generate_tokens_mtp_self_speculative",
     "generate_tokens_speculative",
@@ -122,6 +133,7 @@ __all__ = [
     "quantize_kv_cache",
     "quantize_linear_for_inference",
     "require_model_integrated_paged_attention",
+    "render_tool_use_template",
     "rollback_contiguous_kv_cache",
     "sample_next_token",
     "should_start_kv_quantization",
