@@ -933,12 +933,44 @@ def stage_train(ctx: StageContext) -> StageResult:
                         "kind": str(getattr(a, "kind", "")),
                         "degree": deg,
                     })
+                # H15: real per-rank shard simulation. With the model
+                # already built (`all_modules`), flatten its parameters
+                # and divide the total tensor bytes by shard_dim — that
+                # matches what an FSDP-style row-split would do at
+                # steady state (each rank holds ~1/shard_dim of every
+                # weight). Activations use the dim_env shape (B*S*H per
+                # brick × num bricks × 4-byte fp32 accumulator) so the
+                # number tracks model depth + sequence length.
+                total_param_bytes = 0
+                try:
+                    flat = dict(nn.utils.tree_flatten(
+                        all_modules.parameters()))
+                    for _k, _v in flat.items():
+                        nbytes = int(getattr(_v, "size", 0)) * int(
+                            getattr(getattr(_v, "dtype", None),
+                                    "size", 4))
+                        total_param_bytes += nbytes
+                except Exception:
+                    total_param_bytes = 0
+                per_rank_param_bytes = (
+                    total_param_bytes // max(1, shard_dim))
+                # Activations: B*S*H bytes per layer × #bricks × 4
+                # (fp32 accumulator). Sharded the same way as params.
+                num_layers = max(1, len(modules))
+                total_act_bytes = (
+                    int(batch) * int(seq) * int(hidden) * 4 * num_layers)
+                per_rank_activation_bytes = (
+                    total_act_bytes // max(1, shard_dim))
                 sharding_applied = {
                     "axis_assignments": axis_list,
                     "shard_dim": shard_dim,
                     "microbatch_size": max(1, batch // shard_dim),
                     "compile_mode": str(getattr(
                         ws_sharding, "compile_mode", "off")),
+                    "per_rank_param_bytes": int(per_rank_param_bytes),
+                    "per_rank_activation_bytes":
+                        int(per_rank_activation_bytes),
+                    "total_param_bytes": int(total_param_bytes),
                 }
 
         # G06: memory peak instrumentation — bracket train loop with
