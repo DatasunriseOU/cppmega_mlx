@@ -34,6 +34,7 @@ _REPEAT_GENERATED_MODEL_KWARGS = frozenset({"document_ids", "platform_ids"})
 _SEQUENCE_ALIGNED_MODEL_KWARGS = (
     _ZERO_GENERATED_MODEL_KWARGS | _REPEAT_GENERATED_MODEL_KWARGS
 )
+_PROMPT_CACHE_UNSAFE_ROUTE_ROLES = frozenset({"mamba3", "m2rnn", "engram"})
 
 
 @dataclass(frozen=True)
@@ -474,6 +475,7 @@ def build_prompt_cache(
     max_seq_length = _model_max_seq_length(model)
     if max_seq_length is not None and prompt_ids.shape[1] > max_seq_length:
         raise ValueError("prompt_ids already exceed model.config.max_seq_length")
+    _require_prompt_cache_safe_model(model)
 
     kv_cache = _resolve_kv_cache(
         cache=cache,
@@ -538,6 +540,7 @@ def generate_tokens_with_prompt_cache(
     max_seq_length = _model_max_seq_length(model)
     if max_seq_length is not None and prompt_ids.shape[1] > max_seq_length:
         raise ValueError("prompt_ids already exceed model.config.max_seq_length")
+    _require_prompt_cache_safe_model(model)
 
     tokens = prompt_ids
     kv_cache = clone_contiguous_kv_cache(prompt_cache.cache)
@@ -908,6 +911,20 @@ def _validate_prompt_cache_prefix(
     prefix_matches = cast(mx.array, prompt_ids[:, :prefix_length] == prompt_cache.prompt_ids)
     if not bool(mx.all(prefix_matches)):
         raise ValueError("prompt_ids must start with prompt_cache.prompt_ids")
+
+
+def _require_prompt_cache_safe_model(model: Any) -> None:
+    route_roles = getattr(model, "route_roles", None)
+    if route_roles is None:
+        return
+    roles = tuple(str(role) for role in route_roles)
+    unsafe = tuple(role for role in roles if role in _PROMPT_CACHE_UNSAFE_ROUTE_ROLES)
+    if unsafe:
+        joined = ", ".join(unsafe)
+        raise ValueError(
+            "prompt cache is only validated for attention/stateless routes; "
+            f"route roles requiring their own state cache are present: {joined}"
+        )
 
 
 def _propose_speculative_draft_window(

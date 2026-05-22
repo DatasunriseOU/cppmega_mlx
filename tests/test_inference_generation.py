@@ -293,6 +293,25 @@ def _tiny_attention_lm() -> HybridTinyLM:
     )
 
 
+def _tiny_mamba_lm() -> HybridTinyLM:
+    return HybridTinyLM(
+        HybridTinyConfig(
+            vocab_size=17,
+            hidden_size=8,
+            pattern="M",
+            depth=1,
+            dsa_a_layer_ranks=(),
+            num_attention_heads=1,
+            max_seq_length=8,
+            mamba_expand=1,
+            mamba_head_dim=4,
+            mamba_state_dim=4,
+            mamba_groups=1,
+            mamba_chunk_size=4,
+        )
+    )
+
+
 def test_generate_tokens_greedy_appends_full_prefix_steps() -> None:
     model = _ScriptedLogitsModel([[4], [5], [6]])
     prompt = mx.array([[1, 2, 3]], dtype=mx.int32)
@@ -1193,6 +1212,30 @@ def test_generate_tokens_with_prompt_cache_returns_prompt_for_zero_new_tokens() 
 
     assert tokens is prompt
     assert model.calls == calls_after_build
+
+
+def test_build_prompt_cache_rejects_mamba_route_without_ssm_state_cache() -> None:
+    model = _tiny_mamba_lm()
+    prompt = mx.array([[1, 2, 3]], dtype=mx.int32)
+
+    with pytest.raises(ValueError, match="prompt cache is only validated"):
+        build_prompt_cache(model, prompt)
+
+
+def test_generate_tokens_with_prompt_cache_rejects_mamba_route_reuse() -> None:
+    safe_model = _UpdatingKVScriptedLogitsModel([[4]])
+    prompt = mx.array([[1, 2, 3]], dtype=mx.int32)
+    prompt_cache = build_prompt_cache(safe_model, prompt, cache=_make_cache())
+    unsafe_model = _tiny_mamba_lm()
+
+    with pytest.raises(ValueError, match="prompt cache is only validated"):
+        generate_tokens_with_prompt_cache(
+            unsafe_model,
+            prompt,
+            prompt_cache=prompt_cache,
+            max_new_tokens=1,
+            temperature=0.0,
+        )
 
 
 def test_real_hybrid_tiny_lm_greedy_kv_cache_matches_full_prefix_generation() -> None:
