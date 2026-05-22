@@ -68,6 +68,15 @@ _TOKEN_TEMPORAL_METADATA_COLUMNS = (
     "hunk_id_per_token",
     "edit_op_per_token",
 )
+_FAMILY_TOKEN_SIDE_CHANNEL_COLUMNS: Mapping[str, tuple[str, ...]] = {
+    "semantic_graph": _TOKEN_SEMANTIC_METADATA_COLUMNS,
+    "temporal_diff": _TOKEN_TEMPORAL_METADATA_COLUMNS,
+}
+_FAMILY_TOKEN_SIDE_CHANNEL_COLUMNS_FLAT = tuple(
+    column
+    for columns in _FAMILY_TOKEN_SIDE_CHANNEL_COLUMNS.values()
+    for column in columns
+)
 _SOURCE_PLATFORM_IDS_COLUMN = "source_platform_ids"
 _VALID_TOKEN_COUNT_COLUMN = "valid_token_count"
 _ROW_METADATA_COLUMNS = (
@@ -180,6 +189,12 @@ class _SideChannelColumns:
 
 
 @dataclass(frozen=True)
+class _FamilySideChannelColumns:
+    channels: Mapping[str, Mapping[str, np.ndarray]]
+    sources: Mapping[str, Mapping[str, Mapping[str, str | None]]]
+
+
+@dataclass(frozen=True)
 class _ModelMetadataColumns:
     channels: Mapping[str, np.ndarray]
     sources: Mapping[str, Mapping[str, str | None]]
@@ -288,6 +303,11 @@ class TokenParquetDataset:
         )
         side_channel_columns = _side_channel_windows(columns, token_rows, seq_len)
         side_channels = side_channel_columns.channels
+        family_side_channel_columns = _family_side_channel_windows(
+            columns,
+            token_rows,
+            seq_len,
+        )
         model_metadata_columns = _model_metadata_windows(columns, token_rows, seq_len)
         batch_metadata_columns = _resolve_batch_metadata_columns(
             columns,
@@ -325,6 +345,13 @@ class TokenParquetDataset:
             key: _to_side_channel_values(key, value)
             for key, value in side_channels.items()
         }
+        self._family_side_channels = {
+            family: {
+                column: value.astype(np.int32, copy=False)
+                for column, value in family_columns.items()
+            }
+            for family, family_columns in family_side_channel_columns.channels.items()
+        }
         self._model_metadata_channels = {
             key: value.astype(np.int32, copy=False)
             for key, value in model_metadata_columns.channels.items()
@@ -342,6 +369,7 @@ class TokenParquetDataset:
             document_id_source=document_id_source,
             side_channel_sources=side_channel_columns.sources,
             skipped_side_channels=side_channel_columns.skipped,
+            family_side_channel_sources=family_side_channel_columns.sources,
             model_metadata_sources=model_metadata_columns.sources,
             batch_metadata_columns=batch_metadata_columns,
         )
@@ -441,6 +469,13 @@ class TokenParquetDataset:
                 for key, value in self._model_metadata_channels.items()
             }
         )
+        family_side_channels = {
+            family: {
+                column: mx.array(value[sample_idx])
+                for column, value in family_columns.items()
+            }
+            for family, family_columns in self._family_side_channels.items()
+        }
         return LMTokenBatch(
             tokens=mx.array(self._tokens[sample_idx]),
             target_tokens=None
@@ -452,6 +487,7 @@ class TokenParquetDataset:
             document_ids=None
             if self._document_ids is None
             else mx.array(self._document_ids[sample_idx]),
+            side_channels=family_side_channels or None,
             metadata=self._make_batch_metadata(sample_idx),
             **kwargs,
         )
@@ -496,6 +532,7 @@ def _candidate_parquet_columns(
         candidates.append(text_key)
     candidates.extend(_LOSS_MASK_COLUMN_ALIASES)
     candidates.extend(_DOCUMENT_ID_COLUMN_ALIASES)
+    candidates.extend(_FAMILY_TOKEN_SIDE_CHANNEL_COLUMNS_FLAT)
     candidates.append(_SOURCE_PLATFORM_IDS_COLUMN)
     candidates.append(_VALID_TOKEN_COUNT_COLUMN)
     for aliases in _SIDE_CHANNEL_COLUMN_ALIASES.values():
@@ -719,6 +756,41 @@ def _side_channel_windows(
                 "type": columns.type_label(column_key),
             }
     return _SideChannelColumns(channels=channels, sources=sources, skipped=skipped)
+
+
+def _family_side_channel_windows(
+    columns: ParquetColumns,
+    token_rows: list[list[int]],
+    seq_len: int,
+) -> _FamilySideChannelColumns:
+    channels: dict[str, dict[str, np.ndarray]] = {}
+    sources: dict[str, dict[str, dict[str, str | None]]] = {}
+    for family, family_columns in _FAMILY_TOKEN_SIDE_CHANNEL_COLUMNS.items():
+        for column in family_columns:
+            if column not in columns.values:
+                continue
+            _reject_non_integer_parquet_type(
+                columns,
+                column,
+                f"{column} {family} side-channel IDs",
+            )
+            rows = [
+                _coerce_token_row(value, label=f"{column} {family} side-channel")
+                for value in columns.require(column)
+            ]
+            if not _rows_are_token_aligned(rows, token_rows):
+                raise ValueError(
+                    f"{column} rows must be token-aligned with token IDs"
+                )
+            channels.setdefault(family, {})[column] = _fixed_windows_from_rows(
+                rows,
+                seq_len,
+            )
+            sources.setdefault(family, {})[column] = {
+                "column": column,
+                "type": columns.type_label(column),
+            }
+    return _FamilySideChannelColumns(channels=channels, sources=sources)
 
 
 def _model_metadata_windows(
@@ -1137,6 +1209,10 @@ def _parquet_receipt(
     document_id_source: str | None,
     side_channel_sources: Mapping[str, Mapping[str, str | None]],
     skipped_side_channels: Sequence[Mapping[str, str | None]],
+    family_side_channel_sources: Mapping[
+        str,
+        Mapping[str, Mapping[str, str | None]],
+    ],
     model_metadata_sources: Mapping[str, Mapping[str, str | None]],
     batch_metadata_columns: Sequence[str],
 ) -> dict[str, Any]:
@@ -1172,6 +1248,14 @@ def _parquet_receipt(
     if model_metadata_sources:
         receipt["model_metadata_sources"] = {
             key: dict(value) for key, value in sorted(model_metadata_sources.items())
+        }
+    if family_side_channel_sources:
+        receipt["family_side_channel_sources"] = {
+            family: {
+                column: dict(source)
+                for column, source in sorted(columns.items())
+            }
+            for family, columns in sorted(family_side_channel_sources.items())
         }
     training_sources = {
         "target_tokens": target_source,

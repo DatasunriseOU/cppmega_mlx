@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import mlx.core as mx
 import mlx.nn as nn
 
 from cppmega_mlx.data.parquet_dataset import TokenParquetDataset
@@ -332,6 +333,114 @@ def test_all_metadata_excludes_token_content_and_slices_token_level_fields() -> 
     assert "doc_ids" not in metadata_columns
     assert "platform_ids" not in metadata_columns
     assert metadata_windows[1]["repo"] == "llvm"
+
+
+def test_parquet_token_semantic_and_temporal_metadata_reach_side_channel_map(
+    tmp_path,
+) -> None:
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    path = tmp_path / "semantic_temporal.parquet"
+    table = pa.table(
+        {
+            "token_ids": pa.array(
+                [[0, 1, 2, 3, 4, 5, 6, 7]],
+                type=pa.large_list(pa.int32()),
+            ),
+            "token_symbol_ids": pa.array(
+                [[10, 11, 12, 13, 14, 15, 16, 17]],
+                type=pa.large_list(pa.int32()),
+            ),
+            "token_call_targets": pa.array(
+                [[20, 21, 22, 23, 24, 25, 26, 27]],
+                type=pa.large_list(pa.int32()),
+            ),
+            "token_change_mask_post": pa.array(
+                [[0, 0, 1, 1, 0, 1, 0, 1]],
+                type=pa.large_list(pa.int32()),
+            ),
+            "edit_op_per_token": pa.array(
+                [[0, 0, 2, 2, 0, 3, 0, 3]],
+                type=pa.large_list(pa.int32()),
+            ),
+        }
+    )
+    pq.write_table(table, path)
+
+    dataset = TokenParquetDataset(path, seq_len=4, batch_size=2, token_key="token_ids")
+    batch = next(dataset.iter_batches())
+
+    assert batch.side_channels is not None
+    assert tuple(batch.model_kwargs()) == ()
+    assert set(batch.side_channels) == {"semantic_graph", "temporal_diff"}
+    np.testing.assert_array_equal(
+        np.array(batch.side_channels["semantic_graph"]["token_symbol_ids"]),
+        [[10, 11, 12, 13], [14, 15, 16, 17]],
+    )
+    np.testing.assert_array_equal(
+        np.array(batch.side_channels["semantic_graph"]["token_call_targets"]),
+        [[20, 21, 22, 23], [24, 25, 26, 27]],
+    )
+    np.testing.assert_array_equal(
+        np.array(batch.side_channels["temporal_diff"]["token_change_mask_post"]),
+        [[0, 0, 1, 1], [0, 1, 0, 1]],
+    )
+    np.testing.assert_array_equal(
+        np.array(batch.side_channels["temporal_diff"]["edit_op_per_token"]),
+        [[0, 0, 2, 2], [0, 3, 0, 3]],
+    )
+
+    dropped = batch.with_side_channel_dropout(
+        {"semantic_graph": 1.0, "temporal_diff": 1.0},
+        seed=7,
+    )
+    assert dropped.side_channels is not None
+    assert float(
+        mx.sum(
+            mx.abs(dropped.side_channels["semantic_graph"]["token_symbol_ids"])
+        ).item()
+    ) == 0.0
+    assert float(
+        mx.sum(
+            mx.abs(dropped.side_channels["temporal_diff"]["edit_op_per_token"])
+        ).item()
+    ) == 0.0
+    assert (
+        dataset.parquet_receipt["family_side_channel_sources"]["semantic_graph"][
+            "token_symbol_ids"
+        ]["column"]
+        == "token_symbol_ids"
+    )
+    assert (
+        dataset.parquet_receipt["family_side_channel_sources"]["temporal_diff"][
+            "edit_op_per_token"
+        ]["column"]
+        == "edit_op_per_token"
+    )
+
+
+def test_parquet_token_semantic_side_channel_fails_closed_when_not_token_aligned(
+    tmp_path,
+) -> None:
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    path = tmp_path / "bad_semantic.parquet"
+    table = pa.table(
+        {
+            "token_ids": pa.array(
+                [[0, 1, 2, 3, 4, 5, 6, 7]],
+                type=pa.large_list(pa.int32()),
+            ),
+            "token_symbol_ids": pa.array(
+                [[10, 11]],
+                type=pa.large_list(pa.int32()),
+            ),
+        }
+    )
+    pq.write_table(table, path)
+
+    with pytest.raises(ValueError, match="token_symbol_ids.*token-aligned"):
+        TokenParquetDataset(path, seq_len=4, batch_size=1, token_key="token_ids")
 
 
 def test_platform_ids_parquet_column_threads_to_model_kwargs(tmp_path) -> None:
