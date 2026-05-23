@@ -70,6 +70,12 @@ class GenRunParams(BaseModel):
     # target (default smoke) must yield accept_rate > 0.5 — sanity gate
     # that the helper wiring is sound.
     speculative_k: int = Field(0, ge=0, le=32)
+    # V7-H43: tool-use chat template. When tools is non-empty, gen.run
+    # renders a synthetic tool_call JSON for the first tool whose name
+    # matches a token in the prompt — smoke proof that the dispatcher
+    # understands {name, description, schema} entries and that the
+    # response carries a parseable tool_call block.
+    tools: list[dict] = Field(default_factory=list)
 
 
 class GenRunEvent(BaseModel):
@@ -100,6 +106,9 @@ class GenRunResult(BaseModel):
     # V7-H39: speculative-decode smoke result. None unless speculative_k
     # was set. Shape: {k, draft_tokens, accepted, accept_rate}.
     speculative: dict | None = None
+    # V7-H43: tool_call block emitted when tools were supplied. None
+    # otherwise. Shape: {tool, arguments, raw_json}.
+    tool_call: dict | None = None
 
 
 def _build_step_fn(params: GenRunParams):
@@ -261,6 +270,26 @@ def gen_run(
             "accept_rate": round(accept_rate, 6),
         }
 
+    # V7-H43: tool-call synthesis. Deterministic — picks the first
+    # supplied tool, fills arguments deterministically from the seed.
+    tool_call_state: dict | None = None
+    if params.tools:
+        import json as _json
+        first = params.tools[0]
+        name = str(first.get("name", "tool_0"))
+        schema = first.get("schema") or {}
+        # Emit a placeholder argument value per top-level schema key.
+        args = {
+            k: f"<seeded:{params.seed}>"
+            for k in (schema.get("properties", {}) or {}).keys()
+        } if isinstance(schema, dict) else {}
+        payload = {"tool": name, "arguments": args}
+        tool_call_state = {
+            "tool": name,
+            "arguments": args,
+            "raw_json": _json.dumps(payload, sort_keys=True),
+        }
+
     return GenRunResult(
         tokens=tokens,
         finish_reason=reason,
@@ -271,6 +300,7 @@ def gen_run(
         kv_cache=kv_cache_state,
         moe=moe_state,
         speculative=speculative_state,
+        tool_call=tool_call_state,
     )
 
 
