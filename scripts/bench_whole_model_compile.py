@@ -6,7 +6,15 @@ on a small preset (default llama3_8b @ H=128) and emits:
   reports/whole_model_compile_bench_<date>.json
     { preset, hidden, compile_mode, num_steps,
       first_step_ms, warm_step_ms_mean, warm_step_ms_min,
-      peak_memory_mb, losses }
+      peak_memory_mb, losses,
+      compile_engaged, compile_status, compile_error,
+      first_vs_warm_ratio }
+
+Acceptance: compile_engaged=true (mx.compile actually wrapped the
+value-and-grad closure), AND first_vs_warm_ratio > 1.0 — i.e. the
+first step (compile + run) is measurably slower than the steady-state
+warm steps (compiled fast-path). On a 6-step run the warm-step mean
+is taken over steps 1..N-1.
 
 Usage:
     python -m scripts.bench_whole_model_compile \\
@@ -29,7 +37,8 @@ from cppmega_v4.jsonrpc.schema import VerifyParams
 from cppmega_v4.runner import Pipeline, run_pipeline
 
 
-def _bench(preset: str, hidden: int, num_steps: int) -> dict:
+def _bench(preset: str, hidden: int, num_steps: int,
+           compile_mode: str = "whole_model") -> dict:
     specs = build_preset_specs(preset, hidden_size=hidden)
     spec = VerifyParams.model_validate({
         "graph": {
@@ -57,7 +66,7 @@ def _bench(preset: str, hidden: int, num_steps: int) -> dict:
             "axis_assignments": [
                 {"axis_name": "dp", "kind": "fsdp2", "degree": 1}
             ],
-            "compile_mode": "whole_model",
+            "compile_mode": compile_mode,
             "fp8_enabled": False,
         },
     })
@@ -76,24 +85,45 @@ def _bench(preset: str, hidden: int, num_steps: int) -> dict:
     losses = tr.extras.get("losses", [])
     if not losses:
         return {"status": "fail", "error": str(tr.error)}
-    # Approximate first vs warm: split into first-step + remaining warm.
-    first_step_ms = elapsed * 1000.0 / max(1, len(losses))
-    # We don't have per-step timing from extras yet; use total/N as
-    # both first and warm estimates. Future: per-step timing in extras.
-    warm = first_step_ms
+    sa = tr.extras.get("sharding_applied") or {}
+    # Real per-step timings published by stage_train (V7-I01 wiring).
+    first_step_ms = sa.get("first_step_ms")
+    warm_mean = sa.get("warm_step_ms_mean")
+    warm_min = sa.get("warm_step_ms_min")
+    per_step_ms = sa.get("per_step_ms") or []
+    compile_engaged = bool(sa.get("compile_engaged", False))
+    compile_status = str(sa.get("compile_status", "off"))
+    compile_error = sa.get("compile_error")
+    # Fall-back if the runner didn't surface per-step timing for some
+    # reason (older versions): use elapsed/N as a coarse estimate.
+    if first_step_ms is None:
+        first_step_ms = elapsed * 1000.0 / max(1, len(losses))
+        warm_mean = first_step_ms
+        warm_min = first_step_ms
+    first_vs_warm_ratio = (
+        float(first_step_ms) / float(warm_mean)
+        if warm_mean and warm_mean > 0 else None)
     peak = tr.extras.get("memory_peak_bytes")
     return {
         "preset": preset,
         "hidden": hidden,
-        "compile_mode": "whole_model",
+        "compile_mode": compile_mode,
         "num_steps": num_steps,
         "status": "ok",
-        "first_step_ms": round(first_step_ms, 4),
-        "warm_step_ms_mean": round(warm, 4),
-        "warm_step_ms_min": round(warm, 4),
+        "first_step_ms": round(float(first_step_ms), 4),
+        "warm_step_ms_mean": round(float(warm_mean), 4),
+        "warm_step_ms_min": round(float(warm_min), 4),
+        "first_vs_warm_ratio": (
+            round(first_vs_warm_ratio, 4)
+            if first_vs_warm_ratio is not None else None),
+        "per_step_ms": [round(float(x), 4) for x in per_step_ms],
         "peak_memory_mb": (round(peak / (1024 * 1024), 4)
                            if peak else None),
+        "compile_engaged": compile_engaged,
+        "compile_status": compile_status,
+        "compile_error": compile_error,
         "losses": [round(float(x), 4) for x in losses],
+        "total_elapsed_s": round(elapsed, 4),
     }
 
 
@@ -102,12 +132,15 @@ def main() -> int:
     parser.add_argument("--preset", default="llama3_8b")
     parser.add_argument("--hidden", type=int, default=128)
     parser.add_argument("--num-steps", type=int, default=6)
+    parser.add_argument("--compile-mode", default="whole_model",
+                        choices=["off", "regional", "whole_model"])
     parser.add_argument("--out-dir", default="reports")
     args = parser.parse_args()
     out_dir = pathlib.Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    result = _bench(args.preset, args.hidden, args.num_steps)
-    date = _dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    result = _bench(args.preset, args.hidden, args.num_steps,
+                    compile_mode=args.compile_mode)
+    date = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%d_%H%M%S")
     out = out_dir / f"whole_model_compile_bench_{date}.json"
     out.write_text(json.dumps(result, indent=2))
     print(f"[bench] {result}")
