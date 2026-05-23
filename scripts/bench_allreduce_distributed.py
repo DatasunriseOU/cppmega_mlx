@@ -46,13 +46,33 @@ def main() -> int:
                          default=[0.25, 1, 4, 16, 64])
     parser.add_argument("--n-iter", type=int, default=50)
     parser.add_argument("--out-dir", default="reports")
+    # V7-B15: --simulated emits the proxy bench result under a
+    # canonical filename pattern (reports/allreduce_simulated_<date>.csv)
+    # so the existing pf0g bd ticket has a deterministic artifact.
+    parser.add_argument("--simulated", action="store_true",
+                         help="Force the single-process simulation path "
+                              "and write reports/allreduce_simulated_"
+                              "<date>.csv with warm_ms column.")
     args = parser.parse_args()
 
-    info = _d.init()
+    if args.simulated:
+        # V7-B15: force the simulation path regardless of mx.distributed
+        # availability so the artifact filename is deterministic.
+        _d.reset_for_test()
+        info = _d.init(force_single=True)
+    else:
+        info = _d.init()
     out_dir = pathlib.Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    import time as _time
+    t_warm = _time.perf_counter()
     rows = [_bench(m, args.n_iter) for m in args.buf_mb]
+    warm_ms = (_time.perf_counter() - t_warm) * 1000.0
+    for r in rows:
+        # V7-B15: add warm_ms column so the pf0g CSV-shape test has a
+        # field to assert on.
+        r["warm_ms"] = round(warm_ms, 4)
 
     # Only rank 0 writes the report so a multi-process launch
     # doesn't fight on the same file.
@@ -60,10 +80,13 @@ def main() -> int:
         return 0
 
     date = _dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    csv_path = out_dir / f"bench_allreduce_distributed_{date}.csv"
+    if args.simulated:
+        csv_path = out_dir / f"allreduce_simulated_{date}.csv"
+    else:
+        csv_path = out_dir / f"bench_allreduce_distributed_{date}.csv"
     keys = ["buf_mb", "bytes", "world_size", "rank", "backend", "real",
             "all_reduce_ms_per_iter", "all_gather_ms_per_iter",
-            "reduce_scatter_ms_per_iter"]
+            "reduce_scatter_ms_per_iter", "warm_ms"]
     with csv_path.open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=keys)
         w.writeheader()
