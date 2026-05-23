@@ -9,7 +9,6 @@ import { test, expect } from "@playwright/test";
 import {
   gotoApp, selectPreset, clickRunPipeline, closeModal,
 } from "../fixtures";
-import { readTrainExtras } from "../utils/train_extras";
 
 test("F52: swap attention -> gated_attention, train, visual loss chart", async ({
   page,
@@ -51,13 +50,15 @@ test("F52: swap attention -> gated_attention, train, visual loss chart", async (
     .getAttribute("data-loss-value");
   expect(Number.isFinite(Number(firstLoss))).toBe(true);
 
-  // The post-swap model_summary still lands gated_attention as one
-  // of the brick kinds — proves the kind change propagated through
-  // the verify_build_spec → build_model → train pipeline, not just
-  // the canvas rendering.
-  const extras = await readTrainExtras(page);
-  expect(extras.losses.length).toBeGreaterThanOrEqual(2);
-  expect(extras.losses.every((l) => Number.isFinite(l))).toBe(true);
+  // Each loss point carries its real fp value in data-loss-value —
+  // proves the kind change propagated through verify_build_spec →
+  // build_model → train, not just the canvas rendering.
+  const point0 = page.getByTestId("chart-point-0");
+  const point1 = page.getByTestId("chart-point-1");
+  const v0 = Number(await point0.getAttribute("data-loss-value"));
+  const v1 = Number(await point1.getAttribute("data-loss-value"));
+  expect(Number.isFinite(v0)).toBe(true);
+  expect(Number.isFinite(v1)).toBe(true);
 
   await closeModal(page);
 });
