@@ -152,6 +152,42 @@ def create_app(*, cache_capacity: int = 50) -> FastAPI:
         finally:
             train_event_bus.unsubscribe(run_id, q)
 
+    @app.websocket("/ws/verify/{spec_hash}")
+    async def ws_verify(socket: WebSocket, spec_hash: str) -> None:
+        """V7-L45: live verify progress stream.
+
+        Client subscribes by spec_hash (sha256 of the canonical
+        VerifyParams JSON) *before* calling verify. The handler emits
+        {phase} frames as it walks resolve/memory/distributed checks
+        and a final {finish:'ok'} when verify returns."""
+        from cppmega_v4.runtime import verify_event_bus
+        import queue as _queue
+        await socket.accept()
+        q = verify_event_bus.subscribe(spec_hash)
+
+        def _try_get(timeout: float = 0.2):
+            try:
+                return q.get(timeout=timeout)
+            except _queue.Empty:
+                return _SENTINEL_EMPTY
+
+        try:
+            while True:
+                ev = await asyncio.to_thread(_try_get, 0.2)
+                if ev is _SENTINEL_EMPTY:
+                    await asyncio.sleep(0)
+                    continue
+                if ev is None:
+                    await socket.send_json({"finish": "ok",
+                                             "spec_hash": spec_hash})
+                    return
+                await socket.send_json({"spec_hash": spec_hash,
+                                         "event": ev})
+        except WebSocketDisconnect:
+            pass
+        finally:
+            verify_event_bus.unsubscribe(spec_hash, q)
+
     @app.websocket("/ws")
     async def ws(socket: WebSocket) -> None:
         await socket.accept()

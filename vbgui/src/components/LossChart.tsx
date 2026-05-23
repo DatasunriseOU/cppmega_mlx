@@ -16,6 +16,11 @@ export interface LossChartProps {
   width?: number;
   height?: number;
   testidPrefix?: string;
+  /** V7-L38: per-step overflow markers (step indices). Rendered as
+   *  red vertical bars at the matching x positions on the primary
+   *  loss curve so the user can see scaler overflow events without
+   *  scanning extras text. */
+  overflowSteps?: readonly number[];
 }
 
 const DEFAULT_COLOR = "#2563eb";
@@ -40,6 +45,7 @@ function pathFor(values: number[], w: number, h: number,
 
 export function LossChart({
   losses, series = [], width = 360, height = 140, testidPrefix = "chart",
+  overflowSteps = [],
 }: LossChartProps): JSX.Element {
   // Whether the primary "loss" series has any data. When it doesn't,
   // we still keep overlay series visible but treat them as named
@@ -99,6 +105,29 @@ export function LossChart({
           {xMaxStep}
         </text>
 
+        {/* V7-L38: overflow markers — red vertical bar at each step
+            index. Drawn before the curves so the line + points sit
+            on top. Only meaningful when the primary loss series has
+            enough points to map step→x. */}
+        {overflowSteps.length > 0 && losses.length > 0 && (() => {
+          const innerW = width - 2 * pad;
+          return overflowSteps.map((step, i) => {
+            if (step < 0 || step >= losses.length) return null;
+            const x = pad + (losses.length === 1
+              ? innerW / 2
+              : (step / (losses.length - 1)) * innerW);
+            return (
+              <line key={i}
+                    data-testid={`${testidPrefix}-overflow-${step}`}
+                    x1={x} y1={pad} x2={x} y2={height - pad}
+                    stroke="#dc2626" strokeWidth={2}
+                    strokeDasharray="4 2"
+                    opacity={0.7}>
+                <title>overflow at step {step}</title>
+              </line>
+            );
+          });
+        })()}
         {allSeries.map((s, sIdx) => {
           const d = pathFor(s.values, width, height, yMin, yMax, pad);
           // Only the canonical primary "loss" series at index 0 gets

@@ -206,10 +206,20 @@ def stage_verify_build_spec(ctx: StageContext) -> StageResult:
     _tok = _stage_abort_token(ctx, "verify_build_spec")
     if _tok and _tok in _ABORT_TOKENS:
         clear_abort(_tok)
+        # V7-H06b/H10: mirror the train-side contract so the UI sees
+        # extras.aborted=True on the cancelled stage; mark the run as
+        # aborted in the registry so pipeline.status reflects the
+        # cancel even when train never ran.
+        try:
+            from cppmega_v4.runtime import run_registry as _rr
+            _rr.mark_aborted(_tok)
+        except Exception:
+            pass
         return StageResult(
             name="verify_build_spec", status="cancelled",
             elapsed_ms=(time.perf_counter() - t0) * 1000.0,
             error={"type": "Aborted", "abort_token": _tok},
+            extras={"aborted": True, "abort_token": _tok},
         )
     try:
         if ctx.build_spec is None:
@@ -362,10 +372,16 @@ def stage_dry_forward(ctx: StageContext) -> StageResult:
     _tok = _stage_abort_token(ctx, "dry_forward")
     if _tok and _tok in _ABORT_TOKENS:
         clear_abort(_tok)
+        try:
+            from cppmega_v4.runtime import run_registry as _rr
+            _rr.mark_aborted(_tok)
+        except Exception:
+            pass
         return StageResult(
             name="dry_forward", status="cancelled",
             elapsed_ms=(time.perf_counter() - t0) * 1000.0,
             error={"type": "Aborted", "abort_token": _tok},
+            extras={"aborted": True, "abort_token": _tok},
         )
     try:
         opts = ctx.opts("dry_forward")
@@ -1573,9 +1589,51 @@ def stage_train(ctx: StageContext) -> StageResult:
             _run_registry.mark_step(_registry_key, step, float(losses[-1]))
             # V7-H05: publish per-step event to the train_event_bus so
             # WS subscribers (UI) see loss/lr update live, not only on
-            # pipeline completion.
+            # pipeline completion. V7-L37..44 expansion: payload now also
+            # carries per-brick grad-norms, current memory peak, and
+            # per-expert load (when MoE is present) so the UI can render
+            # live timelines instead of waiting for completion.
             try:
                 from cppmega_v4.runtime import train_event_bus
+                # Per-brick grad-norms (cheap: norm over already-flat
+                # grad tree — see _safe_per_brick_grads).
+                try:
+                    step_grad_norms = _safe_per_brick_grads(
+                        all_modules, grads)
+                except Exception:
+                    step_grad_norms = {}
+                # Per-step memory peak (best-effort; mx.metal may be
+                # unavailable on non-Apple hosts).
+                step_mem_mb: float | None = None
+                try:
+                    if hasattr(mx, "metal"):
+                        step_mem_mb = round(
+                            int(mx.metal.get_peak_memory()) / (1024 * 1024),
+                            3)
+                except Exception:
+                    step_mem_mb = None
+                # Per-step expert load when an MoE brick is in the model.
+                step_expert_load: list[float] | None = None
+                try:
+                    if 'moe_module' in dir() and moe_module is not None:
+                        last_load = getattr(
+                            getattr(moe_module, 'last_router_output',
+                                    None), 'load', None)
+                        if last_load is None:
+                            # Fallback: recompute the router load over the
+                            # cached output if the module exposes it.
+                            ro = getattr(moe_module, 'last_router_output',
+                                          None)
+                            if ro is not None:
+                                last_load = ro.load
+                        if last_load is not None:
+                            step_expert_load = [
+                                round(float(v), 6)
+                                for v in last_load.tolist()
+                            ]
+                except Exception:
+                    step_expert_load = None
+
                 train_event_bus.publish(
                     opts.get("run_id") or opts.get("abort_token"),
                     {"step": int(step),
@@ -1584,7 +1642,11 @@ def stage_train(ctx: StageContext) -> StageResult:
                              if lr_trajectory else None,
                      "overflow":
                        bool(_scaler_overflow_this_step
-                            if loss_scaler is not None else False)},
+                            if loss_scaler is not None else False),
+                     "grad_norms": step_grad_norms,
+                     "mem_mb": step_mem_mb,
+                     "expert_load": step_expert_load,
+                     "ts": float(time.time())},
                 )
             except Exception:
                 pass

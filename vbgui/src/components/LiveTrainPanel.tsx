@@ -1,0 +1,150 @@
+// V7-L37..L41: live training panel.
+//
+//   L37: LossChart subscribed to liveTrainEvents — sparkline draws as
+//        steps arrive, not only on pipeline.run resolve.
+//   L38: overflow_per_step marker on the sparkline timeline.
+//   L39: dead-man-switch — when no event arrives for > stallSeconds,
+//        the strip shows ⚠ "stalled X.Xs".
+//   L40: finish:'ok' frame produces a toast.
+//   L41: WS reconnect — see useLiveTrainEvents below; the panel itself
+//        just consumes the array passed by App.tsx.
+
+import { useEffect, useState } from "react";
+import { LossChart } from "./LossChart";
+
+export interface LiveTrainEvent {
+  step: number;
+  loss: number;
+  lr?: number | null;
+  overflow?: boolean;
+  mem_mb?: number | null;
+  ts?: number | null;
+  grad_norms?: Record<string, number>;
+  expert_load?: number[] | null;
+}
+
+export interface LiveTrainPanelProps {
+  events: LiveTrainEvent[];
+  trainInFlight: boolean;
+  finishToast?: boolean;
+  reconnectAttempts?: number;
+  stallSeconds?: number;       // default 8
+  onDismissToast?: () => void;
+}
+
+export function LiveTrainPanel({
+  events, trainInFlight, finishToast = false,
+  reconnectAttempts = 0, stallSeconds = 8, onDismissToast,
+}: LiveTrainPanelProps): JSX.Element | null {
+  // V7-L39: poll wall-clock so the dead-man-switch can fire even when
+  // events stop arriving. Tick every second while a run is active.
+  const [now, setNow] = useState<number>(() => Date.now() / 1000);
+  useEffect(() => {
+    if (!trainInFlight) return;
+    const t = setInterval(() => setNow(Date.now() / 1000), 1000);
+    return () => clearInterval(t);
+  }, [trainInFlight]);
+
+  if (!trainInFlight && events.length === 0 && !finishToast) return null;
+
+  const last = events[events.length - 1];
+  const lastTs = last?.ts ?? null;
+  const stalledFor = (lastTs && trainInFlight)
+    ? Math.max(0, now - lastTs)
+    : 0;
+  const isStalled = stalledFor > stallSeconds;
+  const overflowSteps = events
+    .filter((e) => e.overflow)
+    .map((e) => e.step);
+  const losses = events.map((e) => e.loss);
+
+  return (
+    <div data-testid="live-train-panel"
+         style={{ position: "fixed", bottom: 36, right: 12,
+                  background: "white", border: "1px solid #e5e7eb",
+                  borderRadius: 6, padding: 8, fontSize: 11,
+                  fontFamily: "monospace",
+                  boxShadow: "0 2px 6px rgba(0,0,0,0.10)",
+                  zIndex: 30, minWidth: 360 }}>
+      <div data-testid="live-train-panel-header"
+           style={{ display: "flex", alignItems: "center",
+                    justifyContent: "space-between",
+                    marginBottom: 4 }}>
+        <div style={{ fontWeight: 600 }}>
+          live train · step {events.length}
+        </div>
+        <div style={{ display: "flex", gap: 4 }}>
+          {reconnectAttempts > 0 && (
+            <span data-testid="live-train-panel-reconnect"
+                  style={{ color: "#d97706" }}>
+              ↻ reconnect #{reconnectAttempts}
+            </span>
+          )}
+          {isStalled && (
+            <span data-testid="live-train-panel-stalled"
+                  style={{ color: "#dc2626" }}>
+              ⚠ stalled {stalledFor.toFixed(1)}s
+            </span>
+          )}
+        </div>
+      </div>
+
+      {events.length > 0 ? (
+        <div data-testid="live-train-panel-chart-wrap"
+             style={{ marginBottom: 4 }}>
+          <LossChart losses={losses}
+                      overflowSteps={overflowSteps}
+                      width={340} height={120}
+                      testidPrefix="live-train-chart" />
+        </div>
+      ) : (
+        <div data-testid="live-train-panel-empty"
+             style={{ color: "#9ca3af", padding: 8 }}>
+          waiting for first event…
+        </div>
+      )}
+
+      {last && (
+        <div data-testid="live-train-panel-pill"
+             style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <span data-testid="live-train-panel-last-loss">
+            loss {last.loss.toFixed(4)}
+          </span>
+          <span data-testid="live-train-panel-last-lr">
+            lr {last.lr != null ? last.lr.toExponential(2) : "?"}
+          </span>
+          {last.mem_mb != null && (
+            <span data-testid="live-train-panel-last-mem">
+              mem {last.mem_mb.toFixed(1)}MB
+            </span>
+          )}
+          {last.overflow && (
+            <span data-testid="live-train-panel-last-overflow"
+                  style={{ color: "#dc2626" }}>
+              ⚠ scaler overflow
+            </span>
+          )}
+        </div>
+      )}
+
+      {finishToast && (
+        <div data-testid="live-train-panel-toast"
+             style={{ marginTop: 6, padding: 6,
+                      background: "#dcfce7", color: "#166534",
+                      borderRadius: 4, display: "flex",
+                      justifyContent: "space-between",
+                      alignItems: "center" }}>
+          <span>✓ train done</span>
+          {onDismissToast && (
+            <button data-testid="live-train-panel-toast-dismiss"
+                    onClick={onDismissToast}
+                    style={{ background: "transparent", border: "none",
+                             color: "#166534", cursor: "pointer" }}>
+              ×
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}

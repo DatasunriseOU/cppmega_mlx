@@ -24,6 +24,8 @@ import { RunResultModal, type RunReport } from "@/components/RunResultModal";
 import { TokenizerPlayground } from "@/components/TokenizerPlayground";
 import { DataInspector } from "@/components/DataInspector";
 import { BrickContextPanel } from "@/components/BrickContextPanel";
+import { LiveTrainPanel } from "@/components/LiveTrainPanel";
+import { useLiveTrainStream } from "@/hooks/useLiveTrainStream";
 
 import { useRpc } from "@/hooks/useRpc";
 import { useVerifyAfter } from "@/hooks/useVerifyAfter";
@@ -1313,34 +1315,11 @@ export function App(): JSX.Element {
           )}
         </div>
         <BottomStrip state={spec} fusedRegionCount={0} />
-        {trainInFlight && liveTrainEvents.length > 0 && (
-          <div data-testid="live-train-strip"
-               style={{ position: "fixed", bottom: 36, right: 12,
-                        background: "white", border: "1px solid #e5e7eb",
-                        borderRadius: 4, padding: 8, fontSize: 10,
-                        fontFamily: "monospace",
-                        boxShadow: "0 2px 6px rgba(0,0,0,0.08)",
-                        zIndex: 30, minWidth: 180 }}>
-            <div data-testid="live-train-strip-header"
-                 style={{ fontWeight: 600, marginBottom: 4 }}>
-              live train · step {liveTrainEvents.length}
-            </div>
-            <div data-testid="live-train-strip-last-loss">
-              loss: {liveTrainEvents[liveTrainEvents.length - 1].loss
-                .toFixed(4)}
-            </div>
-            <div data-testid="live-train-strip-last-lr">
-              lr: {liveTrainEvents[liveTrainEvents.length - 1].lr
-                ?.toFixed(6) ?? "?"}
-            </div>
-            {liveTrainEvents[liveTrainEvents.length - 1].overflow && (
-              <div data-testid="live-train-strip-overflow"
-                   style={{ color: "#dc2626" }}>
-                ⚠ scaler overflow
-              </div>
-            )}
-          </div>
-        )}
+        <LiveTrainPanel events={liveTrain.events}
+                         trainInFlight={!!trainInFlight}
+                         finishToast={liveTrain.finishToast}
+                         reconnectAttempts={liveTrain.reconnectAttempts}
+                         onDismissToast={liveTrain.dismissToast} />
         <RunResultModal report={runReport} error={runError}
                         onClose={() => { setRunReport(null);
                                          setRunError(null); }} />

@@ -298,10 +298,23 @@ def verify(params: VerifyParams, *, cache: LRUCache | None = None) -> VerifyResu
     if hit is not None:
         return hit
 
+    # V7-L45: stream progress so /ws/verify/{spec_hash} subscribers see
+    # phase transitions on long verifies.
+    from cppmega_v4.runtime import verify_event_bus as _vb
+    _vh = _vb.spec_hash(params)
+
+    def _emit(phase: str, extra: dict | None = None) -> None:
+        try:
+            _vb.publish(_vh, {"phase": phase, **(extra or {})})
+        except Exception:
+            pass
+
+    _emit("start")
     t0 = time.perf_counter()
     specs = _graph_to_specs(params.graph)
     hidden = params.dim_env.get("H", 64)
     graph = from_block_specs(specs, hidden_size=hidden, instantiate=False)
+    _emit("graph_built", {"node_count": len(specs)})
 
     available = frozenset(params.available_side_channels)
     resolved = resolve_shapes(
@@ -310,12 +323,14 @@ def verify(params: VerifyParams, *, cache: LRUCache | None = None) -> VerifyResu
     )
     fusion_plan = tuple(plan_fusion_regions(graph))
 
+    _emit("resolve_shapes")
     result_one = verify_and_estimate(
         graph,
         dim_env=params.dim_env,
         training=params.training,
         available_side_channels=available,
     )
+    _emit("memory_estimated")
 
     mem = result_one.memory
     per_brick: dict[str, PerBrickMemory] = {}
@@ -462,6 +477,12 @@ def verify(params: VerifyParams, *, cache: LRUCache | None = None) -> VerifyResu
         elapsed_ms=elapsed_ms,
     )
     _cache_store(cache, key, out)
+    _emit("done", {"elapsed_ms": round(
+        (time.perf_counter() - t0) * 1000.0, 4)})
+    try:
+        _vb.publish(_vh, None)   # sentinel marks completion to subs
+    except Exception:
+        pass
     return out
 
 
