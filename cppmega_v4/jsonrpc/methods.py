@@ -629,9 +629,13 @@ def build_preset_specs(
         hidden_size=params.hidden_size,
         num_layers=params.num_layers,
     )
+    from cppmega_v4.architectures.preset_training_defaults import (
+        get_defaults, to_wire,
+    )
     out = BuildPresetSpecsResult(
         specs=[dict(s) for s in specs],
         preset_name=params.preset_name,
+        defaults=to_wire(get_defaults(params.preset_name)),
     )
     _cache_store(cache, key, out)
     return out

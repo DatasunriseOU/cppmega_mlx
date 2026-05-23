@@ -39,6 +39,7 @@ import { usePresets } from "@/hooks/usePresets";
 
 import {
   INITIAL_SPEC, specReducer, type SpecState, type TopologyFactory,
+  type OptimState, type ScheduleSpecState,
 } from "@/state/spec";
 import { migrate } from "@/state/migrations";
 import { adapterFor } from "@/lib/bricks";
@@ -519,7 +520,15 @@ export function App(): JSX.Element {
       // smallest topologically complete subgraph (some are 6+ bricks long
       // for sliding/global patterns), so asking for num_layers=MINI_DEPTH
       // would truncate to zero for those. Stick with the canonical unit.
-      const r = await rpc.call<{ specs: BrickSpec[]; preset_name: string }>(
+      const r = await rpc.call<{
+        specs: BrickSpec[]; preset_name: string;
+        defaults?: {
+          lr: number; batch_size: number; schedule: string;
+          warmup_steps: number; betas: [number, number] | null;
+          gradient_clip: number; mixed_precision: boolean;
+          optimizer: string; source_paper_url: string;
+        };
+      }>(
         "build_preset_specs",
         { preset_name: name, hidden_size: dimEnv.H ?? MINI_HIDDEN },
       );
@@ -535,6 +544,48 @@ export function App(): JSX.Element {
           ...spec.loss,
           head_outputs: [ns[ns.length - 1].id],
         }});
+      }
+      // V8-R01: auto-fill the Optim/Schedule tabs from paper-anchored
+      // defaults shipped in the same RPC response. The tabs become a
+      // ready-to-train preset the instant a brick lands on the canvas.
+      if (r.defaults) {
+        const d = r.defaults;
+        const validOptimKinds: ReadonlyArray<string> = [
+          "adamw", "muon", "muon_adamw_hybrid",
+          "lion", "lion8bit", "adam8bit", "sgd",
+        ];
+        const validScheduleKinds: ReadonlyArray<string> = [
+          "constant", "linear_warmup", "cosine",
+          "wsd", "inv_sqrt", "polynomial",
+        ];
+        const optimKind = (validOptimKinds.includes(d.optimizer)
+          ? d.optimizer : "adamw") as OptimState["kind"];
+        const scheduleKind = (validScheduleKinds.includes(d.schedule)
+          ? d.schedule : "cosine") as ScheduleSpecState["kind"];
+        const firstGroup = spec.optim.groups[0] ?? {
+          matcher: "regex:.*", lr: d.lr, weight_decay: 0.0,
+        };
+        const nextGroups = [
+          { ...firstGroup, lr: d.lr,
+            betas: d.betas ?? firstGroup.betas,
+            schedule: {
+              ...(firstGroup.schedule ?? {}),
+              kind: scheduleKind,
+              warmup_steps: d.warmup_steps,
+            },
+          },
+          ...spec.optim.groups.slice(1),
+        ];
+        dispatch({
+          type: "optim.set",
+          optim: {
+            ...spec.optim,
+            kind: optimKind,
+            grad_clip_norm: d.gradient_clip,
+            mixed_precision: d.mixed_precision,
+            groups: nextGroups,
+          },
+        });
       }
     } catch (e) {
       setRunError(e);

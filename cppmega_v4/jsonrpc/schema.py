@@ -603,12 +603,21 @@ class BuildPresetSpecsParams(BaseModel):
 
 
 class BuildPresetSpecsResult(BaseModel):
-    """Output — wire-form specs (leaf or parallel-block)."""
+    """Output — wire-form specs + paper-anchored training defaults.
+
+    ``defaults`` is the V8-R01 paper-defaults block — lr / batch_size /
+    schedule / warmup / betas / clip / mixed_precision / optimizer /
+    source_paper_url — used by the UI to auto-fill the Loss/Optim/
+    Schedule tabs the moment a preset is dragged onto the canvas. The
+    contract is total: every preset gets a non-null block via family
+    fallback (see ``preset_training_defaults.get_defaults``).
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     specs: list[dict[str, Any]]
     preset_name: str
+    defaults: dict[str, Any]
 
 
 # ---------------------------------------------------------------------------
