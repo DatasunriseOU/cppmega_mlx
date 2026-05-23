@@ -377,6 +377,7 @@ export function App(): JSX.Element {
       checkpoint_load_path?: string;
       inference_probe_text?: string;
       master_dtype?: "fp32" | "bf16" | "fp16" | "auto";
+      fim_enabled?: boolean;
     },
   ) => {
     // V7-I03: synchronous lock check at the very top — before any
@@ -432,6 +433,11 @@ export function App(): JSX.Element {
       // spec.optim.mixed_precision (H02) — don't override the wire.
       if (opts?.master_dtype && opts.master_dtype !== "auto") {
         trainOpts.master_dtype = opts.master_dtype;
+      }
+      // V7-G05: forward FIM toggle. stage_train opts.fim_enabled gates
+      // the middle-third masking + fim_ratio extras.
+      if (opts?.fim_enabled) {
+        trainOpts.fim_enabled = true;
       }
       // H20: when the spec carries sharding axes, derive fake_ranks
       // from the product of their degrees so a Train run simulates a

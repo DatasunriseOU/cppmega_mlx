@@ -19,6 +19,7 @@ export interface TopBarProps {
       checkpoint_load_path?: string;
       inference_probe_text?: string;
       master_dtype?: "fp32" | "bf16" | "fp16" | "auto";
+      fim_enabled?: boolean;
     }) => void;
   /** H02: toggle callbacks. */
   onMixedPrecisionChange?: (enabled: boolean) => void;
@@ -58,6 +59,10 @@ export function TopBar(p: TopBarProps): JSX.Element {
   // fp32/bf16/fp16 options override that for H23.
   const [masterDtype, setMasterDtype] =
     useState<"fp32" | "bf16" | "fp16" | "auto">("auto");
+  // V7-G05: FIM (Fill-In-Middle) data path toggle. When on, stage_train
+  // surfaces extras.train.fim_active + fim_ratio so the UI honest-closure
+  // shows the FIM math actually fired.
+  const [fimEnabled, setFimEnabled] = useState<boolean>(false);
   return (
     <header data-testid="top-bar"
             style={{ height: 56, display: "flex", alignItems: "center",
@@ -248,6 +253,14 @@ export function TopBar(p: TopBarProps): JSX.Element {
               </select>
             </label>
             <label style={{ padding: "6px 12px", display: "flex",
+                            alignItems: "center", gap: 6, fontSize: 11,
+                            color: "#374151" }}>
+              <input data-testid="train-fim-enabled" type="checkbox"
+                     checked={fimEnabled}
+                     onChange={(e) => setFimEnabled(e.target.checked)} />
+              FIM (Fill-In-Middle) data path
+            </label>
+            <label style={{ padding: "6px 12px", display: "flex",
                             flexDirection: "column", gap: 3, fontSize: 11,
                             color: "#374151" }}>
               <span style={{ color: "#6b7280" }}>probe text:</span>
@@ -270,7 +283,8 @@ export function TopBar(p: TopBarProps): JSX.Element {
                                            ckptLoadPath || undefined,
                                          inference_probe_text:
                                            probeText || undefined,
-                                         master_dtype: masterDtype }); }}
+                                         master_dtype: masterDtype,
+                                         fim_enabled: fimEnabled }); }}
                     // H22: disable while a Train is already running so
                     // double-clicks don't spawn a parallel pipeline.
                     disabled={!!p.trainDisabled || !!p.trainInFlight}
