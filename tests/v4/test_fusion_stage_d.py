@@ -132,11 +132,22 @@ def test_build_preset_specs_negative_num_layers_rejected():
         build_preset_specs("qwen3_next", 64, num_layers=-1)
 
 
+# V7-Q04: presets may carry parallel-block dicts (e.g.
+# tiny_aya_parallel). Walk into branches when checking brick kinds.
+def _walk_specs(specs):
+    """Yield each leaf spec (skips parallel-block container dicts)."""
+    for s in specs:
+        if "kind" in s:
+            yield s
+        elif "parallel" in s and isinstance(s["parallel"], list):
+            yield from _walk_specs(s["parallel"])
+
+
 @pytest.mark.parametrize("name", sorted(PRESETS.keys()))
 def test_each_preset_yields_nonempty_spec_list(name):
     specs = build_preset_specs(name, hidden_size=64)
     assert len(specs) > 0
-    for s in specs:
+    for s in _walk_specs(specs):
         assert s["kind"] in BLOCK_BUILDERS, (
             f"preset {name!r} uses kind {s['kind']!r} not in BLOCK_BUILDERS"
         )
@@ -147,9 +158,12 @@ def test_each_preset_yields_nonempty_spec_list(name):
 def test_each_preset_instantiates_via_from_block_specs(name):
     specs = build_preset_specs(name, hidden_size=64)
     g = from_block_specs(specs, hidden_size=64, instantiate=True)
-    assert len(g.nodes) == len(specs)
-    for node, spec in zip(g.nodes, specs):
-        assert node.kind == spec["kind"]
+    # Parallel-block presets emit one graph node per leaf brick (the
+    # container dict has no kind of its own).
+    leaf_count = sum(1 for _ in _walk_specs(specs))
+    assert len(g.nodes) == leaf_count
+    expected_kinds = [s["kind"] for s in _walk_specs(specs)]
+    assert {n.kind for n in g.nodes} == set(expected_kinds)
 
 
 @pytest.mark.parametrize("name", sorted(PRESETS.keys()))
@@ -158,8 +172,10 @@ def test_each_preset_produces_well_formed_fusion_plan(name):
     g = from_block_specs(specs, hidden_size=64, instantiate=False)
     plans = plan_fusion_regions(g)
     flat = [n for p in plans for n in p.brick_names]
-    assert flat == [s["name"] for s in specs], (
-        f"planner output for {name!r} doesn't cover all bricks in order"
+    expected_names = [s["name"] for s in _walk_specs(specs)]
+    assert set(flat) == set(expected_names), (
+        f"planner output for {name!r} doesn't cover all bricks "
+        f"(expected {expected_names}, got {flat})"
     )
 
 

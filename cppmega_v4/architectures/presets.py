@@ -410,6 +410,85 @@ def tiny_aya_parallel_specs(hidden_size: int) -> list[dict[str, Any]]:
     ]
 
 
+# ---------------------------------------------------------------------------
+# V7-Q04: gallery gap closures (raschka entries #1, #50, #57, #58).
+# Each preset uses an already-existing brick kind from BLOCK_BUILDERS;
+# the missing piece was the factory wiring into PRESETS.
+# ---------------------------------------------------------------------------
+
+
+def _gpt2_xl(hidden_size: int) -> list[dict[str, Any]]:
+    """Gallery #1 GPT-2 XL: abs_pos_embed + attention + mlp.
+
+    The abs_pos_embed brick adds a learned absolute positional residual
+    before the attention stack; remainder is the standard transformer
+    block. Matches Karpathy/GPT-2 architecture pre-RoPE.
+    """
+    return [
+        {"kind": "abs_pos_embed", "name": "gpt2_xl_pos",
+         "params": {"max_position_embeddings": 1024}},
+        {"kind": "attention", "name": "gpt2_xl_attn",
+         "params": _attn_params(hidden_size)},
+        {"kind": "mlp", "name": "gpt2_xl_mlp"},
+    ]
+
+
+def _xlstm_7b(hidden_size: int) -> list[dict[str, Any]]:
+    """Gallery #50 xLSTM 7B: matrix-LSTM stack, no self-attention.
+
+    Hybrid of mlstm blocks (matrix-memory recurrence) + interspersed
+    mlp blocks for FFN. Demonstrates non-attention sequence path.
+    """
+    return [
+        {"kind": "mlstm", "name": "xlstm_7b_mlstm",
+         "params": {"head_dim": 64}},
+        {"kind": "mlp", "name": "xlstm_7b_mlp"},
+    ]
+
+
+def _gemma_4_e2b(hidden_size: int) -> list[dict[str, Any]]:
+    """Gallery #57 Gemma 4 E2B: per-layer scaled embedding + GQA + MLP.
+
+    Gemma 4 E2B/E4B add a per-layer embedding residual that scales
+    inversely with depth. The layer_index/num_layers in params control
+    which layer's scaling factor applies.
+    """
+    return [
+        {"kind": "per_layer_embed", "name": "gemma4_e2b_ple",
+         "params": {"layer_index": 0, "num_layers": 26}},
+        {"kind": "gated_attention", "name": "gemma4_e2b_gqa",
+         "params": {"num_attention_heads": max(8, hidden_size // 64),
+                    "num_key_value_heads": max(2, hidden_size // 64 // 8),
+                    "head_dim": 64}},
+        {"kind": "mlp", "name": "gemma4_e2b_mlp"},
+    ]
+
+
+def _gemma_4_e4b(hidden_size: int) -> list[dict[str, Any]]:
+    """Gallery #58 Gemma 4 E4B: deeper variant of E2B (44 layers).
+
+    Same per_layer_embed + GQA + MLP recipe, more layers.
+    """
+    return [
+        {"kind": "per_layer_embed", "name": "gemma4_e4b_ple",
+         "params": {"layer_index": 0, "num_layers": 44}},
+        {"kind": "gated_attention", "name": "gemma4_e4b_gqa",
+         "params": {"num_attention_heads": max(8, hidden_size // 64),
+                    "num_key_value_heads": max(2, hidden_size // 64 // 8),
+                    "head_dim": 64}},
+        {"kind": "mlp", "name": "gemma4_e4b_mlp"},
+    ]
+
+
+# V7-Q04 — gallery gap closures wired after factory definitions to
+# avoid forward references in the PRESETS dict literal.
+PRESETS["gpt2_xl"]           = _gpt2_xl              # gallery #1
+PRESETS["tiny_aya_parallel"] = tiny_aya_parallel_specs  # gallery #44
+PRESETS["xlstm_7b"]          = _xlstm_7b             # gallery #50
+PRESETS["gemma_4_e2b"]       = _gemma_4_e2b          # gallery #57
+PRESETS["gemma_4_e4b"]       = _gemma_4_e4b          # gallery #58
+
+
 def available_presets() -> list[str]:
     return sorted(PRESETS.keys())
 

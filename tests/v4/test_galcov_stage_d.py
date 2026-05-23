@@ -70,8 +70,7 @@ class GalleryEntry:
 
 GALLERY: tuple[GalleryEntry, ...] = (
     # --- abs-pos / legacy ---
-    GalleryEntry(1, "GPT-2 XL", None,
-                 "abs_pos_embed preset not assembled (brick exists, GalCov-B)"),
+    GalleryEntry(1, "GPT-2 XL", "gpt2_xl"),
 
     # --- LLaMA family (attention + mlp linear chain) ---
     GalleryEntry(2, "Llama 3.1 70B", "llama3_8b"),
@@ -129,10 +128,8 @@ GALLERY: tuple[GalleryEntry, ...] = (
     GalleryEntry(42, "Phi-4", "phi4"),
     GalleryEntry(43, "MiniMax M2.5", "minimax_m2_5"),
 
-    # --- True gap: Tiny Aya parallel-block topology ---
-    GalleryEntry(44, "Tiny Aya", None,
-                 "parallel-block preset not in PRESETS (specs func "
-                 "tiny_aya_parallel_specs exists, GalCov-C)"),
+    # --- V7-Q04: Tiny Aya parallel-block topology wired ---
+    GalleryEntry(44, "Tiny Aya", "tiny_aya_parallel"),
 
     GalleryEntry(45, "MiniMax M2.7", "minimax_m2_7"),
     GalleryEntry(46, "DeepSeek V4-Flash", "deepseek_v4_flash"),
@@ -140,9 +137,8 @@ GALLERY: tuple[GalleryEntry, ...] = (
     GalleryEntry(48, "DeepSeek V4-Pro", "deepseek_v4_flash"),
     GalleryEntry(49, "Phi-4 mini", "phi4"),
 
-    # --- True gap: xLSTM 7B (matrix-memory LSTM, no self-attention) ---
-    GalleryEntry(50, "xLSTM 7B", None,
-                 "mlstm-only preset not assembled (brick exists, GalCov-B)"),
+    # --- V7-Q04: xLSTM 7B (matrix-memory LSTM, no self-attention) ---
+    GalleryEntry(50, "xLSTM 7B", "xlstm_7b"),
 
     GalleryEntry(51, "GLM 5.1", "glm_51"),
     GalleryEntry(52, "Sarvam 30B", "sarvam_30b"),
@@ -151,11 +147,9 @@ GALLERY: tuple[GalleryEntry, ...] = (
     GalleryEntry(55, "Ling 2.6", "ling26"),
     GalleryEntry(56, "Nanbeige 4.1", "nanbeige_4_1"),
 
-    # --- True gap: Gemma 4 E2B/E4B per-layer embed ---
-    GalleryEntry(57, "Gemma 4 E2B", None,
-                 "per_layer_embed preset not assembled (brick exists, GalCov-B)"),
-    GalleryEntry(58, "Gemma 4 E4B", None,
-                 "per_layer_embed preset not assembled (brick exists, GalCov-B)"),
+    # --- V7-Q04: Gemma 4 E2B/E4B per-layer embed wired ---
+    GalleryEntry(57, "Gemma 4 E2B", "gemma_4_e2b"),
+    GalleryEntry(58, "Gemma 4 E4B", "gemma_4_e4b"),
 
     GalleryEntry(59, "Gemma 4 26B-A4B", "gemma4"),
     GalleryEntry(60, "Gemma 4 31B", "gemma4_31b"),
@@ -201,12 +195,13 @@ def test_gallery_fixture_xfail_entries_carry_reason():
             )
 
 
-def test_gallery_fixture_known_gaps_are_exactly_five():
-    """Lock the gap count so regressions show up immediately."""
+def test_gallery_fixture_known_gaps_are_zero():
+    """V7-Q04 closure: all 5 prior gaps (GPT-2 XL, Tiny Aya, xLSTM,
+    Gemma 4 E2B/E4B) now have preset factories wired. Lock at zero
+    so a regression that drops a wired preset surfaces immediately."""
     gaps = tuple(e for e in GALLERY if e.preset is None)
-    assert len(gaps) == 5, (
-        f"Expected 5 known gaps (GPT-2 XL, Tiny Aya, xLSTM, "
-        f"Gemma E2B/E4B); got {len(gaps)}: "
+    assert len(gaps) == 0, (
+        f"Expected 0 gaps post-Q04; got {len(gaps)}: "
         f"{[(e.gid, e.name) for e in gaps]}"
     )
 

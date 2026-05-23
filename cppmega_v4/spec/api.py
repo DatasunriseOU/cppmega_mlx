@@ -111,7 +111,19 @@ def suggest_dim_env(preset_name: str | None = None) -> dict[str, int]:
             f"available: {sorted(set(_PRESET_DIM_ENVS) | set(PRESETS))}"
         )
     specs = build_preset_specs(preset_name, hidden_size=_PROD_BASE["H"])
-    kinds = {s["kind"] for s in specs}
+    # V7-Q04: tolerate parallel-block dicts ({"parallel": [...]} without
+    # a top-level "kind"). Walk into the branch and collect kinds from
+    # the children. Preserves the existing flat-spec contract for
+    # linear presets.
+    def _collect_kinds(items: list) -> set[str]:
+        out: set[str] = set()
+        for it in items:
+            if "kind" in it:
+                out.add(it["kind"])
+            elif "parallel" in it and isinstance(it["parallel"], list):
+                out |= _collect_kinds(it["parallel"])
+        return out
+    kinds = _collect_kinds(specs)
     env = dict(_PROD_BASE)
     # Pull in extras based on which brick categories appear.
     if kinds & {"mla", "mla_absorb", "mistral4_mla", "bailing_mla"}:

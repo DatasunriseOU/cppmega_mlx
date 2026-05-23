@@ -125,10 +125,21 @@ class _PresetRunner(nn.Module):
 
     def __init__(self, specs: list[dict], hidden_size: int):
         super().__init__()
-        self.specs = specs
-        # Instantiate each brick once; attach as attributes for parameter
-        # registration with nn.Module.
-        for i, s in enumerate(specs):
+        # V7-Q04: flatten parallel-block dicts to a leaf list so the
+        # trivial-forward runner can iterate every brick. The container
+        # `{"parallel": [...]}` has no "kind"; only the children do.
+        def _flatten(items: list[dict]) -> list[dict]:
+            out: list[dict] = []
+            for s in items:
+                if "kind" in s:
+                    out.append(s)
+                elif "parallel" in s and isinstance(s["parallel"], list):
+                    out.extend(_flatten(s["parallel"]))
+            return out
+        self.specs = _flatten(specs)
+        # Instantiate each leaf brick once; attach as attributes for
+        # parameter registration with nn.Module.
+        for i, s in enumerate(self.specs):
             mod = BLOCK_BUILDERS[s["kind"]](hidden_size, dict(s.get("params") or {}))
             setattr(self, f"brick_{i}", mod)
         self.hidden_size = hidden_size
