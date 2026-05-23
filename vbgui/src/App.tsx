@@ -650,13 +650,16 @@ export function App(): JSX.Element {
                     data-testid="symbolic-dim-warn-badge"
                     role="alert"
                     style={{
-                      position: "absolute", top: 8, right: 8, zIndex: 5,
+                      position: "absolute", top: 44, right: 8, zIndex: 5,
                       background: "#fef3c7", color: "#92400e",
                       borderLeft: "4px solid #d97706",
                       borderRadius: 4, padding: "6px 10px",
                       fontSize: 12, fontFamily: "system-ui, sans-serif",
                       boxShadow: "0 1px 2px rgba(0,0,0,0.08)",
                       maxWidth: 320,
+                      // Badge is informational; never block clicks
+                      // on the DimEnvEditor Apply button beneath.
+                      pointerEvents: "none",
                     }}
                   >
                     <strong data-testid="symbolic-dim-warn-title">
