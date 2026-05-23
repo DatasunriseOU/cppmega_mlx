@@ -72,6 +72,89 @@ export const HELP_TOPICS: Record<string, HelpTopic> = {
       "Attention memory scales O(B*S^2) for vanilla SDPA. The " +
       "GUI default S=64 keeps mini runs interactive.",
   },
+  // ----- train options (K-block) -----
+  train_val_every: {
+    title: "val_every — validation cadence (V7-A04)",
+    what:
+      "Run a held-out validation pass every N training steps.",
+    why:
+      "Catches train/val divergence early. Default off (no validation " +
+      "during train) keeps mini smoke runs fast; production runs " +
+      "typically val every 50-200 steps.",
+  },
+  train_grad_clip: {
+    title: "grad_clip_max_norm — gradient clipping cap",
+    what:
+      "Global-norm clip on the gradient vector before the optimizer " +
+      "step. If ||grad|| > N, scale grad by N / ||grad||.",
+    why:
+      "Prevents the rare exploding-gradient blow-up from poisoning " +
+      "the optimizer state. 1.0 is a near-universal default; some " +
+      "MoE/large-LR setups use 0.5 or 2.0.",
+  },
+  train_loss_scaler: {
+    title: "loss_scaler — fp16 dynamic range adapter",
+    what:
+      "When training in fp16, the loss is multiplied by init_scale " +
+      "so its gradients fit fp16's narrow range. Optimizer unscales " +
+      "before the parameter update. growth_interval is how many " +
+      "consecutive non-overflow steps must pass before the scale " +
+      "doubles.",
+    why:
+      "Without scaling, fp16 grads quickly underflow to zero and " +
+      "training stalls. Dynamic scaling handles transient overflow " +
+      "by halving + skipping the step.",
+    example:
+      "init_scale=65536, growth_interval=2000 is a common pair " +
+      "(matches the NVIDIA APEX default).",
+  },
+  train_fake_ranks: {
+    title: "fake_ranks — single-process multi-rank simulation",
+    what:
+      "Backend simulates an N-rank distributed train by running N " +
+      "forward/backward passes in sequence and mean-reducing grads. " +
+      "Surfaces gradient_reduce_ms in extras.",
+    why:
+      "Lets the architect validate that a multi-rank shard plan " +
+      "doesn't blow numerical convergence — without spinning up " +
+      "real GPUs.",
+  },
+  warm_start_history: {
+    title: "warm_start_history — which prior run to continue from",
+    what:
+      "Picks the run_id that warm-start should load opt state + " +
+      "weights from. '(latest)' uses lastTrainRunId — the previous " +
+      "default.",
+    why:
+      "When the architect has run several trials and wants to branch " +
+      "from a specific one (e.g. a low-loss checkpoint two runs " +
+      "back), they need to name it explicitly rather than always " +
+      "continuing the most recent run.",
+  },
+  train_live_controls: {
+    title: "train_live_controls — mid-run knobs",
+    what:
+      "Two controls usable around / during a train run: 'Trigger " +
+      "checkpoint' enqueues a one-shot ckpt_save path the next run " +
+      "honours; 'Apply lr' submits a pipeline.update_lr RPC against " +
+      "the active run id.",
+    why:
+      "Manually checkpointing at an interesting loss valley, or " +
+      "stepping LR down when train plateaus, are workflows that " +
+      "production runs need but that smoke runs hardcode away.",
+  },
+  train_abort_token: {
+    title: "abort_token — explicit cancel handle",
+    what:
+      "A string the train run polls every step; if the host sets " +
+      "the token's flag (via pipeline.abort RPC), the train exits " +
+      "cleanly at the next step boundary.",
+    why:
+      "When the run_id derived default isn't enough (e.g. a CLI " +
+      "wants to abort an in-flight train without knowing the " +
+      "auto-generated run_id), the architect can pin a stable token " +
+      "here.",
+  },
   // ----- parallel composition -----
   parallel_block: {
     title: "Parallel-block composition (tiny-aya style)",

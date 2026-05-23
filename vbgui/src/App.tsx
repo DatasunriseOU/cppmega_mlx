@@ -982,6 +982,9 @@ export function App(): JSX.Element {
                 graphNodes={nodes}
                 graphEdges={edges}
                 inferenceLog={inferenceLog}
+                tokenizerSource={
+                  trainTokenizerPath ?? "cppmega_mlx/tokenizer/tokenizer.json"
+                }
                 onHighlightBrick={setSelectedBrickId}
                 onLossApply={(l) => dispatch({ type: "loss.set", loss: l })}
                 onOptimApply={(o) => dispatch({ type: "optim.set", optim: o })}
