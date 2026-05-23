@@ -1,0 +1,15 @@
+{
+  "preset": "mtp_weighted_unit",
+  "dim_env": {
+    "B": 1,
+    "S": 32,
+    "H": 128,
+    "k": 2,
+    "seed": 7
+  },
+  "stage_status": "ok",
+  "mlx_loss": 5.7456,
+  "mlx_weight_delta_norm": 0.404619,
+  "status": "awaiting_cuda_ref",
+  "detail": "CUDA reference bench/baselines/m05_cuda_fastmtp_ref.json missing; regenerate on GB10 (bd cppmega-mlx-hjfn)."
+}

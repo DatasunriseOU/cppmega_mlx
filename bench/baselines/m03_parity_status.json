@@ -1,0 +1,12 @@
+{
+  "preset": "llama3_8b_unit",
+  "dim_env": {
+    "B": 1,
+    "S": 32,
+    "H": 128,
+    "seed": 7
+  },
+  "stage_status": "ok",
+  "status": "mlx_unavailable",
+  "detail": "dry_forward did not surface output_logits; capture_logits wiring is the M0.3 follow-up."
+}
