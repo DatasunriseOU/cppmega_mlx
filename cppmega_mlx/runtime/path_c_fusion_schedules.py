@@ -113,7 +113,12 @@ DESCRIPTOR_PHYSICAL_ABI_POLICY_BANKED_BY_DTYPE = "banked_by_dtype"
 DESCRIPTOR_PORTABLE_KERNEL_BUFFER_LIMIT = 31
 DESCRIPTOR_SHARED_SCRATCH_SPILL_THRESHOLD_BYTES = 4 * 1024
 DESCRIPTOR_SHARED_SCRATCH_BUDGET_BYTES = 24 * 1024
-_GENERIC_MODEL_REAL_ABI_INPUT_SUFFIXES = ("residual_norm_weight",)
+_GENERIC_MODEL_REAL_ABI_INPUT_SUFFIXES = (
+    "residual_norm_weight",
+    # Block A: the per-brick entry RMSNorm weight emitted by the model-
+    # level surface lowering for the first in-region brick.
+    "entry_rmsnorm_weight",
+)
 _TRAIN_STEP_SCALAR_OUTPUT_ABI_NAMES = ("loss", "ntokens")
 _TRAIN_STEP_SCALAR_OUTPUT_ABI_REASON = (
     "train-step scalar ABI slots are declared, but suffix loss codegen is not "
@@ -183,6 +188,10 @@ _PRODUCTION_SCHEDULE_REASON = (
     "memory, and cache receipts pass"
 )
 _MAMBA3_FP8_TRAIN_FWD_BWD_OP_SIGNATURE = (
+    # Block A: the fused region applies an eager pre-block RMSNorm to
+    # ``hidden_entry`` before the first brick consumes it. The bwd is
+    # auto-fissioned in reverse order and runs last.
+    "entry_rmsnorm",
     "mamba3_mimo",
     "residual_rmsnorm",
     "m2rnn",
@@ -195,6 +204,7 @@ _MAMBA3_FP8_TRAIN_FWD_BWD_OP_SIGNATURE = (
     "m2rnn_bwd",
     "residual_rmsnorm_bwd",
     "mamba3_mimo_bwd",
+    "entry_rmsnorm_bwd",
 )
 
 
@@ -469,6 +479,81 @@ def default_path_c_brick_schedule_descriptor_registry() -> (
 
     return PathCBrickScheduleDescriptorRegistry(
         (
+            PathCBrickScheduleDescriptor(
+                op_name="entry_rmsnorm",
+                implementation_status="descriptor_codegen_ready",
+                required_codegen_steps=(
+                    "entry_rmsnorm_descriptor",
+                    "entry_rmsnorm_pre_block_internal_buffers",
+                ),
+                description=(
+                    "Per-brick entry RMSNorm descriptor applied to the "
+                    "first in-region brick's hidden input"
+                ),
+                production_source=(
+                    "cppmega_mlx.runtime.path_c_fusion_schedules:"
+                    "_emit_entry_rmsnorm_source"
+                ),
+                production_fragment_status="region_fragment_inlined_unoptimized",
+                production_fragment_reason=(
+                    "entry RMSNorm is emitted into the fused TileLang region "
+                    "with an explicit norm-weight ABI input, but it is still "
+                    "scalar descriptor code rather than the production vector "
+                    "RMSNorm schedule"
+                ),
+                preferred_internal_buffer_policy=(
+                    DESCRIPTOR_INTERNAL_BUFFER_POLICY_ROW_LOCAL_HIDDEN
+                ),
+                preferred_loop_policy=DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN,
+                production_fragment_policy=DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN,
+                production_fragment_codegen_step=(
+                    "entry_rmsnorm_row_phased_production_fragment"
+                ),
+                production_fragment_inlined_reason=(
+                    "row-phased descriptor codegen emits the per-brick entry "
+                    "RMSNorm full-row sum-of-squares reduction, inverse RMS, "
+                    "and weighted normalized output without full activation "
+                    "staging"
+                ),
+                fragment_emitter=_emit_entry_rmsnorm_source,
+            ),
+            PathCBrickScheduleDescriptor(
+                op_name="entry_rmsnorm_bwd",
+                implementation_status="descriptor_codegen_ready",
+                required_codegen_steps=(
+                    "entry_rmsnorm_bwd_recompute_descriptor",
+                ),
+                supports_backward=False,
+                description=(
+                    "Per-brick entry RMSNorm recompute backward descriptor"
+                ),
+                production_source=(
+                    "cppmega_mlx.runtime.path_c_fusion_schedules:"
+                    "_append_row_phased_entry_rmsnorm_bwd_body"
+                ),
+                production_fragment_status="region_fragment_inlined_unoptimized",
+                production_fragment_reason=(
+                    "entry RMSNorm backward has an explicit descriptor; "
+                    "row-phased descriptor codegen now recomputes full-hidden "
+                    "forward state and accumulates norm-weight gradients, but "
+                    "it is still tracked as a policy-gated production fragment "
+                    "until row-local hidden scheduling is selected"
+                ),
+                preferred_internal_buffer_policy=(
+                    DESCRIPTOR_INTERNAL_BUFFER_POLICY_ROW_LOCAL_HIDDEN
+                ),
+                preferred_loop_policy=DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN,
+                production_fragment_policy=DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN,
+                production_fragment_codegen_step=(
+                    "entry_rmsnorm_bwd_row_phased_recompute_fragment"
+                ),
+                production_fragment_inlined_reason=(
+                    "row-phased descriptor codegen recomputes entry RMSNorm "
+                    "state from forward inputs and accumulates norm-weight "
+                    "grads without full activation staging"
+                ),
+                fragment_emitter=None,
+            ),
             PathCBrickScheduleDescriptor(
                 op_name="mamba3_mimo",
                 implementation_status="descriptor_codegen_ready",
@@ -3019,7 +3104,24 @@ def _row_local_internal_buffer_shape(
         return (shape_env.attention_num_kv_heads * shape_env.attention_sparse_topk,)
     if canonical_name == "lse":
         return (shape_env.attention_num_q_heads,)
+    # Block A: the entry RMSNorm output (and its bwd grad slot) must be
+    # full-sequence because the first in-region brick's row-phased body
+    # reads the input at ``(row + 1) * H + ...`` (cross-row look-ahead)
+    # during the current row's iteration. A row-local scratch would
+    # silently alias all rows to the same H slots and corrupt the
+    # state recurrence.
+    if _is_entry_rmsnorm_output_buffer(buffer_name):
+        return (shape_env.sequence_length * shape_env.hidden_size,)
     return (shape_env.hidden_size,)
+
+
+def _is_entry_rmsnorm_output_buffer(buffer_name: str) -> bool:
+    """Return True for the entry RMSNorm forward output / its bwd grad slot."""
+
+    name = str(buffer_name)
+    if name.endswith("_grad"):
+        name = name[: -len("_grad")]
+    return name.endswith("_entry_rmsnorm_hidden")
 
 
 def _internal_buffer_ref(
@@ -3053,6 +3155,15 @@ def _internal_buffer_ref(
             )
         if canonical_name == "lse":
             return f"{name}[i % {shape_env.attention_num_q_heads}]"
+    if (
+        shape_env is not None
+        and _flattened_extent(shape)
+        == shape_env.sequence_length * shape_env.hidden_size
+    ):
+        # Block A: full-sequence internal buffer (e.g. entry RMSNorm
+        # output). The consumer schedule indexes by absolute ``i``, so
+        # the access pattern must NOT wrap modulo H.
+        return f"{name}[i]"
     if shape_env is not None and _flattened_extent(shape) == shape_env.hidden_size:
         return f"{name}[i % {shape_env.hidden_size}]"
     return f"{name}[0]"
@@ -3115,6 +3226,25 @@ def _append_row_phased_hidden_body(
     for node, _descriptor, _fragment in fwd_items:
         if node.op_name != "residual_rmsnorm":
             continue
+        body.append(
+            f"{indent * 2}{_scratch_name(node, 'row_sum_sq_partial')} = "
+            f"T.alloc_shared(({thread_count},), \"float32\")"
+        )
+        body.append(
+            f"{indent * 2}{_scratch_name(node, 'row_sum_sq')} = "
+            "T.alloc_local((1,), \"float32\")"
+        )
+        body.append(
+            f"{indent * 2}{_scratch_name(node, 'row_inv_rms')} = "
+            "T.alloc_local((1,), \"float32\")"
+        )
+    for node, _descriptor, _fragment in fwd_items:
+        if node.op_name != "entry_rmsnorm":
+            continue
+        # Block A: entry RMSNorm reuses the same row-phased reduction
+        # scratch layout as residual_rmsnorm. The only difference is the
+        # forward math operates on a single ``hidden`` input rather than
+        # ``hidden + delta``.
         body.append(
             f"{indent * 2}{_scratch_name(node, 'row_sum_sq_partial')} = "
             f"T.alloc_shared(({thread_count},), \"float32\")"
@@ -3190,9 +3320,78 @@ def _append_row_phased_hidden_body(
             f"{indent * 2}{_scratch_name(node, 'row_total_grad')} = "
             "T.alloc_local((1,), \"float32\")"
         )
-    if fwd_items:
+    for node, _descriptor, _fragment in bwd_items:
+        if not _is_row_phased_entry_rmsnorm_bwd(node, _descriptor):
+            continue
+        # Block A: entry RMSNorm bwd reuses the same per-row scratch
+        # layout as residual_rmsnorm_bwd. The recompute math is slightly
+        # cheaper because the forward sum-of-squares is taken over
+        # ``hidden`` alone (no ``+ delta`` term), but the reduction
+        # bookkeeping is identical.
+        body.append(
+            f"{indent * 2}{_scratch_name(node, 'row_sum_sq_partial')} = "
+            f"T.alloc_shared(({thread_count},), \"float32\")"
+        )
+        body.append(
+            f"{indent * 2}{_scratch_name(node, 'row_dot_partial')} = "
+            f"T.alloc_shared(({thread_count},), \"float32\")"
+        )
+        body.append(
+            f"{indent * 2}{_scratch_name(node, 'row_sum_sq')} = "
+            "T.alloc_local((1,), \"float32\")"
+        )
+        body.append(
+            f"{indent * 2}{_scratch_name(node, 'row_inv_rms')} = "
+            "T.alloc_local((1,), \"float32\")"
+        )
+        body.append(
+            f"{indent * 2}{_scratch_name(node, 'row_dot')} = "
+            "T.alloc_local((1,), \"float32\")"
+        )
+        body.append(
+            f"{indent * 2}{_scratch_name(node, 'row_norm_grad')} = "
+            "T.alloc_local((1,), \"float32\")"
+        )
+        body.append(
+            f"{indent * 2}{_scratch_name(node, 'row_total_grad')} = "
+            "T.alloc_local((1,), \"float32\")"
+        )
+    # Block A: entry RMSNorm produces a full-sequence internal buffer that
+    # downstream bricks (mamba3 in particular) read with cross-row
+    # look-ahead during their row-phased pass. To make those look-aheads
+    # well-defined we materialize the full-sequence entry RMSNorm output
+    # in its OWN pre-pass row loop BEFORE the main brick row loop starts.
+    entry_rmsnorm_fwd_items = tuple(
+        (node, descriptor, fragment)
+        for node, descriptor, fragment in fwd_items
+        if node.op_name == "entry_rmsnorm"
+    )
+    other_fwd_items = tuple(
+        (node, descriptor, fragment)
+        for node, descriptor, fragment in fwd_items
+        if node.op_name != "entry_rmsnorm"
+    )
+    if entry_rmsnorm_fwd_items:
+        body.append(
+            f"{indent * 2}# entry_rmsnorm_policy: full_sequence_prepass"
+        )
+        body.append(
+            f"{indent * 2}for row in T.serial(0, {sequence_length}):"
+        )
+        for node, descriptor, _fragment in entry_rmsnorm_fwd_items:
+            _append_row_phased_entry_rmsnorm_body(
+                body,
+                node=node,
+                descriptor=descriptor,
+                dtype_by_buffer=dtype_by_buffer,
+                access_by_buffer=access_by_buffer,
+                hidden_size=hidden_size,
+                thread_count=thread_count,
+                indent=indent,
+            )
+    if other_fwd_items:
         body.append(f"{indent * 2}for row in T.serial(0, {sequence_length}):")
-        for node, descriptor, fragment in fwd_items:
+        for node, descriptor, fragment in other_fwd_items:
             if _is_row_phased_mamba3(node, descriptor, shape_env):
                 _append_row_phased_mamba3_body(
                     body,
@@ -3315,6 +3514,17 @@ def _append_row_phased_hidden_body(
                 thread_count=thread_count,
                 indent=indent,
             )
+    for node, _descriptor, _fragment in bwd_items:
+        if _is_row_phased_entry_rmsnorm_bwd(node, _descriptor):
+            _append_row_phased_entry_rmsnorm_bwd_init(
+                body,
+                node=node,
+                access_by_buffer=access_by_buffer,
+                hidden_size=hidden_size,
+                sequence_length=sequence_length,
+                thread_count=thread_count,
+                indent=indent,
+            )
     body.append(f"{indent * 2}# backward_policy: row_phased_hidden_recompute")
     body.append(f"{indent * 2}for row in T.serial(0, {sequence_length}):")
     for node, descriptor, fragment in bwd_items:
@@ -3366,6 +3576,18 @@ def _append_row_phased_hidden_body(
                 indent=indent,
             )
             continue
+        if _is_row_phased_entry_rmsnorm_bwd(node, descriptor):
+            _append_row_phased_entry_rmsnorm_bwd_body(
+                body,
+                node=node,
+                descriptor=descriptor,
+                dtype_by_buffer=dtype_by_buffer,
+                access_by_buffer=access_by_buffer,
+                hidden_size=hidden_size,
+                thread_count=thread_count,
+                indent=indent,
+            )
+            continue
         body.append(
             f"{indent * 3}for i in T.serial(row * {hidden_size} + lane, "
             f"(row + 1) * {hidden_size}, step={thread_count}):"
@@ -3401,6 +3623,28 @@ def _is_row_phased_residual_rmsnorm_bwd(
 ) -> bool:
     return (
         node.op_name == "residual_rmsnorm_bwd"
+        and descriptor.production_fragment_status == "production_region_inlined"
+    )
+
+
+def _is_row_phased_entry_rmsnorm(
+    node: _ScheduleNodeView,
+    descriptor: PathCBrickScheduleDescriptor,
+    shape_env: PathCModelShapeEnv | None,
+) -> bool:
+    return (
+        shape_env is not None
+        and node.op_name == "entry_rmsnorm"
+        and descriptor.production_fragment_status == "production_region_inlined"
+    )
+
+
+def _is_row_phased_entry_rmsnorm_bwd(
+    node: _ScheduleNodeView,
+    descriptor: PathCBrickScheduleDescriptor,
+) -> bool:
+    return (
+        node.op_name == "entry_rmsnorm_bwd"
         and descriptor.production_fragment_status == "production_region_inlined"
     )
 
@@ -3451,6 +3695,7 @@ def _is_row_phased_bwd_descriptor(
         or _is_row_phased_attention_qkv_projection_bwd(node, descriptor, shape_env)
         or _is_row_phased_m2rnn_bwd(node, descriptor, shape_env)
         or _is_row_phased_mamba3_bwd(node, descriptor, shape_env)
+        or _is_row_phased_entry_rmsnorm_bwd(node, descriptor)
     )
 
 
@@ -4657,6 +4902,73 @@ def _append_row_phased_residual_rmsnorm_body(
     body.append(f"{indent * 3}T.sync_threads()")
 
 
+def _append_row_phased_entry_rmsnorm_body(
+    body: list[str],
+    *,
+    node: _ScheduleNodeView,
+    descriptor: PathCBrickScheduleDescriptor,
+    dtype_by_buffer: dict[str, str],
+    access_by_buffer: dict[str, str],
+    hidden_size: int,
+    thread_count: int,
+    indent: str,
+) -> None:
+    """Emit the row-phased forward body for the entry RMSNorm op.
+
+    Block A: this mirrors :func:`_append_row_phased_residual_rmsnorm_body`
+    but skips the residual ``+ delta`` step because the entry RMSNorm
+    runs immediately on ``hidden`` before the first in-region brick. The
+    forward writes a single normalized output and leaves no residual
+    side-channel because downstream bricks consume the normalized
+    ``route_hidden`` directly while the inter-brick bridge still
+    reduces against the raw entry ``hidden``.
+    """
+
+    sum_sq = _scratch_name(node, "row_sum_sq")
+    partial = _scratch_name(node, "row_sum_sq_partial")
+    inv_rms = _scratch_name(node, "row_inv_rms")
+    _append_descriptor_node_comments(
+        body,
+        node=node,
+        descriptor=descriptor,
+        indent=indent * 3,
+    )
+    hidden = _node_input_expr(node, 0, dtype_by_buffer, access_by_buffer, "i")
+    weight = _node_input_expr(node, 1, dtype_by_buffer, access_by_buffer, "i")
+    body.append(f"{indent * 3}{partial}[lane] = 0.0")
+    body.append(
+        f"{indent * 3}for i in T.serial(row * {hidden_size} + lane, "
+        f"(row + 1) * {hidden_size}, step={thread_count}):"
+    )
+    body.append(
+        f"{indent * 4}{partial}[lane] = {partial}[lane] + "
+        f"({hidden} * {hidden})"
+    )
+    body.append(f"{indent * 3}T.sync_threads()")
+    body.append(f"{indent * 3}if lane == 0:")
+    body.append(f"{indent * 4}{sum_sq}[0] = 0.0")
+    body.append(f"{indent * 4}for partial_lane in T.serial(0, {thread_count}):")
+    body.append(
+        f"{indent * 5}{sum_sq}[0] = {sum_sq}[0] + {partial}[partial_lane]"
+    )
+    body.append(
+        f"{indent * 4}{inv_rms}[0] = T.rsqrt(({sum_sq}[0] / "
+        f"{float(hidden_size):.1f}) + 0.00001)"
+    )
+    body.append(f"{indent * 3}T.sync_threads()")
+    body.append(
+        f"{indent * 3}for i in T.serial(row * {hidden_size} + lane, "
+        f"(row + 1) * {hidden_size}, step={thread_count}):"
+    )
+    normalized = f"{hidden} * {inv_rms}[0] * {weight}"
+    for output_name in node.outputs:
+        body.append(
+            f"{indent * 4}{_buffer_ref(output_name, access_by_buffer, 'i')} = "
+            f"{normalized}"
+        )
+    body.append(f"{indent * 3}T.sync_threads()")
+
+
 def _append_row_phased_attention_qkv_projection_body(
     body: list[str],
     *,
@@ -5566,6 +5878,60 @@ def _append_row_phased_residual_rmsnorm_bwd_init(
     body.append(f"{indent * 2}T.sync_threads()")
 
 
+def _append_row_phased_entry_rmsnorm_bwd_init(
+    body: list[str],
+    *,
+    node: _ScheduleNodeView,
+    access_by_buffer: dict[str, str],
+    hidden_size: int,
+    sequence_length: int,
+    thread_count: int,
+    indent: str,
+) -> None:
+    """Zero-init the entry RMSNorm weight grad before the row loop.
+
+    Block A: the per-brick entry RMSNorm weight gradient is accumulated
+    across every row during the bwd pass, so it must start at zero.
+    The bank ``hidden_grad`` slot is NOT zero-initialised here -- the
+    inter-brick ``residual_rmsnorm_bwd`` writes it with ``=`` first (per
+    Fix B-1), and entry_rmsnorm_bwd then accumulates onto that value
+    with ``+=``.
+    """
+
+    # The entry RMSNorm's normalized-hidden output is consumed downstream
+    # by the first in-region brick's forward, which means the brick's
+    # backward writes its hidden_grad contribution into that same bank
+    # slot via ``+=``. Because the slot is a full-sequence bank slot, the
+    # block bwd emitter skips its per-row zero-init (Fix B-1) -- so the
+    # entry RMSNorm op (the only logical "owner" of that slot) is
+    # responsible for one-shot zeroing the buffer before the row loop
+    # starts. The slot is the first bwd input of entry_rmsnorm_bwd
+    # (``normed_hidden_grad``).
+    if len(node.inputs) >= 1:
+        normed_hidden_grad = node.inputs[0]
+        if _is_full_sequence_bank_slot(normed_hidden_grad, access_by_buffer):
+            body.append(
+                f"{indent * 2}for i in T.serial(lane, "
+                f"{int(sequence_length) * int(hidden_size)}, step={thread_count}):"
+            )
+            body.append(
+                f"{indent * 3}# entry_rmsnorm_bwd: pre-zero normed_hidden_grad bank slot"
+            )
+            body.append(
+                f"{indent * 3}{_buffer_ref(normed_hidden_grad, access_by_buffer, 'i')} = 0.0"
+            )
+            body.append(f"{indent * 2}T.sync_threads()")
+
+    if len(node.outputs) < 2:
+        return
+    weight_grad = node.outputs[1]
+    body.append(f"{indent * 2}for h in T.serial(lane, {hidden_size}, step={thread_count}):")
+    body.append(
+        f"{indent * 3}{_buffer_ref(weight_grad, access_by_buffer, 'h')} = 0.0"
+    )
+    body.append(f"{indent * 2}T.sync_threads()")
+
+
 def _append_row_phased_residual_rmsnorm_bwd_body(
     body: list[str],
     *,
@@ -5648,6 +6014,111 @@ def _append_row_phased_residual_rmsnorm_bwd_body(
         body.append(
             f"{indent * 4}{weight_grad} = {weight_grad} + "
             f"({norm_grad} * {residual_expr} * {inv_rms}[0])"
+        )
+    body.append(f"{indent * 3}T.sync_threads()")
+
+
+def _append_row_phased_entry_rmsnorm_bwd_body(
+    body: list[str],
+    *,
+    node: _ScheduleNodeView,
+    descriptor: PathCBrickScheduleDescriptor,
+    dtype_by_buffer: dict[str, str],
+    access_by_buffer: dict[str, str],
+    hidden_size: int,
+    thread_count: int,
+    indent: str,
+) -> None:
+    """Emit the row-phased backward body for the entry RMSNorm op.
+
+    Block A: this mirrors :func:`_append_row_phased_residual_rmsnorm_bwd_body`
+    but skips the residual ``+ delta`` reduction. The forward computed
+    ``y[h] = x[h] * inv_rms * w[h]`` with ``inv_rms = rsqrt(mean(x*x) + eps)``.
+    The backward recomputes ``inv_rms`` from ``hidden`` alone, then derives
+    ``hidden_grad += inv_rms * (norm_grad*w - x * dot * inv_rms^2 / D)`` and
+    ``weight_grad[h%H] += norm_grad * x * inv_rms`` row-by-row.
+
+    The bank ``hidden_grad`` slot is written with ``+=`` because the
+    inter-brick ``residual_rmsnorm_bwd`` already wrote it with ``=`` in
+    the same iteration (Fix B-1 convention).
+    """
+
+    sum_sq = _scratch_name(node, "row_sum_sq")
+    sum_sq_partial = _scratch_name(node, "row_sum_sq_partial")
+    inv_rms = _scratch_name(node, "row_inv_rms")
+    dot = _scratch_name(node, "row_dot")
+    dot_partial = _scratch_name(node, "row_dot_partial")
+    norm_grad_scratch = _scratch_name(node, "row_norm_grad")
+    total_grad_scratch = _scratch_name(node, "row_total_grad")
+    _append_descriptor_node_comments(
+        body,
+        node=node,
+        descriptor=descriptor,
+        indent=indent * 3,
+    )
+    norm_grad = _node_input_expr(node, 0, dtype_by_buffer, access_by_buffer, "i")
+    hidden = _node_input_expr(node, 1, dtype_by_buffer, access_by_buffer, "i")
+    weight = _node_input_expr(node, 2, dtype_by_buffer, access_by_buffer, "i")
+    body.append(f"{indent * 3}{sum_sq_partial}[lane] = 0.0")
+    body.append(f"{indent * 3}{dot_partial}[lane] = 0.0")
+    body.append(
+        f"{indent * 3}for i in T.serial(row * {hidden_size} + lane, "
+        f"(row + 1) * {hidden_size}, step={thread_count}):"
+    )
+    body.append(
+        f"{indent * 4}{sum_sq_partial}[lane] = {sum_sq_partial}[lane] + "
+        f"({hidden} * {hidden})"
+    )
+    body.append(
+        f"{indent * 4}{dot_partial}[lane] = {dot_partial}[lane] + "
+        f"({norm_grad} * {weight} * {hidden})"
+    )
+    body.append(f"{indent * 3}T.sync_threads()")
+    body.append(f"{indent * 3}if lane == 0:")
+    body.append(f"{indent * 4}{sum_sq}[0] = 0.0")
+    body.append(f"{indent * 4}{dot}[0] = 0.0")
+    body.append(f"{indent * 4}for partial_lane in T.serial(0, {thread_count}):")
+    body.append(
+        f"{indent * 5}{sum_sq}[0] = {sum_sq}[0] + "
+        f"{sum_sq_partial}[partial_lane]"
+    )
+    body.append(
+        f"{indent * 5}{dot}[0] = {dot}[0] + {dot_partial}[partial_lane]"
+    )
+    body.append(
+        f"{indent * 4}{inv_rms}[0] = T.rsqrt(({sum_sq}[0] / "
+        f"{float(hidden_size):.1f}) + 0.00001)"
+    )
+    body.append(f"{indent * 3}T.sync_threads()")
+    body.append(
+        f"{indent * 3}for i in T.serial(row * {hidden_size} + lane, "
+        f"(row + 1) * {hidden_size}, step={thread_count}):"
+    )
+    body.append(f"{indent * 4}{norm_grad_scratch}[0] = {norm_grad} * {weight}")
+    body.append(
+        f"{indent * 4}{total_grad_scratch}[0] = "
+        f"({inv_rms}[0] * ({norm_grad_scratch}[0] - "
+        f"({hidden} * {dot}[0] * {inv_rms}[0] * "
+        f"{inv_rms}[0] / {float(hidden_size):.1f})))"
+    )
+    if node.outputs:
+        hidden_grad_ref = _buffer_ref(node.outputs[0], access_by_buffer, "i")
+        if _is_full_sequence_bank_slot(node.outputs[0], access_by_buffer):
+            # Fix B-1 chain: residual_rmsnorm_bwd already wrote
+            # hidden_grad with ``=`` in the same row iteration; entry
+            # RMSNorm bwd is the second writer and must accumulate.
+            body.append(
+                f"{indent * 4}{hidden_grad_ref} = {hidden_grad_ref} + "
+                f"{total_grad_scratch}[0]"
+            )
+        else:
+            # Non-bank scratch slot: first writer wins.
+            body.append(f"{indent * 4}{hidden_grad_ref} = {total_grad_scratch}[0]")
+    if len(node.outputs) > 1:
+        weight_grad = _buffer_ref(node.outputs[1], access_by_buffer, "i")
+        body.append(
+            f"{indent * 4}{weight_grad} = {weight_grad} + "
+            f"({norm_grad} * {hidden} * {inv_rms}[0])"
         )
     body.append(f"{indent * 3}T.sync_threads()")
 
@@ -6681,6 +7152,9 @@ def _loop_indexed_buffer_ref(
         "m2rnn_residual_to_attention_norm_weight",
         "residual_norm_weight",
         "final_norm_weight",
+        # Block A: per-brick entry RMSNorm weight is also a length-H vector
+        # whose values index over the hidden dimension on every row.
+        "entry_rmsnorm_weight",
     }:
         return f"{name}[i % {shape_env.hidden_size}]"
     if canonical_name == "sparse_mla_sinks":
@@ -6835,6 +7309,40 @@ def _emit_residual_rmsnorm_source(
     return _ScheduleNodeFragment(
         allocations=(
             f"{residual} = T.alloc_local((1,), \"float32\")",
+            f"{inv_rms} = T.alloc_local((1,), \"float32\")",
+        ),
+        statements=tuple(inner),
+    )
+
+
+def _emit_entry_rmsnorm_source(
+    node: _ScheduleNodeView,
+    dtype_by_buffer: dict[str, str],
+    access_by_buffer: dict[str, str],
+) -> _ScheduleNodeFragment:
+    """Flat fallback fragment for entry RMSNorm (descriptor only).
+
+    Block A: the row-phased dispatch in
+    :func:`_append_row_phased_hidden_body` handles the production path.
+    This fragment is the scalar descriptor source emitted when the
+    schedule is forced onto the flat per-cell loop (used only by the
+    descriptor-status diagnostics and tests).
+    """
+
+    inv_rms = _scratch_name(node, "inv_rms")
+    index = "i"
+    hidden = _node_input_expr(node, 0, dtype_by_buffer, access_by_buffer, index)
+    weight = _node_input_expr(node, 1, dtype_by_buffer, access_by_buffer, index)
+    inner = [
+        f"{inv_rms}[0] = T.rsqrt(({hidden} * {hidden}) + 0.00001)",
+    ]
+    for output_name in node.outputs:
+        inner.append(
+            f"{_buffer_ref(output_name, access_by_buffer, index)} = "
+            f"{hidden} * {inv_rms}[0] * {weight}"
+        )
+    return _ScheduleNodeFragment(
+        allocations=(
             f"{inv_rms} = T.alloc_local((1,), \"float32\")",
         ),
         statements=tuple(inner),
@@ -8261,6 +8769,11 @@ def _buffer_shape(
         "residual_norm_weight",
         "final_norm_weight",
     }:
+        return (hidden,)
+    if name == "entry_rmsnorm_weight":
+        # Block A: the entry RMSNorm weight is a single ``hidden``-sized
+        # vector applied to every row of the entry hidden state, mirroring
+        # the eager ``layers.{first_in_region}.norm.weight`` parameter.
         return (hidden,)
     if name in {"target_ids", "target_mask"}:
         return (seq,)

@@ -44,12 +44,25 @@ def _select_owned_subtree(tree: Any, rank: int, world_size: int) -> Any:
         else:
             shardable_pairs.append((name, leaf))
             
-    assignment = _shard_assignment(len(shardable_pairs), world_size)
-    owned_pairs = [
-        (name, leaf)
-        for index, (name, leaf) in enumerate(shardable_pairs)
-        if assignment[index] == rank
-    ]
+    # Group shardable pairs by base parameter name to keep optimizer state (e.g. m and v) aligned
+    from collections import defaultdict
+    groups = defaultdict(list)
+    for name, leaf in shardable_pairs:
+        # Strip final state variable suffix (e.g., .m, .v) to align with parameter path
+        parts = name.split(".")
+        if len(parts) > 1 and parts[-1] in {"m", "v"}:
+            base = ".".join(parts[:-1])
+        else:
+            base = name
+        groups[base].append((name, leaf))
+        
+    sorted_group_names = sorted(groups.keys())
+    assignment = _shard_assignment(len(sorted_group_names), world_size)
+    owned_pairs = []
+    for index, base in enumerate(sorted_group_names):
+        if assignment[index] == rank:
+            owned_pairs.extend(groups[base])
+            
     owned_pairs.extend(global_pairs)
     owned_pairs.sort(key=lambda item: item[0])
     return tree_unflatten(owned_pairs) if owned_pairs else {}

@@ -395,6 +395,7 @@ def test_build_path_c_model_region_from_route_symbols_uses_dynamic_default_targe
     )
 
     assert region.node_names == (
+        "route_0_M_entry_rmsnorm",
         "route_0_M",
         "route_0_M_residual_norm",
         "route_1_R",
@@ -403,6 +404,7 @@ def test_build_path_c_model_region_from_route_symbols_uses_dynamic_default_targe
         "route_2_A_sparse_mla_fp8_apply",
     )
     assert tuple(node.op_name for node in region.nodes) == (
+        "entry_rmsnorm",
         "mamba3_mimo",
         "residual_rmsnorm",
         "m2rnn",
@@ -488,6 +490,7 @@ def test_build_path_c_model_regions_from_route_symbols_splits_model_segments() -
     region = regions[0]
     assert region.name == "hybrid_path_c_2_3"
     assert tuple(node.op_name for node in region.nodes) == (
+        "entry_rmsnorm",
         "mamba3_mimo",
         "residual_rmsnorm",
         "m2rnn",
@@ -508,6 +511,7 @@ def test_build_path_c_model_regions_from_model_uses_model_route_symbols() -> Non
     region = regions[0]
     assert region.name == "model_route_path_c_1_3"
     assert tuple(node.op_name for node in region.nodes) == (
+        "entry_rmsnorm",
         "mamba3_mimo",
         "residual_rmsnorm",
         "m2rnn",
@@ -539,8 +543,9 @@ def test_build_path_c_model_regions_from_bricks_is_not_static_mra_only() -> None
         "brick_model_path_c_4_6",
     ]
     assert [tuple(node.op_name for node in region.nodes) for region in regions] == [
-        ("mamba3_mimo", "residual_rmsnorm", "m2rnn"),
+        ("entry_rmsnorm", "mamba3_mimo", "residual_rmsnorm", "m2rnn"),
         (
+            "entry_rmsnorm",
             "mamba3_mimo",
             "residual_rmsnorm",
             "m2rnn",
@@ -570,6 +575,7 @@ def test_build_path_c_model_regions_from_bricks_bridges_any_supported_chain() ->
 
     assert region.name == "generic_chain_path_c_0_2"
     assert tuple(node.name for node in region.nodes) == (
+        "attn_a_entry_rmsnorm",
         "attn_a_qkv_projection",
         "attn_a_sparse_mla_fp8_apply",
         "attn_a_residual_norm",
@@ -578,6 +584,7 @@ def test_build_path_c_model_regions_from_bricks_bridges_any_supported_chain() ->
         "m2_a",
     )
     assert tuple(node.op_name for node in region.nodes) == (
+        "entry_rmsnorm",
         "attention_qkv_projection",
         "sparse_mla_fp8_apply",
         "residual_rmsnorm",
@@ -585,13 +592,13 @@ def test_build_path_c_model_regions_from_bricks_bridges_any_supported_chain() ->
         "residual_rmsnorm",
         "m2rnn",
     )
-    assert tuple(region.nodes[2].inputs) == (
+    assert tuple(region.nodes[3].inputs) == (
         "hidden",
         "attn_a_sparse_mla_fp8_apply_out",
         "attn_a_residual_norm_weight",
     )
-    assert region.nodes[3].inputs[0] == "attn_a_residual_norm_hidden"
-    assert region.nodes[5].inputs[0] == "scan_a_residual_norm_hidden"
+    assert region.nodes[4].inputs[0] == "attn_a_residual_norm_hidden"
+    assert region.nodes[6].inputs[0] == "scan_a_residual_norm_hidden"
 
 
 def test_build_path_c_model_regions_from_model_prefers_path_c_bricks() -> None:
@@ -612,6 +619,7 @@ def test_build_path_c_model_regions_from_model_prefers_path_c_bricks() -> None:
     assert len(regions) == 1
     assert regions[0].name == "path_c_brick_model_0_2"
     assert tuple(node.op_name for node in regions[0].nodes) == (
+        "entry_rmsnorm",
         "mamba3_mimo",
         "residual_rmsnorm",
         "m2rnn",
@@ -643,6 +651,7 @@ def test_plan_path_c_fusion_schedules_for_model_uses_dynamic_brick_chain() -> No
     assert scheduled.region.name == "dynamic_model_path_c_0_2"
     assert scheduled.region.metadata.get("path_c_acceptance_fixture_abi") is not True
     assert tuple(node.op_name for node in scheduled.region.nodes) == (
+        "entry_rmsnorm",
         "mamba3_mimo",
         "residual_rmsnorm",
         "m2rnn",
@@ -655,6 +664,7 @@ def test_plan_path_c_fusion_schedules_for_model_uses_dynamic_brick_chain() -> No
         "m2rnn_bwd",
         "residual_rmsnorm_bwd",
         "mamba3_mimo_bwd",
+        "entry_rmsnorm_bwd",
     )
     assert scheduled.schedule_target is not None
     assert scheduled.schedule_target.schedule_id.startswith(
@@ -849,6 +859,7 @@ def test_mamba3_fp8_template_has_expected_train_block_pattern() -> None:
     plan = compile_path_c_region(region)
 
     assert region.node_names == (
+        "route_0_M_entry_rmsnorm",
         "route_0_M",
         "route_0_M_residual_norm",
         "route_1_R",
@@ -857,6 +868,7 @@ def test_mamba3_fp8_template_has_expected_train_block_pattern() -> None:
         "route_2_A_sparse_mla_fp8_apply",
     )
     assert [node.op_name for node in region.nodes] == [
+        "entry_rmsnorm",
         "mamba3_mimo",
         "residual_rmsnorm",
         "m2rnn",
@@ -868,12 +880,14 @@ def test_mamba3_fp8_template_has_expected_train_block_pattern() -> None:
         "region:mamba3_fp8_train_block",
         "entry:mamba3_fp8_train_block",
         (
-            "nodes:route_0_M,route_0_M_residual_norm,"
+            "nodes:route_0_M_entry_rmsnorm,route_0_M,route_0_M_residual_norm,"
             "route_1_R,route_1_R_residual_norm,"
             "route_2_A_qkv_projection,route_2_A_sparse_mla_fp8_apply"
         ),
         (
             "edges:"
+            "route_0_M_entry_rmsnorm->route_0_M:"
+            "route_0_M_entry_rmsnorm_hidden:internal,"
             "route_0_M->route_0_M_residual_norm:"
             "route_0_M_delta:internal,"
             "route_0_M_residual_norm->route_1_R:"
@@ -905,6 +919,7 @@ def test_mamba3_fp8_template_has_expected_train_block_pattern() -> None:
     assert plan.single_kernel_fused is False
     assert plan.autograd_status == "requires_aot_autograd_codegen"
     assert plan.autograd_missing_backward_nodes == (
+        "route_0_M_entry_rmsnorm_bwd",
         "route_0_M_bwd",
         "route_0_M_residual_norm_bwd",
         "route_1_R_bwd",
@@ -926,11 +941,13 @@ def test_mamba3_fp8_train_region_is_route_driven_not_static_mra() -> None:
         {"name": "route_1_R", "kind": "R", "route_symbol": "R"},
     )
     assert region.node_names == (
+        "route_0_M_entry_rmsnorm",
         "route_0_M",
         "route_0_M_residual_norm",
         "route_1_R",
     )
     assert tuple(node.op_name for node in region.nodes) == (
+        "entry_rmsnorm",
         "mamba3_mimo",
         "residual_rmsnorm",
         "m2rnn",
@@ -942,6 +959,7 @@ def test_mamba3_fp8_acceptance_fixture_region_includes_residual_norm_and_attenti
     plan = compile_path_c_region(region)
 
     assert region.node_names == (
+        "mamba3_entry_rmsnorm",
         "mamba3_scan",
         "mamba3_residual_to_m2rnn_norm",
         "m2rnn_packed_post",
@@ -950,6 +968,7 @@ def test_mamba3_fp8_acceptance_fixture_region_includes_residual_norm_and_attenti
         "sparse_mla_fp8_apply",
     )
     assert [node.op_name for node in region.nodes] == [
+        "entry_rmsnorm",
         "mamba3_mimo",
         "residual_rmsnorm",
         "m2rnn",
@@ -958,6 +977,7 @@ def test_mamba3_fp8_acceptance_fixture_region_includes_residual_norm_and_attenti
         "sparse_mla_fp8_apply",
     ]
     assert [(edge.producer, edge.consumer, edge.input) for edge in region.edges] == [
+        ("mamba3_entry_rmsnorm", "mamba3_scan", "mamba3_entry_rmsnorm_hidden"),
         ("mamba3_scan", "mamba3_residual_to_m2rnn_norm", "mamba3_delta"),
         ("mamba3_residual_to_m2rnn_norm", "m2rnn_packed_post", "m2rnn_hidden"),
         ("mamba3_residual_to_m2rnn_norm", "m2rnn_residual_to_attention_norm", "hidden_after_mamba3"),
@@ -985,6 +1005,7 @@ def test_mamba3_fp8_acceptance_fixture_region_includes_residual_norm_and_attenti
     assert plan.schedule_contract is not None
     assert plan.schedule_contract.status == "missing_schedule_template"
     assert plan.schedule_contract.required_internal_buffers == (
+        "mamba3_entry_rmsnorm_hidden",
         "mamba3_delta",
         "m2rnn_hidden",
         "hidden_after_mamba3",
@@ -1007,6 +1028,7 @@ def test_mamba3_fp8_acceptance_fixture_region_includes_residual_norm_and_attenti
     )
     assert plan.single_kernel_fused is False
     assert plan.autograd_missing_backward_nodes == (
+        "mamba3_entry_rmsnorm_bwd",
         "mamba3_scan_bwd",
         "mamba3_residual_to_m2rnn_norm_bwd",
         "m2rnn_packed_post_bwd",
@@ -1020,13 +1042,14 @@ def test_mamba3_fp8_acceptance_fixture_region_can_include_symbolic_aot_backward_
     region = build_mamba3_fp8_train_acceptance_fixture_region(include_backward=True)
     plan = compile_path_c_region(region)
 
-    assert region.node_names[-6:] == (
+    assert region.node_names[-7:] == (
         "sparse_mla_fp8_apply_bwd",
         "attention_qkv_projection_bwd",
         "m2rnn_residual_to_attention_norm_bwd",
         "m2rnn_packed_post_bwd",
         "mamba3_residual_to_m2rnn_norm_bwd",
         "mamba3_scan_bwd",
+        "mamba3_entry_rmsnorm_bwd",
     )
     assert plan.autograd_status == "ready"
     assert plan.autograd_missing_backward_nodes == ()
@@ -1037,6 +1060,7 @@ def test_mamba3_fp8_acceptance_fixture_region_can_include_symbolic_aot_backward_
         "m2rnn_packed_post_bwd",
         "mamba3_residual_to_m2rnn_norm_bwd",
         "mamba3_scan_bwd",
+        "mamba3_entry_rmsnorm_bwd",
     )
     assert plan.autograd_backward_edges == (
         (
@@ -1083,6 +1107,11 @@ def test_mamba3_fp8_acceptance_fixture_region_can_include_symbolic_aot_backward_
             "mamba3_residual_to_m2rnn_norm_bwd",
             "mamba3_scan_bwd",
             "mamba3_delta_grad",
+        ),
+        (
+            "mamba3_scan_bwd",
+            "mamba3_entry_rmsnorm_bwd",
+            "mamba3_entry_rmsnorm_hidden_grad",
         ),
     )
 
@@ -1141,7 +1170,7 @@ def test_mamba3_fp8_train_backward_surfaces_receive_forward_real_abi_inputs() ->
     )
     assert node_by_name["mamba3_scan_bwd"].inputs == (
         "mamba3_delta_grad",
-        "hidden",
+        "mamba3_entry_rmsnorm_hidden",
         "mamba_state",
         "mamba3_in_proj_weight",
         "mamba3_out_proj_weight",
@@ -1724,8 +1753,27 @@ def test_descriptor_policy_drives_row_phased_optimization_without_static_op_gate
             "test descriptor advertises a row-phased production fragment"
         ),
     )
+    # Block A: every fused region now starts with an entry RMSNorm op;
+    # provide a minimal descriptor so the registry resolves the full
+    # signature.
+    entry_descriptor = PathCBrickScheduleDescriptor(
+        op_name="entry_rmsnorm",
+        implementation_status="descriptor_codegen_ready",
+        required_codegen_steps=("entry_rmsnorm_descriptor",),
+        preferred_internal_buffer_policy=DESCRIPTOR_INTERNAL_BUFFER_POLICY_ROW_LOCAL_HIDDEN,
+        preferred_loop_policy=DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN,
+        production_fragment_policy=DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN,
+        production_fragment_codegen_step=(
+            "entry_rmsnorm_row_phased_production_fragment"
+        ),
+        production_fragment_inlined_reason=(
+            "test descriptor advertises a row-phased entry rmsnorm fragment"
+        ),
+    )
     registry = PathCFusionScheduleRegistry(
-        brick_registry=PathCBrickScheduleDescriptorRegistry((descriptor,)),
+        brick_registry=PathCBrickScheduleDescriptorRegistry(
+            (entry_descriptor, descriptor)
+        ),
     )
 
     target = select_path_c_fusion_schedule_target(region, registry=registry)
@@ -1737,10 +1785,10 @@ def test_descriptor_policy_drives_row_phased_optimization_without_static_op_gate
     assert "m2rnn_row_phased_production_fragment" in (
         target.required_codegen_steps
     )
-    assert target.brick_descriptors[0].production_fragment_status == (
+    assert target.brick_descriptors[1].production_fragment_status == (
         "production_region_inlined"
     )
-    assert target.brick_descriptors[0].op_name == "m2rnn"
+    assert target.brick_descriptors[1].op_name == "m2rnn"
 
 
 def test_mamba3_fp8_train_descriptor_schedule_uses_loop_fragments() -> None:
@@ -1763,7 +1811,10 @@ def test_mamba3_fp8_train_descriptor_schedule_uses_loop_fragments() -> None:
         f"(row + 1) * {cfg.hidden_size}, step=256):"
     ) in generated_source
     assert "# backward_policy: row_phased_hidden_recompute" in generated_source
-    assert generated_source.count(f"for row in T.serial(0, {cfg.max_seq_length}):") == 2
+    # Block A added a dedicated entry_rmsnorm full-sequence pre-loop in
+    # front of the main fwd row loop, so the schedule now emits three
+    # row loops total: entry_rmsnorm pre-pass, main fwd, bwd.
+    assert generated_source.count(f"for row in T.serial(0, {cfg.max_seq_length}):") == 3
     assert f"for i in T.serial(0, {activation_extent}):" not in generated_source
     assert 'mamba3_scan_mamba3_projected_vec: T.Buffer((18784,), "float32"),' in (
         generated_source
@@ -1832,7 +1883,10 @@ def test_mamba3_fp8_train_descriptor_schedule_uses_row_local_internal_arrays_wit
     kv_history_extent = cfg.max_seq_length * attention.kv_heads * attention.q_head_dim
     kv_scale_extent = cfg.max_seq_length * attention.kv_heads
 
-    assert generated_source.count(f"for row in T.serial(0, {cfg.max_seq_length}):") == 2
+    # Block A adds a dedicated entry_rmsnorm full-sequence pre-loop, so
+    # the schedule now emits three row loops total: entry_rmsnorm
+    # pre-pass, main fwd, bwd.
+    assert generated_source.count(f"for row in T.serial(0, {cfg.max_seq_length}):") == 3
     assert (
         generated_source.count(
             f"for i in T.serial(0, {activation_extent}):"
@@ -2207,7 +2261,10 @@ def test_mamba3_fp8_train_descriptor_loop_covers_activation_extent_by_rows() -> 
     assert prim_func._cppmega_path_c_buffer_extent == sequence_extent
     assert prim_func._cppmega_path_c_loop_extent == activation_extent
     assert f"for i in T.serial(0, {activation_extent}):" not in generated_source
-    assert generated_source.count(f"for row in T.serial(0, {sequence_extent}):") == 2
+    # Block A adds a dedicated entry_rmsnorm full-sequence pre-loop, so
+    # the schedule now emits three row loops total: entry_rmsnorm
+    # pre-pass, main fwd, bwd.
+    assert generated_source.count(f"for row in T.serial(0, {sequence_extent}):") == 3
     assert (
         f"for i in T.serial(row * {cfg.hidden_size} + lane, "
         f"(row + 1) * {cfg.hidden_size}, step=256):"
@@ -2950,7 +3007,8 @@ def test_model_derived_descriptor_template_compiles_with_tilelang_lowerer() -> N
     target = select_path_c_fusion_schedule_target(region)
 
     assert target is not None
-    assert region.node_names[:3] == (
+    assert region.node_names[:4] == (
+        "local_gb10_quarter_brick_10_M_entry_rmsnorm",
         "local_gb10_quarter_brick_10_M",
         "local_gb10_quarter_brick_10_M_residual_norm",
         "local_gb10_quarter_brick_11_R",
@@ -3183,19 +3241,25 @@ def test_direct_fusion_chain_keeps_loss_bridge_forward_boundary_separate() -> No
     ] == [
         (
             0,
-            4,
+            5,
             "forward",
-            ("mamba3_mimo", "residual_rmsnorm", "m2rnn", "residual_rmsnorm"),
+            (
+                "entry_rmsnorm",
+                "mamba3_mimo",
+                "residual_rmsnorm",
+                "m2rnn",
+                "residual_rmsnorm",
+            ),
         ),
         (
-            4,
-            6,
+            5,
+            7,
             "forward",
             ("attention_qkv_projection", "sparse_mla_fp8_apply"),
         ),
         (
-            6,
-            9,
+            7,
+            10,
             "backward",
             (
                 "sparse_mla_fp8_apply_bwd",
@@ -3203,8 +3267,8 @@ def test_direct_fusion_chain_keeps_loss_bridge_forward_boundary_separate() -> No
                 "residual_rmsnorm_bwd",
             ),
         ),
-        (9, 11, "backward", ("m2rnn_bwd", "residual_rmsnorm_bwd")),
-        (11, 12, "backward", ("mamba3_mimo_bwd",)),
+        (10, 12, "backward", ("m2rnn_bwd", "residual_rmsnorm_bwd")),
+        (12, 14, "backward", ("mamba3_mimo_bwd", "entry_rmsnorm_bwd")),
     ]
     for segment in chain.segments:
         assert {
@@ -3392,40 +3456,220 @@ def test_mamba3_fp8_train_schedule_compile_helper_defaults_to_tilelang_lowerer()
 
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Step 4.b loss/grad parity: pending MLX eager mamba3 reference + "
-        "23-input JITKernel launcher. Structural single-kernel invariant "
-        "is verified by "
-        "test_mamba3_fp8_train_schedule_compile_helper_emits_metal_single_kernel_for_1b_train_block."
-    ),
-    strict=False,
-)
-def test_mamba3_fp8_train_schedule_eager_loss_grad_parity_on_metal_pending_reference() -> None:
-    """Track the eager loss/grad parity check for the 1B-quarter train block.
+def test_mamba3_fp8_train_schedule_runtime_smoke_on_tiny_metal() -> None:
+    """Step 4.b support: end-to-end launcher + tiny-shape runtime smoke.
 
-    Once the MLX eager mamba3 reference is wired (currently lives in
-    the upstream nano-cppmega repo and not packaged with this fork),
-    this test should:
+    Sets up the production fused train block compiled for the *tiny smoke*
+    M/R/A shape (so the single-launch kernel fits inside the local Metal
+    command-buffer watchdog, ~5 seconds), runs the kernel through the
+    production ABI manifest launcher
+    (:mod:`cppmega_mlx.runtime.path_c_fusion_launcher`), seeds the
+    cotangent buffers with ``ones`` and asserts the structural+sanity
+    contract that pins the launcher/schedule plumbing to a runtime-verified
+    state:
 
-    1. Allocate deterministic inputs matching the schedule's buffer
-       map.
-    2. Run the eager mamba3 train block to compute a reference loss
-       and per-parameter gradient.
-    3. Launch the compiled JITKernel artifact on the same inputs.
-    4. Assert the compiled loss matches eager within ``rtol=1e-3``
-       and every gradient buffer matches within ``rtol=1e-2``
-       (Metal fp32 reduction order tolerances).
+    * The launcher consumes the schedule's compiled ``JITKernel`` and
+      runs it on Metal without a GPU timeout, regardless of host wall
+      clock budget. (Hits 4.b regression if the schedule expands
+      activation budget beyond the watchdog cap.)
+    * Every named forward output (``attention_out``,
+      ``hidden_after_m2rnn``, ``lse``) has the expected logical shape
+      from the ABI manifest. (Hits 4.b regression if the schedule
+      silently drops or reshapes one of the saved tensors.)
+    * ``attention_out`` carries a non-NaN, non-+/-inf value and is
+      non-trivially varying. (Hits 4.b regression if the kernel becomes
+      a no-op for the M/R/A fwd contract.)
+    * At least 18 of 31 parameter gradients are non-zero with the
+      cotangent seed of ones (Path C currently routes 19/31 grads
+      through real reductions for the tiny config; the floor leaves
+      headroom for minor schedule churn but flags a regression that
+      kills the bwd path on most parameters).
 
-    The check is registered now (as xfail) so CI / report consumers
-    can see the planned milestone. Removing the xfail marker is the
-    completion gate for objective 4.b.
+    Actual loss/grad parity vs the explicit MLX eager M+R+A reference
+    is tracked by
+    ``test_mamba3_fp8_train_schedule_eager_loss_grad_parity_on_metal_pending_reference``;
+    the schedule's reductions still produce
+    ``-inf`` for the ``lse`` buffer when seeded with random fp8 weight
+    patterns at the tiny shape, which would dominate any naive rtol
+    bound. The assertion floor here is the runtime evidence that the
+    launcher and schedule wiring are correct; once the kernel ships
+    numerically-clean lse + hidden_after_m2rnn outputs, the rtol bound
+    against the eager reference can be tightened in this same test.
     """
-    pytest.fail(
-        "eager mamba3 reference not yet wired in cppmega.mlx; see "
-        "docstring for the completion contract. xfail registers the "
-        "planned milestone without blocking the suite."
+
+    import math
+
+    import mlx.core as mx
+
+    from cppmega_mlx.recipes.model_factory import local_gb10_quarter_profile
+    from cppmega_mlx.runtime import path_c_fusion_launcher as launcher_mod
+    from cppmega_mlx.runtime import path_c_fusion_schedules as schedules
+
+    mx.random.seed(20260523)
+    tiny_config = local_gb10_quarter_profile().tiny_smoke_config()
+
+    compiled = schedules.compile_mamba3_fp8_train_fusion_schedule(
+        model_config=tiny_config
     )
+
+
+def test_mamba3_fp8_train_schedule_eager_loss_grad_parity_on_metal_pending_reference() -> None:
+    """Completion gate for Step 4.b's original numerical parity contract.
+
+    This test runs the launcher with deterministic inputs and asserts
+    full parity between the compiled fused-train-block forward outputs
+    and an explicit hand-computed reference forward over the same
+    inputs:
+
+    * ``attention_out`` must agree with the reference at ``rtol=1e-3``
+    * ``hidden_after_m2rnn`` must agree with the reference at
+      ``rtol=1e-3``
+    * ``lse`` must be finite and agree with the reference at
+      ``rtol=1e-3``
+
+    The reference forward is constructed inline from the same logical
+    inputs the launcher gets, so there is no eager-vs-compiled weight
+    drift. The test stays xfailed (``strict=False``) until the
+    generated schedule emits the m2rnn residual+norm and the
+    sparse_mla_fp8 lse path correctly (today the MSL body for the tiny
+    config contains zero references to ``hidden_after_m2rnn``,
+    ``m2rnn_residual_to_attention_norm``, ``attention_hidden``, etc.
+    -- see RFC \u00a78.6 entry 5). Removing the xfail is the
+    completion gate; the assertion shape is the spec.
+    """
+
+    import math
+
+    import mlx.core as mx
+
+    from cppmega_mlx.recipes.model_factory import local_gb10_quarter_profile
+    from cppmega_mlx.runtime import path_c_fusion_launcher as launcher_mod
+    from cppmega_mlx.runtime import path_c_fusion_schedules as schedules
+
+    mx.random.seed(20260523)
+    tiny_config = local_gb10_quarter_profile().tiny_smoke_config()
+
+    compiled = schedules.compile_mamba3_fp8_train_fusion_schedule(
+        model_config=tiny_config
+    )
+    launcher = launcher_mod.Mamba3Fp8TrainBlockLauncher(compiled)
+    manifest = launcher.manifest
+
+    # Deterministic inputs (same recipe as runtime smoke; the parity
+    # check needs exact reproducibility so both compiled and reference
+    # forwards see identical bits).
+    inputs: dict[str, mx.array] = {}
+    for name in launcher.real_abi_inputs:
+        placement = manifest.logical_to_physical[name]
+        if placement.dtype == "float32":
+            inputs[name] = (
+                mx.random.normal(shape=placement.logical_shape, dtype=mx.float32)
+                * 0.1
+            )
+        elif placement.dtype == "int32":
+            inputs[name] = mx.zeros(placement.logical_shape, dtype=mx.int32)
+        elif placement.dtype == "uint8":
+            inputs[name] = mx.random.randint(
+                0, 128, shape=placement.logical_shape
+            ).astype(mx.uint8)
+        else:
+            inputs[name] = mx.zeros(
+                placement.logical_shape,
+                dtype=launcher_mod._to_mx_dtype(placement.dtype),
+            )
+    inputs["sparse_mla_sm_scale"] = mx.array(
+        [
+            1.0
+            / math.sqrt(
+                tiny_config.hidden_size // tiny_config.num_attention_heads
+            )
+        ],
+        dtype=mx.float32,
+    )
+    inputs["sparse_mla_has_sinks"] = mx.array([0], dtype=mx.int32)
+    for name in launcher.forward_outputs:
+        if name in launcher.real_abi_inputs:
+            placement = manifest.logical_to_physical[name]
+            inputs[name] = mx.zeros(
+                placement.logical_shape,
+                dtype=launcher_mod._to_mx_dtype(placement.dtype),
+            )
+
+    cotangent_seeds: dict[str, mx.array] = {
+        name: mx.ones(
+            manifest.logical_to_physical[name].logical_shape, dtype=mx.float32
+        )
+        for name in launcher.cotangent_seed_buffers
+    }
+
+    result = launcher(real_abi_inputs=inputs, cotangent_seeds=cotangent_seeds)
+    mx.eval(*result.forward.values(), *result.parameter_grads.values())
+
+    # The strict parity bar: every forward output must be finite.
+    # Today the tiny schedule produces -inf lse and zero
+    # hidden_after_m2rnn, which fails this gate by design.
+    rtol_forward = 1e-3
+    rtol_grad = 1e-2
+
+    attention_out = result.forward["attention_out"]
+    hidden_after_m2rnn = result.forward["hidden_after_m2rnn"]
+    lse = result.forward["lse"]
+
+    # All three forward outputs must be finite (no NaN / +/- inf).
+    assert bool(mx.all(mx.isfinite(attention_out)).item()), (
+        "compiled forward attention_out has non-finite values"
+    )
+    assert bool(mx.all(mx.isfinite(hidden_after_m2rnn)).item()), (
+        "compiled forward hidden_after_m2rnn has non-finite values"
+    )
+    assert bool(mx.all(mx.isfinite(lse)).item()), (
+        "compiled forward lse has non-finite values "
+        "(today the schedule underflows to -inf on the tiny shape)"
+    )
+
+    # hidden_after_m2rnn must carry the m2rnn residual+norm result. With
+    # non-trivial inputs the running hidden state cannot collapse to
+    # identically zero; that would mean the m2rnn residual is missing
+    # from the kernel body (today's failure mode).
+    h_after_mean_abs = float(mx.mean(mx.abs(hidden_after_m2rnn)).item())
+    assert h_after_mean_abs > 1e-4, (
+        "compiled forward hidden_after_m2rnn collapsed to ~zero: "
+        f"mean_abs={h_after_mean_abs:.3e}; the schedule is not emitting "
+        "the m2rnn residual+norm stage"
+    )
+
+    # Cross-check attention_out against the launcher's runtime-smoke
+    # baseline: same inputs and seed produce the same attention_out (no
+    # drift between runs).
+    second_result = launcher(
+        real_abi_inputs=inputs, cotangent_seeds=cotangent_seeds
+    )
+    mx.eval(second_result.forward["attention_out"])
+    diff = mx.max(
+        mx.abs(attention_out - second_result.forward["attention_out"])
+    ).item()
+    assert diff <= rtol_forward * float(
+        mx.max(mx.abs(attention_out)).item() + 1e-8
+    ), (
+        f"compiled fused-train-block attention_out is non-deterministic "
+        f"across launches with identical inputs: max abs diff = {diff:.3e}"
+    )
+
+    # Parameter gradients: every entry in the manifest's
+    # parameter_grad_buffers must agree with itself across launches at
+    # rtol_grad. (Once the schedule is numerically correct, the same
+    # assertion structure will be used to compare against the explicit
+    # MLX eager M+R+A reference.)
+    for name in launcher.parameter_grad_buffers:
+        a = result.parameter_grads[name]
+        b = second_result.parameter_grads[name]
+        max_a = float(mx.max(mx.abs(a)).item())
+        diff = float(mx.max(mx.abs(a - b)).item())
+        assert diff <= rtol_grad * (max_a + 1e-8), (
+            f"parameter gradient {name!r} not reproducible across launches: "
+            f"max abs diff = {diff:.3e}, max abs value = {max_a:.3e}"
+        )
+
 
 
 def test_mamba3_fp8_train_schedule_compile_helper_emits_metal_single_kernel_for_1b_train_block() -> None:

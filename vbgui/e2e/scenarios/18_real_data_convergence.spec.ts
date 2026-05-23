@@ -55,7 +55,7 @@ for (const preset of CONVERGENCE_PRESETS) {
     // Real-data path activated
     const dataSource = await page.getByTestId(
       "run-result-extras-train-data_source").textContent();
-    expect(dataSource?.trim()).toBe("parquet_tokenized");
+    expect(["parquet_tokenized", "parquet_tokenized_stream"]).toContain(dataSource?.trim());
 
     // tokenizer_used reports a path basename (not 'null')
     const tokUsed = await page.getByTestId(

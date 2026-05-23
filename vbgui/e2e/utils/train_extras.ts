@@ -45,6 +45,7 @@ async function arrayOf(page: Page, baseTestid: string): Promise<number[]> {
 export async function readTrainExtras(page: Page): Promise<TrainExtras> {
   // Wait for the train stage status to be "ok" (generous 45s timeout for compilation/run under load).
   await page.getByTestId("run-result-status-train").waitFor({ state: "visible", timeout: 45_000 });
+  
   await expect(page.getByTestId("run-result-status-train")).toHaveText("ok", { timeout: 45_000 });
 
   // Open the train expand row.

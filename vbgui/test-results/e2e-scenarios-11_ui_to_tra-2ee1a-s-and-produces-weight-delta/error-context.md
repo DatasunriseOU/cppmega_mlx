@@ -6,8 +6,8 @@
 
 # Test info
 
-- Name: e2e/scenarios/90_production_preset.spec.ts >> V7-P5: Snap to llama3_8b production scale in DimEnvEditor and validate through UI
-- Location: e2e/scenarios/90_production_preset.spec.ts:7:1
+- Name: e2e/scenarios/11_ui_to_train.spec.ts >> UI optimizer change to Muon propagates and produces weight delta
+- Location: e2e/scenarios/11_ui_to_train.spec.ts:175:1
 
 # Error details
 

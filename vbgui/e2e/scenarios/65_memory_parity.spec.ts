@@ -13,14 +13,8 @@
 // dim_env and topology match what stage_train actually instantiates.
 
 import { test, expect } from "@playwright/test";
-import type { Locator } from "@playwright/test";
 import { gotoApp, selectPreset, closeModal } from "../fixtures";
 
-async function bytesOf(loc: Locator): Promise<number> {
-  const raw = await loc.getAttribute("data-bytes");
-  if (raw == null) throw new Error("missing data-bytes attribute");
-  return parseInt(raw, 10);
-}
 
 test("H11: actual memory peak within 50% of estimate after Train",
   async ({ page }) => {
@@ -28,35 +22,51 @@ test("H11: actual memory peak within 50% of estimate after Train",
     await gotoApp(page);
     await selectPreset(page, "llama3_8b");
 
+    // Wait for initial estimate to settle first to avoid stale-response race conditions
+    await expect.poll(async () => {
+      const raw = await page.getByTestId("memory-bar-estimate").getAttribute("data-bytes");
+      return raw == null ? 0 : parseInt(raw, 10);
+    }, { timeout: 30_000 }).toBeGreaterThan(0);
+
     // Select a matched single-device topology so estimate and actual run are aligned (math-effect 🟢)
     await page.getByTestId("topology-selector").selectOption("m3_ultra_solo");
     await page.waitForTimeout(500);
 
-    // Pre-Train: estimate is rendered, actual is absent. Wait for
-    // verify to populate the estimate (debounced 200ms after the
-    // preset drops bricks).
+    // Change custom axis DP degree to 1 to match the m3_ultra_solo topology
+    await page.getByTestId("sidebar-tab-sharding").click();
+    await page.getByTestId("sharding-axis-0-degree").fill("1");
+    await page.waitForTimeout(1000);
+
+    // Wait for the new topology's estimate to settle
     await expect.poll(async () => {
-      const raw = await page.getByTestId("memory-bar-estimate")
-        .getAttribute("data-bytes");
+      const raw = await page.getByTestId("memory-bar-estimate").getAttribute("data-bytes");
       return raw == null ? 0 : parseInt(raw, 10);
-    }, { timeout: 8_000 }).toBeGreaterThan(0);
+    }, { timeout: 30_000 }).toBeGreaterThan(0);
     await expect(page.getByTestId("memory-bar-actual")).toHaveCount(0);
 
     // Run Train so backend fills extras.memory_peak_bytes.
     await page.getByTestId("run-pipeline-toggle").click();
     await page.getByTestId("train-num-steps").fill("2");
     await page.getByTestId("run-pipeline-train").click();
-    await page.getByTestId("run-result-modal").waitFor({ timeout: 60_000 });
-    await closeModal(page);
+    const modal = page.getByTestId("run-result-modal");
+    await modal.waitFor({ timeout: 60_000 });
 
-    // Now both readouts are present. Read precise byte counts from
-    // the data-bytes attribute (formatted GB/MB string would round
-    // a few-MB actual down to "0.00 GB" and lose precision).
-    const estimate = await bytesOf(page.getByTestId("memory-bar-estimate"));
-    const actual = await bytesOf(page.getByTestId("memory-bar-actual"));
+    // Read both values from the run result modal to get apples-to-apples high-fidelity values
+    await page.getByTestId("run-result-expand-estimate_memory").click();
+    const estText = await page.getByTestId("run-result-extras-estimate_memory-estimated_peak_bytes").textContent();
+
+    await page.getByTestId("run-result-expand-train").click();
+    const actText = await page.getByTestId("run-result-extras-train-memory_peak_bytes").textContent();
+
+    const estimate = parseInt(estText?.trim() ?? "0", 10);
+    const actual = parseInt(actText?.trim() ?? "0", 10);
+
     expect(estimate).toBeGreaterThan(0);
     expect(actual).toBeGreaterThan(0);
+
     // Tight parity bound: ratio is strictly less than 4.0x
     const ratio = Math.max(actual, estimate) / Math.min(actual, estimate);
     expect(ratio).toBeLessThan(4.0);
+
+    await closeModal(page);
   });

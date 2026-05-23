@@ -932,9 +932,21 @@ class HybridTinyLM(nn.Module):
             profile_name = getattr(block, "path_c_profile_brick_name", None)
             if profile_name is not None and profile_name not in logical_prefixes:
                 logical_prefixes.append(str(profile_name))
-            aliases[parameter_name] = tuple(
+            # Block A: accumulate candidates instead of overwriting so the
+            # same MLX parameter (e.g. ``layers.{i}.norm.weight``) can
+            # carry both its inter-brick bridge binding and its
+            # per-brick entry-RMSNorm binding. The in-region resolver
+            # picks the candidate that's actually present in the ABI map
+            # for the given brick.
+            new_candidates = tuple(
                 f"{prefix}_{logical_suffix}" for prefix in logical_prefixes
             )
+            existing = aliases.get(parameter_name, ())
+            merged = list(existing)
+            for candidate in new_candidates:
+                if candidate not in merged:
+                    merged.append(candidate)
+            aliases[parameter_name] = tuple(merged)
 
         def add(
             layer_index: int,
@@ -953,6 +965,21 @@ class HybridTinyLM(nn.Module):
             add_parameter(
                 f"layers.{index + 1}.norm.weight",
                 "residual_norm_weight",
+                block=block,
+            )
+
+        # Block A: every block also owns an "entry RMSNorm" candidate so the
+        # first in-region brick (whichever layer that ends up being) has its
+        # `layers.{i}.norm.weight` parameter routed into the fused region.
+        # The in-region resolver picks this candidate only when the
+        # corresponding `<brick>_entry_rmsnorm_weight` slot is actually
+        # present in the ABI map; for non-first-in-region bricks the
+        # bridge binding above wins because the bridge slot is the one
+        # that lands in the ABI.
+        for index, block in enumerate(self.layers):
+            add_parameter(
+                f"layers.{index}.norm.weight",
+                "entry_rmsnorm_weight",
                 block=block,
             )
 

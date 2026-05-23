@@ -129,7 +129,14 @@ _MAMBA3_FP8_TRAIN_RESIDUAL_RMSNORM_INPUTS = (
     "mamba3_residual_to_m2rnn_norm_weight",
     "m2rnn_residual_to_attention_norm_weight",
 )
+# Block A: the first brick of an in-region chain needs an eager pre-block
+# RMSNorm so the M-block consumes ``norm(hidden_entry)`` instead of raw
+# ``hidden_entry``. The acceptance fixture binds this weight via a shared
+# logical name so the existing M-only acceptance tests can route it as a
+# real ABI input alongside the inter-brick bridge weights.
+_MAMBA3_FP8_TRAIN_ENTRY_RMSNORM_INPUTS = ("mamba3_entry_rmsnorm_weight",)
 MAMBA3_FP8_TRAIN_REQUIRED_REAL_ABI_INPUTS = (
+    *_MAMBA3_FP8_TRAIN_ENTRY_RMSNORM_INPUTS,
     *_MAMBA3_REAL_ABI_INPUTS,
     *_MAMBA3_FP8_TRAIN_RESIDUAL_RMSNORM_INPUTS,
     *_M2RNN_REAL_ABI_INPUTS,
@@ -1395,6 +1402,47 @@ def _path_c_acceptance_fixture_surfaces_from_route_symbols(
     mamba_count = 0
     m2rnn_count = 0
     attention_count = 0
+    # Block A: emit the pre-first-brick entry RMSNorm before the route
+    # walker consumes the first symbol. The acceptance fixture binds
+    # this norm weight under a shared canonical logical name so the
+    # existing M-only ABI / region tests continue to round-trip.
+    first_symbol = normalized[0]
+    if first_symbol == "M":
+        entry_norm_name = (
+            "mamba3_entry_rmsnorm"
+            if shared_acceptance_abi
+            else "mamba3_scan_entry_rmsnorm"
+        )
+    elif first_symbol == "R":
+        entry_norm_name = (
+            "m2rnn_entry_rmsnorm"
+            if shared_acceptance_abi
+            else "m2rnn_packed_post_entry_rmsnorm"
+        )
+    else:
+        entry_norm_name = (
+            "attention_entry_rmsnorm"
+            if shared_acceptance_abi
+            else "attention_qkv_projection_entry_rmsnorm"
+        )
+    entry_norm_weight = (
+        f"{first_symbol.lower()}_entry_rmsnorm_weight"
+        # Shared acceptance ABI keeps the legacy mamba3-flavoured logical
+        # weight name so tests that lock the M-only acceptance contract do
+        # not need to know about per-symbol weight aliases.
+        if not shared_acceptance_abi or first_symbol != "M"
+        else "mamba3_entry_rmsnorm_weight"
+    )
+    entry_normed_hidden = f"{entry_norm_name}_hidden"
+    surfaces.append(
+        _entry_rmsnorm_surface(
+            name=entry_norm_name,
+            hidden=route_hidden,
+            norm_weight=entry_norm_weight,
+            normed_hidden=entry_normed_hidden,
+        )
+    )
+    route_hidden = entry_normed_hidden
     for index, symbol in enumerate(normalized):
         next_symbol = normalized[index + 1] if index + 1 < len(normalized) else ""
         if symbol == "M":
@@ -1587,6 +1635,26 @@ def _path_c_model_surfaces_from_bricks(
         residual_hidden=initial_hidden,
         route_hidden=initial_hidden,
     )
+    # Block A: the eager forward applies ``layers.{first_in_region}.norm``
+    # to the prefix output before the first in-region block consumes it.
+    # Mirror that contract by emitting an entry RMSNorm surface ahead of
+    # the first brick so the M-block (or R/A) reads the normalized
+    # hidden state. Keep ``residual_hidden`` pointing at the raw entry
+    # hidden state -- the bridge AFTER the first brick combines the raw
+    # hidden with the first brick's delta, matching the eager
+    # ``residual + delta`` accumulator.
+    first_brick = bricks[0]
+    entry_norm_name = f"{first_brick.name}_entry_rmsnorm"
+    entry_normed_hidden = f"{entry_norm_name}_hidden"
+    context.surfaces.append(
+        _entry_rmsnorm_surface(
+            name=entry_norm_name,
+            hidden=context.route_hidden,
+            norm_weight=f"{entry_norm_name}_weight",
+            normed_hidden=entry_normed_hidden,
+        )
+    )
+    context.route_hidden = entry_normed_hidden
     for index, brick in enumerate(bricks):
         lowerer = _path_c_model_brick_surface_lowerer_for(brick.route_symbol)
         if lowerer is None:
@@ -1802,6 +1870,32 @@ def _residual_norm_surface(
         op_name="residual_rmsnorm",
         inputs=(hidden, delta, norm_weight),
         outputs=(hidden_after, next_hidden),
+        backward="aot_autograd",
+    )
+
+
+def _entry_rmsnorm_surface(
+    *,
+    name: str,
+    hidden: str,
+    norm_weight: str,
+    normed_hidden: str,
+) -> FusionKernelSurface:
+    """Return the pre-block entry RMSNorm surface for the first in-region brick.
+
+    Unlike :func:`_residual_norm_surface`, this op does not fold a residual
+    add: the eager forward applies ``self.norm(hidden)`` immediately before
+    the first in-region block runs and uses the raw ``hidden`` as the
+    residual baseline downstream. The fused region mirrors that by emitting
+    a single-input RMSNorm whose output replaces ``route_hidden`` while
+    ``residual_hidden`` keeps pointing at the raw entry hidden state.
+    """
+
+    return FusionKernelSurface.path_c(
+        name=name,
+        op_name="entry_rmsnorm",
+        inputs=(hidden, norm_weight),
+        outputs=(normed_hidden,),
         backward="aot_autograd",
     )
 

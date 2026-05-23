@@ -9,7 +9,7 @@
 
 import { test, expect } from "@playwright/test";
 import {
-  gotoApp, selectPreset, clickRunPipeline, closeModal,
+  gotoApp, selectPreset, closeModal,
 } from "../fixtures";
 import { readTrainExtras } from "../utils/train_extras";
 
@@ -56,6 +56,19 @@ test("UI activation change (swiglu) lands in extras.model_summary", async ({
 test("UI linear_warmup w=4 reaches train as scheduled lr_trajectory", async ({
   page,
 }) => {
+  page.on("request", (req) => {
+    if (req.url().includes("/rpc")) {
+      console.log("RPC REQUEST:", req.postData());
+    }
+  });
+  page.on("response", async (res) => {
+    if (res.url().includes("/rpc")) {
+      try {
+        console.log("RPC RESPONSE:", await res.text());
+      } catch {}
+    }
+  });
+
   await gotoApp(page);
   await selectPreset(page, "llama3_8b");
 
@@ -65,7 +78,12 @@ test("UI linear_warmup w=4 reaches train as scheduled lr_trajectory", async ({
   await page.getByTestId("schedule-warmup-0").fill("4");
   await page.getByTestId("optim-apply").click();
 
-  await clickRunPipeline(page, "train");
+  // Run N=4 steps so that weight delta passes the backend's WeightsUnchanged check.
+  await page.getByTestId("run-pipeline-toggle").click();
+  await page.getByTestId("train-num-steps").fill("4");
+  await page.getByTestId("run-pipeline-train").click();
+  const modal = page.getByTestId("run-result-modal");
+  await modal.waitFor({ timeout: 60_000 });
   const extras = await readTrainExtras(page);
 
   // schedule_kind matches selection
