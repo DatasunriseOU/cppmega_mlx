@@ -48,6 +48,9 @@ from cppmega_v4.jsonrpc.ckpt_inspect_method import (
 from cppmega_v4.jsonrpc.dtype_cost_method import (
     DtypeCostParams, dtype_cost_estimate,
 )
+from cppmega_v4.jsonrpc.gen_run_method import (
+    GenRunParams, gen_run,
+)
 from cppmega_v4.jsonrpc.schema import (
     BuildPresetSpecsParams,
     CatalogExplainParams,
@@ -145,6 +148,10 @@ _ROUTES: Mapping[str, tuple[type[BaseModel], _Handler]] = {
     "dtype.cost_estimate": (
         DtypeCostParams,
         lambda p, c: dtype_cost_estimate(p, cache=c),
+    ),
+    "gen.run": (
+        GenRunParams,
+        lambda p, c: gen_run(p, cache=c),
     ),
 }
 

@@ -753,6 +753,7 @@ METHOD_REGISTRY: frozenset[str] = frozenset({
     "dtype.cost_estimate",
     "pipeline.pause",
     "pipeline.resume",
+    "gen.run",
 })
 
 
