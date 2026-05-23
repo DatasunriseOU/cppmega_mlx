@@ -2,6 +2,7 @@
 // button for optimizer/schedule entries.
 
 import { useCatalog } from "@/hooks/useCatalog";
+import { TENSOR_DIAGRAMS } from "./diagrams";
 import type { RpcClient } from "@/lib/rpc";
 
 export interface ExplainModalProps {
@@ -59,7 +60,8 @@ export function ExplainModal({
            onClick={(e) => e.stopPropagation()}
            style={{
              background: "white", borderRadius: 6, padding: 20,
-             width: 560, maxHeight: "85vh", overflowY: "auto",
+             width: 640, maxWidth: "92vw",
+             maxHeight: "85vh", overflowY: "auto",
            }}>
         <header style={{ display: "flex", justifyContent: "space-between",
                           alignItems: "center", marginBottom: 12 }}>
@@ -88,6 +90,21 @@ export function ExplainModal({
               <div style={LABEL}>Summary</div>
               <div data-testid="explain-modal-summary">{entry.summary}</div>
             </section>
+            {(() => {
+              // Tensor-flow diagram lookup — both prefix-namespaced
+              // keys (e.g. "brick_attention") and bare category+name
+              // pairs ("brick" + "attention") resolve through the same
+              // registry.
+              const key = `${category}_${name}`;
+              const Diag = TENSOR_DIAGRAMS[key];
+              return Diag ? (
+                <section style={SECTION}
+                          data-testid="explain-modal-diagram">
+                  <div style={LABEL}>Tensor flow</div>
+                  <Diag />
+                </section>
+              ) : null;
+            })()}
 
             <section style={SECTION}>
               <div style={LABEL}>When to use</div>

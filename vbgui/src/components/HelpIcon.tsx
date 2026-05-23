@@ -3,6 +3,7 @@
 // not gated on touching the component being explained.
 
 import { useState } from "react";
+import { TENSOR_DIAGRAMS } from "./diagrams";
 
 export interface HelpTopic {
   title: string;
@@ -947,8 +948,9 @@ export function HelpModal({ topic, onClose }: HelpModalProps): JSX.Element {
           border: "1px solid rgba(255, 255, 255, 0.1)",
           borderRadius: "12px",
           padding: "24px",
-          width: "520px",
-          maxHeight: "85vh",
+          width: "620px",
+          maxWidth: "92vw",
+          maxHeight: "88vh",
           overflowY: "auto",
           boxShadow: "0 20px 40px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(255, 255, 255, 0.05)",
           display: "flex",
@@ -1016,6 +1018,15 @@ export function HelpModal({ topic, onClose }: HelpModalProps): JSX.Element {
               <Section label="What" testid="help-modal-what">
                 {entry.what}
               </Section>
+              {(() => {
+                const Diag = TENSOR_DIAGRAMS[topic];
+                return Diag ? (
+                  <Section label="Tensor flow"
+                            testid="help-modal-diagram">
+                    <Diag />
+                  </Section>
+                ) : null;
+              })()}
               <Section label="Why" testid="help-modal-why">
                 {entry.why}
               </Section>
