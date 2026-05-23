@@ -46,6 +46,9 @@ from cppmega_v4.jsonrpc.ablation_method import (
 from cppmega_v4.jsonrpc.ckpt_inspect_method import (
     CkptInspectParams, ckpt_inspect,
 )
+from cppmega_v4.jsonrpc.ckpt_history_method import (
+    CkptListHistoryParams, ckpt_list_history,
+)
 from cppmega_v4.jsonrpc.dtype_cost_method import (
     DtypeCostParams, dtype_cost_estimate,
 )
@@ -175,6 +178,10 @@ _ROUTES: Mapping[str, tuple[type[BaseModel], _Handler]] = {
     "ckpt.inspect": (
         CkptInspectParams,
         lambda p, c: ckpt_inspect(p, cache=c),
+    ),
+    "ckpt.list_history": (
+        CkptListHistoryParams,
+        lambda p, c: ckpt_list_history(p, cache=c),
     ),
     "dtype.cost_estimate": (
         DtypeCostParams,

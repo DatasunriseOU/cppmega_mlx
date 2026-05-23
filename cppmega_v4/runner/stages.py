@@ -1895,6 +1895,46 @@ def stage_train(ctx: StageContext) -> StageResult:
                     val_losses.append(vL)
                 except Exception:
                     pass
+            # V7-Q03.4: drain mid-run checkpoint trigger queue. WS
+            # handler can request a save without aborting; we save via
+            # the same _save_compressed path as end-of-run + sidecar.
+            if abort_token is not None:
+                trig_path = consume_checkpoint_trigger(str(abort_token))
+                if trig_path:
+                    try:
+                        from cppmega_v4.runtime.checkpoint_quantize import (
+                            save_state_compressed as _save_mid,
+                        )
+                        mid_flat = dict(nn.utils.tree_flatten(
+                            all_modules.parameters()))
+                        mid_meta = _build_ckpt_metadata(
+                            ctx=ctx, optimizer_kind=optimizer_kind,
+                            n_steps=step + 1, lr=lr,
+                        )
+                        _save_mid(mid_flat, trig_path,
+                                  compress="none",
+                                  metadata=mid_meta,
+                                  role="weights")
+                        # Sidecar opt-state for full resumable bundle.
+                        try:
+                            import safetensors.mlx as _stmlx_mid
+                            mid_opt_flat = dict(nn.utils.tree_flatten(
+                                opt.state))
+                            mid_opt_arrays = {
+                                k: v for k, v in mid_opt_flat.items()
+                                if hasattr(v, "shape")
+                            }
+                            if hasattr(rng_key, "shape"):
+                                mid_opt_arrays["_rng_key"] = rng_key
+                            _stmlx_mid.save_file(
+                                mid_opt_arrays, trig_path + ".opt",
+                                metadata=mid_meta,
+                            )
+                        except Exception:
+                            pass
+                    except Exception:
+                        # Best-effort; don't fail the run on save error.
+                        pass
             if abort_token is not None and abort_token in _ABORT_TOKENS:
                 partial_delta = 0.0
                 if probe_key is not None and probe_before is not None:
@@ -2514,6 +2554,29 @@ def request_abort(token: str) -> None:
 
 def clear_abort(token: str) -> None:
     _ABORT_TOKENS.discard(token)
+
+
+# V7-Q03.4: in-process trigger-checkpoint queue. Caller (WS handler)
+# inserts `{abort_token: save_path}` and the train loop drains it on
+# the next step boundary, saving weights + opt-state sidecar via the
+# existing _save_compressed path. Live mid-run checkpointing without
+# affecting the post-train save_path.
+_TRIGGER_CHECKPOINT_QUEUE: dict[str, str] = {}
+
+
+def request_checkpoint(token: str, save_path: str) -> None:
+    """V7-Q03.4: queue a mid-run checkpoint for the named run.
+
+    The train loop polls _TRIGGER_CHECKPOINT_QUEUE between steps; when
+    it finds an entry keyed by the active abort_token, it saves to
+    save_path (and the sidecar `<save_path>.opt`) then pops the entry.
+    """
+    _TRIGGER_CHECKPOINT_QUEUE[token] = save_path
+
+
+def consume_checkpoint_trigger(token: str) -> str | None:
+    """Pop and return any pending checkpoint save_path for token."""
+    return _TRIGGER_CHECKPOINT_QUEUE.pop(token, None)
 
 
 _REWRITER_FACTORIES: dict[str, Callable[..., Any]] = {}

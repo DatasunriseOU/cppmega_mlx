@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import { MemoryBar } from "./MemoryBar";
+import { CheckpointHistoryDropdown } from "./CheckpointHistoryDropdown";
 import type { SpecState, TopologyFactory } from "@/state/spec";
+import type { RpcClient } from "@/lib/rpc";
 
 export type RunMode = "smoke" | "full" | "train";
 
@@ -44,7 +46,15 @@ export interface TopBarProps {
       inference_probe_text?: string;
       master_dtype?: "fp32" | "bf16" | "fp16" | "auto";
       fim_enabled?: boolean;
+      // V7-Q03.3: checkpoint write/load flags.
+      compress?: "none" | "weights-int8" | "opt-fp16" | "both";
+      ckpt_strict?: boolean;
+      opt_state_strict?: boolean;
     }) => void;
+  /** V7-Q03.2: optional rpc handle for ckpt.list_history dropdown.
+   *  When provided, TopBar renders a "history" picker next to the
+   *  ckpt-load-path input. */
+  rpc?: RpcClient | null;
   /** H02: toggle callbacks. */
   onMixedPrecisionChange?: (enabled: boolean) => void;
   onFp8EnabledChange?: (enabled: boolean) => void;
@@ -119,6 +129,12 @@ export function TopBar(p: TopBarProps): JSX.Element {
   // surfaces extras.train.fim_active + fim_ratio so the UI honest-closure
   // shows the FIM math actually fired.
   const [fimEnabled, setFimEnabled] = useState<boolean>(false);
+  // V7-Q03.3: checkpoint write/load knobs. Default "none" / unchecked
+  // preserves prior behaviour; advanced users opt in.
+  const [compress, setCompress] =
+    useState<"none" | "weights-int8" | "opt-fp16" | "both">("none");
+  const [ckptStrict, setCkptStrict] = useState<boolean>(false);
+  const [optStateStrict, setOptStateStrict] = useState<boolean>(false);
   // V7-C03: cached metadata for the current ckpt-load-path. Populated
   // by a 300ms-debounced ckpt.inspect call so the user sees arch_hash /
   // opt_kind / version before clicking Train with warm-start.
@@ -422,6 +438,49 @@ export function TopBar(p: TopBarProps): JSX.Element {
                        value={ckptLoadPath}
                        onChange={(e) => setCkptLoadPath(e.target.value)}
                        style={{ width: 200 }} />
+                {/* V7-Q03.2: history picker → fills ckpt-load-path. */}
+                {p.rpc && (
+                  <CheckpointHistoryDropdown
+                    rpc={p.rpc}
+                    directory="."
+                    onSelect={(path: string) => setCkptLoadPath(path)}
+                  />
+                )}
+              </label>
+              {/* V7-Q03.3: compress + strict toggles. */}
+              <label style={{ display: "flex", alignItems: "center",
+                              gap: 6 }}>
+                <span style={{ width: 78, color: "#6b7280" }}>compress:</span>
+                <select data-testid="train-opt-compress"
+                        value={compress}
+                        onChange={(e) =>
+                          setCompress(e.target.value as typeof compress)}
+                        style={{ width: 132 }}>
+                  <option value="none">none</option>
+                  <option value="weights-int8">weights-int8</option>
+                  <option value="opt-fp16">opt-fp16</option>
+                  <option value="both">both</option>
+                </select>
+              </label>
+              <label style={{ display: "flex", alignItems: "center",
+                              gap: 6 }}>
+                <input data-testid="train-opt-ckpt-strict" type="checkbox"
+                       checked={ckptStrict}
+                       onChange={(e) => setCkptStrict(e.target.checked)} />
+                <span style={{ color: "#6b7280" }}>
+                  ckpt_strict (arch-hash must match)
+                </span>
+              </label>
+              <label style={{ display: "flex", alignItems: "center",
+                              gap: 6 }}>
+                <input data-testid="train-opt-opt-state-strict"
+                       type="checkbox"
+                       checked={optStateStrict}
+                       onChange={(e) =>
+                         setOptStateStrict(e.target.checked)} />
+                <span style={{ color: "#6b7280" }}>
+                  opt_state_strict (skip on shape diff)
+                </span>
               </label>
               {ckptLoadPath && (
                 <div data-testid="ckpt-inspect-block"
@@ -535,7 +594,11 @@ export function TopBar(p: TopBarProps): JSX.Element {
                                          inference_probe_text:
                                            probeText || undefined,
                                          master_dtype: masterDtype,
-                                         fim_enabled: fimEnabled }); }}
+                                         fim_enabled: fimEnabled,
+                                         compress,
+                                         ckpt_strict: ckptStrict,
+                                         opt_state_strict: optStateStrict,
+                                       }); }}
                     // H22: disable while a Train is already running so
                     // double-clicks don't spawn a parallel pipeline.
                     disabled={!!p.trainDisabled || !!p.trainInFlight}

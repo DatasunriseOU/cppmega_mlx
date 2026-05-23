@@ -654,6 +654,12 @@ export function App(): JSX.Element {
       if (opts?.checkpoint_load_path) {
         trainOpts.checkpoint_load_path = opts.checkpoint_load_path;
       }
+      // V7-Q03.3: checkpoint compress + strict toggles.
+      if (opts?.compress && opts.compress !== "none") {
+        trainOpts.compress = opts.compress;
+      }
+      if (opts?.ckpt_strict) trainOpts.ckpt_strict = true;
+      if (opts?.opt_state_strict) trainOpts.opt_state_strict = true;
       // H08: forward inference probe text (G20). Backend pairs it with
       // tokenizer_path (also forwarded above) to encode real tokens for
       // the pre-vs-post forward divergence probe.
@@ -970,6 +976,7 @@ export function App(): JSX.Element {
           projectName={projectName}
           presets={PRESETS}
           topologies={activeTopologies}
+          rpc={rpc}
           filterByPlatform={filterByPlatform}
           onFilterByPlatformChange={setFilterByPlatform}
           activeDevice={platformInfo.active_device}
