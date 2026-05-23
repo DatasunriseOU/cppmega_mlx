@@ -80,6 +80,8 @@ from cppmega_v4.jsonrpc.schema import (
     VerifyParams,
     VerifyResult,
     WorstRankMemory,
+    PlatformGetInfoParams,
+    PlatformGetInfoResult,
 )
 
 
@@ -391,30 +393,6 @@ def verify(params: VerifyParams, *, cache: LRUCache | None = None) -> VerifyResu
     gotcha_payloads.extend(
         _side_channel_policy_gotchas(params.side_channels, available)
     )
-    # V7-L48: backend-owned recovery hints. The UI used to hardcode
-    # an AUTO_FIXABLE set of gotcha ids; here we let the backend say
-    # which ids have a one-click fix and what the button should say.
-    # Keeping the mapping backend-side means new gotchas ship with
-    # their recovery action without a UI release.
-    _SUGGESTED_FIX_BY_ID: dict[str, str] = {
-        "fsdp2_whole_compile":      "Switch compile_mode → regional",
-        "megatron_tp_whole_compile": "Switch compile_mode → regional",
-        "missing_edge":             "Insert missing edge",
-        "dim_mismatch":             "Adjust hidden_size to nearest valid",
-        "unknown_brick":            "Remove unknown brick",
-        "bad_dtype_combo":          "Reset dtype to bf16 master",
-        "schedule_out_of_range":    "Clamp schedule to valid range",
-        "tokenizer_mismatch":       "Pick MATRIX-compatible tokenizer",
-        "v7_f56b_dim_env_mismatch": "Snap H = nh*head_dim",
-    }
-    gotcha_payloads = [
-        g if g.suggested_fix is not None else GotchaPayload(
-            id=g.id, severity=g.severity, message=g.message,
-            reference=g.reference,
-            suggested_fix=_SUGGESTED_FIX_BY_ID.get(g.id),
-        )
-        for g in gotcha_payloads
-    ]
     # V7-F56b: surface the symbolic-dim mismatch as a gotcha so the
     # vbgui GotchasTab + per-brick badge render it without needing
     # a separate WS channel.
@@ -437,8 +415,34 @@ def verify(params: VerifyParams, *, cache: LRUCache | None = None) -> VerifyResu
                 "this almost always means the architect mis-pinned a "
                 "dim_env value."
             ),
-            reference=None,
+            reference="cppmega_v4/buildspec/diagnostics.py:283",
+            suggested_fix="Snap H = nh*head_dim",
         ))
+
+    # V7-L48: backend-owned recovery hints — for every gotcha whose
+    # suggested_fix wasn't already set by its source, look up a
+    # default from a single backend table. The UI's `onAutoFix`
+    # branches on the id alone, but this keeps the human label
+    # owned by the backend so adding a new gotcha doesn't require a
+    # vbgui release.
+    _SUGGESTED_FIX_BY_ID: dict[str, str] = {
+        "fsdp2_whole_compile":        "Switch compile_mode → regional",
+        "megatron_tp_whole_compile":  "Switch compile_mode → regional",
+        "missing_edge":               "Insert missing edge",
+        "dim_mismatch":               "Adjust hidden_size to nearest valid",
+        "unknown_brick":              "Remove unknown brick",
+        "bad_dtype_combo":            "Reset dtype to bf16 master",
+        "schedule_out_of_range":      "Clamp schedule to valid range",
+        "tokenizer_mismatch":         "Pick MATRIX-compatible tokenizer",
+    }
+    gotcha_payloads = [
+        g if g.suggested_fix is not None else GotchaPayload(
+            id=g.id, severity=g.severity, message=g.message,
+            reference=g.reference,
+            suggested_fix=_SUGGESTED_FIX_BY_ID.get(g.id),
+        )
+        for g in gotcha_payloads
+    ]
 
     edge_payloads: list[EdgeResolution] = []
     for re in resolved.edges:
@@ -662,3 +666,22 @@ def probe_run(params: ProbeRunParams, *, cache: LRUCache | None = None) -> Probe
     out = ProbeRunResult(**report_dict)
     _cache_store(cache, key, out)
     return out
+
+
+# ---------------------------------------------------------------------------
+# platform.get_info
+# ---------------------------------------------------------------------------
+
+
+def platform_get_info(
+    params: PlatformGetInfoParams, *, cache: LRUCache | None = None,
+) -> PlatformGetInfoResult:
+    """Identify the active accelerator platform, supported topologies, and backends."""
+    from cppmega_v4.runtime.platform_probe import probe_platform
+    info = probe_platform()
+    return PlatformGetInfoResult(
+        active_device=info["active_device"],
+        available_topologies=info["available_topologies"],
+        available_comm_backends=info["available_comm_backends"],
+    )
+

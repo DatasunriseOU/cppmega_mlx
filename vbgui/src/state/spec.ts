@@ -117,7 +117,12 @@ export interface GotchaState {
   id: string;
   severity: Severity;
   message: string;
+  // V7-L49: 'file:line' or doc anchor. UI splits the file portion
+  // out for a small chip and keeps the full string as link target.
   reference?: string;
+  // V7-L48: when set, a one-click 'Apply' button appears regardless
+  // of the legacy AUTO_FIXABLE hardcoded id list.
+  suggested_fix?: string;
 }
 
 export interface SpecState {

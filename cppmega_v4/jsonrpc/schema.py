@@ -795,9 +795,23 @@ METHOD_REGISTRY: frozenset[str] = frozenset({
     "pipeline.pause",
     "pipeline.resume",
     "gen.run",
-    "inspect.histogram",
     "side_channels.preview",
+    "platform.get_info",
 })
+
+
+class PlatformGetInfoParams(BaseModel):
+    """platform.get_info — query active platform capabilities."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class PlatformGetInfoResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    active_device: str
+    available_topologies: list[str] = Field(default_factory=list)
+    available_comm_backends: list[str] = Field(default_factory=list)
 
 
 class ArchitecturesListPresetsResult(BaseModel):

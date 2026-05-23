@@ -32,6 +32,17 @@ const COLOR: Record<GotchaState["severity"], string> = {
   info:    "#2563eb",
 };
 
+// V7-L50: card-background tints per severity. Border-left + header
+// color were already differentiated, but the body sat on a neutral
+// gray for all three — so WARNING blended visually with INFO. These
+// soft pastel tints make each severity readable at a glance without
+// being shouty.
+const BG_TINT: Record<GotchaState["severity"], string> = {
+  error:   "#fee2e2",
+  warning: "#fef3c7",
+  info:    "#dbeafe",
+};
+
 // V7-H01: extended auto-fix coverage for the 6 most common
 // validation gotchas. The App handler dispatches the corresponding
 // spec mutation when the user clicks the inline Apply-fix button.
@@ -56,6 +67,20 @@ const FIX_LABELS: Record<string, string> = {
   schedule_out_of_range:    "Clamp schedule to valid range",
   tokenizer_mismatch:       "Pick MATRIX-compatible tokenizer",
 };
+
+// V7-L49: pull a short 'file:line' chip out of the reference URL.
+// Supports common shapes:
+//   '/abs/path/file.py:123' → 'file.py:123'
+//   'cppmega_v4/foo/bar.py:42' → 'bar.py:42'
+//   'docs/plan.md#anchor' → 'plan.md#anchor'
+//   'https://github.com/.../file.py#L42' → 'file.py#L42'
+function parseSourceFile(ref: string | undefined): string | null {
+  if (!ref) return null;
+  // Strip leading path; keep last segment + optional :line / #anchor.
+  const last = ref.split("/").pop() ?? ref;
+  if (!last) return null;
+  return last;
+}
 
 function groupBySeverity(gs: GotchaState[]): Record<string, GotchaState[]> {
   const out: Record<string, GotchaState[]> = { error: [], warning: [], info: [] };
@@ -161,31 +186,79 @@ export function GotchasTab({
             <h4 style={{ margin: "0 0 4px", color: COLOR[sev] }}>
               {sev.toUpperCase()}
             </h4>
-            {grouped[sev].map((g) => (
+            {grouped[sev].map((g) => {
+              const sourceFile = parseSourceFile(g.reference);
+              // V7-L48: prefer backend-provided suggested_fix over the
+              // hardcoded legacy AUTO_FIXABLE/FIX_LABELS pair.
+              const fixLabel = g.suggested_fix
+                            ?? FIX_LABELS[g.id]
+                            ?? null;
+              const showFix = onAutoFix && fixLabel !== null
+                            && (g.suggested_fix !== undefined
+                               || AUTO_FIXABLE.has(g.id));
+              return (
               <div key={g.id} data-testid={`gotcha-${g.id}`}
-                   style={{ background: "#f9fafb",
+                   data-severity={sev}
+                   style={{ background: BG_TINT[sev],
                             borderLeft: `4px solid ${COLOR[sev]}`,
                             padding: "6px 8px", marginBottom: 4,
                             borderRadius: 3 }}>
-                <div style={{ fontWeight: 600 }}>{g.id}</div>
+                <div style={{ display: "flex", alignItems: "center",
+                              gap: 6 }}>
+                  <span data-testid={`gotcha-${g.id}-id`}
+                        style={{ fontWeight: 600 }}>{g.id}</span>
+                  <span data-testid={`gotcha-${g.id}-severity`}
+                        style={{ background: COLOR[sev], color: "#fff",
+                                 padding: "1px 6px", borderRadius: 9999,
+                                 fontSize: 9, textTransform: "uppercase",
+                                 letterSpacing: 0.4 }}>
+                    {sev}
+                  </span>
+                </div>
                 <div style={{ color: "#374151" }}>{g.message}</div>
+                {sourceFile && (
+                  <span data-testid={`gotcha-${g.id}-source`}
+                        title={g.reference}
+                        style={{ display: "inline-block", marginRight: 6,
+                                 fontFamily: "monospace", fontSize: 10,
+                                 color: "#374151",
+                                 background: "rgba(255,255,255,0.6)",
+                                 border: "1px solid #d1d5db",
+                                 borderRadius: 3, padding: "0 4px" }}>
+                    src: {sourceFile}
+                  </span>
+                )}
                 {g.reference && (
                   <a data-testid={`gotcha-${g.id}-ref`}
-                     href={g.reference}
+                     href={g.reference.startsWith("http")
+                       ? g.reference : `#${g.reference}`}
                      target="_blank" rel="noreferrer"
                      style={{ color: "#2563eb", fontSize: 11 }}>
                     {g.reference}
                   </a>
                 )}
-                {onAutoFix && AUTO_FIXABLE.has(g.id) && (
+                {showFix && (
                   <button data-testid={`gotcha-${g.id}-autofix`}
-                          onClick={() => onAutoFix(g.id)}
-                          title={FIX_LABELS[g.id] ?? "Auto-fix"}>
-                    {FIX_LABELS[g.id] ?? "Auto-fix"}
+                          onClick={() => onAutoFix!(g.id)}
+                          title={fixLabel ?? "Auto-fix"}
+                          style={{ display: "block", marginTop: 4 }}>
+                    {fixLabel ?? "Auto-fix"}
                   </button>
                 )}
+                {g.suggested_fix !== undefined && !showFix && (
+                  // backend wants the fix but host didn't pass onAutoFix
+                  // — still surface the hint so the architect knows what
+                  // would happen.
+                  <span data-testid={`gotcha-${g.id}-fix-hint`}
+                        style={{ display: "block", marginTop: 4,
+                                 color: "#6b7280", fontSize: 11,
+                                 fontStyle: "italic" }}>
+                    suggested fix: {g.suggested_fix}
+                  </span>
+                )}
               </div>
-            ))}
+              );
+            })}
           </section>
         ) : null,
       )}
