@@ -63,12 +63,33 @@ def catalog_list_options(
     *,
     cache: LRUCache | None = None,
 ) -> CatalogListOptionsResult:
-    """Return compact summaries for every entry in ``params.category``."""
+    """Return compact summaries for every entry in ``params.category``.
+
+    Special category ``compatible_edges`` (V7-E-AUDIT-02): returns one
+    option per (src_kind, dst_kind) pair where the shape contracts
+    indicate the edge is well-typed. Each option's ``name`` is
+    ``"src_kind->dst_kind"``, ``summary`` is ``dst_kind``, and
+    ``paper_ref`` is ``src_kind`` so the UI can split with a single
+    str.split('->').
+    """
     cache_key = ("catalog.list_options", params.category)
     if cache is not None:
         hit = cache.get(cache_key)
         if hit is not None:
             return hit  # type: ignore[return-value]
+
+    if params.category == "compatible_edges":
+        from cppmega_v4.spec.shape_contract import compatible_edges
+        pairs = compatible_edges()
+        result = CatalogListOptionsResult(options=[
+            CatalogOptionSummary(
+                name=f"{src}->{dst}", summary=dst, paper_ref=src,
+            )
+            for src, dst in pairs
+        ])
+        if cache is not None:
+            cache.set(cache_key, result)
+        return result
 
     entries = list_options(params.category)
     result = CatalogListOptionsResult(options=[

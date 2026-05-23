@@ -28,6 +28,8 @@ import { DataInspector } from "@/components/DataInspector";
 import { BrickContextPanel } from "@/components/BrickContextPanel";
 import { LiveTrainPanel } from "@/components/LiveTrainPanel";
 import { useLiveTrainStream } from "@/hooks/useLiveTrainStream";
+import { useCompatibleEdges, makeIsValidConnection }
+  from "@/hooks/useCompatibleEdges";
 import { useVerifyStream, computeSpecHash } from "@/hooks/useVerifyStream";
 
 import { useRpc } from "@/hooks/useRpc";
@@ -196,6 +198,22 @@ export function App(): JSX.Element {
   // list that was missing 5 architectures. V7-H47: refetch on backend
   // build_id change so a restart with new presets propagates to UI.
   const PRESETS = usePresets(rpc, backendBuildId);
+
+  // V7-E-AUDIT-02: compatible (src_kind, dst_kind) pairs from
+  // catalog.list_options('compatible_edges'). FlowCanvas consults the
+  // resulting predicate to reject incompatible drags client-side.
+  const compatibleEdgePairs = useCompatibleEdges(rpc);
+  const isValidConnection = useCallback(
+    makeIsValidConnection(
+      compatibleEdgePairs,
+      (nodeId: string) => {
+        const n = nodes.find((nn) => nn.id === nodeId);
+        const data = n?.data as { kind?: string } | undefined;
+        return data?.kind ?? null;
+      },
+    ),
+    [compatibleEdgePairs, nodes],
+  );
 
   // V7-F56b / V7-F53: editable dim_env (was a constant MINI_DIM_ENV).
   // Threaded into the verify trigger so changes to H/nh/head_dim
@@ -1215,6 +1233,7 @@ export function App(): JSX.Element {
                   onConnect={handleConnect}
                   onDropBrick={handleDropBrick}
                   onNodeClick={setSelectedBrickId}
+                  isValidConnection={isValidConnection}
                 />
               </div>
               {selectedBrickId && (() => {

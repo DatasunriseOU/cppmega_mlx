@@ -547,10 +547,39 @@ def registered_kinds() -> tuple[str, ...]:
     return tuple(sorted(_CONTRACTS.keys()))
 
 
+def compatible_edges() -> tuple[tuple[str, str], ...]:
+    """V7-E-AUDIT-02: enumerate (src_kind, dst_kind) pairs that the
+    shape-contract layer considers well-typed.
+
+    Rule: edge is compatible iff src declares at least one output AND
+    dst declares at least one input. cppmega bricks use a canonical
+    ``x → y`` channel naming convention; every transformer-block brick
+    can feed every other at the contract layer. Numerical compatibility
+    (dim_env, head_dim, ...) is enforced separately by
+    ``verify_and_estimate``; this helper answers the UI's coarse
+    'can I drop an edge here' question to reject obvious mis-wiring
+    (e.g. dropping an edge into a brick with no inputs).
+    Opaque-shape bricks are universally compatible.
+    """
+    pairs: list[tuple[str, str]] = []
+    kinds = sorted(_CONTRACTS.keys())
+    for src in kinds:
+        src_c = _CONTRACTS[src]
+        for dst in kinds:
+            dst_c = _CONTRACTS[dst]
+            if src_c.opaque_shape or dst_c.opaque_shape:
+                pairs.append((src, dst))
+                continue
+            if src_c.outputs and dst_c.inputs:
+                pairs.append((src, dst))
+    return tuple(pairs)
+
+
 __all__ = [
     "BrickShapeContract",
     "ResolveError",
     "ShapeExpr",
+    "compatible_edges",
     "contract_for",
     "register_contract",
     "registered_kinds",
