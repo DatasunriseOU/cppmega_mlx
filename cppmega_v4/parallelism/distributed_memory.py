@@ -41,7 +41,6 @@ from dataclasses import dataclass, field
 from typing import Final
 
 from cppmega_v4.buildspec import ModelBuildSpec
-from cppmega_v4.buildspec.loss_spec import LossKind
 from cppmega_v4.buildspec.optim_spec import OptimKind
 from cppmega_v4.parallelism.sharding_spec import (
     ParallelismKind,
@@ -361,7 +360,7 @@ def estimate_distributed_memory(
     fsdp_div     = _fsdp_steady_state_divisor(sharding)
     optim_div    = _optim_shard_divisor(sharding)
     grad_div     = _grad_shard_divisor(sharding)
-    ep_div       = max(_aggregate_degree(sharding, ParallelismKind.EP), 1)
+    max(_aggregate_degree(sharding, ParallelismKind.EP), 1)
 
     # 3) Per-rank component byte counts.
     base_weights = int(baseline.weights_bytes * shard_factor)

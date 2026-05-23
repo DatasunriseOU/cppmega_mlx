@@ -11,7 +11,7 @@ Returns a one-word verdict + an optional exception trace. Never raises.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Literal
 
 import mlx.core as mx
 

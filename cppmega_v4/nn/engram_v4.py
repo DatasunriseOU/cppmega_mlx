@@ -16,7 +16,7 @@ from learning n-gram associations across document boundaries (which would
 leak across our parquet batches).
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 import mlx.core as mx

@@ -57,7 +57,6 @@ API surface
 from __future__ import annotations
 
 import threading
-import types
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, cast

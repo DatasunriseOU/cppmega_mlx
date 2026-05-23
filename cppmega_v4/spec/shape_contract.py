@@ -260,7 +260,8 @@ _LIGHTNING_INDEXER_CONTRACT = BrickShapeContract(
 
 # --- standard SDPA attention family --------------------------------------
 
-_SDPA_BASE = lambda extra_params="0": BrickShapeContract(
+def _SDPA_BASE(extra_params="0"):
+    return BrickShapeContract(
     inputs={"x": _bsh()},
     outputs={"y": _bsh()},
     # q + k + v + o projections; GQA shrinks kv to nkv heads

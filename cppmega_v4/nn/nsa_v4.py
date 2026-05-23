@@ -29,7 +29,6 @@ keep using ``NativeSparseAttention``; the new real impl lives under
 """
 
 from dataclasses import dataclass
-from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -137,7 +136,7 @@ def _select_branch(
     match = (top_idx[..., :, None] == all_blocks[..., None, :])  # [B,H,S,topk,n_blocks]
     block_one_hot = match.any(axis=-2)                            # [B,H,S,n_blocks]
     # Expand each block to its token span (block_size repeats).
-    S_kv = n_blocks * block_size
+    n_blocks * block_size
     tok_mask = mx.repeat(block_one_hot, block_size, axis=-1)      # [B,H,S,S_kv]
     # Trim to the original S (post-padding) — caller passed padded K/V.
     tok_mask = tok_mask[..., :k.shape[2]]

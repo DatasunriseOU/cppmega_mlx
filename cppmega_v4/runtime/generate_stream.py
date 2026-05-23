@@ -8,9 +8,8 @@ collector form `collect_stream(...)` returns the same finish_reason
 
 from __future__ import annotations
 
-from typing import Callable, Iterator, Literal
+from typing import Callable, Literal
 
-from cppmega_v4.runtime.generate import generate_until_eos
 
 FinishReason = Literal["eos", "length"]
 

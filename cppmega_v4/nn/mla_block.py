@@ -146,7 +146,6 @@ class MLABlock(nn.Module):
             return
         cfg = self.config
         H = cfg.num_heads
-        D = cfg.hidden_size
         # wkv_b: [r_kv, H*(nope + v_head_dim)] → split into W_UK [H, r_kv, nope]
         # and W_UV [H, r_kv, v_head_dim].
         w = self.wkv_b.weight   # [H*(nope+v), r_kv]

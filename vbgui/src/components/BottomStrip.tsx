@@ -40,10 +40,11 @@ export function BottomStrip({
   return (
     <footer data-testid="bottom-strip"
             style={{ height: 32, display: "flex", alignItems: "center",
-                     gap: 16, padding: "0 12px",
-                     borderTop: "1px solid #e5e7eb",
-                     background: "#f9fafb",
-                     fontFamily: "system-ui, sans-serif", fontSize: 11 }}>
+                     gap: 16, padding: "0 14px",
+                     borderTop: "1px solid var(--vb-border)",
+                     background: "var(--vb-surface)",
+                     color: "var(--vb-text-secondary)",
+                     fontFamily: "var(--vb-font)", fontSize: 11 }}>
       {state.backend_status === "reconnecting" && (
         <span data-testid="bottom-strip-reconnecting"
               style={{ display: "none" }}>reconnecting</span>
@@ -96,14 +97,14 @@ export function BottomStrip({
       {activeDevice && (
         <span data-testid="platform-indicator"
               style={{ display: "inline-flex", alignItems: "center", gap: 4,
-                       color: "#4f46e5", fontWeight: 600, textTransform: "uppercase" }}>
+                       color: "var(--vb-info)", fontWeight: 600, textTransform: "uppercase" }}>
           Platform: {activeDevice}
         </span>
       )}
       {backendBuildId && (
         <span data-testid="backend-build-id"
               title={`Backend build id: ${backendBuildId}`}
-              style={{ fontFamily: "monospace", color: "#6b7280" }}>
+              style={{ fontFamily: "var(--vb-font-mono)", color: "var(--vb-text-muted)" }}>
           build {backendBuildId}
         </span>
       )}

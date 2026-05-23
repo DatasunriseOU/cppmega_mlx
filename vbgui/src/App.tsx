@@ -872,6 +872,18 @@ export function App(): JSX.Element {
         "mistral_small_3_1": { H: 4096, layers: 32, tokenizer: "mistral_tiktoken" },
         "gpt2_xl": { H: 1600, layers: 48, tokenizer: "gpt2_tiktoken" },
         "xlstm_7b": { H: 4096, layers: 36, tokenizer: "xlstm_custom" },
+        "deepseek_v4_flash": { H: 2048, layers: 16, tokenizer: "llama3_tiktoken" },
+        "deepseek_v3": { H: 4096, layers: 32, tokenizer: "llama3_tiktoken" },
+        "gemma4": { H: 2048, layers: 24, tokenizer: "llama3_tiktoken" },
+        "mistral4": { H: 4096, layers: 32, tokenizer: "mistral_tiktoken" },
+        "ling26": { H: 2048, layers: 24, tokenizer: "gpt2_tiktoken" },
+        "kimi_linear": { H: 3072, layers: 28, tokenizer: "gpt2_tiktoken" },
+        "kimi_k2": { H: 3072, layers: 28, tokenizer: "gpt2_tiktoken" },
+        "longcat": { H: 2048, layers: 24, tokenizer: "gpt2_tiktoken" },
+        "nemotron3": { H: 3072, layers: 28, tokenizer: "gpt2_tiktoken" },
+        "zaya1": { H: 2048, layers: 24, tokenizer: "gpt2_tiktoken" },
+        "arcee_trinity": { H: 2048, layers: 24, tokenizer: "gpt2_tiktoken" },
+        "qwen3_next": { H: 2048, layers: 24, tokenizer: "gpt2_tiktoken" },
       };
       
       const defaults = PRESET_CANONICAL_DEFAULTS[name] || { H: 2048, layers: 12, tokenizer: "gpt2_tiktoken" };
@@ -1035,10 +1047,7 @@ export function App(): JSX.Element {
 
   const handlePresetSelect = useCallback(async (name: string) => {
     const isTest = typeof process !== "undefined" && process.env.NODE_ENV === "test";
-    const raschkaPresets = [
-      "llama3_8b", "llama3_2_1b", "llama3_2_3b", "smollm3", "phi4", "mistral_small_3_1", "gpt2_xl", "xlstm_7b"
-    ];
-    if (raschkaPresets.includes(name) && !isTest) {
+    if (!isTest) {
       setWizardPreset(name);
     } else {
       await handlePresetDrop(name);
@@ -1651,6 +1660,22 @@ export function App(): JSX.Element {
                   activeRunId={trainRunId}
                   onScheduleCheckpoint={(path) =>
                     setPendingCheckpointTrigger(path)}
+                  activeLayoutState={{
+                    projectName,
+                    nodes,
+                    edges,
+                    spec,
+                    dimEnv,
+                    trainOptions,
+                  }}
+                  onLoadLayout={(layout: any) => {
+                    if (layout.projectName) setProjectName(layout.projectName);
+                    if (layout.nodes) setNodes(layout.nodes);
+                    if (layout.edges) setEdges(layout.edges);
+                    if (layout.spec) dispatch({ type: "spec.replace", spec: layout.spec });
+                    if (layout.dimEnv) setDimEnv(layout.dimEnv);
+                    if (layout.trainOptions) setTrainOptions(layout.trainOptions);
+                  }}
                 />
                 <ParallelComposeBar
                   onCompose={(composeNodes, composeEdges) => {

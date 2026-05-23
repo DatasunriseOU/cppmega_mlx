@@ -1583,7 +1583,6 @@ def _bench_stage2_q_hoist_wave5(
     reason}`` when prerequisites are missing.
     """
 
-    import time
 
     ok, msg = _tilelang_available()
     if not ok:

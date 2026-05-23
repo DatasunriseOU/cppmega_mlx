@@ -1487,7 +1487,7 @@ def _canonicalize_bwd_path_b_hot_loops(
 ) -> str:
     """Make backward hot loops match the hand-written Path B MSL shape."""
 
-    threads = _threadgroup_size(topk)
+    _threadgroup_size(topk)
     kv_base = "uint kv_row_base = kv_b_base + (uint(gather_idx) * kv_group + g) * qk_dim;"
     msl = msl.replace(
         (

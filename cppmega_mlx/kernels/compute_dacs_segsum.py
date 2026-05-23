@@ -32,7 +32,7 @@ def compute_dacs_segsum(dt: mx.array, A: mx.array, *,
     prod = dt32 * A32                # (B, T, H)
     # Build chunked cumulative sum: each chunk restarts.
     n_chunks = (T + chunk_size - 1) // chunk_size
-    out = mx.zeros((B, T, H), dtype=mx.float32)
+    mx.zeros((B, T, H), dtype=mx.float32)
     out_list = []
     for c in range(n_chunks):
         start = c * chunk_size

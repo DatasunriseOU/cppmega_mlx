@@ -62,7 +62,7 @@ export function ParallelComposeBar({
                   padding: "4px 8px", background: "#fdf4ff",
                   borderBottom: "1px solid #e9d5ff",
                   fontFamily: "system-ui, sans-serif", fontSize: 12 }}>
-      <strong>Parallel composition</strong>
+      <strong style={{ color: "#0f172a" }}>Parallel composition</strong>
       <HelpIcon topic="parallel_block" />
       <button data-testid="parallel-compose-tiny-aya"
               onClick={() => {

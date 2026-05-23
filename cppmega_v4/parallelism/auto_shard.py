@@ -24,11 +24,9 @@ worst). Proposals that would never fit on the topology are filtered out.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Iterable
 
 from cppmega_v4.buildspec import ModelBuildSpec
 from cppmega_v4.parallelism.distributed_memory import (
-    DistributedMemoryReport,
     estimate_distributed_memory,
 )
 from cppmega_v4.parallelism.gotcha_checker import (

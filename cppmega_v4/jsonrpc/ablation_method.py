@@ -10,7 +10,6 @@ Used by the Ablations sidebar tab to show 'replace swiglu with gelu →
 
 from __future__ import annotations
 
-import copy
 import time
 from typing import Any, Literal
 

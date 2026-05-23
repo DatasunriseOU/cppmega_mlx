@@ -22,13 +22,11 @@ through the bf16 master (covered by
 ``tests/v4/test_moe_fp8.py::test_fp8_fwd_with_bf16_master_weight_training_step``).
 """
 
-from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from cppmega_v4._tilelang.fused_fp8_gemm import fused_fp8_gemm
-from cppmega_v4.nn._external._mlx_lm_fp8_dequant_vendored import dequant_block_fp8
 
 _BLOCK = 128
 

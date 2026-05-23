@@ -21,12 +21,12 @@ GUI workflow test in tests/v4/test_vbspec_stage_e.py enforces this.
 from __future__ import annotations
 
 import time
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
 from cppmega_v4.fusion import FusionRegionPlan, plan_fusion_regions
-from cppmega_v4.fusion.brick_graph import BrickGraph, BrickNode
+from cppmega_v4.fusion.brick_graph import BrickGraph
 from cppmega_v4.spec.adapters import (
     AdapterSuggestion,
     suggest_adapter_chain,

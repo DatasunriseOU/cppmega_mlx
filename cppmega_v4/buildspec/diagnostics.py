@@ -25,9 +25,7 @@ from typing import Iterable
 
 from cppmega_v4.buildspec.model_build_spec import (
     ModelBuildSpec,
-    RewriteOrderError,
 )
-from cppmega_v4.buildspec.optim_spec import ParamGroup
 
 
 class BuildDiagnosticSeverity(str, Enum):

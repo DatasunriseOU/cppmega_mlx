@@ -38,7 +38,7 @@ single-Mac training paths are untouched.
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn

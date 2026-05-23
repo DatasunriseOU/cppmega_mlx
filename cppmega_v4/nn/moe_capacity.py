@@ -15,7 +15,6 @@ can adopt it incrementally without touching the autograd path.
 from __future__ import annotations
 
 import math
-from typing import Iterable
 
 
 def compute_drop_reroute_stats(

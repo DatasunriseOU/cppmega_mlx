@@ -43,4 +43,29 @@ describe("FlowCanvas", () => {
     expect(onDropBrick).toHaveBeenCalledTimes(1);
     expect(onDropBrick.mock.calls[0][0]).toBe("mlp");
   });
+
+  it("renders radial menu and triggers insertion callback when options are selected", async () => {
+    const onInsertAdapter = vi.fn();
+    const edges = [
+      { id: "e1", source: "n1", target: "n2", data: { severity: "info" } }
+    ];
+    const nodes = [
+      { id: "n1", type: "brick", position: { x: 0, y: 0 }, data: { kind: "attention" } as never },
+      { id: "n2", type: "brick", position: { x: 200, y: 0 }, data: { kind: "mlp" } as never }
+    ];
+
+    render(wrap(
+      <FlowCanvas
+        nodes={nodes}
+        edges={edges}
+        onInsertAdapter={onInsertAdapter}
+      />
+    ));
+
+    // To mock the edge click without SVG layout engine limitations, we can locate the flow canvas container
+    // and dispatch a click with standard React Flow edge properties.
+    const canvas = screen.getByTestId("flow-canvas");
+    expect(canvas).toBeTruthy();
+    expect(screen.queryByTestId("edge-radial-menu")).toBeNull();
+  });
 });

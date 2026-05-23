@@ -14,7 +14,6 @@ from __future__ import annotations
 from dataclasses import asdict
 from typing import Any, Mapping
 
-from cppmega_v4.buildspec.loss_spec import LossKind
 from cppmega_v4.probe.alternatives import Alternative
 from cppmega_v4.probe.capabilities import (
     ColumnSpec,

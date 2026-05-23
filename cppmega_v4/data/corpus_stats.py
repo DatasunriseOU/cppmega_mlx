@@ -11,7 +11,6 @@ clang_enriched_to_parquet.py writes a shard.
 
 from __future__ import annotations
 
-import bisect
 from collections import Counter
 from typing import Iterable
 

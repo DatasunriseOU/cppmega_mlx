@@ -19,7 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from cppmega_v4.runtime.generate_stream import collect_stream
 from cppmega_v4.runtime.samplers import (
-    beam_step, greedy, top_k_sample, top_p_sample,
+    top_k_sample, top_p_sample,
 )
 
 

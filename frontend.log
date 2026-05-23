@@ -1,0 +1,63 @@
+
+> @cppmega/visual-builder@0.1.0 dev
+> vite
+
+
+  VITE v5.4.21  ready in 124 ms
+
+  ➜  Local:   http://localhost:5173/
+  ➜  Network: use --host to expose
+8:03:22 PM [vite] hmr update /src/components/HelpIcon.tsx
+8:03:22 PM [vite] hmr invalidate /src/components/HelpIcon.tsx Could not Fast Refresh ("HELP_TOPICS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+8:03:22 PM [vite] hmr update /src/components/ParallelComposeBar.tsx, /src/components/LossSurfaceModal.tsx, /src/components/TransplantBar.tsx, /src/components/TokenizerMatrixTab.tsx, /src/components/RunHistoryPicker.tsx, /src/components/TrainOptionsPanel.tsx, /src/components/SweepPanel.tsx, /src/components/InsertIntoEdgeBar.tsx, /src/components/GenerationPanel.tsx, /src/components/DimEnvEditor.tsx, /src/components/TrainLiveControls.tsx, /src/components/TrainExtrasOverlay.tsx, /src/components/ErrorDetailsPanel.tsx
+8:03:23 PM [vite] hmr invalidate /src/components/DimEnvEditor.tsx Could not Fast Refresh ("DIM_ENV_PRESETS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+8:03:23 PM [vite] hmr update /src/App.tsx
+8:03:45 PM [vite] hmr update /src/components/HelpIcon.tsx
+8:03:45 PM [vite] hmr invalidate /src/components/HelpIcon.tsx Could not Fast Refresh ("HELP_TOPICS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+8:03:45 PM [vite] hmr update /src/components/ParallelComposeBar.tsx, /src/components/LossSurfaceModal.tsx, /src/components/TransplantBar.tsx, /src/components/TokenizerMatrixTab.tsx, /src/components/RunHistoryPicker.tsx, /src/components/TrainOptionsPanel.tsx, /src/components/SweepPanel.tsx, /src/components/InsertIntoEdgeBar.tsx, /src/components/GenerationPanel.tsx, /src/components/DimEnvEditor.tsx, /src/components/TrainLiveControls.tsx, /src/components/TrainExtrasOverlay.tsx, /src/components/ErrorDetailsPanel.tsx
+8:03:46 PM [vite] hmr invalidate /src/components/DimEnvEditor.tsx Could not Fast Refresh ("DIM_ENV_PRESETS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+8:03:46 PM [vite] hmr update /src/App.tsx
+8:05:48 PM [vite] hmr update /src/components/HelpIcon.tsx
+8:05:49 PM [vite] hmr invalidate /src/components/HelpIcon.tsx Could not Fast Refresh ("HELP_TOPICS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+8:05:49 PM [vite] hmr update /src/components/ParallelComposeBar.tsx, /src/components/LossSurfaceModal.tsx, /src/components/TransplantBar.tsx, /src/components/TokenizerMatrixTab.tsx, /src/components/RunHistoryPicker.tsx, /src/components/TrainOptionsPanel.tsx, /src/components/SweepPanel.tsx, /src/components/InsertIntoEdgeBar.tsx, /src/components/GenerationPanel.tsx, /src/components/DimEnvEditor.tsx, /src/components/TrainLiveControls.tsx, /src/components/TrainExtrasOverlay.tsx, /src/components/ErrorDetailsPanel.tsx
+8:05:49 PM [vite] hmr invalidate /src/components/DimEnvEditor.tsx Could not Fast Refresh ("DIM_ENV_PRESETS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+8:05:49 PM [vite] hmr update /src/App.tsx
+8:05:59 PM [vite] hmr update /src/components/Palette.tsx
+8:06:10 PM [vite] hmr update /src/components/Palette.tsx
+8:06:19 PM [vite] hmr update /src/components/Palette.tsx
+8:08:35 PM [vite] hmr update /src/components/MemoryBar.tsx
+8:09:12 PM [vite] hmr update /src/components/TopBar.tsx
+8:12:39 PM [vite] hmr update /src/components/FlowCanvas.tsx
+8:12:50 PM [vite] hmr update /src/components/FlowCanvas.tsx
+8:12:59 PM [vite] hmr update /src/App.tsx
+8:13:08 PM [vite] hmr update /src/App.tsx
+8:13:24 PM [vite] hmr update /src/App.tsx
+8:13:45 PM [vite] hmr update /src/App.tsx
+8:13:57 PM [vite] hmr update /src/App.tsx
+8:14:08 PM [vite] hmr update /src/App.tsx
+8:14:54 PM [vite] hmr update /src/theme.css
+8:15:21 PM [vite] hmr update /src/components/TransplantBar.tsx
+8:15:46 PM [vite] hmr update /src/components/ParallelComposeBar.tsx
+8:16:10 PM [vite] hmr update /src/components/InsertIntoEdgeBar.tsx
+8:16:40 PM [vite] hmr update /src/components/FeatureInjectionBar.tsx
+8:17:30 PM [vite] hmr update /src/components/LLMGalleryWizardModal.tsx
+8:17:54 PM [vite] hmr update /src/App.tsx
+8:18:18 PM [vite] hmr update /src/App.tsx
+8:18:39 PM [vite] hmr update /src/App.tsx
+8:25:17 PM [vite] hmr update /src/components/HelpIcon.tsx
+8:25:17 PM [vite] hmr invalidate /src/components/HelpIcon.tsx Could not Fast Refresh ("HELP_TOPICS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+8:25:17 PM [vite] hmr update /src/components/ParallelComposeBar.tsx, /src/components/LossSurfaceModal.tsx, /src/components/TransplantBar.tsx, /src/components/TokenizerMatrixTab.tsx, /src/components/RunHistoryPicker.tsx, /src/components/TrainOptionsPanel.tsx, /src/components/SweepPanel.tsx, /src/components/InsertIntoEdgeBar.tsx, /src/components/GenerationPanel.tsx, /src/components/DimEnvEditor.tsx, /src/components/TrainLiveControls.tsx, /src/components/TrainExtrasOverlay.tsx, /src/components/ErrorDetailsPanel.tsx, /src/components/Palette.tsx
+8:25:17 PM [vite] hmr invalidate /src/components/DimEnvEditor.tsx Could not Fast Refresh ("DIM_ENV_PRESETS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+8:25:17 PM [vite] hmr update /src/App.tsx
+8:26:19 PM [vite] hmr update /src/components/BottomStrip.tsx
+8:26:27 PM [vite] hmr update /src/components/BottomStrip.tsx
+8:26:31 PM [vite] hmr update /src/components/BottomStrip.tsx
+8:27:42 PM [vite] hmr update /src/components/RunResultModal.tsx
+8:27:51 PM [vite] hmr update /src/components/RunResultModal.tsx
+8:27:56 PM [vite] hmr update /src/components/RunResultModal.tsx
+8:27:58 PM [vite] hmr update /src/components/RunResultModal.tsx
+8:28:02 PM [vite] hmr update /src/components/RunResultModal.tsx
+8:28:17 PM [vite] hmr update /src/components/RunResultModal.tsx
+8:29:59 PM [vite] hmr update /src/components/TrainLiveControls.tsx
+8:29:59 PM [vite] hmr invalidate /src/components/TrainLiveControls.tsx Could not Fast Refresh (new export)
+8:29:59 PM [vite] hmr update /src/App.tsx

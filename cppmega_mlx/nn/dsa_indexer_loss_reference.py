@@ -56,7 +56,7 @@ def reference_indexer_kl_loss(
         raise ValueError("Q and K must share batch dim")
     if Q.shape[2] != K.shape[2] or Q.shape[3] != K.shape[3]:
         raise ValueError("Q and K must share (AH, AD)")
-    B, Sq, AH, AD = (int(Q.shape[0]), int(Q.shape[1]),
+    _B, Sq, _AH, _AD = (int(Q.shape[0]), int(Q.shape[1]),
                       int(Q.shape[2]), int(Q.shape[3]))
     Sk = int(K.shape[1])
 

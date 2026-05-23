@@ -80,8 +80,8 @@ export function FeatureInjectionBar({
                   padding: 6, background: "#fefce8",
                   border: "1px solid #fde047", borderRadius: 4,
                   fontSize: 12 }}>
-      <label style={{ display: "flex", alignItems: "center", gap: 4 }}>
-        <span>Inject</span>
+      <strong style={{ color: "#0f172a", marginRight: 2 }}>Inject</strong>
+      <label style={{ display: "flex", alignItems: "center", gap: 4, color: "#0f172a" }}>
         <select
           data-testid="feature-injection-dropdown"
           value={selected}
@@ -96,7 +96,7 @@ export function FeatureInjectionBar({
       </label>
       {selected && (
         <span data-testid="feature-injection-summary"
-              style={{ color: "#6b7280" }}>
+              style={{ color: "#334155", fontWeight: 500 }}>
           {options.find((o) => o.name === selected)?.summary ?? ""}
         </span>
       )}

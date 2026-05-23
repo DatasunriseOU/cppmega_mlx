@@ -46,7 +46,7 @@ describe("E-AUDIT-01 DataInspector file upload", () => {
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalled();
     });
-    const call = (fetchMock.mock.calls[0] ?? []) as
+    const call = (fetchMock.mock.calls[0] ?? []) as unknown as
       [string, RequestInit];
     expect(call[0]).toMatch(/\/upload\/parquet$/);
     expect(call[1].method).toBe("POST");

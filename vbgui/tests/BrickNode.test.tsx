@@ -44,7 +44,7 @@ describe("BrickNode", () => {
   it("renders the brick label and kind", () => {
     renderBrick({ kind: "attention" });
     expect(screen.getByText("Attention (vanilla)")).toBeTruthy();
-    expect(screen.getByText("attention")).toBeTruthy();
+    expect(screen.getByText("sdpa attention")).toBeTruthy();
   });
 
   it("shows resolved shape when provided", () => {

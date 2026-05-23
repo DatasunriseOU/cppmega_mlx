@@ -12,6 +12,7 @@ import { StrictMode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { App } from "./App";
 import "@xyflow/react/dist/style.css";
+import "./theme.css";
 
 interface AnyModel {
   get<T = unknown>(key: string): T;

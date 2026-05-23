@@ -304,7 +304,7 @@ def _gdn_backward_kernel(
             }}
             threadgroup_barrier(metal::mem_flags::mem_threadgroup);'''
                 if use_shared else
-                f'''if (active_v && vj == 0u) dbeta[g_idx] = dbeta_simd;'''
+                '''if (active_v && vj == 0u) dbeta[g_idx] = dbeta_simd;'''
             )}
 
             // ---- (4) kth[vj] = sum_i k_i * S_decayed[i,vj] ----
@@ -317,7 +317,7 @@ def _gdn_backward_kernel(
                 {(
                     f'''if (lane == 0u) tg_vec[i * {n_simd} + simd_id] = dk_i_sum;'''
                     if use_shared else
-                    f'''if (active_v && vj == 0u) dk[qk_base + i] = dk_i_sum;'''
+                    '''if (active_v && vj == 0u) dk[qk_base + i] = dk_i_sum;'''
                 )}
             }}
             {(
@@ -359,7 +359,7 @@ def _gdn_backward_kernel(
             }}
             threadgroup_barrier(metal::mem_flags::mem_threadgroup);'''
                 if use_shared else
-                f'''if (active_v && vj == 0u) dg[g_idx] = d_alpha_simd * alpha_t;'''
+                '''if (active_v && vj == 0u) dg[g_idx] = d_alpha_simd * alpha_t;'''
             )}
 
             // Carry dS to next (earlier) timestep.

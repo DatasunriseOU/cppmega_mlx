@@ -37,9 +37,9 @@ export function InsertIntoEdgeBar({
                   padding: "4px 8px", background: "#ecfeff",
                   borderBottom: "1px solid #67e8f9",
                   fontFamily: "system-ui, sans-serif", fontSize: 12 }}>
-      <strong>Insert into edge</strong>
+      <strong style={{ color: "#0f172a" }}>Insert into edge</strong>
       <HelpIcon topic="insert_into_edge" />
-      <label>
+      <label style={{ color: "#0f172a", display: "flex", alignItems: "center", gap: 4 }}>
         brick
         <select data-testid="insert-edge-brick-kind"
                 value={kind}
@@ -52,7 +52,7 @@ export function InsertIntoEdgeBar({
           ))}
         </select>
       </label>
-      <label>
+      <label style={{ color: "#0f172a", display: "flex", alignItems: "center", gap: 4 }}>
         between
         <select data-testid="insert-edge-target"
                 value={edgeKey}

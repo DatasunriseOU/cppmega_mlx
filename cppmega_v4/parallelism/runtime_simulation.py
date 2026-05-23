@@ -10,7 +10,7 @@ sharded memory layout of FSDP/ZeRO-1 without copying large tensors.
 
 from __future__ import annotations
 
-from typing import Any, Final
+from typing import Any
 import mlx.core as mx
 from mlx.utils import tree_flatten, tree_unflatten
 

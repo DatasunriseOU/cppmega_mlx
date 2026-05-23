@@ -120,7 +120,7 @@ def _kda_backward_kernel(
         k_tile = 16
     else:
         k_tile = kdim  # no tiling — original behavior
-    n_k_tiles = (kdim + k_tile - 1) // k_tile
+    (kdim + k_tile - 1) // k_tile
     group = hv // h
     # Multi-simdgroup path when V > 32: pad threadgroup to a 32-multiple so
     # simd_sum still works (32 lanes per simdgroup). Cross-simdgroup
@@ -135,7 +135,7 @@ def _kda_backward_kernel(
     # Shared-memory: one [kdim, n_simd] vector tile (reused across the three
     # K-vector reductions: dq, dk, ddecay) + a few [n_simd] scalar tiles.
     # Worst case kdim=256, n_simd=8 → 256*8*4 = 8192 bytes + ~64 bytes scalars.
-    shared_bytes = (kdim * n_simd + 2 * n_simd) * 4 if use_shared else 0
+    (kdim * n_simd + 2 * n_simd) * 4 if use_shared else 0
 
     scale = kdim ** -0.5
     q_f = q.astype(mx.float32).reshape(-1)
@@ -372,13 +372,13 @@ def _kda_backward_kernel(
                     {(
                         f'''if (lane == 0u) tg_vec[i * {n_simd} + simd_id] = dk_i_sum;'''
                         if use_shared else
-                        f'''if (active && vj == 0u) {{
+                        '''if (active && vj == 0u) {
                             atomic_fetch_add_explicit(
                                 (device atomic_float*)&dk[qk_base + i],
                                 dk_i_sum,
                                 memory_order_relaxed
                             );
-                        }}'''
+                        }'''
                     )}
                 }}
             }}
@@ -421,9 +421,9 @@ def _kda_backward_kernel(
                     {(
                         f'''if (lane == 0u) tg_vec[i * {n_simd} + simd_id] = ddecay_simd;'''
                         if use_shared else
-                        f'''if (active && vj == 0u) {{
+                        '''if (active && vj == 0u) {
                             dg[g_base + i] = ddecay_simd * decay_arr[ii];
-                        }}'''
+                        }'''
                     )}
                     dS[i] = dS[i] * decay_arr[ii];
                 }}

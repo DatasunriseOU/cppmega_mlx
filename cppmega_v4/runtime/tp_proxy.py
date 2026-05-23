@@ -17,7 +17,6 @@ Two API surfaces:
 
 from __future__ import annotations
 
-from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn

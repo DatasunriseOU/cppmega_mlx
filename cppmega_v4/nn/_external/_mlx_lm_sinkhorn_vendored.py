@@ -45,10 +45,10 @@ def _make_sinkhorn_kernel(hc: int, iters: int, eps: float):
             out.append(f"        {{ float mx = m[{base}];")
             for c in range(1, hc):
                 out.append(f"          mx = metal::max(mx, m[{base + c}]);")
-            out.append(f"          float s = 0.0f;")
+            out.append("          float s = 0.0f;")
             for c in range(hc):
                 out.append(f"          m[{base + c}] = metal::exp(m[{base + c}] - mx); s += m[{base + c}];")
-            out.append(f"          float inv = 1.0f / s;")
+            out.append("          float inv = 1.0f / s;")
             for c in range(hc):
                 out.append(f"          m[{base + c}] *= inv;")
             out.append("        }")

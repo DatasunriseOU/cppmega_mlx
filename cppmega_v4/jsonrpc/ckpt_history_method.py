@@ -118,9 +118,63 @@ def ckpt_list_history(
     )
 
 
+class CkptListSubdirsParams(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    directory: str = "."
+
+
+class CkptListSubdirsResult(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    current: str
+    parent: str | None = None
+    subdirs: list[str] = Field(default_factory=list)
+    error: str | None = None
+
+
+def ckpt_list_subdirs(
+    params: CkptListSubdirsParams, *, cache: LRUCache | None = None,
+) -> CkptListSubdirsResult:
+    root = Path(params.directory).expanduser()
+    try:
+        root = root.resolve()
+    except Exception as exc:
+        return CkptListSubdirsResult(
+            current=params.directory, error=f"resolve failed: {exc}"
+        )
+    if not root.exists():
+        return CkptListSubdirsResult(
+            current=str(root), error="directory does not exist"
+        )
+    if not root.is_dir():
+        return CkptListSubdirsResult(
+            current=str(root), error="path is not a directory"
+        )
+
+    subdirs: list[str] = []
+    try:
+        for p in root.iterdir():
+            if p.is_dir() and not p.name.startswith("."):
+                subdirs.append(p.name)
+    except Exception as exc:
+        return CkptListSubdirsResult(
+            current=str(root), error=f"read failed: {exc}"
+        )
+
+    subdirs.sort()
+    parent = str(root.parent) if root.parent != root else None
+    return CkptListSubdirsResult(
+        current=str(root),
+        parent=parent,
+        subdirs=subdirs,
+    )
+
+
 __all__ = [
     "CkptListHistoryParams",
     "CkptHistoryEntry",
     "CkptListHistoryResult",
     "ckpt_list_history",
+    "CkptListSubdirsParams",
+    "CkptListSubdirsResult",
+    "ckpt_list_subdirs",
 ]

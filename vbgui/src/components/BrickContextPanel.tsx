@@ -30,7 +30,7 @@ function HistogramSvg({ counts }: { counts: number[] }): JSX.Element {
                 data-testid={`brick-histogram-bar-${i}`}
                 x={i * barW} y={H - h}
                 width={Math.max(1, barW - 1)} height={h}
-                fill="#7c3aed">
+                fill="#8b5cf6">
             <title>{`bin ${i}: ${c}`}</title>
           </rect>
         );
@@ -62,6 +62,7 @@ export interface BrickContextPanelProps {
   /** V7-H08: callback to fetch the weight histogram for this brick.
    *  Host (App.tsx) builds the full spec and calls inspect.histogram. */
   onInspectHistogram?: (brickId: string) => Promise<HistogramResult>;
+  onDelete?: () => void; // Support deleting the brick
 }
 
 export interface HistogramResult {
@@ -76,13 +77,13 @@ export interface HistogramResult {
 }
 
 const FIELD: React.CSSProperties = {
-  display: "flex", flexDirection: "column", gap: 4, fontSize: 12,
-  marginBottom: 10,
+  display: "flex", flexDirection: "column", gap: 6, fontSize: 12,
+  marginBottom: 12,
 };
 
 export function BrickContextPanel({
   rpc, brickId, brickKind, params, onApply, onSwapKind, onClose,
-  onInspectHistogram,
+  onInspectHistogram, onDelete,
 }: BrickContextPanelProps): JSX.Element {
   const [draft, setDraft] = useState<Record<string, unknown>>(params);
   const [swapTarget, setSwapTarget] = useState<string>(brickKind);
@@ -109,160 +110,315 @@ export function BrickContextPanel({
     <div data-testid={`brick-context-${brickId}`}
          style={{
            position: "absolute", top: 60, right: 8,
-           width: 320, maxHeight: "calc(100vh - 200px)",
-           background: "white", border: "1px solid #e5e7eb",
-           borderRadius: 6, padding: 12, overflowY: "auto",
-           boxShadow: "0 4px 12px rgba(0,0,0,0.08)",
+           width: 320, maxHeight: "calc(100vh - 120px)",
+           background: "rgba(30, 41, 59, 0.95)",
+           backdropFilter: "blur(16px)",
+           border: "1px solid rgba(255, 255, 255, 0.1)",
+           borderRadius: 12, padding: 16, overflowY: "auto",
+           boxShadow: "0 20px 40px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(255, 255, 255, 0.05)",
            fontFamily: "system-ui, sans-serif", zIndex: 50,
+           color: "#f1f5f9",
+           display: "flex",
+           flexDirection: "column",
+           gap: "14px",
          }}>
       <header style={{ display: "flex", justifyContent: "space-between",
-                        alignItems: "center", marginBottom: 10 }}>
-        <h4 style={{ margin: 0, fontSize: 13 }}>
+                        alignItems: "center", borderBottom: "1px solid rgba(255, 255, 255, 0.1)",
+                        paddingBottom: 10 }}>
+        <h4 style={{ margin: 0, fontSize: 13, fontWeight: "bold", color: "#22d3ee" }}>
           {brickId}
-          <span style={{ marginLeft: 6, color: "#6b7280",
+          <span style={{ marginLeft: 6, color: "#94a3b8",
                           fontSize: 10 }}>
             [{brickKind}]
           </span>
         </h4>
-        <button data-testid="brick-context-close" onClick={onClose}>×</button>
+        <button
+          data-testid="brick-context-close"
+          onClick={onClose}
+          style={{
+            background: "rgba(255, 255, 255, 0.05)",
+            border: "1px solid rgba(255, 255, 255, 0.1)",
+            borderRadius: "50%",
+            width: "28px",
+            height: "28px",
+            cursor: "pointer",
+            fontSize: "18px",
+            color: "#94a3b8",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            lineHeight: 1,
+            transition: "all 0.15s ease",
+          }}
+          onMouseOver={(e) => {
+            e.currentTarget.style.background = "rgba(239, 68, 68, 0.2)";
+            e.currentTarget.style.color = "#f87171";
+            e.currentTarget.style.borderColor = "rgba(239, 68, 68, 0.3)";
+          }}
+          onMouseOut={(e) => {
+            e.currentTarget.style.background = "rgba(255, 255, 255, 0.05)";
+            e.currentTarget.style.color = "#94a3b8";
+            e.currentTarget.style.borderColor = "rgba(255, 255, 255, 0.1)";
+          }}
+        >
+          ×
+        </button>
       </header>
 
-      {supportsAct && (
-        <label style={FIELD}>
-          <Tooltip rpc={rpc} category="activation" name={activation}
-                   onInfoClick={() =>
-                     setExplain({ cat: "activation", name: activation })}>
-            <span style={{ color: "#6b7280" }}>Activation</span>
-          </Tooltip>
-          <select data-testid={`brick-context-${brickId}-activation`}
-                  value={activation}
-                  onChange={(e) => setField("activation", e.target.value)}>
-            {ACTIVATION_OPTIONS.map((a) =>
-              <option key={a} value={a}>{a}</option>)}
-          </select>
-        </label>
-      )}
-
-      {supportsNorm && (
-        <>
+      <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+        {supportsAct && (
           <label style={FIELD}>
-            <Tooltip rpc={rpc} category="norm" name={preNorm}
+            <Tooltip rpc={rpc} category="activation" name={activation}
                      onInfoClick={() =>
-                       setExplain({ cat: "norm", name: preNorm })}>
-              <span style={{ color: "#6b7280" }}>pre_norm</span>
+                       setExplain({ cat: "activation", name: activation })}>
+              <span style={{ color: "#94a3b8", fontWeight: 500 }}>Activation</span>
             </Tooltip>
-            <select data-testid={`brick-context-${brickId}-pre-norm`}
-                    value={preNorm}
-                    onChange={(e) => setField("pre_norm", e.target.value)}>
-              {NORM_OPTIONS.map((n) =>
-                <option key={n} value={n}>{n}</option>)}
+            <select data-testid={`brick-context-${brickId}-activation`}
+                    value={activation}
+                    onChange={(e) => setField("activation", e.target.value)}
+                    style={{
+                      background: "rgba(15, 23, 42, 0.6)",
+                      color: "#f1f5f9",
+                      border: "1px solid rgba(255, 255, 255, 0.15)",
+                      borderRadius: "6px",
+                      padding: "6px 10px",
+                      outline: "none",
+                      fontSize: "13px",
+                      cursor: "pointer",
+                      width: "100%",
+                    }}>
+              {ACTIVATION_OPTIONS.map((a) =>
+                <option key={a} value={a}>{a}</option>)}
             </select>
           </label>
-          <label style={FIELD}>
-            <Tooltip rpc={rpc} category="norm" name={postNorm}
-                     onInfoClick={() =>
-                       setExplain({ cat: "norm", name: postNorm })}>
-              <span style={{ color: "#6b7280" }}>post_norm</span>
-            </Tooltip>
-            <select data-testid={`brick-context-${brickId}-post-norm`}
-                    value={postNorm}
-                    onChange={(e) => setField("post_norm", e.target.value)}>
-              {NORM_OPTIONS.map((n) =>
-                <option key={n} value={n}>{n}</option>)}
-            </select>
-          </label>
-        </>
-      )}
+        )}
 
-      {onSwapKind && (() => {
-        const currentMeta = brickFor(brickKind);
-        const sameCategory = currentMeta
-          ? BRICKS.filter((b) => b.category === currentMeta.category)
-          : [];
-        if (sameCategory.length <= 1) return null;
-        return (
-          <label style={FIELD}>
-            <span style={{ color: "#6b7280" }}>
-              Swap to (same category)
-            </span>
-            <select
-              data-testid={`brick-context-${brickId}-swap-target`}
-              value={swapTarget}
-              onChange={(e) => setSwapTarget(e.target.value)}>
-              {sameCategory.map((b) => (
-                <option key={b.kind} value={b.kind}>{b.label}</option>
-              ))}
-            </select>
+        {supportsNorm && (
+          <>
+            <label style={FIELD}>
+              <Tooltip rpc={rpc} category="norm" name={preNorm}
+                       onInfoClick={() =>
+                         setExplain({ cat: "norm", name: preNorm })}>
+                <span style={{ color: "#94a3b8", fontWeight: 500 }}>pre_norm</span>
+              </Tooltip>
+              <select data-testid={`brick-context-${brickId}-pre-norm`}
+                      value={preNorm}
+                      onChange={(e) => setField("pre_norm", e.target.value)}
+                      style={{
+                        background: "rgba(15, 23, 42, 0.6)",
+                        color: "#f1f5f9",
+                        border: "1px solid rgba(255, 255, 255, 0.15)",
+                        borderRadius: "6px",
+                        padding: "6px 10px",
+                        outline: "none",
+                        fontSize: "13px",
+                        cursor: "pointer",
+                        width: "100%",
+                      }}>
+                {NORM_OPTIONS.map((n) =>
+                  <option key={n} value={n}>{n}</option>)}
+              </select>
+            </label>
+            <label style={FIELD}>
+              <Tooltip rpc={rpc} category="norm" name={postNorm}
+                       onInfoClick={() =>
+                         setExplain({ cat: "norm", name: postNorm })}>
+                <span style={{ color: "#94a3b8", fontWeight: 500 }}>post_norm</span>
+              </Tooltip>
+              <select data-testid={`brick-context-${brickId}-post-norm`}
+                      value={postNorm}
+                      onChange={(e) => setField("post_norm", e.target.value)}
+                      style={{
+                        background: "rgba(15, 23, 42, 0.6)",
+                        color: "#f1f5f9",
+                        border: "1px solid rgba(255, 255, 255, 0.15)",
+                        borderRadius: "6px",
+                        padding: "6px 10px",
+                        outline: "none",
+                        fontSize: "13px",
+                        cursor: "pointer",
+                        width: "100%",
+                      }}>
+                {NORM_OPTIONS.map((n) =>
+                  <option key={n} value={n}>{n}</option>)}
+              </select>
+            </label>
+          </>
+        )}
+
+        {onSwapKind && (() => {
+          const currentMeta = brickFor(brickKind);
+          const sameCategory = currentMeta
+            ? BRICKS.filter((b) => b.category === currentMeta.category)
+            : [];
+          if (sameCategory.length <= 1) return null;
+          return (
+            <label style={FIELD}>
+              <span style={{ color: "#94a3b8", fontWeight: 500, marginBottom: 4 }}>
+                Swap to (same category)
+              </span>
+              <select
+                data-testid={`brick-context-${brickId}-swap-target`}
+                value={swapTarget}
+                onChange={(e) => setSwapTarget(e.target.value)}
+                style={{
+                  background: "rgba(15, 23, 42, 0.6)",
+                  color: "#f1f5f9",
+                  border: "1px solid rgba(255, 255, 255, 0.15)",
+                  borderRadius: "6px",
+                  padding: "6px 10px",
+                  outline: "none",
+                  fontSize: "13px",
+                  cursor: "pointer",
+                  width: "100%",
+                  marginBottom: 6,
+                }}>
+                {sameCategory.map((b) => (
+                  <option key={b.kind} value={b.kind}>{b.label}</option>
+                ))}
+              </select>
+              <button
+                data-testid={`brick-context-${brickId}-swap-apply`}
+                disabled={swapTarget === brickKind}
+                onClick={() => { onSwapKind(swapTarget); onClose(); }}
+                style={{
+                  background: swapTarget === brickKind ? "rgba(255, 255, 255, 0.05)" : "#0ea5e9",
+                  color: swapTarget === brickKind ? "#64748b" : "white",
+                  border: swapTarget === brickKind ? "1px solid rgba(255, 255, 255, 0.08)" : "none",
+                  padding: "6px 12px",
+                  borderRadius: 6,
+                  fontSize: 12,
+                  fontWeight: "bold",
+                  cursor: swapTarget === brickKind ? "default" : "pointer",
+                  transition: "all 0.15s ease",
+                  width: "100%",
+                }}>
+                Swap kind
+              </button>
+            </label>
+          );
+        })()}
+      </div>
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 10, marginTop: 4 }}>
+        <button
+          data-testid={`brick-context-${brickId}-apply`}
+          onClick={() => { onApply(draft); onClose(); }}
+          style={{
+            background: "#0891b2",
+            color: "white",
+            border: "none",
+            padding: "8px 14px",
+            borderRadius: 6,
+            cursor: "pointer",
+            fontSize: 12,
+            fontWeight: "bold",
+            transition: "all 0.15s ease",
+            width: "100%",
+          }}
+          onMouseOver={(e) => {
+            e.currentTarget.style.background = "#06b6d4";
+          }}
+          onMouseOut={(e) => {
+            e.currentTarget.style.background = "#0891b2";
+          }}
+        >
+          Apply
+        </button>
+
+        {onInspectHistogram && (
+          <div data-testid={`brick-context-${brickId}-histogram-block`}
+               style={{ fontSize: 11 }}>
             <button
-              data-testid={`brick-context-${brickId}-swap-apply`}
-              disabled={swapTarget === brickKind}
-              onClick={() => { onSwapKind(swapTarget); onClose(); }}
-              style={{ background: swapTarget === brickKind
-                          ? "#e5e7eb" : "#0ea5e9",
-                        color: swapTarget === brickKind
-                          ? "#9ca3af" : "white",
-                        border: "none", padding: "4px 10px",
-                        borderRadius: 4, fontSize: 12, marginTop: 4,
-                        cursor: swapTarget === brickKind
-                          ? "default" : "pointer" }}>
-              Swap kind
+              data-testid={`brick-context-${brickId}-histogram-fetch`}
+              disabled={histLoading}
+              onClick={async () => {
+                setHistLoading(true); setHistError(null);
+                try {
+                  const r = await onInspectHistogram(brickId);
+                  setHist(r);
+                } catch (e) {
+                  setHistError(e instanceof Error ? e.message : String(e));
+                } finally {
+                  setHistLoading(false);
+                }
+              }}
+              style={{
+                background: "#7c3aed",
+                color: "white",
+                border: "none",
+                padding: "8px 14px",
+                borderRadius: 6,
+                cursor: "pointer",
+                fontSize: 11,
+                fontWeight: "bold",
+                transition: "all 0.15s ease",
+                width: "100%",
+              }}
+            >
+              {histLoading ? "Loading…" : "Inspect weight histogram"}
             </button>
-          </label>
-        );
-      })()}
-
-      <button data-testid={`brick-context-${brickId}-apply`}
-              onClick={() => { onApply(draft); onClose(); }}
-              style={{ background: "#2563eb", color: "white",
-                        border: "none", padding: "5px 12px",
-                        borderRadius: 4, cursor: "pointer", fontSize: 12,
-                        marginTop: 8 }}>
-        Apply
-      </button>
-
-      {onInspectHistogram && (
-        <div data-testid={`brick-context-${brickId}-histogram-block`}
-             style={{ marginTop: 10, fontSize: 11 }}>
-          <button
-            data-testid={`brick-context-${brickId}-histogram-fetch`}
-            disabled={histLoading}
-            onClick={async () => {
-              setHistLoading(true); setHistError(null);
-              try {
-                const r = await onInspectHistogram(brickId);
-                setHist(r);
-              } catch (e) {
-                setHistError(e instanceof Error ? e.message : String(e));
-              } finally {
-                setHistLoading(false);
-              }
-            }}
-            style={{ background: "#7c3aed", color: "white",
-                     border: "none", padding: "4px 10px",
-                     borderRadius: 4, cursor: "pointer", fontSize: 11 }}>
-            {histLoading ? "Loading…" : "Inspect weight histogram"}
-          </button>
-          {histError && (
-            <div data-testid={`brick-context-${brickId}-histogram-error`}
-                 style={{ color: "#dc2626", marginTop: 4 }}>
-              {histError}
-            </div>
-          )}
-          {hist && (
-            <div data-testid={`brick-context-${brickId}-histogram-result`}
-                 style={{ marginTop: 6, fontFamily: "monospace",
-                          background: "#f9fafb", padding: 6,
-                          borderRadius: 4 }}>
-              <div data-testid={`brick-context-${brickId}-histogram-stats`}>
-                n={hist.n_values} · min={hist.min.toExponential(2)} ·
-                max={hist.max.toExponential(2)} ·
-                mean={hist.mean.toExponential(2)}
+            {histError && (
+              <div data-testid={`brick-context-${brickId}-histogram-error`}
+                   style={{ color: "#ef4444", marginTop: 4 }}>
+                {histError}
               </div>
-              <HistogramSvg counts={hist.counts} />
-            </div>
-          )}
-        </div>
-      )}
+            )}
+            {hist && (
+              <div data-testid={`brick-context-${brickId}-histogram-result`}
+                   style={{
+                     marginTop: 6,
+                     fontFamily: "monospace",
+                     background: "rgba(15, 23, 42, 0.5)",
+                     border: "1px solid rgba(255, 255, 255, 0.08)",
+                     padding: 8,
+                     borderRadius: 6,
+                     fontSize: 10,
+                   }}>
+                <div data-testid={`brick-context-${brickId}-histogram-stats`} style={{ color: "#94a3b8", lineHeight: 1.4 }}>
+                  n={hist.n_values} <br />
+                  min={hist.min.toExponential(2)} <br />
+                  max={hist.max.toExponential(2)} <br />
+                  mean={hist.mean.toExponential(2)}
+                </div>
+                <HistogramSvg counts={hist.counts} />
+              </div>
+            )}
+          </div>
+        )}
+
+        {onDelete && (
+          <button
+            data-testid="brick-context-delete"
+            onClick={onDelete}
+            style={{
+              background: "rgba(239, 68, 68, 0.15)",
+              border: "1px solid rgba(239, 68, 68, 0.3)",
+              color: "#f87171",
+              borderRadius: "6px",
+              padding: "8px 14px",
+              fontSize: "12px",
+              fontWeight: "bold",
+              cursor: "pointer",
+              transition: "all 0.15s ease",
+              width: "100%",
+              marginTop: 4,
+            }}
+            onMouseOver={(e) => {
+              e.currentTarget.style.background = "rgba(239, 68, 68, 0.3)";
+              e.currentTarget.style.borderColor = "rgba(239, 68, 68, 0.5)";
+              e.currentTarget.style.color = "#fca5a5";
+            }}
+            onMouseOut={(e) => {
+              e.currentTarget.style.background = "rgba(239, 68, 68, 0.15)";
+              e.currentTarget.style.borderColor = "rgba(239, 68, 68, 0.3)";
+              e.currentTarget.style.color = "#f87171";
+            }}
+          >
+            🗑 Delete Brick
+          </button>
+        )}
+      </div>
 
       {explain && (
         <ExplainModal rpc={rpc} category={explain.cat} name={explain.name}

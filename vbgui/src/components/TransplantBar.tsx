@@ -60,9 +60,9 @@ export function TransplantBar({
                   padding: "4px 8px", background: "#eef2ff",
                   borderBottom: "1px solid #c7d2fe",
                   fontFamily: "system-ui, sans-serif", fontSize: 12 }}>
-      <strong>Transplant</strong>
+      <strong style={{ color: "#0f172a" }}>Transplant</strong>
       <HelpIcon topic="brick_transplant" />
-      <label>
+      <label style={{ color: "#0f172a", display: "flex", alignItems: "center", gap: 4 }}>
         from
         <select data-testid="transplant-source-preset"
                 value={sourcePreset}
@@ -83,7 +83,7 @@ export function TransplantBar({
       </button>
       {bricks.length > 0 && (
         <>
-          <label>
+          <label style={{ color: "#0f172a", display: "flex", alignItems: "center", gap: 4 }}>
             brick
             <select data-testid="transplant-source-brick"
                     value={selectedBrick}
@@ -101,7 +101,7 @@ export function TransplantBar({
           </label>
           <div data-testid="transplant-draggable-list"
                style={{ display: "flex", gap: 6, alignItems: "center", marginLeft: 12 }}>
-            <span style={{ color: "#4b5563", fontWeight: 600 }}>Drag:</span>
+            <span style={{ color: "#0f172a", fontWeight: 700 }}>Drag:</span>
             {bricks.map((b) => {
               const key = b.name ?? b.kind;
               return (
@@ -116,13 +116,14 @@ export function TransplantBar({
                   data-testid={`transplant-drag-brick-${key}`}
                   style={{
                     padding: "3px 8px",
-                    background: "#fff",
-                    border: "1px solid #a5b4fc",
+                    background: "#1e293b",
+                    border: "1px solid #06b6d4",
+                    color: "#22d3ee",
                     borderRadius: 4,
                     cursor: "grab",
                     fontSize: 10,
-                    fontWeight: 600,
-                    boxShadow: "0 1px 2px rgba(0,0,0,0.05)",
+                    fontWeight: 700,
+                    boxShadow: "0 2px 4px rgba(0,0,0,0.15)",
                   }}
                 >
                   {key}

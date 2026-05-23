@@ -17,8 +17,7 @@ indexing, mirroring the upstream XLA-safe variant.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
-from typing import Any
+from collections.abc import Callable
 
 import mlx.core as mx
 import mlx.nn as nn

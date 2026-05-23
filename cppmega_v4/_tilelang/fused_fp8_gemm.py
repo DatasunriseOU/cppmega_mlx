@@ -22,7 +22,6 @@ One thread per output column m × batch row. Block_size=128 amortizes the
 scale_inv lookup across 128 K-elements per (m, batch_row).
 """
 
-from typing import Tuple
 
 import mlx.core as mx
 
@@ -71,7 +70,6 @@ def fused_fp8_gemm(
         n *= d
     a_flat = a_fp32.reshape(n, K)
 
-    blocks_m = blocks_m_expected
     blocks_k = blocks_k_expected
     w_flat = w_fp8.reshape(-1)             # [M*K]
     s_flat = w_scale_inv.reshape(-1)        # [blocks_m * blocks_k]

@@ -81,7 +81,24 @@ def _deepseek_v3(hidden_size: int) -> list[dict[str, Any]]:
 
 
 def _deepseek_v4_flash(hidden_size: int) -> list[dict[str, Any]]:
+    # DeepSeek V4 Flash uses compressed attention and memory blocks:
+    # 1. CSA/HCA Hybrid (csa_hca) cross-head compressed attention
+    # 2. Standalone local engram (n-gram) branch for causal sequence memory
+    # 3. DSv4 MLA sparse attention block
+    # 4. Mixture of Experts (moe)
+    hd = 64
+    if hidden_size % hd != 0:
+        if hidden_size % 32 == 0:
+            hd = 32
+        elif hidden_size % 16 == 0:
+            hd = 16
+        else:
+            hd = hidden_size // 2
+    nh = hidden_size // hd
     return [
+        {"kind": "csa_hca", "name": "dsv4_csa_hca",
+         "params": {"num_heads": nh, "head_dim": hd}},
+        {"kind": "engram", "name": "dsv4_engram"},
         {"kind": "dsv4_attention", "name": "dsv4_attn"},
         {"kind": "moe", "name": "dsv4_moe",
          "params": {"num_experts": 6, "top_k": 2}},

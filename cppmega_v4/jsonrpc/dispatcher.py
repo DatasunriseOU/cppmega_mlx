@@ -49,6 +49,7 @@ from cppmega_v4.jsonrpc.ckpt_inspect_method import (
 )
 from cppmega_v4.jsonrpc.ckpt_history_method import (
     CkptListHistoryParams, ckpt_list_history,
+    CkptListSubdirsParams, ckpt_list_subdirs,
 )
 from cppmega_v4.jsonrpc.dtype_cost_method import (
     DtypeCostParams, dtype_cost_estimate,
@@ -236,6 +237,10 @@ _ROUTES: Mapping[str, tuple[type[BaseModel], _Handler]] = {
     "ckpt.list_history": (
         CkptListHistoryParams,
         lambda p, c: ckpt_list_history(p, cache=c),
+    ),
+    "ckpt.list_subdirs": (
+        CkptListSubdirsParams,
+        lambda p, c: ckpt_list_subdirs(p, cache=c),
     ),
     "dtype.cost_estimate": (
         DtypeCostParams,

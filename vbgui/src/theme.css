@@ -1,0 +1,342 @@
+/* ──────────────────────────────────────────────────────────────────────
+ * cppmega Visual Builder — design tokens & global theme
+ *
+ * Single source of truth for the dark "neon node editor" look modelled on
+ * radial_edge_overlay_mockup.png. Components consume these via the matching
+ * JS references in theme.ts (e.g. T.surface === "var(--vb-surface)"), so
+ * changing a value here re-themes the whole app.
+ *
+ * Loaded once at the app entry points (main.tsx, anywidget.tsx). It is NOT
+ * imported by individual components, so the unit-test render path is
+ * unaffected.
+ * ────────────────────────────────────────────────────────────────────── */
+
+:root {
+  /* Surfaces — near-black navy base, panels lift in small steps */
+  --vb-bg:           #0a0b14;   /* app + window background            */
+  --vb-bg-canvas:    #0b0d18;   /* flow canvas base (grid drawn over) */
+  --vb-grid:         rgba(120, 134, 168, 0.10);
+  --vb-surface:      #11131e;   /* top bar, palette, inspector panels */
+  --vb-surface-2:    #171a28;   /* raised: node cards, dropdowns      */
+  --vb-surface-3:    #1f2333;   /* inputs, hover fills                */
+  --vb-surface-glass: rgba(17, 19, 30, 0.78); /* overlays / radial    */
+
+  /* Borders / dividers */
+  --vb-border:        rgba(148, 163, 184, 0.14);
+  --vb-border-soft:   rgba(148, 163, 184, 0.08);
+  --vb-border-strong: rgba(148, 163, 184, 0.28);
+
+  /* Text */
+  --vb-text:           #e6e9f2;
+  --vb-text-secondary: #9aa3b8;
+  --vb-text-muted:     #626c84;
+
+  /* Primary action accent — cyan (the "Run" button in the mockup) */
+  --vb-accent:          #22d3ee;
+  --vb-accent-strong:   #06b6d4;
+  --vb-accent-soft:     rgba(34, 211, 238, 0.16);
+  --vb-accent-contrast: #03212a;
+
+  /* Category accents (mirror lib/bricks.ts CATEGORY_COLORS, used as
+   * node + palette neon accents on the dark canvas). */
+  --vb-cat-attn:    #6366f1;  /* sdpa_attention → indigo/purple glow */
+  --vb-cat-linear:  #10b981;  /* linear_attn    → green              */
+  --vb-cat-ssm:     #a855f7;  /* ssm            → purple             */
+  --vb-cat-moe:     #f59e0b;  /* moe            → amber              */
+  --vb-cat-sparse:  #06b6d4;  /* sparse_attn    → cyan               */
+  --vb-cat-cross:   #ec4899;  /* cross_attn     → pink               */
+  --vb-cat-norm:    #94a3b8;  /* norm_or_proj   → slate (neutral)    */
+  --vb-cat-rnn:     #ef4444;  /* nonlinear_rnn  → red                */
+
+  /* Semantic */
+  --vb-success: #34d399;
+  --vb-warning: #fbbf24;
+  --vb-danger:  #f87171;
+  --vb-info:    #38bdf8;
+
+  /* Typography */
+  --vb-font: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
+             Arial, sans-serif;
+  --vb-font-mono: ui-monospace, "SF Mono", Menlo, Monaco, Consolas, monospace;
+
+  /* Radii */
+  --vb-radius-sm:   6px;
+  --vb-radius-md:   10px;
+  --vb-radius-lg:   14px;
+  --vb-radius-xl:   18px;
+  --vb-radius-pill: 999px;
+
+  /* Elevation */
+  --vb-shadow-panel: 0 8px 30px rgba(0, 0, 0, 0.45);
+  --vb-shadow-pop:   0 16px 44px rgba(0, 0, 0, 0.55);
+
+  color-scheme: dark;
+}
+
+/* ── Global base ──────────────────────────────────────────────────────── */
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  background: var(--vb-bg);
+  color: var(--vb-text);
+  font-family: var(--vb-font);
+}
+body { -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }
+
+* { box-sizing: border-box; }
+
+::selection { background: var(--vb-accent-soft); color: var(--vb-text); }
+
+/* ── Scrollbars ───────────────────────────────────────────────────────── */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--vb-surface-3) transparent;
+}
+*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb {
+  background: var(--vb-surface-3);
+  border-radius: var(--vb-radius-pill);
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-thumb:hover { background: var(--vb-border-strong); }
+
+/* ── Form controls (baseline) ─────────────────────────────────────────────
+ * These give every un-styled select / input / textarea / button across the
+ * app a coherent dark treatment without touching each file. Inline styles a
+ * component sets explicitly still win (inline > stylesheet). */
+input, select, textarea, button {
+  font-family: inherit;
+  color: var(--vb-text);
+}
+input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]),
+select,
+textarea {
+  background: var(--vb-surface-3);
+  border: 1px solid var(--vb-border);
+  border-radius: var(--vb-radius-sm);
+  padding: 5px 8px;
+  font-size: 12px;
+  outline: none;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+input:focus-visible, select:focus-visible, textarea:focus-visible {
+  border-color: var(--vb-accent-strong);
+  box-shadow: 0 0 0 3px var(--vb-accent-soft);
+}
+select option { background: var(--vb-surface-2); color: var(--vb-text); }
+
+button {
+  background: var(--vb-surface-3);
+  border: 1px solid var(--vb-border);
+  border-radius: var(--vb-radius-sm);
+  padding: 5px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease,
+              box-shadow 0.15s ease, transform 0.12s ease;
+}
+button:hover:not(:disabled) {
+  background: var(--vb-surface-2);
+  border-color: var(--vb-border-strong);
+}
+button:disabled { opacity: 0.45; cursor: not-allowed; }
+
+input[type="checkbox"], input[type="radio"] { accent-color: var(--vb-accent-strong); }
+
+h1, h2, h3, h4, h5 { color: var(--vb-text); font-weight: 600; }
+a { color: var(--vb-accent); }
+
+/* ── React Flow overrides ─────────────────────────────────────────────── */
+.react-flow { background: var(--vb-bg-canvas); }
+.react-flow__background { background: var(--vb-bg-canvas); }
+
+/* Edge midpoint "+" buttons / node handles */
+.react-flow__handle {
+  width: 9px;
+  height: 9px;
+  background: var(--vb-surface-2);
+  border: 1.5px solid var(--vb-border-strong);
+  border-radius: var(--vb-radius-pill);
+  transition: background 0.15s ease, box-shadow 0.15s ease,
+              border-color 0.15s ease;
+}
+.react-flow__handle:hover,
+.react-flow__handle-connecting {
+  background: var(--vb-accent);
+  border-color: var(--vb-accent);
+  box-shadow: 0 0 0 4px var(--vb-accent-soft);
+}
+.react-flow__handle.connectionindicator { cursor: crosshair; }
+
+/* Zoom / fit controls — bottom-center pill in the mockup */
+.react-flow__controls {
+  display: flex;
+  gap: 2px;
+  padding: 5px;
+  background: var(--vb-surface-glass);
+  -webkit-backdrop-filter: blur(12px);
+  backdrop-filter: blur(12px);
+  border: 1px solid var(--vb-border);
+  border-radius: var(--vb-radius-pill);
+  box-shadow: var(--vb-shadow-panel);
+  overflow: hidden;
+}
+.react-flow__controls-button {
+  width: 30px;
+  height: 30px;
+  background: rgba(15, 23, 42, 0.95) !important;
+  border: 1px solid rgba(255, 255, 255, 0.25) !important;
+  border-radius: var(--vb-radius-md) !important;
+  color: #22d3ee !important; /* Premium Neocyan icon color */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.15s ease;
+  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.3) !important;
+}
+.react-flow__controls-button:hover {
+  background: #22d3ee !important;
+  color: #0f172a !important; /* Deep slate on hover */
+}
+.react-flow__controls-button svg { fill: currentColor !important; max-width: 14px; max-height: 14px; }
+
+/* Minimap — bottom-right in the mockup */
+.react-flow__minimap {
+  background: var(--vb-surface-glass);
+  -webkit-backdrop-filter: blur(10px);
+  backdrop-filter: blur(10px);
+  border: 1px solid var(--vb-border);
+  border-radius: var(--vb-radius-lg);
+  box-shadow: var(--vb-shadow-panel);
+  overflow: hidden;
+}
+.react-flow__minimap-mask { fill: rgba(10, 11, 20, 0.6); }
+
+.react-flow__attribution {
+  background: transparent;
+  color: var(--vb-text-muted);
+}
+.react-flow__attribution a { color: var(--vb-text-muted); }
+
+/* ── Reusable component classes ───────────────────────────────────────── */
+
+/* Node card — accent driven by the inline custom property --vb-node-accent */
+.vb-node {
+  --vb-node-accent: var(--vb-cat-norm);
+  position: relative;
+  background: var(--vb-surface-2);
+  border: 1px solid var(--vb-border);
+  border-radius: var(--vb-radius-lg);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
+  transition: border-color 0.18s ease, box-shadow 0.18s ease,
+              transform 0.12s ease;
+}
+.vb-node::before {
+  content: "";
+  position: absolute;
+  inset: -1px;
+  border-radius: inherit;
+  padding: 1px;
+  background: linear-gradient(135deg,
+              var(--vb-node-accent), transparent 60%);
+  -webkit-mask: linear-gradient(#000 0 0) content-box,
+                linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  opacity: 0.55;
+  pointer-events: none;
+}
+.vb-node:hover {
+  border-color: color-mix(in srgb, var(--vb-node-accent) 55%, transparent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--vb-node-accent) 40%, transparent),
+              0 0 22px color-mix(in srgb, var(--vb-node-accent) 30%, transparent),
+              0 6px 18px rgba(0, 0, 0, 0.45);
+  transform: translateY(-1px);
+}
+.vb-node.vb-node-selected,
+.react-flow__node.selected .vb-node {
+  border-color: var(--vb-node-accent);
+  box-shadow: 0 0 0 1px var(--vb-node-accent),
+              0 0 28px color-mix(in srgb, var(--vb-node-accent) 45%, transparent),
+              0 8px 22px rgba(0, 0, 0, 0.5);
+}
+
+/* Palette / library item */
+.vb-palette-item {
+  --vb-node-accent: var(--vb-cat-norm);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  background: var(--vb-surface-2);
+  border: 1px solid var(--vb-border);
+  border-radius: var(--vb-radius-md);
+  color: var(--vb-text);
+  cursor: grab;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease,
+              background 0.15s ease, transform 0.12s ease;
+}
+.vb-palette-item:hover {
+  border-color: color-mix(in srgb, var(--vb-node-accent) 60%, transparent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--vb-node-accent) 35%, transparent),
+              0 0 18px color-mix(in srgb, var(--vb-node-accent) 22%, transparent);
+  transform: translateX(2px);
+}
+.vb-palette-item:active { cursor: grabbing; }
+
+/* Icon chip inside palette items / node headers */
+.vb-chip {
+  --vb-node-accent: var(--vb-cat-norm);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  flex: 0 0 auto;
+  border-radius: var(--vb-radius-md);
+  color: var(--vb-node-accent);
+  background: color-mix(in srgb, var(--vb-node-accent) 16%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--vb-node-accent) 40%, transparent),
+              0 0 12px color-mix(in srgb, var(--vb-node-accent) 22%, transparent);
+}
+
+/* Radial fan insert menu */
+.vb-radial-petal {
+  transition: transform 0.14s cubic-bezier(0.34, 1.56, 0.64, 1),
+              box-shadow 0.14s ease, background 0.14s ease;
+}
+.vb-radial-petal:hover { transform: scale(1.12); }
+
+/* Collapsible section header (library / inspector) */
+.vb-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 8px 4px;
+  background: transparent;
+  border: none;
+  border-radius: var(--vb-radius-sm);
+  color: var(--vb-text);
+  font-size: 13px;
+  cursor: pointer;
+}
+.vb-section-head:hover { background: var(--vb-surface-2); border-color: transparent; }
+.vb-section-chevron { transition: transform 0.18s ease; color: var(--vb-text-muted); }
+.vb-section-chevron.vb-open { transform: rotate(90deg); }
+
+/* ── Keyframes ────────────────────────────────────────────────────────── */
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.35; }
+}
+@keyframes vb-pop {
+  from { opacity: 0; transform: translate(-50%, -50%) scale(0.82); }
+  to   { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+}
+@keyframes vb-fade-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}

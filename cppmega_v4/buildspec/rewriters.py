@@ -41,12 +41,10 @@ from cppmega_v4.buildspec.loss_spec import (
     LossKind,
     LossSpec,
     ifim_shaped_loss,
-    mhc_attn_bias_loss,
     mtp_weighted_loss,
 )
 from cppmega_v4.buildspec.model_build_spec import (
     ModelBuildSpec,
-    Rewriter,
 )
 from cppmega_v4.buildspec.optim_spec import (
     OptimKind,
