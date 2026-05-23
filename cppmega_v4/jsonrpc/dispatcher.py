@@ -58,6 +58,10 @@ from cppmega_v4.jsonrpc.side_channel_methods import (
     SideChannelPreviewParams,
     preview_side_channels,
 )
+from cppmega_v4.jsonrpc.side_channel_apply_method import (
+    SideChannelApplyParams,
+    apply_side_channels,
+)
 from cppmega_v4.jsonrpc.schema import (
     BuildPresetSpecsParams,
     CatalogExplainParams,
@@ -173,6 +177,10 @@ _ROUTES: Mapping[str, tuple[type[BaseModel], _Handler]] = {
     "side_channels.preview": (
         SideChannelPreviewParams,
         lambda p, c: preview_side_channels(p, cache=c),
+    ),
+    "side_channels.apply": (
+        SideChannelApplyParams,
+        lambda p, c: apply_side_channels(p, cache=c),
     ),
 }
 
