@@ -1,7 +1,8 @@
 // Top-level view switcher used by App.tsx. Canvas vs Tokenizer vs
 // Data vs Gallery (V7-F58 per-preset sortable report).
 
-export type AppTab = "canvas" | "tokenizer" | "data" | "gallery";
+export type AppTab = "canvas" | "tokenizer" | "data"
+  | "gallery" | "sweep";
 
 export interface AppTabsProps {
   active: AppTab;
@@ -13,6 +14,7 @@ const TABS: { key: AppTab; label: string }[] = [
   { key: "tokenizer", label: "Tokenizer Playground" },
   { key: "data",      label: "Data Inspector" },
   { key: "gallery",   label: "Gallery" },
+  { key: "sweep",     label: "Scaling Sweep" },
 ];
 
 export function AppTabs({ active, onChange }: AppTabsProps): JSX.Element {

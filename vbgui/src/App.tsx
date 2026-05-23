@@ -922,6 +922,68 @@ export function App(): JSX.Element {
               }}
             />
           )}
+          {activeTab === "sweep" && (
+            <SweepPanel
+              runner={async (H: number) => {
+                // Build preset specs at requested H; default to llama3_8b
+                // when no preset has been dropped on the canvas yet.
+                const presetName = nodes.length > 0
+                  ? "llama3_8b"
+                  : "llama3_8b";
+                const r = await rpc.call<{ specs: BrickSpec[];
+                                            preset_name: string }>(
+                  "build_preset_specs",
+                  { preset_name: presetName, hidden_size: H });
+                const { nodes: ns, edges: es } = presetSpecsToNodes(
+                  r.specs);
+                // Honest dim_env: scale nh with H so nh*head_dim = H
+                // (avoids the F56b warning during the sweep itself).
+                const sweepDimEnv: Record<string, number> = {
+                  B: 1, S: 16, H,
+                  nh: Math.max(2, Math.floor(H / 64)),
+                  nkv: Math.max(1, Math.floor(H / 128)),
+                  head_dim: 64,
+                  num_experts: 4, top_k: 2,
+                };
+                const trainParams = {
+                  spec: {
+                    graph: { nodes: ns.map((n) => ({
+                                id: n.id,
+                                kind: (n.data as { kind: string }).kind,
+                                params: (n.data as { params?: Record<string, unknown> })
+                                         .params ?? {} })),
+                             edges: es.map((e) => ({
+                                src: e.source, dst: e.target })) },
+                    dim_env: sweepDimEnv,
+                    loss: { kind: "cross_entropy",
+                            head_outputs: ns.length > 0
+                              ? [ns[ns.length - 1].id] : [] },
+                    optim: { kind: "adamw",
+                             groups: [{ matcher: "all", lr: 1e-3,
+                               weight_decay: 0.01, betas: [0.9, 0.95] }] },
+                  },
+                  pipeline: {
+                    stages: ["parse", "verify_build_spec",
+                             "build_model", "train"],
+                    stage_options: { train: { num_steps: 2 } },
+                  },
+                };
+                const rep = await rpc.call<{
+                  stages: { name: string; status: string;
+                             losses?: number[] }[];
+                }>("pipeline.run", trainParams);
+                const train = rep.stages.find(
+                  (s) => s.name === "train") as { status?: string;
+                                                  losses?: number[] } | undefined;
+                if (!train || train.status !== "ok") {
+                  throw new Error(
+                    `H=${H} train.status=${train?.status ?? "missing"}`);
+                }
+                return (train.losses ?? []).map(Number)
+                  .filter((n) => Number.isFinite(n));
+              }}
+            />
+          )}
         </div>
         <BottomStrip state={spec} fusedRegionCount={0} />
         <RunResultModal report={runReport} error={runError}

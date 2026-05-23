@@ -41,8 +41,14 @@ function pathFor(values: number[], w: number, h: number,
 export function LossChart({
   losses, series = [], width = 360, height = 140, testidPrefix = "chart",
 }: LossChartProps): JSX.Element {
+  // Whether the primary "loss" series has any data. When it doesn't,
+  // we still keep overlay series visible but treat them as named
+  // overlays (label-suffixed testids), not as the bare primary line.
+  const primaryHasData = losses.length > 0;
   const allSeries: LossSeries[] = [
-    { label: "loss", values: losses, color: DEFAULT_COLOR },
+    ...(primaryHasData
+      ? [{ label: "loss", values: losses, color: DEFAULT_COLOR }]
+      : []),
     ...series.map((s, i) => ({
       ...s,
       color: s.color ?? PALETTE[(i + 1) % PALETTE.length],
@@ -95,7 +101,10 @@ export function LossChart({
 
         {allSeries.map((s, sIdx) => {
           const d = pathFor(s.values, width, height, yMin, yMax, pad);
-          const isPrimary = sIdx === 0;
+          // Only the canonical primary "loss" series at index 0 gets
+          // the bare testid; everything else is label-suffixed so
+          // sweep-style overlays don't collide.
+          const isPrimary = sIdx === 0 && s.label === "loss";
           const lineTid = isPrimary
             ? `${testidPrefix}-line`
             : `${testidPrefix}-line-${s.label}`;
