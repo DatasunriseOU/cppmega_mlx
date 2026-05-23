@@ -226,14 +226,46 @@ async def _dispatch(payload: dict, cache: LRUCache):
     return dispatch(payload, cache=cache)
 
 
+_BUILD_ID: str | None = None
+
+
+def _backend_build_id() -> str:
+    """V7-H48: cached process-lifetime build id.
+
+    Composed from git HEAD sha (best-effort; 'unknown' when not in a
+    git checkout) plus the process boot timestamp so a backend restart
+    yields a distinct id even when HEAD hasn't moved. UI uses this to
+    invalidate caches (e.g. architectures.list_presets, V7-H47)."""
+    global _BUILD_ID
+    if _BUILD_ID is not None:
+        return _BUILD_ID
+    import subprocess
+    import time as _t
+    sha = "unknown"
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--short=12", "HEAD"],
+            capture_output=True, text=True, timeout=1.0,
+        )
+        if out.returncode == 0:
+            sha = out.stdout.strip() or "unknown"
+    except Exception:
+        pass
+    _BUILD_ID = f"{sha}.{int(_t.time())}"
+    return _BUILD_ID
+
+
 async def _heartbeat(socket: WebSocket) -> None:
+    build_id = _backend_build_id()
     while True:
         await asyncio.sleep(_HEARTBEAT_INTERVAL_S)
         try:
             await socket.send_json({
                 "jsonrpc": "2.0", "id": None,
                 "method": "backend.status",
-                "params": {"status": "ok"},
+                # V7-H48: build_id surfaces backend git sha + boot
+                # timestamp so UI can render it + detect restarts.
+                "params": {"status": "ok", "build_id": build_id},
             })
         except Exception:
             return

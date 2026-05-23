@@ -30,12 +30,21 @@ let _cached: readonly string[] | null = null;
 
 interface ListPresetsResult { presets: string[]; }
 
-export function usePresets(rpc: RpcClient | null): readonly string[] {
+export function usePresets(
+  rpc: RpcClient | null,
+  /** V7-H47: bump this key to force a refetch (e.g. when the backend
+   *  build_id changes — see useRpc.onBackendBuildId).  Each distinct
+   *  string triggers exactly one refetch. */
+  invalidationKey: string | null = null,
+): readonly string[] {
   const [presets, setPresets] = useState<readonly string[]>(
     _cached ?? FALLBACK_PRESETS,
   );
 
   useEffect(() => {
+    // V7-H47: when invalidationKey advances, drop the module cache so
+    // the next mount/effect refires.
+    if (invalidationKey) _cached = null;
     if (_cached || !rpc) return;
     let cancelled = false;
     rpc.call<ListPresetsResult>("architectures.list_presets", {})
@@ -48,7 +57,7 @@ export function usePresets(rpc: RpcClient | null): readonly string[] {
        })
        .catch(() => { /* stay with fallback */ });
     return () => { cancelled = true; };
-  }, [rpc]);
+  }, [rpc, invalidationKey]);
 
   return presets;
 }

@@ -170,17 +170,23 @@ export function App(): JSX.Element {
     useState<string[]>(["doc_ids", "token_ids"]);
   const [trainSideChannels, setTrainSideChannels] = useState<string[]>([]);
 
+  // V7-H48: latest backend build_id seen on heartbeat. Used to
+  // invalidate caches (V7-H47: architectures.list_presets) and shown
+  // in BottomStrip.
+  const [backendBuildId, setBackendBuildId] = useState<string | null>(null);
   const rpc = useRpc({
     baseUrl: (import.meta.env.VITE_BACKEND_URL as string | undefined)
               ?? "http://127.0.0.1:8765",
     enableWs: true,
     onBackendStatus: (s) => dispatch({ type: "backend.status", status: s }),
+    onBackendBuildId: (bid) => setBackendBuildId(bid),
   });
 
   // Live preset list (62 entries from backend; falls back to bundled
   // snapshot when RPC is offline). E7-8: replaces the hardcoded 57-entry
-  // list that was missing 5 architectures.
-  const PRESETS = usePresets(rpc);
+  // list that was missing 5 architectures. V7-H47: refetch on backend
+  // build_id change so a restart with new presets propagates to UI.
+  const PRESETS = usePresets(rpc, backendBuildId);
 
   // V7-F56b / V7-F53: editable dim_env (was a constant MINI_DIM_ENV).
   // Threaded into the verify trigger so changes to H/nh/head_dim
@@ -1397,7 +1403,8 @@ export function App(): JSX.Element {
             />
           )}
         </div>
-        <BottomStrip state={spec} fusedRegionCount={0} />
+        <BottomStrip state={spec} fusedRegionCount={0}
+                     backendBuildId={backendBuildId} />
         <LiveTrainPanel events={liveTrain.events}
                          trainInFlight={!!trainInFlight}
                          finishToast={liveTrain.finishToast}

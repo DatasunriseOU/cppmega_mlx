@@ -7,6 +7,10 @@ import { RpcClient } from "@/lib/rpc";
 export interface UseRpcOptions {
   baseUrl?: string;             // defaults to localhost:8765 in dev
   onBackendStatus?: (s: "connected" | "reconnecting" | "disconnected") => void;
+  /** V7-H48: invoked whenever the heartbeat reports a build_id we
+   *  haven't seen before in this session — used by usePresets (V7-H47)
+   *  to invalidate cached lists on backend restart. */
+  onBackendBuildId?: (buildId: string) => void;
   enableWs?: boolean;
   timeoutMs?: number;
 }
@@ -29,6 +33,10 @@ export function useRpc(opts: UseRpcOptions = {}): RpcClient {
   const onStatusRef = useRef<UseRpcOptions["onBackendStatus"]>(undefined);
   useEffect(() => { onStatusRef.current = opts.onBackendStatus; },
            [opts.onBackendStatus]);
+  const onBuildIdRef = useRef<UseRpcOptions["onBackendBuildId"]>(undefined);
+  useEffect(() => { onBuildIdRef.current = opts.onBackendBuildId; },
+           [opts.onBackendBuildId]);
+  const lastBuildIdRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (!enableWs) return;
@@ -53,8 +61,19 @@ export function useRpc(opts: UseRpcOptions = {}): RpcClient {
       };
       socket.onmessage = (ev) => {
         try {
-          const payload = JSON.parse(ev.data) as { method?: string };
-          if (payload.method === "backend.status") fire("connected");
+          const payload = JSON.parse(ev.data) as
+            { method?: string;
+              params?: { status?: string; build_id?: string } };
+          if (payload.method === "backend.status") {
+            fire("connected");
+            // V7-H48: fire onBackendBuildId only when the id changes,
+            // so subscribers aren't spammed on every 1Hz heartbeat.
+            const bid = payload.params?.build_id;
+            if (bid && bid !== lastBuildIdRef.current) {
+              lastBuildIdRef.current = bid;
+              onBuildIdRef.current?.(bid);
+            }
+          }
         } catch { /* ignore */ }
       };
       socket.onclose = () => {

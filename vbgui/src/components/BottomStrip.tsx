@@ -4,6 +4,8 @@ export interface BottomStripProps {
   state: SpecState;
   fusedRegionCount?: number;
   onHelpToggle?: () => void;
+  /** V7-H48: backend git sha + boot timestamp from the heartbeat. */
+  backendBuildId?: string | null;
 }
 
 const STATUS_COLOR: Record<SpecState["backend_status"], string> = {
@@ -19,7 +21,7 @@ const STATUS_LABEL: Record<SpecState["backend_status"], string> = {
 };
 
 export function BottomStrip({
-  state, fusedRegionCount = 0, onHelpToggle,
+  state, fusedRegionCount = 0, onHelpToggle, backendBuildId = null,
 }: BottomStripProps): JSX.Element {
   return (
     <footer data-testid="bottom-strip"
@@ -47,6 +49,13 @@ export function BottomStrip({
       <span data-testid="brick-count">
         {state.brick_count} bricks, {fusedRegionCount} fused regions
       </span>
+      {backendBuildId && (
+        <span data-testid="backend-build-id"
+              title={`Backend build id: ${backendBuildId}`}
+              style={{ fontFamily: "monospace", color: "#6b7280" }}>
+          build {backendBuildId}
+        </span>
+      )}
       <span style={{ flex: 1 }} />
       <button data-testid="help-toggle" onClick={onHelpToggle}>?</button>
     </footer>
