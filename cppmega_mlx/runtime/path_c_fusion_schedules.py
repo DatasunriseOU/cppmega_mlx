@@ -5520,6 +5520,33 @@ def _row_phased_attention_indices_ref(
     )
 
 
+def _is_full_sequence_bank_slot(
+    buffer_name: str,
+    access_by_buffer: Mapping[str, str],
+) -> bool:
+    """Return True when ``buffer_name`` resolves to a full-sequence bank slot.
+
+    A "full-sequence bank slot" is a logical buffer whose physical access
+    expression resolves to ``path_c_..._abi_bank[OFFSET + i]`` (i.e. the
+    index depends on the kernel-wide loop variable ``i`` covering the
+    full ``sequence_length * hidden_size`` range), as opposed to a
+    per-row scratch buffer that wraps around each row iteration.
+
+    The schedule uses this signal to decide whether the bwd needs a
+    one-shot pre-zero (full-sequence bank slot) or whether per-row
+    zero-init followed by ``=`` accumulation is sufficient (per-row
+    scratch buffer).
+    """
+    if buffer_name not in access_by_buffer:
+        return False
+    access = access_by_buffer[buffer_name]
+    if "_abi_bank[" not in access:
+        return False
+    if " % " in access:
+        return False
+    return True
+
+
 def _append_row_phased_residual_rmsnorm_bwd_init(
     body: list[str],
     *,
@@ -5827,7 +5854,8 @@ def _append_row_phased_attention_qkv_projection_bwd_body(
             access_by_buffer,
             f"row * {hidden_size} + {h}",
         )
-        body.append(f"{indent * 4}{hidden_grad_ref} = 0.0")
+        if not _is_full_sequence_bank_slot(hidden_grad, access_by_buffer):
+            body.append(f"{indent * 4}{hidden_grad_ref} = 0.0")
         body.append(f"{indent * 4}for {q_flat} in T.serial(0, {q_dim}):")
         q_head_expr = f"{q_flat} // {head_dim}"
         q_value_index = f"row * {q_dim} + {q_flat}"
@@ -6079,7 +6107,8 @@ def _append_row_phased_m2rnn_bwd_body(
             access_by_buffer,
             f"row * {hidden_size} + {hidden_dim}",
         )
-        body.append(f"{indent * 4}{hidden_grad_ref} = 0.0")
+        if not _is_full_sequence_bank_slot(hidden_grad, access_by_buffer):
+            body.append(f"{indent * 4}{hidden_grad_ref} = 0.0")
         body.append(f"{indent * 4}for {proj_dim} in T.serial(0, {in_proj_dim}):")
         delta_grad = _node_indexed_canonical_or_positional_input_expr(
             node,
@@ -6374,7 +6403,8 @@ def _append_row_phased_mamba3_bwd_body(
             access_by_buffer,
             f"row * {hidden_size} + {hidden_dim}",
         )
-        body.append(f"{indent * 4}{hidden_grad_ref} = 0.0")
+        if not _is_full_sequence_bank_slot(hidden_grad, access_by_buffer):
+            body.append(f"{indent * 4}{hidden_grad_ref} = 0.0")
         body.append(f"{indent * 4}for {proj_dim} in T.serial(0, {in_proj_dim}):")
         delta_grad = _node_indexed_canonical_or_positional_input_expr(
             node,
